@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use nyx_protocol::ServerKeypair;
-use nyx_server::{load_profile, router, AppState};
+use nyx_server::{load_or_create_keypair, load_profile, router, AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -50,8 +50,17 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("control-API bearer-token guard enabled (NYX_TOKEN)");
     }
 
+    let keypair = match std::env::var("NYX_KEYFILE") {
+        Ok(p) => {
+            let kp = load_or_create_keypair(std::path::Path::new(&p))?;
+            tracing::info!(keyfile = %p, "persisted server identity loaded");
+            kp
+        }
+        Err(_) => ServerKeypair::generate(),
+    };
+
     let mut state = AppState {
-        keypair: ServerKeypair::generate(),
+        keypair,
         sessions: Default::default(),
         profile,
         api_token,

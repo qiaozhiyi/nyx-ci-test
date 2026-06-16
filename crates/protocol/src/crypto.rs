@@ -37,6 +37,20 @@ impl ServerKeypair {
         self.public.to_bytes()
     }
 
+    /// Serialize the long-term secret so the server identity can persist across
+    /// restarts (`NYX_KEYFILE`). The secret never leaves the server.
+    pub fn to_secret_bytes(&self) -> [u8; KEY_LEN] {
+        self.secret.to_bytes()
+    }
+
+    /// Reconstruct the identity from a persisted secret (e.g. read from
+    /// `NYX_KEYFILE`). Derives the matching public key.
+    pub fn from_secret_bytes(bytes: [u8; KEY_LEN]) -> Self {
+        let secret = StaticSecret::from(bytes);
+        let public = PublicKey::from(&secret);
+        Self { secret, public }
+    }
+
     /// Derive the AEAD session key for a connecting implant whose ephemeral
     /// public key is `implant_pub`. Both sides compute this and must agree.
     pub fn derive_for(&self, implant_pub: &[u8; PUBKEY_LEN]) -> SessionKey {

@@ -157,6 +157,30 @@ pub fn load_profile(path: &std::path::Path) -> anyhow::Result<nyx_profile::Profi
     }
 }
 
+/// Load the server's long-term keypair from `path`, or generate + persist it
+/// (0600 on Unix) if absent. With `NYX_KEYFILE` set, sessions survive a server
+/// restart instead of getting a fresh identity each boot.
+pub fn load_or_create_keypair(path: &std::path::Path) -> anyhow::Result<nyx_protocol::ServerKeypair> {
+    use nyx_protocol::ServerKeypair;
+    if path.exists() {
+        let bytes = std::fs::read(path)?;
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("keyfile {} is not 32 bytes", path.display()))?;
+        Ok(ServerKeypair::from_secret_bytes(arr))
+    } else {
+        let kp = ServerKeypair::generate();
+        std::fs::write(path, kp.to_secret_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(kp)
+    }
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     // Collect any profile-declared beacon URIs before `state` moves into the
     // router. The beacon handler is URI-agnostic (it just decrypts the body), so
@@ -535,6 +559,22 @@ mod tests {
         assert!(
             load_profile(&path).is_err(),
             "a profile with lint errors must be rejected"
+        );
+    }
+
+    #[test]
+    fn keypair_persists_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.key");
+        let kp1 = load_or_create_keypair(&path).expect("create keypair");
+        assert!(path.exists(), "keyfile must be created");
+        let pub1 = kp1.public_bytes();
+        // A second load must restore the SAME identity (sessions survive restart).
+        let kp2 = load_or_create_keypair(&path).expect("reload keypair");
+        assert_eq!(
+            kp2.public_bytes(),
+            pub1,
+            "reloading the keyfile must restore the same identity"
         );
     }
 }
