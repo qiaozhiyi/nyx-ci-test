@@ -7,6 +7,7 @@ description = "Nyx std-based dev/POSIX implant — proves the protocol loop on t
 
 [dependencies]
 nyx-protocol = { workspace = true }
+nyx-bof-runner = { workspace = true }
 ureq = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }

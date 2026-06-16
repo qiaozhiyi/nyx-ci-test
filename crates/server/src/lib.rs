@@ -398,6 +398,13 @@ enum JsonCommand {
     Upload { name: String, data_hex: String },
     /// Read `path` off the target (streamed back as `FileChunk`s).
     Download { path: String },
+    /// Execute a BOF/COFF object: `name` (entry label), `args`, `data_hex`
+    /// (hex-encoded COFF bytes). Output streams back as a `BofOutput` result.
+    Bof {
+        name: String,
+        args: Vec<String>,
+        data_hex: String,
+    },
     Exit,
 }
 
@@ -414,6 +421,14 @@ impl JsonCommand {
                 Command::Upload { name, data }
             }
             JsonCommand::Download { path } => Command::Download { path },
+            JsonCommand::Bof {
+                name,
+                args,
+                data_hex,
+            } => {
+                let blob = hex::decode(&data_hex).map_err(|_| "bad data_hex")?;
+                Command::Bof { name, args, blob }
+            }
             JsonCommand::Exit => Command::Exit,
         })
     }

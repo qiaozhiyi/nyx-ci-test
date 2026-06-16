@@ -32,6 +32,7 @@ nyx-config = { path = "crates/config" }
 nyx-config-macros = { path = "crates/config-macros" }
 nyx-coff = { path = "crates/coff" }
 nyx-transport = { path = "crates/transport" }
+nyx-bof-runner = { path = "crates/bof-runner" }
 # proc-macro toolchain (compile-time config embedding)
 syn = { version = "2", features = ["full"] }
 quote = "1"

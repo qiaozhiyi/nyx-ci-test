@@ -49,6 +49,11 @@ enum Cmd {
         /// Where to save it locally (defaults to the remote basename).
         local: Option<String>,
     },
+    /// Execute a BOF/COFF object file on a session.
+    Bof {
+        session: String,
+        file: String,
+    },
     /// Interactive REPL (default if no subcommand given).
     Repl,
 }
@@ -110,6 +115,15 @@ fn main() -> Result<()> {
             remote,
             local,
         } => download(&cli.server, &session, &remote, local.as_deref()),
+        Cmd::Bof { session, file } => {
+            let task_id = enqueue_bof(&cli.server, &session, &file)?;
+            match poll_result(&cli.server, &session, task_id)? {
+                Some(t) if t.is_empty() => println!("[bof ran (no captured output)]"),
+                Some(t) => print!("{t}"),
+                None => println!("[no output for bof task {task_id} within timeout]"),
+            }
+            Ok(())
+        }
         Cmd::Repl => repl(&cli.server),
     }
 }
@@ -154,6 +168,25 @@ fn enqueue_exit(server: &str, session: &str) -> Result<()> {
     let body = serde_json::json!({ "session": session, "command": { "type": "exit" } });
     let _ = ureq::post(&format!("{server}/api/task")).send_json(body);
     Ok(())
+}
+
+/// Task a BOF/COFF object file on a session. Returns the task id.
+fn enqueue_bof(server: &str, session: &str, file: &str) -> Result<u64> {
+    let data = std::fs::read(file).map_err(|e| anyhow!("read {file}: {e}"))?;
+    let name = std::path::Path::new(file)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bof")
+        .to_string();
+    let body = serde_json::json!({
+        "session": session,
+        "command": { "type": "bof", "name": name, "args": [], "data_hex": hex::encode(&data) },
+    });
+    let ack: TaskAck = ureq::post(&format!("{server}/api/task"))
+        .send_json(body)
+        .map_err(|e| anyhow!("enqueue failed: {e}"))?
+        .into_json()?;
+    Ok(ack.task_id)
 }
 
 fn upload(server: &str, session: &str, local: &str, remote: &str) -> Result<u64> {
@@ -369,6 +402,31 @@ fn repl(server: &str) -> Result<()> {
                 let local = p.next().map(|s| s.to_string());
                 if let Err(e) = download(server, &session, &remote, local.as_deref()) {
                     println!("! {e}");
+                }
+            }
+            "bof" => {
+                let session = match current.clone() {
+                    Some(s) => s,
+                    None => {
+                        println!("! `use <id>` first");
+                        continue;
+                    }
+                };
+                let file = match rest.split_whitespace().next() {
+                    Some(x) => x.to_string(),
+                    None => {
+                        println!("usage: bof <file.o>");
+                        continue;
+                    }
+                };
+                match enqueue_bof(server, &session, &file) {
+                    Ok(tid) => match poll_result(server, &session, tid) {
+                        Ok(Some(t)) if t.is_empty() => println!("[bof ran]"),
+                        Ok(Some(t)) => print!("{t}"),
+                        Ok(None) => println!("[no output]"),
+                        Err(e) => println!("! {e}"),
+                    },
+                    Err(e) => println!("! {e}"),
                 }
             }
             "exit" | "quit" => break,
