@@ -1,0 +1,23 @@
+# NOTE: not a workspace member yet — requires nightly + a Windows x86_64 target
+# and the PIC extraction step (see README.md). Kept standalone so the stable
+# workspace stays green on the dev host.
+[package]
+name = "nyx-implant-win"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nyx Windows PIC implant (BRC4-grade stealth). Requires nightly + Windows toolchain to build."
+
+# Built position-independent: no std runtime, no main, panic = abort.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nyx-protocol = { workspace = true }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

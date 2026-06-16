@@ -1,0 +1,31 @@
+[package]
+name = "nyx-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nyx team server: HTTP beacon listener, session registry, task queue, control API"
+
+[dependencies]
+nyx-protocol = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+dashmap = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+nyx-agent-dev = { workspace = true }
+ureq = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "nyx-server"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"

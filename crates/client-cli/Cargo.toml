@@ -1,0 +1,18 @@
+[package]
+name = "nyx-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nyx operator CLI — talks to the team server REST API"
+
+[dependencies]
+ureq = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+rustyline = "14"
+
+[[bin]]
+name = "nyx-cli"
+path = "src/main.rs"

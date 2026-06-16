@@ -1,0 +1,22 @@
+[package]
+name = "nyx-agent-dev"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nyx std-based dev/POSIX implant — proves the protocol loop on the dev host (not the Windows PIC agent)"
+
+[dependencies]
+nyx-protocol = { workspace = true }
+ureq = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[[bin]]
+name = "nyx-agent-dev"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
