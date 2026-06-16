@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use nyx_protocol::ServerKeypair;
-use nyx_server::{router, AppState};
+use nyx_server::{load_profile, router, AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -12,9 +12,29 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Load a Malleable C2 profile (lint-checked) if NYX_PROFILE is set. The
+    // server then also serves the beacon endpoint at the profile's URIs.
+    let profile = match std::env::var("NYX_PROFILE") {
+        Ok(path) => {
+            let p = load_profile(std::path::Path::new(&path))?;
+            let get = p
+                .http_get()
+                .and_then(|b| b.get("uri"))
+                .map(|u| u.as_str().into_owned());
+            let post = p
+                .http_post()
+                .and_then(|b| b.get("uri"))
+                .map(|u| u.as_str().into_owned());
+            tracing::info!(?get, ?post, "loaded Malleable C2 profile");
+            Some(p)
+        }
+        Err(_) => None,
+    };
+
     let state = Arc::new(AppState {
         keypair: ServerKeypair::generate(),
         sessions: Default::default(),
+        profile,
     });
 
     let pubkey = hex::encode(state.keypair.public_bytes());

@@ -7,6 +7,7 @@ description = "Nyx team server: HTTP beacon listener, session registry, task que
 
 [dependencies]
 nyx-protocol = { workspace = true }
+nyx-profile = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 dashmap = { workspace = true }

@@ -23,11 +23,14 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(%server_url, "nyx dev agent starting");
     let work_dir =
         std::path::PathBuf::from(std::env::var("NYX_WORKDIR").unwrap_or_else(|_| ".".to_string()));
+    let beacon_uri =
+        std::env::var("NYX_BEACON_URI").unwrap_or_else(|_| "/beacon".to_string());
     nyx_agent_dev::run(Config {
         server_url,
         server_pub,
         sleep_seconds,
         jitter_pct: 20,
         work_dir,
+        beacon_uri,
     })
 }

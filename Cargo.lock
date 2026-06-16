@@ -1000,6 +1000,7 @@ dependencies = [
  "dashmap",
  "hex",
  "nyx-agent-dev",
+ "nyx-profile",
  "nyx-protocol",
  "serde",
  "serde_json",

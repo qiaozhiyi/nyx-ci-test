@@ -29,6 +29,7 @@ async fn checkin_then_shell_task_roundtrips() {
         sleep_seconds: 1,
         jitter_pct: 0,
         work_dir: work.path().to_path_buf(),
+        beacon_uri: "/beacon".into(),
     };
     let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
 
@@ -116,6 +117,7 @@ async fn upload_then_download_roundtrips() {
         sleep_seconds: 1,
         jitter_pct: 0,
         work_dir: work.path().to_path_buf(),
+        beacon_uri: "/beacon".into(),
     };
     let work_path = work.path().to_path_buf();
     let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
@@ -211,6 +213,88 @@ async fn upload_then_download_roundtrips() {
     assert_eq!(got, payload, "downloaded bytes must match uploaded payload");
 
     // 3. teardown
+    let exit = serde_json::json!({ "session": session, "command": { "type": "exit" } });
+    let _ = ureq::post(format!("{url}/api/task").as_str()).send_json(exit);
+    let join = tokio::task::spawn_blocking(move || agent.join());
+    let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+}
+
+/// Malleable C2 transport: load a profile whose http-post URI is custom, serve
+/// the beacon handler there, and confirm an agent beaconing over that URI (not
+/// `/beacon`) can still check in and run a shell task end-to-end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malleable_beacon_uri_roundtrips() {
+    let profile_src = r#"http-get { set uri "/api/v1/Updates"; client { metadata { header "Cookie"; } } server { output { print; } } } http-post { set uri "/api/v1/Telemetry"; client { output { print; } } server { output { print; } } }"#;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("custom.profile");
+    std::fs::write(&path, profile_src).unwrap();
+
+    let state = AppState {
+        profile: Some(nyx_server::load_profile(&path).expect("profile must load+lint")),
+        ..AppState::default()
+    };
+    let server_pub = state.keypair.public_bytes();
+    let app = router(Arc::new(state));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let work = tempfile::tempdir().expect("tempdir");
+    let cfg = nyx_agent_dev::Config {
+        server_url: url.clone(),
+        server_pub,
+        sleep_seconds: 1,
+        jitter_pct: 0,
+        work_dir: work.path().to_path_buf(),
+        // The profile's http-post URI — NOT /beacon.
+        beacon_uri: "/api/v1/Telemetry".into(),
+    };
+    let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
+
+    // Check-in must succeed over the malleable URI.
+    let session = poll_until(Duration::from_secs(10), || async {
+        let list: serde_json::Value =
+            ureq::get(format!("{url}/api/sessions").as_str()).call().ok()?.into_json().ok()?;
+        list.as_array()?.first()?["id"].as_str().map(|s| s.to_string())
+    })
+    .await
+    .expect("agent never checked in over the malleable URI");
+
+    // A shell task must round-trip over the same malleable URI.
+    let body = serde_json::json!({
+        "session": session,
+        "command": { "type": "shell", "args": "echo malleable-ok" },
+    });
+    let ack: serde_json::Value = ureq::post(format!("{url}/api/task").as_str())
+        .send_json(body)
+        .expect("enqueue shell")
+        .into_json()
+        .expect("shell ack");
+    let task_id = ack["task_id"].as_u64().expect("task_id");
+    let out = poll_until(Duration::from_secs(10), || async {
+        let rs: serde_json::Value = ureq::get(format!("{url}/api/results").as_str())
+            .query("session", &session)
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
+        rs.as_array()?.iter().find_map(|r| {
+            if r["task_id"] == task_id && r["kind"] == "output" {
+                r["text"].as_str().map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+    })
+    .await
+    .expect("no shell output over the malleable URI");
+    assert!(out.contains("malleable-ok"), "unexpected output: {out:?}");
+
     let exit = serde_json::json!({ "session": session, "command": { "type": "exit" } });
     let _ = ureq::post(format!("{url}/api/task").as_str()).send_json(exit);
     let join = tokio::task::spawn_blocking(move || agent.join());
