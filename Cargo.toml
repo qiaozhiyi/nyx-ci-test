@@ -12,6 +12,7 @@ members = [
     "crates/config-macros",
     "crates/coff",
     "crates/transport",
+    "crates/bof-runner",
 ]
 
 [workspace.package]

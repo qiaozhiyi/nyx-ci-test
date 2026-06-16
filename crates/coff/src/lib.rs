@@ -269,20 +269,26 @@ pub fn apply<'a>(
                 if end > buf.len() {
                     return Err(ApplyError::BadOffset);
                 }
-                buf[off..end].copy_from_slice(&target.to_le_bytes());
+                // COFF relocs are *deltas*: the field already holds the
+                // compiler's value (incl. any in-section addend); add the
+                // symbol's final address to it.
+                let cur = i64::from_le_bytes(buf[off..end].try_into().unwrap());
+                let v = cur.wrapping_add(target as i64);
+                buf[off..end].copy_from_slice(&v.to_le_bytes());
             }
             reloc::REL32 | reloc::REL32_1..=0x0008 => {
-                let n = if r.typ == reloc::REL32 {
-                    0i64
-                } else {
-                    r.typ as i64 - reloc::REL32 as i64
-                };
                 let end = off.checked_add(4).ok_or(ApplyError::BadOffset)?;
                 if end > buf.len() {
                     return Err(ApplyError::BadOffset);
                 }
-                let disp = (target as i64 - loc as i64 - 4 - n) as i32;
-                buf[off..end].copy_from_slice(&disp.to_le_bytes());
+                // REL32[_N] is a delta too: the field already holds the
+                // compiler's displacement *including* the within-instruction
+                // adjustment the `_N` suffix describes (e.g. an immediate after
+                // the disp32). So we ADD `(target - (field_loc + 4))` — the
+                // `_N` is NOT applied separately.
+                let cur = i32::from_le_bytes(buf[off..end].try_into().unwrap());
+                let v = cur.wrapping_add((target as i64 - loc as i64 - 4) as i32);
+                buf[off..end].copy_from_slice(&v.to_le_bytes());
             }
             other => return Err(ApplyError::UnsupportedReloc(other)),
         }

@@ -84,23 +84,24 @@ fn applies_rel32_call_relocation_correctly() {
 
     let patched = apply(text, &coff, base, &resolver).expect("apply must succeed");
 
-    // Verify the patched 4-byte displacement matches the REL32[_N] formula
-    // exactly: disp = target - (section_base + reloc_offset + 4 + N).
-    let n = if call.typ == reloc::REL32 {
-        0i64
-    } else {
-        call.typ as i64 - reloc::REL32 as i64
-    };
-    let loc = base + call.offset as u64;
-    let expected = (target as i64 - loc as i64 - 4 - n) as i32;
+    // COFF relocs are deltas: the patched field = original_field +
+    // (target - (field_loc + 4)). The `_N` is baked into the original field.
     let off = call.offset as usize;
+    let orig = i32::from_le_bytes([
+        text.raw[off],
+        text.raw[off + 1],
+        text.raw[off + 2],
+        text.raw[off + 3],
+    ]);
+    let loc = base + call.offset as u64;
+    let expected = orig.wrapping_add((target as i64 - loc as i64 - 4) as i32);
     let got = i32::from_le_bytes([
         patched[off],
         patched[off + 1],
         patched[off + 2],
         patched[off + 3],
     ]);
-    assert_eq!(got, expected, "REL32 displacement must match the formula");
+    assert_eq!(got, expected, "REL32 delta must match the addend formula");
 
     // Determinism: applying twice with identical inputs yields identical bytes.
     let patched2 = apply(text, &coff, base, &resolver).unwrap();
