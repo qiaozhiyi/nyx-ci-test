@@ -21,10 +21,13 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or(5);
 
     tracing::info!(%server_url, "nyx dev agent starting");
+    let work_dir =
+        std::path::PathBuf::from(std::env::var("NYX_WORKDIR").unwrap_or_else(|_| ".".to_string()));
     nyx_agent_dev::run(Config {
         server_url,
         server_pub,
         sleep_seconds,
         jitter_pct: 20,
+        work_dir,
     })
 }

@@ -181,17 +181,28 @@ enum JsonCommand {
     Ping,
     Shell { args: String },
     Sleep { seconds: u32, jitter_pct: u8 },
+    /// Write `data_hex` (hex-encoded bytes) to a file named `name` on the target.
+    Upload { name: String, data_hex: String },
+    /// Read `path` off the target (streamed back as `FileChunk`s).
+    Download { path: String },
     Exit,
 }
 
 impl JsonCommand {
-    fn into_command(self) -> Command {
-        match self {
+    /// Convert to a wire [`Command`]. `Upload` decodes its hex payload here; a
+    /// malformed hex string is surfaced as an error for a 400 response.
+    fn into_command(self) -> Result<Command, &'static str> {
+        Ok(match self {
             JsonCommand::Ping => Command::Ping,
             JsonCommand::Shell { args } => Command::Shell { args },
             JsonCommand::Sleep { seconds, jitter_pct } => Command::Sleep { seconds, jitter_pct },
+            JsonCommand::Upload { name, data_hex } => {
+                let data = hex::decode(&data_hex).map_err(|_| "bad data_hex")?;
+                Command::Upload { name, data }
+            }
+            JsonCommand::Download { path } => Command::Download { path },
             JsonCommand::Exit => Command::Exit,
-        }
+        })
     }
 }
 
@@ -210,16 +221,17 @@ async fn post_task(State(st): State<Arc<AppState>>, Json(req): Json<TaskReq>) ->
         Some(id) => id,
         None => return (StatusCode::BAD_REQUEST, "bad session hex").into_response(),
     };
+    let command = match req.command.into_command() {
+        Ok(c) => c,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
     let mut s = match st.sessions.get_mut(&id) {
         Some(s) => s,
         None => return (StatusCode::NOT_FOUND, "no such session").into_response(),
     };
     let task_id = s.next_task_id;
     s.next_task_id += 1;
-    s.pending.push(Task {
-        task_id,
-        command: req.command.into_command(),
-    });
+    s.pending.push(Task { task_id, command });
     (StatusCode::OK, Json(TaskAck { task_id })).into_response()
 }
 
@@ -233,6 +245,13 @@ struct ResultView {
     task_id: u64,
     kind: String,
     text: String,
+    /// Present only for `FileChunk` results (hex-encoded chunk bytes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seq: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eof: Option<u8>,
 }
 
 async fn get_results(State(st): State<Arc<AppState>>, Query(q): Query<ResultsQuery>) -> Response {
@@ -247,18 +266,27 @@ async fn get_results(State(st): State<Arc<AppState>>, Query(q): Query<ResultsQue
     let views: Vec<ResultView> = drained
         .into_iter()
         .map(|r| {
-            let (kind, text) = match r.response {
-                MsgResponse::Output(b) => ("output", String::from_utf8_lossy(&b).into_owned()),
-                MsgResponse::Ok => ("ok", String::new()),
-                MsgResponse::Err(m) => ("error", m),
-                MsgResponse::FileChunk { name, seq, .. } => {
-                    ("file", format!("<chunk {name}#{seq}>"))
+            let (kind, text, data_hex, seq, eof) = match r.response {
+                MsgResponse::Output(b) => {
+                    ("output", String::from_utf8_lossy(&b).into_owned(), None, None, None)
                 }
+                MsgResponse::Ok => ("ok", String::new(), None, None, None),
+                MsgResponse::Err(m) => ("error", m, None, None, None),
+                MsgResponse::FileChunk { name, seq, eof, data } => (
+                    "file",
+                    format!("<chunk {name}#{seq}>"),
+                    Some(hex::encode(&data)),
+                    Some(seq),
+                    Some(eof),
+                ),
             };
             ResultView {
                 task_id: r.task_id,
                 kind: kind.to_string(),
                 text,
+                data_hex,
+                seq,
+                eof,
             }
         })
         .collect();
