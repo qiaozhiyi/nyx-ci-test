@@ -991,6 +991,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-scripting"
+version = "0.1.0"
+
+[[package]]
 name = "nyx-server"
 version = "0.1.0"
 dependencies = [
@@ -1002,6 +1006,7 @@ dependencies = [
  "nyx-agent-dev",
  "nyx-profile",
  "nyx-protocol",
+ "nyx-scripting",
  "serde",
  "serde_json",
  "tempfile",

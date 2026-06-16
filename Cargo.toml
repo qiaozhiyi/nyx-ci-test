@@ -6,6 +6,7 @@ members = [
     "crates/server",
     "crates/agent-dev",
     "crates/client-cli",
+    "crates/scripting",
 ]
 
 [workspace.package]
@@ -19,6 +20,7 @@ license = "Apache-2.0 OR MIT"
 nyx-protocol = { path = "crates/protocol" }
 nyx-profile = { path = "crates/profile" }
 nyx-agent-dev = { path = "crates/agent-dev" }
+nyx-scripting = { path = "crates/scripting" }
 # crypto — all no_std-capable so the same code can ship in the PIC implant later
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"

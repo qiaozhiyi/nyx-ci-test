@@ -36,6 +36,10 @@ impl Writer {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
+    pub fn u16(&mut self, v: u16) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
     pub fn u64(&mut self, v: u64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
@@ -81,6 +85,11 @@ impl<'a> Reader<'a> {
     pub fn u32(&mut self) -> Result<u32, WireError> {
         let s = self.take(4)?;
         Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    pub fn u16(&mut self) -> Result<u16, WireError> {
+        let s = self.take(2)?;
+        Ok(u16::from_le_bytes([s[0], s[1]]))
     }
 
     pub fn u64(&mut self) -> Result<u64, WireError> {

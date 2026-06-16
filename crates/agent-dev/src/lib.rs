@@ -135,6 +135,11 @@ fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
         Command::Sleep { .. } => vec![Response::Ok],
         Command::Upload { name, data } => vec![do_upload(work_dir, &name, &data)],
         Command::Download { path } => do_download(work_dir, &path),
+        // P2/P3 executors (BOF, P2P connect, SOCKS) are implant-side; the dev
+        // agent acks them as unimplemented so the wire types stay round-trippable.
+        Command::Bof { .. } | Command::Connect { .. } | Command::Socks { .. } => {
+            vec![Response::Err("not implemented in dev agent".into())]
+        }
         Command::Exit => vec![Response::Ok],
     }
 }

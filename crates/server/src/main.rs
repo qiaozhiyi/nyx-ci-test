@@ -31,11 +31,35 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => None,
     };
 
-    let state = Arc::new(AppState {
+    // Guardrails: an optional API token (Bearer auth on /api/*) and a kill date.
+    let api_token = std::env::var("NYX_TOKEN").ok().filter(|s| !s.is_empty());
+    let killdate = std::env::var("NYX_KILLDATE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    if let Some(kd) = killdate {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now >= kd {
+            anyhow::bail!("kill date {kd} has passed (now={now}); refusing to start");
+        }
+        tracing::info!(killdate = kd, "kill date active; server will stop serving after it");
+    }
+    if api_token.is_some() {
+        tracing::info!("control-API bearer-token guard enabled (NYX_TOKEN)");
+    }
+
+    let mut state = AppState {
         keypair: ServerKeypair::generate(),
         sessions: Default::default(),
         profile,
-    });
+        api_token,
+        killdate,
+        events: nyx_scripting::EventBus::new(),
+    };
+    state.register_default_hooks();
+    let state = Arc::new(state);
 
     let pubkey = hex::encode(state.keypair.public_bytes());
     let addr = std::env::var("NYX_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_string());

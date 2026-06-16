@@ -301,6 +301,136 @@ async fn malleable_beacon_uri_roundtrips() {
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
 }
 
+/// Control-API guardrail: when NYX_TOKEN is set, `/api/*` requires a matching
+/// `Authorization: Bearer` header; `/beacon` stays open (crypto-authenticated).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_token_guards_control_api() {
+    let state = AppState {
+        api_token: Some("sekret".into()),
+        ..AppState::default()
+    };
+    let app = router(Arc::new(state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // No token -> 401 (ureq surfaces non-2xx as Err::Status).
+    let no_auth_status = match ureq::get(format!("{url}/api/sessions").as_str()).call() {
+        Err(ureq::Error::Status(code, _)) => code,
+        Ok(r) => panic!("expected 401 rejection, got {}", r.status()),
+        Err(e) => panic!("expected 401, got transport error: {e}"),
+    };
+    assert_eq!(no_auth_status, 401, "unauthenticated request must be rejected");
+
+    // Correct bearer token -> 200.
+    let with_auth = ureq::get(format!("{url}/api/sessions").as_str())
+        .set("Authorization", "Bearer sekret")
+        .call()
+        .expect("correct token should yield 200");
+    assert_eq!(with_auth.status(), 200, "correct bearer token must be accepted");
+}
+
+/// Scripting wiring: the server must fire `SessionNew` (on check-in) and
+/// `ResultReceived` (on a task result) into the event bus. We register a
+/// LogHook and assert both events arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scripting_events_fire_on_beacon_cycle() {
+    let mut state = AppState::default();
+    let log = nyx_scripting::LogHook::new();
+    let recs = log.records.clone();
+    state.events.register(Box::new(log));
+    let server_pub = state.keypair.public_bytes();
+    let app = router(Arc::new(state));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let work = tempfile::tempdir().expect("tempdir");
+    let cfg = nyx_agent_dev::Config {
+        server_url: url.clone(),
+        server_pub,
+        sleep_seconds: 1,
+        jitter_pct: 0,
+        work_dir: work.path().to_path_buf(),
+        beacon_uri: "/beacon".into(),
+    };
+    let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
+
+    let session = poll_until(Duration::from_secs(10), || async {
+        let list: serde_json::Value =
+            ureq::get(format!("{url}/api/sessions").as_str()).call().ok()?.into_json().ok()?;
+        list.as_array()?.first()?["id"].as_str().map(|s| s.to_string())
+    })
+    .await
+    .expect("agent never checked in");
+
+    // Check-in must have fired SessionNew into the LogHook.
+    poll_until(Duration::from_secs(5), || async {
+        let r = recs.lock().unwrap();
+        if r.iter().any(|l| l.contains("session_new")) {
+            Some(())
+        } else {
+            None
+        }
+    })
+    .await
+    .expect("SessionNew event never fired");
+
+    // Task a shell so a ResultReceived fires.
+    let body = serde_json::json!({
+        "session": session,
+        "command": { "type": "shell", "args": "echo ev-ok" },
+    });
+    let ack: serde_json::Value = ureq::post(format!("{url}/api/task").as_str())
+        .send_json(body)
+        .unwrap()
+        .into_json()
+        .unwrap();
+    let task_id = ack["task_id"].as_u64().unwrap();
+    poll_until(Duration::from_secs(10), || async {
+        let rs: serde_json::Value = ureq::get(format!("{url}/api/results").as_str())
+            .query("session", &session)
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
+        rs.as_array()?.iter().find_map(|r| {
+            if r["task_id"] == task_id && r["kind"] == "output" {
+                r["text"].as_str().map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+    })
+    .await
+    .expect("shell output");
+
+    poll_until(Duration::from_secs(5), || async {
+        let r = recs.lock().unwrap();
+        if r.iter().any(|l| l.contains("result")) {
+            Some(())
+        } else {
+            None
+        }
+    })
+    .await
+    .expect("ResultReceived event never fired");
+
+    let _ = ureq::post(format!("{url}/api/task").as_str())
+        .send_json(serde_json::json!({ "session": session, "command": { "type": "exit" } }));
+    let join = tokio::task::spawn_blocking(move || agent.join());
+    let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+}
+
 /// Poll an async closure at ~5 Hz until it returns Some or the budget elapses.
 async fn poll_until<T, F, Fut>(budget: Duration, mut f: F) -> Option<T>
 where
