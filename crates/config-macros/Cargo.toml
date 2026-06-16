@@ -1,0 +1,20 @@
+[package]
+name = "nyx-config-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Compile-time, per-build randomized implant-config embedding (proc-macro)"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+# NOTE: deliberately does NOT depend on nyx-config (avoids a dev-dep cycle:
+# nyx-config -> nyx-config-macros [dev] -> nyx-config). The macro encrypts with
+# its own AEAD call and emits a call to `nyx_config::decrypt`, resolved in the
+# downstream crate.
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+rand = { workspace = true }

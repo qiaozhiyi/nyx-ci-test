@@ -1,0 +1,13 @@
+[package]
+name = "nyx-coff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nyx COFF/BOF loader core: parse a Windows x86_64 COFF object and apply AMD64 relocations (portable, fixture-tested; execution is implant-side)"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lib]
+name = "nyx_coff"
+path = "src/lib.rs"

@@ -8,6 +8,9 @@ members = [
     "crates/client-cli",
     "crates/scripting",
     "crates/evasion",
+    "crates/config",
+    "crates/config-macros",
+    "crates/coff",
 ]
 
 [workspace.package]
@@ -23,6 +26,13 @@ nyx-profile = { path = "crates/profile" }
 nyx-agent-dev = { path = "crates/agent-dev" }
 nyx-scripting = { path = "crates/scripting" }
 nyx-evasion = { path = "crates/evasion" }
+nyx-config = { path = "crates/config" }
+nyx-config-macros = { path = "crates/config-macros" }
+nyx-coff = { path = "crates/coff" }
+# proc-macro toolchain (compile-time config embedding)
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
 # crypto — all no_std-capable so the same code can ship in the PIC implant later
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"

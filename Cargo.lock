@@ -972,6 +972,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-coff"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "nyx-config"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "nyx-config-macros",
+ "rand",
+]
+
+[[package]]
+name = "nyx-config-macros"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "proc-macro2",
+ "quote",
+ "rand",
+ "syn",
+]
+
+[[package]]
 name = "nyx-evasion"
 version = "0.1.0"
 

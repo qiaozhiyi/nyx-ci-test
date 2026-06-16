@@ -1,0 +1,17 @@
+[package]
+name = "nyx-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Per-build encrypted implant config — runtime decrypt half of nyx-config-macros::embed!"
+
+[dependencies]
+chacha20poly1305 = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+nyx-config-macros = { workspace = true }
+
+[lib]
+name = "nyx_config"
+path = "src/lib.rs"
