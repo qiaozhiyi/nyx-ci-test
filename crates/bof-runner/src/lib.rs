@@ -17,4 +17,4 @@
 mod win;
 
 #[cfg(target_os = "windows")]
-pub use win::{execute, load, Loaded, Resolver};
+pub use win::{execute, load, ExecResult, Loaded, Resolver};

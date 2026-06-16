@@ -122,25 +122,41 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
     Ok(Loaded { defined, entry: entry_addr })
 }
 
-/// Load + run a BOF's `go()` (no args). Returns the resolved symbol map so the
-/// caller can read results the BOF wrote to globals.
-pub fn execute(blob: &[u8]) -> Result<Loaded, String> {
-    let loaded = load(blob, "go", HashMap::new())?;
-    unsafe {
-        let go: extern "C" fn() = std::mem::transmute(loaded.entry);
-        go();
-    }
-    Ok(loaded)
+extern "C" {
+    fn BeaconPrintf();
+    fn nyx_bof_reset();
+    fn nyx_bof_output() -> *const c_char;
 }
 
-/// Read a NUL-terminated C string the BOF wrote at `addr` (used once a
-/// `BeaconPrintf` shim lands). Kept here for the next step.
-#[allow(dead_code)]
-unsafe fn read_cstr(addr: u64) -> String {
-    if addr == 0 {
-        return String::new();
+/// The Beacon-API external table (symbol name → shim address). Extends as more
+/// of the CS ABI lands (BeaconDataParse, BeaconOutput, …).
+fn beacon_apis() -> HashMap<String, u64> {
+    let fp: unsafe extern "C" fn() = BeaconPrintf;
+    let addr = fp as usize as u64;
+    eprintln!("[bof-runner] BeaconPrintf shim @ 0x{addr:x}");
+    [("BeaconPrintf".to_string(), addr)].into_iter().collect()
+}
+
+/// Result of running a BOF: captured `BeaconPrintf` output + resolved symbols.
+pub struct ExecResult {
+    pub output: String,
+    pub defined: HashMap<String, u64>,
+}
+
+/// Load + run a BOF's `go()`: wire up the Beacon-API externals, reset the
+/// output buffer, call `go`, and return the captured output + symbol map.
+pub fn execute(blob: &[u8]) -> Result<ExecResult, String> {
+    let loaded = load(blob, "go", beacon_apis())?;
+    unsafe {
+        nyx_bof_reset();
+        let go: extern "C" fn() = std::mem::transmute(loaded.entry);
+        go();
+        let output = std::ffi::CStr::from_ptr(nyx_bof_output())
+            .to_string_lossy()
+            .into_owned();
+        Ok(ExecResult {
+            output,
+            defined: loaded.defined,
+        })
     }
-    std::ffi::CStr::from_ptr(addr as *const c_char)
-        .to_string_lossy()
-        .into_owned()
 }
