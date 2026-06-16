@@ -1,0 +1,17 @@
+[package]
+name = "nyx-profile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nyx Malleable C2 profile parser, data-transform engine, and c2lint (CS-compatible grammar)"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lib]
+name = "nyx_profile"
+path = "src/lib.rs"
+
+[[bin]]
+name = "c2lint"
+path = "src/bin/c2lint.rs"

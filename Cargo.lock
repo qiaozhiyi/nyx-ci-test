@@ -901,6 +901,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-profile"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "nyx-protocol"
 version = "0.1.0"
 dependencies = [
