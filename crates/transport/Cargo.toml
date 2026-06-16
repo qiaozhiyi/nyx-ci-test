@@ -1,0 +1,18 @@
+[package]
+name = "nyx-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nyx transport fingerprint engine: TLS ClientHello parse + JA3/JA4 + HTTP/2 (Akamai) fingerprints"
+
+[dependencies]
+md-5 = "0.10"
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+md-5 = "0.10"
+
+[lib]
+name = "nyx_transport"
+path = "src/lib.rs"

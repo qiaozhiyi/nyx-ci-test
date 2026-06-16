@@ -11,6 +11,7 @@ members = [
     "crates/config",
     "crates/config-macros",
     "crates/coff",
+    "crates/transport",
 ]
 
 [workspace.package]
@@ -29,6 +30,7 @@ nyx-evasion = { path = "crates/evasion" }
 nyx-config = { path = "crates/config" }
 nyx-config-macros = { path = "crates/config-macros" }
 nyx-coff = { path = "crates/coff" }
+nyx-transport = { path = "crates/transport" }
 # proc-macro toolchain (compile-time config embedding)
 syn = { version = "2", features = ["full"] }
 quote = "1"
