@@ -972,6 +972,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-evasion"
+version = "0.1.0"
+
+[[package]]
 name = "nyx-profile"
 version = "0.1.0"
 dependencies = [
