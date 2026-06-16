@@ -431,6 +431,40 @@ async fn scripting_events_fire_on_beacon_cycle() {
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
 }
 
+/// `GET /api/profile` exposes the active Malleable C2 profile (or loaded:false).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_endpoint_exposes_loaded_profile() {
+    let profile_src = r#"set useragent "Mozilla/5.0 NyxBrowser";
+        http-get { set uri "/api/v1/Updates"; client { metadata { header "Cookie"; } } server { output { print; } } }
+        http-post { set uri "/api/v1/Telemetry"; client { output { print; } } server { output { print; } } }"#;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("p.profile");
+    std::fs::write(&path, profile_src).unwrap();
+
+    let state = AppState {
+        profile: Some(nyx_server::load_profile(&path).expect("profile load")),
+        ..AppState::default()
+    };
+    let app = router(Arc::new(state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let v: serde_json::Value = ureq::get(format!("{url}/api/profile").as_str())
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(v["loaded"], true, "profile is loaded: {v}");
+    assert_eq!(v["http_get_uri"], "/api/v1/Updates");
+    assert_eq!(v["http_post_uri"], "/api/v1/Telemetry");
+    assert_eq!(v["useragent"], "Mozilla/5.0 NyxBrowser");
+}
+
 /// Poll an async closure at ~5 Hz until it returns Some or the budget elapses.
 async fn poll_until<T, F, Fut>(budget: Duration, mut f: F) -> Option<T>
 where

