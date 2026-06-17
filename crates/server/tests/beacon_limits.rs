@@ -12,7 +12,6 @@
 use std::sync::Arc;
 
 use nyx_server::{router, AppState};
-
 async fn spawn(state: Arc<AppState>) -> String {
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -132,5 +131,72 @@ async fn undecryptable_frame_for_unknown_pubkey_does_not_crash() {
     assert!(
         (400..500).contains(&code2),
         "second undecryptable frame should also be 4xx; got {code2}"
+    );
+}
+
+/// Build a syntactically-valid encrypted check-in frame for a fresh implant
+/// keypair against the given server pubkey, so we can drive the beacon handler
+/// without the full dev agent. Returns (frame_bytes, pubkey).
+fn valid_checkin_frame(server_pub: &[u8; 32]) -> (Vec<u8>, [u8; 32]) {
+    use nyx_protocol::{crypto, frame, wire::Writer, ImplantKeypair, SessionInfo};
+    let ikp = ImplantKeypair::generate();
+    let key = ikp.session_key(server_pub);
+    let pubkey = ikp.public_bytes();
+    let mut w = Writer::new();
+    SessionInfo {
+        beacon_id: 1,
+        hostname: "t".into(),
+        username: "u".into(),
+        os: "OS".into(),
+        arch: 0,
+        pid: 1,
+        is_admin: 0,
+    }
+    .encode(&mut w);
+    (frame::encode_frame(&pubkey, 0, &key, &w.into_bytes()), pubkey)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_task_rejects_when_pending_queue_is_full() {
+    // H2: an authenticated operator can enqueue unbounded tasks per session →
+    // OOM. Past MAX_PENDING_PER_SESSION the enqueue must be rejected (back-
+    // pressure), not silently grow the queue.
+    use nyx_server::MAX_PENDING_PER_SESSION;
+    let state = Arc::new(AppState::default());
+    let server_pub = state.keypair.public_bytes();
+    // Seed one real session via a valid check-in (so post_task finds it).
+    let (frame, pubkey) = valid_checkin_frame(&server_pub);
+    let url = spawn(state.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    let code = status_of(
+        ureq::post(format!("{url}/beacon").as_str())
+            .set("Content-Type", "application/octet-stream")
+            .send_bytes(&frame),
+    );
+    assert!(code == 200, "check-in must succeed, got {code}");
+    let session_hex = hex::encode(pubkey);
+
+    // Enqueue MAX_PENDING_PER_SESSION tasks (no token configured → auth open).
+    for _ in 0..MAX_PENDING_PER_SESSION {
+        let code = status_of(
+            ureq::post(format!("{url}/api/task").as_str())
+                .send_json(serde_json::json!({
+                    "session": session_hex,
+                    "command": { "type": "ping" }
+                })),
+        );
+        assert_eq!(code, 200, "enqueue within cap must succeed");
+    }
+    // The very next enqueue must be rejected (4xx/5xx), not accepted.
+    let over = status_of(
+        ureq::post(format!("{url}/api/task").as_str())
+            .send_json(serde_json::json!({
+                "session": session_hex,
+                "command": { "type": "ping" }
+            })),
+    );
+    assert!(
+        over >= 400,
+        "enqueue past MAX_PENDING_PER_SESSION ({MAX_PENDING_PER_SESSION}) must be rejected, got {over}"
     );
 }

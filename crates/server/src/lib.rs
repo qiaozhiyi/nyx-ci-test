@@ -11,6 +11,20 @@ pub mod tls;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// Maximum queued-but-undelivered tasks per session. An authenticated operator
+/// (or a compromised token) can otherwise enqueue unbounded tasks → OOM. Past
+/// this the enqueue is rejected with 503 (back-pressure), not silently dropped.
+pub const MAX_PENDING_PER_SESSION: usize = 1024;
+/// Maximum undelivered result entries per session. A rogue/compromised implant
+/// streaming Output/FileChunk blobs could otherwise fill RAM forever; past this
+/// the oldest entries are evicted (results are best-effort — operators drain
+/// them, and an unattended server shouldn't OOM on a chatty beacon).
+pub const MAX_RESULTS_PER_SESSION: usize = 4096;
+/// Maximum concurrent sessions. Beacon check-in is unauthenticated (anyone who
+/// speaks the protocol registers a session), so without a cap an attacker can
+/// flood the registry with distinct ephemeral keys → OOM.
+pub const MAX_SESSIONS: usize = 4096;
+
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, DefaultBodyLimit, Query, State},
@@ -432,6 +446,12 @@ fn handle_beacon(st: &AppState, peer: &std::net::SocketAddr, body: &[u8]) -> any
 
     if is_new {
         // First message from an implant is always its SessionInfo (check-in).
+        // Cap the global session count: beacon check-in is unauthenticated
+        // (anyone who speaks the protocol registers), so without a cap an
+        // attacker flooding distinct ephemeral keys OOMs the registry.
+        if st.sessions.len() >= MAX_SESSIONS {
+            anyhow::bail!("session registry full ({MAX_SESSIONS}); refusing new check-in");
+        }
         let mut r = Reader::new(&plaintext);
         let info = SessionInfo::decode(&mut r)?;
         tracing::info!(
@@ -504,6 +524,14 @@ fn handle_beacon(st: &AppState, peer: &std::net::SocketAddr, body: &[u8]) -> any
         s.last_recv = raw.counter;
         for r in responses {
             s.results.push(r);
+            // Bound the results buffer: a rogue/compromised implant streaming
+            // Output/FileChunk blobs could otherwise fill RAM forever. Evict
+            // oldest (results are best-effort; operators drain them, and an
+            // unattended server mustn't OOM on a chatty beacon).
+            if s.results.len() > MAX_RESULTS_PER_SESSION {
+                let drop_n = s.results.len() - MAX_RESULTS_PER_SESSION;
+                s.results.drain(0..drop_n);
+            }
         }
         let tasks = std::mem::take(&mut s.pending);
         s.send_counter += 1;
@@ -687,6 +715,17 @@ async fn post_task(
         Some(s) => s,
         None => return (StatusCode::NOT_FOUND, "no such session").into_response(),
     };
+    // Back-pressure: refuse to enqueue past the per-session cap so an operator
+    // (or a compromised token) can't grow pending unbounded → OOM. The implant
+    // drains pending each beacon cycle, so a full queue means the beacon is
+    // dead/stuck and queueing more is pointless anyway.
+    if s.pending.len() >= MAX_PENDING_PER_SESSION {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pending task queue full (beacon not draining?)",
+        )
+            .into_response();
+    }
     let task_id = s.next_task_id;
     s.next_task_id += 1;
     s.pending.push(Task { task_id, command });
