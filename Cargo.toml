@@ -17,6 +17,12 @@ members = [
     "crates/scripting-rhai",
     "crates/pe",
 ]
+# NOTE: `crates/implant-win` is intentionally NOT a workspace member. It is
+# `#![no_std]` + `#![no_main]` + targets `x86_64-pc-windows-gnu` on nightly, and
+# the PIC extraction step needs the Windows toolchain. Building/checking the
+# workspace with `cargo build --workspace` must stay green on the macOS dev host,
+# so implant-win is built standalone:
+#   cargo +nightly check -p nyx-implant-win --target x86_64-pc-windows-gnu
 
 [workspace.package]
 version = "0.1.0"

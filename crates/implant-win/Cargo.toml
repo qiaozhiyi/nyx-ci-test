@@ -1,19 +1,29 @@
-# NOTE: not a workspace member yet — requires nightly + a Windows x86_64 target
+# NOTE: not a workspace member — requires nightly + a Windows x86_64 target
 # and the PIC extraction step (see README.md). Kept standalone so the stable
-# workspace stays green on the dev host.
+# workspace stays green on the dev host. Build standalone:
+#   cargo +nightly check -p nyx-implant-win --target x86_64-pc-windows-gnu
 [package]
 name = "nyx-implant-win"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
 description = "Nyx Windows PIC implant (BRC4-grade stealth). Requires nightly + Windows toolchain to build."
+
+# Standalone (NOT in the root workspace) so the dev-host stable workspace stays
+# green. Declares its own (empty) workspace to decouple from the root members.
+[workspace]
 
 # Built position-independent: no std runtime, no main, panic = abort.
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-nyx-protocol = { workspace = true }
+# Path deps (this crate is standalone, outside the root workspace).
+nyx-protocol = { path = "../protocol" }
+# Evasion kit: SSN resolution + indirect-syscall stub templates. The resolve
+# module implements SyscallSource over the live ntdll, turning these algorithms
+# into a runtime.
+nyx-evasion = { path = "../evasion" }
 
 [profile.release]
 opt-level = "z"
