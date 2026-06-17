@@ -181,6 +181,15 @@ pub fn load_or_create_keypair(path: &std::path::Path) -> anyhow::Result<nyx_prot
     }
 }
 
+/// Load + compile a Rhai operator script (`NYX_SCRIPT`) into a hook. Errors if
+/// the file can't be read or has a syntax error.
+pub fn load_script(path: &std::path::Path) -> anyhow::Result<nyx_scripting_rhai::RhaiHook> {
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read script {}: {e}", path.display()))?;
+    nyx_scripting_rhai::RhaiHook::new(&path.display().to_string(), &src)
+        .map_err(|e| anyhow::anyhow!("compile script {}: {e}", path.display()))
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     // Collect any profile-declared beacon URIs before `state` moves into the
     // router. The beacon handler is URI-agnostic (it just decrypts the body), so
@@ -677,6 +686,21 @@ mod tests {
             kp2.public_bytes(),
             pub1,
             "reloading the keyfile must restore the same identity"
+        );
+    }
+
+    #[test]
+    fn load_script_compiles_valid_and_rejects_bad() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("ok.rhai");
+        std::fs::write(&good, r#"fn on_session_new(s) { nyx_log(s["hostname"]); }"#).unwrap();
+        assert!(load_script(&good).is_ok(), "valid Rhai script must compile");
+
+        let bad = dir.path().join("bad.rhai");
+        std::fs::write(&bad, "fn ( broken").unwrap();
+        assert!(
+            load_script(&bad).is_err(),
+            "a syntactically broken script must be rejected"
         );
     }
 }

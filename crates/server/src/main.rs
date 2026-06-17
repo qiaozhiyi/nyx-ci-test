@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use nyx_protocol::ServerKeypair;
-use nyx_server::{load_or_create_keypair, load_profile, router, AppState};
+use nyx_server::{load_or_create_keypair, load_profile, load_script, router, AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -68,6 +68,16 @@ async fn main() -> anyhow::Result<()> {
         events: nyx_scripting::EventBus::new(),
     };
     state.register_default_hooks();
+    // Optional operator automation: a Rhai script run on session/result events.
+    if let Ok(p) = std::env::var("NYX_SCRIPT") {
+        match load_script(std::path::Path::new(&p)) {
+            Ok(hook) => {
+                tracing::info!(script = %p, "loaded operator Rhai script");
+                state.events.register(Box::new(hook));
+            }
+            Err(e) => tracing::error!(error = %e, "failed to load NYX_SCRIPT; continuing without it"),
+        }
+    }
     let state = Arc::new(state);
 
     let pubkey = hex::encode(state.keypair.public_bytes());
