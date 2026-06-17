@@ -15,6 +15,7 @@ members = [
     "crates/bof-runner",
     "crates/client",
     "crates/scripting-rhai",
+    "crates/pe",
 ]
 
 [workspace.package]
