@@ -128,6 +128,18 @@ fn main() -> Result<()> {
     }
 }
 
+/// Human-readable architecture tag from the SessionInfo `arch` byte.
+fn arch_str(a: u8) -> &'static str {
+    match a {
+        0 => "?",
+        1 => "x86",
+        2 => "x64",
+        3 => "arm",
+        4 => "arm64",
+        _ => "?",
+    }
+}
+
 fn print_list(server: &str) -> Result<()> {
     let sessions: Vec<SessionView> =
         ureq::get(&format!("{server}/api/sessions")).call()?.into_json()?;
@@ -136,13 +148,21 @@ fn print_list(server: &str) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<66} {:<6} {:<14} {:<14} {:<14} {:<3} {:<7}",
-        "ID", "BEACON", "HOST", "USER", "OS", "ADM", "PENDING"
+        "{:<66} {:<6} {:<14} {:<14} {:<14} {:<4} {:<7} {:<3} {:<7}",
+        "ID", "BEACON", "HOST", "USER", "OS", "ARCH", "PID", "ADM", "PENDING"
     );
     for s in sessions {
         println!(
-            "{:<66} {:<6} {:<14} {:<14} {:<14} {:<3} {:<7}",
-            short(&s.id), s.beacon_id, s.hostname, s.username, s.os, s.is_admin, s.pending
+            "{:<66} {:<6} {:<14} {:<14} {:<14} {:<4} {:<7} {:<3} {:<7}",
+            short(&s.id),
+            s.beacon_id,
+            s.hostname,
+            s.username,
+            s.os,
+            arch_str(s.arch),
+            s.pid,
+            if s.is_admin == 1 { "*" } else { "" },
+            s.pending
         );
     }
     Ok(())

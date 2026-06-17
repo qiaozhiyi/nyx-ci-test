@@ -25,6 +25,18 @@ impl RhaiHook {
     /// Compile `source` (which may define `on_*` handlers and use `nyx_log`).
     pub fn new(name: &str, source: &str) -> Result<Self, Box<EvalAltResult>> {
         let mut engine = Engine::new();
+        // Resource caps: a buggy or hostile operator script runs inline on the
+        // server (the EventBus fires hooks from beacon handlers). Without caps
+        // `loop {}` stalls the request and unbounded string growth OOMs. These
+        // are generous for any real handler but bound the worst case.
+        engine
+            .set_max_call_levels(64) // recursion / call depth
+            .set_max_operations(1_000_000) // ~loop iterations per dispatch
+            .set_max_string_size(64 * 1024) // no unbounded string concatenation
+            .set_max_array_size(4096)
+            .set_max_variables(512)
+            .set_max_functions(64)
+            .set_max_expr_depths(32, 32); // expression / statement nesting
         engine.register_fn("nyx_log", |msg: String| {
             eprintln!("[nyx-rhai] {msg}");
         });

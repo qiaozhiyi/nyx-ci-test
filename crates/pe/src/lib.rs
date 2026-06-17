@@ -13,11 +13,17 @@ const MAGIC_MZ: u16 = 0x5A4D;
 const MAGIC_PE32_PLUS: u16 = 0x020B;
 const SIGNATURE_PE: u32 = 0x00004550; // "PE\0\0"
 
-fn u16le(b: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes([b[o], b[o + 1]])
+/// Bounds-checked little-endian u16 read. Returns None if `o+2` exceeds the
+/// buffer (the caller-derived offset comes from a parsed PE header and must not
+/// be trusted to be in range).
+fn u16le(b: &[u8], o: usize) -> Option<u16> {
+    let s = b.get(o..o + 2)?;
+    Some(u16::from_le_bytes([s[0], s[1]]))
 }
-fn u32le(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+/// Bounds-checked little-endian u32 read.
+fn u32le(b: &[u8], o: usize) -> Option<u32> {
+    let s = b.get(o..o + 4)?;
+    Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
 struct Section {
@@ -27,14 +33,17 @@ struct Section {
 }
 
 /// Resolve an exported function `fn_name` to its RVA within `image`, or `None`.
+///
+/// Every offset derived from a PE header field is bounds-checked before it's
+/// indexed: a malformed/tampered image returns `None` rather than panicking
+/// (panic = "abort" would crash any process that links this crate).
 pub fn resolve_export(image: &[u8], fn_name: &str) -> Option<u32> {
     let nt = nt_headers_off(image)?;
-    let opt_off = nt + 4 + 20; // signature(4) + IMAGE_FILE_HEADER(20)
-    let magic = u16le(image, opt_off);
+    let opt_off = nt.checked_add(4)?.checked_add(20)?; // signature(4) + IMAGE_FILE_HEADER(20)
+    let magic = u16le(image, opt_off)?;
     // DataDirectory starts at optional-header offset 112 (PE32+) or 96 (PE32).
-    let dd_off = opt_off + if magic == MAGIC_PE32_PLUS { 112 } else { 96 };
-    let export_rva = u32le(image, dd_off);
-    let _export_size = u32le(image, dd_off + 4);
+    let dd_off = opt_off.checked_add(if magic == MAGIC_PE32_PLUS { 112 } else { 96 })?;
+    let export_rva = u32le(image, dd_off)?;
     if export_rva == 0 {
         return None;
     }
@@ -42,18 +51,30 @@ pub fn resolve_export(image: &[u8], fn_name: &str) -> Option<u32> {
     let sections = parse_sections(image, nt)?;
     let edir = rva_to_offset(&sections, export_rva)?;
     // IMAGE_EXPORT_DIRECTORY: NumberOfNames@+24, AddressOfFunctions@+28,
-    // AddressOfNames@+32, AddressOfNameOrdinals@+36.
-    let n_names = u32le(image, edir + 24) as usize;
-    let funcs_off = rva_to_offset(&sections, u32le(image, edir + 28))?;
-    let names_off = rva_to_offset(&sections, u32le(image, edir + 32))?;
-    let ords_off = rva_to_offset(&sections, u32le(image, edir + 36))?;
+    // AddressOfNames@+32, AddressOfNameOrdinals@+36. All four reads are
+    // bounds-checked — a truncated directory near EOF returns None, not panic.
+    let n_names = u32le(image, edir.checked_add(24)?)? as usize;
+    // A pathological n_names (up to 4 GiB) makes the loop and the index
+    // arithmetic pointless/expensive; clamp to a sane export count. Real DLLs
+    // export ≤ ~100k functions; 1 MiB is a hard ceiling that rejects garbage.
+    const MAX_EXPORT_NAMES: usize = 1 << 20;
+    if n_names > MAX_EXPORT_NAMES {
+        return None;
+    }
+    let funcs_off = rva_to_offset(&sections, u32le(image, edir.checked_add(28)?)?)?;
+    let names_off = rva_to_offset(&sections, u32le(image, edir.checked_add(32)?)?)?;
+    let ords_off = rva_to_offset(&sections, u32le(image, edir.checked_add(36)?)?)?;
 
     for i in 0..n_names {
-        let name_rva = u32le(image, names_off + i * 4);
+        // names_off + i*4 and ords_off + i*2: checked arithmetic, bounds-checked reads.
+        let name_slot = names_off.checked_add(i.checked_mul(4)?)?;
+        let name_rva = u32le(image, name_slot)?;
         if let Some(name_off) = rva_to_offset(&sections, name_rva) {
             if cstr_at(image, name_off) == fn_name {
-                let ordinal = u16le(image, ords_off + i * 2) as usize;
-                return Some(u32le(image, funcs_off + ordinal * 4));
+                let ord_slot = ords_off.checked_add(i.checked_mul(2)?)?;
+                let ordinal = u16le(image, ord_slot)? as usize;
+                let func_slot = funcs_off.checked_add(ordinal.checked_mul(4)?)?;
+                return u32le(image, func_slot);
             }
         }
     }
@@ -61,30 +82,30 @@ pub fn resolve_export(image: &[u8], fn_name: &str) -> Option<u32> {
 }
 
 fn nt_headers_off(image: &[u8]) -> Option<usize> {
-    if image.len() < 0x40 || u16le(image, 0) != MAGIC_MZ {
+    if image.len() < 0x40 || u16le(image, 0)? != MAGIC_MZ {
         return None;
     }
-    let e_lfanew = u32le(image, 0x3C) as usize;
-    if e_lfanew + 4 > image.len() || u32le(image, e_lfanew) != SIGNATURE_PE {
+    let e_lfanew = u32le(image, 0x3C)? as usize;
+    if e_lfanew.checked_add(4)? > image.len() || u32le(image, e_lfanew)? != SIGNATURE_PE {
         return None;
     }
     Some(e_lfanew)
 }
 
 fn parse_sections(image: &[u8], nt_off: usize) -> Option<Vec<Section>> {
-    let n_sec = u16le(image, nt_off + 4 + 2) as usize; // NumberOfSections
-    let opt_size = u16le(image, nt_off + 4 + 16) as usize; // SizeOfOptionalHeader
-    let sec_off = nt_off + 4 + 20 + opt_size;
+    let n_sec = u16le(image, nt_off.checked_add(4 + 2)?)? as usize; // NumberOfSections
+    let opt_size = u16le(image, nt_off.checked_add(4 + 16)?)? as usize; // SizeOfOptionalHeader
+    let sec_off = nt_off.checked_add(4)?.checked_add(20)?.checked_add(opt_size)?;
     let mut out = Vec::with_capacity(n_sec);
     for i in 0..n_sec {
-        let so = sec_off + i * 40;
-        if so + 40 > image.len() {
+        let so = sec_off.checked_add(i.checked_mul(40)?)?;
+        if so.checked_add(40)? > image.len() {
             break;
         }
         out.push(Section {
-            virtual_size: u32le(image, so + 8),
-            virtual_address: u32le(image, so + 12),
-            raw_ptr: u32le(image, so + 20),
+            virtual_size: u32le(image, so.checked_add(8)?)?,
+            virtual_address: u32le(image, so.checked_add(12)?)?,
+            raw_ptr: u32le(image, so.checked_add(20)?)?,
         });
     }
     Some(out)
@@ -95,13 +116,16 @@ fn rva_to_offset(sections: &[Section], rva: u32) -> Option<usize> {
         let va = s.virtual_address;
         let vsize = if s.virtual_size != 0 { s.virtual_size } else { u32::MAX };
         if rva >= va && rva < va.saturating_add(vsize) {
-            return Some((rva - va + s.raw_ptr) as usize);
+            return Some((rva - va + s.raw_ptr) as usize); // u32 + u32, in range
         }
     }
     None
 }
 
 fn cstr_at(image: &[u8], off: usize) -> &str {
+    if off >= image.len() {
+        return "";
+    }
     let end = image[off..]
         .iter()
         .position(|&b| b == 0)

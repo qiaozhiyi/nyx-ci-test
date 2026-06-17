@@ -412,12 +412,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 fn handle_beacon(st: &AppState, peer: &std::net::SocketAddr, body: &[u8]) -> anyhow::Result<Vec<u8>> {
     // Kill date: once reached, refuse all beacon traffic so a burned server goes
     // dark (checked per-request, not just at boot, so a long-running server
-    // honors it too).
+    // honors it too). Fail CLOSED on a clock error: `unwrap_or(0)` would treat
+    // a pre-epoch / skewed clock as now=0, silently *disabling* the kill date
+    // (0 < kd always passes) — the opposite of safe for a burn-the-server guard.
     if let Some(kd) = st.killdate {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_err(|_| anyhow::anyhow!("clock before UNIX_EPOCH; kill-date check cannot run safely"))?;
         if now >= kd {
             anyhow::bail!("kill date {kd} reached; refusing beacon");
         }
