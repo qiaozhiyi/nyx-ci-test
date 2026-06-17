@@ -154,6 +154,15 @@ impl LiveNtdll {
         Some(Self { module, exports })
     }
 
+    /// Locate ntdll's base address WITHOUT allocating. Cheaper than locate()
+    /// (no export-name Vec) and safe to call before the allocator is validated.
+    /// Returns the raw module base pointer.
+    pub fn locate_base() -> Option<*mut u8> {
+        // SAFETY: PEB walk reads process-global state that is stable post-load.
+        let module = unsafe { find_module_by_hash(djb2(b"ntdll.dll")) }?;
+        Some(module.base)
+    }
+
     /// Raw module handle (for export_rva_by_hash lookups).
     pub fn module(&self) -> Module {
         self.module
@@ -327,7 +336,20 @@ pub struct UnicodeString {
 #[repr(C)]
 pub struct Peb {
     #[allow(dead_code)]
-    pub reserved: [usize; 2],
+    pub inherited_address_space: u8,
+    #[allow(dead_code)]
+    pub read_image_file_exec_options: u8,
+    #[allow(dead_code)]
+    pub being_debugged: u8,
+    #[allow(dead_code)]
+    pub bit_field: u8,
+    #[allow(dead_code)]
+    pub _padding: [u8; 4],
+    #[allow(dead_code)]
+    pub mutant: *mut c_void,
+    #[allow(dead_code)]
+    pub image_base_address: *mut c_void,
+    /// Ldr pointer — at offset 0x18 on x64 (matches the real PEB layout).
     pub ldr: *mut PebLdr,
 }
 
@@ -337,6 +359,9 @@ pub struct PebLdr {
     pub length: u32,
     #[allow(dead_code)]
     pub initialized: u32,
+    #[allow(dead_code)]
+    pub ss_handle: *mut c_void,
+    /// InLoadOrderModuleList — at offset 0x10 in PEB_LDR_DATA (x64).
     pub in_load_order_module_list: ListHead,
 }
 
