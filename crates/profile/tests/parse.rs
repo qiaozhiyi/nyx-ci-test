@@ -160,3 +160,46 @@ fn roundtrip_to_string_preserves_key_fields() {
     .expect("reparse");
     assert_eq!(again.option("useragent"), p.option("useragent"));
 }
+
+#[test]
+fn deeply_nested_profile_is_rejected_not_stack_overflow() {
+    // Regression for the unbounded `items()` recursion: each `{` recursed one
+    // frame deeper with no cap, so a few-hundred-KB profile of nested blocks
+    // blew the stack (SIGSEGV, uncatchable, kills the server/agent under
+    // panic=abort). The parser must reject past a sane depth with a clean
+    // ParseError instead of recursing until the stack dies.
+    let depth = 10_000; // well past any legitimate profile (real ones nest ≤ 5)
+    let mut src = String::new();
+    for _ in 0..depth {
+        src.push_str("a { ");
+    }
+    src.push_str("set uri \"/x\";");
+    for _ in 0..depth {
+        src.push_str(" }");
+    }
+    match parse(&src) {
+        Err(ParseError::Syntax { message, .. }) => {
+            assert!(
+                message.to_lowercase().contains("depth") || message.to_lowercase().contains("nest"),
+                "deeply-nested profile must be rejected with a depth error, got: {message}"
+            );
+        }
+        other => panic!("expected depth-limit error, got {other:?}"),
+    }
+}
+
+#[test]
+fn reasonably_nested_profile_still_parses() {
+    // The depth cap must not reject legitimate (if unusual) nesting. A profile
+    // nesting a dozen deep is absurd for real use but must parse fine.
+    let depth = 32;
+    let mut src = String::new();
+    for _ in 0..depth {
+        src.push_str("a { ");
+    }
+    src.push_str("set uri \"/x\";");
+    for _ in 0..depth {
+        src.push_str(" }");
+    }
+    parse(&src).expect("moderate nesting must parse");
+}

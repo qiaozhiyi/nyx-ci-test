@@ -113,3 +113,64 @@ fn jitter_over_100_is_an_error() {
     let p = parse(src).unwrap();
     assert!(errors(&p).iter().any(|m| m.contains("jitter")), "{:?}", errors(&p));
 }
+
+#[test]
+fn crlf_in_header_value_is_an_error() {
+    // HTTP request/response splitting: a `header "N" "V"` whose value (or name)
+    // contains CR/LF can inject extra headers or smuggle a second request when
+    // the transport reflects it. Must be a hard error.
+    let src = r#"
+        http-get {
+            set uri "/g";
+            client { header "X-Safe" "evil\r\nInjected: yes"; metadata { header "Cookie"; } }
+            server { output { print; } }
+        }
+        http-post { set uri "/p"; client { output { print; } } server { output { print; } } }
+    "#;
+    let p = parse(src).unwrap();
+    assert!(
+        errors(&p)
+            .iter()
+            .any(|m| { let ml = m.to_lowercase(); ml.contains("cr") || ml.contains("lf") || ml.contains("newline") || ml.contains("split") || ml.contains("header") }),
+        "CRLF in header value must be an error: {:?}",
+        errors(&p)
+    );
+}
+
+#[test]
+fn crlf_in_uri_is_an_error() {
+    // A `set uri` carrying CRLF enables request-line splitting when the
+    // transport builds the request line from it.
+    let src = r#"
+        http-get {
+            set uri "/g\r\nGET /admin HTTP/1.1\r\n";
+            client { metadata { header "Cookie"; } } server { output { print; } }
+        }
+        http-post { set uri "/p"; client { output { print; } } server { output { print; } } }
+    "#;
+    let p = parse(src).unwrap();
+    assert!(
+        errors(&p)
+            .iter()
+            .any(|m| { let ml = m.to_lowercase(); ml.contains("cr") || ml.contains("lf") || ml.contains("newline") || ml.contains("split") || ml.contains("uri") }),
+        "CRLF in uri must be an error: {:?}",
+        errors(&p)
+    );
+}
+
+#[test]
+fn crlf_in_header_name_is_an_error() {
+    let src = r#"
+        http-get {
+            set uri "/g";
+            client { header "X-Injec\r\nted" "value"; metadata { header "Cookie"; } } server { output { print; } }
+        }
+        http-post { set uri "/p"; client { output { print; } } server { output { print; } } }
+    "#;
+    let p = parse(src).unwrap();
+    assert!(
+        !errors(&p).is_empty(),
+        "CRLF in header name must be an error: {:?}",
+        errors(&p)
+    );
+}

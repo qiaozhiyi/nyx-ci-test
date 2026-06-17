@@ -20,6 +20,14 @@ pub enum ParseError {
     Syntax { line: u32, message: String },
 }
 
+/// Maximum block-nesting depth. Real Malleable C2 profiles nest ≤ 5 deep
+/// (http-get → client/server → metadata/output → transform statements). The
+/// cap exists to stop an unbounded `items()` recursion from blowing the stack
+/// on a hostile profile (a few-hundred-KB profile of nested blocks → SIGSEGV,
+/// uncatchable, kills the process under panic=abort). 64 is far above any
+/// legitimate profile but well below the default 8 MiB thread stack.
+const MAX_DEPTH: u32 = 64;
+
 /// Parse a profile from source text.
 pub fn parse(src: &str) -> Result<Profile, ParseError> {
     let toks = tokenize(src).map_err(|e| ParseError::Syntax {
@@ -39,7 +47,7 @@ pub fn parse(src: &str) -> Result<Profile, ParseError> {
                 options.push(Setting { key, value, line });
             }
             Tok::Word(_) => {
-                blocks.push(p.block()?);
+                blocks.push(p.block(0)?);
             }
             other => {
                 return Err(ParseError::Syntax {
@@ -115,15 +123,16 @@ impl Parser {
         }
     }
 
-    /// Parse `name [variant] { items }`.
-    fn block(&mut self) -> Result<Block, ParseError> {
+    /// Parse `name [variant] { items }`. `depth` is the current nesting depth
+    /// (0 at top-level blocks); each nested block increments it.
+    fn block(&mut self, depth: u32) -> Result<Block, ParseError> {
         let (name, line) = self.word()?;
         let variant = match self.peek() {
             Some(Tok::Str(_)) => Some(self.value()?),
             _ => None,
         };
         self.eat(&Tok::LBrace)?;
-        let items = self.items()?;
+        let items = self.items(depth)?;
         self.eat(&Tok::RBrace)?;
         Ok(Block {
             name,
@@ -133,8 +142,10 @@ impl Parser {
         })
     }
 
-    /// Parse block items until the matching `}`.
-    fn items(&mut self) -> Result<Vec<Item>, ParseError> {
+    /// Parse block items until the matching `}`. `depth` is the nesting depth of
+    /// the enclosing block; a nested block increments it and rejects past
+    /// [`MAX_DEPTH`] so a hostile profile can't overflow the stack.
+    fn items(&mut self, depth: u32) -> Result<Vec<Item>, ParseError> {
         let mut out = Vec::new();
         loop {
             let (is_rbrace, line) = match self.peek_tok() {
@@ -162,8 +173,24 @@ impl Parser {
                     let (kw, kwline) = self.word()?;
                     match self.peek() {
                         Some(Tok::LBrace) => {
+                            // Depth cap: reject before recursing so a profile
+                            // of N nested blocks can't grow the stack by N frames.
+                            let nested = depth
+                                .checked_add(1)
+                                .ok_or_else(|| ParseError::Syntax {
+                                    line: kwline,
+                                    message: "block nesting depth overflowed u32".into(),
+                                })?;
+                            if nested > MAX_DEPTH {
+                                return Err(ParseError::Syntax {
+                                    line: kwline,
+                                    message: format!(
+                                        "block nesting depth {nested} exceeds limit {MAX_DEPTH}"
+                                    ),
+                                });
+                            }
                             self.eat(&Tok::LBrace)?;
-                            let inner = self.items()?;
+                            let inner = self.items(nested)?;
                             self.eat(&Tok::RBrace)?;
                             out.push(Item::Block(Block {
                                 name: kw,

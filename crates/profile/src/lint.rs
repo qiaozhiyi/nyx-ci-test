@@ -53,6 +53,11 @@ pub fn lint(p: &Profile) -> Vec<Diagnostic> {
                 if !s.starts_with('/') {
                     d.push(warn(b.line, format!("{name}: uri {s:?} should start with '/'")));
                 }
+                // CRLF in the request URI enables request-line splitting when
+                // the transport builds the HTTP request line from this value.
+                if has_crlf(s) {
+                    d.push(err(b.line, format!("{name}: uri contains CR/LF (HTTP request-splitting risk)")));
+                }
             }
         }
         if let Some(v) = b.get("verb") {
@@ -64,6 +69,11 @@ pub fn lint(p: &Profile) -> Vec<Diagnostic> {
         for side in ["client", "server"] {
             if let Some(sb) = b.sub(side) {
                 check_data_blocks(sb, &mut d);
+                // Recursively reject CR/LF in any `header`/`parameter`/
+                // `uri-append` statement args anywhere under this side — those
+                // bytes ride on the wire (headers / query / URL) where a stray
+                // CR or LF splits the HTTP message.
+                check_no_crlf_in_wire_stmts(sb, &mut d);
             }
         }
     }
@@ -132,6 +142,41 @@ fn check_data_blocks(side: &crate::ast::Block, d: &mut Vec<Diagnostic>) {
             d.push(warn(db.line, format!("`{}` block has {terms} terminators (expected exactly 1)", db.name)));
         }
     }
+}
+
+/// Does `s` contain a CR or LF byte? Those are the request-splitting characters
+/// for HTTP (a bare CR or LF, or CRLF, can terminate a header/request line in
+/// many parsers and frontends).
+fn has_crlf(s: impl AsRef<str>) -> bool {
+    let s = s.as_ref();
+    s.contains('\r') || s.contains('\n')
+}
+
+/// Walk a block tree and reject CR/LF in any statement whose args end up on the
+/// HTTP wire as headers (`header`), query parameters (`parameter`), or URL
+/// suffix (`uri-append`). A CR/LF there splits the HTTP message — header
+/// injection / request smuggling. Recurses into nested blocks.
+fn check_no_crlf_in_wire_stmts(block: &crate::ast::Block, d: &mut Vec<Diagnostic>) {
+    /// Statements whose string args are reflected into HTTP headers / the
+    /// request line / the query string and therefore must not contain CR/LF.
+    const WIRE_STMTS: &[&str] = &["header", "parameter", "uri-append"];
+    fn walk(b: &crate::ast::Block, d: &mut Vec<Diagnostic>) {
+        for item in &b.items {
+            if let Item::Stmt { keyword, args, line } = item {
+                if WIRE_STMTS.contains(&keyword.as_str()) {
+                    for arg in args {
+                        if has_crlf(arg.as_str()) {
+                            d.push(err(*line, format!("`{}` statement arg contains CR/LF (HTTP header/request splitting risk)", keyword)));
+                        }
+                    }
+                }
+            }
+            if let Item::Block(inner) = item {
+                walk(inner, d);
+            }
+        }
+    }
+    walk(block, d);
 }
 
 fn err(line: u32, msg: impl Into<String>) -> Diagnostic {
