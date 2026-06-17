@@ -163,7 +163,7 @@ pub unsafe fn post_frame(host: &[u8], port: u16, path: &[u8], body: &[u8]) -> Op
         if (fns.query_data)(req, &mut avail) == 0 || avail == 0 {
             break;
         }
-        let mut chunk = vec![0u8; avail as usize];
+        let capped = avail.min(1 << 20) as usize; let mut chunk = vec![0u8; capped];
         let mut read: u32 = 0;
         if (fns.read_data)(req, chunk.as_mut_ptr(), avail, &mut read) == 0 || read == 0 {
             break;
