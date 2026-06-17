@@ -18,12 +18,14 @@
 //! `c2lint` binary stays tiny.
 
 pub mod ast;
+pub mod envelope;
 pub mod lexer;
 pub mod lint;
 pub mod parser;
 pub mod transform;
 
 pub use ast::{Block, Item, Profile, Setting, Str};
+pub use envelope::{get_server_envelope, post_server_envelope, ServerEnvelope};
 pub use lexer::LexError;
 pub use lint::{lint, Diagnostic, Severity};
 pub use parser::{parse, ParseError};

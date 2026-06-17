@@ -17,7 +17,11 @@ async fn checkin_then_shell_task_roundtrips() {
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{addr}");
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -30,6 +34,7 @@ async fn checkin_then_shell_task_roundtrips() {
         jitter_pct: 0,
         work_dir: work.path().to_path_buf(),
         beacon_uri: "/beacon".into(),
+        profile: None,
     };
     let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
 
@@ -104,7 +109,11 @@ async fn upload_then_download_roundtrips() {
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{addr}");
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -118,6 +127,7 @@ async fn upload_then_download_roundtrips() {
         jitter_pct: 0,
         work_dir: work.path().to_path_buf(),
         beacon_uri: "/beacon".into(),
+        profile: None,
     };
     let work_path = work.path().to_path_buf();
     let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
@@ -229,8 +239,9 @@ async fn malleable_beacon_uri_roundtrips() {
     let path = dir.path().join("custom.profile");
     std::fs::write(&path, profile_src).unwrap();
 
+    let profile = nyx_server::load_profile(&path).expect("profile must load+lint");
     let state = AppState {
-        profile: Some(nyx_server::load_profile(&path).expect("profile must load+lint")),
+        profile: Some(profile.clone()),
         ..AppState::default()
     };
     let server_pub = state.keypair.public_bytes();
@@ -240,7 +251,11 @@ async fn malleable_beacon_uri_roundtrips() {
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{addr}");
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -253,6 +268,8 @@ async fn malleable_beacon_uri_roundtrips() {
         work_dir: work.path().to_path_buf(),
         // The profile's http-post URI — NOT /beacon.
         beacon_uri: "/api/v1/Telemetry".into(),
+        // The agent gets the same profile so it can invert the server envelope.
+        profile: Some(profile),
     };
     let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
 
@@ -314,7 +331,11 @@ async fn api_token_guards_control_api() {
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{addr}");
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -350,7 +371,11 @@ async fn scripting_events_fire_on_beacon_cycle() {
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{addr}");
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -362,6 +387,7 @@ async fn scripting_events_fire_on_beacon_cycle() {
         jitter_pct: 0,
         work_dir: work.path().to_path_buf(),
         beacon_uri: "/beacon".into(),
+        profile: None,
     };
     let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
 
@@ -450,7 +476,11 @@ async fn profile_endpoint_exposes_loaded_profile() {
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{addr}");
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -463,6 +493,110 @@ async fn profile_endpoint_exposes_loaded_profile() {
     assert_eq!(v["http_get_uri"], "/api/v1/Updates");
     assert_eq!(v["http_post_uri"], "/api/v1/Telemetry");
     assert_eq!(v["useragent"], "Mozilla/5.0 NyxBrowser");
+}
+
+/// M0 profile-envelope round-trip: the server applies a transform chain
+/// (base64 + prepend + append) to http-post responses, and the agent — given
+/// the same profile — inverts it to recover the encrypted frame. This proves
+/// the Malleable C2 envelope is actually wired into the beacon loop (not just
+/// parsed). A raw-frame agent would fail to decrypt here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn profile_output_transform_envelope_roundtrips() {
+    // The server wraps its http-post response: base64 the frame, then prepend a
+    // JFIF-ish header and append a footer. The agent must undo all three.
+    let profile_src = r#"http-get { set uri "/api/v1/Updates"; client { metadata { header "Cookie"; } } server { output { print; } } }
+        http-post {
+            set uri "/api/v1/Telemetry";
+            client { output { print; } }
+            server {
+                output {
+                    base64;
+                    prepend "\xff\xd8\xff\xe0";
+                    append "\xff\xd9";
+                    print;
+                }
+                header "Content-Type" "image/jpeg";
+            }
+        }"#;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("env.profile");
+    std::fs::write(&path, profile_src).unwrap();
+
+    let profile = nyx_server::load_profile(&path).expect("profile must load+lint");
+    let state = AppState {
+        profile: Some(profile.clone()),
+        ..AppState::default()
+    };
+    let server_pub = state.keypair.public_bytes();
+    let app = router(Arc::new(state));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let work = tempfile::tempdir().expect("tempdir");
+    let cfg = nyx_agent_dev::Config {
+        server_url: url.clone(),
+        server_pub,
+        sleep_seconds: 1,
+        jitter_pct: 0,
+        work_dir: work.path().to_path_buf(),
+        beacon_uri: "/api/v1/Telemetry".into(),
+        profile: Some(profile),
+    };
+    let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
+
+    // Check-in over the envelope-shaped transaction must succeed.
+    let session = poll_until(Duration::from_secs(10), || async {
+        let list: serde_json::Value =
+            ureq::get(format!("{url}/api/sessions").as_str()).call().ok()?.into_json().ok()?;
+        list.as_array()?.first()?["id"].as_str().map(|s| s.to_string())
+    })
+    .await
+    .expect("agent never checked in through the transform envelope");
+
+    // A shell task must round-trip: server envelopes the response, agent unwraps.
+    let body = serde_json::json!({
+        "session": session,
+        "command": { "type": "shell", "args": "echo envelope-ok" },
+    });
+    let ack: serde_json::Value = ureq::post(format!("{url}/api/task").as_str())
+        .send_json(body)
+        .expect("enqueue shell")
+        .into_json()
+        .expect("shell ack");
+    let task_id = ack["task_id"].as_u64().expect("task_id");
+    let out = poll_until(Duration::from_secs(10), || async {
+        let rs: serde_json::Value = ureq::get(format!("{url}/api/results").as_str())
+            .query("session", &session)
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
+        rs.as_array()?.iter().find_map(|r| {
+            if r["task_id"] == task_id && r["kind"] == "output" {
+                r["text"].as_str().map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+    })
+    .await
+    .expect("no shell output through the transform envelope");
+    assert!(out.contains("envelope-ok"), "unexpected output: {out:?}");
+
+    let exit = serde_json::json!({ "session": session, "command": { "type": "exit" } });
+    let _ = ureq::post(format!("{url}/api/task").as_str()).send_json(exit);
+    let join = tokio::task::spawn_blocking(move || agent.join());
+    let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
 }
 
 /// Poll an async closure at ~5 Hz until it returns Some or the budget elapses.

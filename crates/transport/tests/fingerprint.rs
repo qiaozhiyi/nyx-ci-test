@@ -121,6 +121,47 @@ fn parses_a_real_clienthello_record() {
 }
 
 #[test]
+fn sniffs_client_hello_from_stream_and_returns_fingerprints() {
+    use nyx_transport::sniff_client_hello;
+    // Build the same synthetic ClientHello record as above.
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]);
+    body.extend_from_slice(&[0u8; 32]);
+    body.push(0);
+    body.extend_from_slice(&[0x00, 0x02, 0x00, 0xff]);
+    body.push(1);
+    body.push(0x00);
+    let name = b"a.com";
+    let mut ext = Vec::new();
+    let list_len = 1 + 2 + name.len() as u16;
+    ext.extend_from_slice(&list_len.to_be_bytes());
+    ext.push(0);
+    ext.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    ext.extend_from_slice(name);
+    body.extend_from_slice(&((ext.len() + 4) as u16).to_be_bytes());
+    body.extend_from_slice(&[0x00, 0x00]);
+    body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+    body.extend_from_slice(&ext);
+    let hlen = body.len();
+    let mut hs = vec![0x01, (hlen >> 16) as u8, ((hlen >> 8) & 0xff) as u8, (hlen & 0xff) as u8];
+    hs.extend_from_slice(&body);
+    let mut rec = vec![0x16, 0x03, 0x01, ((hs.len() >> 8) & 0xff) as u8, (hs.len() & 0xff) as u8];
+    rec.extend_from_slice(&hs);
+
+    // Sniff from a cursor over the record bytes.
+    let (replayed, ja3, ja4) = sniff_client_hello(std::io::Cursor::new(&rec)).unwrap();
+    assert_eq!(replayed, rec, "sniff must return the full record for replay");
+    assert!(ja3.is_some(), "JA3 must be computed");
+    assert!(ja4.is_some(), "JA4 must be computed");
+    // Sanity: the JA3 must be a 32-hex MD5.
+    assert_eq!(ja3.unwrap().len(), 32);
+
+    // A non-TLS first byte yields no fingerprints.
+    let (_, j3, j4) = sniff_client_hello(std::io::Cursor::new(&[0x47u8, 0, 0, 0, 0])).unwrap();
+    assert!(j3.is_none() && j4.is_none());
+}
+
+#[test]
 fn parses_http2_settings_and_window_update() {
     // Connection preface + SETTINGS(1:65536; 4:6291456) + WINDOW_UPDATE(15663105).
     let mut raw = Vec::new();

@@ -54,6 +54,17 @@ axum = "0.7"
 dashmap = "6"
 hex = "0.4"
 ureq = { version = "2", features = ["json"] }
+# TLS — rustls with the pure-Rust `ring` crypto provider (no C deps). Used by
+# the team server's optional HTTPS listener (NYX_TLS). `rcgen` generates a
+# self-signed cert for dev; `rustls-pemfile` parses operator-supplied PEM.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+rcgen = "0.13"
+# hyper 1.x server plumbing (axum 0.7 is hyper-1 based). `auto::Builder` serves
+# the TLS stream as either http1 or http2 transparently.
+hyper = { version = "1", features = ["http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1"
