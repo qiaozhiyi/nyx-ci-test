@@ -125,3 +125,68 @@ fn apply_fails_on_unresolved_external() {
         "unresolved extern must surface as Unresolved, got {err:?}"
     );
 }
+
+// ---- malformed-input hardening (panic = "abort" makes every panic a crash) ----
+
+/// Helper: take the real fixture and overwrite the `.text` section's
+/// (raw_ptr, raw_size) so the declared raw window runs past EOF. Before the
+/// fix this silently produced an empty `.text` (`unwrap_or(&[])`); after, it
+/// must return Truncated so a malformed/weaponized BOF can't slip through with
+/// garbage section contents.
+fn fixture_with_text_raw_overrunning_eof() -> Vec<u8> {
+    let mut buf = FIXTURE.to_vec();
+    let coff = parse(FIXTURE).unwrap();
+    let nsec = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+    let opt_hdr = u16::from_le_bytes([buf[16], buf[17]]) as usize;
+    let sec_off = 20 + opt_hdr;
+    // Find the .text section's entry in the section table and inflate its
+    // raw_size so raw_ptr + raw_size > buf.len().
+    for i in 0..nsec {
+        let so = sec_off + i * 40;
+        let name = &buf[so..so + 8];
+        if name.starts_with(b".text") {
+            // raw_size is at section-offset + 16 (u32 LE). Set it huge.
+            let huge = (buf.len() as u32).saturating_add(0x0010_0000);
+            buf[so + 16..so + 20].copy_from_slice(&huge.to_le_bytes());
+            return buf;
+        }
+    }
+    panic!("fixture has no .text section to corrupt");
+}
+
+#[test]
+fn section_raw_window_overrunning_eof_is_rejected() {
+    let bad = fixture_with_text_raw_overrunning_eof();
+    let err = parse(&bad).unwrap_err();
+    assert!(
+        matches!(err, nyx_coff::CoffError::Truncated),
+        "a section whose declared raw window exceeds EOF must be Truncated, got {err:?}"
+    );
+    // The clean fixture still parses (sanity).
+    parse(FIXTURE).expect("clean fixture must still parse");
+}
+
+#[test]
+fn absurd_symbol_count_is_rejected_not_wrapped() {
+    // A COFF header claiming nsym = 0xFFFFFFFF would make `nsym * 18` wrap on
+    // 32-bit (and is just nonsensical on 64-bit). The str_off computation must
+    // detect the overflow / absurdity and reject, not silently wrap str_off to
+    // a small value that aliases section data.
+    let mut buf = FIXTURE.to_vec();
+    // nsym (NumberOfSymbols) is a u32 at file offset 12.
+    buf[12..16].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    let err = parse(&buf).unwrap_err();
+    assert!(
+        matches!(err, nyx_coff::CoffError::Truncated),
+        "absurd nsym must be Truncated, got {err:?}"
+    );
+}
+
+#[test]
+fn truncated_section_table_is_rejected() {
+    // A COFF whose header claims more sections than the body can hold.
+    let mut buf = FIXTURE.to_vec();
+    buf[2..4].copy_from_slice(&0x7FFFu16.to_le_bytes()); // 32767 sections
+    let err = parse(&buf).unwrap_err();
+    assert!(matches!(err, nyx_coff::CoffError::Truncated), "got {err:?}");
+}

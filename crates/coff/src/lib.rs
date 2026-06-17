@@ -121,19 +121,37 @@ pub fn parse<'a>(data: &'a [u8]) -> Result<Coff<'a>, CoffError> {
     let sym_ptr = u32le(data, 8) as usize;
     let nsym = u32le(data, 12) as usize;
     let opt_hdr = u16le(data, 16) as usize;
-    let sec_off = 20 + opt_hdr;
-    if data.len() < sec_off + nsec * 40 {
+    // All offset arithmetic uses checked_add/checked_mul: a malformed COFF can
+    // set nsec/nsym/raw_ptr/raw_size to drive `usize` past MAX and wrap to a
+    // small in-range value, defeating the length guards. The server/agent run
+    // under panic = "abort", so a wrapping-then-slice would crash the process.
+    let sec_off = opt_hdr.checked_add(20).ok_or(CoffError::Truncated)?;
+    let sec_table_end = sec_off
+        .checked_add(nsec.checked_mul(40).ok_or(CoffError::Truncated)?)
+        .ok_or(CoffError::Truncated)?;
+    if data.len() < sec_table_end {
+        return Err(CoffError::Truncated);
+    }
+    // Reject an absurd symbol count up front: nsym * 18 must fit and the
+    // declared symbol table must actually live within the file. A huge nsym
+    // (e.g. 0xFFFFFFFF) used to wrap `nsym * 18` and point str_off at section
+    // data; now it's a clean Truncated.
+    let sym_size = nsym.checked_mul(18).ok_or(CoffError::Truncated)?;
+    let sym_end = sym_ptr.checked_add(sym_size).ok_or(CoffError::Truncated)?;
+    if sym_end > data.len() {
         return Err(CoffError::Truncated);
     }
 
     // String table sits immediately after the symbol table.
-    let str_off = sym_ptr.checked_add(nsym * 18).unwrap_or(0);
-    let str_table: &[u8] = data.get(str_off..).unwrap_or(&[]);
+    let str_table: &[u8] = data.get(sym_end..).unwrap_or(&[]);
 
     // Sections.
     let mut sections = Vec::with_capacity(nsec);
     for i in 0..nsec {
-        let so = sec_off + i * 40;
+        let so = sec_off
+            .checked_add(i.checked_mul(40).ok_or(CoffError::Truncated)?)
+            .ok_or(CoffError::Truncated)?;
+        // so..so+40 is guaranteed in range by the sec_table_end check above.
         let name = sec_name(&data[so..so + 8], str_table);
         let virtual_size = u32le(data, so + 8);
         let virtual_address = u32le(data, so + 12);
@@ -142,19 +160,35 @@ pub fn parse<'a>(data: &'a [u8]) -> Result<Coff<'a>, CoffError> {
         let reloc_ptr = u32le(data, so + 24) as usize;
         let nreloc = u16le(data, so + 32) as usize;
         let characteristics = u32le(data, so + 36);
-        let raw = data
-            .get(raw_ptr..raw_ptr + raw_size)
-            .unwrap_or(&[]);
+        // STRICT raw window: reject (don't silently truncate to &[]) when the
+        // declared (raw_ptr, raw_size) doesn't fit in the file. A silently-empty
+        // .text would let apply() relocate against zero bytes and a crafted
+        // window could alias header bytes — either way a malformed BOF must be
+        // rejected, not accepted with garbage contents.
+        let raw_end = raw_ptr
+            .checked_add(raw_size)
+            .ok_or(CoffError::Truncated)?;
+        let raw = if raw_ptr == 0 && raw_size == 0 {
+            // BSS-like sections legitimately have no raw bytes.
+            &[]
+        } else if raw_end <= data.len() {
+            &data[raw_ptr..raw_end]
+        } else {
+            return Err(CoffError::Truncated);
+        };
         let mut relocations = Vec::with_capacity(nreloc);
         for r in 0..nreloc {
-            let ro = reloc_ptr + r * 10;
-            if let Some(window) = data.get(ro..ro + 10) {
-                relocations.push(Reloc {
-                    offset: u32le(window, 0),
-                    symbol_index: u32le(window, 4),
-                    typ: u16le(window, 8),
-                });
-            }
+            let ro = reloc_ptr
+                .checked_add(r.checked_mul(10).ok_or(CoffError::Truncated)?)
+                .ok_or(CoffError::Truncated)?;
+            let Some(window) = data.get(ro..ro + 10) else {
+                return Err(CoffError::Truncated);
+            };
+            relocations.push(Reloc {
+                offset: u32le(window, 0),
+                symbol_index: u32le(window, 4),
+                typ: u16le(window, 8),
+            });
         }
         sections.push(Section {
             name,
@@ -170,8 +204,11 @@ pub fn parse<'a>(data: &'a [u8]) -> Result<Coff<'a>, CoffError> {
     let mut symbols = Vec::new();
     let mut i = 0;
     while i < nsym {
-        let so = sym_ptr + i * 18;
-        let Some(window) = data.get(so..so + 18) else { break };
+        let so = sym_ptr
+            .checked_add(i.checked_mul(18).ok_or(CoffError::Truncated)?)
+            .ok_or(CoffError::Truncated)?;
+        // so..so+18 is within [sym_ptr, sym_end) which we validated <= len.
+        let window = &data[so..so + 18];
         let name = sym_name(&window[0..8], str_table);
         let value = u32le(window, 8);
         let section_number = i16le(window, 12);
@@ -184,7 +221,10 @@ pub fn parse<'a>(data: &'a [u8]) -> Result<Coff<'a>, CoffError> {
             section_number,
             storage_class,
         });
-        i += 1 + aux as usize;
+        i = i
+            .checked_add(1)
+            .and_then(|x| x.checked_add(aux as usize))
+            .ok_or(CoffError::Truncated)?;
     }
 
     Ok(Coff {
