@@ -13,6 +13,7 @@ members = [
     "crates/coff",
     "crates/transport",
     "crates/bof-runner",
+    "crates/client",
 ]
 
 [workspace.package]
