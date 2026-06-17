@@ -372,11 +372,23 @@ fn body_bytes(b: Vec<u8>) -> axum::body::Body {
 }
 
 /// Constant-time byte comparison to avoid timing oracles on secrets.
+/// Constant-time byte comparison that does NOT short-circuit on length.
+///
+/// A naive `if a.len() != b.len() { return false }` leaks the expected
+/// (secret) length as a timing distinguisher — for an operator API token that
+/// gates tasking on every beacon, that's a real side channel. Instead we scan
+/// every byte of the shorter input and fold a length-mismatch flag into the
+/// same accumulator, so the work depends only on `min(a.len(), b.len())` and
+/// never on where (or whether) the buffers first differ.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
+    // Fold a length-mismatch flag into the accumulator without branching on it:
+    // `same_len` is 0 iff lengths are exactly equal (works for any usize, not
+    // just the low byte). OR-ing it into `diff` each iteration means a length
+    // mismatch makes the result false regardless of byte content, while the
+    // loop still scans every byte of the shorter input (work depends only on
+    // min(len), never on where the buffers first differ).
+    let same_len = (a.len() == b.len()) as u8; // 1 if equal, 0 if not
+    let mut diff = same_len ^ 1; // 0 if equal-length, 1 if not
     for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;
     }
@@ -643,6 +655,14 @@ struct TaskAck {
 }
 
 fn parse_session_hex(s: &str) -> Option<SessionId> {
+    // Reject by length BEFORE decoding: a session id is exactly 32 bytes = 64
+    // hex chars. hex::decode allocates s.len()/2 bytes upfront, so decoding an
+    // arbitrary-length operator/client string first is an allocation bomb
+    // (a 4 MB hex string → a 2 MB transient allocation before the length check
+    // rejects it).
+    if s.len() != 64 {
+        return None;
+    }
     let v = hex::decode(s).ok()?;
     <[u8; 32]>::try_from(v.as_slice()).ok()
 }
@@ -896,5 +916,65 @@ mod tests {
             load_script(&bad).is_err(),
             "a syntactically broken script must be rejected"
         );
+    }
+
+    #[test]
+    fn parse_session_hex_rejects_wrong_length_without_allocating() {
+        // A session id is exactly 32 bytes = 64 hex chars. The parser must
+        // reject any other length WITHOUT first calling hex::decode on the whole
+        // string (which would allocate s.len()/2 bytes — an allocation bomb when
+        // an operator/client sends a multi-MB hex string). Pin: wrong lengths
+        // return None, and a gigantic string doesn't blow up.
+        // 64 valid hex chars → 32 bytes → Some.
+        let valid = "00".repeat(32);
+        assert!(parse_session_hex(&valid).is_some());
+        // Odd length, too short, too long, empty, non-hex — all None.
+        assert!(parse_session_hex("00").is_none());
+        assert!(parse_session_hex(&"0".repeat(63)).is_none());
+        assert!(parse_session_hex(&"0".repeat(65)).is_none());
+        assert!(parse_session_hex("").is_none());
+        assert!(parse_session_hex(&"z".repeat(64)).is_none());
+        // The allocation-bomb regression: a 4 MB hex string must NOT cause a
+        // ~2 MB allocation before being rejected. We can't directly measure the
+        // alloc, but if parse_session_hex short-circuits on length first, this
+        // is essentially free; if it decodes first, it's a 2 MB transient.
+        let huge = "ab".repeat(2 * 1024 * 1024); // 4 MB string, wrong length anyway
+        assert!(parse_session_hex(&huge).is_none());
+        // And a length-64-but-non-hex string is rejected by decode, not length.
+        assert!(parse_session_hex(&'z'.to_string().repeat(64)).is_none());
+    }
+
+    #[test]
+    fn constant_time_eq_handles_length_mismatch_and_content_diffs() {
+        // A timing-constant compare can't be proven by a black-box test, but we
+        // CAN pin the correctness contract that must hold for the length-tolerant
+        // implementation: it must return the right answer for length-mismatched
+        // inputs (no short-circuit returning a wrong `true`) and for every
+        // single-byte difference. The actual constant-time guarantee is upheld
+        // by the implementation scanning min(len) bytes and OR-ing in a length
+        // flag — reviewed, not tested.
+        let eq = |a: &[u8], b: &[u8]| constant_time_eq(a, b);
+        // equal
+        assert!(eq(b"secret-token", b"secret-token"));
+        assert!(eq(b"", b""));
+        // length mismatch — must be false even with a matching prefix
+        assert!(!eq(b"abc", b"abcd"));
+        assert!(!eq(b"abcd", b"abc"));
+        assert!(!eq(b"", b"x"));
+        assert!(!eq(b"x", b""));
+        // length difference > 255 must NOT collide with equal-length via a
+        // truncated low-byte length check (regression for an earlier impl that
+        // did `(a.len() ^ b.len()) as u8`, where 256 xor 0 → 0).
+        assert!(!eq(&vec![0u8; 256], &vec![0u8; 0]));
+        assert!(!eq(&vec![0u8; 512], &vec![0u8; 256]));
+        // same length, every single-byte difference must be detected
+        for i in 0..32u8 {
+            let mut a = vec![0u8; 32];
+            let mut b = vec![0u8; 32];
+            a[i as usize] = 1;
+            assert!(!eq(&a, &b), "diff at byte {i} must compare unequal");
+            b[i as usize] = 1;
+            assert!(eq(&a, &b), "re-equalized at byte {i} must compare equal");
+        }
     }
 }

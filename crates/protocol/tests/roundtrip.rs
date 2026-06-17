@@ -249,6 +249,35 @@ fn nonce_directions_never_collide() {
 }
 
 #[test]
+fn decode_vec_rejects_absurd_count_without_huge_alloc() {
+    // Allocation-bomb regression: decode_vec read a u32 count and called
+    // Vec::with_capacity(n) before reading any elements. A decrypted (auth'd)
+    // beacon body carrying n = 0xFFFFFFFF would force a ~4 GiB reservation on
+    // the server under panic=abort. The count must be rejected when it exceeds
+    // a sane cap, and the reservation must never exceed the remaining bytes
+    // (you can't have more elements than bytes left).
+    let mut w = wire::Writer::new();
+    w.u32(0xFFFF_FFFF); // absurd count
+    let buf = w.into_bytes();
+    let err = msg::Task::decode_vec(&buf).unwrap_err();
+    assert!(
+        matches!(err, wire::WireError::BadLen(_)),
+        "absurd count must be BadLen, got {err:?}"
+    );
+    // Same for TaskResponse.
+    let err = msg::TaskResponse::decode_vec(&buf).unwrap_err();
+    assert!(matches!(err, wire::WireError::BadLen(_)));
+
+    // A count larger than remaining bytes (but < the hard cap) must fail with
+    // Eof when the loop overruns — not over-allocate. 1 task declared, 0 bytes
+    // of task data follow.
+    let mut w = wire::Writer::new();
+    w.u32(1);
+    let err = msg::Task::decode_vec(&w.into_bytes()).unwrap_err();
+    assert!(matches!(err, wire::WireError::Eof), "got {err:?}");
+}
+
+#[test]
 fn channel_response_variants_roundtrip() {
     let responses = vec![
         msg::TaskResponse {

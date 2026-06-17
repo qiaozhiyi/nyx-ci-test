@@ -4,6 +4,27 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use crate::wire::{Reader, WireError, Writer};
 
+/// Upper bound on any length-prefixed batch (tasks, responses, BOF args).
+/// Real batches are tiny (a handful of items per beacon cycle); anything past
+/// this is malformed or an allocation-bomb attempt. Defense-in-depth against a
+/// malicious/compromised implant whose decrypted body could otherwise drive a
+/// `Vec::with_capacity(u32::MAX)` on the server.
+const MAX_BATCH: usize = 65_536;
+
+/// Validate a length-prefixed element count read off the wire. Returns the
+/// count to allocate for, capped at the remaining input (a hard upper bound:
+/// you can't have more elements than unread bytes, since each element is at
+/// least one byte) and at [`MAX_BATCH`]. Errors with [`WireError::BadLen`] on
+/// an absurd declared count so the caller never calls `Vec::with_capacity` with
+/// an attacker-influenced u32.
+fn checked_count(r: &mut Reader, declared: u32) -> Result<usize, WireError> {
+    if declared as usize > MAX_BATCH {
+        return Err(WireError::BadLen(declared as usize));
+    }
+    // Reserve only what could plausibly be read — never more than remaining.
+    Ok((declared as usize).min(r.remaining()))
+}
+
 /// Initial check-in metadata an implant sends on first contact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
@@ -155,8 +176,10 @@ impl Command {
             6 => Command::Exit,
             7 => {
                 let name = r.str()?;
-                let n = r.u32()? as usize;
-                let mut args = Vec::with_capacity(n);
+                let n_raw = r.u32()?;
+                let cap = checked_count(r, n_raw)?;
+                let n = n_raw as usize;
+                let mut args = Vec::with_capacity(cap);
                 for _ in 0..n {
                     args.push(r.str()?);
                 }
@@ -295,8 +318,10 @@ impl Task {
 
     pub fn decode_vec(data: &[u8]) -> Result<Vec<Task>, WireError> {
         let mut r = Reader::new(data);
-        let n = r.u32()? as usize;
-        let mut out = Vec::with_capacity(n);
+        let n_raw = r.u32()?;
+        let cap = checked_count(&mut r, n_raw)?;
+        let n = n_raw as usize;
+        let mut out = Vec::with_capacity(cap);
         for _ in 0..n {
             out.push(Task::decode(&mut r)?);
         }
@@ -334,8 +359,10 @@ impl TaskResponse {
 
     pub fn decode_vec(data: &[u8]) -> Result<Vec<TaskResponse>, WireError> {
         let mut r = Reader::new(data);
-        let n = r.u32()? as usize;
-        let mut out = Vec::with_capacity(n);
+        let n_raw = r.u32()?;
+        let cap = checked_count(&mut r, n_raw)?;
+        let n = n_raw as usize;
+        let mut out = Vec::with_capacity(cap);
         for _ in 0..n {
             out.push(TaskResponse::decode(&mut r)?);
         }
