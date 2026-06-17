@@ -163,12 +163,21 @@ pub unsafe fn post_frame(host: &[u8], port: u16, path: &[u8], body: &[u8]) -> Op
         if (fns.query_data)(req, &mut avail) == 0 || avail == 0 {
             break;
         }
-        let capped = avail.min(1 << 20) as usize; let mut chunk = vec![0u8; capped];
+        // Cap the per-read buffer (and the bytes we ask WinHTTP to fill) at
+        // 1 MiB. CRITICAL: dwNumberOfBytesToRead MUST be `capped`, not `avail` —
+        // passing the uncapped `avail` (a server/MitM-influenced value) told
+        // WinHTTP it could write up to `avail` bytes into a 1 MiB buffer → heap
+        // overflow when `avail > 1 << 20`. Clamp `read` to `capped` before
+        // slicing too, since read can't exceed what we asked for but we defend
+        // in depth against a misbehaving stack.
+        let capped = (avail as usize).min(1 << 20);
+        let mut chunk = vec![0u8; capped];
         let mut read: u32 = 0;
-        if (fns.read_data)(req, chunk.as_mut_ptr(), avail, &mut read) == 0 || read == 0 {
+        if (fns.read_data)(req, chunk.as_mut_ptr(), capped as u32, &mut read) == 0 || read == 0 {
             break;
         }
-        out.extend_from_slice(&chunk[..read as usize]);
+        let n = (read as usize).min(capped);
+        out.extend_from_slice(&chunk[..n]);
     }
     (fns.close_handle)(req);
     (fns.close_handle)(conn);

