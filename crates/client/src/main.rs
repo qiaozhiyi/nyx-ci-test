@@ -1,8 +1,7 @@
-//! Nyx operator GUI — a pure-Rust **egui** desktop client. No Node/JS/HTML: it
-//! is a single Rust binary that talks to the team server's REST API (the same
-//! surface as `nyx-cli`). Left panel = live sessions; centre = a console that
-//! tasks `shell` commands and prints the output. Extend as needed (upload/
-//! download, BOF, profile view).
+//! Nyx operator GUI — a pure-Rust **egui** desktop client. No Node/JS/HTML: a
+//! single Rust binary that talks to the team server's REST API (same surface as
+//! `nyx-cli`). Left panel = live sessions; centre = tabbed console (shell),
+//! BOF runner, and profile view.
 //!
 //! Run: `NYX_SERVER=http://127.0.0.1:8443 cargo run -p nyx-client`
 
@@ -20,6 +19,20 @@ struct SessionView {
     os: String,
     is_admin: u8,
     pending: usize,
+    #[allow(dead_code)]
+    beacon_id: u32,
+    #[allow(dead_code)]
+    arch: u8,
+    #[allow(dead_code)]
+    pid: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProfileView {
+    loaded: bool,
+    http_get_uri: Option<String>,
+    http_post_uri: Option<String>,
+    useragent: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,10 +46,17 @@ struct ResultView {
     text: String,
 }
 
-/// Background -> UI message.
 enum Msg {
     Sessions(Vec<SessionView>),
     Line(String),
+    Profile(ProfileView),
+}
+
+#[derive(PartialEq)]
+enum Tab {
+    Console,
+    Bof,
+    Profile,
 }
 
 struct App {
@@ -46,7 +66,10 @@ struct App {
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
     shell_input: String,
+    bof_path: String,
     log: Vec<String>,
+    tab: Tab,
+    profile: Option<ProfileView>,
 }
 
 impl App {
@@ -55,7 +78,6 @@ impl App {
         let server =
             std::env::var("NYX_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8443".to_string());
 
-        // Background: refresh the session list every second + request a repaint.
         let (srv, tx2, ctx) = (server.clone(), tx.clone(), cc.egui_ctx.clone());
         std::thread::spawn(move || loop {
             if let Ok(list) = fetch_sessions(&srv) {
@@ -72,44 +94,90 @@ impl App {
             rx,
             tx,
             shell_input: String::new(),
-            log: vec!["Nyx client ready. Select a session, then run `shell`.".into()],
+            bof_path: String::new(),
+            log: vec!["Nyx client ready. Select a session, then run commands.".into()],
+            tab: Tab::Console,
+            profile: None,
         }
     }
 
     fn run_shell(&mut self, ctx: &egui::Context) {
-        let Some(sid) = self.selected.clone() else {
-            self.log.push("! select a session first".into());
-            return;
-        };
         let cmd = self.shell_input.trim().to_string();
         if cmd.is_empty() {
             return;
         }
+        let Some(sid) = self.selected.clone() else {
+            self.log.push("! select a session first".into());
+            return;
+        };
         self.shell_input.clear();
         self.log.push(format!("$ {cmd}"));
+        self.task_on_thread(ctx, move |srv, tx| match enqueue_shell(&srv, &sid, &cmd) {
+            Ok(tid) => match poll_result(&srv, &sid, tid) {
+                Ok(Some(o)) => tx_line(tx, o),
+                Ok(None) => tx_line(tx, "[no output within timeout]".into()),
+                Err(e) => tx_line(tx, format!("! {e}")),
+            },
+            Err(e) => tx_line(tx, format!("! {e}")),
+        });
+    }
+
+    fn run_bof(&mut self, ctx: &egui::Context) {
+        let path = self.bof_path.trim().to_string();
+        let Some(sid) = self.selected.clone() else {
+            self.log.push("! select a session first".into());
+            return;
+        };
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("bof")
+            .to_string();
+        self.log.push(format!("[bof] {name}"));
+        self.task_on_thread(ctx, move |srv, tx| match enqueue_bof(&srv, &sid, &path, &name) {
+            Ok(tid) => match poll_result(&srv, &sid, tid) {
+                Ok(Some(o)) => tx_line(tx, if o.is_empty() { "[bof ran (no output)]".into() } else { o }),
+                Ok(None) => tx_line(tx, "[bof: no result]".into()),
+                Err(e) => tx_line(tx, format!("! {e}")),
+            },
+            Err(e) => tx_line(tx, format!("! {e}")),
+        });
+    }
+
+    fn refresh_profile(&mut self, ctx: &egui::Context) {
+        let (srv, tx, ctx) = (self.server.clone(), self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || match fetch_profile(&srv) {
+            Ok(p) => {
+                let _ = tx.send(Msg::Profile(p));
+            }
+            Err(e) => tx_line(tx, format!("profile: ! {e}")),
+        });
+        ctx.request_repaint();
+    }
+
+    /// Run `work` on a background thread; it pushes lines back via the channel.
+    fn task_on_thread(
+        &self,
+        ctx: &egui::Context,
+        work: impl FnOnce(String, Sender<Msg>) + Send + 'static,
+    ) {
         let (srv, tx, ctx) = (self.server.clone(), self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let line = match enqueue_shell(&srv, &sid, &cmd) {
-                Ok(tid) => match poll_result(&srv, &sid, tid) {
-                    Ok(Some(out)) => out,
-                    Ok(None) => "[no output within timeout]".into(),
-                    Err(e) => format!("! {e}"),
-                },
-                Err(e) => format!("! {e}"),
-            };
-            let _ = tx.send(Msg::Line(line));
+            work(srv, tx);
             ctx.request_repaint();
         });
     }
 }
 
+fn tx_line(tx: Sender<Msg>, line: String) {
+    let _ = tx.send(Msg::Line(line));
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Drain background messages.
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Sessions(s) => {
-                    // Keep selection valid.
                     if let Some(id) = &self.selected {
                         if !s.iter().any(|x| &x.id == id) {
                             self.selected = None;
@@ -118,6 +186,7 @@ impl eframe::App for App {
                     self.sessions = s;
                 }
                 Msg::Line(l) => self.log.push(l),
+                Msg::Profile(p) => self.profile = Some(p),
             }
         }
 
@@ -147,41 +216,112 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Console");
-                ui.label(
-                    self.selected
-                        .as_ref()
-                        .map(|s| format!("({})", &s[..8.min(s.len())]))
-                        .unwrap_or_default(),
-                );
-            });
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for line in &self.log {
-                        ui.label(line);
+                for (tab, label) in [
+                    (Tab::Console, "Console"),
+                    (Tab::Bof, "BOF"),
+                    (Tab::Profile, "Profile"),
+                ] {
+                    if ui.selectable_label(self.tab == tab, label).clicked() {
+                        self.tab = tab;
                     }
-                });
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("nyx>");
-                let resp = ui.text_edit_singleline(&mut self.shell_input);
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.button("Run").clicked() || enter {
-                    self.run_shell(ctx);
                 }
             });
+            ui.separator();
+
+            match self.tab {
+                Tab::Console => console_tab(ui, self, ctx),
+                Tab::Bof => bof_tab(ui, self, ctx),
+                Tab::Profile => profile_tab(ui, self, ctx),
+            }
         });
     }
 }
+
+fn console_tab(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
+    ui.horizontal(|ui| {
+        ui.heading("Console");
+        ui.label(
+            app.selected
+                .as_ref()
+                .map(|s| format!("({})", &s[..8.min(s.len())]))
+                .unwrap_or_default(),
+        );
+    });
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            for line in &app.log {
+                ui.label(line);
+            }
+        });
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("nyx>");
+        let resp = ui.text_edit_singleline(&mut app.shell_input);
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if ui.button("Run").clicked() || enter {
+            app.run_shell(ctx);
+        }
+    });
+}
+
+fn bof_tab(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
+    ui.heading("BOF runner");
+    ui.label("Path to a COFF/BOF object (.o) on the operator host:");
+    ui.horizontal(|ui| {
+        ui.text_edit_singleline(&mut app.bof_path);
+        if ui.button("Run BOF").clicked() {
+            app.run_bof(ctx);
+        }
+    });
+    ui.separator();
+    ui.label("(output appears in the Console log)");
+}
+
+fn profile_tab(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
+    ui.heading("Active Malleable C2 profile");
+    if ui.button("Refresh").clicked() {
+        app.refresh_profile(ctx);
+    }
+    ui.separator();
+    match &app.profile {
+        None => {
+            ui.label("(not loaded — click Refresh)");
+        }
+        Some(p) => {
+            ui.label(format!("loaded: {}", p.loaded));
+            ui.label(format!("http-get uri : {}", p.http_get_uri.clone().unwrap_or_default()));
+            ui.label(format!("http-post uri: {}", p.http_post_uri.clone().unwrap_or_default()));
+            ui.label(format!("useragent    : {}", p.useragent.clone().unwrap_or_default()));
+        }
+    };
+}
+
+// ---- REST (ureq, on background threads) ------------------------------------
 
 fn fetch_sessions(server: &str) -> anyhow::Result<Vec<SessionView>> {
     Ok(ureq::get(&format!("{server}/api/sessions")).call()?.into_json()?)
 }
 
+fn fetch_profile(server: &str) -> anyhow::Result<ProfileView> {
+    Ok(ureq::get(&format!("{server}/api/profile")).call()?.into_json()?)
+}
+
 fn enqueue_shell(server: &str, session: &str, args: &str) -> anyhow::Result<u64> {
     let body = serde_json::json!({ "session": session, "command": { "type": "shell", "args": args } });
+    let ack: TaskAck = ureq::post(&format!("{server}/api/task"))
+        .send_json(body)?
+        .into_json()?;
+    Ok(ack.task_id)
+}
+
+fn enqueue_bof(server: &str, session: &str, file: &str, name: &str) -> anyhow::Result<u64> {
+    let data = std::fs::read(file).map_err(|e| anyhow::anyhow!("read {file}: {e}"))?;
+    let body = serde_json::json!({
+        "session": session,
+        "command": { "type": "bof", "name": name, "args": [], "data_hex": hex::encode(&data) },
+    });
     let ack: TaskAck = ureq::post(&format!("{server}/api/task"))
         .send_json(body)?
         .into_json()?;
@@ -196,13 +336,12 @@ fn poll_result(server: &str, session: &str, task_id: u64) -> anyhow::Result<Opti
             .call()?
             .into_json()?;
         if let Some(r) = rs.into_iter().find(|r| r.task_id == task_id) {
-            let text = match r.kind.as_str() {
+            return Ok(Some(match r.kind.as_str() {
                 "output" => r.text,
                 "ok" => String::new(),
                 "error" => format!("[error] {}", r.text),
                 other => format!("[{other}] {}", r.text),
-            };
-            return Ok(Some(text));
+            }));
         }
         if std::time::Instant::now() >= deadline {
             return Ok(None);
@@ -213,9 +352,5 @@ fn poll_result(server: &str, session: &str, task_id: u64) -> anyhow::Result<Opti
 
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions::default();
-    eframe::run_native(
-        "Nyx",
-        opts,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
+    eframe::run_native("Nyx", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
