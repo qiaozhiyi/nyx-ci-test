@@ -30,6 +30,12 @@ pub mod frame;
 pub mod msg;
 pub mod wire;
 
-pub use crypto::{ImplantKeypair, ServerKeypair, SessionKey, KEY_LEN, NONCE_LEN, PUBKEY_LEN};
-pub use frame::{encode_frame, open_frame, parse_frame, RawFrame, FRAME_HEADER, TAG_LEN};
+pub use crypto::{
+    seal_dir, open_dir, Direction, ImplantKeypair, ServerKeypair, SessionKey, KEY_LEN, NONCE_LEN,
+    PUBKEY_LEN,
+};
+pub use frame::{
+    encode_frame, encode_frame_dir, open_frame, open_frame_dir, parse_frame, RawFrame, FRAME_HEADER,
+    TAG_LEN,
+};
 pub use msg::{Command, Response, SessionInfo, Task, TaskResponse};

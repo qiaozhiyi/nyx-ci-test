@@ -6,7 +6,7 @@
 //! server can be largely stateless per request: read pubkey → derive/look up
 //! key → decrypt. The counter is anti-replay (monotonic, checked server-side).
 
-use crate::crypto::{self, SessionKey, PUBKEY_LEN};
+use crate::crypto::{self, Direction, SessionKey, PUBKEY_LEN};
 use crate::wire::WireError;
 use alloc::vec::Vec;
 
@@ -14,6 +14,12 @@ use alloc::vec::Vec;
 pub const FRAME_HEADER: usize = PUBKEY_LEN + 8 + 4;
 /// Poly1305 authentication tag.
 pub const TAG_LEN: usize = 16;
+/// Upper bound on a beacon frame's declared ciphertext length. Beacon payloads
+/// are tiny (a SessionInfo or a small task/response batch), so anything larger
+/// is either malformed or an attempt to induce an oversized allocation.
+/// Defense-in-depth on top of the transport's body-size limit (the raw-TLS
+/// `serve_connection` path has no default limit, so this cap is the backstop).
+pub const MAX_CT_LEN: usize = 256 * 1024; // 256 KiB — generously above any real frame
 
 /// A frame that has been parsed but not yet decrypted.
 #[derive(Debug, Clone)]
@@ -23,20 +29,36 @@ pub struct RawFrame {
     pub ciphertext: Vec<u8>,
 }
 
-/// Build a complete request frame from plaintext.
-pub fn encode_frame(
+/// Build a complete request frame from plaintext, sealed with the given
+/// [`Direction`]'s nonce space. The direction must match what the receiver
+/// will use in [`open_frame_dir`].
+pub fn encode_frame_dir(
     pubkey: &[u8; PUBKEY_LEN],
+    dir: Direction,
     counter: u64,
     key: &SessionKey,
     plaintext: &[u8],
 ) -> Vec<u8> {
-    let ciphertext = crypto::seal(key, counter, pubkey, plaintext);
+    let ciphertext = crypto::seal_dir(key, dir, counter, pubkey, plaintext);
     let mut out = Vec::with_capacity(FRAME_HEADER + ciphertext.len());
     out.extend_from_slice(pubkey);
     out.extend_from_slice(&counter.to_le_bytes());
     out.extend_from_slice(&(ciphertext.len() as u32).to_le_bytes());
     out.extend_from_slice(&ciphertext);
     out
+}
+
+/// Back-compat shim: seals with [`Direction::ClientToServer`] (the historical
+/// implant→server direction). Existing implant/agent-dev callers that *send*
+/// should keep using this; server senders must use [`encode_frame_dir`] with
+/// [`Direction::ServerToClient`].
+pub fn encode_frame(
+    pubkey: &[u8; PUBKEY_LEN],
+    counter: u64,
+    key: &SessionKey,
+    plaintext: &[u8],
+) -> Vec<u8> {
+    encode_frame_dir(pubkey, Direction::ClientToServer, counter, key, plaintext)
 }
 
 /// Parse (but do not decrypt) a frame received off the wire.
@@ -57,7 +79,12 @@ pub fn parse_frame(frame: &[u8]) -> Result<RawFrame, WireError> {
             .expect("4 bytes"),
     ) as usize;
     let ct_end = FRAME_HEADER + ct_len;
-    if frame.len() < ct_end || ct_len < TAG_LEN {
+    // Require the frame to be length-exact (no unauthenticated trailing bytes)
+    // AND that the declared ciphertext is within the beacon cap. The cap is a
+    // backstop against a future extractor change or the raw-TLS serve_connection
+    // path (which has no body-size limit) turning a bogus ct_len into a huge
+    // allocation. ct_len < TAG_LEN means the "ciphertext" can't even hold a tag.
+    if frame.len() != ct_end || ct_len < TAG_LEN || ct_len > MAX_CT_LEN {
         return Err(WireError::BadLen(ct_len));
     }
     let ciphertext = frame[FRAME_HEADER..ct_end].to_vec();
@@ -68,10 +95,22 @@ pub fn parse_frame(frame: &[u8]) -> Result<RawFrame, WireError> {
     })
 }
 
-/// Decrypt a parsed frame.
+/// Decrypt a parsed frame using the given direction's nonce space.
+pub fn open_frame_dir(
+    key: &SessionKey,
+    dir: Direction,
+    raw: &RawFrame,
+) -> Result<Vec<u8>, chacha20poly1305::Error> {
+    crypto::open_dir(key, dir, raw.counter, &raw.pubkey, &raw.ciphertext)
+}
+
+/// Back-compat shim: opens with [`Direction::ClientToServer`]. Existing
+/// server/implant callers that *receive* implant-origin frames should keep
+/// using this; receivers of server-origin frames must use [`open_frame_dir`]
+/// with [`Direction::ServerToClient`].
 pub fn open_frame(
     key: &SessionKey,
     raw: &RawFrame,
 ) -> Result<Vec<u8>, chacha20poly1305::Error> {
-    crypto::open(key, raw.counter, &raw.pubkey, &raw.ciphertext)
+    open_frame_dir(key, Direction::ClientToServer, raw)
 }

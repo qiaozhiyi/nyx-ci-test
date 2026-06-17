@@ -136,6 +136,43 @@ fn truncated_frame_is_rejected() {
 }
 
 #[test]
+fn frame_with_trailing_bytes_is_rejected() {
+    // Integrity: the AEAD authenticates exactly ct_len bytes, so a frame that
+    // carries unauthenticated trailing data after the declared ciphertext must
+    // be rejected (length-exact), not silently trimmed.
+    let server = crypto::ServerKeypair::generate();
+    let implant = crypto::ImplantKeypair::generate();
+    let key = implant.session_key(&server.public_bytes());
+    let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, b"hi");
+    let mut with_trailer = frame.clone();
+    with_trailer.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // unauthenticated tail
+    assert!(
+        frame::parse_frame(&with_trailer).is_err(),
+        "frames with trailing unauthenticated bytes must be rejected"
+    );
+    // The clean frame still parses.
+    assert!(frame::parse_frame(&frame).is_ok());
+}
+
+#[test]
+fn frame_with_oversized_ct_len_is_rejected() {
+    // Defense-in-depth: a beacon frame's ciphertext is always small. Even if
+    // the body is long enough to satisfy the length-exact check, parse_frame
+    // must reject a ct_len beyond a sane cap — so that an extractor change (or
+    // the raw-TLS serve_connection path that has no body limit) cannot turn a
+    // bogus ct_len into a multi-MB allocation. Build a body that *matches* the
+    // declared ct_len so only the cap, not the length check, rejects it.
+    let cap_beyond: u32 = 0x0010_0000; // 1 MiB ct — past the MAX_CT_LEN cap
+    let total = frame::FRAME_HEADER + cap_beyond as usize;
+    let mut bad = vec![0u8; total];
+    bad[40..44].copy_from_slice(&cap_beyond.to_le_bytes());
+    assert!(
+        frame::parse_frame(&bad).is_err(),
+        "a ct_len beyond the beacon cap must be rejected even when the body matches it"
+    );
+}
+
+#[test]
 fn p2p_command_variants_roundtrip() {
     let tasks = vec![
         msg::Task {
@@ -172,6 +209,43 @@ fn p2p_command_variants_roundtrip() {
     let enc = msg::Task::encode_vec(&tasks);
     let dec = msg::Task::decode_vec(&enc).unwrap();
     assert_eq!(dec, tasks);
+}
+
+#[test]
+fn nonce_directions_never_collide() {
+    // Regression for the catastrophic bidirectional nonce-reuse bug: the same
+    // session key was used in both directions with the SAME nonce
+    // (zero-padded counter) and the SAME AAD (implant pubkey). Implant sealed
+    // at counter=0 on check-in and the server replied at send_counter=0 →
+    // two-time-pad under ChaCha20-Poly1305. Fix: split the nonce space by
+    // direction so equal counter values in opposite directions are distinct
+    // nonces. This test seals the same plaintext at the same counter in both
+    // directions and asserts the ciphertexts differ, which is only possible if
+    // the nonces differ (same key, same AAD, same plaintext).
+    let server = crypto::ServerKeypair::generate();
+    let implant = crypto::ImplantKeypair::generate();
+    let key = implant.session_key(&server.public_bytes());
+    let pubkey = implant.public_bytes();
+    let plain = b"identical plaintext, identical counter, different direction";
+
+    let c2s = crypto::seal_dir(&key, crypto::Direction::ClientToServer, 0, &pubkey, plain);
+    let s2c = crypto::seal_dir(&key, crypto::Direction::ServerToClient, 0, &pubkey, plain);
+
+    assert_ne!(
+        c2s, s2c,
+        "same counter in opposite directions must produce distinct ciphertexts (nonce reuse otherwise)"
+    );
+
+    // And each direction must round-trip on its own.
+    let pt_c2s = crypto::open_dir(&key, crypto::Direction::ClientToServer, 0, &pubkey, &c2s).unwrap();
+    let pt_s2c = crypto::open_dir(&key, crypto::Direction::ServerToClient, 0, &pubkey, &s2c).unwrap();
+    assert_eq!(pt_c2s, plain);
+    assert_eq!(pt_s2c, plain);
+
+    // Cross-direction open must FAIL: the direction is part of the nonce, so a
+    // ciphertext sealed C2S must not open S2C and vice-versa.
+    assert!(crypto::open_dir(&key, crypto::Direction::ServerToClient, 0, &pubkey, &c2s).is_err());
+    assert!(crypto::open_dir(&key, crypto::Direction::ClientToServer, 0, &pubkey, &s2c).is_err());
 }
 
 #[test]

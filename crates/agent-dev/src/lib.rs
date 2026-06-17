@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use nyx_profile::ServerEnvelope;
 use nyx_protocol::{
-    encode_frame, open_frame, parse_frame, wire::Writer, Command, ImplantKeypair, Response,
-    SessionInfo, Task, TaskResponse,
+    encode_frame, open_frame_dir, parse_frame, wire::Writer, Command, Direction, ImplantKeypair,
+    Response, SessionInfo, Task, TaskResponse,
 };
 
 pub struct Config {
@@ -117,7 +117,9 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 continue;
             }
         };
-        let plaintext = match open_frame(&key, &raw) {
+        // Server replies travel in the ServerToClient nonce space (see protocol
+        // Direction); open them with the matching direction or the AEAD tag fails.
+        let plaintext = match open_frame_dir(&key, Direction::ServerToClient, &raw) {
             Ok(p) => p,
             Err(_) => {
                 tracing::warn!("server reply decryption failed");

