@@ -18,9 +18,10 @@
 
 #![cfg(target_os = "windows")]
 
-use crate::heap::Vec;
+use crate::heap::{String, Vec};
 use crate::resolve::{djb2, LiveNtdll};
-use nyx_evasion::{indirect_stub, resolve_table, SyscallSource};
+use nyx_evasion::stub::indirect_stub;
+use nyx_evasion::{resolve_table, SyscallSource};
 
 /// The resolved syscall runtime: SSN table + the ntdll `syscall` gadget address.
 pub struct Runtime {

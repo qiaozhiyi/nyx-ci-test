@@ -113,3 +113,26 @@ fn parse_ssn_matches_real_ntdll_prologue() {
     // hooked (jmp) prologue -> None
     assert_eq!(syscalls::parse_ssn(&[0xE9, 0x00, 0x00, 0x00, 0x00]), None);
 }
+
+#[test]
+fn direct_stub_byte_layout() {
+    use nyx_evasion::stub::{direct_stub, PROLOGUE_MOV_R10_RCX, OP_MOV_EAX_IMM32, SYSCALL, RET};
+    let s = direct_stub(0x55);
+    assert_eq!(&s[..3], &PROLOGUE_MOV_R10_RCX[..]);
+    assert_eq!(s[3], OP_MOV_EAX_IMM32);
+    assert_eq!(u32::from_le_bytes([s[4], s[5], s[6], s[7]]), 0x55);
+    assert_eq!(&s[8..10], &SYSCALL);
+    assert_eq!(s[10], RET);
+}
+
+#[test]
+fn indirect_stub_jumps_into_ntdll() {
+    use nyx_evasion::stub::indirect_stub;
+    let addr: u64 = 0x00007FF_12345678;
+    let s = indirect_stub(0x1A, addr);
+    assert_eq!(&s[..4], &[0x4C, 0x8B, 0xD1, 0xB8]);
+    assert_eq!(u32::from_le_bytes([s[4], s[5], s[6], s[7]]), 0x1A);
+    assert_eq!(&s[8..10], &[0x49, 0xBB]);
+    assert_eq!(u64::from_le_bytes(s[10..18].try_into().unwrap()), addr);
+    assert_eq!(&s[18..21], &[0x41, 0xFF, 0xE3]);
+}

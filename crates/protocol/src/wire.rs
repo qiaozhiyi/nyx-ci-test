@@ -1,19 +1,34 @@
 //! Minimal little-endian binary codec primitives. Used by [`crate::msg`] so
 //! the wire format stays tiny, deterministic, and `no_std`-portable.
 
-use thiserror::Error;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt;
 
-#[derive(Debug, Error)]
+/// Codec errors. `no_std`-friendly: hand-rolled `Debug`/`Display` (thiserror's
+/// derive needs `std::error::Error`, unavailable under `no_std`). When the `std`
+/// feature is on, `std::error::Error` is also implemented.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
-    #[error("unexpected end of input")]
     Eof,
-    #[error("invalid utf-8 string")]
     Utf8,
-    #[error("invalid length field: {0}")]
     BadLen(usize),
-    #[error("invalid tag byte: {0}")]
     BadTag(u8),
 }
+
+impl fmt::Display for WireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WireError::Eof => f.write_str("unexpected end of input"),
+            WireError::Utf8 => f.write_str("invalid utf-8 string"),
+            WireError::BadLen(n) => write!(f, "invalid length field: {n}"),
+            WireError::BadTag(t) => write!(f, "invalid tag byte: {t}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for WireError {}
 
 pub struct Writer {
     pub buf: Vec<u8>,

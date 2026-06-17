@@ -1,11 +1,12 @@
 //! Per-session cryptography: X25519 ECDH key agreement, HKDF, ChaCha20-Poly1305 AEAD.
 
+use alloc::vec::Vec;
 use chacha20poly1305::{
     aead::{Aead, Payload},
     ChaCha20Poly1305, KeyInit, Nonce,
 };
 use hkdf::Hkdf;
-use rand::RngCore;
+use rand_core::RngCore;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -15,6 +16,16 @@ pub const NONCE_LEN: usize = 12;
 
 /// A 32-byte symmetric key derived per session via ECDH + HKDF.
 pub type SessionKey = [u8; KEY_LEN];
+
+/// Fill 32 bytes from the OS CSPRNG. no_std-safe: uses rand_core's OsRng, which
+/// on Windows goes through RtlGenRandom (resolved via getrandom). The std build
+/// uses the same path; this just avoids the `rand/std_rng` convenience import.
+fn random_bytes(out: &mut [u8; 32]) {
+    // rand_core's OsRng is available without the rand `std` feature on Windows
+    // (getrandom provides the backend). Fall back to a compile-time error if
+    // neither backend is present.
+    rand_core::OsRng.fill_bytes(out);
+}
 
 /// The team server's long-term identity keypair. The public half is baked
 /// into every implant's config; the secret never leaves the server.
@@ -27,7 +38,7 @@ pub struct ServerKeypair {
 impl ServerKeypair {
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        random_bytes(&mut bytes);
         let secret = StaticSecret::from(bytes);
         let public = PublicKey::from(&secret);
         Self { secret, public }
@@ -69,7 +80,7 @@ pub struct ImplantKeypair {
 impl ImplantKeypair {
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        random_bytes(&mut bytes);
         let secret = StaticSecret::from(bytes);
         let public = PublicKey::from(&secret);
         Self { secret, public }

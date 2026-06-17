@@ -10,6 +10,9 @@
 //!
 //! All encodings are x86_64 little-endian, matching the real ntdll stub layout.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// The real ntdll x64 prologue: `mov r10, rcx` (`4C 8B D1`).
 pub const PROLOGUE_MOV_R10_RCX: [u8; 3] = [0x4C, 0x8B, 0xD1];
 /// `mov eax, imm32` opcode byte (followed by the 4-byte SSN).
@@ -58,30 +61,6 @@ pub fn indirect_stub(ssn: u32, ntdll_syscall_abs: u64) -> Vec<u8> {
     v
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn direct_stub_byte_layout() {
-        let s = direct_stub(0x55);
-        assert_eq!(&s[..3], &PROLOGUE_MOV_R10_RCX[..]); // mov r10, rcx
-        assert_eq!(s[3], OP_MOV_EAX_IMM32); // mov eax, imm32
-        assert_eq!(u32::from_le_bytes([s[4], s[5], s[6], s[7]]), 0x55); // ssn
-        assert_eq!(&s[8..10], &SYSCALL); // syscall
-        assert_eq!(s[10], RET); // ret
-    }
-
-    #[test]
-    fn indirect_stub_jumps_into_ntdll() {
-        let addr: u64 = 0x00007FF_12345678;
-        let s = indirect_stub(0x1A, addr);
-        // prologue + ssn
-        assert_eq!(&s[..4], &[0x4C, 0x8B, 0xD1, 0xB8]);
-        assert_eq!(u32::from_le_bytes([s[4], s[5], s[6], s[7]]), 0x1A);
-        // mov r11, addr ; jmp r11
-        assert_eq!(&s[8..10], &[0x49, 0xBB]);
-        assert_eq!(u64::from_le_bytes(s[10..18].try_into().unwrap()), addr);
-        assert_eq!(&s[18..21], &[0x41, 0xFF, 0xE3]); // jmp r11
-    }
-}
+// Note: stub byte-layout tests live in tests/ssn.rs (external test binary) —
+// this crate is #![no_std], so internal #[cfg(test)] modules aren't usable
+// without a custom test harness.

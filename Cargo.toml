@@ -47,13 +47,15 @@ nyx-scripting-rhai = { path = "crates/scripting-rhai" }
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
-# crypto — all no_std-capable so the same code can ship in the PIC implant later
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-chacha20poly1305 = "0.10"
-hkdf = "0.12"
-sha2 = "0.10"
-rand = "0.8"
-rand_core = "0.6"
+# crypto — all no_std-capable so the same code can ship in the PIC implant later.
+# default-features off across the board; protocol's `std` feature re-enables what
+# the std users need, the implant builds without it.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+chacha20poly1305 = { version = "0.10", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+rand = { version = "0.8", default-features = false }
+rand_core = { version = "0.6", default-features = false }
 # server / client
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"

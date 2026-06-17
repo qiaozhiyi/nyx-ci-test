@@ -16,5 +16,9 @@ proc-macro = true
 syn = { workspace = true }
 quote = { workspace = true }
 proc-macro2 = { workspace = true }
-chacha20poly1305 = { workspace = true }
-rand = { workspace = true }
+# chacha20poly1305's `encrypt` (Aead trait) needs the `alloc` feature; rand's
+# thread_rng needs `std`. This is a proc-macro crate (always std/host), so both
+# are on unconditionally — workspace deps have default-features off (for the
+# no_std protocol), so we re-enable what we need here.
+chacha20poly1305 = { workspace = true, features = ["alloc"] }
+rand = { workspace = true, features = ["std", "std_rng", "getrandom"] }

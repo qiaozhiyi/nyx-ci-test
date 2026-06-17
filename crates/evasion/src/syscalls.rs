@@ -21,6 +21,9 @@
 //! See also the FreshyCalls / SysWhispers4 comparison: Hell's < Halo's <
 //! Tartarus' < FreshyCalls in reliability.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 /// Spacing between adjacent syscall stubs in ntdll (x64 builds). Used by
 /// Halo's/Tartarus' neighbor walk.
 pub const STRIDE: u32 = 0x20;

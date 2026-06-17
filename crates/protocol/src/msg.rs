@@ -1,5 +1,7 @@
 //! Task/response/message types and their (de)serialisation via [`crate::wire`].
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use crate::wire::{Reader, WireError, Writer};
 
 /// Initial check-in metadata an implant sends on first contact.

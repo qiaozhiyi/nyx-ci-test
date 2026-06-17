@@ -18,8 +18,10 @@ description = "Nyx Windows PIC implant (BRC4-grade stealth). Requires nightly + 
 crate-type = ["cdylib"]
 
 [dependencies]
-# Path deps (this crate is standalone, outside the root workspace).
-nyx-protocol = { path = "../protocol" }
+# Path deps (this crate is standalone, outside the root workspace). protocol
+# builds WITHOUT its `std` feature here — the implant is #![no_std], so pulling
+# in std would duplicate the panic_impl lang item.
+nyx-protocol = { path = "../protocol", default-features = false }
 # Evasion kit: SSN resolution + indirect-syscall stub templates. The resolve
 # module implements SyscallSource over the live ntdll, turning these algorithms
 # into a runtime.

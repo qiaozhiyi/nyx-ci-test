@@ -6,8 +6,11 @@ license.workspace = true
 description = "Per-build encrypted implant config — runtime decrypt half of nyx-config-macros::embed!"
 
 [dependencies]
-chacha20poly1305 = { workspace = true }
-rand = { workspace = true }
+# chacha20poly1305 decrypt (Aead trait) needs alloc; rand CSPRNG needs std +
+# getrandom. Workspace deps default-features are off (for the no_std protocol);
+# re-enable here. config is a runtime crate (always std).
+chacha20poly1305 = { workspace = true, features = ["alloc"] }
+rand = { workspace = true, features = ["std", "std_rng", "getrandom"] }
 
 [dev-dependencies]
 nyx-config-macros = { workspace = true }

@@ -1,19 +1,29 @@
 //! Nyx wire protocol: crypto + framing + task/response messages.
 //!
-//! Shared by the team server, the (std) dev agent, and — eventually — the
-//! Windows PIC implant. Encoding is a hand-rolled little-endian binary codec
-//! (deliberately *not* protobuf) so the same logic can be compiled `no_std`
-//! for the position-independent implant without a serde/prost footprint.
+//! Shared by the team server, the (std) dev agent, and the Windows PIC implant.
+//! Encoding is a hand-rolled little-endian binary codec (deliberately *not*
+//! protobuf) so the same logic compiles `no_std` for the position-independent
+//! implant without a serde/prost footprint. The crate is `no_std`-by-default
+//! with a `std` feature (on by default for the server/agent-dev/client); the
+//! implant builds with `--no-default-features`.
 //!
 //! Transport framing (per HTTP body / DNS blob / pipe message):
-//! `[32B session pubkey][8B counter][4B ct_len][ciphertext || 16B tag]`
+//! `[32B session pubkey][8B counter][4B ct_len LE][ciphertext || 16B tag]`
 //!
 //! Crypto (per session):
 //! - Implant generates an ephemeral X25519 keypair; the server holds a
 //!   long-term X25519 identity whose public half is baked into implant config.
 //! - Session key = HKDF-SHA256(ECDH(implant_eph, server_id)).
-//! - AEAD = ChaCha20-Poly1305, 96-bit nonce = zero-padded little-endian
-//!   counter. The implant pubkey is bound as AAD on every operation.
+//! - AEAD = ChaCha20-Poly1305, 96-bit nonce = zero-padded LE counter.
+//!   The implant pubkey is bound as AAD on every operation.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
+#[cfg(feature = "std")]
+extern crate alloc;
 
 pub mod crypto;
 pub mod frame;

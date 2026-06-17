@@ -8,6 +8,7 @@
 
 use crate::crypto::{self, SessionKey, PUBKEY_LEN};
 use crate::wire::WireError;
+use alloc::vec::Vec;
 
 /// pubkey(32) + counter(8) + length(4)
 pub const FRAME_HEADER: usize = PUBKEY_LEN + 8 + 4;

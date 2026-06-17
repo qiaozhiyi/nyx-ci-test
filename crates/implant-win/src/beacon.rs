@@ -12,7 +12,7 @@
 
 #![cfg(target_os = "windows")]
 
-use crate::heap::{String, Vec};
+use crate::heap::{vec, String, Vec};
 use nyx_protocol::{
     encode_frame, open_frame, parse_frame, wire::Writer, Command, ImplantKeypair, Response,
     SessionInfo, Task, TaskResponse,

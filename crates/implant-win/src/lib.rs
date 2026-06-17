@@ -32,9 +32,9 @@ extern crate alloc;
 pub mod heap;
 
 #[cfg(target_os = "windows")]
-pub mod alloc;
+pub mod ntalloc;
 #[cfg(target_os = "windows")]
-pub mod core;
+pub mod beacon;
 #[cfg(target_os = "windows")]
 pub mod entry;
 #[cfg(target_os = "windows")]
@@ -47,7 +47,7 @@ pub mod transport;
 // Register the NT-Heap allocator so Vec/String work under #![no_std].
 #[cfg(target_os = "windows")]
 #[global_allocator]
-static HEAP: alloc::NtHeapAllocator = alloc::NtHeapAllocator;
+static HEAP: ntalloc::NtHeapAllocator = ntalloc::NtHeapAllocator;
 
 #[panic_handler]
 fn _panic(_: &core::panic::PanicInfo) -> ! {
