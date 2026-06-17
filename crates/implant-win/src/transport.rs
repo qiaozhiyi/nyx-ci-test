@@ -9,7 +9,7 @@
 
 #![cfg(target_os = "windows")]
 
-use crate::heap::Vec;
+use crate::heap::{vec, Vec};
 use crate::resolve::export_addr;
 use core::ffi::c_void;
 
@@ -33,7 +33,7 @@ type FSendReq = unsafe extern "system" fn(HINTERNET, *const u8, u32, *const u8, 
 type FRecvResp = unsafe extern "system" fn(HINTERNET, *const c_void) -> i32;
 type FReadData = unsafe extern "system" fn(HINTERNET, *mut u8, u32, *mut u32) -> i32;
 type FClose = unsafe extern "system" fn(HINTERNET) -> i32;
-type FQueryData = unsafe extern "system" fn(HINTERNET, u32, *mut u32, *mut u8, *mut u32) -> i32;
+type FQueryData = unsafe extern "system" fn(HINTERNET, *mut u32) -> i32;
 
 static mut WINHTTP: Option<WinhttpFns> = None;
 
@@ -42,6 +42,24 @@ unsafe fn ensure_winhttp() {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.load(Ordering::Acquire) {
+        return;
+    }
+    // winhttp.dll is NOT loaded by default — resolve LoadLibraryA from
+    // kernel32 and force-load it into the process first.
+    type LoadLibraryA = unsafe extern "system" fn(*const u8) -> *mut core::ffi::c_void;
+    let lla = export_addr(b"kernel32.dll", b"LoadLibraryA");
+    let mut winhttp_loaded = false;
+    if let Some(addr) = lla {
+        let load: LoadLibraryA = core::mem::transmute(addr);
+        let name = b"winhttp.dll\0";
+        let h = load(name.as_ptr());
+        if !h.is_null() {
+            winhttp_loaded = true;
+        }
+    }
+    if !winhttp_loaded {
+        // Can't load winhttp — transport unavailable.
+        DONE.store(true, Ordering::Release);
         return;
     }
     let o = export_addr(b"winhttp.dll", b"WinHttpOpen");
@@ -142,7 +160,7 @@ pub unsafe fn post_frame(host: &[u8], port: u16, path: &[u8], body: &[u8]) -> Op
     let mut avail: u32 = 0;
     loop {
         avail = 0;
-        if (fns.query_data)(req, 0, &mut avail, core::ptr::null_mut(), &mut 0) == 0 || avail == 0 {
+        if (fns.query_data)(req, &mut avail) == 0 || avail == 0 {
             break;
         }
         let mut chunk = vec![0u8; avail as usize];
