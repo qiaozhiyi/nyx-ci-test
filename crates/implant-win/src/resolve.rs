@@ -180,6 +180,13 @@ impl LiveNtdll {
         }
     }
 
+    /// Read `len` bytes at `rva` from the live ntdll image. Unsafe: rva must
+    /// point into a mapped section of ntdll.
+    pub unsafe fn read(&self, rva: u32, len: usize) -> Vec<u8> {
+        let ptr = self.module.base.add(rva as usize);
+        core::slice::from_raw_parts(ptr, len).to_vec()
+    }
+
     /// Raw module handle (for export_rva_by_hash lookups).
     pub fn module(&self) -> Module {
         self.module

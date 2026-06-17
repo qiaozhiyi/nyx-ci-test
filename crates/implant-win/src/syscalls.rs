@@ -21,7 +21,7 @@
 use crate::heap::{String, Vec};
 use crate::resolve::{djb2, LiveNtdll};
 use nyx_evasion::stub::indirect_stub;
-use nyx_evasion::{resolve_table, SyscallSource};
+use nyx_evasion::resolve_table;
 
 /// The resolved syscall runtime: SSN table + the ntdll `syscall` gadget address.
 pub struct Runtime {
@@ -71,36 +71,19 @@ impl Runtime {
 /// Scan ntdll's image for a `syscall; ret` byte pair (`0F 05 C3`) and return
 /// its absolute address. The first Nt* export stub contains one; any works as
 /// the indirect-jump target.
-unsafe fn scan_syscall_gadget<S: SyscallSource + ?Sized>(_src: &S) -> Option<u64> {
-    // The gadget lives inside the syscall stub region of ntdll. We scan the
-    // export we know is cleanest — but simpler: walk the first resolvable
-    // stub's bytes. For M0 we locate ntdll's base via the resolve module and
-    // scan forward for the 3-byte signature within the first ~64 KiB of the
-    // .text-equivalent region.
-    //
-    // The LiveNtdll owns the base; reach into it through a dedicated scan that
-    // reads via the SyscallSource trait.
-    let ntdll = crate::resolve::LiveNtdll::locate()?;
-    // Scan the first 0x10000 bytes of ntdll for 0F 05 C3.
-    for rva in 0x1000u32..0x10000 {
-        let window = ntdll_window(&ntdll, rva, 3)?;
-        if window == [0x0F, 0x05, 0xC3] {
-            // Absolute address = base + rva. We need the base pointer.
-            let base = ntdll.module().base as u64;
-            return Some(base + rva as u64);
+unsafe fn scan_syscall_gadget(ntdll: &LiveNtdll) -> Option<u64> {
+    // Scan ntdll for the first `syscall; ret` (0F 05 C3) gadget. Read the whole
+    // scan range in one shot (not per-byte) to avoid 60k tiny allocations.
+    let start = 0x1000u32;
+    let end = 0x10000u32;
+    let blob = ntdll.read(start, (end - start) as usize);
+    for i in 0..blob.len().saturating_sub(2) {
+        if blob[i] == 0x0F && blob[i + 1] == 0x05 && blob[i + 2] == 0xC3 {
+            let rva = start + i as u32;
+            return Some(ntdll.module().base as u64 + rva as u64);
         }
     }
     None
-}
-
-/// Read `len` bytes at `rva` from the live ntdll via the SyscallSource trait.
-unsafe fn ntdll_window(src: &LiveNtdll, rva: u32, len: usize) -> Option<[u8; 3]> {
-    let v: Vec<u8> = nyx_evasion::SyscallSource::read(src, rva, len);
-    if v.len() == 3 {
-        Some([v[0], v[1], v[2]])
-    } else {
-        None
-    }
 }
 
 /// A typed wrapper around an indirect syscall. The macro is the public face;
