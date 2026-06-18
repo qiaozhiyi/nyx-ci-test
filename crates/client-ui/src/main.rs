@@ -17,7 +17,12 @@ use makepad_widgets::*;
 pub mod bridge;
 pub mod widgets;
 
-use crate::widgets::{bof_panel::BofPanel, cred_table::CredTable, file_tree::FileTree, process_table::ProcessTable};
+use crate::widgets::{
+    bof_panel::{BofEntry, BofPanel, BofStatus, BOFS},
+    cred_table::CredTable,
+    file_tree::FileTree,
+    process_table::ProcessTable,
+};
 
 use std::sync::{LazyLock, RwLock};
 
@@ -53,37 +58,54 @@ script_mod! {
     let Cdanger  = #xef4444
 
     // ── session row (one beacon) ────────────────────────────────────────────
+    // `flow: Overlay` so the transparent full-row `select` Button sits ON TOP
+    // of the label row and captures clicks across the whole row. This is the
+    // only way click-detection works in Makepad: `items_with_actions` yields a
+    // row only when one of its child widgets fired an action, and a plain View
+    // of Labels never does. Mirrors the `todo` example's per-row Button.
     let SessionRow = View{
         width: Fill height: 30
-        padding: {left: 12.0 right: 12.0}
-        flow: Right spacing: 8.0
-        align: {y: 0.5}
+        flow: Overlay
         draw_bg: {color: Crow, color_hover: Crowhov}
 
-        host := Label{
-            width: 140
-            text: "hostname"
-            draw_text: {color: Cprimary, text_style: {font_size: 12.0}}
+        // Label row (the visible content).
+        content := View{
+            width: Fill height: Fill
+            padding: {left: 12.0 right: 12.0}
+            flow: Right spacing: 8.0
+            align: {y: 0.5}
+            host := Label{
+                width: 140
+                text: "hostname"
+                draw_text: {color: Cprimary, text_style: {font_size: 12.0}}
+            }
+            user := Label{
+                width: 110
+                text: "user"
+                draw_text: {color: Csecond, text_style: {font_size: 12.0}}
+            }
+            os := Label{
+                width: Fill
+                text: "os"
+                draw_text: {color: Cmuted, text_style: {font_size: 11.0}}
+            }
+            admin := Label{
+                width: 44
+                text: ""
+                draw_text: {color: Cdanger, text_style: {font_size: 11.0}}
+            }
+            pend := Label{
+                width: 30
+                text: "0"
+                draw_text: {color: Caccent, text_style: {font_size: 11.0}}
+            }
         }
-        user := Label{
-            width: 110
-            text: "user"
-            draw_text: {color: Csecond, text_style: {font_size: 12.0}}
-        }
-        os := Label{
-            width: Fill
-            text: "os"
-            draw_text: {color: Cmuted, text_style: {font_size: 11.0}}
-        }
-        admin := Label{
-            width: 44
+        // Invisible click target on top.
+        select := Button{
+            width: Fill height: Fill
             text: ""
-            draw_text: {color: Cdanger, text_style: {font_size: 11.0}}
-        }
-        pend := Label{
-            width: 30
-            text: "0"
-            draw_text: {color: Caccent, text_style: {font_size: 11.0}}
+            draw_bg: {color: #x00000000, color_hover: #x00000000, color_down: #x00000000, border_size: 0.0}
+            draw_text: {color: #x00000000}
         }
     }
 
@@ -467,6 +489,26 @@ impl App {
                 log.drain(..drop);
             }
         }
+        // Route BOF lifecycle updates into the BOF history global.
+        if !snap.bof_updates.is_empty() {
+            let mut bofs = BOFS.write().unwrap();
+            for u in snap.bof_updates {
+                bofs.push(BofEntry {
+                    name: u.name,
+                    args: u.args,
+                    status: match u.status {
+                        bridge::BofState::Pending => BofStatus::Pending,
+                        bridge::BofState::Done => BofStatus::Done,
+                        bridge::BofState::Error => BofStatus::Error,
+                    },
+                });
+                // Cap the history so it can't grow unbounded.
+                if bofs.len() > 1024 {
+                    let drop = bofs.len() - 1024;
+                    bofs.drain(..drop);
+                }
+            }
+        }
         self.set_status(cx, snap.connected);
         self.ui.redraw(cx);
     }
@@ -542,26 +584,30 @@ impl MatchEvent for App {
             }
         }
 
-        // Session row selection (a row is "clicked" if the PortalList reports
-        // an action for it).
+        // Session row selection. `items_with_actions` only yields rows whose
+        // child widgets fired an action, so each row carries an invisible
+        // `select` Button (overlay) — we check it here. Matches the `todo`
+        // example's per-row `delete` pattern.
         let session_list = self.ui.widget(cx, ids!(session_list));
         let list = session_list.portal_list(cx, ids!(list));
-        for (item_id, _item) in list.items_with_actions(actions) {
-            self.selected = Some(item_id);
-            let sessions = SESSIONS.read().unwrap();
-            let s = sessions.get(item_id);
-            let text = match s {
-                Some(s) => format!("● {} @ {}   (id {:.8})", s.hostname, s.username, s.id),
-                None => "Select a session".to_string(),
-            };
-            let sub = if s.is_some() {
-                "Interactive console arrives in G2".to_string()
-            } else {
-                String::new()
-            };
-            self.ui.label(cx, ids!(center_text)).set_text(cx, &text);
-            self.ui.label(cx, ids!(center_sub)).set_text(cx, &sub);
-            self.ui.redraw(cx);
+        for (item_id, item) in list.items_with_actions(actions) {
+            if item.button(cx, ids!(select)).clicked(actions) {
+                self.selected = Some(item_id);
+                let sessions = SESSIONS.read().unwrap();
+                let s = sessions.get(item_id);
+                let text = match s {
+                    Some(s) => format!("● {} @ {}   (id {:.8})", s.hostname, s.username, s.id),
+                    None => "Select a session".to_string(),
+                };
+                let sub = if s.is_some() {
+                    "Interactive console arrives in G2 console".to_string()
+                } else {
+                    String::new()
+                };
+                self.ui.label(cx, ids!(center_text)).set_text(cx, &text);
+                self.ui.label(cx, ids!(center_sub)).set_text(cx, &sub);
+                self.ui.redraw(cx);
+            }
         }
     }
 
@@ -611,12 +657,13 @@ impl Widget for SessionList {
                     while let Some(item_id) = list.next_visible_item(cx) {
                         let Some(s) = sessions.get(item_id) else { continue };
                         let item = list.item(cx, item_id, id!(Item));
-                        item.label(cx, ids!(host)).set_text(cx, &s.hostname);
-                        item.label(cx, ids!(user)).set_text(cx, &s.username);
-                        item.label(cx, ids!(os)).set_text(cx, &s.os);
-                        item.label(cx, ids!(admin))
+                        // Labels live under `content` now (overlay layout).
+                        item.label(cx, ids!(content.host)).set_text(cx, &s.hostname);
+                        item.label(cx, ids!(content.user)).set_text(cx, &s.username);
+                        item.label(cx, ids!(content.os)).set_text(cx, &s.os);
+                        item.label(cx, ids!(content.admin))
                             .set_text(cx, if s.is_admin != 0 { "ADMIN" } else { "" });
-                        item.label(cx, ids!(pend)).set_text(cx, &s.pending.to_string());
+                        item.label(cx, ids!(content.pend)).set_text(cx, &s.pending.to_string());
                         item.draw_all_unscoped(cx);
                     }
                 }

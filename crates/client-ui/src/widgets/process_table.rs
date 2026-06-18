@@ -78,3 +78,21 @@ impl Widget for ProcessTable {
         self.view.handle_event(cx, event, scope);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::arch_name;
+
+    #[test]
+    fn known_arch_labels() {
+        assert_eq!(arch_name(0), "x64");
+        assert_eq!(arch_name(1), "x86");
+        assert_eq!(arch_name(2), "arm64");
+    }
+
+    #[test]
+    fn unknown_arch_falls_back() {
+        assert_eq!(arch_name(3), "?");
+        assert_eq!(arch_name(255), "?");
+    }
+}

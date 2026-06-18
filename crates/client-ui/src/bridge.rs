@@ -66,6 +66,26 @@ pub struct Snapshot {
     pub log_lines: Vec<String>,
     /// Connection state — drives the top status bar.
     pub connected: bool,
+    /// BOF execution updates since the last snapshot. Each entry is appended to
+    /// the BOF history UI global by the App. Empty unless a BOF task changed
+    /// state (enqueued / completed / errored).
+    pub bof_updates: Vec<BofUpdate>,
+}
+
+/// One BOF lifecycle event, pushed worker→UI and routed into the BOFS global.
+#[derive(Debug, Clone)]
+pub struct BofUpdate {
+    pub name: String,
+    pub args: String,
+    pub status: BofState,
+}
+
+/// Lifecycle of a BOF task. Mirrors the widget's display status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BofState {
+    Pending,
+    Done,
+    Error,
 }
 
 /// UI→worker command. Enum keeps the channel message type closed and explicit.
@@ -75,6 +95,12 @@ pub enum Cmd {
     Connect { server: String },
     /// Enqueue a shell task on the given session.
     Shell { session: String, args: String },
+    /// Enqueue a BOF (Beacon Object File) task on the given session. `name` is
+    /// the COFF entry label shown in the BOF history; `args` the space-separated
+    /// arg string (split here to match the server's `Vec<String>`); `data_hex`
+    /// the hex-encoded COFF bytes. The result (`kind == "bof"`) is routed into
+    /// the BOFS UI global.
+    Bof { session: String, name: String, args: String, data_hex: String },
     /// Stop the worker loop (app shutdown).
     Shutdown,
 }
@@ -129,6 +155,24 @@ pub fn spawn() -> Bridge {
 
 // ---- worker loop -----------------------------------------------------------
 
+/// What kind of task a pending entry is, so its result can be routed to the
+/// right UI surface (shell output → event log; BOF output → BOF history).
+#[derive(Clone)]
+enum TaskKind {
+    Shell,
+    /// BOF, carrying its display name + args for the history row.
+    Bof { name: String, args: String },
+}
+
+/// A task whose result the worker is still polling.
+struct PendingTask {
+    session: String,
+    task_id: u64,
+    kind: TaskKind,
+    backoff: Duration,
+    last_poll: Instant,
+}
+
 async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
     let mut server: Option<String> = None;
     let client = reqwest::Client::builder()
@@ -136,22 +180,22 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
         .build()
         .expect("reqwest client build");
 
-    // Pending (session, task_id) pairs whose result we're still polling.
-    // Each gets an exponential backoff so a slow task doesn't spin.
-    let mut pending: Vec<(String, u64, Duration, Instant)> = Vec::new();
+    // Pending tasks whose result we're still polling. Each gets an exponential
+    // backoff so a slow task doesn't spin.
+    let mut pending: Vec<PendingTask> = Vec::new();
     let mut log_buf: Vec<String> = Vec::new();
+    let mut bof_updates: Vec<BofUpdate> = Vec::new();
     let mut last_session_sig = String::new();
 
     loop {
-        // 1. Drain any UI→worker commands (non-blocking). `FromUIReceiver` is
-        //    a std mpsc under the hood; try_recv is non-blocking.
+        // 1. Drain any UI→worker commands (non-blocking).
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Cmd::Shutdown => return,
                 Cmd::Connect { server: s } => {
                     log_push(&mut log_buf, &format!("connecting to {s} …"));
                     server = Some(s);
-                    let _ = to_ui.send(take_snapshot(&mut log_buf, false, &[]));
+                    let _ = to_ui.send(take_snapshot(&mut log_buf, false, &[], &mut bof_updates));
                 }
                 Cmd::Shell { session, args } => {
                     let Some(ref srv) = server else {
@@ -162,18 +206,46 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                         Ok(tid) => {
                             log_push(
                                 &mut log_buf,
-                                &format!("[{}] $ {} → task {}", &session[..session.len().min(8)], args, tid),
+                                &format!("[{}] $ {} → task {}", short(&session), args, tid),
                             );
-                            pending.push((session, tid, Duration::from_millis(500), Instant::now()));
+                            pending.push(PendingTask {
+                                session, task_id: tid, kind: TaskKind::Shell,
+                                backoff: Duration::from_millis(500), last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! enqueue: {e}")),
+                    }
+                }
+                Cmd::Bof { session, name, args, data_hex } => {
+                    let Some(ref srv) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    match enqueue_bof(&client, srv, &session, &name, &args, &data_hex).await {
+                        Ok(tid) => {
+                            log_push(&mut log_buf, &format!("[{}] bof {} → task {}", short(&session), name, tid));
+                            // Show as pending immediately so the panel isn't empty while polling.
+                            bof_updates.push(BofUpdate {
+                                name: name.clone(), args: args.clone(), status: BofState::Pending,
+                            });
+                            pending.push(PendingTask {
+                                session, task_id: tid,
+                                kind: TaskKind::Bof { name, args },
+                                backoff: Duration::from_millis(500), last_poll: Instant::now(),
+                            });
+                        }
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! bof enqueue: {e}"));
+                            bof_updates.push(BofUpdate {
+                                name, args, status: BofState::Error,
+                            });
+                        }
                     }
                 }
             }
         }
 
         let Some(ref srv) = server else {
-            // Not connected yet — idle, but keep draining cmds.
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         };
@@ -186,50 +258,62 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                 if changed {
                     last_session_sig = sig;
                 }
-                // Push whenever the list changed OR there are buffered log
-                // lines (task results) to deliver.
-                if changed || !log_buf.is_empty() {
-                    let _ = to_ui.send(take_snapshot(&mut log_buf, true, &list));
+                if changed || !log_buf.is_empty() || !bof_updates.is_empty() {
+                    let _ = to_ui.send(take_snapshot(&mut log_buf, true, &list, &mut bof_updates));
                 }
             }
             Err(e) => {
                 log_push(&mut log_buf, &format!("! sessions: {e}"));
-                let _ = to_ui.send(take_snapshot(&mut log_buf, false, &[]));
+                let _ = to_ui.send(take_snapshot(&mut log_buf, false, &[], &mut bof_updates));
             }
         }
 
         // 3. Poll pending task results (with per-task backoff).
         let mut still_pending = Vec::new();
-        for (session, tid, backoff, last_poll) in pending.drain(..) {
-            if last_poll.elapsed() < backoff {
-                still_pending.push((session, tid, backoff, last_poll));
+        for t in pending.drain(..) {
+            if t.last_poll.elapsed() < t.backoff {
+                still_pending.push(t);
                 continue;
             }
-            match poll_result(&client, srv, &session, tid).await {
-                Ok(Some(out)) => {
-                    if !out.is_empty() {
-                        log_push(&mut log_buf, &format!("[{}] {}", &session[..session.len().min(8)], out));
+            let PendingTask { session, task_id, kind, backoff, .. } = t;
+            match poll_result(&client, srv, &session, task_id).await {
+                Ok(Some(out)) => match kind {
+                    TaskKind::Shell => {
+                        if !out.is_empty() {
+                            log_push(&mut log_buf, &format!("[{}] {}", short(&session), out));
+                        }
+                    }
+                    TaskKind::Bof { name, args } => {
+                        let status = if out.starts_with("[error]") { BofState::Error } else { BofState::Done };
+                        if !out.is_empty() {
+                            log_push(&mut log_buf, &format!("[{}] bof {}: {}", short(&session), name, out));
+                        }
+                        bof_updates.push(BofUpdate { name, args, status });
+                    }
+                },
+                Ok(None) => {
+                    let next = backoff.saturating_mul(2).min(Duration::from_secs(4));
+                    still_pending.push(PendingTask {
+                        session, task_id, kind, backoff: next, last_poll: Instant::now(),
+                    });
+                }
+                Err(e) => {
+                    log_push(&mut log_buf, &format!("[{}] ! {}", short(&session), e));
+                    if let TaskKind::Bof { name, args } = kind {
+                        bof_updates.push(BofUpdate { name, args, status: BofState::Error });
                     }
                 }
-                Ok(None) => {
-                    // Not ready yet — back off harder (cap at 4s).
-                    let next = backoff.saturating_mul(2).min(Duration::from_secs(4));
-                    still_pending.push((session, tid, next, Instant::now()));
-                }
-                Err(e) => log_push(
-                    &mut log_buf,
-                    &format!("[{}] ! {}", &session[..session.len().min(8)], e),
-                ),
             }
         }
         pending = still_pending;
 
-        // Flush any task-result log lines accumulated this cycle.
-        if !log_buf.is_empty() {
+        // Flush any task-result log lines / BOF updates accumulated this cycle.
+        if !log_buf.is_empty() || !bof_updates.is_empty() {
             let _ = to_ui.send(Snapshot {
                 log_lines: std::mem::take(&mut log_buf),
                 connected: true,
                 sessions: Vec::new(),
+                bof_updates: std::mem::take(&mut bof_updates),
             });
         }
 
@@ -237,11 +321,22 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
     }
 }
 
-fn take_snapshot(log_buf: &mut Vec<String>, connected: bool, sessions: &[SessionView]) -> Snapshot {
+/// Truncate a session id to 8 chars for log lines (matches the UI's `{:.8}`).
+fn short(s: &str) -> &str {
+    &s[..s.len().min(8)]
+}
+
+fn take_snapshot(
+    log_buf: &mut Vec<String>,
+    connected: bool,
+    sessions: &[SessionView],
+    bof_updates: &mut Vec<BofUpdate>,
+) -> Snapshot {
     Snapshot {
         sessions: sessions.to_vec(),
         log_lines: std::mem::take(log_buf),
         connected,
+        bof_updates: std::mem::take(bof_updates),
     }
 }
 
@@ -272,6 +367,35 @@ async fn enqueue_shell(
     let body = serde_json::json!({
         "session": session,
         "command": { "type": "shell", "args": args }
+    });
+    let ack: TaskAck = c
+        .post(format!("{server}/api/task"))
+        .json(&body)
+        .send()
+        .await?
+        .json()
+        .await?;
+    Ok(ack.task_id)
+}
+
+async fn enqueue_bof(
+    c: &reqwest::Client,
+    server: &str,
+    session: &str,
+    name: &str,
+    args: &str,
+    data_hex: &str,
+) -> anyhow::Result<u64> {
+    // The server's `JsonCommand::Bof` wants `args: Vec<String>` — split the
+    // operator-typed space-separated string. Empty arg string → empty vec.
+    let args_vec: Vec<&str> = if args.trim().is_empty() {
+        Vec::new()
+    } else {
+        args.split_whitespace().collect()
+    };
+    let body = serde_json::json!({
+        "session": session,
+        "command": { "type": "bof", "name": name, "args": args_vec, "data_hex": data_hex }
     });
     let ack: TaskAck = c
         .post(format!("{server}/api/task"))
@@ -322,10 +446,77 @@ fn session_signature(list: &[SessionView]) -> String {
     s
 }
 
-fn log_push(buf: &mut Vec<String>, line: impl Into<String>) {
+/// `pub(crate)` so the unit test in `#[cfg(test)] mod tests` (and any future
+/// integration test) can exercise the cap behaviour directly.
+pub(crate) fn log_push(buf: &mut Vec<String>, line: impl Into<String>) {
     buf.push(line.into());
     if buf.len() > LOG_BUFFER_CAP {
         let drop = buf.len() - LOG_BUFFER_CAP;
         buf.drain(..drop);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sv(id: &str, host: &str, user: &str, admin: u8, pend: usize) -> SessionView {
+        SessionView {
+            id: id.into(),
+            hostname: host.into(),
+            username: user.into(),
+            os: String::new(),
+            is_admin: admin,
+            pending: pend,
+            beacon_id: 0,
+            arch: 0,
+            pid: 0,
+        }
+    }
+
+    #[test]
+    fn signature_stable_order() {
+        // Same list → same signature (so the worker doesn't spam snapshots).
+        let a = vec![sv("s1", "h", "u", 0, 1), sv("s2", "h2", "u2", 1, 0)];
+        let b = a.clone();
+        assert_eq!(session_signature(&a), session_signature(&b));
+    }
+
+    #[test]
+    fn signature_detects_change() {
+        // A changed field (pending count, admin flag, user, host, id) must
+        // change the signature — otherwise stale UI.
+        let base = vec![sv("s1", "h", "u", 0, 1)];
+        let sig0 = session_signature(&base);
+        assert_ne!(sig0, session_signature(&vec![sv("s1", "h", "u", 0, 2)]), "pending change");
+        assert_ne!(sig0, session_signature(&vec![sv("s1", "h", "u", 1, 1)]), "admin change");
+        assert_ne!(sig0, session_signature(&vec![sv("s1", "h2", "u", 0, 1)]), "host change");
+        assert_ne!(sig0, session_signature(&vec![sv("s2", "h", "u", 0, 1)]), "id change");
+    }
+
+    #[test]
+    fn signature_empty_is_empty_string() {
+        assert_eq!(session_signature(&[]), "");
+    }
+
+    #[test]
+    fn log_push_appends() {
+        let mut buf = Vec::new();
+        log_push(&mut buf, "a");
+        log_push(&mut buf, "b");
+        assert_eq!(buf, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn log_push_caps_and_drops_oldest() {
+        // Fill past the cap; oldest entries are dropped, newest kept.
+        let mut buf = Vec::new();
+        for i in 0..(LOG_BUFFER_CAP + 50) {
+            log_push(&mut buf, i.to_string());
+        }
+        assert_eq!(buf.len(), LOG_BUFFER_CAP, "buffer must be capped exactly");
+        // The first surviving entry should be the one at offset 50 (we dropped 50).
+        assert_eq!(buf[0], "50", "oldest surviving line must be index 50");
+        assert_eq!(buf.last().unwrap(), &(LOG_BUFFER_CAP + 50 - 1).to_string());
     }
 }

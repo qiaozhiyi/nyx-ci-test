@@ -25,7 +25,7 @@ pub struct FileEntry {
 static FILES: LazyLock<RwLock<Vec<FileEntry>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 
 /// Format a byte count with a binary unit (B / KiB / MiB / GiB), one decimal.
-fn humanize_size(bytes: u64) -> String {
+pub(crate) fn humanize_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut value = bytes as f64;
     let mut unit = 0usize;
@@ -74,5 +74,35 @@ impl Widget for FileTree {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::humanize_size;
+
+    #[test]
+    fn bytes_under_1024_stay_bytes() {
+        assert_eq!(humanize_size(0), "0.0 B");
+        assert_eq!(humanize_size(1), "1.0 B");
+        assert_eq!(humanize_size(1023), "1023.0 B");
+    }
+
+    #[test]
+    fn kib_boundary() {
+        assert_eq!(humanize_size(1024), "1.0 KiB");
+        assert_eq!(humanize_size(1536), "1.5 KiB");
+    }
+
+    #[test]
+    fn mib_and_gib() {
+        assert_eq!(humanize_size(1024 * 1024), "1.0 MiB");
+        assert_eq!(humanize_size(1024 * 1024 * 1024), "1.0 GiB");
+    }
+
+    #[test]
+    fn does_not_exceed_gib_unit() {
+        // Past GiB it stays in GiB (no TiB unit defined).
+        assert!(humanize_size(u64::MAX).ends_with(" GiB"));
     }
 }

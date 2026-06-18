@@ -15,7 +15,10 @@ use std::sync::{LazyLock, RwLock};
 
 // ── shared UI state, read by BofPanel during draw ────────────────────────────
 
-static BOFS: LazyLock<RwLock<Vec<BofEntry>>> = LazyLock::new(|| RwLock::new(Vec::new()));
+/// Shared BOF history. The App pushes updates from the bridge snapshot here;
+/// the widget reads a snapshot during draw. Capped at 1024 rows so a runaway
+/// BOF loop can't grow it unbounded.
+pub static BOFS: LazyLock<RwLock<Vec<BofEntry>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 
 /// Outcome of a single BOF execution, shown as a per-row status tag.
 #[derive(Clone, Debug)]

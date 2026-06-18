@@ -109,3 +109,45 @@ impl Widget for CredTable {
         self.view.handle_event(cx, event, scope);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{kind_label, mask_secret, CredKind};
+
+    #[test]
+    fn short_secret_fully_masked() {
+        // <= 4 chars → bare dots, never revealing any of it.
+        assert_eq!(mask_secret(""), "••••");
+        assert_eq!(mask_secret("a"), "••••");
+        assert_eq!(mask_secret("ab"), "••••");
+        assert_eq!(mask_secret("abcd"), "••••");
+    }
+
+    #[test]
+    fn long_secret_keeps_only_first_and_last_two() {
+        assert_eq!(mask_secret("abcde"), "ab••••de");
+        assert_eq!(mask_secret("secret123"), "se••••23");
+    }
+
+    #[test]
+    fn mask_does_not_leak_middle() {
+        let masked = mask_secret("P@ssw0rd!");
+        assert!(masked.contains("••••"));
+        // First two and last two may appear, but the middle must be masked.
+        assert!(!masked.contains("ssw"));
+    }
+
+    #[test]
+    fn multibyte_secret_does_not_panic() {
+        // Unicode scalar path; must not index mid-codepoint.
+        let _ = mask_secret("密码123456");
+    }
+
+    #[test]
+    fn kind_labels() {
+        assert_eq!(kind_label(&CredKind::Hash), "hash");
+        assert_eq!(kind_label(&CredKind::Password), "password");
+        assert_eq!(kind_label(&CredKind::Ticket), "ticket");
+        assert_eq!(kind_label(&CredKind::Key), "key");
+    }
+}
