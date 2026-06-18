@@ -15,6 +15,9 @@ pub use makepad_widgets;
 use makepad_widgets::*;
 
 pub mod bridge;
+pub mod widgets;
+
+use crate::widgets::{bof_panel::BofPanel, cred_table::CredTable, file_tree::FileTree, process_table::ProcessTable};
 
 use std::sync::{LazyLock, RwLock};
 
@@ -124,6 +127,106 @@ script_mod! {
         }
     }
 
+    // ── G2 feature widgets (BOF / files / processes / credentials) ──────────
+    // Each mirrors SessionList/LogList: a `register_widget` + a `set_type_default`
+    // wrapper mounting a PortalList with an `Item` CachedView (whose inner ids
+    // match what the Rust impl sets) and an `Empty` CachedView fallback.
+
+    // BOF loader panel — rows: name / status / args
+    let BofRow = View{
+        width: Fill height: 26
+        padding: {left: 12.0 right: 12.0}
+        flow: Right spacing: 10.0
+        align: {y: 0.5}
+        draw_bg: {color: Crow, color_hover: Crowhov}
+        name := Label{width: 200 text: "" draw_text: {color: Cprimary, text_style: {font_size: 12.0}}}
+        status := Label{width: 70 text: "" draw_text: {color: Csecond, text_style: {font_size: 11.0}}}
+        args := Label{width: Fill text: "" draw_text: {color: Cmuted, text_style: {font_size: 11.0}}}
+    }
+    let BofEmpty = View{
+        width: Fill height: Fill align: Center flow: Down spacing: 8.0
+        Label{text: "No BOFs executed" draw_text: {color: Cmuted, text_style: {font_size: 14.0}}}
+        Label{text: "BOF loader input arrives in G2 console" draw_text: {color: Cmuted, text_style: {font_size: 11.0}}}
+    }
+    mod.widgets.BofPanelBase = #(BofPanel::register_widget(vm))
+    mod.widgets.BofPanel = set_type_default() do mod.widgets.BofPanelBase{
+        width: Fill height: Fill
+        list := PortalList{width: Fill height: Fill spacing: 1.0 scroll_bar: ScrollBar{}
+            Item := CachedView{BofRow{}} Empty := CachedView{BofEmpty{}}}
+    }
+
+    // File tree — rows: name / size / modified
+    let FileRow = View{
+        width: Fill height: 24
+        padding: {left: 12.0 right: 12.0}
+        flow: Right spacing: 10.0
+        align: {y: 0.5}
+        draw_bg: {color: Crow, color_hover: Crowhov}
+        name := Label{width: Fill text: "" draw_text: {color: Cprimary, text_style: {font_size: 12.0}}}
+        size := Label{width: 90 text: "" draw_text: {color: Csecond, text_style: {font_size: 11.0}}}
+        modified := Label{width: 150 text: "" draw_text: {color: Cmuted, text_style: {font_size: 11.0}}}
+    }
+    let FileEmpty = View{
+        width: Fill height: Fill align: Center flow: Down spacing: 8.0
+        Label{text: "No remote path listed" draw_text: {color: Cmuted, text_style: {font_size: 14.0}}}
+        Label{text: "Run `ls` on a session to browse" draw_text: {color: Cmuted, text_style: {font_size: 11.0}}}
+    }
+    mod.widgets.FileTreeBase = #(FileTree::register_widget(vm))
+    mod.widgets.FileTree = set_type_default() do mod.widgets.FileTreeBase{
+        width: Fill height: Fill
+        list := PortalList{width: Fill height: Fill spacing: 1.0 scroll_bar: ScrollBar{}
+            Item := CachedView{FileRow{}} Empty := CachedView{FileEmpty{}}}
+    }
+
+    // Process table — rows: pid / ppid / name / user / arch
+    let ProcRow = View{
+        width: Fill height: 24
+        padding: {left: 12.0 right: 12.0}
+        flow: Right spacing: 10.0
+        align: {y: 0.5}
+        draw_bg: {color: Crow, color_hover: Crowhov}
+        pid := Label{width: 60 text: "" draw_text: {color: Caccent, text_style: {font_size: 11.0}}}
+        ppid := Label{width: 60 text: "" draw_text: {color: Cmuted, text_style: {font_size: 11.0}}}
+        name := Label{width: Fill text: "" draw_text: {color: Cprimary, text_style: {font_size: 12.0}}}
+        user := Label{width: 100 text: "" draw_text: {color: Csecond, text_style: {font_size: 11.0}}}
+        arch := Label{width: 50 text: "" draw_text: {color: Cmuted, text_style: {font_size: 11.0}}}
+    }
+    let ProcEmpty = View{
+        width: Fill height: Fill align: Center flow: Down spacing: 8.0
+        Label{text: "No processes" draw_text: {color: Cmuted, text_style: {font_size: 14.0}}}
+        Label{text: "Run `ps` on a session" draw_text: {color: Cmuted, text_style: {font_size: 11.0}}}
+    }
+    mod.widgets.ProcessTableBase = #(ProcessTable::register_widget(vm))
+    mod.widgets.ProcessTable = set_type_default() do mod.widgets.ProcessTableBase{
+        width: Fill height: Fill
+        list := PortalList{width: Fill height: Fill spacing: 1.0 scroll_bar: ScrollBar{}
+            Item := CachedView{ProcRow{}} Empty := CachedView{ProcEmpty{}}}
+    }
+
+    // Credential vault — rows: source / principal / kind / value(masked)
+    let CredRow = View{
+        width: Fill height: 26
+        padding: {left: 12.0 right: 12.0}
+        flow: Right spacing: 10.0
+        align: {y: 0.5}
+        draw_bg: {color: Crow, color_hover: Crowhov}
+        source := Label{width: 120 text: "" draw_text: {color: Csecond, text_style: {font_size: 11.0}}}
+        principal := Label{width: 160 text: "" draw_text: {color: Cprimary, text_style: {font_size: 12.0}}}
+        kind := Label{width: 80 text: "" draw_text: {color: Cmuted, text_style: {font_size: 11.0}}}
+        value := Label{width: Fill text: "" draw_text: {color: Cdanger, text_style: {font_size: 11.0}}}
+    }
+    let CredEmpty = View{
+        width: Fill height: Fill align: Center flow: Down spacing: 8.0
+        Label{text: "No credentials" draw_text: {color: Cmuted, text_style: {font_size: 14.0}}}
+        Label{text: "Credentials surface as beacons collect them" draw_text: {color: Cmuted, text_style: {font_size: 11.0}}}
+    }
+    mod.widgets.CredTableBase = #(CredTable::register_widget(vm))
+    mod.widgets.CredTable = set_type_default() do mod.widgets.CredTableBase{
+        width: Fill height: Fill
+        list := PortalList{width: Fill height: Fill spacing: 1.0 scroll_bar: ScrollBar{}
+            Item := CachedView{CredRow{}} Empty := CachedView{CredEmpty{}}}
+    }
+
     let app = startup() do #(App::script_component(vm)){
         ui: Root{
             on_startup: ||{ ui.main_view.render() }
@@ -209,14 +312,80 @@ script_mod! {
 
                         center := View{
                             width: Fill height: Fill
-                            align: Center flow: Down spacing: 8.0
-                            center_text := Label{
-                                text: "Select a session"
-                                draw_text: {color: Cmuted, text_style: {font_size: 16.0}}
+                            flow: Down spacing: 0
+                            draw_bg: {color: Cbg}
+
+                            // ── tab bar ────────────────────────────────────
+                            View{
+                                width: Fill height: 32
+                                padding: {left: 8.0}
+                                flow: Right spacing: 0
+                                align: {y: 0.5}
+                                draw_bg: {color: Cpanel}
+                                tab_console := Button{
+                                    text: "CONSOLE"
+                                    width: 96 height: 26
+                                    draw_bg: {color: Cpanel, color_hover: Crow, color_down: Crow, border_size: 0.0}
+                                    draw_text: {color: Caccent, color_hover: Caccent, text_style: {font_size: 11.0}}
+                                }
+                                tab_bof := Button{
+                                    text: "BOF"
+                                    width: 72 height: 26
+                                    draw_bg: {color: Cpanel, color_hover: Crow, color_down: Crow, border_size: 0.0}
+                                    draw_text: {color: Cmuted, color_hover: Cprimary, text_style: {font_size: 11.0}}
+                                }
+                                tab_files := Button{
+                                    text: "FILES"
+                                    width: 72 height: 26
+                                    draw_bg: {color: Cpanel, color_hover: Crow, color_down: Crow, border_size: 0.0}
+                                    draw_text: {color: Cmuted, color_hover: Cprimary, text_style: {font_size: 11.0}}
+                                }
+                                tab_procs := Button{
+                                    text: "PROCESSES"
+                                    width: 96 height: 26
+                                    draw_bg: {color: Cpanel, color_hover: Crow, color_down: Crow, border_size: 0.0}
+                                    draw_text: {color: Cmuted, color_hover: Cprimary, text_style: {font_size: 11.0}}
+                                }
+                                tab_creds := Button{
+                                    text: "CREDENTIALS"
+                                    width: 110 height: 26
+                                    draw_bg: {color: Cpanel, color_hover: Crow, color_down: Crow, border_size: 0.0}
+                                    draw_text: {color: Cmuted, color_hover: Cprimary, text_style: {font_size: 11.0}}
+                                }
                             }
-                            center_sub := Label{
-                                text: "Interactive console arrives in G2"
-                                draw_text: {color: Cmuted, text_style: {font_size: 11.0}}
+
+                            // ── tab bodies (toggled via set_visible) ───────
+                            pane_console := View{
+                                width: Fill height: Fill
+                                align: Center flow: Down spacing: 8.0
+                                center_text := Label{
+                                    text: "Select a session"
+                                    draw_text: {color: Cmuted, text_style: {font_size: 16.0}}
+                                }
+                                center_sub := Label{
+                                    text: "Interactive shell arrives in G2 console"
+                                    draw_text: {color: Cmuted, text_style: {font_size: 11.0}}
+                                }
+                            }
+                            pane_bof := View{
+                                width: Fill height: Fill
+                                visible: false
+                                mod.widgets.BofPanel{}
+                            }
+                            pane_files := View{
+                                width: Fill height: Fill
+                                visible: false
+                                mod.widgets.FileTree{}
+                            }
+                            pane_procs := View{
+                                width: Fill height: Fill
+                                visible: false
+                                mod.widgets.ProcessTable{}
+                            }
+                            pane_creds := View{
+                                width: Fill height: Fill
+                                visible: false
+                                mod.widgets.CredTable{}
                             }
                         }
                     }
@@ -252,6 +421,26 @@ pub struct App {
     bridge: Option<Bridge>,
     #[rust]
     selected: Option<usize>,
+    #[rust]
+    active_tab: Tab,
+}
+
+/// Which center pane is shown. Defaults to Console. The tab bar is a row of
+/// `Button`s (not Labels) so click detection works via the standard `.clicked`
+/// action — matching the `todo` example's use of clickable buttons.
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Console,
+    Bof,
+    Files,
+    Procs,
+    Creds,
+}
+
+impl Default for Tab {
+    fn default() -> Self {
+        Tab::Console
+    }
 }
 
 impl App {
@@ -292,6 +481,27 @@ impl App {
             .label(cx, ids!(status_text))
             .set_text(cx, if connected { "connected" } else { "disconnected" });
     }
+
+    /// Switch the center pane to `tab`: hide every pane, show the selected one.
+    fn set_active_tab(&mut self, cx: &mut Cx, tab: Tab) {
+        if self.active_tab == tab {
+            return;
+        }
+        self.active_tab = tab;
+        // Show only the active pane; hide the rest. Pane ids are static so we
+        // use the verified `ids!()` macro rather than a runtime lookup.
+        let panes = [
+            (Tab::Console, ids!(pane_console)),
+            (Tab::Bof, ids!(pane_bof)),
+            (Tab::Files, ids!(pane_files)),
+            (Tab::Procs, ids!(pane_procs)),
+            (Tab::Creds, ids!(pane_creds)),
+        ];
+        for (t, id) in panes {
+            self.ui.view(cx, id).set_visible(cx, t == tab);
+        }
+        self.ui.redraw(cx);
+    }
 }
 
 impl MatchEvent for App {
@@ -301,6 +511,23 @@ impl MatchEvent for App {
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        // Tab bar clicks — switch the center pane.
+        if self.ui.button(cx, ids!(tab_console)).clicked(actions) {
+            self.set_active_tab(cx, Tab::Console);
+        }
+        if self.ui.button(cx, ids!(tab_bof)).clicked(actions) {
+            self.set_active_tab(cx, Tab::Bof);
+        }
+        if self.ui.button(cx, ids!(tab_files)).clicked(actions) {
+            self.set_active_tab(cx, Tab::Files);
+        }
+        if self.ui.button(cx, ids!(tab_procs)).clicked(actions) {
+            self.set_active_tab(cx, Tab::Procs);
+        }
+        if self.ui.button(cx, ids!(tab_creds)).clicked(actions) {
+            self.set_active_tab(cx, Tab::Creds);
+        }
+
         let connect_clicked = self.ui.button(cx, ids!(connect_btn)).clicked(actions);
         let entered = self
             .ui
