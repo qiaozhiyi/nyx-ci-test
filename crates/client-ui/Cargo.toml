@@ -1,0 +1,25 @@
+[package]
+name = "nyx-client-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nyx operator GUI — Makepad 2.0 native client (GPU-first, HiDPI/144Hz). Same REST API as the CLI/egui client."
+
+# Makepad 2.0 ships as a git dependency (no crates.io release of the widget
+# crate matches 2.0 yet). Pinned to the commit validated on darwin arm64
+# (d37a34f2) so builds are reproducible. The 2.0 API removed `live_design!` in
+# favour of the `script_mod!` DSL — see src/main.rs for the working boilerplate.
+[dependencies]
+makepad-widgets = { git = "https://github.com/makepad/makepad.git", rev = "d37a34f24e7d1435fc21a185429a235512bdb03c" }
+
+# Async IO for the bridge worker. rustls to avoid an OpenSSL system dep on
+# Linux/Windows; json feature so we can .json::<T>() the REST shapes directly.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[[bin]]
+name = "nyx-client-ui"
+path = "src/main.rs"
