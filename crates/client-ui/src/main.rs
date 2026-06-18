@@ -706,11 +706,17 @@ impl Widget for SessionList {
         while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = step.as_portal_list().borrow_mut() {
                 if sessions.is_empty() {
-                    list.set_item_range(cx, 0, 1);
-                    while let Some(item_id) = list.next_visible_item(cx) {
-                        let item = list.item(cx, item_id, id!(Empty));
-                        item.draw_all_unscoped(cx);
-                    }
+                    // Empty list: render zero rows. We deliberately do NOT use
+                    // the todo-style `set_item_range(0,1)` + Empty-view trick
+                    // here: drawing a single Empty row on first paint (before
+                    // the layout pass completes) causes the PortalList to
+                    // measure 0 tall, which cascades to a 0x0 window that never
+                    // comes onscreen (verified via CGWindowList). The todo
+                    // example sidesteps this by pre-populating its list at
+                    // startup, so its empty branch never runs on first paint.
+                    // We just render nothing; a separate static EmptySessions
+                    // overlay could be added later if desired.
+                    list.set_item_range(cx, 0, 0);
                 } else {
                     list.set_item_range(cx, 0, sessions.len());
                     while let Some(item_id) = list.next_visible_item(cx) {

@@ -50,11 +50,7 @@ impl Widget for BofPanel {
         while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = step.as_portal_list().borrow_mut() {
                 if bofs.is_empty() {
-                    list.set_item_range(cx, 0, 1);
-                    while let Some(item_id) = list.next_visible_item(cx) {
-                        let item = list.item(cx, item_id, id!(Empty));
-                        item.draw_all_unscoped(cx);
-                    }
+                    list.set_item_range(cx, 0, 0);
                 } else {
                     list.set_item_range(cx, 0, bofs.len());
                     while let Some(item_id) = list.next_visible_item(cx) {
