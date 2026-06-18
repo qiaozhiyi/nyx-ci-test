@@ -35,6 +35,11 @@ use bridge::{Bridge, Cmd, SessionView, Snapshot};
 
 static SESSIONS: LazyLock<RwLock<Vec<SessionView>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 static LOG_LINES: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| RwLock::new(Vec::new()));
+/// Index of the currently-selected session row, or usize::MAX for none.
+/// SessionList::draw_walk reads this to tint the selected row's background
+/// (Crowsel) — the only way to give per-row selection feedback through a
+/// virtualized PortalList (the App can't reach inside individual rows).
+static SELECTED_SESSION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 app_main!(App);
 
@@ -55,16 +60,17 @@ script_mod! {
     let Crow      = #x2b2d30  // table row base (same as panel for calm)
     let Crowhov   = #x3c3f41  // row hover (#3c3f41)
     let Crowsel   = #x2e436e  // row selected (blue-tinted, JetBrains selection)
-    let Cborder   = #x323538  // hairline dividers
+    let Cborder   = #x393b40  // hairline dividers (lifted for visibility)
     let Cbar      = #x323538  // secondary bars (tab bar bg)
     let Cprimary  = #xd4d4d4  // primary text (#d4d4d4)
-    let Csecond   = #xbdbdbd  // secondary text
-    let Cmuted    = #x808080  // muted text/labels
+    let Csecond   = #xc4c4c4  // secondary text (lifted)
+    let Cmuted    = #x9a9a9a  // muted text/labels (5.2:1 contrast — WCAG AA)
     let Caccent   = #x3594f5  // accent blue (JetBrains link blue)
     let Cacchov   = #x519bf0  // accent hover
     let Csuccess  = #x35926c  // success (muted green, not neon)
     let Cdanger   = #xcf5b56  // danger (muted red)
     let Cunder    = #x3594f5  // active-tab underline
+    let Cradius   = 6.0       // unified corner radius everywhere
 
     // ── session row (one beacon) ────────────────────────────────────────────
     // `flow: Overlay` so the transparent full-row `select` Button sits ON TOP
@@ -92,19 +98,19 @@ script_mod! {
                 width: 150
                 text: "hostname"
                 draw_text.color: Cprimary
-                draw_text.text_style: theme.font_regular{}
+                draw_text.text_style: theme.font_regular{font_size: 13}
             }
             user := Label{
                 width: 110
                 text: "user"
                 draw_text.color: Csecond
-                draw_text.text_style: theme.font_regular{}
+                draw_text.text_style: theme.font_regular{font_size: 13}
             }
             os := Label{
                 width: Fill
                 text: "os"
                 draw_text.color: Cmuted
-                draw_text.text_style: theme.font_regular{}
+                draw_text.text_style: theme.font_regular{font_size: 13}
             }
             admin := Label{
                 width: 44
@@ -116,7 +122,7 @@ script_mod! {
                 width: 30
                 text: "0"
                 draw_text.color: Caccent
-                draw_text.text_style: theme.font_regular{}
+                draw_text.text_style: theme.font_regular{font_size: 13}
             }
         }
         select := Button{
@@ -144,7 +150,12 @@ script_mod! {
             width: Fill height: Fill
             spacing: 1.0
             scroll_bar: ScrollBar{}
+            // Two item templates: Item (normal) and ItemSel (selected, blue
+            // bg). draw_walk picks per row — can't mutate bg color at runtime
+            // (no safe set_color API in this Makepad version), so we use the
+            // verified "different CachedView id" approach like todo's Empty.
             Item := CachedView{SessionRow{}}
+            ItemSel := CachedView{SessionRow{draw_bg.color: Crowsel}}
             Empty := CachedView{EmptySessions{}}
         }
     }
@@ -157,7 +168,7 @@ script_mod! {
             width: Fill
             text: ""
             draw_text.color: Csecond
-            draw_text.text_style: theme.font_regular{}
+            draw_text.text_style: theme.font_regular{font_size: 13}
         }
     }
     mod.widgets.LogListBase = #(LogList::register_widget(vm))
@@ -184,14 +195,14 @@ script_mod! {
         align: Align{y: 0.5}
         draw_bg.color: Crow
         draw_bg.color_hover: Crowhov
-        name := Label{width: 200 text: "" draw_text.color: Cprimary draw_text.text_style: theme.font_regular{}}
-        status := Label{width: 70 text: "" draw_text.color: Csecond draw_text.text_style: theme.font_regular{}}
-        args := Label{width: Fill text: "" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{}}
+        name := Label{width: 200 text: "" draw_text.color: Cprimary draw_text.text_style: theme.font_regular{font_size: 13}}
+        status := Label{width: 70 text: "" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: 13}}
+        args := Label{width: Fill text: "" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 13}}
     }
     let BofEmpty = View{
         width: Fill height: Fill align: Center flow: Down spacing: theme.space_2
         Label{text: "No BOFs executed" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: theme.font_size_2}}
-        Label{text: "BOF loader input arrives in G2 console" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{}}
+        Label{text: "BOF loader input arrives in G2 console" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 13}}
     }
     mod.widgets.BofPanelBase = #(BofPanel::register_widget(vm))
     mod.widgets.BofPanel = set_type_default() do mod.widgets.BofPanelBase{
@@ -208,14 +219,14 @@ script_mod! {
         align: Align{y: 0.5}
         draw_bg.color: Crow
         draw_bg.color_hover: Crowhov
-        name := Label{width: Fill text: "" draw_text.color: Cprimary draw_text.text_style: theme.font_regular{}}
-        size := Label{width: 90 text: "" draw_text.color: Csecond draw_text.text_style: theme.font_regular{}}
-        modified := Label{width: 150 text: "" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{}}
+        name := Label{width: Fill text: "" draw_text.color: Cprimary draw_text.text_style: theme.font_regular{font_size: 13}}
+        size := Label{width: 90 text: "" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: 13}}
+        modified := Label{width: 150 text: "" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 13}}
     }
     let FileEmpty = View{
         width: Fill height: Fill align: Center flow: Down spacing: theme.space_2
         Label{text: "No remote path listed" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: theme.font_size_2}}
-        Label{text: "Run ls on a session to browse" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{}}
+        Label{text: "Run ls on a session to browse" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 13}}
     }
     mod.widgets.FileTreeBase = #(FileTree::register_widget(vm))
     mod.widgets.FileTree = set_type_default() do mod.widgets.FileTreeBase{
@@ -232,16 +243,16 @@ script_mod! {
         align: Align{y: 0.5}
         draw_bg.color: Crow
         draw_bg.color_hover: Crowhov
-        pid := Label{width: 60 text: "" draw_text.color: Caccent draw_text.text_style: theme.font_regular{}}
-        ppid := Label{width: 60 text: "" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{}}
-        name := Label{width: Fill text: "" draw_text.color: Cprimary draw_text.text_style: theme.font_regular{}}
-        user := Label{width: 100 text: "" draw_text.color: Csecond draw_text.text_style: theme.font_regular{}}
-        arch := Label{width: 50 text: "" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{}}
+        pid := Label{width: 60 text: "" draw_text.color: Caccent draw_text.text_style: theme.font_regular{font_size: 13}}
+        ppid := Label{width: 60 text: "" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 13}}
+        name := Label{width: Fill text: "" draw_text.color: Cprimary draw_text.text_style: theme.font_regular{font_size: 13}}
+        user := Label{width: 100 text: "" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: 13}}
+        arch := Label{width: 50 text: "" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 13}}
     }
     let ProcEmpty = View{
         width: Fill height: Fill align: Center flow: Down spacing: theme.space_2
         Label{text: "No processes" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: theme.font_size_2}}
-        Label{text: "Run ps on a session" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{}}
+        Label{text: "Run ps on a session" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 13}}
     }
     mod.widgets.ProcessTableBase = #(ProcessTable::register_widget(vm))
     mod.widgets.ProcessTable = set_type_default() do mod.widgets.ProcessTableBase{
@@ -258,15 +269,15 @@ script_mod! {
         align: Align{y: 0.5}
         draw_bg.color: Crow
         draw_bg.color_hover: Crowhov
-        source := Label{width: 120 text: "" draw_text.color: Csecond draw_text.text_style: theme.font_regular{}}
-        principal := Label{width: 160 text: "" draw_text.color: Cprimary draw_text.text_style: theme.font_regular{}}
-        kind := Label{width: 80 text: "" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{}}
-        value := Label{width: Fill text: "" draw_text.color: Cdanger draw_text.text_style: theme.font_regular{}}
+        source := Label{width: 120 text: "" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: 13}}
+        principal := Label{width: 160 text: "" draw_text.color: Cprimary draw_text.text_style: theme.font_regular{font_size: 13}}
+        kind := Label{width: 80 text: "" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 13}}
+        value := Label{width: Fill text: "" draw_text.color: Cdanger draw_text.text_style: theme.font_regular{font_size: 13}}
     }
     let CredEmpty = View{
         width: Fill height: Fill align: Center flow: Down spacing: theme.space_2
         Label{text: "No credentials" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: theme.font_size_2}}
-        Label{text: "Credentials surface as beacons collect them" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{}}
+        Label{text: "Credentials surface as beacons collect them" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 13}}
     }
     mod.widgets.CredTableBase = #(CredTable::register_widget(vm))
     mod.widgets.CredTable = set_type_default() do mod.widgets.CredTableBase{
@@ -330,12 +341,12 @@ script_mod! {
                                 draw_bg.color_focus: Cbg
                                 draw_bg.border_color: Cborder
                                 draw_bg.border_color_focus: Caccent
-                                draw_bg.border_radius: 4.0
+                                draw_bg.border_radius: Cradius
                                 draw_text.color: Cprimary
                                 draw_text.color_hover: Cprimary
                                 draw_text.color_focus: Cprimary
                                 draw_text.color_empty: Cmuted
-                                draw_text.text_style: theme.font_regular{}
+                                draw_text.text_style: theme.font_regular{font_size: 13}
                                 draw_cursor.color: Caccent
                             }
                             Label{text: "Port" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: theme.font_size_code}}
@@ -348,12 +359,12 @@ script_mod! {
                                 draw_bg.color_focus: Cbg
                                 draw_bg.border_color: Cborder
                                 draw_bg.border_color_focus: Caccent
-                                draw_bg.border_radius: 4.0
+                                draw_bg.border_radius: Cradius
                                 draw_text.color: Cprimary
                                 draw_text.color_hover: Cprimary
                                 draw_text.color_focus: Cprimary
                                 draw_text.color_empty: Cmuted
-                                draw_text.text_style: theme.font_regular{}
+                                draw_text.text_style: theme.font_regular{font_size: 13}
                                 draw_cursor.color: Caccent
                             }
                             Label{text: "Password" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: theme.font_size_code}}
@@ -367,12 +378,12 @@ script_mod! {
                                 draw_bg.color_focus: Cbg
                                 draw_bg.border_color: Cborder
                                 draw_bg.border_color_focus: Caccent
-                                draw_bg.border_radius: 4.0
+                                draw_bg.border_radius: Cradius
                                 draw_text.color: Cprimary
                                 draw_text.color_hover: Cprimary
                                 draw_text.color_focus: Cprimary
                                 draw_text.color_empty: Cmuted
-                                draw_text.text_style: theme.font_regular{}
+                                draw_text.text_style: theme.font_regular{font_size: 13}
                                 draw_cursor.color: Caccent
                             }
                             Label{text: "Operator Alias" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: theme.font_size_code}}
@@ -385,12 +396,12 @@ script_mod! {
                                 draw_bg.color_focus: Cbg
                                 draw_bg.border_color: Cborder
                                 draw_bg.border_color_focus: Caccent
-                                draw_bg.border_radius: 4.0
+                                draw_bg.border_radius: Cradius
                                 draw_text.color: Cprimary
                                 draw_text.color_hover: Cprimary
                                 draw_text.color_focus: Cprimary
                                 draw_text.color_empty: Cmuted
-                                draw_text.text_style: theme.font_regular{}
+                                draw_text.text_style: theme.font_regular{font_size: 13}
                                 draw_cursor.color: Caccent
                             }
                             View{width: Fill height: 4}
@@ -399,7 +410,7 @@ script_mod! {
                                 width: Fill height: 34
                                 draw_bg.color: Caccent
                                 draw_bg.color_hover: Cacchov
-                                draw_bg.border_radius: 4.0
+                                draw_bg.border_radius: Cradius
                                 draw_text.color: #ffffff
                                 draw_text.text_style: theme.font_bold{}
                             }
@@ -440,12 +451,12 @@ script_mod! {
                             draw_bg.color_focus: Cbg
                             draw_bg.border_color: Cborder
                             draw_bg.border_color_focus: Caccent
-                            draw_bg.border_radius: 3.0
+                            draw_bg.border_radius: Cradius
                             draw_text.color: Cprimary
                             draw_text.color_hover: Cprimary
                             draw_text.color_focus: Cprimary
                             draw_text.color_empty: Cmuted
-                            draw_text.text_style: theme.font_regular{}
+                            draw_text.text_style: theme.font_regular{font_size: 13}
                             draw_cursor.color: Caccent
                         }
                         connect_btn := Button{
@@ -453,7 +464,7 @@ script_mod! {
                             width: 84 height: 28
                             draw_bg.color: Caccent
                             draw_bg.color_hover: Cacchov
-                            draw_bg.border_radius: 3.0
+                            draw_bg.border_radius: Cradius
                             draw_text.color: #ffffff
                             draw_text.text_style: theme.font_bold{}
                         }
@@ -464,19 +475,19 @@ script_mod! {
                             dot_on := View{
                                 width: 8 height: 8
                                 draw_bg.color: Csuccess
-                                draw_bg.border_radius: 4.0
+                                draw_bg.border_radius: Cradius
                                 visible: false
                             }
                             dot_off := View{
                                 width: 8 height: 8
                                 draw_bg.color: Cdanger
-                                draw_bg.border_radius: 4.0
+                                draw_bg.border_radius: Cradius
                             }
                         }
                         status_text := Label{
                             text: "disconnected"
                             draw_text.color: Cmuted
-                            draw_text.text_style: theme.font_regular{}
+                            draw_text.text_style: theme.font_regular{font_size: 13}
                         }
                     }
                     // hairline under connection bar
@@ -524,7 +535,7 @@ script_mod! {
                                     draw_bg.border_size: 0.0
                                     draw_text.color: Caccent
                                     draw_text.color_hover: Caccent
-                                    draw_text.text_style: theme.font_regular{}
+                                    draw_text.text_style: theme.font_regular{font_size: 13}
                                 }
                                 tab_bof := Button{
                                     text: "BOF"
@@ -535,7 +546,7 @@ script_mod! {
                                     draw_bg.border_size: 0.0
                                     draw_text.color: Cmuted
                                     draw_text.color_hover: Csecond
-                                    draw_text.text_style: theme.font_regular{}
+                                    draw_text.text_style: theme.font_regular{font_size: 13}
                                 }
                                 tab_files := Button{
                                     text: "Files"
@@ -546,7 +557,7 @@ script_mod! {
                                     draw_bg.border_size: 0.0
                                     draw_text.color: Cmuted
                                     draw_text.color_hover: Csecond
-                                    draw_text.text_style: theme.font_regular{}
+                                    draw_text.text_style: theme.font_regular{font_size: 13}
                                 }
                                 tab_procs := Button{
                                     text: "Processes"
@@ -557,7 +568,7 @@ script_mod! {
                                     draw_bg.border_size: 0.0
                                     draw_text.color: Cmuted
                                     draw_text.color_hover: Csecond
-                                    draw_text.text_style: theme.font_regular{}
+                                    draw_text.text_style: theme.font_regular{font_size: 13}
                                 }
                                 tab_creds := Button{
                                     text: "Credentials"
@@ -568,7 +579,7 @@ script_mod! {
                                     draw_bg.border_size: 0.0
                                     draw_text.color: Cmuted
                                     draw_text.color_hover: Csecond
-                                    draw_text.text_style: theme.font_regular{}
+                                    draw_text.text_style: theme.font_regular{font_size: 13}
                                 }
                             }
                             // hairline under tab bar
@@ -586,7 +597,7 @@ script_mod! {
                                 center_sub := Label{
                                     text: "Interactive shell arrives in G2 console"
                                     draw_text.color: Cmuted
-                                    draw_text.text_style: theme.font_regular{}
+                                    draw_text.text_style: theme.font_regular{font_size: 13}
                                 }
                             }
                             pane_bof := View{
@@ -819,6 +830,7 @@ impl MatchEvent for App {
         for (item_id, item) in list.items_with_actions(actions) {
             if item.button(cx, ids!(select)).clicked(actions) {
                 self.selected = Some(item_id);
+                SELECTED_SESSION.store(item_id, std::sync::atomic::Ordering::Relaxed);
                 let sessions = SESSIONS.read().unwrap();
                 let s = sessions.get(item_id);
                 let text = match s {
@@ -885,10 +897,13 @@ impl Widget for SessionList {
                     // overlay could be added later if desired.
                     list.set_item_range(cx, 0, 0);
                 } else {
+                    let sel = SELECTED_SESSION.load(std::sync::atomic::Ordering::Relaxed);
                     list.set_item_range(cx, 0, sessions.len());
                     while let Some(item_id) = list.next_visible_item(cx) {
                         let Some(s) = sessions.get(item_id) else { continue };
-                        let item = list.item(cx, item_id, id!(Item));
+                        // Selected row uses the ItemSel template (blue bg);
+                        // others use Item. Verified per-row-id approach.
+                        let item = list.item(cx, item_id, if item_id == sel { id!(ItemSel) } else { id!(Item) });
                         // Labels live under `content` now (overlay layout).
                         item.label(cx, ids!(content.host)).set_text(cx, &s.hostname);
                         item.label(cx, ids!(content.user)).set_text(cx, &s.username);
