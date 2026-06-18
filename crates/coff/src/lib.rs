@@ -11,10 +11,20 @@
 //! (module stomping, `CreateThread`) is the Windows PIC implant's job.
 //!
 //! ## AMD64 relocation types handled
-//! `ADDR64` (0x01), `REL32` (0x03), `REL32_1..5` (0x04..0x08). `ABSOLUTE` (0x00)
-//! is skipped. Others return [`ApplyError::UnsupportedReloc`] (extend as needed).
+//! `ADDR64` (0x01), `ADDR32NB` (0x02), `REL32` (0x03), `REL32_1..5` (0x04..0x08).
+//! `ABSOLUTE` (0x00) is skipped. Others return [`ApplyError::UnsupportedReloc`]
+//! (extend as needed).
+//!
+//! `#![no_std]`-compatible (uses only `alloc`): the parser is pure byte-work,
+//! so it links into a Windows PIC implant as well as the std dev agent. The
+//! error type is hand-rolled (no `thiserror` derive) to keep `no_std`.
 
-use thiserror::Error;
+#![no_std]
+
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// `IMAGE_FILE_MACHINE_AMD64`.
 pub const MACHINE_AMD64: u16 = 0x8664;
@@ -29,24 +39,44 @@ pub mod reloc {
     pub const REL32_1: u16 = 0x0004;
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum CoffError {
-    #[error("truncated COFF input")]
     Truncated,
-    #[error("unsupported machine 0x{0:04x} (only AMD64)")]
     UnsupportedMachine(u16),
 }
 
-#[derive(Debug, Error)]
+impl core::fmt::Display for CoffError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CoffError::Truncated => f.write_str("truncated COFF input"),
+            CoffError::UnsupportedMachine(m) => {
+                write!(f, "unsupported machine 0x{m:04x} (only AMD64)")
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum ApplyError {
-    #[error("relocation references an out-of-range symbol index {0}")]
     BadSymbolIndex(u32),
-    #[error("unresolved external symbol `{0}`")]
     Unresolved(String),
-    #[error("relocation offset out of section bounds")]
     BadOffset,
-    #[error("unsupported relocation type 0x{0:04x}")]
     UnsupportedReloc(u16),
+}
+
+impl core::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ApplyError::BadSymbolIndex(i) => {
+                write!(f, "relocation references an out-of-range symbol index {i}")
+            }
+            ApplyError::Unresolved(s) => write!(f, "unresolved external symbol `{s}`"),
+            ApplyError::BadOffset => f.write_str("relocation offset out of section bounds"),
+            ApplyError::UnsupportedReloc(t) => {
+                write!(f, "unsupported relocation type 0x{t:04x}")
+            }
+        }
+    }
 }
 
 /// A parsed COFF object.

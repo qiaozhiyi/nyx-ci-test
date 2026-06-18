@@ -44,6 +44,10 @@ pub mod ntalloc;
 #[cfg(target_os = "windows")]
 pub mod beacon;
 #[cfg(target_os = "windows")]
+pub mod blind;
+#[cfg(target_os = "windows")]
+pub mod bof;
+#[cfg(target_os = "windows")]
 pub mod entry;
 #[cfg(target_os = "windows")]
 pub mod resolve;
@@ -51,6 +55,8 @@ pub mod resolve;
 pub mod syscalls;
 #[cfg(target_os = "windows")]
 pub mod transport;
+#[cfg(target_os = "windows")]
+pub mod unhook;
 
 // Register the NT-Heap allocator so Vec/String work under #![no_std].
 #[cfg(target_os = "windows")]

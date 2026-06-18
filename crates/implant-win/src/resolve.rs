@@ -194,6 +194,14 @@ impl LiveNtdll {
 }
 
 impl LiveNtdll {
+    /// Borrow the (name, rva) export list of the hooked in-process ntdll. Names
+    /// and RVAs are intact even when stub *bytes* are inline-hooked (hooks
+    /// patch prologues, never the export directory), so this is a safe source
+    /// of (name, rva) pairs to pair with a fresh `.text` for byte reads.
+    pub fn exports_iter(&self) -> &[(HeapStr, u32)] {
+        &self.exports
+    }
+
     /// Resolve the SSN table over the live ntdll. This is the bridge that turns
     /// `nyx_evasion`'s algorithms (Hell's/Halo's/Tartarus' Gate) into a live
     /// runtime result: real stub bytes, real export RVAs.

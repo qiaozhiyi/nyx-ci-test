@@ -26,6 +26,9 @@ nyx-protocol = { path = "../protocol", default-features = false }
 # module implements SyscallSource over the live ntdll, turning these algorithms
 # into a runtime.
 nyx-evasion = { path = "../evasion" }
+# COFF/BOF loader core (no_std-compatible): parse + relocate a CS-compatible
+# BOF object file. The implant's bof.rs maps sections W^X and runs them.
+nyx-coff = { path = "../coff" }
 
 [profile.release]
 opt-level = "z"
