@@ -289,7 +289,133 @@ script_mod! {
                 pass.clear_color: Cbg
                 body +: {
                     width: Fill height: Fill
-                    flow: Down spacing: 0
+                    // flow: Overlay stacks the connect dialog on top of the
+                    // main console. connect_view starts visible, main_view
+                    // hidden; handle_signal flips them once the bridge reports
+                    // connected:true. Mirrors CS's "connect dialog first" flow.
+                    flow: Overlay
+
+                    // ── connect dialog (shown until connected) ──────────────
+                    connect_view := View{
+                        width: Fill height: Fill
+                        align: Center
+                        // The dialog card itself.
+                        SolidView{
+                            width: 420 height: Fit
+                            padding: theme.mspace_3
+                            flow: Down spacing: theme.space_2
+                            draw_bg.color: Cpanel
+                            draw_bg.border_radius: 8.0
+                            draw_bg.border_size: 1.0
+                            draw_bg.border_color: Cborder
+
+                            Label{
+                                text: "NYX"
+                                draw_text.color: Caccent
+                                draw_text.text_style: theme.font_bold{font_size: theme.font_size_2 * 1.6}
+                            }
+                            Label{
+                                text: "Connect to Team Server"
+                                draw_text.color: Cmuted
+                                draw_text.text_style: theme.font_regular{font_size: theme.font_size_p}
+                            }
+                            View{width: Fill height: 8}
+                            Label{text: "Host" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: theme.font_size_code}}
+                            host_input := TextInput{
+                                width: Fill height: 30
+                                padding: theme.mspace_h_2
+                                text: "127.0.0.1"
+                                draw_bg.color: Cbg
+                                draw_bg.color_hover: Cbg
+                                draw_bg.color_focus: Cbg
+                                draw_bg.border_color: Cborder
+                                draw_bg.border_color_focus: Caccent
+                                draw_bg.border_radius: 4.0
+                                draw_text.color: Cprimary
+                                draw_text.color_hover: Cprimary
+                                draw_text.color_focus: Cprimary
+                                draw_text.color_empty: Cmuted
+                                draw_text.text_style: theme.font_regular{}
+                                draw_cursor.color: Caccent
+                            }
+                            Label{text: "Port" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: theme.font_size_code}}
+                            port_input := TextInput{
+                                width: Fill height: 30
+                                padding: theme.mspace_h_2
+                                text: "8443"
+                                draw_bg.color: Cbg
+                                draw_bg.color_hover: Cbg
+                                draw_bg.color_focus: Cbg
+                                draw_bg.border_color: Cborder
+                                draw_bg.border_color_focus: Caccent
+                                draw_bg.border_radius: 4.0
+                                draw_text.color: Cprimary
+                                draw_text.color_hover: Cprimary
+                                draw_text.color_focus: Cprimary
+                                draw_text.color_empty: Cmuted
+                                draw_text.text_style: theme.font_regular{}
+                                draw_cursor.color: Caccent
+                            }
+                            Label{text: "Password" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: theme.font_size_code}}
+                            pass_input := TextInput{
+                                width: Fill height: 30
+                                padding: theme.mspace_h_2
+                                text: ""
+                                empty_text: "team server password"
+                                draw_bg.color: Cbg
+                                draw_bg.color_hover: Cbg
+                                draw_bg.color_focus: Cbg
+                                draw_bg.border_color: Cborder
+                                draw_bg.border_color_focus: Caccent
+                                draw_bg.border_radius: 4.0
+                                draw_text.color: Cprimary
+                                draw_text.color_hover: Cprimary
+                                draw_text.color_focus: Cprimary
+                                draw_text.color_empty: Cmuted
+                                draw_text.text_style: theme.font_regular{}
+                                draw_cursor.color: Caccent
+                            }
+                            Label{text: "Operator Alias" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: theme.font_size_code}}
+                            alias_input := TextInput{
+                                width: Fill height: 30
+                                padding: theme.mspace_h_2
+                                text: "operator"
+                                draw_bg.color: Cbg
+                                draw_bg.color_hover: Cbg
+                                draw_bg.color_focus: Cbg
+                                draw_bg.border_color: Cborder
+                                draw_bg.border_color_focus: Caccent
+                                draw_bg.border_radius: 4.0
+                                draw_text.color: Cprimary
+                                draw_text.color_hover: Cprimary
+                                draw_text.color_focus: Cprimary
+                                draw_text.color_empty: Cmuted
+                                draw_text.text_style: theme.font_regular{}
+                                draw_cursor.color: Caccent
+                            }
+                            View{width: Fill height: 4}
+                            connect_btn := Button{
+                                text: "Connect"
+                                width: Fill height: 34
+                                draw_bg.color: Caccent
+                                draw_bg.color_hover: Cacchov
+                                draw_bg.border_radius: 4.0
+                                draw_text.color: #ffffff
+                                draw_text.text_style: theme.font_bold{}
+                            }
+                            connect_status := Label{
+                                text: ""
+                                draw_text.color: Cdanger
+                                draw_text.text_style: theme.font_regular{font_size: theme.font_size_code}
+                            }
+                        }
+                    }
+
+                    // ── main console (hidden until connected) ──────────────
+                    main_view := View{
+                        width: Fill height: Fill
+                        visible: false
+                        flow: Down spacing: 0
 
                     // ── connection bar ─────────────────────────────────────
                     SolidView{
@@ -501,6 +627,7 @@ script_mod! {
                         }
                         log_list := mod.widgets.LogList{}
                     }
+                    } // close main_view
                 }
             }
         }
@@ -585,6 +712,19 @@ impl App {
             }
         }
         self.set_status(cx, snap.connected);
+        // Toggle connect dialog vs main console. On successful connect,
+        // hide the dialog and reveal the console. On disconnect while in the
+        // console, we stay (the top bar shows the red dot) but surface a
+        // reconnect hint in the dialog status for next time it's shown.
+        self.ui.view(cx, ids!(connect_view)).set_visible(cx, !snap.connected);
+        self.ui.view(cx, ids!(main_view)).set_visible(cx, snap.connected);
+        if !snap.connected {
+            // Show the most recent error line in the dialog (e.g. connection refused).
+            let last_err = LOG_LINES.read().unwrap().last().cloned();
+            if let Some(e) = last_err {
+                self.ui.label(cx, ids!(connect_status)).set_text(cx, &e);
+            }
+        }
         self.ui.redraw(cx);
     }
 
@@ -645,19 +785,30 @@ impl MatchEvent for App {
             self.set_active_tab(cx, Tab::Creds);
         }
 
-        let connect_clicked = self.ui.button(cx, ids!(connect_btn)).clicked(actions);
-        let entered = self
-            .ui
-            .text_input(cx, ids!(server_input))
-            .returned(actions)
-            .is_some();
-        if connect_clicked || entered {
+        // ── Connect dialog (the dedicated connect window) ────────────────
+        // Connect button OR Enter in any connect-dialog field.
+        let dlg_connect = self.ui.button(cx, ids!(connect_btn)).clicked(actions);
+        let dlg_enter = self.ui.text_input(cx, ids!(host_input)).returned(actions).is_some()
+            || self.ui.text_input(cx, ids!(port_input)).returned(actions).is_some()
+            || self.ui.text_input(cx, ids!(pass_input)).returned(actions).is_some()
+            || self.ui.text_input(cx, ids!(alias_input)).returned(actions).is_some();
+        if dlg_connect || dlg_enter {
             self.ensure_bridge();
             if let Some(b) = &self.bridge {
-                let url = self.ui.text_input(cx, ids!(server_input)).text();
+                let host = self.ui.text_input(cx, ids!(host_input)).text();
+                let port = self.ui.text_input(cx, ids!(port_input)).text();
+                // The bridge expects a full base URL. Nyx server defaults to
+                // plaintext HTTP on the operator port; if the user typed https
+                // we'd need TLS support — for now always http://.
+                let url = format!("http://{}:{}", host.trim(), port.trim());
                 let _ = b.from_ui.send(Cmd::Connect { server: url });
+                self.ui.label(cx, ids!(connect_status)).set_text(cx, "connecting…");
             }
         }
+
+        // ── Main-view connection bar (reconnect after disconnect) ────────
+        let bar_connect = self.ui.button(cx, ids!(connect_btn)).clicked(actions);
+        let _ = bar_connect; // same id as the dialog button; handled above.
 
         // Session row selection. `items_with_actions` only yields rows whose
         // child widgets fired an action, so each row carries an invisible
