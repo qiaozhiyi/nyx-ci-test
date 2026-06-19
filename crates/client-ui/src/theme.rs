@@ -50,6 +50,29 @@ pub struct Palette {
     pub border: Vec4,
     /// Recessed secondary bars (tab bar, section headers).
     pub bar: Vec4,
+    /// Text-input fill — SAME surface as the card (`elev`), so the field does
+    /// NOT fight the card with a lighter/darker patch. This is the GitHub-dark
+    /// input pattern: no fill contrast, the boundary is carried entirely by
+    /// `input_b`. Fiddling with fill contrast (darker = grey patch, brighter =
+    /// floating box) all read worse than just blending in.
+    pub input: Vec4,
+    /// Text-input default edge — a CLEARLY VISIBLE 1px line (not near-
+    /// invisible). Because the fill blends with the card, the border IS the
+    /// field boundary, so it must be legible at rest. Saturated accent still
+    /// reserved for focus.
+    pub input_b: Vec4,
+    /// Network-bg gradient top.
+    pub grad_top: Vec4,
+    /// Network-bg gradient bottom.
+    pub grad_bot: Vec4,
+    /// Network-node dot color.
+    pub node: Vec4,
+    /// Network connecting-line color.
+    pub line: Vec4,
+    /// Card-edge neon glow color (magenta).
+    pub glow: Vec4,
+    /// Connect-button gradient end color (deeper violet).
+    pub btn_grad2: Vec4,
     /// Primary text.
     pub primary: Vec4,
     /// Secondary text.
@@ -101,6 +124,14 @@ impl Palette {
             rowsel:  rgb(0x3A, 0x2A, 0x3E), // #3A2A3E  row selected (magenta tint)
             border:  rgb(0x3D, 0x3D, 0x50), // #3D3D50  hairline dividers (visible)
             bar:     rgb(0x1B, 0x1B, 0x26), // #1B1B26  recessed bars
+            input:   rgb(0x2D, 0x2D, 0x3D), // #2D2D3D  input fill = elev (blend with card)
+            input_b: rgb(0x4A, 0x4A, 0x60), // #4A4A60  visible input border (legible at rest)
+            grad_top: rgb(0x1A, 0x1A, 0x2E), // #1A1A2E  bg gradient top
+            grad_bot: rgb(0x0F, 0x0F, 0x1A), // #0F0F1A  bg gradient bottom
+            node:    rgb(0x8B, 0x9D, 0xC3), // #8B9DC3  network nodes (α set in shader)
+            line:    rgb(0x5A, 0x6B, 0xA0), // #5A6BA0  network lines
+            glow:    rgb(0xC5, 0x86, 0xC0), // #C586C0  card neon glow
+            btn_grad2: rgb(0x9B, 0x6B, 0xB5), // #9B6BB5  button gradient end
             primary: rgb(0xD4, 0xD4, 0xD4), // #D4D4D4  primary text
             second:  rgb(0xAB, 0xAB, 0xB2), // #ABABB2  secondary text
             muted:   rgb(0x7F, 0x7F, 0x86), // #7F7F86  muted text
@@ -125,6 +156,14 @@ impl Palette {
             rowsel:  rgb(0xF3, 0xE9, 0xF1), // #F3E9F1
             border:  rgb(0xDD, 0xDD, 0xE4), // #DDDDE4
             bar:     rgb(0xED, 0xED, 0xF2), // #EDEDF2
+            input:   rgb(0xFF, 0xFF, 0xFF), // #FFFFFF  input fill = elev (blend with card)
+            input_b: rgb(0xD0, 0xD0, 0xDA), // #D0D0DA  visible input border (legible at rest)
+            grad_top: rgb(0xE8, 0xE6, 0xF0), // #E8E6F0
+            grad_bot: rgb(0xD4, 0xD2, 0xE0), // #D4D2E0
+            node:    rgb(0x6A, 0x5A, 0x8A), // #6A5A8A
+            line:    rgb(0x9A, 0x8A, 0xB0), // #9A8AB0
+            glow:    rgb(0xA8, 0x4A, 0x9E), // #A84A9E
+            btn_grad2: rgb(0x8A, 0x4A, 0x86), // #8A4A86
             primary: rgb(0x2C, 0x2C, 0x38), // #2C2C38
             second:  rgb(0x5A, 0x5A, 0x68), // #5A5A68
             muted:   rgb(0x84, 0x84, 0x92), // #848492
