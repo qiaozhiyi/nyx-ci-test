@@ -142,7 +142,7 @@ script_mod! {
     // (tint/border/shadow/fallback) = instance; static knobs (blur level,
     // surface alpha, radii) = uniform.
     let GlassCard = GaussRoundedView{
-        width: 460 height: Fit
+        width: 400 height: Fit
         flow: Down
         draw_bg +: {
             tint_color: instance(#x2D2D3D)
@@ -168,7 +168,7 @@ script_mod! {
     // overlay Button (reusing the dialog_theme_btn id) captures the click so
     // the existing handle_actions toggle path needs NO change.
     let ThemeSwitch = View{
-        width: 90 height: 30
+        width: 76 height: 28
         flow: Overlay
         show_bg: true
         draw_bg +: {
@@ -176,7 +176,6 @@ script_mod! {
             track_dark: instance(#x2A2A3E)
             track_light: instance(#xE8E0F0)
             knob_color: instance(#xF5F5F8)
-            accent: instance(#xC586C0)
 
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
@@ -184,28 +183,30 @@ script_mod! {
                 let h = self.rect_size.y
                 let r = h * 0.5
 
-                // Pill track — color blends with state.
+                // Pill track — color blends with state (mix = free fn, GLSL builtin).
                 sdf.box(0.0, 0.0, w, h, r)
-                sdf.fill(self.track_light.rgb.mix(self.track_dark.rgb, self.is_dark))
+                sdf.fill(vec4(mix(self.track_light.rgb, self.track_dark.rgb, self.is_dark), 1.0))
 
                 // Knob slides: is_dark=0 (light) → left, is_dark=1 (dark) → right.
-                let knob_x = r.mix(w - r, self.is_dark)
-                sdf.circle(knob_x, h * 0.5, r * 0.78)
+                let knob_x = mix(r, w - r, self.is_dark)
+                let kr = r * 0.72
+                sdf.circle(knob_x, h * 0.5, kr)
                 sdf.fill(self.knob_color)
 
-                // Sun (drawn on the LEFT, visible when light / is_dark≈0): small
-                // warm disc inside the knob area when knob is left.
-                let sun_x = r
-                sdf.circle(sun_x, h * 0.5, r * 0.45)
-                sdf.fill_keep(vec4(1.0, 0.82, 0.48, 1.0 - self.is_dark))
-
-                // Moon crescent (drawn on the RIGHT, visible when dark): two
-                // overlapping circles, subtract to carve the crescent.
-                let moon_x = w - r
-                sdf.circle(moon_x, h * 0.5, r * 0.5)
-                sdf.fill_keep(vec4(0.72, 0.77, 0.91, self.is_dark))
-                sdf.circle(moon_x + r * 0.28, h * 0.5 - r * 0.14, r * 0.46)
-                sdf.subtract()
+                // Glyph INSIDE the knob: a sun disc when light (is_dark≈0),
+                // a moon crescent when dark (is_dark≈1). Drawn at the knob's
+                // own center so it always rides with the knob.
+                if self.is_dark < 0.5 {
+                    // Sun: warm disc, slightly smaller than the knob.
+                    sdf.circle(knob_x, h * 0.5, kr * 0.6)
+                    sdf.fill_keep(vec4(1.0, 0.78, 0.42, 1.0))
+                } else {
+                    // Moon: full disc then subtract an offset disc → crescent.
+                    sdf.circle(knob_x, h * 0.5, kr * 0.62)
+                    sdf.fill_keep(vec4(0.72, 0.77, 0.91, 1.0))
+                    sdf.circle(knob_x + kr * 0.3, h * 0.5 - kr * 0.16, kr * 0.56)
+                    sdf.subtract()
+                }
 
                 return sdf.result
             }
@@ -496,7 +497,7 @@ script_mod! {
             // handler (counter's does). Counter needs it because it uses
             // on_render for its label; we don't.
             main_window := Window{
-                window.inner_size: vec2(1280, 800)
+                window.inner_size: vec2(1024, 700)
                 pass.clear_color: Cbg
                 body +: {
                     width: Fill height: Fill
@@ -1383,11 +1384,20 @@ impl App {
         }
 
         // 4b. Connect button gradient — magenta (accent) → deep violet
-        // (btn_grad2), horizontal. Button.shader auto-activates the gradient
-        // once color_2 is a real color (x > -0.5), set here per theme.
+        // (btn_grad2), horizontal. Hover lifts BOTH gradient stops toward a
+        // brighter pink (cacchov / a lightened btn_grad2) so the button visibly
+        // brightens on hover — Button's built-in Animator drives the smooth 0→1
+        // transition via self.hover, giving the "dynamic" feel. color_2_hover
+        // must be set too or hover breaks the gradient (falls to default theme).
+        let cbtn_hover2 = vec4(
+            p.btn_grad2.x.min(1.0) + 0.12,
+            p.btn_grad2.y.min(1.0) + 0.12,
+            p.btn_grad2.z.min(1.0) + 0.12,
+            1.0,
+        );
         let mut cbtn = self.ui.button(cx, ids!(dialog_connect_btn));
         script_apply_eval!(cx, cbtn, {
-            draw_bg +: { color: #(caccent), color_2: #(cbtn_grad2), gradient_fill_horizontal: 1.0 }
+            draw_bg +: { color: #(caccent), color_2: #(cbtn_grad2), color_hover: #(cacchov), color_2_hover: #(cbtn_hover2), gradient_fill_horizontal: 1.0 }
         });
 
         // Theme switch: drive its shader's is_dark instance (1.0 dark / 0.0
