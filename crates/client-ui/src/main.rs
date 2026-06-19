@@ -590,7 +590,7 @@ script_mod! {
                             draw_bg.color: Caccent
                             draw_bg.color_hover: Cacchov
                             draw_bg.border_radius: Cradius
-                            draw_text.color: #ffffff
+                            draw_text.color: Cbg
                             draw_text.text_style: theme.font_bold{font_size: 12}
                         }
                         // Circular status indicator (border_radius = half size).
