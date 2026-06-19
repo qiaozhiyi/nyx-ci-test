@@ -88,25 +88,28 @@ impl Palette {
 
     /// One Dark Pro ramp — deep purple-charcoal with a pink-magenta signal.
     /// Mirrors the `#x` tokens in main.rs script_mod!; change one, change both.
+    /// Elevation steps are spread wide enough (bg → panel → elev → border) that
+    /// the dialog card and panel headers read as distinct surfaces against the
+    /// window background — the v1 ramp was too tight and the card vanished.
     pub fn dark() -> Self {
         Palette {
-            bg:      rgb(0x1A, 0x1A, 0x25), // #1A1A25
-            panel:   rgb(0x1E, 0x1E, 0x2E), // #1E1E2E
-            elev:    rgb(0x25, 0x25, 0x33), // #252533
-            row:     rgb(0x1E, 0x1E, 0x2E), // #1E1E2E
-            rowhov:  rgb(0x2A, 0x2A, 0x3A), // #2A2A3A
-            rowsel:  rgb(0x3A, 0x2A, 0x3E), // #3A2A3E
-            border:  rgb(0x2A, 0x2A, 0x3A), // #2A2A3A
-            bar:     rgb(0x1E, 0x1E, 0x2E), // #1E1E2E
-            primary: rgb(0xCC, 0xCC, 0xCC), // #CCCCCC
-            second:  rgb(0xAA, 0xAA, 0xAA), // #AAAAAA
-            muted:   rgb(0x8A, 0x8A, 0x8A), // #8A8A8A
-            accent:  rgb(0xC5, 0x86, 0xC0), // #C586C0 (One Dark magenta)
-            acchov:  rgb(0xD8, 0x9E, 0xD4), // #D89ED4
-            success: rgb(0x4E, 0xC9, 0xB0), // #4EC9B0 (teal)
-            danger:  rgb(0xF4, 0x47, 0x47), // #F44747
-            warn:    rgb(0xDC, 0xDC, 0xAA), // #DCDCAA
-            info:    rgb(0x9C, 0xDC, 0xFE), // #9CDCFE (light blue)
+            bg:      rgb(0x16, 0x16, 0x1E), // #16161E  app bg (deepest)
+            panel:   rgb(0x1B, 0x1B, 0x26), // #1B1B26  side panels / log shell
+            elev:    rgb(0x2D, 0x2D, 0x3D), // #2D2D3D  card / inputs / headers
+            row:     rgb(0x1B, 0x1B, 0x26), // #1B1B26  table row base
+            rowhov:  rgb(0x35, 0x35, 0x48), // #353548  row hover
+            rowsel:  rgb(0x3A, 0x2A, 0x3E), // #3A2A3E  row selected (magenta tint)
+            border:  rgb(0x3D, 0x3D, 0x50), // #3D3D50  hairline dividers (visible)
+            bar:     rgb(0x1B, 0x1B, 0x26), // #1B1B26  recessed bars
+            primary: rgb(0xD4, 0xD4, 0xD4), // #D4D4D4  primary text
+            second:  rgb(0xAB, 0xAB, 0xB2), // #ABABB2  secondary text
+            muted:   rgb(0x7F, 0x7F, 0x86), // #7F7F86  muted text
+            accent:  rgb(0xC5, 0x86, 0xC0), // #C586C0  One Dark magenta
+            acchov:  rgb(0xD8, 0x9E, 0xD4), // #D89ED4  accent hover
+            success: rgb(0x4E, 0xC9, 0xB0), // #4EC9B0  teal
+            danger:  rgb(0xF4, 0x47, 0x47), // #F44747  red
+            warn:    rgb(0xDC, 0xDC, 0xAA), // #DCDCAA  warm yellow
+            info:    rgb(0x9C, 0xDC, 0xFE), // #9CDCFE  light blue
         }
     }
 

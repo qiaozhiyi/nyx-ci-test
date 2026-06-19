@@ -56,17 +56,17 @@ script_mod! {
     // light-blue info. These hex values MIRROR `Palette::dark()` in theme.rs —
     // the dynamic ramp consulted at draw time so the theme toggle repaints
     // consistently. Keep the two in lockstep: change one, change both.
-    let Cbg       = #x1A1A25  // app background — deepest surface
-    let Cbar      = #x1E1E2E  // recessed secondary bars / tab bar
-    let Cpanel    = #x1E1E2E  // side panels + event-log shell
-    let Crow      = #x1E1E2E  // table/data-row base
-    let Crowhov   = #x2A2A3A  // row hover
+    let Cbg       = #x16161E  // app background — deepest surface
+    let Cbar      = #x1B1B26  // recessed secondary bars / tab bar
+    let Cpanel    = #x1B1B26  // side panels + event-log shell
+    let Crow      = #x1B1B26  // table/data-row base
+    let Crowhov   = #x353548  // row hover
     let Crowsel   = #x3A2A3E  // row selected (magenta-tinted)
-    let Celev     = #x252533  // brightest surface — column headers / dialog card
-    let Cborder   = #x2A2A3A  // hairline dividers
-    let Cprimary  = #xCCCCCC  // primary text
-    let Csecond   = #xAAAAAA  // secondary text
-    let Cmuted    = #x8A8A8A  // muted text / column labels
+    let Celev     = #x2D2D3D  // brightest surface — column headers / dialog card
+    let Cborder   = #x3D3D50  // hairline dividers
+    let Cprimary  = #xD4D4D4  // primary text
+    let Csecond   = #xABABB2  // secondary text
+    let Cmuted    = #x7F7F86  // muted text / column labels
     let Caccent   = #xC586C0  // signature magenta accent
     let Cacchov   = #xD89ED4  // accent hover
     let Csuccess  = #x4EC9B0  // success / online (teal)
@@ -376,7 +376,7 @@ script_mod! {
                     flow: Down
 
                     // ── connect dialog (shown until connected) ──────────────
-                    connect_view := View{
+                    connect_view := SolidView{
                         width: Fill height: Fill
                         align: Center
                         draw_bg.color: Cbg
@@ -386,7 +386,7 @@ script_mod! {
                             flow: Down
                             draw_bg.color: Celev
                             draw_bg.border_radius: Cradius
-                            draw_bg.border_size: 1.0
+                            draw_bg.border_size: 2.0
                             draw_bg.border_color: Cborder
 
                             // Brand header: gradient logo box + wordmark + tagline.
@@ -399,11 +399,12 @@ script_mod! {
                                     width: Fit height: Fit
                                     flow: Right spacing: 10.0
                                     align: Align{y: 0.5}
-                                    logo_box := View{
-                                        width: 30 height: 30
+                                    logo_box := SolidView{
+                                        width: 32 height: 32
                                         draw_bg.color: Caccent
-                                        draw_bg.border_radius: 6.0
-                                        align: Center
+                                        draw_bg.border_radius: 7.0
+                                        padding: Inset{top: 6.0}
+                                        align: Align{x: 0.5 y: 0.5}
                                         logo_letter := Label{
                                             text: "N"
                                             draw_text.color: Cbg
@@ -973,20 +974,16 @@ impl App {
         });
 
         // 2. Dialog: backdrop, card, logo box.
-        let mut cv = self.ui.view(cx, ids!(connect_view));
-        script_apply_eval!(cx, cv, {
-            draw_bg +: { color: #(cbg) }
-        });
-        let mut cc = self.ui.view(cx, ids!(connect_card));
-        script_apply_eval!(cx, cc, {
-            draw_bg +: { color: #(celev), border_color: #(cborder) }
-        });
-        // Logo box (filled with accent) + its "N" letter (drawn in bg color so
-        // it inverts against the magenta).
-        let mut lb = self.ui.view(cx, ids!(logo_box));
-        script_apply_eval!(cx, lb, {
-            draw_bg +: { color: #(caccent) }
-        });
+        // NOTE: connect_view / connect_card / logo_box are SolidView, NOT View.
+        // `self.ui.view()` returns the wrong widget type for a SolidView, and a
+        // `script_apply_eval!` through it silently sets draw_bg to a garbage/
+        // transparent value — which is exactly why the magenta logo box
+        // disappeared in v1. Verified: a SolidView with an inline DSL
+        // draw_bg.color renders correctly WITHOUT any runtime apply (a red
+        // test square showed up), so we rely on the DSL inline values here
+        // (which mirror Palette::dark()). The theme toggle (Light) won't
+        // recolor these three surfaces — acceptable for now; the dark ramp is
+        // the primary theme. Only the Label inside (logo_letter) is repainted.
         let mut ll = self.ui.label(cx, ids!(logo_letter));
         script_apply_eval!(cx, ll, {
             draw_text +: { color: #(cbg) }
