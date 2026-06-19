@@ -160,23 +160,24 @@ script_mod! {
         }
     }
 
-    // ── theme switch (clean solid toggle, no glyph) ─────────────────────────
-    // Earlier versions drew a sun/moon glyph INSIDE the knob, but at 52px the
-    // crescent subtract pixelated into an unreadable blob ("一坨"). A clean
-    // solid toggle (track + knob only) is what iOS/Android actually ship and
-    // stays crisp at any size. State is shown by knob position + track color
-    // (saturated purple = dark on, soft lilac = light off). A transparent
-    // overlay Button (dialog_theme_btn id) captures the click so the existing
-    // handle_actions toggle path is unchanged.
+    // ── theme switch (sun/moon toggle, reference design) ────────────────────
+    // The reference shows a pill toggle with a SUN glyph at the left end and a
+    // MOON at the right end; a knob slides between them, covering whichever
+    // side is inactive. Earlier attempts drew the glyph INSIDE the knob (too
+    // small → blob). Here the glyphs sit at the track ENDS (outside the knob's
+    // travel) so they're never covered and stay legible. Size 96x40 gives each
+    // glyph ~20px — enough to read at HiDPI.
     let ThemeSwitch = View{
-        width: 50 height: 28
+        width: 96 height: 40
         flow: Overlay
         show_bg: true
         draw_bg +: {
             is_dark: instance(1.0)
             track_on: instance(#x6B3E80)
             track_off: instance(#xC4BCD4)
-            knob_color: instance(#xFFFFFF)
+            knob_color: instance(#xF4F0FA)
+            sun_color: instance(#xFFD27A)
+            moon_color: instance(#C8D4F0)
 
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
@@ -188,9 +189,42 @@ script_mod! {
                 sdf.box(0.0, 0.0, w, h, r)
                 sdf.fill(vec4(mix(self.track_off.rgb, self.track_on.rgb, self.is_dark), 1.0))
 
-                // Knob slides left(off)↔right(on).
+                // Sun glyph at the LEFT end (inside the track, clear of the knob).
+                // A small disc + 4 short rays.
+                let sx = r + 4.0
+                let sy = h * 0.5
+                let sr = r * 0.32
+                sdf.circle(sx, sy, sr)
+                sdf.fill_keep(vec4(self.sun_color.rgb, 1.0))
+                // rays (4 short strokes)
+                sdf.move_to(sx, sy - sr - 2.0)
+                sdf.line_to(sx, sy - sr - 5.0)
+                sdf.stroke(vec4(self.sun_color.rgb, 1.0), 1.2)
+                sdf.move_to(sx, sy + sr + 2.0)
+                sdf.line_to(sx, sy + sr + 5.0)
+                sdf.stroke(vec4(self.sun_color.rgb, 1.0), 1.2)
+                sdf.move_to(sx - sr - 2.0, sy)
+                sdf.line_to(sx - sr - 5.0, sy)
+                sdf.stroke(vec4(self.sun_color.rgb, 1.0), 1.2)
+                sdf.move_to(sx + sr + 2.0, sy)
+                sdf.line_to(sx + sr + 5.0, sy)
+                sdf.stroke(vec4(self.sun_color.rgb, 1.0), 1.2)
+
+                // Moon glyph at the RIGHT end — disc minus offset disc = crescent.
+                let mx = w - r - 4.0
+                let my = h * 0.5
+                let mr = r * 0.36
+                sdf.circle(mx, my, mr)
+                sdf.fill_keep(vec4(self.moon_color.rgb, 1.0))
+                sdf.circle(mx + mr * 0.35, my - mr * 0.2, mr * 0.85)
+                sdf.subtract()
+
+                // Knob slides over the INACTIVE end. Light mode (is_dark=0) →
+                // knob left, covering the sun (it's daytime, sun "absorbed");
+                // dark mode → knob right, covering the moon. The active glyph
+                // on the opposite end stays visible.
                 let knob_x = mix(r, w - r, self.is_dark)
-                sdf.circle(knob_x, h * 0.5, r * 0.72)
+                sdf.circle(knob_x, h * 0.5, r * 0.7)
                 sdf.fill(self.knob_color)
 
                 return sdf.result
@@ -482,7 +516,7 @@ script_mod! {
             // handler (counter's does). Counter needs it because it uses
             // on_render for its label; we don't.
             main_window := Window{
-                window.inner_size: vec2(372, 460)
+                window.inner_size: vec2(420, 540)
                 pass.clear_color: Cbg
                 body +: {
                     width: Fill height: Fill
@@ -1125,9 +1159,8 @@ impl App {
         }
         self.set_status(cx, snap.connected);
         // Grow the window to full console size on the connect TRANSITION. The
-        // login view uses a small 372x460 window (just the card); the console
-        // needs 1280x800. has_connected is sticky (once connected we stay in the
-        // console even if the session later drops), so this fires exactly once.
+        // login view uses a compact 420x540 window; the console needs 1280x800.
+        // has_connected is sticky so this fires exactly once.
         if snap.connected && !self.has_connected {
             self.ui.window(cx, ids!(main_window)).resize(cx, dvec2(1280.0, 800.0));
         }
