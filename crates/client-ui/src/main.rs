@@ -51,34 +51,29 @@ script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
-    // ── Professional dark palette ──────────────────────────────────────────
-    // Four discrete elevation steps (bg → bar/panel → row → elev) give real
-    // depth instead of a flat single-grey wash. The cobalt accent (#2f88ff) is
-    // the ONLY saturated hue; everything else is desaturated steel — that single
-    // signal is what makes it read as a pro tool rather than a toy. Text
-    // contrast is tuned for WCAG AA against its surface (the old #5d6575 muted
-    // was ~3:1 and made tables a strain to read).
-    //
-    // These hex values MIRROR `Palette::dark()` in theme.rs — the dynamic ramp
-    // consulted at draw time so the Light/Dark toggle repaints consistently.
-    // Keep the two in lockstep: change one, change the other.
-    let Cbg       = #x0d0f13  // app background — deepest surface
-    let Cbar      = #x0a0c10  // recessed secondary bars / tab bar
-    let Cpanel    = #x14171d  // side panels + event-log shell
-    let Crow      = #x12151b  // table/data-row base
-    let Crowhov   = #x1f2531  // row hover
-    let Crowsel   = #x1b3a5e  // row selected (cobalt-tinted)
-    let Celev     = #x1b1f27  // brightest surface — column headers / dialog card
-    let Cborder   = #x242935  // hairline dividers
-    let Cprimary  = #xe6e9ef  // primary text
-    let Csecond   = #x96a0b0  // secondary text
-    let Cmuted    = #x626c7d  // muted text / column labels
-    let Caccent   = #x2f88ff  // signature cobalt accent
-    let Cacchov   = #x5aa3ff  // accent hover
-    let Csuccess  = #x3ecf8e  // success / online
-    let Cdanger   = #xff5b5b  // danger / alert
-    let Cwarn     = #xffb454  // warning / pending / secrets
-    let Cunder    = #x2f88ff  // active-tab underline
+    // ── One Dark Pro palette ───────────────────────────────────────────────
+    // Deep purple-charcoal base, single magenta signal (#C586C0), teal success,
+    // light-blue info. These hex values MIRROR `Palette::dark()` in theme.rs —
+    // the dynamic ramp consulted at draw time so the theme toggle repaints
+    // consistently. Keep the two in lockstep: change one, change both.
+    let Cbg       = #x1A1A25  // app background — deepest surface
+    let Cbar      = #x1E1E2E  // recessed secondary bars / tab bar
+    let Cpanel    = #x1E1E2E  // side panels + event-log shell
+    let Crow      = #x1E1E2E  // table/data-row base
+    let Crowhov   = #x2A2A3A  // row hover
+    let Crowsel   = #x3A2A3E  // row selected (magenta-tinted)
+    let Celev     = #x252533  // brightest surface — column headers / dialog card
+    let Cborder   = #x2A2A3A  // hairline dividers
+    let Cprimary  = #xCCCCCC  // primary text
+    let Csecond   = #xAAAAAA  // secondary text
+    let Cmuted    = #x8A8A8A  // muted text / column labels
+    let Caccent   = #xC586C0  // signature magenta accent
+    let Cacchov   = #xD89ED4  // accent hover
+    let Csuccess  = #x4EC9B0  // success / online (teal)
+    let Cdanger   = #xF44747  // danger / alert
+    let Cwarn     = #xDCDCAA  // warning / pending / secrets
+    let Cinfo     = #x9CDCFE  // info / command keyword
+    let Cunder    = #xC586C0  // active-tab underline (magenta)
     let Cradius   = 6.0       // unified corner radius (cards / buttons / inputs)
     let Cradius_s = 3.0       // small radius (tags / badges)
     // Shared layout metrics so column headers and data rows stay perfectly
