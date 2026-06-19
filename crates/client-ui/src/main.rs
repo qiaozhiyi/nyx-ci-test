@@ -83,6 +83,58 @@ script_mod! {
     let Cpad      = 14.0      // table row / header horizontal inset
     let Cgap      = 16.0      // column gap inside rows / headers
 
+    // ── animated network-node background (glassmorphism scene) ──────────────
+    // Pure-DSL shader View (the GlassPanel precedent — no Rust struct). Draws a
+    // vertical 2-stop gradient + a drifting grid of glowing nodes + faint
+    // connecting lines, all in one pixel fn. The drift is driven by
+    // self.draw_pass.time so it animates every frame with no app-side code.
+    // GaussRoundedView (the glass card) blurs whatever THIS renders behind it,
+    // so this is what makes the frosted glass actually read as frosted.
+    let NetworkBg = View{
+        show_bg: true
+        draw_bg +: {
+            grad_top: instance(#x1A1A2E)
+            grad_bot: instance(#x0F0F1A)
+            node_color: instance(#x8B9DC3)
+            line_color: instance(#x5A6BA0)
+
+            pixel: fn() {
+                // Vertical 2-stop gradient as the base.
+                let bg = self.grad_top.rgb.mix(self.grad_bot.rgb, self.pos.y)
+
+                // Drifting node grid. Cell size in px; drift over time.
+                let cell = 90.0
+                let drift = vec2(self.draw_pass.time * 4.0, self.draw_pass.time * 2.5)
+                let p = self.pos * self.rect_size + drift
+                let gx = floor(p.x / cell)
+                let gy = floor(p.y / cell)
+
+                // Per-cell pseudo-jitter from gx/gy (deterministic per cell).
+                let jx = Math.random_2d(vec2(gx * 12.9 + gy * 78.2, 1.0))
+                let jy = Math.random_2d(vec2(gx * 4.1 + gy * 91.7, 2.0))
+                let cx = (gx + 0.5) * cell - drift.x + (jx - 0.5) * cell * 0.5
+                let cy = (gy + 0.5) * cell - drift.y + (jy - 0.5) * cell * 0.5
+
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+
+                // Glowing node dot (additive).
+                sdf.circle(cx, cy, 2.0)
+                sdf.glow_keep(vec4(self.node_color.rgb, 0.5), 6.0)
+
+                // Connecting line to the right-neighbor node.
+                let cx2 = (gx + 1.5) * cell - drift.x + (Math.random_2d(vec2((gx + 1.0) * 12.9 + gy * 78.2, 1.0)) - 0.5) * cell * 0.5
+                let cy2 = (gy + 0.5) * cell - drift.y + (Math.random_2d(vec2((gx + 1.0) * 4.1 + gy * 91.7, 2.0)) - 0.5) * cell * 0.5
+                sdf.move_to(cx, cy)
+                sdf.line_to(cx2, cy2)
+                sdf.stroke(vec4(self.line_color.rgb, 0.18), 1.0)
+
+                // Composite shader layer over the gradient base.
+                let layer = sdf.result
+                return vec4(bg * (1.0 - layer.a) + layer.rgb, 1.0)
+            }
+        }
+    }
+
     // ── session row (one beacon) ────────────────────────────────────────────
     // `flow: Overlay` so the transparent full-row `select` Button sits ON TOP
     // of the label row and captures clicks across the whole row. This is the
@@ -388,8 +440,16 @@ script_mod! {
                     // three as View.
                     connect_view := View{
                         width: Fill height: Fill
-                        align: Center
-                        draw_bg.color: Cbg
+                        flow: Overlay
+                        // Animated network background fills the whole view; the
+                        // glass card overlays on top of it (Overlay z-order =
+                        // source order, so later children sit above earlier).
+                        network_bg := NetworkBg{width: Fill height: Fill}
+                        // Centering wrapper for the card.
+                        View{
+                            width: Fill height: Fill
+                            align: Center
+                            draw_bg.color: #x00000000
                         // The dialog card — GaussRoundedView for real backdrop blur.
                         connect_card := GaussRoundedView{
                             width: 460 height: Fit
@@ -637,6 +697,8 @@ script_mod! {
                                     draw_text.text_style: theme.font_regular{font_size: 11}
                                 }
                             }
+                        }
+                        // (closes the centering wrapper View around connect_card)
                         }
                     }
 
