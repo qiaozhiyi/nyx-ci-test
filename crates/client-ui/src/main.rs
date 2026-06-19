@@ -694,8 +694,10 @@ script_mod! {
                                         text: "Connect"
                                         width: Fill height: 38
                                         draw_bg.color: Caccent
+                                        draw_bg.color_2: #x9B6BB5
+                                        draw_bg.gradient_fill_horizontal: 1.0
                                         draw_bg.color_hover: Cacchov
-                                        draw_bg.border_radius: 4.0
+                                        draw_bg.border_radius: 8.0
                                         draw_text.color: Cbg
                                         draw_text.text_style: theme.font_bold{font_size: 13}
                                     }
@@ -1330,6 +1332,14 @@ impl App {
                 draw_text +: { color: #(fg) }
             });
         }
+
+        // 4b. Connect button gradient — magenta (accent) → deep violet
+        // (btn_grad2), horizontal. Button.shader auto-activates the gradient
+        // once color_2 is a real color (x > -0.5), set here per theme.
+        let mut cbtn = self.ui.button(cx, ids!(dialog_connect_btn));
+        script_apply_eval!(cx, cbtn, {
+            draw_bg +: { color: #(caccent), color_2: #(cbtn_grad2), gradient_fill_horizontal: 1.0 }
+        });
 
         // Theme-toggle label names the destination: "Light" when we ARE dark
         // (click → switch to light), "Dark" when light. Plain ASCII because
