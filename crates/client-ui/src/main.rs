@@ -142,7 +142,7 @@ script_mod! {
     // (tint/border/shadow/fallback) = instance; static knobs (blur level,
     // surface alpha, radii) = uniform.
     let GlassCard = GaussRoundedView{
-        width: 340 height: Fit
+        width: Fill height: Fit
         flow: Down
         draw_bg +: {
             tint_color: instance(#x2D2D3D)
@@ -168,14 +168,14 @@ script_mod! {
     // overlay Button (reusing the dialog_theme_btn id) captures the click so
     // the existing handle_actions toggle path needs NO change.
     let ThemeSwitch = View{
-        width: 76 height: 28
+        width: 52 height: 30
         flow: Overlay
         show_bg: true
         draw_bg +: {
             is_dark: instance(1.0)
-            track_dark: instance(#x2A2A3E)
-            track_light: instance(#xE8E0F0)
-            knob_color: instance(#xF5F5F8)
+            track_on: instance(#x5A3A6E)
+            track_off: instance(#xC8C0D8)
+            knob_color: instance(#xF8F8FB)
 
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
@@ -183,28 +183,29 @@ script_mod! {
                 let h = self.rect_size.y
                 let r = h * 0.5
 
-                // Pill track — color blends with state (mix = free fn, GLSL builtin).
+                // Pill track — saturated purple when dark (on), soft lilac when
+                // light (off). mix = GLSL free fn (verified in button.rs:130).
                 sdf.box(0.0, 0.0, w, h, r)
-                sdf.fill(vec4(mix(self.track_light.rgb, self.track_dark.rgb, self.is_dark), 1.0))
+                sdf.fill(vec4(mix(self.track_off.rgb, self.track_on.rgb, self.is_dark), 1.0))
 
-                // Knob slides: is_dark=0 (light) → left, is_dark=1 (dark) → right.
+                // Knob slides left(off)↔right(on), slightly smaller than the
+                // track height so a ring of track shows around it.
                 let knob_x = mix(r, w - r, self.is_dark)
-                let kr = r * 0.72
+                let kr = r * 0.7
                 sdf.circle(knob_x, h * 0.5, kr)
                 sdf.fill(self.knob_color)
 
-                // Glyph INSIDE the knob: a sun disc when light (is_dark≈0),
-                // a moon crescent when dark (is_dark≈1). Drawn at the knob's
-                // own center so it always rides with the knob.
+                // Glyph inside the knob: sun (light) / moon crescent (dark),
+                // drawn at the knob center so it rides along.
                 if self.is_dark < 0.5 {
-                    // Sun: warm disc, slightly smaller than the knob.
-                    sdf.circle(knob_x, h * 0.5, kr * 0.6)
-                    sdf.fill_keep(vec4(1.0, 0.78, 0.42, 1.0))
+                    // Sun: warm disc.
+                    sdf.circle(knob_x, h * 0.5, kr * 0.55)
+                    sdf.fill_keep(vec4(1.0, 0.74, 0.36, 1.0))
                 } else {
-                    // Moon: full disc then subtract an offset disc → crescent.
-                    sdf.circle(knob_x, h * 0.5, kr * 0.62)
-                    sdf.fill_keep(vec4(0.72, 0.77, 0.91, 1.0))
-                    sdf.circle(knob_x + kr * 0.3, h * 0.5 - kr * 0.16, kr * 0.56)
+                    // Moon: disc minus offset disc = crescent.
+                    sdf.circle(knob_x, h * 0.5, kr * 0.58)
+                    sdf.fill_keep(vec4(0.74, 0.80, 0.94, 1.0))
+                    sdf.circle(knob_x + kr * 0.3, h * 0.5 - kr * 0.16, kr * 0.5)
                     sdf.subtract()
                 }
 
@@ -497,7 +498,7 @@ script_mod! {
             // handler (counter's does). Counter needs it because it uses
             // on_render for its label; we don't.
             main_window := Window{
-                window.inner_size: vec2(960, 640)
+                window.inner_size: vec2(372, 460)
                 pass.clear_color: Cbg
                 body +: {
                     width: Fill height: Fill
@@ -518,17 +519,11 @@ script_mod! {
                     // three as View.
                     connect_view := View{
                         width: Fill height: Fill
-                        flow: Overlay
-                        // Animated network background fills the whole view; the
-                        // glass card overlays on top of it (Overlay z-order =
-                        // source order, so later children sit above earlier).
-                        network_bg := NetworkBg{width: Fill height: Fill}
-                        // Centering wrapper for the card.
-                        View{
-                            width: Fill height: Fill
-                            align: Center
-                            draw_bg.color: #x00000000
+                        align: Center
+                        draw_bg.color: Cbg
                         // The dialog card — GlassCard (GaussRoundedView real blur).
+                        // No network background: the window is sized to just the
+                        // login card, so there's no surrounding bg to blur.
                         connect_card := GlassCard{
 
                             // Brand header: gradient logo box + wordmark + tagline.
@@ -770,8 +765,6 @@ script_mod! {
                                     draw_text.text_style: theme.font_regular{font_size: 11}
                                 }
                             }
-                        }
-                        // (closes the centering wrapper View around connect_card)
                         }
                     }
 
@@ -1310,10 +1303,6 @@ impl App {
         let crowhov = p.rowhov;
         let cinput = p.input;
         let cinput_b = p.input_b;
-        let cgrad_top = p.grad_top;
-        let cgrad_bot = p.grad_bot;
-        let cnode = p.node;
-        let cline = p.line;
         let cglow = p.glow;
         let cbtn_grad2 = p.btn_grad2;
 
@@ -1323,20 +1312,13 @@ impl App {
             pass +: { clear_color: #(cbg) }
         });
 
-        // 2. Dialog surfaces: backdrop (now transparent Overlay so NetworkBg
-        // shows through), glass card, logo box.
+        // 2. Dialog backdrop — just the window clear color now (no network bg).
         let mut cv = self.ui.view(cx, ids!(connect_view));
         script_apply_eval!(cx, cv, {
-            draw_bg +: { color: #x00000000 }
+            draw_bg +: { color: #(cbg) }
         });
 
-        // 2b. Network background — recolor gradient + node/line instances.
-        let mut nbg = self.ui.view(cx, ids!(network_bg));
-        script_apply_eval!(cx, nbg, {
-            draw_bg +: { grad_top: #(cgrad_top), grad_bot: #(cgrad_bot), node_color: #(cnode), line_color: #(cline) }
-        });
-
-        // 2c. Glass card (GaussRoundedView) — per-theme tint / glow border /
+        // 2b. Glass card (GaussRoundedView) — per-theme tint / glow border /
         // shadow. The transparent-but-not-fully so tint over the blurred bg is
         // what sells "frosted glass". cshadow: opaque black dark / soft
         // purple-grey light.
@@ -1372,7 +1354,7 @@ impl App {
             let mut inp = self.ui.text_input(cx, path);
             script_apply_eval!(cx, inp, {
                 draw_bg +: { color: #(cinput), color_hover: #(cinput), color_focus: #(cinput), border_color: #(cinput_b), border_color_focus: #(caccent) }
-                draw_text +: { color: #(cprimary), color_hover: #(cprimary), color_focus: #(cprimary), color_empty: #(cmuted) }
+                draw_text +: { color: #(cprimary), color_hover: #(cprimary), color_focus: #(cprimary), color_empty: #(csecond) }
                 draw_cursor +: { color: #(caccent) }
             });
         }
