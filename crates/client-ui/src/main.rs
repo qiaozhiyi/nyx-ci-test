@@ -57,6 +57,8 @@ script_mod! {
     // the dynamic ramp consulted at draw time so the theme toggle repaints
     // consistently. Keep the two in lockstep: change one, change both.
     let Cbg       = #x16161E  // app background — deepest surface
+    let Cinput    = #x2D2D3D  // input fill = elev (blend with card, no patch)
+    let Cinput_b  = #x4A4A60  // visible input border (carries the boundary)
     let Cbar      = #x1B1B26  // recessed secondary bars / tab bar
     let Cpanel    = #x1B1B26  // side panels + event-log shell
     let Crow      = #x1B1B26  // table/data-row base
@@ -376,18 +378,36 @@ script_mod! {
                     flow: Down
 
                     // ── connect dialog (shown until connected) ──────────────
-                    connect_view := SolidView{
+                    // NOTE: connect_view / connect_card / logo_box are plain View,
+                    // NOT SolidView. In Makepad 2.0 `self.ui.view()` returns the
+                    // wrong widget type for a SolidView, and a `script_apply_eval!`
+                    // through it silently writes garbage to draw_bg — which is why
+                    // Light mode never recoloured the card in v1. View supports the
+                    // same draw_bg.color / border_radius / border_color surface
+                    // props AND repaints correctly via apply_theme(). Keep these
+                    // three as View.
+                    connect_view := View{
                         width: Fill height: Fill
                         align: Center
                         draw_bg.color: Cbg
-                        // The dialog card.
-                        connect_card := SolidView{
+                        // The dialog card — GaussRoundedView for real backdrop blur.
+                        connect_card := GaussRoundedView{
                             width: 460 height: Fit
                             flow: Down
-                            draw_bg.color: Celev
-                            draw_bg.border_radius: Cradius
-                            draw_bg.border_size: 2.0
-                            draw_bg.border_color: Cborder
+                            draw_bg +: {
+                                tint_color: #x2D2D3D
+                                tint_alpha: 0.55
+                                surface_alpha: 0.82
+                                border_color: #xC586C0
+                                border_alpha: 0.5
+                                border_width: 1.0
+                                corner_radius: 12.0
+                                blur_level: 4.0
+                                shadow_color: #x000000B3
+                                shadow_radius: 24.0
+                                shadow_offset: vec2(0.0, 8.0)
+                                fallback_color: #x2D2D3D
+                            }
 
                             // Brand header: gradient logo box + wordmark + tagline.
                             // No accent stripe — One Dark doesn't use it.
@@ -399,7 +419,7 @@ script_mod! {
                                     width: Fit height: Fit
                                     flow: Right spacing: 10.0
                                     align: Align{y: 0.5}
-                                    logo_box := SolidView{
+                                    logo_box := View{
                                         width: 32 height: 32
                                         draw_bg.color: Caccent
                                         draw_bg.border_radius: 7.0
@@ -419,14 +439,22 @@ script_mod! {
                                 }
                                 connect_tagline := Label{
                                     text: "Connect to a team server"
-                                    draw_text.color: Cmuted
+                                    draw_text.color: Csecond
                                     draw_text.text_style: theme.font_regular{font_size: 12}
                                 }
                             }
                             View{width: Fill height: 1 draw_bg.color: Cborder}
-                            // Form body. Inputs use a filled style (bg deeper than
-                            // the card, 1px border, magenta focus border) — the VS
-                            // Code / One Dark input look confirmed in the mockup.
+                            // Form body. Inputs BLEND with the card (fill =
+                            // elev) — no lighter/darker patch fighting the
+                            // surface. The field boundary is carried entirely
+                            // by a clearly visible 1px border (GitHub-dark
+                            // input pattern). Saturated magenta lights up ONLY
+                            // on focus — one signal, not three boxes. Every
+                            // earlier attempt to use fill contrast (darker =
+                            // grey patch, brighter = floating box) read worse.
+                            // Each field is a Down column: label / input / (error
+                            // or helper) — inline errors live right under the field
+                            // they describe, never stacked at the bottom.
                             View{
                                 width: Fill height: Fit
                                 padding: Inset{top: 20.0 bottom: 26.0 left: 30.0 right: 30.0}
@@ -435,17 +463,26 @@ script_mod! {
                                 // Server URL — host + port merged into one field
                                 // (simpler than the old two-column HOST/PORT row).
                                 View{
-                                    width: Fill height: Fit flow: Down spacing: 5.0
-                                    url_label := Label{text: "Server URL" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 11}}
+                                    width: Fill height: Fit flow: Down spacing: 3.0
+                                    url_label := Label{text: "Server URL" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: 11}}
                                     url_input := TextInput{
                                         width: Fill height: 30
-                                        padding: Inset{left: 12.0 right: 12.0}
+                                        label_align: Align{y: 0.5}
+                                        // NOTE: Makepad's text layout ignores
+                                        // Align.y for single-line text (only
+                                        // align.x is used — see draw_text.rs
+                                        // layout() → LayoutOptions.align). So
+                                        // vertical centering is done by hand:
+                                        // a top inset nudges the baseline down
+                                        // into the visual middle of the 30pt
+                                        // box. 7pt ≈ (30 − ~16pt line) / 2.
+                                        padding: Inset{top: 7.0 left: 12.0 right: 12.0}
                                         text: "http://127.0.0.1:8443"
                                         empty_text: "http://host:port"
-                                        draw_bg.color: Cbg
-                                        draw_bg.color_hover: Cbg
-                                        draw_bg.color_focus: Cbg
-                                        draw_bg.border_color: Cborder
+                                        draw_bg.color: Cinput
+                                        draw_bg.color_hover: Cinput
+                                        draw_bg.color_focus: Cinput
+                                        draw_bg.border_color: Cinput_b
                                         draw_bg.border_color_focus: Caccent
                                         draw_bg.border_size: 1.0
                                         draw_bg.border_radius: 4.0
@@ -456,18 +493,37 @@ script_mod! {
                                         draw_text.text_style: theme.font_code{font_size: 12}
                                         draw_cursor.color: Caccent
                                     }
+                                    // Inline error for the URL field. Empty by
+                                    // default; validate_connect_form() + the
+                                    // connection-refused route in apply_snapshot()
+                                    // set its text. Lives INSIDE this field's
+                                    // column, so it always reads as "this field".
+                                    url_error := Label{
+                                        text: ""
+                                        draw_text.color: Cdanger
+                                        draw_text.text_style: theme.font_code{font_size: 10}
+                                    }
                                 }
                                 View{
-                                    width: Fill height: Fit flow: Down spacing: 5.0
-                                    alias_label := Label{text: "Operator" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 11}}
+                                    width: Fill height: Fit flow: Down spacing: 3.0
+                                    alias_label := Label{text: "Operator" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: 11}}
                                     alias_input := TextInput{
                                         width: Fill height: 30
-                                        padding: Inset{left: 12.0 right: 12.0}
+                                        label_align: Align{y: 0.5}
+                                        // NOTE: Makepad's text layout ignores
+                                        // Align.y for single-line text (only
+                                        // align.x is used — see draw_text.rs
+                                        // layout() → LayoutOptions.align). So
+                                        // vertical centering is done by hand:
+                                        // a top inset nudges the baseline down
+                                        // into the visual middle of the 30pt
+                                        // box. 7pt ≈ (30 − ~16pt line) / 2.
+                                        padding: Inset{top: 7.0 left: 12.0 right: 12.0}
                                         text: "operator"
-                                        draw_bg.color: Cbg
-                                        draw_bg.color_hover: Cbg
-                                        draw_bg.color_focus: Cbg
-                                        draw_bg.border_color: Cborder
+                                        draw_bg.color: Cinput
+                                        draw_bg.color_hover: Cinput
+                                        draw_bg.color_focus: Cinput
+                                        draw_bg.border_color: Cinput_b
                                         draw_bg.border_color_focus: Caccent
                                         draw_bg.border_size: 1.0
                                         draw_bg.border_radius: 4.0
@@ -477,6 +533,11 @@ script_mod! {
                                         draw_text.color_empty: Cmuted
                                         draw_text.text_style: theme.font_code{font_size: 12}
                                         draw_cursor.color: Caccent
+                                    }
+                                    alias_error := Label{
+                                        text: ""
+                                        draw_text.color: Cdanger
+                                        draw_text.text_style: theme.font_code{font_size: 10}
                                     }
                                 }
                                 // Password = API bearer token. Flows into
@@ -484,18 +545,27 @@ script_mod! {
                                 // as `Authorization: Bearer`. Empty = no token
                                 // (local dev server without NYX_TOKEN).
                                 View{
-                                    width: Fill height: Fit flow: Down spacing: 5.0
-                                    pass_label := Label{text: "Password (API Token)" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 11}}
+                                    width: Fill height: Fit flow: Down spacing: 3.0
+                                    pass_label := Label{text: "Password (API Token)" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: 11}}
                                     pass_input := TextInput{
                                         is_password: true
                                         width: Fill height: 30
-                                        padding: Inset{left: 12.0 right: 12.0}
+                                        label_align: Align{y: 0.5}
+                                        // NOTE: Makepad's text layout ignores
+                                        // Align.y for single-line text (only
+                                        // align.x is used — see draw_text.rs
+                                        // layout() → LayoutOptions.align). So
+                                        // vertical centering is done by hand:
+                                        // a top inset nudges the baseline down
+                                        // into the visual middle of the 30pt
+                                        // box. 7pt ≈ (30 − ~16pt line) / 2.
+                                        padding: Inset{top: 7.0 left: 12.0 right: 12.0}
                                         text: ""
-                                        empty_text: "team server token (leave empty if none)"
-                                        draw_bg.color: Cbg
-                                        draw_bg.color_hover: Cbg
-                                        draw_bg.color_focus: Cbg
-                                        draw_bg.border_color: Cborder
+                                        empty_text: "Enter Team Server Token"
+                                        draw_bg.color: Cinput
+                                        draw_bg.color_hover: Cinput
+                                        draw_bg.color_focus: Cinput
+                                        draw_bg.border_color: Cinput_b
                                         draw_bg.border_color_focus: Caccent
                                         draw_bg.border_size: 1.0
                                         draw_bg.border_radius: 4.0
@@ -506,42 +576,65 @@ script_mod! {
                                         draw_text.text_style: theme.font_code{font_size: 12}
                                         draw_cursor.color: Caccent
                                     }
+                                    // Static helper (not an error): the "(leave
+                                    // empty if none)" hint moved OUT of the
+                                    // placeholder into a persistent micro-caption,
+                                    // so the field's intent is obvious even after
+                                    // the user starts typing.
+                                    pass_helper := Label{
+                                        text: "Leave empty if none"
+                                        draw_text.color: Cmuted
+                                        draw_text.text_style: theme.font_regular{font_size: 10}
+                                    }
                                 }
+                                // Fallback status line — only used for errors we
+                                // can't attribute to a specific field (e.g. a
+                                // generic 500). Field-specific errors go to
+                                // url_error / alias_error above. Kept for safety
+                                // but no longer the primary error surface.
                                 connect_status := Label{
                                     text: ""
                                     draw_text.color: Cdanger
                                     draw_text.text_style: theme.font_code{font_size: 11}
                                 }
-                                // Buttons row: theme toggle (left) + Connect (right).
+                                // Buttons: theme toggle (ghost, right-aligned
+                                // on its own row) then a full-width primary
+                                // Connect below — matches the reference dialog
+                                // where the CTA spans card edge to edge. Toggle
+                                // label names the DESTINATION ("Light"/"Dark"),
+                                // not the current state.
                                 View{
                                     width: Fill height: Fit
-                                    flow: Right spacing: 8.0
-                                    align: Align{y: 0.5}
-                                    dialog_theme_btn := Button{
-                                        text: "Light Mode"
-                                        width: 90 height: 30
-                                        draw_bg.color: Cbg
-                                        draw_bg.color_hover: Crowhov
-                                        draw_bg.border_size: 1.0
-                                        draw_bg.border_radius: 4.0
-                                        draw_text.color: Csecond
-                                        draw_text.text_style: theme.font_regular{font_size: 12}
+                                    flow: Down spacing: 12.0
+                                    View{
+                                        width: Fill height: Fit flow: Right
+                                        View{width: Fill height: 1}
+                                        dialog_theme_btn := Button{
+                                            text: "Light"
+                                            width: Fit height: 26
+                                            draw_bg.color: Cbg
+                                            draw_bg.color_hover: Crowhov
+                                            draw_bg.border_size: 1.0
+                                            draw_bg.border_color: Cborder
+                                            draw_bg.border_radius: 4.0
+                                            draw_text.color: Csecond
+                                            draw_text.text_style: theme.font_regular{font_size: 11}
+                                        }
                                     }
-                                    View{width: Fill height: 1}
                                     dialog_connect_btn := Button{
                                         text: "Connect"
-                                        width: 110 height: 30
+                                        width: Fill height: 38
                                         draw_bg.color: Caccent
                                         draw_bg.color_hover: Cacchov
                                         draw_bg.border_radius: 4.0
                                         draw_text.color: Cbg
-                                        draw_text.text_style: theme.font_bold{font_size: 12}
+                                        draw_text.text_style: theme.font_bold{font_size: 13}
                                     }
                                 }
                                 connect_footer := Label{
                                     text: "Authorized use only · all activity is logged"
-                                    draw_text.color: Cmuted
-                                    draw_text.text_style: theme.font_regular{font_size: 9}
+                                    draw_text.color: Csecond
+                                    draw_text.text_style: theme.font_regular{font_size: 11}
                                 }
                             }
                         }
@@ -569,14 +662,16 @@ script_mod! {
                         div_brand := View{width: 1 height: 20 draw_bg.color: Cborder}
                         server_input := TextInput{
                             width: 360 height: 30
-                            padding: Inset{left: 10.0 right: 10.0}
+                            label_align: Align{y: 0.5}
+                            padding: Inset{top: 7.0 left: 10.0 right: 10.0}
                             text: "http://127.0.0.1:8443"
                             empty_text: "team server URL"
-                            draw_bg.color: Cbg
-                            draw_bg.color_hover: Cbg
-                            draw_bg.color_focus: Cbg
-                            draw_bg.border_color: Cborder
+                            draw_bg.color: Cinput
+                            draw_bg.color_hover: Cinput
+                            draw_bg.color_focus: Cinput
+                            draw_bg.border_color: Cinput_b
                             draw_bg.border_color_focus: Caccent
+                            draw_bg.border_size: 1.0
                             draw_bg.border_radius: Cradius_s
                             draw_text.color: Cprimary
                             draw_text.color_hover: Cprimary
@@ -865,6 +960,15 @@ impl Default for Tab {
     }
 }
 
+/// A dialog form field that can carry an inline error. Used by
+/// [`App::set_field_error`] to route validation/backend errors to the right
+/// `*_error` label without scattering raw `ids!()` paths around.
+#[derive(Clone, Copy)]
+enum Field {
+    Url,
+    Alias,
+}
+
 impl App {
     /// Lazily spawn the bridge on first Connect.
     fn ensure_bridge(&mut self) {
@@ -918,10 +1022,45 @@ impl App {
         self.ui.view(cx, ids!(connect_view)).set_visible(cx, !self.has_connected);
         self.ui.view(cx, ids!(main_view)).set_visible(cx, self.has_connected);
         if !snap.connected && !self.has_connected {
-            // Show the most recent error line in the dialog (e.g. connection refused).
+            // Route the most recent backend error line to the field it most
+            // likely came from, so the failure reads as "this field" instead of
+            // a bottom-of-form blob. The bridge prefixes worker errors with
+            // "! " (e.g. "! sessions: error sending request..."); reqwest
+            // embeds the cause (connection refused / dns / status code) in the
+            // message text, so substring matching is reliable here.
             let last_err = LOG_LINES.read().unwrap().last().cloned();
             if let Some(e) = last_err {
-                self.ui.label(cx, ids!(connect_status)).set_text(cx, &e);
+                let lower = e.to_lowercase();
+                if lower.contains("connection refused")
+                    || lower.contains("timed out")
+                    || lower.contains("timeout")
+                    || lower.contains("dns")
+                    || lower.contains("unreachable")
+                    || lower.contains("connect error")
+                    || lower.contains("error connecting")
+                {
+                    self.set_field_error(cx, Field::Url, "Could not reach server at this address");
+                    self.set_field_error(cx, Field::Alias, "");
+                    self.ui.label(cx, ids!(connect_status)).set_text(cx, "");
+                } else if lower.contains("401")
+                    || lower.contains("403")
+                    || lower.contains("unauthorized")
+                    || lower.contains("forbidden")
+                    || lower.contains("invalid token")
+                {
+                    // No dedicated pass_error label — surface auth failures on
+                    // the password field's column via the status line, since
+                    // the helper text already occupies the slot right below it.
+                    self.set_field_error(cx, Field::Url, "");
+                    self.set_field_error(cx, Field::Alias, "");
+                    self.ui
+                        .label(cx, ids!(connect_status))
+                        .set_text(cx, "Authentication failed — check your API token");
+                } else {
+                    // Unattributable (e.g. 500, malformed response): keep the
+                    // full text on the fallback status line so nothing is lost.
+                    self.ui.label(cx, ids!(connect_status)).set_text(cx, &e);
+                }
             }
         }
         self.ui.redraw(cx);
@@ -945,6 +1084,73 @@ impl App {
         });
     }
 
+    /// Which dialog field an inline error belongs to. Used by
+    /// [`set_field_error`](App::set_field_error) and
+    /// [`validate_connect_form`](App::validate_connect_form) so the routing
+    /// logic and the rendering both name fields symbolically.
+    fn set_field_error(&self, cx: &mut Cx, field: Field, msg: &str) {
+        let path = match field {
+            Field::Url => ids!(url_error),
+            Field::Alias => ids!(alias_error),
+        };
+        self.ui.label(cx, path).set_text(cx, msg);
+    }
+
+    /// Client-side gate run before sending `Cmd::Connect`. Returns true iff the
+    /// form is valid; otherwise writes an inline message under the offending
+    /// field and leaves the connect attempt unstarted. Backend errors (refused,
+    /// auth) are handled separately in [`apply_snapshot`](App::apply_snapshot).
+    ///
+    /// Rules:
+    /// * URL must look like `http(s)://host:port` — scheme, host, and a 2–5
+    ///   digit port. Path/query are allowed but ignored. Intentionally a regex
+    ///   sanity check, not an RFC 3986 parse: it catches fat-finger mistakes
+    ///   without dragging in a URL crate or rejecting exotic-but-valid hosts.
+    /// * Operator must be non-empty (it becomes the operator identity).
+    /// * Password is optional (local dev server without NYX_TOKEN).
+    fn validate_connect_form(&self, cx: &mut Cx) -> bool {
+        let url = self.ui.text_input(cx, ids!(url_input)).text();
+        let alias = self.ui.text_input(cx, ids!(alias_input)).text();
+
+        let url_ok = {
+            // Anchored regex via the `regex`-style manual scan would need a
+            // dependency; a hand-rolled check is enough for a login gate.
+            let u = url.trim();
+            let scheme_ok =
+                u.starts_with("http://") || u.starts_with("https://");
+            let rest = u.split_once("://").map(|(_, r)| r).unwrap_or("");
+            // host (non-empty, no slash/colon before the port) + :port(2-5)
+            let host_port = rest.split('/').next().unwrap_or("");
+            let (host, port) = host_port
+                .rsplit_once(':')
+                .map(|(h, p)| (h, Some(p)))
+                .unwrap_or((host_port, None));
+            let host_ok = !host.is_empty()
+                && !host.contains(' ')
+                && host.chars().any(|c| c != '.');
+            let port_ok = port
+                .map(|p| p.len() >= 2 && p.len() <= 5 && p.chars().all(|c| c.is_ascii_digit()))
+                .unwrap_or(false);
+            scheme_ok && host_ok && port_ok
+        };
+
+        let alias_ok = !alias.trim().is_empty();
+
+        // Always re-set both so a corrected field clears its old error.
+        self.set_field_error(
+            cx,
+            Field::Url,
+            if url_ok { "" } else { "Enter a valid http(s)://host:port URL" },
+        );
+        self.set_field_error(
+            cx,
+            Field::Alias,
+            if alias_ok { "" } else { "Operator name is required" },
+        );
+
+        url_ok && alias_ok
+    }
+
     /// Repaint every static (non-virtualized) surface for the current theme.
     ///
     /// Colors come from the single [`Palette`] source of truth (`theme.rs`) —
@@ -962,10 +1168,13 @@ impl App {
         let celev = p.elev;
         let cborder = p.border;
         let cprimary = p.primary;
+        let csecond = p.second;
         let cmuted = p.muted;
         let caccent = p.accent;
         let cacchov = p.acchov;
         let crowhov = p.rowhov;
+        let cinput = p.input;
+        let cinput_b = p.input_b;
 
         // 1. MainWindow clear_color
         let mut w = self.ui.window(cx, ids!(main_window));
@@ -973,23 +1182,36 @@ impl App {
             pass +: { clear_color: #(cbg) }
         });
 
-        // 2. Dialog: backdrop, card, logo box.
-        // NOTE: connect_view / connect_card / logo_box are SolidView, NOT View.
-        // `self.ui.view()` returns the wrong widget type for a SolidView, and a
-        // `script_apply_eval!` through it silently sets draw_bg to a garbage/
-        // transparent value — which is exactly why the magenta logo box
-        // disappeared in v1. Verified: a SolidView with an inline DSL
-        // draw_bg.color renders correctly WITHOUT any runtime apply (a red
-        // test square showed up), so we rely on the DSL inline values here
-        // (which mirror Palette::dark()). The theme toggle (Light) won't
-        // recolor these three surfaces — acceptable for now; the dark ramp is
-        // the primary theme. Only the Label inside (logo_letter) is repainted.
+        // 2. Dialog surfaces: backdrop, card, logo box.
+        // These were SolidView in v1, so `self.ui.view()` returned the wrong
+        // widget type and the recolour was silently dropped — the root cause of
+        // "Light mode keeps a dark card". They are now plain View (see DSL), so
+        // all three repaint correctly here. The Logo letter is inverted text
+        // (card bg), so it gets `cbg` to stay legible on the magenta logo box.
+        let mut cv = self.ui.view(cx, ids!(connect_view));
+        script_apply_eval!(cx, cv, {
+            draw_bg +: { color: #(cbg) }
+        });
+        let mut cc = self.ui.view(cx, ids!(connect_card));
+        script_apply_eval!(cx, cc, {
+            draw_bg +: { color: #(celev), border_color: #(cborder) }
+        });
+        let mut lb = self.ui.view(cx, ids!(logo_box));
+        script_apply_eval!(cx, lb, {
+            draw_bg +: { color: #(caccent) }
+        });
         let mut ll = self.ui.label(cx, ids!(logo_letter));
         script_apply_eval!(cx, ll, {
             draw_text +: { color: #(cbg) }
         });
 
         // 3. Text inputs (dialog fields + connection-bar server field).
+        // Border-defined style (GitHub-dark): the fill blends with the card
+        // (input = elev, no patch contrast), and a clearly visible 1px border
+        // carries the field boundary. Default border is a legible mid-grey;
+        // the saturated accent replaces it ONLY on focus. Fill contrast
+        // (darker/brighter than the card) was tried and rejected — both read
+        // as dirty grey or a floating box; blending + a real border is clean.
         let inputs = [
             ids!(url_input),
             ids!(pass_input),
@@ -999,13 +1221,16 @@ impl App {
         for path in inputs {
             let mut inp = self.ui.text_input(cx, path);
             script_apply_eval!(cx, inp, {
-                draw_bg +: { color: #(cbg), border_color: #(cborder), border_color_focus: #(caccent) }
-                draw_text +: { color: #(cprimary), color_empty: #(cmuted) }
+                draw_bg +: { color: #(cinput), color_hover: #(cinput), color_focus: #(cinput), border_color: #(cinput_b), border_color_focus: #(caccent) }
+                draw_text +: { color: #(cprimary), color_hover: #(cprimary), color_focus: #(cprimary), color_empty: #(cmuted) }
                 draw_cursor +: { color: #(caccent) }
             });
         }
 
-        // 4. Buttons — accent primary (Connect, dark text), bar-colored secondaries.
+        // 4. Buttons — Connect is the full-width saturated CTA (accent fill,
+        // inverted bg text). dialog_theme_btn is a small ghost toggle (cbg
+        // backdrop so it recedes, bordered, muted text) right-aligned above
+        // the CTA. bar_connect_btn / theme_btn are the in-console variants.
         let buttons = [
             (ids!(dialog_connect_btn), caccent, cacchov, cbg),
             (ids!(bar_connect_btn), caccent, cacchov, cbg),
@@ -1020,22 +1245,45 @@ impl App {
             });
         }
 
-        let mode_label = if is_dark { "Light Mode" } else { "Dark Mode" };
+        // Theme-toggle label names the destination: "Light" when we ARE dark
+        // (click → switch to light), "Dark" when light. Plain ASCII because
+        // IBMPlexSans has no sun/moon glyphs (they render as tofu).
+        let mode_label = if is_dark { "Light" } else { "Dark" };
         self.ui.button(cx, ids!(dialog_theme_btn)).set_text(cx, mode_label);
         self.ui.button(cx, ids!(theme_btn)).set_text(cx, mode_label);
 
         // 5. Dialog text: error status, wordmark/tagline/title, field labels.
+        // Field labels use Csecond (~7:1 on the card) instead of Cmuted, and
+        // the compliance footer is now 11pt Csecond so it clears WCAG AA.
         let mut cs_lbl = self.ui.label(cx, ids!(connect_status));
         script_apply_eval!(cx, cs_lbl, {
             draw_text +: { color: #(p.danger) }
         });
+        // Inline field errors: danger red, repainted every toggle so they stay
+        // legible on either card surface.
+        let field_errors = [
+            ids!(url_error),
+            ids!(alias_error),
+        ];
+        for path in field_errors {
+            let mut lbl = self.ui.label(cx, path);
+            script_apply_eval!(cx, lbl, {
+                draw_text +: { color: #(p.danger) }
+            });
+        }
+        // Helper text under the password field stays muted — it's a hint, not
+        // content, so Cmuted (~4.5:1) is the right weight.
+        let mut ph = self.ui.label(cx, ids!(pass_helper));
+        script_apply_eval!(cx, ph, {
+            draw_text +: { color: #(cmuted) }
+        });
         let dialog_labels = [
             (ids!(nyx_logo), cprimary),
-            (ids!(connect_tagline), cmuted),
-            (ids!(url_label), cmuted),
-            (ids!(alias_label), cmuted),
-            (ids!(pass_label), cmuted),
-            (ids!(connect_footer), cmuted),
+            (ids!(connect_tagline), csecond),
+            (ids!(url_label), csecond),
+            (ids!(alias_label), csecond),
+            (ids!(pass_label), csecond),
+            (ids!(connect_footer), csecond),
         ];
         for (path, color) in dialog_labels {
             let mut lbl = self.ui.label(cx, path);
@@ -1221,22 +1469,34 @@ impl MatchEvent for App {
         let bar_connect = self.ui.button(cx, ids!(bar_connect_btn)).clicked(actions);
 
         if dlg_connect || dlg_enter || bar_connect {
-            self.ensure_bridge();
-            if let Some(b) = &self.bridge {
-                let (url, password) = if bar_connect {
-                    (self.ui.text_input(cx, ids!(server_input)).text(), None)
-                } else {
-                    let raw = self.ui.text_input(cx, ids!(url_input)).text();
-                    let pw = self.ui.text_input(cx, ids!(pass_input)).text();
-                    let pw = if pw.trim().is_empty() { None } else { Some(pw) };
-                    (raw, pw)
-                };
-                let _ = b.from_ui.send(Cmd::Connect {
-                    server: url.trim().to_string(),
-                    password,
-                });
-                if !bar_connect {
-                    self.ui.label(cx, ids!(connect_status)).set_text(cx, "Connecting…");
+            // Front-end validation gate (dialog path only). The connection-bar
+            // field is a quick reconnect control, so it skips this and trusts
+            // whatever the operator types. On failure we abort BEFORE spawning
+            // the bridge attempt and let the inline errors speak.
+            if !bar_connect && !self.validate_connect_form(cx) {
+                self.ui.redraw(cx);
+            } else {
+                self.ensure_bridge();
+                if let Some(b) = &self.bridge {
+                    let (url, password) = if bar_connect {
+                        (self.ui.text_input(cx, ids!(server_input)).text(), None)
+                    } else {
+                        let raw = self.ui.text_input(cx, ids!(url_input)).text();
+                        let pw = self.ui.text_input(cx, ids!(pass_input)).text();
+                        let pw = if pw.trim().is_empty() { None } else { Some(pw) };
+                        (raw, pw)
+                    };
+                    let _ = b.from_ui.send(Cmd::Connect {
+                        server: url.trim().to_string(),
+                        password,
+                    });
+                    if !bar_connect {
+                        // Clear any stale inline errors — a fresh attempt is
+                        // in flight; the next verdict comes from the backend.
+                        self.set_field_error(cx, Field::Url, "");
+                        self.set_field_error(cx, Field::Alias, "");
+                        self.ui.label(cx, ids!(connect_status)).set_text(cx, "Connecting…");
+                    }
                 }
             }
         }
