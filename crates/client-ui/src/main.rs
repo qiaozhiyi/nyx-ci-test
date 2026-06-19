@@ -142,7 +142,7 @@ script_mod! {
     // (tint/border/shadow/fallback) = instance; static knobs (blur level,
     // surface alpha, radii) = uniform.
     let GlassCard = GaussRoundedView{
-        width: 400 height: Fit
+        width: 340 height: Fit
         flow: Down
         draw_bg +: {
             tint_color: instance(#x2D2D3D)
@@ -497,7 +497,7 @@ script_mod! {
             // handler (counter's does). Counter needs it because it uses
             // on_render for its label; we don't.
             main_window := Window{
-                window.inner_size: vec2(1024, 700)
+                window.inner_size: vec2(960, 640)
                 pass.clear_color: Cbg
                 body +: {
                     width: Fill height: Fill
@@ -535,7 +535,7 @@ script_mod! {
                             // No accent stripe — One Dark doesn't use it.
                             View{
                                 width: Fill height: Fit
-                                padding: Inset{top: 30.0 bottom: 22.0 left: 30.0 right: 30.0}
+                                padding: Inset{top: 22.0 bottom: 16.0 left: 24.0 right: 24.0}
                                 flow: Down spacing: 6.0
                                 View{
                                     width: Fit height: Fit
@@ -579,7 +579,7 @@ script_mod! {
                             // they describe, never stacked at the bottom.
                             View{
                                 width: Fill height: Fit
-                                padding: Inset{top: 20.0 bottom: 26.0 left: 30.0 right: 30.0}
+                                padding: Inset{top: 16.0 bottom: 20.0 left: 24.0 right: 24.0}
                                 flow: Down spacing: 16.0
 
                                 // Server URL — host + port merged into one field
@@ -731,11 +731,19 @@ script_mod! {
                                         align: Align{x: 0.5}
                                         theme_switch := ThemeSwitch{
                                             // Transparent hit-area button fills the pill.
+                                            // border_size MUST be 0 — Button's default theme.beveling
+                                            // border was drawing the unwanted elliptical halo.
+                                            // All colors transparent so nothing renders except the
+                                            // ThemeSwitch shader behind it.
                                             dialog_theme_btn := Button{
                                                 width: Fill height: Fill
                                                 text: ""
                                                 draw_bg.color: #x00000000
                                                 draw_bg.color_hover: #x00000000
+                                                draw_bg.color_down: #x00000000
+                                                draw_bg.color_focus: #x00000000
+                                                draw_bg.border_size: 0.0
+                                                draw_bg.border_color: #x00000000
                                                 draw_text.color: #x00000000
                                             }
                                         }
@@ -746,7 +754,11 @@ script_mod! {
                                         draw_bg.color: Caccent
                                         draw_bg.color_2: #x9B6BB5
                                         draw_bg.gradient_fill_horizontal: 1.0
-                                        draw_bg.color_hover: Cacchov
+                                        // Hover lifts hard to a bright pink so the dynamic is
+                                        // obvious — base (#C586C0) → hover (#E8B8E4) is a clear
+                                        // ~20% lightness jump, not the near-invisible acchov.
+                                        draw_bg.color_hover: #xE8B8E4
+                                        draw_bg.color_2_hover: #xB98BCC
                                         draw_bg.border_radius: 8.0
                                         draw_text.color: Cbg
                                         draw_text.text_style: theme.font_bold{font_size: 13}
@@ -1365,13 +1377,11 @@ impl App {
             });
         }
 
-        // 4. Buttons — Connect is the full-width gradient CTA. bar_connect_btn
-        // / theme_btn are the in-console variants. NOTE: dialog_theme_btn is now
-        // the transparent overlay inside ThemeSwitch — it must stay transparent,
-        // so it is NOT in this recolor array (the ThemeSwitch shader draws the
-        // visible surface).
+        // 4. Buttons — bar_connect_btn / theme_btn are the in-console variants.
+        // NOTE: dialog_connect_btn is styled by section 4b (gradient + bright
+        // hover) and dialog_theme_btn is the transparent ThemeSwitch overlay —
+        // neither belongs in this plain recolor array.
         let buttons = [
-            (ids!(dialog_connect_btn), caccent, cacchov, cbg),
             (ids!(bar_connect_btn), caccent, cacchov, cbg),
             (ids!(theme_btn), cbar, crowhov, cprimary),
         ];
@@ -1384,20 +1394,14 @@ impl App {
         }
 
         // 4b. Connect button gradient — magenta (accent) → deep violet
-        // (btn_grad2), horizontal. Hover lifts BOTH gradient stops toward a
-        // brighter pink (cacchov / a lightened btn_grad2) so the button visibly
-        // brightens on hover — Button's built-in Animator drives the smooth 0→1
-        // transition via self.hover, giving the "dynamic" feel. color_2_hover
-        // must be set too or hover breaks the gradient (falls to default theme).
-        let cbtn_hover2 = vec4(
-            p.btn_grad2.x.min(1.0) + 0.12,
-            p.btn_grad2.y.min(1.0) + 0.12,
-            p.btn_grad2.z.min(1.0) + 0.12,
-            1.0,
-        );
+        // (btn_grad2), horizontal. Hover lifts BOTH stops to a bright pink so
+        // the transition is clearly visible (Button's built-in Animator drives
+        // the smooth 0→1 self.hover). Hover colors are brighter than base by a
+        // wide margin (~20% lightness) — the near-invisible acchov delta was
+        // why "no dynamic effect" was reported.
         let mut cbtn = self.ui.button(cx, ids!(dialog_connect_btn));
         script_apply_eval!(cx, cbtn, {
-            draw_bg +: { color: #(caccent), color_2: #(cbtn_grad2), color_hover: #(cacchov), color_2_hover: #(cbtn_hover2), gradient_fill_horizontal: 1.0 }
+            draw_bg +: { color: #(caccent), color_2: #(cbtn_grad2), color_hover: #xE8B8E4, color_2_hover: #xB98BCC, gradient_fill_horizontal: 1.0 }
         });
 
         // Theme switch: drive its shader's is_dark instance (1.0 dark / 0.0
