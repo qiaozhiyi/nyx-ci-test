@@ -160,78 +160,6 @@ script_mod! {
         }
     }
 
-    // ── theme switch (sun/moon toggle, reference design) ────────────────────
-    // The reference shows a pill toggle with a SUN glyph at the left end and a
-    // MOON at the right end; a knob slides between them, covering whichever
-    // side is inactive. Earlier attempts drew the glyph INSIDE the knob (too
-    // small → blob). Here the glyphs sit at the track ENDS (outside the knob's
-    // travel) so they're never covered and stay legible. Size 96x40 gives each
-    // glyph ~20px — enough to read at HiDPI.
-    let ThemeSwitch = View{
-        width: 96 height: 40
-        flow: Overlay
-        show_bg: true
-        draw_bg +: {
-            is_dark: instance(1.0)
-            track_on: instance(#x6B3E80)
-            track_off: instance(#xC4BCD4)
-            knob_color: instance(#xF4F0FA)
-            sun_color: instance(#xFFD27A)
-            moon_color: instance(#C8D4F0)
-
-            pixel: fn() {
-                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                let w = self.rect_size.x
-                let h = self.rect_size.y
-                let r = h * 0.5
-
-                // Pill track.
-                sdf.box(0.0, 0.0, w, h, r)
-                sdf.fill(vec4(mix(self.track_off.rgb, self.track_on.rgb, self.is_dark), 1.0))
-
-                // Sun glyph at the LEFT end (inside the track, clear of the knob).
-                // A small disc + 4 short rays.
-                let sx = r + 4.0
-                let sy = h * 0.5
-                let sr = r * 0.32
-                sdf.circle(sx, sy, sr)
-                sdf.fill_keep(vec4(self.sun_color.rgb, 1.0))
-                // rays (4 short strokes)
-                sdf.move_to(sx, sy - sr - 2.0)
-                sdf.line_to(sx, sy - sr - 5.0)
-                sdf.stroke(vec4(self.sun_color.rgb, 1.0), 1.2)
-                sdf.move_to(sx, sy + sr + 2.0)
-                sdf.line_to(sx, sy + sr + 5.0)
-                sdf.stroke(vec4(self.sun_color.rgb, 1.0), 1.2)
-                sdf.move_to(sx - sr - 2.0, sy)
-                sdf.line_to(sx - sr - 5.0, sy)
-                sdf.stroke(vec4(self.sun_color.rgb, 1.0), 1.2)
-                sdf.move_to(sx + sr + 2.0, sy)
-                sdf.line_to(sx + sr + 5.0, sy)
-                sdf.stroke(vec4(self.sun_color.rgb, 1.0), 1.2)
-
-                // Moon glyph at the RIGHT end — disc minus offset disc = crescent.
-                let mx = w - r - 4.0
-                let my = h * 0.5
-                let mr = r * 0.36
-                sdf.circle(mx, my, mr)
-                sdf.fill_keep(vec4(self.moon_color.rgb, 1.0))
-                sdf.circle(mx + mr * 0.35, my - mr * 0.2, mr * 0.85)
-                sdf.subtract()
-
-                // Knob slides over the INACTIVE end. Light mode (is_dark=0) →
-                // knob left, covering the sun (it's daytime, sun "absorbed");
-                // dark mode → knob right, covering the moon. The active glyph
-                // on the opposite end stays visible.
-                let knob_x = mix(r, w - r, self.is_dark)
-                sdf.circle(knob_x, h * 0.5, r * 0.7)
-                sdf.fill(self.knob_color)
-
-                return sdf.result
-            }
-        }
-    }
-
     // ── session row (one beacon) ────────────────────────────────────────────
     // `flow: Overlay` so the transparent full-row `select` Button sits ON TOP
     // of the label row and captures clicks across the whole row. This is the
@@ -734,46 +662,36 @@ script_mod! {
                                 // The switch reuses the dialog_theme_btn id on
                                 // its transparent overlay Button so the existing
                                 // handle_actions toggle path is unchanged.
-                                View{
-                                    width: Fill height: Fit
-                                    flow: Down spacing: 12.0
-                                    View{
-                                        width: Fill height: Fit
-                                        align: Align{x: 0.5}
-                                        theme_switch := ThemeSwitch{
-                                            // Transparent hit-area button fills the pill.
-                                            // border_size MUST be 0 — Button's default theme.beveling
-                                            // border was drawing the unwanted elliptical halo.
-                                            // All colors transparent so nothing renders except the
-                                            // ThemeSwitch shader behind it.
-                                            dialog_theme_btn := Button{
-                                                width: Fill height: Fill
-                                                text: ""
-                                                draw_bg.color: #x00000000
-                                                draw_bg.color_hover: #x00000000
-                                                draw_bg.color_down: #x00000000
-                                                draw_bg.color_focus: #x00000000
-                                                draw_bg.border_size: 0.0
-                                                draw_bg.border_color: #x00000000
-                                                draw_text.color: #x00000000
-                                            }
-                                        }
-                                    }
-                                    dialog_connect_btn := Button{
-                                        text: "Connect"
-                                        width: Fill height: 38
-                                        draw_bg.color: Caccent
-                                        draw_bg.color_2: #x9B6BB5
-                                        draw_bg.gradient_fill_horizontal: 1.0
-                                        // Hover lifts hard to a bright pink so the dynamic is
-                                        // obvious — base (#C586C0) → hover (#E8B8E4) is a clear
+                                // Theme toggle = a plain full-width bar button (the
+                                // "common long button" the user asked for). Shows the
+                                // destination theme name; clicking flips dark/light via
+                                // the existing handle_actions path (dialog_theme_btn id).
+                                // No shader toggle — those kept pixelating at small sizes.
+                                dialog_theme_btn := Button{
+                                    text: "Light"
+                                    width: Fill height: 34
+                                    draw_bg.color: Cinput
+                                    draw_bg.color_hover: Crowhov
+                                    draw_bg.border_size: 1.0
+                                    draw_bg.border_color: Cinput_b
+                                    draw_bg.border_radius: 6.0
+                                    draw_text.color: Csecond
+                                    draw_text.text_style: theme.font_regular{font_size: 12}
+                                }
+                                dialog_connect_btn := Button{
+                                    text: "Connect"
+                                    width: Fill height: 38
+                                    draw_bg.color: Caccent
+                                    draw_bg.color_2: #x9B6BB5
+                                    draw_bg.gradient_fill_horizontal: 1.0
+                                    // Hover lifts hard to a bright pink so the dynamic is
+                                    // obvious — base (#C586C0) → hover (#E8B8E4) is a clear
                                         // ~20% lightness jump, not the near-invisible acchov.
                                         draw_bg.color_hover: #xE8B8E4
                                         draw_bg.color_2_hover: #xB98BCC
                                         draw_bg.border_radius: 8.0
-                                        draw_text.color: Cbg
-                                        draw_text.text_style: theme.font_bold{font_size: 13}
-                                    }
+                                    draw_text.color: Cbg
+                                    draw_text.text_style: theme.font_bold{font_size: 13}
                                 }
                                 connect_footer := Label{
                                     text: "Authorized use only · all activity is logged"
@@ -1381,13 +1299,13 @@ impl App {
             });
         }
 
-        // 4. Buttons — bar_connect_btn / theme_btn are the in-console variants.
-        // NOTE: dialog_connect_btn is styled by section 4b (gradient + bright
-        // hover) and dialog_theme_btn is the transparent ThemeSwitch overlay —
-        // neither belongs in this plain recolor array.
+        // 4. Buttons — bar_connect_btn / theme_btn are the in-console variants;
+        // dialog_theme_btn is the login bar toggle (now a plain text button).
+        // dialog_connect_btn is styled by section 4b (gradient + bright hover).
         let buttons = [
             (ids!(bar_connect_btn), caccent, cacchov, cbg),
             (ids!(theme_btn), cbar, crowhov, cprimary),
+            (ids!(dialog_theme_btn), cinput, crowhov, csecond),
         ];
         for (path, bg, bg_hov, fg) in buttons {
             let mut btn = self.ui.button(cx, path);
@@ -1408,17 +1326,12 @@ impl App {
             draw_bg +: { color: #(caccent), color_2: #(cbtn_grad2), color_hover: #xE8B8E4, color_2_hover: #xB98BCC, gradient_fill_horizontal: 1.0 }
         });
 
-        // Theme switch: drive its shader's is_dark instance (1.0 dark / 0.0
-        // light) so the knob slides + sun/moon glyph swaps. The transparent
-        // overlay Button keeps the dialog_theme_btn id; it has no label now so
-        // the old set_text calls are dropped. theme_btn (console bar) keeps its
-        // text toggle as before.
-        let cisdark = if is_dark { 1.0 } else { 0.0 };
-        let mut tsw = self.ui.view(cx, ids!(theme_switch));
-        script_apply_eval!(cx, tsw, {
-            draw_bg +: { is_dark: #(cisdark) }
-        });
+        // Theme toggle labels name the destination: "Light" when dark (click →
+        // switch to light), "Dark" when light. Both the dialog bar button and
+        // the console bar button get the same label. (The shader ThemeSwitch was
+        // removed — it kept pixelating; this is a plain text bar button now.)
         let mode_label = if is_dark { "Light" } else { "Dark" };
+        self.ui.button(cx, ids!(dialog_theme_btn)).set_text(cx, mode_label);
         self.ui.button(cx, ids!(theme_btn)).set_text(cx, mode_label);
 
         // 5. Dialog text: error status, wordmark/tagline/title, field labels.
