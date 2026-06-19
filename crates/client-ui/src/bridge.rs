@@ -91,8 +91,10 @@ pub enum BofState {
 /// UI→worker command. Enum keeps the channel message type closed and explicit.
 #[derive(Debug, Clone)]
 pub enum Cmd {
-    /// Target team server base URL (e.g. `http://127.0.0.1:8443`).
-    Connect { server: String },
+    /// Target team server base URL + optional API bearer token.
+    /// `password` is the operator-typed token sent as `Authorization: Bearer`.
+    /// `None` when the server has no `NYX_TOKEN` configured (local dev).
+    Connect { server: String, password: Option<String> },
     /// Enqueue a shell task on the given session.
     Shell { session: String, args: String },
     /// Enqueue a BOF (Beacon Object File) task on the given session. `name` is
@@ -174,7 +176,8 @@ struct PendingTask {
 }
 
 async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
-    let mut server: Option<String> = None;
+    // (server_url, optional bearer token). None until first Connect.
+    let mut server: Option<(String, Option<String>)> = None;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
@@ -192,17 +195,17 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Cmd::Shutdown => return,
-                Cmd::Connect { server: s } => {
+                Cmd::Connect { server: s, password } => {
                     log_push(&mut log_buf, &format!("connecting to {s} …"));
-                    server = Some(s);
+                    server = Some((s, password));
                     let _ = to_ui.send(take_snapshot(&mut log_buf, false, &[], &mut bof_updates));
                 }
                 Cmd::Shell { session, args } => {
-                    let Some(ref srv) = server else {
+                    let Some((ref srv, ref token)) = server else {
                         log_push(&mut log_buf, "! not connected");
                         continue;
                     };
-                    match enqueue_shell(&client, srv, &session, &args).await {
+                    match enqueue_shell(&client, srv, &session, &args, token).await {
                         Ok(tid) => {
                             log_push(
                                 &mut log_buf,
@@ -217,11 +220,11 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                     }
                 }
                 Cmd::Bof { session, name, args, data_hex } => {
-                    let Some(ref srv) = server else {
+                    let Some((ref srv, ref token)) = server else {
                         log_push(&mut log_buf, "! not connected");
                         continue;
                     };
-                    match enqueue_bof(&client, srv, &session, &name, &args, &data_hex).await {
+                    match enqueue_bof(&client, srv, &session, &name, &args, &data_hex, token).await {
                         Ok(tid) => {
                             log_push(&mut log_buf, &format!("[{}] bof {} → task {}", short(&session), name, tid));
                             // Show as pending immediately so the panel isn't empty while polling.
@@ -245,13 +248,13 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
             }
         }
 
-        let Some(ref srv) = server else {
+        let Some((ref srv, ref token)) = server else {
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         };
 
         // 2. Refresh session list (throttled to SESSION_POLL).
-        match fetch_sessions(&client, srv).await {
+        match fetch_sessions(&client, srv, token).await {
             Ok(list) => {
                 let sig = session_signature(&list);
                 let changed = sig != last_session_sig;
@@ -276,7 +279,7 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                 continue;
             }
             let PendingTask { session, task_id, kind, backoff, .. } = t;
-            match poll_result(&client, srv, &session, task_id).await {
+            match poll_result(&client, srv, &session, task_id, token).await {
                 Ok(Some(out)) => match kind {
                     TaskKind::Shell => {
                         if !out.is_empty() {
@@ -342,8 +345,27 @@ fn take_snapshot(
 
 // ---- REST helpers (all async, all on the worker) ---------------------------
 
-async fn fetch_sessions(c: &reqwest::Client, server: &str) -> anyhow::Result<Vec<SessionView>> {
-    Ok(c.get(format!("{server}/api/sessions")).send().await?.json().await?)
+/// Attach the bearer token (if any) to a request builder. `None` token is a
+/// no-op (local dev server with no `NYX_TOKEN`); `Some` sets
+/// `Authorization: Bearer <token>` — exactly what the server's `require_auth`
+/// gate expects on `/api/*`.
+fn authed(req: reqwest::RequestBuilder, token: &Option<String>) -> reqwest::RequestBuilder {
+    match token {
+        Some(t) => req.bearer_auth(t),
+        None => req,
+    }
+}
+
+async fn fetch_sessions(
+    c: &reqwest::Client,
+    server: &str,
+    token: &Option<String>,
+) -> anyhow::Result<Vec<SessionView>> {
+    Ok(authed(c.get(format!("{server}/api/sessions")), token)
+        .send()
+        .await?
+        .json()
+        .await?)
 }
 
 #[derive(Deserialize)]
@@ -363,14 +385,13 @@ async fn enqueue_shell(
     server: &str,
     session: &str,
     args: &str,
+    token: &Option<String>,
 ) -> anyhow::Result<u64> {
     let body = serde_json::json!({
         "session": session,
         "command": { "type": "shell", "args": args }
     });
-    let ack: TaskAck = c
-        .post(format!("{server}/api/task"))
-        .json(&body)
+    let ack: TaskAck = authed(c.post(format!("{server}/api/task")).json(&body), token)
         .send()
         .await?
         .json()
@@ -385,6 +406,7 @@ async fn enqueue_bof(
     name: &str,
     args: &str,
     data_hex: &str,
+    token: &Option<String>,
 ) -> anyhow::Result<u64> {
     // The server's `JsonCommand::Bof` wants `args: Vec<String>` — split the
     // operator-typed space-separated string. Empty arg string → empty vec.
@@ -397,9 +419,7 @@ async fn enqueue_bof(
         "session": session,
         "command": { "type": "bof", "name": name, "args": args_vec, "data_hex": data_hex }
     });
-    let ack: TaskAck = c
-        .post(format!("{server}/api/task"))
-        .json(&body)
+    let ack: TaskAck = authed(c.post(format!("{server}/api/task")).json(&body), token)
         .send()
         .await?
         .json()
@@ -412,14 +432,16 @@ async fn poll_result(
     server: &str,
     session: &str,
     task_id: u64,
+    token: &Option<String>,
 ) -> anyhow::Result<Option<String>> {
-    let rs: Vec<ResultView> = c
-        .get(format!("{server}/api/results"))
-        .query(&[("session", session)])
-        .send()
-        .await?
-        .json()
-        .await?;
+    let rs: Vec<ResultView> = authed(
+        c.get(format!("{server}/api/results")).query(&[("session", session)]),
+        token,
+    )
+    .send()
+    .await?
+    .json()
+    .await?;
     Ok(rs.into_iter().find(|r| r.task_id == task_id).map(|r| match r.kind.as_str() {
         "output" => r.text,
         "ok" => String::new(),
@@ -471,6 +493,28 @@ mod tests {
             beacon_id: 0,
             arch: 0,
             pid: 0,
+        }
+    }
+
+    #[test]
+    fn connect_cmd_carries_password() {
+        // Cmd::Connect now carries an optional bearer token. This pins the
+        // signature so a future refactor can't silently drop it (the original
+        // auth-header bug was exactly this: the field didn't exist).
+        let c = Cmd::Connect { server: "http://x".into(), password: Some("sekret".into()) };
+        match c {
+            Cmd::Connect { password: Some(p), .. } => assert_eq!(p, "sekret"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn connect_cmd_allows_no_token() {
+        // Local dev server (no NYX_TOKEN) → password is None; must not error.
+        let c = Cmd::Connect { server: "http://x".into(), password: None };
+        match c {
+            Cmd::Connect { password: None, .. } => {}
+            _ => panic!("wrong variant"),
         }
     }
 
