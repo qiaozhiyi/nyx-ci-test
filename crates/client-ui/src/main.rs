@@ -142,40 +142,41 @@ script_mod! {
     // (tint/border/shadow/fallback) = instance; static knobs (blur level,
     // surface alpha, radii) = uniform.
     let GlassCard = GaussRoundedView{
-        width: Fill height: Fit
+        width: Fill height: Fill
         flow: Down
         draw_bg +: {
             tint_color: instance(#x2D2D3D)
-            tint_alpha: uniform(0.55)
-            surface_alpha: uniform(0.82)
+            tint_alpha: uniform(1.0)
+            surface_alpha: uniform(1.0)
             border_color: instance(#xC586C0)
-            border_alpha: instance(0.5)
+            border_alpha: instance(0.25)
             border_width: instance(1.0)
-            corner_radius: instance(12.0)
+            corner_radius: instance(14.0)
             blur_level: uniform(4.0)
-            shadow_color: instance(#x000000B3)
-            shadow_radius: uniform(24.0)
-            shadow_offset: uniform(vec2(0.0, 8.0))
+            shadow_color: instance(#x00000000)
+            shadow_radius: uniform(0.0)
+            shadow_offset: uniform(vec2(0.0, 0.0))
             fallback_color: instance(#x2D2D3D)
         }
     }
 
-    // ── theme switch (procedural sun/moon toggle) ───────────────────────────
-    // Pure-DSL shader View: a pill track + sliding knob + sun (light) / moon
-    // crescent (dark) drawn procedurally — IBMPlexSans has no ☀/☾ glyphs, so
-    // we draw them in the shader instead. `is_dark` instance (1.0/0.0) drives
-    // knob position + which glyph shows; apply_theme sets it. A transparent
-    // overlay Button (reusing the dialog_theme_btn id) captures the click so
-    // the existing handle_actions toggle path needs NO change.
+    // ── theme switch (clean solid toggle, no glyph) ─────────────────────────
+    // Earlier versions drew a sun/moon glyph INSIDE the knob, but at 52px the
+    // crescent subtract pixelated into an unreadable blob ("一坨"). A clean
+    // solid toggle (track + knob only) is what iOS/Android actually ship and
+    // stays crisp at any size. State is shown by knob position + track color
+    // (saturated purple = dark on, soft lilac = light off). A transparent
+    // overlay Button (dialog_theme_btn id) captures the click so the existing
+    // handle_actions toggle path is unchanged.
     let ThemeSwitch = View{
-        width: 52 height: 30
+        width: 50 height: 28
         flow: Overlay
         show_bg: true
         draw_bg +: {
             is_dark: instance(1.0)
-            track_on: instance(#x5A3A6E)
-            track_off: instance(#xC8C0D8)
-            knob_color: instance(#xF8F8FB)
+            track_on: instance(#x6B3E80)
+            track_off: instance(#xC4BCD4)
+            knob_color: instance(#xFFFFFF)
 
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
@@ -183,31 +184,14 @@ script_mod! {
                 let h = self.rect_size.y
                 let r = h * 0.5
 
-                // Pill track — saturated purple when dark (on), soft lilac when
-                // light (off). mix = GLSL free fn (verified in button.rs:130).
+                // Pill track.
                 sdf.box(0.0, 0.0, w, h, r)
                 sdf.fill(vec4(mix(self.track_off.rgb, self.track_on.rgb, self.is_dark), 1.0))
 
-                // Knob slides left(off)↔right(on), slightly smaller than the
-                // track height so a ring of track shows around it.
+                // Knob slides left(off)↔right(on).
                 let knob_x = mix(r, w - r, self.is_dark)
-                let kr = r * 0.7
-                sdf.circle(knob_x, h * 0.5, kr)
+                sdf.circle(knob_x, h * 0.5, r * 0.72)
                 sdf.fill(self.knob_color)
-
-                // Glyph inside the knob: sun (light) / moon crescent (dark),
-                // drawn at the knob center so it rides along.
-                if self.is_dark < 0.5 {
-                    // Sun: warm disc.
-                    sdf.circle(knob_x, h * 0.5, kr * 0.55)
-                    sdf.fill_keep(vec4(1.0, 0.74, 0.36, 1.0))
-                } else {
-                    // Moon: disc minus offset disc = crescent.
-                    sdf.circle(knob_x, h * 0.5, kr * 0.58)
-                    sdf.fill_keep(vec4(0.74, 0.80, 0.94, 1.0))
-                    sdf.circle(knob_x + kr * 0.3, h * 0.5 - kr * 0.16, kr * 0.5)
-                    sdf.subtract()
-                }
 
                 return sdf.result
             }
@@ -519,11 +503,9 @@ script_mod! {
                     // three as View.
                     connect_view := View{
                         width: Fill height: Fill
-                        align: Center
                         draw_bg.color: Cbg
-                        // The dialog card — GlassCard (GaussRoundedView real blur).
-                        // No network background: the window is sized to just the
-                        // login card, so there's no surrounding bg to blur.
+                        // The dialog card fills the whole (small) login window —
+                        // no centering, no network bg. The card IS the window.
                         connect_card := GlassCard{
 
                             // Brand header: gradient logo box + wordmark + tagline.
@@ -1142,6 +1124,13 @@ impl App {
             }
         }
         self.set_status(cx, snap.connected);
+        // Grow the window to full console size on the connect TRANSITION. The
+        // login view uses a small 372x460 window (just the card); the console
+        // needs 1280x800. has_connected is sticky (once connected we stay in the
+        // console even if the session later drops), so this fires exactly once.
+        if snap.connected && !self.has_connected {
+            self.ui.window(cx, ids!(main_window)).resize(cx, dvec2(1280.0, 800.0));
+        }
         if snap.connected {
             self.has_connected = true;
         }
