@@ -389,148 +389,153 @@ script_mod! {
                             draw_bg.border_size: 1.0
                             draw_bg.border_color: Cborder
 
-                            // Brand header band: accent stripe, wordmark, tagline.
-                            connect_stripe := View{width: Fill height: 4 draw_bg.color: Caccent}
+                            // Brand header: gradient logo box + wordmark + tagline.
+                            // No accent stripe — One Dark doesn't use it.
                             View{
                                 width: Fill height: Fit
-                                padding: Inset{top: 24.0 bottom: 20.0 left: 28.0 right: 28.0}
-                                flow: Down spacing: 5.0
-                                nyx_logo := Label{
-                                    text: "NYX"
-                                    draw_text.color: Cprimary
-                                    draw_text.text_style: theme.font_bold{font_size: 30}
+                                padding: Inset{top: 30.0 bottom: 22.0 left: 30.0 right: 30.0}
+                                flow: Down spacing: 6.0
+                                View{
+                                    width: Fit height: Fit
+                                    flow: Right spacing: 10.0
+                                    align: Align{y: 0.5}
+                                    logo_box := View{
+                                        width: 30 height: 30
+                                        draw_bg.color: Caccent
+                                        draw_bg.border_radius: 6.0
+                                        align: Center
+                                        logo_letter := Label{
+                                            text: "N"
+                                            draw_text.color: Cbg
+                                            draw_text.text_style: theme.font_bold{font_size: 16}
+                                        }
+                                    }
+                                    nyx_logo := Label{
+                                        text: "Nyx Operator"
+                                        draw_text.color: Cprimary
+                                        draw_text.text_style: theme.font_bold{font_size: 16}
+                                    }
                                 }
                                 connect_tagline := Label{
-                                    text: "RED TEAM COMMAND & CONTROL"
-                                    draw_text.color: Caccent
-                                    draw_text.text_style: theme.font_bold{font_size: 10}
+                                    text: "Connect to a team server"
+                                    draw_text.color: Cmuted
+                                    draw_text.text_style: theme.font_regular{font_size: 12}
                                 }
                             }
                             View{width: Fill height: 1 draw_bg.color: Cborder}
-                            // Form body.
+                            // Form body. Inputs use a filled style (bg deeper than
+                            // the card, 1px border, magenta focus border) — the VS
+                            // Code / One Dark input look confirmed in the mockup.
                             View{
                                 width: Fill height: Fit
-                                padding: Inset{top: 20.0 bottom: 24.0 left: 28.0 right: 28.0}
-                                flow: Down spacing: 14.0
-                                connect_title := Label{
-                                    text: "CONNECT TO TEAM SERVER"
-                                    draw_text.color: Cmuted
-                                    draw_text.text_style: theme.font_bold{font_size: 11}
-                                }
-                                // Host + Port share a row.
+                                padding: Inset{top: 20.0 bottom: 26.0 left: 30.0 right: 30.0}
+                                flow: Down spacing: 16.0
+
+                                // Server URL — host + port merged into one field
+                                // (simpler than the old two-column HOST/PORT row).
                                 View{
-                                    width: Fill height: Fit
-                                    flow: Right spacing: 12.0
-                                    View{
-                                        width: Fill height: Fit flow: Down spacing: 4.0
-                                        host_label := Label{text: "HOST" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 10}}
-                                        host_input := TextInput{
-                                            width: Fill height: 34
-                                            padding: Inset{left: 10.0 right: 10.0}
-                                            text: "127.0.0.1"
-                                            draw_bg.color: Cbg
-                                            draw_bg.color_hover: Cbg
-                                            draw_bg.color_focus: Cbg
-                                            draw_bg.border_color: Cborder
-                                            draw_bg.border_color_focus: Caccent
-                                            draw_bg.border_radius: Cradius_s
-                                            draw_text.color: Cprimary
-                                            draw_text.color_hover: Cprimary
-                                            draw_text.color_focus: Cprimary
-                                            draw_text.color_empty: Cmuted
-                                            draw_text.text_style: theme.font_regular{font_size: 13}
-                                            draw_cursor.color: Caccent
-                                        }
-                                    }
-                                    View{
-                                        width: 140 height: Fit flow: Down spacing: 4.0
-                                        port_label := Label{text: "PORT" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 10}}
-                                        port_input := TextInput{
-                                            width: Fill height: 34
-                                            padding: Inset{left: 10.0 right: 10.0}
-                                            text: "8443"
-                                            draw_bg.color: Cbg
-                                            draw_bg.color_hover: Cbg
-                                            draw_bg.color_focus: Cbg
-                                            draw_bg.border_color: Cborder
-                                            draw_bg.border_color_focus: Caccent
-                                            draw_bg.border_radius: Cradius_s
-                                            draw_text.color: Cprimary
-                                            draw_text.color_hover: Cprimary
-                                            draw_text.color_focus: Cprimary
-                                            draw_text.color_empty: Cmuted
-                                            draw_text.text_style: theme.font_regular{font_size: 13}
-                                            draw_cursor.color: Caccent
-                                        }
-                                    }
-                                }
-                                View{
-                                    width: Fill height: Fit flow: Down spacing: 4.0
-                                    pass_label := Label{text: "PASSWORD" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 10}}
-                                    pass_input := TextInput{
-                                        is_password: true
-                                        width: Fill height: 34
-                                        padding: Inset{left: 10.0 right: 10.0}
-                                        text: ""
-                                        empty_text: "team server password"
+                                    width: Fill height: Fit flow: Down spacing: 5.0
+                                    url_label := Label{text: "Server URL" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 11}}
+                                    url_input := TextInput{
+                                        width: Fill height: 30
+                                        padding: Inset{left: 12.0 right: 12.0}
+                                        text: "http://127.0.0.1:8443"
+                                        empty_text: "http://host:port"
                                         draw_bg.color: Cbg
                                         draw_bg.color_hover: Cbg
                                         draw_bg.color_focus: Cbg
                                         draw_bg.border_color: Cborder
                                         draw_bg.border_color_focus: Caccent
-                                        draw_bg.border_radius: Cradius_s
+                                        draw_bg.border_size: 1.0
+                                        draw_bg.border_radius: 4.0
                                         draw_text.color: Cprimary
                                         draw_text.color_hover: Cprimary
                                         draw_text.color_focus: Cprimary
                                         draw_text.color_empty: Cmuted
-                                        draw_text.text_style: theme.font_regular{font_size: 13}
+                                        draw_text.text_style: theme.font_code{font_size: 12}
                                         draw_cursor.color: Caccent
                                     }
                                 }
                                 View{
-                                    width: Fill height: Fit flow: Down spacing: 4.0
-                                    alias_label := Label{text: "OPERATOR ALIAS" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 10}}
+                                    width: Fill height: Fit flow: Down spacing: 5.0
+                                    alias_label := Label{text: "Operator" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 11}}
                                     alias_input := TextInput{
-                                        width: Fill height: 34
-                                        padding: Inset{left: 10.0 right: 10.0}
+                                        width: Fill height: 30
+                                        padding: Inset{left: 12.0 right: 12.0}
                                         text: "operator"
                                         draw_bg.color: Cbg
                                         draw_bg.color_hover: Cbg
                                         draw_bg.color_focus: Cbg
                                         draw_bg.border_color: Cborder
                                         draw_bg.border_color_focus: Caccent
-                                        draw_bg.border_radius: Cradius_s
+                                        draw_bg.border_size: 1.0
+                                        draw_bg.border_radius: 4.0
                                         draw_text.color: Cprimary
                                         draw_text.color_hover: Cprimary
                                         draw_text.color_focus: Cprimary
                                         draw_text.color_empty: Cmuted
-                                        draw_text.text_style: theme.font_regular{font_size: 13}
+                                        draw_text.text_style: theme.font_code{font_size: 12}
                                         draw_cursor.color: Caccent
                                     }
                                 }
-                                dialog_connect_btn := Button{
-                                    text: "Connect"
-                                    width: Fill height: 38
-                                    draw_bg.color: Caccent
-                                    draw_bg.color_hover: Cacchov
-                                    draw_bg.border_radius: Cradius
-                                    draw_text.color: #ffffff
-                                    draw_text.text_style: theme.font_bold{font_size: 13}
+                                // Password = API bearer token. Flows into
+                                // Cmd::Connect::password; the worker attaches it
+                                // as `Authorization: Bearer`. Empty = no token
+                                // (local dev server without NYX_TOKEN).
+                                View{
+                                    width: Fill height: Fit flow: Down spacing: 5.0
+                                    pass_label := Label{text: "Password (API Token)" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 11}}
+                                    pass_input := TextInput{
+                                        is_password: true
+                                        width: Fill height: 30
+                                        padding: Inset{left: 12.0 right: 12.0}
+                                        text: ""
+                                        empty_text: "team server token (leave empty if none)"
+                                        draw_bg.color: Cbg
+                                        draw_bg.color_hover: Cbg
+                                        draw_bg.color_focus: Cbg
+                                        draw_bg.border_color: Cborder
+                                        draw_bg.border_color_focus: Caccent
+                                        draw_bg.border_size: 1.0
+                                        draw_bg.border_radius: 4.0
+                                        draw_text.color: Cprimary
+                                        draw_text.color_hover: Cprimary
+                                        draw_text.color_focus: Cprimary
+                                        draw_text.color_empty: Cmuted
+                                        draw_text.text_style: theme.font_code{font_size: 12}
+                                        draw_cursor.color: Caccent
+                                    }
                                 }
                                 connect_status := Label{
                                     text: ""
                                     draw_text.color: Cdanger
-                                    draw_text.text_style: theme.font_regular{font_size: 11}
+                                    draw_text.text_style: theme.font_code{font_size: 11}
                                 }
-                                dialog_theme_btn := Button{
-                                    text: "Dark Mode"
-                                    width: Fill height: 28
-                                    draw_bg.color: #x00000000
-                                    draw_bg.color_hover: #x00000000
-                                    draw_bg.color_down: #x00000000
-                                    draw_bg.border_size: 0.0
-                                    draw_text.color: Cmuted
-                                    draw_text.text_style: theme.font_regular{font_size: 11}
+                                // Buttons row: theme toggle (left) + Connect (right).
+                                View{
+                                    width: Fill height: Fit
+                                    flow: Right spacing: 8.0
+                                    align: Align{y: 0.5}
+                                    dialog_theme_btn := Button{
+                                        text: "Light Mode"
+                                        width: 90 height: 30
+                                        draw_bg.color: Cbg
+                                        draw_bg.color_hover: Crowhov
+                                        draw_bg.border_size: 1.0
+                                        draw_bg.border_radius: 4.0
+                                        draw_text.color: Csecond
+                                        draw_text.text_style: theme.font_regular{font_size: 12}
+                                    }
+                                    View{width: Fill height: 1}
+                                    dialog_connect_btn := Button{
+                                        text: "Connect"
+                                        width: 110 height: 30
+                                        draw_bg.color: Caccent
+                                        draw_bg.color_hover: Cacchov
+                                        draw_bg.border_radius: 4.0
+                                        draw_text.color: Cbg
+                                        draw_text.text_style: theme.font_bold{font_size: 12}
+                                    }
                                 }
                                 connect_footer := Label{
                                     text: "Authorized use only · all activity is logged"
@@ -967,7 +972,7 @@ impl App {
             pass +: { clear_color: #(cbg) }
         });
 
-        // 2. Dialog: backdrop, card, accent stripe.
+        // 2. Dialog: backdrop, card, logo box.
         let mut cv = self.ui.view(cx, ids!(connect_view));
         script_apply_eval!(cx, cv, {
             draw_bg +: { color: #(cbg) }
@@ -976,15 +981,20 @@ impl App {
         script_apply_eval!(cx, cc, {
             draw_bg +: { color: #(celev), border_color: #(cborder) }
         });
-        let mut cs = self.ui.view(cx, ids!(connect_stripe));
-        script_apply_eval!(cx, cs, {
+        // Logo box (filled with accent) + its "N" letter (drawn in bg color so
+        // it inverts against the magenta).
+        let mut lb = self.ui.view(cx, ids!(logo_box));
+        script_apply_eval!(cx, lb, {
             draw_bg +: { color: #(caccent) }
+        });
+        let mut ll = self.ui.label(cx, ids!(logo_letter));
+        script_apply_eval!(cx, ll, {
+            draw_text +: { color: #(cbg) }
         });
 
         // 3. Text inputs (dialog fields + connection-bar server field).
         let inputs = [
-            ids!(host_input),
-            ids!(port_input),
+            ids!(url_input),
             ids!(pass_input),
             ids!(alias_input),
             ids!(server_input),
@@ -998,12 +1008,12 @@ impl App {
             });
         }
 
-        // 4. Buttons — accent primaries, bar-colored secondaries.
+        // 4. Buttons — accent primary (Connect, dark text), bar-colored secondaries.
         let buttons = [
-            (ids!(dialog_connect_btn), caccent, cacchov, vec4(1.0, 1.0, 1.0, 1.0)),
-            (ids!(bar_connect_btn), caccent, cacchov, vec4(1.0, 1.0, 1.0, 1.0)),
+            (ids!(dialog_connect_btn), caccent, cacchov, cbg),
+            (ids!(bar_connect_btn), caccent, cacchov, cbg),
             (ids!(theme_btn), cbar, crowhov, cprimary),
-            (ids!(dialog_theme_btn), vec4(0.0, 0.0, 0.0, 0.0), vec4(0.0, 0.0, 0.0, 0.0), cmuted),
+            (ids!(dialog_theme_btn), cbg, crowhov, cmuted),
         ];
         for (path, bg, bg_hov, fg) in buttons {
             let mut btn = self.ui.button(cx, path);
@@ -1024,12 +1034,10 @@ impl App {
         });
         let dialog_labels = [
             (ids!(nyx_logo), cprimary),
-            (ids!(connect_tagline), caccent),
-            (ids!(connect_title), cmuted),
-            (ids!(host_label), cmuted),
-            (ids!(port_label), cmuted),
-            (ids!(pass_label), cmuted),
+            (ids!(connect_tagline), cmuted),
+            (ids!(url_label), cmuted),
             (ids!(alias_label), cmuted),
+            (ids!(pass_label), cmuted),
             (ids!(connect_footer), cmuted),
         ];
         for (path, color) in dialog_labels {
@@ -1209,24 +1217,22 @@ impl MatchEvent for App {
         // ── Connect dialog (the dedicated connect window) ────────────────
         // Connect button OR Enter in any connect-dialog field.
         let dlg_connect = self.ui.button(cx, ids!(dialog_connect_btn)).clicked(actions);
-        let dlg_enter = self.ui.text_input(cx, ids!(host_input)).returned(actions).is_some()
-            || self.ui.text_input(cx, ids!(port_input)).returned(actions).is_some()
-            || self.ui.text_input(cx, ids!(pass_input)).returned(actions).is_some()
-            || self.ui.text_input(cx, ids!(alias_input)).returned(actions).is_some();
-        
+        let dlg_enter = self.ui.text_input(cx, ids!(url_input)).returned(actions).is_some()
+            || self.ui.text_input(cx, ids!(alias_input)).returned(actions).is_some()
+            || self.ui.text_input(cx, ids!(pass_input)).returned(actions).is_some();
+
         let bar_connect = self.ui.button(cx, ids!(bar_connect_btn)).clicked(actions);
-        
+
         if dlg_connect || dlg_enter || bar_connect {
             self.ensure_bridge();
             if let Some(b) = &self.bridge {
                 let (url, password) = if bar_connect {
                     (self.ui.text_input(cx, ids!(server_input)).text(), None)
                 } else {
-                    let host = self.ui.text_input(cx, ids!(host_input)).text();
-                    let port = self.ui.text_input(cx, ids!(port_input)).text();
+                    let raw = self.ui.text_input(cx, ids!(url_input)).text();
                     let pw = self.ui.text_input(cx, ids!(pass_input)).text();
                     let pw = if pw.trim().is_empty() { None } else { Some(pw) };
-                    (format!("http://{}:{}", host.trim(), port.trim()), pw)
+                    (raw, pw)
                 };
                 let _ = b.from_ui.send(Cmd::Connect {
                     server: url.trim().to_string(),
