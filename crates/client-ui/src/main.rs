@@ -160,6 +160,58 @@ script_mod! {
         }
     }
 
+    // ── theme switch (procedural sun/moon toggle) ───────────────────────────
+    // Pure-DSL shader View: a pill track + sliding knob + sun (light) / moon
+    // crescent (dark) drawn procedurally — IBMPlexSans has no ☀/☾ glyphs, so
+    // we draw them in the shader instead. `is_dark` instance (1.0/0.0) drives
+    // knob position + which glyph shows; apply_theme sets it. A transparent
+    // overlay Button (reusing the dialog_theme_btn id) captures the click so
+    // the existing handle_actions toggle path needs NO change.
+    let ThemeSwitch = View{
+        width: 90 height: 30
+        flow: Overlay
+        show_bg: true
+        draw_bg +: {
+            is_dark: instance(1.0)
+            track_dark: instance(#x2A2A3E)
+            track_light: instance(#xE8E0F0)
+            knob_color: instance(#xF5F5F8)
+            accent: instance(#xC586C0)
+
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                let w = self.rect_size.x
+                let h = self.rect_size.y
+                let r = h * 0.5
+
+                // Pill track — color blends with state.
+                sdf.box(0.0, 0.0, w, h, r)
+                sdf.fill(self.track_light.rgb.mix(self.track_dark.rgb, self.is_dark))
+
+                // Knob slides: is_dark=0 (light) → left, is_dark=1 (dark) → right.
+                let knob_x = r.mix(w - r, self.is_dark)
+                sdf.circle(knob_x, h * 0.5, r * 0.78)
+                sdf.fill(self.knob_color)
+
+                // Sun (drawn on the LEFT, visible when light / is_dark≈0): small
+                // warm disc inside the knob area when knob is left.
+                let sun_x = r
+                sdf.circle(sun_x, h * 0.5, r * 0.45)
+                sdf.fill_keep(vec4(1.0, 0.82, 0.48, 1.0 - self.is_dark))
+
+                // Moon crescent (drawn on the RIGHT, visible when dark): two
+                // overlapping circles, subtract to carve the crescent.
+                let moon_x = w - r
+                sdf.circle(moon_x, h * 0.5, r * 0.5)
+                sdf.fill_keep(vec4(0.72, 0.77, 0.91, self.is_dark))
+                sdf.circle(moon_x + r * 0.28, h * 0.5 - r * 0.14, r * 0.46)
+                sdf.subtract()
+
+                return sdf.result
+            }
+        }
+    }
+
     // ── session row (one beacon) ────────────────────────────────────────────
     // `flow: Overlay` so the transparent full-row `select` Button sits ON TOP
     // of the label row and captures clicks across the whole row. This is the
@@ -666,28 +718,25 @@ script_mod! {
                                     draw_text.color: Cdanger
                                     draw_text.text_style: theme.font_code{font_size: 11}
                                 }
-                                // Buttons: theme toggle (ghost, right-aligned
-                                // on its own row) then a full-width primary
-                                // Connect below — matches the reference dialog
-                                // where the CTA spans card edge to edge. Toggle
-                                // label names the DESTINATION ("Light"/"Dark"),
-                                // not the current state.
+                                // Theme switch centered, then full-width Connect.
+                                // The switch reuses the dialog_theme_btn id on
+                                // its transparent overlay Button so the existing
+                                // handle_actions toggle path is unchanged.
                                 View{
                                     width: Fill height: Fit
                                     flow: Down spacing: 12.0
                                     View{
-                                        width: Fill height: Fit flow: Right
-                                        View{width: Fill height: 1}
-                                        dialog_theme_btn := Button{
-                                            text: "Light"
-                                            width: Fit height: 26
-                                            draw_bg.color: Cbg
-                                            draw_bg.color_hover: Crowhov
-                                            draw_bg.border_size: 1.0
-                                            draw_bg.border_color: Cborder
-                                            draw_bg.border_radius: 4.0
-                                            draw_text.color: Csecond
-                                            draw_text.text_style: theme.font_regular{font_size: 11}
+                                        width: Fill height: Fit
+                                        align: Align{x: 0.5}
+                                        theme_switch := ThemeSwitch{
+                                            // Transparent hit-area button fills the pill.
+                                            dialog_theme_btn := Button{
+                                                width: Fill height: Fill
+                                                text: ""
+                                                draw_bg.color: #x00000000
+                                                draw_bg.color_hover: #x00000000
+                                                draw_text.color: #x00000000
+                                            }
                                         }
                                     }
                                     dialog_connect_btn := Button{
@@ -1315,15 +1364,15 @@ impl App {
             });
         }
 
-        // 4. Buttons — Connect is the full-width saturated CTA (accent fill,
-        // inverted bg text). dialog_theme_btn is a small ghost toggle (cbg
-        // backdrop so it recedes, bordered, muted text) right-aligned above
-        // the CTA. bar_connect_btn / theme_btn are the in-console variants.
+        // 4. Buttons — Connect is the full-width gradient CTA. bar_connect_btn
+        // / theme_btn are the in-console variants. NOTE: dialog_theme_btn is now
+        // the transparent overlay inside ThemeSwitch — it must stay transparent,
+        // so it is NOT in this recolor array (the ThemeSwitch shader draws the
+        // visible surface).
         let buttons = [
             (ids!(dialog_connect_btn), caccent, cacchov, cbg),
             (ids!(bar_connect_btn), caccent, cacchov, cbg),
             (ids!(theme_btn), cbar, crowhov, cprimary),
-            (ids!(dialog_theme_btn), cbg, crowhov, cmuted),
         ];
         for (path, bg, bg_hov, fg) in buttons {
             let mut btn = self.ui.button(cx, path);
@@ -1341,11 +1390,17 @@ impl App {
             draw_bg +: { color: #(caccent), color_2: #(cbtn_grad2), gradient_fill_horizontal: 1.0 }
         });
 
-        // Theme-toggle label names the destination: "Light" when we ARE dark
-        // (click → switch to light), "Dark" when light. Plain ASCII because
-        // IBMPlexSans has no sun/moon glyphs (they render as tofu).
+        // Theme switch: drive its shader's is_dark instance (1.0 dark / 0.0
+        // light) so the knob slides + sun/moon glyph swaps. The transparent
+        // overlay Button keeps the dialog_theme_btn id; it has no label now so
+        // the old set_text calls are dropped. theme_btn (console bar) keeps its
+        // text toggle as before.
+        let cisdark = if is_dark { 1.0 } else { 0.0 };
+        let mut tsw = self.ui.view(cx, ids!(theme_switch));
+        script_apply_eval!(cx, tsw, {
+            draw_bg +: { is_dark: #(cisdark) }
+        });
         let mode_label = if is_dark { "Light" } else { "Dark" };
-        self.ui.button(cx, ids!(dialog_theme_btn)).set_text(cx, mode_label);
         self.ui.button(cx, ids!(theme_btn)).set_text(cx, mode_label);
 
         // 5. Dialog text: error status, wordmark/tagline/title, field labels.
