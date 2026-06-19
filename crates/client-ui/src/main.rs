@@ -1246,6 +1246,12 @@ impl App {
         let crowhov = p.rowhov;
         let cinput = p.input;
         let cinput_b = p.input_b;
+        let cgrad_top = p.grad_top;
+        let cgrad_bot = p.grad_bot;
+        let cnode = p.node;
+        let cline = p.line;
+        let cglow = p.glow;
+        let cbtn_grad2 = p.btn_grad2;
 
         // 1. MainWindow clear_color
         let mut w = self.ui.window(cx, ids!(main_window));
@@ -1253,20 +1259,29 @@ impl App {
             pass +: { clear_color: #(cbg) }
         });
 
-        // 2. Dialog surfaces: backdrop, card, logo box.
-        // These were SolidView in v1, so `self.ui.view()` returned the wrong
-        // widget type and the recolour was silently dropped — the root cause of
-        // "Light mode keeps a dark card". They are now plain View (see DSL), so
-        // all three repaint correctly here. The Logo letter is inverted text
-        // (card bg), so it gets `cbg` to stay legible on the magenta logo box.
+        // 2. Dialog surfaces: backdrop (now transparent Overlay so NetworkBg
+        // shows through), glass card, logo box.
         let mut cv = self.ui.view(cx, ids!(connect_view));
         script_apply_eval!(cx, cv, {
-            draw_bg +: { color: #(cbg) }
+            draw_bg +: { color: #x00000000 }
         });
+
+        // 2b. Network background — recolor gradient + node/line instances.
+        let mut nbg = self.ui.view(cx, ids!(network_bg));
+        script_apply_eval!(cx, nbg, {
+            draw_bg +: { grad_top: #(cgrad_top), grad_bot: #(cgrad_bot), node_color: #(cnode), line_color: #(cline) }
+        });
+
+        // 2c. Glass card (GaussRoundedView) — per-theme tint / glow border /
+        // shadow. The transparent-but-not-fully so tint over the blurred bg is
+        // what sells "frosted glass". cshadow: opaque black dark / soft
+        // purple-grey light.
+        let cshadow = if is_dark { vec4(0.0, 0.0, 0.0, 0.7) } else { vec4(0.54, 0.48, 0.62, 0.3) };
         let mut cc = self.ui.view(cx, ids!(connect_card));
         script_apply_eval!(cx, cc, {
-            draw_bg +: { color: #(celev), border_color: #(cborder) }
+            draw_bg +: { tint_color: #(celev), border_color: #(cglow), shadow_color: #(cshadow), fallback_color: #(celev) }
         });
+
         let mut lb = self.ui.view(cx, ids!(logo_box));
         script_apply_eval!(cx, lb, {
             draw_bg +: { color: #(caccent) }
