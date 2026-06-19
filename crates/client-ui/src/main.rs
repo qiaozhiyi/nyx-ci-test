@@ -135,6 +135,31 @@ script_mod! {
         }
     }
 
+    // ── glass card (real frosted-glass surface) ─────────────────────────────
+    // GaussRoundedView wrapper tuned for the login dialog: translucent tint +
+    // real backdrop blur + magenta neon border + soft gaussian shadow. The
+    // instance vs uniform split: properties apply_theme recolors per-theme
+    // (tint/border/shadow/fallback) = instance; static knobs (blur level,
+    // surface alpha, radii) = uniform.
+    let GlassCard = GaussRoundedView{
+        width: 460 height: Fit
+        flow: Down
+        draw_bg +: {
+            tint_color: instance(#x2D2D3D)
+            tint_alpha: uniform(0.55)
+            surface_alpha: uniform(0.82)
+            border_color: instance(#xC586C0)
+            border_alpha: instance(0.5)
+            border_width: instance(1.0)
+            corner_radius: instance(12.0)
+            blur_level: uniform(4.0)
+            shadow_color: instance(#x000000B3)
+            shadow_radius: uniform(24.0)
+            shadow_offset: uniform(vec2(0.0, 8.0))
+            fallback_color: instance(#x2D2D3D)
+        }
+    }
+
     // ── session row (one beacon) ────────────────────────────────────────────
     // `flow: Overlay` so the transparent full-row `select` Button sits ON TOP
     // of the label row and captures clicks across the whole row. This is the
@@ -450,24 +475,8 @@ script_mod! {
                             width: Fill height: Fill
                             align: Center
                             draw_bg.color: #x00000000
-                        // The dialog card — GaussRoundedView for real backdrop blur.
-                        connect_card := GaussRoundedView{
-                            width: 460 height: Fit
-                            flow: Down
-                            draw_bg +: {
-                                tint_color: #x2D2D3D
-                                tint_alpha: 0.55
-                                surface_alpha: 0.82
-                                border_color: #xC586C0
-                                border_alpha: 0.5
-                                border_width: 1.0
-                                corner_radius: 12.0
-                                blur_level: 4.0
-                                shadow_color: #x000000B3
-                                shadow_radius: 24.0
-                                shadow_offset: vec2(0.0, 8.0)
-                                fallback_color: #x2D2D3D
-                            }
+                        // The dialog card — GlassCard (GaussRoundedView real blur).
+                        connect_card := GlassCard{
 
                             // Brand header: gradient logo box + wordmark + tagline.
                             // No accent stripe — One Dark doesn't use it.
