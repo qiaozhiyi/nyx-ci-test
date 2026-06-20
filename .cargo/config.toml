@@ -1,0 +1,8 @@
+# Cross-compile support for the Windows dev/test target.
+# The nyx-server and nyx-agent-dev crates are std-only and cross cleanly to
+# x86_64-pc-windows-gnu from macOS/Linux via mingw-w64 (brew install mingw-w64).
+# (The stealth implant nyx-implant-win is a separate nightly + no_std build —
+# see crates/implant-win/Cargo.toml — and is NOT affected by this config.)
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = ["-C", "link-self-contained=no"]
