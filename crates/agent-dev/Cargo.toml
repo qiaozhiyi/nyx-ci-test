@@ -16,6 +16,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "nyx-agent-dev"
 path = "src/main.rs"

