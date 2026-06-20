@@ -56,13 +56,35 @@ impl Widget for BofPanel {
                     while let Some(item_id) = list.next_visible_item(cx) {
                         let Some(b) = bofs.get(item_id) else { continue };
                         let item = list.item(cx, item_id, id!(Item));
-                        item.label(cx, ids!(name)).set_text(cx, &b.name);
-                        item.label(cx, ids!(status)).set_text(cx, match b.status {
+
+                        // Repaint the row from the single Palette source.
+                        let p = crate::theme::Palette::current();
+                        let mut row_item = item.clone();
+                        script_apply_eval!(cx, row_item, {
+                            draw_bg +: { color: #(p.row), color_hover: #(p.rowhov) }
+                        });
+
+                        let mut name_lbl = item.label(cx, ids!(name));
+                        script_apply_eval!(cx, name_lbl, { draw_text +: { color: #(p.primary) } });
+                        name_lbl.set_text(cx, &b.name);
+
+                        // Status carries semantic color: pending=warn, done=success, error=danger.
+                        let status_color = match b.status {
+                            BofStatus::Pending => p.warn,
+                            BofStatus::Done => p.success,
+                            BofStatus::Error => p.danger,
+                        };
+                        let mut status_lbl = item.label(cx, ids!(status));
+                        script_apply_eval!(cx, status_lbl, { draw_text +: { color: #(status_color) } });
+                        status_lbl.set_text(cx, match b.status {
                             BofStatus::Pending => "pending",
                             BofStatus::Done => "done",
                             BofStatus::Error => "error",
                         });
-                        item.label(cx, ids!(args)).set_text(cx, &b.args);
+
+                        let mut args_lbl = item.label(cx, ids!(args));
+                        script_apply_eval!(cx, args_lbl, { draw_text +: { color: #(p.muted) } });
+                        args_lbl.set_text(cx, &b.args);
                         item.draw_all_unscoped(cx);
                     }
                 }

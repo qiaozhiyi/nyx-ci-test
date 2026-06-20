@@ -70,6 +70,10 @@ pub struct Snapshot {
     /// the BOF history UI global by the App. Empty unless a BOF task changed
     /// state (enqueued / completed / errored).
     pub bof_updates: Vec<BofUpdate>,
+    /// Per-session shell output lines: (session_id, line). Drained into
+    /// `CONSOLE` in `apply_snapshot` so the per-beacon console widget can
+    /// render them without touching the global event log.
+    pub console_lines: Vec<(String, String)>,
 }
 
 /// One BOF lifecycle event, pushed worker→UI and routed into the BOFS global.
@@ -188,7 +192,15 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
     let mut pending: Vec<PendingTask> = Vec::new();
     let mut log_buf: Vec<String> = Vec::new();
     let mut bof_updates: Vec<BofUpdate> = Vec::new();
+    let mut console_lines: Vec<(String, String)> = Vec::new();
     let mut last_session_sig = String::new();
+    // Tracks the connection state last REPORTED to the UI. A connect→disconnect
+    // (or vice-versa) transition must always push a snapshot even if nothing
+    // else changed — otherwise the UI never learns it connected (e.g. fetching
+    // an empty session list on first connect yields no signature change, so the
+    // old `changed || log_buf || bof` guard silently swallowed the only
+    // `connected=true` the UI ever needed).
+    let mut was_connected = false;
 
     loop {
         // 1. Drain any UI→worker commands (non-blocking).
@@ -198,7 +210,7 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                 Cmd::Connect { server: s, password } => {
                     log_push(&mut log_buf, &format!("connecting to {s} …"));
                     server = Some((s, password));
-                    let _ = to_ui.send(take_snapshot(&mut log_buf, false, &[], &mut bof_updates));
+                    let _ = to_ui.send(take_snapshot(&mut log_buf, false, &[], &mut bof_updates, &mut console_lines));
                 }
                 Cmd::Shell { session, args } => {
                     let Some((ref srv, ref token)) = server else {
@@ -258,16 +270,27 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
             Ok(list) => {
                 let sig = session_signature(&list);
                 let changed = sig != last_session_sig;
+                // A successful fetch means we ARE connected. If that differs
+                // from what we last told the UI, we must push a snapshot even
+                // when nothing else changed — otherwise an empty initial
+                // session list (sig "" == initial "") leaves the UI stuck on
+                // "Disconnected" forever, because the `changed || log || bof`
+                // guard below would all be false.
+                let connected_changed = !was_connected;
+                was_connected = true;
                 if changed {
                     last_session_sig = sig;
                 }
-                if changed || !log_buf.is_empty() || !bof_updates.is_empty() {
-                    let _ = to_ui.send(take_snapshot(&mut log_buf, true, &list, &mut bof_updates));
+                if changed || connected_changed || !log_buf.is_empty() || !bof_updates.is_empty() || !console_lines.is_empty() {
+                    let _ = to_ui.send(take_snapshot(&mut log_buf, true, &list, &mut bof_updates, &mut console_lines));
                 }
             }
             Err(e) => {
+                // A failed fetch means we are NOT connected. Mirror the
+                // connected_changed logic so a drop is always reported too.
+                was_connected = false;
                 log_push(&mut log_buf, &format!("! sessions: {e}"));
-                let _ = to_ui.send(take_snapshot(&mut log_buf, false, &[], &mut bof_updates));
+                let _ = to_ui.send(take_snapshot(&mut log_buf, false, &[], &mut bof_updates, &mut console_lines));
             }
         }
 
@@ -284,6 +307,7 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                     TaskKind::Shell => {
                         if !out.is_empty() {
                             log_push(&mut log_buf, &format!("[{}] {}", short(&session), out));
+                            console_lines.push((session.clone(), out));
                         }
                     }
                     TaskKind::Bof { name, args } => {
@@ -310,13 +334,14 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
         }
         pending = still_pending;
 
-        // Flush any task-result log lines / BOF updates accumulated this cycle.
-        if !log_buf.is_empty() || !bof_updates.is_empty() {
+        // Flush any task-result log lines / BOF updates / console lines accumulated this cycle.
+        if !log_buf.is_empty() || !bof_updates.is_empty() || !console_lines.is_empty() {
             let _ = to_ui.send(Snapshot {
                 log_lines: std::mem::take(&mut log_buf),
                 connected: true,
                 sessions: Vec::new(),
                 bof_updates: std::mem::take(&mut bof_updates),
+                console_lines: std::mem::take(&mut console_lines),
             });
         }
 
@@ -334,12 +359,14 @@ fn take_snapshot(
     connected: bool,
     sessions: &[SessionView],
     bof_updates: &mut Vec<BofUpdate>,
+    console_lines: &mut Vec<(String, String)>,
 ) -> Snapshot {
     Snapshot {
         sessions: sessions.to_vec(),
         log_lines: std::mem::take(log_buf),
         connected,
         bof_updates: std::mem::take(bof_updates),
+        console_lines: std::mem::take(console_lines),
     }
 }
 

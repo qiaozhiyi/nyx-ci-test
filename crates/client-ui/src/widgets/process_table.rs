@@ -57,11 +57,32 @@ impl Widget for ProcessTable {
                     while let Some(item_id) = list.next_visible_item(cx) {
                         let Some(p) = procs.get(item_id) else { continue };
                         let item = list.item(cx, item_id, id!(Item));
-                        item.label(cx, ids!(pid)).set_text(cx, &p.pid.to_string());
-                        item.label(cx, ids!(ppid)).set_text(cx, &p.ppid.to_string());
-                        item.label(cx, ids!(name)).set_text(cx, &p.name);
-                        item.label(cx, ids!(user)).set_text(cx, &p.user);
-                        item.label(cx, ids!(arch)).set_text(cx, arch_name(p.arch));
+
+                        // Repaint the row from the single Palette source.
+                        let pal = crate::theme::Palette::current();
+                        let mut row_item = item.clone();
+                        script_apply_eval!(cx, row_item, {
+                            draw_bg +: { color: #(pal.row), color_hover: #(pal.rowhov) }
+                        });
+                        let mut pid_lbl = item.label(cx, ids!(pid));
+                        script_apply_eval!(cx, pid_lbl, { draw_text +: { color: #(pal.accent) } });
+                        pid_lbl.set_text(cx, &p.pid.to_string());
+
+                        let mut ppid_lbl = item.label(cx, ids!(ppid));
+                        script_apply_eval!(cx, ppid_lbl, { draw_text +: { color: #(pal.muted) } });
+                        ppid_lbl.set_text(cx, &p.ppid.to_string());
+
+                        let mut name_lbl = item.label(cx, ids!(name));
+                        script_apply_eval!(cx, name_lbl, { draw_text +: { color: #(pal.primary) } });
+                        name_lbl.set_text(cx, &p.name);
+
+                        let mut user_lbl = item.label(cx, ids!(user));
+                        script_apply_eval!(cx, user_lbl, { draw_text +: { color: #(pal.second) } });
+                        user_lbl.set_text(cx, &p.user);
+
+                        let mut arch_lbl = item.label(cx, ids!(arch));
+                        script_apply_eval!(cx, arch_lbl, { draw_text +: { color: #(pal.muted) } });
+                        arch_lbl.set_text(cx, arch_name(p.arch));
                         item.draw_all_unscoped(cx);
                     }
                 }

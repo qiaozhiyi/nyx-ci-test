@@ -56,10 +56,27 @@ impl Widget for FileTree {
                     while let Some(item_id) = list.next_visible_item(cx) {
                         let Some(f) = files.get(item_id) else { continue };
                         let item = list.item(cx, item_id, id!(Item));
-                        item.label(cx, ids!(name)).set_text(cx, &f.name);
+
+                        // Repaint the row from the single Palette source.
+                        let p = crate::theme::Palette::current();
+                        let mut row_item = item.clone();
+                        script_apply_eval!(cx, row_item, {
+                            draw_bg +: { color: #(p.row), color_hover: #(p.rowhov) }
+                        });
+                        let mut name_lbl = item.label(cx, ids!(name));
+                        // Directories get the accent tint so they stand out from files.
+                        let name_color = if f.is_dir { p.accent } else { p.primary };
+                        script_apply_eval!(cx, name_lbl, { draw_text +: { color: #(name_color) } });
+                        name_lbl.set_text(cx, &f.name);
+
                         let size_text = if f.is_dir { "—".to_string() } else { humanize_size(f.size) };
-                        item.label(cx, ids!(size)).set_text(cx, &size_text);
-                        item.label(cx, ids!(modified)).set_text(cx, &f.modified);
+                        let mut size_lbl = item.label(cx, ids!(size));
+                        script_apply_eval!(cx, size_lbl, { draw_text +: { color: #(p.second) } });
+                        size_lbl.set_text(cx, &size_text);
+
+                        let mut modified_lbl = item.label(cx, ids!(modified));
+                        script_apply_eval!(cx, modified_lbl, { draw_text +: { color: #(p.muted) } });
+                        modified_lbl.set_text(cx, &f.modified);
                         item.draw_all_unscoped(cx);
                     }
                 }

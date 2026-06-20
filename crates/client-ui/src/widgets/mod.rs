@@ -8,6 +8,10 @@
 //! template. They share nothing except the `makepad_widgets` prelude.
 
 pub mod bof_panel;
+pub mod console_list;
 pub mod cred_table;
 pub mod file_tree;
 pub mod process_table;
+pub mod session_graph;
+
+pub use console_list::ConsoleList;

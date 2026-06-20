@@ -89,10 +89,29 @@ impl Widget for CredTable {
                     while let Some(item_id) = list.next_visible_item(cx) {
                         let Some(c) = creds.get(item_id) else { continue };
                         let item = list.item(cx, item_id, id!(Item));
-                        item.label(cx, ids!(source)).set_text(cx, &c.source);
-                        item.label(cx, ids!(principal)).set_text(cx, &c.principal);
-                        item.label(cx, ids!(kind)).set_text(cx, kind_label(&c.kind));
-                        item.label(cx, ids!(value)).set_text(cx, &mask_secret(&c.secret));
+
+                        // Repaint the row from the single Palette source.
+                        let p = crate::theme::Palette::current();
+                        let mut row_item = item.clone();
+                        script_apply_eval!(cx, row_item, {
+                            draw_bg +: { color: #(p.row), color_hover: #(p.rowhov) }
+                        });
+                        let mut source_lbl = item.label(cx, ids!(source));
+                        script_apply_eval!(cx, source_lbl, { draw_text +: { color: #(p.muted) } });
+                        source_lbl.set_text(cx, &c.source);
+
+                        let mut principal_lbl = item.label(cx, ids!(principal));
+                        script_apply_eval!(cx, principal_lbl, { draw_text +: { color: #(p.primary) } });
+                        principal_lbl.set_text(cx, &c.principal);
+
+                        let mut kind_lbl = item.label(cx, ids!(kind));
+                        script_apply_eval!(cx, kind_lbl, { draw_text +: { color: #(p.second) } });
+                        kind_lbl.set_text(cx, kind_label(&c.kind));
+
+                        // Secret value reads as "sensitive" in amber.
+                        let mut value_lbl = item.label(cx, ids!(value));
+                        script_apply_eval!(cx, value_lbl, { draw_text +: { color: #(p.warn) } });
+                        value_lbl.set_text(cx, &mask_secret(&c.secret));
                         item.draw_all_unscoped(cx);
                     }
                 }
