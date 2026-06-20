@@ -135,7 +135,7 @@ fn apply_fails_on_unresolved_external() {
 /// garbage section contents.
 fn fixture_with_text_raw_overrunning_eof() -> Vec<u8> {
     let mut buf = FIXTURE.to_vec();
-    let coff = parse(FIXTURE).unwrap();
+    let _coff = parse(FIXTURE).unwrap();
     let nsec = u16::from_le_bytes([buf[2], buf[3]]) as usize;
     let opt_hdr = u16::from_le_bytes([buf[16], buf[17]]) as usize;
     let sec_off = 20 + opt_hdr;

@@ -40,7 +40,7 @@ fn malformed_pe_returns_none_not_panic() {
     bad[0] = b'M';
     bad[1] = b'Z';
     bad[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes()); // e_lfanew
-    bad[0x80..0x84].copy_from_slice(&"PE\0\0".as_bytes()); // signature
+    bad[0x80..0x84].copy_from_slice("PE\0\0".as_bytes()); // signature
     // export RVA = 0x10 (set DataDirectory[0].VirtualAddress) → points nowhere
     // in a section table that doesn't exist; must return None, not panic.
     assert_eq!(nyx_pe::resolve_export(&bad, "x"), None);
