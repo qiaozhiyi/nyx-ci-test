@@ -3,16 +3,18 @@ name = "nyx-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Nyx operator CLI — talks to the team server REST API"
+description = "Nyx operator TUI — opencode-style fullscreen client over the team server REST API."
 
 [dependencies]
-ureq = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 hex = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
-rustyline = "14"
+ratatui = "0.28"
+crossterm = "0.28"
 
 [[bin]]
 name = "nyx-cli"
