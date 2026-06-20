@@ -84,7 +84,7 @@ pub fn parse_frame(frame: &[u8]) -> Result<RawFrame, WireError> {
     // backstop against a future extractor change or the raw-TLS serve_connection
     // path (which has no body-size limit) turning a bogus ct_len into a huge
     // allocation. ct_len < TAG_LEN means the "ciphertext" can't even hold a tag.
-    if frame.len() != ct_end || ct_len < TAG_LEN || ct_len > MAX_CT_LEN {
+    if frame.len() != ct_end || !(TAG_LEN..=MAX_CT_LEN).contains(&ct_len) {
         return Err(WireError::BadLen(ct_len));
     }
     let ciphertext = frame[FRAME_HEADER..ct_end].to_vec();

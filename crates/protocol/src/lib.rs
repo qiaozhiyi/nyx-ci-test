@@ -38,4 +38,4 @@ pub use frame::{
     encode_frame, encode_frame_dir, open_frame, open_frame_dir, parse_frame, RawFrame, FRAME_HEADER,
     TAG_LEN,
 };
-pub use msg::{Command, Response, SessionInfo, Task, TaskResponse};
+pub use msg::{Command, FileOp, Response, SessionInfo, Task, TaskResponse};
