@@ -60,9 +60,15 @@ impl CredStore {
         }
     }
 
-    /// 写入。临时文件 + 原子 rename，设 0600 权限。
+    /// 写入默认路径 `~/.nyx/creds.json`。临时文件 + 原子 rename，设 0600 权限。
     pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::path();
+        self.save_to(&Self::path())
+    }
+
+    /// 写入指定路径。临时文件 + 原子 rename，避免写一半崩溃损坏凭据库；
+    /// Unix 下文件 0600、目录 0700（凭据库含明文 secret，不能 world-readable）。
+    pub fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
             // 目录 0700 (Unix only)
@@ -80,6 +86,13 @@ impl CredStore {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         // 写临时文件再 rename（原子），避免写一半崩溃损坏凭据库。
         let tmp = path.with_extension("json.tmp");
+        // 先创建并写入临时文件（修复前的 bug：序列化了 json 却从未写盘，导致
+        // tmp 不存在、rename 必然失败、凭据库永远存不下来）。
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(&json)?;
+            f.sync_all()?;
+        }
         // File permissions are only managed strictly on Unix platforms.
         // On Windows, the file will be created with default inherited ACLs.
         #[cfg(unix)]
@@ -90,7 +103,7 @@ impl CredStore {
                 let _ = fs::set_permissions(&tmp, perms);
             }
         }
-        fs::rename(&tmp, &path)
+        fs::rename(&tmp, path)
     }
 
     /// 从一次 dump 入库。去重：(principal, secret, kind) 三元组唯一。
@@ -286,5 +299,55 @@ mod tests {
         assert_eq!(file.entries.len(), 1);
         assert_eq!(file.entries[0].secret, "p\\n\"x\n中文\tend");
         assert_eq!(file.entries[0].principal, "a\"principal");
+    }
+
+    /// 唯一的临时路径（不依赖 tempfile crate）。调用方负责清理。
+    fn tmp_path(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!("nyx_credstore_test_{tag}_{nano}_{pid}.json", tag = tag, nano = nanos, pid = std::process::id()));
+        p
+    }
+
+    #[test]
+    fn save_to_actually_writes_file() {
+        // 回归测试：save() 历史上序列化了 json 却从不写入临时文件，导致凭据库
+        // 永远落不了盘。save_to(path) 必须真正创建文件并写入 JSON 内容。
+        let path = tmp_path("write");
+        let mut store = CredStore { entries: Vec::new() };
+        store.ingest(&[entry("DEV", "alice", CredKind::Hash, "deadbeef")], Some("b1"));
+
+        store.save_to(&path).expect("save_to should succeed");
+
+        // 文件确实被创建（修复前：tmp 从未写入 → rename 失败 → 文件不存在）
+        assert!(path.exists(), "creds file must exist after save_to");
+        // 内容是合法 JSON 且能 roundtrip
+        let bytes = fs::read(&path).expect("should read back written file");
+        let file: CredFile = serde_json::from_slice(&bytes).expect("written content is valid JSON");
+        assert_eq!(file.entries.len(), 1);
+        assert_eq!(file.entries[0].principal, "alice");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_to_overwrites_existing() {
+        // 二次保存应原子替换，不残留旧内容或 .tmp 文件。
+        let path = tmp_path("overwrite");
+        let mut store = CredStore { entries: Vec::new() };
+        store.ingest(&[entry("D", "u1", CredKind::Hash, "s1")], None);
+        store.save_to(&path).unwrap();
+        store.ingest(&[entry("D", "u2", CredKind::Hash, "s2")], None);
+        store.save_to(&path).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let file: CredFile = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(file.entries.len(), 2);
+        // 不应残留 .tmp 临时文件
+        let tmp = path.with_extension("json.tmp");
+        assert!(!tmp.exists(), "no leftover .tmp file after atomic rename");
+        let _ = fs::remove_file(&path);
     }
 }
