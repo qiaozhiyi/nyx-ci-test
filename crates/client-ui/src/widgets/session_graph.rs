@@ -23,10 +23,10 @@ impl Widget for SessionGraph {
         let h_gap = 80.0;
         let v_gap = 20.0;
 
-        let p = crate::theme::Palette::current();
+        let _p = crate::theme::Palette::current();
 
         // 1. Draw Team Server Node
-        if let Some(mut ts_node) = self.list.item(cx, id!(ts_node), id!(Node)) {
+        if let Some(ts_node) = self.list.item(cx, id!(ts_node), id!(Node)) {
             let lbl = ts_node.label(cx, ids!(lbl));
             lbl.set_text(cx, "TEAM SERVER (127.0.0.1)");
             let _ = ts_node.draw_walk(cx, scope, Walk {
@@ -42,7 +42,7 @@ impl Widget for SessionGraph {
             let sy = start_y + (i as f32) * (n_height + v_gap);
             
             // Draw HLine from TS to Session
-            if let Some(mut hline) = self.list.item(cx, LiveId::from_num(1, i as u64), id!(HLine)) {
+            if let Some(hline) = self.list.item(cx, LiveId::from_num(1, i as u64), id!(HLine)) {
                 let line_y = sy + n_height / 2.0;
                 let _ = hline.draw_walk(cx, scope, Walk {
                     abs_pos: Some(dvec2((ts_x + n_width) as f64, line_y as f64)),
@@ -52,7 +52,7 @@ impl Widget for SessionGraph {
             }
 
             // Draw Session Node
-            if let Some(mut node) = self.list.item(cx, LiveId::from_num(2, i as u64), id!(Node)) {
+            if let Some(node) = self.list.item(cx, LiveId::from_num(2, i as u64), id!(Node)) {
                 let lbl = node.label(cx, ids!(lbl));
                 
                 // Construct detailed display text similar to Cobalt Strike
@@ -74,7 +74,7 @@ impl Widget for SessionGraph {
             let first_sy = start_y + n_height / 2.0;
             let last_sy = start_y + ((sessions.len() - 1) as f32) * (n_height + v_gap) + n_height / 2.0;
             if last_sy >= first_sy {
-                if let Some(mut vline) = self.list.item(cx, id!(ts_vline), id!(VLine)) {
+                if let Some(vline) = self.list.item(cx, id!(ts_vline), id!(VLine)) {
                     let _ = vline.draw_walk(cx, scope, Walk {
                         abs_pos: Some(dvec2((ts_x + n_width) as f64, first_sy as f64)),
                         height: Size::Fixed((last_sy - first_sy + 2.0) as f64),
@@ -83,7 +83,7 @@ impl Widget for SessionGraph {
                     
                     // Draw connecting horizontal stub from TS to the VLine
                     let ts_mid_y = ts_y + n_height / 2.0;
-                    if let Some(mut ts_stub) = self.list.item(cx, id!(ts_stub), id!(HLine)) {
+                    if let Some(ts_stub) = self.list.item(cx, id!(ts_stub), id!(HLine)) {
                         let _ = ts_stub.draw_walk(cx, scope, Walk {
                             abs_pos: Some(dvec2((ts_x + n_width) as f64, ts_mid_y as f64)),
                             width: Size::Fixed(20.0),

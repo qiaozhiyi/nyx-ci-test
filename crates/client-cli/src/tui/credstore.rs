@@ -9,7 +9,6 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -66,16 +65,31 @@ impl CredStore {
         let path = Self::path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
-            // 目录 0700
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            // 目录 0700 (Unix only)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(mut perms) = fs::metadata(parent).map(|m| m.permissions()) {
+                    perms.set_mode(0o700);
+                    let _ = fs::set_permissions(parent, perms);
+                }
+            }
         }
         let file = CredFile { entries: self.entries.clone() };
         let json = serde_json::to_vec_pretty(&file)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         // 写临时文件再 rename（原子），避免写一半崩溃损坏凭据库。
         let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, &json)?;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+        // File permissions are only managed strictly on Unix platforms.
+        // On Windows, the file will be created with default inherited ACLs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(mut perms) = fs::metadata(&tmp).map(|m| m.permissions()) {
+                perms.set_mode(0o600);
+                let _ = fs::set_permissions(&tmp, perms);
+            }
+        }
         fs::rename(&tmp, &path)
     }
 

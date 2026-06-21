@@ -1,0 +1,14 @@
+[package]
+name = "nyx-srdi"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Host-side PIC extractor: turns the nyx-implant-win cdylib into position-independent shellcode (agent.bin). Standalone (NOT a workspace member)."
+
+# Standalone so the stable workspace stays green; build directly:
+#   cargo run --release -- <path-to-nyx_implant_win.dll> -o agent.bin
+[workspace]
+
+[[bin]]
+name = "nyx-srdi"
+path = "src/main.rs"

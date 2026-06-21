@@ -39,23 +39,38 @@ unsafe fn ensure_resolved() {
     RESOLVED.store(true, Ordering::Release);
 }
 
-unsafe fn new_slab() -> *mut u8 {
+/// Allocate a fresh slab of at least `min_size` bytes (rounded up to
+/// SLAB_SIZE). A request larger than SLAB_SIZE gets its own oversized slab so
+/// the bump cursor never points past the committed region — the bug this fixes
+/// was: an 8 MiB screenshot buffer requested a new 1 MiB slab, set the bump
+/// cursor to 8 MiB, and handed back the slab base; the 8 MiB write then ran
+/// off the end of the 1 MiB commit → segfault.
+unsafe fn new_slab_min(min_size: usize) -> *mut u8 {
     let f: NtAllocVirtualMemory = match NT_ALLOC.load(Ordering::Acquire) {
         0 => return core::ptr::null_mut(),
         a => core::mem::transmute(a as usize),
     };
     let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
+    // Round up to a whole number of SLAB_SIZE pages, but never below SLAB_SIZE.
     let mut size: usize = SLAB_SIZE;
+    if min_size > SLAB_SIZE {
+        let pages = (min_size + SLAB_SIZE - 1) / SLAB_SIZE;
+        size = pages * SLAB_SIZE;
+    }
     // NtCurrentProcess() == (HANDLE)-1
     let cur_proc: *mut core::ffi::c_void = (-1isize) as *mut core::ffi::c_void;
-    // ZeroBits = 0 (no zero-bit-constrained allocation; let the kernel pick a
-    // user-range address). Passed BY VALUE per the real NT prototype.
     let status = f(cur_proc, &mut base, 0, &mut size, 0x3000, 0x04);
     if status < 0 || base.is_null() {
         return core::ptr::null_mut();
     }
     base as *mut u8
 }
+
+/// The committed size of the slab currently in use. Tracked so the overflow
+/// check compares against the REAL slab size, not the default 1 MiB (an
+/// oversized slab holding a large allocation must allow further bumps within
+/// its remaining space).
+static SLAB_COMMITTED: AtomicU64 = AtomicU64::new(0);
 
 /// Static fallback buffer used before NtAllocateVirtualMemory is resolved
 /// (during Rust runtime static-init at dll load). 64 KiB is plenty for the
@@ -90,29 +105,52 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
         if NT_ALLOC.load(Ordering::Acquire) != 0 {
             // Real allocator path.
             loop {
-                // If no slab yet, allocate one first.
+                // If no slab yet, allocate one first. For a request larger than
+                // the default slab, ask for an oversized slab up front.
                 if SLAB_BASE.load(Ordering::Acquire) == 0 {
-                    let nb = new_slab();
+                    let nb = new_slab_min(aligned);
                     if nb.is_null() {
                         break;
                     }
+                    let committed = if aligned > SLAB_SIZE {
+                        // Oversized slab: its committed size is the rounded-up
+                        // multiple of SLAB_SIZE that new_slab_min chose. Recompute
+                        // it the same way so SLAB_COMMITTED matches.
+                        let pages = (aligned + SLAB_SIZE - 1) / SLAB_SIZE;
+                        (pages * SLAB_SIZE) as u64
+                    } else {
+                        SLAB_SIZE as u64
+                    };
                     SLAB_BASE.store(nb as u64, Ordering::Release);
+                    SLAB_COMMITTED.store(committed, Ordering::Release);
                     SLAB_BUMP.store(0, Ordering::Release);
                 }
                 let base = SLAB_BASE.load(Ordering::Acquire);
+                let committed = SLAB_COMMITTED.load(Ordering::Acquire);
                 let off = SLAB_BUMP.load(Ordering::Acquire);
                 let new_off = off + aligned as u64;
-                if new_off <= SLAB_SIZE as u64 {
+                if new_off <= committed {
                     if SLAB_BUMP.compare_exchange(off, new_off, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                         return (base as usize + off as usize) as *mut u8;
                     }
                     continue;
                 }
-                let nb = new_slab();
+                // Current slab can't fit this allocation: allocate a fresh slab
+                // big enough to hold it. (The OLD bug: always allocated a default
+                // 1 MiB slab even for an 8 MiB request, then set the bump cursor
+                // past the commit → out-of-bounds write → segfault.)
+                let nb = new_slab_min(aligned);
                 if nb.is_null() {
                     break;
                 }
+                let committed = if aligned > SLAB_SIZE {
+                    let pages = (aligned + SLAB_SIZE - 1) / SLAB_SIZE;
+                    (pages * SLAB_SIZE) as u64
+                } else {
+                    SLAB_SIZE as u64
+                };
                 SLAB_BASE.store(nb as u64, Ordering::Release);
+                SLAB_COMMITTED.store(committed, Ordering::Release);
                 SLAB_BUMP.store(aligned as u64, Ordering::Release);
                 return nb;
             }

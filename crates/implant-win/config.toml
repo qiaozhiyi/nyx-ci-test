@@ -1,0 +1,21 @@
+# Nyx implant per-build configuration template.
+#
+# This file is read by build.rs, serialized into a compact binary blob, and
+# embedded into the implant at compile time via nyx_config_macros::embed!
+# (ChaCha20-Poly1305 encrypted, per-build randomized key/nonce/offset). Every
+# build therefore bakes a DIFFERENT config byte layout, defeating static
+# extractors/signature tools.
+#
+# For a real engagement copy this file, edit the values, and build with:
+#   NYX_CONFIG=/abs/path/config.toml NYX_SERVER_PUB=<64hex> cargo +nightly build --release
+#
+# NOTE: this file is a TOML *template* for operator convenience — build.rs does
+# its own minimal parser that only understands the keys below. Keep the format
+# `key = "value"` (or integer), one per line.
+
+server_host = "127.0.0.1"
+server_port = 8443
+beacon_uri  = "/beacon"
+sleep_seconds = 5
+jitter_pct  = 20
+use_tls     = false

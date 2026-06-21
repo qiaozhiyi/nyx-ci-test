@@ -230,8 +230,8 @@ script_mod! {
     let EmptySessions = View{
         width: Fill height: Fill
         align: Center flow: Down spacing: 8.0
-        Label{text: "No Active Beacons" draw_text.color: Cmuted draw_text.text_style.font_size: 13.0}
-        Label{text: "Connect to a team server to display beacons" draw_text.color: Cmuted draw_text.text_style.font_size: 11.0}
+        Label{text: "No Active Beacons" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 13}}
+        Label{text: "Connect to a team server to display beacons" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 11}}
     }
 
     mod.widgets.SessionListBase = #(SessionList::register_widget(vm))
@@ -511,7 +511,7 @@ script_mod! {
                                         width: 28 height: 28
                                         draw_bg.color: Caccent
                                         draw_bg.border_radius: 6.0
-                                        align: Align{x: 0.5 y: 0.5}
+                                        align: Align{x: 0.5, y: 0.5}
                                         logo_letter := Label{
                                             text: "N"
                                             draw_text.color: Cbg
@@ -554,7 +554,7 @@ script_mod! {
                                     url_input := TextInput{
                                         width: Fill height: 28
                                         label_align: Align{y: 0.5}
-                                        padding: Inset{top: 7.0 left: 12.0 right: 12.0}
+                                        padding: Inset{left: 12.0, right: 12.0}
                                         text: "http://127.0.0.1:8443"
                                         empty_text: "http://host:port"
                                         draw_bg.color: Cinput
@@ -591,7 +591,7 @@ script_mod! {
                                     alias_input := TextInput{
                                         width: Fill height: 28
                                         label_align: Align{y: 0.5}
-                                        padding: Inset{top: 7.0 left: 12.0 right: 12.0}
+                                        padding: Inset{left: 12.0, right: 12.0}
                                         text: "operator"
                                         draw_bg.color: Cinput
                                         draw_bg.color_hover: Cinput
@@ -628,7 +628,7 @@ script_mod! {
                                         is_password: true
                                         width: Fill height: 28
                                         label_align: Align{y: 0.5}
-                                        padding: Inset{top: 7.0 left: 12.0 right: 12.0}
+                                        padding: Inset{left: 12.0, right: 12.0}
                                         text: ""
                                         empty_text: "Enter Team Server Token"
                                         draw_bg.color: Cinput
@@ -732,7 +732,7 @@ script_mod! {
                         server_input := TextInput{
                             width: 360 height: 30
                             label_align: Align{y: 0.5}
-                            padding: Inset{top: 7.0 left: 10.0 right: 10.0}
+                            padding: Inset{left: 10.0, right: 10.0}
                             text: "http://127.0.0.1:8443"
                             empty_text: "team server URL"
                             draw_bg.color: Cinput
@@ -1058,7 +1058,7 @@ script_mod! {
                                     cmd_input := TextInput{
                                         width: Fill height: 26
                                         label_align: Align{y: 0.5}
-                                        padding: Inset{top: 5.0 left: 8.0 right: 8.0}
+                                        padding: Inset{left: 8.0, right: 8.0}
                                         text: ""
                                         empty_text: "Enter command…"
                                         draw_bg.color: Cinput
@@ -1110,7 +1110,7 @@ script_mod! {
                                         bof_name_input := TextInput{
                                             width: 200 height: 26
                                             label_align: Align{y: 0.5}
-                                            padding: Inset{top: 5.0 left: 8.0 right: 8.0}
+                                            padding: Inset{left: 8.0, right: 8.0}
                                             text: ""
                                             empty_text: "BOF object name"
                                             draw_bg.color: Cinput
@@ -1126,7 +1126,7 @@ script_mod! {
                                         bof_args_input := TextInput{
                                             width: Fill height: 26
                                             label_align: Align{y: 0.5}
-                                            padding: Inset{top: 5.0 left: 8.0 right: 8.0}
+                                            padding: Inset{left: 8.0, right: 8.0}
                                             text: ""
                                             empty_text: "Arguments (space-separated)"
                                             draw_bg.color: Cinput
@@ -1167,7 +1167,7 @@ script_mod! {
                                     ls_path_input := TextInput{
                                         width: Fill height: 26
                                         label_align: Align{y: 0.5}
-                                        padding: Inset{top: 5.0 left: 8.0 right: 8.0}
+                                        padding: Inset{left: 8.0, right: 8.0}
                                         text: "."
                                         empty_text: "Remote path"
                                         draw_bg.color: Cinput

