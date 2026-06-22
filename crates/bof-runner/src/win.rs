@@ -60,6 +60,13 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
         .map(|s| page((s.virtual_size.max(s.raw.len() as u32)) as usize))
         .sum::<usize>()
         .max(PAGE_SIZE);
+    // DEV-HARNESS ONLY: a single RWX region is the simplest way to load +
+    // relocate + call a BOF. RWX is a loud EDR signal, so the Windows PIC
+    // implant (crates/implant-win) must NOT do this — it uses module stomping +
+    // per-section permissions (RX text / RW data) on the stealth-critical path.
+    // Flipping this whole region to RX here would break BOFs that write .data
+    // globals at runtime, so the proper per-section fix is deferred to the
+    // implant's own loader (tracked as a deferred implant-win hardening item).
     let base = unsafe {
         VirtualAlloc(
             std::ptr::null_mut(),
@@ -133,7 +140,8 @@ extern "C" {
 fn beacon_apis() -> HashMap<String, u64> {
     let fp: unsafe extern "C" fn() = BeaconPrintf;
     let addr = fp as usize as u64;
-    eprintln!("[bof-runner] BeaconPrintf shim @ 0x{addr:x}");
+    // (Removed an `eprintln!` that logged the shim's executable-memory address on
+    // every BOF load — an OPSEC leak for a tool whose stated goal is stealth.)
     [("BeaconPrintf".to_string(), addr)].into_iter().collect()
 }
 

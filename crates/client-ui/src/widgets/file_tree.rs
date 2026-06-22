@@ -22,7 +22,7 @@ pub struct FileEntry {
     pub modified: String,
 }
 
-static FILES: LazyLock<RwLock<Vec<FileEntry>>> = LazyLock::new(|| RwLock::new(Vec::new()));
+pub static FILES: LazyLock<RwLock<Vec<FileEntry>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 
 /// Format a byte count with a binary unit (B / KiB / MiB / GiB), one decimal.
 pub(crate) fn humanize_size(bytes: u64) -> String {

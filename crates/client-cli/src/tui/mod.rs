@@ -1490,6 +1490,7 @@ mod tests {
         app.sessions = vec![SessionView {
             id: "a1b2c3d4e5f6".into(), hostname: "host01".into(), username: "alice".into(),
             os: "macos".into(), is_admin: 1, pending: 0, beacon_id: 7, arch: 4, pid: 1234,
+            ..Default::default()
         }];
         app.selected = Some(0);
         let mut st = ListState::default();

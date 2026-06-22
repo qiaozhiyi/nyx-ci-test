@@ -2,13 +2,15 @@
 //!
 //! The actual parsing logic (field-skip counts, CSV splitting, locale sniffing)
 //! lives in `crates/parse/src/lib.rs` exactly once. This module only maps the
-//! neutral rows (`FileRow`/`ProcRow`/`CredRow`) onto client-cli's own types.
-//! Centralising the parsers there kills the twin-copy drift hazard: a parser
-//! bug fixed in `nyx-parse` is fixed for every client, with no risk of one copy
-//! being silently left behind (which is how the `parse_ps_posix` off-by-one
-//! survived for as long as it did — fixed in client-ui, missed here).
+//! neutral rows (`FileRow`/`ProcRow`/`CredRow`) onto client-ui's own widget
+//! types. Centralising the parsers there kills the twin-copy drift hazard: a
+//! parser bug fixed in `nyx-parse` is fixed for every client, with no risk of
+//! one copy being silently left behind (which is how the `parse_ps_posix`
+//! off-by-one survived for as long as it did).
 
-use crate::types::{CredEntry, CredKind, FileEntry, ProcEntry};
+use crate::widgets::cred_table::{CredEntry, CredKind};
+use crate::widgets::file_tree::FileEntry;
+use crate::widgets::process_table::ProcEntry;
 
 pub fn parse_any_files(out: &str) -> Vec<FileEntry> {
     nyx_parse::parse_any_files(out)
@@ -31,10 +33,10 @@ pub fn parse_creds(out: &str) -> Vec<CredEntry> {
         .collect()
 }
 
-// ---- neutral-row → client-cli-type mappings ------------------------------
+// ---- neutral-row → widget-type mappings ----------------------------------
 //
-// `FileEntry`/`ProcEntry`/`CredEntry` are local to this crate (defined in
-// `types.rs`), so these `From<foreign>` impls satisfy the orphan rule.
+// `FileEntry`/`ProcEntry`/`CredEntry` are local to this crate (defined in the
+// widget modules), so these `From<foreign>` impls satisfy the orphan rule.
 
 impl From<nyx_parse::FileRow> for FileEntry {
     fn from(r: nyx_parse::FileRow) -> Self {
@@ -49,12 +51,14 @@ impl From<nyx_parse::FileRow> for FileEntry {
 
 impl From<nyx_parse::ProcRow> for ProcEntry {
     fn from(r: nyx_parse::ProcRow) -> Self {
-        // client-cli's ProcEntry has no `arch` field (the TUI doesn't render it).
+        // `arch` is a UI-only display field the parser doesn't carry; default
+        // to 255 ("?"), matching the old inline parser's behaviour.
         Self {
             pid: r.pid,
             ppid: r.ppid,
             name: r.name,
             user: r.user,
+            arch: 255,
         }
     }
 }

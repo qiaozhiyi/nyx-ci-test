@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/protocol",
+    "crates/parse",
+    "crates/rest",
     "crates/profile",
     "crates/server",
     "crates/agent-dev",
@@ -13,7 +15,6 @@ members = [
     "crates/coff",
     "crates/transport",
     "crates/bof-runner",
-    "crates/client",
     "crates/client-ui",
     "crates/scripting-rhai",
     "crates/pe",
@@ -34,6 +35,8 @@ license = "Apache-2.0 OR MIT"
 
 [workspace.dependencies]
 nyx-protocol = { path = "crates/protocol" }
+nyx-parse = { path = "crates/parse" }
+nyx-rest = { path = "crates/rest" }
 nyx-profile = { path = "crates/profile" }
 nyx-agent-dev = { path = "crates/agent-dev" }
 nyx-scripting = { path = "crates/scripting" }

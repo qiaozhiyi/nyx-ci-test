@@ -39,7 +39,7 @@ cargo run -p nyx-cli -- repl                                  # interactive (def
 
 Toolchain is pinned to **stable** (`rust-toolchain.toml`). The Windows PIC implant
 (`crates/implant-win`) is **not** a workspace member and doesn't build here (see below). The
-desktop client is pure-Rust **egui** (`crates/client`) — no Node/JS anywhere in the project.
+desktop client is pure-Rust **Makepad** (`crates/client-ui`) — no Node/JS anywhere in the project.
 
 ## Architecture: the beacon loop
 
@@ -47,8 +47,8 @@ There are two distinct surfaces on the team server — keep them separate:
 
 - **`POST /beacon`** — encrypted implant traffic. Binary frame body, never JSON.
 - **`GET/POST /api/*`** (`/api/sessions`, `/api/task`, `/api/tasks`, `/api/results`,
-  `/api/profile`) — plaintext JSON, the **operator** control API. The CLI, the egui client, and
-  tests all drive the loop through it.
+  `/api/profile`) — plaintext JSON, the **operator** control API. The CLI and the Makepad client
+  both drive the loop through it (tests too).
 
 A session's identity is the **implant's 32-byte ephemeral X25519 public key**. That pubkey does
 three jobs at once: it identifies the session, it is the AEAD AAD on every frame, and the server
@@ -83,7 +83,7 @@ is rejected).
 | `server` | team server: `/beacon` listener, session registry, task queue, JSON control API |
 | `agent-dev` | **std**-based dev implant — exists only to prove the loop on the dev host (macOS/Linux/Windows). **Not** the production implant. |
 | `client-cli` | operator REPL/CLI over the REST API |
-| `client` | pure-Rust **egui** desktop client over the REST API (no Node/JS) |
+| `client-ui` | pure-Rust **Makepad** desktop client over the REST API (no Node/JS) |
 | `implant-win` | scaffolded, **not** a workspace member (see below) |
 
 ## Working in this codebase
@@ -94,7 +94,7 @@ is rejected).
 - **Adding/changing a wire message type touches a hand-mirrored chain, not a derived one.** A new
   `Command`/`Response` variant must be updated in lockstep across: `Command::encode`/`decode`
   (`msg.rs`), the server's `JsonCommand` + `into_command` mapping (`server/src/lib.rs`), and the
-  client command surface (CLI / egui client). The wire `Command` enum is broader than the JSON
+  client command surface (CLI / Makepad client). The wire `Command` enum is broader than the JSON
   operator surface (e.g. `Connect`/`Socks` exist on the wire but have no JSON command yet) — by
   design, narrow it deliberately when wiring up.
 - **Server keypair is ephemeral per process.** `AppState::default()` and `main.rs` both call
@@ -126,5 +126,7 @@ runtime), `syscalls` (indirect-syscall runtime: gadget scan + indirect stubs),
 `entry` (`nyx_entry` reflective entry). Full link + sRDI extraction happen on a
 Windows host; the macOS dev host type-checks via cross-compile.
 
-(The old `crates/client-tauri` Tauri+React scaffold was removed — the project is pure Rust. The
-desktop client is `crates/client`, a pure-Rust egui app.)
+(The old `crates/client-tauri` Tauri+React scaffold was removed, and the first-generation
+`crates/client` egui client was in turn superseded and removed — the project is pure Rust and the
+sole native GUI is `crates/client-ui`, a pure-Rust Makepad app. The operator CLI/TUI lives in
+`crates/client-cli`.)

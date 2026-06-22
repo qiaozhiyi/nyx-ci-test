@@ -8,3 +8,5 @@ dist/
 # keep Cargo.lock for this binary/product workspace
 
 .superpowers/
+# agent/session working scratch (transcripts, run logs, reports) — never commit
+.agents/

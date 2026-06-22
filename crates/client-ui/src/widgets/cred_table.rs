@@ -21,7 +21,7 @@ use std::sync::{LazyLock, RwLock};
 
 pub static CREDS: LazyLock<RwLock<Vec<CredEntry>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredKind {
     Hash,
     Password,
@@ -164,5 +164,11 @@ mod tests {
         assert_eq!(kind_label(&CredKind::Password), "password");
         assert_eq!(kind_label(&CredKind::Ticket), "ticket");
         assert_eq!(kind_label(&CredKind::Key), "key");
+    }
+
+    #[test]
+    fn cred_kind_partial_eq_eq() {
+        assert_eq!(CredKind::Hash, CredKind::Hash);
+        assert_ne!(CredKind::Hash, CredKind::Password);
     }
 }

@@ -151,7 +151,9 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                     // 直接发这条独占一个帧
                     let single = vec![TaskResponse { task_id: t.task_id, response }];
                     let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&single));
-                    let _ = ureq::post(&beacon_url).send_bytes(&frame);
+                    if let Err(e) = ureq::post(&beacon_url).send_bytes(&frame) {
+                        tracing::warn!(error = %e, "beacon send failed (oversized chunk); response dropped");
+                    }
                     counter += 1;
                     continue;
                 }
@@ -164,7 +166,9 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 if current_batch_size + estimated_size > BATCH_FLUSH && !pending_responses.is_empty() {
                     // Flush 当前批次
                     let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending_responses));
-                    let _ = ureq::post(&beacon_url).send_bytes(&frame);
+                    if let Err(e) = ureq::post(&beacon_url).send_bytes(&frame) {
+                        tracing::warn!(error = %e, "beacon send failed (batch flush); response batch dropped");
+                    }
                     counter += 1;
                     pending_responses.clear();
                 }

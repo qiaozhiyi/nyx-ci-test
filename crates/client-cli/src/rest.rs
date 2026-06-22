@@ -987,7 +987,24 @@ async fn poll_file_chunks(
             continue;
         }
         let seq = r.seq.unwrap_or(0);
-        let data = r.data_hex.as_deref().map(hex::decode).transpose().ok().flatten().unwrap_or_default();
+        // Don't silently coerce a malformed-hex chunk into empty bytes — that
+        // would produce a corrupt download with a zero-filled hole and no signal
+        // to the operator. Surface it as a per-download error instead. (client-cli
+        // has no logger, so the visible-error path — not a log line — is how we
+        // stay non-silent without corrupting the TUI.) The hex is server-produced
+        // and TLS-protected, so this is rare, but silent corruption is the wrong
+        // failure mode for a file transfer.
+        let data = match r.data_hex.as_deref().map(hex::decode).transpose() {
+            Ok(Some(d)) => d,
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                return PollOutcome::Err(format!(
+                    "download chunk seq {} has malformed data_hex ({e}); \
+                     aborting to avoid a silently-corrupt file",
+                    r.seq.unwrap_or(0)
+                ));
+            }
+        };
         if r.eof.unwrap_or(0) == 1 {
             *saw_eof = true;
         }
@@ -1049,6 +1066,7 @@ mod tests {
         let mk = |id: &str, pend: usize| SessionView {
             id: id.into(), hostname: "h".into(), username: "u".into(), os: String::new(),
             is_admin: 0, pending: pend, beacon_id: 0, arch: 0, pid: 0,
+            ..Default::default()
         };
         let a = vec![mk("s1", 1)];
         assert_ne!(session_signature(&a), session_signature(&[mk("s1", 2)]));

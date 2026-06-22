@@ -71,7 +71,12 @@ impl CredStore {
         use std::io::Write;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
-            // 目录 0700 (Unix only)
+            // Directory 0700 (Unix only). This is defense-in-depth — the file's
+            // 0600 below is the primary control on the secrets themselves, so a
+            // permissive dir only exposes the directory's existence, not its
+            // contents. Intentionally best-effort and non-fatal: a rare dir-chmod
+            // failure must not block saving credentials, and (unlike the file)
+            // there's no plaintext leak from leaving the dir at its created mode.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -95,12 +100,36 @@ impl CredStore {
         }
         // File permissions are only managed strictly on Unix platforms.
         // On Windows, the file will be created with default inherited ACLs.
+        //
+        // SECURITY: `File::create` made this temp 0644 (world-readable on a
+        // typical umask) and it holds plaintext secrets, so 0600 is mandatory.
+        // Fail CLOSED on chmod failure: remove the plaintext temp and return an
+        // error so the caller knows the creds were NOT saved securely — never
+        // leave a world-readable creds file behind. (Previously the chmod result
+        // was `let _ =`-ignored, which could silently leave creds world-readable
+        // — same silent-failure class as the old save()-never-wrote bug.)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(mut perms) = fs::metadata(&tmp).map(|m| m.permissions()) {
-                perms.set_mode(0o600);
-                let _ = fs::set_permissions(&tmp, perms);
+            match fs::metadata(&tmp).map(|m| {
+                let mut p = m.permissions();
+                p.set_mode(0o600);
+                p
+            }) {
+                Ok(perms) => {
+                    if let Err(e) = fs::set_permissions(&tmp, perms) {
+                        let _ = fs::remove_file(&tmp);
+                        return Err(std::io::Error::other(format!(
+                            "could not chmod cred file {} to 0600 ({e}); refusing to leave \
+                             plaintext credentials world-readable",
+                            tmp.display()
+                        )));
+                    }
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e);
+                }
             }
         }
         fs::rename(&tmp, path)

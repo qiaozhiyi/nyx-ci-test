@@ -1,0 +1,15 @@
+[package]
+name = "nyx-rest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared REST view types + client helpers for Nyx operator clients. Single source of truth for the shapes the team server emits, so client-ui / client-cli / client can't drift from each other or the server."
+
+[dependencies]
+serde = { workspace = true }
+# Only the RequestBuilder type + bearer_auth are used (by `authed`); no TLS or
+# json feature needed here — the client crates bring their own configured reqwest.
+reqwest = { version = "0.12", default-features = false }
+
+[dev-dependencies]
+serde_json = "1"
