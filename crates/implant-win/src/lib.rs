@@ -70,6 +70,8 @@ pub mod hostinfo;
 #[cfg(target_os = "windows")]
 pub mod keylog;
 #[cfg(target_os = "windows")]
+pub mod kits;
+#[cfg(target_os = "windows")]
 pub mod mem;
 #[cfg(target_os = "windows")]
 pub mod pivot;

