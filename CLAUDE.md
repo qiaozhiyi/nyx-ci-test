@@ -90,7 +90,11 @@ is rejected).
 
 - **`agent-dev` is the dev harness, not the implant.** It is `std`-based (`ureq`, blocking
   threads) to validate the protocol + server on the dev host. The real Windows PIC implant
-  (`crates/implant-win`) reuses only the `protocol` crate.
+  (`crates/implant-win`) reuses `protocol` (crypto/framing/codec) plus a few small `no_std`
+  helper crates: `config` (per-build encrypted config), `evasion` (SSN + indirect-syscall
+  runtime), `coff` (BOF loader), and `profile` (`no_std` feature — only the pure transform
+  engine; the std parser/lexer/lint layers are resolved host-side by `build.rs` and never
+  enter the PIC binary). It does **not** pull `std` or `thiserror`.
 - **Adding/changing a wire message type touches a hand-mirrored chain, not a derived one.** A new
   `Command`/`Response` variant must be updated in lockstep across: `Command::encode`/`decode`
   (`msg.rs`), the server's `JsonCommand` + `into_command` mapping (`server/src/lib.rs`), and the

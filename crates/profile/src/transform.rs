@@ -14,9 +14,13 @@
 //! the transport layer (server/implant already have a CSPRNG); this engine
 //! exists to make the profile's transform pipeline testable and reusable.
 
-use thiserror::Error;
-
+#[cfg(feature = "std")]
 use crate::ast::{Block, Item};
+
+// The transform engine is compiled under BOTH `std` (workspace: server/agent-dev)
+// and `no_std` (PIC implant). Under `no_std`, `Vec`/`String` are not in the
+// prelude, so import them from `alloc` (a no-op under std — same types).
+use alloc::{string::String, vec::Vec};
 
 /// A single transform step, in the order it appears in a data block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,19 +45,33 @@ pub enum Terminator {
     UriAppend,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransformError {
-    #[error("invalid base64 byte {0:#x}")]
     InvalidBase64(u8),
-    #[error("invalid netbios encoding (expected pairs of a-p / A-P)")]
     InvalidNetbios,
-    #[error("data too short for mask (need >= 4-byte key prefix)")]
     TooShort,
-    #[error("prepend prefix did not match")]
     PrefixMismatch,
-    #[error("append suffix did not match")]
     SuffixMismatch,
 }
+
+// Manual `Display` + `Error` impls (not thiserror) so this module is
+// `no_std`+`alloc`-clean for the PIC implant. The Display strings match the old
+// thiserror `#[error(...)]` attrs exactly — no behavior change on std.
+impl core::fmt::Display for TransformError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidBase64(b) => write!(f, "invalid base64 byte {b:#x}"),
+            Self::InvalidNetbios => {
+                write!(f, "invalid netbios encoding (expected pairs of a-p / A-P)")
+            }
+            Self::TooShort => write!(f, "data too short for mask (need >= 4-byte key prefix)"),
+            Self::PrefixMismatch => write!(f, "prepend prefix did not match"),
+            Self::SuffixMismatch => write!(f, "append suffix did not match"),
+        }
+    }
+}
+
+impl core::error::Error for TransformError {}
 
 /// Encode by folding steps left-to-right.
 pub fn encode(steps: &[Step], input: &[u8]) -> Vec<u8> {
@@ -75,6 +93,10 @@ pub fn decode(steps: &[Step], input: &[u8]) -> Result<Vec<u8>, TransformError> {
 
 /// Pull the transform steps (in order) out of a parsed `output`/`metadata`/`id`
 /// block, ignoring terminators and unknown statements (lint reports those).
+///
+/// Needs `ast::Block` → unavailable under the `no_std` feature (build.rs
+/// resolves steps host-side for the PIC implant instead).
+#[cfg(feature = "std")]
 pub fn steps_from_block(b: &Block) -> Vec<Step> {
     let mut out = Vec::new();
     for item in &b.items {

