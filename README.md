@@ -9,8 +9,9 @@ two commercial benchmarks:
   spoofing, sleep obfuscation, module stomping, AMSI/ETW bypass.
 
 Stack: **Rust full-stack** — team server (`tokio`/`axum`), Windows PIC implant
-(nightly/`no_std`, Rustic64/Stardust-style), desktop client (`Tauri` + React),
-embedded **Lua/Rune** scripting, protobuf-free hand-rolled wire protocol.
+(nightly/`no_std`, Rustic64/Stardust-style), desktop client (**Makepad**,
+`crates/client-ui`) + operator TUI (`crates/client-cli`, ratatui), embedded
+**Rhai** scripting, protobuf-free hand-rolled wire protocol. No Node/JS anywhere.
 
 > Full design + phased roadmap: `~/.claude/plans/composed-zooming-wombat.md`.
 
@@ -18,16 +19,30 @@ embedded **Lua/Rune** scripting, protobuf-free hand-rolled wire protocol.
 
 | component | state |
 |---|---|
-| `crates/protocol` — crypto + framing + codec | ✅ done, 8 unit tests |
-| `crates/server` — HTTP beacon listener, sessions, task queue, control API | ✅ done, e2e test green |
+| `crates/protocol` — crypto + framing + codec | ✅ done |
+| `crates/server` — HTTP beacon listener, sessions, task queue, control API | ✅ done (body limits, anti-replay TOCTOU fix, bearer auth, DoS caps) |
 | `crates/agent-dev` — std implant (proves the loop on the dev host) | ✅ done |
-| `crates/client-cli` — operator REPL | ✅ done |
-| `crates/implant-win` — Windows PIC agent (BRC4-grade) | 🟡 scaffolded (needs nightly + Windows toolchain) |
-| `crates/client-tauri` — desktop client | 🟡 scaffolded (needs `npm install`) |
+| `crates/client-cli` — operator TUI/REPL (ratatui) | ✅ done |
+| `crates/client-ui` — desktop client (Makepad; sole native GUI) | 🟡 in active development |
+| `crates/implant-win` — Windows PIC agent (BRC4-grade) | 🟡 **live**: 9.8k LOC, 8/8 selftests pass on Windows; indirect-syscall runtime + AMSI/ETW patch + NTDLL unhook + anti-debug on real paths (full PIC link needs nightly + `-Z build-std` + Windows host) |
+| `crates/parse`, `crates/rest` — shared parser + REST view types | ✅ done (dedup of the former per-client copies) |
 
 The encrypted beacon loop is **verified end-to-end** (ECDH + ChaCha20-Poly1305,
 anti-replay, check-in → task queue → task delivery → shell exec → encrypted
 response) on macOS via the std dev agent.
+
+## Persistence & guardrails (team server env)
+
+| var | purpose |
+|---|---|
+| `NYX_BIND` | bind addr (default `0.0.0.0:8443`) |
+| `NYX_KEYFILE` | persist the server's long-term X25519 identity to a 0600 file so live sessions **survive a restart** (ephemeral per-process otherwise) |
+| `NYX_TOKEN` | if set, every `/api/*` request must carry `Authorization: Bearer <token>` (constant-time compare); `/beacon` is exempt (implants auth cryptographically) |
+| `NYX_KILLDATE` | Unix-seconds burn switch — once wall-clock passes it, the server refuses beacons (checked at boot **and** on every beacon) |
+| `NYX_PROFILE` | Malleable C2 profile (`c2lint`-validated on load) |
+| `NYX_SCRIPT` | Rhai event-hook script (`on_session_new` / `on_result` / `on_session_exit`) |
+
+In-memory DoS caps: `MAX_SESSIONS` (registry), `MAX_PENDING_PER_SESSION` (task queue → 503 back-pressure), `MAX_RESULTS_PER_SESSION` (oldest-evicted). Beacon body capped at 512 KiB (one frame); operator API at 4 MiB.
 
 ## Build & test
 

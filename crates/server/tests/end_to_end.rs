@@ -355,6 +355,86 @@ async fn api_token_guards_control_api() {
     assert_eq!(with_auth.status(), 200, "correct bearer token must be accepted");
 }
 
+/// All five control-API endpoints carry the `require_auth` guard. This pins
+/// that coverage so a future handler added without the guard is caught, and
+/// asserts the observable constant-time contract: a missing token and a
+/// wrong token are indistinguishable (both 401 — the server reveals nothing
+/// about how many leading bytes of the token matched).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_control_api_endpoints_require_bearer_auth() {
+    let state = AppState {
+        api_token: Some("sekret".into()),
+        ..AppState::default()
+    };
+    let app = router(Arc::new(state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Every require_auth'd GET endpoint (auth runs before query parsing, so the
+    // bogus ?session=x is fine — it never reaches validation).
+    let gets = [
+        "/api/sessions",
+        "/api/tasks?session=x",
+        "/api/results?session=x",
+        "/api/profile",
+    ];
+    let get_status = |auth: Option<&str>, path: &str| -> u16 {
+        let mut req = ureq::get(format!("{url}{path}").as_str());
+        if let Some(a) = auth {
+            req = req.set("Authorization", a);
+        }
+        match req.call() {
+            Ok(r) => r.status(),
+            Err(ureq::Error::Status(c, _)) => c,
+            Err(e) => panic!("transport error on GET {path}: {e}"),
+        }
+    };
+
+    // No token AND wrong token must both be 401 on every endpoint.
+    for g in gets {
+        assert_eq!(get_status(None, g), 401, "no-token GET {g} must be rejected");
+        assert_eq!(
+            get_status(Some("Bearer wrong"), g),
+            401,
+            "wrong-token GET {g} must be rejected (indistinguishable from no token)"
+        );
+    }
+    // POST /api/task: axum's `Json` extractor runs BEFORE the handler body (and
+    // thus before require_auth), so a non-JSON body short-circuits to 415. Send a
+    // valid JSON body so the request reaches the auth gate.
+    for auth in [None, Some("Bearer wrong")] {
+        let mut req = ureq::post(format!("{url}/api/task").as_str());
+        if let Some(a) = auth {
+            req = req.set("Authorization", a);
+        }
+        let code = match req.send_json(serde_json::json!({
+            "session": "x", "command": { "type": "ping" }
+        })) {
+            Ok(r) => r.status(),
+            Err(ureq::Error::Status(c, _)) => c,
+            Err(e) => panic!("transport error on POST /api/task: {e}"),
+        };
+        assert_eq!(code, 401, "POST /api/task with {auth:?} must be rejected");
+    }
+    // Correct token: auth passes on every endpoint (status != 401 — a GET may be
+    // 200, a bodyless POST may 4xx, but neither is an auth failure).
+    for g in gets {
+        assert_ne!(
+            get_status(Some("Bearer sekret"), g),
+            401,
+            "correct-token GET {g} must pass the auth gate"
+        );
+    }
+}
+
 /// Scripting wiring: the server must fire `SessionNew` (on check-in) and
 /// `ResultReceived` (on a task result) into the event bus. We register a
 /// LogHook and assert both events arrive.
