@@ -6,6 +6,7 @@ members = [
     "crates/rest",
     "crates/profile",
     "crates/server",
+    "crates/store",
     "crates/agent-dev",
     "crates/client-cli",
     "crates/scripting",
@@ -37,6 +38,7 @@ license = "Apache-2.0 OR MIT"
 nyx-protocol = { path = "crates/protocol" }
 nyx-parse = { path = "crates/parse" }
 nyx-rest = { path = "crates/rest" }
+nyx-store = { path = "crates/store" }
 nyx-profile = { path = "crates/profile" }
 nyx-agent-dev = { path = "crates/agent-dev" }
 nyx-scripting = { path = "crates/scripting" }
@@ -65,6 +67,7 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 dashmap = "6"
 hex = "0.4"
+rusqlite = { version = "0.31", features = ["bundled"] }
 ureq = { version = "2", features = ["json"] }
 # TLS — rustls with the pure-Rust `ring` crypto provider (no C deps). Used by
 # the team server's optional HTTPS listener (NYX_TLS). `rcgen` generates a

@@ -59,6 +59,25 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => ServerKeypair::generate(),
     };
 
+    // Persistent credential store (Phase 2). Loads on every boot so creds
+    // SURVIVE a server restart — unlike the in-memory sessions (which are lost
+    // even with NYX_KEYFILE, since only the keypair persists, not the registry).
+    // Path from NYX_CREDS, else ~/.nyx/server-creds.db.
+    let creds_path = match std::env::var("NYX_CREDS") {
+        Ok(p) => p,
+        Err(_) => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            format!("{home}/.nyx/server-creds.db")
+        }
+    };
+    let cred_store = nyx_store::CredStore::open(std::path::Path::new(&creds_path))
+        .map_err(|e| anyhow::anyhow!("failed to open cred store at {creds_path}: {e}"))?;
+    tracing::info!(
+        creds = %creds_path,
+        restored = cred_store.count().unwrap_or(0),
+        "credential store loaded"
+    );
+
     let mut state = AppState {
         keypair,
         sessions: Default::default(),
@@ -67,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         killdate,
         events: nyx_scripting::EventBus::new(),
         fingerprints: Default::default(),
+        creds: Arc::new(cred_store),
     };
     state.register_default_hooks();
     // Optional operator automation: a Rhai script run on session/result events.

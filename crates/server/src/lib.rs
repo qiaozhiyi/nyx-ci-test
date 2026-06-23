@@ -89,6 +89,10 @@ pub struct AppState {
     /// for its peer on check-in and stamps it onto the new session. Plaintext
     /// (dev) connections never populate this (no ClientHello to sniff).
     pub fingerprints: DashMap<std::net::SocketAddr, Fingerprint>,
+    /// Persistent credential store (SQLite, WAL). Survives a team-server
+    /// restart — UNLIKE sessions (which are in-memory). Shared across operators:
+    /// a cred POSTed by one is visible to all via `GET /api/creds`.
+    pub creds: Arc<nyx_store::CredStore>,
 }
 
 /// A captured inbound TLS fingerprint (JA3 + JA4), keyed by peer addr.
@@ -116,6 +120,9 @@ impl Default for AppState {
             killdate: None,
             events: nyx_scripting::EventBus::new(),
             fingerprints: DashMap::new(),
+            creds: Arc::new(
+                nyx_store::CredStore::open_in_memory().expect("in-memory cred store"),
+            ),
         }
     }
 }
@@ -299,6 +306,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/tasks", get(get_tasks))
         .route("/api/results", get(get_results))
         .route("/api/profile", get(get_profile))
+        .route("/api/creds", get(list_creds).post(post_creds))
+        .route("/api/creds/delete", post(delete_cred))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024));
 
     beacon_routes.merge(api_routes).with_state(state)
@@ -995,6 +1004,109 @@ async fn get_results(
         })
         .collect();
     (StatusCode::OK, Json(views)).into_response()
+}
+
+// ---- /api/creds — Phase 2 persistent credential store ---------------------
+
+#[derive(Deserialize)]
+struct CredsQuery {
+    /// `?reveal=1` returns cleartext secrets; the default MASKS them so a list
+    /// GET never sprays every harvested hash to a glance.
+    #[serde(default)]
+    reveal: Option<u8>,
+    /// Optional `?kind=hash|password|ticket|key` filter.
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// `GET /api/creds` — list stored credentials. Secrets masked unless `?reveal=1`.
+async fn list_creds(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<CredsQuery>,
+) -> Response {
+    if let Some(r) = require_auth(&st, &headers) {
+        return r;
+    }
+    let mut rows = match st.creds.list() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "cred store list failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("cred store: {e}"))
+                .into_response();
+        }
+    };
+    if let Some(k) = &q.kind {
+        if let Some(want) = nyx_store::CredKind::from_label(k) {
+            rows.retain(|r| r.kind == want);
+        }
+    }
+    if q.reveal.unwrap_or(0) != 1 {
+        for r in &mut rows {
+            r.secret = nyx_store::mask_secret(&r.secret);
+        }
+    }
+    (StatusCode::OK, Json(rows)).into_response()
+}
+
+/// `POST /api/creds` — upsert a credential (add OR update-in-place by
+/// `(realm, user, kind)` — CS parity: a re-dump overwrites the old secret).
+async fn post_creds(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(rec): Json<nyx_store::CredRecord>,
+) -> Response {
+    if let Some(r) = require_auth(&st, &headers) {
+        return r;
+    }
+    match st.creds.upsert(&rec) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "key": [rec.realm, rec.user, rec.kind.label()]
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "cred store upsert failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("cred store: {e}")).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CredKey {
+    realm: String,
+    user: String,
+    kind: String,
+}
+
+/// `POST /api/creds/delete` — delete by composite key (JSON body, to avoid
+/// path-encoding realm/user).
+async fn delete_cred(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(key): Json<CredKey>,
+) -> Response {
+    if let Some(r) = require_auth(&st, &headers) {
+        return r;
+    }
+    let kind = match nyx_store::CredKind::from_label(&key.kind) {
+        Some(k) => k,
+        None => return (StatusCode::BAD_REQUEST, "bad kind").into_response(),
+    };
+    match st.creds.delete(&key.realm, &key.user, kind) {
+        Ok(deleted) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "deleted": deleted })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "cred store delete failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("cred store: {e}")).into_response()
+        }
+    }
 }
 
 /// Short name for a wire [`Command`] variant (for operator-facing views).

@@ -1,0 +1,11 @@
+[package]
+name = "nyx-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Persistent credential store for the Nyx team server (SQLite/ACID)."
+
+[dependencies]
+rusqlite = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

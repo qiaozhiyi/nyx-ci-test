@@ -12,6 +12,8 @@ nyx-scripting = { workspace = true }
 nyx-scripting-rhai = { workspace = true }
 # Fingerprint engine (inbound JA3/JA4 computation). pure Rust.
 nyx-transport = { workspace = true }
+# Persistent credential store (SQLite/ACID, server-side only).
+nyx-store = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 dashmap = { workspace = true }
