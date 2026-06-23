@@ -7,7 +7,7 @@ description = "Nyx operator TUI — opencode-style fullscreen client over the te
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "macros", "net", "io-util", "signal"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
