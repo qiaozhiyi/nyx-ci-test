@@ -84,7 +84,7 @@ is rejected).
 | `agent-dev` | **std**-based dev implant — exists only to prove the loop on the dev host (macOS/Linux/Windows). **Not** the production implant. |
 | `client-cli` | operator REPL/CLI over the REST API |
 | `client-ui` | pure-Rust **Makepad** desktop client over the REST API (no Node/JS) |
-| `implant-win` | scaffolded, **not** a workspace member (see below) |
+| `implant-win` | the real Windows PIC implant (`#![no_std]`/`#![no_main]`); standalone, not a workspace member (see below) |
 
 ## Working in this codebase
 
@@ -113,22 +113,42 @@ is rejected).
 ## `crates/implant-win` — Windows PIC implant (standalone, nightly cross-built)
 
 The real Windows position-independent implant. It is `#![no_std]`/`#![no_main]`,
-registers an NT-Heap `GlobalAlloc`, and is built as a standalone crate **outside**
-the workspace (it has its own empty `[workspace]` so `cargo build --workspace`
-stays green on the dev host). Cross-built from macOS after `brew install
-mingw-w64`:
+registers a **bump allocator over `NtAllocateVirtualMemory`** as `GlobalAlloc`
+(`ntalloc::NtHeapAllocator` — the name is historical; it is NOT an NT-Heap), and
+is built as a standalone crate **outside** the workspace (its own empty
+`[workspace]` so `cargo build --workspace` stays green on the dev host).
+Cross-built from macOS after `brew install mingw-w64`:
 
 ```bash
 cargo +nightly check --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-gnu
 ```
 
-Modules (all `cfg(target_os = "windows")`): `heap` (alloc glue), `alloc`
-(NT-Heap `GlobalAlloc` + bootstrap PEB walk), `resolve` (PEB walk + djb2 +
-`SyscallSource` over live ntdll → turns `nyx_evasion`'s SSN algorithms into a
-runtime), `syscalls` (indirect-syscall runtime: gadget scan + indirect stubs),
-`transport` (WinHTTP check-in), `core` (beacon loop reusing `nyx_protocol`),
-`entry` (`nyx_entry` reflective entry). Full link + sRDI extraction happen on a
-Windows host; the macOS dev host type-checks via cross-compile.
+Modules (all `cfg(target_os = "windows")` except `heap`/`server_pub`):
+
+- **Foundation:** `heap` (alloc glue), `ntalloc` (bump allocator = the global
+  allocator), `resolve` (PEB walk + djb2; `LiveNtdll` impls
+  `nyx_evasion::SyscallSource` over the live ntdll), `syscalls` (indirect-syscall
+  runtime: SSN table + ntdll `syscall;ret` gadget + RX trampoline; `syscall!`
+  macro + global accessor), `config` (per-build encrypted config, re-randomized
+  each build by `build.rs`), `server_pub` (baked server long-term pubkey).
+- **Evasion (the P2 surface — mind shipped vs skeleton):** `unhook` (KnownDlls
+  `\ntdll` fresh-map + disk fallback → pristine SSN bytes & clean gadget;
+  **shipped**), `blind` (AMSI/ETW userland byte-patch; **shipped**), `antidebug`
+  (PEB.BeingDebugged + `ProcessDebugPort` + uptime; **shipped**), `kits`
+  (`SleepmaskKit`/`NoMask` + `ProcessInjectKit`/`NotImpl` — **seams only, default
+  no-op**), `stack` (call-stack spoof — **skeleton, not wired**), `sleep`+`mem`
+  (sleep-mask — **skeletons → `NoMask`/no-op**).
+- **Loop & capabilities:** `beacon` (the task loop; dispatches every wire
+  `Command`), `transport` (WinHTTP POST + TLS), `envelopes` (build-time-baked
+  malleable-C2 shapes), `hostinfo` (real `SessionInfo`), `fs` (Upload/Download/
+  FileOp via NT syscalls → RIP in ntdll), `shell`, `recon`, `bof` (no_std W^X
+  COFF loader + Beacon-API shims), `screenshot`, `keylog` (polling), `hashdump`,
+  `pivot` (SOCKS relay across cycles), `postex` (token ops), `entry` (`nyx_entry`
+  + selftest exports), `selftests` (per-module `rundll32` self-tests, bitmask
+  exit codes).
+
+Full link + sRDI extraction happen on a Windows host; the macOS dev host
+type-checks via cross-compile.
 
 (The old `crates/client-tauri` Tauri+React scaffold was removed, and the first-generation
 `crates/client` egui client was in turn superseded and removed — the project is pure Rust and the
@@ -140,7 +160,62 @@ sole native GUI is `crates/client-ui`, a pure-Rust Makepad app. The operator CLI
 Phases 1 (malleable C2), 2 (cred store), 3 (named operators + audit), 4 (SOCKS relay) are
 **DONE**. **P2 stealth is the active milestone.** Research pass is complete and primary-source
 grounded; the source of truth is **`docs/p2-integration-analysis.md`** (per-kit build-specs), with
-`docs/p2-edr-bypass-plan.md` (layered plan) and `docs/p2-windows-bypass-research.md` (cited survey).
+`docs/p2-edr-bypass-plan.md` (layered plan), `docs/p2-windows-bypass-research.md` (cited survey),
+and `docs/p2-2026-research-addendum.md` (2025-2026 call-stack/CET + ETW-TI kernel sources, which
+**re-prioritize call-stack spoof to co-primary with SleepmaskKit** — our Tier-0 indirect syscalls
+are now detectable, and CET kills the old return-addr spoof; go BYOUD-Gap-class).
+
+**Capability floor (shipped vs seam vs research — read this before assuming what exists):**
+- *Shipped (Tier 0 / EDR Layer 1 — live in `nyx_entry`):* indirect syscalls, Hell/Halo/Tartarus
+  SSN resolution, KnownDlls+disk NTDLL unhook, AMSI/ETW userland blind, anti-debug.
+- *P2.1a-i SHIPPED (verified live, `nyx_selftest_gap_scan` bitmask=0b1111):* real
+  `PdataGapScanner` — `resolve::pdata_view` reads live `.pdata` from ntdll/kernelbase/win32u,
+  feeds `gap::enumerate_gaps`; produced 4945 gaps + 65 ghosts + 12671 nops on a live
+  Server 2019 (ntdll alone: 120404 anchors). `evasion_glue::LivePdataScanner` impls the SDK
+  trait; the shared `GapPool` (absolute addresses) is the foundation for ii/iii.
+- *P2.1a-ii GATED INTERMEDIATE (data path live, RSP swap gated):* `stack.rs` synthesizes +
+  stages real BYOUD-Gap leaf-bridge chains via `frame::build_leaf_bridge` and wires the
+  syscall hot-path hook (`spoof_wrap` + global `GapPool`). The RSP swap itself is gated
+  behind `stack::SPOOF_SWAP_ENABLED` (default OFF) — see the module's CET two-layer note:
+  leaf-gap chains are CET-safe at the *unwinder-walk* layer but a blind `ret`-from-fake-chain
+  swap faults with `#CP` at the *execution* layer; the live swap must route through the
+  `KiControlProtectionFault` lenient-repair seam (Synacktiv SSTIC 2025) before arming.
+- *P2.1a-iii RC4 MASK SHIPPED / FOLIAGE TIMING GATED:* `mem.rs` masks registered regions
+  with real RC4 (`rc4::apply_oneshot`, verified round-trip, `nyx_selftest_mem` bitmask=0b0011).
+  The Foliage APC→`NtContinue` timing primitive (which owns the mask→sleep→unmask window and
+  also masks `.text`/stacks) is gated in `kits::SleepmaskKit` (still `NoMask` default) —
+  needs target-side APC-chain debugging.
+- *P2.1b SHIPPED (verified live, `nyx_selftest_blind_nttrace` bitmask=0b1111):*
+  `blind::patch_nt_trace_event` patches `ntdll!NtTraceEvent` → `xor eax,eax;ret` ([31 C0 C3]),
+  one patch covering the whole `EtwEventWrite*` family. `impl BlindKit for LiveBlind` routes
+  all `BlindTarget` variants; `entry.rs` calls it on the live bootstrap path. Less-watched
+  than the P0 `EtwEventWrite` patch in 2026 Defender.
+- *P2.1c GATED INTERMEDIATE (data path live, stomp+resume gated):* `inject.rs` does real
+  `CreateProcessW(CREATE_SUSPENDED)` + API resolve (verified `nyx_selftest_inject`
+  bitmask=0b1111, IOC-free). The `.text` stomp + `ResumeThread` is gated behind
+  `inject::MODULESTOMP_ENABLED` (default OFF) — cross-process write is the loudest user-mode
+  signal + a botched stomp crashes the sacrificial process; `kits::inject` now routes through
+  `ModuleStompKit` (no longer `NotImpl`). Evades Moneta unbacked/private-exec; does NOT evade
+  PE-sieve `.text` hash-mismatch (use ThreadlessInject for that).
+- *P2.2 kernel tier — TWO IMPLS SHIPPED (algorithm + bootstrap, NOT kernel-loaded):*
+  `operator-kernelsdk::etwti::EtwTiBlind` (ETW-TI provider blind: chase
+  `EtwThreatIntProvRegHandle → provider block → EnableInfo → IsEnabled=0`, HVCI-safe
+  data-section write, 5 mock-KernelRw tests green) + `operator-kernelsdk::byovd::
+  ByovdDriver` (BYOVD `KernelRw` over a driver IOCTL channel, `RtCore64` CVE-2019-16098
+  reference binding + pure ntoskrnl export resolver, 4 tests green). The driver LOAD
+  step (`sc create`/`NtLoadDriver`) is operator-side and deliberately never runs in
+  dev — irreversible kernel op + BSOD risk + Defender flagging; reserved for the
+  authorized target. Remaining kits (CallbackKit/MiniFilterKit/WfpKit/PatchGuardKit/
+  PplKit/CredKit) stay seam-only.
+- *Seam only (trait exists, default no-op — NOT built):* the Foliage `SleepmaskKit` timing
+  primitive (`kits.rs` `NoMask`), the live RSP swap (`stack.rs` gated), the remaining
+  kernel kits (CallbackKit/MiniFilterKit/WfpKit/PatchGuardKit/PplKit/CredKit in
+  `operator-kernelsdk`).
+- *Research only (docs, no code):* EvilEDR repurposing, eBPF.
+- *Open floor gaps after P2.1:* beacon sleep still uses `NtDelayExecution` until the Foliage
+  timing primitive lands (gated); the userland ETW blind is now `NtTraceEvent`-class (P2.1b
+  done); VirtualProtect-on-code-page is still a signal (blind.rs `write_patch` — upgrade to
+  indirect `NtProtectVirtualMemory` is a future tech-debt fix).
 
 **Next build = P2.1a `SleepmaskKit` (Ekko/Foliage).** The seam is `crates/implant-win/src/kits.rs`
 (`SleepmaskKit` owns the mask→sleep→unmask window; swap `const SLEEPMASK_KIT` — no beacon-loop edit).

