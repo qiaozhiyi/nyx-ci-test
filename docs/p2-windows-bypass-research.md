@@ -94,3 +94,32 @@ Annotated + mapped to concrete Nyx enhancements. Complements
 - Few **formal academic** (IEEE/USENIX/CCS) papers specifically on PatchGuard bypass (it's mostly industry research — PG internals are partly undocumented). The HackMD/Fortinet/Outflank sources are the current best.
 - eBPF-for-Windows offensive research is nascent — monitor as it matures.
 - HVCI/VBS-on hosts degrade most kernel tiers to userland-only (P2.1) — per-host capability detection belongs in the beacon.
+
+---
+
+# Revision 2 — 2026-current (mid-2026 sweep)
+
+Re-searched with 2026 recency. The standout NEW current items:
+
+## M. eBPF — "Curing" io_uring rootkit (the definitive 2026 PoC)
+- **[ARMO — Curing io_uring rootkit](https://www.armosec.io/blog/io-uring-rootkit-bypasses-linux-security/)** · **[InfoQ 2025-09](https://www.infoq.com/news/2025/09/linux-security-rootkit/)** · **[THN 2025-04](https://thehackernews.org/2025/04/linux-iouring-poc-rootkit-bypasses.html)** — a PoC that operates entirely through `io_uring` async I/O, **validated against Falco + Tetragon + Microsoft Defender for Endpoint**. This is the concrete reference for Nyx's eBPF-evasion module (not just the concept).
+- **[Cilium — Migrating Falco→Tetragon (Jan 2026)](https://cilium.io/blog/2026/01/19/tetragon-falco-migrate/)** — key defender trend: Tetragon's **in-kernel ENFORCEMENT** (policy enforced in-kernel, not just detected in userspace) is the resilient answer. Nyx must assume enforcement-grade eBPF, not detection-only.
+→ *Nyx Linux v2: model the eBPF-abuse module on Curing (io_uring ops + privileged BPF to blind), and assume Tetragon-enforcement-grade targets.*
+
+## N. BYOVD — 2026 landscape (still viable, still churning)
+- **[Bellator Cyber — 54 EDR Killers via signed drivers (2026)](https://bellatorcyber.com/blog/edr-killers-byovd-signed-vulnerable-drivers-2026)** · **[BlackSnufkin/BYOVD PoC collection](https://github.com/BlackSnufkin/BYOVD)**.
+- Microsoft blocklist updates only **1-2×/year** ([Dark Reading](https://www.darkreading.com/application-security/microsoft-under-pressure-defenses-byovd-attacks)); **CVE-2023-52271 driver still unblocked in 2026** ([r/redteamsec](https://www.reddit.com/r/redteamsec/comments/1r9c8mp/does_killing_edr_with_a_vulnerable_driver_still/)). 2026 patch cycles: Jan (112 CVEs), May (CVE-2026-42898 DC vuln), June (206 CVEs).
+→ *Confirms BYOVD as the viable-but-churning fallback — the kit model (operator-selectable current driver) is mandatory; EDR-repurposing remains the primary.*
+
+## O. Sleep obfuscation — current whitepapers + the detection to beat
+- **[Nation State Minds — EKKO/Foliage/Cronos comparative whitepaper](https://www.nationstateminds.com/whitepapers/sleep-obfuscation-ekko-foliage-and-the-memory-scanner-evasion-landscape)** — current comparative analysis of the major techniques + detection artifacts.
+- **[Kyle Avery — Avoiding Memory Scanners (author of Hunt-Sleeping-Beacons)](https://kyleavery.com/posts/avoiding-memory-scanners/)** — FOLIAGE is detected via **threads in wait states**; the tool was updated to catch it. THIS is the concrete validation target for Nyx's `SleepmaskKit`.
+- **[SysWhispers4 docs — ETW-Ti limitations + sleep-encryption](https://joasasantos-syswhispers4.mintlify.app/advanced/etw-ti-limitations)** — current reference for the ETW-Ti-monitored syscall set + Ekko-inspired sleep encryption.
+→ *Nyx P2.1: implement `SleepmaskKit` (Ekko/Foliage) and validate it specifically against Hunt-Sleeping-Beacons + the Nation State Minds artifacts (RWX→RW transitions, wait-state threads).*
+
+## P. EDR-bypass technique + the cutting-edge DEFENSE
+- **[HookChain — DEF CON 32 "A New Perspective for Bypassing EDR"](https://www.youtube.com/watch?v=0L6TlFYwy2U)** — distinct EDR-bypass approach worth cataloging.
+- **[fluxsec.red — Full-Spectrum ETW Detection in-kernel vs rootkits (Sanctum EDR)](https://fluxsec.red/full-spectrum-event-tracing-for-windows-detection-in-the-kernel-against-rootkits)** — the state-of-the-art DEFENSE Nyx's ETW tier must anticipate (kernel ETW-tamper detection).
+
+## Q. 2026 conference status (as of mid-2026)
+- **USENIX Security '26** (Aug 12-14 2026, Baltimore) · **IEEE S&P 2026** (May 18-20, SF) · **NDSS 2026** (publishing) · **Black Hat USA 2026** (Aug 1-6, 100+ briefings announced Jun 2026, catalog not yet detailed). Full 2026 proceedings are not yet web-indexed as of mid-2026 — re-sweep Aug-Oct 2026 once USENIX'26 + BH'26 + DEF CON 34 land.
