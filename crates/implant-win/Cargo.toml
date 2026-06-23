@@ -53,6 +53,12 @@ nyx-config = { path = "../config" }
 # Step/Terminator lists into OUT_DIR/envelopes.rs for the runtime crate.
 nyx-profile = { path = "../profile" }
 
+# no_std PIC: dev/check builds must abort too — there's no unwinding without
+# std, so any debug panic path (e.g. integer-overflow checks) would otherwise
+# fail `cargo check` with "unwinding panics are not supported without std".
+[profile.dev]
+panic = "abort"
+
 [profile.release]
 opt-level = "z"
 lto = true
