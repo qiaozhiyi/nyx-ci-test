@@ -78,6 +78,43 @@ async fn main() -> anyhow::Result<()> {
         "credential store loaded"
     );
 
+    // Phase 3: named-operator registry + action audit log.
+    let operators_path = match std::env::var("NYX_OPERATORS_FILE") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            std::path::PathBuf::from(format!("{home}/.nyx/operators.json"))
+        }
+    };
+    let operators = nyx_server::operators::OperatorRegistry::load_or_bootstrap(
+        &operators_path,
+        std::env::var("NYX_TOKEN").ok().as_deref(),
+        std::env::var("NYX_BOOTSTRAP_OPERATOR").ok().as_deref(),
+    )?;
+    let auth_mode = if !operators.is_open() {
+        "named-operators"
+    } else if std::env::var("NYX_TOKEN").is_ok() {
+        "legacy-token"
+    } else {
+        "open"
+    };
+    tracing::info!(
+        operators = %operators_path.display(),
+        count = operators.list().len(),
+        mode = auth_mode,
+        "operator registry loaded"
+    );
+
+    let audit_path = match std::env::var("NYX_AUDIT_LOG") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            std::path::PathBuf::from(format!("{home}/.nyx/audit.jsonl"))
+        }
+    };
+    let audit_writer = nyx_server::audit::AuditWriter::open(&audit_path)?;
+    tracing::info!(audit = %audit_path.display(), "action audit log opened");
+
     let mut state = AppState {
         keypair,
         sessions: Default::default(),
@@ -87,6 +124,8 @@ async fn main() -> anyhow::Result<()> {
         events: nyx_scripting::EventBus::new(),
         fingerprints: Default::default(),
         creds: Arc::new(cred_store),
+        operators: Arc::new(operators),
+        audit: Some(Arc::new(audit_writer)),
     };
     state.register_default_hooks();
     // Optional operator automation: a Rhai script run on session/result events.

