@@ -134,3 +134,27 @@ Windows host; the macOS dev host type-checks via cross-compile.
 `crates/client` egui client was in turn superseded and removed — the project is pure Rust and the
 sole native GUI is `crates/client-ui`, a pure-Rust Makepad app. The operator CLI/TUI lives in
 `crates/client-cli`.)
+
+## Current focus & next step (P2 evasion)
+
+Phases 1 (malleable C2), 2 (cred store), 3 (named operators + audit), 4 (SOCKS relay) are
+**DONE**. **P2 stealth is the active milestone.** Research pass is complete and primary-source
+grounded; the source of truth is **`docs/p2-integration-analysis.md`** (per-kit build-specs), with
+`docs/p2-edr-bypass-plan.md` (layered plan) and `docs/p2-windows-bypass-research.md` (cited survey).
+
+**Next build = P2.1a `SleepmaskKit` (Ekko/Foliage).** The seam is `crates/implant-win/src/kits.rs`
+(`SleepmaskKit` owns the mask→sleep→unmask window; swap `const SLEEPMASK_KIT` — no beacon-loop edit).
+Build spec (§2.1 of the integration doc): FOLIAGE 10-step APC→`NtContinue` chain, encrypt via
+`SystemFunction032` (RC4, advapi32 image-commit), sleep via `WaitForSingleObject` (not `Sleep` —
+dodges the `DelayExecution` wait-reason HSB signal), validate against Hunt-Sleeping-Beacons +
+Moneta/PE-sieve/BeaconEye/MalMemDetect. Wire §2.2 return-address-spoof into the chain so the
+APC frames evade the updated HSB `KiUserApcDispatcher`-on-stack check.
+
+**Key 2026 finding that re-shapes the kernel tier (P2.2):** under HVCI **inline kernel hooks are
+dead**; only data-section manipulation + timing-based repair works (Outflank PatchGuard Peekaboo).
+So `CallbackKit`/`PatchGuardKit` must be designed around data+timing, not inline hooks, and degrade
+to the userland floor on HVCI-on hosts.
+
+**Research method note:** do NOT run the `deep-research`/`code-review` Workflow flows concurrently
+(they fan out many internal agents → API rate errors); for paper-reading fetch sources directly
+with the web reader. See memory `ecc-workflow-tool-dsl.md`.
