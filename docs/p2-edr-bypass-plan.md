@@ -156,3 +156,94 @@ add provider-disable.
 - Sleep mask + call-stack spoof: [Cobalt Strike — Behind the Mask](https://www.cobaltstrike.com/blog/behind-the-mask-spoofing-call-stacks-dynamically-with-timers), [InsomniacUnwinding](https://lorenzomeacci.com/unwind-data-cant-sleep-introducing-insomniacunwinding), [mgeeky/ThreadStackSpoofer](https://github.com/mgeeky/ThreadStackSpoofer)
 - Module stomping / threadless: [dtsec.us — Module Stomping](https://dtsec.us/2023-11-04-ModuleStompin/), [Avantguard — Threadless Ops II](https://avantguard.io/en/blog/threadless-ops-ii-enhanced-evasion)
 - EDR tradecraft overview: [0xdbgman — EDR Internals, Detection, Evasion](https://0xdbgman.github.io/posts/edr-internals-research-and-bypass/)
+
+---
+
+# Revision 1 — eBPF telemetry + the BEST kernel-level method (deeper research)
+
+After collecting 2024-2026 academic + threat-intel, the BYOVD-first plan above is
+**revised**: BYOVD is demoted to a fallback. The strongest kernel-level adversarial
+approaches are, in priority order, **EDR-Repurposing → DMA → eBPF-abuse → UEFI →
+hypervisor**, with BYOVD only when none of those are reachable.
+
+## 6. eBPF telemetry — the Linux/cloud frontier (and coming to Windows)
+
+Modern Linux/cloud EDRs (Cilium **Tetragon**, Sysdig **Falco**, Aqua **Tracee**,
+Alibaba **Elkeid**) instrument the kernel with **eBPF**: kprobes/kretprobes,
+tracepoints, and perf events that see syscalls + kernel internals **in-kernel**
+(before any userspace hook). Tetragon even *enforces* policy in-kernel. This is
+the Linux analog of Windows ETW-TI + callbacks — and eBPF-for-Windows (Microsoft,
+2021+) is bringing the same surface to Windows, so the playbook below is
+forward-relevant for both.
+
+How eBPF EDRs detect — and the current evasion primitives (authorized red-team):
+
+| Detection vector | Evasion (cited) |
+|---|---|
+| Syscall tracing via tracepoints/kprobes | **io_uring** async I/O bypasses the syscall path many probes hook — operations never hit the instrumented syscalls ([linuxsecurity.com — Rootkit Threats and Evasion](https://linuxsecurity.com/features/ebpf-security-tools-rootkit-evasion)) |
+| Program enumeration (operators listing loaded BPF) | hook **`sys_bpf`** to hide your own programs from `BPF_OBJ_GET`/iterators — the **LinkPro** 2025 in-the-wild technique ([Synacktiv — LinkPro analysis](https://www.synacktiv.com/en/publications/linkpro-ebpf-rootkit-analysis), [THN coverage](https://thehackernews.com/2025/10/linkpro-linux-rootkit-uses-ebpf-to-hide.html)) |
+| Ringbuffer / perf / BPF-iterator consumers | blind the consumers: hook the BPF iterators/ringbuffers/perf-event read paths so the EDR's userspace agent receives filtered/empty events ([matheuzsecurity — Breaking eBPF Security](https://matheuzsecurity.github.io/hacking/ebpf-security-tools-hacking/), [Doyensec — On Bypassing eBPF Monitoring](https://blog.doyensec.com/2022/10/11/ebpf-bypass-security-monitoring.html)) |
+| The EDR's own enforcement (Tetragon) | **eBPF rootkit** that loads your own privileged programs (needs `CAP_BPF`/root) to subvert or unhook the EDR's programs — the [ebpfkit](https://github.com/Gui774ume/ebpfkit) / [TripleCross](https://github.com/h3xduck/TripleCross) model; [Form3 — Bypassing eBPF enforcement](https://www.form3.tech/blog/engineering/bypassing-ebpf-tools) |
+
+**Nyx implication:** for Linux targets, an **eBPF-abuse module** (load privileged
+BPF that hides the beacon + blinds the EDR's probes, io_uring for syscall-free
+ops) is the kernel-tier primitive — it reuses the host's own eBPF rather than
+fighting it, mirroring the EDR-Repurposing philosophy below. The Nyx Linux v2
+agent (design-doc P4) is the natural home; on Windows, watch the eBPF-for-Windows
+surface as it matures.
+
+## 7. Revised kernel-tier — the BEST method (determined)
+
+Ranked by evasion strength × practicality for an authorized engagement:
+
+1. **EDR-Repurposing — `EvilEDR`, USENIX Security 2025 (RECOMMENDED primary).**
+   Instead of disabling EDR callbacks, **repurpose them**: register your own
+   kernel callbacks / leverage the EDR's already-loaded kernel presence to do your
+   offensive work, so the EDR's telemetry never fires on your actions (you ARE
+   the trusted telemetry source). No vulnerable driver, no blocklist dependence,
+   no HVCI conflict, no loud driver-load event. This is the current academic
+   state-of-the-art for kernel-level adversarial work and directly answers
+   "BYOVD 不太行". Paper: [EvilEDR (USENIX'25 PDF)](https://www.usenix.org/system/files/usenixsecurity25-alachkar.pdf).
+   **Nyx:** the kit model should grow a `RepurposeKit` (or fold into `CallbackKit`)
+   that, post-SYSTEM, registers friendly callbacks + rides the resident EDR rather
+   than killing it.
+2. **DMA via PCILeech (strongest "EDR-blind" R/W, needs hardware access).** FPGA
+   PCIe device reads/writes kernel memory with **zero software on the target** —
+   no driver, no syscall, no callback; EDR fundamentally cannot see it (only
+   IOMMU/Kernel-DMA-Protection mitigates). Use for kernel R/W when physical access
+   / a peripheral is available; then ETW-TI blind + callback neutralization run
+   from a vantage the EDR can't observe. Repo: [ufrink/pcileech](https://github.com/ufrink/pcileech).
+3. **eBPF abuse (Linux targets; future Windows).** Per §6 — load privileged BPF
+   to subvert/blind the eDR's probes (ebpfkit/LinkPro pattern) + io_uring for
+   syscall-free ops.
+4. **UEFI bootkit (persistence, not runtime evasion).** For durable persistence
+   below the OS — [BlackLotus (CVE-2022-21894 "Baton Drop")](https://www.welivesecurity.com/2023/03/01/blacklotus-uefi-bootkit-myth-confirmed/)
+   bypasses Secure Boot on patched systems; [CosmicStrand](https://www.kaspersky.com/about/press-releases/cosmicstrand-sophisticated-firmware-rootkit-allows-durable-persistence)
+   (firmware implant). Survives reinstall; invisible to OS-level EDR. Requires a
+   Secure-Boot-bypass class vuln; treat as a persistence tier, not the evasion tier.
+5. **Hypervisor / ring -1 (BluePill).** Conceptually "god mode" (subordinate the
+   OS+EDR under a thin VT-x hypervisor), but **VBS/Credential-Guard counters it**
+   and it's rare in-the-wild — ransomware ops overwhelmingly use BYOVD instead.
+   Lowest practical priority; academic ref: JYX "Creating Modern Blue Pills and Red Pills".
+6. **BYOVD (DEMOTED to fallback).** Still works for a quick kernel R/W when
+   EDR-repurposing isn't yet implemented and no DMA/hardware path exists, but:
+   the Microsoft Vulnerable Driver Blocklist churns, the driver-load itself is
+   telemetered, and HVCI blocks the classic primitives. Use only as a bridge to
+   tier-1 (EDR-Repurposing), not the destination.
+
+**Bottom line:** the "best" Windows-kernel method is **EDR-Repurposing (EvilEDR)**
+post-SYSTEM, with **DMA (PCILeech)** as the hardware-assisted entry to the kernel
+R/W that bootstraps it without a telemetered driver load. BYOVD is the documented
+fallback. On Linux, the equivalent is **eBPF abuse**. This replaces the BYOVD-led
+Tier 2 in §3.
+
+## 8. Added academic / 2024-2026 sources
+- [EvilEDR: Repurposing EDR as an Offensive Tool — USENIX Security 2025](https://www.usenix.org/system/files/usenixsecurity25-alachkar.pdf)
+- [Evolution of EDR in Cyber Security: A Comprehensive Review (2024, 42+ citations)](https://www.e3s-conferences.org/articles/e3sconf/pdf/2024/86/e3sconf_rawmu2024_01006.pdf)
+- [Endpoint Security Evasion 2020–2025: From EDR Bypass to EDR Blindness](https://windshock.github.io/en/post/2025-05-28-endpoint-security-evasion-techniques-20202025/)
+- [Comparative Analysis of eBPF-Based Runtime Security Monitoring (2025, Falco/Tetragon/Tracee)](https://www.scitepress.org/Papers/2025/142727/142727.pdf)
+- [TripleCross — An analysis of offensive capabilities of eBPF (academic PDF)](https://raw.githubusercontent.com/h3xduck/TripleCross/master/docs/ebpf_offensive_rootkit_tfg.pdf)
+- [Doyensec — On Bypassing eBPF Security Monitoring](https://blog.doyensec.com/2022/10/11/ebpf-bypass-security-monitoring.html) · [Form3 — Bypassing eBPF Enforcement Tools](https://www.form3.tech/blog/engineering/bypassing-ebpf-tools)
+- [Synacktiv — LinkPro eBPF rootkit analysis (2025)](https://www.synacktiv.com/en/publications/linkpro-ebpf-rootkit-analysis)
+- [ESET — BlackLotus UEFI bootkit (CVE-2022-21894)](https://www.welivesecurity.com/2023/03/01/blacklotus-uefi-bootkit-myth-confirmed/) · [Kaspersky — CosmicStrand](https://www.kaspersky.com/about/press-releases/cosmicstrand-sophisticated-firmware-rootkit-allows-durable-persistence)
+- [ufrink/pcileech — DMA FPGA kernel R/W](https://github.com/ufrink/pcileech) · [MITRE emb3D TID-107 — Unauthorized DMA](https://emb3d.mitre.org/threats/TID-107.html)
