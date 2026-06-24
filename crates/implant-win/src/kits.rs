@@ -46,9 +46,19 @@ impl SleepmaskKit for NoMask {
     }
 }
 
-/// The active sleepmask kit. Swap `NoMask` for an encrypting impl (Ekko/Foliage)
-/// in P2; nothing else in the beacon loop changes.
-const SLEEPMASK_KIT: NoMask = NoMask;
+/// Foliage sleepmask kit: delegates to [`crate::sleep`] which runs the gated
+/// Foliage executor. When [`crate::sleep::foliage_enabled`] is OFF (default),
+/// `sleep()` internally delegates to `NoMask` → identical behavior.
+pub struct Foliage;
+impl SleepmaskKit for Foliage {
+    fn sleep_masked(&self, seconds: u32) {
+        crate::sleep::sleep(seconds);
+    }
+}
+
+/// The active sleepmask kit. Foliage masks the image at sleep when armed;
+/// with foliage_enabled OFF (default), it's NoMask-equivalent.
+const SLEEPMASK_KIT: Foliage = Foliage;
 
 /// Beacon-facing sleep entry. Routes through the configured kit so a future
 /// encrypting impl is a one-line kit swap, not a loop edit.
