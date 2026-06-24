@@ -316,4 +316,31 @@ mod tests {
         let r = kit.is_blinded(&krw);
         assert!(matches!(r, Err(KitError::UnsupportedPosture(_))));
     }
+
+    #[test]
+    fn hvci_code_page_error_propagates_as_no_primitive() {
+        // A KernelRw that reads ok (non-null pointers) but refuses writes with
+        // HvciCodePage — simulating an HVCI-on code-page refusal on the blind write.
+        struct ReadOkWriteHvci;
+        impl KernelRw for ReadOkWriteHvci {
+            fn kread(&self, _kaddr: usize, dst: &mut [u8]) -> Result<(), KrwError> {
+                if dst.len() >= 8 { dst[..8].copy_from_slice(&[0x10u8; 8]); }
+                Ok(())
+            }
+            fn kwrite(&self, _kaddr: usize, _src: &[u8]) -> Result<(), KrwError> {
+                Err(KrwError::HvciCodePage)
+            }
+        }
+        let krw = ReadOkWriteHvci;
+        let off = EtwTiOffsets::for_build(17763).unwrap();
+        let kit = EtwTiBlind { prov_reg_handle_kva: 0x1000, offsets: off };
+        let r = kit.blind(&krw);
+        assert!(matches!(r, Err(KitError::NoPrimitive(KrwError::HvciCodePage))));
+    }
+
+    #[test]
+    fn win11_22h2_returns_none_requiring_runtime_probe() {
+        assert!(EtwTiOffsets::for_build(22621).is_none());
+        assert!(EtwTiOffsets::for_build_strict(22621, 1).is_none());
+    }
 }

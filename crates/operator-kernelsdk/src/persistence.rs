@@ -312,4 +312,22 @@ mod tests {
         let r = kit.enter_unchecked(&krw);
         assert!(matches!(r, Err(KitError::UnsupportedPosture(_))));
     }
+
+    #[test]
+    fn ppl_strips_every_signer_level() {
+        use crate::offsets::ps_protection;
+        for signer in [
+            ps_protection::SIGNER_AUTHENTICODE, ps_protection::SIGNER_CODEGEN,
+            ps_protection::SIGNER_ANTIMALWARE, ps_protection::SIGNER_LSA,
+            ps_protection::SIGNER_WINDOWS, ps_protection::SIGNER_WIN_TCB,
+            ps_protection::SIGNER_WIN_SYSTEM,
+        ] {
+            let protected: u8 = ps_protection::TYPE_PROTECTED
+                | (signer << ps_protection::SIGNER_SHIFT);
+            assert_ne!(protected & ps_protection::TYPE_MASK, ps_protection::TYPE_NONE);
+            let stripped = ps_protection::UNPROTECTED;
+            assert_eq!(stripped & ps_protection::TYPE_MASK, ps_protection::TYPE_NONE);
+            assert_eq!((stripped & ps_protection::SIGNER_MASK) >> ps_protection::SIGNER_SHIFT, 0);
+        }
+    }
 }
