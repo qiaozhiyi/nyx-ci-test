@@ -82,6 +82,12 @@ pub mod persistence;
 /// (WFP rule templates), `KernelLsassReader` (DTB + page-walk shell),
 /// `EdrNeutralizer` (Kill/Freeze/Choke tiers). Algorithm + framework.
 pub mod netsec;
+/// x64 4-level page-table walk (VA→PA) — pure algorithm, host-testable.
+/// Used by netsec (cross-process LSASS read) + win/va_rw (kernel VA read/write).
+pub mod pagewalk;
+/// ntoskrnl pattern scan (byte-signature → RVA) — pure algorithm, host-testable.
+/// The fallback offset resolver for unknown builds.
+pub mod pattern_scan;
 /// Windows-specific kernel-tier shells (BYOVD/KslD/DMA `KernelRw` impls +
 /// symbol resolution). Empty for now — algorithms live in the sibling modules;
 /// this is where the Windows-only bootstrap lands.

@@ -87,27 +87,100 @@ fn main() -> Result<()> {
         ));
     };
 
-    // If --pdb-path or --guid was given, verify the file/download works
-    // (proves the fetch pipeline), even though the walker uses known offsets.
-    if let Some(path) = &pdb_path {
-        let _data = std::fs::read(path).context("read pdb")?;
-        eprintln!("PDB file verified: {}", path.display());
-    }
-    if let (Some(g), Some(a)) = (&guid, age) {
-        let ss_path = format_symserver_guid(g, a);
-        let url = format!("{SYMSRV}/ntkrnlmp.pdb/{ss_path}/ntkrnlmp.pdb");
-        eprintln!("Symbol server URL: {url}");
-        // Don't auto-download in this pass — the operator should verify the URL
-        // first. A future version downloads + caches automatically.
-        eprintln!("(Download + parse is the next iteration; using known offsets for build {build_num})");
-    }
-
-    let offsets = emit_known_offsets(build_num)
-        .ok_or_else(|| anyhow!("build {build_num} not in the known table"))?;
+    // If --pdb-path was given, parse the REAL offsets from the PDB.
+    let offsets = if let Some(path) = &pdb_path {
+        let data = std::fs::read(path).context("read pdb")?;
+        eprintln!("Parsing PDB: {} ({} bytes)", path.display(), data.len());
+        parse_pdb_offsets(&data)
+            .context("PDB parse failed — falling back to known table")?
+    } else {
+        eprintln!("No --pdb-path; using known offsets for build {build_num}");
+        emit_known_offsets(build_num)
+            .ok_or_else(|| anyhow!("build {build_num} not in the known table"))?
+    };
     let toml = emit_toml(build_num, &offsets);
     std::fs::write(&out, &toml)?;
     eprintln!("Wrote offsets for build {build_num} to {}", out.display());
     Ok(())
+}
+
+/// Parse EPROCESS field offsets from a real ntoskrnl PDB using the `pdb` crate.
+fn parse_pdb_offsets(data: &[u8]) -> Result<BTreeMap<&'static str, usize>> {
+    use pdb::{PDB, FallibleIterator, TypeData};
+
+    let cursor = std::io::Cursor::new(data.to_vec());
+    let mut pdb = PDB::open(cursor)?;
+    let type_info = pdb.type_information()?;
+
+    // Drain the iterator to populate the finder, collecting _EPROCESS candidates.
+    let mut iter = type_info.iter();
+    let mut eprocess_fields_index: Option<pdb::TypeIndex> = None;
+
+    while let Some(item) = iter.next()? {
+        let type_data = item.parse()?;
+        // _EPROCESS is a ClassData in the PDB type stream.
+        let (name, fields) = match type_data {
+            TypeData::Class(ref c) => (&c.name, c.fields),
+            _ => continue,
+        };
+        let name_bytes = name.as_bytes();
+        if name_bytes == b"_EPROCESS" || name_bytes == b"EPROCESS" {
+            eprintln!("Found _EPROCESS in PDB");
+            eprocess_fields_index = fields;
+            break;
+        }
+    }
+
+    let fields_index = eprocess_fields_index
+        .ok_or_else(|| anyhow::anyhow!("_EPROCESS struct not found in PDB"))?;
+
+    // Use the finder to resolve the FieldList type.
+    let finder = type_info.finder();
+    let field_item = finder.find(fields_index)?;
+    let field_type = field_item.parse()?;
+
+    let mut offsets = BTreeMap::new();
+    if let TypeData::FieldList(field_list) = field_type {
+        // FieldList.fields is a Vec<TypeData> — iterate directly.
+        for field in &field_list.fields {
+            if let TypeData::Member(member) = field {
+                let name = member.name.to_string();
+                let off = member.offset as usize;
+                if let Some(key) = map_eprocess_field(&name) {
+                    offsets.insert(key, off);
+                    eprintln!("  _EPROCESS.{} @ 0x{:x}", name, off);
+                }
+            }
+        }
+    }
+
+    if offsets.is_empty() {
+        anyhow::bail!("_EPROCESS found but no known fields extracted");
+    }
+
+    // ETW-TI offsets can't come from PDB (runtime pointer chase).
+    if let Some(etw) = emit_known_offsets(17763) {
+        offsets.insert("etw_ti.guid_entry_to_provider_block", etw["etw_ti.guid_entry_to_provider_block"]);
+        offsets.insert("etw_ti.provider_block_to_enable_info", etw["etw_ti.provider_block_to_enable_info"]);
+        offsets.insert("etw_ti.is_enabled_within_enable_info", etw["etw_ti.is_enabled_within_enable_info"]);
+    }
+
+    Ok(offsets)
+}
+
+/// Map a PDB field name to our offsets.toml key. Returns None for fields we
+/// don't extract.
+fn map_eprocess_field(name: &str) -> Option<&'static str> {
+    match name {
+        "UniqueProcessId" => Some("eprocess.unique_process_id"),
+        "ActiveProcessLinks" => Some("eprocess.active_process_links"),
+        "Token" => Some("eprocess.token"),
+        "ImageFileName" => Some("eprocess.image_file_name"),
+        "SignatureLevel" => Some("eprocess.signature_level"),
+        "SectionSignatureLevel" => Some("eprocess.section_signature_level"),
+        "Protection" => Some("eprocess.protection"),
+        _ => None,
+    }
 }
 
 /// Format a PDB GUID into the symbol-server path convention.

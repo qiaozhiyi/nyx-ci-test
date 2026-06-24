@@ -31,6 +31,7 @@ pub mod resolve;
 pub mod driver_load;
 pub mod kernel_base;
 pub mod pagewalk;
+pub mod pattern_scan;
 pub mod va_rw;
 
 use crate::{EtwTiKit, KernelRw, KitError};

