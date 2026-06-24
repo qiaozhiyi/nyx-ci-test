@@ -220,8 +220,8 @@ impl MiniFilterKit for MiniFilterUnlinker {
 mod tests {
     use super::*;
     use crate::KrwError;
-    use std::collections::BTreeMap;
-    use std::sync::Mutex;
+    use alloc::collections::BTreeMap;
+    use spin::mutex::Mutex;
 
     struct MockKrw(Mutex<BTreeMap<usize, u8>>);
     impl MockKrw {
@@ -229,13 +229,13 @@ mod tests {
             Self(Mutex::new(BTreeMap::new()))
         }
         fn set_u64(&self, addr: usize, val: u64) {
-            let mut m = self.0.lock().unwrap();
+            let mut m = self.0.lock();
             for (i, b) in val.to_le_bytes().iter().enumerate() {
                 m.insert(addr + i, *b);
             }
         }
         fn get_u64(&self, addr: usize) -> u64 {
-            let m = self.0.lock().unwrap();
+            let m = self.0.lock();
             let mut bytes = [0u8; 8];
             for (i, b) in bytes.iter_mut().enumerate() {
                 *b = *m.get(&(addr + i)).unwrap_or(&0);
@@ -243,19 +243,19 @@ mod tests {
             u64::from_le_bytes(bytes)
         }
         fn get_byte(&self, addr: usize) -> u8 {
-            *self.0.lock().unwrap().get(&addr).unwrap_or(&0)
+            *self.0.lock().get(&addr).unwrap_or(&0)
         }
     }
     impl KernelRw for MockKrw {
         fn kread(&self, kaddr: usize, dst: &mut [u8]) -> Result<(), KrwError> {
-            let m = self.0.lock().unwrap();
+            let m = self.0.lock();
             for (i, b) in dst.iter_mut().enumerate() {
                 *b = *m.get(&(kaddr + i)).unwrap_or(&0);
             }
             Ok(())
         }
         fn kwrite(&self, kaddr: usize, src: &[u8]) -> Result<(), KrwError> {
-            let mut m = self.0.lock().unwrap();
+            let mut m = self.0.lock();
             for (i, b) in src.iter().enumerate() {
                 m.insert(kaddr + i, *b);
             }

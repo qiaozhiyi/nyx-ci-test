@@ -21,3 +21,8 @@ path = "src/lib.rs"
 # types so they can be cross-compiled and reviewed without any toolchain
 # beyond core/alloc. Implementations pull in their own deps (ntapi, windows,
 # pcileech bindings, …) when they are written.
+
+[dev-dependencies]
+# no_std Mutex for the mock KernelRw in tests (replaces std::sync::Mutex so the
+# crate's mock tests compile + run on the macOS dev host without std).
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }

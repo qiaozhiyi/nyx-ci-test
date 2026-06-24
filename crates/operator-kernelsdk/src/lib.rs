@@ -44,11 +44,12 @@
 //! Defender) > driverless CVE-2026-40369 > DMA/PCILeech > runtime-PG bypass >
 //! BYOVD (fallback).
 
-#![cfg(target_os = "windows")]
+#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;

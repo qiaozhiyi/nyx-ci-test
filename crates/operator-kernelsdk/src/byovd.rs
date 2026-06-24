@@ -26,6 +26,7 @@
 //! deliberately omit (the operator does `sc create`/`NtLoadDriver` on target).
 
 use crate::{KernelRw, KrwError};
+use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::ptr;
 
