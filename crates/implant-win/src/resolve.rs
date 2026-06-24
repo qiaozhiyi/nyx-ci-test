@@ -370,7 +370,7 @@ pub struct PebLdr {
 
 /// Read the PEB pointer. On x64 the TEB is at gs:[0x30] and the PEB at gs:[0x60].
 #[cfg(target_arch = "x86_64")]
-unsafe fn peb_pointer() -> Option<*mut Peb> {
+pub unsafe fn peb_pointer() -> Option<*mut Peb> {
     let peb: *mut Peb;
     core::arch::asm!(
         "mov {p}, gs:[0x60]",
@@ -381,7 +381,7 @@ unsafe fn peb_pointer() -> Option<*mut Peb> {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn peb_pointer() -> Option<*mut Peb> {
+pub unsafe fn peb_pointer() -> Option<*mut Peb> {
     None
 }
 
