@@ -281,6 +281,21 @@ just detects) → assume enforcement-grade targets. Linux v2 agent module.
 | **op** | EvilEDR repurposing (operator tooling + Sigma set) | separate track |
 | **Linux v2** | eBPF-abuse module | Linux agent |
 
+## 4a. 实现状态 (2026-06-24)
+
+| Phase | 代码 | 本机测试 | 真机验证 |
+|---|---|---|---|
+| P2.1a-i (gap scanner) | ✅ evasion_glue.rs | ✅ selftest bitmask | 待真机 gap_count>0 |
+| P2.1a-ii (stack spoof) | 🔶 swap.rs 决策✅, RSP asm 待调试 | ✅ swap 5测 | 待真机 CET 探测 |
+| P2.1b (blind) | ✅ NtTraceEvent + provider-disable | — | 待真机 logman 沉默 |
+| P2.1a-iii (foliage) | 🔶 foliage.rs 状态机✅, sleep.rs 同步骨架✅, APC 链待真机 | ✅ foliage 5测 | 待 HSB/Moneta |
+| P2.1c (inject) | 🔶 stomp 骨架 (gated OFF) | — | 待 PE-sieve |
+| P2.2 (kernel) | ✅ 6 模块算法 + win/ 壳占位 | ✅ 27 mock 测 | driver load (operator) |
+
+**测试总数:** evasionsdk 39 + kernel 27 = 66 个本机可测；implant-win 外壳全部
+`cargo +nightly check --target x86_64-pc-windows-gnu` 交叉通过。真机验证清单见
+`docs/p2-real-machine-validation-checklist.md`。
+
 ## 5. Validation matrix
 
 | Kit | Validate against |

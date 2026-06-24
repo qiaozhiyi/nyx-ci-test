@@ -158,13 +158,13 @@ implant-evasionsdk/gap.rs  (纯算法，已写好测好)
 
 依 `p2_research_synthesis.md` §四 的最终 build 顺序：
 
-| 步 | 模块 | 依赖 | 验证靶机 |
-|---|---|---|---|
-| **P2.1a-i** | `PdataGapScanner` 真实 impl（本文 §4） | `gap.rs` ✅ | gap_count>0 |
-| P2.1a-ii | `StackSpoofKit::ByoudGap`（用 `frame.rs`+`GapPool`，接 `syscalls.rs::trampoline_for`） | i | 自建 xacone-style VEH 检测器；ETW-Ti STACKWALK 无告警 |
-| P2.1b | `BlindKit::NtTraceEventBytePatch`（`blind.rs` 升级：`EtwEventWrite`→`NtTraceEvent` byte0→0xC3） | — | `logman`+`tracerpt` provider 沉默 |
-| P2.1a-iii | `SleepmaskKit::Foliage`/`InsomniacUnwinding`（`rc4.rs`+APC→NtContinue 链，集成 ii 的 spoof） | ii | HSB/Moneta/PE-sieve/BeaconEye 零命中 |
-| P2.1c | `ProcessInjectKit::ModuleStomping` | — | Moneta exec-private / PE-sieve unbacked 通过 |
+| 步 | 模块 | 依赖 | 验证靶机 | 状态 (2026-06-24) |
+|---|---|---|---|---|
+| **P2.1a-i** | `PdataGapScanner` 真实 impl（本文 §4） | `gap.rs` ✅ | gap_count>0 | ✅ 完成 (evasion_glue.rs, gap_scan selftest) |
+| P2.1a-ii | `StackSpoofKit::ByoudGap`（用 `frame.rs`+`GapPool`，接 `syscalls.rs::trampoline_for`） | i | 自建 xacone-style VEH 检测器；ETW-Ti STACKWALK 无告警 | 🔶 swap 决策完成 (swap.rs 5测), RSP asm 执行待真机 |
+| P2.1b | `BlindKit::NtTraceEventBytePatch`（`blind.rs` 升级：`EtwEventWrite`→`NtTraceEvent` byte0→0xC3） | — | `logman`+`tracerpt` provider 沉默 | ✅ 完成 (NtTraceEvent + provider-disable 双保险) |
+| P2.1a-iii | `SleepmaskKit::Foliage`/`InsomniacUnwinding`（`rc4.rs`+APC→NtContinue 链，集成 ii 的 spoof） | ii | HSB/Moneta/PE-sieve/BeaconEye 零命中 | 🔶 状态机完成 (foliage.rs 5测), 同步骨架完成, APC 异步链待真机 |
+| P2.1c | `ProcessInjectKit::ModuleStomping` | — | Moneta exec-private / PE-sieve unbacked 通过 | 🔶 stomp 骨架完成 (gated), threadless 待定 |
 
 **验证工具需在本机备好**：Hunt-Sleeping-Beacons、Moneta、PE-sieve、BeaconEye、MalMemDetect、
 Defender 实时扫描（本机已装 Defender）。检测器参考：StackSentry、Sleep-Duck-Eye（见 H2 sweep §D）。
