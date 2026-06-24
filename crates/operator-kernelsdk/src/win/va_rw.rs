@@ -18,14 +18,20 @@
 use crate::win::pagewalk::{PhysRead, PhysReadError, translate_va};
 use crate::{KernelRw, KrwError};
 
+/// Physical-memory write primitive (paired with [`PhysRead`]).
+pub trait PhysWrite {
+    fn write_phys(&self, pa: u64, src: &[u8]) -> Result<(), PhysReadError>;
+}
+
 /// A VA-aware KernelRw backed by a physical-memory driver + page walk.
-pub struct VaKernelRw<P: PhysRead> {
+/// `P` must support BOTH physical read AND physical write.
+pub struct VaKernelRw<P: PhysRead + PhysWrite> {
     phys: P,
     /// The kernel CR3 (DirectoryTableBase) for VA→PA translation.
     cr3: u64,
 }
 
-impl<P: PhysRead> VaKernelRw<P> {
+impl<P: PhysRead + PhysWrite> VaKernelRw<P> {
     pub fn new(phys: P, cr3: u64) -> Self {
         Self { phys, cr3 }
     }
@@ -34,7 +40,7 @@ impl<P: PhysRead> VaKernelRw<P> {
 /// Adapt PhysReadError → KrwError.
 fn map_phys_err(e: PhysReadError) -> KrwError {
     match e {
-        PhysReadError::Ioctl => KrwError::Other("physical read IOCTL failed".into()),
+        PhysReadError::Ioctl => KrwError::Other("physical IOCTL failed".into()),
         PhysReadError::NotPresent { level } => KrwError::Other(
             alloc::format!("page not present at {:?} level", level),
         ),
@@ -42,23 +48,36 @@ fn map_phys_err(e: PhysReadError) -> KrwError {
     }
 }
 
-impl<P: PhysRead + Send + Sync> KernelRw for VaKernelRw<P> {
+impl<P: PhysRead + PhysWrite + Send + Sync> KernelRw for VaKernelRw<P> {
     fn kread(&self, kaddr: usize, dst: &mut [u8]) -> Result<(), KrwError> {
         let pa = translate_va(&self.phys, self.cr3, kaddr as u64).map_err(map_phys_err)?;
         self.phys.read_phys(pa, dst).map_err(map_phys_err)
     }
 
     fn kwrite(&self, kaddr: usize, src: &[u8]) -> Result<(), KrwError> {
-        let pa = translate_va(&self.phys, self.cr3, kaddr as u64).map_err(map_phys_err)?;
-        // Need a write-capable adapter — PhysRead only has read. For now,
-        // physical-write is added via a separate trait (PhysWrite) in the
-        // consumer. This returns an error if the consumer hasn't bound writes.
-        let _ = (pa, src);
-        Err(KrwError::Other("VaKernelRw write requires a PhysWrite binding — use ByovdDriver directly for writes".into()))
+        // Write crossing a page boundary: walk each 4KB page separately.
+        // Most kernel writes are small (u64 IsEnabled, pointer unlink) and
+        // fit in one page, but handle the general case for correctness.
+        let mut va = kaddr as u64;
+        let mut remaining = src;
+        while !remaining.is_empty() {
+            // Bytes left in the current 4KB page.
+            let page_off = (va & 0xFFF) as usize;
+            let bytes_in_page = 0x1000 - page_off;
+            let chunk_len = remaining.len().min(bytes_in_page);
+            let (chunk, rest) = remaining.split_at(chunk_len);
+
+            let pa = translate_va(&self.phys, self.cr3, va).map_err(map_phys_err)?;
+            self.phys.write_phys(pa, chunk).map_err(map_phys_err)?;
+
+            va += chunk_len as u64;
+            remaining = rest;
+        }
+        Ok(())
     }
 }
 
-// SAFETY: VaKernelRw owns its PhysRead + a u64 CR3. PhysRead: Send+Sync (by
-// the trait bound) → VaKernelRw: Send+Sync → satisfies KernelRw: Send+Sync.
-unsafe impl<P: PhysRead + Send + Sync> Send for VaKernelRw<P> {}
-unsafe impl<P: PhysRead + Send + Sync> Sync for VaKernelRw<P> {}
+// SAFETY: VaKernelRw owns its PhysRead + PhysWrite + a u64 CR3.
+// P: Send+Sync (by the trait bound) → VaKernelRw: Send+Sync.
+unsafe impl<P: PhysRead + PhysWrite + Send + Sync> Send for VaKernelRw<P> {}
+unsafe impl<P: PhysRead + PhysWrite + Send + Sync> Sync for VaKernelRw<P> {}
