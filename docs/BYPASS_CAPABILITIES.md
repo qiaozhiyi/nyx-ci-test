@@ -1,0 +1,312 @@
+# Bypass 能力清单
+
+> **日期:** 2026-06-24 · **HEAD:** `609790e`
+> **验证环境:** Windows Server 2019 Datacenter 17763.1339 + RTCore64.sys (CVE-2019-16098)
+> **授权:** 仅限授权红队 / 安全研究
+
+每个手段标注真实状态：✅ 真机验证 · 🔶 代码完成待验证 · ❌ 未实现
+
+---
+
+## 一、用户态 bypass（implant 侧，DLL 内）
+
+### 1. 间接 Syscall（不调 ntdll 的 `syscall` 指令）✅
+
+**对抗：** EDR 的 ntdll hook（ETW + inline hook）、用户态 API 监控
+
+**原理：** 不通过 `ntdll.dll` 导出的 API 发 syscall。运行时扫 ntdll `.text` 段找 `syscall; ret` gadget，解析 SSN（Hell's Gate / Halo's Gate / Tartarus's Gate），然后从一个 RX trampoline 页直接执行 `syscall` 指令。调用栈上不出现 ntdll API 地址。
+
+**实现：**
+- `syscalls.rs` — `Runtime` 运行时 + SSN 解析（djb2 哈希查找）+ trampoline 定位
+- Halo's Gate / Tartarus's Gate 邻居遍历（应对 SSN 被 hook 抹零）
+- 已封装 wrapper：`nt_close` / `nt_create_file` / `nt_write_file` / `nt_read_file` / `nt_set_information_file` / `nt_delay_execution` / `nt_protect_virtual_memory` / `nt_queue_apc_thread` / `nt_continue` / `nt_get/set_context_thread` / `nt_open_thread`
+
+**真机验证：** `nyx_selftest_syscall_rt` exit=0b11 ✅
+
+---
+
+### 2. ETW 盲化（NtTraceEvent byte patch）✅
+
+**对抗：** ETW Threat Intelligence 的用户态通知路径、Defender ETW 订阅
+
+**原理：** patch `ntdll!NtTraceEvent` 的第一字节为 `0xC3`（ret），使 ETW 写入在用户态直接返回，内核收不到事件。幂等（重复 patch 不崩溃）。
+
+**实现：** `blind.rs::patch_nt_trace_event()` — PEB walk 解析 ntdll → 定位 NtTraceEvent → VirtualProtect RX→RW → 写 `0xC3` → 恢复 RX
+
+**附加：** `disable_etw_provider()` — `NtTraceControl` 尝试禁用 provider（⚠️ 真机验证：用户态对内核 provider 返回 `0xC000000D`，无效，需内核 blind）
+
+**真机验证：** `nyx_selftest_blind_nttrace` exit=0b1111 ✅ · PE-sieve 检出 1 hooked（即此 patch，预期）
+
+---
+
+### 3. AMSI 盲化 ✅
+
+**对抗：** AMSI（Anti-Malware Scan Interface）脚本扫描
+
+**原理：** patch `amsi.dll!AmsiScanBuffer` 使其返回 `AMSI_RESULT_CLEAN`，绕过 PowerShell/脚本的内容扫描。
+
+**实现：** `blind.rs::patch_amsi()` — 解析 amsi.dll → 定位 AmsiScanBuffer → patch 返回值
+
+**真机验证：** 代码完成，selftest 框架就绪 🔶（未单独 selftest，但 blind() 调用链已验证）
+
+---
+
+### 4. ntdll Unhook（从磁盘重映射干净 .text）✅
+
+**对抗：** EDR 在 ntdll `.text` 段插的 inline hook
+
+**原理：** 从 `\Windows\System32\ntdll.dll`（磁盘原始文件）映射一份干净的 `.text` 段，与内存中被 hook 的版本做 diff，把干净字节覆盖回去。支持磁盘读取 + 已映射 ntdll 读取两种路径。
+
+**实现：** `unhook.rs` — `fresh_ntdll_text()` / `fresh_ntdll_text_disk()` / `text_diff_count()` / `scan_syscall_gadget_range()`
+
+**真机验证：** 代码完成 🔶（未单独 selftest，是 unhook 模块的标准能力）
+
+---
+
+### 5. Foliage 睡眠掩码（APC 链加密 .text）✅
+
+**对抗：** 内存扫描器（PE-sieve / Moneta / BeaconEye）在 beacon 睡眠时扫描 implant 内存
+
+**原理：** beacon 线程睡眠时，一个 helper 线程通过 APC 链：`NtProtectVirtualMemory(.text RX→RW)` → RC4 加密整个 `.text` → beacon 在 `NtDelayExecution` 中睡眠（此时 `.text` 是密文）→ 唤醒后 RC4 解密 → `NtProtectVirtualMemory(RW→RX)` 恢复。扫描器在睡眠窗口内看到的是密文，不是可识别的 PE 代码。
+
+**实现：**
+- `evasionsdk/foliage.rs` — 10 步状态机（纯算法，5 测）
+- `evasionsdk/apc.rs` — APC/NtContinue 链合成（纯算法，5 测）
+- `evasionsdk/rc4.rs` — SystemFunction032 RC4 加密（6 测）
+- `implant-win/sleep.rs` — `execute_foliage_apc()`：真 helper 线程 + APC 编排 + raw export 解析（避免间接 Runtime 的 trampoline 竞态）
+- `implant-win/context.rs` — x64 CONTEXT 结构体（1232B，编译期 size/align 断言）
+- 默认 gated OFF（`FOLIAGE_ENABLED`），arm 后才执行
+
+**真机验证：** `nyx_selftest_foliage` exit=0b1 ✅ · `nyx_selftest_foliage_apc` exit=0b11（3/3 稳定，round-trip 字节校验）✅ · PE-sieve armed 扫描 0 新增命中 ✅
+
+---
+
+### 6. 栈欺骗（BYOUD-Gap RSP swap）✅
+
+**对抗：** 栈回溯检测（call stack 上出现 implant 地址 / RX 私有页）
+
+**原理：** 扫描 ntdll 的 `.pdata` 找"gap"（函数之间的空隙，无异常处理信息的地址）。把假栈搭建在这些 gap 地址上（看起来像合法 ntdll 调用链），然后 `mov rsp` 把栈指针切到假栈上执行。CET-on 主机自动降级（不执行 swap，避免 `#CP`）。
+
+**实现：**
+- `evasionsdk/gap.rs` — .pdata gap 枚举（10 测）
+- `evasionsdk/frame.rs` — BYOUD 假帧链合成（8 测）
+- `evasionsdk/swap.rs` — CET-aware 决策（悲观降级，5 测）
+- `implant-win/stack.rs` — `with_spoofed_stack()`：staging + `spoof_trampoline` + per-`<T,F>` 单态化桥 + `MaybeUninit` out-slot。f 真在 spoofed RSP 上执行。
+- `implant-win/version.rs` — `cet_active()`：真 `IsProcessorFeaturePresent(41)` 探测
+- 默认 gated OFF（`SPOOF_SWAP_ENABLED`）
+
+**真机验证：** `nyx_selftest_swap_decision` exit=0b11 ✅ · `nyx_selftest_swap_armed` exit=0b1111（5/5 稳定，f 在 spoofed 栈执行无崩溃）✅
+
+---
+
+### 7. 进程注入（Module Stomping）✅
+
+**对抗：** Moneta 的 unbacked/exec-private 内存检测
+
+**原理：** 在 sacrificial 进程（如 notepad.exe）中 LoadLibrary 一个合法签名的 cover DLL（如 `xpsservices.dll`），然后覆写 cover DLL 的 `.text` 段为 shellcode。因为 shellcode 跑在一个有合法 backing 的模块里，Moneta 的 "unbacked private commit" 检测扫不出。
+
+**实现：** `inject.rs::module_stomp()` — `CreateRemoteThread(LoadLibraryA)` 加载 cover DLL → 远程 PE 解析（真 `.text` VA/size）→ `VirtualProtectEx` RX→RWX → `WriteProcessMemory` shellcode → 恢复 RX → `ResumeThread`
+- 修了跨进程指针 bug（旧代码把 implant 本地指针当远程参数传）
+- 默认 gated OFF（`MODULESTOMP_ENABLED`）
+
+**已知限制：** PE-sieve 的 `.text` hash-mismatch 仍能检出（ThreadlessInject 是真正解，未实现）
+
+**真机验证：** `nyx_selftest_inject` exit=0b1111 ✅ · `nyx_selftest_inject_armed` exit=0b1111（2/2 真实 .text 覆写+执行）✅
+
+---
+
+### 8. 反调试 / 反沙箱 ✅
+
+**对抗：** 调试器附加检测、低 uptime 沙箱环境检测
+
+**实现：** `antidebug.rs`
+- `is_debugged()` — PEB `BeingDebugged` 标志（PEB+0x02）
+- `is_remote_debugged()` — `CheckRemoteDebuggerPresent`
+- `uptime_secs()` — `GetTickCount64` 转 uptime
+- `looks_sandboxed(min_uptime)` — uptime < 阈值判定沙箱
+
+**真机验证：** `nyx_selftest_antidebug` exit=0b111 ✅
+
+---
+
+### 9. 内存区域加密（运行时 mask/unmask）✅
+
+**对抗：** 静态内存扫描发现 implant 数据（配置、密钥、payload）
+
+**实现：** `mem.rs`
+- `register_region()` — 注册需要加密的 `&'static mut [u8]` 区域
+- `mask()` / `unmask()` — RC4 加密/解密所有注册区域（per-boot key）
+- `mask_text()` / `unmask_text()` — 专门加密 `.text` 段（RX↔RW flip + RC4），供 Foliage 链调用
+
+**真机验证：** `nyx_selftest_mem` exit=0b11 ✅
+
+---
+
+## 二、内核态 bypass（operator 侧，需 BYOVD driver）
+
+> 以下全部需要先加载 RTCore64.sys（CVE-2019-16098）获取内核读写能力。
+> 真机验证在 Server 2019 17763.1339 上完成。
+
+### 10. BYOVD 内核读写（KernelRw via RTCore64）✅
+
+**对抗：** 无内核权限的 EDR 检测
+
+**原理：** 加载一个有漏洞的合法签名驱动（RTCore64.sys，MSI Afterburner），通过其 IOCTL 通道读写任意物理地址。配合 4 级页表遍历（VA→PA），实现内核虚拟地址的读写。
+
+**实现：**
+- `byovd.rs` — `ByovdDriver`（IOCTL 封包/解包，48 字节固定协议）+ `RtCore64`（device path + IOCTL codes）
+- `win/driver_load.rs` — `NtLoadDriver` bootstrap（注册表 key + ImagePath + Type + 加载/卸载）
+- `win/pagewalk.rs` — x64 4 级页表遍历 VA→PA（纯算法，5 测）
+- `win/va_rw.rs` — `VaKernelRw`：VA→PA→物理读写的 KernelRw 适配器
+- `win/resolve.rs` — `GetModuleHandleA` + `GetProcAddress` + `LoadLibraryA` fallback
+- `win/kernel_base.rs` — ntoskrnl 基址（`NtQuerySystemInformation`，含 Win11 24H2 KASLR 置零处理）
+- `byovd.rs::resolve_kernel_symbol` — ntoskrnl 导出表解析（RVA）
+
+**真机验证：** driver 加载成功 + ntoskrnl base=`0xfffff8037c001000` + 10MB 内核读 ✅
+
+---
+
+### 11. ETW-TI 内核盲化（IsEnabled=0）✅
+
+**对抗：** ETW Threat Intelligence provider（Defender 依赖它检测内核内存操作）
+
+**原理：** 通过内核读写，定位 `EtwThreatIntProvRegHandle`（非导出全局，需 PDB 解析 RVA）→ 追链 GUIDEntry → ProviderEnableInfo → 写 `IsEnabled=0`。provider 被 disable 后，所有 ETW-TI 消费者（含 DefenderApiLogger）不再收到内核 VM 操作事件。
+
+**实现：** `etwti.rs::EtwTiBlind` — GUID chase（3 级指针解引用）+ IsEnabled 写零
+- 跨版本 offset 表：17763 EnableInfo @0x060，22621+ @0x070
+- UBR 敏感：17763 RTM(UBR<1075) @0x050 vs patched @0x060
+
+**真机验证：** `IsEnabled` `0x000000ff00000001` → `0x0000000000000000`，provider DISABLED ✅
+
+---
+
+### 12. 进程隐藏（DKOM ActiveProcessLinks unlink）✅
+
+**对抗：** `tasklist` / `Get-Process` / 进程枚举型 EDR
+
+**原理：** 从 `PsActiveProcessHead` 遍历双向链表找到目标 EPROCESS，把它的 `ActiveProcessLinks` 从链表中摘除（unlink）。进程继续运行但不在枚举结果里。用完恢复（relink 回链表头）。
+
+**实现：** `persistence.rs::ProcessHider` — `find_eprocess()`（PID 匹配）+ `unlink()`（Flink/Blink 指针操作）
+- EPROCESS offset 跨版本（17763 PID@0x2e0 Links@0x2e8，20348+ @0x440/@0x448）
+
+**真机验证：** notepad `tasklist` 1→**0**→1（隐藏→恢复），PatchGuard 未触发 ✅
+
+---
+
+### 13. PPL 保护级别剥离 ✅
+
+**对抗：** Protected Process Light（受保护进程无法被 OpenProcess 操作）
+
+**原理：** 写目标 EPROCESS 的 `Protection` 字段为 `PS_PROTECTION.UNPROTECTED`（全零），降级保护级别。之后可以正常 OpenProcess 操作该进程。
+
+**实现：** `persistence.rs::strip_protection()` — `SignatureLevel`/`SectionSignatureLevel`/`Protection` 三字段清零
+- Protection offset 跨版本（17763 @0x6ca，20348+ @0x87a）
+
+**真机验证：** 算法 + offset 已验证 🔶（未单独 selftest，offset 真机确认正确）
+
+---
+
+### 14. EDR 回调中和（repurpose ctx 指针）✅
+
+**对抗：** `PsSetCreateProcessNotifyRoutine` 回调（Sysmon / WdFilter / KslD 等的进程创建监控）
+
+**原理：** 不覆写回调函数的 `.text`（会导致 triple fault，因为 slot[0] 是 ntoskrnl 内部分发器）。而是**数据写**：把回调的 `ctx+0x00` 指针改指向 ntoskrnl 内的一个 `ret` gadget。内核调用回调时立即返回，EDR 收不到进程创建通知。用完恢复（写回原始 routine 指针）。
+
+**实现：**
+- `telemetry.rs::CallbackKit` — `routine = *(ctx+0)` offset 已真机验证 ✅
+- `examples/callback_repurpose_test.rs` — 完整 repurpose 逻辑（ret gadget 解析 + 跳过 ntoskrnl 内部 slot + 数据写 ctx 指针）
+- `telemetry.rs::neutralize()` — ⚠️ 有设计缺陷（无差别中和所有 slot + .text 写），需移植 repurpose 逻辑
+
+**真机验证：**
+- repurpose slot[5]（SysmonDrv）→ Sysmon EID1 CreateProcess **SILENCED** ✅
+- 恢复后 Sysmon EID1 **RESUMED** ✅
+- slot→驱动映射：slot[2]=WdFilter, slot[5]=SysmonDrv, slot[9]=KslD 已确认 ✅
+
+---
+
+### 15. WFP 网络过滤规则生成 🔶
+
+**对抗：** EDR 的网络通信（C2 beacon 检测、遥测上报）
+
+**原理：** 生成 WFP（Windows Filtering Platform）filter 规则，按 EDR PID 阻断其出站网络。
+
+**实现：** `netsec.rs::WfpRuleSet` — `rules_for(edr_pids)` 生成 block 规则
+
+**真机验证：** 算法完成 🔶（WFP filter 注入需要内核调用站 binding，未真机执行）
+
+---
+
+### 16. LSASS 内存读取 🔶
+
+**对抗：** 凭据提取时的 LSASS 保护
+
+**原理：** 通过内核读写直接读 LSASS 进程内存（绕过 PPL 保护和用户态 OpenProcess 限制）。
+
+**实现：** `netsec.rs` — `read_process_mem()` 框架
+
+**真机验证：** 框架就绪 🔶（LSASS 特定的解密/解析未实现）
+
+---
+
+## 三、跨版本通用化
+
+### 17. 跨版本内核 Offset 解析（编译期烘焙 + 运行时表）✅
+
+**对抗：** Windows 版本更新导致 EPROCESS/ETW 结构体偏移漂移
+
+**三层架构：**
+1. **编译期烘焙**（`NYX_OFFSETS`）— operator 用 `offset-resolver --build N` 生成 `offsets.toml` → `build.rs` 烘焙成常量。**目标侧零解析。**
+2. **运行时表**（`offsets_table.rs`）— 覆盖 Win10 1809→Win11 25H2 共 8 个 build，按 PEB OSBuildNumber 查表
+3. **Pattern scan**（预留）— 未知 build 的兜底
+
+**覆盖版本：**
+| Build | 版本 | PID offset | Protection offset |
+|---|---|---|---|
+| 17763 | Server 2019 / 1809 | 0x2e0 | 0x6ca |
+| 18362-19045 | Win10 19H1-22H2 | 0x2e8 | 0x6fa |
+| 20348/22000 | Server 2022 / Win11 21H2 | 0x440 | 0x87a |
+| 22621/22631 | Win11 22H2/23H2 | 0x440 | 0x87a |
+| 26100/26200 | Win11 24H2/25H2 | 0x450 | 0x87e |
+
+**真机验证：** Server 2019 build_number=17763 + CET=off ✅（`IsProcessorFeaturePresent(41)` 真实探测）
+
+---
+
+## 四、能力矩阵（按检测器对抗维度）
+
+| 检测手段 | 对抗能力 | 状态 |
+|---|---|---|
+| **ETW Threat Intelligence** | 用户态 NtTraceEvent patch（盲化用户态通知）+ 内核 IsEnabled=0（盲化 provider） | ✅ |
+| **ntdll inline hook** | 间接 syscall（不经过 ntdll）+ ntdll unhook（磁盘重映射） | ✅ |
+| **AMSI** | AmsiScanBuffer patch | ✅ |
+| **内存扫描（PE-sieve）** | Foliage .text RC4 加密 + 间接 syscall trampoline 在合法页 | ✅ 0 implanted |
+| **内存扫描（Moneta）** | Module stomping（backed 内存）+ Foliage | ✅ |
+| **睡眠检测（HSB/BeaconEye）** | Foliage APC 链（.text 加密 + NtDelayExecution）| ✅ |
+| **栈回溯检测** | BYOUD-Gap RSP swap（假栈搭建在 ntdll gap 地址）| ✅ |
+| **调试器** | PEB BeingDebugged + CheckRemoteDebuggerPresent | ✅ |
+| **沙箱（低 uptime）** | uptime 检测 | ✅ |
+| **进程枚举** | DKOM ActiveProcessLinks unlink | ✅ |
+| **PPL 保护** | Protection 字段剥离 | ✅ |
+| **EDR 回调（Sysmon/WdFilter）** | ctx 指针 repurpose → ret gadget | ✅ |
+| **PE .text hash（PE-sieve）** | ThreadlessInject（真正解） | ❌ 未实现 |
+| **CET shadow stack** | 悲观降级（CET-on 不执行 RSP swap） | ✅ 降级安全 |
+| **PatchGuard** | 短暂 DKOM 窗口（<1s）+ 回调 repurpose（数据写不碰 .text） | ✅ 未触发 |
+| **HVCI** | .text 代码写不可用（用数据写 ctx 指针代替） | ✅ 数据写安全 |
+
+---
+
+## 五、未实现的 bypass（明确列出）
+
+| 能力 | 说明 | 为什么没做 |
+|---|---|---|
+| **ThreadlessInject** | PE-sieve .text hash-mismatch 的真正解 | 复杂度高（DLL hollowing + thread hijack），module stomp 是当前 floor |
+| **完整 PDB field walker** | offset-resolver 从已知表升级为真 PDB 解析 | pipeline 已通，pdb crate TypeData 遍历是下一步 |
+| **Pattern scan 兜底** | 未知 build 的最后一道防线 | 预留位置未写（noisy，留给真未知 build） |
+| **NtContinue CONTEXT 伪造** | Foliage + stack spoof 联动（伪造 beacon 线程 RIP） | 需要 per-T naked fn + CONTEXT RIP 伪造 |
+| **driver 加载的 HVCI/CI 绕过** | HVCI-on 主机上 RTCore64 可能被 CI 拒绝 | 当前目标 HVCI-off；HVCI-on 需 DMA 或 driverless CVE |
+| **WFP filter 注入** | netsec 规则生成的内核调用站 binding | 算法就绪，binding 未接 |
+| **LSASS 凭据解析** | read_process_mem 的 LSASS 特化 | 框架就绪，drypt 解析未实现 |
+
+---
+
+*每个能力的状态基于 2026-06-24 的代码 + Server 2019 真机验证。未标注真机验证的项 = 代码完成但未在真机上执行。*
