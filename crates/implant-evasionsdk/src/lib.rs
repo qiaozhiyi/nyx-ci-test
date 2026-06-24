@@ -412,3 +412,14 @@ impl EvasionStack {
         Ok(())
     }
 }
+
+/// Private re-export of the ETW-TI provider GUID for the blind module's
+/// provider-disable companion. Not part of the public seam API.
+#[doc(hidden)]
+pub mod __private {
+    /// Microsoft-Windows-Threat-Intelligence provider GUID.
+    pub const ETW_TI_GUID: [u8; 16] = [
+        0x7C, 0x89, 0xE1, 0xF4, 0x5D, 0xBB, 0x68, 0x56,
+        0xF1, 0xD8, 0x04, 0x0F, 0x4D, 0x8D, 0xD3, 0x44,
+    ];
+}

