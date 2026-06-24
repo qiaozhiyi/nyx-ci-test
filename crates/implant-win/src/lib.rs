@@ -68,6 +68,8 @@ pub mod bof;
 #[cfg(target_os = "windows")]
 pub mod config;
 #[cfg(target_os = "windows")]
+pub mod context;
+#[cfg(target_os = "windows")]
 pub mod envelopes;
 #[cfg(target_os = "windows")]
 pub mod entry;

