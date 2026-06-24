@@ -16,10 +16,12 @@ use crate::KrwError;
 
 type GetModuleHandleA = unsafe extern "system" fn(*const u8) -> *mut c_void;
 type GetProcAddress = unsafe extern "system" fn(*mut c_void, *const u8) -> *mut c_void;
+type LoadLibraryAFn = unsafe extern "system" fn(*const u8) -> *mut c_void;
 
 extern "system" {
     fn GetModuleHandleA(lpModuleName: *const u8) -> *mut c_void;
     fn GetProcAddress(hModule: *mut c_void, lpProcName: *const u8) -> *mut c_void;
+    fn LoadLibraryA(lpLibFileName: *const u8) -> *mut c_void;
 }
 
 /// Resolve a Windows export to a typed function pointer. This is the real
@@ -30,6 +32,11 @@ extern "system" {
 ///
 /// Returns the function address transmuted to `T`, or an error if the module
 /// or export isn't found.
+///
+/// Note: kernel32/ntdll are always loaded in any Win32 process, so
+/// `GetModuleHandleA` finds them. Other DLLs (advapi32, fltlib, …) may not be
+/// loaded yet — we fall back to `LoadLibraryA` (kernel32 export, always
+/// resolvable via GetModuleHandleA("kernel32")) to map them on demand.
 ///
 /// # Safety
 /// Caller must ensure `T` is a valid function pointer type matching the
@@ -47,11 +54,45 @@ pub unsafe fn resolve_sym<T>(module: &[u8], name: &[u8]) -> Result<T, KrwError> 
     let name_len = name.len().min(name_buf.len() - 1);
     name_buf[..name_len].copy_from_slice(&name[..name_len]);
 
-    let h = unsafe { GetModuleHandleA(mod_buf.as_ptr()) };
+    // Try GetModuleHandleA first (no load, works for already-mapped DLLs).
+    let mut h = unsafe { GetModuleHandleA(mod_buf.as_ptr()) };
     if h.is_null() {
-        return Err(KrwError::Unavailable("GetModuleHandleA returned null"));
+        // Module not mapped in this process yet (e.g. advapi32). Load it.
+        // LoadLibraryA is a kernel32 export — kernel32 is always mapped.
+        let load_lib: LoadLibraryAFn =
+            unsafe { get_proc(kernel32_handle()?, b"LoadLibraryA")? };
+        h = unsafe { load_lib(mod_buf.as_ptr()) };
+        if h.is_null() {
+            return Err(KrwError::Unavailable("GetModuleHandleA+LoadLibraryA returned null"));
+        }
     }
     let addr = unsafe { GetProcAddress(h, name_buf.as_ptr()) };
+    if addr.is_null() {
+        return Err(KrwError::Unavailable("GetProcAddress returned null"));
+    }
+    Ok(unsafe { core::mem::transmute_copy::<*mut c_void, T>(&addr) })
+}
+
+/// Cached kernel32 module handle. kernel32.dll is always mapped in a Win32
+/// process, so GetModuleHandleA never returns null for it.
+fn kernel32_handle() -> Result<*mut c_void, KrwError> {
+    let name = b"kernel32.dll";
+    let mut buf = [0u8; 16];
+    buf[..name.len()].copy_from_slice(name);
+    let h = unsafe { GetModuleHandleA(buf.as_ptr()) };
+    if h.is_null() {
+        Err(KrwError::Unavailable("kernel32.dll not mapped — not a Win32 process?"))
+    } else {
+        Ok(h)
+    }
+}
+
+/// Look up an export by name in an already-mapped module.
+unsafe fn get_proc<T>(h: *mut c_void, name: &[u8]) -> Result<T, KrwError> {
+    let mut buf = [0u8; 64];
+    let n = name.len().min(buf.len() - 1);
+    buf[..n].copy_from_slice(&name[..n]);
+    let addr = unsafe { GetProcAddress(h, buf.as_ptr()) };
     if addr.is_null() {
         return Err(KrwError::Unavailable("GetProcAddress returned null"));
     }

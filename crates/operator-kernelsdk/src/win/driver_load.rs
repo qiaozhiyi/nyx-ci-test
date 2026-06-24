@@ -145,10 +145,55 @@ impl Drop for LoadedDriver {
     }
 }
 
-/// Build the ImagePath value: `\??\C:\path\to\driver.sys` (NT path prefix).
+/// Build the ImagePath registry value from the operator-supplied driver path.
+///
+/// The IO manager / NtLoadDriver resolves ImagePath as follows:
+///   - A relative path (no drive letter, e.g. `System32\drivers\RTCore64.sys`)
+///     is resolved relative to `%SystemRoot%`. This is what `sc create` writes
+///     and is the most broadly accepted form.
+///   - An absolute NT path (`\??\C:\...`) is accepted on most builds but is
+///     rejected on some (observed: Server 2019 17763 returns
+///     STATUS_INVALID_IMAGE_FORMAT 0xC0000160). We therefore prefer the
+///     relative form whenever the path is under SystemRoot.
+///
+/// Heuristic: if `sys_path` (after stripping a leading `\??\`) starts with
+/// `System32\` / `system32\` (case-insensitive), emit it as-is (relative). Any
+/// other absolute path keeps the `\??\` prefix.
+///
+/// NUL-terminated exactly once (callers may pass a NUL-terminated const; we
+/// trim trailing NULs).
 fn build_image_path(sys_path: &[u16]) -> Vec<u16> {
-    let prefix: &[u16] = &[b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16];
-    prefix.iter().chain(sys_path.iter()).chain(core::iter::once(&0u16)).copied().collect()
+    // Trim trailing NULs (callers like the example pass a NUL-terminated const).
+    let trimmed: &[u16] = sys_path.iter().rposition(|&c| c != 0)
+        .map(|i| &sys_path[..=i])
+        .unwrap_or(&sys_path[..0]);
+    // Strip a leading `\??\` (4 code units) if present, for the SystemRoot check.
+    let nt_prefix: &[u16] = &[b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16];
+    let core: &[u16] = if trimmed.len() >= 4 && trimmed[..4] == *nt_prefix {
+        &trimmed[4..]
+    } else {
+        trimmed
+    };
+    // Is core under System32\ (case-insensitive ASCII compare)?
+    let sys32: &[u8] = b"system32\\";
+    let under_sys32 = core.len() >= sys32.len()
+        && core[..sys32.len()].iter()
+            .zip(sys32.iter())
+            .all(|(c, &e)| (*c as u8).to_ascii_lowercase() == e);
+    if under_sys32 {
+        // Relative path under SystemRoot — accepted most broadly. No `\??\`.
+        let mut out = Vec::with_capacity(core.len() + 1);
+        out.extend_from_slice(core);
+        out.push(0);
+        out
+    } else {
+        // Absolute path: (re-)apply the `\??\` NT-object prefix.
+        let mut out = Vec::with_capacity(nt_prefix.len() + core.len() + 1);
+        out.extend_from_slice(nt_prefix);
+        out.extend_from_slice(core);
+        out.push(0);
+        out
+    }
 }
 
 /// Resolve an ntdll export via our resolver.
@@ -184,6 +229,17 @@ impl RegApi {
     fn create_key_and_set_image_path(&self, reg_path: &[u16], image_path: &[u16]) -> Result<(), KrwError> {
         let mut hkey: *mut c_void = core::ptr::null_mut();
         let mut disposition: u32 = 0;
+        // RegCreateKeyExW param order: hKey, lpSubKey, Reserved, lpClass,
+        //   dwOptions, samDesired, lpSecurityAttributes, phkResult, lpdwDisposition.
+        //   dwOptions = REG_OPTION_NON_VOLATILE (0); samDesired = KEY_ALL_ACCESS.
+        // KEY_ALL_ACCESS = 0xF003F (STANDARD_RIGHTS_REQUIRED | KEY_QUERY_VALUE |
+        // KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_ENUMERATE_SUB_KEYS |
+        // KEY_NOTIFY | KEY_CREATE_LINK). A previous version passed samDesired=0
+        // (no access rights), so RegSetValueExW silently failed to write
+        // ImagePath — NtLoadDriver then saw an empty value and rejected the
+        // image with STATUS_INVALID_IMAGE_FORMAT (0xC0000160).
+        const KEY_ALL_ACCESS: u32 = 0xF003F;
+        const REG_OPTION_NON_VOLATILE: u32 = 0;
         let status = unsafe {
             (self.create_key)(
                 self.hklm,
@@ -193,8 +249,8 @@ impl RegApi {
                 self.strip_prefix(reg_path).as_ptr(),
                 0,
                 core::ptr::null_mut(),
-                0, // KEY_ALL_ACCESS
-                0,
+                REG_OPTION_NON_VOLATILE,
+                KEY_ALL_ACCESS,
                 core::ptr::null_mut(),
                 &mut hkey,
                 &mut disposition,
@@ -213,23 +269,59 @@ impl RegApi {
         let name: &[u16] = &[b'I' as u16, b'm' as u16, b'a' as u16, b'g' as u16,
                             b'e' as u16, b'P' as u16, b'a' as u16, b't' as u16,
                             b'h' as u16, 0];
-        let _ = unsafe {
+        let set_status = unsafe {
             (self.set_value)(hkey, name.as_ptr(), 0, 2 /* REG_EXPAND_SZ */,
                              image_path_bytes.as_ptr(), image_path_bytes.len() as u32)
+        };
+        if set_status != 0 {
+            unsafe { (self.close_key)(hkey) };
+            return Err(KrwError::Other(
+                alloc::format!("RegSetValueExW(ImagePath) failed: {}", set_status),
+            ));
+        }
+        // Set Type = SERVICE_KERNEL_DRIVER (1), Start = SERVICE_DEMAND_START (3),
+        // ErrorControl = SERVICE_ERROR_IGNORE (0). NtLoadDriver → IopLoadDriver
+        // reads the `Type` value to classify the image; without Type=1 the IO
+        // manager rejects the image with STATUS_INVALID_IMAGE_FORMAT
+        // (0xC0000160) even when ImagePath is correct. These three values are
+        // exactly what `sc create <svc> type= kernel` writes.
+        let type_name: &[u16] = &[b'T' as u16, b'y' as u16, b'p' as u16, b'e' as u16, 0];
+        let start_name: &[u16] = &[b'S' as u16, b't' as u16, b'a' as u16, b'r' as u16,
+                                   b't' as u16, 0];
+        let err_name: &[u16]  = &[b'E' as u16, b'r' as u16, b'r' as u16, b'o' as u16,
+                                   b'r' as u16, b'C' as u16, b'o' as u16, b'n' as u16,
+                                   b't' as u16, b'r' as u16, b'o' as u16, b'l' as u16, 0];
+        let dword_one: [u8; 4] = 1u32.to_le_bytes();     // Type = KERNEL_DRIVER
+        let dword_three: [u8; 4] = 3u32.to_le_bytes();   // Start = DEMAND_START
+        let dword_zero: [u8; 4] = 0u32.to_le_bytes();    // ErrorControl = IGNORE
+        const REG_DWORD: u32 = 4;
+        let _ = unsafe {
+            (self.set_value)(hkey, type_name.as_ptr(), 0, REG_DWORD,
+                             dword_one.as_ptr(), 4)
+        };
+        let _ = unsafe {
+            (self.set_value)(hkey, start_name.as_ptr(), 0, REG_DWORD,
+                             dword_three.as_ptr(), 4)
+        };
+        let _ = unsafe {
+            (self.set_value)(hkey, err_name.as_ptr(), 0, REG_DWORD,
+                             dword_zero.as_ptr(), 4)
         };
         unsafe { (self.close_key)(hkey) };
         Ok(())
     }
 
-    /// Strip the \Registry\Machine prefix for RegCreateKeyExW (which wants
-    /// the path relative to HKEY_LOCAL_MACHINE).
+    /// Strip the `\Registry\Machine\` prefix for RegCreateKeyExW (which wants
+    /// the path relative to HKEY_LOCAL_MACHINE, i.e. `SYSTEM\CurrentControl-
+    /// Set\Services\<name>`).
+    ///
+    /// `\Registry\Machine\` is exactly 18 UTF-16 code units
+    /// (`\`(1) + `Registry`(8) + `\`(1) + `Machine`(7) + `\`(1) = 18).
     fn strip_prefix<'a>(&self, reg_path: &'a [u16]) -> &'a [u16] {
-        // Find "SYSTEM\CurrentControlSet\Services" after the prefix.
-        // The prefix is \Registry\Machine\ = 17 chars. Skip to the "SYSTEM" part.
-        // (RegCreateKeyExW with HKEY_LOCAL_MACHINE wants SYSTEM\CurrentControlSet\...)
-        // Count: \ R e g i s t r y \ M a c h i n e \ = 17 chars.
-        if reg_path.len() > 17 {
-            &reg_path[17..]
+        // RegCreateKeyExW with HKEY_LOCAL_MACHINE wants `SYSTEM\CurrentControl-
+        // Set\...` (no leading backslash). Stripping 18 leaves exactly that.
+        if reg_path.len() > 18 {
+            &reg_path[18..]
         } else {
             reg_path
         }
