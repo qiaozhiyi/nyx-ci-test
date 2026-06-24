@@ -58,6 +58,12 @@ pub mod gap;
 pub mod frame;
 /// RC4 stream cipher (sleep-mask memory encryption — `SystemFunction032`).
 pub mod rc4;
+/// Foliage sleep-mask 10-step APC→NtContinue chain — pure state-machine model.
+pub mod foliage;
+/// APC / NtContinue chain synthesis — pure model for Foliage/Ekko.
+pub mod apc;
+/// CET-aware RSP-swap decision — pure logic (pessimistic degrade).
+pub mod swap;
 
 use alloc::boxed::Box;
 use alloc::string::String;
