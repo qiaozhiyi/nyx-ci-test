@@ -64,6 +64,8 @@ pub mod foliage;
 pub mod apc;
 /// CET-aware RSP-swap decision — pure logic (pessimistic degrade).
 pub mod swap;
+/// Cross-version kernel offset table (Win10 1809 → Win11 25H2 + Server).
+pub mod offsets_table;
 
 use alloc::boxed::Box;
 use alloc::string::String;

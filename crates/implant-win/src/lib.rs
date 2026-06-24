@@ -111,6 +111,8 @@ pub mod syscalls;
 pub mod transport;
 #[cfg(target_os = "windows")]
 pub mod unhook;
+#[cfg(target_os = "windows")]
+pub mod version;
 
 // Register the NT-Heap allocator so Vec/String work under #![no_std].
 #[cfg(target_os = "windows")]

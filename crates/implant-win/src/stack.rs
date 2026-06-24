@@ -262,13 +262,11 @@ pub unsafe fn with_spoofed_stack<T>(gaps: &GapPool, f: impl FnOnce() -> T) -> T 
 }
 
 /// Probe whether user-mode CET / shadow stack is active for this process.
-/// Win11 24H2+ opt-in per-process. Server 2019 (build 17763, our target) is
-/// always false. A real probe calls IsProcessorFeaturePresent(41); deferred to
-/// the target-debug pass. Pessimistic on unknown builds.
+/// Delegates to `version::cet_active()` which calls
+/// `IsProcessorFeaturePresent(PF_CET = 41)`. Returns FALSE on Win10/Server 2019
+/// (correct — CET didn't exist), TRUE on Win11 24H2+ if the process opted in.
 fn cet_active() -> bool {
-    // Server 2019 (17763) predates user-mode CET — always off. This is correct
-    // for the verified target. A future build probe replaces this.
-    false
+    crate::version::cet_active()
 }
 
 // ---- RSP swap execution (x86_64 inline asm) --------------------------------

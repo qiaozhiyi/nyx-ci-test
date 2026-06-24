@@ -74,14 +74,50 @@ impl EtwTiOffsets {
             // specifically, assume patched (UBR>=1075) — virtually every live
             // Server 2019 is. RTM (UBR=1) callers should use for_build_strict.
             17763 => Some(Self::patched_17763()),
-            19041..=19044 => Some(Self {
+            18362..=19044 => Some(Self {
                 guid_entry_to_provider_block: 0x020,
                 provider_block_to_enable_info: 0x060,
                 is_enabled_within_enable_info: 0x000,
             }),
-            // Win11 22H2+ (build 22621+): EnableInfo shifted; needs runtime
-            // probe — refuse rather than guess.
-            _ => None,
+            // Server 2022 / Win11 21H2 (20348/22000): same ETW layout as 1904x.
+            20348..=22000 => Some(Self {
+                guid_entry_to_provider_block: 0x020,
+                provider_block_to_enable_info: 0x060,
+                is_enabled_within_enable_info: 0x000,
+            }),
+            // Win11 22H2/23H2 (22621/22631): EnableInfo shifted to 0x070.
+            22621..=22631 => Some(Self {
+                guid_entry_to_provider_block: 0x020,
+                provider_block_to_enable_info: 0x070,
+                is_enabled_within_enable_info: 0x000,
+            }),
+            // Win11 24H2/25H2 (26100/26200): same as 22H2 ETW layout.
+            26100..=26200 => Some(Self {
+                guid_entry_to_provider_block: 0x020,
+                provider_block_to_enable_info: 0x070,
+                is_enabled_within_enable_info: 0x000,
+            }),
+            // Floor match: a patch build (e.g. 19045) maps to the nearest lower.
+            _ => Self::floor_match(build),
+        }
+    }
+
+    /// Floor match: the highest known build <= the requested one. Handles
+    /// patch builds (19045 → 19041's layout, 22635 → 22631's, etc.).
+    fn floor_match(build: u32) -> Option<Self> {
+        // Try each known range ceiling; return the one whose range floor <= build.
+        if build >= 26100 {
+            Self::for_build(26100)
+        } else if build >= 22621 {
+            Self::for_build(22621)
+        } else if build >= 20348 {
+            Self::for_build(20348)
+        } else if build >= 18362 {
+            Self::for_build(19041)
+        } else if build >= 17763 {
+            Self::for_build(17763)
+        } else {
+            None // below the supported range
         }
     }
 
@@ -99,8 +135,7 @@ impl EtwTiOffsets {
                     is_enabled_within_enable_info: 0x000,
                 })
             }
-            19041..=19044 => Self::for_build(build),
-            _ => None,
+            _ => Self::for_build(build),
         }
     }
 
@@ -242,7 +277,9 @@ mod tests {
     fn for_build_known_and_unknown() {
         assert!(EtwTiOffsets::for_build(17763).is_some()); // Server 2019
         assert!(EtwTiOffsets::for_build(19041).is_some()); // Win10 2004
-        assert!(EtwTiOffsets::for_build(22621).is_none()); // Win11 22H2 — must probe
+        assert!(EtwTiOffsets::for_build(22621).is_some()); // Win11 22H2 — now in table
+        assert!(EtwTiOffsets::for_build(26100).is_some()); // Win11 24H2 — now in table
+        assert!(EtwTiOffsets::for_build(9999).is_none()); // truly unknown build
     }
 
     #[test]
@@ -339,8 +376,22 @@ mod tests {
     }
 
     #[test]
-    fn win11_22h2_returns_none_requiring_runtime_probe() {
-        assert!(EtwTiOffsets::for_build(22621).is_none());
-        assert!(EtwTiOffsets::for_build_strict(22621, 1).is_none());
+    fn win11_22h2_now_has_known_offsets() {
+        // 22H2 EnableInfo shifted to 0x070 (was None before the cross-version table).
+        let o = EtwTiOffsets::for_build(22621).unwrap();
+        assert_eq!(o.provider_block_to_enable_info, 0x070);
+        // 24H2 same ETW layout as 22H2.
+        let o2 = EtwTiOffsets::for_build(26100).unwrap();
+        assert_eq!(o2.provider_block_to_enable_info, 0x070);
+        // Server 2022 / Win11 21H2 still at 0x060 (pre-22H2 layout).
+        let o3 = EtwTiOffsets::for_build(20348).unwrap();
+        assert_eq!(o3.provider_block_to_enable_info, 0x060);
+    }
+
+    #[test]
+    fn patch_build_floor_matches() {
+        // 19045 (Win10 22H2 patch) floor-matches to the 19041 ETW layout.
+        let o = EtwTiOffsets::for_build(19045).unwrap();
+        assert_eq!(o.provider_block_to_enable_info, 0x060);
     }
 }
