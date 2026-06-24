@@ -125,7 +125,7 @@ impl Palette {
             border:  rgb(0x33, 0x33, 0x33), // #333333  hairline dividers (visible)
             bar:     rgb(0x1E, 0x1E, 0x1E), // #1E1E1E  recessed bars
             input:   rgb(0x2D, 0x2D, 0x2D), // #2D2D2D  input fill
-            input_b: rgb(0x55, 0x55, 0x55), // #555555  visible input border
+            input_b: rgb(0x70, 0x70, 0x70), // #707070  visible input border
             grad_top: rgb(0x11, 0x11, 0x11), // #111111  bg gradient top
             grad_bot: rgb(0x05, 0x05, 0x05), // #050505  bg gradient bottom
             node:    rgb(0x66, 0x66, 0x66), // #666666  network nodes
@@ -157,7 +157,7 @@ impl Palette {
             border:  rgb(0xA0, 0xA0, 0xA0), // #A0A0A0
             bar:     rgb(0xE0, 0xE0, 0xE0), // #E0E0E0
             input:   rgb(0xFF, 0xFF, 0xFF), // #FFFFFF
-            input_b: rgb(0xA0, 0xA0, 0xA0), // #A0A0A0
+            input_b: rgb(0x80, 0x80, 0x80), // #808080
             grad_top: rgb(0xF0, 0xF0, 0xF0), // #F0F0F0
             grad_bot: rgb(0xD0, 0xD0, 0xD0), // #D0D0D0
             node:    rgb(0x3B, 0x72, 0xAB), // #3B72AB
@@ -166,7 +166,7 @@ impl Palette {
             btn_grad2: rgb(0x2E, 0x5B, 0x8A), // #2E5B8A
             primary: rgb(0x00, 0x00, 0x00), // #000000
             second:  rgb(0x33, 0x33, 0x33), // #333333
-            muted:   rgb(0x66, 0x66, 0x66), // #666666
+            muted:   rgb(0x4F, 0x4F, 0x4F), // #4F4F4F
             accent:  rgb(0x3B, 0x72, 0xAB), // #3B72AB
             acchov:  rgb(0x5B, 0x9B, 0xD5), // #5B9BD5
             success: rgb(0x00, 0x80, 0x00), // #008000

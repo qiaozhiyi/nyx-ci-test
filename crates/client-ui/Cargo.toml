@@ -25,3 +25,6 @@ nyx-rest = { workspace = true }
 [[bin]]
 name = "nyx-client-ui"
 path = "src/main.rs"
+
+[package.metadata.makepad]
+assets = ["assets/**"]

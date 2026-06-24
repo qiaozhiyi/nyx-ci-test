@@ -16,15 +16,18 @@ impl Widget for ConsoleList {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         // Resolve the selected session ID.
         let selected_idx = crate::SELECTED_SESSION.load(std::sync::atomic::Ordering::Relaxed);
-        let session_id: Option<String> = if selected_idx == usize::MAX {
+        let sessions_guard = crate::SESSIONS.read().unwrap_or_else(|e| e.into_inner());
+        let session_id: Option<&str> = if selected_idx == usize::MAX {
             None
         } else {
-            crate::SESSIONS.read().unwrap().get(selected_idx).map(|s| s.id.clone())
+            sessions_guard.get(selected_idx).map(|s| s.id.as_str())
         };
-        let lines: Vec<String> = if let Some(ref sid) = session_id {
-            crate::CONSOLE.read().unwrap().get(sid).cloned().unwrap_or_default()
+        let console_guard = crate::CONSOLE.read().unwrap_or_else(|e| e.into_inner());
+        let empty_lines = Vec::new();
+        let lines: &Vec<String> = if let Some(sid) = session_id {
+            console_guard.get(sid).unwrap_or(&empty_lines)
         } else {
-            Vec::new()
+            &empty_lines
         };
 
         while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {

@@ -79,15 +79,15 @@ pub struct CredTable {
 
 impl Widget for CredTable {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let creds = CREDS.read().unwrap().clone();
+        let creds_guard = CREDS.read().unwrap_or_else(|e| e.into_inner());
         while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = step.as_portal_list().borrow_mut() {
-                if creds.is_empty() {
+                if creds_guard.is_empty() {
                     list.set_item_range(cx, 0, 0);
                 } else {
-                    list.set_item_range(cx, 0, creds.len());
+                    list.set_item_range(cx, 0, creds_guard.len());
                     while let Some(item_id) = list.next_visible_item(cx) {
-                        let Some(c) = creds.get(item_id) else { continue };
+                        let Some(c) = creds_guard.get(item_id) else { continue };
                         let item = list.item(cx, item_id, id!(Item));
 
                         // Repaint the row from the single Palette source.

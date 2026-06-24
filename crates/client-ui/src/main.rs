@@ -39,7 +39,38 @@ use bridge::{Bridge, Cmd, SessionView, Snapshot};
 // thread and single-threaded, so the write-lock in apply_snapshot() never
 // contends in practice; the RwLock is just the documented Makepad idiom.
 
-static SESSIONS: LazyLock<RwLock<Vec<SessionView>>> = LazyLock::new(|| RwLock::new(Vec::new()));
+static SESSIONS: LazyLock<RwLock<Vec<SessionView>>> = LazyLock::new(|| RwLock::new(vec![
+    SessionView {
+        id: "mock_1".to_string(),
+        hostname: "DESKTOP-WIN".to_string(),
+        username: "admin".to_string(),
+        os: "Windows 11".to_string(),
+        arch: 64,
+        pid: 1024,
+        is_admin: 1,
+        ..Default::default()
+    },
+    SessionView {
+        id: "mock_2".to_string(),
+        hostname: "MacBook-Pro".to_string(),
+        username: "qiaozhiyi".to_string(),
+        os: "Mac OS X".to_string(),
+        arch: 64,
+        pid: 3001,
+        is_admin: 0,
+        ..Default::default()
+    },
+    SessionView {
+        id: "mock_3".to_string(),
+        hostname: "ubuntu-server".to_string(),
+        username: "root".to_string(),
+        os: "Linux".to_string(),
+        arch: 64,
+        pid: 1,
+        is_admin: 1,
+        ..Default::default()
+    }
+]));
 static LOG_LINES: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 pub static CONSOLE: LazyLock<RwLock<std::collections::HashMap<String, Vec<String>>>> = LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
 pub static IS_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -188,24 +219,28 @@ script_mod! {
                 draw_text.color: Cprimary
                 draw_text.text_style: theme.font_regular{font_size: 13}
             }
+            v_line1 := View{show_bg: true width: 1 height: Fill draw_bg.color: Cborder}
             user := Label{
                 width: 112
                 text: "user"
                 draw_text.color: Csecond
                 draw_text.text_style: theme.font_regular{font_size: 13}
             }
+            v_line2 := View{show_bg: true width: 1 height: Fill draw_bg.color: Cborder}
             os := Label{
                 width: Fill
                 text: "os"
                 draw_text.color: Cmuted
                 draw_text.text_style: theme.font_regular{font_size: 13}
             }
+            v_line3 := View{show_bg: true width: 1 height: Fill draw_bg.color: Cborder}
             admin := Label{
                 width: 56
                 text: ""
                 draw_text.color: Cdanger
                 draw_text.text_style: theme.font_bold{font_size: theme.font_size_code}
             }
+            v_line4 := View{show_bg: true width: 1 height: Fill draw_bg.color: Cborder}
             pend := Label{
                 width: 44
                 text: "0"
@@ -221,6 +256,12 @@ script_mod! {
             draw_bg.color_down: #x00000000
             draw_bg.border_size: 0.0
             draw_text.color: #x00000000
+        }
+        bottom_line := View {
+            show_bg: true
+            width: Fill height: 1
+            margin: Inset{top: 29.0}
+            draw_bg.color: Cborder
         }
     }
 
@@ -239,21 +280,26 @@ script_mod! {
         // so it stays put while rows scroll beneath it. Column widths/gap/pad
         // MIRROR SessionRow.content exactly, so headers line up with the data.
         header := View{
+            show_bg: true
             width: Fill height: Fit
             flow: Down
             draw_bg.color: Celev
-            View{
+            h_cols := View{
                 width: Fill height: 30
                 padding: Inset{left: Cpad right: Cpad}
                 flow: Right spacing: Cgap
                 align: Align{y: 0.5}
-                Label{width: 160 text: "HOST" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 11}}
-                Label{width: 112 text: "USER" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 11}}
-                Label{width: Fill text: "OPERATING SYSTEM" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 11}}
-                Label{width: 56 text: "PRIV" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 11}}
-                Label{width: 44 text: "QUE" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 11}}
+                host_lbl := Label{width: 160 text: "HOST" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 11}}
+                hv_line1 := View{show_bg: true width: 1 height: Fill draw_bg.color: Cborder}
+                user_lbl := Label{width: 112 text: "USER" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 11}}
+                hv_line2 := View{show_bg: true width: 1 height: Fill draw_bg.color: Cborder}
+                os_lbl := Label{width: Fill text: "OPERATING SYSTEM" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 11}}
+                hv_line3 := View{show_bg: true width: 1 height: Fill draw_bg.color: Cborder}
+                priv_lbl := Label{width: 56 text: "PRIV" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 11}}
+                hv_line4 := View{show_bg: true width: 1 height: Fill draw_bg.color: Cborder}
+                que_lbl := Label{width: 44 text: "QUE" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 11}}
             }
-            View{width: Fill height: 1 draw_bg.color: Cborder}
+            bottom_border := View{show_bg: true width: Fill height: 1 draw_bg.color: Cborder}
         }
         list := PortalList{
             width: Fill height: Fill
@@ -448,20 +494,22 @@ script_mod! {
     mod.widgets.SessionGraph = set_type_default() do mod.widgets.SessionGraphBase{
         width: Fill height: Fill
         scroll_bars: mod.widgets.ScrollBars {show_scroll_x: false, show_scroll_y: true}
-        
-        Node := RoundedView {
-            width: 180 height: 40
-            flow: Right spacing: 8.0
-            align: Align{y: 0.5}
-            padding: Inset{left: 10.0}
-            draw_bg.color: Celev
-            draw_bg.border_radius: 8.0
-            draw_bg.border_size: 1.0
-            lbl := Label { text: "" draw_text.color: Cprimary draw_text.text_style: theme.font_bold{font_size: 11} }
+        Node := View {
+            width: 120 height: 90
+            flow: Down spacing: 4.0
+            align: Align{x: 0.5, y: 0.5}
+            
+            icon_view := View {
+                width: 40 height: 40
+                align: Align{x: 0.5, y: 0.5}
+                os_lbl := Label { text: "" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 11} }
+            }
+            lbl := Label { text: "" draw_text.color: Cprimary draw_text.text_style: theme.font_bold{font_size: 12} }
+            sub_lbl := Label { text: "" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: 10} }
         }
         
-        HLine := View { width: 0 height: 2 draw_bg.color: Caccent }
-        VLine := View { width: 2 height: 0 draw_bg.color: Caccent }
+        HLine := View { show_bg: true width: 0 height: 2 draw_bg.color: Caccent }
+        VLine := View { show_bg: true width: 2 height: 0 draw_bg.color: Caccent }
     }
 
     let app = startup() do #(App::script_component(vm)){
@@ -492,6 +540,7 @@ script_mod! {
                         flow: Down spacing: 0
                         draw_bg.color: Cpanel
                         connect_card := View{
+                            show_bg: true
                             width: Fill height: Fill
                             flow: Down
 
@@ -551,7 +600,7 @@ script_mod! {
                                     url_input := TextInput{
                                         width: Fill height: 28
                                         label_align: Align{y: 0.5}
-                                        padding: Inset{left: 12.0, right: 12.0}
+                                        padding: Inset{left: 12.0, right: 12.0, top: 4.0, bottom: 4.0}
                                         text: "http://127.0.0.1:8443"
                                         empty_text: "http://host:port"
                                         draw_bg.color: Cinput
@@ -588,7 +637,7 @@ script_mod! {
                                     alias_input := TextInput{
                                         width: Fill height: 28
                                         label_align: Align{y: 0.5}
-                                        padding: Inset{left: 12.0, right: 12.0}
+                                        padding: Inset{left: 12.0, right: 12.0, top: 4.0, bottom: 4.0}
                                         text: "operator"
                                         draw_bg.color: Cinput
                                         draw_bg.color_hover: Cinput
@@ -625,7 +674,7 @@ script_mod! {
                                         is_password: true
                                         width: Fill height: 28
                                         label_align: Align{y: 0.5}
-                                        padding: Inset{left: 12.0, right: 12.0}
+                                        padding: Inset{left: 12.0, right: 12.0, top: 4.0, bottom: 4.0}
                                         text: ""
                                         empty_text: "Enter Team Server Token"
                                         draw_bg.color: Cinput
@@ -673,7 +722,7 @@ script_mod! {
                                     padding: Inset{top: 0 bottom: 0 left: 0 right: 0}
                                     
                                     dialog_btn_theme := Button {
-                                        text: "CURRENT THEME: DARK"
+                                        text: "THEME: DARK"
                                         width: Fill height: Fill
                                         draw_bg.color: Cinput
                                         draw_bg.color_hover: Crowhov
@@ -712,14 +761,15 @@ script_mod! {
                         draw_bg.color: Cbg
 
                         menu_bar := View {
+                            show_bg: true
                             width: Fill height: 26
                             flow: Right spacing: 4.0
                             padding: Inset { left: 8.0 right: 8.0 }
                             align: Align{y: 0.5}
                             draw_bg.color: Cbar
                             
-                            menu_cobalt_strike := Button {
-                                text: "Cobalt Strike"
+                            menu_nyx := Button {
+                                text: "NYX"
                                 draw_bg.color: #x00000000
                                 draw_text.color: Cprimary
                                 draw_bg.border_size: 0.0
@@ -764,7 +814,6 @@ script_mod! {
                             align: Align{y: 0.5}
                             draw_bg.color: Cpanel
                             
-                            btn_disconnect := Button { text: "🚫 Disconnect" draw_bg.color: Cbar width: Fit height: 26 padding: Inset{left: 8.0 right: 8.0 top: 2.0 bottom: 2.0} draw_text.text_style: theme.font_regular{font_size: 11} }
                             div_1 := View { width: 1 height: 18 draw_bg.color: Cborder }
                             btn_table := Button { text: "📊 Sessions" draw_bg.color: Cbar width: Fit height: 26 padding: Inset{left: 8.0 right: 8.0 top: 2.0 bottom: 2.0} draw_text.text_style: theme.font_regular{font_size: 11} }
                             btn_graph := Button { text: "🕸️ Graph" draw_bg.color: Cbar width: Fit height: 26 padding: Inset{left: 8.0 right: 8.0 top: 2.0 bottom: 2.0} draw_text.text_style: theme.font_regular{font_size: 11} }
@@ -772,12 +821,24 @@ script_mod! {
                             btn_files := Button { text: "📁 Files" draw_bg.color: Cbar width: Fit height: 26 padding: Inset{left: 8.0 right: 8.0 top: 2.0 bottom: 2.0} draw_text.text_style: theme.font_regular{font_size: 11} }
                             btn_procs := Button { text: "⚙️ Processes" draw_bg.color: Cbar width: Fit height: 26 padding: Inset{left: 8.0 right: 8.0 top: 2.0 bottom: 2.0} draw_text.text_style: theme.font_regular{font_size: 11} }
                             btn_creds := Button { text: "🔑 Creds" draw_bg.color: Cbar width: Fit height: 26 padding: Inset{left: 8.0 right: 8.0 top: 2.0 bottom: 2.0} draw_text.text_style: theme.font_regular{font_size: 11} }
+                            btn_event_log := Button { text: "📋 Event Log" draw_bg.color: Cbar width: Fit height: 26 padding: Inset{left: 8.0 right: 8.0 top: 2.0 bottom: 2.0} draw_text.text_style: theme.font_regular{font_size: 11} }
+                            
+                            View { width: Fill height: 1 }
+                            main_btn_theme := Button { 
+                                text: "🌗" 
+                                draw_bg.color: Cbar 
+                                width: 26 height: 26 
+                                padding: Inset{left: 0.0 right: 0.0 top: 0.0 bottom: 0.0} 
+                                draw_text.text_style: theme.font_regular{font_size: 14} 
+                                draw_bg.border_radius: 13.0 
+                            }
                         }
 
                         div_tool := View { width: Fill height: 1 draw_bg.color: Cborder }
 
                     // ── connection bar ─────────────────────────────────────
-                    conn_bar := SolidView{
+                    conn_bar := View{
+                        show_bg: true
                         width: Fill height: 46
                         padding: Inset{left: 16.0 right: 16.0}
                         flow: Right spacing: 12.0
@@ -790,41 +851,45 @@ script_mod! {
                             draw_text.text_style: theme.font_bold{font_size: 16}
                         }
                         div_brand := View{width: 1 height: 20 draw_bg.color: Cborder}
-                        server_input := TextInput{
-                            width: 360 height: 30
-                            label_align: Align{y: 0.5}
-                            padding: Inset{left: 10.0, right: 10.0}
-                            text: "http://127.0.0.1:8443"
-                            empty_text: "team server URL"
-                            draw_bg.color: Cinput
-                            draw_bg.color_hover: Cinput
-                            draw_bg.color_focus: Cinput
-                            draw_bg.color_empty: Cinput
-                            draw_bg.border_color: Cinput_b
-                            draw_bg.border_color_hover: Cinput_b
-                            draw_bg.border_color_focus: Caccent
-                            draw_bg.border_color_empty: Cinput_b
-                            draw_bg.border_color_2: Cinput_b
-                            draw_bg.border_color_2_hover: Cinput_b
-                            draw_bg.border_color_2_focus: Caccent
-                            draw_bg.border_color_2_empty: Cinput_b
-                            draw_bg.border_size: 1.0
-                            draw_bg.border_radius: Cradius_s
-                            draw_text.color: Cprimary
-                            draw_text.color_hover: Cprimary
-                            draw_text.color_focus: Cprimary
-                            draw_text.color_empty: Cmuted
-                            draw_text.text_style: theme.font_code{font_size: 12}
-                            draw_cursor.color: Caccent
-                        }
-                        bar_connect_btn := Button{
-                            text: "Connect"
-                            width: 92 height: 30
-                            draw_bg.color: Caccent
-                            draw_bg.color_hover: Cacchov
-                            draw_bg.border_radius: Cradius
-                            draw_text.color: Cbg
-                            draw_text.text_style: theme.font_bold{font_size: 12}
+                        reconnect_group := View {
+                            width: Fit height: Fit
+                            flow: Right spacing: 12.0
+                            server_input := TextInput{
+                                width: 360 height: 30
+                                label_align: Align{y: 0.5}
+                                padding: Inset{left: 10.0, right: 10.0, top: 4.0, bottom: 4.0}
+                                text: "http://127.0.0.1:8443"
+                                empty_text: "team server URL"
+                                draw_bg.color: Cinput
+                                draw_bg.color_hover: Cinput
+                                draw_bg.color_focus: Cinput
+                                draw_bg.color_empty: Cinput
+                                draw_bg.border_color: Cinput_b
+                                draw_bg.border_color_hover: Cinput_b
+                                draw_bg.border_color_focus: Caccent
+                                draw_bg.border_color_empty: Cinput_b
+                                draw_bg.border_color_2: Cinput_b
+                                draw_bg.border_color_2_hover: Cinput_b
+                                draw_bg.border_color_2_focus: Caccent
+                                draw_bg.border_color_2_empty: Cinput_b
+                                draw_bg.border_size: 1.0
+                                draw_bg.border_radius: Cradius_s
+                                draw_text.color: Cprimary
+                                draw_text.color_hover: Cprimary
+                                draw_text.color_focus: Cprimary
+                                draw_text.color_empty: Cmuted
+                                draw_text.text_style: theme.font_code{font_size: 12}
+                                draw_cursor.color: Caccent
+                            }
+                            bar_connect_btn := Button{
+                                text: "Connect"
+                                width: 92 height: 30
+                                draw_bg.color: Caccent
+                                draw_bg.color_hover: Cacchov
+                                draw_bg.border_radius: Cradius
+                                draw_text.color: Cbg
+                                draw_text.text_style: theme.font_bold{font_size: 12}
+                            }
                         }
                         // Circular status indicator (border_radius = half size).
                         status_dot := View{
@@ -847,34 +912,6 @@ script_mod! {
                             text: "Disconnected"
                             draw_text.color: Cdanger
                             draw_text.text_style: theme.font_regular{font_size: 12}
-                        }
-                        // Spacer to push theme button to far right
-                        View{width: Fill height: 1}
-                        disconnect_btn := Button{
-                            text: "Disconnect"
-                            width: 96 height: 30
-                            draw_bg.color: Cdanger
-                            draw_bg.color_hover: #xF47070
-                            draw_bg.border_radius: Cradius
-                            draw_text.color: #xFFFFFF
-                            draw_text.text_style: theme.font_regular{font_size: 12}
-                        }
-                        theme_toggle_main := View {
-                            width: 160 height: 28
-                            flow: Right spacing: 0
-                            padding: Inset{top: 0 bottom: 0 left: 0 right: 0}
-                            
-                            main_btn_theme := Button {
-                                text: "CURRENT THEME: DARK"
-                                width: Fill height: Fill
-                                draw_bg.color: Cbar
-                                draw_bg.border_radius: 6.0
-                                draw_bg.border_color: Cborder
-                                draw_bg.border_size: 1.0
-                                draw_bg.color_hover: Crowhov
-                                draw_text.color: Cprimary
-                                draw_text.text_style: theme.font_code{font_size: 10}
-                            }
                         }
                     }
                     // hairline under connection bar
@@ -916,6 +953,81 @@ script_mod! {
                                     width: Fill height: Fill
                                     visible: false
                                     session_graph := mod.widgets.SessionGraph{}
+                                }
+                                pane_files := View{
+                                    width: Fill height: Fill
+                                    visible: false
+                                    flow: Down spacing: 0
+                                    // File browser toolbar.
+                                    View{
+                                        width: Fill height: 34
+                                        padding: Inset{left: 12.0 right: 12.0}
+                                        flow: Right spacing: 8.0
+                                        align: Align{y: 0.5}
+                                        draw_bg.color: Cpanel
+                                        path_input := TextInput{
+                                            width: 300 height: 26
+                                            label_align: Align{y: 0.5}
+                                            padding: Inset{left: 8.0, right: 8.0, top: 4.0, bottom: 4.0}
+                                            text: "."
+                                            empty_text: "Remote path"
+                                            draw_bg.color: Cinput
+                                            draw_bg.border_color: Cinput_b
+                                            draw_bg.border_color_focus: Caccent
+                                            draw_bg.border_size: 1.0
+                                            draw_bg.border_radius: 4.0
+                                            draw_text.color: Cprimary
+                                            draw_text.color_empty: Cmuted
+                                            draw_text.text_style: theme.font_code{font_size: 12}
+                                            draw_cursor.color: Caccent
+                                        }
+                                        ls_btn := Button{
+                                            text: "List"
+                                            width: 60 height: 26
+                                            draw_bg.color: Caccent
+                                            draw_bg.color_hover: Cacchov
+                                            draw_bg.border_radius: 4.0
+                                            draw_text.color: Cbg
+                                            draw_text.text_style: theme.font_bold{font_size: 11}
+                                        }
+                                    }
+                                    View{width: Fill height: 1 draw_bg.color: Cborder}
+                                    mod.widgets.FileTree{}
+                                }
+                                pane_procs := View{
+                                    width: Fill height: Fill
+                                    visible: false
+                                    flow: Down spacing: 0
+                                    // Processes toolbar.
+                                    View{
+                                        width: Fill height: 34
+                                        padding: Inset{left: 12.0 right: 12.0}
+                                        flow: Right spacing: 0
+                                        align: Align{y: 0.5}
+                                        draw_bg.color: Cpanel
+                                        ps_btn := Button{
+                                            text: "Refresh"
+                                            width: 76 height: 26
+                                            draw_bg.color: Caccent
+                                            draw_bg.color_hover: Cacchov
+                                            draw_bg.border_radius: 4.0
+                                            draw_text.color: Cbg
+                                            draw_text.text_style: theme.font_bold{font_size: 11}
+                                        }
+                                    }
+                                    View{width: Fill height: 1 draw_bg.color: Cborder}
+                                    mod.widgets.ProcessTable{}
+                                }
+                                pane_creds := View{
+                                    width: Fill height: Fill
+                                    visible: false
+                                    mod.widgets.CredTable{}
+                                }
+                                pane_event_log := View{
+                                    width: Fill height: Fill
+                                    visible: false
+                                    flow: Down spacing: 0
+                                    log_list := mod.widgets.LogList{}
                                 }
                             }
                         }
@@ -959,25 +1071,6 @@ script_mod! {
                                             visible: true
                                         }
                                     }
-                                    event_log_tab := View{
-                                        flow: Down width: 90 height: Fill
-                                        tab_event_log := Button{
-                                            text: "Event Log"
-                                            width: Fill height: 27
-                                            draw_bg.color: Cbar
-                                            draw_bg.color_hover: Crowhov
-                                            draw_bg.color_down: Crowhov
-                                            draw_bg.border_size: 0.0
-                                            draw_text.color: Cmuted
-                                            draw_text.color_hover: Cprimary
-                                            draw_text.text_style: theme.font_bold{font_size: 11}
-                                        }
-                                        line_event_log := View{
-                                            width: Fill height: 3
-                                            draw_bg.color: Caccent
-                                            visible: false
-                                        }
-                                    }
                                     bof_tab := View{
                                         flow: Down width: 64 height: Fill
                                         tab_bof := Button{
@@ -992,82 +1085,6 @@ script_mod! {
                                             draw_text.text_style: theme.font_bold{font_size: 11}
                                         }
                                         line_bof := View{
-                                            width: Fill height: 3
-                                            draw_bg.color: Caccent
-                                            visible: false
-                                        }
-                                    }
-                                    files_tab := View{
-                                        flow: Down width: 64 height: Fill
-                                        tab_files := Button{
-                                            text: "Files"
-                                            width: Fill height: 27
-                                            draw_bg.color: Cbar
-                                            draw_bg.color_hover: Crowhov
-                                            draw_bg.color_down: Crowhov
-                                            draw_bg.border_size: 0.0
-                                            draw_text.color: Cmuted
-                                            draw_text.color_hover: Cprimary
-                                            draw_text.text_style: theme.font_bold{font_size: 11}
-                                        }
-                                        line_files := View{
-                                            width: Fill height: 3
-                                            draw_bg.color: Caccent
-                                            visible: false
-                                        }
-                                    }
-                                    procs_tab := View{
-                                        flow: Down width: 96 height: Fill
-                                        tab_procs := Button{
-                                            text: "Processes"
-                                            width: Fill height: 27
-                                            draw_bg.color: Cbar
-                                            draw_bg.color_hover: Crowhov
-                                            draw_bg.color_down: Crowhov
-                                            draw_bg.border_size: 0.0
-                                            draw_text.color: Cmuted
-                                            draw_text.color_hover: Cprimary
-                                            draw_text.text_style: theme.font_bold{font_size: 11}
-                                        }
-                                        line_procs := View{
-                                            width: Fill height: 3
-                                            draw_bg.color: Caccent
-                                            visible: false
-                                        }
-                                    }
-                                    creds_tab := View{
-                                        flow: Down width: 104 height: Fill
-                                        tab_creds := Button{
-                                            text: "Credentials"
-                                            width: Fill height: 27
-                                            draw_bg.color: Cbar
-                                            draw_bg.color_hover: Crowhov
-                                            draw_bg.color_down: Crowhov
-                                            draw_bg.border_size: 0.0
-                                            draw_text.color: Cmuted
-                                            draw_text.color_hover: Cprimary
-                                            draw_text.text_style: theme.font_bold{font_size: 11}
-                                        }
-                                        line_creds := View{
-                                            width: Fill height: 3
-                                            draw_bg.color: Caccent
-                                            visible: false
-                                        }
-                                    }
-                                    graph_tab := View{
-                                        flow: Down width: 70 height: Fill
-                                        tab_graph := Button{
-                                            text: "Graph"
-                                            width: Fill height: 27
-                                            draw_bg.color: Cbar
-                                            draw_bg.color_hover: Crowhov
-                                            draw_bg.color_down: Crowhov
-                                            draw_bg.border_size: 0.0
-                                            draw_text.color: Cmuted
-                                            draw_text.color_hover: Cprimary
-                                            draw_text.text_style: theme.font_bold{font_size: 11}
-                                        }
-                                        line_graph := View{
                                             width: Fill height: 3
                                             draw_bg.color: Caccent
                                             visible: false
@@ -1144,7 +1161,7 @@ script_mod! {
                                         cmd_input := TextInput{
                                             width: Fill height: 26
                                             label_align: Align{y: 0.5}
-                                            padding: Inset{left: 8.0, right: 8.0}
+                                            padding: Inset{left: 8.0, right: 8.0, top: 4.0, bottom: 4.0}
                                             text: ""
                                             empty_text: "Enter command…"
                                             draw_bg.color: Cinput
@@ -1179,11 +1196,6 @@ script_mod! {
                                         }
                                     }
                                 }
-                                pane_event_log := View{
-                                    width: Fill height: Fill
-                                    visible: false
-                                    flow: Down spacing: 0
-                                    log_list := mod.widgets.LogList{}
                                 }
                                 pane_bof := View{
                                     width: Fill height: Fill
@@ -1202,7 +1214,7 @@ script_mod! {
                                             bof_name_input := TextInput{
                                                 width: 200 height: 26
                                                 label_align: Align{y: 0.5}
-                                                padding: Inset{left: 8.0, right: 8.0}
+                                                padding: Inset{left: 8.0, right: 8.0, top: 4.0, bottom: 4.0}
                                                 text: ""
                                                 empty_text: "BOF object name"
                                                 draw_bg.color: Cinput
@@ -1218,7 +1230,7 @@ script_mod! {
                                             bof_args_input := TextInput{
                                                 width: Fill height: 26
                                                 label_align: Align{y: 0.5}
-                                                padding: Inset{left: 8.0, right: 8.0}
+                                                padding: Inset{left: 8.0, right: 8.0, top: 4.0, bottom: 4.0}
                                                 text: ""
                                                 empty_text: "Arguments (space-separated)"
                                                 draw_bg.color: Cinput
@@ -1245,83 +1257,9 @@ script_mod! {
                                     }
                                     mod.widgets.BofPanel{}
                                 }
-                                pane_files := View{
-                                    width: Fill height: Fill
-                                    visible: false
-                                    flow: Down spacing: 0
-                                    // Files toolbar.
-                                    View{
-                                        width: Fill height: 34
-                                        padding: Inset{left: 12.0 right: 12.0}
-                                        flow: Right spacing: 8.0
-                                        align: Align{y: 0.5}
-                                        draw_bg.color: Cpanel
-                                        ls_path_input := TextInput{
-                                            width: Fill height: 26
-                                            label_align: Align{y: 0.5}
-                                            padding: Inset{left: 8.0, right: 8.0}
-                                            text: "."
-                                            empty_text: "Remote path"
-                                            draw_bg.color: Cinput
-                                            draw_bg.border_color: Cinput_b
-                                            draw_bg.border_color_focus: Caccent
-                                            draw_bg.border_size: 1.0
-                                            draw_bg.border_radius: 4.0
-                                            draw_text.color: Cprimary
-                                            draw_text.color_empty: Cmuted
-                                            draw_text.text_style: theme.font_code{font_size: 12}
-                                            draw_cursor.color: Caccent
-                                        }
-                                        ls_btn := Button{
-                                            text: "List"
-                                            width: 60 height: 26
-                                            draw_bg.color: Caccent
-                                            draw_bg.color_hover: Cacchov
-                                            draw_bg.border_radius: 4.0
-                                            draw_text.color: Cbg
-                                            draw_text.text_style: theme.font_bold{font_size: 11}
-                                        }
-                                    }
-                                    View{width: Fill height: 1 draw_bg.color: Cborder}
-                                    mod.widgets.FileTree{}
-                                }
-                                pane_procs := View{
-                                    width: Fill height: Fill
-                                    visible: false
-                                    flow: Down spacing: 0
-                                    // Processes toolbar.
-                                    View{
-                                        width: Fill height: 34
-                                        padding: Inset{left: 12.0 right: 12.0}
-                                        flow: Right spacing: 0
-                                        align: Align{y: 0.5}
-                                        draw_bg.color: Cpanel
-                                        ps_btn := Button{
-                                            text: "Refresh"
-                                            width: 76 height: 26
-                                            draw_bg.color: Caccent
-                                            draw_bg.color_hover: Cacchov
-                                            draw_bg.border_radius: 4.0
-                                            draw_text.color: Cbg
-                                            draw_text.text_style: theme.font_bold{font_size: 11}
-                                        }
-                                    }
-                                    View{width: Fill height: 1 draw_bg.color: Cborder}
-                                    mod.widgets.ProcessTable{}
-                                }
-                                pane_creds := View{
-                                    width: Fill height: Fill
-                                    visible: false
-                                    mod.widgets.CredTable{}
-                                }
-                                pane_graph := View{
-                                    width: Fill height: Fill
-                                    visible: false
-                                    mod.widgets.SessionGraph{}
-                                }
+
                             }
                         }
-                    }
                     } // close main_view
                 }
             }
@@ -1354,12 +1292,7 @@ pub struct App {
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Console,
-    EventLog,
     Bof,
-    Files,
-    Procs,
-    Creds,
-    Graph,
 }
 
 impl Default for Tab {
@@ -1493,8 +1426,8 @@ impl App {
         // Two static dots (one green, one red); toggle visibility. Avoids the
         // unverified `apply_over`/`live!` rust-side color API — uses only the
         // documented `.set_visible()` from the `todo` example.
-        self.ui.view(cx, ids!(dot_on)).set_visible(cx, connected);
-        self.ui.view(cx, ids!(dot_off)).set_visible(cx, !connected);
+        self.ui.view(cx, ids!(conn_bar)).set_visible(cx, !connected);
+        self.ui.view(cx, ids!(div_conn_bar)).set_visible(cx, !connected);
         self.ui
             .label(cx, ids!(status_text))
             .set_text(cx, if connected { "Connected" } else { "Disconnected" });
@@ -1601,11 +1534,18 @@ impl App {
         let cinput = p.input;
         let cinput_b = p.input_b;
         let cbtn_grad2 = p.btn_grad2;
+        let cwhite = vec4(1.0, 1.0, 1.0, 1.0);
 
         // 1. MainWindow clear_color
         let mut w = self.ui.window(cx, ids!(main_window));
         script_apply_eval!(cx, w, {
             pass +: { clear_color: #(cbg) }
+        });
+
+        // 1b. main_view background
+        let mut mv = self.ui.view(cx, ids!(main_view));
+        script_apply_eval!(cx, mv, {
+            draw_bg +: { color: #(cbg) }
         });
 
         // 2. Dialog backdrop — just the window clear color now (no network bg).
@@ -1660,38 +1600,45 @@ impl App {
 
         // 4. Buttons.
         let buttons = [
-            (ids!(bar_connect_btn), caccent, cacchov, cbg),
+            (ids!(bar_connect_btn), caccent, cacchov, cwhite),
         ];
         for (path, bg, bg_hov, fg) in buttons {
             let mut btn = self.ui.button(cx, path);
             script_apply_eval!(cx, btn, {
-                draw_bg +: { color: #(bg), color_hover: #(bg_hov) }
-                draw_text +: { color: #(fg) }
+                draw_bg +: { color: #(bg), color_hover: #(bg_hov), color_down: #(bg) }
+                draw_text +: { color: #(fg), color_hover: #(fg), color_down: #(fg) }
             });
         }
 
         // 4a. Theme Toggle controls
-        for view_path in [ids!(theme_toggle_dialog), ids!(theme_toggle_main)] {
-            let mut view = self.ui.view(cx, view_path);
-            script_apply_eval!(cx, view, {
-                draw_bg +: { color: #(cinput), border_color: #(cinput_b) }
-            });
-        }
+        let mut view = self.ui.view(cx, ids!(theme_toggle_dialog));
+        script_apply_eval!(cx, view, {
+            draw_bg +: { color: #(cinput), border_color: #(cinput_b) }
+        });
 
-        for path in [ids!(dialog_btn_theme), ids!(main_btn_theme)] {
-            let mut btn = self.ui.button(cx, path);
-            script_apply_eval!(cx, btn, {
-                draw_bg +: { color: #(cinput), color_hover: #(crowhov) }
-                draw_text +: { color: #(cprimary) }
-            });
-        }
+        let mut dialog_btn = self.ui.button(cx, ids!(dialog_btn_theme));
+        script_apply_eval!(cx, dialog_btn, {
+            draw_bg +: { color: #(cinput), color_hover: #(crowhov), color_down: #(crowhov) }
+            draw_text +: { color: #(cprimary), color_hover: #(cprimary), color_down: #(cprimary) }
+        });
 
         // 4b. Connect button gradient.
         let mut cbtn = self.ui.button(cx, ids!(dialog_connect_btn));
-        let btn_text_color = if is_dark { p.bg } else { p.elev };
         script_apply_eval!(cx, cbtn, {
-            draw_bg +: { color: #(caccent), color_2: #(cbtn_grad2), color_hover: #x0098FF, color_2_hover: #x007ACC, gradient_fill_horizontal: 1.0 }
-            draw_text +: { color: #(btn_text_color) }
+            draw_bg +: {
+                color: #(caccent),
+                color_2: #(cbtn_grad2),
+                color_hover: #(cacchov),
+                color_2_hover: #(cbtn_grad2),
+                color_down: #(caccent),
+                color_2_down: #(cbtn_grad2),
+                gradient_fill_horizontal: 1.0
+            }
+            draw_text +: {
+                color: #(cwhite),
+                color_hover: #(cwhite),
+                color_down: #(cwhite)
+            }
         });
 
         // 5. Dialog text: error status, wordmark/tagline/title, field labels.
@@ -1734,7 +1681,7 @@ impl App {
         // 7. Split panels & their section headers.
         let mut lp = self.ui.view(cx, ids!(left_panel));
         script_apply_eval!(cx, lp, {
-            draw_bg +: { color: #(cpanel) }
+            draw_bg +: { color: #(cpanel), border_color: #(cborder) }
         });
         let mut sh = self.ui.view(cx, ids!(sessions_header));
         script_apply_eval!(cx, sh, {
@@ -1749,10 +1696,6 @@ impl App {
             draw_text +: { color: #(cprimary) }
         });
 
-        let mut lp = self.ui.view(cx, ids!(left_panel));
-        script_apply_eval!(cx, lp, {
-            draw_bg +: { color: #(cpanel), border_color: #(cborder) }
-        });
         let mut cp = self.ui.view(cx, ids!(center_panel));
         script_apply_eval!(cx, cp, {
             draw_bg +: { color: #(cpanel), border_color: #(cborder) }
@@ -1765,18 +1708,13 @@ impl App {
         // Tab buttons + their active underlines.
         let tabs = [
             (ids!(tab_console), ids!(line_console)),
-            (ids!(tab_event_log), ids!(line_event_log)),
             (ids!(tab_bof), ids!(line_bof)),
-            (ids!(tab_files), ids!(line_files)),
-            (ids!(tab_procs), ids!(line_procs)),
-            (ids!(tab_creds), ids!(line_creds)),
-            (ids!(tab_graph), ids!(line_graph)),
         ];
         for (btn_path, line_path) in tabs {
             let mut btn = self.ui.button(cx, btn_path);
             script_apply_eval!(cx, btn, {
                 draw_bg +: { color: #(cbar), color_hover: #(crowhov), color_down: #(crowhov) }
-                draw_text +: { color: #(cprimary), color_hover: #(caccent) }
+                draw_text +: { color: #(cprimary), color_hover: #(caccent), color_down: #(caccent) }
             });
             let mut line = self.ui.view(cx, line_path);
             script_apply_eval!(cx, line, {
@@ -1818,8 +1756,8 @@ impl App {
         // Send button.
         let mut sb = self.ui.button(cx, ids!(send_btn));
         script_apply_eval!(cx, sb, {
-            draw_bg +: { color: #(caccent), color_hover: #(cacchov) }
-            draw_text +: { color: #(cbg) }
+            draw_bg +: { color: #(caccent), color_hover: #(cacchov), color_down: #(cacchov) }
+            draw_text +: { color: #(cbg), color_hover: #(cbg), color_down: #(cbg) }
         });
 
         // MenuBar styling
@@ -1828,7 +1766,7 @@ impl App {
             draw_bg +: { color: #(cbar) }
         });
         let menu_buttons = [
-            ids!(menu_cobalt_strike),
+            ids!(menu_nyx),
             ids!(menu_view),
             ids!(menu_attacks),
             ids!(menu_reporting),
@@ -1836,9 +1774,10 @@ impl App {
         ];
         for path in menu_buttons {
             let mut btn = self.ui.button(cx, path);
+            let text_color = if is_dark { vec4(1.0, 1.0, 1.0, 1.0) } else { cprimary };
             script_apply_eval!(cx, btn, {
                 draw_bg +: { color: #x00000000, color_hover: #(crowhov), color_down: #(crowhov), border_size: 0.0 }
-                draw_text +: { color: #(cprimary) }
+                draw_text +: { color: #(text_color), color_hover: #(text_color), color_down: #(text_color) }
             });
         }
 
@@ -1848,18 +1787,19 @@ impl App {
             draw_bg +: { color: #(cpanel) }
         });
         let toolbar_buttons = [
-            ids!(btn_disconnect),
             ids!(btn_table),
             ids!(btn_graph),
             ids!(btn_files),
             ids!(btn_procs),
             ids!(btn_creds),
+            ids!(btn_event_log),
+            ids!(main_btn_theme),
         ];
         for path in toolbar_buttons {
             let mut btn = self.ui.button(cx, path);
             script_apply_eval!(cx, btn, {
                 draw_bg +: { color: #(cbar), color_hover: #(crowhov), color_down: #(crowhov) }
-                draw_text +: { color: #(cprimary) }
+                draw_text +: { color: #(cprimary), color_hover: #(cprimary), color_down: #(cprimary) }
             });
         }
 
@@ -1872,7 +1812,6 @@ impl App {
             ids!(div_tool),
             ids!(div_1),
             ids!(div_2),
-            ids!(div_3),
         ];
         for path in dividers {
             let mut div = self.ui.view(cx, path);
@@ -1881,21 +1820,15 @@ impl App {
             });
         }
         
-        // 10. Toolbar buttons (ls, ps, bof_run, disconnect) and inputs.
-        let danger_color = p.danger;
-        let mut disc_btn = self.ui.button(cx, ids!(disconnect_btn));
-        script_apply_eval!(cx, disc_btn, {
-            draw_bg +: { color: #(danger_color) }
-            draw_text +: { color: #(p.elev) }
-        });
+        // 10. Toolbar buttons (ls, ps, bof_run) and inputs.
         for btn_path in [ids!(bof_run_btn), ids!(ls_btn), ids!(ps_btn)] {
             let mut btn = self.ui.button(cx, btn_path);
             script_apply_eval!(cx, btn, {
-                draw_bg +: { color: #(caccent), color_hover: #(cacchov) }
-                draw_text +: { color: #(cbg) }
+                draw_bg +: { color: #(caccent), color_hover: #(cacchov), color_down: #(cacchov) }
+                draw_text +: { color: #(cwhite), color_hover: #(cwhite), color_down: #(cwhite) }
             });
         }
-        for inp_path in [ids!(bof_name_input), ids!(bof_args_input), ids!(ls_path_input)] {
+        for inp_path in [ids!(bof_name_input), ids!(bof_args_input), ids!(path_input)] {
             let mut inp = self.ui.text_input(cx, inp_path);
             script_apply_eval!(cx, inp, {
                 draw_bg +: {
@@ -1918,12 +1851,7 @@ impl App {
         // use the verified `ids!()` macro rather than a runtime lookup.
         let panes = [
             (Tab::Console, ids!(pane_console)),
-            (Tab::EventLog, ids!(pane_event_log)),
             (Tab::Bof, ids!(pane_bof)),
-            (Tab::Files, ids!(pane_files)),
-            (Tab::Procs, ids!(pane_procs)),
-            (Tab::Creds, ids!(pane_creds)),
-            (Tab::Graph, ids!(pane_graph)),
         ];
         for (t, id) in panes {
             self.ui.view(cx, id).set_visible(cx, t == tab);
@@ -1931,12 +1859,7 @@ impl App {
         // Toggle the visibility of active tab gold underlines.
         let lines = [
             (Tab::Console, ids!(line_console)),
-            (Tab::EventLog, ids!(line_event_log)),
             (Tab::Bof, ids!(line_bof)),
-            (Tab::Files, ids!(line_files)),
-            (Tab::Procs, ids!(line_procs)),
-            (Tab::Creds, ids!(line_creds)),
-            (Tab::Graph, ids!(line_graph)),
         ];
         for (t, id) in lines {
             self.ui.view(cx, id).set_visible(cx, t == tab);
@@ -1947,12 +1870,25 @@ impl App {
 
 impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
-        self.is_dark = false;
-        IS_DARK.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.is_dark = std::env::var("NYX_START_DARK").is_ok();
+        IS_DARK.store(self.is_dark, std::sync::atomic::Ordering::Relaxed);
+        let label_text = if self.is_dark { "THEME: DARK" } else { "THEME: LIGHT" };
+        self.ui.button(cx, ids!(dialog_btn_theme)).set_text(cx, label_text);
+        self.ui.button(cx, ids!(main_btn_theme)).set_text(cx, label_text);
         self.set_status(cx, false);
         self.ui.window(cx, ids!(main_window)).resize(cx, dvec2(360.0, 480.0));
         self.apply_theme(cx);
         self.ui.redraw(cx);
+
+        if std::env::var("NYX_AUTO_CONNECT").is_ok() {
+            self.ensure_bridge();
+            if let Some(b) = &self.bridge {
+                let _ = b.from_ui.send(Cmd::Connect {
+                    server: "http://127.0.0.1:8443".to_string(),
+                    password: None,
+                });
+            }
+        }
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
@@ -1964,7 +1900,7 @@ impl MatchEvent for App {
             self.is_dark = !self.is_dark;
             IS_DARK.store(self.is_dark, std::sync::atomic::Ordering::Relaxed);
             
-            let label_text = if self.is_dark { "CURRENT THEME: DARK" } else { "CURRENT THEME: LIGHT" };
+            let label_text = if self.is_dark { "THEME: DARK" } else { "THEME: LIGHT" };
             self.ui.button(cx, ids!(dialog_btn_theme)).set_text(cx, label_text);
             self.ui.button(cx, ids!(main_btn_theme)).set_text(cx, label_text);
             
@@ -1976,35 +1912,41 @@ impl MatchEvent for App {
         if self.ui.button(cx, ids!(tab_console)).clicked(actions) {
             self.set_active_tab(cx, Tab::Console);
         }
-        if self.ui.button(cx, ids!(tab_event_log)).clicked(actions) {
-            self.set_active_tab(cx, Tab::EventLog);
-        }
         if self.ui.button(cx, ids!(tab_bof)).clicked(actions) {
             self.set_active_tab(cx, Tab::Bof);
         }
-        if self.ui.button(cx, ids!(tab_files)).clicked(actions) {
-            self.set_active_tab(cx, Tab::Files);
-        }
-        if self.ui.button(cx, ids!(tab_procs)).clicked(actions) {
-            self.set_active_tab(cx, Tab::Procs);
-        }
-        if self.ui.button(cx, ids!(tab_creds)).clicked(actions) {
-            self.set_active_tab(cx, Tab::Creds);
-        }
-        if self.ui.button(cx, ids!(tab_graph)).clicked(actions) {
-            self.set_active_tab(cx, Tab::Graph);
+        // Toolbar buttons click handlers (Top Pane visibility)
+        let top_panes = [
+            ids!(session_list_view),
+            ids!(session_graph_view),
+            ids!(pane_files),
+            ids!(pane_procs),
+            ids!(pane_creds),
+            ids!(pane_event_log),
+        ];
+
+        let mut clicked_toolbar = None;
+        if self.ui.button(cx, ids!(btn_table)).clicked(actions) { clicked_toolbar = Some(ids!(session_list_view)); }
+        else if self.ui.button(cx, ids!(btn_graph)).clicked(actions) { clicked_toolbar = Some(ids!(session_graph_view)); }
+        else if self.ui.button(cx, ids!(btn_files)).clicked(actions) { clicked_toolbar = Some(ids!(pane_files)); }
+        else if self.ui.button(cx, ids!(btn_procs)).clicked(actions) { clicked_toolbar = Some(ids!(pane_procs)); }
+        else if self.ui.button(cx, ids!(btn_creds)).clicked(actions) { clicked_toolbar = Some(ids!(pane_creds)); }
+        else if self.ui.button(cx, ids!(btn_event_log)).clicked(actions) { clicked_toolbar = Some(ids!(pane_event_log)); }
+
+        if let Some(target) = clicked_toolbar {
+            for &id in &top_panes {
+                self.ui.view(cx, id).set_visible(cx, id == target);
+            }
+            self.ui.redraw(cx);
         }
 
-        // Toolbar buttons click handlers
-        if self.ui.button(cx, ids!(btn_table)).clicked(actions) {
-            self.ui.view(cx, ids!(session_list_view)).set_visible(cx, true);
-            self.ui.view(cx, ids!(session_graph_view)).set_visible(cx, false);
-            self.ui.redraw(cx);
-        }
-        if self.ui.button(cx, ids!(btn_graph)).clicked(actions) {
-            self.ui.view(cx, ids!(session_list_view)).set_visible(cx, false);
-            self.ui.view(cx, ids!(session_graph_view)).set_visible(cx, true);
-            self.ui.redraw(cx);
+        // Top bar buttons dummy actions (so they do something)
+        let top_buttons = [ids!(menu_nyx), ids!(menu_view), ids!(menu_attacks), ids!(menu_reporting), ids!(menu_help)];
+        for id in top_buttons {
+            if self.ui.button(cx, id).clicked(actions) {
+                // For now just redraw to register the click visually
+                self.ui.redraw(cx);
+            }
         }
 
         // ── Connect dialog (the dedicated connect window) ────────────────
@@ -2166,7 +2108,7 @@ impl MatchEvent for App {
             if sel != usize::MAX {
                 let session_id = SESSIONS.read().unwrap().get(sel).map(|s| s.id.clone());
                 if let Some(sid) = session_id {
-                    let path = self.ui.text_input(cx, ids!(ls_path_input)).text();
+                    let path = self.ui.text_input(cx, ids!(path_input)).text();
                     self.ensure_bridge();
                     if let Some(b) = &self.bridge {
                         let _ = b.from_ui.send(Cmd::Ls {
@@ -2201,23 +2143,7 @@ impl MatchEvent for App {
             self.ui.redraw(cx);
         }
 
-        // Disconnect button.
-        if self.ui.button(cx, ids!(disconnect_btn)).clicked(actions) || self.ui.button(cx, ids!(btn_disconnect)).clicked(actions) {
-            if let Some(b) = &self.bridge {
-                let _ = b.from_ui.send(Cmd::Shutdown);
-            }
-            self.bridge = None;
-            self.has_connected = false;
-            self.selected = None;
-            SELECTED_SESSION.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
-            *SESSIONS.write().unwrap() = Vec::new();
-            self.ui.view(cx, ids!(connect_view)).set_visible(cx, true);
-            self.ui.view(cx, ids!(main_view)).set_visible(cx, false);
-            self.ui.window(cx, ids!(main_window)).resize(cx, dvec2(360.0, 480.0));
-            self.set_status(cx, false);
-            self.apply_theme(cx);
-            self.ui.redraw(cx);
-        }
+        // Disconnect button removed.
 
 
         // Session row selection. `items_with_actions` only yields rows whose
@@ -2283,6 +2209,43 @@ struct SessionList {
 impl Widget for SessionList {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         let sessions = SESSIONS.read().unwrap().clone();
+        let p = Palette::current();
+        
+        let mut header = self.view.view(cx, ids!(header));
+        script_apply_eval!(cx, header, {
+            draw_bg +: { color: #(p.elev) }
+        });
+        
+        let mut host_lbl = self.view.label(cx, ids!(header.h_cols.host_lbl));
+        script_apply_eval!(cx, host_lbl, { draw_text +: { color: #(p.muted) } });
+        
+        let mut user_lbl = self.view.label(cx, ids!(header.h_cols.user_lbl));
+        script_apply_eval!(cx, user_lbl, { draw_text +: { color: #(p.muted) } });
+        
+        let mut os_lbl = self.view.label(cx, ids!(header.h_cols.os_lbl));
+        script_apply_eval!(cx, os_lbl, { draw_text +: { color: #(p.muted) } });
+        
+        let mut priv_lbl = self.view.label(cx, ids!(header.h_cols.priv_lbl));
+        script_apply_eval!(cx, priv_lbl, { draw_text +: { color: #(p.muted) } });
+        
+        let mut que_lbl = self.view.label(cx, ids!(header.h_cols.que_lbl));
+        script_apply_eval!(cx, que_lbl, { draw_text +: { color: #(p.muted) } });
+        
+        let mut hv_line1 = self.view.view(cx, ids!(header.h_cols.hv_line1));
+        script_apply_eval!(cx, hv_line1, { draw_bg +: { color: #(p.border) } });
+        
+        let mut hv_line2 = self.view.view(cx, ids!(header.h_cols.hv_line2));
+        script_apply_eval!(cx, hv_line2, { draw_bg +: { color: #(p.border) } });
+        
+        let mut hv_line3 = self.view.view(cx, ids!(header.h_cols.hv_line3));
+        script_apply_eval!(cx, hv_line3, { draw_bg +: { color: #(p.border) } });
+        
+        let mut hv_line4 = self.view.view(cx, ids!(header.h_cols.hv_line4));
+        script_apply_eval!(cx, hv_line4, { draw_bg +: { color: #(p.border) } });
+
+        let mut bottom_border = self.view.view(cx, ids!(header.bottom_border));
+        script_apply_eval!(cx, bottom_border, { draw_bg +: { color: #(p.border) } });
+
         while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = step.as_portal_list().borrow_mut() {
                 if sessions.is_empty() {
@@ -2308,7 +2271,6 @@ impl Widget for SessionList {
 
                         // Repaint the row from the single Palette source so the
                         // Light/Dark toggle matches apply_theme exactly.
-                        let p = Palette::current();
                         let row_color = if item_id == sel { p.rowsel } else { p.row };
                         let mut row_item = item.clone();
                         script_apply_eval!(cx, row_item, {
@@ -2335,6 +2297,22 @@ impl Widget for SessionList {
                         let mut pend = item.label(cx, ids!(content.pend));
                         script_apply_eval!(cx, pend, { draw_text +: { color: #(p.accent) } });
                         pend.set_text(cx, &s.pending.to_string());
+
+                        let mut v_line1 = item.view(cx, ids!(content.v_line1));
+                        script_apply_eval!(cx, v_line1, { draw_bg +: { color: #(p.border) } });
+                        
+                        let mut v_line2 = item.view(cx, ids!(content.v_line2));
+                        script_apply_eval!(cx, v_line2, { draw_bg +: { color: #(p.border) } });
+                        
+                        let mut v_line3 = item.view(cx, ids!(content.v_line3));
+                        script_apply_eval!(cx, v_line3, { draw_bg +: { color: #(p.border) } });
+                        
+                        let mut v_line4 = item.view(cx, ids!(content.v_line4));
+                        script_apply_eval!(cx, v_line4, { draw_bg +: { color: #(p.border) } });
+
+                        let mut bottom_line = item.view(cx, ids!(bottom_line));
+                        script_apply_eval!(cx, bottom_line, { draw_bg +: { color: #(p.border) } });
+
                         item.draw_all_unscoped(cx);
                     }
                 }
@@ -2358,12 +2336,12 @@ struct LogList {
 
 impl Widget for LogList {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let lines = LOG_LINES.read().unwrap().clone();
+        let lines_guard = LOG_LINES.read().unwrap_or_else(|e| e.into_inner());
         while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = step.as_portal_list().borrow_mut() {
-                list.set_item_range(cx, 0, lines.len());
+                list.set_item_range(cx, 0, lines_guard.len());
                 while let Some(item_id) = list.next_visible_item(cx) {
-                    let Some(line) = lines.get(item_id) else { continue };
+                    let Some(line) = lines_guard.get(item_id) else { continue };
                     let item = list.item(cx, item_id, id!(Item));
 
                     // Repaint the log row from the Palette source.
