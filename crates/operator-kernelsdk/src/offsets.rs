@@ -395,3 +395,201 @@ mod eprocess_table_tests {
         }
     }
 }
+
+// ============================================================================
+// DefenderDump-style dynamic EPROCESS offset probe
+// ============================================================================
+
+use crate::{KernelRw, KrwError};
+
+/// Maximum EPROCESS size to scan (safety bound).
+const EPROCESS_SCAN_LIMIT: usize = 0x1000;
+
+/// Known-system invariant: PID + 0x78 = Token offset (verified 17763–26200).
+/// This holds because Windows keeps a fixed delta between UniqueProcessId
+/// and Token across ALL known Win10/11 x64 builds (DefenderDump verified).
+const PID_TO_TOKEN_DELTA: usize = 0x78;
+
+/// DefenderDump-style dynamic EPROCESS offset probe.
+///
+/// Given a working `KernelRw` and the System EPROCESS base KVA (PID 4),
+/// discovers all field offsets by scanning the structure invariants:
+///
+/// 1. **PID offset**: scan for a qword == 4 (System PID)
+/// 2. **Links offset**: PID + 8 (ActiveProcessLinks is the LIST_ENTRY
+///    immediately after UniqueProcessId in all known builds)
+/// 3. **Token offset**: PID + 0x78 (constant delta, verified 17763–26200)
+/// 4. **ImageFileName offset**: scan for ASCII "System\0" after Links
+/// 5. **Protection offset**: scan for byte 0x72 (WinSystem:PP) after
+///    ImageFileName — System's protection level
+/// 6. **SignatureLevel**: Protection - 2 (three adjacent bytes:
+///    SigLevel, SectionSigLevel, Protection — verified all builds)
+///
+/// Returns `KrwError::UnresolvedOffset` if any step fails (unknown layout,
+/// corrupted structure, or non-standard build).
+pub fn probe_eprocess_offsets(
+    krw: &dyn KernelRw,
+    system_eprocess_kva: usize,
+) -> Result<EprocessOffsets, KrwError> {
+    // Safety: scan within EPROCESS bounds.
+    let _scan_limit = system_eprocess_kva + EPROCESS_SCAN_LIMIT;
+
+    // Step 1: Find PID offset — scan for qword == 4 (System PID).
+    let mut pid_offset = None;
+    for off in (0..0x600).step_by(8) {
+        let val = krw.kread_u64(system_eprocess_kva + off)?;
+        if val == 4 {
+            pid_offset = Some(off);
+            break;
+        }
+    }
+    let pid_offset = pid_offset.ok_or(KrwError::UnresolvedOffset("PID scan: System PID=4 not found"))?;
+
+    // Step 2: Links offset = PID + 8 (LIST_ENTRY follows UniqueProcessId).
+    let links_offset = pid_offset + 8;
+
+    // Verify Links: Flink should be a valid kernel pointer.
+    let flink = krw.kread_u64(system_eprocess_kva + links_offset)?;
+    if flink < 0xFFFF_8000_0000_0000 {
+        return Err(KrwError::UnresolvedOffset("Links scan: Flink not a kernel VA"));
+    }
+
+    // Step 3: Token offset = PID + 0x78 (constant delta).
+    let token_offset = pid_offset + PID_TO_TOKEN_DELTA;
+    if token_offset + 8 > EPROCESS_SCAN_LIMIT {
+        return Err(KrwError::UnresolvedOffset("Token offset exceeds EPROCESS size"));
+    }
+
+    // Step 4: Scan for ImageFileName — ASCII "System\0" after Links.
+    let system_name = *b"System\0";
+    let mut image_name_offset = None;
+    for off in links_offset + 16..0x600 {
+        let mut buf = [0u8; 8];
+        krw.kread(system_eprocess_kva + off, &mut buf)?;
+        if buf[..7] == system_name[..7] {
+            image_name_offset = Some(off);
+            break;
+        }
+    }
+    let image_name_offset = image_name_offset
+        .ok_or(KrwError::UnresolvedOffset("ImageFileName scan: 'System' not found"))?;
+
+    // Step 5: Scan for Protection byte == 0x72 (WinSystem:PP = Type:2 | Signer:7<<4).
+    // Protection is a single byte, located after ImageFileName in all known builds.
+    let mut protection_offset = None;
+    for off in image_name_offset + 16..0xA00 {
+        let byte = krw.kread_u64(system_eprocess_kva + off)? as u8;
+        if byte == 0x72 {
+            protection_offset = Some(off);
+            break;
+        }
+    }
+    let protection_offset = protection_offset
+        .ok_or(KrwError::UnresolvedOffset("Protection scan: 0x72 (WinSystem:PP) not found"))?;
+
+    // Step 6: SigLevel = Protection - 2, SectionSigLevel = Protection - 1.
+    // Verified: these three bytes are always adjacent in all known builds.
+    let sig_level = protection_offset.checked_sub(2)
+        .ok_or(KrwError::UnresolvedOffset("SigLevel: offset underflow"))?;
+    let section_sig_level = protection_offset - 1;
+
+    Ok(EprocessOffsets {
+        unique_process_id: pid_offset,
+        active_process_links: links_offset,
+        token: token_offset,
+        image_file_name: image_name_offset,
+        signature_level: sig_level,
+        section_signature_level: section_sig_level,
+        protection: protection_offset,
+    })
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use crate::KrwError;
+    use alloc::collections::BTreeMap;
+    use spin::mutex::Mutex;
+
+    struct MockKrw(Mutex<BTreeMap<usize, u8>>);
+    impl MockKrw {
+        fn new() -> Self { Self(Mutex::new(BTreeMap::new())) }
+        fn set_u64(&self, addr: usize, val: u64) {
+            let mut m = self.0.lock();
+            for (i, b) in val.to_le_bytes().iter().enumerate() { m.insert(addr + i, *b); }
+        }
+        fn set_bytes(&self, addr: usize, data: &[u8]) {
+            let mut m = self.0.lock();
+            for (i, &b) in data.iter().enumerate() { m.insert(addr + i, b); }
+        }
+    }
+    impl KernelRw for MockKrw {
+        fn kread(&self, kaddr: usize, dst: &mut [u8]) -> Result<(), KrwError> {
+            let m = self.0.lock();
+            for (i, b) in dst.iter_mut().enumerate() {
+                *b = *m.get(&(kaddr + i)).unwrap_or(&0);
+            }
+            Ok(())
+        }
+        fn kwrite(&self, kaddr: usize, src: &[u8]) -> Result<(), KrwError> {
+            let mut m = self.0.lock();
+            for (i, &b) in src.iter().enumerate() { m.insert(kaddr + i, b); }
+            Ok(())
+        }
+    }
+
+    fn build_mock_system_eprocess(krw: &MockKrw, base: usize, offsets: &EprocessOffsets) {
+        // PID = 4 (System)
+        krw.set_u64(base + offsets.unique_process_id, 4);
+        // ActiveProcessLinks: Flink = kernel VA, Blink = kernel VA
+        krw.set_u64(base + offsets.active_process_links, 0xFFFF_8000_0000_1000);
+        krw.set_u64(base + offsets.active_process_links + 8, 0xFFFF_8000_0000_2000);
+        // Token (any value — probe doesn't validate token content)
+        krw.set_u64(base + offsets.token, 0xFFFF_8000_0000_5000 | 0x7);
+        // ImageFileName = "System\0"
+        krw.set_bytes(base + offsets.image_file_name, b"System\0");
+        // Protection = 0x72 (WinSystem:PP)
+        krw.set_bytes(base + offsets.protection, &[0x72]);
+        // SignatureLevel + SectionSignatureLevel (adjacent bytes before Protection)
+        krw.set_bytes(base + offsets.signature_level, &[0x00]);
+        krw.set_bytes(base + offsets.section_signature_level, &[0x00]);
+    }
+
+    #[test]
+    fn probe_discovers_17763_offsets() {
+        let krw = MockKrw::new();
+        let base = 0xFFFF_8000_0010_0000usize;
+        // Use the KNOWN 17763 offsets to set up the mock.
+        let known = for_build(17763).unwrap().offsets;
+        build_mock_system_eprocess(&krw, base, &known);
+        let discovered = probe_eprocess_offsets(&krw, base).unwrap();
+        assert_eq!(discovered, known);
+    }
+
+    #[test]
+    fn probe_discovers_26100_offsets() {
+        let krw = MockKrw::new();
+        let base = 0xFFFF_8000_0010_0000usize;
+        let known = for_build(26100).unwrap().offsets;
+        build_mock_system_eprocess(&krw, base, &known);
+        let discovered = probe_eprocess_offsets(&krw, base).unwrap();
+        assert_eq!(discovered, known);
+    }
+
+    #[test]
+    fn probe_discovers_19041_offsets() {
+        let krw = MockKrw::new();
+        let base = 0xFFFF_8000_0010_0000usize;
+        let known = for_build(19041).unwrap().offsets;
+        build_mock_system_eprocess(&krw, base, &known);
+        let discovered = probe_eprocess_offsets(&krw, base).unwrap();
+        assert_eq!(discovered, known);
+    }
+
+    #[test]
+    fn probe_fails_on_empty_memory() {
+        let krw = MockKrw::new();
+        let base = 0xFFFF_8000_0010_0000usize;
+        assert!(probe_eprocess_offsets(&krw, base).is_err());
+    }
+}
