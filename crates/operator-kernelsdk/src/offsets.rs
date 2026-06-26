@@ -13,6 +13,8 @@
 //! patches that restructured structs mid-build (ETW GUID entry, EPROCESS
 //! Protection position drifted across Win10/11).
 
+use alloc::vec::Vec;
+
 // ============================================================================
 // EPROCESS — build 17763 x64 (struct size 0x850)
 // Sources: Vergilius _EPROCESS 1809, EDRSandblast NtoskrnlOffsets.csv,
@@ -38,6 +40,126 @@ pub mod eprocess {
     /// `Protection` — PS_PROTECTION (1 byte, bit-packed). Zeroing this Level
     /// byte strips PPL. (17763: 0x6ca. 0x6fa is 19H1, not Win11.)
     pub const PROTECTION: usize = 0x6ca;
+}
+
+/// EPROCESS field offsets for one Windows build.
+/// Cross-checked against EDRSandblast CSV + Vergilius _EPROCESS layouts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EprocessOffsets {
+    pub unique_process_id: usize,
+    pub active_process_links: usize,
+    pub token: usize,
+    pub image_file_name: usize,
+    pub signature_level: usize,
+    pub section_signature_level: usize,
+    pub protection: usize,
+}
+
+/// A known build's EPROCESS offsets, keyed by the Windows build number.
+#[derive(Clone, Copy, Debug)]
+pub struct EprocessBuild {
+    pub build: u32,
+    pub offsets: EprocessOffsets,
+}
+
+pub const KNOWN_EPROCESS_BUILDS: &[EprocessBuild] = &[
+    // Win10 1507 (10240)
+    EprocessBuild { build: 10240, offsets: EprocessOffsets {
+        unique_process_id: 0x2e0, active_process_links: 0x2e8,
+        token: 0x358, image_file_name: 0x450,
+        signature_level: 0x6c0, section_signature_level: 0x6c1, protection: 0x6c2,
+    }},
+    // Win10 1511 (10586) — PID shifted +8 from 1507
+    EprocessBuild { build: 10586, offsets: EprocessOffsets {
+        unique_process_id: 0x2e8, active_process_links: 0x2f0,
+        token: 0x358, image_file_name: 0x450,
+        signature_level: 0x6c0, section_signature_level: 0x6c1, protection: 0x6c2,
+    }},
+    // Win10 1607 (14393) — PID back to 0x2e0
+    EprocessBuild { build: 14393, offsets: EprocessOffsets {
+        unique_process_id: 0x2e0, active_process_links: 0x2e8,
+        token: 0x358, image_file_name: 0x450,
+        signature_level: 0x6c0, section_signature_level: 0x6c1, protection: 0x6c2,
+    }},
+    // Win10 1703 (15063) — Protection shifted to 0x6ca
+    EprocessBuild { build: 15063, offsets: EprocessOffsets {
+        unique_process_id: 0x2e0, active_process_links: 0x2e8,
+        token: 0x358, image_file_name: 0x450,
+        signature_level: 0x6c8, section_signature_level: 0x6c9, protection: 0x6ca,
+    }},
+    // Win10 1709 (16299) — same as 1703
+    EprocessBuild { build: 16299, offsets: EprocessOffsets {
+        unique_process_id: 0x2e0, active_process_links: 0x2e8,
+        token: 0x358, image_file_name: 0x450,
+        signature_level: 0x6c8, section_signature_level: 0x6c9, protection: 0x6ca,
+    }},
+    // Win10 1803 (17134) — Token shifted to 0x3f8, PEB to 0x3f8
+    EprocessBuild { build: 17134, offsets: EprocessOffsets {
+        unique_process_id: 0x2e0, active_process_links: 0x2e8,
+        token: 0x3f8, image_file_name: 0x450,
+        signature_level: 0x6c8, section_signature_level: 0x6c9, protection: 0x6ca,
+    }},
+    // Win10 1809 / Server 2019 (17763) — code-verified: matches existing offsets.rs
+    EprocessBuild { build: 17763, offsets: EprocessOffsets {
+        unique_process_id: 0x2e0, active_process_links: 0x2e8,
+        token: 0x358, image_file_name: 0x450,
+        signature_level: 0x6c8, section_signature_level: 0x6c9, protection: 0x6ca,
+    }},
+    // Win10 1903 (18362) — fields shifted +8 from 1809
+    EprocessBuild { build: 18362, offsets: EprocessOffsets {
+        unique_process_id: 0x2e8, active_process_links: 0x2f0,
+        token: 0x360, image_file_name: 0x450,
+        signature_level: 0x6f8, section_signature_level: 0x6f9, protection: 0x6fa,
+    }},
+    // Win10 2004 (19041) — same EPROCESS as 1903
+    EprocessBuild { build: 19041, offsets: EprocessOffsets {
+        unique_process_id: 0x2e8, active_process_links: 0x2f0,
+        token: 0x360, image_file_name: 0x450,
+        signature_level: 0x6f8, section_signature_level: 0x6f9, protection: 0x6fa,
+    }},
+    // Server 2022 (20348) — major shift: PID→0x440
+    EprocessBuild { build: 20348, offsets: EprocessOffsets {
+        unique_process_id: 0x440, active_process_links: 0x448,
+        token: 0x4b8, image_file_name: 0x5a0,
+        signature_level: 0x878, section_signature_level: 0x879, protection: 0x87a,
+    }},
+    // Win11 22H2 (22621)
+    EprocessBuild { build: 22621, offsets: EprocessOffsets {
+        unique_process_id: 0x440, active_process_links: 0x448,
+        token: 0x4b8, image_file_name: 0x5a0,
+        signature_level: 0x878, section_signature_level: 0x879, protection: 0x87a,
+    }},
+    // Win11 23H2 (22631) — same as 22H2
+    EprocessBuild { build: 22631, offsets: EprocessOffsets {
+        unique_process_id: 0x440, active_process_links: 0x448,
+        token: 0x4b8, image_file_name: 0x5a0,
+        signature_level: 0x878, section_signature_level: 0x879, protection: 0x87a,
+    }},
+    // Win11 24H2 (26100) — CET default, EPROCESS restructured
+    EprocessBuild { build: 26100, offsets: EprocessOffsets {
+        unique_process_id: 0x450, active_process_links: 0x458,
+        token: 0x4c8, image_file_name: 0x5a8,
+        signature_level: 0x87c, section_signature_level: 0x87d, protection: 0x87e,
+    }},
+    // Win11 25H2 (26200) — same as 24H2
+    EprocessBuild { build: 26200, offsets: EprocessOffsets {
+        unique_process_id: 0x450, active_process_links: 0x458,
+        token: 0x4c8, image_file_name: 0x5a8,
+        signature_level: 0x87c, section_signature_level: 0x87d, protection: 0x87e,
+    }},
+];
+
+/// Look up EPROCESS offsets for a Windows build number. Returns the closest
+/// known build ≤ the requested one (floor match). None if below all known builds.
+pub fn for_build(build: u32) -> Option<&'static EprocessBuild> {
+    KNOWN_EPROCESS_BUILDS.iter().find(|b| b.build == build).or_else(|| {
+        KNOWN_EPROCESS_BUILDS.iter().filter(|b| b.build <= build).max_by_key(|b| b.build)
+    })
+}
+
+/// All known build numbers (for diagnostics / selftest).
+pub fn known_builds() -> Vec<u32> {
+    KNOWN_EPROCESS_BUILDS.iter().map(|b| b.build).collect()
 }
 
 /// PS_PROTECTION bit layout (the byte at EPROCESS+0x6ca).
@@ -220,5 +342,56 @@ mod tests {
         assert!(eprocess::TOKEN + 8 <= 0x850);
         assert!(eprocess::PROTECTION + 1 <= 0x850);
         assert!(eprocess::SIGNATURE_LEVEL + 1 <= 0x850);
+    }
+}
+
+#[cfg(test)]
+mod eprocess_table_tests {
+    use super::*;
+
+    #[test]
+    fn build_17763_matches_hardcoded_constants() {
+        let b = for_build(17763).unwrap();
+        assert_eq!(b.offsets.unique_process_id, eprocess::UNIQUE_PROCESS_ID);
+        assert_eq!(b.offsets.active_process_links, eprocess::ACTIVE_PROCESS_LINKS);
+        assert_eq!(b.offsets.token, eprocess::TOKEN);
+        assert_eq!(b.offsets.protection, eprocess::PROTECTION);
+        assert_eq!(b.offsets.signature_level, eprocess::SIGNATURE_LEVEL);
+    }
+
+    #[test]
+    fn floor_match_for_patch_builds() {
+        // 19045 (22H2) should floor-match to 19041
+        let b = for_build(19045).unwrap();
+        assert_eq!(b.build, 19041);
+        // 22630 should floor-match to 22621
+        let b = for_build(22630).unwrap();
+        assert_eq!(b.build, 22621);
+    }
+
+    #[test]
+    fn unknown_build_below_range_returns_none() {
+        assert!(for_build(9600).is_none());
+    }
+
+    #[test]
+    fn all_builds_have_nonzero_offsets_within_range() {
+        for b in KNOWN_EPROCESS_BUILDS {
+            assert!(b.offsets.unique_process_id > 0);
+            assert!(b.offsets.active_process_links > b.offsets.unique_process_id);
+            assert!(b.offsets.token > 0);
+            assert!(b.offsets.protection > 0x400);
+            // SignatureLevel and SectionSignatureLevel are adjacent, Protection = SectionSigLevel + 1
+            assert_eq!(b.offsets.section_signature_level, b.offsets.signature_level + 1);
+            assert_eq!(b.offsets.protection, b.offsets.section_signature_level + 1);
+        }
+    }
+
+    #[test]
+    fn covers_all_major_releases() {
+        let builds = known_builds();
+        for &expected in &[10240, 14393, 17763, 19041, 20348, 22621, 26100, 26200] {
+            assert!(builds.contains(&expected), "missing build {expected}");
+        }
     }
 }
