@@ -69,10 +69,10 @@ pub const KNOWN_EPROCESS_BUILDS: &[EprocessBuild] = &[
         token: 0x358, image_file_name: 0x450,
         signature_level: 0x6c0, section_signature_level: 0x6c1, protection: 0x6c2,
     }},
-    // Win10 1511 (10586) — PID shifted +8 from 1507
+    // Win10 1511 (10586) — PID shifted +8 from 1507, Token maintains +0x78 delta
     EprocessBuild { build: 10586, offsets: EprocessOffsets {
         unique_process_id: 0x2e8, active_process_links: 0x2f0,
-        token: 0x358, image_file_name: 0x450,
+        token: 0x360, image_file_name: 0x450,
         signature_level: 0x6c0, section_signature_level: 0x6c1, protection: 0x6c2,
     }},
     // Win10 1607 (14393) — PID back to 0x2e0
@@ -93,10 +93,10 @@ pub const KNOWN_EPROCESS_BUILDS: &[EprocessBuild] = &[
         token: 0x358, image_file_name: 0x450,
         signature_level: 0x6c8, section_signature_level: 0x6c9, protection: 0x6ca,
     }},
-    // Win10 1803 (17134) — Token shifted to 0x3f8, PEB to 0x3f8
+    // Win10 1803 (17134) — Token maintains +0x78 delta from PID
     EprocessBuild { build: 17134, offsets: EprocessOffsets {
         unique_process_id: 0x2e0, active_process_links: 0x2e8,
-        token: 0x3f8, image_file_name: 0x450,
+        token: 0x358, image_file_name: 0x450,
         signature_level: 0x6c8, section_signature_level: 0x6c9, protection: 0x6ca,
     }},
     // Win10 1809 / Server 2019 (17763) — code-verified: matches existing offsets.rs
@@ -591,5 +591,22 @@ mod probe_tests {
         let krw = MockKrw::new();
         let base = 0xFFFF_8000_0010_0000usize;
         assert!(probe_eprocess_offsets(&krw, base).is_err());
+    }
+
+    /// Cross-validates the probe against every build in KNOWN_EPROCESS_BUILDS.
+    #[test]
+    fn probe_discovers_all_known_builds() {
+        for entry in KNOWN_EPROCESS_BUILDS {
+            let krw = MockKrw::new();
+            let base = 0xFFFF_8000_0010_0000usize;
+            build_mock_system_eprocess(&krw, base, &entry.offsets);
+            let discovered = probe_eprocess_offsets(&krw, base)
+                .unwrap_or_else(|e| panic!("probe failed for build {}: {:?}", entry.build, e));
+            assert_eq!(
+                discovered, entry.offsets,
+                "probe returned wrong offsets for build {}",
+                entry.build,
+            );
+        }
     }
 }
