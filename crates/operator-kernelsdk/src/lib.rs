@@ -65,10 +65,17 @@ pub mod etwti;
 /// ntoskrnl symbol resolution are real and unit-tested; the driver LOAD step
 /// is operator-side and never runs on this host.
 pub mod byovd;
-/// Version-pinned kernel structure offsets (build 17763 x64). Every constant
-/// cites its source (EDRSandblast CSV / Vergilius / fluxsec.red). The kits
-/// below all consume these — getting one wrong is a bugcheck, so they're
-/// centralised + unit-tested here.
+/// Version-pinned kernel structure offsets + dynamic multi-version probe.
+///
+/// Provides a table of known EPROCESS offsets for 14 Windows builds
+/// (10240–26200), a floor-match lookup ([`offsets::for_build`]), and a
+/// DefenderDump-style dynamic probe ([`offsets::probe_eprocess_offsets`])
+/// that discovers offsets at runtime from a live kernel.
+///
+/// Every constant in the legacy `eprocess` module cites its source
+/// (EDRSandblast CSV / Vergilius / fluxsec.red). The kits below all
+/// consume [`offsets::EprocessOffsets`] — getting one wrong is a bugcheck,
+/// so they're centralised + unit-tested here.
 pub mod offsets;
 /// Telemetry neutralization kits (P2.2 §2.2/§2.3): `CallbackNeutralizer`
 /// (Ps*NotifyRoutine ret-stub) + `MiniFilterUnlinker` (RegisteredFilters
