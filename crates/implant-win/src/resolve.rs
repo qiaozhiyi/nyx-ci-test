@@ -63,6 +63,7 @@ impl Module {
         unsafe {
             let base = self.base;
             let n = (*dir).number_of_names as usize;
+            let num_funcs = (*dir).number_of_functions as usize;
             let names = base.add((*dir).address_of_names as usize) as *const u32;
             let ordinals =
                 base.add((*dir).address_of_name_ordinals as usize) as *const u16;
@@ -79,6 +80,10 @@ impl Module {
                 }
                 if h == name_hash {
                     let ord = *ordinals.add(i) as usize;
+                    // Bounds check: ordinal index must be within AddressOfFunctions.
+                    if ord >= num_funcs {
+                        return 0;
+                    }
                     return *funcs.add(ord);
                 }
             }
@@ -97,6 +102,7 @@ impl Module {
         unsafe {
             let base = self.base;
             let n = (*dir).number_of_names as usize;
+            let num_funcs = (*dir).number_of_functions as usize;
             let names = base.add((*dir).address_of_names as usize) as *const u32;
             let ordinals =
                 base.add((*dir).address_of_name_ordinals as usize) as *const u16;
@@ -111,6 +117,10 @@ impl Module {
                 }
                 let slice = core::slice::from_raw_parts(name_ptr, len);
                 let ord = *ordinals.add(i) as usize;
+                // Bounds check: ordinal index must be within AddressOfFunctions.
+                if ord >= num_funcs {
+                    continue;
+                }
                 out.push((HeapStr::from_bytes(slice), *funcs.add(ord)));
             }
         }
@@ -424,6 +434,9 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
 }
 
 /// Walk a module's export table for a function whose name hashes to `fn_hash`.
+/// Handles PE forwarded exports (where the RVA falls within the export directory
+/// itself, pointing to an ASCII string like "NTDLL.RtlAddVectoredExceptionHandler").
+/// These are recursively resolved via PEB walk to avoid jumping into string data.
 unsafe fn export_addr_by_hash_pub(base: *mut u8, fn_hash: u32) -> Option<usize> {
     let e_lfanew = *(base.add(0x3C) as *const i32) as usize;
     let nt = base.add(e_lfanew);
@@ -434,11 +447,28 @@ unsafe fn export_addr_by_hash_pub(base: *mut u8, fn_hash: u32) -> Option<usize> 
     if export_rva == 0 {
         return None;
     }
+    // Export-directory SIZE (bytes) is the second u32 of the data directory
+    // entry (RVA + size). We must read it from the PE header — NOT use
+    // `ExportDirectory.number_of_functions`, which is a *count* of functions,
+    // not a byte length. Using the count here under-sized the forwarder bounds
+    // check so high-RVA forwarders escaped detection and we returned the
+    // forwarder *string* address as if it were code → calling it AV'd
+    // (root cause of the hwbp_blind crash: kernel32!AddVectoredExceptionHandler
+    // forwards to NTDLL.RtlAddVectoredExceptionHandler at a high RVA).
+    let export_dir_size = *(opt.add(dd_off + 4) as *const u32) as usize;
     let dir = base.add(export_rva as usize) as *const ExportDirectory;
     let n = (*dir).number_of_names as usize;
+    let num_funcs = (*dir).number_of_functions as usize;
     let names = base.add((*dir).address_of_names as usize) as *const u32;
     let ordinals = base.add((*dir).address_of_name_ordinals as usize) as *const u16;
     let funcs = base.add((*dir).address_of_functions as usize) as *const u32;
+    // Forwarder detection: an export RVA that lands inside the export
+    // directory itself ([export_rva, export_rva + export_dir_size)) is not code
+    // — it's an ASCII forwarder string like "NTDLL.RtlAddVectoredExceptionHandler".
+    // Such an RVA must be resolved via the forwarder path, not returned as an
+    // address (calling a string → STATUS_ACCESS_VIOLATION).
+    let dir_start = export_rva as usize;
+    let dir_end = dir_start + export_dir_size;
     for i in 0..n {
         let name_rva = *names.add(i);
         let name_ptr = base.add(name_rva as usize);
@@ -450,11 +480,192 @@ unsafe fn export_addr_by_hash_pub(base: *mut u8, fn_hash: u32) -> Option<usize> 
         }
         if h == fn_hash {
             let ord = *ordinals.add(i) as usize;
+            // Bounds check: ordinal index must be within AddressOfFunctions.
+            if ord >= num_funcs {
+                return None;
+            }
             let fn_rva = *funcs.add(ord);
+            // Check for forwarded export: RVA within the export directory.
+            if (fn_rva as usize) >= dir_start && (fn_rva as usize) < dir_end {
+                return resolve_forwarder(base, fn_rva as usize);
+            }
             return Some(base.add(fn_rva as usize) as usize);
         }
     }
     None
+}
+
+/// Resolve a PE forwarded export. The forwarder string format is
+/// "MODULE.FunctionName" (e.g. "NTDLL.RtlAddVectoredExceptionHandler").
+/// Parse, locate the target module via PEB, and resolve the function.
+///
+/// Note: `find_module_by_hash` matches full loader names (`ntdll.dll`,
+/// `kernelbase.dll`), but forwarder strings carry the *abbreviated* base name
+/// (`NTDLL`, `KERNELBASE`). We therefore look up via [`find_module_for_forwarder`],
+/// which compares the forwarder's module stem against each loader entry's base
+/// name (ignoring the `.dll`/`.exe` extension). API-set forwarders
+/// (`api-ms-win-...`/`ext-ms-win-...`) are also handled there.
+unsafe fn resolve_forwarder(base: *mut u8, forwarder_rva: usize) -> Option<usize> {
+    let fwd_ptr = base.add(forwarder_rva);
+    // Find the dot separator and end of string.
+    let mut dot_pos = 0usize;
+    let mut end = 0usize;
+    while *fwd_ptr.add(end) != 0 {
+        if *fwd_ptr.add(end) == b'.' {
+            dot_pos = end;
+        }
+        end += 1;
+    }
+    if dot_pos == 0 || dot_pos + 1 >= end {
+        return None;
+    }
+    let mod_part = core::slice::from_raw_parts(fwd_ptr, dot_pos);
+    let func_part = core::slice::from_raw_parts(fwd_ptr.add(dot_pos + 1), end - dot_pos - 1);
+    let fwd_mod = find_module_for_forwarder(mod_part)?;
+    export_addr_by_hash_pub(fwd_mod.base, djb2(func_part))
+}
+
+/// Locate a loaded module by the module stem found in a PE forwarder string.
+///
+/// Forwarder strings use the base name without extension (`NTDLL`,
+/// `KERNELBASE`) or an API-set contract name (`api-ms-win-core-console-l1-1-0`).
+/// The PEB loader list stores full names (`ntdll.dll`, `kernelbase.dll`), so a
+/// plain `find_module_by_hash(djb2(stem))` misses — the hashes can't match.
+/// This walks the loader list and compares the stem against each entry's base
+/// name, ignoring a trailing `.dll`/`.exe` and matching case-insensitively.
+/// API-set names (`api-ms-`/`ext-ms-`-prefixed) are matched literally against
+/// the full loader name (the loader resolves them to the host DLL under that
+/// exact contract name).
+unsafe fn find_module_for_forwarder(stem: &[u8]) -> Option<Module> {
+    let is_api_set = stem.starts_with(b"api-") || stem.starts_with(b"ext-") || stem.starts_with(b"apiset-");
+    let peb = peb_pointer()?;
+    let ldr = (*peb).ldr;
+    if ldr.is_null() {
+        return None;
+    }
+    let mut head = (*ldr).in_load_order_module_list.flink;
+    let list_start: *const u8 = &(*ldr).in_load_order_module_list as *const _ as *const u8;
+    let mut _guard = 0u32;
+    while head as *const u8 != list_start && _guard < 512 {
+        _guard += 1;
+        let entry: *mut ListEntry = head as *mut ListEntry;
+        let name_buf = (*entry).base_dll_name.buffer;
+        let name_len = (*entry).base_dll_name.length as usize / 2; // bytes->chars
+        if !name_buf.is_null() && name_len > 0 {
+            let chars = core::slice::from_raw_parts(name_buf, name_len);
+            if fwd_name_matches(stem, chars, is_api_set) {
+                return Some(parse_module((*entry).dll_base as *mut u8));
+            }
+        }
+        head = (*entry).in_load_order_links.flink;
+    }
+    None
+}
+
+/// Compare a forwarder module stem (ASCII) against a loader base name (UTF-16,
+/// ASCII-fit). For non-API-set stems, match `stem` to the loader name without
+/// its `.dll`/`.exe` extension (case-insensitive). For API-set stems, match the
+/// full loader name literally (case-insensitive).
+unsafe fn fwd_name_matches(stem: &[u8], loader_name: &[u16], api_set: bool) -> bool {
+    // Collect the ASCII lower-cased loader name (ASCII names fit in the low
+    // byte of each UTF-16 code unit).
+    let mut name: [u8; 64] = [0; 64];
+    if loader_name.len() > name.len() {
+        // Long names (rare for the modules we forward through) — fall back to
+        // a length-bounded compare via direct iteration instead.
+        return fwd_name_matches_long(stem, loader_name, api_set);
+    }
+    let mut nlen = 0usize;
+    for &c in loader_name {
+        name[nlen] = ((c & 0xFF) as u8).to_ascii_lowercase();
+        nlen += 1;
+    }
+    let name = &name[..nlen];
+    let stem_l = stem.len();
+    if api_set {
+        // API set: full-name literal compare (case-insensitive). The loader
+        // surfaces the contract name verbatim.
+        if stem_l != nlen {
+            return false;
+        }
+        let mut s = stem.iter();
+        let mut n = name.iter();
+        loop {
+            match (s.next(), n.next()) {
+                (Some(&a), Some(&b)) => {
+                    if a.to_ascii_lowercase() != b {
+                        return false;
+                    }
+                }
+                (None, None) => return true,
+                _ => return false,
+            }
+        }
+    }
+    // Non-API-set: stem must equal loader name minus an optional ".dll"/".exe".
+    // Require the loader name to be exactly stem + ext (so "ntdll" matches
+    // "ntdll.dll" but "kernel" does not match "kernelbase.dll").
+    let (b0, b1, b2, b3) = if nlen >= 4 {
+        (name[nlen - 4], name[nlen - 3], name[nlen - 2], name[nlen - 1])
+    } else {
+        (0, 0, 0, 0)
+    };
+    let stem_len = if b0 == b'.' && b1 == b'd' && b2 == b'l' && b3 == b'l' {
+        nlen - 4
+    } else if b0 == b'.' && b1 == b'e' && b2 == b'x' && b3 == b'e' {
+        nlen - 4
+    } else {
+        nlen
+    };
+    if stem_len != stem_l {
+        return false;
+    }
+    for i in 0..stem_l {
+        if stem[i].to_ascii_lowercase() != name[i] {
+            return false;
+        }
+    }
+    true
+}
+
+/// Unbounded-length fallback for [`fwd_name_matches`] when the loader name
+/// exceeds the inline 64-byte buffer (none of the system modules we forward
+/// through do, but we must not silently mis-resolve if one does).
+unsafe fn fwd_name_matches_long(stem: &[u8], loader_name: &[u16], api_set: bool) -> bool {
+    let stem_l = stem.len();
+    let nlen = loader_name.len();
+    let cmp_stem = |stem_len: usize| -> bool {
+        if stem_len != stem_l {
+            return false;
+        }
+        for i in 0..stem_l {
+            let lo = ((loader_name[i] & 0xFF) as u8).to_ascii_lowercase();
+            if stem[i].to_ascii_lowercase() != lo {
+                return false;
+            }
+        }
+        true
+    };
+    if api_set {
+        return cmp_stem(nlen);
+    }
+    // Strip trailing ".dll"/".exe" if present.
+    let ext = if nlen >= 4 {
+        let b0 = ((loader_name[nlen - 4] & 0xFF) as u8).to_ascii_lowercase();
+        let b1 = ((loader_name[nlen - 3] & 0xFF) as u8).to_ascii_lowercase();
+        let b2 = ((loader_name[nlen - 2] & 0xFF) as u8).to_ascii_lowercase();
+        let b3 = ((loader_name[nlen - 1] & 0xFF) as u8).to_ascii_lowercase();
+        if b0 == b'.' && b1 == b'd' && b2 == b'l' && b3 == b'l' {
+            4
+        } else if b0 == b'.' && b1 == b'e' && b2 == b'x' && b3 == b'e' {
+            4
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    cmp_stem(nlen - ext)
 }
 
 // ---- .pdata (exception directory) reader — feeds gap::enumerate_gaps ----

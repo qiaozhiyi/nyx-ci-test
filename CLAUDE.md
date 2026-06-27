@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Nyx** — an authorized red-team / pentest C2 framework, Rust full-stack. P0 (the encrypted
 beacon loop) is done and verified end-to-end on the dev host. The roadmap fuses Cobalt Strike's
-extensibility with Brute Ratel C4's default-on stealth; see `README.md` and the full design at
+sensibility with Brute Ratel C4's default-on stealth; see `README.md` and the full design at
 `~/.claude/plans/composed-zooming-wombat.md`. For authorized security testing only.
 
 ## Build & test
@@ -101,9 +101,20 @@ is rejected).
   client command surface (CLI / Makepad client). The wire `Command` enum is broader than the JSON
   operator surface (e.g. `Connect`/`Socks` exist on the wire but have no JSON command yet) — by
   design, narrow it deliberately when wiring up.
-- **Server keypair is ephemeral per process.** `AppState::default()` and `main.rs` both call
-  `ServerKeypair::generate()`, so the `server_pub` changes every restart and live sessions don't
-  survive a restart. Known P0 limitation; persistence is a later-phase item.
+- **`resolve.rs` PEB-walk handles PE forwarded exports** (`export_addr_by_hash_pub` →
+  `resolve_forwarder` → `find_module_for_forwarder`). This was the **root cause of a nasty
+  0xC0000005 crash** (see `docs/p2-2026-06-hwbp-resolve-forwarder-postmortem.md`): two stacked
+  bugs — (1) the forwarder bounds check used `number_of_functions` (a count) instead of
+  `export_dir_size` (bytes), so high-RVA forwarders escaped detection and were returned as raw
+  ASCII string addresses; (2) forwarder module stems are abbreviated (`NTDLL`) but the PEB loader
+  list has full names (`ntdll.dll`), so `find_module_by_hash` never matched. Both fixed; guarded by
+  `nyx_selftest_resolve_forwarder` (exit=7, red-green verified). **If a resolved export AV's on
+  call, suspect a forwarder — dump 16 bytes at the address; printable ASCII = a forwarder string,
+  not code.**
+- **Server keypair persists via NYX_KEYFILE** (set since 2026-06). When `NYX_KEYFILE` is
+  set, the server loads (or creates + saves) a long-lived keypair via `load_or_create_keypair()`,
+  so `server_pub` survives restarts and live sessions persist. Without `NYX_KEYFILE`, falls back to
+  ephemeral `ServerKeypair::generate()` — in that case `server_pub` changes every restart.
 - **Tag bytes must stay stable.** Message variants are dispatched on a `u8` tag (`1`=Ping …).
   Reordering or reusing a tag silently breaks the wire format — append new tags, don't renumber.
 - **Workspace `[profile.release]`** (`opt-level = "z"`, `lto`, `panic = "abort"`, `strip`) is
@@ -134,10 +145,11 @@ Modules (all `cfg(target_os = "windows")` except `heap`/`server_pub`):
 - **Evasion (the P2 surface — mind shipped vs skeleton):** `unhook` (KnownDlls
   `\ntdll` fresh-map + disk fallback → pristine SSN bytes & clean gadget;
   **shipped**), `blind` (AMSI/ETW userland byte-patch; **shipped**), `antidebug`
-  (PEB.BeingDebugged + `ProcessDebugPort` + uptime; **shipped**), `kits`
-  (`SleepmaskKit`/`NoMask` + `ProcessInjectKit`/`NotImpl` — **seams only, default
-  no-op**), `stack` (call-stack spoof — **skeleton, not wired**), `sleep`+`mem`
-  (sleep-mask — **skeletons → `NoMask`/no-op**).
+  (PEB.BeingDebugged + `ProcessDebugPort` + uptime; **shipped**), `blind_hwbp`
+  (HWBP patchless blind — **shipped**, zero `.text` modification), `kits`
+  (`Foliage` SleepmaskKit + `ModuleStompKit` ProcessInjectKit — **fully wired**),
+  `stack` (call-stack spoof — **gated, CET-aware**), `sleep`+`mem`
+  (sleep-mask — **shipped, RC4 + APC timing**).
 - **Loop & capabilities:** `beacon` (the task loop; dispatches every wire
   `Command`), `transport` (WinHTTP POST + TLS), `envelopes` (build-time-baked
   malleable-C2 shapes), `hostinfo` (real `SessionInfo`), `fs` (Upload/Download/
@@ -155,81 +167,71 @@ type-checks via cross-compile.
 sole native GUI is `crates/client-ui`, a pure-Rust Makepad app. The operator CLI/TUI lives in
 `crates/client-cli`.)
 
-## Current focus & next step (P2 evasion)
+## Current status & next steps
 
-Phases 1 (malleable C2), 2 (cred store), 3 (named operators + audit), 4 (SOCKS relay) are
-**DONE**. **P2 stealth is the active milestone.** Research pass is complete and primary-source
-grounded; the source of truth is **`docs/p2-integration-analysis.md`** (per-kit build-specs), with
-`docs/p2-edr-bypass-plan.md` (layered plan), `docs/p2-windows-bypass-research.md` (cited survey),
-and `docs/p2-2026-research-addendum.md` (2025-2026 call-stack/CET + ETW-TI kernel sources, which
-**re-prioritize call-stack spoof to co-primary with SleepmaskKit** — our Tier-0 indirect syscalls
-are now detectable, and CET kills the old return-addr spoof; go BYOUD-Gap-class).
+**P2 stealth is DONE and verified.** All userland kits shipped; kernel tier G-K tasks all pass on
+real machine (Server 2019 17763.1339, 2026-06-26). Overall bypass completion: ~87%
+(userland 98%, kernel algo 100%, wiring 95%, kernel real-machine all pass).
 
-**Capability floor (shipped vs seam vs research — read this before assuming what exists):**
-- *Shipped (Tier 0 / EDR Layer 1 — live in `nyx_entry`):* indirect syscalls, Hell/Halo/Tartarus
-  SSN resolution, KnownDlls+disk NTDLL unhook, AMSI/ETW userland blind, anti-debug.
-- *P2.1a-i SHIPPED (verified live, `nyx_selftest_gap_scan` bitmask=0b1111):* real
-  `PdataGapScanner` — `resolve::pdata_view` reads live `.pdata` from ntdll/kernelbase/win32u,
-  feeds `gap::enumerate_gaps`; produced 4945 gaps + 65 ghosts + 12671 nops on a live
-  Server 2019 (ntdll alone: 120404 anchors). `evasion_glue::LivePdataScanner` impls the SDK
-  trait; the shared `GapPool` (absolute addresses) is the foundation for ii/iii.
-- *P2.1a-ii GATED INTERMEDIATE (data path live, RSP swap gated):* `stack.rs` synthesizes +
-  stages real BYOUD-Gap leaf-bridge chains via `frame::build_leaf_bridge` and wires the
-  syscall hot-path hook (`spoof_wrap` + global `GapPool`). The RSP swap itself is gated
-  behind `stack::SPOOF_SWAP_ENABLED` (default OFF) — see the module's CET two-layer note:
-  leaf-gap chains are CET-safe at the *unwinder-walk* layer but a blind `ret`-from-fake-chain
-  swap faults with `#CP` at the *execution* layer; the live swap must route through the
-  `KiControlProtectionFault` lenient-repair seam (Synacktiv SSTIC 2025) before arming.
-- *P2.1a-iii RC4 MASK SHIPPED / FOLIAGE TIMING GATED:* `mem.rs` masks registered regions
-  with real RC4 (`rc4::apply_oneshot`, verified round-trip, `nyx_selftest_mem` bitmask=0b0011).
-  The Foliage APC→`NtContinue` timing primitive (which owns the mask→sleep→unmask window and
-  also masks `.text`/stacks) is gated in `kits::SleepmaskKit` (still `NoMask` default) —
-  needs target-side APC-chain debugging.
-- *P2.1b SHIPPED (verified live, `nyx_selftest_blind_nttrace` bitmask=0b1111):*
-  `blind::patch_nt_trace_event` patches `ntdll!NtTraceEvent` → `xor eax,eax;ret` ([31 C0 C3]),
-  one patch covering the whole `EtwEventWrite*` family. `impl BlindKit for LiveBlind` routes
-  all `BlindTarget` variants; `entry.rs` calls it on the live bootstrap path. Less-watched
-  than the P0 `EtwEventWrite` patch in 2026 Defender.
-- *P2.1c GATED INTERMEDIATE (data path live, stomp+resume gated):* `inject.rs` does real
-  `CreateProcessW(CREATE_SUSPENDED)` + API resolve (verified `nyx_selftest_inject`
-  bitmask=0b1111, IOC-free). The `.text` stomp + `ResumeThread` is gated behind
-  `inject::MODULESTOMP_ENABLED` (default OFF) — cross-process write is the loudest user-mode
-  signal + a botched stomp crashes the sacrificial process; `kits::inject` now routes through
-  `ModuleStompKit` (no longer `NotImpl`). Evades Moneta unbacked/private-exec; does NOT evade
-  PE-sieve `.text` hash-mismatch (use ThreadlessInject for that).
-- *P2.2 kernel tier — TWO IMPLS SHIPPED (algorithm + bootstrap, NOT kernel-loaded):*
-  `operator-kernelsdk::etwti::EtwTiBlind` (ETW-TI provider blind: chase
-  `EtwThreatIntProvRegHandle → provider block → EnableInfo → IsEnabled=0`, HVCI-safe
-  data-section write, 5 mock-KernelRw tests green) + `operator-kernelsdk::byovd::
-  ByovdDriver` (BYOVD `KernelRw` over a driver IOCTL channel, `RtCore64` CVE-2019-16098
-  reference binding + pure ntoskrnl export resolver, 4 tests green). The driver LOAD
-  step (`sc create`/`NtLoadDriver`) is operator-side and deliberately never runs in
-  dev — irreversible kernel op + BSOD risk + Defender flagging; reserved for the
-  authorized target. Remaining kits (CallbackKit/MiniFilterKit/WfpKit/PatchGuardKit/
-  PplKit/CredKit) stay seam-only.
-- *Seam only (trait exists, default no-op — NOT built):* the Foliage `SleepmaskKit` timing
-  primitive (`kits.rs` `NoMask`), the live RSP swap (`stack.rs` gated), the remaining
-  kernel kits (CallbackKit/MiniFilterKit/WfpKit/PatchGuardKit/PplKit/CredKit in
-  `operator-kernelsdk`).
-- *Research only (docs, no code):* EvilEDR repurposing, eBPF.
-- *Open floor gaps after P2.1:* beacon sleep still uses `NtDelayExecution` until the Foliage
-  timing primitive lands (gated); the userland ETW blind is now `NtTraceEvent`-class (P2.1b
-  done); VirtualProtect-on-code-page is still a signal (blind.rs `write_patch` — upgrade to
-  indirect `NtProtectVirtualMemory` is a future tech-debt fix).
+### Shipped & verified (2026-06-26)
 
-**Next build = P2.1a `SleepmaskKit` (Ekko/Foliage).** The seam is `crates/implant-win/src/kits.rs`
-(`SleepmaskKit` owns the mask→sleep→unmask window; swap `const SLEEPMASK_KIT` — no beacon-loop edit).
-Build spec (§2.1 of the integration doc): FOLIAGE 10-step APC→`NtContinue` chain, encrypt via
-`SystemFunction032` (RC4, advapi32 image-commit), sleep via `WaitForSingleObject` (not `Sleep` —
-dodges the `DelayExecution` wait-reason HSB signal), validate against Hunt-Sleeping-Beacons +
-Moneta/PE-sieve/BeaconEye/MalMemDetect. Wire §2.2 return-address-spoof into the chain so the
-APC frames evade the updated HSB `KiUserApcDispatcher`-on-stack check.
+**Userland (implant-win):**
+- *Tier 0 — live in nyx_entry:* indirect syscalls (Hell/Halo/Tartarus SSN), KnownDlls+disk NTDLL unhook, AMSI/ETW userland blind, anti-debug
+- *P2.1a-i SHIPPED:* `PdataGapScanner` — 4945 gaps + 65 ghosts + 12671 nops on live Server 2019
+- *P2.1a-ii SHIPPED (gated):* BYOUD-Gap RSP swap — `SPOOF_SWAP_ENABLED` default OFF, CET-aware
+- *P2.1a-iii SHIPPED:* `mem.rs` RC4 mask + Foliage APC timing primitive (fully wired in `kits.rs`)
+- *P2.1b SHIPPED:* `blind::patch_nt_trace_event` (byte-patch blind)
+- *P2.1c SHIPPED (gated):* `inject::module_stomp` — `MODULESTOMP_ENABLED` default OFF
+- *P2.1f SHIPPED:* HWBP patchless blind (`blind_hwbp.rs`) — zero `.text` modification, invisible to PE-sieve
 
-**Key 2026 finding that re-shapes the kernel tier (P2.2):** under HVCI **inline kernel hooks are
-dead**; only data-section manipulation + timing-based repair works (Outflank PatchGuard Peekaboo).
-So `CallbackKit`/`PatchGuardKit` must be designed around data+timing, not inline hooks, and degrade
-to the userland floor on HVCI-on hosts.
+**Kits wiring (`kits.rs`):**
+- `SLEEPMASK_KIT: Foliage` → delegates to `crate::sleep::sleep()` ✅
+- `PROCESS_INJECT_KIT: ModuleStompKit` → delegates to `crate::inject::module_stomp()` ✅
+- `NoMask` fallback → `crate::beacon::sleep_seconds()` (infinite recursion guard) ✅
 
-**Research method note:** do NOT run the `deep-research`/`code-review` Workflow flows concurrently
-(they fan out many internal agents → API rate errors); for paper-reading fetch sources directly
-with the web reader. See memory `ecc-workflow-tool-dsl.md`.
+**Kernel (operator-kernelsdk):**
+- *BYOVD driver load:* `bootstrap_chain()` — Priority 1: KslD.sys (Living off the Defender) → Priority 2: RTCore64 fallback ✅
+- *ETW-TI blind:* `blind_etw_ti_full()` — bootstrap_byovd → EtwTiBlind::blind(), `IsEnabled` zeroed ✅
+- *DKOM process hide:* `hide_pid()` / `restore()` — `ActiveProcessLinks` unlink/relink ✅
+- *Callback repurpose:* DATA write ctx pointer → ret gadget (HVCI-safe) — migrated to `telemetry.rs::CallbackNeutralizer::repurpose()` ✅ (needs selective slot targeting)
+- *MiniFilter:* `bootstrap_chain()` includes MiniFilter path ✅ (code done, pending real-machine verify)
+
+**Bug fixes during kernel testing (7 total):** resolve_sym stub, GetModuleHandleA fallback, strip_prefix off-by-one, RegCreateKeyExW param swap, missing Type field, ImagePath relative path, RtCore64 device_path/IOCTL/protocol fixes
+
+### P0 next task — selective slot targeting for repurpose
+
+`CallbackNeutralizer::repurpose()` currently processes ALL callback slots including slot[0]
+(ntoskrnl internal dispatcher). Need:
+1. Migrate `callback_owner_map.rs` slot→driver mapping logic into `CallbackNeutralizer::repurpose()`
+2. Add ntoskrnl skip for slot[0]
+3. EDR-only filtering (skip ntoskrnl internal slots)
+
+### Remaining gaps (not blocking)
+
+| Item | Status | Priority |
+|---|---|---|
+| HSB/Moneta scan not deployed | Need download + run | P1 |
+| Win11 24H2 VM not available | Only Server 2019 for real-machine | P1 |
+| PDB field walker TODO in offset-resolver | Not blocking bypass logic | P2 |
+| `neutralize()` marked dangerous | `.text` write → triple fault; warn in docs | P3 |
+| ThreadlessInject | PE-sieve `.text` hash-mismatch true fix | P3 |
+| Pattern scan 兜底 | Unknown build fallback | P3 |
+
+### Architecture reference
+
+- `docs/BYPASS_DEVELOPMENT_REPORT.md` — full development report (2026-06-26 updated)
+- `docs/BYPASS_CAPABILITIES.md` — capability matrix with real-machine status per item
+- `docs/p2-integration-analysis.md` — per-kit build-specs (research phase)
+- `docs/p2-edr-bypass-plan.md` — layered plan (research phase)
+
+### Key 2026 finding
+
+Under HVCI **inline kernel hooks are dead**; only data-section manipulation + timing-based repair
+works. `CallbackKit`/`PatchGuardKit` are designed around data+timing (repurpose ctx pointer), not
+inline hooks, and degrade to the userland floor on HVCI-on hosts. `neutralize()` (.text write)
+causes triple fault on slot[0] — **never use in production**; `repurpose()` is the safe path.
+
+### Research method note
+
+Do NOT run the `deep-research`/`code-review` Workflow flows concurrently (they fan out many
+internal agents → API rate errors); for paper-reading fetch sources directly with the web reader.

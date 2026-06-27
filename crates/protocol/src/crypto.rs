@@ -106,13 +106,20 @@ pub fn derive_session_key(
     implant_pub: &[u8; PUBKEY_LEN],
 ) -> SessionKey {
     let hk = Hkdf::<Sha256>::new(None, shared);
-    let mut info = Vec::with_capacity(16 + PUBKEY_LEN * 2);
-    info.extend_from_slice(b"nyx-session-v1");
-    info.extend_from_slice(server_pub);
-    info.extend_from_slice(implant_pub);
+    // Stack-allocated info buffer: "nyx-session-v1" (14) + server_pub (32) + implant_pub (32) = 78 bytes.
+    // Audit M-4: avoid Vec heap allocation for this small, fixed-size payload.
+    let mut info = [0u8; 80];
+    let mut pos = 0;
+    let label = b"nyx-session-v1";
+    info[..label.len()].copy_from_slice(label);
+    pos += label.len();
+    info[pos..pos + PUBKEY_LEN].copy_from_slice(server_pub);
+    pos += PUBKEY_LEN;
+    info[pos..pos + PUBKEY_LEN].copy_from_slice(implant_pub);
+    pos += PUBKEY_LEN;
     let mut okm = [0u8; KEY_LEN];
     // HKDF expand only fails if the requested length exceeds 255 * HashLen; 32 is fine.
-    hk.expand(&info, &mut okm)
+    hk.expand(&info[..pos], &mut okm)
         .expect("32-byte HKDF expand cannot fail");
     okm
 }

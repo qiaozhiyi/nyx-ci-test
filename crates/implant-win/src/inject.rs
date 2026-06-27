@@ -484,6 +484,12 @@ unsafe fn resume_thread(h: *mut core::ffi::c_void) -> Result<(), &'static str> {
 /// already uses all 4, injection fails with an error. The code scans for the
 /// first unused slot rather than hardcoding DR0.
 ///
+/// **`trigger_addr` semantics:** The address the target thread is about to
+/// execute (e.g. a frequently-called API entry). When the thread hits this
+/// address, the HWBP fires and the VEH handler redirects RIP to the shellcode.
+/// If `trigger_addr == shellcode_addr` (self-trigger), the shellcode runs
+/// immediately on the next instruction.
+///
 /// # Safety
 /// Cross-process handle + memory + thread context ops. Single-threaded.
 pub unsafe fn threadless_inject(

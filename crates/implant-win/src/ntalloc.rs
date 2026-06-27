@@ -156,16 +156,23 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
             }
         }
 
-        // Fallback: bump within the static buffer. Safe because PIC is
-        // single-threaded at init.
-        let cur = FALLBACK_BUF.load(Ordering::Acquire);
-        let nxt = cur + aligned as u64;
-        if nxt <= FALLBACK_SIZE as u64 {
-            FALLBACK_BUF.store(nxt, Ordering::Release);
-            let base = core::ptr::addr_of_mut!(FALLBACK_MEM) as *mut u8;
-            return base.add(cur as usize);
+        // Fallback: bump within the static buffer.
+        // Uses CAS loop to prevent two threads from receiving the same region
+        // if the fallback path is entered concurrently.
+        loop {
+            let cur = FALLBACK_BUF.load(Ordering::Acquire);
+            let nxt = cur + aligned as u64;
+            if nxt > FALLBACK_SIZE as u64 {
+                return core::ptr::null_mut();
+            }
+            if FALLBACK_BUF
+                .compare_exchange_weak(cur, nxt, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                let base = core::ptr::addr_of_mut!(FALLBACK_MEM) as *mut u8;
+                return base.add(cur as usize);
+            }
         }
-        core::ptr::null_mut()
     }
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {}
 }

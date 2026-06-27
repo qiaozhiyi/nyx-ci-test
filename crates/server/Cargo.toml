@@ -33,6 +33,7 @@ tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+tower = { workspace = true }
 
 [dev-dependencies]
 nyx-agent-dev = { workspace = true }

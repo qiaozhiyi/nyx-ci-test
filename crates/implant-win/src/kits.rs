@@ -47,8 +47,9 @@ impl SleepmaskKit for NoMask {
 }
 
 /// Foliage sleepmask kit: delegates to [`crate::sleep`] which runs the gated
-/// Foliage executor. When [`crate::sleep::foliage_enabled`] is OFF (default),
-/// `sleep()` internally delegates to `NoMask` → identical behavior.
+/// Foliage executor. When [`crate::sleep::foliage_enabled`] is ON (default),
+/// `sleep()` runs the Foliage APC chain; when manually disabled it falls
+/// through to `NoMask` → identical behavior.
 pub struct Foliage;
 impl SleepmaskKit for Foliage {
     fn sleep_masked(&self, seconds: u32) {
@@ -56,8 +57,8 @@ impl SleepmaskKit for Foliage {
     }
 }
 
-/// The active sleepmask kit. Foliage masks the image at sleep when armed;
-/// with foliage_enabled OFF (default), it's NoMask-equivalent.
+/// The active sleepmask kit. Foliage masks the image at sleep when armed
+/// (ON by default via `foliage_enabled`); if disabled, it's NoMask-equivalent.
 const SLEEPMASK_KIT: Foliage = Foliage;
 
 /// Beacon-facing sleep entry. Routes through the configured kit so a future

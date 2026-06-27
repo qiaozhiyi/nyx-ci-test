@@ -2153,6 +2153,7 @@ pub unsafe extern "system" fn nyx_selftest_hwbp_blind() {
 
     if !crate::blind_hwbp::init_shadow_buffer() {
         diag_byte(b'!');
+        crate::blind_hwbp::set_diag_enabled(false);
         exit(0xB0);
     }
     diag_byte(b'1');
@@ -2167,15 +2168,16 @@ pub unsafe extern "system" fn nyx_selftest_hwbp_blind() {
                 diag_byte(b'U');
             }
             diag_byte(b'Z');
+            crate::blind_hwbp::set_diag_enabled(false);
             exit(0xFF);
         }
         Err(e) => {
             diag_byte(b's');
-            // Write first byte of error string as marker.
             let bytes = e.as_bytes();
             if !bytes.is_empty() {
                 diag_byte(bytes[0]);
             }
+            crate::blind_hwbp::set_diag_enabled(false);
             exit(0xC0);
         }
     }

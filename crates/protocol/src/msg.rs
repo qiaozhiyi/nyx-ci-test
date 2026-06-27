@@ -11,6 +11,14 @@ use crate::wire::{Reader, WireError, Writer};
 /// `Vec::with_capacity(u32::MAX)` on the server.
 const MAX_BATCH: usize = 65_536;
 
+/// Hard cap on any wire-encoded element count (tasks per batch, BOF args, etc.).
+/// Legitimate payloads never exceed a few dozen items per beacon cycle; 256 is a
+/// generous ceiling.  This is a *secondary* guard — the primary allocation guard
+/// is [`MAX_BATCH`] — applied directly to the loop iteration count so that even
+/// if the allocation guard is somehow bypassed the decoder still terminates in
+/// bounded time.
+const MAX_WIRE_COUNT: usize = 256;
+
 /// Validate a length-prefixed element count read off the wire. Returns the
 /// count to allocate for, capped at the remaining input (a hard upper bound:
 /// you can't have more elements than unread bytes, since each element is at
@@ -298,7 +306,7 @@ impl Command {
                 let name = r.str()?;
                 let n_raw = r.u32()?;
                 let cap = checked_count(r, n_raw)?;
-                let n = n_raw as usize;
+                let n = (n_raw as usize).min(MAX_WIRE_COUNT);
                 let mut args = Vec::with_capacity(cap);
                 for _ in 0..n {
                     args.push(r.str()?);
@@ -423,12 +431,16 @@ impl Response {
             1 => Response::Output(r.blob()?.to_vec()),
             2 => Response::Ok,
             3 => Response::Err(r.str()?),
-            4 => Response::FileChunk {
-                name: r.str()?,
-                seq: r.u32()?,
-                eof: r.u8()?,
-                data: r.blob()?.to_vec(),
-            },
+            4 => {
+                let name = r.str()?;
+                let seq = r.u32()?;
+                let eof_raw = r.u8()?;
+                if eof_raw > 1 {
+                    return Err(WireError::BadTag(eof_raw));
+                }
+                let data = r.blob()?.to_vec();
+                Response::FileChunk { name, seq, eof: eof_raw, data }
+            }
             5 => Response::BofOutput(r.blob()?.to_vec()),
             6 => Response::Channel {
                 chan: r.u32()?,
@@ -474,7 +486,7 @@ impl Task {
         let mut r = Reader::new(data);
         let n_raw = r.u32()?;
         let cap = checked_count(&mut r, n_raw)?;
-        let n = n_raw as usize;
+        let n = (n_raw as usize).min(MAX_WIRE_COUNT);
         let mut out = Vec::with_capacity(cap);
         for _ in 0..n {
             out.push(Task::decode(&mut r)?);
@@ -515,7 +527,7 @@ impl TaskResponse {
         let mut r = Reader::new(data);
         let n_raw = r.u32()?;
         let cap = checked_count(&mut r, n_raw)?;
-        let n = n_raw as usize;
+        let n = (n_raw as usize).min(MAX_WIRE_COUNT);
         let mut out = Vec::with_capacity(cap);
         for _ in 0..n {
             out.push(TaskResponse::decode(&mut r)?);
