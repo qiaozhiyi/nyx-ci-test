@@ -13,7 +13,7 @@
 //! (size of the lea) + disp32.
 //!
 //! ## Patterns
-//! Each pattern is a byte sequence with wildcard bytes (`0x?` = match any).
+//! Each pattern is a byte sequence with optional wildcard bytes (`0x?` = match any).
 //! The patterns are derived from EDRSandblast's ntoskrnl pattern database +
 //! halosgate research, cross-verified against Win10/11/Server builds.
 //!
@@ -101,6 +101,51 @@ pub fn resolve_rva(image: &[u8], site: &RefSite) -> Option<u32> {
     Some(target_rva as u32)
 }
 
+/// Resolve a global variable's RVA from a reference site, restricted to an
+/// expected address range. Like [`resolve_rva`] but iterates ALL occurrences
+/// of the pattern and returns the first match whose computed RVA falls within
+/// `expected_range`.
+///
+/// This is critical when the same byte pattern (e.g., `lea r14, [rip+disp32]`)
+/// appears in multiple functions — the range filter disambiguates them.
+pub fn resolve_rva_in_range(
+    image: &[u8],
+    site: &RefSite,
+    expected_range: core::ops::Range<u32>,
+) -> Option<u32> {
+    if site.pattern.is_empty() || site.pattern.len() > image.len() {
+        return None;
+    }
+    let mut start = 0;
+    while start + site.pattern.len() <= image.len() {
+        if let Some(off) = find_pattern(&image[start..], site.pattern) {
+            let abs = start + off;
+            let disp_start = abs + site.disp_offset;
+            if disp_start + 4 > image.len() {
+                break;
+            }
+            let disp = i32::from_le_bytes([
+                image[disp_start],
+                image[disp_start + 1],
+                image[disp_start + 2],
+                image[disp_start + 3],
+            ]);
+            let next_insn_rva = (abs + site.disp_offset + 4) as i64;
+            let target_rva = next_insn_rva + disp as i64;
+            if target_rva >= 0 && target_rva <= u32::MAX as i64 {
+                let rva = target_rva as u32;
+                if expected_range.contains(&rva) {
+                    return Some(rva);
+                }
+            }
+            start = abs + 1;
+        } else {
+            break;
+        }
+    }
+    None
+}
+
 // ---- Known reference sites for ntoskrnl globals ----
 //
 // These patterns are extracted from the ntoskrnl code that references each
@@ -114,16 +159,41 @@ pub fn resolve_rva(image: &[u8], site: &RefSite) -> Option<u32> {
 
 /// Reference site for `PspCreateProcessNotifyRoutine`.
 /// In ntoskrnl, `PspCallProcessNotifyRoutines` does:
-///   `lea rax, [rip + disp32]  ; PspCreateProcessNotifyRoutine`
+///   `lea r14, [rip + disp32]  ; PspCreateProcessNotifyRoutine`
 ///   `mov ecx, <count>`
 /// The surrounding bytes are stable across builds.
 pub const PSP_CREATE_PROCESS_NOTIFY_ROUTINE: RefSite = RefSite {
     // 4C 8D 35 ?? ?? ?? ??  ; lea r14, [rip+disp32]
-    // (preceded by a distinctive call sequence that's build-stable)
     pattern: &[
         Some(0x4C), Some(0x8D), Some(0x35), None, None, None, None,
     ],
     disp_offset: 3, // disp32 starts at byte 3 of the lea instruction
+};
+
+/// Reference site for `PspCreateThreadNotifyRoutine`.
+/// In ntoskrnl, `PspCallThreadNotifyRoutines` references this array.
+///
+/// **Disambiguation required:** this uses the same `lea r14, [rip+disp32]`
+/// (4C 8D 35) encoding as `PSP_CREATE_PROCESS_NOTIFY_ROUTINE`. Use
+/// [`resolve_rva_in_range`] with the expected RVA range to distinguish them.
+/// Typical ranges: Process array is at a lower RVA than Thread in most builds.
+pub const PSP_CREATE_THREAD_NOTIFY_ROUTINE: RefSite = RefSite {
+    // 4C 8D 35 ?? ?? ?? ??  ; lea r14, [rip+disp32]  (same encoding as process)
+    pattern: &[
+        Some(0x4C), Some(0x8D), Some(0x35), None, None, None, None,
+    ],
+    disp_offset: 3,
+};
+
+/// Reference site for `PspLoadImageNotifyRoutine`.
+/// In ntoskrnl, `PspCallLoadImageNotifyRoutines` references this array.
+/// Uses `lea rbx, [rip+disp32]` — **distinct** encoding from process/thread.
+pub const PSP_LOAD_IMAGE_NOTIFY_ROUTINE: RefSite = RefSite {
+    // 48 8D 1D ?? ?? ?? ??  ; lea rbx, [rip+disp32]
+    pattern: &[
+        Some(0x48), Some(0x8D), Some(0x1D), None, None, None, None,
+    ],
+    disp_offset: 3,
 };
 
 /// Reference site for `PsActiveProcessHead`.
@@ -148,9 +218,18 @@ pub const ETW_THREAT_INT_PROV_REG_HANDLE: RefSite = RefSite {
 /// Try all known reference sites against `image`, returning a map of
 /// global_name → RVA. Useful for a fully autonomous offset resolution
 /// when no table entry or baked offset is available.
+///
+/// For globals that share the same pattern encoding (Process/Thread arrays
+/// both use `4C 8D 35`), callers should use [`resolve_rva_in_range`] with
+/// known RVA bounds to disambiguate. This function uses the unfiltered
+/// [`resolve_rva`] which returns the **first** match — acceptable for
+/// unique patterns (PsActiveProcessHead, EtwThreatIntProvRegHandle,
+/// PspLoadImageNotifyRoutine) but may return Process's RVA for Thread's key.
 pub fn scan_all_known(image: &[u8]) -> alloc::collections::BTreeMap<&'static str, u32> {
     let sites: &[(&str, &RefSite)] = &[
         ("PspCreateProcessNotifyRoutine", &PSP_CREATE_PROCESS_NOTIFY_ROUTINE),
+        ("PspCreateThreadNotifyRoutine", &PSP_CREATE_THREAD_NOTIFY_ROUTINE),
+        ("PspLoadImageNotifyRoutine", &PSP_LOAD_IMAGE_NOTIFY_ROUTINE),
         ("PsActiveProcessHead", &PS_ACTIVE_PROCESS_HEAD),
         ("EtwThreatIntProvRegHandle", &ETW_THREAT_INT_PROV_REG_HANDLE),
     ];
@@ -231,19 +310,95 @@ mod tests {
     }
 
     #[test]
-    fn scan_all_known_finds_multiple_globals() {
-        // Plant two lea instructions in the image.
+    fn resolve_rva_in_range_disambiguates_same_pattern() {
+        // Two identical `lea r14, [rip+disp32]` instructions at different offsets.
+        // One references RVA 0x100, the other 0x500.
         let mut image = vec![0x90u8; 0x1000];
-        // PspCreateProcessNotifyRoutine ref at 0x100
+        // First: at 0x100 → RVA 0x107 + 0xF9 = 0x100 (disp32 = -7, i.e. 0xFFFFFFF9)
+        image[0x100] = 0x4C;
+        image[0x101] = 0x8D;
+        image[0x102] = 0x35;
+        image[0x103..0x107].copy_from_slice(&(-7i32).to_le_bytes());
+        // Second: at 0x200 → RVA 0x207 + 0x2F9 = 0x500 (disp32 = 0x2F9)
+        image[0x200] = 0x4C;
+        image[0x201] = 0x8D;
+        image[0x202] = 0x35;
+        image[0x203..0x207].copy_from_slice(&0x2F9i32.to_le_bytes());
+
+        // resolve_rva returns the first match (0x100)
+        let first = resolve_rva(&image, &PSP_CREATE_PROCESS_NOTIFY_ROUTINE).unwrap();
+        assert_eq!(first, 0x100);
+
+        // resolve_rva_in_range can pick the second one
+        let in_range = resolve_rva_in_range(
+            &image,
+            &PSP_CREATE_THREAD_NOTIFY_ROUTINE,
+            0x400..0x600,
+        );
+        assert_eq!(in_range, Some(0x500));
+
+        // And still find the first with the right range
+        let in_range = resolve_rva_in_range(
+            &image,
+            &PSP_CREATE_PROCESS_NOTIFY_ROUTINE,
+            0x000..0x200,
+        );
+        assert_eq!(in_range, Some(0x100));
+    }
+
+    #[test]
+    fn resolve_rva_in_range_no_match_outside() {
+        let mut image = vec![0x90u8; 0x20];
+        image[0x10] = 0x4C;
+        image[0x11] = 0x8D;
+        image[0x12] = 0x35;
+        image[0x13..0x17].copy_from_slice(&0x1000u32.to_le_bytes());
+
+        // RVA is 0x1017 — not in this range
+        let result = resolve_rva_in_range(
+            &image,
+            &PSP_CREATE_PROCESS_NOTIFY_ROUTINE,
+            0x5000..0x6000,
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolve_rva_in_range_load_image_unique_pattern() {
+        // PspLoadImageNotifyRoutine uses `lea rbx, [rip+disp32]` (48 8D 1D),
+        // which is unique — no disambiguation needed.
+        let mut image = vec![0x90u8; 0x20];
+        image[0x08] = 0x48;
+        image[0x09] = 0x8D;
+        image[0x0A] = 0x1D;
+        image[0x0B..0x0F].copy_from_slice(&0x200u32.to_le_bytes());
+
+        let rva = resolve_rva_in_range(
+            &image,
+            &PSP_LOAD_IMAGE_NOTIFY_ROUTINE,
+            0x100..0x400,
+        );
+        assert_eq!(rva, Some(0x20F)); // next_insn = 0x0F, + 0x200 = 0x20F
+    }
+
+    #[test]
+    fn scan_all_known_finds_multiple_globals() {
+        // Plant three reference sites in the image.
+        let mut image = vec![0x90u8; 0x1000];
+        // PspCreateProcessNotifyRoutine ref at 0x100 (lea r14, [rip+disp32])
         image[0x100] = 0x4C; image[0x101] = 0x8D; image[0x102] = 0x35;
         image[0x103..0x107].copy_from_slice(&0x5000u32.to_le_bytes());
-        // PsActiveProcessHead ref at 0x200
+        // PsActiveProcessHead ref at 0x200 (mov rax, [rip+disp32])
         image[0x200] = 0x48; image[0x201] = 0x8B; image[0x202] = 0x05;
         image[0x203..0x207].copy_from_slice(&0x4000u32.to_le_bytes());
+        // PspLoadImageNotifyRoutine ref at 0x300 (lea rbx, [rip+disp32])
+        image[0x300] = 0x48; image[0x301] = 0x8D; image[0x302] = 0x1D;
+        image[0x303..0x307].copy_from_slice(&0x3000u32.to_le_bytes());
 
         let map = scan_all_known(&image);
         assert!(map.contains_key("PspCreateProcessNotifyRoutine"));
         assert!(map.contains_key("PsActiveProcessHead"));
+        assert!(map.contains_key("PspLoadImageNotifyRoutine"));
     }
 }
 

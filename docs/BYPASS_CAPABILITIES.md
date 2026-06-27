@@ -1,6 +1,6 @@
 # Bypass 能力清单
 
-> **日期:** 2026-06-27（P1 dev tasks 完成 + 内核真机验证 G-K 全通过同步更新）
+> **日期:** 2026-06-27（内核 H-K 全链路真机验证完成，含 callback 诊断全量数据）
 > **验证环境:** Windows Server 2019 Datacenter 17763.1339 + RTCore64.sys (CVE-2019-16098)
 > **授权:** 仅限授权红队 / 安全研究
 
@@ -96,7 +96,7 @@
 - `implant-win/context.rs` — x64 CONTEXT 结构体（1232B，编译期 size/align 断言）
 - `implant-win/mem.rs` — `enumerate_beacon_heap_regions()` / `mask_heap_regions()` / `unmask_heap_regions()`：注册区域 + 分配器 slab 联合枚举 + RC4 遮蔽
 - `implant-win/ntalloc.rs` — slab tracking（`SlabDesc[16]`），`enumerate_slabs()` / `heap_bytes()`
-- 默认 gated OFF（`FOLIAGE_ENABLED`），arm 后才执行
+- 默认 **ON**（`FOLIAGE_ENABLED = true`，`sleep.rs:40`）—— .text + 堆区域掩码开箱即用
 - **堆区域集成（2026-06-27）：** Foliage helper 在 .text RC4 之后追加 `mask_heap_regions(key)`，唤醒时在 .text 解密之前执行 `unmask_heap_regions(key)`（堆先于 .text 恢复）
 
 **真机验证：** `nyx_selftest_foliage` exit=0b1 ✅ · `nyx_selftest_foliage_apc` exit=0b11（3/3 稳定，round-trip 字节校验）✅ · PE-sieve armed 扫描 0 新增命中 ✅
@@ -115,7 +115,7 @@
 - `evasionsdk/swap.rs` — CET-aware 决策（悲观降级，5 测）
 - `implant-win/stack.rs` — `with_spoofed_stack()`：staging + `spoof_trampoline` + per-`<T,F>` 单态化桥 + `MaybeUninit` out-slot。f 真在 spoofed RSP 上执行。
 - `implant-win/version.rs` — `cet_active()`：真 `IsProcessorFeaturePresent(41)` 探测
-- 默认 gated OFF（`SPOOF_SWAP_ENABLED`）
+- 默认 gated **OFF**（`SPOOF_SWAP_ENABLED = false`，`stack.rs:82`）—— CET-on host 前保守关闭，避免 `#CP`
 
 **真机验证：** `nyx_selftest_swap_decision` exit=0b11 ✅ · `nyx_selftest_swap_armed` exit=0b1111（5/5 稳定，f 在 spoofed 栈执行无崩溃）✅
 
@@ -129,9 +129,9 @@
 
 **实现：** `inject.rs::module_stomp()` — `CreateRemoteThread(LoadLibraryA)` 加载 cover DLL → 远程 PE 解析（真 `.text` VA/size）→ `VirtualProtectEx` RX→RWX → `WriteProcessMemory` shellcode → 恢复 RX → `ResumeThread`
 - 修了跨进程指针 bug（旧代码把 implant 本地指针当远程参数传）
-- 默认 gated OFF（`MODULESTOMP_ENABLED`）
+- 默认 **ON**（`MODULESTOMP_ENABLED = true`，`inject.rs:56`）—— module stomping + ThreadlessInject 开箱即用
 
-**已知限制：** PE-sieve 的 `.text` hash-mismatch 仍能检出（ThreadlessInject 是真正解，未实现）
+**已知限制：** module stomping 的 `.text` 被覆盖仍可能被高级扫描器察觉；**ThreadlessInject (HWBP)** 是补充手段，**已实现**（`inject.rs:489-632`：RWX 分配→shellcode→线程挂起→CONTEXT DR0/DR7→`NtSetContextThread`→恢复），与 module stomp 并列可用。
 
 **真机验证：** `nyx_selftest_inject` exit=0b1111 ✅ · `nyx_selftest_inject_armed` exit=0b1111（2/2 真实 .text 覆写+执行）✅
 
@@ -190,7 +190,11 @@
 
 **接线状态：** 🟢 100% — `operator_kernelsdk::win::bootstrap_byovd()` 完整接通：driver_load → ByovdDriver::open → 返回 (LoadedDriver, ByovdDriver)
 
-**真机验证（任务 G）：** driver 加载成功 + ntoskrnl base=`0xfffff8037c001000` + 10MB 内核读 ✅
+**真机验证（任务 H，2026-06-27）：**
+- RTCore64 加载成功 ✅，ntoskrnl base=`0xfffff8057fa19000`
+- PE header 校验通过 ✅（MZ + PE\0\0 + export dir size=0xA7B80）
+- 10MB 连续内核读成功 ✅
+- ntoskrnl 导出表解析：ETW_THREAT_INT=0x40A6B0, PSP_PROCESS=0x4D9D70, PS_ACTIVE_HEAD=0x40E5C0 ✅
 
 ---
 
@@ -206,7 +210,9 @@
 
 **接线状态：** 🟢 100% — `operator_kernelsdk::win::blind_etw_ti_full()` 完整接通：bootstrap_byovd → EtwTiBlind::blind()
 
-**真机验证（任务 H）：** `IsEnabled` `0x000000ff00000001` → `0x0000000000000000`，provider DISABLED ✅
+**真机验证（任务 I，2026-06-27）：**
+- `IsEnabled` `0x000000ff00000001` → `0x0000000000000000`，provider DISABLED ✅
+- EtwThreatIntProvRegHandle 地址：0xffffc30c32652c80 ✅
 
 ---
 
@@ -221,7 +227,11 @@
 
 **接线状态：** 🟢 100% — 通过 `KernelBootstrap::as_kernel_rw()` 调用 `ProcessHider::hide_pid()`
 
-**真机验证（任务 I）：** notepad `tasklist` 1→**0**→1（隐藏→恢复），PatchGuard 未触发 ✅
+**真机验证（任务 J，2026-06-27）：**
+- 启动 notepad.exe (PID=7756)，`PsActiveProcessHead` KVA = `0xfffff8057fe275c0`
+- EPROCESS 查找成功 @ `0xffffc30c40e83080`，ImageFileName = "notepad.exe" ✅
+- unlink 前 `tasklist` count = 1 → unlink 后 count = **0** → relink 后 count = **1** ✅
+- PatchGuard 未触发 ✅
 
 ---
 
@@ -246,19 +256,44 @@
 
 **实现：**
 - `telemetry.rs::CallbackKit` — `routine = *(ctx+0)` offset 已真机验证 ✅
-- `telemetry.rs::CallbackNeutralizer::repurpose()` — **DATA 写路径已迁入库代码**（2026-06-26），HVCI-safe（非 .text 写）
+- `telemetry.rs::CallbackNeutralizer::repurpose()` — **DATA 写路径已迁入库代码**（2026-06-26），HVCI-safe（非 .text 写），**selective slot targeting 已完成**（2026-06-27）：range-based ntoskrnl skip + slot[0] fallback
 - `examples/callback_repurpose_test.rs` — 完整 repurpose 逻辑（ret gadget 解析 + 跳过 ntoskrnl 内部 slot + 数据写 ctx 指针）
 - `telemetry.rs::neutralize()` — ⚠️ 已知危险（.text 写 → triple fault），仅在 PG 窗口内使用
 
-**接线状态：** 🟡 90% — repurpose DATA 写路径已迁入，但**缺少 selective slot targeting**（生产代码处理 ALL slots，未跳过 slot[0] ntoskrnl 内部）
+**接线状态：** 🟢 100% — repurpose DATA 写路径已迁入，**selective slot targeting 已完成**（range-based ntoskrnl skip + slot[0] fallback）
 
-**真机验证（任务 K，两阶段）：**
-- K-A: neutralize（.text 写 0xC3）→ **两次 triple fault 重启**（slot[0] ntoskrnl 内部分发器被破坏） ❌
-- K-B: repurpose（DATA 写 ctx 指针→ret gadget）→ slot[5] SysmonDrv：
-  - BASELINE marker → Sysmon EID1 **recorded** ✅
-  - REPURPOSED marker → Sysmon EID1 **SILENCED** ✅
-  - RESTORED marker → Sysmon EID1 **RESUMED** ✅
-- slot→驱动映射：slot[0]=ntoskrnl（内部），slot[2]=WdFilter，slot[5]=SysmonDrv，slot[9]=KslD ✅
+**真机验证（任务 K，2026-06-27，三阶段）：**
+
+*K-A: callback_probe_readonly（只读诊断，10 slot 全量扫描）*
+| slot | packed | ctx+0x00 (routine) | 所属驱动 | 备注 |
+|---|---|---|---|---|
+| 0 | 0xffffc30c32650c3f | 0xfffff8057fa95e50 | **ntoskrnl.exe +0x7CE50** | ⚠️ 内部分发器，不可中和 |
+| 1 | 0xffffc30c326fef9f | 0xfffff80420229640 | cng.sys +0x9640 | |
+| 2 | 0xffffc30c33059b1f | 0xfffff80420b50e00 | WdFilter.sys +0x30E00 | Defender |
+| 3 | 0xffffc30c33059def | 0xfffff8041fe8c410 | ksecdd.sys +0x1C410 | |
+| 4 | 0xffffc30c33059d2f | 0xfffff80421e25db0 | tcpip.sys +0x5DB0 | |
+| 5 | 0xffffc30c335a51df | 0xfffff80421279ae0 | **SysmonDrv.sys +0x9AE0** | ← repurpose 目标 |
+| 6 | 0xffffc30c335a595f | 0xfffff804201af320 | CI.dll +0x6F320 | |
+| 7 | 0xffffc30c335a5b9f | 0xfffff804214320d0 | dxgkrnl.sys +0x20D0 | |
+| 8 | 0xffffc30c412c1b5f | 0xfffff80423223c90 | peauth.sys +0x43C90 | |
+| 9 | 0xffffc30c412bf3cf | 0xfffff80422eaa0f0 | KslD.sys +0xA0F0 | BYOVD 驱动 |
+
+- ret gadget: ntoskrnl+0x17F0 = `0xfffff8057fa1a7f0` (bytes=[c3 cc cc cc]) ✅
+- telemetry.rs `routine=*(ctx+0)` 假设：全部 10 slot 一致确认 PLAUSIBLE ✅
+
+*K-B: callback_owner_map（slot→驱动映射 + ntoskrnl 边界判定）*
+- ntoskrnl range: `0xfffff8057fa19000` – `0xfffff80580489000` (size=0xA70000)
+- slot[0] routine=0xfffff8057fa95e50 ∈ ntoskrnl range → 正确标记为 ntoskrnl internal ✅
+- 156 loaded modules 枚举成功 ✅
+
+*K-C: callback_repurpose_test（repurpose 验证 + Sysmon EID1 静默/恢复）*
+| 阶段 | marker | Sysmon EID1 记录 | 预期 | 结果 |
+|---|---|---|---|---|
+| BASELINE | MARKER_BASELINE_1111 | ✅ true | callback 活跃 | ✅ |
+| REPURPOSED | MARKER_REPURPOSED_2222 | ❌ false | callback 静默 | ✅ **SILENCED** |
+| RESTORED | MARKER_RESTORED_3333 | ✅ true | callback 恢复 | ✅ **RESUMED** |
+- SysmonDrv 位于 slot[5]，ctx+0x00 从 `0xfffff80421279ae0` → `0xfffff8057fa1a7f0` (ret gadget) → 恢复 ✅
+- DATA 写（非 .text），HVCI-safe ✅
 
 ---
 
@@ -295,7 +330,7 @@
 **实现：**
 - `operator-kernelsdk/src/win/driver_load.rs` — `load_ksld()` 完整 NtLoadDriver 注册表 bootstrap
 - `operator-kernelsdk/src/win/mod.rs` — `bootstrap_chain()` Priority 1: KslD → Priority 2: RTCore64 fallback
-- `operator-kernelsdk/src/byovd.rs` — `ByovdDriver`（RTCore64 专用），`KslD` 占位结构待展开
+- `operator-kernelsdk/src/byovd.rs` — `ByovdDriver`（RTCore64 专用）；KslD 的完整 KernelRw 在 `win/ksld.rs`（`LivingOffDefender`，`QueryDosDeviceW` 动态设备枚举 + 逐字节 kread/kwrite）
 
 **接线状态：** 🟢 100% — `bootstrap_chain()` 已接通 KslD 优先路径 + `LivingOffDefender::open()` 支持动态 `QueryDosDeviceW` 枚举 MpKsl* 设备名
 
@@ -303,45 +338,27 @@
 
 ---
 
-### 19. MiniFilter filter driver loading ✅
+### 19. MiniFilter 断开（list-unlink 已注册过滤器）🔶 算法完成，接线缺
 
 **对抗：** 内核态文件系统监控（Defender/WdFilter 的文件过滤回调）
 
-**原理：** 加载一个 MiniFilter filter driver 到文件系统栈上，挂接到 FLT_REGISTRATION。可以拦截、修改、丢弃文件系统操作 IRP。用于 sleep 期间抑制文件 I/O 遥测。
+> ⚠️ **纠正历史虚构**：早期文档（及 `docs/archive/` 中的报告）曾声称存在
+> `operator-kernelsdk/src/win/minifilter.rs` 实现 `FltRegisterFilter` /
+> `FltUnregisterFilter` / `pause()` / `resume()`——**该文件不存在**。实际能力是
+> 以下 unlink 算法，而非加载/卸载/暂停一个 filter driver。
 
-**实现：**
-- `operator-kernelsdk/src/win/minifilter.rs` — `MiniFilterManager` / `FltRegisterFilter` + `FltStartFiltering`
-- `operator-kernelsdk/src/win/mod.rs` — `bootstrap_chain()` Priority 1.5: MiniFilter（在 KslD 和 RTCore64 之间）
+**实际原理：** 不加载新的 MiniFilter driver。而是遍历 `FLTMGR!FltGlobals →
+FrameList → RegisteredFilters`，把目标 EDR 过滤器（如 WdFilter）从注册链表上
+**unlink**（数据写，HVCI-safe）。过滤器进程仍在，但内核不再派发文件 I/O 给它。
 
-**接线状态：** 🟢 100% — `bootstrap_chain()` 已将 MiniFilter 作为独立加载路径接通
+**实现：** `operator-kernelsdk/src/telemetry.rs::MiniFilterUnlinker::detach_edr`
+（`telemetry.rs:248-289`）—— `LIST_ENTRY` 遍历 + unlink。
 
-**真机验证：** 代码完成 🔶（MiniFilter 加载需目标机有 filter driver .sys 文件，待验证）
+**接线状态：** 🔴 算法已写，**`bootstrap_chain()` 未接线** —— `win/mod.rs:286`
+`flt_globals_kva: 0`（需 fltmgr PDB/pattern 解析 FLTMGR 的 `FltGlobals` 全局）。
+无 `minifilter.rs`，无 `FltRegisterFilter`。
 
----
-
-### 20. MiniFilter filter driver unload（`FltUnregisterFilter`）✅
-
-**对抗：** 唤醒后的文件 I/O 恢复
-
-**原理：** `FltUnregisterFilter` 取消过滤器注册，立即停止所有文件 I/O 拦截。内核自动清理所有挂接。
-
-**实现：** `operator-kernelsdk/src/win/minifilter.rs` — `MiniFilterManager::unregister()`
-
-**接线状态：** 🟢 100%
-
-**真机验证：** 代码完成 🔶
-
----
-
-### 21. MiniFilter filter driver pause/resume（`FltCbdqRemoveIo` / 暂停队列）✅
-
-**对抗：** 选择性 I/O 抑制（仅 sleep 窗口内暂停，不影响正常 I/O）
-
-**原理：** 通过暂停 MiniFilter 的 callback queue，在 sleep 期间抑制文件 I/O 遥测，醒来后 resume 恢复。
-
-**实现：** `operator-kernelsdk/src/win/minifilter.rs` — `pause()` / `resume()`
-
-**接线状态：** 🟢 100%
+**真机验证：** 代码完成 🔶（未接线，故未上真机）
 
 **真机验证：** 代码完成 🔶
 
@@ -386,28 +403,29 @@
 | **沙箱（低 uptime）** | uptime 检测 | ✅ |
 | **进程枚举** | DKOM ActiveProcessLinks unlink | ✅ |
 | **PPL 保护** | Protection 字段剥离 | ✅ |
-| **EDR 回调（Sysmon/WdFilter）** | ctx 指针 repurpose → ret gadget（DATA 写，HVCI-safe） | ✅ 真机验证 +90% 接线 |
-| **驱动加载（BYOVD）** | bootstrap_chain(): KslD (优先) → RTCore64 (回退) | ✅ RTCore64 真机 / KslD 80% |
-| **MiniFilter 文件过滤** | 内核 filter driver 暂停/恢复文件 I/O | 🔶 代码完成待验证 |
-| **PE .text hash（PE-sieve）** | ThreadlessInject（真正解） | ❌ 未实现 |
-| **CET shadow stack** | 悲观降级（CET-on 不执行 RSP swap） | ✅ 降级安全 |
-| **PatchGuard** | 短暂 DKOM 窗口（<1s）+ 回调 repurpose（数据写不碰 .text） | ✅ 未触发 |
+| **EDR 回调（Sysmon/WdFilter）** | ctx 指针 repurpose → ret gadget（DATA 写，HVCI-safe，**selective slot 已完成**） | ✅ 真机验证 EID1 SILENCED/RESUMED |
+| **驱动加载（BYOVD）** | bootstrap_chain(): KslD 优先（动态 `QueryDosDeviceW` 枚举）→ RTCore64 回退 | ✅ 真机（KslD 设备动态解析 + RTCore64） |
+| **MiniFilter 文件过滤** | `telemetry.rs::MiniFilterUnlinker`（list-unlink 已注册过滤器，数据写） | 🔶 算法完成，**bootstrap 未接线**（`flt_globals_kva=0`） |
+| **PE .text hash（PE-sieve）** | ThreadlessInject (HWBP)（`inject.rs:489-632`） | ✅ 已实现 |
+| **CET shadow stack** | 悲观降级（CET-on 不执行 RSP swap，`SPOOF_SWAP_ENABLED=false`） | ✅ 降级安全 |
+| **PatchGuard** | `TimingRepairWindow` + `RuntimePgBypassWindow`（真实数据写窗口）+ 短暂 DKOM + 回调 repurpose（数据写不碰 .text） | ✅ 2/3 窗口真实 / PG 未触发 |
 | **HVCI** | .text 代码写不可用（用数据写 ctx 指针代替） | ✅ 数据写安全 |
 
 ---
 
-## 五、未实现的 bypass（明确列出）
+## 五、未实现 / 接线中的 bypass（明确列出）
 
-| 能力 | 说明 | 为什么没做 |
+> 注：下方几项**曾经是 TODO 但已实现**，从"未实现"移出——见 §5/§19/矩阵：
+> ThreadlessInject ✅、PDB field walker ✅、Pattern scan ✅、NtContinue CONTEXT 伪造 ✅。
+
+| 能力 | 说明 | 状态 |
 |---|---|---|
-| **ThreadlessInject** | PE-sieve .text hash-mismatch 的真正解 | 复杂度高（DLL hollowing + thread hijack），module stomp 是当前 floor |
-| **完整 PDB field walker** | offset-resolver 从已知表升级为真 PDB 解析 | pipeline 已通，pdb crate TypeData 遍历是下一步 |
-| **Pattern scan 兜底** | 未知 build 的最后一道防线 | 预留位置未写（noisy，留给真未知 build） |
-| **NtContinue CONTEXT 伪造** | Foliage + stack spoof 联动（伪造 beacon 线程 RIP） | 需要 per-T naked fn + CONTEXT RIP 伪造 |
+| **MiniFilter 接线** | `telemetry.rs::MiniFilterUnlinker` 算法已写，但 `bootstrap_chain()` 未解析 `flt_globals_kva` | 🔴 算法在，接线缺（G4） |
 | **driver 加载的 HVCI/CI 绕过** | HVCI-on 主机上 RTCore64 可能被 CI 拒绝 | 当前目标 HVCI-off；HVCI-on 需 DMA 或 driverless CVE |
-| **WFP filter 注入** | netsec 规则生成的内核调用站 binding | 算法就绪，binding 未接 |
-| **LSASS 凭据解析** | read_process_mem 的 LSASS 特化 | 框架就绪，drypt 解析未实现 |
+| **WFP filter 注入** | netsec 规则生成的内核调用站 binding | 🔶 算法就绪，binding 未接 |
+| **LSASS 凭据解析** | `read_process_mem` 框架就绪，LSASS 特化的 drypt 解析未实现 | 🔶 框架就绪 |
+| **postex token 操作接线** | `postex.rs` 有 steal/use/revert 实现，但无 `Command` 调用（仅 selftest） | 🔴 未接线（G1） |
 
 ---
 
-*每个能力的状态基于 2026-06-26 的代码 + Server 2019 真机验证。未标注真机验证的项 = 代码完成但未在真机上执行。接线状态标注：🟢 100% · 🟡 部分（见各节说明） · 🔴 未接通。*
+*每个能力的状态基于 2026-06-27 的代码 + Server 2019 真机验证。内核 H-K 任务全量数据见各节。未标注真机验证的项 = 代码完成但未在真机上执行。接线状态标注：🟢 100% · 🟡 部分（见各节说明） · 🔴 未接通。*

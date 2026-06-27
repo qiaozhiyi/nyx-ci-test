@@ -403,7 +403,7 @@ impl<'a> PatchGuardKit for TimingRepairWindow<'a> {
 /// re-verifying that PG hasn't triggered (e.g., by checking a watchdog).
 /// The flag approach is a *soft* suspension — a racing validation that already
 /// started before the flag was zeroed may still complete.
-pub struct RuntimePgBypassWindow {
+pub struct RuntimePgBypassWindow<'a> {
     /// Per-build PG context offsets.
     offsets: crate::offsets::PgContextOffsets,
     /// KVA of the PRCB for the current processor.
@@ -412,24 +412,29 @@ pub struct RuntimePgBypassWindow {
     armed: core::sync::atomic::AtomicBool,
     /// KVA of the PG context valid flag (for the repair callback).
     valid_flag_addr: core::cell::Cell<usize>,
+    /// Stored KernelRw reference for the repair callback.
+    krw: &'a dyn KernelRw,
 }
 
-impl RuntimePgBypassWindow {
+impl<'a> RuntimePgBypassWindow<'a> {
     pub fn new(
         offsets: crate::offsets::PgContextOffsets,
         prcb_kva: usize,
+        krw: &'a dyn KernelRw,
     ) -> Self {
         Self {
             offsets,
             prcb_kva,
             armed: core::sync::atomic::AtomicBool::new(false),
             valid_flag_addr: core::cell::Cell::new(0),
+            krw,
         }
     }
 }
 
-impl PatchGuardKit for RuntimePgBypassWindow {
-    fn enter_unchecked(&self, krw: &dyn KernelRw) -> Result<crate::PgGuard<'_>, KitError> {
+impl<'a> PatchGuardKit for RuntimePgBypassWindow<'a> {
+    fn enter_unchecked(&self, _krw: &dyn KernelRw) -> Result<crate::PgGuard<'_>, KitError> {
+        let krw = self.krw;
         // 1. Check that this build supports the flag-based suspension approach.
         if !self.offsets.supports_thread_suspend {
             return Err(KitError::UnsupportedPosture(
@@ -666,11 +671,11 @@ mod tests {
         // Set up PRCB → PG thread pointer.
         setup_prcb_pg_thread(&krw, prcb_kva, offsets.prcb_pg_thread_offset, pg_thread_kva);
         // Set up PG context valid flag (e.g., flag = 1 means PG is validating).
-        setup_pg_context_valid_flag(&krw, pg_thread_kva, offsets.context_valid_offset, 1);
+        setup_pg_context_valid_flag(&krw, pg_thread_kva, offsets.context_valid_offset, 0);
 
-        let kit = TimingRepairWindow::new(offsets, prcb_kva);
+        let kit = TimingRepairWindow::new(offsets, prcb_kva, &krw);
         let guard = kit.enter_unchecked(&krw);
-        // The guard should be returned (PG thread found, context readable).
+        // The guard should be returned (PG thread found, context readable, flag=0).
         assert!(guard.is_ok());
         // Guard is dropped here — repair callback fires.
     }
@@ -681,7 +686,7 @@ mod tests {
         let offsets = crate::offsets::pg_context_for_build(17763).unwrap().offsets;
         let prcb_kva = 0xFFFF_8000_0020_0000usize;
         // Do NOT set up the PG thread pointer → it reads as 0.
-        let kit = TimingRepairWindow::new(offsets, prcb_kva);
+        let kit = TimingRepairWindow::new(offsets, prcb_kva, &krw);
         let r = kit.enter_unchecked(&krw);
         assert!(matches!(r, Err(KitError::UnsupportedPosture(_))));
     }
@@ -695,7 +700,7 @@ mod tests {
         setup_prcb_pg_thread(&krw, prcb_kva, offsets.prcb_pg_thread_offset, pg_thread_kva);
         setup_pg_context_valid_flag(&krw, pg_thread_kva, offsets.context_valid_offset, 0);
 
-        let kit = TimingRepairWindow::new(offsets, prcb_kva);
+        let kit = TimingRepairWindow::new(offsets, prcb_kva, &krw);
         let guard = kit.enter_unchecked(&krw).unwrap();
         // The guard should have a repair callback.
         assert!(guard.repair.is_some());
@@ -708,7 +713,7 @@ mod tests {
         let offsets = crate::offsets::pg_context_for_build(17763).unwrap().offsets;
         assert!(!offsets.supports_thread_suspend);
         let prcb_kva = 0xFFFF_8000_0020_0000usize;
-        let kit = RuntimePgBypassWindow::new(offsets, prcb_kva);
+        let kit = RuntimePgBypassWindow::new(offsets, prcb_kva, &krw);
         let r = kit.enter_unchecked(&krw);
         assert!(matches!(r, Err(KitError::UnsupportedPosture(_))));
     }
@@ -720,7 +725,7 @@ mod tests {
         assert!(offsets.supports_thread_suspend);
         let prcb_kva = 0xFFFF_8000_0020_0000usize;
         // Do NOT set up the PG thread pointer.
-        let kit = RuntimePgBypassWindow::new(offsets, prcb_kva);
+        let kit = RuntimePgBypassWindow::new(offsets, prcb_kva, &krw);
         let r = kit.enter_unchecked(&krw);
         assert!(matches!(r, Err(KitError::UnsupportedPosture(_))));
     }
@@ -733,7 +738,7 @@ mod tests {
         let pg_thread_kva = 0xFFFF_8000_0030_0000usize;
         setup_prcb_pg_thread(&krw, prcb_kva, offsets.prcb_pg_thread_offset, pg_thread_kva);
 
-        let kit = RuntimePgBypassWindow::new(offsets, prcb_kva);
+        let kit = RuntimePgBypassWindow::new(offsets, prcb_kva, &krw);
         let guard = kit.enter_unchecked(&krw);
         assert!(guard.is_ok());
         drop(guard);

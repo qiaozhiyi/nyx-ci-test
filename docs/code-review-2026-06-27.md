@@ -4,6 +4,10 @@
 > **方法:** 对承载 P0 路径的 8 个核心文件逐函数/逐变量 review，每条带 `file:line` 证据 + 严重度
 > **覆盖:** blind_hwbp.rs / stack.rs / syscalls.rs(spoof 路径) / sleep.rs / mem.rs / context.rs / telemetry.rs / persistence.rs(PG) / ksld.rs / netsec.rs(WFP+LSASS)
 > **授权:** 仅限授权红队 / 安全研究
+>
+> **更新 2026-06-27（后 review）：** R1（selective slot targeting）、R10（PG 窗口）、
+> 以及 "gate 默认值" 相关发现**已在本次 review 后修复**。各条带 ✅FIXED 标记处见内文。
+> 当前权威状态以 [`STATUS.md`](STATUS.md) 为准。
 
 严重度图例：🔴 阻塞/P0 · 🟠 正确性 bug（会崩或行为错） · 🟡 检测面/IOC · 🔵 加固建议
 
@@ -17,10 +21,10 @@
 |---|---|---|
 | 0-A gate 矛盾 | ✅ 已修 | `stack.rs:82` `false` + docstring 一致；`sleep.rs:40`/`inject.rs:56` docstring 对齐 |
 | 0-B HWBP diag 下线 | ✅ 已修 | `blind_hwbp.rs:105` `if !DIAG_ENABLED { return }` + `:94` default false |
-| 0-C repurpose selective | ⚠️ 部分修 | `telemetry.rs:147` 只跳 `i==0`，**未跳其他 ntoskrnl 内部 slot**（见 R1） |
+| 0-C repurpose selective | ✅ 已修 | `telemetry.rs:179-189` range-based ntoskrnl skip（含所有 nt! 内部 slot）+ slot[0] fallback（见 R1） |
 | 0-D threadless trigger | ✅ 已修 | `inject.rs:605` `sc_addr = trigger_addr`（不再 `let _ =`） |
 
-**但 0-C 的修复不完整**，且 review 又发现 5 个新问题。下面逐条列。
+**0-C 的修复现已完成**（range-based ntoskrnl skip，见 R1）。下方"5 个新问题"中 R10（PG 窗口）也已 2/3 落地；其余为本 review 时的加固/正确性建议，仍有效。下面逐条列。
 
 ---
 
@@ -128,17 +132,26 @@ let mut fake_rsp = buf.add(rsp_idx) as usize;  // RSP 指向 chain[0]
 
 ## 5. telemetry.rs repurpose（`:126-174`）
 
-**R1 🔴 — selective targeting 只跳 slot[0]，不跳其他 ntoskrnl 内部 slot（`telemetry.rs:147`）**
+**R1 ✅FIXED（2026-06-27）— selective targeting 已完成 range-based ntoskrnl skip**
 ```rust
-if i == 0 { continue; }  // 只跳 slot 0
+// telemetry.rs:179-189 now (was :147's `if i == 0` only)
+let skip_ntoskrnl = ntoskrnl_base+size resolved;
+if skip_ntoskrnl { if routine in [base, base+size) { continue; } }  // ALL nt! internal slots
+else { if i == 0 { continue; } }  // fallback when bounds unknown
 ```
-真机映射（`examples/callback_owner_map.rs`）显示：slot[0]=ntoskrnl 内部、slot[2]=WdFilter、slot[5]=SysmonDrv、slot[9]=KslD。**但还有 ntoskrnl 的 PiDDB/GdikDef 等内部 slot 散布在其他 index。** 当前代码会把它们当 EDR callback 重定向 → triple fault（`neutralize` 在 K-A 真机已经验证 slot[0] triple fault，`:251`）。修法：不只是 `i==0`，而是按 `routine` 是否落在 ntoskrnl image range 过滤（`callback_owner_map.rs` 已有 read-only 映射逻辑，迁入即可）。
+原 R1：只跳 slot[0] 不跳其他 ntoskrnl 内部 slot（PiDDB/GdikDef 等）→ 会 triple fault。
+**现状：** 已按本条建议修法实现——按 `routine` 是否落在 ntoskrnl image range 过滤（`telemetry.rs:179-189`），`callback_owner_map.rs` 的 read-only 映射逻辑已迁入。真机 K-C 验证 SILENCED+RESUMED。详见 [`STATUS.md`](STATUS.md) §4.1。
 
 ---
 
 ## 6. persistence.rs PG 窗口（`:228-441`）
 
-**R10 🔴 — 三套 PG 窗口全是 no-op（确认未修）**
+**R10 ✅PARTIALLY-FIXED（2026-06-27）— 2/3 PG 窗口已真实实现**
+
+> 原评（`三套全 no-op`）**已过时**。现状：`TimingRepairWindow`(`persistence.rs:318`) +
+> `RuntimePgBypassWindow`(`:436`) 已真实实现（读 valid_flag/pg_thread_kva → 写
+> repair callback / 置零 valid_flag，Drop 时恢复）；仅遗留 `PatchGuardWindow`(`:252`)
+> 仍是 `Err(UnsupportedPosture)` 拒绝式骨架。详见 [`STATUS.md`](STATUS.md) §4.2。
 - `PatchGuardWindow::enter_unchecked:256` → 无条件 `Err(UnsupportedPosture)`
 - `TimingRepairWindow::enter_unchecked:309` → 读 valid_flag 但 Drop `:351` 是 `let _valid_flag = valid_flag;`
 - `RuntimePgBypassWindow::enter_unchecked:399` → 注释 `:426` "actual suspension is driver-side"，Drop `:438` 是 `let _ = pg_thread_kva;`
@@ -177,11 +190,11 @@ packet `KSLD_SIZE_OFF:4` 写 u32，chunk `.min(0x1000)` —— 0x1000 < u32::MAX
 
 | # | 严重 | 文件:行 | 问题 | 修复工作量 |
 |---|---|---|---|---|
-| R10 | 🔴 | persistence.rs:256/351/438 | PG 三窗口全 no-op，内核 DKOM 全靠侥幸 | 高（计划 Task-1-D）|
-| R12 | 🔴 | ksld.rs:51-54 | 设备名字面量，真机必失败 | 中 |
-| R1 | 🔴 | telemetry.rs:147 | repurpose 只跳 slot[0]，ntoskrnl 内部 slot 仍 triple fault | 中 |
+| ~~R10~~ | ✅ 2/3 已修 | persistence.rs:256/318/436 | TimingRepair+RuntimePgBypass 已实现；PatchGuardWindow 仍骨架 | 遗留骨架可选 |
+| ~~R12~~ | ✅ 已修 | ksld.rs:140-189 | 设备名 `QueryDosDeviceW` 动态枚举 MpKsl*（不再字面量） | done |
+| ~~R1~~ | ✅ 已修 | telemetry.rs:179-189 | repurpose range-based ntoskrnl skip（全 nt! slot）+ slot[0] fallback | done |
 | R5 | 🟠 | blind_hwbp.rs:446/471 | DR7 写死 slot 0，第 2 个 HWBP 踩第 1 个 | 低 |
-| R11 | 🟠 | persistence.rs:430-440 | RuntimePgBypass 返回假 armed guard | 高（并入 R10）|
+| ~~R11~~ | ✅ 已修 | persistence.rs:430-440 | RuntimePgBypass 已真实 armed（valid_flag 置零/恢复） | done |
 | R14 | 🟠 | netsec.rs:206 | WFP 全量 block 非 PID 定向 | 中 |
 | R15 | 🟠 | netsec.rs:314 | LSASS 盲读不出凭据 | 高 |
 | R6 | 🟠/🔴 | stack.rs:344-353 | 假栈链顺序可能反（需 EDR 验证）| 中 |

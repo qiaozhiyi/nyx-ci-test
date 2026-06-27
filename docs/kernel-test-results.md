@@ -1,7 +1,8 @@
 # Windows 内核 tier 真机测试结果 (任务 G–K)
 
 **机器:** `154.201.73.219` / Windows Server 2019 Datacenter 17763.1339
-**日期:** 2026-06-24
+**日期:** 2026-06-27（重跑全链路 + callback 诊断全量数据）
+**首次运行:** 2026-06-24
 **授权:** 红队授权内核测试
 **驱动:** RTCore64.sys (MSI Afterburner, CVE-2019-16098)
   - SHA256 `01aa278b07b58dc46c84bd0b1b5c8e9ee4e62ea0bf7a695862444af32e87f1fd`
@@ -14,11 +15,14 @@
 
 | 任务 | 状态 | 关键结果 |
 |------|------|----------|
-| G 准备 driver + Defender 排除 | ✅ PASS | driver 下载、签名校验、排除生效 |
-| H BYOVD bootstrap | ✅ PASS | 驱动加载+设备打开+ntoskrnl base+KernelRw 10MB 读 |
-| I ETW-TI blind | ✅ PASS | IsEnabled 0x...01 → 0x0, provider disabled |
-| J 进程隐藏 | ✅ PASS | tasklist 1→0→1 (隐藏+恢复) |
-| K 回调中和 | ✅ PASS (repurpose) | neutralize(.text写)→triple fault×2; repurpose(数据写ctx指针)→Sysmon EID1 沉默+恢复成功 |
+| G 准备 driver + Defender 排除 | ✅ PASS | RTCore64 签名 VALID，Defender 排除生效 |
+| H BYOVD bootstrap | ✅ PASS | ntoskrnl=`0xfffff8057fa19000` + PE 校验 + 10MB 读 + 导出表 RVA 解析 |
+| I ETW-TI blind | ✅ PASS | IsEnabled `0x000000ff00000001` → `0x0000000000000000`，provider DISABLED |
+| J 进程隐藏 | ✅ PASS | notepad PID=7756, EPROCESS=`0xffffc30c40e83080`, tasklist 1→0→1, PG 未触发 |
+| K-A callback_probe_readonly | ✅ PASS | 10 occupied CreateProcess slots 全量扫描，telemetry.rs 假设全部 PLAUSIBLE |
+| K-B callback_owner_map | ✅ PASS | slot→驱动映射: slot[0]=ntoskrnl, slot[2]=WdFilter, slot[5]=SysmonDrv, slot[9]=KslD |
+| K-C callback_repurpose_test | ✅ PASS | SysmonDrv slot[5] repurpose: EID1 SILENCED + RESUMED |
+| K-D callback_neutralize_test | ❌ BSOD | 两次 triple fault，**生产禁用** |
 
 **前置修复（任务 H 期间发现并修复的 SDK bug，共 7 处）：**
 见下文 §"代码修复清单"。
@@ -201,13 +205,14 @@ NotifyRoutine 分发器，RVA 0x7CE50）的 routine 也写了 0xC3 → 破坏内
 
 - **回调中和目标达成**：Sysmon CreateProcess 监控成功沉默 + 恢复，零崩溃 ✓
 - **正确方法 = repurpose（数据写 ctx 指针）**，而非 neutralize（.text 代码写 0xC3）
-- **telemetry.rs 当前 `neutralize()` 实现的缺陷**（应修复）：
+- **telemetry.rs 当前 `neutralize()` 实现的缺陷**（应修复，但**生产应用 `repurpose` 不用 `neutralize`**）：
   1. 无差别中和所有 slot，包括 slot[0] ntoskrnl 内部 → triple fault
   2. 一次中和三类回调（任务只要 CreateProcess）
   3. 用 .text 代码写而非数据写 ctx 指针（后者 HVCI-safe 且不破坏函数）
-- **`repurpose()` 当前是 stub**（返回 UnsupportedPosture）—— 本次测试用独立 example
-  实现了 repurpose 真逻辑，证明它安全有效。建议把这套逻辑移植进 telemetry.rs 的
-  `CallbackNeutralizer::repurpose`（需要 ret gadget 解析 + slot 跳过 ntoskrnl 的逻辑）
+- **`repurpose()` 已迁入库代码并完成 selective slot targeting**（`telemetry.rs:126-200`，2026-06-27）——
+  本次测试用的独立 example 逻辑已移植进 `CallbackNeutralizer::repurpose`：range-based
+  ntoskrnl skip + slot[0] fallback + ret gadget 解析。真机任务 K-C 验证 SILENCED+RESUMED。
+  **`neutralize()`（.text 写）仅保留为危险参考，生产禁用。**
 
 
 ---
@@ -289,10 +294,11 @@ lang item 冲突；example 不需要 build-std。）
 
 ## 后续建议
 
-1. **telemetry.rs repurpose 移植**（任务 K 已验证 repurpose 是安全有效路径）：
-   把 `callback_repurpose_test.rs` 的逻辑（解析 ret gadget + 跳过 ntoskrnl 内部 slot
-   + 数据写 ctx+0x00）移植进 `CallbackNeutralizer::repurpose`（当前是 stub）。
-   `neutralize()` 应标记为危险（.text 写 → triple fault），文档警告只在 PG 窗口内用。
+1. **✅ telemetry.rs repurpose 移植已完成**（2026-06-27）：`callback_repurpose_test.rs`
+   的逻辑（解析 ret gadget + 跳过 ntoskrnl 内部 slot + 数据写 ctx+0x00）已移植进
+   `CallbackNeutralizer::repurpose`（`telemetry.rs:126-200`），并加了 selective slot
+   targeting（range-based ntoskrnl skip + slot[0] fallback）。真机 K-C 验证 SILENCED+RESUMED。
+   `neutralize()`（.text 写）保留为危险参考，生产禁用（PG 窗口内也建议用 repurpose）。
 2. **offset-resolver**：把 dbghelp 符号解析流程固化进 `crates/offset-resolver`，
    产出 `offsets.toml`，避免 example 硬编码 RVA（换机/补丁需重跑 sym_lookup.ps1）。
 3. **driver_load 通用化**：ImagePath 相对路径要求驱动在 system32\drivers；

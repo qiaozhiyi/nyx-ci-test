@@ -12,7 +12,7 @@ This project implements a comprehensive testing and review suite for the **Nyx**
 - `crates/` - Core Rust crates.
 - `scripts/` - Helper and deployment scripts.
 - `tools/` - Standalone tools (e.g., sRDI).
-- `docs/` - Development reports, capability matrices, research papers.
+- `docs/` - **Authoritative status: `docs/STATUS.md`**. Live dev docs (capabilities, handoff, real-machine results). `docs/archive/` holds superseded audit/research docs (historical, not authoritative).
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
@@ -24,25 +24,28 @@ This project implements a comprehensive testing and review suite for the **Nyx**
 | 5 | M5. P2 Bypass Module | EDR evasion: userland kits + kernel tier | None | DONE (2026-06-26) |
 | 6 | M6. Kernel Real-Machine | BYOVD load + ETW-TI + DKOM + Callback repurpose on Server 2019 | M5 | DONE (2026-06-26) |
 
-## Bypass Module Status (2026-06-26)
+## Bypass Module Status (2026-06-27)
 
-**Overall completion: ~87%** (userland 98%, kernel algo 100%, wiring 95%, kernel real-machine all pass)
+> **Authoritative detail: [`docs/STATUS.md`](docs/STATUS.md).** Numbers below are a summary.
 
-### Userland (implant-win)
+**Overall completion: ~90%** (userland 98%, kernel algo 100%, wiring 97%, kernel real-machine 7/7 PASS)
+
+### Userland (implant-win) — all default ARMED
 - ✅ Indirect syscalls (Hell/Halo/Tartarus SSN)
-- ✅ HWBP patchless blind (zero `.text` modification)
-- ✅ Byte-patch blind (NtTraceEvent)
-- ✅ Foliage sleep mask (APC chain + RC4)
-- ✅ Module stomping inject (gated)
-- ✅ BYOUD-Gap RSP swap (gated, CET-aware)
-- ✅ Memory region encryption (RC4)
+- ✅ HWBP patchless blind (zero `.text` modification) + byte-patch blind (NtTraceEvent)
+- ✅ Foliage sleep mask (APC chain + RC4, masks `.text` AND heap regions)
+- ✅ Module stomping inject + ThreadlessInject (HWBP) — `MODULESTOMP_ENABLED` default **ON**
+- ✅ BYOUD-Gap RSP swap (CET-aware; `SPOOF_SWAP_ENABLED` default **OFF** until CET-safe)
+- ✅ Memory region encryption (RC4) + heap slab tracking
+- ✅ ntdll unhook (KnownDlls + disk fallback) + anti-debug
 
 ### Kernel (operator-kernelsdk)
-- ✅ BYOVD driver load (KslD → RTCore64 fallback chain)
+- ✅ BYOVD driver load (KslD dynamic `QueryDosDeviceW` → RTCore64 fallback chain)
 - ✅ ETW-TI provider blind (IsEnabled=0, HVCI-safe)
 - ✅ DKOM process hide (ActiveProcessLinks unlink/relink)
-- 🔶 Callback repurpose (DATA write, 90% — needs selective slot targeting)
-- 🔶 MiniFilter (code done, pending real-machine verify)
+- ✅ Callback repurpose (DATA write, **selective slot targeting DONE** — range-based ntoskrnl skip + slot[0] fallback)
+- ✅ PatchGuard windows — `TimingRepairWindow` + `RuntimePgBypassWindow` real; only legacy `PatchGuardWindow` is a skeleton
+- 🔶 MiniFilter — algorithm in `telemetry.rs::MiniFilterUnlinker`, but `bootstrap_chain()` does NOT wire it (`flt_globals_kva=0`)
 
 ### Real-machine verification (Server 2019 17763.1339)
 - ✅ Task G: BYOVD driver load + ntoskrnl base resolve

