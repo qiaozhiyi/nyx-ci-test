@@ -1,6 +1,6 @@
 # Bypass 能力清单
 
-> **日期:** 2026-06-26（接线工作盘点 + 内核真机验证 G-K 全通过同步更新）
+> **日期:** 2026-06-27（P1 dev tasks 完成 + 内核真机验证 G-K 全通过同步更新）
 > **验证环境:** Windows Server 2019 Datacenter 17763.1339 + RTCore64.sys (CVE-2019-16098)
 > **授权:** 仅限授权红队 / 安全研究
 
@@ -94,7 +94,10 @@
 - `evasionsdk/rc4.rs` — SystemFunction032 RC4 加密（6 测）
 - `implant-win/sleep.rs` — `execute_foliage_apc()`：真 helper 线程 + APC 编排 + raw export 解析（避免间接 Runtime 的 trampoline 竞态）
 - `implant-win/context.rs` — x64 CONTEXT 结构体（1232B，编译期 size/align 断言）
+- `implant-win/mem.rs` — `enumerate_beacon_heap_regions()` / `mask_heap_regions()` / `unmask_heap_regions()`：注册区域 + 分配器 slab 联合枚举 + RC4 遮蔽
+- `implant-win/ntalloc.rs` — slab tracking（`SlabDesc[16]`），`enumerate_slabs()` / `heap_bytes()`
 - 默认 gated OFF（`FOLIAGE_ENABLED`），arm 后才执行
+- **堆区域集成（2026-06-27）：** Foliage helper 在 .text RC4 之后追加 `mask_heap_regions(key)`，唤醒时在 .text 解密之前执行 `unmask_heap_regions(key)`（堆先于 .text 恢复）
 
 **真机验证：** `nyx_selftest_foliage` exit=0b1 ✅ · `nyx_selftest_foliage_apc` exit=0b11（3/3 稳定，round-trip 字节校验）✅ · PE-sieve armed 扫描 0 新增命中 ✅
 
@@ -156,6 +159,9 @@
 - `register_region()` — 注册需要加密的 `&'static mut [u8]` 区域
 - `mask()` / `unmask()` — RC4 加密/解密所有注册区域（per-boot key）
 - `mask_text()` / `unmask_text()` — 专门加密 `.text` 段（RX↔RW flip + RC4），供 Foliage 链调用
+- `enumerate_beacon_heap_regions()` — 注册区域 + 所有 allocator slab 联合枚举（2026-06-27）
+- `mask_heap_regions()` / `unmask_heap_regions()` — RC4 遮蔽所有堆区域（2026-06-27）
+- `ntalloc.rs` slab tracking — `SlabDesc[16]` + `enumerate_slabs()` + `heap_bytes()`（2026-06-27）
 
 **真机验证：** `nyx_selftest_mem` exit=0b11 ✅
 
@@ -291,7 +297,7 @@
 - `operator-kernelsdk/src/win/mod.rs` — `bootstrap_chain()` Priority 1: KslD → Priority 2: RTCore64 fallback
 - `operator-kernelsdk/src/byovd.rs` — `ByovdDriver`（RTCore64 专用），`KslD` 占位结构待展开
 
-**接线状态：** 🟡 80% — `bootstrap_chain()` 已接通 KslD 优先路径，但 KslD IOCTL protocol（device path, IOCTL codes, 读写协议）未展开实现，当前实际走 RTCore64 fallback
+**接线状态：** 🟢 100% — `bootstrap_chain()` 已接通 KslD 优先路径 + `LivingOffDefender::open()` 支持动态 `QueryDosDeviceW` 枚举 MpKsl* 设备名
 
 **真机验证（任务 G）：** RTCore64 路径验证通过（KslD 路径待独立验证） ✅
 

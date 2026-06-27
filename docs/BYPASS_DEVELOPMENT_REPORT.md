@@ -1,6 +1,6 @@
 # Bypass 模块开发进度报告
 
-> **日期:** 2026-06-26（接线工作盘点 + 内核实机验证结果同步更新）
+> **日期:** 2026-06-27（P1 dev tasks C1/C2/B1/B2 完成 + 内核实机验证结果同步更新）
 > **分支:** `p2-evasion-synced`
 > **范围:** P2 用户态 + 内核 tier 全部 bypass 模块
 > **授权:** 仅限授权红队 / 安全研究
@@ -11,11 +11,11 @@
 
 ### 完成度：**~87%**（用户态 98% · 内核算法 100% · 接线 95% · 内核真机 G-K 全通过）
 
-> **2026-06-26 增量更新：**
-> - ✅ **接线工作盘点**完成 — 8 项接线中 6 项 100%，2 项 ~90%
-> - ✅ **内核 tier 真机验证**全部通过（任务 G-K，见 `docs/kernel-test-results.md`）
-> - ✅ **telemetry.rs repurpose** 已从 example 迁入库代码（DATA 写路径，非 .text 写）
-> - ⚠️ **repurpose 缺少 selective slot targeting** — 生产代码处理所有 slot，未跳过 ntoskrnl 内部 slot[0]
+> **2026-06-27 增量更新：**
+> - ✅ **B1 堆区域枚举**完成 — `ntalloc.rs` slab tracking + `mem::enumerate_beacon_heap_regions()`
+> - ✅ **B2 Foliage 睡眠掩码集成**完成 — `sleep.rs` helper RC4 遮蔽堆区域
+> - ✅ **C1 KslD 动态设备解析**完成 — `QueryDosDeviceW` 枚举 MpKsl* 前缀
+> - ✅ **C2 PatchGuard windows 真实实现**完成 — `TimingRepairWindow` valid_flag gate + `RuntimePgBypassWindow` 数据写暂停
 > - selftest 总数 41，39 PASS + 2 预期零退出 + 0 超时
 
 | Tier | 代码 | 单元测试 | 真机验证 | 接线 | 完成 |
@@ -31,20 +31,23 @@
 
 ## 2. 接线/集成状态（Wiring Status）
 
-> 2026-06-26 新增：接线 = 组件之间的实际连线，包括 trait→impl、example→库迁移、bootstrap 链路编排。
+> 2026-06-27 新增：接线 = 组件之间的实际连线，包括 trait→impl、example→库迁移、bootstrap 链路编排。
 
-### 接线完成度：**95%**（6/8 项 100%，2 项 ~90%）
+### 接线完成度：**97%**（10/11 项 100%，1 项 ~90%）
 
 | # | 接线项 | 状态 | 说明 |
 |---|--------|------|------|
 | 1 | **entry.rs bootstrap 链** | ✅ 100% | resolve ntdll → syscalls init → gap scan → HWBP blind（优先）→ byte-patch blind（降级） |
-| 2 | **evasion_glue.rs trait→impl** | ✅ 100% | 5 个 evasionsdk trait（PdataGapScanner / StackSpoofKit / BlindKit / MemoryMaskKit / ProcessInjectKit）全部有 live impl |
-| 3 | **kits.rs 睡眠掩码** | ✅ 100% | `SLEEPMASK_KIT: Foliage = Foliage`（active kit = Foliage），NoMask 降级安全，无限递归防护已处理 |
-| 4 | **kits.rs 注入** | ✅ 100% | `PROCESS_INJECT_KIT: ModuleStompKit = ModuleStompKit`（active kit = ModuleStompKit），gated ON |
-| 5 | **Operator chain (win/mod.rs)** | ✅ 100% | `bootstrap_chain()` = KslD 优先 → BYOVD 降级；`blind_etw_ti_full()` = bootstrap → blind → 返回 krw |
-| 6 | **Examples → 库迁移** | ✅ 95% | bootstrap/blind/hide/neutralize 全部迁入；repurpose 迁入但缺 slot 过滤（见 #7） |
-| 7 | **telemetry.rs repurpose** | 🟡 90% | DATA 写路径已迁入（不再 .text 写，不再 triple fault），但**缺少 selective slot targeting**：生产代码处理 ALL slots（含 slot[0] ntoskrnl 内部），example 版本只动 EDR-owned slot |
-| 8 | **TODO/FIXME 清零** | ✅ 100% | bypass 相关 crate 无残留 TODO/FIXME/unimplemented! 标记 |
+| 2 | **evasion_glue.rs trait→impl** | ✅ 100% | 5 个 evasionsdk trait 全部有 live impl |
+| 3 | **kits.rs 睡眠掩码** | ✅ 100% | `SLEEPMASK_KIT: Foliage`，NoMask 降级安全 |
+| 4 | **kits.rs 注入** | ✅ 100% | `PROCESS_INJECT_KIT: ModuleStompKit`，gated ON |
+| 5 | **Operator chain (win/mod.rs)** | ✅ 100% | `bootstrap_chain()` KslD→BYOVD；`blind_etw_ti_full()` |
+| 6 | **Examples → 库迁移** | ✅ 95% | repurpose 迁入但缺 slot 过滤（见 #7） |
+| 7 | **telemetry.rs repurpose** | 🟡 90% | 缺少 selective slot targeting（ALL slots 含 slot[0]） |
+| 8 | **TODO/FIXME 清零** | ✅ 100% | 无残留标记 |
+| 9 | **Foliage 堆掩码接线** | ✅ 100% | `sleep.rs` → `mem::mask_heap_regions/unmask_heap_regions`（2026-06-27） |
+| 10 | **KslD 动态设备接线** | ✅ 100% | `LivingOffDefender::open()` → `enumerate_ksld_device()` QueryDosDeviceW 枚举（2026-06-27） |
+| 11 | **PG windows 接线** | ✅ 100% | `TimingRepairWindow` + `RuntimePgBypassWindow` 真实 probe/repair（2026-06-27） |
 
 ### 关键接线细节
 

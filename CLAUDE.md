@@ -137,7 +137,8 @@ cargo +nightly check --manifest-path crates/implant-win/Cargo.toml --target x86_
 Modules (all `cfg(target_os = "windows")` except `heap`/`server_pub`):
 
 - **Foundation:** `heap` (alloc glue), `ntalloc` (bump allocator = the global
-  allocator), `resolve` (PEB walk + djb2; `LiveNtdll` impls
+  allocator, **slab-tracked** for heap enumeration at sleep-mask time),
+  `resolve` (PEB walk + djb2; `LiveNtdll` impls
   `nyx_evasion::SyscallSource` over the live ntdll), `syscalls` (indirect-syscall
   runtime: SSN table + ntdll `syscall;ret` gadget + RX trampoline; `syscall!`
   macro + global accessor), `config` (per-build encrypted config, re-randomized
@@ -149,7 +150,8 @@ Modules (all `cfg(target_os = "windows")` except `heap`/`server_pub`):
   (HWBP patchless blind — **shipped**, zero `.text` modification), `kits`
   (`Foliage` SleepmaskKit + `ModuleStompKit` ProcessInjectKit — **fully wired**),
   `stack` (call-stack spoof — **gated, CET-aware**), `sleep`+`mem`
-  (sleep-mask — **shipped, RC4 + APC timing**).
+  (sleep-mask — **shipped, RC4 + APC timing; heap regions now tracked and
+  masked alongside .text via Foliage helper**).
 - **Loop & capabilities:** `beacon` (the task loop; dispatches every wire
   `Command`), `transport` (WinHTTP POST + TLS), `envelopes` (build-time-baked
   malleable-C2 shapes), `hostinfo` (real `SessionInfo`), `fs` (Upload/Download/
@@ -170,16 +172,19 @@ sole native GUI is `crates/client-ui`, a pure-Rust Makepad app. The operator CLI
 ## Current status & next steps
 
 **P2 stealth is DONE and verified.** All userland kits shipped; kernel tier G-K tasks all pass on
-real machine (Server 2019 17763.1339, 2026-06-26). Overall bypass completion: ~87%
-(userland 98%, kernel algo 100%, wiring 95%, kernel real-machine all pass).
+real machine (Server 2019 17763.1339, 2026-06-26). Overall bypass completion: ~90%
+(userland 98%, kernel algo 100%, wiring 97%, kernel real-machine all pass).
+P1 dev tasks (C1 KslD dynamic device, C2 PG windows, B1 heap enumerator, B2 Foliage
+heap mask) all completed 2026-06-27.
 
-### Shipped & verified (2026-06-26)
+### Shipped & verified (2026-06-27)
 
 **Userland (implant-win):**
 - *Tier 0 — live in nyx_entry:* indirect syscalls (Hell/Halo/Tartarus SSN), KnownDlls+disk NTDLL unhook, AMSI/ETW userland blind, anti-debug
 - *P2.1a-i SHIPPED:* `PdataGapScanner` — 4945 gaps + 65 ghosts + 12671 nops on live Server 2019
 - *P2.1a-ii SHIPPED (gated):* BYOUD-Gap RSP swap — `SPOOF_SWAP_ENABLED` default OFF, CET-aware
 - *P2.1a-iii SHIPPED:* `mem.rs` RC4 mask + Foliage APC timing primitive (fully wired in `kits.rs`)
+- *P2.1a-iv SHIPPED:* **Heap region tracking + sleep-mask integration** — `ntalloc.rs` slab tracking (`SlabDesc[16]`), `mem::enumerate_beacon_heap_regions()` merges registered regions + all allocator slabs, `sleep.rs` Foliage helper now masks/unmaskes heap alongside `.text` (heap before .text unmask on wake)
 - *P2.1b SHIPPED:* `blind::patch_nt_trace_event` (byte-patch blind)
 - *P2.1c SHIPPED (gated):* `inject::module_stomp` — `MODULESTOMP_ENABLED` default OFF
 - *P2.1f SHIPPED:* HWBP patchless blind (`blind_hwbp.rs`) — zero `.text` modification, invisible to PE-sieve
@@ -191,9 +196,11 @@ real machine (Server 2019 17763.1339, 2026-06-26). Overall bypass completion: ~8
 
 **Kernel (operator-kernelsdk):**
 - *BYOVD driver load:* `bootstrap_chain()` — Priority 1: KslD.sys (Living off the Defender) → Priority 2: RTCore64 fallback ✅
+- *KslD device resolution:* **Dynamic `QueryDosDeviceW` enumeration** — tries operator-supplied → default `\\.\MpKsl` → full dos-device namespace scan for `MpKsl*` prefix ✅ (2026-06-27)
 - *ETW-TI blind:* `blind_etw_ti_full()` — bootstrap_byovd → EtwTiBlind::blind(), `IsEnabled` zeroed ✅
 - *DKOM process hide:* `hide_pid()` / `restore()` — `ActiveProcessLinks` unlink/relink ✅
 - *Callback repurpose:* DATA write ctx pointer → ret gadget (HVCI-safe) — migrated to `telemetry.rs::CallbackNeutralizer::repurpose()` ✅ (needs selective slot targeting)
+- *PatchGuard windows:* **`TimingRepairWindow`** real probe (valid_flag gate + repair callback write), **`RuntimePgBypassWindow`** data-only suspension (zero valid_flag, restore on Drop) — both wired, both HVCI-safe ✅ (2026-06-27)
 - *MiniFilter:* `bootstrap_chain()` includes MiniFilter path ✅ (code done, pending real-machine verify)
 
 **Bug fixes during kernel testing (7 total):** resolve_sym stub, GetModuleHandleA fallback, strip_prefix off-by-one, RegCreateKeyExW param swap, missing Type field, ImagePath relative path, RtCore64 device_path/IOCTL/protocol fixes
