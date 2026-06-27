@@ -214,7 +214,7 @@ pub unsafe fn module_info_by_name(name: &[u8]) -> Result<ModuleInfo, KrwError> {
         if ends_with_ci(&entry.full_path, name) {
             let base = entry.image_base as usize;
             if base == 0 {
-                return Err(KrwError::Unavailable(alloc::format!(
+                return Err(KrwError::Other(alloc::format!(
                     "{} ImageBase is zero (KASLR restriction — need SeDebugPrivilege)",
                     core::str::from_utf8(name).unwrap_or("<mod>")
                 )));
@@ -222,7 +222,7 @@ pub unsafe fn module_info_by_name(name: &[u8]) -> Result<ModuleInfo, KrwError> {
             return Ok(ModuleInfo { base, size: entry.image_size as usize });
         }
     }
-    Err(KrwError::Unavailable(alloc::format!(
+    Err(KrwError::Other(alloc::format!(
         "module {} not found in loaded-kernel-module list",
         core::str::from_utf8(name).unwrap_or("<mod>")
     )))
