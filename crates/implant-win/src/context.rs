@@ -133,7 +133,7 @@ const _: () = assert!(1232 == 0x4D0, "1232 == 0x4D0");
 /// the beacon loop. Safe because the beacon loop is single-threaded: the
 /// helper builds the context, queues the APC, then sleeps — by the time the
 /// next cycle overwrites this buffer, `NtContinue` has already consumed it.
-static mut CTX_BUF: Context = Context::default();
+static mut CTX_BUF: Context = Context { buf: [0u8; 1232] };
 
 /// Build a spoofed CONTEXT for NtContinue: RIP = `target_rip` (a .pdata gap
 /// address), RSP = `real_rsp` (the beacon thread's actual stack pointer),
