@@ -177,11 +177,15 @@ sole native GUI is `crates/client-ui`, a pure-Rust Makepad app. The operator CLI
 
 ## Current status & next steps
 
-**P2 stealth is DONE and verified.** All userland kits shipped; kernel tier G-K tasks all pass on
-real machine (Server 2019 17763.1339, 2026-06-26). Overall bypass completion: ~90%
-(userland 98%, kernel algo 100%, wiring 97%, kernel real-machine all pass).
-P1 dev tasks (C1 KslD dynamic device, C2 PG windows, B1 heap enumerator, B2 Foliage
-heap mask) all completed 2026-06-27.
+**P2 stealth + integration gaps DONE and verified.** All userland kits shipped;
+kernel tier G-K tasks all pass on real machine (Server 2019 17763.1339, 2026-06-26).
+Overall bypass completion: **~95%** (userland 98%, kernel algo 100%, wiring 100%,
+kernel real-machine all pass). P1 dev tasks (C1 KslD dynamic device, C2 PG windows,
+B1 heap enumerator, B2 Foliage heap mask) all completed 2026-06-27. **Gaps G1-G5
+closed 2026-06-27** (postex token-ops wired, creds/audit client sync, client-ui
+BOF loader + env token, MiniFilter reachable, offset-resolver symbol-server).
+Only **G6** remains — Win11 24H2/25H2 real-machine verify (hardware gap: sshconfig
+has no such host; `win`=Server 2019). `cargo test --workspace` = **318 passed / 0 failed**.
 
 ### Shipped & verified (2026-06-27)
 
@@ -212,16 +216,21 @@ heap mask) all completed 2026-06-27.
 
 **Bug fixes during kernel testing (7 total):** resolve_sym stub, GetModuleHandleA fallback, strip_prefix off-by-one, RegCreateKeyExW param swap, missing Type field, ImagePath relative path, RtCore64 device_path/IOCTL/protocol fixes
 
-### P0 next task — wire up `postex` token operations
+### DONE — postex token operations wired (G1) ✅
 
-`postex.rs` implements real `steal_token`/`use_token`/`revert`/`current` but
-**no `Command` variant calls them** (only selftests reach it). The implant
-cannot impersonate / move laterally today. See `docs/STATUS.md` gap G1. Need:
-1. New `Command` variants (tag 22+): `MakeToken{domain,user,password}`,
-   `StealToken{pid}`, `Rev2Self`, `GetUid` — update the hand-mirrored chain
-   (`msg.rs` encode/decode → `JsonCommand`+`into_command` in `server/src/lib.rs`
-   → both clients' command surface).
-2. Dispatch from `beacon.rs::execute()` to the `postex` functions.
+`postex.rs` token primitives are now first-class `Command` variants dispatched
+from `beacon.rs::execute()`. The implant can impersonate / move laterally.
+- New `Command` variants (tags 22-25): `StealToken{pid}`, `MakeToken{domain,
+  user,password,logon_type}`, `Rev2Self`, `GetUid` — wired through the full
+  hand-mirrored chain (`msg.rs` encode/decode → `JsonCommand`+`into_command`
+  in `server/src/lib.rs` → both clients).
+- `postex.rs` gained `make_token` (LogonUserW + DuplicateTokenEx) and `getuid`
+  (OpenThreadToken → GetTokenInformation(TokenUser) → LookupAccountSidW).
+  `steal_token`/`use_token`/`revert`/`current` retained unchanged.
+- Clients: CLI `/steal /make_token /rev2self /getuid`; GUI console parser.
+- **Real-machine verified** on Server 2019 (2026-06-27): rebuilt DLL →
+  `nyx_selftest_postex` exit=15 (0b1111, 4/4); aggregate selftest no regression.
+  See `docs/g1-g5-real-machine-verify-2026-06-27.md`.
 
 ### DONE — selective slot targeting for repurpose ✅
 
@@ -246,10 +255,11 @@ verified: SysmonDrv slot[5] EID1 SILENCED + RESUMED. Only the per-driver
 
 ### Architecture reference
 
-- **`docs/STATUS.md`** — **authoritative** current status (single source of truth)
+- **`docs/STATUS.md`** — **authoritative** current status (single source of truth; gaps G1-G5 closed, only G6=Win11 24H2 hardware remains)
 - `docs/BYPASS_DEVELOPMENT_REPORT.md` — full development report
 - `docs/BYPASS_CAPABILITIES.md` — capability matrix with real-machine status per item
-- `docs/kernel-test-results.md`, `docs/p2-real-machine-verify-2026-06-27.md` — real-machine data
+- `docs/kernel-test-results.md`, `docs/p2-real-machine-verify-2026-06-27.md` — kernel real-machine data
+- `docs/g1-g5-real-machine-verify-2026-06-27.md` — G1-G5 real-machine + G5 symbol-server verification
 - `docs/archive/` — historical audit/research/test docs (NOT authoritative; see `docs/archive/README.md`)
 
 ### Key 2026 finding

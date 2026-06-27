@@ -25,16 +25,19 @@ Node/JS anywhere.
 | `crates/protocol` — crypto + framing + codec | ✅ done (X25519+HKDF+ChaCha20-Poly1305, direction-disjoint nonces, anti-replay under write-guard, layered DoS caps) |
 | `crates/server` — HTTP beacon listener, sessions, task queue, control API | ✅ done (bearer/named-operator auth, JA3/JA4 TLS sniffing, cred store, hash-chain audit) |
 | `crates/agent-dev` — std implant (proves the loop on the dev host) | ✅ done |
-| `crates/client-cli` — operator TUI/REPL (ratatuai) + headless SOCKS5 relay | ✅ done (full tasking surface) |
-| `crates/client-ui` — desktop client (Makepad; sole native GUI) | 🟡 functional scaffold (no BOF loader / no creds-audit sync) |
-| `crates/implant-win` — Windows PIC agent (BRC4-grade) | ✅ **~15.6k LOC**, 48 selftests, all 21 `Command`s dispatched; indirect syscalls + HWBP/AMSI/ETW blind + NTDLL unhook + Foliage sleep mask (heap+text) + module-stomp inject + anti-debug, all default-ARMED |
-| `crates/operator-kernelsdk` — kernel-tier EDR bypass | ✅ BYOVD (KslD→RTCore64) + ETW-TI blind + DKOM hide + selective callback repurpose + 2/3 PatchGuard windows; 7/7 real-machine PASS on Server 2019 |
+| `crates/client-cli` — operator TUI/REPL (ratatui) + headless SOCKS5 relay | ✅ done (full tasking surface incl. token ops, `/creds sync`, `/audit`) |
+| `crates/client-ui` — desktop client (Makepad; sole native GUI) | ✅ functional (BOF file loader, token ops, creds/audit sync, env-token) |
+| `crates/implant-win` — Windows PIC agent (BRC4-grade) | ✅ **~16k LOC**, 48 selftests, all 25 `Command`s dispatched (incl. `StealToken`/`MakeToken`/`Rev2Self`/`GetUid`); indirect syscalls + HWBP/AMSI/ETW blind + NTDLL unhook + Foliage sleep mask (heap+text) + module-stomp inject + anti-debug, all default-ARMED |
+| `crates/operator-kernelsdk` — kernel-tier EDR bypass | ✅ BYOVD (KslD→RTCore64) + ETW-TI blind + DKOM hide + selective callback repurpose + 2/3 PatchGuard windows + MiniFilter-reachable; 7/7 real-machine PASS on Server 2019 |
 
 The encrypted beacon loop is **verified end-to-end** (ECDH + ChaCha20-Poly1305,
 anti-replay, check-in → task queue → task delivery → shell exec → encrypted
-response) on macOS via the std dev agent. Overall completion **~90%**; remaining
-work is integration (postex token-ops wiring, client creds/audit sync, client-ui
-BOF loader) — see `docs/STATUS.md` gap table.
+response) on macOS via the std dev agent. Overall completion **~95%** — gaps
+G1-G5 closed 2026-06-27 (postex token-ops wired & real-machine verified, client
+creds/audit sync, client-ui BOF loader + env token, MiniFilter reachable,
+offset-resolver symbol-server download). Only **G6** remains: Win11 24H2/25H2
+real-machine verify (hardware gap — no such host in sshconfig). See
+`docs/STATUS.md` for the authoritative status.
 
 ## Persistence & guardrails (team server env)
 

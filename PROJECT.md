@@ -23,12 +23,14 @@ This project implements a comprehensive testing and review suite for the **Nyx**
 | 4 | M4. Remote Functional Testing | Execute tests on Windows server via SSH & output pass/fail report | M3 | DONE |
 | 5 | M5. P2 Bypass Module | EDR evasion: userland kits + kernel tier | None | DONE (2026-06-26) |
 | 6 | M6. Kernel Real-Machine | BYOVD load + ETW-TI + DKOM + Callback repurpose on Server 2019 | M5 | DONE (2026-06-26) |
+| 7 | M7. Gap Closure + Real-Machine | Close gaps G1-G5 (postex/creds-audit/BOF-loader/MiniFilter/symserver); verify G1 on Server 2019 | M6 | DONE (2026-06-27) |
+| 8 | M8. Win11 24H2 Real-Machine | Cross-version offset + CET verify on Win11 24H2/25H2 | M7, Win11 VM | 🔶 BLOCKED (no Win11 24H2 host in sshconfig) |
 
 ## Bypass Module Status (2026-06-27)
 
 > **Authoritative detail: [`docs/STATUS.md`](docs/STATUS.md).** Numbers below are a summary.
 
-**Overall completion: ~90%** (userland 98%, kernel algo 100%, wiring 97%, kernel real-machine 7/7 PASS)
+**Overall completion: ~95%** (userland 98%, kernel algo 100%, wiring 100%, kernel real-machine 7/7 PASS). Gaps G1-G5 closed 2026-06-27; only G6 (Win11 24H2 real-machine) remains — hardware gap.
 
 ### Userland (implant-win) — all default ARMED
 - ✅ Indirect syscalls (Hell/Halo/Tartarus SSN)
@@ -38,6 +40,7 @@ This project implements a comprehensive testing and review suite for the **Nyx**
 - ✅ BYOUD-Gap RSP swap (CET-aware; `SPOOF_SWAP_ENABLED` default **OFF** until CET-safe)
 - ✅ Memory region encryption (RC4) + heap slab tracking
 - ✅ ntdll unhook (KnownDlls + disk fallback) + anti-debug
+- ✅ **Post-ex token operations** (G1, wired 2026-06-27): `StealToken`/`MakeToken`/`Rev2Self`/`GetUid` — real-machine verified (`nyx_selftest_postex` exit=15)
 
 ### Kernel (operator-kernelsdk)
 - ✅ BYOVD driver load (KslD dynamic `QueryDosDeviceW` → RTCore64 fallback chain)
