@@ -209,7 +209,8 @@ pub unsafe fn unlink_minifilters(
     krw: &dyn KernelRw,
     flt_globals_kva: usize,
 ) -> Result<(), KitError> {
-    use crate::telemetry::{MiniFilterKit, MiniFilterUnlinker};
+    use crate::MiniFilterKit;
+    use crate::telemetry::MiniFilterUnlinker;
     if flt_globals_kva == 0 {
         return Err(KitError::Other(
             "flt_globals_kva is 0 — MiniFilter unlink not wired (resolve fltmgr FltGlobals first)".into(),

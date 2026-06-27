@@ -160,7 +160,7 @@ pub struct ModuleInfo {
 pub unsafe fn module_info_by_name(name: &[u8]) -> Result<ModuleInfo, KrwError> {
     type NtQuerySystemInformationFn = unsafe extern "system" fn(
         u32, *mut c_void, u32, *mut u32,
-    );
+    ) -> i32;
     let nqsi: NtQuerySystemInformationFn =
         unsafe { super::resolve::resolve_sym(b"ntdll.dll", b"NtQuerySystemInformation") }?;
 
