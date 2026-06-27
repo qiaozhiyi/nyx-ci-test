@@ -753,7 +753,8 @@ async fn list_sessions(
     if let Some(r) = require_auth(&st, &headers) {
         return r;
     }
-    let mut out = Vec::new();
+    // Optimization: pre-allocate capacity to prevent reallocation during DashMap iteration.
+    let mut out = Vec::with_capacity(st.sessions.len());
     for entry in st.sessions.iter() {
         out.push(SessionView {
             id: hex::encode(entry.key()),
