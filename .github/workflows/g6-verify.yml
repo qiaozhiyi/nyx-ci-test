@@ -84,8 +84,18 @@ jobs:
       - name: "G6-3: Build offset-resolver + operator-kernelsdk"
         shell: pwsh
         run: |
-          cargo build --manifest-path crates/offset-resolver/Cargo.toml 2>&1 | Select-Object -Last 4
-          cargo build --manifest-path crates/operator-kernelsdk/Cargo.toml 2>&1 | Select-Object -Last 4
+          Write-Host "::group::offset-resolver"
+          cargo build --manifest-path crates/offset-resolver/Cargo.toml 2>&1 | Tee-Object -FilePath resolver.log | Select-Object -Last 4
+          Write-Host "::endgroup::"
+          Write-Host "::group::operator-kernelsdk (full output — do NOT truncate, we need the errors)"
+          # Capture full output so compile errors are visible; do not pipe to Select.
+          cargo build --manifest-path crates/operator-kernelsdk/Cargo.toml 2>&1 | Tee-Object -FilePath kernelsdk.log
+          Write-Host "::endgroup::"
+          # If the kernelsdk log contains 'error[E', surface it loudly and fail.
+          if (Select-String -Path kernelsdk.log -Pattern 'error\[E' -Quiet) {
+            Write-Host "::error::operator-kernelsdk failed to compile (see errors above)"
+            exit 1
+          }
 
       # ---- 3. Selftest regression suite on the 26100 kernel ----
       - name: "G6-4: Selftest regression (26100 kernel)"
@@ -161,5 +171,7 @@ jobs:
           name: g6-results-${{ github.run_id }}
           path: |
             offsets_g6*.toml
+            resolver.log
+            kernelsdk.log
           if-no-files-found: ignore
           retention-days: 14
