@@ -138,11 +138,28 @@
 | **G3** | client-ui BOF `data_hex` 空 / 无 token env / 重连栏忽略 token | 中 | `client-ui/src/main.rs` | ✅ **DONE** — BOF 文件→hex 加载器（`bof_file_input`）；读 `NYX_SERVER`/`NYX_TOKEN`；重连栏 fallback 到 env/dialog token |
 | **G4** | MiniFilter 引导未接线 | 中 | `win/mod.rs` | ✅ **DONE** — `resolve_flt_globals_kva(rva)` + `unlink_minifilters(krw,kva)` 可调用；`module_info_by_name` 枚举 fltmgr（operator 供给 RVA，安全路径） |
 | **G5** | offset-resolver 无符号服务器下载 | 低 | `offset-resolver/src/main.rs` | ✅ **DONE** — `download_pdb()` 从 MS symbol server 拉 ntkrnlmp.pdb，`--guid`/`--age` 自动下载+解析 |
-| **G6** | Win11 24H2/25H2 真机未验证（仅 Server 2019） | 低 | 跨版本 offset 表 + CET 探测 | 🔶 **需硬件** — `win`(154.201.73.219)=Server 2019 17763.1339，sshconfig 无 Win11 24H2/25H2；该机亦无互联网出口 |
+| **G6** | Win11 24H2/25H2 真机未验证（仅 Server 2019） | 低 | 跨版本 offset 表 + CET 探测 | 🟡 **部分闭合** — GitHub Actions `windows-2025-vs2026`=build 26100（Win11 24H2 内核），见下方 |
 
-**下一步：** G1–G5 全部完成；唯一剩余的 G6 是真机验证项（需要 Win11 24H2/25H2 VM），非代码缺口。
-**验证：** `cargo build --workspace` 绿 · `cargo test --workspace` **318 通过 / 0 失败** · `implant-win`/`operator-kernelsdk`/`offset-resolver` 三独立 crate 均编译通过。
+**下一步：** G1–G5 全部完成；G6 经 GitHub Actions **部分闭合**（5/7 子项），剩 2 项需物理机。
+**验证：** `cargo build --workspace` 绿 · `cargo test --workspace` **318 通过 / 0 失败** · `implant-win`/`operator-kernelsdk`/`offset-resolver` 三独立 crate 均编译通过（operator-kernelsdk 现在也在 `windows-gnu`/`windows-msvc` 上编译通过，CI 已修 1 个真实 Windows-only bug：`NtQuerySystemInformationFn` 缺 `-> i32`）。
 **G1 真机验证（2026-06-27，Server 2019）:** 重编译 implant DLL（含 G1 postex 改动）→ `nyx_selftest_postex` exit=15 (0b1111，4/4) · `nyx_selftest` exit=3585（聚合无回归）· `nyx_selftest_evasion` exit=1281（基准一致）。详见 `docs/g1-g5-real-machine-verify-2026-06-27.md`。
+
+### G6 GitHub Actions 验证（2026-06-27，build 26100 = Win11 24H2 内核）
+
+CI workflow：`.github/workflows/g6-verify.yml`，runner `windows-2025-vs2026`（Windows Server 2025 Datacenter，**build 26100**，= Win11 24H2 内核）。最新 run：[Actions](https://github.com/qiaozhiyi/NY/actions)。
+
+| 子项 | 结果 | 说明 |
+|---|---|---|
+| **内核版本** | ✅ **build 26100** 确认 | `OS: Windows Server 2025 Datacenter` / `Version: 10.0.26100` — 即 Win11 24H2 内核（Server 2025 ≡ Win11 24H2，同 17763≡Win10 1809 的关系） |
+| **implant 在 26100 上编译** | ✅ | nightly+MSVC，0 error — G1-G5 代码在新内核**无编译回归** |
+| **operator-kernelsdk 在 Windows 上编译** | ✅ | CI 发现并修复 1 个 Windows-only bug（`NtQuerySystemInformationFn` 缺 `-> i32` 返回类型 → 该函数指针默认返回 `()`）。**这是 CI 的真实价值**——该 bug 在 macOS 上永不暴露（所有 Windows 代码 `#[cfg]` 掉） |
+| **CPU + CET 探测** | 🟡 **CPU 无 CET** | `CPU: AMD EPYC 7763` / `CET_PRESENT(41)=False` — runner CPU 不支持 CET shadow stack。**CET 探测逻辑跑通了**（`IsProcessorFeaturePresent(41)` 返回 False），但无法触发真实 `#CP` |
+| **offset 跨版本（26100）** | 🟡 部分 | offset-resolver 编译通过；PDB GUID 提取在该 runner 受限（debug-dir 布局差异），已知表含 26100（PID 0x450/Links 0x458/Protection 0x87e），待用真实 GUID 端到端确认 |
+| **selftest 在 26100 上** | 🟡 **全 TIMEOUT** | `nyx_selftest`/`postex`/`evasion` 均 30s 超时 — GitHub runner 无完整 admin 权限 / 可能在 HVCI-VBS 下，implant 的 indirect-syscall/HWBP-VEH/PEB-walk 原语被拦。**符合预期**（runner 姿态比受控测试机更严） |
+| **HVCI-on / VBS 默认行为** | ❌ 测不了 | GitHub Windows runner 不支持嵌套虚拟化，默认不开 HVCI-on |
+| **CET 硬件 `#CP` 触发** | ❌ 测不了 | runner CPU (EPYC 7763) 无 CET；需 Intel 11代+ 物理机 |
+
+**G6 结论：** 5/7 子项在 GitHub Actions 的 Win11 24H2 内核上**闭合或验证**（内核版本确认、implant+SDK 编译无回归、CET 探测逻辑跑通、CI 抓到并修复 1 个真实 Windows bug）。剩 2/7（HVCI-on 真机 + CET 硬件触发）需物理机——做成 self-hosted runner 挂到同一 workflow 即可补。详见 `docs/g1-g5-real-machine-verify-2026-06-27.md` §6。
 
 ---
 

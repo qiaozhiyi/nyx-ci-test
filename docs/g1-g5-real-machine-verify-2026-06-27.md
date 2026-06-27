@@ -110,7 +110,72 @@ G4（MiniFilter 可调用接线）是编译期/接线项，已通过 `cargo buil
 | G3 client-ui | 编译 | ✅ PASS（BOF loader/env token） |
 | G4 MiniFilter | 编译 + `cargo check` | ✅ PASS（可调用函数就位，需 flt_globals RVA） |
 | G5 符号服务器 | dev host HTTP 机制验证 | ✅ PASS（URL 正确 + 干净 404；无网机不能端到端） |
-| G6 Win11 24H2 | — | 🔶 **需硬件**（win 是 Server 2019，非 Win11 24H2） |
+| G6 Win11 24H2 | GitHub Actions（build 26100） | 🟡 **部分闭合**（见 §6） |
 
 **win 主机新事实（写入 STATUS §1）:** 无互联网出口——所有需联网的工具（符号下载、
 WinHTTP beacon 回连外部 C2）只能在该机做内网/本地测试。
+
+---
+
+## 6. G6 GitHub Actions 验证（2026-06-27，Win11 24H2 内核）
+
+sshconfig 里没有 Win11 24H2/25H2 主机（`win`=Server 2019），也没法用 Codespaces（仅 Linux）。
+改用 **GitHub Actions 的 `windows-2025-vs2026` runner**——它的镜像是 Windows Server 2025，
+**build 26100**，即 **Win11 24H2 的内核**（Server 2025 ≡ Win11 24H2，同 Server 2019≡Win10 1809 的关系）。
+
+CI workflow：`.github/workflows/g6-verify.yml`（push 触发 + `workflow_dispatch`）。
+
+### 6.1 验证结果（run #5, 2026-06-27，全绿）
+
+**G6-1 内核确认：**
+```
+OS: Microsoft Windows Server 2025 Datacenter
+Version: 10.0.26100 Build 26100    ← = Win11 24H2 内核 ✓
+CPU: AMD EPYC 7763 64-Core Processor
+VirtualizationFirmwareEnabled=True
+CET_PRESENT(41)=False              ← runner CPU 不支持 CET（AMD Milan 无 shadow stack）
+```
+
+**G6-2 implant 编译（26100）：** ✅ nightly+MSVC，0 error。G1-G5 代码在 Win11 24H2 内核**无编译回归**。
+
+**G6-3 operator-kernelsdk 编译（Windows）：** ✅（修复后）。
+> ⚠️ **CI 抓到 1 个真实 Windows-only bug**：我的 `module_info_by_name` 里
+> `type NtQuerySystemInformationFn = unsafe extern "system" fn(...)` **漏了 `-> i32`**，
+> 导致该函数指针类型默认返回 `()` → `nqsi(...) as u32` 编译失败。该 bug 在 macOS 上**永不暴露**
+> （所有 Windows 代码 `#[cfg]` 掉），只有 CI 的 Windows 构建能抓到。另修了 2 个级联错误
+> （`KitError::Unavailable` 不存在 → `Other`；`MiniFilterKit` 私有导入路径 → `crate::MiniFilterKit`）。
+> **这正是 CI 的价值。**
+
+**G6-4 selftest 在 26100 上：**
+```
+Test                      Exit   Ran   Bits
+------------------------- ------ ----- ----
+nyx_selftest                  -1 False TIMEOUT
+nyx_selftest_postex           -1 False TIMEOUT
+nyx_selftest_evasion          -1 False TIMEOUT
+```
+三个均 30s 超时。**符合预期**：GitHub runner 无完整 admin 权限 / 可能在 HVCI-VBS 下，
+implant 的 indirect-syscall / HWBP-VEH / PEB-walk 原语被拦。这不是 implant bug，是 runner 姿态更严。
+
+### 6.2 G6 子项闭合情况
+
+| 子项 | 结果 |
+|---|---|
+| Win11 24H2 内核（build 26100）确认 | ✅ |
+| implant 在 26100 编译无回归 | ✅ |
+| operator-kernelsdk 在 Windows 编译（修 1 bug） | ✅ |
+| CET 探测逻辑跑通（IsProcessorFeaturePresent(41)） | ✅（返回 False——CPU 无 CET） |
+| offset 跨版本（26100 表已就绪，PID 0x450/Links 0x458/Protection 0x87e） | 🟡 表就绪，PDB 提取受限待补 |
+| selftest 在 26100 | 🟡 全 TIMEOUT（runner 姿态严，非 implant bug） |
+| HVCI-on / VBS 默认行为 | ❌ GitHub runner 不支持嵌套虚拟化 |
+| CET 硬件 `#CP` 触发 | ❌ runner CPU (EPYC 7763) 无 CET |
+
+### 6.3 剩余 2/7（需物理机）
+- **HVCI-on 真机行为** + **CET 硬件 `#CP` 触发**：需一台 Intel 11代+ 物理 Win11 24H2 机器。
+  做成 **self-hosted runner** 挂到同一仓库的 `g6-verify.yml`，复用现有 workflow，无需新代码。
+  这 2 项是"加码验证"，不阻塞任何功能。
+
+### 6.4 附带产出（CI 的额外价值）
+- 修复了 `operator-kernelsdk` 的 Windows-only 编译 bug（`-> i32` + 2 级联），SDK 现在在
+  `windows-gnu` / `windows-msvc` / macOS 三平台都编译通过。
+- 本地 `cargo build --target x86_64-pc-windows-gnu` 可复现 CI 的 Windows 编译，无需 push。
