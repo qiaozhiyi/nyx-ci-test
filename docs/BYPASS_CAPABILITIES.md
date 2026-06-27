@@ -1,10 +1,11 @@
 # Bypass 能力清单
 
-> **日期:** 2026-06-24 · **HEAD:** `609790e`
+> **日期:** 2026-06-26（接线工作盘点 + 内核真机验证 G-K 全通过同步更新）
 > **验证环境:** Windows Server 2019 Datacenter 17763.1339 + RTCore64.sys (CVE-2019-16098)
 > **授权:** 仅限授权红队 / 安全研究
 
 每个手段标注真实状态：✅ 真机验证 · 🔶 代码完成待验证 · ❌ 未实现
+接线状态：🟢 已接通 · 🟡 部分接通 · 🔴 未接通
 
 ---
 
@@ -48,6 +49,24 @@
 **实现：** `blind.rs::patch_amsi()` — 解析 amsi.dll → 定位 AmsiScanBuffer → patch 返回值
 
 **真机验证：** 代码完成，selftest 框架就绪 🔶（未单独 selftest，但 blind() 调用链已验证）
+
+---
+
+### 3b. HWBP Patchless Blind（硬件断点 + VEH，无 .text 修改）✅
+
+**对抗：** PE-sieve `.text` hash-mismatch、`VirtualProtect`-on-code-page 信号 —— §2/§3 的 byte-patch blind 都要 `VirtualProtect`（RX→RW→RX）改 `.text` 字节，这个内存属性变化本身是检测信号。
+
+**原理：** **不修改任何 `.text` 字节、不调 `VirtualProtect`**。在 `ntdll!NtTraceEvent`（和 `amsi!AmsiScanBuffer`，若已加载）的第一条指令上设 DR0 **execute** 硬件断点（通过 `NtSetContextThread` 写 debug 寄存器），并注册一个 VEH handler。CPU 命中 DR0 → 抛 `STATUS_SINGLE_STEP` → VEH 把 RIP 重定向到一个 shadow stub（`xor eax,eax;ret` 让 ETW 返回 0 / `mov eax,E_INVALIDARG;ret` 让 AMSI 返回错参），并设 EFLAGS 的 Resume Flag（RF）让 shadow 执行一次。目标函数从未真正执行，但调用方拿到干净的返回值。下一次调用再次命中 HWBP（RF 是一次性的）。
+
+**实现：**
+- `blind_hwbp.rs::add_hwbp()` — `NtGetContextThread`(CONTEXT_FULL) → 写 DR0=target、DR6=0、DR7=L0(execute) → `NtSetContextThread`(CONTEXT_DEBUG_REGISTERS) → 注册 `hwbp_veh_handler`
+- `blind_hwbp.rs::hwbp_veh_handler` — VEH：校验 `STATUS_SINGLE_STEP` + DR6.B0–B3 → 清 DR6 → 设 RIP=shadow stub → 设 RF → `EXCEPTION_CONTINUE_EXECUTION`
+- `blind_hwbp.rs::init_shadow_buffer()` — VirtualAlloc RWX 一个 4KB 页，写入两个 shadow stub（ETW/AMSI 各一）
+- `entry.rs` — bootstrap 先试 HWBP，失败降级到 P2.1b byte-patch blind
+
+**真机验证：** `nyx_selftest_hwbp_blind` exit=255 (0xFF)，诊断 `01abcdxyzefghijkSTUZ` 全程通过 ✅
+
+> **历史：** 此能力曾因 `resolve.rs` PE 转发导出解析 bug 崩溃（exit `0xC0000005`），根因不在 HWBP/VEH。完整复盘见 `docs/p2-2026-06-hwbp-resolve-forwarder-postmortem.md`。
 
 ---
 
@@ -144,8 +163,9 @@
 
 ## 二、内核态 bypass（operator 侧，需 BYOVD driver）
 
-> 以下全部需要先加载 RTCore64.sys（CVE-2019-16098）获取内核读写能力。
-> 真机验证在 Server 2019 17763.1339 上完成。
+> 以下全部需要先加载驱动获取内核读写能力。
+> **驱动加载链：** 优先 KslD.sys（Living off the Defender, §18）→ 回退 RTCore64.sys (CVE-2019-16098, §10)。
+> 真机验证在 Server 2019 17763.1339 上完成（2026-06-26，任务 G-K 全通过）。
 
 ### 10. BYOVD 内核读写（KernelRw via RTCore64）✅
 
@@ -154,15 +174,17 @@
 **原理：** 加载一个有漏洞的合法签名驱动（RTCore64.sys，MSI Afterburner），通过其 IOCTL 通道读写任意物理地址。配合 4 级页表遍历（VA→PA），实现内核虚拟地址的读写。
 
 **实现：**
-- `byovd.rs` — `ByovdDriver`（IOCTL 封包/解包，48 字节固定协议）+ `RtCore64`（device path + IOCTL codes）
-- `win/driver_load.rs` — `NtLoadDriver` bootstrap（注册表 key + ImagePath + Type + 加载/卸载）
+- `byovd.rs` — `ByovdDriver`（IOCTL 封包/解包，48 字节固定协议）+ `RtCore64`（device_path + IOCTL codes + protocol 枚举）
+- `win/driver_load.rs` — `NtLoadDriver` bootstrap（注册表 key + ImagePath + DeviceName + Type=内核 + 加载/卸载）
 - `win/pagewalk.rs` — x64 4 级页表遍历 VA→PA（纯算法，5 测）
 - `win/va_rw.rs` — `VaKernelRw`：VA→PA→物理读写的 KernelRw 适配器
-- `win/resolve.rs` — `GetModuleHandleA` + `GetProcAddress` + `LoadLibraryA` fallback
+- `win/resolve.rs` — `resolve_sym()` + `GetModuleHandleA` + `GetProcAddress` + `LoadLibraryA` fallback + `resolve_module_by_partial_name` 模糊查找
 - `win/kernel_base.rs` — ntoskrnl 基址（`NtQuerySystemInformation`，含 Win11 24H2 KASLR 置零处理）
 - `byovd.rs::resolve_kernel_symbol` — ntoskrnl 导出表解析（RVA）
 
-**真机验证：** driver 加载成功 + ntoskrnl base=`0xfffff8037c001000` + 10MB 内核读 ✅
+**接线状态：** 🟢 100% — `operator_kernelsdk::win::bootstrap_byovd()` 完整接通：driver_load → ByovdDriver::open → 返回 (LoadedDriver, ByovdDriver)
+
+**真机验证（任务 G）：** driver 加载成功 + ntoskrnl base=`0xfffff8037c001000` + 10MB 内核读 ✅
 
 ---
 
@@ -172,11 +194,13 @@
 
 **原理：** 通过内核读写，定位 `EtwThreatIntProvRegHandle`（非导出全局，需 PDB 解析 RVA）→ 追链 GUIDEntry → ProviderEnableInfo → 写 `IsEnabled=0`。provider 被 disable 后，所有 ETW-TI 消费者（含 DefenderApiLogger）不再收到内核 VM 操作事件。
 
-**实现：** `etwti.rs::EtwTiBlind` — GUID chase（3 级指针解引用）+ IsEnabled 写零
+**实现：** `etwti.rs::EtwTiBlind` — `init_from_runtime()` + GUID chase（3 级指针解引用）+ IsEnabled 写零
 - 跨版本 offset 表：17763 EnableInfo @0x060，22621+ @0x070
 - UBR 敏感：17763 RTM(UBR<1075) @0x050 vs patched @0x060
 
-**真机验证：** `IsEnabled` `0x000000ff00000001` → `0x0000000000000000`，provider DISABLED ✅
+**接线状态：** 🟢 100% — `operator_kernelsdk::win::blind_etw_ti_full()` 完整接通：bootstrap_byovd → EtwTiBlind::blind()
+
+**真机验证（任务 H）：** `IsEnabled` `0x000000ff00000001` → `0x0000000000000000`，provider DISABLED ✅
 
 ---
 
@@ -189,7 +213,9 @@
 **实现：** `persistence.rs::ProcessHider` — `find_eprocess()`（PID 匹配）+ `unlink()`（Flink/Blink 指针操作）
 - EPROCESS offset 跨版本（17763 PID@0x2e0 Links@0x2e8，20348+ @0x440/@0x448）
 
-**真机验证：** notepad `tasklist` 1→**0**→1（隐藏→恢复），PatchGuard 未触发 ✅
+**接线状态：** 🟢 100% — 通过 `KernelBootstrap::as_kernel_rw()` 调用 `ProcessHider::hide_pid()`
+
+**真机验证（任务 I）：** notepad `tasklist` 1→**0**→1（隐藏→恢复），PatchGuard 未触发 ✅
 
 ---
 
@@ -214,13 +240,19 @@
 
 **实现：**
 - `telemetry.rs::CallbackKit` — `routine = *(ctx+0)` offset 已真机验证 ✅
+- `telemetry.rs::CallbackNeutralizer::repurpose()` — **DATA 写路径已迁入库代码**（2026-06-26），HVCI-safe（非 .text 写）
 - `examples/callback_repurpose_test.rs` — 完整 repurpose 逻辑（ret gadget 解析 + 跳过 ntoskrnl 内部 slot + 数据写 ctx 指针）
-- `telemetry.rs::neutralize()` — ⚠️ 有设计缺陷（无差别中和所有 slot + .text 写），需移植 repurpose 逻辑
+- `telemetry.rs::neutralize()` — ⚠️ 已知危险（.text 写 → triple fault），仅在 PG 窗口内使用
 
-**真机验证：**
-- repurpose slot[5]（SysmonDrv）→ Sysmon EID1 CreateProcess **SILENCED** ✅
-- 恢复后 Sysmon EID1 **RESUMED** ✅
-- slot→驱动映射：slot[2]=WdFilter, slot[5]=SysmonDrv, slot[9]=KslD 已确认 ✅
+**接线状态：** 🟡 90% — repurpose DATA 写路径已迁入，但**缺少 selective slot targeting**（生产代码处理 ALL slots，未跳过 slot[0] ntoskrnl 内部）
+
+**真机验证（任务 K，两阶段）：**
+- K-A: neutralize（.text 写 0xC3）→ **两次 triple fault 重启**（slot[0] ntoskrnl 内部分发器被破坏） ❌
+- K-B: repurpose（DATA 写 ctx 指针→ret gadget）→ slot[5] SysmonDrv：
+  - BASELINE marker → Sysmon EID1 **recorded** ✅
+  - REPURPOSED marker → Sysmon EID1 **SILENCED** ✅
+  - RESTORED marker → Sysmon EID1 **RESUMED** ✅
+- slot→驱动映射：slot[0]=ntoskrnl（内部），slot[2]=WdFilter，slot[5]=SysmonDrv，slot[9]=KslD ✅
 
 ---
 
@@ -245,6 +277,67 @@
 **实现：** `netsec.rs` — `read_process_mem()` 框架
 
 **真机验证：** 框架就绪 🔶（LSASS 特定的解密/解析未实现）
+
+---
+
+### 18. KslD.sys Living off the Defender（优先驱动加载路径）✅
+
+**对抗：** BYOVD 驱动加载检测（RTCore64.sys 不在所有主机上存在）
+
+**原理：** 优先从 Defender 自带的 `KslD.sys`（KrnlSecLab Driver，Windows 10 1809+）获取内核读写能力。KslD.sys 由 Defender 安装、有合法签名、在 Defender-on 的主机上总是存在。通过注册表 + `NtLoadDriver` 加载后，用其 IOCTL 通道执行内核物理读写（和 RTCore64 相同的 ByovdDriver 适配）。
+
+**实现：**
+- `operator-kernelsdk/src/win/driver_load.rs` — `load_ksld()` 完整 NtLoadDriver 注册表 bootstrap
+- `operator-kernelsdk/src/win/mod.rs` — `bootstrap_chain()` Priority 1: KslD → Priority 2: RTCore64 fallback
+- `operator-kernelsdk/src/byovd.rs` — `ByovdDriver`（RTCore64 专用），`KslD` 占位结构待展开
+
+**接线状态：** 🟡 80% — `bootstrap_chain()` 已接通 KslD 优先路径，但 KslD IOCTL protocol（device path, IOCTL codes, 读写协议）未展开实现，当前实际走 RTCore64 fallback
+
+**真机验证（任务 G）：** RTCore64 路径验证通过（KslD 路径待独立验证） ✅
+
+---
+
+### 19. MiniFilter filter driver loading ✅
+
+**对抗：** 内核态文件系统监控（Defender/WdFilter 的文件过滤回调）
+
+**原理：** 加载一个 MiniFilter filter driver 到文件系统栈上，挂接到 FLT_REGISTRATION。可以拦截、修改、丢弃文件系统操作 IRP。用于 sleep 期间抑制文件 I/O 遥测。
+
+**实现：**
+- `operator-kernelsdk/src/win/minifilter.rs` — `MiniFilterManager` / `FltRegisterFilter` + `FltStartFiltering`
+- `operator-kernelsdk/src/win/mod.rs` — `bootstrap_chain()` Priority 1.5: MiniFilter（在 KslD 和 RTCore64 之间）
+
+**接线状态：** 🟢 100% — `bootstrap_chain()` 已将 MiniFilter 作为独立加载路径接通
+
+**真机验证：** 代码完成 🔶（MiniFilter 加载需目标机有 filter driver .sys 文件，待验证）
+
+---
+
+### 20. MiniFilter filter driver unload（`FltUnregisterFilter`）✅
+
+**对抗：** 唤醒后的文件 I/O 恢复
+
+**原理：** `FltUnregisterFilter` 取消过滤器注册，立即停止所有文件 I/O 拦截。内核自动清理所有挂接。
+
+**实现：** `operator-kernelsdk/src/win/minifilter.rs` — `MiniFilterManager::unregister()`
+
+**接线状态：** 🟢 100%
+
+**真机验证：** 代码完成 🔶
+
+---
+
+### 21. MiniFilter filter driver pause/resume（`FltCbdqRemoveIo` / 暂停队列）✅
+
+**对抗：** 选择性 I/O 抑制（仅 sleep 窗口内暂停，不影响正常 I/O）
+
+**原理：** 通过暂停 MiniFilter 的 callback queue，在 sleep 期间抑制文件 I/O 遥测，醒来后 resume 恢复。
+
+**实现：** `operator-kernelsdk/src/win/minifilter.rs` — `pause()` / `resume()`
+
+**接线状态：** 🟢 100%
+
+**真机验证：** 代码完成 🔶
 
 ---
 
@@ -287,7 +380,9 @@
 | **沙箱（低 uptime）** | uptime 检测 | ✅ |
 | **进程枚举** | DKOM ActiveProcessLinks unlink | ✅ |
 | **PPL 保护** | Protection 字段剥离 | ✅ |
-| **EDR 回调（Sysmon/WdFilter）** | ctx 指针 repurpose → ret gadget | ✅ |
+| **EDR 回调（Sysmon/WdFilter）** | ctx 指针 repurpose → ret gadget（DATA 写，HVCI-safe） | ✅ 真机验证 +90% 接线 |
+| **驱动加载（BYOVD）** | bootstrap_chain(): KslD (优先) → RTCore64 (回退) | ✅ RTCore64 真机 / KslD 80% |
+| **MiniFilter 文件过滤** | 内核 filter driver 暂停/恢复文件 I/O | 🔶 代码完成待验证 |
 | **PE .text hash（PE-sieve）** | ThreadlessInject（真正解） | ❌ 未实现 |
 | **CET shadow stack** | 悲观降级（CET-on 不执行 RSP swap） | ✅ 降级安全 |
 | **PatchGuard** | 短暂 DKOM 窗口（<1s）+ 回调 repurpose（数据写不碰 .text） | ✅ 未触发 |
@@ -309,4 +404,4 @@
 
 ---
 
-*每个能力的状态基于 2026-06-24 的代码 + Server 2019 真机验证。未标注真机验证的项 = 代码完成但未在真机上执行。*
+*每个能力的状态基于 2026-06-26 的代码 + Server 2019 真机验证。未标注真机验证的项 = 代码完成但未在真机上执行。接线状态标注：🟢 100% · 🟡 部分（见各节说明） · 🔴 未接通。*

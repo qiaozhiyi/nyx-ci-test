@@ -2153,6 +2153,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "ureq",

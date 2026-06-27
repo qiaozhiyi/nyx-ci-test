@@ -11,12 +11,19 @@ use crate::wire::{Reader, WireError, Writer};
 /// `Vec::with_capacity(u32::MAX)` on the server.
 const MAX_BATCH: usize = 65_536;
 
-/// Hard cap on any wire-encoded element count (tasks per batch, BOF args, etc.).
-/// Legitimate payloads never exceed a few dozen items per beacon cycle; 256 is a
-/// generous ceiling.  This is a *secondary* guard — the primary allocation guard
-/// is [`MAX_BATCH`] — applied directly to the loop iteration count so that even
-/// if the allocation guard is somehow bypassed the decoder still terminates in
-/// bounded time.
+/// Hard cap on per-cycle command/arg element counts (tasks dispatched to an
+/// implant, BOF args). Legitimate payloads never exceed a few dozen items per
+/// beacon cycle; 256 is a generous ceiling. This is a *secondary* guard — the
+/// primary allocation guard is [`MAX_BATCH`] — applied directly to the loop
+/// iteration count so that even if the allocation guard is somehow bypassed the
+/// decoder still terminates in bounded time.
+///
+/// **NOT applied to [`TaskResponse`] batches** — those carry `FileChunk`/BOF
+/// output streams that legitimately run into thousands of items per cycle (a
+/// 10 MiB download at 64 KiB chunks = 160 chunks; large uploads far exceed that).
+/// Truncating responses at 256 silently drops file-tail chunks. Result batches
+/// use [`MAX_BATCH`] (65536) as their only wire cap; per-session buffering is
+/// bounded by the server's `MAX_RESULTS_PER_SESSION` eviction instead.
 const MAX_WIRE_COUNT: usize = 256;
 
 /// Validate a length-prefixed element count read off the wire. Returns the
@@ -527,8 +534,13 @@ impl TaskResponse {
         let mut r = Reader::new(data);
         let n_raw = r.u32()?;
         let cap = checked_count(&mut r, n_raw)?;
-        let n = (n_raw as usize).min(MAX_WIRE_COUNT);
-        let mut out = Vec::with_capacity(cap);
+        // Results stream FileChunk / BOF output and legitimately run into the
+        // thousands per cycle — do NOT apply MAX_WIRE_COUNT (256) here, it would
+        // silently drop file-tail chunks. `checked_count` already bounds the
+        // allocation at MAX_BATCH (65536) and the per-session buffer is evicted
+        // server-side past MAX_RESULTS_PER_SESSION.
+        let n = (n_raw as usize).min(MAX_BATCH).min(cap);
+        let mut out = Vec::with_capacity(n);
         for _ in 0..n {
             out.push(TaskResponse::decode(&mut r)?);
         }

@@ -80,6 +80,7 @@ rcgen = "0.13"
 # the TLS stream as either http1 or http2 transparently.
 hyper = { version = "1", features = ["http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1"
