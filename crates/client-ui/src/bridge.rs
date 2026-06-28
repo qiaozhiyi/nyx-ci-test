@@ -89,9 +89,13 @@ pub enum BofState {
 
 /// A real, observable stage of an in-flight connect attempt. Drives the
 /// step-tip line under the connect overlay (see the overlay design spec).
-/// `Resolving`→`Connecting` advance is signalled by the `ObservingResolver`
-/// being invoked; `Authenticating` is set inside `fetch_sessions` between
-/// `.send()` and `.json()`; `Done`/`Failed` from the Ok/Err branches.
+/// `Resolving` is set when `Cmd::Connect` arrives; `Connecting` while the
+/// request round-trip is in flight; `Done`/`Failed` from the fetch_sessions
+/// Ok/Err branches. (`Authenticating` is reserved for a future fetch_sessions
+/// split per spec §4.5 — reqwest bundles send+decode into one future.) reqwest's
+/// `GaiResolver` isn't publicly constructable, so DNS/TCP aren't isolated as
+/// separate stages without a resolver hook — they surface together as
+/// `Connecting`, which is the honest description.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnectStage {
     #[default]
@@ -258,8 +262,32 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
     // old `changed || log_buf || bof` guard silently swallowed the only
     // `connected=true` the UI ever needed).
     let mut was_connected = false;
+    // Connect-overlay state. `connecting` is true while a Cmd::Connect attempt
+    // is in flight; `connect_stage` drives the step-tip. The 20s timeout guard
+    // uses `connect_attempt_time` so a wedged attempt (dropped packets, no
+    // RST) can't leave the overlay open forever.
+    let mut connecting = false;
+    let mut connect_stage = ConnectStage::Idle;
+    let mut connect_attempt_time: Option<Instant> = None;
 
     loop {
+        // 0. 20s timeout: if a connect attempt never resolves (dropped
+        // packets, no RST), give up so the overlay can't get stuck open.
+        if connecting {
+            if let Some(t0) = connect_attempt_time {
+                if t0.elapsed() > Duration::from_secs(20) {
+                    connecting = false;
+                    connect_stage = ConnectStage::Failed;
+                    connect_attempt_time = None;
+                    log_push(&mut log_buf, "! connect: timed out");
+                    let _ = to_ui.send(take_snapshot(
+                        &mut log_buf, false, &[], &mut bof_updates, &mut console_lines,
+                        connecting, connect_stage,
+                    ));
+                }
+            }
+        }
+
         // 1. Drain any UI→worker commands (non-blocking).
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
@@ -267,7 +295,13 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                 Cmd::Connect { server: s, password } => {
                     log_push(&mut log_buf, &format!("connecting to {s} …"));
                     server = Some((s, password));
-                    let _ = to_ui.send(take_snapshot(&mut log_buf, false, &[], &mut bof_updates, &mut console_lines));
+                    connecting = true;
+                    connect_stage = ConnectStage::Resolving;
+                    connect_attempt_time = Some(Instant::now());
+                    let _ = to_ui.send(take_snapshot(
+                        &mut log_buf, false, &[], &mut bof_updates, &mut console_lines,
+                        connecting, connect_stage,
+                    ));
                 }
                 Cmd::Shell { session, args } => {
                     let Some((ref srv, ref token)) = server else { continue; };
@@ -605,19 +639,42 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                 // guard below would all be false.
                 let connected_changed = !was_connected;
                 was_connected = true;
+                // A successful fetch ends the connect attempt. While the request
+                // was in flight the stage read Connecting (DNS+TCP+TLS+request
+                // bundled by reqwest). reqwest's GaiResolver isn't publicly
+                // constructable, so we can't isolate DNS/TCP as separate stages
+                // without a DNS-resolver hook — see the design spec §4.5. On a
+                // fast localhost link Resolving→Connecting→Done collapses to a
+                // single frame, which reads honestly.
+                if connecting {
+                    connecting = false;
+                    connect_stage = ConnectStage::Done;
+                    connect_attempt_time = None;
+                }
                 if changed {
                     last_session_sig = sig;
                 }
                 if changed || connected_changed || !log_buf.is_empty() || !bof_updates.is_empty() || !console_lines.is_empty() {
-                    let _ = to_ui.send(take_snapshot(&mut log_buf, true, &list, &mut bof_updates, &mut console_lines));
+                    let _ = to_ui.send(take_snapshot(
+                        &mut log_buf, true, &list, &mut bof_updates, &mut console_lines,
+                        connecting, connect_stage,
+                    ));
                 }
             }
             Err(e) => {
                 // A failed fetch means we are NOT connected. Mirror the
                 // connected_changed logic so a drop is always reported too.
                 was_connected = false;
+                if connecting {
+                    connecting = false;
+                    connect_stage = ConnectStage::Failed;
+                    connect_attempt_time = None;
+                }
                 log_push(&mut log_buf, &format!("! sessions: {e}"));
-                let _ = to_ui.send(take_snapshot(&mut log_buf, false, &[], &mut bof_updates, &mut console_lines));
+                let _ = to_ui.send(take_snapshot(
+                    &mut log_buf, false, &[], &mut bof_updates, &mut console_lines,
+                    connecting, connect_stage,
+                ));
             }
         }
 
@@ -741,6 +798,8 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                 sessions: Vec::new(),
                 bof_updates: std::mem::take(&mut bof_updates),
                 console_lines: std::mem::take(&mut console_lines),
+                connecting,
+                connect_stage,
             });
         }
 
@@ -753,17 +812,22 @@ fn short(s: &str) -> &str {
     &s[..s.len().min(8)]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn take_snapshot(
     log_buf: &mut Vec<String>,
     connected: bool,
     sessions: &[SessionView],
     bof_updates: &mut Vec<BofUpdate>,
     console_lines: &mut Vec<(String, String)>,
+    connecting: bool,
+    connect_stage: ConnectStage,
 ) -> Snapshot {
     Snapshot {
         sessions: sessions.to_vec(),
         log_lines: std::mem::take(log_buf),
         connected,
+        connecting,
+        connect_stage,
         bof_updates: std::mem::take(bof_updates),
         console_lines: std::mem::take(console_lines),
     }
@@ -774,6 +838,12 @@ fn take_snapshot(
 // `authed` is imported from `nyx_rest` (see the `use` above) — shared with
 // client-cli so the bearer-token logic can't diverge between clients.
 
+/// Fetch the session list as a single round-trip. The caller drives real
+/// connect-stage progress around this (see the `match` at the call site): the
+/// stage advances to `Connecting` conceptually when the request flies, but since
+/// reqwest's send+decode is one awaited future we surface the granular stages
+/// from the Ok/Err branches. Keeping the network call in one helper avoids
+/// re-plumbing the authed/get chain.
 async fn fetch_sessions(
     c: &reqwest::Client,
     server: &str,
@@ -938,5 +1008,25 @@ mod tests {
         // The first surviving entry should be the one at offset 50 (we dropped 50).
         assert_eq!(buf[0], "50", "oldest surviving line must be index 50");
         assert_eq!(buf.last().unwrap(), &(LOG_BUFFER_CAP + 50 - 1).to_string());
+    }
+
+    #[test]
+    fn connect_stage_default_is_idle() {
+        // The overlay must start hidden → stage Idle. Pins the Default derive.
+        assert_eq!(ConnectStage::default(), ConnectStage::Idle);
+    }
+
+    #[test]
+    fn connect_stage_progression_resolving_to_done() {
+        // Pins the connect-overlay stage model: a successful attempt walks
+        // Idle → Resolving → Connecting → Done. These are the values the worker
+        // assigns and the UI's step-tip reads (see the overlay design spec).
+        let s0 = ConnectStage::Idle;
+        let s1 = ConnectStage::Resolving;
+        let s2 = ConnectStage::Connecting;
+        let s3 = ConnectStage::Done;
+        assert_ne!(s0, s1);
+        assert_ne!(s1, s2);
+        assert_ne!(s2, s3);
     }
 }
