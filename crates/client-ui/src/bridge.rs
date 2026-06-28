@@ -54,6 +54,13 @@ pub struct Snapshot {
     pub log_lines: Vec<String>,
     /// Connection state — drives the top status bar.
     pub connected: bool,
+    /// True while a `Cmd::Connect` attempt is in flight (between the Connect
+    /// command and the first `fetch_sessions` resolution). Drives the connect
+    /// overlay: shown while true, fades out when it flips false.
+    pub connecting: bool,
+    /// The real connection stage currently in flight (or the last one reached).
+    /// Drives the step-tip line under the progress bar.
+    pub connect_stage: ConnectStage,
     /// BOF execution updates since the last snapshot. Each entry is appended to
     /// the BOF history UI global by the App. Empty unless a BOF task changed
     /// state (enqueued / completed / errored).
@@ -78,6 +85,22 @@ pub enum BofState {
     Pending,
     Done,
     Error,
+}
+
+/// A real, observable stage of an in-flight connect attempt. Drives the
+/// step-tip line under the connect overlay (see the overlay design spec).
+/// `Resolving`→`Connecting` advance is signalled by the `ObservingResolver`
+/// being invoked; `Authenticating` is set inside `fetch_sessions` between
+/// `.send()` and `.json()`; `Done`/`Failed` from the Ok/Err branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectStage {
+    #[default]
+    Idle,
+    Resolving,
+    Connecting,
+    Authenticating,
+    Done,
+    Failed,
 }
 
 /// UI→worker command. Enum keeps the channel message type closed and explicit.
