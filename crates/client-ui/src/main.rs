@@ -512,6 +512,41 @@ script_mod! {
         VLine := View { show_bg: true width: 2 height: 0 draw_bg.color: Caccent }
     }
 
+    // ── connect overlay progress bar (shader) ───────────────────────────────
+    // A named top-level shader component (like NetworkBg) — Makepad's DSL
+    // requires pixel-fn components to be standalone definitions so the Script
+    // system can compile them. Referenced as `connect_progress := ConnectProgress`
+    // inside the connecting_overlay. 14 cells; a wave head travels L→R lighting
+    // cells with a green neon glow; driven by self.draw_pass.time (the verified
+    // NetworkBg shader path).
+    let ConnectProgress = View{
+        show_bg: true
+        draw_bg +: {
+            // 0 = flowing green, 1 = solid success, 2 = red fail (Rust-driven).
+            state: instance(0.0)
+            green: instance(#x00C800)
+            red: instance(#xF44336)
+            track: instance(#x1a1a1a)
+
+            pixel: fn() {
+                let cells = 14.0
+                let cell_i = floor(self.pos.x * cells)
+                let cell_center = (cell_i + 0.5) / cells
+                // wave head travels L→R, looping every 1.4s
+                let period = 1.4
+                let wave = modf(self.draw_pass.time, period) / period
+                let d = abs(cell_center - wave)
+                let intensity = smoothstep(0.22, 0.0, d)
+                // state partition: flow(0) / success(1) / fail(2)
+                let red_mode = step(1.5, self.state)
+                let solid_mode = step(0.5, self.state) * (1.0 - red_mode)
+                let col = mix(self.green.rgb, self.red.rgb, red_mode)
+                let lit = mix(intensity, 1.0, solid_mode)
+                return vec4(mix(self.track.rgb, col, lit), 1.0)
+            }
+        }
+    }
+
     let app = startup() do #(App::script_component(vm)){
         ui: Root{
             // No `on_startup` render() call: our dynamic content is driven by
@@ -1282,8 +1317,7 @@ script_mod! {
                     // Shown by apply_snapshot right before the resize, hidden
                     // once the attempt resolves. Opaque so the snap is invisible.
                     // Sibling of connect_view/main_view (direct child of body +:)
-                    // so it renders above both. All animation is on the verified
-                    // self.draw_pass.time shader path (NetworkBg precedent).
+                    // so it renders above both.
                     connecting_overlay := SolidView{
                         width: Fill height: Fill
                         visible: false
@@ -1292,61 +1326,20 @@ script_mod! {
                         spacing: 14.0
                         draw_bg.color: #x050505
 
-                        // label above the bar
-                        View {
-                            width: Fit height: Fit
-                            connect_title := Label {
-                                text: "[ ESTABLISHING LINK ]"
-                                draw_text.color: #x9CDCFE
-                                draw_text.text_style: theme.font_code{font_size: 11}
-                            }
+                        connect_title := Label {
+                            text: "[ ESTABLISHING LINK ]"
+                            draw_text.color: #x9CDCFE
+                            draw_text.text_style: theme.font_code{font_size: 11}
                         }
 
-                        // 14-cell segmented data-flow progress bar (shader).
-                        // A wave head travels L→R, lighting cells near it with a
-                        // green neon glow. Driven by self.draw_pass.time.
-                        connect_progress := View {
+                        connect_progress := ConnectProgress {
                             width: 240 height: 6
-                            show_bg: true
-                            draw_bg +: {
-                                // 0 = flowing green, 1 = solid success, 2 = red fail.
-                                // (Rust drives this via the overlay's draw_bg eval;
-                                //  for now it stays in flow mode — see apply_snapshot.)
-                                state: instance(0.0)
-                                green: instance(#x00C800)
-                                red: instance(#xF44336)
-                                track: instance(#x1a1a1a)
-
-                                pixel: fn() {
-                                    let cells = 14.0
-                                    let cell_i = floor(self.pos.x * cells)
-                                    let cell_center = (cell_i + 0.5) / cells
-                                    // wave head travels L→R, looping every 1.4s
-                                    let period = 1.4
-                                    let wave = modf(self.draw_pass.time, period) / period
-                                    let d = abs(cell_center - wave)
-                                    let intensity = smoothstep(0.22, 0.0, d)
-                                    // state partition: flow(0) / success(1) / fail(2)
-                                    let red_mode = step(1.5, self.state)
-                                    let solid_mode = step(0.5, self.state) * (1.0 - red_mode)
-                                    let col = mix(self.green.rgb, self.red.rgb, red_mode)
-                                    let lit = mix(intensity, 1.0, solid_mode)
-                                    let alpha = lit
-                                    return vec4(mix(self.track.rgb, col, alpha), 1.0)
-                                }
-                            }
                         }
 
-                        // step-tip line below the bar — set from Rust each
-                        // snapshot from the real ConnectStage (resolving host… /
-                        // opening connection… / connection failed).
-                        View {
-                            width: Fit height: Fit
-                            connect_step_tip := Label {
-                                text: ""
-                                draw_text.color: #x9CDCFE
-                                draw_text.text_style: theme.font_code{font_size: 11}
-                            }
+                        connect_step_tip := Label {
+                            text: ""
+                            draw_text.color: #x9CDCFE
+                            draw_text.text_style: theme.font_code{font_size: 11}
                         }
                     }
                 }
@@ -1372,6 +1365,10 @@ pub struct App {
     is_dark: bool,
     #[rust]
     has_connected: bool,
+    #[rust]
+    connecting: bool,
+    #[rust]
+    connecting_prev: bool,
 }
 
 /// Which center pane is shown. Defaults to Console. The tab bar is a row of
@@ -1399,6 +1396,20 @@ enum Field {
 }
 
 impl App {
+    /// Map a connect stage to the operator-facing step-tip copy shown under
+    /// the progress bar. Empty when idle (overlay hidden anyway).
+    fn connect_stage_text(s: &bridge::ConnectStage) -> &'static str {
+        use bridge::ConnectStage::*;
+        match s {
+            Idle => "",
+            Resolving => "resolving host…",
+            Connecting => "opening connection…",
+            Authenticating => "awaiting session list…",
+            Done => "connected",
+            Failed => "connection failed",
+        }
+    }
+
     /// Lazily spawn the bridge on first Connect.
     fn ensure_bridge(&mut self) {
         if self.bridge.is_none() {
@@ -1449,9 +1460,28 @@ impl App {
             }
         }
         self.set_status(cx, snap.connected);
+        // Update the step-tip text from the real connect stage.
+        self.ui
+            .label(cx, ids!(connect_step_tip))
+            .set_text(cx, Self::connect_stage_text(&snap.connect_stage));
+
+        // Connect overlay: shown BEFORE the resize so it masks the 420→1280
+        // window snap. Shown when entering connecting (idle→connecting); hidden
+        // once the attempt resolves (connecting→not). The overlay is an opaque
+        // sibling of connect_view/main_view, so while it's visible it covers
+        // whichever of those is underneath — including during the resize.
+        if snap.connecting && !self.connecting_prev {
+            self.ui.view(cx, ids!(connecting_overlay)).set_visible(cx, true);
+        }
+        if !snap.connecting && self.connecting_prev {
+            self.ui.view(cx, ids!(connecting_overlay)).set_visible(cx, false);
+        }
+        self.connecting_prev = snap.connecting;
+
         // Grow the window to full console size on the connect TRANSITION. The
         // login view uses a compact 420x580 window; the console needs 1280x800.
-        // has_connected is sticky so this fires exactly once.
+        // has_connected is sticky so this fires exactly once. The overlay (if
+        // still transitioning) hides this snap.
         if snap.connected && !self.has_connected {
             self.ui.window(cx, ids!(main_window)).resize(cx, dvec2(1280.0, 800.0));
         }
@@ -2049,7 +2079,10 @@ impl MatchEvent for App {
 
         let bar_connect = self.ui.button(cx, ids!(bar_connect_btn)).clicked(actions);
 
-        if dlg_connect || dlg_enter || bar_connect {
+        // Ignore connect clicks while an attempt is in flight — the overlay is
+        // the single source of truth for "can I click connect". Prevents
+        // duplicate concurrent Cmd::Connect requests.
+        if (dlg_connect || dlg_enter || bar_connect) && !self.connecting {
             // Front-end validation gate (dialog path only). The connection-bar
             // field is a quick reconnect control, so it skips this and trusts
             // whatever the operator types. On failure we abort BEFORE spawning
