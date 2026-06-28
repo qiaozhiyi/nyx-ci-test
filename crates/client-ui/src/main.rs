@@ -541,7 +541,9 @@ script_mod! {
                 let red_mode = step(1.5, self.state)
                 let solid_mode = step(0.5, self.state) * (1.0 - red_mode)
                 let col = mix(self.green.rgb, self.red.rgb, red_mode)
-                let lit = mix(intensity, 1.0, solid_mode)
+                // flow: the wave lights cells; success+fail: solid full-lit
+                // (a steady red reads as a terminal failure better than a pulse)
+                let lit = mix(intensity, 1.0, max(solid_mode, red_mode))
                 return vec4(mix(self.track.rgb, col, lit), 1.0)
             }
         }
@@ -1464,6 +1466,25 @@ impl App {
         self.ui
             .label(cx, ids!(connect_step_tip))
             .set_text(cx, Self::connect_stage_text(&snap.connect_stage));
+
+        // Drive the progress bar's success/fail tint via its `state` instance:
+        //   0.0 = flowing green (Resolving/Connecting/Authenticating — in flight)
+        //   1.0 = solid success (Done)
+        //   2.0 = red fail (Failed)
+        // script_apply_eval! + #(value) is the verified runtime path this
+        // codebase already uses for per-frame recolour (see set_status /
+        // apply_theme). The `#(value)` interpolates the Rust float as a DSL
+        // float literal into the component's draw_bg.
+        use bridge::ConnectStage::*;
+        let state = match snap.connect_stage {
+            Done => 1.0,
+            Failed => 2.0,
+            _ => 0.0,
+        };
+        let mut bar = self.ui.view(cx, ids!(connect_progress));
+        script_apply_eval!(cx, bar, {
+            draw_bg +: { state: #(state) }
+        });
 
         // Connect overlay: shown BEFORE the resize so it masks the 420→1280
         // window snap. Shown when entering connecting (idle→connecting); hidden
