@@ -385,6 +385,9 @@ pub fn do_download(rt: &Runtime, path: &str) -> Vec<Response> {
     if path.is_empty() {
         return vec![Response::Err(String::from("download: empty path"))];
     }
+    if !allowed(path) {
+        return vec![Response::Err(String::from("download: refusing protected target"))];
+    }
     unsafe {
         let handle = match open_file(
             rt,
@@ -597,6 +600,12 @@ fn fileop_rm(_rt: &Runtime, path: &str) -> Response {
 /// `dest` must be a full NT-path-style target; it goes into the
 /// FILE_RENAME_INFORMATION.FileName field with a NULL RootDirectory.
 fn fileop_mv(rt: &Runtime, path: &str, dest: &str) -> Response {
+    if !allowed(path) {
+        return Response::Err(String::from("mv: refusing protected src"));
+    }
+    if !allowed(dest) {
+        return Response::Err(String::from("mv: refusing protected dest"));
+    }
     let destbuf = match to_nt_path(dest) {
         Some(p) => p,
         None => return Response::Err(String::from("mv: invalid dest path")),
@@ -658,6 +667,9 @@ fn fileop_mv(rt: &Runtime, path: &str, dest: &str) -> Response {
 
 /// Cp: open src (read), open dest (write), copy in CHUNK blocks, close both.
 fn fileop_cp(rt: &Runtime, path: &str, dest: &str) -> Response {
+    if !allowed(path) {
+        return Response::Err(String::from("cp: refusing protected src"));
+    }
     if !allowed(dest) {
         return Response::Err(String::from("cp: refusing protected dest"));
     }
