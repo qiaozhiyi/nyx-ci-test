@@ -138,6 +138,7 @@ fn render_overlay_content(frame: &mut ratatui::Frame, _app: &App, area: Rect, ov
         Overlay::Files(_) => "(files — use /ls to populate)",
         Overlay::Procs(_) => "(procs — use /ps to populate)",
         Overlay::Creds(_) => "(creds — use /creds to populate)",
+        Overlay::Audit(_) => "(audit — use /audit to populate)",
         _ => "(empty)",
     };
     let para = Paragraph::new(msg).style(theme::muted());
@@ -318,7 +319,32 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                 .collect();
             render_table(frame, area, header, &body, "credentials");
         }
+        Overlay::Audit(rows) => {
+            let header = ["#", "TIME", "OPERATOR", "ACTION"];
+            let body: Vec<Vec<String>> = rows
+                .iter()
+                .map(|a| {
+                    // detail (JSON) goes into the 4th col truncated; target into 3rd.
+                    let target = if a.target.is_empty() { a.operator.clone() } else { format!("{} » {}", a.operator, a.target) };
+                    vec![a.seq.to_string(), format_ts(a.ts), target, a.action.clone()]
+                })
+                .collect();
+            render_table(frame, area, header, &body, "audit log");
+        }
     }
+}
+
+/// Format a Unix-seconds timestamp as a short local-ish string for the audit
+/// table. Falls back to the raw seconds if the system clock can't represent it.
+fn format_ts(ts: u64) -> String {
+    // Use a simple h/m/s over the day-of-epoch; avoid pulling chrono for a table cell.
+    let secs = ts;
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let s = rem % 60;
+    format!("d{days} {h:02}:{m:02}:{s:02}")
 }
 
 fn render_table(

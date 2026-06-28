@@ -173,7 +173,15 @@ async fn main() -> anyhow::Result<()> {
                             let builder = hyper_util::server::conn::auto::Builder::new(
                                 hyper_util::rt::TokioExecutor::new(),
                             );
-                            let svc = hyper_util::service::TowerToHyperService::new(app);
+                            // into_make_service_with_connect_info feeds
+                            // ConnectInfo<SocketAddr> to the beacon handler
+                            // so it can look up the fingerprint cache.
+                            let make_svc = app.clone().into_make_service_with_connect_info::<std::net::SocketAddr>();
+                            // Manually drive the MakeService for this connection
+                            // (axum::serve does this internally, but we handle
+                            // the accept loop ourselves for TLS + fingerprinting).
+                            let svc = tower::ServiceExt::oneshot(make_svc, peer).await.unwrap();
+                            let svc = hyper_util::service::TowerToHyperService::new(svc);
                             let _ = builder.serve_connection(io, svc).await;
                         }
                         Err(e) => tracing::debug!(?e, "TLS handshake failed"),

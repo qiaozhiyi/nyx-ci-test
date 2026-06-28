@@ -46,15 +46,15 @@ pub struct FileTree {
 
 impl Widget for FileTree {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let files = FILES.read().unwrap().clone();
+        let files_guard = FILES.read().unwrap_or_else(|e| e.into_inner());
         while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = step.as_portal_list().borrow_mut() {
-                if files.is_empty() {
+                if files_guard.is_empty() {
                     list.set_item_range(cx, 0, 0);
                 } else {
-                    list.set_item_range(cx, 0, files.len());
+                    list.set_item_range(cx, 0, files_guard.len());
                     while let Some(item_id) = list.next_visible_item(cx) {
-                        let Some(f) = files.get(item_id) else { continue };
+                        let Some(f) = files_guard.get(item_id) else { continue };
                         let item = list.item(cx, item_id, id!(Item));
 
                         // Repaint the row from the single Palette source.

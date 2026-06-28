@@ -247,6 +247,22 @@ fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
         Command::ChannelClose { chan } => vec![Response::Err(format!(
             "dev agent: channel {chan} relay not implemented (implant-side)"
         ))],
+        // Token ops are Windows-implant primitives. The dev agent can't steal/
+        // make a Windows token on macOS/Linux, so those ack as implant-side;
+        // GetUid runs `whoami` so the loop is verifiable end-to-end.
+        Command::StealToken { pid } => vec![Response::Err(format!(
+            "dev agent: steal_token({pid}) is a Windows implant primitive"
+        ))],
+        Command::MakeToken { domain, user, .. } => vec![Response::Err(format!(
+            "dev agent: make_token({domain}\\{user}) is a Windows implant primitive"
+        ))],
+        Command::Rev2Self => vec![Response::Err(
+            "dev agent: rev2self is a Windows implant primitive".into(),
+        )],
+        Command::GetUid => match std::process::Command::new("whoami").output() {
+            Ok(o) => vec![Response::Output(o.stdout)],
+            Err(e) => vec![Response::Err(format!("whoami failed: {e}"))],
+        },
         Command::Exit => vec![Response::Ok],
     }
 }

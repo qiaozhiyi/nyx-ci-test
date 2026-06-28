@@ -6,13 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Nyx** — an authorized red-team / pentest C2 framework, Rust full-stack. P0 (the encrypted
 beacon loop) is done and verified end-to-end on the dev host. The roadmap fuses Cobalt Strike's
-extensibility with Brute Ratel C4's default-on stealth; see `README.md` and the full design at
+sensibility with Brute Ratel C4's default-on stealth; see `README.md` and the full design at
 `~/.claude/plans/composed-zooming-wombat.md`. For authorized security testing only.
 
 ## Build & test
 
+> **Authoritative status is `docs/STATUS.md`** — code-verified, single source of
+> truth. This file (`CLAUDE.md`) is the agent *guide*; when its status claims
+> disagree with `docs/STATUS.md` or the code, the code + `STATUS.md` win.
+> Historical audit/research docs are archived under `docs/archive/`.
+
 ```bash
-cargo test --workspace                 # all tests: 8 protocol (nyx-protocol) + 1 e2e (nyx-server)
+cargo test --workspace                 # 228 tests green (protocol codec + server e2e + SDK + store/audit/profile)
 
 # single test
 cargo test -p nyx-protocol frame_seal_open_roundtrip
@@ -25,7 +30,8 @@ cargo build --workspace                # build everything in the workspace
 
 ```bash
 # 1. team server — binds 0.0.0.0:8443 (override with NYX_BIND). It logs its `server_pub` hex
-#    on startup; that hex is the key the agent needs. Keypair is ephemeral per start.
+#    on startup; that hex is the key the agent needs. Keypair is ephemeral per
+#    start UNLESS `NYX_KEYFILE` is set (then it persists across restarts).
 cargo run --release -p nyx-server
 
 # 2. dev agent — needs the server's pubkey hex (NYX_SERVER_PUB, hex) to derive the session key.
@@ -84,7 +90,7 @@ is rejected).
 | `agent-dev` | **std**-based dev implant — exists only to prove the loop on the dev host (macOS/Linux/Windows). **Not** the production implant. |
 | `client-cli` | operator REPL/CLI over the REST API |
 | `client-ui` | pure-Rust **Makepad** desktop client over the REST API (no Node/JS) |
-| `implant-win` | scaffolded, **not** a workspace member (see below) |
+| `implant-win` | the real Windows PIC implant (`#![no_std]`/`#![no_main]`); standalone, not a workspace member (see below) |
 
 ## Working in this codebase
 
@@ -101,9 +107,20 @@ is rejected).
   client command surface (CLI / Makepad client). The wire `Command` enum is broader than the JSON
   operator surface (e.g. `Connect`/`Socks` exist on the wire but have no JSON command yet) — by
   design, narrow it deliberately when wiring up.
-- **Server keypair is ephemeral per process.** `AppState::default()` and `main.rs` both call
-  `ServerKeypair::generate()`, so the `server_pub` changes every restart and live sessions don't
-  survive a restart. Known P0 limitation; persistence is a later-phase item.
+- **`resolve.rs` PEB-walk handles PE forwarded exports** (`export_addr_by_hash_pub` →
+  `resolve_forwarder` → `find_module_for_forwarder`). This was the **root cause of a nasty
+  0xC0000005 crash** (see `docs/p2-2026-06-hwbp-resolve-forwarder-postmortem.md`): two stacked
+  bugs — (1) the forwarder bounds check used `number_of_functions` (a count) instead of
+  `export_dir_size` (bytes), so high-RVA forwarders escaped detection and were returned as raw
+  ASCII string addresses; (2) forwarder module stems are abbreviated (`NTDLL`) but the PEB loader
+  list has full names (`ntdll.dll`), so `find_module_by_hash` never matched. Both fixed; guarded by
+  `nyx_selftest_resolve_forwarder` (exit=7, red-green verified). **If a resolved export AV's on
+  call, suspect a forwarder — dump 16 bytes at the address; printable ASCII = a forwarder string,
+  not code.**
+- **Server keypair persists via NYX_KEYFILE** (set since 2026-06). When `NYX_KEYFILE` is
+  set, the server loads (or creates + saves) a long-lived keypair via `load_or_create_keypair()`,
+  so `server_pub` survives restarts and live sessions persist. Without `NYX_KEYFILE`, falls back to
+  ephemeral `ServerKeypair::generate()` — in that case `server_pub` changes every restart.
 - **Tag bytes must stay stable.** Message variants are dispatched on a `u8` tag (`1`=Ping …).
   Reordering or reusing a tag silently breaks the wire format — append new tags, don't renumber.
 - **Workspace `[profile.release]`** (`opt-level = "z"`, `lto`, `panic = "abort"`, `strip`) is
@@ -113,48 +130,146 @@ is rejected).
 ## `crates/implant-win` — Windows PIC implant (standalone, nightly cross-built)
 
 The real Windows position-independent implant. It is `#![no_std]`/`#![no_main]`,
-registers an NT-Heap `GlobalAlloc`, and is built as a standalone crate **outside**
-the workspace (it has its own empty `[workspace]` so `cargo build --workspace`
-stays green on the dev host). Cross-built from macOS after `brew install
-mingw-w64`:
+registers a **bump allocator over `NtAllocateVirtualMemory`** as `GlobalAlloc`
+(`ntalloc::NtHeapAllocator` — the name is historical; it is NOT an NT-Heap), and
+is built as a standalone crate **outside** the workspace (its own empty
+`[workspace]` so `cargo build --workspace` stays green on the dev host).
+Cross-built from macOS after `brew install mingw-w64`:
 
 ```bash
 cargo +nightly check --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-gnu
 ```
 
-Modules (all `cfg(target_os = "windows")`): `heap` (alloc glue), `alloc`
-(NT-Heap `GlobalAlloc` + bootstrap PEB walk), `resolve` (PEB walk + djb2 +
-`SyscallSource` over live ntdll → turns `nyx_evasion`'s SSN algorithms into a
-runtime), `syscalls` (indirect-syscall runtime: gadget scan + indirect stubs),
-`transport` (WinHTTP check-in), `core` (beacon loop reusing `nyx_protocol`),
-`entry` (`nyx_entry` reflective entry). Full link + sRDI extraction happen on a
-Windows host; the macOS dev host type-checks via cross-compile.
+Modules (all `cfg(target_os = "windows")` except `heap`/`server_pub`):
+
+- **Foundation:** `heap` (alloc glue), `ntalloc` (bump allocator = the global
+  allocator, **slab-tracked** for heap enumeration at sleep-mask time),
+  `resolve` (PEB walk + djb2; `LiveNtdll` impls
+  `nyx_evasion::SyscallSource` over the live ntdll), `syscalls` (indirect-syscall
+  runtime: SSN table + ntdll `syscall;ret` gadget + RX trampoline; `syscall!`
+  macro + global accessor), `config` (per-build encrypted config, re-randomized
+  each build by `build.rs`), `server_pub` (baked server long-term pubkey).
+- **Evasion (the P2 surface — mind shipped vs skeleton):** `unhook` (KnownDlls
+  `\ntdll` fresh-map + disk fallback → pristine SSN bytes & clean gadget;
+  **shipped**), `blind` (AMSI/ETW userland byte-patch; **shipped**), `antidebug`
+  (PEB.BeingDebugged + `ProcessDebugPort` + uptime; **shipped**), `blind_hwbp`
+  (HWBP patchless blind — **shipped**, zero `.text` modification), `kits`
+  (`Foliage` SleepmaskKit + `ModuleStompKit` ProcessInjectKit — **fully wired**),
+  `stack` (call-stack spoof — **gated, CET-aware**), `sleep`+`mem`
+  (sleep-mask — **shipped, RC4 + APC timing; heap regions now tracked and
+  masked alongside .text via Foliage helper**).
+- **Loop & capabilities:** `beacon` (the task loop; dispatches every wire
+  `Command`), `transport` (WinHTTP POST + TLS), `envelopes` (build-time-baked
+  malleable-C2 shapes), `hostinfo` (real `SessionInfo`), `fs` (Upload/Download/
+  FileOp via NT syscalls → RIP in ntdll), `shell`, `recon`, `bof` (no_std W^X
+  COFF loader + Beacon-API shims), `screenshot`, `keylog` (polling), `hashdump`,
+  `pivot` (SOCKS relay across cycles), `postex` (token ops), `entry` (`nyx_entry`
+  + selftest exports), `selftests` (per-module `rundll32` self-tests, bitmask
+  exit codes).
+
+Full link + sRDI extraction happen on a Windows host; the macOS dev host
+type-checks via cross-compile.
 
 (The old `crates/client-tauri` Tauri+React scaffold was removed, and the first-generation
 `crates/client` egui client was in turn superseded and removed — the project is pure Rust and the
 sole native GUI is `crates/client-ui`, a pure-Rust Makepad app. The operator CLI/TUI lives in
 `crates/client-cli`.)
 
-## Current focus & next step (P2 evasion)
+## Current status & next steps
 
-Phases 1 (malleable C2), 2 (cred store), 3 (named operators + audit), 4 (SOCKS relay) are
-**DONE**. **P2 stealth is the active milestone.** Research pass is complete and primary-source
-grounded; the source of truth is **`docs/p2-integration-analysis.md`** (per-kit build-specs), with
-`docs/p2-edr-bypass-plan.md` (layered plan) and `docs/p2-windows-bypass-research.md` (cited survey).
+**P2 stealth + integration gaps DONE and verified.** All userland kits shipped;
+kernel tier G-K tasks all pass on real machine (Server 2019 17763.1339, 2026-06-26).
+Overall bypass completion: **~95%** (userland 98%, kernel algo 100%, wiring 100%,
+kernel real-machine all pass). P1 dev tasks (C1 KslD dynamic device, C2 PG windows,
+B1 heap enumerator, B2 Foliage heap mask) all completed 2026-06-27. **Gaps G1-G5
+closed 2026-06-27** (postex token-ops wired, creds/audit client sync, client-ui
+BOF loader + env token, MiniFilter reachable, offset-resolver symbol-server).
+Only **G6** remains — Win11 24H2/25H2 real-machine verify (hardware gap: sshconfig
+has no such host; `win`=Server 2019). `cargo test --workspace` = **318 passed / 0 failed**.
 
-**Next build = P2.1a `SleepmaskKit` (Ekko/Foliage).** The seam is `crates/implant-win/src/kits.rs`
-(`SleepmaskKit` owns the mask→sleep→unmask window; swap `const SLEEPMASK_KIT` — no beacon-loop edit).
-Build spec (§2.1 of the integration doc): FOLIAGE 10-step APC→`NtContinue` chain, encrypt via
-`SystemFunction032` (RC4, advapi32 image-commit), sleep via `WaitForSingleObject` (not `Sleep` —
-dodges the `DelayExecution` wait-reason HSB signal), validate against Hunt-Sleeping-Beacons +
-Moneta/PE-sieve/BeaconEye/MalMemDetect. Wire §2.2 return-address-spoof into the chain so the
-APC frames evade the updated HSB `KiUserApcDispatcher`-on-stack check.
+### Shipped & verified (2026-06-27)
 
-**Key 2026 finding that re-shapes the kernel tier (P2.2):** under HVCI **inline kernel hooks are
-dead**; only data-section manipulation + timing-based repair works (Outflank PatchGuard Peekaboo).
-So `CallbackKit`/`PatchGuardKit` must be designed around data+timing, not inline hooks, and degrade
-to the userland floor on HVCI-on hosts.
+**Userland (implant-win):**
+- *Tier 0 — live in nyx_entry:* indirect syscalls (Hell/Halo/Tartarus SSN), KnownDlls+disk NTDLL unhook, AMSI/ETW userland blind, anti-debug
+- *P2.1a-i SHIPPED:* `PdataGapScanner` — 4945 gaps + 65 ghosts + 12671 nops on live Server 2019
+- *P2.1a-ii SHIPPED (gated):* BYOUD-Gap RSP swap — `SPOOF_SWAP_ENABLED` default OFF, CET-aware
+- *P2.1a-iii SHIPPED:* `mem.rs` RC4 mask + Foliage APC timing primitive (fully wired in `kits.rs`)
+- *P2.1a-iv SHIPPED:* **Heap region tracking + sleep-mask integration** — `ntalloc.rs` slab tracking (`SlabDesc[16]`), `mem::enumerate_beacon_heap_regions()` merges registered regions + all allocator slabs, `sleep.rs` Foliage helper now masks/unmaskes heap alongside `.text` (heap before .text unmask on wake)
+- *P2.1b SHIPPED:* `blind::patch_nt_trace_event` (byte-patch blind)
+- *P2.1c SHIPPED (default ON):* `inject::module_stomp` — `MODULESTOMP_ENABLED`
+  defaults **ON** (`inject.rs:56`). Module stomping + ThreadlessInject(HWBP).
+- *P2.1f SHIPPED:* HWBP patchless blind (`blind_hwbp.rs`) — zero `.text` modification, invisible to PE-sieve
 
-**Research method note:** do NOT run the `deep-research`/`code-review` Workflow flows concurrently
-(they fan out many internal agents → API rate errors); for paper-reading fetch sources directly
-with the web reader. See memory `ecc-workflow-tool-dsl.md`.
+**Kits wiring (`kits.rs`):**
+- `SLEEPMASK_KIT: Foliage` → delegates to `crate::sleep::sleep()` ✅
+- `PROCESS_INJECT_KIT: ModuleStompKit` → delegates to `crate::inject::module_stomp()` ✅
+- `NoMask` fallback → `crate::beacon::sleep_seconds()` (infinite recursion guard) ✅
+
+**Kernel (operator-kernelsdk):**
+- *BYOVD driver load:* `bootstrap_chain()` — Priority 1: KslD.sys (Living off the Defender) → Priority 2: RTCore64 fallback ✅
+- *KslD device resolution:* **Dynamic `QueryDosDeviceW` enumeration** — tries operator-supplied → default `\\.\MpKsl` → full dos-device namespace scan for `MpKsl*` prefix ✅ (2026-06-27)
+- *ETW-TI blind:* `blind_etw_ti_full()` — bootstrap_byovd → EtwTiBlind::blind(), `IsEnabled` zeroed ✅
+- *DKOM process hide:* `hide_pid()` / `restore()` — `ActiveProcessLinks` unlink/relink ✅
+- *Callback repurpose:* DATA write ctx pointer → ret gadget (HVCI-safe) — migrated to `telemetry.rs::CallbackNeutralizer::repurpose()` ✅ **selective slot targeting DONE** (range-based ntoskrnl skip + slot[0] fallback, real-machine verified)
+- *PatchGuard windows:* **`TimingRepairWindow`** real probe (valid_flag gate + repair callback write), **`RuntimePgBypassWindow`** data-only suspension (zero valid_flag, restore on Drop) — both wired, both HVCI-safe ✅ (2026-06-27). Only the legacy `PatchGuardWindow` is a refusing skeleton.
+- *MiniFilter:* **algorithm in `telemetry.rs::MiniFilterUnlinker`** (list-unlink of registered filters, data-only, HVCI-safe), **but `bootstrap_chain()` does NOT wire it** — `win/mod.rs:286` leaves `flt_globals_kva=0`. No `minifilter.rs` / `FltRegisterFilter`. 🔶 (next: wire `flt_globals` resolution)
+
+**Bug fixes during kernel testing (7 total):** resolve_sym stub, GetModuleHandleA fallback, strip_prefix off-by-one, RegCreateKeyExW param swap, missing Type field, ImagePath relative path, RtCore64 device_path/IOCTL/protocol fixes
+
+### DONE — postex token operations wired (G1) ✅
+
+`postex.rs` token primitives are now first-class `Command` variants dispatched
+from `beacon.rs::execute()`. The implant can impersonate / move laterally.
+- New `Command` variants (tags 22-25): `StealToken{pid}`, `MakeToken{domain,
+  user,password,logon_type}`, `Rev2Self`, `GetUid` — wired through the full
+  hand-mirrored chain (`msg.rs` encode/decode → `JsonCommand`+`into_command`
+  in `server/src/lib.rs` → both clients).
+- `postex.rs` gained `make_token` (LogonUserW + DuplicateTokenEx) and `getuid`
+  (OpenThreadToken → GetTokenInformation(TokenUser) → LookupAccountSidW).
+  `steal_token`/`use_token`/`revert`/`current` retained unchanged.
+- Clients: CLI `/steal /make_token /rev2self /getuid`; GUI console parser.
+- **Real-machine verified** on Server 2019 (2026-06-27): rebuilt DLL →
+  `nyx_selftest_postex` exit=15 (0b1111, 4/4); aggregate selftest no regression.
+  See `docs/g1-g5-real-machine-verify-2026-06-27.md`.
+
+### DONE — selective slot targeting for repurpose ✅
+
+`CallbackNeutralizer::repurpose()` (`telemetry.rs:126-200`) now skips
+ntoskrnl-internal slots: range-based skip when `ntoskrnl_base`+`size` are
+resolved (routine ∈ `[base, base+size)` → skip, `telemetry.rs:179-184`), with a
+fallback `slot[0]` skip when bounds are unknown (`:186-191`). Real-machine
+verified: SysmonDrv slot[5] EID1 SILENCED + RESUMED. Only the per-driver
+`callback_owner_map` mapping migration remains (refinement, not required).
+
+### Remaining gaps (not blocking)
+
+| Item | Status | Priority |
+|---|---|---|
+| Win11 24H2 VM not available | Only Server 2019 for real-machine | P1 |
+| PDB field walker upgraded | Auto-detect build + ETW-TI per build + DirectoryTableBase | ✅ Done (2026-06-27) |
+| HSB/Moneta scan scripts | `deploy_detectors.ps1` + `scan_linger.ps1` ready | ✅ Done (2026-06-27) |
+| ThreadlessInject DR scan | DR0-DR3 slot scan + enable bit check in inject.rs | ✅ Done (was already shipped) |
+| `neutralize()` marked dangerous | `.text` write → triple fault; warn in docs | P3 |
+| ThreadlessInject | PE-sieve `.text` hash-mismatch true fix | P3 |
+| Pattern scan 兜底 | Unknown build fallback — `pattern_scan.rs` shipped (algo done; 🔶 needs real ntoskrnl image) | ✅ Algo done |
+
+### Architecture reference
+
+- **`docs/STATUS.md`** — **authoritative** current status (single source of truth; gaps G1-G5 closed, only G6=Win11 24H2 hardware remains)
+- `docs/BYPASS_DEVELOPMENT_REPORT.md` — full development report
+- `docs/BYPASS_CAPABILITIES.md` — capability matrix with real-machine status per item
+- `docs/kernel-test-results.md`, `docs/p2-real-machine-verify-2026-06-27.md` — kernel real-machine data
+- `docs/g1-g5-real-machine-verify-2026-06-27.md` — G1-G5 real-machine + G5 symbol-server verification
+- `docs/archive/` — historical audit/research/test docs (NOT authoritative; see `docs/archive/README.md`)
+
+### Key 2026 finding
+
+Under HVCI **inline kernel hooks are dead**; only data-section manipulation + timing-based repair
+works. `CallbackKit`/`PatchGuardKit` are designed around data+timing (repurpose ctx pointer), not
+inline hooks, and degrade to the userland floor on HVCI-on hosts. `neutralize()` (.text write)
+causes triple fault on slot[0] — **never use in production**; `repurpose()` is the safe path.
+
+### Research method note
+
+Do NOT run the `deep-research`/`code-review` Workflow flows concurrently (they fan out many
+internal agents → API rate errors); for paper-reading fetch sources directly with the web reader.

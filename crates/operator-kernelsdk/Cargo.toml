@@ -1,0 +1,28 @@
+# Standalone crate (own empty workspace) so `cargo build --workspace` in the repo
+# root stays green on the macOS dev host — mirrors the `implant-win` layout.
+# This crate is the operator-side kernel-tier SDK: it ONLY defines kit trait
+# seams (+ no-op floor defaults). Real impls (BYOVD / KslD / DMA / driverless
+# CVE / runtime-PG) land as `impl` blocks in submodules later — they never edit
+# the traits or the call sites that consume them.
+[workspace]
+
+[package]
+name = "nyx-operator-kernelsdk"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "Nyx operator-side kernel-tier kit seams (P2.2+). Traits + no-op floor; impls plug in."
+
+[lib]
+name = "nyx_operator_kernelsdk"
+path = "src/lib.rs"
+
+# No dependencies by design: the seams are pure trait definitions + error
+# types so they can be cross-compiled and reviewed without any toolchain
+# beyond core/alloc. Implementations pull in their own deps (ntapi, windows,
+# pcileech bindings, …) when they are written.
+
+[dev-dependencies]
+# no_std Mutex for the mock KernelRw in tests (replaces std::sync::Mutex so the
+# crate's mock tests compile + run on the macOS dev host without std).
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }

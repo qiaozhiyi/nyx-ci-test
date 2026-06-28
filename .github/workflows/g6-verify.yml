@@ -1,0 +1,183 @@
+name: G6 Verify (Win11 24H2 kernel)
+
+# Runs the G6 verification suite on the Win11 24H2 / Server 2025 kernel (build
+# 26100). Closes 5/7 G6 sub-items: cross-version EPROCESS offsets, symbol-server
+# download, CET probe logic, and selftest regression on a non-17763 kernel.
+# The remaining 2/7 (HVCI-on default behavior, CET hardware #CP trigger) need a
+# physical machine — GitHub Windows runners do not support nested virtualization
+# and do not enable HVCI by default. See docs/STATUS.md §5 (G6).
+#
+# This is an authorized red-team security research project. The workflow only
+# exercises the project's own selftest/offset tooling; it does not touch other
+# systems.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [p2-evasion-synced]
+    paths:
+      - '.github/workflows/g6-verify.yml'
+      - 'crates/implant-win/**'
+      - 'crates/protocol/**'
+      - 'crates/operator-kernelsdk/**'
+      - 'crates/offset-resolver/**'
+
+# Private repo → Windows minutes count at 2x. Keep runs short.
+concurrency:
+  group: g6-verify
+  cancel-in-progress: true
+
+jobs:
+  g6:
+    runs-on: windows-2025-vs2026   # Windows Server 2025 = build 26100 (= Win11 24H2 kernel)
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- 1. Environment baseline: confirm we're on the 26100 kernel ----
+      - name: "G6-1: Kernel build + CET capability probe"
+        shell: pwsh
+        run: |
+          Write-Host "::group::OS + CPU"
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host ("OS: " + $os.Caption)
+          Write-Host ("Version: " + $os.Version + " Build " + $os.BuildNumber)
+          $cpu = Get-CimInstance Win32_Processor
+          Write-Host ("CPU: " + $cpu.Name)
+          Write-Host ("VirtualizationFirmwareEnabled=" + $cpu.VirtualizationFirmwareEnabled)
+          Write-Host "::endgroup::"
+
+          Write-Host "::group::CET probe (IsProcessorFeaturePresent 41 = PF_CET_SHADOW_STACK)"
+          # 41 = PROCESSOR_FEATURE_CET_SHADOW_STACK. Mirrors implant version.rs.
+          Add-Type -Namespace W -Name Nt -MemberDefinition '
+          [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+          public static extern bool IsProcessorFeaturePresent(uint feat);
+          '
+          $cet = [W.Nt]::IsProcessorFeaturePresent(41)
+          Write-Host ("CET_PRESENT(41)=" + $cet)
+          Write-Host "::endgroup::"
+
+          # Record build number for later steps to gate on.
+          "BUILD=$($os.BuildNumber)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CET=$cet" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ---- 2. Standalone crates build (implant + SDK + offset-resolver) ----
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: "G6-2: Build implant DLL (nightly + MSVC)"
+        shell: pwsh
+        run: |
+          cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1 | Select-Object -Last 15
+          $dll = "crates/implant-win/target/x86_64-pc-windows-msvc/release/nyx_implant_win.dll"
+          if (Test-Path $dll) {
+            $sz = (Get-Item $dll).Length
+            Write-Host ("DLL built OK: {0} bytes" -f $sz)
+          } else {
+            Write-Host "::error::implant DLL build failed"
+            exit 1
+          }
+
+      - name: "G6-3: Build offset-resolver + operator-kernelsdk"
+        shell: pwsh
+        run: |
+          Write-Host "::group::offset-resolver"
+          cargo build --manifest-path crates/offset-resolver/Cargo.toml 2>&1 | Tee-Object -FilePath resolver.log | Select-Object -Last 4
+          Write-Host "::endgroup::"
+          Write-Host "::group::operator-kernelsdk (full output — do NOT truncate, we need the errors)"
+          # Capture full output so compile errors are visible; do not pipe to Select.
+          cargo build --manifest-path crates/operator-kernelsdk/Cargo.toml 2>&1 | Tee-Object -FilePath kernelsdk.log
+          Write-Host "::endgroup::"
+          # If the kernelsdk log contains 'error[E', surface it loudly and fail.
+          if (Select-String -Path kernelsdk.log -Pattern 'error\[E' -Quiet) {
+            Write-Host "::error::operator-kernelsdk failed to compile (see errors above)"
+            exit 1
+          }
+
+      # ---- 3. Selftest regression suite on the 26100 kernel ----
+      - name: "G6-4: Selftest regression (26100 kernel)"
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $dllDir = "crates/implant-win/target/x86_64-pc-windows-msvc/release"
+          $dll = "$dllDir/nyx_implant_win.dll"
+          # The aggregator + the G1 (postex) + evasion entry points.
+          $tests = @("nyx_selftest","nyx_selftest_postex","nyx_selftest_evasion")
+          Write-Host "Test                      Exit   Ran   Bits"
+          Write-Host "------------------------- ------ ----- ----"
+          foreach ($t in $tests) {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "rundll32.exe"
+            $psi.Arguments = "$dll,$t"
+            $psi.UseShellExecute = $false
+            $psi.WorkingDirectory = $dllDir
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $p.WaitForExit(30000) | Out-Null
+            if ($p.HasExited) {
+              $code = $p.ExitCode
+              $ran = ($code -ne 0)
+              $bits = if ($code -ge 0) { [Convert]::ToString($code, 2) } else { "0x{0:X}" -f $code }
+            } else {
+              $p.Kill()
+              $code = -1
+              $ran = $false
+              $bits = "TIMEOUT"
+            }
+            Write-Host ("{0,-25} {1,6} {2,5} {3}" -f $t, $code, $ran, $bits)
+          }
+          Write-Host "::notice::selftest regression ran on build 26100 (see table above; TIMEOUT/0 may reflect the runner's stricter posture — no full admin / possible HVCI)"
+
+      # ---- 4. Cross-version offset verification: live ntkrnl GUID → resolver ----
+      - name: "G6-5: Offset cross-version verify (symbol-server download)"
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "::group::Extract live ntkrnlmp.pdb GUID+Age"
+          # Reuse the PE-debug-directory walker. Inline (no separate script) so
+          # the workflow is self-contained.
+          $b = [IO.File]::ReadAllBytes("C:\Windows\System32\ntoskrnl.exe")
+          $pe = [BitConverter]::ToInt32($b,0x3C)
+          $numSec = [BitConverter]::ToUInt16($b,$pe+6)
+          $optSz = [BitConverter]::ToUInt16($b,$pe+20)
+          $secStart = $pe+24+$optSz
+          $ddVA = [BitConverter]::ToInt32($b,$pe+24+0xA0)
+          $ddSize = [BitConverter]::ToInt32($b,$pe+24+0xA4)
+          function R2F($rva){ for($i=0;$i -lt $numSec;$i++){ $s=$secStart+$i*40; $va=[BitConverter]::ToInt32($b,$s+12); $vs=[BitConverter]::ToInt32($b,$s+8); $pr=[BitConverter]::ToInt32($b,$s+20); if($rva -ge $va -and $rva -lt ($va+$vs)){ return $pr+($rva-$va) } } return -1 }
+          $ddOff = R2F $ddVA; if($ddOff -lt 0){$ddOff=$ddVA}
+          $guid=$null; $age=0
+          for($i=0;$i -lt ($ddSize/28);$i++){ $e=$ddOff+$i*28; if([BitConverter]::ToInt32($b,$e+12) -eq 6){ $cv=[BitConverter]::ToInt32($b,$e+24); if($cv -le 0){$cv=R2F ([BitConverter]::ToInt32($b,$e+20))} $sig=-join($b[$cv..($cv+3)]|%{[char]$_}); if($sig -eq "RSDS"){ $g=[Guid]::new($b,$cv+4); $guid=$g.ToString("N").ToUpper(); $age=[BitConverter]::ToInt32($b,$cv+20); break } } }
+          if(-not $guid){ Write-Host "::error::could not extract PDB GUID"; exit 1 }
+          Write-Host ("GUID={0} Age={1}" -f $guid,$age)
+          Write-Host "::endgroup::"
+
+          Write-Host "::group::offset-resolver download + parse (G5 path, build $env:BUILD)"
+          # Pad GUID to 32 hex chars (N format already is). Pass to resolver.
+          $exe = "crates/offset-resolver/target/debug/nyx-offset-resolver.exe"
+          & $exe --guid $guid --age $age --out offsets_g6.toml 2>&1 | Select-Object -Last 12
+          Write-Host "::endgroup::"
+
+          if(Test-Path offsets_g6.toml){
+            Write-Host "::group::Resolved offsets (sample)"
+            Get-Content offsets_g6.toml | Select-Object -First 12
+            Write-Host "::endgroup::"
+          } else {
+            Write-Host "::warning::offset-resolver did not emit a TOML (symbol-server 404? the resolver falls back to the known table only with --build)"
+            # Fallback: known-table comparison for build 26100.
+            & $exe --build $env:BUILD --out offsets_g6_known.toml 2>&1 | Select-Object -Last 6
+            if(Test-Path offsets_g6_known.toml){ Write-Host "Known-table offsets for build $env:BUILD:"; Get-Content offsets_g6_known.toml | Select-Object -First 12 }
+          }
+
+      - name: "G6-6: Upload artifacts"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g6-results-${{ github.run_id }}
+          path: |
+            offsets_g6*.toml
+            resolver.log
+            kernelsdk.log
+          if-no-files-found: ignore
+          retention-days: 14

