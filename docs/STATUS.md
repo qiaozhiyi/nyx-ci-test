@@ -16,6 +16,7 @@
 - `operator-kernelsdk` + `offset-resolver` 独立 crate ✅ 编译通过
 - selftest 导出 **48 个**（45 `selftests.rs` + 2 `entry.rs` + 1 `syscalls.rs`）
 - 真机环境：Windows Server 2019 Datacenter **17763.1339** + RTCore64.sys (CVE-2019-16098)
+- server TLS 监听 ✅ 可用（2026-06-29 修复 rustls 0.23 CryptoProvider panic，commit `746e1dd`）
 
 ---
 
@@ -215,6 +216,30 @@ CI workflow：`.github/workflows/g6-verify.yml`，runner `windows-2025-vs2026`�
 | `/sessions` G7 字段 | ✅ `pid=3812 is_admin=1 pending=N age_secs=N` 全部可见 |
 
 **G7 修复在真机生效**：`pid`/`pending`/`age_secs`/`is_admin` 字段从 server 透传到 client 端可用；`/api/tasks` 实测可查询排队任务。`ja3`/`ja4` 因隧道走明文 HTTP（无 TLS ClientHello）不产生，预期行为。
+
+### 5e 稳定可重复测试方案 + 系统性命令验证（2026-06-29）
+
+**问题**：§5d 的测试拓扑有三个易碎点——SSH `-R` 隧道断线即失效、server 公钥每次启动随机（implant 要重编译）、明文测不了 ja3/ja4。
+
+**固化方案（一键可重复）**：
+1. **固定 server 公钥**：`NYX_KEYFILE=~/.nyx/server.key`（`load_or_create_keypair`，首次生成 32 字节裸文件后永久复用）。公钥固定为 `9605ea49...`，implant 编译一次即可，server 重启无需重编译。
+2. **持久隧道**：`autossh -M 0`（`ServerAliveInterval=15` 探活，断线自动重连）替代脆弱的 `ssh -R`。`AUTOSSH_GATETIME=0` 首次失败立即重试。
+3. **持久 beacon**：`schtasks /create /ru SYSTEM /sc onstart`（SSH session 退出不杀进程；普通 `start`/`Start-Process` 会被 sshd job object 清理）。
+
+**修复的 server bug**：rustls 0.23 不再自动选 CryptoProvider，`NYX_TLS=on` 启动直接 panic。修复：`main()` 早期 `rustls::crypto::ring::default_provider().install_default()`（commit `746e1dd`）。server HTTPS 监听恢复可用。
+
+**系统性命令验证（持久 SYSTEM beacon，7 命令全过）**：
+| 命令 | 类型 | 结果 |
+|---|---|---|
+| shell hostname / whoami /groups / ipconfig | shell | ✅ 全部执行 |
+| **net conn** | 协议原生（Command::Net） | ✅ 19 行连接表 |
+| **env** | 协议原生（Command::Env） | ✅ 31 行环境变量 |
+| **getuid** | 协议原生（Command::GetUid） | ✅ `NT AUTHORITY\SYSTEM` |
+| **ping** | 协议原生（Command::Ping） | ✅ ok |
+
+> shell + 4 个协议原生命令全通 → **协议命令分发链路完整可用**，不止 shell 通道。
+
+**已知待办**：TLS implant（`use_tls=true`）经 WinHTTP 连自签证书 server 时 check-in 失败（明文路径正常）。curl 经同一隧道 HTTPS 握手正常（server TLS + 指纹嗅探本身可用），问题在 implant 的 `WinHttpSetOption` 证书放宽路径。ja3/ja4 指纹需 TLS beacon check-in 才产生，暂未验证（待调试 WinHTTP TLS）。
 
 ---
 
