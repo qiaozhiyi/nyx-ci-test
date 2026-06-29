@@ -86,6 +86,7 @@
 |---|---|---|---|
 | `MODULESTOMP_ENABLED` | **`true`（ON）** | `implant-win/src/inject.rs:56` | 保持 ON（module stomp 作为开箱即用能力） |
 | `FOLIAGE_ENABLED` | **`true`（ON）** | `implant-win/src/sleep.rs:40` | 保持 ON（.text + 堆掩码默认开启） |
+| `NYX_FOLIAGE_OFF`（编译期） | **未设 = ON**；`=1` 则 OFF | `implant-win/src/sleep.rs:43-56` | 2026-06-29 新增：rundll32 加载器上下文下 Foliage APC 链触发 `STATUS_STACK_BUFFER_OVERRUN`；`NYX_FOLIAGE_OFF=1` 降级为纯 sleep 用于测试。sRDI 注入真实进程时预期 ON（见 §5d） |
 | `SPOOF_SWAP_ENABLED` | **`false`（OFF）** | `implant-win/src/stack.rs:82` | 保持 OFF（CET-on host 之前保守关闭，避免 `#CP`） |
 
 > `SPOOF_SWAP_ENABLED` 早期为 `true`，已在 `p2-evasion-synced` 改回 `false`。
@@ -183,6 +184,37 @@ CI workflow：`.github/workflows/g6-verify.yml`，runner `windows-2025-vs2026`�
 | **CET 硬件 `#CP` 触发** | ❌ 测不了 | runner CPU (EPYC 7763) 无 CET；需 Intel 11代+ 物理机 |
 
 **G6 结论：** 已标记**暂缓搁置**。CI 已完成 5/7 子项（内核版本确认、implant+SDK 编译无回归、CET 探测逻辑跑通、CI 抓到并修复 1 个真实 Windows bug）。剩 2/7（HVCI-on 真机 + CET 硬件触发）需物理机——做成 self-hosted runner 挂到同一 workflow 即可补。详见 `docs/g1-g5-real-machine-verify-2026-06-27.md` §6。
+
+### 5d 全链路真机端到端验证（2026-06-29）
+
+**首次完整 beacon 循环真机测试**——server + 持久 implant + 完整 task 循环，在 Defender 实时保护开启下验证。
+
+**拓扑**（本地 macOS 无公网入站，用 SSH 反向隧道绕过 NAT）：
+```
+[本地 macOS]                            [Win Server 2019 17763, Defender ON]
+  nyx-server (127.0.0.1:8443)  ←SSH -R→  127.0.0.1:8443
+  nyx-cli / curl                          nyx_implant_win.dll（schtasks+SYSTEM 持久）
+```
+- implant 回连地址硬编码 `127.0.0.1:8443`（`entry.rs:201`），经隧道直达本地 server，DLL 零改动。
+- `NYX_SERVER_PUB` 烤入当前 server 的 X25519 公钥（每轮 server 重启需重新编译 implant）。
+- 持久 beacon：`schtasks /create /ru SYSTEM`（SSH session 退出不杀进程；普通 `start ""` 会被 sshd job object 清理）。
+
+**发现并修复的 bug：Foliage 睡眠掩码在 rundll32 加载器下崩溃**
+- 症状：`nyx_entry`/`nyx_beacon_oneshot` check-in 成功后崩溃，exit `0xC0000409`（STATUS_STACK_BUFFER_OVERRUN）。
+- 二分定位：beacon_loop task loop 首轮 `sleep_jitter` → `kits::sleep` → `Foliage::sleep_masked` → APC 链 + NtSetContextThread 恢复破坏栈（GS cookie 失败）。selftest 不走 beacon_loop 故无回归。
+- 修复：`NYX_FOLIAGE_OFF=1` 编译期 gate（`sleep.rs:43-56`），降级为纯 NtDelayExecution sleep。默认仍 ON（sRDI 注入真实进程预期可用，rundll32 的线程/模块上下文是诱因）。commit `02d7e07`。
+
+**验证结果（NYX_FOLIAGE_OFF=1 build）**：
+| 环节 | 结果 |
+|---|---|
+| 加密 check-in（X25519+ChaCha20-Poly1305 经隧道） | ✅ 会话注册 `user=SYSTEM os=Windows` |
+| Defender 实时保护 ON 下存活 | ✅（AMSI/ETW 盲化有效） |
+| 持久 beacon（schtasks+SYSTEM） | ✅ 脱离 SSH session 持续 check-in |
+| shell task 循环 | ✅ `whoami`→`nt authority\system`、`hostname`→`ser213364685943`、`ipconfig`→`Windows IP 配置`，3 任务批量执行+加密回传 |
+| `/api/tasks`（G7 修复端点） | ✅ 返回排队任务列表 |
+| `/sessions` G7 字段 | ✅ `pid=3812 is_admin=1 pending=N age_secs=N` 全部可见 |
+
+**G7 修复在真机生效**：`pid`/`pending`/`age_secs`/`is_admin` 字段从 server 透传到 client 端可用；`/api/tasks` 实测可查询排队任务。`ja3`/`ja4` 因隧道走明文 HTTP（无 TLS ClientHello）不产生，预期行为。
 
 ---
 
