@@ -5,6 +5,14 @@ use nyx_server::{load_or_create_keypair, load_profile, load_script, router, AppS
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // rustls 0.23 no longer auto-selects a CryptoProvider at first use — even
+    // with the `ring` feature enabled, if more than one provider is in the
+    // dependency graph (e.g. aws-lc-rs pulled transitively) the first TLS op
+    // panics with "Could not automatically determine the process-level
+    // CryptoProvider". Install ring explicitly, early, before any TLS use.
+    // No-op if a provider is already installed (e.g. by another crate).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
