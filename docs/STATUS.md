@@ -2,7 +2,7 @@
 
 > **权威文档。** 这是项目当前的、经代码核对的唯一状态事实源。
 > **优先级口径：** 一切以源码 `file:line` 为唯一证据。当本文与其他文档（含 `CLAUDE.md`、`docs/archive/`）冲突时，**以本文为准**。
-> **核对日期:** 2026-06-27（G1–G5 开发完成后） · **分支:** `p2-evasion-synced` · **授权:** 仅限授权红队 / 安全研究
+> **核对日期:** 2026-06-27（G1–G5 开发完成后） · **最后增量核对:** 2026-06-29（client-cli 会话字段显示闭合） · **分支:** `p2-evasion-synced` · **授权:** 仅限授权红队 / 安全研究
 > 历史审计 / 研究产物已移入 `docs/archive/`（见 `docs/archive/README.md`）。
 
 ---
@@ -10,7 +10,8 @@
 ## 0. 验证基线（已重新核对）
 
 - `cargo build --workspace` ✅ 绿
-- `cargo test --workspace` ✅ **318 通过 / 0 失败**（含 G1 新增的 token-op codec 测试）
+- `cargo test --workspace` ✅ **326 通过 / 0 失败**（含 G1 token-op codec 测试 + 2026-06-29 client-cli 会话字段/任务 overlay 新增 6 项）
+- `cargo clippy -p nyx-cli -- -D warnings` ✅ 零警告（2026-06-29 闭合工作树先存 clippy 破损）
 - `cargo +nightly check -p nyx-implant-win --target x86_64-pc-windows-gnu` ✅ 绿（46 warnings，无 error；多为 Rust-2024 `static_mut_refs` lint）
 - `operator-kernelsdk` + `offset-resolver` 独立 crate ✅ 编译通过
 - selftest 导出 **48 个**（45 `selftests.rs` + 2 `entry.rs` + 1 `syscalls.rs`）
@@ -26,11 +27,11 @@
 | 内核算法（operator-kernelsdk） | 100% | 82 单测通过（`cargo test -p nyx-operator-kernelsdk`） |
 | 内核接线 | ~97% | `bootstrap_chain` → KslD → BYOVD → ETW-TI → DKOM → callback repurpose 全通 |
 | 内核真机（Server 2019） | 7/7 PASS | 任务 G–K 全链路（见 `kernel-test-results.md`） |
-| **整体** | **~95%** | G1–G5 全部完成；仅剩 G6 真机验证（Win11 24H2） |
+| **整体** | **~95%** | G1–G5 全部完成；G6 已暂缓搁置（需物理机验证） |
 
 > 注：所有用户态规避模块均已**实装且默认 ARMED**（gate 默认见 §3）。
 > 2026-06-27 关闭了全部代码缺口（G1 postex 接线、G2 creds/audit、G3 GUI、
-> G4 MiniFilter 可调用、G5 符号服务器下载）；仅 G6 需真机。
+> G4 MiniFilter 可调用、G5 符号服务器下载）；**G6 真机验证已暂缓搁置**（需物理机）。
 
 ---
 
@@ -139,12 +140,34 @@
 | **G4** | MiniFilter 引导未接线 | 中 | `win/mod.rs` | ✅ **DONE** — `resolve_flt_globals_kva(rva)` + `unlink_minifilters(krw,kva)` 可调用；`module_info_by_name` 枚举 fltmgr（operator 供给 RVA，安全路径） |
 | **G5** | offset-resolver 无符号服务器下载 | 低 | `offset-resolver/src/main.rs` | ✅ **DONE** — `download_pdb()` 从 MS symbol server 拉 ntkrnlmp.pdb，`--guid`/`--age` 自动下载+解析 |
 | **G6** | Win11 24H2/25H2 真机未验证（仅 Server 2019） | 低 | 跨版本 offset 表 + CET 探测 | 🟡 **部分闭合** — GitHub Actions `windows-2025-vs2026`=build 26100（Win11 24H2 内核），见下方 |
+| **G7** | client-cli 丢弃 server 已返回的会话字段（`pid`/`pending`/`age_secs`/`ja3`/`ja4`）+ 从未调 `/api/tasks` | 中 | `client-cli/src/tui/`, `rest.rs` | ✅ **DONE** — 见 §5c |
 
-**下一步：** G1–G5 全部完成；G6 经 GitHub Actions **部分闭合**（5/7 子项），剩 2 项需物理机。
-**验证：** `cargo build --workspace` 绿 · `cargo test --workspace` **318 通过 / 0 失败** · `implant-win`/`operator-kernelsdk`/`offset-resolver` 三独立 crate 均编译通过（operator-kernelsdk 现在也在 `windows-gnu`/`windows-msvc` 上编译通过，CI 已修 1 个真实 Windows-only bug：`NtQuerySystemInformationFn` 缺 `-> i32`）。
+**下一步：** G1–G5、G7 全部完成；G6 已标记**暂缓搁置**（CI 5/7 子项已闭合，剩 2 项需物理机，见 §5b）。
+**验证：** `cargo build --workspace` 绿 · `cargo test --workspace` **326 通过 / 0 失败** · `implant-win`/`operator-kernelsdk`/`offset-resolver` 三独立 crate 均编译通过（operator-kernelsdk 现在也在 `windows-gnu`/`windows-msvc` 上编译通过，CI 已修 1 个真实 Windows-only bug：`NtQuerySystemInformationFn` 缺 `-> i32`）。
 **G1 真机验证（2026-06-27，Server 2019）:** 重编译 implant DLL（含 G1 postex 改动）→ `nyx_selftest_postex` exit=15 (0b1111，4/4) · `nyx_selftest` exit=3585（聚合无回归）· `nyx_selftest_evasion` exit=1281（基准一致）。详见 `docs/g1-g5-real-machine-verify-2026-06-27.md`。
 
-### G6 GitHub Actions 验证（2026-06-27，build 26100 = Win11 24H2 内核）
+### G7 client-cli 会话字段显示闭合（2026-06-29）
+
+**根因**：`SessionView`（`crates/rest/src/lib.rs:28-56`）已携带 `pid`/`pending`/`age_secs`/`ja3`/`ja4` 五个字段，但 TUI 全部丢弃；`GET /api/tasks` 端点 server 已实现但 client-cli 从未调用。纯客户端渲染/接线缺口，server 与 wire 层零改动。
+
+| 子项 | 闭合方式 |
+|---|---|
+| **`/info` 详情 overlay** | 新增 `Overlay::SessionDetail` + 2 列 key/value 表（`render_kv`），展示全字段（pid/pending/age/ja3/ja4 + 本地 meta：alias/tags/star/note）。本地数据 overlay，每帧重绘，pending/age 是活的 |
+| **状态栏 age/pending** | `App.age_baseline` 记 `(Instant, age_secs)` 基线，`age_for()` 客户端推算（每帧 `now-基线`）。不改 worker 2s 轮询、不污染 `session_signature`（后者刻意排除 age_secs 防抖动）。pending>0 时状态栏追加 `pend:N` |
+| **`/tasks`** | 调用 `GET /api/tasks?session=<hex>`，新增 `TaskRow`/`Cmd::FetchTasks`/`ParsedTable::Tasks`/`Overlay::Tasks`，4 列表（task_id/type/arg/detail） |
+| **`/profile` overlay 死代码** | `FetchProfile` 原本只 log 不设 `parsed_buf`，overlay 永不弹出 → 现设 `ParsedTable::Profile`，正常弹 overlay |
+
+**附带修复的工作树先存破损**（不修则 crate 编译不过；均为先于本次会话的未完成改动残留，非 G7 引入）：
+- 恢复被误删的 5 个 `Cmd` handler（`Shutdown`/`Connect`/`Shell`/`Bof`/`Upload`）
+- `Cmd::Download` 补 `local` 字段 + 注册 `TaskKind::Download` pending task（下载原本不落盘）
+- `/audit verify` 死代码（同 `/profile` 同类 bug）→ 设 `ParsedTable::AuditVerify`，改用 `AuditVerifyResponse`
+- 截图 overlay 死代码：`finish_chunked` 落盘后返回 `ParsedTable::Image`
+- `render_table` 签名 `[&str;4]` → `&[&str]`（兼容 2 列 Image/Profile/AuditVerify）
+- 杂项 clippy：重复 `let is_image`、`&""` 多余引用、未用 import、`AuditRow.detail` 未读、`poll_file_chunks` 参数过多
+
+**验证**：`cargo build --workspace` 绿 · `cargo test --workspace` **326 通过 / 0 失败**（新增 6 项：age_for 推算、fmt_age、SessionDetail/Tasks overlay 渲染、TaskRow JSON 反序列化）· `cargo clippy -p nyx-cli -- -D warnings` 零警告。
+
+### G6 暂缓搁置说明（Win11 24H2/25H2 真机验证）
 
 CI workflow：`.github/workflows/g6-verify.yml`，runner `windows-2025-vs2026`（Windows Server 2025 Datacenter，**build 26100**，= Win11 24H2 内核）。最新 run：[Actions](https://github.com/qiaozhiyi/NY/actions)。
 
@@ -159,7 +182,7 @@ CI workflow：`.github/workflows/g6-verify.yml`，runner `windows-2025-vs2026`�
 | **HVCI-on / VBS 默认行为** | ❌ 测不了 | GitHub Windows runner 不支持嵌套虚拟化，默认不开 HVCI-on |
 | **CET 硬件 `#CP` 触发** | ❌ 测不了 | runner CPU (EPYC 7763) 无 CET；需 Intel 11代+ 物理机 |
 
-**G6 结论：** 5/7 子项在 GitHub Actions 的 Win11 24H2 内核上**闭合或验证**（内核版本确认、implant+SDK 编译无回归、CET 探测逻辑跑通、CI 抓到并修复 1 个真实 Windows bug）。剩 2/7（HVCI-on 真机 + CET 硬件触发）需物理机——做成 self-hosted runner 挂到同一 workflow 即可补。详见 `docs/g1-g5-real-machine-verify-2026-06-27.md` §6。
+**G6 结论：** 已标记**暂缓搁置**。CI 已完成 5/7 子项（内核版本确认、implant+SDK 编译无回归、CET 探测逻辑跑通、CI 抓到并修复 1 个真实 Windows bug）。剩 2/7（HVCI-on 真机 + CET 硬件触发）需物理机——做成 self-hosted runner 挂到同一 workflow 即可补。详见 `docs/g1-g5-real-machine-verify-2026-06-27.md` §6。
 
 ---
 

@@ -11,11 +11,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::theme;
-use crate::types::arch_str;
+use crate::types::{arch_str, SessionView};
 
 use super::input::{self, filter_meta};
 use super::panes;
-use super::{short, App, Overlay};
+use super::{fmt_age, short, App, Overlay};
 
 pub(super) fn render(app: &mut App, frame: &mut ratatui::Frame) {
     let area = frame.area();
@@ -139,6 +139,7 @@ fn render_overlay_content(frame: &mut ratatui::Frame, _app: &App, area: Rect, ov
         Overlay::Procs(_) => "(procs — use /ps to populate)",
         Overlay::Creds(_) => "(creds — use /creds to populate)",
         Overlay::Audit(_) => "(audit — use /audit to populate)",
+        Overlay::Image(_, _) => "(screenshot — see event log for path)",
         _ => "(empty)",
     };
     let para = Paragraph::new(msg).style(theme::muted());
@@ -154,7 +155,16 @@ fn render_statusbar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         ("○", Style::default().fg(theme::DANGER), "disconnected")
     };
     let beacon = match app.current_session() {
-        Some(s) => format!("{}@{} · {}", s.username, s.hostname, short(&s.id)),
+        Some(s) => {
+            // user@host · <id> · pend:N(仅当>0) · <age>。age 每帧由 age_for() 推算，
+            // 每秒自然推进；不触发 session 全表重绘（status bar 单行重绘）。
+            let mut buf = format!("{}@{} · {}", s.username, s.hostname, short(&s.id));
+            if s.pending > 0 {
+                buf.push_str(&format!(" · pend:{}", s.pending));
+            }
+            buf.push_str(&format!(" · {}", fmt_age(app.age_for(&s.id))));
+            buf
+        }
         None => "no beacon".to_string(),
     };
     let line = Line::from(vec![
@@ -301,7 +311,7 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                 .iter()
                 .map(|f| vec![f.name.clone(), f.size.to_string(), if f.is_dir { "dir" } else { "file" }.into(), f.modified.clone()])
                 .collect();
-            render_table(frame, area, header, &body, "files");
+            render_table(frame, area, &header, &body, "files");
         }
         Overlay::Procs(rows) => {
             let header = ["PID", "PPID", "USER", "NAME"];
@@ -309,7 +319,7 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                 .iter()
                 .map(|p| vec![p.pid.to_string(), p.ppid.to_string(), p.user.clone(), p.name.clone()])
                 .collect();
-            render_table(frame, area, header, &body, "processes");
+            render_table(frame, area, &header, &body, "processes");
         }
         Overlay::Creds(rows) => {
             let header = ["SOURCE", "PRINCIPAL", "KIND", "SECRET"];
@@ -317,21 +327,83 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                 .iter()
                 .map(|c| vec![c.source.clone(), c.principal.clone(), c.kind.label().into(), input::mask(&c.secret)])
                 .collect();
-            render_table(frame, area, header, &body, "credentials");
+            render_table(frame, area, &header, &body, "credentials");
         }
-        Overlay::Audit(rows) => {
-            let header = ["#", "TIME", "OPERATOR", "ACTION"];
+Overlay::Audit(rows) => {
+    let header = ["#", "TIME", "OPERATOR", "ACTION"];
+    let body: Vec<Vec<String>> = rows
+        .iter()
+        .map(|a| {
+            // detail (JSON) goes into the 4th col truncated; target into 3rd.
+            let target = if a.target.is_empty() { a.operator.clone() } else { format!("{} » {}", a.operator, a.target) };
+            vec![a.seq.to_string(), format_ts(a.ts), target, a.action.clone()]
+        })
+        .collect();
+    render_table(frame, area, &header, &body, "audit log");
+}
+Overlay::Image(path, bytes) => {
+    let header = ["PATH", "BYTES"];
+    let body = vec![vec![path.clone(), bytes.to_string()]];
+    render_table(frame, area, &header, &body, "screenshot");
+}
+Overlay::Profile { loaded, http_get_uri, http_post_uri, useragent } => {
+    let header = ["FIELD", "VALUE"];
+    let body = vec![
+        vec!["loaded".into(), loaded.to_string()],
+        vec!["http_get".into(), http_get_uri.clone()],
+        vec!["http_post".into(), http_post_uri.clone()],
+        vec!["useragent".into(), useragent.clone()],
+    ];
+    render_table(frame, area, &header, &body, "c2 profile");
+}
+Overlay::AuditVerify { ok, broken_at } => {
+    let header = ["STATUS", "BROKEN_AT"];
+    let status = if *ok { "OK" } else { "BROKEN" };
+    let broken = broken_at.as_ref().map(|b| b.to_string()).unwrap_or_else(|| "-".into());
+    let body = vec![vec![status.into(), broken]];
+    render_table(frame, area, &header, &body, "audit chain");
+}
+        Overlay::SessionDetail(id_ref) => {
+            // 本地数据 overlay：每帧从 app.sessions 实时查找（所以 pending/age 是活的）。
+            // 这是 ja3/ja4/pid/age_secs/pending 的唯一展示入口——它们在 SessionView
+            // 里一直有，但 Sessions 行列表和状态栏都放不下。
+            //
+            // match &mut app.overlay 使 overlay 的可变借用贯穿整个 arm；直接读
+            // app.sessions / sessions_meta / age_for 会与之冲突。先把 id clone 成
+            // 所有权值，可变借用随即结束，后续对 app 的不可变借用即可成立。
+            let id = id_ref.clone();
+            match app.sessions.iter().find(|s| s.id == id) {
+                Some(s) => {
+                    let meta = app.sessions_meta.get(&id);
+                    let age = app.age_for(&id);
+                    let rows = build_session_detail_rows(s, &meta, age);
+                    render_kv(frame, area, &rows, "session detail");
+                }
+                None => {
+                    let block = Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(theme::faint())
+                        .style(theme::header_bg())
+                        .title(Span::styled(" session detail ", theme::brand()))
+                        .title_bottom(Span::styled(" q/Esc ", theme::muted()));
+                    let para = Paragraph::new(" session gone").style(theme::muted());
+                    frame.render_widget(block, area);
+                    frame.render_widget(para, area);
+                }
+            }
+        }
+        Overlay::Tasks(rows) => {
+            let header = ["TASK_ID", "TYPE", "ARG", "DETAIL"];
             let body: Vec<Vec<String>> = rows
                 .iter()
-                .map(|a| {
-                    // detail (JSON) goes into the 4th col truncated; target into 3rd.
-                    let target = if a.target.is_empty() { a.operator.clone() } else { format!("{} » {}", a.operator, a.target) };
-                    vec![a.seq.to_string(), format_ts(a.ts), target, a.action.clone()]
+                .map(|t| {
+                    let ty = t.command.get("type").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                    vec![t.task_id.to_string(), ty, task_arg(&t.command), task_detail(&t.command)]
                 })
                 .collect();
-            render_table(frame, area, header, &body, "audit log");
+            render_table(frame, area, &header, &body, "queued tasks");
         }
-    }
+}
 }
 
 /// Format a Unix-seconds timestamp as a short local-ish string for the audit
@@ -350,7 +422,7 @@ fn format_ts(ts: u64) -> String {
 fn render_table(
     frame: &mut ratatui::Frame,
     area: Rect,
-    header: [&str; 4],
+    header: &[&str],
     rows: &[Vec<String>],
     title: &str,
 ) {
@@ -362,12 +434,17 @@ fn render_table(
         .iter()
         .map(|r| Row::new(r.iter().cloned().map(|c| Cell::new(c).style(theme::text()))))
         .collect();
-    let widths = [
-        Constraint::Percentage(32),
-        Constraint::Percentage(14),
-        Constraint::Percentage(18),
-        Constraint::Percentage(36),
-    ];
+    // 按列数挑宽度：4 列用原比例（32/14/18/36），2 列用 22/78，其余均分。
+    let widths: Vec<Constraint> = match header.len() {
+        4 => vec![
+            Constraint::Percentage(32),
+            Constraint::Percentage(14),
+            Constraint::Percentage(18),
+            Constraint::Percentage(36),
+        ],
+        2 => vec![Constraint::Percentage(22), Constraint::Percentage(78)],
+        _ => (0..header.len()).map(|_| Constraint::Percentage((100 / header.len()) as u16)).collect(),
+    };
     // Build the themed block here (same look as the session-list overlay).
     let block = Block::default()
         .borders(Borders::ALL)
@@ -380,4 +457,121 @@ fn render_table(
         .highlight_style(theme::selected())
         .block(block);
     frame.render_widget(table, area);
+}
+
+/// 2 列 key/value 表（左窄右宽），用于 `/info` 会话详情。
+/// 与 4 列的 [`render_table`] 同样的 themed 外观，仅列数/宽度不同。
+fn render_kv(frame: &mut ratatui::Frame, area: Rect, rows: &[(String, String)], title: &str) {
+    use ratatui::widgets::{Cell, Row, Table};
+    let header_row = Row::new(["KEY", "VALUE"].iter().map(|h| Cell::from(*h)))
+        .style(Style::default().fg(theme::MAUVE).add_modifier(Modifier::BOLD));
+    let data_rows: Vec<Row> = rows
+        .iter()
+        .map(|(k, v)| {
+            Row::new(vec![
+                Cell::new(k.as_str()).style(theme::muted()),
+                Cell::new(v.as_str()).style(theme::text()),
+            ])
+        })
+        .collect();
+    let widths = [Constraint::Percentage(22), Constraint::Percentage(78)];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::faint())
+        .style(theme::header_bg())
+        .title(Span::styled(format!(" {title} "), theme::brand()))
+        .title_bottom(Span::styled(" q/Esc ", theme::muted()));
+    let table = Table::new(data_rows, widths)
+        .header(header_row)
+        .highlight_style(theme::selected())
+        .block(block);
+    frame.render_widget(table, area);
+}
+
+/// 构建 `/info` 详情表的数据行：SessionView 全字段 + 本地 meta（alias/tags/star/notes）。
+/// `age` 由调用方客户端推算传入（`app.age_for(id)`），故每帧都是活的。
+fn build_session_detail_rows(
+    s: &SessionView,
+    meta: &super::session_meta::SessionMeta,
+    age: u64,
+) -> Vec<(String, String)> {
+    let ja3 = s.ja3.clone().unwrap_or_else(|| "-".into());
+    let ja4 = s.ja4.clone().unwrap_or_else(|| "-".into());
+    let alias = meta.alias.clone().unwrap_or_else(|| "-".into());
+    let tags = if meta.tags.is_empty() {
+        "-".into()
+    } else {
+        meta.tags.join(", ")
+    };
+    let star = if meta.favorite { "★ favorite" } else { "-" };
+    let notes = meta.notes.clone().unwrap_or_else(|| "-".into());
+    vec![
+        ("id".into(), s.id.clone()),
+        ("beacon_id".into(), s.beacon_id.to_string()),
+        ("hostname".into(), s.hostname.clone()),
+        ("username".into(), s.username.clone()),
+        ("os".into(), s.os.clone()),
+        ("arch".into(), arch_str(s.arch).to_string()),
+        ("pid".into(), s.pid.to_string()),
+        ("admin".into(), if s.is_admin == 1 { "yes ⚡".into() } else { "no".into() }),
+        ("pending".into(), format!("{} queued", s.pending)),
+        ("age".into(), fmt_age(age)),
+        ("ja3".into(), ja3),
+        ("ja4".into(), ja4),
+        ("alias".into(), alias),
+        ("tags".into(), tags),
+        ("star".into(), star.into()),
+        ("notes".into(), notes),
+    ]
+}
+
+/// 提取排队任务的主要参数（一个短摘要），用于 `/tasks` 表的 ARG 列。
+/// 按常见 command type 取最显眼的字段；不认识的 type 显示 "-"。
+fn task_arg(cmd: &serde_json::Value) -> String {
+    let ty = match cmd.get("type").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return "-".into(),
+    };
+    let str_field = |k: &str| cmd.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+    match ty {
+        "shell" => str_field("args"),
+        "bof" => str_field("name"),
+        "upload" => str_field("name"),
+        "download" => str_field("path"),
+        "sleep" => cmd.get("seconds").map(|s| s.to_string()),
+        "fileop" => str_field("path"),
+        "connect" | "portscan" => str_field("host"),
+        "screenshot" => cmd.get("monitor").map(|m| format!("mon:{m}")),
+        "env" => str_field("name"),
+        "stealtoken" => cmd.get("pid").map(|p| format!("pid:{p}")),
+        "maketoken" => str_field("user"),
+        _ => None,
+    }
+    .unwrap_or_else(|| "-".into())
+}
+
+/// 提取排队任务的次要详情，用于 `/tasks` 表的 DETAIL 列。
+/// 这是 ARG 列装不下的补充信息（端口、jitter、子操作等）。
+fn task_detail(cmd: &serde_json::Value) -> String {
+    let ty = match cmd.get("type").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return "-".into(),
+    };
+    let str_field = |k: &str| cmd.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+    match ty {
+        "sleep" => cmd.get("jitter_pct").map(|j| format!("jitter:{j}%")),
+        "fileop" => str_field("op"),
+        "connect" => cmd.get("port").map(|p| format!("port:{p}")),
+        "portscan" => str_field("ports"),
+        "bof" => cmd.get("args")
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "))
+            .filter(|s| !s.is_empty()),
+        "net" => str_field("query"),
+        "hashdump" => cmd.get("method").map(|m| format!("method:{m}")),
+        "keylog" => cmd.get("action").map(|a| format!("action:{a}")),
+        "maketoken" => cmd.get("logon_type").map(|lt| format!("logon:{lt}")),
+        _ => None,
+    }
+    .unwrap_or_else(|| "-".into())
 }

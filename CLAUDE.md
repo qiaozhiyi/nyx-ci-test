@@ -17,7 +17,7 @@ sensibility with Brute Ratel C4's default-on stealth; see `README.md` and the fu
 > Historical audit/research docs are archived under `docs/archive/`.
 
 ```bash
-cargo test --workspace                 # 228 tests green (protocol codec + server e2e + SDK + store/audit/profile)
+cargo test --workspace                 # 326 tests green (protocol codec + server e2e + SDK + store/audit/profile + client-cli)
 
 # single test
 cargo test -p nyx-protocol frame_seal_open_roundtrip
@@ -185,7 +185,7 @@ B1 heap enumerator, B2 Foliage heap mask) all completed 2026-06-27. **Gaps G1-G5
 closed 2026-06-27** (postex token-ops wired, creds/audit client sync, client-ui
 BOF loader + env token, MiniFilter reachable, offset-resolver symbol-server).
 Only **G6** remains — Win11 24H2/25H2 real-machine verify (hardware gap: sshconfig
-has no such host; `win`=Server 2019). `cargo test --workspace` = **318 passed / 0 failed**.
+has no such host; `win`=Server 2019). `cargo test --workspace` = **326 passed / 0 failed**.
 
 ### Shipped & verified (2026-06-27)
 
