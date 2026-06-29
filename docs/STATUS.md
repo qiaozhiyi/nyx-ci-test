@@ -287,10 +287,13 @@ CI workflow：`.github/workflows/g6-verify.yml`，runner `windows-2025-vs2026`�
 
 **本地命令（纯 client 逻辑，不涉及 server）**：`/sessions`/`/info`/`/tasks`/`/rename`/`/tag`/`/star`/`/note`/`/topo`/`/alias`/`/clear`/`/help`/`/connect`/`/use` —— 数据源（sessions API G7 字段 pid/pending/age + sessions.json 本地元数据）已验证就绪；TUI 渲染层 116 集成测试全过（含 sessions/session_detail/tasks overlay）。
 
-**发现的 3 个真实限制**（非 bug，记录备查）：
-1. **fileop rm 不支持** —— implant 要求走 shell `del`/`rmdir`
-2. **socks 只支持 connect op** —— 未实现 open/bind 等
-3. **Session 0 限制** —— hashdump(SAM)/screenshot/部分 token 操作在 SYSTEM 服务会话下受限（图形/registry 保护），需交互式会话
+**原 3 个限制现已修复**（commit `84e26d9`，2026-06-30）：
+1. ~~**fileop rm 不支持**~~ → ✅ **已修复**：改用 Win32 `DeleteFileW`/`RemoveDirectoryW`（绕过 indirect-syscall 挂起）。真机：upload 建文件后 `rm` 成功。
+2. ~~**socks 只支持 connect op**~~ → ✅ **已修复**：新增 op=2 BIND（`do_bind` socket+bind+listen + `pump_channels` accept 分支）。真机：返回 listening channel。
+3. ~~**Session 0 限制**~~ → ✅ **部分修复**：
+   - **stealtoken**：根因是**真实 bug**（从未启用 SeDebugPrivilege）→ 加 `enable_debug_privilege`。真机：`stealtoken lsass(pid=744)` 成功。
+   - **hashdump**：原直读 SAM 被 oplock 拒 → 加 `RegSaveKeyW` save-hive fallback（+ 修复 `HKEY_LOCAL_MACHINE` 句柄值 `0x80000002`）。真机：**SAM(80KB) + SYSTEM(344KB) hive 全部成功 dump**。
+   - **screenshot**：加 `attach_interactive`（切到 WinSta0\default）→ 走通新路径，但纯 SSH 服务器无交互会话登录仍无桌面可截（需 RDP/console 会话，预期行为）。
 
 ---
 
