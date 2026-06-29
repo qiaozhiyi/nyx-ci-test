@@ -241,6 +241,57 @@ CI workflow：`.github/workflows/g6-verify.yml`，runner `windows-2025-vs2026`�
 
 **已知待办**：TLS implant（`use_tls=true`）经 WinHTTP 连自签证书 server 时 check-in 失败（明文路径正常）。curl 经同一隧道 HTTPS 握手正常（server TLS + 指纹嗅探本身可用），问题在 implant 的 `WinHttpSetOption` 证书放宽路径。ja3/ja4 指纹需 TLS beacon check-in 才产生，暂未验证（待调试 WinHTTP TLS）。
 
+### 5f TUI 全命令真机测试矩阵（2026-06-29）
+
+47 个 TUI 命令逐个验证（持久 SYSTEM beacon + autossh 隧道 + 固定 keyfile 明文 server）。每条发 `POST /api/task` 精确复现 TUI 的 wire 格式，验证 implant 执行 + server 返回。
+
+**implant 任务命令（走 beacon 循环）**：
+
+| 命令 | wire type | 状态 | 备注 |
+|---|---|---|---|
+| `/ls`(shell dir) / `/ps`(tasklist) | shell | ✅ | 解析成表 |
+| `/cd` `/mkdir` `/cp` `/mv` | fileop | ✅ | ok |
+| **`/rm`** | fileop rm | ❌ | **implant 拒绝：'rm: not directly supported — use Shell'**（已知限制，需走 shell） |
+| `/net ifconfig/arp/routes/conn` | net | ✅ | 全部返回解析后的表（IP/ARP/路由/连接） |
+| `/drive` | driveinfo | ✅ | `C:\ total=53GB free=16GB` |
+| `/env` / `/env NAME` | env | ✅ | 31 行全部 / 单变量 |
+| `/portscan` | portscan | ✅ | 探测到 `22 open` |
+| `/clipboard` | clipboard | ✅ | 空（剪贴板无内容） |
+| `/getuid` | getuid | ✅ | `NT AUTHORITY\SYSTEM` |
+| `/ping` | ping | ✅ | ok |
+| `/sleep` | sleep | ✅ | ok（改 beacon 间隔） |
+| `/upload` | upload | ✅ | 文件写入 + data_hex 往返正确 |
+| `/download` | download | ✅ | file chunk 返回，字节与上传一致 |
+| `/keylog start` | keylog 0 | ✅ | ok（启动键盘记录） |
+| `/make_token` | maketoken | ✅ | ok（造令牌） |
+| `/rev2self` | rev2self | ✅ | ok |
+| `/pivot` | connect | ✅ | server 分配 `chan:1`（P2P 协议工作） |
+| `/chan close` | channelclose | ✅ | ok |
+| **`/socks` op=0** | socks | ❌ | **'socks: unsupported op 0 (only connect=1)'**（implant 只实现 connect op） |
+| `/hashdump` | hashdump 0 | ⚠️ | 'SAM hive locked by SAM service'（**环境限制**：SYSTEM 在线不能直读 SAM，需先 save hive） |
+| `/steal pid=4` | stealtoken | ⚠️ | 'OpenProcessToken failed'（**预期**：pid=4 System 进程令牌受保护） |
+| `/screenshot` | screenshot | ⚠️ | 'BitBlt failed'（**环境限制**：Session 0 SYSTEM 服务无图形桌面） |
+| `/bof` `/screenwatch` `/kill`(exit) | bof/screenwatch/exit | 未测 | BOF 需真实 .obj；screenwatch 同 screenshot 限制；exit 会杀 beacon |
+
+**server 控制 API（不走 implant）**：
+
+| 端点 | 对应 TUI 命令 | 状态 |
+|---|---|---|
+| `POST /api/creds` | `/creds add` | ✅ `{"ok":true}` |
+| `GET /api/creds` | `/creds sync` | ✅ 自动掩码 `P@....23` |
+| `GET /api/creds?reveal=1` | `/creds sync reveal` | ✅ 明文 `P@ss123` |
+| `POST /api/creds/delete` | `/creds del` | ✅ `{"deleted":true}` |
+| `GET /api/audit` | `/audit` | ✅ 审计记录（task/cred_add/cred_delete 全被记录） |
+| `GET /api/audit/verify` | `/audit verify` | ✅ `{"ok":true}` 哈希链完整 |
+| `GET /api/profile` | `/profile` | ✅ `{"loaded":false}` |
+
+**本地命令（纯 client 逻辑，不涉及 server）**：`/sessions`/`/info`/`/tasks`/`/rename`/`/tag`/`/star`/`/note`/`/topo`/`/alias`/`/clear`/`/help`/`/connect`/`/use` —— 数据源（sessions API G7 字段 pid/pending/age + sessions.json 本地元数据）已验证就绪；TUI 渲染层 116 集成测试全过（含 sessions/session_detail/tasks overlay）。
+
+**发现的 3 个真实限制**（非 bug，记录备查）：
+1. **fileop rm 不支持** —— implant 要求走 shell `del`/`rmdir`
+2. **socks 只支持 connect op** —— 未实现 open/bind 等
+3. **Session 0 限制** —— hashdump(SAM)/screenshot/部分 token 操作在 SYSTEM 服务会话下受限（图形/registry 保护），需交互式会话
+
 ---
 
 ## 6. 真机验证关键地址（Server 2019 17763.1339）
