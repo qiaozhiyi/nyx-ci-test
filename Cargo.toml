@@ -18,8 +18,13 @@ members = [
     "crates/bof-runner",
     "crates/client-ui",
     "crates/scripting-rhai",
-    "crates/pe",
 ]
+# NOTE: `crates/pe` is excluded — it's a dead crate (zero dependents, zero code
+# references; its sole public fn `resolve_export` is used only by its own tests).
+# The implant resolves symbols via nyx-coff / nyx-implant-evasionsdk instead.
+# The code is retained for reference; remove this line + re-add to `members`
+# if a consumer is ever wired.
+exclude = ["crates/pe"]
 # NOTE: `crates/implant-win` is intentionally NOT a workspace member. It is
 # `#![no_std]` + `#![no_main]` + targets `x86_64-pc-windows-gnu` on nightly, and
 # the PIC extraction step needs the Windows toolchain. Building/checking the
