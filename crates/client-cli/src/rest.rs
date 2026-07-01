@@ -1419,7 +1419,6 @@ async fn worker_loop(
             }
             // Chunked tasks (downloads + screenshots) stream FileChunks + eof.
             let is_chunked = matches!(t.kind, TaskKind::Download { .. } | TaskKind::Screenshot);
-            let is_image = matches!(t.kind, TaskKind::Screenshot);
             if !is_chunked && t.started_at.elapsed() > TASK_DEADLINE {
                 log_push(
                     &mut log_buf,
@@ -1441,7 +1440,6 @@ async fn worker_loop(
                     &t.session,
                     t.task_id,
                     &mut t.chunks,
-                    is_image,
                     &mut t.saw_eof,
                     token,
                 )
@@ -1903,7 +1901,6 @@ async fn poll_file_chunks(
     session: &str,
     task_id: u64,
     chunks: &mut Vec<(u32, Vec<u8>)>,
-    is_image: bool,
     saw_eof: &mut bool,
     token: &Option<String>,
 ) -> PollOutcome {
@@ -1915,11 +1912,12 @@ async fn poll_file_chunks(
         if r.task_id != task_id {
             continue;
         }
-        if is_image {
-            if r.kind != "image" {
-                continue;
-            }
-        } else if r.kind != "file" {
+        // Screenshots stream back as `FileChunk`s (kind "file"), exactly like
+        // downloads — `Response::Image`/kind "image" is a dead variant no
+        // implant ever emits, so both download + screenshot tasks filter on
+        // kind == "file". (Requiring "image" here silently dropped every
+        // screenshot chunk.)
+        if r.kind != "file" {
             continue;
         }
         let seq = r.seq.unwrap_or(0);

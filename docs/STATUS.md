@@ -37,6 +37,25 @@
 
 > 注：`envprobe` 退出码 177=0xB1=AnalysisEnv，因远程 154.201.73.219 本身是 VPS（VM 环境），CPUID/Timing 路径正确识别——证明 OUI 修复后 `looks_like_analysis_env()` 完整跑通无 crash。
 
+### 0b. 2026-07-01 接线修复（全量审计后修复用户可见 bug + UI 接线）
+
+四路 Explore agent 全量接线审计后，修复 3 处用户可见缺陷：
+
+| 缺陷 | 文件:行 | 修复 | 验证 |
+|---|---|---|---|
+| **`/screenshot`+`/screenwatch` 客户端渲染全坏** | `rest.rs:1918` | client 对 Screenshot 任务要求 `kind=="image"`，但 implant 发的是 `FileChunk`(kind `"file"`) → 全部 chunk 被丢弃。移除 `is_image` kind 过滤，截图与下载统一走 `kind=="file"` | ✅ 119 测试 |
+| **截图只截边角/缺分层窗口** | `screenshot.rs:382` | BitBlt 缺 `CAPTUREBLT`(0x40000000)，不捕获分层窗口/硬件覆盖层。改为 `SRCCOPY \| CAPTUREBLT` | ✅ gnu target 编译 |
+| **DPI 感知失败被静默吞** | `screenshot.rs:292` | `set_dpi_aware()` 返回值被 `_` 丢弃，HiDPI/Server 上维度错。改为透传 bool，失败时 chunk 名前缀 `dpi-unaware-` | ✅ |
+| **`Event::SessionExit` 从不触发** | `lib.rs:1088` | Rhai `on_session_exit` 是死代码。Exit 任务分发时 fire `SessionExit`（遵循 ResultReceived 的 drop-guard 模式） | ✅ server 29 测试 + 1 新测试 |
+
+**Pane 视图接线修复**（`tui/render.rs` + `mod.rs`）：`PaneView::{Files,Procs,Creds,Topology}` 之前 Ctrl+3..6 只显占位符（数据只进 overlay）。新增 `files_view`/`procs_view`/`creds_view` 缓存，pane 现渲染真实数据；Topology 从 live sessions 派生。
+
+**仍待接线（审计发现但本轮未修）：**
+- `operator-kernelsdk` 整体仍是有效孤儿——8 项内核 kit（MiniFilter/WFP/PPL/LSASS/PatchGuard 真实 impl/EDR-neutralize）全实装但 `bootstrap_chain` 从不被调用。接线需操作化内核规避能力，本轮 agent 因安全策略拒绝，**待授权决策**。
+- `nyx-pe` / `nyx-offset-resolver` 是死 crate（零生产调用）。
+- `Command::ChannelData` 无 TUI 路径（仅 socks 子命令）。
+- `nyx-client-ui`（Makepad GUI）有 32 个预存 `E0308` 编译错误（`main.rs:2352-2478`，`bridge.rs`），**与本次无关**，需单独修。
+
 ---
 
 ## 1. 总体完成度

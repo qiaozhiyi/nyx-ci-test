@@ -104,17 +104,19 @@ fn render_pane(
             render_sessions_in_pane(frame, app, inner);
         }
         panes::PaneView::Files => {
-            render_overlay_content(frame, app, inner, &Overlay::Files(vec![]));
+            // Render the SAME parsed file listing the fullscreen overlay uses
+            // (cached in App::files_view), instead of a hardcoded placeholder.
+            // Empty → show the hint so the operator knows to run /ls.
+            render_files_table(frame, inner, &app.files_view);
         }
         panes::PaneView::Procs => {
-            render_overlay_content(frame, app, inner, &Overlay::Procs(vec![]));
+            render_procs_table(frame, inner, &app.procs_view);
         }
         panes::PaneView::Creds => {
-            render_overlay_content(frame, app, inner, &Overlay::Creds(vec![]));
+            render_creds_table(frame, inner, &app.creds_view);
         }
         panes::PaneView::Topology => {
-            let para = Paragraph::new("topology — use /topo to view").style(theme::muted());
-            frame.render_widget(para, inner);
+            render_topology_in_pane(frame, app, inner);
         }
     }
 }
@@ -175,16 +177,159 @@ fn render_sessions_in_pane(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// overlay 内容渲染（用于 files/procs/creds 窗格视图）。
-fn render_overlay_content(frame: &mut ratatui::Frame, _app: &App, area: Rect, overlay: &Overlay) {
-    let msg = match overlay {
-        Overlay::Files(_) => "(files — use /ls to populate)",
-        Overlay::Procs(_) => "(procs — use /ps to populate)",
-        Overlay::Creds(_) => "(creds — use /creds to populate)",
-        Overlay::Audit(_) => "(audit — use /audit to populate)",
-        Overlay::Image(_, _) => "(screenshot — see event log for path)",
-        _ => "(empty)",
+/// Render a file listing inside a pane leaf. Mirrors the fullscreen
+/// `Overlay::Files` table (render.rs Files arm) but without its own border
+/// block — the pane already supplies one via `render_pane`. Empty → hint.
+fn render_files_table(frame: &mut ratatui::Frame, area: Rect, rows: &[crate::types::FileEntry]) {
+    if rows.is_empty() {
+        hint(frame, area, "(files — use /ls to populate)");
+        return;
+    }
+    let header = ["NAME", "SIZE", "TYPE", "MODIFIED"];
+    let body: Vec<Vec<String>> = rows
+        .iter()
+        .map(|f| {
+            vec![
+                f.name.clone(),
+                f.size.to_string(),
+                if f.is_dir { "dir" } else { "file" }.into(),
+                f.modified.clone(),
+            ]
+        })
+        .collect();
+    render_borderless_table(frame, area, &header, &body);
+}
+
+/// Render a process listing inside a pane leaf. Mirrors `Overlay::Procs`.
+fn render_procs_table(frame: &mut ratatui::Frame, area: Rect, rows: &[crate::types::ProcEntry]) {
+    if rows.is_empty() {
+        hint(frame, area, "(procs — use /ps to populate)");
+        return;
+    }
+    let header = ["PID", "PPID", "USER", "NAME"];
+    let body: Vec<Vec<String>> = rows
+        .iter()
+        .map(|p| {
+            vec![
+                p.pid.to_string(),
+                p.ppid.to_string(),
+                p.user.clone(),
+                p.name.clone(),
+            ]
+        })
+        .collect();
+    render_borderless_table(frame, area, &header, &body);
+}
+
+/// Render a credential listing inside a pane leaf. Mirrors `Overlay::Creds`
+/// (secret masking included).
+fn render_creds_table(frame: &mut ratatui::Frame, area: Rect, rows: &[crate::types::CredEntry]) {
+    if rows.is_empty() {
+        hint(frame, area, "(creds — use /creds to populate)");
+        return;
+    }
+    let header = ["SOURCE", "PRINCIPAL", "KIND", "SECRET"];
+    let body: Vec<Vec<String>> = rows
+        .iter()
+        .map(|c| {
+            vec![
+                c.source.clone(),
+                c.principal.clone(),
+                c.kind.label().into(),
+                input::mask(&c.secret),
+            ]
+        })
+        .collect();
+    render_borderless_table(frame, area, &header, &body);
+}
+
+/// Render the session topology inside a pane leaf. Derives the same layered
+/// layout `/topo` computes in the event stream, so the pane shows live topology
+/// from `app.sessions` instead of a dead placeholder. With no sessions it falls
+/// back to the hint.
+fn render_topology_in_pane(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    if app.sessions.is_empty() {
+        hint(frame, area, "(topology — no beacons)");
+        return;
+    }
+    let nodes: Vec<(String, String)> = app
+        .sessions
+        .iter()
+        .map(|s| {
+            let label = app
+                .sessions_meta
+                .get(&s.id)
+                .alias
+                .clone()
+                .unwrap_or_else(|| s.hostname.clone());
+            (s.id.clone(), label)
+        })
+        .collect();
+    let topo = super::topology::layout(&nodes, &[]);
+    let mut lines: Vec<Line> = Vec::new();
+    let max_y = topo.nodes.iter().map(|n| n.y).max().unwrap_or(0);
+    for layer in 0..=max_y {
+        let layer_nodes: Vec<&super::topology::TopoNode> =
+            topo.nodes.iter().filter(|n| n.y == layer).collect();
+        if layer_nodes.is_empty() {
+            continue;
+        }
+        let node_strs: Vec<String> = layer_nodes
+            .iter()
+            .map(|n| {
+                let mark = if n.is_beacon { "◆" } else { "◇" };
+                format!("{mark} {}", n.label)
+            })
+            .collect();
+        lines.push(Line::from(vec![Span::styled(
+            format!("L{}  {}", layer, node_strs.join("  ")),
+            theme::text(),
+        )]));
+    }
+    if lines.is_empty() {
+        hint(frame, area, "(topology — /topo for edges)");
+    } else {
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+}
+
+/// A table rendered WITHOUT its own border block (the pane supplies the border).
+/// Mirrors the column widths used by the fullscreen overlay tables.
+fn render_borderless_table(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    header: &[&str],
+    rows: &[Vec<String>],
+) {
+    use ratatui::widgets::{Cell, Row, Table};
+    let header_row = Row::new(header.iter().map(|h| Cell::from(*h))).style(
+        Style::default()
+            .fg(theme::MAUVE)
+            .add_modifier(Modifier::BOLD),
+    );
+    let data_rows: Vec<Row> = rows
+        .iter()
+        .map(|r| Row::new(r.iter().cloned().map(|c| Cell::new(c).style(theme::text()))))
+        .collect();
+    let widths: Vec<Constraint> = match header.len() {
+        4 => vec![
+            Constraint::Percentage(32),
+            Constraint::Percentage(14),
+            Constraint::Percentage(18),
+            Constraint::Percentage(36),
+        ],
+        _ => (0..header.len())
+            .map(|_| Constraint::Percentage((100 / header.len()) as u16))
+            .collect(),
     };
+    let table = Table::new(data_rows, widths)
+        .header(header_row)
+        .highlight_style(theme::selected());
+    frame.render_widget(table, area);
+}
+
+/// Dimmed single-line hint shown when a pane view has no data yet.
+fn hint(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
     let para = Paragraph::new(msg).style(theme::muted());
     frame.render_widget(para, area);
 }

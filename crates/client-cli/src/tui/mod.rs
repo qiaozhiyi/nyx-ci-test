@@ -104,6 +104,15 @@ pub(super) struct App {
     pub(super) popup_open: bool,
     pub(super) popup_state: ListState,
     pub(super) overlay: Overlay,
+    /// Latest parsed files listing — mirrored from the most recent `/ls` result
+    /// so a Files pane view can render it WITHOUT depending on the fullscreen
+    /// overlay being open (q/Esc dismisses the overlay but the data persists).
+    /// Previously the pane path got hardcoded `Overlay::Files(vec![])`.
+    pub(super) files_view: Vec<FileEntry>,
+    /// Latest parsed process listing — mirrors `/ps` for the Procs pane view.
+    pub(super) procs_view: Vec<ProcEntry>,
+    /// Latest parsed credential listing — mirrors `/creds` for the Creds pane.
+    pub(super) creds_view: Vec<CredEntry>,
     /// tmux 式窗格树（可递归分割）。
     pub(super) pane_tree: panes::Pane,
     /// 当前焦点叶 id。
@@ -140,6 +149,9 @@ impl App {
             popup_open: false,
             popup_state,
             overlay: Overlay::default(),
+            files_view: Vec::new(),
+            procs_view: Vec::new(),
+            creds_view: Vec::new(),
             pane_tree: panes::Pane::single(1),
             focused_pane: 1,
             config: config::Config::load(),
@@ -208,7 +220,11 @@ impl App {
                 let drop = self.stream.len() - STREAM_CAP;
                 self.stream.drain(..drop);
             }
-            // A parsed table arrived → pop it as the fullscreen overlay.
+            // A parsed table arrived → pop it as the fullscreen overlay AND mirror
+            // it into the per-view cache so the in-pane renderers (Ctrl+3/4/5)
+            // show real data instead of placeholders. The overlay is dismissible
+            // (q/Esc); the cached view data persists so a pane keeps its content
+            // after the overlay closes.
             if let Some(table) = snap.parsed {
                 self.overlay = match table {
                     ParsedTable::Files(rows) => {
@@ -216,6 +232,7 @@ impl App {
                             self.log("(no files parsed)", Level::Warn);
                             Overlay::None
                         } else {
+                            self.files_view = rows.clone();
                             Overlay::Files(rows)
                         }
                     }
@@ -224,6 +241,7 @@ impl App {
                             self.log("(no processes parsed)", Level::Warn);
                             Overlay::None
                         } else {
+                            self.procs_view = rows.clone();
                             Overlay::Procs(rows)
                         }
                     }
@@ -247,6 +265,7 @@ impl App {
                                     Level::Ok,
                                 );
                             }
+                            self.creds_view = rows.clone();
                             Overlay::Creds(rows)
                         }
                     }
@@ -2245,6 +2264,95 @@ mod tests {
             .set_view(101, panes::PaneView::SessionList);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
+    }
+
+    #[test]
+    fn files_pane_renders_cached_data_not_placeholder() {
+        // BUG 2: the Files pane view used a hardcoded empty vec and always showed
+        // "(files — use /ls to populate)". Now it renders App::files_view. Pin:
+        // with files_view populated and a pane set to PaneView::Files, the drawn
+        // buffer contains the file name — proving the real data flows through.
+        let mut app = fake_app();
+        app.files_view = vec![FileEntry {
+            name: "secret.txt".into(),
+            size: 4096,
+            is_dir: false,
+            modified: "Jan 01".into(),
+        }];
+        app.pane_tree = app.pane_tree.clone().set_view(1, panes::PaneView::Files);
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rendered: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            rendered.contains("secret.txt"),
+            "Files pane must render the cached file name, not a placeholder"
+        );
+        assert!(
+            !rendered.contains("use /ls to populate"),
+            "Files pane must NOT show the placeholder when data is present"
+        );
+    }
+
+    #[test]
+    fn files_pane_shows_placeholder_when_empty() {
+        // Empty cache → the hint is still shown (operator is told how to populate).
+        let mut app = fake_app();
+        app.pane_tree = app.pane_tree.clone().set_view(1, panes::PaneView::Files);
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        let rendered: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            rendered.contains("use /ls to populate"),
+            "empty Files pane must keep the hint"
+        );
+    }
+
+    #[test]
+    fn poll_worker_mirrors_files_into_view_cache() {
+        // BUG 2 mirror contract: when a ParsedTable::Files snapshot arrives,
+        // poll_worker must populate files_view (so the pane keeps the data after
+        // q/Esc closes the overlay). Build a live channel, send a snapshot, and
+        // assert the cache is populated + the overlay opened (both paths fed).
+        let (snap_tx, snap_rx) = std::sync::mpsc::channel();
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Bridge {
+            snapshots: snap_rx,
+            cmds: _cmd_tx,
+        });
+        let _ = cmd_rx; // silence unused; receiver unused in this test
+        snap_tx
+            .send(rest::Snapshot {
+                sessions: Vec::new(),
+                log_lines: Vec::new(),
+                connected: true,
+                parsed: Some(rest::ParsedTable::Files(vec![FileEntry {
+                    name: "cached.txt".into(),
+                    size: 7,
+                    is_dir: false,
+                    modified: "Feb 02".into(),
+                }])),
+            })
+            .unwrap();
+        app.poll_worker();
+        assert_eq!(
+            app.files_view.len(),
+            1,
+            "files_view must mirror the parsed /ls result"
+        );
+        assert_eq!(app.files_view[0].name, "cached.txt");
+        assert!(
+            matches!(app.overlay, Overlay::Files(_)),
+            "overlay path must still open as before"
+        );
     }
 
     #[test]
