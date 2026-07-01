@@ -127,6 +127,55 @@ pub fn build_leaf_bridge(
     out
 }
 
+/// Build a LACUNA six-layer chain: a deep leaf-lacuna bridge round-robining
+/// across **five** pools (gaps → nops → ghosts → tails → backed), terminating
+/// with a backed module-legitimate frame so the unwinder's final walk resolves
+/// to a real signed module (defeats return-address-in-module validation).
+///
+/// This is the LACUNA evolution of [`build_leaf_bridge`]:
+/// - Layer 4 (tails): tail-padding lacunae — large contiguous unwinder-invisible regions.
+/// - Layer 5 (backed): real `.pdata`-covered functions as the chain terminator.
+///
+/// The `backed` pool supplies `FrameKind::Backed` frames (terminal in the
+/// unwinder walk); all other pools supply `LeafGap` frames. If `backed` is
+/// empty, the chain is all-leaf (degrades to the BYOUD-Gap behavior).
+///
+/// Returns an empty vec if `depth == 0` or all leaf pools are empty.
+pub fn build_lacuna_chain(
+    gaps: &[usize],
+    nops: &[usize],
+    ghosts: &[usize],
+    tails: &[usize],
+    backed: &[usize],
+    depth: usize,
+) -> Vec<SyntheticFrame> {
+    // Leaf pools (round-robin for the bridge body).
+    let leaf_pools: [&[usize]; 4] = [gaps, nops, ghosts, tails];
+    if depth == 0 || leaf_pools.iter().all(|p| p.is_empty()) {
+        return Vec::new();
+    }
+    let mut out: Vec<SyntheticFrame> = Vec::with_capacity(depth);
+    // Reserve the last slot for a backed terminator if available.
+    let leaf_depth = if !backed.is_empty() { depth.saturating_sub(1) } else { depth };
+    let max_len = leaf_pools.iter().map(|p| p.len()).max().unwrap_or(0);
+    'outer: for i in 0..max_len {
+        for pool in leaf_pools {
+            if i < pool.len() {
+                out.push(SyntheticFrame { addr: pool[i], kind: FrameKind::LeafGap });
+                if out.len() == leaf_depth {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    // Append the backed terminator (layer 5) — round-robin the first entry so
+    // consecutive chains don't share the same terminator address.
+    if !backed.is_empty() && out.len() < depth {
+        out.push(SyntheticFrame { addr: backed[0], kind: FrameKind::Backed });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +257,64 @@ mod tests {
     #[test]
     fn empty_chain_has_zero_depth() {
         assert_eq!(unwind_depth(&[]), 0);
+    }
+
+    // ---- LACUNA chain tests (five-pool + backed terminator) ----
+
+    #[test]
+    fn lacuna_chain_round_robins_five_pools() {
+        let gaps = [0xA0];
+        let nops = [0xB0];
+        let ghosts = [0xC0];
+        let tails = [0xD0];
+        let backed = [0xE0]; // terminator
+        // depth 5 → 4 leaf frames (one per leaf pool) + 1 backed terminator
+        let chain = build_lacuna_chain(&gaps, &nops, &ghosts, &tails, &backed, 5);
+        assert_eq!(chain.len(), 5);
+        // First 4 are leaf gaps, round-robin across gaps/nops/ghosts/tails.
+        assert_eq!(chain[0].addr, 0xA0);
+        assert_eq!(chain[0].kind, FrameKind::LeafGap);
+        assert_eq!(chain[1].addr, 0xB0);
+        assert_eq!(chain[2].addr, 0xC0);
+        assert_eq!(chain[3].addr, 0xD0);
+        // Last is the backed terminator.
+        assert_eq!(chain[4].addr, 0xE0);
+        assert_eq!(chain[4].kind, FrameKind::Backed);
+    }
+
+    #[test]
+    fn lacuna_chain_terminates_with_backed_when_available() {
+        // Even with many leaf addresses, the LAST frame is always backed.
+        let gaps = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7];
+        let backed = [0xE0];
+        let chain = build_lacuna_chain(&gaps, &[], &[], &[], &backed, 8);
+        assert_eq!(chain.len(), 8);
+        assert_eq!(chain.last().unwrap().kind, FrameKind::Backed);
+        assert_eq!(chain.last().unwrap().addr, 0xE0);
+    }
+
+    #[test]
+    fn lacuna_chain_without_backed_is_all_leaf() {
+        // No backed pool → degrades to pure leaf bridge (BYOUD-Gap behavior).
+        let gaps = [0xA0, 0xA1];
+        let tails = [0xD0, 0xD1];
+        let chain = build_lacuna_chain(&gaps, &[], &[], &tails, &[], 4);
+        assert_eq!(chain.len(), 4);
+        assert!(chain.iter().all(|f| f.kind == FrameKind::LeafGap));
+    }
+
+    #[test]
+    fn lacuna_chain_empty_when_all_pools_empty() {
+        assert!(build_lacuna_chain(&[], &[], &[], &[], &[0xE0], 4).is_empty());
+        assert!(build_lacuna_chain(&[0xA0], &[], &[], &[], &[], 0).is_empty());
+    }
+
+    #[test]
+    fn lacuna_chain_uses_tails_pool() {
+        // tails-only host (no inter-function gaps) still produces a chain.
+        let tails = [0xD0, 0xD1, 0xD2];
+        let chain = build_lacuna_chain(&[], &[], &[], &tails, &[], 3);
+        assert_eq!(chain.len(), 3);
+        assert!(chain.iter().all(|f| f.addr >= 0xD0));
     }
 }

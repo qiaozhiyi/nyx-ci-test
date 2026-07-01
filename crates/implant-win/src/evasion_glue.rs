@@ -126,14 +126,33 @@ impl PdataGapScanner for LivePdataScanner {
             for a in per_module.nops.iter_mut() {
                 *a += base_usize;
             }
+            for a in per_module.tails.iter_mut() {
+                *a += base_usize;
+            }
             pool.gaps.extend_from_slice(&per_module.gaps);
             pool.ghosts.extend_from_slice(&per_module.ghosts);
             pool.nops.extend_from_slice(&per_module.nops);
+            pool.tails.extend_from_slice(&per_module.tails);
         }
         if !pool.is_usable() {
             // No gaps anywhere = something is badly wrong (every Win10/11/Server
             // ntdll has thousands). Surface it rather than silently degrade.
             return Err(EvasionError::Unresolved("no .pdata gaps on any whitelisted DLL"));
+        }
+        // LACUNA layer 5: populate the `backed` pool with real `.pdata`-covered
+        // ntdll/kernelbase function addresses to use as chain terminators. These
+        // defeat return-address-in-module validation (the unwinder's final frame
+        // resolves to a legit signed module). We pick a few well-known leaf-like
+        // exports whose addresses are stable and non-sensitive.
+        let backed_targets: &[(&[u8], &[u8])] = &[
+            (b"ntdll.dll", b"NtDelayExecution"),
+            (b"ntdll.dll", b"NtClose"),
+            (b"kernelbase.dll", b"Sleep"),
+        ];
+        for &(module, func) in backed_targets {
+            if let Some(addr) = unsafe { resolve::export_addr(module, func) } {
+                pool.backed.push(addr);
+            }
         }
         Ok(pool)
     }

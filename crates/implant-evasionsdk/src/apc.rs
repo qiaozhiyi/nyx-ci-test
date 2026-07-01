@@ -74,7 +74,7 @@ mod tests {
 
     fn pool_with_gaps(n: usize) -> GapPool {
         let gaps = (1..=n).map(|i| 0x1000_0000 + i * 0x10).collect();
-        GapPool { gaps, ghosts: alloc::vec![], nops: alloc::vec![] }
+        GapPool { gaps, ..Default::default() }
     }
 
     #[test]

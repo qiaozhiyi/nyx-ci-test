@@ -163,16 +163,36 @@ pub struct GapPool {
     pub ghosts: Vec<usize>,
     /// NOP / alignment gaps (e.g. win32u 8-byte NOP gaps between syscall stubs).
     pub nops: Vec<usize>,
+    /// Tail-padding lacunae: the region after the last `.pdata` entry up to
+    /// `SizeOfImage`. Large, contiguous, unwinder-invisible. (LACUNA layer 4)
+    pub tails: Vec<usize>,
+    /// Backed module-legitimate addresses (real `.pdata`-covered functions in
+    /// ntdll/kernelbase). Used as the chain TERMINATOR so the unwinder's final
+    /// backed frame resolves to a real signed module — defeats return-address-
+    /// in-module validation. (LACUNA layer 5)
+    pub backed: Vec<usize>,
 }
 impl GapPool {
     pub fn gap_count(&self) -> usize { self.gaps.len() }
     pub fn ghost_count(&self) -> usize { self.ghosts.len() }
     pub fn nop_count(&self) -> usize { self.nops.len() }
-    pub fn is_usable(&self) -> bool { !self.gaps.is_empty() }
+    /// Total usable leaf-lacuna addresses across all four leaf pools.
+    pub fn lacuna_count(&self) -> usize {
+        self.gaps.len() + self.ghosts.len() + self.nops.len() + self.tails.len()
+    }
+    /// True if ANY leaf-lacuna pool is non-empty (relaxed from gaps-only so a
+    /// host with only ghosts/nops/tails still produces a usable chain).
+    pub fn is_usable(&self) -> bool { self.lacuna_count() > 0 }
 }
 impl Default for GapPool {
     fn default() -> Self {
-        Self { gaps: Vec::new(), ghosts: Vec::new(), nops: Vec::new() }
+        Self {
+            gaps: Vec::new(),
+            ghosts: Vec::new(),
+            nops: Vec::new(),
+            tails: Vec::new(),
+            backed: Vec::new(),
+        }
     }
 }
 

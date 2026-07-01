@@ -127,6 +127,10 @@ pub fn classify_into_pool(
             pool.ghosts.push(g.rva as usize);
         } else if nop_pred(g.rva, image) {
             pool.nops.push(g.rva as usize);
+        } else if g.kind == GapKind::TailPadding {
+            // LACUNA layer 4: tail-padding lacunae get their own bucket so
+            // build_leaf_bridge can round-robin across all four leaf pools.
+            pool.tails.push(g.rva as usize);
         } else {
             pool.gaps.push(g.rva as usize);
         }
