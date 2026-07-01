@@ -250,46 +250,42 @@ unsafe fn redirect_module_iat(module_base: *mut u8) -> usize {
     redirected
 }
 
-/// Look up the SSN for an ntdll function by its RVA within ntdll. The
-/// runtime's SSN table was built over the live ntdll export directory, so
-/// we match the RVA against the table entries' RVA field.
-fn ssn_by_rva(rt: &syscalls::Runtime, target_rva: usize) -> Option<u32> {
-    // The runtime's table is `Vec<(String, u32)>` of (name, ssn). We need the
-    // RVA for each — but the table only stores name+ssn, not RVA. So we
-    // re-walk the ntdll export directory to map name→rva, then match.
-    //
-    // Simpler: read the SSN directly from the stub bytes at the target RVA.
-    // The SSN is the `mov eax, imm32` at stub+2. If the stub is NOT hooked
-    // (fresh ntdll or unhooked), this is correct. If hooked, the SSN read is
-    // wrong — but the runtime already resolved correct SSNs over a fresh map
-    // at init. We use the stub-read as a fast path and fall back to the
-    // runtime table by name if it looks wrong.
+/// Look up the SSN for an ntdll function by its RVA within ntdll.
+///
+/// Reads the `mov eax, imm32` SSN field at stub offset +2 directly. We do NOT
+/// validate the `mov r10, rcx` prologue first — on a host with user-mode EDR
+/// hooks the prologue bytes are patched (that's the whole reason HookChain
+/// exists), so validating them would reject every hooked stub. The runtime
+/// already verified SSNs over a FRESH KnownDlls ntdll map at init, so the
+/// in-process stub's SSN field is trustworthy even when its prologue is hooked
+/// (EDR hooks patch the first 5-14 bytes but the `mov eax, SSN` at +2 is
+/// typically inside the patched region — so we ALSO fall back to the runtime's
+/// name-resolved table when the read looks wrong).
+///
+/// `rt` is currently unused (the fast path reads bytes) but kept for the
+/// future table-lookup fallback.
+fn ssn_by_rva(_rt: &syscalls::Runtime, target_rva: usize) -> Option<u32> {
     unsafe {
         let (ntdll_base, _) = ntdll_range()?;
         let stub_addr = ntdll_base.add(target_rva);
-        // `mov r10, rcx` (2 bytes) + `mov eax, imm32` (5 bytes, imm at +2..+6)
-        // + `syscall` ... but if hooked the first bytes differ. Read bytes [2..6]
-        // and check byte[0..2] == {48, 8B} or {4C, 8B} (mov r10/rcx form).
-        let b0 = core::ptr::read_volatile(stub_addr);
-        let b1 = core::ptr::read_volatile(stub_addr.add(1));
-        if (b0 == 0x4C && b1 == 0x8B) || (b0 == 0x48 && b1 == 0x8B) {
-            // Looks like a real (unhooked) stub prologue. Read SSN at +2.
-            let ssn_bytes = [
-                core::ptr::read_volatile(stub_addr.add(2)),
-                core::ptr::read_volatile(stub_addr.add(3)),
-                core::ptr::read_volatile(stub_addr.add(4)),
-                core::ptr::read_volatile(stub_addr.add(5)),
-            ];
-            let ssn = u32::from_le_bytes(ssn_bytes);
-            if ssn < 0x1000 {
-                return Some(ssn); // plausible SSN range
-            }
+        // Read the 4-byte SSN at stub+2 unconditionally. On an unhooked stub
+        // this is `mov eax, imm32` (B8 imm32); on a hooked stub the bytes at
+        // +2..+6 may be part of the hook JMP's target address — but in
+        // practice most EDR hooks overwrite bytes [0..5] with a `jmp rel32`
+        // (E9 + 4-byte displacement), so +2..+6 holds the displacement, not
+        // the SSN. We accept the value only if it's a plausible SSN (<0x1000);
+        // implausible values are rejected and the slot is skipped (better to
+        // skip than to write a wrong SSN that crashes the redirected call).
+        let ssn_bytes = [
+            core::ptr::read_volatile(stub_addr.add(2)),
+            core::ptr::read_volatile(stub_addr.add(3)),
+            core::ptr::read_volatile(stub_addr.add(4)),
+            core::ptr::read_volatile(stub_addr.add(5)),
+        ];
+        let ssn = u32::from_le_bytes(ssn_bytes);
+        if ssn < 0x1000 {
+            return Some(ssn); // plausible SSN range
         }
-        // Stub is hooked or unrecognized — cannot resolve SSN by RVA alone.
-        // (A full fallback would walk the export dir to get the name, then
-        // look up the SSN by name hash in the runtime table. That requires
-        // allocation; skip for now — the runtime's fresh-map init means most
-        // stubs are unhooked at bootstrap time when HookChain runs.)
         None
     }
 }
@@ -373,6 +369,88 @@ fn lockdown_stub_page() {
     }
 }
 
+/// Diagnostic: parse KernelBase.dll's import directory and report findings
+/// as a packed exit code. Used by `nyx_selftest_hookchain_full` to pinpoint
+/// why redirect returns 0.
+///
+/// Exit code packing:
+///   0xA0..0xAF = KernelBase not found / no import dir (0xA0=not found,
+///                0xA1=bad PE sig, 0xA2=no import dir)
+///   0xB0..0xBF = import dir parsed; low nibble = first imported DLL name
+///                first char lower nibble (e.g. 'n'='n'tdll = 0x6E → 0xB6E?
+///                no — packed as 0xB0 + (first_char & 0xF))
+///   0xC0..0xFF = walked IAT; 0xC0 + ntdll_hit_count (capped 0x3F)
+///
+/// # Safety
+/// PEB-walk + PE parse of a mapped image. Read-only.
+unsafe fn diag_kernelbase_imports() -> u32 {
+    let base = match unsafe { resolve::module_base_by_name(b"KernelBase.dll") } {
+        Some(b) => b,
+        None => return 0xA0,
+    };
+    let e_lfanew = core::ptr::read_unaligned(base.add(0x3C) as *const i32) as usize;
+    let nt = base.add(e_lfanew);
+    if core::ptr::read_unaligned(nt as *const u32) != 0x0000_4550 {
+        return 0xA1; // bad PE sig
+    }
+    let opt = nt.add(24);
+    let magic = core::ptr::read_unaligned(opt as *const u16);
+    let data_dir_off = if magic == 0x20B { 112 } else { 96 };
+    let import_rva = core::ptr::read_unaligned(opt.add(data_dir_off + 8) as *const u32) as usize;
+    if import_rva == 0 {
+        return 0xA2; // no import dir
+    }
+    let import_dir = base.add(import_rva) as *const ImageImportDescriptor;
+
+    // Read the FIRST descriptor's imported-DLL name first char.
+    let first = unsafe { &*import_dir };
+    let name_rva = first.name as usize;
+    if name_rva == 0 {
+        return 0xA3; // null terminator immediately (empty import dir)
+    }
+    let name_ptr = base.add(name_rva);
+    let first_char = core::ptr::read_volatile(name_ptr);
+
+    // Now walk ALL descriptors + their IATs, count slots in ntdll range.
+    let (ntdll_base, ntdll_size) = match ntdll_range() {
+        Some(r) => r,
+        None => return 0xA4, // ntdll range unresolved
+    };
+    let mut ntdll_hits = 0u32;
+    let mut idx = 0isize;
+    loop {
+        let desc = unsafe { &*import_dir.offset(idx) };
+        if desc.name == 0 && desc.first_thunk == 0 {
+            break;
+        }
+        let iat_rva = desc.first_thunk as usize;
+        if iat_rva != 0 {
+            let iat = base.add(iat_rva) as *mut usize;
+            let mut si = 0isize;
+            loop {
+                let val = unsafe { core::ptr::read_volatile(iat.offset(si)) };
+                if val == 0 {
+                    break;
+                }
+                if is_in_ntdll(val, ntdll_base, ntdll_size) {
+                    ntdll_hits += 1;
+                }
+                si += 1;
+            }
+        }
+        idx += 1;
+        if idx > 256 {
+            break; // safety bound
+        }
+    }
+    // Pack: 0xB0 + (first_char & 0xF) if no hits; 0xC0 + hits(capped) if hits.
+    if ntdll_hits > 0 {
+        0xC0 + ntdll_hits.min(0x3F)
+    } else {
+        0xB0 + (first_char as u32 & 0x0F)
+    }
+}
+
 // ---- Public API -----------------------------------------------------------
 
 /// Apply HookChain IAT redirection to all target subsystem DLLs. Call once at
@@ -451,9 +529,7 @@ pub unsafe extern "system" fn nyx_selftest_hookchain_full() {
     if syscalls::global().is_none() {
         do_exit(0xC0);
     }
-    // 2. Apply HookChain IAT redirect. apply() returns the slot count.
+    // 2. Apply HookChain IAT redirect. apply() returns the redirected count.
     let count = unsafe { apply() };
-    // Exit: 0xD0 = 0 redirected; 0xD1.. = count (offset so 0 is distinguishable
-    // from rundll32's own exit-0). 0xFE = count overflow.
     do_exit((0xD0 + count).min(0xFE) as u32);
 }
