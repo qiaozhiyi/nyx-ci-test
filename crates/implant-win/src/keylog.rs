@@ -135,10 +135,10 @@ fn get_async_key_state_fn() -> Option<unsafe extern "system" fn(i32) -> i16> {
 fn map_vkey(vk: i32, shift: bool) -> Option<u8> {
     // Control/whitespace keys.
     match vk {
-        0x08 => return Some(0x08), // Backspace → '\b'
-        0x09 => return Some(0x09), // Tab       → '\t'
-        0x0D => return Some(b'\n'), // Enter     → '\n'
-        0x20 => return Some(b' '), // Space
+        0x08 => return Some(0x08),         // Backspace → '\b'
+        0x09 => return Some(0x09),         // Tab       → '\t'
+        0x0D => return Some(b'\n'),        // Enter     → '\n'
+        0x20 => return Some(b' '),         // Space
         0x10 | 0x11 | 0x12 => return None, // Shift/Ctrl/Alt modifiers — not recorded.
         _ => {}
     }

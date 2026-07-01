@@ -32,14 +32,12 @@ pub fn find_pattern(image: &[u8], pattern: &Pattern) -> Option<usize> {
     if pattern.is_empty() || pattern.len() > image.len() {
         return None;
     }
-    image
-        .windows(pattern.len())
-        .position(|window| {
-            window
-                .iter()
-                .zip(pattern.iter())
-                .all(|(&byte, &pat)| pat.is_none() || pat == Some(byte))
-        })
+    image.windows(pattern.len()).position(|window| {
+        window
+            .iter()
+            .zip(pattern.iter())
+            .all(|(&byte, &pat)| pat.is_none() || pat == Some(byte))
+    })
 }
 
 /// Find ALL occurrences of `pattern` in `image`. Returns offsets in order.
@@ -164,9 +162,7 @@ pub fn resolve_rva_in_range(
 /// The surrounding bytes are stable across builds.
 pub const PSP_CREATE_PROCESS_NOTIFY_ROUTINE: RefSite = RefSite {
     // 4C 8D 35 ?? ?? ?? ??  ; lea r14, [rip+disp32]
-    pattern: &[
-        Some(0x4C), Some(0x8D), Some(0x35), None, None, None, None,
-    ],
+    pattern: &[Some(0x4C), Some(0x8D), Some(0x35), None, None, None, None],
     disp_offset: 3, // disp32 starts at byte 3 of the lea instruction
 };
 
@@ -179,9 +175,7 @@ pub const PSP_CREATE_PROCESS_NOTIFY_ROUTINE: RefSite = RefSite {
 /// Typical ranges: Process array is at a lower RVA than Thread in most builds.
 pub const PSP_CREATE_THREAD_NOTIFY_ROUTINE: RefSite = RefSite {
     // 4C 8D 35 ?? ?? ?? ??  ; lea r14, [rip+disp32]  (same encoding as process)
-    pattern: &[
-        Some(0x4C), Some(0x8D), Some(0x35), None, None, None, None,
-    ],
+    pattern: &[Some(0x4C), Some(0x8D), Some(0x35), None, None, None, None],
     disp_offset: 3,
 };
 
@@ -190,18 +184,14 @@ pub const PSP_CREATE_THREAD_NOTIFY_ROUTINE: RefSite = RefSite {
 /// Uses `lea rbx, [rip+disp32]` — **distinct** encoding from process/thread.
 pub const PSP_LOAD_IMAGE_NOTIFY_ROUTINE: RefSite = RefSite {
     // 48 8D 1D ?? ?? ?? ??  ; lea rbx, [rip+disp32]
-    pattern: &[
-        Some(0x48), Some(0x8D), Some(0x1D), None, None, None, None,
-    ],
+    pattern: &[Some(0x48), Some(0x8D), Some(0x1D), None, None, None, None],
     disp_offset: 3,
 };
 
 /// Reference site for `PsActiveProcessHead`.
 pub const PS_ACTIVE_PROCESS_HEAD: RefSite = RefSite {
     // 48 8B 05 ?? ?? ?? ??  ; mov rax, [rip+disp32]  (PsActiveProcessHead)
-    pattern: &[
-        Some(0x48), Some(0x8B), Some(0x05), None, None, None, None,
-    ],
+    pattern: &[Some(0x48), Some(0x8B), Some(0x05), None, None, None, None],
     disp_offset: 3,
 };
 
@@ -209,9 +199,7 @@ pub const PS_ACTIVE_PROCESS_HEAD: RefSite = RefSite {
 /// This global is referenced in the ETW-TI enable/disable path.
 pub const ETW_THREAT_INT_PROV_REG_HANDLE: RefSite = RefSite {
     // 48 8D 0D ?? ?? ?? ??  ; lea rcx, [rip+disp32]
-    pattern: &[
-        Some(0x48), Some(0x8D), Some(0x0D), None, None, None, None,
-    ],
+    pattern: &[Some(0x48), Some(0x8D), Some(0x0D), None, None, None, None],
     disp_offset: 3,
 };
 
@@ -227,8 +215,14 @@ pub const ETW_THREAT_INT_PROV_REG_HANDLE: RefSite = RefSite {
 /// PspLoadImageNotifyRoutine) but may return Process's RVA for Thread's key.
 pub fn scan_all_known(image: &[u8]) -> alloc::collections::BTreeMap<&'static str, u32> {
     let sites: &[(&str, &RefSite)] = &[
-        ("PspCreateProcessNotifyRoutine", &PSP_CREATE_PROCESS_NOTIFY_ROUTINE),
-        ("PspCreateThreadNotifyRoutine", &PSP_CREATE_THREAD_NOTIFY_ROUTINE),
+        (
+            "PspCreateProcessNotifyRoutine",
+            &PSP_CREATE_PROCESS_NOTIFY_ROUTINE,
+        ),
+        (
+            "PspCreateThreadNotifyRoutine",
+            &PSP_CREATE_THREAD_NOTIFY_ROUTINE,
+        ),
         ("PspLoadImageNotifyRoutine", &PSP_LOAD_IMAGE_NOTIFY_ROUTINE),
         ("PsActiveProcessHead", &PS_ACTIVE_PROCESS_HEAD),
         ("EtwThreatIntProvRegHandle", &ETW_THREAT_INT_PROV_REG_HANDLE),
@@ -257,9 +251,7 @@ mod tests {
     #[test]
     fn find_pattern_with_wildcards() {
         let image = [0x00, 0x4C, 0x8D, 0x35, 0xAA, 0xBB, 0xCC, 0xDD, 0x00];
-        let pattern: &[Option<u8>] = &[
-            Some(0x4C), Some(0x8D), Some(0x35), None, None, None, None,
-        ];
+        let pattern: &[Option<u8>] = &[Some(0x4C), Some(0x8D), Some(0x35), None, None, None, None];
         assert_eq!(find_pattern(&image, pattern), Some(1));
     }
 
@@ -330,19 +322,13 @@ mod tests {
         assert_eq!(first, 0x100);
 
         // resolve_rva_in_range can pick the second one
-        let in_range = resolve_rva_in_range(
-            &image,
-            &PSP_CREATE_THREAD_NOTIFY_ROUTINE,
-            0x400..0x600,
-        );
+        let in_range =
+            resolve_rva_in_range(&image, &PSP_CREATE_THREAD_NOTIFY_ROUTINE, 0x400..0x600);
         assert_eq!(in_range, Some(0x500));
 
         // And still find the first with the right range
-        let in_range = resolve_rva_in_range(
-            &image,
-            &PSP_CREATE_PROCESS_NOTIFY_ROUTINE,
-            0x000..0x200,
-        );
+        let in_range =
+            resolve_rva_in_range(&image, &PSP_CREATE_PROCESS_NOTIFY_ROUTINE, 0x000..0x200);
         assert_eq!(in_range, Some(0x100));
     }
 
@@ -355,11 +341,8 @@ mod tests {
         image[0x13..0x17].copy_from_slice(&0x1000u32.to_le_bytes());
 
         // RVA is 0x1017 — not in this range
-        let result = resolve_rva_in_range(
-            &image,
-            &PSP_CREATE_PROCESS_NOTIFY_ROUTINE,
-            0x5000..0x6000,
-        );
+        let result =
+            resolve_rva_in_range(&image, &PSP_CREATE_PROCESS_NOTIFY_ROUTINE, 0x5000..0x6000);
         assert_eq!(result, None);
     }
 
@@ -373,11 +356,7 @@ mod tests {
         image[0x0A] = 0x1D;
         image[0x0B..0x0F].copy_from_slice(&0x200u32.to_le_bytes());
 
-        let rva = resolve_rva_in_range(
-            &image,
-            &PSP_LOAD_IMAGE_NOTIFY_ROUTINE,
-            0x100..0x400,
-        );
+        let rva = resolve_rva_in_range(&image, &PSP_LOAD_IMAGE_NOTIFY_ROUTINE, 0x100..0x400);
         assert_eq!(rva, Some(0x20F)); // next_insn = 0x0F, + 0x200 = 0x20F
     }
 
@@ -386,13 +365,19 @@ mod tests {
         // Plant three reference sites in the image.
         let mut image = vec![0x90u8; 0x1000];
         // PspCreateProcessNotifyRoutine ref at 0x100 (lea r14, [rip+disp32])
-        image[0x100] = 0x4C; image[0x101] = 0x8D; image[0x102] = 0x35;
+        image[0x100] = 0x4C;
+        image[0x101] = 0x8D;
+        image[0x102] = 0x35;
         image[0x103..0x107].copy_from_slice(&0x5000u32.to_le_bytes());
         // PsActiveProcessHead ref at 0x200 (mov rax, [rip+disp32])
-        image[0x200] = 0x48; image[0x201] = 0x8B; image[0x202] = 0x05;
+        image[0x200] = 0x48;
+        image[0x201] = 0x8B;
+        image[0x202] = 0x05;
         image[0x203..0x207].copy_from_slice(&0x4000u32.to_le_bytes());
         // PspLoadImageNotifyRoutine ref at 0x300 (lea rbx, [rip+disp32])
-        image[0x300] = 0x48; image[0x301] = 0x8D; image[0x302] = 0x1D;
+        image[0x300] = 0x48;
+        image[0x301] = 0x8D;
+        image[0x302] = 0x1D;
         image[0x303..0x307].copy_from_slice(&0x3000u32.to_le_bytes());
 
         let map = scan_all_known(&image);

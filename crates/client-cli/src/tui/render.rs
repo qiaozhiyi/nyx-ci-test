@@ -31,7 +31,11 @@ pub(super) fn render(app: &mut App, frame: &mut ratatui::Frame) {
     }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
         .split(area);
 
     render_statusbar(frame, app, chunks[0]);
@@ -40,8 +44,20 @@ pub(super) fn render(app: &mut App, frame: &mut ratatui::Frame) {
     let layouts = app.pane_tree.clone().layout(pane_area);
     for (id, rect) in &layouts {
         let is_focused = *id == app.focused_pane;
-        let view = app.pane_tree.leaves().iter().find(|(lid, _)| lid == id).map(|(_, v)| *v);
-        render_pane(frame, app, *id, *rect, is_focused, view.unwrap_or(panes::PaneView::Console));
+        let view = app
+            .pane_tree
+            .leaves()
+            .iter()
+            .find(|(lid, _)| lid == id)
+            .map(|(_, v)| *v);
+        render_pane(
+            frame,
+            app,
+            *id,
+            *rect,
+            is_focused,
+            view.unwrap_or(panes::PaneView::Console),
+        );
     }
     render_input(frame, app, chunks[2]);
 
@@ -54,14 +70,28 @@ pub(super) fn render(app: &mut App, frame: &mut ratatui::Frame) {
 }
 
 /// 渲染单个窗格叶。
-fn render_pane(frame: &mut ratatui::Frame, app: &mut App, _id: usize, area: Rect, focused: bool, view: panes::PaneView) {
+fn render_pane(
+    frame: &mut ratatui::Frame,
+    app: &mut App,
+    _id: usize,
+    area: Rect,
+    focused: bool,
+    view: panes::PaneView,
+) {
     // 焦点窗格用 Accent 边框，非焦点用 Faint。
     let border = if focused { theme::ACCENT } else { theme::FAINT };
     let title = format!(" {} ", view.label());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
-        .title(Span::styled(title, if focused { theme::brand() } else { theme::muted() }))
+        .title(Span::styled(
+            title,
+            if focused {
+                theme::brand()
+            } else {
+                theme::muted()
+            },
+        ))
         .style(theme::header_bg());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -83,8 +113,7 @@ fn render_pane(frame: &mut ratatui::Frame, app: &mut App, _id: usize, area: Rect
             render_overlay_content(frame, app, inner, &Overlay::Creds(vec![]));
         }
         panes::PaneView::Topology => {
-            let para = Paragraph::new("topology — use /topo to view")
-                .style(theme::muted());
+            let para = Paragraph::new("topology — use /topo to view").style(theme::muted());
             frame.render_widget(para, inner);
         }
     }
@@ -97,12 +126,15 @@ fn render_stream_content(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let end = total.saturating_sub(app.stream_offset);
     let start = end.saturating_sub(height);
     let visible = &app.stream[start..end.min(total)];
-    let lines: Vec<Line> = visible.iter().map(|l| {
-        Line::from(vec![
-            Span::styled("▎ ", theme::level_marker(l.level)),
-            Span::styled(l.text.clone(), theme::level(l.level)),
-        ])
-    }).collect();
+    let lines: Vec<Line> = visible
+        .iter()
+        .map(|l| {
+            Line::from(vec![
+                Span::styled("▎ ", theme::level_marker(l.level)),
+                Span::styled(l.text.clone(), theme::level(l.level)),
+            ])
+        })
+        .collect();
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 }
@@ -110,25 +142,36 @@ fn render_stream_content(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 /// 在窗格里渲染 session 列表（只读预览）。
 fn render_sessions_in_pane(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     if app.sessions.is_empty() {
-        let para = Paragraph::new("(no beacons — waiting for sessions)")
-            .style(theme::muted());
+        let para = Paragraph::new("(no beacons — waiting for sessions)").style(theme::muted());
         frame.render_widget(para, area);
         return;
     }
-    let lines: Vec<Line> = app.sessions.iter().enumerate().map(|(i, s)| {
-        let mark = if app.selected == Some(i) { "▸ " } else { "  " };
-        let m = app.sessions_meta.get(&s.id);
-        let star = if m.favorite { "★" } else { " " };
-        let alias = m.alias.as_deref().unwrap_or("");
-        Line::from(vec![
-            Span::styled(mark, Style::default().fg(theme::MAUVE)),
-            Span::styled(format!("{:8} ", short(&s.id)), Style::default().fg(theme::ACCENT)),
-            Span::styled(format!("{:14} ", s.hostname), theme::text()),
-            Span::styled(format!("{:12} ", s.username), theme::text()),
-            Span::styled(star, Style::default().fg(theme::WARN)),
-            Span::styled(format!(" {alias}"), theme::muted()),
-        ])
-    }).collect();
+    let lines: Vec<Line> = app
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let mark = if app.selected == Some(i) {
+                "▸ "
+            } else {
+                "  "
+            };
+            let m = app.sessions_meta.get(&s.id);
+            let star = if m.favorite { "★" } else { " " };
+            let alias = m.alias.as_deref().unwrap_or("");
+            Line::from(vec![
+                Span::styled(mark, Style::default().fg(theme::MAUVE)),
+                Span::styled(
+                    format!("{:8} ", short(&s.id)),
+                    Style::default().fg(theme::ACCENT),
+                ),
+                Span::styled(format!("{:14} ", s.hostname), theme::text()),
+                Span::styled(format!("{:12} ", s.username), theme::text()),
+                Span::styled(star, Style::default().fg(theme::WARN)),
+                Span::styled(format!(" {alias}"), theme::muted()),
+            ])
+        })
+        .collect();
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -173,7 +216,12 @@ fn render_statusbar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         Span::styled(dot, dot_style),
         Span::styled(format!(" {label}"), theme::muted()),
         Span::styled("  ", theme::muted()),
-        Span::styled(format!("{} ", app.sessions.len()), Style::default().fg(theme::MAUVE).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{} ", app.sessions.len()),
+            Style::default()
+                .fg(theme::MAUVE)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("beacons", theme::muted()),
         Span::styled("   ", theme::muted()),
         Span::styled(beacon, theme::text()),
@@ -187,11 +235,11 @@ fn render_input(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(theme::input_border())
-        .title(Span::styled(" type a command · / for menu ", theme::muted()));
-    frame.render_widget(
-        Paragraph::new("").style(theme::input_bg()),
-        area,
-    );
+        .title(Span::styled(
+            " type a command · / for menu ",
+            theme::muted(),
+        ));
+    frame.render_widget(Paragraph::new("").style(theme::input_bg()), area);
     let inner = Rect {
         x: area.x + 1,
         y: area.y + 1,
@@ -240,7 +288,10 @@ fn render_popup(frame: &mut ratatui::Frame, app: &mut App, input_area: Rect) {
         .iter()
         .map(|m| {
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{:11} ", m.name), Style::default().fg(theme::ACCENT)),
+                Span::styled(
+                    format!("{:11} ", m.name),
+                    Style::default().fg(theme::ACCENT),
+                ),
                 Span::styled(format!("{:18} ", m.args_hint), theme::muted()),
                 Span::styled(m.help, theme::faint()),
             ]))
@@ -285,16 +336,26 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                 .iter()
                 .enumerate()
                 .map(|(i, s)| {
-                    let mark = if app.selected == Some(i) { "▸ " } else { "  " };
+                    let mark = if app.selected == Some(i) {
+                        "▸ "
+                    } else {
+                        "  "
+                    };
                     let admin = if s.is_admin == 1 { " ⚡" } else { "" };
                     Line::from(vec![
                         Span::styled(mark, Style::default().fg(theme::MAUVE)),
-                        Span::styled(format!("{:10} ", short(&s.id)), Style::default().fg(theme::ACCENT)),
+                        Span::styled(
+                            format!("{:10} ", short(&s.id)),
+                            Style::default().fg(theme::ACCENT),
+                        ),
                         Span::styled(format!("{:14} ", s.hostname), theme::text()),
                         Span::styled(format!("{:14} ", s.username), theme::text()),
                         Span::styled(format!("{:5} ", arch_str(s.arch)), theme::muted()),
                         Span::styled(format!("#{:<6} ", s.beacon_id), theme::muted()),
-                        Span::styled(format!("{:4}{} ", "", admin), Style::default().fg(theme::WARN)),
+                        Span::styled(
+                            format!("{:4}{} ", "", admin),
+                            Style::default().fg(theme::WARN),
+                        ),
                         Span::styled(s.os.clone(), theme::faint()),
                     ])
                 })
@@ -309,7 +370,14 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
             let header = ["NAME", "SIZE", "TYPE", "MODIFIED"];
             let body: Vec<Vec<String>> = rows
                 .iter()
-                .map(|f| vec![f.name.clone(), f.size.to_string(), if f.is_dir { "dir" } else { "file" }.into(), f.modified.clone()])
+                .map(|f| {
+                    vec![
+                        f.name.clone(),
+                        f.size.to_string(),
+                        if f.is_dir { "dir" } else { "file" }.into(),
+                        f.modified.clone(),
+                    ]
+                })
                 .collect();
             render_table(frame, area, &header, &body, "files");
         }
@@ -317,7 +385,14 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
             let header = ["PID", "PPID", "USER", "NAME"];
             let body: Vec<Vec<String>> = rows
                 .iter()
-                .map(|p| vec![p.pid.to_string(), p.ppid.to_string(), p.user.clone(), p.name.clone()])
+                .map(|p| {
+                    vec![
+                        p.pid.to_string(),
+                        p.ppid.to_string(),
+                        p.user.clone(),
+                        p.name.clone(),
+                    ]
+                })
                 .collect();
             render_table(frame, area, &header, &body, "processes");
         }
@@ -325,44 +400,63 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
             let header = ["SOURCE", "PRINCIPAL", "KIND", "SECRET"];
             let body: Vec<Vec<String>> = rows
                 .iter()
-                .map(|c| vec![c.source.clone(), c.principal.clone(), c.kind.label().into(), input::mask(&c.secret)])
+                .map(|c| {
+                    vec![
+                        c.source.clone(),
+                        c.principal.clone(),
+                        c.kind.label().into(),
+                        input::mask(&c.secret),
+                    ]
+                })
                 .collect();
             render_table(frame, area, &header, &body, "credentials");
         }
-Overlay::Audit(rows) => {
-    let header = ["#", "TIME", "OPERATOR", "ACTION"];
-    let body: Vec<Vec<String>> = rows
-        .iter()
-        .map(|a| {
-            // detail (JSON) goes into the 4th col truncated; target into 3rd.
-            let target = if a.target.is_empty() { a.operator.clone() } else { format!("{} » {}", a.operator, a.target) };
-            vec![a.seq.to_string(), format_ts(a.ts), target, a.action.clone()]
-        })
-        .collect();
-    render_table(frame, area, &header, &body, "audit log");
-}
-Overlay::Image(path, bytes) => {
-    let header = ["PATH", "BYTES"];
-    let body = vec![vec![path.clone(), bytes.to_string()]];
-    render_table(frame, area, &header, &body, "screenshot");
-}
-Overlay::Profile { loaded, http_get_uri, http_post_uri, useragent } => {
-    let header = ["FIELD", "VALUE"];
-    let body = vec![
-        vec!["loaded".into(), loaded.to_string()],
-        vec!["http_get".into(), http_get_uri.clone()],
-        vec!["http_post".into(), http_post_uri.clone()],
-        vec!["useragent".into(), useragent.clone()],
-    ];
-    render_table(frame, area, &header, &body, "c2 profile");
-}
-Overlay::AuditVerify { ok, broken_at } => {
-    let header = ["STATUS", "BROKEN_AT"];
-    let status = if *ok { "OK" } else { "BROKEN" };
-    let broken = broken_at.as_ref().map(|b| b.to_string()).unwrap_or_else(|| "-".into());
-    let body = vec![vec![status.into(), broken]];
-    render_table(frame, area, &header, &body, "audit chain");
-}
+        Overlay::Audit(rows) => {
+            let header = ["#", "TIME", "OPERATOR", "ACTION"];
+            let body: Vec<Vec<String>> = rows
+                .iter()
+                .map(|a| {
+                    // detail (JSON) goes into the 4th col truncated; target into 3rd.
+                    let target = if a.target.is_empty() {
+                        a.operator.clone()
+                    } else {
+                        format!("{} » {}", a.operator, a.target)
+                    };
+                    vec![a.seq.to_string(), format_ts(a.ts), target, a.action.clone()]
+                })
+                .collect();
+            render_table(frame, area, &header, &body, "audit log");
+        }
+        Overlay::Image(path, bytes) => {
+            let header = ["PATH", "BYTES"];
+            let body = vec![vec![path.clone(), bytes.to_string()]];
+            render_table(frame, area, &header, &body, "screenshot");
+        }
+        Overlay::Profile {
+            loaded,
+            http_get_uri,
+            http_post_uri,
+            useragent,
+        } => {
+            let header = ["FIELD", "VALUE"];
+            let body = vec![
+                vec!["loaded".into(), loaded.to_string()],
+                vec!["http_get".into(), http_get_uri.clone()],
+                vec!["http_post".into(), http_post_uri.clone()],
+                vec!["useragent".into(), useragent.clone()],
+            ];
+            render_table(frame, area, &header, &body, "c2 profile");
+        }
+        Overlay::AuditVerify { ok, broken_at } => {
+            let header = ["STATUS", "BROKEN_AT"];
+            let status = if *ok { "OK" } else { "BROKEN" };
+            let broken = broken_at
+                .as_ref()
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "-".into());
+            let body = vec![vec![status.into(), broken]];
+            render_table(frame, area, &header, &body, "audit chain");
+        }
         Overlay::SessionDetail(id_ref) => {
             // 本地数据 overlay：每帧从 app.sessions 实时查找（所以 pending/age 是活的）。
             // 这是 ja3/ja4/pid/age_secs/pending 的唯一展示入口——它们在 SessionView
@@ -397,13 +491,23 @@ Overlay::AuditVerify { ok, broken_at } => {
             let body: Vec<Vec<String>> = rows
                 .iter()
                 .map(|t| {
-                    let ty = t.command.get("type").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-                    vec![t.task_id.to_string(), ty, task_arg(&t.command), task_detail(&t.command)]
+                    let ty = t
+                        .command
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    vec![
+                        t.task_id.to_string(),
+                        ty,
+                        task_arg(&t.command),
+                        task_detail(&t.command),
+                    ]
                 })
                 .collect();
             render_table(frame, area, &header, &body, "queued tasks");
         }
-}
+    }
 }
 
 /// Format a Unix-seconds timestamp as a short local-ish string for the audit
@@ -428,7 +532,11 @@ fn render_table(
 ) {
     use ratatui::widgets::{Cell, Row, Table};
     let header_row = Row::new(header.iter().map(|h| Cell::from(*h)))
-        .style(Style::default().fg(theme::MAUVE).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(theme::MAUVE)
+                .add_modifier(Modifier::BOLD),
+        )
         .bottom_margin(0);
     let data_rows: Vec<Row> = rows
         .iter()
@@ -443,7 +551,9 @@ fn render_table(
             Constraint::Percentage(36),
         ],
         2 => vec![Constraint::Percentage(22), Constraint::Percentage(78)],
-        _ => (0..header.len()).map(|_| Constraint::Percentage((100 / header.len()) as u16)).collect(),
+        _ => (0..header.len())
+            .map(|_| Constraint::Percentage((100 / header.len()) as u16))
+            .collect(),
     };
     // Build the themed block here (same look as the session-list overlay).
     let block = Block::default()
@@ -463,8 +573,11 @@ fn render_table(
 /// 与 4 列的 [`render_table`] 同样的 themed 外观，仅列数/宽度不同。
 fn render_kv(frame: &mut ratatui::Frame, area: Rect, rows: &[(String, String)], title: &str) {
     use ratatui::widgets::{Cell, Row, Table};
-    let header_row = Row::new(["KEY", "VALUE"].iter().map(|h| Cell::from(*h)))
-        .style(Style::default().fg(theme::MAUVE).add_modifier(Modifier::BOLD));
+    let header_row = Row::new(["KEY", "VALUE"].iter().map(|h| Cell::from(*h))).style(
+        Style::default()
+            .fg(theme::MAUVE)
+            .add_modifier(Modifier::BOLD),
+    );
     let data_rows: Vec<Row> = rows
         .iter()
         .map(|(k, v)| {
@@ -513,7 +626,14 @@ fn build_session_detail_rows(
         ("os".into(), s.os.clone()),
         ("arch".into(), arch_str(s.arch).to_string()),
         ("pid".into(), s.pid.to_string()),
-        ("admin".into(), if s.is_admin == 1 { "yes ⚡".into() } else { "no".into() }),
+        (
+            "admin".into(),
+            if s.is_admin == 1 {
+                "yes ⚡".into()
+            } else {
+                "no".into()
+            },
+        ),
         ("pending".into(), format!("{} queued", s.pending)),
         ("age".into(), fmt_age(age)),
         ("ja3".into(), ja3),
@@ -563,9 +683,15 @@ fn task_detail(cmd: &serde_json::Value) -> String {
         "fileop" => str_field("op"),
         "connect" => cmd.get("port").map(|p| format!("port:{p}")),
         "portscan" => str_field("ports"),
-        "bof" => cmd.get("args")
+        "bof" => cmd
+            .get("args")
             .and_then(|a| a.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "))
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
             .filter(|s| !s.is_empty()),
         "net" => str_field("query"),
         "hashdump" => cmd.get("method").map(|m| format!("method:{m}")),

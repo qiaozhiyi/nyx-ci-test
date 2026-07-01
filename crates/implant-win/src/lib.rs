@@ -56,8 +56,6 @@ mod server_pub {
 pub mod heap;
 
 #[cfg(target_os = "windows")]
-pub mod ntalloc;
-#[cfg(target_os = "windows")]
 pub mod antidebug;
 #[cfg(target_os = "windows")]
 pub mod beacon;
@@ -72,19 +70,19 @@ pub mod config;
 #[cfg(target_os = "windows")]
 pub mod context;
 #[cfg(target_os = "windows")]
+pub mod entry;
+#[cfg(target_os = "windows")]
 pub mod envelopes;
 #[cfg(target_os = "windows")]
 pub mod envprobe;
-#[cfg(target_os = "windows")]
-pub mod hookchain;
-#[cfg(target_os = "windows")]
-pub mod entry;
 #[cfg(target_os = "windows")]
 pub mod evasion_glue;
 #[cfg(target_os = "windows")]
 pub mod fs;
 #[cfg(target_os = "windows")]
 pub mod hashdump;
+#[cfg(target_os = "windows")]
+pub mod hookchain;
 #[cfg(target_os = "windows")]
 pub mod hostinfo;
 #[cfg(target_os = "windows")]
@@ -95,6 +93,8 @@ pub mod keylog;
 pub mod kits;
 #[cfg(target_os = "windows")]
 pub mod mem;
+#[cfg(target_os = "windows")]
+pub mod ntalloc;
 #[cfg(target_os = "windows")]
 pub mod pivot;
 #[cfg(target_os = "windows")]

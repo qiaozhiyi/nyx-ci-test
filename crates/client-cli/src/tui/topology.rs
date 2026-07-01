@@ -39,12 +39,15 @@ pub struct Topology {
 /// - 同层按发现顺序赋 x=0,1,2...
 /// - 外部目标（to 不在 sessions）作为叶子节点注入
 pub fn layout(
-    sessions: &[(String, String)],                       // (id, label)
-    channels: &[(String, String, String)],               // (from_id, to_id, label)
+    sessions: &[(String, String)],         // (id, label)
+    channels: &[(String, String, String)], // (from_id, to_id, label)
 ) -> Topology {
     // 收集所有 beacon id
     let beacon_ids: HashSet<&str> = sessions.iter().map(|(id, _)| id.as_str()).collect();
-    let label_of: HashMap<&str, &str> = sessions.iter().map(|(id, l)| (id.as_str(), l.as_str())).collect();
+    let label_of: HashMap<&str, &str> = sessions
+        .iter()
+        .map(|(id, l)| (id.as_str(), l.as_str()))
+        .collect();
 
     // 外部目标节点（to 不在 sessions）
     let mut external: Vec<String> = Vec::new();
@@ -142,7 +145,11 @@ pub fn layout(
 
     let edges = channels
         .iter()
-        .map(|(f, t, l)| TopoEdge { from: f.clone(), to: t.clone(), label: l.clone() })
+        .map(|(f, t, l)| TopoEdge {
+            from: f.clone(),
+            to: t.clone(),
+            label: l.clone(),
+        })
         .collect();
 
     Topology { nodes, edges }

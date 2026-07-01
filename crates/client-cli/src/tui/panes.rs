@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use ratatui::layout::{Rect};
+use ratatui::layout::Rect;
 
 // ---- 分割方向 ----
 
@@ -73,10 +73,12 @@ pub enum Pane {
         #[serde(default = "default_ratio")]
         ratio: f32,
         children: Vec<Pane>, // 恒为 2 个
-    }
+    },
 }
 
-fn default_ratio() -> f32 { 0.5 }
+fn default_ratio() -> f32 {
+    0.5
+}
 
 /// 焦点移动方向。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,7 +92,11 @@ pub enum FocusDir {
 impl Pane {
     /// 创建单叶窗格（默认布局）。
     pub fn single(id: usize) -> Self {
-        Pane::Leaf { id, view: PaneView::Console, bound_session: None }
+        Pane::Leaf {
+            id,
+            view: PaneView::Console,
+            bound_session: None,
+        }
     }
 
     /// 收集所有叶节点的 (id, view)。
@@ -114,25 +120,39 @@ impl Pane {
     /// 新叶成为第一个子，原叶内容成为第二个子（焦点会移到新叶）。
     pub fn split(self, target: usize, dir: SplitDir) -> Pane {
         match self {
-            Pane::Leaf { id, view, bound_session } if id == target => {
+            Pane::Leaf {
+                id,
+                view,
+                bound_session,
+            } if id == target => {
                 let new_id = id + 100; // 简单递增（split 时 next_id 已在外部算好）
                 Pane::Split {
                     dir,
                     ratio: 0.5,
                     children: vec![
-                        Pane::Leaf { id: new_id, view, bound_session: bound_session.clone() },
-                        Pane::Leaf { id, view, bound_session },
+                        Pane::Leaf {
+                            id: new_id,
+                            view,
+                            bound_session: bound_session.clone(),
+                        },
+                        Pane::Leaf {
+                            id,
+                            view,
+                            bound_session,
+                        },
                     ],
                 }
             }
             Pane::Leaf { .. } => self,
-            Pane::Split { dir: d, ratio, children } => {
-                Pane::Split {
-                    dir: d,
-                    ratio,
-                    children: children.into_iter().map(|c| c.split(target, dir)).collect(),
-                }
-            }
+            Pane::Split {
+                dir: d,
+                ratio,
+                children,
+            } => Pane::Split {
+                dir: d,
+                ratio,
+                children: children.into_iter().map(|c| c.split(target, dir)).collect(),
+            },
         }
     }
 
@@ -152,11 +172,19 @@ impl Pane {
         match self {
             Pane::Leaf { id, .. } if id == target => None, // 删掉
             Pane::Leaf { .. } => Some(self),
-            Pane::Split { children, dir, ratio } => {
+            Pane::Split {
+                children,
+                dir,
+                ratio,
+            } => {
                 let a = children[0].clone().close_inner(target);
                 let b = children[1].clone().close_inner(target);
                 match (a, b) {
-                    (Some(a), Some(b)) => Some(Pane::Split { dir, ratio, children: vec![a, b] }),
+                    (Some(a), Some(b)) => Some(Pane::Split {
+                        dir,
+                        ratio,
+                        children: vec![a, b],
+                    }),
                     (Some(a), None) => Some(a), // b 被删，a 提升
                     (None, Some(b)) => Some(b), // a 被删，b 提升
                     (None, None) => None,
@@ -176,13 +204,25 @@ impl Pane {
     /// 改 id == target 的叶的视图。
     pub fn set_view(self, target: usize, view: PaneView) -> Pane {
         match self {
-            Pane::Leaf { id, bound_session, .. } if id == target => {
-                Pane::Leaf { id, view, bound_session }
-            }
+            Pane::Leaf {
+                id, bound_session, ..
+            } if id == target => Pane::Leaf {
+                id,
+                view,
+                bound_session,
+            },
             Pane::Leaf { .. } => self,
-            Pane::Split { dir, ratio, children } => Pane::Split {
-                dir, ratio,
-                children: children.into_iter().map(|c| c.set_view(target, view)).collect(),
+            Pane::Split {
+                dir,
+                ratio,
+                children,
+            } => Pane::Split {
+                dir,
+                ratio,
+                children: children
+                    .into_iter()
+                    .map(|c| c.set_view(target, view))
+                    .collect(),
             },
         }
     }
@@ -190,17 +230,24 @@ impl Pane {
     /// 改 id == target 的叶的 bound_session。
     pub fn set_session(self, target: usize, session: Option<String>) -> Pane {
         match self {
-            Pane::Leaf { id, view, .. } if id == target => {
-                Pane::Leaf { id, view, bound_session: session }
-            }
+            Pane::Leaf { id, view, .. } if id == target => Pane::Leaf {
+                id,
+                view,
+                bound_session: session,
+            },
             Pane::Leaf { .. } => self,
-            Pane::Split { dir, ratio, children } => {
+            Pane::Split {
+                dir,
+                ratio,
+                children,
+            } => {
                 let mut iter = children.into_iter();
                 let a = iter.next().unwrap();
                 let b = iter.next().unwrap();
                 let s = session.clone();
                 Pane::Split {
-                    dir, ratio,
+                    dir,
+                    ratio,
                     children: vec![a.set_session(target, session), b.set_session(target, s)],
                 }
             }
@@ -211,7 +258,11 @@ impl Pane {
     pub fn layout(&self, rect: Rect) -> Vec<(usize, Rect)> {
         match self {
             Pane::Leaf { id, .. } => vec![(*id, rect)],
-            Pane::Split { dir, ratio, children } => {
+            Pane::Split {
+                dir,
+                ratio,
+                children,
+            } => {
                 let (r0, r1) = split_rect(rect, *dir, *ratio);
                 let mut v = children[0].layout(r0);
                 v.extend(children[1].layout(r1));
@@ -224,13 +275,20 @@ impl Pane {
     /// 用屏幕坐标判断：找到 current 的 rect，然后在该方向上找最近的叶。
     pub fn move_focus(&self, current: usize, dir: FocusDir, full_rect: Rect) -> usize {
         let layouts = self.layout(full_rect);
-        let cur_rect = layouts.iter().find(|(id, _)| *id == current).map(|(_, r)| *r);
-        let Some(cur) = cur_rect else { return current; };
+        let cur_rect = layouts
+            .iter()
+            .find(|(id, _)| *id == current)
+            .map(|(_, r)| *r);
+        let Some(cur) = cur_rect else {
+            return current;
+        };
         // 在 dir 方向上找中心距离最近的叶（排除自己）
         let (cx, cy) = rect_center(cur);
         let mut best: Option<(usize, i64)> = None;
         for (id, r) in &layouts {
-            if *id == current { continue; }
+            if *id == current {
+                continue;
+            }
             let (nx, ny) = rect_center(*r);
             let valid = match dir {
                 FocusDir::Left => nx < cx && rects_v_overlap(cur, *r),
@@ -271,8 +329,18 @@ pub fn split_rect(rect: Rect, dir: SplitDir, ratio: f32) -> (Rect, Rect) {
             let h0 = (rect.height as f32 * ratio).round() as u16;
             let h0 = h0.max(1);
             let h1 = rect.height.saturating_sub(h0);
-            let top = Rect { x: rect.x, y: rect.y, width: rect.width, height: h0 };
-            let bot = Rect { x: rect.x, y: rect.y + h0, width: rect.width, height: h1 };
+            let top = Rect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: h0,
+            };
+            let bot = Rect {
+                x: rect.x,
+                y: rect.y + h0,
+                width: rect.width,
+                height: h1,
+            };
             (top, bot)
         }
         SplitDir::Vertical => {
@@ -280,8 +348,18 @@ pub fn split_rect(rect: Rect, dir: SplitDir, ratio: f32) -> (Rect, Rect) {
             let w0 = (rect.width as f32 * ratio).round() as u16;
             let w0 = w0.max(1);
             let w1 = rect.width.saturating_sub(w0);
-            let left = Rect { x: rect.x, y: rect.y, width: w0, height: rect.height };
-            let right = Rect { x: rect.x + w0, y: rect.y, width: w1, height: rect.height };
+            let left = Rect {
+                x: rect.x,
+                y: rect.y,
+                width: w0,
+                height: rect.height,
+            };
+            let right = Rect {
+                x: rect.x + w0,
+                y: rect.y,
+                width: w1,
+                height: rect.height,
+            };
             (left, right)
         }
     }
@@ -385,7 +463,10 @@ mod tests {
             .split(101, SplitDir::Horizontal);
         let full = Rect::new(0, 0, 80, 24);
         let layouts = p.layout(full);
-        let total: u64 = layouts.iter().map(|(_, r)| (r.width as u64) * (r.height as u64)).sum();
+        let total: u64 = layouts
+            .iter()
+            .map(|(_, r)| (r.width as u64) * (r.height as u64))
+            .sum();
         let full_area = (full.width as u64) * (full.height as u64);
         assert_eq!(total, full_area, "叶面积之和应等于总面积（无重叠无遗漏）");
     }

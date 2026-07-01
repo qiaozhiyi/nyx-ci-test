@@ -15,7 +15,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::types::{CredEntry, CredKind};
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// 存储的凭据条目。
@@ -54,9 +57,13 @@ impl CredStore {
         match fs::read(Self::path()) {
             Ok(bytes) => {
                 let file: CredFile = serde_json::from_slice(&bytes).unwrap_or_default();
-                CredStore { entries: file.entries }
+                CredStore {
+                    entries: file.entries,
+                }
             }
-            Err(_) => CredStore { entries: Vec::new() },
+            Err(_) => CredStore {
+                entries: Vec::new(),
+            },
         }
     }
 
@@ -86,7 +93,9 @@ impl CredStore {
                 }
             }
         }
-        let file = CredFile { entries: self.entries.clone() };
+        let file = CredFile {
+            entries: self.entries.clone(),
+        };
         let json = serde_json::to_vec_pretty(&file)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         // 写临时文件再 rename（原子），避免写一半崩溃损坏凭据库。
@@ -142,9 +151,10 @@ impl CredStore {
         let beacon_owned = beacon.map(|s| s.to_string());
         let start = self.entries.len();
         for c in creds {
-            let dup = self.entries.iter().any(|e| {
-                e.principal == c.principal && e.secret == c.secret && e.kind == c.kind
-            });
+            let dup = self
+                .entries
+                .iter()
+                .any(|e| e.principal == c.principal && e.secret == c.secret && e.kind == c.kind);
             if dup {
                 continue;
             }
@@ -199,7 +209,9 @@ impl CredStore {
     }
 
     pub fn export_json(&self) -> String {
-        let file = CredFile { entries: self.entries.clone() };
+        let file = CredFile {
+            entries: self.entries.clone(),
+        };
         serde_json::to_string_pretty(&file).unwrap_or_else(|_| "{}".into())
     }
 
@@ -242,12 +254,19 @@ mod tests {
     use super::*;
 
     fn entry(source: &str, principal: &str, kind: CredKind, secret: &str) -> CredEntry {
-        CredEntry { source: source.to_string(), principal: principal.to_string(), kind, secret: secret.to_string() }
+        CredEntry {
+            source: source.to_string(),
+            principal: principal.to_string(),
+            kind,
+            secret: secret.to_string(),
+        }
     }
 
     #[test]
     fn ingest_dedups() {
-        let mut store = CredStore { entries: Vec::new() };
+        let mut store = CredStore {
+            entries: Vec::new(),
+        };
         let creds = vec![
             entry("DEV", "alice", CredKind::Hash, "deadbeef"),
             entry("DEV", "alice", CredKind::Hash, "deadbeef"),
@@ -258,7 +277,9 @@ mod tests {
     #[test]
     fn ingest_same_secret_diff_kind_not_deduped() {
         // 同 principal+secret 但 kind 不同 → 不去重（审计 P1 修复）
-        let mut store = CredStore { entries: Vec::new() };
+        let mut store = CredStore {
+            entries: Vec::new(),
+        };
         let creds = vec![
             entry("", "alice", CredKind::Hash, "xyz"),
             entry("", "alice", CredKind::Password, "xyz"),
@@ -268,36 +289,70 @@ mod tests {
 
     #[test]
     fn search_kind_hash() {
-        let mut store = CredStore { entries: Vec::new() };
-        store.ingest(&[entry("", "a", CredKind::Hash, "h"), entry("", "b", CredKind::Password, "p")], None);
+        let mut store = CredStore {
+            entries: Vec::new(),
+        };
+        store.ingest(
+            &[
+                entry("", "a", CredKind::Hash, "h"),
+                entry("", "b", CredKind::Password, "p"),
+            ],
+            None,
+        );
         assert_eq!(store.search("kind:hash").len(), 1);
     }
 
     #[test]
     fn search_user_fuzzy() {
-        let mut store = CredStore { entries: Vec::new() };
-        store.ingest(&[entry("", "Administrator", CredKind::Hash, "a"), entry("", "guest", CredKind::Hash, "g")], None);
+        let mut store = CredStore {
+            entries: Vec::new(),
+        };
+        store.ingest(
+            &[
+                entry("", "Administrator", CredKind::Hash, "a"),
+                entry("", "guest", CredKind::Hash, "g"),
+            ],
+            None,
+        );
         assert_eq!(store.search("user:admin").len(), 1);
     }
 
     #[test]
     fn search_empty_returns_all() {
-        let mut store = CredStore { entries: Vec::new() };
-        store.ingest(&[entry("", "a", CredKind::Hash, "1"), entry("", "b", CredKind::Password, "2")], None);
+        let mut store = CredStore {
+            entries: Vec::new(),
+        };
+        store.ingest(
+            &[
+                entry("", "a", CredKind::Hash, "1"),
+                entry("", "b", CredKind::Password, "2"),
+            ],
+            None,
+        );
         assert_eq!(store.search("").len(), 2);
     }
 
     #[test]
     fn export_csv_header() {
-        let mut store = CredStore { entries: Vec::new() };
-        store.ingest(&[entry("DEV", "alice", CredKind::Hash, "deadbeef")], Some("b1"));
+        let mut store = CredStore {
+            entries: Vec::new(),
+        };
+        store.ingest(
+            &[entry("DEV", "alice", CredKind::Hash, "deadbeef")],
+            Some("b1"),
+        );
         let csv = store.export_csv();
-        assert_eq!(csv.lines().next().unwrap(), "source,principal,kind,secret,beacon,collected_at");
+        assert_eq!(
+            csv.lines().next().unwrap(),
+            "source,principal,kind,secret,beacon,collected_at"
+        );
     }
 
     #[test]
     fn export_csv_escapes_commas() {
-        let mut store = CredStore { entries: Vec::new() };
+        let mut store = CredStore {
+            entries: Vec::new(),
+        };
         store.ingest(&[entry("", "bob", CredKind::Password, "p,w")], None);
         let csv = store.export_csv();
         let body = csv.lines().nth(1).unwrap();
@@ -306,8 +361,13 @@ mod tests {
 
     #[test]
     fn json_roundtrip_basic() {
-        let mut store = CredStore { entries: Vec::new() };
-        store.ingest(&[entry("DEV", "alice", CredKind::Hash, "deadbeef")], Some("b1"));
+        let mut store = CredStore {
+            entries: Vec::new(),
+        };
+        store.ingest(
+            &[entry("DEV", "alice", CredKind::Hash, "deadbeef")],
+            Some("b1"),
+        );
         let json = store.export_json();
         let file: CredFile = serde_json::from_str(&json).unwrap();
         assert_eq!(file.entries.len(), 1);
@@ -318,9 +378,16 @@ mod tests {
     #[test]
     fn json_roundtrip_special_chars() {
         // 审计 P1：含引号/反斜杠/换行/中文 的 secret 必须正确 roundtrip
-        let mut store = CredStore { entries: Vec::new() };
+        let mut store = CredStore {
+            entries: Vec::new(),
+        };
         store.ingest(
-            &[entry("", "a\"principal", CredKind::Password, "p\\n\"x\n中文\tend")],
+            &[entry(
+                "",
+                "a\"principal",
+                CredKind::Password,
+                "p\\n\"x\n中文\tend",
+            )],
             None,
         );
         let json = store.export_json();
@@ -337,7 +404,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        p.push(format!("nyx_credstore_test_{tag}_{nano}_{pid}.json", tag = tag, nano = nanos, pid = std::process::id()));
+        p.push(format!(
+            "nyx_credstore_test_{tag}_{nano}_{pid}.json",
+            tag = tag,
+            nano = nanos,
+            pid = std::process::id()
+        ));
         p
     }
 
@@ -346,8 +418,13 @@ mod tests {
         // 回归测试：save() 历史上序列化了 json 却从不写入临时文件，导致凭据库
         // 永远落不了盘。save_to(path) 必须真正创建文件并写入 JSON 内容。
         let path = tmp_path("write");
-        let mut store = CredStore { entries: Vec::new() };
-        store.ingest(&[entry("DEV", "alice", CredKind::Hash, "deadbeef")], Some("b1"));
+        let mut store = CredStore {
+            entries: Vec::new(),
+        };
+        store.ingest(
+            &[entry("DEV", "alice", CredKind::Hash, "deadbeef")],
+            Some("b1"),
+        );
 
         store.save_to(&path).expect("save_to should succeed");
 
@@ -365,7 +442,9 @@ mod tests {
     fn save_to_overwrites_existing() {
         // 二次保存应原子替换，不残留旧内容或 .tmp 文件。
         let path = tmp_path("overwrite");
-        let mut store = CredStore { entries: Vec::new() };
+        let mut store = CredStore {
+            entries: Vec::new(),
+        };
         store.ingest(&[entry("D", "u1", CredKind::Hash, "s1")], None);
         store.save_to(&path).unwrap();
         store.ingest(&[entry("D", "u2", CredKind::Hash, "s2")], None);

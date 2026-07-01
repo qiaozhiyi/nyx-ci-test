@@ -65,8 +65,7 @@ impl Module {
             let n = (*dir).number_of_names as usize;
             let num_funcs = (*dir).number_of_functions as usize;
             let names = base.add((*dir).address_of_names as usize) as *const u32;
-            let ordinals =
-                base.add((*dir).address_of_name_ordinals as usize) as *const u16;
+            let ordinals = base.add((*dir).address_of_name_ordinals as usize) as *const u16;
             let funcs = base.add((*dir).address_of_functions as usize) as *const u32;
             for i in 0..n {
                 let name_rva = *names.add(i);
@@ -75,7 +74,9 @@ impl Module {
                 let mut h: u32 = 5381;
                 let mut p = name_ptr;
                 while *p != 0 {
-                    h = h.wrapping_mul(33).wrapping_add((*p).to_ascii_lowercase() as u32);
+                    h = h
+                        .wrapping_mul(33)
+                        .wrapping_add((*p).to_ascii_lowercase() as u32);
                     p = p.add(1);
                 }
                 if h == name_hash {
@@ -104,8 +105,7 @@ impl Module {
             let n = (*dir).number_of_names as usize;
             let num_funcs = (*dir).number_of_functions as usize;
             let names = base.add((*dir).address_of_names as usize) as *const u32;
-            let ordinals =
-                base.add((*dir).address_of_name_ordinals as usize) as *const u16;
+            let ordinals = base.add((*dir).address_of_name_ordinals as usize) as *const u16;
             let funcs = base.add((*dir).address_of_functions as usize) as *const u32;
             for i in 0..n {
                 let name_rva = *names.add(i);
@@ -184,7 +184,9 @@ impl LiveNtdll {
             let magic = *(opt as *const u16);
             let dd_off = if magic == 0x20B { 112 } else { 96 };
             let export_rva = *(opt.add(dd_off) as *const u32);
-            if export_rva == 0 { return 0; }
+            if export_rva == 0 {
+                return 0;
+            }
             let dir = base.add(export_rva as usize) as *const ExportDirectory;
             (*dir).number_of_names
         }
@@ -228,7 +230,10 @@ impl LiveNtdll {
             .iter()
             .map(|(name, rva)| (name.to_string_lossy(), *rva))
             .collect();
-        let src = OwnedSource { base: self.module.base, exports: &owned };
+        let src = OwnedSource {
+            base: self.module.base,
+            exports: &owned,
+        };
         nyx_evasion::resolve_table(&src)
     }
 }
@@ -275,7 +280,9 @@ unsafe fn find_module_by_hash(name_hash: u32) -> Option<Module> {
             let mut h: u32 = 5381;
             for &c in chars {
                 let lo = (c & 0xFF) as u8;
-                h = h.wrapping_mul(33).wrapping_add(lo.to_ascii_lowercase() as u32);
+                h = h
+                    .wrapping_mul(33)
+                    .wrapping_add(lo.to_ascii_lowercase() as u32);
             }
             if h == name_hash {
                 return Some(parse_module((*entry).dll_base as *mut u8));
@@ -421,7 +428,9 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
             // djb2 over UTF-16 low bytes (ASCII names fit).
             let mut mh: u32 = 5381;
             for &c in chars {
-                mh = mh.wrapping_mul(33).wrapping_add(((c & 0xff) as u8).to_ascii_lowercase() as u32);
+                mh = mh
+                    .wrapping_mul(33)
+                    .wrapping_add(((c & 0xff) as u8).to_ascii_lowercase() as u32);
             }
             if mh == mod_hash {
                 let base = (*entry).dll_base as *mut u8;
@@ -475,7 +484,9 @@ unsafe fn export_addr_by_hash_pub(base: *mut u8, fn_hash: u32) -> Option<usize> 
         let mut h: u32 = 5381;
         let mut p = name_ptr;
         while *p != 0 {
-            h = h.wrapping_mul(33).wrapping_add((*p).to_ascii_lowercase() as u32);
+            h = h
+                .wrapping_mul(33)
+                .wrapping_add((*p).to_ascii_lowercase() as u32);
             p = p.add(1);
         }
         if h == fn_hash {
@@ -537,7 +548,8 @@ unsafe fn resolve_forwarder(base: *mut u8, forwarder_rva: usize) -> Option<usize
 /// the full loader name (the loader resolves them to the host DLL under that
 /// exact contract name).
 unsafe fn find_module_for_forwarder(stem: &[u8]) -> Option<Module> {
-    let is_api_set = stem.starts_with(b"api-") || stem.starts_with(b"ext-") || stem.starts_with(b"apiset-");
+    let is_api_set =
+        stem.starts_with(b"api-") || stem.starts_with(b"ext-") || stem.starts_with(b"apiset-");
     let peb = peb_pointer()?;
     let ldr = (*peb).ldr;
     if ldr.is_null() {
@@ -606,7 +618,12 @@ unsafe fn fwd_name_matches(stem: &[u8], loader_name: &[u16], api_set: bool) -> b
     // Require the loader name to be exactly stem + ext (so "ntdll" matches
     // "ntdll.dll" but "kernel" does not match "kernelbase.dll").
     let (b0, b1, b2, b3) = if nlen >= 4 {
-        (name[nlen - 4], name[nlen - 3], name[nlen - 2], name[nlen - 1])
+        (
+            name[nlen - 4],
+            name[nlen - 3],
+            name[nlen - 2],
+            name[nlen - 1],
+        )
     } else {
         (0, 0, 0, 0)
     };
@@ -730,11 +747,12 @@ pub unsafe fn pdata_view(base: *mut u8) -> Option<PdataView> {
     // SAFETY: the .pdata section of a mapped module is committed readable
     // memory for the process lifetime (the loader maps it). Caller guarantees
     // `base` is a live module; we read a stable, loader-owned region.
-    let bytes = core::slice::from_raw_parts(
-        base.add(pdata_rva as usize),
-        pdata_size as usize,
-    );
-    Some(PdataView { bytes, image_size, base })
+    let bytes = core::slice::from_raw_parts(base.add(pdata_rva as usize), pdata_size as usize);
+    Some(PdataView {
+        bytes,
+        image_size,
+        base,
+    })
 }
 
 /// Locate a loaded module by name (ASCII, case-insensitive) via the PEB walk

@@ -168,12 +168,7 @@ unsafe fn redirect_module_iat(module_base: *mut u8, rva_ssn: &[RvaSsn]) -> usize
         Some(a) => a,
         None => return 0,
     };
-    type VirtualProtect = unsafe extern "system" fn(
-        *mut c_void,
-        usize,
-        u32,
-        *mut u32,
-    ) -> i32;
+    type VirtualProtect = unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32;
     let vp: VirtualProtect = core::mem::transmute(vp_addr);
 
     let mut redirected = 0usize;
@@ -225,7 +220,9 @@ unsafe fn redirect_module_iat(module_base: *mut u8, rva_ssn: &[RvaSsn]) -> usize
                         // binding), so VirtualProtect is required.
                         let mut old: u32 = 0;
                         let page_addr = slot_ptr as *mut c_void;
-                        let ok = unsafe { vp(page_addr, 8, 0x04 /* PAGE_READWRITE */, &mut old) };
+                        let ok = unsafe {
+                            vp(page_addr, 8, 0x04 /* PAGE_READWRITE */, &mut old)
+                        };
                         if ok != 0 {
                             unsafe { core::ptr::write(slot_ptr, stub_addr) };
                             // Restore original protection (closes the RW window).
@@ -343,16 +340,18 @@ unsafe fn alloc_persistent_stub(bytes: &[u8]) -> usize {
             Some(a) => a,
             None => return 0,
         };
-        type VirtualAlloc = unsafe extern "system" fn(
-            *mut c_void,
-            usize,
-            u32,
-            u32,
-        ) -> *mut c_void;
+        type VirtualAlloc = unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void;
         let f: VirtualAlloc = core::mem::transmute(va);
         // PAGE_EXECUTE_READ (0x20) — NOT RWX. We flip to RWX briefly for the
         // write, then back to RX (W^X discipline, same as syscalls.rs).
-        let p = unsafe { f(core::ptr::null_mut(), 0x1000, 0x3000, 0x40 /* RWX initially */) };
+        let p = unsafe {
+            f(
+                core::ptr::null_mut(),
+                0x1000,
+                0x3000,
+                0x40, /* RWX initially */
+            )
+        };
         if p.is_null() {
             return 0;
         }
@@ -388,7 +387,9 @@ fn lockdown_stub_page() {
         type VirtualProtect = unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32;
         let vp: VirtualProtect = unsafe { core::mem::transmute(vp_addr) };
         let mut old: u32 = 0;
-        unsafe { vp(page as *mut c_void, 0x1000, 0x20 /* RX */, &mut old) };
+        unsafe {
+            vp(page as *mut c_void, 0x1000, 0x20 /* RX */, &mut old)
+        };
     }
 }
 

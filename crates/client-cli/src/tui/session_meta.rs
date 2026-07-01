@@ -111,7 +111,12 @@ fn meta_to_value(m: &SessionMeta) -> serde_json::Value {
     o.insert("favorite".into(), serde_json::Value::Bool(m.favorite));
     o.insert(
         "tags".into(),
-        serde_json::Value::Array(m.tags.iter().map(|t| serde_json::Value::String(t.clone())).collect()),
+        serde_json::Value::Array(
+            m.tags
+                .iter()
+                .map(|t| serde_json::Value::String(t.clone()))
+                .collect(),
+        ),
     );
     o.insert(
         "notes".into(),
@@ -133,7 +138,10 @@ fn meta_from_value(v: &serde_json::Value) -> SessionMeta {
             m.favorite = b;
         }
         if let Some(arr) = o.get("tags").and_then(|x| x.as_array()) {
-            m.tags = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+            m.tags = arr
+                .iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect();
         }
         if let Some(n) = o.get("notes").and_then(|x| x.as_str()) {
             m.notes = Some(n.to_string());
@@ -199,12 +207,18 @@ mod tests {
 
     #[test]
     fn parse_filter_tags_multiple() {
-        assert_eq!(parse_filter("tag:web tag:db").tags, vec!["web".to_string(), "db".to_string()]);
+        assert_eq!(
+            parse_filter("tag:web tag:db").tags,
+            vec!["web".to_string(), "db".to_string()]
+        );
     }
 
     #[test]
     fn parse_filter_alias_contains() {
-        assert_eq!(parse_filter("alias:prod").alias_contains, Some("prod".to_string()));
+        assert_eq!(
+            parse_filter("alias:prod").alias_contains,
+            Some("prod".to_string())
+        );
     }
 
     #[test]
@@ -275,7 +289,11 @@ mod tests {
 
     #[test]
     fn save_creates_parent_dir() {
-        let dir = std::env::temp_dir().join(format!("nyx-sm-parent-{}-{}", std::process::id(), counter()));
+        let dir = std::env::temp_dir().join(format!(
+            "nyx-sm-parent-{}-{}",
+            std::process::id(),
+            counter()
+        ));
         let p = dir.join("sessions.json");
         let mut s = SessionStore::default();
         s.tag("a1", "web");

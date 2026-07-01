@@ -156,12 +156,7 @@ impl StagedChain {
     /// Pure data path: allocates the fake-stack buffer and writes the chain,
     /// but does NOT touch the live stack. Safe to call + inspect from a selftest.
     pub fn stage(pool: &GapPool) -> Option<Self> {
-        let chain = frame::build_leaf_bridge(
-            &pool.gaps,
-            &pool.nops,
-            &pool.ghosts,
-            BRIDGE_DEPTH,
-        );
+        let chain = frame::build_leaf_bridge(&pool.gaps, &pool.nops, &pool.ghosts, BRIDGE_DEPTH);
         if chain.is_empty() {
             return None;
         }
@@ -196,8 +191,7 @@ impl StagedChain {
 /// Cache of the most-recently-staged chain, set by [`stage_for`] and read by
 /// the (gated) swap path. Held at module scope so a selftest can inspect it
 /// after a staging run without threading it through the call.
-static LAST_STAGED_DEPTH: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static LAST_STAGED_DEPTH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Stage a chain from `pool` and record its depth for diagnostics. Returns the
 /// staged chain (caller may inspect it); `None` if the pool yielded nothing.
@@ -362,7 +356,10 @@ unsafe fn do_rsp_swap<T, F: FnOnce() -> T>(chain: &StagedChain, f: F) -> T {
 
     // Reentrancy guard: if another swap is in flight (shouldn't happen under
     // the single-beacon-thread invariant, but belt-and-suspenders), degrade.
-    if SWAP_IN_FLIGHT.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    if SWAP_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return f();
     }
 
@@ -390,7 +387,10 @@ unsafe fn do_rsp_swap<T, F: FnOnce() -> T>(chain: &StagedChain, f: F) -> T {
     // do_rsp_swap<T> it is fixed — so we pass it to a <T, F> bridge whose F is
     // inferred here. The bridge reads f by raw pointer + writes T to out.
     SWAP_FN.store(run_f_on_spoof::<T, F> as usize, Ordering::Release);
-    SWAP_F.store(core::ptr::addr_of!(f) as *const () as usize, Ordering::Release);
+    SWAP_F.store(
+        core::ptr::addr_of!(f) as *const () as usize,
+        Ordering::Release,
+    );
     SWAP_OUT.store(out_addr, Ordering::Release);
 
     // fake_rsp: the low end of the chain (so [RSP] = innermost gap frame).
@@ -449,7 +449,7 @@ unsafe fn do_rsp_swap<T, F: FnOnce() -> T>(chain: &StagedChain, f: F) -> T {
 /// from 0→1 at entry and store(0) at exit. ~1 ns per call.
 static SWAP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static SWAP_FN: AtomicUsize = AtomicUsize::new(0); // erased run_f_on_spoof::<T> ptr
-static SWAP_F: AtomicUsize = AtomicUsize::new(0);  // &f as *const ()
+static SWAP_F: AtomicUsize = AtomicUsize::new(0); // &f as *const ()
 static SWAP_OUT: AtomicUsize = AtomicUsize::new(0); // *mut T out-slot
 
 /// Concrete (non-generic) trampoline called by the `asm!` `call`. RSP is the

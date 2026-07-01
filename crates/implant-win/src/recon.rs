@@ -171,12 +171,11 @@ pub fn do_driveinfo() -> Response {
     type GetDiskFreeSpaceExW =
         unsafe extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32;
 
-    let glds: GetLogicalDriveStringsW = match unsafe {
-        export_addr(b"kernel32.dll", b"GetLogicalDriveStringsW")
-    } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err("driveinfo: GetLogicalDriveStringsW unresolved".into()),
-    };
+    let glds: GetLogicalDriveStringsW =
+        match unsafe { export_addr(b"kernel32.dll", b"GetLogicalDriveStringsW") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return Response::Err("driveinfo: GetLogicalDriveStringsW unresolved".into()),
+        };
     let gdfs: GetDiskFreeSpaceExW =
         match unsafe { export_addr(b"kernel32.dll", b"GetDiskFreeSpaceExW") } {
             Some(a) => unsafe { core::mem::transmute(a) },
@@ -243,12 +242,11 @@ pub fn do_env(name: &str) -> Response {
         type GetEnvStringsW = unsafe extern "system" fn() -> *mut u16;
         type FreeEnvStringsW = unsafe extern "system" fn(*mut u16) -> i32;
 
-        let ges: GetEnvStringsW = match unsafe {
-            export_addr(b"kernel32.dll", b"GetEnvironmentStringsW")
-        } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return Response::Err("env: GetEnvironmentStringsW unresolved".into()),
-        };
+        let ges: GetEnvStringsW =
+            match unsafe { export_addr(b"kernel32.dll", b"GetEnvironmentStringsW") } {
+                Some(a) => unsafe { core::mem::transmute(a) },
+                None => return Response::Err("env: GetEnvironmentStringsW unresolved".into()),
+            };
         let fes: FreeEnvStringsW =
             match unsafe { export_addr(b"kernel32.dll", b"FreeEnvironmentStringsW") } {
                 Some(a) => unsafe { core::mem::transmute(a) },
@@ -286,12 +284,11 @@ pub fn do_env(name: &str) -> Response {
         Response::Output(out)
     } else {
         type GetEnvVarW = unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
-        let gev: GetEnvVarW = match unsafe {
-            export_addr(b"kernel32.dll", b"GetEnvironmentVariableW")
-        } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return Response::Err("env: GetEnvironmentVariableW unresolved".into()),
-        };
+        let gev: GetEnvVarW =
+            match unsafe { export_addr(b"kernel32.dll", b"GetEnvironmentVariableW") } {
+                Some(a) => unsafe { core::mem::transmute(a) },
+                None => return Response::Err("env: GetEnvironmentVariableW unresolved".into()),
+            };
 
         let name16 = to_utf16(name.as_bytes());
         // 32767 is the documented max env-var length in chars; avoids the
@@ -336,39 +333,33 @@ pub fn do_clipboard() -> Response {
     type GlobalLock = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
     type GlobalUnlock = unsafe extern "system" fn(*mut c_void) -> i32;
 
-    let open: OpenClipboard =
-        match unsafe { export_addr(b"user32.dll", b"OpenClipboard") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return Response::Err("clipboard: OpenClipboard unresolved".into()),
-        };
-    let close: CloseClipboard =
-        match unsafe { export_addr(b"user32.dll", b"CloseClipboard") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return Response::Err("clipboard: CloseClipboard unresolved".into()),
-        };
-    let getdata: GetClipboardData =
-        match unsafe { export_addr(b"user32.dll", b"GetClipboardData") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return Response::Err("clipboard: GetClipboardData unresolved".into()),
-        };
-    let isavail: IsClipboardFormatAvailable =
-        match unsafe { export_addr(b"user32.dll", b"IsClipboardFormatAvailable") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => {
-                return Response::Err(
-                    "clipboard: IsClipboardFormatAvailable unresolved".into(),
-                )
-            }
-        };
+    let open: OpenClipboard = match unsafe { export_addr(b"user32.dll", b"OpenClipboard") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Response::Err("clipboard: OpenClipboard unresolved".into()),
+    };
+    let close: CloseClipboard = match unsafe { export_addr(b"user32.dll", b"CloseClipboard") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Response::Err("clipboard: CloseClipboard unresolved".into()),
+    };
+    let getdata: GetClipboardData = match unsafe { export_addr(b"user32.dll", b"GetClipboardData") }
+    {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Response::Err("clipboard: GetClipboardData unresolved".into()),
+    };
+    let isavail: IsClipboardFormatAvailable = match unsafe {
+        export_addr(b"user32.dll", b"IsClipboardFormatAvailable")
+    } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Response::Err("clipboard: IsClipboardFormatAvailable unresolved".into()),
+    };
     let glock: GlobalLock = match unsafe { export_addr(b"kernel32.dll", b"GlobalLock") } {
         Some(a) => unsafe { core::mem::transmute(a) },
         None => return Response::Err("clipboard: GlobalLock unresolved".into()),
     };
-    let gunlock: GlobalUnlock =
-        match unsafe { export_addr(b"kernel32.dll", b"GlobalUnlock") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return Response::Err("clipboard: GlobalUnlock unresolved".into()),
-        };
+    let gunlock: GlobalUnlock = match unsafe { export_addr(b"kernel32.dll", b"GlobalUnlock") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Response::Err("clipboard: GlobalUnlock unresolved".into()),
+    };
 
     if unsafe { open(core::ptr::null_mut()) } == 0 {
         return Response::Err("clipboard: OpenClipboard failed".into());
@@ -447,8 +438,8 @@ fn parse_ports(spec: &str) -> Vec<u16> {
 #[derive(Clone, Copy)]
 struct SockAddrIn {
     sin_family: u16,
-    sin_port: u16,    // network byte order
-    sin_addr: u32,    // network byte order (from inet_addr)
+    sin_port: u16, // network byte order
+    sin_addr: u32, // network byte order (from inet_addr)
     sin_zero: [u8; 8],
 }
 
@@ -474,9 +465,13 @@ struct WsaFns {
     connect: unsafe extern "system" fn(usize, *const SockAddrIn, i32) -> i32,
     close: unsafe extern "system" fn(usize) -> i32,
     ioctl: unsafe extern "system" fn(usize, i32, *mut u32) -> i32,
-    select:
-        unsafe extern "system" fn(i32, *const FdSet, *const FdSet, *const FdSet, *const Timeval)
-            -> i32,
+    select: unsafe extern "system" fn(
+        i32,
+        *const FdSet,
+        *const FdSet,
+        *const FdSet,
+        *const Timeval,
+    ) -> i32,
     getsockopt: unsafe extern "system" fn(usize, i32, i32, *mut u8, *mut i32) -> i32,
 }
 
@@ -511,15 +506,7 @@ fn probe_one(f: &WsaFns, addr: u32, port: u16) -> bool {
         tv_sec: 2,
         tv_usec: 0,
     };
-    let n = unsafe {
-        (f.select)(
-            0,
-            core::ptr::null(),
-            &wfds,
-            core::ptr::null(),
-            &tv,
-        )
-    };
+    let n = unsafe { (f.select)(0, core::ptr::null(), &wfds, core::ptr::null(), &tv) };
 
     let mut open = false;
     if n > 0 {
@@ -806,7 +793,16 @@ fn net_connections() -> Response {
 
     // Size query: AF_INET=2, TCP_TABLE_OWNER_PID_ALL=5, Reserved=0.
     let mut size: u32 = 0;
-    let _ = unsafe { f(core::ptr::null_mut(), &mut size, 0, AF_INET as u32, TCP_TABLE_OWNER_PID_ALL, 0) };
+    let _ = unsafe {
+        f(
+            core::ptr::null_mut(),
+            &mut size,
+            0,
+            AF_INET as u32,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        )
+    };
     if size == 0 || (size as usize) > (1 << 20) {
         return Response::Output(Vec::new());
     }

@@ -37,8 +37,7 @@ use crate::{EtwTiKit, KernelRw, KitError};
 /// Used only for diagnostics / a future self-check that the resolved handle
 /// points at this provider; the blind itself chases the handle, not the GUID.
 pub const ETW_TI_GUID: [u8; 16] = [
-    0x7C, 0x89, 0xE1, 0xF4, 0x5D, 0xBB, 0x68, 0x56,
-    0xF1, 0xD8, 0x04, 0x0F, 0x4D, 0x8D, 0xD3, 0x44,
+    0x7C, 0x89, 0xE1, 0xF4, 0x5D, 0xBB, 0x68, 0x56, 0xF1, 0xD8, 0x04, 0x0F, 0x4D, 0x8D, 0xD3, 0x44,
 ];
 
 /// Build-dependent offsets for the ETW-TI provider-block chase. See [`for_build`].
@@ -177,7 +176,9 @@ impl EtwTiBlind {
     fn resolve_is_enabled_kva(&self, krw: &dyn KernelRw) -> Result<usize, KitError> {
         // Step 1: prov_reg_handle → GUIDEntry. The handle is itself a pointer
         // to the GUIDEntry; dereference it.
-        let guid_entry = krw.kread_u64(self.prov_reg_handle_kva).map_err(KitError::from)?;
+        let guid_entry = krw
+            .kread_u64(self.prov_reg_handle_kva)
+            .map_err(KitError::from)?;
         if guid_entry == 0 {
             return Err(KitError::UnsupportedPosture(
                 "EtwThreatIntProvRegHandle is NULL — ETW-TI provider not registered",
@@ -291,8 +292,18 @@ mod tests {
         let patched = EtwTiOffsets::for_build_strict(17763, 1339).unwrap(); // this host
         assert_eq!(patched.provider_block_to_enable_info, 0x060);
         // Boundary: UBR=1074 still RTM, 1075 flips.
-        assert_eq!(EtwTiOffsets::for_build_strict(17763, 1074).unwrap().provider_block_to_enable_info, 0x050);
-        assert_eq!(EtwTiOffsets::for_build_strict(17763, 1075).unwrap().provider_block_to_enable_info, 0x060);
+        assert_eq!(
+            EtwTiOffsets::for_build_strict(17763, 1074)
+                .unwrap()
+                .provider_block_to_enable_info,
+            0x050
+        );
+        assert_eq!(
+            EtwTiOffsets::for_build_strict(17763, 1075)
+                .unwrap()
+                .provider_block_to_enable_info,
+            0x060
+        );
     }
 
     #[test]
@@ -308,10 +319,16 @@ mod tests {
 
         // Wire the pointer chain.
         krw.set_u64(handle_kva, guid_entry_kva as u64);
-        krw.set_u64(guid_entry_kva + off.guid_entry_to_provider_block, prov_block_kva as u64);
+        krw.set_u64(
+            guid_entry_kva + off.guid_entry_to_provider_block,
+            prov_block_kva as u64,
+        );
         krw.set_u64(is_enabled_kva, 1); // provider "enabled" pre-blind
 
-        let kit = EtwTiBlind { prov_reg_handle_kva: handle_kva, offsets: off };
+        let kit = EtwTiBlind {
+            prov_reg_handle_kva: handle_kva,
+            offsets: off,
+        };
         assert!(!kit.is_blinded(&krw).unwrap()); // enabled pre-blind
         kit.blind(&krw).unwrap();
         assert!(kit.is_blinded(&krw).unwrap()); // disabled post-blind
@@ -327,7 +344,10 @@ mod tests {
         krw.set_u64(0x5000 + off.guid_entry_to_provider_block, 0x6000);
         let is_enabled = 0x6000 + off.provider_block_to_enable_info;
         krw.set_u64(is_enabled, 1);
-        let kit = EtwTiBlind { prov_reg_handle_kva: handle_kva, offsets: off };
+        let kit = EtwTiBlind {
+            prov_reg_handle_kva: handle_kva,
+            offsets: off,
+        };
         kit.blind(&krw).unwrap();
         kit.blind(&krw).unwrap(); // second blind — must not error
         assert!(kit.is_blinded(&krw).unwrap());
@@ -338,7 +358,10 @@ mod tests {
         let krw = MockKrw::new();
         let off = EtwTiOffsets::for_build(17763).unwrap();
         krw.set_u64(0x7000, 0); // handle dereferences to NULL
-        let kit = EtwTiBlind { prov_reg_handle_kva: 0x7000, offsets: off };
+        let kit = EtwTiBlind {
+            prov_reg_handle_kva: 0x7000,
+            offsets: off,
+        };
         let r = kit.blind(&krw);
         assert!(matches!(r, Err(KitError::UnsupportedPosture(_))));
     }
@@ -349,7 +372,10 @@ mod tests {
         let off = EtwTiOffsets::for_build(17763).unwrap();
         krw.set_u64(0x8000, 0x9000); // handle → GUIDEntry
         krw.set_u64(0x9000 + off.guid_entry_to_provider_block, 0); // block ptr NULL
-        let kit = EtwTiBlind { prov_reg_handle_kva: 0x8000, offsets: off };
+        let kit = EtwTiBlind {
+            prov_reg_handle_kva: 0x8000,
+            offsets: off,
+        };
         let r = kit.is_blinded(&krw);
         assert!(matches!(r, Err(KitError::UnsupportedPosture(_))));
     }
@@ -361,7 +387,9 @@ mod tests {
         struct ReadOkWriteHvci;
         impl KernelRw for ReadOkWriteHvci {
             fn kread(&self, _kaddr: usize, dst: &mut [u8]) -> Result<(), KrwError> {
-                if dst.len() >= 8 { dst[..8].copy_from_slice(&[0x10u8; 8]); }
+                if dst.len() >= 8 {
+                    dst[..8].copy_from_slice(&[0x10u8; 8]);
+                }
                 Ok(())
             }
             fn kwrite(&self, _kaddr: usize, _src: &[u8]) -> Result<(), KrwError> {
@@ -370,9 +398,15 @@ mod tests {
         }
         let krw = ReadOkWriteHvci;
         let off = EtwTiOffsets::for_build(17763).unwrap();
-        let kit = EtwTiBlind { prov_reg_handle_kva: 0x1000, offsets: off };
+        let kit = EtwTiBlind {
+            prov_reg_handle_kva: 0x1000,
+            offsets: off,
+        };
         let r = kit.blind(&krw);
-        assert!(matches!(r, Err(KitError::NoPrimitive(KrwError::HvciCodePage))));
+        assert!(matches!(
+            r,
+            Err(KitError::NoPrimitive(KrwError::HvciCodePage))
+        ));
     }
 
     #[test]

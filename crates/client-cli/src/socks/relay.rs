@@ -73,7 +73,10 @@ pub async fn handle_conn(mut stream: TcpStream, ctx: Arc<BridgeCtx>) {
 
     // ---- cap (client-side headroom under the implant's MAX_CHANNELS=16) ----
     if ctx.active.load(Ordering::Acquire) >= ctx.max_chan {
-        eprintln!("[socks] rejecting connection: channel cap ({}) reached", ctx.max_chan);
+        eprintln!(
+            "[socks] rejecting connection: channel cap ({}) reached",
+            ctx.max_chan
+        );
         let _ = handshake::write_reply_failure(&mut stream, 0x05).await;
         return;
     }
@@ -123,7 +126,10 @@ pub async fn handle_conn(mut stream: TcpStream, ctx: Arc<BridgeCtx>) {
             }
             Ok(None) => false, // poll loop dropped our sender (shouldn't happen)
             Err(_) => {
-                eprintln!("[socks] chan {chan}: open-confirmation timed out ({:?})", OPEN_DEADLINE);
+                eprintln!(
+                    "[socks] chan {chan}: open-confirmation timed out ({:?})",
+                    OPEN_DEADLINE
+                );
                 false
             }
         }
@@ -200,7 +206,7 @@ pub async fn handle_conn(mut stream: TcpStream, ctx: Arc<BridgeCtx>) {
 /// removes on status 2/3) — `HashMap::remove` on a missing key is a no-op.
 async fn cleanup(ctx: &BridgeCtx, chan: u32) {
     ctx.chans.lock().unwrap().by_chan.remove(&chan);
-    let _ = api::enqueue_channel_close(&ctx.client, &ctx.server, &ctx.session, chan, &ctx.token)
-        .await;
+    let _ =
+        api::enqueue_channel_close(&ctx.client, &ctx.server, &ctx.session, chan, &ctx.token).await;
     ctx.active.fetch_sub(1, Ordering::AcqRel);
 }

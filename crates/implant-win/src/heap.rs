@@ -47,7 +47,9 @@ impl Str {
                         Err(e) => {
                             let valid_up_to = e.valid_up_to();
                             if valid_up_to > 0 {
-                                out.push_str(core::str::from_utf8(&self.0[i..i + valid_up_to]).unwrap());
+                                out.push_str(
+                                    core::str::from_utf8(&self.0[i..i + valid_up_to]).unwrap(),
+                                );
                             }
                             out.push('\u{FFFD}');
                             i += valid_up_to + 1;

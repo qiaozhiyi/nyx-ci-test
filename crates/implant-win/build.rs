@@ -52,16 +52,17 @@ fn bake_server_pub() {
             // a real (non-identity) X25519 point, so the crypto is structurally
             // exercised instead of collapsing. Real builds set NYX_SERVER_PUB.
             [
-                0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
-                0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
-                0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+                0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+                0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+                0x42, 0x42, 0x42, 0x42,
             ]
         }
     };
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest = Path::new(&out_dir).join("server_pub.rs");
-    let mut src = String::from("/// Team server long-term X25519 public key, baked at build time.\n");
+    let mut src =
+        String::from("/// Team server long-term X25519 public key, baked at build time.\n");
     src.push_str("/// See build.rs. Do not edit by hand.\n");
     src.push_str("pub static SERVER_PUB: [u8; 32] = [");
     for (i, b) in key_bytes.iter().enumerate() {
@@ -190,9 +191,8 @@ fn bake_offsets() {
         Ok(path) => {
             let p = Path::new(&path);
             println!("cargo:rerun-if-changed={}", p.display());
-            let text = fs::read_to_string(p).unwrap_or_else(|e| {
-                panic!("NYX_OFFSETS={} unreadable: {e}", p.display())
-            });
+            let text = fs::read_to_string(p)
+                .unwrap_or_else(|e| panic!("NYX_OFFSETS={} unreadable: {e}", p.display()));
             let offsets = parse_offsets_toml(&text);
             emit_baked_offsets(&offsets)
         }
@@ -306,9 +306,8 @@ fn bake_envelopes() {
         Ok(path) => {
             let p = Path::new(&path);
             println!("cargo:rerun-if-changed={}", p.display());
-            fs::read_to_string(p).unwrap_or_else(|e| {
-                panic!("NYX_PROFILE={} unreadable: {e}", p.display())
-            })
+            fs::read_to_string(p)
+                .unwrap_or_else(|e| panic!("NYX_PROFILE={} unreadable: {e}", p.display()))
         }
         Err(_) => {
             let out_dir = env::var("OUT_DIR").unwrap();
@@ -318,7 +317,8 @@ fn bake_envelopes() {
         }
     };
 
-    let profile = nyx_profile::parse(&src).unwrap_or_else(|e| panic!("NYX_PROFILE parse error: {e}"));
+    let profile =
+        nyx_profile::parse(&src).unwrap_or_else(|e| panic!("NYX_PROFILE parse error: {e}"));
     let errs: Vec<_> = nyx_profile::lint(&profile)
         .into_iter()
         .filter(|d| d.severity == nyx_profile::Severity::Error)

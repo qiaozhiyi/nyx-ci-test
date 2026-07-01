@@ -21,8 +21,8 @@
 
 #![cfg(target_os = "windows")]
 
-use core::ffi::c_void;
 use crate::KrwError;
+use core::ffi::c_void;
 
 /// SystemInformationClass for "loaded kernel modules".
 const SYSTEM_MODULE_INFORMATION: u32 = 11;
@@ -33,7 +33,7 @@ const SYSTEM_MODULE_INFORMATION: u32 = 11;
 struct RtlProcessModuleInformation {
     section: *mut c_void,
     mapped_base: *mut c_void,
-    image_base: *mut c_void,  // ← the kernel VA of the module
+    image_base: *mut c_void, // ← the kernel VA of the module
     image_size: u32,
     flags: u32,
     load_order_index: u16,
@@ -68,9 +68,8 @@ pub unsafe fn ntoskrnl_base() -> Result<usize, KrwError> {
 /// # Safety
 /// Same as [`ntoskrnl_base`].
 pub unsafe fn ntoskrnl_module_info() -> Result<(usize, usize), KrwError> {
-    type NtQuerySystemInformationFn = unsafe extern "system" fn(
-        u32, *mut c_void, u32, *mut u32,
-    ) -> i32;
+    type NtQuerySystemInformationFn =
+        unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
 
     let nqsi: NtQuerySystemInformationFn =
         unsafe { super::resolve::resolve_sym(b"ntdll.dll", b"NtQuerySystemInformation") }?;
@@ -102,30 +101,38 @@ pub unsafe fn ntoskrnl_module_info() -> Result<(usize, usize), KrwError> {
             )
         };
         if status2 < 0 {
-            return Err(KrwError::Other(
-                alloc::format!("NtQuerySystemInformation retry failed: {:#x}", status2 as u32),
-            ));
+            return Err(KrwError::Other(alloc::format!(
+                "NtQuerySystemInformation retry failed: {:#x}",
+                status2 as u32
+            )));
         }
     } else if status < 0 {
-        return Err(KrwError::Other(
-            alloc::format!("NtQuerySystemInformation failed: {:#x}", status as u32),
-        ));
+        return Err(KrwError::Other(alloc::format!(
+            "NtQuerySystemInformation failed: {:#x}",
+            status as u32
+        )));
     }
 
     // Parse: first ULONG = module count, then the array of entries.
     if buf.len() < 8 {
-        return Err(KrwError::Other("NtQuerySystemInformation buffer too short".into()));
+        return Err(KrwError::Other(
+            "NtQuerySystemInformation buffer too short".into(),
+        ));
     }
     let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
     if count == 0 {
-        return Err(KrwError::Other("NtQuerySystemInformation returned 0 modules".into()));
+        return Err(KrwError::Other(
+            "NtQuerySystemInformation returned 0 modules".into(),
+        ));
     }
 
     // Module[0] is at offset 8 (after the count ULONG + 4 padding bytes on x64).
     // Each RTL_PROCESS_MODULE_INFORMATION is 296 bytes on x64.
     const ENTRY_SIZE: usize = 296;
     if buf.len() < 8 + ENTRY_SIZE {
-        return Err(KrwError::Other("buffer too short for first module entry".into()));
+        return Err(KrwError::Other(
+            "buffer too short for first module entry".into(),
+        ));
     }
     let entry_ptr = buf.as_ptr().wrapping_add(8) as *const RtlProcessModuleInformation;
     let entry = unsafe { &*entry_ptr };
@@ -158,21 +165,30 @@ pub struct ModuleInfo {
 /// # Safety
 /// Same NtQuerySystemInformation contract as [`ntoskrnl_module_info`].
 pub unsafe fn module_info_by_name(name: &[u8]) -> Result<ModuleInfo, KrwError> {
-    type NtQuerySystemInformationFn = unsafe extern "system" fn(
-        u32, *mut c_void, u32, *mut u32,
-    ) -> i32;
+    type NtQuerySystemInformationFn =
+        unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
     let nqsi: NtQuerySystemInformationFn =
         unsafe { super::resolve::resolve_sym(b"ntdll.dll", b"NtQuerySystemInformation") }?;
 
     let mut buf = alloc::vec![0u8; 256 * 1024];
     let mut ret_len: u32 = 0;
     let status = unsafe {
-        nqsi(SYSTEM_MODULE_INFORMATION, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut ret_len)
+        nqsi(
+            SYSTEM_MODULE_INFORMATION,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as u32,
+            &mut ret_len,
+        )
     };
     if status as u32 == 0xC0000004 {
         buf = alloc::vec![0u8; ret_len as usize + 0x1000];
         let status2 = unsafe {
-            nqsi(SYSTEM_MODULE_INFORMATION, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut ret_len)
+            nqsi(
+                SYSTEM_MODULE_INFORMATION,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                &mut ret_len,
+            )
         };
         if status2 < 0 {
             return Err(KrwError::Other(alloc::format!(
@@ -187,7 +203,9 @@ pub unsafe fn module_info_by_name(name: &[u8]) -> Result<ModuleInfo, KrwError> {
         )));
     }
     if buf.len() < 8 {
-        return Err(KrwError::Other("NtQuerySystemInformation buffer too short".into()));
+        return Err(KrwError::Other(
+            "NtQuerySystemInformation buffer too short".into(),
+        ));
     }
     let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
     const ENTRY_SIZE: usize = 296;
@@ -219,7 +237,10 @@ pub unsafe fn module_info_by_name(name: &[u8]) -> Result<ModuleInfo, KrwError> {
                     core::str::from_utf8(name).unwrap_or("<mod>")
                 )));
             }
-            return Ok(ModuleInfo { base, size: entry.image_size as usize });
+            return Ok(ModuleInfo {
+                base,
+                size: entry.image_size as usize,
+            });
         }
     }
     Err(KrwError::Other(alloc::format!(

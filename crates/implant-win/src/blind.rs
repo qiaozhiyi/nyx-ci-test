@@ -261,7 +261,11 @@ pub unsafe fn disable_etw_provider_status(guid: &[u8; 16], control_code: u32) ->
         _reserved: [u8; 8],
         is_enabled: u32,
     }
-    let ei = EnableInfo { guid: *guid, _reserved: [0; 8], is_enabled: 0 };
+    let ei = EnableInfo {
+        guid: *guid,
+        _reserved: [0; 8],
+        is_enabled: 0,
+    };
     let mut ret_len: u32 = 0;
     unsafe {
         ntc(

@@ -15,7 +15,7 @@
 
 #![cfg(target_os = "windows")]
 
-use crate::win::pagewalk::{PhysRead, PhysReadError, translate_va};
+use crate::win::pagewalk::{translate_va, PhysRead, PhysReadError};
 use crate::{KernelRw, KrwError};
 
 /// Physical-memory write primitive (paired with [`PhysRead`]).
@@ -41,9 +41,9 @@ impl<P: PhysRead + PhysWrite> VaKernelRw<P> {
 fn map_phys_err(e: PhysReadError) -> KrwError {
     match e {
         PhysReadError::Ioctl => KrwError::Other("physical IOCTL failed".into()),
-        PhysReadError::NotPresent { level } => KrwError::Other(
-            alloc::format!("page not present at {:?} level", level),
-        ),
+        PhysReadError::NotPresent { level } => {
+            KrwError::Other(alloc::format!("page not present at {:?} level", level))
+        }
         PhysReadError::Overflow => KrwError::Other("physical address overflow".into()),
     }
 }

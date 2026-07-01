@@ -17,12 +17,19 @@
 //! 2. **Runtime table lookup (this module)** — if no offsets were baked (dev
 //!    builds, unknown target), the runtime reads the OS build number from the
 //!    PEB and picks the matching row from [`KNOWN_BUILDS`]. Covers all major
-//!    Win10/Win11/Server builds. Unknown builds return None → the kit degrades.
+//!    Win10/Win11/Server builds **exactly**, plus verified patch-equivalent
+//!    builds via [`PATCH_EQUIVALENT_BUILDS`]. Unknown builds return `None`
+//!    → the kit degrades (skips the kernel-structure-dependent technique).
+//!    **No floor-match** — a blind floor-match silently gambles the layout is
+//!    unchanged, which bugchecks on every EPROCESS restructuring.
 //!
-//! 3. **Pattern-scan fallback (future, `win/`)** — for truly unknown builds
-//!    with no table entry AND no baked offsets, a pattern scan of ntoskrnl
-//!    recovers offsets at runtime. This is the noisiest path (code-section
-//!    traversal) and is reserved for when 1 and 2 both miss.
+//! 3. **Operator-side pattern scan (`operator-kernelsdk::probe_eprocess_offsets`)**
+//!    — for truly unknown builds with no table entry AND no baked offsets, the
+//!    operator (which has a KernelRw primitive via its driver) runs a
+//!    DefenderDump-style invariant scan of the live System EPROCESS at runtime.
+//!    This discovers offsets on ANY build without a table. It lives on the
+//!    operator side because it requires kernel memory read (ring-0), which the
+//!    implant (ring-3) does not have.
 //!
 //! ## Sources
 //! Every offset is cross-checked against EDRSandblast's NtoskrnlOffsets.csv +
@@ -235,19 +242,61 @@ pub const KNOWN_BUILDS: &[BuildOffsets] = &[
     },
 ];
 
-/// Look up offsets for an exact build number. Returns None for unknown builds
-/// (caller should degrade or pattern-scan).
+/// Patch builds whose EPROCESS + ETW-TI layout is *verified identical* to a
+/// baseline build. These are service-update / enablement-package builds that
+/// ship the same kernel structure layout as their base release (e.g. 19042/43/
+/// 44/45 are all 19041 + an enablement package — the kernel binary is byte-
+/// identical modulo the EULA-gated SKU rotation).
+///
+/// Each entry is `(patch_build, baseline_build)`. A patch build resolves to
+/// its baseline's offsets. This is an EXPLICIT allow-list — adding a new
+/// patch build here requires confirming (via Vergilius / EDRSandblast CSV)
+/// that the layout truly matches. Builds NOT in this list and NOT in
+/// [`KNOWN_BUILDS`] return `None` from [`for_build`].
+///
+/// **Why not floor-match?** A blind floor-match (highest table build ≤ the
+/// requested build) silently gambles that the layout is unchanged. That gamble
+/// is wrong on every major EPROCESS restructuring (e.g. 20348 shifted PID from
+/// 0x2e8 to 0x440 — a floor-match from 20347 to 19041 would write the wrong
+/// field → bugcheck). An explicit allow-list makes the assumption visible and
+/// falsifiable.
+pub const PATCH_EQUIVALENT_BUILDS: &[(u32, u32)] = &[
+    // Win10 20H2/21H1/21H2/22H2 (enablement packages over 2004) — same kernel.
+    (19042, 19041),
+    (19043, 19041),
+    (19044, 19041),
+    (19045, 19041),
+    // Win10 1909 (18363) — same EPROCESS as 1903 (18362).
+    (18363, 18362),
+    // Win11 21H2 (22000) — same EPROCESS + ETW-TI as Server 2022 (20348).
+    (22000, 20348),
+];
+
+/// Look up offsets for a build number. Resolution order:
+///
+/// 1. **Exact match** in [`KNOWN_BUILDS`].
+/// 2. **Patch-equivalent** match in [`PATCH_EQUIVALENT_BUILDS`] (e.g. 19045 →
+///    19041).
+/// 3. **`None`** for anything else — the caller MUST degrade (skip the kernel-
+///    structure-dependent technique) or resolve via the operator-side
+///    `probe_eprocess_offsets` pattern scan.
+///
+/// This deliberately does NOT floor-match unknown builds. A floor-match
+/// silently assumes the nearest-lower build shares the same layout — an
+/// assumption that breaks on every EPROCESS restructuring and causes a
+/// bugcheck. Unknown builds return `None` so the failure is loud.
 pub fn for_build(build: u32) -> Option<&'static BuildOffsets> {
-    // Find the closest build <= the requested one (a patch like 19045 maps to
-    // the 19041 row since the EPROCESS layout is identical across 19041-19045).
-    // First try exact match, then floor match.
-    KNOWN_BUILDS.iter().find(|b| b.build == build).or_else(|| {
-        // Floor match: the highest table build <= the requested build.
-        KNOWN_BUILDS
-            .iter()
-            .filter(|b| b.build <= build)
-            .max_by_key(|b| b.build)
-    })
+    // 1. Exact match.
+    if let Some(b) = KNOWN_BUILDS.iter().find(|b| b.build == build) {
+        return Some(b);
+    }
+    // 2. Patch-equivalent: resolve the patch build to its baseline, then look
+    //    up the baseline in KNOWN_BUILDS.
+    if let Some(&(_, baseline)) = PATCH_EQUIVALENT_BUILDS.iter().find(|(p, _)| *p == build) {
+        return KNOWN_BUILDS.iter().find(|b| b.build == baseline);
+    }
+    // 3. Unknown build — return None (caller degrades or operator-side probes).
+    None
 }
 
 /// Look up offsets for 17763 with UBR sensitivity (the ETW-TI EnableInfo
@@ -295,11 +344,37 @@ mod tests {
     }
 
     #[test]
-    fn floor_match_handles_patch_builds() {
-        // 19045 (22H2) has the same EPROCESS as 19041 → floor-matches.
+    fn patch_equivalent_builds_resolve_to_baseline() {
+        // Win10 22H2 (19045) is an enablement package over 2004 (19041) —
+        // same kernel binary, same EPROCESS layout. Resolves to 19041's row.
         let o = for_build(19045).unwrap();
         assert_eq!(o.build, 19041);
         assert_eq!(o.eprocess.unique_process_id, 0x2e8);
+
+        // The full 19042-19045 enablement range all maps to 19041.
+        for &patch in &[19042, 19043, 19044, 19045] {
+            let o = for_build(patch).unwrap();
+            assert_eq!(o.build, 19041, "patch {} should map to 19041", patch);
+        }
+
+        // Win11 21H2 (22000) maps to Server 2022 (20348).
+        let o = for_build(22000).unwrap();
+        assert_eq!(o.build, 20348);
+
+        // Win10 1909 (18363) maps to 1903 (18362).
+        let o = for_build(18363).unwrap();
+        assert_eq!(o.build, 18362);
+    }
+
+    #[test]
+    fn unknown_future_build_returns_none() {
+        // A hypothetical future build (e.g. Win11 26H2 = 26300) that is NOT in
+        // the table and NOT in the patch-equivalent list. Must return None
+        // rather than silently floor-matching to 26200 (which would bugcheck
+        // if the layout changed). The operator-side probe_eprocess_offsets is
+        // the fallback for this case.
+        assert!(for_build(26300).is_none());
+        assert!(for_build(26999).is_none());
     }
 
     #[test]

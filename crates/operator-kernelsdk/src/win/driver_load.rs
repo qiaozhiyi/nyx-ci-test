@@ -27,14 +27,14 @@
 
 #![cfg(target_os = "windows")]
 
-use core::ffi::c_void;
 use crate::KrwError;
+use core::ffi::c_void;
 
 // ---- Win32/NT FFI types ----
 
 #[repr(C)]
 pub struct UnicodeString {
-    pub length: u16,        // bytes, excluding null
+    pub length: u16, // bytes, excluding null
     pub maximum_length: u16,
     pub buffer: *const u16,
 }
@@ -46,12 +46,18 @@ type NtUnloadDriverFn = unsafe extern "system" fn(*const UnicodeString) -> i32;
 
 // Registry APIs for creating the service key.
 type RegCreateKeyExWFn = unsafe extern "system" fn(
-    *mut c_void, *const u16, u32, *mut c_void, u32, u32,
-    *mut c_void, *mut *mut c_void, *mut u32,
+    *mut c_void,
+    *const u16,
+    u32,
+    *mut c_void,
+    u32,
+    u32,
+    *mut c_void,
+    *mut *mut c_void,
+    *mut u32,
 ) -> i32;
-type RegSetValueExWFn = unsafe extern "system" fn(
-    *mut c_void, *const u16, u32, u32, *const u8, u32,
-) -> i32;
+type RegSetValueExWFn =
+    unsafe extern "system" fn(*mut c_void, *const u16, u32, u32, *const u8, u32) -> i32;
 type RegCloseKeyFn = unsafe extern "system" fn(*mut c_void) -> i32;
 type RegDeleteKeyWFn = unsafe extern "system" fn(*mut c_void, *const u16) -> i32;
 
@@ -85,7 +91,10 @@ impl LoadedDriver {
     /// Caller must have SeLoadDriverPrivilege.
     pub unsafe fn load(sys_path: &[u16], svc_name: &[u16]) -> Result<Self, KrwError> {
         // Build the registry path: \Registry\Machine\...\Services\<svc_name>
-        let prefix: Vec<u16> = SERVICES_PREFIX.encode_utf16().chain(core::iter::once(0)).collect();
+        let prefix: Vec<u16> = SERVICES_PREFIX
+            .encode_utf16()
+            .chain(core::iter::once(0))
+            .collect();
         let mut reg_path: Vec<u16> = prefix[..prefix.len() - 1] // drop the null for concat
             .iter()
             .chain(svc_name.iter())
@@ -114,12 +123,16 @@ impl LoadedDriver {
         } else {
             // Cleanup the key on failure.
             reg.delete_key(&reg_path);
-            return Err(KrwError::Other(
-                alloc::format!("NtLoadDriver failed: NTSTATUS {:#x}", status as u32),
-            ));
+            return Err(KrwError::Other(alloc::format!(
+                "NtLoadDriver failed: NTSTATUS {:#x}",
+                status as u32
+            )));
         };
 
-        Ok(Self { reg_path, newly_loaded })
+        Ok(Self {
+            reg_path,
+            newly_loaded,
+        })
     }
 
     /// Unload the driver + delete the registry key. Best-effort.
@@ -164,7 +177,9 @@ impl Drop for LoadedDriver {
 /// trim trailing NULs).
 fn build_image_path(sys_path: &[u16]) -> Vec<u16> {
     // Trim trailing NULs (callers like the example pass a NUL-terminated const).
-    let trimmed: &[u16] = sys_path.iter().rposition(|&c| c != 0)
+    let trimmed: &[u16] = sys_path
+        .iter()
+        .rposition(|&c| c != 0)
         .map(|i| &sys_path[..=i])
         .unwrap_or(&sys_path[..0]);
     // Strip a leading `\??\` (4 code units) if present, for the SystemRoot check.
@@ -177,7 +192,8 @@ fn build_image_path(sys_path: &[u16]) -> Vec<u16> {
     // Is core under System32\ (case-insensitive ASCII compare)?
     let sys32: &[u8] = b"system32\\";
     let under_sys32 = core.len() >= sys32.len()
-        && core[..sys32.len()].iter()
+        && core[..sys32.len()]
+            .iter()
             .zip(sys32.iter())
             .all(|(c, &e)| (*c as u8).to_ascii_lowercase() == e);
     if under_sys32 {
@@ -226,7 +242,11 @@ impl RegApi {
     }
 
     /// Create the service key + set ImagePath.
-    fn create_key_and_set_image_path(&self, reg_path: &[u16], image_path: &[u16]) -> Result<(), KrwError> {
+    fn create_key_and_set_image_path(
+        &self,
+        reg_path: &[u16],
+        image_path: &[u16],
+    ) -> Result<(), KrwError> {
         let mut hkey: *mut c_void = core::ptr::null_mut();
         let mut disposition: u32 = 0;
         // RegCreateKeyExW param order: hKey, lpSubKey, Reserved, lpClass,
@@ -257,7 +277,10 @@ impl RegApi {
             )
         };
         if status != 0 {
-            return Err(KrwError::Other(alloc::format!("RegCreateKeyExW failed: {}", status)));
+            return Err(KrwError::Other(alloc::format!(
+                "RegCreateKeyExW failed: {}",
+                status
+            )));
         }
         // Set ImagePath = image_path (REG_EXPAND_SZ = 2, or REG_SZ = 1).
         let image_path_bytes: &[u8] = unsafe {
@@ -266,18 +289,34 @@ impl RegApi {
                 (image_path.len() - 1) * 2, // exclude null, in bytes
             )
         };
-        let name: &[u16] = &[b'I' as u16, b'm' as u16, b'a' as u16, b'g' as u16,
-                            b'e' as u16, b'P' as u16, b'a' as u16, b't' as u16,
-                            b'h' as u16, 0];
+        let name: &[u16] = &[
+            b'I' as u16,
+            b'm' as u16,
+            b'a' as u16,
+            b'g' as u16,
+            b'e' as u16,
+            b'P' as u16,
+            b'a' as u16,
+            b't' as u16,
+            b'h' as u16,
+            0,
+        ];
         let set_status = unsafe {
-            (self.set_value)(hkey, name.as_ptr(), 0, 2 /* REG_EXPAND_SZ */,
-                             image_path_bytes.as_ptr(), image_path_bytes.len() as u32)
+            (self.set_value)(
+                hkey,
+                name.as_ptr(),
+                0,
+                2, /* REG_EXPAND_SZ */
+                image_path_bytes.as_ptr(),
+                image_path_bytes.len() as u32,
+            )
         };
         if set_status != 0 {
             unsafe { (self.close_key)(hkey) };
-            return Err(KrwError::Other(
-                alloc::format!("RegSetValueExW(ImagePath) failed: {}", set_status),
-            ));
+            return Err(KrwError::Other(alloc::format!(
+                "RegSetValueExW(ImagePath) failed: {}",
+                set_status
+            )));
         }
         // Set Type = SERVICE_KERNEL_DRIVER (1), Start = SERVICE_DEMAND_START (3),
         // ErrorControl = SERVICE_ERROR_IGNORE (0). NtLoadDriver → IopLoadDriver
@@ -286,26 +325,62 @@ impl RegApi {
         // (0xC0000160) even when ImagePath is correct. These three values are
         // exactly what `sc create <svc> type= kernel` writes.
         let type_name: &[u16] = &[b'T' as u16, b'y' as u16, b'p' as u16, b'e' as u16, 0];
-        let start_name: &[u16] = &[b'S' as u16, b't' as u16, b'a' as u16, b'r' as u16,
-                                   b't' as u16, 0];
-        let err_name: &[u16]  = &[b'E' as u16, b'r' as u16, b'r' as u16, b'o' as u16,
-                                   b'r' as u16, b'C' as u16, b'o' as u16, b'n' as u16,
-                                   b't' as u16, b'r' as u16, b'o' as u16, b'l' as u16, 0];
-        let dword_one: [u8; 4] = 1u32.to_le_bytes();     // Type = KERNEL_DRIVER
-        let dword_three: [u8; 4] = 3u32.to_le_bytes();   // Start = DEMAND_START
-        let dword_zero: [u8; 4] = 0u32.to_le_bytes();    // ErrorControl = IGNORE
+        let start_name: &[u16] = &[
+            b'S' as u16,
+            b't' as u16,
+            b'a' as u16,
+            b'r' as u16,
+            b't' as u16,
+            0,
+        ];
+        let err_name: &[u16] = &[
+            b'E' as u16,
+            b'r' as u16,
+            b'r' as u16,
+            b'o' as u16,
+            b'r' as u16,
+            b'C' as u16,
+            b'o' as u16,
+            b'n' as u16,
+            b't' as u16,
+            b'r' as u16,
+            b'o' as u16,
+            b'l' as u16,
+            0,
+        ];
+        let dword_one: [u8; 4] = 1u32.to_le_bytes(); // Type = KERNEL_DRIVER
+        let dword_three: [u8; 4] = 3u32.to_le_bytes(); // Start = DEMAND_START
+        let dword_zero: [u8; 4] = 0u32.to_le_bytes(); // ErrorControl = IGNORE
         const REG_DWORD: u32 = 4;
         let _ = unsafe {
-            (self.set_value)(hkey, type_name.as_ptr(), 0, REG_DWORD,
-                             dword_one.as_ptr(), 4)
+            (self.set_value)(
+                hkey,
+                type_name.as_ptr(),
+                0,
+                REG_DWORD,
+                dword_one.as_ptr(),
+                4,
+            )
         };
         let _ = unsafe {
-            (self.set_value)(hkey, start_name.as_ptr(), 0, REG_DWORD,
-                             dword_three.as_ptr(), 4)
+            (self.set_value)(
+                hkey,
+                start_name.as_ptr(),
+                0,
+                REG_DWORD,
+                dword_three.as_ptr(),
+                4,
+            )
         };
         let _ = unsafe {
-            (self.set_value)(hkey, err_name.as_ptr(), 0, REG_DWORD,
-                             dword_zero.as_ptr(), 4)
+            (self.set_value)(
+                hkey,
+                err_name.as_ptr(),
+                0,
+                REG_DWORD,
+                dword_zero.as_ptr(),
+                4,
+            )
         };
         unsafe { (self.close_key)(hkey) };
         Ok(())
@@ -330,9 +405,7 @@ impl RegApi {
     fn delete_key(&self, reg_path: &[u16]) {
         // RegDeleteKeyW also wants relative path. Open the parent first, then
         // delete the leaf. For simplicity, use RegDeleteKeyW with HKLM + relative.
-        let _ = unsafe {
-            (self.delete_key_fn)(self.hklm, self.strip_prefix(reg_path).as_ptr())
-        };
+        let _ = unsafe { (self.delete_key_fn)(self.hklm, self.strip_prefix(reg_path).as_ptr()) };
     }
 }
 

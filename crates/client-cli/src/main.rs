@@ -65,12 +65,7 @@ fn main() -> anyhow::Result<()> {
                 .enable_all()
                 .build()?;
             rt.block_on(socks::run_socks(
-                cli.server,
-                cli.token,
-                session,
-                listen,
-                poll_ms,
-                max_chan,
+                cli.server, cli.token, session, listen, poll_ms, max_chan,
             ))
         }
         None => tui::run(&cli.server, cli.token.as_deref()),

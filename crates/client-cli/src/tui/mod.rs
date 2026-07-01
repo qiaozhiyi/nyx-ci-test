@@ -25,7 +25,9 @@ use crossterm::event::{
     MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
@@ -42,11 +44,11 @@ mod panes;
 mod render;
 mod session_meta;
 mod topology;
-use render::render;
 use input::{
-    apply_scroll, filter_meta, move_popup_selection, parse_sleep_args,
-    popup_submit_target, Input, META_COMMANDS, PopupMove, ScrollDir, SleepSpec,
+    apply_scroll, filter_meta, move_popup_selection, parse_sleep_args, popup_submit_target, Input,
+    PopupMove, ScrollDir, SleepSpec, META_COMMANDS,
 };
+use render::render;
 
 /// Max lines kept in the event stream (older dropped).
 const STREAM_CAP: usize = 5000;
@@ -167,7 +169,10 @@ impl App {
 
     fn log(&mut self, text: &str, level: Level) {
         for line in text.lines() {
-            self.stream.push(LogLine { text: line.to_string(), level });
+            self.stream.push(LogLine {
+                text: line.to_string(),
+                level,
+            });
         }
         if self.stream.len() > STREAM_CAP {
             let drop = self.stream.len() - STREAM_CAP;
@@ -182,7 +187,11 @@ impl App {
             if !snap.sessions.is_empty() {
                 // keep selection valid
                 if self.selected.is_none_or(|i| i >= snap.sessions.len()) {
-                    self.selected = if snap.sessions.is_empty() { None } else { Some(0) };
+                    self.selected = if snap.sessions.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    };
                 }
                 self.sessions = snap.sessions;
                 // Refresh the age baseline for every live session so age_for()
@@ -230,66 +239,80 @@ impl App {
                                 self.log(&format!("! save creds: {e}"), Level::Err);
                             }
                             if added > 0 {
-                                self.log(&format!("credstore: +{added} new (total {})", self.creds.entries.len()), Level::Ok);
+                                self.log(
+                                    &format!(
+                                        "credstore: +{added} new (total {})",
+                                        self.creds.entries.len()
+                                    ),
+                                    Level::Ok,
+                                );
                             }
                             Overlay::Creds(rows)
                         }
                     }
-ParsedTable::Audit(rows) => {
-        if rows.is_empty() {
-            self.log("(audit log empty)", Level::Warn);
-            Overlay::None
-        } else {
-            Overlay::Audit(rows)
-        }
-    }
-    ParsedTable::Image { path, bytes } => {
-        if path.is_empty() {
-            self.log("(screenshot: no path)", Level::Warn);
-            Overlay::None
-        } else {
-            self.log(&format!("screenshot saved ({} bytes): {}", bytes, path), Level::Ok);
-            Overlay::Image(path, bytes)
-        }
-    }
-    ParsedTable::Profile {
-        loaded,
-        http_get_uri,
-        http_post_uri,
-        useragent,
-    } => {
-        if !loaded {
-            self.log("(profile: not loaded)", Level::Warn);
-            Overlay::None
-        } else {
-            self.log(
+                    ParsedTable::Audit(rows) => {
+                        if rows.is_empty() {
+                            self.log("(audit log empty)", Level::Warn);
+                            Overlay::None
+                        } else {
+                            Overlay::Audit(rows)
+                        }
+                    }
+                    ParsedTable::Image { path, bytes } => {
+                        if path.is_empty() {
+                            self.log("(screenshot: no path)", Level::Warn);
+                            Overlay::None
+                        } else {
+                            self.log(
+                                &format!("screenshot saved ({} bytes): {}", bytes, path),
+                                Level::Ok,
+                            );
+                            Overlay::Image(path, bytes)
+                        }
+                    }
+                    ParsedTable::Profile {
+                        loaded,
+                        http_get_uri,
+                        http_post_uri,
+                        useragent,
+                    } => {
+                        if !loaded {
+                            self.log("(profile: not loaded)", Level::Warn);
+                            Overlay::None
+                        } else {
+                            self.log(
                 &format!(
                     "profile: loaded: {loaded} http-get: {http_get_uri} http-post: {http_post_uri} useragent: {useragent}"
                 ),
                 Level::Info,
             );
-            Overlay::Profile { loaded, http_get_uri, http_post_uri, useragent }
-        }
-    }
-    ParsedTable::AuditVerify { ok, broken_at } => {
-        if ok {
-            self.log("audit chain: OK", Level::Ok);
-        } else if let Some(b) = broken_at {
-            self.log(&format!("audit chain: BROKEN at seq {b}"), Level::Err);
-        } else {
-            self.log("audit chain: UNKNOWN", Level::Warn);
-        }
-        Overlay::AuditVerify { ok, broken_at }
-    }
-    ParsedTable::Tasks(rows) => {
-        if rows.is_empty() {
-            self.log("(no queued tasks)", Level::Info);
-            Overlay::None
-        } else {
-            Overlay::Tasks(rows)
-        }
-    }
-};
+                            Overlay::Profile {
+                                loaded,
+                                http_get_uri,
+                                http_post_uri,
+                                useragent,
+                            }
+                        }
+                    }
+                    ParsedTable::AuditVerify { ok, broken_at } => {
+                        if ok {
+                            self.log("audit chain: OK", Level::Ok);
+                        } else if let Some(b) = broken_at {
+                            self.log(&format!("audit chain: BROKEN at seq {b}"), Level::Err);
+                        } else {
+                            self.log("audit chain: UNKNOWN", Level::Warn);
+                        }
+                        Overlay::AuditVerify { ok, broken_at }
+                    }
+                    ParsedTable::Tasks(rows) => {
+                        if rows.is_empty() {
+                            self.log("(no queued tasks)", Level::Info);
+                            Overlay::None
+                        } else {
+                            Overlay::Tasks(rows)
+                        }
+                    }
+                };
             }
         }
     }
@@ -326,39 +349,57 @@ ParsedTable::Audit(rows) => {
                     // 焦点左移
                     let full = Rect::new(0, 0, 80, 24);
                     self.focused_pane = self.pane_tree.clone().move_focus(
-                        self.focused_pane, panes::FocusDir::Left, full);
+                        self.focused_pane,
+                        panes::FocusDir::Left,
+                        full,
+                    );
                     return;
                 }
                 KeyCode::Char('j') => {
                     let full = Rect::new(0, 0, 80, 24);
                     self.focused_pane = self.pane_tree.clone().move_focus(
-                        self.focused_pane, panes::FocusDir::Down, full);
+                        self.focused_pane,
+                        panes::FocusDir::Down,
+                        full,
+                    );
                     return;
                 }
                 KeyCode::Char('k') => {
                     let full = Rect::new(0, 0, 80, 24);
                     self.focused_pane = self.pane_tree.clone().move_focus(
-                        self.focused_pane, panes::FocusDir::Up, full);
+                        self.focused_pane,
+                        panes::FocusDir::Up,
+                        full,
+                    );
                     return;
                 }
                 // Ctrl+L 已被 clear 占用，焦点右移用 Ctrl+f (forward)
                 KeyCode::Char('f') => {
                     let full = Rect::new(0, 0, 80, 24);
                     self.focused_pane = self.pane_tree.clone().move_focus(
-                        self.focused_pane, panes::FocusDir::Right, full);
+                        self.focused_pane,
+                        panes::FocusDir::Right,
+                        full,
+                    );
                     return;
                 }
                 KeyCode::Char('%') => {
                     // 垂直分割（左右）
                     let new_id = self.pane_tree.next_id();
-                    self.pane_tree = self.pane_tree.clone().split(self.focused_pane, panes::SplitDir::Vertical);
+                    self.pane_tree = self
+                        .pane_tree
+                        .clone()
+                        .split(self.focused_pane, panes::SplitDir::Vertical);
                     self.focused_pane = new_id;
                     return;
                 }
                 KeyCode::Char('"') => {
                     // 水平分割（上下）
                     let new_id = self.pane_tree.next_id();
-                    self.pane_tree = self.pane_tree.clone().split(self.focused_pane, panes::SplitDir::Horizontal);
+                    self.pane_tree = self
+                        .pane_tree
+                        .clone()
+                        .split(self.focused_pane, panes::SplitDir::Horizontal);
                     self.focused_pane = new_id;
                     return;
                 }
@@ -367,7 +408,12 @@ ParsedTable::Audit(rows) => {
                     let closed = self.focused_pane;
                     self.pane_tree = self.pane_tree.clone().close(closed);
                     // 焦点移到第一个叶
-                    self.focused_pane = self.pane_tree.leaves().first().map(|(id, _)| *id).unwrap_or(1);
+                    self.focused_pane = self
+                        .pane_tree
+                        .leaves()
+                        .first()
+                        .map(|(id, _)| *id)
+                        .unwrap_or(1);
                     return;
                 }
                 KeyCode::Char(c @ ('1'..='6')) => {
@@ -407,7 +453,9 @@ ParsedTable::Audit(rows) => {
                 // command, replace the input with the resolved command name and
                 // run it. This makes `/ls<Enter>` and `/s↑<Enter>` both work.
                 if self.popup_open {
-                    if let Some(name) = popup_submit_target(&self.input, self.popup_state.selected()) {
+                    if let Some(name) =
+                        popup_submit_target(&self.input, self.popup_state.selected())
+                    {
                         self.input = name.to_string();
                         self.cursor = self.input.len();
                     }
@@ -429,19 +477,28 @@ ParsedTable::Audit(rows) => {
                 } else {
                     // re-filter + clamp selection as the prefix shrinks
                     let filtered = filter_meta(&self.input);
-                    self.popup_state.select(if filtered.is_empty() { None } else { Some(0) });
+                    self.popup_state
+                        .select(if filtered.is_empty() { None } else { Some(0) });
                 }
             }
             // When the popup is open, ↑/↓ navigate the menu (opencode-style);
             // otherwise they walk input history.
             KeyCode::Up if self.popup_open => {
                 let filtered = filter_meta(&self.input);
-                let next = move_popup_selection(filtered.len(), self.popup_state.selected(), PopupMove::Up);
+                let next = move_popup_selection(
+                    filtered.len(),
+                    self.popup_state.selected(),
+                    PopupMove::Up,
+                );
                 self.popup_state.select(next);
             }
             KeyCode::Down if self.popup_open => {
                 let filtered = filter_meta(&self.input);
-                let next = move_popup_selection(filtered.len(), self.popup_state.selected(), PopupMove::Down);
+                let next = move_popup_selection(
+                    filtered.len(),
+                    self.popup_state.selected(),
+                    PopupMove::Down,
+                );
                 self.popup_state.select(next);
             }
             KeyCode::Up => {
@@ -492,7 +549,11 @@ ParsedTable::Audit(rows) => {
                     let filtered = filter_meta(&self.input);
                     // keep selection if still valid, else reset to top
                     let keep = self.popup_state.selected().filter(|&i| i < filtered.len());
-                    self.popup_state.select(keep.or(if filtered.is_empty() { None } else { Some(0) }));
+                    self.popup_state.select(keep.or(if filtered.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    }));
                 } else {
                     self.popup_open = false;
                 }
@@ -503,38 +564,34 @@ ParsedTable::Audit(rows) => {
 
     fn handle_overlay_key(&mut self, key: KeyEvent) {
         match &mut self.overlay {
-            Overlay::Sessions(state) => {
-                match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        let i = state.selected().unwrap_or(0);
-                        if i + 1 < self.sessions.len() {
-                            state.select(Some(i + 1));
-                        }
+            Overlay::Sessions(state) => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let i = state.selected().unwrap_or(0);
+                    if i + 1 < self.sessions.len() {
+                        state.select(Some(i + 1));
                     }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        let i = state.selected().unwrap_or(0);
-                        state.select(Some(i.saturating_sub(1)));
-                    }
-                    KeyCode::Enter => {
-                        if let Some(i) = state.selected() {
-                            self.selected = Some(i);
-                            if let Some(s) = self.sessions.get(i) {
-                                self.log(&format!("selected beacon {}", short(&s.id)), Level::Ok);
-                            }
-                        }
-                        self.overlay = Overlay::None;
-                    }
-                    KeyCode::Char('q') | KeyCode::Esc => self.overlay = Overlay::None,
-                    _ => {}
                 }
-            }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    let i = state.selected().unwrap_or(0);
+                    state.select(Some(i.saturating_sub(1)));
+                }
+                KeyCode::Enter => {
+                    if let Some(i) = state.selected() {
+                        self.selected = Some(i);
+                        if let Some(s) = self.sessions.get(i) {
+                            self.log(&format!("selected beacon {}", short(&s.id)), Level::Ok);
+                        }
+                    }
+                    self.overlay = Overlay::None;
+                }
+                KeyCode::Char('q') | KeyCode::Esc => self.overlay = Overlay::None,
+                _ => {}
+            },
             Overlay::None => {}
-            _ => {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => self.overlay = Overlay::None,
-                    _ => {}
-                }
-            }
+            _ => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => self.overlay = Overlay::None,
+                _ => {}
+            },
         }
     }
 
@@ -617,7 +674,10 @@ ParsedTable::Audit(rows) => {
 
     fn run_shell(&mut self, cmd: &str) {
         let Some(s) = self.current_session().cloned() else {
-            self.log("! no beacon selected — use /use <id> or /sessions", Level::Err);
+            self.log(
+                "! no beacon selected — use /use <id> or /sessions",
+                Level::Err,
+            );
             return;
         };
         self.log(&format!("[{}] $ {}", short(&s.id), cmd), Level::Info);
@@ -632,7 +692,10 @@ ParsedTable::Audit(rows) => {
         match name {
             "/help" => {
                 for m in META_COMMANDS {
-                    self.log(&format!("{:14} {:18} {}", m.name, m.args_hint, m.help), Level::Info);
+                    self.log(
+                        &format!("{:14} {:18} {}", m.name, m.args_hint, m.help),
+                        Level::Info,
+                    );
                 }
             }
             "/clear" => self.stream.clear(),
@@ -643,7 +706,10 @@ ParsedTable::Audit(rows) => {
                     Some("add") => {
                         let name = match parts.next() {
                             Some(n) => n.to_string(),
-                            None => { self.log("usage: /alias add <name> <command...>", Level::Warn); return; }
+                            None => {
+                                self.log("usage: /alias add <name> <command...>", Level::Warn);
+                                return;
+                            }
                         };
                         let cmd: String = parts.collect::<Vec<_>>().join(" ");
                         if cmd.is_empty() {
@@ -659,7 +725,10 @@ ParsedTable::Audit(rows) => {
                     Some("rm") | Some("del") | Some("remove") => {
                         let name = match parts.next() {
                             Some(n) => n.to_string(),
-                            None => { self.log("usage: /alias rm <name>", Level::Warn); return; }
+                            None => {
+                                self.log("usage: /alias rm <name>", Level::Warn);
+                                return;
+                            }
                         };
                         if self.config.del_alias(&name) {
                             let _ = self.config.save();
@@ -672,7 +741,10 @@ ParsedTable::Audit(rows) => {
                         if self.config.aliases.is_empty() {
                             self.log("(no aliases)", Level::Warn);
                         } else {
-                            let pairs: Vec<(String, String)> = self.config.aliases.iter()
+                            let pairs: Vec<(String, String)> = self
+                                .config
+                                .aliases
+                                .iter()
                                 .map(|(n, c)| (n.clone(), c.clone()))
                                 .collect();
                             for (n, c) in &pairs {
@@ -680,14 +752,23 @@ ParsedTable::Audit(rows) => {
                             }
                         }
                     }
-                    Some(other) => self.log(&format!("! /alias: unknown subcommand '{other}' (add/rm/list)"), Level::Err),
+                    Some(other) => self.log(
+                        &format!("! /alias: unknown subcommand '{other}' (add/rm/list)"),
+                        Level::Err,
+                    ),
                 }
             }
             "/topo" => {
                 // 用拓扑布局算法画 session 关系图。
-                let nodes: Vec<(String, String)> = self.sessions.iter()
+                let nodes: Vec<(String, String)> = self
+                    .sessions
+                    .iter()
                     .map(|s| {
-                        let label = self.sessions_meta.get(&s.id).alias.clone()
+                        let label = self
+                            .sessions_meta
+                            .get(&s.id)
+                            .alias
+                            .clone()
                             .unwrap_or_else(|| s.hostname.clone());
                         (s.id.clone(), label)
                     })
@@ -696,24 +777,43 @@ ParsedTable::Audit(rows) => {
                 if topo.nodes.is_empty() {
                     self.log("(no beacons to graph)", Level::Warn);
                 } else {
-                    self.log(&format!("╔══ topology: {} nodes, {} edges ═══", topo.nodes.len(), topo.edges.len()), Level::Info);
+                    self.log(
+                        &format!(
+                            "╔══ topology: {} nodes, {} edges ═══",
+                            topo.nodes.len(),
+                            topo.edges.len()
+                        ),
+                        Level::Info,
+                    );
                     // 按层分组渲染 ASCII 树
                     let max_y = topo.nodes.iter().map(|n| n.y).max().unwrap_or(0);
                     for layer in 0..=max_y {
-                        let layer_nodes: Vec<&topology::TopoNode> = topo.nodes.iter()
-                            .filter(|n| n.y == layer).collect();
-                        if layer_nodes.is_empty() { continue; }
+                        let layer_nodes: Vec<&topology::TopoNode> =
+                            topo.nodes.iter().filter(|n| n.y == layer).collect();
+                        if layer_nodes.is_empty() {
+                            continue;
+                        }
                         // 层标签
                         if layer == 0 {
                             self.log("║", Level::Info);
                         }
                         // 节点行
-                        let node_strs: Vec<String> = layer_nodes.iter().map(|n| {
-                            let mark = if n.is_beacon { "◆" } else { "◇" };
-                            let star = if self.sessions_meta.get(&n.id).favorite { " ★" } else { "" };
-                            format!("{mark} {}{star}", n.label)
-                        }).collect();
-                        self.log(&format!("║  L{}  {}", layer, node_strs.join("  ──→  ")), Level::Info);
+                        let node_strs: Vec<String> = layer_nodes
+                            .iter()
+                            .map(|n| {
+                                let mark = if n.is_beacon { "◆" } else { "◇" };
+                                let star = if self.sessions_meta.get(&n.id).favorite {
+                                    " ★"
+                                } else {
+                                    ""
+                                };
+                                format!("{mark} {}{star}", n.label)
+                            })
+                            .collect();
+                        self.log(
+                            &format!("║  L{}  {}", layer, node_strs.join("  ──→  ")),
+                            Level::Info,
+                        );
                         // 连接线（非最后一层）
                         if layer < max_y {
                             self.log("║  │", Level::Info);
@@ -724,7 +824,15 @@ ParsedTable::Audit(rows) => {
                         self.log("║", Level::Info);
                         self.log("║  edges:", Level::Info);
                         for e in &topo.edges {
-                            self.log(&format!("║    {} ─{}→ {}", short_topo(&topo, &e.from), e.label, short_topo(&topo, &e.to)), Level::Info);
+                            self.log(
+                                &format!(
+                                    "║    {} ─{}→ {}",
+                                    short_topo(&topo, &e.from),
+                                    e.label,
+                                    short_topo(&topo, &e.to)
+                                ),
+                                Level::Info,
+                            );
                         }
                     }
                     self.log("╚══════════════════════════════", Level::Info);
@@ -747,87 +855,109 @@ ParsedTable::Audit(rows) => {
                     if hits.is_empty() {
                         self.log(&format!("(no creds match '{query}')"), Level::Warn);
                     } else {
-                        let rows: Vec<CredEntry> = hits.iter().map(|c| CredEntry {
-                            source: c.source.clone(),
-                            principal: c.principal.clone(),
-                            kind: c.kind,
-                            secret: c.secret.clone(),
-                        }).collect();
+                        let rows: Vec<CredEntry> = hits
+                            .iter()
+                            .map(|c| CredEntry {
+                                source: c.source.clone(),
+                                principal: c.principal.clone(),
+                                kind: c.kind,
+                                secret: c.secret.clone(),
+                            })
+                            .collect();
                         self.log(&format!("{} match(es)", rows.len()), Level::Ok);
                         self.overlay = Overlay::Creds(rows);
                     }
                 } else if sub == "list" || sub.is_empty() {
                     if self.creds.entries.is_empty() {
-                        self.log("(credstore empty — run a cred dump BOF or /creds sync first)", Level::Warn);
+                        self.log(
+                            "(credstore empty — run a cred dump BOF or /creds sync first)",
+                            Level::Warn,
+                        );
                     } else {
-                        let rows: Vec<CredEntry> = self.creds.entries.iter().map(|c| CredEntry {
-                            source: c.source.clone(),
-                            principal: c.principal.clone(),
-                            kind: c.kind,
-                            secret: c.secret.clone(),
-                        }).collect();
+                        let rows: Vec<CredEntry> = self
+                            .creds
+                            .entries
+                            .iter()
+                            .map(|c| CredEntry {
+                                source: c.source.clone(),
+                                principal: c.principal.clone(),
+                                kind: c.kind,
+                                secret: c.secret.clone(),
+                            })
+                            .collect();
                         self.overlay = Overlay::Creds(rows);
                     }
-		} else if sub.starts_with("add ") {
-			let mut parts = sub.split_whitespace().skip(1);
-			let realm = parts.next().unwrap_or("").to_string();
-			let user = parts.next().unwrap_or("").to_string();
-			let kind = parts.next().unwrap_or("").to_string();
-			let secret = parts.next().unwrap_or("").to_string();
-			if realm.is_empty() || user.is_empty() || kind.is_empty() || secret.is_empty() {
-				self.log("usage: /creds add <realm> <user> <kind> <secret>", Level::Warn);
-				return;
-			}
-			self.send(crate::rest::Cmd::AddCred { realm, user, kind, secret });
-		} else if sub.starts_with("del ") {
-			let mut parts = sub.split_whitespace().skip(1);
-			let realm = parts.next().unwrap_or("").to_string();
-			let user = parts.next().unwrap_or("").to_string();
-			let kind = parts.next().unwrap_or("").to_string();
-			if realm.is_empty() || user.is_empty() || kind.is_empty() {
-				self.log("usage: /creds del <realm> <user> <kind>", Level::Warn);
-				return;
-			}
-			self.send(crate::rest::Cmd::DelCred { realm, user, kind });
-		} else if sub == "sync" || sub.starts_with("sync ") {
-			let reveal = sub.contains("reveal");
-			self.send(Cmd::FetchCreds { reveal });
-		} else {
-			// 当作 shell 命令跑，结果解析后入库
-			self.run_parsed_shell(sub, "/creds", ShellFor::Creds);
-		}
-	}
-	"/profile" => {
-		self.send(crate::rest::Cmd::FetchProfile);
-	}
-	"/chan" => {
-		let mut parts = args.split_whitespace();
-		let sub = match parts.next() {
-			Some(s) => s,
-			None => {
-				self.log("usage: /chan close <id>", Level::Warn);
-				return;
-			}
-		};
-		if sub == "close" {
-			let chan: u32 = match parts.next().and_then(|x| x.parse().ok()) {
-				Some(c) => c,
-				None => {
-					self.log("usage: /chan close <id>", Level::Warn);
-					return;
-				}
-			};
-			self.send(crate::rest::Cmd::CloseChan { chan });
-		} else {
-			self.log(&format!("! /chan: unknown subcommand '{sub}' (close)"), Level::Err);
-		}
-	}
+                } else if sub.starts_with("add ") {
+                    let mut parts = sub.split_whitespace().skip(1);
+                    let realm = parts.next().unwrap_or("").to_string();
+                    let user = parts.next().unwrap_or("").to_string();
+                    let kind = parts.next().unwrap_or("").to_string();
+                    let secret = parts.next().unwrap_or("").to_string();
+                    if realm.is_empty() || user.is_empty() || kind.is_empty() || secret.is_empty() {
+                        self.log(
+                            "usage: /creds add <realm> <user> <kind> <secret>",
+                            Level::Warn,
+                        );
+                        return;
+                    }
+                    self.send(crate::rest::Cmd::AddCred {
+                        realm,
+                        user,
+                        kind,
+                        secret,
+                    });
+                } else if sub.starts_with("del ") {
+                    let mut parts = sub.split_whitespace().skip(1);
+                    let realm = parts.next().unwrap_or("").to_string();
+                    let user = parts.next().unwrap_or("").to_string();
+                    let kind = parts.next().unwrap_or("").to_string();
+                    if realm.is_empty() || user.is_empty() || kind.is_empty() {
+                        self.log("usage: /creds del <realm> <user> <kind>", Level::Warn);
+                        return;
+                    }
+                    self.send(crate::rest::Cmd::DelCred { realm, user, kind });
+                } else if sub == "sync" || sub.starts_with("sync ") {
+                    let reveal = sub.contains("reveal");
+                    self.send(Cmd::FetchCreds { reveal });
+                } else {
+                    // 当作 shell 命令跑，结果解析后入库
+                    self.run_parsed_shell(sub, "/creds", ShellFor::Creds);
+                }
+            }
+            "/profile" => {
+                self.send(crate::rest::Cmd::FetchProfile);
+            }
+            "/chan" => {
+                let mut parts = args.split_whitespace();
+                let sub = match parts.next() {
+                    Some(s) => s,
+                    None => {
+                        self.log("usage: /chan close <id>", Level::Warn);
+                        return;
+                    }
+                };
+                if sub == "close" {
+                    let chan: u32 = match parts.next().and_then(|x| x.parse().ok()) {
+                        Some(c) => c,
+                        None => {
+                            self.log("usage: /chan close <id>", Level::Warn);
+                            return;
+                        }
+                    };
+                    self.send(crate::rest::Cmd::CloseChan { chan });
+                } else {
+                    self.log(
+                        &format!("! /chan: unknown subcommand '{sub}' (close)"),
+                        Level::Err,
+                    );
+                }
+            }
             "/audit" => {
-		let sub = args.trim();
-		if sub == "verify" {
-			self.send(crate::rest::Cmd::VerifyAudit);
-			return;
-		}
+                let sub = args.trim();
+                if sub == "verify" {
+                    self.send(crate::rest::Cmd::VerifyAudit);
+                    return;
+                }
                 // /audit                       — 全量审计日志
                 // /audit operator <name>       — 按操作员过滤
                 // /audit action <task|cred_*>  — 按动作过滤
@@ -842,11 +972,17 @@ ParsedTable::Audit(rows) => {
                         "operator" => operator = it.next().map(|s| s.to_string()),
                         "action" => action = it.next().map(|s| s.to_string()),
                         "limit" => limit = it.next().and_then(|s| s.parse().ok()),
-                        _ => { filters = Some(k.to_string()); }
+                        _ => {
+                            filters = Some(k.to_string());
+                        }
                     }
                 }
                 let _ = filters;
-                self.send(Cmd::FetchAudit { operator, action, limit });
+                self.send(Cmd::FetchAudit {
+                    operator,
+                    action,
+                    limit,
+                });
             }
             "/connect" => {
                 let mut parts = args.split_whitespace();
@@ -858,7 +994,7 @@ ParsedTable::Audit(rows) => {
                     }
                 };
                 let token = parts.next().map(|s| s.to_string());
-                self.log(&format!("connecting to {url} …", ), Level::Info);
+                self.log(&format!("connecting to {url} …",), Level::Info);
                 self.send(Cmd::Connect(url, token));
             }
             "/sessions" => {
@@ -867,25 +1003,31 @@ ParsedTable::Audit(rows) => {
                 } else {
                     // 支持过滤：/sessions tag:web star alias:db
                     let filter = session_meta::parse_filter(args);
-                    let filtered: Vec<usize> = self.sessions.iter().enumerate()
+                    let filtered: Vec<usize> = self
+                        .sessions
+                        .iter()
+                        .enumerate()
                         .filter(|(_, s)| {
                             let m = self.sessions_meta.get(&s.id);
                             let tags_ok = filter.tags.iter().all(|t| m.tags.iter().any(|x| x == t));
                             let star_ok = !filter.star_only || m.favorite;
-                            let alias_ok = filter.alias_contains.as_ref()
-                                .is_none_or(|sub| {
-                                    m.alias.as_ref().is_some_and(|a| a.contains(sub))
+                            let alias_ok = filter.alias_contains.as_ref().is_none_or(|sub| {
+                                m.alias.as_ref().is_some_and(|a| a.contains(sub))
                                     || s.hostname.contains(sub)
-                                });
+                            });
                             tags_ok && star_ok && alias_ok
                         })
                         .map(|(i, _)| i)
                         .collect();
                     if filtered.is_empty() {
-                        self.log(&format!("(no beacons match '{args}')", ), Level::Warn);
+                        self.log(&format!("(no beacons match '{args}')",), Level::Warn);
                     } else {
                         let mut st = ListState::default();
-                        st.select(self.selected.filter(|i| filtered.contains(i)).or(filtered.first().copied()));
+                        st.select(
+                            self.selected
+                                .filter(|i| filtered.contains(i))
+                                .or(filtered.first().copied()),
+                        );
                         self.overlay = Overlay::Sessions(st);
                     }
                 }
@@ -903,7 +1045,9 @@ ParsedTable::Audit(rows) => {
                 // 拉取当前会话排队中（未投递）的任务。worker-driven overlay，
                 // 仿 /audit。解决"任务下发后状态黑盒"——看不到是还在排队还是已投递。
                 match self.current_session() {
-                    Some(s) => self.send(Cmd::FetchTasks { session: s.id.clone() }),
+                    Some(s) => self.send(Cmd::FetchTasks {
+                        session: s.id.clone(),
+                    }),
                     None => self.log("! no beacon selected", Level::Warn),
                 }
             }
@@ -916,7 +1060,10 @@ ParsedTable::Audit(rows) => {
                 match self.sessions.iter().position(|s| s.id.starts_with(id)) {
                     Some(i) => {
                         self.selected = Some(i);
-                        self.log(&format!("selected beacon {}", short(&self.sessions[i].id)), Level::Ok);
+                        self.log(
+                            &format!("selected beacon {}", short(&self.sessions[i].id)),
+                            Level::Ok,
+                        );
                     }
                     None => self.log(&format!("! no beacon matching {id}"), Level::Err),
                 }
@@ -948,7 +1095,10 @@ ParsedTable::Audit(rows) => {
                     }
                 };
                 let name = std::path::Path::new(&file)
-                    .file_name().and_then(|n| n.to_str()).unwrap_or("bof").to_string();
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("bof")
+                    .to_string();
                 self.log(&format!("[{}] bof {} …", short(&s.id), name), Level::Info);
                 self.send(Cmd::Bof {
                     session: s.id,
@@ -984,7 +1134,10 @@ ParsedTable::Audit(rows) => {
                         return;
                     }
                 };
-                self.log(&format!("[{}] upload {local} -> {remote}", short(&s.id)), Level::Info);
+                self.log(
+                    &format!("[{}] upload {local} -> {remote}", short(&s.id)),
+                    Level::Info,
+                );
                 self.send(Cmd::Upload {
                     session: s.id,
                     name: remote,
@@ -1006,7 +1159,11 @@ ParsedTable::Audit(rows) => {
                 };
                 let local = parts.next().map(|s| s.to_string());
                 self.log(&format!("[{}] download {path}", short(&s.id)), Level::Info);
-                self.send(Cmd::Download { session: s.id, path, local });
+                self.send(Cmd::Download {
+                    session: s.id,
+                    path,
+                    local,
+                });
             }
             "/sleep" => {
                 let Some(s) = self.current_session().cloned() else {
@@ -1015,12 +1172,26 @@ ParsedTable::Audit(rows) => {
                 };
                 match parse_sleep_args(args) {
                     SleepSpec::Seconds(secs) => {
-                        self.send(Cmd::Sleep { session: s.id.clone(), seconds: secs, jitter_pct: 0 });
-                        self.log(&format!("[{}] tasked sleep {secs}s", short(&s.id)), Level::Info);
+                        self.send(Cmd::Sleep {
+                            session: s.id.clone(),
+                            seconds: secs,
+                            jitter_pct: 0,
+                        });
+                        self.log(
+                            &format!("[{}] tasked sleep {secs}s", short(&s.id)),
+                            Level::Info,
+                        );
                     }
                     SleepSpec::SecondsJitter(secs, jit) => {
-                        self.send(Cmd::Sleep { session: s.id.clone(), seconds: secs, jitter_pct: jit });
-                        self.log(&format!("[{}] tasked sleep {secs}s (±{jit}%)", short(&s.id)), Level::Info);
+                        self.send(Cmd::Sleep {
+                            session: s.id.clone(),
+                            seconds: secs,
+                            jitter_pct: jit,
+                        });
+                        self.log(
+                            &format!("[{}] tasked sleep {secs}s (±{jit}%)", short(&s.id)),
+                            Level::Info,
+                        );
                     }
                     SleepSpec::Usage(msg) => self.log(&msg, Level::Warn),
                 }
@@ -1034,76 +1205,116 @@ ParsedTable::Audit(rows) => {
             }
             "/screenshot" => {
                 let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err); return;
+                    self.log("! select a beacon first", Level::Err);
+                    return;
                 };
                 let monitor: u8 = args.trim().parse().unwrap_or(0);
                 self.log(&format!("[{}] screenshot…", short(&s.id)), Level::Info);
-                self.send(Cmd::Screenshot { session: s.id, monitor });
+                self.send(Cmd::Screenshot {
+                    session: s.id,
+                    monitor,
+                });
             }
             "/portscan" => {
                 let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err); return;
+                    self.log("! select a beacon first", Level::Err);
+                    return;
                 };
                 let mut it = args.split_whitespace();
                 let host = match it.next() {
                     Some(h) => h.to_string(),
-                    None => { self.log("usage: /portscan <host> <ports>", Level::Warn); return; }
+                    None => {
+                        self.log("usage: /portscan <host> <ports>", Level::Warn);
+                        return;
+                    }
                 };
                 let ports = match it.next() {
                     Some(p) => p.to_string(),
-                    None => { self.log("usage: /portscan <host> <ports>", Level::Warn); return; }
+                    None => {
+                        self.log("usage: /portscan <host> <ports>", Level::Warn);
+                        return;
+                    }
                 };
-                self.send(Cmd::Portscan { session: s.id, host, ports });
+                self.send(Cmd::Portscan {
+                    session: s.id,
+                    host,
+                    ports,
+                });
             }
             "/net" => {
                 let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err); return;
+                    self.log("! select a beacon first", Level::Err);
+                    return;
                 };
-                self.send(Cmd::Net { session: s.id, query: args.trim().to_string() });
+                self.send(Cmd::Net {
+                    session: s.id,
+                    query: args.trim().to_string(),
+                });
             }
             "/drive" => {
                 let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err); return;
+                    self.log("! select a beacon first", Level::Err);
+                    return;
                 };
                 self.send(Cmd::DriveInfo { session: s.id });
             }
             "/clipboard" => {
                 let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err); return;
+                    self.log("! select a beacon first", Level::Err);
+                    return;
                 };
                 self.send(Cmd::Clipboard { session: s.id });
             }
             "/env" => {
                 let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err); return;
+                    self.log("! select a beacon first", Level::Err);
+                    return;
                 };
-                self.send(Cmd::Env { session: s.id, name: args.trim().to_string() });
+                self.send(Cmd::Env {
+                    session: s.id,
+                    name: args.trim().to_string(),
+                });
             }
             "/keylog" => {
                 let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err); return;
+                    self.log("! select a beacon first", Level::Err);
+                    return;
                 };
                 let action = match args.trim() {
                     "start" => 0,
                     "stop" => 1,
                     "dump" | "" => 2,
-                    _ => { self.log("usage: /keylog <start|stop|dump>", Level::Warn); return; }
+                    _ => {
+                        self.log("usage: /keylog <start|stop|dump>", Level::Warn);
+                        return;
+                    }
                 };
-                self.send(Cmd::Keylog { session: s.id, action });
+                self.send(Cmd::Keylog {
+                    session: s.id,
+                    action,
+                });
             }
             "/screenwatch" => {
                 let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err); return;
+                    self.log("! select a beacon first", Level::Err);
+                    return;
                 };
                 let secs: u32 = match args.trim().parse() {
                     Ok(v) if v > 0 => v,
-                    _ => { self.log("usage: /screenwatch <secs>", Level::Warn); return; }
+                    _ => {
+                        self.log("usage: /screenwatch <secs>", Level::Warn);
+                        return;
+                    }
                 };
-                self.send(Cmd::Screenwatch { session: s.id, interval_secs: secs });
+                self.send(Cmd::Screenwatch {
+                    session: s.id,
+                    interval_secs: secs,
+                });
             }
             "/hashdump" => {
                 let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err); return;
+                    self.log("! select a beacon first", Level::Err);
+                    return;
                 };
                 // method 语义（跨后端统一）：0=SAM, 1=SYSTEM, 2=LSASS(deferred),
                 // 3=macOS-shadow。默认 sam(0)。`lsass`/`mac` 保留为兼容别名但
@@ -1114,36 +1325,56 @@ ParsedTable::Audit(rows) => {
                     "lsass" => 2,
                     "shadow" | "mac" => 3,
                     other => {
-                        self.log(&format!("! unknown hashdump method '{other}': use sam|system|shadow"), Level::Err);
+                        self.log(
+                            &format!("! unknown hashdump method '{other}': use sam|system|shadow"),
+                            Level::Err,
+                        );
                         return;
                     }
                 };
-                self.send(Cmd::Hashdump { session: s.id, method });
+                self.send(Cmd::Hashdump {
+                    session: s.id,
+                    method,
+                });
             }
             "/getuid" => {
                 let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err); return;
+                    self.log("! select a beacon first", Level::Err);
+                    return;
                 };
                 self.send(Cmd::GetUid { session: s.id });
             }
             "/inject" => {
                 let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err); return;
+                    self.log("! select a beacon first", Level::Err);
+                    return;
                 };
                 // /inject <method> <pid|spawn_to> <file.bin>
                 let mut parts = args.split_whitespace();
                 let method: u8 = match parts.next().and_then(|m| m.parse().ok()) {
                     Some(v) => v,
-                    None => { self.log("usage: /inject <method 0|1|2> <pid|spawn_to> <file>", Level::Warn); return; }
+                    None => {
+                        self.log(
+                            "usage: /inject <method 0|1|2> <pid|spawn_to> <file>",
+                            Level::Warn,
+                        );
+                        return;
+                    }
                 };
                 let target = parts.next().unwrap_or("").to_string();
                 let file = match parts.next() {
                     Some(f) => f.to_string(),
-                    None => { self.log("usage: /inject <method> <pid|spawn_to> <file>", Level::Warn); return; }
+                    None => {
+                        self.log("usage: /inject <method> <pid|spawn_to> <file>", Level::Warn);
+                        return;
+                    }
                 };
                 let data = match std::fs::read(&file) {
                     Ok(d) => d,
-                    Err(e) => { self.log(&format!("! read {file}: {e}"), Level::Err); return; }
+                    Err(e) => {
+                        self.log(&format!("! read {file}: {e}"), Level::Err);
+                        return;
+                    }
                 };
                 // Parse target: if numeric, it's a pid; otherwise spawn_to name.
                 let (pid, spawn_to) = match target.parse::<u32>() {
@@ -1161,22 +1392,30 @@ ParsedTable::Audit(rows) => {
             }
             "/steal" => {
                 let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err); return;
+                    self.log("! select a beacon first", Level::Err);
+                    return;
                 };
                 let pid: u32 = match args.trim().parse() {
                     Ok(v) => v,
-                    _ => { self.log("usage: /steal <pid>", Level::Warn); return; }
+                    _ => {
+                        self.log("usage: /steal <pid>", Level::Warn);
+                        return;
+                    }
                 };
                 self.send(Cmd::StealToken { session: s.id, pid });
             }
             "/make_token" => {
                 let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err); return;
+                    self.log("! select a beacon first", Level::Err);
+                    return;
                 };
                 // /make_token DOMAIN\user password [logon_type 1|2|3]
                 let parts: Vec<&str> = args.split_whitespace().collect();
                 if parts.len() < 2 {
-                    self.log("usage: /make_token DOMAIN\\user password [1|2|3]", Level::Err);
+                    self.log(
+                        "usage: /make_token DOMAIN\\user password [1|2|3]",
+                        Level::Err,
+                    );
                     return;
                 }
                 let du = parts[0];
@@ -1196,19 +1435,30 @@ ParsedTable::Audit(rows) => {
             }
             "/rev2self" => {
                 let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err); return;
+                    self.log("! select a beacon first", Level::Err);
+                    return;
                 };
                 self.send(Cmd::Rev2Self { session: s.id });
             }
             "/cd" | "/mkdir" | "/rm" => {
                 let (op, path) = self.fileop_one_arg(name, args);
                 let Some((s, p)) = path else { return };
-                self.send(Cmd::FileOp { session: s.id, op, path: p, dest: None });
+                self.send(Cmd::FileOp {
+                    session: s.id,
+                    op,
+                    path: p,
+                    dest: None,
+                });
             }
             "/mv" | "/cp" => {
                 let (op, parts) = self.fileop_two_args(name, args);
                 let Some((s, src, dst)) = parts else { return };
-                self.send(Cmd::FileOp { session: s.id, op, path: src, dest: Some(dst) });
+                self.send(Cmd::FileOp {
+                    session: s.id,
+                    op,
+                    path: src,
+                    dest: Some(dst),
+                });
             }
             "/pivot" => {
                 let Some(s) = self.current_session().cloned() else {
@@ -1218,13 +1468,23 @@ ParsedTable::Audit(rows) => {
                 let mut it = args.split_whitespace();
                 let host = match it.next() {
                     Some(h) => h.to_string(),
-                    None => { self.log("usage: /pivot <host> <port>", Level::Warn); return; }
+                    None => {
+                        self.log("usage: /pivot <host> <port>", Level::Warn);
+                        return;
+                    }
                 };
                 let port: u16 = match it.next().and_then(|p| p.parse().ok()) {
                     Some(p) => p,
-                    None => { self.log("usage: /pivot <host> <port>", Level::Warn); return; }
+                    None => {
+                        self.log("usage: /pivot <host> <port>", Level::Warn);
+                        return;
+                    }
                 };
-                self.send(Cmd::Pivot { session: s.id, host, port });
+                self.send(Cmd::Pivot {
+                    session: s.id,
+                    host,
+                    port,
+                });
             }
             "/socks" => {
                 let Some(s) = self.current_session().cloned() else {
@@ -1234,31 +1494,54 @@ ParsedTable::Audit(rows) => {
                 let mut it = args.split_whitespace();
                 let chan: u32 = match it.next().and_then(|x| x.parse().ok()) {
                     Some(c) => c,
-                    None => { self.log("usage: /socks <chan> <op> <addr> <port>", Level::Warn); return; }
+                    None => {
+                        self.log("usage: /socks <chan> <op> <addr> <port>", Level::Warn);
+                        return;
+                    }
                 };
                 let op: u8 = match it.next().and_then(|x| x.parse().ok()) {
                     Some(o) => o,
-                    None => { self.log("usage: /socks <chan> <op> <addr> <port>", Level::Warn); return; }
+                    None => {
+                        self.log("usage: /socks <chan> <op> <addr> <port>", Level::Warn);
+                        return;
+                    }
                 };
                 let addr = match it.next() {
                     Some(a) => a.to_string(),
-                    None => { self.log("usage: /socks <chan> <op> <addr> <port>", Level::Warn); return; }
+                    None => {
+                        self.log("usage: /socks <chan> <op> <addr> <port>", Level::Warn);
+                        return;
+                    }
                 };
                 let port: u16 = match it.next().and_then(|p| p.parse().ok()) {
                     Some(p) => p,
-                    None => { self.log("usage: /socks <chan> <op> <addr> <port>", Level::Warn); return; }
+                    None => {
+                        self.log("usage: /socks <chan> <op> <addr> <port>", Level::Warn);
+                        return;
+                    }
                 };
-                self.send(Cmd::Socks { session: s.id, chan, op, addr, port });
+                self.send(Cmd::Socks {
+                    session: s.id,
+                    chan,
+                    op,
+                    addr,
+                    port,
+                });
             }
             "/kill" => {
                 let Some(s) = self.current_session().cloned() else {
                     self.log("! select a beacon first", Level::Err);
                     return;
                 };
-                self.send(Cmd::Exit { session: s.id.clone() });
+                self.send(Cmd::Exit {
+                    session: s.id.clone(),
+                });
                 self.log(&format!("[{}] tasked exit", short(&s.id)), Level::Warn);
             }
-            other => self.log(&format!("! unknown command {other} — try /help", ), Level::Err),
+            other => self.log(
+                &format!("! unknown command {other} — try /help",),
+                Level::Err,
+            ),
         }
     }
 
@@ -1296,7 +1579,10 @@ ParsedTable::Audit(rows) => {
                 (args.to_string(), ParseAs::Creds)
             }
         };
-        self.log(&format!("[{}] {} $ {}", short(&s.id), label, cmd), Level::Info);
+        self.log(
+            &format!("[{}] {} $ {}", short(&s.id), label, cmd),
+            Level::Info,
+        );
         self.send(Cmd::Shell {
             session: s.id,
             args: cmd,
@@ -1305,7 +1591,11 @@ ParsedTable::Audit(rows) => {
     }
 
     /// 单参数文件操作（cd/mkdir/rm）的参数解析。返回 (op_string, Some((session, path)))。
-    fn fileop_one_arg(&mut self, name: &str, args: &str) -> (String, Option<(SessionView, String)>) {
+    fn fileop_one_arg(
+        &mut self,
+        name: &str,
+        args: &str,
+    ) -> (String, Option<(SessionView, String)>) {
         let op = name.trim_start_matches('/').to_string();
         let Some(s) = self.current_session().cloned() else {
             self.log("! select a beacon first", Level::Err);
@@ -1322,7 +1612,11 @@ ParsedTable::Audit(rows) => {
     }
 
     /// 双参数文件操作（mv/cp）的参数解析。返回 (op_string, Some((session, src, dst)))。
-    fn fileop_two_args(&mut self, name: &str, args: &str) -> (String, Option<(SessionView, String, String)>) {
+    fn fileop_two_args(
+        &mut self,
+        name: &str,
+        args: &str,
+    ) -> (String, Option<(SessionView, String, String)>) {
         let op = name.trim_start_matches('/').to_string();
         let Some(s) = self.current_session().cloned() else {
             self.log("! select a beacon first", Level::Err);
@@ -1394,7 +1688,11 @@ ParsedTable::Audit(rows) => {
             "/star" => {
                 self.sessions_meta.toggle_star(&full_id);
                 let m = self.sessions_meta.get(&full_id);
-                let msg = if m.favorite { "★ starred" } else { "unstarred" };
+                let msg = if m.favorite {
+                    "★ starred"
+                } else {
+                    "unstarred"
+                };
                 self.persist_meta(&full_id, msg);
             }
             "/note" => {
@@ -1444,7 +1742,9 @@ pub(super) fn fmt_age(secs: u64) -> String {
 
 /// 在拓扑图里显示节点的短标签（label 或 id 前 8 字符）。
 pub(super) fn short_topo(topo: &topology::Topology, id: &str) -> String {
-    topo.nodes.iter().find(|n| n.id == id)
+    topo.nodes
+        .iter()
+        .find(|n| n.id == id)
         .map(|n| n.label.clone())
         .unwrap_or_else(|| short(id))
 }
@@ -1465,7 +1765,11 @@ pub fn run(server: &str, token: Option<&str>) -> anyhow::Result<()> {
 
     // restore
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     result
 }
@@ -1516,17 +1820,29 @@ mod tests {
     fn classify_slash_is_meta_split() {
         assert_eq!(
             classify("/use abc123"),
-            Input::Meta { name: "/use".into(), args: "abc123".to_string() }
+            Input::Meta {
+                name: "/use".into(),
+                args: "abc123".to_string()
+            }
         );
         assert_eq!(
             classify("/LS /tmp"),
-            Input::Meta { name: "/ls".into(), args: "/tmp".to_string() }
+            Input::Meta {
+                name: "/ls".into(),
+                args: "/tmp".to_string()
+            }
         );
     }
 
     #[test]
     fn classify_meta_no_args() {
-        assert_eq!(classify("/ps"), Input::Meta { name: "/ps".into(), args: String::new() });
+        assert_eq!(
+            classify("/ps"),
+            Input::Meta {
+                name: "/ps".into(),
+                args: String::new()
+            }
+        );
     }
 
     // ---- filter_meta (pure) ----
@@ -1621,7 +1937,10 @@ mod tests {
     fn popup_submit_ambiguous_without_selection_is_none() {
         // "/s" matches several; no selection → can't resolve.
         let filtered = filter_meta("/s");
-        assert!(filtered.len() > 1, "test precondition: /s should be ambiguous");
+        assert!(
+            filtered.len() > 1,
+            "test precondition: /s should be ambiguous"
+        );
         assert_eq!(popup_submit_target("/s", None), None);
     }
 
@@ -1701,12 +2020,18 @@ mod tests {
 
     #[test]
     fn sleep_seconds_and_jitter() {
-        assert!(matches!(parse_sleep_args("5 20%"), SleepSpec::SecondsJitter(5, 20)));
+        assert!(matches!(
+            parse_sleep_args("5 20%"),
+            SleepSpec::SecondsJitter(5, 20)
+        ));
     }
 
     #[test]
     fn sleep_jitter_without_percent_sign() {
-        assert!(matches!(parse_sleep_args("5 20"), SleepSpec::SecondsJitter(5, 20)));
+        assert!(matches!(
+            parse_sleep_args("5 20"),
+            SleepSpec::SecondsJitter(5, 20)
+        ));
     }
 
     #[test]
@@ -1770,8 +2095,18 @@ mod tests {
     fn render_does_not_panic_with_files_overlay() {
         let mut app = fake_app();
         app.overlay = Overlay::Files(vec![
-            FileEntry { name: "notes.txt".into(), size: 1234, is_dir: false, modified: "May 21".into() },
-            FileEntry { name: "sub".into(), size: 0, is_dir: true, modified: "May 21".into() },
+            FileEntry {
+                name: "notes.txt".into(),
+                size: 1234,
+                is_dir: false,
+                modified: "May 21".into(),
+            },
+            FileEntry {
+                name: "sub".into(),
+                size: 0,
+                is_dir: true,
+                modified: "May 21".into(),
+            },
         ]);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
@@ -1782,8 +2117,15 @@ mod tests {
         use crate::types::SessionView;
         let mut app = fake_app();
         app.sessions = vec![SessionView {
-            id: "a1b2c3d4e5f6".into(), hostname: "host01".into(), username: "alice".into(),
-            os: "macos".into(), is_admin: 1, pending: 0, beacon_id: 7, arch: 4, pid: 1234,
+            id: "a1b2c3d4e5f6".into(),
+            hostname: "host01".into(),
+            username: "alice".into(),
+            os: "macos".into(),
+            is_admin: 1,
+            pending: 0,
+            beacon_id: 7,
+            arch: 4,
+            pid: 1234,
             ..Default::default()
         }];
         app.selected = Some(0);
@@ -1798,10 +2140,8 @@ mod tests {
     fn age_for_returns_baseline_when_just_recorded() {
         // 客户端推算：刚记下的基线 (now, 100)，elapsed≈0 → age_for 仍为 100。
         let mut app = fake_app();
-        app.age_baseline.insert(
-            "a1b2c3d4".into(),
-            (Instant::now(), 100),
-        );
+        app.age_baseline
+            .insert("a1b2c3d4".into(), (Instant::now(), 100));
         assert_eq!(app.age_for("a1b2c3d4"), 100);
     }
 
@@ -1826,13 +2166,21 @@ mod tests {
         use crate::types::SessionView;
         let mut app = fake_app();
         app.sessions = vec![SessionView {
-            id: "a1b2c3d4e5f6".into(), hostname: "host01".into(), username: "alice".into(),
-            os: "macos".into(), is_admin: 1, pending: 2, beacon_id: 7, arch: 4, pid: 1234,
+            id: "a1b2c3d4e5f6".into(),
+            hostname: "host01".into(),
+            username: "alice".into(),
+            os: "macos".into(),
+            is_admin: 1,
+            pending: 2,
+            beacon_id: 7,
+            arch: 4,
+            pid: 1234,
             ja3: Some("e7d705a3286e19ea42f587b344ee6865".into()),
             ja4: Some("t13d0400_002b_c8dd0a8e8c9b".into()),
             ..Default::default()
         }];
-        app.age_baseline.insert("a1b2c3d4e5f6".into(), (Instant::now(), 300));
+        app.age_baseline
+            .insert("a1b2c3d4e5f6".into(), (Instant::now(), 300));
         app.overlay = Overlay::SessionDetail("a1b2c3d4e5f6".into());
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
@@ -1859,13 +2207,20 @@ mod tests {
     #[test]
     fn render_does_not_panic_with_procs_and_creds_overlay() {
         let mut app = fake_app();
-        app.overlay = Overlay::Procs(vec![ProcEntry { pid: 1, ppid: 0, name: "launchd".into(), user: "root".into() }]);
+        app.overlay = Overlay::Procs(vec![ProcEntry {
+            pid: 1,
+            ppid: 0,
+            name: "launchd".into(),
+            user: "root".into(),
+        }]);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
 
         app.overlay = Overlay::Creds(vec![CredEntry {
-            source: "DEV".into(), principal: "alice".into(),
-            kind: crate::types::CredKind::Hash, secret: "8846f7".into(),
+            source: "DEV".into(),
+            principal: "alice".into(),
+            kind: crate::types::CredKind::Hash,
+            secret: "8846f7".into(),
         }]);
         term.draw(|f| render(&mut app, f)).unwrap();
     }
@@ -1898,12 +2253,20 @@ mod tests {
         let mut app = fake_app();
         assert_eq!(app.pane_tree.leaf_count(), 1);
         // split：split(target=1) 创建新叶 id=101
-        app.pane_tree = app.pane_tree.clone().split(app.focused_pane, panes::SplitDir::Vertical);
+        app.pane_tree = app
+            .pane_tree
+            .clone()
+            .split(app.focused_pane, panes::SplitDir::Vertical);
         app.focused_pane = 101;
         assert_eq!(app.pane_tree.leaf_count(), 2);
         // close 新叶
         app.pane_tree = app.pane_tree.clone().close(101);
-        app.focused_pane = app.pane_tree.leaves().first().map(|(id, _)| *id).unwrap_or(1);
+        app.focused_pane = app
+            .pane_tree
+            .leaves()
+            .first()
+            .map(|(id, _)| *id)
+            .unwrap_or(1);
         assert_eq!(app.pane_tree.leaf_count(), 1);
     }
 

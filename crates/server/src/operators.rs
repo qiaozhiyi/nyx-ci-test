@@ -68,8 +68,20 @@ impl OperatorRegistry {
     /// `true` when no operators are loaded (open mode — every request allowed
     /// as `_anonymous`). Used by `authenticate` to short-circuit to the legacy
     /// token / open paths.
+    ///
+    /// # Panic / poison safety
+    ///
+    /// A poisoned `RwLock` means a thread panicked while holding the write lock.
+    /// Treat poisoning as a security event: **fail CLOSED** and refuse all
+    /// authentication rather than silently falling back to open mode.
     pub fn is_open(&self) -> bool {
-        self.ops.read().map(|g| g.is_empty()).unwrap_or(true)
+        match self.ops.read() {
+            Ok(g) => g.is_empty(),
+            Err(_) => {
+                tracing::error!("operator registry RwLock poisoned — failing CLOSED");
+                false
+            }
+        }
     }
 
     /// Resolve a bearer value to an identity. Accepts `name:secret` (multi-op)

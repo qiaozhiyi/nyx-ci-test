@@ -9,10 +9,10 @@
 // ---- REST wire types + arch map (shared — see crates/rest) ---------------
 // Re-exported so the historical `crate::types::SessionView` / `arch_str` paths
 // keep resolving with zero call-site churn.
-pub use nyx_rest::{ResultView, SessionView, TaskAck};
 /// Re-export of the shared, protocol-correct arch mapping under this crate's
 /// historical name so existing call sites keep working.
 pub use nyx_rest::arch_name as arch_str;
+pub use nyx_rest::{ResultView, SessionView, TaskAck};
 
 // ---- domain models (parsed agent output) ----
 
@@ -65,4 +65,3 @@ impl CredKind {
 
 // Architecture tag from the `arch` wire byte — re-exported from `nyx_rest`
 // (see the `arch_str` alias above) so there is one protocol-correct mapping.
-

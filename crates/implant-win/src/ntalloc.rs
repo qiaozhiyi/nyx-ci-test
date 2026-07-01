@@ -69,17 +69,15 @@ pub fn enumerate_slabs() -> impl Iterator<Item = (*mut u8, usize)> {
 pub fn heap_bytes() -> usize {
     let count = unsafe { SLAB_COUNT };
     let table = unsafe { SLAB_TABLE };
-    (0..count)
-        .map(|i| table[i].len as usize)
-        .sum()
+    (0..count).map(|i| table[i].len as usize).sum()
 }
 
 type NtAllocVirtualMemory = unsafe extern "system" fn(
     *mut core::ffi::c_void,
     *mut *mut core::ffi::c_void,
-    usize,  // ZeroBits — BY VALUE (ULONG_PTR), not a pointer. Passing &mut here
-            // put a stack address in the ZeroBits argument register; the kernel
-            // validates ZeroBits ≤ 21 for user mode and rejected the allocation.
+    usize, // ZeroBits — BY VALUE (ULONG_PTR), not a pointer. Passing &mut here
+    // put a stack address in the ZeroBits argument register; the kernel
+    // validates ZeroBits ≤ 21 for user mode and rejected the allocation.
     *mut usize,
     u32,
     u32,
@@ -188,7 +186,10 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
                 let off = SLAB_BUMP.load(Ordering::Acquire);
                 let new_off = off + aligned as u64;
                 if new_off <= committed {
-                    if SLAB_BUMP.compare_exchange(off, new_off, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    if SLAB_BUMP
+                        .compare_exchange(off, new_off, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
                         return (base as usize + off as usize) as *mut u8;
                     }
                     continue;

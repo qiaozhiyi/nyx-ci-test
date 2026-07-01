@@ -33,7 +33,12 @@ pub enum PhysReadError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PageLevel { Pml4, Pdpt, Pd, Pt }
+pub enum PageLevel {
+    Pml4,
+    Pdpt,
+    Pd,
+    Pt,
+}
 
 /// Translate a virtual address to a physical address via the 4-level walk.
 ///
@@ -51,7 +56,9 @@ pub fn translate_va<P: PhysRead>(reader: &P, cr3: u64, va: u64) -> Result<u64, P
     let pml4_entry_pa = pml4_base + (pml4_idx as u64 * 8);
     let pml4_entry = read_u64(reader, pml4_entry_pa)?;
     if pml4_entry & 1 == 0 {
-        return Err(PhysReadError::NotPresent { level: PageLevel::Pml4 });
+        return Err(PhysReadError::NotPresent {
+            level: PageLevel::Pml4,
+        });
     }
 
     // PDPT: entry = PML4_entry & mask (bits 51:12, the PFN).
@@ -60,7 +67,9 @@ pub fn translate_va<P: PhysRead>(reader: &P, cr3: u64, va: u64) -> Result<u64, P
     let pdpt_entry_pa = pdpt_base + (pdpt_idx as u64 * 8);
     let pdpt_entry = read_u64(reader, pdpt_entry_pa)?;
     if pdpt_entry & 1 == 0 {
-        return Err(PhysReadError::NotPresent { level: PageLevel::Pdpt });
+        return Err(PhysReadError::NotPresent {
+            level: PageLevel::Pdpt,
+        });
     }
     // 1GB large page: PDPT entry bit 7 set → PA = entry[51:30] | VA[29:0].
     if pdpt_entry & (1 << 7) != 0 {
@@ -74,7 +83,9 @@ pub fn translate_va<P: PhysRead>(reader: &P, cr3: u64, va: u64) -> Result<u64, P
     let pd_entry_pa = pd_base + (pd_idx as u64 * 8);
     let pd_entry = read_u64(reader, pd_entry_pa)?;
     if pd_entry & 1 == 0 {
-        return Err(PhysReadError::NotPresent { level: PageLevel::Pd });
+        return Err(PhysReadError::NotPresent {
+            level: PageLevel::Pd,
+        });
     }
     // 2MB large page: PD entry bit 7 set → PA = entry[51:21] | VA[20:0].
     if pd_entry & (1 << 7) != 0 {
@@ -88,7 +99,9 @@ pub fn translate_va<P: PhysRead>(reader: &P, cr3: u64, va: u64) -> Result<u64, P
     let pt_entry_pa = pt_base + (pt_idx as u64 * 8);
     let pt_entry = read_u64(reader, pt_entry_pa)?;
     if pt_entry & 1 == 0 {
-        return Err(PhysReadError::NotPresent { level: PageLevel::Pt });
+        return Err(PhysReadError::NotPresent {
+            level: PageLevel::Pt,
+        });
     }
 
     // 4KB page: PA = entry[51:12] | VA[11:0].
@@ -100,7 +113,9 @@ pub fn translate_va<P: PhysRead>(reader: &P, cr3: u64, va: u64) -> Result<u64, P
 /// Read a little-endian u64 from physical memory via the reader.
 fn read_u64<P: PhysRead>(reader: &P, pa: u64) -> Result<u64, PhysReadError> {
     let mut buf = [0u8; 8];
-    reader.read_phys(pa, &mut buf).map_err(|_| PhysReadError::Ioctl)?;
+    reader
+        .read_phys(pa, &mut buf)
+        .map_err(|_| PhysReadError::Ioctl)?;
     Ok(u64::from_le_bytes(buf))
 }
 
@@ -170,11 +185,16 @@ mod tests {
         mem.insert(0x1000, (0x2000u64 | 1).to_le_bytes()); // PML4 present
         mem.insert(0x2000, (0x3000u64 | 1).to_le_bytes()); // PDPT present
         mem.insert(0x3000, (0x4000u64 | 1).to_le_bytes()); // PD present
-        // PT[0] NOT inserted → reads 0 → not present.
+                                                           // PT[0] NOT inserted → reads 0 → not present.
 
         let reader = MockPhys { mem };
         let r = translate_va(&reader, cr3, 0);
-        assert!(matches!(r, Err(PhysReadError::NotPresent { level: PageLevel::Pt })));
+        assert!(matches!(
+            r,
+            Err(PhysReadError::NotPresent {
+                level: PageLevel::Pt
+            })
+        ));
     }
 
     #[test]

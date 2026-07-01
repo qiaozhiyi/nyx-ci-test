@@ -125,7 +125,10 @@ pub unsafe extern "system" fn nyx_selftest_fs() {
     // bit 4: mkdir a scratch dir, then cd confirms it's a directory.
     // Use a unique-per-run name (pid-suffixed) so residual dirs from prior
     // runs don't make FILE_OPEN_IF race. mkdir is idempotent (FILE_OPEN_IF).
-    let dir = join(&join(&tmp, "\\nyx_fs_dir_"), &dec_u32(crate::hostinfo::pid()));
+    let dir = join(
+        &join(&tmp, "\\nyx_fs_dir_"),
+        &dec_u32(crate::hostinfo::pid()),
+    );
     let mk = crate::fs::do_fileop(rt, nyx_protocol::FileOp::Mkdir, &dir, None);
     if matches!(mk, Response::Ok) {
         let cd = crate::fs::do_fileop(rt, nyx_protocol::FileOp::Cd, &dir, None);
@@ -192,7 +195,10 @@ pub unsafe extern "system" fn nyx_selftest_screenshot() {
     let mut bmp = Vec::new();
     let mut saw_eof = false;
     for r in &chunks {
-        if let Response::FileChunk { name, data, eof, .. } = r {
+        if let Response::FileChunk {
+            name, data, eof, ..
+        } = r
+        {
             if name.as_bytes() == b"screenshot.bmp" {
                 bmp.extend_from_slice(data);
                 if *eof == 1 {
@@ -230,11 +236,18 @@ pub unsafe extern "system" fn nyx_selftest_screenshot_diag() {
     type GetSystemMetrics = unsafe extern "system" fn(i32) -> i32;
     type GetDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
     type CreateCompatibleDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
-    type CreateCompatibleBitmap =
-        unsafe extern "system" fn(*mut c_void, i32, i32) -> *mut c_void;
+    type CreateCompatibleBitmap = unsafe extern "system" fn(*mut c_void, i32, i32) -> *mut c_void;
     type SelectObject = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
     type BitBlt = unsafe extern "system" fn(
-        *mut c_void, i32, i32, i32, i32, *mut c_void, i32, i32, u32,
+        *mut c_void,
+        i32,
+        i32,
+        i32,
+        i32,
+        *mut c_void,
+        i32,
+        i32,
+        u32,
     ) -> i32;
 
     let mut mask: u32 = 0;
@@ -258,7 +271,9 @@ pub unsafe extern "system" fn nyx_selftest_screenshot_diag() {
     }
     mask |= 1 << 1;
     let gsm: GetSystemMetrics = unsafe {
-        core::mem::transmute(crate::resolve::export_addr(b"user32.dll", b"GetSystemMetrics").unwrap_or(0))
+        core::mem::transmute(
+            crate::resolve::export_addr(b"user32.dll", b"GetSystemMetrics").unwrap_or(0),
+        )
     };
     let w = unsafe { gsm(0) };
     let h = unsafe { gsm(1) };
@@ -275,7 +290,9 @@ pub unsafe extern "system" fn nyx_selftest_screenshot_diag() {
     }
     mask |= 1 << 3;
     let ccdc: CreateCompatibleDc = unsafe {
-        core::mem::transmute(crate::resolve::export_addr(b"gdi32.dll", b"CreateCompatibleDC").unwrap_or(0))
+        core::mem::transmute(
+            crate::resolve::export_addr(b"gdi32.dll", b"CreateCompatibleDC").unwrap_or(0),
+        )
     };
     let mem_dc = unsafe { ccdc(screen_dc) };
     if mem_dc.is_null() {
@@ -283,7 +300,9 @@ pub unsafe extern "system" fn nyx_selftest_screenshot_diag() {
     }
     mask |= 1 << 4;
     let ccb: CreateCompatibleBitmap = unsafe {
-        core::mem::transmute(crate::resolve::export_addr(b"gdi32.dll", b"CreateCompatibleBitmap").unwrap_or(0))
+        core::mem::transmute(
+            crate::resolve::export_addr(b"gdi32.dll", b"CreateCompatibleBitmap").unwrap_or(0),
+        )
     };
     let bmp = unsafe { ccb(screen_dc, w, h) };
     if bmp.is_null() {
@@ -291,7 +310,9 @@ pub unsafe extern "system" fn nyx_selftest_screenshot_diag() {
     }
     mask |= 1 << 5;
     let selobj: SelectObject = unsafe {
-        core::mem::transmute(crate::resolve::export_addr(b"gdi32.dll", b"SelectObject").unwrap_or(0))
+        core::mem::transmute(
+            crate::resolve::export_addr(b"gdi32.dll", b"SelectObject").unwrap_or(0),
+        )
     };
     let _prev = unsafe { selobj(mem_dc, bmp) };
     let bitblt: BitBlt = unsafe {
@@ -307,7 +328,13 @@ pub unsafe extern "system" fn nyx_selftest_screenshot_diag() {
     let need = (w as usize) * (h as usize) * 4;
     let mut pixels = crate::heap::vec![0u8; need.min(1 << 20)]; // cap probe at 1MB
     type GetDiBits = unsafe extern "system" fn(
-        *mut c_void, *mut c_void, u32, u32, *mut c_void, *mut u8, u32,
+        *mut c_void,
+        *mut c_void,
+        u32,
+        u32,
+        *mut c_void,
+        *mut u8,
+        u32,
     ) -> i32;
     let gdb: GetDiBits = unsafe {
         core::mem::transmute(crate::resolve::export_addr(b"gdi32.dll", b"GetDIBits").unwrap_or(0))
@@ -321,8 +348,13 @@ pub unsafe extern "system" fn nyx_selftest_screenshot_diag() {
     bi[14..16].copy_from_slice(&32u16.to_le_bytes()); // bpp
     let got = unsafe {
         gdb(
-            screen_dc, bmp, 0, h as u32, pixels.as_mut_ptr() as *mut c_void,
-            bi.as_mut_ptr(), 0,
+            screen_dc,
+            bmp,
+            0,
+            h as u32,
+            pixels.as_mut_ptr() as *mut c_void,
+            bi.as_mut_ptr(),
+            0,
         )
     };
     if got == 0 {
@@ -656,7 +688,10 @@ pub unsafe extern "system" fn nyx_linger() {
     // Sleep ~30s in 1s slices so we stay responsive if killed. NtDelayExecution
     // via the indirect runtime (exercises the trampoline page repeatedly).
     for _ in 0..30 {
-        let rt = match crate::syscalls::global() { Some(r) => r, None => break };
+        let rt = match crate::syscalls::global() {
+            Some(r) => r,
+            None => break,
+        };
         let interval: i64 = -10_000_000; // 1s in 100ns units (negative = relative)
         let interval_ptr = &interval as *const i64 as usize;
         let _ = unsafe { crate::syscalls::nt_delay_execution(rt, 0, interval_ptr) };
@@ -792,18 +827,18 @@ pub unsafe extern "system" fn nyx_selftest_inject_armed() {
         None => unsafe { exit(mask) },
     };
     let mut shellcode: [u8; 24] = [
-        0x31, 0xC9,                         // xor ecx, ecx
+        0x31, 0xC9, // xor ecx, ecx
         0xFF, 0x15, 0x08, 0x00, 0x00, 0x00, // call qword ptr [rip+8]
-        0xCC,                               // int3 guard
+        0xCC, // int3 guard
         0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // pad to offset 0x10
-        0, 0, 0, 0, 0, 0, 0, 0,             // ExitProcess pointer (patched)
+        0, 0, 0, 0, 0, 0, 0, 0, // ExitProcess pointer (patched)
     ];
     shellcode[0x10..0x18].copy_from_slice(&(exit_addr as u64).to_le_bytes());
 
     match unsafe { crate::inject::create_sacrificial("notepad.exe") } {
         Ok(proc) => {
             mask |= 1 << 0; // create_sacrificial Ok
-            // module_stomp creates its OWN sacrificial process; close this one.
+                            // module_stomp creates its OWN sacrificial process; close this one.
             if let Some(ch) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") {
                 type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
                 let close: CloseHandle = unsafe { core::mem::transmute(ch) };
@@ -825,7 +860,6 @@ pub unsafe extern "system" fn nyx_selftest_inject_armed() {
     crate::inject::set_modulestomp_enabled(false);
     unsafe { exit(mask) };
 }
-
 
 // Bits: 0 = 135 reports open, 1 = 1 reports closed, 2 = output non-empty.
 // ============================================================================
@@ -907,7 +941,10 @@ pub unsafe extern "system" fn nyx_selftest_env() {
             mask |= 1 << 0;
         }
     }
-    if matches!(crate::recon::do_env("NYX_DEFINITELY_UNSET_VAR_X9Z"), Response::Err(_)) {
+    if matches!(
+        crate::recon::do_env("NYX_DEFINITELY_UNSET_VAR_X9Z"),
+        Response::Err(_)
+    ) {
         mask |= 1 << 1;
     }
     unsafe { exit(mask) };
@@ -1144,12 +1181,39 @@ unsafe fn nt_create_file_stack_path(rt: &crate::syscalls::Runtime) -> i32 {
     // Build "\??\C:\Windows\Temp\nyx_stack_probe.txt" as a fixed stack array.
     // (Use a known-writable path.)
     let path: &[u16] = &[
-        '\\' as u16, '?' as u16, '?' as u16, '\\' as u16,
-        'C' as u16, ':' as u16, '\\' as u16, 'W' as u16, 'i' as u16, 'n' as u16,
-        'd' as u16, 'o' as u16, 'w' as u16, 's' as u16, '\\' as u16, 'T' as u16,
-        'e' as u16, 'm' as u16, 'p' as u16, '\\' as u16, 'n' as u16, 'y' as u16,
-        'x' as u16, '_' as u16, 's' as u16, 't' as u16, 'a' as u16, 'c' as u16,
-        'k' as u16, '.' as u16, 't' as u16, 'x' as u16, 't' as u16,
+        '\\' as u16,
+        '?' as u16,
+        '?' as u16,
+        '\\' as u16,
+        'C' as u16,
+        ':' as u16,
+        '\\' as u16,
+        'W' as u16,
+        'i' as u16,
+        'n' as u16,
+        'd' as u16,
+        'o' as u16,
+        'w' as u16,
+        's' as u16,
+        '\\' as u16,
+        'T' as u16,
+        'e' as u16,
+        'm' as u16,
+        'p' as u16,
+        '\\' as u16,
+        'n' as u16,
+        'y' as u16,
+        'x' as u16,
+        '_' as u16,
+        's' as u16,
+        't' as u16,
+        'a' as u16,
+        'c' as u16,
+        'k' as u16,
+        '.' as u16,
+        't' as u16,
+        'x' as u16,
+        't' as u16,
     ];
     // UnicodeString + ObjectAttributes + IoStatusBlock, all on the stack.
     #[repr(C)]
@@ -1172,7 +1236,11 @@ unsafe fn nt_create_file_stack_path(rt: &crate::syscalls::Runtime) -> i32 {
         status: i32,
         info: usize,
     }
-    let us = Ustr { len: (path.len() * 2) as u16, max: (path.len() * 2) as u16, buf: path.as_ptr() };
+    let us = Ustr {
+        len: (path.len() * 2) as u16,
+        max: (path.len() * 2) as u16,
+        buf: path.as_ptr(),
+    };
     let oa = Oa {
         length: core::mem::size_of::<Oa>() as u32,
         root: core::ptr::null_mut(),
@@ -1190,11 +1258,13 @@ unsafe fn nt_create_file_stack_path(rt: &crate::syscalls::Runtime) -> i32 {
             0x4000_0000, // GENERIC_WRITE
             &oa as *const Oa as usize,
             &mut iosb as *mut Iosb as usize,
-            0, 0,
+            0,
+            0,
             0x03, // FILE_SHARE_READ|WRITE
             5,    // FILE_OVERWRITE_IF
             0x60, // FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
-            0, 0,
+            0,
+            0,
         )
     };
     match st {
@@ -1218,65 +1288,186 @@ unsafe fn nt_create_file_via_export_stack() -> i32 {
     };
     type NtCreateFile = unsafe extern "system" fn(
         *mut *mut core::ffi::c_void, // FileHandle
-        u32,                          // DesiredAccess
-        *const core::ffi::c_void,     // ObjectAttributes
-        *mut core::ffi::c_void,       // IoStatusBlock
-        *mut core::ffi::c_void,       // AllocationSize
-        u32,                          // FileAttributes
-        u32,                          // ShareAccess
-        u32,                          // CreateDisposition
-        u32,                          // CreateOptions
-        *mut core::ffi::c_void,       // EaBuffer
-        u32,                          // EaLength
+        u32,                         // DesiredAccess
+        *const core::ffi::c_void,    // ObjectAttributes
+        *mut core::ffi::c_void,      // IoStatusBlock
+        *mut core::ffi::c_void,      // AllocationSize
+        u32,                         // FileAttributes
+        u32,                         // ShareAccess
+        u32,                         // CreateDisposition
+        u32,                         // CreateOptions
+        *mut core::ffi::c_void,      // EaBuffer
+        u32,                         // EaLength
     ) -> i32;
     let f: NtCreateFile = unsafe { core::mem::transmute(addr) };
     let path: &[u16] = &[
-        '\\' as u16, '?' as u16, '?' as u16, '\\' as u16,
-        'C' as u16, ':' as u16, '\\' as u16, 'W' as u16, 'i' as u16, 'n' as u16,
-        'd' as u16, 'o' as u16, 'w' as u16, 's' as u16, '\\' as u16, 'T' as u16,
-        'e' as u16, 'm' as u16, 'p' as u16, '\\' as u16, 'n' as u16, 'y' as u16,
-        'x' as u16, '_' as u16, 'e' as u16, 'x' as u16, 'p' as u16, '.' as u16,
-        't' as u16, 'x' as u16, 't' as u16,
+        '\\' as u16,
+        '?' as u16,
+        '?' as u16,
+        '\\' as u16,
+        'C' as u16,
+        ':' as u16,
+        '\\' as u16,
+        'W' as u16,
+        'i' as u16,
+        'n' as u16,
+        'd' as u16,
+        'o' as u16,
+        'w' as u16,
+        's' as u16,
+        '\\' as u16,
+        'T' as u16,
+        'e' as u16,
+        'm' as u16,
+        'p' as u16,
+        '\\' as u16,
+        'n' as u16,
+        'y' as u16,
+        'x' as u16,
+        '_' as u16,
+        'e' as u16,
+        'x' as u16,
+        'p' as u16,
+        '.' as u16,
+        't' as u16,
+        'x' as u16,
+        't' as u16,
     ];
     #[repr(C)]
-    struct Ustr { len: u16, max: u16, buf: *const u16 }
-    #[repr(C)]
-    struct Oa {
-        length: u32, root: *mut core::ffi::c_void, name: *const Ustr,
-        attrs: u32, sd: *mut core::ffi::c_void, qos: *mut core::ffi::c_void,
+    struct Ustr {
+        len: u16,
+        max: u16,
+        buf: *const u16,
     }
     #[repr(C)]
-    struct Iosb { status: i32, info: usize }
-    let us = Ustr { len: (path.len() * 2) as u16, max: (path.len() * 2) as u16, buf: path.as_ptr() };
+    struct Oa {
+        length: u32,
+        root: *mut core::ffi::c_void,
+        name: *const Ustr,
+        attrs: u32,
+        sd: *mut core::ffi::c_void,
+        qos: *mut core::ffi::c_void,
+    }
+    #[repr(C)]
+    struct Iosb {
+        status: i32,
+        info: usize,
+    }
+    let us = Ustr {
+        len: (path.len() * 2) as u16,
+        max: (path.len() * 2) as u16,
+        buf: path.as_ptr(),
+    };
     let oa = Oa {
-        length: core::mem::size_of::<Oa>() as u32, root: core::ptr::null_mut(),
-        name: &us, attrs: 0x40, sd: core::ptr::null_mut(), qos: core::ptr::null_mut(),
+        length: core::mem::size_of::<Oa>() as u32,
+        root: core::ptr::null_mut(),
+        name: &us,
+        attrs: 0x40,
+        sd: core::ptr::null_mut(),
+        qos: core::ptr::null_mut(),
     };
     // Try SEVERAL parameter combos; record each status so we can pinpoint which
     // flag组合 triggers INVALID_PARAMETER. Each line: "comboN = <status>\n".
     let mut report = String::new();
     let combos: &[(u32, u32, u32, u32, u32, &str)] = &[
         // (DesiredAccess, ShareAccess, Disp, CreateOptions, _, label)
-        (0x4000_0000, 0x03, 5, 0x60, 0, "A: GENERIC_W, OVERWRITE_IF, NONDIR|SYNC"),
-        (0x1200_0000, 0x07, 5, 0x60, 0, "B: READ|WRITE|SYNC, OVERWRITE_IF, NONDIR|SYNC"),
-        (0x4000_0000, 0x03, 2, 0x40, 0, "C: GENERIC_W, CREATE, NONDIR (no SYNC)"),
-        (0x8000_0000, 0x07, 1, 0x60, 0, "D: GENERIC_R, OPEN, NONDIR|SYNC"),
-        (0x100000, 0x07, 5, 0x60, 0, "E: SYNCHRONIZE only, OVERWRITE_IF, NONDIR|SYNC"),
-        (0x4000_0000, 0x03, 5, 0x20, 0, "F: GENERIC_W, OVERWRITE_IF, SYNC only (no NONDIR)"),
-        (0x100000, 0x03, 2, 0x21, 0, "G: SYNCHRONIZE, CREATE, DIR|SYNC (mkdir)"),
-        (0x100000, 0x07, 1, 0x60, 0, "H: SYNCHRONIZE, OPEN, NONDIR|SYNC (dl)"),
-        (0x10000, 0x07, 1, 0x60, 0, "I: DELETE, OPEN, NONDIR|SYNC (rm)"),
-        (0x110000, 0x07, 1, 0x60, 0, "J: DELETE|SYNC, OPEN, NONDIR|SYNC (rm fixed)"),
+        (
+            0x4000_0000,
+            0x03,
+            5,
+            0x60,
+            0,
+            "A: GENERIC_W, OVERWRITE_IF, NONDIR|SYNC",
+        ),
+        (
+            0x1200_0000,
+            0x07,
+            5,
+            0x60,
+            0,
+            "B: READ|WRITE|SYNC, OVERWRITE_IF, NONDIR|SYNC",
+        ),
+        (
+            0x4000_0000,
+            0x03,
+            2,
+            0x40,
+            0,
+            "C: GENERIC_W, CREATE, NONDIR (no SYNC)",
+        ),
+        (
+            0x8000_0000,
+            0x07,
+            1,
+            0x60,
+            0,
+            "D: GENERIC_R, OPEN, NONDIR|SYNC",
+        ),
+        (
+            0x100000,
+            0x07,
+            5,
+            0x60,
+            0,
+            "E: SYNCHRONIZE only, OVERWRITE_IF, NONDIR|SYNC",
+        ),
+        (
+            0x4000_0000,
+            0x03,
+            5,
+            0x20,
+            0,
+            "F: GENERIC_W, OVERWRITE_IF, SYNC only (no NONDIR)",
+        ),
+        (
+            0x100000,
+            0x03,
+            2,
+            0x21,
+            0,
+            "G: SYNCHRONIZE, CREATE, DIR|SYNC (mkdir)",
+        ),
+        (
+            0x100000,
+            0x07,
+            1,
+            0x60,
+            0,
+            "H: SYNCHRONIZE, OPEN, NONDIR|SYNC (dl)",
+        ),
+        (
+            0x10000,
+            0x07,
+            1,
+            0x60,
+            0,
+            "I: DELETE, OPEN, NONDIR|SYNC (rm)",
+        ),
+        (
+            0x110000,
+            0x07,
+            1,
+            0x60,
+            0,
+            "J: DELETE|SYNC, OPEN, NONDIR|SYNC (rm fixed)",
+        ),
     ];
     for &(access, share, disp, opts, _ea, label) in combos {
         let mut handle: *mut core::ffi::c_void = core::ptr::null_mut();
         let mut iosb = Iosb { status: 0, info: 0 };
         let st = unsafe {
             f(
-                &mut handle, access, &oa as *const Oa as *const core::ffi::c_void,
+                &mut handle,
+                access,
+                &oa as *const Oa as *const core::ffi::c_void,
                 &mut iosb as *mut Iosb as *mut core::ffi::c_void,
-                core::ptr::null_mut(), 0, share, disp, opts,
-                core::ptr::null_mut(), 0,
+                core::ptr::null_mut(),
+                0,
+                share,
+                disp,
+                opts,
+                core::ptr::null_mut(),
+                0,
             )
         };
         if st >= 0 {
@@ -1308,13 +1499,19 @@ pub unsafe extern "system" fn nyx_selftest_rm_probe() {
     let ok = matches!(r, Response::Output(_));
     // Verify the dir is gone by trying to cd into it (should fail).
     let after = crate::fs::do_fileop(
-        match ensure_rt() { Some(rt) => rt, None => unsafe { exit(0xE0) } },
+        match ensure_rt() {
+            Some(rt) => rt,
+            None => unsafe { exit(0xE0) },
+        },
         nyx_protocol::FileOp::Cd,
         "C:\\Windows\\Temp\\nyx_rm_probe",
         None,
     );
     let gone = matches!(after, Response::Err(_));
-    write_marker("nyx_rm_probe.txt", if gone { "GONE\n" } else { "STILL_EXISTS\n" });
+    write_marker(
+        "nyx_rm_probe.txt",
+        if gone { "GONE\n" } else { "STILL_EXISTS\n" },
+    );
     unsafe { exit(if ok && gone { 1 } else { 0 }) };
 }
 
@@ -1391,11 +1588,16 @@ pub unsafe extern "system" fn nyx_selftest_fs_probe() {
 fn write_marker(name: &str, content: &str) {
     use core::ffi::c_void;
     type CreateFileW = unsafe extern "system" fn(
-        *const u16, u32, u32, *mut c_void, u32, u32, *mut c_void,
+        *const u16,
+        u32,
+        u32,
+        *mut c_void,
+        u32,
+        u32,
+        *mut c_void,
     ) -> *mut c_void;
-    type WriteFile = unsafe extern "system" fn(
-        *mut c_void, *const u8, u32, *mut u32, *mut c_void,
-    ) -> i32;
+    type WriteFile =
+        unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
     let cf = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CreateFileW") };
     let wf = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"WriteFile") };
@@ -1416,12 +1618,30 @@ fn write_marker(name: &str, content: &str) {
     for (i, b) in fname.as_bytes().iter().enumerate() {
         path16[i] = *b as u16;
     }
-    let h = unsafe { cf(path16.as_ptr(), 0x4000_0000, 0, core::ptr::null_mut(), 2, 0, core::ptr::null_mut()) };
+    let h = unsafe {
+        cf(
+            path16.as_ptr(),
+            0x4000_0000,
+            0,
+            core::ptr::null_mut(),
+            2,
+            0,
+            core::ptr::null_mut(),
+        )
+    };
     if h.is_null() {
         return;
     }
     let mut written: u32 = 0;
-    let _ = unsafe { wf(h, content.as_ptr(), content.len() as u32, &mut written, core::ptr::null_mut()) };
+    let _ = unsafe {
+        wf(
+            h,
+            content.as_ptr(),
+            content.len() as u32,
+            &mut written,
+            core::ptr::null_mut(),
+        )
+    };
     let _ = unsafe { ch(h) };
 }
 
@@ -1562,11 +1782,16 @@ pub unsafe extern "system" fn nyx_selftest_rt_probe() {
     }
     // Step 3: Win32 file write (export-resolved, NOT via RT).
     type CreateFileW = unsafe extern "system" fn(
-        *const u16, u32, u32, *mut c_void, u32, u32, *mut c_void,
+        *const u16,
+        u32,
+        u32,
+        *mut c_void,
+        u32,
+        u32,
+        *mut c_void,
     ) -> *mut c_void;
-    type WriteFile = unsafe extern "system" fn(
-        *mut c_void, *const u8, u32, *mut u32, *mut c_void,
-    ) -> i32;
+    type WriteFile =
+        unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
     let cf: CreateFileW = match crate::resolve::export_addr(b"kernel32.dll", b"CreateFileW") {
         Some(a) => unsafe { core::mem::transmute(a) },
@@ -1586,13 +1811,31 @@ pub unsafe extern "system" fn nyx_selftest_rt_probe() {
     for (i, b) in path.as_bytes().iter().enumerate() {
         path16[i] = *b as u16;
     }
-    let h = unsafe { cf(path16.as_ptr(), 0x4000_0000, 0, core::ptr::null_mut(), 2, 0, core::ptr::null_mut()) };
+    let h = unsafe {
+        cf(
+            path16.as_ptr(),
+            0x4000_0000,
+            0,
+            core::ptr::null_mut(),
+            2,
+            0,
+            core::ptr::null_mut(),
+        )
+    };
     if h.is_null() {
         unsafe { exit(0xA6) }; // CreateFileW failed
     }
     let msg = b"RT_THEN_WRITE_OK\n";
     let mut written: u32 = 0;
-    let wok = unsafe { wf(h, msg.as_ptr(), msg.len() as u32, &mut written, core::ptr::null_mut()) };
+    let wok = unsafe {
+        wf(
+            h,
+            msg.as_ptr(),
+            msg.len() as u32,
+            &mut written,
+            core::ptr::null_mut(),
+        )
+    };
     let _ = unsafe { ch(h) };
     let _ = rt;
     unsafe { exit(if wok != 0 { 0xA7 } else { 0xA8 }) };
@@ -1624,11 +1867,16 @@ pub unsafe extern "system" fn nyx_selftest_alloc_probe() {
     // + WriteFile + CloseHandle, all export-resolved.
     use core::ffi::c_void;
     type CreateFileW = unsafe extern "system" fn(
-        *const u16, u32, u32, *mut c_void, u32, u32, *mut c_void,
+        *const u16,
+        u32,
+        u32,
+        *mut c_void,
+        u32,
+        u32,
+        *mut c_void,
     ) -> *mut c_void;
-    type WriteFile = unsafe extern "system" fn(
-        *mut c_void, *const u8, u32, *mut u32, *mut c_void,
-    ) -> i32;
+    type WriteFile =
+        unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
     let cf: CreateFileW = match crate::resolve::export_addr(b"kernel32.dll", b"CreateFileW") {
         Some(a) => unsafe { core::mem::transmute(a) },
@@ -1649,13 +1897,35 @@ pub unsafe extern "system" fn nyx_selftest_alloc_probe() {
         path16[i] = *b as u16;
     }
     // GENERIC_WRITE=0x40000000, CREATE_ALWAYS=2.
-    let h = unsafe { cf(path16.as_ptr(), 0x4000_0000, 0, core::ptr::null_mut(), 2, 0, core::ptr::null_mut()) };
+    let h = unsafe {
+        cf(
+            path16.as_ptr(),
+            0x4000_0000,
+            0,
+            core::ptr::null_mut(),
+            2,
+            0,
+            core::ptr::null_mut(),
+        )
+    };
     if h.is_null() {
         unsafe { exit(0xF3) }; // file create failed
     }
-    let msg: &[u8] = if mask == 3 { b"ALLOC_OK\n" } else { b"ALLOC_BAD\n" };
+    let msg: &[u8] = if mask == 3 {
+        b"ALLOC_OK\n"
+    } else {
+        b"ALLOC_BAD\n"
+    };
     let mut written: u32 = 0;
-    let _ = unsafe { wf(h, msg.as_ptr(), msg.len() as u32, &mut written, core::ptr::null_mut()) };
+    let _ = unsafe {
+        wf(
+            h,
+            msg.as_ptr(),
+            msg.len() as u32,
+            &mut written,
+            core::ptr::null_mut(),
+        )
+    };
     let _ = unsafe { ch(h) };
     let _ = v;
     unsafe { exit(mask) };
@@ -1819,9 +2089,7 @@ pub unsafe extern "system" fn nyx_selftest_transport() {
     // 127.0.0.1:1 — nothing listening. post_frame must return None (the beacon
     // loop's retry path), not crash. This exercises WinHTTP resolve + connect
     // + error handling.
-    let r = unsafe {
-        crate::transport::post_frame(b"127.0.0.1", 1, b"/beacon", b"x", false)
-    };
+    let r = unsafe { crate::transport::post_frame(b"127.0.0.1", 1, b"/beacon", b"x", false) };
     if r.is_none() {
         mask |= 1 << 0;
     }
@@ -1833,7 +2101,8 @@ pub unsafe extern "system" fn nyx_selftest_transport() {
 /// Read an env var (UTF-16) → ASCII-lossy String, or `fallback` if unset.
 fn env_var_or(name: &[u8], fallback: &str) -> String {
     type GetEnvVarW = unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
-    let gev: GetEnvVarW = match unsafe { export_addr(b"kernel32.dll", b"GetEnvironmentVariableW") } {
+    let gev: GetEnvVarW = match unsafe { export_addr(b"kernel32.dll", b"GetEnvironmentVariableW") }
+    {
         Some(a) => unsafe { core::mem::transmute(a) },
         None => return String::from(fallback),
     };
@@ -2022,24 +2291,50 @@ unsafe fn diag_byte(ch: u8) {
     path[name.len()] = 0;
 
     type FnCreate = unsafe extern "system" fn(
-        *const u16, u32, u32, *mut core::ffi::c_void, u32, u32, *mut core::ffi::c_void,
+        *const u16,
+        u32,
+        u32,
+        *mut core::ffi::c_void,
+        u32,
+        u32,
+        *mut core::ffi::c_void,
     ) -> *mut core::ffi::c_void;
     type FnWrite = unsafe extern "system" fn(
-        *mut core::ffi::c_void, *const u8, u32, *mut u32, *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *const u8,
+        u32,
+        *mut u32,
+        *mut core::ffi::c_void,
     ) -> i32;
     type FnClose = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
     type FnSetFP = unsafe extern "system" fn(*mut core::ffi::c_void, i32, *mut i32, u32) -> u32;
 
-    let Some(cf) = crate::resolve::export_addr(b"kernel32.dll", b"CreateFileW") else { return };
-    let Some(wf) = crate::resolve::export_addr(b"kernel32.dll", b"WriteFile") else { return };
-    let Some(ch_) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") else { return };
+    let Some(cf) = crate::resolve::export_addr(b"kernel32.dll", b"CreateFileW") else {
+        return;
+    };
+    let Some(wf) = crate::resolve::export_addr(b"kernel32.dll", b"WriteFile") else {
+        return;
+    };
+    let Some(ch_) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") else {
+        return;
+    };
     let create_file: FnCreate = core::mem::transmute(cf);
     let write_file: FnWrite = core::mem::transmute(wf);
     let close_handle: FnClose = core::mem::transmute(ch_);
 
     // OPEN_ALWAYS=4, FILE_SHARE_READ|WRITE=3, FILE_ATTRIBUTE_NORMAL=0x80
-    let h = create_file(path.as_ptr(), 4, 3, core::ptr::null_mut(), 4, 0x80, core::ptr::null_mut());
-    if h as isize == -1 { return; }
+    let h = create_file(
+        path.as_ptr(),
+        4,
+        3,
+        core::ptr::null_mut(),
+        4,
+        0x80,
+        core::ptr::null_mut(),
+    );
+    if h as isize == -1 {
+        return;
+    }
 
     // Seek to end (FILE_END=2).
     if let Some(sfp) = crate::resolve::export_addr(b"kernel32.dll", b"SetFilePointer") {
@@ -2059,16 +2354,27 @@ unsafe fn diag_byte(ch: u8) {
 /// alloc+free a page?  Exit 0x11 on failure.
 unsafe fn diag_test_resolve_va_vf() {
     diag_byte(b'a');
-    let Some(vf) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") else { exit(0x11); };
+    let Some(vf) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") else {
+        exit(0x11);
+    };
     diag_byte(b'b');
-    let Some(vfree) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualFree") else { exit(0x11); };
+    let Some(vfree) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualFree") else {
+        exit(0x11);
+    };
     diag_byte(b'c');
-    type VAlloc = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, u32) -> *mut core::ffi::c_void;
-    type VFree  = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32) -> i32;
+    type VAlloc = unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        usize,
+        u32,
+        u32,
+    ) -> *mut core::ffi::c_void;
+    type VFree = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32) -> i32;
     let vaf: VAlloc = core::mem::transmute(vf);
-    let vff: VFree  = core::mem::transmute(vfree);
+    let vff: VFree = core::mem::transmute(vfree);
     let p = vaf(core::ptr::null_mut(), 4096, 0x3000, 0x04);
-    if p.is_null() { exit(0x12); }
+    if p.is_null() {
+        exit(0x12);
+    }
     diag_byte(b'd');
     vff(p, 0, 0x8000);
     diag_byte(b'e');
@@ -2078,24 +2384,39 @@ unsafe fn diag_test_resolve_va_vf() {
 /// CONTEXT_DEBUG_REGISTERS.  Exit 0x2x on failure.
 unsafe fn diag_test_ctx_thread() {
     type FnCtx = unsafe extern "system" fn(usize, usize) -> i32;
-    let Some(ng) = crate::resolve::export_addr(b"ntdll.dll", b"NtGetContextThread") else { exit(0x21); };
+    let Some(ng) = crate::resolve::export_addr(b"ntdll.dll", b"NtGetContextThread") else {
+        exit(0x21);
+    };
     diag_byte(b'f');
-    let Some(ns) = crate::resolve::export_addr(b"ntdll.dll", b"NtSetContextThread") else { exit(0x21); };
+    let Some(ns) = crate::resolve::export_addr(b"ntdll.dll", b"NtSetContextThread") else {
+        exit(0x21);
+    };
     diag_byte(b'g');
     let ntgct: FnCtx = core::mem::transmute(ng);
     let ntsct: FnCtx = core::mem::transmute(ns);
     const NT: usize = 0xFFFF_FFFF_FFFF_FFFE;
 
     // Allocate ctx buffer.
-    let Some(vf) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") else { exit(0x21); };
-    let Some(vf2) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualFree") else { exit(0x21); };
-    type VAlloc = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, u32) -> *mut core::ffi::c_void;
-    type VFree  = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32) -> i32;
+    let Some(vf) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") else {
+        exit(0x21);
+    };
+    let Some(vf2) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualFree") else {
+        exit(0x21);
+    };
+    type VAlloc = unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        usize,
+        u32,
+        u32,
+    ) -> *mut core::ffi::c_void;
+    type VFree = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32) -> i32;
     let vaf: VAlloc = core::mem::transmute(vf);
-    let vff: VFree  = core::mem::transmute(vf2);
+    let vff: VFree = core::mem::transmute(vf2);
 
     let buf = vaf(core::ptr::null_mut(), 1232, 0x3000, 0x04);
-    if buf.is_null() { exit(0x22); }
+    if buf.is_null() {
+        exit(0x22);
+    }
     diag_byte(b'h');
     let base = buf as usize;
     core::ptr::write_bytes(buf as *mut u8, 0, 1232);
@@ -2121,7 +2442,10 @@ unsafe fn diag_test_ctx_thread() {
     };
     core::ptr::write_unaligned((base + 0x048) as *mut u64, nt_trace as u64);
     core::ptr::write_unaligned((base + 0x068) as *mut u64, 0u64);
-    core::ptr::write_unaligned((base + 0x070) as *mut u64, (_dr7 | 1) & !(3u64 << 16) & !(3u64 << 18));
+    core::ptr::write_unaligned(
+        (base + 0x070) as *mut u64,
+        (_dr7 | 1) & !(3u64 << 16) & !(3u64 << 18),
+    );
     core::ptr::write_unaligned((base + 0x030) as *mut u32, 0x0010_0010);
     diag_byte(b'k');
 
@@ -2246,9 +2570,13 @@ pub unsafe extern "system" fn nyx_selftest_resolve_forwarder() {
     let f: AddVEH = core::mem::transmute(aveh);
     let h = f(1, noop_veh_handler);
     if !h.is_null() {
-        if let Some(rveh) = crate::resolve::export_addr(b"kernel32.dll", b"RemoveVectoredExceptionHandler")
-            .or_else(|| crate::resolve::export_addr(b"kernelbase.dll", b"RemoveVectoredExceptionHandler"))
-        {
+        if let Some(rveh) = crate::resolve::export_addr(
+            b"kernel32.dll",
+            b"RemoveVectoredExceptionHandler",
+        )
+        .or_else(|| {
+            crate::resolve::export_addr(b"kernelbase.dll", b"RemoveVectoredExceptionHandler")
+        }) {
             type RemoveVEH = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
             let fr: RemoveVEH = core::mem::transmute(rveh);
             fr(h);
@@ -2258,4 +2586,3 @@ pub unsafe extern "system" fn nyx_selftest_resolve_forwarder() {
 
     exit(mask);
 }
-

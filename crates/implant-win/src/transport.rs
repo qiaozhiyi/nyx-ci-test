@@ -59,11 +59,21 @@ struct WinhttpFns {
 type HINTERNET = *mut c_void;
 type FOpen = unsafe extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> HINTERNET;
 type FConnect = unsafe extern "system" fn(HINTERNET, *const u16, u16, u32) -> HINTERNET;
-type FOpenReq = unsafe extern "system" fn(HINTERNET, *const u16, *const u16, *const u16, *const u16, *const *const u16, u32, u32) -> HINTERNET;
+type FOpenReq = unsafe extern "system" fn(
+    HINTERNET,
+    *const u16,
+    *const u16,
+    *const u16,
+    *const u16,
+    *const *const u16,
+    u32,
+    u32,
+) -> HINTERNET;
 /// WinHttpSetOption(hInternet, dwOption, lpBuffer, dwBufferLength) -> BOOL.
 /// Used to relax certificate validation for self-signed redirectors.
 type FSetOption = unsafe extern "system" fn(HINTERNET, u32, *const u8, u32) -> i32;
-type FSendReq = unsafe extern "system" fn(HINTERNET, *const u8, u32, *const u8, u32, u32, usize) -> i32;
+type FSendReq =
+    unsafe extern "system" fn(HINTERNET, *const u8, u32, *const u8, u32, u32, usize) -> i32;
 type FRecvResp = unsafe extern "system" fn(HINTERNET, *const c_void) -> i32;
 type FReadData = unsafe extern "system" fn(HINTERNET, *mut u8, u32, *mut u32) -> i32;
 type FClose = unsafe extern "system" fn(HINTERNET) -> i32;

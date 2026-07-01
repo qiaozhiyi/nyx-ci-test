@@ -8,62 +8,262 @@
 
 /// One entry in the `/` menu.
 pub(crate) struct MetaCmd {
-    pub name: &'static str,       // e.g. "/ls"
-    pub args_hint: &'static str,  // e.g. "[path]"
-    pub help: &'static str,       // short description
+    pub name: &'static str,      // e.g. "/ls"
+    pub args_hint: &'static str, // e.g. "[path]"
+    pub help: &'static str,      // short description
 }
 
 pub(crate) const META_COMMANDS: &[MetaCmd] = &[
-    MetaCmd { name: "/sessions", args_hint: "[filter]", help: "list beacons / switch" },
-    MetaCmd { name: "/connect", args_hint: "<url> [token]", help: "switch team server" },
-    MetaCmd { name: "/use", args_hint: "<id>", help: "select beacon by id prefix" },
-    MetaCmd { name: "/info", args_hint: "", help: "full details of current beacon" },
-    MetaCmd { name: "/rename", args_hint: "<id> <name>", help: "alias a beacon" },
-    MetaCmd { name: "/tag", args_hint: "<id> <tag>", help: "tag a beacon" },
-    MetaCmd { name: "/untag", args_hint: "<id> <tag>", help: "remove a tag" },
-    MetaCmd { name: "/star", args_hint: "<id>", help: "toggle favorite" },
-    MetaCmd { name: "/note", args_hint: "<id> <text>", help: "annotate a beacon" },
-    MetaCmd { name: "/alias", args_hint: "add|rm|list", help: "command aliases" },
-    MetaCmd { name: "/topo", args_hint: "", help: "topology graph" },
-    MetaCmd { name: "/ls", args_hint: "[path]", help: "list files (parsed)" },
-    MetaCmd { name: "/cd", args_hint: "<path>", help: "change dir" },
-    MetaCmd { name: "/mkdir", args_hint: "<path>", help: "make directory" },
-    MetaCmd { name: "/rm", args_hint: "<path>", help: "remove file/dir" },
-    MetaCmd { name: "/mv", args_hint: "<src> <dst>", help: "move/rename" },
-    MetaCmd { name: "/cp", args_hint: "<src> <dst>", help: "copy" },
-    MetaCmd { name: "/ps", args_hint: "", help: "list processes (parsed)" },
-    MetaCmd { name: "/creds", args_hint: "[list|find|sync|export]", help: "credentials vault" },
-    MetaCmd { name: "/creds add", args_hint: "<realm> <user> <kind> <secret>", help: "add credential to server vault" },
-    MetaCmd { name: "/creds del", args_hint: "<realm> <user> <kind>", help: "delete credential from server vault" },
-    MetaCmd { name: "/audit", args_hint: "[operator <n>] [action <a>] [limit <n>]", help: "server action audit log" },
-    MetaCmd { name: "/audit verify", args_hint: "", help: "verify audit log hash chain" },
-    MetaCmd { name: "/tasks", args_hint: "", help: "queued (undelivered) tasks for current beacon" },
-    MetaCmd { name: "/profile", args_hint: "", help: "fetch active C2 profile summary" },
-    MetaCmd { name: "/bof", args_hint: "<file> [args]", help: "run a BOF object" },
-    MetaCmd { name: "/upload", args_hint: "<local> <remote>", help: "upload a file" },
-    MetaCmd { name: "/download", args_hint: "<remote> [local]", help: "download a file" },
-    MetaCmd { name: "/sleep", args_hint: "<secs> [jitter%]", help: "set beacon interval" },
-    MetaCmd { name: "/ping", args_hint: "", help: "liveness probe" },
-    MetaCmd { name: "/screenshot", args_hint: "[monitor]", help: "capture screen" },
-    MetaCmd { name: "/portscan", args_hint: "<host> <ports>", help: "scan ports" },
-    MetaCmd { name: "/net", args_hint: "<ifconfig|arp|routes|conn>", help: "network info" },
-    MetaCmd { name: "/drive", args_hint: "", help: "disk info" },
-    MetaCmd { name: "/clipboard", args_hint: "", help: "read clipboard" },
-    MetaCmd { name: "/env", args_hint: "[name]", help: "environment vars" },
-    MetaCmd { name: "/keylog", args_hint: "<start|stop|dump>", help: "keystroke logger" },
-    MetaCmd { name: "/screenwatch", args_hint: "<secs>", help: "periodic screenshots" },
-    MetaCmd { name: "/hashdump", args_hint: "[sam|system|shadow]", help: "credential hashes (sam=0 system=1 shadow=3)" },
-    MetaCmd { name: "/getuid", args_hint: "", help: "current thread identity" },
-    MetaCmd { name: "/inject", args_hint: "<method> <pid|spawn_to> <file>", help: "inject shellcode (method 0=pool/stomp 1=threadless 2=stomp)" },
-    MetaCmd { name: "/steal", args_hint: "<pid>", help: "steal a process token" },
-    MetaCmd { name: "/make_token", args_hint: "<domain\\user> <password> [1|2|3]", help: "make a logon token" },
-    MetaCmd { name: "/rev2self", args_hint: "", help: "drop impersonation (keep token)" },
-    MetaCmd { name: "/pivot", args_hint: "<host> <port>", help: "outbound connect (P2P)" },
-    MetaCmd { name: "/socks", args_hint: "<chan> <op> <addr> <port>", help: "SOCKS relay" },
-    MetaCmd { name: "/chan close", args_hint: "<id>", help: "close relay channel" },
-    MetaCmd { name: "/kill", args_hint: "", help: "task the beacon to exit" },
-    MetaCmd { name: "/clear", args_hint: "", help: "clear the event stream" },
-    MetaCmd { name: "/help", args_hint: "", help: "show this list" },
+    MetaCmd {
+        name: "/sessions",
+        args_hint: "[filter]",
+        help: "list beacons / switch",
+    },
+    MetaCmd {
+        name: "/connect",
+        args_hint: "<url> [token]",
+        help: "switch team server",
+    },
+    MetaCmd {
+        name: "/use",
+        args_hint: "<id>",
+        help: "select beacon by id prefix",
+    },
+    MetaCmd {
+        name: "/info",
+        args_hint: "",
+        help: "full details of current beacon",
+    },
+    MetaCmd {
+        name: "/rename",
+        args_hint: "<id> <name>",
+        help: "alias a beacon",
+    },
+    MetaCmd {
+        name: "/tag",
+        args_hint: "<id> <tag>",
+        help: "tag a beacon",
+    },
+    MetaCmd {
+        name: "/untag",
+        args_hint: "<id> <tag>",
+        help: "remove a tag",
+    },
+    MetaCmd {
+        name: "/star",
+        args_hint: "<id>",
+        help: "toggle favorite",
+    },
+    MetaCmd {
+        name: "/note",
+        args_hint: "<id> <text>",
+        help: "annotate a beacon",
+    },
+    MetaCmd {
+        name: "/alias",
+        args_hint: "add|rm|list",
+        help: "command aliases",
+    },
+    MetaCmd {
+        name: "/topo",
+        args_hint: "",
+        help: "topology graph",
+    },
+    MetaCmd {
+        name: "/ls",
+        args_hint: "[path]",
+        help: "list files (parsed)",
+    },
+    MetaCmd {
+        name: "/cd",
+        args_hint: "<path>",
+        help: "change dir",
+    },
+    MetaCmd {
+        name: "/mkdir",
+        args_hint: "<path>",
+        help: "make directory",
+    },
+    MetaCmd {
+        name: "/rm",
+        args_hint: "<path>",
+        help: "remove file/dir",
+    },
+    MetaCmd {
+        name: "/mv",
+        args_hint: "<src> <dst>",
+        help: "move/rename",
+    },
+    MetaCmd {
+        name: "/cp",
+        args_hint: "<src> <dst>",
+        help: "copy",
+    },
+    MetaCmd {
+        name: "/ps",
+        args_hint: "",
+        help: "list processes (parsed)",
+    },
+    MetaCmd {
+        name: "/creds",
+        args_hint: "[list|find|sync|export]",
+        help: "credentials vault",
+    },
+    MetaCmd {
+        name: "/creds add",
+        args_hint: "<realm> <user> <kind> <secret>",
+        help: "add credential to server vault",
+    },
+    MetaCmd {
+        name: "/creds del",
+        args_hint: "<realm> <user> <kind>",
+        help: "delete credential from server vault",
+    },
+    MetaCmd {
+        name: "/audit",
+        args_hint: "[operator <n>] [action <a>] [limit <n>]",
+        help: "server action audit log",
+    },
+    MetaCmd {
+        name: "/audit verify",
+        args_hint: "",
+        help: "verify audit log hash chain",
+    },
+    MetaCmd {
+        name: "/tasks",
+        args_hint: "",
+        help: "queued (undelivered) tasks for current beacon",
+    },
+    MetaCmd {
+        name: "/profile",
+        args_hint: "",
+        help: "fetch active C2 profile summary",
+    },
+    MetaCmd {
+        name: "/bof",
+        args_hint: "<file> [args]",
+        help: "run a BOF object",
+    },
+    MetaCmd {
+        name: "/upload",
+        args_hint: "<local> <remote>",
+        help: "upload a file",
+    },
+    MetaCmd {
+        name: "/download",
+        args_hint: "<remote> [local]",
+        help: "download a file",
+    },
+    MetaCmd {
+        name: "/sleep",
+        args_hint: "<secs> [jitter%]",
+        help: "set beacon interval",
+    },
+    MetaCmd {
+        name: "/ping",
+        args_hint: "",
+        help: "liveness probe",
+    },
+    MetaCmd {
+        name: "/screenshot",
+        args_hint: "[monitor]",
+        help: "capture screen",
+    },
+    MetaCmd {
+        name: "/portscan",
+        args_hint: "<host> <ports>",
+        help: "scan ports",
+    },
+    MetaCmd {
+        name: "/net",
+        args_hint: "<ifconfig|arp|routes|conn>",
+        help: "network info",
+    },
+    MetaCmd {
+        name: "/drive",
+        args_hint: "",
+        help: "disk info",
+    },
+    MetaCmd {
+        name: "/clipboard",
+        args_hint: "",
+        help: "read clipboard",
+    },
+    MetaCmd {
+        name: "/env",
+        args_hint: "[name]",
+        help: "environment vars",
+    },
+    MetaCmd {
+        name: "/keylog",
+        args_hint: "<start|stop|dump>",
+        help: "keystroke logger",
+    },
+    MetaCmd {
+        name: "/screenwatch",
+        args_hint: "<secs>",
+        help: "periodic screenshots",
+    },
+    MetaCmd {
+        name: "/hashdump",
+        args_hint: "[sam|system|shadow]",
+        help: "credential hashes (sam=0 system=1 shadow=3)",
+    },
+    MetaCmd {
+        name: "/getuid",
+        args_hint: "",
+        help: "current thread identity",
+    },
+    MetaCmd {
+        name: "/inject",
+        args_hint: "<method> <pid|spawn_to> <file>",
+        help: "inject shellcode (method 0=pool/stomp 1=threadless 2=stomp)",
+    },
+    MetaCmd {
+        name: "/steal",
+        args_hint: "<pid>",
+        help: "steal a process token",
+    },
+    MetaCmd {
+        name: "/make_token",
+        args_hint: "<domain\\user> <password> [1|2|3]",
+        help: "make a logon token",
+    },
+    MetaCmd {
+        name: "/rev2self",
+        args_hint: "",
+        help: "drop impersonation (keep token)",
+    },
+    MetaCmd {
+        name: "/pivot",
+        args_hint: "<host> <port>",
+        help: "outbound connect (P2P)",
+    },
+    MetaCmd {
+        name: "/socks",
+        args_hint: "<chan> <op> <addr> <port>",
+        help: "SOCKS relay",
+    },
+    MetaCmd {
+        name: "/chan close",
+        args_hint: "<id>",
+        help: "close relay channel",
+    },
+    MetaCmd {
+        name: "/kill",
+        args_hint: "",
+        help: "task the beacon to exit",
+    },
+    MetaCmd {
+        name: "/clear",
+        args_hint: "",
+        help: "clear the event stream",
+    },
+    MetaCmd {
+        name: "/help",
+        args_hint: "",
+        help: "show this list",
+    },
 ];
 
 // ---- parsed input model ----------------------------------------------------
@@ -90,7 +290,10 @@ pub(crate) fn classify(raw: &str) -> Input {
             Some((n, r)) => (n.to_string(), r.trim().to_string()),
             None => (trimmed.to_string(), String::new()),
         };
-        Input::Meta { name: name.to_ascii_lowercase(), args: rest }
+        Input::Meta {
+            name: name.to_ascii_lowercase(),
+            args: rest,
+        }
     } else {
         Input::Shell(trimmed.to_string())
     }
@@ -245,7 +448,10 @@ pub(crate) fn mask(secret: &str) -> String {
 ///
 /// 优先级：空输入 → `!` 强制 shell → 别名命中 → 原 classify 逻辑。
 /// 纯函数，TDD 覆盖。
-pub(crate) fn classify_with(raw: &str, aliases: &std::collections::HashMap<String, String>) -> Input {
+pub(crate) fn classify_with(
+    raw: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Input {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Input::Empty;
@@ -284,7 +490,10 @@ mod tests {
 
     #[test]
     fn with_force_shell_strips_bang() {
-        assert_eq!(classify_with("!ls", &HashMap::new()), Input::Shell("ls".into()));
+        assert_eq!(
+            classify_with("!ls", &HashMap::new()),
+            Input::Shell("ls".into())
+        );
     }
 
     #[test]
@@ -306,14 +515,20 @@ mod tests {
         // alias ll=ls -la，输入 `ll /tmp` → `ls -la /tmp`（不吞参数）
         let mut a = HashMap::new();
         a.insert("ll".into(), "ls -la".into());
-        assert_eq!(classify_with("ll /tmp", &a), Input::Shell("ls -la /tmp".into()));
+        assert_eq!(
+            classify_with("ll /tmp", &a),
+            Input::Shell("ls -la /tmp".into())
+        );
     }
 
     #[test]
     fn with_alias_miss_falls_to_meta() {
         assert_eq!(
             classify_with("/sessions", &HashMap::new()),
-            Input::Meta { name: "/sessions".into(), args: String::new() }
+            Input::Meta {
+                name: "/sessions".into(),
+                args: String::new()
+            }
         );
     }
 

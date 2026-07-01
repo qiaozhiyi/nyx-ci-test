@@ -141,15 +141,18 @@ async fn poll_loop(ctx: Arc<BridgeCtx>, poll_ms: u64) {
     let mut tick = interval(Duration::from_millis(poll_ms.max(50)));
     loop {
         tick.tick().await;
-        let rows = match api::fetch_channel_results(&ctx.client, &ctx.server, &ctx.session, &ctx.token).await {
-            Ok(r) => r,
-            Err(e) => {
-                // Transient poll failure — don't tear down live channels; the
-                // implant sockets stay open; data resumes when the poll recovers.
-                eprintln!("[socks] poll error: {e}");
-                continue;
-            }
-        };
+        let rows =
+            match api::fetch_channel_results(&ctx.client, &ctx.server, &ctx.session, &ctx.token)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // Transient poll failure — don't tear down live channels; the
+                    // implant sockets stay open; data resumes when the poll recovers.
+                    eprintln!("[socks] poll error: {e}");
+                    continue;
+                }
+            };
         for row in rows {
             handle_row(&ctx, row);
         }
@@ -178,7 +181,9 @@ fn handle_row(ctx: &BridgeCtx, row: ResultView) {
                     match row.data_hex.as_deref().map(hex::decode).transpose() {
                         Ok(Some(d)) => {
                             if tx.try_send(ChannelMsg::Data(chan, d)).is_err() {
-                                eprintln!("[socks] chan {chan}: data backlog full (consumer slow?)");
+                                eprintln!(
+                                    "[socks] chan {chan}: data backlog full (consumer slow?)"
+                                );
                             }
                         }
                         Ok(None) => {} // empty data row — nothing to ferry
@@ -213,7 +218,10 @@ fn handle_row(ctx: &BridgeCtx, row: ResultView) {
         if let Some(ch) = chan {
             let tx = ctx.chans.lock().unwrap().by_chan.remove(&ch);
             if let Some(tx) = tx {
-                eprintln!("[socks] chan {ch}: connect failed (task {}): {}", row.task_id, row.text);
+                eprintln!(
+                    "[socks] chan {ch}: connect failed (task {}): {}",
+                    row.task_id, row.text
+                );
                 let _ = tx.try_send(ChannelMsg::Error(ch));
             }
         }

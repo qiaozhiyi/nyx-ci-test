@@ -10,7 +10,11 @@ use ratatui::style::{Color, Modifier, Style};
 // ---- base palette (Catppuccin Mocha) ----
 
 const fn rgb(hex: u32) -> Color {
-    Color::Rgb(((hex >> 16) & 0xff) as u8, ((hex >> 8) & 0xff) as u8, (hex & 0xff) as u8)
+    Color::Rgb(
+        ((hex >> 16) & 0xff) as u8,
+        ((hex >> 8) & 0xff) as u8,
+        (hex & 0xff) as u8,
+    )
 }
 
 /// Default text.
@@ -61,7 +65,10 @@ pub fn brand() -> Style {
 
 /// Bold + bright — used for the selected popup/overlay row.
 pub fn selected() -> Style {
-    Style::default().bg(ACCENT_DIM).fg(BASE).add_modifier(Modifier::BOLD)
+    Style::default()
+        .bg(ACCENT_DIM)
+        .fg(BASE)
+        .add_modifier(Modifier::BOLD)
 }
 
 /// Background fill for the status bar (header) strip.

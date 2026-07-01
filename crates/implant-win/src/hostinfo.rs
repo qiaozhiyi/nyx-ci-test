@@ -136,14 +136,13 @@ pub fn is_admin() -> u8 {
         return 0;
     }
     type GetCurrentProcess = unsafe extern "system" fn() -> *mut c_void;
-    type OpenProcessToken =
-        unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
+    type OpenProcessToken = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
     type GetTokenInformation = unsafe extern "system" fn(
         *mut c_void,
-        u32,            // TOKEN_INFORMATION_CLASS
-        *mut c_void,    // TokenInformation
-        u32,            // TokenInformationLength
-        *mut u32,       // ReturnLength
+        u32,         // TOKEN_INFORMATION_CLASS
+        *mut c_void, // TokenInformation
+        u32,         // TokenInformationLength
+        *mut u32,    // ReturnLength
     ) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
 

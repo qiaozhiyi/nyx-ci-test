@@ -164,7 +164,13 @@ unsafe fn add_channel(chan: u32, sock: usize) -> bool {
 unsafe fn add_channel_kind(chan: u32, sock: usize, listening: bool) -> bool {
     for i in 0..MAX_CHANNELS {
         if unsafe { CHANNELS[i] }.is_none() {
-            unsafe { CHANNELS[i] = Some(Channel { chan, sock, listening }) };
+            unsafe {
+                CHANNELS[i] = Some(Channel {
+                    chan,
+                    sock,
+                    listening,
+                })
+            };
             return true;
         }
     }
@@ -204,7 +210,13 @@ pub fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
     type SocketFn = unsafe extern "system" fn(i32, i32, i32) -> usize;
     type ConnectFn = unsafe extern "system" fn(usize, *const SockAddrIn, i32) -> i32;
     type IoctlSocket = unsafe extern "system" fn(usize, i32, *mut u32) -> i32;
-    type SelectFn = unsafe extern "system" fn(i32, *const FdSet, *const FdSet, *const FdSet, *const Timeval) -> i32;
+    type SelectFn = unsafe extern "system" fn(
+        i32,
+        *const FdSet,
+        *const FdSet,
+        *const FdSet,
+        *const Timeval,
+    ) -> i32;
     type InetAddr = unsafe extern "system" fn(*const u8) -> u32;
     type GetSockOpt = unsafe extern "system" fn(usize, i32, i32, *mut u8, *mut i32) -> i32;
 
@@ -260,8 +272,14 @@ pub fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
 
     let mut fdarr = [0usize; 64];
     fdarr[0] = s;
-    let wfds = FdSet { fd_count: 1, fd_array: fdarr };
-    let tv = Timeval { tv_sec: 5, tv_usec: 0 };
+    let wfds = FdSet {
+        fd_count: 1,
+        fd_array: fdarr,
+    };
+    let tv = Timeval {
+        tv_sec: 5,
+        tv_usec: 0,
+    };
     let n = unsafe { select_fn(0, core::ptr::null(), &wfds, core::ptr::null(), &tv) };
 
     let mut ok = false;
@@ -269,7 +287,13 @@ pub fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
         let mut err: i32 = 0;
         let mut errlen: i32 = 4;
         let r = unsafe {
-            getsockopt(s, SOL_SOCKET, SO_ERROR, &mut err as *mut i32 as *mut u8, &mut errlen)
+            getsockopt(
+                s,
+                SOL_SOCKET,
+                SO_ERROR,
+                &mut err as *mut i32 as *mut u8,
+                &mut errlen,
+            )
         };
         if r == 0 && err == 0 {
             ok = true;
@@ -280,7 +304,11 @@ pub fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
         // Keep the socket in the channel table (the relay owns it now). If the
         // table is full, close + report rather than leak.
         if unsafe { add_channel(chan, s) } {
-            return Response::Channel { chan, status: 0, data: Vec::new() };
+            return Response::Channel {
+                chan,
+                status: 0,
+                data: Vec::new(),
+            };
         }
         if let Some(fns) = unsafe { ensure_relay() } {
             let _ = unsafe { (fns.closesocket)(s) };
@@ -408,7 +436,15 @@ fn do_bind(addr: &str, port: u16, chan: u32) -> Response {
         let on: u32 = 1;
         const SOL_SOCKET: i32 = 0xFFFF;
         const SO_REUSEADDR: i32 = 0x0004;
-        let _ = unsafe { sso(s, SOL_SOCKET, SO_REUSEADDR, &on as *const u32 as *const u8, 4) };
+        let _ = unsafe {
+            sso(
+                s,
+                SOL_SOCKET,
+                SO_REUSEADDR,
+                &on as *const u32 as *const u8,
+                4,
+            )
+        };
     }
     let sa = SockAddrIn {
         sin_family: AF_INET as u16,
@@ -439,7 +475,11 @@ fn do_bind(addr: &str, port: u16, chan: u32) -> Response {
         close(s);
         return Response::Err(String::from("bind: channel table full"));
     }
-    Response::Channel { chan, status: 0, data: Vec::new() }
+    Response::Channel {
+        chan,
+        status: 0,
+        data: Vec::new(),
+    }
 }
 
 // ---- ChannelData / ChannelClose / pump ------------------------------------
@@ -464,13 +504,15 @@ pub fn channel_data(chan: u32, data: &[u8]) -> Response {
     // can reconnect.
     let mut sent = 0usize;
     while sent < data.len() {
-        let n = unsafe {
-            (fns.send)(c.sock, data[sent..].as_ptr(), (data.len() - sent) as i32, 0)
-        };
+        let n = unsafe { (fns.send)(c.sock, data[sent..].as_ptr(), (data.len() - sent) as i32, 0) };
         if n <= 0 {
             let _ = unsafe { (fns.closesocket)(c.sock) };
             unsafe { CHANNELS[idx] = None };
-            return Response::Channel { chan, status: 3, data: Vec::new() };
+            return Response::Channel {
+                chan,
+                status: 3,
+                data: Vec::new(),
+            };
         }
         sent += n as usize;
     }
@@ -550,7 +592,11 @@ pub fn pump_channels() -> Vec<Response> {
                 // BIND: the first accepted connection IS the relay). If the
                 // table is full, drop the peer.
                 if unsafe { add_channel_kind(c.chan, peer, false) } {
-                    out.push(Response::Channel { chan: c.chan, status: 0, data: Vec::new() });
+                    out.push(Response::Channel {
+                        chan: c.chan,
+                        status: 0,
+                        data: Vec::new(),
+                    });
                 } else {
                     let _ = unsafe { (fns.closesocket)(peer) };
                 }
@@ -561,13 +607,21 @@ pub fn pump_channels() -> Vec<Response> {
         let n = unsafe { (fns.recv)(c.sock, buf.as_mut_ptr(), buf.len() as i32, 0) };
         if n > 0 {
             let data: Vec<u8> = buf[..n as usize].to_vec();
-            out.push(Response::Channel { chan: c.chan, status: 1, data });
+            out.push(Response::Channel {
+                chan: c.chan,
+                status: 1,
+                data,
+            });
             i += 1;
         } else if n == 0 {
             // Peer closed the connection cleanly.
             let _ = unsafe { (fns.closesocket)(c.sock) };
             unsafe { CHANNELS[i] = None };
-            out.push(Response::Channel { chan: c.chan, status: 2, data: Vec::new() });
+            out.push(Response::Channel {
+                chan: c.chan,
+                status: 2,
+                data: Vec::new(),
+            });
             i += 1;
         } else {
             // SOCKET_ERROR: WOULDBLOCK = nothing to read (keep open); else tear down.
@@ -577,7 +631,11 @@ pub fn pump_channels() -> Vec<Response> {
             } else {
                 let _ = unsafe { (fns.closesocket)(c.sock) };
                 unsafe { CHANNELS[i] = None };
-                out.push(Response::Channel { chan: c.chan, status: 3, data: Vec::new() });
+                out.push(Response::Channel {
+                    chan: c.chan,
+                    status: 3,
+                    data: Vec::new(),
+                });
                 i += 1;
             }
         }

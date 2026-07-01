@@ -60,10 +60,11 @@ impl Writer {
     }
 
     /// A length-prefixed (u32 LE) byte blob.
-    pub fn blob(&mut self, v: &[u8]) {
-        self.u32(v.len() as u32);
-        self.buf.extend_from_slice(v);
-    }
+pub fn blob(&mut self, v: &[u8]) {
+    let len = v.len().try_into().expect("blob length exceeds u32");
+    self.u32(len);
+    self.buf.extend_from_slice(v);
+}
 
     /// A length-prefixed UTF-8 string.
     pub fn str(&mut self, v: &str) {

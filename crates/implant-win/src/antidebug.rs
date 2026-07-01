@@ -77,7 +77,8 @@ pub fn is_remote_debugged() -> bool {
     }
 
     // Export fallback.
-    let gcp: GetCurrentProcess = match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") } {
+    let gcp: GetCurrentProcess = match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") }
+    {
         Some(a) => unsafe { core::mem::transmute(a) },
         None => return false,
     };

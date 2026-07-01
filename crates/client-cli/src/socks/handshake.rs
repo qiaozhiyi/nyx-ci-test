@@ -13,7 +13,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// The target address a SOCKS5 client asked us to reach. The bridge passes the
@@ -119,14 +119,16 @@ where
 /// does not report a real bound address; the client only needs the success code).
 pub async fn write_reply_success<W: AsyncWrite + Unpin>(w: &mut W) -> Result<()> {
     // [VER=05][REP=00 success][RSV=00][ATYP=01 IPv4][BND.ADDR=0.0.0.0][BND.PORT=0]
-    w.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+    w.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
     Ok(())
 }
 
 /// Write a SOCKS5 failure reply with the given REP code (e.g. `0x05` connection
 /// refused, `0x07` command not supported).
 pub async fn write_reply_failure<W: AsyncWrite + Unpin>(w: &mut W, code: u8) -> Result<()> {
-    w.write_all(&[0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+    w.write_all(&[0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
     Ok(())
 }
 

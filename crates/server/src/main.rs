@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .unwrap_or(u64::MAX); // Err on the side of caution: kill-date active if clock is broken
         if now >= kd {
             anyhow::bail!("kill date {kd} has passed (now={now}); refusing to start");
         }

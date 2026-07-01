@@ -11,8 +11,8 @@
 
 #![cfg(target_os = "windows")]
 
-use core::ffi::c_void;
 use crate::KrwError;
+use core::ffi::c_void;
 
 type GetModuleHandleA = unsafe extern "system" fn(*const u8) -> *mut c_void;
 type GetProcAddress = unsafe extern "system" fn(*mut c_void, *const u8) -> *mut c_void;
@@ -59,11 +59,12 @@ pub unsafe fn resolve_sym<T>(module: &[u8], name: &[u8]) -> Result<T, KrwError> 
     if h.is_null() {
         // Module not mapped in this process yet (e.g. advapi32). Load it.
         // LoadLibraryA is a kernel32 export — kernel32 is always mapped.
-        let load_lib: LoadLibraryAFn =
-            unsafe { get_proc(kernel32_handle()?, b"LoadLibraryA")? };
+        let load_lib: LoadLibraryAFn = unsafe { get_proc(kernel32_handle()?, b"LoadLibraryA")? };
         h = unsafe { load_lib(mod_buf.as_ptr()) };
         if h.is_null() {
-            return Err(KrwError::Unavailable("GetModuleHandleA+LoadLibraryA returned null"));
+            return Err(KrwError::Unavailable(
+                "GetModuleHandleA+LoadLibraryA returned null",
+            ));
         }
     }
     let addr = unsafe { GetProcAddress(h, name_buf.as_ptr()) };
@@ -81,7 +82,9 @@ fn kernel32_handle() -> Result<*mut c_void, KrwError> {
     buf[..name.len()].copy_from_slice(name);
     let h = unsafe { GetModuleHandleA(buf.as_ptr()) };
     if h.is_null() {
-        Err(KrwError::Unavailable("kernel32.dll not mapped — not a Win32 process?"))
+        Err(KrwError::Unavailable(
+            "kernel32.dll not mapped — not a Win32 process?",
+        ))
     } else {
         Ok(h)
     }
@@ -107,19 +110,22 @@ mod tests {
     fn resolve_kernel32_createfilew() {
         // kernel32 is always loaded; CreateFileW always exists.
         let f: unsafe extern "system" fn(
-            *const u16, u32, u32, *mut c_void, u32, u32, *mut c_void,
-        ) -> *mut c_void = unsafe {
-            resolve_sym(b"kernel32.dll", b"CreateFileW").unwrap()
-        };
+            *const u16,
+            u32,
+            u32,
+            *mut c_void,
+            u32,
+            u32,
+            *mut c_void,
+        ) -> *mut c_void = unsafe { resolve_sym(b"kernel32.dll", b"CreateFileW").unwrap() };
         // We got a non-null function pointer — proves resolution works.
         let _ = f;
     }
 
     #[test]
     fn resolve_ntdll_ntquerysysteminformation() {
-        let f: unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32 = unsafe {
-            resolve_sym(b"ntdll.dll", b"NtQuerySystemInformation").unwrap()
-        };
+        let f: unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32 =
+            unsafe { resolve_sym(b"ntdll.dll", b"NtQuerySystemInformation").unwrap() };
         let _ = f;
     }
 

