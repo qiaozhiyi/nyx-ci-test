@@ -3,8 +3,7 @@ use nyx_agent_dev::Config;
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .init();
 
@@ -30,10 +29,13 @@ fn main() -> anyhow::Result<()> {
     // every relative FileOp return an error on the first beacon. "." (the
     // default) always exists, so this is effectively a no-op unless the
     // operator pointed NYX_WORKDIR somewhere new.
-    std::fs::create_dir_all(&work_dir)
-        .map_err(|e| anyhow::anyhow!("NYX_WORKDIR `{}` cannot be created: {e}", work_dir.display()))?;
-    let beacon_uri =
-        std::env::var("NYX_BEACON_URI").unwrap_or_else(|_| "/beacon".to_string());
+    std::fs::create_dir_all(&work_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "NYX_WORKDIR `{}` cannot be created: {e}",
+            work_dir.display()
+        )
+    })?;
+    let beacon_uri = std::env::var("NYX_BEACON_URI").unwrap_or_else(|_| "/beacon".to_string());
     // Optional Malleable C2 profile: when set, the agent inverts the profile's
     // server.output envelope on responses (mirrors the server's shaping).
     let profile = match std::env::var("NYX_PROFILE") {

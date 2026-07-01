@@ -116,31 +116,31 @@ impl Palette {
     /// window background — the v1 ramp was too tight and the card vanished.
     pub fn dark() -> Self {
         Palette {
-            bg:      rgb(0x11, 0x11, 0x11), // #111111  app bg (deepest)
-            panel:   rgb(0x1E, 0x1E, 0x1E), // #1E1E1E  side panels / log shell
-            elev:    rgb(0x25, 0x25, 0x26), // #252526  card / inputs / headers
-            row:     rgb(0x1E, 0x1E, 0x1E), // #1E1E1E  table row base
-            rowhov:  rgb(0x2A, 0x2D, 0x2E), // #2A2D2E  row hover
-            rowsel:  rgb(0x09, 0x47, 0x71), // #094771  row selected (cobalt blue)
-            border:  rgb(0x33, 0x33, 0x33), // #333333  hairline dividers (visible)
-            bar:     rgb(0x1E, 0x1E, 0x1E), // #1E1E1E  recessed bars
-            input:   rgb(0x2D, 0x2D, 0x2D), // #2D2D2D  input fill
-            input_b: rgb(0x70, 0x70, 0x70), // #707070  visible input border
-            grad_top: rgb(0x11, 0x11, 0x11), // #111111  bg gradient top
-            grad_bot: rgb(0x05, 0x05, 0x05), // #050505  bg gradient bottom
-            node:    rgb(0x66, 0x66, 0x66), // #666666  network nodes
-            line:    rgb(0x00, 0x7A, 0xCC), // #007ACC  network lines
-            glow:    rgb(0x00, 0x7A, 0xCC), // #007ACC  card neon glow (changed to blue)
+            bg: rgb(0x11, 0x11, 0x11),        // #111111  app bg (deepest)
+            panel: rgb(0x1E, 0x1E, 0x1E),     // #1E1E1E  side panels / log shell
+            elev: rgb(0x25, 0x25, 0x26),      // #252526  card / inputs / headers
+            row: rgb(0x1E, 0x1E, 0x1E),       // #1E1E1E  table row base
+            rowhov: rgb(0x2A, 0x2D, 0x2E),    // #2A2D2E  row hover
+            rowsel: rgb(0x09, 0x47, 0x71),    // #094771  row selected (cobalt blue)
+            border: rgb(0x33, 0x33, 0x33),    // #333333  hairline dividers (visible)
+            bar: rgb(0x1E, 0x1E, 0x1E),       // #1E1E1E  recessed bars
+            input: rgb(0x2D, 0x2D, 0x2D),     // #2D2D2D  input fill
+            input_b: rgb(0x70, 0x70, 0x70),   // #707070  visible input border
+            grad_top: rgb(0x11, 0x11, 0x11),  // #111111  bg gradient top
+            grad_bot: rgb(0x05, 0x05, 0x05),  // #050505  bg gradient bottom
+            node: rgb(0x66, 0x66, 0x66),      // #666666  network nodes
+            line: rgb(0x00, 0x7A, 0xCC),      // #007ACC  network lines
+            glow: rgb(0x00, 0x7A, 0xCC),      // #007ACC  card neon glow (changed to blue)
             btn_grad2: rgb(0x00, 0x50, 0xA0), // #0050A0  button gradient end
-            primary: rgb(0xCC, 0xCC, 0xCC), // #CCCCCC  primary text
-            second:  rgb(0xA0, 0xA0, 0xA0), // #A0A0A0  secondary text
-            muted:   rgb(0x80, 0x80, 0x80), // #808080  muted text
-            accent:  rgb(0x00, 0x7A, 0xCC), // #007ACC  Cobalt blue
-            acchov:  rgb(0x00, 0x98, 0xFF), // #0098FF  accent hover
-            success: rgb(0x00, 0xC8, 0x00), // #00C800  sharp hacker green
-            danger:  rgb(0xF4, 0x43, 0x36), // #F44336  bright red
-            warn:    rgb(0xFF, 0xC1, 0x07), // #FFC107  amber
-            info:    rgb(0x56, 0x9C, 0xD6), // #569CD6  light blue
+            primary: rgb(0xCC, 0xCC, 0xCC),   // #CCCCCC  primary text
+            second: rgb(0xA0, 0xA0, 0xA0),    // #A0A0A0  secondary text
+            muted: rgb(0x80, 0x80, 0x80),     // #808080  muted text
+            accent: rgb(0x00, 0x7A, 0xCC),    // #007ACC  Cobalt blue
+            acchov: rgb(0x00, 0x98, 0xFF),    // #0098FF  accent hover
+            success: rgb(0x00, 0xC8, 0x00),   // #00C800  sharp hacker green
+            danger: rgb(0xF4, 0x43, 0x36),    // #F44336  bright red
+            warn: rgb(0xFF, 0xC1, 0x07),      // #FFC107  amber
+            info: rgb(0x56, 0x9C, 0xD6),      // #569CD6  light blue
         }
     }
 
@@ -148,31 +148,31 @@ impl Palette {
     /// theme toggle still reads as the same product family.
     pub fn light() -> Self {
         Palette {
-            bg:      rgb(0xD0, 0xD0, 0xD0), // #D0D0D0
-            panel:   rgb(0xF0, 0xF0, 0xF0), // #F0F0F0
-            elev:    rgb(0xEA, 0xEA, 0xEA), // #EAEAEA
-            row:     rgb(0xFF, 0xFF, 0xFF), // #FFFFFF
-            rowhov:  rgb(0xE8, 0xF0, 0xFA), // #E8F0FA
-            rowsel:  rgb(0x3B, 0x72, 0xAB), // #3B72AB
-            border:  rgb(0xA0, 0xA0, 0xA0), // #A0A0A0
-            bar:     rgb(0xE0, 0xE0, 0xE0), // #E0E0E0
-            input:   rgb(0xFF, 0xFF, 0xFF), // #FFFFFF
-            input_b: rgb(0x80, 0x80, 0x80), // #808080
-            grad_top: rgb(0xF0, 0xF0, 0xF0), // #F0F0F0
-            grad_bot: rgb(0xD0, 0xD0, 0xD0), // #D0D0D0
-            node:    rgb(0x3B, 0x72, 0xAB), // #3B72AB
-            line:    rgb(0xA0, 0xA0, 0xA0), // #A0A0A0
-            glow:    rgb(0x3B, 0x72, 0xAB), // #3B72AB
+            bg: rgb(0xD0, 0xD0, 0xD0),        // #D0D0D0
+            panel: rgb(0xF0, 0xF0, 0xF0),     // #F0F0F0
+            elev: rgb(0xEA, 0xEA, 0xEA),      // #EAEAEA
+            row: rgb(0xFF, 0xFF, 0xFF),       // #FFFFFF
+            rowhov: rgb(0xE8, 0xF0, 0xFA),    // #E8F0FA
+            rowsel: rgb(0x3B, 0x72, 0xAB),    // #3B72AB
+            border: rgb(0xA0, 0xA0, 0xA0),    // #A0A0A0
+            bar: rgb(0xE0, 0xE0, 0xE0),       // #E0E0E0
+            input: rgb(0xFF, 0xFF, 0xFF),     // #FFFFFF
+            input_b: rgb(0x80, 0x80, 0x80),   // #808080
+            grad_top: rgb(0xF0, 0xF0, 0xF0),  // #F0F0F0
+            grad_bot: rgb(0xD0, 0xD0, 0xD0),  // #D0D0D0
+            node: rgb(0x3B, 0x72, 0xAB),      // #3B72AB
+            line: rgb(0xA0, 0xA0, 0xA0),      // #A0A0A0
+            glow: rgb(0x3B, 0x72, 0xAB),      // #3B72AB
             btn_grad2: rgb(0x2E, 0x5B, 0x8A), // #2E5B8A
-            primary: rgb(0x00, 0x00, 0x00), // #000000
-            second:  rgb(0x33, 0x33, 0x33), // #333333
-            muted:   rgb(0x4F, 0x4F, 0x4F), // #4F4F4F
-            accent:  rgb(0x3B, 0x72, 0xAB), // #3B72AB
-            acchov:  rgb(0x5B, 0x9B, 0xD5), // #5B9BD5
-            success: rgb(0x00, 0x80, 0x00), // #008000
-            danger:  rgb(0xD1, 0x34, 0x38), // #D13438
-            warn:    rgb(0xE3, 0x8B, 0x00), // #E38B00
-            info:    rgb(0x00, 0x5A, 0x9C), // #005A9C
+            primary: rgb(0x00, 0x00, 0x00),   // #000000
+            second: rgb(0x33, 0x33, 0x33),    // #333333
+            muted: rgb(0x4F, 0x4F, 0x4F),     // #4F4F4F
+            accent: rgb(0x3B, 0x72, 0xAB),    // #3B72AB
+            acchov: rgb(0x5B, 0x9B, 0xD5),    // #5B9BD5
+            success: rgb(0x00, 0x80, 0x00),   // #008000
+            danger: rgb(0xD1, 0x34, 0x38),    // #D13438
+            warn: rgb(0xE3, 0x8B, 0x00),      // #E38B00
+            info: rgb(0x00, 0x5A, 0x9C),      // #005A9C
         }
     }
 }

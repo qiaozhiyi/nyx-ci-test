@@ -39,46 +39,50 @@ use bridge::{Bridge, Cmd, SessionView, Snapshot};
 // thread and single-threaded, so the write-lock in apply_snapshot() never
 // contends in practice; the RwLock is just the documented Makepad idiom.
 
-static SESSIONS: LazyLock<RwLock<Vec<SessionView>>> = LazyLock::new(|| RwLock::new(vec![
-    SessionView {
-        id: "mock_1".to_string(),
-        hostname: "DESKTOP-WIN".to_string(),
-        username: "admin".to_string(),
-        os: "Windows 11".to_string(),
-        arch: 64,
-        pid: 1024,
-        is_admin: 1,
-        ..Default::default()
-    },
-    SessionView {
-        id: "mock_2".to_string(),
-        hostname: "MacBook-Pro".to_string(),
-        username: "qiaozhiyi".to_string(),
-        os: "Mac OS X".to_string(),
-        arch: 64,
-        pid: 3001,
-        is_admin: 0,
-        ..Default::default()
-    },
-    SessionView {
-        id: "mock_3".to_string(),
-        hostname: "ubuntu-server".to_string(),
-        username: "root".to_string(),
-        os: "Linux".to_string(),
-        arch: 64,
-        pid: 1,
-        is_admin: 1,
-        ..Default::default()
-    }
-]));
+static SESSIONS: LazyLock<RwLock<Vec<SessionView>>> = LazyLock::new(|| {
+    RwLock::new(vec![
+        SessionView {
+            id: "mock_1".to_string(),
+            hostname: "DESKTOP-WIN".to_string(),
+            username: "admin".to_string(),
+            os: "Windows 11".to_string(),
+            arch: 64,
+            pid: 1024,
+            is_admin: 1,
+            ..Default::default()
+        },
+        SessionView {
+            id: "mock_2".to_string(),
+            hostname: "MacBook-Pro".to_string(),
+            username: "qiaozhiyi".to_string(),
+            os: "Mac OS X".to_string(),
+            arch: 64,
+            pid: 3001,
+            is_admin: 0,
+            ..Default::default()
+        },
+        SessionView {
+            id: "mock_3".to_string(),
+            hostname: "ubuntu-server".to_string(),
+            username: "root".to_string(),
+            os: "Linux".to_string(),
+            arch: 64,
+            pid: 1,
+            is_admin: 1,
+            ..Default::default()
+        },
+    ])
+});
 static LOG_LINES: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| RwLock::new(Vec::new()));
-pub static CONSOLE: LazyLock<RwLock<std::collections::HashMap<String, Vec<String>>>> = LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
+pub static CONSOLE: LazyLock<RwLock<std::collections::HashMap<String, Vec<String>>>> =
+    LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
 pub static IS_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Index of the currently-selected session row, or usize::MAX for none.
 /// SessionList::draw_walk reads this to tint the selected row's background
 /// (Crowsel) — the only way to give per-row selection feedback through a
 /// virtualized PortalList (the App can't reach inside individual rows).
-static SELECTED_SESSION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+static SELECTED_SESSION: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 app_main!(App);
 
@@ -498,7 +502,7 @@ script_mod! {
             width: 120 height: 90
             flow: Down spacing: 4.0
             align: Align{x: 0.5, y: 0.5}
-            
+
             icon_view := View {
                 width: 40 height: 40
                 align: Align{x: 0.5, y: 0.5}
@@ -507,7 +511,7 @@ script_mod! {
             lbl := Label { text: "" draw_text.color: Cprimary draw_text.text_style: theme.font_bold{font_size: 12} }
             sub_lbl := Label { text: "" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: 10} }
         }
-        
+
         HLine := View { show_bg: true width: 0 height: 2 draw_bg.color: Caccent }
         VLine := View { show_bg: true width: 2 height: 0 draw_bg.color: Caccent }
     }
@@ -757,7 +761,7 @@ script_mod! {
                                     width: Fill height: 36
                                     flow: Right spacing: 0
                                     padding: Inset{top: 0 bottom: 0 left: 0 right: 0}
-                                    
+
                                     dialog_btn_theme := Button {
                                         text: "THEME: DARK"
                                         width: Fill height: Fill
@@ -804,7 +808,7 @@ script_mod! {
                             padding: Inset { left: 8.0 right: 8.0 }
                             align: Align{y: 0.5}
                             draw_bg.color: Cbar
-                            
+
                             menu_nyx := Button {
                                 text: "NYX"
                                 draw_bg.color: #x00000000
@@ -841,7 +845,7 @@ script_mod! {
                                 draw_text.text_style: theme.font_bold{font_size: 11}
                             }
                         }
-                        
+
                         div_menu := View { width: Fill height: 1 draw_bg.color: Cborder }
 
                         tool_bar := View {
@@ -850,7 +854,7 @@ script_mod! {
                             padding: Inset { left: 10.0 right: 10.0 }
                             align: Align{y: 0.5}
                             draw_bg.color: Cpanel
-                            
+
                             div_1 := View { width: 1 height: 18 draw_bg.color: Cborder }
                             btn_table := Button { text: "📊 Sessions" draw_bg.color: Cbar width: Fit height: 26 padding: Inset{left: 8.0 right: 8.0 top: 2.0 bottom: 2.0} draw_text.text_style: theme.font_regular{font_size: 11} }
                             btn_graph := Button { text: "🕸️ Graph" draw_bg.color: Cbar width: Fit height: 26 padding: Inset{left: 8.0 right: 8.0 top: 2.0 bottom: 2.0} draw_text.text_style: theme.font_regular{font_size: 11} }
@@ -859,15 +863,15 @@ script_mod! {
                             btn_procs := Button { text: "⚙️ Processes" draw_bg.color: Cbar width: Fit height: 26 padding: Inset{left: 8.0 right: 8.0 top: 2.0 bottom: 2.0} draw_text.text_style: theme.font_regular{font_size: 11} }
                             btn_creds := Button { text: "🔑 Creds" draw_bg.color: Cbar width: Fit height: 26 padding: Inset{left: 8.0 right: 8.0 top: 2.0 bottom: 2.0} draw_text.text_style: theme.font_regular{font_size: 11} }
                             btn_event_log := Button { text: "📋 Event Log" draw_bg.color: Cbar width: Fit height: 26 padding: Inset{left: 8.0 right: 8.0 top: 2.0 bottom: 2.0} draw_text.text_style: theme.font_regular{font_size: 11} }
-                            
+
                             View { width: Fill height: 1 }
-                            main_btn_theme := Button { 
-                                text: "🌗" 
-                                draw_bg.color: Cbar 
-                                width: 26 height: 26 
-                                padding: Inset{left: 0.0 right: 0.0 top: 0.0 bottom: 0.0} 
-                                draw_text.text_style: theme.font_regular{font_size: 14} 
-                                draw_bg.border_radius: 13.0 
+                            main_btn_theme := Button {
+                                text: "🌗"
+                                draw_bg.color: Cbar
+                                width: 26 height: 26
+                                padding: Inset{left: 0.0 right: 0.0 top: 0.0 bottom: 0.0}
+                                draw_text.text_style: theme.font_regular{font_size: 14}
+                                draw_bg.border_radius: 13.0
                             }
                         }
 
@@ -971,7 +975,7 @@ script_mod! {
                                 draw_bg.border_color: Cborder
                                 draw_bg.border_radius: 8.0
                                 draw_bg.border_size: 1.0
-                                
+
                                 sessions_header := View{
                                     width: Fill height: 32
                                     padding: Inset{left: 14.0 right: 14.0}
@@ -1492,10 +1496,14 @@ impl App {
         // sibling of connect_view/main_view, so while it's visible it covers
         // whichever of those is underneath — including during the resize.
         if snap.connecting && !self.connecting_prev {
-            self.ui.view(cx, ids!(connecting_overlay)).set_visible(cx, true);
+            self.ui
+                .view(cx, ids!(connecting_overlay))
+                .set_visible(cx, true);
         }
         if !snap.connecting && self.connecting_prev {
-            self.ui.view(cx, ids!(connecting_overlay)).set_visible(cx, false);
+            self.ui
+                .view(cx, ids!(connecting_overlay))
+                .set_visible(cx, false);
         }
         self.connecting_prev = snap.connecting;
 
@@ -1504,15 +1512,21 @@ impl App {
         // has_connected is sticky so this fires exactly once. The overlay (if
         // still transitioning) hides this snap.
         if snap.connected && !self.has_connected {
-            self.ui.window(cx, ids!(main_window)).resize(cx, dvec2(1280.0, 800.0));
+            self.ui
+                .window(cx, ids!(main_window))
+                .resize(cx, dvec2(1280.0, 800.0));
         }
         if snap.connected {
             self.has_connected = true;
         }
         // If we have ever connected successfully, we remain in the console view.
         // If we haven't connected yet, keep showing the connect dialog.
-        self.ui.view(cx, ids!(connect_view)).set_visible(cx, !self.has_connected);
-        self.ui.view(cx, ids!(main_view)).set_visible(cx, self.has_connected);
+        self.ui
+            .view(cx, ids!(connect_view))
+            .set_visible(cx, !self.has_connected);
+        self.ui
+            .view(cx, ids!(main_view))
+            .set_visible(cx, self.has_connected);
         if !snap.connected && !self.has_connected {
             // Route the most recent backend error line to the field it most
             // likely came from, so the failure reads as "this field" instead of
@@ -1534,7 +1548,9 @@ impl App {
                     self.set_field_error(cx, Field::Url, "Could not reach server at this address");
                     self.set_field_error(cx, Field::Alias, "");
                     self.ui.label(cx, ids!(connect_status)).set_text(cx, "");
-                    self.ui.view(cx, ids!(connect_status)).set_visible(cx, false);
+                    self.ui
+                        .view(cx, ids!(connect_status))
+                        .set_visible(cx, false);
                 } else if lower.contains("401")
                     || lower.contains("403")
                     || lower.contains("unauthorized")
@@ -1554,7 +1570,9 @@ impl App {
                     // Unattributable (e.g. 500, malformed response): keep the
                     // full text on the fallback status line so nothing is lost.
                     self.ui.label(cx, ids!(connect_status)).set_text(cx, &e);
-                    self.ui.view(cx, ids!(connect_status)).set_visible(cx, !e.is_empty());
+                    self.ui
+                        .view(cx, ids!(connect_status))
+                        .set_visible(cx, !e.is_empty());
                 }
             }
         }
@@ -1566,10 +1584,17 @@ impl App {
         // unverified `apply_over`/`live!` rust-side color API — uses only the
         // documented `.set_visible()` from the `todo` example.
         self.ui.view(cx, ids!(conn_bar)).set_visible(cx, !connected);
-        self.ui.view(cx, ids!(div_conn_bar)).set_visible(cx, !connected);
         self.ui
-            .label(cx, ids!(status_text))
-            .set_text(cx, if connected { "Connected" } else { "Disconnected" });
+            .view(cx, ids!(div_conn_bar))
+            .set_visible(cx, !connected);
+        self.ui.label(cx, ids!(status_text)).set_text(
+            cx,
+            if connected {
+                "Connected"
+            } else {
+                "Disconnected"
+            },
+        );
         // Color the status word to match the dot so the state reads at a glance.
         let p = Palette::current();
         let st_color = if connected { p.success } else { p.danger };
@@ -1613,8 +1638,7 @@ impl App {
             // Anchored regex via the `regex`-style manual scan would need a
             // dependency; a hand-rolled check is enough for a login gate.
             let u = url.trim();
-            let scheme_ok =
-                u.starts_with("http://") || u.starts_with("https://");
+            let scheme_ok = u.starts_with("http://") || u.starts_with("https://");
             let rest = u.split_once("://").map(|(_, r)| r).unwrap_or("");
             // host (non-empty, no slash/colon before the port) + :port(2-5)
             let host_port = rest.split('/').next().unwrap_or("");
@@ -1622,9 +1646,7 @@ impl App {
                 .rsplit_once(':')
                 .map(|(h, p)| (h, Some(p)))
                 .unwrap_or((host_port, None));
-            let host_ok = !host.is_empty()
-                && !host.contains(' ')
-                && host.chars().any(|c| c != '.');
+            let host_ok = !host.is_empty() && !host.contains(' ') && host.chars().any(|c| c != '.');
             let port_ok = port
                 .map(|p| p.len() >= 2 && p.len() <= 5 && p.chars().all(|c| c.is_ascii_digit()))
                 .unwrap_or(false);
@@ -1637,12 +1659,20 @@ impl App {
         self.set_field_error(
             cx,
             Field::Url,
-            if url_ok { "" } else { "Enter a valid http(s)://host:port URL" },
+            if url_ok {
+                ""
+            } else {
+                "Enter a valid http(s)://host:port URL"
+            },
         );
         self.set_field_error(
             cx,
             Field::Alias,
-            if alias_ok { "" } else { "Operator name is required" },
+            if alias_ok {
+                ""
+            } else {
+                "Operator name is required"
+            },
         );
 
         url_ok && alias_ok
@@ -1738,9 +1768,7 @@ impl App {
         }
 
         // 4. Buttons.
-        let buttons = [
-            (ids!(bar_connect_btn), caccent, cacchov, cwhite),
-        ];
+        let buttons = [(ids!(bar_connect_btn), caccent, cacchov, cwhite)];
         for (path, bg, bg_hov, fg) in buttons {
             let mut btn = self.ui.button(cx, path);
             script_apply_eval!(cx, btn, {
@@ -1785,10 +1813,7 @@ impl App {
         script_apply_eval!(cx, cs_lbl, {
             draw_text +: { color: #(p.danger) }
         });
-        let field_errors = [
-            ids!(url_error),
-            ids!(alias_error),
-        ];
+        let field_errors = [ids!(url_error), ids!(alias_error)];
         for path in field_errors {
             let mut lbl = self.ui.label(cx, path);
             script_apply_eval!(cx, lbl, {
@@ -1913,7 +1938,11 @@ impl App {
         ];
         for path in menu_buttons {
             let mut btn = self.ui.button(cx, path);
-            let text_color = if is_dark { vec4(1.0, 1.0, 1.0, 1.0) } else { cprimary };
+            let text_color = if is_dark {
+                vec4(1.0, 1.0, 1.0, 1.0)
+            } else {
+                cprimary
+            };
             script_apply_eval!(cx, btn, {
                 draw_bg +: { color: #x00000000, color_hover: #(crowhov), color_down: #(crowhov), border_size: 0.0 }
                 draw_text +: { color: #(text_color), color_hover: #(text_color), color_down: #(text_color) }
@@ -1958,7 +1987,7 @@ impl App {
                 draw_bg +: { color: #(cborder) }
             });
         }
-        
+
         // 10. Toolbar buttons (ls, ps, bof_run) and inputs.
         for btn_path in [ids!(bof_run_btn), ids!(ls_btn), ids!(ps_btn)] {
             let mut btn = self.ui.button(cx, btn_path);
@@ -2011,11 +2040,21 @@ impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
         self.is_dark = std::env::var("NYX_START_DARK").is_ok();
         IS_DARK.store(self.is_dark, std::sync::atomic::Ordering::Relaxed);
-        let label_text = if self.is_dark { "THEME: DARK" } else { "THEME: LIGHT" };
-        self.ui.button(cx, ids!(dialog_btn_theme)).set_text(cx, label_text);
-        self.ui.button(cx, ids!(main_btn_theme)).set_text(cx, label_text);
+        let label_text = if self.is_dark {
+            "THEME: DARK"
+        } else {
+            "THEME: LIGHT"
+        };
+        self.ui
+            .button(cx, ids!(dialog_btn_theme))
+            .set_text(cx, label_text);
+        self.ui
+            .button(cx, ids!(main_btn_theme))
+            .set_text(cx, label_text);
         self.set_status(cx, false);
-        self.ui.window(cx, ids!(main_window)).resize(cx, dvec2(360.0, 480.0));
+        self.ui
+            .window(cx, ids!(main_window))
+            .resize(cx, dvec2(360.0, 480.0));
         self.apply_theme(cx);
         self.ui.redraw(cx);
 
@@ -2041,11 +2080,19 @@ impl MatchEvent for App {
         if clicked_theme {
             self.is_dark = !self.is_dark;
             IS_DARK.store(self.is_dark, std::sync::atomic::Ordering::Relaxed);
-            
-            let label_text = if self.is_dark { "THEME: DARK" } else { "THEME: LIGHT" };
-            self.ui.button(cx, ids!(dialog_btn_theme)).set_text(cx, label_text);
-            self.ui.button(cx, ids!(main_btn_theme)).set_text(cx, label_text);
-            
+
+            let label_text = if self.is_dark {
+                "THEME: DARK"
+            } else {
+                "THEME: LIGHT"
+            };
+            self.ui
+                .button(cx, ids!(dialog_btn_theme))
+                .set_text(cx, label_text);
+            self.ui
+                .button(cx, ids!(main_btn_theme))
+                .set_text(cx, label_text);
+
             self.apply_theme(cx);
             self.ui.redraw(cx);
         }
@@ -2068,12 +2115,19 @@ impl MatchEvent for App {
         ];
 
         let mut clicked_toolbar = None;
-        if self.ui.button(cx, ids!(btn_table)).clicked(actions) { clicked_toolbar = Some(ids!(session_list_view)); }
-        else if self.ui.button(cx, ids!(btn_graph)).clicked(actions) { clicked_toolbar = Some(ids!(session_graph_view)); }
-        else if self.ui.button(cx, ids!(btn_files)).clicked(actions) { clicked_toolbar = Some(ids!(pane_files)); }
-        else if self.ui.button(cx, ids!(btn_procs)).clicked(actions) { clicked_toolbar = Some(ids!(pane_procs)); }
-        else if self.ui.button(cx, ids!(btn_creds)).clicked(actions) { clicked_toolbar = Some(ids!(pane_creds)); }
-        else if self.ui.button(cx, ids!(btn_event_log)).clicked(actions) { clicked_toolbar = Some(ids!(pane_event_log)); }
+        if self.ui.button(cx, ids!(btn_table)).clicked(actions) {
+            clicked_toolbar = Some(ids!(session_list_view));
+        } else if self.ui.button(cx, ids!(btn_graph)).clicked(actions) {
+            clicked_toolbar = Some(ids!(session_graph_view));
+        } else if self.ui.button(cx, ids!(btn_files)).clicked(actions) {
+            clicked_toolbar = Some(ids!(pane_files));
+        } else if self.ui.button(cx, ids!(btn_procs)).clicked(actions) {
+            clicked_toolbar = Some(ids!(pane_procs));
+        } else if self.ui.button(cx, ids!(btn_creds)).clicked(actions) {
+            clicked_toolbar = Some(ids!(pane_creds));
+        } else if self.ui.button(cx, ids!(btn_event_log)).clicked(actions) {
+            clicked_toolbar = Some(ids!(pane_event_log));
+        }
 
         if let Some(target) = clicked_toolbar {
             for &id in &top_panes {
@@ -2083,7 +2137,13 @@ impl MatchEvent for App {
         }
 
         // Top bar buttons dummy actions (so they do something)
-        let top_buttons = [ids!(menu_nyx), ids!(menu_view), ids!(menu_attacks), ids!(menu_reporting), ids!(menu_help)];
+        let top_buttons = [
+            ids!(menu_nyx),
+            ids!(menu_view),
+            ids!(menu_attacks),
+            ids!(menu_reporting),
+            ids!(menu_help),
+        ];
         for id in top_buttons {
             if self.ui.button(cx, id).clicked(actions) {
                 // For now just redraw to register the click visually
@@ -2093,10 +2153,25 @@ impl MatchEvent for App {
 
         // ── Connect dialog (the dedicated connect window) ────────────────
         // Connect button OR Enter in any connect-dialog field.
-        let dlg_connect = self.ui.button(cx, ids!(dialog_connect_btn)).clicked(actions);
-        let dlg_enter = self.ui.text_input(cx, ids!(url_input)).returned(actions).is_some()
-            || self.ui.text_input(cx, ids!(alias_input)).returned(actions).is_some()
-            || self.ui.text_input(cx, ids!(pass_input)).returned(actions).is_some();
+        let dlg_connect = self
+            .ui
+            .button(cx, ids!(dialog_connect_btn))
+            .clicked(actions);
+        let dlg_enter = self
+            .ui
+            .text_input(cx, ids!(url_input))
+            .returned(actions)
+            .is_some()
+            || self
+                .ui
+                .text_input(cx, ids!(alias_input))
+                .returned(actions)
+                .is_some()
+            || self
+                .ui
+                .text_input(cx, ids!(pass_input))
+                .returned(actions)
+                .is_some();
 
         let bar_connect = self.ui.button(cx, ids!(bar_connect_btn)).clicked(actions);
 
@@ -2142,7 +2217,9 @@ impl MatchEvent for App {
                         // in flight; the next verdict comes from the backend.
                         self.set_field_error(cx, Field::Url, "");
                         self.set_field_error(cx, Field::Alias, "");
-                        self.ui.label(cx, ids!(connect_status)).set_text(cx, "Connecting…");
+                        self.ui
+                            .label(cx, ids!(connect_status))
+                            .set_text(cx, "Connecting…");
                         self.ui.view(cx, ids!(connect_status)).set_visible(cx, true);
                     }
                 }
@@ -2169,23 +2246,73 @@ impl MatchEvent for App {
                 // state only and bypass the network entirely.
                 match first {
                     "help" | "?" => {
-                        LOG_LINES.write().unwrap().push("=== Nyx GUI console ===".into());
-                        LOG_LINES.write().unwrap().push("Local:      help clear use <id|prefix> info".into());
-                        LOG_LINES.write().unwrap().push("Global:     profile sessions refresh".into());
-                        LOG_LINES.write().unwrap().push("            creds [reveal|add|del] audit [verify]".into());
-                        LOG_LINES.write().unwrap().push("            tasks <id-prefix>".into());
-                        LOG_LINES.write().unwrap().push("Beacon:     ping sleep <s> [<jitter%>] exit".into());
-                        LOG_LINES.write().unwrap().push("Files:      ls upload <path> download <path>".into());
-                        LOG_LINES.write().unwrap().push("            cd|mkdir|rm|mv|cp <path> [dest]".into());
-                        LOG_LINES.write().unwrap().push("Recon:      ps env <name> driveinfo net <q>".into());
-                        LOG_LINES.write().unwrap().push("            portscan <host> <ports>".into());
-                        LOG_LINES.write().unwrap().push("Media:      screenshot [monitor] screenwatch <s>".into());
-                        LOG_LINES.write().unwrap().push("            clipboard keylog start|stop|dump".into());
-                        LOG_LINES.write().unwrap().push("Creds:      hashdump sam|system|lsass|shadow".into());
-                        LOG_LINES.write().unwrap().push("Tokens:     getuid steal <pid> make_token <DOMAIN\\user> <pwd> [type]".into());
-                        LOG_LINES.write().unwrap().push("            rev2self".into());
-                        LOG_LINES.write().unwrap().push("Pivot:      connect <host> <port> chan close <id> socks ...".into());
-                        LOG_LINES.write().unwrap().push("Payloads:   bof <name> <args> [path.o] inject <method> <pid> <sc_hex>".into());
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("=== Nyx GUI console ===".into());
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("Local:      help clear use <id|prefix> info".into());
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("Global:     profile sessions refresh".into());
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("            creds [reveal|add|del] audit [verify]".into());
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("            tasks <id-prefix>".into());
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("Beacon:     ping sleep <s> [<jitter%>] exit".into());
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("Files:      ls upload <path> download <path>".into());
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("            cd|mkdir|rm|mv|cp <path> [dest]".into());
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("Recon:      ps env <name> driveinfo net <q>".into());
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("            portscan <host> <ports>".into());
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("Media:      screenshot [monitor] screenwatch <s>".into());
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("            clipboard keylog start|stop|dump".into());
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("Creds:      hashdump sam|system|lsass|shadow".into());
+                        LOG_LINES.write().unwrap().push(
+                            "Tokens:     getuid steal <pid> make_token <DOMAIN\\user> <pwd> [type]"
+                                .into(),
+                        );
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("            rev2self".into());
+                        LOG_LINES.write().unwrap().push(
+                            "Pivot:      connect <host> <port> chan close <id> socks ...".into(),
+                        );
+                        LOG_LINES.write().unwrap().push(
+                            "Payloads:   bof <name> <args> [path.o] inject <method> <pid> <sc_hex>"
+                                .into(),
+                        );
                         self.ui.redraw(cx);
                         return;
                     }
@@ -2202,14 +2329,17 @@ impl MatchEvent for App {
                         match sessions.iter().position(|s| s.id.starts_with(target)) {
                             Some(idx) => {
                                 SELECTED_SESSION.store(idx, std::sync::atomic::Ordering::Relaxed);
-                                LOG_LINES.write().unwrap().push(
-                                    format!("selected: {} ({})", &sessions[idx].id[..sessions[idx].id.len().min(8)], sessions[idx].hostname)
-                                );
+                                LOG_LINES.write().unwrap().push(format!(
+                                    "selected: {} ({})",
+                                    &sessions[idx].id[..sessions[idx].id.len().min(8)],
+                                    sessions[idx].hostname
+                                ));
                             }
                             None => {
-                                LOG_LINES.write().unwrap().push(
-                                    format!("! no session matching '{target}' (have {} loaded)", sessions.len())
-                                );
+                                LOG_LINES.write().unwrap().push(format!(
+                                    "! no session matching '{target}' (have {} loaded)",
+                                    sessions.len()
+                                ));
                             }
                         }
                         drop(sessions);
@@ -2225,16 +2355,46 @@ impl MatchEvent for App {
                         match sessions.get(sel) {
                             Some(s) => {
                                 LOG_LINES.write().unwrap().push(format!("=== {} ===", s.id));
-                                LOG_LINES.write().unwrap().push(format!("  hostname: {}", s.hostname));
-                                LOG_LINES.write().unwrap().push(format!("  user:     {}", s.username));
-                                LOG_LINES.write().unwrap().push(format!("  os:       {} ({}-bit)", s.os, if s.arch == 86 { "x86" } else { "x64" }));
-                                LOG_LINES.write().unwrap().push(format!("  pid:      {}", s.pid));
-                                LOG_LINES.write().unwrap().push(format!("  admin:    {}", if s.is_admin != 0 { "yes" } else { "no" }));
-                                LOG_LINES.write().unwrap().push(format!("  pending:  {}", s.pending));
-                                LOG_LINES.write().unwrap().push(format!("  ja3:      {}", s.ja3.as_deref().unwrap_or("-")));
-                                LOG_LINES.write().unwrap().push(format!("  ja4:      {}", s.ja4.as_deref().unwrap_or("-")));
+                                LOG_LINES
+                                    .write()
+                                    .unwrap()
+                                    .push(format!("  hostname: {}", s.hostname));
+                                LOG_LINES
+                                    .write()
+                                    .unwrap()
+                                    .push(format!("  user:     {}", s.username));
+                                LOG_LINES.write().unwrap().push(format!(
+                                    "  os:       {} ({}-bit)",
+                                    s.os,
+                                    if s.arch == 86 { "x86" } else { "x64" }
+                                ));
+                                LOG_LINES
+                                    .write()
+                                    .unwrap()
+                                    .push(format!("  pid:      {}", s.pid));
+                                LOG_LINES.write().unwrap().push(format!(
+                                    "  admin:    {}",
+                                    if s.is_admin != 0 { "yes" } else { "no" }
+                                ));
+                                LOG_LINES
+                                    .write()
+                                    .unwrap()
+                                    .push(format!("  pending:  {}", s.pending));
+                                LOG_LINES.write().unwrap().push(format!(
+                                    "  ja3:      {}",
+                                    s.ja3.as_deref().unwrap_or("-")
+                                ));
+                                LOG_LINES.write().unwrap().push(format!(
+                                    "  ja4:      {}",
+                                    s.ja4.as_deref().unwrap_or("-")
+                                ));
                             }
-                            None => { LOG_LINES.write().unwrap().push("! no beacon selected — use /use <id> first".into()); }
+                            None => {
+                                LOG_LINES
+                                    .write()
+                                    .unwrap()
+                                    .push("! no beacon selected — use /use <id> first".into());
+                            }
                         }
                         drop(sessions);
                         self.ui.redraw(cx);
@@ -2269,7 +2429,12 @@ impl MatchEvent for App {
                         // /tasks <id-or-prefix> — fall back to selected if no arg.
                         let target = parts.get(1).copied().unwrap_or("");
                         let session_id = if !target.is_empty() {
-                            SESSIONS.read().unwrap().iter().find(|s| s.id.starts_with(target)).map(|s| s.id.clone())
+                            SESSIONS
+                                .read()
+                                .unwrap()
+                                .iter()
+                                .find(|s| s.id.starts_with(target))
+                                .map(|s| s.id.clone())
                         } else {
                             let sel = SELECTED_SESSION.load(std::sync::atomic::Ordering::Relaxed);
                             SESSIONS.read().unwrap().get(sel).map(|s| s.id.clone())
@@ -2281,7 +2446,11 @@ impl MatchEvent for App {
                                     let _ = b.from_ui.send(Cmd::FetchTasks { session: sid });
                                 }
                             }
-                            None => { LOG_LINES.write().unwrap().push("! /tasks: no beacon selected and no target id given".into()); }
+                            None => {
+                                LOG_LINES.write().unwrap().push(
+                                    "! /tasks: no beacon selected and no target id given".into(),
+                                );
+                            }
                         }
                         return;
                     }
@@ -2298,7 +2467,12 @@ impl MatchEvent for App {
                                     Some((r, u)) => (r.to_string(), u.to_string()),
                                     None => (String::new(), principal.to_string()),
                                 };
-                                let _ = b.from_ui.send(Cmd::CredAdd { realm, user, kind: kind.to_string(), secret: secret.to_string() });
+                                let _ = b.from_ui.send(Cmd::CredAdd {
+                                    realm,
+                                    user,
+                                    kind: kind.to_string(),
+                                    secret: secret.to_string(),
+                                });
                             } else if parts.iter().any(|p| *p == "del" || *p == "delete") {
                                 let principal = parts.get(2).copied().unwrap_or("");
                                 let kind = parts.get(3).copied().unwrap_or("password");
@@ -2306,7 +2480,11 @@ impl MatchEvent for App {
                                     Some((r, u)) => (r.to_string(), u.to_string()),
                                     None => (String::new(), principal.to_string()),
                                 };
-                                let _ = b.from_ui.send(Cmd::CredDelete { realm, user, kind: kind.to_string() });
+                                let _ = b.from_ui.send(Cmd::CredDelete {
+                                    realm,
+                                    user,
+                                    kind: kind.to_string(),
+                                });
                             } else {
                                 let reveal = parts.iter().any(|p| *p == "reveal");
                                 let _ = b.from_ui.send(Cmd::FetchCreds { reveal });
@@ -2329,11 +2507,17 @@ impl MatchEvent for App {
                                     match k {
                                         "operator" => operator = it.next().map(|s| s.to_string()),
                                         "action" => action = it.next().map(|s| s.to_string()),
-                                        "limit" => limit = it.next().and_then(|s| s.parse::<u32>().ok()),
+                                        "limit" => {
+                                            limit = it.next().and_then(|s| s.parse::<u32>().ok())
+                                        }
                                         _ => {}
                                     }
                                 }
-                                let _ = b.from_ui.send(Cmd::FetchAudit { operator, action, limit });
+                                let _ = b.from_ui.send(Cmd::FetchAudit {
+                                    operator,
+                                    action,
+                                    limit,
+                                });
                             }
                         }
                         return;
@@ -2346,41 +2530,101 @@ impl MatchEvent for App {
                 if sel != usize::MAX {
                     let session_id = SESSIONS.read().unwrap().get(sel).map(|s| s.id.clone());
                     if let Some(sid) = session_id {
-                        CONSOLE.write().unwrap().entry(sid.clone()).or_default().push(format!("$ {}", cmd));
+                        CONSOLE
+                            .write()
+                            .unwrap()
+                            .entry(sid.clone())
+                            .or_default()
+                            .push(format!("$ {}", cmd));
                         self.ensure_bridge();
                         if let Some(b) = &self.bridge {
                             let bridge_cmd = match first {
-                                "ping" => Cmd::Ping { session: sid.clone() },
+                                "ping" => Cmd::Ping {
+                                    session: sid.clone(),
+                                },
                                 "sleep" => {
-                                    let secs = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(60);
-                                    let jitter = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-                                    Cmd::Sleep { session: sid.clone(), seconds: secs, jitter_pct: jitter }
+                                    let secs =
+                                        parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(60);
+                                    let jitter =
+                                        parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+                                    Cmd::Sleep {
+                                        session: sid.clone(),
+                                        seconds: secs,
+                                        jitter_pct: jitter,
+                                    }
                                 }
-                                "exit" => Cmd::Exit { session: sid.clone() },
+                                "exit" => Cmd::Exit {
+                                    session: sid.clone(),
+                                },
                                 "upload" => {
                                     let name = parts.get(1).copied().unwrap_or("").to_string();
                                     // Local file reading should ideally be async, but for now we read it here
                                     // Alternatively, we just send empty data if file not found, which will fail gracefully
-                                    let data_hex = if let Ok(data) = std::fs::read(&name) { hex::encode(data) } else { String::new() };
-                                    Cmd::Upload { session: sid.clone(), name, data_hex }
+                                    let data_hex = if let Ok(data) = std::fs::read(&name) {
+                                        hex::encode(data)
+                                    } else {
+                                        String::new()
+                                    };
+                                    Cmd::Upload {
+                                        session: sid.clone(),
+                                        name,
+                                        data_hex,
+                                    }
                                 }
-                                "download" => Cmd::Download { session: sid.clone(), path: parts.get(1).copied().unwrap_or("").to_string() },
-                                "cd" | "mkdir" | "rm" => {
-                                    Cmd::FileOp { session: sid.clone(), op: parts[0].to_string(), path: parts.get(1).copied().unwrap_or("").to_string(), dest: None }
-                                }
-                                "mv" | "cp" => {
-                                    Cmd::FileOp { session: sid.clone(), op: parts[0].to_string(), path: parts.get(1).copied().unwrap_or("").to_string(), dest: parts.get(2).map(|s| s.to_string()) }
-                                }
-                                "ls" => Cmd::Ls { session: sid.clone(), args: cmd.clone() },
-                                "ps" => Cmd::Ps { session: sid.clone(), args: cmd.clone() },
-                                "screenshot" => Cmd::Screenshot { session: sid.clone(), monitor: parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0) },
-                                "screenwatch" => Cmd::Screenwatch { session: sid.clone(), interval_secs: parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(5) },
-                                "clipboard" => Cmd::Clipboard { session: sid.clone() },
-                                "env" => Cmd::Env { session: sid.clone(), name: parts.get(1).copied().unwrap_or("").to_string() },
+                                "download" => Cmd::Download {
+                                    session: sid.clone(),
+                                    path: parts.get(1).copied().unwrap_or("").to_string(),
+                                },
+                                "cd" | "mkdir" | "rm" => Cmd::FileOp {
+                                    session: sid.clone(),
+                                    op: parts[0].to_string(),
+                                    path: parts.get(1).copied().unwrap_or("").to_string(),
+                                    dest: None,
+                                },
+                                "mv" | "cp" => Cmd::FileOp {
+                                    session: sid.clone(),
+                                    op: parts[0].to_string(),
+                                    path: parts.get(1).copied().unwrap_or("").to_string(),
+                                    dest: parts.get(2).map(|s| s.to_string()),
+                                },
+                                "ls" => Cmd::Ls {
+                                    session: sid.clone(),
+                                    args: cmd.clone(),
+                                },
+                                "ps" => Cmd::Ps {
+                                    session: sid.clone(),
+                                    args: cmd.clone(),
+                                },
+                                "screenshot" => Cmd::Screenshot {
+                                    session: sid.clone(),
+                                    monitor: parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0),
+                                },
+                                "screenwatch" => Cmd::Screenwatch {
+                                    session: sid.clone(),
+                                    interval_secs: parts
+                                        .get(1)
+                                        .and_then(|s| s.parse().ok())
+                                        .unwrap_or(5),
+                                },
+                                "clipboard" => Cmd::Clipboard {
+                                    session: sid.clone(),
+                                },
+                                "env" => Cmd::Env {
+                                    session: sid.clone(),
+                                    name: parts.get(1).copied().unwrap_or("").to_string(),
+                                },
                                 "keylog" => {
                                     let action_str = parts.get(1).copied().unwrap_or("start");
-                                    let action = match action_str { "start" => 0, "stop" => 1, "dump" => 2, _ => 0 };
-                                    Cmd::Keylog { session: sid.clone(), action }
+                                    let action = match action_str {
+                                        "start" => 0,
+                                        "stop" => 1,
+                                        "dump" => 2,
+                                        _ => 0,
+                                    };
+                                    Cmd::Keylog {
+                                        session: sid.clone(),
+                                        action,
+                                    }
                                 }
                                 "hashdump" => {
                                     // 统一语义：sam=0 system=1 lsass=2(deferred) shadow=3
@@ -2392,14 +2636,21 @@ impl MatchEvent for App {
                                         "shadow" | "mac" => 3,
                                         _ => 0,
                                     };
-                                    Cmd::Hashdump { session: sid.clone(), method }
+                                    Cmd::Hashdump {
+                                        session: sid.clone(),
+                                        method,
+                                    }
                                 }
-                                "getuid" => Cmd::GetUid { session: sid.clone() },
+                                "getuid" => Cmd::GetUid {
+                                    session: sid.clone(),
+                                },
                                 "steal" => Cmd::StealToken {
                                     session: sid.clone(),
                                     pid: parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0),
                                 },
-                                "rev2self" => Cmd::Rev2Self { session: sid.clone() },
+                                "rev2self" => Cmd::Rev2Self {
+                                    session: sid.clone(),
+                                },
                                 "make_token" => {
                                     // make_token DOMAIN\user password [1|2|3]
                                     let du = parts.get(1).copied().unwrap_or("");
@@ -2408,8 +2659,15 @@ impl MatchEvent for App {
                                         None => (String::new(), du.to_string()),
                                     };
                                     let password = parts.get(2).copied().unwrap_or("").to_string();
-                                    let logon_type = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
-                                    Cmd::MakeToken { session: sid.clone(), domain, user, password, logon_type }
+                                    let logon_type =
+                                        parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
+                                    Cmd::MakeToken {
+                                        session: sid.clone(),
+                                        domain,
+                                        user,
+                                        password,
+                                        logon_type,
+                                    }
                                 }
                                 "creds" => {
                                     // creds [reveal] — pull server credential store
@@ -2424,25 +2682,58 @@ impl MatchEvent for App {
                                     let mut it = parts[1..].iter();
                                     while let Some(&k) = it.next() {
                                         match k {
-                                            "operator" => operator = it.next().map(|s| s.to_string()),
+                                            "operator" => {
+                                                operator = it.next().map(|s| s.to_string())
+                                            }
                                             "action" => action = it.next().map(|s| s.to_string()),
-                                            "limit" => limit = it.next().and_then(|s| s.parse().ok()),
+                                            "limit" => {
+                                                limit = it.next().and_then(|s| s.parse().ok())
+                                            }
                                             _ => {}
                                         }
                                     }
-                                    Cmd::FetchAudit { operator, action, limit }
+                                    Cmd::FetchAudit {
+                                        operator,
+                                        action,
+                                        limit,
+                                    }
                                 }
-                                "driveinfo" => Cmd::Driveinfo { session: sid.clone() },
-                                "portscan" => Cmd::Portscan { session: sid.clone(), host: parts.get(1).copied().unwrap_or("").to_string(), ports: parts.get(2).copied().unwrap_or("").to_string() },
-                                "net" => Cmd::Net { session: sid.clone(), query: parts.get(1).copied().unwrap_or("").to_string() },
-                                "connect" => Cmd::ConnectChan { session: sid.clone(), host: parts.get(1).copied().unwrap_or("").to_string(), port: parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0) },
+                                "driveinfo" => Cmd::Driveinfo {
+                                    session: sid.clone(),
+                                },
+                                "portscan" => Cmd::Portscan {
+                                    session: sid.clone(),
+                                    host: parts.get(1).copied().unwrap_or("").to_string(),
+                                    ports: parts.get(2).copied().unwrap_or("").to_string(),
+                                },
+                                "net" => Cmd::Net {
+                                    session: sid.clone(),
+                                    query: parts.get(1).copied().unwrap_or("").to_string(),
+                                },
+                                "connect" => Cmd::ConnectChan {
+                                    session: sid.clone(),
+                                    host: parts.get(1).copied().unwrap_or("").to_string(),
+                                    port: parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0),
+                                },
                                 "socks" => {
-                                    let chan = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                                    let chan =
+                                        parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
                                     let op_str = parts.get(2).copied().unwrap_or("start");
-                                    let op = match op_str { "start" => 0, "stop" => 1, _ => 0 };
+                                    let op = match op_str {
+                                        "start" => 0,
+                                        "stop" => 1,
+                                        _ => 0,
+                                    };
                                     let addr = parts.get(3).copied().unwrap_or("").to_string();
-                                    let port = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
-                                    Cmd::Socks { session: sid.clone(), chan, op, addr, port }
+                                    let port =
+                                        parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+                                    Cmd::Socks {
+                                        session: sid.clone(),
+                                        chan,
+                                        op,
+                                        addr,
+                                        port,
+                                    }
                                 }
                                 "bof" => {
                                     // /bof <name> <args...> [path.o]
@@ -2451,12 +2742,15 @@ impl MatchEvent for App {
                                     // bridge sends real bytes (empty path → empty hex,
                                     // the implant handles that case gracefully).
                                     let name = parts.get(1).copied().unwrap_or("").to_string();
-                                    let mut args_parts: Vec<&str> = parts.get(2..).unwrap_or(&[]).to_vec();
+                                    let mut args_parts: Vec<&str> =
+                                        parts.get(2..).unwrap_or(&[]).to_vec();
                                     let mut data_hex = String::new();
                                     if let Some(last) = args_parts.last() {
                                         let candidate = last.to_string();
                                         if std::path::Path::new(&candidate).exists() {
-                                            data_hex = std::fs::read(&candidate).map(hex::encode).unwrap_or_default();
+                                            data_hex = std::fs::read(&candidate)
+                                                .map(hex::encode)
+                                                .unwrap_or_default();
                                             args_parts.pop();
                                         }
                                     }
@@ -2469,30 +2763,53 @@ impl MatchEvent for App {
                                 }
                                 "inject" => {
                                     // /inject <method> <pid> [<spawn_to>] <sc_hex>
-                                    let method = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1u8);
-                                    let pid = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0u32);
+                                    let method =
+                                        parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1u8);
+                                    let pid =
+                                        parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0u32);
                                     let spawn_to = parts.get(3).copied().unwrap_or("").to_string();
                                     let sc_hex = parts.get(4).copied().unwrap_or("").to_string();
-                                    Cmd::Inject { session: sid.clone(), method, pid, spawn_to, sc_hex }
+                                    Cmd::Inject {
+                                        session: sid.clone(),
+                                        method,
+                                        pid,
+                                        spawn_to,
+                                        sc_hex,
+                                    }
                                 }
                                 "chan" => {
                                     // /chan close <id> — closes a pivot/SOCKS channel.
                                     let sub = parts.get(1).copied().unwrap_or("");
                                     match sub {
                                         "close" => {
-                                            let chan = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-                                            Cmd::ChannelClose { session: sid.clone(), chan }
+                                            let chan = parts
+                                                .get(2)
+                                                .and_then(|s| s.parse().ok())
+                                                .unwrap_or(0);
+                                            Cmd::ChannelClose {
+                                                session: sid.clone(),
+                                                chan,
+                                            }
                                         }
-                                        _ => Cmd::Shell { session: sid.clone(), args: cmd.clone() },
+                                        _ => Cmd::Shell {
+                                            session: sid.clone(),
+                                            args: cmd.clone(),
+                                        },
                                     }
                                 }
-                                _ => Cmd::Shell { session: sid.clone(), args: cmd.clone() },
+                                _ => Cmd::Shell {
+                                    session: sid.clone(),
+                                    args: cmd.clone(),
+                                },
                             };
                             let _ = b.from_ui.send(bridge_cmd);
                         }
                     }
                 } else {
-                    LOG_LINES.write().unwrap().push("! No beacon selected — select a session first".to_string());
+                    LOG_LINES
+                        .write()
+                        .unwrap()
+                        .push("! No beacon selected — select a session first".to_string());
                 }
                 self.ui.redraw(cx);
             }
@@ -2514,7 +2831,8 @@ impl MatchEvent for App {
                         // but we warn so the operator notices the missing payload.
                         let data_hex = if file_path.trim().is_empty() {
                             LOG_LINES.write().unwrap().push(
-                                "! BOF file path empty — sending empty COFF (set a local .o path)".to_string(),
+                                "! BOF file path empty — sending empty COFF (set a local .o path)"
+                                    .to_string(),
                             );
                             String::new()
                         } else {
@@ -2549,11 +2867,17 @@ impl MatchEvent for App {
                             });
                         }
                     } else {
-                        LOG_LINES.write().unwrap().push("! BOF name is required".to_string());
+                        LOG_LINES
+                            .write()
+                            .unwrap()
+                            .push("! BOF name is required".to_string());
                     }
                 }
             } else {
-                LOG_LINES.write().unwrap().push("! No beacon selected".to_string());
+                LOG_LINES
+                    .write()
+                    .unwrap()
+                    .push("! No beacon selected".to_string());
             }
             self.ui.redraw(cx);
         }
@@ -2574,7 +2898,10 @@ impl MatchEvent for App {
                     }
                 }
             } else {
-                LOG_LINES.write().unwrap().push("! No beacon selected".to_string());
+                LOG_LINES
+                    .write()
+                    .unwrap()
+                    .push("! No beacon selected".to_string());
             }
             self.ui.redraw(cx);
         }
@@ -2594,13 +2921,15 @@ impl MatchEvent for App {
                     }
                 }
             } else {
-                LOG_LINES.write().unwrap().push("! No beacon selected".to_string());
+                LOG_LINES
+                    .write()
+                    .unwrap()
+                    .push("! No beacon selected".to_string());
             }
             self.ui.redraw(cx);
         }
 
         // Disconnect button removed.
-
 
         // Session row selection. `items_with_actions` only yields rows whose
         // child widgets fired an action, so each row carries an invisible
@@ -2617,7 +2946,12 @@ impl MatchEvent for App {
                 let has_session = s.is_some();
                 // Update the beacon identity bar in the console log view.
                 if let Some(s) = s {
-                    let info = format!("{} @ {}  ·  {}", s.hostname, s.username, &s.id[..8.min(s.id.len())]);
+                    let info = format!(
+                        "{} @ {}  ·  {}",
+                        s.hostname,
+                        s.username,
+                        &s.id[..8.min(s.id.len())]
+                    );
                     self.ui.label(cx, ids!(beacon_info)).set_text(cx, &info);
                 }
                 // Show/hide the placeholder vs. the active console log.
@@ -2666,36 +3000,36 @@ impl Widget for SessionList {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         let sessions = SESSIONS.read().unwrap().clone();
         let p = Palette::current();
-        
+
         let mut header = self.view.view(cx, ids!(header));
         script_apply_eval!(cx, header, {
             draw_bg +: { color: #(p.elev) }
         });
-        
+
         let mut host_lbl = self.view.label(cx, ids!(header.h_cols.host_lbl));
         script_apply_eval!(cx, host_lbl, { draw_text +: { color: #(p.muted) } });
-        
+
         let mut user_lbl = self.view.label(cx, ids!(header.h_cols.user_lbl));
         script_apply_eval!(cx, user_lbl, { draw_text +: { color: #(p.muted) } });
-        
+
         let mut os_lbl = self.view.label(cx, ids!(header.h_cols.os_lbl));
         script_apply_eval!(cx, os_lbl, { draw_text +: { color: #(p.muted) } });
-        
+
         let mut priv_lbl = self.view.label(cx, ids!(header.h_cols.priv_lbl));
         script_apply_eval!(cx, priv_lbl, { draw_text +: { color: #(p.muted) } });
-        
+
         let mut que_lbl = self.view.label(cx, ids!(header.h_cols.que_lbl));
         script_apply_eval!(cx, que_lbl, { draw_text +: { color: #(p.muted) } });
-        
+
         let mut hv_line1 = self.view.view(cx, ids!(header.h_cols.hv_line1));
         script_apply_eval!(cx, hv_line1, { draw_bg +: { color: #(p.border) } });
-        
+
         let mut hv_line2 = self.view.view(cx, ids!(header.h_cols.hv_line2));
         script_apply_eval!(cx, hv_line2, { draw_bg +: { color: #(p.border) } });
-        
+
         let mut hv_line3 = self.view.view(cx, ids!(header.h_cols.hv_line3));
         script_apply_eval!(cx, hv_line3, { draw_bg +: { color: #(p.border) } });
-        
+
         let mut hv_line4 = self.view.view(cx, ids!(header.h_cols.hv_line4));
         script_apply_eval!(cx, hv_line4, { draw_bg +: { color: #(p.border) } });
 
@@ -2720,10 +3054,20 @@ impl Widget for SessionList {
                     let sel = SELECTED_SESSION.load(std::sync::atomic::Ordering::Relaxed);
                     list.set_item_range(cx, 0, sessions.len());
                     while let Some(item_id) = list.next_visible_item(cx) {
-                        let Some(s) = sessions.get(item_id) else { continue };
+                        let Some(s) = sessions.get(item_id) else {
+                            continue;
+                        };
                         // Selected row uses the ItemSel template (blue bg);
                         // others use Item. Verified per-row-id approach.
-                        let item = list.item(cx, item_id, if item_id == sel { id!(ItemSel) } else { id!(Item) });
+                        let item = list.item(
+                            cx,
+                            item_id,
+                            if item_id == sel {
+                                id!(ItemSel)
+                            } else {
+                                id!(Item)
+                            },
+                        );
 
                         // Repaint the row from the single Palette source so the
                         // Light/Dark toggle matches apply_theme exactly.
@@ -2756,13 +3100,13 @@ impl Widget for SessionList {
 
                         let mut v_line1 = item.view(cx, ids!(content.v_line1));
                         script_apply_eval!(cx, v_line1, { draw_bg +: { color: #(p.border) } });
-                        
+
                         let mut v_line2 = item.view(cx, ids!(content.v_line2));
                         script_apply_eval!(cx, v_line2, { draw_bg +: { color: #(p.border) } });
-                        
+
                         let mut v_line3 = item.view(cx, ids!(content.v_line3));
                         script_apply_eval!(cx, v_line3, { draw_bg +: { color: #(p.border) } });
-                        
+
                         let mut v_line4 = item.view(cx, ids!(content.v_line4));
                         script_apply_eval!(cx, v_line4, { draw_bg +: { color: #(p.border) } });
 
@@ -2797,7 +3141,9 @@ impl Widget for LogList {
             if let Some(mut list) = step.as_portal_list().borrow_mut() {
                 list.set_item_range(cx, 0, lines_guard.len());
                 while let Some(item_id) = list.next_visible_item(cx) {
-                    let Some(line) = lines_guard.get(item_id) else { continue };
+                    let Some(line) = lines_guard.get(item_id) else {
+                        continue;
+                    };
                     let item = list.item(cx, item_id, id!(Item));
 
                     // Repaint the log row from the Palette source.

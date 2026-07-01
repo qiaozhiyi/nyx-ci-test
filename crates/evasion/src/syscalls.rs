@@ -99,7 +99,9 @@ pub fn tartarus_gate(src: &dyn SyscallSource, target_rva: u32) -> Option<u32> {
         if r == target_rva {
             continue;
         }
-        let Some(s) = hells_gate(src, r) else { continue };
+        let Some(s) = hells_gate(src, r) else {
+            continue;
+        };
         let cand = (r, s);
         // Nearest unhooked neighbour below = highest RVA that's still < target.
         if r < target_rva {
@@ -122,7 +124,11 @@ pub fn tartarus_gate(src: &dyn SyscallSource, target_rva: u32) -> Option<u32> {
         // Two anchors: derive the per-SSN stride from them, then project.
         (Some((br, bs)), Some((ar, as_))) if as_ > bs => {
             let rva_per_ssn = (ar - br) / (as_ - bs);
-            let stride = if rva_per_ssn == 0 { STRIDE } else { rva_per_ssn };
+            let stride = if rva_per_ssn == 0 {
+                STRIDE
+            } else {
+                rva_per_ssn
+            };
             Some(bs + (target_rva - br) / stride)
         }
         (Some((br, bs)), _) => Some(bs + (target_rva - br) / STRIDE),

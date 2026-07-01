@@ -45,7 +45,13 @@ pub fn encrypt(plain: &[u8]) -> ([u8; KEY_LEN], [u8; NONCE_LEN], Vec<u8>) {
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key));
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plain, aad: b"" })
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plain,
+                aad: b"",
+            },
+        )
         .expect("chacha20poly1305 encrypt is infallible");
     (key, nonce, ct)
 }
@@ -57,7 +63,13 @@ pub fn encrypt(plain: &[u8]) -> ([u8; KEY_LEN], [u8; NONCE_LEN], Vec<u8>) {
 pub fn decrypt(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> Vec<u8> {
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
     cipher
-        .decrypt(Nonce::from_slice(nonce), Payload { msg: ciphertext, aad: b"" })
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: b"",
+            },
+        )
         .expect("nyx config: decrypt failed (tampered embedded config?)")
 }
 
@@ -82,7 +94,13 @@ mod tests {
         // Wrong key must fail (AEAD integrity).
         let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&k2));
         assert!(cipher
-            .decrypt(Nonce::from_slice(&n1), Payload { msg: &ct1[..], aad: b"" })
+            .decrypt(
+                Nonce::from_slice(&n1),
+                Payload {
+                    msg: &ct1[..],
+                    aad: b""
+                }
+            )
             .is_err());
     }
 

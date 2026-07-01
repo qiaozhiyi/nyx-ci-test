@@ -195,9 +195,7 @@ pub fn parse<'a>(data: &'a [u8]) -> Result<Coff<'a>, CoffError> {
         // .text would let apply() relocate against zero bytes and a crafted
         // window could alias header bytes — either way a malformed BOF must be
         // rejected, not accepted with garbage contents.
-        let raw_end = raw_ptr
-            .checked_add(raw_size)
-            .ok_or(CoffError::Truncated)?;
+        let raw_end = raw_ptr.checked_add(raw_size).ok_or(CoffError::Truncated)?;
         let raw = if raw_ptr == 0 && raw_size == 0 {
             // BSS-like sections legitimately have no raw bytes.
             &[]

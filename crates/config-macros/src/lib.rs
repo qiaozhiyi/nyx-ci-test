@@ -27,12 +27,9 @@ pub fn embed(input: TokenStream) -> TokenStream {
     let plain = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) => {
-            return syn::Error::new(
-                lit.span(),
-                format!("nyx_config::embed: {rel}: {e}"),
-            )
-            .to_compile_error()
-            .into();
+            return syn::Error::new(lit.span(), format!("nyx_config::embed: {rel}: {e}"))
+                .to_compile_error()
+                .into();
         }
     };
 
@@ -77,7 +74,13 @@ fn encrypt(plain: &[u8]) -> ([u8; 32], [u8; 12], Vec<u8>) {
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key));
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plain, aad: b"" })
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plain,
+                aad: b"",
+            },
+        )
         .expect("chacha20poly1305 encrypt is infallible");
     (key, nonce, ct)
 }

@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use nyx_coff::{reloc, apply, parse, SymbolResolver};
+use nyx_coff::{apply, parse, reloc, SymbolResolver};
 
 struct TableResolver(HashMap<String, u64>);
 impl SymbolResolver for TableResolver {

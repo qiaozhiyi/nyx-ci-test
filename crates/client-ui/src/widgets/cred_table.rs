@@ -87,7 +87,9 @@ impl Widget for CredTable {
                 } else {
                     list.set_item_range(cx, 0, creds_guard.len());
                     while let Some(item_id) = list.next_visible_item(cx) {
-                        let Some(c) = creds_guard.get(item_id) else { continue };
+                        let Some(c) = creds_guard.get(item_id) else {
+                            continue;
+                        };
                         let item = list.item(cx, item_id, id!(Item));
 
                         // Repaint the row from the single Palette source.

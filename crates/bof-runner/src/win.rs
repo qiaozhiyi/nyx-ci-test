@@ -110,9 +110,11 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
         if s.relocations.is_empty() {
             continue;
         }
-        let patched =
-            apply(s, &coff, bases[i], &resolver).map_err(|e| format!("reloc `{}`: {:?}", s.name, e))?;
-        unsafe { std::ptr::copy_nonoverlapping(patched.as_ptr(), bases[i] as *mut u8, patched.len()) };
+        let patched = apply(s, &coff, bases[i], &resolver)
+            .map_err(|e| format!("reloc `{}`: {:?}", s.name, e))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(patched.as_ptr(), bases[i] as *mut u8, patched.len())
+        };
     }
 
     // Resolve the entry symbol.
@@ -126,7 +128,10 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
     }
     let entry_addr = bases[(entry_sym.section_number - 1) as usize] + entry_sym.value as u64;
 
-    Ok(Loaded { defined, entry: entry_addr })
+    Ok(Loaded {
+        defined,
+        entry: entry_addr,
+    })
 }
 
 extern "C" {

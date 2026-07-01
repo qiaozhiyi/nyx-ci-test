@@ -76,7 +76,7 @@ impl AuditWriter {
         let (mut seq, mut last_hash) = (0u64, ZERO_HASH.to_string());
         if path.exists() {
             let f = File::open(path)?;
-            for line in BufReader::new(f).lines().flatten() {
+            for line in BufReader::new(f).lines().map_while(Result::ok) {
                 if let Ok(rec) = serde_json::from_str::<AuditRecord>(&line) {
                     seq = rec.seq;
                     last_hash = rec.hash;
@@ -92,20 +92,18 @@ impl AuditWriter {
             let _ = std::fs::set_permissions(path, perms);
         }
         Ok(Self {
-            inner: Mutex::new(Inner { file, seq, last_hash }),
+            inner: Mutex::new(Inner {
+                file,
+                seq,
+                last_hash,
+            }),
             path: path.to_path_buf(),
         })
     }
 
     /// Append a record. Never panics (a poisoned lock or IO error drops ONE
     /// record + logs — the server must stay up; the `seq` gap surfaces the loss).
-    pub fn append(
-        &self,
-        action: &str,
-        operator: &str,
-        target: &str,
-        detail: serde_json::Value,
-    ) {
+    pub fn append(&self, action: &str, operator: &str, target: &str, detail: serde_json::Value) {
         let mut inner = match self.inner.lock() {
             Ok(g) => g,
             Err(_) => {
@@ -144,17 +142,17 @@ impl AuditWriter {
         let f = File::open(&self.path)?;
         let mut recs: Vec<AuditRecord> = BufReader::new(f)
             .lines()
-            .flatten()
+            .map_while(Result::ok)
             .filter_map(|l| serde_json::from_str::<AuditRecord>(&l).ok())
-            .filter(|r| q.operator.as_deref().map_or(true, |o| r.operator == o))
-            .filter(|r| q.action.as_deref().map_or(true, |a| r.action == a))
-            .filter(|r| q.since.map_or(true, |s| r.ts >= s))
-            .filter(|r| q.until.map_or(true, |u| r.ts <= u))
+            .filter(|r| q.operator.as_deref().is_none_or(|o| r.operator == o))
+            .filter(|r| q.action.as_deref().is_none_or(|a| r.action == a))
+            .filter(|r| q.since.is_none_or(|s| r.ts >= s))
+            .filter(|r| q.until.is_none_or(|u| r.ts <= u))
             .collect();
         if q.dir.as_deref() == Some("asc") {
             recs.sort_by_key(|r| r.seq);
         } else {
-            recs.sort_by(|a, b| b.seq.cmp(&a.seq));
+            recs.sort_by_key(|r| std::cmp::Reverse(r.seq));
         }
         let offset = q.offset.unwrap_or(0).min(recs.len());
         let limit = q.limit.unwrap_or(500).min(5000);
@@ -171,7 +169,7 @@ impl AuditWriter {
     pub fn verify_chain(path: &Path) -> std::io::Result<Option<u64>> {
         let f = File::open(path)?;
         let mut prev = ZERO_HASH.to_string();
-        for line in BufReader::new(f).lines().flatten() {
+        for line in BufReader::new(f).lines().map_while(Result::ok) {
             let rec: AuditRecord = match serde_json::from_str(&line) {
                 Ok(r) => r,
                 Err(_) => return Ok(Some(prev_parse_seq(&line).unwrap_or(0))),
@@ -181,7 +179,13 @@ impl AuditWriter {
             }
             let detail_json = serde_json::to_string(&rec.detail).unwrap_or_else(|_| "null".into());
             let recomputed = hash_record(
-                rec.seq, rec.ts, &rec.operator, &rec.action, &rec.target, &detail_json, &rec.prev_hash,
+                rec.seq,
+                rec.ts,
+                &rec.operator,
+                &rec.action,
+                &rec.target,
+                &detail_json,
+                &rec.prev_hash,
             );
             if recomputed != rec.hash {
                 return Ok(Some(rec.seq));
@@ -215,7 +219,9 @@ fn hash_record(
 }
 
 fn prev_parse_seq(line: &str) -> Option<u64> {
-    serde_json::from_str::<AuditRecord>(line).ok().map(|r| r.seq)
+    serde_json::from_str::<AuditRecord>(line)
+        .ok()
+        .map(|r| r.seq)
 }
 
 fn now_secs() -> u64 {
@@ -248,7 +254,7 @@ mod tests {
         assert_eq!(recs[0].seq, 2);
         assert_eq!(recs[1].prev_hash, ZERO_HASH); // first record
         assert_eq!(recs[0].prev_hash, recs[1].hash); // chained
-        // verify clean
+                                                     // verify clean
         let path = dir.path().join("audit.jsonl");
         assert_eq!(AuditWriter::verify_chain(&path).unwrap(), None);
     }

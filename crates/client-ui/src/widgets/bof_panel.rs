@@ -54,7 +54,9 @@ impl Widget for BofPanel {
                 } else {
                     list.set_item_range(cx, 0, bofs_guard.len());
                     while let Some(item_id) = list.next_visible_item(cx) {
-                        let Some(b) = bofs_guard.get(item_id) else { continue };
+                        let Some(b) = bofs_guard.get(item_id) else {
+                            continue;
+                        };
                         let item = list.item(cx, item_id, id!(Item));
 
                         // Repaint the row from the single Palette source.
@@ -76,11 +78,14 @@ impl Widget for BofPanel {
                         };
                         let mut status_lbl = item.label(cx, ids!(status));
                         script_apply_eval!(cx, status_lbl, { draw_text +: { color: #(status_color) } });
-                        status_lbl.set_text(cx, match b.status {
-                            BofStatus::Pending => "pending",
-                            BofStatus::Done => "done",
-                            BofStatus::Error => "error",
-                        });
+                        status_lbl.set_text(
+                            cx,
+                            match b.status {
+                                BofStatus::Pending => "pending",
+                                BofStatus::Done => "done",
+                                BofStatus::Error => "error",
+                            },
+                        );
 
                         let mut args_lbl = item.label(cx, ids!(args));
                         script_apply_eval!(cx, args_lbl, { draw_text +: { color: #(p.muted) } });

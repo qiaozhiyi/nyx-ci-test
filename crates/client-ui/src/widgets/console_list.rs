@@ -34,7 +34,9 @@ impl Widget for ConsoleList {
             if let Some(mut list) = step.as_portal_list().borrow_mut() {
                 list.set_item_range(cx, 0, lines.len());
                 while let Some(item_id) = list.next_visible_item(cx) {
-                    let Some(line) = lines.get(item_id) else { continue };
+                    let Some(line) = lines.get(item_id) else {
+                        continue;
+                    };
                     let item = list.item(cx, item_id, id!(Item));
                     let p = crate::theme::Palette::current();
                     let mut row_item = item.clone();

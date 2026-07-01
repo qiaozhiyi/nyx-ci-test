@@ -1,0 +1,46 @@
+# cargo-fuzz harness for the nyx-protocol wire codec.
+#
+# This is a STANDALONE workspace (deliberately NOT a member of the repo's root
+# [workspace] in ../../../Cargo.toml). Reasons:
+#   1. cargo-fuzz must build the harness + libfuzzer with a nightly toolchain and
+#      sanitizer/-Z flags that the stable root toolchain (rust-toolchain.toml)
+#      does not provide. cargo-fuzz selects nightly automatically.
+#   2. The root workspace sets `panic = "abort"` on [profile.release] (implant
+#      size constraint) along with opt-level="z"/lto=true. By keeping a separate
+#      workspace here, that profile does NOT leak into the fuzz build; cargo-fuzz
+#      manages its own [profile.fuzz]. We re-assert panic=abort below because a
+#      panic in the decode path must surface as a crash — on the real server,
+#      panic=abort kills the process (= DoS), so the fuzz harness must model
+#      that exactly rather than letting a panic unwind quietly.
+#
+# Run from crates/protocol:
+#   cargo fuzz run decode_vec -- -max_total_time=30
+#   cargo fuzz build decode_vec
+
+[package]
+name = "nyx-protocol-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0 OR MIT"
+
+# Do NOT merge into the repo root workspace. cargo-fuzz expects to manage this.
+[workspace]
+
+[dependencies]
+nyx-protocol = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[profile.fuzz]
+inherits = "release"
+panic = "abort"
+
+# Required by cargo-fuzz >= 0.13 to recognize this as a fuzz manifest.
+[package.metadata]
+cargo-fuzz = true
+
+[[bin]]
+name = "decode_vec"
+path = "fuzz_targets/decode_vec.rs"
+test = false
+doc = false

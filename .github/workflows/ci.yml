@@ -1,0 +1,80 @@
+name: CI
+
+# Continuous integration for the Nyx framework core crates.
+# Runs on every push to main + all PRs. Three gates: test, clippy, fmt.
+#
+# Scope: workspace crates (server, client-cli, protocol, transport, etc.)
+# EXCLUDING nyx-client-ui (Makepad GUI — has its own clippy profile; tracked
+# separately) and the standalone non-workspace crates (implant-win,
+# operator-kernelsdk, implant-evasionsdk — each has its own [workspace] and
+# is verified by g6-verify.yml + manual real-machine testing).
+#
+# The standalone crates ARE tested in the `standalone` job via their own
+# `cargo test --lib` so their 87+53 unit tests are gated too.
+#
+# Authorized red-team security research project.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ---- Gate 1: fmt (fastest, fail early) ----
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # ---- Gate 2: clippy on core crates (exclude client-ui Makepad GUI) ----
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: cargo clippy (workspace, excl. client-ui)
+        run: cargo clippy --workspace --exclude nyx-client-ui --all-targets -- -D warnings
+
+  # ---- Gate 3: tests on matrix (Ubuntu + macOS) ----
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test --workspace
+        run: cargo test --workspace --all-targets
+
+  # ---- Gate 4: standalone crates (each has its own [workspace]) ----
+  standalone:
+    name: Standalone crate tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: operator-kernelsdk lib tests
+        run: cargo test --manifest-path crates/operator-kernelsdk/Cargo.toml --lib
+      - name: implant-evasionsdk tests
+        run: cargo test --manifest-path crates/implant-evasionsdk/Cargo.toml
