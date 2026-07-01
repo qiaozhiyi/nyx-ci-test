@@ -19,8 +19,9 @@
 //!
 //! ## Host-testable
 //! The scan logic is pure byte matching — tested with a mock ntoskrnl image.
-
-#![cfg_attr(not(test), allow(dead_code))]
+//
+// `pattern_scan` is consumed by `win::resolve_offsets` (the autonomous offset
+// resolver) on the non-test build path. No blanket dead-code suppression.
 
 /// A byte pattern with optional wildcards. `None` = wildcard (match any byte).
 pub type Pattern = [Option<u8>];

