@@ -54,6 +54,7 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
     MetaCmd { name: "/screenwatch", args_hint: "<secs>", help: "periodic screenshots" },
     MetaCmd { name: "/hashdump", args_hint: "[sam|system|shadow]", help: "credential hashes (sam=0 system=1 shadow=3)" },
     MetaCmd { name: "/getuid", args_hint: "", help: "current thread identity" },
+    MetaCmd { name: "/inject", args_hint: "<method> <pid|spawn_to> <file>", help: "inject shellcode (method 0=pool/stomp 1=threadless 2=stomp)" },
     MetaCmd { name: "/steal", args_hint: "<pid>", help: "steal a process token" },
     MetaCmd { name: "/make_token", args_hint: "<domain\\user> <password> [1|2|3]", help: "make a logon token" },
     MetaCmd { name: "/rev2self", args_hint: "", help: "drop impersonation (keep token)" },

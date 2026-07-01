@@ -263,6 +263,9 @@ fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
             Ok(o) => vec![Response::Output(o.stdout)],
             Err(e) => vec![Response::Err(format!("whoami failed: {e}"))],
         },
+        Command::Inject { .. } => vec![Response::Err(
+            "dev agent: inject is a Windows implant primitive".into(),
+        )],
         Command::Exit => vec![Response::Ok],
     }
 }

