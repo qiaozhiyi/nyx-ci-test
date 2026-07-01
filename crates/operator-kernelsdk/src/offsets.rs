@@ -53,6 +53,11 @@ pub struct EprocessOffsets {
     pub signature_level: usize,
     pub section_signature_level: usize,
     pub protection: usize,
+    /// `_EPROCESS.Peb` — build-specific offset of the PEB pointer field.
+    /// Authoritative: comes from the offsets table (Vergilius cross-checked).
+    /// The dynamic probe cannot discover this (System's PEB is NULL), so it
+    /// returns 0 for unknown builds — callers must rely on the table.
+    pub peb: usize,
 }
 
 /// A known build's EPROCESS offsets, keyed by the Windows build number.
@@ -64,97 +69,244 @@ pub struct EprocessBuild {
 
 pub const KNOWN_EPROCESS_BUILDS: &[EprocessBuild] = &[
     // Win10 1507 (10240)
-    EprocessBuild { build: 10240, offsets: EprocessOffsets {
-        unique_process_id: 0x2e0, active_process_links: 0x2e8,
-        token: 0x358, image_file_name: 0x450,
-        signature_level: 0x6c0, section_signature_level: 0x6c1, protection: 0x6c2,
-    }},
+    EprocessBuild {
+        build: 10240,
+        offsets: EprocessOffsets {
+            unique_process_id: 0x2e0,
+            active_process_links: 0x2e8,
+            token: 0x358,
+            image_file_name: 0x450,
+            signature_level: 0x6c0,
+            section_signature_level: 0x6c1,
+            protection: 0x6c2,
+            peb: 0x358,
+        },
+    },
     // Win10 1511 (10586) — PID shifted +8 from 1507, Token maintains +0x78 delta
-    EprocessBuild { build: 10586, offsets: EprocessOffsets {
-        unique_process_id: 0x2e8, active_process_links: 0x2f0,
-        token: 0x360, image_file_name: 0x450,
-        signature_level: 0x6c0, section_signature_level: 0x6c1, protection: 0x6c2,
-    }},
+    EprocessBuild {
+        build: 10586,
+        offsets: EprocessOffsets {
+            unique_process_id: 0x2e8,
+            active_process_links: 0x2f0,
+            token: 0x360,
+            image_file_name: 0x450,
+            signature_level: 0x6c0,
+            section_signature_level: 0x6c1,
+            protection: 0x6c2,
+            peb: 0x358, // peb: approximated from build 1507
+        },
+    },
     // Win10 1607 (14393) — PID back to 0x2e0
-    EprocessBuild { build: 14393, offsets: EprocessOffsets {
-        unique_process_id: 0x2e0, active_process_links: 0x2e8,
-        token: 0x358, image_file_name: 0x450,
-        signature_level: 0x6c0, section_signature_level: 0x6c1, protection: 0x6c2,
-    }},
+    EprocessBuild {
+        build: 14393,
+        offsets: EprocessOffsets {
+            unique_process_id: 0x2e0,
+            active_process_links: 0x2e8,
+            token: 0x358,
+            image_file_name: 0x450,
+            signature_level: 0x6c0,
+            section_signature_level: 0x6c1,
+            protection: 0x6c2,
+            peb: 0x338,
+        },
+    },
     // Win10 1703 (15063) — Protection shifted to 0x6ca
-    EprocessBuild { build: 15063, offsets: EprocessOffsets {
-        unique_process_id: 0x2e0, active_process_links: 0x2e8,
-        token: 0x358, image_file_name: 0x450,
-        signature_level: 0x6c8, section_signature_level: 0x6c9, protection: 0x6ca,
-    }},
+    EprocessBuild {
+        build: 15063,
+        offsets: EprocessOffsets {
+            unique_process_id: 0x2e0,
+            active_process_links: 0x2e8,
+            token: 0x358,
+            image_file_name: 0x450,
+            signature_level: 0x6c8,
+            section_signature_level: 0x6c9,
+            protection: 0x6ca,
+            peb: 0x338, // peb: approximated from build 1607
+        },
+    },
     // Win10 1709 (16299) — same as 1703
-    EprocessBuild { build: 16299, offsets: EprocessOffsets {
-        unique_process_id: 0x2e0, active_process_links: 0x2e8,
-        token: 0x358, image_file_name: 0x450,
-        signature_level: 0x6c8, section_signature_level: 0x6c9, protection: 0x6ca,
-    }},
+    EprocessBuild {
+        build: 16299,
+        offsets: EprocessOffsets {
+            unique_process_id: 0x2e0,
+            active_process_links: 0x2e8,
+            token: 0x358,
+            image_file_name: 0x450,
+            signature_level: 0x6c8,
+            section_signature_level: 0x6c9,
+            protection: 0x6ca,
+            peb: 0x338, // peb: approximated from build 1607
+        },
+    },
     // Win10 1803 (17134) — Token maintains +0x78 delta from PID
-    EprocessBuild { build: 17134, offsets: EprocessOffsets {
-        unique_process_id: 0x2e0, active_process_links: 0x2e8,
-        token: 0x358, image_file_name: 0x450,
-        signature_level: 0x6c8, section_signature_level: 0x6c9, protection: 0x6ca,
-    }},
+    EprocessBuild {
+        build: 17134,
+        offsets: EprocessOffsets {
+            unique_process_id: 0x2e0,
+            active_process_links: 0x2e8,
+            token: 0x358,
+            image_file_name: 0x450,
+            signature_level: 0x6c8,
+            section_signature_level: 0x6c9,
+            protection: 0x6ca,
+            peb: 0x338, // peb: approximated from build 1607
+        },
+    },
     // Win10 1809 / Server 2019 (17763) — code-verified: matches existing offsets.rs
-    EprocessBuild { build: 17763, offsets: EprocessOffsets {
-        unique_process_id: 0x2e0, active_process_links: 0x2e8,
-        token: 0x358, image_file_name: 0x450,
-        signature_level: 0x6c8, section_signature_level: 0x6c9, protection: 0x6ca,
-    }},
+    EprocessBuild {
+        build: 17763,
+        offsets: EprocessOffsets {
+            unique_process_id: 0x2e0,
+            active_process_links: 0x2e8,
+            token: 0x358,
+            image_file_name: 0x450,
+            signature_level: 0x6c8,
+            section_signature_level: 0x6c9,
+            protection: 0x6ca,
+            peb: 0x3F8,
+        },
+    },
     // Win10 1903 (18362) — fields shifted +8 from 1809
-    EprocessBuild { build: 18362, offsets: EprocessOffsets {
-        unique_process_id: 0x2e8, active_process_links: 0x2f0,
-        token: 0x360, image_file_name: 0x450,
-        signature_level: 0x6f8, section_signature_level: 0x6f9, protection: 0x6fa,
-    }},
+    EprocessBuild {
+        build: 18362,
+        offsets: EprocessOffsets {
+            unique_process_id: 0x2e8,
+            active_process_links: 0x2f0,
+            token: 0x360,
+            image_file_name: 0x450,
+            signature_level: 0x6f8,
+            section_signature_level: 0x6f9,
+            protection: 0x6fa,
+            peb: 0x408,
+        },
+    },
     // Win10 2004 (19041) — same EPROCESS as 1903
-    EprocessBuild { build: 19041, offsets: EprocessOffsets {
-        unique_process_id: 0x2e8, active_process_links: 0x2f0,
-        token: 0x360, image_file_name: 0x450,
-        signature_level: 0x6f8, section_signature_level: 0x6f9, protection: 0x6fa,
-    }},
+    EprocessBuild {
+        build: 19041,
+        offsets: EprocessOffsets {
+            unique_process_id: 0x2e8,
+            active_process_links: 0x2f0,
+            token: 0x360,
+            image_file_name: 0x450,
+            signature_level: 0x6f8,
+            section_signature_level: 0x6f9,
+            protection: 0x6fa,
+            peb: 0x440,
+        },
+    },
     // Server 2022 (20348) — major shift: PID→0x440
-    EprocessBuild { build: 20348, offsets: EprocessOffsets {
-        unique_process_id: 0x440, active_process_links: 0x448,
-        token: 0x4b8, image_file_name: 0x5a0,
-        signature_level: 0x878, section_signature_level: 0x879, protection: 0x87a,
-    }},
+    EprocessBuild {
+        build: 20348,
+        offsets: EprocessOffsets {
+            unique_process_id: 0x440,
+            active_process_links: 0x448,
+            token: 0x4b8,
+            image_file_name: 0x5a0,
+            signature_level: 0x878,
+            section_signature_level: 0x879,
+            protection: 0x87a,
+            peb: 0x4C0,
+        },
+    },
     // Win11 22H2 (22621)
-    EprocessBuild { build: 22621, offsets: EprocessOffsets {
-        unique_process_id: 0x440, active_process_links: 0x448,
-        token: 0x4b8, image_file_name: 0x5a0,
-        signature_level: 0x878, section_signature_level: 0x879, protection: 0x87a,
-    }},
+    EprocessBuild {
+        build: 22621,
+        offsets: EprocessOffsets {
+            unique_process_id: 0x440,
+            active_process_links: 0x448,
+            token: 0x4b8,
+            image_file_name: 0x5a0,
+            signature_level: 0x878,
+            section_signature_level: 0x879,
+            protection: 0x87a,
+            peb: 0x5B8,
+        },
+    },
     // Win11 23H2 (22631) — same as 22H2
-    EprocessBuild { build: 22631, offsets: EprocessOffsets {
-        unique_process_id: 0x440, active_process_links: 0x448,
-        token: 0x4b8, image_file_name: 0x5a0,
-        signature_level: 0x878, section_signature_level: 0x879, protection: 0x87a,
-    }},
+    EprocessBuild {
+        build: 22631,
+        offsets: EprocessOffsets {
+            unique_process_id: 0x440,
+            active_process_links: 0x448,
+            token: 0x4b8,
+            image_file_name: 0x5a0,
+            signature_level: 0x878,
+            section_signature_level: 0x879,
+            protection: 0x87a,
+            peb: 0x5B8, // peb: approximated from build 22621
+        },
+    },
     // Win11 24H2 (26100) — CET default, EPROCESS restructured
-    EprocessBuild { build: 26100, offsets: EprocessOffsets {
-        unique_process_id: 0x450, active_process_links: 0x458,
-        token: 0x4c8, image_file_name: 0x5a8,
-        signature_level: 0x87c, section_signature_level: 0x87d, protection: 0x87e,
-    }},
+    EprocessBuild {
+        build: 26100,
+        offsets: EprocessOffsets {
+            unique_process_id: 0x450,
+            active_process_links: 0x458,
+            token: 0x4c8,
+            image_file_name: 0x5a8,
+            signature_level: 0x87c,
+            section_signature_level: 0x87d,
+            protection: 0x87e,
+            peb: 0x6C8,
+        },
+    },
     // Win11 25H2 (26200) — same as 24H2
-    EprocessBuild { build: 26200, offsets: EprocessOffsets {
-        unique_process_id: 0x450, active_process_links: 0x458,
-        token: 0x4c8, image_file_name: 0x5a8,
-        signature_level: 0x87c, section_signature_level: 0x87d, protection: 0x87e,
-    }},
+    EprocessBuild {
+        build: 26200,
+        offsets: EprocessOffsets {
+            unique_process_id: 0x450,
+            active_process_links: 0x458,
+            token: 0x4c8,
+            image_file_name: 0x5a8,
+            signature_level: 0x87c,
+            section_signature_level: 0x87d,
+            protection: 0x87e,
+            peb: 0x6C8,
+        },
+    },
 ];
 
-/// Look up EPROCESS offsets for a Windows build number. Returns the closest
-/// known build ≤ the requested one (floor match). None if below all known builds.
+/// Patch builds whose EPROCESS layout is *verified identical* to a baseline
+/// build (enablement packages / service updates with the same kernel binary).
+/// A patch build here resolves to its baseline's offsets. This is an EXPLICIT
+/// allow-list — adding an entry requires confirming (Vergilius / EDRSandblast
+/// CSV) that the layout truly matches. See `offsets_table.rs` for the rationale
+/// against blind floor-matching.
+pub const PATCH_EQUIVALENT_BUILDS: &[(u32, u32)] = &[
+    // Win10 20H2/21H1/21H2/22H2 — enablement packages over 2004 (19041).
+    (19042, 19041),
+    (19043, 19041),
+    (19044, 19041),
+    (19045, 19041),
+    // Win10 1909 (18363) — same EPROCESS as 1903 (18362).
+    (18363, 18362),
+    // Win11 21H2 (22000) — same EPROCESS as Server 2022 (20348).
+    (22000, 20348),
+    // Win11 25H2 (26200) is already in the table (same as 24H2). Future
+    // Insider builds (e.g. 262xx, 263xx) are NOT listed — they return None
+    // from for_build and must go through resolve_eprocess_offsets (probe).
+];
+
+/// Look up EPROCESS offsets for a Windows build number. Resolution order:
+///
+/// 1. **Exact match** in [`KNOWN_EPROCESS_BUILDS`].
+/// 2. **Patch-equivalent** match in [`PATCH_EQUIVALENT_BUILDS`].
+/// 3. **`None`** — the caller should fall back to [`resolve_eprocess_offsets`]
+///    (DefenderDump-style invariant probe) or skip the technique.
+///
+/// Does NOT floor-match. A blind floor-match silently gambles the layout is
+/// unchanged — wrong on every EPROCESS restructuring → bugcheck.
 pub fn for_build(build: u32) -> Option<&'static EprocessBuild> {
-    KNOWN_EPROCESS_BUILDS.iter().find(|b| b.build == build).or_else(|| {
-        KNOWN_EPROCESS_BUILDS.iter().filter(|b| b.build <= build).max_by_key(|b| b.build)
-    })
+    // 1. Exact match.
+    if let Some(b) = KNOWN_EPROCESS_BUILDS.iter().find(|b| b.build == build) {
+        return Some(b);
+    }
+    // 2. Patch-equivalent: resolve to baseline, then look up the baseline.
+    if let Some(&(_, baseline)) = PATCH_EQUIVALENT_BUILDS.iter().find(|(p, _)| *p == build) {
+        return KNOWN_EPROCESS_BUILDS.iter().find(|b| b.build == baseline);
+    }
+    // 3. Unknown build.
+    None
 }
 
 /// All known build numbers (for diagnostics / selftest).
@@ -171,10 +323,10 @@ pub mod ps_protection {
     pub const TYPE_PROTECTED: u8 = 2;
     /// Type occupies bits 0-2.
     pub const TYPE_MASK: u8 = 0b0000_1111; // bits 0-2 (bit 3 is Audit)
-    // NOTE: SIGNER values are the ENUM values (PS_PROTECTED_SIGNER), packed
-    // into bits 4-7 (not bits 3-7 — bit 3 is Audit). Assembly:
-    //   level = type | (audit << 3) | (signer << 4)
-    // phnt enum PS_PROTECTED_SIGNER:
+                                           // NOTE: SIGNER values are the ENUM values (PS_PROTECTED_SIGNER), packed
+                                           // into bits 4-7 (not bits 3-7 — bit 3 is Audit). Assembly:
+                                           //   level = type | (audit << 3) | (signer << 4)
+                                           // phnt enum PS_PROTECTED_SIGNER:
     pub const SIGNER_NONE: u8 = 0;
     pub const SIGNER_AUTHENTICODE: u8 = 1;
     pub const SIGNER_CODEGEN: u8 = 2;
@@ -226,10 +378,9 @@ pub mod notify_routines {
 
 /// ETW-TI symbol name (exported) — resolve via MmGetSystemRoutineAddress.
 pub const ETW_TI_HANDLE_SYMBOL: &[u16] = &[
-    'E' as u16, 't' as u16, 'w' as u16, 'T' as u16, 'h' as u16, 'r' as u16,
-    'e' as u16, 'a' as u16, 't' as u16, 'I' as u16, 'n' as u16, 't' as u16,
-    'P' as u16, 'r' as u16, 'o' as u16, 'v' as u16, 'R' as u16, 'e' as u16,
-    'g' as u16, 'H' as u16, 'a' as u16, 'n' as u16, 'd' as u16, 'l' as u16,
+    'E' as u16, 't' as u16, 'w' as u16, 'T' as u16, 'h' as u16, 'r' as u16, 'e' as u16, 'a' as u16,
+    't' as u16, 'I' as u16, 'n' as u16, 't' as u16, 'P' as u16, 'r' as u16, 'o' as u16, 'v' as u16,
+    'R' as u16, 'e' as u16, 'g' as u16, 'H' as u16, 'a' as u16, 'n' as u16, 'd' as u16, 'l' as u16,
     'e' as u16, 0,
 ];
 
@@ -320,9 +471,9 @@ pub const KNOWN_PG_CONTEXT_BUILDS: &[PgContextBuild] = &[
     PgContextBuild {
         build: 17763,
         offsets: PgContextOffsets {
-            prcb_pg_thread_offset: 0x190,   // PRCB.KiReservedContext area
-            context_valid_offset: 0x08,     // first qword = valid flag
-            context_size: 0x800,            // typical PG context size
+            prcb_pg_thread_offset: 0x190, // PRCB.KiReservedContext area
+            context_valid_offset: 0x08,   // first qword = valid flag
+            context_size: 0x800,          // typical PG context size
             supports_thread_suspend: false,
         },
     },
@@ -368,12 +519,35 @@ pub const KNOWN_PG_CONTEXT_BUILDS: &[PgContextBuild] = &[
     },
 ];
 
-/// Look up PG context offsets for a Windows build. Returns the closest known
-/// build ≤ the requested one (floor match). None if below all known builds.
+/// Patch builds whose PatchGuard context layout is verified identical to a
+/// baseline. PG context offsets are coarser-grained than EPROCESS (most builds
+/// share `prcb_pg_thread_offset: 0x190`, `context_valid_offset: 0x08`), so the
+/// patch-equivalent list overlaps heavily with the EPROCESS one.
+pub const PG_PATCH_EQUIVALENT_BUILDS: &[(u32, u32)] = &[
+    // Win10 20H2-22H2 — same PG context as 2004 (19041).
+    (19042, 19041),
+    (19043, 19041),
+    (19044, 19041),
+    (19045, 19041),
+    // Win11 21H2 — same PG context as Server 2022 (19041 row; timing-repair).
+    (22000, 19041),
+    // Win11 23H2 (22631) — same as 22H2 (22621).
+    (22631, 22621),
+];
+
+/// Look up PG context offsets for a Windows build. Same resolution strategy as
+/// [`for_build`]: exact match → patch-equivalent → None. Does NOT floor-match.
 pub fn pg_context_for_build(build: u32) -> Option<&'static PgContextBuild> {
-    KNOWN_PG_CONTEXT_BUILDS.iter().find(|b| b.build == build).or_else(|| {
-        KNOWN_PG_CONTEXT_BUILDS.iter().filter(|b| b.build <= build).max_by_key(|b| b.build)
-    })
+    // 1. Exact match.
+    if let Some(b) = KNOWN_PG_CONTEXT_BUILDS.iter().find(|b| b.build == build) {
+        return Some(b);
+    }
+    // 2. Patch-equivalent.
+    if let Some(&(_, baseline)) = PG_PATCH_EQUIVALENT_BUILDS.iter().find(|(p, _)| *p == build) {
+        return KNOWN_PG_CONTEXT_BUILDS.iter().find(|b| b.build == baseline);
+    }
+    // 3. Unknown build.
+    None
 }
 
 // ============================================================================
@@ -435,9 +609,16 @@ mod tests {
         assert_eq!(ps_protection::TYPE_MASK & ps_protection::SIGNER_MASK, 0);
         assert_eq!(ps_protection::TYPE_MASK | ps_protection::SIGNER_MASK, 0xFF);
         // A WinSystem-protected process packs: Protected(2) | (WinSystem<<4).
-        let level: u8 = ps_protection::TYPE_PROTECTED | (ps_protection::SIGNER_WIN_SYSTEM << ps_protection::SIGNER_SHIFT);
-        assert_eq!(level & ps_protection::TYPE_MASK, ps_protection::TYPE_PROTECTED);
-        assert_eq!((level & ps_protection::SIGNER_MASK) >> ps_protection::SIGNER_SHIFT, ps_protection::SIGNER_WIN_SYSTEM);
+        let level: u8 = ps_protection::TYPE_PROTECTED
+            | (ps_protection::SIGNER_WIN_SYSTEM << ps_protection::SIGNER_SHIFT);
+        assert_eq!(
+            level & ps_protection::TYPE_MASK,
+            ps_protection::TYPE_PROTECTED
+        );
+        assert_eq!(
+            (level & ps_protection::SIGNER_MASK) >> ps_protection::SIGNER_SHIFT,
+            ps_protection::SIGNER_WIN_SYSTEM
+        );
         // Sanity: WinSystem=7 (phnt enum), WinTcb=6, Lsa=4, Antimalware=3.
         assert_eq!(ps_protection::SIGNER_WIN_SYSTEM, 7);
         assert_eq!(ps_protection::SIGNER_WIN_TCB, 6);
@@ -465,20 +646,34 @@ mod eprocess_table_tests {
     fn build_17763_matches_hardcoded_constants() {
         let b = for_build(17763).unwrap();
         assert_eq!(b.offsets.unique_process_id, eprocess::UNIQUE_PROCESS_ID);
-        assert_eq!(b.offsets.active_process_links, eprocess::ACTIVE_PROCESS_LINKS);
+        assert_eq!(
+            b.offsets.active_process_links,
+            eprocess::ACTIVE_PROCESS_LINKS
+        );
         assert_eq!(b.offsets.token, eprocess::TOKEN);
         assert_eq!(b.offsets.protection, eprocess::PROTECTION);
         assert_eq!(b.offsets.signature_level, eprocess::SIGNATURE_LEVEL);
     }
 
     #[test]
-    fn floor_match_for_patch_builds() {
-        // 19045 (22H2) should floor-match to 19041
+    fn patch_equivalent_builds_resolve() {
+        // 19045 (22H2) is an enablement package over 2004 (19041).
         let b = for_build(19045).unwrap();
         assert_eq!(b.build, 19041);
-        // 22630 should floor-match to 22621
-        let b = for_build(22630).unwrap();
-        assert_eq!(b.build, 22621);
+        // Full enablement range.
+        for &patch in &[19042, 19043, 19044, 19045] {
+            assert_eq!(for_build(patch).unwrap().build, 19041);
+        }
+        // Win11 21H2 → Server 2022.
+        assert_eq!(for_build(22000).unwrap().build, 20348);
+    }
+
+    #[test]
+    fn unknown_future_build_returns_none() {
+        // A future build NOT in the table and NOT patch-equivalent. Must NOT
+        // silently floor-match — resolve_eprocess_offsets is the fallback.
+        assert!(for_build(26300).is_none());
+        assert!(for_build(26999).is_none());
     }
 
     #[test]
@@ -494,7 +689,10 @@ mod eprocess_table_tests {
             assert!(b.offsets.token > 0);
             assert!(b.offsets.protection > 0x400);
             // SignatureLevel and SectionSignatureLevel are adjacent, Protection = SectionSigLevel + 1
-            assert_eq!(b.offsets.section_signature_level, b.offsets.signature_level + 1);
+            assert_eq!(
+                b.offsets.section_signature_level,
+                b.offsets.signature_level + 1
+            );
             assert_eq!(b.offsets.protection, b.offsets.section_signature_level + 1);
         }
     }
@@ -555,7 +753,9 @@ pub fn probe_eprocess_offsets(
             break;
         }
     }
-    let pid_offset = pid_offset.ok_or(KrwError::UnresolvedOffset("PID scan: System PID=4 not found"))?;
+    let pid_offset = pid_offset.ok_or(KrwError::UnresolvedOffset(
+        "PID scan: System PID=4 not found",
+    ))?;
 
     // Step 2: Links offset = PID + 8 (LIST_ENTRY follows UniqueProcessId).
     let links_offset = pid_offset + 8;
@@ -563,13 +763,17 @@ pub fn probe_eprocess_offsets(
     // Verify Links: Flink should be a valid kernel pointer.
     let flink = krw.kread_u64(system_eprocess_kva + links_offset)?;
     if flink < 0xFFFF_8000_0000_0000 {
-        return Err(KrwError::UnresolvedOffset("Links scan: Flink not a kernel VA"));
+        return Err(KrwError::UnresolvedOffset(
+            "Links scan: Flink not a kernel VA",
+        ));
     }
 
     // Step 3: Token offset = PID + 0x78 (constant delta).
     let token_offset = pid_offset + PID_TO_TOKEN_DELTA;
     if token_offset + 8 > EPROCESS_SCAN_LIMIT {
-        return Err(KrwError::UnresolvedOffset("Token offset exceeds EPROCESS size"));
+        return Err(KrwError::UnresolvedOffset(
+            "Token offset exceeds EPROCESS size",
+        ));
     }
 
     // Step 4: Scan for ImageFileName — ASCII "System\0" after Links.
@@ -583,8 +787,9 @@ pub fn probe_eprocess_offsets(
             break;
         }
     }
-    let image_name_offset = image_name_offset
-        .ok_or(KrwError::UnresolvedOffset("ImageFileName scan: 'System' not found"))?;
+    let image_name_offset = image_name_offset.ok_or(KrwError::UnresolvedOffset(
+        "ImageFileName scan: 'System' not found",
+    ))?;
 
     // Step 5: Scan for Protection byte == 0x72 (WinSystem:PP = Type:2 | Signer:7<<4).
     // Protection is a single byte, located after ImageFileName in all known builds.
@@ -596,12 +801,14 @@ pub fn probe_eprocess_offsets(
             break;
         }
     }
-    let protection_offset = protection_offset
-        .ok_or(KrwError::UnresolvedOffset("Protection scan: 0x72 (WinSystem:PP) not found"))?;
+    let protection_offset = protection_offset.ok_or(KrwError::UnresolvedOffset(
+        "Protection scan: 0x72 (WinSystem:PP) not found",
+    ))?;
 
     // Step 6: SigLevel = Protection - 2, SectionSigLevel = Protection - 1.
     // Verified: these three bytes are always adjacent in all known builds.
-    let sig_level = protection_offset.checked_sub(2)
+    let sig_level = protection_offset
+        .checked_sub(2)
         .ok_or(KrwError::UnresolvedOffset("SigLevel: offset underflow"))?;
     let section_sig_level = protection_offset - 1;
 
@@ -613,7 +820,46 @@ pub fn probe_eprocess_offsets(
         signature_level: sig_level,
         section_signature_level: section_sig_level,
         protection: protection_offset,
+        // peb: undiscoverable via System-process invariants (System's PEB is
+        // NULL); unknown builds relying on the probe return 0 here and must
+        // resolve the PEB offset another way or degrade.
+        peb: 0,
     })
+}
+
+/// The three-layer EPROCESS offset resolution chain. This is the canonical
+/// entry point for any kit that needs EPROCESS offsets — it implements the
+/// "table → probe" degradation documented at the top of this module:
+///
+/// 1. **Table lookup (zero kernel reads)** — [`for_build`] exact match +
+///    patch-equivalent allow-list. The fast path for any known build; costs
+///    nothing on the target (offsets are compile-time constants).
+/// 2. **DefenderDump invariant probe (a handful of kernel reads)** —
+///    [`probe_eprocess_offsets`] scans the live System EPROCESS for structural
+///    invariants (PID=4, "System" name, 0x72 protection byte). Works on ANY
+///    Windows x64 build, including future ones not in the table. This is the
+///    fallback for unknown builds.
+///
+/// Call this instead of `for_build` directly when you have a `KernelRw`
+/// primitive (i.e. the operator's driver is loaded). The implant-side
+/// `offsets_table::for_build` has no probe fallback because ring-3 cannot read
+/// kernel memory — it returns `None` for unknown builds and the technique
+/// degrades.
+///
+/// Returns the offsets on success, or a [`KrwError`] if both layers fail
+/// (corrupted EPROCESS, kernel read fault, or a layout the probe's invariants
+/// don't cover — which would indicate a genuinely novel EPROCESS redesign).
+pub fn resolve_eprocess_offsets(
+    build: u32,
+    krw: &dyn KernelRw,
+    system_eprocess_kva: usize,
+) -> Result<EprocessOffsets, KrwError> {
+    // Layer 1: table lookup (fast path — no kernel reads needed).
+    if let Some(entry) = for_build(build) {
+        return Ok(entry.offsets);
+    }
+    // Layer 2: dynamic invariant probe (works on any build, known or unknown).
+    probe_eprocess_offsets(krw, system_eprocess_kva)
 }
 
 #[cfg(test)]
@@ -625,14 +871,20 @@ mod probe_tests {
 
     struct MockKrw(Mutex<BTreeMap<usize, u8>>);
     impl MockKrw {
-        fn new() -> Self { Self(Mutex::new(BTreeMap::new())) }
+        fn new() -> Self {
+            Self(Mutex::new(BTreeMap::new()))
+        }
         fn set_u64(&self, addr: usize, val: u64) {
             let mut m = self.0.lock();
-            for (i, b) in val.to_le_bytes().iter().enumerate() { m.insert(addr + i, *b); }
+            for (i, b) in val.to_le_bytes().iter().enumerate() {
+                m.insert(addr + i, *b);
+            }
         }
         fn set_bytes(&self, addr: usize, data: &[u8]) {
             let mut m = self.0.lock();
-            for (i, &b) in data.iter().enumerate() { m.insert(addr + i, b); }
+            for (i, &b) in data.iter().enumerate() {
+                m.insert(addr + i, b);
+            }
         }
     }
     impl KernelRw for MockKrw {
@@ -645,7 +897,9 @@ mod probe_tests {
         }
         fn kwrite(&self, kaddr: usize, src: &[u8]) -> Result<(), KrwError> {
             let mut m = self.0.lock();
-            for (i, &b) in src.iter().enumerate() { m.insert(kaddr + i, b); }
+            for (i, &b) in src.iter().enumerate() {
+                m.insert(kaddr + i, b);
+            }
             Ok(())
         }
     }
@@ -655,7 +909,10 @@ mod probe_tests {
         krw.set_u64(base + offsets.unique_process_id, 4);
         // ActiveProcessLinks: Flink = kernel VA, Blink = kernel VA
         krw.set_u64(base + offsets.active_process_links, 0xFFFF_8000_0000_1000);
-        krw.set_u64(base + offsets.active_process_links + 8, 0xFFFF_8000_0000_2000);
+        krw.set_u64(
+            base + offsets.active_process_links + 8,
+            0xFFFF_8000_0000_2000,
+        );
         // Token (any value — probe doesn't validate token content)
         krw.set_u64(base + offsets.token, 0xFFFF_8000_0000_5000 | 0x7);
         // ImageFileName = "System\0"
@@ -675,7 +932,9 @@ mod probe_tests {
         let known = for_build(17763).unwrap().offsets;
         build_mock_system_eprocess(&krw, base, &known);
         let discovered = probe_eprocess_offsets(&krw, base).unwrap();
-        assert_eq!(discovered, known);
+        let mut expected = known;
+        expected.peb = 0;
+        assert_eq!(discovered, expected);
     }
 
     #[test]
@@ -685,7 +944,9 @@ mod probe_tests {
         let known = for_build(26100).unwrap().offsets;
         build_mock_system_eprocess(&krw, base, &known);
         let discovered = probe_eprocess_offsets(&krw, base).unwrap();
-        assert_eq!(discovered, known);
+        let mut expected = known;
+        expected.peb = 0;
+        assert_eq!(discovered, expected);
     }
 
     #[test]
@@ -695,7 +956,9 @@ mod probe_tests {
         let known = for_build(19041).unwrap().offsets;
         build_mock_system_eprocess(&krw, base, &known);
         let discovered = probe_eprocess_offsets(&krw, base).unwrap();
-        assert_eq!(discovered, known);
+        let mut expected = known;
+        expected.peb = 0;
+        assert_eq!(discovered, expected);
     }
 
     #[test]
@@ -714,11 +977,64 @@ mod probe_tests {
             build_mock_system_eprocess(&krw, base, &entry.offsets);
             let discovered = probe_eprocess_offsets(&krw, base)
                 .unwrap_or_else(|e| panic!("probe failed for build {}: {:?}", entry.build, e));
+            let mut expected = entry.offsets;
+            expected.peb = 0;
             assert_eq!(
-                discovered, entry.offsets,
+                discovered, expected,
                 "probe returned wrong offsets for build {}",
                 entry.build,
             );
         }
+    }
+
+    // ---- resolve_eprocess_offsets: the table → probe fallback chain ---------
+
+    #[test]
+    fn resolve_uses_table_for_known_build() {
+        // A known build (17763) resolves from the table WITHOUT touching the
+        // kernel — even with an empty MockKrw (no System EPROCESS populated),
+        // the table layer returns the offsets before the probe ever runs.
+        let krw = MockKrw::new();
+        let base = 0xFFFF_8000_0010_0000usize;
+        let resolved = resolve_eprocess_offsets(17763, &krw, base).unwrap();
+        assert_eq!(resolved, for_build(17763).unwrap().offsets);
+    }
+
+    #[test]
+    fn resolve_uses_table_for_patch_equivalent_build() {
+        // 19045 is a patch-equivalent build (→ 19041). The table layer resolves
+        // it before the probe runs (empty MockKrw is fine).
+        let krw = MockKrw::new();
+        let base = 0xFFFF_8000_0010_0000usize;
+        let resolved = resolve_eprocess_offsets(19045, &krw, base).unwrap();
+        assert_eq!(resolved, for_build(19041).unwrap().offsets);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_probe_for_unknown_build() {
+        // A hypothetical future build (26300) is NOT in the table and NOT
+        // patch-equivalent. resolve_eprocess_offsets MUST fall back to the
+        // DefenderDump probe. We simulate a 26100-layout EPROCESS (the most
+        // recent known layout) and verify the probe discovers it — proving
+        // the fallback chain works even when the table has no entry.
+        let krw = MockKrw::new();
+        let base = 0xFFFF_8000_0010_0000usize;
+        let known_26100 = for_build(26100).unwrap().offsets;
+        build_mock_system_eprocess(&krw, base, &known_26100);
+        // 26300 is unknown → for_build returns None → probe runs.
+        let resolved = resolve_eprocess_offsets(26300, &krw, base)
+            .unwrap_or_else(|e| panic!("resolve should probe-fallback for unknown build: {:?}", e));
+        let mut expected = known_26100;
+        expected.peb = 0;
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_fails_when_both_layers_miss() {
+        // Unknown build AND empty kernel memory (probe finds nothing).
+        // Both layers fail → resolve returns Err (NOT a silent wrong offset).
+        let krw = MockKrw::new();
+        let base = 0xFFFF_8000_0010_0000usize;
+        assert!(resolve_eprocess_offsets(26300, &krw, base).is_err());
     }
 }

