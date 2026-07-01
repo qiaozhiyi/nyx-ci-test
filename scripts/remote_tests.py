@@ -88,17 +88,22 @@ def parse_ssh_config(config_path):
     return hosts
 
 def find_alias(hosts):
+    # 1. Explicit env override (no assumption about the alias name).
+    # Honor both NYX_WIN_HOST and WIN_HOST (the latter matches win_deploy.sh).
+    if os.environ.get('NYX_WIN_HOST'):
+        return os.environ['NYX_WIN_HOST']
+    if os.environ.get('WIN_HOST'):
+        return os.environ['WIN_HOST']
+    # 2. An entry literally aliased 'win' in ~/.ssh/config.
     for entry in hosts:
         if 'win' in entry['hosts']:
             return 'win'
-    for entry in hosts:
-        if entry['hostname'] == '154.201.73.67':
-            if entry['hosts']:
-                return entry['hosts'][0]
+    # 3. Any host alias containing 'win' (case-insensitive).
     for entry in hosts:
         for h in entry['hosts']:
             if 'win' in h.lower():
                 return h
+    # 4. Last resort default — no hardcoded IP.
     return 'win'
 
 def main():
@@ -115,9 +120,29 @@ def main():
     ssh_alias = find_alias(hosts)
     log(f"Resolved Windows server SSH alias: {ssh_alias}")
 
-    # Paths
-    local_dll = "/Users/qiaozhiyi/Desktop/pentest/crates/implant-win/target/x86_64-pc-windows-gnu/release/nyx_implant_win.dll"
-    remote_dir = "C:\\nyx"
+    # Paths — derive the DLL location dynamically (no hardcoded absolute path).
+    # Repo root = parent of this script's directory. Target dir from cargo metadata
+    # (falls back to <repo>/target). Override with NYX_DLL env if needed.
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    target_triple = "x86_64-pc-windows-gnu"
+    dll_name = "nyx_implant_win.dll"
+    local_dll = os.environ.get('NYX_DLL', '')
+    if not local_dll:
+        # Try cargo metadata for the real target dir (handles CARGO_TARGET_DIR).
+        try:
+            meta = subprocess.run(
+                ["cargo", "metadata", "--format-version=1", "--no-deps"],
+                cwd=repo_root, capture_output=True, text=True, timeout=30, check=True)
+            target_dir = __import__("json").loads(meta.stdout).get("target_directory", "")
+        except Exception:
+            target_dir = os.path.join(repo_root, "target")
+        local_dll = os.path.join(target_dir, target_triple, "release", dll_name)
+        # The implant has its own (non-workspace) target dir; fall back to the
+        # per-crate location if the workspace-level path doesn't exist.
+        if not os.path.exists(local_dll):
+            local_dll = os.path.join(repo_root, "crates", "implant-win", "target",
+                                     target_triple, "release", dll_name)
+    remote_dir = os.environ.get('NYX_REMOTE_DIR', r"C:\nyx")
     remote_dll = f"{remote_dir}\\nyx_implant_win.dll"
 
     # 2. Copy DLL via SCP
@@ -250,17 +275,19 @@ def main():
         report_lines.append("")
 
     report_content = "\n".join(report_lines)
-    
-    # Write report to orchestrator folder
-    report_path = "/Users/qiaozhiyi/Desktop/pentest/.agents/orchestrator/remote_tests_report.md"
-    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+
+    # Write report + log under the repo's .agents/ tree (paths relative to repo
+    # root, derived above — no hardcoded absolute paths).
+    report_dir = os.path.join(repo_root, ".agents", "orchestrator")
+    os.makedirs(report_dir, exist_ok=True)
+    report_path = os.path.join(report_dir, "remote_tests_report.md")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report_content)
     log(f"Functional test report written to: {report_path}")
 
-    # Write log to worker_m4 folder
-    log_path = "/Users/qiaozhiyi/Desktop/pentest/.agents/worker_m4/remote_tests.log"
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    log_dir = os.path.join(repo_root, ".agents", "worker_m4")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "remote_tests.log")
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("\n".join(log_messages))
     log(f"Execution log written to: {log_path}")

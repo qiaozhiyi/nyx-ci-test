@@ -10,7 +10,8 @@ import subprocess
 import time
 from datetime import datetime
 
-LOG_FILE = "/Users/qiaozhiyi/Desktop/pentest/.agents/worker_m2/ui_test_results.log"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_FILE = os.path.join(_REPO_ROOT, ".agents", "worker_m2", "ui_test_results.log")
 
 
 def log(msg):

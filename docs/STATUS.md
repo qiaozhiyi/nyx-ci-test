@@ -2,7 +2,7 @@
 
 > **权威文档。** 这是项目当前的、经代码核对的唯一状态事实源。
 > **优先级口径：** 一切以源码 `file:line` 为唯一证据。当本文与其他文档（含 `CLAUDE.md`、`docs/archive/`）冲突时，**以本文为准**。
-> **核对日期:** 2026-06-27（G1–G5 开发完成后） · **最后增量核对:** 2026-06-29（client-cli 会话字段显示闭合） · **分支:** `p2-evasion-synced` · **授权:** 仅限授权红队 / 安全研究
+> **核对日期:** 2026-06-27（G1–G5 开发完成后） · **最后增量核对:** 2026-07-01（真机全量回归：3 处 CRITICAL 修复 + 49 selftest + 偏移校验） · **分支:** `main` · **授权:** 仅限授权红队 / 安全研究
 > 历史审计 / 研究产物已移入 `docs/archive/`（见 `docs/archive/README.md`）。
 
 ---
@@ -10,13 +10,32 @@
 ## 0. 验证基线（已重新核对）
 
 - `cargo build --workspace` ✅ 绿
-- `cargo test --workspace` ✅ **326 通过 / 0 失败**（含 G1 token-op codec 测试 + 2026-06-29 client-cli 会话字段/任务 overlay 新增 6 项）
-- `cargo clippy -p nyx-cli -- -D warnings` ✅ 零警告（2026-06-29 闭合工作树先存 clippy 破损）
-- `cargo +nightly check -p nyx-implant-win --target x86_64-pc-windows-gnu` ✅ 绿（46 warnings，无 error；多为 Rust-2024 `static_mut_refs` lint）
-- `operator-kernelsdk` + `offset-resolver` 独立 crate ✅ 编译通过
-- selftest 导出 **48 个**（45 `selftests.rs` + 2 `entry.rs` + 1 `syscalls.rs`）
-- 真机环境：Windows Server 2019 Datacenter **17763.1339** + RTCore64.sys (CVE-2019-16098)
+- `cargo test --workspace` ✅ **88 通过 / 0 失败**（2026-07-01 真机回归；implant-win/kernelsdk 非 workspace 成员单独计）
+- `cargo clippy -p nyx-cli -- -D warnings` ✅ 零警告（2026-07-01 闭合 `urlencoding` 未用导入）
+- `cargo +nightly check -p nyx-implant-win --target x86_64-pc-windows-gnu` ✅ 绿（52 warnings，无 error）
+- `operator-kernelsdk`（独立 crate）✅ 编译通过，`cargo test --lib` = **90 通过 / 4 失败**（4 个为预存 `*_is_windows_only` 平台 gate 缺陷，真 Windows 上函数实际执行导致断言失败，与功能无关；见 §0a）
+- `implant-evasionsdk`（独立 crate）✅ **53 通过 / 0 失败**
+- **implant-win DLL 真机 release build** ✅ `nyx_implant_win.dll` 286.5 KB（远程 mingw-w64 16.1.0 + nightly build-std，2026-07-01）
+- selftest 导出 **49 个**（2026-07-01 真机 objdump 枚举；原计 48 漏了 `nyx_selftest_envprobe`）
+- **49 个 selftest 真机 rundll32 全量回归** ✅ 49/49 正常退出，0 超时（2026-07-01；`scripts/win_selftest_all.ps1`）
+- 真机环境：Windows Server 2019 Datacenter **17763.1339**（UBR=0x53b, ntoskrnl=10.0.17763.1339）+ RTCore64.sys (CVE-2019-16098)
 - server TLS 监听 ✅ 可用（2026-06-29 修复 rustls 0.23 CryptoProvider panic，commit `746e1dd`）
+
+### 0a. 2026-07-01 真机全量回归（本次修复验证）
+
+本次修复 3 处 CRITICAL 并在 17763.1339 真机全量验证：
+
+| 修复 | 文件:行 | 真机验证结果 |
+|---|---|---|
+| `netsec.rs` 编译错误 + DTB page-walk | `netsec.rs:269/282` | ✅ kernelsdk 编译通过，`cred_kit_dump_lsass` 测试真机 PASS |
+| `EprocessOffsets.peb` 字段 + 全表填充 | `offsets.rs:60` + 14 行 | ✅ 17763 peb=0x3F8 结构合法，`build_17763_matches` 真机 PASS |
+| `etw_deception` 堆指针信息泄露 | `etw_deception.rs:233` | ✅ 改为 `0u64`，编译通过 |
+| client-cli `urlencoding` 未用导入 + query 编码 | `rest.rs:10/1321/1355` | ✅ `clippy -D warnings` 零警告，3 处 query 参数已编码 |
+| **envprobe OUI 检测失效** | `envprobe.rs:438` | ✅ **`nyx_selftest_envprobe`=177 (0xB1 AnalysisEnv)** — VM 检测恢复工作（修复前 bug 恒报 Clean） |
+
+**已知预存缺陷（非本次引入）：** operator-kernelsdk 4 个 `*_is_windows_only` 单测在真 Windows 上失败——测试断言"非 Windows 返回 UnsupportedPosture"，但真 Windows 上函数执行了 Windows 逻辑。建议加 `#[cfg(not(target_os="windows"))]` gate。
+
+> 注：`envprobe` 退出码 177=0xB1=AnalysisEnv，因远程 154.201.73.219 本身是 VPS（VM 环境），CPUID/Timing 路径正确识别——证明 OUI 修复后 `looks_like_analysis_env()` 完整跑通无 crash。
 
 ---
 

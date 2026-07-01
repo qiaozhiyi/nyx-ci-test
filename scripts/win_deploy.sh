@@ -6,7 +6,8 @@
 # alongside it, beaconing to the local server. The macOS/Linux operator drives
 # everything over SSH + the server's REST API.
 #
-# Why this topology: in our environment the Windows host (154.201.73.67) is on a
+# Why this topology: in our environment the Windows host (resolved via the
+# `$WIN_HOST` ssh alias, default "win") is on a
 # public IP while the operator's macOS sits behind NAT with no inbound reach, so
 # the server has to live on the Windows side. The dev agent is the cross-platform
 # std build (not the stealth implant-win), good enough to exercise every Command

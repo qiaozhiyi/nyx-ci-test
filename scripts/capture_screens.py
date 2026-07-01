@@ -42,17 +42,18 @@ def capture_screenshot(output_path, env=None):
 
 def main():
     import os
+    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     # 1. Screenshot 1: default startup, disconnected (no env vars)
     print("Capturing Screenshot 1...")
-    capture_screenshot("/Users/qiaozhiyi/Desktop/pentest/screenshot_ui_1.png")
-    
+    capture_screenshot(os.path.join(_repo_root, "screenshot_ui_1.png"))
+
     # 2. Screenshot 2: connected and dark mode (using our new env vars)
     print("Capturing Screenshot 2...")
     custom_env = os.environ.copy()
     custom_env["NYX_AUTO_CONNECT"] = "1"
     custom_env["NYX_START_DARK"] = "1"
-    capture_screenshot("/Users/qiaozhiyi/Desktop/pentest/screenshot_ui_2.png", env=custom_env)
-    
+    capture_screenshot(os.path.join(_repo_root, "screenshot_ui_2.png"), env=custom_env)
+
     print("Done capturing screenshots.")
 
 if __name__ == "__main__":

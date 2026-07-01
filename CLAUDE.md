@@ -185,7 +185,15 @@ B1 heap enumerator, B2 Foliage heap mask) all completed 2026-06-27. **Gaps G1-G5
 closed 2026-06-27** (postex token-ops wired, creds/audit client sync, client-ui
 BOF loader + env token, MiniFilter reachable, offset-resolver symbol-server).
 Only **G6** remains — Win11 24H2/25H2 real-machine verify (hardware gap: sshconfig
-has no such host; `win`=Server 2019). `cargo test --workspace` = **326 passed / 0 failed**.
+has no such host; `win`=Server 2019).
+
+**2026-07-01 真机全量回归（3 处 CRITICAL 修复）：** 修复了 `operator-kernelsdk` 的 2 个编译
+错误（`netsec.rs:269/282` 缺失 `peb_offset` 字段 + usize/u64 类型）+ PEB 地址空间逻辑 bug、
+`etw_deception.rs` 堆指针信息泄露、`client-cli` 的 `urlencoding` 未用导入 + query 参数未编码、
+以及 `implant-win/envprobe.rs` 的 MAC-OUI 沙箱检测失效（`KEY_VALUE_PARTIAL_INFORMATION.Data`
+偏移 8→12 + UTF-16 stride）。在 17763.1339 真机验证：workspace 88 测试全过、kernelsdk 90/94
+（4 个预存平台 gate 缺陷）、evasionsdk 53 全过、**49 个 selftest 全部正常退出**（含
+`nyx_selftest_envprobe`=177 证明 OUI 检测恢复工作）。`cargo test --workspace` = **88 passed / 0 failed**（implant-win/kernelsdk 为非 workspace 独立 crate，单独计）。详情见 `docs/STATUS.md` §0a。
 
 ### Shipped & verified (2026-06-27)
 

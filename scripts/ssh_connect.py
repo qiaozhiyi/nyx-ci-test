@@ -40,23 +40,24 @@ def parse_ssh_config(config_path):
     return hosts
 
 def find_alias(hosts):
-    # 1. Search for entry with Host "win"
+    # 1. Explicit env override (no assumption about the alias name).
+    # Honor both NYX_WIN_HOST and WIN_HOST (the latter matches win_deploy.sh).
+    if os.environ.get('NYX_WIN_HOST'):
+        return os.environ['NYX_WIN_HOST']
+    if os.environ.get('WIN_HOST'):
+        return os.environ['WIN_HOST']
+
+    # 2. Search for entry with Host "win"
     for entry in hosts:
         if 'win' in entry['hosts']:
             return 'win'
-            
-    # 2. Search for HostName "154.201.73.67"
-    for entry in hosts:
-        if entry['hostname'] == '154.201.73.67':
-            if entry['hosts']:
-                return entry['hosts'][0]
-                
+
     # 3. Fallback: if 'win' exists in hosts list at all (case-insensitive)
     for entry in hosts:
         for h in entry['hosts']:
             if 'win' in h.lower():
                 return h
-                
+
     return None
 
 def main():
@@ -75,7 +76,10 @@ def main():
     cmd = ["ssh", alias, "hostname"]
     print(f"Executing command: {' '.join(cmd)}")
     
-    log_dir = "/Users/qiaozhiyi/Desktop/pentest/.agents/worker_m3"
+    # Log under the repo's .agents/ tree (path relative to this script, no
+    # hardcoded absolute path).
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    log_dir = os.path.join(repo_root, ".agents", "worker_m3")
     log_file = os.path.join(log_dir, "ssh_test_results.log")
     
     # Run the SSH command
