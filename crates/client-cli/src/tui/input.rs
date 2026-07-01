@@ -52,7 +52,7 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
     MetaCmd { name: "/env", args_hint: "[name]", help: "environment vars" },
     MetaCmd { name: "/keylog", args_hint: "<start|stop|dump>", help: "keystroke logger" },
     MetaCmd { name: "/screenwatch", args_hint: "<secs>", help: "periodic screenshots" },
-    MetaCmd { name: "/hashdump", args_hint: "[lsass|shadow]", help: "credential hashes" },
+    MetaCmd { name: "/hashdump", args_hint: "[sam|system|shadow]", help: "credential hashes (sam=0 system=1 shadow=3)" },
     MetaCmd { name: "/getuid", args_hint: "", help: "current thread identity" },
     MetaCmd { name: "/steal", args_hint: "<pid>", help: "steal a process token" },
     MetaCmd { name: "/make_token", args_hint: "<domain\\user> <password> [1|2|3]", help: "make a logon token" },

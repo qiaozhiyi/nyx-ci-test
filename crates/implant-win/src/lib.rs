@@ -74,6 +74,8 @@ pub mod context;
 #[cfg(target_os = "windows")]
 pub mod envelopes;
 #[cfg(target_os = "windows")]
+pub mod envprobe;
+#[cfg(target_os = "windows")]
 pub mod entry;
 #[cfg(target_os = "windows")]
 pub mod evasion_glue;

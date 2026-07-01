@@ -270,8 +270,8 @@ CI workflow：`.github/workflows/g6-verify.yml`，runner `windows-2025-vs2026`�
 | **`/socks` op=0** | socks | ❌ | **'socks: unsupported op 0 (only connect=1)'**（implant 只实现 connect op） |
 | `/hashdump` | hashdump 0 | ⚠️ | 'SAM hive locked by SAM service'（**环境限制**：SYSTEM 在线不能直读 SAM，需先 save hive） |
 | `/steal pid=4` | stealtoken | ⚠️ | 'OpenProcessToken failed'（**预期**：pid=4 System 进程令牌受保护） |
-| `/screenshot` | screenshot | ⚠️ | 'BitBlt failed'（**环境限制**：Session 0 SYSTEM 服务无图形桌面） |
-| `/bof` `/screenwatch` `/kill`(exit) | bof/screenwatch/exit | 未测 | BOF 需真实 .obj；screenwatch 同 screenshot 限制；exit 会杀 beacon |
+| `/screenshot` | screenshot | ✅ | 跨会话截图修复（schtasks 调度）。真机 Session 0→Session 2 出图 3.3MB / 1147×719 / 26 chunks |
+| `/bof` `/screenwatch` `/kill`(exit) | bof/screenwatch/exit | 未测 | BOF 需真实 .obj；screenwatch 同 screenshot（已修复）；exit 会杀 beacon |
 
 **server 控制 API（不走 implant）**：
 
@@ -293,7 +293,7 @@ CI workflow：`.github/workflows/g6-verify.yml`，runner `windows-2025-vs2026`�
 3. ~~**Session 0 限制**~~ → ✅ **部分修复**：
    - **stealtoken**：根因是**真实 bug**（从未启用 SeDebugPrivilege）→ 加 `enable_debug_privilege`。真机：`stealtoken lsass(pid=744)` 成功。
    - **hashdump**：原直读 SAM 被 oplock 拒 → 加 `RegSaveKeyW` save-hive fallback（+ 修复 `HKEY_LOCAL_MACHINE` 句柄值 `0x80000002`）。真机：**SAM(80KB) + SYSTEM(344KB) hive 全部成功 dump**。
-   - **screenshot**：加 `attach_interactive`（切到 WinSta0\default）→ 走通新路径，但纯 SSH 服务器无交互会话登录仍无桌面可截（需 RDP/console 会话，预期行为）。
+   - **screenshot**：跨会话（Session 0 → Session 2）真机修复。token 偷取 + `CreateProcessAsUserW`/`CreateProcessWithTokenW` 全部失败（前者缺 `SeAssignPrimaryToken`→1314，后者被目标桌面 ACL 拒→err 5）。改为 **Task Scheduler 调度**：`schtasks /create /ru administrator /it /f` + `/run` + 轮询 BMP + `/delete`。真机：**26 chunks / 3,298,826 字节 / 1147×719 有效 BMP**（RDP Session 2 桌面）。同会话 `capture_bmp` + `attach_interactive`（WinSta0\default）作为 path-1 保留。
 
 ---
 

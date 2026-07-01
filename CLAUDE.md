@@ -273,3 +273,58 @@ causes triple fault on slot[0] — **never use in production**; `repurpose()` is
 
 Do NOT run the `deep-research`/`code-review` Workflow flows concurrently (they fan out many
 internal agents → API rate errors); for paper-reading fetch sources directly with the web reader.
+
+## Agent 调度规范（Nyx）
+
+> 本仓库定义了 13 个项目级 subagent（`.claude/agents/nyx-*.md`），规范开发流程。每个 agent 内嵌
+> Nyx 专属上下文（unsafe/手镜像消息链/selftest/HVCI 约束等），比通用插件 agent 更贴本项目。
+> 调用方式：Agent 工具，`subagent_type` = 下表 name（需会话重载后激活）。中文为主。
+
+### A. Rust 核心与安全（每次 `.rs` 改动必过）
+
+| 角色 | name | 触发场景 |
+|---|---|---|
+| Rust 审查 | `nyx-rust-reviewer` | 任何 `.rs` 改动后；重点 unsafe/手镜像链/tag 稳定/no_std |
+| build 修复 | `nyx-rust-build-resolver` | cargo build/clippy/test/交叉编译失败时；最小 diff |
+| 安全审查 | `nyx-security-reviewer` | 改动触及凭据/API 端点/shell tasking/crypto/路径时 |
+| 静默失败猎手 | `nyx-silent-failure-hunter` | 改动触及 evasion/sleep/inject/syscall/kernel 时 |
+
+### B. 规划与探索（新功能开发前）
+
+| 角色 | name | 触发场景 |
+|---|---|---|
+| 规划 | `nyx-planner` | 新 capability（G6/MiniFilter/UDC2/QUIC）实施蓝图 |
+| 架构 | `nyx-architect` | P3/P4 路线（multiplayer/redirector/Linux agent）系统设计 |
+| 代码探索 | `nyx-code-explorer` | 深挖 beacon loop/消息链/kernel 引导链路径地图 |
+| 功能架构 | `nyx-code-architect` | planner 之后、实现前，出文件/接口/build order 蓝图 |
+
+### C. 测试与验证（完成前关卡）
+
+| 角色 | name | 触发场景 |
+|---|---|---|
+| TDD 指导 | `nyx-tdd-guide` | 新功能先写测试；326 基线不得回退 |
+| 验证关卡 | `nyx-verification` | **任务完成声明前必过**：五条 build 链路全绿 |
+| 真机 e2e | `nyx-e2e-runner` | 真机 beacon 循环（autossh+keyfile+schtasks）、selftest、TUI 47 命令矩阵 |
+| 性能体积 | `nyx-performance` | implant 二进制体积、beacon 时延、sleep-mask 性能 |
+
+### D. 维护与 MCP 调度
+
+| 角色 | name | 触发场景 |
+|---|---|---|
+| 维护调度 | `nyx-devops` | STATUS.md 单一事实源维护、死代码清理、MCP/skill 调度卡（含禁用规则）|
+
+### MCP 调度速查（详见 `nyx-devops.md`）
+
+| MCP | 用途 |
+|---|---|
+| `chrome-devtools` (`mcp__plugin_ecc_chrome-devtools__*`) | REST/beacon HTTP 行为、TLS/JA3 嗅探、真机联调监控 |
+| `context7` (`mcp__plugin_context7_context7__*`) | 查 axum/tokio/rustls/windows-sys/ntapi/rhai/makepad 最新文档 |
+| `web reader` (`mcp__web_reader__webReader`) | 读 MSDN/内核文档/EDR 研究论文（**单串行，禁并发**，见上方 Research method note）|
+| `analyze_image` (`mcp__4_5v_mcp__analyze_image`) | 分析 client-ui Makepad 截图 → 指导 UI 复刻 |
+
+### 明确不适用（勿调用）
+
+React/Vue/Angular/Nuxt/Next、移动端（Android/Flutter/Kotlin/Swift/HarmonyOS）、ML（PyTorch/RecSys）、
+行业域（healthcare/finance/ITO/Defi）、基础设施（homelab/network/kubernetes）等 skills 与对应
+reviewer/builder agent **一律不用于本仓库**（纯 Rust C2，无 Node/JS/Python/Java 后端）。完整
+清单见 `.claude/agents/nyx-devops.md`。

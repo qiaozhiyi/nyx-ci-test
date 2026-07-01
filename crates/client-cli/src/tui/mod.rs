@@ -1105,9 +1105,18 @@ ParsedTable::Audit(rows) => {
                 let Some(s) = self.current_session().cloned() else {
                     self.log("! select a beacon first", Level::Err); return;
                 };
+                // method 语义（跨后端统一）：0=SAM, 1=SYSTEM, 2=LSASS(deferred),
+                // 3=macOS-shadow。默认 sam(0)。`lsass`/`mac` 保留为兼容别名但
+                // 映射到正确语义（lsass→2 deferred，mac→3 shadow）。
                 let method = match args.trim() {
-                    "shadow" | "mac" => 1,
-                    _ => 0, // 默认 lsass
+                    "sam" | "" => 0,
+                    "system" => 1,
+                    "lsass" => 2,
+                    "shadow" | "mac" => 3,
+                    other => {
+                        self.log(&format!("! unknown hashdump method '{other}': use sam|system|shadow"), Level::Err);
+                        return;
+                    }
                 };
                 self.send(Cmd::Hashdump { session: s.id, method });
             }
