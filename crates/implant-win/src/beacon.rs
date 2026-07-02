@@ -183,9 +183,12 @@ pub unsafe fn beacon_loop() {
 pub unsafe fn beacon_oneshot() -> u32 {
     let (cfg, config_plain) = config::load();
     crate::mem::register_owned(config_plain);
+    // DIAG step 1: config loaded OK
 
     let kp = ImplantKeypair::generate();
+    // DIAG step 2: keygen done (if we crash here → CSPRNG or curve25519)
     let key = kp.session_key(&cfg.server_pub);
+    // DIAG step 3: session_key (HKDF) done
     crate::mem::register_key(key);
     let pubkey = kp.public_bytes();
 

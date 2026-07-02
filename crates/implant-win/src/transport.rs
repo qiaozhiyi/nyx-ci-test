@@ -86,7 +86,7 @@ type FAddReqHeaders = unsafe extern "system" fn(HINTERNET, *const u16, u32, u32)
 static mut WINHTTP: Option<WinhttpFns> = None;
 
 /// Resolve the WinHTTP function table once (no allocation).
-unsafe fn ensure_winhttp() {
+pub unsafe fn ensure_winhttp() {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.load(Ordering::Acquire) {
