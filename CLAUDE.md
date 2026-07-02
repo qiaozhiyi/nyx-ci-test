@@ -195,6 +195,21 @@ has no such host; `win`=Server 2019).
 （4 个预存平台 gate 缺陷）、evasionsdk 53 全过、**49 个 selftest 全部正常退出**（含
 `nyx_selftest_envprobe`=177 证明 OUI 检测恢复工作）。`cargo test --workspace` = **88 passed / 0 failed**（implant-win/kernelsdk 为非 workspace 独立 crate，单独计）。详情见 `docs/STATUS.md` §0a。
 
+**2026-07-02 Beacon Loop 打通（里程碑）：** implant beacon loop 在真机 Windows Server 2019
+上完整运行，含全部隐蔽手段（HookChain + HWBP blind + PDT gap scan + Foliage heap masking +
+CSPRNG PEB-walk）。通过 `diag_mark` 文件标记诊断法精确定位 3 个 abort 根因：
+(1) CSPRNG：`getrandom` 静态链接 `advapi32` 在 PIC cdylib IAT 解析失败 → 改用 PEB-walk 动态
+解析 `SystemFunction036`（适配 XP SP2 → 11 25H2）；
+(2) curve25519 SIMD 后端栈问题 → 强制 serial 后端；
+(3) Foliage APC helper 加密自身 .text → 降级到 data-only floor（heap RC4 + indirect-syscall
+sleep，Foliage 保持启用）。
+**全接线闭合**：26/26 Command 变体 TUI→REST→server→implant 完整贯通；inject pid 接线
+（`pid != 0` → OpenProcess+NtAllocVM+NtWriteVM+CreateRemoteThread）；screenshot Session 0
+已有 cross_session_capture（schtasks 到交互会话）。
+**新增**：CI pipeline（fmt+clippy+test 跨平台）、protocol fuzz harness（1050 万输入无 panic）、
+selftest 退出码验证 gate、`nyx-operator-kernel-cli` bin（kernel tier 操作化）。
+详情见 `docs/STATUS.md` §0c。
+
 ### Shipped & verified (2026-06-27)
 
 **Userland (implant-win):**

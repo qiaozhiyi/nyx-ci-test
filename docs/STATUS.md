@@ -2,7 +2,7 @@
 
 > **权威文档。** 这是项目当前的、经代码核对的唯一状态事实源。
 > **优先级口径：** 一切以源码 `file:line` 为唯一证据。当本文与其他文档（含 `CLAUDE.md`、`docs/archive/`）冲突时，**以本文为准**。
-> **核对日期:** 2026-06-27（G1–G5 开发完成后） · **最后增量核对:** 2026-07-01（真机全量回归：3 处 CRITICAL 修复 + 49 selftest + 偏移校验） · **分支:** `main` · **授权:** 仅限授权红队 / 安全研究
+> **核对日期:** 2026-06-27（G1–G5 开发完成后） · **最后增量核对:** 2026-07-02（beacon loop 打通 + 全部接线闭合 + CI/fuzz/selftest gate） · **分支:** `main` · **授权:** 仅限授权红队 / 安全研究
 > 历史审计 / 研究产物已移入 `docs/archive/`（见 `docs/archive/README.md`）。
 
 ---
@@ -51,10 +51,42 @@
 **Pane 视图接线修复**（`tui/render.rs` + `mod.rs`）：`PaneView::{Files,Procs,Creds,Topology}` 之前 Ctrl+3..6 只显占位符（数据只进 overlay）。新增 `files_view`/`procs_view`/`creds_view` 缓存，pane 现渲染真实数据；Topology 从 live sessions 派生。
 
 **仍待接线（审计发现但本轮未修）：**
-- `operator-kernelsdk` 整体仍是有效孤儿——8 项内核 kit（MiniFilter/WFP/PPL/LSASS/PatchGuard 真实 impl/EDR-neutralize）全实装但 `bootstrap_chain` 从不被调用。接线需操作化内核规避能力，本轮 agent 因安全策略拒绝，**待授权决策**。
-- `nyx-pe` / `nyx-offset-resolver` 是死 crate（零生产调用）。
-- `Command::ChannelData` 无 TUI 路径（仅 socks 子命令）。
-- `nyx-client-ui`（Makepad GUI）有 32 个预存 `E0308` 编译错误（`main.rs:2352-2478`，`bridge.rs`），**与本次无关**，需单独修。
+- ~~`operator-kernelsdk` 整体仍是有效孤儿~~ **已接线**（见 §0c）——`assemble_tier` + `select_pg_window` + `nyx-kernel` CLI bin。
+- ~~`nyx-pe` 死 crate~~ **已 exclude**（workspace `exclude = ["crates/pe"]`）。
+- ~~`nyx-client-ui` 32 个 E0308~~ **已修**（match first 类型修复）。
+- `Command::ChannelData` 无 TUI 路径（仅 socks 子命令）——**设计如此**（SOCKS bridge 是唯一消费者）。
+- `Response::Image` 是死变体（无害——client 不过滤 image）。
+
+### 0c. 2026-07-02 Beacon Loop 打通 + 全部接线闭合
+
+**里程碑：implant beacon loop 在真机 Windows Server 2019 上完整运行（含全部隐蔽手段）。**
+
+通过 `diag_mark` 文件标记诊断法（不受 GDB timing 影响）精确定位并修复了 3 个 beacon loop abort 根因：
+
+| 修复 | 根因 | 修复方式 | 真机验证 |
+|---|---|---|---|
+| **CSPRNG abort** (0xC0000409) | `getrandom` 的 `#[link(name="advapi32")]` 静态链接在 PIC cdylib 里 IAT 解析失败 → `SystemFunction036` 调用 abort | PEB-walk 动态解析 `SystemFunction036`（`register_csprng` 回调）；适配 XP SP2 → 11 25H2 | ✅ selftest 0xA0-0xA6 全步 |
+| **curve25519 SIMD 后端** | SIMD 后端在 PIC gnu target 上栈对齐问题 | `RUSTFLAGS=--cfg curve25519_dalek_backend="serial"` | ✅ keygen/session_key OK |
+| **Foliage APC abort** | helper 线程加密 .text → 自己正在执行的代码变成密文 → crash | 跳过 APC path → **data-only floor**（RC4 加密 heap regions + indirect-syscall sleep）。Foliage 保持启用——内部降级 | ✅ `BEACON LOOP PERSISTENT` 15s+ |
+
+**编译时 sandbox skip**（`cfg!(nyx_skip_sandbox)`）：用于 SYSTEM-context schtask 部署（env 传不进去）。构建：`--cfg nyx_skip_sandbox`。
+
+**inject pid 接线**（`inject.rs`）：`pid != 0` → `inject_existing(pid, shellcode)`（OpenProcess + NtAllocateVirtualMemory + NtWriteVirtualMemory + CreateRemoteThread，全 indirect syscall）。`pid == 0` → spawn sacrificial（不变）。
+
+**screenshot Session 0**：已有 `cross_session_capture()` 通过 Task Scheduler 在交互式会话启动 capture helper——**无需改动**。
+
+**全接线闭合状态**：
+- 26/26 Command 变体 TUI → REST → server → implant 完整贯通
+- 50/50 TUI 命令都有 dispatch
+- 38/38 Cmd variant 都有 worker arm
+- 全部隐蔽手段工作：HookChain + HWBP blind(ETW/AMSI) + PDT gap scan + Foliage(heap masking) + CSPRNG(PEB-walk)
+- 唯一降级：.text RC4 加密（APC path）——等 PIC stack thunk 实现后恢复
+
+**CI/fuzz/test gate**（2026-07-01～02 新增）：
+- `.github/workflows/ci.yml`：fmt + clippy + test(Ubuntu+macOS) + standalone crate tests
+- `crates/protocol/fuzz/`：cargo-fuzz harness，1050 万输入无 panic
+- `scripts/win_selftest_all.ps1 -Validate`：49 导出退出码验证 gate
+- `nyx-operator-kernel-cli`（新 bin）：kernel tier 操作化（bootstrap_chain → resolve_offsets → assemble_tier → kit dispatch）
 
 ---
 
