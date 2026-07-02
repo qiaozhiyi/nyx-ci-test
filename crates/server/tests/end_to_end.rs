@@ -40,8 +40,11 @@ async fn checkin_then_shell_task_roundtrips() {
 
     // 1. wait for the agent to check in.
     let session = poll_until(Duration::from_secs(10), || async {
-        let list: serde_json::Value =
-            ureq::get(format!("{url}/api/sessions").as_str()).call().ok()?.into_json().ok()?;
+        let list: serde_json::Value = ureq::get(format!("{url}/api/sessions").as_str())
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
         let arr = list.as_array()?;
         arr.first()?["id"].as_str().map(|s| s.to_string())
     })
@@ -70,9 +73,7 @@ async fn checkin_then_shell_task_roundtrips() {
             .ok()?;
         let arr = rs.as_array()?;
         arr.iter().find_map(|r| {
-            if r["task_id"].as_u64() == Some(task_id)
-                && r["kind"].as_str() == Some("output")
-            {
+            if r["task_id"].as_u64() == Some(task_id) && r["kind"].as_str() == Some("output") {
                 r["text"].as_str().map(|s| s.to_string())
             } else {
                 None
@@ -133,9 +134,14 @@ async fn upload_then_download_roundtrips() {
     let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
 
     let session = poll_until(Duration::from_secs(10), || async {
-        let list: serde_json::Value =
-            ureq::get(format!("{url}/api/sessions").as_str()).call().ok()?.into_json().ok()?;
-        list.as_array()?.first()?["id"].as_str().map(|s| s.to_string())
+        let list: serde_json::Value = ureq::get(format!("{url}/api/sessions").as_str())
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
+        list.as_array()?.first()?["id"]
+            .as_str()
+            .map(|s| s.to_string())
     })
     .await
     .expect("agent never checked in");
@@ -166,7 +172,11 @@ async fn upload_then_download_roundtrips() {
             .as_array()?
             .iter()
             .any(|r| r["task_id"] == up_task && r["kind"] == "ok");
-        if acked { Some(()) } else { None }
+        if acked {
+            Some(())
+        } else {
+            None
+        }
     })
     .await
     .expect("upload never acked");
@@ -275,9 +285,14 @@ async fn malleable_beacon_uri_roundtrips() {
 
     // Check-in must succeed over the malleable URI.
     let session = poll_until(Duration::from_secs(10), || async {
-        let list: serde_json::Value =
-            ureq::get(format!("{url}/api/sessions").as_str()).call().ok()?.into_json().ok()?;
-        list.as_array()?.first()?["id"].as_str().map(|s| s.to_string())
+        let list: serde_json::Value = ureq::get(format!("{url}/api/sessions").as_str())
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
+        list.as_array()?.first()?["id"]
+            .as_str()
+            .map(|s| s.to_string())
     })
     .await
     .expect("agent never checked in over the malleable URI");
@@ -345,14 +360,21 @@ async fn api_token_guards_control_api() {
         Ok(r) => panic!("expected 401 rejection, got {}", r.status()),
         Err(e) => panic!("expected 401, got transport error: {e}"),
     };
-    assert_eq!(no_auth_status, 401, "unauthenticated request must be rejected");
+    assert_eq!(
+        no_auth_status, 401,
+        "unauthenticated request must be rejected"
+    );
 
     // Correct bearer token -> 200.
     let with_auth = ureq::get(format!("{url}/api/sessions").as_str())
         .set("Authorization", "Bearer sekret")
         .call()
         .expect("correct token should yield 200");
-    assert_eq!(with_auth.status(), 200, "correct bearer token must be accepted");
+    assert_eq!(
+        with_auth.status(),
+        200,
+        "correct bearer token must be accepted"
+    );
 }
 
 /// All five control-API endpoints carry the `require_auth` guard. This pins
@@ -400,7 +422,11 @@ async fn all_control_api_endpoints_require_bearer_auth() {
 
     // No token AND wrong token must both be 401 on every endpoint.
     for g in gets {
-        assert_eq!(get_status(None, g), 401, "no-token GET {g} must be rejected");
+        assert_eq!(
+            get_status(None, g),
+            401,
+            "no-token GET {g} must be rejected"
+        );
         assert_eq!(
             get_status(Some("Bearer wrong"), g),
             401,
@@ -472,9 +498,14 @@ async fn scripting_events_fire_on_beacon_cycle() {
     let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
 
     let session = poll_until(Duration::from_secs(10), || async {
-        let list: serde_json::Value =
-            ureq::get(format!("{url}/api/sessions").as_str()).call().ok()?.into_json().ok()?;
-        list.as_array()?.first()?["id"].as_str().map(|s| s.to_string())
+        let list: serde_json::Value = ureq::get(format!("{url}/api/sessions").as_str())
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
+        list.as_array()?.first()?["id"]
+            .as_str()
+            .map(|s| s.to_string())
     })
     .await
     .expect("agent never checked in");
@@ -636,9 +667,14 @@ async fn profile_output_transform_envelope_roundtrips() {
 
     // Check-in over the envelope-shaped transaction must succeed.
     let session = poll_until(Duration::from_secs(10), || async {
-        let list: serde_json::Value =
-            ureq::get(format!("{url}/api/sessions").as_str()).call().ok()?.into_json().ok()?;
-        list.as_array()?.first()?["id"].as_str().map(|s| s.to_string())
+        let list: serde_json::Value = ureq::get(format!("{url}/api/sessions").as_str())
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
+        list.as_array()?.first()?["id"]
+            .as_str()
+            .map(|s| s.to_string())
     })
     .await
     .expect("agent never checked in through the transform envelope");

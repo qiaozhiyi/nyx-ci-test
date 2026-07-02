@@ -43,7 +43,9 @@ pub fn from_frames(raw: &[u8]) -> Result<H2Fingerprint, &'static str> {
     while p + 9 <= raw.len() {
         let len = ((raw[p] as usize) << 16) | ((raw[p + 1] as usize) << 8) | raw[p + 2] as usize;
         let ftype = raw[p + 3];
-        let payload = raw.get(p + 9..p + 9 + len).ok_or("frame payload out of bounds")?;
+        let payload = raw
+            .get(p + 9..p + 9 + len)
+            .ok_or("frame payload out of bounds")?;
         match ftype {
             0x04 => {
                 // SETTINGS: id(2 BE) value(4 BE) pairs.
@@ -61,7 +63,8 @@ pub fn from_frames(raw: &[u8]) -> Result<H2Fingerprint, &'static str> {
                 }
             }
             0x08 if payload.len() >= 4 => {
-                fp.window_update = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                fp.window_update =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
             }
             0x02 => fp.priorities += 1, // PRIORITY
             _ => {}

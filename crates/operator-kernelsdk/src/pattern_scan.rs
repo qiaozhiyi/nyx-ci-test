@@ -240,7 +240,6 @@ pub fn scan_all_known(image: &[u8]) -> alloc::collections::BTreeMap<&'static str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
 
     #[test]
     fn find_exact_pattern() {

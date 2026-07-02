@@ -103,14 +103,6 @@ pub trait VulnDriverIoctl: Send + Sync {
 /// (CVE-2019-16098); encoding them here is research documentation, not a 0day.
 pub struct RtCore64;
 
-impl RtCore64 {
-    /// The 48-byte RTCore64 MemoryOperation struct (METHOD_BUFFERED, in==out).
-    const OP_SIZE: usize = 48;
-    const ADDR_OFF: usize = 0x08;
-    const SIZE_OFF: usize = 0x18;
-    const DATA_OFF: usize = 0x1C;
-}
-
 impl VulnDriverIoctl for RtCore64 {
     fn device_path(&self) -> &[u16] {
         // `\\.\RTCore64` — the Win32 device namespace path (two leading

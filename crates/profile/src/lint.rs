@@ -23,7 +23,15 @@ pub struct Diagnostic {
 }
 
 /// Statements that transform bytes inside a `output`/`metadata`/`id` block.
-const TRANSFORMS: &[&str] = &["base64", "base64url", "netbios", "netbiosu", "mask", "prepend", "append"];
+const TRANSFORMS: &[&str] = &[
+    "base64",
+    "base64url",
+    "netbios",
+    "netbiosu",
+    "mask",
+    "prepend",
+    "append",
+];
 /// Statements that terminate a data block (place the result on the wire).
 const TERMINATORS: &[&str] = &["header", "parameter", "print", "uri-append"];
 
@@ -51,19 +59,28 @@ pub fn lint(p: &Profile) -> Vec<Diagnostic> {
             Some(u) => {
                 let s = u.as_str();
                 if !s.starts_with('/') {
-                    d.push(warn(b.line, format!("{name}: uri {s:?} should start with '/'")));
+                    d.push(warn(
+                        b.line,
+                        format!("{name}: uri {s:?} should start with '/'"),
+                    ));
                 }
                 // CRLF in the request URI enables request-line splitting when
                 // the transport builds the HTTP request line from this value.
                 if has_crlf(s) {
-                    d.push(err(b.line, format!("{name}: uri contains CR/LF (HTTP request-splitting risk)")));
+                    d.push(err(
+                        b.line,
+                        format!("{name}: uri contains CR/LF (HTTP request-splitting risk)"),
+                    ));
                 }
             }
         }
         if let Some(v) = b.get("verb") {
             let s = v.as_str();
             if !matches!(&*s, "GET" | "POST") {
-                d.push(warn(b.line, format!("{name}: verb {s:?} should be GET or POST")));
+                d.push(warn(
+                    b.line,
+                    format!("{name}: verb {s:?} should be GET or POST"),
+                ));
             }
         }
         for side in ["client", "server"] {
@@ -80,7 +97,10 @@ pub fn lint(p: &Profile) -> Vec<Diagnostic> {
 
     // useragent
     match p.option("useragent") {
-        None => d.push(warn(0, "no `set useragent` (Beacon's default is a well-known IOC)")),
+        None => d.push(warn(
+            0,
+            "no `set useragent` (Beacon's default is a well-known IOC)",
+        )),
         Some(u) => {
             let s = u.as_str();
             if DEFAULT_UA_FRAGMENTS.iter().any(|frag| s.contains(frag)) {
@@ -104,10 +124,20 @@ pub fn lint(p: &Profile) -> Vec<Diagnostic> {
     }
 
     // duplicate top-level blocks
-    for name in ["http-get", "http-post", "http-stager", "stage", "process-inject", "post-ex"] {
+    for name in [
+        "http-get",
+        "http-post",
+        "http-stager",
+        "stage",
+        "process-inject",
+        "post-ex",
+    ] {
         let n = p.blocks(name).count();
         if n > 1 {
-            d.push(warn(0, format!("{n} `{name}` blocks (CS allows named variants; usually one)")));
+            d.push(warn(
+                0,
+                format!("{n} `{name}` blocks (CS allows named variants; usually one)"),
+            ));
         }
     }
 
@@ -132,14 +162,29 @@ fn check_data_blocks(side: &crate::ast::Block, d: &mut Vec<Diagnostic>) {
                 } else if TERMINATORS.contains(&kw) {
                     terms += 1;
                 } else {
-                    d.push(err(*line, format!("`{}`: unknown statement `{}`", db.name, kw)));
+                    d.push(err(
+                        *line,
+                        format!("`{}`: unknown statement `{}`", db.name, kw),
+                    ));
                 }
             }
         }
         if terms == 0 {
-            d.push(err(db.line, format!("`{}` block has no terminator (need one of header/parameter/print/uri-append)", db.name)));
+            d.push(err(
+                db.line,
+                format!(
+                    "`{}` block has no terminator (need one of header/parameter/print/uri-append)",
+                    db.name
+                ),
+            ));
         } else if terms > 1 {
-            d.push(warn(db.line, format!("`{}` block has {terms} terminators (expected exactly 1)", db.name)));
+            d.push(warn(
+                db.line,
+                format!(
+                    "`{}` block has {terms} terminators (expected exactly 1)",
+                    db.name
+                ),
+            ));
         }
     }
 }
@@ -162,7 +207,12 @@ fn check_no_crlf_in_wire_stmts(block: &crate::ast::Block, d: &mut Vec<Diagnostic
     const WIRE_STMTS: &[&str] = &["header", "parameter", "uri-append"];
     fn walk(b: &crate::ast::Block, d: &mut Vec<Diagnostic>) {
         for item in &b.items {
-            if let Item::Stmt { keyword, args, line } = item {
+            if let Item::Stmt {
+                keyword,
+                args,
+                line,
+            } = item
+            {
                 if WIRE_STMTS.contains(&keyword.as_str()) {
                     for arg in args {
                         if has_crlf(arg.as_str()) {
@@ -180,11 +230,23 @@ fn check_no_crlf_in_wire_stmts(block: &crate::ast::Block, d: &mut Vec<Diagnostic
 }
 
 fn err(line: u32, msg: impl Into<String>) -> Diagnostic {
-    Diagnostic { severity: Severity::Error, line, message: msg.into() }
+    Diagnostic {
+        severity: Severity::Error,
+        line,
+        message: msg.into(),
+    }
 }
 fn warn(line: u32, msg: impl Into<String>) -> Diagnostic {
-    Diagnostic { severity: Severity::Warning, line, message: msg.into() }
+    Diagnostic {
+        severity: Severity::Warning,
+        line,
+        message: msg.into(),
+    }
 }
 fn note(line: u32, msg: impl Into<String>) -> Diagnostic {
-    Diagnostic { severity: Severity::Note, line, message: msg.into() }
+    Diagnostic {
+        severity: Severity::Note,
+        line,
+        message: msg.into(),
+    }
 }

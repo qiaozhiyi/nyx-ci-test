@@ -97,9 +97,7 @@ impl Block {
     pub fn stmts<'a>(&'a self, keyword: &'a str) -> impl Iterator<Item = &'a [Str]> {
         self.items.iter().filter_map(move |i| match i {
             Item::Stmt {
-                keyword: k,
-                args,
-                ..
+                keyword: k, args, ..
             } if k == keyword => Some(args.as_slice()),
             _ => None,
         })

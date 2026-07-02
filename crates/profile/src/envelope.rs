@@ -49,7 +49,9 @@ impl ServerEnvelope {
             Some(Terminator::Header(_)) | Some(Terminator::Parameter(_)) => {
                 (Vec::new(), transformed)
             }
-            Some(Terminator::Print) | Some(Terminator::UriAppend) | None => (transformed, Vec::new()),
+            Some(Terminator::Print) | Some(Terminator::UriAppend) | None => {
+                (transformed, Vec::new())
+            }
         }
     }
 }
@@ -124,7 +126,9 @@ impl ClientEnvelope {
             Some(Terminator::Header(_)) | Some(Terminator::Parameter(_)) => {
                 (Vec::new(), transformed)
             }
-            Some(Terminator::Print) | Some(Terminator::UriAppend) | None => (transformed, Vec::new()),
+            Some(Terminator::Print) | Some(Terminator::UriAppend) | None => {
+                (transformed, Vec::new())
+            }
         }
     }
 
@@ -286,7 +290,10 @@ mod tests {
         );
         let env = post_server_envelope(&p);
         let (body, extra) = env.shape_body(b"hello");
-        assert!(body.is_empty(), "body should be empty for header terminator");
+        assert!(
+            body.is_empty(),
+            "body should be empty for header terminator"
+        );
         assert!(!extra.is_empty(), "transformed bytes go in extra");
     }
 
@@ -351,7 +358,10 @@ mod tests {
             Some(&b"Mozilla/5.0 (X11; Linux x86_64) Chrome/120"[..])
         );
         assert_eq!(env.headers.len(), 2);
-        assert_eq!(env.headers[0], (b"Accept".to_vec(), b"application/json".to_vec()));
+        assert_eq!(
+            env.headers[0],
+            (b"Accept".to_vec(), b"application/json".to_vec())
+        );
         assert_eq!(env.headers[1], (b"X-Client".to_vec(), b"nyx".to_vec()));
     }
 
@@ -392,7 +402,10 @@ mod tests {
         assert!(matches!(env.terminator, Some(Terminator::Header(ref h)) if h == "Cookie"));
         let (body, extra) = env.shape_body(b"checkin-frame");
         assert!(body.is_empty(), "header terminator → body empty");
-        assert!(!extra.is_empty(), "transformed bytes go in extra (the header value)");
+        assert!(
+            !extra.is_empty(),
+            "transformed bytes go in extra (the header value)"
+        );
         // Server reads the header value and base64-decodes it back to the frame.
         let restored = transform::decode(&env.steps, &extra).unwrap();
         assert_eq!(restored, b"checkin-frame");

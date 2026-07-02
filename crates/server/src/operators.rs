@@ -22,7 +22,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::RwLock;
 
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
 use argon2::Argon2;
 use serde::{Deserialize, Serialize};
 
@@ -90,18 +92,25 @@ impl OperatorRegistry {
         let g = self.ops.read().ok()?;
         if let Some((name, secret)) = bearer.split_once(':') {
             let rec = g.get(name)?;
-            return verify_secret(&rec.secret_hash, secret)
-                .then(|| OperatorIdentity { name: rec.name.clone(), role: rec.role });
+            return verify_secret(&rec.secret_hash, secret).then(|| OperatorIdentity {
+                name: rec.name.clone(),
+                role: rec.role,
+            });
         }
         // Bare token → legacy `_legacy` record.
         let rec = g.get("_legacy")?;
-        verify_secret(&rec.secret_hash, bearer)
-            .then(|| OperatorIdentity { name: "_legacy".into(), role: rec.role })
+        verify_secret(&rec.secret_hash, bearer).then(|| OperatorIdentity {
+            name: "_legacy".into(),
+            role: rec.role,
+        })
     }
 
     /// All records (for a future /api/operators admin surface + boot logging).
     pub fn list(&self) -> Vec<OperatorRecord> {
-        self.ops.read().map(|g| g.values().cloned().collect()).unwrap_or_default()
+        self.ops
+            .read()
+            .map(|g| g.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Load the registry from `path`. If the file is absent/empty:
@@ -126,8 +135,8 @@ impl OperatorRegistry {
                 let (n, sec) = s.split_once(':')?;
                 (!n.is_empty() && !sec.is_empty()).then_some((n, sec))
             }) {
-                let hash = hash_argon2(bs.1)
-                    .unwrap_or_else(|_| format!("plain:{}", sha256_hex(bs.1)));
+                let hash =
+                    hash_argon2(bs.1).unwrap_or_else(|_| format!("plain:{}", sha256_hex(bs.1)));
                 map.insert(
                     bs.0.to_string(),
                     OperatorRecord {
@@ -138,7 +147,10 @@ impl OperatorRegistry {
                     },
                 );
                 persist(path, &map)?;
-                tracing::info!(operator = bs.0, "bootstrapped admin operator from NYX_BOOTSTRAP_OPERATOR");
+                tracing::info!(
+                    operator = bs.0,
+                    "bootstrapped admin operator from NYX_BOOTSTRAP_OPERATOR"
+                );
             } else if let Some(tok) = nyx_token.filter(|s| !s.is_empty()) {
                 map.insert(
                     "_legacy".into(),
@@ -285,7 +297,10 @@ mod tests {
         // Reload WITHOUT the bootstrap env (file already has alice) → no double-bootstrap.
         let reg2 = OperatorRegistry::load_or_bootstrap(&path, None, Some("bob:ignored")).unwrap();
         assert!(reg2.resolve("alice:hunter2").is_some());
-        assert!(reg2.resolve("bob:ignored").is_none(), "bootstrap env ignored once registry non-empty");
+        assert!(
+            reg2.resolve("bob:ignored").is_none(),
+            "bootstrap env ignored once registry non-empty"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

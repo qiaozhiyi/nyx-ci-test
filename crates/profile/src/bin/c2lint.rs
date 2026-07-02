@@ -44,7 +44,11 @@ fn main() {
             }
             Severity::Note => ("[+]", d.line),
         };
-        let at = if line > 0 { format!(" line {line}: ") } else { String::from(": ") };
+        let at = if line > 0 {
+            format!(" line {line}: ")
+        } else {
+            String::from(": ")
+        };
         println!("{tag}{at}{}", d.message);
     }
 

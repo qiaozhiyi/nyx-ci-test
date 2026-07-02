@@ -108,9 +108,6 @@ pub fn open_frame_dir(
 /// server/implant callers that *receive* implant-origin frames should keep
 /// using this; receivers of server-origin frames must use [`open_frame_dir`]
 /// with [`Direction::ServerToClient`].
-pub fn open_frame(
-    key: &SessionKey,
-    raw: &RawFrame,
-) -> Result<Vec<u8>, chacha20poly1305::Error> {
+pub fn open_frame(key: &SessionKey, raw: &RawFrame) -> Result<Vec<u8>, chacha20poly1305::Error> {
     open_frame_dir(key, Direction::ClientToServer, raw)
 }

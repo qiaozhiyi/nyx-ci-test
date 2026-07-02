@@ -31,12 +31,15 @@ fn good_profile_has_no_errors() {
     let p = parse(GOOD).expect("parse");
     let diags = lint(&p);
     assert!(errors(&p).is_empty(), "unexpected errors: {:?}", errors(&p));
-    assert!(diags.iter().any(|d| d.severity == Severity::Note && d.message.contains("OK")));
+    assert!(diags
+        .iter()
+        .any(|d| d.severity == Severity::Note && d.message.contains("OK")));
 }
 
 #[test]
 fn missing_http_get_is_an_error() {
-    let src = "http-post { set uri \"/p\"; client { output { print; } } server { output { print; } } }";
+    let src =
+        "http-post { set uri \"/p\"; client { output { print; } } server { output { print; } } }";
     let p = parse(src).unwrap();
     let errs = errors(&p);
     assert!(errs.iter().any(|m| m.contains("http-get")), "{errs:?}");
@@ -57,7 +60,11 @@ fn missing_uri_is_an_error() {
         http-post { set uri "/p"; client { output { print; } } server { output { print; } } }
     "#;
     let p = parse(src).unwrap();
-    assert!(errors(&p).iter().any(|m| m.contains("uri")), "{:?}", errors(&p));
+    assert!(
+        errors(&p).iter().any(|m| m.contains("uri")),
+        "{:?}",
+        errors(&p)
+    );
 }
 
 #[test]
@@ -86,7 +93,11 @@ fn unknown_data_statement_is_an_error() {
         http-post { set uri "/p"; client { output { print; } } server { output { print; } } }
     "#;
     let p = parse(src).unwrap();
-    assert!(errors(&p).iter().any(|m| m.contains("bogus_transform")), "{:?}", errors(&p));
+    assert!(
+        errors(&p).iter().any(|m| m.contains("bogus_transform")),
+        "{:?}",
+        errors(&p)
+    );
 }
 
 #[test]
@@ -99,8 +110,14 @@ fn uri_not_starting_with_slash_is_a_warning() {
         http-post { set uri "/p"; client { output { print; } } server { output { print; } } }
     "#;
     let p = parse(src).unwrap();
-    let warns: Vec<_> = lint(&p).into_iter().filter(|d| d.severity == Severity::Warning).collect();
-    assert!(warns.iter().any(|w| w.message.contains("should start")), "{warns:?}");
+    let warns: Vec<_> = lint(&p)
+        .into_iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .collect();
+    assert!(
+        warns.iter().any(|w| w.message.contains("should start")),
+        "{warns:?}"
+    );
 }
 
 #[test]
@@ -111,7 +128,11 @@ fn jitter_over_100_is_an_error() {
         http-post { set uri "/p"; client { output { print; } } server { output { print; } } }
     "#;
     let p = parse(src).unwrap();
-    assert!(errors(&p).iter().any(|m| m.contains("jitter")), "{:?}", errors(&p));
+    assert!(
+        errors(&p).iter().any(|m| m.contains("jitter")),
+        "{:?}",
+        errors(&p)
+    );
 }
 
 #[test]
@@ -129,9 +150,14 @@ fn crlf_in_header_value_is_an_error() {
     "#;
     let p = parse(src).unwrap();
     assert!(
-        errors(&p)
-            .iter()
-            .any(|m| { let ml = m.to_lowercase(); ml.contains("cr") || ml.contains("lf") || ml.contains("newline") || ml.contains("split") || ml.contains("header") }),
+        errors(&p).iter().any(|m| {
+            let ml = m.to_lowercase();
+            ml.contains("cr")
+                || ml.contains("lf")
+                || ml.contains("newline")
+                || ml.contains("split")
+                || ml.contains("header")
+        }),
         "CRLF in header value must be an error: {:?}",
         errors(&p)
     );
@@ -150,9 +176,14 @@ fn crlf_in_uri_is_an_error() {
     "#;
     let p = parse(src).unwrap();
     assert!(
-        errors(&p)
-            .iter()
-            .any(|m| { let ml = m.to_lowercase(); ml.contains("cr") || ml.contains("lf") || ml.contains("newline") || ml.contains("split") || ml.contains("uri") }),
+        errors(&p).iter().any(|m| {
+            let ml = m.to_lowercase();
+            ml.contains("cr")
+                || ml.contains("lf")
+                || ml.contains("newline")
+                || ml.contains("split")
+                || ml.contains("uri")
+        }),
         "CRLF in uri must be an error: {:?}",
         errors(&p)
     );

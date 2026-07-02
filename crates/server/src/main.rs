@@ -52,7 +52,10 @@ async fn main() -> anyhow::Result<()> {
         if now >= kd {
             anyhow::bail!("kill date {kd} has passed (now={now}); refusing to start");
         }
-        tracing::info!(killdate = kd, "kill date active; server will stop serving after it");
+        tracing::info!(
+            killdate = kd,
+            "kill date active; server will stop serving after it"
+        );
     }
     if api_token.is_some() {
         tracing::info!("control-API bearer-token guard enabled (NYX_TOKEN)");
@@ -143,7 +146,9 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!(script = %p, "loaded operator Rhai script");
                 state.events.register(Box::new(hook));
             }
-            Err(e) => tracing::error!(error = %e, "failed to load NYX_SCRIPT; continuing without it"),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to load NYX_SCRIPT; continuing without it")
+            }
         }
     }
     let state = Arc::new(state);
@@ -184,7 +189,9 @@ async fn main() -> anyhow::Result<()> {
                             // into_make_service_with_connect_info feeds
                             // ConnectInfo<SocketAddr> to the beacon handler
                             // so it can look up the fingerprint cache.
-                            let make_svc = app.clone().into_make_service_with_connect_info::<std::net::SocketAddr>();
+                            let make_svc = app
+                                .clone()
+                                .into_make_service_with_connect_info::<std::net::SocketAddr>();
                             // Manually drive the MakeService for this connection
                             // (axum::serve does this internally, but we handle
                             // the accept loop ourselves for TLS + fingerprinting).
@@ -228,7 +235,10 @@ async fn sniff_and_store(
     if header[0] != 22 {
         // Not a TLS handshake — return the preamble (header bytes) and let the
         // TLS acceptor fail naturally. No fingerprint stored.
-        return Ok(nyx_server::tls::PreambleStream::new(header.to_vec(), stream));
+        return Ok(nyx_server::tls::PreambleStream::new(
+            header.to_vec(),
+            stream,
+        ));
     }
     let rec_len = ((header[3] as usize) << 8) | header[4] as usize;
     let rec_len = rec_len.min(16 * 1024);
@@ -247,9 +257,6 @@ async fn sniff_and_store(
     if ja3.is_some() || ja4.is_some() {
         tracing::debug!(%peer, ja3 = ?ja3, ja4 = ?ja4, "captured inbound TLS fingerprint");
     }
-    fps.insert(
-        peer,
-        nyx_server::Fingerprint { ja3, ja4 },
-    );
+    fps.insert(peer, nyx_server::Fingerprint { ja3, ja4 });
     Ok(nyx_server::tls::PreambleStream::new(record, stream))
 }

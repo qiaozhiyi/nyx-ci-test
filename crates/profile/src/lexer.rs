@@ -80,7 +80,10 @@ pub fn tokenize(src: &str) -> Result<Vec<(Tok, u32)>, LexError> {
                     });
                 }
                 let word = std::str::from_utf8(&b[start..i])
-                    .map_err(|_| LexError::Token { line: start_line, message: "non-utf8 word".into() })?
+                    .map_err(|_| LexError::Token {
+                        line: start_line,
+                        message: "non-utf8 word".into(),
+                    })?
                     .to_string();
                 out.push((Tok::Word(word), start_line));
             }
@@ -98,7 +101,10 @@ fn skip_line(b: &[u8], i: &mut usize) {
 
 /// A byte terminates a bare word.
 fn is_delim(c: u8) -> bool {
-    matches!(c, b' ' | b'\t' | b'\r' | b'\n' | b'{' | b'}' | b';' | b'"' | b'#')
+    matches!(
+        c,
+        b' ' | b'\t' | b'\r' | b'\n' | b'{' | b'}' | b';' | b'"' | b'#'
+    )
 }
 
 /// Scan a quoted string starting just after the opening `"`, processing escapes.

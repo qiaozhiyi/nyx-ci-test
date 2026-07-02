@@ -85,7 +85,12 @@ mod tests {
 
     #[test]
     fn kind_label_roundtrip() {
-        for k in [CredKind::Hash, CredKind::Password, CredKind::Ticket, CredKind::Key] {
+        for k in [
+            CredKind::Hash,
+            CredKind::Password,
+            CredKind::Ticket,
+            CredKind::Key,
+        ] {
             assert_eq!(CredKind::from_label(k.label()), Some(k));
         }
         assert_eq!(CredKind::from_label("bogus"), None);

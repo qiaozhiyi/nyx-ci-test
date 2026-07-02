@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn query_filters_and_paginates() {
-        let (dir, w) = writer();
+        let (_dir, w) = writer();
         for i in 0..5 {
             w.append(
                 "task",

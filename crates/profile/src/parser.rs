@@ -175,9 +175,8 @@ impl Parser {
                         Some(Tok::LBrace) => {
                             // Depth cap: reject before recursing so a profile
                             // of N nested blocks can't grow the stack by N frames.
-                            let nested = depth
-                                .checked_add(1)
-                                .ok_or_else(|| ParseError::Syntax {
+                            let nested =
+                                depth.checked_add(1).ok_or_else(|| ParseError::Syntax {
                                     line: kwline,
                                     message: "block nesting depth overflowed u32".into(),
                                 })?;

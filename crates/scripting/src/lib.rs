@@ -8,13 +8,13 @@
 //!
 //! Dependency-free by design (pure std + sync primitives).
 
-pub mod bus;
 pub mod builtins;
+pub mod bus;
 pub mod event;
 pub mod hook;
 
-pub use bus::EventBus;
 pub use builtins::{FirstBloodHook, LogHook};
+pub use bus::EventBus;
 pub use event::{ResultKind, ResultReceived, SessionExit, SessionNew};
 pub use hook::{Event, Hook};
 

@@ -153,7 +153,10 @@ fn valid_checkin_frame(server_pub: &[u8; 32]) -> (Vec<u8>, [u8; 32]) {
         is_admin: 0,
     }
     .encode(&mut w);
-    (frame::encode_frame(&pubkey, 0, &key, &w.into_bytes()), pubkey)
+    (
+        frame::encode_frame(&pubkey, 0, &key, &w.into_bytes()),
+        pubkey,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -178,23 +181,21 @@ async fn post_task_rejects_when_pending_queue_is_full() {
 
     // Enqueue MAX_PENDING_PER_SESSION tasks (no token configured → auth open).
     for _ in 0..MAX_PENDING_PER_SESSION {
-        let code = status_of(
-            ureq::post(format!("{url}/api/task").as_str())
-                .send_json(serde_json::json!({
-                    "session": session_hex,
-                    "command": { "type": "ping" }
-                })),
-        );
+        let code = status_of(ureq::post(format!("{url}/api/task").as_str()).send_json(
+            serde_json::json!({
+                "session": session_hex,
+                "command": { "type": "ping" }
+            }),
+        ));
         assert_eq!(code, 200, "enqueue within cap must succeed");
     }
     // The very next enqueue must be rejected (4xx/5xx), not accepted.
-    let over = status_of(
-        ureq::post(format!("{url}/api/task").as_str())
-            .send_json(serde_json::json!({
-                "session": session_hex,
-                "command": { "type": "ping" }
-            })),
-    );
+    let over = status_of(ureq::post(format!("{url}/api/task").as_str()).send_json(
+        serde_json::json!({
+            "session": session_hex,
+            "command": { "type": "ping" }
+        }),
+    ));
     assert!(
         over >= 400,
         "enqueue past MAX_PENDING_PER_SESSION ({MAX_PENDING_PER_SESSION}) must be rejected, got {over}"

@@ -89,8 +89,8 @@ fn self_signed_config() -> Result<Arc<rustls::ServerConfig>> {
         san = %san,
         "NYX_TLS=on with no NYX_CERT/NYX_KEY: generating a SELF-SIGNED dev cert (do NOT use in engagements)"
     );
-    let params = rcgen::CertificateParams::new(vec![san])
-        .map_err(|e| anyhow!("rcgen params: {e}"))?;
+    let params =
+        rcgen::CertificateParams::new(vec![san]).map_err(|e| anyhow!("rcgen params: {e}"))?;
     let kp = rcgen::KeyPair::generate().map_err(|e| anyhow!("rcgen keypair: {e}"))?;
     let cert = params
         .self_signed(&kp)

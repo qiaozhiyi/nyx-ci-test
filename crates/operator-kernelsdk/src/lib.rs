@@ -269,6 +269,10 @@ pub trait PatchGuardKit {
 /// validation or resuming the suspended validation thread.
 #[must_use = "the PG guard repairs on Drop; leaking it leaves the kernel tampered"]
 pub struct PgGuard<'a> {
+    // Lifetime anchor: ties the guard's lifetime to the kit so the kit cannot
+    // be dropped mid-window. Never read at runtime — the field exists for the
+    // borrow-checker guarantee.
+    #[allow(dead_code)]
     kit: &'a dyn PatchGuardKit,
     /// Repair callback invoked on Drop. Set by the concrete PG bypass impl.
     /// When `Some`, the closure performs PG state restoration (re-arm, thread
@@ -290,6 +294,7 @@ impl<'a> PgGuard<'a> {
     /// Create a no-op guard (skeleton — no real PG bypass wired).
     /// Returns `UnsupportedPosture` if the repair is needed. Used by the
     /// skeleton `PatchGuardWindow` which refuses without a real probe.
+    #[allow(dead_code)] // seam for the skeleton impl path; not yet wired
     pub(crate) fn noop(kit: &'a dyn PatchGuardKit) -> Self {
         Self { kit, repair: None }
     }

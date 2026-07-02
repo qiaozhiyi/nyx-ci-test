@@ -26,11 +26,7 @@ fn ja3_matches_md5_of_canonical_join() {
     let ch = sample_hello();
     let expected = format!(
         "{},{},{},{},{}",
-        0x0303,
-        "4865-4866-4867",
-        "0-43-10-11",
-        "29-23",
-        "0"
+        0x0303, "4865-4866-4867", "0-43-10-11", "29-23", "0"
     );
     let want = hex::encode(Md5::digest(expected.as_bytes()));
     assert_eq!(ja3(&ch), want);
@@ -95,7 +91,7 @@ fn parses_a_real_clienthello_record() {
     body.extend_from_slice(&[0x00, 0x02, 0x00, 0xff]); // 1 cipher
     body.push(1);
     body.push(0x00); // compression: null
-    // SNI ext: type 0, len 8, data = list_len(2)+name_type(1)+name_len(2)+"a.com"
+                     // SNI ext: type 0, len 8, data = list_len(2)+name_type(1)+name_len(2)+"a.com"
     let name = b"a.com";
     let mut ext = Vec::new();
     let list_len = 1 + 2 + name.len() as u16;
@@ -110,9 +106,20 @@ fn parses_a_real_clienthello_record() {
 
     // Handshake header (type 0x01, 3-byte len) + record header.
     let hlen = body.len();
-    let mut hs = vec![0x01, (hlen >> 16) as u8, ((hlen >> 8) & 0xff) as u8, (hlen & 0xff) as u8];
+    let mut hs = vec![
+        0x01,
+        (hlen >> 16) as u8,
+        ((hlen >> 8) & 0xff) as u8,
+        (hlen & 0xff) as u8,
+    ];
     hs.extend_from_slice(&body);
-    let mut rec = vec![0x16, 0x03, 0x01, ((hs.len() >> 8) & 0xff) as u8, (hs.len() & 0xff) as u8];
+    let mut rec = vec![
+        0x16,
+        0x03,
+        0x01,
+        ((hs.len() >> 8) & 0xff) as u8,
+        (hs.len() & 0xff) as u8,
+    ];
     rec.extend_from_slice(&hs);
 
     let ch = parse_client_hello(&rec).expect("parse synthetic ClientHello");
@@ -143,14 +150,28 @@ fn sniffs_client_hello_from_stream_and_returns_fingerprints() {
     body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
     body.extend_from_slice(&ext);
     let hlen = body.len();
-    let mut hs = vec![0x01, (hlen >> 16) as u8, ((hlen >> 8) & 0xff) as u8, (hlen & 0xff) as u8];
+    let mut hs = vec![
+        0x01,
+        (hlen >> 16) as u8,
+        ((hlen >> 8) & 0xff) as u8,
+        (hlen & 0xff) as u8,
+    ];
     hs.extend_from_slice(&body);
-    let mut rec = vec![0x16, 0x03, 0x01, ((hs.len() >> 8) & 0xff) as u8, (hs.len() & 0xff) as u8];
+    let mut rec = vec![
+        0x16,
+        0x03,
+        0x01,
+        ((hs.len() >> 8) & 0xff) as u8,
+        (hs.len() & 0xff) as u8,
+    ];
     rec.extend_from_slice(&hs);
 
     // Sniff from a cursor over the record bytes.
     let (replayed, ja3, ja4) = sniff_client_hello(std::io::Cursor::new(&rec)).unwrap();
-    assert_eq!(replayed, rec, "sniff must return the full record for replay");
+    assert_eq!(
+        replayed, rec,
+        "sniff must return the full record for replay"
+    );
     assert!(ja3.is_some(), "JA3 must be computed");
     assert!(ja4.is_some(), "JA4 must be computed");
     // Sanity: the JA3 must be a 32-hex MD5.

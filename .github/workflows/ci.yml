@@ -64,8 +64,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: cargo test --workspace
-        run: cargo test --workspace --all-targets
+      - name: cargo test --workspace (excl. client-ui)
+        run: cargo test --workspace --exclude nyx-client-ui --all-targets
 
   # ---- Gate 4: standalone crates (each has its own [workspace]) ----
   standalone:

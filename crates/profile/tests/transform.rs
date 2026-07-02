@@ -23,7 +23,13 @@ http-post { set uri "/p"; client { output { print; } } server { output { print; 
 #[test]
 fn declared_steps_match_order() {
     let p = parse(META_PROFILE).expect("parse");
-    let meta = p.http_get().unwrap().sub("client").unwrap().sub("metadata").unwrap();
+    let meta = p
+        .http_get()
+        .unwrap()
+        .sub("client")
+        .unwrap()
+        .sub("metadata")
+        .unwrap();
     assert_eq!(
         steps_from_block(meta),
         vec![
@@ -38,10 +44,21 @@ fn declared_steps_match_order() {
 #[test]
 fn full_pipeline_roundtrips() {
     let p = parse(META_PROFILE).expect("parse");
-    let meta = p.http_get().unwrap().sub("client").unwrap().sub("metadata").unwrap();
+    let meta = p
+        .http_get()
+        .unwrap()
+        .sub("client")
+        .unwrap()
+        .sub("metadata")
+        .unwrap();
     let steps = steps_from_block(meta);
 
-    for msg in [b"".as_slice(), b"x", b"session-payload-12345", b"\x00\xff\x10\x80"] {
+    for msg in [
+        b"".as_slice(),
+        b"x",
+        b"session-payload-12345",
+        b"\x00\xff\x10\x80",
+    ] {
         let wire = encode(&steps, msg);
         let back = decode(&steps, &wire).expect("decode");
         assert_eq!(back.as_slice(), msg, "round-trip failed for {msg:?}");

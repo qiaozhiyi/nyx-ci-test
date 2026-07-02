@@ -117,7 +117,9 @@ pub fn parse_client_hello(rec: &[u8]) -> Result<ClientHello, &'static str> {
         let etype = u16be(body, q);
         let elen = u16be(body, q + 2) as usize;
         q += 4;
-        let edata = body.get(q..q + elen).ok_or("extension data out of bounds")?;
+        let edata = body
+            .get(q..q + elen)
+            .ok_or("extension data out of bounds")?;
         extensions.push((etype, edata.to_vec()));
         match etype {
             0 => {
@@ -260,12 +262,24 @@ pub fn ja4(ch: &ClientHello) -> String {
     let ja4_a = format!("t{ver}{sni}{ncs:02x}{nex:02x}{alpn}");
 
     // ja4_b — sorted GREASE-free ciphers.
-    let mut cs: Vec<u16> = ch.cipher_suites.iter().copied().filter(|c| !is_grease(*c)).collect();
+    let mut cs: Vec<u16> = ch
+        .cipher_suites
+        .iter()
+        .copied()
+        .filter(|c| !is_grease(*c))
+        .collect();
     cs.sort_unstable();
     let ja4_b = if cs.is_empty() {
         "000000000000".to_string()
     } else {
-        sha256_12hex(cs.iter().copied().map(hex4).collect::<Vec<_>>().join("-").as_bytes())
+        sha256_12hex(
+            cs.iter()
+                .copied()
+                .map(hex4)
+                .collect::<Vec<_>>()
+                .join("-")
+                .as_bytes(),
+        )
     };
 
     // ja4_c — sorted GREASE/SNI/ALPN-free extensions + original-order sig algs.
@@ -292,7 +306,11 @@ pub fn ja4(ch: &ClientHello) -> String {
             .map(hex4)
             .collect::<Vec<_>>()
             .join("-");
-        format!("{}{}", prefix, sha256_12hex(format!("{ext_str}_{sig_str}").as_bytes()))
+        format!(
+            "{}{}",
+            prefix,
+            sha256_12hex(format!("{ext_str}_{sig_str}").as_bytes())
+        )
     };
 
     format!("{ja4_a}_{ja4_b}_{ja4_c}")
@@ -306,7 +324,9 @@ pub fn ja4(ch: &ClientHello) -> String {
 /// This is the team server's inbound fingerprint probe: it peeks the ClientHello
 /// *before* rustls consumes the stream, computes the fingerprints, then replays
 /// the bytes so the handshake completes normally.
-pub fn sniff_client_hello<R: std::io::Read>(mut r: R) -> std::io::Result<(Vec<u8>, Option<String>, Option<String>)> {
+pub fn sniff_client_hello<R: std::io::Read>(
+    mut r: R,
+) -> std::io::Result<(Vec<u8>, Option<String>, Option<String>)> {
     // TLS record header: ContentType(1) Version(2) Length(2). Read header first.
     let mut header = [0u8; 5];
     let _ = read_exact(&mut r, &mut header);

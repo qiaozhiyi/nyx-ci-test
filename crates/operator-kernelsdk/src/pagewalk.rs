@@ -123,7 +123,6 @@ fn read_u64<P: PhysRead>(reader: &P, pa: u64) -> Result<u64, PhysReadError> {
 mod tests {
     use super::*;
     use alloc::collections::BTreeMap;
-    use alloc::vec::Vec;
 
     /// A mock physical memory reader over a sparse byte map (physical address → bytes).
     /// Lets us lay out fake page tables + verify the walk without a real driver.

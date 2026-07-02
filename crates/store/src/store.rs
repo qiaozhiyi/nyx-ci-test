@@ -117,8 +117,9 @@ impl CredStore {
     /// All records (cleartext). The caller masks secrets for list/preview.
     pub fn list(&self) -> Result<Vec<CredRecord>> {
         let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
-        let mut stmt =
-            conn.prepare("SELECT realm, user, kind, secret, source, beacon, collected_at, notes FROM creds")?;
+        let mut stmt = conn.prepare(
+            "SELECT realm, user, kind, secret, source, beacon, collected_at, notes FROM creds",
+        )?;
         let rows = stmt.query_map([], row_to_record)?;
         let mut out = Vec::new();
         for r in rows {
@@ -203,7 +204,7 @@ mod tests {
             secret: secret.into(),
             source: "test".into(),
             beacon: None,
-            collected_at: 1700_000_000,
+            collected_at: 1_700_000_000,
             notes: String::new(),
         }
     }
@@ -225,7 +226,13 @@ mod tests {
         s.upsert(&rec("DEV", "alice", "oldhash")).unwrap();
         s.upsert(&rec("DEV", "alice", "newhash")).unwrap();
         assert_eq!(s.count().unwrap(), 1); // no duplicate
-        assert_eq!(s.get("DEV", "alice", CredKind::Hash).unwrap().unwrap().secret, "newhash");
+        assert_eq!(
+            s.get("DEV", "alice", CredKind::Hash)
+                .unwrap()
+                .unwrap()
+                .secret,
+            "newhash"
+        );
     }
 
     #[test]
@@ -251,7 +258,10 @@ mod tests {
         let s = CredStore::open(&path).unwrap();
         assert_eq!(s.count().unwrap(), 1);
         assert_eq!(
-            s.get("DEV", "alice", CredKind::Hash).unwrap().unwrap().secret,
+            s.get("DEV", "alice", CredKind::Hash)
+                .unwrap()
+                .unwrap()
+                .secret,
             "persisted"
         );
         let _ = std::fs::remove_file(&path);

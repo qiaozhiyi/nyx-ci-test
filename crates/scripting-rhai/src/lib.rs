@@ -51,7 +51,9 @@ impl RhaiHook {
     fn dispatch(&self, handler: &str, payload: Map) {
         // Missing handler -> Err; that's fine (a script need not handle every event).
         let mut scope = Scope::new();
-        let _ = self.engine.call_fn::<()>(&mut scope, &self.ast, handler, (payload,));
+        let _ = self
+            .engine
+            .call_fn::<()>(&mut scope, &self.ast, handler, (payload,));
     }
 }
 
@@ -119,13 +121,18 @@ mod tests {
 
         let mut scope = Scope::new();
         let host: String = engine
-            .call_fn(&mut scope, &ast, "on_session_new", (session_map(&SessionNew {
-                session_id: "a".into(),
-                hostname: "ws7".into(),
-                username: "u".into(),
-                os: "Windows".into(),
-                is_admin: true,
-            }),))
+            .call_fn(
+                &mut scope,
+                &ast,
+                "on_session_new",
+                (session_map(&SessionNew {
+                    session_id: "a".into(),
+                    hostname: "ws7".into(),
+                    username: "u".into(),
+                    os: "Windows".into(),
+                    is_admin: true,
+                }),),
+            )
             .unwrap();
         assert_eq!(host, "ws7");
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -134,11 +141,8 @@ mod tests {
     #[test]
     fn rhai_hook_dispatches_all_event_kinds() {
         // A script that only handles session_new must not break on result/exit.
-        let hook = RhaiHook::new(
-            "t",
-            r#"fn on_session_new(s) { nyx_log(s["hostname"]); }"#,
-        )
-        .unwrap();
+        let hook =
+            RhaiHook::new("t", r#"fn on_session_new(s) { nyx_log(s["hostname"]); }"#).unwrap();
         let mut bus = EventBus::new();
         bus.register(Box::new(hook));
         bus.fire(&Event::SessionNew(SessionNew {
@@ -154,7 +158,9 @@ mod tests {
             kind: nyx_scripting::event::ResultKind::Output,
             summary: "ok".into(),
         }));
-        bus.fire(&Event::SessionExit(SessionExit { session_id: "a".into() }));
+        bus.fire(&Event::SessionExit(SessionExit {
+            session_id: "a".into(),
+        }));
         // No panic => all three dispatched; undefined handlers were ignored.
     }
 }

@@ -1,8 +1,8 @@
 //! Parser tests: lexing (escapes, comments), structural extraction, errors.
 
-use nyx_profile::{parse, ParseError};
 use nyx_profile::transform::steps_from_block;
 use nyx_profile::Step;
+use nyx_profile::{parse, ParseError};
 
 /// A faithful, trimmed Malleable C2 profile exercising every construct the
 /// parser must handle: options, http-get/post, client/server, metadata/output/id
@@ -72,8 +72,14 @@ fn parses_options_and_uris() {
     let p = parse(GOOD).expect("GOOD must parse");
     assert_eq!(p.option("sample_name").unwrap().as_str(), "Nyx Test");
     assert_eq!(p.option("sleeptime").unwrap().as_str(), "60000");
-    assert_eq!(p.http_get().unwrap().get("uri").unwrap().as_str(), "/api/v1/Updates");
-    assert_eq!(p.http_post().unwrap().get("uri").unwrap().as_str(), "/api/v1/Telemetry/Id/");
+    assert_eq!(
+        p.http_get().unwrap().get("uri").unwrap().as_str(),
+        "/api/v1/Updates"
+    );
+    assert_eq!(
+        p.http_post().unwrap().get("uri").unwrap().as_str(),
+        "/api/v1/Telemetry/Id/"
+    );
     assert_eq!(p.http_post().unwrap().get("verb").unwrap().as_str(), "POST");
 }
 
@@ -115,7 +121,13 @@ fn one_arg_vs_two_arg_header_is_unambiguous() {
     // In a data block, `header "Cookie";` is a 1-arg terminator.
     // In a client block, `header "Server" "Apache";` is a 2-arg statement.
     let p = parse(GOOD).expect("parse");
-    let meta = p.http_get().unwrap().sub("client").unwrap().sub("metadata").unwrap();
+    let meta = p
+        .http_get()
+        .unwrap()
+        .sub("client")
+        .unwrap()
+        .sub("metadata")
+        .unwrap();
     let header_stmts: Vec<_> = meta.stmts("header").collect();
     assert_eq!(header_stmts.len(), 1, "metadata has one header terminator");
     assert_eq!(header_stmts[0].len(), 1, "terminator form has a single arg");

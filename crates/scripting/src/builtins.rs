@@ -34,7 +34,10 @@ impl Hook for LogHook {
         let line = match event {
             Event::SessionNew(s) => format!("session_new: {}@{}", s.username, s.hostname),
             Event::ResultReceived(r) => {
-                format!("result: {}#{} {:?} {}", r.session_id, r.task_id, r.kind, r.summary)
+                format!(
+                    "result: {}#{} {:?} {}",
+                    r.session_id, r.task_id, r.kind, r.summary
+                )
             }
             Event::SessionExit(s) => format!("session_exit: {}", s.session_id),
         };

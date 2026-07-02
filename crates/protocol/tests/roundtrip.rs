@@ -22,7 +22,10 @@ fn ecdh_key_agreement_is_mutual() {
     let k_server = server.derive_for(&implant.public_bytes());
     let k_implant = implant.session_key(&server.public_bytes());
 
-    assert_eq!(k_server, k_implant, "server and implant must derive the same key");
+    assert_eq!(
+        k_server, k_implant,
+        "server and implant must derive the same key"
+    );
 }
 
 #[test]
@@ -77,20 +80,34 @@ fn wrong_key_does_not_decrypt() {
 #[test]
 fn task_batch_roundtrip() {
     let tasks = vec![
-        msg::Task { task_id: 1, command: msg::Command::Ping },
+        msg::Task {
+            task_id: 1,
+            command: msg::Command::Ping,
+        },
         msg::Task {
             task_id: 2,
-            command: msg::Command::Shell { args: "whoami /groups".into() },
+            command: msg::Command::Shell {
+                args: "whoami /groups".into(),
+            },
         },
         msg::Task {
             task_id: 3,
-            command: msg::Command::Sleep { seconds: 30, jitter_pct: 20 },
+            command: msg::Command::Sleep {
+                seconds: 30,
+                jitter_pct: 20,
+            },
         },
         msg::Task {
             task_id: 4,
-            command: msg::Command::Upload { name: "loot.bin".into(), data: vec![0xDE, 0xAD, 0xBE, 0xEF] },
+            command: msg::Command::Upload {
+                name: "loot.bin".into(),
+                data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            },
         },
-        msg::Task { task_id: 5, command: msg::Command::Exit },
+        msg::Task {
+            task_id: 5,
+            command: msg::Command::Exit,
+        },
     ];
     let enc = msg::Task::encode_vec(&tasks);
     let dec = msg::Task::decode_vec(&enc).unwrap();
@@ -104,7 +121,10 @@ fn response_batch_roundtrip() {
             task_id: 2,
             response: msg::Response::Output(b"corp\\admin\n".to_vec()),
         },
-        msg::TaskResponse { task_id: 1, response: msg::Response::Ok },
+        msg::TaskResponse {
+            task_id: 1,
+            response: msg::Response::Ok,
+        },
         msg::TaskResponse {
             task_id: 9,
             response: msg::Response::FileChunk {
@@ -122,7 +142,9 @@ fn response_batch_roundtrip() {
 
 #[test]
 fn empty_batches_roundtrip() {
-    assert!(msg::Task::decode_vec(&msg::Task::encode_vec(&[])).unwrap().is_empty());
+    assert!(msg::Task::decode_vec(&msg::Task::encode_vec(&[]))
+        .unwrap()
+        .is_empty());
     assert!(
         msg::TaskResponse::decode_vec(&msg::TaskResponse::encode_vec(&[]))
             .unwrap()
@@ -237,8 +259,10 @@ fn nonce_directions_never_collide() {
     );
 
     // And each direction must round-trip on its own.
-    let pt_c2s = crypto::open_dir(&key, crypto::Direction::ClientToServer, 0, &pubkey, &c2s).unwrap();
-    let pt_s2c = crypto::open_dir(&key, crypto::Direction::ServerToClient, 0, &pubkey, &s2c).unwrap();
+    let pt_c2s =
+        crypto::open_dir(&key, crypto::Direction::ClientToServer, 0, &pubkey, &c2s).unwrap();
+    let pt_s2c =
+        crypto::open_dir(&key, crypto::Direction::ServerToClient, 0, &pubkey, &s2c).unwrap();
     assert_eq!(pt_c2s, plain);
     assert_eq!(pt_s2c, plain);
 

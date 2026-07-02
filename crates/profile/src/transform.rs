@@ -107,8 +107,12 @@ pub fn steps_from_block(b: &Block) -> Vec<Step> {
                 "netbios" => out.push(Step::Netbios),
                 "netbiosu" => out.push(Step::NetbiosU),
                 "mask" => out.push(Step::Mask),
-                "prepend" => out.push(Step::Prepend(args.first().map(|a| a.0.clone()).unwrap_or_default())),
-                "append" => out.push(Step::Append(args.first().map(|a| a.0.clone()).unwrap_or_default())),
+                "prepend" => out.push(Step::Prepend(
+                    args.first().map(|a| a.0.clone()).unwrap_or_default(),
+                )),
+                "append" => out.push(Step::Append(
+                    args.first().map(|a| a.0.clone()).unwrap_or_default(),
+                )),
                 _ => {}
             }
         }
@@ -289,7 +293,14 @@ mod tests {
 
     #[test]
     fn base64_roundtrip() {
-        for msg in [&b""[..], b"A", b"AB", b"ABC", b"hello world", b"\x00\xff\x10"] {
+        for msg in [
+            &b""[..],
+            b"A",
+            b"AB",
+            b"ABC",
+            b"hello world",
+            b"\x00\xff\x10",
+        ] {
             let enc = encode(&[Step::Base64], msg);
             assert_eq!(decode(&[Step::Base64], &enc).unwrap(), msg);
         }
@@ -301,14 +312,23 @@ mod tests {
     fn base64url_alphabet() {
         let enc = encode(&[Step::Base64Url], b"\xfb\xff");
         // standard would be '+/'; url-safe must be '-_'
-        assert!(enc.windows(2).any(|w| w == b"-_" || w[0] == b'-'), "url-safe alphabet used: {enc:?}");
+        assert!(
+            enc.windows(2).any(|w| w == b"-_" || w[0] == b'-'),
+            "url-safe alphabet used: {enc:?}"
+        );
     }
 
     #[test]
     fn netbios_roundtrip() {
         for msg in [&b""[..], b"\x1f\x8b", b"\x00\x10\xff"] {
-            assert_eq!(decode(&[Step::Netbios], &encode(&[Step::Netbios], msg)).unwrap(), msg);
-            assert_eq!(decode(&[Step::NetbiosU], &encode(&[Step::NetbiosU], msg)).unwrap(), msg);
+            assert_eq!(
+                decode(&[Step::Netbios], &encode(&[Step::Netbios], msg)).unwrap(),
+                msg
+            );
+            assert_eq!(
+                decode(&[Step::NetbiosU], &encode(&[Step::NetbiosU], msg)).unwrap(),
+                msg
+            );
         }
         assert_eq!(netbios_encode(&[0x1fu8], false), b"bp");
     }
@@ -316,12 +336,18 @@ mod tests {
     #[test]
     fn mask_roundtrip() {
         let msg = b"the quick brown fox";
-        assert_eq!(decode(&[Step::Mask], &encode(&[Step::Mask], msg)).unwrap(), msg);
+        assert_eq!(
+            decode(&[Step::Mask], &encode(&[Step::Mask], msg)).unwrap(),
+            msg
+        );
     }
 
     #[test]
     fn prepend_append_roundtrip() {
-        let steps = vec![Step::Prepend(b"SESSION=".to_vec()), Step::Append(b";".to_vec())];
+        let steps = vec![
+            Step::Prepend(b"SESSION=".to_vec()),
+            Step::Append(b";".to_vec()),
+        ];
         assert_eq!(decode(&steps, &encode(&steps, b"xyz")).unwrap(), b"xyz");
     }
 
