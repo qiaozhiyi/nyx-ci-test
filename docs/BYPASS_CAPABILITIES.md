@@ -103,7 +103,7 @@
 
 ---
 
-### 6. 栈欺骗（BYOUD-Gap RSP swap）✅
+### 6. 栈欺骗（BYOUD-Gap RSP swap）🔶 需显式启用
 
 **对抗：** 栈回溯检测（call stack 上出现 implant 地址 / RX 私有页）
 
@@ -115,7 +115,7 @@
 - `evasionsdk/swap.rs` — CET-aware 决策（悲观降级，5 测）
 - `implant-win/stack.rs` — `with_spoofed_stack()`：staging + `spoof_trampoline` + per-`<T,F>` 单态化桥 + `MaybeUninit` out-slot。f 真在 spoofed RSP 上执行。
 - `implant-win/version.rs` — `cet_active()`：真 `IsProcessorFeaturePresent(41)` 探测
-- 默认 gated **OFF**（`SPOOF_SWAP_ENABLED = false`，`stack.rs:82`）—— CET-on host 前保守关闭，避免 `#CP`
+- 默认 gated **OFF**（`SPOOF_SWAP_ENABLED = false`，`stack.rs:82`）—— CET-on host 前保守关闭，避免 `#CP`。**接线现状：** gap-pool 装填 + staging + `with_spoofed_stack` 内的 CET/gaps 运行时降级（`decide()`）均为真且已 selftest 验证；缺的只是 `core_bootstrap` 时的自动 arm 决策——CET-off 且 gaps 可用的主机目前仍需 operator 手动 `set_swap_enabled(true)`。自动化激活见 `entry.rs` 的栈欺骗 arm 路径（任务 #2）。
 
 **真机验证：** `nyx_selftest_swap_decision` exit=0b11 ✅ · `nyx_selftest_swap_armed` exit=0b1111（5/5 稳定，f 在 spoofed 栈执行无崩溃）✅
 
@@ -169,8 +169,9 @@
 
 ## 二、内核态 bypass（operator 侧，需 BYOVD driver）
 
-> 以下全部需要先加载驱动获取内核读写能力。
-> **驱动加载链：** 优先 KslD.sys（Living off the Defender, §18）→ 回退 RTCore64.sys (CVE-2019-16098, §10)。
+> **⚠️ 前置条件（适用本章节 §10–§17 全部能力）：必须先成功加载一个合法签名的漏洞驱动获取内核读写（`KernelRw`）能力。** 未加载驱动时，本章节所有能力均不可用。`byovd.rs` 头部明确标注 "CODE SHIPPED, NOT LOADED"——代码已就绪，但驱动加载是 operator 的显式动作，非默认行为。
+>
+> **驱动加载链：** 优先 KslD.sys（Living off the Defender, §18）→ 回退 RTCore64.sys (CVE-2019-16098, §10)。驱动层已抽象为 `VulnDriverIoctl` trait，可插拔其他 Nday/白驱动（见 §10 末尾）。
 > 真机验证在 Server 2019 17763.1339 上完成（2026-06-26，任务 G-K 全通过）。
 
 ### 10. BYOVD 内核读写（KernelRw via RTCore64）✅

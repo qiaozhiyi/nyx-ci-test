@@ -164,75 +164,191 @@ fn detect_build_from_pdb(data: &[u8]) -> Option<u32> {
 }
 
 /// Parse EPROCESS + ETW-TI field offsets from a real ntoskrnl PDB using the
-/// `pdb` crate. Uses `build_num` to select the correct ETW-TI offsets when
-/// they can't be directly extracted from the PDB type stream.
+/// `pdb` crate. Uses `build_num` only as a fallback for the ETW-TI offsets
+/// when their structures can't be located in the PDB type stream.
+///
+/// ## Offset chains resolved
+///
+/// **EPROCESS** (always from PDB): the 8 fields in [`map_eprocess_field`].
+///
+/// **ETW-TI** (the 4-hop blind chain — see `etwti.rs`):
+/// ```text
+///   nt!EtwThreatIntProvRegHandle  (global symbol → RVA)
+///     → *_ETW_REG_ENTRY :: GuidEntry         (+0x20, stable since 6.0)
+///       → *_ETW_GUID_ENTRY :: ProviderEnableInfo  (0x50 or 0x60, varies!)
+///         → _TRACE_ENABLE_INFO :: IsEnabled  (+0x0, stable)
+/// ```
+/// All 3 structs are named in the PDB type stream, so we parse them directly.
+/// The only offset that actually varies is `ProviderEnableInfo` — it moved
+/// from 0x050 (≤1903 / 17763 RTM) to 0x060 (≥2004 / 17763.1075+), and again
+/// on some Win11 builds. This is exactly why PDB resolution beats the
+/// hardcoded table: the table can't distinguish 17763.1 from 17763.1339, but
+/// the PDB for each LCU has the correct value.
 fn parse_pdb_offsets(data: &[u8], build_num: u32) -> Result<BTreeMap<&'static str, usize>> {
-    use pdb::{PDB, FallibleIterator, TypeData};
+    use pdb::{FallibleIterator, TypeData};
 
     let cursor = std::io::Cursor::new(data.to_vec());
-    let mut pdb = PDB::open(cursor)?;
+    let mut pdb = pdb::PDB::open(cursor)?;
     let type_info = pdb.type_information()?;
 
-    // Drain the iterator to populate the finder, collecting _EPROCESS candidates.
+    // Drain the TPI iterator once. We collect ALL wanted struct candidates in
+    // a single pass (_EPROCESS + the 3 ETW-TI structs) so the finder can later
+    // resolve any FieldList by TypeIndex without re-iterating.
     let mut iter = type_info.iter();
-    let mut eprocess_fields_index: Option<pdb::TypeIndex> = None;
+    let wanted: &[&[u8]] = &[
+        b"_EPROCESS",
+        b"EPROCESS",
+        b"_ETW_REG_ENTRY",
+        b"_ETW_GUID_ENTRY",
+        b"_TRACE_ENABLE_INFO",
+    ];
+    let mut struct_fields: std::collections::HashMap<&[u8], pdb::TypeIndex> =
+        std::collections::HashMap::new();
 
     while let Some(item) = iter.next()? {
         let type_data = item.parse()?;
-        // _EPROCESS is a ClassData in the PDB type stream.
-        let (name, fields) = match type_data {
-            TypeData::Class(ref c) => (&c.name, c.fields),
-            _ => continue,
-        };
-        let name_bytes = name.as_bytes();
-        if name_bytes == b"_EPROCESS" || name_bytes == b"EPROCESS" {
-            eprintln!("Found _EPROCESS in PDB");
-            eprocess_fields_index = fields;
-            break;
-        }
-    }
-
-    let fields_index = eprocess_fields_index
-        .ok_or_else(|| anyhow::anyhow!("_EPROCESS struct not found in PDB"))?;
-
-    // Use the finder to resolve the FieldList type.
-    let finder = type_info.finder();
-    let field_item = finder.find(fields_index)?;
-    let field_type = field_item.parse()?;
-
-    let mut offsets = BTreeMap::new();
-    if let TypeData::FieldList(field_list) = field_type {
-        // FieldList.fields is a Vec<TypeData> — iterate directly.
-        for field in &field_list.fields {
-            if let TypeData::Member(member) = field {
-                let name = member.name.to_string();
-                let off = member.offset as usize;
-                if let Some(key) = map_eprocess_field(&name) {
-                    offsets.insert(key, off);
-                    eprintln!("  _EPROCESS.{} @ 0x{:x}", name, off);
+        if let TypeData::Class(ref c) = type_data {
+            let name_bytes = c.name.as_bytes();
+            if wanted.contains(&name_bytes) && !struct_fields.contains_key(name_bytes) {
+                // c.fields is None for forward declarations (struct declared
+                // but not defined in this PDB). Skip those — we need the real
+                // FieldList TypeIndex to walk members.
+                if let Some(fields) = c.fields {
+                    struct_fields.insert(name_bytes, fields);
                 }
             }
         }
+    }
+
+    let finder = type_info.finder();
+    let mut offsets = BTreeMap::new();
+
+    // ---- EPROCESS field offsets ----
+    if let Some(&fields_index) = struct_fields
+        .get(b"_EPROCESS".as_slice())
+        .or_else(|| struct_fields.get(b"EPROCESS".as_slice()))
+    {
+        eprintln!("Found _EPROCESS in PDB");
+        extract_struct_fields(&finder, fields_index, &mut offsets, map_eprocess_field, "_EPROCESS")?;
+    } else {
+        anyhow::bail!("_EPROCESS struct not found in PDB");
     }
 
     if offsets.is_empty() {
         anyhow::bail!("_EPROCESS found but no known fields extracted");
     }
 
-    // ETW-TI offsets: the pointer chain targets (EtwThreatIntProvRegHandle,
-    // GUIDEntry, ProviderBlock, EnableInfo) are internal kernel structures.
-    // The field offsets WITHIN those structures drift across builds, so we
-    // select from the known table by build number rather than parsing them
-    // from the PDB type stream (which would require chasing _ETW_GUID_ENTRY
-    // and ETWRT_PROVIDER_BLOCK — both present in the PDB but complex to
-    // walk correctly). When the PDB build is detected, use its offsets.
-    if let Some(etw) = emit_known_offsets(build_num) {
-        offsets.insert("etw_ti.guid_entry_to_provider_block", etw["etw_ti.guid_entry_to_provider_block"]);
-        offsets.insert("etw_ti.provider_block_to_enable_info", etw["etw_ti.provider_block_to_enable_info"]);
-        offsets.insert("etw_ti.is_enabled_within_enable_info", etw["etw_ti.is_enabled_within_enable_info"]);
+    // ---- ETW-TI 4-hop chain (task PDB-1) ----
+    //
+    // The 3 struct field offsets. These replace the build-number table lookup
+    // — the PDB has the EXACT value for this build+LCU, including the
+    // 17763.1 vs 17763.1075+ ProviderEnableInfo difference.
+    if let Err(e) = resolve_etw_ti_offsets(&finder, &struct_fields, &mut offsets) {
+        // ETW-TI structs missing from this PDB (e.g. a stripped/public PDB).
+        // Fall back to the build-number table so the TOML still has values.
+        eprintln!("Warning: ETW-TI PDB parse failed ({e:#}); using build-table fallback");
+    }
+    if !offsets.contains_key("etw_ti.guid_entry_to_provider_block") {
+        if let Some(etw) = emit_known_offsets(build_num) {
+            for (k, v) in etw {
+                if k.starts_with("etw_ti.") {
+                    offsets.insert(k, v);
+                }
+            }
+        }
     }
 
     Ok(offsets)
+}
+
+/// Walk a struct's FieldList and insert every mapped field's offset.
+/// `mapper` translates a PDB field name → our offsets.toml key (None = skip).
+fn extract_struct_fields(
+    finder: &pdb::TypeFinder,
+    fields_index: pdb::TypeIndex,
+    offsets: &mut BTreeMap<&'static str, usize>,
+    mapper: fn(&str) -> Option<&'static str>,
+    struct_label: &str,
+) -> Result<()> {
+    let field_item = finder.find(fields_index)?.parse()?;
+    if let pdb::TypeData::FieldList(field_list) = field_item {
+        for field in &field_list.fields {
+            if let pdb::TypeData::Member(member) = field {
+                let name = member.name.to_string();
+                let off = member.offset as usize;
+                if let Some(key) = mapper(&name) {
+                    offsets.insert(key, off);
+                    eprintln!("  {}.{} @ 0x{:x}", struct_label, name, off);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the 3 ETW-TI struct field offsets from the PDB type stream.
+///
+/// Chain (see `parse_pdb_offsets` docs):
+///   `_ETW_REG_ENTRY::GuidEntry` (→ our key `etw_ti.guid_entry_to_provider_block`)
+///   `_ETW_GUID_ENTRY::ProviderEnableInfo` (→ `etw_ti.provider_block_to_enable_info`)
+///   `_TRACE_ENABLE_INFO::IsEnabled` (→ `etw_ti.is_enabled_within_enable_info`)
+///
+/// The key names are retained for TOML/back-compat even though the struct
+/// names are clearer — the field docs in `etwti.rs::EtwTiOffsets` map them.
+/// (Historical: the keys were named before the chain was fully traced.)
+fn resolve_etw_ti_offsets(
+    finder: &pdb::TypeFinder,
+    struct_fields: &std::collections::HashMap<&[u8], pdb::TypeIndex>,
+    offsets: &mut BTreeMap<&'static str, usize>,
+) -> Result<()> {
+    // Hop 1: _ETW_REG_ENTRY :: GuidEntry (→ 0x20 on every known x64 build)
+    if let Some(&idx) = struct_fields.get(b"_ETW_REG_ENTRY".as_slice()) {
+        extract_struct_fields(finder, idx, offsets, map_etw_reg_entry, "_ETW_REG_ENTRY")?;
+    } else {
+        anyhow::bail!("_ETW_REG_ENTRY not found in PDB type stream");
+    }
+    // Hop 2: _ETW_GUID_ENTRY :: ProviderEnableInfo (→ 0x50 or 0x60, the variable one)
+    if let Some(&idx) = struct_fields.get(b"_ETW_GUID_ENTRY".as_slice()) {
+        extract_struct_fields(finder, idx, offsets, map_etw_guid_entry, "_ETW_GUID_ENTRY")?;
+    } else {
+        anyhow::bail!("_ETW_GUID_ENTRY not found in PDB type stream");
+    }
+    // Hop 3: _TRACE_ENABLE_INFO :: IsEnabled (→ 0x0, struct's first field)
+    if let Some(&idx) = struct_fields.get(b"_TRACE_ENABLE_INFO".as_slice()) {
+        extract_struct_fields(finder, idx, offsets, map_trace_enable_info, "_TRACE_ENABLE_INFO")?;
+    } else {
+        anyhow::bail!("_TRACE_ENABLE_INFO not found in PDB type stream");
+    }
+    Ok(())
+}
+
+/// Map `_ETW_REG_ENTRY` PDB field names → our TOML keys.
+fn map_etw_reg_entry(name: &str) -> Option<&'static str> {
+    match name {
+        // Key name retained for TOML back-compat; semantically this is
+        // `_ETW_REG_ENTRY::GuidEntry` (the +0x20 pointer hop in the chain).
+        "GuidEntry" => Some("etw_ti.guid_entry_to_provider_block"),
+        _ => None,
+    }
+}
+
+/// Map `_ETW_GUID_ENTRY` PDB field names → our TOML keys.
+fn map_etw_guid_entry(name: &str) -> Option<&'static str> {
+    match name {
+        // Key name retained for TOML back-compat; semantically this is
+        // `_ETW_GUID_ENTRY::ProviderEnableInfo` (the 0x50/0x60 hop).
+        "ProviderEnableInfo" => Some("etw_ti.provider_block_to_enable_info"),
+        _ => None,
+    }
+}
+
+/// Map `_TRACE_ENABLE_INFO` PDB field names → our TOML keys.
+fn map_trace_enable_info(name: &str) -> Option<&'static str> {
+    match name {
+        // IsEnabled is the struct's first field (offset 0x0 on every build).
+        "IsEnabled" => Some("etw_ti.is_enabled_within_enable_info"),
+        _ => None,
+    }
 }
 
 /// Map a PDB field name to our offsets.toml key. Returns None for fields we

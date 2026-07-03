@@ -1,11 +1,57 @@
 //! ETW-TI (Threat Intelligence) provider kernel blind — REAL algorithm (P2.2 §2.1).
 //!
 //! Disables the `Microsoft-Windows-Threat-Intelligence` kernel ETW provider by
-//! a single QWORD write to its `ProviderEnableInfo.IsEnabled` field, reached by
-//! chasing `nt!EtwThreatIntProvRegHandle → +provider_block_off → +enableinfo_off`.
-//! This is HVCI-safe: the target is a data-section field, not code, so a kernel
-//! R/W primitive that refuses code-page writes (the `KernelRw` HVCI contract)
-//! still permits this.
+//! a single DWORD write to its `ProviderEnableInfo.IsEnabled` field, reached by
+//! a 4-hop pointer chain through three internal kernel structures. This is
+//! HVCI-safe: every target is a data-section field, not code, so a kernel R/W
+//! primitive that refuses code-page writes (the `KernelRw` HVCI contract) still
+//! permits this.
+//!
+//! ## The 4-hop chain (chased at runtime by [`EtwTiBlind::blind`])
+//!
+//! ```text
+//!   nt!EtwThreatIntProvRegHandle          (global symbol → RVA, resolved by bootstrap)
+//!     │
+//!     ▼  *(reg_handle_kva)
+//!   _ETW_REG_ENTRY                        (the provider registration)
+//!     +0x20  GuidEntry*  ──────────────┐  (field name in PDB: "GuidEntry")
+//!     │                                │
+//!     ▼  *(guid_entry_kva)             │
+//!   _ETW_GUID_ENTRY  ◀─────────────────┘
+//!     +0x50/+0x60  ProviderEnableInfo    (field name: "ProviderEnableInfo")
+//!       │   (the offset that VARIES — see below)
+//!       ▼
+//!     _TRACE_ENABLE_INFO (embedded struct, not a pointer)
+//!       +0x00  IsEnabled: ULONG          ← we write 0 here to blind
+//! ```
+//!
+//! The hop offsets in [`EtwTiOffsets`] map to the chain as:
+//! - `guid_entry_to_provider_block` = `_ETW_REG_ENTRY::GuidEntry` offset (the
+//!   first pointer dereference). Despite the legacy field name, this is NOT a
+//!   "GUID entry → provider block" hop — it's the `RegEntry → GuidEntry` hop.
+//!   Stable at `0x20` on every x64 build since Vista.
+//! - `provider_block_to_enable_info` = `_ETW_GUID_ENTRY::ProviderEnableInfo`
+//!   offset. Despite the legacy field name, there is no separate
+//!   `ETWRT_PROVIDER_BLOCK` in this chain — `ProviderEnableInfo` is embedded
+//!   directly in `_ETW_GUID_ENTRY`. **This is the offset that varies**:
+//!   `0x050` on builds ≤1903 and 17763 RTM (<1075); `0x060` on ≥2004 and
+//!   17763.1075+; possibly `0x070` on some Win11 builds (needs PDB verification).
+//! - `is_enabled_within_enable_info` = `_TRACE_ENABLE_INFO::IsEnabled` offset.
+//!   Stable at `0x0` (it's the struct's first field on every build).
+//!
+//! ## Offset resolution — the three-layer strategy
+//!
+//! 1. **PDB (ground truth):** `offset-resolver`'s `parse_pdb_offsets` walks the
+//!    ntoskrnl PDB type stream and extracts `_ETW_REG_ENTRY::GuidEntry`,
+//!    `_ETW_GUID_ENTRY::ProviderEnableInfo`, and `_TRACE_ENABLE_INFO::IsEnabled`
+//!    directly. This is the only method that correctly distinguishes 17763.1
+//!    (0x050) from 17763.1339 (0x060) — same build number, different LCU.
+//! 2. **Pattern scan (runtime, no network):** `pattern_scan` finds the
+//!    `EtwThreatIntProvRegHandle` global via RIP-relative `lea`/`mov`
+//!    references in ntoskrnl `.text` (see CheekyBlinder/EDRSandblast methods).
+//! 3. **`for_build` table (floor fallback):** the values below, keyed by build
+//!    number. Use ONLY when PDB + pattern scan are both unavailable. The
+//!    `for_build_strict` variant takes UBR for the 17763 LCU split.
 //!
 //! ## Why this works against kernel-tier EDR telemetry
 //! User-mode ETW blinds (Nyx P2.1b patches `ntdll!NtTraceEvent`) only stop
@@ -18,18 +64,21 @@
 //! kernel-side feed at the source. This is the S12 / EDRSandblast technique.
 //!
 //! ## Layering / what this module is NOT
-//! This is the **algorithm** given a working `&dyn KernelRw`. It does NOT load
-//! a driver, resolve `EtwThreatIntProvRegHandle`, or touch the kernel directly —
-//! those are the bootstrap (`KernelRw` impl + symbol resolution) in Part B /
-//! the operator's chosen BYOVD path. Splitting algorithm from primitive keeps
-//! the algorithm unit-testable with a mock `KernelRw` and lets any bootstrap
-//! (KslD.sys / driverless CVE / DMA) drive it without editing this code.
+//! This is the **algorithm** given a working `&dyn KernelRw` + a resolved
+//! `EtwThreatIntProvRegHandle` KVA. It does NOT load a driver, resolve the
+//! symbol, or touch the kernel directly — those are the bootstrap (`KernelRw`
+//! impl + symbol resolution via PDB/pattern-scan) in `win::bootstrap_*`.
+//! Splitting algorithm from primitive keeps the algorithm unit-testable with a
+//! mock `KernelRw` and lets any bootstrap (KslD.sys / driverless CVE / DMA)
+//! drive it without editing this code.
 //!
 //! ## Offset versioning
-//! The `GUIDEntry → provider block` and `provider block → EnableInfo` offsets
-//! vary across Windows builds. [`EtwTiOffsets`] holds them; [`for_build`] picks
-//! known-good values per build, and a real impl may probe at runtime. NEVER
-//! hardcode a single offset across builds — it silently writes the wrong field.
+//! The `_ETW_GUID_ENTRY::ProviderEnableInfo` offset varies across Windows
+//! builds (and even across LCUs of the same build — see 17763). [`EtwTiOffsets`]
+//! holds the 3 hop offsets; [`for_build`] picks known-good values per build,
+//! `for_build_strict` refines by UBR, and the PDB resolver (`offset-resolver`)
+//! gives the exact value. NEVER hardcode a single offset across builds — it
+//! silently writes the wrong field.
 
 use crate::{EtwTiKit, KernelRw, KitError};
 
@@ -40,14 +89,19 @@ pub const ETW_TI_GUID: [u8; 16] = [
     0x7C, 0x89, 0xE1, 0xF4, 0x5D, 0xBB, 0x68, 0x56, 0xF1, 0xD8, 0x04, 0x0F, 0x4D, 0x8D, 0xD3, 0x44,
 ];
 
-/// Build-dependent offsets for the ETW-TI provider-block chase. See [`for_build`].
+/// Build-dependent offsets for the ETW-TI 4-hop blind chain. See the module
+/// docs for the full chain diagram and [`for_build`] for the per-build table.
 ///
-/// - `guid_entry_to_provider_block`: offset within the `GUIDEntry` struct to the
-///   `ETWRT_PROVIDER_BLOCK*` pointer.
-/// - `provider_block_to_enable_info`: offset within `ETWRT_PROVIDER_BLOCK` to the
-///   `ProviderEnableInfo` struct, whose first DWORD is `IsEnabled`.
-/// - `is_enabled_within_enable_info`: byte offset of `IsEnabled` within
-///   `ProviderEnableInfo` (0 on every known build — it's the first field).
+/// **Field names are legacy** (kept for TOML/back-compat with `offset-resolver`
+/// output + existing offsets tables). They do NOT reflect the actual struct
+/// names in the chain — see the module-level docs for the correct mapping:
+/// - `guid_entry_to_provider_block`: actually `_ETW_REG_ENTRY::GuidEntry`
+///   (offset `0x20`, stable since Vista x64).
+/// - `provider_block_to_enable_info`: actually
+///   `_ETW_GUID_ENTRY::ProviderEnableInfo` (offset `0x050`/`0x060`/`0x070` —
+///   **the variable one**; resolved exactly by the PDB walker).
+/// - `is_enabled_within_enable_info`: `_TRACE_ENABLE_INFO::IsEnabled`
+///   (offset `0x0`, stable — struct's first field).
 #[derive(Clone, Copy, Debug)]
 pub struct EtwTiOffsets {
     pub guid_entry_to_provider_block: usize,

