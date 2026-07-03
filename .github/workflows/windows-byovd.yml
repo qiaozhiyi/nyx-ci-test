@@ -69,6 +69,10 @@ jobs:
             [Parameter(Mandatory)][string]$Sha
           )
           $ErrorActionPreference = 'Continue'  # show every error, don't abort early
+          # Normalize the run dir to backslashes — bash passes it with forward
+          # slashes (scp/ssh want /), but PowerShell + git on Windows want \.
+          # Mixing C:/Users/...\src → git clone fails + Push-Location not found.
+          $RunDir = $RunDir -replace '/', '\'
           $exe      = "$RunDir\nyx-kernel.exe"
           $resolver = "$RunDir\nyx-offset-resolver.exe"
           $sys      = "C:\Users\Administrator\RTCore64.sys"
