@@ -8,7 +8,7 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
 
 use crate::theme;
 use crate::types::{arch_str, SessionView};
@@ -19,6 +19,14 @@ use super::{fmt_age, short, App, Overlay};
 
 pub(super) fn render(app: &mut App, frame: &mut ratatui::Frame) {
     let area = frame.area();
+    // 记录本帧尺寸，handle_key 里 move_focus 用它替代硬编码的4 80×24。
+    app.last_frame_size = area;
+    // 清空上一帧的 view tab hit regions，render_pane 会重建。防止窗格关闭后残留。
+    app.view_tab_rect.clear();
+    // 清空上一帧的 session 行 hit regions，render_overlay 重建。
+    app.session_row_rects.clear();
+    // 清空上一帧的 per-pane SessionList 行 hit regions。
+    app.pane_session_rows.clear();
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(Paragraph::new("").style(theme::base_bg()), area);
 
@@ -39,74 +47,126 @@ pub(super) fn render(app: &mut App, frame: &mut ratatui::Frame) {
         .split(area);
 
     render_statusbar(frame, app, chunks[0]);
-    // 窗格树区域：递归渲染每个叶。
+    // 窗格树区域：递归渲染每个叶。用 layout_full 一次遍历拿全 (id, rect, view, session)，
+    // 避免之前每帧 clone 整棵树 + O(n²) 二次 leaves() 查找 view（P1-2）。
     let pane_area = chunks[1];
-    let layouts = app.pane_tree.clone().layout(pane_area);
-    for (id, rect) in &layouts {
+    let layouts = app.pane_tree.layout_full(pane_area);
+    for (id, rect, view, session_id) in &layouts {
         let is_focused = *id == app.focused_pane;
-        let view = app
-            .pane_tree
-            .leaves()
-            .iter()
-            .find(|(lid, _)| lid == id)
-            .map(|(_, v)| *v);
-        render_pane(
-            frame,
-            app,
-            *id,
-            *rect,
-            is_focused,
-            view.unwrap_or(panes::PaneView::Console),
-        );
+        // 记录焦点窗格 rect，供 overlay 限制区域用（不再全屏遮挡其他窗格）。
+        if is_focused {
+            app.focused_pane_rect = *rect;
+        }
+        render_pane(frame, app, *id, *rect, is_focused, *view, session_id.as_deref());
     }
     render_input(frame, app, chunks[2]);
 
-    if app.popup_open {
+    // popup 是否打开由焦点窗格决定（per-pane）
+    if app.focused_state().popup_open {
         render_popup(frame, app, chunks[2]);
     }
+    // view picker：某窗格的视图选择菜单开着 → 在它的 tab 下方画小 popup。
+    if app.view_picker.is_some() {
+        render_view_picker(frame, app);
+    }
     if app.overlay.is_open() {
-        render_overlay(frame, app, area);
+        // overlay 限制在焦点窗格区域内（不再全屏遮挡其他窗格）。
+        // 用 focused_pane_rect 让 overlay 只覆盖当前操作的窗格。
+        render_overlay(frame, app, app.focused_pane_rect);
     }
 }
 
 /// 渲染单个窗格叶。
+///
+/// 顶部边框行改造成可点击的视图 tab bar（opencode 风格）：6 个 tab 横排，
+/// 当前视图高亮（实心背景），其余 muted。每个 tab 的屏幕 Rect 记录到
+/// `app.tab_hit_regions`，供 click 反查切换视图。
 fn render_pane(
     frame: &mut ratatui::Frame,
     app: &mut App,
-    _id: usize,
+    id: usize,
     area: Rect,
     focused: bool,
     view: panes::PaneView,
+    session_id: Option<&str>,
 ) {
-    // 焦点窗格用 Accent 边框，非焦点用 Faint。
-    let border = if focused { theme::ACCENT } else { theme::FAINT };
-    let title = format!(" {} ", view.label());
+    // ---- 边框 + 配色层次（P0 视觉改造）----
+    // 焦点：Rounded 圆角 + accent 边框（醒目）。
+    // hover：Rounded + accent_dim（次醒目）。
+    // 普通：Rounded + surface2（接近背景色，相邻窗格的双线感自然消失，gitui 手法）。
+    // 不再用 Thick 粗块（笨重）和 faint（太淡看不见）。
+    let is_hovered = app.hover_pane == Some(id) && !focused;
+    let (border_color, bg_color) = if focused {
+        (theme::accent(), theme::surface())
+    } else if is_hovered {
+        (theme::accent_dim(), theme::base())
+    } else {
+        (theme::surface2(), theme::base())
+    };
+
+    // ---- 紧凑视图 tab：只画当前视图名 + ▾ 下拉指示 ----
+    let tab_y = area.y;
+    let tab_label = view.label();
+    let picker_open = app
+        .view_picker
+        .as_ref()
+        .is_some_and(|(pid, _)| *pid == id);
+    let arrow = if picker_open { "▴" } else { "▾" };
+    let tab_text = format!(" {tab_label} {arrow} ");
+    let tab_w = tab_text.chars().count() as u16;
+    let tab_x = area.x + 1;
+    app.view_tab_rect.insert(
+        id,
+        Rect {
+            x: tab_x,
+            y: tab_y,
+            width: tab_w,
+            height: 1,
+        },
+    );
+    // tab 高亮改柔和配色（P1）：surface1 背景 + text 前景，不再强反色刺眼。
+    // 焦点窗格的 tab 用 accent 前景强化，其余用 text。
+    let mut tab_spans: Vec<Span> = vec![Span::styled(
+        tab_text,
+        Style::default()
+            .fg(if focused { theme::accent() } else { theme::text_color() })
+            .bg(theme::surface1())
+            .add_modifier(Modifier::BOLD),
+    )];
+    tab_spans.push(Span::styled(format!(" [{id}]"), theme::faint()));
+    if let Some(sid) = session_id {
+        let alias = app
+            .sessions_meta
+            .get(sid)
+            .alias
+            .clone()
+            .unwrap_or_else(|| short(sid));
+        tab_spans.push(Span::styled(format!(" · {alias}"), theme::faint()));
+    }
+    let off = app.pane_scroll.get(&id).copied().unwrap_or(0);
+    if off > 0 {
+        tab_spans.push(Span::styled(format!(" ↑{off}"), theme::warn()));
+    }
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border))
-        .title(Span::styled(
-            title,
-            if focused {
-                theme::brand()
-            } else {
-                theme::muted()
-            },
-        ))
-        .style(theme::header_bg());
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title_top(Line::from(tab_spans))
+        // P1 呼吸感：内容区加 1 列水平 padding，内容不再紧贴边框。
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(bg_color).fg(theme::text_color()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     match view {
         panes::PaneView::Console => {
-            render_stream_content(frame, app, inner);
+            render_stream_content(frame, app, inner, id);
         }
         panes::PaneView::SessionList => {
-            render_sessions_in_pane(frame, app, inner);
+            render_sessions_in_pane(frame, app, inner, id);
         }
         panes::PaneView::Files => {
-            // Render the SAME parsed file listing the fullscreen overlay uses
-            // (cached in App::files_view), instead of a hardcoded placeholder.
-            // Empty → show the hint so the operator knows to run /ls.
             render_files_table(frame, inner, &app.files_view);
         }
         panes::PaneView::Procs => {
@@ -122,17 +182,38 @@ fn render_pane(
 }
 
 /// 事件流内容（无边框，边框由 render_pane 提供）。
-fn render_stream_content(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+/// 使用该窗格自己的 pane_scroll 居中滚动偏移（独立），回退到全局 stream_offset。
+fn render_stream_content(frame: &mut ratatui::Frame, app: &App, area: Rect, pane_id: usize) {
+    let pane_session = app.pane_tree.get_session_id(pane_id);
+    let target_session = pane_session.as_ref();
+
+    // Filter stream: include global logs (None) and logs matching target_session (supporting prefix matching)
+    let pane_stream: Vec<&crate::rest::LogLine> = app.stream
+        .iter()
+        .filter(|l| {
+            match (&l.session_id, target_session) {
+                (None, _) => true,
+                (Some(s1), Some(s2)) => s1 == s2 || s2.starts_with(s1) || s1.starts_with(s2),
+                (Some(_), None) => false,
+            }
+        })
+        .collect();
+
+    // 使用该窗格自己的 scroll offset（独立滚动），不存在则用全局 stream_offset。
+    let scroll_offset = app.pane_scroll.get(&pane_id).copied().unwrap_or(app.stream_offset);
     let height = area.height as usize;
-    let total = app.stream.len();
-    let end = total.saturating_sub(app.stream_offset);
+    let total = pane_stream.len();
+    let end = total.saturating_sub(scroll_offset);
     let start = end.saturating_sub(height);
-    let visible = &app.stream[start..end.min(total)];
+    let visible = &pane_stream[start..end.min(total)];
     let lines: Vec<Line> = visible
         .iter()
         .map(|l| {
+            // A11y-A2：marker 用级别专属形状符号（ℹ✓⚠✕），不再统一 ▎，
+            // 色盲用户也能区分级别。后接空格保持视觉间距。
+            let glyph = theme::level_glyph(l.level);
             Line::from(vec![
-                Span::styled("▎ ", theme::level_marker(l.level)),
+                Span::styled(format!("{glyph} "), theme::level_marker(l.level)),
                 Span::styled(l.text.clone(), theme::level(l.level)),
             ])
         })
@@ -141,40 +222,84 @@ fn render_stream_content(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     frame.render_widget(para, area);
 }
 
-/// 在窗格里渲染 session 列表（只读预览）。
-fn render_sessions_in_pane(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+/// 在窗格里渲染 session 列表。逐行渲染 + 记录 hit regions 支持点击切换。
+/// 当前选中的 session 行高亮（surface1 背景 + ▸ 标记），点击其他行切换 beacon。
+fn render_sessions_in_pane(
+    frame: &mut ratatui::Frame,
+    app: &mut App,
+    area: Rect,
+    pane_id: usize,
+) {
     if app.sessions.is_empty() {
-        let para = Paragraph::new("(no beacons — waiting for sessions)").style(theme::muted());
+        let para = Paragraph::new("· no beacons — waiting for sessions")
+            .style(theme::faint())
+            .alignment(Alignment::Center);
         frame.render_widget(para, area);
         return;
     }
-    let lines: Vec<Line> = app
-        .sessions
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let mark = if app.selected == Some(i) {
-                "▸ "
-            } else {
-                "  "
-            };
-            let m = app.sessions_meta.get(&s.id);
-            let star = if m.favorite { "★" } else { " " };
-            let alias = m.alias.as_deref().unwrap_or("");
-            Line::from(vec![
-                Span::styled(mark, Style::default().fg(theme::MAUVE)),
+    // 该窗格当前绑定的 session（用于高亮"当前调用的是哪个 beacon"）。
+    let cur_sid = app.pane_tree.get_session_id(pane_id);
+    let mut row_rects: Vec<(Rect, String)> = Vec::new();
+    for (i, s) in app.sessions.iter().enumerate() {
+        let row_y = area.y + i as u16;
+        if row_y >= area.y + area.height {
+            break; // 超出窗格截断
+        }
+        let row_rect = Rect {
+            x: area.x,
+            y: row_y,
+            width: area.width,
+            height: 1,
+        };
+        let is_current = cur_sid.as_deref() == Some(&s.id);
+        row_rects.push((row_rect, s.id.clone()));
+
+        let m = app.sessions_meta.get(&s.id);
+        let star = if m.favorite { "★" } else { " " };
+        let alias = m.alias.as_deref().unwrap_or("");
+        let mark = if is_current { "▸ " } else { "  " };
+        // 当前 session 行用 selected() 高亮（蓝色背景）——但只覆盖有内容的列，
+        // 不填满整行（避免行尾一大坨色块）。行尾空白保持窗格背景。
+        let sel = theme::selected();
+        let sel_bg = sel.bg.unwrap_or(theme::base());
+        let sel_fg = sel.fg.unwrap_or(theme::text_color());
+        let mk = |color: ratatui::style::Color, text: String| -> Span<'_> {
+            if is_current {
                 Span::styled(
-                    format!("{:8} ", short(&s.id)),
-                    Style::default().fg(theme::ACCENT),
-                ),
-                Span::styled(format!("{:14} ", s.hostname), theme::text()),
-                Span::styled(format!("{:12} ", s.username), theme::text()),
-                Span::styled(star, Style::default().fg(theme::WARN)),
-                Span::styled(format!(" {alias}"), theme::muted()),
-            ])
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), area);
+                    text,
+                    Style::default()
+                        .fg(sel_fg)
+                        .bg(sel_bg)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(text, Style::default().fg(color))
+            }
+        };
+        let line = Line::from(vec![
+            mk(theme::mauve(), mark.to_string()),
+            mk(theme::accent(), format!("{:8} ", short(&s.id))),
+            mk(theme::text_color(), format!("{:14} ", s.hostname)),
+            mk(theme::text_color(), format!("{:12} ", s.username)),
+            mk(theme::warn(), star.to_string()),
+            mk(theme::muted_color(), format!(" {alias}")),
+        ]);
+        if is_current {
+            // 当前行：把内容 pad 到窗格满宽，让蓝色高亮填满整行长条。
+            // 计算已有内容的字符数，补足空格（带 sel_bg 背景）。
+            let content_len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            let pad = (area.width as usize).saturating_sub(content_len);
+            let mut full_line = line;
+            full_line.spans.push(Span::styled(
+                " ".repeat(pad),
+                Style::default().bg(sel_bg),
+            ));
+            frame.render_widget(Paragraph::new(full_line), row_rect);
+        } else {
+            frame.render_widget(Paragraph::new(line), row_rect);
+        }
+    }
+    app.pane_session_rows.insert(pane_id, row_rects);
 }
 
 /// Render a file listing inside a pane leaf. Mirrors the fullscreen
@@ -304,9 +429,9 @@ fn render_borderless_table(
     use ratatui::widgets::{Cell, Row, Table};
     let header_row = Row::new(header.iter().map(|h| Cell::from(*h))).style(
         Style::default()
-            .fg(theme::MAUVE)
+            .fg(theme::muted_color())
             .add_modifier(Modifier::BOLD),
-    );
+    ).bottom_margin(1);
     let data_rows: Vec<Row> = rows
         .iter()
         .map(|r| Row::new(r.iter().cloned().map(|c| Cell::new(c).style(theme::text()))))
@@ -328,9 +453,12 @@ fn render_borderless_table(
     frame.render_widget(table, area);
 }
 
-/// Dimmed single-line hint shown when a pane view has no data yet.
+/// Dimmed hint shown when a pane view has no data yet. 加 · 前缀符号做视觉锚点，
+/// 居中显示比左对齐更优雅（空状态是"等待操作员"，居中暗示"这里待填充"）。
 fn hint(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
-    let para = Paragraph::new(msg).style(theme::muted());
+    let para = Paragraph::new(format!("· {msg}"))
+        .style(theme::faint())
+        .alignment(Alignment::Center);
     frame.render_widget(para, area);
 }
 
@@ -338,14 +466,12 @@ fn render_statusbar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     // Header strip: solid background, brand on the left, status dot+label,
     // then dimmed session/beacon info.
     let (dot, dot_style, label) = if app.connected {
-        ("●", Style::default().fg(theme::SUCCESS), "connected")
+        ("●", Style::default().fg(theme::success()), "connected")
     } else {
-        ("○", Style::default().fg(theme::DANGER), "disconnected")
+        ("○", Style::default().fg(theme::danger()), "disconnected")
     };
     let beacon = match app.current_session() {
         Some(s) => {
-            // user@host · <id> · pend:N(仅当>0) · <age>。age 每帧由 age_for() 推算，
-            // 每秒自然推进；不触发 session 全表重绘（status bar 单行重绘）。
             let mut buf = format!("{}@{} · {}", s.username, s.hostname, short(&s.id));
             if s.pending > 0 {
                 buf.push_str(&format!(" · pend:{}", s.pending));
@@ -355,87 +481,143 @@ fn render_statusbar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         }
         None => "no beacon".to_string(),
     };
-    let line = Line::from(vec![
+    // 三段式状态栏（P2 视觉改造）：左品牌+连接 · 中 beacon 上下文 · 右计数+模式。
+    // 段间用 │ 竖线分隔，段内不同色相（左 brand、中 text、右 muted），层次分明。
+    let mut spans = vec![
+        // ---- 左段：品牌 + 连接状态 ----
         Span::styled(" nyx ", theme::brand()),
-        Span::styled(" ", theme::muted()),
         Span::styled(dot, dot_style),
-        Span::styled(format!(" {label}"), theme::muted()),
-        Span::styled("  ", theme::muted()),
+        Span::styled(format!(" {label} "), theme::muted()),
+        Span::styled("│", Style::default().fg(theme::surface2())),
+        // ---- 中段：当前 beacon 上下文 ----
+        Span::styled(format!(" {beacon} "), theme::text()),
+        Span::styled("│", Style::default().fg(theme::surface2())),
+        // ---- 右段：计数 + 模式 ----
         Span::styled(
-            format!("{} ", app.sessions.len()),
+            format!(" {} ", app.sessions.len()),
             Style::default()
-                .fg(theme::MAUVE)
+                .fg(theme::mauve())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("beacons", theme::muted()),
-        Span::styled("   ", theme::muted()),
-        Span::styled(beacon, theme::text()),
-    ]);
+        Span::styled("beacons ", theme::muted()),
+    ];
+    // prefix 模式指示器（UX-S5）：激活时在状态栏最右显示醒目标记。
+    if app.tmux_prefix {
+        spans.push(Span::styled("│", Style::default().fg(theme::surface2())));
+        spans.push(Span::styled(
+            " [PREFIX] ",
+            Style::default()
+                .fg(theme::warn())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line).style(theme::header_bg()), area);
 }
 
-fn render_input(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    // Soft rounded-top border in the accent colour; surface-fill body. The title
-    // hint sits dimmed so it reads as chrome, not content.
+fn render_input(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    // 输入栏：顶部圆角分隔线 + surface 底色。标题精简为 " input "。
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(theme::input_border())
-        .title(Span::styled(
-            " type a command · / for menu ",
-            theme::muted(),
-        ));
-    frame.render_widget(Paragraph::new("").style(theme::input_bg()), area);
-    let inner = Rect {
-        x: area.x + 1,
-        y: area.y + 1,
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(1),
-    };
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::surface2()))
+        .title(Span::styled(" input ", theme::muted()))
+        .style(theme::input_bg())
+        .padding(Padding::horizontal(2));
+    // 关键：用 block.inner(area) 拿到去掉边框+padding 后的真实内容区。
+    // 之前错误地用 area 原始值，导致 prompt 画在边框上、位置错乱。
+    let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let display: String = app.input.chars().collect();
-    let prompt = if display.is_empty() {
-        Paragraph::new(Span::styled(
-            "type a shell command (runs on the selected beacon), or / for the menu",
-            theme::muted(),
-        ))
+    let (display, cursor_chars) = {
+        let st = app.focused_state();
+        (st.input.clone(), st.cursor)
+    };
+
+    // 目标 session 标签（UX-S1）：防误发。无 session 显示 "[no beacon]"。
+    let tag_text = match app.current_session() {
+        Some(s) => {
+            let alias = app
+                .sessions_meta
+                .get(&s.id)
+                .alias
+                .clone()
+                .unwrap_or_else(|| s.hostname.clone());
+            format!("[{} {}] ", short(&s.id), alias)
+        }
+        None => "[no beacon] ".to_string(),
+    };
+    let is_empty = display.is_empty();
+    let prompt = if is_empty {
+        Paragraph::new(Line::from(vec![
+            Span::styled(tag_text.clone(), theme::muted()),
+            Span::styled("type a command, or / for menu", theme::faint()),
+        ]))
         .style(theme::input_bg())
     } else {
-        Paragraph::new(Span::styled(
-            format!("❯ {display}"),
-            Style::default().fg(theme::ACCENT),
-        ))
+        Paragraph::new(Line::from(vec![
+            Span::styled(tag_text.clone(), theme::muted()),
+            Span::styled(
+                format!("❯ {display}"),
+                Style::default().fg(theme::accent()),
+            ),
+        ]))
         .style(theme::input_bg())
     };
     frame.render_widget(prompt, inner);
 
-    // place the hardware cursor (prefix is "❯ ")
-    let prefix = "❯ ".chars().count() as u16;
-    let x = inner.x + prefix + app.cursor as u16;
-    frame.set_cursor_position((x.min(inner.x + inner.width.saturating_sub(1)), inner.y));
+    // 硬件光标定位。inner 已是去掉边框+padding 后的区域，光标相对 inner 算。
+    // 非空状态：tag_text + "❯ "(2列) + cursor；空状态：光标停在 tag 后（无 ❯）。
+    let tag_w = tag_text.chars().count() as u16;
+    let prefix_w = if is_empty {
+        tag_w
+    } else {
+        tag_w + 2 // "❯ " = ❯(1列) + space(1列)
+    };
+    let cursor_x = inner.x + prefix_w + cursor_chars as u16;
+    frame.set_cursor_position((
+        cursor_x.min(inner.x + inner.width.saturating_sub(1)),
+        inner.y,
+    ));
 }
 
 fn render_popup(frame: &mut ratatui::Frame, app: &mut App, input_area: Rect) {
-    let filtered = filter_meta(&app.input);
+    // Popup 也按焦点窗格渲染（per-pane）：只有当前焦点窗格的输入态
+    // 处于 "/" 前缀下时才弹 popup，弹的内容也用焦点窗格的 popup_state。
+    let (input_snapshot, popup_open) = {
+        let st = app.focused_state();
+        (st.input.clone(), st.popup_open)
+    };
+    if !popup_open {
+        return;
+    }
+    let filtered = filter_meta(&input_snapshot);
     if filtered.is_empty() {
         return;
     }
-    let height = (filtered.len() as u16 + 2).min(14);
-    let width = 56;
+    // 宽度加宽（内容不截断），高度克制（不遮挡太多窗格内容）。
+    // 宽度取终端 85%，最少 74；高度最多 12 行（含边框），够看常用命令。
+    let height = (filtered.len() as u16 + 2).min(12);
+    let width = 74.max((frame.area().width as f32 * 0.85) as u16);
+    let width = width.min(input_area.width.saturating_sub(2));
     let area = Rect {
         x: input_area.x + 1,
         y: input_area.y.saturating_sub(height),
         width,
         height,
     };
-    // Each item: bright command name, muted args-hint, dimmed help.
+    // Each item: cyber 图标 + 命令名 + args-hint + help。
     let items: Vec<ListItem> = filtered
         .iter()
         .map(|m| {
             ListItem::new(Line::from(vec![
                 Span::styled(
+                    format!("{} ", m.icon),
+                    Style::default().fg(theme::accent_dim()),
+                ),
+                Span::styled(
                     format!("{:11} ", m.name),
-                    Style::default().fg(theme::ACCENT),
+                    Style::default().fg(theme::accent()),
                 ),
                 Span::styled(format!("{:18} ", m.args_hint), theme::muted()),
                 Span::styled(m.help, theme::faint()),
@@ -446,70 +628,151 @@ fn render_popup(frame: &mut ratatui::Frame, app: &mut App, input_area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(theme::faint())
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::surface2()))
                 .title(Span::styled(" menu ", theme::muted()))
-                .style(theme::header_bg()),
+                .style(theme::input_bg())
+                .padding(Padding::horizontal(1)),
         )
         .highlight_style(theme::selected());
     frame.render_widget(Clear, area);
-    frame.render_stateful_widget(list, area, &mut app.popup_state);
+    // render_stateful_widget 需要 &mut ListState，所以这里临时借用焦点窗格状态。
+    frame.render_stateful_widget(list, area, &mut app.focused_state_mut().popup_state);
+}
+
+/// 渲染视图选择器 popup：在某窗格 tab 正下方画一个小菜单，列出全部 6 个视图。
+/// 当前视图高亮；点击或 ↑↓+Enter 选择。把 picker 的可点击行区记录到 hit regions
+/// 不必要——click 直接按坐标算（菜单固定从 tab 下方开始，每行高 1）。
+fn render_view_picker(frame: &mut ratatui::Frame, app: &mut App) {
+    // 先克隆出 picker 状态避免长借用 app（后面还要 render_stateful_widget 借 app）。
+    let (pane_id, _) = match app.view_picker.clone() {
+        Some(p) => p,
+        None => return,
+    };
+    // 找该窗格的 tab rect，菜单从 tab 正下方开始。
+    let tab_rect = match app.view_tab_rect.get(&pane_id) {
+        Some(r) => *r,
+        None => return,
+    };
+    let cur_view = app
+        .pane_tree
+        .leaves()
+        .iter()
+        .find(|(id, _)| *id == pane_id)
+        .map(|(_, v)| *v);
+
+    let count = panes::PaneView::ALL.len();
+    let height = (count as u16 + 2).min(10); // +2 边框，封顶 10 行
+    let width = 14u16; // 最长 label "sessions"=8 + 边框 + padding
+    let area = Rect {
+        x: tab_rect.x,
+        y: tab_rect.y.saturating_add(1), // tab 下一行
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let items: Vec<ListItem> = panes::PaneView::ALL
+        .iter()
+        .map(|v| {
+            let is_cur = cur_view == Some(*v);
+            let mark = if is_cur { "● " } else { "  " };
+            ListItem::new(Line::from(vec![
+                Span::styled(mark, Style::default().fg(theme::accent())),
+                Span::styled(v.label(), if is_cur { theme::brand() } else { theme::text() }),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::surface2()))
+                .style(theme::input_bg())
+                .padding(Padding::horizontal(1))
+                .title(Span::styled(" view ", theme::muted())),
+        )
+        .highlight_style(theme::selected());
+    if let Some((_, state)) = app.view_picker.as_mut() {
+        frame.render_stateful_widget(list, area, state);
+    }
 }
 
 fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
-    // inset slightly
+    // overlay 限制在焦点窗格内：直接覆盖窗格的边框内容区（各方向缩进 1，贴边框内侧）。
+    // 不再全屏遮挡——分屏下其他窗格保持可见。窗格太小时保护性 clamp。
     let area = Rect {
-        x: full.x + 2,
+        x: full.x + 1,
         y: full.y + 1,
-        width: full.width.saturating_sub(4),
-        height: full.height.saturating_sub(2),
+        width: full.width.saturating_sub(2),
+        height: full.height.saturating_sub(2).max(3), // 至少留 3 行画标题+内容+底
     };
     frame.render_widget(Clear, area);
-    // A single soft border; the title carries the content name + close hint.
+    // overlay 统一圆角风格：圆角边框 + surface2 退让色 + input_bg 底 + padding。
     let make_block = |title: &str| {
         Block::default()
             .borders(Borders::ALL)
-            .border_style(theme::faint())
-            .style(theme::header_bg())
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme::accent_dim()))
+            .style(theme::input_bg())
+            .padding(Padding::new(1, 1, 0, 1))
             .title(Span::styled(format!(" {title} "), theme::brand()))
             .title_bottom(Span::styled(" q/Esc ", theme::muted()))
     };
+    let cur_id = app.current_session().map(|s| s.id.clone());
     match &mut app.overlay {
         Overlay::None => {}
         Overlay::Sessions(state) => {
-            let items: Vec<ListItem> = app
-                .sessions
-                .iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    let mark = if app.selected == Some(i) {
-                        "▸ "
-                    } else {
-                        "  "
-                    };
-                    let admin = if s.is_admin == 1 { " ⚡" } else { "" };
-                    Line::from(vec![
-                        Span::styled(mark, Style::default().fg(theme::MAUVE)),
-                        Span::styled(
-                            format!("{:10} ", short(&s.id)),
-                            Style::default().fg(theme::ACCENT),
-                        ),
-                        Span::styled(format!("{:14} ", s.hostname), theme::text()),
-                        Span::styled(format!("{:14} ", s.username), theme::text()),
-                        Span::styled(format!("{:5} ", arch_str(s.arch)), theme::muted()),
-                        Span::styled(format!("#{:<6} ", s.beacon_id), theme::muted()),
-                        Span::styled(
-                            format!("{:4}{} ", "", admin),
-                            Style::default().fg(theme::WARN),
-                        ),
-                        Span::styled(s.os.clone(), theme::faint()),
-                    ])
-                })
-                .map(ListItem::new)
-                .collect();
-            let list = List::new(items)
-                .block(make_block("beacons  ↑/↓ select · Enter pick"))
-                .highlight_style(theme::selected());
-            frame.render_stateful_widget(list, area, state);
+            // 先画 block（标题+边框），拿 inner 区域逐行渲染 session。
+            // 手动逐行而非 List widget：List 的滚动偏移不可外部读取，
+            // 导致 click 坐标映射失效。手动渲染每行 hit region 精确记录。
+            let block = make_block("beacons  ↑/↓ select · Enter · click pick");
+            frame.render_widget(Clear, area);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let cur = state.selected().unwrap_or(0);
+            // 记录每行的 hit region，供 click 精确命中。
+            let mut row_rects: Vec<Rect> = Vec::new();
+            for (i, s) in app.sessions.iter().enumerate() {
+                let row_y = inner.y + i as u16;
+                if row_y >= inner.y + inner.height {
+                    break; // 超出 inner 截断（不滚动，简单可靠）
+                }
+                let row_rect = Rect {
+                    x: inner.x,
+                    y: row_y,
+                    width: inner.width,
+                    height: 1,
+                };
+                row_rects.push(row_rect);
+                let is_cur = cur_id.as_deref() == Some(&s.id);
+                let is_selected = i == cur;
+                let mark = if is_cur { "▸ " } else { "  " };
+                let admin = if s.is_admin == 1 { " ⚡" } else { "" };
+                let base_style = if is_selected {
+                    theme::selected()
+                } else {
+                    theme::text()
+                };
+                let line = Line::from(vec![
+                    Span::styled(mark, Style::default().fg(theme::mauve())),
+                    Span::styled(
+                        format!("{:10} ", short(&s.id)),
+                        Style::default().fg(theme::accent()),
+                    ),
+                    Span::styled(format!("{:14} ", s.hostname), base_style),
+                    Span::styled(format!("{:14} ", s.username), base_style),
+                    Span::styled(format!("{:5} ", arch_str(s.arch)), theme::muted()),
+                    Span::styled(format!("#{:<6} ", s.beacon_id), theme::muted()),
+                    Span::styled(
+                        format!("{:4}{} ", "", admin),
+                        Style::default().fg(theme::warn()),
+                    ),
+                    Span::styled(s.os.clone(), theme::faint()),
+                ]);
+                frame.render_widget(Paragraph::new(line), row_rect);
+            }
+            app.session_row_rects = row_rects;
         }
         Overlay::Files(rows) => {
             let header = ["NAME", "SIZE", "TYPE", "MODIFIED"];
@@ -621,8 +884,9 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                 None => {
                     let block = Block::default()
                         .borders(Borders::ALL)
-                        .border_style(theme::faint())
-                        .style(theme::header_bg())
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(theme::accent_dim()))
+                        .style(theme::input_bg())
                         .title(Span::styled(" session detail ", theme::brand()))
                         .title_bottom(Span::styled(" q/Esc ", theme::muted()));
                     let para = Paragraph::new(" session gone").style(theme::muted());
@@ -679,10 +943,10 @@ fn render_table(
     let header_row = Row::new(header.iter().map(|h| Cell::from(*h)))
         .style(
             Style::default()
-                .fg(theme::MAUVE)
+                .fg(theme::muted_color())
                 .add_modifier(Modifier::BOLD),
         )
-        .bottom_margin(0);
+        .bottom_margin(1); // header 和数据行间留 1 行空隙，呼吸感
     let data_rows: Vec<Row> = rows
         .iter()
         .map(|r| Row::new(r.iter().cloned().map(|c| Cell::new(c).style(theme::text()))))
@@ -700,11 +964,13 @@ fn render_table(
             .map(|_| Constraint::Percentage((100 / header.len()) as u16))
             .collect(),
     };
-    // Build the themed block here (same look as the session-list overlay).
+    // 统一圆角风格：圆角 + accent_dim 边框 + padding，与 overlay make_block 一致。
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme::faint())
-        .style(theme::header_bg())
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::accent_dim()))
+        .style(theme::input_bg())
+        .padding(Padding::new(1, 1, 0, 1))
         .title(Span::styled(format!(" {title} "), theme::brand()))
         .title_bottom(Span::styled(" q/Esc ", theme::muted()));
     let table = Table::new(data_rows, widths)
@@ -720,7 +986,7 @@ fn render_kv(frame: &mut ratatui::Frame, area: Rect, rows: &[(String, String)], 
     use ratatui::widgets::{Cell, Row, Table};
     let header_row = Row::new(["KEY", "VALUE"].iter().map(|h| Cell::from(*h))).style(
         Style::default()
-            .fg(theme::MAUVE)
+            .fg(theme::muted_color())
             .add_modifier(Modifier::BOLD),
     );
     let data_rows: Vec<Row> = rows
@@ -735,8 +1001,10 @@ fn render_kv(frame: &mut ratatui::Frame, area: Rect, rows: &[(String, String)], 
     let widths = [Constraint::Percentage(22), Constraint::Percentage(78)];
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme::faint())
-        .style(theme::header_bg())
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::accent_dim()))
+        .style(theme::input_bg())
+        .padding(Padding::new(1, 1, 0, 1))
         .title(Span::styled(format!(" {title} "), theme::brand()))
         .title_bottom(Span::styled(" q/Esc ", theme::muted()));
     let table = Table::new(data_rows, widths)

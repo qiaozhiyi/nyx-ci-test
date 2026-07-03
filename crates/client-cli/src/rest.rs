@@ -129,6 +129,7 @@ pub enum ParseAs {
 pub struct LogLine {
     pub text: String,
     pub level: Level,
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -310,6 +311,7 @@ pub fn spawn(server: String, token: Option<String>) -> Bridge {
                     log_lines: vec![LogLine {
                         text: format!("runtime build failed: {e}"),
                         level: Level::Err,
+                        session_id: None,
                     }],
                     connected: false,
                     parsed: None,
@@ -1498,10 +1500,11 @@ fn route_result(
     let out = match out {
         Some(o) => o,
         None => {
-            log_push(
+            log_push_session(
                 log_buf,
                 &format!("[{}] (task {} no output)", short(&t.session), t.task_id),
                 Level::Warn,
+                Some(t.session.clone()),
             );
             return;
         }
@@ -1510,7 +1513,7 @@ fn route_result(
         TaskKind::Shell(parse) => match parse {
             ParseAs::None => {
                 for line in out.lines() {
-                    log_push(log_buf, line, Level::Info);
+                    log_push_session(log_buf, line, Level::Info, Some(t.session.clone()));
                 }
             }
             ParseAs::Files => {
@@ -1528,10 +1531,11 @@ fn route_result(
         },
         TaskKind::Bof { name } => {
             for line in out.lines() {
-                log_push(
+                log_push_session(
                     log_buf,
                     &format!("[{}] bof {}: {}", short(&t.session), name, line),
                     Level::Info,
+                    Some(t.session.clone()),
                 );
             }
         }
@@ -1542,16 +1546,18 @@ fn route_result(
             // An `ok` result surfaces here as the empty string; anything else is
             // treated as the beacon's response. Empty ⟺ alive.
             if out.trim().is_empty() {
-                log_push(
+                log_push_session(
                     log_buf,
                     &format!("[{}] ping: alive", short(&t.session)),
                     Level::Ok,
+                    Some(t.session.clone()),
                 );
             } else {
-                log_push(
+                log_push_session(
                     log_buf,
                     &format!("[{}] ping: {}", short(&t.session), out.trim()),
                     Level::Info,
+                    Some(t.session.clone()),
                 );
             }
         }
@@ -1594,17 +1600,19 @@ fn finish_chunked(
         }
     }
     if let Err(e) = std::fs::write(&save_path, &out) {
-        log_push(
+        log_push_session(
             log_buf,
             &format!("[{}] ! save {save_path}: {e}", short(&t.session)),
             Level::Err,
+            Some(t.session.clone()),
         );
         return;
     }
-    log_push(
+    log_push_session(
         log_buf,
         &format!("[{}] {} -> {save_path}", short(&t.session), log_msg),
         Level::Ok,
+        Some(t.session.clone()),
     );
     // 截图落盘后弹出 fullscreen 图片 overlay（path + bytes）。下载不弹 overlay
     // （文件在磁盘上，日志已指明路径）。
@@ -1974,10 +1982,30 @@ fn session_signature(list: &[SessionView]) -> String {
     s
 }
 
+fn extract_session_prefix(text: &str) -> Option<String> {
+    if text.starts_with('[') {
+        if let Some(end_idx) = text.find(']') {
+            if end_idx > 1 && end_idx <= 9 {
+                let prefix = &text[1..end_idx];
+                if prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(prefix.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn log_push(buf: &mut Vec<LogLine>, text: &str, level: Level) {
+    log_push_session(buf, text, level, None);
+}
+
+fn log_push_session(buf: &mut Vec<LogLine>, text: &str, level: Level, session_id: Option<String>) {
+    let sid = session_id.or_else(|| extract_session_prefix(text));
     buf.push(LogLine {
         text: text.to_string(),
         level,
+        session_id: sid,
     });
     if buf.len() > LOG_BUFFER_CAP {
         let drop = buf.len() - LOG_BUFFER_CAP;
@@ -1988,6 +2016,14 @@ fn log_push(buf: &mut Vec<LogLine>, text: &str, level: Level) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_session_prefix() {
+        assert_eq!(extract_session_prefix("[a1b2c3d4] test"), Some("a1b2c3d4".to_string()));
+        assert_eq!(extract_session_prefix("[a1b2c3d4] $ whoami"), Some("a1b2c3d4".to_string()));
+        assert_eq!(extract_session_prefix("[INFO] test"), None);
+        assert_eq!(extract_session_prefix("connecting to ..."), None);
+    }
 
     #[test]
     fn log_push_caps() {

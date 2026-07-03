@@ -53,6 +53,10 @@ use render::render;
 /// Max lines kept in the event stream (older dropped).
 const STREAM_CAP: usize = 5000;
 
+/// Max entries kept in command history (older dropped). 与 STREAM_CAP 对称，
+/// 防止长时间运行（尤其自动化脚本通过 TUI 发大量命令）导致 history 无界增长。
+const HISTORY_CAP: usize = 2000;
+
 /// What fullscreen overlay table to show (q/Esc dismisses).
 #[derive(Default)]
 pub(super) enum Overlay {
@@ -94,15 +98,14 @@ pub(super) struct App {
     bridge: Bridge,
     pub(super) connected: bool,
     pub(super) sessions: Vec<SessionView>,
-    pub(super) selected: Option<usize>, // index into `sessions`
     pub(super) stream: Vec<LogLine>,    // event log
     pub(super) stream_offset: usize,    // for scrolling (0 = bottom)
-    pub(super) input: String,
-    pub(super) cursor: usize,
+    /// 每个 Console 窗格独立的滚动偏移量（0 = pinned to bottom）。
+    /// 键为窗格 id；不存在则退回到 stream_offset（全局 fallback，兼容旧逻辑）。
+    pub(super) pane_scroll: HashMap<usize, usize>,
+    /// 全局命令历史（所有窗格共享）。↑/↓ 导航时每个窗格各自维护一个
+    /// `hist_idx`（在 PaneState 里），所以多窗格下切换不会互相污染。
     history: Vec<String>,
-    hist_idx: Option<usize>,
-    pub(super) popup_open: bool,
-    pub(super) popup_state: ListState,
     pub(super) overlay: Overlay,
     /// Latest parsed files listing — mirrored from the most recent `/ls` result
     /// so a Files pane view can render it WITHOUT depending on the fullscreen
@@ -128,26 +131,45 @@ pub(super) struct App {
     /// 秒数，每帧重算不会引入抖动，也不污染 session_signature（后者刻意排除
     /// age_secs 防止 UI 每秒全表重绘）。
     pub(super) age_baseline: HashMap<String, (Instant, u64)>,
+    pub(super) tmux_prefix: bool,
+    /// prefix 激活时刻（UX-S5）。用于超时自动复位：按 Ctrl+B 后 2s 内未按有效键
+    /// 则自动退出 prefix 模式，防止操作员分心后误触改布局。None = 无活跃计时。
+    pub(super) prefix_since: Option<Instant>,
     should_quit: bool,
+    /// 上一帧的终端尺寸（宽 × 高）。render 每帧更新，handle_key 里 move_focus
+    /// 用它替代硬编码的 80×24，保证在任意终端尺寸下焦点移动都能正确找到邻窗格。
+    pub(super) last_frame_size: Rect,
+    /// 每个窗格的"当前视图 tab"的屏幕 hit region（单个）。render 每帧填充，
+    /// click 时查询：点中它就开关该窗格的视图选择器（view picker）。
+    /// 之前是 6 个 tab 平铺，多分屏时挤爆；改成 1 个紧凑 tab + 点击弹菜单。
+    pub(super) view_tab_rect: HashMap<usize, Rect>,
+    /// 视图选择器状态：Some(pane_id, ListState) = 该窗格的 picker 正开着，
+    /// None = 关。开窗时 render 在 tab 下方画小 popup 列 6 个视图，点击选择。
+    pub(super) view_picker: Option<(usize, ratatui::widgets::ListState)>,
+    /// 焦点窗格的屏幕区域（render 每帧记录）。overlay 限制在这个区域内，
+    /// 不再全屏遮挡其他窗格——分屏下操作一个窗格不影响另一个可见。
+    pub(super) focused_pane_rect: Rect,
+    /// Sessions overlay 里每行的屏幕 hit region（render 每帧重建）。
+    /// click 精确命中查询用——避免 List widget 滚动偏移导致算术推算失效。
+    pub(super) session_row_rects: Vec<Rect>,
+    /// 每个窗格 SessionList 视图的行 hit regions（per-pane）。render 每帧重建。
+    /// 键 = 窗格 id；值 = 该窗格 session 列表每行的 (Rect, session_id)。
+    /// click 点中某行 → 把该窗格的 session 切到对应 beacon。
+    pub(super) pane_session_rows: HashMap<usize, Vec<(Rect, String)>>,
+    /// 鼠标当前悬停的窗格 id（用于 hover 高亮）。None = 未悬停窗格区域。
+    pub(super) hover_pane: Option<usize>,
 }
 
 impl App {
     fn new(bridge: Bridge) -> Self {
-        let mut popup_state = ListState::default();
-        popup_state.select(Some(0));
         Self {
             bridge,
             connected: false,
             sessions: Vec::new(),
-            selected: None,
             stream: Vec::new(),
             stream_offset: 0,
-            input: String::new(),
-            cursor: 0,
+            pane_scroll: HashMap::new(),
             history: Vec::new(),
-            hist_idx: None,
-            popup_open: false,
-            popup_state,
             overlay: Overlay::default(),
             files_view: Vec::new(),
             procs_view: Vec::new(),
@@ -158,12 +180,54 @@ impl App {
             creds: credstore::CredStore::load(),
             sessions_meta: session_meta::SessionStore::load(),
             age_baseline: HashMap::new(),
+            tmux_prefix: false,
+            prefix_since: None,
             should_quit: false,
+            last_frame_size: Rect::new(0, 0, 80, 24),
+            view_tab_rect: HashMap::new(),
+            view_picker: None,
+            focused_pane_rect: Rect::new(0, 0, 80, 20),
+            session_row_rects: Vec::new(),
+            pane_session_rows: HashMap::new(),
+            hover_pane: None,
         }
     }
 
+    /// 焦点窗格的 PaneState（输入缓冲 + 光标 + popup + 历史游标）。
+    /// handle_key / render_input / render_popup 都走这个，每个窗格独立。
+    ///
+    /// P0-4 安全降级：不再无条件 expect（render 期 panic = 终端卡死在 raw mode）。
+    /// 若 focused_pane 因任何原因失效，fallback 到第一个叶；只有树完全空
+    /// （真正的不可恢复状态）才 panic。
+    fn focused_state(&self) -> &panes::PaneState {
+        self.pane_tree
+            .leaf_state(self.focused_pane)
+            .or_else(|| {
+                // focused_pane 失效 → 回退到深度优先第一个叶。
+                self.pane_tree
+                    .leaves()
+                    .first()
+                    .and_then(|(id, _)| self.pane_tree.leaf_state(*id))
+            })
+            .expect("pane_tree has no leaves — App invariant violated")
+    }
+
+    fn focused_state_mut(&mut self) -> &mut panes::PaneState {
+        // 先校正 focused_pane（若失效则指向第一个叶），再取 mutable 借用。
+        if self.pane_tree.leaf_state(self.focused_pane).is_none() {
+            if let Some((id, _)) = self.pane_tree.leaves().first() {
+                self.focused_pane = *id;
+            }
+        }
+        self.pane_tree
+            .leaf_state_mut(self.focused_pane)
+            .expect("focused_pane corrected above; tree must have a leaf")
+    }
+
     pub(super) fn current_session(&self) -> Option<&SessionView> {
-        self.selected.and_then(|i| self.sessions.get(i))
+        self.pane_tree
+            .get_session_id(self.focused_pane)
+            .and_then(|id| self.sessions.iter().find(|s| s.id == id))
     }
 
     /// 客户端推算的会话存活秒数。基线 = 最近一次工作线程真发会话列表时的
@@ -180,10 +244,12 @@ impl App {
     }
 
     fn log(&mut self, text: &str, level: Level) {
+        let sid = self.current_session().map(|s| s.id.clone());
         for line in text.lines() {
             self.stream.push(LogLine {
                 text: line.to_string(),
                 level,
+                session_id: sid.clone(),
             });
         }
         if self.stream.len() > STREAM_CAP {
@@ -198,12 +264,10 @@ impl App {
             self.connected = snap.connected;
             if !snap.sessions.is_empty() {
                 // keep selection valid
-                if self.selected.is_none_or(|i| i >= snap.sessions.len()) {
-                    self.selected = if snap.sessions.is_empty() {
-                        None
-                    } else {
-                        Some(0)
-                    };
+                if self.pane_tree.get_session_id(self.focused_pane).is_none() {
+                    if let Some(first) = snap.sessions.first() {
+                        self.pane_tree.set_session_id(self.focused_pane, Some(first.id.clone()));
+                    }
                 }
                 self.sessions = snap.sessions;
                 // Refresh the age baseline for every live session so age_for()
@@ -212,6 +276,10 @@ impl App {
                 for s in &self.sessions {
                     self.age_baseline.insert(s.id.clone(), (now, s.age_secs));
                 }
+                // 清理已断开 session 的 baseline（P1-1b）：只保留当前仍活着的会话，
+                // 防止长时间运行（beacon 来去）下 age_baseline 无限增长。
+                let live: Vec<String> = self.sessions.iter().map(|s| s.id.clone()).collect();
+                self.age_baseline.retain(|id, _| live.iter().any(|l| l == id));
             }
             for l in snap.log_lines {
                 self.stream.push(l);
@@ -336,8 +404,12 @@ impl App {
         }
     }
 
-    fn send(&self, cmd: Cmd) {
-        let _ = self.bridge.cmds.send(cmd);
+    /// 发命令到 worker。channel 断开（worker panic/退出）时不再静默吞错：
+    /// 对操作命令（shell/bof/inject...）反馈到事件流，让操作员知道任务没发出去。
+    fn send(&mut self, cmd: Cmd) {
+        if self.bridge.cmds.send(cmd).is_err() {
+            self.log("! worker channel closed — command dropped", Level::Err);
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -345,6 +417,42 @@ impl App {
         if self.overlay.is_open() {
             self.handle_overlay_key(key);
             return;
+        }
+        // view picker 开着时拦截键盘：↑↓ 导航、Enter 选、Esc/q 关。
+        if self.view_picker.is_some() {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let Some((_, st)) = self.view_picker.as_mut() {
+                        let n = panes::PaneView::ALL.len();
+                        let i = st.selected().unwrap_or(0);
+                        st.select(Some((i + 1) % n));
+                    }
+                    return;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Some((_, st)) = self.view_picker.as_mut() {
+                        let n = panes::PaneView::ALL.len();
+                        let i = st.selected().unwrap_or(0);
+                        st.select(Some(i.checked_sub(1).unwrap_or(n - 1)));
+                    }
+                    return;
+                }
+                KeyCode::Enter => {
+                    if let Some((pane_id, st)) = self.view_picker.take() {
+                        if let Some(i) = st.selected() {
+                            if let Some(&v) = panes::PaneView::ALL.get(i) {
+                                self.pane_tree = self.pane_tree.clone().set_view(pane_id, v);
+                            }
+                        }
+                    }
+                    return;
+                }
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.view_picker = None;
+                    return;
+                }
+                _ => {}
+            }
         }
         // Ctrl+C always quits.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -358,109 +466,169 @@ impl App {
                     return;
                 }
                 KeyCode::Char('u') => {
-                    self.input.clear();
-                    self.cursor = 0;
-                    self.popup_open = false;
+                    let st = self.focused_state_mut();
+                    st.input.clear();
+                    st.cursor = 0;
+                    st.popup_open = false;
                     return;
                 }
-                // ---- 窗格管理（tmux 式）----
-                KeyCode::Char('h') => {
-                    // 焦点左移
-                    let full = Rect::new(0, 0, 80, 24);
-                    self.focused_pane = self.pane_tree.clone().move_focus(
+                KeyCode::Char('b') => {
+                    self.tmux_prefix = true;
+                    self.prefix_since = Some(Instant::now());
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if self.tmux_prefix {
+            self.tmux_prefix = false; // Reset immediately after one keystroke
+            self.prefix_since = None;
+            // Esc 显式取消 prefix（UX-S5）：之前 Esc 落到 _ 分支被静默吞，违反
+            // "Esc = 取消" 通用约定。这里虽已复位，补个清晰语义。
+            if key.code == KeyCode::Esc {
+                return;
+            }
+            match key.code {
+                KeyCode::Char('v') | KeyCode::Char('%') => {
+                    let new_id = self.pane_tree.next_id();
+                    self.pane_tree = self
+                        .pane_tree
+                        .clone()
+                        .split(self.focused_pane, panes::SplitDir::Columns, new_id);
+                    self.focused_pane = new_id;
+                    return;
+                }
+                KeyCode::Char('s') | KeyCode::Char('"') => {
+                    let new_id = self.pane_tree.next_id();
+                    self.pane_tree = self
+                        .pane_tree
+                        .clone()
+                        .split(self.focused_pane, panes::SplitDir::Rows, new_id);
+                    self.focused_pane = new_id;
+                    return;
+                }
+                KeyCode::Char('x') => {
+                    let closed = self.focused_pane;
+                    // UX-S4：close 前先记下被关叶的屏幕位置，close 后焦点回退到
+                    // 几何上最近的剩余叶（通常是它的兄弟），而不是总跳到第一个叶。
+                    // 之前 leaves().first() 会让 2×2 布局关右下角后焦点飞到左上。
+                    let full = self.last_frame_size;
+                    // 算 pane_area（与 render/click 一致：去掉 statusbar 1 行 + input 3 行）
+                    let pane_area = ratatui::layout::Rect {
+                        x: full.x,
+                        y: full.y + 1,
+                        width: full.width,
+                        height: full.height.saturating_sub(1 + 3),
+                    };
+                    let before = self.pane_tree.layout(pane_area);
+                    let closed_rect = before.iter().find(|(id, _)| *id == closed).map(|(_, r)| *r);
+                    self.pane_tree = self.pane_tree.clone().close(closed);
+                    // 清理被关窗格的滚动偏移，防止 id 复用时新窗格读到脏偏移（P1-1a）。
+                    self.pane_scroll.remove(&closed);
+                    let remaining = self.pane_tree.layout(pane_area);
+                    self.focused_pane = pick_nearest_leaf(&remaining, closed_rect)
+                        .unwrap_or_else(|| {
+                            self.pane_tree
+                                .leaves()
+                                .first()
+                                .map(|(id, _)| *id)
+                                .unwrap_or(1)
+                        });
+                    return;
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    let full = self.last_frame_size;
+                    self.focused_pane = self.pane_tree.move_focus(
                         self.focused_pane,
                         panes::FocusDir::Left,
                         full,
                     );
                     return;
                 }
-                KeyCode::Char('j') => {
-                    let full = Rect::new(0, 0, 80, 24);
-                    self.focused_pane = self.pane_tree.clone().move_focus(
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let full = self.last_frame_size;
+                    self.focused_pane = self.pane_tree.move_focus(
                         self.focused_pane,
                         panes::FocusDir::Down,
                         full,
                     );
                     return;
                 }
-                KeyCode::Char('k') => {
-                    let full = Rect::new(0, 0, 80, 24);
-                    self.focused_pane = self.pane_tree.clone().move_focus(
+                KeyCode::Char('k') | KeyCode::Up => {
+                    let full = self.last_frame_size;
+                    self.focused_pane = self.pane_tree.move_focus(
                         self.focused_pane,
                         panes::FocusDir::Up,
                         full,
                     );
                     return;
                 }
-                // Ctrl+L 已被 clear 占用，焦点右移用 Ctrl+f (forward)
-                KeyCode::Char('f') => {
-                    let full = Rect::new(0, 0, 80, 24);
-                    self.focused_pane = self.pane_tree.clone().move_focus(
+                KeyCode::Char('l') | KeyCode::Right => {
+                    let full = self.last_frame_size;
+                    self.focused_pane = self.pane_tree.move_focus(
                         self.focused_pane,
                         panes::FocusDir::Right,
                         full,
                     );
                     return;
                 }
-                KeyCode::Char('%') => {
-                    // 垂直分割（左右）
-                    let new_id = self.pane_tree.next_id();
-                    self.pane_tree = self
-                        .pane_tree
-                        .clone()
-                        .split(self.focused_pane, panes::SplitDir::Vertical);
-                    self.focused_pane = new_id;
-                    return;
-                }
-                KeyCode::Char('"') => {
-                    // 水平分割（上下）
-                    let new_id = self.pane_tree.next_id();
-                    self.pane_tree = self
-                        .pane_tree
-                        .clone()
-                        .split(self.focused_pane, panes::SplitDir::Horizontal);
-                    self.focused_pane = new_id;
-                    return;
-                }
-                KeyCode::Char('x') => {
-                    // 关闭当前窗格
-                    let closed = self.focused_pane;
-                    self.pane_tree = self.pane_tree.clone().close(closed);
-                    // 焦点移到第一个叶
-                    self.focused_pane = self
-                        .pane_tree
-                        .leaves()
-                        .first()
-                        .map(|(id, _)| *id)
-                        .unwrap_or(1);
-                    return;
-                }
                 KeyCode::Char(c @ ('1'..='6')) => {
-                    // 切换焦点窗格视图
                     if let Some(view) = panes::PaneView::from_index(c as u8 - b'0') {
                         self.pane_tree = self.pane_tree.clone().set_view(self.focused_pane, view);
                     }
                     return;
                 }
-                _ => {}
+                // 调整 split ratio（UX-S2）：大写 H/J/K/L 调比例，小写 hjkl 移焦点。
+                // H=向左扩（左块变大）、L=向右扩（右块变大）、J=向下扩、K=向上扩。
+                // delta 0.05 每次约 5%，连续按可精细调。
+                KeyCode::Char('H') => {
+                    self.pane_tree.adjust_ratio(self.focused_pane, 0.05);
+                    return;
+                }
+                KeyCode::Char('L') => {
+                    self.pane_tree.adjust_ratio(self.focused_pane, -0.05);
+                    return;
+                }
+                KeyCode::Char('K') => {
+                    self.pane_tree.adjust_ratio(self.focused_pane, 0.05);
+                    return;
+                }
+                KeyCode::Char('J') => {
+                    self.pane_tree.adjust_ratio(self.focused_pane, -0.05);
+                    return;
+                }
+                _ => {
+                    // 未命中的 prefix 键不再静默吞（UX-S5）：给操作员反馈，告知
+                    // prefix 已消耗但键无效，并列出有效键，降低学习成本。
+                    self.log(
+                        "! prefix: unknown key (v/s split · x close · hjkl focus · HJKL resize · 1-6 view)",
+                        Level::Warn,
+                    );
+                    return;
+                }
             }
         }
         // Scroll keys (work even while typing).
         match key.code {
             KeyCode::PageUp => {
-                self.stream_offset = self.stream_offset.saturating_add(10);
+                let off = self.pane_scroll.entry(self.focused_pane).or_insert(0);
+                *off = off.saturating_add(10);
                 return;
             }
             KeyCode::PageDown => {
-                self.stream_offset = self.stream_offset.saturating_sub(10);
+                let off = self.pane_scroll.entry(self.focused_pane).or_insert(0);
+                *off = off.saturating_sub(10);
                 return;
             }
             KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.stream_offset = self.stream_offset.saturating_add(1);
+                let off = self.pane_scroll.entry(self.focused_pane).or_insert(0);
+                *off = off.saturating_add(1);
                 return;
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.stream_offset = self.stream_offset.saturating_sub(1);
+                let off = self.pane_scroll.entry(self.focused_pane).or_insert(0);
+                *off = off.saturating_sub(1);
                 return;
             }
             _ => {}
@@ -471,110 +639,152 @@ impl App {
                 // If the popup is open and we can resolve the typed prefix to a
                 // command, replace the input with the resolved command name and
                 // run it. This makes `/ls<Enter>` and `/s↑<Enter>` both work.
-                if self.popup_open {
-                    if let Some(name) =
-                        popup_submit_target(&self.input, self.popup_state.selected())
-                    {
-                        self.input = name.to_string();
-                        self.cursor = self.input.len();
+                {
+                    let st = self.focused_state_mut();
+                    if st.popup_open {
+                        if let Some(name) =
+                            popup_submit_target(&st.input, st.popup_state.selected())
+                        {
+                            st.input = name.to_string();
+                            st.cursor = st.input.len();
+                        }
                     }
                 }
                 self.submit();
             }
             KeyCode::Esc => {
-                self.input.clear();
-                self.cursor = 0;
-                self.popup_open = false;
+                let st = self.focused_state_mut();
+                st.input.clear();
+                st.cursor = 0;
+                st.popup_open = false;
             }
             KeyCode::Backspace => {
-                if self.cursor > 0 && self.cursor <= self.input.len() {
-                    self.input.remove(self.cursor - 1);
-                    self.cursor -= 1;
+                let st = self.focused_state_mut();
+                if st.cursor > 0 && st.cursor <= st.input.len() {
+                    st.input.remove(st.cursor - 1);
+                    st.cursor -= 1;
                 }
-                if self.input.is_empty() || !self.input.starts_with('/') {
-                    self.popup_open = false;
+                if st.input.is_empty() || !st.input.starts_with('/') {
+                    st.popup_open = false;
                 } else {
                     // re-filter + clamp selection as the prefix shrinks
-                    let filtered = filter_meta(&self.input);
-                    self.popup_state
+                    let filtered = filter_meta(&st.input);
+                    st.popup_state
                         .select(if filtered.is_empty() { None } else { Some(0) });
                 }
             }
             // When the popup is open, ↑/↓ navigate the menu (opencode-style);
             // otherwise they walk input history.
-            KeyCode::Up if self.popup_open => {
-                let filtered = filter_meta(&self.input);
+            KeyCode::Up if self.focused_state().popup_open => {
+                let st = self.focused_state_mut();
+                let filtered = filter_meta(&st.input);
                 let next = move_popup_selection(
                     filtered.len(),
-                    self.popup_state.selected(),
+                    st.popup_state.selected(),
                     PopupMove::Up,
                 );
-                self.popup_state.select(next);
+                st.popup_state.select(next);
             }
-            KeyCode::Down if self.popup_open => {
-                let filtered = filter_meta(&self.input);
+            KeyCode::Down if self.focused_state().popup_open => {
+                let st = self.focused_state_mut();
+                let filtered = filter_meta(&st.input);
                 let next = move_popup_selection(
                     filtered.len(),
-                    self.popup_state.selected(),
+                    st.popup_state.selected(),
                     PopupMove::Down,
                 );
-                self.popup_state.select(next);
+                st.popup_state.select(next);
             }
             KeyCode::Up => {
                 // input history navigation
                 if !self.history.is_empty() {
-                    let idx = match self.hist_idx {
-                        Some(i) => i.saturating_sub(1),
-                        None => self.history.len() - 1,
+                    // 先用不可变借用算出 idx + 拷出历史条目，释放 borrow 后
+                    // 再拿 focused_state_mut，避免 self.history 与 self.pane_tree
+                    // 同时被借的冲突。
+                    let (idx, entry) = {
+                        let st = self.focused_state();
+                        let idx = match st.hist_idx {
+                            Some(i) => i.saturating_sub(1),
+                            None => self.history.len() - 1,
+                        };
+                        (idx, self.history[idx].clone())
                     };
-                    self.hist_idx = Some(idx);
-                    self.input = self.history[idx].clone();
-                    self.cursor = self.input.len();
+                    let st = self.focused_state_mut();
+                    st.hist_idx = Some(idx);
+                    st.input = entry;
+                    st.cursor = st.input.len();
                 }
             }
             KeyCode::Down => {
-                if let Some(i) = self.hist_idx {
-                    let next = i + 1;
-                    if next < self.history.len() {
-                        self.hist_idx = Some(next);
-                        self.input = self.history[next].clone();
-                    } else {
-                        self.hist_idx = None;
-                        self.input.clear();
+                // 同样先把索引/条目拷出来，再 mutate 焦点窗格。
+                let action = {
+                    let st = self.focused_state();
+                    match st.hist_idx {
+                        Some(i) => {
+                            let next = i + 1;
+                            if next < self.history.len() {
+                                Some(HistoryNav::Pick(self.history[next].clone()))
+                            } else {
+                                Some(HistoryNav::Clear)
+                            }
+                        }
+                        None => None,
                     }
-                    self.cursor = self.input.len();
+                };
+                match action {
+                    Some(HistoryNav::Pick(s)) => {
+                        let st = self.focused_state_mut();
+                        if let Some(i) = st.hist_idx {
+                            st.hist_idx = Some(i + 1);
+                        }
+                        st.input = s;
+                        st.cursor = st.input.len();
+                    }
+                    Some(HistoryNav::Clear) => {
+                        let st = self.focused_state_mut();
+                        st.hist_idx = None;
+                        st.input.clear();
+                        st.cursor = 0;
+                    }
+                    None => {}
                 }
             }
-            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Right => {
-                self.cursor = (self.cursor + 1).min(self.input.len());
+            KeyCode::Left => {
+                let st = self.focused_state_mut();
+                st.cursor = st.cursor.saturating_sub(1);
             }
-            KeyCode::Tab if self.popup_open => {
+            KeyCode::Right => {
+                let st = self.focused_state_mut();
+                st.cursor = (st.cursor + 1).min(st.input.len());
+            }
+            KeyCode::Tab if self.focused_state().popup_open => {
                 // Tab completes to the selected popup entry (still available
                 // alongside ↑↓+Enter for users who prefer it).
-                let filtered = filter_meta(&self.input);
-                if let Some(sel) = self.popup_state.selected() {
+                let st = self.focused_state_mut();
+                let filtered = filter_meta(&st.input);
+                if let Some(sel) = st.popup_state.selected() {
                     if let Some(m) = filtered.get(sel) {
-                        self.input = format!("{} ", m.name);
-                        self.cursor = self.input.len();
+                        st.input = format!("{} ", m.name);
+                        st.cursor = st.input.len();
                     }
                 }
             }
             KeyCode::Char(c) => {
-                self.input.insert(self.cursor, c);
-                self.cursor += 1;
-                if self.input.starts_with('/') {
-                    self.popup_open = true;
-                    let filtered = filter_meta(&self.input);
+                let st = self.focused_state_mut();
+                st.input.insert(st.cursor, c);
+                st.cursor += 1;
+                if st.input.starts_with('/') {
+                    st.popup_open = true;
+                    let filtered = filter_meta(&st.input);
                     // keep selection if still valid, else reset to top
-                    let keep = self.popup_state.selected().filter(|&i| i < filtered.len());
-                    self.popup_state.select(keep.or(if filtered.is_empty() {
+                    let keep = st.popup_state.selected().filter(|&i| i < filtered.len());
+                    st.popup_state.select(keep.or(if filtered.is_empty() {
                         None
                     } else {
                         Some(0)
                     }));
                 } else {
-                    self.popup_open = false;
+                    st.popup_open = false;
                 }
             }
             _ => {}
@@ -596,7 +806,7 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some(i) = state.selected() {
-                        self.selected = Some(i);
+                        if let Some(s) = self.sessions.get(i) { self.pane_tree.set_session_id(self.focused_pane, Some(s.id.clone())); }
                         if let Some(s) = self.sessions.get(i) {
                             self.log(&format!("selected beacon {}", short(&s.id)), Level::Ok);
                         }
@@ -614,75 +824,247 @@ impl App {
         }
     }
 
-    /// Handle a mouse event. Scroll wheels (and touchpad two-finger scrolls)
-    /// move the active scroll surface: the fullscreen overlay if one is open,
-    /// otherwise the main event stream. A left-click inside an open overlay
-    /// selects the clicked row; a second click confirms it.
+    /// Handle a mouse event. opencode 风格全套鼠标操作：
+    /// - 滚轮：滚动焦点窗格内容（原有）
+    /// - 左键单击：聚焦窗格 / 点 tab 切视图 / 点 overlay 行选择
+    /// - 右键单击：关闭所点窗格（opencode 的 "中键关闭 tab" 等价物，这里关 pane）
+    /// - 中键单击：分屏（左右切分所点窗格，快速开新工作区）
+    /// - 鼠标移动：更新 hover_pane 供 render 高亮（视觉反馈）
     fn handle_mouse(&mut self, ev: MouseEvent) {
+        // 先更新 hover：鼠标在哪格上方。render 用它做 hover 高亮。
+        if let Some(id) = self.pane_at(ev.row, ev.column) {
+            self.hover_pane = Some(id);
+        } else {
+            self.hover_pane = None;
+        }
         match ev.kind {
             // Wheel / touchpad vertical scroll.
             MouseEventKind::ScrollUp => self.scroll(ScrollDir::Up, 3),
             MouseEventKind::ScrollDown => self.scroll(ScrollDir::Down, 3),
-            // Some terminals emit horizontal gestures as ScrollLeft/Right; treat
-            // them as vertical for convenience (rare, but harmless).
             MouseEventKind::ScrollLeft => self.scroll(ScrollDir::Up, 1),
             MouseEventKind::ScrollRight => self.scroll(ScrollDir::Down, 1),
-            // Click-to-select inside an overlay (sessions table) or popup menu.
-            MouseEventKind::Down(MouseButton::Left) => self.click(ev.row),
+            // 左键：点击聚焦 / 切 tab / overlay 选择。
+            MouseEventKind::Down(MouseButton::Left) => self.click(ev.row, ev.column),
+            // 右键：关闭所点窗格（opencode 中键关 tab 的等价，终端中键常用于粘贴，
+            // 故用右键关 pane）。
+            MouseEventKind::Down(MouseButton::Right) => {
+                if let Some(id) = self.pane_at(ev.row, ev.column) {
+                    self.close_pane(id);
+                }
+            }
+            // 中键：在所点窗格处左右分屏（快速开新工作区，opencode 无此操作但很顺手）。
+            MouseEventKind::Down(MouseButton::Middle) => {
+                if let Some(id) = self.pane_at(ev.row, ev.column) {
+                    self.split_pane(id, panes::SplitDir::Columns);
+                }
+            }
+            // 鼠标移动：仅更新 hover（已在上面处理），不触发其他。
+            MouseEventKind::Moved => {}
             _ => {}
         }
     }
 
-    /// Move the active scroll surface by `amount` lines in `dir`.
-    fn scroll(&mut self, dir: ScrollDir, amount: usize) {
-        match &mut self.overlay {
-            // The tables (files/procs/creds) and sessions list are short and
-            // top-anchored — scrolling them would need per-table state we don't
-            // keep yet, so for now scrolling dismisses nothing but routes to the
-            // main stream (the long-lived, scrollable surface).
-            Overlay::None => {
-                self.stream_offset = apply_scroll(self.stream_offset, dir, amount);
-            }
-            _ => {
-                // An overlay is open. Let the user scroll the underlying stream
-                // too, so reading history while a table is up stays ergonomic.
-                self.stream_offset = apply_scroll(self.stream_offset, dir, amount);
-            }
+    /// 查屏幕坐标落在哪个窗格里。返回该叶 id，或 None（点击在窗格区外）。
+    /// 供右键/中键/hover 共用，避免每个事件都重算 layout。
+    fn pane_at(&self, row: u16, col: u16) -> Option<usize> {
+        let full = self.last_frame_size;
+        if full.height < 8 {
+            return None;
         }
+        let pane_area = ratatui::layout::Rect {
+            x: full.x,
+            y: full.y + 1,
+            width: full.width,
+            height: full.height.saturating_sub(1 + 3),
+        };
+        let layouts = self.pane_tree.layout(pane_area);
+        layouts.iter().find_map(|(id, r)| {
+            (col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height).then_some(*id)
+        })
     }
 
-    /// Handle a left-click at terminal row `row`. If an overlay or popup is
-    /// open and the click lands inside it, select/activate the corresponding row.
-    fn click(&mut self, row: u16) {
-        // Sessions overlay: click a row to select it; the row index maps from
-        // (click_row - overlay_top). We don't track the exact rendered rect, so
-        // we approximate: the overlay is inset by 1 row at top and the list body
-        // starts one row below its title.
+    /// 关闭指定窗格（鼠标右键等价 prefix+x）。复用 close 的焦点回退逻辑。
+    fn close_pane(&mut self, target: usize) {
+        if self.pane_tree.leaf_count() <= 1 {
+            return; // 不关最后一个
+        }
+        let full = self.last_frame_size;
+        let pane_area = ratatui::layout::Rect {
+            x: full.x,
+            y: full.y + 1,
+            width: full.width,
+            height: full.height.saturating_sub(1 + 3),
+        };
+        let before = self.pane_tree.layout(pane_area);
+        let closed_rect = before.iter().find(|(id, _)| *id == target).map(|(_, r)| *r);
+        self.pane_tree = self.pane_tree.clone().close(target);
+        self.pane_scroll.remove(&target);
+        let remaining = self.pane_tree.layout(pane_area);
+        self.focused_pane = pick_nearest_leaf(&remaining, closed_rect).unwrap_or_else(|| {
+            self.pane_tree
+                .leaves()
+                .first()
+                .map(|(id, _)| *id)
+                .unwrap_or(1)
+        });
+    }
+
+    /// 在指定窗格处分屏。鼠标中键的快捷操作。
+    fn split_pane(&mut self, target: usize, dir: panes::SplitDir) {
+        let new_id = self.pane_tree.next_id();
+        self.pane_tree = self.pane_tree.clone().split(target, dir, new_id);
+        self.focused_pane = new_id;
+    }
+
+    /// Move the active scroll surface by `amount` lines in `dir`.
+    fn scroll(&mut self, dir: ScrollDir, amount: usize) {
+        // 鼠标滚轮滚动焦点 Console 窗格（或全局 stream）。
+        let off = self.pane_scroll.entry(self.focused_pane).or_insert(0);
+        *off = apply_scroll(*off, dir, amount);
+        // 同步全局 stream_offset 保持旧逻辑兼容。
+        self.stream_offset = *off;
+    }
+
+    /// Handle a left-click at terminal `(row, col)`.
+    /// - 若 Sessions overlay 开着且点中行 → 选择该 beacon（原有逻辑）。
+    /// - 否则（UX-S6）按坐标反查窗格 layout，点击即聚焦对应窗格，
+    ///   对齐 tmux `set -g mouse on` 的点击聚焦行为。之前鼠标能滚但不能点，
+    ///   是半残的反而误导。
+    fn click(&mut self, row: u16, col: u16) {
+        // Sessions overlay：用 session_row_rects 精确命中（render 记录的每行 Rect）。
+        // 不再用算术推算——List widget 滚动偏移会让 row→idx 映射失效。
         if let Overlay::Sessions(state) = &mut self.overlay {
-            // Overlay starts at full.y + 1, title is row 0 of the block.
-            let body_start = 2u16; // approx: title row + header gap
-            if row >= body_start {
-                let idx = (row - body_start) as usize;
-                if idx < self.sessions.len() {
-                    state.select(Some(idx));
-                    // second behavior: clicking also confirms the selection.
-                    self.selected = Some(idx);
-                    if let Some(s) = self.sessions.get(idx) {
+            // 用上一帧 render 记录的 hit regions 查命中。
+            for (i, r) in self.session_row_rects.iter().enumerate() {
+                if row >= r.y && row < r.y + r.height && col >= r.x && col < r.x + r.width {
+                    state.select(Some(i));
+                    if let Some(s) = self.sessions.get(i) {
+                        self.pane_tree.set_session_id(self.focused_pane, Some(s.id.clone()));
                         self.log(&format!("selected beacon {}", short(&s.id)), Level::Ok);
                     }
                     self.overlay = Overlay::None;
+                    return;
                 }
+            }
+            // 点在 overlay 外 → 不处理（让窗格聚焦逻辑跑）。
+        }
+        // 无 overlay → 点击聚焦窗格。用与 render 一致的布局算 pane_area：
+        // 顶部 statusbar 1 行 + 底部 input 3 行，中间是窗格区。
+        let full = self.last_frame_size;
+        if full.height < 8 {
+            return; // 太小不处理（render 也走了 too-small 分支）
+        }
+        // 优先处理 view picker：若开着且点击落在它上面 → 选对应行视图并关闭。
+        if let Some((picker_pane, _)) = &self.view_picker {
+            if let Some(tab_rect) = self.view_tab_rect.get(picker_pane).copied() {
+                let count = panes::PaneView::ALL.len();
+                // picker 区域：tab 下方，每行 1 个视图，从 tab_rect.y+2 开始
+                // （+1 进窗格内容区，+1 跳边框标题）。宽度固定 14（与 render 一致）。
+                let picker_top = tab_rect.y.saturating_add(2);
+                let picker_bot = picker_top + count as u16;
+                if row >= picker_top && row < picker_bot
+                    && col >= tab_rect.x
+                    && col < tab_rect.x + 14
+                {
+                    let idx = (row - picker_top) as usize;
+                    if let Some(v) = panes::PaneView::ALL.get(idx).copied() {
+                        self.pane_tree = self.pane_tree.clone().set_view(*picker_pane, v);
+                    }
+                    self.view_picker = None;
+                    return;
+                }
+            }
+            // 点在 picker 外的任何地方 → 关闭 picker（点 tab 外区域 = 取消）。
+            // 但先让下面的窗格聚焦逻辑跑（可能点的是另一个窗格 tab）。
+        }
+
+        let pane_area = ratatui::layout::Rect {
+            x: full.x,
+            y: full.y + 1, // 跳过 statusbar
+            width: full.width,
+            height: full.height.saturating_sub(1 + 3), // statusbar + input
+        };
+        // 反查点击坐标落在哪个叶的 rect 里。
+        let layouts = self.pane_tree.layout(pane_area);
+        for (id, rect) in &layouts {
+            if col >= rect.x
+                && col < rect.x + rect.width
+                && row >= rect.y
+                && row < rect.y + rect.height
+            {
+                // 先聚焦该窗格（点哪聚焦哪）。
+                if *id != self.focused_pane {
+                    self.focused_pane = *id;
+                }
+                // 点中窗格后，检查是否点中了它的视图 tab（顶部边框行）。
+                // 命中 → 开关该窗格的 view picker（而非直接切视图）。
+                if let Some(tab_rect) = self.view_tab_rect.get(id).copied() {
+                    if col >= tab_rect.x
+                        && col < tab_rect.x + tab_rect.width
+                        && row == tab_rect.y
+                    {
+                        // toggle picker：已开则关，没开则开（初始选中当前视图）。
+                        if self.view_picker.as_ref().is_some_and(|(pid, _)| pid == id) {
+                            self.view_picker = None;
+                        } else {
+                            let mut st = ratatui::widgets::ListState::default();
+                            // 初始选中当前视图对应行。
+                            if let Some(cur) = self
+                                .pane_tree
+                                .leaves()
+                                .iter()
+                                .find(|(lid, _)| lid == id)
+                                .map(|(_, v)| *v)
+                            {
+                                st.select(panes::PaneView::ALL.iter().position(|v| *v == cur));
+                            }
+                            self.view_picker = Some((*id, st));
+                        }
+                        return;
+                    }
+                }
+                // 点在窗格内容区（非 tab）。
+                // 若该窗格是 SessionList 视图，检查是否点中了某 session 行 → 切换 beacon。
+                if let Some(rows) = self.pane_session_rows.get(id) {
+                    for (r, sid) in rows {
+                        if col >= r.x
+                            && col < r.x + r.width
+                            && row >= r.y
+                            && row < r.y + r.height
+                        {
+                            self.pane_tree.set_session_id(*id, Some(sid.clone()));
+                            self.log(
+                                &format!("[pane {}] selected beacon {}", id, short(sid)),
+                                Level::Ok,
+                            );
+                            return;
+                        }
+                    }
+                }
+                // 点在内容区非 session 行 → 关掉任何开着的 picker。
+                self.view_picker = None;
+                return;
             }
         }
     }
 
     fn submit(&mut self) {
-        let raw = std::mem::take(&mut self.input);
-        self.cursor = 0;
-        self.popup_open = false;
+        // 从焦点窗格取出输入，避免动到其他窗格的 input/cursor/popup。
+        let raw = {
+            let st = self.focused_state_mut();
+            let r = std::mem::take(&mut st.input);
+            st.cursor = 0;
+            st.popup_open = false;
+            st.hist_idx = None;
+            r
+        };
         if !raw.trim().is_empty() {
             self.history.push(raw.clone());
-            self.hist_idx = None;
+            // Cap history to prevent unbounded growth（P1-1c），与 STREAM_CAP 对称。
+            if self.history.len() > HISTORY_CAP {
+                let drop = self.history.len() - HISTORY_CAP;
+                self.history.drain(..drop);
+            }
         }
         match input::classify_with(&raw, &self.config.aliases) {
             Input::Empty => {}
@@ -718,6 +1100,39 @@ impl App {
                 }
             }
             "/clear" => self.stream.clear(),
+            "/theme" => {
+                // /theme             — 显示当前主题
+                // /theme mocha       — Catppuccin Mocha（默认）
+                // /theme highcontrast — WCAG AAA 高对比度
+                // /theme nocolor     — 无色（遵守 NO_COLOR）
+                let sub = args.trim();
+                if sub.is_empty() {
+                    self.log(
+                        &format!("current theme: {} (options: mocha, highcontrast, nocolor)", self.config.theme),
+                        Level::Info,
+                    );
+                } else {
+                    let valid = matches!(
+                        sub.to_ascii_lowercase().as_str(),
+                        "mocha" | "highcontrast" | "hc" | "nocolor"
+                    );
+                    if !valid {
+                        self.log(
+                            &format!("! unknown theme '{sub}' (mocha | highcontrast | nocolor)"),
+                            Level::Warn,
+                        );
+                        return;
+                    }
+                    // 热切换调色板（RwLock 写入，立即生效，下一帧渲染就用新色）。
+                    crate::theme::switch(sub);
+                    // 持久化到配置文件，下次启动生效。
+                    self.config.theme = sub.to_string();
+                    match self.config.save() {
+                        Ok(()) => self.log(&format!("theme switched to {sub}"), Level::Ok),
+                        Err(e) => self.log(&format!("theme switched but save failed: {e}"), Level::Warn),
+                    }
+                }
+            }
             "/alias" => {
                 // /alias add <name> <command...>  /  /alias rm <name>  /  /alias list
                 let mut parts = args.split_whitespace();
@@ -1042,8 +1457,9 @@ impl App {
                         self.log(&format!("(no beacons match '{args}')",), Level::Warn);
                     } else {
                         let mut st = ListState::default();
+                        let cur_idx = self.current_session().and_then(|s| self.sessions.iter().position(|x| x.id == s.id));
                         st.select(
-                            self.selected
+                            cur_idx
                                 .filter(|i| filtered.contains(i))
                                 .or(filtered.first().copied()),
                         );
@@ -1078,7 +1494,7 @@ impl App {
                 }
                 match self.sessions.iter().position(|s| s.id.starts_with(id)) {
                     Some(i) => {
-                        self.selected = Some(i);
+                        if let Some(s) = self.sessions.get(i) { self.pane_tree.set_session_id(self.focused_pane, Some(s.id.clone())); }
                         self.log(
                             &format!("selected beacon {}", short(&self.sessions[i].id)),
                             Level::Ok,
@@ -1741,8 +2157,38 @@ enum ShellFor {
     Creds,
 }
 
+/// `Down` 键历史导航的动作。三态表达比 `Option<(bool, String)>` 更清晰：
+/// `Pick` = 取下一条历史填入输入框；`Clear` = 已到末尾，清空回到底部；
+/// `None`（外层 Option）= 没有 hist_idx 时什么都不做。
+enum HistoryNav {
+    Pick(String),
+    Clear,
+}
+
 pub(super) fn short(s: &str) -> String {
     s.chars().take(8).collect()
+}
+
+/// 从剩余叶里挑屏幕中心距离 `closed_rect` 最近的那个（UX-S4 焦点回退）。
+/// `closed_rect` 是被关窗格关闭前的位置；None 或无剩余叶时返回 None。
+fn pick_nearest_leaf(
+    remaining: &[(usize, ratatui::layout::Rect)],
+    closed_rect: Option<ratatui::layout::Rect>,
+) -> Option<usize> {
+    let target = closed_rect?;
+    let (tcx, tcy) = (
+        (target.x + target.width / 2) as i64,
+        (target.y + target.height / 2) as i64,
+    );
+    remaining
+        .iter()
+        .map(|(id, r)| {
+            let (cx, cy) = ((r.x + r.width / 2) as i64, (r.y + r.height / 2) as i64);
+            let dist = (cx - tcx).pow(2) + (cy - tcy).pow(2);
+            (*id, dist)
+        })
+        .min_by_key(|(_, d)| *d)
+        .map(|(id, _)| id)
 }
 
 /// 把秒数格式化成紧凑时长：`1h02m` / `3m10s` / `45s` / `0s`。
@@ -1779,6 +2225,9 @@ pub fn run(server: &str, token: Option<&str>) -> anyhow::Result<()> {
 
     let bridge = rest::spawn(server.to_string(), token.map(|t| t.to_string()));
     let mut app = App::new(bridge);
+    // 初始化主题：根据配置文件 theme 字段 + NO_COLOR 环境变量选定调色板。
+    // 必须在首次 render 前调用（render 会读 theme::current()）。
+    crate::theme::init(&app.config.theme);
 
     let result = main_loop(&mut terminal, &mut app);
 
@@ -1798,9 +2247,21 @@ fn main_loop(
     app: &mut App,
 ) -> anyhow::Result<()> {
     while !app.should_quit {
+        // prefix 超时自动复位（UX-S5）：按 Ctrl+B 后 2s 内未按有效键则退出 prefix
+        // 模式，防止操作员分心后误触改布局。放在 draw 前保证状态栏及时反映。
+        if app.tmux_prefix
+            && app
+                .prefix_since
+                .is_some_and(|t| t.elapsed() > Duration::from_secs(2))
+        {
+            app.tmux_prefix = false;
+            app.prefix_since = None;
+        }
         terminal.draw(|f| render(app, f))?;
-        // poll input at 100ms cadence so we can also drain worker snapshots
-        if event::poll(Duration::from_millis(100))? {
+        // poll input at ~33ms cadence（P1-3）。之前 100ms 导致 worker 快照最多
+        // 延迟 ~200ms 才渲染（人眼可感卡顿）。降到 33ms（~30fps 上限）后端到端
+        // 延迟 <70ms，CPU 成本可忽略（poll 空转极廉价）。
+        if event::poll(Duration::from_millis(33))? {
             match event::read()? {
                 Event::Key(key) => app.handle_key(key),
                 Event::Mouse(ev) => app.handle_mouse(ev),
@@ -2104,8 +2565,12 @@ mod tests {
         app.log("[a1b2c3] $ whoami", Level::Info);
         app.log("DEV\\alice", Level::Ok);
         app.log("! some error", Level::Err);
-        app.input = "/l".into();
-        app.popup_open = true;
+        // 字段已迁移到 per-pane PaneState（P0-2）：通过 focused_state_mut 设置。
+        {
+            let st = app.focused_state_mut();
+            st.input = "/l".into();
+            st.popup_open = true;
+        }
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
     }
@@ -2147,12 +2612,187 @@ mod tests {
             pid: 1234,
             ..Default::default()
         }];
-        app.selected = Some(0);
+        if let Some(s) = app.sessions.first() { app.pane_tree.set_session_id(app.focused_pane, Some(s.id.clone())); }
         let mut st = ListState::default();
         st.select(Some(0));
         app.overlay = Overlay::Sessions(st);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
+    }
+
+    /// 鼠标点击 Sessions overlay 的行确实切换 session（核心交互测试）。
+    /// 之前 List widget 滚动偏移导致 click 坐标映射失效；改用 hit regions 后修复。
+    #[test]
+    fn click_on_sessions_overlay_row_switches_session() {
+        use crate::types::SessionView;
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = fake_app();
+        // 两个 session，当前选第一个。
+        app.sessions = vec![
+            SessionView {
+                id: "aaaa1111aaaa".into(),
+                hostname: "hostA".into(),
+                username: "alice".into(),
+                os: "linux".into(),
+                beacon_id: 1,
+                ..Default::default()
+            },
+            SessionView {
+                id: "bbbb2222bbbb".into(),
+                hostname: "hostB".into(),
+                username: "bob".into(),
+                os: "macos".into(),
+                beacon_id: 2,
+                ..Default::default()
+            },
+        ];
+        app.pane_tree.set_session_id(app.focused_pane, Some("aaaa1111aaaa".into()));
+        let mut st = ListState::default();
+        st.select(Some(0));
+        app.overlay = Overlay::Sessions(st);
+        // render 一帧，让 session_row_rects 被填充。
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        // 确认 hit regions 至少 2 行。
+        assert!(app.session_row_rects.len() >= 2, "应记录至少 2 行 hit region");
+        // 点击第 2 行（hostB）的中间位置。
+        let row2 = app.session_row_rects[1];
+        let click_col = row2.x + 5;
+        let click_row = row2.y;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: click_col,
+            row: click_row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        // 验证焦点窗格的 session 切到了 bbbb2222（hostB）。
+        let selected = app.pane_tree.get_session_id(app.focused_pane);
+        assert_eq!(
+            selected.as_deref(),
+            Some("bbbb2222bbbb"),
+            "点击 hostB 行应切换到该 session，got {selected:?}"
+        );
+        // overlay 应关闭。
+        assert!(!app.overlay.is_open(), "点击后 overlay 应关闭");
+    }
+
+    /// 点击窗格 SessionList 视图的行切换该窗格的 session（核心交互）。
+    /// 从 console 切到 sessions 视图后，点列表里的 beacon 行 → 该窗格绑定它。
+    #[test]
+    fn click_pane_sessionlist_row_switches_pane_session() {
+        use crate::types::SessionView;
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = fake_app();
+        // 两个 session。
+        app.sessions = vec![
+            SessionView {
+                id: "aaaa1111aaaa".into(),
+                hostname: "hostA".into(),
+                username: "alice".into(),
+                os: "linux".into(),
+                beacon_id: 1,
+                ..Default::default()
+            },
+            SessionView {
+                id: "bbbb2222bbbb".into(),
+                hostname: "hostB".into(),
+                username: "bob".into(),
+                os: "macos".into(),
+                beacon_id: 2,
+                ..Default::default()
+            },
+        ];
+        // 焦点窗格设为 SessionList 视图，初始绑 hostA。
+        app.pane_tree = app
+            .pane_tree
+            .clone()
+            .set_view(app.focused_pane, panes::PaneView::SessionList);
+        app.pane_tree.set_session_id(app.focused_pane, Some("aaaa1111aaaa".into()));
+        // render 一帧，让 pane_session_rows 被填充。
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        // 确认 hit regions 有 2 行。
+        let rows = app
+            .pane_session_rows
+            .get(&app.focused_pane)
+            .expect("焦点窗格应有 session 行 hit regions");
+        assert!(rows.len() >= 2, "应记录至少 2 行");
+        // 点击第 2 行（hostB）。
+        let (row2_rect, _) = &rows[1];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: row2_rect.x + 5,
+            row: row2_rect.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        // 验证焦点窗格切到 hostB。
+        let selected = app.pane_tree.get_session_id(app.focused_pane);
+        assert_eq!(
+            selected.as_deref(),
+            Some("bbbb2222bbbb"),
+            "点击 hostB 行应切换该窗格 session"
+        );
+    }
+
+    /// SessionList 当前 session 行有高亮背景（surface1），其他行没有。
+    /// 之前高亮没显示因为背景只部分应用；现在整行填满。
+    #[test]
+    fn sessionlist_current_row_has_highlight_background() {
+        use crate::types::SessionView;
+        let mut app = fake_app();
+        app.sessions = vec![
+            SessionView {
+                id: "aaaa1111aaaa".into(),
+                hostname: "hostA".into(),
+                username: "alice".into(),
+                os: "linux".into(),
+                beacon_id: 1,
+                ..Default::default()
+            },
+            SessionView {
+                id: "bbbb2222bbbb".into(),
+                hostname: "hostB".into(),
+                username: "bob".into(),
+                os: "macos".into(),
+                beacon_id: 2,
+                ..Default::default()
+            },
+        ];
+        // 焦点窗格 SessionList 视图，绑 hostA（第一行应高亮）。
+        app.pane_tree = app
+            .pane_tree
+            .clone()
+            .set_view(app.focused_pane, panes::PaneView::SessionList);
+        app.pane_tree.set_session_id(app.focused_pane, Some("aaaa1111aaaa".into()));
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        let buf = term.backend().buffer();
+
+        // 第一行（hostA，当前）的背景应是 surface1；第二行（hostB）不是。
+        // 第一行（hostA，当前）的背景应是 accent_dim（selected 样式，蓝色高亮）。
+        let accent_dim = crate::theme::accent_dim();
+        let mut found_highlight = false;
+        for y in 2u16..20u16 {
+            let cell = &buf[(5, y)]; // x=5 在 hostname 区域内
+            // selected 用 accent_dim 背景前景。检查 bg 是否是 accent_dim。
+            if cell.bg == accent_dim {
+                found_highlight = true;
+                break;
+            }
+        }
+        assert!(found_highlight, "当前 session 行应有 accent_dim 蓝色高亮背景");
+    }
+
+    /// /theme 命令切换主题：switch 后颜色访问器返回新调色板的值。
+    #[test]
+    fn theme_switch_changes_active_palette() {
+        // switch 到 highcontrast 后，accent 应变成 Cyan（high_contrast 预设）。
+        crate::theme::switch("highcontrast");
+        assert_eq!(crate::theme::accent(), ratatui::style::Color::Cyan);
+        // 恢复 mocha 避免污染其他测试。
+        crate::theme::switch("mocha");
+        assert_eq!(crate::theme::accent(), crate::theme::ACCENT);
     }
 
     #[test]
@@ -2248,8 +2888,9 @@ mod tests {
     fn render_does_not_panic_with_split_panes() {
         // tmux 式分屏：Ctrl+% 后两个窗格，渲染不崩
         let mut app = fake_app();
-        app.pane_tree = panes::Pane::single(1).split(1, panes::SplitDir::Vertical);
-        app.focused_pane = 101;
+        let new_id = app.pane_tree.next_id(); // == 2
+        app.pane_tree = panes::Pane::single(1).split(1, panes::SplitDir::Columns, new_id);
+        app.focused_pane = new_id; // 新叶 id = 2
         app.log("[a1b2c3] $ whoami", Level::Info);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
@@ -2259,11 +2900,120 @@ mod tests {
     fn render_does_not_panic_with_different_pane_views() {
         // 焦点窗格切换为 Files 视图，渲染不崩
         let mut app = fake_app();
+        let nid1 = panes::Pane::single(1).next_id(); // == 2
         app.pane_tree = panes::Pane::single(1)
-            .split(1, panes::SplitDir::Horizontal)
-            .set_view(101, panes::PaneView::SessionList);
+            .split(1, panes::SplitDir::Rows, nid1)
+            .set_view(nid1, panes::PaneView::SessionList);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
+    }
+
+    /// 单 tab：render 后焦点窗格有一个 view_tab_rect hit region，
+    /// buffer 含当前视图名（console）+ ▾ 下拉指示。
+    #[test]
+    fn view_tab_renders_current_view_with_dropdown_arrow() {
+        let mut app = fake_app();
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        // 焦点窗格（id=1）应有 1 个 view tab hit region。
+        assert!(
+            app.view_tab_rect.contains_key(&1),
+            "焦点窗格应有 view tab hit region"
+        );
+        // buffer 应含当前视图名 + ▾。
+        let buf_str: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(buf_str.contains("console"), "应显示当前视图名 console");
+        assert!(buf_str.contains('▾'), "应显示下拉箭头 ▾");
+    }
+
+    /// view picker 打开后：render 画出全部 6 个视图选项。
+    #[test]
+    fn view_picker_renders_all_views_when_open() {
+        let mut app = fake_app();
+        // 手动打开 id=1 窗格的 picker。
+        app.view_picker = Some((1, ratatui::widgets::ListState::default()));
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        let buf_str: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // picker 打开时 buffer 应含全部 6 个视图 label。
+        for v in panes::PaneView::ALL {
+            assert!(
+                buf_str.contains(v.label()),
+                "picker 应列出 {:?} = '{}'",
+                v,
+                v.label()
+            );
+        }
+        // 箭头应变 ▴（菜单已展开）。
+        assert!(buf_str.contains('▴'), "picker 开时箭头应变 ▴");
+    }
+
+    /// 窄终端下单 tab 仍能正常渲染（不像旧 6-tab 设计会挤爆）。
+    #[test]
+    fn single_tab_survives_narrow_pane() {
+        let mut app = fake_app();
+        let nid = app.pane_tree.next_id();
+        app.pane_tree = app
+            .pane_tree
+            .clone()
+            .split(app.focused_pane, panes::SplitDir::Columns, nid);
+        // 窄终端，多分屏——单 tab 设计应不挤、不 panic。
+        let mut term = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        // 每个窗格都应有自己的 tab rect。
+        assert!(app.view_tab_rect.len() >= 2);
+    }
+
+    /// 输入框渲染修复回归测试：prompt 内容（tag + ❯ + 输入）必须画在内容区
+    /// （去掉边框+padding 后），不能覆盖顶部边框行。之前 inner=area 的 bug
+    /// 导致 prompt 画在边框上。现在用 block.inner(area) 正确收缩。
+    #[test]
+    fn input_prompt_renders_inside_block_not_on_border() {
+        let mut app = fake_app();
+        // 模拟有输入的状态。
+        {
+            let st = app.focused_state_mut();
+            st.input = "whoami".into();
+            st.cursor = 6;
+        }
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        let buf = term.backend().buffer();
+
+        // 输入框区域：底部 3 行（chunks[2]，y=21..23）。顶部边框在 y=21，
+        // 内容在 y=22。验证 prompt 文本在 y=22（内容行），不在 y=21（边框行）。
+        // 收集 y=21 和 y=22 两行的内容。
+        let row_at = |y: usize| -> String {
+            (0..80).map(|x| buf[(x as u16, y as u16)].symbol().chars().next().unwrap_or(' ')).collect()
+        };
+        let border_row = row_at(21);
+        let content_row = row_at(22);
+        // 边框行应含圆角分隔线（═ 或 ╭ 或 ' input ' 标题），不含 "whoami"。
+        assert!(
+            !border_row.contains("whoami"),
+            "prompt 不应画在边框行；border_row={border_row:?}"
+        );
+        // 内容行应含输入文本 "whoami"。
+        assert!(
+            content_row.contains("whoami"),
+            "prompt 应画在内容行；content_row={content_row:?}"
+        );
+        // 内容行还应含 ❯ 提示符和 [no beacon] 标签（fake_app 无 session）。
+        assert!(content_row.contains("❯"), "内容行应有 ❯ 提示符");
+        assert!(content_row.contains("[no beacon]"), "内容行应有 session 标签");
     }
 
     #[test]
@@ -2360,15 +3110,16 @@ mod tests {
         // 完整生命周期：split → close → 焦点回退
         let mut app = fake_app();
         assert_eq!(app.pane_tree.leaf_count(), 1);
-        // split：split(target=1) 创建新叶 id=101
+        // split：当前最大 id=1，next_id()=2
+        let new_id = app.pane_tree.next_id(); // == 2
         app.pane_tree = app
             .pane_tree
             .clone()
-            .split(app.focused_pane, panes::SplitDir::Vertical);
-        app.focused_pane = 101;
+            .split(app.focused_pane, panes::SplitDir::Columns, new_id);
+        app.focused_pane = new_id;
         assert_eq!(app.pane_tree.leaf_count(), 2);
         // close 新叶
-        app.pane_tree = app.pane_tree.clone().close(101);
+        app.pane_tree = app.pane_tree.clone().close(new_id);
         app.focused_pane = app
             .pane_tree
             .leaves()
@@ -2385,5 +3136,95 @@ mod tests {
         app.poll_worker();
         assert!(!app.connected);
         assert!(app.stream.is_empty());
+    }
+
+    /// UX-S4：pick_nearest_leaf 选屏幕中心距离被关叶最近的剩余叶。
+    #[test]
+    fn pick_nearest_chooses_spatial_neighbor() {
+        use ratatui::layout::Rect;
+        // 被关叶在右上角 (x=40,y=0,w=40,h=12)，剩余两个叶：
+        // 左下 (0,0,40,24) 中心 (20,12)；右下 (40,12,40,12) 中心 (60,18)。
+        // 被关中心 (60,6)。右下距离 √(0²+12²)=12，左下距离 √(40²+6²)≈40。
+        // 应选右下（距离更近），即兄弟而非左下角。
+        let remaining = vec![
+            (1, Rect::new(0, 0, 40, 24)),
+            (3, Rect::new(40, 12, 40, 12)),
+        ];
+        let closed = Some(Rect::new(40, 0, 40, 12));
+        assert_eq!(pick_nearest_leaf(&remaining, closed), Some(3));
+    }
+
+    /// pick_nearest 无剩余叶时返回 None。
+    #[test]
+    fn pick_nearest_empty_returns_none() {
+        let remaining: Vec<(usize, ratatui::layout::Rect)> = vec![];
+        assert_eq!(pick_nearest_leaf(&remaining, None), None);
+    }
+
+    /// overlay 限制在焦点窗格内，不遮另一半（核心修复回归测试）。
+    /// 分屏后开 Files overlay，验证 overlay 内容（文件名）只出现在焦点窗格列范围，
+    /// 非焦点窗格区域不含 overlay 内容（保持可见）。
+    #[test]
+    fn overlay_does_not_cover_other_pane_in_split() {
+        let mut app = fake_app();
+        // 左右分屏：新叶 id=2 在左（x=0..40），原叶 id=1 在右（x=40..80）。
+        // focused_pane 默认 = 1（原叶，右侧），所以 overlay 在右半。
+        let nid = app.pane_tree.next_id();
+        app.pane_tree = app
+            .pane_tree
+            .clone()
+            .split(app.focused_pane, panes::SplitDir::Columns, nid);
+        // 确认焦点窗格在哪侧：layout 后查 focused_pane=1 的 rect。
+        app.overlay = Overlay::Files(vec![FileEntry {
+            name: "ZZZ_OVERLAY_MARKER".into(),
+            size: 1,
+            is_dir: false,
+            modified: "x".into(),
+        }]);
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        let buf = term.backend().buffer();
+
+        // 非焦点窗格是 id=2（左侧 x=0..40）。扫描左侧，确认不含 overlay marker。
+        for y in 1u16..21u16 {
+            for x in 0u16..40u16 {
+                let cell = &buf[(x, y)];
+                let sym = cell.symbol();
+                assert!(
+                    !sym.contains('Z'),
+                    "overlay 内容泄漏到非焦点窗格 x={x} y={y}: {sym:?}"
+                );
+            }
+        }
+        // 焦点窗格（右侧）应含 overlay marker（证明 overlay 确实渲染了）。
+        let right_half: String = (1u16..21u16)
+            .flat_map(|y| (40u16..80u16).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            right_half.contains('Z'),
+            "焦点窗格应含 overlay marker"
+        );
+    }
+
+    /// overlay 的 focused_pane_rect 正确指向焦点窗格（非全屏）。
+    #[test]
+    fn overlay_focused_pane_rect_is_pane_not_fullscreen() {
+        let mut app = fake_app();
+        let nid = app.pane_tree.next_id();
+        app.pane_tree = app
+            .pane_tree
+            .clone()
+            .split(app.focused_pane, panes::SplitDir::Columns, nid);
+        app.overlay = Overlay::Files(vec![]);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        // 焦点窗格 rect 宽度应 < 80（不是全屏）。
+        assert!(
+            app.focused_pane_rect.width < 80,
+            "focused_pane_rect 应是窗格大小非全屏，got width={}",
+            app.focused_pane_rect.width
+        );
     }
 }
