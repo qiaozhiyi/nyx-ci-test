@@ -162,8 +162,12 @@ jobs:
           echo "RUN_DIR=$RUN_DIR" >> $GITHUB_ENV
           ssh win "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path '$RUN_DIR' | Out-Null\""
           scp build_and_test.ps1 win:"$RUN_DIR/"
-          ssh win "powershell -NoProfile -ExecutionPolicy Bypass -File '$RUN_DIR\build_and_test.ps1' -RunDir '$RUN_DIR' -Sha '$SHA'" 2>&1 | tee byovd_output.txt
-          # Fail the job if the build stage didn't print BUILD_DONE.
+          # PowerShell -File needs a consistent path separator. Use backslashes
+          # for the -File arg (Windows native), but forward slashes are fine
+          # inside the script (PowerShell accepts both there). The mixed
+          # 'C:/.../dir\file.ps1' form was rejected as an invalid path.
+          PS_PATH="${RUN_DIR//\//\\}\\build_and_test.ps1"
+          ssh win "powershell -NoProfile -ExecutionPolicy Bypass -File '$PS_PATH' -RunDir '$RUN_DIR' -Sha '$SHA'" 2>&1 | tee byovd_output.txt
           grep -q "BUILD_DONE" byovd_output.txt || { echo "::error::build failed on host (see byovd_output.txt)"; exit 1; }
 
       - name: Collect + cleanup
