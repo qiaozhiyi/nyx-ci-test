@@ -48,7 +48,26 @@ use crate::{KernelRw, KitError, KrwError};
 /// On Windows we try `\\.\MpKsl` first; if that fails, we enumerate all
 /// dos-device mappings via `QueryDosDeviceW` to find the real `MpKslXXXX`
 /// device and construct `\\.\Global\MpKslXXXX`.
+/// Default KslD device path. We try TWO common names:
+/// - `\\.\KslD`   — used by newer Defender engines (observed on Server 2019
+///                  with engine 1.1.26050.11; the dos-device symlink is the
+///                  bare driver name, no MpKsl prefix). This is the default
+///                  we try first.
+/// - `\\.\MpKsl`  — used by older Defender engine versions (KslDump reference)
+/// `open()` tries both; `enumerate_ksld_device` matches both prefixes.
 pub const KSLD_DEFAULT_DEVICE: &[u16] = &[
+    '\\' as u16,
+    '\\' as u16,
+    '.' as u16,
+    '\\' as u16,
+    'K' as u16,
+    's' as u16,
+    'l' as u16,
+    'D' as u16,
+];
+
+/// Alternate path for the older `MpKsl` naming (KslDump-era Defender).
+pub const KSLD_ALT_DEVICE_MPKSL: &[u16] = &[
     '\\' as u16,
     '\\' as u16,
     '.' as u16,
@@ -133,7 +152,13 @@ mod windows_impl {
     ) -> u32;
 
     /// MpKsl prefix in UTF-16 for device name matching during enumeration.
+    /// Used by older Defender engine versions (KslDump reference).
     const MPKSL_PREFIX_U16: [u16; 5] = ['M' as u16, 'p' as u16, 'K' as u16, 's' as u16, 'l' as u16];
+
+    /// Bare `KslD` prefix in UTF-16. Newer Defender engines (observed on
+    /// Server 2019 engine 1.1.26050.11) name the dos-device symlink after the
+    /// driver itself, without the MpKsl prefix. Match both at enumeration time.
+    const KSLD_PREFIX_U16: [u16; 4] = ['K' as u16, 's' as u16, 'l' as u16, 'D' as u16];
 
     /// Win32 device path prefix for the global dos-device namespace.
     const GLOBAL_PREFIX_U16: &[u16] = &[
@@ -210,7 +235,9 @@ mod windows_impl {
                         } else {
                             &name[..]
                         };
-                        if trimmed.starts_with(&MPKSL_PREFIX_U16) {
+                        if trimmed.starts_with(&MPKSL_PREFIX_U16)
+                            || trimmed.starts_with(&KSLD_PREFIX_U16)
+                        {
                             // Build the Win32 device path: \\.\Global\<name>
                             let mut path: alloc::vec::Vec<u16> = alloc::vec::Vec::with_capacity(
                                 GLOBAL_PREFIX_U16.len() + name.len() + 1,
@@ -266,13 +293,15 @@ mod windows_impl {
             let create_file: CreateFileWFn = resolve_sym(b"kernel32.dll", b"CreateFileW")?;
             let dioctl: DeviceIoControlFn = resolve_sym(b"kernel32.dll", b"DeviceIoControl")?;
 
-            // Try the operator-supplied name first, then the default, then enumerate.
+            // Try the operator-supplied name first, then BOTH default device
+            // names (KslD for newer Defender, MpKsl for older), then enumerate.
             let paths_to_try: alloc::vec::Vec<&[u16]> = {
-                let mut v = alloc::vec::Vec::with_capacity(3);
+                let mut v = alloc::vec::Vec::with_capacity(4);
                 if let Some(name) = device_name {
                     v.push(name);
                 }
-                v.push(KSLD_DEFAULT_DEVICE);
+                v.push(KSLD_DEFAULT_DEVICE);       // \\.\KslD (newer engines)
+                v.push(KSLD_ALT_DEVICE_MPKSL);     // \\.\MpKsl (older engines)
                 v
             };
 
@@ -553,7 +582,9 @@ mod tests {
         assert_eq!(*KSLD_DEFAULT_DEVICE.last().unwrap(), 0);
     }
 
-    /// Default device path matches "\\.\MpKsl".
+    /// Default device path matches "\\.\KslD" (newer Defender engines name
+    /// the dos-device symlink after the driver itself). The older `\\.\MpKsl`
+    /// path is in KSLD_ALT_DEVICE_MPKSL, tried as a fallback in open().
     #[test]
     fn default_device_path_matches_expected() {
         let expected: &[u16] = &[
@@ -561,11 +592,10 @@ mod tests {
             '\\' as u16,
             '.' as u16,
             '\\' as u16,
-            'M' as u16,
-            'p' as u16,
             'K' as u16,
             's' as u16,
             'l' as u16,
+            'D' as u16,
         ];
         assert_eq!(&KSLD_DEFAULT_DEVICE[..expected.len()], expected);
     }
