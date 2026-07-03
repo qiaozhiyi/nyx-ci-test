@@ -47,20 +47,24 @@ jobs:
           Write-Host "Defender: AMRunningMode=$($def.AMRunningMode) RTP=$($def.RealTimeProtectionEnabled)"
 
       - name: Build operator CLI + offset-resolver
-        shell: powershell
+        shell: cmd
         run: |
-          # MSVC is the host's default toolchain. Full output — no piping, so
-          # compile errors are visible (the '| Select-Object -Last N' trap from
-          # the old workflow hid real errors).
-          cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml 2>&1
-          if (-not (Test-Path "crates/operator-kernel-cli/target/release/nyx-kernel.exe")) {
-            Write-Host "::error::operator-kernel-cli build failed"; exit 1
-          }
-          cargo build --manifest-path crates/offset-resolver/Cargo.toml 2>&1
-          Write-Host "BUILD_OK"
+          REM Use cmd (not powershell) so cargo's stderr progress ("Compiling...")
+          REM isn't reinterpreted as a NativeCommandError by PS 5.1 and aborting.
+          cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml
+          if not exist "crates\operator-kernel-cli\target\release\nyx-kernel.exe" (
+            echo ::error::operator-kernel-cli build failed & exit /b 1
+          )
+          cargo build --manifest-path crates/offset-resolver/Cargo.toml
+          echo BUILD_OK
 
       - name: "Live PDB offset resolution (17763 ground truth)"
         shell: powershell
+        env:
+          # PS 5.1 treats any native command's stderr output as a terminating
+          # error (NativeCommandError). offset-resolver writes progress to
+          # stderr. Continue-on-error so it doesn't abort the step.
+          ERRORACTIONPREFERENCE: 'Continue'
         run: |
           # Extract the PDB GUID from this host's ntoskrnl.exe, download the
           # matching PDB from MS symbol server, parse with offset-resolver.
@@ -110,6 +114,8 @@ jobs:
 
       - name: "Kernel bootstrap via KslD (Living off the Defender)"
         shell: powershell
+        env:
+          ERRORACTIONPREFERENCE: 'Continue'
         continue-on-error: true   # KslD IOCTL may differ by Defender engine version
         run: |
           # bootstrap_chain defaults to KslD first (no --byovd → no driver load).
@@ -117,7 +123,7 @@ jobs:
           # (if we wire a subcommand) can blind ETW-TI. Here we just confirm
           # the bootstrap succeeds — the KslD path works on this host.
           $exe = "crates/operator-kernel-cli/target/release/nyx-kernel.exe"
-          & $exe bootstrap 2>&1
+          cmd /c "$exe bootstrap 2>&1"
           Write-Host "BOOTSTRAP_EXIT=$LASTEXITCODE"
 
       - name: Upload artifacts
