@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: "Environment check (build / Defender / KslD)"
-        shell: pwsh
+        shell: powershell
         run: |
           $os = Get-CimInstance Win32_OperatingSystem
           Write-Host "OS: $($os.Caption) build $($os.BuildNumber)"
@@ -47,7 +47,7 @@ jobs:
           Write-Host "Defender: AMRunningMode=$($def.AMRunningMode) RTP=$($def.RealTimeProtectionEnabled)"
 
       - name: Build operator CLI + offset-resolver
-        shell: pwsh
+        shell: powershell
         run: |
           # MSVC is the host's default toolchain. Full output — no piping, so
           # compile errors are visible (the '| Select-Object -Last N' trap from
@@ -60,7 +60,7 @@ jobs:
           Write-Host "BUILD_OK"
 
       - name: "Live PDB offset resolution (17763 ground truth)"
-        shell: pwsh
+        shell: powershell
         run: |
           # Extract the PDB GUID from this host's ntoskrnl.exe, download the
           # matching PDB from MS symbol server, parse with offset-resolver.
@@ -109,7 +109,7 @@ jobs:
           Get-Content offsets_17763_live.toml
 
       - name: "Kernel bootstrap via KslD (Living off the Defender)"
-        shell: pwsh
+        shell: powershell
         continue-on-error: true   # KslD IOCTL may differ by Defender engine version
         run: |
           # bootstrap_chain defaults to KslD first (no --byovd → no driver load).
