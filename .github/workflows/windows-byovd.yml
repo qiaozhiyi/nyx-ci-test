@@ -73,11 +73,19 @@ jobs:
           $resolver = "$RunDir\nyx-offset-resolver.exe"
           $sys      = "C:\Users\Administrator\RTCore64.sys"
 
-          # ===== 1. Clone the exact tested SHA into the run dir =====
-          Write-Output "=== clone $Sha ==="
-          git clone --depth 1 --no-checkout https://github.com/qiaozhiyi/NY "$RunDir\src" 2>&1
+          # ===== 1. Clone the repo at the tested SHA into the run dir =====
+          # Full clone (not shallow): we need to checkout a specific SHA that
+          # may not be the branch tip. --depth 1 + checkout <non-HEAD sha>
+          # silently fails to populate the worktree → "Cargo.toml does not
+          # exist". A full clone of this repo is ~fast enough.
+          Write-Output "=== clone @ $Sha ==="
+          git clone https://github.com/qiaozhiyi/NY "$RunDir\src" 2>&1
           Push-Location "$RunDir\src"
           git checkout $Sha 2>&1
+          if (-not (Test-Path "crates\operator-kernel-cli\Cargo.toml")) {
+            Write-Output "CLONE_FAILED: worktree empty after checkout"
+            Pop-Location; exit 1
+          }
 
           # ===== 2. Build with MSVC (host's default toolchain) =====
           Write-Output "=== build operator-kernel-cli ==="
