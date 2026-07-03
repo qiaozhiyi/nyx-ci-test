@@ -192,9 +192,6 @@ fn parse_pdb_offsets(data: &[u8], build_num: u32) -> Result<BTreeMap<&'static st
     let type_info = pdb.type_information()?;
 
     // Drain the TPI iterator once. We collect ALL wanted struct candidates in
-    // a single pass (_EPROCESS + the 3 ETW-TI structs) so the finder can later
-    // resolve any FieldList by TypeIndex without re-iterating.
-    let mut iter = type_info.iter();
     let wanted: &[&[u8]] = &[
         b"_EPROCESS",
         b"EPROCESS",
@@ -205,22 +202,42 @@ fn parse_pdb_offsets(data: &[u8], build_num: u32) -> Result<BTreeMap<&'static st
     let mut struct_fields: std::collections::HashMap<&[u8], pdb::TypeIndex> =
         std::collections::HashMap::new();
 
-    while let Some(item) = iter.next()? {
-        let type_data = item.parse()?;
-        if let TypeData::Class(ref c) = type_data {
-            let name_bytes = c.name.as_bytes();
-            if wanted.contains(&name_bytes) && !struct_fields.contains_key(name_bytes) {
-                // c.fields is None for forward declarations (struct declared
-                // but not defined in this PDB). Skip those — we need the real
-                // FieldList TypeIndex to walk members.
-                if let Some(fields) = c.fields {
-                    struct_fields.insert(name_bytes, fields);
+    // pdb crate contract (src/tpi/mod.rs:375-387): ItemFinder is populated by
+    // calling finder.update(iter) AFTER EVERY iter.next(). The finder records
+    // byte positions so it can later seek to any visited TypeIndex. A struct's
+    // FieldList TypeIndex can be forward-referenced (higher than the struct
+    // itself), so we must drain the ENTIRE stream + update finder each step.
+    // Missing the update → "Type N not indexed (index covers M)".
+    let mut iter = type_info.iter();
+    let mut finder = type_info.finder();
+    loop {
+        match iter.next() {
+            Ok(Some(item)) => {
+                if let Ok(TypeData::Class(ref c)) = item.parse() {
+                    let name_bytes = c.name.as_bytes();
+                    if wanted.contains(&name_bytes) && !struct_fields.contains_key(name_bytes) {
+                        // c.fields is None for forward declarations (struct
+                        // declared but not defined). We need the real FieldList.
+                        if let Some(fields) = c.fields {
+                            struct_fields.insert(name_bytes, fields);
+                        }
+                    }
                 }
+                finder.update(&iter);
+            }
+            Ok(None) => break,           // drained — finder now covers all types
+            Err(_) => {
+                // Skip malformed item but still advance the finder position map.
+                finder.update(&iter);
+                continue;
             }
         }
     }
 
-    let finder = type_info.finder();
+    // `finder` was built incrementally during the drain loop above (each
+    // iter.next() + finder.update). Do NOT re-create it here — a fresh
+    // type_info.finder() is empty and can't resolve forward-referenced
+    // FieldList indices.
     let mut offsets = BTreeMap::new();
 
     // ---- EPROCESS field offsets ----
@@ -370,21 +387,22 @@ fn map_eprocess_field(name: &str) -> Option<&'static str> {
 /// Format a PDB GUID into the symbol-server path convention.
 /// Input: "01234567-89AB-CDEF-0123-456789ABCDEF" (PE debug dir GUID).
 /// Output: "67452301ABEFCD0123456789ABCDEFXXXXXXXX" (byte-swapped + age hex).
+/// Format a PDB GUID + age into the MS symbol-server path component.
+///
+/// Verified format against the live symbol server (Server 2019 ntoskrnl):
+/// the path is `<GUID_no_dashes><age_lowercase_hex_no_padding>`. The GUID is
+/// the **standard Win32 GUID string** (mixed-endian: Data1/Data2/Data3 in the
+/// endianness they appear in the GUID string, i.e. big-endian hex after the
+/// PE little-endian bytes were read by BitConverter). NO byte-swapping here —
+/// the input is already the canonical GUID string form.
+///
+/// Example: GUID "B02B8B6B-1856-8873-0845-5D5FCCAC7A8B", age 1
+///        → "B02B8B6B1856887308455D5FCCAC7A8B1"
+/// URL: msdl/symbols/ntkrnlmp.pdb/<that>/ntkrnlmp.pdb → HTTP 302 (found).
 fn format_symserver_guid(guid: &str, age: u32) -> String {
     let hex: String = guid.chars().filter(|c| *c != '-').collect();
-    let mut bytes = [0u8; 16];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        if i < 16 {
-            bytes[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or("00"), 16).unwrap_or(0);
-        }
-    }
-    let mut out = String::new();
-    for &b in bytes[0..4].iter().rev() { out.push_str(&format!("{:02X}", b)); }
-    for &b in bytes[4..6].iter().rev() { out.push_str(&format!("{:02X}", b)); }
-    for &b in bytes[6..8].iter().rev() { out.push_str(&format!("{:02X}", b)); }
-    for &b in &bytes[8..16] { out.push_str(&format!("{:02X}", b)); }
-    out.push_str(&format!("{:08X}", age));
-    out
+    // age as lowercase hex, NO zero-padding (symbol server rejects 00000001).
+    format!("{}{:x}", hex, age)
 }
 
 /// Download `ntkrnlmp.pdb` (or any PDB) from the MS symbol server given its

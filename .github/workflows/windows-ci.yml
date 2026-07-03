@@ -92,7 +92,6 @@ jobs:
       # ---- 3. Live PDB offset resolution (ground-truth verification) ----
       - name: "Live PDB offset resolution (runner's own kernel)"
         shell: pwsh
-        continue-on-error: true   # PDB GUID extraction is fragile across runner images; don't gate CI on it
         run: |
           # Extract the PDB GUID from the runner's live ntoskrnl.exe, download
           # the matching PDB from MS symbol server, parse it with our resolver.
@@ -130,12 +129,22 @@ jobs:
           $guid = $null; $age = 0
           for ($i=0; $i -lt ($ddSize/28); $i++) {
             $e = $ddOff + $i*28
-            if ([BitConverter]::ToInt32($b,$e+12) -eq 6) {
+            # IMAGE_DEBUG_TYPE_CODEVIEW = 2 (NOT 6 — that was the bug). The
+            # data at PointerToRawData starts with "RSDS" + 16-byte GUID + age.
+            if ([BitConverter]::ToInt32($b,$e+12) -eq 2) {
               $cv = [BitConverter]::ToInt32($b,$e+24)
               if ($cv -le 0) { $cv = Resolve-FileOffset ([BitConverter]::ToInt32($b,$e+20)) }
               if ($b[$cv] -eq 0x52 -and $b[$cv+1] -eq 0x53 -and $b[$cv+2] -eq 0x44 -and $b[$cv+3] -eq 0x53) {
-                $g = [Guid]::new($b,$cv+4)
-                $guid = $g.ToString("N").ToUpper()
+                # Build the standard GUID hex (mixed-endian, no dashes) from the
+                # PE little-endian bytes via BitConverter. PowerShell 5.1 lacks
+                # [Guid]::new(byte[],int), so format each field manually. This
+                # matches offset-resolver's format_symserver_guid input format
+                # and was verified end-to-end on 17763.1339.
+                $d1 = [BitConverter]::ToUInt32($b,$cv+4)
+                $d2 = [BitConverter]::ToUInt16($b,$cv+8)
+                $d3 = [BitConverter]::ToUInt16($b,$cv+10)
+                $guid = ("{0:X8}{1:X4}{2:X4}" -f $d1,$d2,$d3)
+                for ($j=12; $j -lt 20; $j++) { $guid += ("{0:X2}" -f $b[$cv+$j]) }
                 $age = [BitConverter]::ToInt32($b,$cv+20)
                 break
               }
