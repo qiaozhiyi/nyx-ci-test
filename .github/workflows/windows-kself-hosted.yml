@@ -59,71 +59,23 @@ jobs:
           echo BUILD_OK
 
       - name: "Live PDB offset resolution (17763 ground truth)"
-        shell: powershell
+        shell: cmd
         run: |
-          # FIRST line: suppress PS 5.1's NativeCommandError (it reinterprets
-          # any native command's stderr as a terminating error). Must be set
-          # INSIDE the script — the env var ERRORACTIONPREFERENCE is ignored.
-          $ErrorActionPreference = 'Continue'
-          # Extract the PDB GUID from this host's ntoskrnl.exe, download the
-          # matching PDB from MS symbol server, parse with offset-resolver.
-          # Verifies the multi-version adapter resolves the correct offsets for
-          # THIS exact build+LCU (17763.1339 → ProviderEnableInfo @ 0x060).
-          $resolver = "crates/offset-resolver/target/debug/nyx-offset-resolver.exe"
-          $script:bytes = [IO.File]::ReadAllBytes("C:\Windows\System32\ntoskrnl.exe")
-          $script:pe = [BitConverter]::ToInt32($script:bytes, 0x3C)
-          $script:numSec = [BitConverter]::ToUInt16($script:bytes, $script:pe + 6)
-          $script:optSz = [BitConverter]::ToUInt16($script:bytes, $script:pe + 20)
-          $script:secStart = $script:pe + 24 + $script:optSz
-          function Resolve-FileOffset($rva) {
-            for ($i=0; $i -lt $script:numSec; $i++) {
-              $s = $script:secStart + $i*40
-              $va = [BitConverter]::ToInt32($script:bytes, $s+12)
-              $vs = [BitConverter]::ToInt32($script:bytes, $s+8)
-              $pr = [BitConverter]::ToInt32($script:bytes, $s+20)
-              if ($rva -ge $va -and $rva -lt ($va+$vs)) { return $pr + ($rva - $va) }
-            }
-            return $rva
-          }
-          $ddVA = [BitConverter]::ToInt32($script:bytes, $script:pe + 24 + 0xA0)
-          $ddSize = [BitConverter]::ToInt32($script:bytes, $script:pe + 24 + 0xA4)
-          $ddOff = Resolve-FileOffset $ddVA
-          $guid = $null; $age = 0
-          for ($i=0; $i -lt ($ddSize/28); $i++) {
-            $e = $ddOff + $i*28
-            # IMAGE_DEBUG_TYPE_CODEVIEW = 2 (verified — NOT 6)
-            if ([BitConverter]::ToInt32($script:bytes, $e+12) -eq 2) {
-              $cv = [BitConverter]::ToInt32($script:bytes, $e+24)
-              if ($cv -le 0) { $cv = Resolve-FileOffset ([BitConverter]::ToInt32($script:bytes, $e+20)) }
-              if ($script:bytes[$cv] -eq 0x52 -and $script:bytes[$cv+1] -eq 0x53 -and $script:bytes[$cv+2] -eq 0x44 -and $script:bytes[$cv+3] -eq 0x53) {
-                $d1 = [BitConverter]::ToUInt32($script:bytes, $cv+4)
-                $d2 = [BitConverter]::ToUInt16($script:bytes, $cv+8)
-                $d3 = [BitConverter]::ToUInt16($script:bytes, $cv+10)
-                $guid = ("{0:X8}{1:X4}{2:X4}" -f $d1,$d2,$d3)
-                for ($j=12; $j -lt 20; $j++) { $guid += ("{0:X2}" -f $script:bytes[$cv+$j]) }
-                $age = [BitConverter]::ToInt32($script:bytes, $cv+20)
-                break
-              }
-            }
-          }
-          if (-not $guid) { Write-Host "::error::could not extract PDB GUID"; exit 1 }
-          Write-Host "Live ntoskrnl PDB: GUID=$guid AGE=$age"
-          & $resolver --guid $guid --age $age --out offsets_17763_live.toml 2>&1
-          Get-Content offsets_17763_live.toml
+          REM One-shot: offset-resolver reads the live ntoskrnl.exe's PE debug
+          REM dir (goblin), downloads the matching PDB from MS symbol server,
+          REM parses EPROCESS + ETW-TI 4-hop chain offsets. No PowerShell PE
+          REM walker — that ate 5 CI iterations on PS 5.1 NativeCommandError.
+          crates\offset-resolver\target\debug\nyx-offset-resolver.exe --ntoskrnl C:\Windows\System32\ntoskrnl.exe --out offsets_17763_live.toml
+          type offsets_17763_live.toml
 
       - name: "Kernel bootstrap via KslD (Living off the Defender)"
-        shell: powershell
-        env:
-          ERRORACTIONPREFERENCE: 'Continue'
+        shell: cmd
         continue-on-error: true   # KslD IOCTL may differ by Defender engine version
         run: |
-          # bootstrap_chain defaults to KslD first (no --byovd → no driver load).
-          # It opens the MpKsl device, gets a KernelRw, resolves offsets, and
-          # (if we wire a subcommand) can blind ETW-TI. Here we just confirm
-          # the bootstrap succeeds — the KslD path works on this host.
-          $exe = "crates/operator-kernel-cli/target/release/nyx-kernel.exe"
-          cmd /c "$exe bootstrap 2>&1"
-          Write-Host "BOOTSTRAP_EXIT=$LASTEXITCODE"
+          REM bootstrap_chain defaults to KslD first (no --byovd = no driver load).
+          REM It opens the MpKsl device, gets a KernelRw, resolves offsets.
+          crates\operator-kernel-cli\target\release\nyx-kernel.exe bootstrap
+          echo BOOTSTRAP_EXIT=%ERRORLEVEL%
 
       - name: Upload artifacts
         if: always()

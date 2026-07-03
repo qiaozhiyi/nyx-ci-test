@@ -46,6 +46,7 @@ fn main() -> Result<()> {
     let mut age: Option<u32> = None;
     let mut out: PathBuf = PathBuf::from("offsets.toml");
     let mut build: Option<u32> = None;
+    let mut ntoskrnl: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -54,21 +55,41 @@ fn main() -> Result<()> {
             "--guid" => { i += 1; guid = Some(args[i].clone()); }
             "--age" => { i += 1; age = Some(args[i].parse()?); }
             "--build" => { i += 1; build = Some(args[i].parse()?); }
+            "--ntoskrnl" => { i += 1; ntoskrnl = Some(PathBuf::from(&args[i])); }
             "--out" => { i += 1; out = PathBuf::from(&args[i]); }
             "--help" | "-h" => {
                 eprintln!(
-                    "Usage: nyx-offset-resolver --pdb-path <file> | --guid <hex> --age <n> | --build <num> [--out offsets.toml]\n\
+                    "Usage: nyx-offset-resolver <source> [--out offsets.toml]\n\
                      \n\
-                     --build <num>   Use the known offsets for Windows build <num> (e.g. 22621).\n\
-                     --pdb-path <f>  Parse a local ntoskrnl.pdb (full PDB walker).\n\
-                     --guid + --age Download ntkrnlmp.pdb from the MS symbol server\n\
-                                     and parse real offsets from it (works on unknown builds)."
+                     Source (one of):\n\
+                     \n\
+                     --ntoskrnl <exe>  Extract PDB GUID+age from a live ntoskrnl.exe's PE\n\
+                                       debug directory (CodeView entry), download the matching\n\
+                                       PDB from MS symbol server, parse real offsets. This is\n\
+                                       the one-shot mode for CI: point it at C:\\Windows\\System32\\\n\
+                                       ntoskrnl.exe and it does everything. No PowerShell needed.\n\
+                     --guid <hex> --age <n>\n\
+                                       Download by explicit GUID+age (hex GUID, no dashes).\n\
+                     --pdb-path <file> Parse a local ntoskrnl.pdb you already have.\n\
+                     --build <num>     Use the known offsets table for build <num> (no PDB).\n\
+                     \n\
+                     --out <file>      Write offsets here (default: offsets.toml)."
                 );
                 return Ok(());
             }
             _ => {}
         }
         i += 1;
+    }
+
+    // --ntoskrnl: extract GUID+age from the PE, then behave as --guid/--age.
+    if let Some(nk_path) = &ntoskrnl {
+        let (nk_guid, nk_age) = extract_pdb_ref_from_pe(nk_path)
+            .with_context(|| format!("extract PDB ref from {}", nk_path.display()))?;
+        eprintln!("Extracted from {}: GUID={nk_guid} AGE={nk_age}", nk_path.display());
+        guid = Some(nk_guid);
+        // If --build wasn't given, we'll auto-detect from the downloaded PDB below.
+        if age.is_none() { age = Some(nk_age); }
     }
 
     // Determine the build number: from --build, or extract from the PDB.
@@ -403,6 +424,47 @@ fn format_symserver_guid(guid: &str, age: u32) -> String {
     let hex: String = guid.chars().filter(|c| *c != '-').collect();
     // age as lowercase hex, NO zero-padding (symbol server rejects 00000001).
     format!("{}{:x}", hex, age)
+}
+
+/// Extract the PDB GUID + age from a PE file's CodeView debug directory entry.
+///
+/// Replaces the fragile PowerShell PE-walker that PS 5.1's NativeCommandError
+/// kept eating in CI. Uses `goblin` to parse the PE, walks the debug directory
+/// for `IMAGE_DEBUG_TYPE_CODEVIEW` (= 2), reads the RSDS record (sig "RSDS" +
+/// 16-byte GUID + 4-byte age).
+///
+/// Returns `(guid_no_dashes, age)` where the GUID is the canonical mixed-endian
+/// hex form `format_symserver_guid` expects (Data1/Data2/Data3 big-endian after
+/// BitConverter read, Data4 raw). Verified end-to-end against the live MS
+/// symbol server for 17763.1339 (GUID B02B8B6B-1856-8873-..., age 1).
+fn extract_pdb_ref_from_pe(exe_path: &std::path::Path) -> Result<(String, u32)> {
+    let bytes = std::fs::read(exe_path)
+        .with_context(|| format!("read PE {}", exe_path.display()))?;
+    let pe = goblin::pe::PE::parse(&bytes)
+        .with_context(|| format!("parse PE {}", exe_path.display()))?;
+
+    // goblin parses the CodeView debug entry for us: codeview_pdb70_debug_info
+    // holds the RSDS record's GUID (16 raw LE bytes) + age. We just format it
+    // into the canonical mixed-endian hex string format_symserver_guid expects.
+    let debug_data = pe.debug_data
+        .ok_or_else(|| anyhow::anyhow!("PE has no debug data directory"))?;
+    let cv70 = debug_data.codeview_pdb70_debug_info
+        .ok_or_else(|| anyhow::anyhow!("PE has no PDB 7.0 (RSDS) CodeView entry"))?;
+
+    // signature is a [u8; 16] Win32 GUID in little-endian layout:
+    //   Data1(u32 LE) | Data2(u16 LE) | Data3(u16 LE) | Data4(8 bytes)
+    // The canonical GUID string form renders Data1/2/3 as big-endian hex after
+    // reading the LE bytes, and Data4 as raw hex. That's what we build here.
+    let s = cv70.signature;
+    let d1 = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+    let d2 = u16::from_le_bytes([s[4], s[5]]);
+    let d3 = u16::from_le_bytes([s[6], s[7]]);
+    let guid = format!(
+        "{:08X}{:04X}{:04X}{}",
+        d1, d2, d3,
+        s[8..16].iter().map(|b| format!("{:02X}", b)).collect::<String>()
+    );
+    Ok((guid, cv70.age))
 }
 
 /// Download `ntkrnlmp.pdb` (or any PDB) from the MS symbol server given its
