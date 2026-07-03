@@ -167,7 +167,10 @@ jobs:
           # inside the script (PowerShell accepts both there). The mixed
           # 'C:/.../dir\file.ps1' form was rejected as an invalid path.
           PS_PATH="${RUN_DIR//\//\\}\\build_and_test.ps1"
-          ssh win "powershell -NoProfile -ExecutionPolicy Bypass -File '$PS_PATH' -RunDir '$RUN_DIR' -Sha '$SHA'" 2>&1 | tee byovd_output.txt
+          # NOTE: powershell -File does NOT accept quotes around the path (it
+          # treats 'C:\...' literally, including the quote char, and rejects
+          # it). The path has no spaces, so unquoted is correct + required.
+          ssh win "powershell -NoProfile -ExecutionPolicy Bypass -File $PS_PATH -RunDir '$RUN_DIR' -Sha '$SHA'" 2>&1 | tee byovd_output.txt
           grep -q "BUILD_DONE" byovd_output.txt || { echo "::error::build failed on host (see byovd_output.txt)"; exit 1; }
 
       - name: Collect + cleanup
