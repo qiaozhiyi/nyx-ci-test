@@ -34,18 +34,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust + windows-gnu target
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-gnu
-
-      - name: Cross-compile (windows-gnu)
-        run: |
-          cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml --target x86_64-pc-windows-gnu 2>&1 | tail -3
-          cargo build --manifest-path crates/offset-resolver/Cargo.toml --target x86_64-pc-windows-gnu 2>&1 | tail -3
-          test -f crates/operator-kernel-cli/target/x86_64-pc-windows-gnu/release/nyx-kernel.exe
-          test -f crates/offset-resolver/target/x86_64-pc-windows-gnu/debug/nyx-offset-resolver.exe
-
       - name: Setup SSH tunnel
         env:
           WIN_SSH_KEY: ${{ secrets.WIN_SSH_KEY }}
@@ -68,44 +56,86 @@ jobs:
           EOF
           ssh win 'echo TUNNEL_OK' || { echo "::error::SSH tunnel failed"; exit 1; }
 
-      - name: Write test script (avoids nested-escaping)
+      - name: Build + test on the physical host (local MSVC, no cross-compile)
         run: |
-          # The runner script is parameterized by $env:RUN_DIR. scp'd to the
-          # server and invoked via `powershell -File`, so no SSH escaping hell.
+          # The host has git + cargo nightly + MSVC already. We git-fetch the
+          # exact commit being tested into a fresh worktree (not the C:\nyx
+          # checkout — that's the host's own scratch copy, not ours to mutate),
+          # build with MSVC, and run the kernel chain. All state is scoped to
+          # the run dir and cleaned at the end.
+          RUN_DIR="C:/Users/Administrator/nyx_run_${{ github.run_id }}"
+          SHA="${{ github.sha }}"
+          echo "RUN_DIR=$RUN_DIR" >> $GITHUB_ENV
+          ssh win "powershell -NoProfile -ExecutionPolicy Bypass -Command \"
+            \$ErrorActionPreference='Stop';
+            \$run='$RUN_DIR';
+            \$sha='$SHA';
+            New-Item -ItemType Directory -Force -Path \\\$run | Out-Null;
+
+            # Clone the repo at the tested SHA (shallow + exact rev — fast).
+            git clone --depth 1 --no-checkout https://github.com/qiaozhiyi/NY \\\$run\\src 2>&1 | Select-Object -Last 2;
+            Push-Location \\\$run\\src;
+            git checkout \\\$sha 2>&1 | Select-Object -Last 2;
+
+            # Build with MSVC (the host's default toolchain). operator-kernel-cli
+            # + offset-resolver. Full output — never pipe to Select-Object, so
+            # compile errors are visible in the log.
+            Write-Output '=== build operator-kernel-cli ===';
+            cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml 2>&1;
+            Write-Output '=== build offset-resolver ===';
+            cargo build --manifest-path crates/offset-resolver/Cargo.toml 2>&1;
+
+            Copy-Item crates/operator-kernel-cli/target/release/nyx-kernel.exe \\\$run\\;
+            Copy-Item crates/offset-resolver/target/debug/nyx-offset-resolver.exe \\\$run\\;
+            Pop-Location;
+            Write-Output BUILD_DONE
+          \"" 2>&1 | tee build.log
+          # If the build failed, abort before the destructive kernel test.
+          grep -q "BUILD_DONE" build.log || { echo "::error::build failed on host"; exit 1; }
+
+      - name: Run kernel test (PDB resolve + BYOVD chain)
+        continue-on-error: true
+        run: |
+          # The test script is written locally (clean heredoc, no SSH escaping)
+          # and scp'd to the host, then invoked via powershell -File.
           cat > run_byovd.ps1 <<'PSEOF'
           param([string]$RunDir)
           $ErrorActionPreference = 'Continue'
-          $exe       = "$RunDir\nyx-kernel.exe"
-          $resolver  = "$RunDir\nyx-offset-resolver.exe"
-          $sys       = "C:\Users\Administrator\RTCore64.sys"
+          $exe      = "$RunDir\nyx-kernel.exe"
+          $resolver = "$RunDir\nyx-offset-resolver.exe"
+          $sys      = "C:\Users\Administrator\RTCore64.sys"
 
-          # --- 1. Live PDB offset resolution (17763.1339) ---
+          # --- 1. Live PDB offset resolution (build 17763.1339) ---
+          # $script: scoping so Resolve-FileOffset can see the byte array +
+          # section table (PowerShell functions don't inherit caller locals).
           Write-Output "=== PDB resolve (17763) ==="
-          $b = [IO.File]::ReadAllBytes("C:\Windows\System32\ntoskrnl.exe")
-          $pe = [BitConverter]::ToInt32($b, 0x3C)
-          $ddVA = [BitConverter]::ToInt32($b, $pe + 24 + 0xA0)
-          $ddSize = [BitConverter]::ToInt32($b, $pe + 24 + 0xA4)
-          $numSec = [BitConverter]::ToUInt16($b, $pe + 6)
-          $optSz = [BitConverter]::ToUInt16($b, $pe + 20)
-          $secStart = $pe + 24 + $optSz
-          function R2F($rva) {
-            for ($i=0; $i -lt $numSec; $i++) {
-              $s = $secStart + $i*40
-              $va = [BitConverter]::ToInt32($b, $s+12); $vs = [BitConverter]::ToInt32($b, $s+8); $pr = [BitConverter]::ToInt32($b, $s+20)
+          $script:bytes = [IO.File]::ReadAllBytes("C:\Windows\System32\ntoskrnl.exe")
+          $script:pe = [BitConverter]::ToInt32($script:bytes, 0x3C)
+          $script:numSec = [BitConverter]::ToUInt16($script:bytes, $script:pe + 6)
+          $script:optSz = [BitConverter]::ToUInt16($script:bytes, $script:pe + 20)
+          $script:secStart = $script:pe + 24 + $script:optSz
+          function Resolve-FileOffset($rva) {
+            for ($i=0; $i -lt $script:numSec; $i++) {
+              $s = $script:secStart + $i*40
+              $va = [BitConverter]::ToInt32($script:bytes, $s+12)
+              $vs = [BitConverter]::ToInt32($script:bytes, $s+8)
+              $pr = [BitConverter]::ToInt32($script:bytes, $s+20)
               if ($rva -ge $va -and $rva -lt ($va+$vs)) { return $pr + ($rva - $va) }
             }
             return $rva
           }
-          $ddOff = R2F $ddVA
+          $ddVA = [BitConverter]::ToInt32($script:bytes, $script:pe + 24 + 0xA0)
+          $ddSize = [BitConverter]::ToInt32($script:bytes, $script:pe + 24 + 0xA4)
+          $ddOff = Resolve-FileOffset $ddVA
           for ($i=0; $i -lt ($ddSize/28); $i++) {
             $e = $ddOff + $i*28
-            if ([BitConverter]::ToInt32($b, $e+12) -eq 6) {
-              $cv = [BitConverter]::ToInt32($b, $e+24)
-              if ($cv -le 0) { $cv = R2F ([BitConverter]::ToInt32($b, $e+20)) }
-              if ($b[$cv] -eq 0x52 -and $b[$cv+1] -eq 0x53 -and $b[$cv+2] -eq 0x44 -and $b[$cv+3] -eq 0x53) {
-                $g = [Guid]::new($b, $cv+4)
+            if ([BitConverter]::ToInt32($script:bytes, $e+12) -eq 6) {
+              $cv = [BitConverter]::ToInt32($script:bytes, $e+24)
+              if ($cv -le 0) { $cv = Resolve-FileOffset ([BitConverter]::ToInt32($script:bytes, $e+20)) }
+              if ($script:bytes[$cv] -eq 0x52 -and $script:bytes[$cv+1] -eq 0x53 -and $script:bytes[$cv+2] -eq 0x44 -and $script:bytes[$cv+3] -eq 0x53) {
+                $g = [Guid]::new($script:bytes, $cv+4)
                 $guid = $g.ToString('N').ToUpper()
-                $age = [BitConverter]::ToInt32($b, $cv+20)
+                $age = [BitConverter]::ToInt32($script:bytes, $cv+20)
                 Write-Output "GUID=$guid AGE=$age"
                 & $resolver --guid $guid --age $age --out "$RunDir\offsets_17763.toml" 2>&1 | Select-Object -Last 8
                 break
@@ -125,21 +155,11 @@ jobs:
             & $exe bootstrap --byovd $sys RTCore64 2>&1 | Tee-Object "$RunDir\kernel.log"
             Write-Output "KERNEL_EXIT=$LASTEXITCODE"
           } else {
-            Write-Output "SKIP: $sys not staged (stage RTCore64.sys on the host to enable BYOVD)"
+            Write-Output "SKIP: $sys not staged on host"
           }
           PSEOF
 
-      - name: Stage binaries + script on server
-        run: |
-          RUN_DIR="C:/Users/Administrator/nyx_run_${{ github.run_id }}"
-          ssh win "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path '$RUN_DIR' | Out-Null\""
-          scp crates/operator-kernel-cli/target/x86_64-pc-windows-gnu/release/nyx-kernel.exe win:"$RUN_DIR/"
-          scp crates/offset-resolver/target/x86_64-pc-windows-gnu/debug/nyx-offset-resolver.exe win:"$RUN_DIR/"
           scp run_byovd.ps1 win:"$RUN_DIR/"
-          echo "RUN_DIR=$RUN_DIR" >> $GITHUB_ENV
-
-      - name: Run kernel test (SSH, -File so no escaping)
-        run: |
           ssh win "powershell -NoProfile -ExecutionPolicy Bypass -File '$RUN_DIR\run_byovd.ps1' -RunDir '$RUN_DIR'" 2>&1 | tee byovd_output.txt
 
       - name: Collect + cleanup
@@ -148,6 +168,7 @@ jobs:
           scp win:"$RUN_DIR/offsets_17763.toml" ./offsets_17763.toml 2>/dev/null || true
           scp win:"$RUN_DIR/kernel.log" ./kernel.log 2>/dev/null || true
           cat byovd_output.txt 2>/dev/null || true
+          # Remove the entire run-scoped dir (src clone + binaries + logs).
           ssh win "powershell -NoProfile -Command \"Remove-Item -Recurse -Force '$RUN_DIR' -ErrorAction SilentlyContinue\"" 2>/dev/null || true
 
       - name: Upload artifacts
@@ -156,6 +177,7 @@ jobs:
         with:
           name: byovd-${{ github.run_id }}
           path: |
+            build.log
             byovd_output.txt
             offsets_17763.toml
             kernel.log

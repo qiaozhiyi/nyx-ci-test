@@ -44,7 +44,8 @@ jobs:
       - name: Build implant DLL (nightly)
         shell: pwsh
         run: |
-          cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1 | Select-Object -Last 8
+          # Full output — never pipe to Select-Object, so compile errors show.
+          cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1
           $dll = "crates/implant-win/target/x86_64-pc-windows-msvc/release/nyx_implant_win.dll"
           if (-not (Test-Path $dll)) { Write-Host "::error::implant DLL build failed"; exit 1 }
           Write-Host "DLL OK: $((Get-Item $dll).Length) bytes"
@@ -52,8 +53,8 @@ jobs:
       - name: Build operator CLI + offset-resolver (stable)
         shell: pwsh
         run: |
-          cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml 2>&1 | Select-Object -Last 3
-          cargo build --manifest-path crates/offset-resolver/Cargo.toml 2>&1 | Select-Object -Last 3
+          cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml 2>&1
+          cargo build --manifest-path crates/offset-resolver/Cargo.toml 2>&1
           Write-Host "CLI + resolver built"
 
       # ---- 2. User-mode selftests on this kernel (build 26100) ----
@@ -61,10 +62,13 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: |
-          # Build 26100 (Win11 24H2 / Server 2025). GitHub runners run as a
-          # limited user without full admin — some selftests may TIMEOUT or
-          # exit 0 when a privileged API refuses. That's expected here; the
-          # BYOVD workflow covers the full-pass case.
+          # Build 26100 (Win11 24H2 / Server 2025). The implant's anti-sandbox
+          # suite (envprobe + antidebug) correctly flags the GitHub runner as a
+          # VM/sandbox, so we set NYX_SKIP_SANDBOX=1 to bypass that gate and let
+          # the selftests actually execute. Without it the DLL aborts → TIMEOUT.
+          # Even so, the limited (non-admin) token means some privileged APIs
+          # will refuse; the BYOVD workflow covers the full-pass case.
+          $env:NYX_SKIP_SANDBOX = "1"
           $dll = "crates/implant-win/target/x86_64-pc-windows-msvc/release/nyx_implant_win.dll"
           $dllDir = Split-Path $dll
           $tests = @(
@@ -97,25 +101,41 @@ jobs:
           $resolver = "crates/offset-resolver/target/debug/nyx-offset-resolver.exe"
           if (-not (Test-Path $resolver)) { Write-Host "::error::resolver missing"; exit 1 }
 
+          # --- Extract the PDB GUID + age from the PE debug directory ---
+          # NOTE: the RVA→file-offset helper uses $script: scoping so the inner
+          # function can see the outer byte array + section table. A plain
+          # `function R2F` would NOT close over $b/$numSec/$secStart (PowerShell
+          # functions don't inherit caller locals by default), which was the
+          # bug that caused "could not extract PDB GUID" on the first run.
           $b = [IO.File]::ReadAllBytes("C:\Windows\System32\ntoskrnl.exe")
-          $pe = [BitConverter]::ToInt32($b,0x3C)
-          $ddVA = [BitConverter]::ToInt32($b,$pe+24+0xA0)
-          $ddSize = [BitConverter]::ToInt32($b,$pe+24+0xA4)
-          $numSec = [BitConverter]::ToUInt16($b,$pe+6)
-          $optSz = [BitConverter]::ToUInt16($b,$pe+20)
-          $secStart = $pe+24+$optSz
-          function R2F($rva){ for($i=0;$i -lt $numSec;$i++){ $s=$secStart+$i*40; $va=[BitConverter]::ToInt32($b,$s+12); $vs=[BitConverter]::ToInt32($b,$s+8); $pr=[BitConverter]::ToInt32($b,$s+20); if($rva -ge $va -and $rva -lt ($va+$vs)){ return $pr+($rva-$va) } }; return $rva }
-          $ddOff = R2F $ddVA
+          $script:bytes = $b
+          $script:pe = [BitConverter]::ToInt32($b,0x3C)
+          $script:numSec = [BitConverter]::ToUInt16($b,$script:pe+6)
+          $script:optSz = [BitConverter]::ToUInt16($b,$script:pe+20)
+          $script:secStart = $script:pe + 24 + $script:optSz
+          function Resolve-FileOffset($rva) {
+            for ($i=0; $i -lt $script:numSec; $i++) {
+              $s = $script:secStart + $i*40
+              $va = [BitConverter]::ToInt32($script:bytes,$s+12)
+              $vs = [BitConverter]::ToInt32($script:bytes,$s+8)
+              $pr = [BitConverter]::ToInt32($script:bytes,$s+20)
+              if ($rva -ge $va -and $rva -lt ($va+$vs)) { return $pr + ($rva - $va) }
+            }
+            return $rva
+          }
+          $ddVA = [BitConverter]::ToInt32($b,$script:pe+24+0xA0)
+          $ddSize = [BitConverter]::ToInt32($b,$script:pe+24+0xA4)
+          $ddOff = Resolve-FileOffset $ddVA
           $guid = $null; $age = 0
-          for($i=0;$i -lt ($ddSize/28);$i++){
-            $e=$ddOff+$i*28
-            if([BitConverter]::ToInt32($b,$e+12) -eq 6){
-              $cv=[BitConverter]::ToInt32($b,$e+24)
-              if($cv -le 0){$cv=R2F([BitConverter]::ToInt32($b,$e+20))}
-              if($b[$cv] -eq 0x52 -and $b[$cv+1] -eq 0x53 -and $b[$cv+2] -eq 0x44 -and $b[$cv+3] -eq 0x53){
-                $g=[Guid]::new($b,$cv+4)
-                $guid=$g.ToString("N").ToUpper()
-                $age=[BitConverter]::ToInt32($b,$cv+20)
+          for ($i=0; $i -lt ($ddSize/28); $i++) {
+            $e = $ddOff + $i*28
+            if ([BitConverter]::ToInt32($b,$e+12) -eq 6) {
+              $cv = [BitConverter]::ToInt32($b,$e+24)
+              if ($cv -le 0) { $cv = Resolve-FileOffset ([BitConverter]::ToInt32($b,$e+20)) }
+              if ($b[$cv] -eq 0x52 -and $b[$cv+1] -eq 0x53 -and $b[$cv+2] -eq 0x44 -and $b[$cv+3] -eq 0x53) {
+                $g = [Guid]::new($b,$cv+4)
+                $guid = $g.ToString("N").ToUpper()
+                $age = [BitConverter]::ToInt32($b,$cv+20)
                 break
               }
             }
@@ -123,12 +143,10 @@ jobs:
           if (-not $guid) { Write-Host "::error::could not extract PDB GUID"; exit 1 }
           Write-Host "Live ntoskrnl PDB: GUID=$guid AGE=$age"
 
-          & $resolver --guid $guid --age $age --out offsets_live.toml 2>&1 | Select-Object -Last 12
+          & $resolver --guid $guid --age $age --out offsets_live.toml 2>&1
           if (Test-Path offsets_live.toml) {
             Write-Host "=== Resolved offsets (live build 26100) ==="
             Get-Content offsets_live.toml
-            # The ETW-TI chain MUST resolve all 3 hops from the PDB. If
-            # provider_block_to_enable_info is missing, the PDB walker has a bug.
             $content = Get-Content offsets_live.toml -Raw
             if ($content -notmatch "etw_ti\.provider_block_to_enable_info") {
               Write-Host "::warning::ETW-TI ProviderEnableInfo offset missing — PDB walker issue"
