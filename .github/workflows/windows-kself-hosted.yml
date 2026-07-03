@@ -60,12 +60,11 @@ jobs:
 
       - name: "Live PDB offset resolution (17763 ground truth)"
         shell: powershell
-        env:
-          # PS 5.1 treats any native command's stderr output as a terminating
-          # error (NativeCommandError). offset-resolver writes progress to
-          # stderr. Continue-on-error so it doesn't abort the step.
-          ERRORACTIONPREFERENCE: 'Continue'
         run: |
+          # FIRST line: suppress PS 5.1's NativeCommandError (it reinterprets
+          # any native command's stderr as a terminating error). Must be set
+          # INSIDE the script — the env var ERRORACTIONPREFERENCE is ignored.
+          $ErrorActionPreference = 'Continue'
           # Extract the PDB GUID from this host's ntoskrnl.exe, download the
           # matching PDB from MS symbol server, parse with offset-resolver.
           # Verifies the multi-version adapter resolves the correct offsets for
