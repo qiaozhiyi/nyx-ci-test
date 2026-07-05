@@ -118,11 +118,11 @@ jobs:
           $driverDir = New-Item -ItemType Directory -Force -Path "target\drivers"
           $driverPath = Join-Path $driverDir.FullName "RTCore64.sys"
 
-          # Try multiple public mirrors (any one working is enough)
+          # Try multiple public mirrors (any one working is enough).
+          # Verified 2026-07-06: VoidSec raw URL returns 200 with valid MZ PE.
           $mirrors = @(
-            "https://github.com/BlackSnufkin/BYOVD/raw/main/DumpDrivers/RTCore64.sys",
-            "https://github.com/zer0condition/BYOVD/raw/main/VulnerableDrivers/RTCore64.sys",
-            "https://raw.githubusercontent.com/Al1ex/Red-Team-Infrastructure/master/BYOVD/RTCore64.sys"
+            "https://raw.githubusercontent.com/VoidSec/Exploit-Development/b82b6d3ac1cce66221101d3e0f4634aa64cb4ca7/windows/x64/kernel/RTCore64_MSI_Afterburner_v.4.6.4.16117/RTCore64.sys",
+            "https://github.com/VoidSec/Exploit-Development/raw/b82b6d3ac1cce66221101d3e0f4634aa64cb4ca7/windows/x64/kernel/RTCore64_MSI_Afterburner_v.4.6.4.16117/RTCore64.sys"
           )
           $got = $false
           foreach ($url in $mirrors) {
@@ -131,9 +131,18 @@ jobs:
               Invoke-WebRequest -Uri $url -OutFile $driverPath -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
               $sz = (Get-Item $driverPath).Length
               if ($sz -gt 10000) {
-                Write-Host "::notice::downloaded: $driverPath ($sz bytes)"
-                $got = $true
-                break
+                # Verify MZ PE magic before accepting.
+                $fs = [IO.File]::OpenRead($driverPath)
+                $b = New-Object byte[] 2
+                $fs.Read($b, 0, 2) | Out-Null
+                $fs.Close()
+                if ($b[0] -eq 0x4D -and $b[1] -eq 0x5A) {
+                  Write-Host "::notice::downloaded: $driverPath ($sz bytes, valid MZ)"
+                  $got = $true
+                  break
+                } else {
+                  Write-Host "  downloaded but NOT a valid PE (no MZ); trying next mirror"
+                }
               }
             } catch {
               Write-Host "  failed: $($_.Exception.Message)"
