@@ -331,6 +331,7 @@ fn channel_response_variants_roundtrip() {
 /// above depends on it being the precise backstop. Catch a future edit that
 /// silently shrinks (regress) or expands (DoS surface) the cap.
 #[test]
+#[allow(clippy::assertions_on_constants)]
 fn frame_max_ct_len_constant_matches_docs() {
     // 512 KiB — matches the README wire-format spec.
     assert_eq!(frame::MAX_CT_LEN, 512 * 1024);
@@ -343,9 +344,11 @@ fn frame_max_ct_len_constant_matches_docs() {
 
 /// `SessionKey` is a wrapped struct (not a bare `[u8;32]`) precisely so that
 /// `ZeroizeOnDrop` can be implemented. Verify the contract:
-///   1. construction round-trips through `as_bytes()`
-///   2. `Zeroize::zeroize()` actually clears the inner bytes in-place
-///   3. equality holds for two keys built from the same input
+///
+/// 1. construction round-trips through `as_bytes()`
+/// 2. `Zeroize::zeroize()` actually clears the inner bytes in-place
+/// 3. equality holds for two keys built from the same input
+///
 /// This is a defense-in-depth sanity check on the wrapper type — the security
 /// guarantee (drop zeroes memory) is provided by `ZeroizeOnDrop`, which we
 /// can't directly assert without `unsafe` reads of freed memory.
@@ -426,6 +429,7 @@ fn encode_frame_dir_panics_on_empty_plaintext() {
 /// MIN_CT_LEN constant pin — guards the lower bound against silent regressions.
 /// The upper bound is already pinned by `frame_max_ct_len_constant_matches_docs`.
 #[test]
+#[allow(clippy::assertions_on_constants)]
 fn frame_min_ct_len_constant_matches_docs() {
     // Must equal TAG_LEN + 1 — the smallest ciphertext that carries >=1 byte
     // of actual plaintext under ChaCha20-Poly1305.
