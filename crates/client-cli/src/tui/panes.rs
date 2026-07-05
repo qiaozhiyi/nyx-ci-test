@@ -151,9 +151,9 @@ impl Pane {
         match self {
             Pane::Leaf { id, session_id, .. } if *id == target => session_id.clone(),
             Pane::Leaf { .. } => None,
-            Pane::Split { children, .. } => {
-                children[0].get_session_id(target).or_else(|| children[1].get_session_id(target))
-            }
+            Pane::Split { children, .. } => children[0]
+                .get_session_id(target)
+                .or_else(|| children[1].get_session_id(target)),
         }
     }
 
@@ -697,7 +697,10 @@ mod tests {
         // 验证 layout 反映了比例变化：左块应该比之前宽。
         let full = Rect::new(0, 0, 80, 24);
         let layouts = p.layout(full);
-        let left = layouts.iter().find(|(id, _)| *id == nid).map(|(_, r)| r.width);
+        let left = layouts
+            .iter()
+            .find(|(id, _)| *id == nid)
+            .map(|(_, r)| r.width);
         // ratio +0.2 → 0.7，左块占 70% ≈ 56 列（0.5 时是 40）。
         assert!(left.unwrap_or(0) > 45, "左块应变宽");
     }

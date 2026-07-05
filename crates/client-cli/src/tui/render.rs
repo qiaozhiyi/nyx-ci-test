@@ -8,7 +8,9 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap,
+};
 
 use crate::theme;
 use crate::types::{arch_str, SessionView};
@@ -57,7 +59,15 @@ pub(super) fn render(app: &mut App, frame: &mut ratatui::Frame) {
         if is_focused {
             app.focused_pane_rect = *rect;
         }
-        render_pane(frame, app, *id, *rect, is_focused, *view, session_id.as_deref());
+        render_pane(
+            frame,
+            app,
+            *id,
+            *rect,
+            is_focused,
+            *view,
+            session_id.as_deref(),
+        );
     }
     render_input(frame, app, chunks[2]);
 
@@ -107,10 +117,7 @@ fn render_pane(
     // ---- 紧凑视图 tab：只画当前视图名 + ▾ 下拉指示 ----
     let tab_y = area.y;
     let tab_label = view.label();
-    let picker_open = app
-        .view_picker
-        .as_ref()
-        .is_some_and(|(pid, _)| *pid == id);
+    let picker_open = app.view_picker.as_ref().is_some_and(|(pid, _)| *pid == id);
     let arrow = if picker_open { "▴" } else { "▾" };
     let tab_text = format!(" {tab_label} {arrow} ");
     let tab_w = tab_text.chars().count() as u16;
@@ -129,7 +136,11 @@ fn render_pane(
     let mut tab_spans: Vec<Span> = vec![Span::styled(
         tab_text,
         Style::default()
-            .fg(if focused { theme::accent() } else { theme::text_color() })
+            .fg(if focused {
+                theme::accent()
+            } else {
+                theme::text_color()
+            })
             .bg(theme::surface1())
             .add_modifier(Modifier::BOLD),
     )];
@@ -188,19 +199,22 @@ fn render_stream_content(frame: &mut ratatui::Frame, app: &App, area: Rect, pane
     let target_session = pane_session.as_ref();
 
     // Filter stream: include global logs (None) and logs matching target_session (supporting prefix matching)
-    let pane_stream: Vec<&crate::rest::LogLine> = app.stream
+    let pane_stream: Vec<&crate::rest::LogLine> = app
+        .stream
         .iter()
-        .filter(|l| {
-            match (&l.session_id, target_session) {
-                (None, _) => true,
-                (Some(s1), Some(s2)) => s1 == s2 || s2.starts_with(s1) || s1.starts_with(s2),
-                (Some(_), None) => false,
-            }
+        .filter(|l| match (&l.session_id, target_session) {
+            (None, _) => true,
+            (Some(s1), Some(s2)) => s1 == s2 || s2.starts_with(s1) || s1.starts_with(s2),
+            (Some(_), None) => false,
         })
         .collect();
 
     // 使用该窗格自己的 scroll offset（独立滚动），不存在则用全局 stream_offset。
-    let scroll_offset = app.pane_scroll.get(&pane_id).copied().unwrap_or(app.stream_offset);
+    let scroll_offset = app
+        .pane_scroll
+        .get(&pane_id)
+        .copied()
+        .unwrap_or(app.stream_offset);
     let height = area.height as usize;
     let total = pane_stream.len();
     let end = total.saturating_sub(scroll_offset);
@@ -224,12 +238,7 @@ fn render_stream_content(frame: &mut ratatui::Frame, app: &App, area: Rect, pane
 
 /// 在窗格里渲染 session 列表。逐行渲染 + 记录 hit regions 支持点击切换。
 /// 当前选中的 session 行高亮（surface1 背景 + ▸ 标记），点击其他行切换 beacon。
-fn render_sessions_in_pane(
-    frame: &mut ratatui::Frame,
-    app: &mut App,
-    area: Rect,
-    pane_id: usize,
-) {
+fn render_sessions_in_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect, pane_id: usize) {
     if app.sessions.is_empty() {
         let para = Paragraph::new("· no beacons — waiting for sessions")
             .style(theme::faint())
@@ -290,10 +299,9 @@ fn render_sessions_in_pane(
             let content_len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
             let pad = (area.width as usize).saturating_sub(content_len);
             let mut full_line = line;
-            full_line.spans.push(Span::styled(
-                " ".repeat(pad),
-                Style::default().bg(sel_bg),
-            ));
+            full_line
+                .spans
+                .push(Span::styled(" ".repeat(pad), Style::default().bg(sel_bg)));
             frame.render_widget(Paragraph::new(full_line), row_rect);
         } else {
             frame.render_widget(Paragraph::new(line), row_rect);
@@ -427,11 +435,13 @@ fn render_borderless_table(
     rows: &[Vec<String>],
 ) {
     use ratatui::widgets::{Cell, Row, Table};
-    let header_row = Row::new(header.iter().map(|h| Cell::from(*h))).style(
-        Style::default()
-            .fg(theme::muted_color())
-            .add_modifier(Modifier::BOLD),
-    ).bottom_margin(1);
+    let header_row = Row::new(header.iter().map(|h| Cell::from(*h)))
+        .style(
+            Style::default()
+                .fg(theme::muted_color())
+                .add_modifier(Modifier::BOLD),
+        )
+        .bottom_margin(1);
     let data_rows: Vec<Row> = rows
         .iter()
         .map(|r| Row::new(r.iter().cloned().map(|c| Cell::new(c).style(theme::text()))))
@@ -557,10 +567,7 @@ fn render_input(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     } else {
         Paragraph::new(Line::from(vec![
             Span::styled(tag_text.clone(), theme::muted()),
-            Span::styled(
-                format!("❯ {display}"),
-                Style::default().fg(theme::accent()),
-            ),
+            Span::styled(format!("❯ {display}"), Style::default().fg(theme::accent())),
         ]))
         .style(theme::input_bg())
     };
@@ -678,7 +685,14 @@ fn render_view_picker(frame: &mut ratatui::Frame, app: &mut App) {
             let mark = if is_cur { "● " } else { "  " };
             ListItem::new(Line::from(vec![
                 Span::styled(mark, Style::default().fg(theme::accent())),
-                Span::styled(v.label(), if is_cur { theme::brand() } else { theme::text() }),
+                Span::styled(
+                    v.label(),
+                    if is_cur {
+                        theme::brand()
+                    } else {
+                        theme::text()
+                    },
+                ),
             ]))
         })
         .collect();

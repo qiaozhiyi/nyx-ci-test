@@ -98,8 +98,8 @@ pub(super) struct App {
     bridge: Bridge,
     pub(super) connected: bool,
     pub(super) sessions: Vec<SessionView>,
-    pub(super) stream: Vec<LogLine>,    // event log
-    pub(super) stream_offset: usize,    // for scrolling (0 = bottom)
+    pub(super) stream: Vec<LogLine>, // event log
+    pub(super) stream_offset: usize, // for scrolling (0 = bottom)
     /// 每个 Console 窗格独立的滚动偏移量（0 = pinned to bottom）。
     /// 键为窗格 id；不存在则退回到 stream_offset（全局 fallback，兼容旧逻辑）。
     pub(super) pane_scroll: HashMap<usize, usize>,
@@ -266,7 +266,8 @@ impl App {
                 // keep selection valid
                 if self.pane_tree.get_session_id(self.focused_pane).is_none() {
                     if let Some(first) = snap.sessions.first() {
-                        self.pane_tree.set_session_id(self.focused_pane, Some(first.id.clone()));
+                        self.pane_tree
+                            .set_session_id(self.focused_pane, Some(first.id.clone()));
                     }
                 }
                 self.sessions = snap.sessions;
@@ -279,7 +280,8 @@ impl App {
                 // 清理已断开 session 的 baseline（P1-1b）：只保留当前仍活着的会话，
                 // 防止长时间运行（beacon 来去）下 age_baseline 无限增长。
                 let live: Vec<String> = self.sessions.iter().map(|s| s.id.clone()).collect();
-                self.age_baseline.retain(|id, _| live.iter().any(|l| l == id));
+                self.age_baseline
+                    .retain(|id, _| live.iter().any(|l| l == id));
             }
             for l in snap.log_lines {
                 self.stream.push(l);
@@ -492,19 +494,21 @@ impl App {
             match key.code {
                 KeyCode::Char('v') | KeyCode::Char('%') => {
                     let new_id = self.pane_tree.next_id();
-                    self.pane_tree = self
-                        .pane_tree
-                        .clone()
-                        .split(self.focused_pane, panes::SplitDir::Columns, new_id);
+                    self.pane_tree = self.pane_tree.clone().split(
+                        self.focused_pane,
+                        panes::SplitDir::Columns,
+                        new_id,
+                    );
                     self.focused_pane = new_id;
                     return;
                 }
                 KeyCode::Char('s') | KeyCode::Char('"') => {
                     let new_id = self.pane_tree.next_id();
-                    self.pane_tree = self
-                        .pane_tree
-                        .clone()
-                        .split(self.focused_pane, panes::SplitDir::Rows, new_id);
+                    self.pane_tree = self.pane_tree.clone().split(
+                        self.focused_pane,
+                        panes::SplitDir::Rows,
+                        new_id,
+                    );
                     self.focused_pane = new_id;
                     return;
                 }
@@ -527,8 +531,8 @@ impl App {
                     // 清理被关窗格的滚动偏移，防止 id 复用时新窗格读到脏偏移（P1-1a）。
                     self.pane_scroll.remove(&closed);
                     let remaining = self.pane_tree.layout(pane_area);
-                    self.focused_pane = pick_nearest_leaf(&remaining, closed_rect)
-                        .unwrap_or_else(|| {
+                    self.focused_pane =
+                        pick_nearest_leaf(&remaining, closed_rect).unwrap_or_else(|| {
                             self.pane_tree
                                 .leaves()
                                 .first()
@@ -539,38 +543,30 @@ impl App {
                 }
                 KeyCode::Char('h') | KeyCode::Left => {
                     let full = self.last_frame_size;
-                    self.focused_pane = self.pane_tree.move_focus(
-                        self.focused_pane,
-                        panes::FocusDir::Left,
-                        full,
-                    );
+                    self.focused_pane =
+                        self.pane_tree
+                            .move_focus(self.focused_pane, panes::FocusDir::Left, full);
                     return;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
                     let full = self.last_frame_size;
-                    self.focused_pane = self.pane_tree.move_focus(
-                        self.focused_pane,
-                        panes::FocusDir::Down,
-                        full,
-                    );
+                    self.focused_pane =
+                        self.pane_tree
+                            .move_focus(self.focused_pane, panes::FocusDir::Down, full);
                     return;
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     let full = self.last_frame_size;
-                    self.focused_pane = self.pane_tree.move_focus(
-                        self.focused_pane,
-                        panes::FocusDir::Up,
-                        full,
-                    );
+                    self.focused_pane =
+                        self.pane_tree
+                            .move_focus(self.focused_pane, panes::FocusDir::Up, full);
                     return;
                 }
                 KeyCode::Char('l') | KeyCode::Right => {
                     let full = self.last_frame_size;
-                    self.focused_pane = self.pane_tree.move_focus(
-                        self.focused_pane,
-                        panes::FocusDir::Right,
-                        full,
-                    );
+                    self.focused_pane =
+                        self.pane_tree
+                            .move_focus(self.focused_pane, panes::FocusDir::Right, full);
                     return;
                 }
                 KeyCode::Char(c @ ('1'..='6')) => {
@@ -678,11 +674,8 @@ impl App {
             KeyCode::Up if self.focused_state().popup_open => {
                 let st = self.focused_state_mut();
                 let filtered = filter_meta(&st.input);
-                let next = move_popup_selection(
-                    filtered.len(),
-                    st.popup_state.selected(),
-                    PopupMove::Up,
-                );
+                let next =
+                    move_popup_selection(filtered.len(), st.popup_state.selected(), PopupMove::Up);
                 st.popup_state.select(next);
             }
             KeyCode::Down if self.focused_state().popup_open => {
@@ -806,7 +799,10 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some(i) = state.selected() {
-                        if let Some(s) = self.sessions.get(i) { self.pane_tree.set_session_id(self.focused_pane, Some(s.id.clone())); }
+                        if let Some(s) = self.sessions.get(i) {
+                            self.pane_tree
+                                .set_session_id(self.focused_pane, Some(s.id.clone()));
+                        }
                         if let Some(s) = self.sessions.get(i) {
                             self.log(&format!("selected beacon {}", short(&s.id)), Level::Ok);
                         }
@@ -939,7 +935,8 @@ impl App {
                 if row >= r.y && row < r.y + r.height && col >= r.x && col < r.x + r.width {
                     state.select(Some(i));
                     if let Some(s) = self.sessions.get(i) {
-                        self.pane_tree.set_session_id(self.focused_pane, Some(s.id.clone()));
+                        self.pane_tree
+                            .set_session_id(self.focused_pane, Some(s.id.clone()));
                         self.log(&format!("selected beacon {}", short(&s.id)), Level::Ok);
                     }
                     self.overlay = Overlay::None;
@@ -962,7 +959,8 @@ impl App {
                 // （+1 进窗格内容区，+1 跳边框标题）。宽度固定 14（与 render 一致）。
                 let picker_top = tab_rect.y.saturating_add(2);
                 let picker_bot = picker_top + count as u16;
-                if row >= picker_top && row < picker_bot
+                if row >= picker_top
+                    && row < picker_bot
                     && col >= tab_rect.x
                     && col < tab_rect.x + 14
                 {
@@ -999,10 +997,7 @@ impl App {
                 // 点中窗格后，检查是否点中了它的视图 tab（顶部边框行）。
                 // 命中 → 开关该窗格的 view picker（而非直接切视图）。
                 if let Some(tab_rect) = self.view_tab_rect.get(id).copied() {
-                    if col >= tab_rect.x
-                        && col < tab_rect.x + tab_rect.width
-                        && row == tab_rect.y
-                    {
+                    if col >= tab_rect.x && col < tab_rect.x + tab_rect.width && row == tab_rect.y {
                         // toggle picker：已开则关，没开则开（初始选中当前视图）。
                         if self.view_picker.as_ref().is_some_and(|(pid, _)| pid == id) {
                             self.view_picker = None;
@@ -1027,11 +1022,7 @@ impl App {
                 // 若该窗格是 SessionList 视图，检查是否点中了某 session 行 → 切换 beacon。
                 if let Some(rows) = self.pane_session_rows.get(id) {
                     for (r, sid) in rows {
-                        if col >= r.x
-                            && col < r.x + r.width
-                            && row >= r.y
-                            && row < r.y + r.height
-                        {
+                        if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height {
                             self.pane_tree.set_session_id(*id, Some(sid.clone()));
                             self.log(
                                 &format!("[pane {}] selected beacon {}", id, short(sid)),
@@ -1108,7 +1099,10 @@ impl App {
                 let sub = args.trim();
                 if sub.is_empty() {
                     self.log(
-                        &format!("current theme: {} (options: mocha, highcontrast, nocolor)", self.config.theme),
+                        &format!(
+                            "current theme: {} (options: mocha, highcontrast, nocolor)",
+                            self.config.theme
+                        ),
                         Level::Info,
                     );
                 } else {
@@ -1129,7 +1123,9 @@ impl App {
                     self.config.theme = sub.to_string();
                     match self.config.save() {
                         Ok(()) => self.log(&format!("theme switched to {sub}"), Level::Ok),
-                        Err(e) => self.log(&format!("theme switched but save failed: {e}"), Level::Warn),
+                        Err(e) => {
+                            self.log(&format!("theme switched but save failed: {e}"), Level::Warn)
+                        }
                     }
                 }
             }
@@ -1457,7 +1453,9 @@ impl App {
                         self.log(&format!("(no beacons match '{args}')",), Level::Warn);
                     } else {
                         let mut st = ListState::default();
-                        let cur_idx = self.current_session().and_then(|s| self.sessions.iter().position(|x| x.id == s.id));
+                        let cur_idx = self
+                            .current_session()
+                            .and_then(|s| self.sessions.iter().position(|x| x.id == s.id));
                         st.select(
                             cur_idx
                                 .filter(|i| filtered.contains(i))
@@ -1494,7 +1492,10 @@ impl App {
                 }
                 match self.sessions.iter().position(|s| s.id.starts_with(id)) {
                     Some(i) => {
-                        if let Some(s) = self.sessions.get(i) { self.pane_tree.set_session_id(self.focused_pane, Some(s.id.clone())); }
+                        if let Some(s) = self.sessions.get(i) {
+                            self.pane_tree
+                                .set_session_id(self.focused_pane, Some(s.id.clone()));
+                        }
                         self.log(
                             &format!("selected beacon {}", short(&self.sessions[i].id)),
                             Level::Ok,
@@ -2612,7 +2613,10 @@ mod tests {
             pid: 1234,
             ..Default::default()
         }];
-        if let Some(s) = app.sessions.first() { app.pane_tree.set_session_id(app.focused_pane, Some(s.id.clone())); }
+        if let Some(s) = app.sessions.first() {
+            app.pane_tree
+                .set_session_id(app.focused_pane, Some(s.id.clone()));
+        }
         let mut st = ListState::default();
         st.select(Some(0));
         app.overlay = Overlay::Sessions(st);
@@ -2646,7 +2650,8 @@ mod tests {
                 ..Default::default()
             },
         ];
-        app.pane_tree.set_session_id(app.focused_pane, Some("aaaa1111aaaa".into()));
+        app.pane_tree
+            .set_session_id(app.focused_pane, Some("aaaa1111aaaa".into()));
         let mut st = ListState::default();
         st.select(Some(0));
         app.overlay = Overlay::Sessions(st);
@@ -2654,7 +2659,10 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
         // 确认 hit regions 至少 2 行。
-        assert!(app.session_row_rects.len() >= 2, "应记录至少 2 行 hit region");
+        assert!(
+            app.session_row_rects.len() >= 2,
+            "应记录至少 2 行 hit region"
+        );
         // 点击第 2 行（hostB）的中间位置。
         let row2 = app.session_row_rects[1];
         let click_col = row2.x + 5;
@@ -2707,7 +2715,8 @@ mod tests {
             .pane_tree
             .clone()
             .set_view(app.focused_pane, panes::PaneView::SessionList);
-        app.pane_tree.set_session_id(app.focused_pane, Some("aaaa1111aaaa".into()));
+        app.pane_tree
+            .set_session_id(app.focused_pane, Some("aaaa1111aaaa".into()));
         // render 一帧，让 pane_session_rows 被填充。
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
@@ -2763,7 +2772,8 @@ mod tests {
             .pane_tree
             .clone()
             .set_view(app.focused_pane, panes::PaneView::SessionList);
-        app.pane_tree.set_session_id(app.focused_pane, Some("aaaa1111aaaa".into()));
+        app.pane_tree
+            .set_session_id(app.focused_pane, Some("aaaa1111aaaa".into()));
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
@@ -2775,13 +2785,16 @@ mod tests {
         let mut found_highlight = false;
         for y in 2u16..20u16 {
             let cell = &buf[(5, y)]; // x=5 在 hostname 区域内
-            // selected 用 accent_dim 背景前景。检查 bg 是否是 accent_dim。
+                                     // selected 用 accent_dim 背景前景。检查 bg 是否是 accent_dim。
             if cell.bg == accent_dim {
                 found_highlight = true;
                 break;
             }
         }
-        assert!(found_highlight, "当前 session 行应有 accent_dim 蓝色高亮背景");
+        assert!(
+            found_highlight,
+            "当前 session 行应有 accent_dim 蓝色高亮背景"
+        );
     }
 
     /// /theme 命令切换主题：switch 后颜色访问器返回新调色板的值。
@@ -2965,10 +2978,10 @@ mod tests {
     fn single_tab_survives_narrow_pane() {
         let mut app = fake_app();
         let nid = app.pane_tree.next_id();
-        app.pane_tree = app
-            .pane_tree
-            .clone()
-            .split(app.focused_pane, panes::SplitDir::Columns, nid);
+        app.pane_tree =
+            app.pane_tree
+                .clone()
+                .split(app.focused_pane, panes::SplitDir::Columns, nid);
         // 窄终端，多分屏——单 tab 设计应不挤、不 panic。
         let mut term = Terminal::new(TestBackend::new(40, 20)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
@@ -2997,7 +3010,15 @@ mod tests {
         // 内容在 y=22。验证 prompt 文本在 y=22（内容行），不在 y=21（边框行）。
         // 收集 y=21 和 y=22 两行的内容。
         let row_at = |y: usize| -> String {
-            (0..80).map(|x| buf[(x as u16, y as u16)].symbol().chars().next().unwrap_or(' ')).collect()
+            (0..80)
+                .map(|x| {
+                    buf[(x as u16, y as u16)]
+                        .symbol()
+                        .chars()
+                        .next()
+                        .unwrap_or(' ')
+                })
+                .collect()
         };
         let border_row = row_at(21);
         let content_row = row_at(22);
@@ -3013,7 +3034,10 @@ mod tests {
         );
         // 内容行还应含 ❯ 提示符和 [no beacon] 标签（fake_app 无 session）。
         assert!(content_row.contains("❯"), "内容行应有 ❯ 提示符");
-        assert!(content_row.contains("[no beacon]"), "内容行应有 session 标签");
+        assert!(
+            content_row.contains("[no beacon]"),
+            "内容行应有 session 标签"
+        );
     }
 
     #[test]
@@ -3112,10 +3136,10 @@ mod tests {
         assert_eq!(app.pane_tree.leaf_count(), 1);
         // split：当前最大 id=1，next_id()=2
         let new_id = app.pane_tree.next_id(); // == 2
-        app.pane_tree = app
-            .pane_tree
-            .clone()
-            .split(app.focused_pane, panes::SplitDir::Columns, new_id);
+        app.pane_tree =
+            app.pane_tree
+                .clone()
+                .split(app.focused_pane, panes::SplitDir::Columns, new_id);
         app.focused_pane = new_id;
         assert_eq!(app.pane_tree.leaf_count(), 2);
         // close 新叶
@@ -3146,10 +3170,7 @@ mod tests {
         // 左下 (0,0,40,24) 中心 (20,12)；右下 (40,12,40,12) 中心 (60,18)。
         // 被关中心 (60,6)。右下距离 √(0²+12²)=12，左下距离 √(40²+6²)≈40。
         // 应选右下（距离更近），即兄弟而非左下角。
-        let remaining = vec![
-            (1, Rect::new(0, 0, 40, 24)),
-            (3, Rect::new(40, 12, 40, 12)),
-        ];
+        let remaining = vec![(1, Rect::new(0, 0, 40, 24)), (3, Rect::new(40, 12, 40, 12))];
         let closed = Some(Rect::new(40, 0, 40, 12));
         assert_eq!(pick_nearest_leaf(&remaining, closed), Some(3));
     }
@@ -3170,10 +3191,10 @@ mod tests {
         // 左右分屏：新叶 id=2 在左（x=0..40），原叶 id=1 在右（x=40..80）。
         // focused_pane 默认 = 1（原叶，右侧），所以 overlay 在右半。
         let nid = app.pane_tree.next_id();
-        app.pane_tree = app
-            .pane_tree
-            .clone()
-            .split(app.focused_pane, panes::SplitDir::Columns, nid);
+        app.pane_tree =
+            app.pane_tree
+                .clone()
+                .split(app.focused_pane, panes::SplitDir::Columns, nid);
         // 确认焦点窗格在哪侧：layout 后查 focused_pane=1 的 rect。
         app.overlay = Overlay::Files(vec![FileEntry {
             name: "ZZZ_OVERLAY_MARKER".into(),
@@ -3202,10 +3223,7 @@ mod tests {
             .flat_map(|y| (40u16..80u16).map(move |x| (x, y)))
             .map(|(x, y)| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
             .collect();
-        assert!(
-            right_half.contains('Z'),
-            "焦点窗格应含 overlay marker"
-        );
+        assert!(right_half.contains('Z'), "焦点窗格应含 overlay marker");
     }
 
     /// overlay 的 focused_pane_rect 正确指向焦点窗格（非全屏）。
@@ -3213,10 +3231,10 @@ mod tests {
     fn overlay_focused_pane_rect_is_pane_not_fullscreen() {
         let mut app = fake_app();
         let nid = app.pane_tree.next_id();
-        app.pane_tree = app
-            .pane_tree
-            .clone()
-            .split(app.focused_pane, panes::SplitDir::Columns, nid);
+        app.pane_tree =
+            app.pane_tree
+                .clone()
+                .split(app.focused_pane, panes::SplitDir::Columns, nid);
         app.overlay = Overlay::Files(vec![]);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();

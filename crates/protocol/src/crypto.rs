@@ -23,12 +23,18 @@ pub struct SessionKey([u8; KEY_LEN]);
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 impl SessionKey {
-    pub fn new(inner: [u8; KEY_LEN]) -> Self { Self(inner) }
-    pub fn as_bytes(&self) -> &[u8; KEY_LEN] { &self.0 }
+    pub fn new(inner: [u8; KEY_LEN]) -> Self {
+        Self(inner)
+    }
+    pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
+        &self.0
+    }
 }
 
 impl Zeroize for SessionKey {
-    fn zeroize(&mut self) { self.0.zeroize(); }
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 impl ZeroizeOnDrop for SessionKey {}

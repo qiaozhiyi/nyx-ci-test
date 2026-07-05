@@ -96,14 +96,14 @@ impl Palette {
     fn high_contrast() -> Self {
         Self {
             text: Color::White,
-            muted: Color::Gray,        // 7:1 on black
-            faint: Color::DarkGray,    // 用于纯装饰；承载内容用 muted
+            muted: Color::Gray,     // 7:1 on black
+            faint: Color::DarkGray, // 用于纯装饰；承载内容用 muted
             surface: Color::Black,
             surface1: Color::DarkGray, // tab 高亮用深灰，和黑底有对比
             surface2: Color::DarkGray, // 非焦点边框
             base: Color::Black,
             header: Color::Black,
-            accent: Color::Cyan,       // 醒目
+            accent: Color::Cyan, // 醒目
             accent_dim: Color::Cyan,
             success: Color::Green,
             warn: Color::Yellow,

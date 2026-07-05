@@ -2019,8 +2019,14 @@ mod tests {
 
     #[test]
     fn test_extract_session_prefix() {
-        assert_eq!(extract_session_prefix("[a1b2c3d4] test"), Some("a1b2c3d4".to_string()));
-        assert_eq!(extract_session_prefix("[a1b2c3d4] $ whoami"), Some("a1b2c3d4".to_string()));
+        assert_eq!(
+            extract_session_prefix("[a1b2c3d4] test"),
+            Some("a1b2c3d4".to_string())
+        );
+        assert_eq!(
+            extract_session_prefix("[a1b2c3d4] $ whoami"),
+            Some("a1b2c3d4".to_string())
+        );
         assert_eq!(extract_session_prefix("[INFO] test"), None);
         assert_eq!(extract_session_prefix("connecting to ..."), None);
     }
