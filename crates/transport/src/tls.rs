@@ -254,8 +254,18 @@ pub fn ja4(ch: &ClientHello) -> String {
         _ => "00",
     };
     let sni = if ch.sni.is_some() { 'd' } else { 'i' };
-    let ncs = ch.cipher_suites.iter().filter(|c| !is_grease(**c)).count().min(99);
-    let nex = ch.extensions.iter().filter(|(t, _)| !is_grease(*t)).count().min(99);
+    let ncs = ch
+        .cipher_suites
+        .iter()
+        .filter(|c| !is_grease(**c))
+        .count()
+        .min(99);
+    let nex = ch
+        .extensions
+        .iter()
+        .filter(|(t, _)| !is_grease(*t))
+        .count()
+        .min(99);
     let alpn = ch
         .alpn
         .as_deref()
@@ -296,8 +306,8 @@ pub fn ja4(ch: &ClientHello) -> String {
         .extensions
         .iter()
         .map(|(t, _)| *t)
-        .filter(|t| !is_grease(*t))
-        .next() == Some(0)
+        .find(|t| !is_grease(*t))
+        == Some(0)
     {
         'a'
     } else {

@@ -413,12 +413,16 @@ impl Command {
                 seconds: r.u32()?,
                 jitter_pct: r.u8()?,
             },
-            3 => Command::Shell { args: checked_str(r, 65536)? },
+            3 => Command::Shell {
+                args: checked_str(r, 65536)?,
+            },
             4 => Command::Upload {
                 name: checked_str(r, 4096)?,
                 data: r.blob()?.to_vec(),
             },
-            5 => Command::Download { path: checked_str(r, 4096)? },
+            5 => Command::Download {
+                path: checked_str(r, 4096)?,
+            },
             6 => Command::Exit,
             7 => {
                 let name = checked_str(r, 256)?;
@@ -447,7 +451,11 @@ impl Command {
             10 => {
                 let op = FileOp::decode(r)?;
                 let path = checked_str(r, 4096)?;
-                let dest = if r.u8()? == 1 { Some(checked_str(r, 4096)?) } else { None };
+                let dest = if r.u8()? == 1 {
+                    Some(checked_str(r, 4096)?)
+                } else {
+                    None
+                };
                 Command::FileOp { op, path, dest }
             }
             11 => Command::Screenshot { monitor: r.u8()? },
@@ -455,10 +463,14 @@ impl Command {
                 host: checked_str(r, 512)?,
                 ports: checked_str(r, 512)?,
             },
-            13 => Command::Net { query: checked_str(r, 512)? },
+            13 => Command::Net {
+                query: checked_str(r, 512)?,
+            },
             14 => Command::DriveInfo,
             15 => Command::Clipboard,
-            16 => Command::Env { name: checked_str(r, 256)? },
+            16 => Command::Env {
+                name: checked_str(r, 256)?,
+            },
             17 => Command::Keylog { action: r.u8()? },
             18 => Command::Screenwatch {
                 interval_secs: r.u32()?,

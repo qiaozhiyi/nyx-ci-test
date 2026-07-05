@@ -124,8 +124,12 @@ impl OperatorRegistry {
     ) -> std::io::Result<Self> {
         let mut map: HashMap<String, OperatorRecord> = if path.exists() {
             let txt = std::fs::read_to_string(path)?;
-            let parsed: Vec<OperatorRecord> = serde_json::from_str(&txt)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("operators file parse error: {e}")))?;
+            let parsed: Vec<OperatorRecord> = serde_json::from_str(&txt).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("operators file parse error: {e}"),
+                )
+            })?;
             parsed.into_iter().map(|r| (r.name.clone(), r)).collect()
         } else {
             HashMap::new()
@@ -217,9 +221,9 @@ fn persist(path: &Path, map: &HashMap<String, OperatorRecord>) -> std::io::Resul
     let json = serde_json::to_vec_pretty(&rows).map_err(io_err)?;
     let tmp = path.with_extension("json.tmp");
     use std::fs::OpenOptions;
+    use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
-    use std::io::Write;
 
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);

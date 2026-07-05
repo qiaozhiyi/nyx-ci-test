@@ -75,12 +75,15 @@ static CSPRNG_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomic
 /// never freed — it must point to a function that lives for the process lifetime.
 #[cfg(not(feature = "std"))]
 pub fn register_csprng(fill: fn(&mut [u8]) -> bool) -> Result<(), ()> {
-    CSPRNG_HOOK.compare_exchange(
-        0,
-        fill as usize,
-        core::sync::atomic::Ordering::Release,
-        core::sync::atomic::Ordering::Relaxed,
-    ).map(|_| ()).map_err(|_| ())
+    CSPRNG_HOOK
+        .compare_exchange(
+            0,
+            fill as usize,
+            core::sync::atomic::Ordering::Release,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .map(|_| ())
+        .map_err(|_| ())
 }
 
 #[cfg(not(feature = "std"))]

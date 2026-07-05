@@ -174,13 +174,16 @@ async fn main() -> anyhow::Result<()> {
                 tokio::spawn(async move {
                     let timeout_dur = std::time::Duration::from_secs(5);
                     // Read the ClientHello (blocking, tiny) off the stream first.
-                    let stream = match tokio::time::timeout(timeout_dur, sniff_and_store(stream, peer, fps)).await {
-                        Ok(Ok(s)) => s,
-                        _ => {
-                            tracing::debug!(%peer, "ClientHello sniff timed out or failed");
-                            return;
-                        }
-                    };
+                    let stream =
+                        match tokio::time::timeout(timeout_dur, sniff_and_store(stream, peer, fps))
+                            .await
+                        {
+                            Ok(Ok(s)) => s,
+                            _ => {
+                                tracing::debug!(%peer, "ClientHello sniff timed out or failed");
+                                return;
+                            }
+                        };
 
                     match tokio::time::timeout(timeout_dur, acc.accept(stream)).await {
                         Ok(Ok(tls)) => {

@@ -344,7 +344,9 @@ enum TaskKind {
     /// (LSASS) returns `Output` containing the actionable PID+instruction
     /// signal from the implant (the real dump happens via `nyx-kernel` out of
     /// band). Routed as Shell-like text, NOT chunked.
-    Hashdump { method: u8 },
+    Hashdump {
+        method: u8,
+    },
     /// A ping; an `ok` result confirms the beacon is alive.
     Ping,
 }

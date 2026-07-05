@@ -145,7 +145,7 @@ impl AuditWriter {
         let limit = q.limit.unwrap_or(500).min(5000);
         let offset = q.offset.unwrap_or(0);
         let mut match_count = 0;
-        
+
         for line in reader.lines().map_while(Result::ok) {
             if let Ok(r) = serde_json::from_str::<AuditRecord>(&line) {
                 if q.operator.as_deref().is_none_or(|o| r.operator == o)
@@ -167,7 +167,7 @@ impl AuditWriter {
                 }
             }
         }
-        
+
         if q.dir.as_deref() != Some("asc") {
             recs.reverse();
             let page_offset = offset.min(recs.len());
@@ -227,7 +227,7 @@ fn hash_record(
     let mut h = Sha256::new();
     h.update(seq.to_le_bytes());
     h.update(ts.to_le_bytes());
-    
+
     let fields = [operator, action, target, detail_json, prev_hash];
     for f in fields {
         h.update((f.len() as u64).to_le_bytes());

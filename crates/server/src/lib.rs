@@ -440,15 +440,15 @@ fn body_bytes(b: Vec<u8>) -> axum::body::Body {
 /// never on where (or whether) the buffers first differ.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use sha2::{Digest, Sha256};
-    
+
     let mut ha = Sha256::new();
     ha.update(a);
     let digest_a = ha.finalize();
-    
+
     let mut hb = Sha256::new();
     hb.update(b);
     let digest_b = hb.finalize();
-    
+
     let mut diff = 0;
     for (x, y) in digest_a.iter().zip(digest_b.iter()) {
         diff |= x ^ y;
@@ -1047,7 +1047,11 @@ async fn post_task(
         AuthOutcome::Denied(r) => return r,
     };
     if op.role == operators::Role::Viewer {
-        return (StatusCode::FORBIDDEN, "forbidden: viewer role cannot task beacons").into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            "forbidden: viewer role cannot task beacons",
+        )
+            .into_response();
     }
     let id = match parse_session_hex(&req.session) {
         Some(id) => id,
@@ -1228,7 +1232,11 @@ async fn list_creds(
         AuthOutcome::Denied(r) => return r,
     };
     if q.reveal.unwrap_or(0) == 1 && op.role == operators::Role::Viewer {
-        return (StatusCode::FORBIDDEN, "forbidden: viewer role cannot reveal plaintext secrets").into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            "forbidden: viewer role cannot reveal plaintext secrets",
+        )
+            .into_response();
     }
     let mut rows = match st.creds.list() {
         Ok(r) => r,
@@ -1266,7 +1274,11 @@ async fn post_creds(
         AuthOutcome::Denied(r) => return r,
     };
     if op.role == operators::Role::Viewer {
-        return (StatusCode::FORBIDDEN, "forbidden: viewer role cannot add credentials").into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            "forbidden: viewer role cannot add credentials",
+        )
+            .into_response();
     }
     match st.creds.upsert(&rec) {
         Ok(()) => {
@@ -1317,7 +1329,11 @@ async fn delete_cred(
         AuthOutcome::Denied(r) => return r,
     };
     if op.role == operators::Role::Viewer {
-        return (StatusCode::FORBIDDEN, "forbidden: viewer role cannot delete credentials").into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            "forbidden: viewer role cannot delete credentials",
+        )
+            .into_response();
     }
     let kind = match nyx_store::CredKind::from_label(&key.kind) {
         Some(k) => k,
@@ -1381,7 +1397,11 @@ async fn verify_audit(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
         AuthOutcome::Denied(r) => return r,
     };
     if op.role == operators::Role::Viewer {
-        return (StatusCode::FORBIDDEN, "forbidden: viewer role cannot verify audit log").into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            "forbidden: viewer role cannot verify audit log",
+        )
+            .into_response();
     }
     let Some(audit) = &st.audit else {
         return (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response();
