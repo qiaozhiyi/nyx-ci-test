@@ -90,6 +90,14 @@ impl LoadedDriver {
     /// Loading a driver changes kernel state; BSOD risk if the driver is buggy.
     /// Caller must have SeLoadDriverPrivilege.
     pub unsafe fn load(sys_path: &[u16], svc_name: &[u16]) -> Result<Self, KrwError> {
+        // Enable SeLoadDriverPrivilege in the calling thread's token before
+        // NtLoadDriver. Even administrators have it present-but-DISABLED by
+        // default; without enabling, NtLoadDriver returns
+        // STATUS_PRIVILEGE_NOT_HELD (0xC0000061). This is the difference between
+        // a self-hosted runner (where the operator's shell already enabled it)
+        // and a hosted runner (where the default token lacks it).
+        let _ = enable_load_driver_privilege();
+
         // Build the registry path: \Registry\Machine\...\Services\<svc_name>
         let prefix: Vec<u16> = SERVICES_PREFIX
             .encode_utf16()
@@ -216,6 +224,36 @@ fn build_image_path(sys_path: &[u16]) -> Vec<u16> {
 fn resolve_nt<T>(name: &[u8]) -> Result<T, KrwError> {
     // resolve_sym is unsafe (FFI); wrap it.
     unsafe { super::resolve::resolve_sym(b"ntdll.dll", name) }
+}
+
+/// `RtlAdjustPrivilege` — enables/disables a privilege in the calling thread's
+/// token (or the process token, falling back to the system token). Simpler than
+/// the OpenProcessToken → AdjustTokenPrivileges chain.
+type RtlAdjustPrivilegeFn =
+    unsafe extern "system" fn(u32, i32, i32, *mut i32) -> i32;
+
+/// Enable `SeLoadDriverPrivilege` (LUID 10) in the calling thread's token.
+/// Returns `true` if the privilege is now enabled (or was already). Best-effort:
+/// on failure the caller proceeds anyway — `NtLoadDriver` will surface the
+/// real error if the privilege is genuinely unavailable.
+///
+/// `RtlAdjustPrivilege` signature: `(Privilege, Enable, ClientOnly, Enabled)`.
+/// `ClientOnly=0` adjusts the process token; `1` would adjust an impersonation
+/// token. We use `0` (process).
+fn enable_load_driver_privilege() -> bool {
+    const SE_LOAD_DRIVER_PRIVILEGE: u32 = 10;
+    let rtl_adjust: RtlAdjustPrivilegeFn = match unsafe {
+        super::resolve::resolve_sym(b"ntdll.dll", b"RtlAdjustPrivilege")
+    } {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut enabled: i32 = 0;
+    // SAFETY: RtlAdjustPrivilege with the well-known LUID 10 + ClientOnly=0 is
+    // a documented safe path; the out-param is a stack i32.
+    let status = unsafe { rtl_adjust(SE_LOAD_DRIVER_PRIVILEGE, 1, 0, &mut enabled) };
+    // NT_SUCCESS(status) AND the privilege was enabled.
+    status >= 0 && enabled != 0
 }
 
 /// Registry API bundle (resolved once).
