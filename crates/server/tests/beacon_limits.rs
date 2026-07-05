@@ -152,7 +152,8 @@ fn valid_checkin_frame(server_pub: &[u8; 32]) -> (Vec<u8>, [u8; 32]) {
         pid: 1,
         is_admin: 0,
     }
-    .encode(&mut w);
+    .encode(&mut w)
+    .expect("test SessionInfo fields are tiny literals << MAX_BLOB_LEN");
     (
         frame::encode_frame(&pubkey, 0, &key, &w.into_bytes()),
         pubkey,

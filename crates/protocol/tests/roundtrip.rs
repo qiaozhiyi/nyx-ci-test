@@ -47,7 +47,9 @@ fn frame_seal_open_roundtrip() {
     let key = implant.session_key(&server.public_bytes());
 
     let mut w = wire::Writer::new();
-    sample_info().encode(&mut w);
+    sample_info()
+        .encode(&mut w)
+        .expect("test SessionInfo fields are tiny literals << MAX_BLOB_LEN");
     let plaintext = w.into_bytes();
 
     let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, &plaintext);
@@ -109,7 +111,7 @@ fn task_batch_roundtrip() {
             command: msg::Command::Exit,
         },
     ];
-    let enc = msg::Task::encode_vec(&tasks);
+    let enc = msg::Task::encode_vec(&tasks).expect("encode_vec should succeed for test fixture");
     let dec = msg::Task::decode_vec(&enc).unwrap();
     assert_eq!(dec, tasks);
 }
@@ -135,18 +137,19 @@ fn response_batch_roundtrip() {
             },
         },
     ];
-    let enc = msg::TaskResponse::encode_vec(&responses);
+    let enc = msg::TaskResponse::encode_vec(&responses)
+        .expect("encode_vec should succeed for test fixture");
     let dec = msg::TaskResponse::decode_vec(&enc).unwrap();
     assert_eq!(dec, responses);
 }
 
 #[test]
 fn empty_batches_roundtrip() {
-    assert!(msg::Task::decode_vec(&msg::Task::encode_vec(&[]))
+    assert!(msg::Task::decode_vec(&msg::Task::encode_vec(&[]).unwrap())
         .unwrap()
         .is_empty());
     assert!(
-        msg::TaskResponse::decode_vec(&msg::TaskResponse::encode_vec(&[]))
+        msg::TaskResponse::decode_vec(&msg::TaskResponse::encode_vec(&[]).unwrap())
             .unwrap()
             .is_empty()
     );
@@ -228,7 +231,7 @@ fn p2p_command_variants_roundtrip() {
             },
         },
     ];
-    let enc = msg::Task::encode_vec(&tasks);
+    let enc = msg::Task::encode_vec(&tasks).expect("encode_vec should succeed for test fixture");
     let dec = msg::Task::decode_vec(&enc).unwrap();
     assert_eq!(dec, tasks);
 }
@@ -317,7 +320,8 @@ fn channel_response_variants_roundtrip() {
             },
         },
     ];
-    let enc = msg::TaskResponse::encode_vec(&responses);
+    let enc = msg::TaskResponse::encode_vec(&responses)
+        .expect("encode_vec should succeed for test fixture");
     let dec = msg::TaskResponse::decode_vec(&enc).unwrap();
     assert_eq!(dec, responses);
 }
@@ -353,7 +357,11 @@ fn session_key_wrapper_zeroizes_in_place() {
     let secret = [0xABu8; 32];
     let mut key = SessionKey::new(secret);
     // Round-trip through the accessor — this is the contract callers rely on.
-    assert_eq!(key.as_bytes(), &secret, "as_bytes() must return the inner bytes");
+    assert_eq!(
+        key.as_bytes(),
+        &secret,
+        "as_bytes() must return the inner bytes"
+    );
 
     // Two keys from the same input must compare equal (Eq + PartialEq + Hash
     // are derived on the wrapper; the inner array provides the impls).
@@ -364,7 +372,11 @@ fn session_key_wrapper_zeroizes_in_place() {
     // wrapper is logically destroyed — we don't read it via as_bytes() in
     // production code after zeroize, but we can verify the contract here.
     key.zeroize();
-    assert_eq!(key.as_bytes(), &[0u8; 32], "Zeroize must clear the inner bytes");
+    assert_eq!(
+        key.as_bytes(),
+        &[0u8; 32],
+        "Zeroize must clear the inner bytes"
+    );
 
     // A freshly-zeroized key must NOT equal a real key (sanity for the Eq
     // derive — it should compare bytes, not pointer or wrapper identity).

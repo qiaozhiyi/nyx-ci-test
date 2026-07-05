@@ -227,6 +227,7 @@ dependencies = [
  "rand_core",
  "sha2",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

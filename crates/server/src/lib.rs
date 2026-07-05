@@ -597,7 +597,7 @@ fn handle_beacon(
             Direction::ServerToClient,
             0,
             &key,
-            &Task::encode_vec(&[]),
+            &Task::encode_vec(&[])?,
         ))
     } else {
         // Subsequent messages carry task responses; we reply with queued tasks.
@@ -656,7 +656,7 @@ fn handle_beacon(
         for ev in fired {
             st.events.fire(&ev);
         }
-        let reply = Task::encode_vec(&tasks);
+        let reply = Task::encode_vec(&tasks)?;
         Ok(encode_frame_dir(
             &raw.pubkey,
             Direction::ServerToClient,
@@ -1711,7 +1711,8 @@ mod tests {
             is_admin: 0,
         };
         let mut w = nyx_protocol::wire::Writer::new();
-        info.encode(&mut w);
+        info.encode(&mut w)
+            .expect("test SessionInfo fields are tiny literals << MAX_BLOB_LEN");
         let plaintext = w.into_bytes();
         let frame = encode_frame_dir(pubkey, Direction::ClientToServer, counter, &key, &plaintext);
         (key, frame)
@@ -1720,7 +1721,7 @@ mod tests {
     /// Build a sealed "subsequent" frame (an empty TaskResponse batch) for an
     /// existing session — the shape every post-check-in beacon carries.
     fn response_frame(pubkey: &[u8; 32], key: &SessionKey, counter: u64) -> Vec<u8> {
-        let plaintext = TaskResponse::encode_vec(&[]);
+        let plaintext = TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially");
         encode_frame_dir(pubkey, Direction::ClientToServer, counter, key, &plaintext)
     }
 
@@ -1866,7 +1867,7 @@ mod tests {
                 response: MsgResponse::Ok,
             })
             .collect();
-        let plaintext = TaskResponse::encode_vec(&batch);
+        let plaintext = TaskResponse::encode_vec(&batch).expect("batch of Ok encodes trivially");
         let frame = encode_frame_dir(&pubkey, Direction::ClientToServer, 2, &key, &plaintext);
         handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &frame)
             .expect("ingest of oversized result batch");
