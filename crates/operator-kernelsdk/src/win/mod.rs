@@ -299,7 +299,7 @@ pub unsafe fn unlink_minifilters(
 /// Reads kernel memory (ntoskrnl image). Requires a working `KernelRw`.
 pub fn resolve_offsets(
     krw: &dyn KernelRw,
-    _build: u32,
+    build: u32,
     flt_globals_rva: Option<u32>,
 ) -> Result<crate::offsets::RuntimeOffsets, KitError> {
     use crate::pattern_scan;
