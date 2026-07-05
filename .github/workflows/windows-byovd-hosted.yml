@@ -174,14 +174,19 @@ jobs:
       - name: BYOVD bootstrap + kernelsdk full path
         if: steps.probe.outputs.skip == 'false'
         shell: cmd
-        continue-on-error: true   # individual IOCTLs may fail by Defender version; do not fail job
+        continue-on-error: true   # BYOVD load may fail by privilege/blocklist/registry; do not fail job
         run: |
           REM ---- Task G: BYOVD driver load ----
           echo === Task G: BYOVD bootstrap ===
           crates\operator-kernel-cli\target\release\nyx-kernel.exe bootstrap --byovd "%DRIVER_PATH%" NyaRTCore
           echo BOOTSTRAP_EXIT=%ERRORLEVEL%
           if %ERRORLEVEL% NEQ 0 (
-            echo ::warning::bootstrap failed - Defender version may block driver load
+            echo ::warning::bootstrap failed - see NTSTATUS above. Common causes:
+            echo   0xC0000061 STATUS_PRIVILEGE_NOT_HELD  - SeLoadDriverPrivilege not enabled (fixed via RtlAdjustPrivilege)
+            echo   0xC0000428 STATUS_DRIVER_BLOCKED      - Vulnerable Driver Blocklist enforced (CodeIntegrityPolicyEnforcementStatus=2)
+            echo   0xC0000034 STATUS_OBJECT_NAME_NOT_FOUND - registry service key path mismatch (needs Win debugging)
+            echo   0xC000010E STATUS_IMAGE_ALREADY_LOADED - benign, driver already in kernel
+            echo kernelsdk BYOVD needs a HVCI-off + blocklist-off host (self-hosted 17763, see windows-kself-hosted.yml)
             exit /b 0
           )
 
