@@ -21,6 +21,17 @@ pub const TAG_LEN: usize = 16;
 /// `serve_connection` path has no default limit, so this cap is the backstop).
 pub const MAX_CT_LEN: usize = 512 * 1024; // 512 KiB — matches documented limit
 
+/// Lower bound on a beacon frame's declared ciphertext length. A real frame
+/// always carries at least one byte of plaintext (a SessionInfo, a task
+/// batch's `u32 count`, a response batch's `u32 count` — never empty), so the
+/// ciphertext is always `≥ TAG_LEN + 1`. A frame whose ct_len equals exactly
+/// `TAG_LEN` would carry zero plaintext bytes — the AEAD's "all tag, no data"
+/// degenerate case, which an attacker could craft without compromising the
+/// key. Reject it at the parser so the decoder never has to handle an empty
+/// plaintext (the wire codec doesn't define a meaningful interpretation for
+/// one anyway). Defense-in-depth, not a correctness fix.
+pub const MIN_CT_LEN: usize = TAG_LEN + 1;
+
 /// A frame that has been parsed but not yet decrypted.
 #[derive(Debug, Clone)]
 pub struct RawFrame {
@@ -32,6 +43,13 @@ pub struct RawFrame {
 /// Build a complete request frame from plaintext, sealed with the given
 /// [`Direction`]'s nonce space. The direction must match what the receiver
 /// will use in [`open_frame_dir`].
+///
+/// **Panics** if `plaintext` is empty. The wire codec never produces a
+/// zero-byte plaintext (every batch carries at least a `u32 count` and every
+/// SessionInfo is non-empty), so an empty plaintext here signals a caller bug.
+/// The parser also rejects the resulting "all-tag, no-data" frame on the
+/// receive side (see [`MIN_CT_LEN`]); panicking here gives the developer a
+/// louder signal at the source rather than a silent round-trip failure.
 pub fn encode_frame_dir(
     pubkey: &[u8; PUBKEY_LEN],
     dir: Direction,
@@ -39,6 +57,10 @@ pub fn encode_frame_dir(
     key: &SessionKey,
     plaintext: &[u8],
 ) -> Vec<u8> {
+    assert!(
+        !plaintext.is_empty(),
+        "encode_frame_dir: empty plaintext is not a valid beacon frame"
+    );
     let ciphertext = crypto::seal_dir(key, dir, counter, pubkey, plaintext);
     let mut out = Vec::with_capacity(FRAME_HEADER + ciphertext.len());
     out.extend_from_slice(pubkey);
@@ -80,11 +102,13 @@ pub fn parse_frame(frame: &[u8]) -> Result<RawFrame, WireError> {
     ) as usize;
     let ct_end = FRAME_HEADER + ct_len;
     // Require the frame to be length-exact (no unauthenticated trailing bytes)
-    // AND that the declared ciphertext is within the beacon cap. The cap is a
-    // backstop against a future extractor change or the raw-TLS serve_connection
-    // path (which has no body-size limit) turning a bogus ct_len into a huge
-    // allocation. ct_len < TAG_LEN means the "ciphertext" can't even hold a tag.
-    if frame.len() != ct_end || !(TAG_LEN..=MAX_CT_LEN).contains(&ct_len) {
+    // AND that the declared ciphertext is within the beacon bounds. The upper
+    // cap (MAX_CT_LEN) is a backstop against a future extractor change or the
+    // raw-TLS serve_connection path (which has no body-size limit) turning a
+    // bogus ct_len into a huge allocation. The lower bound (MIN_CT_LEN) rejects
+    // the "all tag, no data" degenerate case so the decoder never has to handle
+    // an empty plaintext — see MIN_CT_LEN for the rationale.
+    if frame.len() != ct_end || !(MIN_CT_LEN..=MAX_CT_LEN).contains(&ct_len) {
         return Err(WireError::BadLen(ct_len));
     }
     let ciphertext = frame[FRAME_HEADER..ct_end].to_vec();

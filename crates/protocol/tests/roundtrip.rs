@@ -370,3 +370,56 @@ fn session_key_wrapper_zeroizes_in_place() {
     // derive — it should compare bytes, not pointer or wrapper identity).
     assert_ne!(key, key2, "zeroized key must differ from a real key");
 }
+
+/// H-2 (zero-width plaintext rejection, decode side): a frame whose declared
+/// ct_len equals exactly TAG_LEN is the AEAD's "all tag, no data" degenerate
+/// case. Such a frame carries zero plaintext bytes, which the wire codec
+/// doesn't define a meaningful interpretation for. parse_frame must reject it
+/// at the boundary so the decoder never has to handle an empty plaintext.
+#[test]
+fn frame_with_zero_width_plaintext_is_rejected() {
+    // Build a frame whose ct_len equals exactly TAG_LEN (16). We craft the
+    // raw bytes manually rather than going through encode_frame_dir, because
+    // encode_frame_dir refuses to seal an empty plaintext (see the next test).
+    let mut bad = vec![0u8; frame::FRAME_HEADER + frame::TAG_LEN];
+    // ct_len = TAG_LEN at offset PUBKEY_LEN+8 .. +12.
+    let l = crypto::PUBKEY_LEN;
+    bad[l + 8..l + 12].copy_from_slice(&(frame::TAG_LEN as u32).to_le_bytes());
+    assert_eq!(
+        bad.len(),
+        frame::FRAME_HEADER + frame::TAG_LEN,
+        "test fixture must be length-exact"
+    );
+    let err = frame::parse_frame(&bad).unwrap_err();
+    assert!(
+        matches!(err, wire::WireError::BadLen(16)),
+        "ct_len == TAG_LEN (zero plaintext) must be rejected by the parser, got {err:?}"
+    );
+}
+
+/// H-2 (zero-width plaintext rejection, encode side): encode_frame_dir must
+/// panic on an empty plaintext. The wire codec never legitimately produces
+/// one (every batch carries at least a `u32 count`, every SessionInfo is
+/// non-empty), so an empty plaintext here signals a caller bug — panicking
+/// gives the developer a loud signal at the source rather than silently
+/// producing a frame the receiver will reject anyway.
+#[test]
+#[should_panic(expected = "encode_frame_dir: empty plaintext is not a valid beacon frame")]
+fn encode_frame_dir_panics_on_empty_plaintext() {
+    let key = crypto::SessionKey::new([0u8; 32]);
+    let pubkey = [0u8; crypto::PUBKEY_LEN];
+    let _ = frame::encode_frame_dir(&pubkey, crypto::Direction::ClientToServer, 0, &key, b"");
+}
+
+/// MIN_CT_LEN constant pin — guards the lower bound against silent regressions.
+/// The upper bound is already pinned by `frame_max_ct_len_constant_matches_docs`.
+#[test]
+fn frame_min_ct_len_constant_matches_docs() {
+    // Must equal TAG_LEN + 1 — the smallest ciphertext that carries >=1 byte
+    // of actual plaintext under ChaCha20-Poly1305.
+    assert_eq!(frame::MIN_CT_LEN, frame::TAG_LEN + 1);
+    // Sanity: MIN must be strictly greater than TAG_LEN (else zero-plaintext
+    // frames would slip through) and strictly less than MAX (else no range).
+    assert!(frame::MIN_CT_LEN > frame::TAG_LEN);
+    assert!(frame::MIN_CT_LEN < frame::MAX_CT_LEN);
+}
