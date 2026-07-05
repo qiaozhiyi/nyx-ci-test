@@ -1801,7 +1801,7 @@ mod tests {
     /// Minimal valid `Session` for filling the registry without per-entry crypto.
     fn dummy_session() -> Session {
         Session {
-            key: [0u8; 32],
+            key: SessionKey::new([0u8; 32]),
             info: SessionInfo {
                 beacon_id: 0,
                 hostname: String::new(),

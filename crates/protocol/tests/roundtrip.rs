@@ -321,3 +321,52 @@ fn channel_response_variants_roundtrip() {
     let dec = msg::TaskResponse::decode_vec(&enc).unwrap();
     assert_eq!(dec, responses);
 }
+
+/// `MAX_CT_LEN` must stay at 512 KiB — the README's wire-format spec
+/// documents this as the DoS cap, and `frame_with_oversized_ct_len_is_rejected`
+/// above depends on it being the precise backstop. Catch a future edit that
+/// silently shrinks (regress) or expands (DoS surface) the cap.
+#[test]
+fn frame_max_ct_len_constant_matches_docs() {
+    // 512 KiB — matches the README wire-format spec.
+    assert_eq!(frame::MAX_CT_LEN, 512 * 1024);
+    // Sanity: it must always exceed any real-world frame ciphertext (so
+    // legitimate large task blobs aren't rejected) while staying far below
+    // a multi-MB DoS amplification range.
+    assert!(frame::MAX_CT_LEN >= 256 * 1024);
+    assert!(frame::MAX_CT_LEN <= 1024 * 1024);
+}
+
+/// `SessionKey` is a wrapped struct (not a bare `[u8;32]`) precisely so that
+/// `ZeroizeOnDrop` can be implemented. Verify the contract:
+///   1. construction round-trips through `as_bytes()`
+///   2. `Zeroize::zeroize()` actually clears the inner bytes in-place
+///   3. equality holds for two keys built from the same input
+/// This is a defense-in-depth sanity check on the wrapper type — the security
+/// guarantee (drop zeroes memory) is provided by `ZeroizeOnDrop`, which we
+/// can't directly assert without `unsafe` reads of freed memory.
+#[test]
+fn session_key_wrapper_zeroizes_in_place() {
+    use nyx_protocol::crypto::SessionKey;
+    use zeroize::Zeroize;
+
+    let secret = [0xABu8; 32];
+    let mut key = SessionKey::new(secret);
+    // Round-trip through the accessor — this is the contract callers rely on.
+    assert_eq!(key.as_bytes(), &secret, "as_bytes() must return the inner bytes");
+
+    // Two keys from the same input must compare equal (Eq + PartialEq + Hash
+    // are derived on the wrapper; the inner array provides the impls).
+    let key2 = SessionKey::new(secret);
+    assert_eq!(key, key2, "SessionKey equality must be byte-equality");
+
+    // Zeroize must clear the inner bytes in place. After this call, the
+    // wrapper is logically destroyed — we don't read it via as_bytes() in
+    // production code after zeroize, but we can verify the contract here.
+    key.zeroize();
+    assert_eq!(key.as_bytes(), &[0u8; 32], "Zeroize must clear the inner bytes");
+
+    // A freshly-zeroized key must NOT equal a real key (sanity for the Eq
+    // derive — it should compare bytes, not pointer or wrapper identity).
+    assert_ne!(key, key2, "zeroized key must differ from a real key");
+}

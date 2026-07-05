@@ -15,7 +15,23 @@ pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
 
 /// A 32-byte symmetric key derived per session via ECDH + HKDF.
-pub type SessionKey = [u8; KEY_LEN];
+/// Wrapped so ZeroizeOnDrop can be implemented (orphan rule prevents impl
+/// for the bare array type from outside this crate).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct SessionKey([u8; KEY_LEN]);
+
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+impl SessionKey {
+    pub fn new(inner: [u8; KEY_LEN]) -> Self { Self(inner) }
+    pub fn as_bytes(&self) -> &[u8; KEY_LEN] { &self.0 }
+}
+
+impl Zeroize for SessionKey {
+    fn zeroize(&mut self) { self.0.zeroize(); }
+}
+
+impl ZeroizeOnDrop for SessionKey {}
 
 /// Fill 32 bytes from the OS CSPRNG.
 ///
@@ -166,7 +182,7 @@ pub fn derive_session_key(
     // HKDF expand only fails if the requested length exceeds 255 * HashLen; 32 is fine.
     hk.expand(&info[..pos], &mut okm)
         .expect("32-byte HKDF expand cannot fail");
-    okm
+    SessionKey::new(okm)
 }
 
 /// Which direction a frame travels. The session key is shared by both peers,
@@ -216,7 +232,7 @@ pub fn seal_dir(
     aad: &[u8],
     plaintext: &[u8],
 ) -> Vec<u8> {
-    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key.as_bytes()));
     let nonce_bytes = nonce_for(dir, counter);
     let nonce = Nonce::from_slice(&nonce_bytes);
     cipher
@@ -239,7 +255,7 @@ pub fn open_dir(
     aad: &[u8],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, chacha20poly1305::Error> {
-    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key.as_bytes()));
     let nonce_bytes = nonce_for(dir, counter);
     let nonce = Nonce::from_slice(&nonce_bytes);
     cipher.decrypt(

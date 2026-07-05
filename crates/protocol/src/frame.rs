@@ -19,7 +19,7 @@ pub const TAG_LEN: usize = 16;
 /// is either malformed or an attempt to induce an oversized allocation.
 /// Defense-in-depth on top of the transport's body-size limit (the raw-TLS
 /// `serve_connection` path has no default limit, so this cap is the backstop).
-pub const MAX_CT_LEN: usize = 256 * 1024; // 256 KiB — generously above any real frame
+pub const MAX_CT_LEN: usize = 512 * 1024; // 512 KiB — matches documented limit
 
 /// A frame that has been parsed but not yet decrypted.
 #[derive(Debug, Clone)]
