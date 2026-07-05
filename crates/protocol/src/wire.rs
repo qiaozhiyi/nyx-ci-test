@@ -236,4 +236,3 @@ mod tests {
         assert_eq!(w.buf, vec![0, 0, 0, 0]);
     }
 }
-
