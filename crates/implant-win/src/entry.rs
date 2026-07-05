@@ -167,9 +167,8 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     // SystemFunction036 (RtlGenRandom) in advapi32.dll via export_addr, call it
     // directly. SystemFunction036 is the documented stable CSPRNG entry point,
     // available on every Windows version from XP SP2 through 11 25H2.
-    nyx_protocol::crypto::register_csprng(csprng_fill);
+    let _ = nyx_protocol::crypto::register_csprng(csprng_fill);
     diag_mark(b"7_csprng");
-    nyx_protocol::crypto::register_csprng(csprng_fill);
 
     Some(ntdll)
 }
@@ -270,7 +269,7 @@ unsafe fn init_minimal() {
     };
     let _ssn = ntdll.resolve_table_owned();
     crate::syscalls::init_global();
-    nyx_protocol::crypto::register_csprng(csprng_fill);
+    let _ = nyx_protocol::crypto::register_csprng(csprng_fill);
 }
 
 /// Helper: resolve ExitProcess and exit with `code`. Never returns.

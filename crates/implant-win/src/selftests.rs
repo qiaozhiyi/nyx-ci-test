@@ -672,7 +672,7 @@ pub unsafe extern "system" fn nyx_selftest_csprng() {
     use nyx_protocol::{ImplantKeypair, crypto};
 
     // Step 1: Register + test CSPRNG fill.
-    crypto::register_csprng(crate::entry::csprng_fill);
+    let _ = crypto::register_csprng(crate::entry::csprng_fill);
     let mut buf = [0u8; 32];
     if !crate::entry::csprng_fill(&mut buf) {
         unsafe { exit(0xAF) };
@@ -718,7 +718,7 @@ pub unsafe extern "system" fn nyx_selftest_csprng() {
 pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     use nyx_protocol::crypto;
 
-    crypto::register_csprng(crate::entry::csprng_fill);
+    let _ = crypto::register_csprng(crate::entry::csprng_fill);
     let (cfg, config_plain) = crate::config::load();
     crate::mem::register_owned(config_plain);
     let kp = nyx_protocol::ImplantKeypair::generate();

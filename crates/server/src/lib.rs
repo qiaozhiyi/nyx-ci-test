@@ -439,15 +439,18 @@ fn body_bytes(b: Vec<u8>) -> axum::body::Body {
 /// same accumulator, so the work depends only on `min(a.len(), b.len())` and
 /// never on where (or whether) the buffers first differ.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // Fold a length-mismatch flag into the accumulator without branching on it:
-    // `same_len` is 0 iff lengths are exactly equal (works for any usize, not
-    // just the low byte). OR-ing it into `diff` each iteration means a length
-    // mismatch makes the result false regardless of byte content, while the
-    // loop still scans every byte of the shorter input (work depends only on
-    // min(len), never on where the buffers first differ).
-    let same_len = (a.len() == b.len()) as u8; // 1 if equal, 0 if not
-    let mut diff = same_len ^ 1; // 0 if equal-length, 1 if not
-    for (x, y) in a.iter().zip(b.iter()) {
+    use sha2::{Digest, Sha256};
+    
+    let mut ha = Sha256::new();
+    ha.update(a);
+    let digest_a = ha.finalize();
+    
+    let mut hb = Sha256::new();
+    hb.update(b);
+    let digest_b = hb.finalize();
+    
+    let mut diff = 0;
+    for (x, y) in digest_a.iter().zip(digest_b.iter()) {
         diff |= x ^ y;
     }
     diff == 0
@@ -1043,6 +1046,9 @@ async fn post_task(
         AuthOutcome::Allowed(o) => o,
         AuthOutcome::Denied(r) => return r,
     };
+    if op.role == operators::Role::Viewer {
+        return (StatusCode::FORBIDDEN, "forbidden: viewer role cannot task beacons").into_response();
+    }
     let id = match parse_session_hex(&req.session) {
         Some(id) => id,
         None => return (StatusCode::BAD_REQUEST, "bad session hex").into_response(),
@@ -1217,8 +1223,12 @@ async fn list_creds(
     headers: HeaderMap,
     Query(q): Query<CredsQuery>,
 ) -> Response {
-    if let Some(r) = require_auth(&st, &headers) {
-        return r;
+    let op = match authenticate(&st, &headers) {
+        AuthOutcome::Allowed(o) => o,
+        AuthOutcome::Denied(r) => return r,
+    };
+    if q.reveal.unwrap_or(0) == 1 && op.role == operators::Role::Viewer {
+        return (StatusCode::FORBIDDEN, "forbidden: viewer role cannot reveal plaintext secrets").into_response();
     }
     let mut rows = match st.creds.list() {
         Ok(r) => r,
@@ -1255,6 +1265,9 @@ async fn post_creds(
         AuthOutcome::Allowed(o) => o,
         AuthOutcome::Denied(r) => return r,
     };
+    if op.role == operators::Role::Viewer {
+        return (StatusCode::FORBIDDEN, "forbidden: viewer role cannot add credentials").into_response();
+    }
     match st.creds.upsert(&rec) {
         Ok(()) => {
             if let Some(audit) = &st.audit {
@@ -1303,6 +1316,9 @@ async fn delete_cred(
         AuthOutcome::Allowed(o) => o,
         AuthOutcome::Denied(r) => return r,
     };
+    if op.role == operators::Role::Viewer {
+        return (StatusCode::FORBIDDEN, "forbidden: viewer role cannot delete credentials").into_response();
+    }
     let kind = match nyx_store::CredKind::from_label(&key.kind) {
         Some(k) => k,
         None => return (StatusCode::BAD_REQUEST, "bad kind").into_response(),
@@ -1360,8 +1376,12 @@ async fn get_audit(
 
 /// `GET /api/audit/verify` — walk the hash-chain. `{ "ok": bool, "broken_at": Option<u64> }`.
 async fn verify_audit(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let AuthOutcome::Denied(r) = authenticate(&st, &headers) {
-        return r;
+    let op = match authenticate(&st, &headers) {
+        AuthOutcome::Allowed(o) => o,
+        AuthOutcome::Denied(r) => return r,
+    };
+    if op.role == operators::Role::Viewer {
+        return (StatusCode::FORBIDDEN, "forbidden: viewer role cannot verify audit log").into_response();
     }
     let Some(audit) = &st.audit else {
         return (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response();

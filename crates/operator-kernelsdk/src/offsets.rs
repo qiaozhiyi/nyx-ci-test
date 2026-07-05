@@ -795,8 +795,12 @@ pub fn probe_eprocess_offsets(
     // Protection is a single byte, located after ImageFileName in all known builds.
     let mut protection_offset = None;
     for off in image_name_offset + 16..0xA00 {
-        let byte = krw.kread_u64(system_eprocess_kva + off)? as u8;
-        if byte == 0x72 {
+        // Read one byte at a time to avoid IOCTL storms and page-boundary
+        // faults (kread_u64 issues 8 individual IOCTL calls per step).
+        let mut byte_buf = [0u8; 1];
+        krw.kread(system_eprocess_kva + off, &mut byte_buf)
+            .map_err(|_| KrwError::UnresolvedOffset("Protection scan: kread failed"))?;
+        if byte_buf[0] == 0x72 {
             protection_offset = Some(off);
             break;
         }

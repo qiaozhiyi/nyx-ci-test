@@ -227,9 +227,9 @@ impl MiniFilterUnlinker {
         // LIST_ENTRY { Flink: *mut, Blink: *mut } — read both.
         let flink = krw.kread_u64(link_kva).map_err(KitError::from)? as usize;
         let blink = krw.kread_u64(link_kva + 8).map_err(KitError::from)? as usize;
-        if flink == 0 || blink == 0 {
+        if flink < 0xFFFF_8000_0000_0000 || blink < 0xFFFF_8000_0000_0000 {
             return Err(KitError::UnsupportedPosture(
-                "filter PrimaryLink is zero — not in a list or already unlinked",
+                "filter PrimaryLink is non-canonical — not in a list or already unlinked",
             ));
         }
         // blink->Flink = flink ; flink->Blink = blink

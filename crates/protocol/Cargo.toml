@@ -8,7 +8,7 @@ description = "Nyx wire protocol: crypto, framing, task/response messages (share
 [dependencies]
 # default-features off (set in workspace); we re-enable per-crate alloc + the
 # std/no_std-appropriate bits below via features.
-x25519-dalek = { workspace = true, features = ["alloc", "static_secrets", "getrandom"] }
+x25519-dalek = { workspace = true, features = ["alloc", "static_secrets", "getrandom", "zeroize"] }
 chacha20poly1305 = { workspace = true, features = ["alloc"] }
 hkdf = { workspace = true }
 sha2 = { workspace = true }
@@ -31,5 +31,4 @@ std = [
     "chacha20poly1305/std",
     "hkdf/std",
     "sha2/std",
-    "x25519-dalek/zeroize",
 ]

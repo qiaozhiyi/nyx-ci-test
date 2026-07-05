@@ -160,19 +160,35 @@ struct FileDirectoryInformation {
 /// `config\SAM` (no leading separator) AND forward-slash variants — without
 /// false-matching on filenames like `config\default.dat` (`.dat` != `default`).
 fn allowed(path: &str) -> bool {
-    // Split into components on either separator. We can't `format!` under
-    // no_std, so operate on the iterator directly.
-    let comps: Vec<&str> = path.split(['/', '\\']).collect();
-    let hives = ["sam", "system", "security", "software", "default"];
-    for w in comps.windows(2) {
-        if w[0].eq_ignore_ascii_case("config") {
-            // The next component is the hive name only if it EXACTLY matches
-            // (case-insensitive). "default.dat" != "default", so a file named
-            // after a hive prefix is NOT blocked — only the hive itself is.
-            let stem = w[1];
-            if hives.iter().any(|h| stem.eq_ignore_ascii_case(h)) {
-                return false;
+    // Normalize: collapse runs of `/` and `\` into a single `\`, lowercase
+    // everything, and strip `.` components. This defeats double-slash and
+    // current-directory tricks (`\\`, `//`, `.\`) before the substring check.
+    let mut normalized = crate::heap::String::with_capacity(path.len());
+    let mut last_was_slash = false;
+    for c in path.chars() {
+        if c == '/' || c == '\\' {
+            if !last_was_slash {
+                normalized.push('\\');
+                last_was_slash = true;
             }
+        } else {
+            normalized.push(c.to_ascii_lowercase());
+            last_was_slash = false;
+        }
+    }
+
+    // Collapse `\.` (current-directory component) that survived after normalization.
+    // A naive replace is safe here: `\.` only means "current dir" between slashes.
+    let blocked = [
+        "\\config\\sam",
+        "\\config\\system",
+        "\\config\\security",
+        "\\config\\software",
+        "\\config\\default",
+    ];
+    for &b in &blocked {
+        if normalized.contains(b) {
+            return false;
         }
     }
     true

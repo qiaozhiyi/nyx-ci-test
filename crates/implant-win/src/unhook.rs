@@ -217,8 +217,8 @@ pub unsafe fn fresh_ntdll_text() -> Option<(*mut u8, u32, u32)> {
 
     // Build "\KnownDlls\ntdll" as UTF-16 on the stack. NO ".dll" — the
     // KnownDlls object is named "ntdll", and "\KnownDlls\ntdll.dll" FAILS.
-    // 14 chars + NUL = 15 wide = 30 bytes (length) / 32 bytes (max).
-    let mut path: [u16; 15] = [
+    // 16 chars + NUL = 17 wide = 32 bytes (length) / 34 bytes (max).
+    let mut path: [u16; 17] = [
         b'\\' as u16,
         b'K' as u16,
         b'n' as u16,
@@ -234,10 +234,12 @@ pub unsafe fn fresh_ntdll_text() -> Option<(*mut u8, u32, u32)> {
         b't' as u16,
         b'd' as u16,
         b'l' as u16,
+        b'l' as u16,
+        0,
     ];
     let mut name = UnicodeStringMut {
-        length: (14 * 2) as u16,         // 14 chars, no NUL counted
-        maximum_length: (15 * 2) as u16, // room for NUL
+        length: (16 * 2) as u16,         // 16 chars, no NUL counted
+        maximum_length: (17 * 2) as u16, // room for NUL
         buffer: path.as_mut_ptr(),
     };
     let mut oa = ObjectAttributes {

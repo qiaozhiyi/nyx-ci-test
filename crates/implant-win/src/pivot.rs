@@ -152,6 +152,18 @@ unsafe fn slot_of(chan: u32) -> Option<usize> {
     }
     None
 }
+/// Like `slot_of` but skips listening (BIND) sockets — used for data routing
+/// so that operator data is never sent to a passive listener.
+unsafe fn slot_of_active(chan: u32) -> Option<usize> {
+    for i in 0..MAX_CHANNELS {
+        if let Some(c) = unsafe { CHANNELS[i] } {
+            if c.chan == chan && !c.listening {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
 
 /// Insert a new channel. Returns false if the table is full (the caller closes
 /// the socket — the Connect then reports a clean error instead of leaking).
@@ -492,7 +504,7 @@ pub fn channel_data(chan: u32, data: &[u8]) -> Response {
     let Some(fns) = (unsafe { ensure_relay() }) else {
         return Response::Err(String::from("channel_data: winsock unresolved"));
     };
-    let Some(idx) = (unsafe { slot_of(chan) }) else {
+    let Some(idx) = (unsafe { slot_of_active(chan) }) else {
         return Response::Err(String::from("channel_data: unknown channel"));
     };
     let Some(c) = (unsafe { CHANNELS[idx] }) else {

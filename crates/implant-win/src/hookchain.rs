@@ -367,11 +367,26 @@ unsafe fn alloc_persistent_stub(bytes: &[u8]) -> usize {
     }
     let stub_addr = page + slot_idx * STUB_SIZE;
 
-    // Write the stub bytes. The page is RWX (allocated above), so no
-    // protection flip needed for the write. After writing all stubs, a
-    // final pass (in `apply`) flips the whole page to RX.
+    // Write the stub bytes. The page might be locked down to RX on subsequent apply() calls.
+    // Transition to RWX before copying, then back to the old protection.
+    let mut old_protect: u32 = 0;
+    type FnVP = unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32;
+    let vp_resolved = unsafe { resolve::export_addr(b"kernel32.dll", b"VirtualProtect") };
+    if let Some(vp_addr) = vp_resolved {
+        let vp: FnVP = core::mem::transmute(vp_addr);
+        unsafe {
+            vp(stub_addr as *mut c_void, STUB_SIZE, 0x40 /* RWX */, &mut old_protect);
+        }
+    }
     unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), stub_addr as *mut u8, bytes.len());
+    }
+    if let Some(vp_addr) = vp_resolved {
+        let vp: FnVP = core::mem::transmute(vp_addr);
+        let mut dummy: u32 = 0;
+        unsafe {
+            vp(stub_addr as *mut c_void, STUB_SIZE, old_protect, &mut dummy);
+        }
     }
     stub_addr
 }

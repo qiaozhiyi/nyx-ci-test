@@ -340,7 +340,10 @@ pub unsafe fn post_frame(
         // the cap. The bump allocator maps a fixed virtual region; letting a
         // malicious server push past the limit risks OOM / process death.
         if out.len().saturating_add(n) > MAX_RESPONSE_BYTES {
-            break;
+            // Discard all accumulated data and signal a clean transport error
+            // to the caller. Returning partial ciphertext would cause decryption
+            // / frame-parse failures rather than a clean retry.
+            return None;
         }
         out.extend_from_slice(&chunk[..n]);
     }

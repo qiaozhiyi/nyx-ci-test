@@ -172,16 +172,18 @@ async fn main() -> anyhow::Result<()> {
                 let app = app.clone();
                 let fps = state.fingerprints.clone();
                 tokio::spawn(async move {
+                    let timeout_dur = std::time::Duration::from_secs(5);
                     // Read the ClientHello (blocking, tiny) off the stream first.
-                    let stream = match sniff_and_store(stream, peer, fps).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::debug!(?e, %peer, "ClientHello sniff failed");
+                    let stream = match tokio::time::timeout(timeout_dur, sniff_and_store(stream, peer, fps)).await {
+                        Ok(Ok(s)) => s,
+                        _ => {
+                            tracing::debug!(%peer, "ClientHello sniff timed out or failed");
                             return;
                         }
                     };
-                    match acc.accept(stream).await {
-                        Ok(tls) => {
+
+                    match tokio::time::timeout(timeout_dur, acc.accept(stream)).await {
+                        Ok(Ok(tls)) => {
                             let io = hyper_util::rt::TokioIo::new(tls);
                             let builder = hyper_util::server::conn::auto::Builder::new(
                                 hyper_util::rt::TokioExecutor::new(),
@@ -199,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
                             let svc = hyper_util::service::TowerToHyperService::new(svc);
                             let _ = builder.serve_connection(io, svc).await;
                         }
-                        Err(e) => tracing::debug!(?e, "TLS handshake failed"),
+                        _ => tracing::debug!(%peer, "TLS handshake timed out or failed"),
                     }
                 });
             }
@@ -241,7 +243,12 @@ async fn sniff_and_store(
         ));
     }
     let rec_len = ((header[3] as usize) << 8) | header[4] as usize;
-    let rec_len = rec_len.min(16 * 1024);
+    if rec_len > 16384 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ClientHello record size exceeds TLS maximum",
+        ));
+    }
     let mut payload = vec![0u8; rec_len];
     stream.read_exact(&mut payload).await?;
 

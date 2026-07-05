@@ -140,23 +140,40 @@ impl AuditWriter {
     /// default; `?dir=asc` flips it. Hard cap 5000 so a full scan can't OOM.
     pub fn query(&self, q: &AuditQuery) -> std::io::Result<Vec<AuditRecord>> {
         let f = File::open(&self.path)?;
-        let mut recs: Vec<AuditRecord> = BufReader::new(f)
-            .lines()
-            .map_while(Result::ok)
-            .filter_map(|l| serde_json::from_str::<AuditRecord>(&l).ok())
-            .filter(|r| q.operator.as_deref().is_none_or(|o| r.operator == o))
-            .filter(|r| q.action.as_deref().is_none_or(|a| r.action == a))
-            .filter(|r| q.since.is_none_or(|s| r.ts >= s))
-            .filter(|r| q.until.is_none_or(|u| r.ts <= u))
-            .collect();
-        if q.dir.as_deref() == Some("asc") {
-            recs.sort_by_key(|r| r.seq);
-        } else {
-            recs.sort_by_key(|r| std::cmp::Reverse(r.seq));
-        }
-        let offset = q.offset.unwrap_or(0).min(recs.len());
+        let reader = BufReader::new(f);
+        let mut recs = Vec::new();
         let limit = q.limit.unwrap_or(500).min(5000);
-        Ok(recs.into_iter().skip(offset).take(limit).collect())
+        let offset = q.offset.unwrap_or(0);
+        let mut match_count = 0;
+        
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(r) = serde_json::from_str::<AuditRecord>(&line) {
+                if q.operator.as_deref().is_none_or(|o| r.operator == o)
+                    && q.action.as_deref().is_none_or(|a| r.action == a)
+                    && q.since.is_none_or(|s| r.ts >= s)
+                    && q.until.is_none_or(|u| r.ts <= u)
+                {
+                    match_count += 1;
+                    if q.dir.as_deref() == Some("asc") {
+                        if match_count > offset {
+                            recs.push(r);
+                            if recs.len() >= limit {
+                                break;
+                            }
+                        }
+                    } else {
+                        recs.push(r);
+                    }
+                }
+            }
+        }
+        
+        if q.dir.as_deref() != Some("asc") {
+            recs.reverse();
+            let page_offset = offset.min(recs.len());
+            recs = recs.into_iter().skip(page_offset).take(limit).collect();
+        }
+        Ok(recs)
     }
 
     /// The on-disk log path (for `GET /api/audit/verify`).
@@ -210,11 +227,12 @@ fn hash_record(
     let mut h = Sha256::new();
     h.update(seq.to_le_bytes());
     h.update(ts.to_le_bytes());
-    h.update(operator.as_bytes());
-    h.update(action.as_bytes());
-    h.update(target.as_bytes());
-    h.update(detail_json.as_bytes());
-    h.update(prev_hash.as_bytes());
+    
+    let fields = [operator, action, target, detail_json, prev_hash];
+    for f in fields {
+        h.update((f.len() as u64).to_le_bytes());
+        h.update(f.as_bytes());
+    }
     hex::encode(h.finalize())
 }
 

@@ -35,7 +35,8 @@ pub struct ClientHello {
 /// GREASE values: `0x?a?a` (both bytes equal, low nibble 0xa) for both cipher
 /// suites and extension types.
 fn is_grease(v: u16) -> bool {
-    (v & 0x0f0f) == 0x0a0a
+    let bytes = v.to_be_bytes();
+    bytes[0] == bytes[1] && (bytes[0] & 0x0f) == 0x0a
 }
 
 fn u16be(b: &[u8], o: usize) -> u16 {
@@ -52,9 +53,11 @@ pub fn parse_client_hello(rec: &[u8]) -> Result<ClientHello, &'static str> {
     if hs.len() < 4 {
         return Err("handshake header too short");
     }
+    if hs[0] != 1 {
+        return Err("handshake message is not a ClientHello");
+    }
     let hlen = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | hs[3] as usize;
     let body = hs.get(4..4 + hlen).ok_or("handshake length mismatch")?;
-
     if body.len() < 2 + 32 {
         return Err("clienthello too short");
     }
@@ -251,15 +254,15 @@ pub fn ja4(ch: &ClientHello) -> String {
         _ => "00",
     };
     let sni = if ch.sni.is_some() { 'd' } else { 'i' };
-    let ncs = ch.cipher_suites.iter().filter(|c| !is_grease(**c)).count();
-    let nex = ch.extensions.iter().filter(|(t, _)| !is_grease(*t)).count();
+    let ncs = ch.cipher_suites.iter().filter(|c| !is_grease(**c)).count().min(99);
+    let nex = ch.extensions.iter().filter(|(t, _)| !is_grease(*t)).count().min(99);
     let alpn = ch
         .alpn
         .as_deref()
         .map(|a| a.chars().take(2).collect::<String>())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "00".to_string());
-    let ja4_a = format!("t{ver}{sni}{ncs:02x}{nex:02x}{alpn}");
+    let ja4_a = format!("t{ver}{sni}{ncs:02}{nex:02}{alpn}");
 
     // ja4_b — sorted GREASE-free ciphers.
     let mut cs: Vec<u16> = ch
@@ -277,7 +280,7 @@ pub fn ja4(ch: &ClientHello) -> String {
                 .copied()
                 .map(hex4)
                 .collect::<Vec<_>>()
-                .join("-")
+                .join(",")
                 .as_bytes(),
         )
     };
@@ -289,7 +292,13 @@ pub fn ja4(ch: &ClientHello) -> String {
         .map(|(t, _)| *t)
         .filter(|t| !is_grease(*t) && *t != 0 && *t != 16)
         .collect();
-    let prefix = if ch.extensions.first().map(|(t, _)| *t) == Some(0) {
+    let prefix = if ch
+        .extensions
+        .iter()
+        .map(|(t, _)| *t)
+        .filter(|t| !is_grease(*t))
+        .next() == Some(0)
+    {
         'a'
     } else {
         'i'
@@ -298,14 +307,14 @@ pub fn ja4(ch: &ClientHello) -> String {
     let ja4_c = if exts.is_empty() && ch.signature_algorithms.is_empty() {
         "000000000000".to_string()
     } else {
-        let ext_str = exts.iter().copied().map(hex4).collect::<Vec<_>>().join("-");
+        let ext_str = exts.iter().copied().map(hex4).collect::<Vec<_>>().join(",");
         let sig_str = ch
             .signature_algorithms
             .iter()
             .copied()
             .map(hex4)
             .collect::<Vec<_>>()
-            .join("-");
+            .join(",");
         format!(
             "{}{}",
             prefix,
@@ -335,12 +344,15 @@ pub fn sniff_client_hello<R: std::io::Read>(
         return Ok((header.to_vec(), None, None));
     }
     let rec_len = ((header[3] as usize) << 8) | header[4] as usize;
-    // Cap to avoid a malicious length forcing a huge alloc.
-    let rec_len = rec_len.min(16 * 1024);
+    if rec_len > 16384 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ClientHello record size exceeds TLS maximum",
+        ));
+    }
     let mut payload = vec![0u8; rec_len];
     let n = read_exact(&mut r, &mut payload)?;
     let payload = payload[..n].to_vec();
-
     let mut record = Vec::with_capacity(5 + payload.len());
     record.extend_from_slice(&header);
     record.extend_from_slice(&payload);

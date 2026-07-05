@@ -123,6 +123,25 @@ fn get_async_key_state_fn() -> Option<unsafe extern "system" fn(i32) -> i16> {
     GAKS_ADDR.store(addr, Ordering::Relaxed);
     Some(unsafe { core::mem::transmute::<usize, _>(addr) })
 }
+/// Cached `GetKeyState` export address (0 = unresolved). Resolved alongside
+/// `GAKS_ADDR`; used exclusively for the CapsLock toggle query (bit 0 = on).
+static GKS_ADDR: AtomicUsize = AtomicUsize::new(0);
+
+/// Resolve & cache `GetKeyState`. Returns the function pointer, or `None`
+/// if user32 is not loaded. The toggle state returned by `GetKeyState(VK_CAPITAL)`
+/// reflects the system toggle, unlike `GetAsyncKeyState` whose bit-0 tracks
+/// "pressed since last call" rather than "currently toggled on".
+fn get_key_state_fn() -> Option<unsafe extern "system" fn(i32) -> i16> {
+    let cached = GKS_ADDR.load(Ordering::Relaxed);
+    if cached != 0 {
+        return Some(unsafe { core::mem::transmute::<usize, _>(cached) });
+    }
+    // user32 must already be loaded by get_async_key_state_fn() above;
+    // just walk the export table.
+    let addr = unsafe { crate::resolve::export_addr(b"user32.dll", b"GetKeyState") }?;
+    GKS_ADDR.store(addr, Ordering::Relaxed);
+    Some(unsafe { core::mem::transmute::<usize, _>(addr) })
+}
 
 /// Map a virtual-key code + shift state to a single printable byte, or `None`
 /// if the key isn't one we record (function keys, arrows, modifiers, etc.).
@@ -213,8 +232,13 @@ pub fn poll_once() {
     // Determine Shift / CapsLock once for this whole scan.
     // SAFETY: gaks is a valid GetAsyncKeyState pointer.
     let shift = (unsafe { gaks(VK_SHIFT) } & KEY_DOWN_BIT) == KEY_DOWN_BIT;
-    // CapsLock is a *toggle*: its persisted on/off state is the low bit (0x0001).
-    let caps = (unsafe { gaks(VK_CAPITAL) } & 1) != 0;
+    // CapsLock is a *toggle*: use GetKeyState (bit 0 = toggle on/off).
+    // GetAsyncKeyState bit-0 is "pressed since last call", NOT the toggle state.
+    let caps = if let Some(gks) = get_key_state_fn() {
+        (unsafe { gks(VK_CAPITAL) } & 1) != 0
+    } else {
+        false // conservative: assume CapsLock off if user32 unavailable
+    };
     // Letters are uppercase iff Shift XOR CapsLock.
     let upper_for_letters = shift ^ caps;
 

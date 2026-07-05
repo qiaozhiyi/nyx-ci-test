@@ -719,7 +719,7 @@ fn freeze_edr_coma(pid: u32) -> Result<(), KitError> {
             core::ptr::null_mut(),
         )
     };
-    if h_file.is_null() {
+    if h_file.is_null() || h_file as isize == -1 {
         let _ = unsafe { close_handle(h_process) };
         return Err(KitError::Other(format!(
             "CreateFileW failed for dump file — is C:\\Windows\\Temp writable?"

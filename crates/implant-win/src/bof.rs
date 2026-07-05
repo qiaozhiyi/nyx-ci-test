@@ -351,13 +351,27 @@ pub unsafe extern "C" fn BeaconDataParse(d: *mut DataParseState, buffer: *const 
 /// that many bytes; advances the buffer cursor.
 #[no_mangle]
 pub unsafe extern "C" fn BeaconDataExtract(d: *mut DataParseState, size: *mut i32) -> *const u8 {
-    if d.is_null() || (*d).buffer.is_null() {
+    if d.is_null() || (*d).buffer.is_null() || (*d).original.is_null() {
+        if !size.is_null() {
+            *size = 0;
+        }
+        return core::ptr::null();
+    }
+    let consumed = (*d).buffer as usize - (*d).original as usize;
+    let left = (*d).size - consumed as i32;
+    if left < 4 {
         if !size.is_null() {
             *size = 0;
         }
         return core::ptr::null();
     }
     let len = *((*d).buffer as *const i32);
+    if len < 0 || left < 4 + len {
+        if !size.is_null() {
+            *size = 0;
+        }
+        return core::ptr::null();
+    }
     let p = (*d).buffer.add(4);
     (*d).buffer = p.add(len as usize);
     if !size.is_null() {
@@ -369,7 +383,12 @@ pub unsafe extern "C" fn BeaconDataExtract(d: *mut DataParseState, size: *mut i3
 /// `int BeaconGetInt(datap *parser)` — read a 4-byte LE int, advance.
 #[no_mangle]
 pub unsafe extern "C" fn BeaconGetInt(d: *mut DataParseState) -> i32 {
-    if d.is_null() || (*d).buffer.is_null() {
+    if d.is_null() || (*d).buffer.is_null() || (*d).original.is_null() {
+        return 0;
+    }
+    let consumed = (*d).buffer as usize - (*d).original as usize;
+    let left = (*d).size - consumed as i32;
+    if left < 4 {
         return 0;
     }
     let v = *((*d).buffer as *const i32);
@@ -380,7 +399,12 @@ pub unsafe extern "C" fn BeaconGetInt(d: *mut DataParseState) -> i32 {
 /// `short BeaconGetShort(datap *parser)` — read a 2-byte LE short, advance.
 #[no_mangle]
 pub unsafe extern "C" fn BeaconGetShort(d: *mut DataParseState) -> i16 {
-    if d.is_null() || (*d).buffer.is_null() {
+    if d.is_null() || (*d).buffer.is_null() || (*d).original.is_null() {
+        return 0;
+    }
+    let consumed = (*d).buffer as usize - (*d).original as usize;
+    let left = (*d).size - consumed as i32;
+    if left < 2 {
         return 0;
     }
     let v = *((*d).buffer as *const i16);
@@ -391,15 +415,23 @@ pub unsafe extern "C" fn BeaconGetShort(d: *mut DataParseState) -> i16 {
 /// `char *BeaconGetStr(datap *parser)` — read a NUL-terminated string, advance.
 #[no_mangle]
 pub unsafe extern "C" fn BeaconGetStr(d: *mut DataParseState) -> *const u8 {
-    if d.is_null() || (*d).buffer.is_null() {
+    if d.is_null() || (*d).buffer.is_null() || (*d).original.is_null() {
+        return core::ptr::null();
+    }
+    let consumed = (*d).buffer as usize - (*d).original as usize;
+    let left = (*d).size - consumed as i32;
+    if left <= 0 {
         return core::ptr::null();
     }
     let mut len = 0usize;
-    while *(*d).buffer.add(len) != 0 {
+    while len < left as usize && *(*d).buffer.add(len) != 0 {
         len += 1;
         if len > 4096 {
             break;
         }
+    }
+    if len >= left as usize {
+        return core::ptr::null();
     }
     let p = (*d).buffer;
     (*d).buffer = (*d).buffer.add(len + 1);
@@ -410,23 +442,13 @@ pub unsafe extern "C" fn BeaconGetStr(d: *mut DataParseState) -> *const u8 {
 /// Sibling of [`BeaconGetInt`] that takes a `datap` (CS aliases the two names).
 #[no_mangle]
 pub unsafe extern "C" fn BeaconDataInt(d: *mut DataParseState) -> i32 {
-    if d.is_null() || (*d).buffer.is_null() {
-        return 0;
-    }
-    let v = *((*d).buffer as *const i32);
-    (*d).buffer = (*d).buffer.add(4);
-    v
+    BeaconGetInt(d)
 }
 
 /// `short BeaconDataShort(datap *parser)` — read a 2-byte LE short, advance.
 #[no_mangle]
 pub unsafe extern "C" fn BeaconDataShort(d: *mut DataParseState) -> i16 {
-    if d.is_null() || (*d).buffer.is_null() {
-        return 0;
-    }
-    let v = *((*d).buffer as *const i16);
-    (*d).buffer = (*d).buffer.add(2);
-    v
+    BeaconGetShort(d)
 }
 
 /// `int BeaconDataLength(datap *parser)` — bytes remaining in the buffer.
@@ -461,14 +483,14 @@ pub unsafe extern "C" fn BeaconIsAdmin() -> i32 {
 pub unsafe extern "C" fn BeaconGetSpawnTo(_x86: i32) -> *mut u8 {
     // Writable static buffer (lives in .data, not .rdata). Re-stamped each call
     // so a prior BOF's mutations don't leak into the next caller.
-    static mut SPAWN: [u8; 28] = [0; 28];
-    const TEMPLATE: &[u8; 28] = b"C:\\Windows\\System32\\cmd.exe\0";
+    static mut SPAWN: [u8; 1024] = [0; 1024];
+    const TEMPLATE: &[u8] = b"C:\\Windows\\System32\\cmd.exe\0";
     // SAFETY: single-threaded (beacon loop); SPAWN is only touched here.
     unsafe {
         core::ptr::copy_nonoverlapping(
             TEMPLATE.as_ptr(),
             core::ptr::addr_of_mut!(SPAWN).cast::<u8>(),
-            28,
+            TEMPLATE.len(),
         );
         core::ptr::addr_of_mut!(SPAWN).cast::<u8>()
     }

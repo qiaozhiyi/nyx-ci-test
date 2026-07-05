@@ -502,9 +502,12 @@ fn probe_one(f: &WsaFns, addr: u32, port: u16) -> bool {
         fd_count: 1,
         fd_array: fdarr,
     };
+    // 250 ms per port — keeps total scan time bounded and avoids long beacon
+    // blackouts. The original 2 s × N-ports would stall check-ins for minutes
+    // on filtered hosts.
     let tv = Timeval {
-        tv_sec: 2,
-        tv_usec: 0,
+        tv_sec: 0,
+        tv_usec: 250_000,
     };
     let n = unsafe { (f.select)(0, core::ptr::null(), &wfds, core::ptr::null(), &tv) };
 
