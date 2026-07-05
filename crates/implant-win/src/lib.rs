@@ -106,6 +106,8 @@ pub mod resolve;
 #[cfg(target_os = "windows")]
 pub mod screenshot;
 #[cfg(target_os = "windows")]
+pub mod pic_thunk;
+#[cfg(target_os = "windows")]
 pub mod selftests;
 #[cfg(target_os = "windows")]
 pub mod shell;
@@ -113,6 +115,8 @@ pub mod shell;
 pub mod sleep;
 #[cfg(target_os = "windows")]
 pub mod stack;
+#[cfg(target_os = "windows")]
+pub mod tp;
 #[cfg(target_os = "windows")]
 pub mod syscalls;
 #[cfg(target_os = "windows")]

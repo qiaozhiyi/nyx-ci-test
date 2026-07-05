@@ -105,7 +105,10 @@ jobs:
           $dllDir = "crates/implant-win/target/x86_64-pc-windows-msvc/release"
           $dll = "$dllDir/nyx_implant_win.dll"
           # The aggregator + the G1 (postex) + evasion entry points.
-          $tests = @("nyx_selftest","nyx_selftest_postex","nyx_selftest_evasion")
+          $tests = @(
+            "nyx_selftest","nyx_selftest_postex","nyx_selftest_evasion",
+            "nyx_selftest_foliage_apc","nyx_selftest_inject_pool"
+          )
           Write-Host "Test                      Exit   Ran   Bits"
           Write-Host "------------------------- ------ ----- ----"
           foreach ($t in $tests) {

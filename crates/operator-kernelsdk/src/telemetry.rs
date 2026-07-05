@@ -406,10 +406,13 @@ mod tests {
     #[test]
     fn minifilter_unlink_relinks_neighbours() {
         let krw = MockKrw::new();
+        // Use kernel-canonical addresses (>= 0xFFFF_8000_0000_0000) — the
+        // production guard rejects user-space-range pointers as non-canonical.
+        const KBASE: usize = 0xFFFF_8000_0000_0000;
         // Build: head <-> A (filter) <-> B (filter) <-> head
-        let head = 0x1000usize;
-        let filter_a = 0x2000usize;
-        let filter_b = 0x3000usize;
+        let head = KBASE + 0x1000;
+        let filter_a = KBASE + 0x2000;
+        let filter_b = KBASE + 0x3000;
         let link_a = filter_a + flt::FLT_OBJECT_PRIMARY_LINK;
         let link_b = filter_b + flt::FLT_OBJECT_PRIMARY_LINK;
         // head.Flink = link_a, head.Blink = link_b

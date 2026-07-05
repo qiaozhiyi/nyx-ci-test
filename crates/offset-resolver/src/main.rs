@@ -47,6 +47,7 @@ fn main() -> Result<()> {
     let mut out: PathBuf = PathBuf::from("offsets.toml");
     let mut build: Option<u32> = None;
     let mut ntoskrnl: Option<PathBuf> = None;
+    let mut fltmgr: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -56,6 +57,7 @@ fn main() -> Result<()> {
             "--age" => { i += 1; age = Some(args[i].parse()?); }
             "--build" => { i += 1; build = Some(args[i].parse()?); }
             "--ntoskrnl" => { i += 1; ntoskrnl = Some(PathBuf::from(&args[i])); }
+            "--fltmgr" => { i += 1; fltmgr = Some(PathBuf::from(&args[i])); }
             "--out" => { i += 1; out = PathBuf::from(&args[i]); }
             "--help" | "-h" => {
                 eprintln!(
@@ -72,6 +74,11 @@ fn main() -> Result<()> {
                                        Download by explicit GUID+age (hex GUID, no dashes).\n\
                      --pdb-path <file> Parse a local ntoskrnl.pdb you already have.\n\
                      --build <num>     Use the known offsets table for build <num> (no PDB).\n\
+                     --fltmgr <exe>    ALSO resolve FltGlobals RVA from a live fltmgr.sys PE\n\
+                                       (downloads fltmgr.pdb, parses the global symbol, merges\n\
+                                       `flt.globals_rva` into the output). Combine with any source\n\
+                                       above (--ntoskrnl / --build / --pdb-path). The resulting\n\
+                                       TOML can be passed to nyx-kernel via --flt-rva.\n\
                      \n\
                      --out <file>      Write offsets here (default: offsets.toml)."
                 );
@@ -143,6 +150,26 @@ fn main() -> Result<()> {
         emit_known_offsets(build_num)
             .ok_or_else(|| anyhow!("build {build_num} not in the known table"))?
     };
+    // Merge FltGlobals RVA from fltmgr.sys PDB if `--fltmgr` was supplied.
+    // This is independent of the ntoskrnl flow above — fltmgr.pdb carries its
+    // own global symbols, and FltGlobals is an unexported `.data` symbol there.
+    let mut offsets = offsets;
+    if let Some(flt_path) = &fltmgr {
+        match resolve_flt_globals_rva(flt_path) {
+            Ok(rva) => {
+                eprintln!("Resolved FltGlobals RVA = 0x{rva:x} from {}", flt_path.display());
+                offsets.insert("flt.globals_rva", rva);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: --fltmgr resolution failed ({}); omitting flt.globals_rva. \
+                     Operator must supply --flt-rva to nyx-kernel.",
+                    e
+                );
+            }
+        }
+    }
+
     let toml = emit_toml(build_num, &offsets);
     std::fs::write(&out, &toml)?;
     eprintln!("Wrote offsets for build {build_num} to {}", out.display());
@@ -498,6 +525,95 @@ fn download_pdb(pdb_name: &str, guid: &str, age: u32) -> Result<Vec<u8>> {
         .with_context(|| format!("read PDB body from {url}"))?;
     eprintln!("Downloaded {} ({} bytes)", pdb_name, buf.len());
     Ok(buf)
+}
+
+/// Resolve the `FltGlobals` RVA from a live `fltmgr.sys` PE.
+///
+/// `FltGlobals` is an unexported `.data` global in fltmgr.sys — the build
+/// table covers the common case, but for an unknown/early-UBR build the
+/// operator points this at `C:\Windows\System32\drivers\fltmgr.sys` and we
+/// resolve the symbol from the matching `fltmgr.pdb` on the MS symbol server.
+///
+/// Returns the RVA (offset within fltmgr.sys) on success. The caller merges it
+/// into the TOML as `flt.globals_rva`; nyx-kernel reads it via `--flt-rva`.
+fn resolve_flt_globals_rva(fltmgr_exe: &std::path::Path) -> Result<usize> {
+    // 1. Extract the PDB GUID+age from fltmgr.sys's PE debug directory.
+    let (guid, age) = extract_pdb_ref_from_pe(fltmgr_exe)
+        .with_context(|| format!("extract PDB ref from {}", fltmgr_exe.display()))?;
+    eprintln!(
+        "Extracted from {}: GUID={guid} AGE={age}",
+        fltmgr_exe.display()
+    );
+
+    // 2. Download fltmgr.pdb (download_pdb is parameterised by pdb_name).
+    let pdb_name = "fltmgr.pdb";
+    let data = download_pdb(pdb_name, &guid, age)
+        .context("download fltmgr.pdb from symbol server")?;
+
+    // 3. Walk the PDB global/public symbols for `FltGlobals`.
+    parse_pdb_global_rva(&data, &["FltGlobals", "_FltGlobals"])
+        .context("parse FltGlobals RVA from fltmgr.pdb")
+}
+
+/// Find the RVA of a named global symbol in a PDB by walking the public/global
+/// symbol stream. Modeled on `detect_build_from_pdb` (which already iterates
+/// `global_symbols()` to find `NtBuildNumber` by name).
+///
+/// `names` is tried in order (some symbols are underscore-prefixed on x64).
+/// Returns the first match's RVA. The RVA is computed from the PDB's section
+/// table (DBI stream) + the symbol's `(segment, offset)` — the public-symbol
+/// stream carries a `PdbInternalSectionOffset`, not a ready-made RVA.
+fn parse_pdb_global_rva(data: &[u8], names: &[&str]) -> Result<usize> {
+    use pdb::{FallibleIterator, PDB};
+    let cursor = std::io::Cursor::new(data.to_vec());
+    let mut pdb = PDB::open(cursor).context("open PDB")?;
+
+    // Pull the PE section table from the PDB so we can translate
+    // (section_index, section_offset) → file RVA. Each section's
+    // `virtual_address` is its RVA base; the symbol offset is added to it.
+    let sections: Vec<pdb::ImageSectionHeader> = pdb
+        .sections()
+        .context("read section headers from PDB")?
+        .ok_or_else(|| anyhow!("PDB has no section table (corrupt or stripped)?"))?;
+    eprintln!("Loaded {} PE sections from PDB", sections.len());
+
+    let symbols = pdb
+        .global_symbols()
+        .context("read global_symbols stream")?;
+    let mut iter = symbols.iter();
+    while let Some(symbol) = iter.next().with_context(|| "iterate PDB symbols")? {
+        if let Ok(pdb::SymbolData::Public(pub_data)) = symbol.parse() {
+            let name = pub_data.name.to_string();
+            if names.iter().any(|n| name == *n || name == format!("_{n}")) {
+                // pub_data.offset is a PdbInternalSectionOffset { section, offset }.
+                let sec_idx = pub_data.offset.section;
+                let sect_off = pub_data.offset.offset as usize;
+                // Section indices in the pdb crate are 1-based; sections[] is
+                // 0-based, so section N maps to sections[N - 1].
+                let rva = if sec_idx == 0 {
+                    // Some symbols carry an absolute/zero section (the offset
+                    // IS the RVA). Rare for `.data` globals but defensive.
+                    sect_off
+                } else {
+                    let sec = sections.get(sec_idx as usize - 1).ok_or_else(|| {
+                        anyhow!(
+                            "symbol {name}: section index {sec_idx} out of range ({} sections)",
+                            sections.len()
+                        )
+                    })?;
+                    sec.virtual_address as usize + sect_off
+                };
+                eprintln!(
+                    "Found symbol {name} (section={sec_idx}, section_offset=0x{sect_off:x}, rva=0x{rva:x})"
+                );
+                return Ok(rva);
+            }
+        }
+    }
+    Err(anyhow!(
+        "symbol(s) {:?} not found in PDB global stream",
+        names
+    ))
 }
 
 /// Known offsets per build (mirrors evasionsdk::offsets_table). The PDB walker

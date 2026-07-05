@@ -12,8 +12,7 @@ This project implements a comprehensive testing and review suite for the **Nyx**
 - `crates/` - Core Rust crates.
 - `scripts/` - Helper and deployment scripts.
 - `tools/` - Standalone tools (e.g., sRDI).
-- `docs/` - **Authoritative status: `docs/STATUS.md`**. Live dev docs (capabilities, handoff, real-machine results). `docs/archive/` holds superseded audit/research docs (historical, not authoritative).
-
+- `docs/` - **Authoritative status: [`docs/STATUS.md`](docs/STATUS.md)** + **code-audited capability inventory: [`docs/CAPABILITY_AUDIT_2026-07-05.md`](docs/CAPABILITY_AUDIT_2026-07-05.md)**. Live dev docs (capabilities, handoff, real-machine results). `docs/archive/` holds superseded audit/research docs (historical, not authoritative).
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
@@ -25,6 +24,17 @@ This project implements a comprehensive testing and review suite for the **Nyx**
 | 6 | M6. Kernel Real-Machine | BYOVD load + ETW-TI + DKOM + Callback repurpose on Server 2019 | M5 | DONE (2026-06-26) |
 | 7 | M7. Gap Closure + Real-Machine | Close gaps G1-G5 (postex/creds-audit/BOF-loader/MiniFilter/symserver); verify G1 on Server 2019 | M6 | DONE (2026-06-27) |
 | 8 | M8. Win11 24H2 Real-Machine | Cross-version offset + CET verify on Win11 24H2/25H2 | M7, Win11 VM | 🔶 BLOCKED (no Win11 24H2 host in sshconfig) |
+| 9 | M9. Traffic Resilience V1 | Multi-channel mesh (HTTPS+DoH) + DGA + jitter mimicry | None | 🎯 PLANNED — see [`docs/NATIONAL_TIER_MASTER_DESIGN.md`](docs/NATIONAL_TIER_MASTER_DESIGN.md) §C1 |
+| 10 | M10. Lateral Movement V1 | LSASS dump + Kerberoasting + PtH + WMI/DCOM lateral | None | 🎯 PLANNED — §C5 |
+| 11 | M11. Anti-Forensics V1 | Windows timestomp/USN/Prefetch/EventLog cleanup + memory-only path | None | 🎯 PLANNED — §C4 |
+| 12 | M12. Cross-Platform V1 | `implant-core` trait + Linux production implant | None | 🎯 PLANNED — §C2 |
+| 13 | M13. Delivery & Exploit V1 | stager + multi-stage loader + 1 N-day LPE chain + payload polymorphism | None | 🎯 PLANNED — §C3 |
+| 14 | M14. Server Federation V1 | 3-node Raft + session migration + operator cooperative locks | None | 🎯 PLANNED — §C6 |
+| 15 | M15. macOS Implant + Integration | Mach-O dylib implant + amfid/ES bypass + full-pillar integration | M12 | 🎯 PLANNED — §C2 |
+
+## National-Tier Roadmap (2026-07-05)
+
+> **Master design:** [`docs/NATIONAL_TIER_MASTER_DESIGN.md`](docs/NATIONAL_TIER_MASTER_DESIGN.md) — defines the 18–24 month evolution from current single-platform C2 to a Tier-1 nation-grade action platform across six pillars (C1 traffic resilience · C2 cross-platform · C3 delivery · C4 anti-forensics · C5 lateral · C6 federation). M9–M15 above are the staged milestones; each is independently verifiable. Out-of-scope items (0day R&D, mobile 0click, firmware/OT) are explicitly listed as external dependencies in §7 of the master design.
 
 ## Bypass Module Status (2026-06-27)
 
@@ -47,8 +57,8 @@ This project implements a comprehensive testing and review suite for the **Nyx**
 - ✅ ETW-TI provider blind (IsEnabled=0, HVCI-safe)
 - ✅ DKOM process hide (ActiveProcessLinks unlink/relink)
 - ✅ Callback repurpose (DATA write, **selective slot targeting DONE** — range-based ntoskrnl skip + slot[0] fallback)
-- ✅ PatchGuard windows — `TimingRepairWindow` + `RuntimePgBypassWindow` real; only legacy `PatchGuardWindow` is a skeleton
-- 🔶 MiniFilter — algorithm in `telemetry.rs::MiniFilterUnlinker`, but `bootstrap_chain()` does NOT wire it (`flt_globals_kva=0`)
+- ✅ PatchGuard windows — `TimingRepairWindow` + `RuntimePgBypassWindow` real; **vestigial `PatchGuardWindow` skeleton deleted (P0.a, 2026-07-05)**; `nyx-kernel pg-window` subcommand now exposes `select_pg_window`
+- ✅ MiniFilter — algorithm in `telemetry.rs::MiniFilterUnlinker`; **`bootstrap_chain` now auto-resolves FltGlobals RVA via build table (P0.b, 2026-07-05)** (17763/19041/22621/26100 + patch-equiv); `--flt-rva` only needed for unknown/early-UBR builds
 
 ### Real-machine verification (Server 2019 17763.1339)
 - ✅ Task G: BYOVD driver load + ntoskrnl base resolve

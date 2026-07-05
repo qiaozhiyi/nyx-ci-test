@@ -581,6 +581,73 @@ pub mod flt {
     /// `CONTAINING_RECORD(entry, _FLT_FILTER, PrimaryLink)` = entry - 0x10.
     /// (17763: 0x10. The prior 0x1c was wrong.)
     pub const FLT_OBJECT_PRIMARY_LINK: usize = 0x10;
+
+    // ---- Build-keyed FltGlobals RVA table --------------------------------
+    //
+    // FltGlobals is an unexported `.data` symbol in fltmgr.sys, so it cannot be
+    // pattern-scanned safely (no stable cross-version byte signature). This
+    // table carries the RVA per build, sourced from EDRSandblast's
+    // FltmgrOffsets.csv (latest UBR per build family). It mirrors the EPROCESS
+    // / PG-context table pattern so `resolve_offsets` can fall back to it when
+    // the operator did not supply `--flt-rva`.
+    //
+    // UBR drift: the RVA is stable on the latest UBR per family but drifts on
+    // early UBRs (e.g. 22621.1 = 0x2c700, 22621.2361+ = 0x2e700). We carry the
+    // latest-UBR value and document the risk; an operator hitting an early UBR
+    // must supply `--flt-rva` or run offset-resolver's `--fltmgr` mode.
+    pub const KNOWN_FLT_GLOBALS_RVAS: &[(u32, usize)] = &[
+        // Server 2019 LTSC / 1809 — stable across all UBRs.
+        (17763, 0x2a540),
+        // Win10 2004-22H2 family — latest UBR (≥1806).
+        (19041, 0x29600),
+        // Win11 22H2-23H2 — latest UBR (≥2361). Early 22621.1 = 0x2c700.
+        (22621, 0x2e700),
+        // Win11 24H2 — observed on 26100.1xxx; not yet in EDRSandblast CSV,
+        // sourced from community offsets. Operator should verify / supply
+        // --flt-rva if the kit refuses to assemble.
+        (26100, 0x2a940),
+    ];
+
+    /// Patch-equivalent FltGlobals builds — same RVA as the baseline family.
+    pub const FLT_PATCH_EQUIVALENT_BUILDS: &[(u32, u32)] = &[
+        // Win10 20H2-22H2 → 19041 family.
+        (19042, 19041),
+        (19043, 19041),
+        (19044, 19041),
+        (19045, 19041),
+        // Win11 21H2 → 19041 family (same fltmgr binary base).
+        (22000, 19041),
+        // Win11 23H2 → 22621.
+        (22631, 22621),
+        // Win11 25H2 → 26100.
+        (26200, 26100),
+    ];
+
+    /// Resolve the FltGlobals RVA for a Windows build number.
+    ///
+    /// Resolution order mirrors `offsets::for_build`:
+    /// 1. Exact match in [`KNOWN_FLT_GLOBALS_RVAS`].
+    /// 2. Patch-equivalent in [`FLT_PATCH_EQUIVALENT_BUILDS`].
+    /// 3. `None` — caller should fall back to `--flt-rva` CLI flag or the
+    ///    offset-resolver `--fltmgr` PDB mode.
+    ///
+    /// Does NOT floor-match — a wrong FltGlobals RVA corrupts an unrelated
+    /// `.data` symbol and likely bugchecks.
+    pub fn flt_globals_rva_for_build(build: u32) -> Option<usize> {
+        // 1. Exact match.
+        if let Some(&(_, rva)) = KNOWN_FLT_GLOBALS_RVAS.iter().find(|(b, _)| *b == build) {
+            return Some(rva);
+        }
+        // 2. Patch-equivalent.
+        if let Some(&(_, baseline)) = FLT_PATCH_EQUIVALENT_BUILDS.iter().find(|(p, _)| *p == build) {
+            return KNOWN_FLT_GLOBALS_RVAS
+                .iter()
+                .find(|(b, _)| *b == baseline)
+                .map(|(_, rva)| *rva);
+        }
+        // 3. Unknown.
+        None
+    }
 }
 
 // (ETW-TI handle is resolved by symbol name — see ETW_TI_HANDLE_SYMBOL above.
@@ -674,6 +741,55 @@ mod eprocess_table_tests {
         // silently floor-match — resolve_eprocess_offsets is the fallback.
         assert!(for_build(26300).is_none());
         assert!(for_build(26999).is_none());
+    }
+
+    #[test]
+    fn flt_globals_rva_known_builds() {
+        // Exact matches: every build in the table resolves.
+        assert_eq!(flt::flt_globals_rva_for_build(17763), Some(0x2a540));
+        assert_eq!(flt::flt_globals_rva_for_build(19041), Some(0x29600));
+        assert_eq!(flt::flt_globals_rva_for_build(22621), Some(0x2e700));
+        assert_eq!(flt::flt_globals_rva_for_build(26100), Some(0x2a940));
+        // Sanity: matches the documented 17763.1 reference constant.
+        assert_eq!(
+            flt::flt_globals_rva_for_build(17763),
+            Some(flt::FLT_GLOBALS_RVA_17763_1)
+        );
+    }
+
+    #[test]
+    fn flt_globals_rva_patch_equivalent() {
+        // Win10 20H2-22H2 → 19041 family.
+        for &patch in &[19042, 19043, 19044, 19045] {
+            assert_eq!(
+                flt::flt_globals_rva_for_build(patch),
+                flt::flt_globals_rva_for_build(19041),
+                "build {patch} should resolve via patch-equivalence"
+            );
+        }
+        // Win11 21H2 → 19041.
+        assert_eq!(
+            flt::flt_globals_rva_for_build(22000),
+            flt::flt_globals_rva_for_build(19041)
+        );
+        // Win11 23H2 → 22621.
+        assert_eq!(
+            flt::flt_globals_rva_for_build(22631),
+            flt::flt_globals_rva_for_build(22621)
+        );
+        // Win11 25H2 → 26100.
+        assert_eq!(
+            flt::flt_globals_rva_for_build(26200),
+            flt::flt_globals_rva_for_build(26100)
+        );
+    }
+
+    #[test]
+    fn flt_globals_rva_unknown_returns_none() {
+        // Future / unknown build — must NOT floor-match (would corrupt an
+        // unrelated `.data` symbol and likely bugcheck).
+        assert!(flt::flt_globals_rva_for_build(26300).is_none());
+        assert!(flt::flt_globals_rva_for_build(26999).is_none());
     }
 
     #[test]

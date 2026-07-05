@@ -370,13 +370,22 @@ pub fn resolve_offsets(
         0
     };
 
-    // Step 5b: Resolve FltGlobals KVA via the operator-supplied RVA.
-    // FltGlobals is an unexported `.data` symbol in fltmgr.sys — it has no
-    // reliable cross-version byte signature, so pattern scan cannot safely
-    // locate it. The operator resolves the RVA offline (PDB / offset-resolver
-    // / build table) and we add it to fltmgr's runtime base here.
+    // Step 5b: Resolve FltGlobals KVA. Resolution priority:
+    //   1. operator-supplied `--flt-rva` (most precise, overrides everything)
+    //   2. build-table fallback (`offsets::flt::flt_globals_rva_for_build`)
+    //   3. zero (kit stays unassembled — operator must supply --flt-rva or
+    //      run offset-resolver `--fltmgr` PDB mode)
+    // FltGlobals is an unexported `.data` symbol in fltmgr.sys — no reliable
+    // cross-version byte signature, so pattern scan cannot safely locate it.
     let flt_globals_kva = flt_globals_rva
         .and_then(|rva| unsafe { resolve_flt_globals_kva(Some(rva)) })
+        .or_else(|| {
+            // Build-table fallback for when the operator didn't supply --flt-rva.
+            // Covers the common case (latest UBR per family); early-UBR drift
+            // still requires the operator-supplied flag.
+            crate::offsets::flt::flt_globals_rva_for_build(build)
+                .and_then(|rva| unsafe { resolve_flt_globals_kva(Some(rva as u32)) })
+        })
         .unwrap_or(0);
 
     Ok(crate::offsets::RuntimeOffsets {

@@ -16,3 +16,5 @@ crates/*/target/
 /librust_out.rmeta
 /ui.log
 /screenshot*.png
+.claude/worktrees/
+target/drivers/

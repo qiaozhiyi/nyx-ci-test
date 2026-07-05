@@ -13,3 +13,4 @@ path = "src/main.rs"
 
 [dependencies]
 nyx-operator-kernelsdk = { path = "../operator-kernelsdk" }
+nyx-minidump-assembler = { path = "../minidump-assembler" }
