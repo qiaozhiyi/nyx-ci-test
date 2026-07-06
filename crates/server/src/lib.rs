@@ -1142,7 +1142,11 @@ async fn get_results(
         AuthOutcome::Denied(r) => return r,
     };
     if op.role == operators::Role::Viewer {
-        return (StatusCode::FORBIDDEN, "forbidden: viewer role cannot drain results").into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            "forbidden: viewer role cannot drain results",
+        )
+            .into_response();
     }
     let id = match parse_session_hex(&q.session) {
         Some(id) => id,

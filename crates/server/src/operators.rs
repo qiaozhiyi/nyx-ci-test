@@ -111,7 +111,10 @@ impl OperatorRegistry {
             .map(|g| g.values().cloned().collect())
             .map_err(|_| {
                 eprintln!("FATAL: operator registry RwLock poisoned — refusing to operate");
-                std::io::Error::new(std::io::ErrorKind::Other, "operator registry RwLock poisoned")
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "operator registry RwLock poisoned",
+                )
             })
     }
 
