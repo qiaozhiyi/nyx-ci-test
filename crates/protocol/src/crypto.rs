@@ -154,6 +154,7 @@ impl ServerKeypair {
 impl Drop for ServerKeypair {
     fn drop(&mut self) {
         self.secret.zeroize();
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -191,6 +192,7 @@ impl ImplantKeypair {
 impl Drop for ImplantKeypair {
     fn drop(&mut self) {
         self.secret.zeroize();
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
 

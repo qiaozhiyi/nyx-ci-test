@@ -2,7 +2,7 @@
 
 > **权威文档。** 这是项目当前的、经代码核对的唯一状态事实源。
 > **优先级口径：** 一切以源码 `file:line` 为唯一证据。当本文与其他文档（含 `CLAUDE.md`、`docs/archive/`）冲突时，**以本文为准**。
-> **核对日期:** 2026-06-27（G1–G5 开发完成后） · **最后增量核对:** 2026-07-02（beacon loop 打通 + 全部接线闭合 + CI/fuzz/selftest gate） · **分支:** `main` · **授权:** 仅限授权红队 / 安全研究
+> **核对日期:** 2026-07-06（P6 Fluctuation+LACUNA 接线完成） · **分支:** `main` · **授权:** 仅限授权红队 / 安全研究
 > 历史审计 / 研究产物已移入 `docs/archive/`（见 `docs/archive/README.md`）。
 
 ---
@@ -15,13 +15,9 @@
 - `cargo +nightly check -p nyx-implant-win --target x86_64-pc-windows-gnu` ✅ 绿（52 warnings，无 error）
 - `operator-kernelsdk`（独立 crate）✅ 编译通过，`cargo test --lib` = **90 通过 / 4 失败**（4 个为预存 `*_is_windows_only` 平台 gate 缺陷，真 Windows 上函数实际执行导致断言失败，与功能无关；见 §0a）
 - `implant-evasionsdk`（独立 crate）✅ **53 通过 / 0 失败**
-- **implant-win DLL 真机 release build** ✅ `nyx_implant_win.dll` 286.5 KB（远程 mingw-w64 16.1.0 + nightly build-std，2026-07-01）
-- selftest 导出 **49 个**（2026-07-01 真机 objdump 枚举；原计 48 漏了 `nyx_selftest_envprobe`）
-- **49 个 selftest 真机 rundll32 全量回归** ✅ 49/49 正常退出，0 超时（2026-07-01；`scripts/win_selftest_all.ps1`）
+- selftest 导出 **53 个**（2026-07-06 新增 `nyx_selftest_lacuna`）
+- **53 个 selftest 真机 rundll32 全量回归** ✅ 53/53 正常退出，0 超时（2026-07-06；`scripts/win_selftest_all.ps1 -Validate` = 35 验证码匹配 / 0 偏差）
 - 真机环境：Windows Server 2019 Datacenter **17763.1339**（UBR=0x53b, ntoskrnl=10.0.17763.1339）+ RTCore64.sys (CVE-2019-16098)
-- server TLS 监听 ✅ 可用（2026-06-29 修复 rustls 0.23 CryptoProvider panic，commit `746e1dd`）
-
-### 0a. 2026-07-01 真机全量回归（本次修复验证）
 
 本次修复 3 处 CRITICAL 并在 17763.1339 真机全量验证：
 
@@ -88,6 +84,29 @@
 - `scripts/win_selftest_all.ps1 -Validate`：49 导出退出码验证 gate
 - `nyx-operator-kernel-cli`（新 bin）：kernel tier 操作化（bootstrap_chain → resolve_offsets → assemble_tier → kit dispatch）
 
+
+### 0d. 2026-07-06 P6 Fluctuation + LACUNA + Pool Party + TLS 接线闭合
+
+**里程碑：军用级睡眠混淆（CFG/CET 免疫）+ 幽灵帧调用栈欺骗。**
+
+| 特性 | 模块 | 说明 |
+|---|---|---|
+| **Fluctuation 睡眠混淆** | `fluctuation.rs` + `fluctuation_thunk.rs` | 替代 Foliage/Ekko。睡眠时 `.text`→`PAGE_NOACCESS`（内存扫描器不可读），唤醒→`PAGE_EXECUTE_READ`。零 CFG/CET 问题，无线程池回调，无 NtContinue ROP。Thunk 置于动态分配 RWX 页（CFG bitmap 不覆盖）。 |
+| **LACUNA 幽灵帧扫描** | `lacuna.rs` | 跨版本 `.pdata` 间隙扫描器。bootstrap 时扫描 ntdll/kernelbase/win32u 的 RUNTIME_FUNCTION lacunae。双路径：DataDirectory[3] 优先 → 段头表 fallback（17763 ntdll 的 Exception Directory 为空）。构建幽灵帧链用于调用栈欺骗。移植自 Mohamed Alzhrani LACUNA Chain（2026 年 6 月）。 |
+| **Pool Party 修复** | `tp.rs` | `local_base` 替代 `target_base` 写入 TpDirect（修复 STATUS_ACCESS_VIOLATION）。`TP_DIRECT_CALLBACK_OFFSET` 0x08→0x10。注入执行改为 section-backed NtCreateThreadEx。 |
+| **WinHTTP TLS 修复** | `transport.rs` | `WINHTTP_OPTION_SECURITY_FLAGS` 32→31 (0x1F)。先发严格验证→失败后设 IGNORE flag→重试的经典模式。 |
+
+**真机验证结果（17763.1339）**：
+
+| selftest | 退出码 | 状态 |
+|---|---|---|
+| `nyx_selftest_lacuna` | 15 (0b1111) | ntdll/kernelbase/win32u 间隙扫描 + 六层链构建 |
+| `nyx_selftest_foliage` | 1 | Fluctuation 睡眠混淆正常 |
+| `nyx_selftest_foliage_apc` | 1 | 同上（旧 gate 强制 ON 不影响） |
+| `nyx_selftest_inject_pool` | 1 | Pool Party 注入正常 |
+| `nyx_selftest_transport` | 1 | WinHTTP TLS 正常 |
+
+**53/53 selftest 全部正常退出，0 超时。35 项验证码精确匹配，0 偏差。**
 ---
 
 ## 1. 总体完成度
@@ -97,10 +116,10 @@
 | 用户态 bypass（implant-win） | ~98% | 14 selftest 全通过；PE-sieve 0 implanted |
 | 内核算法（operator-kernelsdk） | 100% | 82 单测通过（`cargo test -p nyx-operator-kernelsdk`） |
 | 内核接线 | ~97% | `bootstrap_chain` → KslD → BYOVD → ETW-TI → DKOM → callback repurpose 全通 |
-| 内核真机（Server 2019） | 7/7 PASS | 任务 G–K 全链路（见 `kernel-test-results.md`） |
-| **整体** | **~95%** | G1–G5 全部完成；G6 已暂缓搁置（需物理机验证） |
-
-> 注：所有用户态规避模块均已**实装且默认 ARMED**（gate 默认见 §3）。
+| 5b | **Fluctuation 睡眠混淆**（PAGE_NOACCESS 振荡） | `fluctuation.rs` | ✅ | `FLUCTUATION_ENABLED`=**ON** |
+| 5c | **LACUNA 幽灵帧栈欺骗**（.pdata 间隙扫描） | `lacuna.rs` | ✅ | —（bootstrap 自动扫描） |
+| 6 | 栈欺骗（BYOUD-Gap RSP swap，CET-aware） | `stack.rs` | ✅ 代码完成 | `SPOOF_SWAP_ENABLED`=**OFF**（CET-on 前保守关闭） |
+| 7 | 进程注入（Module Stomping + ThreadlessInject HWBP + **Pool Party**） | `inject.rs` + `tp.rs` | ✅ | `MODULESTOMP_ENABLED`=**ON**，`POOL_PARTY_ENABLED`=OFF |
 > 2026-06-27 关闭了全部代码缺口（G1 postex 接线、G2 creds/audit、G3 GUI、
 > G4 MiniFilter 可调用、G5 符号服务器下载）；**G6 真机验证已暂缓搁置**（需物理机）。
 

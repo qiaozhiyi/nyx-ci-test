@@ -225,7 +225,9 @@ fn hash_record(
     prev_hash: &str,
 ) -> String {
     let mut h = Sha256::new();
+    h.update(8u64.to_le_bytes());
     h.update(seq.to_le_bytes());
+    h.update(8u64.to_le_bytes());
     h.update(ts.to_le_bytes());
 
     let fields = [operator, action, target, detail_json, prev_hash];

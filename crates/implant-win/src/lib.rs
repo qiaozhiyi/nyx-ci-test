@@ -79,6 +79,8 @@ pub mod envprobe;
 pub mod evasion_glue;
 #[cfg(target_os = "windows")]
 pub mod fs;
+pub mod fluctuation;
+pub mod fluctuation_thunk;
 #[cfg(target_os = "windows")]
 pub mod hashdump;
 #[cfg(target_os = "windows")]
@@ -86,6 +88,7 @@ pub mod hookchain;
 #[cfg(target_os = "windows")]
 pub mod hostinfo;
 #[cfg(target_os = "windows")]
+pub mod lacuna;
 pub mod inject;
 #[cfg(target_os = "windows")]
 pub mod keylog;

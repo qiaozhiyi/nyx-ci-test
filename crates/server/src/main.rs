@@ -111,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing::info!(
         operators = %operators_path.display(),
-        count = operators.list().len(),
+        count = operators.list()?.len(),
         mode = auth_mode,
         "operator registry loaded"
     );
@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
                 let app = app.clone();
                 let fps = state.fingerprints.clone();
                 tokio::spawn(async move {
-                    let timeout_dur = std::time::Duration::from_secs(5);
+                    let timeout_dur = std::time::Duration::from_secs(30);
                     // Read the ClientHello (blocking, tiny) off the stream first.
                     let stream =
                         match tokio::time::timeout(timeout_dur, sniff_and_store(stream, peer, fps))

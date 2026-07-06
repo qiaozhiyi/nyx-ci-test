@@ -161,8 +161,8 @@ struct FileDirectoryInformation {
 /// false-matching on filenames like `config\default.dat` (`.dat` != `default`).
 fn allowed(path: &str) -> bool {
     // Normalize: collapse runs of `/` and `\` into a single `\`, lowercase
-    // everything, and strip `.` components. This defeats double-slash and
-    // current-directory tricks (`\\`, `//`, `.\`) before the substring check.
+    // everything. This defeats double-slash tricks (`\\`, `//`) before the
+    // substring check.
     let mut normalized = crate::heap::String::with_capacity(path.len());
     let mut last_was_slash = false;
     for c in path.chars() {
@@ -177,8 +177,30 @@ fn allowed(path: &str) -> bool {
         }
     }
 
-    // Collapse `\.` (current-directory component) that survived after normalization.
-    // A naive replace is safe here: `\.` only means "current dir" between slashes.
+    // Strip `.` (current-directory) components from the normalized path so that
+    // `.\config\SAM` and `\\.\config\SAM` resolve to `\config\sam` — otherwise
+    // the leading `.\` defeats the substring check below. We split on `\`,
+    // drop every empty-or-`.` segment, and rejoin.
+    let mut clean = crate::heap::String::with_capacity(normalized.len());
+    let mut first = true;
+    for seg in normalized.split('\\') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if first {
+            first = false;
+        } else {
+            clean.push('\\');
+        }
+        clean.push_str(seg);
+    }
+    // If the path was ALL dots/slashes (e.g. ".\\.\\\\.\\"), the clean string
+    // is empty — that means the operator tried to reach the root of a drive
+    // relative to CWD — NOT a hive path, so allow it.
+    if clean.is_empty() {
+        return true;
+    }
+
     let blocked = [
         "\\config\\sam",
         "\\config\\system",
@@ -187,7 +209,7 @@ fn allowed(path: &str) -> bool {
         "\\config\\default",
     ];
     for &b in &blocked {
-        if normalized.contains(b) {
+        if clean.contains(b) {
             return false;
         }
     }

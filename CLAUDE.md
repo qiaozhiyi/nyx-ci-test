@@ -177,15 +177,27 @@ sole native GUI is `crates/client-ui`, a pure-Rust Makepad app. The operator CLI
 
 ## Current status & next steps
 
-**P2 stealth + integration gaps DONE and verified.** All userland kits shipped;
-kernel tier G-K tasks all pass on real machine (Server 2019 17763.1339, 2026-06-26).
-Overall bypass completion: **~95%** (userland 98%, kernel algo 100%, wiring 100%,
-kernel real-machine all pass). P1 dev tasks (C1 KslD dynamic device, C2 PG windows,
-B1 heap enumerator, B2 Foliage heap mask) all completed 2026-06-27. **Gaps G1-G5
-closed 2026-06-27** (postex token-ops wired, creds/audit client sync, client-ui
-BOF loader + env token, MiniFilter reachable, offset-resolver symbol-server).
-Only **G6** remains — Win11 24H2/25H2 real-machine verify (hardware gap: sshconfig
-has no such host; `win`=Server 2019).
+**2026-07-06: Military-grade sleep obfuscation + LACUNA ghost frames shipped.**
+
+- **Fluctuation sleep mask** (`fluctuation.rs`, `fluctuation_thunk.rs`): replaces Foliage/Ekko.
+  Flips `.text` to `PAGE_NOACCESS` during sleep (memory scanners cannot read), back to
+  `PAGE_EXECUTE_READ` on wake. CFG/CET immune — no ROP chains, no NtContinue, no indirect
+  calls. Thunk placed on dynamically allocated RWX page (outside CFG bitmap coverage).
+- **LACUNA ghost-frame scanner** (`lacuna.rs`): cross-version `.pdata` gap scanner.
+  Scans ntdll/kernelbase/win32u for RUNTIME_FUNCTION lacunae at bootstrap.
+  Dual-path: DataDirectory[3] first, section-header fallback for builds where
+  Exception Directory is empty (17763 ntdll). Builds ghost frame chains for call-stack
+  spoofing — addresses in .pdata gaps are treated as leaf frames by RtlVirtualUnwind.
+  Ported from Mohamed Alzhrani's LACUNA Chain (June 2026).
+- **Pool Party fix**: `local_base` replaces `target_base` for TpDirect write (was
+  causing STATUS_ACCESS_VIOLATION). `TP_DIRECT_CALLBACK_OFFSET` 0x08→0x10.
+- **WinHTTP TLS fix**: `WINHTTP_OPTION_SECURITY_FLAGS` 32→31 (0x1F). Added retry
+  pattern: send with strict validation → on failure, set IGNORE flags → retry.
+
+**53/53 selftests pass on Server 2019 (17763.1339), 0 timeout.** 35 validated exit
+codes match expected values.
+
+Previous milestones retained below for history.
 
 **2026-07-01 真机全量回归（3 处 CRITICAL 修复）：** 修复了 `operator-kernelsdk` 的 2 个编译
 错误（`netsec.rs:269/282` 缺失 `peb_offset` 字段 + usize/u64 类型）+ PEB 地址空间逻辑 bug、

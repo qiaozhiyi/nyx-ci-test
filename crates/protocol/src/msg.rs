@@ -414,7 +414,7 @@ impl Command {
                 jitter_pct: r.u8()?,
             },
             3 => Command::Shell {
-                args: checked_str(r, 65536)?,
+                args: checked_str(r, 4096)?,
             },
             4 => Command::Upload {
                 name: checked_str(r, 4096)?,
@@ -431,7 +431,7 @@ impl Command {
                 let n = (n_raw as usize).min(MAX_WIRE_COUNT);
                 let mut args = Vec::with_capacity(cap);
                 for _ in 0..n {
-                    args.push(checked_str(r, 8192)?);
+                    args.push(checked_str(r, 4096)?);
                 }
                 let blob = r.blob()?.to_vec();
                 Command::Bof { name, args, blob }

@@ -10,6 +10,18 @@ description = "Operator-side kernel-tier CLI — drives bootstrap_chain → reso
 [[bin]]
 name = "nyx-kernel"
 path = "src/main.rs"
+[[bin]]
+name = "cfg-write"
+path = "src/bin/cfg-write.rs"
+[[bin]]
+name = "probe-offsets"
+path = "src/bin/probe-offsets.rs"
+[[bin]]
+name = "probe2"
+path = "src/bin/probe2.rs"
+[[bin]]
+name = "find-bitmap"
+path = "src/bin/find-bitmap.rs"
 
 [dependencies]
 nyx-operator-kernelsdk = { path = "../operator-kernelsdk" }

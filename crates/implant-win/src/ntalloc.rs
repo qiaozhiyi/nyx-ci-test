@@ -48,7 +48,8 @@ static mut SLAB_COUNT: usize = 0;
 
 /// Record a newly allocated slab in the tracking table.
 /// Called from `new_slab_min` after a successful NtAllocateVirtualMemory.
-unsafe fn track_slab_unlocked(base: *mut u8, committed: usize) {
+/// The caller MUST hold `ALLOC_LOCK`.
+unsafe fn track_slab(base: *mut u8, committed: usize) {
     let idx = SLAB_COUNT;
     if idx < MAX_SLABS {
         SLAB_TABLE[idx] = SlabDesc {
@@ -57,7 +58,16 @@ unsafe fn track_slab_unlocked(base: *mut u8, committed: usize) {
         };
         SLAB_COUNT = idx + 1;
     } else {
-        crate::entry::diag_mark(b"ERR_SLAB_OVERFLOW");
+        // Slab table full — shift entries left (drop oldest), insert at end.
+        // This keeps tracking alive instead of silently losing slab info.
+        crate::entry::diag_mark(b"ERR_SLAB_OVERFLOW_SHIFT");
+        for i in 1..MAX_SLABS {
+            SLAB_TABLE[i - 1] = SLAB_TABLE[i];
+        }
+        SLAB_TABLE[MAX_SLABS - 1] = SlabDesc {
+            base: base as u64,
+            len: committed as u64,
+        };
     }
 }
 
@@ -137,7 +147,7 @@ unsafe fn new_slab_min(min_size: usize) -> *mut u8 {
         return core::ptr::null_mut();
     }
     // Track the slab for heap enumeration at sleep-mask time.
-    track_slab_unlocked(base as *mut u8, size);
+    track_slab(base as *mut u8, size);
     base as *mut u8
 }
 

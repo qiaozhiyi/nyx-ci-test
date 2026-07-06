@@ -786,7 +786,7 @@ pub fn poll_once() {
     // CapsLock is a *toggle*: use GetKeyState (bit 0 = toggle on/off).
     // GetAsyncKeyState bit-0 is "pressed since last call", NOT the toggle state.
     let caps = if let Some(gks) = get_key_state_fn() {
-        (unsafe { gks(VK_CAPITAL) } & 1) != 0
+        (unsafe { gks(VK_CAPITAL) } & 0x01) != 0
     } else {
         false // conservative: assume CapsLock off if user32 unavailable
     };

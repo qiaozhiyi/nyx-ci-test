@@ -35,8 +35,7 @@ pub struct ClientHello {
 /// GREASE values: `0x?a?a` (both bytes equal, low nibble 0xa) for both cipher
 /// suites and extension types.
 fn is_grease(v: u16) -> bool {
-    let bytes = v.to_be_bytes();
-    bytes[0] == bytes[1] && (bytes[0] & 0x0f) == 0x0a
+    (v >> 8) == (v & 0xFF) && (v & 0x0F0F) == 0x0A0A
 }
 
 fn u16be(b: &[u8], o: usize) -> u16 {

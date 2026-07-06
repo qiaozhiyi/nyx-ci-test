@@ -201,17 +201,17 @@ pub unsafe fn spoofed_context(target_rip: u64, real_rsp: u64, saved_ctx: *const 
     ctx.set_context_flags(CONTEXT_AMD64 | 0x1 /* CONTEXT_CONTROL */);
     ctx.set_rip(target_rip);
     ctx.set_rsp(real_rsp);
+    // x64 user-mode selectors are invariant — 0x33 for CS, 0x2B for SS.
+    // Never trust saved_ctx's segment values (they may be zero if the context
+    // was captured without CONTEXT_SEGMENTS). NtContinue with SegCs=0/SegSs=0
+    // faults with #GP(0) on x64.
+    ctx.set_seg_cs(0x33);
+    core::ptr::write_unaligned((ctx as *mut _ as usize + 0x42) as *mut u16, 0x2b_u16);
 
     if !saved_ctx.is_null() {
-        ctx.set_seg_cs((*saved_ctx).seg_cs());
         ctx.set_e_flags((*saved_ctx).e_flags());
-        // Copy SegSs at offset 0x42
-        let seg_ss = core::ptr::read_unaligned((saved_ctx as usize + 0x42) as *const u16);
-        core::ptr::write_unaligned((ctx as *mut _ as usize + 0x42) as *mut u16, seg_ss);
     } else {
-        ctx.set_seg_cs(0x33);
         ctx.set_e_flags(0x202);
-        core::ptr::write_unaligned((ctx as *mut _ as usize + 0x42) as *mut u16, 0x2b); // SegSs
     }
     ctx as *mut Context
 }

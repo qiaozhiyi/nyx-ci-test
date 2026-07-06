@@ -385,14 +385,11 @@ fn do_bind(addr: &str, port: u16, chan: u32) -> Response {
     if !unsafe { wsa_init() } {
         return Response::Err(String::from("bind: winsock init failed"));
     }
-    // Reuse the chan id: close any existing channel with this id first.
-    if let Some(idx) = unsafe { slot_of(chan) } {
-        if let Some(c) = unsafe { CHANNELS[idx] } {
-            if let Some(fns) = unsafe { ensure_relay() } {
-                let _ = unsafe { (fns.closesocket)(c.sock) };
-            }
-            unsafe { CHANNELS[idx] = None };
-        }
+    // Refuse to overwrite an existing channel on the same id.  A BIND on an
+    // already-bound chan id is a protocol error (the operator should
+    // ChannelClose it first).  Silently replacing the old socket leaks it.
+    if unsafe { slot_of(chan) }.is_some() {
+        return Response::Err(String::from("bind: channel already bound"));
     }
 
     type SocketFn = unsafe extern "system" fn(i32, i32, i32) -> usize;

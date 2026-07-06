@@ -1137,8 +1137,12 @@ async fn get_results(
     headers: HeaderMap,
     Query(q): Query<ResultsQuery>,
 ) -> Response {
-    if let Some(r) = require_auth(&st, &headers) {
-        return r;
+    let op = match authenticate(&st, &headers) {
+        AuthOutcome::Allowed(o) => o,
+        AuthOutcome::Denied(r) => return r,
+    };
+    if op.role == operators::Role::Viewer {
+        return (StatusCode::FORBIDDEN, "forbidden: viewer role cannot drain results").into_response();
     }
     let id = match parse_session_hex(&q.session) {
         Some(id) => id,

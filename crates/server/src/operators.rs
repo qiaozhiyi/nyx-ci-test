@@ -105,12 +105,14 @@ impl OperatorRegistry {
         })
     }
 
-    /// All records (for a future /api/operators admin surface + boot logging).
-    pub fn list(&self) -> Vec<OperatorRecord> {
+    pub fn list(&self) -> std::io::Result<Vec<OperatorRecord>> {
         self.ops
             .read()
             .map(|g| g.values().cloned().collect())
-            .unwrap_or_default()
+            .map_err(|_| {
+                eprintln!("FATAL: operator registry RwLock poisoned — refusing to operate");
+                std::io::Error::new(std::io::ErrorKind::Other, "operator registry RwLock poisoned")
+            })
     }
 
     /// Load the registry from `path`. If the file is absent/empty:

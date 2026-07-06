@@ -2818,6 +2818,42 @@ pub unsafe extern "system" fn nyx_selftest_resolve_forwarder() {
 
 // ============================================================================
 // #[cfg(test)] CI wrappers for hosted Windows runner
+
+// ============================================================================
+// nyx_selftest_lacuna: scan .pdata lacunae in ntdll/kernelbase/win32u.
+// Proves the ghost region scanner works cross-version.
+//   bit0 = ntdll .pdata scanned (ghosts >= 1)
+//   bit1 = kernelbase .pdata scanned (ghosts >= 1)
+//   bit2 = win32u .pdata scanned (ghosts >= 1)
+//   bit3 = ghost chain built (>= 4 frames)
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_lacuna() {
+    let mut mask: u32 = 0;
+    crate::syscalls::init_global();
+
+    let ntdll_base = match crate::resolve::module_base_by_name(b"ntdll.dll") {
+        Some(b) => b, None => { unsafe { exit(mask) }; }
+    };
+    let ntdll_ghosts = unsafe { crate::lacuna::scan_ghosts(ntdll_base) };
+    if !ntdll_ghosts.is_empty() { mask |= 1 << 0; }
+
+    let kb_ghosts = if let Some(kb) = crate::resolve::module_base_by_name(b"kernelbase.dll") {
+        unsafe { crate::lacuna::scan_ghosts(kb) }
+    } else { crate::heap::Vec::new() };
+    if !kb_ghosts.is_empty() { mask |= 1 << 1; }
+
+    let w32_ghosts = if let Some(w32) = crate::resolve::module_base_by_name(b"win32u.dll") {
+        unsafe { crate::lacuna::scan_ghosts(w32) }
+    } else { crate::heap::Vec::new() };
+    if !w32_ghosts.is_empty() { mask |= 1 << 2; }
+
+    let chain = crate::lacuna::build_ghost_chain(&ntdll_ghosts, &kb_ghosts, &w32_ghosts, 6);
+    if chain.frames.len() >= 4 { mask |= 1 << 3; }
+
+    unsafe { exit(mask) };
+}
 // ============================================================================
 // These wrappers call the internal functions (not the #[no_mangle] exports) so
 // `cargo test` on a hosted Windows runner can exercise the same code paths.

