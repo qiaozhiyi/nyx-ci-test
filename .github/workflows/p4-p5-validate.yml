@@ -57,10 +57,11 @@ jobs:
         with:
           targets: x86_64-pc-windows-gnu
 
-      - name: Install Rust nightly (implant requires nightly + rust-src)
+      - name: Install Rust nightly (implant requires nightly + rust-src + gnu target)
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
+          targets: x86_64-pc-windows-gnu
 
       - name: Install mingw-w64
         shell: pwsh
@@ -132,10 +133,10 @@ jobs:
           Write-Host "HVCI actively running: $hvci_running"
           Write-Host "CI policy enforced: $ci_enforced"
           if ($ci_enforced -or $hvci_running) {
-            Write-Host "::warning::HVCI/CI policy is enforcing — BYOVD (RTCore64) load will be blocked. Skipping kernelsdk job."
+            Write-Host "::warning::HVCI/CI policy is enforcing -- BYOVD (RTCore64) load blocked. Skipping kernelsdk job."
             echo "skip=true" >> $env:GITHUB_OUTPUT
           } else {
-            Write-Host "::notice::HVCI NOT running + CI policy NOT enforced — BYOVD load should succeed."
+            Write-Host "::notice::HVCI NOT running + CI policy NOT enforced -- BYOVD load should succeed."
             echo "skip=false" >> $env:GITHUB_OUTPUT
           }
 
@@ -167,7 +168,7 @@ jobs:
           # RTCore64.sys is .gitignore excluded — must be pre-provisioned.
           $driverPath = "$env:GITHUB_WORKSPACE\tools\RTCore64.sys"
           if (-not (Test-Path $driverPath)) {
-            Write-Host "::warning::RTCore64.sys not found at $driverPath — skipping BYOVD load."
+            Write-Host "::warning::RTCore64.sys not found at $driverPath -- skipping BYOVD load."
             return
           }
           # Bootstrap (KslD → BYOVD fallback)
