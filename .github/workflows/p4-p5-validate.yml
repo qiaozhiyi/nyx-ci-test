@@ -75,7 +75,7 @@ jobs:
           # Selftest exports call ExitProcess with a bitmask — the exit code IS the
           # test result (e.g. calib42 → 42, foliage bit0=1 → 1). Non-crash non-zero
           # exit codes are expected and indicate the selftest ran successfully.
-          if ($code -ge 0x80000000) { throw "DLL load/run CRASHED (exit 0x$($code.ToString('X8')))" }
+          if ([uint32]$code -ge 0x80000000) { throw "DLL load/run CRASHED (exit 0x$($code.ToString('X8')))" }
           Write-Host "PASS: DLL loads, calib42 ran (exit $code = expected 42)"
 
       # -- 5. P4 Foliage data-only baseline ------------------------------------
@@ -87,7 +87,7 @@ jobs:
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_foliage -PassThru -Wait -NoNewWindow
           $code = $p.ExitCode
           Write-Host "foliage exit: 0x$($code.ToString('X8')) (bitmask $code)"
-          if ($code -ge 0x80000000) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
+          if ([uint32]$code -ge 0x80000000) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
           Write-Host "PASS: foliage exit $code (bit0=$($code -band 1), bit1=$($code -band 2))"
 
       # -- 6. P4 Foliage APC thunk ---------------------------------------------
@@ -99,7 +99,7 @@ jobs:
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_foliage_apc -PassThru -Wait -NoNewWindow
           $code = $p.ExitCode
           Write-Host "foliage_apc exit: 0x$($code.ToString('X8')) (bitmask $code)"
-          if ($code -ge 0x80000000) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
+          if ([uint32]$code -ge 0x80000000) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
           Write-Host "PASS: foliage_apc exit $code"
 
       # -- 7. P5 Pool Party ----------------------------------------------------
@@ -111,7 +111,7 @@ jobs:
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_inject_pool -PassThru -Wait -NoNewWindow
           $code = $p.ExitCode
           Write-Host "inject_pool exit: 0x$($code.ToString('X8')) (bitmask $code)"
-          if ($code -ge 0x80000000) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
+          if ([uint32]$code -ge 0x80000000) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
           Write-Host "PASS: inject_pool exit $code"
 
       # -- 8. Upload DLL artifact ----------------------------------------------
