@@ -66,42 +66,47 @@ jobs:
       - name: Install mingw-w64
         shell: pwsh
         run: choco install mingw -y --no-progress
-
-      # -- 3. Build implant with P4/P5 gates ON ---------------------------------
-      - name: Build implant with P4/P5 gates ON
+      # -- 3. Build implant DLL with P4/P5 gates ON ------------------------------
+      - name: Build implant DLL
         shell: bash
         run: |
           cargo +nightly build --release --target x86_64-pc-windows-gnu --manifest-path crates/implant-win/Cargo.toml
 
-      # -- 4. P4 Foliage data-only baseline (safe — no .text encryption) --------
-      - name: P4 baseline — foliage data-only
+      # -- 4. P4 Foliage data-only baseline (safe -- no .text encryption) --------
+      - name: P4 baseline -- foliage data-only
         shell: pwsh
         run: |
-          $env:RUST_BACKTRACE = "full"
-          cargo +nightly test --target x86_64-pc-windows-gnu --manifest-path crates/implant-win/Cargo.toml --lib -- foliage_data_only --nocapture
+          $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-gnu\release\nyx_implant_win.dll"
+          if (-not (Test-Path $dll)) { throw "DLL not found: $dll" }
+          $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_foliage -PassThru -Wait -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "nyx_selftest_foliage crashed (exit 0x$($p.ExitCode.ToString('X8')))" }
+          Write-Host "PASS: nyx_selftest_foliage returned cleanly"
 
-      # -- 5. P4 Foliage APC with PIC thunk wired (exercises .text RC4 encryption) -
-      - name: P4 thunk — foliage_apc (thunk wired)
+      # -- 5. P4 Foliage APC with PIC thunk wired (exercises .text RC4 encryption)
+      - name: P4 thunk -- foliage_apc
         shell: pwsh
         run: |
-          $env:RUST_BACKTRACE = "full"
-          cargo +nightly test --target x86_64-pc-windows-gnu --manifest-path crates/implant-win/Cargo.toml --lib -- foliage_apc --nocapture
+          $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-gnu\release\nyx_implant_win.dll"
+          $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_foliage_apc -PassThru -Wait -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "nyx_selftest_foliage_apc crashed (exit 0x$($p.ExitCode.ToString('X8')))" }
+          Write-Host "PASS: nyx_selftest_foliage_apc returned cleanly"
 
-      # -- 6. P5 Pool Party section delivery to self ----------------------------
-      - name: P5 — inject_pool section delivery
+      # -- 6. P5 Pool Party section delivery ------------------------------------
+      - name: P5 -- inject_pool
         shell: pwsh
         run: |
-          cargo +nightly test --target x86_64-pc-windows-gnu --manifest-path crates/implant-win/Cargo.toml --lib -- inject_pool --nocapture
+          $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-gnu\release\nyx_implant_win.dll"
+          $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_inject_pool -PassThru -Wait -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "nyx_selftest_inject_pool crashed (exit 0x$($p.ExitCode.ToString('X8')))" }
+          Write-Host "PASS: nyx_selftest_inject_pool returned cleanly"
 
-      # -- 7. Upload selftest logs / dumps --------------------------------------
-      - name: Upload selftest logs
+      # -- 7. Upload DLL + diagnostics ------------------------------------------
+      - name: Upload DLL artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: p4-p5-selftest-logs
-          path: |
-            target/*/release/*.log
-            target/*/release/*.dmp
+          name: nyx-implant-win-dll
+          path: crates/implant-win/target/x86_64-pc-windows-gnu/release/nyx_implant_win.dll
 
   # ==========================================================================
   # kernelsdk-byovd — kernelsdk BYOVD regression (only if HVCI is OFF)
