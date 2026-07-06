@@ -25,13 +25,12 @@ jobs:
   # userland-validation — P4 (Foliage APC) + P5 (Pool Party) user-mode selftests
   # ==========================================================================
   userland-validation:
-    runs-on: windows-latest   # Server 2022, Defender disabled by default
-    timeout-minutes: 20       # Windows 2x multiplier — caps burn
+    runs-on: windows-latest   # Server 2025, Defender disabled by default
+    timeout-minutes: 20       # Windows 2x multiplier -- caps burn
     env:
       # Arm P4/P5 research gates at build time so the selftest paths fire.
       NYX_FOLIAGE_APC_ON: "1"
       NYX_POOL_PARTY_ON: "1"
-      RUSTFLAGS: "-C link-arg=-Wl,--gc-sections"
 
     steps:
       - uses: actions/checkout@v4
@@ -40,43 +39,35 @@ jobs:
       - name: Disable Defender + add exclusions
         shell: powershell
         run: |
-          # Confirm the image default
           $pref = (Get-MpPreference).DisableRealtimeMonitoring
           Write-Host "Defender realtime disabled (image default): $pref"
-          # Double-insurance: re-disable + exclude workspace and toolchain
           Set-MpPreference -DisableRealtimeMonitoring $true -Force -ErrorAction SilentlyContinue
           Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\target" -Force -ErrorAction SilentlyContinue
-          Add-MpPreference -ExclusionProcess "cargo.exe","nyx-selftest-foliage-apc.exe","nyx-inject-test.exe" -Force -ErrorAction SilentlyContinue
-          # Verify
+          Add-MpPreference -ExclusionProcess "cargo.exe","rundll32.exe" -Force -ErrorAction SilentlyContinue
           $now = (Get-MpPreference).DisableRealtimeMonitoring
           Write-Host "Defender realtime disabled (after step): $now"
 
-      # -- 2. Toolchain: stable + nightly + Windows GNU target ------------------
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-gnu
-
-      - name: Install Rust nightly (implant requires nightly + rust-src + gnu target)
+      # -- 2. Toolchain: nightly + MSVC target ---------------------------------
+      # MSVC target works reliably on all Windows versions including Server 2025
+      # (build 26100).  GNU target (mingw-w64) has CRT startup compat issues on
+      # Server 2025 causing STATUS_STACK_BUFFER_OVERRUN (0xC0000409) at DLL load.
+      - name: Install Rust nightly (implant requires nightly + rust-src)
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
-          targets: x86_64-pc-windows-gnu
+          targets: x86_64-pc-windows-msvc
 
-      - name: Install mingw-w64
-        shell: pwsh
-        run: choco install mingw -y --no-progress
-      # -- 3. Build implant DLL with P4/P5 gates ON ------------------------------
+      # -- 3. Build implant DLL -------------------------------------------------
       - name: Build implant DLL
         shell: bash
         run: |
-          cargo +nightly build --release --target x86_64-pc-windows-gnu --manifest-path crates/implant-win/Cargo.toml
+          cargo +nightly build --release --target x86_64-pc-windows-msvc --manifest-path crates/implant-win/Cargo.toml
 
       # -- 4. Smoke test: can the DLL even be loaded? ---------------------------
       - name: SMOKE -- calib42 (exit 42, no syscalls)
         shell: pwsh
         run: |
-          $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-gnu\release\nyx_implant_win.dll"
+          $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
           if (-not (Test-Path $dll)) { throw "DLL not found: $dll" }
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_calib42 -PassThru -Wait -NoNewWindow
           Write-Host "calib42 exit code: 0x$($p.ExitCode.ToString('X8')) ($($p.ExitCode))"
@@ -88,7 +79,7 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: |
-          $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-gnu\release\nyx_implant_win.dll"
+          $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_foliage -PassThru -Wait -NoNewWindow
           Write-Host "foliage exit code: 0x$($p.ExitCode.ToString('X8'))"
           if ($p.ExitCode -ne 0) { throw "crashed (exit 0x$($p.ExitCode.ToString('X8')))" }
@@ -99,7 +90,7 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: |
-          $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-gnu\release\nyx_implant_win.dll"
+          $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_foliage_apc -PassThru -Wait -NoNewWindow
           Write-Host "foliage_apc exit code: 0x$($p.ExitCode.ToString('X8'))"
           if ($p.ExitCode -ne 0) { throw "crashed (exit 0x$($p.ExitCode.ToString('X8')))" }
@@ -110,7 +101,7 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: |
-          $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-gnu\release\nyx_implant_win.dll"
+          $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_inject_pool -PassThru -Wait -NoNewWindow
           Write-Host "inject_pool exit code: 0x$($p.ExitCode.ToString('X8'))"
           if ($p.ExitCode -ne 0) { throw "crashed (exit 0x$($p.ExitCode.ToString('X8')))" }
@@ -122,7 +113,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nyx-implant-win-dll
-          path: crates/implant-win/target/x86_64-pc-windows-gnu/release/nyx_implant_win.dll
+          path: crates/implant-win/target/x86_64-pc-windows-msvc/release/nyx_implant_win.dll
 
 
   # ==========================================================================
