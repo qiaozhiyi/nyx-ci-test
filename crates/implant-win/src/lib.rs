@@ -125,6 +125,8 @@ pub mod transport;
 pub mod unhook;
 #[cfg(target_os = "windows")]
 pub mod version;
+#[cfg(target_os = "windows")]
+pub mod dllmain;
 
 // Register the NT-Heap allocator so Vec/String work under #![no_std].
 // In test mode (std available), use the default allocator — the NT allocator

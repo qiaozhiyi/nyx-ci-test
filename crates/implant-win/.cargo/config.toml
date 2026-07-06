@@ -27,6 +27,9 @@
 build-std = ["core", "compiler_builtins", "alloc"]
 
 [target.x86_64-pc-windows-gnu]
-# mingw-w64 linker. On the MSVC path (`x86_64-pc-windows-msvc`) leave this unset
-# and let rustc pick `link.exe` instead.
+# mingw-w64 linker. `-nostartfiles` skips CRT startup objects (dllcrt2.o):
+# we provide our own `DllMain` in `dllmain.rs` as the real entry point.
+# Without this, the CRT startup crashes on Windows Server 2025 (build 26100)
+# with STATUS_STACK_BUFFER_OVERRUN (0xC0000409).
 linker = "x86_64-w64-mingw32-gcc"
+rustflags = ["-C", "link-args=-nostartfiles -Wl,-e,DllMain"]
