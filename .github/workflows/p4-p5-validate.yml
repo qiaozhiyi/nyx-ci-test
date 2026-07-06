@@ -71,11 +71,9 @@ jobs:
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_calib42 -PassThru -Wait -NoNewWindow
           $code = $p.ExitCode
           Write-Host "calib42 exit: 0x$($code.ToString('X8')) (decimal $code)"
-          # Exit codes >= 0x80000000 indicate a crash (STATUS_*, exception).
-          # Selftest exports call ExitProcess with a bitmask — the exit code IS the
-          # test result (e.g. calib42 → 42, foliage bit0=1 → 1). Non-crash non-zero
-          # exit codes are expected and indicate the selftest ran successfully.
-          if ([uint32]$code -ge 0x80000000) { throw "DLL load/run CRASHED (exit 0x$($code.ToString('X8')))" }
+          # Negative exit codes indicate Windows errors (STATUS_* / exceptions).
+          # Positive exit codes are selftest bitmasks from ExitProcess().
+          if ($code -lt 0) { throw "DLL load/run CRASHED (exit 0x$($code.ToString('X8')))" }
           Write-Host "PASS: DLL loads, calib42 ran (exit $code = expected 42)"
 
       # -- 5. P4 Foliage data-only baseline ------------------------------------
@@ -86,9 +84,9 @@ jobs:
           $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_foliage -PassThru -Wait -NoNewWindow
           $code = $p.ExitCode
-          Write-Host "foliage exit: 0x$($code.ToString('X8')) (bitmask $code)"
-          if ([uint32]$code -ge 0x80000000) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
-          Write-Host "PASS: foliage exit $code (bit0=$($code -band 1), bit1=$($code -band 2))"
+          Write-Host "foliage exit: 0x$($code.ToString('X8')) (bitmask=$code)"
+          if ($code -lt 0) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
+          Write-Host "PASS: foliage exit $code (bit0=$($code -band 1))"
 
       # -- 6. P4 Foliage APC thunk ---------------------------------------------
       - name: P4 thunk -- foliage_apc
@@ -98,8 +96,8 @@ jobs:
           $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_foliage_apc -PassThru -Wait -NoNewWindow
           $code = $p.ExitCode
-          Write-Host "foliage_apc exit: 0x$($code.ToString('X8')) (bitmask $code)"
-          if ([uint32]$code -ge 0x80000000) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
+          Write-Host "foliage_apc exit: 0x$($code.ToString('X8')) (bitmask=$code)"
+          if ($code -lt 0) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
           Write-Host "PASS: foliage_apc exit $code"
 
       # -- 7. P5 Pool Party ----------------------------------------------------
@@ -110,8 +108,8 @@ jobs:
           $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_inject_pool -PassThru -Wait -NoNewWindow
           $code = $p.ExitCode
-          Write-Host "inject_pool exit: 0x$($code.ToString('X8')) (bitmask $code)"
-          if ([uint32]$code -ge 0x80000000) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
+          Write-Host "inject_pool exit: 0x$($code.ToString('X8')) (bitmask=$code)"
+          if ($code -lt 0) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
           Write-Host "PASS: inject_pool exit $code"
 
       # -- 8. Upload DLL artifact ----------------------------------------------
