@@ -34,27 +34,28 @@
 
 #![cfg(target_os = "windows")]
 
-/// Windows DLL entry point. Returns TRUE unconditionally — no init is performed.
+/// Windows DLL entry point. Returns TRUE unconditionally.
 ///
-/// The linker is configured with `-nostartfiles`, so this function IS the
-/// effective DLL entry point (not a callback from `DllMainCRTStartup`).
+/// Implemented with inline assembly (`nomem`, `nostack`) so the compiler does
+/// NOT emit a stack frame or GS cookie check.  Without CRT startup (`-nostartfiles`)
+/// the `__security_cookie` is never initialised, and any function with a stack
+/// frame would fail the cookie check → STATUS_STACK_BUFFER_OVERRUN (0xC0000409).
 ///
-/// # DLL load reasons
-/// - `DLL_PROCESS_ATTACH` (1): DLL is being loaded. We return TRUE to allow the
-///   load but perform NO initialisation. The beacon/selftest export does its own
-///   init lazily on first call.
-/// - `DLL_THREAD_ATTACH` (2): A new thread is starting in a process that already
-///   has this DLL loaded. We return TRUE immediately — this is the critical fix
-///   for Server 2025: touching CRT/TLS here on foreign threads causes
-///   `STATUS_STACK_BUFFER_OVERRUN`.
-/// - `DLL_PROCESS_DETACH` (0): DLL is being unloaded. No-op.
-/// - `DLL_THREAD_DETACH` (3): A thread is exiting. No-op.
+/// This is the real DLL entry point — the linker flag `-Wl,-e,DllMain` points
+/// the PE entry directly here, bypassing `DllMainCRTStartup` entirely.
 #[no_mangle]
 pub unsafe extern "system" fn DllMain(
     _hinst: *mut core::ffi::c_void,
     _reason: u32,
     _reserved: *mut core::ffi::c_void,
 ) -> i32 {
-    // Always succeed — the beacon/selftest export handles its own init.
-    1
+    // Return TRUE (1) via raw assembly — no prologue, no stack frame, no GS cookie.
+    // `nostack` tells LLVM this asm block does not touch the stack.
+    core::arch::asm!(
+        "mov eax, 1",
+        "ret",
+        options(nostack, nomem)
+    );
+    // Unreachable — the asm above returns. Below is only for type-checking.
+    core::hint::unreachable_unchecked();
 }
