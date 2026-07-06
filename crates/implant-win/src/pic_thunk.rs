@@ -72,6 +72,10 @@ pub struct PicThunkParams {
     /// Address of the RC4 mask/unmask routine (PIC-safe; operates on a slice).
     /// The thunk calls this twice (mask then unmask). Signature:
     ///   `unsafe extern "system" fn(key: *const u8, key_len: usize, buf: *mut u8, len: usize)`
+    /// When the thunk is wired, this points to a small PIC wrapper on the RWX
+    /// page that builds USTRINGs and calls `advapi32!SystemFunction032` — the
+    /// RC4 runs from a system DLL, not from our .text, so encrypting .text
+    /// doesn't corrupt the RC4 code.
     pub rc4_mask: usize,
     /// Base of `.text` to mask.
     pub text_base: usize,
@@ -87,8 +91,6 @@ pub struct PicThunkParams {
 }
 
 // Offsets into PicThunkParams (must match the struct field order). We assert
-// these at test time (`fn_pointer_offsets_match_struct`) so a struct reorder
-// can't silently break the addressing.
 const OFF_PROTECT: u8 = 0x00;
 const OFF_WAIT: u8 = 0x08;
 const OFF_INVAL: u8 = 0x10;
@@ -367,6 +369,141 @@ pub fn build_mask_thunk() -> PicThunk {
     }
 }
 
+// ============================================================================
+// RC4 wrapper: calls advapi32!SystemFunction032 with USTRING args
+// ============================================================================
+// The PIC thunk needs an RC4 function that does NOT live in .text (otherwise
+// encrypting .text corrupts it).  This builder emits a small position-independent
+// trampoline that adapts the thunk's 4-arg calling convention to SystemFunction032's
+// 2-USTRING convention.  The trampoline is intended to live on the same RWX page
+// as the thunk, so it survives .text encryption.
+///
+/// Maximum size of the RC4 wrapper trampoline (generous, ~80 bytes in practice).
+pub const RC4_WRAPPER_MAX_LEN: usize = 128;
+///
+/// Build a PIC trampoline that calls `advapi32!SystemFunction032`.  The trampoline
+/// has the same 4-arg signature as `rc4_shim`:
+///   `extern "system" fn(key: *const u8, key_len: usize, buf: *mut u8, len: usize)`
+///
+/// Internally it builds two `USTRING` structs on the stack (each 16 bytes: {Length,
+/// MaximumLength, Buffer}) and calls `SystemFunction032(&key_ustring, &data_ustring)`.
+///
+/// `sf032_addr` is the absolute address of `advapi32!SystemFunction032`, resolved
+/// once at thunk-wire time and embedded as an immediate in the generated code.
+/// This is the ONLY non-PIC part of the trampoline — the advapi32 load address
+/// doesn't change during the process lifetime, so the immediate remains valid.
+pub fn build_rc4_sf032_wrapper(sf032_addr: usize) -> ([u8; RC4_WRAPPER_MAX_LEN], usize) {
+    let mut bytes = [0u8; RC4_WRAPPER_MAX_LEN];
+    let mut len = 0usize;
+    let a = sf032_addr;
+
+    // Helper closures
+    macro_rules! push {
+        ($b:expr) => {{
+            bytes[len] = $b;
+            len += 1;
+        }};
+    }
+
+    // ---- Prologue: save rcx in a non-volatile register --------------------
+    // We need to preserve the incoming args (rcx, rdx, r8, r9) while setting
+    // up the SystemFunction032 call (rcx, rdx).  Store rcx (key_ptr) in r10.
+    // mov r10, rcx
+    push!(0x4c);
+    push!(0x89);
+    push!(0xd1);
+
+    // ---- Allocate stack: 0x20 shadow + 0x20 (two USTRINGs) + 0x8 align ---
+    // sub rsp, 0x48
+    push!(0x48);
+    push!(0x83);
+    push!(0xec);
+    push!(0x48);
+
+    // ---- Build key_ustring at rsp+0x28 -----------------------------------
+    // key_ustring.Length = key_len (rdx, truncated to 32 bits)
+    // mov [rsp+0x28], edx
+    push!(0x89);
+    push!(0x54);
+    push!(0x24);
+    push!(0x28);
+    // key_ustring.MaximumLength = key_len
+    // mov [rsp+0x2C], edx
+    push!(0x89);
+    push!(0x54);
+    push!(0x24);
+    push!(0x2c);
+    // key_ustring.Buffer = key_ptr (saved in r10)
+    // mov [rsp+0x30], r10
+    push!(0x4c);
+    push!(0x89);
+    push!(0x54);
+    push!(0x24);
+    push!(0x30);
+
+    // ---- Build data_ustring at rsp+0x38 ----------------------------------
+    // data_ustring.Length = buf_len (r9, truncated to 32 bits)
+    // mov [rsp+0x38], r9d
+    push!(0x44);
+    push!(0x89);
+    push!(0x4c);
+    push!(0x24);
+    push!(0x38);
+    // data_ustring.MaximumLength = buf_len
+    // mov [rsp+0x3C], r9d
+    push!(0x44);
+    push!(0x89);
+    push!(0x4c);
+    push!(0x24);
+    push!(0x3c);
+    // data_ustring.Buffer = buf_ptr (r8)
+    // mov [rsp+0x40], r8
+    push!(0x4c);
+    push!(0x89);
+    push!(0x44);
+    push!(0x24);
+    push!(0x40);
+
+    // ---- Call SystemFunction032(&key_ustring, &data_ustring) --------------
+    // rcx = &key_ustring (rsp+0x28)
+    // lea rcx, [rsp+0x28]
+    push!(0x48);
+    push!(0x8d);
+    push!(0x4c);
+    push!(0x24);
+    push!(0x28);
+    // rdx = &data_ustring (rsp+0x38)
+    // lea rdx, [rsp+0x38]
+    push!(0x48);
+    push!(0x8d);
+    push!(0x54);
+    push!(0x24);
+    push!(0x38);
+    // call [rip + <offset>] — we embed the absolute address right after the call
+    // using a RIP-relative load.
+    // mov rax, <sf032_addr>
+    push!(0x48);
+    push!(0xb8); // REX.W + MOV RAX, imm64
+    // Little-endian absolute address (8 bytes)
+    let addr_bytes = a.to_le_bytes();
+    for b in addr_bytes {
+        push!(b);
+    }
+    // call rax
+    push!(0xff);
+    push!(0xd0);
+
+    // ---- Epilogue: free stack + return -----------------------------------
+    // add rsp, 0x48
+    push!(0x48);
+    push!(0x83);
+    push!(0xc4);
+    push!(0x48);
+    // ret
+    push!(0xc3);
+
+    (bytes, len)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
