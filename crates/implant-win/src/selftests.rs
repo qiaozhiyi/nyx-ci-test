@@ -2828,9 +2828,18 @@ pub unsafe extern "system" fn nyx_selftest_resolve_forwarder() {
 
 #[cfg(all(test, target_os = "windows"))]
 mod ci_tests {
+    /// Initialize the indirect-syscall runtime once per test binary.
+    /// Without this, any implant code that goes through syscallN crashes
+    /// with STATUS_ACCESS_VIOLATION because the trampoline page + SSN
+    /// table are never set up. Idempotent — safe to call per test.
+    fn init_rt() {
+        unsafe { crate::syscalls::init_global() };
+    }
+
     /// P4 data-only Foliage: arm mask, sleep 1s, verify no crash.
     #[test]
     fn ci_foliage_data_only_survives_one_cycle() {
+        init_rt();
         if !crate::sleep::foliage_enabled() {
             eprintln!("skipped: FOLIAGE_ENABLED off");
             return;
@@ -2845,6 +2854,7 @@ mod ci_tests {
     /// Expects FOLIAGE_APC_OK > 0 after a 2s sleep cycle.
     #[test]
     fn ci_foliage_apc_survives_one_cycle() {
+        init_rt();
         if !crate::sleep::foliage_apc_enabled() {
             eprintln!("skipped: FOLIAGE_APC_ENABLED off");
             return;
@@ -2874,6 +2884,7 @@ mod ci_tests {
     /// the section machinery doesn't panic.
     #[test]
     fn ci_pool_party_section_delivery_to_self() {
+        init_rt();
         if !crate::tp::pool_party_enabled() {
             eprintln!("skipped: POOL_PARTY_ENABLED off");
             return;
