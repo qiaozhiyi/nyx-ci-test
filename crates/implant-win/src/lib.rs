@@ -127,7 +127,9 @@ pub mod unhook;
 pub mod version;
 
 // Register the NT-Heap allocator so Vec/String work under #![no_std].
-#[cfg(target_os = "windows")]
+// In test mode (std available), use the default allocator — the NT allocator
+// would crash because Rust's std runtime allocates before init_global() is called.
+#[cfg(all(target_os = "windows", not(test)))]
 #[global_allocator]
 static HEAP: ntalloc::NtHeapAllocator = ntalloc::NtHeapAllocator;
 
