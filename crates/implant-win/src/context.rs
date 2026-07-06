@@ -40,6 +40,7 @@
 /// x64 `CONTEXT` (WinNT.h). 1232 bytes, 16-byte aligned. Stored as a raw byte
 /// buffer; accessors read/write fields at their WinNT.h offsets.
 #[repr(C, align(16))]
+#[derive(Clone, Copy)]
 pub struct Context {
     buf: [u8; 1232],
 }

