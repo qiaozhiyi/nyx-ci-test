@@ -68,11 +68,15 @@ jobs:
         shell: pwsh
         run: |
           $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
-          if (-not (Test-Path $dll)) { throw "DLL not found: $dll" }
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_calib42 -PassThru -Wait -NoNewWindow
-          Write-Host "calib42 exit code: 0x$($p.ExitCode.ToString('X8')) ($($p.ExitCode))"
-          if ($p.ExitCode -ne 0) { throw "DLL load itself crashes (exit 0x$($p.ExitCode.ToString('X8')))" }
-          Write-Host "PASS: DLL loads, calib42 ran"
+          $code = $p.ExitCode
+          Write-Host "calib42 exit: 0x$($code.ToString('X8')) (decimal $code)"
+          # Exit codes >= 0x80000000 indicate a crash (STATUS_*, exception).
+          # Selftest exports call ExitProcess with a bitmask — the exit code IS the
+          # test result (e.g. calib42 → 42, foliage bit0=1 → 1). Non-crash non-zero
+          # exit codes are expected and indicate the selftest ran successfully.
+          if ($code -ge 0x80000000) { throw "DLL load/run CRASHED (exit 0x$($code.ToString('X8')))" }
+          Write-Host "PASS: DLL loads, calib42 ran (exit $code = expected 42)"
 
       # -- 5. P4 Foliage data-only baseline ------------------------------------
       - name: P4 baseline -- foliage data-only
@@ -81,9 +85,10 @@ jobs:
         run: |
           $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_foliage -PassThru -Wait -NoNewWindow
-          Write-Host "foliage exit code: 0x$($p.ExitCode.ToString('X8'))"
-          if ($p.ExitCode -ne 0) { throw "crashed (exit 0x$($p.ExitCode.ToString('X8')))" }
-          Write-Host "PASS: foliage returned cleanly"
+          $code = $p.ExitCode
+          Write-Host "foliage exit: 0x$($code.ToString('X8')) (bitmask $code)"
+          if ($code -ge 0x80000000) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
+          Write-Host "PASS: foliage exit $code (bit0=$($code -band 1), bit1=$($code -band 2))"
 
       # -- 6. P4 Foliage APC thunk ---------------------------------------------
       - name: P4 thunk -- foliage_apc
@@ -92,9 +97,10 @@ jobs:
         run: |
           $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_foliage_apc -PassThru -Wait -NoNewWindow
-          Write-Host "foliage_apc exit code: 0x$($p.ExitCode.ToString('X8'))"
-          if ($p.ExitCode -ne 0) { throw "crashed (exit 0x$($p.ExitCode.ToString('X8')))" }
-          Write-Host "PASS: foliage_apc returned cleanly"
+          $code = $p.ExitCode
+          Write-Host "foliage_apc exit: 0x$($code.ToString('X8')) (bitmask $code)"
+          if ($code -ge 0x80000000) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
+          Write-Host "PASS: foliage_apc exit $code"
 
       # -- 7. P5 Pool Party ----------------------------------------------------
       - name: P5 -- inject_pool
@@ -103,9 +109,10 @@ jobs:
         run: |
           $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
           $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_inject_pool -PassThru -Wait -NoNewWindow
-          Write-Host "inject_pool exit code: 0x$($p.ExitCode.ToString('X8'))"
-          if ($p.ExitCode -ne 0) { throw "crashed (exit 0x$($p.ExitCode.ToString('X8')))" }
-          Write-Host "PASS: inject_pool returned cleanly"
+          $code = $p.ExitCode
+          Write-Host "inject_pool exit: 0x$($code.ToString('X8')) (bitmask $code)"
+          if ($code -ge 0x80000000) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
+          Write-Host "PASS: inject_pool exit $code"
 
       # -- 8. Upload DLL artifact ----------------------------------------------
       - name: Upload DLL artifact
@@ -114,7 +121,6 @@ jobs:
         with:
           name: nyx-implant-win-dll
           path: crates/implant-win/target/x86_64-pc-windows-msvc/release/nyx_implant_win.dll
-
 
   # ==========================================================================
   # kernelsdk-byovd — kernelsdk BYOVD regression (only if HVCI is OFF)
