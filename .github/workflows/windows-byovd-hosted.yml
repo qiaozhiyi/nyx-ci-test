@@ -84,11 +84,20 @@ jobs:
 
           Write-Host "=== Decision ==="
           Write-Host "HVCI actively running: $hvci_running"
-          if ($hvci_running) {
-            Write-Host "::warning::HVCI is running - RTCore64.sys load will be blocked. Skipping BYOVD job."
+          # The blocklist is enforced when CodeIntegrityPolicyEnforcementStatus=2
+          # (Enforced), NOT only when HVCI is actively running. On Server 2025 /
+          # Win11 24H2 the CI policy is enforced even with VBS but no HVCI
+          # service. RTCore64.sys IS on the blocklist -> load blocked -> manifests
+          # as 0xC0000034 STATUS_OBJECT_NAME_NOT_FOUND (not the expected
+          # 0xC0000428 STATUS_DRIVER_BLOCKED on this build).
+          $ci_enforced = ($dg.CodeIntegrityPolicyEnforcementStatus -eq 2)
+          $blocked = $hvci_running -or $ci_enforced
+          if ($blocked) {
+            Write-Host "::warning::Code Integrity policy enforced (CI=$ci_enforced, HVCI=$hvci_running) - RTCore64.sys on blocklist will be rejected. Skipping BYOVD load attempt."
+            Write-Host "::notice::This is the documented Server 2025 hardening: WDAC/blocklist enforces without HVCI. Use self-hosted runner (windows-kself-hosted.yml) where CI policy is off."
             "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } else {
-            Write-Host "::notice::HVCI NOT running - RTCore64.sys load should succeed (signed + blocklist not enforced without HVCI)."
+            Write-Host "::notice::CI policy NOT enforced (HVCI=$hvci_running, CI=$ci_enforced) - RTCore64.sys load should succeed (signed driver, blocklist not on enforcement path)."
             "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           }
 

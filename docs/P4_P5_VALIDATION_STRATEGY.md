@@ -49,23 +49,32 @@ Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" -Name Disa
 | 障碍 | 是否挡 BYOVD? | hosted runner 实际情况 |
 |---|---|---|
 | **test-signing 关闭** | ❌ **不挡** BYOVD | test-signing 只挡**未签名/测试签名**驱动。BYOVD(如 RTCore64.sys)用的是**微软合法签名**(MSI Afterburner 签发),`NtLoadDriver` 走正常签名验证路径,**不需要 test-signing** |
-| **HVCI / Memory Integrity** | ⚠️ 可能挡 | HVCI 开启时拒 `.text` 可写驱动(很多 BYOVD 触发)。**但 Azure VM/GitHub runner 出于性能默认关 HVCI**(VBS 有 5-10% CPU 开销,runner 不会开) |
-| **微软易受攻击驱动黑名单** | ⚠️ **你说的对** | RTCore64.sys 在黑名单里([GHSA-h935-vxwx-xh2m](https://github.com/advisories/GHSA-h935-vxwx-xh2m))。**黑名单默认只在 HVCI/WDAC 开启时才在内核强制路径上执行**;HVCI 关 → 黑名单不强制 → RTCore64 可加载 |
+| **HVCI / Memory Integrity** | ⚠️ 实测不挡 NtLoadDriver | hosted runner 上 `SecurityServicesRunning={0}`(HVCI 没在跑),但… |
+| **微软易受攻击驱动黑名单** | ❌ **实测挡(BYOVD 走不通)** | RTCore64.sys 在黑名单里。**关键修正**:黑名单在 `CodeIntegrityPolicyEnforcementStatus=2`(Enforced)时就强制执行,**不需要 HVCI 在跑**。hosted runner(Server 2025/build 26100)实测 `CodeIntegrityPolicyEnforcementStatus=2`(CI 策略强制),`VBS=2`(启用),但 `SecurityServicesRunning={0}`(HVCI 没跑)。RTCore64 加载被挡,表现为 `0xC0000034 STATUS_OBJECT_NAME_NOT_FOUND`(非预期的 `0xC0000428`) |
 
-**结论:BYOVD 在 hosted runner 大概率能跑**,因为:
-1. ✅ **管理员权限 + UAC 关闭**(§1.2)— `NtLoadDriver` 直接成功
-2. ✅ **RTCore64 是合法签名**,不需 test-signing
-3. ✅ **HVCI 大概率默认关**(Azure VM 性能优化)
-4. ✅ **黑名单在 HVCI 关时不强制**(只在 HVCI/WDAC 路径生效)
+**❌ 结论修正(2026-07-06 实测):BYOVD 在 hosted runner 跑不通。**
+1. ✅ **管理员权限 + UAC 关闭**(§1.2)— `NtLoadDriver` 直接调到
+2. ✅ **RTCore64 是合法签名** + **SeLoadDriverPrivilege 已 enable**(`RtlAdjustPrivilege` 修了 0xC0000061)
+3. ✅ **HVCI 没在跑**(`SecurityServicesRunning={0}`)
+4. ❌ **但 CodeIntegrityPolicyEnforcementStatus=2** → 黑名单在 CI 强制路径上执行 → RTCore64.sys 被挡 → `0xC0000034`
 
-**唯一不确定**:HVCI/黑名单的**确切**运行时状态。公开网没有直接记录 `windows-latest` 的 `Win32_DeviceGuard` 输出。最可靠的办法是 workflow 里跑一段检测(§2 step 0),失败则跳过 kernelsdk job。
+**调试过程(2026-07-06):**
+- 推 1:probe 只查 HVCI → 报 `HVCI NOT running` → 以为能跑
+- 推 2:加 `enable_load_driver_privilege`(RtlAdjustPrivilege)→ 修了 `0xC0000061 STATUS_PRIVILEGE_NOT_HELD` → 进了一步
+- 推 3:加 VoidSec 镜像(verified 200 OK + MZ)→ 修了"all mirrors failed"
+- 推 4:`_build`→`build`(P0.b flt fallback 用到,MSVC 捕获)→ 修了 kernelsdk 编译
+- 推 5:stage 到 `System32\drivers`(相对 ImagePath)→ 没修(还是 `0xC0000034`)
+- 推 6:`reg query` 诊断 → 写的 key 被 `delete_key` 清了(失败路径),文件在(`dir` 确认 36824 bytes)
+- **最终判定**:`CodeIntegrityPolicyEnforcementStatus=2` 是 Server 2025 runner 的硬化默认值,WDAC 黑名单在这条路径上强制,RTCore64.sys(黑名单内)必被挡。`Set-MpPreference` 只关 Defender,关不了 WDAC。
+
+**kernelsdk BYOVD 的可行路径:只能 self-hosted runner(CI policy off)。** 见 `windows-kself-hosted.yml`(17763,HVCI + CI policy off)。hosted runner 继续走 mock 单测(93/93 绿)。
 
 ### 1.5 各技术在 hosted runner 的可行性矩阵
 | 技术 | 是否需要内核驱动 | hosted runner 可行? |
 |---|---|---|
 | **P4 Foliage APC**(PIC thunk + NtQueueApcThread + 间接 syscall) | ❌ 纯用户态 | ✅ 一定能跑 |
 | **P5 Pool Party**(NtCreateSection + NtMapViewOfSection + TP_DIRECT) | ❌ 纯用户态 | ✅ 一定能跑 |
-| **kernelsdk PatchGuard / ETW-TI / DKOM / LSASS kernel read**(BYOVD) | ✅ 需要 RTCore64 加载 | ⚠️ **大概率能跑**(HVCI 关),workflow step 0 检测确认 |
+| **kernelsdk PatchGuard / ETW-TI / DKOM / LSASS kernel read**(BYOVD) | ✅ 需要 RTCore64 加载 | ❌ **跑不通**(`CodeIntegrityPolicyEnforcementStatus=2`,黑名单强制,RTCore64 被挡 → `0xC0000034`)。走 self-hosted 17763(`windows-kself-hosted.yml`) |
 
 ---
 
