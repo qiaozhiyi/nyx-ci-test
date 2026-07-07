@@ -134,7 +134,7 @@ pub fn set_diag_enabled(on: bool) {
 /// Write a single ASCII marker byte to C:\nyx\hwbp_diag.txt (append mode).
 /// Used for step-by-step crash diagnostics during selftest ONLY.
 /// **Gated behind DIAG_ENABLED** — production builds never write to disk.
-unsafe fn diag(ch: u8) {
+pub(crate) unsafe fn diag(ch: u8) {
     if !DIAG_ENABLED.load(core::sync::atomic::Ordering::Acquire) {
         return;
     }

@@ -27,7 +27,6 @@ pub mod delivery;
 
 use crate::heap::{String, Vec};
 
-
 // ---- Decision Engine ------------------------------------------------------
 
 /// Security posture verdict after assessment.
