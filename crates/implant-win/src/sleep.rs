@@ -196,7 +196,7 @@ pub(crate) unsafe fn own_text_region() -> Option<TextRegion> {
 /// Find a PE section's (virtual_address, virtual_size) by name. Returns None
 /// if the PE headers can't be parsed or the section isn't found.
 #[allow(dead_code)] // used by the APC-chain refactor (own_text_region)
-unsafe fn section_va_len(base: usize, name: &[u8]) -> Option<(usize, usize)> {
+pub(crate) unsafe fn section_va_len(base: usize, name: &[u8]) -> Option<(usize, usize)> {
     let dos = unsafe { &*(base as *const [u8; 64]) };
     if dos[0] != b'M' || dos[1] != b'Z' {
         return None;

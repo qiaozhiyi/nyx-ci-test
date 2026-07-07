@@ -181,6 +181,8 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     // Ghost addresses in .pdata gaps are treated as leaf frames by RtlVirtualUnwind.
     crate::lacuna::bootstrap_scan();
     diag_mark(b"8_lacuna");
+    // ---- InsomniacUnwinding check ---------------------------------------------
+    crate::insomniac::bootstrap_check();
 
     Some(ntdll)
 }

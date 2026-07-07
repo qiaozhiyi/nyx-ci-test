@@ -91,6 +91,8 @@ pub mod hostinfo;
 pub mod lacuna;
 #[cfg(target_os = "windows")]
 pub mod lacuna_stomp;
+#[cfg(target_os = "windows")]
+pub mod insomniac;
 pub mod inject;
 #[cfg(target_os = "windows")]
 pub mod keylog;
