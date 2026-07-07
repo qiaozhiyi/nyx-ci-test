@@ -335,13 +335,20 @@ mod windows_impl {
                 }
             }
 
-            // If default path failed, try dynamic enumeration via QueryDosDeviceW.
-            if h.is_null() {
+            // If direct paths failed AND operator enabled device scanning,
+            // try dynamic enumeration via QueryDosDeviceW. This is OFF by
+            // default: QueryDosDeviceW(NULL) scans the entire dos-device
+            // namespace and is a behavioral IOC on monitored hosts.
+            const KSLD_SCAN: bool = match option_env!("KSLD_SCAN_DEVICES") {
+                Some(v) => v.len() == 1 && v.as_bytes()[0] == b'1',
+                None => false,
+            };
+            if h.is_null() && KSLD_SCAN {
                 if let Some(enum_path) = enumerate_ksld_device() {
                     let test_h = unsafe {
                         create_file(
                             enum_path.as_ptr(),
-                            0xC0_00_00_00,
+                            0x0012_0003, // FILE_READ_DATA|FILE_WRITE_DATA|SYNCHRONIZE
                             0x03,
                             ptr::null_mut(),
                             0x03,
@@ -357,12 +364,12 @@ mod windows_impl {
             }
 
             if h.is_null() {
-                return Err(KrwError::Other(
-                    alloc::format!(
-                        "KslD device open failed (tried default, operator, and QueryDosDeviceW enumeration). \
-                         Is WinDefend / KslD.sys loaded?"
-                    ),
-                ));
+                let msg = if KSLD_SCAN {
+                    "KslD device open failed (tried direct paths + QueryDosDeviceW). Is Defender running?"
+                } else {
+                    "KslD device open failed (tried direct paths). Set KSLD_SCAN_DEVICES=1 to enable device enumeration."
+                };
+                return Err(KrwError::Other(alloc::format!("{msg}")));
             }
 
             Ok(Self {
