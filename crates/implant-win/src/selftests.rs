@@ -2501,6 +2501,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 // see exactly where the crash happens even if the process terminates mid-test.
 // ============================================================================
 
+#[cfg(nyx_diag)]
 /// Write a single ASCII marker byte to C:\nyx\hwbp_diag.txt (append mode).
 /// Uses CreateFileW(APPEND) + WriteFile — no std, no format!.
 /// **Gated behind DIAG_ENABLED** — only writes when selftest explicitly enables diagnostics.
@@ -2574,6 +2575,13 @@ unsafe fn diag_byte(ch: u8) {
     let mut nwritten: u32 = 0;
     let _ = write_file(h, byte.as_ptr(), 1, &mut nwritten, core::ptr::null_mut());
     close_handle(h);
+}
+
+// Production builds ship without --cfg nyx_diag, so diag_byte is a compile-time
+// no-op that leaves no forensic marker file on the target host.
+#[cfg(not(nyx_diag))]
+unsafe fn diag_byte(_ch: u8) {
+    // no-op: diagnostic markers are disabled in production builds
 }
 
 // ---- Minimal primitive tests (one step at a time) -----------------------

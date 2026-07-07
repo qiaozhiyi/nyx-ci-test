@@ -222,7 +222,7 @@ impl ByovdDriver {
         let h = unsafe {
             create_file(
                 path_buf.as_ptr(),
-                0xC0_00_00_00, // GENERIC_READ | GENERIC_WRITE
+                0x0012_0003, // FILE_READ_DATA|FILE_WRITE_DATA|SYNCHRONIZE (minimal)
                 0x03,          // FILE_SHARE_READ | FILE_SHARE_WRITE
                 ptr::null_mut(),
                 0x03, // OPEN_EXISTING

