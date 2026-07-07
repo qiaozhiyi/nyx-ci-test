@@ -226,6 +226,7 @@ pub enum Command {
         spawn_to: String,
         shellcode: Vec<u8>,
     },
+    Trex,
 }
 
 /// 文件操作的种类（u8 tag 0-4）。
@@ -402,6 +403,7 @@ impl Command {
                 w.str(spawn_to)?;
                 w.blob(shellcode)?;
             }
+            Command::Trex => w.u8(27),
         }
         Ok(())
     }
@@ -502,6 +504,7 @@ impl Command {
                     shellcode,
                 }
             }
+            27 => Command::Trex,
             t => return Err(WireError::BadTag(t)),
         })
     }

@@ -352,6 +352,12 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
         icon: "✕",
     },
     MetaCmd {
+        name: "/trex",
+        args_hint: "",
+        help: "T-REX target recon (noise-graded EDR detection)",
+        icon: "🦖",
+    },
+    MetaCmd {
         name: "/help",
         args_hint: "",
         help: "show this list",

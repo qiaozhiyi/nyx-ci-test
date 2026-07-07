@@ -291,6 +291,9 @@ fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
         Command::Inject { .. } => vec![Response::Err(
             "dev agent: inject is a Windows implant primitive".into(),
         )],
+        Command::Trex => vec![Response::Err(
+            "dev agent: trex is a Windows implant primitive".into(),
+        )],
         Command::Exit => vec![Response::Ok],
     }
 }

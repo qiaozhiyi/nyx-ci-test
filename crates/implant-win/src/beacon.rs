@@ -336,6 +336,24 @@ fn execute(
             }
             vec![Response::Ok]
         }
+        Command::Trex => {
+            let assessment = unsafe { crate::trex::assess_user_mode() };
+            let mut out: crate::heap::Vec<u8> = crate::heap::Vec::new();
+            let tier_names = [b"Clean", b"ConsumerAV", b"EnterpriseEDR", b"KernelArmed", b"Fortress"];
+            let tn = tier_names.get(assessment.tier as usize).map_or(&b"Unknown"[..], |s| *s);
+            out.extend_from_slice(b"=== T-REX ===\nTier: ");
+            out.extend_from_slice(tn);
+            out.extend_from_slice(b"\nProducts: ");
+            let n = assessment.products.len();
+            if n == 0 { out.extend_from_slice(b"none"); }
+            for (i, p) in assessment.products.iter().enumerate() {
+                if i > 0 { out.extend_from_slice(b", "); }
+                out.extend_from_slice(p.vendor.default_name().as_bytes());
+            }
+            out.extend_from_slice(b"\n");
+            out.extend_from_slice(assessment.recommendation.as_bytes());
+            vec![Response::Output(out)]
+        }
         Command::Exit => vec![Response::Ok],
         Command::Shell { args } => vec![crate::shell::run_shell(&args)],
         Command::Upload { name, data } => match rt {
