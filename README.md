@@ -13,8 +13,7 @@ Nyx 是一个纯 Rust 全栈 C2 框架，融合了 Cobalt Strike 的可扩展性
 | **加密协议** | X25519 ECDH + HKDF + ChaCha20-Poly1305；方向隔离 nonce；单调计数器防重放 |
 | **团队服务器** | tokio/axum HTTP(S) 监听；命名操作员 + Bearer 鉴权；会话/任务队列；SQLite 凭据库；哈希链审计日志；Rhai 事件脚本；Malleable C2 profile |
 | **Windows PIC 植入体** | ~25k LOC `no_std` DLL；26 个 Command 变体；间接 syscall + HWBP patchless blind + **Fluctuation 军用级睡眠混淆**（CFG/CET 免疫）+ **LACUNA 幽灵帧栈欺骗** + Pool Party section 注入 + Module Stomping + ThreadlessInject；全部默认 ARMED |
-| **内核层 SDK** | **可插拔 BYOVD 驱动包**（Shield/WDTKernel/RTCore64）+ 4 级页表遍历；ETW-TI 盲化；DKOM 进程隐藏；回调选择性中和；2 个真实 PatchGuard 窗口；KslD 动态设备枚举 |
-| **检测面审计** | 2026-07-06 完成全量 IOC 审计：9 项 CRITICAL/HIGH 修复（磁盘写入 gating、TLS 重试 gating、VEH 碰撞检测、AMSI 周期封顶、BYOVD 最小访问掩码等） |
+| **内核层 SDK** | **可插拔 BYOVD 驱动包**（Shield/WDTKernel/RTCore64）+ **TUI 内核命令**（/blind-etw /hide /dump-lsass /neutralize /detach-mf /driver-status）+ ETW-TI 盲化 + DKOM 进程隐藏 + 回调选择性中和 + PatchGuard 窗口 + KslD + CFG bypass |
 | **桌面客户端** | Makepad GUI（`crates/client-ui`）+ ratatui TUI（`crates/client-cli`）；REST API；SOCKS5 relay |
 | **脚本 / 扩展** | 嵌入式 Rhai 脚本；Malleable C2 profile（c2lint 验证）；BOF（CS ABI） |
 

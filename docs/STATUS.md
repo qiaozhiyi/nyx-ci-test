@@ -107,6 +107,16 @@
 | `nyx_selftest_transport` | 1 | WinHTTP TLS 正常 |
 
 **53/53 selftest 全部正常退出，0 超时。35 项验证码精确匹配，0 偏差。**
+
+### 0e. 2026-07-07 P6-Kernel-TUI 内核命令接线
+
+| 组件 | 说明 |
+|---|---|
+| **服务端内核桥** | `kernel.rs` — TCP JSON-line 客户端连接 `nyx-kernel --serve` daemon |
+| **API 端点** | `/api/kernel/status`, `/blind-etw`, `/hide`, `/dump-lsass`, `/neutralize`, `/detach-minifilter` — Admin 角色门控 |
+| **TUI 命令** | `/driver-status`, `/blind-etw`, `/hide <pid>`, `/dump-lsass <pid>`, `/neutralize <pid>`, `/detach-mf` |
+| **REST 客户端** | `rest.rs` — 6 个 `Kernel*` Cmd 变体 + worker_loop dispatch |
+| **可插拔驱动包** | `byovd_drivers/` — Shield (Horizon DataSys, 默认) + WDTKernel (Dell, HVCI兼容) + RTCore64 + IQVW64E；`NYX_BYOVD=<name>` 构建期选择 |
 ---
 
 ## 1. 总体完成度

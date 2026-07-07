@@ -178,26 +178,22 @@ sole native GUI is `crates/client-ui`, a pure-Rust Makepad app. The operator CLI
 
 ## Current status & next steps
 
-**2026-07-06: Military-grade sleep obfuscation + LACUNA ghost frames shipped.**
+**2026-07-07: P6 complete — military-grade sleep + LACUNA + IOC audit + kernel TUI wiring.**
 
-- **Fluctuation sleep mask** (`fluctuation.rs`, `fluctuation_thunk.rs`): replaces Foliage/Ekko.
-  Flips `.text` to `PAGE_NOACCESS` during sleep (memory scanners cannot read), back to
-  `PAGE_EXECUTE_READ` on wake. CFG/CET immune — no ROP chains, no NtContinue, no indirect
-  calls. Thunk placed on dynamically allocated RWX page (outside CFG bitmap coverage).
-- **LACUNA ghost-frame scanner** (`lacuna.rs`): cross-version `.pdata` gap scanner.
-  Scans ntdll/kernelbase/win32u for RUNTIME_FUNCTION lacunae at bootstrap.
-  Dual-path: DataDirectory[3] first, section-header fallback for builds where
-  Exception Directory is empty (17763 ntdll). Builds ghost frame chains for call-stack
-  spoofing — addresses in .pdata gaps are treated as leaf frames by RtlVirtualUnwind.
-  Ported from Mohamed Alzhrani's LACUNA Chain (June 2026).
-- **Pool Party fix**: `local_base` replaces `target_base` for TpDirect write (was
-  causing STATUS_ACCESS_VIOLATION). `TP_DIRECT_CALLBACK_OFFSET` 0x08→0x10.
-- **WinHTTP TLS fix**: `WINHTTP_OPTION_SECURITY_FLAGS` 32→31 (0x1F). Added retry
-  pattern: send with strict validation → on failure, set IGNORE flags → retry.
+- **Fluctuation sleep mask** (`fluctuation.rs`): PAGE_NOACCESS oscillation, CFG/CET immune.
+- **LACUNA ghost frames** (`lacuna.rs` + `lacuna_stomp.rs`): cross-version .pdata gap scanner
+  + BYOUD-Gap stack injection. Ported from Mohamed Alzhrani LACUNA Chain (June 2026).
+- **IOC audit closure**: 9 CRITICAL/HIGH detection surfaces fixed (diag_mark gate, TLS retry
+  gate, VEH probe, AMSI cycle cap, CreateFileW minimal mask, BLIND_OK tracking, Pool Party
+  explicit error, KslD device scan gate, BYOVD pluggable driver pack).
+- **Kernel TUI commands**: 6 kernel ops exposed via TUI (`/blind-etw`, `/hide <pid>`,
+  `/dump-lsass <pid>`, `/neutralize <pid>`, `/detach-mf`, `/driver-status`) → server
+  `/api/kernel/*` endpoints → `nyx-kernel --serve` daemon bridge.
+- **BYOVD driver pack**: Shield (Horizon DataSys, clean July 2026 default), WDTKernel
+  (Dell, HVCI-safe), RTCore64, IQVW64E. `NYX_BYOVD=<name>` build-time selection.
 
-**53/53 selftests pass on Server 2019 (17763.1339), 0 timeout.** 35 validated exit
-codes match expected values.
-
+**53/53 selftests pass on Server 2019 (17763.1339), 0 timeout.**
+Workspace compiles clean (0 errors).
 Previous milestones retained below for history.
 
 **2026-07-01 真机全量回归（3 处 CRITICAL 修复）：** 修复了 `operator-kernelsdk` 的 2 个编译
@@ -242,15 +238,14 @@ selftest 退出码验证 gate、`nyx-operator-kernel-cli` bin（kernel tier 操�
 - `NoMask` fallback → `crate::beacon::sleep_seconds()` (infinite recursion guard) ✅
 
 **Kernel (operator-kernelsdk):**
-- *BYOVD driver load:* `bootstrap_chain()` — Priority 1: KslD.sys (Living off the Defender) → Priority 2: RTCore64 fallback ✅
-- *KslD device resolution:* **Dynamic `QueryDosDeviceW` enumeration** — tries operator-supplied → default `\\.\MpKsl` → full dos-device namespace scan for `MpKsl*` prefix ✅ (2026-06-27)
-- *ETW-TI blind:* `blind_etw_ti_full()` — bootstrap_byovd → EtwTiBlind::blind(), `IsEnabled` zeroed ✅
-- *DKOM process hide:* `hide_pid()` / `restore()` — `ActiveProcessLinks` unlink/relink ✅
-- *Callback repurpose:* DATA write ctx pointer → ret gadget (HVCI-safe) — migrated to `telemetry.rs::CallbackNeutralizer::repurpose()` ✅ **selective slot targeting DONE** (range-based ntoskrnl skip + slot[0] fallback, real-machine verified)
-- *PatchGuard windows:* **`TimingRepairWindow`** real probe (valid_flag gate + repair callback write), **`RuntimePgBypassWindow`** data-only suspension (zero valid_flag, restore on Drop) — both wired, both HVCI-safe ✅ (2026-06-27). Only the legacy `PatchGuardWindow` is a refusing skeleton.
-- *MiniFilter:* **algorithm in `telemetry.rs::MiniFilterUnlinker`** (list-unlink of registered filters, data-only, HVCI-safe), **but `bootstrap_chain()` does NOT wire it** — `win/mod.rs:286` leaves `flt_globals_kva=0`. No `minifilter.rs` / `FltRegisterFilter`. 🔶 (next: wire `flt_globals` resolution)
-
-**Bug fixes during kernel testing (7 total):** resolve_sym stub, GetModuleHandleA fallback, strip_prefix off-by-one, RegCreateKeyExW param swap, missing Type field, ImagePath relative path, RtCore64 device_path/IOCTL/protocol fixes
+- **Pluggable BYOVD driver pack** (`byovd_drivers/`): Shield (Horizon DataSys, clean July 2026) + WDTKernel (Dell, HVCI-safe) + RTCore64 + IQVW64E. `NYX_BYOVD=<name>` build-time switching. `VulnDriverIoctl::blocklist_status()` ✅
+- **TUI kernel commands** (`client-cli`): `/driver-status`, `/blind-etw`, `/hide <pid>`, `/dump-lsass <pid>`, `/neutralize <pid>`, `/detach-mf` — routed through server `/api/kernel/*` → `nyx-kernel --serve` daemon ✅ (2026-07-07)
+- *ETW-TI blind:* `blind_etw_ti_full()` ✅
+- *DKOM process hide:* `hide_pid()` ✅
+- *Callback repurpose:* selective slot targeting ✅
+- *PatchGuard windows:* TimingRepairWindow + RuntimePgBypassWindow ✅
+- *MiniFilter:* algorithm in telemetry.rs, bootstrap_chain auto-resolves via build table ✅
+- *CFG bypass:* `cfg.rs` — kernel bitmap write for NtContinue marking ✅
 
 ### DONE — postex token operations wired (G1) ✅
 
