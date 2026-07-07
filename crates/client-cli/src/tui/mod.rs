@@ -1745,13 +1745,7 @@ impl App {
                     action,
                 });
             }
-            "/trex" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                self.send(Cmd::Trex { session: s.id });
-            }
+
             "/screenwatch" => {
                 let Some(s) = self.current_session().cloned() else {
                     self.log("! select a beacon first", Level::Err);
