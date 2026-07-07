@@ -316,6 +316,42 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
         icon: "◐",
     },
     MetaCmd {
+        name: "/driver-status",
+        args_hint: "",
+        help: "kernel daemon status",
+        icon: "⚙",
+    },
+    MetaCmd {
+        name: "/blind-etw",
+        args_hint: "",
+        help: "blind ETW-TI kernel provider",
+        icon: "⊘",
+    },
+    MetaCmd {
+        name: "/hide",
+        args_hint: "<pid>",
+        help: "DKOM process hide",
+        icon: "◈",
+    },
+    MetaCmd {
+        name: "/dump-lsass",
+        args_hint: "<pid>",
+        help: "kernel LSASS dump",
+        icon: "⚿",
+    },
+    MetaCmd {
+        name: "/neutralize",
+        args_hint: "<pid>",
+        help: "neutralize EDR callbacks",
+        icon: "☠",
+    },
+    MetaCmd {
+        name: "/detach-mf",
+        args_hint: "",
+        help: "detach EDR minifilter",
+        icon: "✕",
+    },
+    MetaCmd {
         name: "/help",
         args_hint: "",
         help: "show this list",
