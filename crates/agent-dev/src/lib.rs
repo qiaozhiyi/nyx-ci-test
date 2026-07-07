@@ -294,6 +294,9 @@ fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
         Command::Trex => vec![Response::Err(
             "dev agent: trex is a Windows implant primitive".into(),
         )],
+        Command::SetChannel { .. } => vec![Response::Err(
+            "dev agent: setchannel is a Windows implant primitive".into(),
+        )],
         Command::Exit => vec![Response::Ok],
     }
 }

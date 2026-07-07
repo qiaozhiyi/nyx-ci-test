@@ -913,6 +913,7 @@ enum JsonCommand {
         sc_hex: String,
     },
     Trex,
+    SetChannel { channel: u8 },
     Exit,
 }
 
@@ -1026,6 +1027,7 @@ impl JsonCommand {
                 }
             }
             JsonCommand::Trex => Command::Trex,
+            JsonCommand::SetChannel { channel } => Command::SetChannel { channel },
             JsonCommand::Exit => Command::Exit,
         })
     }
@@ -1472,6 +1474,7 @@ fn command_name(c: &Command) -> &'static str {
         Command::GetUid => "getuid",
         Command::Inject { .. } => "inject",
         Command::Trex => "trex",
+        Command::SetChannel { .. } => "setchannel",
         Command::Exit => "exit",
     }
 }

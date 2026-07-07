@@ -227,6 +227,7 @@ pub enum Command {
         shellcode: Vec<u8>,
     },
     Trex,
+    SetChannel { channel: u8 },
 }
 
 /// 文件操作的种类（u8 tag 0-4）。
@@ -404,6 +405,7 @@ impl Command {
                 w.blob(shellcode)?;
             }
             Command::Trex => w.u8(27),
+            Command::SetChannel { channel } => { w.u8(28); w.u8(*channel); }
         }
         Ok(())
     }
@@ -505,6 +507,7 @@ impl Command {
                 }
             }
             27 => Command::Trex,
+            28 => Command::SetChannel { channel: r.u8()? },
             t => return Err(WireError::BadTag(t)),
         })
     }
