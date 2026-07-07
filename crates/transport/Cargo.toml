@@ -9,6 +9,11 @@ description = "Nyx transport fingerprint engine: TLS ClientHello parse + JA3/JA4
 md-5 = "0.10"
 sha2 = { workspace = true }
 hex = { workspace = true }
+ureq = { workspace = true }
+rand = { workspace = true, features = ["std", "std_rng"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = "0.22"
 # NOTE: exact browser JA3/JA4/Akamai emission needs a BoringSSL-backed HTTP
 # client. The `rquest` line was renamed `wreq` (6.0.0-rc.x, author 0x676e67);
 # rquest 5.x is yanked. We do NOT declare it here yet (an unresolvable optional
