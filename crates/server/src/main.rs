@@ -137,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
         creds: Arc::new(cred_store),
         operators: Arc::new(operators),
         audit: Some(Arc::new(audit_writer)),
+        kernel: None,
     };
     state.register_default_hooks();
     // Optional operator automation: a Rhai script run on session/result events.
