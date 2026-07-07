@@ -25,14 +25,25 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: windows-ci
+  group: windows-ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    runs-on: windows-2025-vs2026
+  # ---- Multi-version implant build + selftest ----
+  implant-matrix:
+    name: "Implant (${{ matrix.os }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2019, windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:
+      - name: "OS: ${{ matrix.os }}"
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host "Build: $($os.BuildNumber) | $($os.Caption)"
       - uses: actions/checkout@v4
 
       - name: Install Rust nightly + MSVC target
