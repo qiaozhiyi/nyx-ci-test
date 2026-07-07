@@ -7,9 +7,9 @@
 //! - `GET  /api/results`       — drain task results for a session (JSON).
 
 pub mod audit;
+pub mod kernel;
 pub mod operators;
 pub mod tls;
-pub mod kernel;
 
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -104,7 +104,6 @@ pub struct AppState {
     /// Kernel daemon bridge (P6). `None` when no daemon configured.
     pub kernel: Option<Arc<kernel::KernelBridge>>,
 }
-
 
 /// A captured inbound TLS fingerprint (JA3 + JA4), keyed by peer addr.
 #[derive(Debug, Clone, Default)]
@@ -331,7 +330,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/kernel/hide", post(kernel::hide))
         .route("/api/kernel/dump-lsass", post(kernel::dump_lsass))
         .route("/api/kernel/neutralize", post(kernel::neutralize))
-        .route("/api/kernel/detach-minifilter", post(kernel::detach_minifilter))
+        .route(
+            "/api/kernel/detach-minifilter",
+            post(kernel::detach_minifilter),
+        )
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024));
 
     beacon_routes.merge(api_routes).with_state(state)

