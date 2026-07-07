@@ -12,7 +12,7 @@ Nyx 是一个纯 Rust 全栈 C2 框架（**69,509 行 Rust**），融合了 Coba
 |---|---|
 | **加密协议** | X25519 ECDH + HKDF + ChaCha20-Poly1305；方向隔离 nonce；单调计数器防重放 |
 | **团队服务器** | tokio/axum HTTP(S) 监听；命名操作员 + Bearer 鉴权；会话/任务队列；SQLite 凭据库；哈希链审计日志；Rhai 事件脚本；Malleable C2 profile |
-| **Windows PIC 植入体** | ~25k LOC `no_std` DLL；26 个 Command 变体；间接 syscall + HWBP patchless blind + **Fluctuation 军用级睡眠混淆**（CFG/CET 免疫）+ **LACUNA 幽灵帧栈欺骗** + Pool Party section 注入 + Module Stomping + ThreadlessInject；全部默认 ARMED |
+| **Windows PIC 植入体** | ~27k LOC `no_std` DLL；26 个 Command 变体；间接 syscall + **V2 CFG 用户态绕过** + HWBP patchless blind + **V2 DR0-DR7 睡眠消毒** + **Fluctuation 军用级睡眠混淆**（CFG/CET 免疫）+ **LACUNA 幽灵帧栈欺骗** + **caller-spoof stub 扫描** + **VEH proxy gadget 扫描** + Pool Party section 注入 + Module Stomping + ThreadlessInject；全部默认 ARMED |
 | **内核层 SDK** | **可插拔 BYOVD 驱动包**（Shield/WDTKernel/RTCore64）+ **TUI 内核命令**（/blind-etw /hide /dump-lsass /neutralize /detach-mf /driver-status）+ ETW-TI 盲化 + DKOM 进程隐藏 + 回调选择性中和 + PatchGuard 窗口 + KslD + CFG bypass |
 | **桌面客户端** | Makepad GUI（`crates/client-ui`）+ ratatui TUI（`crates/client-cli`）；REST API；SOCKS5 relay |
 | **脚本 / 扩展** | 嵌入式 Rhai 脚本；Malleable C2 profile（c2lint 验证）；BOF（CS ABI） |
@@ -35,11 +35,15 @@ crates/
 │   ├── fluctuation.rs     #   军用级睡眠混淆（PAGE_NOACCESS 振荡, CFG/CET 免疫）
 │   ├── lacuna.rs          #   LACUNA .pdata 间隙扫描器（跨版本）
 │   ├── lacuna_stomp.rs    #   BYOUD-Gap 幽灵帧栈注入
-│   ├── blind_hwbp.rs      #   HWBP patchless 盲化（VEH 碰撞检测）
+│   ├── blind_hwbp.rs      #   HWBP patchless 盲化（VEH 碰撞检测 + CFG bypass）
+│   ├── cfg_user.rs        #   **V2** 用户态 CFG bitmap 写入（无内核驱动）
+│   ├── caller_spoof.rs    #   **V2** ntdll RET stub 扫描器（EDR 调用源审计绕过）
+│   ├── proxy_veh.rs       #   **V2** VEH 代理处理器（jmp/call rbx gadget 扫描）
+│   ├── caller_spoof_thunk.rs # **V2** raw-byte 调用栈欺骗 trampoline
+│   ├── fluctuation.rs     #   军用级睡眠混淆 + **V2 DR0-DR7 消毒**
 │   ├── tp.rs              #   Pool Party section 注入
 │   ├── inject.rs          #   Module Stomping + ThreadlessInject
-│   └── selftests.rs       #   53 个 selftest 导出（位掩码退出码）
-│
+│   └── selftests.rs       #   54 个 selftest 导出（位掩码退出码）
 ├── operator-kernelsdk/    # 内核级 EDR 绕过 SDK（24 模块）
 │   ├── byovd.rs           #   KernelRw trait + ByovdDriver
 │   ├── byovd_drivers/     #   可插拔驱动包（Shield/WDTKernel/RTCore64/IQVW64E）

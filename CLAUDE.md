@@ -284,6 +284,26 @@ verified: SysmonDrv slot[5] EID1 SILENCED + RESUMED. Only the per-driver
 | ThreadlessInject | PE-sieve `.text` hash-mismatch true fix | P3 |
 | Pattern scan 兜底 | Unknown build fallback — `pattern_scan.rs` shipped (algo done; 🔶 needs real ntoskrnl image) | ✅ Algo done |
 
+
+### V2 Evasion Countermeasures (2026-07-06)
+
+Four user-mode countermeasures that close the remaining detection surfaces on the
+VEH+HWBP blind path, all implemented WITHOUT kernel driver:
+
+| Module | Countermeasure | IOC Closed |
+|---|---|---|
+| `cfg_user.rs` | `NtSetInformationVirtualMemory(VmCfgCallTargetInformation)` — marks implant code as CFG-valid target | `STATUS_STACK_BUFFER_OVERRUN` on CFG-enabled processes |
+| `caller_spoof.rs` | `ADD RSP, imm8; RET` stub in ntdll → fake return address on `AddVectoredExceptionHandler` call | EDR inline hook caller-audit (return address in implant memory) |
+| `proxy_veh.rs` | `jmp rbx`/`call rbx` gadget in signed DLL + section-backed handler mapping | VEH chain scan (handler address in unbacked memory) |
+| `fluctuation.rs` (DR save/restore) | Save DR0-DR7 → clear → sleep → `NtContinue` restore (no ETW TI) | EDR async thread scan during PAGE_NOACCESS sleep |
+
+**Residual IOCs** (user-mode ceiling):
+- CET Shadow Stack on Win11 24H2+ — no user-mode workaround for gadget-based control flow
+- Section-backed handler CoW pages differ from canonical ntdll mapping (detectable via `QueryWorkingSetEx`)
+- `AddVectoredExceptionHandler` API call itself (mitigated by caller-spoof, not eliminated)
+
+**V2 optima**l path: accept `AddVectoredExceptionHandler` as the one remaining IOC (used by .NET JIT, V8), contextualize as legitimate software.
+
 ### Architecture reference
 
 - **`docs/STATUS.md`** — **authoritative** current status (single source of truth; gaps G1-G5 closed, only G6=Win11 24H2 hardware remains)

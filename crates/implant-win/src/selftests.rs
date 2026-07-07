@@ -2705,6 +2705,7 @@ unsafe fn diag_test_ctx_thread() {
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_hwbp_blind() {
     crate::blind_hwbp::set_diag_enabled(true); // enable diag markers for selftest
+    crate::blind_hwbp::init_countermeasures();  // scan gadgets + caller-spoof stubs
 
     // Minimal test: init shadow + call blind_etw_hwbp → add_hwbp → remove_hwbp.
     // Markers: 0=entry, 1=shadow_ok, S=add_ok, T=remove_ok, U=count_clean

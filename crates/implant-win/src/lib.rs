@@ -60,6 +60,14 @@ pub mod antidebug;
 #[cfg(target_os = "windows")]
 pub mod beacon;
 #[cfg(target_os = "windows")]
+pub mod cfg_user;
+
+pub mod caller_spoof_thunk;
+#[cfg(target_os = "windows")]
+pub mod caller_spoof;
+#[cfg(target_os = "windows")]
+pub mod proxy_veh;
+#[cfg(target_os = "windows")]
 pub mod blind;
 #[cfg(target_os = "windows")]
 pub mod blind_hwbp;

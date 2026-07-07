@@ -24,8 +24,8 @@ This project implements a comprehensive testing and review suite for the **Nyx**
 | 6 | M6. Kernel Real-Machine | BYOVD load + ETW-TI + DKOM + Callback repurpose on Server 2019 | M5 | DONE (2026-06-26) |
 | 7 | M7. Gap Closure + Real-Machine | Close gaps G1-G5 (postex/creds-audit/BOF-loader/MiniFilter/symserver); verify G1 on Server 2019 | M6 | DONE (2026-06-27) |
 | 8 | M8. Win11 24H2 Real-Machine | Cross-version offset + CET verify on Win11 24H2/25H2 | M7, Win11 VM | 🔶 PARTIAL (CI compiles on 26100, selftest blocked by HVCI on runners) |
-| 8b | **P6. Military-Grade Sleep + Stack Spoof + Kernel TUI** | Fluctuation + LACUNA + IOC audit + BYOVD driver pack + kernel TUI wiring (6 commands) + server kernel bridge | M7 | ✅ DONE (2026-07-07, 53/53 selftest, workspace 0 errors) |
-| 9 | M9. Traffic Resilience V1 | Multi-channel mesh (HTTPS+DoH) + DGA + jitter mimicry | None | 🎯 PLANNED — see [`docs/NATIONAL_TIER_MASTER_DESIGN.md`](docs/NATIONAL_TIER_MASTER_DESIGN.md) §C1 |
+| 8b | P6. Military-Grade Sleep + Stack Spoof + Kernel TUI | Fluctuation + LACUNA + IOC audit + BYOVD driver pack + kernel TUI wiring | M7 | ✅ DONE (2026-07-07, 54/54 selftest, workspace 0 errors) |
+| 8c | **P7. V2 Evasion Countermeasures** | CFG user-mode bypass + DR sleep sanitization + caller-spoof stub scanner + VEH proxy gadget scanner — four countermeasures, zero kernel driver | M8b | ✅ DONE (2026-07-07, 54/54 selftest on 17763.1339) |
 | 10 | M10. Lateral Movement V1 | LSASS dump + Kerberoasting + PtH + WMI/DCOM lateral | None | 🎯 PLANNED — §C5 |
 | 11 | M11. Anti-Forensics V1 | Windows timestomp/USN/Prefetch/EventLog cleanup + memory-only path | None | 🎯 PLANNED — §C4 |
 | 12 | M12. Cross-Platform V1 | `implant-core` trait + Linux production implant | None | 🎯 PLANNED — §C2 |

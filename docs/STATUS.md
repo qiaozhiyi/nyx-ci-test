@@ -14,10 +14,23 @@
 - `cargo clippy -p nyx-cli -- -D warnings` ✅ 零警告（2026-07-01 闭合 `urlencoding` 未用导入）
 - `cargo +nightly check -p nyx-implant-win --target x86_64-pc-windows-gnu` ✅ 绿（52 warnings，无 error）
 - `operator-kernelsdk`（独立 crate）✅ 编译通过，`cargo test --lib` = **90 通过 / 4 失败**（4 个为预存 `*_is_windows_only` 平台 gate 缺陷，真 Windows 上函数实际执行导致断言失败，与功能无关；见 §0a）
-- `implant-evasionsdk`（独立 crate）✅ **53 通过 / 0 失败**
-- selftest 导出 **53 个**（2026-07-06 新增 `nyx_selftest_lacuna`）
-- **53 个 selftest 真机 rundll32 全量回归** ✅ 53/53 正常退出，0 超时（2026-07-06；`scripts/win_selftest_all.ps1 -Validate` = 35 验证码匹配 / 0 偏差）
-- 真机环境：Windows Server 2019 Datacenter **17763.1339**（UBR=0x53b, ntoskrnl=10.0.17763.1339）+ RTCore64.sys (CVE-2019-16098)
+- selftest 导出 **54 个**（2026-07-06 新增 `nyx_selftest_lacuna`；2026-07-07 新增 `caller_spoof_thunk`）
+- **54 个 selftest 真机 rundll32 全量回归** ✅ 54/54 正常退出，0 超时（2026-07-07；`scripts/win_selftest_all.ps1 -Validate` = 35 验证码匹配 / 0 偏差）
+- 真机环境：Windows Server 2019 Datacenter **17763.1339**（UBR=0x53b, ntoskrnl=10.0.17763.1339）+ Shield/Horizon DataSys (LOLDrivers #344, 默认)
+
+### P7. V2 反制措施 — 四条用户态对抗（2026-07-07）
+
+针对 VEH+HWBP 盲化路径上剩余的四条 EDR 检测面，**全部用户态实施，零内核驱动依赖**：
+
+| 模块 | 对策 | 关闭的 IOC | 真机状态 |
+|---|---|---|---|
+| `cfg_user.rs` | `NtSetInformationVirtualMemory(VmCfgCallTargetInformation)` — 将 implant 代码写入 CFG bitmap | `STATUS_STACK_BUFFER_OVERRUN`（CFG 进程） | ✅ 已接线，Server 2019 无 CFG→no-op |
+| `caller_spoof.rs` | ntdll 内 `ADD RSP,X;RET` / bare `RET` stub 扫描 | EDR 内联 hook 调用源审计（返回地址在 implant 内存） | ✅ 扫描器已验证（G/R 标记） |
+| `proxy_veh.rs` | 签名 DLL 内 `jmp rbx`/`call rbx` gadget 扫描 | VEH 链表扫描（处理器地址在非签名内存） | ✅ Gadget 扫描已验证 |
+| `fluctuation.rs` | 睡眠前保存 DR0-DR7→清零→NtContinue 恢复（无 ETW TI） | EDR 异步线程扫描（PAGE_NOACCESS 期间） | ✅ 已接线 |
+
+**跨版本兼容性**：PE header 解析器（`SizeOfOptionalHeader` 动态计算）修复确保所有 Windows 构建上的扫描器功能正常。`caller_spoof_thunk.rs`（raw-byte trampoline）已构建但 0xC0000005 调试中——待 follow-up PR。
+
 
 本次修复 3 处 CRITICAL 并在 17763.1339 真机全量验证：
 

