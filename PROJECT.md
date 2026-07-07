@@ -23,7 +23,8 @@ This project implements a comprehensive testing and review suite for the **Nyx**
 | 5 | M5. P2 Bypass Module | EDR evasion: userland kits + kernel tier | None | DONE (2026-06-26) |
 | 6 | M6. Kernel Real-Machine | BYOVD load + ETW-TI + DKOM + Callback repurpose on Server 2019 | M5 | DONE (2026-06-26) |
 | 7 | M7. Gap Closure + Real-Machine | Close gaps G1-G5 (postex/creds-audit/BOF-loader/MiniFilter/symserver); verify G1 on Server 2019 | M6 | DONE (2026-06-27) |
-| 8 | M8. Win11 24H2 Real-Machine | Cross-version offset + CET verify on Win11 24H2/25H2 | M7, Win11 VM | 🔶 BLOCKED (no Win11 24H2 host in sshconfig) |
+| 8 | M8. Win11 24H2 Real-Machine | Cross-version offset + CET verify on Win11 24H2/25H2 | M7, Win11 VM | 🔶 PARTIAL (CI compiles on 26100, selftest blocked by HVCI on runners) |
+| 8b | **P6. Military-Grade Sleep + Stack Spoof** | Fluctuation PAGE_NOACCESS sleep mask (CFG/CET immune) + LACUNA ghost-frame .pdata gap scanner + BYOUD-Gap stack injection + Pool Party fix + TLS fix + IOC audit closure | M7 | ✅ DONE (2026-07-07, 53/53 selftest on 17763) |
 | 9 | M9. Traffic Resilience V1 | Multi-channel mesh (HTTPS+DoH) + DGA + jitter mimicry | None | 🎯 PLANNED — see [`docs/NATIONAL_TIER_MASTER_DESIGN.md`](docs/NATIONAL_TIER_MASTER_DESIGN.md) §C1 |
 | 10 | M10. Lateral Movement V1 | LSASS dump + Kerberoasting + PtH + WMI/DCOM lateral | None | 🎯 PLANNED — §C5 |
 | 11 | M11. Anti-Forensics V1 | Windows timestomp/USN/Prefetch/EventLog cleanup + memory-only path | None | 🎯 PLANNED — §C4 |
@@ -40,26 +41,27 @@ This project implements a comprehensive testing and review suite for the **Nyx**
 
 > **Authoritative detail: [`docs/STATUS.md`](docs/STATUS.md).** Numbers below are a summary.
 
-**Overall completion: ~95%** (userland 98%, kernel algo 100%, wiring 100%, kernel real-machine 7/7 PASS). Gaps G1-G5 closed 2026-06-27; only G6 (Win11 24H2 real-machine) remains — hardware gap.
+**Overall completion: ~97%** (userland 99%, kernel algo 100%, wiring 100%). P6 Fluctuation+LACUNA+IOC audit closed 2026-07-07. All selftests pass on Server 2019 (17763.1339).
 
 ### Userland (implant-win) — all default ARMED
 - ✅ Indirect syscalls (Hell/Halo/Tartarus SSN)
-- ✅ HWBP patchless blind (zero `.text` modification) + byte-patch blind (NtTraceEvent)
-- ✅ Foliage sleep mask (APC chain + RC4, masks `.text` AND heap regions)
-- ✅ Module stomping inject + ThreadlessInject (HWBP) — `MODULESTOMP_ENABLED` default **ON**
-- ✅ BYOUD-Gap RSP swap (CET-aware; `SPOOF_SWAP_ENABLED` default **OFF** until CET-safe)
+- ✅ HWBP patchless blind (zero `.text` modification, VEH chain probe) + byte-patch blind
+- ✅ **Fluctuation sleep mask** (PAGE_NOACCESS oscillation, CFG/CET immune) — replaces Foliage
+- ✅ **LACUNA ghost-frame scanner** (.pdata gap discovery + BYOUD-Gap stack injection)
+- ✅ Module stomping + ThreadlessInject (HWBP) + **Pool Party section injection**
+- ✅ BYOUD-Gap RSP swap (CET-aware; `SPOOF_SWAP_ENABLED` default **OFF**)
 - ✅ Memory region encryption (RC4) + heap slab tracking
 - ✅ ntdll unhook (KnownDlls + disk fallback) + anti-debug
-- ✅ **Post-ex token operations** (G1, wired 2026-06-27): `StealToken`/`MakeToken`/`Rev2Self`/`GetUid` — real-machine verified (`nyx_selftest_postex` exit=15)
+- ✅ **Post-ex token operations**: `StealToken`/`MakeToken`/`Rev2Self`/`GetUid`
 
 ### Kernel (operator-kernelsdk)
-- ✅ BYOVD driver load (KslD dynamic `QueryDosDeviceW` → RTCore64 fallback chain)
+- ✅ **Pluggable BYOVD driver pack** — Shield/Horizon (default, clean July 2026) + WDTKernel/Dell (HVCI-safe) + RTCore64 + IQVW64E; `NYX_BYOVD=<name>` build-time selection
 - ✅ ETW-TI provider blind (IsEnabled=0, HVCI-safe)
 - ✅ DKOM process hide (ActiveProcessLinks unlink/relink)
-- ✅ Callback repurpose (DATA write, **selective slot targeting DONE** — range-based ntoskrnl skip + slot[0] fallback)
-- ✅ PatchGuard windows — `TimingRepairWindow` + `RuntimePgBypassWindow` real; **vestigial `PatchGuardWindow` skeleton deleted (P0.a, 2026-07-05)**; `nyx-kernel pg-window` subcommand now exposes `select_pg_window`
-- ✅ MiniFilter — algorithm in `telemetry.rs::MiniFilterUnlinker`; **`bootstrap_chain` now auto-resolves FltGlobals RVA via build table (P0.b, 2026-07-05)** (17763/19041/22621/26100 + patch-equiv); `--flt-rva` only needed for unknown/early-UBR builds
-
+- ✅ Callback repurpose (DATA write, selective slot targeting)
+- ✅ PatchGuard windows — TimingRepairWindow + RuntimePgBypassWindow
+- ✅ MiniFilter — auto-resolves FltGlobals RVA via build table (17763/19041/22621/26100)
+- ✅ **CFG bitmap kernel write** (cfg.rs) — marks NtContinue valid via kernel r/w
 ### Real-machine verification (Server 2019 17763.1339)
 - ✅ Task G: BYOVD driver load + ntoskrnl base resolve
 - ✅ Task H: ETW-TI IsEnabled zeroed

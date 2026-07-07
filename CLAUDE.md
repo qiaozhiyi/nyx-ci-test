@@ -149,15 +149,16 @@ Modules (all `cfg(target_os = "windows")` except `heap`/`server_pub`):
   runtime: SSN table + ntdll `syscall;ret` gadget + RX trampoline; `syscall!`
   macro + global accessor), `config` (per-build encrypted config, re-randomized
   each build by `build.rs`), `server_pub` (baked server long-term pubkey).
-- **Evasion (the P2 surface — mind shipped vs skeleton):** `unhook` (KnownDlls
-  `\ntdll` fresh-map + disk fallback → pristine SSN bytes & clean gadget;
-  **shipped**), `blind` (AMSI/ETW userland byte-patch; **shipped**), `antidebug`
-  (PEB.BeingDebugged + `ProcessDebugPort` + uptime; **shipped**), `blind_hwbp`
-  (HWBP patchless blind — **shipped**, zero `.text` modification), `kits`
-  (`Foliage` SleepmaskKit + `ModuleStompKit` ProcessInjectKit — **fully wired**),
-  `stack` (call-stack spoof — **gated, CET-aware**), `sleep`+`mem`
-  (sleep-mask — **shipped, RC4 + APC timing; heap regions now tracked and
-  masked alongside .text via Foliage helper**).
+- **Evasion (P6 — military-grade):** `fluctuation` + `fluctuation_thunk`
+  (PAGE_NOACCESS sleep mask — CFG/CET immune, replaces Foliage/Ekko),
+  `lacuna` (cross-version .pdata gap scanner → ghost frame chain builder),
+  `lacuna_stomp` (BYOUD-Gap stack injection via inline asm),
+  `unhook` (KnownDlls fresh-map + disk fallback), `blind` (AMSI/ETW byte-patch;
+  with BLIND_OK tracking + AMSI_PATCHED cycle cap), `blind_hwbp` (HWBP patchless
+  blind — VEH chain probe before registration), `antidebug`, `kits`
+  (Fluctuation SleepmaskKit + ModuleStompKit — fully wired),
+  `stack` (call-stack spoof — gated, CET-aware), `sleep`+`mem`
+  (delegates to fluctuation; old Foliage code retained for reference).
 - **Loop & capabilities:** `beacon` (the task loop; dispatches every wire
   `Command`), `transport` (WinHTTP POST + TLS), `envelopes` (build-time-baked
   malleable-C2 shapes), `hostinfo` (real `SessionInfo`), `fs` (Upload/Download/
