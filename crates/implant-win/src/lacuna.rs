@@ -130,21 +130,23 @@ static SCANNED: AtomicBool = AtomicBool::new(false);
 
     if SCANNED.load(Ordering::Acquire) { return; }
 
-    // ntdll — always loaded, must succeed.
+    let mut ntdll_ghosts = Vec::new();
+    let mut kb_ghosts = Vec::new();
+    let mut w32_ghosts = Vec::new();
+
     if let Some(base) = unsafe { crate::resolve::module_base_by_name(b"ntdll.dll") } {
-        let _ghosts = unsafe { scan_ghosts(base) };
-        // Ghosts are consumed on-demand via scan_ghosts at call time.
-        // Caching them globally adds alloc pressure; re-scan is cheap.
+        ntdll_ghosts = scan_ghosts(base);
     }
-
-    // kernelbase — loaded in most processes.
     if let Some(base) = unsafe { crate::resolve::module_base_by_name(b"kernelbase.dll") } {
-        let _ghosts = unsafe { scan_ghosts(base) };
+        kb_ghosts = scan_ghosts(base);
+    }
+    if let Some(base) = unsafe { crate::resolve::module_base_by_name(b"win32u.dll") } {
+        w32_ghosts = scan_ghosts(base);
     }
 
-    // win32u — loaded in GUI processes.
-    if let Some(base) = unsafe { crate::resolve::module_base_by_name(b"win32u.dll") } {
-        let _ghosts = unsafe { scan_ghosts(base) };
+    if !ntdll_ghosts.is_empty() {
+        let chain = build_ghost_chain(&ntdll_ghosts, &kb_ghosts, &w32_ghosts, 6);
+        crate::lacuna_stomp::install_ghost_chain(&chain);
     }
 
     SCANNED.store(true, Ordering::Release);

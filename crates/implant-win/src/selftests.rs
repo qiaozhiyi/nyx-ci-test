@@ -2841,16 +2841,23 @@ pub unsafe extern "system" fn nyx_selftest_lacuna() {
 
     let kb_ghosts = if let Some(kb) = crate::resolve::module_base_by_name(b"kernelbase.dll") {
         unsafe { crate::lacuna::scan_ghosts(kb) }
-    } else { crate::heap::Vec::new() };
+    } else { crate::heap::Vec::<crate::lacuna::GhostRegion>::new() };
     if !kb_ghosts.is_empty() { mask |= 1 << 1; }
 
     let w32_ghosts = if let Some(w32) = crate::resolve::module_base_by_name(b"win32u.dll") {
         unsafe { crate::lacuna::scan_ghosts(w32) }
-    } else { crate::heap::Vec::new() };
+    } else { crate::heap::Vec::<crate::lacuna::GhostRegion>::new() };
     if !w32_ghosts.is_empty() { mask |= 1 << 2; }
 
     let chain = crate::lacuna::build_ghost_chain(&ntdll_ghosts, &kb_ghosts, &w32_ghosts, 6);
     if chain.frames.len() >= 4 { mask |= 1 << 3; }
+
+    // Install ghost chain for stack injection.
+    crate::lacuna_stomp::install_ghost_chain(&chain);
+    // Verify: with_ghost_stack executes without crashing.
+    let mut stomp_ok = false;
+    unsafe { crate::lacuna_stomp::with_ghost_stack(|| stomp_ok = true) };
+    if stomp_ok { mask |= 1 << 4; }
 
     unsafe { exit(mask) };
 }

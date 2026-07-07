@@ -89,6 +89,8 @@ pub mod hookchain;
 pub mod hostinfo;
 #[cfg(target_os = "windows")]
 pub mod lacuna;
+#[cfg(target_os = "windows")]
+pub mod lacuna_stomp;
 pub mod inject;
 #[cfg(target_os = "windows")]
 pub mod keylog;
