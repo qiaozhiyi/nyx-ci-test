@@ -285,6 +285,23 @@ verified: SysmonDrv slot[5] EID1 SILENCED + RESUMED. Only the per-driver
 | Pattern scan 兜底 | Unknown build fallback — `pattern_scan.rs` shipped (algo done; 🔶 needs real ntoskrnl image) | ✅ Algo done |
 
 
+
+### Multi-Channel Transport Layer (2026-07-07)
+
+7 pluggable C2 channels implementing the `Transport` trait in `crates/transport/src/`:
+
+| Priority | Channel | File | Parity | Stealth Principle |
+|----------|---------|------|--------|-------------------|
+| 0 | HTTPS | (existing WinHTTP) | CS 4.13 + BRC4 v2.5 | Baseline, always available |
+| 1 | DoH DNS | `doh_dns.rs` | CS+BRC4 | DNS queries in TLS 1.3 = Cloudflare DoH traffic |
+| 2 | Slack API | `slack_api.rs` | BRC4 Mercury v2.5 | `chat.postMessage` = Slack bot messages |
+| 3 | LLM API (Claude) | `llm_api.rs` | Check Point 2026.04 | `POST api.anthropic.com` = AI dev traffic |
+| 4 | MCP | `mcp.rs` | ArXiv 2025 | JSON-RPC `tools/call` = Cursor/Windsurf traffic |
+| 5 | WebTransport | `webtransport.rs` | IETF Draft-15 | QUIC streams = Google Meet video |
+| 6 | SMB/Named Pipe | `smb_pipe.rs` | CS+BRC4 | Named pipes = Windows IPC |
+
+`TransportStack` in `traits.rs` handles priority-based auto-fallback with health probes.
+
 ### V2 Evasion Countermeasures (2026-07-06)
 
 Four user-mode countermeasures that close the remaining detection surfaces on the
