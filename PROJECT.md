@@ -32,10 +32,13 @@ This project implements a comprehensive testing and review suite for the **Nyx**
 | 13 | M13. Delivery & Exploit V1 | stager + multi-stage loader + 1 N-day LPE chain + payload polymorphism | None | 🎯 PLANNED — §C3 |
 | 14 | M14. Server Federation V1 | 3-node Raft + session migration + operator cooperative locks | None | 🎯 PLANNED — §C6 |
 | 15 | M15. macOS Implant + Integration | Mach-O dylib implant + amfid/ES bypass + full-pillar integration | M12 | 🎯 PLANNED — §C2 |
+## National-Tier Roadmap (2026-07-07)
 
-## National-Tier Roadmap (2026-07-05)
+> **详细计划:** [`docs/ROADMAP_2026-2027.md`](docs/ROADMAP_2026-2027.md) — 18-24 个月从当前 P7 到 Nyx 2.0 GA 的分阶段演进蓝图。
+> **六根支柱:** 流量韧性(C1) · 跨平台(C2) · 交付链(C3) · 反取证(C4) · 横向移动(C5) · 服务器联邦(C6)。
+> M9–M15 是分阶段里程碑，每阶段独立可验证。
+> 范围外项目（0day 研发、移动端 0click、固件/OT）在路线图 §7 中列为外部依赖。
 
-> **Master design:** [`docs/NATIONAL_TIER_MASTER_DESIGN.md`](docs/NATIONAL_TIER_MASTER_DESIGN.md) — defines the 18–24 month evolution from current single-platform C2 to a Tier-1 nation-grade action platform across six pillars (C1 traffic resilience · C2 cross-platform · C3 delivery · C4 anti-forensics · C5 lateral · C6 federation). M9–M15 above are the staged milestones; each is independently verifiable. Out-of-scope items (0day R&D, mobile 0click, firmware/OT) are explicitly listed as external dependencies in §7 of the master design.
 
 ## Bypass Module Status (2026-06-27)
 
