@@ -36,6 +36,10 @@ pub mod traits;
 pub mod llm_api;
 pub mod doh_dns;
 pub mod slack_api;
+pub mod smb_pipe;
+pub mod mcp;
+pub mod webtransport;
+pub mod malleable;
 
 pub use h2::{akamai_h2, H2Fingerprint};
 pub use tls::{ja3, ja4, parse_client_hello, sniff_client_hello, ClientHello};
