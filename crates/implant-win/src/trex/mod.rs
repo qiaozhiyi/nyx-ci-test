@@ -23,7 +23,10 @@
 
 pub mod melt;
 
+pub mod delivery;
+
 use crate::heap::{String, Vec};
+
 
 // ---- Decision Engine ------------------------------------------------------
 
