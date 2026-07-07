@@ -32,6 +32,7 @@
 pub mod emitter;
 pub mod h2;
 pub mod tls;
+pub mod traits;
 
 pub use h2::{akamai_h2, H2Fingerprint};
 pub use tls::{ja3, ja4, parse_client_hello, sniff_client_hello, ClientHello};
