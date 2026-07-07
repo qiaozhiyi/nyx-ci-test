@@ -2,7 +2,7 @@
 
 > **授权红队 / 渗透测试专用。禁止在未获授权的系统上部署。**
 
-Nyx 是一个纯 Rust 全栈 C2 框架，融合了 Cobalt Strike 的可扩展性与 Brute Ratel C4 的默认隐蔽性，并经过完整的代码安全审计（2026-07-05）。
+Nyx 是一个纯 Rust 全栈 C2 框架（**69,509 行 Rust**），融合了 Cobalt Strike 的可扩展性与 Brute Ratel C4 的默认隐蔽性，经过完整的代码安全审计（2026-07-07）。
 
 ---
 
@@ -19,33 +19,68 @@ Nyx 是一个纯 Rust 全栈 C2 框架，融合了 Cobalt Strike 的可扩展性
 
 ---
 
-## 项目结构
+## 项目结构（69,509 行 Rust · 25 crates · 53 selftest · workspace 142 test）
 
 ```
 crates/
-├── protocol/          # 加密协议（no_std，X25519+HKDF+ChaCha20-Poly1305）
-├── server/            # 团队服务器（tokio/axum，鉴权，会话，审计）
-├── store/             # SQLite 凭据库（rusqlite/WAL）
-├── transport/         # TLS 握手嗅探（JA3/JA4）
-├── rest/              # REST API 客户端库
-├── parse/             # 协议解析工具
-├── profile/           # Malleable C2 profile 解析 + c2lint
-├── implant-win/       # Windows PIC 植入体（no_std/no_main，nightly，独立构建）
-├── implant-evasionsdk/# 植入体逃避 SDK（Foliage/HookChain/HWBP）
-├── operator-kernelsdk/# 内核级 EDR 绕过 SDK
-├── operator-kernel-cli/# 内核层操作化 CLI
-├── offset-resolver/   # EPROCESS 偏移自动解析（MS Symbol Server PDB 下载）
-├── agent-dev/         # 标准 std 植入体（macOS 开发验证用）
-├── client-cli/        # 操作员 TUI（ratatui）
-├── client-ui/         # 桌面 GUI（Makepad）
-├── bof-runner/        # BOF（CS ABI）加载器
-├── coff/              # COFF/PE 解析
-├── evasion/           # 间接 syscall stub 生成
-├── scripting/         # 脚本事件总线
-├── scripting-rhai/    # Rhai 脚本引擎绑定
-└── config/            # 编译期配置宏
+├── protocol/              # 加密协议（no_std, X25519+HKDF+ChaCha20-Poly1305）
+├── server/                # 团队服务器（tokio/axum, 鉴权, 会话, 审计, 内核桥）
+├── store/                 # SQLite 凭据库（WAL）
+├── transport/             # TLS JA3/JA4 指纹嗅探 + 发射器
+├── rest/                  # REST API 客户端类型库
+├── parse/                 # 协议解析工具
+├── profile/               # Malleable C2 profile 解析 + c2lint
+│
+├── implant-win/           # Windows PIC 植入体（no_std, 42 模块, ~25k LOC）
+│   ├── fluctuation.rs     #   军用级睡眠混淆（PAGE_NOACCESS 振荡, CFG/CET 免疫）
+│   ├── lacuna.rs          #   LACUNA .pdata 间隙扫描器（跨版本）
+│   ├── lacuna_stomp.rs    #   BYOUD-Gap 幽灵帧栈注入
+│   ├── blind_hwbp.rs      #   HWBP patchless 盲化（VEH 碰撞检测）
+│   ├── tp.rs              #   Pool Party section 注入
+│   ├── inject.rs          #   Module Stomping + ThreadlessInject
+│   └── selftests.rs       #   53 个 selftest 导出（位掩码退出码）
+│
+├── operator-kernelsdk/    # 内核级 EDR 绕过 SDK（24 模块）
+│   ├── byovd.rs           #   KernelRw trait + ByovdDriver
+│   ├── byovd_drivers/     #   可插拔驱动包（Shield/WDTKernel/RTCore64/IQVW64E）
+│   ├── cfg.rs             #   CFG bitmap 内核态写入
+│   └── win/               #   KslD + driver_load + kernel_base + va_rw
+│
+├── operator-kernel-cli/   # 内核层 CLI（bootstrap + 10 子命令 + daemon 模式）
+├── offset-resolver/       # EPROCESS 偏移解析（MS Symbol Server PDB 下载）
+├── minidump-assembler/    # LSASS 裸内存 → mimikatz .dmp
+│
+├── client-cli/            # 操作员 TUI（ratatui, 56 命令含 6 内核命令）
+├── client-ui/             # 桌面 GUI（Makepad, 7 widget）
+│
+├── agent-dev/             # macOS 标准植入体（开发验证用）
+├── bof-runner/            # BOF（CS ABI）加载器
+├── coff/                  # COFF/PE 解析
+├── evasion/               # 间接 syscall stub 生成（Hell/Halo/Tartarus）
+├── implant-evasionsdk/    # 植入体逃避 SDK trait 定义
+├── scripting/             # 脚本事件总线
+├── scripting-rhai/        # Rhai 脚本引擎绑定
+├── config/                # 编译期加密配置嵌入
+└── config-macros/         # 配置宏（embed!）
 ```
 
+
+## 工作量统计
+
+| 维度 | 数值 |
+|---|---|
+| **总 Rust 源码** | 69,509 行 |
+| **crate 数** | 25 |
+| **植入体模块** | 42 个（`implant-win/src/`） |
+| **内核 SDK 模块** | 24 个（`operator-kernelsdk/src/`） |
+| **selftest 导出** | 53 个 |
+| **workspace 测试** | 142 个（141 通过） |
+| **wire Command 变体** | 26 个 |
+| **服务端 API 端点** | 18 个（含 `/api/kernel/*`） |
+| **TUI 命令** | 56 个（含 6 个内核命令） |
+| **内核 kit trait** | 10 个 |
+| **BYOVD 驱动** | 4 个（Shield / WDTKernel / RTCore64 / IQVW64E） |
+| **Windows 版本覆盖** | 17763 · 19041 · 20348 · 22621 · 26100 |
 ---
 
 ## 环境要求
