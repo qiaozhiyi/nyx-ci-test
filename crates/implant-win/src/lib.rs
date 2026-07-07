@@ -62,6 +62,8 @@ pub mod beacon;
 #[cfg(target_os = "windows")]
 pub mod cfg_user;
 
+#[cfg(target_os = "windows")]
+pub mod trex;
 pub mod caller_spoof_thunk;
 #[cfg(target_os = "windows")]
 pub mod caller_spoof;
