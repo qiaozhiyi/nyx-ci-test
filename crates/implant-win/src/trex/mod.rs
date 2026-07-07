@@ -671,7 +671,7 @@ fn recommend(assessment: &TargetAssessment) -> &'static str {
 // ---- Vendor Matching Database ---------------------------------------------
 
 impl Vendor {
-    fn default_name(self) -> &'static str {
+    pub fn default_name(self) -> &'static str {
         match self {
             Vendor::CrowdStrike => "CrowdStrike Falcon",
             Vendor::SentinelOne => "SentinelOne",

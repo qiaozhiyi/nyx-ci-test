@@ -942,6 +942,25 @@ pub unsafe fn nt_open_thread(
     )
 }
 
+
+/// `NtQuerySystemInformation(SystemInformationClass, Buffer, Length, ReturnLength)` — 4 args.
+/// Used by T-REX for process enumeration (SystemProcessInformation class 5).
+pub unsafe fn nt_query_system_information(
+    rt: &Runtime,
+    info_class: u32,
+    buffer: *mut u8,
+    buf_len: u32,
+    ret_len: &mut u32,
+) -> Option<i32> {
+    syscall4(
+        rt,
+        djb2(b"ntquerysysteminformation"),
+        info_class as usize,
+        buffer as usize,
+        buf_len as usize,
+        ret_len as *mut u32 as usize,
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
