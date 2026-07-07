@@ -77,8 +77,11 @@ async fn main() -> anyhow::Result<()> {
     let creds_path = match std::env::var("NYX_CREDS") {
         Ok(p) => p,
         Err(_) => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            format!("{home}/.nyx/server-creds.db")
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| ".".to_string());
+            std::path::PathBuf::from(&home).join(".nyx").join("server-creds.db")
+                .to_string_lossy().to_string()
         }
     };
     let cred_store = nyx_store::CredStore::open(std::path::Path::new(&creds_path))
@@ -90,39 +93,25 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Phase 3: named-operator registry + action audit log.
+    let data_dir = || -> std::path::PathBuf {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(&home).join(".nyx")
+    };
     let operators_path = match std::env::var("NYX_OPERATORS_FILE") {
         Ok(p) => std::path::PathBuf::from(p),
-        Err(_) => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            std::path::PathBuf::from(format!("{home}/.nyx/operators.json"))
-        }
+        Err(_) => data_dir().join("operators.json"),
+    };
+    let audit_path = match std::env::var("NYX_AUDIT_LOG") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => data_dir().join("audit.jsonl"),
     };
     let operators = nyx_server::operators::OperatorRegistry::load_or_bootstrap(
         &operators_path,
         std::env::var("NYX_TOKEN").ok().as_deref(),
         std::env::var("NYX_BOOTSTRAP_OPERATOR").ok().as_deref(),
     )?;
-    let auth_mode = if !operators.is_open() {
-        "named-operators"
-    } else if std::env::var("NYX_TOKEN").is_ok() {
-        "legacy-token"
-    } else {
-        "open"
-    };
-    tracing::info!(
-        operators = %operators_path.display(),
-        count = operators.list()?.len(),
-        mode = auth_mode,
-        "operator registry loaded"
-    );
-
-    let audit_path = match std::env::var("NYX_AUDIT_LOG") {
-        Ok(p) => std::path::PathBuf::from(p),
-        Err(_) => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            std::path::PathBuf::from(format!("{home}/.nyx/audit.jsonl"))
-        }
-    };
     let audit_writer = nyx_server::audit::AuditWriter::open(&audit_path)?;
     tracing::info!(audit = %audit_path.display(), "action audit log opened");
 

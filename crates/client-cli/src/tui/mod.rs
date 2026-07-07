@@ -1694,6 +1694,21 @@ impl App {
                 };
                 self.send(Cmd::DriveInfo { session: s.id });
             }
+            "/trex" => {
+                let Some(s) = self.current_session().cloned() else {
+                    self.log("! select a beacon first", Level::Err);
+                    return;
+                };
+                self.send(Cmd::Trex { session: s.id });
+            }
+            "/channel" => {
+                let Some(s) = self.current_session().cloned() else {
+                    self.log("! select a beacon first", Level::Err);
+                    return;
+                };
+                let ch: u8 = args.trim().parse().unwrap_or(0);
+                self.send(Cmd::SetChannel { session: s.id, channel: ch });
+            }
             "/clipboard" => {
                 let Some(s) = self.current_session().cloned() else {
                     self.log("! select a beacon first", Level::Err);
