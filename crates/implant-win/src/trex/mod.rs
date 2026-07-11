@@ -157,6 +157,20 @@ pub struct KernelPosture {
 
 // ---- Public API -----------------------------------------------------------
 
+/// Whether the T-REX user-mode scanners are backed by real syscall resolvers.
+///
+/// Currently `false`: every `scan_*` helper in this module
+/// (`create_toolhelp_snapshot`, `open_registry_key`, `wmi_query_*`,
+/// `open_sc_manager`, ...) is a stub that returns null / is a no-op, so
+/// `assess_user_mode` cannot actually detect any product and would resolve
+/// to `ThreatTier::Clean` even on a fully fortified host.
+///
+/// Flip to `true` once the stubs are replaced with `crate::resolve`-backed
+/// implementations. Until then `assess_user_mode` returns `ThreatTier::Unknown`
+/// with an UNIMPLEMENTED banner so operators are not misled. See P0-6 in
+/// `docs/FIX_PLAN_2026-07-08.md`.
+const TREX_SCANNERS_IMPLEMENTED: bool = false;
+
 /// Run a full T0-T3 assessment (no kernel driver needed).
 /// Returns the highest noise tier that succeeded.
 pub unsafe fn assess_user_mode() -> TargetAssessment {
@@ -167,6 +181,17 @@ pub unsafe fn assess_user_mode() -> TargetAssessment {
         kernel_posture: KernelPosture::default(),
         recommendation: "Continue with user-mode evasion",
     };
+    // ⚠ T-REX RECON UNIMPLEMENTED (P0-6): every scan_* helper below is a stub
+    // (returns null / no-op), so no products are ever detected and the tier
+    // would resolve to Clean even on fortified hosts. Surface this honestly:
+    // force Unknown + an explicit banner until the real scanners land.
+    if !TREX_SCANNERS_IMPLEMENTED {
+        assessment.tier = ThreatTier::Unknown;
+        assessment.recommendation = "⚠ T-REX RECON UNIMPLEMENTED: output is NOT \
+            trustworthy. Assessment may show Clean even on fortified hosts. \
+            Do not base evasion decisions on this.";
+        return assessment;
+    }
 
     // === T0: Process name scanning (silent) ===
     scan_processes(&mut assessment);
@@ -872,6 +897,7 @@ impl Max for ThreatTier {
 /// Exit codes:
 ///   0xE0 + tier (0..4) = Clean/ConsumerAV/EnterpriseEDR/KernelArmed/Fortress
 ///   0xFF = assessment failed (Unknown)
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_trex() -> ! {
     let assessment = assess_user_mode();

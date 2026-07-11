@@ -54,11 +54,40 @@ pub const EVENT_ID_PROCESS_STOP: u16 = 2;
 /// Event ID: Process Retarget (43) — newer builds.
 pub const EVENT_ID_PROCESS_RETARGET: u16 = 43;
 
-// ---- Windows EVENT_DESCRIPTOR layout (16 bytes) ----
+// ---- Windows EVENT_HEADER layout (evntcons.h, 0x50 = 80 bytes) ----
+//
+// Authoritative layout (mingw-w64 evntcons.h + `windows-rs` EVENT_HEADER agree
+// exactly). Note EVENT_DESCRIPTOR is *embedded* at 0x28, not appended after the
+// header, and the struct terminates with a 16-byte ActivityId GUID — so the
+// total is 0x50, not 0x40.
+//
+//   offset  size  field
+//   0x00    u16   Size            (total event record size in bytes)
+//   0x02    u16   HeaderType      (reserved; ETW_HEADER_TYPE_ETW_EVENT = 1)
+//   0x04    u16   Flags           (EVENT_HEADER_FLAG_* bitmask)
+//   0x06    u16   EventProperty   (EVENT_HEADER_PROPERTY_* bitmask)
+//   0x08    u32   ThreadId
+//   0x0C    u32   ProcessId
+//   0x10    u64   TimeStamp       (LARGE_INTEGER FILETIME, 100ns since 1601)
+//   0x18    16    ProviderId      (GUID)
+//   0x28    16    EventDescriptor (Id+Version+Channel+Level+Opcode+Task+Keyword)
+//   0x38    u64   KernelTime/UserTime union (u32/u32 packed)
+//   0x40    16    ActivityId      (GUID)
+//   0x50          -- end of EVENT_HEADER (80 bytes) -- UserData follows
 
-/// Size of the EVENT_TRACE_HEADER structure (packed, LE). Includes the
-/// full header through KernelTime/UserTime (offset 0..64).
-pub const EVENT_HEADER_SIZE: usize = 64;
+/// Size of the EVENT_HEADER structure (evntcons.h): 0x50 = 80 bytes on both
+/// x86 and x64. EVENT_DESCRIPTOR is embedded at 0x28 and the struct ends with
+/// the 16-byte ActivityId GUID.
+pub const EVENT_HEADER_SIZE: usize = 80;
+
+/// `ETW_HEADER_TYPE_ETW_EVENT` (1) — the HeaderType value for events written
+/// through the modern ETW provider path (`EtwWrite` / `EventWrite`).
+pub const ETW_HEADER_TYPE_ETW_EVENT: u16 = 1;
+
+/// `EVENT_HEADER_FLAG_64_BIT_HEADER` (0x0040) — provider was running on a
+/// 64-bit host. (There is no PROCESS_ID flag; 0x0002 is PRIVATE_SESSION, which
+/// we do not want on forged kernel-provider events.)
+pub const EVENT_HEADER_FLAG_64_BIT_HEADER: u16 = 0x0040;
 
 // ---- §4.1 Event Forgery ---------------------------------------------------
 
@@ -127,20 +156,20 @@ impl EtwDeceiver {
     ///
     /// # Event layout (x64, Windows 10+)
     /// ```text
+    /// -- EVENT_HEADER (80 bytes, evntcons.h) --
     /// offset  size  field
-    /// 0x00     4     Size (total buffer size)
-    /// 0x04     2     HeaderSize
-    /// 0x06     2     Flags
-    /// 0x08     4     ProcessId
-    /// 0x0C     4     ThreadId
-    /// 0x10     4     TimeStamp (low 32)
-    /// 0x14     4     TimeStamp (high 32)
-    /// 0x18     16    ProviderGuid
-    /// 0x28     2     EventDescriptor (Id + Version + Channel + Level + Opcode + Task + Keyword)
-    /// 0x2A     2     (alignment)
-    /// 0x2C     4     KernelTime
-    /// 0x30     4     UserTime
-    /// 0x34     8     UserData...
+    /// 0x00     2     Size (USHORT, total event record size in bytes)
+    /// 0x02     2     HeaderType (reserved; = ETW_HEADER_TYPE_ETW_EVENT = 1)
+    /// 0x04     2     Flags (EVENT_HEADER_FLAG_*; 64_BIT_HEADER here)
+    /// 0x06     2     EventProperty
+    /// 0x08     4     ThreadId
+    /// 0x0C     4     ProcessId
+    /// 0x10     8     TimeStamp (LARGE_INTEGER FILETIME)
+    /// 0x18     16    ProviderId (GUID)
+    /// 0x28     16    EventDescriptor (embedded; Id+Version+Channel+Level+Opcode+Task+Keyword)
+    /// 0x38     8     KernelTime/UserTime (u32/u32 union; zeroed for forged events)
+    /// 0x40     16    ActivityId (GUID; zeroed = empty correlation)
+    /// 0x50           -- end of EVENT_HEADER -- UserData follows
     /// ```
     ///
     /// UserData for Process Start:
@@ -181,23 +210,25 @@ impl EtwDeceiver {
         let total_size = EVENT_HEADER_SIZE + user_data_size_aligned;
         let mut buf = alloc::vec![0u8; total_size];
 
-        // -- EVENT_HEADER fields (offset 0x00..0x34) --
-        // Size (u32 LE)
-        buf[0..4].copy_from_slice(&(total_size as u32).to_le_bytes());
-        // HeaderSize (u16 LE)
-        buf[4..6].copy_from_slice(&(EVENT_HEADER_SIZE as u16).to_le_bytes());
-        // Flags (u16 LE) — 0x0002 = EVENT_HEADER_FLAG_PROCESS_ID
-        buf[6..8].copy_from_slice(&0x0002u16.to_le_bytes());
-        // ProcessId (u32 LE)
-        buf[8..12].copy_from_slice(&parent_pid.to_le_bytes());
-        // ThreadId (u32 LE) — 0 (kernel event, thread not meaningful)
-        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
-        // TimeStamp (u64 LE)
+        // -- EVENT_HEADER fields (offset 0x00..0x50, evntcons.h) --
+        // Size (USHORT, offset 0x00) — total event record size in bytes.
+        buf[0..2].copy_from_slice(&(total_size as u16).to_le_bytes());
+        // HeaderType (USHORT, offset 0x02) — reserved; 1 = ETW_HEADER_TYPE_ETW_EVENT.
+        buf[2..4].copy_from_slice(&ETW_HEADER_TYPE_ETW_EVENT.to_le_bytes());
+        // Flags (USHORT, offset 0x04) — 0x0040 = EVENT_HEADER_FLAG_64_BIT_HEADER.
+        buf[4..6].copy_from_slice(&EVENT_HEADER_FLAG_64_BIT_HEADER.to_le_bytes());
+        // EventProperty (USHORT, offset 0x06) — 0 (no XML/legacy props).
+        buf[6..8].copy_from_slice(&0u16.to_le_bytes());
+        // ThreadId (ULONG, offset 0x08) — 0 (forged kernel event: no caller TID).
+        buf[8..12].copy_from_slice(&0u32.to_le_bytes());
+        // ProcessId (ULONG, offset 0x0C) — the forged "parent" PID.
+        buf[12..16].copy_from_slice(&parent_pid.to_le_bytes());
+        // TimeStamp (LARGE_INTEGER, offset 0x10)
         buf[16..24].copy_from_slice(&timestamp.to_le_bytes());
-        // ProviderGuid (16 bytes)
+        // ProviderId (GUID, offset 0x18)
         buf[24..40].copy_from_slice(&KERNEL_PROCESS_PROVIDER_GUID);
 
-        // -- EVENT_DESCRIPTOR (at offset 0x28, 16 bytes) --
+        // -- EVENT_DESCRIPTOR (embedded at offset 0x28, 16 bytes) --
         // Id (u16) = EVENT_ID_PROCESS_START
         buf[40..42].copy_from_slice(&EVENT_ID_PROCESS_START.to_le_bytes());
         // Version (u8) = 0
@@ -211,11 +242,14 @@ impl EtwDeceiver {
         // Task (u16) = 0
         buf[46..48].copy_from_slice(&0u16.to_le_bytes());
         // Keyword (u64) = 0x0020000000000000 (EVENT_KEYWORD_PROCESS)
-        // Stored at offset 0x30...0x38 (but EVENT_DESCRIPTOR is 16 bytes total,
-        // so keyword occupies bytes 48..56)
         buf[48..56].copy_from_slice(&0x0020_0000_0000_0000u64.to_le_bytes());
-        // KernelTime + UserTime (at 0x2C..0x34) — 0
+
+        // -- KernelTime/UserTime union (offset 0x38, 8 bytes) — 0 for forged events.
         buf[56..64].copy_from_slice(&0u64.to_le_bytes());
+
+        // -- ActivityId (GUID, offset 0x40, 16 bytes) — zeroed = no correlation.
+        // (Explicitly zeroed; buffer is already zero-initialized.)
+        // buf[64..80] stays 0.
 
         // -- UserData: UNICODE_STRING for ImageName --
         let user_data_offset = EVENT_HEADER_SIZE;
@@ -260,24 +294,35 @@ impl EtwDeceiver {
         let total_size = EVENT_HEADER_SIZE + user_data_size;
         let mut buf = alloc::vec![0u8; total_size];
 
-        // EVENT_HEADER
-        buf[0..4].copy_from_slice(&(total_size as u32).to_le_bytes());
-        buf[4..6].copy_from_slice(&(EVENT_HEADER_SIZE as u16).to_le_bytes());
-        buf[6..8].copy_from_slice(&0x0002u16.to_le_bytes()); // PID flag
-        buf[8..12].copy_from_slice(&pid.to_le_bytes());
-        buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // ThreadId = 0
+        // EVENT_HEADER (evntcons.h; see forge_process_create for field docs)
+        // Size (USHORT, offset 0x00)
+        buf[0..2].copy_from_slice(&(total_size as u16).to_le_bytes());
+        // HeaderType (USHORT, offset 0x02) = ETW_HEADER_TYPE_ETW_EVENT
+        buf[2..4].copy_from_slice(&ETW_HEADER_TYPE_ETW_EVENT.to_le_bytes());
+        // Flags (USHORT, offset 0x04) = 64_BIT_HEADER
+        buf[4..6].copy_from_slice(&EVENT_HEADER_FLAG_64_BIT_HEADER.to_le_bytes());
+        // EventProperty (USHORT, offset 0x06) = 0
+        buf[6..8].copy_from_slice(&0u16.to_le_bytes());
+        // ThreadId (ULONG, offset 0x08) = 0
+        buf[8..12].copy_from_slice(&0u32.to_le_bytes());
+        // ProcessId (ULONG, offset 0x0C)
+        buf[12..16].copy_from_slice(&pid.to_le_bytes());
+        // TimeStamp (LARGE_INTEGER, offset 0x10)
         buf[16..24].copy_from_slice(&timestamp.to_le_bytes());
+        // ProviderId (GUID, offset 0x18)
         buf[24..40].copy_from_slice(&KERNEL_PROCESS_PROVIDER_GUID);
 
-        // EVENT_DESCRIPTOR
-        buf[40..42].copy_from_slice(&EVENT_ID_PROCESS_STOP.to_le_bytes());
+        // EVENT_DESCRIPTOR (embedded at offset 0x28)
+        buf[40..42].copy_from_slice(&EVENT_ID_PROCESS_STOP.to_le_bytes()); // Id
         buf[42] = 0; // Version
         buf[43] = 11; // Channel
         buf[44] = 4; // Level
         buf[45] = 2; // Opcode = Stop
         buf[46..48].copy_from_slice(&0u16.to_le_bytes()); // Task
         buf[48..56].copy_from_slice(&0x0020_0000_0000_0000u64.to_le_bytes()); // Keyword
-        buf[56..64].copy_from_slice(&0u64.to_le_bytes()); // KernelTime/UserTime
+        // KernelTime/UserTime union (offset 0x38) — 0
+        buf[56..64].copy_from_slice(&0u64.to_le_bytes());
+        // ActivityId (GUID, offset 0x40, 16 bytes) — zeroed (already 0).
 
         // UserData: ExitStatus
         let ud = EVENT_HEADER_SIZE;
@@ -468,31 +513,53 @@ mod tests {
             }
             buf
         };
-        let buf = d
-            .forge_process_create(100, 200, &image_name_utf16, 0x01D8_A000_0000_0000)
-            .unwrap();
+        let ts = 0x01D8_A000_0000_0000u64;
+        let buf = d.forge_process_create(100, 200, &image_name_utf16, ts).unwrap();
 
         // Buffer must be at least EVENT_HEADER_SIZE + 16 (UNICODE_STRING header) + image data.
         assert!(buf.len() >= EVENT_HEADER_SIZE + 16 + image_name_utf16.len());
 
-        // Size field matches buffer length.
-        let size = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        // Size (USHORT, offset 0x00) matches the total buffer length.
+        let size = u16::from_le_bytes([buf[0], buf[1]]);
         assert_eq!(size as usize, buf.len());
 
-        // HeaderSize = 48.
-        let header_size = u16::from_le_bytes([buf[4], buf[5]]);
-        assert_eq!(header_size as usize, EVENT_HEADER_SIZE);
+        // HeaderType (USHORT, offset 0x02) = ETW_HEADER_TYPE_ETW_EVENT (1).
+        let header_type = u16::from_le_bytes([buf[2], buf[3]]);
+        assert_eq!(header_type, ETW_HEADER_TYPE_ETW_EVENT);
 
-        // ProcessId = 100 (the parent).
-        let pid = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        // Flags (USHORT, offset 0x04) = EVENT_HEADER_FLAG_64_BIT_HEADER.
+        let flags = u16::from_le_bytes([buf[4], buf[5]]);
+        assert_eq!(flags, EVENT_HEADER_FLAG_64_BIT_HEADER);
+
+        // EventProperty (USHORT, offset 0x06) = 0.
+        assert_eq!(&buf[6..8], &[0, 0]);
+
+        // ThreadId (ULONG, offset 0x08) = 0 (forged kernel event, no caller TID).
+        let tid = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        assert_eq!(tid, 0);
+
+        // ProcessId (ULONG, offset 0x0C) = 100 (the parent).
+        let pid = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
         assert_eq!(pid, 100);
 
-        // ProviderGuid matches.
+        // TimeStamp (LARGE_INTEGER, offset 0x10).
+        assert_eq!(u64::from_le_bytes(buf[16..24].try_into().unwrap()), ts);
+
+        // ProviderId (GUID, offset 0x18).
         assert_eq!(&buf[24..40], &KERNEL_PROCESS_PROVIDER_GUID);
 
-        // EventDescriptor.Id = EVENT_ID_PROCESS_START.
+        // EventDescriptor.Id (offset 0x28) = EVENT_ID_PROCESS_START.
         let event_id = u16::from_le_bytes([buf[40], buf[41]]);
         assert_eq!(event_id, EVENT_ID_PROCESS_START);
+
+        // KernelTime/UserTime union (offset 0x38) = 0.
+        assert_eq!(&buf[56..64], &[0u8; 8]);
+
+        // ActivityId (GUID, offset 0x40) = all-zero (no correlation).
+        assert_eq!(&buf[64..80], &[0u8; 16]);
+
+        // UserData begins exactly at EVENT_HEADER_SIZE (0x50 = 80).
+        assert_eq!(&buf[80..82], &(image_name_utf16.len() as u16).to_le_bytes());
     }
 
     #[test]

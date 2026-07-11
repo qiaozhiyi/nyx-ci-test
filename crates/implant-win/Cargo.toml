@@ -8,6 +8,13 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 description = "Nyx Windows PIC implant (BRC4-grade stealth). Requires nightly + Windows toolchain to build."
+[features]
+default = []
+# Gate the ~50 #[no_mangle] nyx_selftest_* / nyx_linger* rundll32 exports
+# behind this feature (P1-11b). Production builds (default features) exclude
+# all selftest exports - the largest avoidable detection surface. Test/debug
+# builds use --features selftest to include them.
+selftest = []
 
 # Standalone (NOT in the root workspace) so the dev-host stable workspace stays
 # green. Declares its own (empty) workspace to decouple from the root members.

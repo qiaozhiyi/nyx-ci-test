@@ -181,12 +181,41 @@ fn allowed(path: &str) -> bool {
     // `.\config\SAM` and `\\.\config\SAM` resolve to `\config\sam` — otherwise
     // the leading `.\` defeats the substring check below. We split on `\`,
     // drop every empty-or-`.` segment, and rejoin.
-    let mut clean = crate::heap::String::with_capacity(normalized.len());
-    let mut first = true;
+    //
+    // CRITICAL: we also collapse `..` (parent-directory) segments here. Without
+    // this, a path like `C:\config\dummy\..\sam` normalizes to
+    // `\config\dummy\..\sam`, which does NOT contain `\config\sam` → the hive
+    // guard returns true → all 5 blocked hives (SAM/SYSTEM/SECURITY/SOFTWARE/
+    // DEFAULT) become reachable via path traversal, and downloading the live
+    // SAM bricks the beacon on oplock. Collapsing `..` resolves the traversal
+    // so `\config\dummy\..\sam` → `\config\sam` is correctly blocked.
+    //
+    // We track segments in a small stack-like Vec: a non-traversal segment is
+    // pushed; a `..` pops the previous segment (the parent). A leading `..` with
+    // no preceding segment is kept verbatim — on a Windows absolute path it
+    // will fail naturally at NtCreateFile, and leaving it lets the substring
+    // check apply to the literal form too.
+    let mut segs: crate::heap::Vec<&str> = crate::heap::Vec::new();
     for seg in normalized.split('\\') {
         if seg.is_empty() || seg == "." {
             continue;
         }
+        if seg == ".." {
+            if segs.last().is_some() {
+                // Pop the preceding segment to collapse the traversal.
+                segs.pop();
+                continue;
+            }
+            // `..` at the start (no preceding segment) — keep it; an absolute
+            // Windows path can't ascend past the root anyway, so NtCreateFile
+            // will reject it. Keeping the literal also subjects it to the
+            // substring check below.
+        }
+        segs.push(seg);
+    }
+    let mut clean = crate::heap::String::with_capacity(normalized.len());
+    let mut first = true;
+    for seg in &segs {
         if first {
             first = false;
         } else {

