@@ -1108,8 +1108,11 @@ fn parse_session_hex(s: &str) -> Option<SessionId> {
     if s.len() != 64 {
         return None;
     }
-    let v = hex::decode(s).ok()?;
-    <[u8; 32]>::try_from(v.as_slice()).ok()
+    // Decode directly into a stack array — avoids the transient Vec<u8> heap
+    // allocation that hex::decode would create for a known 32-byte output.
+    let mut buf = [0u8; 32];
+    hex::decode_to_slice(s, &mut buf).ok()?;
+    Some(buf)
 }
 
 async fn post_task(

