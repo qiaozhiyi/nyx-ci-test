@@ -12,6 +12,15 @@ name: CI
 # The standalone crates ARE tested in the `standalone` job via their own
 # `cargo test --lib` so their 87+53 unit tests are gated too.
 #
+# Runner: self-hosted Windows Server 2019 (build 17763). GitHub-hosted
+# ubuntu/macos runners were retired after a billing block stopped all
+# hosted jobs. macOS coverage is dropped (no Mac self-hosted runner); the
+# Linux-equivalent assertions are covered on Windows since the workspace is
+# pure Rust with no platform-specific gates in these jobs.
+#
+# All cargo commands use `shell: cmd` to avoid PowerShell 5.1 treating
+# cargo's stderr progress ("Compiling...") as a NativeCommandError.
+#
 # Authorized red-team security research project.
 
 on:
@@ -32,55 +41,59 @@ jobs:
   # ---- Gate 1: fmt (fastest, fail early) ----
   fmt:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, win-17763]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - name: cargo fmt --check
+        shell: cmd
         run: cargo fmt --all -- --check
 
   # ---- Gate 2: clippy on core crates (exclude client-ui Makepad GUI) ----
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, win-17763]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - name: cargo clippy (workspace, excl. client-ui)
+        shell: cmd
         run: cargo clippy --workspace --exclude nyx-client-ui --all-targets -- -D warnings
 
-  # ---- Gate 3: tests on matrix (Ubuntu + macOS) ----
+  # ---- Gate 3: workspace tests ----
   test:
-    name: Test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: Test
+    runs-on: [self-hosted, win-17763]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo test --workspace (excl. client-ui)
+        shell: cmd
         run: cargo test --workspace --exclude nyx-client-ui --all-targets
 
   # ---- Gate 4: standalone crates (each has its own [workspace]) ----
   standalone:
     name: Standalone crate tests
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, win-17763]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: operator-kernelsdk lib tests
+        shell: cmd
         run: cargo test --manifest-path crates/operator-kernelsdk/Cargo.toml --lib
       - name: implant-evasionsdk tests
+        shell: cmd
         run: cargo test --manifest-path crates/implant-evasionsdk/Cargo.toml
       - name: minidump-assembler tests (P3.a)
+        shell: cmd
         run: cargo test --manifest-path crates/minidump-assembler/Cargo.toml
       - name: offset-resolver build check (P0.b --fltmgr)
+        shell: cmd
         run: cargo check --manifest-path crates/offset-resolver/Cargo.toml
       - name: operator-kernel-cli build check (P0.a/3.b)
+        shell: cmd
         run: cargo check --manifest-path crates/operator-kernel-cli/Cargo.toml

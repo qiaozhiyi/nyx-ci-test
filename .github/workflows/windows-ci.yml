@@ -1,19 +1,20 @@
 name: Windows CI
 
-# The main Windows gate. Runs entirely on GitHub-hosted Windows runners —
-# no external machine dependency. Covers:
+# The main Windows gate. Runs on the self-hosted physical Windows Server 2019
+# (build 17763.1339, HVCI off, Defender active). Covers:
 #   1. Build (nightly MSVC implant DLL + operator CLI + offset-resolver)
-#   2. User-mode selftests (evasion stack) on the runner's own kernel
-#   3. Live PDB offset resolution — extracts the GUID from the runner's own
+#   2. User-mode selftests (evasion stack) on the host's own kernel (17763)
+#   3. Live PDB offset resolution — extracts the GUID from the host's own
 #      ntoskrnl.exe, downloads the matching PDB from the MS symbol server,
 #      and verifies the offset-resolver extracts correct EPROCESS + ETW-TI
 #      offsets. This proves the PDB walker works end-to-end on a real kernel
-#      (build 26100 / Win11 24H2 / Server 2025) without needing a driver.
+#      (build 17763) without needing a driver.
 #
 # The BYOVD kernel-tier chain (driver load → ETW-TI blind → process hide)
-# CANNOT run here (GitHub runners forbid driver loading) — that's in
-# windows-byovd.yml, which SSH-tunnels to the authorized physical host
-# (build 17763, HVCI off).
+# runs in windows-byovd-hosted.yml or windows-kself-hosted.yml.
+#
+# Runner: self-hosted label `win-17763`. GitHub-hosted windows-2022/2025
+# runners were retired after a billing block stopped all hosted jobs.
 #
 # Authorized red-team security research.
 
@@ -29,17 +30,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ---- Multi-version implant build + selftest ----
-  implant-matrix:
-    name: "Implant (${{ matrix.os }})"
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-2022, windows-2025]
-    runs-on: ${{ matrix.os }}
+  # ---- Implant build + selftest (build 17763) ----
+  implant:
+    name: "Implant (win-17763)"
+    runs-on: [self-hosted, win-17763]
     timeout-minutes: 25
     steps:
-      - name: "OS: ${{ matrix.os }}"
+      - name: "OS check"
         shell: pwsh
         run: |
           $os = Get-CimInstance Win32_OperatingSystem
@@ -69,17 +66,15 @@ jobs:
           cargo build --manifest-path crates/offset-resolver/Cargo.toml 2>&1
           Write-Host "CLI + resolver built"
 
-      # ---- 2. User-mode selftests on this kernel (build 26100) ----
+      # ---- 2. User-mode selftests on this kernel (build 17763) ----
       - name: Selftest regression (evasion stack)
         shell: pwsh
         continue-on-error: true
         run: |
-          # Build 26100 (Win11 24H2 / Server 2025). The implant's anti-sandbox
-          # suite (envprobe + antidebug) correctly flags the GitHub runner as a
-          # VM/sandbox, so we set NYX_SKIP_SANDBOX=1 to bypass that gate and let
-          # the selftests actually execute. Without it the DLL aborts → TIMEOUT.
-          # Even so, the limited (non-admin) token means some privileged APIs
-          # will refuse; the BYOVD workflow covers the full-pass case.
+          # Build 17763 (Windows Server 2019). The implant's anti-sandbox
+          # suite (envprobe + antidebug) may flag the host as a VM, so we set
+          # NYX_SKIP_SANDBOX=1 to bypass that gate and let the selftests
+          # actually execute. The admin token means privileged APIs work.
           $env:NYX_SKIP_SANDBOX = "1"
           $dll = "crates/implant-win/target/x86_64-pc-windows-msvc/release/nyx_implant_win.dll"
           $dllDir = Split-Path $dll
@@ -103,14 +98,14 @@ jobs:
           }
 
       # ---- 3. Live PDB offset resolution (ground-truth verification) ----
-      - name: "Live PDB offset resolution (runner's own kernel)"
+      - name: "Live PDB offset resolution (host's own kernel, build 17763)"
         shell: pwsh
         run: |
-          # Extract the PDB GUID from the runner's live ntoskrnl.exe, download
+          # Extract the PDB GUID from the host's live ntoskrnl.exe, download
           # the matching PDB from MS symbol server, parse it with our resolver.
           # This verifies _EPROCESS + ETW-TI 4-hop chain extraction on a REAL
           # kernel (no mocked fixtures), proving the PDB walker works for
-          # build 26100. The byovd workflow repeats this for build 17763.
+          # build 17763.
           $resolver = "crates/offset-resolver/target/debug/nyx-offset-resolver.exe"
           if (-not (Test-Path $resolver)) { Write-Host "::error::resolver missing"; exit 1 }
 
@@ -168,7 +163,7 @@ jobs:
 
           & $resolver --guid $guid --age $age --out offsets_live.toml 2>&1
           if (Test-Path offsets_live.toml) {
-            Write-Host "=== Resolved offsets (live build 26100) ==="
+            Write-Host "=== Resolved offsets (live build 17763) ==="
             Get-Content offsets_live.toml
             $content = Get-Content offsets_live.toml -Raw
             if ($content -notmatch "etw_ti\.provider_block_to_enable_info") {
