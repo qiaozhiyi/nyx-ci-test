@@ -43,11 +43,9 @@ jobs:
           Write-Host "Build: $($os.BuildNumber) | $($os.Caption)"
       - uses: actions/checkout@v4
 
-      - name: Install Rust nightly + MSVC + rust-src
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: x86_64-pc-windows-msvc
-          components: rust-src, rustfmt
+      - name: Ensure nightly toolchain + rust-src
+        shell: cmd
+        run: rustup toolchain install nightly --component rust-src --no-self-update & rustup target add x86_64-pc-windows-msvc --toolchain nightly
 
       # ---- 1. Build the three binaries ----
       - name: Build implant DLL (nightly)
