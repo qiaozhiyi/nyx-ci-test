@@ -583,10 +583,13 @@ mod tests {
         assert!(defender.kwrite(0, &[0u8; 8]).is_err());
     }
 
-    /// KslD device path is a valid NUL-terminated wide string.
+    /// KslD device path is NOT nul-terminated in the const (callers add the
+    /// null before CreateFileW — see open() at line 315). This test verifies
+    /// the const ends with the 'D' character, not a null, so the null-add
+    /// logic in open() is actually exercised.
     #[test]
-    fn default_device_path_is_nul_terminated() {
-        assert_eq!(*KSLD_DEFAULT_DEVICE.last().unwrap(), 0);
+    fn default_device_path_not_nul_terminated() {
+        assert_eq!(*KSLD_DEFAULT_DEVICE.last().unwrap(), 'D' as u16);
     }
 
     /// Default device path matches "\\.\KslD" (newer Defender engines name

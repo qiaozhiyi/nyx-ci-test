@@ -1151,6 +1151,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))] // verifies non-Windows gate; on Windows it executes
     fn edr_neutralize_trait_freeze_returns_windows_only() {
         let krw = MockKrw::new();
         let offsets = test_offsets();
@@ -1166,6 +1167,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn edr_neutralize_trait_choke_returns_windows_only() {
         let krw = MockKrw::new();
         let offsets = test_offsets();
@@ -1180,6 +1182,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn freeze_edr_coma_is_windows_only() {
         // freeze_edr_coma is a free function; on non-Windows it returns
         // UnsupportedPosture. This test verifies the platform gate.
@@ -1188,6 +1191,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn choke_edr_qos_is_windows_only() {
         // choke_edr_qos is a free function; on non-Windows it returns
         // UnsupportedPosture. This test verifies the platform gate.

@@ -40,10 +40,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  # MSVC LNK1318 PDB LIMIT on Windows when 4 parallel jobs each write ~4GB
-  # PDBs to the same target dir. split-debuginfo=off avoids full PDBs.
-  CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
-  CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+  # MSVC LNK1140/LNK1318 PDB size limit on Windows debug builds. The full
+  # debug info for nyx-server (with axum/tokio/rustls/aws-lc-rs) exceeds the
+  # 4GB PDB limit. Setting debug=0 skips PDB generation entirely for CI.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   # ---- Gate 1: fmt (fastest, fail early) ----
