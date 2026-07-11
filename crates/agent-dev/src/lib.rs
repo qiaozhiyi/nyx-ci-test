@@ -308,7 +308,7 @@ fn do_screenshot(monitor: u8) -> Vec<Response> {
     #[cfg(not(unix))]
     {
         let _ = monitor;
-        return vec![Response::Err("screenshot: not supported on this OS".into())];
+        vec![Response::Err("screenshot: not supported on this OS".into())]
     }
     #[cfg(unix)]
     {

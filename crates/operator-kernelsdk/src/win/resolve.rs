@@ -14,8 +14,11 @@
 use crate::KrwError;
 use core::ffi::c_void;
 
+#[allow(dead_code)] // type aliases retained for documentation; code uses extern fns directly
 type GetModuleHandleA = unsafe extern "system" fn(*const u8) -> *mut c_void;
+#[allow(dead_code)]
 type GetProcAddress = unsafe extern "system" fn(*mut c_void, *const u8) -> *mut c_void;
+#[allow(dead_code)]
 type LoadLibraryAFn = unsafe extern "system" fn(*const u8) -> *mut c_void;
 
 extern "system" {
