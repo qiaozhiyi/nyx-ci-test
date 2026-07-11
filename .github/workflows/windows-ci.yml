@@ -15,6 +15,8 @@ name: Windows CI
 #
 # Runner: self-hosted label `win-17763`. GitHub-hosted windows-2022/2025
 # runners were retired after a billing block stopped all hosted jobs.
+# Uses `shell: powershell` (PS 5.1, built into Server 2019) — the runner
+# does not have pwsh (PowerShell 7) installed.
 #
 # Authorized red-team security research.
 
@@ -37,7 +39,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: "OS check"
-        shell: pwsh
+        shell: powershell
         run: |
           $os = Get-CimInstance Win32_OperatingSystem
           Write-Host "Build: $($os.BuildNumber) | $($os.Caption)"
@@ -49,7 +51,7 @@ jobs:
 
       # ---- 1. Build the three binaries ----
       - name: Build implant DLL (nightly)
-        shell: pwsh
+        shell: powershell
         run: |
           # Full output — never pipe to Select-Object, so compile errors show.
           cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1
@@ -58,7 +60,7 @@ jobs:
           Write-Host "DLL OK: $((Get-Item $dll).Length) bytes"
 
       - name: Build operator CLI + offset-resolver (stable)
-        shell: pwsh
+        shell: powershell
         run: |
           cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml 2>&1
           cargo build --manifest-path crates/offset-resolver/Cargo.toml 2>&1
@@ -66,7 +68,7 @@ jobs:
 
       # ---- 2. User-mode selftests on this kernel (build 17763) ----
       - name: Selftest regression (evasion stack)
-        shell: pwsh
+        shell: powershell
         continue-on-error: true
         run: |
           # Build 17763 (Windows Server 2019). The implant's anti-sandbox
@@ -97,7 +99,7 @@ jobs:
 
       # ---- 3. Live PDB offset resolution (ground-truth verification) ----
       - name: "Live PDB offset resolution (host's own kernel, build 17763)"
-        shell: pwsh
+        shell: powershell
         run: |
           # Extract the PDB GUID from the host's live ntoskrnl.exe, download
           # the matching PDB from MS symbol server, parse it with our resolver.
