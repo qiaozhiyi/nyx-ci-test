@@ -46,6 +46,14 @@ enum CliCmd {
         /// Max concurrent relay channels (the implant caps at 16).
         #[arg(long, default_value_t = 14)]
         max_chan: usize,
+        /// SOCKS5 username (RFC 1929 method 0x02). REQUIRED for non-loopback
+        /// `--listen` binds (otherwise the listener is an open proxy).
+        /// Optional on loopback.
+        #[arg(long)]
+        socks_user: Option<String>,
+        /// SOCKS5 password (RFC 1929). Paired with --socks-user.
+        #[arg(long)]
+        socks_pass: Option<String>,
     },
 }
 
@@ -57,7 +65,22 @@ fn main() -> anyhow::Result<()> {
             listen,
             poll_ms,
             max_chan,
+            socks_user,
+            socks_pass,
         }) => {
+            // P0-10: socks auth must be both-or-neither. A lone user without a
+            // pass (or vice-versa) is a misconfiguration. run_socks separately
+            // refuses a non-loopback bind that has no auth configured.
+            let socks_auth = match (socks_user, socks_pass) {
+                (Some(u), Some(p)) => Some((u, p)),
+                (None, None) => None,
+                _ => {
+                    anyhow::bail!(
+                        "--socks-user and --socks-pass must be set together, or both omitted \
+                         for a loopback (NO-AUTH) listener"
+                    );
+                }
+            };
             // Headless: own a multi-thread runtime (the SOCKS relay needs
             // concurrent per-connection tasks + a TcpListener). This runtime is
             // distinct from the TUI worker's current-thread one.
@@ -65,7 +88,7 @@ fn main() -> anyhow::Result<()> {
                 .enable_all()
                 .build()?;
             rt.block_on(socks::run_socks(
-                cli.server, cli.token, session, listen, poll_ms, max_chan,
+                cli.server, cli.token, session, listen, poll_ms, max_chan, socks_auth,
             ))
         }
         None => tui::run(&cli.server, cli.token.as_deref()),

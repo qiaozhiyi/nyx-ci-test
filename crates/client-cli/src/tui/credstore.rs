@@ -5,6 +5,16 @@
 //!
 //! 序列化用 serde_json（安全、转义正确），写盘用临时文件 + 原子 rename，
 //! 且设文件权限 0600（凭据库含明文 secret，不能 world-readable）。
+//!
+//! ## SECURITY (P1-8): plaintext secret storage
+//! `~/.nyx/creds.json` stores the `secret` field in PLAINTEXT. The 0600 file
+//! mode and 0700 directory mode are access controls, NOT confidentiality — any
+//! root/admin or a stolen disk image exposes every secret via a plain `cat`.
+//! Real protection needs the OS keychain (macOS Keychain / Windows DPAPI) or a
+//! key derived from an operator passphrase (argon2id); not implemented yet.
+//! As a stopgap, set `NYX_CREDS_ENCRYPT=1` to REFUSE local persistence
+//! entirely, forcing the operator to keep credentials server-side via the team
+//! server's `/creds` endpoint instead of on disk.
 
 #![allow(dead_code)]
 
@@ -19,6 +29,13 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// P1-8 stopgap gate logic (pure, testable): returns `true` when local
+/// plaintext credential persistence must be refused because the operator set
+/// `NYX_CREDS_ENCRYPT=1`. Any non-empty value other than `"0"` triggers it.
+fn refuse_plaintext(env_val: Option<&str>) -> bool {
+    matches!(env_val, Some(v) if !v.is_empty() && v != "0")
 }
 
 /// 存储的凭据条目。
@@ -75,6 +92,18 @@ impl CredStore {
     /// 写入指定路径。临时文件 + 原子 rename，避免写一半崩溃损坏凭据库；
     /// Unix 下文件 0600、目录 0700（凭据库含明文 secret，不能 world-readable）。
     pub fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        // P1-8: ~/.nyx/creds.json stores `secret` in PLAINTEXT (0600 is an
+        // access control, not encryption). When NYX_CREDS_ENCRYPT=1 is set,
+        // refuse to persist so the operator is forced to use server-side
+        // credentials instead of leaking secrets to a cat-able disk file.
+        let env_val = std::env::var("NYX_CREDS_ENCRYPT").ok();
+        if refuse_plaintext(env_val.as_deref()) {
+            return Err(std::io::Error::other(
+                "NYX_CREDS_ENCRYPT=1 is set: refusing to write plaintext credentials to disk \
+                 (~/.nyx/creds.json stores secrets in PLAINTEXT). Use server-side credentials \
+                 (/creds on the team server) until local OS-keychain/argon2 encryption lands.",
+            ));
+        }
         use std::io::Write;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -457,5 +486,16 @@ mod tests {
         let tmp = path.with_extension("json.tmp");
         assert!(!tmp.exists(), "no leftover .tmp file after atomic rename");
         let _ = fs::remove_file(&path);
+    }
+    #[test]
+    fn refuse_plaintext_gate_logic() {
+        // P1-8: NYX_CREDS_ENCRYPT gate must refuse on any truthy value and
+        // allow when unset/empty/"0". Pure logic — no env mutation (avoids
+        // cross-test parallel flakiness from a process-global env var).
+        assert!(!refuse_plaintext(None));
+        assert!(!refuse_plaintext(Some("")));
+        assert!(!refuse_plaintext(Some("0")));
+        assert!(refuse_plaintext(Some("1")));
+        assert!(refuse_plaintext(Some("yes")));
     }
 }

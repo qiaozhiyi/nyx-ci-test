@@ -1,4 +1,4 @@
-//! 主题系统——支持 Catppuccin Mocha（默认）、高对比度、NO_COLOR 三种调色板。
+//! 主题系统——支持 Catppuccin Mocha/Frappé/Macchiato（默认 Mocha）、高对比度、NO_COLOR 五种调色板。
 //!
 //! 历史背景：最初硬编码 Mocha 配色，所有颜色是 `pub const`。现改成运行时可切换：
 //! `Palette` 结构体持有当前生效的全部颜色，`init(name)` 在 TUI 启动时根据
@@ -44,12 +44,13 @@ pub const SUCCESS: Color = rgb(0xa6e3a1); // Green
 pub const WARN: Color = rgb(0xf9e2af); // Yellow
 pub const DANGER: Color = rgb(0xf38ba8); // Red
 pub const MAUVE: Color = rgb(0xcba6f7); // Mauve
-#[allow(dead_code)]
 pub const TEAL: Color = rgb(0x94e2d5); // Teal
+pub const PEACH: Color = rgb(0xfab387); // Peach
+pub const SKY: Color = rgb(0x89dceb); // Sky
 
 // ---- 调色板（运行时生效的颜色集合）----
 
-/// 一套完整的 UI 调色板。三套预设（Mocha/HighContrast/NoColor）各产出一个。
+/// 一套完整的 UI 调色板。五套预设（Mocha/Frappé/Macchiato/HighContrast/NoColor）各产出一个。
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub text: Color,
@@ -68,6 +69,12 @@ pub struct Palette {
     pub warn: Color,
     pub danger: Color,
     pub mauve: Color,
+    /// Teal — Catppuccin Teal slot（之前是 orphan const，现在接入调色板）。
+    pub teal: Color,
+    /// Peach — Catppuccin Peach slot。用于次级警告 / 数字着色。
+    pub peach: Color,
+    /// Sky — Catppuccin Sky slot。用于次级信息着色。
+    pub sky: Color,
 }
 
 impl Palette {
@@ -88,6 +95,58 @@ impl Palette {
             warn: WARN,
             danger: DANGER,
             mauve: MAUVE,
+            teal: TEAL,
+            peach: PEACH,
+            sky: SKY,
+        }
+    }
+
+    /// Catppuccin Frappé（medium-dark，饱和度低于 Mocha）。
+    /// 槽位映射与 [`Palette::mocha`] 一致（text→Text … sky→Sky）。
+    /// Hex 值取自 catppuccin.com/palette。
+    fn frappe() -> Self {
+        Self {
+            text: rgb(0xc6d0f5),       // Text
+            muted: rgb(0xb5bfe2),      // Subtext1
+            faint: rgb(0x949cbb),      // Overlay2
+            surface: rgb(0x292c3c),    // Mantle
+            surface1: rgb(0x303446),   // Base
+            surface2: rgb(0x414559),   // Surface0
+            base: rgb(0x232634),       // Crust
+            header: rgb(0x292c3c),     // Mantle
+            accent: rgb(0x8caaee),     // Blue
+            accent_dim: rgb(0x85c1dc), // Sapphire
+            success: rgb(0xa6d189),    // Green
+            warn: rgb(0xe5c890),       // Yellow
+            danger: rgb(0xe78284),     // Red
+            mauve: rgb(0xca9ee6),      // Mauve
+            teal: rgb(0x81c8be),       // Teal
+            peach: rgb(0xef9f76),      // Peach
+            sky: rgb(0x99d1db),        // Sky
+        }
+    }
+
+    /// Catppuccin Macchiato（比 Frappé 深、比 Mocha 浅）。
+    /// 槽位映射与 [`Palette::mocha`] 一致。Hex 值取自 catppuccin.com/palette。
+    fn macchiato() -> Self {
+        Self {
+            text: rgb(0xcad3f5),       // Text
+            muted: rgb(0xb8c0e0),      // Subtext1
+            faint: rgb(0x939ab7),      // Overlay2
+            surface: rgb(0x1e2030),    // Mantle
+            surface1: rgb(0x24273a),   // Base
+            surface2: rgb(0x363a4f),   // Surface0
+            base: rgb(0x181926),       // Crust
+            header: rgb(0x1e2030),     // Mantle
+            accent: rgb(0x8aadf4),     // Blue
+            accent_dim: rgb(0x7dc4e4), // Sapphire
+            success: rgb(0xa6da95),    // Green
+            warn: rgb(0xeed49f),       // Yellow
+            danger: rgb(0xed8796),     // Red
+            mauve: rgb(0xc6a0f6),      // Mauve
+            teal: rgb(0x8bd5ca),       // Teal
+            peach: rgb(0xf5a97f),      // Peach
+            sky: rgb(0x91d7e3),        // Sky
         }
     }
 
@@ -109,6 +168,13 @@ impl Palette {
             warn: Color::Yellow,
             danger: Color::Red,
             mauve: Color::Magenta,
+            // Teal 约束复用 Cyan（饱和、终端原生、>=7:1 on black）。
+            teal: Color::Cyan,
+            // Peach 次级警告：饱和暖色 DarkRed/Red 系均偏 danger，用 Yellow 作
+            // safe 回退会和 warn 重叠；这里用 Magenta 作区分的暖色 fallback。
+            peach: Color::Magenta,
+            // Sky 次级信息：和 accent/accent_dim 共用 Cyan 家族。
+            sky: Color::Cyan,
         }
     }
 
@@ -130,6 +196,9 @@ impl Palette {
             warn: Color::Reset,
             danger: Color::Reset,
             mauve: Color::Reset,
+            teal: Color::Reset,
+            peach: Color::Reset,
+            sky: Color::Reset,
         }
     }
 }
@@ -171,6 +240,8 @@ fn palette_for_name(name: &str) -> Palette {
         return Palette::no_color();
     }
     match name.to_ascii_lowercase().as_str() {
+        "frappe" => Palette::frappe(),
+        "macchiato" => Palette::macchiato(),
         "highcontrast" | "hc" => Palette::high_contrast(),
         "nocolor" => Palette::no_color(),
         _ => Palette::mocha(),
@@ -214,6 +285,21 @@ pub fn danger() -> Color {
 }
 pub fn mauve() -> Color {
     current().mauve
+}
+/// Teal slot（原 orphan const TEAL，现接入调色板）。预留给次级强调 / 信息着色。
+#[allow(dead_code)]
+pub fn teal() -> Color {
+    current().teal
+}
+/// Peach slot——次级警告 / 数字着色。
+#[allow(dead_code)]
+pub fn peach() -> Color {
+    current().peach
+}
+/// Sky slot——次级信息着色。
+#[allow(dead_code)]
+pub fn sky() -> Color {
+    current().sky
 }
 #[allow(dead_code)]
 pub fn base() -> Color {
@@ -355,6 +441,64 @@ mod tests {
         let p = Palette::mocha();
         assert_ne!(p.text, Color::Reset);
         assert_ne!(p.accent, Color::Reset);
+    }
+
+    #[test]
+    fn frappe_palette_uses_official_hex_values() {
+        // 关键锚点 hex（catppuccin.com/palette Frappé）：回归保护，防止手抄错。
+        let p = Palette::frappe();
+        assert_eq!(p.text, rgb(0xc6d0f5)); // Text
+        assert_eq!(p.base, rgb(0x232634)); // Crust
+        assert_eq!(p.accent, rgb(0x8caaee)); // Blue
+        assert_eq!(p.teal, rgb(0x81c8be)); // Teal
+        assert_eq!(p.peach, rgb(0xef9f76)); // Peach
+        assert_eq!(p.sky, rgb(0x99d1db)); // Sky
+                                          // Frappé base 比 Mocha 浅（medium-dark），accent 也应不同。
+        assert_ne!(p.base, Palette::mocha().base);
+    }
+
+    #[test]
+    fn macchiato_palette_uses_official_hex_values() {
+        let p = Palette::macchiato();
+        assert_eq!(p.text, rgb(0xcad3f5)); // Text
+        assert_eq!(p.base, rgb(0x181926)); // Crust
+        assert_eq!(p.accent, rgb(0x8aadf4)); // Blue
+        assert_eq!(p.teal, rgb(0x8bd5ca)); // Teal
+        assert_eq!(p.peach, rgb(0xf5a97f)); // Peach
+        assert_eq!(p.sky, rgb(0x91d7e3)); // Sky
+                                          // 三套深色调色板的 accent 必须互不相同（防止复制粘贴漏改）。
+        assert_ne!(p.accent, Palette::mocha().accent);
+        assert_ne!(p.accent, Palette::frappe().accent);
+    }
+
+    #[test]
+    fn palette_for_name_resolves_new_flavors() {
+        // switch/init 走 palette_for_name；直接测它避免全局 OnceLock 污染。
+        assert!(matches!(palette_for_name("frappe").accent, Color::Rgb(..)));
+        assert!(matches!(
+            palette_for_name("Macchiato").accent,
+            Color::Rgb(..)
+        ));
+        // 大小写不敏感 + 未知名回退 Mocha。
+        assert_eq!(palette_for_name("FRAPPE").text, Palette::frappe().text);
+        assert_eq!(palette_for_name("nonsense").base, Palette::mocha().base);
+    }
+
+    #[test]
+    fn switch_and_telemetry_accessors_return_active_palette() {
+        // 任务验收标准：switch("frappe") 后 teal() 返回 Frappé 的 Teal 值。
+        switch("frappe");
+        assert_eq!(teal(), Palette::frappe().teal);
+        assert_eq!(peach(), Palette::frappe().peach);
+        assert_eq!(sky(), Palette::frappe().sky);
+        // 同理 Macchiato。
+        switch("macchiato");
+        assert_eq!(teal(), rgb(0x8bd5ca));
+        assert_eq!(peach(), rgb(0xf5a97f));
+        assert_eq!(sky(), rgb(0x91d7e3));
+        // 恢复 Mocha 避免污染后续测试。
+        switch("mocha");
+        assert_eq!(teal(), TEAL);
     }
 
     #[test]
