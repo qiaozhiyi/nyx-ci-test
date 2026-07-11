@@ -18,3 +18,7 @@ crates/*/target/
 /screenshot*.png
 .claude/worktrees/
 target/drivers/
+# zcode agent working scratch (plans, transcripts) — never commit
+.zcode/
+# downloaded artifacts during testing — never commit
+downloads/

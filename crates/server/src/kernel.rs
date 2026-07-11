@@ -92,7 +92,9 @@ fn gate(
             }
             Ok(op)
         }
-        crate::AuthOutcome::Denied(_) => Err((axum::http::StatusCode::UNAUTHORIZED, "auth required")),
+        crate::AuthOutcome::Denied(_) => {
+            Err((axum::http::StatusCode::UNAUTHORIZED, "auth required"))
+        }
     }
 }
 
