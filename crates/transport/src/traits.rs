@@ -2,8 +2,6 @@
 //
 // Channel priorities (0 = highest): HTTPS > DoH DNS > Slack API > LLM API > MCP > WebTransport > SMB
 
-use std::time::Duration;
-
 // ---- Error type -----------------------------------------------------------
 
 #[derive(Debug)]
@@ -38,13 +36,19 @@ pub trait Transport {
     fn name(&self) -> &'static str;
 
     /// Maximum payload size this channel supports in a single frame.
-    fn max_frame_size(&self) -> usize { 1024 * 1024 } // default 1MB
+    fn max_frame_size(&self) -> usize {
+        1024 * 1024
+    } // default 1MB
 
     /// Whether this channel requires connectivity check before use.
-    fn requires_probe(&self) -> bool { true }
+    fn requires_probe(&self) -> bool {
+        true
+    }
 
     /// One-time initialization (called once when channel is first activated).
-    fn init(&mut self) -> Result<(), TransportError> { Ok(()) }
+    fn init(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
 }
 
 // ---- TransportStack -------------------------------------------------------
@@ -62,6 +66,9 @@ pub struct TransportStack {
     channels: Vec<ChannelSlot>,
     active: usize,
     max_consecutive_fails: u8,
+    /// Cadence (ms) for background health probes. Stored for the health
+    /// monitor task (not yet wired); read once the probe loop is added.
+    #[allow(dead_code)]
     health_probe_interval_ms: u64,
 }
 
@@ -126,7 +133,9 @@ impl TransportStack {
 
         // Fallback: try all channels in priority order
         for (i, slot) in self.channels.iter_mut().enumerate() {
-            if i == self.active { continue; } // already tried
+            if i == self.active {
+                continue;
+            } // already tried
             if !slot.transport.requires_probe() || slot.healthy {
                 match slot.transport.send(frame) {
                     Ok(()) => {
@@ -170,7 +179,9 @@ impl TransportStack {
                     slot.fail_count += 1;
                     if slot.fail_count >= self.max_consecutive_fails {
                         slot.healthy = false;
-                        if i == self.active { needs_switch = true; }
+                        if i == self.active {
+                            needs_switch = true;
+                        }
                     }
                 }
             }

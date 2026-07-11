@@ -24,7 +24,6 @@ use crate::traits::{Transport, TransportError};
 
 // ---- Slack API JSON shapes ------------------------------------------------
 
-
 #[derive(Debug, Deserialize)]
 struct HistoryPayload {
     #[serde(default)]
@@ -132,12 +131,8 @@ impl SlackTransport {
     /// Classify a `ureq::Error` into a `TransportError`.
     fn classify_ureq_error(&self, e: ureq::Error) -> TransportError {
         match &e {
-            ureq::Error::Status(429, _) => {
-                TransportError::Transient("Slack rate limited (429)")
-            }
-            ureq::Error::Status(401, _) => {
-                TransportError::Dead("Slack token invalid (401)")
-            }
+            ureq::Error::Status(429, _) => TransportError::Transient("Slack rate limited (429)"),
+            ureq::Error::Status(401, _) => TransportError::Dead("Slack token invalid (401)"),
             ureq::Error::Status(403, _) => {
                 TransportError::Dead("Slack token lacks required scopes (403)")
             }
@@ -150,7 +145,6 @@ impl SlackTransport {
             _ => TransportError::Transient("Slack API error"),
         }
     }
-
 
     /// Resolve the bot user ID by calling `auth.test`. Used during `init()`.
     fn resolve_bot_user_id(&mut self) -> Result<(), TransportError> {
@@ -166,9 +160,7 @@ impl SlackTransport {
 
         let ok = resp["ok"].as_bool().unwrap_or(false);
         if !ok {
-            let err = resp["error"]
-                .as_str()
-                .unwrap_or("unknown");
+            let err = resp["error"].as_str().unwrap_or("unknown");
             return Err(match err {
                 "invalid_auth" | "token_revoked" | "account_inactive" => {
                     TransportError::Dead("Slack token invalid")
@@ -352,8 +344,7 @@ mod tests {
         assert!(t.next_send_after.is_none());
         t.enforce_rate_limit();
         // No-op when next_send_after is None.
-        t.next_send_after =
-            Some(Instant::now() + Duration::from_millis(SEND_COOLDOWN_MS));
+        t.next_send_after = Some(Instant::now() + Duration::from_millis(SEND_COOLDOWN_MS));
         let before = Instant::now();
         t.enforce_rate_limit();
         assert!(before.elapsed() >= Duration::from_millis(SEND_COOLDOWN_MS));

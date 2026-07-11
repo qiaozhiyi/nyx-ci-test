@@ -29,17 +29,22 @@
 //! [JA4]: https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
 //! [Akamai passive HTTP/2 fingerprint]: https://blackhat.com/docs/eu-17/materials/eu-17-Shuster-Passive-Fingerprinting-Of-HTTP2-Clients-wp.pdf
 
+pub mod doh_dns;
+/// ⚠ NOT WIRED (P1-14): [`emitter::FingerprintEmitter`] / [`emitter::best`]
+/// exist as the seam for future JA3 control, but no transport calls them. All
+/// HTTPS traffic uses the default rustls `ClientHello`; outbound JA3 is NOT
+/// controllable today. See the *emission backend status* section above and the
+/// banner at the top of [`emitter`].
 pub mod emitter;
 pub mod h2;
-pub mod tls;
-pub mod traits;
 pub mod llm_api;
-pub mod doh_dns;
+pub mod malleable;
+pub mod mcp;
 pub mod slack_api;
 pub mod smb_pipe;
-pub mod mcp;
+pub mod tls;
+pub mod traits;
 pub mod webtransport;
-pub mod malleable;
 
 pub use h2::{akamai_h2, H2Fingerprint};
 pub use tls::{ja3, ja4, parse_client_hello, sniff_client_hello, ClientHello};

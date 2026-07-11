@@ -34,6 +34,13 @@ rcgen = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 tower = { workspace = true }
+# Constant-time comparison for secret/token equality checks (HIGH-1).
+# `subtle` is already a transitive dep of chacha20poly1305; listing it directly
+# only pins the API surface we use (ConstantTimeEq).
+subtle = "2"
+# OsRng for the auto-generated control-API token (P0-2). `getrandom` enables
+# `rand::rngs::OsRng` on top of the workspace's default-features=false base.
+rand = { workspace = true, features = ["getrandom"] }
 
 [dev-dependencies]
 nyx-agent-dev = { workspace = true }

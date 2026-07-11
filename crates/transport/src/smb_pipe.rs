@@ -26,7 +26,6 @@ mod win32 {
     pub const GENERIC_READ: u32 = 0x80000000;
     pub const GENERIC_WRITE: u32 = 0x40000000;
     pub const OPEN_EXISTING: u32 = 3;
-    pub const FILE_FLAG_OVERLAPPED: u32 = 0x40000000;
     pub const ERROR_PIPE_BUSY: u32 = 231;
     pub const NMPWAIT_USE_DEFAULT_WAIT: u32 = 0;
 
@@ -59,10 +58,7 @@ mod win32 {
 
         pub fn CloseHandle(hObject: RawHandle) -> i32;
 
-        pub fn WaitNamedPipeW(
-            lpNamedPipeName: *const u16,
-            nTimeOut: u32,
-        ) -> i32;
+        pub fn WaitNamedPipeW(lpNamedPipeName: *const u16, nTimeOut: u32) -> i32;
 
         pub fn GetLastError() -> u32;
     }
@@ -239,10 +235,10 @@ impl SmbPipeTransport {
             CreateFileW(
                 wide.as_ptr(),
                 GENERIC_READ | GENERIC_WRITE,
-                0,          // dwShareMode — exclusive access
+                0, // dwShareMode — exclusive access
                 std::ptr::null(),
                 OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED,
+                0, // synchronous IO — ReadFile/WriteFile use NULL OVERLAPPED; FILE_FLAG_OVERLAPPED without an OVERLAPPED struct fails with ERROR_INVALID_PARAMETER.
                 INVALID_HANDLE_VALUE as std::os::windows::io::RawHandle,
             )
         };
@@ -340,11 +336,15 @@ impl Drop for SmbPipeTransport {
 #[cfg(not(windows))]
 impl Transport for SmbPipeTransport {
     fn send(&mut self, _frame: &[u8]) -> Result<(), TransportError> {
-        Err(TransportError::Dead("smb-pipe: Windows-only (SMB named pipes unavailable on this platform)"))
+        Err(TransportError::Dead(
+            "smb-pipe: Windows-only (SMB named pipes unavailable on this platform)",
+        ))
     }
 
     fn recv(&mut self, _timeout_ms: u32) -> Result<Vec<u8>, TransportError> {
-        Err(TransportError::Dead("smb-pipe: Windows-only (SMB named pipes unavailable on this platform)"))
+        Err(TransportError::Dead(
+            "smb-pipe: Windows-only (SMB named pipes unavailable on this platform)",
+        ))
     }
 
     fn health_check(&self) -> Option<u64> {

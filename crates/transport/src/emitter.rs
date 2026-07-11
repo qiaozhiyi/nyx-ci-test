@@ -1,3 +1,10 @@
+//! ⚠ NOT WIRED (P1-14): this trait exists as the seam for future JA3/JA4
+//! control, but **no transport currently calls [`best()`]**. All HTTPS traffic
+//! in the implant/server uses the default rustls `ClientHello`. Operators must
+//! NOT assume outbound JA3 is controllable today — it is not. Wiring requires
+//! the `rquest` (soon `wreq` 6.0) backend, which is pending; until it lands the
+//! emitter is dead code kept only as the integration seam.
+//!
 //! TLS fingerprint *emission* — the seam for producing a browser-matching
 //! ClientHello.
 //!

@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Guardrails: an optional API token (Bearer auth on /api/*) and a kill date.
-    let api_token = std::env::var("NYX_TOKEN").ok().filter(|s| !s.is_empty());
+    let mut api_token = std::env::var("NYX_TOKEN").ok().filter(|s| !s.is_empty());
     let killdate = std::env::var("NYX_KILLDATE")
         .ok()
         .and_then(|s| s.parse::<u64>().ok());
@@ -67,7 +67,8 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(keyfile = %p, "persisted server identity loaded");
             kp
         }
-        Err(_) => ServerKeypair::generate(),
+        Err(_) => ServerKeypair::generate()
+            .expect("server keypair generation: OsRng is infallible on supported targets"),
     };
 
     // Persistent credential store (Phase 2). Loads on every boot so creds
@@ -80,8 +81,11 @@ async fn main() -> anyhow::Result<()> {
             let home = std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
                 .unwrap_or_else(|_| ".".to_string());
-            std::path::PathBuf::from(&home).join(".nyx").join("server-creds.db")
-                .to_string_lossy().to_string()
+            std::path::PathBuf::from(&home)
+                .join(".nyx")
+                .join("server-creds.db")
+                .to_string_lossy()
+                .to_string()
         }
     };
     let cred_store = nyx_store::CredStore::open(std::path::Path::new(&creds_path))
@@ -115,6 +119,62 @@ async fn main() -> anyhow::Result<()> {
     let audit_writer = nyx_server::audit::AuditWriter::open(&audit_path)?;
     tracing::info!(audit = %audit_path.display(), "action audit log opened");
 
+    // Resolve the bind address up front (P0-2): default is loopback, NOT
+    // 0.0.0.0, so a fresh `nyx-server` with no config is only reachable from
+    // the local host. Binding the wider network requires an explicit
+    // NYX_BIND=0.0.0.0:8443 — and that triggers the auth check below.
+    let addr = std::env::var("NYX_BIND").unwrap_or_else(|_| "127.0.0.1:8443".to_string());
+
+    // P0-2 (CRIT-1): a non-loopback bind with NO auth (empty operator registry
+    // AND no NYX_TOKEN) is an OPEN team server on the network — anyone who can
+    // reach it can task implants, read results, and pivot. Refuse that footgun
+    // by auto-generating a strong random token (printed to stderr, mirroring the
+    // server-pubkey pattern below) unless the operator explicitly opts into open
+    // mode via NYX_ALLOW_OPEN=1 (CI/test — logged as a WARN).
+    let is_network_bind = !nyx_server::is_loopback_bind(&addr);
+    let no_auth = operators.is_open() && api_token.is_none();
+    if is_network_bind && no_auth {
+        if std::env::var("NYX_ALLOW_OPEN").as_deref() == Ok("1") {
+            tracing::warn!(
+                %addr,
+                "non-loopback bind with NO auth (NYX_ALLOW_OPEN=1) — team server is OPEN; \
+                 anyone who reaches it can task implants"
+            );
+        } else {
+            let token = nyx_server::generate_api_token();
+            eprintln!("╔═══════════════════════════════════════════════════════════════════╗");
+            eprintln!("║ AUTO-GENERATED API TOKEN (control-API auth — save this!):          ║");
+            eprintln!("║ {token} ║");
+            eprintln!("║ Use: Authorization: Bearer {token:<55} (or set NYX_TOKEN)        ║");
+            eprintln!("╚═══════════════════════════════════════════════════════════════════╝");
+            tracing::info!("auto-generated control-API token for non-loopback bind");
+            api_token = Some(token);
+        }
+    }
+
+    // Kernel daemon bridge (P6): only wire up when NYX_KERNEL_DAEMON is set.
+    // Without it the `/api/kernel/*` routes are dead code that returns
+    // `{"ok":false,"err":"no daemon"}` for every call — misleading operators
+    // into thinking a daemon is misconfigured when none is intended. When the
+    // env var IS set (to the `host:port` of a running `nyx-kernel --serve`
+    // daemon), construct the bridge and register the routes; otherwise leave
+    // `kernel = None` and the router skips registering those routes entirely.
+    let kernel = match std::env::var("NYX_KERNEL_DAEMON") {
+        Ok(addr) => {
+            let bridge =
+                nyx_server::kernel::KernelBridge::new(nyx_server::kernel::KernelConfig { addr });
+            tracing::info!("kernel daemon bridge enabled (NYX_KERNEL_DAEMON)");
+            Some(Arc::new(bridge))
+        }
+        Err(_) => {
+            tracing::info!(
+                "kernel daemon bridge disabled (set NYX_KERNEL_DAEMON=<host:port> to enable \
+                 /api/kernel/* routes)"
+            );
+            None
+        }
+    };
+
     let mut state = AppState {
         keypair,
         sessions: Default::default(),
@@ -126,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
         creds: Arc::new(cred_store),
         operators: Arc::new(operators),
         audit: Some(Arc::new(audit_writer)),
-        kernel: None,
+        kernel,
     };
     state.register_default_hooks();
     // Optional operator automation: a Rhai script run on session/result events.
@@ -144,7 +204,6 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(state);
 
     let pubkey = hex::encode(state.keypair.public_bytes());
-    let addr = std::env::var("NYX_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
 
     let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -190,9 +249,18 @@ async fn main() -> anyhow::Result<()> {
                             // Manually drive the MakeService for this connection
                             // (axum::serve does this internally, but we handle
                             // the accept loop ourselves for TLS + fingerprinting).
-                            let svc = tower::ServiceExt::oneshot(make_svc, peer).await.unwrap();
-                            let svc = hyper_util::service::TowerToHyperService::new(svc);
-                            let _ = builder.serve_connection(io, svc).await;
+                            // P0-11: never unwrap() — a single MakeService build
+                            // failure must drop ONE connection, not panic the
+                            // whole accept loop (which takes down every beacon).
+                            match tower::ServiceExt::oneshot(make_svc, peer).await {
+                                Ok(svc) => {
+                                    let svc = hyper_util::service::TowerToHyperService::new(svc);
+                                    let _ = builder.serve_connection(io, svc).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%peer, error=%e, "make_service build failed; connection dropped")
+                                }
+                            }
                         }
                         _ => tracing::debug!(%peer, "TLS handshake timed out or failed"),
                     }

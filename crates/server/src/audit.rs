@@ -103,7 +103,13 @@ impl AuditWriter {
 
     /// Append a record. Never panics (a poisoned lock or IO error drops ONE
     /// record + logs — the server must stay up; the `seq` gap surfaces the loss).
-    pub fn append(&self, action: &str, operator: &str, target: &str, detail: serde_json::Value) {
+    pub fn append(
+        &self,
+        action: &str,
+        operator: &str,
+        target: &str,
+        mut detail: serde_json::Value,
+    ) {
         let mut inner = match self.inner.lock() {
             Ok(g) => g,
             Err(_) => {
@@ -115,7 +121,20 @@ impl AuditWriter {
         let seq = inner.seq;
         let ts = now_secs();
         let prev = inner.last_hash.clone();
-        let detail_json = serde_json::to_string(&detail).unwrap_or_else(|_| "null".into());
+        // Serialize detail ONCE; the SAME bytes feed both the hash-chain link
+        // AND the persisted record, so `verify_chain` can never observe a
+        // hash/storage fork (HIGH-4). Previously `detail_json` fell back to
+        // "null" for the hash while `rec.detail` kept the original `Value` —
+        // if that Value then re-serialized to something else, the recomputed
+        // link wouldn't match. Now a serialization failure zeroes `detail` in
+        // BOTH places (hash input + stored record) so they always agree.
+        let detail_json = match serde_json::to_string(&detail) {
+            Ok(s) => s,
+            Err(_) => {
+                detail = serde_json::Value::Null;
+                "null".to_string()
+            }
+        };
         let hash = hash_record(seq, ts, operator, action, target, &detail_json, &prev);
         let rec = AuditRecord {
             seq,
