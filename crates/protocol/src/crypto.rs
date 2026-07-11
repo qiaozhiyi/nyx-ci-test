@@ -9,18 +9,26 @@ use hkdf::Hkdf;
 use rand_core::RngCore;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 pub const PUBKEY_LEN: usize = 32;
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
 
 /// A 32-byte symmetric key derived per session via ECDH + HKDF.
-/// Wrapped so ZeroizeOnDrop can be implemented (orphan rule prevents impl
-/// for the bare array type from outside this crate).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+///
+/// The wrapper exists so we can give the key a real `Drop` (which zeroizes the
+/// bytes) and a redacted `Debug` (so a stray `{:?}` / `tracing` log can't dump
+/// it). It deliberately does **not** derive `Copy`: a `Copy` type is forbidden
+/// from implementing `Drop` (E0184), and the prior code derived `Copy` *plus* a
+/// bare `ZeroizeOnDrop` marker with no `Drop` — i.e. the marker's promise was
+/// structurally unsatisfiable and the key was never actually cleared. Removing
+/// `Copy` lets the real destructor below run and prevents implicit duplication
+/// that would leave extra residual copies in freed memory.
+///
+/// Callers pass `&SessionKey` to `seal_dir`/`open_dir`; construction is a move,
+/// so dropping the `Copy` bound does not break existing call sites.
 pub struct SessionKey([u8; KEY_LEN]);
-
-use zeroize::{Zeroize, ZeroizeOnDrop};
 
 impl SessionKey {
     pub fn new(inner: [u8; KEY_LEN]) -> Self {
@@ -31,13 +39,46 @@ impl SessionKey {
     }
 }
 
+impl Clone for SessionKey {
+    fn clone(&self) -> Self {
+        Self(self.0)
+    }
+}
+
+impl PartialEq for SessionKey {
+    fn eq(&self, other: &Self) -> bool {
+        // Equality on session keys is only used in tests, never in a path that
+        // gates secrets, so a direct compare is acceptable.
+        self.0.as_slice() == other.0.as_slice()
+    }
+}
+impl Eq for SessionKey {}
+
+impl core::hash::Hash for SessionKey {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl core::fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // NEVER expose raw key bytes through {:?} / tracing / dbg!.
+        f.write_str("SessionKey(<redacted>)")
+    }
+}
+
 impl Zeroize for SessionKey {
     fn zeroize(&mut self) {
         self.0.zeroize();
     }
 }
 
-impl ZeroizeOnDrop for SessionKey {}
+impl Drop for SessionKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// Fill 32 bytes from the OS CSPRNG.
 ///
@@ -54,21 +95,44 @@ impl ZeroizeOnDrop for SessionKey {}
 /// Windows version from XP SP2 through 11 25H2 (SystemFunction036 is the documented
 /// stable entry point for the kernel CSPRNG). If no callback is registered,
 /// `random_bytes` falls back to `OsRng` (which works on std targets).
+/// Fill 32 bytes from the OS CSPRNG.
+///
+/// **std build** (server/agent-dev/client): uses `rand_core::OsRng` → `getrandom`.
+/// `OsRng::fill_bytes` is documented infallible on supported targets, so the std
+/// variant stays infallible (it panics only on truly unsupported platforms,
+/// which fail to compile-link anyway).
+///
+/// **no_std build** (PIC implant): uses a registered CSPRNG callback
+/// ([`register_csprng`]). Unlike `OsRng`, the hook CAN fail at runtime (export
+/// not resolvable, `RtlGenRandom` returns 0), so the no_std variant returns
+/// `Result` and the caller MUST act on failure — proceeding with the zeroed
+/// buffer would build an all-zero X25519 scalar → identity-point ECDH → a
+/// deterministic, decryptable, cross-implant-identical session key. That was the
+/// pre-fix bug: the hook's `bool` return was discarded.
 #[cfg(feature = "std")]
 fn random_bytes(out: &mut [u8; 32]) {
     rand_core::OsRng.fill_bytes(out);
 }
 
-/// Registered CSPRNG callback for the no_std PIC implant. Set by the implant's
-/// bootstrap via [`register_csprng`]. Stores a raw function pointer in an
-/// AtomicUsize (no_std-safe, no Mutex needed — set once at init, read forever).
+/// Error returned when CSPRNG fill fails or yields an invalid (all-zero) scalar.
+/// In the no_std implant this is fatal: the caller writes a diag marker and
+/// aborts rather than constructing predictable key material.
+#[derive(Debug)]
+#[cfg(not(feature = "std"))]
+pub enum CryptoError {
+    /// The registered CSPRNG hook returned `false` (fill failed).
+    CsprngFailed,
+    /// The CSPRNG produced an all-zero scalar — never a legitimate key. Treated
+    /// as a failure even if the hook reported success (defense in depth: a
+    /// broken/hooked RNG that returns `true` with a zero buffer is caught).
+    ZeroScalar,
+}
+
+/// Registered CSPRNG callback for the no_std PIC implant.
 #[cfg(not(feature = "std"))]
 static CSPRNG_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// Register a CSPRNG fill function for the no_std build. The implant calls this
-/// once during bootstrap, passing a closure that resolves `SystemFunction036`
-/// via PEB walk and fills the buffer with cryptographically-secure random bytes.
-/// Returning `false` = failure (the caller should abort / treat as fatal).
+/// Register a CSPRNG fill function for the no_std build.
 ///
 /// **Safety**: `fill` must be safe to call from any thread (the CSPRNG is
 /// stateless / thread-safe on Windows). The pointer is stored in an atomic and
@@ -86,20 +150,73 @@ pub fn register_csprng(fill: fn(&mut [u8]) -> bool) -> Result<(), ()> {
         .map_err(|_| ())
 }
 
+/// Fill 32 random bytes in the no_std build. Returns `Err` if the registered
+/// CSPRNG hook reports failure; the buffer is left zeroed in that case (and the
+/// caller MUST NOT use it — an all-zero scalar is rejected by [`reject_zero`]
+/// even if reached by another path).
 #[cfg(not(feature = "std"))]
-fn random_bytes(out: &mut [u8; 32]) {
+fn random_bytes(out: &mut [u8; 32]) -> Result<(), CryptoError> {
     let hook = CSPRNG_HOOK.load(core::sync::atomic::Ordering::Acquire);
     if hook != 0 {
-        // SAFETY: the pointer was stored by register_csprng and points to a
-        // process-lifetime fn(&mut [u8]) -> bool. Thread-safe (CSPRNG is
-        // stateless on Windows).
+        // SAFETY: stored by register_csprng; process-lifetime fn pointer.
         let f: fn(&mut [u8]) -> bool = unsafe { core::mem::transmute(hook) };
-        f(out);
+        // KEY FIX: act on the bool. Discarding it (the pre-fix bug) left `out`
+        // zeroed on hook failure → all-zero scalar → total crypto breakdown.
+        if !f(out) {
+            return Err(CryptoError::CsprngFailed);
+        }
+        Ok(())
     } else {
-        // Fallback: OsRng (works on std targets; on no_std without a registered
-        // hook this will use getrandom's static link — may abort on PIC cdylib).
+        // Fallback: OsRng. On a no_std PIC cdylib without a registered hook this
+        // may abort at link/runtime; but if it returns it filled the buffer.
         rand_core::OsRng.fill_bytes(out);
+        Ok(())
     }
+}
+
+/// Reject an all-zero scalar. An all-zero X25519 private key clamps to an
+/// effective zero scalar whose public key is the curve identity point — every
+/// such implant derives the same (all-zero) shared secret. Never legitimate.
+fn reject_zero(bytes: &[u8; 32]) -> Result<(), ZeroScalarMarker> {
+    if bytes.iter().all(|&b| b == 0) {
+        Err(ZeroScalarMarker)
+    } else {
+        Ok(())
+    }
+}
+
+/// Marker type for [`reject_zero`]'s failure (kept out of the public `CryptoError`
+/// enum so the std build, which never hits it, doesn't need the enum).
+struct ZeroScalarMarker;
+
+/// Error from [`ServerKeypair::generate`] / [`ImplantKeypair::generate`].
+///
+/// This is returned (not panicked) so the no_std implant can surface a clean
+/// diagnostic and abort rather than constructing predictable key material.
+/// Under the std build the CSPRNG is infallible, so this is only ever `Ok`.
+#[derive(Debug)]
+pub enum GenerateError {
+    /// The no_std CSPRNG hook returned `false`.
+    #[cfg(not(feature = "std"))]
+    CsprngFailed,
+    /// The RNG returned success but produced an all-zero scalar (identity point).
+    /// Defense in depth: a hooked/broken RNG that lies with `true` is still caught.
+    ZeroScalar,
+}
+
+/// Fill 32 random bytes and reject the all-zero result. Bridges the std
+/// (infallible `OsRng`) and no_std (fallible hook) `random_bytes` into one
+/// `Result`-returning helper used by both keypair generators.
+fn fill_random_checked(out: &mut [u8; 32]) -> Result<(), GenerateError> {
+    #[cfg(feature = "std")]
+    {
+        random_bytes(out);
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        random_bytes(out).map_err(|_| GenerateError::CsprngFailed)?;
+    }
+    reject_zero(out).map_err(|_| GenerateError::ZeroScalar)
 }
 
 /// The team server's long-term identity keypair. The public half is baked
@@ -111,13 +228,20 @@ pub struct ServerKeypair {
 }
 
 impl ServerKeypair {
-    pub fn generate() -> Self {
+    /// Generate a fresh keypair from the OS CSPRNG.
+    ///
+    /// Returns `Err` only when the CSPRNG fails (no_std hook reports failure,
+    /// or — defense in depth — the fill yields an all-zero scalar, which would
+    /// produce the curve identity point). In the std build `OsRng` is
+    /// infallible, so the `Err` arm is unreachable in practice but kept for a
+    /// uniform call-site signature.
+    pub fn generate() -> Result<Self, GenerateError> {
         let mut bytes = [0u8; 32];
-        random_bytes(&mut bytes);
+        fill_random_checked(&mut bytes)?;
         let secret = StaticSecret::from(bytes);
         bytes.zeroize();
         let public = PublicKey::from(&secret);
-        Self { secret, public }
+        Ok(Self { secret, public })
     }
 
     pub fn public_bytes(&self) -> [u8; PUBKEY_LEN] {
@@ -165,13 +289,19 @@ pub struct ImplantKeypair {
 }
 
 impl ImplantKeypair {
-    pub fn generate() -> Self {
+    /// Generate a fresh keypair from the OS CSPRNG.
+    ///
+    /// Returns `Err` only when the CSPRNG fails or yields an all-zero scalar
+    /// (which would produce the curve identity point and a deterministic shared
+    /// secret shared with every other affected implant). In the std build
+    /// `OsRng` is infallible so the `Err` arm is unreachable in practice.
+    pub fn generate() -> Result<Self, GenerateError> {
         let mut bytes = [0u8; 32];
-        random_bytes(&mut bytes);
+        fill_random_checked(&mut bytes)?;
         let secret = StaticSecret::from(bytes);
         bytes.zeroize();
         let public = PublicKey::from(&secret);
-        Self { secret, public }
+        Ok(Self { secret, public })
     }
 
     pub fn public_bytes(&self) -> [u8; PUBKEY_LEN] {
@@ -203,21 +333,20 @@ pub fn derive_session_key(
     server_pub: &[u8; PUBKEY_LEN],
     implant_pub: &[u8; PUBKEY_LEN],
 ) -> SessionKey {
-    let hk = Hkdf::<Sha256>::new(None, shared);
-    // Stack-allocated info buffer: "nyx-session-v1" (14) + server_pub (32) + implant_pub (32) = 78 bytes.
-    // Audit M-4: avoid Vec heap allocation for this small, fixed-size payload.
+    // P1-2 fix: use server_pub as the HKDF-Extract salt (RFC 5869 §3.1
+    // recommends a non-empty salt; the server's long-term public key is public,
+    // fixed, and non-attacker-controlled — an ideal salt per Trail of Bits
+    // guidance). Previously `None` (a string of HashLen zeros), so extract-stage
+    // domain separation depended solely on `info`. The pubkeys also go into
+    // `info` for expand-stage binding, layering separation at both stages.
+    let hk = Hkdf::<Sha256>::new(Some(server_pub), shared);
+    // Stack-allocated info buffer: "nyx-session-v1" (14) + server_pub (32) +
+    // implant_pub (32) = 78 bytes. Avoids a heap allocation for this small,
+    // fixed-size payload.
     let mut info = [0u8; 80];
-    let mut pos = 0;
-    let mut label = *b"nyx-session-v1";
-    for b in &mut label {
-        *b ^= 0x42;
-    }
-    let mut recovered_label = [0u8; 14];
-    for i in 0..14 {
-        recovered_label[i] = label[i] ^ 0x42;
-    }
-    info[..recovered_label.len()].copy_from_slice(&recovered_label);
-    pos += recovered_label.len();
+    let label = b"nyx-session-v1";
+    info[..label.len()].copy_from_slice(label);
+    let mut pos = label.len();
     info[pos..pos + PUBKEY_LEN].copy_from_slice(server_pub);
     pos += PUBKEY_LEN;
     info[pos..pos + PUBKEY_LEN].copy_from_slice(implant_pub);

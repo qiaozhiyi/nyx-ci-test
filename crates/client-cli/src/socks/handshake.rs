@@ -1,10 +1,13 @@
-//! Server-side SOCKS5 handshake (RFC 1928), hand-rolled — no new deps.
+//! Server-side SOCKS5 handshake (RFC 1928 + RFC 1929), hand-rolled — no new deps.
 //!
-//! The bridge accepts ONLY method `0x00` (NO AUTH) and ONLY `CONNECT` (cmd
-//! `0x01`); BIND and UDP ASSOCIATE are rejected with reply `0x07`. Supporting
-//! SOCKS username/password auth would add nothing: the operator API bearer
-//! token already authenticates the bridge to the team server, and the local
-//! listener binds to loopback by default.
+//! The bridge accepts `CONNECT` (cmd `0x01`) only; BIND and UDP ASSOCIATE are
+//! rejected with reply `0x07`. Auth method selection is bind-aware (P0-10):
+//!  - loopback binds run auth-less (method `0x00` only) — local, safe;
+//!  - non-loopback binds REQUIRE RFC 1929 username/password auth (`0x02`),
+//!    enforced by `run_socks` (it refuses to start an open proxy). When creds
+//!    are configured the greeting requires `0x02` and refuses clients that
+//!    don't offer it (no `0x00` fallback — that would open an unauthenticated
+//!    tunnel through configured creds).
 //!
 //! Each function takes a SINGLE combined `AsyncRead + AsyncWrite` stream and
 //! uses it for both reading the request and writing the reply — the handshake
@@ -44,10 +47,20 @@ impl SocksTarget {
     }
 }
 
-/// Read the SOCKS5 greeting `[05][nmethods][methods…]`, accept iff method
-/// `0x00` (NO AUTH) is offered, and write the method-selection reply. Writes
-/// `[05][FF]` (no acceptable method) and bails otherwise.
-pub async fn read_greeting<S>(s: &mut S) -> Result<()>
+/// Read the SOCKS5 greeting `[05][nmethods][methods…]` and select an auth
+/// method (RFC 1928 §3), then write the method-selection reply.
+///
+/// Auth policy (P0-10 — prevents an open proxy on non-loopback binds):
+///  - `auth = Some(_)` (non-loopback bind, RFC 1929 creds configured): REQUIRE
+///    method `0x02` (username/password). If the client doesn't offer `0x02`,
+///    reply `[05][FF]` and bail — never fall back to `0x00`, since that would
+///    open an unauthenticated tunnel through configured creds.
+///  - `auth = None` (loopback only): accept `0x00` exclusively.
+///  - Otherwise reply `[05][FF]` (no acceptable method) and bail.
+///
+/// When `0x02` is selected, the RFC 1929 username/password sub-negotiation is
+/// performed inline by [`read_userpass_auth`].
+pub async fn read_greeting<S>(s: &mut S, auth: Option<&(String, String)>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -58,12 +71,64 @@ where
     let nmethods = s.read_u8().await? as usize;
     let mut methods = vec![0u8; nmethods];
     s.read_exact(&mut methods).await?;
-    if methods.contains(&0x00) {
-        s.write_all(&[0x05, 0x00]).await?;
+
+    let selected = if auth.is_some() {
+        if methods.contains(&0x02) {
+            0x02 // username/password (RFC 1929)
+        } else {
+            // Auth is configured, so an open NO-AUTH tunnel would defeat it.
+            // Require 0x02 — never fall back to 0x00 even if the client offers it.
+            0xFF
+        }
+    } else if methods.contains(&0x00) {
+        0x00
     } else {
-        // No acceptable methods — reply then close.
-        s.write_all(&[0x05, 0xFF]).await?;
-        bail!("client offered no NO-AUTH (0x00) method");
+        0xFF
+    };
+
+    s.write_all(&[0x05, selected]).await?;
+    if selected == 0xFF {
+        bail!(
+            "client offered no acceptable SOCKS5 auth method (got {:?})",
+            methods
+        );
+    }
+    if selected == 0x02 {
+        let creds = auth.expect("0x02 selected only when auth is Some");
+        read_userpass_auth(s, creds).await?;
+    }
+    Ok(())
+}
+
+/// RFC 1929 username/password sub-negotiation. Reads
+/// `VER(0x01) ULEN(1) UNAME(ULEN) PLEN(1) PASSWD(PLEN)`, validates against
+/// `creds`, and replies `VER(0x01) STATUS(0=ok / 1=fail)`. Bails on a mismatch
+/// or malformed frame so the caller drops the connection.
+///
+/// The compare is not constant-time: this guards an open proxy, not a
+/// high-value secret, and the username length already leaks via ULEN anyway.
+/// ULEN/PLEN are bounded by u8 (≤255), so the reads cannot be a memory DoS.
+async fn read_userpass_auth<S>(s: &mut S, creds: &(String, String)) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let ver = s.read_u8().await?;
+    if ver != 0x01 {
+        // RFC 1929 fixes the sub-negotiation version at 0x01.
+        let _ = s.write_all(&[0x01, 0x01]).await; // status = failure
+        bail!("bad RFC1929 auth version ({ver})");
+    }
+    let ulen = s.read_u8().await? as usize;
+    let mut uname = vec![0u8; ulen];
+    s.read_exact(&mut uname).await?;
+    let plen = s.read_u8().await? as usize;
+    let mut passwd = vec![0u8; plen];
+    s.read_exact(&mut passwd).await?;
+
+    let ok = uname.as_slice() == creds.0.as_bytes() && passwd.as_slice() == creds.1.as_bytes();
+    s.write_all(&[0x01, if ok { 0x00 } else { 0x01 }]).await?;
+    if !ok {
+        bail!("SOCKS5 username/password authentication failed");
     }
     Ok(())
 }
@@ -147,7 +212,7 @@ mod tests {
     async fn greeting_accepts_no_auth() {
         let (mut client, mut server) = tokio::io::duplex(64);
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        read_greeting(&mut server).await.unwrap();
+        read_greeting(&mut server, None).await.unwrap();
         let mut reply = [0u8; 2];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply, [0x05, 0x00]);
@@ -158,7 +223,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(64);
         // Only username/password (0x02) offered.
         client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
-        let res = read_greeting(&mut server).await;
+        let res = read_greeting(&mut server, None).await;
         assert!(res.is_err());
         let mut reply = [0u8; 2];
         client.read_exact(&mut reply).await.unwrap();
@@ -208,5 +273,77 @@ mod tests {
         let mut buf = [0u8; 10];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn greeting_prefers_userpass_when_configured() {
+        // Non-loopback policy: auth configured + client offers both 0x02 and
+        // 0x00 → server MUST select 0x02 (prefer auth over the open fallback).
+        let (mut client, mut server) = tokio::io::duplex(128);
+        client.write_all(&[0x05, 0x02, 0x00, 0x02]).await.unwrap();
+        let creds = ("op".to_string(), "s3cret".to_string());
+        // 0x02 selected → server now expects the RFC 1929 frame.
+        client
+            .write_all(&[0x01, 2, b'o', b'p', 6, b's', b'3', b'c', b'r', b'e', b't'])
+            .await
+            .unwrap();
+        read_greeting(&mut server, Some(&creds)).await.unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x05, 0x02]); // method = username/password
+        let mut status = [0u8; 2];
+        client.read_exact(&mut status).await.unwrap();
+        assert_eq!(status, [0x01, 0x00]); // RFC 1929 success
+    }
+
+    #[tokio::test]
+    async fn greeting_userpass_rejects_wrong_creds() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let creds = ("op".to_string(), "s3cret".to_string());
+        // Wrong password.
+        client
+            .write_all(&[0x01, 2, b'o', b'p', 4, b'w', b'r', b'o', b'n'])
+            .await
+            .unwrap();
+        let res = read_greeting(&mut server, Some(&creds)).await;
+        assert!(res.is_err());
+        // Server first writes the method-selection reply [0x05, 0x02], then
+        // the RFC 1929 status frame [0x01, 0x01] (failure). Drain both.
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x02]);
+        let mut status = [0u8; 2];
+        client.read_exact(&mut status).await.unwrap();
+        assert_eq!(status, [0x01, 0x01]); // RFC 1929 failure
+    }
+
+    #[tokio::test]
+    async fn greeting_rejects_noauth_when_configured() {
+        // Auth configured but client only offers 0x00 → must NOT fall back to
+        // NO-AUTH; reply 0xFF (no acceptable method) and close. Falling back
+        // here would open an unauthenticated tunnel through configured creds.
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let creds = ("op".to_string(), "s3cret".to_string());
+        let res = read_greeting(&mut server, Some(&creds)).await;
+        assert!(res.is_err());
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x05, 0xFF]);
+    }
+
+    #[tokio::test]
+    async fn greeting_rejects_when_auth_required_but_only_noauth_offered_without_creds() {
+        // Loopback policy (auth=None): client offers only 0x02 → must reject
+        // with 0xFF (no acceptable method), since 0x00 isn't offered and there
+        // are no configured creds to validate 0x02 anyway.
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let res = read_greeting(&mut server, None).await;
+        assert!(res.is_err());
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x05, 0xFF]);
     }
 }

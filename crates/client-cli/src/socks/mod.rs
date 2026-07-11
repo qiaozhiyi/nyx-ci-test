@@ -57,6 +57,10 @@ pub struct BridgeCtx {
     pub server: String,
     pub token: Option<String>,
     pub session: String,
+    /// SOCKS5 username/password auth (RFC 1929 method 0x02). `Some` when the
+    /// listener is bound non-loopback (forced by `run_socks`) or the operator
+    /// opted in on loopback; `None` → only NO-AUTH (0x00) is accepted.
+    pub socks_auth: Option<(String, String)>,
     pub chans: Mutex<ChanTable>,
     /// connect `task_id` → chan, so a `kind:"error"` row on the connect task
     /// can be correlated back to its chan (channeldata errors surface as
@@ -67,6 +71,21 @@ pub struct BridgeCtx {
     pub max_chan: usize,
     /// Current open-channel count (drives the cap).
     pub active: AtomicUsize,
+    /// Where relay log lines go. The headless bridge uses a closure that
+    /// `eprintln!`s (it owns stderr). The in-TUI relay uses a closure that
+    /// pushes into a shared buffer the TUI worker drains into its `log_buf` —
+    /// because `eprintln!` from the worker thread would corrupt the TUI's
+    /// alternate screen.
+    pub log_sink: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl BridgeCtx {
+    /// Emit one relay log line through the configured sink. Used by `handle_conn`
+    /// and the accept loop so the headless + in-TUI paths share one logging
+    /// mechanism without `eprintln!` leaking onto the TUI's terminal.
+    pub fn log(&self, msg: &str) {
+        (self.log_sink)(msg);
+    }
 }
 
 /// Entry point for the `nyx-cli socks` subcommand. Binds the SOCKS5 listener,
@@ -78,7 +97,19 @@ pub async fn run_socks(
     listen: SocketAddr,
     poll_ms: u64,
     max_chan: usize,
+    socks_auth: Option<(String, String)>,
 ) -> Result<()> {
+    // P0-10: a SOCKS5 listener bound to a non-loopback address with no auth is
+    // an OPEN PROXY. Refuse to start unless RFC 1929 username/password auth is
+    // configured. Loopback binds may run auth-less (local-only, safe).
+    let is_loopback = listen.ip().is_loopback();
+    if !is_loopback && socks_auth.is_none() {
+        anyhow::bail!(
+            "refusing to start an open SOCKS5 proxy on {listen}: a non-loopback bind requires \
+             --socks-user/--socks-pass (RFC 1929 username/password auth). Bind 127.0.0.1 for an \
+             auth-less listener."
+        );
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()?;
@@ -87,6 +118,7 @@ pub async fn run_socks(
         server,
         token,
         session,
+        socks_auth,
         chans: Mutex::new(ChanTable {
             by_chan: HashMap::new(),
             seen_open: HashSet::new(),
@@ -94,6 +126,8 @@ pub async fn run_socks(
         task_to_chan: Mutex::new(HashMap::new()),
         max_chan,
         active: AtomicUsize::new(0),
+        // Headless: relay logs go to stderr (the bridge owns the terminal).
+        log_sink: Arc::new(|msg: &str| eprintln!("{msg}")),
     });
 
     // The poll task is the SOLE /api/results consumer for this session.
@@ -101,33 +135,38 @@ pub async fn run_socks(
     tokio::spawn(async move { poll_loop(poll_ctx, poll_ms).await });
 
     let listener = TcpListener::bind(listen).await?;
-    eprintln!(
-        "[socks] SOCKS5 listener bound on {listen} (session {}, poll {poll_ms}ms, max-chan {max_chan})",
-        session_short(&ctx.session)
-    );
-    eprintln!("[socks] note: relay latency = one beacon sleep cycle per direction; set a low /sleep on the beacon for active use.");
-    eprintln!("[socks] note: implant is IPv4-only — domain/IPv6 targets will fail at connect.");
+    ctx.log(&format!(
+        "[socks] SOCKS5 listener bound on {listen} (session {}, poll {poll_ms}ms, max-chan {max_chan}, auth: {})",
+        session_short(&ctx.session),
+        if ctx.socks_auth.is_some() {
+            "user/pass (RFC 1929)"
+        } else {
+            "none (loopback)"
+        }
+    ));
+    ctx.log("[socks] note: relay latency = one beacon sleep cycle per direction; set a low /sleep on the beacon for active use.");
+    ctx.log("[socks] note: implant is IPv4-only — domain/IPv6 targets will fail at connect.");
 
     loop {
         tokio::select! {
             acc = listener.accept() => match acc {
                 Ok((stream, peer)) => {
-                    eprintln!("[socks] inbound SOCKS5 from {peer}");
+                    ctx.log(&format!("[socks] inbound SOCKS5 from {peer}"));
                     let c = ctx.clone();
                     tokio::spawn(async move { relay::handle_conn(stream, c).await; });
                 }
-                Err(e) => eprintln!("[socks] accept error: {e}"),
+                Err(e) => ctx.log(&format!("[socks] accept error: {e}")),
             },
             _ = tokio::signal::ctrl_c() => {
                 let n = ctx.active.load(Ordering::SeqCst);
-                eprintln!("[socks] Ctrl-C: closing {n} channel(s)…");
+                ctx.log(&format!("[socks] Ctrl-C: closing {n} channel(s)…"));
                 let chans: Vec<u32> = ctx.chans.lock().unwrap().by_chan.keys().copied().collect();
                 for ch in chans {
                     let _ = api::enqueue_channel_close(
                         &ctx.client, &ctx.server, &ctx.session, ch, &ctx.token,
                     ).await;
                 }
-                eprintln!("[socks] bye.");
+                ctx.log("[socks] bye.");
                 return Ok(());
             }
         }
@@ -149,7 +188,7 @@ async fn poll_loop(ctx: Arc<BridgeCtx>, poll_ms: u64) {
                 Err(e) => {
                     // Transient poll failure — don't tear down live channels; the
                     // implant sockets stay open; data resumes when the poll recovers.
-                    eprintln!("[socks] poll error: {e}");
+                    ctx.log(&format!("[socks] poll error: {e}"));
                     continue;
                 }
             };
@@ -159,9 +198,15 @@ async fn poll_loop(ctx: Arc<BridgeCtx>, poll_ms: u64) {
     }
 }
 
-/// Route one drained result row. `try_send` is non-blocking so it's safe to
-/// call under the `chans` lock (held for microseconds, never across an await).
-fn handle_row(ctx: &BridgeCtx, row: ResultView) {
+/// Route one drained result row to its chan's consumer. `try_send` is
+/// non-blocking so it's safe to call under the `chans` lock (held for
+/// microseconds, never across an await).
+///
+/// This is shared by both the headless bridge's `poll_loop` and the in-TUI
+/// SOCKS relay (the TUI worker feeds its drained `kind:"channel"` rows here
+/// instead of running its own `/api/results` consumer — the worker is already
+/// the sole drainer for its session, per the P0-A fix).
+pub(crate) fn handle_row(ctx: &BridgeCtx, row: ResultView) {
     if row.kind == "channel" {
         let Some((chan, status)) = parse_chan_status(&row.text) else {
             return;
@@ -181,16 +226,18 @@ fn handle_row(ctx: &BridgeCtx, row: ResultView) {
                     match row.data_hex.as_deref().map(hex::decode).transpose() {
                         Ok(Some(d)) => {
                             if tx.try_send(ChannelMsg::Data(chan, d)).is_err() {
-                                eprintln!(
+                                ctx.log(&format!(
                                     "[socks] chan {chan}: data backlog full (consumer slow?)"
-                                );
+                                ));
                             }
                         }
                         Ok(None) => {} // empty data row — nothing to ferry
                         Err(e) => {
                             // Never silently corrupt a tunneled stream (mirrors
                             // rest.rs poll_file_chunks' malformed-hex rule).
-                            eprintln!("[socks] chan {chan}: malformed data_hex ({e}) — closing");
+                            ctx.log(&format!(
+                                "[socks] chan {chan}: malformed data_hex ({e}) — closing"
+                            ));
                             let _ = tx.try_send(ChannelMsg::Error(chan));
                             g.by_chan.remove(&chan);
                         }
@@ -218,10 +265,10 @@ fn handle_row(ctx: &BridgeCtx, row: ResultView) {
         if let Some(ch) = chan {
             let tx = ctx.chans.lock().unwrap().by_chan.remove(&ch);
             if let Some(tx) = tx {
-                eprintln!(
+                ctx.log(&format!(
                     "[socks] chan {ch}: connect failed (task {}): {}",
                     row.task_id, row.text
-                );
+                ));
                 let _ = tx.try_send(ChannelMsg::Error(ch));
             }
         }

@@ -57,7 +57,10 @@ const OPEN_DEADLINE: Duration = Duration::from_secs(30);
 /// server must stay robust to malformed clients).
 pub async fn handle_conn(mut stream: TcpStream, ctx: Arc<BridgeCtx>) {
     // ---- handshake ----
-    if handshake::read_greeting(&mut stream).await.is_err() {
+    if handshake::read_greeting(&mut stream, ctx.socks_auth.as_ref())
+        .await
+        .is_err()
+    {
         return;
     }
     let (target, port) = match handshake::read_request(&mut stream).await {
@@ -65,18 +68,18 @@ pub async fn handle_conn(mut stream: TcpStream, ctx: Arc<BridgeCtx>) {
         Err(_) => return, // failure reply already written inside read_request
     };
     if !target.implant_reachable() {
-        eprintln!(
+        ctx.log(&format!(
             "[socks] warning: target {} is not IPv4 — implant is IPv4-only (inet_addr); connect will fail",
             target.to_host()
-        );
+        ));
     }
 
     // ---- cap (client-side headroom under the implant's MAX_CHANNELS=16) ----
     if ctx.active.load(Ordering::Acquire) >= ctx.max_chan {
-        eprintln!(
+        ctx.log(&format!(
             "[socks] rejecting connection: channel cap ({}) reached",
             ctx.max_chan
-        );
+        ));
         let _ = handshake::write_reply_failure(&mut stream, 0x05).await;
         return;
     }
@@ -95,12 +98,14 @@ pub async fn handle_conn(mut stream: TcpStream, ctx: Arc<BridgeCtx>) {
     {
         Ok(x) => x,
         Err(e) => {
-            eprintln!("[socks] connect enqueue to {host}:{port} failed: {e}");
+            ctx.log(&format!(
+                "[socks] connect enqueue to {host}:{port} failed: {e}"
+            ));
             let _ = handshake::write_reply_failure(&mut stream, 0x05).await;
             return;
         }
     };
-    eprintln!("[socks] chan {chan}: opening to {host}:{port}");
+    ctx.log(&format!("[socks] chan {chan}: opening to {host}:{port}"));
 
     // ---- register as the chan's consumer (atomic w/ the poll loop) ----
     let (tx, mut rx) = mpsc::channel::<ChannelMsg>(64);
@@ -121,15 +126,17 @@ pub async fn handle_conn(mut stream: TcpStream, ctx: Arc<BridgeCtx>) {
             Ok(Some(other)) => {
                 // An early Data/Closed/Error before Open means the channel is
                 // already dead (e.g. status:3 from a failed connect).
-                eprintln!("[socks] chan {chan}: got {other:?} before open — failing");
+                ctx.log(&format!(
+                    "[socks] chan {chan}: got {other:?} before open — failing"
+                ));
                 false
             }
             Ok(None) => false, // poll loop dropped our sender (shouldn't happen)
             Err(_) => {
-                eprintln!(
+                ctx.log(&format!(
                     "[socks] chan {chan}: open-confirmation timed out ({:?})",
                     OPEN_DEADLINE
-                );
+                ));
                 false
             }
         }
@@ -144,7 +151,7 @@ pub async fn handle_conn(mut stream: TcpStream, ctx: Arc<BridgeCtx>) {
         cleanup(&ctx, chan).await;
         return;
     }
-    eprintln!("[socks] chan {chan}: open → ferrying");
+    ctx.log(&format!("[socks] chan {chan}: open → ferrying"));
 
     // ---- bidirectional ferry ----
     let (mut r, mut w) = tokio::io::split(stream);
@@ -160,11 +167,11 @@ pub async fn handle_conn(mut stream: TcpStream, ctx: Arc<BridgeCtx>) {
                         }
                     }
                     Some(ChannelMsg::Closed(_)) => {
-                        eprintln!("[socks] chan {chan}: peer closed");
+                        ctx.log(&format!("[socks] chan {chan}: peer closed"));
                         break;
                     }
                     Some(ChannelMsg::Error(_)) => {
-                        eprintln!("[socks] chan {chan}: channel error");
+                        ctx.log(&format!("[socks] chan {chan}: channel error"));
                         break;
                     }
                     Some(ChannelMsg::Open(_)) => {
@@ -178,19 +185,19 @@ pub async fn handle_conn(mut stream: TcpStream, ctx: Arc<BridgeCtx>) {
                 match n {
                     Ok(0) => {
                         // Client closed — tell the implant to tear down its socket.
-                        eprintln!("[socks] chan {chan}: client EOF");
+                        ctx.log(&format!("[socks] chan {chan}: client EOF"));
                         break;
                     }
                     Ok(n) => {
                         if api::enqueue_channel_data(
                             &ctx.client, &ctx.server, &ctx.session, chan, &buf[..n], &ctx.token,
                         ).await.is_err() {
-                            eprintln!("[socks] chan {chan}: channeldata enqueue failed — tearing down");
+                            ctx.log(&format!("[socks] chan {chan}: channeldata enqueue failed — tearing down"));
                             break;
                         }
                     }
                     Err(e) => {
-                        eprintln!("[socks] chan {chan}: socks read error: {e}");
+                        ctx.log(&format!("[socks] chan {chan}: socks read error: {e}"));
                         break;
                     }
                 }

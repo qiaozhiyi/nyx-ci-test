@@ -31,8 +31,8 @@ pub mod msg;
 pub mod wire;
 
 pub use crypto::{
-    open_dir, seal_dir, Direction, ImplantKeypair, ServerKeypair, SessionKey, KEY_LEN, NONCE_LEN,
-    PUBKEY_LEN,
+    open_dir, seal_dir, Direction, GenerateError, ImplantKeypair, ServerKeypair, SessionKey,
+    KEY_LEN, NONCE_LEN, PUBKEY_LEN,
 };
 pub use frame::{
     encode_frame, encode_frame_dir, open_frame, open_frame_dir, parse_frame, RawFrame,
