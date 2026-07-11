@@ -24,7 +24,12 @@
 //! Build version is detected at runtime via RtlGetVersion — NO hardcoded build.
 //! All offsets come from the build table (`for_build`) or pattern scan.
 
-#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+// This CLI is Windows-only; the non-Windows stub main() at the bottom
+// makes `cargo check` pass on macOS/Linux. On Windows, all the kit code
+// compiles but not every kit is reachable from every subcommand, so some
+// imports/code paths are flagged by the compiler. Allow them here rather
+// than cluttering every function with #[allow] attributes.
+#![allow(unused_imports, unreachable_code, dead_code)]
 
 #[cfg(target_os = "windows")]
 fn main() {
