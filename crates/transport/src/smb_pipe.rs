@@ -27,6 +27,7 @@ mod win32 {
     pub const GENERIC_WRITE: u32 = 0x40000000;
     pub const OPEN_EXISTING: u32 = 3;
     pub const ERROR_PIPE_BUSY: u32 = 231;
+    #[allow(dead_code)] // reserved for future WaitNamedPipe integration
     pub const NMPWAIT_USE_DEFAULT_WAIT: u32 = 0;
 
     extern "system" {
@@ -226,7 +227,7 @@ impl SmbPipeTransport {
             // Returns 0 on timeout or error.
             let wait_result = unsafe { WaitNamedPipeW(wide.as_ptr(), ms) };
             if wait_result == 0 {
-                let err = unsafe { GetLastError() };
+                let _err = unsafe { GetLastError() };
                 return Err(TransportError::Transient("smb-pipe: pipe not available"));
             }
         }
