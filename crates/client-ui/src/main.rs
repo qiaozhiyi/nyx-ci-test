@@ -637,7 +637,7 @@ script_mod! {
                                 // Server URL — host + port merged into one field.
                                 View{
                                     width: Fill height: Fit flow: Down spacing: 1.0
-                                    url_label := Label{text: "Server URL" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 10}}
+                                    url_label := Label{text: "Server URL *" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 10}}
                                     url_input := TextInput{
                                         width: Fill height: 28
                                         label_align: Align{y: 0.5}
@@ -674,12 +674,13 @@ script_mod! {
                                 }
                                 View{
                                     width: Fill height: Fit flow: Down spacing: 1.0
-                                    alias_label := Label{text: "Operator" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 10}}
+                                    alias_label := Label{text: "Operator *" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 10}}
                                     alias_input := TextInput{
                                         width: Fill height: 28
                                         label_align: Align{y: 0.5}
                                         padding: Inset{left: 12.0, right: 12.0, top: 4.0, bottom: 4.0}
                                         text: "operator"
+                                        empty_text: "operator alias"
                                         draw_bg.color: Cinput
                                         draw_bg.color_hover: Cinput
                                         draw_bg.color_focus: Cinput
@@ -710,7 +711,7 @@ script_mod! {
                                 }
                                 View{
                                     width: Fill height: Fit flow: Down spacing: 1.0
-                                    pass_label := Label{text: "Password (API Token)" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 10}}
+                                    pass_label := Label{text: "Password (API Token) *" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 10}}
                                     pass_input := TextInput{
                                         is_password: true
                                         width: Fill height: 28
