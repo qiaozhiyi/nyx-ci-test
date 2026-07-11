@@ -40,6 +40,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # MSVC LNK1318 PDB LIMIT on Windows when 4 parallel jobs each write ~4GB
+  # PDBs to the same target dir. split-debuginfo=off avoids full PDBs.
+  CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
+  CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
 
 jobs:
   # ---- Gate 1: fmt (fastest, fail early) ----

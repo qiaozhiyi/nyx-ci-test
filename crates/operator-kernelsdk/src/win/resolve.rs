@@ -24,6 +24,7 @@ type LoadLibraryAFn = unsafe extern "system" fn(*const u8) -> *mut c_void;
 extern "system" {
     fn GetModuleHandleA(lpModuleName: *const u8) -> *mut c_void;
     fn GetProcAddress(hModule: *mut c_void, lpProcName: *const u8) -> *mut c_void;
+    #[allow(dead_code)] // retained for future on-demand DLL loading
     fn LoadLibraryA(lpLibFileName: *const u8) -> *mut c_void;
 }
 

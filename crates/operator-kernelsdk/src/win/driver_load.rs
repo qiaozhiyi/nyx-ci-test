@@ -104,7 +104,7 @@ impl LoadedDriver {
             .encode_utf16()
             .chain(core::iter::once(0))
             .collect();
-        let mut reg_path: Vec<u16> = prefix[..prefix.len() - 1] // drop the null for concat
+        let reg_path: Vec<u16> = prefix[..prefix.len() - 1] // drop the null for concat
             .iter()
             .chain(svc_name.iter())
             .chain(core::iter::once(&0u16))
