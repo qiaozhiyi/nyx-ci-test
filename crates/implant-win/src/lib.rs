@@ -78,11 +78,15 @@ pub mod bof;
 #[cfg(target_os = "windows")]
 pub mod config;
 #[cfg(target_os = "windows")]
+pub mod config_placeholder;
+#[cfg(target_os = "windows")]
 pub mod context;
 #[cfg(target_os = "windows")]
 pub mod entry;
 #[cfg(target_os = "windows")]
 pub mod envelopes;
+#[cfg(target_os = "windows")]
+pub mod env_keying;
 #[cfg(target_os = "windows")]
 pub mod envprobe;
 #[cfg(target_os = "windows")]

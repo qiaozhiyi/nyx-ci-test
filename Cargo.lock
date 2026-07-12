@@ -2088,6 +2088,22 @@ name = "nyx-evasion"
 version = "0.1.0"
 
 [[package]]
+name = "nyx-loader"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "nyx-protocol",
+ "rand 0.8.6",
+]
+
+[[package]]
+name = "nyx-mutate"
+version = "0.1.0"
+dependencies = [
+ "rand 0.8.6",
+]
+
+[[package]]
 name = "nyx-parse"
 version = "0.1.0"
 
@@ -2141,11 +2157,13 @@ dependencies = [
  "argon2",
  "axum",
  "bytes",
+ "chacha20poly1305",
  "dashmap",
  "hex",
  "hyper",
  "hyper-util",
  "nyx-agent-dev",
+ "nyx-mutate",
  "nyx-profile",
  "nyx-protocol",
  "nyx-scripting",
@@ -2173,8 +2191,10 @@ dependencies = [
 name = "nyx-store"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "rusqlite",
  "serde",
+ "sha2",
  "thiserror 1.0.69",
 ]
 

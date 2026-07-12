@@ -18,6 +18,8 @@ members = [
     "crates/bof-runner",
     "crates/client-ui",
     "crates/scripting-rhai",
+    "crates/nyx-loader",
+    "crates/nyx-mutate",
 ]
 # NOTE: `crates/pe` is excluded — it's a dead crate (zero dependents, zero code
 # references; its sole public fn `resolve_export` is used only by its own tests).
@@ -54,6 +56,8 @@ nyx-coff = { path = "crates/coff" }
 nyx-transport = { path = "crates/transport" }
 nyx-bof-runner = { path = "crates/bof-runner" }
 nyx-scripting-rhai = { path = "crates/scripting-rhai" }
+nyx-loader = { path = "crates/nyx-loader" }
+nyx-mutate = { path = "crates/nyx-mutate" }
 # proc-macro toolchain (compile-time config embedding)
 syn = { version = "2", features = ["full"] }
 quote = "1"

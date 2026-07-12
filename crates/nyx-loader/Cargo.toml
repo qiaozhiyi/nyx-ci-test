@@ -1,0 +1,20 @@
+[package]
+name = "nyx-loader"
+version = "0.1.0"
+edition = "2021"
+description = "Nyx PIC reflective loader stub — decrypts and reflectively loads a PE DLL from shellcode"
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+nyx-protocol = { path = "../protocol", default-features = false }
+# Direct crypto deps needed for payload encryption (nyx-protocol re-exports
+# aead_decrypt but not a standalone aead_encrypt — seal_dir requires SessionKey +
+# Direction ceremony that is overkill for simple payload wrapping).
+chacha20poly1305 = { workspace = true, features = ["alloc"] }
+rand = { workspace = true, features = ["std", "std_rng"] }
+
+[features]
+default = ["std"]
+std = ["nyx-protocol/std", "chacha20poly1305/std"]

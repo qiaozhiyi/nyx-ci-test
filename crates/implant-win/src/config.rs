@@ -21,6 +21,10 @@ use nyx_protocol::wire::{Reader, WireError}; // WireError kept for decode()'s Re
 /// Build config baked into the implant at build time. The `server_pub` is baked
 /// separately by `build.rs` (into `server_pub::SERVER_PUB`); it lives here so
 /// the beacon loop has one place to read the full transport+session config.
+///
+/// For per-implant (server-patched) configs, additional fields (auth_token,
+/// features_bitmap, keying_levels, expires_at) are provided by
+/// [`crate::config_placeholder::ImplantConfig`].
 pub struct Config {
     pub server_host: String,
     pub server_port: u16,

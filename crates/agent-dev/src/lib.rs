@@ -60,6 +60,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         arch: arch_code(),
         pid: std::process::id(),
         is_admin: is_admin(),
+        auth_token: None, // dev agent has no per-implant token
     };
 
     // Beacon endpoint: `/beacon`, or the profile's http-post URI when malleable.

@@ -304,6 +304,15 @@ impl ImplantKeypair {
         Ok(Self { secret, public })
     }
 
+    /// Reconstruct an implant keypair from a raw 32-byte secret (e.g. from
+    /// a per-implant config baked at generation time).
+    pub fn from_secret_bytes(mut bytes: [u8; KEY_LEN]) -> Self {
+        let secret = StaticSecret::from(bytes);
+        bytes.zeroize();
+        let public = PublicKey::from(&secret);
+        Self { secret, public }
+    }
+
     pub fn public_bytes(&self) -> [u8; PUBKEY_LEN] {
         self.public.to_bytes()
     }
@@ -457,4 +466,55 @@ pub fn open(
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, chacha20poly1305::Error> {
     open_dir(key, Direction::ClientToServer, counter, aad, ciphertext)
+}
+
+// ── Per-implant config crypto helpers ──────────────────────────────────────
+// These are used by the implant's config_placeholder.rs to derive the per-implant
+// config decryption key and decrypt the runtime config blob. They operate on raw
+// byte arrays (no SessionKey wrapper) because the config key is a separate key
+// domain from session keys.
+
+/// Derive the X25519 public key from a raw 32-byte secret.
+pub fn public_from_secret(secret: &[u8; 32]) -> Option<[u8; 32]> {
+    let bytes: [u8; 32] = *secret;
+    let scalar = x25519_dalek::StaticSecret::from(bytes);
+    let pubkey = x25519_dalek::PublicKey::from(&scalar);
+    Some(*pubkey.as_bytes())
+}
+
+/// Raw X25519 ECDH: compute `our_secret × their_public`. Returns the 32-byte
+/// shared secret (the x-coordinate of the result point). Returns `None` if the
+/// public key is a low-order point (zero-scalar guard).
+pub fn ecdh(our_secret: &[u8; 32], their_public: &[u8; 32]) -> Option<[u8; 32]> {
+    let scalar = x25519_dalek::StaticSecret::from(*our_secret);
+    let pubkey = x25519_dalek::PublicKey::from(*their_public);
+    // Zero-scalar check: if the scalar is all zeros, reject.
+    if *our_secret == [0u8; 32] {
+        return None;
+    }
+    let shared = scalar.diffie_hellman(&pubkey);
+    Some(*shared.as_bytes())
+}
+
+/// HKDF-SHA256: extract-then-expand. `salt` and `info` are passed as-is (RFC
+/// 5869). `okm` receives the output key material; its length determines the
+/// HKDF output length (must be ≤ 255 × 32 = 8160 bytes).
+pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], okm: &mut [u8]) {
+    let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
+    hk.expand(info, okm)
+        .expect("HKDF expand length ≤ 255 × HashLen; okm is well within that");
+}
+
+/// ChaCha20-Poly1305 AEAD decrypt. `key` is the raw 32-byte key, `nonce` is
+/// 12 bytes, `ct_with_tag` is ciphertext || 16-byte Poly1305 tag. AAD is empty
+/// (the config blob is self-authenticating via the tag).
+/// Returns `None` on tag mismatch.
+pub fn aead_decrypt(key: &[u8; 32], nonce: &[u8; 12], ct_with_tag: &[u8]) -> Option<Vec<u8>> {
+    use chacha20poly1305::aead::KeyInit;
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
+    let nonce = Nonce::from_slice(nonce);
+    cipher
+        .decrypt(nonce, ct_with_tag)
+        .ok()
 }

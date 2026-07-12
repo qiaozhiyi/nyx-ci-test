@@ -11,6 +11,7 @@ fn sample_info() -> msg::SessionInfo {
         arch: 0,
         pid: 4812,
         is_admin: 1,
+        auth_token: None,
     }
 }
 

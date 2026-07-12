@@ -9,8 +9,10 @@
 //! clients agree on one shape (killing the prior triplicate cred-model drift —
 //! see `nyx-rest`'s `SessionView` for the same pattern).
 
+pub mod implant_store;
 pub mod model;
 pub mod store;
 
+pub use implant_store::{ImplantRecord, ImplantStore, ImplantStoreError};
 pub use model::{mask_secret, CredKind, CredRecord};
 pub use store::{CredStore, StoreError};

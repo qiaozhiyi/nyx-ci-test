@@ -151,6 +151,7 @@ fn valid_checkin_frame(server_pub: &[u8; 32]) -> (Vec<u8>, [u8; 32]) {
         arch: 0,
         pid: 1,
         is_admin: 0,
+        auth_token: None,
     }
     .encode(&mut w)
     .expect("test SessionInfo fields are tiny literals << MAX_BLOB_LEN");

@@ -377,6 +377,23 @@ pub enum Cmd {
         session: String,
         channel: u8,
     },
+    /// Generate a per-implant binary (POST /api/generate-implant).
+    GenerateImplant {
+        callback: String,
+        port: u16,
+        format: String,
+        uri: String,
+        sleep: u32,
+        jitter: u8,
+        tls: bool,
+        features: u32,
+    },
+    /// List all generated implants (GET /api/implants).
+    FetchImplants,
+    /// Revoke an implant by pubkey (POST /api/implant/revoke).
+    RevokeImplant {
+        implant_pub: String,
+    },
     Shutdown,
 }
 
@@ -1952,6 +1969,124 @@ async fn worker_loop(
                             }
                         },
                         Err(e) => log_push(&mut log_buf, &format!("! detach-mf: {e}"), Level::Err),
+                    }
+                }
+                // ── Implant generation ──────────────────────────────────
+                Cmd::GenerateImplant {
+                    ref callback,
+                    port,
+                    ref format,
+                    ref uri,
+                    sleep,
+                    jitter,
+                    tls,
+                    features,
+                } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        continue;
+                    };
+                    let body = serde_json::json!({
+                        "callback": callback,
+                        "port": port,
+                        "format": format,
+                        "uri": uri,
+                        "sleep": sleep,
+                        "jitter": jitter,
+                        "tls": tls,
+                        "features": features,
+                    });
+                    match authed(
+                        client.post(format!("{srv}/api/generate-implant")).json(&body),
+                        tok,
+                    )
+                    .send()
+                    .await
+                    {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => {
+                                let sha = v["sha256"].as_str().unwrap_or("?");
+                                let pk = v["implant_pub"].as_str().unwrap_or("?");
+                                log_push(
+                                    &mut log_buf,
+                                    &format!("implant generated: pub={pk} sha256={sha}"),
+                                    Level::Info,
+                                );
+                                log_push(
+                                    &mut log_buf,
+                                    &format!("  response: {v}"),
+                                    Level::Info,
+                                );
+                            }
+                            Err(e) => log_push(
+                                &mut log_buf,
+                                &format!("! generate-implant: {e}"),
+                                Level::Err,
+                            ),
+                        },
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! generate-implant: {e}"), Level::Err)
+                        }
+                    }
+                }
+                Cmd::FetchImplants => {
+                    let Some((ref srv, ref tok)) = server else {
+                        continue;
+                    };
+                    match authed(client.get(format!("{srv}/api/implants")), tok)
+                        .send()
+                        .await
+                    {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => {
+                                if let Some(implants) = v["implants"].as_array() {
+                                    for imp in implants {
+                                        let pk = imp["implant_pub"].as_str().unwrap_or("?");
+                                        let cb = imp["callback_host"].as_str().unwrap_or("?");
+                                        let used = imp["auth_token_used"].as_bool().unwrap_or(false);
+                                        let rev = imp["revoked"].as_bool().unwrap_or(false);
+                                        log_push(
+                                            &mut log_buf,
+                                            &format!("implant {pk} → {cb}  used={used} revoked={rev}"),
+                                            Level::Info,
+                                        );
+                                    }
+                                }
+                                log_push(
+                                    &mut log_buf,
+                                    &format!("{} implants total", v["implants"].as_array().map(|a| a.len()).unwrap_or(0)),
+                                    Level::Info,
+                                );
+                            }
+                            Err(e) => {
+                                log_push(&mut log_buf, &format!("! implants: {e}"), Level::Err)
+                            }
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! implants: {e}"), Level::Err),
+                    }
+                }
+                Cmd::RevokeImplant { ref implant_pub } => {
+                    let Some((ref srv, ref tok)) = server else {
+                        continue;
+                    };
+                    let body = serde_json::json!({"implant_pub": implant_pub});
+                    match authed(
+                        client.post(format!("{srv}/api/implant/revoke")).json(&body),
+                        tok,
+                    )
+                    .send()
+                    .await
+                    {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => log_push(
+                                &mut log_buf,
+                                &format!("revoke {implant_pub}: {v}"),
+                                Level::Info,
+                            ),
+                            Err(e) => {
+                                log_push(&mut log_buf, &format!("! revoke: {e}"), Level::Err)
+                            }
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! revoke: {e}"), Level::Err),
                     }
                 }
             }

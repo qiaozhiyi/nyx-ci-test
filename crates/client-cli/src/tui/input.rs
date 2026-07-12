@@ -363,6 +363,25 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
         help: "T-REX target recon (noise-graded EDR detection)",
         icon: "🦖",
     },
+    // ── Implant generation ───────────────────────────────────────────────
+    MetaCmd {
+        name: "/generate",
+        args_hint: "<callback> [port] [--sleep N] [--jitter N] [--tls/--no-tls] [--format dll|shellcode]",
+        help: "generate a per-implant binary with unique keypair + auth token",
+        icon: "⚙",
+    },
+    MetaCmd {
+        name: "/implants",
+        args_hint: "",
+        help: "list all generated implants",
+        icon: "☰",
+    },
+    MetaCmd {
+        name: "/revoke",
+        args_hint: "<implant_pub>",
+        help: "revoke a generated implant",
+        icon: "✕",
+    },
     MetaCmd {
         name: "/help",
         args_hint: "",
