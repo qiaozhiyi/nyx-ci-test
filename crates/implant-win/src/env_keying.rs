@@ -20,9 +20,20 @@
 //!
 //! Layers are applied in numeric order (Username → SID → Network → Temporal).
 //! If env data cannot be read (PEB walk fails), that layer is **skipped gracefully**
-//! — the key is still well-defined, just bound to fewer env factors. The server
-//! must apply the exact same set of layers (with the same env data) during implant
-//! generation; otherwise the AEAD tag won't validate and decryption fails.
+//! — the key is still well-defined, just bound to fewer env factors.
+//!
+//! ## Runtime-only lock — NOT mirrored by the server
+//!
+//! These layers are a **pure runtime lock**: they mix in data only the target
+//! machine knows at execution time (most critically the Temporal layer, which
+//! includes `GetTickCount64` — a transient value no server can predict at
+//! generation time). The server therefore **cannot** apply these layers when
+//! encrypting the config, and so the generation endpoint rejects any non-zero
+//! `keying` value with HTTP 400. Shipping an implant with `keying != 0` would
+//! produce a beacon that can never decrypt its own config — a guaranteed dead
+//! implant. Enabling env-keying requires a generation-side mechanism that does
+//! not yet exist (e.g. operator-supplied static target factors); until then,
+//! `keying_levels` stays 0 for all server-generated implants.
 
 #![cfg(target_os = "windows")]
 

