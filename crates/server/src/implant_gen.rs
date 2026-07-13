@@ -10,14 +10,14 @@
 //!    section (magic `0x41414141`, 1024 bytes of `0xAA`).
 //! 2. The server loads this template at startup (`NYX_TEMPLATE`).
 //! 3. On generation:
-//!    a. Generate a random 32-byte implant_priv (X25519 private key)
-//!    b. Derive implant_pub from implant_priv
-//!    c. Derive config_key via ECDH(implant_priv, server_pub) + HKDF
-//!       (matching the implant's derive_config_key)
-//!    d. Encrypt config with config_key, store ciphertext+tag
-//!    e. Store implant_priv + server_pub + ciphertext in `.nyx_cfg`
-//!    f. Store implant metadata in DB
-//!    g. Return the patched binary
+//!    - Generate a random 32-byte implant_priv (X25519 private key)
+//!    - Derive implant_pub from implant_priv
+//!    - Derive config_key via ECDH(implant_priv, server_pub) + HKDF
+//!      (matching the implant's derive_config_key)
+//!    - Encrypt config with config_key, store ciphertext+tag
+//!    - Store implant_priv + server_pub + ciphertext in `.nyx_cfg`
+//!    - Store implant metadata in DB
+//!    - Return the patched binary
 //!
 //! ## Key storage
 //!

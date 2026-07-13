@@ -204,20 +204,20 @@ fn insert_nops(data: &mut Vec<u8>, seed: u64) -> usize {
 ///
 /// The register encoding in ModRM.reg and ModRM.rm fields (bits 5:3 and 2:0):
 ///   r8=0, r9=1, r10=2, r11=3, r12=4, r13=5, r14=6, r15=7  (with REX.B or REX.R)
-fn rotate_registers(data: &mut Vec<u8>, seed: u64) -> usize {
+fn rotate_registers(data: &mut [u8], seed: u64) -> usize {
     let mut rng = StdRng::seed_from_u64(seed);
 
     // Build a "safe zone" map: bytes within 32 bytes of a call (0xE8) are
     // excluded from register rotation to avoid ABI breakage.
     let len = data.len();
     let mut near_call = vec![false; len];
-    for i in 0..len {
-        if data[i] == 0xE8 || data[i] == 0xFF {
+    for (i, &byte) in data.iter().enumerate() {
+        if byte == 0xE8 || byte == 0xFF {
             // 0xE8 = call rel32, 0xFF /2 = call r/m (indirect)
             let start = i.saturating_sub(32);
             let end = (i + 32).min(len);
-            for j in start..end {
-                near_call[j] = true;
+            for nc in &mut near_call[start..end] {
+                *nc = true;
             }
         }
     }
@@ -295,15 +295,11 @@ fn rotate_registers(data: &mut Vec<u8>, seed: u64) -> usize {
 
             // Skip displacement bytes.
             match mod_field {
-                0x01 => {
-                    if i < len {
-                        i += 1;
-                    }
+                0x01 if i < len => {
+                    i += 1;
                 }
-                0x02 => {
-                    if i + 4 <= len {
-                        i += 4;
-                    }
+                0x02 if i + 4 <= len => {
+                    i += 4;
                 }
                 _ => {}
             }
@@ -425,7 +421,7 @@ fn randomize_keys(data: &mut Vec<u8>, seed: u64) -> usize {
     }
 
     // Pad to 4-byte alignment for well-formed PE.
-    while data.len() % 4 != 0 {
+    while !data.len().is_multiple_of(4) {
         data.push(0);
     }
 

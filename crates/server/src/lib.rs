@@ -320,9 +320,9 @@ pub fn spawn_session_gc(state: Arc<AppState>) {
                 .filter_map(|entry| {
                     let age = now.duration_since(entry.value().created).as_secs();
                     let idle = now.duration_since(entry.value().last_seen).as_secs();
-                    if age > max_age {
-                        Some(*entry.key())
-                    } else if idle > max_idle && entry.value().pending.is_empty() {
+                    let too_old = age > max_age;
+                    let too_idle = idle > max_idle && entry.value().pending.is_empty();
+                    if too_old || too_idle {
                         Some(*entry.key())
                     } else {
                         None
