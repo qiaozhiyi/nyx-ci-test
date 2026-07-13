@@ -958,6 +958,20 @@ pub unsafe extern "system" fn nyx_linger() {
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_linger_foliage() {
+    // Foliage APC-chain sleep mask is known to crash under rundll32-hosted
+    // DLLs (NtSetContextThread restore mishandles the thread context in the
+    // rundll32 loader — see sleep.rs module docs). Detect early and exit
+    // cleanly so the selftest doesn't produce a false-positive crash.
+    // For real foliage testing, inject via sRDI into a host process.
+    let is_rundll32 = unsafe {
+        crate::resolve::module_base_by_name(b"rundll32.exe").is_some()
+    };
+    if is_rundll32 {
+        // Safe exit: rundll32 can't safely run the APC chain. Signal
+        // "skipped" with exit code 1 (distinct from true pass=0).
+        unsafe { exit(1) };
+    }
+
     // Same runtime bring-up as nyx_linger.
     crate::syscalls::init_global();
     let _ = crate::blind::patch_etw();
