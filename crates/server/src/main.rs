@@ -123,7 +123,10 @@ async fn main() -> anyhow::Result<()> {
     // 0.0.0.0, so a fresh `nyx-server` with no config is only reachable from
     // the local host. Binding the wider network requires an explicit
     // NYX_BIND=0.0.0.0:8443 — and that triggers the auth check below.
-    let addr = std::env::var("NYX_BIND").unwrap_or_else(|_| "127.0.0.1:8443".to_string());
+    let addr = std::env::var("NYX_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:8443".to_string())
+        .trim()
+        .to_string();
 
     // P0-2 (CRIT-1): a non-loopback bind with NO auth (empty operator registry
     // AND no NYX_TOKEN) is an OPEN team server on the network — anyone who can
@@ -260,6 +263,13 @@ async fn main() -> anyhow::Result<()> {
     let pubkey = hex::encode(state.keypair.public_bytes());
 
     let app = router(state.clone());
+    // Port-in-use guard: a quick std bind-then-drop detects stale instances
+    // before the real tokio listener. Gives a clear error instead of the
+    // opaque "os error 10048".
+    if let Err(e) = std::net::TcpListener::bind(addr.trim()) {
+        anyhow::bail!("port {addr} is already in use ({e}); stop the previous server instance first");
+    }
+
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     // HTTPS (NYX_TLS): peek the ClientHello before rustls consumes the stream,
