@@ -191,13 +191,20 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("invalid DLL template {path}: {e}"))?;
             // Sanity: a real DLL is at least a few KiB (PE header + sections).
             if bytes.len() < 4096 {
-                anyhow::bail!("DLL template {path} is too small ({len} bytes) — not a valid PE DLL", len = bytes.len());
+                anyhow::bail!(
+                    "DLL template {path} is too small ({len} bytes) — not a valid PE DLL",
+                    len = bytes.len()
+                );
             }
             // Verify the .nyx_cfg section exists (look for 0xAA*1024 pattern).
-            let has_nyx_cfg = bytes
-                .windows(8)
-                .any(|w| w[0] == 0x41 && w[1] == 0x41 && w[2] == 0x41 && w[3] == 0x41
-                      && w[4] == 0xAA && w[5] == 0xAA);
+            let has_nyx_cfg = bytes.windows(8).any(|w| {
+                w[0] == 0x41
+                    && w[1] == 0x41
+                    && w[2] == 0x41
+                    && w[3] == 0x41
+                    && w[4] == 0xAA
+                    && w[5] == 0xAA
+            });
             if !has_nyx_cfg {
                 tracing::warn!(
                     "DLL template {path}: .nyx_cfg section with 0x41414141 magic + 0xAA padding not found; \
@@ -267,7 +274,9 @@ async fn main() -> anyhow::Result<()> {
     // before the real tokio listener. Gives a clear error instead of the
     // opaque "os error 10048".
     if let Err(e) = std::net::TcpListener::bind(addr.trim()) {
-        anyhow::bail!("port {addr} is already in use ({e}); stop the previous server instance first");
+        anyhow::bail!(
+            "port {addr} is already in use ({e}); stop the previous server instance first"
+        );
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

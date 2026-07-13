@@ -48,12 +48,10 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use rand::RngCore;
-use stub::{PIC_STUB, NYX2_MAGIC};
+use stub::{NYX2_MAGIC, PIC_STUB};
 
 // Re-export key constants for callers that need to reason about offsets.
-pub use stub::{
-    CIPHERTEXT_OFFSET, ENCRYPTED_LEN_OFFSET, NONCE_OFFSET, PIC_STUB_LEN, TAG_LEN,
-};
+pub use stub::{CIPHERTEXT_OFFSET, ENCRYPTED_LEN_OFFSET, NONCE_OFFSET, PIC_STUB_LEN, TAG_LEN};
 
 // ── LoaderConfig ────────────────────────────────────────────────────────
 
@@ -140,9 +138,7 @@ pub fn wrap_payload(dll_bytes: &[u8], config: &LoaderConfig) -> Vec<u8> {
     let encrypted_len = dll_bytes.len() as u32;
 
     // 2. Assemble: stub + NYX2 header + ciphertext (includes tag)
-    let mut payload = Vec::with_capacity(
-        PIC_STUB.len() + 4 + 4 + 12 + ciphertext.len(),
-    );
+    let mut payload = Vec::with_capacity(PIC_STUB.len() + 4 + 4 + 12 + ciphertext.len());
 
     // Stub
     payload.extend_from_slice(PIC_STUB);
@@ -207,15 +203,11 @@ mod tests {
         assert_eq!(&payload[0..50], PIC_STUB);
 
         // Check NYX2 magic at offset 50
-        let magic = u32::from_le_bytes(
-            payload[50..54].try_into().unwrap(),
-        );
+        let magic = u32::from_le_bytes(payload[50..54].try_into().unwrap());
         assert_eq!(magic, NYX2_MAGIC);
 
         // Check encrypted_len at offset 54
-        let enc_len = u32::from_le_bytes(
-            payload[54..58].try_into().unwrap(),
-        );
+        let enc_len = u32::from_le_bytes(payload[54..58].try_into().unwrap());
         assert_eq!(enc_len, dll.len() as u32);
 
         // Check nonce at offset 58
@@ -252,13 +244,12 @@ mod tests {
         let nonce = Nonce::from_slice(&config.nonce);
 
         // Read encrypted_len from the payload header
-        let enc_len = u32::from_le_bytes(
-            payload[54..58].try_into().unwrap(),
-        ) as usize;
+        let enc_len = u32::from_le_bytes(payload[54..58].try_into().unwrap()) as usize;
 
         // ciphertext + tag starts at offset 70
         let ct_with_tag = &payload[70..70 + enc_len + 16];
-        let decrypted = cipher.decrypt(nonce, ct_with_tag)
+        let decrypted = cipher
+            .decrypt(nonce, ct_with_tag)
             .expect("decrypt should succeed with correct key/nonce");
 
         assert_eq!(decrypted, dll);

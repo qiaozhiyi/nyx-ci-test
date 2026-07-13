@@ -366,7 +366,8 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
     // ── Implant generation ───────────────────────────────────────────────
     MetaCmd {
         name: "/generate",
-        args_hint: "<callback> [port] [--sleep N] [--jitter N] [--tls/--no-tls] [--format dll|shellcode]",
+        args_hint:
+            "<callback> [port] [--sleep N] [--jitter N] [--tls/--no-tls] [--format dll|shellcode]",
         help: "generate a per-implant binary with unique keypair + auth token",
         icon: "⚙",
     },

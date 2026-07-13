@@ -87,13 +87,13 @@ impl Mutator {
 /// Variants of NOP-equivalent instructions we insert. Each variant is a
 /// different length, producing diverse sleds.
 const NOP_VARIANTS: &[&[u8]] = &[
-    &[0x90],                         // 1B: true NOP
-    &[0x66, 0x90],                   // 2B: operand-size override NOP
-    &[0x0F, 0x1F, 0x00],            // 3B: multi-byte NOP
-    &[0x0F, 0x1F, 0x40, 0x00],      // 4B: multi-byte NOP
-    &[0x0F, 0x1F, 0x44, 0x00, 0x00], // 5B: multi-byte NOP
-    &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00], // 6B
-    &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00], // 7B
+    &[0x90],                                           // 1B: true NOP
+    &[0x66, 0x90],                                     // 2B: operand-size override NOP
+    &[0x0F, 0x1F, 0x00],                               // 3B: multi-byte NOP
+    &[0x0F, 0x1F, 0x40, 0x00],                         // 4B: multi-byte NOP
+    &[0x0F, 0x1F, 0x44, 0x00, 0x00],                   // 5B: multi-byte NOP
+    &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],             // 6B
+    &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],       // 7B
     &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00], // 8B
 ];
 
@@ -104,7 +104,7 @@ fn is_instruction_boundary(byte: u8) -> bool {
         0xC3 |        // ret (near)
         0xC2 |        // ret imm16
         0xCB |        // ret far
-        0xCA          // retf imm16
+        0xCA // retf imm16
     )
 }
 
@@ -250,8 +250,8 @@ fn rotate_registers(data: &mut Vec<u8>, seed: u64) -> usize {
             let rex = data[i];
             let rex_r = (rex & 0x04) != 0; // REX.R extends ModRM.reg
             let rex_b = (rex & 0x01) != 0; // REX.B extends ModRM.rm
-            // REX.X (bit 1) extends SIB.index — we skip SIB-index manipulation
-            // to stay conservative.
+                                           // REX.X (bit 1) extends SIB.index — we skip SIB-index manipulation
+                                           // to stay conservative.
 
             let modrm = data[i + 1];
             let modrm_reg = (modrm >> 3) & 0x07;
@@ -437,9 +437,12 @@ fn randomize_keys(data: &mut Vec<u8>, seed: u64) -> usize {
 /// Find the .nyx_cfg section by scanning for the 0xDEADBEEF magic.
 fn find_nyx_cfg(data: &[u8]) -> Option<usize> {
     let magic_bytes = NYX_CFG_MAGIC.to_le_bytes();
-    data.windows(4)
-        .position(|w| w[0] == magic_bytes[0] && w[1] == magic_bytes[1]
-                  && w[2] == magic_bytes[2] && w[3] == magic_bytes[3])
+    data.windows(4).position(|w| {
+        w[0] == magic_bytes[0]
+            && w[1] == magic_bytes[1]
+            && w[2] == magic_bytes[2]
+            && w[3] == magic_bytes[3]
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -490,9 +493,9 @@ mod tests {
         // 0x48 = REX.W, 0xC1 = ModRM (mod=11, reg=r8, rm=r9)
         let input = vec![
             0x48, 0xC1, // REX.W + ModRM r8/rm9 → should swap to r9/rm8
-            0x90,        // NOP spacer
+            0x90, // NOP spacer
             0x49, 0xD0, // REX.W+R.B + ModRM (reg=r11, rm=r12? let's use known encoding)
-            0xC3,        // ret
+            0xC3, // ret
         ];
         let mut a = input.clone();
         let mut b = input.clone();
@@ -553,7 +556,7 @@ mod tests {
         // .nyx_cfg section area (with magic, then implant_priv, etc.)
         bin.extend_from_slice(&NYX_CFG_MAGIC.to_le_bytes()); // magic at offset 0
         bin.extend_from_slice(&[0x10, 0x00]); // data_len = 16
-        // implant_priv (32 bytes of high-entropy)
+                                              // implant_priv (32 bytes of high-entropy)
         for _ in 0..32 {
             bin.push(rng.gen());
         }
@@ -574,14 +577,18 @@ mod tests {
 
         let count = randomize_keys(&mut bin, 7777);
         // Should have randomized at least one key and appended the tail.
-        assert!(count > 0, "should find and randomize at least one high-entropy block");
+        assert!(
+            count > 0,
+            "should find and randomize at least one high-entropy block"
+        );
 
         // Check the tail magic is present at the end.
         let magic_bytes = MUT_TAIL_MAGIC.to_le_bytes();
-        let tail_pos = bin
-            .windows(4)
-            .rposition(|w| w == magic_bytes);
-        assert!(tail_pos.is_some(), "mut tail magic must be present after key randomization");
+        let tail_pos = bin.windows(4).rposition(|w| w == magic_bytes);
+        assert!(
+            tail_pos.is_some(),
+            "mut tail magic must be present after key randomization"
+        );
     }
 
     #[test]
@@ -593,9 +600,10 @@ mod tests {
             bin.push(0x90); // NOPs
         }
         bin.push(0xC3); // ret
-        // .nyx_cfg section
+                        // .nyx_cfg section
         bin.extend_from_slice(&NYX_CFG_MAGIC.to_le_bytes());
-        bin.push(0x10); bin.push(0x00); // data_len
+        bin.push(0x10);
+        bin.push(0x00); // data_len
         for _ in 0..32 {
             bin.push(rng.gen::<u8>()); // implant_priv
         }
@@ -624,6 +632,9 @@ mod tests {
         let m = Mutator::new(42);
         let report = m.mutate(&mut bin, MutationPasses::default());
         // nops_inserted should be non-zero (lots of rets, 50% probability).
-        assert!(report.nops_inserted > 0, "NOPs should be inserted after rets");
+        assert!(
+            report.nops_inserted > 0,
+            "NOPs should be inserted after rets"
+        );
     }
 }

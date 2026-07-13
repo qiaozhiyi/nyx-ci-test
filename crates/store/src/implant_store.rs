@@ -236,8 +236,7 @@ impl ImplantStore {
     /// Count total implants.
     pub fn count(&self) -> Result<i64> {
         let conn = self.conn.lock().map_err(|_| ImplantStoreError::Poisoned)?;
-        let n: i64 =
-            conn.query_row("SELECT COUNT(*) FROM implants", [], |row| row.get(0))?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM implants", [], |row| row.get(0))?;
         Ok(n)
     }
 

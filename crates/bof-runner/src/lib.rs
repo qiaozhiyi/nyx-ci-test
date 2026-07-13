@@ -14,9 +14,9 @@
 //! captured output) is a pure-Rust implementation — no C CRT dependency.
 
 #[cfg(target_os = "windows")]
-mod win;
-#[cfg(target_os = "windows")]
 mod shim;
+#[cfg(target_os = "windows")]
+mod win;
 
 #[cfg(target_os = "windows")]
 pub use win::{execute, load, ExecResult, Loaded, Resolver};

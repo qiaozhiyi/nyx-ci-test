@@ -1996,7 +1996,9 @@ async fn worker_loop(
                         "features": features,
                     });
                     match authed(
-                        client.post(format!("{srv}/api/generate-implant")).json(&body),
+                        client
+                            .post(format!("{srv}/api/generate-implant"))
+                            .json(&body),
                         tok,
                     )
                     .send()
@@ -2011,11 +2013,7 @@ async fn worker_loop(
                                     &format!("implant generated: pub={pk} sha256={sha}"),
                                     Level::Info,
                                 );
-                                log_push(
-                                    &mut log_buf,
-                                    &format!("  response: {v}"),
-                                    Level::Info,
-                                );
+                                log_push(&mut log_buf, &format!("  response: {v}"), Level::Info);
                             }
                             Err(e) => log_push(
                                 &mut log_buf,
@@ -2023,9 +2021,11 @@ async fn worker_loop(
                                 Level::Err,
                             ),
                         },
-                        Err(e) => {
-                            log_push(&mut log_buf, &format!("! generate-implant: {e}"), Level::Err)
-                        }
+                        Err(e) => log_push(
+                            &mut log_buf,
+                            &format!("! generate-implant: {e}"),
+                            Level::Err,
+                        ),
                     }
                 }
                 Cmd::FetchImplants => {
@@ -2036,31 +2036,37 @@ async fn worker_loop(
                         .send()
                         .await
                     {
-                        Ok(r) => match r.json::<serde_json::Value>().await {
-                            Ok(v) => {
-                                if let Some(implants) = v["implants"].as_array() {
-                                    for imp in implants {
-                                        let pk = imp["implant_pub"].as_str().unwrap_or("?");
-                                        let cb = imp["callback_host"].as_str().unwrap_or("?");
-                                        let used = imp["auth_token_used"].as_bool().unwrap_or(false);
-                                        let rev = imp["revoked"].as_bool().unwrap_or(false);
-                                        log_push(
+                        Ok(r) => {
+                            match r.json::<serde_json::Value>().await {
+                                Ok(v) => {
+                                    if let Some(implants) = v["implants"].as_array() {
+                                        for imp in implants {
+                                            let pk = imp["implant_pub"].as_str().unwrap_or("?");
+                                            let cb = imp["callback_host"].as_str().unwrap_or("?");
+                                            let used =
+                                                imp["auth_token_used"].as_bool().unwrap_or(false);
+                                            let rev = imp["revoked"].as_bool().unwrap_or(false);
+                                            log_push(
                                             &mut log_buf,
                                             &format!("implant {pk} → {cb}  used={used} revoked={rev}"),
                                             Level::Info,
                                         );
+                                        }
                                     }
+                                    log_push(
+                                        &mut log_buf,
+                                        &format!(
+                                            "{} implants total",
+                                            v["implants"].as_array().map(|a| a.len()).unwrap_or(0)
+                                        ),
+                                        Level::Info,
+                                    );
                                 }
-                                log_push(
-                                    &mut log_buf,
-                                    &format!("{} implants total", v["implants"].as_array().map(|a| a.len()).unwrap_or(0)),
-                                    Level::Info,
-                                );
+                                Err(e) => {
+                                    log_push(&mut log_buf, &format!("! implants: {e}"), Level::Err)
+                                }
                             }
-                            Err(e) => {
-                                log_push(&mut log_buf, &format!("! implants: {e}"), Level::Err)
-                            }
-                        },
+                        }
                         Err(e) => log_push(&mut log_buf, &format!("! implants: {e}"), Level::Err),
                     }
                 }
@@ -2082,9 +2088,7 @@ async fn worker_loop(
                                 &format!("revoke {implant_pub}: {v}"),
                                 Level::Info,
                             ),
-                            Err(e) => {
-                                log_push(&mut log_buf, &format!("! revoke: {e}"), Level::Err)
-                            }
+                            Err(e) => log_push(&mut log_buf, &format!("! revoke: {e}"), Level::Err),
                         },
                         Err(e) => log_push(&mut log_buf, &format!("! revoke: {e}"), Level::Err),
                     }

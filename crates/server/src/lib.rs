@@ -421,10 +421,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/audit", get(get_audit))
         .route("/api/audit/verify", get(verify_audit))
         // Implant generation (requires NYX_TEMPLATE + implant store at runtime)
-        .route(
-            "/api/generate-implant",
-            post(implant_gen::generate_implant),
-        )
+        .route("/api/generate-implant", post(implant_gen::generate_implant))
         .route("/api/implants", get(implant_gen::list_implants))
         .route("/api/implant/revoke", post(implant_gen::revoke_implant))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024));

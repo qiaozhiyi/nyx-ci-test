@@ -514,7 +514,5 @@ pub fn aead_decrypt(key: &[u8; 32], nonce: &[u8; 12], ct_with_tag: &[u8]) -> Opt
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
     let nonce = Nonce::from_slice(nonce);
-    cipher
-        .decrypt(nonce, ct_with_tag)
-        .ok()
+    cipher.decrypt(nonce, ct_with_tag).ok()
 }

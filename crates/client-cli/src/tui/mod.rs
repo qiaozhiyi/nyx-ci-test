@@ -2456,17 +2456,23 @@ impl App {
                     match parts[i] {
                         "--sleep" => {
                             i += 1;
-                            if let Some(v) = parts.get(i).and_then(|s| s.parse().ok()) { sleep = v; }
+                            if let Some(v) = parts.get(i).and_then(|s| s.parse().ok()) {
+                                sleep = v;
+                            }
                         }
                         "--jitter" => {
                             i += 1;
-                            if let Some(v) = parts.get(i).and_then(|s| s.parse().ok()) { jitter = v; }
+                            if let Some(v) = parts.get(i).and_then(|s| s.parse().ok()) {
+                                jitter = v;
+                            }
                         }
                         "--tls" => tls = true,
                         "--no-tls" => tls = false,
                         "--format" => {
                             i += 1;
-                            if let Some(f) = parts.get(i) { format = f.to_string(); }
+                            if let Some(f) = parts.get(i) {
+                                format = f.to_string();
+                            }
                         }
                         _ => {
                             // Try to parse as port number

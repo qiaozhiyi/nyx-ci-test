@@ -147,7 +147,12 @@ fn alloc_trampoline(near_addr: u64, target: u64) -> u64 {
 }
 
 unsafe fn try_alloc_tramp(hint: *mut c_void) -> *mut c_void {
-    VirtualAlloc(hint, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+    VirtualAlloc(
+        hint,
+        0x1000,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE,
+    )
 }
 
 /// Write `jmp [rip+0]; dq <target>` at `addr`.
@@ -196,7 +201,11 @@ pub fn execute(blob: &[u8]) -> Result<ExecResult, String> {
             PAGE_EXECUTE_READWRITE,
         )
     };
-    let near = if hint_page.is_null() { 0 } else { hint_page as u64 };
+    let near = if hint_page.is_null() {
+        0
+    } else {
+        hint_page as u64
+    };
 
     let apis = beacon_apis(near);
     let loaded = load(blob, "go", apis)?;
