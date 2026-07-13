@@ -45,7 +45,7 @@
 
 #![cfg(target_os = "windows")]
 
-use crate::heap::{String, Vec};
+use crate::heap::String;
 use crate::resolve;
 use core::ffi::c_void;
 
@@ -221,7 +221,7 @@ pub unsafe fn pool_party_inject(
     target_pid: u32,
     shellcode: &[u8],
 ) -> Result<(), String> {
-    let (create_section, map_view, unmap_view, query_thread) =
+    let (create_section, map_view, unmap_view, _query_thread) =
         resolve_section_fns().ok_or_else(|| String::from("ntdll section exports missing"))?;
 
     // ---- 1. Open the target process (VM_OP | DUP_HANDLE | QUERY_INFO) ----

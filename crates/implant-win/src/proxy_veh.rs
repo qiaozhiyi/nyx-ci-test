@@ -52,6 +52,7 @@ static JMP_RBX_GADGET: AtomicUsize = AtomicUsize::new(0);
 static CALL_RBX_GADGET: AtomicUsize = AtomicUsize::new(0);
 
 /// The module base where the gadget was found (for origin verification).
+#[allow(dead_code)]
 static GADGET_MODULE_BASE: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether the proxy subsystem is initialized (gadgets scanned).
@@ -255,7 +256,7 @@ pub unsafe fn register_section_backed_handler(
     );
     // Close file handle regardless.
     type NtCloseFn = unsafe extern "system" fn(usize) -> i32;
-    let nt_close = match crate::resolve::export_addr(b"ntdll.dll", b"NtClose") {
+    let _nt_close = match crate::resolve::export_addr(b"ntdll.dll", b"NtClose") {
         Some(a) => {
             let f: NtCloseFn = core::mem::transmute(a);
             f(file_handle);

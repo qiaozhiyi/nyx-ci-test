@@ -238,7 +238,7 @@ pub unsafe fn post_frame(
     use_tls: bool,
 ) -> Option<Vec<u8>> {
     ensure_winhttp();
-    let fns = WINHTTP.as_ref()?;
+    let fns = unsafe { (*{ &raw const WINHTTP }).as_ref() }?;
     // User-agent: the profile's `set useragent` (baked at build) overrides the
     // transport default. CS's default beacon UA is a well-known IOC, so a real
     // engagement sets one in the profile.
@@ -379,6 +379,7 @@ pub unsafe fn post_frame(
     }
     // Read the response body.
     let mut out: Vec<u8> = Vec::new();
+    #[allow(unused_assignments)]
     let mut avail: u32 = 0;
     loop {
         avail = 0;

@@ -26,6 +26,7 @@ type NtDeleteFileFn = unsafe extern "system" fn(*mut c_void) -> i32;
 // ---- Constants ------------------------------------------------------------
 
 const DELETE: u32 = 0x0001_0000;
+#[allow(dead_code)]
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 const FILE_SHARE_READ: u32 = 1;

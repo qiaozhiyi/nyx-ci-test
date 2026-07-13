@@ -483,6 +483,7 @@ pub unsafe fn init_global() {
 ///   0xB5 = Runtime built + Box::leak installed
 /// A crash (127) before any of these = the step crashed.
 #[no_mangle]
+#[allow(unused_assignments)]
 pub unsafe extern "system" fn nyx_selftest_rt_steps() {
     // ExitProcess resolved inline (can't depend on selftests::exit ordering).
     let exit_proc = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess");
@@ -504,7 +505,7 @@ pub unsafe extern "system" fn nyx_selftest_rt_steps() {
     // 0xB2: SSN table resolution (the suspected crash point — allocates a Vec
     // of (String, u32) per export, ~2300 entries).
     let (table, _gadget_placeholder) = match fresh {
-        Some((fresh_base, text_rva, text_size)) => {
+        Some((fresh_base, _text_rva, _text_size)) => {
             let owned: Vec<(String, u32)> = ntdll
                 .exports_iter()
                 .iter()
@@ -525,6 +526,7 @@ pub unsafe extern "system" fn nyx_selftest_rt_steps() {
         }
     };
     // 0xB3: gadget scan over the in-process ntdll.
+    #[allow(unused_assignments, unused_variables)]
     let mut step: u32 = 0xB2;
     let g = scan_syscall_gadget(&ntdll);
     if g.is_some() {

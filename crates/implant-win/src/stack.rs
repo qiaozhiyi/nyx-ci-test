@@ -313,6 +313,7 @@ pub fn swap_was_attempted() -> bool {
 /// # Safety
 /// Caller guarantees CET off + gaps usable. `chain` must be valid.
 #[cfg(target_arch = "x86_64")]
+#[allow(unused_assignments)]
 unsafe fn do_rsp_swap<T, F: FnOnce() -> T>(chain: &StagedChain, f: F) -> T {
     // Stage the fake stack (process-lifetime leak). Layout (stack grows DOWN,
     // low address → high): the fake stack needs room BELOW RSP for the nested
@@ -386,7 +387,7 @@ unsafe fn do_rsp_swap<T, F: FnOnce() -> T>(chain: &StagedChain, f: F) -> T {
     // is anonymous (impl FnOnce), but within THIS monomorphization of
     // do_rsp_swap<T> it is fixed — so we pass it to a <T, F> bridge whose F is
     // inferred here. The bridge reads f by raw pointer + writes T to out.
-    SWAP_FN.store(run_f_on_spoof::<T, F> as usize, Ordering::Release);
+    SWAP_FN.store(run_f_on_spoof::<T, F> as *const () as usize, Ordering::Release);
     SWAP_F.store(
         core::ptr::addr_of!(f) as *const () as usize,
         Ordering::Release,
@@ -402,8 +403,9 @@ unsafe fn do_rsp_swap<T, F: FnOnce() -> T>(chain: &StagedChain, f: F) -> T {
     let rsp_idx = cap / 2 - depth;
     let mut fake_rsp = unsafe { buf.add(rsp_idx) } as usize;
     fake_rsp &= !0xFusize; // round DOWN to 16-byte alignment
+    #[allow(unused_assignments, unused_variables)]
     let mut save_rsp: usize;
-    let mut fake_in = fake_rsp;
+    let fake_in = fake_rsp;
 
     // The swap: save real RSP → load spoofed RSP → call trampoline (f runs on
     // the spoofed stack) → restore real RSP. The trampoline's `ret` returns to

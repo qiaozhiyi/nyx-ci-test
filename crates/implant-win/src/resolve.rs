@@ -18,7 +18,7 @@
 
 #![cfg(target_os = "windows")]
 
-use crate::heap::{self, vec, String, Vec};
+use crate::heap::{self, String, Vec};
 type HeapStr = heap::Str;
 use core::ffi::c_void;
 

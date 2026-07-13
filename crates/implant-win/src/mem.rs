@@ -124,7 +124,7 @@ pub(crate) fn mask_key() -> &'static [u8; 32] {
         // SAFETY: MASK_KEY_BUF is populated and never mutated again after
         // init; the beacon is single-threaded (documented invariant) so there
         // is no concurrent mutation.
-        return unsafe { &MASK_KEY_BUF };
+        return unsafe { &*(&raw const MASK_KEY_BUF) };
     }
     let mut key = [0u8; 32];
     if !crate::entry::csprng_fill(&mut key) {
@@ -143,7 +143,7 @@ pub(crate) fn mask_key() -> &'static [u8; 32] {
         MASK_KEY_BUF = key;
     }
     MASK_KEY_INIT.store(1, Ordering::Release);
-    unsafe { &MASK_KEY_BUF }
+    unsafe { &*(&raw const MASK_KEY_BUF) }
 }
 
 /// Apply RC4 (via the pure core) to every registered region in place. RC4 is an

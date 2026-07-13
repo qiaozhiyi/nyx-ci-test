@@ -118,8 +118,8 @@ static mut RELAY: Option<RelayFns> = None;
 /// Resolve + cache the relay fn pointers. Returns `None` if winsock or any fn
 /// can't be resolved (every relay op then fails cleanly rather than crashing).
 unsafe fn ensure_relay() -> Option<&'static RelayFns> {
-    if unsafe { RELAY.is_some() } {
-        return unsafe { RELAY.as_ref() };
+    if unsafe { (*{ &raw const RELAY }).is_some() } {
+        return unsafe { (*{ &raw const RELAY }).as_ref() };
     }
     if !unsafe { wsa_init() } {
         return None;
@@ -136,7 +136,7 @@ unsafe fn ensure_relay() -> Option<&'static RelayFns> {
             last_err: core::mem::transmute(e),
         })
     };
-    unsafe { RELAY.as_ref() }
+    unsafe { (*{ &raw const RELAY }).as_ref() }
 }
 
 // ---- channel table helpers ------------------------------------------------

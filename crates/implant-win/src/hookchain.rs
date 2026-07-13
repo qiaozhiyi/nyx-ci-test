@@ -264,7 +264,7 @@ fn build_rva_ssn_table(rt: &syscalls::Runtime) -> crate::heap::Vec<RvaSsn> {
     let mut out: crate::heap::Vec<RvaSsn> = crate::heap::Vec::new();
     // Walk the in-process ntdll export directory (hook-proof: hooks patch
     // stub bytes, not the export directory structure). This gives (name, RVA).
-    let ntdll = match unsafe { resolve::LiveNtdll::locate() } {
+    let ntdll = match resolve::LiveNtdll::locate() {
         Some(n) => n,
         None => return out,
     };

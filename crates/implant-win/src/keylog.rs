@@ -414,11 +414,11 @@ fn resolve_hook_raw() -> Option<HookRaw> {
         unsafe { crate::resolve::export_addr(b"kernel32.dll", b"GetCurrentThreadId")? };
     // Reuse the layout fns the polling path already resolves (or resolve now).
     let get_keyboard_layout = get_keyboard_layout_fn()
-        .map(|f| f as usize)
+        .map(|f| f as *const () as usize)
         .unwrap_or(0);
-    let get_keyboard_state = get_keyboard_state_fn().map(|f| f as usize).unwrap_or(0);
-    let map_virtual_key_ex_w = map_virtual_key_ex_fn().map(|f| f as usize).unwrap_or(0);
-    let to_unicode_ex = to_unicode_ex_fn().map(|f| f as usize).unwrap_or(0);
+    let get_keyboard_state = get_keyboard_state_fn().map(|f| f as *const () as usize).unwrap_or(0);
+    let map_virtual_key_ex_w = map_virtual_key_ex_fn().map(|f| f as *const () as usize).unwrap_or(0);
+    let to_unicode_ex = to_unicode_ex_fn().map(|f| f as *const () as usize).unwrap_or(0);
     Some(HookRaw {
         set_windows_hook_ex_w,
         unhook_windows_hook_ex,
@@ -795,7 +795,7 @@ pub fn poll_once() {
 
     // Raw pointer to LAST so we never form a shared/mut ref to the static.
     // SAFETY: only the beacon thread touches LAST.
-    let last_ptr: *mut u8 = unsafe { core::ptr::addr_of_mut!(LAST).cast::<u8>() };
+    let last_ptr: *mut u8 = core::ptr::addr_of_mut!(LAST).cast::<u8>();
 
     for vk in 0i32..256 {
         // SAFETY: gaks is a valid GetAsyncKeyState pointer.

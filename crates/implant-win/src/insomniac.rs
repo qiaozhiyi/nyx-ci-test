@@ -114,7 +114,7 @@ pub unsafe fn bootstrap_check() {
         return;
     }
     // Find our own module — the one containing this function.
-    let my_addr = bootstrap_check as usize;
+    let my_addr = bootstrap_check as *const () as usize;
     let peb = match unsafe { crate::resolve::peb_pointer() } {
         Some(p) => p,
         None => return,

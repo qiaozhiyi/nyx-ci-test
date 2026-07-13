@@ -3,7 +3,6 @@
 
 #![cfg(target_os = "windows")]
 
-use crate::heap::Vec;
 use crate::resolve;
 use core::ffi::c_void;
 

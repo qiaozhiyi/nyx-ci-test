@@ -12,6 +12,7 @@
 
 use core::ffi::c_void;
 
+#[allow(dead_code)]
 const STATUS_SUCCESS: i32 = 0;
 const SECTION_MAP_READ: u32 = 0x0004;
 const SECTION_MAP_WRITE: u32 = 0x0002;
@@ -19,6 +20,7 @@ const SECTION_MAP_EXECUTE: u32 = 0x0008;
 const PAGE_READWRITE: u32 = 0x04;
 const PAGE_EXECUTE_READ: u32 = 0x20;
 const SEC_COMMIT: u32 = 0x0800_0000;
+#[allow(dead_code)]
 const MEM_COMMIT: u32 = 0x1000;
 const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
 const THREAD_SET_CONTEXT: u32 = 0x0010;
