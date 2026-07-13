@@ -22,7 +22,7 @@ static OUT_LEN: AtomicUsize = AtomicUsize::new(0);
 pub extern "C" fn nyx_bof_reset() {
     OUT_LEN.store(0, Ordering::SeqCst);
     unsafe {
-        core::ptr::write((&raw mut OUT[0]) as *mut u8, 0);
+        core::ptr::write(&raw mut OUT[0], 0);
     }
 }
 
@@ -32,7 +32,7 @@ pub extern "C" fn nyx_bof_output() -> *const c_char {
     let len = OUT_LEN.load(Ordering::SeqCst);
     if len < OUT_CAP {
         unsafe {
-            core::ptr::write((&raw mut OUT[len]) as *mut u8, 0);
+            core::ptr::write(&raw mut OUT[len], 0);
         }
     }
     unsafe { (&raw const OUT[0]) as *const c_char }
@@ -122,7 +122,7 @@ fn push_byte(b: u8) {
     let len = OUT_LEN.load(Ordering::Relaxed);
     if len < OUT_CAP {
         unsafe {
-            core::ptr::write((&raw mut OUT[len]) as *mut u8, b);
+            core::ptr::write(&raw mut OUT[len], b);
         }
         OUT_LEN.store(len + 1, Ordering::Release);
     }
@@ -150,8 +150,8 @@ fn push_i32(v: i32) {
         pos -= 1;
         buf[pos] = b'-';
     }
-    for i in pos..buf.len() {
-        push_byte(buf[i]);
+    for &b in buf.iter().skip(pos) {
+        push_byte(b);
     }
 }
 
@@ -169,7 +169,7 @@ fn push_hex(v: u32) {
         buf[pos] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
         n >>= 4;
     }
-    for i in pos..buf.len() {
-        push_byte(buf[i]);
+    for &b in buf.iter().skip(pos) {
+        push_byte(b);
     }
 }
