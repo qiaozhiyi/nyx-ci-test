@@ -8,13 +8,6 @@ description = "BOF execution layer: load + relocate + run a Windows COFF BOF via
 [dependencies]
 nyx-coff = { workspace = true }
 
-[build-dependencies]
-cc = "1.0"
-
 [lib]
 name = "nyx_bof_runner"
 path = "src/lib.rs"
-
-[[bin]]
-name = "bof_demo"
-path = "src/bin/bof_demo.rs"
