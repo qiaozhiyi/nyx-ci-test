@@ -72,11 +72,13 @@ const CTX_EFLAGS: usize = 0x044;
 const CTX_DR0: usize = 0x048;
 const CTX_DR6: usize = 0x068;
 const CTX_DR7: usize = 0x070;
+#[allow(dead_code)]
 const CTX_RAX: usize = 0x078;
 const CTX_RIP: usize = 0x0F8;
 
 // ---- STATE ---------------------------------------------------------------
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct HwbpEntry {
     target: usize,
@@ -524,11 +526,21 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
         }
     };
     diag(b'b'); // shadow addr OK
-    let slot = match HWBP_ENTRIES.iter().position(|e| e.is_none()) {
-        Some(s) => s,
-        None => {
-            diag(b'3');
-            return Err("all 4 DR slots full");
+    let slot = {
+        let entries: *const Option<HwbpEntry> = (&raw const HWBP_ENTRIES).cast::<Option<HwbpEntry>>();
+        let mut found = None;
+        for i in 0..4usize {
+            if core::ptr::read(entries.add(i)).is_none() {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(s) => s,
+            None => {
+                diag(b'3');
+                return Err("all 4 DR slots full");
+            }
         }
     };
     diag(b'c'); // slot found
@@ -571,7 +583,7 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
 
         // ---- CFG bypass: mark handler as valid indirect-call target ----
         if crate::cfg_user::cfg_enabled() {
-            crate::cfg_user::mark_addr_cfg_valid(hwbp_veh_handler as usize);
+            crate::cfg_user::mark_addr_cfg_valid(hwbp_veh_handler as *const () as usize);
             if !SHADOW_BUF.is_null() {
                 crate::cfg_user::mark_addr_cfg_valid(SHADOW_BUF as usize);
             }
@@ -712,7 +724,7 @@ pub unsafe fn remove_hwbp(slot: usize) -> Result<(), &'static str> {
     if slot >= 4 || HWBP_ENTRIES[slot].is_none() {
         return Err("invalid slot");
     }
-    let entry = HWBP_ENTRIES[slot].take();
+    let _entry = HWBP_ENTRIES[slot].take();
     HWBP_COUNT -= 1;
 
     // Allocate CONTEXT buffer.

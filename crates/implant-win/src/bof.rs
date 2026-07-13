@@ -102,7 +102,7 @@ unsafe fn out_push(bytes: &[u8]) {
     }
     let room = OUT_CAP - OUT_LEN;
     let n = bytes.len().min(room);
-    ptr::copy_nonoverlapping(bytes.as_ptr(), OUT.as_mut_ptr().add(OUT_LEN), n);
+    ptr::copy_nonoverlapping(bytes.as_ptr(), (&raw mut OUT).cast::<u8>().add(OUT_LEN), n);
     OUT_LEN += n;
 }
 
@@ -122,7 +122,7 @@ pub unsafe fn reset_capture() {
 
 /// Read the captured output as bytes (caller copies before the next BOF runs).
 pub unsafe fn captured_output() -> &'static [u8] {
-    core::slice::from_raw_parts(OUT.as_ptr(), OUT_LEN)
+    core::slice::from_raw_parts((&raw const OUT).cast::<u8>(), OUT_LEN)
 }
 
 // ---- minimal varargs printf (%s, %d, %x, %c, %%) ----
@@ -508,11 +508,12 @@ pub unsafe extern "C" fn BeaconGetSpawnTo(_x86: i32) -> *mut u8 {
     // for the template (~28) + BOF-appended " /c <cmd>" without overflowing
     // into adjacent statics. Re-stamped each call so a prior BOF's mutations
     // don't leak into the next caller.
-    static mut SPAWN: [u8; 2048] = [0; 2048];
+    static mut SPAWN: [u8; SPAWN_CAP] = [0; SPAWN_CAP];
+    const SPAWN_CAP: usize = 2048;
     const TEMPLATE: &[u8] = b"C:\\Windows\\System32\\cmd.exe\0";
     // SAFETY: single-threaded (beacon loop); SPAWN is only touched here.
     // Bounds check: truncate to SPAWN capacity if the template somehow grew.
-    let copy_len = if TEMPLATE.len() > SPAWN.len() { SPAWN.len() } else { TEMPLATE.len() };
+    let copy_len = if TEMPLATE.len() > SPAWN_CAP { SPAWN_CAP } else { TEMPLATE.len() };
     unsafe {
         core::ptr::copy_nonoverlapping(
             TEMPLATE.as_ptr(),
