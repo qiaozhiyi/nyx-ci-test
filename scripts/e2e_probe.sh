@@ -11,6 +11,10 @@
 # Usage:   ./scripts/e2e_probe.sh
 # Exits:   0 if all commands returned a result, 1 otherwise.
 set -uo pipefail
+# Prevent MSYS2 from converting env-var values that look like Unix paths
+# (e.g. /beacon -> C:/Program Files/Git/beacon) when launching Windows binaries.
+export MSYS2_ENV_CONV_EXCL='*'
+
 PORT="${PORT:-18455}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
