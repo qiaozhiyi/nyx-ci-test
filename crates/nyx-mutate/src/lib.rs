@@ -592,9 +592,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(0xDEAD);
         let mut bin = Vec::new();
         // Build a minimal mock binary.
-        for _ in 0..256 {
-            bin.push(0x90); // NOPs
-        }
+        bin.extend(std::iter::repeat_n(0x90u8, 256)); // NOPs
         bin.push(0xC3); // ret
                         // .nyx_cfg section
         bin.extend_from_slice(&NYX_CFG_MAGIC.to_le_bytes());
@@ -603,7 +601,7 @@ mod tests {
         for _ in 0..32 {
             bin.push(rng.gen::<u8>()); // implant_priv
         }
-        bin.resize(bin.len() + (1024 - 38).max(0), 0x00);
+        bin.resize(bin.len() + (1024 - 38), 0x00);
         // High-entropy key block outside .nyx_cfg
         for _ in 0..32 {
             bin.push(rng.gen());
