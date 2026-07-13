@@ -11,10 +11,12 @@
 //! Loads multi-section COFFs, applies `ADDR64` / `REL32[_1..5]`, calls `go()`,
 //! and exposes the resolved symbol addresses so a caller can read results the
 //! BOF wrote (e.g. a marker global). The Beacon-API shim (`BeaconPrintf` →
-//! captured output) is the next addition; for now BOFs signal via globals.
+//! captured output) is a pure-Rust implementation — no C CRT dependency.
 
 #[cfg(target_os = "windows")]
 mod win;
+#[cfg(target_os = "windows")]
+mod shim;
 
 #[cfg(target_os = "windows")]
 pub use win::{execute, load, ExecResult, Loaded, Resolver};
