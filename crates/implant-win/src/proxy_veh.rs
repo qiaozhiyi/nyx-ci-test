@@ -99,7 +99,10 @@ pub unsafe fn init_proxy_gadgets() {
     }
 
     PROXY_READY.store(true, Ordering::Release);
-    PROXY_ENABLED.store(jmp_rbx_gadget() != 0 || call_rbx_gadget() != 0, Ordering::Release);
+    PROXY_ENABLED.store(
+        jmp_rbx_gadget() != 0 || call_rbx_gadget() != 0,
+        Ordering::Release,
+    );
 }
 
 /// Whether a proxy gadget was found and proxy mode is available.
@@ -121,7 +124,11 @@ pub fn call_rbx_gadget() -> usize {
 /// Prefers `call rbx` (CET-safe) over `jmp rbx`.
 pub fn proxy_handler_addr() -> usize {
     let call = call_rbx_gadget();
-    if call != 0 { call } else { jmp_rbx_gadget() }
+    if call != 0 {
+        call
+    } else {
+        jmp_rbx_gadget()
+    }
 }
 
 /// Set proxy mode on/off at runtime.
@@ -160,24 +167,64 @@ pub unsafe fn register_section_backed_handler(
 ) -> *mut c_void {
     // Resolve the NT APIs we need.
     let nt_open = match crate::resolve::export_addr(b"ntdll.dll", b"NtOpenFile") {
-        Some(a) => a, None => return core::ptr::null_mut(),
+        Some(a) => a,
+        None => return core::ptr::null_mut(),
     };
     let nt_create_sec = match crate::resolve::export_addr(b"ntdll.dll", b"NtCreateSection") {
-        Some(a) => a, None => return core::ptr::null_mut(),
+        Some(a) => a,
+        None => return core::ptr::null_mut(),
     };
     let nt_map_view = match crate::resolve::export_addr(b"ntdll.dll", b"NtMapViewOfSection") {
-        Some(a) => a, None => return core::ptr::null_mut(),
+        Some(a) => a,
+        None => return core::ptr::null_mut(),
     };
 
     // Open \KnownDlls\ntdll.dll — this is the canonical backing file.
     // Use a UNICODE_STRING on the stack for the path.
     let path: [u16; 43] = [
-        b'\\' as u16, b'K' as u16, b'n' as u16, b'o' as u16, b'w' as u16,
-        b'n' as u16, b'D' as u16, b'l' as u16, b'l' as u16, b's' as u16,
-        b'\\' as u16, b'n' as u16, b't' as u16, b'd' as u16, b'l' as u16,
-        b'l' as u16, b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+        b'\\' as u16,
+        b'K' as u16,
+        b'n' as u16,
+        b'o' as u16,
+        b'w' as u16,
+        b'n' as u16,
+        b'D' as u16,
+        b'l' as u16,
+        b'l' as u16,
+        b's' as u16,
+        b'\\' as u16,
+        b'n' as u16,
+        b't' as u16,
+        b'd' as u16,
+        b'l' as u16,
+        b'l' as u16,
+        b'.' as u16,
+        b'd' as u16,
+        b'l' as u16,
+        b'l' as u16,
         0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     ];
 
     #[repr(C)]
@@ -198,7 +245,7 @@ pub unsafe fn register_section_backed_handler(
     }
 
     let us = UnicodeString {
-        len: 40, // 20 chars * 2
+        len: 40,     // 20 chars * 2
         max_len: 86, // 43 * 2
         buffer: path.as_ptr(),
     };
@@ -218,17 +265,25 @@ pub unsafe fn register_section_backed_handler(
     }
 
     type NtOpenFileFn = unsafe extern "system" fn(
-        *mut usize, u32, *const ObjectAttributes, *mut IoStatusBlock,
-        u32, u32,
+        *mut usize,
+        u32,
+        *const ObjectAttributes,
+        *mut IoStatusBlock,
+        u32,
+        u32,
     ) -> i32;
     let open_fn: NtOpenFileFn = core::mem::transmute(nt_open);
 
     let mut file_handle: usize = 0;
-    let mut iosb = IoStatusBlock { _status: 0, _info: 0 };
+    let mut iosb = IoStatusBlock {
+        _status: 0,
+        _info: 0,
+    };
     let st = open_fn(
         &mut file_handle,
         0x8010_0000, // GENERIC_READ | SYNCHRONIZE
-        &oa, &mut iosb,
+        &oa,
+        &mut iosb,
         1, // FILE_SHARE_READ
         1, // FILE_SYNCHRONOUS_IO_NONALERT
     );
@@ -238,8 +293,13 @@ pub unsafe fn register_section_backed_handler(
 
     // Create a SEC_IMAGE section from the file handle.
     type NtCreateSectionFn = unsafe extern "system" fn(
-        *mut usize, u32, *const ObjectAttributes, *mut i64,
-        u32, u32, usize,
+        *mut usize,
+        u32,
+        *const ObjectAttributes,
+        *mut i64,
+        u32,
+        u32,
+        usize,
     ) -> i32;
     let sec_fn: NtCreateSectionFn = core::mem::transmute(nt_create_sec);
 
@@ -247,10 +307,10 @@ pub unsafe fn register_section_backed_handler(
     let mut sec_size: i64 = 0;
     let st2 = sec_fn(
         &mut sec_handle,
-        0x000F_0007, // SECTION_ALL_ACCESS
+        0x000F_0007,       // SECTION_ALL_ACCESS
         core::ptr::null(), // no object attributes
         &mut sec_size,
-        0x02, // PAGE_READONLY
+        0x02,        // PAGE_READONLY
         0x0100_0000, // SEC_IMAGE
         file_handle,
     );
@@ -270,8 +330,16 @@ pub unsafe fn register_section_backed_handler(
 
     // Map a view.
     type NtMapViewFn = unsafe extern "system" fn(
-        usize, usize, *mut *mut c_void, usize, usize,
-        *mut i64, *mut usize, u32, u32, u32,
+        usize,
+        usize,
+        *mut *mut c_void,
+        usize,
+        usize,
+        *mut i64,
+        *mut usize,
+        u32,
+        u32,
+        u32,
     ) -> i32;
     let map_fn: NtMapViewFn = core::mem::transmute(nt_map_view);
 
@@ -282,11 +350,12 @@ pub unsafe fn register_section_backed_handler(
         sec_handle,
         (-1isize) as usize, // CurrentProcess
         &mut view_base,
-        0, 0,
+        0,
+        0,
         &mut view_offset,
         &mut view_size,
-        2, // ViewUnmap (allows partial unmap)
-        0, // MEM_TOP_DOWN = 0
+        2,    // ViewUnmap (allows partial unmap)
+        0,    // MEM_TOP_DOWN = 0
         0x20, // PAGE_EXECUTE_READ
     );
     // Close section handle.
@@ -310,8 +379,7 @@ pub unsafe fn register_section_backed_handler(
         None => {
             // Unmap and return null.
             type NtUnmapViewFn = unsafe extern "system" fn(usize, *mut c_void) -> i32;
-            if let Some(a) = crate::resolve::export_addr(b"ntdll.dll", b"NtUnmapViewOfSection")
-            {
+            if let Some(a) = crate::resolve::export_addr(b"ntdll.dll", b"NtUnmapViewOfSection") {
                 let f: NtUnmapViewFn = core::mem::transmute(a);
                 f((-1isize) as usize, view_base);
             }
@@ -321,12 +389,9 @@ pub unsafe fn register_section_backed_handler(
 
     // The gap is in the RX view. We need to write our handler code there.
     // Change protection: RX → RWX → write → RX.
-    type NtProtectVmFn = unsafe extern "system" fn(
-        usize, *mut *mut c_void, *mut usize, u32, *mut u32,
-    ) -> i32;
-    let nt_protect = match crate::resolve::export_addr(
-        b"ntdll.dll", b"NtProtectVirtualMemory",
-    ) {
+    type NtProtectVmFn =
+        unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32, *mut u32) -> i32;
+    let nt_protect = match crate::resolve::export_addr(b"ntdll.dll", b"NtProtectVirtualMemory") {
         Some(a) => a,
         None => {
             // Can't write to the gap — fall back to direct registration.
@@ -356,7 +421,7 @@ pub unsafe fn register_section_backed_handler(
     //   jmp rax
     // 10 bytes total: 48 B8 XX XX XX XX XX XX XX XX  FF E0
     let tramp = gap_addr as *mut u8;
-    core::ptr::write(tramp, 0x48u8);       // REX.W
+    core::ptr::write(tramp, 0x48u8); // REX.W
     core::ptr::write(tramp.add(1), 0xB8u8); // MOV RAX, imm64
     let handler_bytes = (handler as usize).to_le_bytes();
     for i in 0..8 {
@@ -385,43 +450,34 @@ pub unsafe fn register_section_backed_handler(
 }
 
 /// Default direct VEH registration (fallback when section-backed fails).
-unsafe fn register_veh_direct(
-    handler: unsafe extern "system" fn(usize) -> i32,
-) -> *mut c_void {
-    let aveh = match crate::resolve::export_addr(
-        b"kernelbase.dll", b"AddVectoredExceptionHandler",
-    ).or_else(|| crate::resolve::export_addr(
-        b"kernel32.dll", b"AddVectoredExceptionHandler",
-    )) {
+unsafe fn register_veh_direct(handler: unsafe extern "system" fn(usize) -> i32) -> *mut c_void {
+    let aveh = match crate::resolve::export_addr(b"kernelbase.dll", b"AddVectoredExceptionHandler")
+        .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"AddVectoredExceptionHandler"))
+    {
         Some(a) => a,
         None => return core::ptr::null_mut(),
     };
-    type AddVehFn = unsafe extern "system" fn(
-        u32, unsafe extern "system" fn(usize) -> i32,
-    ) -> *mut c_void;
+    type AddVehFn =
+        unsafe extern "system" fn(u32, unsafe extern "system" fn(usize) -> i32) -> *mut c_void;
     let f: AddVehFn = core::mem::transmute(aveh);
     f(1, handler)
 }
 
 /// Register VEH handler at a specific address (the proxy gadget).
 unsafe fn register_veh_at(addr: usize) -> *mut c_void {
-    let aveh = match crate::resolve::export_addr(
-        b"kernelbase.dll", b"AddVectoredExceptionHandler",
-    ).or_else(|| crate::resolve::export_addr(
-        b"kernel32.dll", b"AddVectoredExceptionHandler",
-    )) {
+    let aveh = match crate::resolve::export_addr(b"kernelbase.dll", b"AddVectoredExceptionHandler")
+        .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"AddVectoredExceptionHandler"))
+    {
         Some(a) => a,
         None => return core::ptr::null_mut(),
     };
-    type AddVehFn = unsafe extern "system" fn(
-        u32, unsafe extern "system" fn(usize) -> i32,
-    ) -> *mut c_void;
+    type AddVehFn =
+        unsafe extern "system" fn(u32, unsafe extern "system" fn(usize) -> i32) -> *mut c_void;
     let f: AddVehFn = core::mem::transmute(aveh);
     // Transmute addr → fn pointer. This is the proxy: the VEH dispatcher
     // calls `addr(ExceptionPointers)` directly. The code at `addr`
     // (our trampoline or gadget) handles the redirect.
-    let handler: unsafe extern "system" fn(usize) -> i32 =
-        core::mem::transmute(addr);
+    let handler: unsafe extern "system" fn(usize) -> i32 = core::mem::transmute(addr);
     f(1, handler)
 }
 
@@ -457,6 +513,14 @@ unsafe fn find_code_cave(view_base: *mut c_void, _view_size: usize) -> Option<us
                     run_byte = b;
                 }
                 if j - run_start >= 16 {
+                    // Verify this is inter-function padding (preceded by ret/int3),
+                    // not intra-function NOPs inside a hot function.
+                    if run_start > 0 {
+                        let prev = sec_bytes[run_start - 1];
+                        if prev != 0xC3 && prev != 0xCC {
+                            continue; // Skip — likely intra-function padding
+                        }
+                    }
                     return Some(sec_start + run_start);
                 }
             } else {
@@ -500,7 +564,10 @@ unsafe fn scan_module_for_gadgets(name: &[u8]) -> (Option<*mut u8>, Option<Found
         let sec_start = base as usize + sec_va;
         let bytes = core::slice::from_raw_parts(sec_start as *const u8, sec_size.min(0x200000));
 
-        let mut result = FoundGadgets { jmp_rbx: None, call_rbx: None };
+        let mut result = FoundGadgets {
+            jmp_rbx: None,
+            call_rbx: None,
+        };
         for (j, &b) in bytes.iter().enumerate().take(bytes.len().saturating_sub(1)) {
             if b == 0xFF && bytes[j + 1] == 0xE3 {
                 if result.jmp_rbx.is_none() {
@@ -526,29 +593,47 @@ unsafe fn scan_module_for_gadgets(name: &[u8]) -> (Option<*mut u8>, Option<Found
 // ---- PE header types ------------------------------------------------------
 
 #[repr(C)]
-struct ImageDosHeader { e_magic: u16, _pad: [u16; 29], e_lfanew: i32, }
+struct ImageDosHeader {
+    e_magic: u16,
+    _pad: [u16; 29],
+    e_lfanew: i32,
+}
 
 #[repr(C)]
 struct ImageFileHeader {
-    _machine: u16, number_of_sections: u16,
-    _pad: [u32; 3], size_of_optional_header: u16, _characteristics: u16,
+    _machine: u16,
+    number_of_sections: u16,
+    _pad: [u32; 3],
+    size_of_optional_header: u16,
+    _characteristics: u16,
 }
 
 #[repr(C)]
 struct ImageSectionHeader {
-    name: [u8; 8], virtual_size: u32, virtual_address: u32,
-    size_of_raw_data: u32, _pad: [u32; 3], _characteristics: u32,
+    name: [u8; 8],
+    virtual_size: u32,
+    virtual_address: u32,
+    size_of_raw_data: u32,
+    _pad: [u32; 3],
+    _characteristics: u32,
 }
 
 /// Read PE section headers correctly using SizeOfOptionalHeader from FileHeader.
 unsafe fn pe_sections(base: *mut u8) -> Option<(*const ImageSectionHeader, usize)> {
     let dos = &*(base as *const ImageDosHeader);
-    if dos.e_magic != 0x5A4D { return None; }
+    if dos.e_magic != 0x5A4D {
+        return None;
+    }
     let pe_sig = *((base as usize + dos.e_lfanew as usize) as *const u32);
-    if pe_sig != 0x00004550 { return None; }
+    if pe_sig != 0x00004550 {
+        return None;
+    }
     let fh = &*((base as usize + dos.e_lfanew as usize + 4) as *const ImageFileHeader);
     let off = dos.e_lfanew as usize + 4 + 20 + fh.size_of_optional_header as usize;
-    Some(((base as usize + off) as *const ImageSectionHeader, fh.number_of_sections as usize))
+    Some((
+        (base as usize + off) as *const ImageSectionHeader,
+        fh.number_of_sections as usize,
+    ))
 }
 
 // ---- Selftest support -----------------------------------------------------

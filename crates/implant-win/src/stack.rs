@@ -387,7 +387,10 @@ unsafe fn do_rsp_swap<T, F: FnOnce() -> T>(chain: &StagedChain, f: F) -> T {
     // is anonymous (impl FnOnce), but within THIS monomorphization of
     // do_rsp_swap<T> it is fixed — so we pass it to a <T, F> bridge whose F is
     // inferred here. The bridge reads f by raw pointer + writes T to out.
-    SWAP_FN.store(run_f_on_spoof::<T, F> as *const () as usize, Ordering::Release);
+    SWAP_FN.store(
+        run_f_on_spoof::<T, F> as *const () as usize,
+        Ordering::Release,
+    );
     SWAP_F.store(
         core::ptr::addr_of!(f) as *const () as usize,
         Ordering::Release,

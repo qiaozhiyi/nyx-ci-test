@@ -398,6 +398,13 @@ async fn sniff_and_store(
     if ja3.is_some() || ja4.is_some() {
         tracing::debug!(%peer, ja3 = ?ja3, ja4 = ?ja4, "captured inbound TLS fingerprint");
     }
-    fps.insert(peer, nyx_server::Fingerprint { ja3, ja4 });
+    fps.insert(
+        peer,
+        nyx_server::Fingerprint {
+            ja3,
+            ja4,
+            created: std::time::Instant::now(),
+        },
+    );
     Ok(nyx_server::tls::PreambleStream::new(record, stream))
 }

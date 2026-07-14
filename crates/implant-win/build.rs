@@ -663,18 +663,10 @@ fn parse_hex_key(s: &str) -> Result<[u8; 32], String> {
     }
     let mut key = [0u8; 32];
     for (i, pair) in s.as_bytes().chunks(2).enumerate() {
-        let hi = hex_nibble(pair[0]).ok_or_else(|| {
-            format!(
-                "NYX_CONFIG_KEY contains non-hex char {:?}",
-                pair[0] as char
-            )
-        })?;
-        let lo = hex_nibble(pair[1]).ok_or_else(|| {
-            format!(
-                "NYX_CONFIG_KEY contains non-hex char {:?}",
-                pair[1] as char
-            )
-        })?;
+        let hi = hex_nibble(pair[0])
+            .ok_or_else(|| format!("NYX_CONFIG_KEY contains non-hex char {:?}", pair[0] as char))?;
+        let lo = hex_nibble(pair[1])
+            .ok_or_else(|| format!("NYX_CONFIG_KEY contains non-hex char {:?}", pair[1] as char))?;
         key[i] = (hi << 4) | lo;
     }
     Ok(key)

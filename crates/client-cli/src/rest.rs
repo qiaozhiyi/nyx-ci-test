@@ -2850,11 +2850,7 @@ fn start_socks_relay(
 
 /// First 8 chars of a session id, for terse logging (mirrors socks/mod.rs).
 fn session_short(session: &str) -> &str {
-    if session.len() >= 8 {
-        &session[..8]
-    } else {
-        session
-    }
+    session.get(..8).unwrap_or(session)
 }
 
 async fn enqueue_pivot(
@@ -3056,7 +3052,7 @@ async fn poll_file_chunks(
 // ---- helpers ----
 
 fn short(s: &str) -> &str {
-    &s[..s.len().min(8)]
+    s.get(..8).unwrap_or(s)
 }
 
 fn session_signature(list: &[SessionView]) -> String {
@@ -3078,7 +3074,7 @@ fn extract_session_prefix(text: &str) -> Option<String> {
     if text.starts_with('[') {
         if let Some(end_idx) = text.find(']') {
             if end_idx > 1 && end_idx <= 9 {
-                let prefix = &text[1..end_idx];
+                let prefix = text.get(1..end_idx)?;
                 if prefix.chars().all(|c| c.is_ascii_hexdigit()) {
                     return Some(prefix.to_string());
                 }

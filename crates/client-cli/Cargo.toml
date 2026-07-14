@@ -13,6 +13,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 hex = { workspace = true }
+tracing = { workspace = true }
 nyx-parse = { workspace = true }
 nyx-rest = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }

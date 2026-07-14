@@ -51,11 +51,7 @@ pub unsafe extern "system" fn DllMain(
 ) -> i32 {
     // Return TRUE (1) via raw assembly — no prologue, no stack frame, no GS cookie.
     // `nostack` tells LLVM this asm block does not touch the stack.
-    core::arch::asm!(
-        "mov eax, 1",
-        "ret",
-        options(nostack, nomem)
-    );
+    core::arch::asm!("mov eax, 1", "ret", options(nostack, nomem));
     // Unreachable — the asm above returns. Below is only for type-checking.
     core::hint::unreachable_unchecked();
 }

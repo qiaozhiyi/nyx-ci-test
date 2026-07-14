@@ -12,7 +12,10 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 static ALLOC_LOCK: AtomicBool = AtomicBool::new(false);
 
 unsafe fn lock_allocator() {
-    while ALLOC_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+    while ALLOC_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
         core::hint::spin_loop();
     }
 }
@@ -178,7 +181,12 @@ unsafe fn new_slab_min(min_size: usize) -> *mut u8 {
         // nothing else has a pointer into it yet (we never bumped inside it).
         let free_addr = crate::resolve::export_addr(b"ntdll.dll", b"NtFreeVirtualMemory");
         if let Some(addr) = free_addr {
-            type NtFree = unsafe extern "system" fn(usize, *mut *mut core::ffi::c_void, *mut usize, u32) -> i32;
+            type NtFree = unsafe extern "system" fn(
+                usize,
+                *mut *mut core::ffi::c_void,
+                *mut usize,
+                u32,
+            ) -> i32;
             let nt_free: NtFree = core::mem::transmute(addr);
             let mut addr_arg: *mut core::ffi::c_void = base as *mut core::ffi::c_void;
             let mut region_size: usize = 0;
@@ -227,7 +235,9 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
 
         ensure_resolved();
         if NT_ALLOC.load(Ordering::Acquire) != 0 {
-            unsafe { lock_allocator(); }
+            unsafe {
+                lock_allocator();
+            }
             // Real allocator path.
             loop {
                 // If no slab yet, allocate one first. For a request larger than
@@ -259,7 +269,9 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
                         .compare_exchange(off, new_off, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
-                        unsafe { unlock_allocator(); }
+                        unsafe {
+                            unlock_allocator();
+                        }
                         return (base as usize + off as usize) as *mut u8;
                     }
                     continue;
@@ -281,10 +293,14 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
                 SLAB_BASE.store(nb as u64, Ordering::Release);
                 SLAB_COMMITTED.store(committed, Ordering::Release);
                 SLAB_BUMP.store(aligned as u64, Ordering::Release);
-                unsafe { unlock_allocator(); }
+                unsafe {
+                    unlock_allocator();
+                }
                 return nb;
             }
-            unsafe { unlock_allocator(); }
+            unsafe {
+                unlock_allocator();
+            }
         }
 
         // Fallback: bump within the static buffer.

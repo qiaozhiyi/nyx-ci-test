@@ -114,7 +114,15 @@ impl Runtime {
         // SSNs on Win10/11 range to ~500, so ~16 KiB of trampoline memory
         // (4 pages) handles all resolved syscalls without per-call VirtualProtect
         // or race conditions between concurrent/APC callers.
-        let max_ssn = table.iter().map(|(_, s)| *s).max().unwrap_or(0);
+        // CRITICAL: filter out unresolved SSNs (u32::MAX) before taking the max.
+        // Without this, an all-unresolved table makes max_ssn = u32::MAX, which
+        // overflows the trampoline size calculation and writes a wild pointer.
+        let max_ssn = table
+            .iter()
+            .map(|(_, s)| *s)
+            .filter(|s| *s != u32::MAX)
+            .max()
+            .unwrap_or(0);
         let trampoline_bytes = ((max_ssn as usize) + 1) * STUB_SIZE;
         let trampoline_pages = (trampoline_bytes + 0xFFF) & !0xFFF;
 
@@ -130,8 +138,8 @@ impl Runtime {
         let page = alloc(
             core::ptr::null_mut(),
             trampoline_pages,
-            0x3000,               // MEM_COMMIT | MEM_RESERVE
-            0x04,                 // PAGE_READWRITE
+            0x3000, // MEM_COMMIT | MEM_RESERVE
+            0x04,   // PAGE_READWRITE
         );
         if page.is_null() {
             return None;
@@ -139,6 +147,11 @@ impl Runtime {
 
         // Pre-fill every stub at its fixed offset: trampoline + (ssn * STUB_SIZE).
         for (_name, ssn) in &table {
+            // Skip unresolved entries — their SSN is u32::MAX, which would
+            // overflow the offset calculation and write out of bounds.
+            if *ssn == u32::MAX {
+                continue;
+            }
             let stub = indirect_stub(*ssn, syscall_gadget);
             core::ptr::copy_nonoverlapping(
                 stub.as_ptr(),
@@ -151,7 +164,8 @@ impl Runtime {
         // VirtualProtect flips. Uses kernel32!VirtualProtect (PEB-resolved) to
         // avoid recursing through the indirect-syscall trampoline.
         if let Some(vp_addr) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect") {
-            type VpFn = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, *mut u32) -> i32;
+            type VpFn =
+                unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, *mut u32) -> i32;
             let vp: VpFn = core::mem::transmute(vp_addr);
             let mut old: u32 = 0;
             vp(page, trampoline_pages, 0x20, &mut old);
@@ -943,7 +957,6 @@ pub unsafe fn nt_open_thread(
         client_id,
     )
 }
-
 
 /// `NtQuerySystemInformation(SystemInformationClass, Buffer, Length, ReturnLength)` — 4 args.
 /// Used by T-REX for process enumeration (SystemProcessInformation class 5).

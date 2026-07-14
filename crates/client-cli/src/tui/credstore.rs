@@ -63,17 +63,42 @@ pub struct CredStore {
 }
 
 impl CredStore {
-    pub fn path() -> PathBuf {
-        let mut p = home_dir();
+    /// Resolve the default credentials path `~/.nyx/creds.json`.
+    ///
+    /// SECURITY (H10): returns `Err` when the home directory cannot be
+    /// determined (`HOME`/`USERPROFILE` both unset). We must NEVER fall back to
+    /// CWD here — that would silently write plaintext secrets into an arbitrary
+    /// working directory.
+    pub fn path() -> Result<PathBuf, String> {
+        let mut p = home_dir().ok_or_else(|| {
+            "cannot determine home directory (HOME/USERPROFILE unset)".to_string()
+        })?;
         p.push(".nyx");
         p.push("creds.json");
-        p
+        Ok(p)
     }
 
     pub fn load() -> CredStore {
-        match fs::read(Self::path()) {
+        // SECURITY (H10): if home is unset, return an empty store rather than
+        // silently reading from CWD. A subsequent save() will surface the error.
+        let path = match Self::path() {
+            Ok(p) => p,
+            Err(_) => {
+                return CredStore {
+                    entries: Vec::new(),
+                }
+            }
+        };
+        match fs::read(path) {
             Ok(bytes) => {
-                let file: CredFile = serde_json::from_slice(&bytes).unwrap_or_default();
+                let file: CredFile = match serde_json::from_slice(&bytes) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!("creds.json parse error: {e}; starting with empty store");
+                        // Optionally: move the corrupt file aside for recovery
+                        CredFile::default()
+                    }
+                };
                 CredStore {
                     entries: file.entries,
                 }
@@ -85,8 +110,12 @@ impl CredStore {
     }
 
     /// 写入默认路径 `~/.nyx/creds.json`。临时文件 + 原子 rename，设 0600 权限。
+    ///
+    /// SECURITY (H10): returns an error if the home directory cannot be
+    /// resolved, so secrets are never written to CWD.
     pub fn save(&self) -> std::io::Result<()> {
-        self.save_to(&Self::path())
+        let path = Self::path().map_err(std::io::Error::other)?;
+        self.save_to(&path)
     }
 
     /// 写入指定路径。临时文件 + 原子 rename，避免写一半崩溃损坏凭据库；
@@ -271,11 +300,17 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
-fn home_dir() -> PathBuf {
-    if let Ok(h) = std::env::var("HOME") {
-        return PathBuf::from(h);
-    }
-    PathBuf::from(".")
+/// Resolve the user's home directory.
+///
+/// SECURITY (H10): returns `None` when neither `HOME` nor `USERPROFILE` is set
+/// (the latter is common on Windows). Previously this fell back to `"."` (CWD),
+/// which silently wrote plaintext credentials into whatever directory the CLI
+/// happened to run from. Returning `None` forces callers to refuse to persist
+/// rather than write secrets to an arbitrary CWD.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 #[cfg(test)]

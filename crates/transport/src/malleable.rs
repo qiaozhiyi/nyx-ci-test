@@ -92,13 +92,20 @@ impl MalleableTransport {
 
     /// Create a transport from a raw profile.
     ///
-    /// Panics if the HTTP client cannot be built (should never happen with
-    /// default rustls-tls).
+    /// Builds a blocking `reqwest` client with a 30s timeout. The server runs
+    /// under `panic = "abort"`, so a client-build failure (e.g. a TLS backend
+    /// misconfiguration) must NOT panic the process — instead we log and fall
+    /// back to `Client::new()`, which uses system defaults and is documented to
+    /// always succeed. The transport then degrades to default behaviour rather
+    /// than aborting.
     pub fn new(base_url: String, profile: MalleableProfile) -> Self {
         let agent = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .expect("malleable reqwest blocking client");
+            .unwrap_or_else(|e| {
+                tracing::error!("malleable reqwest build failed: {e}, using default");
+                reqwest::blocking::Client::new()
+            });
         Self {
             profile,
             base_url,

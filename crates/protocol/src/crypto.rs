@@ -493,7 +493,13 @@ pub fn ecdh(our_secret: &[u8; 32], their_public: &[u8; 32]) -> Option<[u8; 32]> 
         return None;
     }
     let shared = scalar.diffie_hellman(&pubkey);
-    Some(*shared.as_bytes())
+    let shared_bytes = shared.as_bytes();
+    // RFC 7748 §6.1 contributory behavior: reject all-zero shared secret
+    // (indicates the peer's public key is a low-order point).
+    if shared_bytes.iter().all(|&b| b == 0) {
+        return None;
+    }
+    Some(*shared_bytes)
 }
 
 /// HKDF-SHA256: extract-then-expand. `salt` and `info` are passed as-is (RFC

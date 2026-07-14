@@ -72,13 +72,14 @@ pub unsafe fn mark_addrs_cfg_valid(addrs: &[usize]) -> usize {
     }
     // Resolve APIs once.
     let nt_query_vm = match crate::resolve::export_addr(b"ntdll.dll", b"NtQueryVirtualMemory") {
-        Some(a) => a, None => return 0,
+        Some(a) => a,
+        None => return 0,
     };
-    let nt_set_vm = match crate::resolve::export_addr(
-        b"ntdll.dll", b"NtSetInformationVirtualMemory",
-    ) {
-        Some(a) => a, None => return 0,
-    };
+    let nt_set_vm =
+        match crate::resolve::export_addr(b"ntdll.dll", b"NtSetInformationVirtualMemory") {
+            Some(a) => a,
+            None => return 0,
+        };
 
     // Query the region for the first address (all must be in same region).
     let (alloc_base, reg_size) = match query_region(nt_query_vm, addrs[0]) {
@@ -108,9 +109,7 @@ pub fn cfg_enabled() -> bool {
             .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"GetProcessMitigationPolicy"))
     };
     if let Some(a) = gpm {
-        type GpmFn = unsafe extern "system" fn(
-            *mut c_void, u32, *mut c_void, usize,
-        ) -> i32;
+        type GpmFn = unsafe extern "system" fn(*mut c_void, u32, *mut c_void, usize) -> i32;
         let gpm_fn: GpmFn = unsafe { core::mem::transmute(a) };
         // ProcessControlFlowGuardPolicy = 8
         #[repr(C)]
@@ -122,7 +121,7 @@ pub fn cfg_enabled() -> bool {
         let st = unsafe {
             gpm_fn(
                 -1isize as *mut c_void, // GetCurrentProcess pseudo-handle
-                8,                       // ProcessControlFlowGuardPolicy
+                8,                      // ProcessControlFlowGuardPolicy
                 &mut policy as *mut CfgPolicy as *mut c_void,
                 4,
             )
@@ -141,7 +140,8 @@ pub fn cfg_enabled() -> bool {
 
 unsafe fn mark_std(addr: usize, spvct: usize) -> bool {
     let nt_query_vm = match crate::resolve::export_addr(b"ntdll.dll", b"NtQueryVirtualMemory") {
-        Some(a) => a, None => return false,
+        Some(a) => a,
+        None => return false,
     };
     let (alloc_base, reg_size) = match query_region(nt_query_vm, addr) {
         Some(r) => r,
@@ -155,7 +155,11 @@ unsafe fn mark_std(addr: usize, spvct: usize) -> bool {
     }
 
     type SpvctFn = unsafe extern "system" fn(
-        *mut c_void, *const c_void, usize, u32, *const CfgCallTargetInfo,
+        *mut c_void,
+        *const c_void,
+        usize,
+        u32,
+        *const CfgCallTargetInfo,
     ) -> i32;
     let spvct_fn: SpvctFn = core::mem::transmute(spvct);
 
@@ -170,16 +174,16 @@ unsafe fn mark_std(addr: usize, spvct: usize) -> bool {
 
 unsafe fn mark_nt(addr: usize) -> bool {
     let nt_query_vm = match crate::resolve::export_addr(b"ntdll.dll", b"NtQueryVirtualMemory") {
-        Some(a) => a, None => return false,
-    };
-    let nt_set_vm = match crate::resolve::export_addr(
-        b"ntdll.dll", b"NtSetInformationVirtualMemory",
-    ) {
         Some(a) => a,
-        // If NtSetInformationVirtualMemory isn't resolvable, CFG probably
-        // isn't relevant for this target. Non-fatal.
-        None => return true,
+        None => return false,
     };
+    let nt_set_vm =
+        match crate::resolve::export_addr(b"ntdll.dll", b"NtSetInformationVirtualMemory") {
+            Some(a) => a,
+            // If NtSetInformationVirtualMemory isn't resolvable, CFG probably
+            // isn't relevant for this target. Non-fatal.
+            None => return true,
+        };
 
     let (alloc_base, reg_size) = match query_region(nt_query_vm, addr) {
         Some(r) => r,
@@ -220,24 +224,36 @@ unsafe fn mark_single_nt(
     }
 
     type SetVmFn = unsafe extern "system" fn(
-        *mut c_void, u32, usize, *mut MemRegionEntry, *mut VmCfgInfo, u32,
+        *mut c_void,
+        u32,
+        usize,
+        *mut MemRegionEntry,
+        *mut VmCfgInfo,
+        u32,
     ) -> i32;
     let set_fn: SetVmFn = core::mem::transmute(nt_set_vm);
 
     let mut cti = CfgTargetInfo { offset, flags: 1 };
-    let mut mre = MemRegionEntry { virtual_address: alloc_base, number_of_bytes: reg_size };
+    let mut mre = MemRegionEntry {
+        virtual_address: alloc_base,
+        number_of_bytes: reg_size,
+    };
     let mut out: u32 = 0;
     let mut vmi = VmCfgInfo {
-        number_of_entries: 1, _pad: 0, _z1: 0, _z2: 0,
-        entry_ptr: &mut cti, out_ptr: &mut out,
+        number_of_entries: 1,
+        _pad: 0,
+        _z1: 0,
+        _z2: 0,
+        entry_ptr: &mut cti,
+        out_ptr: &mut out,
     };
 
     // VmCfgCallTargetInformation = 4 (0x4)
     // InformationClass = 4 for the Set call
     let st = set_fn(
         (-1isize) as *mut c_void, // CurrentProcess
-        4,                          // VmCfgCallTargetInformation
-        1,                          // NumberOfMemRangeEntries
+        4,                        // VmCfgCallTargetInformation
+        1,                        // NumberOfMemRangeEntries
         &mut mre,
         &mut vmi,
         core::mem::size_of::<VmCfgInfo>() as u32,
@@ -252,10 +268,7 @@ unsafe fn mark_single_nt(
 /// Query the allocation base and region size for `addr`.
 /// Returns `Some((alloc_base, region_size))` if the region is committed private
 /// memory (MEM_COMMIT | MEM_PRIVATE); `None` otherwise.
-unsafe fn query_region(
-    nt_query_vm: usize,
-    addr: usize,
-) -> Option<(*mut c_void, usize)> {
+unsafe fn query_region(nt_query_vm: usize, addr: usize) -> Option<(*mut c_void, usize)> {
     #[repr(C)]
     struct MemBasicInfo {
         base: *mut c_void,
@@ -270,20 +283,32 @@ unsafe fn query_region(
     }
 
     type QueryVmFn = unsafe extern "system" fn(
-        *mut c_void, *const c_void, u32, *mut c_void, usize, *mut usize,
+        *mut c_void,
+        *const c_void,
+        u32,
+        *mut c_void,
+        usize,
+        *mut usize,
     ) -> i32;
     let query_fn: QueryVmFn = core::mem::transmute(nt_query_vm);
 
     let mut mbi = MemBasicInfo {
-        base: core::ptr::null_mut(), alloc_base: core::ptr::null_mut(),
-        alloc_prot: 0, _p1: 0, reg_size: 0, state: 0, prot: 0, typ: 0, _p2: 0,
+        base: core::ptr::null_mut(),
+        alloc_base: core::ptr::null_mut(),
+        alloc_prot: 0,
+        _p1: 0,
+        reg_size: 0,
+        state: 0,
+        prot: 0,
+        typ: 0,
+        _p2: 0,
     };
     let mut ret_len: usize = 0;
 
     if query_fn(
-        (-1isize) as *mut c_void,    // CurrentProcess
+        (-1isize) as *mut c_void, // CurrentProcess
         addr as *const c_void,
-        0,                            // MemoryBasicInformation
+        0, // MemoryBasicInformation
         &mut mbi as *mut MemBasicInfo as *mut c_void,
         core::mem::size_of::<MemBasicInfo>(),
         &mut ret_len,
@@ -320,9 +345,7 @@ pub fn selftest_cfg() -> u8 {
         Some(a) => a,
         None => return 0x80,
     };
-    type VAlloc = unsafe extern "system" fn(
-        *mut c_void, usize, u32, u32,
-    ) -> *mut c_void;
+    type VAlloc = unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void;
     let vaf: VAlloc = unsafe { core::mem::transmute(va) };
     let page = unsafe { vaf(core::ptr::null_mut(), 0x1000, 0x3000, 0x40) }; // RWX
     if page.is_null() {
@@ -331,9 +354,9 @@ pub fn selftest_cfg() -> u8 {
     let test_addr = page as usize;
 
     // Try standard path.
-    let std_ok = if let Some(spvct) = unsafe {
-        crate::resolve::export_addr(b"kernelbase.dll", b"SetProcessValidCallTargets")
-    } {
+    let std_ok = if let Some(spvct) =
+        unsafe { crate::resolve::export_addr(b"kernelbase.dll", b"SetProcessValidCallTargets") }
+    {
         unsafe { mark_std(test_addr, spvct) }
     } else {
         false

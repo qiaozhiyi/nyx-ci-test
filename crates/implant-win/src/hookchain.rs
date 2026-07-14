@@ -375,7 +375,12 @@ unsafe fn alloc_persistent_stub(bytes: &[u8]) -> usize {
     if let Some(vp_addr) = vp_resolved {
         let vp: FnVP = core::mem::transmute(vp_addr);
         unsafe {
-            vp(stub_addr as *mut c_void, STUB_SIZE, 0x40 /* RWX */, &mut old_protect);
+            vp(
+                stub_addr as *mut c_void,
+                STUB_SIZE,
+                0x40, /* RWX */
+                &mut old_protect,
+            );
         }
     }
     unsafe {

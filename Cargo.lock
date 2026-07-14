@@ -2040,6 +2040,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "urlencoding",
 ]
 
@@ -2210,6 +2211,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tracing",
  "ureq",
 ]
 

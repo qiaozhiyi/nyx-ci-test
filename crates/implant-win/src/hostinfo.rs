@@ -227,16 +227,15 @@ pub fn machine_sid() -> Option<[u8; 68]> {
         unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
 
-    let gcp: GetCurrentProcess =
-        match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return None,
-        };
-    let opt: OpenProcessToken =
-        match unsafe { export_addr(b"advapi32.dll", b"OpenProcessToken") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return None,
-        };
+    let gcp: GetCurrentProcess = match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") }
+    {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return None,
+    };
+    let opt: OpenProcessToken = match unsafe { export_addr(b"advapi32.dll", b"OpenProcessToken") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return None,
+    };
     let gti: GetTokenInformation =
         match unsafe { export_addr(b"advapi32.dll", b"GetTokenInformation") } {
             Some(a) => unsafe { core::mem::transmute(a) },
@@ -300,11 +299,10 @@ pub fn primary_mac() -> Option<[u8; 6]> {
         return None;
     }
     type GetAdaptersInfo = unsafe extern "system" fn(*mut u8, *mut u32) -> u32;
-    let f: GetAdaptersInfo =
-        match unsafe { export_addr(b"iphlpapi.dll", b"GetAdaptersInfo") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return None,
-        };
+    let f: GetAdaptersInfo = match unsafe { export_addr(b"iphlpapi.dll", b"GetAdaptersInfo") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return None,
+    };
 
     // First call with NULL buffer → get required size.
     let mut size: u32 = 0;

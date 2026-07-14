@@ -157,41 +157,70 @@ impl AuditWriter {
     /// Read + filter + paginate. Re-opens the file fresh (the log is
     /// append-only, so a concurrent writer can only add lines). Newest-first by
     /// default; `?dir=asc` flips it. Hard cap 5000 so a full scan can't OOM.
+    ///
+    /// Memory bounding (M12): the file is read oldest-first. The oldest-first
+    /// (`dir=asc`) output short-circuits as soon as `limit` page records past
+    /// `offset` are collected, so it never holds more than `limit` records. The
+    /// default newest-first output cannot short-circuit (the newest records come
+    /// last), so it uses a ring buffer capped at `keep = offset + limit`
+    /// matches: each new match pushes to the back and, once `keep` is exceeded,
+    /// the oldest is dropped from the front. After the scan the buffer holds at
+    /// most the `keep` newest matches; reversing yields newest-first and
+    /// `skip(offset).take(limit)` selects the page. `keep` is itself capped at
+    /// `HARD_CAP` so a malicious `offset` can't force a huge buffer — beyond the
+    /// cap the page just returns fewer rows.
     pub fn query(&self, q: &AuditQuery) -> std::io::Result<Vec<AuditRecord>> {
         let f = File::open(&self.path)?;
         let reader = BufReader::new(f);
-        let mut recs = Vec::new();
-        let limit = q.limit.unwrap_or(500).min(5000);
+        let limit = q.limit.unwrap_or(500).min(HARD_CAP);
         let offset = q.offset.unwrap_or(0);
+        let is_asc = q.dir.as_deref() == Some("asc");
+        // `keep` bounds the ring buffer for the newest-first path. Cap it at
+        // HARD_CAP so an attacker-supplied `offset` can't grow the buffer
+        // unboundedly; an offset beyond the cap simply yields an empty page.
+        let keep = offset.saturating_add(limit).min(HARD_CAP);
+
+        // Oldest-first (`asc`) path: collect only the page records, then stop.
+        // Newest-first path: ring buffer of the `keep` newest matches.
+        let mut asc_recs: Vec<AuditRecord> = Vec::new();
+        let mut ring: std::collections::VecDeque<AuditRecord> =
+            std::collections::VecDeque::with_capacity(keep.max(1));
         let mut match_count = 0;
 
         for line in reader.lines().map_while(Result::ok) {
-            if let Ok(r) = serde_json::from_str::<AuditRecord>(&line) {
-                if q.operator.as_deref().is_none_or(|o| r.operator == o)
-                    && q.action.as_deref().is_none_or(|a| r.action == a)
-                    && q.since.is_none_or(|s| r.ts >= s)
-                    && q.until.is_none_or(|u| r.ts <= u)
-                {
-                    match_count += 1;
-                    if q.dir.as_deref() == Some("asc") {
-                        if match_count > offset {
-                            recs.push(r);
-                            if recs.len() >= limit {
-                                break;
-                            }
-                        }
-                    } else {
-                        recs.push(r);
+            let Ok(r) = serde_json::from_str::<AuditRecord>(&line) else {
+                continue;
+            };
+            if !(q.operator.as_deref().is_none_or(|o| r.operator == o)
+                && q.action.as_deref().is_none_or(|a| r.action == a)
+                && q.since.is_none_or(|s| r.ts >= s)
+                && q.until.is_none_or(|u| r.ts <= u))
+            {
+                continue;
+            }
+            match_count += 1;
+            if is_asc {
+                if match_count > offset {
+                    asc_recs.push(r);
+                    if asc_recs.len() >= limit {
+                        break;
                     }
+                }
+            } else {
+                // Ring buffer: keep only the `keep` newest matches in memory.
+                ring.push_back(r);
+                if ring.len() > keep {
+                    ring.pop_front();
                 }
             }
         }
 
-        if q.dir.as_deref() != Some("asc") {
-            recs.reverse();
-            let page_offset = offset.min(recs.len());
-            recs = recs.into_iter().skip(page_offset).take(limit).collect();
+        if is_asc {
+            return Ok(asc_recs);
         }
+        // Newest-first: the buffer holds the `keep` newest matches in insertion
+        // (oldest-first) order. Reverse → newest-first, then skip/take the page.
+        let recs: Vec<AuditRecord> = ring.into_iter().rev().skip(offset).take(limit).collect();
         Ok(recs)
     }
 
@@ -233,6 +262,12 @@ impl AuditWriter {
 }
 
 const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Hard cap on the number of records a single `query()` can return (and on the
+/// ring-buffer size for the newest-first path). Bounds memory so a full-file
+/// scan can't OOM (M12) — an append-only audit log can grow arbitrarily large,
+/// and the newest-first pagination previously materialized every match.
+const HARD_CAP: usize = 5000;
 
 fn hash_record(
     seq: u64,

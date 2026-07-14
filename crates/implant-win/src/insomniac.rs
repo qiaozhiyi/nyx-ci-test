@@ -69,13 +69,11 @@ pub unsafe fn check_preservation(
     let text_end = text_rva + text_size;
 
     // Check if .pdata overlaps with .text range.
-    let pdata_in_text = pdata_rva > 0
-        && pdata_rva < text_end
-        && (pdata_rva + pdata_size) > text_rva;
+    let pdata_in_text =
+        pdata_rva > 0 && pdata_rva < text_end && (pdata_rva + pdata_size) > text_rva;
 
-    let rdata_in_text = rdata_rva > 0
-        && rdata_rva < text_end
-        && (rdata_rva + rdata_size) > text_rva;
+    let rdata_in_text =
+        rdata_rva > 0 && rdata_rva < text_end && (rdata_rva + rdata_size) > text_rva;
 
     let automatic = !pdata_in_text && !rdata_in_text;
 
@@ -120,7 +118,9 @@ pub unsafe fn bootstrap_check() {
         None => return,
     };
     let ldr = unsafe { (*peb).ldr };
-    if ldr.is_null() { return; }
+    if ldr.is_null() {
+        return;
+    }
     let mut head = unsafe { (*ldr).in_load_order_module_list.flink };
     let list_start: *const u8 =
         unsafe { &(*ldr).in_load_order_module_list as *const _ as *const u8 };

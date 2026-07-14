@@ -30,6 +30,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::constant_time_eq;
 
+/// Pre-computed dummy argon2id hash for timing equalization on missing
+/// usernames (H6). `resolve()` returns immediately when a name isn't found, but
+/// runs the argon2 KDF for an existing one — a remote timing oracle that lets
+/// an attacker enumerate valid operator names. To close it, the not-found path
+/// verifies the supplied secret against this dummy hash first (the result is
+/// always wrong, so auth still fails — but the argon2 KDF runs in BOTH paths,
+/// equalizing timing). This is a real argon2id PHC string generated with
+/// `Argon2::default()` (m=19456, t=2, p=1) so `PasswordHash::new` parses it and
+/// the verifier does full work; the salt+hash correspond to a throwaway value,
+/// not any operator credential.
+const DUMMY_ARGON2_HASH: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$avsslxbZ8H9a70Oz4U8X2A$wyQB2YXwW8o/KHkgNgVa93jV2hezrFS9XtUiRh/p1eA";
+
+/// Run the argon2 KDF against the dummy hash, discarding the result. Used on
+/// the username-not-found path of `resolve()` to equalize timing with the
+/// found path (which runs argon2 to verify the real secret). Parsing the PHC
+/// string is cached in a `OnceLock` so only the first miss pays the parse cost;
+/// subsequent misses share the parsed hash (the KDF still runs every time, which
+/// is the whole point). A parse failure (impossible for this constant, but
+/// defended against so a future edit can't panic the server under
+/// `panic = "abort"`) simply skips the dummy work.
+fn run_dummy_argon2(secret: &str) {
+    static DUMMY: std::sync::OnceLock<Option<PasswordHash>> = std::sync::OnceLock::new();
+    let parsed = DUMMY.get_or_init(|| PasswordHash::new(DUMMY_ARGON2_HASH).ok());
+    if let Some(h) = parsed {
+        let _ = Argon2::default().verify_password(secret.as_bytes(), h);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -88,17 +117,40 @@ impl OperatorRegistry {
 
     /// Resolve a bearer value to an identity. Accepts `name:secret` (multi-op)
     /// or a bare token (matched against the `_legacy` record, if any).
+    ///
+    /// Timing equalization (H6): when the username is not found, the argon2 KDF
+    /// would otherwise be skipped entirely, making the found-vs-not-found paths
+    /// distinguishable by wall-clock time — a remote oracle for enumerating
+    /// valid operator names. On every not-found path we run the argon2 KDF
+    /// against [`DUMMY_ARGON2_HASH`] (result discarded) so both paths pay the
+    /// same dominant cost.
     pub fn resolve(&self, bearer: &str) -> Option<OperatorIdentity> {
         let g = self.ops.read().ok()?;
         if let Some((name, secret)) = bearer.split_once(':') {
-            let rec = g.get(name)?;
+            // Not-found path: run the dummy argon2 KDF before returning None so
+            // the timing matches the found path (which verifies a real hash).
+            let rec = match g.get(name) {
+                Some(r) => r,
+                None => {
+                    run_dummy_argon2(secret);
+                    return None;
+                }
+            };
             return verify_secret(&rec.secret_hash, secret).then(|| OperatorIdentity {
                 name: rec.name.clone(),
                 role: rec.role,
             });
         }
-        // Bare token → legacy `_legacy` record.
-        let rec = g.get("_legacy")?;
+        // Bare token → legacy `_legacy` record. Same dummy-KDF equalization when
+        // no `_legacy` record exists (e.g. a name was supplied without a colon
+        // but no legacy token was configured).
+        let rec = match g.get("_legacy") {
+            Some(r) => r,
+            None => {
+                run_dummy_argon2(bearer);
+                return None;
+            }
+        };
         verify_secret(&rec.secret_hash, bearer).then(|| OperatorIdentity {
             name: "_legacy".into(),
             role: rec.role,

