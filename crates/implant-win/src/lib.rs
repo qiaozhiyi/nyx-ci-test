@@ -70,6 +70,8 @@ pub mod blind_hwbp;
 pub mod bof;
 #[cfg(target_os = "windows")]
 pub mod caller_spoof;
+#[cfg(target_os = "windows")]
+pub mod channels;
 pub mod caller_spoof_thunk;
 #[cfg(target_os = "windows")]
 pub mod config;

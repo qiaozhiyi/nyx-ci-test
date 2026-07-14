@@ -182,6 +182,29 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
     let _keying_levels_plain = r.u32().ok().unwrap_or(0);
     let expires_at = r.u64().ok().unwrap_or(0);
 
+    // Channel dispatcher fields (spec-1). Old server-generated configs stop
+    // after expires_at — `remaining()==0` → default to Https-only.
+    let (primary_channel, fallback_bitmap, doh_resolver, smb_pipe_name, extc2_api_host, extc2_token) =
+        if r.remaining() > 0 {
+            (
+                r.u8().ok().unwrap_or(0),
+                r.u8().ok().unwrap_or(0),
+                r.str().ok().unwrap_or_default(),
+                r.str().ok().unwrap_or_default(),
+                r.str().ok().unwrap_or_default(),
+                r.str().ok().unwrap_or_default(),
+            )
+        } else {
+            (
+                0u8,
+                0u8,
+                crate::heap::String::new(),
+                crate::heap::String::new(),
+                crate::heap::String::new(),
+                crate::heap::String::new(),
+            )
+        };
+
     let cfg = crate::config::Config {
         server_host,
         server_port,
@@ -190,6 +213,12 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
         sleep_seconds,
         jitter_pct,
         use_tls,
+        primary_channel,
+        fallback_bitmap,
+        doh_resolver,
+        smb_pipe_name,
+        extc2_api_host,
+        extc2_token,
     };
 
     let implant = ImplantConfig {

