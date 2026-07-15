@@ -16,19 +16,9 @@ serde_json = { workspace = true }
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 tracing = { workspace = true }
-# NOTE: exact browser JA3/JA4/Akamai emission needs a BoringSSL-backed HTTP
-# client. The `rquest` line was renamed `wreq` (6.0.0-rc.x, author 0x676e67);
-# rquest 5.x is yanked. We do NOT declare it here yet (an unresolvable optional
-# dep would break `cargo metadata` even when the feature is off). The
-# `rquest` feature below is a no-op stub until wreq 6.0 goes stable and we pin
-# it; enablement is a post-M0 task (see ROADMAP M5).
 
 [features]
 default = []
-# Placeholder for the BoringSSL fingerprint-emission backend (wreq/rquest). When
-# wreq 6.0 is stable this feature will pull it in; for now it's a documented
-# no-op so the emitter trait seam exists and `cfg`-gates the call sites.
-rquest = []
 
 [dev-dependencies]
 md-5 = "0.10"

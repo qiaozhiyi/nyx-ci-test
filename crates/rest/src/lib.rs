@@ -53,6 +53,12 @@ pub struct SessionView {
     /// Inbound TLS JA4 (FoxIO `a_b_c`), if captured.
     #[serde(default)]
     pub ja4: Option<String>,
+    /// `true` when the session was restored from the persistent store at boot
+    /// and has NOT beaconed since the restart — i.e. its last_seen is from a
+    /// prior server lifetime, so the operator sees it flagged as potentially
+    /// gone. Cleared to `false` on the first live check-in after boot.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 /// Ack for `POST /api/task`: the assigned task id (and, for `Connect`, the

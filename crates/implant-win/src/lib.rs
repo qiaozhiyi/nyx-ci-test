@@ -72,7 +72,6 @@ pub mod bof;
 pub mod caller_spoof;
 #[cfg(target_os = "windows")]
 pub mod channels;
-pub mod caller_spoof_thunk;
 #[cfg(target_os = "windows")]
 pub mod config;
 #[cfg(target_os = "windows")]
@@ -116,8 +115,6 @@ pub mod lacuna_stomp;
 pub mod mem;
 #[cfg(target_os = "windows")]
 pub mod ntalloc;
-#[cfg(target_os = "windows")]
-pub mod pic_thunk;
 #[cfg(target_os = "windows")]
 pub mod pivot;
 #[cfg(target_os = "windows")]

