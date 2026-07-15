@@ -83,6 +83,43 @@ impl CredStore {
                 PRIMARY KEY (realm, user, kind)
             );",
         )?;
+        Self::migrate(conn)?;
+        Ok(())
+    }
+
+    /// Lightweight schema-migration gate.
+    ///
+    /// The `_schema_version` row records which migration step the database is
+    /// at. Bump `CURRENT_SCHEMA_VERSION` and append a migration arm when adding
+    /// columns or altering tables — `ALTER TABLE ... ADD COLUMN` is the
+    /// forward-only pattern SQLite supports without a full reload.
+    const CURRENT_SCHEMA_VERSION: i64 = 1;
+
+    fn migrate(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _schema_version (
+                version INTEGER NOT NULL
+            );",
+        )?;
+        // Seed version 0 for pre-existing databases that lack the row.
+        conn.execute(
+            "INSERT OR IGNORE INTO _schema_version (version) VALUES (0);",
+            [],
+        )?;
+        let current: i64 =
+            conn.query_row("SELECT version FROM _schema_version LIMIT 1", [], |r| r.get(0))?;
+        if current < Self::CURRENT_SCHEMA_VERSION {
+            // --- migration arms (forward-only) ---------------------------------
+            // v0 → v1: initial baseline (creds table already created by init).
+            //         No ALTER needed — this just stamps the version.
+            // if current < 1 {
+            //     conn.execute("ALTER TABLE creds ADD COLUMN ...", [])?;
+            // }
+            conn.execute(
+                "UPDATE _schema_version SET version = ?1;",
+                params![Self::CURRENT_SCHEMA_VERSION],
+            )?;
+        }
         Ok(())
     }
 

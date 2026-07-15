@@ -501,6 +501,7 @@ pub async fn generate_implant(
             nops: true,
             registers: true,
             keys: true,
+            substitute: true,
         };
         let report = mutator.mutate(&mut binary, passes);
         tracing::info!(
@@ -508,6 +509,7 @@ pub async fn generate_implant(
             nops = report.nops_inserted,
             regs = report.registers_swapped,
             keys = report.keys_randomized,
+            subst = report.instructions_substituted,
             "binary mutation applied"
         );
         Some(report)
@@ -651,6 +653,7 @@ pub async fn generate_implant(
                 "nops_inserted": report.nops_inserted,
                 "registers_swapped": report.registers_swapped,
                 "keys_randomized": report.keys_randomized,
+                "instructions_substituted": report.instructions_substituted,
             });
         }
         audit.append("implant_generated", "system", "", detail);

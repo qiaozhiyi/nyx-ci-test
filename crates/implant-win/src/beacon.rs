@@ -176,6 +176,9 @@ pub unsafe fn beacon_loop() {
             let active = crate::channels::get_active();
             if let Some(fb) = crate::channels::next_fallback(active) {
                 crate::channels::set_active(fb);
+            } else {
+                // Fallback chain exhausted — reset to primary for next cycle.
+                crate::channels::set_active(crate::channels::PRIMARY_CHANNEL);
             }
             continue;
         };

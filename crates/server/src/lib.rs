@@ -50,7 +50,11 @@ use nyx_protocol::{
     encode_frame_dir, open_frame, parse_frame, wire::Reader, Command, Direction, FileOp,
     Response as MsgResponse, ServerKeypair, SessionInfo, SessionKey, Task, TaskResponse,
 };
-use serde::{Deserialize, Serialize};
+// REST view types — the server serializes these for /api/* responses. Using
+// nyx-rest as the single source of truth prevents field drift between the
+// server's serializers and the clients' deserializers.
+use nyx_rest::{ProfileView, ResultView, SessionView, TaskAck, TaskView};
+use serde::Deserialize;
 use sha2::Digest;
 
 /// A session is keyed by the implant's 32-byte ephemeral public key.
@@ -1015,26 +1019,8 @@ fn handle_frame(
 }
 
 // ---- control API -----------------------------------------------------------
-
-#[derive(Serialize)]
-struct SessionView {
-    id: String,
-    beacon_id: u32,
-    hostname: String,
-    username: String,
-    os: String,
-    arch: u8,
-    pid: u32,
-    is_admin: u8,
-    pending: usize,
-    age_secs: u64,
-    /// Inbound TLS JA3 (if captured by the ClientHello sniffer).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ja3: Option<String>,
-    /// Inbound TLS JA4 (if captured).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ja4: Option<String>,
-}
+// View types (SessionView, TaskAck, ResultView, TaskView, ProfileView) are
+// imported from nyx_rest — the single source of truth for /api/* JSON shapes.
 
 /// If an API token is configured, every control-API request must carry
 /// `Authorization: Bearer <token>`. `/beacon` is exempt (implants authenticate
@@ -1371,15 +1357,6 @@ impl JsonCommand {
     }
 }
 
-#[derive(Serialize)]
-struct TaskAck {
-    task_id: u64,
-    /// 对 Connect 命令，server 分配的 channel id（操作员用它发后续 /socks）。
-    /// 其他命令为 None。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    chan: Option<u32>,
-}
-
 fn parse_session_hex(s: &str) -> Option<SessionId> {
     // Reject by length BEFORE decoding: a session id is exactly 32 bytes = 64
     // hex chars. hex::decode allocates s.len()/2 bytes upfront, so decoding an
@@ -1547,20 +1524,6 @@ async fn post_task(
 #[derive(Deserialize)]
 struct ResultsQuery {
     session: String,
-}
-
-#[derive(Serialize)]
-struct ResultView {
-    task_id: u64,
-    kind: String,
-    text: String,
-    /// Present only for `FileChunk` results (hex-encoded chunk bytes).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data_hex: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    seq: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    eof: Option<u8>,
 }
 
 async fn get_results(
@@ -1903,12 +1866,6 @@ fn command_name(c: &Command) -> &'static str {
     }
 }
 
-#[derive(Serialize)]
-struct TaskView {
-    task_id: u64,
-    command: String,
-}
-
 /// `GET /api/tasks?session=<hex>` — the pending task queue for a session.
 async fn get_tasks(
     State(st): State<Arc<AppState>>,
@@ -1934,14 +1891,6 @@ async fn get_tasks(
         None => Vec::new(),
     };
     Json(views).into_response()
-}
-
-#[derive(Serialize)]
-struct ProfileView {
-    loaded: bool,
-    http_get_uri: Option<String>,
-    http_post_uri: Option<String>,
-    useragent: Option<String>,
 }
 
 /// `GET /api/profile` — the active Malleable C2 profile summary (or `loaded:

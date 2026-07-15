@@ -14,7 +14,7 @@
 
 #![forbid(unsafe_code)]
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ---- view types (mirror the server's REST output, ALL fields) ------------
 //
@@ -25,7 +25,7 @@ use serde::Deserialize;
 /// One beacon session, as returned by `GET /api/sessions`. Field-for-field with
 /// `server::SessionView` (the serializer), including `age_secs`/`ja3`/`ja4`
 /// which prior client copies silently dropped.
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SessionView {
     pub id: String,
     #[serde(default)]
@@ -57,7 +57,7 @@ pub struct SessionView {
 
 /// Ack for `POST /api/task`: the assigned task id (and, for `Connect`, the
 /// server-allocated channel id).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskAck {
     pub task_id: u64,
     #[serde(default)]
@@ -65,7 +65,7 @@ pub struct TaskAck {
 }
 
 /// One task result row from `GET /api/results`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResultView {
     pub task_id: u64,
     pub kind: String,
@@ -91,6 +91,25 @@ pub fn arch_name(a: u8) -> &'static str {
         2 => "x86",
         _ => "?",
     }
+}
+
+/// One pending-task row from `GET /api/tasks`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskView {
+    pub task_id: u64,
+    pub command: String,
+}
+
+/// `GET /api/profile` — the active Malleable C2 profile summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileView {
+    pub loaded: bool,
+    #[serde(default)]
+    pub http_get_uri: Option<String>,
+    #[serde(default)]
+    pub http_post_uri: Option<String>,
+    #[serde(default)]
+    pub useragent: Option<String>,
 }
 
 /// Attach the bearer API token to a request when one is configured; pass the

@@ -322,18 +322,33 @@ pub unsafe fn post_frame(
         }
     }
 
-    // ---- WinHttpSendRequest with optional TLS cert-ignore retry ----
+    // ---- WinHttpSendRequest with optional TLS cert-ignore ----
     // Default: strict cert validation — failure returns None immediately.
-    // When NYX_TLS_INSECURE=1 is set at build time, the legacy self-signed
-    // redirector retry path is active:
-    //   1. Attempt with strict cert validation.
-    //   2. On failure, set SECURITY_FLAG_IGNORE_* and retry.
+    // When NYX_TLS_INSECURE=1 is set at build time, relax cert validation
+    // BEFORE the first send (WinHTTP requires SECURITY_FLAGS set before
+    // WinHttpSendRequest; setting them after a failed send is rejected or
+    // silently ignored, so the old post-failure retry never actually relaxed).
     // NOTE: WINHTTP_OPTION_SECURITY_FLAGS = 31 (0x1F), not 32.
-    let tls_flags: u32 = SECURITY_FLAG_IGNORE_UNKNOWN_CA
-        | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
-        | SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
-    let can_relax_cert = use_tls && fns.set_option.is_some();
-    // First attempt (strict cert validation).
+    let can_relax_cert = use_tls && fns.set_option.is_some() && tls_insecure_retry();
+    if can_relax_cert {
+        let tls_flags: u32 = SECURITY_FLAG_IGNORE_UNKNOWN_CA
+            | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+            | SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
+        let set_option = fns.set_option.unwrap();
+        if set_option(
+            req,
+            WINHTTP_OPTION_SECURITY_FLAGS,
+            &tls_flags as *const u32 as *const u8,
+            4,
+        ) == 0
+        {
+            // Could not set relaxation flags — abort rather than send strict.
+            (fns.close_handle)(req);
+            (fns.close_handle)(conn);
+            (fns.close_handle)(session);
+            return None;
+        }
+    }
     let ok = (fns.send_request)(
         req,
         core::ptr::null(),
@@ -343,38 +358,7 @@ pub unsafe fn post_frame(
         wire_body.len() as u32,
         0,
     );
-    if ok == 0 && can_relax_cert && tls_insecure_retry() {
-        let set_option = fns.set_option.unwrap();
-        if set_option(
-            req,
-            WINHTTP_OPTION_SECURITY_FLAGS,
-            &tls_flags as *const u32 as *const u8,
-            4,
-        ) != 0
-        {
-            // Retry with relaxed cert validation.
-            let retry_ok = (fns.send_request)(
-                req,
-                core::ptr::null(),
-                0,
-                wire_body.as_ptr(),
-                wire_body.len() as u32,
-                wire_body.len() as u32,
-                0,
-            );
-            if retry_ok == 0 {
-                (fns.close_handle)(req);
-                (fns.close_handle)(conn);
-                (fns.close_handle)(session);
-                return None;
-            }
-        } else {
-            (fns.close_handle)(req);
-            (fns.close_handle)(conn);
-            (fns.close_handle)(session);
-            return None;
-        }
-    } else if ok == 0 {
+    if ok == 0 {
         (fns.close_handle)(req);
         (fns.close_handle)(conn);
         (fns.close_handle)(session);
@@ -598,11 +582,26 @@ pub unsafe fn post_frame_enhanced(
         }
     }
 
-    // ---- Send request (with cert-ignore retry, same as post_frame) ----
-    let tls_flags: u32 = SECURITY_FLAG_IGNORE_UNKNOWN_CA
-        | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
-        | SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
-    let can_relax_cert = use_tls && fns.set_option.is_some();
+    // ---- Send request (with cert-ignore, same pre-send approach as post_frame) ----
+    let can_relax_cert = use_tls && fns.set_option.is_some() && tls_insecure_retry();
+    if can_relax_cert {
+        let tls_flags: u32 = SECURITY_FLAG_IGNORE_UNKNOWN_CA
+            | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+            | SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
+        let set_option = fns.set_option.unwrap();
+        if set_option(
+            req,
+            WINHTTP_OPTION_SECURITY_FLAGS,
+            &tls_flags as *const u32 as *const u8,
+            4,
+        ) == 0
+        {
+            (fns.close_handle)(req);
+            (fns.close_handle)(conn);
+            (fns.close_handle)(session);
+            return None;
+        }
+    }
     let ok = (fns.send_request)(
         req,
         core::ptr::null(),
@@ -612,37 +611,7 @@ pub unsafe fn post_frame_enhanced(
         wire_body.len() as u32,
         0,
     );
-    if ok == 0 && can_relax_cert && tls_insecure_retry() {
-        let set_option = fns.set_option.unwrap();
-        if set_option(
-            req,
-            WINHTTP_OPTION_SECURITY_FLAGS,
-            &tls_flags as *const u32 as *const u8,
-            4,
-        ) != 0
-        {
-            let retry_ok = (fns.send_request)(
-                req,
-                core::ptr::null(),
-                0,
-                wire_body.as_ptr(),
-                wire_body.len() as u32,
-                wire_body.len() as u32,
-                0,
-            );
-            if retry_ok == 0 {
-                (fns.close_handle)(req);
-                (fns.close_handle)(conn);
-                (fns.close_handle)(session);
-                return None;
-            }
-        } else {
-            (fns.close_handle)(req);
-            (fns.close_handle)(conn);
-            (fns.close_handle)(session);
-            return None;
-        }
-    } else if ok == 0 {
+    if ok == 0 {
         (fns.close_handle)(req);
         (fns.close_handle)(conn);
         (fns.close_handle)(session);
