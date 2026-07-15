@@ -363,6 +363,12 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
         help: "T-REX target recon (noise-graded EDR detection)",
         icon: "🦖",
     },
+    MetaCmd {
+        name: "/channel",
+        args_hint: "[0-8|https|doh|dns|smb|tcp|slack|llm|mcp|discord]",
+        help: "switch C2 transport channel (no arg = list all)",
+        icon: "📡",
+    },
     // ── Implant generation ───────────────────────────────────────────────
     MetaCmd {
         name: "/generate",
