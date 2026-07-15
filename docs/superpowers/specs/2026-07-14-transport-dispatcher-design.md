@@ -1,9 +1,23 @@
 # spec-1: 信道无关帧层 + 双侧 Dispatcher(多信道基座接线)
 
 **日期**: 2026-07-14
-**状态**: 设计中
+**状态**: ✅ 已实现并验证 (2026-07-14)
 **决策**: 双层架构(PIC implant 用 FFI,nyx-transport 作 dev/reference)+ 运行时热切换
 **前置**: 无(本 spec 是后续所有信道 spec 的前提)
+
+> **实现完成**: 所有 spec(spec-1 ~ spec-7)已全部实现并编译通过。
+> - spec-1 基座: commit `7f586ca`
+> - spec-2 DoH+SMB: commit `c7aa6e1`
+> - spec-3 TCP: commit `c7aa6e1`
+> - spec-4 DNS: commit `c7aa6e1`
+> - spec-6 External C2: commit `c7aa6e1`
+> - spec-7 HTTP 增强: commit `28806a1`
+> - safe_http: commit `8454134`
+> - SetChannel fix: commit `aa8b6a3`
+> - TUI /channel: commit `10a6631`
+>
+> **Windows Server 2019 验证**: 7 个 HTTP 端点全部在线(/beacon /doh /dns /extc2/*),
+> beacon check-in + Ping 任务 round-trip 通过, SetChannel wire 协议端到端通过。
 
 ---
 

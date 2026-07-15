@@ -28,9 +28,9 @@
 │   PIC DLL)   │                    │              │
 └──────────────┘                    └──────┬───────┘
       │                                     │ REST API
-      │ 7 transport channels                │ (JSON, bearer auth)
-      │ (HTTPS/DoH/Slack/                   │
-      │  LLM/MCP/Malleable/SMB)             │
+      │ 9 transport channels                │ (JSON, bearer auth)
+      │ (HTTPS/DoH/DNS/SMB/TCP/             │
+      │  Slack/LLM/MCP/Discord)             │
       │                            ┌────────┴────────┐
       └── Indirect syscalls        │  Client CLI     │
           PEB-walk resolve         │  (TUI + SOCKS)  │
@@ -214,8 +214,8 @@
 | 24 | `Rev2Self` | ✅ 完整 | 恢复身份（保留 token） |
 | 25 | `GetUid` | ✅ 完整 | 当前线程身份 |
 | 26 | `Inject` | ⚠️ 混合 | method 0=Pool Party（门控）, 1=Threadless HWBP ✅, 2=Module Stomp ✅ |
-| 27 | `Trex` | ❌ 桩 | T-REX EDR 侦察引擎（`TREX_SCANNERS_IMPLEMENTED=false`） |
-| 28 | `SetChannel` | ✅ 完整 | 切换传输信道（7 种） |
+| 27 | `Trex` | ✅ 完整 | T-REX EDR 侦察引擎（T0 进程枚举 + T3 服务枚举 + CFG/CET/DEP/ASLR 缓解查询） |
+| 28 | `SetChannel` | ✅ 完整 | 切换传输信道（9 种：Https/DohDns/Dns/SmbPipe/Tcp/Slack/Llm/Mcp/Discord） |
 
 ### 3.2 Bootstrap 时辅助能力
 
@@ -225,7 +225,7 @@
 | ETW 致盲 | ✅ 完整 | `EtwEventWrite` → xor rax,rax;ret + `NtTraceEvent` |
 | HWBP 无补丁致盲 | ✅ **默认路径** | DR0 执行断点 + VEH 重定向（PE-sieve 不可见） |
 | ntdll 解 hook | ✅ 完整 | KnownDlls 映射 + 磁盘回退 |
-| VM/沙箱检测 | ✅ 完整 | CPUID vendor + sandbox DLL + MAC OUI + RDTSC timing |
+| VM/沙箱检测 | ✅ 完整 | CPUID vendor + sandbox DLL + MAC OUI + RDTSC timing + **云服务器区分**（uptime > 1h 或进程数 > 15 → 视为合法云目标） |
 | 主机信息采集 | ✅ 完整 | hostname/user/pid/admin/arch/SID/MAC/beacon_id |
 
 ### 3.3 DLL 导出点
@@ -289,7 +289,7 @@ nyx-cli socks <session> --listen 127.0.0.1:1080
 - `/keylog start|stop|dump|stream [secs]|unstream`
 
 **Lateral / Beacon 控制**
-- `/sleep <secs> [jitter%]`, `/ping`, `/channel`, `/topo`
+- `/sleep <secs> [jitter%]`, `/ping`, `/channel [0-8|name]`, `/topo`
 
 **Server / Audit / Implant**
 - `/audit [operator] [action] [limit]`, `/audit verify`
@@ -316,46 +316,107 @@ nyx-cli socks <session> --listen 127.0.0.1:1080
 - 非环回绑定强制要求用户名/密码认证
 - CONNECT only（不支持 BIND/UDP ASSOCIATE）
 - 单排空约束（P0-A）：in-TUI relay 由 worker 线程的 `/api/results` 排空喂入
-- 通道上限 14（implant 端 MAX_CHANNELS=16）
+- relay 通道上限 14（implant 端 pivot 模块 MAX_CHANNELS=16，与 C2 transport Channel enum 独立）
 
 ---
 
 ## 5. Transport（传输层）
 
-### 5.1 传输栈
+### 5.1 信道 Dispatcher
 
-`TransportStack` 按优先级自动故障转移：
+Implant 端使用 `channels::dispatch_send_recv` 作为统一传输入口，`Channel` enum + `match` dispatch（PIC 友好，无 `dyn` trait object）。运行时通过 `SetChannel` 命令热切换，build-time 可配 primary + fallback chain。
 
 ```
-HTTPS → DoH DNS → Slack API → LLM API → MCP → WebTransport → SMB Pipe
+beacon_loop
+  → encode_frame → channels::dispatch_send_recv(ctx, active, frame)
+    → match active {
+        Https    => winhttp_post("/beacon")
+        DohDns   => winhttp_post("/doh")        // CS 4.11 DoH Beacon 模式
+        Dns      => winhttp_post("/dns")        // DoH 模式 DNS beacon
+        SmbPipe  => kernel32 FFI (CreateFileW/WriteFile/ReadFile)
+        Tcp      => ws2_32 FFI (reverse_tcp, 4B 长度前缀)
+        SlackApi => winhttp_post("/extc2/slack")
+        LlmApi   => winhttp_post("/extc2/llm")
+        Mcp      => winhttp_post("/extc2/mcp")
+        DiscordApi=> winhttp_post("/extc2/discord")
+      }
+  → primary 失败 → next_fallback() → 自动切换信道
 ```
+
+Server 端 `handle_frame()` 是信道无关核心（从 `handle_beacon` 提取），所有信道端点汇入：
+
+| 端点 | 信道 |
+|---|---|
+| `POST /beacon` | HTTPS |
+| `POST /doh` | DoH |
+| `POST /dns` | DNS |
+| `POST /extc2/slack` | Slack |
+| `POST /extc2/discord` | Discord |
+| `POST /extc2/llm` | LLM |
+| `POST /extc2/mcp` | MCP |
+| SMB pipe listener | SMB（Windows only，待接线 listener） |
+| TCP beacon listener | TCP（待接线 listener） |
 
 ### 5.2 各信道状态
 
-| 信道 | 状态 | 说明 |
-|---|---|---|
-| **HTTPS/TLS** | ✅ 完整 | rustls，JA3/JA4 入站计算/验证完整；**JA3 出站伪装未接线**（阻塞在 wreq 6.0） |
-| **SMB Named Pipe** | ✅ 完整（Windows） | `\\.\pipe\nyx`，4B 长度前缀 + payload，1 MiB 帧 |
-| **DoH DNS** | ✅ 完整 | Cloudflare/Google/Quad9，URL-safe base64 分块，1 QPS |
-| **LLM API (Claude)** | ✅ 完整 | XOR 混淆（⚠ 非真正加密），5 RPM，4 KiB 帧 |
-| **Slack API** | ✅ 完整 | Bot token，chat.postMessage + conversations.history |
-| **MCP JSON-RPC** | ✅ 完整 | tools/call 隧道，Bearer 认证（P1-15） |
-| **Malleable C2** | ✅ 完整 | 3 个预置 profile（jQuery CDN / O365 API / Windows Update） |
-| **WebTransport** | ❌ 桩 | 所有方法返回 Dead，需 quinn/quiche/msquic |
+| 信道 | 编号 | 状态 | 实现方式 | CS 对标 | BRC4 对标 |
+|---|---|---|---|---|---|
+| **HTTPS** | 0 | ✅ 完整 | WinHTTP POST，PEB walk 无 IAT | ✅ HTTP Beacon | ✅ HTTPS Badger |
+| **DoH** | 1 | ✅ 完整 | WinHTTP POST `/doh`，cover host 支持（cloudflare/google） | ✅ 4.11 DoH Beacon | ✅ DoH Badger |
+| **DNS** | 2 | ✅ 完整 | WinHTTP POST `/dns`，DoH 模式（CS 4.11 对齐） | ✅ DNS Beacon | — |
+| **SMB Pipe** | 3 | ✅ 完整 | kernel32 FFI（CreateFileW/WriteFile/ReadFile），4B LE 长度前缀，1 MiB 帧 | ✅ SMB Beacon | ✅ SMB Badger |
+| **TCP** | 4 | ✅ 完整 | ws2_32 FFI reverse_tcp（WSAStartup/socket/connect/send/recv），4B 长度前缀，16 MiB 防护 | ✅ TCP Beacon | ✅ TCP Badger |
+| **Slack** | 5 | ✅ 完整 | WinHTTP POST `/extc2/slack`，server 转发到 Slack API | — | ✅ External C2 |
+| **LLM** | 6 | ✅ 完整 | WinHTTP POST `/extc2/llm`，server 转发到 Anthropic | — | — (独家) |
+| **MCP** | 7 | ✅ 完整 | WinHTTP POST `/extc2/mcp`，server 转发到 MCP server | — | — (独家) |
+| **Discord** | 8 | ✅ 完整 | WinHTTP POST `/extc2/discord`，server 转发到 Discord | — | ✅ External C2 |
 
-### 5.3 TLS 指纹
+### 5.3 HTTPS 信道增强（spec-7）
+
+| 特性 | 状态 | 说明 |
+|---|---|---|
+| **Host Rotation** | ✅ 完整 | `rotation_hosts` 配置逗号分隔 redirector 列表，round-robin 轮换 + CS 4.10 hold 语义（失败跳过，全列表轮完后重试） |
+| **Domain Fronting** | ✅ 完整 | `fronting_host` 覆盖 HTTP `Host:` header，TCP 连 CDN IP 但 SNI/Host 说合法域名 |
+| **Explicit Proxy** | ✅ 完整 | `proxy_server` 配置 `host:port`，WinHTTP `ACCESS_TYPE_NAMED_PROXY` |
+| **safe_http** | ✅ 完整 | `NYX_SAFE_HTTP=1` build-time 开启：请求期间 `mem::mask()` RC4 加密所有注册敏感区域（config/key/token），防御 ETW 触发的内存扫描（BRC4 v2.3 对标） |
+| **Malleable C2** | ✅ 完整 | 3 个预置 profile（jQuery CDN / O365 API / Windows Update），envelope shaping 双向（client + server） |
+
+### 5.4 TLS 指纹
 
 - **入站（server 侧）**：✅ 完整 — `sniff_client_hello` 在 rustls 消费前 peek ClientHello，计算 JA3/JA4
-- **出站（implant 侧）**：❌ 未接线（P1-14）— 所有 HTTPS 流量使用 rustls 默认 ClientHello
+- **出站（implant 侧）**：❌ 未接线（P1-14）— 所有 HTTPS 流量使用 WinHTTP 默认 ClientHello
 - **HTTP/2 Akamai 指纹**：⚠ 部分 — SETTINGS/WINDOW_UPDATE/PRIORITY 解析完整，pseudo-header 顺序需 HPACK
 
-### 5.4 预置 Malleable Profile
+### 5.5 预置 Malleable Profile
 
 | Profile | 方法 | URI 池 | User-Agent | 伪装目标 |
 |---|---|---|---|---|
 | `jquery_cdn` | GET | cdnjs/jsDelivr | Chrome | jQuery CDN 流量 |
 | `o365_api` | POST | /v1.0/me/messages | Office | Microsoft Graph API |
 | `windows_update` | GET | .cab 文件 | Windows-Update-Agent | WSUS 更新 |
+
+### 5.6 传输层配置
+
+Implant config.toml 支持以下传输相关字段（build-time bake，加密嵌入）：
+
+```toml
+server_host    = "127.0.0.1"
+server_port    = 8443
+use_tls        = false
+# 信道选择
+primary_channel = 0                    # 0=Https(默认), 1=DohDns, 2=Dns, 3=SmbPipe, 4=Tcp, 5-8=ExtC2
+# spec-7 HTTPS 增强
+rotation_hosts  = "cdn1.x,cdn2.x"      # 逗号分隔 redirector 列表
+fronting_host   = "legit.cloudfront.net" # Domain fronting Host header
+proxy_server    = "proxy.corp.local:8080"  # 显式 HTTP 代理
+# DoH
+doh_resolver    = "cloudflare-dns.com"  # Cover host for DoH channel
+# SMB
+smb_pipe_name   = "\\\\.\pipe\\nyx_abc"
+# External C2
+extc2_api_host  = "slack.com"
+extc2_token     = "xoxb-..."
+```
 
 ---
 
