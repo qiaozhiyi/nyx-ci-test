@@ -1,9 +1,41 @@
 # Nyx — 当前状态（单一事实源）
 
 > **权威文档。** 这是项目当前的、经代码核对的唯一状态事实源。
-> **优先级口径：** 一切以源码 `file:line` 为唯一证据。当本文与其他文档（含 `CLAUDE.md`、`docs/archive/`）冲突时，**以本文为准**。
-> **核对日期:** 2026-07-12（P7 Implant Generation System Phase 1a-2a 实现 + 473 测试全绿） · **分支:** `main` · **授权:** 仅限授权红队 / 安全研究
-> 历史审计 / 研究产物已移入 `docs/archive/`（见 `docs/archive/README.md`）。
+> **优先级口径：** 一切以源码 `file:line` 为唯一证据。当本文与其他文档（含 `CLAUDE.md`、`docs/audits/`）冲突时，**以本文为准**。
+> **核对日期:** 2026-07-15（多信道 C2 9 信道 + safe_http + T-REX 真实扫描器 + 云服务器区分） · **分支:** `main` · **授权:** 仅限授权红队 / 安全研究
+> 历史审计 / 研究产物已归类到 `docs/` 子目录（见 `docs/README.md`）。
+
+---
+
+## 0d. 多信道 C2 传输层（2026-07-15）
+
+从单一 HTTPS POST 进化为 **9 信道 + 运行时热切换 + 自动 fallback**。CS/BRC4 传输对等。
+
+| 信道 | 编号 | 实现 | CS | BRC4 |
+|---|---|---|---|---|
+| HTTPS | 0 | ✅ WinHTTP POST + host rotation + domain fronting + proxy + safe_http | ✅ | ✅ |
+| DoH | 1 | ✅ WinHTTP POST `/doh`, cover host | ✅ 4.11 | ✅ |
+| DNS | 2 | ✅ WinHTTP POST `/dns`, DoH 模式 | ✅ | — |
+| SMB Pipe | 3 | ✅ kernel32 FFI, 4B 长度前缀, PEB walk | ✅ | ✅ |
+| TCP | 4 | ✅ ws2_32 FFI reverse_tcp, 4B 长度前缀 | ✅ | ✅ |
+| Slack | 5 | ✅ WinHTTP POST `/extc2/slack` | ✅ UDC2 | ✅ |
+| LLM | 6 | ✅ WinHTTP POST `/extc2/llm` | — | — |
+| MCP | 7 | ✅ WinHTTP POST `/extc2/mcp` | — | — |
+| Discord | 8 | ✅ WinHTTP POST `/extc2/discord` | — | ✅ |
+
+**验证**: Windows Server 2019 — 7 HTTP 端点在线(`/beacon` `/doh` `/dns` `/extc2/*`), beacon check-in + Ping round-trip 通过, SetChannel wire 协议端到端通过。Server 44/44 测试全过。
+
+### T-REX 真实扫描器（2026-07-14）
+
+`TREX_SCANNERS_IMPLEMENTED` 从 `false` 改为 `true`:
+- T0 进程枚举: `CreateToolhelp32Snapshot` + `Process32First/Next`（PEB walk）
+- T3 服务枚举: `OpenSCManager` + `EnumServicesStatusEx(SERVICE_STATE_ALL)`
+- 缓解查询: `GetProcessMitigationPolicy` — CFG/CET/DEP/ASLR/dyn-code/signature/image-load
+- 新增 `trex/scanners.rs`（221 行）
+
+### 云服务器 vs 沙箱区分（2026-07-14）
+
+`looks_like_cloud_server()`: uptime > 1h(`GetTickCount64`) 或进程数 > 15(`NtQuerySystemInformation`) → 合法云目标。防止 AWS/Azure/GCP 真实目标被误判为沙箱。
 
 ---
 

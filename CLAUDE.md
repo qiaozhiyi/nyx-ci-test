@@ -51,7 +51,7 @@ desktop client is pure-Rust **Makepad** (`crates/client-ui`) — no Node/JS anyw
 
 There are two distinct surfaces on the team server — keep them separate:
 
-- **`POST /beacon`** — encrypted implant traffic. Binary frame body, never JSON.
+- **`POST /beacon`** (and `/doh`, `/dns`, `/extc2/*`) — encrypted implant traffic. Binary frame body, never JSON. All channel endpoints converge on the same `handle_frame()` core.
 - **`GET/POST /api/*`** (`/api/sessions`, `/api/task`, `/api/tasks`, `/api/results`,
   `/api/profile`) — plaintext JSON, the **operator** control API. The CLI and the Makepad client
   both drive the loop through it (tests too).
@@ -86,8 +86,8 @@ is rejected).
 | crate | role |
 |---|---|
 | `protocol` | shared by all: crypto, framing, message types + LE codec. The heart of the repo. |
-| `server` | team server: `/beacon` listener, session registry, task queue, JSON control API |
-| `agent-dev` | **std**-based dev implant — exists only to prove the loop on the dev host (macOS/Linux/Windows). **Not** the production implant. |
+| `server` | team server: `/beacon` + `/doh` + `/dns` + `/extc2/*` listeners, session registry, task queue, JSON control API. `handle_frame()` is the channel-agnostic core. |
+| `agent-dev` | **std**-based dev implant — exists only to prove the loop on the dev host (macOS/Linux/Windows). **Not** the production implant. **Rejects SetChannel** (Windows-implant-only primitive). |
 | `client-cli` | operator REPL/CLI over the REST API |
 | `client-ui` | pure-Rust **Makepad** desktop client over the REST API (no Node/JS) |
 | `implant-win` | the real Windows PIC implant (`#![no_std]`/`#![no_main]`); standalone, not a workspace member (see below) |
@@ -160,13 +160,53 @@ Modules (all `cfg(target_os = "windows")` except `heap`/`server_pub`):
   `stack` (call-stack spoof — gated, CET-aware), `sleep`+`mem`
   (delegates to fluctuation; old Foliage code retained for reference).
 - **Loop & capabilities:** `beacon` (the task loop; dispatches every wire
-  `Command`), `transport` (WinHTTP POST + TLS), `envelopes` (build-time-baked
-  malleable-C2 shapes), `hostinfo` (real `SessionInfo`), `fs` (Upload/Download/
-  FileOp via NT syscalls → RIP in ntdll), `shell`, `recon`, `bof` (no_std W^X
-  COFF loader + Beacon-API shims), `screenshot`, `keylog` (polling), `hashdump`,
-  `pivot` (SOCKS relay across cycles), `postex` (token ops), `entry` (`nyx_entry`
-  + selftest exports), `selftests` (per-module `rundll32` self-tests, bitmask
-  exit codes).
+  `Command`), `channels/` (multi-channel dispatcher — see below), `transport`
+  (WinHTTP POST + TLS + `post_frame_enhanced` with proxy/fronting), `envelopes`
+  (build-time-baked malleable-C2 shapes), `hostinfo` (real `SessionInfo`), `fs`
+  (Upload/Download/FileOp via NT syscalls → RIP in ntdll), `shell`, `recon`,
+  `bof` (no_std W^X COFF loader + Beacon-API shims), `screenshot`, `keylog`
+  (polling), `hashdump`, `pivot` (SOCKS relay across cycles), `postex` (token
+  ops), `entry` (`nyx_entry` + selftest exports), `selftests` (per-module
+  `rundll32` self-tests, bitmask exit codes).
+
+### Multi-channel C2 dispatcher (spec-1 ~ spec-7, 2026-07-14)
+
+The implant uses **9 transport channels** with runtime hot-switching. The
+dispatcher is a `Channel` enum + `match` (no `dyn` — PIC-friendly):
+
+```rust
+// crates/implant-win/src/channels/mod.rs
+pub enum Channel { Https=0, DohDns=1, Dns=2, SmbPipe=3, Tcp=4,
+                   SlackApi=5, LlmApi=6, Mcp=7, DiscordApi=8 }
+```
+
+**`beacon_loop` calls `channels::dispatch_send_recv(ctx, active, frame)`**
+instead of hardcoding WinHTTP. The active channel is switchable at runtime via
+`SetChannel` command (wire tag 28). On failure, `next_fallback()` walks the
+build-time fallback chain for automatic channel failover.
+
+| Channel | Module | Transport | Notes |
+|---|---|---|---|
+| Https | `channels/https.rs` | WinHTTP POST `/beacon` | + host rotation, domain fronting, proxy, safe_http |
+| DohDns | `channels/doh.rs` | WinHTTP POST `/doh` | Cover host support (cloudflare/google) |
+| Dns | `channels/dns.rs` | WinHTTP POST `/dns` | DoH mode (CS 4.11 alignment) |
+| SmbPipe | `channels/smb.rs` | kernel32 FFI | CreateFileW/WriteFile/ReadFile, 4B length prefix |
+| Tcp | `channels/tcp.rs` | ws2_32 FFI | reverse_tcp, WSAStartup/socket/connect/send/recv |
+| Slack/Llm/Mcp/Discord | `channels/extc2.rs` | WinHTTP POST `/extc2/*` | Server relays to real third-party API |
+
+**HTTPS enhancements** (spec-7, `channels/https.rs` + `transport.rs`):
+- Host rotation: `rotation_hosts` config → round-robin + CS 4.10 hold semantics
+- Domain fronting: `fronting_host` → Host header override
+- Explicit proxy: `proxy_server` → `WINHTTP_ACCESS_TYPE_NAMED_PROXY`
+- safe_http: `NYX_SAFE_HTTP=1` build-time → `mem::mask()`/`unmask()` wraps the
+  WinHTTP request window (BRC4 v2.3 alignment)
+
+**Server side**: `handle_frame()` extracted from `handle_beacon()` as the
+channel-agnostic core. All 7 HTTP endpoints (`/beacon`, `/doh`, `/dns`,
+`/extc2/slack`, `/extc2/discord`, `/extc2/llm`, `/extc2/mcp`) route to it.
+
+**TUI**: `/channel` command accepts names (`/channel doh`) or IDs (`/channel 1`),
+lists all channels with no argument.
 
 Full link + sRDI extraction happen on a Windows host; the macOS dev host
 type-checks via cross-compile.
@@ -178,31 +218,21 @@ sole native GUI is `crates/client-ui`, a pure-Rust Makepad app. The operator CLI
 
 ## Current status & next steps
 
+**2026-07-15: Multi-channel C2 complete — 9 transport channels + HTTP enhancements + safe_http.**
+
+- **9 transport channels** with runtime hot-switching: HTTPS, DoH, DNS, SMB Pipe, TCP Beacon,
+  Slack, LLM, MCP, Discord. CS/BRC4 parity. See `channels/` architecture section above.
+- **HTTPS enhancements** (spec-7): host rotation (CS 4.10-style), domain fronting, explicit
+  proxy, safe_http (`NYX_SAFE_HTTP=1` → RC4 memory encryption during requests).
+- **T-REX real scanners**: `TREX_SCANNERS_IMPLEMENTED=true` — T0 process enum + T3 service
+  enum + CFG/CET/DEP/ASLR mitigation queries via PEB-walk-resolved Win32 APIs.
+- **Cloud-server differentiation**: `looks_like_cloud_server()` — uptime > 1h or process count
+  > 15 → legitimate cloud target (not sandbox). Prevents false abort on AWS/Azure/GCP.
+- **Windows Server 2019 verified**: 7 HTTP endpoints online, beacon check-in + Ping round-trip,
+  SetChannel wire protocol end-to-end.
+
 **2026-07-07: P6 complete — military-grade sleep + LACUNA + IOC audit + kernel TUI wiring.**
-
-- **Fluctuation sleep mask** (`fluctuation.rs`): PAGE_NOACCESS oscillation, CFG/CET immune.
-- **LACUNA ghost frames** (`lacuna.rs` + `lacuna_stomp.rs`): cross-version .pdata gap scanner
-  + BYOUD-Gap stack injection. Ported from Mohamed Alzhrani LACUNA Chain (June 2026).
-- **IOC audit closure**: 9 CRITICAL/HIGH detection surfaces fixed (diag_mark gate, TLS retry
-  gate, VEH probe, AMSI cycle cap, CreateFileW minimal mask, BLIND_OK tracking, Pool Party
-  explicit error, KslD device scan gate, BYOVD pluggable driver pack).
-- **Kernel TUI commands**: 6 kernel ops exposed via TUI (`/blind-etw`, `/hide <pid>`,
-  `/dump-lsass <pid>`, `/neutralize <pid>`, `/detach-mf`, `/driver-status`) → server
-  `/api/kernel/*` endpoints → `nyx-kernel --serve` daemon bridge.
-- **BYOVD driver pack**: Shield (Horizon DataSys, clean July 2026 default), WDTKernel
-  (Dell, HVCI-safe), RTCore64, IQVW64E. `NYX_BYOVD=<name>` build-time selection.
-
-**53/53 selftests pass on Server 2019 (17763.1339), 0 timeout.**
-Workspace compiles clean (0 errors).
-Previous milestones retained below for history.
-
-**2026-07-01 真机全量回归（3 处 CRITICAL 修复）：** 修复了 `operator-kernelsdk` 的 2 个编译
-错误（`netsec.rs:269/282` 缺失 `peb_offset` 字段 + usize/u64 类型）+ PEB 地址空间逻辑 bug、
-`etw_deception.rs` 堆指针信息泄露、`client-cli` 的 `urlencoding` 未用导入 + query 参数未编码、
-以及 `implant-win/envprobe.rs` 的 MAC-OUI 沙箱检测失效（`KEY_VALUE_PARTIAL_INFORMATION.Data`
-偏移 8→12 + UTF-16 stride）。在 17763.1339 真机验证：workspace 88 测试全过、kernelsdk 90/94
-（4 个预存平台 gate 缺陷）、evasionsdk 53 全过、**49 个 selftest 全部正常退出**（含
-`nyx_selftest_envprobe`=177 证明 OUI 检测恢复工作）。`cargo test --workspace` = **88 passed / 0 failed**（implant-win/kernelsdk 为非 workspace 独立 crate，单独计）。详情见 `docs/STATUS.md` §0a。
+(Historical — see git log for details.)
 
 **2026-07-02 Beacon Loop 打通（里程碑）：** implant beacon loop 在真机 Windows Server 2019
 上完整运行，含全部隐蔽手段（HookChain + HWBP blind + PDT gap scan + Foliage heap masking +
