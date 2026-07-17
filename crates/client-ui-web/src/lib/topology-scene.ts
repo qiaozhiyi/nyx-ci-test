@@ -17,6 +17,10 @@
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { drawOsIcon } from './os-icons';
 import { OS_COLORS } from './os-icons';
 import type { OsKind } from './types';
@@ -79,15 +83,31 @@ const CHANNEL_COLOR: Record<ChannelKind, number> = {
   tcp: 0xa78bfa,
 };
 const CHANNEL_OPACITY: Record<ChannelKind, number> = {
-  https: 0.5,
-  smb: 0.45,
-  tcp: 0.55,
+  https: 0.6,
+  smb: 0.5,
+  tcp: 0.6,
 };
 export const CHANNEL_LABEL: Record<ChannelKind, string> = {
   https: 'HTTPS egress',
   smb: 'SMB pivot',
   tcp: 'TCP pivot',
 };
+
+/**
+ * Tube edge parameters — tuned so edges read as glowing energy filaments.
+ * With AdditiveBlending + bloom, these values sit clearly above the bloom
+ * threshold while staying thinner than the node cards.
+ */
+const TUBE_RADIUS = 0.06; // thick enough to read at distance, not chunky
+const TUBE_TUBULAR_SEGMENTS = 20; // straight filaments: modest tessellation
+const TUBE_RADIAL_SEGMENTS = 8; // round cross-section
+
+/** UnrealBloom — "cosmic star-map" glow. Strength kept moderate so overall
+ *  brightness is dominated by material colors (stable across zoom) rather
+ *  than the bloom pass (which varies with on-screen element size). */
+const BLOOM_STRENGTH = 0.65;
+const BLOOM_RADIUS = 0.4;
+const BLOOM_THRESHOLD = 0.5;
 
 const SELECT_COLOR = 0x7c5cff; // accent purple (matches tokens --accent)
 
@@ -250,7 +270,8 @@ interface NodeRecord {
 
 interface EdgeRecord {
   edge: TopologyEdge;
-  line: THREE.Line;
+  /** Tube mesh replacing the old THREE.Line — has real volume so edges read in 3D. */
+  line: THREE.Mesh;
   particles: { sprite: THREE.Sprite; offset: number }[]; // 2 per edge
   from: THREE.Vector3;
   to: THREE.Vector3;
@@ -279,6 +300,12 @@ export function createTopologyScene(
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(container.clientWidth, container.clientHeight, false);
   renderer.setClearColor(0x000000, 0); // CSS paints the radial-gradient backdrop
+  // Reinhard tone mapping: smoother luminance transitions than ACES when the
+  // camera distance changes (less perceived "dimming on zoom-out"). Materials
+  // use toneMapped:false so they write linear values; OutputPass applies this
+  // mapping once at the end of the post chain.
+  renderer.toneMapping = THREE.ReinhardToneMapping;
+  renderer.toneMappingExposure = 1.4;
   renderer.domElement.style.display = 'block';
   renderer.domElement.style.width = '100%';
   renderer.domElement.style.height = '100%';
@@ -295,16 +322,23 @@ export function createTopologyScene(
     0.1,
     500,
   );
-  camera.position.set(0, 12, 34);
+  // Camera pulled back from [0,12,34] -> [0,18,52] so the wider (≈1.8x) node
+  // envelope fits in the default viewport without the user having to zoom out.
+  camera.position.set(0, 18, 52);
 
   // --- controls -----------------------------------------------------------
   const controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   controls.rotateSpeed = 0.7;
-  controls.zoomSpeed = 0.9;
-  controls.minDistance = 8;
-  controls.maxDistance = 90;
+  // Zoom range widened + speed bumped so users can read a single card up close
+  // (minDistance 4) and still pull back to see the whole spread-out graph
+  // (maxDistance 120). Pan enabled — without it "zoom" feels broken when the
+  // focus point is off-center.
+  controls.enablePan = true;
+  controls.zoomSpeed = 1.2;
+  controls.minDistance = 4;
+  controls.maxDistance = 120;
   controls.autoRotate = true;
   controls.autoRotateSpeed = 0.45;
   controls.target.set(0, 0, 0);
@@ -339,6 +373,7 @@ export function createTopologyScene(
     transparent: true,
     opacity: 0.7,
     depthWrite: false,
+    toneMapped: false,
   });
   const stars = new THREE.Points(starGeo, starMat);
   scene.add(stars);
@@ -347,6 +382,7 @@ export function createTopologyScene(
   const grid = new THREE.GridHelper(120, 60, 0x2a2f45, 0x141826);
   (grid.material as THREE.Material).transparent = true;
   (grid.material as THREE.Material).opacity = 0.32;
+  (grid.material as THREE.Material).toneMapped = false;
   grid.position.y = -10;
   scene.add(grid);
 
@@ -371,19 +407,23 @@ export function createTopologyScene(
       transparent: true,
       depthWrite: false,
       depthTest: true,
+      toneMapped: false,
     });
     disposables.push(cardMat);
     const sprite = new THREE.Sprite(cardMat);
-    const baseScale = n.size * 4.2;
+    // Larger baseline so cards dominate their connecting filaments; server nodes
+    // get an extra boost so they read as the central gravity well.
+    const baseScale = n.size * 4.6 * (n.isServer ? 1.18 : 1);
     sprite.scale.set(baseScale, baseScale, 1);
     sprite.position.set(n.pos[0], n.pos[1], n.pos[2]);
     sprite.userData.nodeId = n.id;
     nodeGroup.add(sprite);
 
-    // halo: 3 transparent BackSide spheres
+    // halo: 3 transparent BackSide spheres. Opacities trimmed slightly so the
+    // additive bloom does not wash out the node cards.
     const halo: THREE.Mesh[] = [];
     const haloRadii = [n.size * 2.6, n.size * 3.4, n.size * 4.3];
-    const haloOpacities = [0.16, 0.08, 0.04];
+    const haloOpacities = [0.13, 0.06, 0.03];
     for (let i = 0; i < haloRadii.length; i++) {
       const g = new THREE.SphereGeometry(haloRadii[i], 24, 16);
       const m = new THREE.MeshBasicMaterial({
@@ -393,6 +433,7 @@ export function createTopologyScene(
         side: THREE.BackSide,
         depthWrite: false,
         blending: THREE.AdditiveBlending,
+        toneMapped: false,
       });
       disposables.push(g, m);
       const mesh = new THREE.Mesh(g, m);
@@ -416,6 +457,7 @@ export function createTopologyScene(
           opacity: 0.55,
           depthWrite: false,
           blending: THREE.AdditiveBlending,
+          toneMapped: false,
         });
         disposables.push(g, m);
         const mesh = new THREE.Mesh(g, m);
@@ -434,6 +476,7 @@ export function createTopologyScene(
       transparent: true,
       depthWrite: false,
       depthTest: true,
+      toneMapped: false,
     });
     disposables.push(labelMat);
     const label = new THREE.Sprite(labelMat);
@@ -486,11 +529,22 @@ export function createTopologyScene(
     const color = CHANNEL_COLOR[e.kind];
     const opacity = CHANNEL_OPACITY[e.kind];
 
-    // line
-    const geo = new THREE.BufferGeometry().setFromPoints([from.clone(), to.clone()]);
-    const mat = new THREE.LineBasicMaterial({ color, transparent: true, opacity });
+    // tube edge — a thin glowing filament with real volume. Built from a
+    // LineCurve3 (straight) so tubularSegments can stay low. Additive blending
+    // makes the colour saturate where filaments cross and lifts edges clearly
+    // above the bloom threshold so they glow.
+    const curve = new THREE.CatmullRomCurve3([from.clone(), to.clone()]);
+    const geo = new THREE.TubeGeometry(curve, TUBE_TUBULAR_SEGMENTS, TUBE_RADIUS, TUBE_RADIAL_SEGMENTS, false);
+    const mat = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    });
     disposables.push(geo, mat);
-    const line = new THREE.Line(geo, mat);
+    const line = new THREE.Mesh(geo, mat);
     edgeGroup.add(line);
 
     // 2 particles with phase offset 0.5
@@ -503,6 +557,7 @@ export function createTopologyScene(
         opacity: 0.95,
         depthWrite: false,
         blending: THREE.AdditiveBlending,
+        toneMapped: false,
       });
       disposables.push(pm);
       const sp = new THREE.Sprite(pm);
@@ -548,21 +603,35 @@ export function createTopologyScene(
     pointerDownAt = { x: ev.clientX, y: ev.clientY, t: performance.now() };
   }
 
-  function onPointerUp(ev: PointerEvent) {
-    if (!pointerDownAt) return;
+  function onClick(ev: MouseEvent) {
+    // Guard: ignore if this was a drag (pointer moved much or held long).
+    // OrbitControls may swallow pointerup during a drag, so we listen on the
+    // native `click` event which only fires for genuine clicks.
+    if (!pointerDownAt) {
+      // pointerdown was lost (e.g. started on a different element); still
+      // attempt the pick from the click coordinates.
+      pointerDownAt = { x: ev.clientX, y: ev.clientY, t: performance.now() };
+    }
     const dx = ev.clientX - pointerDownAt.x;
     const dy = ev.clientY - pointerDownAt.y;
     const moved = Math.hypot(dx, dy);
     const dt = performance.now() - pointerDownAt.t;
     pointerDownAt = null;
     // treat as a click only when pointer barely moved + was quick
-    if (moved > 5 || dt > 600) return;
+    if (moved > 6 || dt > 800) return;
 
-    setPointer(ev);
+    setPointer(ev as unknown as PointerEvent);
     raycaster.setFromCamera(pointer, camera);
-    const hits = raycaster.intersectObjects(nodeGroup.children, false);
-    if (hits.length === 0) {
-      // click on empty space clears selection
+    // Recursive: hit any descendant. Filter to Sprites that carry a nodeId,
+    // since halo/ring meshes live on the scene (not nodeGroup) but we
+    // defensive-filter anyway.
+    const hits = raycaster.intersectObjects(nodeGroup.children, true);
+    const nodeHit = hits.find((h) => {
+      const o = h.object as THREE.Object3D;
+      return o.userData && typeof o.userData.nodeId === 'string';
+    });
+    if (!nodeHit) {
+      // click on empty space (or non-node mesh) clears selection
       if (currentSelectedId !== null) {
         applySelectedVisual(null);
         callbacks.onSelect(null);
@@ -570,8 +639,7 @@ export function createTopologyScene(
       }
       return;
     }
-    const hitSprite = hits[0].object as THREE.Sprite;
-    const id = hitSprite.userData.nodeId as string;
+    const id = (nodeHit.object as THREE.Object3D).userData.nodeId as string;
     const rec = nodeMap.get(id);
     if (!rec) return;
     applySelectedVisual(id);
@@ -581,7 +649,7 @@ export function createTopologyScene(
   }
 
   renderer.domElement.addEventListener('pointerdown', onPointerDown);
-  renderer.domElement.addEventListener('pointerup', onPointerUp);
+  renderer.domElement.addEventListener('click', onClick);
 
   // --- resize -------------------------------------------------------------
   const resize = () => {
@@ -592,9 +660,27 @@ export function createTopologyScene(
     camera.updateProjectionMatrix();
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(w, h, false);
+    composer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    composer.setSize(w, h);
   };
   const ro = new ResizeObserver(resize);
   ro.observe(container);
+
+  // --- post-processing: UnrealBloom "star-map" pipeline -------------------
+  // RenderPass draws the scene into an HDR target, UnrealBloomPass lifts the
+  // bright filaments / node glows / stars into a soft halo, and OutputPass
+  // applies ACES tone mapping + sRGB transfer at the very end (so tone mapping
+  // happens AFTER bloom — that is what makes highlights bloom, not get crushed).
+  const composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+  const bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(container.clientWidth || 1, container.clientHeight || 1),
+    BLOOM_STRENGTH,
+    BLOOM_RADIUS,
+    BLOOM_THRESHOLD,
+  );
+  composer.addPass(bloomPass);
+  composer.addPass(new OutputPass());
 
   // --- animation loop ------------------------------------------------------
   let rafId = 0;
@@ -649,7 +735,7 @@ export function createTopologyScene(
     stars.rotation.y += 0.0002;
 
     controls.update();
-    renderer.render(scene, camera);
+    composer.render();
     rafId = requestAnimationFrame(tick);
   }
   rafId = requestAnimationFrame(tick);
@@ -660,7 +746,7 @@ export function createTopologyScene(
       cancelAnimationFrame(rafId);
       ro.disconnect();
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
-      renderer.domElement.removeEventListener('pointerup', onPointerUp);
+      renderer.domElement.removeEventListener('click', onClick);
       // dispose every tracked resource
       for (const d of disposables) {
         try {
@@ -675,6 +761,7 @@ export function createTopologyScene(
         rec.texPlain.dispose();
       }
       controls.dispose();
+      composer.dispose(); // frees the composer's render targets + passes
       renderer.dispose();
       if (renderer.domElement.parentElement === container) {
         container.removeChild(renderer.domElement);
@@ -715,14 +802,18 @@ export function createTopologyScene(
 // ---------------------------------------------------------------------------
 
 export const MOCK_NODES: TopologyNode[] = [
-  { id: 'srv', label: 'nyx-srv', os: 'debian', priv: 'server', pos: [0, 0, 0], size: 1.6, isServer: true },
-  { id: 'dc01', label: 'DC-01', os: 'win-server', priv: 'admin', pos: [8, 2, -6], size: 1.3, active: true },
-  { id: 'win7', label: 'WIN-7F3A', os: 'windows', priv: 'user', pos: [-9, 3, -4], size: 1.1 },
-  { id: 'db', label: 'DB-SRV', os: 'ubuntu', priv: 'user', pos: [7, -4, 8], size: 1.1 },
-  { id: 'web', label: 'WEB-EDGE', os: 'debian', priv: 'user', pos: [-7, -3, 9], size: 1.0 },
-  { id: 'fs', label: 'FS-01', os: 'windows', priv: 'user', pos: [11, -1, 5], size: 1.0 },
-  { id: 'mac', label: 'DEV-MAC', os: 'macos', priv: 'user', pos: [-3, 6, 6], size: 0.95, stale: true },
-  { id: 'kali', label: 'PWN-01', os: 'kali', priv: 'user', pos: [3, 7, -8], size: 0.9 },
+  // size hierarchy: server (central gravity well) >> admin > user, so the
+  // hierarchy reads at a glance. Effective card scale spans ~3x.
+  // Positions spread ~1.8x wider than the original ±11 envelope so cards do
+  // not overlap at the default zoom (server stays at the origin).
+  { id: 'srv', label: 'nyx-srv', os: 'debian', priv: 'server', pos: [0, 0, 0], size: 2.2, isServer: true },
+  { id: 'dc01', label: 'DC-01', os: 'win-server', priv: 'admin', pos: [14.4, 3.6, -10.8], size: 1.4, active: true },
+  { id: 'win7', label: 'WIN-7F3A', os: 'windows', priv: 'user', pos: [-16.2, 5.4, -7.2], size: 0.85 },
+  { id: 'db', label: 'DB-SRV', os: 'ubuntu', priv: 'user', pos: [12.6, -7.2, 14.4], size: 0.85 },
+  { id: 'web', label: 'WEB-EDGE', os: 'debian', priv: 'user', pos: [-12.6, -5.4, 16.2], size: 0.8 },
+  { id: 'fs', label: 'FS-01', os: 'windows', priv: 'user', pos: [19.8, -1.8, 9], size: 0.8 },
+  { id: 'mac', label: 'DEV-MAC', os: 'macos', priv: 'user', pos: [-5.4, 10.8, 10.8], size: 0.78, stale: true },
+  { id: 'kali', label: 'PWN-01', os: 'kali', priv: 'user', pos: [5.4, 12.6, -14.4], size: 0.78 },
 ];
 
 export const MOCK_EDGES: TopologyEdge[] = [
@@ -749,14 +840,17 @@ export function sessionsToNodes(sessions: SessionView[]): TopologyNode[] {
   return sessions.map((s, i) => {
     const phi = Math.acos(1 - 2 * (i + 0.5) / Math.max(sessions.length, 1));
     const theta = Math.PI * (1 + Math.sqrt(5)) * (i + 0.5);
-    const r = 10;
+    // Sphere radius enlarged from 10 -> 19 so live-session nodes spread out to
+    // match the wider mock-data envelope (cards no longer overlap at default zoom).
+    const r = 19;
     return {
       id: s.id,
       label: s.hostname || s.id.slice(0, 8),
       os: classifyOs(s.os),
       priv: s.is_admin ? 'admin' : 'user',
       pos: [r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi) - 2, r * Math.sin(phi) * Math.sin(theta)],
-      size: 1.0,
+      // mirror the mock hierarchy: admins read larger than regular users
+      size: s.is_admin ? 1.4 : 0.85,
       active: !s.stale,
       stale: s.stale,
     };

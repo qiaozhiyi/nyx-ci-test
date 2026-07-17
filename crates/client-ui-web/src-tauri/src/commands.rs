@@ -75,3 +75,141 @@ pub async fn send_command(
 
     Ok(ack.task_id)
 }
+
+// ===== Credentials =====
+
+#[tauri::command]
+pub async fn list_creds(
+    state: State<'_, Arc<BackendState>>,
+    reveal: Option<bool>,
+    kind: Option<String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = state.connection.read().await.clone();
+    let Some(Connection { server, bearer }) = conn else {
+        return Err("not connected".into());
+    };
+    let client = rest::http_client();
+    rest::list_creds(&client, &server, &bearer, reveal.unwrap_or(false), kind.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn add_cred(
+    state: State<'_, Arc<BackendState>>,
+    cred: Value,
+) -> Result<Value, String> {
+    let conn = state.connection.read().await.clone();
+    let Some(Connection { server, bearer }) = conn else {
+        return Err("not connected".into());
+    };
+    let client = rest::http_client();
+    rest::add_cred(&client, &server, &bearer, cred)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_cred(
+    state: State<'_, Arc<BackendState>>,
+    realm: String,
+    user: String,
+    kind: String,
+) -> Result<Value, String> {
+    let conn = state.connection.read().await.clone();
+    let Some(Connection { server, bearer }) = conn else {
+        return Err("not connected".into());
+    };
+    let client = rest::http_client();
+    rest::delete_cred(&client, &server, &bearer, &realm, &user, &kind)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ===== Audit =====
+
+#[tauri::command]
+pub async fn fetch_audit(
+    state: State<'_, Arc<BackendState>>,
+    params: Option<Value>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = state.connection.read().await.clone();
+    let Some(Connection { server, bearer }) = conn else {
+        return Err("not connected".into());
+    };
+    let client = rest::http_client();
+    let p = params.unwrap_or(serde_json::json!({}));
+    rest::fetch_audit(&client, &server, &bearer, &p)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn verify_audit(state: State<'_, Arc<BackendState>>) -> Result<Value, String> {
+    let conn = state.connection.read().await.clone();
+    let Some(Connection { server, bearer }) = conn else {
+        return Err("not connected".into());
+    };
+    let client = rest::http_client();
+    rest::verify_audit(&client, &server, &bearer)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ===== Implant =====
+
+#[tauri::command]
+pub async fn generate_implant(
+    state: State<'_, Arc<BackendState>>,
+    req: Value,
+) -> Result<Value, String> {
+    let conn = state.connection.read().await.clone();
+    let Some(Connection { server, bearer }) = conn else {
+        return Err("not connected".into());
+    };
+    let client = rest::http_client();
+    rest::generate_implant(&client, &server, &bearer, req)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn list_implants(state: State<'_, Arc<BackendState>>) -> Result<Value, String> {
+    let conn = state.connection.read().await.clone();
+    let Some(Connection { server, bearer }) = conn else {
+        return Err("not connected".into());
+    };
+    let client = rest::http_client();
+    rest::list_implants(&client, &server, &bearer)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn revoke_implant(
+    state: State<'_, Arc<BackendState>>,
+    implant_pub: String,
+) -> Result<Value, String> {
+    let conn = state.connection.read().await.clone();
+    let Some(Connection { server, bearer }) = conn else {
+        return Err("not connected".into());
+    };
+    let client = rest::http_client();
+    rest::revoke_implant(&client, &server, &bearer, &implant_pub)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ===== Profile =====
+
+#[tauri::command]
+pub async fn fetch_profile(state: State<'_, Arc<BackendState>>) -> Result<Value, String> {
+    let conn = state.connection.read().await.clone();
+    let Some(Connection { server, bearer }) = conn else {
+        return Err("not connected".into());
+    };
+    let client = rest::http_client();
+    rest::fetch_profile(&client, &server, &bearer)
+        .await
+        .map_err(|e| e.to_string())
+}

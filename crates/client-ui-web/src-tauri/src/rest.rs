@@ -69,3 +69,176 @@ pub async fn drain_results(
     }
     Ok(resp.json().await?)
 }
+
+// ===== Credentials =====
+
+/// `GET /api/creds?reveal=&kind=` — list credentials.
+/// `reveal=true` shows plaintext secrets (requires non-Viewer role server-side).
+/// `kind` filters by hash/password/ticket/key.
+pub async fn list_creds(
+    client: &Client,
+    server: &str,
+    bearer: &str,
+    reveal: bool,
+    kind: Option<&str>,
+) -> Result<Vec<serde_json::Value>> {
+    let mut url = format!("{}/api/creds", server.trim_end_matches('/'));
+    let mut params: Vec<String> = Vec::new();
+    if reveal {
+        params.push("reveal=1".into());
+    }
+    if let Some(k) = kind {
+        params.push(format!("kind={}", k));
+    }
+    if !params.is_empty() {
+        url.push('?');
+        url.push_str(&params.join("&"));
+    }
+    let resp = authed(client.get(&url), &Some(bearer.to_string())).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("creds: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+    }
+    Ok(resp.json().await?)
+}
+
+/// `POST /api/creds` — upsert a credential by (realm, user, kind).
+pub async fn add_cred(
+    client: &Client,
+    server: &str,
+    bearer: &str,
+    cred: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let url = format!("{}/api/creds", server.trim_end_matches('/'));
+    let resp = authed(client.post(&url).json(&cred), &Some(bearer.to_string())).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("creds add: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+    }
+    Ok(resp.json().await?)
+}
+
+/// `POST /api/creds/delete` — delete by composite key.
+pub async fn delete_cred(
+    client: &Client,
+    server: &str,
+    bearer: &str,
+    realm: &str,
+    user: &str,
+    kind: &str,
+) -> Result<serde_json::Value> {
+    let url = format!("{}/api/creds/delete", server.trim_end_matches('/'));
+    let body = serde_json::json!({ "realm": realm, "user": user, "kind": kind });
+    let resp = authed(client.post(&url).json(&body), &Some(bearer.to_string())).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("creds delete: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+    }
+    Ok(resp.json().await?)
+}
+
+// ===== Audit =====
+
+/// `GET /api/audit` — query the hash-chained audit log.
+pub async fn fetch_audit(
+    client: &Client,
+    server: &str,
+    bearer: &str,
+    params: &serde_json::Value,
+) -> Result<Vec<serde_json::Value>> {
+    let base = format!("{}/api/audit", server.trim_end_matches('/'));
+    let mut url = base;
+    let mut qs: Vec<String> = Vec::new();
+    if let Some(obj) = params.as_object() {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                qs.push(format!("{}={}", k, s));
+            } else if let Some(n) = v.as_u64() {
+                qs.push(format!("{}={}", k, n));
+            }
+        }
+    }
+    if !qs.is_empty() {
+        url.push('?');
+        url.push_str(&qs.join("&"));
+    }
+    let resp = authed(client.get(&url), &Some(bearer.to_string())).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("audit: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+    }
+    Ok(resp.json().await?)
+}
+
+/// `GET /api/audit/verify` — verify the hash-chain integrity.
+pub async fn verify_audit(
+    client: &Client,
+    server: &str,
+    bearer: &str,
+) -> Result<serde_json::Value> {
+    let url = format!("{}/api/audit/verify", server.trim_end_matches('/'));
+    let resp = authed(client.get(&url), &Some(bearer.to_string())).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("audit verify: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+    }
+    Ok(resp.json().await?)
+}
+
+// ===== Implant generation =====
+
+/// `POST /api/generate-implant` — build a per-implant binary.
+pub async fn generate_implant(
+    client: &Client,
+    server: &str,
+    bearer: &str,
+    req: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let url = format!("{}/api/generate-implant", server.trim_end_matches('/'));
+    let resp = authed(client.post(&url).json(&req), &Some(bearer.to_string())).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("generate: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+    }
+    Ok(resp.json().await?)
+}
+
+/// `GET /api/implants` — list all generated implants.
+pub async fn list_implants(
+    client: &Client,
+    server: &str,
+    bearer: &str,
+) -> Result<serde_json::Value> {
+    let url = format!("{}/api/implants", server.trim_end_matches('/'));
+    let resp = authed(client.get(&url), &Some(bearer.to_string())).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("implants: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+    }
+    Ok(resp.json().await?)
+}
+
+/// `POST /api/implant/revoke` — revoke an implant by pubkey.
+pub async fn revoke_implant(
+    client: &Client,
+    server: &str,
+    bearer: &str,
+    implant_pub: &str,
+) -> Result<serde_json::Value> {
+    let url = format!("{}/api/implant/revoke", server.trim_end_matches('/'));
+    let body = serde_json::json!({ "implant_pub": implant_pub });
+    let resp = authed(client.post(&url).json(&body), &Some(bearer.to_string())).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("revoke: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+    }
+    Ok(resp.json().await?)
+}
+
+// ===== Profile =====
+
+/// `GET /api/profile` — current Malleable C2 profile summary.
+pub async fn fetch_profile(
+    client: &Client,
+    server: &str,
+    bearer: &str,
+) -> Result<serde_json::Value> {
+    let url = format!("{}/api/profile", server.trim_end_matches('/'));
+    let resp = authed(client.get(&url), &Some(bearer.to_string())).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("profile: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+    }
+    Ok(resp.json().await?)
+}

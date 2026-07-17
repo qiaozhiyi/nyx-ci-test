@@ -22,7 +22,13 @@ export interface CommandInputProps {
 }
 
 /** Known MVP command names (ls is parsed into a fileop on submit). */
-const KNOWN_COMMANDS = ['ping', 'shell', 'exit', 'sleep', 'download', 'cd', 'ls'] as const;
+const KNOWN_COMMANDS = [
+  'ping', 'shell', 'exit', 'sleep',
+  'download', 'upload', 'ls', 'cd', 'mkdir', 'rm', 'cp', 'mv', 'driveinfo',
+  'screenshot', 'screenwatch', 'portscan', 'net', 'clipboard', 'env', 'keylog',
+  'hashdump', 'stealtoken', 'steal', 'maketoken', 'rev2self', 'getuid',
+  'bof', 'connect', 'setchannel', 'trex',
+] as const;
 
 /** Static OPSEC trip: lsass-touching tooling. UI warning only, never blocks. */
 const OPSEC_PATTERNS = /\b(mimikatz|lsass|procdump.*lsass|sekurlsa)\b/i;
@@ -200,6 +206,135 @@ export function parseCommand(line: string): ParsedCommand | null {
         label: `ls ${path}`,
       };
     }
+
+    // --- more file ops ---
+    case 'mkdir':
+    case 'rm':
+    case 'cp':
+    case 'mv': {
+      if (args.length === 0) return null;
+      const path = args[0];
+      const dest = args.length > 1 ? args[1] : undefined;
+      return {
+        command: { type: 'fileop', op: name as 'mkdir' | 'rm' | 'cp' | 'mv', path, dest },
+        label: `${name} ${path}${dest ? ` ${dest}` : ''}`,
+      };
+    }
+
+    case 'driveinfo':
+      return { command: { type: 'driveinfo' }, label: 'driveinfo' };
+
+    // --- recon / collection ---
+    case 'screenshot': {
+      const monitor = args.length > 0 ? parseInt(args[0], 10) : 0;
+      return {
+        command: { type: 'screenshot', monitor: Number.isFinite(monitor) ? monitor : 0 },
+        label: `screenshot ${monitor}`,
+      };
+    }
+
+    case 'portscan': {
+      if (args.length < 2) return null;
+      return {
+        command: { type: 'portscan', host: args[0], ports: args[1] },
+        label: `portscan ${args[0]} ${args[1]}`,
+      };
+    }
+
+    case 'net': {
+      if (args.length === 0) return null;
+      const query = args.join(' ');
+      return { command: { type: 'net', query }, label: `net ${query}` };
+    }
+
+    case 'clipboard':
+      return { command: { type: 'clipboard' }, label: 'clipboard' };
+
+    case 'env': {
+      const envName = args.length > 0 ? args[0] : '';
+      return { command: { type: 'env', name: envName }, label: `env ${envName || '(all)'}` };
+    }
+
+    case 'keylog': {
+      if (args.length === 0) return null;
+      const action = parseInt(args[0], 10);
+      if (![0, 1, 2].includes(action)) return null;
+      return { command: { type: 'keylog', action }, label: `keylog ${action}` };
+    }
+
+    // --- credentials / tokens ---
+    case 'hashdump': {
+      const method = args.length > 0 ? parseInt(args[0], 10) : 0;
+      return {
+        command: { type: 'hashdump', method: [0, 1].includes(method) ? method : 0 },
+        label: `hashdump ${method}`,
+      };
+    }
+
+    case 'stealtoken':
+    case 'steal': {
+      if (args.length === 0) return null;
+      const pid = parseInt(args[0], 10);
+      if (!Number.isFinite(pid)) return null;
+      return { command: { type: 'stealtoken', pid }, label: `stealtoken ${pid}` };
+    }
+
+    case 'maketoken': {
+      // maketoken DOMAIN\user password [logon_type]
+      if (args.length < 2) return null;
+      return {
+        command: {
+          type: 'maketoken',
+          domain: args[0].split('\\')[0] || '',
+          user: args[0].includes('\\') ? args[0].split('\\').slice(1).join('\\') : args[0],
+          password: args[1],
+          logon_type: args.length > 2 ? parseInt(args[2], 10) || 2 : 2,
+        },
+        label: `maketoken ${args[0]}`,
+      };
+    }
+
+    case 'rev2self':
+      return { command: { type: 'rev2self' }, label: 'rev2self' };
+
+    case 'getuid':
+      return { command: { type: 'getuid' }, label: 'getuid' };
+
+    // --- execution ---
+    case 'bof': {
+      // bof <name> [args...] — data_hex empty (BOF upload via separate flow)
+      if (args.length === 0) return null;
+      return {
+        command: { type: 'bof', name: args[0], args: args.slice(1), data_hex: '' },
+        label: `bof ${args[0]}`,
+      };
+    }
+
+    case 'screenwatch': {
+      const interval = args.length > 0 ? parseInt(args[0], 10) : 10;
+      return {
+        command: { type: 'screenwatch', interval_secs: Number.isFinite(interval) ? interval : 10 },
+        label: `screenwatch ${interval}`,
+      };
+    }
+
+    case 'connect': {
+      if (args.length < 2) return null;
+      return {
+        command: { type: 'connect', host: args[0], port: parseInt(args[1], 10) || 0 },
+        label: `connect ${args[0]}:${args[1]}`,
+      };
+    }
+
+    case 'setchannel': {
+      if (args.length === 0) return null;
+      const ch = parseInt(args[0], 10);
+      if (!Number.isFinite(ch)) return null;
+      return { command: { type: 'setchannel', channel: ch }, label: `setchannel ${ch}` };
+    }
+
+    case 'trex':
+      return { command: { type: 'trex' }, label: 'trex' };
 
     default:
       return null;

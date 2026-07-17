@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
+use tauri::async_runtime;
 use tokio::time::{interval, Duration};
 
 use crate::rest;
@@ -18,9 +19,11 @@ use crate::state::{BackendState, Connection};
 /// Poll interval for `/api/sessions`. Matches the old bridge.
 const SESSION_POLL: Duration = Duration::from_secs(2);
 
-/// Spawn the background poll loop on the tokio runtime. Runs until the app exits.
+/// Spawn the background poll loop on Tauri's async runtime.
+/// Must use `tauri::async_runtime::spawn` (not bare `tokio::spawn`) because
+/// Tauri 2's setup callback runs outside a tokio runtime context.
 pub fn spawn(app: AppHandle, state: Arc<BackendState>) {
-    tokio::spawn(async move {
+    async_runtime::spawn(async move {
         let client = rest::http_client();
         let mut tick = interval(SESSION_POLL);
         let mut last_sig: Option<String> = None;

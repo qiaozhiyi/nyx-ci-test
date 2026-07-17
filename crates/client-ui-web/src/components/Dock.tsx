@@ -18,10 +18,9 @@ interface NavItem {
 const NAV: NavItem[] = [
   { id: 'workspace', icon: '⌘', label: 'Workspace — Sessions & Console' },
   { id: 'topology', icon: '◈', label: 'Topology — 3D beacon graph' },
-  { id: 'creds', icon: '🔑', label: 'Credentials (later release)', disabled: true },
-  { id: 'downloads', icon: '📁', label: 'Downloads (later release)', disabled: true, badge: 3 },
-  { id: 'events', icon: '≡', label: 'Event stream (later release)', disabled: true },
-  { id: 'implant', icon: '⚙', label: 'Implant builder (later release)', disabled: true },
+  { id: 'creds', icon: '🔑', label: 'Credentials vault' },
+  { id: 'events', icon: '≡', label: 'Audit / Event log' },
+  { id: 'implant', icon: '⚙', label: 'Implant builder' },
 ];
 
 export function Dock({ activePage, onPageChange }: DockProps) {

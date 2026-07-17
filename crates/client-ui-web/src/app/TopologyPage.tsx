@@ -55,6 +55,10 @@ export function TopologyPage({ sessions, tasksBySession }: TopologyPageProps) {
   const handleRef = useRef<TopologySceneHandle | null>(null);
   const [selected, setSelected] = useState<TopologyNode | null>(null);
   const [toggles, setToggles] = useState<ToggleState>(DEFAULT_TOGGLES);
+  // Panel visibility — both panels start open but can be collapsed by the user.
+  // The toolbar's "Details"/"Stats" toggles re-open them.
+  const [showInfo, setShowInfo] = useState(true);
+  const [showStats, setShowStats] = useState(true);
 
   // Decide node/edge set: prefer real sessions, fall back to mock.
   const { nodes, edges, usingMock } = useMemo<{
@@ -157,6 +161,17 @@ export function TopologyPage({ sessions, tasksBySession }: TopologyPageProps) {
             active={toggles.labels}
             onClick={() => setToggle('labels', !toggles.labels)}
           />
+          {/* Panel visibility toggles — re-open a panel after it's been closed. */}
+          <Toggle
+            label="Details"
+            active={showInfo}
+            onClick={() => setShowInfo((v) => !v)}
+          />
+          <Toggle
+            label="Stats"
+            active={showStats}
+            onClick={() => setShowStats((v) => !v)}
+          />
         </div>
       </div>
 
@@ -166,17 +181,24 @@ export function TopologyPage({ sessions, tasksBySession }: TopologyPageProps) {
         session={selectedSession}
         pivotChain={pivotChain}
         tasks={selectedTasks}
+        visible={showInfo}
+        onClose={() => setShowInfo(false)}
       />
 
       {/* Bottom-left legend */}
       <TopologyLegend />
 
       {/* Bottom-right stats */}
-      <TopologyStats nodes={nodes} edges={edges} />
+      <TopologyStats
+        nodes={nodes}
+        edges={edges}
+        visible={showStats}
+        onClose={() => setShowStats(false)}
+      />
 
       {/* Hint footer */}
       <div className="topo-hint">
-        Drag to orbit · Scroll to zoom · Click a node to inspect
+        Drag to orbit · Scroll to zoom · Right-drag to pan · Click a node to inspect
       </div>
     </div>
   );

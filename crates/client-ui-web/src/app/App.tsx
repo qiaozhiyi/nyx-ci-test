@@ -4,12 +4,15 @@ import type { SessionView } from '../lib/types';
 import { ConnectPage } from './ConnectPage';
 import { Workspace } from './Workspace';
 import { TopologyPage } from './TopologyPage';
+import { CredsPage } from './CredsPage';
+import { ImplantPage } from './ImplantPage';
+import { EventsPage } from './EventsPage';
 import { Dock } from '../components/Dock';
 import { onError, onSessions } from '../lib/invoke';
 import './App.css';
 
-/** The two primary surfaces reachable from the Dock. */
-export type Page = 'workspace' | 'topology';
+/** The surfaces reachable from the Dock. */
+export type Page = 'workspace' | 'topology' | 'creds' | 'implant' | 'events';
 
 export function App() {
   const [connected, setConnected] = useState(false);
@@ -76,15 +79,17 @@ export function App() {
     <div className="app-shell">
       <Dock activePage={activePage} onPageChange={setActivePage} />
       <main className="app-main">
-        {activePage === 'workspace' ? (
+        {activePage === 'workspace' && (
           <Workspace
             sessions={sessions}
             selectedId={selectedId}
             onSelect={setSelectedId}
           />
-        ) : (
-          <TopologyPage sessions={sessions} />
         )}
+        {activePage === 'topology' && <TopologyPage sessions={sessions} />}
+        {activePage === 'creds' && <CredsPage />}
+        {activePage === 'implant' && <ImplantPage />}
+        {activePage === 'events' && <EventsPage />}
       </main>
     </div>
   );
