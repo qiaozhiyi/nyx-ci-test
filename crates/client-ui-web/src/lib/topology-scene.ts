@@ -11,9 +11,15 @@
  * the single requestAnimationFrame loop. NO CSS @keyframes are used anywhere —
  * that pattern caused refresh-time flicker in an earlier iteration.
  *
+ * Data policy: the scene is built once; live data changes flow through
+ * `handle.update(nodes, edges)`, which diffs by node id (and edge
+ * from→to→kind), adding/removing/updating objects in place. Camera orbit,
+ * selection and toggle states all survive updates.
+ *
  * Resource policy: every Geometry/Material/Texture created here is tracked and
- * disposed in `dispose()` so the React page can mount/unmount without leaking
- * GPU memory.
+ * disposed — scene-level resources in `dispose()`, per-node/per-edge resources
+ * when the diff removes them — so the React page can mount/unmount and live
+ * sessions can churn without leaking GPU memory.
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
@@ -53,11 +59,17 @@ export interface TopologyEdge {
 export interface TopologySceneCallbacks {
   /** Called whenever the user picks (or clears) a node via raycast. */
   onSelect: (node: TopologyNode | null) => void;
+  /** Called when the scene itself stops auto-rotate (user picked/cleared a
+   *  node) so the React toolbar toggle can stay in sync. */
+  onAutoRotateChange?: (v: boolean) => void;
 }
 
 export interface TopologySceneHandle {
   /** Tear down everything: cancel RAF, remove listeners, dispose GPU resources. */
   dispose: () => void;
+  /** Incrementally reconcile the scene with a new node/edge set (diff by node
+   *  id, edge from→to→kind). Camera, selection and toggles are untouched. */
+  update: (nodes: TopologyNode[], edges: TopologyEdge[]) => void;
   /** Programmatically select a node by id (null clears). */
   setSelected: (id: string | null) => void;
   /** Toggle OrbitControls auto-rotate. */
@@ -77,10 +89,14 @@ export interface TopologySceneHandle {
 /** Node canvas texture is square at this resolution; plenty for a sprite. */
 const NODE_TEX = 256;
 
-const CHANNEL_COLOR: Record<ChannelKind, number> = {
-  https: 0x3b82f6,
-  smb: 0xd9a036,
-  tcp: 0xa78bfa,
+/**
+ * Channel colors — single source of truth. `num` feeds three.js materials,
+ * `css` feeds React/DOM overlays (the legend). Keep the two in lockstep.
+ */
+export const CHANNEL_COLORS: Record<ChannelKind, { num: number; css: string }> = {
+  https: { num: 0x3b82f6, css: '#3b82f6' },
+  smb: { num: 0xd9a036, css: '#d9a036' },
+  tcp: { num: 0xa78bfa, css: '#a78bfa' },
 };
 const CHANNEL_OPACITY: Record<ChannelKind, number> = {
   https: 0.6,
@@ -262,8 +278,13 @@ interface NodeRecord {
   halo: THREE.Mesh[];
   rings: THREE.Mesh[]; // server-only torus rings
   label: THREE.Sprite;
-  texIcon: THREE.Texture; // card texture WITH os icon
-  texPlain: THREE.Texture; // card texture WITHOUT os icon
+  /** Distance from the node origin to the label center (clears the card). */
+  labelOffset: number;
+  texIcon: THREE.Texture; // cached card texture WITH os icon (unselected)
+  texPlain: THREE.Texture; // cached card texture WITHOUT os icon (unselected)
+  /** Geometries/materials/label textures owned by this node. texIcon/texPlain
+   *  and any one-off selected texture are disposed explicitly instead. */
+  disposables: { dispose(): void }[];
   /** scale-pulse animation state, >=0 means animating; phase in [0,1]. */
   pulseStart: number;
 }
@@ -275,6 +296,8 @@ interface EdgeRecord {
   particles: { sprite: THREE.Sprite; offset: number }[]; // 2 per edge
   from: THREE.Vector3;
   to: THREE.Vector3;
+  /** Materials owned by this edge (tube geometry is disposed via the mesh). */
+  disposables: { dispose(): void }[];
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +306,7 @@ interface EdgeRecord {
 
 /**
  * Build the topology scene inside `container`. Returns a handle for the React
- * layer to drive selection, toggles, and disposal.
+ * layer to drive selection, toggles, incremental data updates, and disposal.
  */
 export function createTopologyScene(
   container: HTMLElement,
@@ -374,6 +397,9 @@ export function createTopologyScene(
     opacity: 0.7,
     depthWrite: false,
     toneMapped: false,
+    // stars sit 90–170 units out where FogExp2 leaves only ~4% visibility —
+    // they are a backdrop and must ignore fog
+    fog: false,
   });
   const stars = new THREE.Points(starGeo, starMat);
   scene.add(stars);
@@ -386,30 +412,60 @@ export function createTopologyScene(
   grid.position.y = -10;
   scene.add(grid);
 
-  // --- nodes --------------------------------------------------------------
+  // --- shared state -------------------------------------------------------
   const nodeGroup = new THREE.Group();
   scene.add(nodeGroup);
   const nodeMap = new Map<string, NodeRecord>();
+  const edgeGroup = new THREE.Group();
+  scene.add(edgeGroup);
+  const edgeMap = new Map<string, EdgeRecord>();
+  const idToPos = new Map<string, THREE.Vector3>();
+  // Scene-level resources (shared, live for the whole mount). Per-node and
+  // per-edge resources are tracked on their records instead.
   const disposables: { dispose(): void }[] = [
     starGeo,
     starMat,
     grid.geometry,
     grid.material as THREE.Material,
   ];
+  // Toggle state — read when the diff adds new objects so late arrivals
+  // respect the current toggles instead of resetting them.
+  let showOsIcons = true;
+  let showEdges = true;
+  let showLabels = true;
+  let currentSelectedId: string | null = null;
 
-  for (const n of nodes) {
-    // card sprite (unselected, with icon to start)
+  // small round particle texture (shared by all edge particles)
+  const partCanvas = document.createElement('canvas');
+  partCanvas.width = 64;
+  partCanvas.height = 64;
+  const pctx = partCanvas.getContext('2d')!;
+  const partGrad = pctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  partGrad.addColorStop(0, 'rgba(255,255,255,1)');
+  partGrad.addColorStop(0.35, 'rgba(255,255,255,0.7)');
+  partGrad.addColorStop(1, 'rgba(255,255,255,0)');
+  pctx.fillStyle = partGrad;
+  pctx.fillRect(0, 0, 64, 64);
+  const partTex = new THREE.CanvasTexture(partCanvas);
+  partTex.colorSpace = THREE.SRGBColorSpace;
+  disposables.push(partTex);
+
+  // --- node lifecycle -----------------------------------------------------
+
+  function addNode(n: TopologyNode): void {
+    // card sprite — both cached variants are painted up front; the icon
+    // toggle then just swaps `map` instead of repainting
     const texIcon = createNodeTexture(n, { selected: false, showOsIcon: true });
     const texPlain = createNodeTexture(n, { selected: false, showOsIcon: false });
-    disposables.push(texIcon, texPlain);
     const cardMat = new THREE.SpriteMaterial({
-      map: texIcon,
+      map: showOsIcons ? texIcon : texPlain,
       transparent: true,
       depthWrite: false,
       depthTest: true,
       toneMapped: false,
+      fog: false, // emissive overlay — FogExp2 would dim it at distance
     });
-    disposables.push(cardMat);
+    const recDisposables: { dispose(): void }[] = [cardMat];
     const sprite = new THREE.Sprite(cardMat);
     // Larger baseline so cards dominate their connecting filaments; server nodes
     // get an extra boost so they read as the central gravity well.
@@ -434,8 +490,9 @@ export function createTopologyScene(
         depthWrite: false,
         blending: THREE.AdditiveBlending,
         toneMapped: false,
+        fog: false, // additive overlay — fog would tint it towards the fog color
       });
-      disposables.push(g, m);
+      recDisposables.push(g, m);
       const mesh = new THREE.Mesh(g, m);
       mesh.position.copy(sprite.position);
       scene.add(mesh);
@@ -458,8 +515,9 @@ export function createTopologyScene(
           depthWrite: false,
           blending: THREE.AdditiveBlending,
           toneMapped: false,
+          fog: false,
         });
-        disposables.push(g, m);
+        recDisposables.push(g, m);
         const mesh = new THREE.Mesh(g, m);
         mesh.position.copy(sprite.position);
         mesh.rotation.set(cfg.rot[0], cfg.rot[1], cfg.rot[2]);
@@ -470,19 +528,24 @@ export function createTopologyScene(
 
     // hostname label sprite
     const labelTex = createLabelTexture(n.label);
-    disposables.push(labelTex);
     const labelMat = new THREE.SpriteMaterial({
       map: labelTex,
       transparent: true,
       depthWrite: false,
       depthTest: true,
       toneMapped: false,
+      fog: false, // text must stay readable at any distance
     });
-    disposables.push(labelMat);
+    recDisposables.push(labelTex, labelMat);
     const label = new THREE.Sprite(labelMat);
     const labelScale = n.size * 3.6;
     label.scale.set(labelScale, labelScale * 0.25, 1);
-    label.position.set(n.pos[0], n.pos[1] - n.size * 2.0, n.pos[2]);
+    // Clear the card's lower edge: card half-height is baseScale/2 (≈ size*2.3),
+    // the label's own half-height is (labelScale*0.25)/2 — the old fixed
+    // size*2.0 offset overlapped the card.
+    const labelOffset = baseScale / 2 + (labelScale * 0.25) / 2 + n.size * 0.25;
+    label.position.set(n.pos[0], n.pos[1] - labelOffset, n.pos[2]);
+    label.visible = showLabels;
     scene.add(label);
 
     nodeMap.set(n.id, {
@@ -492,47 +555,102 @@ export function createTopologyScene(
       halo,
       rings,
       label,
+      labelOffset,
       texIcon,
       texPlain,
+      disposables: recDisposables,
       pulseStart: -1,
     });
   }
 
-  // --- edges + flowing particles -----------------------------------------
-  const edgeGroup = new THREE.Group();
-  scene.add(edgeGroup);
-  const edgeRecords: EdgeRecord[] = [];
-  const idToPos = new Map<string, THREE.Vector3>();
-  for (const n of nodes) {
-    idToPos.set(n.id, new THREE.Vector3(n.pos[0], n.pos[1], n.pos[2]));
+  function removeNode(id: string): void {
+    const rec = nodeMap.get(id);
+    if (!rec) return;
+    nodeGroup.remove(rec.sprite);
+    scene.remove(rec.label);
+    for (const h of rec.halo) scene.remove(h);
+    for (const r of rec.rings) scene.remove(r);
+    // dispose the one-off selected texture if it happens to be bound
+    const bound = (rec.sprite.material as THREE.SpriteMaterial).map;
+    if (bound && bound !== rec.texIcon && bound !== rec.texPlain) bound.dispose();
+    rec.texIcon.dispose();
+    rec.texPlain.dispose();
+    for (const d of rec.disposables) d.dispose();
+    nodeMap.delete(id);
   }
 
-  // small round particle texture (shared)
-  const partCanvas = document.createElement('canvas');
-  partCanvas.width = 64;
-  partCanvas.height = 64;
-  const pctx = partCanvas.getContext('2d')!;
-  const partGrad = pctx.createRadialGradient(32, 32, 0, 32, 32, 32);
-  partGrad.addColorStop(0, 'rgba(255,255,255,1)');
-  partGrad.addColorStop(0.35, 'rgba(255,255,255,0.7)');
-  partGrad.addColorStop(1, 'rgba(255,255,255,0)');
-  pctx.fillStyle = partGrad;
-  pctx.fillRect(0, 0, 64, 64);
-  const partTex = new THREE.CanvasTexture(partCanvas);
-  partTex.colorSpace = THREE.SRGBColorSpace;
-  disposables.push(partTex);
+  /** Re-position an existing node record in place (sprite + halo + rings + label). */
+  function moveNode(rec: NodeRecord, n: TopologyNode): void {
+    rec.sprite.position.set(n.pos[0], n.pos[1], n.pos[2]);
+    for (const h of rec.halo) h.position.copy(rec.sprite.position);
+    for (const r of rec.rings) r.position.copy(rec.sprite.position);
+    rec.label.position.set(n.pos[0], n.pos[1] - rec.labelOffset, n.pos[2]);
+  }
 
-  for (const e of edges) {
+  /** Repaint the cached card textures after OS/priv/status changes — theme
+   *  stroke, status dot and halo tint all derive from those fields. */
+  function repaintNodeCard(rec: NodeRecord): void {
+    const mat = rec.sprite.material as THREE.SpriteMaterial;
+    const bound = mat.map;
+    if (bound && bound !== rec.texIcon && bound !== rec.texPlain) bound.dispose();
+    rec.texIcon.dispose();
+    rec.texPlain.dispose();
+    rec.texIcon = createNodeTexture(rec.node, { selected: false, showOsIcon: true });
+    rec.texPlain = createNodeTexture(rec.node, { selected: false, showOsIcon: false });
+    mat.map = rec.node.id === currentSelectedId
+      ? createNodeTexture(rec.node, { selected: true, showOsIcon: showOsIcons })
+      : showOsIcons ? rec.texIcon : rec.texPlain;
+    mat.needsUpdate = true;
+    const theme = nodeThemeColor(rec.node);
+    for (const h of rec.halo) (h.material as THREE.MeshBasicMaterial).color.setHex(theme);
+  }
+
+  /** Swap a card between its cached unselected texture and an on-demand
+   *  selected (ring) variant. Only ever runs for the previously- and
+   *  newly-selected node — the whole scene is never repainted on a click. */
+  function bindCardTexture(rec: NodeRecord, selected: boolean): void {
+    const mat = rec.sprite.material as THREE.SpriteMaterial;
+    const bound = mat.map;
+    mat.map = selected
+      ? createNodeTexture(rec.node, { selected: true, showOsIcon: showOsIcons })
+      : showOsIcons ? rec.texIcon : rec.texPlain;
+    mat.needsUpdate = true;
+    // the replaced one-off selected texture is disposed immediately instead
+    // of accumulating in the disposables list
+    if (bound && bound !== rec.texIcon && bound !== rec.texPlain) bound.dispose();
+  }
+
+  function applySelectedVisual(id: string | null) {
+    if (id === currentSelectedId) return;
+    const prevRec = currentSelectedId ? nodeMap.get(currentSelectedId) : undefined;
+    const nextRec = id ? nodeMap.get(id) : undefined;
+    if (id && !nextRec) return; // unknown id — leave the current selection alone
+    currentSelectedId = id;
+    if (prevRec) bindCardTexture(prevRec, false);
+    if (nextRec) {
+      bindCardTexture(nextRec, true);
+      nextRec.pulseStart = performance.now();
+    }
+  }
+
+  // --- edge lifecycle -----------------------------------------------------
+
+  /** Stable edge identity for diffing: endpoints + channel kind. */
+  function edgeKey(e: TopologyEdge): string {
+    return `${e.from}→${e.to}→${e.kind}`;
+  }
+
+  function addEdge(e: TopologyEdge): void {
     const from = idToPos.get(e.from);
     const to = idToPos.get(e.to);
-    if (!from || !to) continue;
-    const color = CHANNEL_COLOR[e.kind];
+    if (!from || !to) return; // endpoint node missing — skip
+    const color = CHANNEL_COLORS[e.kind].num;
     const opacity = CHANNEL_OPACITY[e.kind];
 
     // tube edge — a thin glowing filament with real volume. Built from a
-    // LineCurve3 (straight) so tubularSegments can stay low. Additive blending
-    // makes the colour saturate where filaments cross and lifts edges clearly
-    // above the bloom threshold so they glow.
+    // CatmullRomCurve3 (straight two-point) so tubularSegments can stay low.
+    // Additive blending makes the colour saturate where filaments cross and
+    // lifts edges clearly above the bloom threshold so they glow.
     const curve = new THREE.CatmullRomCurve3([from.clone(), to.clone()]);
     const geo = new THREE.TubeGeometry(curve, TUBE_TUBULAR_SEGMENTS, TUBE_RADIUS, TUBE_RADIAL_SEGMENTS, false);
     const mat = new THREE.MeshBasicMaterial({
@@ -542,13 +660,14 @@ export function createTopologyScene(
       depthWrite: false,
       blending: THREE.AdditiveBlending,
       toneMapped: false,
+      fog: false, // additive filament — fog would tint it at distance
     });
-    disposables.push(geo, mat);
     const line = new THREE.Mesh(geo, mat);
     edgeGroup.add(line);
 
     // 2 particles with phase offset 0.5
     const particles: { sprite: THREE.Sprite; offset: number }[] = [];
+    const recDisposables: { dispose(): void }[] = [mat];
     for (let i = 0; i < 2; i++) {
       const pm = new THREE.SpriteMaterial({
         map: partTex,
@@ -558,39 +677,133 @@ export function createTopologyScene(
         depthWrite: false,
         blending: THREE.AdditiveBlending,
         toneMapped: false,
+        fog: false,
       });
-      disposables.push(pm);
+      recDisposables.push(pm);
       const sp = new THREE.Sprite(pm);
       const sc = 0.55;
       sp.scale.set(sc, sc, 1);
       edgeGroup.add(sp);
       particles.push({ sprite: sp, offset: i * 0.5 });
     }
-    edgeRecords.push({ edge: e, line, particles, from, to });
+    // The tube geometry is tracked on the mesh itself (retessellated when an
+    // endpoint moves); partTex is shared and owned by the scene-level list.
+    edgeMap.set(edgeKey(e), {
+      edge: e,
+      line,
+      particles,
+      from: from.clone(),
+      to: to.clone(),
+      disposables: recDisposables,
+    });
   }
+
+  function removeEdge(key: string): void {
+    const rec = edgeMap.get(key);
+    if (!rec) return;
+    edgeGroup.remove(rec.line);
+    for (const p of rec.particles) edgeGroup.remove(p.sprite);
+    rec.line.geometry.dispose();
+    for (const d of rec.disposables) d.dispose();
+    edgeMap.delete(key);
+  }
+
+  // --- incremental data update ---------------------------------------------
+
+  /**
+   * Reconcile the scene with a new node/edge set. Nodes diff by id, edges by
+   * from→to→kind: new objects are added, departed ones removed (their GPU
+   * resources disposed), changed ones updated in place. Camera, selection
+   * and toggle states are untouched.
+   */
+  function updateNodesEdges(nextNodes: TopologyNode[], nextEdges: TopologyEdge[]): void {
+    // --- nodes: add / update ---
+    const seen = new Set<string>();
+    for (const n of nextNodes) {
+      seen.add(n.id);
+      const rec = nodeMap.get(n.id);
+      if (!rec) {
+        addNode(n);
+        continue;
+      }
+      const prev = rec.node;
+      // size/label/isServer drive the sprite scale, halo/ring radii and the
+      // label texture — rebuilding the record is cheaper than retessellating.
+      if (prev.size !== n.size || prev.label !== n.label || !!prev.isServer !== !!n.isServer) {
+        const wasSelected = currentSelectedId === n.id;
+        removeNode(n.id);
+        addNode(n);
+        if (wasSelected) {
+          // re-apply the ring on the rebuilt record (no pulse — not a click)
+          const fresh = nodeMap.get(n.id);
+          if (fresh) bindCardTexture(fresh, true);
+        }
+        continue;
+      }
+      rec.node = n;
+      if (prev.pos[0] !== n.pos[0] || prev.pos[1] !== n.pos[1] || prev.pos[2] !== n.pos[2]) {
+        moveNode(rec, n);
+      }
+      if (prev.os !== n.os || prev.priv !== n.priv || !!prev.stale !== !!n.stale || !!prev.active !== !!n.active) {
+        repaintNodeCard(rec);
+      }
+    }
+    // --- nodes: remove departed ---
+    for (const id of [...nodeMap.keys()]) {
+      if (seen.has(id)) continue;
+      if (currentSelectedId === id) {
+        // the selected node left the graph — clear the React-side panel too
+        currentSelectedId = null;
+        callbacks.onSelect(null);
+      }
+      removeNode(id);
+    }
+
+    // --- edges ---
+    idToPos.clear();
+    for (const n of nextNodes) {
+      idToPos.set(n.id, new THREE.Vector3(n.pos[0], n.pos[1], n.pos[2]));
+    }
+    const seenEdges = new Set<string>();
+    for (const e of nextEdges) {
+      const key = edgeKey(e);
+      seenEdges.add(key);
+      const from = idToPos.get(e.from);
+      const to = idToPos.get(e.to);
+      if (!from || !to) continue; // endpoint node missing — skip
+      const rec = edgeMap.get(key);
+      if (!rec) {
+        addEdge(e);
+        continue;
+      }
+      rec.edge = e;
+      if (!rec.from.equals(from) || !rec.to.equals(to)) {
+        // endpoint moved — retessellate the tube; particles follow in tick()
+        const curve = new THREE.CatmullRomCurve3([from.clone(), to.clone()]);
+        rec.line.geometry.dispose();
+        rec.line.geometry = new THREE.TubeGeometry(curve, TUBE_TUBULAR_SEGMENTS, TUBE_RADIUS, TUBE_RADIAL_SEGMENTS, false);
+        rec.from.copy(from);
+        rec.to.copy(to);
+      }
+    }
+    for (const key of [...edgeMap.keys()]) {
+      if (!seenEdges.has(key)) removeEdge(key);
+    }
+  }
+
+  // initial data load — same code path as every later incremental update
+  updateNodesEdges(nodes, edges);
 
   // --- raycast click handling --------------------------------------------
   const raycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
   let pointerDownAt: { x: number; y: number; t: number } | null = null;
-  let currentSelectedId: string | null = null;
 
-  function applySelectedVisual(id: string | null) {
-    for (const rec of nodeMap.values()) {
-      const isSelected = rec.node.id === id;
-      const tex = (rec.sprite.material as THREE.SpriteMaterial).map;
-      // Rebuild the card texture so selection ring + state render correctly.
-      const newTex = createNodeTexture(rec.node, { selected: isSelected, showOsIcon: showOsIcons });
-      disposables.push(newTex);
-      // dispose old per-node texture (the one currently bound) but keep the
-      // cached texIcon/texPlain as the canonical "no ring" copies — they are
-      // only used for the os-icon toggle, not selection state.
-      if (tex && tex !== rec.texIcon && tex !== rec.texPlain) tex.dispose();
-      (rec.sprite.material as THREE.SpriteMaterial).map = newTex;
-      (rec.sprite.material as THREE.SpriteMaterial).needsUpdate = true;
-      if (isSelected) rec.pulseStart = performance.now();
-    }
-    currentSelectedId = id;
+  /** Scene-initiated auto-rotate stop — notify React so the toggle stays honest. */
+  function stopAutoRotate() {
+    if (!controls.autoRotate) return;
+    controls.autoRotate = false;
+    callbacks.onAutoRotateChange?.(false);
   }
 
   function setPointer(ev: PointerEvent) {
@@ -635,7 +848,7 @@ export function createTopologyScene(
       if (currentSelectedId !== null) {
         applySelectedVisual(null);
         callbacks.onSelect(null);
-        controls.autoRotate = false; // stays off once user has interacted
+        stopAutoRotate(); // stays off once user has interacted
       }
       return;
     }
@@ -643,8 +856,10 @@ export function createTopologyScene(
     const rec = nodeMap.get(id);
     if (!rec) return;
     applySelectedVisual(id);
+    // re-clicking the selected node still pulses (applySelectedVisual no-ops there)
+    rec.pulseStart = performance.now();
     // picking a node turns off auto-rotate (explicit user focus)
-    controls.autoRotate = false;
+    stopAutoRotate();
     callbacks.onSelect(rec.node);
   }
 
@@ -684,8 +899,6 @@ export function createTopologyScene(
 
   // --- animation loop ------------------------------------------------------
   let rafId = 0;
-  let showOsIcons = true;
-  let showEdges = true;
   const tmp = new THREE.Vector3();
 
   function tick() {
@@ -722,7 +935,7 @@ export function createTopologyScene(
 
     // flowing particles along edges
     if (showEdges) {
-      for (const er of edgeRecords) {
+      for (const er of edgeMap.values()) {
         for (const p of er.particles) {
           const u = ((now * 0.18) + p.offset) % 1;
           tmp.copy(er.from).lerp(er.to, u);
@@ -747,7 +960,10 @@ export function createTopologyScene(
       ro.disconnect();
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       renderer.domElement.removeEventListener('click', onClick);
-      // dispose every tracked resource
+      // per-node + per-edge resources (records delete themselves from the maps)
+      for (const id of [...nodeMap.keys()]) removeNode(id);
+      for (const key of [...edgeMap.keys()]) removeEdge(key);
+      // dispose every tracked scene-level resource
       for (const d of disposables) {
         try {
           d.dispose();
@@ -755,17 +971,21 @@ export function createTopologyScene(
           /* some geometries share disposers — ignore */
         }
       }
-      // also dispose per-node canonical textures
-      for (const rec of nodeMap.values()) {
-        rec.texIcon.dispose();
-        rec.texPlain.dispose();
-      }
       controls.dispose();
-      composer.dispose(); // frees the composer's render targets + passes
+      // free pass-level resources (bloom render targets/materials), then the
+      // composer's own render targets
+      for (const p of composer.passes) p.dispose();
+      composer.dispose();
       renderer.dispose();
+      // release the WebGL context itself so repeated mount/unmount cannot
+      // accumulate live contexts
+      if (typeof renderer.forceContextLoss === 'function') renderer.forceContextLoss();
       if (renderer.domElement.parentElement === container) {
         container.removeChild(renderer.domElement);
       }
+    },
+    update(nextNodes: TopologyNode[], nextEdges: TopologyEdge[]) {
+      updateNodesEdges(nextNodes, nextEdges);
     },
     setSelected(id: string | null) {
       if (id === currentSelectedId) return;
@@ -781,6 +1001,7 @@ export function createTopologyScene(
       controls.autoRotate = enabled;
     },
     setShowLabels(enabled: boolean) {
+      showLabels = enabled;
       for (const rec of nodeMap.values()) rec.label.visible = enabled;
     },
     setShowEdges(enabled: boolean) {
@@ -788,9 +1009,12 @@ export function createTopologyScene(
       edgeGroup.visible = enabled;
     },
     setShowOsIcons(enabled: boolean) {
+      if (enabled === showOsIcons) return;
       showOsIcons = enabled;
-      // rebuild every card so icon visibility changes
-      applySelectedVisual(currentSelectedId);
+      // swap each card between its cached icon/plain textures — no repaints
+      for (const rec of nodeMap.values()) {
+        bindCardTexture(rec, rec.node.id === currentSelectedId);
+      }
     },
   };
 

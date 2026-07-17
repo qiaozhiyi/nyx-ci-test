@@ -6,8 +6,11 @@
  * the visual unit of that lifecycle, plus the result renderer.
  *
  * Shared with CommandConsole via the exported `TaskEntry` interface.
+ * `ls` task results render as a FileTable whose row actions (进入 / 下载)
+ * submit follow-up commands through the `onCommand` prop.
  */
-import type { ResultView } from '../lib/types';
+import type { JsonCommand, ResultView } from '../lib/types';
+import { FileTable, parseLsLines } from './FileTable';
 import './TaskBlock.css';
 
 /** Lifecycle of a single submitted command. Shared across console + block. */
@@ -28,9 +31,11 @@ export interface TaskEntry {
 
 export interface TaskBlockProps {
   task: TaskEntry;
+  /** Submit a follow-up command (FileTable row actions on `ls` results). */
+  onCommand?: (command: JsonCommand, label: string) => void;
 }
 
-export function TaskBlock({ task }: TaskBlockProps) {
+export function TaskBlock({ task, onCommand }: TaskBlockProps) {
   const { task_id, command_label, status, results, opsec } = task;
 
   return (
@@ -53,7 +58,12 @@ export function TaskBlock({ task }: TaskBlockProps) {
       {results.length > 0 && (
         <div className="taskblock__body">
           {results.map((r, i) => (
-            <ResultLine key={`${r.task_id}-${i}-${r.seq ?? 0}`} result={r} />
+            <ResultLine
+              key={`${r.task_id}-${i}-${r.seq ?? 0}`}
+              result={r}
+              commandLabel={command_label}
+              onCommand={onCommand}
+            />
           ))}
         </div>
       )}
@@ -76,12 +86,43 @@ function StatusPill({ status }: { status: TaskEntry['status'] }) {
 
 /**
  * Result renderer for the 7 wire `kind` values.
- * MVP fully renders: output | bof | ok | error | file.
+ * Fully renders: output | bof | ok | error | file; `ls` output goes structured
+ * via FileTable when it parses into rows (plain <pre> fallback otherwise).
  * TODO (later agents): image -> screenshot preview, channel -> SOCKS/rportfwd monitor.
  */
-function ResultLine({ result }: { result: ResultView }) {
+function ResultLine({
+  result,
+  commandLabel,
+  onCommand,
+}: {
+  result: ResultView;
+  commandLabel: string;
+  onCommand?: (command: JsonCommand, label: string) => void;
+}) {
   switch (result.kind) {
-    case 'output':
+    case 'output': {
+      // Structured path: an `ls` task's output parses into a FileTable.
+      if (isLsLabel(commandLabel)) {
+        const rows = parseLsLines(result.text.split('\n'));
+        if (rows.length > 0) {
+          const base = lsBasePath(commandLabel);
+          return (
+            <FileTable
+              entries={rows}
+              onEnter={onCommand ? (dir) => {
+                const path = resolveLsPath(base, dir);
+                onCommand({ type: 'fileop', op: 'cd', path }, `cd ${path}`);
+              } : undefined}
+              onDownload={onCommand ? (file) => {
+                const path = resolveLsPath(base, file);
+                onCommand({ type: 'download', path }, `download ${path}`);
+              } : undefined}
+            />
+          );
+        }
+      }
+      return <pre className="result result--text mono">{result.text}</pre>;
+    }
     case 'bof':
       return <pre className="result result--text mono">{result.text}</pre>;
     case 'ok':
@@ -89,8 +130,7 @@ function ResultLine({ result }: { result: ResultView }) {
     case 'error':
       return <pre className="result result--error mono">{result.text}</pre>;
     case 'file':
-      // MVP: plain status. TODO: aggregate FileChunk into a download manager
-      // (see FileTable.tsx for the structured file list direction).
+      // MVP: plain status. TODO: aggregate FileChunk into a download manager.
       return (
         <div className="result result--file mono">
           文件下载中… {result.text}
@@ -110,4 +150,30 @@ function ResultLine({ result }: { result: ResultView }) {
         </pre>
       );
   }
+}
+
+/* ----------------------------- ls path helpers ----------------------------- */
+
+/** True when the task label is an `ls` invocation ("ls" or "ls <path>"). */
+function isLsLabel(label: string): boolean {
+  return /^ls(\s|$)/.test(label.trim());
+}
+
+/**
+ * Directory an `ls` label listed, or null when it listed the implant's cwd
+ * ("ls" / "ls .") — relative names then work as-is for cd/download.
+ */
+function lsBasePath(label: string): string | null {
+  const m = label.trim().match(/^ls(?:\s+(.*))?$/);
+  if (!m) return null;
+  const p = (m[1] ?? '').trim();
+  return p === '' || p === '.' ? null : p;
+}
+
+/** Join a listed name onto the ls'd directory (Windows- or POSIX-style). */
+function resolveLsPath(base: string | null, name: string): string {
+  if (!base) return name;
+  if (/[\\/]$/.test(base)) return base + name;
+  const sep = base.includes('\\') ? '\\' : '/';
+  return base + sep + name;
 }

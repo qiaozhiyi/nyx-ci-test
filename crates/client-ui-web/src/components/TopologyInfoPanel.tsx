@@ -1,7 +1,9 @@
 /**
  * TopologyInfoPanel — right-side floating detail panel.
- * Renders all metadata for the currently-selected node: OS/arch/user/privilege,
- * channel, sleep, the pivot chain it belongs to, and recent tasks.
+ * Renders only the metadata actually carried by the selected node/session:
+ * hostname, OS, arch, user, privilege, state, channel (when an upstream edge
+ * exists) and pending task count. Nothing is fabricated — unknown values
+ * render as "—".
  * Frosted-glass surface (backdrop-filter) overlaying the canvas.
  *
  * Visibility is driven by the `visible` prop (parent owns the toggle). When
@@ -9,7 +11,8 @@
  * transition so there is no mount/unmount flicker. A small close button in the
  * header calls `onClose` to ask the parent to hide it.
  */
-import type { TopologyNode } from '../lib/topology-scene';
+import type { TopologyNode, ChannelKind } from '../lib/topology-scene';
+import { CHANNEL_LABEL } from '../lib/topology-scene';
 import type { SessionView } from '../lib/types';
 import { archName, classifyOs } from '../lib/types';
 import { OS_COLORS, OS_LABELS } from '../lib/os-icons';
@@ -22,7 +25,9 @@ export interface TopologyInfoPanelProps {
   session?: SessionView;
   /** Pivot chain (ordered list of hostnames) leading to this node from server. */
   pivotChain?: string[];
-  /** Recent task labels for this node. */
+  /** Upstream channel kind — only when an actual edge terminates at the node. */
+  channel?: ChannelKind;
+  /** Recent task labels for this node (real data only). */
   tasks?: { id: number; label: string }[];
   /** Whether the panel is shown. Parent owns this; fade is handled by CSS. */
   visible?: boolean;
@@ -32,14 +37,15 @@ export interface TopologyInfoPanelProps {
 
 const PRIV_LABEL: Record<string, string> = {
   server: 'Team Server',
-  admin: 'ADMIN / DA',
-  user: 'Standard User',
+  admin: '管理员',
+  user: '普通用户',
 };
 
 export function TopologyInfoPanel({
   node,
   session,
   pivotChain,
+  channel,
   tasks,
   visible = true,
   onClose,
@@ -56,8 +62,8 @@ export function TopologyInfoPanel({
           type="button"
           className="topo-panel-close"
           onClick={onClose}
-          aria-label="Close details panel"
-          title="Close details"
+          aria-label="关闭详情面板"
+          title="关闭详情"
         >
           ✕
         </button>
@@ -66,9 +72,9 @@ export function TopologyInfoPanel({
       {!node ? (
         <>
           <div className="topo-info-empty-glyph" aria-hidden>◇</div>
-          <div className="topo-info-empty-title">No node selected</div>
+          <div className="topo-info-empty-title">未选择节点</div>
           <div className="topo-info-empty-hint">
-            Click a node in the topology to inspect its metadata, pivot chain, and tasks.
+            点击拓扑中的节点，查看其元数据、Pivot 链路与任务。
           </div>
         </>
       ) : (
@@ -86,17 +92,18 @@ export function TopologyInfoPanel({
           </header>
 
           <dl className="topo-info-grid">
-            <Row k="Architecture" v={session ? archName(session.arch) : 'x64'} mono />
-            <Row k="User" v={session ? session.username : (node.priv === 'server' ? 'nyx' : 'operator')} mono />
-            <Row k="Channel" v={node.priv === 'server' ? 'loopback' : 'HTTPS egress'} />
-            <Row k="Sleep" v="8s ± 15%" mono />
+            <Row k="架构" v={session ? archName(session.arch) : '—'} mono />
+            <Row k="用户" v={session?.username ? session.username : '—'} mono />
+            <Row k="状态" v={node.stale ? '失联' : node.active ? '活跃' : '—'} />
+            <Row k="通道" v={channel ? CHANNEL_LABEL[channel] : '—'} />
+            <Row k="待办任务" v={session ? String(session.pending) : '—'} mono />
             {session && <Row k="Beacon" v={`#${session.beacon_id}`} mono />}
-            {session && <Row k="Age" v={`${Math.round(session.age_secs / 60)}m`} mono />}
+            {session && <Row k="上线时长" v={`${Math.round(session.age_secs / 60)} 分钟`} mono />}
             {session?.ja3 && <Row k="JA3" v={session.ja3} mono />}
           </dl>
 
           <section className="topo-info-section">
-            <h3 className="topo-info-section-title">Pivot chain</h3>
+            <h3 className="topo-info-section-title">Pivot 链路</h3>
             {pivotChain && pivotChain.length > 0 ? (
               <ol className="topo-chain">
                 {pivotChain.map((hop, i) => (
@@ -107,12 +114,12 @@ export function TopologyInfoPanel({
                 ))}
               </ol>
             ) : (
-              <div className="topo-info-empty-inline">Direct egress — no pivot hops.</div>
+              <div className="topo-info-empty-inline">直连 egress — 无 Pivot 跳点。</div>
             )}
           </section>
 
           <section className="topo-info-section">
-            <h3 className="topo-info-section-title">Recent tasks</h3>
+            <h3 className="topo-info-section-title">最近任务</h3>
             {tasks && tasks.length > 0 ? (
               <ul className="topo-tasks">
                 {tasks.map((t) => (
@@ -123,7 +130,7 @@ export function TopologyInfoPanel({
                 ))}
               </ul>
             ) : (
-              <div className="topo-info-empty-inline">No tasks queued for this node.</div>
+              <div className="topo-info-empty-inline">该节点暂无排队任务。</div>
             )}
           </section>
         </>

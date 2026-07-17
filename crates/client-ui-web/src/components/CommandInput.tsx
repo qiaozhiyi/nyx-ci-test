@@ -4,13 +4,18 @@
  * Design (Raijin-inspired): the first token (command name) is recognized and
  * rendered purple; remaining args render white. Unknown commands get a red
  * wavy underline + a hint. A static OPSEC rule warns on lsass-touching intent
- * (mimikatz / lsass) without blocking — MVP only ships 6 commands, so those
- * inputs naturally fall through to the unknown-command path.
+ * (mimikatz / lsass) without blocking — inputs that don't parse (mimikatz)
+ * fall through to the unknown-command path, while flagged commands that DO
+ * parse (e.g. `shell procdump ... lsass`) submit and carry the opsec tag.
  *
  * Implementation: a translucent <input> sits on top of a styled overlay layer
  * that mirrors its text token-by-token. The input holds the value and cursor;
  * the overlay does the coloring. This avoids contentEditable's quirks while
  * still giving per-token color.
+ *
+ * History: ↑/↓ walk a per-session history of submitted lines (module-level
+ * map, survives re-renders and session switches). Walking up stashes the
+ * in-progress draft; walking past the newest entry restores it.
  */
 import { useState, useRef, type KeyboardEvent, type ChangeEvent } from 'react';
 import type { JsonCommand, SessionView } from '../lib/types';
@@ -18,7 +23,7 @@ import './CommandInput.css';
 
 export interface CommandInputProps {
   session: SessionView;
-  onSubmit: (command: JsonCommand, label: string) => void;
+  onSubmit: (command: JsonCommand, label: string, opsec: boolean) => void;
 }
 
 /** Known MVP command names (ls is parsed into a fileop on submit). */
@@ -34,8 +39,23 @@ const KNOWN_COMMANDS = [
 /** Static OPSEC trip: lsass-touching tooling. UI warning only, never blocks. */
 const OPSEC_PATTERNS = /\b(mimikatz|lsass|procdump.*lsass|sekurlsa)\b/i;
 
+/** Per-session input history, keyed by session id (no localStorage needed). */
+const HISTORY = new Map<string, string[]>();
+const HISTORY_CAP = 200;
+
+/** Append a submitted line; dedupe only consecutive repeats, cap per session. */
+function pushHistory(sessionId: string, line: string) {
+  const hist = HISTORY.get(sessionId) ?? [];
+  if (hist[hist.length - 1] !== line) hist.push(line);
+  if (hist.length > HISTORY_CAP) hist.splice(0, hist.length - HISTORY_CAP);
+  HISTORY.set(sessionId, hist);
+}
+
 export function CommandInput({ session, onSubmit }: CommandInputProps) {
   const [value, setValue] = useState('');
+  // null = editing the draft; a number = walking HISTORY at that index.
+  const [histIdx, setHistIdx] = useState<number | null>(null);
+  const draftRef = useRef('');
   const inputRef = useRef<HTMLInputElement>(null);
 
   const tokens = value.trim().split(/\s+/).filter(Boolean);
@@ -48,8 +68,32 @@ export function CommandInput({ session, onSubmit }: CommandInputProps) {
     if (!trimmed) return;
     const parsed = parseCommand(trimmed);
     if (!parsed) return; // unknown command — refuse to submit, hint already shown
-    onSubmit(parsed.command, parsed.label);
+    pushHistory(session.id, trimmed);
+    onSubmit(parsed.command, parsed.label, opsec);
     setValue('');
+    setHistIdx(null);
+  }
+
+  /** Walk history: delta -1 = older entries, +1 = newer (draft past the end). */
+  function recall(delta: -1 | 1) {
+    const hist = HISTORY.get(session.id) ?? [];
+    if (hist.length === 0) return;
+    if (delta === -1) {
+      if (histIdx === null) draftRef.current = value; // stash the in-progress draft
+      const next = histIdx === null ? hist.length - 1 : Math.max(0, histIdx - 1);
+      setHistIdx(next);
+      setValue(hist[next] ?? '');
+    } else {
+      if (histIdx === null) return;
+      const next = histIdx + 1;
+      if (next >= hist.length) {
+        setHistIdx(null);
+        setValue(draftRef.current);
+      } else {
+        setHistIdx(next);
+        setValue(hist[next] ?? '');
+      }
+    }
   }
 
   function handleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
@@ -59,11 +103,25 @@ export function CommandInput({ session, onSubmit }: CommandInputProps) {
     } else if (e.key === 'Escape') {
       e.preventDefault();
       setValue('');
+      setHistIdx(null);
+    } else if (e.key === 'ArrowUp') {
+      // Single-line input: only hijack at line start (or mid-navigation) so
+      // normal caret behavior elsewhere is untouched.
+      if (histIdx !== null || e.currentTarget.selectionStart === 0) {
+        e.preventDefault();
+        recall(-1);
+      }
+    } else if (e.key === 'ArrowDown') {
+      if (histIdx !== null || e.currentTarget.selectionStart === e.currentTarget.value.length) {
+        e.preventDefault();
+        recall(1);
+      }
     }
   }
 
   function handleChange(e: ChangeEvent<HTMLInputElement>) {
     setValue(e.target.value);
+    setHistIdx(null); // manual edits leave history-navigation mode
   }
 
   return (
@@ -115,7 +173,7 @@ export function CommandInput({ session, onSubmit }: CommandInputProps) {
       <div className="cmdinput__hints">
         {!known && (
           <span className="cmdinput__hint cmdinput__hint--err">
-            未知命令，可用: ping/shell/exit/sleep/download/cd/ls
+            未知命令。常用: ping / shell / sleep / download / ls / cd / net / screenshot …
           </span>
         )}
         {opsec && (

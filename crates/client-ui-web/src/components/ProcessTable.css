@@ -59,7 +59,8 @@
   opacity: 0;
   transition: opacity 120ms ease;
 }
-.proctable__row:hover .proctable__ops {
+.proctable__row:hover .proctable__ops,
+.proctable__row:focus-within .proctable__ops {
   opacity: 1;
 }
 
@@ -71,8 +72,12 @@
   font-weight: 500;
   transition: filter 120ms ease;
 }
-.proctable__btn:hover {
+.proctable__btn:hover:not(:disabled) {
   filter: brightness(1.15);
+}
+.proctable__btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 .proctable__btn--inject {
   background: var(--accent);

@@ -42,12 +42,12 @@ export function ConnectPage({ onConnected, error: externalError }: ConnectPagePr
           <div className="brand-logo" aria-hidden>N</div>
           <div className="brand-text">
             <h1>Nyx Operator</h1>
-            <p className="brand-sub">Authorized red team use only</p>
+            <p className="brand-sub">仅限授权红队使用</p>
           </div>
         </div>
 
         <label className="field">
-          <span className="field-label">Server URL</span>
+          <span className="field-label">服务器地址</span>
           <input
             type="text"
             className="field-input mono"
@@ -61,7 +61,7 @@ export function ConnectPage({ onConnected, error: externalError }: ConnectPagePr
         </label>
 
         <label className="field">
-          <span className="field-label">Bearer token</span>
+          <span className="field-label">Bearer 令牌</span>
           <input
             type="password"
             className="field-input mono"
@@ -77,7 +77,7 @@ export function ConnectPage({ onConnected, error: externalError }: ConnectPagePr
         {error && <div className="connect-error" role="alert">{error}</div>}
 
         <button type="submit" className="connect-btn" disabled={!canSubmit}>
-          {loading ? 'Connecting…' : 'Connect'}
+          {loading ? '连接中…' : '连接'}
         </button>
       </form>
     </div>

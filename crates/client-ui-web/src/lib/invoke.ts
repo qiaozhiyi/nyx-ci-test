@@ -38,9 +38,16 @@ export function onResult(cb: (r: ResultView) => void): Promise<UnlistenFn> {
   return listen<ResultView>('nyx://result', (e) => cb(e.payload));
 }
 
+/** Payload of the `nyx://task-submitted` ack (emitted before send_command resolves). */
+export interface TaskSubmitted {
+  task_id: number;
+  session: string;
+  chan?: number;
+}
+
 /** Subscribe to task-submitted acks (immediate feedback on enqueue). */
-export function onTaskSubmitted(cb: (t: { task_id: number; session: string; chan?: number }) => void): Promise<UnlistenFn> {
-  return listen('nyx://task-submitted', (e) => cb(e.payload as any));
+export function onTaskSubmitted(cb: (t: TaskSubmitted) => void): Promise<UnlistenFn> {
+  return listen<TaskSubmitted>('nyx://task-submitted', (e) => cb(e.payload));
 }
 
 /** Subscribe to backend errors (e.g. auth failure, network). */

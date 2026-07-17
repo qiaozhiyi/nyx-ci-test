@@ -11,12 +11,12 @@ export interface SessionTableProps {
 
 type FilterKey = 'all' | 'admin' | 'da' | 'x64' | 'alive';
 
-const FILTERS: { key: FilterKey; label: string }[] = [
+const FILTERS: { key: FilterKey; label: string; title?: string }[] = [
   { key: 'all', label: '全部' },
   { key: 'admin', label: 'admin' },
   { key: 'da', label: 'DA' },
   { key: 'x64', label: 'x64' },
-  { key: 'alive', label: '●活跃' },
+  { key: 'alive', label: '●活跃', title: '本次服务器生命周期内已回连' },
 ];
 
 /** Elevated context: explicit admin flag OR username mentions admin. */
@@ -32,12 +32,13 @@ function isDA(s: SessionView): boolean {
   return s.is_admin === 1 && classifyOs(s.os) === 'win-server';
 }
 
-function formatAge(secs: number): string {
-  if (secs < 60) return `${secs}s ago`;
+/** age_secs is seconds since FIRST check-in — render it as session lifetime. */
+function formatAlive(secs: number): string {
+  if (secs < 60) return '存活 <1m';
   const m = Math.round(secs / 60);
-  if (m < 60) return `${m}m ago`;
+  if (m < 60) return `存活 ${m}m`;
   const h = Math.round(m / 60);
-  return `${h}h ago`;
+  return `存活 ${h}h`;
 }
 
 function staleMinutes(secs: number): number {
@@ -67,7 +68,7 @@ export function SessionTable({ sessions, selectedId, onSelect }: SessionTablePro
         <span className="st-count mono">
           {sessions.length === 0
             ? '—'
-            : `${aliveCount} alive${staleCount ? ` · ${staleCount} stale` : ''}`}
+            : `${aliveCount} 活跃${staleCount ? ` · ${staleCount} 未回连` : ''}`}
         </span>
       </div>
 
@@ -77,6 +78,7 @@ export function SessionTable({ sessions, selectedId, onSelect }: SessionTablePro
             key={f.key}
             type="button"
             className={'st-chip' + (filter === f.key ? ' on' : '')}
+            title={f.title}
             onClick={() => setFilter(f.key)}
           >
             {f.label}
@@ -114,8 +116,12 @@ export function SessionTable({ sessions, selectedId, onSelect }: SessionTablePro
                   <Sep />
                   <span>{archName(s.arch)}</span>
                   <Sep />
-                  <span>{formatAge(s.age_secs)}</span>
-                  {s.stale && <span className="st-stale">stale {staleMinutes(s.age_secs)}m</span>}
+                  <span>{formatAlive(s.age_secs)}</span>
+                  {s.stale && (
+                    <span className="st-stale" title="服务器重启后尚未回连">
+                      stale {staleMinutes(s.age_secs)}m
+                    </span>
+                  )}
                 </div>
               </button>
             );

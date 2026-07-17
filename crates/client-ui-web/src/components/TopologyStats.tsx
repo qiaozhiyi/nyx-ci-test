@@ -34,16 +34,16 @@ export function TopologyStats({ nodes, edges, visible = true, onClose }: Topolog
           type="button"
           className="topo-panel-close"
           onClick={onClose}
-          aria-label="Close stats panel"
-          title="Close stats"
+          aria-label="关闭统计面板"
+          title="关闭统计"
         >
           ✕
         </button>
       )}
-      <Stat value={active} label="Active" tone="ok" />
-      <Stat value={total} label="Total" tone="default" />
+      <Stat value={active} label="活跃" tone="ok" />
+      <Stat value={total} label="总数" tone="default" />
       <Stat value={pivots} label="Pivots" tone="warn" />
-      <Stat value={stale} label="Stale" tone="dim" />
+      <Stat value={stale} label="失联" tone="dim" />
     </aside>
   );
 }

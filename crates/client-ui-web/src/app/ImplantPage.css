@@ -45,10 +45,10 @@
 }
 
 .implant-section-title {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text);
-  letter-spacing: 0.02em;
+  letter-spacing: 0.04em;
 }
 
 .implant-section-sub {
@@ -163,6 +163,30 @@
 .ip-check-label {
   font-size: 12px;
   color: var(--text-second);
+}
+
+/* Inline per-field validation message (e.g. port range). */
+.ip-field-error {
+  font-size: 11px;
+  color: var(--danger);
+}
+
+/* Advanced options — collapsed <details> under the main form. */
+.ip-advanced summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  color: var(--text-second);
+  user-select: none;
+  outline: none;
+}
+
+.ip-advanced summary:hover,
+.ip-advanced summary:focus-visible {
+  color: var(--text);
+}
+
+.ip-advanced[open] summary {
+  margin-bottom: var(--sp-3);
 }
 
 /* ===== Primary / ghost buttons ===== */

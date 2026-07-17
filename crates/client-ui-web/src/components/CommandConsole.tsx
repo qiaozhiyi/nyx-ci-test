@@ -9,10 +9,15 @@
  * 'completed' (or 'error' if any result has kind==='error') as results drain
  * in from onResult — which only fires when the beacon checks in (~30s). The
  * task list is scoped to the currently selected session and resets on switch.
+ *
+ * Race note: the backend emits `nyx://task-submitted` BEFORE the send_command
+ * invoke promise resolves, so an ack can arrive while its optimistic block
+ * doesn't exist yet. Those early acks are stashed in ackStash and consumed
+ * by handleSubmit when the entry is inserted.
  */
 import { useEffect, useRef, useState } from 'react';
 import type { JsonCommand, SessionView } from '../lib/types';
-import { sendCommand, onResult, onTaskSubmitted } from '../lib/invoke';
+import { sendCommand, onResult, onTaskSubmitted, type TaskSubmitted } from '../lib/invoke';
 import { archName, classifyOs } from '../lib/types';
 import { OS_LABELS } from '../lib/os-icons';
 import { TaskBlock, type TaskEntry } from './TaskBlock';
@@ -26,11 +31,20 @@ export interface CommandConsoleProps {
 export function CommandConsole({ session }: CommandConsoleProps) {
   const [tasks, setTasks] = useState<TaskEntry[]>([]);
   const flowRef = useRef<HTMLDivElement>(null);
+  // Acks that arrived before their optimistic block was inserted (see header).
+  const ackStash = useRef(new Map<number, TaskSubmitted>());
+  // Mirror of tasks for synchronous checks inside event handlers (the
+  // setTasks updater runs later, so it can't answer "does this block exist?").
+  const tasksRef = useRef<TaskEntry[]>([]);
+  useEffect(() => {
+    tasksRef.current = tasks;
+  });
 
   // Reset the task flow whenever the selected session changes — each console
   // only shows the current session's command history.
   useEffect(() => {
     setTasks([]);
+    ackStash.current.clear();
   }, [session.id]);
 
   // Auto-scroll to the bottom when a new task/result lands.
@@ -43,8 +57,14 @@ export function CommandConsole({ session }: CommandConsoleProps) {
   // matching queued task as 'processing' (it's been enqueued server-side).
   useEffect(() => {
     let unsub: (() => void) | undefined;
+    let cancelled = false;
     onTaskSubmitted((ack) => {
       if (ack.session !== session.id) return;
+      // Ack beat the send_command promise: no block exists yet — stash it so
+      // handleSubmit can flip the entry to 'processing' at insertion time.
+      if (!tasksRef.current.some((t) => t.task_id === ack.task_id)) {
+        ackStash.current.set(ack.task_id, ack);
+      }
       setTasks((prev) =>
         prev.map((t) =>
           t.task_id === ack.task_id && t.status === 'queued'
@@ -53,9 +73,11 @@ export function CommandConsole({ session }: CommandConsoleProps) {
         ),
       );
     }).then((u) => {
-      unsub = u;
+      if (cancelled) u();
+      else unsub = u;
     });
     return () => {
+      cancelled = true;
       if (unsub) unsub();
     };
   }, [session.id]);
@@ -63,6 +85,7 @@ export function CommandConsole({ session }: CommandConsoleProps) {
   // Listen for results: attach to the matching task and resolve its status.
   useEffect(() => {
     let unsub: (() => void) | undefined;
+    let cancelled = false;
     onResult((r) => {
       setTasks((prev) => {
         // Only the task for THIS session is tracked here; but results carry no
@@ -78,15 +101,19 @@ export function CommandConsole({ session }: CommandConsoleProps) {
         return next;
       });
     }).then((u) => {
-      unsub = u;
+      if (cancelled) u();
+      else unsub = u;
     });
     return () => {
+      cancelled = true;
       if (unsub) unsub();
     };
   }, []);
 
-  // Submit handler: send to backend, then insert an optimistic 'queued' entry.
-  async function handleSubmit(command: JsonCommand, label: string) {
+  // Submit handler: send to backend, then insert an optimistic entry. If the
+  // task-submitted ack already arrived (see header race note), skip 'queued'
+  // and go straight to 'processing'.
+  async function handleSubmit(command: JsonCommand, label: string, opsec = false) {
     let taskId = -1;
     try {
       taskId = await sendCommand(session.id, command, label);
@@ -104,16 +131,20 @@ export function CommandConsole({ session }: CommandConsoleProps) {
           },
         ],
         session: session.id,
+        opsec,
       };
       setTasks((prev) => [...prev, errorTask]);
       return;
     }
+    const earlyAck = ackStash.current.get(taskId);
+    if (earlyAck) ackStash.current.delete(taskId);
     const entry: TaskEntry = {
       task_id: taskId,
       command_label: label,
-      status: 'queued',
+      status: earlyAck ? 'processing' : 'queued',
       results: [],
       session: session.id,
+      opsec,
     };
     setTasks((prev) => [...prev, entry]);
   }
@@ -168,7 +199,7 @@ export function CommandConsole({ session }: CommandConsoleProps) {
             </div>
           </div>
         ) : (
-          tasks.map((t) => <TaskBlock key={t.task_id} task={t} />)
+          tasks.map((t) => <TaskBlock key={t.task_id} task={t} onCommand={handleSubmit} />)
         )}
       </div>
 

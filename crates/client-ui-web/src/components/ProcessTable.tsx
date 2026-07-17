@@ -51,6 +51,7 @@ export function ProcessTable({ entries, lines, onAction }: ProcessTableProps) {
             <button
               type="button"
               className="proctable__btn proctable__btn--inject mono"
+              disabled={!onAction}
               onClick={() => onAction?.('inject', p)}
             >
               inject
@@ -58,6 +59,7 @@ export function ProcessTable({ entries, lines, onAction }: ProcessTableProps) {
             <button
               type="button"
               className="proctable__btn proctable__btn--kill mono"
+              disabled={!onAction}
               onClick={() => onAction?.('kill', p)}
             >
               kill

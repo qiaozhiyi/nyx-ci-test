@@ -8,7 +8,7 @@ import { CredsPage } from './CredsPage';
 import { ImplantPage } from './ImplantPage';
 import { EventsPage } from './EventsPage';
 import { Dock } from '../components/Dock';
-import { onError, onSessions } from '../lib/invoke';
+import { disconnect, onError, onSessions } from '../lib/invoke';
 import './App.css';
 
 /** The surfaces reachable from the Dock. */
@@ -63,6 +63,20 @@ export function App() {
     };
   }, [connected]);
 
+  // Drop the team-server link and return to the connect page. Even if the
+  // backend call fails we still leave — the session state is cleared either way.
+  async function handleDisconnect() {
+    try {
+      await disconnect();
+    } catch (err) {
+      console.error('disconnect failed:', err);
+    }
+    setConnected(false);
+    setActivePage('workspace');
+    setSessions([]);
+    setSelectedId(null);
+  }
+
   if (!connected) {
     return (
       <ConnectPage
@@ -77,7 +91,7 @@ export function App() {
 
   return (
     <div className="app-shell">
-      <Dock activePage={activePage} onPageChange={setActivePage} />
+      <Dock activePage={activePage} onPageChange={setActivePage} onDisconnect={handleDisconnect} />
       <main className="app-main">
         {activePage === 'workspace' && (
           <Workspace

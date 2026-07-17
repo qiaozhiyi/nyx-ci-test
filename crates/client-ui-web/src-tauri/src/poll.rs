@@ -19,6 +19,12 @@ use crate::state::{BackendState, Connection};
 /// Poll interval for `/api/sessions`. Matches the old bridge.
 const SESSION_POLL: Duration = Duration::from_secs(2);
 
+/// Consecutive `/api/sessions` failures tolerated before emitting `nyx://error`.
+/// The frontend treats any such error as a dropped connection and logs the
+/// operator out, so a single transient blip must not trigger it — only a
+/// sustained outage (3 consecutive misses ≈ 6s) is surfaced.
+const MAX_SESSION_FETCH_FAILURES: u32 = 3;
+
 /// Spawn the background poll loop on Tauri's async runtime.
 /// Must use `tauri::async_runtime::spawn` (not bare `tokio::spawn`) because
 /// Tauri 2's setup callback runs outside a tokio runtime context.
@@ -27,6 +33,7 @@ pub fn spawn(app: AppHandle, state: Arc<BackendState>) {
         let client = rest::http_client();
         let mut tick = interval(SESSION_POLL);
         let mut last_sig: Option<String> = None;
+        let mut fail_count: u32 = 0;
 
         loop {
             tick.tick().await;
@@ -39,8 +46,11 @@ pub fn spawn(app: AppHandle, state: Arc<BackendState>) {
             };
 
             // 1. Refresh sessions (with change detection via signature).
+            // Tolerate up to MAX_SESSION_FETCH_FAILURES consecutive failures
+            // before emitting `nyx://error` (frontend treats it as fatal).
             match rest::fetch_sessions(&client, &server, &bearer).await {
                 Ok(sessions) => {
+                    fail_count = 0;
                     let sig = nyx_rest::session_signature(&sessions);
                     if last_sig.as_deref() != Some(sig.as_str()) {
                         last_sig = Some(sig);
@@ -48,7 +58,13 @@ pub fn spawn(app: AppHandle, state: Arc<BackendState>) {
                     }
                 }
                 Err(e) => {
-                    let _ = app.emit("nyx://error", e.to_string());
+                    fail_count += 1;
+                    eprintln!(
+                        "[poll] fetch_sessions failed ({fail_count}/{MAX_SESSION_FETCH_FAILURES}): {e}"
+                    );
+                    if fail_count >= MAX_SESSION_FETCH_FAILURES {
+                        let _ = app.emit("nyx://error", e.to_string());
+                    }
                 }
             }
 

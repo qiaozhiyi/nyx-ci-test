@@ -38,7 +38,9 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--sp-4);
+  gap: var(--sp-2) var(--sp-4);
+  /* brand + 6 toggles overflow on narrow windows — wrap instead of clipping */
+  flex-wrap: wrap;
   pointer-events: none;
 }
 .topo-toolbar > * { pointer-events: auto; }
@@ -70,6 +72,8 @@
 
 .topo-toolbar-toggles {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: var(--sp-2);
   padding: 6px;
   background: rgba(10, 12, 16, 0.72);
@@ -112,6 +116,35 @@
   background: var(--accent);
   box-shadow: 0 0 6px rgba(124, 92, 255, 0.8);
 }
+.topo-toggle-label {
+  line-height: 1;
+  white-space: nowrap;
+}
+
+/* --- WebGL failure fallback ----------------------------------------------- */
+.topo-fallback {
+  position: absolute;
+  inset: 0;
+  z-index: 5; /* above the (empty) canvas, below the floating overlays */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3);
+  padding: var(--sp-5);
+  text-align: center;
+}
+.topo-fallback-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.topo-fallback-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  max-width: 320px;
+  color: var(--text-muted);
+}
 
 /* --- Hint footer ---------------------------------------------------------- */
 .topo-hint {
@@ -128,4 +161,9 @@
   font-size: 11px;
   pointer-events: none;
   white-space: nowrap;
+}
+/* Narrow windows: the centered hint collides with the bottom-left legend and
+   bottom-right stats — drop it there. */
+@media (max-width: 760px) {
+  .topo-hint { display: none; }
 }

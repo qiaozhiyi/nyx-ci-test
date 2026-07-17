@@ -8,7 +8,8 @@
  * left gutter and each row has a node marker so the eye reads top-to-bottom
  * as a stream of events (newest at the top, since records are reversed).
  *
- * All colors come from styles/tokens.css — no hardcoded values.
+ * Colors reference styles/tokens.css vars; the only raw literals are rgba
+ * alpha variants of token colors (soft borders and glows).
  */
 
 .events-root {
@@ -39,7 +40,7 @@
 }
 
 .audit-title {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text);
   letter-spacing: 0.04em;
@@ -60,7 +61,7 @@
 }
 
 .audit-btn {
-  height: 28px;
+  height: 26px;
   padding: 0 var(--sp-3);
   background: var(--elev);
   border: 1px solid var(--border);
@@ -93,7 +94,7 @@
 /* Select + operator filter inputs share a compact control style. */
 .audit-select,
 .audit-input {
-  height: 28px;
+  height: 26px;
   padding: 0 var(--sp-3);
   background: var(--elev);
   border: 1px solid var(--border);
@@ -115,7 +116,7 @@
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  height: 28px;
+  height: 26px;
   padding: 0 var(--sp-3);
   border-radius: var(--r-pill);
   font-size: 11.5px;
@@ -165,11 +166,12 @@
   background: var(--border);
 }
 
-/* Each event row. */
+/* Each event row. Time column is wide enough for an MM-DD prefix on older
+   records (see formatAuditTime in the TSX). */
 .audit-row {
   position: relative;
   display: grid;
-  grid-template-columns: 70px 1fr auto;
+  grid-template-columns: 96px 1fr auto;
   align-items: start;
   gap: var(--sp-3);
   padding: var(--sp-2) var(--sp-3) var(--sp-2) var(--sp-4);
@@ -298,10 +300,6 @@
   white-space: pre-wrap;
   word-break: break-word;
   max-width: 100%;
-}
-
-.audit-detail-key {
-  color: var(--text-muted);
 }
 
 /* Right column: seq + hash. */

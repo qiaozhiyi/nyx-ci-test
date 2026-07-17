@@ -8,7 +8,7 @@
  * Imports only the shared contract in lib/invoke.ts; visuals reference
  * styles/tokens.css via ImplantPage.css.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, FormEvent } from 'react';
 import {
   generateImplant,
@@ -35,6 +35,8 @@ interface FormState {
   tls: boolean;
   notes: string;
   inline: boolean;
+  expires: string;
+  features: string;
 }
 
 const DEFAULTS: FormState = {
@@ -47,32 +49,57 @@ const DEFAULTS: FormState = {
   tls: true,
   notes: '',
   inline: false,
+  expires: '',
+  features: '',
 };
 
 /**
  * Decode a base64 string into an octet-stream Blob and trigger a browser
  * download with the given filename. Used for the inline binary payload.
+ * Returns false when the WebView refuses the synthetic click (callers then
+ * offer a copy-base64 fallback). The object URL is revoked lazily: Tauri's
+ * WKWebView may not have started the download synchronously, and revoking
+ * immediately can cancel it.
  */
-function downloadBase64(b64: string, filename: string): void {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  const blob = new Blob([bytes], { type: 'application/octet-stream' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
+function downloadBase64(b64: string, filename: string): boolean {
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const blob = new Blob([bytes], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-/** Copy text to the clipboard, returning whether it succeeded. */
+/** Copy text to the clipboard, returning whether it succeeded. Falls back to
+ *  a hidden textarea + execCommand for non-secure contexts where
+ *  navigator.clipboard is unavailable. */
 async function copyText(text: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(text);
     return true;
   } catch {
-    return false;
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -93,7 +120,18 @@ export function ImplantPage() {
   const [listLoading, setListLoading] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
   const [revokingPub, setRevokingPub] = useState<string | null>(null);
-  const [copied, setCopied] = useState<'pub' | 'sha' | null>(null);
+  const [copied, setCopied] = useState<'pub' | 'sha' | 'bin' | null>(null);
+  const [copyFailed, setCopyFailed] = useState(false);
+  const [downloadFailed, setDownloadFailed] = useState(false);
+
+  // Holds the "已复制" feedback timer so it can be re-armed and cleared on
+  // unmount (a bare setTimeout would setState on a dead component).
+  const copyTimer = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+    };
+  }, []);
 
   const refreshList = useCallback(async () => {
     setListLoading(true);
@@ -126,31 +164,51 @@ export function ImplantPage() {
     return (e: ChangeEvent<HTMLInputElement>) => update(key, e.target.checked);
   }
 
+  // Port is optional (empty = server default) but must be 1–65535 when set;
+  // the raw Number() coercion would otherwise silently drop bad input.
+  const portNum = form.port.trim() === '' ? undefined : Number(form.port);
+  const portValid =
+    portNum === undefined ||
+    (Number.isInteger(portNum) && portNum >= 1 && portNum <= 65535);
+  // features is a number when provided; empty/non-numeric stays undefined.
+  const featuresNum =
+    form.features.trim() === '' ? undefined : Number(form.features);
+
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     const callback = form.callback.trim();
     if (!callback) {
-      setError('Callback host is required.');
+      setError('必须填写 callback host。');
+      return;
+    }
+    if (!portValid) {
+      setError('端口必须在 1–65535 之间。');
       return;
     }
     setLoading(true);
     setError(null);
     setResult(null);
+    setCopyFailed(false);
+    setDownloadFailed(false);
     try {
       const req: GenerateRequest = {
         callback,
-        port: Number(form.port) || undefined,
+        port: portNum,
         format: form.format,
         uri: form.uri.trim() || undefined,
         sleep: Number(form.sleep) || undefined,
         jitter: Number(form.jitter) || undefined,
         tls: form.tls,
+        features: Number.isFinite(featuresNum) ? featuresNum : undefined,
+        expires: form.expires.trim() || undefined,
         notes: form.notes.trim() || undefined,
         deliver: form.inline ? 'inline' : undefined,
       };
       const res = await generateImplant(req);
+      // Backend reports failures in-band as { ok: false, message }, not via
+      // rejection — render that through the same error card as a throw.
       if (!res.ok) {
-        setError(res.message || 'Generation failed.');
+        setError(res.message || '生成失败。');
       } else {
         setResult(res);
         // A new implant exists now; refresh the list.
@@ -163,12 +221,29 @@ export function ImplantPage() {
     }
   }
 
-  async function handleCopy(kind: 'pub' | 'sha', text: string) {
+  async function handleCopy(kind: 'pub' | 'sha' | 'bin', text: string) {
     const ok = await copyText(text);
     if (ok) {
+      setCopyFailed(false);
       setCopied(kind);
-      window.setTimeout(() => setCopied((c) => (c === kind ? null : c)), 1200);
+      if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(
+        () => setCopied((c) => (c === kind ? null : c)),
+        1200,
+      );
+    } else {
+      setCopied(null);
+      setCopyFailed(true);
     }
+  }
+
+  function handleDownload() {
+    if (!result?.binary) return;
+    const ok = downloadBase64(
+      result.binary,
+      binaryFilename(result.format, result.implant_pub),
+    );
+    setDownloadFailed(!ok);
   }
 
   async function handleRevoke(implant: ImplantSummary) {
@@ -188,16 +263,16 @@ export function ImplantPage() {
     }
   }
 
-  const canSubmit = !loading && form.callback.trim().length > 0;
+  const canSubmit = !loading && form.callback.trim().length > 0 && portValid;
 
   return (
     <div className="implant-page">
       <section className="implant-gen">
         <form className="implant-form" onSubmit={handleSubmit}>
           <div className="implant-form-head">
-            <h2 className="implant-section-title">Generate Implant</h2>
+            <h2 className="implant-section-title">生成 implant</h2>
             <span className="implant-section-sub">
-              Build a callback payload for the current team server.
+              为当前 team server 构建回连 payload。
             </span>
           </div>
 
@@ -226,6 +301,9 @@ export function ImplantPage() {
                 min={1}
                 max={65535}
               />
+              {!portValid && (
+                <span className="ip-field-error">端口必须在 1–65535 之间。</span>
+              )}
             </label>
 
             <label className="ip-field">
@@ -292,7 +370,7 @@ export function ImplantPage() {
                 checked={form.inline}
                 onChange={onCheck('inline')}
               />
-              <span className="ip-check-label">Inline binary (download)</span>
+              <span className="ip-check-label">内联 binary（下载）</span>
             </label>
           </div>
 
@@ -303,22 +381,53 @@ export function ImplantPage() {
               value={form.notes}
               onChange={onText('notes')}
               rows={2}
-              placeholder="optional operator note"
+              placeholder="可选备注"
               spellCheck={false}
             />
           </label>
 
+          {/* Secondary knobs, hidden by default to keep the main form lean. */}
+          <details className="ip-advanced">
+            <summary>高级选项</summary>
+            <div className="implant-grid">
+              <label className="ip-field">
+                <span className="ip-label">expires</span>
+                <input
+                  type="text"
+                  className="ip-input mono"
+                  value={form.expires}
+                  onChange={onText('expires')}
+                  placeholder="2026-12-31"
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+              </label>
+
+              <label className="ip-field">
+                <span className="ip-label">features</span>
+                <input
+                  type="number"
+                  className="ip-input mono"
+                  value={form.features}
+                  onChange={onText('features')}
+                  min={0}
+                  placeholder="留空则不设置"
+                />
+              </label>
+            </div>
+          </details>
+
           {error && <div className="ip-error" role="alert">{error}</div>}
 
           <button type="submit" className="ip-primary" disabled={!canSubmit}>
-            {loading ? 'Generating…' : 'Generate'}
+            {loading ? '生成中…' : '生成'}
           </button>
         </form>
 
         {result && (
           <div className="implant-result" role="status">
             <div className="implant-result-head">
-              <span className="implant-result-title">Generated</span>
+              <span className="implant-result-title">已生成</span>
               <span className="implant-result-badge">{result.format}</span>
             </div>
 
@@ -331,7 +440,7 @@ export function ImplantPage() {
                   className="ip-copy"
                   onClick={() => handleCopy('pub', result.implant_pub)}
                 >
-                  {copied === 'pub' ? 'Copied' : 'Copy'}
+                  {copied === 'pub' ? '已复制' : '复制'}
                 </button>
               </div>
             </div>
@@ -345,7 +454,7 @@ export function ImplantPage() {
                   className="ip-copy"
                   onClick={() => handleCopy('sha', result.sha256)}
                 >
-                  {copied === 'sha' ? 'Copied' : 'Copy'}
+                  {copied === 'sha' ? '已复制' : '复制'}
                 </button>
               </div>
             </div>
@@ -363,14 +472,31 @@ export function ImplantPage() {
                 <button
                   type="button"
                   className="ip-download"
-                  onClick={() =>
-                    downloadBase64(result.binary!, binaryFilename(result.format, result.implant_pub))
-                  }
+                  onClick={handleDownload}
                 >
-                  Download binary
+                  下载二进制
                 </button>
               )}
             </div>
+
+            {downloadFailed && result.binary && (
+              <div className="ip-error" role="alert">
+                下载失败（WebView 可能拦截了 blob 下载），可改为手动保存：{' '}
+                <button
+                  type="button"
+                  className="ip-copy"
+                  onClick={() => handleCopy('bin', result.binary!)}
+                >
+                  {copied === 'bin' ? '已复制' : '复制 base64'}
+                </button>
+              </div>
+            )}
+
+            {copyFailed && (
+              <div className="ip-error" role="alert">
+                复制失败，请手动选择文本复制。
+              </div>
+            )}
 
             {result.message && (
               <p className="ip-result-msg">{result.message}</p>
@@ -381,10 +507,10 @@ export function ImplantPage() {
 
       <section className="implant-list">
         <div className="implant-form-head">
-          <h2 className="implant-section-title">Generated Implants</h2>
+          <h2 className="implant-section-title">已生成 implant</h2>
           <div className="implant-section-actions">
             <span className="implant-section-sub">
-              {listLoading ? 'loading…' : `${implants.length} total`}
+              {listLoading ? '加载中…' : `共 ${implants.length} 个`}
             </span>
             <button
               type="button"
@@ -392,7 +518,7 @@ export function ImplantPage() {
               onClick={() => void refreshList()}
               disabled={listLoading}
             >
-              Refresh
+              刷新
             </button>
           </div>
         </div>
@@ -415,7 +541,7 @@ export function ImplantPage() {
                   <th>created</th>
                   <th>expires</th>
                   <th>status</th>
-                  <th className="ip-th-action">action</th>
+                  <th className="ip-th-action">操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -445,7 +571,7 @@ export function ImplantPage() {
                         {revokingPub === imp.implant_pub
                           ? '…'
                           : imp.revoked
-                            ? 'revoked'
+                            ? '已吊销'
                             : '吊销'}
                       </button>
                     </td>

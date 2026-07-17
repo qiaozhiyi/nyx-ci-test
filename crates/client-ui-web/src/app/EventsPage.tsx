@@ -3,7 +3,9 @@
  *
  * Pulls the tamper-evident audit log via fetchAudit() and renders it as a
  * vertical timeline (newest first). The toolbar exposes a manual refresh, a
- * hash-chain verification (verifyAudit), and action/operator filters.
+ * hash-chain verification (verifyAudit), and action/operator filters. Every
+ * successful refresh re-runs verification automatically, so the chain pill
+ * never goes stale against newer records.
  *
  * Records are not a plain table: each row sits on a left gutter rail with a
  * per-action colored marker, the timestamp anchored on the left, the action
@@ -75,6 +77,22 @@ function summarizeDetail(action: string, detail: unknown): string {
   return JSON.stringify(detail, null, 2);
 }
 
+/** Time-only for today's records; older ones get an MM-DD prefix so cross-day
+ *  rows stay distinguishable in the timeline (e.g. "07-16 22:41:03"). */
+function formatAuditTime(ts: number): string {
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  const time = d.toLocaleTimeString();
+  if (sameDay) return time;
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${mm}-${dd} ${time}`;
+}
+
 type VerifyState =
   | { kind: 'idle' }
   | { kind: 'pending' }
@@ -91,27 +109,7 @@ export function EventsPage() {
 
   const [verify, setVerify] = useState<VerifyState>({ kind: 'idle' });
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      // Default: most recent 500, newest first (server returns ascending by seq,
-      // so we reverse for a newest-first timeline).
-      const rows = await fetchAudit({ limit: 500 });
-      setRecords([...rows].sort((a, b) => b.seq - a.seq));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setRecords([]);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
-
-  const runVerify = useCallback(async () => {
+  const runVerify = useCallback(async (opts?: { quiet?: boolean }) => {
     setVerify({ kind: 'pending' });
     try {
       const res = await verifyAudit();
@@ -121,10 +119,38 @@ export function EventsPage() {
           : { kind: 'broken', brokenAt: res.broken_at ?? -1 },
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      // quiet: auto-verify after a refresh must not clobber the record list
+      // with a full-page error; the pill just falls back to unverified.
+      if (!opts?.quiet) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
       setVerify({ kind: 'idle' });
     }
   }, []);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    // New records invalidate the previous verdict — back to unverified.
+    setVerify({ kind: 'idle' });
+    try {
+      // Default: most recent 500, newest first (server returns ascending by seq,
+      // so we reverse for a newest-first timeline).
+      const rows = await fetchAudit({ limit: 500 });
+      setRecords([...rows].sort((a, b) => b.seq - a.seq));
+      // Re-verify the chain against the refreshed set.
+      void runVerify({ quiet: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setRecords([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [runVerify]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
 
   // Apply client-side filters (action + operator substring, case-insensitive).
   const visible = useMemo(() => {
@@ -140,7 +166,7 @@ export function EventsPage() {
     <div className="events-root">
       <div className="audit-toolbar">
         <div className="audit-toolbar-left">
-          <span className="audit-title">Audit Log</span>
+          <span className="audit-title">事件审计</span>
           <span className="audit-count">
             {loading ? '…' : `${visible.length} / ${records.length}`}
           </span>
@@ -148,7 +174,7 @@ export function EventsPage() {
 
         <div className="audit-toolbar-right">
           {verify.kind === 'ok' && (
-            <span className="audit-verify ok" title="Hash chain intact">
+            <span className="audit-verify ok" title="哈希链完整">
               <span className="audit-verify-dot" />
               链完整 ✓
             </span>
@@ -156,7 +182,7 @@ export function EventsPage() {
           {verify.kind === 'broken' && (
             <span
               className="audit-verify broken"
-              title="A record's stored hash does not match recomputed value"
+              title="存在记录的存储哈希与重算值不匹配"
             >
               <span className="audit-verify-dot" />
               链在 seq #{verify.brokenAt} 处断裂 ✕
@@ -176,7 +202,7 @@ export function EventsPage() {
             className="audit-select"
             value={actionFilter}
             onChange={(e) => setActionFilter(e.target.value as ActionFilter)}
-            aria-label="Filter by action"
+            aria-label="按动作过滤"
           >
             {ACTION_FILTERS.map((a) => (
               <option key={a} value={a}>
@@ -189,6 +215,7 @@ export function EventsPage() {
             type="text"
             className="audit-input"
             placeholder="操作员…"
+            aria-label="按 operator 过滤"
             value={operatorFilter}
             onChange={(e) => setOperatorFilter(e.target.value)}
             spellCheck={false}
@@ -248,7 +275,7 @@ function EventRow({ record }: { record: AuditRecord }) {
 
   const summary = summarizeDetail(action, detail);
   const isSystem = operator === 'system' || operator.length === 0;
-  const time = new Date(ts * 1000).toLocaleTimeString();
+  const time = formatAuditTime(ts);
 
   return (
     <div className={`audit-row ${rowClass(action)}`}>

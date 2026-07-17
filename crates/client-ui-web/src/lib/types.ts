@@ -106,6 +106,8 @@ export function classifyOs(osStr: string): OsKind {
   if (s.includes('windows 7') || s.includes('win7')) return 'win7';
   if (s.includes('windows xp') || s.includes('winxp')) return 'winxp';
   if (s.includes('windows 95') || s.includes('win95')) return 'win95';
+  // macOS must precede the generic 'win' fallback — "darwin" contains "win".
+  if (s.includes('macos') || s.includes('mac os') || s.includes('darwin')) return 'macos';
   if (s.includes('windows') || s.includes('win')) return 'windows';
   // Linux distributions
   if (s.includes('ubuntu')) return 'ubuntu';
@@ -128,7 +130,6 @@ export function classifyOs(osStr: string): OsKind {
   if (s.includes('openbsd')) return 'openbsd';
   if (s.includes('netbsd')) return 'netbsd';
   // Other
-  if (s.includes('macos') || s.includes('mac os') || s.includes('darwin')) return 'macos';
   if (s.includes('reactos')) return 'reactos';
   return 'unknown';
 }

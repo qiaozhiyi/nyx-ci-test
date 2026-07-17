@@ -61,7 +61,7 @@
 }
 
 .cv-select {
-  height: 22px;
+  height: 26px;
   padding: 0 var(--sp-2);
   border: 1px solid var(--border);
   background: var(--elev);
@@ -85,7 +85,7 @@
 
 /* reveal toggle — solid LED indicator, no blink (matches TopologyPage policy) */
 .cv-reveal {
-  height: 22px;
+  height: 26px;
   padding: 0 var(--sp-2);
   display: inline-flex;
   align-items: center;
@@ -123,7 +123,7 @@
 }
 
 .cv-add {
-  height: 22px;
+  height: 26px;
   padding: 0 var(--sp-3);
   border: 1px solid var(--accent-border);
   background: var(--accent-bg);
@@ -163,7 +163,7 @@
 }
 
 .cv-input {
-  height: 24px;
+  height: 26px;
   padding: 0 var(--sp-2);
   border: 1px solid var(--border);
   background: var(--elev);
@@ -184,11 +184,11 @@
 }
 
 .cv-add-form .cv-select {
-  height: 24px;
+  height: 26px;
 }
 
 .cv-add-submit {
-  height: 24px;
+  height: 26px;
   padding: 0 var(--sp-3);
   border: 1px solid var(--success);
   background: var(--success-bg);
@@ -203,7 +203,7 @@
 }
 
 .cv-add-cancel {
-  height: 24px;
+  height: 26px;
   padding: 0 var(--sp-3);
   border: 1px solid var(--border);
   background: transparent;
@@ -228,7 +228,7 @@
   width: 100%;
   border-collapse: collapse;
   table-layout: auto;
-  font-size: 11.5px;
+  font-size: 12px;
 }
 
 .cv-table thead th {
@@ -344,10 +344,17 @@
   transition: color 0.1s ease, background 0.1s ease, border-color 0.1s ease;
 }
 
-.cv-del:hover {
+/* Keyboard users get the same reveal cue as hover via the row's focus. */
+.cv-del:hover,
+.cv-table tbody tr:focus-within .cv-del {
   color: var(--danger);
   background: var(--danger-bg);
   border-color: rgba(248, 113, 113, 0.3);
+}
+
+.cv-del:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 /* ---- empty / loading --------------------------------------------------- */

@@ -10,7 +10,7 @@
  *
  * Visual language mirrors SessionTable (dark --panel rows, hover, mono data).
  */
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import {
   addCred,
   deleteCred,
@@ -48,6 +48,11 @@ function isMasked(secret: string): boolean {
   return /^\*+$/.test(secret);
 }
 
+/** Stable identity of a cred row (the server deletes by the same triple). */
+function credKey(c: CredRecord): string {
+  return `${c.realm}\\${c.user}\\${c.kind}`;
+}
+
 export function CredsPage() {
   const [creds, setCreds] = useState<CredRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -55,8 +60,14 @@ export function CredsPage() {
   const [reveal, setReveal] = useState(false);
   const [kindFilter, setKindFilter] = useState<KindFilter>('all');
   const [showAdd, setShowAdd] = useState(false);
+  const [deletingKey, setDeletingKey] = useState<string | null>(null);
+
+  // Monotonic request id: only the latest reload may touch state, so a slow
+  // earlier response can't overwrite a newer filter/reveal selection.
+  const reqSeq = useRef(0);
 
   const reload = useCallback(async () => {
+    const seq = ++reqSeq.current;
     setLoading(true);
     setError(null);
     try {
@@ -64,11 +75,13 @@ export function CredsPage() {
         reveal,
         kindFilter === 'all' ? undefined : kindFilter,
       );
-      setCreds(data);
+      if (seq === reqSeq.current) setCreds(data);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (seq === reqSeq.current) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setLoading(false);
+      if (seq === reqSeq.current) setLoading(false);
     }
   }, [reveal, kindFilter]);
 
@@ -78,11 +91,15 @@ export function CredsPage() {
 
   const handleDelete = async (c: CredRecord) => {
     if (!window.confirm(`删除凭据 ${c.realm}\\${c.user} (${c.kind})?`)) return;
+    const key = credKey(c);
+    setDeletingKey(key);
     try {
       await deleteCred(c.realm, c.user, c.kind);
       await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeletingKey(null);
     }
   };
 
@@ -100,7 +117,7 @@ export function CredsPage() {
     <div className="creds-page">
       <div className="cv-header">
         <div className="cv-title-group">
-          <span className="cv-title">Credential Vault</span>
+          <span className="cv-title">凭据库</span>
           <span className="cv-count mono">
             {loading ? '…' : creds.length}
           </span>
@@ -169,13 +186,14 @@ export function CredsPage() {
                 <th>secret</th>
                 <th>source</th>
                 <th>collected</th>
-                <th className="cv-th-actions" aria-label="actions" />
+                <th className="cv-th-actions" aria-label="操作" />
               </tr>
             </thead>
             <tbody>
               {creds.map((c, i) => {
                 const masked = isMasked(c.secret);
                 const sourceLabel = c.source ?? c.beacon ?? '—';
+                const deleting = deletingKey === credKey(c);
                 return (
                   <tr key={`${c.realm}\\${c.user}\\${c.kind}\\${i}`}>
                     <td className="mono">{c.realm}</td>
@@ -208,9 +226,10 @@ export function CredsPage() {
                         type="button"
                         className="cv-del"
                         onClick={() => handleDelete(c)}
+                        disabled={deleting}
                         title="删除凭据"
                       >
-                        删除
+                        {deleting ? '…' : '删除'}
                       </button>
                     </td>
                   </tr>
@@ -266,6 +285,7 @@ function AddCredForm({ onCancel, onSubmit }: AddCredFormProps) {
       />
       <select
         className="cv-select"
+        aria-label="kind"
         value={kind}
         onChange={(e) => setKind(e.target.value as CredRecord['kind'])}
       >

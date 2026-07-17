@@ -1,10 +1,10 @@
 /**
  * FileTable — structured rendering of an `ls` result.
  *
- * Standby component (not yet wired into TaskBlock's result renderer; today
- * TaskBlock shows ls output as plain text). Built so the integration step can
- * drop it in once the backend's `ls` op exists: TaskBlock will detect an `ls`
- * task and feed its `output` text here via parseLsLines.
+ * Wired into TaskBlock's result renderer: an `ls` task's `output` text is fed
+ * through parseLsLines and, when it yields rows, shown here instead of a <pre>.
+ * Row actions fire the optional onEnter / onDownload callbacks; the parent
+ * (TaskBlock via CommandConsole) turns them into `cd` / `download` commands.
  *
  * Accepts either pre-parsed `entries` or raw `lines` (typically the joined
  * result.text of an `output`-kind result). Raw lines are best-effort parsed:
@@ -24,9 +24,13 @@ export interface FileTableProps {
   entries?: FileEntry[];
   /** Raw text lines from an `ls` output to best-effort parse. */
   lines?: string[];
+  /** Row action: enter a directory (name relative to the ls'd path). */
+  onEnter?: (dirName: string) => void;
+  /** Row action: download a file (name relative to the ls'd path). */
+  onDownload?: (fileName: string) => void;
 }
 
-export function FileTable({ entries, lines }: FileTableProps) {
+export function FileTable({ entries, lines, onEnter, onDownload }: FileTableProps) {
   const rows = entries ?? parseLsLines(lines ?? []);
   if (rows.length === 0) {
     return <div className="filetable filetable--empty mono">(空目录或无输出)</div>;
@@ -47,7 +51,7 @@ export function FileTable({ entries, lines }: FileTableProps) {
         <span className="filetable__ops" />
       </div>
       {sorted.map((r) => (
-        <div key={r.name} className="filetable__row">
+        <div key={`${r.isDir ? 'd' : 'f'}:${r.name}`} className="filetable__row">
           <span className="filetable__name mono">
             <span className={`filetable__icon${r.isDir ? ' filetable__icon--dir' : ''}`}>
               {r.isDir ? '▸' : '📄'}
@@ -57,7 +61,12 @@ export function FileTable({ entries, lines }: FileTableProps) {
           <span className="filetable__modified mono">{r.modified}</span>
           <span className="filetable__size mono">{r.isDir ? '—' : r.size}</span>
           <span className="filetable__ops">
-            <button type="button" className="filetable__op mono">
+            <button
+              type="button"
+              className="filetable__op mono"
+              disabled={r.isDir ? !onEnter : !onDownload}
+              onClick={() => (r.isDir ? onEnter?.(r.name) : onDownload?.(r.name))}
+            >
               {r.isDir ? '进入' : '下载'}
             </button>
           </span>
@@ -83,7 +92,8 @@ export function parseLsLines(lines: string[]): FileEntry[] {
     if (/^(total\s+\d+|总计\s+\d+|Directory of|Volume|Volume in drive)/i.test(line)) continue;
 
     const dirWin = /<DIR>/i.test(line);
-    const dirSlash = /\/\s*$/.test(line) && !/\S\s+\S+\s*$/.test(line);
+    // Trailing slash is a directory marker — even when the name has spaces.
+    const dirSlash = /\/\s*$/.test(line);
 
     if (dirWin) {
       // e.g. "01/02/2024  03:04 PM    <DIR>   Documents"
@@ -95,7 +105,8 @@ export function parseLsLines(lines: string[]): FileEntry[] {
     }
 
     if (dirSlash) {
-      out.push({ name: line.trim(), size: '', isDir: true, modified: '' });
+      // strip the '/' marker: names feed path resolution for cd/download
+      out.push({ name: line.trim().replace(/\/+$/, ''), size: '', isDir: true, modified: '' });
       continue;
     }
 
