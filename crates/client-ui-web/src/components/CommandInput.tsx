@@ -28,6 +28,7 @@ const KNOWN_COMMANDS = [
   'screenshot', 'screenwatch', 'portscan', 'net', 'clipboard', 'env', 'keylog',
   'hashdump', 'stealtoken', 'steal', 'maketoken', 'rev2self', 'getuid',
   'bof', 'connect', 'setchannel', 'trex',
+  'inject', 'socks', 'channelclose',
 ] as const;
 
 /** Static OPSEC trip: lsass-touching tooling. UI warning only, never blocks. */
@@ -335,6 +336,59 @@ export function parseCommand(line: string): ParsedCommand | null {
 
     case 'trex':
       return { command: { type: 'trex' }, label: 'trex' };
+
+    // --- injection ---
+    case 'inject': {
+      // inject <method> <pid> <spawn_to> <hex_shellcode>
+      // method: 0=pool_party 1=threadless 2=module_stomp
+      if (args.length < 3) return null;
+      const method = parseInt(args[0], 10) || 0;
+      const pid = parseInt(args[1], 10);
+      if (!Number.isFinite(pid)) return null;
+      const spawn_to = args[2];
+      // args[3..] joined as hex string (or empty if inline-loaded via UI)
+      const sc_hex = args.slice(3).join('') || '';
+      return {
+        command: { type: 'inject', method, pid, spawn_to, sc_hex },
+        label: `inject ${method} ${pid} ${spawn_to}`,
+      };
+    }
+
+    // --- channels / pivots ---
+    case 'socks': {
+      // socks <chan> <op> <addr> <port>
+      if (args.length < 4) return null;
+      return {
+        command: {
+          type: 'socks',
+          chan: parseInt(args[0], 10) || 0,
+          op: parseInt(args[1], 10) || 0,
+          addr: args[2],
+          port: parseInt(args[3], 10) || 0,
+        },
+        label: `socks chan=${args[0]} op=${args[1]} ${args[2]}:${args[3]}`,
+      };
+    }
+
+    case 'channelclose': {
+      // channelclose <chan>
+      if (args.length === 0) return null;
+      const chan = parseInt(args[0], 10);
+      if (!Number.isFinite(chan)) return null;
+      return { command: { type: 'channelclose', chan }, label: `channelclose ${chan}` };
+    }
+
+    // --- file upload (hex data inline; for GUI file-picker upload see upload button) ---
+    case 'upload': {
+      // upload <name> <hex_data>
+      if (args.length < 2) return null;
+      const name = args[0];
+      const data_hex = args.slice(1).join('');
+      return {
+        command: { type: 'upload', name, data_hex },
+        label: `upload ${name} (${data_hex.length / 2} bytes)`,
+      };
+    }
 
     default:
       return null;
