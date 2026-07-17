@@ -17,8 +17,9 @@ use crate::theme;
 use crate::types::{arch_str, SessionView};
 
 use super::input::{self, filter_meta};
+use super::overlay::{ConfirmAction, Overlay};
 use super::panes;
-use super::{fmt_age, short, App, ConfirmAction, Overlay};
+use super::{fmt_age, short, App};
 
 /// Braille spinner frames — classic ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ cycle.
 ///
@@ -35,13 +36,13 @@ fn spinner_char(tick: u64) -> char {
 pub(super) fn render(app: &mut App, frame: &mut ratatui::Frame) {
     let area = frame.area();
     // 记录本帧尺寸，handle_key 里 move_focus 用它替代硬编码的4 80×24。
-    app.last_frame_size = area;
+    app.panes.last_frame = area;
     // 清空上一帧的 view tab hit regions，render_pane 会重建。防止窗格关闭后残留。
-    app.view_tab_rect.clear();
+    app.panes.tab_rects.clear();
     // 清空上一帧的 session 行 hit regions，render_overlay 重建。
-    app.session_row_rects.clear();
+    app.panes.overlay_rows.clear();
     // 清空上一帧的 per-pane SessionList 行 hit regions。
-    app.pane_session_rows.clear();
+    app.panes.list_rows.clear();
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(Paragraph::new("").style(theme::base_bg()), area);
 
@@ -65,12 +66,12 @@ pub(super) fn render(app: &mut App, frame: &mut ratatui::Frame) {
     // 窗格树区域：递归渲染每个叶。用 layout_full 一次遍历拿全 (id, rect, view, session)，
     // 避免之前每帧 clone 整棵树 + O(n²) 二次 leaves() 查找 view（P1-2）。
     let pane_area = chunks[1];
-    let layouts = app.pane_tree.layout_full(pane_area);
+    let layouts = app.panes.tree.layout_full(pane_area);
     for (id, rect, view, session_id) in &layouts {
-        let is_focused = *id == app.focused_pane;
+        let is_focused = *id == app.panes.focused;
         // 记录焦点窗格 rect，供 overlay 限制区域用（不再全屏遮挡其他窗格）。
         if is_focused {
-            app.focused_pane_rect = *rect;
+            app.panes.focused_rect = *rect;
         }
         render_pane(
             frame,
@@ -89,13 +90,13 @@ pub(super) fn render(app: &mut App, frame: &mut ratatui::Frame) {
         render_popup(frame, app, chunks[2]);
     }
     // view picker：某窗格的视图选择菜单开着 → 在它的 tab 下方画小 popup。
-    if app.view_picker.is_some() {
+    if app.panes.picker.is_some() {
         render_view_picker(frame, app);
     }
-    if app.overlay.is_open() {
+    if app.ovl.overlay.is_open() {
         // overlay 限制在焦点窗格区域内（不再全屏遮挡其他窗格）。
         // 用 focused_pane_rect 让 overlay 只覆盖当前操作的窗格。
-        render_overlay(frame, app, app.focused_pane_rect);
+        render_overlay(frame, app, app.panes.focused_rect);
     }
     // Toasts 浮在所有常规内容之上、模态 overlay 之下：它们是 eye-level 的瞬时
     // 反馈（连接结果、命令错误、破坏性操作取消等），不应遮住模态对话框。
@@ -103,12 +104,12 @@ pub(super) fn render(app: &mut App, frame: &mut ratatui::Frame) {
     render_toasts(frame, app);
     // 确认 overlay 画在最上层（盖过其他 overlay / 窗格 / 输入栏），
     // 因为它是模态的：开启时只有 y/n/Esc 有效（见 handle_confirm_key）。
-    if app.confirm_action.is_some() {
+    if app.ovl.confirm.is_some() {
         render_confirm_overlay(frame, app, area);
     }
     // 搜索栏：正在输入（search_input）或过滤激活（search_query）时在底部画一行。
     // 输入态显示光标 + 实时缓冲；纯过滤态显示当前查询 + 命中数。
-    if app.search_input.is_some() || app.search_query.is_some() {
+    if app.ovl.search_input.is_some() || app.ovl.search_query.is_some() {
         render_search_bar(frame, app, chunks[2]);
     }
 }
@@ -202,7 +203,7 @@ fn render_pane(
     // hover：Rounded + accent_dim（次醒目）。
     // 普通：Rounded + surface2（接近背景色，相邻窗格的双线感自然消失，gitui 手法）。
     // 不再用 Thick 粗块（笨重）和 faint（太淡看不见）。
-    let is_hovered = app.hover_pane == Some(id) && !focused;
+    let is_hovered = app.panes.hover == Some(id) && !focused;
     let (border_color, bg_color) = if focused {
         (theme::accent(), theme::surface())
     } else if is_hovered {
@@ -214,12 +215,12 @@ fn render_pane(
     // ---- 紧凑视图 tab：只画当前视图名 + ▾ 下拉指示 ----
     let tab_y = area.y;
     let tab_label = view.label();
-    let picker_open = app.view_picker.as_ref().is_some_and(|(pid, _)| *pid == id);
+    let picker_open = app.panes.picker.as_ref().is_some_and(|(pid, _)| *pid == id);
     let arrow = if picker_open { "▴" } else { "▾" };
     let tab_text = format!(" {tab_label} {arrow} ");
     let tab_w = tab_text.chars().count() as u16;
     let tab_x = area.x + 1;
-    app.view_tab_rect.insert(
+    app.panes.tab_rects.insert(
         id,
         Rect {
             x: tab_x,
@@ -243,15 +244,14 @@ fn render_pane(
     )];
     tab_spans.push(Span::styled(format!(" [{id}]"), theme::faint()));
     if let Some(sid) = session_id {
-        let alias = app
-            .sessions_meta
+        let alias = app.sess.meta
             .get(sid)
             .alias
             .clone()
             .unwrap_or_else(|| short(sid));
         tab_spans.push(Span::styled(format!(" · {alias}"), theme::faint()));
     }
-    let off = app.pane_scroll.get(&id).copied().unwrap_or(0);
+    let off = app.panes.scroll.get(&id).copied().unwrap_or(0);
     if off > 0 {
         tab_spans.push(Span::styled(format!(" ↑{off}"), theme::warn()));
     }
@@ -278,7 +278,7 @@ fn render_pane(
             render_files_table(
                 frame,
                 inner,
-                &app.files_view,
+                &app.sess.files_view,
                 app.tick,
                 app.pending_total() > 0,
             );
@@ -287,13 +287,13 @@ fn render_pane(
             render_procs_table(
                 frame,
                 inner,
-                &app.procs_view,
+                &app.sess.procs_view,
                 app.tick,
                 app.pending_total() > 0,
             );
         }
         panes::PaneView::Creds => {
-            render_creds_table(frame, inner, &app.creds_view);
+            render_creds_table(frame, inner, &app.sess.creds_view);
         }
         panes::PaneView::Topology => {
             render_topology_in_pane(frame, app, inner);
@@ -309,15 +309,14 @@ fn render_pane(
 /// 不受影响，pane_scroll 仍作用在过滤后的结果上——所以搜索下滚动只走匹配行。
 /// 输入态（search_input）优先，让 Ctrl+F 敲字时过滤实时更新。
 fn render_stream_content(frame: &mut ratatui::Frame, app: &App, area: Rect, pane_id: usize) {
-    let pane_session = app.pane_tree.get_session_id(pane_id);
+    let pane_session = app.panes.tree.get_session_id(pane_id);
     let target_session = pane_session.as_ref();
     // 活跃查询词：输入态用 search_input（实时），否则用 search_query。
     // 空串视为不过滤（避免输入框清空后突然全部消失的困惑，显示全量）。
-    let active_q: Option<&str> = app
-        .search_input
+    let active_q: Option<&str> = app.ovl.search_input
         .as_deref()
         .filter(|s| !s.is_empty())
-        .or(app.search_query.as_deref());
+        .or(app.ovl.search_query.as_deref());
     let query_lower = active_q.map(|q| q.to_lowercase());
 
     // Filter stream: include global logs (None) and logs matching target_session (supporting prefix matching)
@@ -342,13 +341,52 @@ fn render_stream_content(frame: &mut ratatui::Frame, app: &App, area: Rect, pane
         .collect();
 
     // 使用该窗格自己的 scroll offset（独立滚动），不存在则用全局 stream_offset。
-    let scroll_offset = app
-        .pane_scroll
+    let scroll_offset = app.panes.scroll
         .get(&pane_id)
         .copied()
         .unwrap_or(app.stream_offset);
     let height = area.height as usize;
     let total = pane_stream.len();
+
+    // 空状态必须引导（contract §3）：console 无内容时显示真实可用的键位引导，
+    // 不留白。键位以 mod.rs handle_key 实际实现为准（写错键位=bug）。
+    if total == 0 {
+        if let Some(q) = active_q {
+            // 搜索/过滤态下空 = 无匹配，告诉操作员怎么退出过滤。
+            let para = Paragraph::new(format!(
+                "· no matches for '{q}' — Ctrl+F then Esc to clear the filter"
+            ))
+            .style(theme::faint())
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false });
+            frame.render_widget(para, area);
+        } else {
+            let guide = [
+                "empty console — type a command + Enter to task the selected session",
+                "",
+                "/        command menu (/sessions · /use · /ls · /ps · /help)",
+                "Ctrl+B   prefix → v split-right · s split-down · hjkl focus · x close · 1-6 view",
+                "Ctrl+F   search stream · PgUp/PgDn scroll · Ctrl+L clear · Ctrl+C quit",
+            ];
+            let lines: Vec<Line> = guide
+                .iter()
+                .map(|s| Line::from(Span::styled(*s, theme::faint())))
+                .collect();
+            // 垂直居中：窄窗格 wrap 时会向下多占行，高度给足到底部防截断。
+            let top_pad = area.height.saturating_sub(guide.len() as u16) / 2;
+            let guide_area = Rect {
+                x: area.x,
+                y: area.y + top_pad,
+                width: area.width,
+                height: area.height - top_pad,
+            };
+            let para = Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: false });
+            frame.render_widget(para, guide_area);
+        }
+        return;
+    }
     let end = total.saturating_sub(scroll_offset);
     let start = end.saturating_sub(height);
     let visible = &pane_stream[start..end.min(total)];
@@ -369,19 +407,22 @@ fn render_stream_content(frame: &mut ratatui::Frame, app: &App, area: Rect, pane
 }
 
 /// 在窗格里渲染 session 列表。逐行渲染 + 记录 hit regions 支持点击切换。
-/// 当前选中的 session 行高亮（surface1 背景 + ▸ 标记），点击其他行切换 beacon。
+/// 当前选中的 session 行高亮（surface1 背景 + ▸ 标记），点击其他行切换 session。
 fn render_sessions_in_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect, pane_id: usize) {
-    if app.sessions.is_empty() {
-        let para = Paragraph::new("· no beacons — waiting for sessions")
+    if app.sess.list.is_empty() {
+        // 空状态引导（contract §3）：告诉操作员下一步——启动 agent 等其上线。
+        // wrap 开启：窄窗格（默认布局右侧仅 ~30% 宽）换行而非截断（contract §4）。
+        let para = Paragraph::new("· no sessions — waiting for agents to check in")
             .style(theme::faint())
-            .alignment(Alignment::Center);
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false });
         frame.render_widget(para, area);
         return;
     }
     // 该窗格当前绑定的 session（用于高亮"当前调用的是哪个 beacon"）。
-    let cur_sid = app.pane_tree.get_session_id(pane_id);
+    let cur_sid = app.panes.tree.get_session_id(pane_id);
     let mut row_rects: Vec<(Rect, String)> = Vec::new();
-    for (i, s) in app.sessions.iter().enumerate() {
+    for (i, s) in app.sess.list.iter().enumerate() {
         let row_y = area.y + i as u16;
         if row_y >= area.y + area.height {
             break; // 超出窗格截断
@@ -395,7 +436,7 @@ fn render_sessions_in_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect
         let is_current = cur_sid.as_deref() == Some(&s.id);
         row_rects.push((row_rect, s.id.clone()));
 
-        let m = app.sessions_meta.get(&s.id);
+        let m = app.sess.meta.get(&s.id);
         let star = if m.favorite { "★" } else { " " };
         let alias = m.alias.as_deref().unwrap_or("");
         let mark = if is_current { "▸ " } else { "  " };
@@ -439,7 +480,7 @@ fn render_sessions_in_pane(frame: &mut ratatui::Frame, app: &mut App, area: Rect
             frame.render_widget(Paragraph::new(line), row_rect);
         }
     }
-    app.pane_session_rows.insert(pane_id, row_rects);
+    app.panes.list_rows.insert(pane_id, row_rects);
 }
 
 /// Render a file listing inside a pane leaf. Mirrors the fullscreen
@@ -532,19 +573,17 @@ fn render_creds_table(frame: &mut ratatui::Frame, area: Rect, rows: &[crate::typ
 
 /// Render the session topology inside a pane leaf. Derives the same layered
 /// layout `/topo` computes in the event stream, so the pane shows live topology
-/// from `app.sessions` instead of a dead placeholder. With no sessions it falls
+/// from `app.sess.list` instead of a dead placeholder. With no sessions it falls
 /// back to the hint.
 fn render_topology_in_pane(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    if app.sessions.is_empty() {
-        hint(frame, area, "(topology — no beacons)");
+    if app.sess.list.is_empty() {
+        hint(frame, area, "(topology — no sessions yet)");
         return;
     }
-    let nodes: Vec<(String, String)> = app
-        .sessions
+    let nodes: Vec<(String, String)> = app.sess.list
         .iter()
         .map(|s| {
-            let label = app
-                .sessions_meta
+            let label = app.sess.meta
                 .get(&s.id)
                 .alias
                 .clone()
@@ -684,10 +723,12 @@ fn render_borderless_table(
 
 /// Dimmed hint shown when a pane view has no data yet. 加 · 前缀符号做视觉锚点，
 /// 居中显示比左对齐更优雅（空状态是"等待操作员"，居中暗示"这里待填充"）。
+/// wrap 开启：窄窗格换行而非截断（contract §4 文本不得截断）。
 fn hint(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
     let para = Paragraph::new(format!("· {msg}"))
         .style(theme::faint())
-        .alignment(Alignment::Center);
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 }
 
@@ -697,7 +738,8 @@ fn hint(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
 fn fetching_hint(frame: &mut ratatui::Frame, area: Rect, tick: u64, msg: &str) {
     let para = Paragraph::new(format!("{} {msg}", spinner_char(tick)))
         .style(Style::default().fg(theme::accent()))
-        .alignment(Alignment::Center);
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 }
 
@@ -708,7 +750,7 @@ fn render_statusbar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     // 断线时圆点不静止：用 spinner 帧替代空心 ○，暗示"正在重连"而非"死掉了"。
     // 仅在 !connected 时生效；连上后仍是实心 ●。
     let pending_total = app.pending_total();
-    let (dot, dot_style, label) = if app.connected {
+    let (dot, dot_style, label) = if app.conn.connected {
         (
             "●".to_string(),
             Style::default().fg(theme::success()),
@@ -742,7 +784,7 @@ fn render_statusbar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
             buf.push_str(&format!(" · {}", fmt_age(app.age_for(&s.id))));
             middle.push(Span::styled(format!(" {buf} "), theme::text()));
         }
-        None => middle.push(Span::styled(" no beacon ", theme::text())),
+        None => middle.push(Span::styled(" no session ", theme::text())),
     }
     // 三段式状态栏（P2 视觉改造）：左品牌+连接 · 中 beacon 上下文 · 右计数+模式。
     // 段间用 │ 竖线分隔，段内不同色相（左 brand、中 text、右 muted），层次分明。
@@ -758,14 +800,14 @@ fn render_statusbar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     spans.push(Span::styled("│", Style::default().fg(theme::surface2())));
     // ---- 右段：计数 + 模式 ----
     spans.push(Span::styled(
-        format!(" {} ", app.sessions.len()),
+        format!(" {} ", app.sess.list.len()),
         Style::default()
             .fg(theme::mauve())
             .add_modifier(Modifier::BOLD),
     ));
-    spans.push(Span::styled("beacons ", theme::muted()));
+    spans.push(Span::styled("sessions ", theme::muted()));
     // prefix 模式指示器（UX-S5）：激活时在状态栏最右显示醒目标记。
-    if app.tmux_prefix {
+    if app.panes.prefix {
         spans.push(Span::styled("│", Style::default().fg(theme::surface2())));
         spans.push(Span::styled(
             " [PREFIX] ",
@@ -797,18 +839,17 @@ fn render_input(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         (st.input.clone(), st.cursor)
     };
 
-    // 目标 session 标签（UX-S1）：防误发。无 session 显示 "[no beacon]"。
+    // 目标 session 标签（UX-S1）：防误发。无 session 显示 "[no session]"。
     let tag_text = match app.current_session() {
         Some(s) => {
-            let alias = app
-                .sessions_meta
+            let alias = app.sess.meta
                 .get(&s.id)
                 .alias
                 .clone()
                 .unwrap_or_else(|| s.hostname.clone());
             format!("[{} {}] ", short(&s.id), alias)
         }
-        None => "[no beacon] ".to_string(),
+        None => "[no session] ".to_string(),
     };
     let is_empty = display.is_empty();
     let prompt = if is_empty {
@@ -905,17 +946,16 @@ fn render_popup(frame: &mut ratatui::Frame, app: &mut App, input_area: Rect) {
 /// 不必要——click 直接按坐标算（菜单固定从 tab 下方开始，每行高 1）。
 fn render_view_picker(frame: &mut ratatui::Frame, app: &mut App) {
     // 先克隆出 picker 状态避免长借用 app（后面还要 render_stateful_widget 借 app）。
-    let (pane_id, _) = match app.view_picker.clone() {
+    let (pane_id, _) = match app.panes.picker.clone() {
         Some(p) => p,
         None => return,
     };
     // 找该窗格的 tab rect，菜单从 tab 正下方开始。
-    let tab_rect = match app.view_tab_rect.get(&pane_id) {
+    let tab_rect = match app.panes.tab_rects.get(&pane_id) {
         Some(r) => *r,
         None => return,
     };
-    let cur_view = app
-        .pane_tree
+    let cur_view = app.panes.tree
         .leaves()
         .iter()
         .find(|(id, _)| *id == pane_id)
@@ -960,7 +1000,7 @@ fn render_view_picker(frame: &mut ratatui::Frame, app: &mut App) {
                 .title(Span::styled(" view ", theme::muted())),
         )
         .highlight_style(theme::selected());
-    if let Some((_, state)) = app.view_picker.as_mut() {
+    if let Some((_, state)) = app.panes.picker.as_mut() {
         frame.render_stateful_widget(list, area, state);
     }
 }
@@ -995,27 +1035,27 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
             .title_bottom(Span::styled(" q/Esc ", theme::muted()))
     };
     let cur_id = app.current_session().map(|s| s.id.clone());
-    match &mut app.overlay {
+    match &mut app.ovl.overlay {
         Overlay::None => {}
         Overlay::Sessions(state) => {
             // 先画 block（标题+边框），拿 inner 区域逐行渲染 session。
             // 手动逐行而非 List widget：List 的滚动偏移不可外部读取，
             // 导致 click 坐标映射失效。手动渲染每行 hit region 精确记录。
-            let block = make_block("beacons  ↑/↓ select · PgUp/PgDn scroll · Enter");
+            let block = make_block("sessions  ↑/↓ select · PgUp/PgDn scroll · Enter");
             frame.render_widget(Clear, area);
             let inner = block.inner(area);
             frame.render_widget(block, area);
             let cur = state.selected().unwrap_or(0);
             // Window with overlay_scroll（clamped to max_scroll）。超出可见区的行
             // 不渲染；hit region 仅记录可见行（click 命中索引仍是全局 session 索引）。
-            let total = app.sessions.len();
+            let total = app.sess.list.len();
             let visible_height = inner.height as usize;
             let max_scroll = total.saturating_sub(visible_height);
-            let scroll = app.overlay_scroll.min(max_scroll);
+            let scroll = app.ovl.scroll.min(max_scroll);
             let end = (scroll + visible_height).min(total);
             // 记录每行的 hit region，供 click 精确命中。
             let mut row_rects: Vec<(Rect, usize)> = Vec::new();
-            for (row_idx, s) in app.sessions[scroll..end].iter().enumerate() {
+            for (row_idx, s) in app.sess.list[scroll..end].iter().enumerate() {
                 let i = scroll + row_idx; // 全局 session 索引
                 let row_y = inner.y + row_idx as u16;
                 let row_rect = Rect {
@@ -1061,7 +1101,7 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                 let line = Line::from(spans);
                 frame.render_widget(Paragraph::new(line), row_rect);
             }
-            app.session_row_rects = row_rects;
+            app.panes.overlay_rows = row_rects;
         }
         Overlay::Files(rows) => {
             let header = ["NAME", "SIZE", "TYPE", "MODIFIED"];
@@ -1076,7 +1116,7 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                     ]
                 })
                 .collect();
-            render_table(frame, area, &header, &body, "files", app.overlay_scroll);
+            render_table(frame, area, &header, &body, "files", app.ovl.scroll);
         }
         Overlay::Procs(rows) => {
             let header = ["PID", "PPID", "USER", "NAME"];
@@ -1091,7 +1131,7 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                     ]
                 })
                 .collect();
-            render_table(frame, area, &header, &body, "processes", app.overlay_scroll);
+            render_table(frame, area, &header, &body, "processes", app.ovl.scroll);
         }
         Overlay::Creds(rows) => {
             let header = ["SOURCE", "PRINCIPAL", "KIND", "SECRET"];
@@ -1112,7 +1152,7 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                 &header,
                 &body,
                 "credentials",
-                app.overlay_scroll,
+                app.ovl.scroll,
             );
         }
         Overlay::Audit(rows) => {
@@ -1129,7 +1169,7 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                     vec![a.seq.to_string(), format_ts(a.ts), target, a.action.clone()]
                 })
                 .collect();
-            render_table(frame, area, &header, &body, "audit log", app.overlay_scroll);
+            render_table(frame, area, &header, &body, "audit log", app.ovl.scroll);
         }
         Overlay::Image(path, bytes) => {
             let header = ["PATH", "BYTES"];
@@ -1140,7 +1180,7 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                 &header,
                 &body,
                 "screenshot",
-                app.overlay_scroll,
+                app.ovl.scroll,
             );
         }
         Overlay::Profile {
@@ -1162,7 +1202,7 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                 &header,
                 &body,
                 "c2 profile",
-                app.overlay_scroll,
+                app.ovl.scroll,
             );
         }
         Overlay::AuditVerify { ok, broken_at } => {
@@ -1179,21 +1219,21 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                 &header,
                 &body,
                 "audit chain",
-                app.overlay_scroll,
+                app.ovl.scroll,
             );
         }
         Overlay::SessionDetail(id_ref) => {
-            // 本地数据 overlay：每帧从 app.sessions 实时查找（所以 pending/age 是活的）。
+            // 本地数据 overlay：每帧从 app.sess.list 实时查找（所以 pending/age 是活的）。
             // 这是 ja3/ja4/pid/age_secs/pending 的唯一展示入口——它们在 SessionView
             // 里一直有，但 Sessions 行列表和状态栏都放不下。
             //
-            // match &mut app.overlay 使 overlay 的可变借用贯穿整个 arm；直接读
-            // app.sessions / sessions_meta / age_for 会与之冲突。先把 id clone 成
+            // match &mut app.ovl.overlay 使 overlay 的可变借用贯穿整个 arm；直接读
+            // app.sess.list / sessions_meta / age_for 会与之冲突。先把 id clone 成
             // 所有权值，可变借用随即结束，后续对 app 的不可变借用即可成立。
             let id = id_ref.clone();
-            match app.sessions.iter().find(|s| s.id == id) {
+            match app.sess.list.iter().find(|s| s.id == id) {
                 Some(s) => {
-                    let meta = app.sessions_meta.get(&id);
+                    let meta = app.sess.meta.get(&id);
                     let age = app.age_for(&id);
                     let rows = build_session_detail_rows(s, &meta, age);
                     render_kv(frame, area, &rows, "session detail");
@@ -1237,7 +1277,7 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
                 &header,
                 &body,
                 "queued tasks",
-                app.overlay_scroll,
+                app.ovl.scroll,
             );
         }
     }
@@ -1255,7 +1295,7 @@ fn render_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
 /// the longest current description ("Dump LSASS memory for pid <pid>? …")
 /// comfortably on a single line at ≥64 cols.
 fn render_confirm_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect) {
-    let action: &ConfirmAction = match &app.confirm_action {
+    let action: &ConfirmAction = match &app.ovl.confirm {
         Some(a) => a,
         None => return,
     };
@@ -1334,7 +1374,7 @@ fn render_confirm_overlay(frame: &mut ratatui::Frame, app: &mut App, full: Rect)
 /// Ctrl+F 进入、Esc 退出、Enter 提交（见 `handle_search_key`）。
 fn render_search_bar(frame: &mut ratatui::Frame, app: &App, input_area: Rect) {
     // 计算当前查询的命中数（仅纯过滤态显示，输入态每帧重算代价高且没必要）。
-    let active_query: Option<&str> = app.search_input.as_deref().or(app.search_query.as_deref());
+    let active_query: Option<&str> = app.ovl.search_input.as_deref().or(app.ovl.search_query.as_deref());
     let hits = match active_query {
         Some(q) if !q.trim().is_empty() => {
             let ql = q.to_lowercase();
@@ -1356,7 +1396,7 @@ fn render_search_bar(frame: &mut ratatui::Frame, app: &App, input_area: Rect) {
     frame.render_widget(Clear, input_area);
     frame.render_widget(block, input_area);
 
-    if let Some(buf) = &app.search_input {
+    if let Some(buf) = &app.ovl.search_input {
         // 输入态：search: <buf> + 硬件光标 + 实时命中数。
         // 过滤由 render_stream_content 直接读 search_input 完成（实时），无需同步。
         let prompt = Line::from(vec![
@@ -1375,7 +1415,7 @@ fn render_search_bar(frame: &mut ratatui::Frame, app: &App, input_area: Rect) {
             cursor_x.min(inner.x + inner.width.saturating_sub(1)),
             inner.y,
         ));
-    } else if let Some(q) = &app.search_query {
+    } else if let Some(q) = &app.ovl.search_query {
         // 纯过滤态：显示查询 + 命中数 + Esc 提示。
         let line = Line::from(vec![
             Span::styled("filter ❯ ", theme::accent()),

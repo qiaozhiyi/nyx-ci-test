@@ -13,6 +13,40 @@
 use makepad_widgets::*;
 use std::sync::{LazyLock, RwLock};
 
+script_mod! {
+    use mod.prelude.widgets.*
+    use mod.widgets.*
+    use mod.nyx.*
+
+    // BOF history row — columns: OBJECT / STATUS / ARGUMENTS
+    let BofRow = View{
+        width: Fill height: 32
+        padding: Inset{left: Cpad right: Cpad}
+        flow: Right spacing: Cgap
+        align: Align{y: 0.5}
+        draw_bg.color: Crow
+        draw_bg.color_hover: Crowhov
+        name := Label{width: 240 text: "" draw_text.color: Cprimary draw_text.text_style: theme.font_regular{font_size: 13}}
+        status := Label{width: 96 text: "" draw_text.color: Csecond draw_text.text_style: theme.font_regular{font_size: 13}}
+        args := Label{width: Fill text: "" draw_text.color: Cmuted draw_text.text_style: theme.font_code{font_size: 12}}
+    }
+    mod.widgets.BofPanelBase = #(BofPanel::register_widget(vm))
+    mod.widgets.BofPanel = set_type_default() do mod.widgets.BofPanelBase{
+        width: Fill height: Fill
+        flow: Down
+        header := View{width: Fill height: Fit flow: Down draw_bg.color: Celev
+            View{width: Fill height: 30 padding: Inset{left: Cpad right: Cpad} flow: Right spacing: Cgap align: Align{y: 0.5}
+                Label{width: 240 text: "OBJECT" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 11}}
+                Label{width: 96 text: "STATUS" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 11}}
+                Label{width: Fill text: "ARGUMENTS" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 11}}
+            }
+            View{width: Fill height: 1 draw_bg.color: Cborder}
+        }
+        list := PortalList{width: Fill height: Fill spacing: 1.0 scroll_bar: ScrollBar{}
+            Item := CachedView{BofRow{}}}
+    }
+}
+
 // ── shared UI state, read by BofPanel during draw ────────────────────────────
 
 /// Shared BOF history. The App pushes updates from the bridge snapshot here;

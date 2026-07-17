@@ -1,10 +1,27 @@
-//! Per-beacon interactive console output list.
+//! Per-session interactive console output list.
 //!
 //! Reads from [`crate::CONSOLE`] keyed by the currently-selected session ID.
 //! This is the virtualized list that displays only the output relevant to the
-//! selected beacon (as opposed to the global event log which shows all activity).
+//! selected session (as opposed to the global event log which shows all activity).
 
 use makepad_widgets::*;
+
+script_mod! {
+    use mod.prelude.widgets.*
+    use mod.widgets.*
+    use mod.nyx.*
+
+    mod.widgets.ConsoleListBase = #(ConsoleList::register_widget(vm))
+    mod.widgets.ConsoleList = set_type_default() do mod.widgets.ConsoleListBase{
+        width: Fill height: Fill
+        list := PortalList{
+            width: Fill height: Fill
+            spacing: 0.0
+            scroll_bar: ScrollBar{}
+            Item := CachedView{mod.widgets.LogLine{}}
+        }
+    }
+}
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct ConsoleList {

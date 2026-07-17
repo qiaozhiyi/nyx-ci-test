@@ -1173,8 +1173,8 @@ async fn worker_loop(
                             );
                             log_push(
                                 &mut log_buf,
-                                "[socks] note: relay latency = one beacon sleep cycle per direction; \
-                                 set a low /sleep on the beacon for active use.",
+                                "[socks] note: relay latency = one sleep cycle per direction; \
+                                 set a low /sleep on the session for active use.",
                                 Level::Info,
                             );
                             log_push(

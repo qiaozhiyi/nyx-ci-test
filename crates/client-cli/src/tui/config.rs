@@ -14,8 +14,9 @@ pub(crate) struct Config {
     /// 命令别名表：name -> 展开后的 shell 命令串。
     #[serde(default)]
     pub aliases: HashMap<String, String>,
-    /// 主题选择："mocha"(默认) / "frappe" / "macchiato" / "highcontrast" / "nocolor"。
+    /// 主题选择："nyx"(默认) / "mocha" / "frappe" / "macchiato" / "highcontrast" / "nocolor"。
     /// 启动时传给 `theme::init`；`NO_COLOR` 环境变量优先级更高。
+    /// 空串（无配置）= Nyx 默认。
     #[serde(default)]
     pub theme: String,
 }

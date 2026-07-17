@@ -76,7 +76,7 @@ static SESSIONS: LazyLock<RwLock<Vec<SessionView>>> = LazyLock::new(|| {
 static LOG_LINES: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 pub static CONSOLE: LazyLock<RwLock<std::collections::HashMap<String, Vec<String>>>> =
     LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
-pub static IS_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static IS_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// Index of the currently-selected session row, or usize::MAX for none.
 /// SessionList::draw_walk reads this to tint the selected row's background
 /// (Crowsel) — the only way to give per-row selection feedback through a
@@ -90,56 +90,61 @@ script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
-    // ── Cobalt Industrial palette ──────────────────────────────────────────
-    let Cbg       = #xD0D0D0  // app background — deepest surface
-    let Cinput    = #xFFFFFF  // input fill
-    let Cinput_b  = #xA0A0A0  // visible input border
-    let Cbar      = #xE0E0E0  // recessed secondary bars / tab bar
-    let Cpanel    = #xF0F0F0  // side panels + event-log shell
-    let Crow      = #xFFFFFF  // table/data-row base
-    let Crowhov   = #xE8F0FA  // row hover
-    let Crowsel   = #x3B72AB  // row selected (cobalt blue)
-    let Celev     = #xEAEAEA  // brightest surface — column headers / dialog card
-    let Cborder   = #xA0A0A0  // hairline dividers
-    let Cprimary  = #x000000  // primary text
-    let Csecond   = #x333333  // secondary text
-    let Cmuted    = #x666666  // muted text / column labels
-    let Caccent   = #x3B72AB  // Cobalt blue accent
-    let Cacchov   = #x5B9BD5  // accent hover
-    let Csuccess  = #x008000  // success / online (teal)
-    let Cdanger   = #xD13438  // danger / alert
-    let Cwarn     = #xE38B00  // warning / pending / secrets
-    let Cinfo     = #x005A9C  // info / command keyword
-    let Cunder    = #x3B72AB  // active-tab underline
-    let Cradius   = 6.0       // unified corner radius (cards / buttons / inputs)
-    let Cradius_s = 3.0       // small radius (tags / badges)
+    // ── Violet Dark palette (2026-07-16 reskin) ────────────────────────────
+    // First-paint values mirror Palette::dark() in theme.rs EXACTLY — the app
+    // boots dark (IS_DARK default true), so a cold first frame matches the
+    // dynamic recolor that apply_theme() applies afterwards.
+    let Cbg       = #x0D0E12  // app background — deepest surface
+    let Cinput    = #x1B1E26  // input fill (= card surface)
+    let Cinput_b  = #x3A3F4C  // visible input border
+    let Cbar      = #x181A21  // recessed secondary bars / tab bar
+    let Cpanel    = #x14161B  // side panels + event-log shell
+    let Crow      = #x14161B  // table/data-row base
+    let Crowhov   = #x1F2330  // row hover
+    let Crowsel   = #x2E2849  // row selected (violet tint)
+    let Celev     = #x1B1E26  // brightest surface — column headers / dialog card
+    let Cborder   = #x262A35  // hairline dividers
+    let Cprimary  = #xE2E4EA  // primary text
+    let Csecond   = #x9BA0AE  // secondary text
+    let Cmuted    = #x6B707E  // muted text / column labels
+    let Caccent   = #x8B7CF6  // violet accent
+    let Cacchov   = #xA395FF  // accent hover
+    let Csuccess  = #x3FB68B  // success / online (soft teal)
+    let Cdanger   = #xE5534B  // danger / alert
+    let Cwarn     = #xD9A036  // warning / pending / secrets
+    let Cinfo     = #x5EB1EF  // info / command keyword
+    let Cunder    = #x8B7CF6  // active-tab underline
+    let Cradius   = 6.0       // unified corner radius (buttons / inputs)
+    let Cradius_l = 8.0       // large radius (cards / dialogs)
+    let Cradius_s = 4.0       // small radius (tags / badges)
     // Shared layout metrics so column headers and data rows stay perfectly
     // aligned: both reference these instead of re-typing the same numbers.
     let Cpad      = 14.0      // table row / header horizontal inset
     let Cgap      = 16.0      // column gap inside rows / headers
 
-    // ── animated network-node background (glassmorphism scene) ──────────────
+    // ── static network-node background (glassmorphism scene) ────────────────
     // Pure-DSL shader View (the GlassPanel precedent — no Rust struct). Draws a
-    // vertical 2-stop gradient + a drifting grid of glowing nodes + faint
-    // connecting lines, all in one pixel fn. The drift is driven by
-    // self.draw_pass.time so it animates every frame with no app-side code.
+    // vertical 2-stop gradient + a STATIC grid of dim nodes + faint violet
+    // connecting lines, all in one pixel fn. 2026-07-16 reskin: the time drift
+    // was removed (a pro tool doesn't animate its backdrop) and the node/line
+    // alphas were dropped so the texture stays subtle.
     // GaussRoundedView (the glass card) blurs whatever THIS renders behind it,
     // so this is what makes the frosted glass actually read as frosted.
     let NetworkBg = View{
         show_bg: true
         draw_bg +: {
-            grad_top: instance(#x111111)
-            grad_bot: instance(#x050505)
-            node_color: instance(#x666666)
-            line_color: instance(#x007ACC)
+            grad_top: instance(#x0D0E12)
+            grad_bot: instance(#x08090C)
+            node_color: instance(#x3A3F4C)
+            line_color: instance(#x8B7CF6)
 
             pixel: fn() {
                 // Vertical 2-stop gradient as the base.
                 let bg = self.grad_top.rgb.mix(self.grad_bot.rgb, self.pos.y)
 
-                // Drifting node grid. Cell size in px; drift over time.
+                // Static node grid. Cell size in px; drift pinned to zero.
                 let cell = 90.0
-                let drift = vec2(self.draw_pass.time * 4.0, self.draw_pass.time * 2.5)
+                let drift = vec2(0.0, 0.0)
                 let p = self.pos * self.rect_size + drift
                 let gx = floor(p.x / cell)
                 let gy = floor(p.y / cell)
@@ -152,16 +157,16 @@ script_mod! {
 
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
 
-                // Glowing node dot (additive).
+                // Dim node dot (additive, half the old alpha).
                 sdf.circle(cx, cy, 2.0)
-                sdf.glow_keep(vec4(self.node_color.rgb, 0.5), 6.0)
+                sdf.glow_keep(vec4(self.node_color.rgb, 0.25), 6.0)
 
                 // Connecting line to the right-neighbor node.
                 let cx2 = (gx + 1.5) * cell - drift.x + (Math.random_2d(vec2((gx + 1.0) * 12.9 + gy * 78.2, 1.0)) - 0.5) * cell * 0.5
                 let cy2 = (gy + 0.5) * cell - drift.y + (Math.random_2d(vec2((gx + 1.0) * 4.1 + gy * 91.7, 2.0)) - 0.5) * cell * 0.5
                 sdf.move_to(cx, cy)
                 sdf.line_to(cx2, cy2)
-                sdf.stroke(vec4(self.line_color.rgb, 0.18), 1.0)
+                sdf.stroke(vec4(self.line_color.rgb, 0.10), 1.0)
 
                 // Composite shader layer over the gradient base.
                 let layer = sdf.result
@@ -207,8 +212,13 @@ script_mod! {
     // latter pass the macro but crash at runtime with "expected DrawQuad, got
     // object". This was the G3 smoke-test root cause.
     let SessionRow = View{
-        width: Fill height: 30
+        width: Fill height: 32
         flow: Overlay
+        // show_bg defaults to FALSE on View in this Makepad rev — without this
+        // the row's draw_bg (normal/hover/selected colors) is never rasterized.
+        // Invisible for normal rows only because Crow == Cpanel; it silently
+        // killed the ItemSel selection tint.
+        show_bg: true
         draw_bg.color: Crow
         draw_bg.color_hover: Crowhov
 
@@ -242,7 +252,7 @@ script_mod! {
                 width: 56
                 text: ""
                 draw_text.color: Cdanger
-                draw_text.text_style: theme.font_bold{font_size: theme.font_size_code}
+                draw_text.text_style: theme.font_bold{font_size: 12}
             }
             v_line4 := View{show_bg: true width: 1 height: Fill draw_bg.color: Cborder}
             pend := Label{
@@ -264,7 +274,7 @@ script_mod! {
         bottom_line := View {
             show_bg: true
             width: Fill height: 1
-            margin: Inset{top: 29.0}
+            margin: Inset{top: 31.0}
             draw_bg.color: Cborder
         }
     }
@@ -272,7 +282,7 @@ script_mod! {
     let EmptySessions = View{
         width: Fill height: Fill
         align: Center flow: Down spacing: 8.0
-        Label{text: "No Active Beacons" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 13}}
+        Label{text: "No Active Beacons" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 13}}
         Label{text: "Connect to a team server to display beacons" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 11}}
     }
 
@@ -309,12 +319,22 @@ script_mod! {
             width: Fill height: Fill
             spacing: 1.0
             scroll_bar: ScrollBar{}
-            // Two item templates: Item (normal) and ItemSel (selected, blue
-            // bg). draw_walk picks per row — can't mutate bg color at runtime
-            // (no safe set_color API in this Makepad version), so we use the
-            // verified "different CachedView id" approach like todo's Empty.
-            Item := CachedView{SessionRow{}}
-            ItemSel := CachedView{SessionRow{draw_bg.color: Crowsel}}
+            // Two item templates: Item (normal) and ItemSel (selected, violet
+            // bg). draw_walk picks per row. The template SWITCH is the actual
+            // invalidation mechanism: CachedView renders its content into a
+            // cached texture and PortalList::redraw never flags item draw
+            // lists, so mutating colors on a live row leaves the stale texture
+            // on screen — swapping templates spawns a fresh widget (empty
+            // texture cache) that re-renders. The inner SessionRow is named
+            // `row` so draw_walk can repaint its bg from the Palette per frame.
+            // CachedWidget caches its child GLOBALLY by the child's key name
+            // (cached_widget.rs: template_id = child key). Two templates whose
+            // child shares one key therefore resolve to THE SAME singleton
+            // instance — `row :=` on both made ItemSel reuse Item's widget and
+            // the Crowsel override silently never applied (the real reason the
+            // selection tint never painted). Distinct keys = distinct instances.
+            Item := CachedView{item_row := SessionRow{draw_bg.color: #xFF0000}}
+            ItemSel := CachedView{sel_row := SessionRow{draw_bg.color: Crowsel}}
             Empty := CachedView{EmptySessions{}}
         }
     }
@@ -358,7 +378,7 @@ script_mod! {
 
     // BOF loader panel — columns: OBJECT / STATUS / ARGUMENTS
     let BofRow = View{
-        width: Fill height: 30
+        width: Fill height: 32
         padding: Inset{left: Cpad right: Cpad}
         flow: Right spacing: Cgap
         align: Align{y: 0.5}
@@ -370,7 +390,7 @@ script_mod! {
     }
     let BofEmpty = View{
         width: Fill height: Fill align: Center flow: Down spacing: theme.space_2
-        Label{text: "No BOF runs recorded" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 13}}
+        Label{text: "No BOF runs recorded" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 13}}
         Label{text: "Execute a BOF task from the console to display history" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 11}}
     }
     mod.widgets.BofPanelBase = #(BofPanel::register_widget(vm))
@@ -391,7 +411,7 @@ script_mod! {
 
     // File tree — columns: NAME / SIZE / MODIFIED
     let FileRow = View{
-        width: Fill height: 30
+        width: Fill height: 32
         padding: Inset{left: Cpad right: Cpad}
         flow: Right spacing: Cgap
         align: Align{y: 0.5}
@@ -403,7 +423,7 @@ script_mod! {
     }
     let FileEmpty = View{
         width: Fill height: Fill align: Center flow: Down spacing: theme.space_2
-        Label{text: "No remote files listed" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 13}}
+        Label{text: "No remote files listed" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 13}}
         Label{text: "Run the 'ls' command in the console to populate directory tree" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 11}}
     }
     mod.widgets.FileTreeBase = #(FileTree::register_widget(vm))
@@ -424,7 +444,7 @@ script_mod! {
 
     // Process table — columns: PID / PPID / PROCESS / USER / ARCH
     let ProcRow = View{
-        width: Fill height: 30
+        width: Fill height: 32
         padding: Inset{left: Cpad right: Cpad}
         flow: Right spacing: Cgap
         align: Align{y: 0.5}
@@ -438,7 +458,7 @@ script_mod! {
     }
     let ProcEmpty = View{
         width: Fill height: Fill align: Center flow: Down spacing: theme.space_2
-        Label{text: "No process list active" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 13}}
+        Label{text: "No process list active" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 13}}
         Label{text: "Run the 'ps' command in the console to view active tasks" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 11}}
     }
     mod.widgets.ProcessTableBase = #(ProcessTable::register_widget(vm))
@@ -461,7 +481,7 @@ script_mod! {
 
     // Credential vault — columns: SOURCE / PRINCIPAL / KIND / SECRET
     let CredRow = View{
-        width: Fill height: 30
+        width: Fill height: 32
         padding: Inset{left: Cpad right: Cpad}
         flow: Right spacing: Cgap
         align: Align{y: 0.5}
@@ -474,7 +494,7 @@ script_mod! {
     }
     let CredEmpty = View{
         width: Fill height: Fill align: Center flow: Down spacing: theme.space_2
-        Label{text: "No credentials collected" draw_text.color: Cmuted draw_text.text_style: theme.font_bold{font_size: 13}}
+        Label{text: "No credentials collected" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 13}}
         Label{text: "Credentials will appear here once beacons dump passwords" draw_text.color: Cmuted draw_text.text_style: theme.font_regular{font_size: 11}}
     }
     mod.widgets.CredTableBase = #(CredTable::register_widget(vm))
@@ -521,16 +541,16 @@ script_mod! {
     // requires pixel-fn components to be standalone definitions so the Script
     // system can compile them. Referenced as `connect_progress := ConnectProgress`
     // inside the connecting_overlay. 14 cells; a wave head travels L→R lighting
-    // cells with a green neon glow; driven by self.draw_pass.time (the verified
-    // NetworkBg shader path).
+    // cells with the soft-teal success color; driven by self.draw_pass.time
+    // (the verified NetworkBg shader path).
     let ConnectProgress = View{
         show_bg: true
         draw_bg +: {
             // 0 = flowing green, 1 = solid success, 2 = red fail (Rust-driven).
             state: instance(0.0)
-            green: instance(#x00C800)
-            red: instance(#xF44336)
-            track: instance(#x1a1a1a)
+            green: instance(Csuccess)
+            red: instance(Cdanger)
+            track: instance(Cborder)
 
             pixel: fn() {
                 let cells = 14.0
@@ -558,8 +578,9 @@ script_mod! {
             // No `on_startup` render() call: our dynamic content is driven by
             main_window := Window{
                 show_caption_bar: true
-                window.inner_size: vec2(360, 480)
-                pass.clear_color: Cpanel
+                window.title: "Nyx Operator"
+                window.inner_size: vec2(420, 580)
+                pass.clear_color: Cbg
                 body +: {
                     width: Fill height: Fill
                     // hidden; handle_signal flips them once the bridge reports
@@ -579,11 +600,19 @@ script_mod! {
                         width: Fill height: Fill
                         padding: Inset{top: 0.0 left: 0.0 right: 0.0}
                         flow: Down spacing: 0
-                        draw_bg.color: Cpanel
+                        draw_bg.color: Cbg
                         connect_card := View{
                             show_bg: true
                             width: Fill height: Fill
                             flow: Down
+                            // Floating card on the deep window bg: elev surface,
+                            // large radius, 1px hairline, margin all around so
+                            // the Cbg backdrop frames it.
+                            margin: Inset{top: 16.0 bottom: 16.0 left: 16.0 right: 16.0}
+                            draw_bg.color: Celev
+                            draw_bg.border_radius: Cradius_l
+                            draw_bg.border_color: Cborder
+                            draw_bg.border_size: 1.0
 
                             // Brand header — compact.
                             View{
@@ -595,26 +624,26 @@ script_mod! {
                                     flow: Right spacing: 8.0
                                     align: Align{y: 0.5}
                                     logo_box := RoundedView{
-                                        width: 28 height: 28
+                                        width: 32 height: 32
                                         draw_bg.color: Caccent
-                                        draw_bg.border_radius: 6.0
+                                        draw_bg.border_radius: 8.0
                                         align: Align{x: 0.5, y: 0.5}
                                         logo_letter := Label{
                                             text: "N"
-                                            draw_text.color: Cbg
-                                            draw_text.text_style: theme.font_bold{font_size: 14}
+                                            draw_text.color: #xFFFFFF
+                                            draw_text.text_style: theme.font_bold{font_size: 16}
                                         }
                                     }
                                     nyx_logo := Label{
                                         text: "Nyx Operator"
                                         draw_text.color: Cprimary
-                                        draw_text.text_style: theme.font_bold{font_size: 16}
+                                        draw_text.text_style: theme.font_bold{font_size: 18}
                                     }
                                 }
                                 connect_tagline := Label{
-                                    text: "CONNECT TO TEAM SERVER"
-                                    draw_text.color: Caccent
-                                    draw_text.text_style: theme.font_bold{font_size: 10}
+                                    text: "Connect to a team server"
+                                    draw_text.color: Cmuted
+                                    draw_text.text_style: theme.font_regular{font_size: 12}
                                 }
                             }
                             View{width: Fill height: 1 draw_bg.color: Cborder}
@@ -637,9 +666,9 @@ script_mod! {
                                 // Server URL — host + port merged into one field.
                                 View{
                                     width: Fill height: Fit flow: Down spacing: 1.0
-                                    url_label := Label{text: "Server URL *" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 10}}
+                                    url_label := Label{text: "Server URL *" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 11}}
                                     url_input := TextInput{
-                                        width: Fill height: 28
+                                        width: Fill height: 32
                                         label_align: Align{y: 0.5}
                                         padding: Inset{left: 12.0, right: 12.0, top: 4.0, bottom: 4.0}
                                         text: "http://127.0.0.1:8443"
@@ -657,12 +686,12 @@ script_mod! {
                                         draw_bg.border_color_2_focus: Caccent
                                         draw_bg.border_color_2_empty: Cinput_b
                                         draw_bg.border_size: 1.0
-                                        draw_bg.border_radius: 4.0
+                                        draw_bg.border_radius: Cradius
                                         draw_text.color: Cprimary
                                         draw_text.color_hover: Cprimary
                                         draw_text.color_focus: Cprimary
                                         draw_text.color_empty: Cmuted
-                                        draw_text.text_style: theme.font_code{font_size: 12}
+                                        draw_text.text_style: theme.font_code{font_size: 13}
                                         draw_cursor.color: Caccent
                                     }
                                     url_error := Label{
@@ -674,9 +703,9 @@ script_mod! {
                                 }
                                 View{
                                     width: Fill height: Fit flow: Down spacing: 1.0
-                                    alias_label := Label{text: "Operator *" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 10}}
+                                    alias_label := Label{text: "Operator *" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 11}}
                                     alias_input := TextInput{
-                                        width: Fill height: 28
+                                        width: Fill height: 32
                                         label_align: Align{y: 0.5}
                                         padding: Inset{left: 12.0, right: 12.0, top: 4.0, bottom: 4.0}
                                         text: "operator"
@@ -694,12 +723,12 @@ script_mod! {
                                         draw_bg.border_color_2_focus: Caccent
                                         draw_bg.border_color_2_empty: Cinput_b
                                         draw_bg.border_size: 1.0
-                                        draw_bg.border_radius: 4.0
+                                        draw_bg.border_radius: Cradius
                                         draw_text.color: Cprimary
                                         draw_text.color_hover: Cprimary
                                         draw_text.color_focus: Cprimary
                                         draw_text.color_empty: Cmuted
-                                        draw_text.text_style: theme.font_code{font_size: 12}
+                                        draw_text.text_style: theme.font_code{font_size: 13}
                                         draw_cursor.color: Caccent
                                     }
                                     alias_error := Label{
@@ -711,10 +740,10 @@ script_mod! {
                                 }
                                 View{
                                     width: Fill height: Fit flow: Down spacing: 1.0
-                                    pass_label := Label{text: "Password (API Token) *" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 10}}
+                                    pass_label := Label{text: "Password (API Token) *" draw_text.color: Csecond draw_text.text_style: theme.font_bold{font_size: 11}}
                                     pass_input := TextInput{
                                         is_password: true
-                                        width: Fill height: 28
+                                        width: Fill height: 32
                                         label_align: Align{y: 0.5}
                                         padding: Inset{left: 12.0, right: 12.0, top: 4.0, bottom: 4.0}
                                         text: ""
@@ -732,12 +761,12 @@ script_mod! {
                                         draw_bg.border_color_2_focus: Caccent
                                         draw_bg.border_color_2_empty: Cinput_b
                                         draw_bg.border_size: 1.0
-                                        draw_bg.border_radius: 4.0
+                                        draw_bg.border_radius: Cradius
                                         draw_text.color: Cprimary
                                         draw_text.color_hover: Cprimary
                                         draw_text.color_focus: Cprimary
                                         draw_text.color_empty: Cmuted
-                                        draw_text.text_style: theme.font_code{font_size: 12}
+                                        draw_text.text_style: theme.font_code{font_size: 13}
                                         draw_cursor.color: Caccent
                                     }
                                     pass_helper := Label{
@@ -756,22 +785,25 @@ script_mod! {
                             View{width: Fill height: 1 draw_bg.color: Cborder}
                             View{
                                 width: Fill height: Fit
-                                padding: Inset{top: 6.0 bottom: 8.0 left: 20.0 right: 20.0}
+                                padding: Inset{top: 10.0 bottom: 16.0 left: 20.0 right: 20.0}
                                 flow: Down spacing: 5.0
                                 theme_toggle_dialog := View {
-                                    width: Fill height: 36
+                                    width: Fill height: 32
                                     flow: Right spacing: 0
                                     padding: Inset{top: 0 bottom: 0 left: 0 right: 0}
 
+                                    // Secondary style: transparent fill, hairline
+                                    // border, muted text — never competes with
+                                    // the primary Connect button.
                                     dialog_btn_theme := Button {
                                         text: "THEME: DARK"
                                         width: Fill height: Fill
-                                        draw_bg.color: Cinput
+                                        draw_bg.color: #x00000000
                                         draw_bg.color_hover: Crowhov
-                                        draw_bg.border_radius: 6.0
-                                        draw_bg.border_color: Cinput_b
+                                        draw_bg.border_radius: Cradius
+                                        draw_bg.border_color: Cborder
                                         draw_bg.border_size: 1.0
-                                        draw_text.color: Cprimary
+                                        draw_text.color: Cmuted
                                         draw_text.text_style: theme.font_code{font_size: 11}
                                     }
                                 }
@@ -779,16 +811,14 @@ script_mod! {
                                     text: "Connect"
                                     width: Fill height: 36
                                     draw_bg.color: Caccent
-                                    draw_bg.color_2: #x0050A0
-                                    draw_bg.gradient_fill_horizontal: 1.0
-                                    draw_bg.color_2_hover: #xB98BCC
-                                    draw_bg.border_radius: 8.0
-                                    draw_text.color: Cbg
+                                    draw_bg.color_hover: Cacchov
+                                    draw_bg.border_radius: Cradius
+                                    draw_text.color: #xFFFFFF
                                     draw_text.text_style: theme.font_bold{font_size: 13}
                                 }
                                 connect_footer := Label{
                                     text: "Authorized use only · all activity is logged"
-                                    draw_text.color: Csecond
+                                    draw_text.color: Cmuted
                                     draw_text.text_style: theme.font_regular{font_size: 11}
                                 }
                             }
@@ -796,7 +826,8 @@ script_mod! {
                     }
 
                     // ── main console (hidden until connected) ──────────────
-                    main_view := SolidView{
+                    main_view := View{
+                        show_bg: true
                         width: Fill height: Fill
                         visible: false
                         flow: Down spacing: 0
@@ -868,9 +899,13 @@ script_mod! {
                             View { width: Fill height: 1 }
                             main_btn_theme := Button {
                                 text: "🌗"
-                                draw_bg.color: Cbar
+                                draw_bg.color: #x00000000
+                                draw_bg.color_hover: Crowhov
+                                draw_bg.border_color: Cborder
+                                draw_bg.border_size: 1.0
                                 width: 26 height: 26
                                 padding: Inset{left: 0.0 right: 0.0 top: 0.0 bottom: 0.0}
+                                draw_text.color: Cmuted
                                 draw_text.text_style: theme.font_regular{font_size: 14}
                                 draw_bg.border_radius: 13.0
                             }
@@ -885,7 +920,7 @@ script_mod! {
                         padding: Inset{left: 16.0 right: 16.0}
                         flow: Right spacing: 12.0
                         align: Align{y: 0.5}
-                        draw_bg.color: Cpanel
+                        draw_bg.color: Cbar
 
                         Label{
                             text: "NYX"
@@ -915,7 +950,7 @@ script_mod! {
                                 draw_bg.border_color_2_focus: Caccent
                                 draw_bg.border_color_2_empty: Cinput_b
                                 draw_bg.border_size: 1.0
-                                draw_bg.border_radius: Cradius_s
+                                draw_bg.border_radius: Cradius
                                 draw_text.color: Cprimary
                                 draw_text.color_hover: Cprimary
                                 draw_text.color_focus: Cprimary
@@ -974,7 +1009,7 @@ script_mod! {
                                 flow: Down spacing: 0
                                 draw_bg.color: Cpanel
                                 draw_bg.border_color: Cborder
-                                draw_bg.border_radius: 8.0
+                                draw_bg.border_radius: Cradius_l
                                 draw_bg.border_size: 1.0
 
                                 sessions_header := View{
@@ -1017,7 +1052,7 @@ script_mod! {
                                             draw_bg.border_color: Cinput_b
                                             draw_bg.border_color_focus: Caccent
                                             draw_bg.border_size: 1.0
-                                            draw_bg.border_radius: 4.0
+                                            draw_bg.border_radius: Cradius
                                             draw_text.color: Cprimary
                                             draw_text.color_empty: Cmuted
                                             draw_text.text_style: theme.font_code{font_size: 12}
@@ -1028,7 +1063,7 @@ script_mod! {
                                             width: 60 height: 26
                                             draw_bg.color: Caccent
                                             draw_bg.color_hover: Cacchov
-                                            draw_bg.border_radius: 4.0
+                                            draw_bg.border_radius: Cradius
                                             draw_text.color: Cbg
                                             draw_text.text_style: theme.font_bold{font_size: 11}
                                         }
@@ -1052,7 +1087,7 @@ script_mod! {
                                             width: 76 height: 26
                                             draw_bg.color: Caccent
                                             draw_bg.color_hover: Cacchov
-                                            draw_bg.border_radius: 4.0
+                                            draw_bg.border_radius: Cradius
                                             draw_text.color: Cbg
                                             draw_text.text_style: theme.font_bold{font_size: 11}
                                         }
@@ -1083,7 +1118,7 @@ script_mod! {
                                 flow: Down spacing: 0
                                 draw_bg.color: Cpanel
                                 draw_bg.border_color: Cborder
-                                draw_bg.border_radius: 8.0
+                                draw_bg.border_radius: Cradius_l
                                 draw_bg.border_size: 1.0
 
                                 // ── tab bar ────────────────────────────────────
@@ -1096,40 +1131,36 @@ script_mod! {
 
                                     console_tab := View{
                                         flow: Down width: 90 height: Fill
+                                        // Active tab reads as a RAISED surface (Celev)
+                                        // against the recessed bar (Cbar) — the classic
+                                        // connected-tab metaphor. (A separate 2px
+                                        // underline View was tried but plain-View
+                                        // children after a Button don't paint reliably
+                                        // in this Makepad rev; button bg always paints.)
                                         tab_console := Button{
                                             text: "Console"
-                                            width: Fill height: 27
-                                            draw_bg.color: Cbar
+                                            width: Fill height: 30
+                                            draw_bg.color: Celev
                                             draw_bg.color_hover: Crowhov
                                             draw_bg.color_down: Crowhov
                                             draw_bg.border_size: 0.0
                                             draw_text.color: Cprimary
-                                            draw_text.color_hover: Caccent
+                                            draw_text.color_hover: Cprimary
                                             draw_text.text_style: theme.font_bold{font_size: 11}
-                                        }
-                                        line_console := View{
-                                            width: Fill height: 3
-                                            draw_bg.color: Caccent
-                                            visible: true
                                         }
                                     }
                                     bof_tab := View{
                                         flow: Down width: 64 height: Fill
                                         tab_bof := Button{
                                             text: "BOF"
-                                            width: Fill height: 27
+                                            width: Fill height: 30
                                             draw_bg.color: Cbar
                                             draw_bg.color_hover: Crowhov
                                             draw_bg.color_down: Crowhov
                                             draw_bg.border_size: 0.0
-                                            draw_text.color: Cmuted
+                                            draw_text.color: Csecond
                                             draw_text.color_hover: Cprimary
                                             draw_text.text_style: theme.font_bold{font_size: 11}
-                                        }
-                                        line_bof := View{
-                                            width: Fill height: 3
-                                            draw_bg.color: Caccent
-                                            visible: false
                                         }
                                     }
                                 }
@@ -1153,8 +1184,8 @@ script_mod! {
                                             align: Center flow: Down spacing: 8.0
                                             center_text := Label{
                                                 text: "No beacon selected"
-                                                draw_text.color: Cmuted
-                                                draw_text.text_style: theme.font_bold{font_size: 14}
+                                                draw_text.color: Csecond
+                                                draw_text.text_style: theme.font_bold{font_size: 13}
                                             }
                                             center_sub := Label{
                                                 text: "Select a session from the beacon list to open the interactive console"
@@ -1219,7 +1250,7 @@ script_mod! {
                                             draw_bg.border_color_2_focus: Caccent
                                             draw_bg.border_color_2_empty: Cinput_b
                                             draw_bg.border_size: 1.0
-                                            draw_bg.border_radius: 4.0
+                                            draw_bg.border_radius: Cradius
                                             draw_text.color: Cprimary
                                             draw_text.color_hover: Cprimary
                                             draw_text.color_focus: Cprimary
@@ -1232,7 +1263,7 @@ script_mod! {
                                             width: 56 height: 26
                                             draw_bg.color: Caccent
                                             draw_bg.color_hover: Cacchov
-                                            draw_bg.border_radius: 4.0
+                                            draw_bg.border_radius: Cradius
                                             draw_text.color: Cbg
                                             draw_text.text_style: theme.font_bold{font_size: 11}
                                         }
@@ -1263,7 +1294,7 @@ script_mod! {
                                                 draw_bg.border_color: Cinput_b
                                                 draw_bg.border_color_focus: Caccent
                                                 draw_bg.border_size: 1.0
-                                                draw_bg.border_radius: 4.0
+                                                draw_bg.border_radius: Cradius
                                                 draw_text.color: Cprimary
                                                 draw_text.color_empty: Cmuted
                                                 draw_text.text_style: theme.font_code{font_size: 12}
@@ -1279,7 +1310,7 @@ script_mod! {
                                                 draw_bg.border_color: Cinput_b
                                                 draw_bg.border_color_focus: Caccent
                                                 draw_bg.border_size: 1.0
-                                                draw_bg.border_radius: 4.0
+                                                draw_bg.border_radius: Cradius
                                                 draw_text.color: Cprimary
                                                 draw_text.color_empty: Cmuted
                                                 draw_text.text_style: theme.font_code{font_size: 12}
@@ -1295,7 +1326,7 @@ script_mod! {
                                                 draw_bg.border_color: Cinput_b
                                                 draw_bg.border_color_focus: Caccent
                                                 draw_bg.border_size: 1.0
-                                                draw_bg.border_radius: 4.0
+                                                draw_bg.border_radius: Cradius
                                                 draw_text.color: Cprimary
                                                 draw_text.color_empty: Cmuted
                                                 draw_text.text_style: theme.font_code{font_size: 12}
@@ -1306,7 +1337,7 @@ script_mod! {
                                                 width: 80 height: 26
                                                 draw_bg.color: Caccent
                                                 draw_bg.color_hover: Cacchov
-                                                draw_bg.border_radius: 4.0
+                                                draw_bg.border_radius: Cradius
                                                 draw_text.color: Cbg
                                                 draw_text.text_style: theme.font_bold{font_size: 11}
                                             }
@@ -1331,11 +1362,11 @@ script_mod! {
                         flow: Down
                         align: Align{x: 0.5, y: 0.5}
                         spacing: 14.0
-                        draw_bg.color: #x050505
+                        draw_bg.color: Cbg
 
                         connect_title := Label {
                             text: "[ ESTABLISHING LINK ]"
-                            draw_text.color: #x9CDCFE
+                            draw_text.color: Csecond
                             draw_text.text_style: theme.font_code{font_size: 11}
                         }
 
@@ -1345,7 +1376,7 @@ script_mod! {
 
                         connect_step_tip := Label {
                             text: ""
-                            draw_text.color: #x9CDCFE
+                            draw_text.color: Csecond
                             draw_text.text_style: theme.font_code{font_size: 11}
                         }
                     }
@@ -1382,16 +1413,13 @@ pub struct App {
 /// `Button`s (not Labels) so click detection works via the standard `.clicked`
 /// action — matching the `todo` example's use of clickable buttons.
 #[derive(Clone, Copy, PartialEq)]
+#[derive(Default)]
 enum Tab {
+    #[default]
     Console,
     Bof,
 }
 
-impl Default for Tab {
-    fn default() -> Self {
-        Tab::Console
-    }
-}
 
 /// A dialog form field that can carry an inline error. Used by
 /// [`App::set_field_error`] to route validation/backend errors to the right
@@ -1509,13 +1537,15 @@ impl App {
         self.connecting_prev = snap.connecting;
 
         // Grow the window to full console size on the connect TRANSITION. The
-        // login view uses a compact 420x580 window; the console needs 1280x800.
+        // login view uses a compact 420x580 window; the console wants 1280x800
+        // but is capped at 720 tall so it fits smaller screens (e.g. 745pt
+        // logical-height MacBooks) without clipping the bottom command bar.
         // has_connected is sticky so this fires exactly once. The overlay (if
         // still transitioning) hides this snap.
         if snap.connected && !self.has_connected {
             self.ui
                 .window(cx, ids!(main_window))
-                .resize(cx, dvec2(1280.0, 800.0));
+                .resize(cx, dvec2(1280.0, 720.0));
         }
         if snap.connected {
             self.has_connected = true;
@@ -1703,7 +1733,6 @@ impl App {
         let crowhov = p.rowhov;
         let cinput = p.input;
         let cinput_b = p.input_b;
-        let cbtn_grad2 = p.btn_grad2;
         let cwhite = vec4(1.0, 1.0, 1.0, 1.0);
 
         // 1. MainWindow clear_color
@@ -1718,16 +1747,16 @@ impl App {
             draw_bg +: { color: #(cbg) }
         });
 
-        // 2. Dialog backdrop — just the window clear color now (no network bg).
+        // 2. Dialog backdrop — the deep app bg that frames the floating card.
         let mut cv = self.ui.view(cx, ids!(connect_view));
         script_apply_eval!(cx, cv, {
-            draw_bg +: { color: #(celev) }
+            draw_bg +: { color: #(cbg) }
         });
 
-        // 2b. Glass card (View) — per-theme tint / glow border.
+        // 2b. Connect card (View) — elev surface, hairline border, large radius.
         let mut cc = self.ui.view(cx, ids!(connect_card));
         script_apply_eval!(cx, cc, {
-            draw_bg +: { color: #(celev) }
+            draw_bg +: { color: #(celev), border_color: #(cborder), border_size: 1.0, border_radius: 8.0 }
         });
 
         let mut lb = self.ui.view(cx, ids!(logo_box));
@@ -1736,7 +1765,7 @@ impl App {
         });
         let mut ll = self.ui.label(cx, ids!(logo_letter));
         script_apply_eval!(cx, ll, {
-            draw_text +: { color: #(celev) }
+            draw_text +: { color: #(cwhite) }
         });
 
         // 3. Text inputs (dialog fields + connection-bar server field).
@@ -1769,7 +1798,7 @@ impl App {
         }
 
         // 4. Buttons.
-        let buttons = [(ids!(bar_connect_btn), caccent, cacchov, cwhite)];
+        let buttons = [(ids!(bar_connect_btn), caccent, cacchov, cbg)];
         for (path, bg, bg_hov, fg) in buttons {
             let mut btn = self.ui.button(cx, path);
             script_apply_eval!(cx, btn, {
@@ -1778,29 +1807,21 @@ impl App {
             });
         }
 
-        // 4a. Theme Toggle controls
-        let mut view = self.ui.view(cx, ids!(theme_toggle_dialog));
-        script_apply_eval!(cx, view, {
-            draw_bg +: { color: #(cinput), border_color: #(cinput_b) }
-        });
-
+        // 4a. Theme toggle button — secondary style: transparent fill, hairline
+        // border, muted text (the wrapper View carries no background).
         let mut dialog_btn = self.ui.button(cx, ids!(dialog_btn_theme));
         script_apply_eval!(cx, dialog_btn, {
-            draw_bg +: { color: #(cinput), color_hover: #(crowhov), color_down: #(crowhov) }
-            draw_text +: { color: #(cprimary), color_hover: #(cprimary), color_down: #(cprimary) }
+            draw_bg +: { color: #x00000000, color_hover: #(crowhov), color_down: #(crowhov), border_color: #(cborder), border_size: 1.0 }
+            draw_text +: { color: #(cmuted), color_hover: #(cmuted), color_down: #(cmuted) }
         });
 
-        // 4b. Connect button gradient.
+        // 4b. Connect button — solid accent, no gradient.
         let mut cbtn = self.ui.button(cx, ids!(dialog_connect_btn));
         script_apply_eval!(cx, cbtn, {
             draw_bg +: {
                 color: #(caccent),
-                color_2: #(cbtn_grad2),
                 color_hover: #(cacchov),
-                color_2_hover: #(cbtn_grad2),
-                color_down: #(caccent),
-                color_2_down: #(cbtn_grad2),
-                gradient_fill_horizontal: 1.0
+                color_down: #(caccent)
             }
             draw_text +: {
                 color: #(cwhite),
@@ -1823,12 +1844,12 @@ impl App {
         }
         let dialog_labels = [
             (ids!(nyx_logo), cprimary),
-            (ids!(connect_tagline), csecond),
+            (ids!(connect_tagline), cmuted),
             (ids!(url_label), csecond),
             (ids!(alias_label), csecond),
             (ids!(pass_label), csecond),
             (ids!(pass_helper), csecond),
-            (ids!(connect_footer), csecond),
+            (ids!(connect_footer), cmuted),
         ];
         for (path, color) in dialog_labels {
             let mut lbl = self.ui.label(cx, path);
@@ -1837,10 +1858,27 @@ impl App {
             });
         }
 
+        // 5b. Connect overlay (backdrop + mono labels) and the progress shader's
+        // theme-driven instances — mirrors the DSL first-frame values.
+        let mut ov = self.ui.view(cx, ids!(connecting_overlay));
+        script_apply_eval!(cx, ov, {
+            draw_bg +: { color: #(cbg) }
+        });
+        for path in [ids!(connect_title), ids!(connect_step_tip)] {
+            let mut lbl = self.ui.label(cx, path);
+            script_apply_eval!(cx, lbl, {
+                draw_text +: { color: #(csecond) }
+            });
+        }
+        let mut prog = self.ui.view(cx, ids!(connect_progress));
+        script_apply_eval!(cx, prog, {
+            draw_bg +: { green: #(p.success), red: #(p.danger), track: #(cborder) }
+        });
+
         // 6. Connection bar.
         let mut conn_b = self.ui.view(cx, ids!(conn_bar));
         script_apply_eval!(cx, conn_b, {
-            draw_bg +: { color: #(cpanel) }
+            draw_bg +: { color: #(cbar) }
         });
 
         // 7. Split panels & their section headers.
@@ -1870,27 +1908,28 @@ impl App {
             draw_bg +: { color: #(cbar) }
         });
 
-        // Tab buttons + their active underlines.
+        // Tab buttons: the active tab reads as a RAISED surface (elev) against
+        // the recessed bar (bar); text follows the same active split as the
+        // DSL first frame and set_active_tab's recolor.
         let tabs = [
-            (ids!(tab_console), ids!(line_console)),
-            (ids!(tab_bof), ids!(line_bof)),
+            (Tab::Console, ids!(tab_console)),
+            (Tab::Bof, ids!(tab_bof)),
         ];
-        for (btn_path, line_path) in tabs {
+        for (t, btn_path) in tabs {
+            let active = t == self.active_tab;
+            let text_color = if active { cprimary } else { csecond };
+            let bg = if active { celev } else { cbar };
             let mut btn = self.ui.button(cx, btn_path);
             script_apply_eval!(cx, btn, {
-                draw_bg +: { color: #(cbar), color_hover: #(crowhov), color_down: #(crowhov) }
-                draw_text +: { color: #(cprimary), color_hover: #(caccent), color_down: #(caccent) }
-            });
-            let mut line = self.ui.view(cx, line_path);
-            script_apply_eval!(cx, line, {
-                draw_bg +: { color: #(caccent) }
+                draw_bg +: { color: #(bg), color_hover: #(crowhov), color_down: #(crowhov) }
+                draw_text +: { color: #(text_color), color_hover: #(cprimary), color_down: #(cprimary) }
             });
         }
 
         // Center console: style the "no beacon" placeholder + beacon info bar.
         let mut ctxt = self.ui.label(cx, ids!(center_text));
         script_apply_eval!(cx, ctxt, {
-            draw_text +: { color: #(cmuted) }
+            draw_text +: { color: #(csecond) }
         });
         let mut csub = self.ui.label(cx, ids!(center_sub));
         script_apply_eval!(cx, csub, {
@@ -1962,7 +2001,6 @@ impl App {
             ids!(btn_procs),
             ids!(btn_creds),
             ids!(btn_event_log),
-            ids!(main_btn_theme),
         ];
         for path in toolbar_buttons {
             let mut btn = self.ui.button(cx, path);
@@ -1971,6 +2009,14 @@ impl App {
                 draw_text +: { color: #(cprimary), color_hover: #(cprimary), color_down: #(cprimary) }
             });
         }
+        // Theme toggle is a SECONDARY control: transparent fill, hairline
+        // border, muted glyph — mirrors the DSL first frame (and the connect
+        // dialog's toggle), so it stops competing with the accent buttons.
+        let mut tgl = self.ui.button(cx, ids!(main_btn_theme));
+        script_apply_eval!(cx, tgl, {
+            draw_bg +: { color: #x00000000, color_hover: #(crowhov), color_down: #(crowhov), border_color: #(cborder) }
+            draw_text +: { color: #(cmuted), color_hover: #(cprimary), color_down: #(cprimary) }
+        });
 
         // 9. Hairlines / dividers.
         let dividers = [
@@ -1994,7 +2040,7 @@ impl App {
             let mut btn = self.ui.button(cx, btn_path);
             script_apply_eval!(cx, btn, {
                 draw_bg +: { color: #(caccent), color_hover: #(cacchov), color_down: #(cacchov) }
-                draw_text +: { color: #(cwhite), color_hover: #(cwhite), color_down: #(cwhite) }
+                draw_text +: { color: #(cbg), color_hover: #(cbg), color_down: #(cbg) }
             });
         }
         for inp_path in [ids!(bof_name_input), ids!(bof_args_input), ids!(path_input)] {
@@ -2025,13 +2071,22 @@ impl App {
         for (t, id) in panes {
             self.ui.view(cx, id).set_visible(cx, t == tab);
         }
-        // Toggle the visibility of active tab gold underlines.
-        let lines = [
-            (Tab::Console, ids!(line_console)),
-            (Tab::Bof, ids!(line_bof)),
+        // Recolor tab buttons: active = raised surface (elev) + primary text,
+        // inactive = bar + second (same split apply_theme applies).
+        let p = Palette::current();
+        let tab_btns = [
+            (Tab::Console, ids!(tab_console)),
+            (Tab::Bof, ids!(tab_bof)),
         ];
-        for (t, id) in lines {
-            self.ui.view(cx, id).set_visible(cx, t == tab);
+        for (t, id) in tab_btns {
+            let active = t == tab;
+            let color = if active { p.primary } else { p.second };
+            let bg = if active { p.elev } else { p.bar };
+            let mut btn = self.ui.button(cx, id);
+            script_apply_eval!(cx, btn, {
+                draw_bg +: { color: #(bg) }
+                draw_text +: { color: #(color) }
+            });
         }
         self.ui.redraw(cx);
     }
@@ -2039,7 +2094,9 @@ impl App {
 
 impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
-        self.is_dark = std::env::var("NYX_START_DARK").is_ok();
+        // Dark is the default product theme (2026-07-16 reskin); set
+        // NYX_START_LIGHT to boot into the light ramp instead.
+        self.is_dark = std::env::var("NYX_START_LIGHT").is_err();
         IS_DARK.store(self.is_dark, std::sync::atomic::Ordering::Relaxed);
         let label_text = if self.is_dark {
             "THEME: DARK"
@@ -2049,13 +2106,16 @@ impl MatchEvent for App {
         self.ui
             .button(cx, ids!(dialog_btn_theme))
             .set_text(cx, label_text);
+        // main_btn_theme is a 26px circular icon button — a long text label
+        // overflows it and gets clipped; show a per-theme icon instead.
+        let theme_icon = if self.is_dark { "🌙" } else { "☀️" };
         self.ui
             .button(cx, ids!(main_btn_theme))
-            .set_text(cx, label_text);
+            .set_text(cx, theme_icon);
         self.set_status(cx, false);
         self.ui
             .window(cx, ids!(main_window))
-            .resize(cx, dvec2(360.0, 480.0));
+            .resize(cx, dvec2(420.0, 580.0));
         self.apply_theme(cx);
         self.ui.redraw(cx);
 
@@ -2090,9 +2150,11 @@ impl MatchEvent for App {
             self.ui
                 .button(cx, ids!(dialog_btn_theme))
                 .set_text(cx, label_text);
+            // Same 26px icon-button constraint as startup: icon, not text.
+            let theme_icon = if self.is_dark { "🌙" } else { "☀️" };
             self.ui
                 .button(cx, ids!(main_btn_theme))
-                .set_text(cx, label_text);
+                .set_text(cx, theme_icon);
 
             self.apply_theme(cx);
             self.ui.redraw(cx);
@@ -2134,6 +2196,25 @@ impl MatchEvent for App {
             for &id in &top_panes {
                 self.ui.view(cx, id).set_visible(cx, id == target);
             }
+            // Sync the left-panel header title with the now-visible pane — the
+            // toolbar previously only toggled visibility, so it always read
+            // "SESSIONS" no matter which pane was showing.
+            let title = if target == ids!(session_list_view) {
+                "SESSIONS"
+            } else if target == ids!(session_graph_view) {
+                "SESSION GRAPH"
+            } else if target == ids!(pane_files) {
+                "FILES"
+            } else if target == ids!(pane_procs) {
+                "PROCESSES"
+            } else if target == ids!(pane_creds) {
+                "CREDENTIALS"
+            } else {
+                "EVENT LOG"
+            };
+            self.ui
+                .label(cx, ids!(sessions_header_title))
+                .set_text(cx, title);
             self.ui.redraw(cx);
         }
 
@@ -2460,7 +2541,7 @@ impl MatchEvent for App {
                         //                  |  /creds del DOMAIN\user kind
                         self.ensure_bridge();
                         if let Some(b) = &self.bridge {
-                            if parts.iter().any(|p| *p == "add") {
+                            if parts.contains(&"add") {
                                 let principal = parts.get(2).copied().unwrap_or("");
                                 let kind = parts.get(3).copied().unwrap_or("password");
                                 let secret = parts.get(4).copied().unwrap_or("");
@@ -2487,7 +2568,7 @@ impl MatchEvent for App {
                                     kind: kind.to_string(),
                                 });
                             } else {
-                                let reveal = parts.iter().any(|p| *p == "reveal");
+                                let reveal = parts.contains(&"reveal");
                                 let _ = b.from_ui.send(Cmd::FetchCreds { reveal });
                             }
                         }
@@ -2497,7 +2578,7 @@ impl MatchEvent for App {
                         // /audit [verify]  |  /audit [operator <n>] [action <a>] [limit <n>]
                         self.ensure_bridge();
                         if let Some(b) = &self.bridge {
-                            if parts.iter().any(|p| *p == "verify") {
+                            if parts.contains(&"verify") {
                                 let _ = b.from_ui.send(Cmd::FetchAuditVerify);
                             } else {
                                 let mut operator = None;
@@ -2657,11 +2738,11 @@ impl MatchEvent for App {
                         }
                         return;
                     }
-                    "channel" => {
+                    "channel"
                         // channel with no arg → list available channels (no
                         // session needed). With an arg it falls through to the
                         // session-bound Layer 3 handler that sends SetChannel.
-                        if parts.len() < 2 {
+                        if parts.len() < 2 => {
                             LOG_LINES
                                 .write()
                                 .unwrap()
@@ -2686,7 +2767,6 @@ impl MatchEvent for App {
                         }
                         // Has an argument → fall through to Layer 3 (needs a
                         // selected session to switch the channel on).
-                    }
                     _ => {}
                 }
 
@@ -2856,7 +2936,7 @@ impl MatchEvent for App {
                                 }
                                 "creds" => {
                                     // creds [reveal] — pull server credential store
-                                    let reveal = parts.iter().any(|p| *p == "reveal");
+                                    let reveal = parts.contains(&"reveal");
                                     Cmd::FetchCreds { reveal }
                                 }
                                 "audit" => {
@@ -3276,23 +3356,34 @@ impl Widget for SessionList {
                         let Some(s) = sessions.get(item_id) else {
                             continue;
                         };
-                        // Selected row uses the ItemSel template (blue bg);
+                        // Selected row uses the ItemSel template (violet bg);
                         // others use Item. Verified per-row-id approach.
+                        let is_sel = item_id == sel;
                         let item = list.item(
                             cx,
                             item_id,
-                            if item_id == sel {
+                            if is_sel {
                                 id!(ItemSel)
                             } else {
                                 id!(Item)
                             },
                         );
 
-                        // Repaint the row from the single Palette source so the
-                        // Light/Dark toggle matches apply_theme exactly.
-                        let row_color = if item_id == sel { p.rowsel } else { p.row };
-                        let mut row_item = item.clone();
-                        script_apply_eval!(cx, row_item, {
+                        // Repaint the row bg from the single Palette source so
+                        // the Light/Dark toggle matches apply_theme exactly.
+                        // Must target the inner SessionRow (`item_row`/`sel_row`
+                        // — distinct cache keys, see the template comment above):
+                        // eval applies don't propagate to children, and the
+                        // CachedView wrapper's own draw_bg is the texture-sampler
+                        // shader, which ignores `color` (the old item.clone()
+                        // apply was a silent no-op).
+                        let row_color = if is_sel { p.rowsel } else { p.row };
+                        let mut row_bg = if is_sel {
+                            item.view(cx, ids!(sel_row))
+                        } else {
+                            item.view(cx, ids!(item_row))
+                        };
+                        script_apply_eval!(cx, row_bg, {
                             draw_bg +: { color: #(row_color), color_hover: #(p.rowhov) }
                         });
 

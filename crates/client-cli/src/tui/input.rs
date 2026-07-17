@@ -18,7 +18,7 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
     MetaCmd {
         name: "/sessions",
         args_hint: "[filter]",
-        help: "list beacons / switch",
+        help: "list sessions / switch",
         icon: "◉",
     },
     MetaCmd {
@@ -30,25 +30,25 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
     MetaCmd {
         name: "/use",
         args_hint: "<id>",
-        help: "select beacon by id prefix",
+        help: "select session by id prefix",
         icon: "▣",
     },
     MetaCmd {
         name: "/info",
         args_hint: "",
-        help: "full details of current beacon",
+        help: "full details of current session",
         icon: "ℹ",
     },
     MetaCmd {
         name: "/rename",
         args_hint: "<id> <name>",
-        help: "alias a beacon",
+        help: "alias a session",
         icon: "✎",
     },
     MetaCmd {
         name: "/tag",
         args_hint: "<id> <tag>",
-        help: "tag a beacon",
+        help: "tag a session",
         icon: "▸",
     },
     MetaCmd {
@@ -66,7 +66,7 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
     MetaCmd {
         name: "/note",
         args_hint: "<id> <text>",
-        help: "annotate a beacon",
+        help: "annotate a session",
         icon: "✑",
     },
     MetaCmd {
@@ -156,7 +156,7 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
     MetaCmd {
         name: "/tasks",
         args_hint: "",
-        help: "queued (undelivered) tasks for current beacon",
+        help: "queued (undelivered) tasks for current session",
         icon: "☐",
     },
     MetaCmd {
@@ -186,7 +186,7 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
     MetaCmd {
         name: "/sleep",
         args_hint: "<secs> [jitter%]",
-        help: "set beacon interval",
+        help: "set session interval",
         icon: "⏱",
     },
     MetaCmd {
@@ -300,7 +300,7 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
     MetaCmd {
         name: "/kill",
         args_hint: "",
-        help: "task the beacon to exit",
+        help: "task the session to exit",
         icon: "☠",
     },
     MetaCmd {
@@ -311,7 +311,7 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
     },
     MetaCmd {
         name: "/theme",
-        args_hint: "[mocha|frappe|macchiato|highcontrast|nocolor]",
+        args_hint: "[nyx|mocha|frappe|macchiato|highcontrast|nocolor]",
         help: "switch color theme (or show current)",
         icon: "◐",
     },
@@ -361,13 +361,13 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
         name: "/trex",
         args_hint: "",
         help: "T-REX target recon (noise-graded EDR detection)",
-        icon: "🦖",
+        icon: "✦",
     },
     MetaCmd {
         name: "/channel",
         args_hint: "[0-8|https|doh|dns|smb|tcp|slack|llm|mcp|discord]",
         help: "switch C2 transport channel (no arg = list all)",
-        icon: "📡",
+        icon: "⇄",
     },
     // ── Implant generation ───────────────────────────────────────────────
     MetaCmd {
@@ -393,7 +393,7 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
         name: "/help",
         args_hint: "",
         help: "show this list",
-        icon: "❓",
+        icon: "?",
     },
 ];
 
@@ -404,7 +404,7 @@ pub(crate) const META_COMMANDS: &[MetaCmd] = &[
 pub(crate) enum Input {
     /// Empty line — nothing to do.
     Empty,
-    /// Doesn't start with `/` → a shell command for the current beacon.
+    /// Doesn't start with `/` → a shell command for the current session.
     Shell(String),
     /// Starts with `/`. `name` includes the leading slash, lowercased.
     Meta { name: String, args: String },
@@ -579,7 +579,7 @@ pub(crate) fn mask(secret: &str) -> String {
 ///
 /// Each carries a one-line human-readable description builder. The TUI's
 /// `submit` calls [`destructive_confirm`] *before* dispatch; if it returns
-/// `Some`, the command is held in a [`super::ConfirmAction`] and re-dispatched
+/// `Some`, the command is held in a [`super::overlay::ConfirmAction`] and re-dispatched
 /// verbatim only after the operator presses `y`.
 ///
 /// Pure data — the description strings live here so they're easy to audit in
@@ -587,7 +587,7 @@ pub(crate) fn mask(secret: &str) -> String {
 const DESTRUCTIVE_COMMANDS: &[(&str, &str)] = &[
     (
         "/kill",
-        "Kill beacon session — the implant will exit immediately.",
+        "Kill session — the implant will exit immediately.",
     ),
     ("/rm", "Delete the file/dir on the target."),
     (

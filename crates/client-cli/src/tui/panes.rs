@@ -120,13 +120,38 @@ pub enum FocusDir {
 }
 
 impl Pane {
-    /// 创建单叶窗格（默认布局）。
+    /// 创建单叶窗格。
     pub fn single(id: usize) -> Self {
         Pane::Leaf {
             id,
             view: PaneView::Console,
             session_id: None,
             state: PaneState::default(),
+        }
+    }
+
+    /// 默认工作区布局（启动即双窗格）：左 console 70% · 右 session list 30%。
+    /// 焦点在 console（id=1）；session list（id=2）实时显示上线 agent，点击行
+    /// 即为该窗格绑定 session。用户手动 split/close 照旧走 [`Self::split`]/[`Self::close`]。
+    /// 纯构造，与 split 一样不依赖运行时状态。
+    pub fn default_workspace() -> Self {
+        Pane::Split {
+            dir: SplitDir::Columns,
+            ratio: 0.7,
+            children: vec![
+                Pane::Leaf {
+                    id: 1,
+                    view: PaneView::Console,
+                    session_id: None,
+                    state: PaneState::default(),
+                },
+                Pane::Leaf {
+                    id: 2,
+                    view: PaneView::SessionList,
+                    session_id: None,
+                    state: PaneState::default(),
+                },
+            ],
         }
     }
 
@@ -505,6 +530,31 @@ pub fn split_rect(rect: Rect, dir: SplitDir, ratio: f32) -> (Rect, Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_workspace_is_console_plus_sessions() {
+        // 启动默认布局契约：console | sessions 双窗格，70/30，焦点在 console。
+        let p = Pane::default_workspace();
+        assert_eq!(p.leaf_count(), 2);
+        let leaves = p.leaves();
+        assert_eq!(leaves[0], (1, PaneView::Console));
+        assert_eq!(leaves[1], (2, PaneView::SessionList));
+        // 70/30 左右分割验证。
+        let full = Rect::new(0, 0, 100, 24);
+        let layout = p.layout(full);
+        let left = layout.iter().find(|(id, _)| *id == 1).unwrap().1;
+        let right = layout.iter().find(|(id, _)| *id == 2).unwrap().1;
+        assert_eq!(left.width, 70, "console 应占 70%");
+        assert_eq!(right.width, 30, "sessions 应占 30%");
+        // 新叶 id 分配不与默认两叶冲突。
+        assert_eq!(p.next_id(), 3);
+        // 默认双窗格 close 到一叶后仍可 split（用户手动行为不变）。
+        let p = p.close(2);
+        assert_eq!(p.leaf_count(), 1);
+        let nid = p.next_id();
+        let p = p.split(1, SplitDir::Rows, nid);
+        assert_eq!(p.leaf_count(), 2);
+    }
 
     #[test]
     fn single_leaf_layout() {

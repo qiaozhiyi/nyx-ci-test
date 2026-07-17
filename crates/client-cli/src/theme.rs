@@ -1,4 +1,4 @@
-//! 主题系统——支持 Catppuccin Mocha/Frappé/Macchiato（默认 Mocha）、高对比度、NO_COLOR 五种调色板。
+//! 主题系统——Nyx violet（默认）+ Catppuccin Mocha/Frappé/Macchiato、高对比度、NO_COLOR 六套调色板。
 //!
 //! 历史背景：最初硬编码 Mocha 配色，所有颜色是 `pub const`。现改成运行时可切换：
 //! `Palette` 结构体持有当前生效的全部颜色，`init(name)` 在 TUI 启动时根据
@@ -50,7 +50,7 @@ pub const SKY: Color = rgb(0x89dceb); // Sky
 
 // ---- 调色板（运行时生效的颜色集合）----
 
-/// 一套完整的 UI 调色板。五套预设（Mocha/Frappé/Macchiato/HighContrast/NoColor）各产出一个。
+/// 一套完整的 UI 调色板。六套预设（Nyx/Mocha/Frappé/Macchiato/HighContrast/NoColor）各产出一个。
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub text: Color,
@@ -78,7 +78,38 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// Catppuccin Mocha（默认，已修复 A11y 对比度）。
+    /// Nyx 产品默认调色板（violet 单信号色 ramp）。
+    /// 与 GUI (client-ui theme.rs `Palette::dark()`) 同一套 hex，两端读作同一产品。
+    /// ramp（tmp/ui_refactor/contract.md §1）：
+    ///   bg #0D0E12 · panel #14161B · elev #1B1E26 · rowhov #1F2330 · rowsel #2E2849
+    ///   border #262A35 · input_b #3A3F4C · primary #E2E4EA · second #9BA0AE
+    ///   muted #6B707E · accent #8B7CF6 · acchov #A395FF · success #3FB68B
+    ///   danger #E5534B · warn #D9A036 · info #5EB1EF
+    /// 槽位映射：rowhov/rowsel/input_b 是 GUI 专用 token，TUI 无对应槽位；
+    /// 唯一饱和信号色 = violet（accent #8B7CF6），acchov 仅用于 hover/选中底。
+    fn nyx() -> Self {
+        Self {
+            text: rgb(0xE2E4EA),       // primary
+            muted: rgb(0x9BA0AE),      // second
+            faint: rgb(0x6B707E),      // muted
+            surface: rgb(0x14161B),    // panel
+            surface1: rgb(0x1B1E26),   // elev（tab 高亮 / 卡片 / toast 底）
+            surface2: rgb(0x262A35),   // border（非焦点边框）
+            base: rgb(0x0D0E12),       // bg（最深背景）
+            header: rgb(0x14161B),     // panel（状态栏底）
+            accent: rgb(0x8B7CF6),     // violet——唯一饱和信号色
+            accent_dim: rgb(0xA395FF), // acchov（选中底 / hover 边框 / 图标）
+            success: rgb(0x3FB68B),
+            warn: rgb(0xD9A036),
+            danger: rgb(0xE5534B),
+            mauve: rgb(0x8B7CF6),      // 单信号色规则：计数/标记复用 violet
+            teal: rgb(0x5EB1EF),       // info（次级信息着色）
+            peach: rgb(0xD9A036),      // warn 家族（数字/次级警告）
+            sky: rgb(0x5EB1EF),        // info（次级信息着色）
+        }
+    }
+
+    /// Catppuccin Mocha（已修复 A11y 对比度；`theme = "mocha"` 显式可选）。
     fn mocha() -> Self {
         Self {
             text: TEXT,
@@ -208,7 +239,7 @@ impl Palette {
 static CURRENT: OnceLock<RwLock<Palette>> = OnceLock::new();
 
 /// 在 TUI 启动时调用一次，选定初始调色板（从配置文件 + NO_COLOR 环境变量）。
-/// 选择优先级：`NO_COLOR` 环境变量 > `name` 参数 > 默认 Mocha。
+/// 选择优先级：`NO_COLOR` 环境变量 > `name` 参数 > 默认 Nyx（violet）。
 pub fn init(name: &str) {
     let palette = palette_for_name(name);
     // OnceLock::get_or_init 只首次生效；RwLock 内部值可被 switch 热改。
@@ -240,21 +271,23 @@ fn palette_for_name(name: &str) -> Palette {
         return Palette::no_color();
     }
     match name.to_ascii_lowercase().as_str() {
+        "mocha" => Palette::mocha(),
         "frappe" => Palette::frappe(),
         "macchiato" => Palette::macchiato(),
         "highcontrast" | "hc" => Palette::high_contrast(),
         "nocolor" => Palette::no_color(),
-        _ => Palette::mocha(),
+        // "nyx"、空串（无配置）、未知名一律回退 Nyx 默认。
+        _ => Palette::nyx(),
     }
 }
 
-/// 取当前生效调色板。若 `init` 未调用，惰性返回 Mocha 默认。
+/// 取当前生效调色板。若 `init` 未调用，惰性返回 Nyx 默认。
 fn current() -> Palette {
     // Copy 语义：读出 owned 值，避免持锁渲染。
     CURRENT
         .get()
         .and_then(|l| l.read().ok().map(|g| *g))
-        .unwrap_or_else(Palette::mocha)
+        .unwrap_or_else(Palette::nyx)
 }
 
 // ---- 颜色访问器（render 代码用这些，不直接读 const）----
@@ -472,6 +505,22 @@ mod tests {
     }
 
     #[test]
+    fn nyx_palette_uses_contract_hex_values() {
+        // 关键锚点 hex（contract.md §1 ramp）：回归保护，防止手抄错。
+        let p = Palette::nyx();
+        assert_eq!(p.text, rgb(0xE2E4EA)); // primary
+        assert_eq!(p.base, rgb(0x0D0E12)); // bg
+        assert_eq!(p.surface, rgb(0x14161B)); // panel
+        assert_eq!(p.accent, rgb(0x8B7CF6)); // violet——唯一信号色
+        assert_eq!(p.success, rgb(0x3FB68B));
+        assert_eq!(p.danger, rgb(0xE5534B));
+        assert_eq!(p.warn, rgb(0xD9A036));
+        // 与 Catppuccin 深色三套互不相同（防复制粘贴漏改）。
+        assert_ne!(p.accent, Palette::mocha().accent);
+        assert_ne!(p.base, Palette::mocha().base);
+    }
+
+    #[test]
     fn palette_for_name_resolves_new_flavors() {
         // switch/init 走 palette_for_name；直接测它避免全局 OnceLock 污染。
         assert!(matches!(palette_for_name("frappe").accent, Color::Rgb(..)));
@@ -479,9 +528,13 @@ mod tests {
             palette_for_name("Macchiato").accent,
             Color::Rgb(..)
         ));
-        // 大小写不敏感 + 未知名回退 Mocha。
+        // 大小写不敏感 + 未知名/空串回退 Nyx（无配置默认）。
         assert_eq!(palette_for_name("FRAPPE").text, Palette::frappe().text);
-        assert_eq!(palette_for_name("nonsense").base, Palette::mocha().base);
+        assert_eq!(palette_for_name("nonsense").base, Palette::nyx().base);
+        assert_eq!(palette_for_name("").accent, Palette::nyx().accent);
+        // "mocha" 显式可选，行为不变。
+        assert_eq!(palette_for_name("mocha").accent, Palette::mocha().accent);
+        assert_eq!(palette_for_name("nyx").accent, rgb(0x8B7CF6));
     }
 
     #[test]

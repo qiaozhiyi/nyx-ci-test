@@ -16,7 +16,7 @@
 | **团队服务器** | tokio/axum HTTP(S);三机制鉴权(bootstrap operator / operators file / legacy token);三角色 RBAC;会话/任务队列;SQLite 凭据+implant 库;哈希链审计;Rhai 事件脚本;Malleable C2 profile;implant 生成 | ✅ 完整 |
 | **Windows PIC 植入体** | 30,848 LOC `no_std` DLL;27 Command;间接 syscall;Fluctuation 睡眠混淆;HWBP patchless blind;CFG 用户态 bitmap;LACUNA/insomniac/caller-spoof/proxy-veh scanner;Pool Party(投递半)+ Module Stomping + ThreadlessInject | ✅ 核心;见已知限制 |
 | **内核层 SDK** | BYOVD(Shield/RTCore64/Iqvw64e 可用,WDTKernel loud-error);ETW-TI blind;DKOM 进程隐藏;回调中和;MiniFilter 解链;PatchGuard 窗口(2 real);PPL stripper;CFG bypass;LSASS dump;minidump 组装 | ✅ 算法完整;见已知限制 |
-| **操作端** | ratatui TUI(64 命令,零 stub)+ Makepad GUI(TUI 子集);REST API;SOCKS5 relay | ✅ TUI 完整;GUI 缺 kernel/implant-gen 端点 |
+| **操作端** | ratatui TUI(64 命令,零 stub)+ Makepad GUI(console 命令层全接入);REST API;SOCKS5 relay | ✅ TUI 完整;GUI 已接入全部 server 端点(2026-07-16 e2e 验证) |
 | **脚本 / 扩展** | Rhai 脚本(3 event);Malleable C2 profile(c2lint);BOF(CS ABI,W^X loader) | ✅ |
 
 ---
@@ -199,7 +199,7 @@ curl -X POST http://127.0.0.1:8443/api/generate-implant \
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `NYX_BIND` | `127.0.0.1:8443` | 监听地址 |
-| `NYX_KEYFILE` | —(每次随机) | 持久 X25519 私钥(0600)。**仅密钥持久化,session 不持久化** |
+| `NYX_KEYFILE` | —(每次随机) | 持久 X25519 私钥(0600)。session 元数据经 SQLite 持久化层落盘(`NYX_CREDS` 库,boot 恢复,见 `server/src/lib.rs:201`) |
 | `NYX_TOKEN` | — | legacy 共享 Bearer(Admin);优先级低于 operators file |
 | `NYX_BOOTSTRAP_OPERATOR` | — | `name:secret` 首个 Admin(argon2 哈希) |
 | `NYX_OPERATORS_FILE` | `~/.nyx/operators.json` | 操作员注册表 |
@@ -439,10 +439,10 @@ cargo clippy --workspace -- -D warnings
 | **指纹 emitter** | 🔴死代码 | 出站 JA3 不可控;`rquest` feature 空占位 |
 | **fallback 链** | 🟡stub | 只有 `[Channel::Https]` 一个元素,`next_fallback` 永返 None |
 | **C2 通道多样性** | 🟡需理解 | implant-win dispatcher 9 个,但 4 个 ExtC2(Slack/LLM/MCP/Discord)是 server 中转 `post_frame`,非直连第三方协议;DoH/DNS 是 URI 伪装 |
-| **GUI 功能覆盖** | 🟡TUI 子集 | GUI 缺 kernel 端点/implant 生成/trex/channel 切换/keylog stream/SOCKS relay |
+| **GUI 功能覆盖** | ✅全接入 | GUI console 命令层已接入全部 server 端点(kernel×6 / generate / implants / revoke / trex / channel×9 / keylog stream / socks / creds / audit);与 TUI 差异仅剩会话元数据 overlay(rename/tag/star/alias,客户端本地功能)。2026-07-16 本机 e2e 全过 |
 | **`rest` crate** | 🟡半真相源 | server 不依赖它(自定义 view struct),只有两个 client 用;drift 靠人工约定 |
 | **Win11 25H2 真机** | 🟡暂缓 | 需 CET+HVCI 物理机 |
-| **sessions 持久化** | 🔴不持久化 | in-memory DashMap,重启丢失(仅密钥持久化) |
+| **sessions 持久化** | ✅持久化 | SQLite durability layer(`lib.rs:201`),boot 恢复;2026-07-16 实测重启 server 会话同 id 复原 |
 | **SQLite migration** | 🔴无 | 仅 `CREATE TABLE IF NOT EXISTS` |
 
 完整审计(含 25 条文档偏差表 + 19 条活跃缺陷):[`docs/audits/CODE_TRUTH_2026-07-15.md`](docs/audits/CODE_TRUTH_2026-07-15.md)
@@ -469,7 +469,7 @@ cargo clippy --workspace -- -D warnings
 - **SPOOF_SWAP 完成** — CET `#CP` 修复缝(`KiControlProtectionFault` + `RtlRestoreContext`)+ 伪造栈执行
 - **CET 物理机验证** — Win11 25H2 CET+HVCI 真机
 - **nyx-loader 反射加载** — PEB walk / import resolve / DllMain
-- **GUI 功能对齐** — kernel 端点 / implant 生成 / channel 切换
+- **GUI 会话元数据 overlay** — rename / tag / star / alias(TUI 有,GUI 无;客户端本地功能)
 - **transport/ crate 接线** — 让 beacon 走 `TransportStack` 而非自滚 WinHTTP
 
 ---

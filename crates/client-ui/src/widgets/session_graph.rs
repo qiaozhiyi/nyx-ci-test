@@ -27,12 +27,17 @@ impl Widget for SessionGraph {
         }
         let sessions = crate::SESSIONS.read().unwrap_or_else(|e| e.into_inner());
         while self.list.draw_walk(cx, scope, walk).is_step() {
+            // `Walk::abs_pos` is absolute in pass coordinates (see PortalList),
+            // so anchor all graph content to the list's scrolled viewport origin.
+            let origin = cx.turtle().inner_rect().pos;
+
             let ts_x = 20.0;
             let ts_y = 60.0;
             let n_width = 120.0;
             let n_height = 90.0;
             let h_gap = 40.0;
-            let v_gap = 10.0;
+            // Spacing scale (4/8/12/16/20/24): 10 → 12.
+            let v_gap = 12.0;
 
             let p = crate::theme::Palette::current();
 
@@ -54,8 +59,8 @@ impl Widget for SessionGraph {
                     cx,
                     scope,
                     Walk {
-                        abs_pos: Some(dvec2(ts_x as f64, ts_y as f64) * self.zoom + self.pan),
-                        width: Size::Fixed(n_width as f64 * self.zoom),
+                        abs_pos: Some(origin + dvec2(ts_x, ts_y as f64) * self.zoom + self.pan),
+                        width: Size::Fixed(n_width * self.zoom),
                         height: Size::Fixed(n_height as f64 * self.zoom),
                         ..Walk::default()
                     },
@@ -80,10 +85,11 @@ impl Widget for SessionGraph {
                         scope,
                         Walk {
                             abs_pos: Some(
-                                dvec2((ts_x + n_width + 20.0) as f64, line_y as f64) * self.zoom
+                                origin
+                                    + dvec2(ts_x + n_width + 20.0, line_y as f64) * self.zoom
                                     + self.pan,
                             ),
-                            width: Size::Fixed((h_gap - 20.0) as f64 * self.zoom),
+                            width: Size::Fixed((h_gap - 20.0) * self.zoom),
                             height: Size::Fixed((2.0 * self.zoom).max(1.0)),
                             ..Walk::default()
                         },
@@ -125,8 +131,8 @@ impl Widget for SessionGraph {
                         cx,
                         scope,
                         Walk {
-                            abs_pos: Some(dvec2(sx as f64, sy as f64) * self.zoom + self.pan),
-                            width: Size::Fixed(n_width as f64 * self.zoom),
+                            abs_pos: Some(origin + dvec2(sx, sy as f64) * self.zoom + self.pan),
+                            width: Size::Fixed(n_width * self.zoom),
                             height: Size::Fixed(n_height as f64 * self.zoom),
                             ..Walk::default()
                         },
@@ -149,7 +155,8 @@ impl Widget for SessionGraph {
                             scope,
                             Walk {
                                 abs_pos: Some(
-                                    dvec2((ts_x + n_width) as f64, ts_mid_y as f64) * self.zoom
+                                    origin
+                                        + dvec2(ts_x + n_width, ts_mid_y as f64) * self.zoom
                                         + self.pan,
                                 ),
                                 width: Size::Fixed(20.0 * self.zoom),
@@ -168,7 +175,9 @@ impl Widget for SessionGraph {
                             scope,
                             Walk {
                                 abs_pos: Some(
-                                    dvec2((ts_x + n_width + 20.0) as f64, min_y as f64) * self.zoom
+                                    origin
+                                        + dvec2(ts_x + n_width + 20.0, min_y as f64)
+                                            * self.zoom
                                         + self.pan,
                                 ),
                                 width: Size::Fixed((2.0 * self.zoom).max(1.0)),

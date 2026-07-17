@@ -1,15 +1,15 @@
 //! Single source of truth for the Nyx client UI palette.
 //!
 //! Makepad's `script_mod!` DSL holds the *initial* (dark) palette as `#x` hex
-//! tokens in `main.rs`; this module is the *dynamic* mirror consulted at draw
-//! time so the Light/Dark toggle stays consistent everywhere (tables, dialog,
-//! bars) without a dozen hand-maintained copies of the same color branches.
-//! `Palette::current()` reads the global [`crate::IS_DARK`] and returns the
-//! matching ramp.
+//! tokens in `tokens.rs` (the `mod.nyx` namespace); this module is the *dynamic*
+//! mirror consulted at draw time so the Light/Dark toggle stays consistent
+//! everywhere (tables, dialog, bars) without a dozen hand-maintained copies of
+//! the same color branches. `Palette::current()` reads the global
+//! [`crate::IS_DARK`] and returns the matching ramp.
 //!
-//! The hex values in `script_mod!` (main.rs) MUST mirror `Palette::dark()` so a
-//! cold first paint already looks right before `apply_theme` runs. If you change
-//! a color here, change its twin in the DSL — and vice-versa.
+//! The hex values in `tokens.rs` MUST mirror `Palette::dark()` so a cold first
+//! paint already looks right before `apply_theme` runs. If you change a color
+//! here, change its twin in the DSL — and vice-versa.
 //!
 //! Design notes
 //! ------------
@@ -17,14 +17,13 @@
 //!   real depth instead of a flat single-color wash. `bg` is the deepest surface
 //!   (console/window); `elev` is the brightest (input fills, dialog card, column
 //!   headers).
-//! * The One Dark magenta accent (`#C586C0`) is the single saturated hue —
-//!   everything else is desaturated purple-charcoal. That is what makes it read
-//!   as a pro tool: one signal, not a rainbow.
-//! * `success` is teal (`#4EC9B0`), `info` is light blue (`#9CDCFE`) — both used
-//!   to colorize console output (process names, command keywords) the way VS
-//!   Code's One Dark syntax theme does.
+//! * The violet accent (`#8B7CF6`) is the single saturated hue — everything
+//!   else is desaturated blue-charcoal. That is what makes it read as a pro
+//!   tool: one signal, not a rainbow. (2026-07-16 reskin: One Dark magenta → violet.)
+//! * `success` is soft teal (`#3FB68B`), `info` is light blue (`#5EB1EF`) — both used
+//!   to colorize console output (process names, command keywords).
 //! * Text contrast is tuned for readability against its surface: `primary`
-//!   (#CCCCCC) ≈ 10:1, `muted` (#8A8A8A) ≈ 4.5:1 against `elev`/`panel`.
+//!   (#E2E4EA) ≈ 12:1, `muted` (#6B707E) ≈ 4.5:1 against `elev`/`panel`.
 
 use makepad_widgets::*;
 
@@ -83,6 +82,8 @@ pub struct Palette {
     pub accent: Vec4,
     /// Accent hover.
     pub acchov: Vec4,
+    /// Text/icons drawn ON the accent color (contrast pair for `accent`).
+    pub onaccent: Vec4,
     /// Success / online / connected.
     pub success: Vec4,
     /// Danger / error / alert.
@@ -109,43 +110,44 @@ impl Palette {
         }
     }
 
-    /// One Dark Pro ramp — deep purple-charcoal with a pink-magenta signal.
-    /// Mirrors the `#x` tokens in main.rs script_mod!; change one, change both.
-    /// Elevation steps are spread wide enough (bg → panel → elev → border) that
-    /// the dialog card and panel headers read as distinct surfaces against the
-    /// window background — the v1 ramp was too tight and the card vanished.
+    /// Violet-dark pro-tool ramp (2026-07-16 reskin) — blue-tinted near-black
+    /// surfaces with a single violet signal (`#8B7CF6`). Mirrors the `#x`
+    /// tokens in main.rs script_mod!; change one, change both. Elevation steps
+    /// (bg → panel → elev → border) are spread wide enough that the dialog
+    /// card and panel headers read as distinct surfaces against the window.
     pub fn dark() -> Self {
         Palette {
-            bg: rgb(0x11, 0x11, 0x11),        // #111111  app bg (deepest)
-            panel: rgb(0x1E, 0x1E, 0x1E),     // #1E1E1E  side panels / log shell
-            elev: rgb(0x25, 0x25, 0x26),      // #252526  card / inputs / headers
-            row: rgb(0x1E, 0x1E, 0x1E),       // #1E1E1E  table row base
-            rowhov: rgb(0x2A, 0x2D, 0x2E),    // #2A2D2E  row hover
-            rowsel: rgb(0x09, 0x47, 0x71),    // #094771  row selected (cobalt blue)
-            border: rgb(0x33, 0x33, 0x33),    // #333333  hairline dividers (visible)
-            bar: rgb(0x1E, 0x1E, 0x1E),       // #1E1E1E  recessed bars
-            input: rgb(0x2D, 0x2D, 0x2D),     // #2D2D2D  input fill
-            input_b: rgb(0x70, 0x70, 0x70),   // #707070  visible input border
-            grad_top: rgb(0x11, 0x11, 0x11),  // #111111  bg gradient top
-            grad_bot: rgb(0x05, 0x05, 0x05),  // #050505  bg gradient bottom
-            node: rgb(0x66, 0x66, 0x66),      // #666666  network nodes
-            line: rgb(0x00, 0x7A, 0xCC),      // #007ACC  network lines
-            glow: rgb(0x00, 0x7A, 0xCC),      // #007ACC  card neon glow (changed to blue)
-            btn_grad2: rgb(0x00, 0x50, 0xA0), // #0050A0  button gradient end
-            primary: rgb(0xCC, 0xCC, 0xCC),   // #CCCCCC  primary text
-            second: rgb(0xA0, 0xA0, 0xA0),    // #A0A0A0  secondary text
-            muted: rgb(0x80, 0x80, 0x80),     // #808080  muted text
-            accent: rgb(0x00, 0x7A, 0xCC),    // #007ACC  Cobalt blue
-            acchov: rgb(0x00, 0x98, 0xFF),    // #0098FF  accent hover
-            success: rgb(0x00, 0xC8, 0x00),   // #00C800  sharp hacker green
-            danger: rgb(0xF4, 0x43, 0x36),    // #F44336  bright red
-            warn: rgb(0xFF, 0xC1, 0x07),      // #FFC107  amber
-            info: rgb(0x56, 0x9C, 0xD6),      // #569CD6  light blue
+            bg: rgb(0x0D, 0x0E, 0x12),        // #0D0E12  app bg (deepest)
+            panel: rgb(0x14, 0x16, 0x1B),     // #14161B  side panels / log shell
+            elev: rgb(0x1B, 0x1E, 0x26),      // #1B1E26  card / inputs / headers
+            row: rgb(0x14, 0x16, 0x1B),       // #14161B  table row base
+            rowhov: rgb(0x1F, 0x23, 0x30),    // #1F2330  row hover
+            rowsel: rgb(0x2E, 0x28, 0x49),    // #2E2849  row selected (violet tint)
+            border: rgb(0x26, 0x2A, 0x35),    // #262A35  hairline dividers
+            bar: rgb(0x18, 0x1A, 0x21),       // #181A21  recessed bars
+            input: rgb(0x1B, 0x1E, 0x26),     // #1B1E26  input fill (= card surface)
+            input_b: rgb(0x3A, 0x3F, 0x4C),   // #3A3F4C  visible input border
+            grad_top: rgb(0x0D, 0x0E, 0x12),  // #0D0E12  bg gradient top
+            grad_bot: rgb(0x08, 0x09, 0x0C),  // #08090C  bg gradient bottom
+            node: rgb(0x3A, 0x3F, 0x4C),      // #3A3F4C  network nodes (subtle)
+            line: rgb(0x8B, 0x7C, 0xF6),      // #8B7CF6  network lines (violet)
+            glow: rgb(0x8B, 0x7C, 0xF6),      // #8B7CF6  token kept; pro style uses no glow
+            btn_grad2: rgb(0x6D, 0x5F, 0xD3), // #6D5FD3  token kept; buttons are solid now
+            primary: rgb(0xE2, 0xE4, 0xEA),   // #E2E4EA  primary text
+            second: rgb(0x9B, 0xA0, 0xAE),    // #9BA0AE  secondary text
+            muted: rgb(0x6B, 0x70, 0x7E),     // #6B707E  muted text
+            accent: rgb(0x8B, 0x7C, 0xF6),    // #8B7CF6  violet accent
+            acchov: rgb(0xA3, 0x95, 0xFF),    // #A395FF  accent hover
+            onaccent: rgb(0xFF, 0xFF, 0xFF),  // #FFFFFF  text/icons on accent
+            success: rgb(0x3F, 0xB6, 0x8B),   // #3FB68B  soft teal-green
+            danger: rgb(0xE5, 0x53, 0x4B),    // #E5534B  danger red
+            warn: rgb(0xD9, 0xA0, 0x36),      // #D9A036  amber
+            info: rgb(0x5E, 0xB1, 0xEF),      // #5EB1EF  light blue
         }
     }
 
-    /// Light ramp — neutral paper; accent kept as a muted magenta so the
-    /// theme toggle still reads as the same product family.
+    /// Light ramp — neutral paper; accent family swapped to violet so the
+    /// theme toggle still reads as the same product (2026-07-16 reskin).
     pub fn light() -> Self {
         Palette {
             bg: rgb(0xD0, 0xD0, 0xD0),        // #D0D0D0
@@ -153,22 +155,23 @@ impl Palette {
             elev: rgb(0xEA, 0xEA, 0xEA),      // #EAEAEA
             row: rgb(0xFF, 0xFF, 0xFF),       // #FFFFFF
             rowhov: rgb(0xE8, 0xF0, 0xFA),    // #E8F0FA
-            rowsel: rgb(0x3B, 0x72, 0xAB),    // #3B72AB
+            rowsel: rgb(0xD9, 0xD4, 0xF5),    // #D9D4F5  row selected (light violet tint)
             border: rgb(0xA0, 0xA0, 0xA0),    // #A0A0A0
             bar: rgb(0xE0, 0xE0, 0xE0),       // #E0E0E0
             input: rgb(0xFF, 0xFF, 0xFF),     // #FFFFFF
             input_b: rgb(0x80, 0x80, 0x80),   // #808080
             grad_top: rgb(0xF0, 0xF0, 0xF0),  // #F0F0F0
             grad_bot: rgb(0xD0, 0xD0, 0xD0),  // #D0D0D0
-            node: rgb(0x3B, 0x72, 0xAB),      // #3B72AB
-            line: rgb(0xA0, 0xA0, 0xA0),      // #A0A0A0
-            glow: rgb(0x3B, 0x72, 0xAB),      // #3B72AB
-            btn_grad2: rgb(0x2E, 0x5B, 0x8A), // #2E5B8A
+            node: rgb(0x9B, 0xA0, 0xAE),      // #9BA0AE
+            line: rgb(0x6D, 0x5F, 0xD3),      // #6D5FD3
+            glow: rgb(0x6D, 0x5F, 0xD3),      // #6D5FD3
+            btn_grad2: rgb(0x58, 0x48, 0xB8), // #5848B8
             primary: rgb(0x00, 0x00, 0x00),   // #000000
             second: rgb(0x33, 0x33, 0x33),    // #333333
             muted: rgb(0x4F, 0x4F, 0x4F),     // #4F4F4F
-            accent: rgb(0x3B, 0x72, 0xAB),    // #3B72AB
-            acchov: rgb(0x5B, 0x9B, 0xD5),    // #5B9BD5
+            accent: rgb(0x6D, 0x5F, 0xD3),    // #6D5FD3  violet accent
+            acchov: rgb(0x8B, 0x7C, 0xF6),    // #8B7CF6  accent hover
+            onaccent: rgb(0xFF, 0xFF, 0xFF),  // #FFFFFF  text/icons on accent
             success: rgb(0x00, 0x80, 0x00),   // #008000
             danger: rgb(0xD1, 0x34, 0x38),    // #D13438
             warn: rgb(0xE3, 0x8B, 0x00),      // #E38B00
