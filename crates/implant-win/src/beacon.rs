@@ -325,7 +325,9 @@ pub unsafe fn beacon_oneshot() -> u32 {
     // queue one via POST /api/task) ----
     let mut got_task = false;
     for _ in 0..6 {
+        crate::entry::diag_mark(b"b7a_before_sleep");
         sleep_jitter(2, 0);
+        crate::entry::diag_mark(b"b7b_after_sleep");
         // POST empty batch, receive any queued tasks.
         let frame = encode_frame(
             &pubkey,

