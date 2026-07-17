@@ -16,7 +16,7 @@
 | **团队服务器** | tokio/axum HTTP(S);三机制鉴权(bootstrap operator / operators file / legacy token);三角色 RBAC;会话/任务队列;SQLite 凭据+implant 库;哈希链审计;Rhai 事件脚本;Malleable C2 profile;implant 生成 | ✅ 完整 |
 | **Windows PIC 植入体** | 30,848 LOC `no_std` DLL;27 Command;间接 syscall;Fluctuation 睡眠混淆;HWBP patchless blind;CFG 用户态 bitmap;LACUNA/insomniac/caller-spoof/proxy-veh scanner;Pool Party(投递半)+ Module Stomping + ThreadlessInject | ✅ 核心;见已知限制 |
 | **内核层 SDK** | BYOVD(Shield/RTCore64/Iqvw64e 可用,WDTKernel loud-error);ETW-TI blind;DKOM 进程隐藏;回调中和;MiniFilter 解链;PatchGuard 窗口(2 real);PPL stripper;CFG bypass;LSASS dump;minidump 组装 | ✅ 算法完整;见已知限制 |
-| **操作端** | ratatui TUI(64 命令,零 stub)+ Makepad GUI(console 命令层全接入);REST API;SOCKS5 relay | ✅ TUI 完整;GUI 已接入全部 server 端点(2026-07-16 e2e 验证) |
+| **操作端** | Tauri 2 + React 桌面 GUI(3D 网络拓扑 + 语义化命令 + 结构化输出);REST API;SOCKS5 relay | 🔨 重写中(2026-07-17,替代旧 ratatui TUI + Makepad GUI) |
 | **脚本 / 扩展** | Rhai 脚本(3 event);Malleable C2 profile(c2lint);BOF(CS ABI,W^X loader) | ✅ |
 
 ---
@@ -56,8 +56,7 @@ crates/
 ├── offset-resolver/       # ntoskrnl PDB 下载 + 偏移解析
 ├── minidump-assembler/    # LSASS 裸内存 → mimikatz .dmp
 │
-├── client-cli/            # 操作员 TUI (ratatui, 13,813 LOC, 64 命令)
-├── client-ui/             # 桌面 GUI (Makepad, 6,337 LOC)
+├── client-ui-web/         # 操作端 GUI (Tauri 2 + React + Three.js,3D 拓扑 + 语义化命令)
 │
 ├── agent-dev/             # macOS/Linux 开发验证植入体 (完整协议循环)
 ├── bof-runner/            # BOF 加载器 (CS ABI)
@@ -158,24 +157,16 @@ cargo +nightly build --release -p nyx-implant-win \
 > - `NYX_POOL_PARTY_ON=1` — 开启 Pool Party 注入(默认 OFF,仅投递半)
 > - `NYX_SKIP_SANDBOX=1` — 跳过沙箱检测(SYSTEM 部署时)
 
-### 4. 启动 TUI 客户端
+### 4. 启动操作端 GUI (Tauri 2 + React)
 
 ```bash
-cargo run --release -p nyx-cli -- --server http://127.0.0.1:8443
-
-# 带鉴权
-cargo run --release -p nyx-cli -- \
-  --server https://your-server:8443 --token your_secret
+cd crates/client-ui-web
+npm install          # 首次：装前端依赖
+npm run tauri dev    # 启动（自动连 http://127.0.0.1:8443，在连接页输入 bearer）
 ```
 
-### 5. 启动 GUI 客户端
-
-```bash
-cargo build --profile gui -p nyx-client-ui
-./target/gui/nyx-client-ui
-```
-
-> GUI 必须用 `--profile gui`(opt-level 3 + 无 LTO)。release profile 会在 macOS Metal 初始化时 SIGSEGV。
+> GUI 含 3D 网络拓扑（Three.js，节点带官方 OS 图标）、语义化命令输入、结构化任务输出。
+> 纯前端开发（不启动 Tauri 外壳）：`npm run dev`。
 
 ### 6. 服务器侧生成 implant
 

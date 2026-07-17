@@ -1,0 +1,120 @@
+/* CommandInput — semantic command entry. Overlay-colored tokens over a
+   transparent input. Focus ring is the accent purple glow. */
+
+.cmdinput {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.cmdinput__wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  background: var(--elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg); /* 7px */
+  padding: var(--sp-3) var(--sp-4);
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+  cursor: text;
+  /* keep the wrap from collapsing; input + overlay both flex */
+  min-height: 38px;
+}
+
+.cmdinput__wrap:focus-within {
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 3px rgba(124, 92, 255, 0.18);
+}
+
+/* unknown command: red wavy underline cue on the border */
+.cmdinput__wrap--unknown:focus-within {
+  border-color: rgba(248, 113, 113, 0.5);
+  box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.14);
+}
+/* OPSEC trip: keep the accent focus ring but tint the resting border amber */
+.cmdinput__wrap--opsec {
+  border-color: rgba(217, 160, 54, 0.4);
+}
+
+.cmdinput__prompt {
+  color: var(--accent);
+  font-weight: 600;
+  user-select: none;
+  flex: 0 0 auto;
+}
+
+/* overlay + input share the same line box so tokens line up exactly */
+.cmdinput__overlay {
+  position: relative;
+  flex: 1 1 auto;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.4;
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+.cmdinput__placeholder {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.cmdinput__tok {
+  /* inline with a trailing space recreated by layout via whitespace pre above */
+}
+.cmdinput__tok--cmd {
+  color: var(--accent-hov);
+  font-weight: 600;
+}
+.cmdinput__tok--bad {
+  color: var(--danger);
+  text-decoration: underline wavy;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.cmdinput__tok--arg {
+  color: var(--text);
+}
+
+/* the real input: transparent text, same metrics as the overlay */
+.cmdinput__input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: transparent;
+  caret-color: var(--accent-hov);
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 0 var(--sp-4) 0 calc(var(--sp-4) + 14px); /* leave room for "$ " */
+  /* selection highlight stays visible even though text is transparent */
+  z-index: 1;
+}
+.cmdinput__input::selection {
+  background: rgba(124, 92, 255, 0.3);
+}
+
+/* ---- hints below the input ---- */
+.cmdinput__hints {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 16px;
+  padding: 0 var(--sp-2);
+}
+.cmdinput__hint {
+  font-size: 11px;
+  line-height: 1.4;
+}
+.cmdinput__hint--err {
+  color: var(--danger);
+}
+.cmdinput__hint--opsec {
+  color: var(--warn);
+}

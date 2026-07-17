@@ -1,0 +1,125 @@
+/* CommandConsole — active session workspace: header + task flow + input. */
+
+.console {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0; /* allow children to scroll within a flex column */
+  background: var(--panel);
+}
+
+/* ---- header ---- */
+.console__head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.console__ident {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.console__host {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+
+.console__user {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* permission + OS pills reuse the pill base from TaskBlock.css */
+.pill--perm {
+  font-size: 10px;
+  padding: 2px 7px;
+  background: rgba(82, 88, 102, 0.18);
+  color: var(--text-second);
+  border: 1px solid var(--border);
+}
+.pill--perm-admin {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-color: rgba(248, 113, 113, 0.35);
+}
+.pill--os {
+  font-size: 10px;
+  padding: 2px 7px;
+  background: var(--info-bg);
+  color: var(--info);
+  border: 1px solid rgba(96, 165, 250, 0.3);
+}
+
+/* right-aligned metadata: pending queue / arch / pid */
+.console__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.console__pending {
+  color: var(--warn);
+}
+.console__arch {
+  color: var(--text-second);
+}
+
+/* ---- task flow (scrolls) ---- */
+.console__flow {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.console__empty {
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-2);
+  text-align: center;
+  color: var(--text-muted);
+  padding: var(--sp-7) var(--sp-5);
+}
+.console__empty-title {
+  color: var(--text-second);
+  font-size: 14px;
+  font-weight: 600;
+}
+.console__empty-hint {
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.console__empty-async {
+  font-size: 11px;
+  color: var(--text-faint);
+  max-width: 420px;
+}
+
+/* ---- input (fixed at the bottom of the console) ---- */
+.console__input {
+  flex: 0 0 auto;
+  padding: var(--sp-3) var(--sp-5) var(--sp-4);
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}

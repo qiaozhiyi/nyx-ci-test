@@ -1,0 +1,178 @@
+.session-table {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  min-width: 0;
+}
+
+.st-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: var(--sp-4) var(--sp-5) var(--sp-2);
+}
+
+.st-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.st-count {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.st-filters {
+  display: flex;
+  gap: var(--sp-1);
+  padding: 0 var(--sp-5) var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.st-chip {
+  height: 22px;
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-second);
+  border-radius: var(--r-pill);
+  font-size: 11px;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.st-chip:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.st-chip.on {
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+  color: var(--accent-hov);
+}
+
+.st-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 var(--sp-3) var(--sp-4);
+}
+
+.st-row {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-left: 2px solid transparent;
+  padding: var(--sp-2) var(--sp-3);
+  margin-bottom: 1px;
+  border-radius: var(--r-md);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  transition: background 0.1s ease;
+}
+
+.st-row:hover {
+  background: var(--hover);
+}
+
+.st-row.active {
+  background: var(--accent-bg);
+  border-left: 2px solid var(--accent);
+}
+
+.st-row-top {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.st-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  flex-shrink: 0;
+  box-shadow: 0 0 6px rgba(63, 182, 139, 0.5);
+}
+
+.st-dot.stale {
+  background: var(--text-muted);
+  box-shadow: none;
+}
+
+.st-host {
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.st-tag {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: var(--r-sm);
+  flex-shrink: 0;
+  text-transform: uppercase;
+}
+
+.tag-admin {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.tag-da {
+  background: var(--accent-bg);
+  color: var(--accent-hov);
+}
+
+.tag-user {
+  background: var(--hover);
+  color: var(--text-muted);
+}
+
+/* Align second line under the hostname (dot 7px + gap 8px = 15px). */
+.st-row-bot {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: 11px;
+  color: var(--text-second);
+  padding-left: 15px;
+  flex-wrap: wrap;
+}
+
+.st-sep {
+  color: var(--text-faint);
+}
+
+.st-stale {
+  color: var(--warn);
+  margin-left: var(--sp-1);
+}
+
+.st-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: var(--sp-7) var(--sp-5);
+  color: var(--text-second);
+  font-size: 12px;
+  gap: var(--sp-1);
+}
+
+.st-empty-sub {
+  color: var(--text-muted);
+  font-size: 11px;
+}

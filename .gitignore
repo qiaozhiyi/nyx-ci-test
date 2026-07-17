@@ -22,3 +22,5 @@ target/drivers/
 .zcode/
 # downloaded artifacts during testing — never commit
 downloads/
+crates/client-ui-web/node_modules/
+crates/client-ui-web/dist/

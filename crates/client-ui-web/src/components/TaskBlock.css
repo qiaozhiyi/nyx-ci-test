@@ -1,0 +1,140 @@
+/* TaskBlock — single command lifecycle card in the console task flow. */
+
+.taskblock {
+  background: var(--elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg); /* 7px */
+  padding: var(--sp-3) var(--sp-5);
+  transition: border-color 160ms ease;
+}
+
+/* processing tasks get the warn-colored border to draw the eye to in-flight work */
+.taskblock--processing {
+  border-color: var(--warn-border, rgba(217, 160, 54, 0.45));
+}
+.taskblock--error {
+  border-color: rgba(248, 113, 113, 0.4);
+}
+
+.taskblock__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 22px;
+}
+
+.taskblock__id {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.taskblock__cmd {
+  color: var(--accent-hov);
+  font-weight: 600;
+  font-size: 12.5px;
+  flex: 1 1 auto;
+  /* long shell commands shouldn't blow out the layout */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.taskblock__opsec {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  border-radius: var(--r-pill);
+  padding: 1px 7px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* status pill sits at the right edge of the header */
+.taskblock__status {
+  margin-left: auto;
+}
+
+.taskblock__async {
+  margin-top: var(--sp-2);
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.taskblock__body {
+  margin-top: var(--sp-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+/* ---- status pills ---- */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: var(--r-pill);
+  padding: 2px 8px;
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.pill--queued {
+  background: rgba(82, 88, 102, 0.18);
+  color: var(--text-second);
+  border: 1px solid var(--border);
+}
+.pill--processing {
+  background: var(--warn-bg);
+  color: var(--warn);
+  border: 1px solid rgba(217, 160, 54, 0.35);
+}
+.pill--completed {
+  background: var(--success-bg);
+  color: var(--success);
+  border: 1px solid rgba(63, 182, 139, 0.3);
+}
+.pill--error {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border: 1px solid rgba(248, 113, 113, 0.35);
+}
+
+/* ---- result renderers ---- */
+.result {
+  font-size: 12px;
+  line-height: 1.55;
+  margin: 0;
+}
+.result--text {
+  color: var(--text-second);
+  background: var(--bg);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--r-md);
+  padding: var(--sp-2) var(--sp-3);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+}
+.result--ok {
+  color: var(--success);
+}
+.result--error {
+  color: var(--danger);
+  background: rgba(127, 29, 29, 0.12);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+  border-radius: var(--r-md);
+  padding: var(--sp-2) var(--sp-3);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.result--file {
+  color: var(--info);
+}
+.result--todo {
+  color: var(--text-muted);
+  font-style: italic;
+}

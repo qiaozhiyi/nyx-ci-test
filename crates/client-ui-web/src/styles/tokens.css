@@ -1,0 +1,86 @@
+/**
+ * Nyx design tokens — single source of truth for all visual decisions.
+ * Mirrors the violet dark theme from docs/superpowers/specs/2026-07-17-client-ui-web-design.md.
+ * Every component MUST reference these vars, never hardcode colors.
+ */
+:root {
+  /* background ramp (Zinc-based dark) */
+  --bg: #08090c;
+  --panel: #0a0b0f;
+  --elev: #0a0c10;
+  --elev-hi: #0e1015;
+  --border: #161a22;
+  --border-dim: #101218;
+  --hover: #0d0f14;
+
+  /* text */
+  --text: #e4e4e7;
+  --text-second: #9ca3af;
+  --text-muted: #525866;
+  --text-faint: #4a4f5a;
+
+  /* accent + semantic */
+  --accent: #7c5cff;
+  --accent-hov: #a78bfa;
+  --accent-bg: rgba(124, 92, 255, 0.13);
+  --accent-border: rgba(124, 92, 255, 0.33);
+  --success: #3fb68b;
+  --success-bg: rgba(63, 182, 139, 0.1);
+  --danger: #f87171;
+  --danger-bg: rgba(127, 29, 29, 0.2);
+  --warn: #d9a036;
+  --warn-bg: rgba(217, 160, 54, 0.13);
+  --info: #60a5fa;
+  --info-bg: rgba(59, 130, 246, 0.1);
+
+  /* OS official colors (only for OS icons, not UI theme) */
+  --os-windows: #0078d4;
+  --os-win-server: #00a4ef;
+  --os-ubuntu: #e95420;
+  --os-debian: #a81d33;
+  --os-macos: #9ca3af;
+  --os-kali: #2fa8d8;
+  --os-fedora: #51a2da;
+  --os-alpine: #0d597f;
+  --os-arch: #1793d1;
+  --os-rhel: #ee0000;
+
+  /* typography */
+  --font-sans: 'Inter', -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, monospace;
+
+  /* spacing */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 14px;
+  --sp-5: 16px;
+  --sp-6: 18px;
+  --sp-7: 24px;
+
+  /* radius */
+  --r-sm: 2px;
+  --r-md: 5px;
+  --r-lg: 7px;
+  --r-xl: 11px;
+  --r-pill: 10px;
+
+  /* shadows */
+  --shadow-panel: 0 1px 0 var(--border);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button { font-family: inherit; cursor: pointer; }
+input { font-family: inherit; }
+.mono { font-family: var(--font-mono); }
