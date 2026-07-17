@@ -204,6 +204,7 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     diag_mark(b"8_lacuna");
     // ---- InsomniacUnwinding check ---------------------------------------------
     crate::insomniac::bootstrap_check();
+    diag_mark(b"9_insomniac");
 
     Some(ntdll)
 }

