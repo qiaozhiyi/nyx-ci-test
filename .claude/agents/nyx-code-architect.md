@@ -13,10 +13,10 @@ model: sonnet
 
 为任何新功能出蓝图前，先读对应区域的现有实现作为模式样本：
 
-- **新 wire 消息** → 读最近一个新增 variant（tag 22-25，`StealToken`/`MakeToken`/`Rev2Self`/`GetUid`）在四处的实现（`msg.rs` + `server/lib.rs` + 两 client），复刻这个模式。
+- **新 wire 消息** → 读最近一个新增 variant（`Inject` tag 26 / `Trex` tag 27 / `SetChannel` tag 28）在四处的实现（`msg.rs` + `server/lib.rs` + `client-ui-web/src/components/CommandInput.tsx` + `client-ui-web/src-tauri`），复刻这个模式。
 - **新 evasion 模块** → 读 `blind_hwbp.rs`（独立模块 + entry bootstrap 注册 + selftest 导出 + gate）。
 - **新 kernel 能力** → 读 `telemetry.rs::CallbackNeutralizer`（selective slot + DATA 写 + HVCI-safe + 真机验证）。
-- **新 client 命令** → 读 client-cli 的 G7 闭合改动（`Cmd` enum + handler + overlay 渲染）。
+- **新 client 命令** → 读 `client-ui-web/src/components/CommandInput.tsx` 的 case 分支（29 GUI 命令）+ Tauri invoke handler。
 
 ## 蓝图产出格式
 
@@ -28,15 +28,15 @@ model: sonnet
 
 ```rust
 // crates/protocol/src/msg.rs — 新 variant
-// tag = 26（追加，不重排）
+// tag = 29（追加，不重排；现有最大 tag=28）
 Command::NewCapability { field: u32 }  // encode/decode 对称
 
 // crates/server/src/lib.rs — JsonCommand + into_command
 struct JsonNewCapability { field: u32 }
 // into_command: JsonNewCapability → Command::NewCapability
 
-// crates/client-cli/... — Cmd::NewCapability 解析 + handler
-// crates/client-ui/src/parse.rs — 控制台命令解析
+// crates/client-ui-web/src/components/CommandInput.tsx — 新 case 分支
+// crates/client-ui-web/src-tauri/... — Tauri invoke handler
 ```
 
 ### 3. 数据流
@@ -58,12 +58,12 @@ struct JsonNewCapability { field: u32 }
 - 是否复用手写 codec（非 serde/prost）？
 - no_std 路径是否避免 std？
 - gate 是否需要（参考 STATUS §3 模式）？
-- selftest 导出是否需要（参考 48 导出模式）？
+- selftest 导出是否需要（参考 50 导出模式：49 个 `nyx_selftest_*` + 1 个 `nyx_linger*`）？
 - 失败是否显式降级（参考 nyx-silent-failure-hunter）？
 
 ## Nyx 专属蓝图约束
 
-- **新 wire tag 只追加**：当前 max=25，下一个=26。在蓝图里显式写新 tag 值。
+- **新 wire tag 只追加**：当前 max=28，下一个=29。在蓝图里显式写新 tag 值。
 - **no_std 路径零 std**：protocol 新代码不得 `use std::...`。
 - **gate 默认值**：若新功能带 gate，默认值要在蓝图里明确，并提示"需同步 STATUS.md §3"。
 - **kernel 能力**：必须 DATA 写 + HVCI-safe，不能 inline hook。

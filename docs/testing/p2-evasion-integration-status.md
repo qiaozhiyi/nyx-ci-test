@@ -4,10 +4,18 @@
 > **分支:** `p2-evasion-synced`
 > **授权:** 仅限授权红队 / 安全研究
 > **权威状态：** 完整能力清单 + gate 默认值 + 已知缺口见 [`STATUS.md`](STATUS.md)。本文是集成进度的速查摘要。
+>
+> ⚠️ **2026-07-18 勘误：** 下方"~95% 完成"及 B2 Foliage 堆掩码 ✅ 的判定已过时。据
+> [`AUTHORITATIVE_FACTS`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) §2/§3，**睡眠混淆当前未接线**
+> （`kits.rs:65-71` 短路到 `beacon::sleep_seconds`，Foliage/Fluctuation/mem::mask 全为死路径），
+> 是 §3 最高优先级缺口 #1。阅读本文完成度数字时请以此为准。
 
 ---
 
 ## 总体完成度: ~95%
+
+> ⚠️ 此数字反映 2026-06-27 自测结果。2026-07-18 审计（[`AUTHORITATIVE_FACTS`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md)）
+> 发现睡眠混淆路径在 `kits.rs:65-71` 短路、实际未接线，请勿据此数字判断睡眠混淆可用。
 
 | 维度 | 完成度 | 说明 |
 |---|---|---|
@@ -15,6 +23,7 @@
 | 内核算法 | 100% | 全部 trait + mock test 通过 |
 | 内核接线 | 100% | bootstrap_chain → KslD → BYOVD → ETW-TI → DKOM → callback |
 | 内核真机 | 7/7 PASS | H→I→J→K 全链路 Server 2019 验证 |
+| 睡眠混淆 | 🔴 未接线 | 2026-07-18 审计：`kits.rs:65-71` 短路，Foliage/heap mask 实为死路径 |
 
 ---
 

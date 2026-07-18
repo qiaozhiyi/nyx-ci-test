@@ -1,5 +1,7 @@
 # Nyx 操作端重写设计 — Tauri 2 + React 3D 拓扑
 
+> 📚 **参考文档** — 外部资料/ API 参考/设计探索，与当前代码状态无关。项目实际能力见 [`README.md`](../../README.md) 与 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md)。
+
 > 2026-07-17 · 范围：删除 `crates/client-cli/`（ratatui TUI）+ `crates/client-ui/`（Makepad GUI），从零重写为 `crates/client-ui-web/`（Tauri 2 + React + Three.js）。
 >
 > 目标：对标 Cobalt Strike 4.12 / Brute Ratel v2.3，做一个**颠覆性的 C2 操作端**——不是给老框架换皮，而是重新定义操作员与 C2 的交互方式。

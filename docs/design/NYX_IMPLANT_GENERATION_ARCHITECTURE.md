@@ -4,6 +4,7 @@
 > **Status:** Planning  
 > **Goal:** Operator-facing server-side implant generation, crypographically per-implant uniqueness, sRDI shellcode conversion, mutation engine.  
 > **Principles:** Use existing crypto stack exclusively (X25519+HKDF+ChaCha20-Poly1305). Zero XOR, zero weak primitives. Per-implant unique binary every time.
+> **Fact alignment (2026-07-18):** 本文档为生成系统的架构规划（Planning）。下方 §1.1 中"已存在"的条目经 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) 复核，凡是状态/计数与审计冲突处已在行内以"⚠️"标注（主要：睡眠混淆未接线、nyx-loader 反射加载仅 std 参考实现、server 路由数、selftest 导出数）。
 
 ---
 
@@ -18,13 +19,13 @@
 | Compile-time config embedding via proc-macro | `crates/config-macros/src/lib.rs` | ✅ Complete |
 | Server keypair persistence (NYX_KEYFILE) | `crates/server/src/main.rs:64-71` | ✅ Complete |
 | Server AppState (sessions, keypair, store, audit) | `crates/server/src/lib.rs:73-103` | ✅ Complete |
-| REST API framework (axum) | `crates/server/src/lib.rs:319-345` | ✅ 13 endpoints |
-| SQLite credential store (rusqlite, WAL) | `crates/store/src/store.rs` | ✅ Complete |
+| REST API framework (axum) | `crates/server/src/lib.rs:319-345` | ✅ Complete · ⚠️ 实测 14 静态 API 路由（AUTHORITATIVE_FACTS §0），本文写"13 endpoints"少计一条 |
+| SQLite credential store (rusqlite, WAL) | `crates/store/src/store.rs` | ✅ Complete · ⚠️ `mask_secret()` 是 stub（永返 `********`），migration 仅基线（AUTHORITATIVE_FACTS §1） |
 | Audit log (hash-chained) | `crates/server/src/audit.rs` | ✅ Complete |
 | PEB-walk + djb2 API resolution | `crates/implant-win/src/resolve.rs` | ✅ Complete |
-| Basic sRDI extractor (NYX1 header) | `tools/srdi/src/main.rs` | 🟡 v1 only (no loader) |
-| CI pipeline (DLL build + selftest) | `.github/workflows/windows-ci.yml` | ✅ Complete |
-| Evasion kits (Fluctuation, ModuleStomp) | `crates/implant-win/src/kits.rs` | ✅ Complete |
+| Basic sRDI extractor (NYX1 header) | `tools/srdi/src/main.rs` | 🟡 v1 only (no loader) · ⚠️ `nyx-loader` 加密+组装真，但反射加载仅 std 参考实现（AUTHORITATIVE_FACTS §1，nyx-loader 🔴） |
+| CI pipeline (DLL build + selftest) | `.github/workflows/windows-ci.yml` | ✅ Complete · ⚠️ selftest 导出实际 50 符号（49 `nyx_selftest_*` + 1 `nyx_linger*`，AUTHORITATIVE_FACTS §0） |
+| Evasion kits (Fluctuation, ModuleStomp) | `crates/implant-win/src/kits.rs` | 🔴 **睡眠混淆未接线**（`kits.rs:65-71` 短路到 `beacon::sleep_seconds`，Fluctuation/Foliage/mem::mask 全死路径，AUTHORITATIVE_FACTS §1/§2/§3 #1）。ModuleStomp 注入 kit 已接线 |
 
 ### 1.2 What's Missing
 

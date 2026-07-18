@@ -17,7 +17,7 @@ implant-win 规避模块（`unhook.rs`/`blind.rs`/`blind_hwbp.rs`/`sleep.rs`/`in
 
 - **unhook 失败**（KnownDlls fresh-map + disk fallback）：两条路径都失败时，应记录并降级，不能假装已 unhook。
 - **blind 失败**（AMSI/ETW byte-patch）：patch 失败时后续操作应假设 blind 未生效，不能当作"已盲化"继续敏感操作。
-- **sleep-mask 失败**（Foliage APC + RC4）：APC 链失败曾有 `STATUS_STACK_BUFFER_OVERRUN`（commit `02d7e07`，现 `NYX_FOLIAGE_OFF=1` gate 降级）。核对：降级路径真的生效，不是"gate 标志设了但代码路径没分叉"。
+- **sleep-mask 失败**（Foliage APC + RC4）：APC 链失败曾有 `STATUS_STACK_BUFFER_OVERRUN`（commit `02d7e07`，现 `NYX_FOLIAGE_OFF=1` gate 降级）。**重要现状**：当前 `kits.rs:65-71` 把 `sleep()` 短路到 `beacon::sleep_seconds`，Foliage/Fluctuation/mem::mask 全为死路径——睡眠混淆实际未生效，不是"已接线可能失败"。核对：接线后降级路径真的生效，不是"gate 标志设了但代码路径没分叉"。
 - **inject 失败**（module stomp + ThreadlessInject）：注入失败必须清理半分配资源，不能泄露残留。
 
 ### CRITICAL — syscall gadget / resolve 失败
@@ -52,7 +52,7 @@ gate 默认值以 **`docs/STATUS.md` §3 为唯一真相**（CLAUDE.md 与多份
 
 ### MEDIUM — server 端错误传播
 
-- `cargo test --workspace` 基线 326 不得回退——测试失败若被 `unwrap_or_default()` 吞掉是典型静默失败。
+- `cargo test --workspace` 基线 ~267 不得回退（AUTHORITATIVE_FACTS §0）——测试失败若被 `unwrap_or_default()` 吞掉是典型静默失败。
 - `?` 传播链：server handler 的 error 应映射到正确 HTTP status，不能全 `500` 或全 `200`（后者是吞错）。
 
 ## 寻找的反模式（grep 友好）

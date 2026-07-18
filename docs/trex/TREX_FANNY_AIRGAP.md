@@ -1,5 +1,7 @@
 # T-REX vs Fanny · 空气间隙跨越能力对比
 
+> 📚 **参考文档** — 外部资料/ API 参考/设计探索，与当前代码状态无关。项目实际能力见 [`README.md`](../../README.md) 与 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md)。
+
 > **制定:** 2026-07-07 · **参考:** Equation Group Fanny (2008) · ESET Jumping the Air Gap (2021) · ACM Bridgeware Survey (2023) · Hak5 Keystroke Reflection (2026) · APT37 Ruby Jumper (2026)
 
 ---

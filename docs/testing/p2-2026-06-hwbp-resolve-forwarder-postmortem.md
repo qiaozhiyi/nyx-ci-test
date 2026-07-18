@@ -1,3 +1,7 @@
+> ⚠️ **历史快照** — 本文档记录 2026-06-26 的状态，可能已过时。
+> 最新项目事实以 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) 为准。
+> 如需当前能力状态，请查阅 [`README.md`](../../README.md)。
+
 # Postmortem — `hwbp_blind` 0xC0000005 崩溃（根因：resolve.rs 转发导出解析两个叠加 bug）
 
 > **日期:** 2026-06-26 · **分支:** `p2-evasion-synced`

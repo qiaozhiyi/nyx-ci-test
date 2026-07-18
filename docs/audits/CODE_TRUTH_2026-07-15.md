@@ -1,4 +1,8 @@
-# NYX 代码实情审计报告 (CODE_TRUTH)
+# NYX 代码实情审计报告 (CODE_TRUTH) — ⚠️ 已被取代 (SUPERSEDED)
+
+> ⚠️ **本文档已被 [`CODE_TRUTH_2026-07-18.md`](CODE_TRUTH_2026-07-18.md) 取代。**
+> 本报告的状态结论(LOC/test/Command 计数、能力状态)已过时:实测 LOC 68,751(非 88,874)、Command 28(非 27)、test 488(非 674)、睡眠混淆未接线等关键修正见新报告。
+> **本报告 §7 安全发现仍有效**,保留作历史参考。数字基准以 [`AUTHORITATIVE_FACTS_2026-07-18.md`](AUTHORITATIVE_FACTS_2026-07-18.md) 为准。
 
 - **日期**: 2026-07-15
 - **分支**: `main`

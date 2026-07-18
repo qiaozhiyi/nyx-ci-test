@@ -1,5 +1,8 @@
 # T-REX v2 · 网络投递侦察探针（精简版）
 
+> 📚 **参考文档** — 外部资料/ API 参考/设计探索，与当前代码状态无关。项目实际能力见 [`README.md`](../../README.md) 与 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md)。
+> 实施进度见 README.md Roadmap。
+
 > **制定:** 2026-07-07 · **原则:** 网络投递，网络外传。不碰 USB。不搞学术边信道。
 
 ---

@@ -3,6 +3,7 @@
 > **日期:** 2026-06-27（内核 H-K 全链路真机验证完成，含 callback 诊断全量数据）
 > **验证环境:** Windows Server 2019 Datacenter 17763.1339 + RTCore64.sys (CVE-2019-16098)
 > **授权:** 仅限授权红队 / 安全研究
+> **事实口径:** 数字、接线状态、crate 状态以 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) 为准。本文成文较早，下方凡是与 AUTHORITATIVE_FACTS 冲突处已在对应条目中以"⚠️ 审计修正（2026-07-18）"标注。
 
 每个手段标注真实状态：✅ 真机验证 · 🔶 代码完成待验证 · ❌ 未实现
 接线状态：🟢 已接通 · 🟡 部分接通 · 🔴 未接通
@@ -82,7 +83,9 @@
 
 ---
 
-### 5. Foliage 睡眠掩码（APC 链加密 .text）✅
+### 5. Foliage 睡眠掩码（APC 链加密 .text）✅ 算法真 · 🔴 未接线
+
+> ⚠️ **审计修正（2026-07-18，AUTHORITATIVE_FACTS §1/§2）**：Foliage / Fluctuation / mem::mask 的算法与单元测试均真，但 **implant 睡眠混淆路径整体未接线**——`implant-win/src/kits.rs:65-71` 短路到 `beacon::sleep_seconds`，Fluctuation/Foliage/mem::mask 全部死路径。下文"默认 ON""已接通"等表述为成文时（2026-06-27）自评，**当前不成立**。这是 AUTHORITATIVE_FACTS §3 #1 优先级缺口（接线睡眠混淆）。算法层的 selftest 验证结果（foliage / foliage_apc）仍然有效，因为它们测的是算法子模块而非端到端睡眠路径。
 
 **对抗：** 内存扫描器（PE-sieve / Moneta / BeaconEye）在 beacon 睡眠时扫描 implant 内存
 
@@ -103,7 +106,9 @@
 
 ---
 
-### 6. 栈欺骗（BYOUD-Gap RSP swap）🔶 需显式启用
+### 6. 栈欺骗（BYOUD-Gap RSP swap）🔶 需显式启用 · caller-spoof 仅 scanner
+
+> ⚠️ **审计修正（2026-07-18，AUTHORITATIVE_FACTS §3 #7）**：`caller_spoof` 宏实现当前**仅 scanner**（扫描器侧），未实现完整的运行时调用方欺骗宏；`.pdata` gap / frame / swap 算法真且已 selftest，但端到端"任意敏感调用都自动 spoof"的宏未完成。下文接线现状为成文时自评。
 
 **对抗：** 栈回溯检测（call stack 上出现 implant 地址 / RX 私有页）
 
@@ -151,7 +156,9 @@
 
 ---
 
-### 9. 内存区域加密（运行时 mask/unmask）✅
+### 9. 内存区域加密（运行时 mask/unmask）✅ 算法真 · 🔴 未接线（端到端睡眠路径）
+
+> ⚠️ **审计修正（2026-07-18）**：`mem::mask` / `unmask` / `mask_text` 算法真且单元测试通过，但端到端睡眠路径下 `kits.rs:65-71` 短路，mem::mask 与 Foliage 同为死路径（见 §5 修正）。selftest_mem 仍有效（测的是 mask 算法本身）。
 
 **对抗：** 静态内存扫描发现 implant 数据（配置、密钥、payload）
 
@@ -396,9 +403,9 @@ FrameList → RegisteredFilters`，把目标 EDR 过滤器（如 WdFilter）从�
 | **ETW Threat Intelligence** | 用户态 NtTraceEvent patch（盲化用户态通知）+ 内核 IsEnabled=0（盲化 provider） | ✅ |
 | **ntdll inline hook** | 间接 syscall（不经过 ntdll）+ ntdll unhook（磁盘重映射） | ✅ |
 | **AMSI** | AmsiScanBuffer patch | ✅ |
-| **内存扫描（PE-sieve）** | Foliage .text RC4 加密 + 间接 syscall trampoline 在合法页 | ✅ 0 implanted |
-| **内存扫描（Moneta）** | Module stomping（backed 内存）+ Foliage | ✅ |
-| **睡眠检测（HSB/BeaconEye）** | Foliage APC 链（.text 加密 + NtDelayExecution）| ✅ |
+| **内存扫描（PE-sieve）** | Foliage .text RC4 加密（算法真）+ 间接 syscall trampoline 在合法页 | 🔴 **睡眠路径未接线**（kits.rs:65-71 短路，见 §5 修正） |
+| **内存扫描（Moneta）** | Module stomping（backed 内存）+ Foliage（算法真） | 🔴 睡眠路径未接线（见 §5） |
+| **睡眠检测（HSB/BeaconEye）** | Foliage APC 链（.text 加密 + NtDelayExecution）| 🔴 **未接线**（kits.rs 短路，AUTHORITATIVE_FACTS §3 #1） |
 | **栈回溯检测** | BYOUD-Gap RSP swap（假栈搭建在 ntdll gap 地址）| ✅ |
 | **调试器** | PEB BeingDebugged + CheckRemoteDebuggerPresent | ✅ |
 | **沙箱（低 uptime）** | uptime 检测 | ✅ |
@@ -411,6 +418,8 @@ FrameList → RegisteredFilters`，把目标 EDR 过滤器（如 WdFilter）从�
 | **CET shadow stack** | 悲观降级（CET-on 不执行 RSP swap，`SPOOF_SWAP_ENABLED=false`） | ✅ 降级安全 |
 | **PatchGuard** | `TimingRepairWindow` + `RuntimePgBypassWindow`（真实数据写窗口）+ 短暂 DKOM + 回调 repurpose（数据写不碰 .text） | ✅ 2/3 窗口真实 / PG 未触发 |
 | **HVCI** | .text 代码写不可用（用数据写 ctx 指针代替） | ✅ 数据写安全 |
+| **TLS 指纹（JA3/JA4）** | transport crate 有 JA3/JA4 计算引擎，但 `build_impersonating_client` 是 **Err stub**；emitter 未接线 | 🔴 **stub**（AUTHORITATIVE_FACTS §3 #5）—— team server JA3 暴露 |
+| **多信道传输（DoH/Slack/LLM/MCP/SMB）** | transport crate 6 个 Transport impl | 🔴 **全部零消费者**（AUTHORITATIVE_FACTS §0/§1/§3 #4）—— 代码在，implant/server 不消费 |
 
 ---
 
@@ -421,6 +430,10 @@ FrameList → RegisteredFilters`，把目标 EDR 过滤器（如 WdFilter）从�
 
 | 能力 | 说明 | 状态 |
 |---|---|---|
+| **睡眠混淆接线** | `kits.rs:65-71` 短路到 `beacon::sleep_seconds`，Fluctuation/Foliage/mem::mask 全死路径 | 🔴 **未接通**（AUTHORITATIVE_FACTS §3 #1，最高优先级） |
+| **TLS 指纹 emitter** | `transport/src/emitter.rs` 是 Err stub；JA3/JA4 引擎有但 emission 未接线 | 🔴 **stub**（AUTHORITATIVE_FACTS §3 #5） |
+| **transport 信道消费** | 6 个 Transport impl（Malleable/DoH/Slack/LLM/MCP/SMB）全部零消费者 | 🔴 **未接通**（AUTHORITATIVE_FACTS §3 #4） |
+| **caller-spoof 运行时宏** | 当前仅 scanner，缺任意敏感调用的自动 spoof 宏 | 🔴 未接通（AUTHORITATIVE_FACTS §3 #7） |
 | **MiniFilter 接线** | `telemetry.rs::MiniFilterUnlinker` 算法已写，但 `bootstrap_chain()` 未解析 `flt_globals_kva` | 🔴 算法在，接线缺（G4） |
 | **driver 加载的 HVCI/CI 绕过** | HVCI-on 主机上 RTCore64 可能被 CI 拒绝 | 当前目标 HVCI-off；HVCI-on 需 DMA 或 driverless CVE |
 | **WFP filter 注入** | netsec 规则生成的内核调用站 binding | 🔶 算法就绪，binding 未接 |
@@ -430,3 +443,4 @@ FrameList → RegisteredFilters`，把目标 EDR 过滤器（如 WdFilter）从�
 ---
 
 *每个能力的状态基于 2026-06-27 的代码 + Server 2019 真机验证。内核 H-K 任务全量数据见各节。未标注真机验证的项 = 代码完成但未在真机上执行。接线状态标注：🟢 100% · 🟡 部分（见各节说明） · 🔴 未接通。*
+*2026-07-18 审计裁定（AUTHORITATIVE_FACTS）：睡眠混淆路径、TLS emitter、6 个 transport 信道消费、caller-spoof 宏均未接线——以上条目已就地标注"审计修正"。当前代码总量 68,751 LOC / wire Command 28 变体 / selftest 导出 50 符号（49 `nyx_selftest_*` + 1 `nyx_linger*`），数字以 AUTHORITATIVE_FACTS §0 为准。*

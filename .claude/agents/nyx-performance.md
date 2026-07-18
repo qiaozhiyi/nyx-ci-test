@@ -36,9 +36,9 @@ workspace `[profile.release]` 已为体积调优（**不要动这个全局配置
 
 ### 3. Sleep-mask 性能
 
-- `sleep.rs` Foliage APC 链 + RC4 mask/unmask 的耗时（mask .text + heap regions）。
-- `mem.rs` `enumerate_beacon_heap_regions()` 的枚举开销（slab-tracked）。
-- mask 范围越大越隐蔽但越慢——权衡，不能让 sleep 间隔异常。
+- **当前睡眠混淆未接线**：`kits.rs:65-71` 短路到 `beacon::sleep_seconds`，`sleep.rs` 的 Foliage APC 链 + RC4 mask/unmask 路径全部为死代码。接线上线后，才需要测 mask/unmask 耗时（mask .text + heap regions）。
+- `mem.rs` `enumerate_beacon_heap_regions()` 当前无消费者（同上）。
+- mask 范围越大越隐蔽但越慢——接线后权衡，不能让 sleep 间隔异常。
 
 ### 4. 内存占用
 
@@ -59,7 +59,7 @@ workspace `[profile.release]` 已为体积调优（**不要动这个全局配置
 1. **建立基线**：测当前体积/时延（记录数值）。
 2. **定位热点**：`cargo bloat`（若可用）/ 手动分析依赖体积 / 真机 timing。
 3. **最小改动优化**：一次一个变量，每次重测。
-4. **回归验证**：`cargo test --workspace` ≥ 326 + implant 交叉编译绿 + selftest exit code 不变。
+4. **回归验证**：`cargo test --workspace` ≥ ~267（基线，详见 `docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md` §0）+ implant 交叉编译绿 + selftest exit code 不变。
 5. 报告：基线 vs 优化后，每项改动的体积/时延 delta + 是否影响规避。
 
 ## 红线

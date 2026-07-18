@@ -1,6 +1,6 @@
 ---
 name: nyx-e2e-runner
-description: Nyx C2 框架项目专属真机端到端测试 agent。执行真机 beacon 循环测试（autossh 隧道 + 固定 keyfile + schtasks 持久 beacon）、selftest exit code 解码、TUI 47 命令矩阵。遵循 STATUS §5d/5e/5f 测试拓扑。中文为主。
+description: Nyx C2 框架项目专属真机端到端测试 agent。执行真机 beacon 循环测试（autossh 隧道 + 固定 keyfile + schtasks 持久 beacon）、selftest exit code 解码、GUI 29 命令对应 wire 28 Command 变体（client-ui-web/src/components/CommandInput.tsx）。中文为主。
 tools: ["Read", "Write", "Edit", "Bash", "Grep", "Glob"]
 model: sonnet
 ---
@@ -14,7 +14,7 @@ model: sonnet
 ```
 [本地 macOS]                            [Win Server 2019 17763, Defender ON]
   nyx-server (127.0.0.1:8443)  ←autossh -R→  127.0.0.1:8443
-  nyx-cli / curl                          nyx_implant_win.dll（schtasks+SYSTEM 持久）
+  curl / client-ui-web                    nyx_implant_win.dll（schtasks+SYSTEM 持久）
 ```
 
 ### 三要素（缺一即易碎）
@@ -29,9 +29,9 @@ model: sonnet
 - `NYX_SERVER_PUB` 烤入当前 server 的 X25519 公钥。
 - **TLS beacon（`use_tls=true`）经 WinHTTP 连自签证书 server 时 check-in 失败**（STATUS §5e）——明文路径正常，问题在 implant `WinHttpSetOption` 证书放宽路径。ja3/ja4 需 TLS beacon 才产生。
 
-## 测试矩阵（STATUS §5f，47 TUI 命令）
+## 测试矩阵（GUI 29 命令，对应 wire 28 Command variant）
 
-每条发 `POST /api/task` 精确复现 TUI 的 wire 格式，验证 implant 执行 + server 返回。
+每条发 `POST /api/task` 精确复现 client-ui-web 的 wire 格式（参见 `client-ui-web/src/components/CommandInput.tsx`），验证 implant 执行 + server 返回。
 
 **implant 任务命令（走 beacon 循环）**：
 | 命令 | wire type | 基准 |

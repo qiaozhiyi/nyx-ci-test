@@ -1,5 +1,7 @@
 # CONTEXT Structure (x86 64-bit) - Win32 apps
 
+> 📚 **参考文档** — 外部资料/ API 参考/设计探索，与当前代码状态无关。项目实际能力见 [`README.md`](../../README.md) 与 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md)。
+
 Contains processor-specific register data. The system uses CONTEXT structures to perform various internal operations. This page applies to the **64-bit x86 architecture**.
 
 ## Architecture Links

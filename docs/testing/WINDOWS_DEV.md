@@ -60,9 +60,9 @@ pentest/
 │  edr_kernel_complete_handbook.md / kernel_edr_evasion_2026.md / p2_research_synthesis.md
 │                              ← 根目录 5 份研究语料（USENIX/BH/DC 论文 + CVE + 商业 C2 对标）
 │
-├─ crates/  （主 workspace 成员，`cargo build --workspace` 在本机也能跑）
-│  ├─ protocol/ … server/ agent-dev/ client-cli/ client-ui/ store/ pe/ evasion/ parse/
-│  │  coff/ config/ config-macros/ profile/ transport/ rest/ scripting*/ bof-runner/
+├─ crates/  （主 workspace 成员 18 个，`cargo build --workspace` 在本机也能跑）
+│  ├─ protocol/ … server/ agent-dev/ client-ui-web/ store/ evasion/ parse/
+│  │  coff/ config/ config-macros/ profile/ transport/ rest/ scripting/ scripting-rhai/ bof-runner/
 │  │
 │  └─ （standalone，各自带空 [workspace]，不在主 workspace 内）
 │     ├─ implant-win/          ← 【本机主战场】真实 Windows PIC implant
@@ -78,11 +78,13 @@ pentest/
 - `implant-evasionsdk`：用户态规避接缝面。9 个 trait（`SyscallSource`/`PdataGapScanner`/
   `StackSpoofKit`+`SpoofGuard`/`SleepmaskKit`/`MemoryMaskKit`+`MaskToken`/`BlindKit`+`BlindTarget`/
   `UnhookKit`/`AntiDebugKit`/`ProcessInjectKit`）+ `EvasionStack` 组装器 + `Floors` no-op 地板。
-  已含 3 个纯算法实现模块：`gap.rs`（.pdata gap 枚举，10 测试）、`frame.rs`（BYOUD 假帧链合成，8 测试）、
-  `rc4.rs`（SystemFunction032 睡眠掩码 RC4，6 测试）。
+  纯算法实现模块：`gap.rs`（.pdata gap 枚举）、`frame.rs`（BYOUD 假帧链合成）、
+  `rc4.rs`（SystemFunction032 睡眠掩码 RC4）、`foliage.rs`/`apc.rs`/`swap.rs`/`offsets_table.rs`。
+  （注意：算法子模块为真且已测试，但当前 `#[allow(dead_code)]` —— 见
+  [`AUTHORITATIVE_FACTS`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) §1。）
 - `operator-kernelsdk`：内核 tier 接缝（operator-side）。`KernelRw` 基础 → `EtwTiKit`/`CallbackKit`/
   `MiniFilterKit`/`WfpKit`/`PatchGuardKit`+`PgGuard`/`ProcHideKit`/`PplKit`/`EdrNeutralizeKit`/`CredKit` +
-  `NoKernel` 地板 + `KernelTier` 组装。**接缝-only，无真实 impl。**
+  `NoKernel` 地板 + `KernelTier` 组装。**9/10 kit 算法为真并已测试**（WfpKit 永返 Err，WdtKernel 为 stub）。
 
 ---
 
@@ -95,7 +97,7 @@ cd C:\Users\administrator\nyx\pentest
 cargo build --workspace
 cargo test --workspace
 
-# B. 两个 SDK crate（独立，no_std；evasionsdk 有 24 个 host 测试）
+# B. 两个 SDK crate（独立，no_std；evasionsdk 有 host 测试）
 cargo test --manifest-path crates\implant-evasionsdk\Cargo.toml
 cargo check --manifest-path crates\operator-kernelsdk\Cargo.toml
 

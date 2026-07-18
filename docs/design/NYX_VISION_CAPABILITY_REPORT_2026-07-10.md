@@ -1,5 +1,8 @@
 # Nyx C2 框架 — 究极远见能力调查报告
 
+> ⚠️ **设计/历史文档** — 本文档成文于 2026-07-10，能力状态可能已演进。
+> 最新事实以 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) 为准。
+
 > **调查日期:** 2026-07-10
 > **方法:** 全栈源码审查（25 crate / 77K 行）× 三轮审计交叉验证 × 2025–2026 年 C2/evasion 领域 SOTA（state-of-the-art）全量检索（exa + context7 + web reader，30+ 篇 2026 年技术文献）
 > **工具链:** Exa search × 8 轮 · Context7 docs × 3 轮 · web reader × 3 篇全文 · 10 路并行子报告审计

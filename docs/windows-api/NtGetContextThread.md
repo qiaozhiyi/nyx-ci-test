@@ -1,5 +1,7 @@
 # NtGetContextThread
 
+> 📚 **参考文档** — 外部资料/ API 参考/设计探索，与当前代码状态无关。项目实际能力见 [`README.md`](../../README.md) 与 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md)。
+
 > **Note**: The official Microsoft documentation for this page returned a 404 error. This is a kernel-mode undocumented/semi-documented NT API. The information below is compiled from public sources (ReactOS, Process Hacker, and Windows internals research).
 
 ## Summary

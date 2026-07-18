@@ -1,5 +1,7 @@
 # 商业 C2 框架 & 各大安全公司研究全景报告
 
+> 📚 **参考文档** — 外部资料/ API 参考/设计探索，与当前代码状态无关。项目实际能力见 [`README.md`](../../README.md) 与 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md)。
+
 > 2026年6月 | Cobalt Strike / BRc4 / Outflank / MDSec / Elastic / CrowdStrike / Microsoft / SentinelOne / Sophos / ESET / Mandiant / Huntress
 
 ---

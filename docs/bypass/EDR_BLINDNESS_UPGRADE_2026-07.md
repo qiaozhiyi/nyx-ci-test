@@ -1,5 +1,8 @@
 # EDR Blindness Upgrade Blueprint — 截止 2026-07 SOTA
 
+> ⚠️ **设计/历史文档** — 本文档成文于 2026-07-01，能力状态可能已演进。
+> 最新事实以 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) 为准。
+
 > **授权红队 / 安全研究文档。** 本文档基于对 40+ 篇 2024-2026 公开一手研究的深读(FND Security、SafeBreach、Outflank、Synacktiv SSTIC 2025、Black Hat EU/USA 2025、DEF CON 32、Praetorian、fluxsec、Elastic Security Labs、0xmaz、klezVirus 等),结合对 Nyx 全栈 bypass 代码(`implant-win` / `operator-kernelsdk` / `implant-evasionsdk`)的逐文件审计,产出一份**自主决策的"最小噪音 EDR 彻底致盲"升级蓝图**。
 >
 > **核对日期:** 2026-07-01 · **分支:** `main` · **适用对象:** Nyx 框架

@@ -1,5 +1,8 @@
 # Bypass 模块开发进度报告
 
+> ⚠️ **设计/历史文档** — 本文档成文于 2026-06-27，能力状态可能已演进。
+> 最新事实以 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) 为准。
+
 > **日期:** 2026-06-27（内核 H-K 全链路真机验证完成，callback 诊断全量数据同步）
 > **分支:** `p2-evasion-synced`
 > **范围:** P2 用户态 + 内核 tier 全部 bypass 模块

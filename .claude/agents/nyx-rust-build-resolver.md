@@ -16,8 +16,8 @@ model: sonnet
 cargo build --workspace
 cargo test --workspace
 
-# 2. CLI clippy（-D warnings，零容忍）
-cargo clippy -p nyx-cli -- -D warnings
+# 2. client clippy（-D warnings，零容忍）
+cargo clippy -p nyx-client-ui-web -- -D warnings
 
 # 3. Windows PIC implant（nightly + no_std，交叉编译）
 cargo +nightly check -p nyx-implant-win --target x86_64-pc-windows-gnu
@@ -45,7 +45,7 @@ cargo build -p nyx-offset-resolver
 
 6. **Rust-2024 `static_mut_refs` lint**：implant 在 nightly 下约 46 个此类 warning（非 error）。若 `-D warnings` 下需修，用 `addr_of!`/`addr_of_mut!` 替代直接 `&` 引用 static mut。属正常 lint，非 build 断裂。
 
-7. **clippy 零容忍残留**：client-cli 历史 G7 闭合时修过一批（重复 `let is_image`、`&""` 多余引用、未用 import、`AuditRow.detail` 未读、`poll_file_chunks` 参数过多）。clippy 红时优先用 `cargo clippy <pkg> -- -D warnings --explain <LINT>` 看具体规则。
+7. **clippy 零容忍残留**：client 历史闭合时修过一批（重复 `let is_image`、`&""` 多余引用、未用 import、`AuditRow.detail` 未读、`poll_file_chunks` 参数过多）。clippy 红时优先用 `cargo clippy <pkg> -- -D warnings --explain <LINT>` 看具体规则。
 
 ## 修复流程
 

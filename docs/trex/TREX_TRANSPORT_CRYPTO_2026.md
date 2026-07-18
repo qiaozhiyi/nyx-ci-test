@@ -1,5 +1,7 @@
 # T-REX 传输与加密层 · 2026 前沿方案
 
+> 📚 **参考文档** — 外部资料/ API 参考/设计探索，与当前代码状态无关。项目实际能力见 [`README.md`](../../README.md) 与 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md)。
+
 > **制定日期:** 2026-07-07
 > **情报基线:**
 > QUICstep (POPETS 2026) — QUIC 连接迁移绕过 GFW 审查

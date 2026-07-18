@@ -1,7 +1,7 @@
 # Nyx → 国家级 / 军用级 C2 平台 — 总设计
 
 > **本文档性质：** 拓展总设计（master design），定义 Nyx 从当前"商业级单平台高级威胁模拟器"演化为"国家级 / 军用级全栈行动平台"的目标架构、工程拆分、阶段路线与验收准则。
-> **优先级口径：** 设计文档，非现状事实源。当前代码现状一律以 [`STATUS.md`](STATUS.md) 为准；本文只描述**目标态**与**演进路径**。
+> **优先级口径：** 设计文档，非现状事实源。当前代码现状一律以 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) 为准（STATUS.md 次之，冲突时以 AUTHORITATIVE_FACTS 为准）；本文只描述**目标态**与**演进路径**。
 > **起草日期：** 2026-07-05 · **目标 horizon：** 18–24 个月（4 阶段） · **授权边界：** 仅限授权红队 / 国家授权安全研究 / 合法防御演练。
 >
 > ⚠️ **现实口径：** 国家级 APT 平台（NSO Pegasus / Equation Group / APT29 级）的核心资产**不是代码**，而是 0day 储备 + 投递链 + 域名基础设施 + 持续运营。本设计**只覆盖代码与工程层面可达的能力**；0day 研发、移动端 0click chain、固件级 implant 等需独立研发预算与硬件资源的部分，列为**外部依赖**而非本工程交付物（见 §7）。
@@ -23,14 +23,18 @@
 | **C5** | **横向移动** | 在标准 AD 域环境（林级别）中，从普通域用户走到 Enterprise Admin，可用 Kerberos 全家族 + DCSync + RBCD 自动化 |
 | **C6** | **C2 韧性与可协同** | team server 联邦（多节点 session 迁移）、操作员协同锁、目标资产拓扑追踪、air-gap 跨网段双向 pivot |
 
-### 0.2 当前基线（事实，引用 STATUS.md）
+### 0.2 当前基线（事实，引用 AUTHORITATIVE_FACTS_2026-07-18）
 
-- Windows 单平台 implant，~286 KB strip，`no_std` PIC DLL
-- 用户态规避 ~98% 完成度，内核 tier 100% 算法 + 7/7 真机
-- 加密协议：X25519 + HKDF + ChaCha20-Poly1305，方向隔离 nonce，反重放计数器（`crates/protocol/src/crypto.rs`）
-- 流量层：单一 HTTPS（axum + rustls），`transport/` 共 816 行
+> ⚠️ 数字以 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) §0/§1 为准。下方为 2026-07-05 起草时的快照 + 审计修正。
+
+- 总 Rust LOC **68,751**（AUTHORITATIVE_FACTS §0 实测）；workspace 18 成员 + 6 独立 crate
+- Windows 单平台 implant，~286 KB strip，`no_std` PIC DLL；wire `Command` 变体 **28**（`protocol/src/msg.rs:130`）
+- 用户态规避：算法层完整但 **睡眠混淆未接线**（`implant-win/src/kits.rs:65-71` 短路，Fluctuation/Foliage/mem::mask 全死路径，AUTHORITATIVE_FACTS §1/§2）。"98% 完成度"自评不再适用。
+- 内核 tier 100% 算法 + 7/7 真机（operator-kernelsdk 🟡：9/10 kit 算法真，WfpKit 永返 Err，WdtKernel stub，PatchGuard 偏移未验证）
+- 加密协议：X25519 + HKDF + ChaCha20-Poly1305，方向隔离 nonce，反重放计数器（`crates/protocol/src/crypto.rs`），40 测试
+- 流量层：implant 实际回连单一 HTTPS（axum + rustls）；`transport/` crate 共 **3,420 LOC**（非 816），含 **6 个 Transport impl（Malleable/DoH/Slack/LLM/MCP/SMB）全部零消费者**；TLS emitter 是 Err stub（AUTHORITATIVE_FACTS §0/§1）
 - 横向：4 个 token 原语（`postex.rs`），无 Kerberos / AD 攻击
-- 投递链：0 行代码，真机测试靠手动 `schtasks`
+- 投递链：nyx-loader 加密+组装真，但反射加载仅 std 参考实现（on-target 反射为空，AUTHORITATIVE_FACTS §1 nyx-loader 🔴）；真机测试靠手动 `schtasks`
 - 反取证：0 行代码
 
 ### 0.3 能力差距矩阵（C1–C6 × 当前 vs 目标）
@@ -50,7 +54,7 @@
 
 ### C1. 流量生存性（Traffic Resilience）
 
-**现状根因**：`crates/transport/src/{tls,h2,emitter}.rs` 共 594 行，只实现 TLS 指纹嗅探（JA3/JA4），implant 回连通道单一。`crates/implant-win/src/transport.rs` 仅 HTTPS。一旦域名被 EDR 上传 → VirusTotal → sinkhole，全网 implant 哑火。
+**现状根因**：`crates/transport` 共 **3,420 LOC**（AUTHORITATIVE_FACTS §1，非旧文 594 行），含 6 个 Transport impl（Malleable/DoH/Slack/LLM/MCP/SMB）**全部零消费者**；`tls.rs`/`h2.rs` 实现 JA3/JA4 嗅探，但 `emitter.rs`（`build_impersonating_client`）是 **Err stub**——emission 未接线。`crates/implant-win/src/transport.rs` 仅 HTTPS。一旦域名被 EDR 上传 → VirusTotal → sinkhole，全网 implant 哑火。
 
 **目标架构**：将"传输"抽象为**多通道并发复合层**（multiplexed channel mesh），每条 implant 同时维护 ≥3 条异构通道，任一可用即存活。
 
@@ -453,12 +457,13 @@ members = [
 
 ---
 
-## 6. 与现有 STATUS.md 的关系
+## 6. 与现有事实源的关系
 
-- **STATUS.md**：当前代码事实源（描述"现在是什么"）
+- **AUTHORITATIVE_FACTS_2026-07-18.md**：**当前代码事实的权威源**（描述"现在是什么"，数字优先级最高）
+- **STATUS.md**：历史事实源（可能滞后，冲突时以 AUTHORITATIVE_FACTS 为准）
 - **本文档**：目标架构与路线（描述"未来要成为什么"）
-- 冲突时：STATUS.md 描述现状胜出；本文档仅描述目标态。
-- 每个里程碑完成后：在 STATUS.md 增量 §X 记录真机验证结果，本文档相应阶段标记 ✅ DONE。
+- 冲突时：AUTHORITATIVE_FACTS 描述现状胜出；本文档仅描述目标态。
+- 每个里程碑完成后：在 STATUS.md / AUTHORITATIVE_FACTS 增量记录真机验证结果，本文档相应阶段标记 ✅ DONE。
 
 ---
 

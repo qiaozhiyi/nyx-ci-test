@@ -3,6 +3,10 @@
 > **更新:** 2026-06-27（H-K 全链路真机验证通过）
 > **分支:** `p2-evasion-synced`
 > **权威状态：** 详细能力清单 + gate 默认值 + 缺口见 [`STATUS.md`](STATUS.md)。本文是内核 tier 的架构速查。
+>
+> ⚠️ **2026-07-18 勘误：** 据独立审计 [`AUTHORITATIVE_FACTS`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md)：
+> (1) **PatchGuard 偏移未在真机验证**；(2) **WfpKit 永返 Err**（下表标 🔶 偏乐观，实际无可用调用路径）；
+> (3) **WdtKernel 为 stub**；(4) 下表"真机 7/7 PASS"指 H–K 诊断链路，不等同于所有 kit 算法生产可用。
 
 ---
 
@@ -47,9 +51,9 @@ bootstrap_chain() → Priority 1: KslD.sys (Living off the Defender)
 | ProcessHider (DKOM) | ✅ | ✅ | ✅ 1→0→1 | ActiveProcessLinks unlink |
 | PPL Strip | ✅ | ✅ | 🔶 | offset 真机确认 |
 | CallbackKit | ✅ | ✅ | ✅ EID1 SILENCED | repurpose DATA write, selective slot |
-| PatchGuardKit | ✅ | ✅ | ✅ | TimingRepair + RuntimePgBypass |
+| PatchGuardKit | ✅ | ✅ | 🔴 偏移未验证 | TimingRepair + RuntimePgBypass（2026-07-18 审计：PG 偏移未真机验证） |
 | KslD | ✅ | ✅ | ✅ | QueryDosDeviceW enum, bootstrap_chain |
-| WfpRuleSet | ✅ | ✅ | 🔶 | 需内核调用站 binding |
+| WfpRuleSet | ✅ | 🟡 | 🔴 永返 Err | 2026-07-18 审计：`netsec.rs` WfpKit 永返 Err，无可用调用路径 |
 | LSASS Reader | ✅ | ✅ | 🔶 | 框架就绪 |
 | PatternScan | ✅ | ✅ | 🔶 | 需真实 ntoskrnl image |
 

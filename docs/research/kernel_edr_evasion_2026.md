@@ -1,5 +1,7 @@
 # Windows 内核层 EDR 对抗 — 2026年6月最新研究综合
 
+> 📚 **参考文档** — 外部资料/ API 参考/设计探索，与当前代码状态无关。项目实际能力见 [`README.md`](../../README.md) 与 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md)。
+
 > 网络搜索实证，覆盖学术会议、行业研究、PoC 仓库。授权红队研究用途。
 
 ---

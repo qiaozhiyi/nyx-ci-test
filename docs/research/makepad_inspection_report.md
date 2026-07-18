@@ -1,5 +1,8 @@
 # Makepad Operator GUI Inspection & Code Review Report
 
+> 📚 **参考文档** — 外部资料/ API 参考/设计探索，与当前代码状态无关。项目实际能力见 [`README.md`](../../README.md) 与 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md)。
+> ⚠️ 注意：本文涉及的 Makepad client 已于 commit c5064dc 归档，现用 client-ui-web (Tauri 2)。
+
 This report provides a comprehensive visual and code-level inspection of the Makepad-based operator interface (`crates/client-ui`) for the Nyx C2 platform.
 
 ---

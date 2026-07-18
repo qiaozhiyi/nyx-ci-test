@@ -1,5 +1,8 @@
 # Cobalt Strike UI Redesign Research and Planning
 
+> 📚 **参考文档** — 外部资料/ API 参考/设计探索，与当前代码状态无关。项目实际能力见 [`README.md`](../../README.md) 与 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md)。
+> ⚠️ 注意：本文涉及的 Makepad client 已于 commit c5064dc 归档，现用 client-ui-web (Tauri 2)。
+
 This document serves as the research base and redesign plan for refactoring the Nyx operator client UI (`crates/client-ui/`) into a classic, recognizable Cobalt Strike-inspired design.
 
 ---

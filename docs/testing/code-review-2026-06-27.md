@@ -1,3 +1,7 @@
+> ⚠️ **历史快照** — 本文档记录 2026-06-27 的状态，可能已过时。
+> 最新项目事实以 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) 为准。
+> 如需当前能力状态，请查阅 [`README.md`](../../README.md)。
+
 # Nyx C2 — 逐函数代码 Review 记录
 
 > **日期:** 2026-06-27 · **分支:** `p2-evasion-synced`

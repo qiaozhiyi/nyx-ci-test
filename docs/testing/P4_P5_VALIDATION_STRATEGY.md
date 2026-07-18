@@ -3,6 +3,12 @@
 > **约束:** 只用 GitHub Actions 的 **hosted** runner(`windows-latest`),不使用 self-hosted。
 > **结论:** ✅ **可行**(含 kernelsdk BYOVD)。P4 Foliage APC、P5 Pool Party 是纯用户态;**kernelsdk 的 BYOVD 路径也能跑**(RTCore64 是合法签名,不需 test-signing;hosted runner 有管理员权限 + UAC 关闭;HVCI 大概率默认关)。
 > **日期:** 2026-07-06
+>
+> ⚠️ **2026-07-18 勘误：** 本策略假设 P4 Foliage APC 已在生产路径中生效。据
+> [`AUTHORITATIVE_FACTS`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) §2，**睡眠混淆当前未接线**
+> （`implant-win/src/kits.rs:65-71` 短路到 `beacon::sleep_seconds`，Foliage/Fluctuation/mem::mask
+> 全为死路径）。下方 P4 CI gate（`ci_foliage_apc_survives_one_cycle`）即便不崩，也**不证明线上
+> beacon 真的在加密睡眠**——需先修 §3 优先级缺口 #1（接线睡眠混淆），本 workflow 的 P4 判据才有意义。
 
 ---
 

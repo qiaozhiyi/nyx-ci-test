@@ -1,5 +1,7 @@
 # Nyx 多信道传输层设计
 
+> ⚠️ **关键现状（AUTHORITATIVE_FACTS §0/§1/§3 #4，2026-07-18 审计）**：`transport` crate 已有 **6 个 Transport impl**（Malleable / DoH / Slack / LLM / MCP / SMB），**全部零消费者**——trait 与实现都已存在，但 implant/server 侧**无任何消费路径**。implant 实际回连通道仍为单一 HTTPS（axum + rustls）。TLS 指纹伪装（`build_impersonating_client`）是 **Err stub**，JA3/JA4 嗅探引擎已实现但 emission 未接线。**本文件描述的六级信道栈是目标架构，非现状。** 数字与状态以 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) 为准。
+
 > **2026-07-07 · 情报基线:**
 > Shrike (2026) — 20+ 隐蔽信道检测 · ArchWorks (2026) — L0-L9 隧道分层检测
 > QuicFuscate (2026) — Rust 模块化 QUIC 传输栈 · HTTP/3 Multiplexing Covert (2026)
@@ -9,12 +11,15 @@
 
 ## 当前 vs 目标
 
-| 维度 | 当前 | 目标 |
+> ⚠️ "当前"列经 2026-07-18 审计修正。transport crate 的 6 个 Transport impl 是**真实存在但零消费者**的代码，不算作"已生效信道"。
+
+| 维度 | 当前（2026-07-18 审计） | 目标 |
 |------|------|------|
-| 协议 | 1 (HTTPS) | 6 (QUIC / WS / H2 / DNS / ICMP / HTTPS) |
+| 协议（implant 实际回连） | **1（HTTPS via WinHTTP/axum+rustls）** | 6（QUIC / WS / H2 / DNS / ICMP / HTTPS） |
+| transport crate Transport impl | **6 个（Malleable/DoH/Slack/LLM/MCP/SMB），全部零消费者** | 6 个全接线 + 自动降级 |
 | 信道模式 | 单信道 | 多信道自动降级 |
-| 传输层 | 硬编码 WinHTTP | `Transport` trait 可插拔 |
-| JA4 指纹 | 无 | 每信道独立 JA4/JA4H 随机化 |
+| 传输层 | 硬编码 WinHTTP（implant） | `Transport` trait 可插拔（trait 已定义，未消费） |
+| JA4 指纹 | **引擎已实现（JA3/JA4 计算），emission 未接线（Err stub）** | 每信道独立 JA4/JA4H 随机化 |
 | 隐蔽性 | 低（单一直连 HTTPS） | 五级降级链 |
 
 ---
@@ -128,9 +133,14 @@ impl TransportStack {
 
 ## 实施计划
 
+> ⚠️ **现状修正（AUTHORITATIVE_FACTS §0/§1/§3 #4）**：P19a（Transport trait）与 6 个 Transport impl **已存在**，本阶段的核心缺口是**接线消费者**（让 implant/server 实际调用这 6 个 impl），以及修复 TLS emitter stub（见下方"即刻行动"）。
+
 ```
-P19a. Transport trait (1 周)
-  crates/transport/src/traits.rs — Transport + TransportStack
+P0.（最高优先）transport 消费者接线——为 6 个零消费者 Transport impl 在 implant/server 补消费路径
+P0'. TLS emitter 接线——修复 transport/src/emitter.rs 的 Err stub（build_impersonating_client）
+
+P19a. Transport trait ✅ 已存在（crates/transport/src/traits.rs）+ 6 个 impl ✅ 已存在
+  缺口：消费者接线（implant/server 侧调用方）
 
 P19b. L6: HTTPS upgrade (1 周)
   crates/transport/src/https.rs — 现有 WinHTTP 封装 + JA4 指纹池
@@ -153,15 +163,19 @@ P19g. L5: ICMP (1 周)
 P19h. TransportStack 集成 (1 周)
   TransportStack + 自动降级 + 健康检查 + JA4 轮换
 
-总计: 12 周 · ~5,000 LOC
+总计: 12 周 · ~5,000 LOC（不含消费者接线与 emitter 修复的 P0 工作）
 ```
 
 ---
 
 ## 即刻行动
 
+> ⚠️ 优先级已重排：先做消费者接线与 emitter 修复（AUTHORITATIVE_FACTS §3 #4/#5），再做 P19b 起的新信道。
+
 ```
-1. P19a — 创建 crates/transport/src/traits.rs: Transport trait + TransportStack
+0.（最高优先）transport 消费者接线——6 个 Transport impl 接到 implant beacon / server 路由
+0'. TLS emitter 修复——transport/src/emitter.rs 的 build_impersonating_client 从 Err stub 改为真实现
+1. P19a — ✅ traits.rs 已存在，无需新建
 2. P19b — 封装现有 WinHTTP 为 Transport impl
 3. P19d — DNS Tunneling（最高性价比——零额外依赖，无处不在）
 ```

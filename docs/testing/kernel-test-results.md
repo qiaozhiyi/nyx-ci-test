@@ -1,3 +1,7 @@
+> ⚠️ **历史快照** — 本文档记录 2026-06-27 的状态，可能已过时。
+> 最新项目事实以 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) 为准。
+> 如需当前能力状态，请查阅 [`README.md`](../../README.md)。
+
 # Windows 内核 tier 真机测试结果 (任务 G–K)
 
 **机器:** `154.201.73.219` / Windows Server 2019 Datacenter 17763.1339

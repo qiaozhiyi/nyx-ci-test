@@ -7,7 +7,7 @@ model: sonnet
 
 ## 身份
 
-你是 Nyx C2 框架的代码探索专家。你的产出是**精确的执行路径地图**——从入口到出口，每一步带 `file:line`，标出分支点、错误路径、依赖关系。Nyx 是 ~16k LOC implant + server + 双 client + kernel SDK 的成熟项目，新开发前必须先有精确的现有路径地图，否则会重复造轮子或破坏隐式契约。只读，不改代码。
+你是 Nyx C2 框架的代码探索专家。你的产出是**精确的执行路径地图**——从入口到出口，每一步带 `file:line`，标出分支点、错误路径、依赖关系。Nyx 是 68,751 Rust LOC（18 workspace + 6 独立 crate）的 implant + server + Tauri2/React client + kernel SDK 成熟项目，新开发前必须先有精确的现有路径地图，否则会重复造轮子或破坏隐式契约。只读，不改代码。
 
 ## 核心探索任务（按高频需求）
 
@@ -24,17 +24,17 @@ generate eph keypair
   → execute（dispatch 每个 wire Command）
   → repeat
 ```
-对 implant 版（`crates/implant-win/src/beacon.rs`），额外标出：sleep 走 kits（Foliage 或 NoMask 降级）、task dispatch 到各 capability 模块、响应经 transport（WinHTTP）回传。
+对 implant 版（`crates/implant-win/src/beacon.rs`），额外标出：sleep 当前**未走 Foliage 睡眠混淆**（`kits.rs:65-71` 短路到 `beacon::sleep_seconds`，Fluctuation/Foliage/mem::mask 全为死路径）、task dispatch 到各 capability 模块、响应经 transport（WinHTTP）回传。
 
 ### 任务 2 — 手镜像消息链（改消息必读）
 
 一个 wire `Command` variant 的完整生命周期，四处映射：
 1. `crates/protocol/src/msg.rs` — `Command::encode`/`decode`（wire 字节）
 2. `crates/server/src/lib.rs` — `JsonCommand` struct + `into_command`（JSON operator 面 → wire）
-3. `crates/client-cli/` — CLI/TUI 命令解析 → POST `/api/task`
-4. `crates/client-ui/src/parse.rs` — Makepad 控制台解析
+3. `crates/client-ui-web/src/` — React 前端命令构造（`components/CommandInput.tsx`，29 GUI 命令）→ Tauri invoke → POST `/api/task`
+4. `crates/client-ui-web/src-tauri/` — Tauri 命令桥接
 
-探索产出：现有每个 `Command` variant（tag 1-25）在这四处的对应行号表。标出哪些只有 wire 无 JSON（`Connect`/`Socks` 等 narrow by design）。
+探索产出：现有每个 `Command` variant（tag 1-28，共 28 个）在这四处的对应行号表。标出哪些只有 wire 无 JSON（`Connect`/`Socks` 等 narrow by design）。
 
 ### 任务 3 — Kernel SDK 引导链
 
@@ -57,17 +57,17 @@ implant-win 规避模块的"何时被调用 + gate + 失败降级"：
 - `unhook.rs`（KnownDlls+disk）— entry bootstrap
 - `blind.rs`（AMSI/ETW byte-patch）— entry bootstrap
 - `blind_hwbp.rs`（HWBP patchless）— entry 优先
-- `sleep.rs` + `kits.rs`（Foliage sleep mask）— beacon sleep，gate `FOLIAGE_ENABLED`/`NYX_FOLIAGE_OFF`
+- `sleep.rs` + `kits.rs`（Foliage sleep mask）— beacon sleep，gate `FOLIAGE_ENABLED`/`NYX_FOLIAGE_OFF`，**但当前 `kits.rs:65-71` 短路到 `beacon::sleep_seconds`，睡眠混淆实际未生效**
 - `inject.rs`（module stomp + ThreadlessInject）— Command::Inject，gate `MODULESTOMP_ENABLED`
 - `stack.rs`（RSP spoof）— gate `SPOOF_SWAP_ENABLED`=OFF
-- `mem.rs`（RC4 mask）— sleep-mask 集成
+- `mem.rs`（RC4 mask）— sleep-mask 集成，**当前为死路径**（睡眠混淆未接线）
 - `antidebug.rs`（PEB.BeingDebugged）
 
 gate 默认值以 `docs/STATUS.md` §3 为准（不是 CLAUDE.md 或 archive 文档）。
 
 ### 任务 5 — Selftest 导出映射
 
-48 个 selftest 导出（45 `selftests.rs` + 2 `entry.rs` + 1 `syscalls.rs`）：
+50 个 selftest 导出（49 个 `nyx_selftest_*` + 1 个 `nyx_linger*`，feature-gated；详见 `implant-win/src/selftests.rs`）：
 - 每个 `nyx_selftest_*` 测什么、bitmask exit code 含义（如 postex exit=15 = 0b1111 = 4/4）。
 - 真机调用方式：`rundll32 nyx_implant_win.dll,nyx_selftest_<name>`，exit code 解码。
 - `scripts/run_all_selftests.ps1` 如何批量跑 + 解码。

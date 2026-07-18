@@ -3,6 +3,7 @@
 > **制定日期:** 2026-07-07
 > **合规目标:** CNSA 2.0 (NSA 2025) · NIST FIPS 203/204/205/206 (2024) · NIST IR 8547 (2024)
 > **协议参考:** Signal PQXDH (2023 生产) · MLS RFC 9420 · Noise Protocol Framework · IETF TLS 1.3 Hybrid KEM (draft-ietf-tls-ecdhe-mlkem)
+> **事实口径:** "当前 Nyx" 列以 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) §1（protocol crate ✅，X25519+HKDF+ChaCha20-Poly1305，40 测试，无 stub）为准。本文是 CNSA 2.0 升级规划，P1–P4 均为**未实施**的目标态。
 
 ---
 
@@ -359,7 +360,7 @@ pub fn build_noise_handshake(
 Week 1-2:  P1 Hybrid KEM + SHA-512 upgrade (minimal diff)
            └─ crates/protocol/src/pq.rs
            └─ Frame v3 wire format (backward compatible flag)
-           └─ cargo test --workspace (must pass all 88 tests)
+           └─ cargo test --workspace (当前 protocol 加密测试 40 个，AUTHORITATIVE_FACTS §0；升级后须保持全绿，不得引入回归)
 
 Week 3-6:  P2 Double Ratchet
            └─ crates/protocol/src/ratchet.rs

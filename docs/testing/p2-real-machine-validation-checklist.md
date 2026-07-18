@@ -1,3 +1,7 @@
+> ⚠️ **历史快照** — 本文档记录 2026-06-24 的状态，可能已过时。
+> 最新项目事实以 [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) 为准。
+> 如需当前能力状态，请查阅 [`README.md`](../../README.md)。
+
 # P2 Bypass 模块 — Windows 真机验证清单
 
 > **本清单本会话不执行**。以下是为在 `ssh win`（Server 2019, build 17763）
