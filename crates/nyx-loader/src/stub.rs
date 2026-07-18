@@ -264,7 +264,7 @@ pub fn reflective_load_at(
     let image_base_preferred = win.image_base;
     let size_of_image = win.size_of_image as usize;
     let size_of_headers = win.size_of_headers as usize;
-    let entry_rva = opt.standard_fields.address_of_entry_point as u64;
+    let entry_rva = opt.standard_fields.address_of_entry_point;
 
     // ── 1. Allocate the image buffer (target: NtAllocateVirtualMemory) ────
     // Zero-filled so unmapped gaps (e.g. .bss) read as zero, matching the
@@ -345,7 +345,7 @@ fn copy_section(
         return Ok(());
     }
 
-    let src_end = raw_off.checked_add(raw_size).ok_or_else(|| {
+    let src_end = raw_off.checked_add(raw_size).ok_or({
         ReflectiveLoadError::SectionOutOfRange {
             section: index,
             raw_offset: sec.pointer_to_raw_data,
@@ -443,7 +443,7 @@ fn apply_base_relocations(
 ///   * `imp.dll`     — the owning module name (e.g. "kernel32.dll"),
 ///   * `imp.name`    — the imported symbol (or "ORDINAL n"),
 ///   * `imp.offset`  — the **IAT slot RVA** that must receive the resolved
-///                     function pointer (= `FirstThunk + i * 8`).
+///     function pointer (= `FirstThunk + i * 8`).
 ///
 /// Note goblin also exposes `imp.rva`, but that holds the *hint/name table*
 /// RVA (or 0 for ordinal imports), NOT the IAT slot — patching it would
@@ -568,7 +568,7 @@ mod tests {
         // import descriptor (20B), null descriptor (20B), dll name, reloc block.
         // Both the IAT and ILT are walked by goblin until a zero qword, so each
         // needs its own 8-byte null terminator.
-        let iat_slot_rva = rdata_rva + 0x00; // FirstThunk: one entry + null
+        let iat_slot_rva = rdata_rva; // FirstThunk: one entry + null
         let ilt_slot_rva = rdata_rva + 0x10; // OriginalFirstThunk: one entry + null
         let hint_name_rva = rdata_rva + 0x20; // u16 hint + "ExportedFn\0"
         let sym_name = b"ExportedFn\0";

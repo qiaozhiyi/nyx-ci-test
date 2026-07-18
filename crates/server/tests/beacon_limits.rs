@@ -167,7 +167,12 @@ async fn post_task_rejects_when_pending_queue_is_full() {
     // OOM. Past MAX_PENDING_PER_SESSION the enqueue must be rejected (back-
     // pressure), not silently grow the queue.
     use nyx_server::MAX_PENDING_PER_SESSION;
-    let state = Arc::new(AppState::default());
+    let mut state = AppState::default();
+    // RBAC: open mode now maps anonymous → Viewer (read-only), so post_task
+    // would 403. Set a legacy api_token (→ _legacy Admin) and send it as a
+    // Bearer — mirrors how a production operator authenticates.
+    state.api_token = Some("test-admin-token".to_string());
+    let state = Arc::new(state);
     let server_pub = state.keypair.public_bytes();
     // Seed one real session via a valid check-in (so post_task finds it).
     let (frame, pubkey) = valid_checkin_frame(&server_pub);
@@ -181,23 +186,27 @@ async fn post_task_rejects_when_pending_queue_is_full() {
     assert!(code == 200, "check-in must succeed, got {code}");
     let session_hex = hex::encode(pubkey);
 
-    // Enqueue MAX_PENDING_PER_SESSION tasks (no token configured → auth open).
+    // Enqueue MAX_PENDING_PER_SESSION tasks as the authenticated _legacy admin.
     for _ in 0..MAX_PENDING_PER_SESSION {
-        let code = status_of(ureq::post(format!("{url}/api/task").as_str()).send_json(
-            serde_json::json!({
-                "session": session_hex,
-                "command": { "type": "ping" }
-            }),
-        ));
+        let code = status_of(
+            ureq::post(format!("{url}/api/task").as_str())
+                .set("Authorization", "Bearer test-admin-token")
+                .send_json(serde_json::json!({
+                    "session": session_hex,
+                    "command": { "type": "ping" }
+                })),
+        );
         assert_eq!(code, 200, "enqueue within cap must succeed");
     }
     // The very next enqueue must be rejected (4xx/5xx), not accepted.
-    let over = status_of(ureq::post(format!("{url}/api/task").as_str()).send_json(
-        serde_json::json!({
-            "session": session_hex,
-            "command": { "type": "ping" }
-        }),
-    ));
+    let over = status_of(
+        ureq::post(format!("{url}/api/task").as_str())
+            .set("Authorization", "Bearer test-admin-token")
+            .send_json(serde_json::json!({
+                "session": session_hex,
+                "command": { "type": "ping" }
+            })),
+    );
     assert!(
         over >= 400,
         "enqueue past MAX_PENDING_PER_SESSION ({MAX_PENDING_PER_SESSION}) must be rejected, got {over}"

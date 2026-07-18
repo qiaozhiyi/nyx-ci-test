@@ -9,7 +9,9 @@ use nyx_server::{router, AppState};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn checkin_then_shell_task_roundtrips() {
-    let state = Arc::new(AppState::default());
+    let mut state = AppState::default();
+    state.api_token = Some("test-admin-token".to_string());
+    let state = Arc::new(state);
     let server_pub = state.keypair.public_bytes();
     let app = router(state);
 
@@ -41,6 +43,7 @@ async fn checkin_then_shell_task_roundtrips() {
     // 1. wait for the agent to check in.
     let session = poll_until(Duration::from_secs(10), || async {
         let list: serde_json::Value = ureq::get(format!("{url}/api/sessions").as_str())
+            .set("Authorization", "Bearer test-admin-token")
             .call()
             .ok()?
             .into_json()
@@ -57,6 +60,7 @@ async fn checkin_then_shell_task_roundtrips() {
         "command": { "type": "shell", "args": "echo nyx-p0-ok" },
     });
     let ack: serde_json::Value = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
         .send_json(body)
         .expect("enqueue task")
         .into_json()
@@ -66,6 +70,7 @@ async fn checkin_then_shell_task_roundtrips() {
     // 3. poll results until the shell output arrives.
     let output = poll_until(Duration::from_secs(10), || async {
         let rs: serde_json::Value = ureq::get(format!("{url}/api/results").as_str())
+            .set("Authorization", "Bearer test-admin-token")
             .query("session", &session)
             .call()
             .ok()?
@@ -92,7 +97,9 @@ async fn checkin_then_shell_task_roundtrips() {
         "session": session,
         "command": { "type": "exit" },
     });
-    let _ = ureq::post(format!("{url}/api/task").as_str()).send_json(exit);
+    let _ = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .send_json(exit);
     // allow the agent thread to process Exit and return.
     let join = tokio::task::spawn_blocking(move || agent.join());
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
@@ -103,7 +110,9 @@ async fn checkin_then_shell_task_roundtrips() {
 /// reassemble the streamed FileChunks back through the control API.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upload_then_download_roundtrips() {
-    let state = Arc::new(AppState::default());
+    let mut state = AppState::default();
+    state.api_token = Some("test-admin-token".to_string());
+    let state = Arc::new(state);
     let server_pub = state.keypair.public_bytes();
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -135,6 +144,7 @@ async fn upload_then_download_roundtrips() {
 
     let session = poll_until(Duration::from_secs(10), || async {
         let list: serde_json::Value = ureq::get(format!("{url}/api/sessions").as_str())
+            .set("Authorization", "Bearer test-admin-token")
             .call()
             .ok()?
             .into_json()
@@ -153,6 +163,7 @@ async fn upload_then_download_roundtrips() {
         "command": { "type": "upload", "name": "loot/secret.bin", "data_hex": hex::encode(&payload) },
     });
     let ack: serde_json::Value = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
         .send_json(body)
         .expect("enqueue upload")
         .into_json()
@@ -163,6 +174,7 @@ async fn upload_then_download_roundtrips() {
     // same execute() call that produces the ack, so once acked the file exists.
     poll_until(Duration::from_secs(10), || async {
         let rs: serde_json::Value = ureq::get(format!("{url}/api/results").as_str())
+            .set("Authorization", "Bearer test-admin-token")
             .query("session", &session)
             .call()
             .ok()?
@@ -189,6 +201,7 @@ async fn upload_then_download_roundtrips() {
         "command": { "type": "download", "path": "loot/secret.bin" },
     });
     let ack: serde_json::Value = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
         .send_json(body)
         .expect("enqueue download")
         .into_json()
@@ -197,6 +210,7 @@ async fn upload_then_download_roundtrips() {
 
     let got = poll_until(Duration::from_secs(10), || async {
         let rs: serde_json::Value = ureq::get(format!("{url}/api/results").as_str())
+            .set("Authorization", "Bearer test-admin-token")
             .query("session", &session)
             .call()
             .ok()?
@@ -234,7 +248,9 @@ async fn upload_then_download_roundtrips() {
 
     // 3. teardown
     let exit = serde_json::json!({ "session": session, "command": { "type": "exit" } });
-    let _ = ureq::post(format!("{url}/api/task").as_str()).send_json(exit);
+    let _ = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .send_json(exit);
     let join = tokio::task::spawn_blocking(move || agent.join());
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
 }
@@ -252,6 +268,7 @@ async fn malleable_beacon_uri_roundtrips() {
     let profile = nyx_server::load_profile(&path).expect("profile must load+lint");
     let state = AppState {
         profile: Some(profile.clone()),
+        api_token: Some("test-admin-token".to_string()),
         ..AppState::default()
     };
     let server_pub = state.keypair.public_bytes();
@@ -286,6 +303,7 @@ async fn malleable_beacon_uri_roundtrips() {
     // Check-in must succeed over the malleable URI.
     let session = poll_until(Duration::from_secs(10), || async {
         let list: serde_json::Value = ureq::get(format!("{url}/api/sessions").as_str())
+            .set("Authorization", "Bearer test-admin-token")
             .call()
             .ok()?
             .into_json()
@@ -303,6 +321,7 @@ async fn malleable_beacon_uri_roundtrips() {
         "command": { "type": "shell", "args": "echo malleable-ok" },
     });
     let ack: serde_json::Value = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
         .send_json(body)
         .expect("enqueue shell")
         .into_json()
@@ -310,6 +329,7 @@ async fn malleable_beacon_uri_roundtrips() {
     let task_id = ack["task_id"].as_u64().expect("task_id");
     let out = poll_until(Duration::from_secs(10), || async {
         let rs: serde_json::Value = ureq::get(format!("{url}/api/results").as_str())
+            .set("Authorization", "Bearer test-admin-token")
             .query("session", &session)
             .call()
             .ok()?
@@ -328,7 +348,9 @@ async fn malleable_beacon_uri_roundtrips() {
     assert!(out.contains("malleable-ok"), "unexpected output: {out:?}");
 
     let exit = serde_json::json!({ "session": session, "command": { "type": "exit" } });
-    let _ = ureq::post(format!("{url}/api/task").as_str()).send_json(exit);
+    let _ = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .send_json(exit);
     let join = tokio::task::spawn_blocking(move || agent.join());
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
 }
@@ -467,6 +489,7 @@ async fn all_control_api_endpoints_require_bearer_auth() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scripting_events_fire_on_beacon_cycle() {
     let mut state = AppState::default();
+    state.api_token = Some("test-admin-token".to_string());
     let log = nyx_scripting::LogHook::new();
     let recs = log.records.clone();
     state.events.register(Box::new(log));
@@ -499,6 +522,7 @@ async fn scripting_events_fire_on_beacon_cycle() {
 
     let session = poll_until(Duration::from_secs(10), || async {
         let list: serde_json::Value = ureq::get(format!("{url}/api/sessions").as_str())
+            .set("Authorization", "Bearer test-admin-token")
             .call()
             .ok()?
             .into_json()
@@ -528,6 +552,7 @@ async fn scripting_events_fire_on_beacon_cycle() {
         "command": { "type": "shell", "args": "echo ev-ok" },
     });
     let ack: serde_json::Value = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
         .send_json(body)
         .unwrap()
         .into_json()
@@ -535,6 +560,7 @@ async fn scripting_events_fire_on_beacon_cycle() {
     let task_id = ack["task_id"].as_u64().unwrap();
     poll_until(Duration::from_secs(10), || async {
         let rs: serde_json::Value = ureq::get(format!("{url}/api/results").as_str())
+            .set("Authorization", "Bearer test-admin-token")
             .query("session", &session)
             .call()
             .ok()?
@@ -563,6 +589,7 @@ async fn scripting_events_fire_on_beacon_cycle() {
     .expect("ResultReceived event never fired");
 
     let _ = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
         .send_json(serde_json::json!({ "session": session, "command": { "type": "exit" } }));
     let join = tokio::task::spawn_blocking(move || agent.join());
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
@@ -636,6 +663,7 @@ async fn profile_output_transform_envelope_roundtrips() {
     let profile = nyx_server::load_profile(&path).expect("profile must load+lint");
     let state = AppState {
         profile: Some(profile.clone()),
+        api_token: Some("test-admin-token".to_string()),
         ..AppState::default()
     };
     let server_pub = state.keypair.public_bytes();
@@ -668,6 +696,7 @@ async fn profile_output_transform_envelope_roundtrips() {
     // Check-in over the envelope-shaped transaction must succeed.
     let session = poll_until(Duration::from_secs(10), || async {
         let list: serde_json::Value = ureq::get(format!("{url}/api/sessions").as_str())
+            .set("Authorization", "Bearer test-admin-token")
             .call()
             .ok()?
             .into_json()
@@ -685,6 +714,7 @@ async fn profile_output_transform_envelope_roundtrips() {
         "command": { "type": "shell", "args": "echo envelope-ok" },
     });
     let ack: serde_json::Value = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
         .send_json(body)
         .expect("enqueue shell")
         .into_json()
@@ -692,6 +722,7 @@ async fn profile_output_transform_envelope_roundtrips() {
     let task_id = ack["task_id"].as_u64().expect("task_id");
     let out = poll_until(Duration::from_secs(10), || async {
         let rs: serde_json::Value = ureq::get(format!("{url}/api/results").as_str())
+            .set("Authorization", "Bearer test-admin-token")
             .query("session", &session)
             .call()
             .ok()?
@@ -710,7 +741,9 @@ async fn profile_output_transform_envelope_roundtrips() {
     assert!(out.contains("envelope-ok"), "unexpected output: {out:?}");
 
     let exit = serde_json::json!({ "session": session, "command": { "type": "exit" } });
-    let _ = ureq::post(format!("{url}/api/task").as_str()).send_json(exit);
+    let _ = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .send_json(exit);
     let join = tokio::task::spawn_blocking(move || agent.join());
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
 }
