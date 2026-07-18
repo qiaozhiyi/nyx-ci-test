@@ -915,6 +915,7 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
                     nyx_coff::ApplyError::Unresolved(_) => "unresolved external",
                     nyx_coff::ApplyError::BadOffset => "bad offset",
                     nyx_coff::ApplyError::UnsupportedReloc(_) => "unsupported reloc type",
+                    nyx_coff::ApplyError::RelocOverflow => "reloc displacement out of i32 range",
                 });
                 return Response::Err(m);
             }

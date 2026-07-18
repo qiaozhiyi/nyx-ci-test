@@ -88,7 +88,13 @@ pub fn enumerate_gaps(
             push_samples(&mut out, a_end, b_begin, GapKind::InterFunction, max_per_gap);
         }
     }
-    let last = *entries.last().unwrap();
+    // SAFETY: the `entries.is_empty()` early-return above guarantees at least
+    // one element here. Use `expect` rather than `unwrap` so the invariant is
+    // documented at the call site and any future refactor that drops the guard
+    // produces a diagnosable panic instead of a bare `unwrap`.
+    let last = *entries
+        .last()
+        .expect("checked non-empty at the early-return above");
     let last_end = last.end_address.max(last.begin_address);
     if image_size > last_end {
         push_samples(&mut out, last_end, image_size, GapKind::TailPadding, max_per_gap);

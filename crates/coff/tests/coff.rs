@@ -12,9 +12,12 @@ use nyx_coff::{apply, parse, reloc, SymbolResolver};
 struct TableResolver(HashMap<String, u64>);
 impl SymbolResolver for TableResolver {
     fn resolve(&self, name: &str) -> Option<u64> {
-        // Resolve every symbol to a deterministic address so apply() succeeds;
-        // we single out BeaconPrintf for an exact displacement check.
-        self.0.get(name).copied().or(Some(0xAA00_0000))
+        // Resolve every symbol to a deterministic address so apply() succeeds.
+        // The default is kept within i32 displacement of the 0x10000 base so a
+        // REL32 fixup's disp actually fits — a far-away default (e.g.
+        // 0xAA00_0000, ~2.8 GiB) would now correctly trip RelocOverflow, now
+        // that the truncation is a hard error rather than silent.
+        self.0.get(name).copied().or(Some(0x0001_0000 + 0x2000))
     }
 }
 
@@ -76,8 +79,15 @@ fn applies_rel32_call_relocation_correctly() {
         call.typ
     );
 
+    // Pick a target within i32 displacement of the fixup so the REL32 disp
+    // actually fits — historically this test used 0xDEAD_BEEF (~3.7 GiB away
+    // from the 0x10000 base), which exceeds the ±2 GiB REL32 range and only
+    // "worked" because the old code silently truncated the i64 disp to i32.
+    // The disp range check now rejects that, so exercise the happy path with
+    // an in-range target (the dedicated applies_rel32_overflow_rejected test
+    // below covers the out-of-range branch).
     let base: u64 = 0x0001_0000;
-    let target: u64 = 0xDEAD_BEEF;
+    let target: u64 = 0x0001_0000 + 0x1000;
     let mut map = HashMap::new();
     map.insert("BeaconPrintf".to_string(), target);
     let resolver = TableResolver(map);
@@ -116,6 +126,43 @@ fn applies_rel32_call_relocation_correctly() {
     // Determinism: applying twice with identical inputs yields identical bytes.
     let patched2 = apply(text, &coff, base, &resolver).unwrap();
     assert_eq!(patched, patched2);
+}
+
+#[test]
+fn applies_rel32_overflow_is_rejected() {
+    // A REL32[_N] displacement that does not fit in i32 must be reported as
+    // RelocOverflow rather than silently truncated. We place the resolved
+    // BeaconPrintf target ~3.7 GiB away from the fixup location; before the
+    // range check this produced a wrong-but-deterministic fixup via an `as i32`
+    // truncation. The whole point of the fix is that this now fails cleanly.
+    let coff = parse(FIXTURE).unwrap();
+    let text = coff
+        .sections
+        .iter()
+        .find(|s| s.name == ".text")
+        .expect(".text section");
+    let bp_idx = coff
+        .symbols
+        .iter()
+        .find(|s| s.name == "BeaconPrintf")
+        .expect("BeaconPrintf present")
+        .index;
+    assert!(
+        text.relocations.iter().any(|r| r.symbol_index == bp_idx),
+        "fixture must have a REL32 reloc against BeaconPrintf"
+    );
+
+    let base: u64 = 0x0001_0000;
+    let target: u64 = 0xDEAD_BEEF; // ~3.7 GiB from base → disp > i32::MAX
+    let mut map = HashMap::new();
+    map.insert("BeaconPrintf".to_string(), target);
+    let resolver = TableResolver(map);
+
+    let err = apply(text, &coff, base, &resolver).expect_err("out-of-range disp must be rejected");
+    assert!(
+        matches!(err, nyx_coff::ApplyError::RelocOverflow),
+        "out-of-range REL32 disp must surface as RelocOverflow, got {err:?}"
+    );
 }
 
 #[test]

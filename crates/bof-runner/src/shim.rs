@@ -14,6 +14,13 @@ use std::os::raw::c_char;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const OUT_CAP: usize = 16 * 1024;
+// TODO(soundness): `static mut OUT` is fine under the current single-threaded
+// BOF execution contract (and `Loaded` is no longer `Sync`, so `&Loaded`
+// cannot leak across threads), but Miri still flags the mutable static for
+// aliasing. The full fix is `static OUT: Mutex<[u8; OUT_CAP]>` — deferred
+// because this is the BOF output hot path (`push_byte` is called per char and
+// Mutex locking would regress BOF capture throughput). Revisit if/when BOF
+// execution becomes multi-threaded or if we enable Miri in CI.
 static mut OUT: [u8; OUT_CAP] = [0; OUT_CAP];
 static OUT_LEN: AtomicUsize = AtomicUsize::new(0);
 

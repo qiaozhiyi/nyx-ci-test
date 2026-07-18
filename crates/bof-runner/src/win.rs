@@ -126,7 +126,12 @@ impl Drop for Loaded {
 // does not outlive the call). `HashMap<String,u64>` and `u64` are `Send`, so
 // the whole struct is safe to move across threads.
 unsafe impl Send for Loaded {}
-unsafe impl Sync for Loaded {}
+// NOTE: `Sync` is deliberately NOT implemented. Sharing `&Loaded` across
+// threads would expose the BOF's RWX `base` region to data races, and BOF
+// execution is single-threaded by contract (`agent-dev` spawns one owned
+// thread that takes ownership of the `Loaded`). If a future caller needs to
+// share `&Loaded` across threads, audit the RWX region and the `static mut
+// OUT` capture buffer in `shim.rs` first — do NOT blindly re-add `Sync`.
 
 pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result<Loaded, String> {
     let coff = parse(blob).map_err(|e| format!("parse: {e:?}"))?;
@@ -262,8 +267,12 @@ unsafe fn write_trampoline(addr: u64, target: u64) {
     core::ptr::write(p.add(3), 0x00u8);
     core::ptr::write(p.add(4), 0x00u8);
     core::ptr::write(p.add(5), 0x00u8);
-    // 8-byte absolute target (little-endian)
-    core::ptr::write(p.add(6) as *mut u64, target);
+    // 8-byte absolute target (little-endian). `p.add(6)` is 6 mod 8 — i.e. NOT
+    // u64-aligned — so we MUST use `write_unaligned` here. Plain `ptr::write`
+    // requires alignment; on it this would be UB (x86-64 hardware tolerates
+    // misalignment, but LLVM is free to exploit the alignment assumption and
+    // Miri flags it). `write_unaligned` emits an unaligned store.
+    core::ptr::write_unaligned(p.add(6) as *mut u64, target);
 }
 
 // ── Beacon-API table ────────────────────────────────────────────────────────

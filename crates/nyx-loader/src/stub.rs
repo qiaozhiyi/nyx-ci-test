@@ -419,7 +419,15 @@ fn apply_base_relocations(
             if target + 8 > image.len() {
                 return Err(ReflectiveLoadError::RelocTableTruncated);
             }
-            let current = u64::from_le_bytes(image[target..target + 8].try_into().unwrap());
+            // Defensive: a prior `target + 8 > image.len()` guard makes the
+            // slice exactly 8 bytes, so `try_into::<[u8; 8]>()` cannot fail —
+            // but we never `unwrap()` on attacker-supplied bytes. Propagate as
+            // a truncation error so a malformed reloc table surfaces cleanly
+            // instead of panicking under panic = "abort".
+            let arr: [u8; 8] = image[target..target + 8]
+                .try_into()
+                .map_err(|_| ReflectiveLoadError::RelocTableTruncated)?;
+            let current = u64::from_le_bytes(arr);
             let fixed = current.wrapping_add(delta);
             image[target..target + 8].copy_from_slice(&fixed.to_le_bytes());
         }

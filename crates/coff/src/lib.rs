@@ -69,6 +69,12 @@ pub enum ApplyError {
     Unresolved(String),
     BadOffset,
     UnsupportedReloc(u16),
+    /// A REL32[_N] relocation's computed displacement did not fit in an i32.
+    /// This happens when the resolved target is more than ~2 GiB away from the
+    /// fixup location (e.g. a BOF and its trampoline loaded far apart). Silently
+    /// truncating the i64 displacement to i32 would apply a wrong fixup and jump
+    /// to an unintended address; we surface it as a hard error instead.
+    RelocOverflow,
 }
 
 impl core::fmt::Display for ApplyError {
@@ -81,6 +87,9 @@ impl core::fmt::Display for ApplyError {
             ApplyError::BadOffset => f.write_str("relocation offset out of section bounds"),
             ApplyError::UnsupportedReloc(t) => {
                 write!(f, "unsupported relocation type 0x{t:04x}")
+            }
+            ApplyError::RelocOverflow => {
+                f.write_str("REL32 displacement out of i32 range (target > ~2 GiB from fixup)")
             }
         }
     }
@@ -377,7 +386,19 @@ pub fn apply<'a>(
                     _ => unreachable!("REL32 family arm caught non-family type"),
                 };
                 let cur = i32::from_le_bytes(buf[off..end].try_into().unwrap());
-                let v = cur.wrapping_add((target as i64 - loc as i64 - 4 - n) as i32);
+                // The displacement must fit in an i32 (the field width). If the
+                // resolved target is more than ~2 GiB away from the fixup
+                // location (e.g. BOF and trampoline loaded far apart), casting
+                // the i64 disp to i32 would silently truncate and apply a wrong
+                // fixup. Reject it instead. The pre-existing `end - off == 4`
+                // bounds check above makes the `try_into().unwrap()` above
+                // unreachable; it is left in because removing it would require
+                // an extra local.
+                let disp = target as i64 - loc as i64 - 4 - n;
+                if !(-2_147_483_648i64..=2_147_483_647i64).contains(&disp) {
+                    return Err(ApplyError::RelocOverflow);
+                }
+                let v = cur.wrapping_add(disp as i32);
                 buf[off..end].copy_from_slice(&v.to_le_bytes());
             }
             reloc::ADDR32NB => {

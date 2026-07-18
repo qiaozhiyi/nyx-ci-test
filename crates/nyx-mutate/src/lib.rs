@@ -29,6 +29,19 @@ use rand::SeedableRng;
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Which mutation passes to apply.
+///
+/// # Default
+///
+/// Only the `keys` pass is enabled by default. The `nops`, `registers`, and
+/// `substitute` passes are **soundness-unsafe**: they mutate instruction bytes
+/// without a real x86-64 decoder, so they cannot correctly fix up RIP-relative
+/// ModRM disp32 encodings (`mod==00 && rm==101`, e.g. `lea rax,[rip+disp]`) or
+/// reliably distinguish REX prefixes / opcode bytes in a raw byte stream. On a
+/// real PE they will produce a crashing binary.
+///
+/// They are retained for research / fuzzing harnesses that operate on synthetic
+/// byte buffers (the in-tree tests construct such buffers). To opt in, construct
+/// the struct explicitly, e.g. `MutationPasses { nops: true, ..Default::default() }`.
 #[derive(Debug, Clone, Copy)]
 pub struct MutationPasses {
     pub nops: bool,
@@ -40,10 +53,13 @@ pub struct MutationPasses {
 impl Default for MutationPasses {
     fn default() -> Self {
         Self {
-            nops: true,
-            registers: true,
+            // Soundness-unsafe without a real instruction decoder; off by default.
+            nops: false,
+            registers: false,
+            substitute: false,
+            // Safe: operates only on detected high-entropy byte blocks and is
+            // self-describing via the appended `.nyx_mut` recovery tail.
             keys: true,
-            substitute: true,
         }
     }
 }
@@ -133,6 +149,17 @@ fn is_rel_branch(data: &[u8], offset: usize) -> bool {
 /// inserts 1-8 bytes of NOP variants (chosen randomly). Adjusts all subsequent
 /// relative call/jmp displacements by the total number of bytes inserted so
 /// the binary still executes correctly.
+///
+/// # SOUNDNESS WARNING — off by default, do not enable on real PEs
+///
+/// This pass has **no real x86-64 decoder**. It only fixes up `E8`/`E9`
+/// relative branches; it does **not** fix up RIP-relative ModRM disp32
+/// encodings (`mod==00 && rm==101`, ubiquitous in x86-64 code such as
+/// `lea rax,[rip+disp]`, `mov rax,[rip+disp]`, RIP-relative calls, etc.).
+/// Inserting bytes before such an instruction shifts its target, so enabling
+/// this pass on a real PE will produce a crashing binary. It is retained only
+/// for testing on synthetic byte buffers. See `MutationPasses` for how to opt
+/// in explicitly.
 fn insert_nops(data: &mut Vec<u8>, seed: u64) -> usize {
     let mut rng = StdRng::seed_from_u64(seed);
 
@@ -214,6 +241,16 @@ fn insert_nops(data: &mut Vec<u8>, seed: u64) -> usize {
 ///
 /// The register encoding in ModRM.reg and ModRM.rm fields (bits 5:3 and 2:0):
 ///   r8=0, r9=1, r10=2, r11=3, r12=4, r13=5, r14=6, r15=7  (with REX.B or REX.R)
+///
+/// # SOUNDNESS WARNING — off by default, do not enable on real PEs
+///
+/// The scan assumes every byte in `0x40..=0x4F` is a REX prefix, but without a
+/// real decoder there is no way to know we are at an instruction boundary — the
+/// same byte could equally be an opcode, a ModRM, a displacement, or an
+/// immediate. Touching such a byte silently corrupts the instruction stream.
+/// Additionally the "32-byte window around `0xE8`/`0xFF`" heuristic is not a
+/// real control-flow analysis, so even the safe-zone reasoning is unreliable.
+/// Retained for testing on synthetic buffers only.
 fn rotate_registers(data: &mut [u8], seed: u64) -> usize {
     let mut rng = StdRng::seed_from_u64(seed);
 
@@ -406,6 +443,14 @@ fn randomize_keys(data: &mut Vec<u8>, seed: u64) -> usize {
 
             masks.push((mask, offset));
             randomized += 1;
+
+            // The recovery tail stores the mask count as a u16; stop once we
+            // hit that limit so we don't silently truncate on write below.
+            if randomized > u16::MAX as usize {
+                randomized = u16::MAX as usize;
+                masks.truncate(u16::MAX as usize);
+                break;
+            }
         }
 
         offset += 4; // step by 4 to catch unaligned keys too
@@ -422,7 +467,6 @@ fn randomize_keys(data: &mut Vec<u8>, seed: u64) -> usize {
     //   for each mask:
     //     [offset u32 LE]  — where the XOR was applied
     //     [mask   [32]u8]  — the XOR mask
-    let tail_start = data.len();
     data.extend_from_slice(&MUT_TAIL_MAGIC.to_le_bytes());
     data.extend_from_slice(&(randomized as u16).to_le_bytes());
     for (mask, off) in &masks {
@@ -431,11 +475,12 @@ fn randomize_keys(data: &mut Vec<u8>, seed: u64) -> usize {
     }
 
     // Pad to 4-byte alignment for well-formed PE.
-    while !data.len().is_multiple_of(4) {
+    // NOTE: written as `% 4 != 0` (not `!is_multiple_of(4)`) deliberately —
+    // `is_multiple_of` only stabilised in Rust 1.87 but our MSRV is 1.80.
+    #[allow(clippy::manual_is_multiple_of)] // guarded by MSRV, see note above
+    while data.len() % 4 != 0 {
         data.push(0);
     }
-
-    let _ = tail_start;
 
     randomized
 }
@@ -476,6 +521,15 @@ fn find_nyx_cfg(data: &[u8]) -> Option<usize> {
 ///
 /// The 0x90→0x87 0xC0 substitution also grows by 1 byte, so we apply the same
 /// guard: only when the next byte is 0x90 or 0xC3.
+///
+/// # SOUNDNESS WARNING — off by default, do not enable on real PEs
+///
+/// The "absorb the size growth into the following byte" strategy assumes that
+/// the byte after the target (`0x90`/`0xC3` check) is genuinely a separate
+/// instruction. Without a real decoder we cannot know that — it may be a ModRM,
+/// SIB, displacement, or immediate byte of the *current* instruction. Clobbering
+/// it corrupts the instruction stream. Retained for testing on synthetic buffers
+/// only; see `MutationPasses` for how to opt in explicitly.
 fn substitute_instructions(data: &mut [u8], seed: u64) -> usize {
     let mut rng = StdRng::seed_from_u64(seed);
     let len = data.len();
@@ -731,7 +785,15 @@ mod tests {
     fn mutation_report_tracks_all_passes() {
         let mut bin = vec![0xC3; 64];
         let m = Mutator::new(42);
-        let report = m.mutate(&mut bin, MutationPasses::default());
+        // `nops` is off by default (soundness-unsafe); enable explicitly here
+        // because this test exercises the NOP-insertion report path.
+        let report = m.mutate(
+            &mut bin,
+            MutationPasses {
+                nops: true,
+                ..Default::default()
+            },
+        );
         // nops_inserted should be non-zero (lots of rets, 50% probability).
         assert!(
             report.nops_inserted > 0,
