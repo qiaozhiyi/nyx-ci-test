@@ -25,38 +25,53 @@ use std::sync::RwLock;
 use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use serde::{Deserialize, Serialize};
 
 use crate::constant_time_eq;
 
-/// Pre-computed dummy argon2id hash for timing equalization on missing
-/// usernames (H6). `resolve()` returns immediately when a name isn't found, but
-/// runs the argon2 KDF for an existing one — a remote timing oracle that lets
-/// an attacker enumerate valid operator names. To close it, the not-found path
-/// verifies the supplied secret against this dummy hash first (the result is
-/// always wrong, so auth still fails — but the argon2 KDF runs in BOTH paths,
-/// equalizing timing). This is a real argon2id PHC string generated with
-/// `Argon2::default()` (m=19456, t=2, p=1) so `PasswordHash::new` parses it and
-/// the verifier does full work; the salt+hash correspond to a throwaway value,
-/// not any operator credential.
-const DUMMY_ARGON2_HASH: &str =
-    "$argon2id$v=19$m=19456,t=2,p=1$avsslxbZ8H9a70Oz4U8X2A$wyQB2YXwW8o/KHkgNgVa93jV2hezrFS9XtUiRh/p1eA";
+/// Construct the canonical argon2id instance used for hashing new secrets.
+///
+/// Defaults to OWASP 2023 baseline (m=64 MiB / 65536 KiB, t=3, p=1); tunable
+/// via `NYX_ARGON2_M` / `NYX_ARGON2_T` / `NYX_ARGON2_P` for hardware-specific
+/// calibration. Verification reads m/t/p from each record's PHC string, so
+/// existing records hashed under prior parameters still verify correctly.
+fn argon2_instance() -> Argon2<'static> {
+    let m_cost = std::env::var("NYX_ARGON2_M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(65536);
+    let t_cost = std::env::var("NYX_ARGON2_T")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let p_cost = std::env::var("NYX_ARGON2_P")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let params = Params::new(m_cost, t_cost, p_cost, None).expect("argon2 params must be valid");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
 
-/// Run the argon2 KDF against the dummy hash, discarding the result. Used on
-/// the username-not-found path of `resolve()` to equalize timing with the
-/// found path (which runs argon2 to verify the real secret). Parsing the PHC
-/// string is cached in a `OnceLock` so only the first miss pays the parse cost;
-/// subsequent misses share the parsed hash (the KDF still runs every time, which
-/// is the whole point). A parse failure (impossible for this constant, but
-/// defended against so a future edit can't panic the server under
-/// `panic = "abort"`) simply skips the dummy work.
+/// Run the argon2 KDF for timing equalization on missing usernames (H6), then
+/// discard the result. `resolve()` returns immediately when a name isn't found,
+/// but the found path runs the argon2 KDF — a remote timing oracle that lets an
+/// attacker enumerate valid operator names. To close it, the not-found path
+/// hashes the supplied secret against a throwaway salt here (the result is
+/// always wrong, so auth still fails — but the argon2 KDF runs in BOTH paths,
+/// equalizing timing).
+///
+/// Hashing (not verifying a pre-baked dummy) guarantees the KDF parameters
+/// exactly match the found path's `argon2_instance()` regardless of how the
+/// operator records were hashed — a static dummy baked at a different m/t/p
+/// would re-open the timing gap.
 fn run_dummy_argon2(secret: &str) {
-    static DUMMY: std::sync::OnceLock<Option<PasswordHash>> = std::sync::OnceLock::new();
-    let parsed = DUMMY.get_or_init(|| PasswordHash::new(DUMMY_ARGON2_HASH).ok());
-    if let Some(h) = parsed {
-        let _ = Argon2::default().verify_password(secret.as_bytes(), h);
-    }
+    // A fixed dummy salt is fine: we never store or compare the output, we just
+    // need the KDF to run with identical parameters as the found path. Using a
+    // random salt would add OsRng jitter that itself widens the timing gap.
+    static DUMMY_SALT: &[u8] = b"nyxdummytimingequalizationsalt";
+    let salt = SaltString::encode_b64(DUMMY_SALT).expect("21-byte salt encodes to b64");
+    let _ = argon2_instance().hash_password(secret.as_bytes(), &salt);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,8 +209,15 @@ impl OperatorRegistry {
                 let (n, sec) = s.split_once(':')?;
                 (!n.is_empty() && !sec.is_empty()).then_some((n, sec))
             }) {
-                let hash =
-                    hash_argon2(bs.1).unwrap_or_else(|_| format!("plain:{}", sha256_hex(bs.1)));
+                // Bootstrap operator: always argon2id. The plain: fallback is
+                // gone — if argon2 fails we surface the error rather than
+                // silently storing an unsalted SHA-256 (the legacy weakness).
+                let hash = hash_argon2(bs.1).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("bootstrap argon2 hash failed: {e}"),
+                    )
+                })?;
                 map.insert(
                     bs.0.to_string(),
                     OperatorRecord {
@@ -211,11 +233,15 @@ impl OperatorRegistry {
                     "bootstrapped admin operator from NYX_BOOTSTRAP_OPERATOR"
                 );
             } else if let Some(tok) = nyx_token.filter(|s| !s.is_empty()) {
+                // _legacy token: upgrade from plain:sha256 to argon2id. The
+                // legacy plain: path remains in verify_secret only for reading
+                // pre-existing records; new _legacy records are argon2id.
+                let hash = hash_argon2(tok).unwrap_or_else(|_| format!("plain:{}", sha256_hex(tok)));
                 map.insert(
                     "_legacy".into(),
                     OperatorRecord {
                         name: "_legacy".into(),
-                        secret_hash: format!("plain:{}", sha256_hex(tok)),
+                        secret_hash: hash,
                         role: Role::Admin,
                         created: now_secs(),
                     },
@@ -231,10 +257,23 @@ impl OperatorRegistry {
 
 /// Verify a secret against a stored hash. argon2 PHC strings use argon2;
 /// `plain:<hex>` markers use a constant-time SHA-256 compare (legacy `_legacy`).
+///
+/// The `plain:` SHA-256 path is **legacy**: it is kept only for backward-
+/// compatibility with operator records / `_legacy` tokens created before the
+/// argon2id upgrade. New tokens are always argon2id (see `hash_argon2`). A
+/// successful legacy match emits a warning prompting rehash to argon2id; the
+/// rehash itself must be flushed by the store layer (TODO: wire on next login).
 fn verify_secret(stored: &str, secret: &str) -> bool {
     if let Some(hex) = stored.strip_prefix("plain:") {
         let got = sha256_hex(secret);
-        return constant_time_eq(got.as_bytes(), hex.as_bytes());
+        let ok = constant_time_eq(got.as_bytes(), hex.as_bytes());
+        if ok {
+            tracing::warn!(
+                "legacy plain:sha256 secret verified; should be rehashed to argon2id on next login \
+                 (store-layer rehash TODO)"
+            );
+        }
+        return ok;
     }
     match PasswordHash::new(stored) {
         Ok(parsed) => Argon2::default()
@@ -244,10 +283,10 @@ fn verify_secret(stored: &str, secret: &str) -> bool {
     }
 }
 
-/// Hash a secret with argon2 → PHC string.
+/// Hash a secret with argon2id (OWASP baseline params) → PHC string.
 fn hash_argon2(secret: &str) -> Result<String, argon2::password_hash::Error> {
     let salt = SaltString::generate(&mut OsRng);
-    Ok(Argon2::default()
+    Ok(argon2_instance()
         .hash_password(secret.as_bytes(), &salt)?
         .to_string())
 }

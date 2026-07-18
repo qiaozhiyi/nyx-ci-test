@@ -45,6 +45,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use nyx_protocol::{
     encode_frame_dir, open_frame, parse_frame, wire::Reader, Command, Direction, FileOp,
@@ -1068,11 +1069,13 @@ fn handle_frame(
         // mismatch fails the AEAD tag deterministically. Log our current
         // identity so the operator can diff it against what the implant was
         // built/launched with — this turns a opaque "decryption failed" into a
-        // one-line diagnostic. (Do NOT log the implant's claimed pubkey at
-        // debug+ — it is attacker-controlled beacon input.)
+        // one-line diagnostic. The claimed pubkey is attacker-controlled beacon
+        // input, so only log a truncated prefix (8 hex) for correlation — never
+        // the full 64 hex (log-injection / passive-fingerprint surface).
         let our_pub = hex::encode(st.keypair.public_bytes());
+        let claimed_short = format!("{:.8}…", hex::encode(&raw.pubkey[..4]));
         tracing::warn!(
-            implant_pub = %hex::encode(raw.pubkey),
+            implant_pub_short = %claimed_short,
             this_server_pub = %our_pub,
             "frame decryption failed; if the implant was built/launched with a \
              different server_pub, regenerate it against this_server_pub (or fix \
@@ -1186,7 +1189,7 @@ fn handle_frame(
             info.arch,
             info.pid,
             info.is_admin,
-            info.auth_token.clone(),
+            info.auth_token,
         );
         let boot_time = now_unix();
         let session = Session {
@@ -1204,72 +1207,73 @@ fn handle_frame(
             stale: false,
             persisted_last_touch: Instant::now(),
         };
-        // Atomically check-and-insert. Closes the TOCTOU between the read-guard
-        // `is_new` decision above and the insert: two concurrent check-ins
-        // carrying the same ephemeral pubkey + counter=0 both saw `None`, both
-        // derived the same key, and a plain `insert` here would let the second
-        // silently overwrite the first session — losing its queued pending
-        // tasks. `entry()` holds the DashMap shard write lock across the vacant
-        // check AND the insert, so exactly one racer creates the entry; the
-        // other finds it occupied and reuses it (same derived key, same
-        // empty-task reply). The loser's pre-built `session` is dropped unused
-        // (its SessionKey is zeroized on Drop). The returned guard is a
-        // temporary, dropped at the semicolon, so the shard lock is released
-        // before the scripting event fires below.
+        // Atomically check-and-insert via `entry()`. This fully closes the
+        // TOCTOU that previously existed between `contains_key` and
+        // `or_insert_with` (two separate lock acquisitions): two concurrent
+        // check-ins carrying the same ephemeral pubkey + counter=0 could BOTH
+        // see `contains_key == false`, both proceed into the "newly inserted"
+        // branch, and both emit `encode_frame_dir(ServerToClient, 0, ...)` —
+        // reusing AEAD nonce 0 under the same session key and breaking the
+        // (key, nonce) uniqueness invariant of ChaCha20-Poly1305.
         //
-        // M1: check `contains_key` BEFORE the insert so we know whether THIS
-        // call won the race. Only the winner fires `SessionNew` AND replies
-        // with S2C nonce 0 — the loser returns a clean error (→ 400) so the
-        // server never emits two S2C:0 frames under one shared key (AEAD nonce
-        // reuse). The loser's next beacon cycle arrives as an existing session.
-        // (Small TOCTOU window remains if both pass `contains_key` before either
-        // inserts, but it closes the duplicate-nonce issue in the common case.)
-        let is_newly_inserted = !st.sessions.contains_key(&raw.pubkey);
-        st.sessions.entry(raw.pubkey).or_insert_with(|| session);
-        if is_newly_inserted {
-            st.events.fire(&new_event);
-            // Persist full session metadata so the registry survives a team-
-            // server restart. Fire-and-forget off the hot path: the upsert hands
-            // an owned record to the background writer thread, so a slow disk
-            // can never block this check-in. Only the race-winner persists (the
-            // loser bails before reaching here), so there's no double-write.
-            if let Some(persist) = &st.sessions_db {
-                let (beacon_id, hostname, username, os, arch, pid, is_admin, auth_token) =
-                    persist_info;
-                persist.upsert(nyx_store::SessionRecord {
-                    session_id: persist_id,
-                    beacon_id,
-                    hostname,
-                    username,
-                    os,
-                    arch,
-                    pid,
-                    is_admin,
-                    first_seen: boot_time,
-                    last_seen: boot_time,
-                    // SessionInfo.auth_token is [u8;32]; the store keeps a Vec.
-                    // By the time this row is written the token has already been
-                    // consumed in the `implants` table, so this is forensic, not
-                    // auth state.
-                    auth_token: auth_token.map(|t| t.to_vec()),
-                });
+        // `Entry::Vacant` holds the DashMap shard write lock across both the
+        // vacancy check AND the insert, so exactly one racer observes Vacant
+        // (winner: fires SessionNew, persists, replies S2C:0) while the other
+        // observes Occupied (loser: bails with a clean error → 400, no second
+        // S2C:0 frame). The loser's next beacon cycle arrives as an existing
+        // session. The loser's pre-built `session` is dropped unused (its
+        // SessionKey zeroizes on Drop).
+        match st.sessions.entry(raw.pubkey) {
+            Entry::Vacant(v) => {
+                // Winner: insert the session, then fire event + persist + reply.
+                // Insert via the vacant entry (not a separate `insert` call) so
+                // the shard lock stays held through the whole match arm.
+                v.insert(session);
+                st.events.fire(&new_event);
+                // Persist full session metadata so the registry survives a team-
+                // server restart. Fire-and-forget off the hot path: the upsert
+                // hands an owned record to the background writer thread, so a
+                // slow disk can never block this check-in. Only the race-winner
+                // persists (the loser bails below), so there's no double-write.
+                if let Some(persist) = &st.sessions_db {
+                    let (beacon_id, hostname, username, os, arch, pid, is_admin, auth_token) =
+                        persist_info;
+                    persist.upsert(nyx_store::SessionRecord {
+                        session_id: persist_id,
+                        beacon_id,
+                        hostname,
+                        username,
+                        os,
+                        arch,
+                        pid,
+                        is_admin,
+                        first_seen: boot_time,
+                        last_seen: boot_time,
+                        // SessionInfo.auth_token is [u8;32]; the store keeps a Vec.
+                        // By the time this row is written the token has already been
+                        // consumed in the `implants` table, so this is forensic, not
+                        // auth state.
+                        auth_token: auth_token.map(|t| t.to_vec()),
+                    });
+                }
+                // No tasks queued yet — reply with an empty batch.
+                // Reply sealed in the server→implant nonce space
+                // (Direction::ServerToClient) so it never collides with the
+                // implant's own Tx nonces under the shared key.
+                Ok(encode_frame_dir(
+                    &raw.pubkey,
+                    Direction::ServerToClient,
+                    0,
+                    &reply_key,
+                    &Task::encode_vec(&[])?,
+                ))
             }
-            // No tasks queued yet — reply with an empty batch.
-            // Reply sealed in the server→implant nonce space
-            // (Direction::ServerToClient) so it never collides with the
-            // implant's own Tx nonces under the shared key.
-            Ok(encode_frame_dir(
-                &raw.pubkey,
-                Direction::ServerToClient,
-                0,
-                &reply_key,
-                &Task::encode_vec(&[])?,
-            ))
-        } else {
-            // Lost the check-in race: the other thread already registered the
-            // session and will send the S2C:0 reply. Bail so we don't fire a
-            // duplicate SessionNew or emit a second S2C:0 frame.
-            anyhow::bail!("concurrent check-in race: session already registered");
+            Entry::Occupied(_) => {
+                // Lost the check-in race: the other thread already registered the
+                // session and will send the S2C:0 reply. Bail so we don't fire a
+                // duplicate SessionNew or emit a second S2C:0 frame.
+                anyhow::bail!("concurrent check-in race: session already registered");
+            }
         }
     } else {
         // Subsequent messages carry task responses; we reply with queued tasks.
@@ -1441,10 +1445,21 @@ fn authenticate(st: &AppState, headers: &HeaderMap) -> AuthOutcome {
             role: operators::Role::Admin,
         });
     }
-    // (3) Open (dev/CI).
+    // (3) Open (dev/CI) — NO credentials provided at all.
+    // Security: map to read-only Viewer, NOT Admin. The original Admin mapping
+    // was an RBAC bypass: in open mode any reachable client could POST tasks,
+    // read plaintext creds, revoke implants. With Viewer, the existing
+    // `if op.role == Role::Viewer { 403 }` guards on every write endpoint
+    // close the bypass. For a full-privilege dev/CI session, set
+    // NYX_BOOTSTRAP_OPERATOR or NYX_TOKEN.
+    tracing::warn!(
+        "RBAC open-mode active: anonymous mapped to Viewer (read-only). \
+         Set NYX_BOOTSTRAP_OPERATOR or NYX_TOKEN for full-privilege access. \
+         Write endpoints (task/creds/generate-implant) will return 403."
+    );
     AuthOutcome::Allowed(operators::OperatorIdentity {
         name: "_anonymous".into(),
-        role: operators::Role::Admin,
+        role: operators::Role::Viewer,
     })
 }
 
@@ -3092,7 +3107,13 @@ mod tests {
         // A real check-in registers the session (→ SessionNew), then an Exit
         // task dispatched via post_task must fire SessionExit exactly once; a
         // later non-Exit task (ping) must fire none.
+        //
+        // RBAC: since open mode maps anonymous → Viewer (read-only), the test
+        // must supply a valid api_token (→ _legacy Admin) to pass post_task's
+        // Viewer 403 gate. This mirrors production, where write endpoints
+        // require real credentials.
         let mut st = AppState::default();
+        st.api_token = Some("test-admin-token".to_string());
         let rec = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         st.events.register(Box::new(RecordingHook(rec.clone())));
         let st = std::sync::Arc::new(st);
@@ -3104,13 +3125,20 @@ mod tests {
             .expect("check-in must register the session before tasking exit");
 
         let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut auth_headers = HeaderMap::new();
+        auth_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer test-admin-token"
+                .parse()
+                .expect("valid header value"),
+        );
         let exit_body = serde_json::json!({
             "session": hex::encode(pubkey),
             "command": { "type": "exit" },
         });
         let resp = rt.block_on(post_task(
             State(st.clone()),
-            HeaderMap::new(),
+            auth_headers.clone(),
             Json(serde_json::from_value(exit_body).unwrap()),
         ));
         assert_eq!(resp.status(), StatusCode::OK, "Exit task must be accepted");
@@ -3121,7 +3149,7 @@ mod tests {
         });
         let resp2 = rt.block_on(post_task(
             State(st.clone()),
-            HeaderMap::new(),
+            auth_headers,
             Json(serde_json::from_value(ping_body).unwrap()),
         ));
         assert_eq!(resp2.status(), StatusCode::OK);
