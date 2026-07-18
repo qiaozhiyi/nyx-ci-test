@@ -17,6 +17,87 @@ const OUT_CAP: usize = 16 * 1024;
 static mut OUT: [u8; OUT_CAP] = [0; OUT_CAP];
 static OUT_LEN: AtomicUsize = AtomicUsize::new(0);
 
+// ── VirtualQuery — defensive pointer validation for `%s` ──────────────────────
+//
+// `%s` reads a NUL-terminated string from a BOF-supplied pointer. Before
+// dereferencing it we ask the OS whether `[p, p+min_bytes)` lives in a
+// `MEM_COMMIT`-ted (backed, readable) region. This is coarse-grained
+// (region-level, not byte-level) but it turns a guaranteed access-violation
+// crash on a bogus pointer (e.g. 0x1) into a graceful "stop reading this %s".
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct MEMORY_BASIC_INFORMATION {
+    BaseAddress: *mut std::ffi::c_void,
+    AllocationBase: *mut std::ffi::c_void,
+    AllocationProtect: u32,
+    __alignment1: u32,
+    RegionSize: usize,
+    State: u32,
+    Protect: u32,
+    Type: u32,
+    __alignment2: u32,
+}
+
+extern "system" {
+    fn VirtualQuery(
+        lp_address: *const std::ffi::c_void,
+        lp_buffer: *mut MEMORY_BASIC_INFORMATION,
+        dw_length: usize,
+    ) -> usize;
+}
+
+/// `MEM_COMMIT` — pages whose storage has been committed (backed by RAM/pagefile)
+/// and is therefore readable. From `winnt.h`.
+const WIN_MEM_COMMIT: u32 = 0x1000;
+
+/// Return true iff `[p, p+min_bytes)` lies entirely within a single
+/// `MEM_COMMIT` region. Null pointers and unmapped/reserved-only memory
+/// return false. `min_bytes == 0` degenerates to "is `p` in any committed
+/// region".
+///
+/// Granularity is a single VAD region: if `min_bytes` would cross a region
+/// boundary we conservatively return false. `%s` callers therefore re-check at
+/// 4 KiB strides so a long string crossing a page boundary into a fresh
+/// region is caught rather than read partway.
+#[allow(clippy::missing_safety_doc)]
+fn is_readable(p: *const u8, min_bytes: usize) -> bool {
+    if p.is_null() {
+        return false;
+    }
+    // Guard against the obvious wrap so `p + min_bytes` below cannot overflow.
+    let p_usize = p as usize;
+    let p_end = match p_usize.checked_add(min_bytes) {
+        Some(e) => e,
+        None => return false,
+    };
+
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `p` is non-null (checked above). `VirtualQuery` accepts any
+    // address — it does not dereference `lp_address`, only describes the VAD
+    // entry that would contain it. `&mut mbi` is a valid, properly-aligned
+    // output buffer of the documented size.
+    let r = unsafe {
+        VirtualQuery(
+            p as *const std::ffi::c_void,
+            &mut mbi as *mut MEMORY_BASIC_INFORMATION,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if r == 0 {
+        return false;
+    }
+    if mbi.State != WIN_MEM_COMMIT {
+        return false;
+    }
+    let region_start = mbi.BaseAddress as usize;
+    let region_end = match region_start.checked_add(mbi.RegionSize) {
+        Some(e) => e,
+        None => return false,
+    };
+    p_usize >= region_start && p_end <= region_end
+}
+
 /// Reset the capture buffer before running a BOF.
 #[no_mangle]
 pub extern "C" fn nyx_bof_reset() {
@@ -78,9 +159,35 @@ fn format_into(args: &[u64; 4], fmt: *const c_char) {
             b's' => {
                 if ai < 4 {
                     let p = args[ai] as *const u8;
-                    if !p.is_null() {
+                    // Validate the pointer before any deref. A BOF may pass an
+                    // arbitrary pointer (NULL already excluded by the caller
+                    // of `BeaconPrintf`; bugs/malice can supply e.g. 0x1).
+                    // Without this check `*p` would raise an access violation
+                    // and crash the agent. If unreadable we stop reading this
+                    // %s (emit nothing) and move on — never crash.
+                    if !p.is_null() && is_readable(p, 1) {
                         let mut si = 0usize;
+                        // Track the 4 KiB page index we last validated, so we
+                        // re-run VirtualQuery once per page transition rather
+                        // than once per byte. This closes the "short first
+                        // region" gap (region < 4096 B): the moment we step
+                        // into the next page we re-check, even mid-%s.
+                        let mut last_page = p as usize / 0x1000;
                         loop {
+                            let cur_page = (p as usize).saturating_add(si) / 0x1000;
+                            if cur_page != last_page {
+                                // SAFETY: `p.add(si)` is pointer arithmetic
+                                // only; not dereferenced here, and VirtualQuery
+                                // does not dereference its address argument.
+                                let np = unsafe { p.add(si) };
+                                if !is_readable(np, 1) {
+                                    break;
+                                }
+                                last_page = cur_page;
+                            }
+                            // SAFETY: `p.add(si)` is in committed memory —
+                            // validated at si==0 before the loop, and re-
+                            // validated on every page transition above.
                             let cb = unsafe { *p.add(si) };
                             if cb == 0 || si >= 4096 {
                                 break;
@@ -171,5 +278,170 @@ fn push_hex(v: u32) {
     }
     for &b in buf.iter().skip(pos) {
         push_byte(b);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reset the capture buffer, run `format_into` with the given args + a
+    /// Rust `&str` fmt (NUL-terminated on the stack), and return the captured
+    /// output. Drives every test below.
+    fn run_format(args: [u64; 4], fmt: &str) -> String {
+        nyx_bof_reset();
+        // Put a NUL terminator after the bytes; the fmt string in real BOFs is
+        // also NUL-terminated. Capacity +1 guarantees room for it.
+        let mut bytes = fmt.as_bytes().to_vec();
+        bytes.push(0);
+        format_into(&args, bytes.as_ptr() as *const c_char);
+        let p = nyx_bof_output();
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    // ── is_readable ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_readable_rejects_null() {
+        assert!(!is_readable(std::ptr::null(), 1));
+        assert!(!is_readable(std::ptr::null(), 0));
+    }
+
+    #[test]
+    fn is_readable_rejects_low_bogus_pointer() {
+        // 0x1 is not mapped on any mainstream OS; VirtualQuery either returns
+        // 0 or reports a non-MEM_COMMIT region. Must NOT crash. Deliberately a
+        // low dangling address (NOT `ptr::dangling`, which is non-null-aligned
+        // and thus a poor stand-in for "real bogus pointer").
+        #[allow(clippy::manual_dangling_ptr)]
+        let bogus = 0x1 as *const u8;
+        assert!(!is_readable(bogus, 1));
+    }
+
+    #[test]
+    fn is_readable_rejects_high_bogus_pointer() {
+        // A kernel-space-ish address on x86_64 Windows is not user-readable.
+        assert!(!is_readable(0xFFFF_FFFF_FFFF_0000u64 as *const u8, 1));
+    }
+
+    #[test]
+    fn is_readable_accepts_real_stack_buffer() {
+        let buf = [b'h', b'i', 0u8];
+        // Whole buffer and prefix are readable; one byte past the buffer is
+        // still on the same stack page in practice.
+        assert!(is_readable(buf.as_ptr(), buf.len()));
+        assert!(is_readable(buf.as_ptr(), 1));
+    }
+
+    #[test]
+    fn is_readable_wrap_safe() {
+        // usize::MAX would overflow `p + min_bytes`; must return false rather
+        // than panicking on debug / wrapping on release.
+        assert!(!is_readable(usize::MAX as *const u8, 1));
+    }
+
+    // ── %s formatting via format_into ────────────────────────────────────────
+
+    #[test]
+    fn percent_s_reads_valid_string() {
+        let s = b"hello-bof\0";
+        let out = run_format([s.as_ptr() as u64, 0, 0, 0], "got: %s!");
+        assert_eq!(out, "got: hello-bof!");
+    }
+
+    #[test]
+    fn percent_s_null_pointer_emits_nothing() {
+        // A NULL arg: the BOF supplied no string. Should emit nothing for the
+        // %s slot and not crash. (Caller-side null check inside %s.)
+        let out = run_format([0, 0, 0, 0], "[%s]");
+        assert_eq!(out, "[]");
+    }
+
+    #[test]
+    fn percent_s_bogus_pointer_does_not_crash() {
+        // The whole point of P0-3: a bogus pointer (0x42) used to dereference
+        // blindly and crash the agent with an access violation. Now the
+        // is_readable gate must reject it and emit nothing for %s.
+        let out = run_format([0x42, 0, 0, 0], "v=%s!");
+        assert_eq!(out, "v=!");
+    }
+
+    #[test]
+    fn percent_s_truncates_at_4096_without_nul() {
+        // A 6000-byte run of 'A' with no NUL terminator: must stop at 4096
+        // (the documented cap) without reading past the allocation and without
+        // re-validating into unmapped memory. We allocate well past 4096 so the
+        // page-boundary re-check never trips; the 4096 cap is what binds.
+        let mut big = vec![b'A'; 6000];
+        big.push(0);
+        let out = run_format([big.as_ptr() as u64, 0, 0, 0], "%s");
+        assert_eq!(out.len(), 4096);
+        assert!(out.bytes().all(|b| b == b'A'));
+    }
+
+    #[test]
+    fn percent_s_stops_at_region_boundary() {
+        // Allocate exactly one page, put non-NUL bytes filling to the end, and
+        // ensure we stop (do not read into the next, potentially uncommitted
+        // region). We cannot force the next page to be uncommitted portably,
+        // but the page-boundary re-validation path must at least not crash and
+        // must return a string no longer than what was committed.
+        let page_size = 0x1000usize;
+        let layout = std::alloc::Layout::from_size_align(page_size, page_size).unwrap();
+        // SAFETY: one-page allocation; we never read past it.
+        let page = unsafe { std::alloc::alloc(layout) };
+        if page.is_null() {
+            // Allocator refused (e.g. test env); skip rather than fail.
+            eprintln!("skipping percent_s_stops_at_region_boundary: alloc failed");
+            return;
+        }
+        // SAFETY: fill the whole page with 'B' (no NUL). We then ask %s to
+        // read; the re-check at si=0x1000 must observe the next region and
+        // stop. Even if the next page happens to be committed and readable,
+        // the 4096 cap also stops us, so the assertion is a lower bound.
+        unsafe { std::ptr::write_bytes(page, b'B', page_size) };
+        let out = run_format([page as u64, 0, 0, 0], "%s");
+        unsafe { std::alloc::dealloc(page, layout) };
+        // We must have read something (page is committed & non-NUL) and never
+        // crashed. Length is bounded by 4096 (the cap) — exact length depends
+        // on whether the next page is also committed.
+        assert!(!out.is_empty(), "expected at least one byte from committed page");
+        assert!(out.len() <= 4096, "exceeded the 4096 %s cap");
+        assert!(out.bytes().all(|b| b == b'B'));
+    }
+
+    // ── non-%s sanity checks (regression guard) ──────────────────────────────
+
+    #[test]
+    fn percent_d_formats_i32() {
+        let out = run_format([uint_minus_42() as u64, 0, 0, 0], "n=%d");
+        assert_eq!(out, "n=-42");
+    }
+
+    #[test]
+    fn percent_x_formats_u32() {
+        let out = run_format([0xDEAD_BEEFu64, 0, 0, 0], "0x%x");
+        assert_eq!(out, "0xdeadbeef");
+    }
+
+    #[test]
+    fn literal_percent_escaping() {
+        let out = run_format([0, 0, 0, 0], "100%% done");
+        assert_eq!(out, "100% done");
+    }
+
+    #[test]
+    fn unknown_spec_is_passed_through() {
+        let out = run_format([0, 0, 0, 0], "code=%q");
+        assert_eq!(out, "code=%q");
+    }
+
+    /// Helper: get the bit pattern of `-42i32` as the `u64` the BOF ABI would
+    /// place in r8/r9/stack. We pass the full u64; the %d handler casts the
+    /// low 32 bits to i32.
+    fn uint_minus_42() -> i32 {
+        -42
     }
 }

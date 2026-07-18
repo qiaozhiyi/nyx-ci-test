@@ -22,14 +22,61 @@ extern "system" {
         allocation_type: u32,
         protect: u32,
     ) -> *mut c_void;
+    fn VirtualFree(lp_address: *mut c_void, dw_size: usize, dw_free_type: u32) -> i32;
 }
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
+/// `MEM_RELEASE` — passed to `VirtualFree` to release the entire reservation.
+/// When used, `dw_size` MUST be 0.
+const MEM_RELEASE: u32 = 0x8000;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const PAGE_SIZE: usize = 0x1000;
 
 fn page(n: usize) -> usize {
     (n + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
+
+/// RAII guard over a `VirtualAlloc`-ed region.
+///
+/// Owns one `VirtualAlloc` reservation and releases it on `Drop` via
+/// `VirtualFree(ptr, 0, MEM_RELEASE)`. Holding the only pointer to the
+/// region, so there is no aliasing and no double-free.
+///
+/// `Drop` is a no-op when `ptr` is null — this lets callers wrap the result of
+/// a `VirtualAlloc` that may legitimately have failed without branching.
+///
+/// `size` is stored for diagnostics only; `MEM_RELEASE` ignores it and always
+/// frees the whole reservation.
+struct VirtualAllocGuard {
+    ptr: *mut u8,
+    #[allow(dead_code)]
+    size: usize,
+}
+
+impl VirtualAllocGuard {
+    /// Wrap a `VirtualAlloc`-returned pointer. Safe to call with a null
+    /// pointer; `Drop` becomes a no-op in that case.
+    fn new(ptr: *mut u8, size: usize) -> Self {
+        Self { ptr, size }
+    }
+
+    fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+}
+
+impl Drop for VirtualAllocGuard {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: `ptr` was produced by a matching `VirtualAlloc(...,
+            // MEM_RESERVE, ...)` call and is not null. `MEM_RELEASE` requires
+            // size 0 and frees the whole reservation. Ownership is unique to
+            // this guard (no aliasing, no second owner), so no double-free.
+            unsafe {
+                VirtualFree(self.ptr as *mut c_void, 0, MEM_RELEASE);
+            }
+        }
+    }
 }
 
 pub struct Resolver {
@@ -47,9 +94,39 @@ impl SymbolResolver for Resolver {
 }
 
 pub struct Loaded {
+    /// Base of the `VirtualAlloc`-ed reservation holding the relocated BOF
+    /// sections, or null if `load()` allocated nothing (never set today, but
+    /// kept defensively so `Drop` is a no-op on a never-allocated value).
+    /// Freed in `Drop` via `VirtualFree(base, 0, MEM_RELEASE)`.
+    base: *mut u8,
+    /// Size passed to the matching `VirtualAlloc`. Used only for diagnostics;
+    /// `MEM_RELEASE` ignores it.
+    #[allow(dead_code)]
+    total: usize,
     pub defined: HashMap<String, u64>,
     pub entry: u64,
 }
+
+impl Drop for Loaded {
+    fn drop(&mut self) {
+        if !self.base.is_null() {
+            // SAFETY: `base` came from `VirtualAlloc(..., MEM_RESERVE, ...)`
+            // inside `load()`, is unique to this `Loaded`, and is not null.
+            // `MEM_RELEASE` with size 0 frees the entire reservation.
+            unsafe {
+                VirtualFree(self.base as *mut c_void, 0, MEM_RELEASE);
+            }
+        }
+    }
+}
+
+// SAFETY: `Loaded::base` is a raw pointer to private RWX memory owned solely
+// by this `Loaded` value; no other thread holds an aliasing reference at the
+// Rust level (the BOF machine code runs synchronously during `execute()` and
+// does not outlive the call). `HashMap<String,u64>` and `u64` are `Send`, so
+// the whole struct is safe to move across threads.
+unsafe impl Send for Loaded {}
+unsafe impl Sync for Loaded {}
 
 pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result<Loaded, String> {
     let coff = parse(blob).map_err(|e| format!("parse: {e:?}"))?;
@@ -61,6 +138,10 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
         .sum::<usize>()
         .max(PAGE_SIZE);
 
+    // RAII: `guard` owns the BOF section region and frees it (MEM_RELEASE) if
+    // this function returns early via `?` or panics. On the success path we
+    // `mem::forget` the guard and hand ownership to the returned `Loaded`,
+    // whose own `Drop` frees the region.
     let base = unsafe {
         VirtualAlloc(
             std::ptr::null_mut(),
@@ -72,11 +153,13 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
     if base.is_null() {
         return Err("VirtualAlloc failed".into());
     }
+    let guard = VirtualAllocGuard::new(base as *mut u8, total);
+    let base = guard.ptr();
 
     let mut bases: Vec<u64> = Vec::with_capacity(coff.sections.len());
     let mut offset = 0usize;
     for s in &coff.sections {
-        let addr = unsafe { (base as *mut u8).add(offset) } as u64;
+        let addr = unsafe { base.add(offset) } as u64;
         bases.push(addr);
         if !s.raw.is_empty() {
             unsafe { std::ptr::copy_nonoverlapping(s.raw.as_ptr(), addr as *mut u8, s.raw.len()) };
@@ -117,42 +200,57 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
     }
     let entry_addr = bases[(entry_sym.section_number - 1) as usize] + entry_sym.value as u64;
 
-    Ok(Loaded {
+    // Success: hand the reservation to `Loaded`. `Drop` for `Loaded` becomes
+    // the sole owner of the free; forget the guard so it does not also free.
+    let loaded = Loaded {
+        base: guard.ptr(),
+        total,
         defined,
         entry: entry_addr,
-    })
+    };
+    std::mem::forget(guard);
+    Ok(loaded)
 }
 
 // ── trampoline ──────────────────────────────────────────────────────────────
 
 /// Allocate a small trampoline page near `near_addr` and write an absolute
-/// indirect jump (`jmp [rip+0]` + 8-byte target) to `target`. Returns the
-/// trampoline's address, or falls back to `target` if allocation fails.
-fn alloc_trampoline(near_addr: u64, target: u64) -> u64 {
+/// indirect jump (`jmp [rip+0]` + 8-byte target) to `target`.
+///
+/// Returns `Some(guard)` on success — the guard owns the RWX page and will
+/// `VirtualFree` it on `Drop`, so the caller MUST keep the guard alive for as
+/// long as the BOF might branch through the trampoline (i.e. for the duration
+/// of `go()`). Returns `None` if both allocations fail; the caller then falls
+/// back to addressing `target` directly (REL32 may overflow, but we degrade
+/// rather than abort).
+fn alloc_trampoline(near_addr: u64, target: u64) -> Option<VirtualAllocGuard> {
     let hint = near_addr.saturating_sub(0x1000_0000); // 256 MiB below
-    unsafe {
-        let ptr = try_alloc_tramp(hint as *mut c_void);
-        let ptr = if ptr.is_null() {
-            try_alloc_tramp(std::ptr::null_mut())
-        } else {
-            ptr
-        };
-        if ptr.is_null() {
-            return target;
-        }
-        let tramp = ptr as u64;
-        write_trampoline(tramp, target);
-        tramp
-    }
+    // SAFETY: `hint` is an arbitrary address, only handed to `VirtualAlloc`;
+    // `try_alloc_tramp` documents this contract.
+    let guard = unsafe { try_alloc_tramp(hint as *mut c_void) }
+        .or_else(|| {
+            // SAFETY: null hint lets the OS pick an address.
+            unsafe { try_alloc_tramp(std::ptr::null_mut()) }
+        })?;
+    // SAFETY: `guard.ptr()` is a fresh RWX page; we are the sole writer.
+    unsafe { write_trampoline(guard.ptr() as u64, target) };
+    Some(guard)
 }
 
-unsafe fn try_alloc_tramp(hint: *mut c_void) -> *mut c_void {
-    VirtualAlloc(
+/// SAFETY: caller may pass any `hint` (including dangling); it is only fed to
+/// `VirtualAlloc`, which tolerates arbitrary addresses.
+unsafe fn try_alloc_tramp(hint: *mut c_void) -> Option<VirtualAllocGuard> {
+    let ptr = VirtualAlloc(
         hint,
         0x1000,
         MEM_COMMIT | MEM_RESERVE,
         PAGE_EXECUTE_READWRITE,
-    )
+    );
+    if ptr.is_null() {
+        None
+    } else {
+        Some(VirtualAllocGuard::new(ptr as *mut u8, 0x1000))
+    }
 }
 
 /// Write `jmp [rip+0]; dq <target>` at `addr`.
@@ -173,10 +271,24 @@ unsafe fn write_trampoline(addr: u64, target: u64) {
 
 /// Build the Beacon-API external table. `near_addr` should be near the BOF's
 /// allocated memory so REL32 relocations can reach the trampoline.
-fn beacon_apis(near_addr: u64) -> HashMap<String, u64> {
+///
+/// Returns the symbol table plus the trampoline guard. The guard MUST be kept
+/// alive for the lifetime of the BOF execution (the relocated BOF jumps
+/// through the trampoline into `BeaconPrintf`); it is freed on `Drop`.
+fn beacon_apis(near_addr: u64) -> (HashMap<String, u64>, Option<VirtualAllocGuard>) {
     let real = crate::shim::BeaconPrintf as *const () as usize as u64;
-    let tramp = alloc_trampoline(near_addr, real);
-    [("BeaconPrintf".to_string(), tramp)].into_iter().collect()
+    let (tramp_addr, tramp_guard) = match alloc_trampoline(near_addr, real) {
+        Some(g) => (g.ptr() as u64, Some(g)),
+        // Allocation failed: fall back to the direct target address. REL32 may
+        // overflow on high-ASLR systems; we degrade rather than abort.
+        None => (real, None),
+    };
+    (
+        [("BeaconPrintf".to_string(), tramp_addr)]
+            .into_iter()
+            .collect(),
+        tramp_guard,
+    )
 }
 
 // ── execute ─────────────────────────────────────────────────────────────────
@@ -189,11 +301,18 @@ pub struct ExecResult {
 /// Load + run a BOF's `go()`: wire up Beacon-API, reset output, call `go`,
 /// return captured output.
 pub fn execute(blob: &[u8]) -> Result<ExecResult, String> {
+    // RAII order matters here. `hint_guard`, `_tramp_guard`, and `loaded` are
+    // dropped in *declaration order* at the end of this function, i.e. hint
+    // first, then trampoline, then the BOF region. The BOF keeps running
+    // synchronously until `go()` returns below; by the time any guard is
+    // dropped the BOF code is no longer executing, so freeing is safe.
+
     // Use a dummy address to seed the trampoline allocator — we need a hint
     // near where the BOF will be loaded. Allocate a small scratch page first
     // to anchor the hint, then pass that to beacon_apis so the trampoline
-    // lands near the BOF sections.
-    let hint_page = unsafe {
+    // lands near the BOF sections. The scratch page itself is unused after
+    // seeding; `hint_guard` frees it (MEM_RELEASE) at scope end.
+    let hint_guard = unsafe {
         VirtualAlloc(
             std::ptr::null_mut(),
             PAGE_SIZE,
@@ -201,14 +320,16 @@ pub fn execute(blob: &[u8]) -> Result<ExecResult, String> {
             PAGE_EXECUTE_READWRITE,
         )
     };
-    let near = if hint_page.is_null() {
+    let hint_guard = VirtualAllocGuard::new(hint_guard as *mut u8, PAGE_SIZE);
+    let near = if hint_guard.ptr().is_null() {
         0
     } else {
-        hint_page as u64
+        hint_guard.ptr() as u64
     };
 
-    let apis = beacon_apis(near);
-    let loaded = load(blob, "go", apis)?;
+    let (apis, _tramp_guard) = beacon_apis(near);
+    // `loaded` is the BOF section region; its `Drop` frees it.
+    let mut loaded = load(blob, "go", apis)?;
     unsafe {
         crate::shim::nyx_bof_reset();
         let go: extern "C" fn() = std::mem::transmute(loaded.entry);
@@ -216,9 +337,13 @@ pub fn execute(blob: &[u8]) -> Result<ExecResult, String> {
         let output = std::ffi::CStr::from_ptr(crate::shim::nyx_bof_output())
             .to_string_lossy()
             .into_owned();
-        Ok(ExecResult {
-            output,
-            defined: loaded.defined,
-        })
+        // `Loaded` implements `Drop` (frees `base`), so we cannot move out of
+        // a field by value. `mem::take` leaves an empty map in its place; the
+        // map contents move into `ExecResult`, `Drop` only frees `base`.
+        let defined = std::mem::take(&mut loaded.defined);
+        Ok(ExecResult { output, defined })
     }
+    // Drop order (declared order): hint_guard, _tramp_guard, loaded.
+    // `go()` has already returned, so the BOF is not executing when its
+    // memory (or the trampoline) is freed.
 }
