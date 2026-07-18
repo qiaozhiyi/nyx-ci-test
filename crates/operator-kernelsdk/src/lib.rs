@@ -378,8 +378,14 @@ impl EtwTiKit for NoKernel {
     fn blind(&self, _krw: &dyn KernelRw) -> Result<(), KitError> {
         Err(KitError::UnsupportedPosture("NoKernel floor"))
     }
+    // Previously returned `Ok(false)` — falsely claimed "ETW-TI provider is
+    // ENABLED / not blinded", hiding the fact that no kernel primitive is
+    // available to read the provider's IsEnabled field. Now honestly reports
+    // UnsupportedPosture, consistent with every other NoKernel method.
+    // Callers MUST handle this with a `match` (do NOT `?`-propagate into a
+    // hard exit; log and treat as "blinded state unknown").
     fn is_blinded(&self, _krw: &dyn KernelRw) -> Result<bool, KitError> {
-        Ok(false)
+        Err(KitError::UnsupportedPosture("NoKernel floor"))
     }
 }
 impl CallbackKit for NoKernel {

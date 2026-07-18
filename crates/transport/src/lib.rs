@@ -16,6 +16,18 @@
 //! [JA3]: https://engineering.salesforce.com/tls-fingerprinting-with-ja3-and-ja3s-247362855967/
 //! [JA4]: https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
 //! [Akamai passive HTTP/2 fingerprint]: https://blackhat.com/docs/eu-17/materials/eu-17-Shuster-Passive-Fingerprinting-Of-HTTP2-Clients-wp.pdf
+//!
+//! # Status: pending integration
+//!
+//! The `Transport` trait (in `traits.rs`) and its 6 impls — `malleable`,
+//! `doh_dns`, `slack_api`, `llm_api`, `mcp`, `smb_pipe` — are fully implemented
+//! and unit-tested but have **ZERO consumers** in the workspace. The server
+//! (`crates/server`) uses raw `tokio-rustls` for its TLS listener, and
+//! `implant-win` ships a hand-rolled WinHTTP client. Only the JA3/JA4
+//! fingerprinting path (`tls`, `h2`) is actually wired into the server (see
+//! `server/src/main.rs:427`). These channels are "pending wiring" — do NOT
+//! delete them; see ROADMAP entry "transport/ crate 接线".
+#![allow(dead_code)]
 
 pub mod doh_dns;
 pub mod fingerprint;

@@ -75,6 +75,15 @@ use nyx_implant_evasionsdk::foliage::{FoliagePlan, FoliageStep};
 /// **With [`foliage_enabled`] OFF**: delegates to `beacon::sleep_seconds`
 /// (plain indirect-syscall NtDelayExecution). On any failure (runtime down,
 /// .text unresolved), degrades to the plain sleep — never crashes.
+///
+/// # Deprecated: superseded by `crate::fluctuation::sleep`
+///
+/// This entry point has zero callers — the beacon loop routes through
+/// `kits::sleep` → `fluctuation::sleep` (see `kits.rs:55`). Kept for
+/// reference; do NOT add new callers. The module's helpers (`own_text_region`,
+/// `section_va_len`, `raw_create_thread`, `FoliageRaw`) ARE still live and
+/// used by `fluctuation`, `evasion_glue`, `keylog`, `insomniac`, `selftests`.
+#[allow(dead_code)]
 pub fn sleep(seconds: u32) {
     // Delegate to fluctuation sleep mask (military-grade, CFG/CET immune).
     // Falls back to plain NtDelayExecution if fluctuation is disabled or fails.

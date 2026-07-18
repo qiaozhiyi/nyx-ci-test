@@ -5,9 +5,10 @@
 //! crypto/frame layer is reused verbatim from [`nyx_protocol`]; only the
 //! transport (WinHTTP) and the sleeper differ.
 //!
-//! The command dispatch covers every wire `Command` variant (all 21): file
-//! ops, shell, recon, BOF, screenshot, keylog, hashdump, connect/socks relay,
-//! etc. — all route to real implementations (none are stubs).
+//! The command dispatch covers every wire `Command` variant (all 28 wire
+//! Command variants): file ops, shell, recon, BOF, screenshot, keylog,
+//! hashdump, connect/socks relay, etc. — all route to real implementations
+//! (none are stubs).
 
 #![cfg(target_os = "windows")]
 
