@@ -231,13 +231,47 @@ impl AuditWriter {
 
     /// Walk the chain; returns `Some(seq)` of the first record whose `hash`
     /// doesn't match the recomputed link (a broken/tampered page), else `None`.
+    ///
+    /// Line-count bounded (M-DoS): unlike the read path this used to scan the
+    /// ENTIRE audit file with no cap. An attacker who grew `audit.jsonl` to
+    /// millions of lines could force a single `GET /api/audit/verify` to burn
+    /// unbounded CPU/memory. We cap the scan at `MAX_VERIFY_LINES`: past it the
+    /// chain is considered unverifiable from this call and we return `None` with
+    /// a warning (the operator should rotate/trim the log rather than trust a
+    /// partial verification).
     pub fn verify_chain(path: &Path) -> std::io::Result<Option<u64>> {
         let f = File::open(path)?;
         let mut prev = ZERO_HASH.to_string();
+        let mut line_count = 0usize;
         for line in BufReader::new(f).lines().map_while(Result::ok) {
+            line_count += 1;
+            if line_count > MAX_VERIFY_LINES {
+                tracing::warn!(
+                    line_count,
+                    max = MAX_VERIFY_LINES,
+                    "audit verify_chain hit MAX_VERIFY_LINES; aborting verification \
+                     (rotate/trim the audit log to verify in full)"
+                );
+                // Treat as untrusted: a truncated verification cannot honestly
+                // return "chain intact" (Ok(None)), and we have no single seq to
+                // blame. Return u64::MAX as a synthetic "tail not verified"
+                // sentinel so the API surfaces a non-clean result instead of a
+                // false green light.
+                return Ok(Some(u64::MAX));
+            }
+            // Malformed line (serde_json failed): previously this fell back to
+            // `prev_parse_seq(&line).unwrap_or(0)`, but `prev_parse_seq` ALSO
+            // parses via serde_json — so it ALWAYS failed too and returned 0,
+            // silently masking the real corruption position with a bogus seq 0.
+            // Now surface the corruption explicitly: log the offending line and
+            // blame seq 0 (the canonical "unparseable" sentinel) so operators
+            // see WHERE verification broke instead of a misleading pass/fail.
             let rec: AuditRecord = match serde_json::from_str(&line) {
                 Ok(r) => r,
-                Err(_) => return Ok(Some(prev_parse_seq(&line).unwrap_or(0))),
+                Err(_) => {
+                    tracing::warn!(line, "audit line malformed during verify");
+                    return Ok(Some(0));
+                }
             };
             if rec.prev_hash != prev {
                 return Ok(Some(rec.seq));
@@ -260,6 +294,13 @@ impl AuditWriter {
         Ok(None)
     }
 }
+
+/// Upper bound on the number of lines `verify_chain` will scan in one call.
+/// Bounds CPU/memory so a multi-million-line audit log (attacker-grown or just
+/// long-lived) can't force a single verify request to scan the whole file.
+/// `query()` already bounds its read via `HARD_CAP`; this is the verify-path
+/// analogue.
+const MAX_VERIFY_LINES: usize = 1_000_000;
 
 const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -290,12 +331,6 @@ fn hash_record(
         h.update(f.as_bytes());
     }
     hex::encode(h.finalize())
-}
-
-fn prev_parse_seq(line: &str) -> Option<u64> {
-    serde_json::from_str::<AuditRecord>(line)
-        .ok()
-        .map(|r| r.seq)
 }
 
 fn now_secs() -> u64 {

@@ -29,14 +29,18 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    Json,
+};
 use nyx_mutate::{MutationPasses, Mutator};
 use nyx_protocol::wire::Writer;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::AppState;
+use crate::{operators::Role, AppState, AuthOutcome};
 
 /// Feature bit (bit 30 in the `features` u32) that enables binary mutation
 /// (NOP insertion, register rotation, key randomization) during implant
@@ -275,8 +279,28 @@ pub struct ImplantSummary {
 /// auth middleware layer).
 pub async fn generate_implant(
     State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<GenerateRequest>,
 ) -> Result<Json<GenerateResponse>, (StatusCode, String)> {
+    // Resolve the calling operator for attribution (audit `created_by`,
+    // rate-limit key) and RBAC. Mirrors `post_task`'s auth path: open mode maps
+    // to Viewer, which is blocked from write endpoints below. Previously this
+    // handler skipped auth entirely — every generation was attributed to the
+    // literal string "system", and the rate-limit key omitted the operator
+    // dimension entirely.
+    let op = match crate::authenticate(&st, &headers) {
+        AuthOutcome::Allowed(o) => o,
+        AuthOutcome::Denied(r) => {
+            return Err((r.status(), "unauthorized".to_string()));
+        }
+    };
+    if op.role == Role::Viewer {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "forbidden: viewer role cannot generate implants".into(),
+        ));
+    }
+
     let template = st.template.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -331,12 +355,18 @@ pub async fn generate_implant(
         ));
     }
 
-    // Rate limiting: sliding window per (callback, port) pair. Prevents
-    // enumeration/spray against a single target by capping generation to
-    // DEFAULT_RATE_LIMIT_MAX requests per DEFAULT_RATE_LIMIT_WINDOW_SECS.
+    // Rate limiting: sliding window keyed by (operator, callback, port). Two
+    // concerns are bounded by including the operator dimension:
+    //   1. Enumeration/spray against a single target: capped at
+    //      DEFAULT_RATE_LIMIT_MAX per target per window.
+    //   2. A single operator (or compromised token) flooding generation across
+    //      MANY targets: previously the (callback,port)-only key let an
+    //      attacker rotate the target to bypass the per-target cap and emit
+    //      unbounded implants. The operator-scoped key makes one identity's
+    //      volume observable + throttleable per target.
     {
         use std::time::Instant;
-        let key = format!("{}:{}", req.callback, req.port);
+        let key = format!("{}:{}:{}", op.name, req.callback, req.port);
         let mut entry = st.implant_rate_limiter.entry(key).or_default();
         let now = Instant::now();
         let window = std::time::Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS);
@@ -345,7 +375,7 @@ pub async fn generate_implant(
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
-                    "rate limit exceeded: max {} implants per hour per target",
+                    "rate limit exceeded: max {} implants per hour per operator/target",
                     DEFAULT_RATE_LIMIT_MAX
                 ),
             ));
@@ -607,17 +637,34 @@ pub async fn generate_implant(
     token_hasher.update(auth_token);
     let token_hash = hex::encode(token_hasher.finalize());
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string());
+    // Clock: fail CLOSED on a pre-epoch / skewed clock. A `created_at = "0"`
+    // (the previous `unwrap_or_else(|_| "0")` fallback) is a silent lie — it
+    // makes a freshly generated implant look 55+ years old and breaks any
+    // expiry/rotation logic keyed on created_at. The kill-date path in lib.rs
+    // already fails closed for the same reason; mirror that here. The only
+    // realistic failure is a badly-skewed system clock, which is an operator-
+    // visible condition the server should surface as a 500, not paper over.
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs().to_string(),
+        Err(e) => {
+            tracing::error!(error = %e, "clock failure during implant generation");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server clock unavailable: implant generation refused (pre-epoch clock?)".into(),
+            ));
+        }
+    };
     let record = nyx_store::ImplantRecord {
         id: 0, // auto-incremented
         implant_pub: hex::encode(implant_pub),
         auth_token_hash: token_hash,
         auth_token_used: false,
         created_at: now.clone(),
-        created_by: None, // TODO: extract from auth context
+        // Attribute the generation to the resolved operator identity (Phase 3
+        // audit attribution). Previously this was always `None`, which made
+        // every generated implant's provenance unattributable — an insider
+        // could mass-generate implants and the record would show no operator.
+        created_by: Some(op.name.clone()),
         expires_at: req.expires.clone(),
         callback_host: req.callback.clone(),
         callback_port: req.port,
@@ -656,7 +703,7 @@ pub async fn generate_implant(
                 "instructions_substituted": report.instructions_substituted,
             });
         }
-        audit.append("implant_generated", "system", "", detail);
+        audit.append("implant_generated", &op.name, "", detail);
     }
 
     tracing::info!(

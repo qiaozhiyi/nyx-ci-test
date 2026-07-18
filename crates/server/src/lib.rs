@@ -1395,7 +1395,7 @@ fn require_auth(st: &AppState, headers: &HeaderMap) -> Option<Response> {
 }
 
 /// Phase 3 auth outcome: either a resolved operator identity or a 401 response.
-enum AuthOutcome {
+pub(crate) enum AuthOutcome {
     Allowed(operators::OperatorIdentity),
     Denied(Response),
 }
@@ -1405,7 +1405,7 @@ enum AuthOutcome {
 /// (2) else the legacy shared `NYX_TOKEN` (constant-time, identity `_legacy`);
 /// (3) else open mode (identity `_anonymous`). `require_auth` is retained for
 /// the read-only handlers that don't need attribution in v1.
-fn authenticate(st: &AppState, headers: &HeaderMap) -> AuthOutcome {
+pub(crate) fn authenticate(st: &AppState, headers: &HeaderMap) -> AuthOutcome {
     let bearer_val = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
