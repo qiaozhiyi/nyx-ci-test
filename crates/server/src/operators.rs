@@ -236,7 +236,8 @@ impl OperatorRegistry {
                 // _legacy token: upgrade from plain:sha256 to argon2id. The
                 // legacy plain: path remains in verify_secret only for reading
                 // pre-existing records; new _legacy records are argon2id.
-                let hash = hash_argon2(tok).unwrap_or_else(|_| format!("plain:{}", sha256_hex(tok)));
+                let hash =
+                    hash_argon2(tok).unwrap_or_else(|_| format!("plain:{}", sha256_hex(tok)));
                 map.insert(
                     "_legacy".into(),
                     OperatorRecord {

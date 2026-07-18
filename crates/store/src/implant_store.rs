@@ -139,7 +139,9 @@ impl ImplantStore {
             [],
         )?;
         let current: i64 =
-            conn.query_row("SELECT version FROM _schema_version LIMIT 1", [], |r| r.get(0))?;
+            conn.query_row("SELECT version FROM _schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })?;
         if current < Self::CURRENT_SCHEMA_VERSION {
             // v0 → v1: baseline (implants table already created above).
             conn.execute(

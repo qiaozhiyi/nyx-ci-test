@@ -407,7 +407,10 @@ mod tests {
         // We must have read something (page is committed & non-NUL) and never
         // crashed. Length is bounded by 4096 (the cap) — exact length depends
         // on whether the next page is also committed.
-        assert!(!out.is_empty(), "expected at least one byte from committed page");
+        assert!(
+            !out.is_empty(),
+            "expected at least one byte from committed page"
+        );
         assert!(out.len() <= 4096, "exceeded the 4096 %s cap");
         assert!(out.bytes().all(|b| b == b'B'));
     }

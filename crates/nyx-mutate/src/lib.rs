@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn instruction_substitution_changes_bytes() {
         // Enough NOP pairs that with 30% probability at least one changes.
-        let input = vec![0x90, 0x90].repeat(64);
+        let input = [0x90, 0x90].repeat(64);
         let mut a = input.clone();
         let mut b = input.clone();
         substitute_instructions(&mut a, 1);
@@ -780,7 +780,7 @@ mod tests {
     fn full_pipeline_includes_substitution_report() {
         // Build a binary with lots of NOP pairs (substitution targets) that are
         // far from any branch.
-        let mut bin = vec![0x90, 0x90].repeat(128); // 256 bytes of nop pairs
+        let mut bin = [0x90, 0x90].repeat(128); // 256 bytes of nop pairs
         bin.push(0xC3); // ret at the very end
         let m = Mutator::new(777);
         let report = m.mutate(

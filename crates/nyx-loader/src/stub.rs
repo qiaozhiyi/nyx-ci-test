@@ -158,10 +158,7 @@ pub enum ReflectiveLoadError {
     /// An import thunk slot referenced bytes past the end of the image.
     ImportTableTruncated,
     /// An import thunk could not be resolved by the caller's resolver.
-    UnresolvedImport {
-        dll: String,
-        symbol: String,
-    },
+    UnresolvedImport { dll: String, symbol: String },
 }
 
 impl core::fmt::Display for ReflectiveLoadError {
@@ -248,8 +245,8 @@ pub fn reflective_load_at(
     base: u64,
     resolver: ImportResolver<'_>,
 ) -> Result<MappedImage, ReflectiveLoadError> {
-    let pe = goblin::pe::PE::parse(pe_bytes)
-        .map_err(|e| ReflectiveLoadError::Parse(e.to_string()))?;
+    let pe =
+        goblin::pe::PE::parse(pe_bytes).map_err(|e| ReflectiveLoadError::Parse(e.to_string()))?;
 
     if !pe.is_64 {
         return Err(ReflectiveLoadError::NotPe64);
@@ -393,12 +390,9 @@ fn apply_base_relocations(
 
     let mut pos = table_rva;
     while pos + 8 <= table_end {
-        let page_rva = u32::from_le_bytes([
-            image[pos],
-            image[pos + 1],
-            image[pos + 2],
-            image[pos + 3],
-        ]) as usize;
+        let page_rva =
+            u32::from_le_bytes([image[pos], image[pos + 1], image[pos + 2], image[pos + 3]])
+                as usize;
         let block_size = u32::from_le_bytes([
             image[pos + 4],
             image[pos + 5],
@@ -411,10 +405,7 @@ fn apply_base_relocations(
 
         let entries = (block_size - 8) / 2;
         for i in 0..entries {
-            let entry = u16::from_le_bytes([
-                image[pos + 8 + i * 2],
-                image[pos + 8 + i * 2 + 1],
-            ]);
+            let entry = u16::from_le_bytes([image[pos + 8 + i * 2], image[pos + 8 + i * 2 + 1]]);
             let typ = entry >> 12;
             let offset = (entry & 0x0FFF) as usize;
             if typ == IMAGE_REL_BASED_ABSOLUTE {
@@ -604,7 +595,7 @@ mod tests {
         rdata[id_off + 8..id_off + 12].copy_from_slice(&0u32.to_le_bytes()); // ForwarderChain
         rdata[id_off + 12..id_off + 16].copy_from_slice(&(dll_name_rva as u32).to_le_bytes()); // Name
         rdata[id_off + 16..id_off + 20].copy_from_slice(&(iat_slot_rva as u32).to_le_bytes()); // FirstThunk
-        // null_desc_rva .. +20 already zero = null terminator descriptor.
+                                                                                               // null_desc_rva .. +20 already zero = null terminator descriptor.
 
         // dll name
         let dn_off = dll_name_rva - rdata_rva;
@@ -691,11 +682,11 @@ mod tests {
         let mut c = [0u8; COFF_HEADER_LEN];
         c[0..2].copy_from_slice(&0x8664u16.to_le_bytes()); // IMAGE_FILE_MACHINE_AMD64
         c[2..4].copy_from_slice(&3u16.to_le_bytes()); // NumberOfSections
-        // TimeDateStamp[4..8] = 0
+                                                      // TimeDateStamp[4..8] = 0
         c[8..12].copy_from_slice(&0u32.to_le_bytes()); // PointerToSymbolTable
         c[12..16].copy_from_slice(&0u32.to_le_bytes()); // NumberOfSymbols
         c[16..18].copy_from_slice(&(OPT_HEADER_LEN as u16).to_le_bytes()); // SizeOfOptionalHeader
-        // Characteristics: DLL | EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+                                                                           // Characteristics: DLL | EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
         let chars: u16 = 0x2000 | 0x0002 | 0x0020;
         c[18..20].copy_from_slice(&chars.to_le_bytes());
         c
@@ -715,8 +706,8 @@ mod tests {
         o[0..2].copy_from_slice(&0x020Bu16.to_le_bytes());
         o[2] = 14; // MajorLinkerVersion
         o[3] = 0; // MinorLinkerVersion
-        // [4..8] SizeOfCode, [8..12] SizeOfInitializedData, [12..16] SizeOfUninitializedData = 0
-        // [16..20] AddressOfEntryPoint
+                  // [4..8] SizeOfCode, [8..12] SizeOfInitializedData, [12..16] SizeOfUninitializedData = 0
+                  // [16..20] AddressOfEntryPoint
         o[16..20].copy_from_slice(&entry.to_le_bytes());
         // [20..24] BaseOfCode
         o[20..24].copy_from_slice(&0x1000u32.to_le_bytes());
@@ -764,9 +755,9 @@ mod tests {
         s[12..16].copy_from_slice(&rva.to_le_bytes()); // VirtualAddress
         s[16..20].copy_from_slice(&(raw.len() as u32).to_le_bytes()); // SizeOfRawData
         s[20..24].copy_from_slice(&rva.to_le_bytes()); // PointerToRawData
-        // Characteristics: CODE|EXECUTE|READ for .text; INITIALIZED_DATA|READ
-        // otherwise. We set a generic readable flag for all; the loader below
-        // doesn't act on these so a permissive value is fine for tests.
+                                                       // Characteristics: CODE|EXECUTE|READ for .text; INITIALIZED_DATA|READ
+                                                       // otherwise. We set a generic readable flag for all; the loader below
+                                                       // doesn't act on these so a permissive value is fine for tests.
         let chars: u32 = 0x4000_0040; // IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_INITIALIZED_DATA
         s[36..40].copy_from_slice(&chars.to_le_bytes());
         s
@@ -818,10 +809,11 @@ mod tests {
         // The qword at .text+0 was originally PREFERRED_BASE and carried a
         // DIR64 reloc; it must now equal PREFERRED_BASE + (base - PREFERRED_BASE)
         // == base.
-        let fixed =
-            u64::from_le_bytes(mapped.image[synth.reloc_target_rva..synth.reloc_target_rva + 8]
+        let fixed = u64::from_le_bytes(
+            mapped.image[synth.reloc_target_rva..synth.reloc_target_rva + 8]
                 .try_into()
-                .unwrap());
+                .unwrap(),
+        );
         assert_eq!(fixed, base, "DIR64 reloc must add delta = base - preferred");
 
         // .data bytes survive the copy.
@@ -833,7 +825,9 @@ mod tests {
         // IAT slot (at iat_slot_rva = 0x2000) must hold the resolved address.
         let iat_slot_rva = 0x2000usize;
         let iat_val = u64::from_le_bytes(
-            mapped.image[iat_slot_rva..iat_slot_rva + 8].try_into().unwrap(),
+            mapped.image[iat_slot_rva..iat_slot_rva + 8]
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(iat_val, expected_addr, "IAT must be patched with export VA");
     }

@@ -107,7 +107,9 @@ impl CredStore {
             [],
         )?;
         let current: i64 =
-            conn.query_row("SELECT version FROM _schema_version LIMIT 1", [], |r| r.get(0))?;
+            conn.query_row("SELECT version FROM _schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })?;
         if current < Self::CURRENT_SCHEMA_VERSION {
             // --- migration arms (forward-only) ---------------------------------
             // v0 → v1: initial baseline (creds table already created by init).

@@ -225,13 +225,12 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
 /// rather than abort).
 fn alloc_trampoline(near_addr: u64, target: u64) -> Option<VirtualAllocGuard> {
     let hint = near_addr.saturating_sub(0x1000_0000); // 256 MiB below
-    // SAFETY: `hint` is an arbitrary address, only handed to `VirtualAlloc`;
-    // `try_alloc_tramp` documents this contract.
-    let guard = unsafe { try_alloc_tramp(hint as *mut c_void) }
-        .or_else(|| {
-            // SAFETY: null hint lets the OS pick an address.
-            unsafe { try_alloc_tramp(std::ptr::null_mut()) }
-        })?;
+                                                      // SAFETY: `hint` is an arbitrary address, only handed to `VirtualAlloc`;
+                                                      // `try_alloc_tramp` documents this contract.
+    let guard = unsafe { try_alloc_tramp(hint as *mut c_void) }.or_else(|| {
+        // SAFETY: null hint lets the OS pick an address.
+        unsafe { try_alloc_tramp(std::ptr::null_mut()) }
+    })?;
     // SAFETY: `guard.ptr()` is a fresh RWX page; we are the sole writer.
     unsafe { write_trampoline(guard.ptr() as u64, target) };
     Some(guard)

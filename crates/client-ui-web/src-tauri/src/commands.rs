@@ -5,8 +5,8 @@
 //! The frontend constructs any `JsonCommand` as a `serde_json::Value` and
 //! this layer forwards it to `POST /api/task` verbatim. No 28-arm match.
 
-use std::sync::Arc;
 use serde_json::Value;
+use std::sync::Arc;
 use tauri::{Emitter, State};
 
 use crate::rest;
@@ -89,16 +89,19 @@ pub async fn list_creds(
         return Err("not connected".into());
     };
     let client = rest::http_client();
-    rest::list_creds(&client, &server, &bearer, reveal.unwrap_or(false), kind.as_deref())
-        .await
-        .map_err(|e| e.to_string())
+    rest::list_creds(
+        &client,
+        &server,
+        &bearer,
+        reveal.unwrap_or(false),
+        kind.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn add_cred(
-    state: State<'_, Arc<BackendState>>,
-    cred: Value,
-) -> Result<Value, String> {
+pub async fn add_cred(state: State<'_, Arc<BackendState>>, cred: Value) -> Result<Value, String> {
     let conn = state.connection.read().await.clone();
     let Some(Connection { server, bearer }) = conn else {
         return Err("not connected".into());

@@ -9,14 +9,14 @@
 //! The old Makepad bridge had a 912-line dispatch.rs match. It's gone:
 //! `send_command` accepts any `JsonCommand` as JSON and forwards it verbatim.
 
-pub mod state;
-pub mod rest;
-pub mod poll;
 pub mod commands;
+pub mod poll;
+pub mod rest;
+pub mod state;
 
+use state::BackendState;
 use std::sync::Arc;
 use tauri::Manager;
-use state::BackendState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

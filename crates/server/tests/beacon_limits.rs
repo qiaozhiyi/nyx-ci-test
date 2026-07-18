@@ -167,12 +167,13 @@ async fn post_task_rejects_when_pending_queue_is_full() {
     // OOM. Past MAX_PENDING_PER_SESSION the enqueue must be rejected (back-
     // pressure), not silently grow the queue.
     use nyx_server::MAX_PENDING_PER_SESSION;
-    let mut state = AppState::default();
     // RBAC: open mode now maps anonymous → Viewer (read-only), so post_task
     // would 403. Set a legacy api_token (→ _legacy Admin) and send it as a
     // Bearer — mirrors how a production operator authenticates.
-    state.api_token = Some("test-admin-token".to_string());
-    let state = Arc::new(state);
+    let state = Arc::new(AppState {
+        api_token: Some("test-admin-token".to_string()),
+        ..AppState::default()
+    });
     let server_pub = state.keypair.public_bytes();
     // Seed one real session via a valid check-in (so post_task finds it).
     let (frame, pubkey) = valid_checkin_frame(&server_pub);

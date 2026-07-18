@@ -9,9 +9,10 @@ use nyx_server::{router, AppState};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn checkin_then_shell_task_roundtrips() {
-    let mut state = AppState::default();
-    state.api_token = Some("test-admin-token".to_string());
-    let state = Arc::new(state);
+    let state = Arc::new(AppState {
+        api_token: Some("test-admin-token".to_string()),
+        ..AppState::default()
+    });
     let server_pub = state.keypair.public_bytes();
     let app = router(state);
 
@@ -110,9 +111,10 @@ async fn checkin_then_shell_task_roundtrips() {
 /// reassemble the streamed FileChunks back through the control API.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upload_then_download_roundtrips() {
-    let mut state = AppState::default();
-    state.api_token = Some("test-admin-token".to_string());
-    let state = Arc::new(state);
+    let state = Arc::new(AppState {
+        api_token: Some("test-admin-token".to_string()),
+        ..AppState::default()
+    });
     let server_pub = state.keypair.public_bytes();
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -488,8 +490,10 @@ async fn all_control_api_endpoints_require_bearer_auth() {
 /// LogHook and assert both events arrive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scripting_events_fire_on_beacon_cycle() {
-    let mut state = AppState::default();
-    state.api_token = Some("test-admin-token".to_string());
+    let mut state = AppState {
+        api_token: Some("test-admin-token".to_string()),
+        ..AppState::default()
+    };
     let log = nyx_scripting::LogHook::new();
     let recs = log.records.clone();
     state.events.register(Box::new(log));

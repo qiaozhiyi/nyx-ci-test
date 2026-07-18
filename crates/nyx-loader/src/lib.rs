@@ -54,8 +54,8 @@ use stub::{NYX2_MAGIC, PIC_STUB};
 
 // Re-export key constants for callers that need to reason about offsets.
 pub use stub::{
-    reflective_load, reflective_load_at, MappedImage, ReflectiveLoadError, CIPHERTEXT_OFFSET,
-    ENCRYPTED_LEN_OFFSET, ImportResolver, NONCE_OFFSET, PIC_STUB_LEN, TAG_LEN,
+    reflective_load, reflective_load_at, ImportResolver, MappedImage, ReflectiveLoadError,
+    CIPHERTEXT_OFFSET, ENCRYPTED_LEN_OFFSET, NONCE_OFFSET, PIC_STUB_LEN, TAG_LEN,
 };
 
 // ── LoaderConfig ────────────────────────────────────────────────────────

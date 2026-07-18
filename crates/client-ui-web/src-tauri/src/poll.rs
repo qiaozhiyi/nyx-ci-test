@@ -9,8 +9,8 @@
 //! Makepad's private channel API.
 
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
 use tauri::async_runtime;
+use tauri::{AppHandle, Emitter};
 use tokio::time::{interval, Duration};
 
 use crate::rest;
@@ -103,10 +103,8 @@ async fn drain_pending_results(
                     let _ = app.emit("nyx://result", r);
                 }
                 // Remove completed/errored tasks from pending.
-                let done_ids: std::collections::HashSet<u64> = results
-                    .iter()
-                    .map(|r| r.task_id)
-                    .collect();
+                let done_ids: std::collections::HashSet<u64> =
+                    results.iter().map(|r| r.task_id).collect();
                 if !done_ids.is_empty() {
                     let mut p = state.pending.write().await;
                     p.retain(|t| !done_ids.contains(&t.task_id));

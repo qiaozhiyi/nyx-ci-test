@@ -230,19 +230,12 @@ const PERSIST_TOUCH_THROTTLE: std::time::Duration = std::time::Duration::from_se
 enum PersistCmd {
     /// Upsert full session metadata (new-session check-in). Carries the
     /// ORIGINAL `first_seen` so creation time survives re-check-ins.
-    Upsert {
-        rec: nyx_store::SessionRecord,
-    },
+    Upsert { rec: nyx_store::SessionRecord },
     /// Bump only `last_seen` for an existing session (throttled per-session).
-    Touch {
-        session_id: String,
-        last_seen: u64,
-    },
+    Touch { session_id: String, last_seen: u64 },
     /// Delete a session row (GC evicted it). The store must not accumulate
     /// dead rows forever.
-    Delete {
-        session_id: String,
-    },
+    Delete { session_id: String },
 }
 
 /// The persistence handle: a background thread + its command channel. Cheap to
@@ -292,7 +285,9 @@ impl SessionPersistence {
                     session_id,
                     last_seen,
                 } => ("touch", store.touch(&session_id, last_seen).map(|_| ())),
-                PersistCmd::Delete { session_id } => ("delete", store.delete(&session_id).map(|_| ())),
+                PersistCmd::Delete { session_id } => {
+                    ("delete", store.delete(&session_id).map(|_| ()))
+                }
             };
             if let Err(e) = res {
                 tracing::warn!(
@@ -393,7 +388,9 @@ pub fn load_persisted_sessions(state: &AppState) -> usize {
         let now_s = now_unix();
         let age_secs = now_s.saturating_sub(r.first_seen);
         let idle_secs = now_s.saturating_sub(r.last_seen);
-        let created = now.checked_sub(std::time::Duration::from_secs(age_secs)).unwrap_or(now);
+        let created = now
+            .checked_sub(std::time::Duration::from_secs(age_secs))
+            .unwrap_or(now);
         let last_seen_instant = now
             .checked_sub(std::time::Duration::from_secs(idle_secs))
             .unwrap_or(now);
@@ -1026,7 +1023,6 @@ fn handle_frame(
     peer: &std::net::SocketAddr,
     raw: &nyx_protocol::RawFrame,
 ) -> anyhow::Result<Vec<u8>> {
-
     // Decide new-vs-existing and (for existing) grab the session key. This
     // read-guard counter check is ADVISORY only: it lets us skip the decrypt
     // for an obvious stale replay, but it is NOT the authoritative anti-replay
@@ -2562,15 +2558,19 @@ mod tests {
     // (no more than one last_seen write per session per PERSIST_TOUCH_THROTTLE).
 
     /// Build an AppState whose session persistence points at an in-memory store
-    /// + a spawned writer thread. Returns the state and a handle to the store
+    /// and a spawned writer thread. Returns the state and a handle to the store
     /// for direct synchronous querying (the writer is async/fire-and-forget).
-    fn state_with_persistence() -> (std::sync::Arc<AppState>, std::sync::Arc<nyx_store::SessionStore>)
-    {
+    fn state_with_persistence() -> (
+        std::sync::Arc<AppState>,
+        std::sync::Arc<nyx_store::SessionStore>,
+    ) {
         let store = std::sync::Arc::new(nyx_store::SessionStore::open_in_memory().unwrap());
         let persist = SessionPersistence::spawn(store.clone());
-        let mut st = AppState::default();
-        st.sessions_db = Some(std::sync::Arc::new(persist));
-        (std::sync::Arc::new(st), store)
+        let st = std::sync::Arc::new(AppState {
+            sessions_db: Some(std::sync::Arc::new(persist)),
+            ..AppState::default()
+        });
+        (st, store)
     }
 
     #[test]
@@ -2628,13 +2628,17 @@ mod tests {
             .unwrap();
 
         let persist = SessionPersistence::spawn(std::sync::Arc::new(store));
-        let mut st = AppState::default();
-        st.sessions_db = Some(std::sync::Arc::new(persist));
-        let st = std::sync::Arc::new(st);
+        let st = std::sync::Arc::new(AppState {
+            sessions_db: Some(std::sync::Arc::new(persist)),
+            ..AppState::default()
+        });
 
         let loaded = load_persisted_sessions(&st);
         assert_eq!(loaded, 1);
-        let s = st.sessions.get(&pk).expect("restored session must be in the registry");
+        let s = st
+            .sessions
+            .get(&pk)
+            .expect("restored session must be in the registry");
         assert!(s.stale, "a restored session must be marked stale");
         assert_eq!(s.info.hostname, "restored-host");
         assert_eq!(s.info.beacon_id, 7);
@@ -2665,9 +2669,10 @@ mod tests {
             .unwrap();
 
         let persist = SessionPersistence::spawn(std::sync::Arc::new(store));
-        let mut st = AppState::default();
-        st.sessions_db = Some(std::sync::Arc::new(persist));
-        let st = std::sync::Arc::new(st);
+        let st = std::sync::Arc::new(AppState {
+            sessions_db: Some(std::sync::Arc::new(persist)),
+            ..AppState::default()
+        });
         load_persisted_sessions(&st);
         assert!(st.sessions.get(&pubkey).unwrap().stale, "restored → stale");
 
@@ -2696,8 +2701,7 @@ mod tests {
         let pubkey = ServerKeypair::generate().unwrap().public_bytes();
         let peer: std::net::SocketAddr = "127.0.0.1:7820".parse().unwrap();
         let (key, checkin) = checkin_frame(&st, &pubkey, 1);
-        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
-            .expect("check-in");
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin).expect("check-in");
 
         // Wait for the initial upsert to land so we have a baseline last_seen.
         let id_hex = hex::encode(pubkey);
@@ -2785,19 +2789,12 @@ mod tests {
 
         // Mimic the GC eviction path for a persisted session.
         st.sessions.remove(&pubkey);
-        st.sessions_db
-            .as_ref()
-            .unwrap()
-            .delete(id_hex.clone());
+        st.sessions_db.as_ref().unwrap().delete(id_hex.clone());
 
         // The delete is fire-and-forget; poll for it.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let gone = !store
-                .list()
-                .unwrap()
-                .iter()
-                .any(|r| r.session_id == id_hex);
+            let gone = !store.list().unwrap().iter().any(|r| r.session_id == id_hex);
             if gone {
                 return;
             }
@@ -3112,8 +3109,10 @@ mod tests {
         // must supply a valid api_token (→ _legacy Admin) to pass post_task's
         // Viewer 403 gate. This mirrors production, where write endpoints
         // require real credentials.
-        let mut st = AppState::default();
-        st.api_token = Some("test-admin-token".to_string());
+        let mut st = AppState {
+            api_token: Some("test-admin-token".to_string()),
+            ..AppState::default()
+        };
         let rec = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         st.events.register(Box::new(RecordingHook(rec.clone())));
         let st = std::sync::Arc::new(st);

@@ -5,8 +5,8 @@
 //! Binary payloads (upload data, shellcode) are hex-encoded strings in JSON,
 //! matching the server's `JsonCommand` convention.
 
-use anyhow::{Result, anyhow};
-use nyx_rest::{SessionView, TaskAck, ResultView, authed};
+use anyhow::{anyhow, Result};
+use nyx_rest::{authed, ResultView, SessionView, TaskAck};
 use reqwest::Client;
 
 /// Build a reqwest client with sane timeouts for an operator console.
@@ -18,11 +18,21 @@ pub fn http_client() -> Client {
 }
 
 /// `GET /api/sessions` — list all active sessions.
-pub async fn fetch_sessions(client: &Client, server: &str, bearer: &str) -> Result<Vec<SessionView>> {
+pub async fn fetch_sessions(
+    client: &Client,
+    server: &str,
+    bearer: &str,
+) -> Result<Vec<SessionView>> {
     let url = format!("{}/api/sessions", server.trim_end_matches('/'));
-    let resp = authed(client.get(&url), &Some(bearer.to_string())).send().await?;
+    let resp = authed(client.get(&url), &Some(bearer.to_string()))
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(anyhow!("sessions: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+        return Err(anyhow!(
+            "sessions: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
     }
     Ok(resp.json().await?)
 }
@@ -42,9 +52,15 @@ pub async fn enqueue_task(
 ) -> Result<TaskAck> {
     let url = format!("{}/api/task", server.trim_end_matches('/'));
     let body = serde_json::json!({ "session": session, "command": command });
-    let resp = authed(client.post(&url).json(&body), &Some(bearer.to_string())).send().await?;
+    let resp = authed(client.post(&url).json(&body), &Some(bearer.to_string()))
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(anyhow!("task: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+        return Err(anyhow!(
+            "task: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
     }
     Ok(resp.json().await?)
 }
@@ -63,9 +79,15 @@ pub async fn drain_results(
         server.trim_end_matches('/'),
         session
     );
-    let resp = authed(client.get(&url), &Some(bearer.to_string())).send().await?;
+    let resp = authed(client.get(&url), &Some(bearer.to_string()))
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(anyhow!("results: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+        return Err(anyhow!(
+            "results: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
     }
     Ok(resp.json().await?)
 }
@@ -94,9 +116,15 @@ pub async fn list_creds(
         url.push('?');
         url.push_str(&params.join("&"));
     }
-    let resp = authed(client.get(&url), &Some(bearer.to_string())).send().await?;
+    let resp = authed(client.get(&url), &Some(bearer.to_string()))
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(anyhow!("creds: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+        return Err(anyhow!(
+            "creds: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
     }
     Ok(resp.json().await?)
 }
@@ -109,9 +137,15 @@ pub async fn add_cred(
     cred: serde_json::Value,
 ) -> Result<serde_json::Value> {
     let url = format!("{}/api/creds", server.trim_end_matches('/'));
-    let resp = authed(client.post(&url).json(&cred), &Some(bearer.to_string())).send().await?;
+    let resp = authed(client.post(&url).json(&cred), &Some(bearer.to_string()))
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(anyhow!("creds add: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+        return Err(anyhow!(
+            "creds add: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
     }
     Ok(resp.json().await?)
 }
@@ -127,9 +161,15 @@ pub async fn delete_cred(
 ) -> Result<serde_json::Value> {
     let url = format!("{}/api/creds/delete", server.trim_end_matches('/'));
     let body = serde_json::json!({ "realm": realm, "user": user, "kind": kind });
-    let resp = authed(client.post(&url).json(&body), &Some(bearer.to_string())).send().await?;
+    let resp = authed(client.post(&url).json(&body), &Some(bearer.to_string()))
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(anyhow!("creds delete: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+        return Err(anyhow!(
+            "creds delete: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
     }
     Ok(resp.json().await?)
 }
@@ -159,9 +199,15 @@ pub async fn fetch_audit(
         url.push('?');
         url.push_str(&qs.join("&"));
     }
-    let resp = authed(client.get(&url), &Some(bearer.to_string())).send().await?;
+    let resp = authed(client.get(&url), &Some(bearer.to_string()))
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(anyhow!("audit: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+        return Err(anyhow!(
+            "audit: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
     }
     Ok(resp.json().await?)
 }
@@ -173,9 +219,15 @@ pub async fn verify_audit(
     bearer: &str,
 ) -> Result<serde_json::Value> {
     let url = format!("{}/api/audit/verify", server.trim_end_matches('/'));
-    let resp = authed(client.get(&url), &Some(bearer.to_string())).send().await?;
+    let resp = authed(client.get(&url), &Some(bearer.to_string()))
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(anyhow!("audit verify: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+        return Err(anyhow!(
+            "audit verify: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
     }
     Ok(resp.json().await?)
 }
@@ -190,9 +242,15 @@ pub async fn generate_implant(
     req: serde_json::Value,
 ) -> Result<serde_json::Value> {
     let url = format!("{}/api/generate-implant", server.trim_end_matches('/'));
-    let resp = authed(client.post(&url).json(&req), &Some(bearer.to_string())).send().await?;
+    let resp = authed(client.post(&url).json(&req), &Some(bearer.to_string()))
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(anyhow!("generate: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+        return Err(anyhow!(
+            "generate: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
     }
     Ok(resp.json().await?)
 }
@@ -204,9 +262,15 @@ pub async fn list_implants(
     bearer: &str,
 ) -> Result<serde_json::Value> {
     let url = format!("{}/api/implants", server.trim_end_matches('/'));
-    let resp = authed(client.get(&url), &Some(bearer.to_string())).send().await?;
+    let resp = authed(client.get(&url), &Some(bearer.to_string()))
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(anyhow!("implants: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+        return Err(anyhow!(
+            "implants: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
     }
     Ok(resp.json().await?)
 }
@@ -220,9 +284,15 @@ pub async fn revoke_implant(
 ) -> Result<serde_json::Value> {
     let url = format!("{}/api/implant/revoke", server.trim_end_matches('/'));
     let body = serde_json::json!({ "implant_pub": implant_pub });
-    let resp = authed(client.post(&url).json(&body), &Some(bearer.to_string())).send().await?;
+    let resp = authed(client.post(&url).json(&body), &Some(bearer.to_string()))
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(anyhow!("revoke: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+        return Err(anyhow!(
+            "revoke: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
     }
     Ok(resp.json().await?)
 }
@@ -236,9 +306,15 @@ pub async fn fetch_profile(
     bearer: &str,
 ) -> Result<serde_json::Value> {
     let url = format!("{}/api/profile", server.trim_end_matches('/'));
-    let resp = authed(client.get(&url), &Some(bearer.to_string())).send().await?;
+    let resp = authed(client.get(&url), &Some(bearer.to_string()))
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(anyhow!("profile: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default()));
+        return Err(anyhow!(
+            "profile: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
     }
     Ok(resp.json().await?)
 }

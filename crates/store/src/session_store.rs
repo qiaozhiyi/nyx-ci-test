@@ -142,7 +142,9 @@ impl SessionStore {
             [],
         )?;
         let current: i64 =
-            conn.query_row("SELECT version FROM _schema_version LIMIT 1", [], |r| r.get(0))?;
+            conn.query_row("SELECT version FROM _schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })?;
         if current < Self::CURRENT_SCHEMA_VERSION {
             // v0 → v1: baseline (creds/implants tables created by their stores).
             // v1 → v2: session-persistence baseline — the `sessions` table is
@@ -315,14 +317,20 @@ mod tests {
         let got = s.list().unwrap().remove(0);
         assert_eq!(got.hostname, "host-a-renamed");
         assert_eq!(got.last_seen, 9999);
-        assert_eq!(got.first_seen, 1000, "first_seen must be preserved on re-upsert");
+        assert_eq!(
+            got.first_seen, 1000,
+            "first_seen must be preserved on re-upsert"
+        );
     }
 
     #[test]
     fn touch_updates_last_seen_only() {
         let s = SessionStore::open_in_memory().unwrap();
         s.upsert(&rec("aa", "host-a", 1000)).unwrap();
-        assert!(s.touch("aa", 5555).unwrap(), "touch on known session must match");
+        assert!(
+            s.touch("aa", 5555).unwrap(),
+            "touch on known session must match"
+        );
         let got = s.list().unwrap().remove(0);
         assert_eq!(got.last_seen, 5555);
         assert_eq!(got.first_seen, 1000, "touch must not alter first_seen");
@@ -346,7 +354,10 @@ mod tests {
         r.auth_token = None; // legacy implant: no token
         s.upsert(&r).unwrap();
         let got = s.list().unwrap().remove(0);
-        assert!(got.auth_token.is_none(), "NULL auth_token must round-trip as None");
+        assert!(
+            got.auth_token.is_none(),
+            "NULL auth_token must round-trip as None"
+        );
     }
 
     #[test]
@@ -404,8 +415,16 @@ mod tests {
 
         // Reopen sessions alone — its row (and the creds table) must survive.
         let sessions2 = SessionStore::open(&path).unwrap();
-        assert_eq!(sessions2.count().unwrap(), 1, "session row must survive reopen");
-        assert_eq!(creds.count().unwrap(), 1, "creds row must be untouched by session store");
+        assert_eq!(
+            sessions2.count().unwrap(),
+            1,
+            "session row must survive reopen"
+        );
+        assert_eq!(
+            creds.count().unwrap(),
+            1,
+            "creds row must be untouched by session store"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

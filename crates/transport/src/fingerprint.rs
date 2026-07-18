@@ -141,9 +141,7 @@ impl std::error::Error for ValidateJa3Error {}
 ///         .map_err(|e| ValidateJa3Error::Http(e.to_string()))
 /// }
 /// ```
-pub fn build_impersonating_client(
-    _profile: BrowserProfile,
-) -> Result<(), ValidateJa3Error> {
+pub fn build_impersonating_client(_profile: BrowserProfile) -> Result<(), ValidateJa3Error> {
     Err(ValidateJa3Error::BackendUnavailable)
 }
 
