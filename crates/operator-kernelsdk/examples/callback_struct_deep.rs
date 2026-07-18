@@ -3,12 +3,16 @@
 //! 值，再读它指向的前 16 字节，判断哪个像 x64 函数序言。
 //! **只读，零写风险。**
 
-#![cfg(target_os = "windows")]
 
+
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::offsets::notify_routines;
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::win::{bootstrap_byovd, kernel_base};
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::KernelRw;
 
+#[cfg(target_os = "windows")]
 const SYS_PATH: &[u16] = &[
     'S' as u16,
     'y' as u16,
@@ -41,11 +45,14 @@ const SYS_PATH: &[u16] = &[
     's' as u16,
     0,
 ];
+#[cfg(target_os = "windows")]
 const SVC_NAME: &[u16] = &[
     'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
 ];
+#[cfg(target_os = "windows")]
 const PSP_CREATE_PROCESS_NOTIFY_RVA: u32 = 0x4D9D70;
 
+#[cfg(target_os = "windows")]
 extern "system" {
     fn RtlAdjustPrivilege(
         privilege: u32,
@@ -54,6 +61,7 @@ extern "system" {
         enabled: *mut i32,
     ) -> i32;
 }
+#[cfg(target_os = "windows")]
 fn enable_privileges() {
     for luid in [10u32, 20u32] {
         let mut p: i32 = 0;
@@ -61,6 +69,7 @@ fn enable_privileges() {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn looks_like_kexec_ptr(v: u64) -> bool {
     v >= 0xFFFFF800_00000000 && (v & 0xFFFFF000_00000000) == 0xFFFFF000_00000000
 }
@@ -75,6 +84,7 @@ fn looks_like_kexec_ptr(v: u64) -> bool {
 ///   53              push rbx
 ///   41 54/55/56/57  push r8-r15
 ///   48 8B           mov (various)
+#[cfg(target_os = "windows")]
 fn looks_like_function_prologue(b: &[u8]) -> bool {
     if b.len() < 3 {
         return false;
@@ -105,6 +115,7 @@ fn looks_like_function_prologue(b: &[u8]) -> bool {
     false
 }
 
+#[cfg(target_os = "windows")]
 fn main() {
     println!(
         "[callback_struct_deep] READ-ONLY: find real routine offset in _PS_NOTIFY_ROUTINE_BLOCK"
@@ -169,4 +180,24 @@ fn main() {
 
     println!("[callback_struct_deep] DONE");
     std::mem::forget(loaded);
+}
+
+
+// ----------------------------------------------------------------------------
+// Non-Windows entry-point fallback (E0601 mitigation).
+//
+// The real `fn main()` (and every Windows-only item above) is gated by
+// `#[cfg(target_os = "windows")]`. This file is compiled as an example crate,
+// which requires a `main` entry point; on macOS/Linux dev hosts the Windows
+// body compiles to nothing and the build would fail with E0601 ("main
+// function not found"). This stub exists solely to satisfy the crate root on
+// non-Windows so `cargo build --examples` / `cargo test` stay green. It is
+// mutually exclusive with the Windows `main` above and never runs on target.
+// ----------------------------------------------------------------------------
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!(
+        "{} is a Windows-only kernel example (BYOVD driver load). It has no          effect on non-Windows hosts.",
+        env!("CARGO_BIN_NAME")
+    );
 }

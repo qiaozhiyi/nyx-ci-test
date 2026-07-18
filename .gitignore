@@ -25,3 +25,6 @@ downloads/
 crates/client-ui-web/node_modules/
 crates/client-ui-web/dist/
 tmp/
+
+# Playwright MCP test artifacts
+.playwright-mcp/

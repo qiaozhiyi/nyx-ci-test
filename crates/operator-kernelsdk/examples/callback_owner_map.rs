@@ -10,13 +10,18 @@
 //! 目的: 找出哪个 slot 是 ntoskrnl 内部(不能碰，会导致 triple fault)，
 //! 哪些是外部 EDR 驱动(Defender/Sysmon)，为 K-2 安全 repurpose 选目标。
 
-#![cfg(target_os = "windows")]
 
+
+#[cfg(target_os = "windows")]
 use core::ffi::c_void;
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::offsets::notify_routines;
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::win::{bootstrap_byovd, kernel_base};
+#[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::KernelRw;
 
+#[cfg(target_os = "windows")]
 const SYS_PATH: &[u16] = &[
     'S' as u16,
     'y' as u16,
@@ -49,12 +54,16 @@ const SYS_PATH: &[u16] = &[
     's' as u16,
     0,
 ];
+#[cfg(target_os = "windows")]
 const SVC_NAME: &[u16] = &[
     'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
 ];
+#[cfg(target_os = "windows")]
 const PSP_CREATE_PROCESS_NOTIFY_RVA: u32 = 0x4D9D70;
+#[cfg(target_os = "windows")]
 const SYSTEM_MODULE_INFORMATION: u32 = 11;
 
+#[cfg(target_os = "windows")]
 extern "system" {
     fn RtlAdjustPrivilege(
         privilege: u32,
@@ -65,6 +74,7 @@ extern "system" {
     fn NtQuerySystemInformation(class: u32, buf: *mut c_void, buflen: u32, retlen: *mut u32)
         -> i32;
 }
+#[cfg(target_os = "windows")]
 fn enable_privileges() {
     for luid in [10u32, 20u32] {
         let mut p: i32 = 0;
@@ -77,6 +87,7 @@ fn enable_privileges() {
 /// full_path 末尾找最后一个 '\' 取短名。
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg(target_os = "windows")]
 struct RtlModule {
     section: *mut c_void,
     mapped_base: *mut c_void,
@@ -89,6 +100,7 @@ struct RtlModule {
 }
 
 /// 拿全部已加载内核驱动的 (base, size, 短名)。
+#[cfg(target_os = "windows")]
 fn loaded_kernel_modules() -> Vec<(usize, usize, String)> {
     let mut buf = vec![0u8; 256 * 1024];
     let mut retlen: u32 = 0;
@@ -197,6 +209,7 @@ fn loaded_kernel_modules() -> Vec<(usize, usize, String)> {
 }
 
 /// 在已加载模块列表里找 routine 落在哪个驱动的 [base, base+size)。
+#[cfg(target_os = "windows")]
 fn owner_of(routine: usize, mods: &[(usize, usize, String)]) -> Option<(&str, usize)> {
     for (base, size, name) in mods {
         let end = base.wrapping_add(*size);
@@ -207,6 +220,7 @@ fn owner_of(routine: usize, mods: &[(usize, usize, String)]) -> Option<(&str, us
     None
 }
 
+#[cfg(target_os = "windows")]
 fn main() {
     println!("[callback_owner_map] READ-ONLY: map each callback routine to its driver");
     enable_privileges();
@@ -284,4 +298,24 @@ fn main() {
 
     println!("\n[callback_owner_map] DONE (read-only).");
     std::mem::forget(loaded);
+}
+
+
+// ----------------------------------------------------------------------------
+// Non-Windows entry-point fallback (E0601 mitigation).
+//
+// The real `fn main()` (and every Windows-only item above) is gated by
+// `#[cfg(target_os = "windows")]`. This file is compiled as an example crate,
+// which requires a `main` entry point; on macOS/Linux dev hosts the Windows
+// body compiles to nothing and the build would fail with E0601 ("main
+// function not found"). This stub exists solely to satisfy the crate root on
+// non-Windows so `cargo build --examples` / `cargo test` stay green. It is
+// mutually exclusive with the Windows `main` above and never runs on target.
+// ----------------------------------------------------------------------------
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!(
+        "{} is a Windows-only kernel example (BYOVD driver load). It has no          effect on non-Windows hosts.",
+        env!("CARGO_BIN_NAME")
+    );
 }
