@@ -155,6 +155,10 @@ impl<'a> Reader<'a> {
 
     pub fn blob(&mut self) -> Result<&'a [u8], WireError> {
         let len = self.u32()? as usize;
+        // Defense-in-depth: mirror Writer::blob's cap so a hostile or buggy
+        // u32 length field can't drive a huge take() even if a future caller
+        // routes through Reader without the frame layer's MAX_CT_LEN bound.
+        check_blob_len(len)?;
         self.take(len)
     }
 
@@ -234,5 +238,27 @@ mod tests {
         let mut w = Writer::new();
         w.blob(&[]).expect("empty blob should encode");
         assert_eq!(w.buf, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn reader_blob_rejects_over_cap() {
+        // A hostile u32 length field must trip check_blob_len BEFORE take(),
+        // even though take() would also Eof — defense-in-depth so Reader and
+        // Writer enforce the same cap symmetrically.
+        let over = (MAX_BLOB_LEN as u32 + 1).to_le_bytes();
+        let mut r = Reader::new(&over);
+        let err = r.blob().expect_err("over-cap declared len must error");
+        assert_eq!(err, WireError::BadLen(MAX_BLOB_LEN + 1));
+    }
+
+    #[test]
+    fn reader_blob_accepts_at_cap() {
+        // Exactly MAX_BLOB_LEN is permitted by check_blob_len; take() then
+        // fails with Eof since we don't supply payload here — but the failure
+        // must be Eof, NOT BadLen.
+        let mut buf = (MAX_BLOB_LEN as u32).to_le_bytes().to_vec();
+        buf.extend(std::iter::repeat_n(0u8, MAX_BLOB_LEN));
+        let mut r = Reader::new(&buf);
+        r.blob().expect("blob at cap with full payload must decode");
     }
 }

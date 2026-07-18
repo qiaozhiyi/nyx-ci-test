@@ -363,7 +363,7 @@ pub fn derive_session_key(
     let mut okm = [0u8; KEY_LEN];
     // HKDF expand only fails if the requested length exceeds 255 * HashLen; 32 is fine.
     hk.expand(&info[..pos], &mut okm)
-        .expect("32-byte HKDF expand cannot fail");
+        .expect("okm.len() <= 255*HashLen is a caller invariant (32 bytes << 255*32)");
     let key = SessionKey::new(okm);
     okm.zeroize();
     key
@@ -427,7 +427,7 @@ pub fn seal_dir(
                 aad,
             },
         )
-        .expect("chacha20poly1305 encrypt is infallible")
+        .expect("AEAD encrypt only fails on alloc failure; under panic=abort the server terminates anyway — caller invariant ensures plaintext < 2^32")
 }
 
 /// AEAD-decrypt `ciphertext`. Returns `Err` on tag mismatch (tampering / wrong
@@ -508,7 +508,7 @@ pub fn ecdh(our_secret: &[u8; 32], their_public: &[u8; 32]) -> Option<[u8; 32]> 
 pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], okm: &mut [u8]) {
     let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
     hk.expand(info, okm)
-        .expect("HKDF expand length ≤ 255 × HashLen; okm is well within that");
+        .expect("okm.len() <= 255*HashLen is a caller invariant");
 }
 
 /// ChaCha20-Poly1305 AEAD decrypt. `key` is the raw 32-byte key, `nonce` is

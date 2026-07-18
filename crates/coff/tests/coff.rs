@@ -84,8 +84,18 @@ fn applies_rel32_call_relocation_correctly() {
 
     let patched = apply(text, &coff, base, &resolver).expect("apply must succeed");
 
-    // COFF relocs are deltas: the patched field = original_field +
-    // (target - (field_loc + 4)). The `_N` is baked into the original field.
+    // AMD64 REL32[_N]: per PE/COFF spec, patched = original_field +
+    // (target - (field_loc + 4 + N)), where N is the `_N` suffix (0 for plain
+    // REL32, 1..5 for REL32_1..REL32_5). Determined from the actual reloc typ.
+    let n: i64 = match call.typ {
+        reloc::REL32 => 0,
+        reloc::REL32_1 => 1,
+        reloc::REL32_2 => 2,
+        reloc::REL32_3 => 3,
+        reloc::REL32_4 => 4,
+        reloc::REL32_5 => 5,
+        other => panic!("unexpected non-REL32-family reloc 0x{:04x}", other),
+    };
     let off = call.offset as usize;
     let orig = i32::from_le_bytes([
         text.raw[off],
@@ -94,7 +104,7 @@ fn applies_rel32_call_relocation_correctly() {
         text.raw[off + 3],
     ]);
     let loc = base + call.offset as u64;
-    let expected = orig.wrapping_add((target as i64 - loc as i64 - 4) as i32);
+    let expected = orig.wrapping_add((target as i64 - loc as i64 - 4 - n) as i32);
     let got = i32::from_le_bytes([
         patched[off],
         patched[off + 1],

@@ -12,8 +12,11 @@
 //!
 //! ## AMD64 relocation types handled
 //! `ADDR64` (0x01), `ADDR32NB` (0x02), `REL32` (0x03), `REL32_1..5` (0x04..0x08).
-//! `ABSOLUTE` (0x00) is skipped. Others return [`ApplyError::UnsupportedReloc`]
-//! (extend as needed).
+//! `ABSOLUTE` (0x00) is skipped. Others return
+//! [`ApplyError::UnsupportedReloc`] (extend as needed).
+//!
+//! `REL32_N` follows the PE/COFF spec: the loader applies
+//! `(target - (field_loc + 4 + N))`, where N is the `_N` suffix.
 //!
 //! `#![no_std]`-compatible (uses only `alloc`): the parser is pure byte-work,
 //! so it links into a Windows PIC implant as well as the std dev agent. The
@@ -37,6 +40,10 @@ pub mod reloc {
     pub const REL32: u16 = 0x0003;
     /// First of the REL32_1..REL32_5 family (0x04..=0x08).
     pub const REL32_1: u16 = 0x0004;
+    pub const REL32_2: u16 = 0x0005;
+    pub const REL32_3: u16 = 0x0006;
+    pub const REL32_4: u16 = 0x0007;
+    pub const REL32_5: u16 = 0x0008;
 }
 
 #[derive(Debug)]
@@ -344,18 +351,45 @@ pub fn apply<'a>(
                 let v = cur.wrapping_add(target as i64);
                 buf[off..end].copy_from_slice(&v.to_le_bytes());
             }
-            reloc::REL32 | reloc::REL32_1..=0x0008 => {
+            reloc::REL32
+            | reloc::REL32_1
+            | reloc::REL32_2
+            | reloc::REL32_3
+            | reloc::REL32_4
+            | reloc::REL32_5 => {
                 let end = off.checked_add(4).ok_or(ApplyError::BadOffset)?;
                 if end > buf.len() {
                     return Err(ApplyError::BadOffset);
                 }
-                // REL32[_N] is a delta too: the field already holds the
-                // compiler's displacement *including* the within-instruction
-                // adjustment the `_N` suffix describes (e.g. an immediate after
-                // the disp32). So we ADD `(target - (field_loc + 4))` — the
-                // `_N` is NOT applied separately.
+                // AMD64 REL32[_N]: per PE/COFF spec the decoded target sits at
+                // (field_loc + 4 + N), where N is the `_N` suffix (0 for plain
+                // REL32, 1..5 for REL32_1..REL32_5). The field holds the
+                // compiler's disp32 baseline; the loader adds
+                // (resolved_target - (field_loc + 4 + N)) to relocate it.
+                let n: i64 = match r.typ {
+                    reloc::REL32 => 0,
+                    reloc::REL32_1 => 1,
+                    reloc::REL32_2 => 2,
+                    reloc::REL32_3 => 3,
+                    reloc::REL32_4 => 4,
+                    reloc::REL32_5 => 5,
+                    // unreachable: the match arm above enumerates exactly these.
+                    _ => unreachable!("REL32 family arm caught non-family type"),
+                };
                 let cur = i32::from_le_bytes(buf[off..end].try_into().unwrap());
-                let v = cur.wrapping_add((target as i64 - loc as i64 - 4) as i32);
+                let v = cur.wrapping_add((target as i64 - loc as i64 - 4 - n) as i32);
+                buf[off..end].copy_from_slice(&v.to_le_bytes());
+            }
+            reloc::ADDR32NB => {
+                // ADDR32NB (RVA / base-not-applied): BOF loaders conventionally
+                // treat it as a flat u32 of the resolved virtual address — the
+                // "NB" (no base) is absorbed because sections load at their own
+                // base, not the PE image base. Matches CobaltStrike / inline-exec.
+                let end = off.checked_add(4).ok_or(ApplyError::BadOffset)?;
+                if end > buf.len() {
+                    return Err(ApplyError::BadOffset);
+                }
+                let v = target as u32;
                 buf[off..end].copy_from_slice(&v.to_le_bytes());
             }
             other => return Err(ApplyError::UnsupportedReloc(other)),
