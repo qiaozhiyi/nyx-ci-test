@@ -161,6 +161,7 @@ export interface ProfileView {
   useragent?: string | null;
 }
 
+// @deprecated: zero callers, kept for future profile API
 export function fetchProfile(): Promise<ProfileView> {
   return invoke('fetch_profile');
 }

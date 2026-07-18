@@ -20,13 +20,13 @@
 | wire `Response` 变体 | **7** | `protocol/src/msg.rs:560` |
 | GUI 命令（已解析） | **29** | `client-ui-web/src/components/CommandInput.tsx` |
 | server 路由 | 14 静态 API + 7 beacon + 6 kernel(条件) + 动态 profile | `server/src/lib.rs:716-779` |
-| selftest 导出符号 | **49 个 `nyx_selftest_*` + 1 个 `nyx_linger*` = 50** | `implant-win/src/selftests.rs`（feature-gated） |
+| selftest 导出符号 | **46 个 `nyx_selftest_*` + 1 个 `nyx_linger*` + 1 个 `noop_veh_handler` = 48** | `implant-win/src/selftests.rs`（feature-gated） |
 | BYOVD 驱动 | **3 可用 + 1 stub** | Shield / RTCore64 / Iqvw64e / WdtKernel(stub) |
 | Windows build 覆盖 | 8 主 + 6 patch-equiv = 14 distinct | `implant-evasionsdk/src/offsets_table.rs` |
 | transport `Transport` impl | **6 个，全部零消费者** | Malleable/DoH/Slack/LLM/MCP/SMB |
 | 加密协议测试数 | 40 | `protocol/tests/roundtrip.rs` 等 |
 
-> **旧 CODE_TRUTH_2026-07-15 的过时值**：LOC 88,874（错，含注释/空行重复计）/ test 674（错）/ Command 27（错，实际 28）/ selftest 55（错，实际 50）。本次审计已取代。
+> **旧 CODE_TRUTH_2026-07-15 的过时值**：LOC 88,874（错，含注释/空行重复计）/ test 674（错）/ Command 27（错，实际 28）/ selftest 55（错，实际 48）。本次审计已取代。
 
 ---
 

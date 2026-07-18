@@ -19,7 +19,7 @@
 | `#[test]` 函数 | **488**(含独立 crate) | 674 | `grep -rE '^\s*#\[(test\|tokio::test)\]'` |
 | Command 变体 | **28** | 27 | `protocol/src/msg.rs:130` |
 | Response 变体 | **7** | 7 | `protocol/src/msg.rs:560` |
-| selftest 导出 | **50**(49 nyx_selftest_ + 1 nyx_linger) | 55 | `implant-win/src/selftests.rs` |
+| selftest 导出 | **48**(46 nyx_selftest_ + 1 nyx_linger + 1 noop_veh_handler) | 55 | `implant-win/src/selftests.rs` |
 | GUI 命令 | **29**(Tauri) | 64 MetaCmd(TUI,已删) | `client-ui-web/src/components/CommandInput.tsx` |
 | BYOVD 驱动 | **3 可用 + 1 stub** | 同 | `operator-kernelsdk/src/byovd_drivers/` |
 

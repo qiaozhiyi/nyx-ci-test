@@ -351,7 +351,7 @@ cargo clippy --workspace --all-targets
 | 项 | 代码实情 | 证据(file:line) |
 |---|---|---|
 | **睡眠混淆 Fluctuation** | 🔴 **未接线** | `fluctuation.rs` 实现完整,但 `kits.rs:65-71` 的 `sleep()` 短路到 `beacon::sleep_seconds`(纯 `NtWaitForSingleObject`)。注释承认"Foliage fluctuation crashes in noevasion mode"。`mem::mask()` 注册了 config/key/heap 区域但永不调用。**中睡眠时 .text/config/key 为明文。** |
-| **Foliage APC .text 加密** | 🔴 死代码 | `sleep.rs` 仅脚手架(`FoliageRaw` 等),`sleep::sleep()` 零调用方。文档提到的 `execute_foliage_plan`/`FOLIAGE_ENABLED` 符号在代码中不存在。 |
+| **Foliage APC .text 加密** | 🔴 死代码 | `sleep.rs` 仅脚手架(`FoliageRaw` 等),`sleep::sleep()` 零调用方。文档提到的 `execute_foliage_plan`/`FOLIAGE_ENABLED` 仅作为 doc 注释提及,无可调用定义。 |
 | **transport/ crate** | 🟡 零消费者 | 6 个 `Transport` impl(Malleable/DoH/Slack/LLM/MCP/SMB)+ trait 本身在 crate 外**零引用**。server 用裸 `tokio-rustls`,implant 用自滚 WinHTTP。仅 JA3/JA4 计算接入 server。 |
 | **TLS 指纹 emitter** | 🔴 死代码 | `build_impersonating_client` 永返 `Err(BackendUnavailable)`(`fingerprint.rs:144-148`),`rquest` 依赖未在 Cargo.toml。出站 JA3 不可控。 |
 | **caller-spoof** | 🟡 仅 scanner | `caller_spoof.rs` 只扫 `ADD RSP,imm8;RET` stub,文档所述 `call_with_spoofed_return!` 宏不存在。 |
