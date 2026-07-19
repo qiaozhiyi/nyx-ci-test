@@ -17,17 +17,32 @@
 //! [JA4]: https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
 //! [Akamai passive HTTP/2 fingerprint]: https://blackhat.com/docs/eu-17/materials/eu-17-Shuster-Passive-Fingerprinting-Of-HTTP2-Clients-wp.pdf
 //!
-//! # Status: pending integration
+//! # Status: partial integration (2026-07-18)
 //!
 //! The `Transport` trait (in `traits.rs`) and its 6 impls — `malleable`,
-//! `doh_dns`, `slack_api`, `llm_api`, `mcp`, `smb_pipe` — are fully implemented
-//! and unit-tested but have **ZERO consumers** in the workspace. The server
-//! (`crates/server`) uses raw `tokio-rustls` for its TLS listener, and
-//! `implant-win` ships a hand-rolled WinHTTP client. Only the JA3/JA4
-//! fingerprinting path (`tls`, `h2`) is actually wired into the server (see
-//! `server/src/main.rs:427`). These channels are "pending wiring" — do NOT
-//! delete them; see ROADMAP entry "transport/ crate 接线".
+//! `doh_dns`, `slack_api`, `llm_api`, `mcp`, `smb_pipe` — are now consumed by
+//! the [`TransportStack`] adapter (`stack.rs`), a CS-style ordered fallback
+//! chain that drives `send`/`recv`/`health_check`/`init`/`max_frame_size`
+//! across a `Vec<Box<dyn Transport>>`.
+//!
+//! The server (`crates/server`) uses the stack to back its `/extc2/slack` and
+//! `/extc2/mcp` routes, which now actually relay to the real third-party API
+//! via `SlackTransport` / `McpTransport` (see `server/src/extc2_relay.rs`).
+//! The other 4 channels (`malleable`, `doh_dns`, `llm_api`, `smb_pipe`) are
+//! still stack-ready but not yet wired to a server route — see the per-channel
+//! TODOs in `extc2_relay.rs`.
+//!
+//! `implant-win` remains on its own hand-rolled WinHTTP/kernel32 channel
+//! system (`channels/`) by design: it is `#![no_std]` PIC and cannot link the
+//! `std`-using transport crate. The transport crate's role is the *server-side*
+//! relay; the implant-side channels live in `implant-win/src/channels/`.
+//!
+//! Only the JA3/JA4 fingerprinting path (`tls`, `h2`) is wired into the server
+//! listener itself (see `server/src/main.rs`).
 #![allow(dead_code)]
+// doc_lazy_continuation fires on paragraph→bullet-list transitions in the
+// fingerprint module's feature-gating doc; the bullets are independent items.
+#![allow(clippy::doc_lazy_continuation)]
 
 pub mod doh_dns;
 pub mod fingerprint;
@@ -37,8 +52,10 @@ pub mod malleable;
 pub mod mcp;
 pub mod slack_api;
 pub mod smb_pipe;
+pub mod stack;
 pub mod tls;
 pub mod traits;
 
 pub use h2::{akamai_h2, H2Fingerprint};
+pub use stack::{StackError, TransportStack, TransportStackBuilder};
 pub use tls::{ja3, ja4, parse_client_hello, sniff_client_hello, ClientHello};
