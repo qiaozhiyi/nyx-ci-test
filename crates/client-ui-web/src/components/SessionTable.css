@@ -61,6 +61,18 @@
   padding: 0 var(--sp-3) var(--sp-4);
 }
 
+/* Wrapper groups a row with its inline metadata editor. */
+.st-row-wrap {
+  margin-bottom: 1px;
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+
+.st-row-wrap.active {
+  background: var(--accent-bg);
+  border-left: 2px solid var(--accent);
+}
+
 .st-row {
   width: 100%;
   text-align: left;
@@ -68,7 +80,6 @@
   border: none;
   border-left: 2px solid transparent;
   padding: var(--sp-2) var(--sp-3);
-  margin-bottom: 1px;
   border-radius: var(--r-md);
   display: flex;
   flex-direction: column;
@@ -76,13 +87,16 @@
   transition: background 0.1s ease;
 }
 
-.st-row:hover {
-  background: var(--hover);
+/* Wrapper already paints the active background; keep the button transparent
+   when active so the wrap's accent bg shows through. */
+.st-row-wrap.active .st-row,
+.st-row.active {
+  background: transparent;
+  border-left-color: transparent;
 }
 
-.st-row.active {
-  background: var(--accent-bg);
-  border-left: 2px solid var(--accent);
+.st-row-wrap:not(.active) .st-row:hover {
+  background: var(--hover);
 }
 
 .st-row-top {
@@ -175,4 +189,177 @@
 .st-empty-sub {
   color: var(--text-muted);
   font-size: 11px;
+}
+
+/* ===== Star button (inline on each row) ===== */
+.st-star {
+  color: var(--warn);
+  font-size: 11px;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.st-star-btn {
+  margin-left: auto;
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: var(--r-sm);
+  transition: color 0.1s ease, background 0.1s ease;
+}
+
+.st-star-btn:hover {
+  color: var(--warn);
+  background: var(--warn-bg);
+}
+
+.st-star-btn.on {
+  color: var(--warn);
+}
+
+.st-star-btn:focus-visible {
+  outline: 1px solid var(--accent-border);
+}
+
+/* ===== Operator tags (shown inline under the row) ===== */
+.st-usertag {
+  color: var(--accent-hov);
+  background: var(--accent-bg);
+  padding: 0 4px;
+  border-radius: var(--r-sm);
+  font-size: 10px;
+  margin-left: var(--sp-1);
+}
+
+/* ===== Metadata editor panel (below the active row) ===== */
+.st-meta {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4) var(--sp-3);
+  background: var(--hover);
+  border-top: 1px solid var(--border-dim);
+}
+
+.st-meta-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.st-meta-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.st-meta-input,
+.st-tag-input,
+.st-meta-notes {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: var(--r-sm);
+  padding: 4px var(--sp-2);
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.1s ease;
+  font-family: inherit;
+}
+
+.st-meta-input:focus,
+.st-tag-input:focus,
+.st-meta-notes:focus {
+  border-color: var(--accent-border);
+}
+
+.st-meta-notes {
+  resize: vertical;
+  min-height: 36px;
+  line-height: 1.4;
+}
+
+.st-tag-edit {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 3px var(--sp-2);
+}
+
+.st-tag-edit:focus-within {
+  border-color: var(--accent-border);
+}
+
+.st-tag-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: var(--accent-bg);
+  color: var(--accent-hov);
+  border-radius: var(--r-pill);
+  padding: 1px 4px 1px 6px;
+  font-size: 10.5px;
+}
+
+.st-tag-x {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0 2px;
+  border-radius: var(--r-sm);
+}
+
+.st-tag-x:hover {
+  color: var(--danger);
+}
+
+.st-tag-input {
+  flex: 1;
+  min-width: 70px;
+  border: none;
+  background: transparent;
+  padding: 2px 0;
+}
+
+.st-tag-input:focus {
+  border: none;
+}
+
+.st-meta-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.st-meta-reset {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  padding: 2px var(--sp-2);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: color 0.1s ease, border-color 0.1s ease;
+}
+
+.st-meta-reset:hover {
+  color: var(--danger);
+  border-color: var(--danger);
 }
