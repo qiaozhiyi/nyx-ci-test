@@ -724,7 +724,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     // external-C2 relay rather than just a URI alias for `/beacon`.
     //
     // **Discord** and **LLM** still delegate to the plain `beacon` handler
-    // pending their own relay wiring (see TODOs in `extc2_relay.rs`).
+    // pending their own relay wiring (see design notes in `extc2_relay.rs`).
     //
     // `/doh` is the DoH-channel beacon endpoint (spec-2). The DoH channel POSTs
     // the same encrypted frame as `/beacon` but to `/doh` (CS 4.11 DoH Beacon

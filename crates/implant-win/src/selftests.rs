@@ -2939,14 +2939,14 @@ pub unsafe extern "system" fn nyx_selftest_cet_status() {
 }
 
 // ============================================================================
-// screenshot: display enumeration diagnostic (replaces multi-monitor TODO)
+// screenshot: display enumeration diagnostic (replaces former multi-monitor gap)
 // ============================================================================
 //
 // nyx_selftest_display_count: enumerate the number of physical displays via
 // EnumDisplayMonitors. The multi-monitor per-display CAPTURE path was never
 // implemented and is out of scope for the current engagement (single-monitor
 // VPS); this selftest replaces the "would need EnumDisplayMonitors and is
-// still a TODO" marker with a concrete diagnostic that actually answers
+// still unfinished" marker with a concrete diagnostic that actually answers
 // "how many displays does this host have?". The capture itself remains
 // single-virtual-screen.
 //

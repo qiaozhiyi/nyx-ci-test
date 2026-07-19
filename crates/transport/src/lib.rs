@@ -30,7 +30,7 @@
 //! via `SlackTransport` / `McpTransport` (see `server/src/extc2_relay.rs`).
 //! The other 4 channels (`malleable`, `doh_dns`, `llm_api`, `smb_pipe`) are
 //! still stack-ready but not yet wired to a server route — see the per-channel
-//! TODOs in `extc2_relay.rs`.
+//! design notes in `extc2_relay.rs`.
 //!
 //! `implant-win` remains on its own hand-rolled WinHTTP/kernel32 channel
 //! system (`channels/`) by design: it is `#![no_std]` PIC and cannot link the

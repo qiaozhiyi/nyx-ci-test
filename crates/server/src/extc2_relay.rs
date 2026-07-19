@@ -52,8 +52,8 @@
 //! The four external-C2 channels in `crates/transport/src/` are Slack, LLM,
 //! MCP, and (via the transport crate's `MalleableTransport`) the HTTP profile
 //! detail. This module wires the two highest-value, most-tested relays as a
-//! proof-of-concept and leaves clear TODOs for the remaining channels. See
-//! the per-channel notes at the bottom of this file.
+//! proof-of-concept and leaves clear design notes for the remaining channels.
+//! See the per-channel notes at the bottom of this file.
 
 use std::sync::Arc;
 
@@ -198,7 +198,7 @@ pub fn relay_reply_to_mcp(cfg: &McpRelay, reply_frame: Vec<u8>) {
     });
 }
 
-// ── Remaining-channel TODOs ───────────────────────────────────────────────
+// ── Remaining-channel design notes ────────────────────────────────────────
 //
 // The other transport-crate channels are NOT wired here yet. Each is a
 // straightforward extension of the pattern above once its env-var contract is

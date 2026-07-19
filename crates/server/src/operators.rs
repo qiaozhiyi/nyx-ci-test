@@ -19,7 +19,7 @@
 //! `NYX_BOOTSTRAP_OPERATOR=name:secret` when the registry is empty.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use argon2::password_hash::{
@@ -102,12 +102,19 @@ pub struct OperatorIdentity {
 
 pub struct OperatorRegistry {
     ops: RwLock<HashMap<String, OperatorRecord>>,
+    /// On-disk registry path (when this registry was loaded from / should be
+    /// flushed back to a file). `None` for in-memory test registries constructed
+    /// via `empty()` / struct literals. Rehash-on-login (see [`Self::resolve`])
+    /// is best-effort: when this is `None`, the in-memory record is still
+    /// upgraded to argon2id but the change is not persisted.
+    path: Option<std::sync::Mutex<PathBuf>>,
 }
 
 impl OperatorRegistry {
     pub fn empty() -> Self {
         Self {
             ops: RwLock::new(HashMap::new()),
+            path: None,
         }
     }
 
@@ -139,37 +146,127 @@ impl OperatorRegistry {
     /// valid operator names. On every not-found path we run the argon2 KDF
     /// against [`DUMMY_ARGON2_HASH`] (result discarded) so both paths pay the
     /// same dominant cost.
+    ///
+    /// **Transparent rehash (OWASP password-storage pattern)**: when the matched
+    /// record is a legacy `plain:<sha256>` marker AND the supplied secret
+    /// verifies, the plaintext is re-hashed to argon2id and the record is
+    /// updated in memory + flushed to disk (when a backing path is configured).
+    /// This runs after the read lock is released — rehash needs a write lock and
+    /// must not be held during the argon2 KDF (which is the slow path).
     pub fn resolve(&self, bearer: &str) -> Option<OperatorIdentity> {
-        let g = self.ops.read().ok()?;
-        if let Some((name, secret)) = bearer.split_once(':') {
-            // Not-found path: run the dummy argon2 KDF before returning None so
-            // the timing matches the found path (which verifies a real hash).
-            let rec = match g.get(name) {
-                Some(r) => r,
+        // Snapshot the matched record under a read lock, verify OUTSIDE the
+        // lock, then re-acquire a write lock for the transparent rehash. This
+        // avoids holding any lock during the argon2 KDF (the dominant cost) and
+        // sidesteps the read→write upgrade deadlock entirely.
+        let (name, secret): (&str, &str) = match bearer.split_once(':') {
+            Some((n, s)) => (n, s),
+            None => ("_legacy", bearer),
+        };
+        // `MatchedRecord` holds the minimal cloned fields we need post-unlock.
+        // Cloning is cheap (name + role + a PHC string) and avoids borrowing
+        // into the lock guard's lifetime.
+        struct MatchedRecord {
+            name: String,
+            role: Role,
+            secret_hash: String,
+        }
+        let matched: MatchedRecord = {
+            let g = self.ops.read().ok()?;
+            match g.get(name) {
+                Some(r) => MatchedRecord {
+                    name: r.name.clone(),
+                    role: r.role,
+                    secret_hash: r.secret_hash.clone(),
+                },
                 None => {
+                    // Not-found path: run the dummy argon2 KDF before returning
+                    // None so the timing matches the found path.
                     run_dummy_argon2(secret);
                     return None;
                 }
-            };
-            return verify_secret(&rec.secret_hash, secret).then(|| OperatorIdentity {
-                name: rec.name.clone(),
-                role: rec.role,
-            });
-        }
-        // Bare token → legacy `_legacy` record. Same dummy-KDF equalization when
-        // no `_legacy` record exists (e.g. a name was supplied without a colon
-        // but no legacy token was configured).
-        let rec = match g.get("_legacy") {
-            Some(r) => r,
-            None => {
-                run_dummy_argon2(bearer);
-                return None;
             }
         };
-        verify_secret(&rec.secret_hash, bearer).then(|| OperatorIdentity {
-            name: "_legacy".into(),
-            role: rec.role,
-        })
+        if !verify_secret(&matched.secret_hash, secret) {
+            return None;
+        }
+        let identity = OperatorIdentity {
+            name: matched.name.clone(),
+            role: matched.role,
+        };
+        // Transparent rehash: legacy `plain:` records are upgraded to argon2id
+        // on successful verification. The argon2 KDF runs here, lock-free; the
+        // write lock is only taken to swap the hash + persist.
+        if matched.secret_hash.starts_with("plain:") {
+            self.rehash_operator(&matched.name, secret);
+        }
+        Some(identity)
+    }
+
+    /// Re-hash `name`'s secret to argon2id and persist. Called from
+    /// [`resolve`](Self::resolve) when a legacy `plain:` record verifies
+    /// successfully — this is the OWASP "rehash on next login" migration path.
+    ///
+    /// Acquires the write lock, swaps the `secret_hash`, then drops the lock
+    /// before touching the disk (so a slow/unresponsive filesystem can't stall
+    /// concurrent authentications on other operators). Persistence is
+    /// best-effort: a flush failure is logged but does NOT revert the in-memory
+    /// upgrade (the next successful login will retry the flush).
+    fn rehash_operator(&self, name: &str, plaintext_secret: &str) {
+        let new_hash = match hash_argon2(plaintext_secret) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(
+                    operator = name,
+                    error = ?e,
+                    "transparent rehash to argon2id failed; legacy plain: record left in place"
+                );
+                return;
+            }
+        };
+        // Swap in-memory under the write lock.
+        let flush_path = {
+            let mut g = match self.ops.write() {
+                Ok(g) => g,
+                Err(_) => {
+                    tracing::error!(
+                        "operator registry RwLock poisoned during rehash — failing soft (no in-memory upgrade)"
+                    );
+                    return;
+                }
+            };
+            let Some(rec) = g.get_mut(name) else {
+                // Record vanished between read and write locks — nothing to do.
+                return;
+            };
+            // Only upgrade if still legacy (a concurrent rehash may have won the
+            // race). Idempotent under contention.
+            if !rec.secret_hash.starts_with("plain:") {
+                return;
+            }
+            rec.secret_hash = new_hash;
+            self.path
+                .as_ref()
+                .and_then(|p| p.lock().ok().map(|g| g.clone()))
+        };
+        tracing::info!(
+            operator = name,
+            "transparent rehash: legacy plain:sha256 secret upgraded to argon2id on login"
+        );
+        // Flush outside the write lock. Best-effort: a failure is logged but
+        // doesn't undo the in-memory upgrade (next login retries the flush).
+        if let Some(path) = flush_path {
+            let map: HashMap<String, OperatorRecord> = match self.ops.read() {
+                Ok(g) => g.values().map(|r| (r.name.clone(), r.clone())).collect(),
+                Err(_) => return,
+            };
+            if let Err(e) = persist(&path, &map) {
+                tracing::warn!(
+                    operator = name,
+                    error = ?e,
+                    "transparent rehash flush failed (in-memory upgrade kept; next login retries)"
+                );
+            }
+        }
     }
 
     pub fn list(&self) -> std::io::Result<Vec<OperatorRecord>> {
@@ -252,6 +349,7 @@ impl OperatorRegistry {
         }
         Ok(Self {
             ops: RwLock::new(map),
+            path: Some(std::sync::Mutex::new(path.to_path_buf())),
         })
     }
 }
@@ -262,16 +360,17 @@ impl OperatorRegistry {
 /// The `plain:` SHA-256 path is **legacy**: it is kept only for backward-
 /// compatibility with operator records / `_legacy` tokens created before the
 /// argon2id upgrade. New tokens are always argon2id (see `hash_argon2`). A
-/// successful legacy match emits a warning prompting rehash to argon2id; the
-/// rehash itself must be flushed by the store layer (TODO: wire on next login).
+/// successful legacy match is transparently rehashed to argon2id by the caller
+/// ([`OperatorRegistry::resolve`]) on the next login — the OWASP password-
+/// storage migration pattern. The rehash warning here is a belt-and-braces
+/// audit breadcrumb in case a future code path calls `verify_secret` directly.
 fn verify_secret(stored: &str, secret: &str) -> bool {
     if let Some(hex) = stored.strip_prefix("plain:") {
         let got = sha256_hex(secret);
         let ok = constant_time_eq(got.as_bytes(), hex.as_bytes());
         if ok {
             tracing::warn!(
-                "legacy plain:sha256 secret verified; should be rehashed to argon2id on next login \
-                 (store-layer rehash TODO)"
+                "legacy plain:sha256 secret verified; resolve() transparently rehashes to argon2id"
             );
         }
         return ok;
@@ -377,6 +476,7 @@ mod tests {
                 );
                 m
             }),
+            path: None,
         };
         // named op
         let op = reg.resolve("alice:s3cret").unwrap();
@@ -386,6 +486,75 @@ mod tests {
         // legacy bare token
         let leg = reg.resolve("TOK").unwrap();
         assert_eq!(leg.name, "_legacy");
+        // The first legacy resolve must have transparently rehashed the
+        // in-memory `_legacy` record from plain:sha256 to argon2id. A second
+        // resolve still succeeds AND the stored hash is no longer `plain:`.
+        let stored_after = {
+            let g = reg.ops.read().unwrap();
+            g.get("_legacy").unwrap().secret_hash.clone()
+        };
+        assert!(
+            !stored_after.starts_with("plain:"),
+            "transparent rehash should have upgraded _legacy to argon2id, got: {stored_after}"
+        );
+        // Re-resolve — still authenticates against the now-argon2id record.
+        assert!(
+            reg.resolve("TOK").is_some(),
+            "post-rehash legacy token must still verify"
+        );
+    }
+
+    /// Verify the transparent rehash flushes to disk when a backing path is
+    /// configured (the OWASP "rehash on next login" pattern). After a legacy
+    /// login, the persisted file must contain an argon2id hash for the operator
+    /// and reloading it must yield a registry where the record is argon2id (not
+    /// `plain:`).
+    #[test]
+    fn resolve_transparent_rehash_flushes_to_disk() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("nyx-ops-rehash-test-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // Build an in-memory registry seeded with a legacy `plain:` operator
+        // and a backing path, simulating a pre-argon2id file.
+        let reg = OperatorRegistry {
+            ops: RwLock::new({
+                let mut m = HashMap::new();
+                m.insert(
+                    "carol".into(),
+                    OperatorRecord {
+                        name: "carol".into(),
+                        secret_hash: format!("plain:{}", sha256_hex("legacy-secret")),
+                        role: Role::Operator,
+                        created: 0,
+                    },
+                );
+                m
+            }),
+            path: Some(std::sync::Mutex::new(path.clone())),
+        };
+        // Login with the legacy secret — resolves and transparently rehashes.
+        let op = reg
+            .resolve("carol:legacy-secret")
+            .expect("legacy login must succeed");
+        assert_eq!(op.name, "carol");
+        // The on-disk file must now exist and contain an argon2id hash.
+        assert!(path.exists(), "rehash must flush the registry to disk");
+        let reloaded = OperatorRegistry::load_or_bootstrap(&path, None, None)
+            .expect("reloaded registry parses");
+        let stored = {
+            let g = reloaded.ops.read().unwrap();
+            g.get("carol").unwrap().secret_hash.clone()
+        };
+        assert!(
+            !stored.starts_with("plain:"),
+            "persisted record must be argon2id after rehash flush, got: {stored}"
+        );
+        // And the reloaded registry must still authenticate carol.
+        assert!(
+            reloaded.resolve("carol:legacy-secret").is_some(),
+            "reloaded registry must still verify the upgraded record"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

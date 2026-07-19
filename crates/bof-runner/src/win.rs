@@ -130,8 +130,10 @@ unsafe impl Send for Loaded {}
 // threads would expose the BOF's RWX `base` region to data races, and BOF
 // execution is single-threaded by contract (`agent-dev` spawns one owned
 // thread that takes ownership of the `Loaded`). If a future caller needs to
-// share `&Loaded` across threads, audit the RWX region and the `static mut
-// OUT` capture buffer in `shim.rs` first — do NOT blindly re-add `Sync`.
+// share `&Loaded` across threads, audit the RWX region and the
+// `SyncUnsafeCell<[u8; OUT_CAP]>` capture buffer in `shim.rs` first — the
+// buffer relies on `!Sync for Loaded` as a load-bearing part of its SAFETY
+// proof, so do NOT blindly re-add `Sync`.
 
 pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result<Loaded, String> {
     let coff = parse(blob).map_err(|e| format!("parse: {e:?}"))?;

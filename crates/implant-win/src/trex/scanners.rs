@@ -221,6 +221,133 @@ pub unsafe fn free(p: *mut u8) {
 }
 
 // ============================================================================
+// T1: Registry enumeration (SYSTEM\CurrentControlSet\Services) via Reg*A
+// ============================================================================
+//
+// T-REX T1 is the "silent" service scanner: instead of OpenSCManagerW +
+// EnumServicesStatusExW (T3, which most EDRs hook + log), we walk the Services
+// registry tree directly. RegOpenKeyEx / RegEnumKeyEx / RegQueryValueEx are
+// ntoskrnl-origin syscalls that older-generation EDR registry minifilters
+// (CmRegisterCallback) watch, but the EDRs that hook the SCM RPC path do NOT
+// reliably alert on raw registry reads — so T1 catches the same data as T3 at
+// lower OPSEC cost.
+//
+// We use the ANSI (-A) variants deliberately: every key/value name we touch
+// (SYSTEM\CurrentControlSet\Services, DisplayName, ImagePath, service-name
+// subkeys) is pure ASCII, and the -A entrypoints avoid the per-call UTF-16
+// widen that -W would force. Service subkey names on Windows are restricted to
+// the ASCII service-name charset by the SCM anyway (MAX_PATH-length, no wide-
+// only chars), so no data is lost.
+//
+// HKEY Local Machine is a predefined handle: 0x80000002. KEY_READ (0x20019) is
+// the read-only access mask — we never write. ERROR_SUCCESS (0) is the win32
+// success code; ERROR_NO_MORE_ITEMS (259) ends the RegEnumKeyEx loop.
+
+/// `HKEY_LOCAL_MACHINE` — predefined handle (not a real handle, resolved by the
+/// kernel on first use). Encoded as `usize` so it round-trips through the FFI.
+pub const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
+/// `KEY_READ` — composite access mask (STANDARD_RIGHTS_READ | KEY_QUERY_VALUE |
+/// KEY_ENUMERATE_SUB_KEYS | KEY_NOTIFY). Read-only; we never write.
+pub const KEY_READ: u32 = 0x0002_0019;
+/// `ERROR_SUCCESS` (0) — win32 success.
+pub const ERROR_SUCCESS: i32 = 0;
+/// `ERROR_NO_MORE_ITEMS` (259) — returned by RegEnumKeyEx past the last subkey.
+pub const ERROR_NO_MORE_ITEMS: i32 = 259;
+/// `REG_SZ` (1) — NUL-terminated string (DisplayName, ImagePath).
+pub const REG_SZ: u32 = 1;
+/// `REG_EXPAND_SZ` (2) — like REG_SZ but with unexpanded %VAR% refs (ImagePath
+/// often is this). Treat the same as REG_SZ for our substring matching.
+pub const REG_EXPAND_SZ: u32 = 2;
+
+/// advapi32!RegOpenKeyExA(HKEY, lpSubKey, ulOptions, samDesired, phkResult).
+/// Opens a predefined or existing key. Returns ERROR_SUCCESS on success.
+/// `hkey` is `usize` (HKEY is a void* but the predefined handles are 32-bit
+/// sentinels that fit); `sub_key` is a NUL-terminated ASCII byte string.
+pub unsafe fn reg_open_key_ex_a(
+    hkey: usize,
+    sub_key: *const u8,
+    options: u32,
+    access: u32,
+    result: *mut usize,
+) -> i32 {
+    let addr = resolve_advapi32!(b"RegOpenKeyExA", ROKEA);
+    if addr == 0 {
+        return -1;
+    }
+    type Fn = unsafe extern "system" fn(usize, *const u8, u32, u32, *mut usize) -> i32;
+    let f: Fn = core::mem::transmute(addr);
+    f(hkey, sub_key, options, access, result)
+}
+
+/// advapi32!RegEnumKeyExA(hKey, dwIndex, lpName, lpcName, lpReserved, lpClass,
+/// lpcClass, lpftLastWrite). Enumerates one subkey name per call. Returns
+/// ERROR_SUCCESS or ERROR_NO_MORE_ITEMS.
+pub unsafe fn reg_enum_key_ex_a(
+    hkey: usize,
+    index: u32,
+    name: *mut u8,
+    name_len: *mut u32,
+    reserved: *mut u32,
+    class: *mut u8,
+    class_len: *mut u32,
+    last_write: *mut u64,
+) -> i32 {
+    let addr = resolve_advapi32!(b"RegEnumKeyExA", REKEA);
+    if addr == 0 {
+        return -1;
+    }
+    type Fn = unsafe extern "system" fn(
+        usize,
+        u32,
+        *mut u8,
+        *mut u32,
+        *mut u32,
+        *mut u8,
+        *mut u32,
+        *mut u64,
+    ) -> i32;
+    let f: Fn = core::mem::transmute(addr);
+    f(hkey, index, name, name_len, reserved, class, class_len, last_write)
+}
+
+/// advapi32!RegQueryValueExA(hKey, lpValueName, lpReserved, lpType, lpData,
+/// lpcbData). Reads one named value. Returns ERROR_SUCCESS.
+pub unsafe fn reg_query_value_ex_a(
+    hkey: usize,
+    name: *const u8,
+    reserved: *mut u32,
+    typ: *mut u32,
+    data: *mut u8,
+    len: *mut u32,
+) -> i32 {
+    let addr = resolve_advapi32!(b"RegQueryValueExA", RQVEA);
+    if addr == 0 {
+        return -1;
+    }
+    type Fn = unsafe extern "system" fn(
+        usize,
+        *const u8,
+        *mut u32,
+        *mut u32,
+        *mut u8,
+        *mut u32,
+    ) -> i32;
+    let f: Fn = core::mem::transmute(addr);
+    f(hkey, name, reserved, typ, data, len)
+}
+
+/// advapi32!RegCloseKey(hKey). Closes a handle opened by RegOpenKeyExA.
+pub unsafe fn reg_close_key(hkey: usize) -> i32 {
+    let addr = resolve_advapi32!(b"RegCloseKey", RCK);
+    if addr == 0 {
+        return 0;
+    }
+    type Fn = unsafe extern "system" fn(usize) -> i32;
+    let f: Fn = core::mem::transmute(addr);
+    f(hkey)
+}
+
+// ============================================================================
 // T2: WMI queries (root\SecurityCenter2 + root\CIMV2) via raw COM
 // ============================================================================
 //

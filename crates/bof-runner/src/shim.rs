@@ -10,18 +10,39 @@
 //! additional args go on the stack. We accept up to 4 inline args (covers
 //! >99% of community BOF format strings).
 
+use std::cell::UnsafeCell;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const OUT_CAP: usize = 16 * 1024;
-// TODO(soundness): `static mut OUT` is fine under the current single-threaded
-// BOF execution contract (and `Loaded` is no longer `Sync`, so `&Loaded`
-// cannot leak across threads), but Miri still flags the mutable static for
-// aliasing. The full fix is `static OUT: Mutex<[u8; OUT_CAP]>` — deferred
-// because this is the BOF output hot path (`push_byte` is called per char and
-// Mutex locking would regress BOF capture throughput). Revisit if/when BOF
-// execution becomes multi-threaded or if we enable Miri in CI.
-static mut OUT: [u8; OUT_CAP] = [0; OUT_CAP];
+// SAFETY (soundness): `OUT` is the per-process capture buffer for BOF output.
+// BOF execution is a single-threaded contract: `win::Loaded` is `Send` but
+// deliberately `!Sync` (see `win.rs`), so a `&Loaded` — and therefore the BOF
+// machine code that writes here through `BeaconPrintf` — cannot be shared
+// across threads. The agent's BOF executor owns one `Loaded`, moves it onto a
+// single worker thread, and runs `go()` synchronously.
+//
+// We model the buffer with a `SyncUnsafeCell`-equivalent (a private newtype
+// around `UnsafeCell` plus a manual `unsafe impl Sync`) rather than a plain
+// `static mut`:
+//   * it compiles in a `static` (plain `UnsafeCell` is `!Sync`);
+//   * it makes the interior-mutability aliasing explicit so Miri no longer
+//     flags a `static mut` aliasing violation;
+//   * it is zero-cost — a ZFF newtype around `UnsafeCell`, no lock/unlock on
+//     the per-byte `push_byte` hot path (a `Mutex` here would regress BOF
+//     capture throughput for no safety gain, since two threads can never
+//     legitimately touch this buffer).
+// Every access below goes through `OUT.get()` and is gated by the
+// single-threaded contract; the `unsafe` blocks document that contract at each
+// site. If BOF execution ever becomes multi-threaded, switch to a real
+// `Mutex<[u8; OUT_CAP]>` (or per-thread buffers) — do not relax the SAFETY
+// proofs here.
+struct OutCell(UnsafeCell<[u8; OUT_CAP]>);
+// SAFETY: see the comment block above. `Sync` is sound because the buffer is
+// only ever touched from a single thread at a time — the BOF execution
+// contract enforced by `win::Loaded: !Sync`.
+unsafe impl Sync for OutCell {}
+static OUT: OutCell = OutCell(UnsafeCell::new([0; OUT_CAP]));
 static OUT_LEN: AtomicUsize = AtomicUsize::new(0);
 
 // ── VirtualQuery — defensive pointer validation for `%s` ──────────────────────
@@ -109,8 +130,13 @@ fn is_readable(p: *const u8, min_bytes: usize) -> bool {
 #[no_mangle]
 pub extern "C" fn nyx_bof_reset() {
     OUT_LEN.store(0, Ordering::SeqCst);
+    // SAFETY: single-threaded BOF contract (see `OUT` declaration). We are the
+    // only thread with access to the buffer; the prior contents are about to
+    // be overwritten by `format_into` anyway, so clearing the first byte only
+    // matters for the empty-output case.
     unsafe {
-        core::ptr::write(&raw mut OUT[0], 0);
+        let buf: *mut u8 = OUT.0.get().cast();
+        core::ptr::write(buf, 0);
     }
 }
 
@@ -118,12 +144,17 @@ pub extern "C" fn nyx_bof_reset() {
 #[no_mangle]
 pub extern "C" fn nyx_bof_output() -> *const c_char {
     let len = OUT_LEN.load(Ordering::SeqCst);
-    if len < OUT_CAP {
-        unsafe {
-            core::ptr::write(&raw mut OUT[len], 0);
+    // SAFETY: single-threaded BOF contract (see `OUT` declaration). We write a
+    // NUL terminator so the returned `*const c_char` is a valid CStr; the BOF
+    // code that filled the buffer has already returned by the time the caller
+    // of `nyx_bof_output` reads through this pointer.
+    unsafe {
+        let buf: *mut u8 = OUT.0.get().cast();
+        if len < OUT_CAP {
+            core::ptr::write(buf.add(len), 0);
         }
+        buf as *const c_char
     }
-    unsafe { (&raw const OUT[0]) as *const c_char }
 }
 
 /// BeaconPrintf shim — called by BOFs.
@@ -235,8 +266,12 @@ fn format_into(args: &[u64; 4], fmt: *const c_char) {
 fn push_byte(b: u8) {
     let len = OUT_LEN.load(Ordering::Relaxed);
     if len < OUT_CAP {
+        // SAFETY: single-threaded BOF contract (see `OUT` declaration). `len`
+        // was just loaded and is bounded above by `OUT_CAP`, so `buf.add(len)`
+        // is in bounds; no other thread can race on the store.
         unsafe {
-            core::ptr::write(&raw mut OUT[len], b);
+            let buf: *mut u8 = OUT.0.get().cast();
+            core::ptr::write(buf.add(len), b);
         }
         OUT_LEN.store(len + 1, Ordering::Release);
     }

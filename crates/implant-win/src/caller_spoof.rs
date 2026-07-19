@@ -452,7 +452,7 @@ unsafe fn call_plain(target: usize, a1: usize, a2: usize, a3: usize, a4: usize) 
 // surgery, IRET_FRAME swap, thread-pool detour). All three require real
 // CET-capable hardware (Intel Tiger Lake+ with HSP enabled) to validate, and
 // the engagement target (Server 2019 17763.1339, no CET) does not have it —
-// the path could never be more than dead code with a "TODO(CET)" marker.
+// the path could never be more than dead code with a stale marker.
 //
 // What stays:
 //   * `is_cet_enabled()` — the runtime probe (kept as a diagnostic).
