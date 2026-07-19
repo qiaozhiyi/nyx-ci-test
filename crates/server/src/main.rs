@@ -256,6 +256,18 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // External-C2 relay config (Slack/MCP). Opt-in via NYX_EXTC2_* env vars;
+    // absent → relay disabled and /extc2/* routes behave as plain beacon aliases.
+    let extc2 = nyx_server::extc2_relay::ExtC2RelayConfig::from_env();
+    if extc2.any_enabled() {
+        tracing::info!(
+            slack = extc2.slack.is_some(),
+            mcp = extc2.mcp.is_some(),
+            "external-C2 relay enabled (routes /extc2/slack and /extc2/mcp now \
+             fan out to the real third-party API via nyx-transport)"
+        );
+    }
+
     let mut state = AppState {
         keypair,
         sessions: Default::default(),
@@ -272,6 +284,7 @@ async fn main() -> anyhow::Result<()> {
         implant_rate_limiter: Default::default(),
         implants: implant_store,
         sessions_db,
+        extc2,
     };
     state.register_default_hooks();
     // Optional operator automation: a Rhai script run on session/result events.
