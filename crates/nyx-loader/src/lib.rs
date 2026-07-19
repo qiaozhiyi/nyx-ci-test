@@ -43,6 +43,7 @@
 //! where N = `dll_bytes.len()` (ChaCha20-Poly1305 ciphertext is same length
 //! as plaintext).
 
+pub mod peb_walk;
 pub mod stub;
 
 use chacha20poly1305::{
