@@ -280,8 +280,17 @@ fn allowed(path: &str) -> bool {
         "\\config\\software",
         "\\config\\default",
     ];
+    // `clean` is built by joining non-empty segments with `\`, so it has NO
+    // leading `\` (e.g. input "config\sam" → clean "config\sam"). The blocked
+    // entries all start with `\`, so a bare "config\sam" would NOT match
+    // "\config\sam" → hive guard bypassed (CVE-class: PR #41). Fix: build a
+    // check string with a guaranteed leading `\` so the substring match works
+    // regardless of whether the operator typed a leading slash.
+    let mut check_str = crate::heap::String::with_capacity(clean.len() + 1);
+    check_str.push('\\');
+    check_str.push_str(&clean);
     for &b in &blocked {
-        if clean.contains(b) {
+        if check_str.contains(b) {
             return false;
         }
     }
