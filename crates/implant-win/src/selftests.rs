@@ -159,6 +159,16 @@ pub unsafe extern "system" fn nyx_selftest_fs() {
     unsafe { exit(mask) };
 }
 
+/// Hive-guard regression selftest (PR #41: bare `config\sam` bypassed the
+/// guard because the blocked list carries a leading `\`). Exits with the
+/// bitmask from crate::fs::selftest_hive_guard — 0x3F (63) = all cases behave.
+#[cfg(feature = "selftest")]
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_hive_guard() {
+    let mask = crate::fs::selftest_hive_guard();
+    unsafe { exit(mask) };
+}
+
 // ============================================================================
 // shell: CreateProcessW captures stdout
 // ============================================================================
@@ -720,6 +730,64 @@ pub unsafe extern "system" fn nyx_selftest_bof_marker() {
     let args: Vec<String> = Vec::new();
     let _ = crate::bof::run("go", &args, blob); // marker writes a global; no output expected
     unsafe { exit(1) }; // reaching here = loader didn't crash
+}
+
+/// BOF boundary tracer: runs bof_print.o and reports which side of the
+/// BeaconPrintf boundary broke. Writes "kind=<resp> hits=<H> len=<L>" to the
+/// marker file, where hits = times BeaconPrintf was entered and L = captured
+/// output length after go() returned:
+///   hits=0           → go() never reached the shim (reloc/entry wrong)
+///   hits>=1, len=0   → shim reached but capture buffer empty (shim/capture)
+///   hits>=1, len>=17 → capture works; a marker mismatch would be in fmt decode
+#[cfg(feature = "selftest")]
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_bof_trace() {
+    let blob: &[u8] = include_bytes!("../tests/fixtures/bof_print.o");
+    let r = crate::bof::run("go", &Vec::new(), blob);
+    let kind = match &r {
+        Response::BofOutput(_) => "BofOutput",
+        Response::Err(_) => "Err",
+        _ => "other",
+    };
+    let hits = unsafe { crate::bof::printf_hits() };
+    let len = unsafe { crate::bof::capture_len() };
+    let mut s = String::from("kind=");
+    s.push_str(kind);
+    s.push_str(" hits=");
+    s.push_str(&dec_u32(hits as u32));
+    s.push_str(" len=");
+    s.push_str(&dec_u32(len as u32));
+    s.push('\n');
+    // Loader boundary trace: bases / entry / shim addr / relocated dwords.
+    unsafe {
+        let nums = &crate::bof::TRACE_NUMS;
+        for (i, v) in nums.iter().enumerate() {
+            s.push_str("n");
+            s.push_str(&dec_u32(i as u32));
+            s.push_str("=0x");
+            push_hex_u64(&mut s, *v);
+            s.push('\n');
+        }
+        s.push_str("bytes=");
+        for b in crate::bof::TRACE_BYTES.iter() {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            s.push(HEX[(b >> 4) as usize] as char);
+            s.push(HEX[(b & 0xf) as usize] as char);
+        }
+        s.push('\n');
+    }
+    write_marker("nyx_bof_trace.txt", &s);
+    unsafe { exit(1) };
+}
+
+/// Append `v` as 16 lowercase hex chars (no 0x prefix).
+#[cfg(feature = "selftest")]
+fn push_hex_u64(s: &mut String, v: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for i in (0..16).rev() {
+        let nib = (v >> (i * 4)) & 0xf;
+        s.push(HEX[nib as usize] as char);
+    }
 }
 
 // ============================================================================

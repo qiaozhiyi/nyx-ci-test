@@ -297,6 +297,42 @@ fn allowed(path: &str) -> bool {
     true
 }
 
+/// Runtime regression test for the hive guard (PR #41): feeds `allowed()` the
+/// bypass inputs that reached the hives before the leading-`\` fix, plus the
+/// traversal / dot-prefix / forward-slash variants, and one benign path that
+/// must stay allowed. Bit N set ⇒ case N behaved correctly:
+///   0: bare relative `config\sam` blocked (the PR #41 bypass input)
+///   1: absolute `C:\Windows\System32\config\SAM` blocked
+///   2: forward-slash `config/security` blocked
+///   3: traversal `C:\Windows\System32\config\dummy\..\sam` blocked
+///   4: dot-prefix `\\.\config\SYSTEM` blocked
+///   5: benign temp path still allowed
+/// Full mask = 0x3F. Requires NYX_FS_ALLOW_PROTECTED to be unset (rundll32
+/// spawns a fresh process, so it is).
+#[cfg(feature = "selftest")]
+pub fn selftest_hive_guard() -> u32 {
+    let mut mask: u32 = 0;
+    if !allowed("config\\sam") {
+        mask |= 1 << 0;
+    }
+    if !allowed("C:\\Windows\\System32\\config\\SAM") {
+        mask |= 1 << 1;
+    }
+    if !allowed("config/security") {
+        mask |= 1 << 2;
+    }
+    if !allowed("C:\\Windows\\System32\\config\\dummy\\..\\sam") {
+        mask |= 1 << 3;
+    }
+    if !allowed("\\\\.\\config\\SYSTEM") {
+        mask |= 1 << 4;
+    }
+    if allowed("C:\\Windows\\Temp\\nyx_hive_guard_probe.bin") {
+        mask |= 1 << 5;
+    }
+    mask
+}
+
 /// Convert an operator path ("C:\Users\foo\bar.txt") into an NT object path
 /// ("\??\C:\Users\foo\bar.txt") as a UTF-16 buffer. NtCreateFile requires the
 /// `\??\` (or `\Device\...`) prefix — raw drive letters without it are

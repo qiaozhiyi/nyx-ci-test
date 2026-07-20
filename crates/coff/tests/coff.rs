@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use nyx_coff::{apply, parse, reloc, SymbolResolver};
+use nyx_coff::{apply, parse, SymbolResolver};
 
 struct TableResolver(HashMap<String, u64>);
 impl SymbolResolver for TableResolver {
@@ -73,10 +73,20 @@ fn applies_rel32_call_relocation_correctly() {
         .iter()
         .find(|r| r.symbol_index == bp_idx)
         .expect("a relocation against BeaconPrintf in .text");
+    // Raw spec numbers, NOT nyx_coff::reloc::* constants: IMAGE_REL_AMD64_REL32
+    // is 0x0004 and REL32_1..5 are 0x0005..=0x0009 per winnt.h. Asserting
+    // against the crate's own constants would re-import a wrong constant table
+    // into the test and make it a tautology (this bug actually shipped).
     assert!(
-        matches!(call.typ, reloc::REL32 | reloc::REL32_1..=0x0008),
-        "expected a REL32-family call reloc, got 0x{:04x}",
+        matches!(call.typ, 0x0004..=0x0009),
+        "expected a REL32-family call reloc (REL32=0x0004..REL32_5=0x0009), got 0x{:04x}",
         call.typ
+    );
+    // An ordinary `call` with no bytes after its disp32 field must be plain
+    // REL32 — both clang and MinGW GCC emit 0x0004 for it.
+    assert_eq!(
+        call.typ, 0x0004,
+        "a plain call reloc must be IMAGE_REL_AMD64_REL32 (0x0004)"
     );
 
     // Pick a target within i32 displacement of the fixup so the REL32 disp
@@ -95,15 +105,11 @@ fn applies_rel32_call_relocation_correctly() {
     let patched = apply(text, &coff, base, &resolver).expect("apply must succeed");
 
     // AMD64 REL32[_N]: per PE/COFF spec, patched = original_field +
-    // (target - (field_loc + 4 + N)), where N is the `_N` suffix (0 for plain
-    // REL32, 1..5 for REL32_1..REL32_5). Determined from the actual reloc typ.
+    // (target - (field_loc + 4 + N)), where N is the `_N` suffix. N is derived
+    // from the RAW reloc type number (REL32=0x0004 → N=0, REL32_N=0x0004+N),
+    // independent of the crate's reloc::* constants — see the comment above.
     let n: i64 = match call.typ {
-        reloc::REL32 => 0,
-        reloc::REL32_1 => 1,
-        reloc::REL32_2 => 2,
-        reloc::REL32_3 => 3,
-        reloc::REL32_4 => 4,
-        reloc::REL32_5 => 5,
+        0x0004..=0x0009 => (call.typ - 0x0004) as i64,
         other => panic!("unexpected non-REL32-family reloc 0x{:04x}", other),
     };
     let off = call.offset as usize;
@@ -126,6 +132,54 @@ fn applies_rel32_call_relocation_correctly() {
     // Determinism: applying twice with identical inputs yields identical bytes.
     let patched2 = apply(text, &coff, base, &resolver).unwrap();
     assert_eq!(patched, patched2);
+}
+
+/// Regression for the off-by-one reloc-type table (REL32 was declared 0x0003,
+/// so plain REL32 = 0x0004 decoded as REL32_1 and every branch target shifted
+/// by -1 byte — the BOF's `call BeaconPrintf` jumped one byte before the shim).
+/// Decodes every patched .text disp32 exactly the way the CPU would
+/// (branch target = next_insn + disp32) and asserts control flow lands
+/// EXACTLY on the resolved symbol — not one byte off in either direction.
+#[test]
+fn relocated_branches_land_exactly_on_symbols() {
+    let coff = parse(FIXTURE).unwrap();
+    let text = coff
+        .sections
+        .iter()
+        .find(|s| s.name == ".text")
+        .expect(".text section");
+    assert!(
+        !text.relocations.is_empty(),
+        "fixture .text must carry relocations"
+    );
+    let base: u64 = 0x0001_0000;
+    let resolver = TableResolver(HashMap::new()); // default addrs, all in range
+    let patched = apply(text, &coff, base, &resolver).expect("apply must succeed");
+    for r in &text.relocations {
+        if r.typ == 0x0000 {
+            continue; // ABSOLUTE: apply() skips it
+        }
+        // All .text relocs in this fixture are plain REL32 (0x0004) — no bytes
+        // follow the disp32 field, so the CPU decodes target = loc + 4 + disp.
+        assert_eq!(r.typ, 0x0004, "fixture .text relocs are plain REL32");
+        let sym = coff
+            .symbols
+            .iter()
+            .find(|s| s.index == r.symbol_index)
+            .expect("reloc symbol");
+        let target = resolver.resolve(&sym.name).expect("resolver covers all");
+        let off = r.offset as usize;
+        let cur = i32::from_le_bytes(text.raw[off..off + 4].try_into().unwrap());
+        let field = i32::from_le_bytes(patched[off..off + 4].try_into().unwrap());
+        let loc = base + r.offset as u64;
+        let decoded = (loc as i64 + 4 + field as i64) as u64;
+        let expected = (target as i64 + cur as i64) as u64; // symbol + addend
+        assert_eq!(
+            decoded, expected,
+            "reloc at +{off:#x} against `{}` must land exactly on the symbol",
+            sym.name
+        );
+    }
 }
 
 #[test]

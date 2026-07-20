@@ -77,6 +77,37 @@ fn page(n: usize) -> usize {
     (n + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
+/// VirtualQuery-backed readability probe (selftest diagnostics only): true if
+/// [addr, addr+len) lies in a single MEM_COMMIT region whose protection allows
+/// reads. Used to guard raw-pointer derefs in the BOF boundary tracer so a
+/// wild relocation target reports status bits instead of AV'ing the probe.
+#[cfg(feature = "selftest")]
+unsafe fn vq_readable(addr: usize, len: usize) -> bool {
+    type VirtualQueryFn =
+        unsafe extern "system" fn(*const c_void, *mut u8, usize) -> usize;
+    let Some(a) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualQuery") else {
+        return false;
+    };
+    let vq: VirtualQueryFn = core::mem::transmute(a);
+    // MEMORY_BASIC_INFORMATION (x64) = 48 bytes.
+    let mut mbi = [0u8; 48];
+    let got = vq(addr as *const c_void, mbi.as_mut_ptr(), mbi.len());
+    if got == 0 {
+        return false;
+    }
+    let base = u64::from_le_bytes(mbi[0..8].try_into().unwrap()) as usize;
+    let region_size = u64::from_le_bytes(mbi[24..32].try_into().unwrap()) as usize;
+    let state = u32::from_le_bytes(mbi[32..36].try_into().unwrap());
+    let protect = u32::from_le_bytes(mbi[36..40].try_into().unwrap());
+    const MEM_COMMIT: u32 = 0x1000;
+    const PAGE_NOACCESS: u32 = 0x01;
+    const PAGE_GUARD: u32 = 0x100;
+    if state != MEM_COMMIT || protect == PAGE_NOACCESS || (protect & PAGE_GUARD) != 0 {
+        return false;
+    }
+    addr >= base && addr.saturating_add(len) <= base.saturating_add(region_size)
+}
+
 // ============================================================================
 // Beacon-API shim: output capture buffer + the functions a CS BOF calls.
 //
@@ -90,6 +121,32 @@ fn page(n: usize) -> usize {
 const OUT_CAP: usize = 16 * 1024;
 static mut OUT: [u8; OUT_CAP] = [0; OUT_CAP];
 static mut OUT_LEN: usize = 0;
+
+/// Diagnostic: incremented on every BeaconPrintf entry. Read by
+/// `nyx_selftest_bof_trace` to tell "BOF never reached the shim" apart from
+/// "shim ran but produced no output".
+static mut PRINTF_HITS: u64 = 0;
+
+/// Read the BeaconPrintf hit counter (selftest diagnostics only).
+#[cfg(feature = "selftest")]
+pub unsafe fn printf_hits() -> u64 {
+    PRINTF_HITS
+}
+
+/// Read the current capture length (selftest diagnostics only).
+#[cfg(feature = "selftest")]
+pub unsafe fn capture_len() -> usize {
+    OUT_LEN
+}
+
+/// Loader boundary trace (selftest diagnostics only): captured inside `run`
+/// right before `go()` is called. TRACE_NUMS = [n_sections, base0..3,
+/// entry_addr, beaconprintf_addr, lea_target]; TRACE_BYTES = [entry 16B,
+/// lea disp32 4B, call disp32 4B, bytes at lea_target 8B].
+#[cfg(feature = "selftest")]
+pub static mut TRACE_NUMS: [u64; 8] = [0; 8];
+#[cfg(feature = "selftest")]
+pub static mut TRACE_BYTES: [u8; 32] = [0; 32];
 
 /// Per-BOF args blob (CS beacon.h packing), set by the loader before `go()`.
 /// BeaconDataParse(NULL, 0) reads from this.
@@ -302,6 +359,10 @@ pub unsafe extern "C" fn BeaconPrintf(
     a5: u64,
     a6: u64,
 ) {
+    // Diagnostic counter (see nyx_selftest_bof_trace): proves the BOF's call
+    // actually reached this shim — distinguishes "relocation sent the call
+    // elsewhere" from "shim ran but capture is broken".
+    unsafe { PRINTF_HITS += 1 };
     if fmt.is_null() {
         return;
     }
@@ -959,6 +1020,37 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
     //    dropped when `run` returns (here or at any error above), so the section
     //    regions are zeroed + freed AFTER go() has returned — by which point no
     //    Beacon-API shim holds a live pointer into them.
+    #[cfg(feature = "selftest")]
+    unsafe {
+        let n = bases.len().min(4);
+        TRACE_NUMS[0] = bases.len() as u64;
+        for i in 0..n {
+            TRACE_NUMS[1 + i] = bases[i];
+        }
+        TRACE_NUMS[5] = entry_addr;
+        TRACE_NUMS[6] = beacon_api_addr("BeaconPrintf").unwrap_or(0);
+        let mut status: u64 = 0;
+        let e = entry_addr as *const u8;
+        // Fixture layout (bof_print.o): lea disp32 at +0x11, call disp32 at
+        // +0x1e. Every raw read is gated on a VirtualQuery readability probe
+        // so a broken relocation degrades to status bits instead of an AV.
+        if vq_readable(e as usize, 0x30) {
+            status |= 1;
+            ptr::copy_nonoverlapping(e, TRACE_BYTES.as_mut_ptr(), 16);
+            ptr::copy_nonoverlapping(e.add(0x11), TRACE_BYTES.as_mut_ptr().add(16), 4);
+            ptr::copy_nonoverlapping(e.add(0x1e), TRACE_BYTES.as_mut_ptr().add(20), 4);
+            let disp = (e.add(0x11) as *const i32).read_unaligned() as i64;
+            let tgt = (entry_addr + 0x15).wrapping_add(disp as u64);
+            TRACE_NUMS[7] = tgt;
+            if vq_readable(tgt as usize, 8) {
+                status |= 2;
+                ptr::copy_nonoverlapping(tgt as *const u8, TRACE_BYTES.as_mut_ptr().add(24), 8);
+            }
+        }
+        // status rides in the high dword of TRACE_NUMS[0]:
+        // bit32 = entry 16B readable, bit33 = lea target readable.
+        TRACE_NUMS[0] |= status << 32;
+    }
     let args_blob = pack_args(args);
     let resp = unsafe {
         reset_capture();

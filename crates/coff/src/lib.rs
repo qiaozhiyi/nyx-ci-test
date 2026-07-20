@@ -11,8 +11,8 @@
 //! (module stomping, `CreateThread`) is the Windows PIC implant's job.
 //!
 //! ## AMD64 relocation types handled
-//! `ADDR64` (0x01), `ADDR32NB` (0x02), `REL32` (0x03), `REL32_1..5` (0x04..0x08).
-//! `ABSOLUTE` (0x00) is skipped. Others return
+//! `ADDR64` (0x01), `ADDR32` (0x02), `ADDR32NB` (0x03), `REL32` (0x04),
+//! `REL32_1..5` (0x05..0x09). `ABSOLUTE` (0x00) is skipped. Others return
 //! [`ApplyError::UnsupportedReloc`] (extend as needed).
 //!
 //! `REL32_N` follows the PE/COFF spec: the loader applies
@@ -32,18 +32,25 @@ use alloc::vec::Vec;
 /// `IMAGE_FILE_MACHINE_AMD64`.
 pub const MACHINE_AMD64: u16 = 0x8664;
 
-/// AMD64 relocation type constants (subset).
+/// AMD64 relocation type constants (subset), per the PE/COFF spec (winnt.h
+/// `IMAGE_REL_AMD64_*`). NOTE: the numbering is NOT contiguous in the way one
+/// might expect — `ADDR32NB` is 0x0003 and plain `REL32` is 0x0004, so the
+/// `REL32_N` family starts at 0x0005. An earlier revision of this table had
+/// every value from `ADDR32NB` on shifted down by one, which made plain REL32
+/// (what both clang and MinGW GCC emit for ordinary call/lea) decode as
+/// REL32_1 and shifted every branch target by a byte.
 pub mod reloc {
     pub const ABSOLUTE: u16 = 0x0000;
     pub const ADDR64: u16 = 0x0001;
-    pub const ADDR32NB: u16 = 0x0002;
-    pub const REL32: u16 = 0x0003;
-    /// First of the REL32_1..REL32_5 family (0x04..=0x08).
-    pub const REL32_1: u16 = 0x0004;
-    pub const REL32_2: u16 = 0x0005;
-    pub const REL32_3: u16 = 0x0006;
-    pub const REL32_4: u16 = 0x0007;
-    pub const REL32_5: u16 = 0x0008;
+    pub const ADDR32: u16 = 0x0002;
+    pub const ADDR32NB: u16 = 0x0003;
+    pub const REL32: u16 = 0x0004;
+    /// First of the REL32_1..REL32_5 family (0x05..=0x09).
+    pub const REL32_1: u16 = 0x0005;
+    pub const REL32_2: u16 = 0x0006;
+    pub const REL32_3: u16 = 0x0007;
+    pub const REL32_4: u16 = 0x0008;
+    pub const REL32_5: u16 = 0x0009;
 }
 
 #[derive(Debug)]
@@ -401,11 +408,14 @@ pub fn apply<'a>(
                 let v = cur.wrapping_add(disp as i32);
                 buf[off..end].copy_from_slice(&v.to_le_bytes());
             }
-            reloc::ADDR32NB => {
+            reloc::ADDR32 | reloc::ADDR32NB => {
                 // ADDR32NB (RVA / base-not-applied): BOF loaders conventionally
                 // treat it as a flat u32 of the resolved virtual address — the
                 // "NB" (no base) is absorbed because sections load at their own
                 // base, not the PE image base. Matches CobaltStrike / inline-exec.
+                // ADDR32 strictly wants image_base + RVA; a BOF has no image
+                // base, so it gets the same flat-u32 treatment (what CS's own
+                // loader and TrustedSec's COFFLoader do for both types).
                 let end = off.checked_add(4).ok_or(ApplyError::BadOffset)?;
                 if end > buf.len() {
                     return Err(ApplyError::BadOffset);
