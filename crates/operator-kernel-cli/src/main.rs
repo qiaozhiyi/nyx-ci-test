@@ -425,7 +425,10 @@ fn main() {
                 child_pid,
                 image_name.as_bytes(),
                 timestamp,
-            );
+            ).map_err(|e| {
+                eprintln!("[!] forge_process_create failed: {e}");
+                std::process::exit(5);
+            }).unwrap();
             match std::fs::write(&out_path, &buf) {
                 Ok(()) => eprintln!(
                     "[+] forged Process Start event ({} bytes) written to {out_path}\n    \
