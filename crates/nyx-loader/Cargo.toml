@@ -1,6 +1,6 @@
 [package]
 name = "nyx-loader"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Nyx PIC reflective loader stub — decrypts and reflectively loads a PE DLL from shellcode"
 

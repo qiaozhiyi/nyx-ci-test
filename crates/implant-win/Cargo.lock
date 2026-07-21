@@ -180,11 +180,11 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "nyx-coff"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "nyx-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "rand",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "nyx-evasion"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "nyx-implant-evasionsdk"
@@ -200,7 +200,7 @@ version = "0.0.1"
 
 [[package]]
 name = "nyx-implant-win"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nyx-coff",
  "nyx-config",
@@ -212,14 +212,14 @@ dependencies = [
 
 [[package]]
 name = "nyx-profile"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "nyx-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "hkdf",

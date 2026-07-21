@@ -2770,7 +2770,7 @@ dependencies = [
 
 [[package]]
 name = "nyx-agent-dev"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -2786,14 +2786,14 @@ dependencies = [
 
 [[package]]
 name = "nyx-bof-runner"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nyx-coff",
 ]
 
 [[package]]
 name = "nyx-client-ui-web"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "nyx-rest",
@@ -2809,11 +2809,11 @@ dependencies = [
 
 [[package]]
 name = "nyx-coff"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "nyx-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "nyx-config-macros",
@@ -2822,7 +2822,7 @@ dependencies = [
 
 [[package]]
 name = "nyx-config-macros"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "proc-macro2",
@@ -2833,11 +2833,11 @@ dependencies = [
 
 [[package]]
 name = "nyx-evasion"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "nyx-loader"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "goblin",
@@ -2847,25 +2847,25 @@ dependencies = [
 
 [[package]]
 name = "nyx-mutate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rand 0.8.6",
 ]
 
 [[package]]
 name = "nyx-parse"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "nyx-profile"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "nyx-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "hkdf",
@@ -2879,7 +2879,7 @@ dependencies = [
 
 [[package]]
 name = "nyx-rest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -2888,11 +2888,11 @@ dependencies = [
 
 [[package]]
 name = "nyx-scripting"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "nyx-scripting-rhai"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nyx-scripting",
  "rhai",
@@ -2900,7 +2900,7 @@ dependencies = [
 
 [[package]]
 name = "nyx-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2940,7 +2940,7 @@ dependencies = [
 
 [[package]]
 name = "nyx-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "rusqlite",
@@ -2951,7 +2951,7 @@ dependencies = [
 
 [[package]]
 name = "nyx-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "hex",

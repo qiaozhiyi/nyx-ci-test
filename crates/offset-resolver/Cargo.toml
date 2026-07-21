@@ -6,7 +6,7 @@
 
 [package]
 name = "nyx-offset-resolver"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 publish = false
 description = "Downloads target ntoskrnl.pdb from MS symbol server, resolves kernel offsets, emits offsets.toml."

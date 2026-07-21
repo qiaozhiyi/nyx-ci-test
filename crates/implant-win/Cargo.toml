@@ -4,7 +4,7 @@
 #   cargo +nightly check -p nyx-implant-win --target x86_64-pc-windows-gnu
 [package]
 name = "nyx-implant-win"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 description = "Nyx Windows PIC implant (BRC4-grade stealth). Requires nightly + Windows toolchain to build."
