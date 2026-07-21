@@ -1,0 +1,145 @@
+name: Release
+
+# Tag-triggered release pipeline. Produces all four release artifacts (prod DLL,
+# selftest DLL, reflective PIC blob, server + operator CLI) on the same
+# self-hosted Win Server 2019 runner as windows-ci.yml, gates them through the
+# selftest + loader-probe gauntlet, and publishes a DRAFT GitHub Release.
+#
+# Why draft-only: spec §3 locks release visibility to Draft. Assets are not
+# publicly listed until an operator manually publishes the draft. This matches
+# the red-team engagement model: each release is reviewed + signed per-engagement.
+#
+# Why a single job on the existing self-hosted runner: the VPS (Cloud-Init-Win,
+# 8 GB RAM, build 17763) is already the CI host for windows-ci.yml. One cargo
+# invocation saturates the box; parallelism would just thrash. Sequential steps
+# mirror the spec §6.2 matrix order.
+#
+# Trigger: push of a `v*` tag ONLY. No PR, no push-to-main — releases are
+# explicit (operator pushes a tag, never accidentally off main).
+#
+# Concurrency: never cancel a release mid-write (cancel-in-progress: false).
+# Two operators pushing tags seconds apart race; the loser queues behind the
+# winner rather than tearing down a half-published draft.
+#
+# Authorized red-team security research.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # softprops/action-gh-release needs this to create the release
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    # All steps below invoke scripts under scripts/release/. Pin the shell to
+    # powershell (PS 5.1, built into Server 2019) explicitly — the runner does
+    # NOT have pwsh 7 installed (see windows-ci.yml header comment). Setting it
+    # at the defaults level matches the windows-ci.yml convention and means each
+    # step's `run:` is interpreted by PS 5.1 without per-step repetition.
+    shell: powershell
+
+jobs:
+  release:
+    name: "Release (win-17763)"
+    runs-on: [self-hosted, win-17763]
+    timeout-minutes: 40
+    steps:
+      # fetch-depth: 0 — full history. Not strictly needed for the build itself
+      # (cargo doesn't care) but CHANGELOG.md extraction + any `git log` based
+      # provenance in release notes wants the full graph. Cheap on a self-hosted
+      # runner (no fresh clone-per-run cost like hosted runners).
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Step order is the spec §6.2 matrix order: env check → build matrix →
+      # validation gates → stage → notes → release. Any step failure aborts;
+      # no draft release is created (spec §6.3 failure semantics).
+      #
+      # Each step delegates to a script under scripts/release/. Scripts assume
+      # CWD = repo root (GitHub Actions sets this to the checkout root).
+      # First gate: if the runner isn't in the locked-down Defender posture
+      # (MAPSReporting=0 + exclusions in place), abort BEFORE building anything.
+      # No `if:` condition — implicit `if: success()` means a failure here
+      # skips every subsequent step (including the draft release).
+      - name: Verify environment
+        run: |
+          ./scripts/release/verify_env.ps1
+
+      - name: Build prod DLL
+        run: |
+          ./scripts/release/build_prod_dll.ps1
+
+      - name: Build selftest DLL
+        run: |
+          ./scripts/release/build_selftest_dll.ps1
+
+      - name: Build operator-kernel-cli
+        run: |
+          ./scripts/release/build_cli.ps1
+
+      - name: Build team server
+        run: |
+          ./scripts/release/build_server.ps1
+
+      - name: Build offset-resolver
+        run: |
+          ./scripts/release/build_offset_resolver.ps1
+
+      - name: Wrap reflective blob
+        run: |
+          ./scripts/release/wrap_blob.ps1
+
+      # Validation gate #1: 8 core nyx_selftest_* exports must run clean against
+      # the selftest DLL. Sentinel/zero/timeout = release-blocking.
+      - name: Selftest gate
+        run: |
+          ./scripts/release/selftest_gate.ps1
+
+      # Validation gate #2: reflective blob must inject+execute in a dedicated
+      # probe process. Depends on T1's scripts/loader_probe.ps1.
+      - name: Loader probe gate
+        run: |
+          ./scripts/release/loader_probe_gate.ps1
+
+      - name: Stage assets + SHA256SUMS
+        run: |
+          ./scripts/release/stage_assets.ps1
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          ./scripts/release/extract_notes.ps1
+
+      # Upload staging/ as a CI artifact so a failed release is debuggable even
+      # before the draft exists (the draft step below only runs if everything
+      # above succeeded). Includes selftest_results.csv + SHA256SUMS.
+      - name: Upload staging artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-staging-${{ github.run_id }}
+          path: staging/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # Final step: create the DRAFT release. body_path = release_notes.md
+      # produced by extract_notes.ps1. files glob picks up everything in staging/.
+      # draft: true means the release is created in draft state — assets are
+      # uploaded but the release is NOT public until an operator publishes it.
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          body_path: release_notes.md
+          files: |
+            staging/*.dll
+            staging/*.bin
+            staging/*.tar.gz
+            staging/SHA256SUMS

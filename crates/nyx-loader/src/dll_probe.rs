@@ -1,9 +1,11 @@
 //! Host-side DLL probe — loads a built implant DLL via `LoadLibraryW` and
 //! enumerates its `nyx_selftest_*` exports.
 //!
-//! This replaces the unrealizable on-target reflective loader (the former
-//! "Layer 2" PIC shellcode spec) with a verifiable host-side check that
-//! actually runs on the engagement box:
+//! The on-target reflective loader is now realized — see
+//! [`crate::on_target`] for the Layer-2 PIC shellcode (decrypt + reflective
+//! PE map) and [`crate::generate_loader_stub`] for the blob emitter. This
+//! `dll_probe` remains as a host-side sanity check that actually runs on the
+//! engagement box:
 //!
 //!   * "does the implant DLL load cleanly under Defender?" — `LoadLibraryW`
 //!     triggers the real Windows loader, the import-table resolver, and any

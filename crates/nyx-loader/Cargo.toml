@@ -19,6 +19,13 @@ rand = { workspace = true, features = ["std", "std_rng"] }
 # PIC shellcode, which carries its own handwritten loader.
 goblin = { workspace = true }
 
+[dev-dependencies]
+# Used by tests/roundtrip_decrypt.rs to cross-check that a host-side decrypt
+# of a wrap_payload() blob matches the chacha20poly1305 crate's decrypt under
+# the same (key, nonce). Re-declared here because integration tests are
+# external crates and cannot see [dependencies] directly.
+chacha20poly1305 = { workspace = true, features = ["alloc"] }
+
 [features]
 default = ["std"]
 std = ["nyx-protocol/std", "chacha20poly1305/std"]
