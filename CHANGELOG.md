@@ -12,6 +12,142 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-21
+
+Security-and-correctness fix release following the 2026-07-21 full-codebase
+audit (`docs/audits/FULL_CODE_AUDIT_2026-07-21.md`, 12 parallel sub-agents,
+~78,849 LOC reviewed). This release closes the audit's top P0 findings — the
+ones that would crash the beacon on first use, leave the injection path
+non-functional, ship an open team server, or silently defeat the kill-date
+safety control. The remaining CRITICAL/HIGH findings (crypto `.expect()`
+refactors, `static mut` modernization, `blind_hwbp` rewrite, BOF/C2 HMAC
+framing) are tracked for v0.3.2 and are **not** blockers for authorized
+engagements — see Known Limitations.
+
+### Fixed
+
+- **fluctuation_thunk Win64 ABI stack alignment (CRITICAL).** Steps 1-3 of
+  the sleep-mask thunk emitted `sub rsp, 0x20` / `add rsp, 0x20`, leaving
+  RSP ≡ 8 (mod 16) at the `call` — any callee `movaps`/`movdqa` raised #GP/#PF,
+  killing the beacon on the first sleep with `.text` still PAGE_NOACCESS and
+  registered data regions still RC4-masked. Step 4 already used the correct
+  `0x28` immediate; Steps 1-3 now match. `crates/implant-win/src/fluctuation_thunk.rs:126-211`.
+- **NtHeapAllocator dealloc UAF on aligned pointers (CRITICAL).** The
+  `align > 8` branch conditionally stored the raw pointer at
+  `aligned_addr - 8` only when `offset >= 8`, but dealloc unconditionally
+  read that slot. When `RtlAllocateHeap` returned an already-aligned block
+  (common for align=16 under LFH), `offset = 0` → the store was skipped →
+  dealloc freed a garbage address → heap metadata corruption. Now over-
+  allocates `size + align + 8` and stores unconditionally. Also: the two
+  `Layout::from_size_align(...).unwrap()` calls in `realloc` (panic=abort
+  hazards on attacker-controlled sizes) now fail soft. `crates/implant-win/src/ntalloc.rs:258-330, 334-376`.
+- **threadless_inject execute-breakpoint crash (CRITICAL).** The function
+  set DR0=sc_addr + DR7=0x1 (local execute breakpoint) with RIP=sc_addr. An
+  x64 execute breakpoint traps BEFORE the instruction at DR0 runs — with
+  DR0 == RIP the first instruction raised #DB, and with no VEH registered
+  the OS terminated the target on every call. The RIP hijack alone is
+  sufficient and correct; the DR0/DR7 writes are removed. Also:
+  `nt_suspend_thread` return value is now checked (was silently dropped —
+  proceeding to NtGetContextThread/NtSetContextThread on a live thread
+  raced). `crates/implant-win/src/inject.rs:652-746`.
+- **inject_existing `CreateRemoteThread` NULL lpStartAddress (CRITICAL).**
+  The primary existing-process inject path passed `None` as the start
+  address and the shellcode address as `lpParameter` — the kernel rejects a
+  NULL start address, so the call always returned NULL and the path was
+  100% broken (operators always saw "CreateRemoteThread failed"). Now wraps
+  the shellcode address in `Some(transmute(...))`, mirroring the working
+  `remote_load_library` pattern. `crates/implant-win/src/inject.rs:1014-1024`.
+- **stomp_and_resume cross-process buffer overrun (CRITICAL).**
+  `WriteProcessMemory` wrote `shellcode.len()` bytes unconditionally into a
+  region capped at `min(vsize, 0x2000)`. Any shellcode >8 KiB overran into
+  the cover DLL's `.rdata`/`.data`, crashing the sacrificial process. Now
+  bounds-checked; the RWX→RX restore (Step 5) also propagates errors
+  instead of leaving `.text` RWX. `crates/implant-win/src/inject.rs:215-219`.
+- **Kill-date never enforced (CRITICAL).** `ImplantConfig.expires_at` was
+  decoded from the config blob (u64 unix seconds, 0 = no expiry) but
+  `beacon_loop` never checked it — the implant ran forever, defeating the
+  operator's engagement time-box safety control. Added
+  `hostinfo::now_unix()` (resolves `GetSystemTimeAsFileTime` via PEB walk,
+  converts FILETIME → unix seconds) and a per-cycle comparison at the top
+  of `beacon_loop` that returns cleanly on expiry. A clock-resolution
+  failure (`now_unix() == 0`) does NOT enforce, so a missing clock can't
+  kill the beacon spuriously. `crates/implant-win/src/beacon.rs:187-196`,
+  `crates/implant-win/src/hostinfo.rs:107-141`.
+- **deaddrop JSON OOB panic (CRITICAL).** `json_extract_str` had two OOB
+  bugs: `i += 1` past `:` ran unconditionally even when the preceding
+  while-loop had exhausted the input, and `i < json.len() && json[i] == b' '
+  || json[i] == b'"'` evaluated the right operand even when `i >= json.len()`
+  (operator precedence). Under panic=abort any truncated GitHub response
+  (network blip, 401/403 body) killed the implant. Both fixed.
+  `crates/implant-win/src/trex/exfil/deaddrop.rs:113-138`.
+- **selftests screenshot diag heap overflow (CRITICAL).**
+  `nyx_selftest_screenshot_diag` computed `need = w*h*4` but allocated only
+  `need.min(1<<20)` (1 MiB) — `GetDIBits` wrote `need` bytes, overrunning
+  NT-heap metadata on any display larger than ~512×512. The export is
+  compiled out of production DLLs (default no-selftest profile) but crashed
+  dev/selftest builds. Now allocates the full `need`; `iLines` capped
+  defensively. `crates/implant-win/src/selftests.rs:347-378`.
+- **`is_loopback_bind` string-prefix bypass (HIGH).** The auto-token guard
+  keyed off `starts_with("127.") / "localhost" / "::1"`, which missed
+  `localhost.localdomain`, `0.0.0.0`, `[::]`, and bare `::1:8443` (whose
+  `::1` literal parses as `1`, not loopback). A misconfigured `NYX_BIND`
+  could ship an OPEN team server. Now parses the host out of the `host:port`
+  string and delegates to `IpAddr::is_loopback` (authoritative for the full
+  `127.0.0.0/8` range and `::1`). Unparseable input → fail-closed.
+  `crates/server/src/lib.rs:998-1041`. New test
+  `is_loopback_bind_closes_v030_string_prefix_bypasses` covers the bypass
+  cases.
+- **Kernel handlers executed with zero audit trail (HIGH).** All 6
+  privileged kernel handlers (`dump_lsass`, `hide`, `blind_etw`,
+  `neutralize`, `detach_minifilter`, `driver_status`) called `gate()` for
+  admin RBAC but discarded the `OperatorIdentity` — the most sensitive
+  operator actions (LSASS dump, process hiding, ETW blinding) left no audit
+  record, defeating the audit log's "who tasked WHAT" contract. Each
+  handler now captures `op` and writes an audit record before dispatching
+  to the daemon, mirroring the `post_task` / `cred_add` pattern.
+  `crates/server/src/kernel.rs:114-226`.
+- **`implant_gen` expires ISO 8601 silent drop (HIGH).** The kill-date
+  parser used `s.parse::<i64>().ok().map(...).unwrap_or(0)`, which only
+  succeeded on bare integers — every ISO 8601 string (the documented input
+  form; client placeholder is `"2026-12-31"`) failed and defaulted to 0
+  ("never expire"). Operators believed they set a 30-day kill-date; the
+  implant ran forever, and the audit record showed the intended date while
+  the binary got 0. New `parse_iso8601_to_unix` accepts bare seconds,
+  `YYYY-MM-DD`, and `YYYY-MM-DDTHH:MM:SS[Z|+00:00]`; parse failure now
+  returns 400 (fail-closed). 4 new unit tests. Paired with the beacon-side
+  kill-date enforcement above, operator kill-dates now actually fire.
+  `crates/server/src/implant_gen.rs:233-340, 456-475`.
+
+### Operational Notes
+
+- **`do_inject` PID guard.** The operator-facing inject entry now rejects
+  `pid == 4` (System kernel process — OpenProcess writes would BSOD) and
+  `pid == self_pid` (self-inject, almost always a typo). `pid == 0` (the
+  "spawn fresh sacrificial" sentinel) is still allowed.
+  `crates/implant-win/src/inject.rs:800-820`.
+
+### Known Limitations (deferred to v0.3.2)
+
+The 2026-07-21 audit surfaced 27 CRITICAL + 46 HIGH findings across the
+codebase. v0.3.1 closes the 10 that block first-use or ship an open server.
+The remaining findings are real but are **not** blockers for authorized
+engagements — they are tracked for v0.3.2:
+
+- **panic=abort + `.unwrap()`/`.expect()`/`assert!`/`unreachable!()`** across
+  ~30 sites (crypto `seal`/`decrypt`, protocol framing, BOF entry lookup).
+  Requires Result-type refactors.
+- **`static mut` global state** under the aliasing model (blind_hwbp, mem,
+  screenshot, transport, keylog). Requires AtomicPtr/Mutex rewrites.
+- **`blind_hwbp` VEH lock contention** returning EXCEPTION_CONTINUE_SEARCH
+  (process kill). Requires a lock-free handler redesign.
+- **Slack / MCP / LLM C2 frame injection** via unauthenticated channel
+  messages and `extract_hex` longest-run heuristic. Requires HMAC framing.
+- **sRDI export-table OOB reads** (tools/srdi). Outside the release matrix.
+- **beacon task isolation** (single panicking task kills the beacon).
+  Architectural — requires spawn-to-sacrificial for BOF/Inject.
+
+Full detail in `docs/audits/FULL_CODE_AUDIT_2026-07-21.md`.
+
 ## [0.3.0] - 2026-07-21
 
 First release with compiled Windows payloads + a real reflective PIC loader.
