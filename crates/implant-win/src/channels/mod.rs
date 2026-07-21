@@ -276,10 +276,6 @@ pub fn next_fallback(current: Channel) -> Option<Channel> {
 // Host rotation (spec-7) — CS 4.10-style redirector rotation with fail-hold
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Maximum redirector hosts parsed from the comma-separated config string.
-/// 8 is generous (CS profiles rarely declare more than 3-5 redirectors).
-const MAX_ROTATION_HOSTS: usize = 8;
-
 /// Current index into the rotation host list. Advanced on each beacon cycle
 /// (round-robin) or on failure (skip to next). CS 4.10 "hold" semantics:
 /// a failed host is skipped, not permanently removed — it's retried after

