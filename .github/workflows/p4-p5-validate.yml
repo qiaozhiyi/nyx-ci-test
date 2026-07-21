@@ -61,7 +61,11 @@ jobs:
       - name: Build implant DLL
         shell: bash
         run: |
-          cargo +nightly build --release --target x86_64-pc-windows-msvc --manifest-path crates/implant-win/Cargo.toml
+          # --features selftest: the nyx_selftest_calib42 / nyx_selftest_inject_pool
+          # exports invoked below are #[cfg(feature = "selftest")]; without the
+          # flag rundll32 emits "missing entry" and exits 0, which the
+          # (continue-on-error) steps below would swallow as a false pass.
+          cargo +nightly build --release --features selftest --target x86_64-pc-windows-msvc --manifest-path crates/implant-win/Cargo.toml
 
       # -- 4. Smoke test: can the DLL even be loaded? ---------------------------
       - name: SMOKE -- calib42 (exit 42, no syscalls)
@@ -76,29 +80,16 @@ jobs:
           if ($code -lt 0) { throw "DLL load/run CRASHED (exit 0x$($code.ToString('X8')))" }
           Write-Host "PASS: DLL loads, calib42 ran (exit $code = expected 42)"
 
-      # -- 5. P4 Foliage data-only baseline ------------------------------------
-      - name: P4 baseline -- foliage data-only
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
-          $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_foliage -PassThru -Wait -NoNewWindow
-          $code = $p.ExitCode
-          Write-Host "foliage exit: 0x$($code.ToString('X8')) (bitmask=$code)"
-          if ($code -lt 0) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
-          Write-Host "PASS: foliage exit $code (bit0=$($code -band 1))"
-
-      # -- 6. P4 Foliage APC thunk ---------------------------------------------
-      - name: P4 thunk -- foliage_apc
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $dll = "$env:GITHUB_WORKSPACE\crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
-          $p = Start-Process rundll32 -ArgumentList $dll,nyx_selftest_foliage_apc -PassThru -Wait -NoNewWindow
-          $code = $p.ExitCode
-          Write-Host "foliage_apc exit: 0x$($code.ToString('X8')) (bitmask=$code)"
-          if ($code -lt 0) { throw "CRASHED (exit 0x$($code.ToString('X8')))" }
-          Write-Host "PASS: foliage_apc exit $code"
+      # -- 5/6. P4 Foliage steps REMOVED ---------------------------------------
+      # nyx_selftest_foliage and nyx_selftest_foliage_apc were deleted from the
+      # implant (selftests.rs:2473-2474: "Foliage APC chain is dead code,
+      # superseded by Fluctuation sleep mask"). The previous steps invoked them
+      # via rundll32, which emitted "missing entry" and exited 0; the steps'
+      # `continue-on-error: true` swallowed that as a false pass. Steps deleted
+      # entirely rather than rewired — there is no live foliage export to call.
+      # The NYX_FOLIAGE_APC_ON env above is now inert; left in place because it
+      # is a build-time cfg in the research tree and removing it is out of scope
+      # for this CI-only fix.
 
       # -- 7. P5 Pool Party ----------------------------------------------------
       - name: P5 -- inject_pool

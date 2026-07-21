@@ -14,7 +14,11 @@ name: G6 Verify (Win11 24H2 kernel)
 on:
   workflow_dispatch: {}
   push:
-    branches: [p2-evasion-synced]
+    # NOTE: was `branches: [p2-evasion-synced]` — that branch does not exist
+    # (git branch -a shows only main + palette-ux-*), so the push trigger
+    # never fired and g6-verify was effectively manual-only. Repoint at main
+    # so implant/SDK changes on main exercise the 26100-kernel path here too.
+    branches: [main]
     paths:
       - '.github/workflows/g6-verify.yml'
       - 'crates/implant-win/**'
@@ -71,7 +75,11 @@ jobs:
       - name: "G6-2: Build implant DLL (nightly + MSVC)"
         shell: pwsh
         run: |
-          cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1 | Select-Object -Last 15
+          # --features selftest: the nyx_selftest_* exports invoked in G6-4 are
+          # #[cfg(feature = "selftest")]; without the flag the DLL has no such
+          # entry points and rundll32 exits 0 ("missing entry"), which G6-4
+          # would previously treat as pass under continue-on-error.
+          cargo +nightly build --release --features selftest --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1 | Select-Object -Last 15
           $dll = "crates/implant-win/target/x86_64-pc-windows-msvc/release/nyx_implant_win.dll"
           if (Test-Path $dll) {
             $sz = (Get-Item $dll).Length
@@ -98,19 +106,26 @@ jobs:
           }
 
       # ---- 3. Selftest regression suite on the 26100 kernel ----
+      # GATES THE PR (this workflow now triggers on push to main). The prior
+      # `continue-on-error: true` meant a selftest that returned the
+      # 0xFFFFFFFF harness-bootstrap sentinel, or that timed out, was silently
+      # swallowed. The sentinel/timeout check below turns those into hard fails.
       - name: "G6-4: Selftest regression (26100 kernel)"
         shell: pwsh
-        continue-on-error: true
         run: |
           $dllDir = "crates/implant-win/target/x86_64-pc-windows-msvc/release"
           $dll = "$dllDir/nyx_implant_win.dll"
           # The aggregator + the G1 (postex) + evasion entry points.
+          # NOTE: nyx_selftest_foliage_apc was removed (selftests.rs:2473-2474);
+          # do NOT re-add it — rundll32 would exit 0 ("missing entry") and the
+          # sentinel check below would misread that as a passing run.
           $tests = @(
             "nyx_selftest","nyx_selftest_postex","nyx_selftest_evasion",
-            "nyx_selftest_foliage_apc","nyx_selftest_inject_pool"
+            "nyx_selftest_inject_pool"
           )
           Write-Host "Test                      Exit   Ran   Bits"
           Write-Host "------------------------- ------ ----- ----"
+          $failed = @()
           foreach ($t in $tests) {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = "rundll32.exe"
@@ -123,15 +138,26 @@ jobs:
               $code = $p.ExitCode
               $ran = ($code -ne 0)
               $bits = if ($code -ge 0) { [Convert]::ToString($code, 2) } else { "0x{0:X}" -f $code }
+              # 0xFFFFFFFF / 0xFFFFFFFE = documented bootstrap-failure
+              # sentinels (selftests.rs:5,42) — the test harness itself could
+              # not start, distinct from "ran and reported a bitmask of 0".
+              if ($code -eq -1 -or $code -eq 0xFFFFFFFE -or $code -eq -2) {
+                $failed += "{0}=0x{1:X8} (bootstrap sentinel)" -f $t, $code
+              }
             } else {
               $p.Kill()
               $code = -1
               $ran = $false
               $bits = "TIMEOUT"
+              $failed += "$t=TIMEOUT"
             }
             Write-Host ("{0,-25} {1,6} {2,5} {3}" -f $t, $code, $ran, $bits)
           }
-          Write-Host "::notice::selftest regression ran on build 26100 (see table above; TIMEOUT/0 may reflect the runner's stricter posture — no full admin / possible HVCI)"
+          if ($failed.Count -gt 0) {
+            Write-Host "::error::selftest failures:`n  - " + ($failed -join "`n  - ")
+            exit 1
+          }
+          Write-Host "::notice::selftest regression ran on build 26100 (see table above); all $($tests.Count) tests avoided the bootstrap sentinels and TIMEOUT."
 
       # ---- 4. Cross-version offset verification: live ntkrnl GUID → resolver ----
       - name: "G6-5: Offset cross-version verify (symbol-server download)"

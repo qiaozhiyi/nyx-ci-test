@@ -58,8 +58,8 @@ $EXPECTED_CODES = @{
     "nyx_selftest_bof_diag"       = 1
     "nyx_selftest_bof_marker"     = 1
     "nyx_selftest_evasion"        = $null   # aggregator
-    "nyx_selftest_foliage"        = $null   # APC injection — needs target context
-    "nyx_selftest_foliage_apc"    = $null
+    # nyx_selftest_foliage / nyx_selftest_foliage_apc were removed (selftests.rs
+    # commit) — the Foliage APC chain is dead code, superseded by Fluctuation.
     "nyx_selftest_fs_edge"        = 15
     "nyx_selftest_fs_probe"       = $null   # probe
     "nyx_selftest_gap_scan"       = 15
