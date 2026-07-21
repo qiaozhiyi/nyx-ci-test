@@ -53,7 +53,8 @@ fn frame_seal_open_roundtrip() {
         .expect("test SessionInfo fields are tiny literals << MAX_BLOB_LEN");
     let plaintext = w.into_bytes();
 
-    let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, &plaintext);
+    let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, &plaintext)
+        .expect("test encode of tiny SessionInfo plaintext is infallible");
     let raw = frame::parse_frame(&frame).unwrap();
     assert_eq!(raw.counter, 0);
     assert_eq!(raw.pubkey, implant.public_bytes());
@@ -72,7 +73,8 @@ fn wrong_key_does_not_decrypt() {
     let implant = crypto::ImplantKeypair::generate().unwrap();
     let key = implant.session_key(&server.public_bytes());
 
-    let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, b"secret");
+    let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, b"secret")
+        .expect("test encode of tiny plaintext is infallible");
     let raw = frame::parse_frame(&frame).unwrap();
 
     let other = crypto::ImplantKeypair::generate().unwrap();
@@ -169,7 +171,8 @@ fn frame_with_trailing_bytes_is_rejected() {
     let server = crypto::ServerKeypair::generate().unwrap();
     let implant = crypto::ImplantKeypair::generate().unwrap();
     let key = implant.session_key(&server.public_bytes());
-    let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, b"hi");
+    let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, b"hi")
+        .expect("test encode of tiny plaintext is infallible");
     let mut with_trailer = frame.clone();
     with_trailer.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // unauthenticated tail
     assert!(
@@ -254,8 +257,10 @@ fn nonce_directions_never_collide() {
     let pubkey = implant.public_bytes();
     let plain = b"identical plaintext, identical counter, different direction";
 
-    let c2s = crypto::seal_dir(&key, crypto::Direction::ClientToServer, 0, &pubkey, plain);
-    let s2c = crypto::seal_dir(&key, crypto::Direction::ServerToClient, 0, &pubkey, plain);
+    let c2s = crypto::seal_dir(&key, crypto::Direction::ClientToServer, 0, &pubkey, plain)
+        .expect("test seal of tiny plaintext is infallible");
+    let s2c = crypto::seal_dir(&key, crypto::Direction::ServerToClient, 0, &pubkey, plain)
+        .expect("test seal of tiny plaintext is infallible");
 
     assert_ne!(
         c2s, s2c,

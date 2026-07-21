@@ -409,25 +409,29 @@ fn nonce_for(dir: Direction, counter: u64) -> [u8; NONCE_LEN] {
 
 /// AEAD-encrypt `plaintext` under `key` with a direction- and counter-derived
 /// nonce. `aad` is authenticated but not encrypted (we bind the session pubkey).
+///
+/// Returns `Err` only on allocator failure (the underlying AEAD encrypt is
+/// otherwise infallible). Pre-fix this used `.expect()`; under `panic="abort"`
+/// (used by the implant) an OOM would have torn the process down without any
+/// diagnostic, so we now surface it as a `Result` and let the caller decide
+/// whether to retry, drop the frame, or terminate.
 pub fn seal_dir(
     key: &SessionKey,
     dir: Direction,
     counter: u64,
     aad: &[u8],
     plaintext: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, chacha20poly1305::Error> {
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key.as_bytes()));
     let nonce_bytes = nonce_for(dir, counter);
     let nonce = Nonce::from_slice(&nonce_bytes);
-    cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
-        .expect("AEAD encrypt only fails on alloc failure; under panic=abort the server terminates anyway — caller invariant ensures plaintext < 2^32")
+    cipher.encrypt(
+        nonce,
+        Payload {
+            msg: plaintext,
+            aad,
+        },
+    )
 }
 
 /// AEAD-decrypt `ciphertext`. Returns `Err` on tag mismatch (tampering / wrong
@@ -452,8 +456,14 @@ pub fn open_dir(
 }
 
 /// Back-compat shim: seals with [`Direction::ClientToServer`]. Prefer
-/// [`seal_dir`] for new call sites so the direction is explicit.
-pub fn seal(key: &SessionKey, counter: u64, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
+/// [`seal_dir`] for new call sites so the direction is explicit. See
+/// [`seal_dir`] for the error semantics.
+pub fn seal(
+    key: &SessionKey,
+    counter: u64,
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, chacha20poly1305::Error> {
     seal_dir(key, Direction::ClientToServer, counter, aad, plaintext)
 }
 
@@ -502,13 +512,52 @@ pub fn ecdh(our_secret: &[u8; 32], their_public: &[u8; 32]) -> Option<[u8; 32]> 
     Some(*shared_bytes)
 }
 
+/// Error returned by [`hkdf_sha256`] when the requested output length
+/// violates the HKDF-Expand bound (RFC 5869 §2.3: `L ≤ 255 × HashLen`). SHA-256
+/// has `HashLen = 32`, so any `okm.len() > 255 × 32 = 8160` is rejected.
+///
+/// Kept as a small hand-rolled enum (rather than re-exporting `hkdf::Error`)
+/// so the `no_std` implant build does not pull the full `hkdf` error surface
+/// through its public API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HkdfError {
+    /// `okm.len()` exceeds `255 × 32 = 8160` bytes (the RFC 5869 expand bound).
+    OutputTooLong,
+}
+
+impl core::fmt::Display for HkdfError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            HkdfError::OutputTooLong => f.write_str(
+                "hkdf_sha256: requested OKM length exceeds 255 * HashLen (8160 bytes for SHA-256)",
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for HkdfError {}
+
 /// HKDF-SHA256: extract-then-expand. `salt` and `info` are passed as-is (RFC
 /// 5869). `okm` receives the output key material; its length determines the
-/// HKDF output length (must be ≤ 255 × 32 = 8160 bytes).
-pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], okm: &mut [u8]) {
+/// HKDF output length. Returns `Err(HkdfError::OutputTooLong)` if
+/// `okm.len() > 255 × 32` (the RFC 5869 §2.3 expand bound).
+///
+/// **Why this is a `Result`**: this function is `pub` and callable from the
+/// implant, which builds with `panic = "abort"`. The pre-fix implementation
+/// used `.expect("okm.len() <= 255*HashLen is a caller invariant")`, so any
+/// caller that passed an oversized buffer killed the process with no recovery
+/// path. Surfacing the error lets callers degrade gracefully (the server
+/// returns 500; the implant writes a diagnostic exit code).
+pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], okm: &mut [u8]) -> Result<(), HkdfError> {
     let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
-    hk.expand(info, okm)
-        .expect("okm.len() <= 255*HashLen is a caller invariant");
+    hk.expand(info, okm).map_err(|_| {
+        // `hkdf::Hkdf::expand` returns `Err(InvalidLength)` *only* when
+        // `okm.len() > 255 * HashLen`; the `info` length is unbounded. So any
+        // error here is the output-length invariant — map it to our single
+        // variant.
+        HkdfError::OutputTooLong
+    })
 }
 
 /// ChaCha20-Poly1305 AEAD decrypt. `key` is the raw 32-byte key, `nonce` is

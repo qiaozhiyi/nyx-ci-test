@@ -12,6 +12,84 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-22
+
+Second round of audit fixes — closes the remaining 13 CRITICAL findings
+from the 2026-07-21 full-codebase audit. With v0.3.1 + v0.3.2 combined,
+**all 27 CRITICAL findings are closed**. The only remaining audit item is
+CRITICAL-19 (beacon task isolation), which is an architectural change
+deferred to v0.4.0.
+
+### Fixed (13 CRITICAL)
+
+- **crypto `.expect()` → `Result` (CRITICAL-1/2 + HIGH).** `hkdf_sha256`,
+  `seal_dir`, `seal`, `encode_frame`/`encode_frame_dir`, and
+  `config::decrypt` now return `Result` instead of panicking under
+  `panic="abort"`. All ~27 call sites updated: server propagates via
+  `anyhow`; implant exits with diagnostic codes (`0xC3`, `0xA7`,
+  `0xB8-BA`, `0xC000_0002`); `embed!` proc-macro keeps a build-time
+  `.expect()` (correct signal for a broken-build fixture). New
+  `HkdfError` enum (no new deps). 16 files, +306/-105.
+- **blind_hwbp `static mut` UB + VEH lock-contention kill (CRITICAL-6/7).**
+  Eliminated all `static mut` declarations; replaced with `AtomicU8` per-slot
+  state machine (`VACANT`/`OCCUPIED`/`CLAIMED`), `AtomicPtr` for handles,
+  `SyncUnsafeCell` for the fixed backing store. VEH handler is now fully
+  lock-free — returns `EXCEPTION_CONTINUE_SEARCH` only for genuine "not our
+  #DB" (null pointer, no DR6 bits, address mismatch), never for lock
+  contention. Arming/disarming uses CAS + Release publication so the VEH
+  never observes an armed entry without a matching DR bit.
+- **stack.rs `assume_init`/`forget(f)` UB (CRITICAL-8).** Added
+  `AtomicBool SWAP_DONE` set by `run_f_on_spoof` after `ptr::read(f)`.
+  Only `forget(f)` + `assume_init()` if `SWAP_DONE`; otherwise `drop(f)` +
+  return `T::default()`. `FAKE_STACK` bumped from 2 KiB to 8 KiB. Added
+  `T: Default` bound (all existing callers satisfy it).
+- **lacuna_stomp uninitialized slice UB (CRITICAL-9).** Replaced
+  `Vec::with_capacity + forget + from_raw_parts_mut` (uninit slots) with
+  `extend_from_slice + as_mut_ptr + forget` (initialized before detach).
+  OOM check on `capacity >= len`. Capped `MAX_GHOST_DEPTH = 32`;
+  `frames_len * 8` → `checked_mul`.
+- **keylog `BUF`/`BUF_LEN` data race (CRITICAL-12).** Moved
+  `HOOK_THREAD_LIVE` publication into the hook thread (after
+  `SetWindowsHookExW`, before the message pump). New CAS-based
+  `claim_buf_index()` gives single-writer-per-byte semantics. Polling path
+  re-checks `hook_is_active()` per-byte. Drain uses `BUF_LEN.swap(0,
+  AcqRel)`.
+- **screenshot winsta handle leak/UAF (CRITICAL-13).** Eliminated
+  `static mut CAPTURE_WINSTA_ORIGINAL/OPENED`; replaced with a
+  `WinstaGuard { original, opened }` struct passed by value through
+  `attach_interactive` → `detach_interactive`. The borrowed
+  `GetProcessWindowStation` pseudo-handle is never closed; only the
+  `OpenWindowStationW` handle is.
+- **Slack/MCP/LLM C2 frame injection HMAC (CRITICAL-22/23/24).** All three
+  relay transports now seal frames with `[HMAC-SHA256(32) ||
+  len_be(4) || frame]` before encoding (base64 for Slack, hex for
+  MCP/LLM). `open_frame` verifies the tag (constant-time via
+  `hmac::Mac::verify_slice`) before returning bytes. Per-channel key
+  derivation prevents cross-channel replay. Removed `xor_frame` entirely
+  from LLM transport (the protocol AEAD provides confidentiality). 19 new
+  frame-integrity tests.
+- **sRDI export-table OOB (CRITICAL-25/26/27).** Every PE-derived slice
+  index now bounds-checked via `checked_slice` helper. `num_names` capped
+  at `1<<20`; `ordinal < num_names` enforced; `rva_to_off` takes a
+  `max_read` parameter. All `as u32` size casts go through
+  `usize_to_u32()` (errors on truncation). Malformed PE → descriptive
+  `Err`, not panic.
+- **EnableDebug.cs `cmd /c` argument injection (CRITICAL-28).** Removed
+  the `cmd.exe /c` shim entirely; `args[0]` passed directly as
+  `FileName`. Remaining args quoted via `WindowsArgvQuote()` (MSVC CRT
+  rules). Deleted unused `CreateProcessAsUser` P/Invokes. SeDebugPrivilege
+  behavior preserved.
+
+### Known Limitations (deferred to v0.4.0)
+
+- **CRITICAL-19 — beacon task isolation.** A single panicking task still
+  aborts the beacon (architectural; requires spawn-to-sacrificial redesign
+  for BOF/Inject).
+- **Selftest gate TIMEOUT in CI.** Pre-existing since v0.3.0 — rundll32
+  hangs in the non-interactive Session 0 of the win-17763 runner. All
+  build steps pass; only the selftest execution gate times out. Requires
+  remote debugging on the runner to diagnose.
+
 ## [0.3.1] - 2026-07-21
 
 Security-and-correctness fix release following the 2026-07-21 full-codebase

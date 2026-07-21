@@ -156,7 +156,8 @@ fn valid_checkin_frame(server_pub: &[u8; 32]) -> (Vec<u8>, [u8; 32]) {
     .encode(&mut w)
     .expect("test SessionInfo fields are tiny literals << MAX_BLOB_LEN");
     (
-        frame::encode_frame(&pubkey, 0, &key, &w.into_bytes()),
+        frame::encode_frame(&pubkey, 0, &key, &w.into_bytes())
+            .expect("test encode of tiny SessionInfo plaintext is infallible"),
         pubkey,
     )
 }

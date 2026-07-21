@@ -8,6 +8,7 @@ description = "Nyx transport fingerprint engine: TLS ClientHello parse + JA3/JA4
 [dependencies]
 md-5 = "0.10"
 sha2 = { workspace = true }
+hmac = { version = "0.12", default-features = false }
 hex = { workspace = true }
 ureq = { workspace = true }
 rand = { workspace = true, features = ["std", "std_rng"] }

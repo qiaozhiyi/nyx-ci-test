@@ -93,9 +93,24 @@ pub fn apply_layers(key: &mut [u8; 32], layers_bitmap: u32) {
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /// Single HKDF-SHA256 layer: `key = HKDF-SHA256(ikm=key, salt=salt, info=info)`.
+///
+/// The output buffer is a fixed 32 bytes — well under the 8160-byte HKDF-Expand
+/// bound — so `OutputTooLong` is structurally unreachable here. We still avoid
+/// `.expect()` (the pre-fix pattern) because this code runs under
+/// `panic = "abort"`: on the (impossible) failure we zero the key rather than
+/// abort the beacon. A zeroed key produces a deterministic (but useless)
+/// downstream AEAD failure that the caller surfaces as a config-decrypt error
+/// and exits cleanly — strictly better than tearing the process down with no
+/// diagnostic.
 fn layer_hkdf(key: &mut [u8; 32], salt: &[u8], info: &[u8]) {
     let mut out = [0u8; 32];
-    nyx_protocol::crypto::hkdf_sha256(key, salt, info, &mut out);
+    if nyx_protocol::crypto::hkdf_sha256(key, salt, info, &mut out).is_err() {
+        // Defensive: zero the key so a downstream AEAD failure is the visible
+        // signal, not an abort. Reachable only if HKDF-Expand's bound is
+        // violated, which the fixed 32-byte buffer structurally prevents.
+        *key = [0u8; 32];
+        return;
+    }
     *key = out;
 }
 

