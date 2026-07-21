@@ -736,9 +736,27 @@ pub async fn generate_implant(
 }
 
 /// `GET /api/implants` — list all generated implants.
+///
+/// Requires operator authentication. Anonymous open-mode callers are denied:
+/// the implant registry exposes callback hosts, ports, public keys — metadata
+/// that is sensitive even in dev/CI.
 pub async fn list_implants(
     State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<ImplantListResponse>, (StatusCode, String)> {
+    let op = match crate::authenticate(&st, &headers) {
+        AuthOutcome::Allowed(o) => o,
+        AuthOutcome::Denied(r) => {
+            return Err((r.status(), "unauthorized".to_string()));
+        }
+    };
+    if op.role == Role::Viewer {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "forbidden: viewer role cannot list implants".into(),
+        ));
+    }
+
     let store = st
         .implants
         .as_ref()
@@ -773,6 +791,10 @@ pub async fn list_implants(
 }
 
 /// `POST /api/implant/revoke` — revoke an implant by pubkey.
+///
+/// Requires operator authentication (Admin or Operator; Viewer is denied).
+/// Audit attribution uses the authenticated operator's name rather than the
+/// hardcoded "system" string used before auth was wired.
 #[derive(Debug, Deserialize)]
 pub struct RevokeRequest {
     pub implant_pub: String,
@@ -780,8 +802,22 @@ pub struct RevokeRequest {
 
 pub async fn revoke_implant(
     State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<RevokeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let op = match crate::authenticate(&st, &headers) {
+        AuthOutcome::Allowed(o) => o,
+        AuthOutcome::Denied(r) => {
+            return Err((r.status(), "unauthorized".to_string()));
+        }
+    };
+    if op.role == Role::Viewer {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "forbidden: viewer role cannot revoke implants".into(),
+        ));
+    }
+
     let store = st
         .implants
         .as_ref()
@@ -796,7 +832,7 @@ pub async fn revoke_implant(
 
     if let Some(audit) = &st.audit {
         let detail = serde_json::json!({"implant_pub": &req.implant_pub});
-        audit.append("implant_revoked", "system", "", detail);
+        audit.append("implant_revoked", &op.name, "", detail);
     }
 
     Ok(Json(serde_json::json!({

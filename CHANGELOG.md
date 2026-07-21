@@ -12,7 +12,13 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
-_Nothing staged._
+- **Implant endpoint auth bypass (CRITICAL).** `GET /api/implants` and
+  `POST /api/implant/revoke` had zero authentication — any reachable client
+  could enumerate all active implant metadata (callback hosts, ports, public
+  keys) and arbitrarily revoke them, severing C2 connections. Both endpoints
+  now require operator authentication and deny the anonymous Viewer fallback.
+  `revoke_implant` audit attribution corrected from hardcoded `"system"` to
+  the authenticated operator's name (fixes PR #44).
 
 ## [0.2.0] - 2026-07-21
 
@@ -91,6 +97,9 @@ implant-win CI + DLL-surface + screenshot DPI + upload/beacon-reliability fixes.
   (`8e7f507`).
 - **Server-side audit hardening, round 2** — DoS limits, `created_by` attribution, rate
   limiting, clock skew handling (`e0c342b`).
+- **Implant endpoint auth bypass (CRITICAL).** `GET /api/implants` and
+  `POST /api/implant/revoke` had no authentication. Now require operator
+  auth and block anonymous Viewer access (PR #44).
 
 ### Removed
 
@@ -123,6 +132,11 @@ any beacon built from a pre-`0.2.0` tree:
   on inputs lacking a terminator (`548c5be`).
 - **Protocol blob DoS** — unbounded blob size on ingress; now capped (`265e140`).
 - **Hive path traversal** — leading-slash bypass of `allowed()` (PR #41, `c9a3593`).
+- **Implant endpoint auth bypass (CRITICAL).** `GET /api/implants` and
+  `POST /api/implant/revoke` were completely unauthenticated — any reachable
+  client could enumerate all active implant metadata and arbitrarily revoke
+  implants, severing C2 connections. Both endpoints now require operator
+  authentication and deny the anonymous Viewer fallback (PR #44).
 
 ### Known Limitations
 
