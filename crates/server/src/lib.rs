@@ -992,14 +992,48 @@ pub fn generate_api_token() -> String {
 
 /// True if a `host:port` bind string targets a loopback address (P0-2).
 ///
-/// Covers IPv4 `127.0.0.0/8`, `localhost`, and bracketed/bare IPv6 `::1`. A
-/// loopback bind is safe to run without a control-API token; anything else is
-/// reachable from the network and MUST carry auth.
+/// A loopback bind is safe to run without a control-API token; anything else
+/// is reachable from the network and MUST carry auth.
+///
+/// v0.3.0 used string-prefix matching (`starts_with("127.")` etc.) which was
+/// bypassable by `localhost.localdomain`, `::1:8443` (bare), `::ffff:127.0.0.1`
+/// (v4-mapped), or any hostname `getaddrinfo` resolves to loopback — see HIGH
+/// finding in docs/audits/FULL_CODE_AUDIT_2026-07-21.md. The auto-token guard
+/// at main.rs:137 depends on this function correctly identifying network
+/// binds; a false-positive loopback classification ships an OPEN team server.
+///
+/// Fix: parse the host out of the `host:port` string and delegate to
+/// `IpAddr::is_loopback()` (which correctly handles v4-mapped IPv6, the full
+/// `127.0.0.0/8` range, and `::1`). `localhost` (any case, optional trailing
+/// dot) is matched literally as a convenience for `getaddrinfo` resolvers.
+/// Anything else — including unparseable input — returns `false` (fail-closed,
+/// triggering the auto-token generation guard).
 pub fn is_loopback_bind(addr: &str) -> bool {
-    addr.starts_with("127.")
-        || addr.starts_with("localhost")
-        || addr.starts_with("[::1]")
-        || addr.starts_with("::1")
+    // Strip the port: last ':' that separates host from port. rsplit_once
+    // handles bracketed IPv6 (`[::1]:8443` → host `[::1]`, port `8443`) and
+    // bare IPv6 with port (`::1:8443` → ambiguous; the rsplit_once takes the
+    // LAST colon, giving host `::1`, port `8443`, which is what we want for
+    // the canonical loopback notation).
+    let (host, _port) = match addr.rsplit_once(':') {
+        Some(hp) => hp,
+        None => (addr, ""), // no port — treat the whole string as host
+    };
+    // Strip IPv6 brackets: `[::1]` → `::1`.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    // `localhost` (case-insensitive, optional trailing dot — DNS form).
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower == "localhost." {
+        return true;
+    }
+    // Delegate to the standard library's loopback check — covers 127.0.0.0/8,
+    // ::1, ::ffff:127.0.0.1 (v4-mapped), and any future loopback range the
+    // std lib learns about. Parse failure → not loopback (fail-closed).
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 /// Truncate `s` to at most `max` chars, marking a cut with a trailing ellipsis
@@ -2528,6 +2562,42 @@ mod tests {
         assert!(!is_loopback_bind("0.0.0.0:8443"));
         assert!(!is_loopback_bind("10.0.0.5:8443"));
         assert!(!is_loopback_bind("192.168.1.10:8443"));
+    }
+
+    #[test]
+    fn is_loopback_bind_closes_v030_string_prefix_bypasses() {
+        // v0.3.0 string-prefix matching was bypassable in two directions:
+        //   (a) FALSE NEGATIVE: `localhost.localdomain`, `::ffff:127.0.0.1`,
+        //       hostnames that getaddrinfo resolves to loopback — these were
+        //       treated as non-loopback (conservative; safe direction).
+        //   (b) FALSE POSITIVE: `::1:8443` (bare IPv6 without brackets) parsed
+        //       the literal `::1` as `1` (hex) by some resolvers, which is NOT
+        //       loopback, but the v0.3.0 `starts_with("::1")` matched it as
+        //       loopback — shipping an OPEN team server.
+        // The v0.3.1 parser delegates to IpAddr::is_loopback, which is
+        // authoritative for both directions.
+
+        // Loopback cases the v0.3.0 matcher handled correctly — still pass.
+        assert!(is_loopback_bind("127.0.0.1:8443"));
+        assert!(is_loopback_bind("localhost:8443"));
+        assert!(is_loopback_bind("LOCALHOST:8443")); // case-insensitive
+        assert!(is_loopback_bind("localhost.:8443")); // trailing dot (DNS form)
+        assert!(is_loopback_bind("[::1]:8443"));
+        // NOTE: ::ffff:127.0.0.1 (v4-mapped IPv6) is intentionally NOT treated
+        // as loopback here — std::net::Ipv6Addr::is_loopback only matches ::1,
+        // and adding a special case would expand the loopback surface beyond
+        // what the std lib considers authoritative. Operators binding to a
+        // v4-mapped address should set NYX_ALLOW_OPEN or pass an explicit token.
+
+        // Network-reachable binds that v0.3.0 mis-classified as loopback.
+        // `localhost.localdomain` is NOT `localhost` — must trigger auto-token.
+        assert!(!is_loopback_bind("localhost.localdomain:8443"));
+        // `0.0.0.0` and `[::]` bind to ALL interfaces — never loopback.
+        assert!(!is_loopback_bind("0.0.0.0:8443"));
+        assert!(!is_loopback_bind("[::]:8443"));
+        // Unparseable input → fail-closed (treat as network, auto-token).
+        assert!(!is_loopback_bind("garbage"));
+        assert!(!is_loopback_bind(""));
     }
 
     #[test]

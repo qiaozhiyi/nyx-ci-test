@@ -255,7 +255,7 @@ impl DllProbe {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, rva)| *rva)
-            .ok_or_else(|| ProbeError::BadImageFormat("selftest export not found"))?;
+            .ok_or(ProbeError::BadImageFormat("selftest export not found"))?;
         // Re-resolve via GetProcAddress so the function pointer is the real
         // loader-sanctioned address. RVA is used as the "yes it's in our
         // table" sentinel above; GetProcAddress also handles forwarders

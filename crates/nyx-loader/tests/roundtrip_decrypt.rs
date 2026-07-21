@@ -24,7 +24,7 @@ use chacha20poly1305::{
 };
 use nyx_loader::{
     on_target::{KEY_LEN, KEY_PATCH_OFFSET, LAYER1_BOOTSTRAP, LAYER2_PEB_WALK},
-    wrap_payload, CIPHERTEXT_OFFSET, TAG_LEN, LoaderConfig,
+    wrap_payload, LoaderConfig, CIPHERTEXT_OFFSET, TAG_LEN,
 };
 
 /// Expected stub length: Layer 1 + 32-byte key + Layer 2.
@@ -53,9 +53,7 @@ fn fake_dll() -> Vec<u8> {
 fn parse_payload(payload: &[u8]) -> (usize, u32, &[u8], &[u8]) {
     let stub_len = expected_stub_len();
     let magic_off = stub_len;
-    let enc_len = u32::from_le_bytes(
-        payload[magic_off + 4..magic_off + 8].try_into().unwrap(),
-    );
+    let enc_len = u32::from_le_bytes(payload[magic_off + 4..magic_off + 8].try_into().unwrap());
     let nonce = &payload[magic_off + 8..magic_off + 20];
     let ct_off = magic_off + CIPHERTEXT_OFFSET;
     let ct_with_tag = &payload[ct_off..ct_off + enc_len as usize + TAG_LEN];
@@ -93,8 +91,7 @@ fn host_decrypt_matches_crate() {
         .expect("host-side decrypt with the correct key + nonce must succeed");
 
     assert_eq!(
-        decrypted,
-        dll,
+        decrypted, dll,
         "host-side decrypt must recover the original DLL byte-for-byte"
     );
     let _ = magic_off; // (used for clarity in diagnostics if parsing shifts)
@@ -138,7 +135,10 @@ fn tag_check_rejects_corruption() {
     let payload = wrap_payload(&dll, &config);
 
     let (_, enc_len, _, _) = parse_payload(&payload);
-    assert!(enc_len > 0, "test DLL must be non-empty for a flip to matter");
+    assert!(
+        enc_len > 0,
+        "test DLL must be non-empty for a flip to matter"
+    );
 
     // Build a corrupted payload: flip a single ciphertext byte (the first
     // byte of the ciphertext, not the tag, so we exercise the AEAD's

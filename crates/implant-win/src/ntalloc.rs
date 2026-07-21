@@ -256,24 +256,34 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
                     }
                     return ptr as *mut u8;
                 } else {
-                    // Over-allocate for alignment: alloc size + align, then
-                    // store the original pointer just before the aligned address.
-                    let total = size + align;
+                    // Over-allocate for alignment: alloc size + align + 8, so
+                    // there is ALWAYS room to store the raw pointer 8 bytes
+                    // before the aligned address (and aligned_addr - 8 >= raw).
+                    // The historical comment claiming "offset >= 8 for align > 8"
+                    // was wrong — when RtlAllocateHeap returns an already-
+                    // aligned block (common for align=16 under LFH), offset = 0
+                    // and the conditional store was SKIPPED, but dealloc still
+                    // unconditionally read *(ptr - 8) → UAF / wild free. See
+                    // CRITICAL-4 in docs/audits/FULL_CODE_AUDIT_2026-07-21.md.
+                    //
+                    // Saturating add guards against usize overflow on attacker-
+                    // controlled sizes (BEACON task sizes flow through here).
+                    let total = size.saturating_add(align).saturating_add(8);
                     let raw = alloc_fn(heap_handle as *mut core::ffi::c_void, 0, total);
                     if raw.is_null() {
                         return core::ptr::null_mut();
                     }
                     let raw_addr = raw as usize;
+                    // Round up to the next aligned address >= raw_addr.
+                    // aligned_addr is in [raw_addr, raw_addr + align - 1].
                     let aligned_addr = (raw_addr + align - 1) & !(align - 1);
-                    let offset = aligned_addr - raw_addr;
-                    // Store offset at aligned_addr - sizeof(usize) (must be >= 1
-                    // because align >= 9 > sizeof(usize) = 8 on x64).
-                    // Actually for align > 8, offset is in [1, align-1].
-                    // Store the raw pointer 8 bytes before the aligned addr.
-                    if offset >= 8 {
-                        let store = (aligned_addr - 8) as *mut *mut core::ffi::c_void;
-                        core::ptr::write(store, raw);
-                    }
+                    // Unconditionally store the raw pointer 8 bytes below the
+                    // aligned address. Because total = size + align + 8, the
+                    // slot at aligned_addr - 8 always lies inside the allocation
+                    // (>= raw_addr) and doesn't overlap the user payload
+                    // (which starts at aligned_addr and runs for `size` bytes).
+                    let store = (aligned_addr - 8) as *mut *mut core::ffi::c_void;
+                    core::ptr::write(store, raw);
                     if total > 65536 {
                         track_large_alloc(raw as *mut u8, total);
                     }
@@ -338,7 +348,14 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
         let ptr_addr = ptr as usize;
         if ptr_addr >= fb_base && ptr_addr < fb_end {
             // Fallback allocation — can't realloc, do alloc + copy.
-            let new = self.alloc(core::alloc::Layout::from_size_align(new_size, layout.align()).unwrap());
+            // Layout::from_size_align can Err on overflow/non-power-of-2 align;
+            // under panic=abort the .unwrap() killed the implant. Fail soft
+            // (return null) — matches GlobalAlloc's documented OOM contract.
+            let new_layout = match core::alloc::Layout::from_size_align(new_size, layout.align()) {
+                Ok(l) => l,
+                Err(_) => return core::ptr::null_mut(),
+            };
+            let new = self.alloc(new_layout);
             if !new.is_null() {
                 let old_len = (fb_end - ptr_addr).min(layout.size());
                 let copy_len = old_len.min(new_size);
@@ -366,7 +383,11 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
         }
 
         // Generic fallback: alloc + copy + (skip free since dealloc might work).
-        let new = self.alloc(core::alloc::Layout::from_size_align(new_size, layout.align()).unwrap());
+        let new_layout = match core::alloc::Layout::from_size_align(new_size, layout.align()) {
+            Ok(l) => l,
+            Err(_) => return core::ptr::null_mut(),
+        };
+        let new = self.alloc(new_layout);
         if !new.is_null() {
             let copy_len = layout.size().min(new_size);
             core::ptr::copy_nonoverlapping(ptr, new, copy_len);
