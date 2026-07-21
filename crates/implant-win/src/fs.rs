@@ -509,27 +509,66 @@ pub fn do_upload(rt: &Runtime, name: &str, data: &[u8]) -> Response {
                 return Response::Err(String::from(format_ntstatus("upload open", s)))
             }
         };
-        // Write the whole buffer in one NtWriteFile. For very large uploads we'd
-        // chunk, but Upload payloads are already capped by MAX_CT_LEN on the
-        // wire (~256 KiB), so a single write is fine.
-        let mut w_iosb: IoStatusBlock = IoStatusBlock::default();
-        let wst = crate::syscalls::nt_write_file(
-            rt,
-            handle as usize,
-            0, // Event
-            0, // ApcRoutine
-            0, // ApcContext
-            &mut w_iosb as *mut IoStatusBlock as usize,
-            data.as_ptr() as usize,
-            data.len() as usize,
-            0, // ByteOffset (NULL ⇒ append at current EOF / start for new file)
-            0, // Key
-        );
+        // Write in CHUNK-sized blocks, advancing by the ACTUAL bytes written
+        // each call (w_iosb.information). NtWriteFile on filter drivers / pipe
+        // endpoints / near-full disks can return success with fewer bytes than
+        // requested; gating purely on nt_success() would silently truncate the
+        // file and report Response::Ok (same class of bug as the read_file
+        // short-read). Loop until the whole buffer is confirmed written. The
+        // handle was opened with FILE_SYNCHRONOUS_IO_NONALERT, so a NULL
+        // ByteOffset uses the OS-maintained current position, which advances
+        // by `information` on each write (same contract the download read loop
+        // at do_download relies on).
+        let mut off = 0usize;
+        let mut err: Option<String> = None;
+        while off < data.len() {
+            let want = (data.len() - off).min(CHUNK);
+            let mut w_iosb: IoStatusBlock = IoStatusBlock::default();
+            let wst = crate::syscalls::nt_write_file(
+                rt,
+                handle as usize,
+                0, // Event
+                0, // ApcRoutine
+                0, // ApcContext
+                &mut w_iosb as *mut IoStatusBlock as usize,
+                data.as_ptr().add(off) as usize,
+                want,
+                0, // ByteOffset (NULL ⇒ current position on the sync handle)
+                0, // Key
+            );
+            let status = match wst {
+                Some(s) => s,
+                None => {
+                    err = Some(String::from("upload: NtWriteFile unresolved"));
+                    break;
+                }
+            };
+            if !nt_success(status) {
+                err = Some(String::from(format_ntstatus("upload write", status)));
+                break;
+            }
+            let wrote = w_iosb.information; // bytes actually written this call
+            if wrote > want {
+                // Defensive: a driver should never report more than asked, but
+                // if it does, advancing by `wrote` would overrun `data`. Clamp
+                // and treat the excess as a short-write failure.
+                err = Some(String::from("upload: write over-reported bytes"));
+                break;
+            }
+            if wrote == 0 {
+                // Success but no progress: a filter driver or pipe endpoint can
+                // accept a write yet report zero bytes. Treat as a failure so we
+                // never loop forever and never report a truncated file as Ok.
+                err = Some(String::from("upload: short write (no progress)"));
+                break;
+            }
+            off += wrote;
+        }
         let _ = crate::syscalls::nt_close(rt, handle as usize);
-        match wst {
-            Some(s) if nt_success(s) => Response::Ok,
-            Some(s) => Response::Err(String::from(format_ntstatus("upload write", s))),
-            None => Response::Err(String::from("upload: NtWriteFile unresolved")),
+        if off == data.len() {
+            Response::Ok
+        } else {
+            Response::Err(err.unwrap_or_else(|| String::from("upload: short write")))
         }
     }
 }
