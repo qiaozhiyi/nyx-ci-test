@@ -115,10 +115,13 @@ pub async fn driver_status(
     State(st): State<std::sync::Arc<crate::AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    let _ = match gate(&st, &headers) {
+    let op = match gate(&st, &headers) {
         Ok(o) => o,
         Err((code, msg)) => return (code, msg).into_response(),
     };
+    if let Some(audit) = &st.audit {
+        audit.append("kernel_driver_status", &op.name, "-", serde_json::json!({}));
+    }
     let bridge = match &st.kernel {
         Some(b) => b,
         None => {
@@ -136,10 +139,14 @@ pub async fn blind_etw(
     State(st): State<std::sync::Arc<crate::AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    let _ = match gate(&st, &headers) {
+    let op = match gate(&st, &headers) {
         Ok(o) => o,
         Err((code, msg)) => return (code, msg).into_response(),
     };
+    // HIGH-severity privileged action — audit before dispatching to the daemon.
+    if let Some(audit) = &st.audit {
+        audit.append("kernel_blind_etw", &op.name, "-", serde_json::json!({}));
+    }
     let bridge = match &st.kernel {
         Some(b) => b,
         None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
@@ -155,10 +162,18 @@ pub async fn hide(
     headers: HeaderMap,
     Query(q): Query<PidQ>,
 ) -> Response {
-    let _ = match gate(&st, &headers) {
+    let op = match gate(&st, &headers) {
         Ok(o) => o,
         Err((code, msg)) => return (code, msg).into_response(),
     };
+    if let Some(audit) = &st.audit {
+        audit.append(
+            "kernel_hide",
+            &op.name,
+            &format!("pid:{}", q.pid),
+            serde_json::json!({}),
+        );
+    }
     let bridge = match &st.kernel {
         Some(b) => b,
         None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
@@ -174,10 +189,20 @@ pub async fn dump_lsass(
     headers: HeaderMap,
     Query(q): Query<PidQ>,
 ) -> Response {
-    let _ = match gate(&st, &headers) {
+    let op = match gate(&st, &headers) {
         Ok(o) => o,
         Err((code, msg)) => return (code, msg).into_response(),
     };
+    // Credential extraction — highest-sensitivity operator action; audit
+    // attribution is mandatory for after-action review.
+    if let Some(audit) = &st.audit {
+        audit.append(
+            "kernel_dump_lsass",
+            &op.name,
+            &format!("pid:{}", q.pid),
+            serde_json::json!({}),
+        );
+    }
     let bridge = match &st.kernel {
         Some(b) => b,
         None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
@@ -193,10 +218,18 @@ pub async fn neutralize(
     headers: HeaderMap,
     Query(q): Query<NeutQ>,
 ) -> Response {
-    let _ = match gate(&st, &headers) {
+    let op = match gate(&st, &headers) {
         Ok(o) => o,
         Err((code, msg)) => return (code, msg).into_response(),
     };
+    if let Some(audit) = &st.audit {
+        audit.append(
+            "kernel_neutralize",
+            &op.name,
+            &format!("pid:{}", q.pid),
+            serde_json::json!({ "method": q.method }),
+        );
+    }
     let bridge = match &st.kernel {
         Some(b) => b,
         None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
@@ -211,10 +244,18 @@ pub async fn detach_minifilter(
     State(st): State<std::sync::Arc<crate::AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    let _ = match gate(&st, &headers) {
+    let op = match gate(&st, &headers) {
         Ok(o) => o,
         Err((code, msg)) => return (code, msg).into_response(),
     };
+    if let Some(audit) = &st.audit {
+        audit.append(
+            "kernel_detach_minifilter",
+            &op.name,
+            "-",
+            serde_json::json!({}),
+        );
+    }
     let bridge = match &st.kernel {
         Some(b) => b,
         None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
