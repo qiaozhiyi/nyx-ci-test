@@ -1375,7 +1375,8 @@ fn handle_frame(
                     0,
                     &reply_key,
                     &Task::encode_vec(&[])?,
-                ))
+                )
+                .map_err(|e| anyhow::anyhow!("failed to seal S2C:0 reply: {e}"))?)
             }
             Entry::Occupied(_) => {
                 // Lost the check-in race: the other thread already registered the
@@ -1476,13 +1477,14 @@ fn handle_frame(
             st.events.fire(&ev);
         }
         let reply = Task::encode_vec(&tasks)?;
-        Ok(encode_frame_dir(
+        encode_frame_dir(
             &raw.pubkey,
             Direction::ServerToClient,
             counter,
             &key,
             &reply,
-        ))
+        )
+        .map_err(|e| anyhow::anyhow!("failed to seal S2C reply: {e}"))
     }
 }
 
@@ -2982,7 +2984,8 @@ mod tests {
         info.encode(&mut w)
             .expect("test SessionInfo fields are tiny literals << MAX_BLOB_LEN");
         let plaintext = w.into_bytes();
-        let frame = encode_frame_dir(pubkey, Direction::ClientToServer, counter, &key, &plaintext);
+        let frame = encode_frame_dir(pubkey, Direction::ClientToServer, counter, &key, &plaintext)
+            .expect("test seal of SessionInfo is infallible (tiny plaintext, host alloc)");
         (key, frame)
     }
 
@@ -2991,6 +2994,7 @@ mod tests {
     fn response_frame(pubkey: &[u8; 32], key: &SessionKey, counter: u64) -> Vec<u8> {
         let plaintext = TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially");
         encode_frame_dir(pubkey, Direction::ClientToServer, counter, key, &plaintext)
+            .expect("test seal of empty TaskResponse batch is infallible")
     }
 
     #[test]
@@ -3140,7 +3144,8 @@ mod tests {
             })
             .collect();
         let plaintext = TaskResponse::encode_vec(&batch).expect("batch of Ok encodes trivially");
-        let frame = encode_frame_dir(&pubkey, Direction::ClientToServer, 2, &key, &plaintext);
+        let frame = encode_frame_dir(&pubkey, Direction::ClientToServer, 2, &key, &plaintext)
+            .expect("test seal of batched TaskResponses is infallible");
         handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &frame)
             .expect("ingest of oversized result batch");
 

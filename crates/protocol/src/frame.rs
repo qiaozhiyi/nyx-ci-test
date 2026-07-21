@@ -44,6 +44,12 @@ pub struct RawFrame {
 /// [`Direction`]'s nonce space. The direction must match what the receiver
 /// will use in [`open_frame_dir`].
 ///
+/// Returns `Err(chacha20poly1305::Error)` only if the underlying AEAD encrypt
+/// fails (allocator failure — the AEAD itself is otherwise infallible). The
+/// pre-fix `seal_dir` used `.expect()` here, which under the implant's
+/// `panic = "abort"` killed the process on a transient alloc failure; the
+/// error is now propagated so the caller can drop the frame or retry.
+///
 /// **Panics** if `plaintext` is empty. The wire codec never produces a
 /// zero-byte plaintext (every batch carries at least a `u32 count` and every
 /// SessionInfo is non-empty), so an empty plaintext here signals a caller bug.
@@ -56,30 +62,30 @@ pub fn encode_frame_dir(
     counter: u64,
     key: &SessionKey,
     plaintext: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, chacha20poly1305::Error> {
     assert!(
         !plaintext.is_empty(),
         "encode_frame_dir: empty plaintext is not a valid beacon frame"
     );
-    let ciphertext = crypto::seal_dir(key, dir, counter, pubkey, plaintext);
+    let ciphertext = crypto::seal_dir(key, dir, counter, pubkey, plaintext)?;
     let mut out = Vec::with_capacity(FRAME_HEADER + ciphertext.len());
     out.extend_from_slice(pubkey);
     out.extend_from_slice(&counter.to_le_bytes());
     out.extend_from_slice(&(ciphertext.len() as u32).to_le_bytes());
     out.extend_from_slice(&ciphertext);
-    out
+    Ok(out)
 }
 
 /// Back-compat shim: seals with [`Direction::ClientToServer`] (the historical
 /// implant→server direction). Existing implant/agent-dev callers that *send*
 /// should keep using this; server senders must use [`encode_frame_dir`] with
-/// [`Direction::ServerToClient`].
+/// [`Direction::ServerToClient`]. See [`encode_frame_dir`] for error semantics.
 pub fn encode_frame(
     pubkey: &[u8; PUBKEY_LEN],
     counter: u64,
     key: &SessionKey,
     plaintext: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, chacha20poly1305::Error> {
     encode_frame_dir(pubkey, Direction::ClientToServer, counter, key, plaintext)
 }
 

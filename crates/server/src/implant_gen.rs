@@ -74,7 +74,11 @@ fn derive_config_key_server(implant_priv: &[u8; 32], server_pub: &[u8; 32]) -> O
     info[..32].copy_from_slice(server_pub);
     info[32..].copy_from_slice(&implant_pub);
     let mut okm = [0u8; 32];
-    nyx_protocol::crypto::hkdf_sha256(&shared, b"nyx-implant-config-v1", &info, &mut okm);
+    // okm is exactly 32 bytes, well under the 8160-byte HKDF-Expand bound, so
+    // OutputTooLong is unreachable here. The 32-byte fixed buffer keeps the
+    // invariant compiler-checkable; if it ever fails (impossible for a correct
+    // build) we surface it as a key-derivation failure rather than panicking.
+    nyx_protocol::crypto::hkdf_sha256(&shared, b"nyx-implant-config-v1", &info, &mut okm).ok()?;
     Some(okm)
 }
 
@@ -559,7 +563,13 @@ pub async fn generate_implant(
         b"nyx-implant-key-v1",
         &server_pub,
         &mut implant_priv_derived,
-    );
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to derive implant private key (HKDF): {e}"),
+        )
+    })?;
     let implant_priv = clamp_scalar(implant_priv_derived);
     // Defense in depth: zero the unclamped intermediate. The compiler
     // warns about dead-store since Copy semantics already made a clone
