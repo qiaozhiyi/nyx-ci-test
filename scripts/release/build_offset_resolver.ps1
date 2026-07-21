@@ -17,8 +17,16 @@
 $ErrorActionPreference = 'Stop'
 
 Write-Host '== build_offset_resolver: cargo build --release offset-resolver =='
-& cargo build --release --manifest-path crates/offset-resolver/Cargo.toml 2>&1
-if ($LASTEXITCODE -ne 0) { Write-Host '::error::offset-resolver build failed'; exit 1 }
+# PS 5.1 NATIVE-COMMAND STDERR TRAP — see build_prod_dll.ps1.
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & cargo build --release --manifest-path crates/offset-resolver/Cargo.toml 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Host '::error::offset-resolver build failed'; exit 1 }
+}
+finally {
+    $ErrorActionPreference = $prevEAP
+}
 
 $binDir = 'crates\offset-resolver\target\release'
 $resolverExe = Join-Path $binDir 'nyx-offset-resolver.exe'

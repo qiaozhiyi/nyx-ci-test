@@ -24,8 +24,16 @@
 $ErrorActionPreference = 'Stop'
 
 Write-Host '== build_server: cargo build -p nyx-server --release (workspace member) =='
-& cargo build -p nyx-server --release 2>&1
-if ($LASTEXITCODE -ne 0) { Write-Host '::error::nyx-server build failed'; exit 1 }
+# PS 5.1 NATIVE-COMMAND STDERR TRAP — see build_prod_dll.ps1.
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & cargo build -p nyx-server --release 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Host '::error::nyx-server build failed'; exit 1 }
+}
+finally {
+    $ErrorActionPreference = $prevEAP
+}
 
 # The shared workspace target dir: root/target/release/. (Cargo respects the
 # nearest workspace root [workspace] [profile.release] for output location.)

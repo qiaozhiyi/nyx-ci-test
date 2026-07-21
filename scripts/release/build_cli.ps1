@@ -22,8 +22,18 @@
 $ErrorActionPreference = 'Stop'
 
 Write-Host '== build_cli: cargo build --release operator-kernel-cli =='
-& cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml 2>&1
-if ($LASTEXITCODE -ne 0) { Write-Host '::error::operator-kernel-cli build failed'; exit 1 }
+# PS 5.1 NATIVE-COMMAND STDERR TRAP — see build_prod_dll.ps1. cargo writes
+# compile progress to stderr; EAP=Stop would throw NativeCommandError on the
+# first stderr byte. Relax EAP for the cargo call; restore in finally.
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Host '::error::operator-kernel-cli build failed'; exit 1 }
+}
+finally {
+    $ErrorActionPreference = $prevEAP
+}
 
 $binDir = 'crates\operator-kernel-cli\target\release'
 if (-not (Test-Path $binDir)) {

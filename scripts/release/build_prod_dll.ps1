@@ -22,22 +22,31 @@ $ErrorActionPreference = 'Stop'
 # invocation as windows-ci.yml (collapsed into one rustup call so a missing
 # toolchain doesn't fail mid-build on a freshly-registered runner).
 Write-Host '== build_prod_dll: ensure nightly + rust-src + msvc target =='
-# 2>&1 is MANDATORY: rustup writes progress ("info: syncing channel updates...")
-# to stderr, which PS 5.1 + $ErrorActionPreference=Stop interprets as a fatal
-# NativeCommandError BEFORE the command finishes (so $LASTEXITCODE never gets
-# checked). Merging stderr into stdout turns those lines into normal output.
-& rustup toolchain install nightly --component rust-src --no-self-update 2>&1
-if ($LASTEXITCODE -ne 0) { Write-Host '::error::rustup nightly install failed'; exit 1 }
-& rustup target add x86_64-pc-windows-msvc --toolchain nightly 2>&1
-if ($LASTEXITCODE -ne 0) { Write-Host '::error::rustup target add failed'; exit 1 }
+# PS 5.1 NATIVE-COMMAND STDERR TRAP: rustup writes progress ("info: syncing
+# channel updates...") to stderr (standard Unix convention). PowerShell 5.1,
+# under $ErrorActionPreference='Stop', throws a NativeCommandError
+# RemoteException the moment the FIRST stderr line appears — BEFORE the
+# command finishes, regardless of $LASTEXITCODE. `2>&1` does NOT fix this:
+# PS intercepts the stderr stream before the redirect applies.
+#
+# The real fix is to temporarily relax EAP for the rustup/cargo calls so
+# stderr writes don't escalate to terminating errors. We use a try/finally
+# to guarantee EAP is restored even on exit/throw.
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & rustup toolchain install nightly --component rust-src --no-self-update 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Host '::error::rustup nightly install failed'; exit 1 }
+    & rustup target add x86_64-pc-windows-msvc --toolchain nightly 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Host '::error::rustup target add failed'; exit 1 }
 
-Write-Host '== build_prod_dll: cargo +nightly build (prod, NO selftest feature) =='
-# Full output (no Select-Object) so compile errors are surfaced verbatim — same
-# rationale as windows-ci.yml. The PS 5.1 NativeCommandError-on-stderr trap is
-# sidestepped because we capture $LASTEXITCODE explicitly and the script's
-# ErrorActionPreference=Stop doesn't fire for native-command stderr writes.
-& cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1
-if ($LASTEXITCODE -ne 0) { Write-Host '::error::prod implant DLL build failed'; exit 1 }
+    Write-Host '== build_prod_dll: cargo +nightly build (prod, NO selftest feature) =='
+    & cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Host '::error::prod implant DLL build failed'; exit 1 }
+}
+finally {
+    $ErrorActionPreference = $prevEAP
+}
 
 $dll = 'crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll'
 if (-not (Test-Path $dll)) {

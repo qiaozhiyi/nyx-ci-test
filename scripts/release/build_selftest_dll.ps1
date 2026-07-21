@@ -16,18 +16,24 @@
 $ErrorActionPreference = 'Stop'
 
 Write-Host '== build_selftest_dll: ensure nightly + rust-src + msvc target =='
-# 2>&1 mandatory — see build_prod_dll.ps1 for the PS 5.1 NativeCommandError trap.
-& rustup toolchain install nightly --component rust-src --no-self-update 2>&1
-if ($LASTEXITCODE -ne 0) { Write-Host '::error::rustup nightly install failed'; exit 1 }
-& rustup target add x86_64-pc-windows-msvc --toolchain nightly 2>&1
-if ($LASTEXITCODE -ne 0) { Write-Host '::error::rustup target add failed'; exit 1 }
+# PS 5.1 NATIVE-COMMAND STDERR TRAP — see build_prod_dll.ps1 for full comment.
+# TL;DR: EAP=Stop + native command writes stderr = RemoteException on first
+# byte. Fix: relax EAP for the rustup/cargo block; restore in finally.
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & rustup toolchain install nightly --component rust-src --no-self-update 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Host '::error::rustup nightly install failed'; exit 1 }
+    & rustup target add x86_64-pc-windows-msvc --toolchain nightly 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Host '::error::rustup target add failed'; exit 1 }
 
-Write-Host '== build_selftest_dll: cargo +nightly build (release + selftest feature) =='
-# This is the EXACT command windows-ci.yml's "Build implant DLL (nightly)" step
-# runs — it is the well-trodden path. The only delta vs build_prod_dll.ps1 is
-# the --features selftest flag.
-& cargo +nightly build --release --features selftest --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1
-if ($LASTEXITCODE -ne 0) { Write-Host '::error::selftest implant DLL build failed'; exit 1 }
+    Write-Host '== build_selftest_dll: cargo +nightly build (release + selftest feature) =='
+    & cargo +nightly build --release --features selftest --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Host '::error::selftest implant DLL build failed'; exit 1 }
+}
+finally {
+    $ErrorActionPreference = $prevEAP
+}
 
 $dll = 'crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll'
 if (-not (Test-Path $dll)) {

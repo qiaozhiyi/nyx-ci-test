@@ -70,6 +70,9 @@ if (-not (Test-Path $blobPath)) {
 # ── Build harness DLL ────────────────────────────────────────────────────────
 
 Write-Host '== loader_probe: building harness DLL =='
+# PS 5.1 NATIVE-COMMAND STDERR TRAP — see scripts/release/build_prod_dll.ps1.
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 Push-Location $harnessDir
 try {
     & cargo build --release 2>&1
@@ -79,7 +82,10 @@ try {
         exit 3
     }
 }
-finally { Pop-Location }
+finally {
+    $ErrorActionPreference = $prevEAP
+    Pop-Location
+}
 
 if (-not (Test-Path $harnessDll)) {
     Write-Host "::error::cargo build reported success but $harnessDll is missing."

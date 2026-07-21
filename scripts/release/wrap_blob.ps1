@@ -68,12 +68,20 @@ if ($WRAP_MODE -eq 'example') {
 $cargoArgs += @('--', $inputDll, $outputBlob)
 
 Write-Host ("invoking: cargo " + ($cargoArgs -join ' '))
-& cargo @cargoArgs 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "::error::nyx-loader wrap failed (exit $LASTEXITCODE)."
-    Write-Host '::error::Likely cause: T1 has not yet provided the wrap example/bin target in crates/nyx-loader.'
-    Write-Host '::error::See header of this script for the T1 dependency contract.'
-    exit 1
+# PS 5.1 NATIVE-COMMAND STDERR TRAP — see build_prod_dll.ps1.
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & cargo @cargoArgs 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "::error::nyx-loader wrap failed (exit $LASTEXITCODE)."
+        Write-Host '::error::Likely cause: T1 has not yet provided the wrap example/bin target in crates/nyx-loader.'
+        Write-Host '::error::See header of this script for the T1 dependency contract.'
+        exit 1
+    }
+}
+finally {
+    $ErrorActionPreference = $prevEAP
 }
 
 if (-not (Test-Path $outputBlob)) {
