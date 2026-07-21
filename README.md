@@ -4,6 +4,8 @@
 
 纯 Rust 全栈 C2 框架,融合 Cobalt Strike 的可扩展性与 Brute Ratel 的默认隐蔽性。**所有能力状态以代码核对为准**(本次 README 于 2026-07-18 经 6 路并行代码审计重写,每条声称附 `file:line` 证据)。
 
+> ⚠️ **证据时效(2026-07-21)**:本日一批 P0 修复合并,改 16 个文件(`beacon.rs`/`fs.rs`/`ntalloc.rs`/`screenshot.rs`/`entry.rs`/`syscalls.rs`/`envprobe.rs`/`hookchain.rs`/`selftests.rs`/`sleep.rs`/`channels/mod.rs` + 3 workflow yml + 2 ps1 脚本)。正文 `file:line` 证据可能因行号偏移/函数签名变更/截图捕获序列重写而滞后数行;**canonical truth 以 `git log --oneline -10` + 实际源码为准**。查当前状态:`git log --oneline -- crates/implant-win/src/` 与 `git diff 2026-07-18..HEAD -- crates/implant-win/src/`。
+
 > 📋 **完整审计报告**:[`docs/audits/CODE_TRUTH_2026-07-18.md`](docs/audits/CODE_TRUTH_2026-07-18.md)(逐 crate 证据) · [`AUTHORITATIVE_FACTS_2026-07-18.md`](docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md)(数字基准,所有文档统一来源)
 
 **实测规模**:~68,800 行 Rust · 18 workspace 成员 + 6 独立 crate · 488 `#[test]` · 46 个 selftest 导出 · 28 wire `Command` / 7 `Response` 变体。
