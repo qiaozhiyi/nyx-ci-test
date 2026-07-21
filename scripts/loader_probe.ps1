@@ -15,6 +15,7 @@
     nyx-implant-win prod DLL via crates/nyx-loader/examples/wrap.rs).
 
     Result file contract (written by tools/loader_probe_dll/src/lib.rs):
+      Location: $env:NYX_PROBE_RESULT, else C:\nyx\loader_probe_result.txt
       OK rv=0x<HEX>                        — stub returned cleanly
       FAIL stage=<stage> [code=0x<N> ...]  — harness or stub failed
 
@@ -55,7 +56,10 @@ $repoRoot = (Get-Location).Path
 $blobPath = if ([System.IO.Path]::IsPathRooted($Blob)) { $Blob } else { Join-Path $repoRoot $Blob }
 $harnessDir = Join-Path $repoRoot 'tools\loader_probe_dll'
 $harnessDll = Join-Path $harnessDir 'target\release\loader_probe.dll'
-$resultPath = 'C:\nyx\loader_probe_result.txt'
+# Result file: prefer $env:NYX_PROBE_RESULT (lets CI point it inside the
+# checkout's staging/ dir), else default to C:\nyx\loader_probe_result.txt
+# (the manual SSH worktree, covered by setup_release_env.ps1 ExclusionPath).
+$resultPath = if ($env:NYX_PROBE_RESULT) { $env:NYX_PROBE_RESULT } else { 'C:\nyx\loader_probe_result.txt' }
 
 if (-not (Test-Path $blobPath)) {
     Write-Host "::error::blob not found: $blobPath"

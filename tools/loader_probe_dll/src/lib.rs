@@ -32,7 +32,8 @@
 //!
 //! # Result file contract
 //!
-//! Written to `C:\nyx\loader_probe_result.txt` (single ASCII line):
+//! Written to the path in `NYX_PROBE_RESULT` (env), or
+//! `C:\nyx\loader_probe_result.txt` as fallback (single ASCII line):
 //!   * `OK rv=0x<HEX>`               — stub returned, N = its return value
 //!   * `FAIL stage=read <msg>`       — could not read blob file
 //!   * `FAIL stage=alloc GLE=<N>`    — VirtualAlloc failed
@@ -121,7 +122,30 @@ const OPEN_EXISTING: u32 = 3;
 const CREATE_ALWAYS: u32 = 2;
 const INVALID_HANDLE_VALUE: RawHandle = -1isize as RawHandle;
 
-const RESULT_PATH: &[u8] = b"C:\\nyx\\loader_probe_result.txt\0";
+const DEFAULT_RESULT_PATH: &[u8] = b"C:\\nyx\\loader_probe_result.txt\0";
+
+/// Resolve the result-file path. Honors `NYX_PROBE_RESULT` (so CI can point
+/// it inside the checkout's staging/ dir); falls back to the legacy
+/// `C:\nyx\loader_probe_result.txt` location otherwise. Returns a NUL-terminated
+/// ASCII byte buffer suitable for `CreateFileA`.
+fn resolve_result_path() -> Vec<u8> {
+    use std::env;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStrExt;
+
+    if let Ok(custom) = env::var("NYX_PROBE_RESULT") {
+        // Convert UTF-8 -> UTF-16 -> back to ASCII-safe bytes (CreateFileA
+        // takes ANSI; we require the path be ASCII to keep it simple).
+        if custom.is_ascii() && !custom.is_empty() {
+            let mut bytes = custom.into_bytes();
+            if !bytes.starts_with(b"\\\\") && bytes.iter().all(|&b| b != 0) {
+                bytes.push(0);
+                return bytes;
+            }
+        }
+    }
+    DEFAULT_RESULT_PATH.to_vec()
+}
 
 // ── SEH (vectored exception handler) ─────────────────────────────────────────
 
@@ -195,9 +219,10 @@ unsafe extern "system" fn veh_handler(ptrs: *mut c_void) -> u32 {
 // ── Result file I/O ──────────────────────────────────────────────────────────
 
 fn write_result_raw(bytes: &[u8]) {
+    let path = resolve_result_path();
     unsafe {
         let h = CreateFileA(
-            RESULT_PATH.as_ptr(),
+            path.as_ptr(),
             GENERIC_WRITE,
             0,
             core::ptr::null(),

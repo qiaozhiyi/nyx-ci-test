@@ -108,15 +108,36 @@ if (-not (Get-Command -Name Set-MpPreference -ErrorAction SilentlyContinue)) {
 # Mirror the crate layout verified live on 2026-07-21 (see RELEASE_ENV.md
 # baseline table). Each crates/<name> has its own target/ because the
 # standalone crates (implant-win) carry an empty [workspace] block and do
-# not share the workspace-level C:\nyx\target.
+# not share the workspace-level target/.
+#
+# Two parallel working trees must be covered:
+#   1. C:\nyx                        — manual SSH validation worktree (the
+#                                      one win_remote_run.sh etc. operate on)
+#   2. C:\actions-runner\_work\NY\NY — the GH Actions self-hosted runner
+#                                      checkout root (verified 2026-07-21).
+# Both get the same exclusion pattern; the runner path is what CI uses, the
+# C:\nyx path is what manual testing uses.
 $exclusionPaths = @(
+    # C:\nyx manual worktree
     'C:\nyx\target',
     'C:\nyx\crates\implant-win\target',
     'C:\nyx\crates\server\target',
     'C:\nyx\crates\operator-kernel-cli\target',
     'C:\nyx\crates\offset-resolver\target',
     'C:\nyx\crates\nyx-loader\target',
-    'C:\nyx\staging'
+    'C:\nyx\tools\loader_probe_dll\target',
+    'C:\nyx\staging',
+    # C:\actions-runner\_work\NY\NY self-hosted runner checkout
+    'C:\actions-runner\_work\NY\NY\target',
+    'C:\actions-runner\_work\NY\NY\crates\implant-win\target',
+    'C:\actions-runner\_work\NY\NY\crates\server\target',
+    'C:\actions-runner\_work\NY\NY\crates\operator-kernel-cli\target',
+    'C:\actions-runner\_work\NY\NY\crates\offset-resolver\target',
+    'C:\actions-runner\_work\NY\NY\crates\nyx-loader\target',
+    'C:\actions-runner\_work\NY\NY\tools\loader_probe_dll\target',
+    'C:\actions-runner\_work\NY\NY\staging',
+    'C:\actions-runner\_work\NY\NY'   # belt-and-braces: whole checkout, since
+                                       # staging/ + ad-hoc test files live here too
 )
 
 # Build-tool processes. clink is not added because it is not in the
