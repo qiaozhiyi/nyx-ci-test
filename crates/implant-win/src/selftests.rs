@@ -344,8 +344,25 @@ pub unsafe extern "system" fn nyx_selftest_screenshot_diag() {
     mask |= 1 << 6;
     // GetDIBits needs a buffer; allocate w*h*4. If the allocator fails the
     // GetDIBits call would crash — so probe the alloc first.
-    let need = (w as usize) * (h as usize) * 4;
-    let mut pixels = crate::heap::vec![0u8; need.min(1 << 20)]; // cap probe at 1MB
+    // GetDIBits needs a buffer; allocate w*h*4. If the allocator fails the
+    // GetDIBits call would crash — so probe the alloc first.
+    //
+    // CRITICAL-21 (2026-07-21 audit): v0.3.0 capped the buffer at 1MiB
+    // (need.min(1<<20)) but still asked GetDIBits to fill `h` scan lines.
+    // On any screen larger than ~512x512 (so every real display — 1920x1080
+    // needs 8.3MiB) GetDIBits wrote `need` bytes into a 1MiB buffer and
+    // stomped NT-heap metadata → abort or worse. The cap was wrong; the
+    // probe only needs to verify the allocator works, not bound the write.
+    // Fix: allocate the full `need` bytes (matches the GetDIBits request).
+    // Defensive: also cap iLines to what the buffer can hold, so a future
+    // edit that reintroduces a cap can't re-trigger the overflow.
+    let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+    let mut pixels = crate::heap::vec![0u8; need];
+    let ilines = if w as usize == 0 {
+        h as u32
+    } else {
+        ((need / 4) / w as usize).min(h as usize) as u32
+    };
     type GetDiBits = unsafe extern "system" fn(
         *mut c_void,
         *mut c_void,
@@ -370,7 +387,7 @@ pub unsafe extern "system" fn nyx_selftest_screenshot_diag() {
             screen_dc,
             bmp,
             0,
-            h as u32,
+            ilines,
             pixels.as_mut_ptr() as *mut c_void,
             bi.as_mut_ptr(),
             0,
