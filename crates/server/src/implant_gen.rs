@@ -230,6 +230,160 @@ fn default_tls() -> bool {
     true
 }
 
+/// Parse an implant expiry timestamp into Unix seconds.
+///
+/// Accepts three input forms (matching what an operator is likely to type in
+/// the client UI, where the placeholder is `2026-12-31`):
+///   - A bare integer: interpreted as Unix seconds (`"1735689600"`).
+///   - `YYYY-MM-DD`: midnight UTC on that date.
+///   - `YYYY-MM-DDTHH:MM:SSZ` (or with an explicit `+00:00` offset): the
+///     full ISO 8601 instant. Offset is parsed but must be zero or `Z`;
+///     non-UTC offsets are rejected to keep the contract unambiguous.
+///
+/// Returns `None` on any parse failure — the caller must surface this as a
+/// 400 rather than silently defaulting to "never expire" (the v0.3.0 bug).
+///
+/// No `time`/`chrono` dependency — the parser is a hand-rolled ~40-line scan.
+/// Civil-to-days-since-epoch uses the well-known Howard Hinnant algorithm
+/// (valid for any year in [1970, 9999]).
+fn parse_iso8601_to_unix(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // (1) Bare integer — Unix seconds.
+    if let Ok(secs) = s.parse::<u64>() {
+        return Some(secs);
+    }
+    // (2) YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS[Z|+00:00]
+    let bytes = s.as_bytes();
+    // Year: 4 ASCII digits.
+    if bytes.len() < 10 || !bytes[..4].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let year: u32 = s[..4].parse().ok()?;
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    if !bytes[5..7].iter().all(u8::is_ascii_digit) || !bytes[8..10].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let month: u32 = s[5..7].parse().ok()?;
+    let day: u32 = s[8..10].parse().ok()?;
+    let days = civil_to_days(year, month, day)?;
+    // Default to midnight UTC if no time component.
+    if bytes.len() == 10 {
+        return Some(days as u64 * 86_400);
+    }
+    // Expect 'T' or ' ' separator then HH:MM:SS.
+    if bytes[10] != b'T' && bytes[10] != b't' && bytes[10] != b' ' {
+        return None;
+    }
+    if bytes.len() < 19
+        || !bytes[11..13].iter().all(u8::is_ascii_digit)
+        || bytes[13] != b':'
+        || !bytes[14..16].iter().all(u8::is_ascii_digit)
+        || bytes[16] != b':'
+        || !bytes[17..19].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let hour: u32 = s[11..13].parse().ok()?;
+    let minute: u32 = s[14..16].parse().ok()?;
+    let second: u32 = s[17..19].parse().ok()?;
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // Optional suffix: 'Z' (any case) or '+00:00' / '-00:00' (UTC only).
+    let suffix = &s[19..];
+    let suffix = suffix.trim();
+    if !suffix.is_empty() {
+        let lower_eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+        if !(lower_eq(suffix, "Z") || suffix == "+00:00" || suffix == "-00:00") {
+            return None; // non-UTC offset — reject
+        }
+    }
+    let secs = days as u64 * 86_400 + hour as u64 * 3600 + minute as u64 * 60 + second as u64;
+    Some(secs)
+}
+
+/// Civil (gregorian) date → days since 1970-01-01. Howard Hinnant's algorithm.
+/// Returns None for out-of-range month/day (caller surfaces as 400).
+fn civil_to_days(y: u32, m: u32, d: u32) -> Option<i64> {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = y as i64;
+    let m = m as i64;
+    let d = d as i64;
+    let y0 = y - if m <= 2 { 1 } else { 0 };
+    let era = if y0 >= 0 { y0 } else { y0 - 399 } / 400;
+    let yoe = (y0 - era * 400) as u64; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u64; // [0, 146096]
+    Some(era * 146_097 + doe as i64 - 719_468)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_iso8601_to_unix;
+
+    #[test]
+    fn parses_bare_unix_seconds() {
+        // Backward compat: v0.3.0 only accepted this form.
+        assert_eq!(parse_iso8601_to_unix("1735689600"), Some(1_735_689_600));
+        assert_eq!(parse_iso8601_to_unix("0"), Some(0));
+    }
+
+    #[test]
+    fn parses_iso_date_midnight_utc() {
+        // 2025-01-01 00:00:00 UTC = 1735689600.
+        assert_eq!(parse_iso8601_to_unix("2025-01-01"), Some(1_735_689_600));
+        // Documented placeholder in the client UI is "2026-12-31".
+        assert_eq!(parse_iso8601_to_unix("2026-12-31"), Some(1_798_675_200));
+    }
+
+    #[test]
+    fn parses_iso_instant_with_z() {
+        assert_eq!(
+            parse_iso8601_to_unix("2025-01-01T00:00:00Z"),
+            Some(1_735_689_600)
+        );
+        // Lowercase t/z accepted.
+        assert_eq!(
+            parse_iso8601_to_unix("2025-01-01t00:00:00z"),
+            Some(1_735_689_600)
+        );
+        // Space separator accepted.
+        assert_eq!(
+            parse_iso8601_to_unix("2025-01-01 00:00:00Z"),
+            Some(1_735_689_600)
+        );
+        // Explicit +00:00 offset (UTC).
+        assert_eq!(
+            parse_iso8601_to_unix("2025-01-01T00:00:00+00:00"),
+            Some(1_735_689_600)
+        );
+    }
+
+    #[test]
+    fn rejects_non_utc_offsets_and_garbage() {
+        // Non-UTC offset → reject (fail-closed, not silently shift).
+        assert_eq!(parse_iso8601_to_unix("2025-01-01T00:00:00+05:00"), None);
+        assert_eq!(parse_iso8601_to_unix("2025-01-01T00:00:00-08:00"), None);
+        // Garbage.
+        assert_eq!(parse_iso8601_to_unix("garbage"), None);
+        assert_eq!(parse_iso8601_to_unix(""), None);
+        assert_eq!(parse_iso8601_to_unix("   "), None);
+        // Bad month/day.
+        assert_eq!(parse_iso8601_to_unix("2025-13-01"), None);
+        assert_eq!(parse_iso8601_to_unix("2025-01-32"), None);
+        // Bad time.
+        assert_eq!(parse_iso8601_to_unix("2025-01-01T25:00:00Z"), None);
+        assert_eq!(parse_iso8601_to_unix("2025-01-01T00:60:00Z"), None);
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct GenerateResponse {
     pub ok: bool,
@@ -453,15 +607,29 @@ pub async fn generate_implant(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     pw.u32(req.features);
     pw.u32(req.keying);
-    let expires_ts: u64 = req
-        .expires
-        .as_ref()
-        .and_then(|s| {
-            // Parse ISO 8601 timestamp or fall back to 0.
-            // Simple parse: expect YYYY-MM-DDTHH:MM:SSZ or similar.
-            s.parse::<i64>().ok().map(|v| v as u64)
-        })
-        .unwrap_or(0);
+    // Kill-date parse. v0.3.0 used s.parse::<i64>().ok().map(...).unwrap_or(0),
+    // which silently dropped any ISO 8601 string (the documented input form —
+    // see the client placeholder "2026-12-31") and wrote expires_at=0, meaning
+    // "never expire". HIGH finding in docs/audits/FULL_CODE_AUDIT_2026-07-21.md.
+    //
+    // Fix: accept bare unix seconds (backward compat), YYYY-MM-DD, or the full
+    // ISO 8601 instant. On parse failure return 400 (fail-closed) so the
+    // operator learns immediately that their kill-date was rejected, instead
+    // of shipping an immortal implant. None → 0 (no expiry) is still allowed
+    // by simply omitting the field.
+    let expires_ts: u64 = match req.expires.as_deref() {
+        None => 0,
+        Some("") => 0,
+        Some(s) => parse_iso8601_to_unix(s).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "invalid `expires` (use bare unix seconds, YYYY-MM-DD, or \
+                     YYYY-MM-DDTHH:MM:SSZ): {s:?}"
+                ),
+            )
+        })?,
+    };
     pw.u64(expires_ts);
     let config_plaintext = pw.into_bytes();
 
