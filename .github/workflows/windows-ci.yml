@@ -57,7 +57,23 @@ jobs:
           # #[cfg(feature = "selftest")]; without this flag the DLL CI invokes
           # below does not contain them and every test reports "missing entry".
           # Full output — never pipe to Select-Object, so compile errors show.
-          cargo +nightly build --release --features selftest --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1
+          #
+          # PS 5.1 NativeCommandError trap: cargo writes compile progress to
+          # stderr (standard Rust behavior), and PS 5.1 treats ANY non-empty
+          # stderr from a native command as a terminating error → RemoteException
+          # → exit 1, even when the build succeeded. The release scripts
+          # (scripts/release/build_*.ps1) already solve this with the
+          # EAP=Continue try/finally pattern documented in CHANGELOG v0.3.0.
+          # Mirror it here so a green build isn't masked as a failure.
+          $prevEap = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            cargo +nightly build --release --features selftest --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1 |
+              Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "cargo build exited $LASTEXITCODE" }
+          } finally {
+            $ErrorActionPreference = $prevEap
+          }
           $dll = "crates/implant-win/target/x86_64-pc-windows-msvc/release/nyx_implant_win.dll"
           if (-not (Test-Path $dll)) { Write-Host "::error::implant DLL build failed"; exit 1 }
           Write-Host "DLL OK: $((Get-Item $dll).Length) bytes"
@@ -65,8 +81,19 @@ jobs:
       - name: Build operator CLI + offset-resolver (stable)
         shell: powershell
         run: |
-          cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml 2>&1
-          cargo build --manifest-path crates/offset-resolver/Cargo.toml 2>&1
+          # Same PS 5.1 NativeCommandError workaround as the implant build above.
+          $prevEap = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml 2>&1 |
+              Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "CLI build exited $LASTEXITCODE" }
+            cargo build --manifest-path crates/offset-resolver/Cargo.toml 2>&1 |
+              Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "resolver build exited $LASTEXITCODE" }
+          } finally {
+            $ErrorActionPreference = $prevEap
+          }
           Write-Host "CLI + resolver built"
 
       # ---- 2. User-mode selftests on this kernel (build 17763) ----
