@@ -18,8 +18,8 @@
 use nyx_loader::{
     generate_loader_stub, on_target,
     on_target::{KEY_LEN, KEY_PATCH_OFFSET, LAYER1_BOOTSTRAP, LAYER2_PEB_WALK},
-    wrap_payload, CIPHERTEXT_OFFSET, ENCRYPTED_LEN_OFFSET, NONCE_OFFSET, NYX2_MAGIC, TAG_LEN,
-    LoaderConfig,
+    wrap_payload, LoaderConfig, CIPHERTEXT_OFFSET, ENCRYPTED_LEN_OFFSET, NONCE_OFFSET, NYX2_MAGIC,
+    TAG_LEN,
 };
 
 /// Expected stub length for a given config: Layer 1 + 32-byte key + Layer 2.
@@ -81,17 +81,13 @@ fn wrap_payload_emits_magic_and_lengths() {
     );
 
     // ── NYX2 magic (4 bytes, little-endian) ──────────────────────────────
-    let magic = u32::from_le_bytes(
-        payload[magic_off..magic_off + 4].try_into().unwrap(),
-    );
+    let magic = u32::from_le_bytes(payload[magic_off..magic_off + 4].try_into().unwrap());
     assert_eq!(magic, NYX2_MAGIC, "NYX2 magic must follow the stub");
     // The bytes in memory are 'N' 'Y' 'X' '2'.
     assert_eq!(&payload[magic_off..magic_off + 4], b"NYX2");
 
     // ── encrypted_len (u32 LE) ───────────────────────────────────────────
-    let enc_len = u32::from_le_bytes(
-        payload[enc_len_off..enc_len_off + 4].try_into().unwrap(),
-    );
+    let enc_len = u32::from_le_bytes(payload[enc_len_off..enc_len_off + 4].try_into().unwrap());
     assert_eq!(
         enc_len as usize,
         dll.len(),
@@ -142,9 +138,7 @@ fn wrap_payload_handles_empty_dll() {
 
     assert_eq!(payload.len(), stub_len + 4 + 4 + 12 + TAG_LEN);
 
-    let enc_len = u32::from_le_bytes(
-        payload[magic_off + 4..magic_off + 8].try_into().unwrap(),
-    );
+    let enc_len = u32::from_le_bytes(payload[magic_off + 4..magic_off + 8].try_into().unwrap());
     assert_eq!(enc_len, 0);
 
     // Trailing bytes are exactly the tag.

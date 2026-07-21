@@ -39,7 +39,10 @@ fn stub_starts_with_call_pop() {
     );
     // The first byte of Layer 1 in isolation is the same opcode — belt and
     // braces, so a future reordering that moves Layer 1 is caught.
-    assert_eq!(&LAYER1_BOOTSTRAP[..6], &[0xE8, 0x00, 0x00, 0x00, 0x00, 0x58]);
+    assert_eq!(
+        &LAYER1_BOOTSTRAP[..6],
+        &[0xE8, 0x00, 0x00, 0x00, 0x00, 0x58]
+    );
 }
 
 /// The scan loop terminates at the NYX2 magic within the 256-byte bound.
@@ -75,8 +78,7 @@ fn stub_finds_magic_within_max_scan() {
 
     // The header fields are at the documented offsets relative to the magic
     // (lib.rs payload layout: magic+4 = enc_len, magic+8 = nonce).
-    let enc_len =
-        u32::from_le_bytes(image[magic_off + 4..magic_off + 8].try_into().unwrap());
+    let enc_len = u32::from_le_bytes(image[magic_off + 4..magic_off + 8].try_into().unwrap());
     assert_eq!(enc_len, 1234);
 }
 
