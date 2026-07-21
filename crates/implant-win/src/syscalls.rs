@@ -496,6 +496,7 @@ pub unsafe fn init_global() {
 ///   0xB4 = trampoline page allocated
 ///   0xB5 = Runtime built + Box::leak installed
 /// A crash (127) before any of these = the step crashed.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 #[allow(unused_assignments)]
 pub unsafe extern "system" fn nyx_selftest_rt_steps() {

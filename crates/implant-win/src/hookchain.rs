@@ -462,6 +462,7 @@ pub unsafe fn apply() -> usize {
 /// and reports the redirect count via exit code:
 ///   0xC0 = runtime not initialized (call after bootstrap)
 ///   0xC1..0xFE = count of redirected slots (capped)
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_hookchain() {
     let exit_proc = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess");
@@ -490,6 +491,7 @@ pub unsafe extern "system" fn nyx_selftest_hookchain() {
 /// Exit codes:
 ///   0xC0 = runtime init failed (LiveNtdll::locate or SSN resolution failed)
 ///   0xC1..0xFE = count of redirected slots (capped). >0 = hookchain works.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_hookchain_full() {
     let exit_proc = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess");

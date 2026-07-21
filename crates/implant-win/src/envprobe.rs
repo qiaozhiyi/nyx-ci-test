@@ -739,6 +739,7 @@ pub unsafe fn looks_like_cloud_server() -> bool {
 ///   0xCF = probe failed (could not resolve APIs)
 ///
 /// Useful for validating the suite against known VM/bare-metal hosts.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_envprobe() {
     let exit_proc = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess");

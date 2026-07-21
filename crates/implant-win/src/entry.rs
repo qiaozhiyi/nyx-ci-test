@@ -495,6 +495,7 @@ fn push_dec(s: &mut crate::heap::String, n: u64) {
 /// Exits 0 on a successful capture, 1 otherwise. Invoke as
 /// `rundll32 nyx_implant_win.dll,nyx_screenshot_test`. NOT shipped in production
 /// builds — temporary instrumentation.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_screenshot_test() {
     let resp = crate::screenshot::do_screenshot(0);
@@ -567,6 +568,7 @@ unsafe fn report_exit(exit_proc: Option<usize>, code: u32) -> ! {
     }
 }
 
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest() {
     let exit_proc = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess");
@@ -655,6 +657,7 @@ pub unsafe extern "system" fn nyx_selftest() {
 /// through to Phase 5's code. To read each independently, run with the host in
 /// different states (e.g. under an EDR for D>0). Invoke via
 /// `rundll32 nyx_implant_win.dll,nyx_selftest_evasion`.
+#[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_evasion() {
     let exit_proc = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess");
