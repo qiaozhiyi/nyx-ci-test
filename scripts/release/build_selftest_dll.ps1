@@ -16,9 +16,10 @@
 $ErrorActionPreference = 'Stop'
 
 Write-Host '== build_selftest_dll: ensure nightly + rust-src + msvc target =='
-& rustup toolchain install nightly --component rust-src --no-self-update
+# 2>&1 mandatory — see build_prod_dll.ps1 for the PS 5.1 NativeCommandError trap.
+& rustup toolchain install nightly --component rust-src --no-self-update 2>&1
 if ($LASTEXITCODE -ne 0) { Write-Host '::error::rustup nightly install failed'; exit 1 }
-& rustup target add x86_64-pc-windows-msvc --toolchain nightly
+& rustup target add x86_64-pc-windows-msvc --toolchain nightly 2>&1
 if ($LASTEXITCODE -ne 0) { Write-Host '::error::rustup target add failed'; exit 1 }
 
 Write-Host '== build_selftest_dll: cargo +nightly build (release + selftest feature) =='

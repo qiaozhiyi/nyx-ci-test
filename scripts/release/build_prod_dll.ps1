@@ -22,9 +22,13 @@ $ErrorActionPreference = 'Stop'
 # invocation as windows-ci.yml (collapsed into one rustup call so a missing
 # toolchain doesn't fail mid-build on a freshly-registered runner).
 Write-Host '== build_prod_dll: ensure nightly + rust-src + msvc target =='
-& rustup toolchain install nightly --component rust-src --no-self-update
+# 2>&1 is MANDATORY: rustup writes progress ("info: syncing channel updates...")
+# to stderr, which PS 5.1 + $ErrorActionPreference=Stop interprets as a fatal
+# NativeCommandError BEFORE the command finishes (so $LASTEXITCODE never gets
+# checked). Merging stderr into stdout turns those lines into normal output.
+& rustup toolchain install nightly --component rust-src --no-self-update 2>&1
 if ($LASTEXITCODE -ne 0) { Write-Host '::error::rustup nightly install failed'; exit 1 }
-& rustup target add x86_64-pc-windows-msvc --toolchain nightly
+& rustup target add x86_64-pc-windows-msvc --toolchain nightly 2>&1
 if ($LASTEXITCODE -ne 0) { Write-Host '::error::rustup target add failed'; exit 1 }
 
 Write-Host '== build_prod_dll: cargo +nightly build (prod, NO selftest feature) =='
