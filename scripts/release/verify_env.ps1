@@ -57,6 +57,16 @@ try {
 $currentNorm = $current | ForEach-Object { $_.TrimEnd('\').ToUpper() } | Sort-Object -Unique
 Write-Host ("Current ExclusionPath entries: {0}" -f ($currentNorm.Count))
 
+# Short-circuit: if the checkout root itself is excluded, every subdir target/
+# is transitively covered (Defender ExclusionPath applies recursively). This
+# is how setup_release_env.ps1 is configured for CI — the whole
+# C:\actions-runner\_work\NY\NY root is excluded as belt-and-braces.
+$repoRootNorm = $repoRoot.TrimEnd('\').ToUpper()
+if ($currentNorm -contains $repoRootNorm) {
+    Write-Host ("== verify_env OK: checkout root '{0}' is excluded — all subdirs transitively covered ==" -f $repoRoot)
+    exit 0
+}
+
 # Resolve the wildcard 'crates\*\target' into the concrete crate target dirs.
 $crateTargetDirs = @()
 foreach ($crate in (Get-ChildItem -Path (Join-Path $repoRoot 'crates') -Directory)) {
@@ -79,7 +89,10 @@ if ($missing.Count -gt 0) {
     Write-Host '::error::Missing Defender ExclusionPath entries. The following build dirs are NOT excluded:'
     foreach ($m in $missing) { Write-Host "  - $m" }
     Write-Host '::error::Without exclusions Defender realtime protection will quarantine the freshly-built DLL/EXE blobs mid-build.'
-    Write-Host '::error::Run scripts/setup_release_env.ps1 on this runner first, then re-push the tag.'
+    Write-Host '::error::Either (a) run scripts/setup_release_env.ps1 on this runner first, OR'
+    Write-Host '::error::(b) add the checkout root to ExclusionPath (covers all subdirs recursively):'
+    Write-Host ("::error::    Add-MpPreference -ExclusionPath '{0}'" -f $repoRoot)
+    Write-Host '::error::then re-push the tag.'
     exit 1
 }
 
