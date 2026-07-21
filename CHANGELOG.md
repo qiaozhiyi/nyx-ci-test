@@ -12,13 +12,70 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
-- **Implant endpoint auth bypass (CRITICAL).** `GET /api/implants` and
-  `POST /api/implant/revoke` had zero authentication — any reachable client
-  could enumerate all active implant metadata (callback hosts, ports, public
-  keys) and arbitrarily revoke them, severing C2 connections. Both endpoints
-  now require operator authentication and deny the anonymous Viewer fallback.
+## [0.3.0] - 2026-07-21
+
+First release with compiled Windows payloads + a real reflective PIC loader.
+Establishes a tag-triggered release pipeline on the existing self-hosted
+win-17763 runner and backfills the reflective loader that was previously
+"intentionally out of scope". The release is published as a **GitHub Draft
+Release** (assets not publicly listed) pending operator review.
+
+### Added
+
+- **Reflective PIC loader (`crates/nyx-loader`).** `generate_loader_stub()`
+  was a `_config`-ignored stub; it now emits Layer-1 (call/pop self-location
+  + NYX2 magic scan + header parse) + Layer-2 (PEB walk, RWX alloc, inline
+  ChaCha20-Poly1305 decrypt with tag check, reflective PE load, DllMain call).
+  The magic self-match scanner bug — the naive `cmp dword [rcx], 0x3258594E`
+  matches its own operand inside the stub — is fixed via XOR recovery
+  (`on_target::MAGIC_XOR_KEY = 0x5A5A5A5A`). 54 tests (lib 41 + integration
+  13) cover byte layout, scan algorithm, payload format, and crypto
+  roundtrip against the `chacha20poly1305` crate (`8a385cc`).
+- **`crates/nyx-loader/examples/wrap.rs`** — CLI that wraps a PE DLL into
+  a self-contained NYX2 blob with a random per-build key (`8a385cc`).
+- **`tools/loader_probe_dll/`** — standalone Windows cdylib harness that
+  `VirtualAlloc(RWX)` + `memcpy` + VEH-protected jump into a wrapped blob.
+  Result file (`NYX_PROBE_RESULT` env or `C:\nyx\loader_probe_result.txt`):
+  `OK rv=0x<HEX>` / `FAIL stage=<stage> [code=0x<HEX> addr=0x<HEX>]`
+  (`8a385cc`, path fix `2222f08`).
+- **`scripts/setup_release_env.ps1` + `docs/RELEASE_ENV.md`** — idempotent
+  VPS setup: `MAPSReporting=0` + `SubmitSamplesConsent=2` (do not feed MS
+  threat intel) + ExclusionPath for both the manual `C:\nyx` worktree and
+  the CI checkout at `C:\actions-runner\_work\NY\NY` (`8a385cc`,
+  `2222f08`).
+- **`scripts/loader_probe.ps1`** — driver that builds the harness, spawns
+  `rundll32`, polls for result file, parses OK/FAIL (`8a385cc`).
+- **`scripts/release/*.ps1` (11 scripts)** — per-step build, gate, stage,
+  notes-extraction (`8a385cc`).
+- **`.github/workflows/release.yml`** — tag push → single-job sequential
+  pipeline → `softprops/action-gh-release@v2` **draft** release
+  (`8a385cc`).
+
+### Security
+
+- **Implant endpoint auth bypass (CRITICAL, inherited from unreleased).**
+  `GET /api/implants` and `POST /api/implant/revoke` had zero
+  authentication — any reachable client could enumerate all active implant
+  metadata (callback hosts, ports, public keys) and arbitrarily revoke
+  them, severing C2 connections. Both endpoints now require operator
+  authentication and deny the anonymous Viewer fallback.
   `revoke_implant` audit attribution corrected from hardcoded `"system"` to
-  the authenticated operator's name (fixes PR #44).
+  the authenticated operator's name (fixes PR #44, `73006cd`).
+
+### Operational Notes
+
+- **Build environment transparency.** Built on the self-hosted Windows
+  Server 2019 (build 17763) with Defender Realtime **ON**. Defender
+  `ExclusionPath` is active for build dirs; `MAPSReporting` is disabled.
+  DLLs are **unsigned**. See `docs/RELEASE_ENV.md` for reproducible setup.
+- **Loader probe is release-blocking.** The reflective blob must inject +
+  execute `DllMain` cleanly in the harness process before any draft
+  release is created. A crash produces a `FAIL stage=invoke code=0x<N>`
+  line in the result file; iteration is expected here.
+- **Scope boundaries preserved.** Sleep obfuscation `fluctuation` is still
+  not wired; 6 Transport channels still have zero consumers; BOF compat
+  surface is still narrow. These known limits are inherited from v0.2.0
+  and called out in release notes.
 
 ## [0.2.0] - 2026-07-21
 
