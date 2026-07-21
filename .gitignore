@@ -10,8 +10,10 @@ dist/
 .superpowers/
 # agent/session working scratch (transcripts, run logs, reports) — never commit
 .agents/
-# per-standalone-crate build artifacts
+# per-standalone-crate build artifacts (also covers deeper nesting like
+# crates/nyx-loader/pic-loader/target/ which the single-level pattern missed)
 crates/*/target/
+crates/*/*/target/
 # dev junk at repo root
 /librust_out.rmeta
 /ui.log

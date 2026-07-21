@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "nyx-minidump-assembler"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "nyx-operator-kernel-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nyx-minidump-assembler",
  "nyx-operator-kernelsdk",

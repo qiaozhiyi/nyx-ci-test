@@ -124,27 +124,17 @@ const INVALID_HANDLE_VALUE: RawHandle = -1isize as RawHandle;
 
 const DEFAULT_RESULT_PATH: &[u8] = b"C:\\nyx\\loader_probe_result.txt\0";
 
-/// Resolve the result-file path. Honors `NYX_PROBE_RESULT` (so CI can point
-/// it inside the checkout's staging/ dir); falls back to the legacy
-/// `C:\nyx\loader_probe_result.txt` location otherwise. Returns a NUL-terminated
-/// ASCII byte buffer suitable for `CreateFileA`.
-fn resolve_result_path() -> Vec<u8> {
-    use std::env;
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStrExt;
-
-    if let Ok(custom) = env::var("NYX_PROBE_RESULT") {
-        // Convert UTF-8 -> UTF-16 -> back to ASCII-safe bytes (CreateFileA
-        // takes ANSI; we require the path be ASCII to keep it simple).
-        if custom.is_ascii() && !custom.is_empty() {
-            let mut bytes = custom.into_bytes();
-            if !bytes.starts_with(b"\\\\") && bytes.iter().all(|&b| b != 0) {
-                bytes.push(0);
-                return bytes;
-            }
-        }
-    }
-    DEFAULT_RESULT_PATH.to_vec()
+/// Resolve the result-file path as a static slice (no allocation).
+///
+/// Historically this returned `Vec<u8>` and honored `NYX_PROBE_RESULT`, but
+/// both `Vec::new()` (heap alloc) and `std::env::var` (std runtime) require
+/// the Rust runtime to be fully initialized — which is NOT guaranteed when
+/// `nyx_probe_run` is invoked by rundll32 immediately after `DllMain`. Both
+/// paths silently abort. Returning a `&'static [u8]` avoids the dependency.
+///
+/// To change the result path, edit `DEFAULT_RESULT_PATH` above and rebuild.
+fn resolve_result_path() -> &'static [u8] {
+    DEFAULT_RESULT_PATH
 }
 
 // ── SEH (vectored exception handler) ─────────────────────────────────────────
