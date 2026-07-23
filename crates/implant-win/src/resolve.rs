@@ -38,11 +38,12 @@ pub fn djb2(s: &[u8]) -> u32 {
 /// djb2 hash over the low byte of each `u16` in a UTF-16 slice.
 /// Used to match module names from the PEB loader list (UTF-16)
 /// without holding string literals in the implant.
-pub fn djb2_utf16(ptr: *const u16, len: usize) -> u32 {
+/// # Safety
+/// `ptr..ptr+len` must be a valid UTF-16 buffer.
+pub unsafe fn djb2_utf16(ptr: *const u16, len: usize) -> u32 {
     let mut h: u32 = 5381;
     for i in 0..len {
-        // SAFETY: caller guarantees ptr..ptr+len is a valid UTF-16 slice.
-        let c = unsafe { *ptr.add(i) };
+        let c = *ptr.add(i);
         let lo = (c & 0xFF) as u8;
         h = h.wrapping_mul(33).wrapping_add(lo.to_ascii_lowercase() as u32);
     }

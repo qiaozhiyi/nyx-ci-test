@@ -232,8 +232,8 @@ pub static BLIND_OK: AtomicBool = AtomicBool::new(false);
 ///
 /// `UnsafeCell` is the minimal safe wrapper for a static that is written once
 /// during bootstrap and read later in single-threaded beacon context.
-pub static BLIND_ERR: core::cell::UnsafeCell<Option<&'static str>> =
-    core::cell::UnsafeCell::new(None);
+pub static BLIND_ERR: crate::cell::SyncCell<Option<&'static str>> =
+    crate::cell::SyncCell::new(None);
 
 /// Check whether blinding succeeded.
 pub fn blind_ok() -> bool {

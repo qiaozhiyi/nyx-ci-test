@@ -255,7 +255,11 @@ fn beacon_send_frame(
     };
     *counter += 1;
     pending.clear();
-    let body = crate::channels::dispatch_send_recv(ch_ctx, crate::channels::get_active(), &frame);
+    // SAFETY: same contract as the beacon_loop call sites — `ch_ctx` outlives
+    // the call and the active channel's fns were resolved at bootstrap.
+    let body = unsafe {
+        crate::channels::dispatch_send_recv(ch_ctx, crate::channels::get_active(), &frame)
+    };
     match body {
         Some(b) => Some(b),
         None => {

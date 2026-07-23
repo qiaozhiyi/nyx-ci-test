@@ -1079,11 +1079,17 @@ unsafe fn query_session_user(sid: u32) -> crate::heap::Vec<u16> {
     type WTSQuerySessionInfoW = unsafe extern "system" fn(
         *mut c_void, u32, u32, *mut *mut u16, *mut u32,
     ) -> i32;
-    let query_si: WTSQuerySessionInfoW = unsafe {
-        core::mem::transmute(export_addr(b"wtsapi32.dll", b"WTSQuerySessionInformationW")?)
+    let query_si_addr = match unsafe { export_addr(b"wtsapi32.dll", b"WTSQuerySessionInformationW") } {
+        Some(a) => a,
+        None => return crate::heap::Vec::new(),
+    };
+    let query_si: WTSQuerySessionInfoW = unsafe { core::mem::transmute(query_si_addr) };
+    let free_mem_addr = match unsafe { export_addr(b"wtsapi32.dll", b"WTSFreeMemory") } {
+        Some(a) => a,
+        None => return crate::heap::Vec::new(),
     };
     let free_mem: unsafe extern "system" fn(*mut c_void) =
-        unsafe { core::mem::transmute(export_addr(b"wtsapi32.dll", b"WTSFreeMemory")?) };
+        unsafe { core::mem::transmute(free_mem_addr) };
     let query_str = |class: u32| -> crate::heap::Vec<u16> {
         let mut p: *mut u16 = core::ptr::null_mut();
         let mut bytes: u32 = 0;

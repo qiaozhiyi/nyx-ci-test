@@ -47,8 +47,8 @@ static MASK_STATE: AtomicU8 = AtomicU8::new(0);
 /// # Safety
 /// Access is guarded by `MASK_KEY_INIT`: written once, read-only after init.
 /// Single-threaded beacon context.
-static MASK_KEY_BUF: core::cell::UnsafeCell<[u8; 32]> =
-    core::cell::UnsafeCell::new([0u8; 32]);
+static MASK_KEY_BUF: crate::cell::SyncCell<[u8; 32]> =
+    crate::cell::SyncCell::new([0u8; 32]);
 /// 0 = MASK_KEY_BUF uninitialized, 1 = populated.
 static MASK_KEY_INIT: AtomicU8 = AtomicU8::new(0);
 

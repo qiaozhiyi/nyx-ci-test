@@ -73,8 +73,8 @@ const MAX_CHANNELS: usize = 16;
 /// Channel table wrapped in `UnsafeCell` — all access is single-threaded
 /// beacon context. The `UnsafeCell` is the minimal safe wrapper replacing
 /// the previous `static mut`.
-static CHANNELS: core::cell::UnsafeCell<[Option<Channel>; MAX_CHANNELS]> =
-    core::cell::UnsafeCell::new([None; MAX_CHANNELS]);
+static CHANNELS: crate::cell::SyncCell<[Option<Channel>; MAX_CHANNELS]> =
+    crate::cell::SyncCell::new([None; MAX_CHANNELS]);
 
 /// Winsock init-once guard. `WSAStartup` is globally reference-counted; calling
 /// it once per process is enough, and we never `WSACleanup` — the implant lives

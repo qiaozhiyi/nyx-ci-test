@@ -33,8 +33,8 @@
 
 #![cfg(target_os = "windows")]
 
-use crate::heap::{String, Vec};
-use nyx_protocol::wire::{Reader, WireError};
+use crate::heap::Vec;
+use nyx_protocol::wire::Reader;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Config types

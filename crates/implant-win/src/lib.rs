@@ -60,6 +60,8 @@ pub mod antidebug;
 #[cfg(target_os = "windows")]
 pub mod beacon;
 #[cfg(target_os = "windows")]
+pub mod cell;
+
 pub mod cfg_user;
 
 #[cfg(target_os = "windows")]

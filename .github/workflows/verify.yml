@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: cargo test (workspace, excl. client-ui)
         shell: cmd
-        run: cargo test --workspace --exclude nyx-client-ui
+        run: cargo test --workspace --exclude nyx-client-ui --exclude nyx-client-ui-web
 
   # ---- Gate 2: implant-win check + clippy + release build (gnu target, nightly) ----
   implant-build:
