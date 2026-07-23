@@ -63,18 +63,18 @@ jobs:
       - name: nightly toolchain + gnu target
         shell: cmd
         run: |
-          rustup toolchain install nightly --no-self-update
+          rustup toolchain install nightly --component rust-src --no-self-update
           rustup target add x86_64-pc-windows-gnu --toolchain nightly
       - name: ensure mingw linker
         shell: cmd
         run: where x86_64-w64-mingw32-gcc || choco install mingw -y
-      - name: build selftest DLL (debug)
+      - name: build selftest DLL (canonical: build-std + release, per scripts/win_build.sh)
         shell: cmd
-        run: cargo +nightly build --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-gnu --features selftest
+        run: cargo +nightly build -Z build-std=core,alloc,panic_abort --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-gnu --release --features selftest
       - name: run all selftests via rundll32
         shell: powershell
         env:
-          NYX_DLL: crates\implant-win\target\x86_64-pc-windows-gnu\debug\nyx_implant_win.dll
+          NYX_DLL: crates\implant-win\target\x86_64-pc-windows-gnu\release\nyx_implant_win.dll
           NYX_OUT: selftest_results.csv
           NYX_EXPORTS: exports.txt
         run: |
