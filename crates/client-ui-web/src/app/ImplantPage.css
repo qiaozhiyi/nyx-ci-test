@@ -1,0 +1,520 @@
+/**
+ * ImplantPage — generation form + result card + implant list.
+ * Field styling mirrors ConnectPage.css (dark inputs, violet focus border).
+ * List styling mirrors SessionTable.css (state pills, muted separators).
+ */
+
+.implant-page {
+  height: 100%;
+  width: 100%;
+  overflow-y: auto;
+  padding: var(--sp-7);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-7);
+  background:
+    radial-gradient(1000px 500px at 50% -10%, rgba(124, 92, 255, 0.06), transparent 60%),
+    var(--bg);
+}
+
+/* ===== Section heads ===== */
+
+.implant-gen,
+.implant-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-xl);
+  padding: var(--sp-7);
+  box-shadow: var(--shadow-panel);
+}
+
+.implant-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+}
+
+.implant-form-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+
+.implant-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.04em;
+}
+
+.implant-section-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.implant-section-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+/* ===== Form grid ===== */
+
+.implant-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--sp-4) var(--sp-4);
+}
+
+.ip-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.ip-field-grow {
+  grid-column: span 2;
+}
+
+.ip-label {
+  font-size: 11px;
+  color: var(--text-second);
+  letter-spacing: 0.02em;
+}
+
+/* Inputs share the ConnectPage field-input language. */
+.ip-input,
+.ip-select,
+.ip-textarea {
+  width: 100%;
+  background: var(--elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--text);
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color 0.12s ease;
+}
+
+.ip-input {
+  height: 34px;
+  padding: 0 var(--sp-3);
+}
+
+.ip-select {
+  height: 34px;
+  padding: 0 var(--sp-3);
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-muted) 50%),
+    linear-gradient(135deg, var(--text-muted) 50%, transparent 50%);
+  background-position: calc(100% - 14px) 14px, calc(100% - 9px) 14px;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  cursor: pointer;
+}
+
+.ip-textarea {
+  padding: var(--sp-2) var(--sp-3);
+  resize: vertical;
+  min-height: 48px;
+  line-height: 1.4;
+  font-family: inherit;
+}
+
+.ip-input::placeholder,
+.ip-textarea::placeholder {
+  color: var(--text-faint);
+}
+
+.ip-input:focus,
+.ip-select:focus,
+.ip-textarea:focus {
+  border-color: var(--accent-border);
+}
+
+/* Select dropdown options inherit OS styling; darken the panel surface. */
+.ip-select option {
+  background: var(--elev-hi);
+  color: var(--text);
+}
+
+/* Checkboxes — pill-like inline label. */
+.ip-check {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 34px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.ip-check input[type='checkbox'] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.ip-check-label {
+  font-size: 12px;
+  color: var(--text-second);
+}
+
+/* Inline per-field validation message (e.g. port range). */
+.ip-field-error {
+  font-size: 11px;
+  color: var(--danger);
+}
+
+/* Advanced options — collapsed <details> under the main form. */
+.ip-advanced summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  color: var(--text-second);
+  user-select: none;
+  outline: none;
+}
+
+.ip-advanced summary:hover,
+.ip-advanced summary:focus-visible {
+  color: var(--text);
+}
+
+.ip-advanced[open] summary {
+  margin-bottom: var(--sp-3);
+}
+
+/* ===== Primary / ghost buttons ===== */
+
+.ip-primary {
+  align-self: flex-start;
+  height: 36px;
+  padding: 0 var(--sp-7);
+  border: none;
+  border-radius: var(--r-md);
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  transition: background 0.12s ease;
+}
+
+.ip-primary:hover:not(:disabled) {
+  background: var(--accent-hov);
+}
+
+.ip-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ip-ghost {
+  height: 26px;
+  padding: 0 var(--sp-3);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--text-second);
+  font-size: 11px;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.ip-ghost:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.ip-ghost:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ===== Error banner ===== */
+
+.ip-error {
+  font-size: 12px;
+  color: var(--danger);
+  background: var(--danger-bg);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+  border-radius: var(--r-md);
+  padding: var(--sp-2) var(--sp-3);
+  line-height: 1.4;
+}
+
+/* ===== Result card (success highlight) ===== */
+
+.implant-result {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-5);
+  background: linear-gradient(180deg, var(--accent-bg), transparent 80%), var(--elev);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--r-lg);
+  box-shadow: 0 0 0 1px rgba(124, 92, 255, 0.08), 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+
+.implant-result-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.implant-result-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-hov);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.implant-result-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: var(--r-sm);
+  background: var(--accent-bg);
+  color: var(--accent-hov);
+  border: 1px solid var(--accent-border);
+}
+
+.ip-kv {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ip-kv-key {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.ip-kv-val {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.ip-kv-mono {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--text);
+  word-break: break-all;
+  line-height: 1.45;
+}
+
+.ip-copy {
+  flex-shrink: 0;
+  height: 24px;
+  padding: 0 var(--sp-2);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  color: var(--text-second);
+  font-size: 10.5px;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.ip-copy:hover {
+  background: var(--hover);
+  color: var(--text);
+  border-color: var(--accent-border);
+}
+
+.ip-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-5);
+  flex-wrap: wrap;
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--border-dim);
+}
+
+.ip-meta-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.ip-meta-key {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.ip-download {
+  margin-left: auto;
+  height: 28px;
+  padding: 0 var(--sp-4);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--r-md);
+  background: var(--accent-bg);
+  color: var(--accent-hov);
+  font-size: 12px;
+  font-weight: 600;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.ip-download:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+.ip-result-msg {
+  font-size: 11.5px;
+  color: var(--text-second);
+  line-height: 1.4;
+}
+
+/* ===== Implant list / table ===== */
+
+.ip-table-wrap {
+  flex: 1;
+  overflow: auto;
+  border: 1px solid var(--border-dim);
+  border-radius: var(--r-md);
+}
+
+.ip-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.ip-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  text-align: left;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  background: var(--elev-hi);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.ip-table tbody td {
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--border-dim);
+  color: var(--text);
+  vertical-align: middle;
+}
+
+.ip-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.ip-table tbody tr:hover td {
+  background: var(--hover);
+}
+
+.ip-table tbody tr.is-revoked td {
+  opacity: 0.6;
+}
+
+.ip-dim {
+  color: var(--text-faint);
+}
+
+.ip-th-action,
+.ip-td-action {
+  text-align: right;
+}
+
+.ip-td-action {
+  white-space: nowrap;
+}
+
+/* State pills — match SessionTable tag colors. */
+.ip-state {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border-radius: var(--r-sm);
+  text-transform: uppercase;
+}
+
+.ip-state-active {
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.ip-state-revoked {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.ip-revoke {
+  height: 24px;
+  padding: 0 var(--sp-3);
+  background: transparent;
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  border-radius: var(--r-sm);
+  color: var(--danger);
+  font-size: 11px;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.ip-revoke:hover:not(:disabled) {
+  background: var(--danger-bg);
+  border-color: var(--danger);
+}
+
+.ip-revoke:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
+/* ===== Empty state ===== */
+
+.ip-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: var(--sp-7) var(--sp-5);
+  color: var(--text-second);
+  font-size: 12px;
+  gap: var(--sp-1);
+}
+
+.ip-empty-sub {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* ===== Responsive: collapse the 4-col grid on narrow widths ===== */
+
+@media (max-width: 900px) {
+  .implant-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .ip-field-grow {
+    grid-column: span 2;
+  }
+}

@@ -1,0 +1,12 @@
+[package]
+name = "nyx-scripting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nyx event/hook scripting foundation (Lua/Rune VM plugs in later)"
+
+[dependencies]
+
+[lib]
+name = "nyx_scripting"
+path = "src/lib.rs"

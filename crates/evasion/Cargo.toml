@@ -1,0 +1,12 @@
+[package]
+name = "nyx-evasion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nyx evasion kit core: syscall-number resolution (Hells/Halo/Tartarus Gate) + indirect-syscall stub templates. Portable logic; Windows asm is gated to the PIC implant."
+
+[dependencies]
+
+[lib]
+name = "nyx_evasion"
+path = "src/lib.rs"

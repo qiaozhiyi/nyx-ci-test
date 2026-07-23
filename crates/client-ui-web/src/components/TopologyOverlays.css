@@ -1,0 +1,351 @@
+/**
+ * Shared overlay styling for the three side panels (info / legend / stats).
+ * Frosted-glass surface via backdrop-filter; no @keyframes (deliberate).
+ */
+
+/* --- Common panel surface ------------------------------------------------- */
+.topo-panel {
+  position: absolute;
+  z-index: 10;
+  background: rgba(10, 12, 16, 0.72);
+  backdrop-filter: blur(14px) saturate(125%);
+  -webkit-backdrop-filter: blur(14px) saturate(125%);
+  border: 1px solid var(--border);
+  border-radius: var(--r-xl);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+  color: var(--text);
+  /* Show/hide is a CSS transition (NOT @keyframes — those flickered on refresh).
+     Hidden state slides right + fades so the panel clearly leaves the canvas. */
+  transition:
+    opacity 180ms ease,
+    transform 220ms cubic-bezier(0.22, 0.61, 0.36, 1),
+    visibility 0s linear 220ms;
+}
+.topo-panel.is-visible {
+  opacity: 1;
+  transform: translateX(0);
+  visibility: visible;
+  pointer-events: auto;
+  transition-delay: 0s;
+}
+.topo-panel.is-hidden {
+  opacity: 0;
+  transform: translateX(24px);
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* --- Close button (shared by info + stats) -------------------------------- */
+/* Small translucent circle, top-right inside the panel. Stays subtle so it
+   doesn't break the frosted-glass aesthetic. */
+.topo-panel-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--border-dim);
+  border-radius: 50%;
+  background: rgba(20, 24, 34, 0.55);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease, transform 120ms ease;
+}
+.topo-panel-close:hover {
+  background: var(--hover);
+  color: var(--text);
+  border-color: var(--border);
+  transform: scale(1.08);
+}
+.topo-panel-close:active {
+  transform: scale(0.94);
+}
+
+/* --- Info panel (right) --------------------------------------------------- */
+.topo-info {
+  top: 64px;
+  right: 14px;
+  bottom: 64px;
+  width: 300px;
+  padding: var(--sp-5);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+}
+.topo-info::-webkit-scrollbar { width: 6px; }
+.topo-info::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: var(--r-pill);
+}
+
+.topo-info-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: var(--sp-3);
+  color: var(--text-muted);
+}
+.topo-info-empty-glyph {
+  font-size: 30px;
+  color: var(--accent);
+  opacity: 0.7;
+}
+.topo-info-empty-title {
+  font-size: 13px;
+  color: var(--text-second);
+}
+.topo-info-empty-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  max-width: 220px;
+}
+
+.topo-info-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.topo-info-os {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+}
+.topo-info-host {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* leave clearance for the close button in the top-right corner */
+  padding-right: 28px;
+}
+.topo-info-priv {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border-radius: var(--r-pill);
+}
+.topo-info-priv--server {
+  color: var(--accent);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+}
+.topo-info-priv--admin {
+  color: var(--danger);
+  background: var(--danger-bg);
+  border: 1px solid rgba(248, 113, 113, 0.35);
+}
+.topo-info-priv--user {
+  color: var(--text-second);
+  background: rgba(82, 88, 102, 0.18);
+  border: 1px solid var(--border);
+}
+
+.topo-info-grid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.topo-info-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+.topo-info-k {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.topo-info-v {
+  font-size: 12px;
+  color: var(--text);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 180px;
+}
+
+.topo-info-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.topo-info-section-title {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+}
+.topo-info-empty-inline {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* Pivot chain */
+.topo-chain {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.topo-chain-hop {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 4px 6px;
+  background: rgba(124, 92, 255, 0.06);
+  border-left: 2px solid var(--accent);
+  border-radius: 0 var(--r-md) var(--r-md) 0;
+}
+.topo-chain-idx {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  color: var(--accent-hov);
+  font-size: 10px;
+  font-weight: 700;
+}
+.topo-chain-name {
+  font-size: 12px;
+  color: var(--text);
+  font-family: var(--font-mono);
+}
+
+/* Tasks */
+.topo-tasks {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.topo-task {
+  display: flex;
+  gap: var(--sp-2);
+  font-size: 12px;
+}
+.topo-task-id {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  min-width: 32px;
+}
+.topo-task-label {
+  color: var(--text-second);
+  font-family: var(--font-mono);
+}
+
+/* --- Legend (bottom-left) ------------------------------------------------- */
+.topo-legend {
+  bottom: 14px;
+  left: 14px;
+  width: 200px;
+  padding: var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+.topo-legend-title {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+}
+.topo-legend-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.topo-legend-group-title {
+  font-size: 10px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.topo-legend-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.topo-legend-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: 11px;
+  color: var(--text-second);
+}
+.topo-legend-label { line-height: 1; }
+.topo-swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: var(--r-sm);
+  flex-shrink: 0;
+}
+.topo-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.topo-line {
+  width: 16px;
+  height: 2px;
+  border-radius: 1px;
+  flex-shrink: 0;
+}
+
+/* --- Stats (bottom-right) ------------------------------------------------- */
+.topo-stats {
+  bottom: 14px;
+  right: 14px;
+  display: flex;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+}
+.topo-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 44px;
+}
+.topo-stat-value {
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1;
+}
+.topo-stat-label {
+  margin-top: 3px;
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.topo-stat--ok .topo-stat-value { color: var(--success); }
+.topo-stat--warn .topo-stat-value { color: var(--warn); }
+.topo-stat--dim .topo-stat-value { color: var(--text-muted); }
+.topo-stat--default .topo-stat-value { color: var(--text); }

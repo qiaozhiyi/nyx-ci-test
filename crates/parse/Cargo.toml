@@ -1,0 +1,12 @@
+[package]
+name = "nyx-parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shell-output parsers shared by the Nyx client-ui and client-cli. Pure functions over &str; no I/O, no deps."
+
+# Intentionally dependency-free: the parsers are plain string splitting so the
+# crate stays tiny and builds identically for every consumer. This is the single
+# source of truth for the parsing logic that used to be duplicated verbatim in
+# crates/client-ui/src/parse.rs and crates/client-cli/src/parse.rs — fix a
+# parser here once and both clients get it.

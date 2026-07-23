@@ -1,0 +1,376 @@
+/**
+ * CredsPage — Credential Vault panel.
+ * Visual language mirrors SessionTable: dark --panel rows, hover highlight,
+ * monospace data, small colored badges for the `kind` column.
+ * All colors/spacing reference tokens.css vars.
+ */
+.creds-page {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  min-width: 0;
+}
+
+/* ---- toolbar ----------------------------------------------------------- */
+.cv-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-5) var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.cv-title-group {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+
+.cv-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.cv-count {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.cv-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.cv-filter {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.cv-filter-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: lowercase;
+}
+
+.cv-select {
+  height: 26px;
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--border);
+  background: var(--elev);
+  color: var(--text);
+  border-radius: var(--r-pill);
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease;
+}
+
+.cv-select:hover {
+  border-color: var(--accent-border);
+  color: var(--accent-hov);
+}
+
+.cv-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* reveal toggle — solid LED indicator, no blink (matches TopologyPage policy) */
+.cv-reveal {
+  height: 26px;
+  padding: 0 var(--sp-2);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-second);
+  border-radius: var(--r-pill);
+  font-size: 11px;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.cv-reveal:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.cv-reveal-led {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.cv-reveal.on {
+  background: var(--warn-bg);
+  border-color: rgba(217, 160, 54, 0.4);
+  color: var(--warn);
+}
+
+.cv-reveal.on .cv-reveal-led {
+  background: var(--warn);
+  box-shadow: 0 0 6px rgba(217, 160, 54, 0.55);
+}
+
+.cv-add {
+  height: 26px;
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--accent-hov);
+  border-radius: var(--r-pill);
+  font-size: 11px;
+  font-weight: 600;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.cv-add:hover {
+  background: rgba(124, 92, 255, 0.22);
+  color: var(--text);
+}
+
+/* ---- error banner ------------------------------------------------------ */
+.cv-error {
+  margin: 0 var(--sp-5) var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--danger-bg);
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  border-radius: var(--r-md);
+  color: var(--danger);
+  font-size: 11.5px;
+  font-family: var(--font-mono);
+  word-break: break-all;
+}
+
+/* ---- inline add form --------------------------------------------------- */
+.cv-add-form {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-5) var(--sp-3);
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border-dim);
+}
+
+.cv-input {
+  height: 26px;
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--border);
+  background: var(--elev);
+  color: var(--text);
+  border-radius: var(--r-md);
+  font-size: 11.5px;
+  font-family: inherit;
+  min-width: 90px;
+}
+
+.cv-input::placeholder {
+  color: var(--text-faint);
+}
+
+.cv-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.cv-add-form .cv-select {
+  height: 26px;
+}
+
+.cv-add-submit {
+  height: 26px;
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--success);
+  background: var(--success-bg);
+  color: var(--success);
+  border-radius: var(--r-md);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.cv-add-submit:hover {
+  background: rgba(63, 182, 139, 0.2);
+}
+
+.cv-add-cancel {
+  height: 26px;
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-second);
+  border-radius: var(--r-md);
+  font-size: 11px;
+}
+
+.cv-add-cancel:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+/* ---- table body -------------------------------------------------------- */
+.cv-body {
+  flex: 1;
+  overflow: auto;
+  padding: 0 var(--sp-3) var(--sp-4);
+}
+
+.cv-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: auto;
+  font-size: 12px;
+}
+
+.cv-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  text-align: left;
+  padding: var(--sp-2) var(--sp-3);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.cv-table thead .cv-th-actions {
+  width: 1%;
+}
+
+.cv-table tbody tr {
+  border-bottom: 1px solid var(--border-dim);
+  transition: background 0.1s ease;
+}
+
+.cv-table tbody tr:hover {
+  background: var(--hover);
+}
+
+.cv-table tbody td {
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--text-second);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.cv-table tbody td.mono {
+  color: var(--text);
+}
+
+/* kind badges — hash=orange, password=green, ticket=violet, key=blue */
+.cv-kind {
+  display: inline-block;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  text-transform: uppercase;
+}
+
+.ck-hash {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.ck-password {
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.ck-ticket {
+  background: var(--accent-bg);
+  color: var(--accent-hov);
+}
+
+.ck-key {
+  background: var(--info-bg);
+  color: var(--info);
+}
+
+.ck-other {
+  background: var(--hover);
+  color: var(--text-muted);
+}
+
+/* secret column — monospace, dim grey when masked */
+.cv-secret {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cv-secret.masked {
+  color: var(--text-faint);
+}
+
+.cv-source {
+  color: var(--text-muted);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cv-ts {
+  color: var(--text-muted);
+}
+
+.cv-actions {
+  text-align: right;
+}
+
+.cv-del {
+  height: 20px;
+  padding: 0 var(--sp-2);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-faint);
+  border-radius: var(--r-md);
+  font-size: 10.5px;
+  transition: color 0.1s ease, background 0.1s ease, border-color 0.1s ease;
+}
+
+/* Keyboard users get the same reveal cue as hover via the row's focus. */
+.cv-del:hover,
+.cv-table tbody tr:focus-within .cv-del {
+  color: var(--danger);
+  background: var(--danger-bg);
+  border-color: rgba(248, 113, 113, 0.3);
+}
+
+.cv-del:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ---- empty / loading --------------------------------------------------- */
+.cv-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: var(--sp-7) var(--sp-5);
+  color: var(--text-second);
+  font-size: 12px;
+  gap: var(--sp-1);
+}
+
+.cv-empty-sub {
+  color: var(--text-muted);
+  font-size: 11px;
+}

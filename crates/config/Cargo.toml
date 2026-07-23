@@ -1,0 +1,30 @@
+[package]
+name = "nyx-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Per-build encrypted implant config — runtime decrypt half of nyx-config-macros::embed!"
+
+[dependencies]
+# chacha20poly1305 decrypt (Aead trait) needs alloc; rand CSPRNG needs std +
+# getrandom. Workspace deps default-features are off (for the no_std protocol);
+# the `alloc` feature is no_std-compatible. rand (OsRng/encrypt, compile-time
+# only) is std-only and optional — the PIC implant turns default-features off.
+chacha20poly1305 = { workspace = true, features = ["alloc"] }
+rand = { workspace = true, features = ["std", "std_rng", "getrandom"], optional = true }
+
+[dev-dependencies]
+nyx-config-macros = { workspace = true }
+
+[features]
+default = ["std"]
+# `std` (default): enables rand-backed `encrypt` (compile-time use by the
+# proc-macro). server / agent-dev / tests consume the crate this way.
+std = ["dep:rand"]
+# `no_std`: drops rand and `encrypt`, leaving only `decrypt` (needs just
+# chacha20poly1305 + alloc). Used by the #![no_std] PIC implant.
+no_std = []
+
+[lib]
+name = "nyx_config"
+path = "src/lib.rs"

@@ -1,0 +1,14 @@
+[package]
+name = "nyx-scripting-rhai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rhai scripting hook for nyx-scripting — pure-Rust operator automation (Aggressor-equivalent)"
+
+[dependencies]
+nyx-scripting = { workspace = true }
+rhai = { version = "1.19", features = ["sync"] }
+
+[lib]
+name = "nyx_scripting_rhai"
+path = "src/lib.rs"

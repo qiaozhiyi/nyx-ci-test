@@ -1,0 +1,63 @@
+[package]
+name = "nyx-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nyx team server: HTTP beacon listener, session registry, task queue, control API"
+
+[dependencies]
+nyx-protocol = { workspace = true }
+nyx-profile = { workspace = true }
+nyx-scripting = { workspace = true }
+nyx-scripting-rhai = { workspace = true }
+# Fingerprint engine (inbound JA3/JA4 computation). pure Rust.
+nyx-transport = { workspace = true }
+# Persistent credential store (SQLite/ACID, server-side only).
+nyx-store = { workspace = true }
+nyx-mutate = { workspace = true }
+# Shared REST view types — single source of truth for /api/* JSON shapes.
+nyx-rest = { workspace = true }
+# Named-operator auth (argon2) + audit-log hash-chain.
+argon2 = "0.5"
+sha2 = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+dashmap = { workspace = true }
+hex = { workspace = true }
+base64 = "0.22"
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
+# Constant-time comparison for secret/token equality checks (HIGH-1).
+# `subtle` is already a transitive dep of chacha20poly1305; listing it directly
+# only pins the API surface we use (ConstantTimeEq).
+subtle = "2"
+# OsRng for the auto-generated control-API token (P0-2). `getrandom` enables
+# `rand::rngs::OsRng` on top of the workspace's default-features=false base.
+rand = { workspace = true, features = ["getrandom"] }
+# ChaCha20-Poly1305 for implant config encryption in implant_gen.rs.
+chacha20poly1305 = { workspace = true, features = ["alloc", "std"] }
+
+[dev-dependencies]
+nyx-agent-dev = { workspace = true }
+nyx-scripting = { workspace = true }
+ureq = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+
+[[bin]]
+name = "nyx-server"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"

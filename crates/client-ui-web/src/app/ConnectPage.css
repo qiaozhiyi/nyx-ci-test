@@ -1,0 +1,120 @@
+.connect {
+  height: 100%;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-7);
+  background:
+    radial-gradient(1200px 600px at 50% -10%, rgba(124, 92, 255, 0.08), transparent 60%),
+    var(--bg);
+}
+
+.connect-card {
+  width: 360px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-xl);
+  padding: var(--sp-7);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-2);
+}
+
+.brand-logo {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--r-md);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 20px;
+  color: #fff;
+  background: linear-gradient(135deg, var(--accent), #4c3bbf);
+  box-shadow: 0 6px 20px rgba(124, 92, 255, 0.35);
+}
+
+.brand-text h1 {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text);
+}
+
+.brand-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.field-label {
+  font-size: 11px;
+  color: var(--text-second);
+  letter-spacing: 0.02em;
+}
+
+.field-input {
+  height: 34px;
+  padding: 0 var(--sp-3);
+  background: var(--elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--text);
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color 0.12s ease;
+}
+
+.field-input::placeholder {
+  color: var(--text-faint);
+}
+
+.field-input:focus {
+  border-color: var(--accent-border);
+}
+
+.connect-error {
+  font-size: 12px;
+  color: var(--danger);
+  background: var(--danger-bg);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+  border-radius: var(--r-md);
+  padding: var(--sp-2) var(--sp-3);
+  line-height: 1.4;
+}
+
+.connect-btn {
+  height: 36px;
+  border: none;
+  border-radius: var(--r-md);
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  transition: background 0.12s ease;
+}
+
+.connect-btn:hover:not(:disabled) {
+  background: var(--accent-hov);
+}
+
+.connect-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

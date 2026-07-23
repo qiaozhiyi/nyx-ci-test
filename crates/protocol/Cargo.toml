@@ -1,0 +1,34 @@
+[package]
+name = "nyx-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nyx wire protocol: crypto, framing, task/response messages (shared by server + implants)"
+
+[dependencies]
+# default-features off (set in workspace); we re-enable per-crate alloc + the
+# std/no_std-appropriate bits below via features.
+x25519-dalek = { workspace = true, features = ["alloc", "static_secrets", "getrandom", "zeroize"] }
+chacha20poly1305 = { workspace = true, features = ["alloc"] }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+# rand is no_std-capable; rand_core's OsRng provides entropy (getrandom backend).
+rand = { workspace = true }
+rand_core = { workspace = true }
+# thiserror's derive needs std (it implements std::error::Error). Under no_std we
+# hand-roll the trait impl; under `std` we use the derive.
+thiserror = { workspace = true, optional = true }
+zeroize = "1.9.0"
+
+[features]
+default = ["std"]
+# Enable for the std users (server, agent-dev, client). The PIC implant builds
+# with --no-default-features.
+std = [
+    "dep:thiserror",
+    "rand/std",
+    "rand/std_rng",
+    "chacha20poly1305/std",
+    "hkdf/std",
+    "sha2/std",
+]

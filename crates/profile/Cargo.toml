@@ -1,0 +1,31 @@
+[package]
+name = "nyx-profile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nyx Malleable C2 profile parser, data-transform engine, and c2lint (CS-compatible grammar)"
+
+[dependencies]
+# Optional: only the std-only layers (parser/lexer/lint/envelope) use thiserror.
+# Kept OUT of the `no_std` build (thiserror depends on std's core, which
+# conflicts with the implant's -Z build-std core → duplicate lang item).
+thiserror = { workspace = true, optional = true }
+
+[features]
+default = ["std"]
+# Include the std-only layers (parser + lexer + lint + envelope) + thiserror.
+# On by default for the team server, agent-dev, and the `c2lint` binary.
+std = ["dep:thiserror"]
+# Opt OUT of std: the crate compiles as `#![no_std]` and exposes ONLY the pure
+# byte-transform engine (`transform`), which is `no_std`+`alloc`-clean. The PIC
+# implant uses `default-features = false, features = ["no_std"]` so neither the
+# std layers nor thiserror are pulled into the no_std build.
+no_std = []
+
+[lib]
+name = "nyx_profile"
+path = "src/lib.rs"
+
+[[bin]]
+name = "c2lint"
+path = "src/bin/c2lint.rs"

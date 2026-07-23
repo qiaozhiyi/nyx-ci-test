@@ -1,0 +1,30 @@
+# Standalone tool (own workspace) — downloads the target's ntoskrnl.pdb from
+# the MS symbol server, parses out EPROCESS + ETW-TI offsets, and emits an
+# offsets.toml for build.rs to bake into the implant. Operator-side, runs on
+# the team server (NOT on the target).
+[workspace]
+
+[package]
+name = "nyx-offset-resolver"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "Downloads target ntoskrnl.pdb from MS symbol server, resolves kernel offsets, emits offsets.toml."
+
+[[bin]]
+name = "nyx-offset-resolver"
+path = "src/main.rs"
+
+[dependencies]
+# PDB parser (pure Rust, no Windows deps).
+pdb = "0.8"
+# HTTP client for the symbol-server download.
+ureq = { version = "2", features = ["json"] }
+# Hash the PE to build the symbol-server path (Age + GUID).
+sha2 = "0.10"
+# PE parser — extracts the PDB GUID/age from a live ntoskrnl.exe's debug
+# directory, so we don't depend on PowerShell to do PE parsing (PS 5.1's
+# NativeCommandError kept eating the offset-resolver's stderr in CI).
+goblin = "0.9"
+# CLI.
+anyhow = "1"

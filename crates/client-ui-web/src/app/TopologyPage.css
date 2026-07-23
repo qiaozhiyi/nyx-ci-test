@@ -1,0 +1,169 @@
+/**
+ * TopologyPage layout — full-screen canvas with floating overlays.
+ * No @keyframes anywhere: animation is driven by Three.js requestAnimationFrame
+ * inside topology-scene.ts. Toggles use a solid LED indicator (no blink).
+ */
+.topo-root {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #040507;
+  color: var(--text);
+}
+
+/* Radial gradient backdrop — the canvas itself is transparent so this shows through. */
+.topo-canvas-bg {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse at center, #0a0f1a 0%, #040507 75%);
+  z-index: 0;
+}
+
+.topo-canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  cursor: grab;
+}
+.topo-canvas:active { cursor: grabbing; }
+
+/* --- Top floating toolbar ------------------------------------------------- */
+.topo-toolbar {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  right: 14px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2) var(--sp-4);
+  /* brand + 6 toggles overflow on narrow windows — wrap instead of clipping */
+  flex-wrap: wrap;
+  pointer-events: none;
+}
+.topo-toolbar > * { pointer-events: auto; }
+
+.topo-toolbar-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 8px 12px;
+  background: rgba(10, 12, 16, 0.72);
+  backdrop-filter: blur(12px) saturate(120%);
+  -webkit-backdrop-filter: blur(12px) saturate(120%);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  color: var(--text);
+}
+.topo-toolbar-brand-mark { color: var(--accent); font-size: 14px; }
+.topo-toolbar-brand-text { font-weight: 600; letter-spacing: 0.02em; }
+.topo-toolbar-tag {
+  margin-left: var(--sp-2);
+  padding: 1px 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--warn);
+  background: var(--warn-bg);
+  border-radius: var(--r-pill);
+}
+
+.topo-toolbar-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  padding: 6px;
+  background: rgba(10, 12, 16, 0.72);
+  backdrop-filter: blur(12px) saturate(120%);
+  -webkit-backdrop-filter: blur(12px) saturate(120%);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+}
+
+.topo-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  color: var(--text-second);
+  font-size: 12px;
+  font-weight: 500;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.topo-toggle:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.topo-toggle.is-on {
+  color: var(--text);
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+}
+/* Solid LED indicator — deliberately NOT animated. */
+.topo-toggle-led {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+.topo-toggle.is-on .topo-toggle-led {
+  background: var(--accent);
+  box-shadow: 0 0 6px rgba(124, 92, 255, 0.8);
+}
+.topo-toggle-label {
+  line-height: 1;
+  white-space: nowrap;
+}
+
+/* --- WebGL failure fallback ----------------------------------------------- */
+.topo-fallback {
+  position: absolute;
+  inset: 0;
+  z-index: 5; /* above the (empty) canvas, below the floating overlays */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3);
+  padding: var(--sp-5);
+  text-align: center;
+}
+.topo-fallback-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.topo-fallback-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  max-width: 320px;
+  color: var(--text-muted);
+}
+
+/* --- Hint footer ---------------------------------------------------------- */
+.topo-hint {
+  position: absolute;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  padding: 4px 10px;
+  background: rgba(10, 12, 16, 0.6);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--r-pill);
+  color: var(--text-muted);
+  font-size: 11px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+/* Narrow windows: the centered hint collides with the bottom-left legend and
+   bottom-right stats — drop it there. */
+@media (max-width: 760px) {
+  .topo-hint { display: none; }
+}

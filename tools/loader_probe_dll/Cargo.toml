@@ -1,0 +1,16 @@
+[package]
+name = "loader-probe-dll"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "Host-side harness DLL that injects + invokes the reflective PIC blob. Standalone crate (Windows-only, not in workspace)."
+
+# Standalone (not in root workspace) — Windows host-side tool, not part of any
+# cross-compile matrix. Built on the Windows VPS only.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+name = "loader_probe"
+
+[dependencies]

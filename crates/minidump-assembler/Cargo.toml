@@ -1,0 +1,25 @@
+# Standalone library (own workspace) — wraps raw LSASS user-mode memory into a
+# minimal Windows minidump file that mimikatz / yokatool / rust-minidump can
+# parse. Pure core/alloc (no_std-compatible), zero dependencies by design, so
+# it can be consumed by both the operator-kernel-cli (std) and a future no_std
+# caller.
+[workspace]
+
+[package]
+name = "nyx-minidump-assembler"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "Assembles a minimal Windows minidump (.dmp) envelope around raw LSASS memory for mimikatz."
+
+[lib]
+name = "nyx_minidump_assembler"
+path = "src/lib.rs"
+
+[dependencies]
+# Intentionally zero — pure core/alloc byte serialization.
+
+[dev-dependencies]
+# Dev-only: parse the assembled output to verify field correctness in tests.
+# Kept out of the runtime dep tree so the crate stays no_std-friendly.
+minidump = "0.22"

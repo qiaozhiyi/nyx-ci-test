@@ -1,0 +1,121 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/parse",
+    "crates/rest",
+    "crates/profile",
+    "crates/server",
+    "crates/store",
+    "crates/agent-dev",
+    "crates/scripting",
+    "crates/evasion",
+    "crates/config",
+    "crates/config-macros",
+    "crates/coff",
+    "crates/transport",
+    "crates/bof-runner",
+    "crates/client-ui-web/src-tauri",
+    "crates/scripting-rhai",
+    "crates/nyx-loader",
+    "crates/nyx-mutate",
+]
+# NOTE: `crates/implant-win` is intentionally NOT a workspace member. It is
+# `#![no_std]` + `#![no_main]` + targets `x86_64-pc-windows-gnu` on nightly, and
+# the PIC extraction step needs the Windows toolchain. Building/checking the
+# workspace with `cargo build --workspace` must stay green on the macOS dev host,
+# so implant-win is built standalone:
+#   cargo +nightly check -p nyx-implant-win --target x86_64-pc-windows-gnu
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.80"
+publish = false
+license = "Apache-2.0 OR MIT"
+
+[workspace.dependencies]
+nyx-protocol = { path = "crates/protocol" }
+nyx-parse = { path = "crates/parse" }
+nyx-rest = { path = "crates/rest" }
+nyx-store = { path = "crates/store" }
+nyx-profile = { path = "crates/profile" }
+nyx-agent-dev = { path = "crates/agent-dev" }
+nyx-scripting = { path = "crates/scripting" }
+nyx-evasion = { path = "crates/evasion" }
+nyx-config = { path = "crates/config" }
+nyx-config-macros = { path = "crates/config-macros" }
+nyx-coff = { path = "crates/coff" }
+nyx-transport = { path = "crates/transport" }
+nyx-bof-runner = { path = "crates/bof-runner" }
+nyx-scripting-rhai = { path = "crates/scripting-rhai" }
+nyx-loader = { path = "crates/nyx-loader" }
+nyx-mutate = { path = "crates/nyx-mutate" }
+# proc-macro toolchain (compile-time config embedding)
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+# crypto — all no_std-capable so the same code can ship in the PIC implant later.
+# default-features off across the board; protocol's `std` feature re-enables what
+# the std users need, the implant builds without it.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+chacha20poly1305 = { version = "0.10", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+rand = { version = "0.8", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+# server / client
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+dashmap = "6"
+hex = "0.4"
+rusqlite = { version = "0.31", features = ["bundled"] }
+ureq = { version = "2", features = ["json"] }
+# TLS — rustls with the pure-Rust `ring` crypto provider (no C deps). Used by
+# the team server's optional HTTPS listener (NYX_TLS). `rcgen` generates a
+# self-signed cert for dev; `rustls-pemfile` parses operator-supplied PEM.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+rcgen = "0.13"
+# hyper 1.x server plumbing (axum 0.7 is hyper-1 based). `auto::Builder` serves
+# the TLS stream as either http1 or http2 transparently.
+hyper = { version = "1", features = ["http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+anyhow = "1"
+# PE parser — used by nyx-loader (reflective PE mapping) and offset-resolver
+# (PDB GUID extraction). `default-features = false` + `pe64` keeps it lean;
+# re-enable `std` per-crate where needed.
+goblin = { version = "0.9", default-features = false, features = ["pe64", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+
+# Implant builds favour tiny, stripped binaries.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# The Makepad GUI client must NOT use the implant release profile. The implant
+# settings above (opt-level="z", lto=true, codegen-units=1, panic="abort") cause
+# a SIGSEGV during Makepad's GPU/Metal init on macOS 26 — the aggressive size
+# optimization + LTO mis-compiles something in the wgpu/Metal binding path,
+# producing a null-deref (EXC_BAD_ACCESS @0x68) on window creation. This is a
+# normal, full-debug-info release profile for the desktop app. Build with:
+#   cargo build --profile gui -p nyx-client-ui
+[profile.gui]
+inherits = "release"
+opt-level = 3
+lto = false
+codegen-units = 16
+strip = false
+panic = "unwind"
+debug = true
+

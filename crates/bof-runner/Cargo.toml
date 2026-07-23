@@ -1,0 +1,13 @@
+[package]
+name = "nyx-bof-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BOF execution layer: load + relocate + run a Windows COFF BOF via nyx-coff (Windows / Wine only)"
+
+[dependencies]
+nyx-coff = { workspace = true }
+
+[lib]
+name = "nyx_bof_runner"
+path = "src/lib.rs"

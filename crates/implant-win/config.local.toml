@@ -1,0 +1,6 @@
+server_host = "127.0.0.1"
+server_port = 8443
+beacon_uri  = "/beacon"
+sleep_seconds = 5
+jitter_pct  = 30
+use_tls     = false

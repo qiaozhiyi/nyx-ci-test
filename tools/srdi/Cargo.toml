@@ -1,0 +1,31 @@
+[package]
+name = "nyx-srdi"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Host-side PIC extractor: turns the nyx-implant-win cdylib into position-independent shellcode (agent.bin). Standalone (NOT a workspace member)."
+
+# Standalone so the stable workspace stays green; build directly:
+#   cargo run --release -- <path-to-nyx_implant_win.dll> -o agent.bin
+#
+# NOTE: nyx-loader is a member of the root workspace (pentest/Cargo.toml). To
+# resolve its `workspace = true` deps without pulling tools/srdi into the root
+# workspace, we mirror the relevant [workspace.dependencies] here so Cargo
+# resolves them from this standalone workspace.
+[workspace]
+
+[workspace.dependencies]
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+chacha20poly1305 = { version = "0.10", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+rand = { version = "0.8", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+thiserror = "1"
+
+[dependencies]
+nyx-loader = { path = "../../crates/nyx-loader" }
+
+[[bin]]
+name = "nyx-srdi"
+path = "src/main.rs"

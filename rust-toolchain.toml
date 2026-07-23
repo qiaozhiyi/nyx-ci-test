@@ -1,0 +1,5 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# The Windows PIC implant (crates/implant-win) will pin a separate nightly
+# toolchain via its own build setup; the rest of the workspace stays on stable.

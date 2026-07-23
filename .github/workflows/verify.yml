@@ -1,0 +1,91 @@
+name: verify
+
+# One-shot verification for the NY working-tree snapshot (AH-audit fixes).
+# Public-repo-hosted Windows runners (NY's self-hosted win-17763 is Session 0
+# and its hosted minutes are billed 2x). Repo is wiped after the run.
+
+on: [push]
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  # Avoid MSVC PDB 4GB limit on debug builds (same as NY's ci.yml).
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  # ---- Gate 1: workspace tests on real Windows (server/store/transport changes) ----
+  workspace-test:
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo test (workspace, excl. client-ui)
+        shell: cmd
+        run: cargo test --workspace --exclude nyx-client-ui
+
+  # ---- Gate 2: implant-win check + clippy + release build (gnu target, nightly) ----
+  implant-build:
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: nightly toolchain + gnu target
+        shell: cmd
+        run: |
+          rustup toolchain install nightly --component clippy --no-self-update
+          rustup target add x86_64-pc-windows-gnu --toolchain nightly
+      - name: ensure mingw linker
+        shell: cmd
+        run: where x86_64-w64-mingw32-gcc || choco install mingw -y
+      - name: implant check (selftest feature)
+        shell: cmd
+        run: cargo +nightly check --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-gnu --features selftest
+      - name: implant clippy
+        shell: cmd
+        run: cargo +nightly clippy --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-gnu --features selftest
+      - name: implant release build
+        shell: cmd
+        run: cargo +nightly build --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-gnu --release --features selftest
+
+  # ---- Gate 3: rundll32 selftest on a NON-Session-0 hosted runner ----
+  # NY's self-hosted win-17763 runs as a service (Session 0) where the
+  # selftest gate TIMEOUTs since v0.3.0. Hosted runners execute in the
+  # interactive session — this run tests that hypothesis directly.
+  implant-selftest:
+    runs-on: windows-2025
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: nightly toolchain + gnu target
+        shell: cmd
+        run: |
+          rustup toolchain install nightly --no-self-update
+          rustup target add x86_64-pc-windows-gnu --toolchain nightly
+      - name: ensure mingw linker
+        shell: cmd
+        run: where x86_64-w64-mingw32-gcc || choco install mingw -y
+      - name: build selftest DLL (debug)
+        shell: cmd
+        run: cargo +nightly build --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-gnu --features selftest
+      - name: run all selftests via rundll32
+        shell: powershell
+        env:
+          NYX_DLL: crates\implant-win\target\x86_64-pc-windows-gnu\debug\nyx_implant_win.dll
+          NYX_OUT: selftest_results.csv
+          NYX_EXPORTS: exports.txt
+        run: |
+          New-Item -ItemType File -Force -Path $env:NYX_EXPORTS | Out-Null
+          powershell -ExecutionPolicy Bypass -File scripts/win_selftest_all.ps1 -Validate -Timeout 20
+          Write-Output "---- selftest_results.csv ----"
+          Get-Content $env:NYX_OUT
+      - name: upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-results
+          path: selftest_results.csv
+          if-no-files-found: ignore

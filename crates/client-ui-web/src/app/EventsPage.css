@@ -1,0 +1,374 @@
+/**
+ * EventsPage — audit log / event stream panel.
+ *
+ * Layout: a full-height column with a sticky toolbar on top and a scrolling
+ * vertical timeline below. Each audit record is rendered as a single row in
+ * the timeline, anchored on the left by its timestamp. The aesthetic borrows
+ * from `git log`/activity-feed patterns: a faint vertical rail runs down the
+ * left gutter and each row has a node marker so the eye reads top-to-bottom
+ * as a stream of events (newest at the top, since records are reversed).
+ *
+ * Colors reference styles/tokens.css vars; the only raw literals are rgba
+ * alpha variants of token colors (soft borders and glows).
+ */
+
+.events-root {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  min-width: 0;
+}
+
+/* --- Toolbar --------------------------------------------------------------- */
+
+.audit-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-5) var(--sp-3);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.audit-toolbar-left {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.audit-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.audit-count {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.audit-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.audit-btn {
+  height: 26px;
+  padding: 0 var(--sp-3);
+  background: var(--elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--text-second);
+  font-size: 12px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.audit-btn:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+  border-color: var(--accent-border);
+}
+
+.audit-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.audit-btn.primary {
+  color: var(--accent-hov);
+  border-color: var(--accent-border);
+}
+
+/* Select + operator filter inputs share a compact control style. */
+.audit-select,
+.audit-input {
+  height: 26px;
+  padding: 0 var(--sp-3);
+  background: var(--elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.12s ease;
+}
+
+.audit-select { padding-right: var(--sp-5); }
+.audit-input { width: 130px; }
+.audit-input::placeholder { color: var(--text-faint); }
+.audit-select:focus,
+.audit-input:focus { border-color: var(--accent-border); }
+
+/* Hash-chain verify status pill — appears next to the toolbar after a verify run. */
+.audit-verify {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-pill);
+  font-size: 11.5px;
+  font-weight: 500;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.audit-verify.ok {
+  color: var(--success);
+  background: var(--success-bg);
+  border-color: rgba(63, 182, 139, 0.3);
+}
+.audit-verify.broken {
+  color: var(--danger);
+  background: var(--danger-bg);
+  border-color: rgba(248, 113, 113, 0.3);
+}
+.audit-verify-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* --- Timeline body --------------------------------------------------------- */
+
+.audit-body {
+  flex: 1;
+  overflow-y: auto;
+  position: relative;
+}
+
+/* Vertical rail running down the left gutter of the timeline. */
+.audit-timeline {
+  position: relative;
+  padding: var(--sp-3) var(--sp-5) var(--sp-5) var(--sp-5);
+}
+
+.audit-timeline::before {
+  content: '';
+  position: absolute;
+  top: var(--sp-4);
+  bottom: var(--sp-4);
+  /* Gutter: padding-left 16px, then center the marker column (12px wide). */
+  left: calc(var(--sp-5) + 6px);
+  width: 1px;
+  background: var(--border);
+}
+
+/* Each event row. Time column is wide enough for an MM-DD prefix on older
+   records (see formatAuditTime in the TSX). */
+.audit-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 96px 1fr auto;
+  align-items: start;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3) var(--sp-2) var(--sp-4);
+  margin-left: 12px; /* leaves room for the marker + rail */
+  border-radius: var(--r-md);
+  transition: background 0.1s ease;
+}
+
+.audit-row:hover {
+  background: var(--hover);
+}
+
+/* Node marker sitting on the rail at the row's vertical center. */
+.audit-row::before {
+  content: '';
+  position: absolute;
+  left: -6px;
+  top: 12px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--panel);
+  border: 2px solid var(--text-faint);
+  z-index: 1;
+}
+
+/* Color the marker per action family so the rail reads as a colored stream. */
+.audit-row.is-task::before { border-color: var(--accent); }
+.audit-row.is-cred_add::before { border-color: var(--warn); }
+.audit-row.is-cred_delete::before { border-color: var(--success); }
+.audit-row.is-implant_generated::before { border-color: var(--info); }
+.audit-row.is-implant_revoked::before { border-color: var(--danger); }
+
+/* Left column: timestamp. */
+.audit-time {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  padding-top: 2px;
+  white-space: nowrap;
+}
+
+/* Middle column: badge + operator/target line + optional detail. */
+.audit-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.audit-line {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+/* Action badge — small rounded pill, color-coded per action family. */
+.audit-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 17px;
+  padding: 0 7px;
+  border-radius: var(--r-pill);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+.badge-task {
+  color: var(--accent-hov);
+  background: var(--accent-bg);
+}
+.badge-cred_add {
+  color: var(--warn);
+  background: var(--warn-bg);
+}
+.badge-cred_delete {
+  color: var(--success);
+  background: var(--success-bg);
+}
+.badge-implant_generated {
+  color: var(--info);
+  background: var(--info-bg);
+}
+.badge-implant_revoked {
+  color: var(--danger);
+  background: var(--danger-bg);
+}
+
+.audit-operator {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.audit-operator.is-system {
+  color: var(--text-muted);
+  font-style: italic;
+  font-weight: 500;
+}
+
+.audit-arrow {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.audit-target {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-second);
+  word-break: break-all;
+}
+
+/* Detail expansion block — indented under the main line, secondary color. */
+.audit-detail {
+  margin-top: 2px;
+  padding-left: var(--sp-4);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-second);
+  line-height: 1.45;
+  border-left: 1px solid var(--border-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: 100%;
+}
+
+/* Right column: seq + hash. */
+.audit-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  padding-top: 2px;
+  flex-shrink: 0;
+}
+
+.audit-seq {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.audit-hash {
+  position: relative;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  cursor: help;
+}
+
+/* Full hash revealed on hover via a native title tooltip, plus a subtle
+   underline cue that there's more to see. */
+.audit-hash:hover {
+  color: var(--text-second);
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+/* --- States ---------------------------------------------------------------- */
+
+.audit-status {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-7) var(--sp-5);
+  color: var(--text-second);
+  font-size: 12.5px;
+}
+
+.audit-error {
+  color: var(--danger);
+  background: var(--danger-bg);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+  border-radius: var(--r-md);
+  padding: var(--sp-3) var(--sp-5);
+  max-width: 480px;
+  text-align: center;
+  line-height: 1.45;
+}
+
+.audit-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: var(--sp-1);
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.audit-empty-sub {
+  color: var(--text-faint);
+  font-size: 11px;
+}

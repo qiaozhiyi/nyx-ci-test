@@ -1,0 +1,46 @@
+[package]
+name = "nyx-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nyx transport fingerprint engine: TLS ClientHello parse + JA3/JA4 + HTTP/2 (Akamai) fingerprints + fingerprint emission seam"
+
+[dependencies]
+md-5 = "0.10"
+sha2 = { workspace = true }
+hmac = { version = "0.12", default-features = false }
+hex = { workspace = true }
+ureq = { workspace = true }
+rand = { workspace = true, features = ["std", "std_rng"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+tracing = { workspace = true }
+# --- impersonation backend (optional) ---
+# `wreq` is the active successor to the deprecated `rquest`/yanked
+# `reqwest-impersonate` lineage (same author: 0x676e67). It drives BoringSSL
+# directly and gives field-accurate TLS ClientHello + HTTP/2 SETTINGS presets.
+# `wreq-util` ships the per-browser-version presets (Chrome137 / Firefox139 /
+# Safari18_5 / Edge134 as of 2026-07). Gated behind `impersonation` because
+# `boring-sys2` needs cmake + go + clang, which we don't want to require for a
+# default dev build.
+wreq = { version = "5.3", default-features = false, features = ["json"], optional = true }
+wreq-util = { version = "2.2", optional = true }
+
+[features]
+default = []
+# Enable the BoringSSL-backed wreq client for real out-bound JA3 control.
+# Pulls in `wreq` + `wreq-util` (and transitively `boring-sys2`, which needs
+# cmake, go, and a C compiler on the host).
+impersonation = ["dep:wreq", "dep:wreq-util"]
+
+[dev-dependencies]
+md-5 = "0.10"
+# The `validate_ja3_live_*` ignored test is async and needs a runtime. tokio is
+# already a workspace dependency; pull it in single-threaded for tests.
+tokio = { workspace = true }
+
+[lib]
+name = "nyx_transport"
+path = "src/lib.rs"
