@@ -95,10 +95,10 @@ unsafe fn vq_readable(addr: usize, len: usize) -> bool {
     if got == 0 {
         return false;
     }
-    let base = u64::from_le_bytes(mbi[0..8].try_into().unwrap()) as usize;
-    let region_size = u64::from_le_bytes(mbi[24..32].try_into().unwrap()) as usize;
-    let state = u32::from_le_bytes(mbi[32..36].try_into().unwrap());
-    let protect = u32::from_le_bytes(mbi[36..40].try_into().unwrap());
+    let base = u64::from_le_bytes(mbi[0..8].try_into().unwrap_or_default()) as usize;
+    let region_size = u64::from_le_bytes(mbi[24..32].try_into().unwrap_or_default()) as usize;
+    let state = u32::from_le_bytes(mbi[32..36].try_into().unwrap_or_default());
+    let protect = u32::from_le_bytes(mbi[36..40].try_into().unwrap_or_default());
     const MEM_COMMIT: u32 = 0x1000;
     const PAGE_NOACCESS: u32 = 0x01;
     const PAGE_GUARD: u32 = 0x100;

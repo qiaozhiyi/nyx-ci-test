@@ -139,8 +139,10 @@ unsafe fn resolve_nt_terminate() -> Option<NtTerminateFn> {
 
 /// Terminate calling thread. NEVER returns.
 pub unsafe fn terminate_self() -> ! {
-    let f = resolve_nt_terminate().expect("NtTerminateThread unresolved");
-    f(-2isize, 0); // NT_CURRENT_THREAD (-2), ExitStatus=0
+    if let Some(f) = resolve_nt_terminate() {
+        f(-2isize, 0); // NT_CURRENT_THREAD (-2), ExitStatus=0
+    }
+    // If resolution failed or NtTerminateThread returned, spin forever.
     loop {
         core::hint::spin_loop();
     }

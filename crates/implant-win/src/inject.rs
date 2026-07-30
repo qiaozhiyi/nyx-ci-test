@@ -708,7 +708,11 @@ pub unsafe fn threadless_inject(
     let mut prev_count: u32 = 0;
     let susp_status =
         unsafe { crate::syscalls::nt_suspend_thread(rt, main_thread as usize, &mut prev_count) };
-    if susp_status.is_none() || susp_status.unwrap() < 0 {
+    let susp_status = match susp_status {
+        Some(s) => s,
+        None => return Err("NtSuspendThread failed"),
+    };
+    if susp_status < 0 {
         return Err("NtSuspendThread failed");
     }
 
@@ -723,7 +727,15 @@ pub unsafe fn threadless_inject(
             ctx.0.as_mut_ptr() as usize,
         )
     };
-    if get_status.is_none() || get_status.unwrap() < 0 {
+    let get_status = match get_status {
+        Some(s) => s,
+        None => {
+            let mut dummy: u32 = 0;
+            unsafe { crate::syscalls::nt_resume_thread(rt, main_thread as usize, &mut dummy) };
+            return Err("NtGetContextThread failed");
+        }
+    };
+    if get_status < 0 {
         let mut dummy: u32 = 0;
         unsafe { crate::syscalls::nt_resume_thread(rt, main_thread as usize, &mut dummy) };
         return Err("NtGetContextThread failed");
@@ -758,7 +770,15 @@ pub unsafe fn threadless_inject(
             ctx.0.as_mut_ptr() as usize,
         )
     };
-    if set_status.is_none() || set_status.unwrap() < 0 {
+    let set_status = match set_status {
+        Some(s) => s,
+        None => {
+            let mut dummy: u32 = 0;
+            unsafe { crate::syscalls::nt_resume_thread(rt, main_thread as usize, &mut dummy) };
+            return Err("NtSetContextThread failed");
+        }
+    };
+    if set_status < 0 {
         let mut dummy: u32 = 0;
         unsafe { crate::syscalls::nt_resume_thread(rt, main_thread as usize, &mut dummy) };
         return Err("NtSetContextThread failed");
