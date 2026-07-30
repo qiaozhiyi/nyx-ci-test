@@ -160,8 +160,8 @@ pub const fn context_full_flags() -> u32 {
 // way the evasionsdk crate does). Building the DLL proves the layout matches.
 // ---------------------------------------------------------------------------
 const _: () = assert!(
-    core::mem::size_of::<Context>() == 1232,
-    "CONTEXT must be 1232 bytes"
+    core::mem::size_of::<Context>() == 0x4D0,
+    "CONTEXT must be 0x4D0 (1232) bytes"
 );
 const _: () = assert!(
     core::mem::align_of::<Context>() == 16,
@@ -169,7 +169,6 @@ const _: () = assert!(
 );
 // RIP/RSP/ContextFlags offsets are hard-coded in the accessors above; the size
 // assert proves the buffer backing those offsets is correct.
-const _: () = assert!(1232 == 0x4D0, "1232 == 0x4D0");
 
 /// Static reusable buffer for the spoofed CONTEXT. Avoids a per-sleep
 /// `Box<[u8; 1232]>` allocation that creates bump-allocator pressure during

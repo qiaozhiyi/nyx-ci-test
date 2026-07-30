@@ -26,6 +26,16 @@ use std::fs;
 use std::path::Path;
 
 fn main() {
+    // Declare the crate's custom cfg flags so recent nightlies (which enable
+    // check-cfg by default) don't reject them as `unexpected cfg condition
+    // name`. None of these is set in a default build — they are opt-in build
+    // flags (e.g. -Z unstable-options builds pass --cfg nyx_diag on the dev
+    // box) or read at runtime via `cfg!(...)`. Declaring them here marks them
+    // as known-to-be-absent rather than unknown names.
+    println!("cargo::rustc-check-cfg=cfg(nyx_diag)");
+    println!("cargo::rustc-check-cfg=cfg(nyx_skip_sandbox)");
+    println!("cargo::rustc-check-cfg=cfg(nyx_fs_allow_protected)");
+
     println!("cargo:rerun-if-env-changed=NYX_SERVER_PUB");
     println!("cargo:rerun-if-env-changed=NYX_CONFIG");
     println!("cargo:rerun-if-env-changed=NYX_CONFIG_KEY");
