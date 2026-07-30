@@ -140,36 +140,6 @@ impl LlmApiTransport {
         Ok(text.to_string())
     }
 
-    /// Extract a hex block from Claude's response text. Finds the longest
-    /// contiguous run of hex digits (at least 8 chars). Non-hex characters
-    /// act as delimiters — only consecutive hex digits form a valid block.
-    fn extract_hex(text: &str) -> Option<String> {
-        let mut longest: Option<&str> = None;
-        let mut run_start: Option<usize> = None;
-
-        for (i, c) in text.char_indices() {
-            if c.is_ascii_hexdigit() {
-                if run_start.is_none() {
-                    run_start = Some(i);
-                }
-            } else if let Some(s) = run_start.take() {
-                let run = &text[s..i];
-                if run.len() >= 8 && longest.is_none_or(|l| run.len() > l.len()) {
-                    longest = Some(run);
-                }
-            }
-        }
-        // Flush any run that extends to the end of the text.
-        if let Some(s) = run_start {
-            let run = &text[s..];
-            if run.len() >= 8 && longest.is_none_or(|l| run.len() > l.len()) {
-                longest = Some(run);
-            }
-        }
-
-        longest.map(|s| s.to_string())
-    }
-
     /// Enforce the free-tier rate limit (5 RPM = 15 s between frames).
     fn enforce_rate_limit(&mut self) {
         if let Some(last) = self.last_send {
@@ -221,7 +191,7 @@ impl Transport for LlmApiTransport {
 
         // Extract the hex block from Claude's response. A missing hex run is
         // a transient "no frame yet" — Claude just didn't echo one.
-        let hex_ct = match Self::extract_hex(&text) {
+        let hex_ct = match crate::extract_hex(&text) {
             Some(h) => h,
             None => return Err(TransportError::Transient("no hex data in LLM response")),
         };
@@ -318,7 +288,7 @@ mod tests {
         let hex_ct = sealed_hex(&transport, frame);
 
         // Recv side: extract_hex → hex::decode → open_frame.
-        let extracted = LlmApiTransport::extract_hex(&format!("analysis: {hex_ct}"))
+        let extracted = crate::extract_hex(&format!("analysis: {hex_ct}"))
             .expect("sealed hex is a valid hex run");
         let blob = hex::decode(&extracted).expect("hex decodes");
         assert_eq!(open_frame(&transport.channel_secret, &blob).unwrap(), frame);
@@ -371,7 +341,7 @@ mod tests {
         // "Here's" has 'e' as hex, "analysis:" has 'a' — these should NOT be
         // included because they're not contiguous with the real hex block.
         let text = "Here's the analysis: deadbeefc0ffee Some extra commentary.";
-        let hex = LlmApiTransport::extract_hex(text).unwrap();
+        let hex = crate::extract_hex(text).unwrap();
         assert_eq!(hex, "deadbeefc0ffee");
     }
 
@@ -379,7 +349,7 @@ mod tests {
     fn extract_hex_rejects_short() {
         // Only 3 contiguous hex chars → rejected.
         let text = "only abc def ghijklm nope";
-        assert!(LlmApiTransport::extract_hex(text).is_none());
+        assert!(crate::extract_hex(text).is_none());
     }
 
     #[test]
@@ -387,14 +357,14 @@ mod tests {
         // "Here:" has 'e', then space, then "ab12cd34ef56" — only the contiguous
         // block after the space should match.
         let text = "Here: ab12cd34ef56 -- end.";
-        let hex = LlmApiTransport::extract_hex(text).unwrap();
+        let hex = crate::extract_hex(text).unwrap();
         assert_eq!(hex, "ab12cd34ef56");
     }
 
     #[test]
     fn extract_hex_longest_run_wins() {
         let text = "abc123 deadbeefc0ffee12345 xyz";
-        let hex = LlmApiTransport::extract_hex(text).unwrap();
+        let hex = crate::extract_hex(text).unwrap();
         assert_eq!(hex, "deadbeefc0ffee12345"); // 20 chars > 6 chars
     }
 

@@ -44,6 +44,42 @@
 // fingerprint module's feature-gating doc; the bullets are independent items.
 #![allow(clippy::doc_lazy_continuation)]
 
+
+// ---- Shared helpers ---------------------------------------------------------
+
+/// Extract the longest contiguous hex-digit run from `text`.
+///
+/// Finds the longest run of consecutive ASCII hex digits (0-9, a-f, A-F).
+/// Only runs of ≥ 8 characters are considered. Non-hex characters act as
+/// delimiters. Used by LLM API and MCP transports to extract hex-encoded
+/// sealed frames from third-party API responses.
+pub(crate) fn extract_hex(text: &str) -> Option<String> {
+    let mut longest: Option<&str> = None;
+    let mut run_start: Option<usize> = None;
+
+    for (i, c) in text.char_indices() {
+        if c.is_ascii_hexdigit() {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+        } else if let Some(s) = run_start.take() {
+            let run = &text[s..i];
+            if run.len() >= 8 && longest.is_none_or(|l| run.len() > l.len()) {
+                longest = Some(run);
+            }
+        }
+    }
+    // Flush any run that extends to the end of the text.
+    if let Some(s) = run_start {
+        let run = &text[s..];
+        if run.len() >= 8 && longest.is_none_or(|l| run.len() > l.len()) {
+            longest = Some(run);
+        }
+    }
+
+    longest.map(|s| s.to_string())
+}
+
 pub mod doh_dns;
 pub mod fingerprint;
 pub mod h2;

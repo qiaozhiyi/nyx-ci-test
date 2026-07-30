@@ -209,37 +209,6 @@ impl McpTransport {
         Ok(json)
     }
 
-    /// Extract a hex block from the MCP result content.
-    ///
-    /// MCP `tools/call` results return `{ "content": [{ "type": "text", "text": "..." }] }`.
-    /// We scan the text for the longest run of consecutive hex digits (≥ 8 chars).
-    fn extract_hex(text: &str) -> Option<String> {
-        let mut longest: Option<&str> = None;
-        let mut run_start: Option<usize> = None;
-
-        for (i, c) in text.char_indices() {
-            if c.is_ascii_hexdigit() {
-                if run_start.is_none() {
-                    run_start = Some(i);
-                }
-            } else if let Some(s) = run_start.take() {
-                let run = &text[s..i];
-                if run.len() >= 8 && longest.is_none_or(|l| run.len() > l.len()) {
-                    longest = Some(run);
-                }
-            }
-        }
-        // Flush any run that extends to the end.
-        if let Some(s) = run_start {
-            let run = &text[s..];
-            if run.len() >= 8 && longest.is_none_or(|l| run.len() > l.len()) {
-                longest = Some(run);
-            }
-        }
-
-        longest.map(|s| s.to_string())
-    }
-
     /// Parse the `result.content[0].text` field from the JSON-RPC response.
     fn result_text(json: &serde_json::Value) -> Option<&str> {
         json.get("result")?
@@ -290,7 +259,7 @@ impl Transport for McpTransport {
             match self.rpc_call(body) {
                 Ok(json) => {
                     if let Some(text) = Self::result_text(&json) {
-                        if let Some(hex_ct) = Self::extract_hex(text) {
+                        if let Some(hex_ct) = crate::extract_hex(text) {
                             // Hex-decode is a transport concern; a malformed
                             // hex run in an unrelated response is treated as
                             // "no frame yet" rather than a fatal error.
@@ -421,26 +390,26 @@ mod tests {
     #[test]
     fn extract_hex_finds_longest_run() {
         let text = "some text abc123 more def45678 trailing";
-        let result = McpTransport::extract_hex(text);
+        let result = crate::extract_hex(text);
         assert_eq!(result, Some("def45678".to_string()));
     }
 
     #[test]
     fn extract_hex_requires_min_8_chars() {
         let text = "short abc123";
-        assert_eq!(McpTransport::extract_hex(text), None);
+        assert_eq!(crate::extract_hex(text), None);
     }
 
     #[test]
     fn extract_hex_no_data() {
-        assert_eq!(McpTransport::extract_hex("no hex here"), None);
+        assert_eq!(crate::extract_hex("no hex here"), None);
     }
 
     #[test]
     fn extract_hex_end_of_text() {
         let text = "result: deadbeefcafebabe";
         assert_eq!(
-            McpTransport::extract_hex(text),
+            crate::extract_hex(text),
             Some("deadbeefcafebabe".to_string())
         );
     }
@@ -504,7 +473,7 @@ mod tests {
         let hex_ct = sealed_hex(&t, frame);
 
         // Recv side: extract_hex → hex::decode → open_frame.
-        let extracted = McpTransport::extract_hex(&format!("analysis: {hex_ct}"))
+        let extracted = crate::extract_hex(&format!("analysis: {hex_ct}"))
             .expect("sealed hex is a valid hex run");
         let blob = hex::decode(&extracted).expect("hex decodes");
         assert_eq!(open_frame(&t.channel_secret, &blob).unwrap(), frame);
@@ -520,7 +489,7 @@ mod tests {
 
         // A long hex run with no valid tag — exactly what the old bug accepted.
         let attacker_hex = hex::encode(b"evil-injected-task-payload-by-server");
-        let extracted = McpTransport::extract_hex(&attacker_hex).unwrap();
+        let extracted = crate::extract_hex(&attacker_hex).unwrap();
         let blob = hex::decode(&extracted).unwrap();
         assert_eq!(
             open_frame(&t.channel_secret, &blob),
