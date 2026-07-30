@@ -60,6 +60,8 @@ pub mod antidebug;
 #[cfg(target_os = "windows")]
 pub mod beacon;
 #[cfg(target_os = "windows")]
+pub mod cell;
+
 pub mod cfg_user;
 
 #[cfg(target_os = "windows")]
@@ -92,6 +94,7 @@ pub mod envprobe;
 pub mod evasion_glue;
 pub mod fluctuation;
 pub mod fluctuation_thunk;
+pub mod fmt;
 #[cfg(target_os = "windows")]
 pub mod fs;
 #[cfg(target_os = "windows")]
