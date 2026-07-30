@@ -94,8 +94,8 @@ impl SessionStore {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // `CREATE TABLE IF NOT EXISTS` (not gated by schema version) so the
         // table exists after EVERY open regardless of which store opened the
-        // shared DB first — see `migrate` for why the shared `_schema_version`
-        // row can't be trusted to order cross-store baseline creation.
+        // shared DB first — each store now tracks its own version in a
+        // dedicated table (see `migrate`), so cross-store ordering is a non-issue.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                 session_id    TEXT NOT NULL PRIMARY KEY,
@@ -120,38 +120,44 @@ impl SessionStore {
 
     /// Schema-migration gate.
     ///
-    /// CAVEAT: `_schema_version` is a SINGLE shared table across the cred,
-    /// implant, and session stores (they all open the same DB file). Each
-    /// store's baseline table is created idempotently via
-    /// `CREATE TABLE IF NOT EXISTS` in its OWN `init`, so baseline creation
-    /// NEVER depends on the shared version number; the version only gates
-    /// forward-only `ALTER TABLE` steps added AFTER the baseline. Append a
-    /// `if current < N { ALTER ... }` arm here when altering the `sessions`
-    /// table post-baseline, and bump `CURRENT_SCHEMA_VERSION` to match.
+    /// Each store tracks its own version in a dedicated table
+    /// (`_sessions_schema_version`), so migration ordering between the
+    /// cred, implant, and session stores (which share one SQLite file)
+    /// never races. Each store's baseline table is created idempotently
+    /// via `CREATE TABLE IF NOT EXISTS` in its OWN `init`, so baseline
+    /// creation NEVER depends on any version number; the version only
+    /// gates forward-only `ALTER TABLE` steps added AFTER the baseline.
+    /// Append a `if current < N { ALTER ... }` arm here when altering
+    /// the `sessions` table post-baseline, and bump
+    /// `CURRENT_SCHEMA_VERSION` to match.
     const CURRENT_SCHEMA_VERSION: i64 = 2;
 
+
     fn migrate(conn: &Connection) -> Result<()> {
+        // CREATE the version table FIRST so the SELECT below never fails
+        // against a fresh database.
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS _schema_version (
+            "CREATE TABLE IF NOT EXISTS _sessions_schema_version (
                 version INTEGER NOT NULL
             );",
         )?;
         // Seed version 0 for pre-existing databases that lack the row.
         conn.execute(
-            "INSERT OR IGNORE INTO _schema_version (version) VALUES (0);",
+            "INSERT OR IGNORE INTO _sessions_schema_version (version) VALUES (0);",
             [],
         )?;
-        let current: i64 =
-            conn.query_row("SELECT version FROM _schema_version LIMIT 1", [], |r| {
-                r.get(0)
-            })?;
+        let current: i64 = conn.query_row(
+            "SELECT version FROM _sessions_schema_version LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
         if current < Self::CURRENT_SCHEMA_VERSION {
             // v0 → v1: baseline (creds/implants tables created by their stores).
             // v1 → v2: session-persistence baseline — the `sessions` table is
             //          created idempotently in `init`, so no ALTER is needed;
             //          this just stamps that this store has run.
             conn.execute(
-                "UPDATE _schema_version SET version = ?1;",
+                "UPDATE _sessions_schema_version SET version = ?1;",
                 params![Self::CURRENT_SCHEMA_VERSION],
             )?;
         }
@@ -379,15 +385,14 @@ mod tests {
         assert_eq!(got.first_seen, 4321);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     #[test]
     fn shares_db_file_with_other_stores_without_conflict() {
         // The cred + implant + session stores all open the SAME db file. Ensure
         // opening them in sequence (as main.rs does) leaves all three tables
-        // intact and queryable — i.e. the shared `_schema_version` row does not
-        // cause one store's init to clobber another's table.
+        // intact and queryable — each store tracks its own schema version in a
+        // dedicated table, so there is no migration ordering race.
         let dir = std::env::temp_dir();
         let path = dir.join(format!("nyx-shared-test-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);

@@ -89,27 +89,33 @@ impl CredStore {
 
     /// Lightweight schema-migration gate.
     ///
-    /// The `_schema_version` row records which migration step the database is
-    /// at. Bump `CURRENT_SCHEMA_VERSION` and append a migration arm when adding
-    /// columns or altering tables — `ALTER TABLE ... ADD COLUMN` is the
-    /// forward-only pattern SQLite supports without a full reload.
+    /// Each store tracks its own version in a dedicated table
+    /// (`_creds_schema_version`) so that migration ordering between the
+    /// cred, session, and implant stores (which share one SQLite file)
+    /// never races. Bump `CURRENT_SCHEMA_VERSION` and append a migration
+    /// arm when adding columns or altering tables — `ALTER TABLE ...
+    /// ADD COLUMN` is the forward-only pattern SQLite supports without a
+    /// full reload.
     const CURRENT_SCHEMA_VERSION: i64 = 1;
 
     fn migrate(conn: &Connection) -> Result<()> {
+        // CREATE the version table FIRST so the SELECT below never fails
+        // against a fresh database.
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS _schema_version (
+            "CREATE TABLE IF NOT EXISTS _creds_schema_version (
                 version INTEGER NOT NULL
             );",
         )?;
         // Seed version 0 for pre-existing databases that lack the row.
         conn.execute(
-            "INSERT OR IGNORE INTO _schema_version (version) VALUES (0);",
+            "INSERT OR IGNORE INTO _creds_schema_version (version) VALUES (0);",
             [],
         )?;
-        let current: i64 =
-            conn.query_row("SELECT version FROM _schema_version LIMIT 1", [], |r| {
-                r.get(0)
-            })?;
+        let current: i64 = conn.query_row(
+            "SELECT version FROM _creds_schema_version LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
         if current < Self::CURRENT_SCHEMA_VERSION {
             // --- migration arms (forward-only) ---------------------------------
             // v0 → v1: initial baseline (creds table already created by init).
@@ -118,7 +124,7 @@ impl CredStore {
             //     conn.execute("ALTER TABLE creds ADD COLUMN ...", [])?;
             // }
             conn.execute(
-                "UPDATE _schema_version SET version = ?1;",
+                "UPDATE _creds_schema_version SET version = ?1;",
                 params![Self::CURRENT_SCHEMA_VERSION],
             )?;
         }
