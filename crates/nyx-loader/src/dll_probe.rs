@@ -172,6 +172,7 @@ impl std::error::Error for ProbeError {}
 /// the image mapped; releasing it unmaps the pages and invalidates every
 /// resolved function pointer, so callers must not retain `extern "system"`
 /// function pointers past the probe's lifetime).
+#[derive(Debug)]
 pub struct DllProbe {
     module: HModule,
     /// Cached `(export name, RVA-from-base)` pairs, collected once at load.
