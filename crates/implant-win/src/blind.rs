@@ -229,7 +229,13 @@ fn mark_amsi_patched() {
 pub static BLIND_OK: AtomicBool = AtomicBool::new(false);
 
 /// First blind error encountered during bootstrap, if any.
-pub static mut BLIND_ERR: Option<&'static str> = None;
+///
+/// `SyncCell` (a `pub(crate)` newtype) is the minimal wrapper for a static that
+/// is written once during bootstrap and read later in single-threaded beacon
+/// context. `pub(crate)` — the static is an internal implementation detail;
+/// callers go through `blind_err()` rather than touching the cell directly.
+pub(crate) static BLIND_ERR: crate::cell::SyncCell<Option<&'static str>> =
+    crate::cell::SyncCell::new(None);
 
 /// Check whether blinding succeeded.
 pub fn blind_ok() -> bool {
@@ -238,7 +244,9 @@ pub fn blind_ok() -> bool {
 
 /// Return the first blind error, if any.
 pub fn blind_err() -> Option<&'static str> {
-    unsafe { BLIND_ERR }
+    // SAFETY: single-threaded beacon context; written once during bootstrap,
+    // read-only thereafter.
+    unsafe { *BLIND_ERR.get() }
 }
 
 /// Convenience: patch ETW (always) and try AMSI once. Returns
