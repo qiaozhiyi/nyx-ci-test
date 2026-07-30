@@ -69,8 +69,14 @@ pub struct CredRecord {
 /// Mask a secret for list/preview rendering: `first2….last2` when long enough,
 /// else a bare `…. Sentinel for "this view is masked; call ?reveal=1 for
 /// cleartext". UTF-8-safe (char-based, not byte-slice).
-pub fn mask_secret(_s: &str) -> String {
-    "********".to_string()
+pub fn mask_secret(s: &str) -> String {
+    if s.len() <= 4 {
+        "....".to_string()
+    } else {
+        let prefix = &s[..2];
+        let suffix = &s[s.len()-2..];
+        format!("{prefix}....{suffix}")
+    }
 }
 
 #[cfg(test)]
@@ -92,8 +98,8 @@ mod tests {
 
     #[test]
     fn mask_long_and_short() {
-        assert_eq!(mask_secret("8846f7eaee8fb117ad06bdd830b7586c"), "********");
-        assert_eq!(mask_secret("ab"), "********");
-        assert_eq!(mask_secret(""), "********");
+        assert_eq!(mask_secret("8846f7eaee8fb117ad06bdd830b7586c"), "88....6c");
+        assert_eq!(mask_secret("ab"), "....");
+        assert_eq!(mask_secret(""), "....");
     }
 }
