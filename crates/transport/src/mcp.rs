@@ -291,7 +291,7 @@ impl Transport for McpTransport {
         }
     }
 
-    fn health_check(&self) -> Option<u64> {
+    fn health_check(&self) -> Result<u64, TransportError> {
         let start = Instant::now();
         let body = Self::notification_body(
             "initialize",
@@ -305,10 +305,8 @@ impl Transport for McpTransport {
             }),
         );
 
-        match self.rpc_call(body) {
-            Ok(_) => Some(start.elapsed().as_millis() as u64),
-            Err(_) => None,
-        }
+        self.rpc_call(body)?;
+        Ok(start.elapsed().as_millis() as u64)
     }
 
     fn name(&self) -> &'static str {
@@ -324,9 +322,7 @@ impl Transport for McpTransport {
     }
 
     fn init(&mut self) -> Result<(), TransportError> {
-        self.health_check().map(|_| ()).ok_or(TransportError::Dead(
-            "MCP server unreachable — initialize failed",
-        ))
+        self.health_check().map(|_| ())
     }
 }
 

@@ -1,8 +1,9 @@
 //! Ordered transport fallback stack — CS-style multi-channel C2 dispatcher.
 //!
 //! This is the **first real consumer** of the `Transport` trait. It wraps an
-//! ordered list of `Box<dyn Transport>` channel implementations and provides
-//! the Cobalt Strike / BRC4-style behaviour the rest of the framework expects:
+//! ordered list of `Box<dyn Transport + Send>` channel implementations and
+//! provides the Cobalt Strike / BRC4-style behaviour the rest of the framework
+//! expects:
 //!
 //! - **Ordered fallback**: try channels in priority order. If the active
 //!   channel is `Dead`, demote it (skip until reset) and advance to the next.
@@ -27,16 +28,18 @@
 //!
 //! ## Consumer
 //!
-//! The team server's `/extc2/*` relay uses this to fan an inbound beacon
+//! The team server's `/extc2/*` relay will use this to fan an inbound beacon
 //! frame out to the configured third-party channel (Slack/MCP/...) and relay
-//! the reply back. See `crates/server/src/extc2_relay.rs`.
+//! the reply back — the wiring lands in `crates/server/src/extc2_relay.rs`
+//! this sprint; until then the relay constructs `SlackTransport` /
+//! `McpTransport` directly per call.
 //!
 //! ## What this is NOT
 //!
 //! This is a synchronous, blocking dispatcher (the leaf transports are all
-//! blocking: `ureq`, `reqwest::blocking`, Win32 `ReadFile`/`WriteFile`). The
-//! server calls it from `spawn_blocking` so a slow third-party API can't stall
-//! the async beacon listener.
+//! blocking: `ureq`, `reqwest::blocking`, Win32 `ReadFile`/`WriteFile`). A
+//! server relay will call it from `spawn_blocking` so a slow third-party API
+//! can't stall the async beacon listener.
 
 use crate::traits::{Transport, TransportError};
 
@@ -59,7 +62,12 @@ enum SlotState {
 
 /// One entry in the fallback stack.
 struct Slot {
-    transport: Box<dyn Transport>,
+    // `+ Send`: the server shares ONE stack across relay tasks via
+    // `Arc<Mutex<TransportStack>>` and runs `send` from `spawn_blocking`, so
+    // the boxed channel must be movable across threads. All six concrete
+    // channel impls are `Send` (std types only); the bound just makes the
+    // trait object carry the auto-trait.
+    transport: Box<dyn Transport + Send>,
     state: SlotState,
     /// Cached `max_frame_size()` so the selector can frame-check without a
     /// virtual call on the hot path.
@@ -100,7 +108,7 @@ impl std::fmt::Display for StackError {
                 f,
                 "frame {frame_len} bytes exceeds every channel's max (smallest cap {min_cap})"
             ),
-            StackError::Leaf(e) => write!(f, "leaf transport error: {e:?}"),
+            StackError::Leaf(e) => write!(f, "leaf transport error: {e}"),
         }
     }
 }
@@ -195,9 +203,11 @@ impl TransportStack {
     fn activate(&mut self, idx: usize) -> Result<(), TransportError> {
         let slot = &mut self.slots[idx];
         if slot.state == SlotState::Fresh {
-            if slot.transport.requires_probe() && slot.transport.health_check().is_none() {
-                slot.state = SlotState::Demoted;
-                return Err(TransportError::Dead("probe: health_check failed"));
+            if slot.transport.requires_probe() {
+                if let Err(error) = slot.transport.health_check() {
+                    slot.state = SlotState::Demoted;
+                    return Err(error);
+                }
             }
             slot.transport.init()?;
             slot.state = SlotState::Active;
@@ -328,10 +338,50 @@ impl TransportStack {
     /// Receive the next frame from the active channel. Must be called after a
     /// successful [`send`](Self::send); calling recv with no active channel
     /// returns `StackError::Exhausted`.
+    ///
+    /// Transient failures and timeouts use the same retry budget/backoff as
+    /// sends. A permanently dead channel is demoted immediately. Exhausting
+    /// transient retries burns the channel so the next send can select a
+    /// fallback; exhausting timeout retries keeps it active because an empty
+    /// poll does not prove the channel itself is unhealthy.
     pub fn recv(&mut self, timeout_ms: u32) -> Result<Vec<u8>, StackError> {
         let idx = self.active_idx.ok_or(StackError::Exhausted)?;
-        let slot = &mut self.slots[idx];
-        slot.transport.recv(timeout_ms).map_err(StackError::Leaf)
+        let mut attempt = 0u32;
+
+        loop {
+            attempt += 1;
+            match self.slots[idx].transport.recv(timeout_ms) {
+                Ok(frame) => return Ok(frame),
+                Err(error @ TransportError::Dead(_)) => {
+                    self.slots[idx].state = SlotState::Demoted;
+                    self.active_idx = None;
+                    return Err(StackError::Leaf(error));
+                }
+                Err(error @ TransportError::Transient(_)) => {
+                    if attempt > self.max_transient_retries {
+                        self.slots[idx].state = SlotState::Burned;
+                        self.active_idx = None;
+                        return Err(StackError::Leaf(error));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        RETRY_BACKOFF_MS * u64::from(attempt),
+                    ));
+                }
+                Err(error @ TransportError::Timeout) => {
+                    if attempt > self.max_transient_retries {
+                        return Err(StackError::Leaf(error));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        RETRY_BACKOFF_MS * u64::from(attempt),
+                    ));
+                }
+                Err(error @ TransportError::PayloadTooLarge(_)) => {
+                    self.slots[idx].state = SlotState::Burned;
+                    self.active_idx = None;
+                    return Err(StackError::Leaf(error));
+                }
+            }
+        }
     }
 
     /// Convenience round-trip: send then recv. The send pins the active
@@ -370,7 +420,7 @@ pub struct TransportStackBuilder {
 
 impl TransportStackBuilder {
     /// Push a channel onto the stack. Order = priority (first = highest).
-    pub fn push<T: Transport + 'static>(mut self, transport: T) -> Self {
+    pub fn push<T: Transport + Send + 'static>(mut self, transport: T) -> Self {
         let max_frame = transport.max_frame_size();
         self.slots.push(Slot {
             transport: Box::new(transport),
@@ -415,7 +465,7 @@ mod tests {
         max_frame: usize,
         send_results: Mutex<Vec<Result<(), TransportError>>>,
         recv_results: Mutex<Vec<Result<Vec<u8>, TransportError>>>,
-        health: Option<u64>,
+        health: Result<u64, TransportError>,
         probe_required: bool,
         send_calls: AtomicU32,
     }
@@ -427,7 +477,7 @@ mod tests {
                 max_frame: 1024 * 1024,
                 send_results: Mutex::new(Vec::new()),
                 recv_results: Mutex::new(Vec::new()),
-                health: Some(1),
+                health: Ok(1),
                 probe_required: false,
                 send_calls: AtomicU32::new(0),
             }
@@ -443,7 +493,7 @@ mod tests {
             self
         }
 
-        fn health(mut self, h: Option<u64>) -> Self {
+        fn health(mut self, h: Result<u64, TransportError>) -> Self {
             self.health = h;
             self
         }
@@ -484,8 +534,8 @@ mod tests {
             }
         }
 
-        fn health_check(&self) -> Option<u64> {
-            self.health
+        fn health_check(&self) -> Result<u64, TransportError> {
+            self.health.clone()
         }
 
         fn name(&self) -> &'static str {
@@ -620,7 +670,9 @@ mod tests {
     #[test]
     fn probe_failure_demotes_channel() {
         // primary fails health check → demoted, never sent on.
-        let primary = Mock::ok("dead-probe").health(None).probe(true);
+        let primary = Mock::ok("dead-probe")
+            .health(Err(TransportError::Dead("probe rejected")))
+            .probe(true);
         let backup = Mock::ok("alive").probe(true);
         let mut stack = TransportStack::builder()
             .push(primary)
@@ -661,6 +713,65 @@ mod tests {
             Err(StackError::Exhausted) => {}
             other => panic!("expected Exhausted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn recv_transient_then_success_retries_on_active_channel() {
+        let channel = Mock::ok("flaky-recv").recv_seq(vec![
+            Err(TransportError::Transient("poll failed")),
+            Ok(b"reply".to_vec()),
+        ]);
+        let mut stack = TransportStack::builder()
+            .transient_retries(1)
+            .push(channel)
+            .build()
+            .unwrap();
+
+        stack.send(b"request").unwrap();
+        assert_eq!(stack.recv(10).unwrap(), b"reply");
+        assert_eq!(stack.active_name(), Some("flaky-recv"));
+    }
+
+    #[test]
+    fn recv_timeout_exhaustion_keeps_channel_active() {
+        let channel = Mock::ok("quiet").recv_seq(vec![
+            Err(TransportError::Timeout),
+            Err(TransportError::Timeout),
+        ]);
+        let mut stack = TransportStack::builder()
+            .transient_retries(1)
+            .push(channel)
+            .build()
+            .unwrap();
+
+        stack.send(b"request").unwrap();
+        assert!(matches!(
+            stack.recv(10),
+            Err(StackError::Leaf(TransportError::Timeout))
+        ));
+        assert_eq!(stack.active_name(), Some("quiet"));
+    }
+
+    #[test]
+    fn recv_dead_demotes_channel_for_next_send() {
+        let primary = Mock::ok("primary")
+            .recv_seq(vec![Err(TransportError::Dead("connection closed"))]);
+        let backup = Mock::ok("backup");
+        let mut stack = TransportStack::builder()
+            .push(primary)
+            .push(backup)
+            .build()
+            .unwrap();
+
+        stack.send(b"request").unwrap();
+        assert!(matches!(
+            stack.recv(10),
+            Err(StackError::Leaf(TransportError::Dead(_)))
+        ));
+        assert_eq!(stack.active_name(), None);
+
+        stack.send(b"retry-on-backup").unwrap();
+        assert_eq!(stack.active_name(), Some("backup"));
     }
 
     #[test]

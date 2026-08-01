@@ -7,14 +7,23 @@
 //! This mirrors the proven design from the old Makepad bridge (single worker
 //! thread, per-session drain) but uses Tauri's `Window::emit` instead of
 //! Makepad's private channel API.
+//!
+//! Pending-task hygiene: a task whose session vanishes from `/api/sessions`
+//! can never drain, and a task in a live session that produces no result after
+//! `MAX_EMPTY_DRAINS` consecutive empty drains belongs to a dead beacon. Both
+//! are expired here and the console block is resolved with a synthetic
+//! `nyx://result` error so the UI never shows a stuck `queued`/`processing`
+//! entry.
 
 use std::sync::Arc;
 use tauri::async_runtime;
 use tauri::{AppHandle, Emitter};
 use tokio::time::{interval, Duration};
 
+use nyx_rest::{ResultView, SessionView};
+
 use crate::rest;
-use crate::state::{BackendState, Connection};
+use crate::state::{BackendState, Connection, PendingTask};
 
 /// Poll interval for `/api/sessions`. Matches the old bridge.
 const SESSION_POLL: Duration = Duration::from_secs(2);
@@ -24,6 +33,23 @@ const SESSION_POLL: Duration = Duration::from_secs(2);
 /// operator out, so a single transient blip must not trigger it — only a
 /// sustained outage (3 consecutive misses ≈ 6s) is surfaced.
 const MAX_SESSION_FETCH_FAILURES: u32 = 3;
+
+/// Consecutive EMPTY `/api/results` drains tolerated for a pending task before
+/// it is expired and the console block resolved with a synthetic error result.
+/// 60 drains × 2s poll ≈ 2 minutes of beacon silence — check-ins usually
+/// happen every ~30s, so this is a generous dead-beacon bound.
+const MAX_EMPTY_DRAINS: u32 = 60;
+
+/// `nyx://result` payload: a `ResultView` plus the session it belongs to.
+/// Every result (real drain or synthetic expiry error) carries `session_id`
+/// so the frontend can route it into the right per-session task flow by
+/// `(session_id, task_id)` instead of matching task ids across all sessions.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ResultEvent {
+    session_id: String,
+    #[serde(flatten)]
+    result: ResultView,
+}
 
 /// Spawn the background poll loop on Tauri's async runtime.
 /// Must use `tauri::async_runtime::spawn` (not bare `tokio::spawn`) because
@@ -51,6 +77,12 @@ pub fn spawn(app: AppHandle, state: Arc<BackendState>) {
             match rest::fetch_sessions(&client, &server, &bearer).await {
                 Ok(sessions) => {
                     fail_count = 0;
+                    // Expire pending tasks for sessions that vanished from the
+                    // server: their results will never drain, so resolve the
+                    // console blocks with a synthetic error instead of hanging.
+                    // Only runs on a SUCCESSFUL fetch — a failed fetch means
+                    // the list is stale and must not trigger expiry.
+                    expire_absent_sessions(&app, &state, &sessions).await;
                     let sig = nyx_rest::session_signature(&sessions);
                     if last_sig.as_deref() != Some(sig.as_str()) {
                         last_sig = Some(sig);
@@ -72,6 +104,45 @@ pub fn spawn(app: AppHandle, state: Arc<BackendState>) {
             drain_pending_results(&app, &state, &client, &server, &bearer).await;
         }
     });
+}
+
+/// Drop pending tasks whose session is absent from the latest `/api/sessions`
+/// snapshot, emitting a synthetic `nyx://result` error per task so the console
+/// resolves the stuck block.
+async fn expire_absent_sessions(
+    app: &AppHandle,
+    state: &Arc<BackendState>,
+    sessions: &[SessionView],
+) {
+    let live: std::collections::HashSet<&str> =
+        sessions.iter().map(|s| s.id.as_str()).collect();
+
+    // Snapshot the expired tasks under the read lock, then remove under the
+    // write lock (emit happens outside any lock).
+    let expired: Vec<PendingTask> = {
+        let p = state.pending.read().await;
+        p.iter()
+            .filter(|t| !live.contains(t.session.as_str()))
+            .cloned()
+            .collect()
+    };
+    if expired.is_empty() {
+        return;
+    }
+
+    {
+        let mut p = state.pending.write().await;
+        p.retain(|t| live.contains(t.session.as_str()));
+    }
+
+    for t in &expired {
+        emit_error_result(
+            app,
+            &t.session,
+            t.task_id,
+            format!("命令超时：session 已不在线（{}），任务未回流。", t.session),
+        );
+    }
 }
 
 /// Drain `/api/results` for each session that has pending tasks.
@@ -100,13 +171,51 @@ async fn drain_pending_results(
         match rest::drain_results(client, server, bearer, &session).await {
             Ok(results) => {
                 for r in &results {
-                    let _ = app.emit("nyx://result", r);
+                    let _ = app.emit(
+                        "nyx://result",
+                        ResultEvent {
+                            session_id: session.clone(),
+                            result: r.clone(),
+                        },
+                    );
                 }
                 // Remove completed/errored tasks from pending.
                 let done_ids: std::collections::HashSet<u64> =
                     results.iter().map(|r| r.task_id).collect();
-                if !done_ids.is_empty() {
-                    let mut p = state.pending.write().await;
+                let mut p = state.pending.write().await;
+                if done_ids.is_empty() {
+                    // Empty drain: nothing completed this tick. Advance the
+                    // consecutive-empty counter; tasks that still produce no
+                    // result after MAX_EMPTY_DRAINS are expired (dead beacon).
+                    for t in p.iter_mut().filter(|t| t.session == session) {
+                        t.empty_drains = t.empty_drains.saturating_add(1);
+                    }
+                    let expired: Vec<PendingTask> = p
+                        .iter()
+                        .filter(|t| t.session == session && t.empty_drains >= MAX_EMPTY_DRAINS)
+                        .cloned()
+                        .collect();
+                    if !expired.is_empty() {
+                        p.retain(|t| !(t.session == session && t.empty_drains >= MAX_EMPTY_DRAINS));
+                        for t in &expired {
+                            emit_error_result(
+                                app,
+                                &t.session,
+                                t.task_id,
+                                format!(
+                                    "命令超时：连续 {} 次检查未回流结果，beacon 可能已失联。",
+                                    MAX_EMPTY_DRAINS
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    // Drain produced results — the session is alive; reset the
+                    // empty-drain counters of its remaining pending tasks, then
+                    // drop the completed ones.
+                    for t in p.iter_mut().filter(|t| t.session == session) {
+                        t.empty_drains = 0;
+                    }
                     p.retain(|t| !done_ids.contains(&t.task_id));
                 }
             }
@@ -115,4 +224,23 @@ async fn drain_pending_results(
             }
         }
     }
+}
+
+/// Emit a synthetic `nyx://result` error for a task, stamped with its session.
+/// Lets the console resolve a block whose result will never drain (expired).
+fn emit_error_result(app: &AppHandle, session: &str, task_id: u64, text: String) {
+    let _ = app.emit(
+        "nyx://result",
+        ResultEvent {
+            session_id: session.to_string(),
+            result: ResultView {
+                task_id,
+                kind: "error".into(),
+                text,
+                data_hex: None,
+                seq: None,
+                eof: None,
+            },
+        },
+    );
 }

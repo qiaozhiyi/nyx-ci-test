@@ -322,23 +322,28 @@ impl Transport for SlackTransport {
         }
     }
 
-    fn health_check(&self) -> Option<u64> {
+    fn health_check(&self) -> Result<u64, TransportError> {
         let start = Instant::now();
         let resp = self
             .agent
             .post(&format!("{SLACK_API_BASE}auth.test"))
             .set("Authorization", &self.auth_header())
             .set("Content-Type", "application/json; charset=utf-8")
-            .send_json(serde_json::json!({}));
+            .send_json(serde_json::json!({}))
+            .map_err(|error| self.classify_ureq_error(error))?;
 
-        match resp {
-            Ok(r) => match r.into_json::<serde_json::Value>() {
-                Ok(v) if v["ok"].as_bool().unwrap_or(false) => {
-                    Some(start.elapsed().as_millis() as u64)
+        let json = resp
+            .into_json::<serde_json::Value>()
+            .map_err(|_| TransportError::Transient("Slack auth.test parse error"))?;
+        if json["ok"].as_bool().unwrap_or(false) {
+            Ok(start.elapsed().as_millis() as u64)
+        } else {
+            match json["error"].as_str().unwrap_or("unknown") {
+                "invalid_auth" | "token_revoked" | "account_inactive" => {
+                    Err(TransportError::Dead("Slack token invalid"))
                 }
-                _ => None,
-            },
-            Err(_) => None,
+                _ => Err(TransportError::Transient("Slack health probe failed")),
+            }
         }
     }
 

@@ -295,16 +295,14 @@ impl Transport for DohDnsTransport {
         }
     }
 
-    fn health_check(&self) -> Option<u64> {
+    fn health_check(&self) -> Result<u64, TransportError> {
         let qname = format!("health.{}", self.domain);
         let start = Instant::now();
 
         // Query an A record — faster than TXT, and the resolver still has
         // to reach the authoritative DNS (proving the path is live).
-        match self.doh_query(&qname, DNS_TYPE_A) {
-            Ok(_) => Some(start.elapsed().as_millis() as u64),
-            Err(_) => None,
-        }
+        self.doh_query(&qname, DNS_TYPE_A)?;
+        Ok(start.elapsed().as_millis() as u64)
     }
 
     fn name(&self) -> &'static str {
@@ -319,9 +317,7 @@ impl Transport for DohDnsTransport {
 
     fn init(&mut self) -> Result<(), TransportError> {
         // Verify the DoH endpoint is reachable and responds with valid JSON.
-        self.health_check()
-            .map(|_| ())
-            .ok_or(TransportError::Dead("DoH endpoint unreachable"))
+        self.health_check().map(|_| ())
     }
 }
 

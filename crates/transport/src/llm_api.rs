@@ -210,12 +210,10 @@ impl Transport for LlmApiTransport {
             .map_err(|_| TransportError::Transient("LLM response failed integrity check"))
     }
 
-    fn health_check(&self) -> Option<u64> {
+    fn health_check(&self) -> Result<u64, TransportError> {
         let start = Instant::now();
-        match self.post_message("ping", 1) {
-            Ok(_) => Some(start.elapsed().as_millis() as u64),
-            Err(_) => None,
-        }
+        self.post_message("ping", 1)?;
+        Ok(start.elapsed().as_millis() as u64)
     }
 
     fn name(&self) -> &'static str {
@@ -237,9 +235,7 @@ impl Transport for LlmApiTransport {
         // layer was removed (CRITICAL-24) and confidentiality is provided by
         // the protocol-layer AEAD. Frame integrity is enforced by the HMAC
         // framing applied in send/recv.
-        self.health_check().map(|_| ()).ok_or(TransportError::Dead(
-            "LLM API key invalid or endpoint unreachable",
-        ))
+        self.health_check().map(|_| ())
     }
 }
 

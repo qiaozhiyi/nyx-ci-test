@@ -180,14 +180,14 @@ impl Transport for SmbPipeTransport {
         Ok(buf)
     }
 
-    fn health_check(&self) -> Option<u64> {
+    fn health_check(&self) -> Result<u64, TransportError> {
         if !self.connected {
-            return None;
+            return Err(TransportError::Transient("smb-pipe is not connected"));
         }
         // A connected pipe handle is alive — we can't easily measure latency
         // without sending data, but the handle being open is a decent signal.
         // Return 0 to indicate "alive, latency unknown."
-        Some(0)
+        Ok(0)
     }
 
     fn name(&self) -> &'static str {
@@ -348,8 +348,10 @@ impl Transport for SmbPipeTransport {
         ))
     }
 
-    fn health_check(&self) -> Option<u64> {
-        None
+    fn health_check(&self) -> Result<u64, TransportError> {
+        Err(TransportError::Dead(
+            "smb-pipe: Windows-only (SMB named pipes unavailable on this platform)",
+        ))
     }
 
     fn name(&self) -> &'static str {
@@ -391,7 +393,7 @@ mod tests {
     #[test]
     fn test_health_check_when_disconnected() {
         let t = SmbPipeTransport::new();
-        assert_eq!(t.health_check(), None);
+        assert!(t.health_check().is_err());
     }
 
     #[cfg(windows)]
@@ -409,7 +411,7 @@ mod tests {
         let mut t = SmbPipeTransport::new();
         assert!(matches!(t.send(b"test"), Err(TransportError::Dead(_))));
         assert!(matches!(t.recv(1000), Err(TransportError::Dead(_))));
-        assert_eq!(t.health_check(), None);
+        assert!(t.health_check().is_err());
         assert_eq!(t.name(), "smb-pipe");
     }
 }

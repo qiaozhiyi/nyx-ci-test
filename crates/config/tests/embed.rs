@@ -21,3 +21,17 @@ fn two_embeds_of_same_content_both_decrypt_correctly() {
     let b: Vec<u8> = nyx_config_macros::embed!("tests/fixtures/sample.cfg");
     assert_eq!(a, b);
 }
+
+#[test]
+#[allow(deprecated)]
+fn embed_roundtrips_arbitrary_binary_bytes() {
+    // 257 bytes covering every u8 value (0x00..=0xFF then 0x00 again) —
+    // exercises the decoy-prefix slice and the AEAD path over non-UTF8 content,
+    // so expansion semantics must stay byte-exact regardless of config content.
+    let decrypted: Vec<u8> = nyx_config_macros::embed!("tests/fixtures/binary.bin");
+    let raw = std::fs::read("tests/fixtures/binary.bin").unwrap();
+    assert_eq!(
+        decrypted, raw,
+        "embed! must round-trip arbitrary binary config bytes"
+    );
+}

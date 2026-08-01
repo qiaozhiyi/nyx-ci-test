@@ -322,8 +322,12 @@ impl Transport for MalleableTransport {
         }
     }
 
-    fn health_check(&self) -> Option<u64> {
-        let uri = self.profile.uris.first()?;
+    fn health_check(&self) -> Result<u64, TransportError> {
+        let uri = self
+            .profile
+            .uris
+            .first()
+            .ok_or(TransportError::Dead("malleable profile has no URI"))?;
         let url = format!("{}{}", self.base_url, uri);
         let start = Instant::now();
 
@@ -334,8 +338,19 @@ impl Transport for MalleableTransport {
             .send();
 
         match resp {
-            Ok(_) => Some(start.elapsed().as_millis() as u64),
-            Err(_) => None,
+            Ok(response) if response.status().is_success() => {
+                Ok(start.elapsed().as_millis() as u64)
+            }
+            Ok(response) if response.status().is_server_error() => Err(TransportError::Transient(
+                "malleable health probe returned a server error",
+            )),
+            Ok(_) => Err(TransportError::Dead(
+                "malleable health probe returned a client error",
+            )),
+            Err(error) if error.is_timeout() => Err(TransportError::Timeout),
+            Err(_) => Err(TransportError::Transient(
+                "malleable health probe transport failed",
+            )),
         }
     }
 
@@ -480,7 +495,7 @@ mod tests {
         let start = Instant::now();
         let result = t.health_check();
         let elapsed = start.elapsed();
-        assert!(result.is_none(), "expected None on dead host");
+        assert!(result.is_err(), "expected an error on dead host");
         assert!(
             elapsed < Duration::from_secs(HEALTH_TIMEOUT_S + 2),
             "health check took {:?}, should be bounded by {HEALTH_TIMEOUT_S}s",

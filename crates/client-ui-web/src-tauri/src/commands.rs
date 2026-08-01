@@ -61,6 +61,7 @@ pub async fn send_command(
         task_id: ack.task_id,
         session: session.clone(),
         command_label,
+        empty_drains: 0,
     });
 
     // Emit a "task submitted" event so the UI can show the queued block immediately.

@@ -33,9 +33,19 @@ export function onSessions(cb: (s: SessionView[]) => void): Promise<UnlistenFn> 
   return listen<SessionView[]>('nyx://sessions', (e) => cb(e.payload));
 }
 
-/** Subscribe to individual task results. */
-export function onResult(cb: (r: ResultView) => void): Promise<UnlistenFn> {
-  return listen<ResultView>('nyx://result', (e) => cb(e.payload));
+/**
+ * Payload of the `nyx://result` event: a ResultView plus the session it
+ * belongs to. The Rust poll loop stamps session_id onto every result (real
+ * drain or synthetic expiry error) so consumers can route by
+ * (session_id, task_id) instead of matching bare task ids across sessions.
+ */
+export interface ResultEvent extends ResultView {
+  session_id: string;
+}
+
+/** Subscribe to individual task results (session-stamped by the backend). */
+export function onResult(cb: (r: ResultEvent) => void): Promise<UnlistenFn> {
+  return listen<ResultEvent>('nyx://result', (e) => cb(e.payload));
 }
 
 /** Payload of the `nyx://task-submitted` ack (emitted before send_command resolves). */

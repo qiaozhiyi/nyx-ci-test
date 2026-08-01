@@ -8,13 +8,30 @@ import { CredsPage } from './CredsPage';
 import { ImplantPage } from './ImplantPage';
 import { EventsPage } from './EventsPage';
 import { Dock } from '../components/Dock';
+import { TaskStoreProvider, useTaskStore } from './taskStore';
 import { disconnect, onError, onSessions } from '../lib/invoke';
 import './App.css';
 
 /** The surfaces reachable from the Dock. */
 export type Page = 'workspace' | 'topology' | 'creds' | 'implant' | 'events';
 
+/**
+ * App — top-level shell.
+ *
+ * Wraps everything in the TaskStoreProvider so per-session task history
+ * survives session switches (and lives for the whole app lifetime); the
+ * inner component consumes it to clear history on explicit disconnect.
+ */
 export function App() {
+  return (
+    <TaskStoreProvider>
+      <AppInner />
+    </TaskStoreProvider>
+  );
+}
+
+function AppInner() {
+  const { clearAll } = useTaskStore();
   const [connected, setConnected] = useState(false);
   const [activePage, setActivePage] = useState<Page>('workspace');
   const [error, setError] = useState<string | null>(null);
@@ -71,6 +88,9 @@ export function App() {
     } catch (err) {
       console.error('disconnect failed:', err);
     }
+    // Explicit disconnect: forget per-session history (mirrors the backend
+    // clearing its pending queue). Session SWITCHES do not reset it.
+    clearAll();
     setConnected(false);
     setActivePage('workspace');
     setSessions([]);

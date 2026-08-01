@@ -4,7 +4,7 @@
 
 // ---- Error type -----------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
     /// Channel is dead — no recovery possible.
     Dead(&'static str),
@@ -15,6 +15,21 @@ pub enum TransportError {
     /// Payload too large for this channel.
     PayloadTooLarge(usize),
 }
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dead(reason) => write!(f, "channel is permanently unavailable: {reason}"),
+            Self::Transient(reason) => write!(f, "temporary channel failure: {reason}"),
+            Self::Timeout => f.write_str("channel operation timed out"),
+            Self::PayloadTooLarge(size) => {
+                write!(f, "payload is too large for this channel ({size} bytes)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TransportError {}
 
 // ---- Transport trait ------------------------------------------------------
 
@@ -28,8 +43,12 @@ pub trait Transport {
     /// Receive next frame. Blocks up to `timeout_ms`.
     fn recv(&mut self, timeout_ms: u32) -> Result<Vec<u8>, TransportError>;
 
-    /// Check channel health. Returns latency in ms, or None if dead.
-    fn health_check(&self) -> Option<u64>;
+    /// Check channel health and return latency in milliseconds.
+    ///
+    /// Unlike an `Option`, the error preserves whether the probe timed out,
+    /// hit a transient network failure, or found a permanently unusable
+    /// configuration/credential.
+    fn health_check(&self) -> Result<u64, TransportError>;
 
     /// Channel identifier for logging.
     fn name(&self) -> &'static str;
@@ -236,6 +255,22 @@ mod frame_integrity_tests {
 
     fn k(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    #[test]
+    fn transport_error_display_is_operator_readable() {
+        assert_eq!(
+            TransportError::Dead("credential rejected").to_string(),
+            "channel is permanently unavailable: credential rejected"
+        );
+        assert_eq!(
+            TransportError::Transient("upstream unavailable").to_string(),
+            "temporary channel failure: upstream unavailable"
+        );
+        assert_eq!(
+            TransportError::PayloadTooLarge(4097).to_string(),
+            "payload is too large for this channel (4097 bytes)"
+        );
     }
 
     #[test]

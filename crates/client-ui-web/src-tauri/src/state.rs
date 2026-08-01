@@ -23,6 +23,11 @@ pub struct PendingTask {
     pub session: String,
     /// Human-readable command string for display.
     pub command_label: String,
+    /// Consecutive EMPTY `/api/results` drains since a result last arrived.
+    /// The poll loop increments this on empty drains and resets it when any
+    /// result drains; at `MAX_EMPTY_DRAINS` the task is expired and the
+    /// console block is resolved with a synthetic error result (dead beacon).
+    pub empty_drains: u32,
 }
 
 /// The full backend state. Held in an `Arc<RwLock<>>` so the poll loop and

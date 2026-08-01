@@ -11,6 +11,20 @@
 //! on `embed!` to keep sensitive config values confidential. Set
 //! `NYX_CONFIG_KEY=<hex>` at build time to bake a unique key per build; the key
 //! is still embedded either way.
+//!
+//! ## Build-dependency tracking
+//!
+//! `embed!` reads two inputs at compile time — the config file and the
+//! `NYX_CONFIG_KEY` env var — so a rebuild is required when either changes. The
+//! canonical mechanism is registering them via `proc_macro::tracked_path::path`
+//! and `proc_macro::tracked_env::var`, but on the pinned stable toolchain
+//! (1.96) those APIs are still unstable (`proc_macro_tracked_env`,
+//! <https://github.com/rust-lang/rust/issues/99515>) and cannot be used from a
+//! stable proc macro. Until they stabilize, cargo only re-runs `embed!` when
+//! this crate or a dependent crate is rebuilt; consumers that need incremental
+//! picks of config edits must declare the inputs in their own build script
+//! (`cargo:rerun-if-changed=<config path>`,
+//! `cargo:rerun-if-env-changed=NYX_CONFIG_KEY`) — see crates/implant-win/build.rs.
 
 use std::path::Path;
 
@@ -39,12 +53,26 @@ use rand::{Rng, RngCore};
 /// Set `NYX_CONFIG_KEY=<64 hex chars>` at build time to substitute your own
 /// 32-byte key for the default random one (e.g. to give each operator/build a
 /// unique key). The key is still embedded in the binary either way.
+///
+/// **Build tracking:** the config path and `NYX_CONFIG_KEY` are compile-time
+/// inputs. The intended registration (`proc_macro::tracked_path` /
+/// `proc_macro::tracked_env`) is not yet usable on the pinned stable toolchain
+/// — see the crate-level docs for the current caveat and workaround.
 #[proc_macro]
 pub fn embed(input: TokenStream) -> TokenStream {
     let lit = syn::parse_macro_input!(input as syn::LitStr);
     let rel = lit.value();
     let path = resolve(&rel);
 
+    // TRACKED-DEPS: register the config file as a build input so cargo re-runs
+    // this macro when the file changes. On the pinned stable toolchain this API
+    // is still unstable (`proc_macro::tracked_path`, rust-lang/rust#99515), so
+    // the call cannot ship yet. Once stable, add exactly:
+    //     proc_macro::tracked_path::path(&path);
+    // here — before the read below, so a missing file at first build is still
+    // registered and creating it later triggers a rebuild. Until then consumers
+    // must declare the path via `cargo:rerun-if-changed` in their own build
+    // script (see crate-level docs).
     let plain = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) => {
@@ -157,6 +185,13 @@ fn encrypt(plain: &[u8], key: [u8; 32]) -> ([u8; 12], Vec<u8>) {
 /// - `Err(msg)` if `NYX_CONFIG_KEY` is set but malformed (surfaced as a
 ///   compile error at the call site).
 fn resolve_key() -> Result<Option<[u8; 32]>, String> {
+    // TRACKED-DEPS: re-read via `proc_macro::tracked_env::var("NYX_CONFIG_KEY")`
+    // (returns `Option<String>`, `None` when unset) once that API is stable. It
+    // is functionally identical to the `std::env::var` read below but also
+    // registers the variable as a build input, so cargo re-runs the macro when
+    // the key changes. As of the pinned stable toolchain (1.96) it is still
+    // unstable (rust-lang/rust#99515); see the crate-level docs for the
+    // workaround (`cargo:rerun-if-env-changed=NYX_CONFIG_KEY` in consumers).
     match std::env::var("NYX_CONFIG_KEY") {
         Ok(raw) => {
             let trimmed = raw.trim();

@@ -85,7 +85,7 @@ pub fn lint(p: &Profile) -> Vec<Diagnostic> {
         }
         for side in ["client", "server"] {
             if let Some(sb) = b.sub(side) {
-                check_data_blocks(sb, &mut d);
+                check_data_blocks(side, sb, &mut d);
                 // Recursively reject CR/LF in any `header`/`parameter`/
                 // `uri-append` statement args anywhere under this side — those
                 // bytes ride on the wire (headers / query / URL) where a stray
@@ -105,6 +105,15 @@ pub fn lint(p: &Profile) -> Vec<Diagnostic> {
             let s = u.as_str();
             if DEFAULT_UA_FRAGMENTS.iter().any(|frag| s.contains(frag)) {
                 d.push(warn(0, "useragent matches a known Beacon default"));
+            }
+            // `set useragent` is baked verbatim into the implant's User-Agent
+            // header on every check-in — CR/LF there is header injection /
+            // request splitting, the same class the block-level scan rejects.
+            if has_crlf(s) {
+                d.push(err(
+                    0,
+                    "`set useragent` contains CR/LF (HTTP header injection risk)",
+                ));
             }
         }
     }
@@ -147,19 +156,56 @@ pub fn lint(p: &Profile) -> Vec<Diagnostic> {
     d
 }
 
-fn check_data_blocks(side: &crate::ast::Block, d: &mut Vec<Diagnostic>) {
-    let dbs = side
+fn check_data_blocks(side: &str, side_block: &crate::ast::Block, d: &mut Vec<Diagnostic>) {
+    let dbs = side_block
         .subs("output")
-        .chain(side.subs("metadata"))
-        .chain(side.subs("id"));
+        .chain(side_block.subs("metadata"))
+        .chain(side_block.subs("id"));
     for db in dbs {
         let mut terms = 0usize;
+        // The RESOLVED terminator is the FIRST terminator statement in the
+        // block (envelope.rs::terminator_of) — the downstream enforcement
+        // points (implant-win/build.rs emit_envelopes, the server's
+        // handle_beacon bail) check exactly that resolved value, so mirror
+        // them here instead of counting every terminator occurrence.
+        let mut seen_first_term = false;
         for item in &db.items {
             if let Item::Stmt { keyword, line, .. } = item {
                 let kw = keyword.as_str();
                 if TRANSFORMS.contains(&kw) {
                     // transform step
                 } else if TERMINATORS.contains(&kw) {
+                    if !seen_first_term {
+                        seen_first_term = true;
+                        // Capability matrix: the shipping implant/server pair
+                        // cannot serve a client-side `parameter` terminator
+                        // (the server bails every check-in,
+                        // server/src/lib.rs:1135-1137, and the implant build
+                        // panics) nor a server-response `header` terminator
+                        // (the implant never queries response headers;
+                        // implant-win/build.rs panics). A clean lint verdict
+                        // for a profile that hard-fails downstream is a trap.
+                        if side == "client" && kw == "parameter" {
+                            d.push(err(
+                                *line,
+                                format!(
+                                    "`{}`: client `parameter` terminator is unsupported \
+                                     (server bails every check-in; implant build panics)",
+                                    db.name
+                                ),
+                            ));
+                        }
+                        if side == "server" && kw == "header" {
+                            d.push(err(
+                                *line,
+                                format!(
+                                    "`{}`: server `header` terminator is unsupported \
+                                     (implant never queries response headers; build panics)",
+                                    db.name
+                                ),
+                            ));
+                        }
+                    }
                     terms += 1;
                 } else {
                     d.push(err(

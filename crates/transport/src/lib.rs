@@ -25,12 +25,13 @@
 //! chain that drives `send`/`recv`/`health_check`/`init`/`max_frame_size`
 //! across a `Vec<Box<dyn Transport>>`.
 //!
-//! The server (`crates/server`) uses the stack to back its `/extc2/slack` and
-//! `/extc2/mcp` routes, which now actually relay to the real third-party API
-//! via `SlackTransport` / `McpTransport` (see `server/src/extc2_relay.rs`).
-//! The other 4 channels (`malleable`, `doh_dns`, `llm_api`, `smb_pipe`) are
-//! still stack-ready but not yet wired to a server route — see the per-channel
-//! design notes in `extc2_relay.rs`.
+//! The server (`crates/server`) will consume the stack to back its `/extc2/slack`
+//! and `/extc2/mcp` routes — that wiring lands in `server/src/extc2_relay.rs`
+//! this sprint. Until then those routes relay through directly-constructed
+//! `SlackTransport` / `McpTransport` instances, not the stack. The other 4
+//! channels (`malleable`, `doh_dns`, `llm_api`, `smb_pipe`) are stack-ready but
+//! not yet wired to a server route — see the per-channel design notes in
+//! `extc2_relay.rs`.
 //!
 //! `implant-win` remains on its own hand-rolled WinHTTP/kernel32 channel
 //! system (`channels/`) by design: it is `#![no_std]` PIC and cannot link the
