@@ -5,6 +5,17 @@
 //! This adapter bridges them: each `kread/kwrite` call translates the VA to
 //! physical via the 4-level page walk, then calls the driver's physical R/W.
 //!
+//! ## Address-space contract (kernelsdk-2-1)
+//! This adapter presents the base [`KernelRw`] **virtual** contract: the
+//! addresses fed to `kread`/`kwrite` are kernel VAs (canonical high-half,
+//! `0xFFFF_8000_…`+). Every VA is validated with
+//! [`crate::netsec::is_plausible_kernel_va`] before the walk, so feeding a
+//! **physical** address (or a user VA) — the classic VA/PA mix-up — returns
+//! a clear [`KrwError`] instead of walking a bogus page table or reading
+//! unrelated memory. Contrast with `netsec::KrwPhysRead` / `read_process_mem`,
+//! which require a PHYSICAL-addressing `KernelRw`; the two spaces must never
+//! be mixed on one primitive.
+//!
 //! ## CR3 source
 //! The page walk needs the kernel's CR3 (DirectoryTableBase). For kernel
 //! addresses, CR3 is the SYSTEM process's DTB. We read it from
@@ -35,6 +46,16 @@ impl<P: PhysRead + PhysWrite> VaKernelRw<P> {
     pub fn new(phys: P, cr3: u64) -> Self {
         Self { phys, cr3 }
     }
+
+    /// The address space this adapter presents: `KernelRwAddressSpace::Virtual`
+    /// (the base VA contract; the type lives in `crate::netsec`).
+    ///
+    /// Queryable at runtime so an operator can confirm an impl matches the
+    /// consumer's expectation before wiring it into a page-walk (physical)
+    /// path like `netsec::KernelLsassReader::read_process_mem`.
+    pub fn address_space(&self) -> crate::netsec::KernelRwAddressSpace {
+        crate::netsec::KernelRwAddressSpace::Virtual
+    }
 }
 
 /// Adapt PhysReadError → KrwError.
@@ -50,6 +71,16 @@ fn map_phys_err(e: PhysReadError) -> KrwError {
 
 impl<P: PhysRead + PhysWrite + Send + Sync> KernelRw for VaKernelRw<P> {
     fn kread(&self, kaddr: usize, dst: &mut [u8]) -> Result<(), KrwError> {
+        // Contract check: kread takes kernel VAs. A physical address (or user
+        // VA) fed here means the caller mixed address spaces — error clearly
+        // instead of walking garbage page tables (kernelsdk-2-1).
+        if !crate::netsec::is_plausible_kernel_va(kaddr as u64) {
+            return Err(KrwError::Other(
+                "VaKernelRw: address is not a kernel VA (physical/user address fed to a \
+                 VA-based KernelRw?)"
+                    .into(),
+            ));
+        }
         // Chunk reads by 4KB page boundary — consecutive virtual pages are
         // rarely mapped to contiguous physical pages. Reading across a boundary
         // without re-translating fetches data from unrelated physical pages
@@ -70,6 +101,14 @@ impl<P: PhysRead + PhysWrite + Send + Sync> KernelRw for VaKernelRw<P> {
     }
 
     fn kwrite(&self, kaddr: usize, src: &[u8]) -> Result<(), KrwError> {
+        // Contract check: kwrite takes kernel VAs (see kread).
+        if !crate::netsec::is_plausible_kernel_va(kaddr as u64) {
+            return Err(KrwError::Other(
+                "VaKernelRw: address is not a kernel VA (physical/user address fed to a \
+                 VA-based KernelRw?)"
+                    .into(),
+            ));
+        }
         // Write crossing a page boundary: walk each 4KB page separately.
         // Most kernel writes are small (u64 IsEnabled, pointer unlink) and
         // fit in one page, but handle the general case for correctness.

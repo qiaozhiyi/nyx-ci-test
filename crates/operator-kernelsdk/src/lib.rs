@@ -34,6 +34,11 @@
 //! - `persistence::TimingRepairWindow` / `RuntimePgBypassWindow` — the two real
 //!   PatchGuard bypass windows, selected by `win::select_pg_window` (capability-
 //!   driven: PG-context offsets table + `supports_thread_suspend` flag).
+//!   ⚠ EXPERIMENTAL (kernelsdk-1-1): the PG-context table rows are PLACEHOLDER
+//!   offsets (0x190/0x08, never PDB-verified) — `select_pg_window` gates on
+//!   `PgContextOffsets::verified` and returns `None` for every build until
+//!   per-build validation lands. The bypass code paths stay; the capability
+//!   is OFF rather than silently wrong.
 //! - `netsec::UserModeEdrSilencer` — WFP block-rule templates (FFI operator-side).
 //! - `netsec::KernelLsassReader` — DTB read + page-walk orchestration shell.
 //! - `netsec::EdrNeutralizer` — Kill/Freeze/Choke tiers (framework).
@@ -437,14 +442,29 @@ impl CredKit for NoKernel {
 
 // ---- §6 Assembled tier ----------------------------------------------------
 
+/// Opaque handle to a loaded kernel driver (the BYOVD `LoadedDriver`).
+///
+/// [`KernelTier::loaded_driver`] holds this behind a trait object so the
+/// non-cfg-gated `KernelTier` (defined here in lib.rs) can store the
+/// Windows-only `LoadedDriver`. The only operation that matters is the
+/// explicit unload (NtUnloadDriver + registry-key cleanup) — there is
+/// deliberately no auto-unload on drop (the operator may keep a driver loaded
+/// across operations; the tier's [`KernelTier::unload_driver`] is the cleanup
+/// path).
+pub trait DriverHandle: Send + Sync {
+    /// Unload the driver (NtUnloadDriver) + delete its registry service key.
+    /// Best-effort; safe to call once — a second unload fails harmlessly.
+    fn unload(&mut self);
+}
+
 /// An engagement's kernel tier, assembled at runtime after the operator picks a
 /// bootstrap path. `rw` is the LIVE kernel primitive (moved out of the
 /// `KernelBootstrap` by `assemble_tier`); the rest are optional kits that
 /// degrade to `None` when their required offsets aren't resolved.
 ///
-/// `loaded_driver` holds the BYOVD `LoadedDriver` (for explicit `unload()` by
-/// the operator). It does NOT auto-unload on drop (by design — see
-/// `LoadedDriver`'s Drop). KslD path leaves this `None`.
+/// `loaded_driver` holds the BYOVD `LoadedDriver` (for explicit unload by the
+/// operator via [`KernelTier::unload_driver`]). It does NOT auto-unload on
+/// drop (by design — see `LoadedDriver`'s Drop). KslD path leaves this `None`.
 ///
 /// PG windows are NOT stored here (they borrow `&dyn KernelRw` for their
 /// repair callback and can't outlive `rw`). Use `select_pg_window(build,
@@ -462,10 +482,11 @@ pub struct KernelTier {
     /// primitive via `EdrNeutralizer::kill(krw, pid)` directly; Freeze/Choke
     /// are user-mode tiers that run real FFI when this is `Some`.
     pub neutralize: Option<Box<dyn EdrNeutralizeKit>>,
-    /// BYOVD loaded driver (for explicit unload). Opaque `Send+Sync` box so the
-    /// non-cfg-gated `KernelTier` (defined here in lib.rs) can hold the
-    /// Windows-only `LoadedDriver`. `None` for KslD path.
-    pub loaded_driver: Option<Box<dyn Send + Sync>>,
+    /// BYOVD loaded driver (for explicit unload via [`KernelTier::unload_driver`]).
+    /// Opaque [`DriverHandle`] box so the non-cfg-gated `KernelTier` (defined
+    /// here in lib.rs) can hold the Windows-only `LoadedDriver`. `None` for
+    /// KslD path.
+    pub loaded_driver: Option<Box<dyn DriverHandle>>,
 }
 
 impl KernelTier {
@@ -483,5 +504,66 @@ impl KernelTier {
             neutralize: None,
             loaded_driver: None,
         }
+    }
+
+    /// Explicitly unload the BYOVD driver held by this tier, if any.
+    ///
+    /// This is the documented cleanup flow for the BYOVD bootstrap
+    /// (kernelsdk-1-2): the driver does NOT auto-unload on drop (the operator
+    /// may keep it loaded across ops), so the tier hands out the handle with
+    /// this method. On success the driver has been unloaded (NtUnloadDriver)
+    /// and its registry service key deleted, `self.loaded_driver` is `None`,
+    /// and the returned box lets the caller confirm what was unloaded. KslD
+    /// path (no loaded driver) returns `None` and does nothing.
+    pub fn unload_driver(&mut self) -> Option<Box<dyn DriverHandle>> {
+        if let Some(mut driver) = self.loaded_driver.take() {
+            driver.unload();
+            Some(driver)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Minimal `DriverHandle` that counts unload calls (host-testable stand-in
+    /// for the Windows-only `LoadedDriver`).
+    struct MockDriver {
+        unload_count: Arc<AtomicUsize>,
+    }
+
+    impl DriverHandle for MockDriver {
+        fn unload(&mut self) {
+            self.unload_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn unload_driver_unloads_exactly_once_and_clears_field() {
+        // Nothing loaded (KslD path) → None, no-op.
+        let mut tier = KernelTier::floor();
+        assert!(tier.unload_driver().is_none());
+
+        // Loaded driver → unload_driver runs unload() exactly once, clears
+        // the field, and returns the handle so the caller can confirm.
+        let count = Arc::new(AtomicUsize::new(0));
+        tier.loaded_driver = Some(Box::new(MockDriver {
+            unload_count: Arc::clone(&count),
+        }));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+
+        let handle = tier.unload_driver();
+        assert!(handle.is_some());
+        assert_eq!(count.load(Ordering::SeqCst), 1, "unload must run exactly once");
+        assert!(tier.loaded_driver.is_none(), "field must be cleared after unload");
+
+        // Second call is a harmless no-op (idempotent contract).
+        assert!(tier.unload_driver().is_none());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

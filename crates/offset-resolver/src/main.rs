@@ -8,10 +8,13 @@
 //! ## Usage
 //! ```sh
 //! # Resolve offsets for a known ntoskrnl.exe (from the target or a Win ISO):
-//! nyx-offset-resolver --pdb-path /path/to/ntoskrnl.pdb --out offsets.toml
+//! # NOTE: --build is REQUIRED — the build number cannot be auto-detected from
+//! # a PDB (see `--build` in --help); a silent default previously shipped the
+//! # wrong ETW-TI offsets (kernel-tools-2).
+//! nyx-offset-resolver --pdb-path /path/to/ntoskrnl.pdb --build 17763 --out offsets.toml
 //!
 //! # Or download from the symbol server by GUID + age:
-//! nyx-offset-resolver --guid <32-hex> --age <n> --out offsets.toml
+//! nyx-offset-resolver --guid <32-hex> --age <n> --build 17763 --out offsets.toml
 //! ```
 //!
 //! Then build the implant with the baked offsets:
@@ -26,11 +29,18 @@
 //! constants in the binary, indistinguishable from any other data.
 //!
 //! ## Status
-//! The download + TOML emission pipeline is COMPLETE. The PDB field-offset
-//! walker is the next iteration — the `pdb` crate's TypeData/FieldList API
-//! needs careful traversal. For now this emits the build's known offsets from
-//! the cross-version table (offsets_table.rs), proving the end-to-end pipeline.
-//! The walker replaces `emit_known_offsets` with real PDB-parsed values.
+//! The download + TOML emission pipeline and the PDB field-offset walker
+//! (EPROCESS + ETW-TI, via the `pdb` crate's TypeData/FieldList API) are
+//! COMPLETE. A PDB source parses the real offsets; `emit_known_offsets` is the
+//! fallback for `--build`-only runs.
+//!
+//! **Build-number detection (kernel-tools-2):** the Windows build number is a
+//! runtime u32 stored in ntoskrnl's `.data` section at the `NtBuildNumber`
+//! symbol's RVA. A PDB records that symbol's RVA but NOT the section bytes it
+//! points to (verified against msdl's ntkrnlmp.pdb: the DBI stream ends right
+//! after the DbgHdr; no raw section data is embedded anywhere in the file).
+//! So the build number cannot be extracted from a PDB, `--build <num>` is
+//! required on every run, and there is deliberately NO silent default.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -67,13 +77,21 @@ fn main() -> Result<()> {
                      \n\
                      --ntoskrnl <exe>  Extract PDB GUID+age from a live ntoskrnl.exe's PE\n\
                                        debug directory (CodeView entry), download the matching\n\
-                                       PDB from MS symbol server, parse real offsets. This is\n\
-                                       the one-shot mode for CI: point it at C:\\Windows\\System32\\\n\
-                                       ntoskrnl.exe and it does everything. No PowerShell needed.\n\
+                                       PDB from MS symbol server, parse real offsets. Pair with\n\
+                                       --build (below) — the build cannot be detected from a\n\
+                                       PDB, so the CI one-shot needs --build 17763.\n\
                      --guid <hex> --age <n>\n\
                                        Download by explicit GUID+age (hex GUID, no dashes).\n\
+                                       Requires --build <num>.\n\
                      --pdb-path <file> Parse a local ntoskrnl.pdb you already have.\n\
-                     --build <num>     Use the known offsets table for build <num> (no PDB).\n\
+                                       Requires --build <num>: a PDB stores the NtBuildNumber\n\
+                                       symbol's RVA but not the u32 value at that RVA (raw .data\n\
+                                       section bytes are not embedded in the PDB), so the build\n\
+                                       cannot be auto-detected. A silent 17763 default previously\n\
+                                       baked wrong ETW-TI offsets (kernel-tools-2).\n\
+                     --build <num>     REQUIRED on every run. Use the known offsets table for\n\
+                                       build <num> (no PDB), or name the build whose PDB you are\n\
+                                       parsing via --pdb-path/--guid/--ntoskrnl.\n\
                      --fltmgr <exe>    ALSO resolve FltGlobals RVA from a live fltmgr.sys PE\n\
                                        (downloads fltmgr.pdb, parses the global symbol, merges\n\
                                        `flt.globals_rva` into the output). Combine with any source\n\
@@ -95,44 +113,47 @@ fn main() -> Result<()> {
             .with_context(|| format!("extract PDB ref from {}", nk_path.display()))?;
         eprintln!("Extracted from {}: GUID={nk_guid} AGE={nk_age}", nk_path.display());
         guid = Some(nk_guid);
-        // If --build wasn't given, we'll auto-detect from the downloaded PDB below.
         if age.is_none() { age = Some(nk_age); }
     }
 
-    // Determine the build number: from --build, or extract from the PDB.
-    // For --guid/--age we also retain the downloaded PDB bytes so the real
-    // offsets can be parsed from them below (instead of falling back to the
-    // known table).
+    // The build number must ALWAYS be explicit (kernel-tools-2). There is no
+    // auto-detection: the Windows build number is a runtime u32 stored in
+    // ntoskrnl's .data section at the `NtBuildNumber` symbol's RVA, and a PDB
+    // records only the symbol's RVA — not the section bytes it points to
+    // (verified against msdl's ntkrnlmp.pdb 17763.1339: the DBI stream ends
+    // exactly after the DbgHdr and no raw section data is embedded anywhere in
+    // the file). The old `detect_build_from_pdb` stub therefore always
+    // returned None, and every PDB-driven run silently baked 17763's ETW-TI
+    // offsets into the TOML. That silent wrong-offset path is gone: without
+    // `--build`, a PDB source is a hard error telling the operator to name the
+    // build explicitly.
+    if guid.is_some() != age.is_some() {
+        return Err(anyhow!("--guid and --age must be provided together"));
+    }
     let mut downloaded_pdb: Option<Vec<u8>> = None;
     let build_num = if let Some(b) = build {
         b
-    } else if let Some(path) = &pdb_path {
-        let data = std::fs::read(path).context("read pdb for auto-detect")?;
-        detect_build_from_pdb(&data).unwrap_or_else(|| {
-            eprintln!("Warning: could not auto-detect build from PDB; using 17763 as default.");
-            17763
-        })
-    } else if let (Some(g), Some(a)) = (&guid, age) {
-        // --guid/--age without --build: download the PDB and auto-detect the
-        // build from its symbols, falling back to 17763 if detection fails.
-        let pdb_name = "ntkrnlmp.pdb";
-        let data = download_pdb(pdb_name, g, a)
-            .context("download PDB from symbol server")?;
-        let detected = detect_build_from_pdb(&data);
-        let build = if let Some(b) = detected {
-            eprintln!("Auto-detected build {b} from downloaded PDB.");
-            b
-        } else {
-            eprintln!("Warning: could not auto-detect build from downloaded PDB; using 17763 as default.");
-            17763
-        };
-        downloaded_pdb = Some(data);
-        build
+    } else if pdb_path.is_some() || guid.is_some() {
+        return Err(anyhow!(
+            "cannot auto-detect the Windows build from a PDB: the PDB stores the \
+             NtBuildNumber symbol's RVA but not the u32 value at that RVA (raw \
+             .data section bytes are not embedded in the PDB). Pass --build <num> \
+             explicitly, e.g. --build 17763."
+        ));
     } else {
         return Err(anyhow!(
             "provide --build <num>, --pdb-path <file>, or --guid <hex> --age <n>"
         ));
     };
+
+    // --guid/--age (and --ntoskrnl, which folded into --guid/--age above):
+    // download the PDB so the real offsets are parsed from it below instead
+    // of the known table. build_num is already pinned by --build.
+    if let (Some(g), Some(a)) = (&guid, age) {
+        let data = download_pdb("ntkrnlmp.pdb", g, a)
+            .context("download PDB from symbol server")?;
+        downloaded_pdb = Some(data);
+    }
 
     // Parse the REAL offsets from a PDB if we have one (local --pdb-path OR a
     // freshly-downloaded one); otherwise fall back to the known-build table.
@@ -174,41 +195,6 @@ fn main() -> Result<()> {
     std::fs::write(&out, &toml)?;
     eprintln!("Wrote offsets for build {build_num} to {}", out.display());
     Ok(())
-}
-
-/// Try to detect the Windows build number from PDB global symbols.
-/// Scans the symbol stream for `NtBuildNumber` (an ntoskrnl global variable)
-/// and reads its value to determine the build.
-fn detect_build_from_pdb(data: &[u8]) -> Option<u32> {
-    use pdb::{PDB, FallibleIterator};
-    let cursor = std::io::Cursor::new(data.to_vec());
-    let mut pdb = PDB::open(cursor).ok()?;
-    let symbols = pdb.global_symbols().ok()?;
-    let mut iter = symbols.iter();
-    while let Some(symbol) = iter.next().ok()? {
-        if let Ok(pdb::SymbolData::Public(data)) = symbol.parse() {
-            let name = data.name.to_string();
-            // NtBuildNumber is the canonical global holding the build number.
-            if name == "NtBuildNumber" || name == "_NtBuildNumber" {
-                // The RVA tells us where it lives; the actual build value
-                // is stored at that address (runtime read), but we can
-                // correlate with known ranges by checking the PDB's named
-                // streams or nearby symbols. For now, this serves as a
-                // positive build-range indicator.
-                // NOTE: full build extraction requires reading the data
-                // stream at this RVA — the known-table fallback covers
-                // this gap for all currently-supported builds.
-                eprintln!("  Found NtBuildNumber symbol (offset={:?})", data.offset);
-            }
-        }
-    }
-    // Heuristic: scan the type stream for _KUSER_SHARED_DATA which embeds
-    // NtMajorVersion / NtMinorVersion / NtBuildNumber fields.
-    // The actual build is a runtime value, but we can infer from the PDB's
-    // compile target or version info if available.
-    // Fallback: use the known table by checking which build's EPROCESS
-    // offsets match the PDB's _EPROCESS layout.
-    None
 }
 
 /// Parse EPROCESS + ETW-TI field offsets from a real ntoskrnl PDB using the
@@ -555,9 +541,9 @@ fn resolve_flt_globals_rva(fltmgr_exe: &std::path::Path) -> Result<usize> {
         .context("parse FltGlobals RVA from fltmgr.pdb")
 }
 
-/// Find the RVA of a named global symbol in a PDB by walking the public/global
-/// symbol stream. Modeled on `detect_build_from_pdb` (which already iterates
-/// `global_symbols()` to find `NtBuildNumber` by name).
+/// Find the RVA of a named global symbol in a PDB by walking the global
+/// symbol stream (`global_symbols()` — the same stream that carries
+/// `NtBuildNumber`'s RVA for build identification).
 ///
 /// `names` is tried in order (some symbols are underscore-prefixed on x64).
 /// Returns the first match's RVA. The RVA is computed from the PDB's section
@@ -654,4 +640,83 @@ fn emit_toml(build: u32, offsets: &BTreeMap<&str, usize>) -> String {
         s.push_str(&format!("{} = 0x{:x}\n", k, v));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nyx_implant_evasionsdk::offsets_table as ev;
+
+    /// The known-offsets rows `--build` emits must agree with the implant-side
+    /// canonical table (`evasionsdk::offsets_table`) for every overlapping
+    /// build. The baked offsets are the compile-time primary path, so a row
+    /// that disagrees with the canonical table would ship a wrong offset
+    /// straight into the implant binary.
+    #[test]
+    fn emit_known_offsets_rows_agree_with_evasionsdk_table() {
+        // Iterate the canonical build → patched-build map (exact + patch-
+        // equivalent builds). Every one must have a matching row here.
+        for &(build, patched) in ev::known_builds() {
+            // The accessor's pair must match for_build's own resolution.
+            let ev_off = ev::for_build(build)
+                .unwrap_or_else(|| panic!("evasionsdk table misses its own pair build {build}"));
+            assert_eq!(
+                ev_off.build, patched,
+                "evasionsdk pair ({build}, {patched}) disagrees with for_build"
+            );
+
+            let row = emit_known_offsets(build)
+                .unwrap_or_else(|| panic!("emit_known_offsets misses build {build}"));
+            assert_eq!(
+                row["eprocess.unique_process_id"],
+                ev_off.eprocess.unique_process_id,
+                "pid row mismatch for build {build}"
+            );
+            assert_eq!(
+                row["eprocess.active_process_links"],
+                ev_off.eprocess.active_process_links,
+                "links row mismatch for build {build}"
+            );
+            assert_eq!(
+                row["eprocess.token"],
+                ev_off.eprocess.token,
+                "token row mismatch for build {build}"
+            );
+            assert_eq!(
+                row["eprocess.image_file_name"],
+                ev_off.eprocess.image_file_name,
+                "image row mismatch for build {build}"
+            );
+            assert_eq!(
+                row["eprocess.signature_level"],
+                ev_off.eprocess.signature_level,
+                "sig-level row mismatch for build {build}"
+            );
+            assert_eq!(
+                row["eprocess.section_signature_level"],
+                ev_off.eprocess.section_signature_level,
+                "sec-sig-level row mismatch for build {build}"
+            );
+            assert_eq!(
+                row["eprocess.protection"],
+                ev_off.eprocess.protection,
+                "protection row mismatch for build {build}"
+            );
+            assert_eq!(
+                row["etw_ti.guid_entry_to_provider_block"],
+                ev_off.etw_ti.guid_entry_to_provider_block,
+                "etw guid-entry row mismatch for build {build}"
+            );
+            assert_eq!(
+                row["etw_ti.provider_block_to_enable_info"],
+                ev_off.etw_ti.provider_block_to_enable_info,
+                "etw provider-block row mismatch for build {build}"
+            );
+            assert_eq!(
+                row["etw_ti.is_enabled_within_enable_info"],
+                ev_off.etw_ti.is_enabled_within_enable_info,
+                "etw is-enabled row mismatch for build {build}"
+            );
+        }
+    }
 }

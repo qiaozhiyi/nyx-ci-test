@@ -11,6 +11,10 @@
 //!   [`crate::win::select_pg_window`]. No skeleton base — selection is
 //!   capability-driven (`supports_thread_suspend` flag + PG-context offsets
 //!   table) and returns `None` when no window is available for the build.
+//!   ⚠ EXPERIMENTAL (kernelsdk-1-1): the PG-context table rows are
+//!   PLACEHOLDER offsets (0x190/0x08, never PDB-verified), so `select_pg_window`
+//!   is gated OFF (returns `None`) until a row flips `PgContextOffsets::verified`.
+//!   These windows remain code-available for the verified-row future.
 //!
 //! All consume `&dyn KernelRw` + version-resolved [`EprocessOffsets`] from
 //! [`crate::offsets`]. Unit-tested with a mock KernelRw; never run against a

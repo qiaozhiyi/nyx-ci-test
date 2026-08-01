@@ -36,6 +36,15 @@
 //! the Vergilius Project (_EPROCESS per build) + fluxsec.red. A wrong offset
 //! is a bugcheck, so each cites its build.
 //!
+//! ## Canonical source
+//! This module is the **canonical** cross-version kernel offset table for Nyx.
+//! The operator-side mirrors — `operator-kernelsdk::offsets` (EPROCESS) and
+//! `operator-kernelsdk::etwti` (ETW-TI) — and `offset-resolver`'s
+//! `emit_known_offsets` must agree with it on every overlapping build: those
+//! crates dev-depend on this one and run consistency tests that fail when a
+//! build resolves to a different patched build here. When a build row or the
+//! patch-equivalent policy changes, update the mirrors and run those tests.
+//!
 //! ## Layout stability (what does NOT drift)
 //! - x64 PEB layout (gs:[0x60], ImageBaseAddress@0x10, BeingDebugged@0x02,
 //!   OSBuildNumber@0x120) — frozen by the x64 ABI across all Win10/11/Server.
@@ -45,7 +54,6 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 extern crate alloc;
-use alloc::vec::Vec;
 
 /// EPROCESS field offsets for one Windows build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,9 +323,35 @@ pub fn for_build_strict(build: u32, ubr: u32) -> Option<EtwTiOffsets> {
     }
 }
 
-/// All known build numbers (for diagnostics / selftest display).
-pub fn known_builds() -> Vec<u32> {
-    KNOWN_BUILDS.iter().map(|b| b.build).collect()
+/// All builds this table knows how to resolve, as `(build, patched_build)`
+/// pairs (for diagnostics / selftest display / cross-crate consistency
+/// checks). `patched_build` is the row the build resolves to: an exact
+/// [`KNOWN_BUILDS`] match maps to itself; a [`PATCH_EQUIVALENT_BUILDS`]
+/// patch build maps to its baseline (e.g. `(19045, 19041)`).
+///
+/// This is the canonical build → patched-build map: `operator-kernelsdk` and
+/// `offset-resolver` dev-depend on this crate and assert their own tables
+/// resolve every overlapping build to the SAME patched build listed here.
+pub fn known_builds() -> &'static [(u32, u32)] {
+    // Exact rows: a build resolves to itself (mirrors KNOWN_BUILDS).
+    &[
+        (17763, 17763),
+        (18362, 18362),
+        (19041, 19041),
+        (20348, 20348),
+        (22621, 22621),
+        (22631, 22631),
+        (26100, 26100),
+        (26200, 26200),
+        // Patch-equivalent rows: (patch_build, baseline_build) — mirrors
+        // PATCH_EQUIVALENT_BUILDS.
+        (18363, 18362),
+        (19042, 19041),
+        (19043, 19041),
+        (19044, 19041),
+        (19045, 19041),
+        (22000, 20348),
+    ]
 }
 
 #[cfg(test)]
@@ -415,12 +449,30 @@ mod tests {
 
     #[test]
     fn known_builds_covers_major_releases() {
-        let builds = known_builds();
         // Must cover Server 2019, Win10 2004, Server 2022, Win11 22H2, Win11 24H2.
-        assert!(builds.contains(&17763));
-        assert!(builds.contains(&19041));
-        assert!(builds.contains(&20348));
-        assert!(builds.contains(&22621));
-        assert!(builds.contains(&26100));
+        assert!(known_builds().iter().any(|&(b, _)| b == 17763));
+        assert!(known_builds().iter().any(|&(b, _)| b == 19041));
+        assert!(known_builds().iter().any(|&(b, _)| b == 20348));
+        assert!(known_builds().iter().any(|&(b, _)| b == 22621));
+        assert!(known_builds().iter().any(|&(b, _)| b == 26100));
+    }
+
+    #[test]
+    fn known_builds_pairs_match_the_tables() {
+        // The pair list must exactly cover KNOWN_BUILDS + PATCH_EQUIVALENT_BUILDS
+        // and every pair must match for_build's resolution — keeps the accessor
+        // honest when either table gains a row.
+        assert_eq!(
+            known_builds().len(),
+            KNOWN_BUILDS.len() + PATCH_EQUIVALENT_BUILDS.len()
+        );
+        for &(build, patched) in known_builds() {
+            let o =
+                for_build(build).unwrap_or_else(|| panic!("build {build} not resolvable"));
+            assert_eq!(
+                o.build, patched,
+                "build {build} must resolve to patched build {patched}"
+            );
+        }
     }
 }

@@ -3,9 +3,14 @@
 version = 4
 
 [[package]]
+name = "nyx-implant-evasionsdk"
+version = "0.0.1"
+
+[[package]]
 name = "nyx-operator-kernelsdk"
 version = "0.0.1"
 dependencies = [
+ "nyx-implant-evasionsdk",
  "spin",
 ]
 

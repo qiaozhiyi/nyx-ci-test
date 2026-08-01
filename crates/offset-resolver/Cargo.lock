@@ -342,11 +342,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-implant-evasionsdk"
+version = "0.0.1"
+
+[[package]]
 name = "nyx-offset-resolver"
 version = "0.2.0"
 dependencies = [
  "anyhow",
  "goblin",
+ "nyx-implant-evasionsdk",
  "pdb",
  "sha2",
  "ureq",

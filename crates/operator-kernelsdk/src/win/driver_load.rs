@@ -85,7 +85,11 @@ impl LoadedDriver {
     /// 2. Call NtLoadDriver with the key path.
     /// 3. If STATUS_IMAGE_ALREADY_LOADED, that's OK (driver is usable).
     ///
-    /// Returns the LoadedDriver handle (Drop unloads + cleans the key).
+    /// Returns the LoadedDriver handle. It does NOT auto-unload on drop —
+    /// the operator may keep the driver loaded across operations (see the
+    /// `Drop` impl below). Cleanup is explicit: call [`unload`](Self::unload)
+    /// directly, or [`KernelTier::unload_driver`] when the driver is held by a
+    /// tier.
     ///
     /// # Safety
     /// Loading a driver changes kernel state; BSOD risk if the driver is buggy.
@@ -164,6 +168,16 @@ impl Drop for LoadedDriver {
     fn drop(&mut self) {
         // Don't auto-unload on drop — the operator may want the driver to stay
         // loaded across multiple operations. Explicit unload() is the cleanup path.
+    }
+}
+
+/// [`crate::DriverHandle`] impl — lets a `LoadedDriver` live behind the opaque
+/// [`crate::KernelTier::loaded_driver`] box and be unloaded via
+/// [`crate::KernelTier::unload_driver`]. Delegates to the inherent `unload`
+/// (method resolution prefers the inherent method, so this is not recursion).
+impl crate::DriverHandle for LoadedDriver {
+    fn unload(&mut self) {
+        self.unload();
     }
 }
 

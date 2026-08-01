@@ -436,6 +436,13 @@ impl RuntimeOffsets {
 //
 // Sources: kurasagi / TheiaPg research (Win11 24H2+), Outflank Peekaboo
 // (timing-based PG bypass), Vergilius _KPCR/_KPRCB layouts.
+//
+// ⚠ EXPERIMENTAL (kernelsdk-1-1): every row below carries PLACEHOLDER
+// offsets — `prcb_pg_thread_offset: 0x190` / `context_valid_offset: 0x08`
+// guessed from public KPCR/_KPRCB layouts, never verified against a live
+// kernel or PDB. `win::select_pg_window` gates on `PgContextOffsets::verified`
+// and returns `None` while a row is unverified, so the PatchGuard-window
+// capability is OFF for every build until per-build PDB validation lands.
 // ============================================================================
 
 /// Per-build PatchGuard context offsets. The bootstrap resolves the current
@@ -457,10 +464,21 @@ pub struct PgContextOffsets {
     /// Older builds (Win10 17763–19041) use the timing-repair approach
     /// instead of thread suspension.
     pub supports_thread_suspend: bool,
+    /// Whether this row's offsets were verified against a real kernel / PDB.
+    ///
+    /// **kernelsdk-1-1:** every row in [`KNOWN_PG_CONTEXT_BUILDS`] currently
+    /// carries PLACEHOLDER offsets (0x190 / 0x08 — guessed, never verified).
+    /// [`crate::win::select_pg_window`] refuses to build a bypass window from
+    /// an unverified row, so the PG-window capability stays gated OFF until
+    /// per-build PDB validation lands. Flip to `true` only with per-build
+    /// evidence (verified PDB/KPCR dump), never by assumption.
+    pub verified: bool,
 }
 
 /// Known PG context layouts. The bootstrap resolves these at runtime; the
-/// table below documents the known-good values for reference/testing.
+/// table below documents the reference/placeholder values for testing —
+/// NOT known-good until each row's `verified` flag is flipped (see
+/// [`PgContextOffsets::verified`]).
 pub struct PgContextBuild {
     pub build: u32,
     pub offsets: PgContextOffsets,
@@ -471,50 +489,55 @@ pub const KNOWN_PG_CONTEXT_BUILDS: &[PgContextBuild] = &[
     PgContextBuild {
         build: 17763,
         offsets: PgContextOffsets {
-            prcb_pg_thread_offset: 0x190, // PRCB.KiReservedContext area
-            context_valid_offset: 0x08,   // first qword = valid flag
+            prcb_pg_thread_offset: 0x190, // PRCB.KiReservedContext area (PLACEHOLDER)
+            context_valid_offset: 0x08,   // first qword = valid flag (PLACEHOLDER)
             context_size: 0x800,          // typical PG context size
             supports_thread_suspend: false,
+            verified: false, // placeholder — unverified (kernelsdk-1-1)
         },
     },
     // Win10 2004 (19041) — timing-repair only
     PgContextBuild {
         build: 19041,
         offsets: PgContextOffsets {
-            prcb_pg_thread_offset: 0x190,
-            context_valid_offset: 0x08,
+            prcb_pg_thread_offset: 0x190, // PLACEHOLDER
+            context_valid_offset: 0x08,   // PLACEHOLDER
             context_size: 0x800,
             supports_thread_suspend: false,
+            verified: false, // placeholder — unverified (kernelsdk-1-1)
         },
     },
     // Win11 22H2 (22621) — timing-repair, thread suspend experimental
     PgContextBuild {
         build: 22621,
         offsets: PgContextOffsets {
-            prcb_pg_thread_offset: 0x190,
-            context_valid_offset: 0x08,
+            prcb_pg_thread_offset: 0x190, // PLACEHOLDER
+            context_valid_offset: 0x08,   // PLACEHOLDER
             context_size: 0x900,
             supports_thread_suspend: false,
+            verified: false, // placeholder — unverified (kernelsdk-1-1)
         },
     },
     // Win11 24H2 (26100) — kurasagi RuntimePgBypass supported
     PgContextBuild {
         build: 26100,
         offsets: PgContextOffsets {
-            prcb_pg_thread_offset: 0x190,
-            context_valid_offset: 0x08,
+            prcb_pg_thread_offset: 0x190, // PLACEHOLDER
+            context_valid_offset: 0x08,   // PLACEHOLDER
             context_size: 0x900,
             supports_thread_suspend: true,
+            verified: false, // placeholder — unverified (kernelsdk-1-1)
         },
     },
     // Win11 25H2 (26200) — same as 24H2
     PgContextBuild {
         build: 26200,
         offsets: PgContextOffsets {
-            prcb_pg_thread_offset: 0x190,
-            context_valid_offset: 0x08,
+            prcb_pg_thread_offset: 0x190, // PLACEHOLDER
+            context_valid_offset: 0x08,   // PLACEHOLDER
             context_size: 0x900,
             supports_thread_suspend: true,
+            verified: false, // placeholder — unverified (kernelsdk-1-1)
         },
     },
 ];
@@ -548,6 +571,25 @@ pub fn pg_context_for_build(build: u32) -> Option<&'static PgContextBuild> {
     }
     // 3. Unknown build.
     None
+}
+
+/// True when `build` has a PG-context row whose offsets are verified enough to
+/// build a bypass window.
+///
+/// This is the single gate for the (EXPERIMENTAL, kernelsdk-1-1)
+/// PatchGuard-window capability: while every table row is a placeholder
+/// ([`PgContextOffsets::verified`] == false), this returns `false` for every
+/// build and [`crate::win::select_pg_window`] yields `None`. Rows are flipped
+/// to verified per-build as PDB validation lands — no other code needs to
+/// change.
+///
+/// Patch-equivalent builds (e.g. 19045 → 19041) inherit the baseline row's
+/// `verified` flag through [`pg_context_for_build`].
+pub fn pg_context_usable_for_window(build: u32) -> bool {
+    match pg_context_for_build(build) {
+        Some(row) => row.offsets.verified,
+        None => false,
+    }
 }
 
 // ============================================================================
@@ -702,6 +744,32 @@ mod tests {
         assert!(eprocess::TOKEN + 8 <= 0x850);
         assert!(eprocess::PROTECTION + 1 <= 0x850);
         assert!(eprocess::SIGNATURE_LEVEL + 1 <= 0x850);
+    }
+
+    #[test]
+    fn pg_window_gate_is_off_for_placeholder_rows() {
+        // kernelsdk-1-1: every PG-context row is a placeholder (0x190/0x08,
+        // never verified against a live kernel/PDB). select_pg_window must
+        // NOT return a window for any of them, and patch-equivalent builds
+        // inherit the baseline row's unverified gate.
+        let known: [u32; 5] = [17763, 19041, 22621, 26100, 26200];
+        for b in known {
+            let row = pg_context_for_build(b).expect("known PG build resolves");
+            assert!(
+                !row.offsets.verified,
+                "build {b} marked verified without per-build PDB evidence"
+            );
+            assert!(
+                !pg_context_usable_for_window(b),
+                "build {b} must be gated OFF while offsets are placeholders"
+            );
+        }
+        // Patch-equivalent builds resolve to a baseline row and stay gated.
+        assert!(!pg_context_usable_for_window(19045));
+        assert!(!pg_context_usable_for_window(22000));
+        assert!(!pg_context_usable_for_window(22631));
+        // Unknown builds have no row at all → gated.
+        assert!(!pg_context_usable_for_window(99999));
     }
 }
 
@@ -1156,5 +1224,90 @@ mod probe_tests {
         let krw = MockKrw::new();
         let base = 0xFFFF_8000_0010_0000usize;
         assert!(resolve_eprocess_offsets(26300, &krw, base).is_err());
+    }
+}
+
+// ============================================================================
+// Cross-crate offset-table consistency (dev-dep: nyx-implant-evasionsdk)
+//
+// The implant-side `evasionsdk::offsets_table` is the canonical cross-version
+// kernel offset table. The ring-0 kit (this crate) and the ring-3 implant
+// reading the SAME structure at DIFFERENT offsets is a silent-miss / bugcheck
+// pair, so every build both sides know must resolve to the same patched build.
+// ============================================================================
+#[cfg(test)]
+mod cross_crate_table_consistency_tests {
+    use super::*;
+    use crate::etwti::EtwTiOffsets;
+    use alloc::vec::Vec;
+
+    /// Every build in KNOWN_EPROCESS_BUILDS / the explicit ETW-TI ranges that
+    /// overlaps the implant-side evasionsdk table must resolve to the SAME
+    /// patched build (EPROCESS) / the SAME chase-hop offsets (ETW-TI) on both
+    /// sides. Also checks the reverse direction: every build in evasionsdk's
+    /// canonical pair list must be resolvable here with the same patched build
+    /// (catches a build added to evasionsdk but not mirrored into this crate).
+    #[test]
+    fn kernelsdk_resolves_every_evasionsdk_overlap_to_the_same_patch_build() {
+        use nyx_implant_evasionsdk::offsets_table as ev;
+
+        // Kernelsdk's known domain: EPROCESS table + patch equivalents + the
+        // explicit ETW-TI ranges (must mirror the match arms in etwti.rs).
+        let mut builds: Vec<u32> = KNOWN_EPROCESS_BUILDS.iter().map(|b| b.build).collect();
+        builds.extend(PATCH_EQUIVALENT_BUILDS.iter().map(|&(patch, _)| patch));
+        builds.push(17763);
+        builds.extend(18362..=19045); // ends at 19045 — explicit, like evasionsdk
+        builds.extend(20348..=22000);
+        builds.extend(22621..=22631);
+        builds.extend(26100..=26200);
+        builds.sort_unstable();
+        builds.dedup();
+
+        for build in builds {
+            // Overlap filter: only builds the implant-side table also knows.
+            let Some(ev_off) = ev::for_build(build) else { continue };
+
+            // EPROCESS — same patched build on both sides.
+            let k_ep = crate::offsets::for_build(build)
+                .unwrap_or_else(|| panic!("kernelsdk EPROCESS table misses build {build}"));
+            assert_eq!(
+                k_ep.build, ev_off.build,
+                "EPROCESS patch-build disagreement for build {build}: \
+                 kernelsdk resolves to {}, evasionsdk to {}",
+                k_ep.build, ev_off.build
+            );
+
+            // ETW-TI — same 3 chase-hop offsets on both sides.
+            let k_etw = EtwTiOffsets::for_build(build)
+                .unwrap_or_else(|| panic!("kernelsdk ETW-TI table misses build {build}"));
+            assert_eq!(
+                k_etw.guid_entry_to_provider_block,
+                ev_off.etw_ti.guid_entry_to_provider_block,
+                "ETW-TI guid-entry hop disagreement for build {build}"
+            );
+            assert_eq!(
+                k_etw.provider_block_to_enable_info,
+                ev_off.etw_ti.provider_block_to_enable_info,
+                "ETW-TI provider-block hop disagreement for build {build}"
+            );
+            assert_eq!(
+                k_etw.is_enabled_within_enable_info,
+                ev_off.etw_ti.is_enabled_within_enable_info,
+                "ETW-TI is-enabled hop disagreement for build {build}"
+            );
+        }
+
+        // Reverse direction: every build in evasionsdk's canonical table must
+        // ALSO resolve here to the same patched build.
+        for &(build, patched) in ev::known_builds() {
+            let k_ep = crate::offsets::for_build(build).unwrap_or_else(|| {
+                panic!("evasionsdk build {build} not in kernelsdk EPROCESS table")
+            });
+            assert_eq!(
+                k_ep.build, patched,
+                "kernelsdk resolves {build} to {} but evasionsdk says {patched}",
+                k_ep.build
+            );
+        }
     }
 }

@@ -26,3 +26,7 @@ path = "src/lib.rs"
 # no_std Mutex for the mock KernelRw in tests (replaces std::sync::Mutex so the
 # crate's mock tests compile + run on the macOS dev host without std).
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+# Cross-crate offset-table consistency tests: the implant-side canonical table
+# (evasionsdk::offsets_table) is the source of truth; every overlapping build
+# here must resolve to the same patched build.
+nyx-implant-evasionsdk = { path = "../implant-evasionsdk" }
