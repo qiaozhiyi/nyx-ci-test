@@ -219,6 +219,35 @@ fn fill_random_checked(out: &mut [u8; 32]) -> Result<(), GenerateError> {
     reject_zero(out).map_err(|_| GenerateError::ZeroScalar)
 }
 
+/// Error from [`ServerKeypair::derive_for`] / [`ImplantKeypair::session_key`].
+///
+/// Surfaced (not panicked) because both the server (`panic = "abort"`) and the
+/// no_std implant need a clean recovery path: the server fails the check-in
+/// with an error response, the implant treats it as a fatal config error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyExchangeError {
+    /// The peer's public key is a low-order point (e.g. the curve identity
+    /// point), so X25519 ECDH yields an all-zero shared secret. RFC 7748 §6.1
+    /// requires rejecting such keys: accepting them would let an attacker
+    /// force a deterministic, decryptable session key shared by every implant
+    /// that presents the same pubkey (contributory behavior violation).
+    NonContributory,
+}
+
+impl core::fmt::Display for KeyExchangeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            KeyExchangeError::NonContributory => f.write_str(
+                "key exchange rejected: peer public key is a low-order point \
+                 (identity point / all-zero shared secret)",
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for KeyExchangeError {}
+
 /// The team server's long-term identity keypair. The public half is baked
 /// into every implant's config; the secret never leaves the server.
 #[derive(Clone)]
@@ -265,13 +294,28 @@ impl ServerKeypair {
 
     /// Derive the AEAD session key for a connecting implant whose ephemeral
     /// public key is `implant_pub`. Both sides compute this and must agree.
-    pub fn derive_for(&self, implant_pub: &[u8; PUBKEY_LEN]) -> SessionKey {
+    ///
+    /// Returns [`KeyExchangeError::NonContributory`] when the implant's public
+    /// key is a low-order point (the ECDH shared secret is all zeros) — the
+    /// server must fail the check-in rather than derive a deterministic,
+    /// attacker-forced session key.
+    pub fn derive_for(
+        &self,
+        implant_pub: &[u8; PUBKEY_LEN],
+    ) -> Result<SessionKey, KeyExchangeError> {
         let their = PublicKey::from(*implant_pub);
         let shared = self.secret.diffie_hellman(&their);
         let mut shared_bytes = shared.to_bytes();
+        // RFC 7748 §6.1 contributory behavior: an all-zero shared secret means
+        // the peer's public key is a low-order point. Reject it — accepting it
+        // would let an attacker force a session key identical across every
+        // implant presenting the same pubkey (see [`KeyExchangeError`]).
+        if shared_bytes.iter().all(|&b| b == 0) {
+            return Err(KeyExchangeError::NonContributory);
+        }
         let key = derive_session_key(&shared_bytes, &self.public.to_bytes(), implant_pub);
         shared_bytes.zeroize();
-        key
+        Ok(key)
     }
 }
 
@@ -318,13 +362,27 @@ impl ImplantKeypair {
     }
 
     /// Derive the session key given the server's known public key.
-    pub fn session_key(&self, server_pub: &[u8; PUBKEY_LEN]) -> SessionKey {
+    ///
+    /// Returns [`KeyExchangeError::NonContributory`] when the configured
+    /// server public key is a low-order point (all-zero shared secret) — a
+    /// fatal config error: the implant must not proceed with a deterministic,
+    /// attacker-forced session key.
+    pub fn session_key(
+        &self,
+        server_pub: &[u8; PUBKEY_LEN],
+    ) -> Result<SessionKey, KeyExchangeError> {
         let server = PublicKey::from(*server_pub);
         let shared = self.secret.diffie_hellman(&server);
         let mut shared_bytes = shared.to_bytes();
+        // RFC 7748 §6.1 contributory behavior: reject an all-zero shared
+        // secret (the configured server pubkey is a low-order point). See
+        // [`KeyExchangeError`].
+        if shared_bytes.iter().all(|&b| b == 0) {
+            return Err(KeyExchangeError::NonContributory);
+        }
         let key = derive_session_key(&shared_bytes, server_pub, &self.public.to_bytes());
         shared_bytes.zeroize();
-        key
+        Ok(key)
     }
 }
 

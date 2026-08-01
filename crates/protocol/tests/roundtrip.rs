@@ -20,8 +20,8 @@ fn ecdh_key_agreement_is_mutual() {
     let server = crypto::ServerKeypair::generate().unwrap();
     let implant = crypto::ImplantKeypair::generate().unwrap();
 
-    let k_server = server.derive_for(&implant.public_bytes());
-    let k_implant = implant.session_key(&server.public_bytes());
+    let k_server = server.derive_for(&implant.public_bytes()).unwrap();
+    let k_implant = implant.session_key(&server.public_bytes()).unwrap();
 
     assert_eq!(
         k_server, k_implant,
@@ -35,8 +35,8 @@ fn keys_differ_per_session() {
     let a = crypto::ImplantKeypair::generate().unwrap();
     let b = crypto::ImplantKeypair::generate().unwrap();
     assert_ne!(
-        a.session_key(&server.public_bytes()),
-        b.session_key(&server.public_bytes()),
+        a.session_key(&server.public_bytes()).unwrap(),
+        b.session_key(&server.public_bytes()).unwrap(),
         "each session must get a distinct key"
     );
 }
@@ -45,7 +45,7 @@ fn keys_differ_per_session() {
 fn frame_seal_open_roundtrip() {
     let server = crypto::ServerKeypair::generate().unwrap();
     let implant = crypto::ImplantKeypair::generate().unwrap();
-    let key = implant.session_key(&server.public_bytes());
+    let key = implant.session_key(&server.public_bytes()).unwrap();
 
     let mut w = wire::Writer::new();
     sample_info()
@@ -71,14 +71,14 @@ fn frame_seal_open_roundtrip() {
 fn wrong_key_does_not_decrypt() {
     let server = crypto::ServerKeypair::generate().unwrap();
     let implant = crypto::ImplantKeypair::generate().unwrap();
-    let key = implant.session_key(&server.public_bytes());
+    let key = implant.session_key(&server.public_bytes()).unwrap();
 
     let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, b"secret")
         .expect("test encode of tiny plaintext is infallible");
     let raw = frame::parse_frame(&frame).unwrap();
 
     let other = crypto::ImplantKeypair::generate().unwrap();
-    let wrong_key = other.session_key(&server.public_bytes());
+    let wrong_key = other.session_key(&server.public_bytes()).unwrap();
     assert!(frame::open_frame(&wrong_key, &raw).is_err());
 }
 
@@ -170,7 +170,7 @@ fn frame_with_trailing_bytes_is_rejected() {
     // be rejected (length-exact), not silently trimmed.
     let server = crypto::ServerKeypair::generate().unwrap();
     let implant = crypto::ImplantKeypair::generate().unwrap();
-    let key = implant.session_key(&server.public_bytes());
+    let key = implant.session_key(&server.public_bytes()).unwrap();
     let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, b"hi")
         .expect("test encode of tiny plaintext is infallible");
     let mut with_trailer = frame.clone();
@@ -253,7 +253,7 @@ fn nonce_directions_never_collide() {
     // the nonces differ (same key, same AAD, same plaintext).
     let server = crypto::ServerKeypair::generate().unwrap();
     let implant = crypto::ImplantKeypair::generate().unwrap();
-    let key = implant.session_key(&server.public_bytes());
+    let key = implant.session_key(&server.public_bytes()).unwrap();
     let pubkey = implant.public_bytes();
     let plain = b"identical plaintext, identical counter, different direction";
 
@@ -491,4 +491,135 @@ fn frame_min_ct_len_constant_matches_docs() {
     // frames would slip through) and strictly less than MAX (else no range).
     assert!(frame::MIN_CT_LEN > frame::TAG_LEN);
     assert!(frame::MIN_CT_LEN < frame::MAX_CT_LEN);
+}
+
+/// Contract-1 contributory-X25519 rejection: a peer public key that is the
+/// curve identity point (all-zero x-coordinate, the classic low-order point)
+/// must be rejected by BOTH derivation entry points — the shared secret is
+/// all zeros, so accepting it would let an attacker force a deterministic,
+/// cross-implant-identical session key (RFC 7748 §6.1 contributory behavior).
+#[test]
+fn derive_for_rejects_identity_point_pubkey() {
+    let server = crypto::ServerKeypair::generate().unwrap();
+    let identity: [u8; 32] = [0u8; 32]; // the curve identity point
+
+    let err = server
+        .derive_for(&identity)
+        .expect_err("identity-point pubkey must be rejected");
+    assert!(
+        matches!(err, crypto::KeyExchangeError::NonContributory),
+        "expected NonContributory, got {err:?}"
+    );
+}
+
+/// Same contributory guard on the implant side: a configured server pubkey
+/// that is a low-order point must fail `session_key` so the implant treats it
+/// as a fatal config error instead of proceeding with a zero shared secret.
+#[test]
+fn session_key_rejects_all_zero_server_pubkey() {
+    let implant = crypto::ImplantKeypair::generate().unwrap();
+    let zero_server_pub: [u8; 32] = [0u8; 32]; // identity point → all-zero shared
+
+    let err = implant
+        .session_key(&zero_server_pub)
+        .expect_err("all-zero shared secret must be rejected");
+    assert!(
+        matches!(err, crypto::KeyExchangeError::NonContributory),
+        "expected NonContributory, got {err:?}"
+    );
+}
+
+/// Another low-order point (x = 1, a non-identity small-order key) must also
+/// be rejected — the all-zero-shared-secret check is the RFC 7748 guard, and
+/// it must not only catch the all-zero pubkey.
+#[test]
+fn derive_for_rejects_other_low_order_point() {
+    let server = crypto::ServerKeypair::generate().unwrap();
+    let mut low_order = [0u8; 32];
+    low_order[0] = 1; // x = 1: small-order point (order 2), not the identity
+
+    let err = server
+        .derive_for(&low_order)
+        .expect_err("low-order (non-identity) pubkey must be rejected");
+    assert!(matches!(err, crypto::KeyExchangeError::NonContributory));
+}
+
+/// Normal path still works after the contributory guard: a well-formed
+/// ephemeral pubkey derives successfully and both sides agree (this is the
+/// pre-existing mutual-agreement test; the explicit Ok check guards the new
+/// Result signature against regressing the happy path).
+#[test]
+fn derive_for_normal_pubkey_succeeds() {
+    let server = crypto::ServerKeypair::generate().unwrap();
+    let implant = crypto::ImplantKeypair::generate().unwrap();
+    let k_server = server.derive_for(&implant.public_bytes()).unwrap();
+    let k_implant = implant.session_key(&server.public_bytes()).unwrap();
+    assert_eq!(k_server, k_implant);
+}
+
+/// Contract-2 encode-side cap: sealing a plaintext whose ciphertext would
+/// exceed MAX_CT_LEN must return `FrameError::PlaintextTooLarge` BEFORE any
+/// AEAD work — the receiver's parse_frame rejects over-cap frames anyway, so
+/// an encode that "succeeds" would produce a frame that can never be opened.
+#[test]
+fn encode_frame_rejects_plaintext_over_cap() {
+    let server = crypto::ServerKeypair::generate().unwrap();
+    let implant = crypto::ImplantKeypair::generate().unwrap();
+    let key = implant.session_key(&server.public_bytes()).unwrap();
+    let pubkey = implant.public_bytes();
+
+    // One byte over the bound: plaintext_len + TAG_LEN > MAX_CT_LEN.
+    let too_big = vec![0u8; frame::MAX_CT_LEN - frame::TAG_LEN + 1];
+    let err = frame::encode_frame_dir(
+        &pubkey,
+        crypto::Direction::ClientToServer,
+        0,
+        &key,
+        &too_big,
+    )
+    .expect_err("over-cap plaintext must be rejected at encode time");
+    match err {
+        frame::FrameError::PlaintextTooLarge {
+            plaintext_len,
+            max_plaintext_len,
+        } => {
+            assert_eq!(plaintext_len, frame::MAX_CT_LEN - frame::TAG_LEN + 1);
+            assert_eq!(max_plaintext_len, frame::MAX_CT_LEN - frame::TAG_LEN);
+        }
+        other => panic!("expected PlaintextTooLarge, got {other:?}"),
+    }
+}
+
+/// The cap boundary is exact: a plaintext of exactly `MAX_CT_LEN - TAG_LEN`
+/// bytes seals fine (ciphertext == MAX_CT_LEN), and one byte more is rejected.
+#[test]
+fn encode_frame_cap_boundary_is_exact() {
+    let server = crypto::ServerKeypair::generate().unwrap();
+    let implant = crypto::ImplantKeypair::generate().unwrap();
+    let key = implant.session_key(&server.public_bytes()).unwrap();
+    let pubkey = implant.public_bytes();
+
+    let at_cap = vec![0u8; frame::MAX_CT_LEN - frame::TAG_LEN];
+    let frame_bytes = frame::encode_frame_dir(
+        &pubkey,
+        crypto::Direction::ClientToServer,
+        0,
+        &key,
+        &at_cap,
+    )
+    .expect("plaintext at exactly MAX_CT_LEN - TAG_LEN must seal");
+    // The sealed frame declares ct_len == MAX_CT_LEN and parses (still within
+    // the receiver's cap).
+    let raw = frame::parse_frame(&frame_bytes).unwrap();
+    assert_eq!(raw.ciphertext.len(), frame::MAX_CT_LEN);
+    // And it round-trips.
+    let pt = frame::open_frame(&key, &raw).unwrap();
+    assert_eq!(pt.len(), frame::MAX_CT_LEN - frame::TAG_LEN);
+
+    // One byte past the cap is rejected.
+    let over = vec![0u8; frame::MAX_CT_LEN - frame::TAG_LEN + 1];
+    assert!(matches!(
+        frame::encode_frame_dir(&pubkey, crypto::Direction::ClientToServer, 0, &key, &over),
+        Err(frame::FrameError::PlaintextTooLarge { .. })
+    ));
 }

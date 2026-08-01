@@ -270,7 +270,7 @@ pub enum Command {
     },
 }
 
-/// 文件操作的种类（u8 tag 0-4）。
+/// 文件操作的种类（u8 tag 0-5）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileOp {
     Cd,
@@ -278,6 +278,8 @@ pub enum FileOp {
     Rm,
     Mv,
     Cp,
+    /// 列目录：返回目录条目列表（每行一个名称）。
+    Ls,
 }
 
 impl FileOp {
@@ -288,6 +290,7 @@ impl FileOp {
             FileOp::Rm => 2,
             FileOp::Mv => 3,
             FileOp::Cp => 4,
+            FileOp::Ls => 5,
         });
     }
 
@@ -298,6 +301,7 @@ impl FileOp {
             2 => FileOp::Rm,
             3 => FileOp::Mv,
             4 => FileOp::Cp,
+            5 => FileOp::Ls,
             t => return Err(WireError::BadTag(t)),
         })
     }
@@ -784,6 +788,24 @@ mod tests {
     }
 
     #[test]
+    fn fileop_ls_roundtrips() {
+        // Ls 是 wire tag 5：编码→解码必须还原（并验证 decode 认 5）。
+        let cmd = Command::FileOp {
+            op: FileOp::Ls,
+            path: ".".into(),
+            dest: None,
+        };
+        assert_eq!(round_trip(cmd.clone()), cmd);
+
+        // 直接验证 wire tag：FileOp::Ls 编码为 u8(5)。
+        let mut w = Writer::new();
+        FileOp::Ls.encode(&mut w);
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(FileOp::decode(&mut r).unwrap(), FileOp::Ls);
+    }
+
+    #[test]
     fn fileop_all_variants_roundtrip() {
         let ops = [
             FileOp::Cd,
@@ -791,6 +813,7 @@ mod tests {
             FileOp::Rm,
             FileOp::Mv,
             FileOp::Cp,
+            FileOp::Ls,
         ];
         for op in ops {
             let cmd = Command::FileOp {
