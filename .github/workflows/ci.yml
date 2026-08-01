@@ -33,6 +33,12 @@ on:
   pull_request:
     branches: [main]
 
+# Workflows run on a persistent self-hosted runner. Never execute code from an
+# external fork there: fork PRs are reviewed before a maintainer branch is
+# created, then receive the normal required checks.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -50,63 +56,89 @@ jobs:
   # ---- Gate 1: fmt (fastest, fail early) ----
   fmt:
     name: Format
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, win-17763]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Ensure stable toolchain + rustfmt
         shell: cmd
-        run: rustup toolchain install stable --component rustfmt --no-self-update
+        run: rustup toolchain install 1.96.0 --component rustfmt --no-self-update
       - name: cargo fmt --check
         shell: cmd
-        run: cargo +stable fmt --all -- --check
+        run: cargo +1.96.0 fmt --all -- --check
 
   # ---- Gate 2: clippy on core crates (exclude client-ui Makepad GUI) ----
   clippy:
     name: Clippy
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, win-17763]
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Ensure stable toolchain + clippy
         shell: cmd
-        run: rustup toolchain install stable --component clippy --no-self-update
+        run: rustup toolchain install 1.96.0 --component clippy --no-self-update
       - name: cargo clippy (workspace, excl. client-ui)
         shell: cmd
-        run: cargo +stable clippy --workspace --exclude nyx-client-ui --all-targets -- -D warnings
+        run: cargo +1.96.0 clippy --locked --workspace --exclude nyx-client-ui --all-targets -- -D warnings
 
   # ---- Gate 3: workspace tests ----
   test:
     name: Test
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, win-17763]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Ensure stable toolchain
         shell: cmd
-        run: rustup toolchain install stable --no-self-update
+        run: rustup toolchain install 1.96.0 --no-self-update
       - name: cargo test --workspace (excl. client-ui)
         shell: cmd
-        run: cargo +stable test --workspace --exclude nyx-client-ui --all-targets
+        run: cargo +1.96.0 test --locked --workspace --exclude nyx-client-ui --all-targets
 
   # ---- Gate 4: standalone crates (each has its own [workspace]) ----
   standalone:
     name: Standalone crate tests
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, win-17763]
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - name: Ensure stable toolchain
         shell: cmd
-        run: rustup toolchain install stable --no-self-update
+        run: rustup toolchain install 1.96.0 --no-self-update
       - name: operator-kernelsdk lib tests
         shell: cmd
-        run: cargo +stable test --manifest-path crates/operator-kernelsdk/Cargo.toml --lib
+        run: cargo +1.96.0 test --locked --manifest-path crates/operator-kernelsdk/Cargo.toml --lib
       - name: implant-evasionsdk tests
         shell: cmd
-        run: cargo +stable test --manifest-path crates/implant-evasionsdk/Cargo.toml
+        run: cargo +1.96.0 test --locked --manifest-path crates/implant-evasionsdk/Cargo.toml
       - name: minidump-assembler tests (P3.a)
         shell: cmd
-        run: cargo +stable test --manifest-path crates/minidump-assembler/Cargo.toml
+        run: cargo +1.96.0 test --locked --manifest-path crates/minidump-assembler/Cargo.toml
       - name: offset-resolver build check (P0.b --fltmgr)
         shell: cmd
-        run: cargo +stable check --manifest-path crates/offset-resolver/Cargo.toml
+        run: cargo +1.96.0 check --locked --manifest-path crates/offset-resolver/Cargo.toml
       - name: operator-kernel-cli build check (P0.a/3.b)
         shell: cmd
-        run: cargo +stable check --manifest-path crates/operator-kernel-cli/Cargo.toml
+        run: cargo +1.96.0 check --locked --manifest-path crates/operator-kernel-cli/Cargo.toml
+
+  # The operator UI is outside the Rust workspace, so it needs an explicit
+  # quality gate rather than relying on the workspace jobs above.
+  ui-build:
+    name: UI build
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, win-17763]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install locked UI dependencies
+        shell: cmd
+        working-directory: crates/client-ui-web
+        run: npm ci
+      - name: Type-check and production build
+        shell: cmd
+        working-directory: crates/client-ui-web
+        run: npm run build

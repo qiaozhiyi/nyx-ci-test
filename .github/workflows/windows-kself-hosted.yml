@@ -65,7 +65,7 @@ jobs:
           REM dir (goblin), downloads the matching PDB from MS symbol server,
           REM parses EPROCESS + ETW-TI 4-hop chain offsets. No PowerShell PE
           REM walker — that ate 5 CI iterations on PS 5.1 NativeCommandError.
-          crates\offset-resolver\target\debug\nyx-offset-resolver.exe --ntoskrnl C:\Windows\System32\ntoskrnl.exe --out offsets_17763_live.toml
+          crates\offset-resolver\target\debug\nyx-offset-resolver.exe --ntoskrnl C:\Windows\System32\ntoskrnl.exe --build 17763 --out offsets_17763_live.toml
           type offsets_17763_live.toml
 
       - name: "Kernel bootstrap via KslD (Living off the Defender)"

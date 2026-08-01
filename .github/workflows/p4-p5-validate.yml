@@ -2,7 +2,8 @@ name: P4-P5 Real-machine Validation
 
 # P4 (Foliage APC) + P5 (Pool Party) + kernelsdk BYOVD regression on hosted
 # Windows runners.  Manual trigger conserves minutes; PR trigger on implant
-# changes catches regressions before merge.  See docs/P4_P5_VALIDATION_STRATEGY.md.
+# changes catches regressions before merge.  See
+# docs/testing/P4_P5_VALIDATION_STRATEGY.md.
 #
 # Authorized red-team security research project.
 

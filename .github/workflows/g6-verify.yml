@@ -5,7 +5,7 @@ name: G6 Verify (Win11 24H2 kernel)
 # download, CET probe logic, and selftest regression on a non-17763 kernel.
 # The remaining 2/7 (HVCI-on default behavior, CET hardware #CP trigger) need a
 # physical machine — GitHub Windows runners do not support nested virtualization
-# and do not enable HVCI by default. See docs/STATUS.md §5 (G6).
+# and do not enable HVCI by default. See docs/STATUS.md.
 #
 # This is an authorized red-team security research project. The workflow only
 # exercises the project's own selftest/offset tooling; it does not touch other
@@ -13,6 +13,14 @@ name: G6 Verify (Win11 24H2 kernel)
 
 on:
   workflow_dispatch: {}
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/g6-verify.yml'
+      - 'crates/implant-win/**'
+      - 'crates/protocol/**'
+      - 'crates/operator-kernelsdk/**'
+      - 'crates/offset-resolver/**'
   push:
     # NOTE: was `branches: [p2-evasion-synced]` — that branch does not exist
     # (git branch -a shows only main + palette-ux-*), so the push trigger
@@ -185,7 +193,9 @@ jobs:
           Write-Host "::group::offset-resolver download + parse (G5 path, build $env:BUILD)"
           # Pad GUID to 32 hex chars (N format already is). Pass to resolver.
           $exe = "crates/offset-resolver/target/debug/nyx-offset-resolver.exe"
-          & $exe --guid $guid --age $age --out offsets_g6.toml 2>&1 | Select-Object -Last 12
+          # G5 path: --build is REQUIRED (the resolver hard-fails without it since
+          # the silent 17763 fallback was removed). $env:BUILD is set earlier in this job.
+          & $exe --guid $guid --age $age --build $env:BUILD --out offsets_g6.toml 2>&1 | Select-Object -Last 12
           Write-Host "::endgroup::"
 
           if(Test-Path offsets_g6.toml){

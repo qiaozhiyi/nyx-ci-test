@@ -27,6 +27,11 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+# This workflow uses a persistent self-hosted Windows machine. Keep its token
+# read-only and do not run code supplied by an external fork on that machine.
+permissions:
+  contents: read
+
 concurrency:
   group: windows-ci-${{ github.ref }}
   cancel-in-progress: true
@@ -35,6 +40,7 @@ jobs:
   # ---- Implant build + selftest (build 17763) ----
   implant:
     name: "Implant (win-17763)"
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, win-17763]
     timeout-minutes: 25
     steps:
@@ -214,7 +220,7 @@ jobs:
           if (-not $guid) { Write-Host "::error::could not extract PDB GUID"; exit 1 }
           Write-Host "Live ntoskrnl PDB: GUID=$guid AGE=$age"
 
-          & $resolver --guid $guid --age $age --out offsets_live.toml 2>&1
+          & $resolver --guid $guid --age $age --build 17763 --out offsets_live.toml 2>&1
           if (Test-Path offsets_live.toml) {
             Write-Host "=== Resolved offsets (live build 17763) ==="
             Get-Content offsets_live.toml
