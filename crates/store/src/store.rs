@@ -43,12 +43,14 @@ pub struct CredStore {
 
 impl CredStore {
     /// Open (or create) the store at `path`. Sets WAL + synchronous=NORMAL for
-    /// crash-safe ACID, creates the schema if absent, and best-effort 0600s the
-    /// db file (the team-server disk is a single high-value target).
+    /// crash-safe ACID, a busy_timeout so concurrent writers from the sibling
+    /// stores (same DB file) wait instead of failing with SQLITE_BUSY, creates
+    /// the schema if absent, and best-effort 0600s the db file (the team-server
+    /// disk is a single high-value target).
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         Self::init(&conn)?;
-        let _ = set_private(path); // best-effort; not fatal
+        let _ = crate::set_private(path); // best-effort; not fatal
         Ok(Self {
             conn: Mutex::new(conn),
             path: path.to_path_buf(),
@@ -70,6 +72,11 @@ impl CredStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // The cred/session/implant stores all open the SAME DB file, each with
+        // its own Connection. WAL allows one writer at a time; busy_timeout
+        // makes a contended write WAIT (up to 5s) instead of returning
+        // SQLITE_BUSY as a spurious failure under check-in bursts.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS creds (
                 realm        TEXT NOT NULL,
@@ -106,13 +113,17 @@ impl CredStore {
                 version INTEGER NOT NULL
             );",
         )?;
-        // Seed version 0 for pre-existing databases that lack the row.
+        // Seed version 0 only when the table is empty. The version table has
+        // no UNIQUE constraint, so a plain INSERT OR IGNORE would append a
+        // stale version=0 row on EVERY open (one per server boot).
         conn.execute(
-            "INSERT OR IGNORE INTO _creds_schema_version (version) VALUES (0);",
+            "INSERT INTO _creds_schema_version (version) SELECT 0 WHERE NOT EXISTS \
+             (SELECT 1 FROM _creds_schema_version);",
             [],
         )?;
+        // MAX() so the gate never depends on unspecified rowid scan order.
         let current: i64 = conn.query_row(
-            "SELECT version FROM _creds_schema_version LIMIT 1",
+            "SELECT MAX(version) FROM _creds_schema_version",
             [],
             |r| r.get(0),
         )?;
@@ -221,20 +232,6 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CredRecord> {
         collected_at: row.get::<_, i64>(6)? as u64,
         notes: row.get(7)?,
     })
-}
-
-/// Best-effort `chmod 0600` (Unix only). Non-fatal — the store still opens.
-#[cfg(unix)]
-fn set_private(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)
-}
-
-#[cfg(not(unix))]
-fn set_private(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

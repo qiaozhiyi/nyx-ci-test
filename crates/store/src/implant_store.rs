@@ -70,10 +70,12 @@ pub struct ImplantStore {
 
 impl ImplantStore {
     /// Open (or create) the implant store at `path`. Uses the same DB file as
-    /// the cred store — SQLite WAL handles concurrent access.
+    /// the cred store — SQLite WAL handles concurrent access. Best-effort
+    /// 0600s the db file + WAL siblings (shared with the cred/session stores).
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         Self::init(&conn)?;
+        let _ = crate::set_private(path); // best-effort; not fatal
         Ok(Self {
             conn: Mutex::new(conn),
             path: path.to_path_buf(),
@@ -94,6 +96,9 @@ impl ImplantStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Same DB file is shared with the cred/session stores; make contended
+        // writes WAIT (up to 5s) instead of failing with SQLITE_BUSY.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS implants (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,12 +141,17 @@ impl ImplantStore {
                 version INTEGER NOT NULL
             );",
         )?;
+        // Seed version 0 only when the table is empty. The version table has
+        // no UNIQUE constraint, so a plain INSERT OR IGNORE would append a
+        // stale version=0 row on EVERY open (one per server boot).
         conn.execute(
-            "INSERT OR IGNORE INTO _implants_schema_version (version) VALUES (0);",
+            "INSERT INTO _implants_schema_version (version) SELECT 0 WHERE NOT EXISTS \
+             (SELECT 1 FROM _implants_schema_version);",
             [],
         )?;
+        // MAX() so the gate never depends on unspecified rowid scan order.
         let current: i64 = conn.query_row(
-            "SELECT version FROM _implants_schema_version LIMIT 1",
+            "SELECT MAX(version) FROM _implants_schema_version",
             [],
             |r| r.get(0),
         )?;
@@ -186,8 +196,14 @@ impl ImplantStore {
         Ok(conn.last_insert_rowid())
     }
 
-    /// Look up an implant by auth_token_hash. Returns the record if found and
-    /// the token has NOT been used AND the implant is NOT revoked.
+    /// Validate a one-time auth token: look up an implant by auth_token_hash.
+    /// Returns the record ONLY if the token is fresh (`auth_token_used = 0`)
+    /// AND the implant is not revoked.
+    ///
+    /// PURE validation — does NOT consume. The actual (atomic) claim is
+    /// [`Self::mark_token_used`], whose guarded UPDATE re-checks both
+    /// conditions under the write lock, so a token checked here can still lose
+    /// a concurrent claim race and be rejected there (fail-closed).
     pub fn get_by_token_hash(&self, token_hash: &str) -> Result<Option<ImplantRecord>> {
         let conn = self.conn.lock().map_err(|_| ImplantStoreError::Poisoned)?;
         let mut stmt = conn.prepare(
@@ -207,12 +223,23 @@ impl ImplantStore {
         }
     }
 
-    /// Mark an auth token as used (first check-in consumed it).
-    /// Returns true if a row was updated.
+    /// Atomically claim (consume) a one-time auth token for `implant_pub`.
+    ///
+    /// The claim is a SINGLE guarded UPDATE — `WHERE implant_pub = ?1 AND
+    /// auth_token_used = 0 AND revoked = 0` — so it can only flip a still-
+    /// fresh, non-revoked row (check-then-act is replaced by one atomic
+    /// statement; there is no window in which two concurrent check-ins both
+    /// win). Returns:
+    /// - `Ok(true)` — this caller won the claim (rows updated = 1).
+    /// - `Ok(false)` — no row matched: token already claimed by a concurrent
+    ///   check-in, implant revoked, or unknown. The caller MUST reject.
+    /// - `Err` — store error; the caller MUST reject (fail-closed: an
+    ///   unclaimable token must not be accepted).
     pub fn mark_token_used(&self, implant_pub: &str) -> Result<bool> {
         let conn = self.conn.lock().map_err(|_| ImplantStoreError::Poisoned)?;
         let n = conn.execute(
-            "UPDATE implants SET auth_token_used = 1 WHERE implant_pub = ?1",
+            "UPDATE implants SET auth_token_used = 1
+             WHERE implant_pub = ?1 AND auth_token_used = 0 AND revoked = 0",
             params![implant_pub],
         )?;
         Ok(n > 0)
@@ -353,13 +380,17 @@ mod tests {
         assert!(!got.revoked);
     }
 
+    fn hash(token: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(token);
+        hex::encode(hasher.finalize())
+    }
+
     #[test]
     fn get_by_token_hash_finds_fresh_token() {
         let s = ImplantStore::open_in_memory().unwrap();
         let token = b"secret-token-42";
-        let mut hasher = Sha256::new();
-        hasher.update(token);
-        let token_hash = hex::encode(hasher.finalize());
+        let token_hash = hash(token);
 
         let rec = test_record("pubkey1", token);
         s.insert(&rec).unwrap();
@@ -372,18 +403,16 @@ mod tests {
     fn get_by_token_hash_rejects_used_token() {
         let s = ImplantStore::open_in_memory().unwrap();
         let token = b"used-token";
-        let mut hasher = Sha256::new();
-        hasher.update(token);
-        let token_hash = hex::encode(hasher.finalize());
+        let token_hash = hash(token);
 
         let rec = test_record("pubkey2", token);
         s.insert(&rec).unwrap();
 
-        // First lookup finds it
+        // Pure validation: a fresh token is visible...
         assert!(s.get_by_token_hash(&token_hash).unwrap().is_some());
 
-        // Mark as used
-        s.mark_token_used("pubkey2").unwrap();
+        // ...until the atomic claim consumes it.
+        assert!(s.mark_token_used("pubkey2").unwrap());
 
         // Now it should NOT be found
         assert!(s.get_by_token_hash(&token_hash).unwrap().is_none());
@@ -393,9 +422,7 @@ mod tests {
     fn get_by_token_hash_rejects_revoked() {
         let s = ImplantStore::open_in_memory().unwrap();
         let token = b"revoked-token";
-        let mut hasher = Sha256::new();
-        hasher.update(token);
-        let token_hash = hex::encode(hasher.finalize());
+        let token_hash = hash(token);
 
         let rec = test_record("pubkey3", token);
         s.insert(&rec).unwrap();
@@ -407,15 +434,34 @@ mod tests {
     }
 
     #[test]
-    fn mark_token_used_idempotent() {
+    fn token_claim_is_atomic_and_single_use() {
+        // The guarded UPDATE is the ONE atomic decision point: a second claim
+        // of the same token must return false (rows == 0), which the consumer
+        // treats as rejection — no check-then-act window remains.
         let s = ImplantStore::open_in_memory().unwrap();
         let rec = test_record("pubkey4", b"token-4");
         s.insert(&rec).unwrap();
 
-        assert!(s.mark_token_used("pubkey4").unwrap());
-        // Second mark should be a no-op (already used), but returns true
-        // because the UPDATE matched the row (it just set 1 → 1)
-        assert!(s.mark_token_used("pubkey4").unwrap());
+        assert!(s.mark_token_used("pubkey4").unwrap(), "first claim wins");
+        assert!(
+            !s.mark_token_used("pubkey4").unwrap(),
+            "second claim must be rejected (already consumed)"
+        );
+    }
+
+    #[test]
+    fn token_claim_rejects_revoked_implant() {
+        let s = ImplantStore::open_in_memory().unwrap();
+        s.insert(&test_record("pubkey-revoked", b"token-revoked"))
+            .unwrap();
+
+        // Revoke AFTER a pure validation SELECT would have passed: the
+        // guarded claim must still lose (revoked = 1 => rows == 0).
+        s.revoke("pubkey-revoked").unwrap();
+        assert!(
+            !s.mark_token_used("pubkey-revoked").unwrap(),
+            "revoked implant's token must not be claimable"
+        );
     }
 
     #[test]

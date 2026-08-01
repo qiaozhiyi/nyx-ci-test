@@ -68,13 +68,15 @@ pub struct CredRecord {
 
 /// Mask a secret for list/preview rendering: `first2….last2` when long enough,
 /// else a bare `…. Sentinel for "this view is masked; call ?reveal=1 for
-/// cleartext". UTF-8-safe (char-based, not byte-slice).
+/// cleartext". UTF-8-safe (char-based, not byte-slice): byte slicing would
+/// panic on a multi-byte char boundary, so masking operates on `char`s.
 pub fn mask_secret(s: &str) -> String {
-    if s.len() <= 4 {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= 4 {
         "....".to_string()
     } else {
-        let prefix = &s[..2];
-        let suffix = &s[s.len()-2..];
+        let prefix: String = chars[..2].iter().collect();
+        let suffix: String = chars[chars.len() - 2..].iter().collect();
         format!("{prefix}....{suffix}")
     }
 }
@@ -101,5 +103,18 @@ mod tests {
         assert_eq!(mask_secret("8846f7eaee8fb117ad06bdd830b7586c"), "88....6c");
         assert_eq!(mask_secret("ab"), "....");
         assert_eq!(mask_secret(""), "....");
+    }
+
+    #[test]
+    fn mask_non_ascii_no_panic() {
+        // Regression: the old implementation sliced byte ranges (`&s[..2]`),
+        // which is NOT a char boundary for multi-byte UTF-8 and panicked.
+        // Char-based masking must never panic and must mask the first/last
+        // two *characters*.
+        assert_eq!(mask_secret("pässwörd-ünïcode"), "pä....de");
+        assert_eq!(mask_secret("日本語文書"), "日本....文書");
+        assert_eq!(mask_secret("日本語文"), "...."); // exactly 4 chars
+        assert_eq!(mask_secret("日本語"), "...."); // 3 chars
+        assert_eq!(mask_secret("aä"), "...."); // 2 chars, multi-byte
     }
 }
