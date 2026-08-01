@@ -730,6 +730,41 @@ pub unsafe fn nt_query_attributes_file(
     )
 }
 
+/// `NtQueryDirectoryFile` — 11 real args. Used by fs.rs to enumerate a
+/// directory (FileDirectoryInformation class): `file_info`/`length` describe
+/// the output buffer, `file_name` is an optional wildcard mask (NULL = all
+/// entries), `return_single_entry`/`restart_scan` control the scan position.
+pub unsafe fn nt_query_directory_file(
+    rt: &Runtime,
+    handle: usize,
+    event: usize,
+    apc_routine: usize,
+    apc_context: usize,
+    io_status: usize,
+    file_info: usize,
+    length: usize,
+    file_info_class: u32,
+    return_single_entry: i32,
+    file_name: usize,
+    restart_scan: i32,
+) -> Option<i32> {
+    syscall11(
+        rt,
+        djb2(b"ntquerydirectoryfile"),
+        handle,
+        event,
+        apc_routine,
+        apc_context,
+        io_status,
+        file_info,
+        length,
+        file_info_class as usize,
+        return_single_entry as usize,
+        file_name,
+        restart_scan as usize,
+    )
+}
+
 /// `NtDelayExecution` — 2 real args (padded into the 4-arg shim).
 pub unsafe fn nt_delay_execution(rt: &Runtime, alertable: u8, delay: usize) -> Option<i32> {
     syscall4(
@@ -850,10 +885,12 @@ pub unsafe fn nt_set_context_thread(rt: &Runtime, thread: usize, ctx: usize) -> 
     syscall4(rt, djb2(b"ntsetcontextthread"), thread, ctx, 0, 0)
 }
 
-/// `NtAllocateVirtualMemory(ProcessHandle, BaseAddress*, RegionSize, AllocationType,
-/// Protect)` — 5 real args. Allocates virtual memory in the target process.
-/// Pass `NtCurrentProcess` pseudo-handle (0xFFFF_FFFF_FFFF_FFFF) for
-/// current-process allocations; a real handle for cross-process allocs.
+/// `NtAllocateVirtualMemory(ProcessHandle, BaseAddress*, ZeroBits, RegionSize*,
+/// AllocationType, Protect)` — 6 real args. Allocates virtual memory in the
+/// target process. Pass `NtCurrentProcess` pseudo-handle (0xFFFF_FFFF_FFFF_FFFF)
+/// for current-process allocations; a real handle for cross-process allocs.
+/// `zero_bits` must be 0 for 64-bit targets (it restricts the high bits of the
+/// allocation's base address); callers pass 0.
 ///
 /// # Safety
 /// `base_out` must point at a valid `usize` the syscall writes the allocated
@@ -862,16 +899,18 @@ pub unsafe fn nt_set_context_thread(rt: &Runtime, thread: usize, ctx: usize) -> 
 pub unsafe fn nt_allocate_virtual_memory(
     rt: &Runtime,
     process_handle: usize,
+    zero_bits: usize,
     base_out: &mut usize,
     region_size: &mut usize,
     allocation_type: u32,
     protect: u32,
 ) -> Option<i32> {
-    syscall5(
+    syscall6(
         rt,
         djb2(b"ntallocatevirtualmemory"),
         process_handle,
         base_out as *mut usize as usize,
+        zero_bits,
         region_size as *mut usize as usize,
         allocation_type as usize,
         protect as usize,

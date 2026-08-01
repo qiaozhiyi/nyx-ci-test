@@ -230,6 +230,24 @@ static mut FALLBACK_MEM: [u8; FALLBACK_SIZE] = [0; FALLBACK_SIZE];
 
 // ---- The allocator ----
 
+/// Compute the aligned user pointer for an over-allocation, guaranteeing the
+/// 8-byte raw-pointer header slot (`aligned - 8`) always lies AT or AFTER the
+/// raw heap pointer (`raw_addr`) — i.e. inside the allocation.
+///
+/// The naive `(raw_addr + align - 1) & !(align - 1)` rounds `raw_addr` up but
+/// yields `aligned == raw_addr` when the heap already returned an aligned
+/// block (common for align=16 under LFH); the header would then be written
+/// 8 bytes BEFORE the allocation (OOB write, wild free on dealloc). Rounding
+/// `raw_addr + 8` up instead makes `aligned >= raw_addr + 8`, so
+/// `aligned - 8 >= raw_addr` holds for every input (implant-inject-2).
+///
+/// `align` MUST be a power of two (the `GlobalAlloc` contract).
+/// Pure arithmetic — host-testable.
+#[inline]
+fn align_with_header(raw_addr: usize, align: usize) -> usize {
+    (raw_addr + 8 + align - 1) & !(align - 1)
+}
+
 pub struct NtHeapAllocator;
 
 unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
@@ -256,32 +274,39 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
                     }
                     return ptr as *mut u8;
                 } else {
-                    // Over-allocate for alignment: alloc size + align + 8, so
-                    // there is ALWAYS room to store the raw pointer 8 bytes
-                    // before the aligned address (and aligned_addr - 8 >= raw).
-                    // The historical comment claiming "offset >= 8 for align > 8"
-                    // was wrong — when RtlAllocateHeap returns an already-
-                    // aligned block (common for align=16 under LFH), offset = 0
-                    // and the conditional store was SKIPPED, but dealloc still
-                    // unconditionally read *(ptr - 8) → UAF / wild free. See
-                    // CRITICAL-4 in docs/audits/FULL_CODE_AUDIT_2026-07-21.md.
+                    // Over-allocate for alignment: size + align + 16. The 16 is
+                    // the 8-byte raw-pointer header plus rounding headroom, so
+                    // the aligned address computed below ALWAYS leaves room for
+                    // the header INSIDE the allocation.
+                    //
+                    // implant-inject-2: the naive round-up
+                    //   aligned_addr = (raw_addr + align - 1) & !(align - 1)
+                    // yields aligned_addr == raw_addr when RtlAllocateHeap
+                    // already returned an aligned block (common for align=16
+                    // under LFH) — the header then lands 8 bytes BEFORE the
+                    // allocation (OOB write, and dealloc's *(ptr - 8) becomes a
+                    // wild free). Rounding `raw_addr + 8` up instead guarantees
+                    // aligned_addr - 8 >= raw_addr ALWAYS. See implant-inject-2
+                    // in docs/audits/FULL_CODE_AUDIT_2026-07-21.md.
                     //
                     // Saturating add guards against usize overflow on attacker-
                     // controlled sizes (BEACON task sizes flow through here).
-                    let total = size.saturating_add(align).saturating_add(8);
+                    let total = size.saturating_add(align).saturating_add(16);
                     let raw = alloc_fn(heap_handle as *mut core::ffi::c_void, 0, total);
                     if raw.is_null() {
                         return core::ptr::null_mut();
                     }
                     let raw_addr = raw as usize;
-                    // Round up to the next aligned address >= raw_addr.
-                    // aligned_addr is in [raw_addr, raw_addr + align - 1].
-                    let aligned_addr = (raw_addr + align - 1) & !(align - 1);
+                    // Round (raw_addr + 8) up to the next aligned address.
+                    // aligned_addr >= raw_addr + 8, so the header slot at
+                    // aligned_addr - 8 is always at or after the raw pointer.
+                    let aligned_addr = align_with_header(raw_addr, align);
                     // Unconditionally store the raw pointer 8 bytes below the
-                    // aligned address. Because total = size + align + 8, the
-                    // slot at aligned_addr - 8 always lies inside the allocation
-                    // (>= raw_addr) and doesn't overlap the user payload
-                    // (which starts at aligned_addr and runs for `size` bytes).
+                    // aligned address. The slot lies inside the allocation
+                    // (aligned_addr - 8 >= raw_addr) and doesn't overlap the
+                    // user payload (which starts at aligned_addr and runs for
+                    // `size` bytes); the payload end (aligned_addr + size) is
+                    // <= raw_addr + size + align + 7 < raw_addr + total.
                     let store = (aligned_addr - 8) as *mut *mut core::ffi::c_void;
                     core::ptr::write(store, raw);
                     if total > 65536 {
@@ -394,5 +419,75 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
             self.dealloc(ptr, layout);
         }
         new
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn already_16_aligned_raw_pointer_keeps_header_inside() {
+        // The exact implant-inject-2 case: RtlAllocateHeap (LFH) often returns
+        // a block that is ALREADY 16-aligned. The naive formula then produced
+        // aligned_addr == raw_addr and wrote the header 8 bytes BEFORE the
+        // allocation. The fixed formula must round (raw + 8) up, keeping the
+        // header slot at [aligned - 8, aligned) at or after raw.
+        let raw: usize = 0x1234_5678_9000; // already 16-aligned
+        let align: usize = 16;
+        let aligned = align_with_header(raw, align);
+        // (raw + 8) rounds up to the next 16 boundary, i.e. raw + 16 here.
+        assert_eq!(aligned, raw + 16);
+        assert!(aligned % align == 0);
+        // Invariant: the header slot is INSIDE the allocation, never before it.
+        assert!(aligned - 8 >= raw, "header lands before the allocation");
+        // Payload (size = 16 here) must fit in total = size + align + 16.
+        let size: usize = 16;
+        let total = size.saturating_add(align).saturating_add(16);
+        assert!(aligned + size <= raw + total);
+    }
+
+    #[test]
+    fn header_slot_always_inside_allocation() {
+        // Exhaustive small-domain check: for every raw alignment class and
+        // power-of-two align, the header slot must stay at/after raw and the
+        // (size=0) payload base must fit inside the over-allocation.
+        for align in [16usize, 32, 64, 256] {
+            for raw in 0..512usize {
+                let aligned = align_with_header(raw, align);
+                assert_eq!(aligned % align, 0, "raw {raw:#x} not {align}-aligned");
+                assert!(
+                    aligned - 8 >= raw,
+                    "header before allocation: raw {raw:#x}, aligned {aligned:#x}"
+                );
+                let total = 0usize.saturating_add(align).saturating_add(16);
+                assert!(
+                    aligned <= raw + total,
+                    "aligned {aligned:#x} beyond raw+total {:#x}",
+                    raw + total
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn payload_end_always_within_overallocation() {
+        // Worst case: aligned == raw + 8 + align - 1; payload of `size` bytes
+        // must end at or before raw + size + align + 16.
+        for align in [16usize, 64, 4096] {
+            for size in [1usize, 15, 16, 17, 1024, 65536] {
+                for raw in 0..128usize {
+                    let aligned = align_with_header(raw, align);
+                    let total = size.saturating_add(align).saturating_add(16);
+                    assert!(aligned - 8 >= raw);
+                    assert!(
+                        aligned + size <= raw + total,
+                        "payload end {:#x} beyond raw+total {:#x}",
+                        aligned + size,
+                        raw + total
+                    );
+                }
+            }
+        }
     }
 }

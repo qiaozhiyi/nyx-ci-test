@@ -673,6 +673,7 @@ pub unsafe fn threadless_inject(
         crate::syscalls::nt_allocate_virtual_memory(
             rt,
             proc_handle as usize,
+            0, // ZeroBits
             &mut remote_base,
             &mut region_size,
             0x3000, // MEM_COMMIT | MEM_RESERVE
@@ -1045,6 +1046,7 @@ unsafe fn inject_existing(pid: u32, shellcode: &[u8]) -> Result<(), &'static str
         crate::syscalls::nt_allocate_virtual_memory(
             rt,
             h_proc as usize,
+            0, // ZeroBits
             &mut remote_base,
             &mut region_size,
             0x3000,

