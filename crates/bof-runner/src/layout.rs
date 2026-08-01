@@ -56,7 +56,7 @@ pub const TRAMP_STUB_LEN: usize = 14;
 /// rounded up to a 16-byte slot. Keeps the stubs at stable,
 /// cache-line-friendly offsets (the 8-byte target of each stub is
 /// deliberately written with `write_unaligned`; see `win::write_trampoline`).
-pub const TRAMP_STUB_STRIDE: usize = ((TRAMP_STUB_LEN + 15) / 16) * 16;
+pub const TRAMP_STUB_STRIDE: usize = TRAMP_STUB_LEN.div_ceil(16) * 16;
 /// Maximum number of stubs that fit in one trampoline page.
 pub const TRAMP_STUBS_PER_PAGE: usize = PAGE_SIZE / TRAMP_STUB_STRIDE;
 

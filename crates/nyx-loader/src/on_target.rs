@@ -43,10 +43,11 @@
 //! process, no PEB, no `gs:[0x60]`); the scan algorithm is extracted into the
 //! pure [`find_magic_offset`] function so the exact loop the stub runs is
 //! exercised host-side. Execution validation of the complete loader (Layer 1
-//! + Layer 2) is the job of the VPS loader probe (spec §5.5,
-//! `scripts/loader_probe.ps1`): the wrapped blob is injected into a dedicated
+//! Execution validation of the complete loader (Layer 1 plus Layer 2) is the
+//! job of the VPS loader probe (spec §5.5; see scripts/loader_probe.ps1): the
+//! wrapped blob is injected into a dedicated
 //! short-lived test process via a harness DLL, and the harness reports
-//! `OK <dllmain_rv>` or `FAIL <stage>`. Host-side tests
+//! OK/FAIL per stage. Host-side tests
 //! ([`crate::stub_layout`], [`crate::payload_format`]) cover what can be
 //! verified without a target: the Layer-1 byte layout, the scan algorithm,
 //! and the payload header format.

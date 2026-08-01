@@ -333,7 +333,7 @@ fn parse_iso8601_to_unix(s: &str) -> Option<u64> {
 /// True iff `y` is a Gregorian leap year (divisible by 4, except centuries
 /// not divisible by 400).
 fn is_leap_year(y: u32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 /// Days in Gregorian month `m` of year `y`, with February leap-day handling.
@@ -359,10 +359,10 @@ fn civil_to_days(y: u32, m: u32, d: u32) -> Option<i64> {
     // caps at 9999). Keeping the check here too makes the function
     // self-contained: years before 1970 would produce negative day counts
     // that must never reach the caller's `u64` conversion.
-    if y < 1970 || y > 9999 {
+    if !(1970..=9999).contains(&y) {
         return None;
     }
-    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+    if !(1..=12).contains(&m) || !(1..=days_in_month(y, m)).contains(&d) {
         return None;
     }
     let y = y as i64;
@@ -765,7 +765,7 @@ fn encrypt_implant_config(
 /// Patch the DLL template, locate and patch the .nyx_cfg section, and validate
 /// the PE.
 fn patch_implant_template(
-    binary: &mut Vec<u8>,
+    binary: &mut [u8],
     req: &GenerateRequest,
     implant_priv: [u8; 32],
     server_pub: [u8; 32],

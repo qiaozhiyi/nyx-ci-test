@@ -26,16 +26,21 @@
 //! kernel32/ntdll exports (`GetModuleHandleA/W`, `GetProcAddress`,
 //! `VirtualAlloc`, `VirtualProtect`, `VirtualFree`, `LoadLibraryA`,
 //! `GetLastError`, the memcpy family, …) at load time via `GetModuleHandleA`
-//! + `GetProcAddress` — no C CRT dependency. Every external gets a stub in
-//! the shared trampoline page, so REL32 relocations can reach addresses
+//! and `GetProcAddress`, with no C CRT dependency. Every external gets a stub
+//! in the shared trampoline page, so REL32 relocations can reach addresses
 //! >2 GiB away from the low-address BOF allocation.
 //!
 //! ## ABI
+//!
 //! [`execute`]`(blob, args)` loads the BOF and invokes its entry as
 //! `go(args.as_ptr(), args.len() as i32)`. `args` is the packed CS argument
 //! blob; pass `&[]` for a no-args BOF — the entry then receives a NULL buffer
 //! and length 0, preserving the `BeaconDataParse(NULL, 0)` idiom.
 
+// Windows PE-layout helpers: constants + pure math consumed by `win`.
+// Compiled on all platforms so the host-side unit tests below still run in
+// macOS/Linux CI; the helpers are dead code outside Windows.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod layout;
 #[cfg(target_os = "windows")]
 mod shim;

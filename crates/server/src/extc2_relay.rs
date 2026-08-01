@@ -161,10 +161,11 @@ impl ExtC2RelayConfig {
     /// This is the single source of truth for relay config — `main.rs` calls
     /// it once at boot and stores the result in `AppState`.
     ///
-    /// Fail-closed: when the Slack relay is enabled (`NYX_EXTC2_SLACK_TOKEN`
-    /// + `NYX_EXTC2_SLACK_CHANNEL` both set) but `NYX_EXTC2_SLACK_HMAC_KEY` is
-    /// missing, malformed, or all-zero, this returns `Err` and the server
-    /// refuses to boot — the relay must never run with a guessable HMAC key.
+    /// Fail-closed: when the Slack relay is enabled (both
+    /// `NYX_EXTC2_SLACK_TOKEN` and `NYX_EXTC2_SLACK_CHANNEL` set) but
+    /// `NYX_EXTC2_SLACK_HMAC_KEY` is missing, malformed, or all-zero, this
+    /// returns `Err` and the server refuses to boot — the relay must never
+    /// run with a guessable HMAC key.
     ///
     /// When any relay is enabled, the ONE shared [`TransportStack`] is built
     /// here (channels pushed in priority order: Slack first, MCP as fallback)
