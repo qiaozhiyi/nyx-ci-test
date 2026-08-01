@@ -534,6 +534,7 @@ unsafe fn report_exit(exit_proc: Option<usize>, code: u32) -> ! {
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest() {
+    crate::selftests::write_marker("nyx_g6_selftest.started", "entered\n");
     let exit_proc = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess");
 
     // === Phase 1: PEB walk + export table (no alloc) ===
@@ -629,6 +630,7 @@ pub unsafe extern "system" fn nyx_selftest() {
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_evasion() {
+    crate::selftests::write_marker("nyx_g6_evasion.started", "entered\n");
     let exit_proc = crate::resolve::export_addr(b"kernel32.dll", b"ExitProcess");
 
     // Bootstrap the allocator (Phase 2 of the main selftest does this; we need

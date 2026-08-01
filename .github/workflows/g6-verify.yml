@@ -158,6 +158,19 @@ jobs:
               $ran = $false
               $bits = "TIMEOUT"
               $failed += "$t=TIMEOUT"
+              # Headless-Session-0 diagnostic (known limitation since v0.3.2):
+              # rundll32 hangs on GitHub-hosted runners. Dump the entry markers
+              # the selftests write on entry (nyx_g6_*.started) plus any diag
+              # files, so a future run can tell "rundll32 never entered the
+              # export" from "entered and hung at phase X".
+              Write-Host "::group::diag files for $t (TIMEOUT)"
+              Get-ChildItem "$env:TEMP\nyx_*" -ErrorAction SilentlyContinue | ForEach-Object {
+                Write-Host "--- $($_.FullName)"; Get-Content $_.FullName -ErrorAction SilentlyContinue
+              }
+              Get-ChildItem "$dllDir\*.txt" -ErrorAction SilentlyContinue | ForEach-Object {
+                Write-Host "--- $($_.Name)"; Get-Content $_.FullName -ErrorAction SilentlyContinue
+              }
+              Write-Host "::endgroup::"
             }
             Write-Host ("{0,-25} {1,6} {2,5} {3}" -f $t, $code, $ran, $bits)
           }

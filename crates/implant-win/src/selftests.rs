@@ -577,6 +577,7 @@ pub unsafe extern "system" fn nyx_selftest_inject() {
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_inject_pool() {
+    crate::selftests::write_marker("nyx_g6_inject_pool.started", "entered\n");
     let mut mask: u32 = 0;
     // Force the gate ON for this selftest (restore on exit).
     let prev_gate = crate::tp::set_pool_party_enabled(true);
@@ -1449,6 +1450,7 @@ pub unsafe extern "system" fn nyx_selftest_hashdump() {
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_postex() {
+    crate::selftests::write_marker("nyx_g6_postex.started", "entered\n");
     let mut mask: u32 = 0;
     let self_pid = crate::hostinfo::pid();
     if self_pid == 0 {
@@ -2054,7 +2056,7 @@ pub unsafe extern "system" fn nyx_selftest_fs_probe() {
 
 /// Write a small marker file via kernel32 WriteFile (the path proven to work).
 #[cfg(feature = "selftest")]
-fn write_marker(name: &str, content: &str) {
+pub(crate) fn write_marker(name: &str, content: &str) {
     use core::ffi::c_void;
     type CreateFileW = unsafe extern "system" fn(
         *const u16,
