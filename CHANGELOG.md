@@ -12,7 +12,160 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
-## [0.3.2] - 2026-07-22
+2026-07-31 wave-2 fix sprint (work packages w2-clipboard / w2-ntalloc / w2-channels /
+w2-kernelsdk-core / w2-kernelsdk-net / w2-pdb / w2-quickwins). All changes below are
+UNCOMMITTED in the working tree, so entries cite `file:line` evidence instead of commit
+SHAs; backfill SHAs when the wave is committed.
+
+### Changed
+
+- **SmbPipe/Tcp channels gated as not implemented + I/O timeouts (w2-channels).**
+  Findings implant-channels-2/3: SmbPipe/Tcp have no parent-side implementation in the
+  repo, so a beacon on them can never transact, and neither channel bounded its I/O — a
+  wedged peer could hold the single beacon thread indefinitely. `SetChannel` now rejects
+  both with a clear `Response::Err` (never silently accepted,
+  `crates/implant-win/src/beacon.rs` `Command::SetChannel` arm) and
+  `channels::dispatch_send_recv` refuses to transact on them (returns `None` +
+  `ERR_CH_NOT_IMPL` diag; `crates/implant-win/src/channels/mod.rs`). tcp.rs gained a
+  bounded non-blocking connect (FIONBIO + `select` with a 10s deadline, mirroring
+  pivot.rs) plus `SO_RCVTIMEO`/`SO_SNDTIMEO` 10s per-op bounds on send/recv
+  (`crates/implant-win/src/channels/tcp.rs`); smb.rs bounds the pipe-open phase with
+  `WaitNamedPipeW` (5s) on `ERROR_PIPE_BUSY` and documents the bounded-blocking contract
+  (`crates/implant-win/src/channels/smb.rs`).
+- **PatchGuard windows gated off behind placeholder offsets (w2-kernelsdk-core).**
+  Finding kernelsdk-1-1: all 5 rows of `KNOWN_PG_CONTEXT_BUILDS` carried the same
+  guessed PLACEHOLDER offsets (PRCB thread ptr 0x190 / valid-flag 0x08, never
+  verified against a live kernel or PDB), yet `select_pg_window` happily returned a
+  window for every one — a bugcheck lottery. Each row now carries an explicit
+  `PgContextOffsets::verified` flag (all `false` today) and `select_pg_window`
+  returns `None` for any unverified build (`pg_context_usable_for_window` gate,
+  `crates/operator-kernelsdk/src/offsets.rs:475,588` +
+  `crates/operator-kernelsdk/src/win/mod.rs:467`). The bypass code paths
+  (`TimingRepairWindow`/`RuntimePgBypassWindow`) stay and become reachable
+  per-build as PDB validation flips rows; the capability is documented
+  EXPERIMENTAL in the crate status docs, and the CLI `pg-window` command now
+  reports the gate instead of a fake success (`crates/operator-kernel-cli/src/main.rs`).
+- **KernelTier gained a real driver-unload path (w2-kernelsdk-core).**
+  Finding kernelsdk-1-2: the BYOVD `LoadedDriver` was sealed inside
+  `Option<Box<dyn Send + Sync>>` with no way to reach it, so the documented
+  unload flow was impossible. `LoadedDriver` now implements a new opaque
+  `DriverHandle` trait and `KernelTier::unload_driver(&mut self) ->
+  Option<Box<dyn DriverHandle>>` takes the handle, runs the unload
+  (NtUnloadDriver + registry-key cleanup), and clears the field
+  (`crates/operator-kernelsdk/src/lib.rs:454,489,518` +
+  `crates/operator-kernelsdk/src/win/driver_load.rs:178`). The contradictory
+  `load()` doc ("Drop unloads + cleans the key") vs the no-op `Drop` impl is
+  fixed to state the explicit-unload contract (`driver_load.rs:90-92`).
+
+2026-07-31 audit-follow-up sprint (branch `refactor/ah-audit-followups`, work packages
+wp-protocol / wp-store / wp-kernel-daemon / wp-loader / wp-implant-core / wp-implant-inject /
+wp-bof-runner / wp-agent-dev / wp-server-a / wp-server-b / wp-ui / wp-scripting /
+wp-config-macros / wp-transport / wp-offsets). All changes below are UNCOMMITTED in the
+working tree, so entries cite `file:line` evidence instead of commit SHAs; backfill SHAs
+when the wave is committed. Central validation: `cargo check`/`cargo test --workspace
+--exclude nyx-client-ui` all green; standalone `implant-evasionsdk` (54), `operator-kernelsdk`
+(102+8), `minidump-assembler`, `offset-resolver`, `client-ui-web`, and implant-win nightly
+cross-check all pass.
+
+### Changed
+
+- **Contributory X25519 (wp-protocol).** `ServerKeypair::derive_for` /
+  `ImplantKeypair::session_key` now return `Result<SessionKey, KeyExchangeError>` and
+  reject low-order (identity-point / all-zero shared secret) peer keys per RFC 7748 §6.1
+  (`crates/protocol/src/crypto.rs:222-248, 302-319, 370-386`). The server fails the
+  check-in with an error response; the implant/agent treat it as a fatal config error.
+- **Encode-side size cap (wp-protocol).** `encode_frame_dir` errors when ciphertext would
+  exceed `MAX_CT_LEN` (512 KiB) instead of producing an over-limit frame
+  (`crates/protocol/src/frame.rs`).
+- **`FileOp::Ls` wire variant (wp-protocol).** `Ls` added after `Cp` (wire tag 5) with
+  encode/decode + round-trip tests (`crates/protocol/src/msg.rs:274-307`); the server maps
+  the `ls` command to it.
+- **Session counter persistence (wp-store, wp-server-a).** `session_store` gained
+  `send_counter`/`last_recv` columns via a real `schema_version` migration; the server
+  restores and persists them per frame (`crates/store/src/session_store.rs`). Also:
+  `mask_secret` is now char-based `first2….last2` (UTF-8-safe, non-ASCII regression tests,
+  `crates/store/src/model.rs:73-82`), token consumption is an atomic fail-closed
+  `UPDATE … WHERE used=0`, `busy_timeout` is set on all connections, and DB files are
+  created 0600.
+- **Kernel daemon auth (wp-kernel-daemon).** `--serve` requires `NYX_DAEMON_TOKEN`
+  (exit 7 without it); every connection must open with `auth <token>` (constant-time
+  compare); `pid<=0` rejected; per-connection op rate limit
+  (`crates/operator-kernel-cli/src/main.rs:157-177, 536-551`).
+- **Beacon send/receive discipline (wp-implant-core).** `beacon_send_frame` advances the
+  counter and clears pending only after a successful send (P0-3 discipline); S2C replay
+  protection via `LAST_SERVER_COUNTER` / `accept_server_counter`; `#[alloc_error_handler]`
+  converted to a recoverable OOM path; init failure gets a distinct exit code.
+- **BOF entry ABI (wp-bof-runner, wp-implant-inject, wp-agent-dev).** CS ABI
+  `go(char *args, int alen)`: `bof-runner::execute(blob, args)` invokes the entry as
+  `go(args.as_ptr(), args.len() as i32)` with a NULL-buffer fallback for no-args BOFs
+  (`crates/bof-runner/src/win.rs:489-498`); W^X — code sections flipped to
+  `PAGE_EXECUTE_READ` via `VirtualProtect` before `go()`, memory freed by RAII guards
+  after return (`win.rs:455-459`); externals table extended with kernel32/ntdll exports
+  resolved via `GetModuleHandleA`/`GetProcAddress` (`win.rs:409-414`). agent-dev passes
+  BOF args through.
+- **Server-side relay stack (wp-server-b).** ONE `TransportStack` built at boot by
+  `ExtC2RelayConfig::from_env` and shared by both `/extc2/slack` and `/extc2/mcp` relay
+  entry points instead of per-call transport construction
+  (`crates/server/src/extc2_relay.rs:57-59, 122-127, 214-218`).
+- **UI task history + expiry (wp-ui).** Task history lifted to an App-level store keyed by
+  session (no wipe on session switch); every result emit carries `session_id`; pending
+  tasks expire with a synthetic error result.
+- **Scripting resource budgets (wp-scripting).** Global cumulative op budget via
+  `on_progress` (never resets per dispatch) plus a per-dispatch cap and wall-clock
+  deadline; `nyx_log` call/byte rate limit per dispatch.
+- **config-macros (PARTIAL).** `tracked_path`/`tracked_env` documented as unavailable on
+  stable 1.96 (verified E0433) with exact insertion points for when the API stabilizes;
+  regression fixture added (`crates/config-macros/src/`).
+- **Offsets canonicalization (wp-offsets).** `implant-evasionsdk::offsets_table` marked
+  canonical with a pub accessor; `operator-kernelsdk` + `offset-resolver` gained
+  consistency dev-dep tests; 19045 range policy aligned
+  (`crates/implant-evasionsdk/src/offsets_table.rs:39-44, 296, 335`).
+
+### Fixed
+
+- **Low-order key exchange accepted (wp-protocol, CRITICAL).** An implant presenting the
+  curve identity point forced a deterministic, attacker-known session key; now rejected
+  (see Changed). Tests: identity-point pubkey and all-zero shared secret are rejected;
+  normal path still works.
+- **Oversized frame / blob kills (wp-protocol, wp-agent-dev).** Encode-side cap plus
+  `encode_batch` ported to agent-dev: oversized responses become `Response::Err`, never a
+  loop-killing panic; counter/pending cleared only after a successful POST.
+- **Pool Party handle layout (wp-implant-inject).** `SYSTEM_HANDLE_INFORMATION_EX`
+  parsed with correct layout (count@0, stride 0x28, handle@0x10, pid@0x08) + synthetic
+  buffer test; `nt_allocate_virtual_memory` gained the ZeroBits param (6-arg `syscall6`).
+- **Kill-date silent drop (wp-server-a).** Kill-date validation is strict: days-in-month +
+  leap-year logic, year ≥ 1970, checked arithmetic, ISO 8601 / `YYYY-MM-DD` / bare seconds
+  (`crates/server/src/implant_gen.rs:258-268, 340-374`).
+- **Argon2id on the async runtime (wp-server-a).** Verification offloaded via
+  `spawn_blocking` with an auth-work budget that fails closed when exhausted.
+- **Session GC evicted active sessions (wp-server-a).** GC now exempts recently-active
+  sessions from age eviction and re-admits lost sessions on `TaskResponse` batch
+  re-registration.
+- **Transport doc claims (wp-transport).** False 'server uses `TransportStack`' claims in
+  `crates/transport/src/lib.rs` corrected.
+
+### Removed
+
+- **`nyx-mutate` crate deleted (wp-server-b).** Workspace member, dependency, and
+  `FEATURE_MUTATE` / `MutationReport` plumbing removed from the server
+  (`Cargo.toml` members, `crates/server/Cargo.toml`, `implant_gen.rs`).
+- **nyx-loader `LAYER2_PEB_WALK` fragment deleted (wp-loader).** The broken 65-byte
+  fragment is gone; `generate_loader_stub`/`wrap_payload` now fail loudly (return `Result`)
+  — reflective loading is explicitly not shippable until a real layer-2 exists
+  (`crates/nyx-loader/src/lib.rs:169-172, 208-211`). `tools/srdi --loader` now requires
+  `--encrypt` (inert PIC_STUB path rejected).
+
+### Security
+
+- **Fail-closed Slack relay (wp-server-b).** `NYX_EXTC2_SLACK_HMAC_KEY` is required when
+  the Slack relay is enabled — missing, non-hex, or all-zero key is a boot error
+  (`crates/server/src/extc2_relay.rs:381-413`).
+- **Fail-closed release probe gate (wp-loader).** A missing or `FAIL` loader probe result
+  blocks release (`scripts/release/*.ps1`).
+- **Token consumption fail-closed (wp-store).** One-time token consume is atomic — a
+  `used=0` row with zero rows updated rejects the attempt.
+- **Daemon rate limit + auth (wp-kernel-daemon).** See Changed; unauthenticated or
+  rate-exceeding daemon connections are closed.
 
 Second round of audit fixes — closes the remaining 13 CRITICAL findings
 from the 2026-07-21 full-codebase audit. With v0.3.1 + v0.3.2 combined,
