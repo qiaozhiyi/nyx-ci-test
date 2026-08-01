@@ -2846,13 +2846,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nyx-mutate"
-version = "0.2.0"
-dependencies = [
- "rand 0.8.6",
-]
-
-[[package]]
 name = "nyx-parse"
 version = "0.2.0"
 
@@ -2913,7 +2906,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "nyx-agent-dev",
- "nyx-mutate",
  "nyx-profile",
  "nyx-protocol",
  "nyx-rest",

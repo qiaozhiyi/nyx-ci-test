@@ -140,7 +140,7 @@ async fn undecryptable_frame_for_unknown_pubkey_does_not_crash() {
 fn valid_checkin_frame(server_pub: &[u8; 32]) -> (Vec<u8>, [u8; 32]) {
     use nyx_protocol::{frame, wire::Writer, ImplantKeypair, SessionInfo};
     let ikp = ImplantKeypair::generate().unwrap();
-    let key = ikp.session_key(server_pub);
+    let key = ikp.session_key(server_pub).unwrap();
     let pubkey = ikp.public_bytes();
     let mut w = Writer::new();
     SessionInfo {

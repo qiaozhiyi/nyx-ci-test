@@ -18,9 +18,10 @@
 //! `load_or_create_keypair`). The first admin is bootstrapped from
 //! `NYX_BOOTSTRAP_OPERATOR=name:secret` when the registry is empty.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
@@ -29,6 +30,90 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use serde::{Deserialize, Serialize};
 
 use crate::constant_time_eq;
+
+/// Expensive-auth-work budget constants. The argon2id KDF (OWASP baseline:
+/// 64 MiB, t=3) is the dominant cost of a login attempt. Without a cap, an
+/// unauthenticated attacker can force unbounded KDF executions by spraying
+/// garbage bearer tokens — a CPU DoS on the operator-auth path.
+///
+/// The budget is a GLOBAL sliding window (all operators share it): every
+/// argon2 execution — the not-found dummy, the real verify, and the
+/// transparent-rehash KDF — must first take a slot. When the window is
+/// exhausted the attempt fails CLOSED (denied) without running the KDF, so a
+/// garbage-token flood costs at most [`AUTH_KDF_BUDGET`] argon2 runs per
+/// window server-wide.
+///
+/// Trade-offs (deliberate):
+/// - Global, not per-name/IP: `resolve` has no peer address, and per-name
+///   keys are attacker-rotatable. A global budget is the only key that
+///   actually bounds total work.
+/// - It can briefly throttle ALL named logins during an attack (fail-closed
+///   denial rather than unbounded KDF work). Beacon traffic and the legacy
+///   `NYX_TOKEN` path (constant-time SHA-256, no argon2) are unaffected.
+const AUTH_KDF_WINDOW: Duration = Duration::from_secs(10);
+const AUTH_KDF_BUDGET: usize = 16;
+
+/// Sliding-window budget for expensive auth work. See [`AUTH_KDF_BUDGET`].
+struct AuthBudget {
+    recent: Mutex<VecDeque<Instant>>,
+}
+
+impl AuthBudget {
+    fn new() -> Self {
+        Self {
+            recent: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Reserve one argon2 execution slot. Returns `false` (fail-closed) when
+    /// the window is already at budget; on success records the timestamp.
+    /// The deque is pruned of expired entries on each call, so it never grows
+    /// past the budget.
+    fn try_take(&self) -> bool {
+        let mut q = match self.recent.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = Instant::now();
+        let cutoff = now
+            .checked_sub(AUTH_KDF_WINDOW)
+            .unwrap_or(now); // clock anomaly: treat everything as expired
+        while q.front().is_some_and(|t| *t < cutoff) {
+            q.pop_front();
+        }
+        if q.len() >= AUTH_KDF_BUDGET {
+            return false;
+        }
+        q.push_back(now);
+        true
+    }
+}
+
+/// Run the blocking argon2 KDF closure on the tokio blocking pool so a login
+/// attempt can never stall a runtime worker thread.
+///
+/// `resolve` is synchronous (the axum auth path calls it from sync helpers), so
+/// the offload uses the documented tokio pattern: `block_in_place` leases the
+/// current worker back to the runtime, then
+/// `Handle::block_on(spawn_blocking(...))` runs the closure on the blocking
+/// pool and waits for it. When no runtime is present (plain sync unit tests,
+/// or a runtime that is shutting down) the closure runs inline — same result,
+/// no worker to protect.
+///
+/// Returns `None` only if the spawned closure panicked (JoinError); callers
+/// map that to fail-closed (verify → false, dummy → skipped, rehash → kept
+/// legacy). The closures here are panic-free by construction, so this is
+/// unreachable in practice — but auth must never unwrap-and-abort.
+fn offload_kdf<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(move || {
+                handle.block_on(tokio::task::spawn_blocking(f)).ok()
+            })
+        }
+        _ => Some(f()),
+    }
+}
 
 /// Construct the canonical argon2id instance used for hashing new secrets.
 ///
@@ -107,7 +192,10 @@ pub struct OperatorRegistry {
     /// via `empty()` / struct literals. Rehash-on-login (see [`Self::resolve`])
     /// is best-effort: when this is `None`, the in-memory record is still
     /// upgraded to argon2id but the change is not persisted.
-    path: Option<std::sync::Mutex<PathBuf>>,
+    path: Option<Mutex<PathBuf>>,
+    /// Global sliding-window budget on expensive auth work (argon2 KDF
+    /// executions). See [`AUTH_KDF_BUDGET`].
+    auth_budget: AuthBudget,
 }
 
 impl OperatorRegistry {
@@ -115,6 +203,7 @@ impl OperatorRegistry {
         Self {
             ops: RwLock::new(HashMap::new()),
             path: None,
+            auth_budget: AuthBudget::new(),
         }
     }
 
@@ -144,8 +233,15 @@ impl OperatorRegistry {
     /// would otherwise be skipped entirely, making the found-vs-not-found paths
     /// distinguishable by wall-clock time — a remote oracle for enumerating
     /// valid operator names. On every not-found path we run the argon2 KDF
-    /// against [`DUMMY_ARGON2_HASH`] (result discarded) so both paths pay the
-    /// same dominant cost.
+    /// (result discarded) so both paths pay the same dominant cost.
+    ///
+    /// **Bounded work for garbage tokens**: every argon2 execution — the
+    /// not-found dummy, the real verify, and the transparent-rehash KDF — must
+    /// first take a slot in the global [`AuthBudget`]. Once the window is
+    /// exhausted, attempts fail closed WITHOUT running the KDF, so an
+    /// unauthenticated flood of garbage tokens can never drive unbounded KDF
+    /// work (CPU DoS). The KDF itself always runs on the tokio blocking pool
+    /// (see [`offload_kdf`]), never on a runtime worker thread.
     ///
     /// **Transparent rehash (OWASP password-storage pattern)**: when the matched
     /// record is a legacy `plain:<sha256>` marker AND the supplied secret
@@ -179,14 +275,36 @@ impl OperatorRegistry {
                     secret_hash: r.secret_hash.clone(),
                 },
                 None => {
-                    // Not-found path: run the dummy argon2 KDF before returning
-                    // None so the timing matches the found path.
-                    run_dummy_argon2(secret);
+                    // Not-found path: pay the same argon2 cost as the found
+                    // path (timing equalization), but only within the global
+                    // auth-work budget — a garbage-token flood must not be
+                    // able to force unbounded KDF executions. Both paths take
+                    // (or skip) the budget identically, preserving the timing
+                    // match between found and not-found.
+                    if self.auth_budget.try_take() {
+                        let secret_owned = secret.to_string();
+                        let _ = offload_kdf(move || run_dummy_argon2(&secret_owned));
+                    } else {
+                        tracing::warn!(
+                            target: "nyx::auth",
+                            "auth-work budget exhausted; denying unknown operator without KDF (fail-closed)"
+                        );
+                    }
                     return None;
                 }
             }
         };
-        if !verify_secret(&matched.secret_hash, secret) {
+        if !self.auth_budget.try_take() {
+            tracing::warn!(
+                target: "nyx::auth",
+                operator = %matched.name,
+                "auth-work budget exhausted; denying without running argon2 (fail-closed)"
+            );
+            return None;
+        }
+        let stored_hash = matched.secret_hash.clone();
+        let secret_owned = secret.to_string();
+        if !offload_kdf(move || verify_secret(&stored_hash, &secret_owned)).unwrap_or(false) {
             return None;
         }
         let identity = OperatorIdentity {
@@ -212,13 +330,33 @@ impl OperatorRegistry {
     /// best-effort: a flush failure is logged but does NOT revert the in-memory
     /// upgrade (the next successful login will retry the flush).
     fn rehash_operator(&self, name: &str, plaintext_secret: &str) {
-        let new_hash = match hash_argon2(plaintext_secret) {
-            Ok(h) => h,
-            Err(e) => {
+        // The rehash KDF is as expensive as a verify; run it off the worker
+        // thread and within the auth-work budget. Fail-closed: when the budget
+        // is exhausted the upgrade is skipped (the record stays legacy and
+        // retries on the next successful login) rather than paying unbounded
+        // KDF work.
+        if !self.auth_budget.try_take() {
+            tracing::warn!(
+                operator = name,
+                "auth-work budget exhausted; skipping transparent rehash (record stays legacy)"
+            );
+            return;
+        }
+        let secret_owned = plaintext_secret.to_string();
+        let new_hash = match offload_kdf(move || hash_argon2(&secret_owned)) {
+            Some(Ok(h)) => h,
+            Some(Err(e)) => {
                 tracing::warn!(
                     operator = name,
                     error = ?e,
                     "transparent rehash to argon2id failed; legacy plain: record left in place"
+                );
+                return;
+            }
+            None => {
+                tracing::warn!(
+                    operator = name,
+                    "transparent rehash: KDF closure failed in spawn_blocking; legacy plain: record left in place"
                 );
                 return;
             }
@@ -349,7 +487,8 @@ impl OperatorRegistry {
         }
         Ok(Self {
             ops: RwLock::new(map),
-            path: Some(std::sync::Mutex::new(path.to_path_buf())),
+            path: Some(Mutex::new(path.to_path_buf())),
+            auth_budget: AuthBudget::new(),
         })
     }
 }
@@ -477,6 +616,7 @@ mod tests {
                 m
             }),
             path: None,
+            auth_budget: AuthBudget::new(),
         };
         // named op
         let op = reg.resolve("alice:s3cret").unwrap();
@@ -530,7 +670,8 @@ mod tests {
                 );
                 m
             }),
-            path: Some(std::sync::Mutex::new(path.clone())),
+            path: Some(Mutex::new(path.clone())),
+            auth_budget: AuthBudget::new(),
         };
         // Login with the legacy secret — resolves and transparently rehashes.
         let op = reg
@@ -574,5 +715,78 @@ mod tests {
             "bootstrap env ignored once registry non-empty"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A garbage-token flood must not drive unbounded argon2 work: once the
+    /// global budget is exhausted, even a CORRECT credential is denied without
+    /// running the KDF (fail-closed).
+    #[test]
+    fn auth_budget_denies_all_auth_once_exhausted() {
+        // Shrink the argon2 cost so 16 KDF executions finish well inside the
+        // 10s sliding window (with the real 64 MiB params the loop takes
+        // ~20s and the first attempts age out, re-opening the budget).
+        std::env::set_var("NYX_ARGON2_M", "16");
+        std::env::set_var("NYX_ARGON2_T", "1");
+        let reg = OperatorRegistry {
+            ops: RwLock::new({
+                let mut m = HashMap::new();
+                m.insert(
+                    "alice".into(),
+                    OperatorRecord {
+                        name: "alice".into(),
+                        secret_hash: hash_argon2("s3cret").unwrap(),
+                        role: Role::Admin,
+                        created: 0,
+                    },
+                );
+                m
+            }),
+            path: None,
+            auth_budget: AuthBudget::new(),
+        };
+        // Exhaust the window with unknown-name (dummy-KDF) attempts.
+        for i in 0..AUTH_KDF_BUDGET {
+            assert!(
+                reg.resolve(&format!("ghost{i}:x")).is_none(),
+                "unknown operator {i} must be denied"
+            );
+        }
+        // The next attempt — even with the correct credential — is denied
+        // without KDF work (bounded).
+        assert!(
+            reg.resolve("alice:s3cret").is_none(),
+            "budget exhausted ⇒ auth fails closed"
+        );
+    }
+
+    /// Under a real multi-threaded tokio runtime the argon2 KDF must run on
+    /// the blocking pool (offload_kdf), not on the worker thread. This test
+    /// exercises exactly that path (the sync fallback is covered by the other
+    /// tests, which run without a runtime).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_offloads_kdf_under_runtime() {
+        let reg = OperatorRegistry {
+            ops: RwLock::new({
+                let mut m = HashMap::new();
+                m.insert(
+                    "alice".into(),
+                    OperatorRecord {
+                        name: "alice".into(),
+                        secret_hash: hash_argon2("s3cret").unwrap(),
+                        role: Role::Admin,
+                        created: 0,
+                    },
+                );
+                m
+            }),
+            path: None,
+            auth_budget: AuthBudget::new(),
+        };
+        // The resolved identity is identical whether the KDF ran on the
+        // blocking pool or inline.
+        let op = reg.resolve("alice:s3cret").expect("correct credential resolves");
+        assert_eq!(op.name, "alice");
+        assert!(reg.resolve("alice:wrong").is_none());
+        assert!(reg.resolve("nobody:x").is_none());
     }
 }

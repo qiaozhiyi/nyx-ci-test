@@ -257,8 +257,12 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // External-C2 relay config (Slack/MCP). Opt-in via NYX_EXTC2_* env vars;
-    // absent → relay disabled and /extc2/* routes behave as plain beacon aliases.
-    let extc2 = nyx_server::extc2_relay::ExtC2RelayConfig::from_env();
+    // absent → relay disabled and /extc2/* routes behave as plain beacon
+    // aliases. Fail-closed: enabling the Slack relay without a valid
+    // NYX_EXTC2_SLACK_HMAC_KEY is a boot error (a missing/all-zero HMAC key
+    // would let third parties forge relayed frames — CRITICAL-22).
+    let extc2 = nyx_server::extc2_relay::ExtC2RelayConfig::from_env()
+        .map_err(|e| anyhow::anyhow!("external-C2 relay config invalid: {e}"))?;
     if extc2.any_enabled() {
         tracing::info!(
             slack = extc2.slack.is_some(),

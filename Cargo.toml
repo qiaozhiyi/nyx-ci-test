@@ -18,7 +18,6 @@ members = [
     "crates/client-ui-web/src-tauri",
     "crates/scripting-rhai",
     "crates/nyx-loader",
-    "crates/nyx-mutate",
 ]
 # NOTE: `crates/implant-win` is intentionally NOT a workspace member. It is
 # `#![no_std]` + `#![no_main]` + targets `x86_64-pc-windows-gnu` on nightly, and
@@ -50,7 +49,6 @@ nyx-transport = { path = "crates/transport" }
 nyx-bof-runner = { path = "crates/bof-runner" }
 nyx-scripting-rhai = { path = "crates/scripting-rhai" }
 nyx-loader = { path = "crates/nyx-loader" }
-nyx-mutate = { path = "crates/nyx-mutate" }
 # proc-macro toolchain (compile-time config embedding)
 syn = { version = "2", features = ["full"] }
 quote = "1"

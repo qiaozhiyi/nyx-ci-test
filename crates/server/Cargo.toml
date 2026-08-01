@@ -14,7 +14,6 @@ nyx-scripting-rhai = { workspace = true }
 nyx-transport = { workspace = true }
 # Persistent credential store (SQLite/ACID, server-side only).
 nyx-store = { workspace = true }
-nyx-mutate = { workspace = true }
 # Shared REST view types — single source of truth for /api/* JSON shapes.
 nyx-rest = { workspace = true }
 # Named-operator auth (argon2) + audit-log hash-chain.
