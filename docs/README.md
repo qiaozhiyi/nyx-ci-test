@@ -4,6 +4,7 @@
 
 - [项目状态](STATUS.md)：当前能力边界、交付状态与文档生命周期。
 - [工程化整改计划（2026 Q3）](design/NYX_REMEDIATION_PROGRAM_2026Q3.md)：当前整改目标、验收门禁与里程碑。
+- [Nyx vs 前沿商业 C2 基准评测（2026-07-31）](design/BENCHMARK_FRONTIER_C2_2026-07-31.md)：2026-07-31 修复冲刺后的权威当前状态对标（CS 4.13 / BRc4 Catalyst 2.6.3）。
 
 ## 按用途查阅
 
