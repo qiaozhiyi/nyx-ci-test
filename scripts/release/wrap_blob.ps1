@@ -1,26 +1,18 @@
 # wrap_blob.ps1 — wrap the prod implant DLL into the reflective PIC blob.
 #
-# DEPENDENCY ON T1 (crates/nyx-loader, owned by T1):
-#   This script invokes `cargo run -p nyx-loader --example wrap -- <input> <output>`.
-#   As of 2026-07-21 the nyx-loader crate (crates/nyx-loader/Cargo.toml) exposes
-#   ONLY a lib target — wrap_payload() is a library function (lib.rs:145) with no
-#   bin or example entry point. This pipeline CANNOT add that example target
-#   because crates/ is out of scope for T3 (T1 owns crates/nyx-loader/** per
-#   spec §7 task table).
+# DEPENDENCY ON crates/nyx-loader (loader owner):
+#   This script invokes `cargo run -p nyx-loader --example wrap -- <input> <output>`
+#   (crates/nyx-loader/examples/wrap.rs), which reads <input_dll>, calls
+#   nyx_loader::wrap_payload() with a random LoaderConfig, and writes the blob
+#   to <output_blob>.
 #
-#   T1 MUST provide one of:
-#     (a) crates/nyx-loader/examples/wrap.rs  — a small binary that reads
-#         <input_dll>, calls nyx_loader::wrap_payload() with a LoaderConfig
-#         (random key + nonce), and writes the blob to <output_blob>. The
-#         operator is responsible for exfiltrating the key (it is baked into
-#         the PIC stub at build time by generate_loader_stub()). OR
-#     (b) a [[bin]] target in crates/nyx-loader/Cargo.toml that does the same,
-#         invoked as `cargo run -p nyx-loader --release -- wrap <in> <out>`.
-#
-#   Until T1 lands (a) or (b), this step fails clearly with a cargo
-#   "no example target named `wrap`" error — the failure is loud, not silent.
-#   Integration note: if T1 names the target differently, update the
-#   $WRAP_TARGET / $WRAP_MODE vars below.
+#   STATUS: wrap_payload() currently ALWAYS fails — generate_loader_stub()
+#   returns LoaderError::Layer2Unavailable because the on-target Layer-2
+#   shellcode does not exist. This step therefore fails loudly (no blob is
+#   produced), which is correct fail-closed behavior: the loader capability is
+#   not shippable until a real Layer-2 exists (spec §5.3). When Layer-2 lands,
+#   this step starts producing the blob again and loader_probe_gate.ps1 takes
+#   over verification.
 #
 # Input:  crates/implant-win/target/x86_64-pc-windows-msvc/release/nyx_implant_win.dll
 #         (produced by build_prod_dll.ps1)
@@ -75,8 +67,9 @@ try {
     & cargo @cargoArgs 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "::error::nyx-loader wrap failed (exit $LASTEXITCODE)."
-        Write-Host '::error::Likely cause: T1 has not yet provided the wrap example/bin target in crates/nyx-loader.'
-        Write-Host '::error::See header of this script for the T1 dependency contract.'
+        Write-Host '::error::Expected while Layer-2 is unimplemented: generate_loader_stub() fails loudly'
+        Write-Host '::error::with LoaderError::Layer2Unavailable, so no reflective blob can be produced.'
+        Write-Host '::error::This is release-blocking by design (see header of this script).'
         exit 1
     }
 }

@@ -58,7 +58,17 @@ fn main() -> ExitCode {
     }
 
     let config = LoaderConfig::random();
-    let blob = wrap_payload(&dll_bytes, &config);
+    let blob = match wrap_payload(&dll_bytes, &config) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "error: cannot wrap '{input_path}': {e}\n\nThe loader capability is not \
+                 shippable until a real on-target Layer-2 exists; no reflective blob can be \
+                 emitted right now."
+            );
+            return ExitCode::from(1);
+        }
+    };
 
     if let Err(e) = fs::write(output_path, &blob) {
         eprintln!("error: cannot write output '{output_path}': {e}");
