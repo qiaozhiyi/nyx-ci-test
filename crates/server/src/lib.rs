@@ -1154,7 +1154,6 @@ fn handle_beacon(
     handle_frame(st, peer, &raw)
 }
 
-
 /// Resolve session key: determine whether this is a new or existing session,
 /// and return the derived/stored [`SessionKey`]. For existing sessions, the
 /// read-guard counter check is ADVISORY only — the authoritative anti-replay
@@ -1216,9 +1215,7 @@ fn handle_new_session(
             // an existing session. The AEAD decrypt above already proved the
             // implant holds the session key, so no re-authentication is needed.
             if TaskResponse::decode_vec(&plaintext).is_err() {
-                anyhow::bail!(
-                    "check-in body is neither a SessionInfo nor a TaskResponse batch"
-                );
+                anyhow::bail!("check-in body is neither a SessionInfo nor a TaskResponse batch");
             }
             return handle_readmission(st, raw, key, plaintext);
         }
@@ -1257,9 +1254,7 @@ fn handle_new_session(
                                     "mark_token_used consumed 0 rows; token already claimed by \
                                      a concurrent check-in — rejecting"
                                 );
-                                anyhow::bail!(
-                                    "auth_token already consumed by another check-in"
-                                );
+                                anyhow::bail!("auth_token already consumed by another check-in");
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -3427,7 +3422,10 @@ mod tests {
 
         // The session was re-registered under the same pubkey and the response
         // was buffered; the reply is a sealed (empty) task batch with S2C:1.
-        let s = st.sessions.get(&pubkey).expect("session re-admitted under same pubkey");
+        let s = st
+            .sessions
+            .get(&pubkey)
+            .expect("session re-admitted under same pubkey");
         assert_eq!(s.results.len(), 1, "response batch must be processed");
         assert_eq!(s.results[0].task_id, 7);
         assert!(!s.stale);

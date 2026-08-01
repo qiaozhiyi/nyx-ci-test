@@ -34,7 +34,10 @@ use crate::layout;
 
 extern "system" {
     fn GetModuleHandleA(lp_module_name: *const std::os::raw::c_char) -> *mut c_void;
-    fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const std::os::raw::c_char) -> *mut c_void;
+    fn GetProcAddress(
+        h_module: *mut c_void,
+        lp_proc_name: *const std::os::raw::c_char,
+    ) -> *mut c_void;
     fn VirtualAlloc(
         addr: *mut c_void,
         size: usize,
@@ -231,9 +234,7 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
             continue; // data section: already RW, nothing to flip
         }
         let mut old: u32 = 0;
-        let ok = unsafe {
-            VirtualProtect(bases[i] as *mut c_void, sizes[i], target, &mut old)
-        };
+        let ok = unsafe { VirtualProtect(bases[i] as *mut c_void, sizes[i], target, &mut old) };
         if ok == 0 {
             return Err("VirtualProtect -> PAGE_EXECUTE_READ failed".into());
         }
@@ -424,9 +425,7 @@ fn beacon_apis(near_addr: u64) -> (HashMap<String, u64>, Option<VirtualAllocGuar
     let mut apis: HashMap<String, u64> = HashMap::with_capacity(targets.len());
     for (i, (name, real_addr)) in targets.iter().enumerate() {
         let addr = match table_base {
-            Some(b) if i < layout::TRAMP_STUBS_PER_PAGE => {
-                b + layout::tramp_stub_offset(i) as u64
-            }
+            Some(b) if i < layout::TRAMP_STUBS_PER_PAGE => b + layout::tramp_stub_offset(i) as u64,
             _ => *real_addr,
         };
         apis.insert(name.clone(), addr);

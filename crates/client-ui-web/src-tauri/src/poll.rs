@@ -114,8 +114,7 @@ async fn expire_absent_sessions(
     state: &Arc<BackendState>,
     sessions: &[SessionView],
 ) {
-    let live: std::collections::HashSet<&str> =
-        sessions.iter().map(|s| s.id.as_str()).collect();
+    let live: std::collections::HashSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
 
     // Snapshot the expired tasks under the read lock, then remove under the
     // write lock (emit happens outside any lock).

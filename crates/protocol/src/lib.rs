@@ -32,11 +32,11 @@ pub mod wire;
 
 pub use crypto::{
     aead_decrypt, ecdh, hkdf_sha256, open_dir, public_from_secret, seal_dir, Direction,
-    GenerateError, HkdfError, ImplantKeypair, KeyExchangeError, ServerKeypair, SessionKey,
-    KEY_LEN, NONCE_LEN, PUBKEY_LEN,
+    GenerateError, HkdfError, ImplantKeypair, KeyExchangeError, ServerKeypair, SessionKey, KEY_LEN,
+    NONCE_LEN, PUBKEY_LEN,
 };
 pub use frame::{
-    encode_frame, encode_frame_dir, open_frame, open_frame_dir, parse_frame, FrameError,
-    RawFrame, FRAME_HEADER, TAG_LEN,
+    encode_frame, encode_frame_dir, open_frame, open_frame_dir, parse_frame, FrameError, RawFrame,
+    FRAME_HEADER, TAG_LEN,
 };
 pub use msg::{Command, FileOp, Response, SessionInfo, Task, TaskResponse};

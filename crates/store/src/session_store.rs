@@ -483,7 +483,10 @@ mod tests {
         // v2 → v3 migration. Old rows must come back with counters defaulted to
         // 0 (old rows stay compatible), and the store must be writable.
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("nyx-session-migrate-test-{}.db", std::process::id()));
+        let path = dir.join(format!(
+            "nyx-session-migrate-test-{}.db",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         {
             let conn = Connection::open(&path).unwrap();
@@ -522,11 +525,9 @@ mod tests {
         // Version must be stamped 3 after the migration.
         let v: i64 = {
             let conn = Connection::open(&path).unwrap();
-            conn.query_row(
-                "SELECT version FROM _sessions_schema_version",
-                [],
-                |r| r.get(0),
-            )
+            conn.query_row("SELECT version FROM _sessions_schema_version", [], |r| {
+                r.get(0)
+            })
             .unwrap()
         };
         assert_eq!(v, 3, "schema version must be stamped to 3");

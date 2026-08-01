@@ -36,11 +36,11 @@
 //! blob; pass `&[]` for a no-args BOF — the entry then receives a NULL buffer
 //! and length 0, preserving the `BeaconDataParse(NULL, 0)` idiom.
 
+mod layout;
 #[cfg(target_os = "windows")]
 mod shim;
 #[cfg(target_os = "windows")]
 mod win;
-mod layout;
 
 #[cfg(target_os = "windows")]
 pub use win::{execute, load, ExecResult, Loaded, Resolver};

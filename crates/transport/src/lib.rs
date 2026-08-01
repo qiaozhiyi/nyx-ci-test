@@ -45,7 +45,6 @@
 // fingerprint module's feature-gating doc; the bullets are independent items.
 #![allow(clippy::doc_lazy_continuation)]
 
-
 // ---- Shared helpers ---------------------------------------------------------
 
 /// Extract the longest contiguous hex-digit run from `text`.

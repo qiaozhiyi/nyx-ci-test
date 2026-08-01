@@ -75,9 +75,7 @@ impl AuthBudget {
             Err(poisoned) => poisoned.into_inner(),
         };
         let now = Instant::now();
-        let cutoff = now
-            .checked_sub(AUTH_KDF_WINDOW)
-            .unwrap_or(now); // clock anomaly: treat everything as expired
+        let cutoff = now.checked_sub(AUTH_KDF_WINDOW).unwrap_or(now); // clock anomaly: treat everything as expired
         while q.front().is_some_and(|t| *t < cutoff) {
             q.pop_front();
         }
@@ -106,11 +104,9 @@ impl AuthBudget {
 /// unreachable in practice — but auth must never unwrap-and-abort.
 fn offload_kdf<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            tokio::task::block_in_place(move || {
-                handle.block_on(tokio::task::spawn_blocking(f)).ok()
-            })
-        }
+        Ok(handle) => tokio::task::block_in_place(move || {
+            handle.block_on(tokio::task::spawn_blocking(f)).ok()
+        }),
         _ => Some(f()),
     }
 }
@@ -784,7 +780,9 @@ mod tests {
         };
         // The resolved identity is identical whether the KDF ran on the
         // blocking pool or inline.
-        let op = reg.resolve("alice:s3cret").expect("correct credential resolves");
+        let op = reg
+            .resolve("alice:s3cret")
+            .expect("correct credential resolves");
         assert_eq!(op.name, "alice");
         assert!(reg.resolve("alice:wrong").is_none());
         assert!(reg.resolve("nobody:x").is_none());

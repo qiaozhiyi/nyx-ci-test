@@ -221,7 +221,9 @@ impl RhaiHook {
         // budget does NOT reset.
         let deadline_ms = (Instant::now() - self.budget.epoch).as_millis() as u64
             + self.limits.deadline.as_millis() as u64;
-        self.budget.deadline_ms.store(deadline_ms, Ordering::Relaxed);
+        self.budget
+            .deadline_ms
+            .store(deadline_ms, Ordering::Relaxed);
         self.budget.log_calls.store(0, Ordering::Relaxed);
         self.budget.log_bytes.store(0, Ordering::Relaxed);
         self.budget.log_warned.store(false, Ordering::Relaxed);

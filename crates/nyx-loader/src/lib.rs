@@ -275,9 +275,8 @@ mod tests {
     #[test]
     fn generate_loader_stub_fails_loudly_without_layer2() {
         let config = LoaderConfig::random();
-        let err = generate_loader_stub(&config).expect_err(
-            "generate_loader_stub must fail: Layer-2 shellcode is not implemented",
-        );
+        let err = generate_loader_stub(&config)
+            .expect_err("generate_loader_stub must fail: Layer-2 shellcode is not implemented");
         assert_eq!(err, LoaderError::Layer2Unavailable);
         // The error message must be actionable, not a bare enum name.
         let msg = err.to_string();

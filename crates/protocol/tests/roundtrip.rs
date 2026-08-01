@@ -600,14 +600,9 @@ fn encode_frame_cap_boundary_is_exact() {
     let pubkey = implant.public_bytes();
 
     let at_cap = vec![0u8; frame::MAX_CT_LEN - frame::TAG_LEN];
-    let frame_bytes = frame::encode_frame_dir(
-        &pubkey,
-        crypto::Direction::ClientToServer,
-        0,
-        &key,
-        &at_cap,
-    )
-    .expect("plaintext at exactly MAX_CT_LEN - TAG_LEN must seal");
+    let frame_bytes =
+        frame::encode_frame_dir(&pubkey, crypto::Direction::ClientToServer, 0, &key, &at_cap)
+            .expect("plaintext at exactly MAX_CT_LEN - TAG_LEN must seal");
     // The sealed frame declares ct_len == MAX_CT_LEN and parses (still within
     // the receiver's cap).
     let raw = frame::parse_frame(&frame_bytes).unwrap();

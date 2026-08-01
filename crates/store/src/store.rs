@@ -122,11 +122,10 @@ impl CredStore {
             [],
         )?;
         // MAX() so the gate never depends on unspecified rowid scan order.
-        let current: i64 = conn.query_row(
-            "SELECT MAX(version) FROM _creds_schema_version",
-            [],
-            |r| r.get(0),
-        )?;
+        let current: i64 =
+            conn.query_row("SELECT MAX(version) FROM _creds_schema_version", [], |r| {
+                r.get(0)
+            })?;
         if current < Self::CURRENT_SCHEMA_VERSION {
             // --- migration arms (forward-only) ---------------------------------
             // v0 → v1: initial baseline (creds table already created by init).

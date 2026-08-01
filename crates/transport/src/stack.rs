@@ -754,8 +754,8 @@ mod tests {
 
     #[test]
     fn recv_dead_demotes_channel_for_next_send() {
-        let primary = Mock::ok("primary")
-            .recv_seq(vec![Err(TransportError::Dead("connection closed"))]);
+        let primary =
+            Mock::ok("primary").recv_seq(vec![Err(TransportError::Dead("connection closed"))]);
         let backup = Mock::ok("backup");
         let mut stack = TransportStack::builder()
             .push(primary)

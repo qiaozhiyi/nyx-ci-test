@@ -118,8 +118,8 @@ pub fn encode_frame_dir(
             max_plaintext_len: MAX_CT_LEN - TAG_LEN,
         });
     }
-    let ciphertext = crypto::seal_dir(key, dir, counter, pubkey, plaintext)
-        .map_err(FrameError::Aead)?;
+    let ciphertext =
+        crypto::seal_dir(key, dir, counter, pubkey, plaintext).map_err(FrameError::Aead)?;
     let mut out = Vec::with_capacity(FRAME_HEADER + ciphertext.len());
     out.extend_from_slice(pubkey);
     out.extend_from_slice(&counter.to_le_bytes());

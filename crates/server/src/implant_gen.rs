@@ -42,14 +42,7 @@ use crate::{operators::OperatorIdentity, operators::Role, AppState, AuthOutcome}
 
 /// Return type of [`generate_implant_keys`]: (implant_priv, implant_pub,
 /// config_key, key_seed, auth_token, config_nonce) — all fixed-size arrays.
-type ImplantKeyMaterial = (
-    [u8; 32],
-    [u8; 32],
-    [u8; 32],
-    [u8; 32],
-    [u8; 32],
-    [u8; 12],
-);
+type ImplantKeyMaterial = ([u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 12]);
 
 /// Return type of [`validate_generate_request`]:
 /// (template, implant_store) references.
@@ -514,7 +507,6 @@ pub struct ImplantSummary {
 
 // ── Handler ─────────────────────────────────────────────────────────────────
 
-
 // ── generate_implant helpers ────────────────────────────────────────────────
 
 /// Validate the generate-implant request: operator role, template/store
@@ -626,9 +618,7 @@ fn check_rate_limit(
 
 /// Generate per-implant secrets: key_seed, auth_token, config_nonce,
 /// implant keypair (X25519 with clamping), and config encryption key.
-fn generate_implant_keys(
-    server_pub: [u8; 32],
-) -> Result<ImplantKeyMaterial, (StatusCode, String)> {
+fn generate_implant_keys(server_pub: [u8; 32]) -> Result<ImplantKeyMaterial, (StatusCode, String)> {
     // key_seed: 32 random bytes, NEVER stored directly. Split into 4
     //              fragments, XOR-obfuscated, and scattered across .nyx_cfg.
     //    auth_token: one-time first-check-in token (stored in encrypted config).
@@ -682,7 +672,14 @@ fn generate_implant_keys(
         )
     })?;
 
-    Ok((implant_priv, implant_pub, config_key, key_seed, auth_token, config_nonce))
+    Ok((
+        implant_priv,
+        implant_pub,
+        config_key,
+        key_seed,
+        auth_token,
+        config_nonce,
+    ))
 }
 
 /// Build the per-implant config plaintext in wire format.
@@ -798,8 +795,7 @@ fn patch_implant_template(
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "DLL template has no .nyx_cfg placeholder (0x41414141 + 0xAA)"
-                    .into(),
+                "DLL template has no .nyx_cfg placeholder (0x41414141 + 0xAA)".into(),
             )
         })?;
     if placeholder_offset + 1024 > binary.len() {

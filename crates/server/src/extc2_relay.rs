@@ -455,7 +455,10 @@ mod tests {
         let err = decode_hmac_key(&"00".repeat(32)).unwrap_err();
         assert!(err.contains("all-zero"), "all-zero key error: {err}");
         // Trims surrounding whitespace.
-        assert_eq!(decode_hmac_key(&format!("  {}  ", "cd".repeat(32))), Ok([0xcd; 32]));
+        assert_eq!(
+            decode_hmac_key(&format!("  {}  ", "cd".repeat(32))),
+            Ok([0xcd; 32])
+        );
         // Malformed input → Err, never an all-zero fallback.
         assert!(decode_hmac_key("").is_err());
         assert!(decode_hmac_key("00").is_err()); // 1 byte ≠ 32

@@ -16,8 +16,8 @@
 //! emitter must honour.
 
 use nyx_loader::{
-    on_target,
-    wrap_payload, LoaderConfig, CIPHERTEXT_OFFSET, ENCRYPTED_LEN_OFFSET, NONCE_OFFSET, TAG_LEN,
+    on_target, wrap_payload, LoaderConfig, CIPHERTEXT_OFFSET, ENCRYPTED_LEN_OFFSET, NONCE_OFFSET,
+    TAG_LEN,
 };
 
 /// Build a small but non-trivial fake DLL body.
