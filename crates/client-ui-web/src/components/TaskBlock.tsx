@@ -227,7 +227,9 @@ function FileDownloadView({ chunks }: { chunks: ResultView[] }) {
     const ordered = [...chunks].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
     const hex = ordered.map((c) => c.data_hex ?? '').join('');
     const bytes = hexToBytes(hex);
-    return URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    // TS 5.7+ lib types make hexToBytes' Uint8Array<ArrayBufferLike> not
+    // assignable to BlobPart; the runtime value is a plain Uint8Array.
+    return URL.createObjectURL(new Blob([bytes as BlobPart], { type: 'application/octet-stream' }));
   }, [chunks, done]);
 
   // Revoke the object URL when it is replaced or the view unmounts.

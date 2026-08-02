@@ -273,7 +273,8 @@ def main() -> int:
         print(f"{'export':<32} {'works':<6} {'exit':<10} note")
         for r in rows:
             exit_s = "n/a" if r["exit_code"] is None else f"0x{r['exit_code']:x}"
-            print(f"{r['export']:<32} {str(r['works']):<6} {exit_s:<10} {r['note']}")
+            extra = f" | {r['detail']}" if (not r["works"] and r["detail"]) else ""
+            print(f"{r['export']:<32} {str(r['works']):<6} {exit_s:<10} {r['note']}{extra}")
         print(f"\n{len(rows)} exports tested, {n_ok} working (threshold: >=3)")
 
     return 0 if n_ok >= 3 else 1
