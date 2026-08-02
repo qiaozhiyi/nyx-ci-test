@@ -1,0 +1,4 @@
+# pic-loader.bin is a GENERATED artifact that IS committed (the nyx-loader
+# emitter embeds it via include_bytes! from on_target.rs), so it must negate
+# the root `*.bin` ignore rule. Same precedent as crates/config fixtures.
+!pic-loader.bin

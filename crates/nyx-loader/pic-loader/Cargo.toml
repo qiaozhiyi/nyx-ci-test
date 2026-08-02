@@ -1,19 +1,51 @@
 # Cargo manifest for the on-target LAYER2 PIC loader (Rustic64 / b1tg style).
 #
 # This crate is **compiled to a raw PIC binary** and embedded into the
-# nyx-loader stub by `nyx_loader::on_target::PIC_LOADER_BIN`. It is NOT a
-# workspace member — like `crates/implant-win` it is built standalone with
-# nightly + the Windows mingw target + `-Zbuild-std`, so the macOS dev-host
-# `cargo build --workspace` stays green.
+# nyx-loader stub by `nyx_loader::on_target::LAYER2_CODE` (include_bytes! of
+# `pic-loader/pic-loader.bin`). It is NOT a workspace member — like
+# `crates/implant-win` it is built standalone with nightly + the Windows mingw
+# target + `-Zbuild-std`, so the macOS dev-host `cargo build --workspace`
+# stays green.
 #
-# Build (regenerate `pic-loader.bin`):
+# Build + regenerate `pic-loader.bin`:
 #
-#   RUSTFLAGS="-Cpanic=abort" \
+#   ./regen.sh   # (builds the DLL below, then runs nyx-pic-dumper)
+#
+# Manual equivalent:
+#
+#   RUSTFLAGS="-Cpanic=abort --cfg poly1305_force_soft --cfg chacha20_force_soft \
+#     -Clink-arg=-nostdlib -Clink-arg=-Wl,-e,nyx_layer2_entry \
+#     -Clink-arg=-Wl,--gc-sections" \
 #     cargo +nightly build --release \
 #       --manifest-path crates/nyx-loader/pic-loader/Cargo.toml \
 #       --target x86_64-pc-windows-gnu \
-#       -Zbuild-std=core,compiler_builtins
-#   cargo run --release -p nyx-pic-dumper   # extracts .text -> pic-loader.bin
+#       -Zbuild-std=core,compiler_builtins \
+#       -Zbuild-std-features=compiler-builtins-mem
+#   cargo run --release --manifest-path crates/nyx-loader/pic-loader/Cargo.toml \
+#     -p nyx-pic-dumper -- target/x86_64-pc-windows-gnu/release/nyx_pic_loader.dll \
+#     pic-loader.bin
+#
+# Why the flags:
+#   * `--cfg poly1305_force_soft --cfg chacha20_force_soft`: the crates'
+#     AVX2 autodetect backends (cpufeatures) add a runtime-writable flag byte
+#     (.data) and AVX2 constants/instructions — unusable for bare shellcode.
+#     Force-soft makes the crypto pure scalar: no writable globals at all, so
+#     the blob is RX-safe.
+#   * `-Clink-arg=-nostdlib`: no mingw CRT (dllcrt2/msvcrt). Without it,
+#     `memcpy` resolves to an api-ms-win-crt IAT thunk and the loader's calls
+#     would jump into an import table the raw blob doesn't have.
+#   * `-Wl,-e,nyx_layer2_entry`: make our function the PE entry so LTO's
+#     dead-stripping roots on it and drops the CRT startup.
+#   * `-Wl,--gc-sections`: drop whatever LTO leaves unreferenced.
+#   * `-Zbuild-std-features=compiler-builtins-mem`: memcpy/memset/memcmp come
+#     from compiler_builtins (pure code) instead of a CRT import.
+#
+# `nyx-pic-dumper` (workspace member below, host target) then walks .text from
+# the `nyx_layer2_entry` export, extracts the reachable closure, copies the
+# referenced .rdata constants, and re-patches every displacement so the blob
+# is self-contained and starts with the entry prologue. It refuses to emit a
+# blob for any image with relocations, imports in the reachable set, or
+# writable data references.
 #
 # Why `no_std` + `no_main`: the LAYER2 bytes execute as bare PIC shellcode
 # before any loader has run — no `std`, no heap, no `main`. `panic = "abort"`
@@ -31,8 +63,10 @@ publish = false
 description = "Nyx LAYER2 reflective loader — compiled to a raw PIC binary that runs as shellcode."
 
 # Standalone (NOT in the root workspace) so the dev-host stable workspace stays
-# green. Declares its own (empty) workspace to decouple from the root members.
+# green. Declares its own workspace to decouple from the root members; the
+# host-side `nyx-pic-dumper` (raw-image extractor) lives here as a member.
 [workspace]
+members = ["dumper"]
 
 [lib]
 crate-type = ["cdylib"]

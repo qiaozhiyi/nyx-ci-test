@@ -1,0 +1,30 @@
+# nyx-pic-dumper — host-side raw-image extractor for the LAYER2 pic-loader.
+#
+# Converts the built `nyx_pic_loader.dll` (cdylib, x86_64-pc-windows-gnu,
+# nightly + -Zbuild-std) into `pic-loader.bin`, the self-contained LAYER2
+# shellcode blob that `nyx-loader` embeds via include_bytes!.
+#
+# What it emits (see src/relayout.rs for the full algorithm):
+#   [compacted reachable code, nyx_layer2_entry first]
+#   [16-byte-aligned .rdata constants the code references]
+#   every RIP-relative displacement and direct branch re-patched to the new
+#   layout; entry prologue at blob offset 0 (LAYER2_ENTRY_OFFSET = 0).
+#
+# The crate is a member of the pic-loader workspace (host target, std), so it
+# never affects the root workspace. Zero external dependencies: PE parsing,
+# an x86-64 length/operand decoder, and the BFS reachability walk are all
+# hand-rolled in this crate (the decoder is validated against objdump by the
+# regen script).
+
+[package]
+name = "nyx-pic-dumper"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Extracts the reachable PIC closure of nyx_pic_loader.dll into pic-loader.bin"
+
+[[bin]]
+name = "nyx-pic-dumper"
+path = "src/main.rs"
+
+[dependencies]
