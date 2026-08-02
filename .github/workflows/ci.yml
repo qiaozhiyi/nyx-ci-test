@@ -191,4 +191,6 @@ jobs:
           brew install python@3.12
           /opt/homebrew/opt/python@3.12/bin/python3.12 -m venv /tmp/qiling-venv
           /tmp/qiling-venv/bin/pip install -q capstone==5.0.1 qiling==1.4.6
+          # Surface the REAL import error (qiling wraps it as QlErrorModuleNotFound)
+          /tmp/qiling-venv/bin/python -c "import qiling.arch.x86" 2>&1 || true
           /tmp/qiling-venv/bin/python tools/selftest-qiling/runner.py
