@@ -625,10 +625,14 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> bool {
     }
     let image_base_preferred = opt.image_base;
     let size_of_image = opt.size_of_image as usize;
-    if size_of_image == 0 || size_of_image > image.len() {
-        // We map into VirtualAlloc'd memory of `image.len()` (= ct_len, the
-        // decrypted PE size on disk). A mapped SizeOfImage larger than that
-        // cannot fit; reject.
+    // SizeOfImage is the ALIGNED mapped size (headers + section padding) and
+    // is normally LARGER than the file on disk — the old `> image.len()`
+    // guard rejected every real PE (reflective_load always returned false;
+    // observed as exit 0x3 on both the emulator and real Windows). Bound it
+    // against a sane maximum instead; the file-to-image delta is zero-filled
+    // by VirtualAlloc (committed memory is zeroed).
+    const MAX_IMAGE_SIZE: usize = 64 * 1024 * 1024;
+    if size_of_image == 0 || size_of_image > MAX_IMAGE_SIZE {
         return false;
     }
     let entry_rva = opt.address_of_entry_point as usize;
