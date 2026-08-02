@@ -76,7 +76,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ksld-${{ github.run_id }}
+          # The resolver step above writes --out offsets_live.toml (build number
+          # taken from the registry, never hardcoded); upload THAT file.
           path: |
-            offsets_17763_live.toml
+            offsets_live.toml
           if-no-files-found: ignore
           retention-days: 14

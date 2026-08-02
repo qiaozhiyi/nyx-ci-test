@@ -39,6 +39,15 @@
 //!
 //! ## Configuration
 //!
+//! NOTE — the implant-side `extc2_token` / `extc2_api_host` config fields
+//! (`implant-win/src/config.rs`, `channels/mod.rs::ChannelCtx`) are KEPT as
+//! per-implant configuration gates only: the implant POSTs the raw encrypted
+//! frame to the C2 server's `/extc2/<service>` endpoint, so those values never
+//! reach any wire (they are never sent and never used to reach the third-party
+//! API). The real provider credentials live HERE, server-side, via the env
+//! vars below. Removing the implant fields would break the serialized config
+//! blob layout shared with `build.rs`; documenting, not deleting.
+//!
 //! Each relay is opt-in via an environment variable:
 //! - `NYX_EXTC2_SLACK_TOKEN` + `NYX_EXTC2_SLACK_CHANNEL` + `NYX_EXTC2_SLACK_HMAC_KEY` → enables Slack relay
 //! - `NYX_EXTC2_MCP_URL` + `NYX_EXTC2_MCP_KEY` + `NYX_EXTC2_MCP_SESSION` → enables MCP relay

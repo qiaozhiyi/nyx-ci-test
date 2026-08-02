@@ -150,6 +150,24 @@ fn argon2_instance() -> Argon2<'static> {
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
+/// Build the argon2 instance a stored PHC string specifies — the algorithm,
+/// version, and m/t/p cost params EMBEDDED in the record. Returns `None` when
+/// the PHC string doesn't parse or carries non-argon2 params (then the caller
+/// falls back to the env-tuned [`argon2_instance`]).
+fn argon2_from_phc(phc: &str) -> Option<Argon2<'static>> {
+    let parsed = PasswordHash::new(phc).ok()?;
+    let m_cost = parsed.params.get_decimal("m")?;
+    let t_cost = parsed.params.get_decimal("t")?;
+    let p_cost = parsed.params.get_decimal("p")?;
+    let params = Params::new(m_cost, t_cost, p_cost, None).ok()?;
+    let algorithm = Algorithm::try_from(parsed.algorithm).ok()?;
+    let version = parsed
+        .version
+        .map_or(Ok(Version::V0x13), Version::try_from)
+        .unwrap_or(Version::V0x13);
+    Some(Argon2::new(algorithm, version, params))
+}
+
 /// Run the argon2 KDF for timing equalization on missing usernames (H6), then
 /// discard the result. `resolve()` returns immediately when a name isn't found,
 /// but the found path runs the argon2 KDF — a remote timing oracle that lets an
@@ -158,19 +176,40 @@ fn argon2_instance() -> Argon2<'static> {
 /// always wrong, so auth still fails — but the argon2 KDF runs in BOTH paths,
 /// equalizing timing).
 ///
-/// Hashing (not verifying a pre-baked dummy) guarantees the KDF parameters
-/// exactly match the found path's `argon2_instance()` regardless of how the
-/// operator records were hashed — a static dummy baked at a different m/t/p
-/// would re-open the timing gap.
-fn run_dummy_argon2(secret: &str) {
+/// The dummy MUST cost what the found path costs: `verify_secret` verifies
+/// with the params EMBEDDED in the matched record's PHC string, while
+/// [`argon2_instance`] reads the env-tuned NYX_ARGON2_* params — if those env
+/// vars change AFTER a record was hashed, an env-param dummy drifts from the
+/// stored-param verify and re-opens the timing gap. So the dummy hashes with
+/// the PHC params of a representative stored record (`stored_phc`, selected
+/// deterministically by `resolve`); `None` (no argon2 record in the registry)
+/// falls back to the env instance, which is also exactly what hashing a new
+/// record would use.
+fn run_dummy_argon2(secret: &str, stored_phc: Option<&str>) {
     // A fixed dummy salt is fine: we never store or compare the output, we just
     // need the KDF to run with identical parameters as the found path. Using a
     // random salt would add OsRng jitter that itself widens the timing gap.
     static DUMMY_SALT: &[u8] = b"nyxdummytimingequalizationsalt";
     let salt = SaltString::encode_b64(DUMMY_SALT).expect("21-byte salt encodes to b64");
-    let _ = argon2_instance().hash_password(secret.as_bytes(), &salt);
+    match stored_phc.and_then(argon2_from_phc) {
+        Some(instance) => {
+            let _ = instance.hash_password(secret.as_bytes(), &salt);
+        }
+        None => {
+            let _ = argon2_instance().hash_password(secret.as_bytes(), &salt);
+        }
+    }
 }
 
+/// Operator tier. **Admin** has full privileges; **Viewer** is read-only.
+/// **Operator** is admin-equivalent EXCEPT for the destructive deny-list:
+/// tasking beacons (`POST /api/task` — shell/inject/file ops/… delivery),
+/// kernel operations (`/api/kernel/*`, Admin-only in `kernel.rs`), credential
+/// deletion (`POST /api/creds/delete`), and implant revocation
+/// (`POST /api/implant/revoke`). Everything else an Operator can do (view
+/// sessions/results, add creds, generate/list implants, query audit) is shared
+/// with Admin. Enforced per-route (the same deny-list pattern the Viewer
+/// gates use).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -293,9 +332,25 @@ impl OperatorRegistry {
                     // able to force unbounded KDF executions. Both paths take
                     // (or skip) the budget identically, preserving the timing
                     // match between found and not-found.
+                    //
+                    // The dummy KDF must cost what the FOUND path would cost:
+                    // verify_secret verifies with the params EMBEDDED in the
+                    // matched record's PHC string, not the current env-tuned
+                    // instance — so pick a representative argon2 record
+                    // (smallest name: deterministic across calls and
+                    // restarts) and run the dummy with ITS params. `plain:`
+                    // markers are skipped: their found path runs no argon2 at
+                    // all. See `run_dummy_argon2`.
+                    let dummy_phc = g
+                        .values()
+                        .filter(|r| r.secret_hash.starts_with("$argon2"))
+                        .min_by_key(|r| &r.name)
+                        .map(|r| r.secret_hash.clone());
                     if self.auth_budget.try_take() {
                         let secret_owned = secret.to_string();
-                        let _ = offload_kdf(move || run_dummy_argon2(&secret_owned));
+                        let _ = offload_kdf(move || {
+                            run_dummy_argon2(&secret_owned, dummy_phc.as_deref())
+                        });
                     } else {
                         tracing::warn!(
                             target: "nyx::auth",
@@ -409,7 +464,7 @@ impl OperatorRegistry {
                 Ok(g) => g.values().map(|r| (r.name.clone(), r.clone())).collect(),
                 Err(_) => return,
             };
-            if let Err(e) = persist(&path, &map) {
+            if let Err(e) = persist(&path, &map, name) {
                 tracing::warn!(
                     operator = name,
                     error = ?e,
@@ -474,7 +529,7 @@ impl OperatorRegistry {
                         created: now_secs(),
                     },
                 );
-                persist(path, &map)?;
+                persist(path, &map, bs.0)?;
                 tracing::info!(
                     operator = bs.0,
                     "bootstrapped admin operator from NYX_BOOTSTRAP_OPERATOR"
@@ -557,13 +612,22 @@ fn now_secs() -> u64 {
 }
 
 /// Atomic write (temp + rename, 0600 on Unix) — mirrors `load_or_create_keypair`.
-fn persist(path: &Path, map: &HashMap<String, OperatorRecord>) -> std::io::Result<()> {
+///
+/// The temp file is named per-writer (`tag` = the operator whose write this
+/// is): `json.tmp.<sha256(tag) prefix>`. Two concurrent writers (e.g. two
+/// operators rehashing at once, or a bootstrap racing a rehash) previously
+/// shared ONE `json.tmp` path — writer A could truncate/write while writer B
+/// was mid-write, and whichever renamed last could move a half-written file
+/// into place (torn write). Distinct temp names mean each writer's rename
+/// moves a complete snapshot; the rename itself is atomic either way.
+fn persist(path: &Path, map: &HashMap<String, OperatorRecord>, tag: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let rows: Vec<&OperatorRecord> = map.values().collect();
     let json = serde_json::to_vec_pretty(&rows).map_err(io_err)?;
-    let tmp = path.with_extension("json.tmp");
+    let tag_hash = sha256_hex(tag);
+    let tmp = path.with_extension(format!("json.tmp.{}", &tag_hash[..16]));
     use std::fs::OpenOptions;
     use std::io::Write;
     #[cfg(unix)]

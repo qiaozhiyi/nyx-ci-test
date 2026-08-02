@@ -46,7 +46,11 @@ pub enum Channel {
     Https = 0,
     /// DNS-over-HTTPS tunneling (spec-2).
     DohDns = 1,
-    /// Native DNS beacon: A/AAAA/TXT records over UDP 53 (spec-4).
+    /// "DNS" channel — a DoH-style HTTPS POST to `/dns`, NOT a raw UDP-53
+    /// tunnel. The encrypted frame is POSTed over WinHTTP to the C2 server's
+    /// `/dns` endpoint with an `application/dns-message` flavor (CS 4.11 DoH
+    /// Beacon shape), optionally fronted behind `ctx.doh_resolver`. See
+    /// [`dns`] for the implementation.
     Dns = 2,
     /// SMB Named Pipe — internal lateral / P2P pivot (spec-2).
     ///
@@ -204,8 +208,24 @@ pub struct ChannelCtx {
 
     // ---- External C2 (spec-6) ----
     /// API host for the external C2 service, e.g. "slack.com" or "discord.com".
+    ///
+    /// KEPT BY DESIGN — never reaches the wire. The implant POSTs the raw
+    /// encrypted frame to the C2 server's own `/extc2/<service>` endpoint
+    /// (`ctx.server_host`), NOT to the third-party API; the third-party
+    /// fan-out happens server-side (`crates/server/src/extc2_relay.rs`). This
+    /// field exists only as a per-implant "channel configured" gate (see
+    /// `channels/extc2.rs`) so an unconfigured extc2 channel fails fast with a
+    /// diag mark instead of emitting a request. It is part of the serialized
+    /// config blob layout shared with `build.rs`; removing it would break that
+    /// wire format.
     pub extc2_api_host: String,
     /// Bot/webhook token (base64 or raw). Empty = not configured.
+    ///
+    /// Same contract as [`Self::extc2_api_host`]: kept as a configuration
+    /// gate, never sent anywhere by the implant (the frame is AEAD-encrypted
+    /// under the session key; the server authenticates it cryptographically,
+    /// not by token). The real provider token lives server-side in the
+    /// `NYX_EXTC2_*` env vars.
     pub extc2_token: String,
 
     // ---- HTTP channel enhancements (spec-7) ----

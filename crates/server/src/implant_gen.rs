@@ -1132,7 +1132,9 @@ pub async fn list_implants(
 
 /// `POST /api/implant/revoke` — revoke an implant by pubkey.
 ///
-/// Requires operator authentication (Admin or Operator; Viewer is denied).
+/// Requires Admin (revocation is destructive — the implant's baked-in auth
+/// token is burned permanently; the Operator deny-list covers this endpoint,
+/// see the `Role` enum in `operators.rs`).
 /// Audit attribution uses the authenticated operator's name rather than the
 /// hardcoded "system" string used before auth was wired.
 #[derive(Debug, Deserialize)]
@@ -1151,11 +1153,23 @@ pub async fn revoke_implant(
             return Err((r.status(), "unauthorized".to_string()));
         }
     };
-    if op.role == Role::Viewer {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "forbidden: viewer role cannot revoke implants".into(),
-        ));
+    // RBAC deny-list: revoking an implant is destructive (burns the implant's
+    // baked-in auth token — the revocation is permanent), so it is Admin-only
+    // like tasking / creds delete (see the `Role` enum in `operators.rs`).
+    match op.role {
+        Role::Admin => {}
+        Role::Operator => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "forbidden: operator role cannot revoke implants (destructive; admin-only)".into(),
+            ));
+        }
+        Role::Viewer => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "forbidden: viewer role cannot revoke implants".into(),
+            ));
+        }
     }
 
     let store = st

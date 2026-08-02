@@ -9,6 +9,12 @@
 //! On x86_64 Windows the first 4 integer/pointer args land in rcx/rdx/r8/r9;
 //! additional args go on the stack. We accept up to 4 inline args (covers
 //! >99% of community BOF format strings).
+//!
+//! **>4 vararg limit:** a format string with more than four conversions
+//! references stack args this shim cannot read (no frame access from the
+//! capture buffer). The 5th+ conversions are therefore dropped: known specs
+//! emit nothing, unknown specs print literally — the shim never reads past
+//! the four register args, so the output is garbage-free but incomplete.
 
 use std::cell::UnsafeCell;
 use std::os::raw::c_char;
@@ -191,16 +197,21 @@ fn format_into(args: &[u64; 4], fmt: *const c_char) {
             continue;
         }
         // Parse the conversion spec, folding C length prefixes (l/ll/h/hh/z)
-        // into the base spec — on x64 the vararg register width is identical,
-        // so value handling is unchanged; skipping the prefixes would
-        // otherwise misparse "%llu"/"%zu" as unknown specs and misalign
-        // every later argument.
+        // into the base spec. On x64 every vararg occupies a full register,
+        // but the VALUE interpretation differs: `l`/`ll`/`z` make the
+        // conversion read the whole 64-bit register (`%llx` prints a u64,
+        // NOT a truncated u32), while bare `%x`/`%u`/`%d` read the low 32
+        // bits per the C default promotions. Skipping the prefixes entirely
+        // would both misparse the spec ("%llu" as an unknown spec that
+        // misaligns every later argument) and silently truncate 64-bit
+        // values, so we track `wide` and dispatch on it below.
         let mut spec = unsafe { *fmt.add(fi) as u8 };
         if spec == 0 {
             push_byte(b'%');
             break;
         }
         fi += 1;
+        let mut wide = false;
         while matches!(spec, b'l' | b'h' | b'z') {
             let next = unsafe { *fmt.add(fi) as u8 };
             if next == 0 {
@@ -208,6 +219,12 @@ fn format_into(args: &[u64; 4], fmt: *const c_char) {
                 push_byte(b'%');
                 push_byte(spec);
                 return;
+            }
+            // `h` narrows (`%hx` reads the low 16 bits after promotion to
+            // int — still a 32-bit register read); `l`/`ll`/`z` widen to the
+            // full 64-bit register.
+            if spec != b'h' {
+                wide = true;
             }
             spec = next;
             fi += 1;
@@ -259,27 +276,43 @@ fn format_into(args: &[u64; 4], fmt: *const c_char) {
             }
             b'd' | b'i' => {
                 if ai < 4 {
-                    push_i32(args[ai] as i32);
+                    if wide {
+                        push_i64(args[ai] as i64);
+                    } else {
+                        push_i32(args[ai] as i32);
+                    }
                     ai += 1;
                 }
             }
             b'x' => {
                 if ai < 4 {
-                    push_hex(args[ai] as u32);
+                    if wide {
+                        push_hex64(args[ai]);
+                    } else {
+                        push_hex(args[ai] as u32);
+                    }
                     ai += 1;
                 }
             }
             b'X' => {
                 if ai < 4 {
-                    push_hex_upper(args[ai] as u32);
+                    if wide {
+                        push_hex_upper64(args[ai]);
+                    } else {
+                        push_hex_upper(args[ai] as u32);
+                    }
                     ai += 1;
                 }
             }
             b'u' => {
-                // Unsigned decimal: args[ai] is the full register; %u reads
-                // the low 32 bits as an unsigned value.
+                // Unsigned decimal: bare %u reads the low 32 bits as an
+                // unsigned value; %llu/%zu print the full 64-bit register.
                 if ai < 4 {
-                    push_u32(args[ai] as u32);
+                    if wide {
+                        push_u64(args[ai]);
+                    } else {
+                        push_u32(args[ai] as u32);
+                    }
                     ai += 1;
                 }
             }
@@ -436,6 +469,100 @@ fn push_ptr(v: u64) {
     }
     push_byte(b'0');
     push_byte(b'x');
+    for &b in buf.iter().skip(pos) {
+        push_byte(b);
+    }
+}
+
+/// Unsigned decimal 64-bit (`%llu`/`%zu`). Prints the full register, so a
+/// value whose high 32 bits are set does not wrap to the low 32 (the old
+/// `push_u32` truncation bug for length-prefixed conversions).
+fn push_u64(v: u64) {
+    if v == 0 {
+        push_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20]; // u64::MAX = 18446744073709551615 (20 digits)
+    let mut n = v;
+    let mut pos = buf.len();
+    while n > 0 && pos > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + ((n % 10) as u8);
+        n /= 10;
+    }
+    for &b in buf.iter().skip(pos) {
+        push_byte(b);
+    }
+}
+
+/// Signed decimal 64-bit (`%lld`/`%ld`/`%zd`). Same shape as [`push_i32`]
+/// with a 64-bit magnitude and a sign.
+fn push_i64(v: i64) {
+    if v == 0 {
+        push_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 21]; // sign + i64::MIN (20 digits)
+    let mut neg = false;
+    // Widen to i128 before negating: `-i64::MIN` overflows i64 (UB in
+    // release, panic under debug with panic=abort).
+    let mut n = i128::from(v);
+    if n < 0 {
+        neg = true;
+        n = -n;
+    }
+    let mut pos = buf.len();
+    while n > 0 && pos > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + ((n % 10) as u8);
+        n /= 10;
+    }
+    if neg && pos > 0 {
+        pos -= 1;
+        buf[pos] = b'-';
+    }
+    for &b in buf.iter().skip(pos) {
+        push_byte(b);
+    }
+}
+
+/// Lowercase hex 64-bit (`%llx`/`%zx`): prints the full register, no leading
+/// zeros — same shape as [`push_hex`] over 16 hex digits.
+fn push_hex64(v: u64) {
+    if v == 0 {
+        push_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut n = v;
+    let mut pos = buf.len();
+    while n > 0 && pos > 0 {
+        pos -= 1;
+        let d = (n & 0xF) as u8;
+        buf[pos] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+        n >>= 4;
+    }
+    for &b in buf.iter().skip(pos) {
+        push_byte(b);
+    }
+}
+
+/// Uppercase hex 64-bit (`%llX`/`%zX`), same shape as [`push_hex64`] with
+/// A-F digits.
+fn push_hex_upper64(v: u64) {
+    if v == 0 {
+        push_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut n = v;
+    let mut pos = buf.len();
+    while n > 0 && pos > 0 {
+        pos -= 1;
+        let d = (n & 0xF) as u8;
+        buf[pos] = if d < 10 { b'0' + d } else { b'A' + (d - 10) };
+        n >>= 4;
+    }
     for &b in buf.iter().skip(pos) {
         push_byte(b);
     }
@@ -675,6 +802,69 @@ mod tests {
         // an unknown spec that misaligns the argument stream.
         let out = run_format([0xFFFF_FFFFu64, 0, 0, 0], "%llu");
         assert_eq!(out, "4294967295");
+    }
+
+    // ── 64-bit length-prefixed conversions (the %llx truncation fix) ───────
+
+    #[test]
+    fn length_prefix_llx_formats_u64() {
+        // Regression: %llx used to truncate the value to u32, dropping the
+        // high 32 bits (0xDEADBEEF would print as "cafef00d"). Must print the
+        // full 64-bit register.
+        let out = run_format([0xDEAD_BEEF_CAFE_F00Du64, 0, 0, 0], "%llx");
+        assert_eq!(out, "deadbeefcafef00d");
+    }
+
+    #[test]
+    fn length_prefix_llx_high_bits_not_truncated() {
+        // 0x1_0000_0000 has a zero low-32; the old u32 truncation printed "0".
+        let out = run_format([0x1_0000_0000u64, 0, 0, 0], "%llx");
+        assert_eq!(out, "100000000");
+    }
+
+    #[test]
+    fn length_prefix_llx_upper_formats_u64() {
+        let out = run_format([0xDEAD_BEEF_CAFE_F00Du64, 0, 0, 0], "%llX");
+        assert_eq!(out, "DEADBEEFCAFEF00D");
+    }
+
+    #[test]
+    fn length_prefix_llu_formats_u64() {
+        // %llu on a value whose high 32 bits are set must print the full
+        // unsigned value, not wrap to the low 32.
+        let out = run_format([0x1_0000_0000u64, 0, 0, 0], "%llu");
+        assert_eq!(out, "4294967296");
+    }
+
+    #[test]
+    fn length_prefix_lld_formats_i64() {
+        // -2^40 is unrepresentable in i32; the signed 64-bit path must print
+        // it fully (and must not overflow negating i64::MIN-class values).
+        let out = run_format([-(1i64 << 40) as u64, 0, 0, 0], "%lld");
+        assert_eq!(out, "-1099511627776");
+    }
+
+    #[test]
+    fn length_prefix_zx_matches_u64() {
+        // %zx (usize) reads the full register like %llx.
+        let out = run_format([0x1_0000_0000u64, 0, 0, 0], "%zx");
+        assert_eq!(out, "100000000");
+    }
+
+    #[test]
+    fn bare_x_still_truncates_to_u32() {
+        // No length prefix: %x keeps C semantics (reads the low 32 bits) —
+        // the widening must only apply to explicitly 64-bit prefixes.
+        let out = run_format([0x1_0000_0000u64, 0, 0, 0], "%x");
+        assert_eq!(out, "0");
+    }
+
+    #[test]
+    fn length_prefix_llx_consumes_one_arg_slot() {
+        // A 64-bit conversion must advance the arg index exactly once, so the
+        // next conversion reads the next register (alignment regression guard).
+        let out = run_format([0x1_0000_0001u64, 0x2222_2222u64, 0, 0], "%llx %llx");
+        assert_eq!(out, "100000001 22222222");
     }
 
     /// Helper: get the bit pattern of `-42i32` as the `u64` the BOF ABI would

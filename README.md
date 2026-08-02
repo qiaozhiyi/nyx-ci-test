@@ -69,10 +69,10 @@ crates/
 │   ├── src-tauri/src/     #   Rust 后端 (~613 LOC, 12 #[tauri::command])
 │   └── src/               #   前端 (~4,500 LOC ts/tsx, 含 1001 LOC 拓扑场景)
 ├── agent-dev/             # macOS/Linux 开发验证植入体 (1,181 LOC, 完整协议循环)
-├── bof-runner/            # BOF 加载器 (421 LOC, CS ABI + kernel32/ntdll externals 表)
+├── bof-runner/            # BOF 加载器 (1,564 LOC, CS ABI + kernel32/ntdll externals 表)
 ├── coff/                  # COFF/AMD64 解析 + 重定位 (365 LOC)
 ├── evasion/               # syscall 解析 (Hell/Halo/Tartarus Gate, 264 LOC)
-├── implant-evasionsdk/    # 植入体逃避算法库 (2,028 LOC, 9 trait 全 floor)
+├── implant-evasionsdk/    # 植入体逃避算法库 (2,028 LOC, 5/9 trait 有 live impl)
 ├── scripting/             # 脚本事件总线 (237 LOC)
 ├── scripting-rhai/        # Rhai 引擎绑定 (166 LOC, 资源配额)
 ├── config/ + config-macros/  # 编译期加密配置 (ChaCha20-Poly1305, 345 LOC)
@@ -95,7 +95,7 @@ crates/
 | GUI 命令(已解析) | 29 | `client-ui-web/src/components/CommandInput.tsx` |
 | server 路由 | 14 静态 + 7 beacon + 6 kernel(条件) + 动态 profile | `server/src/lib.rs:716-779` |
 | BYOVD 驱动 | 3 可用 + 1 stub | `operator-kernelsdk/src/byovd_drivers/` |
-| Windows build 覆盖 | 8 主 + 6 patch-equiv = 14 distinct | `implant-evasionsdk/src/offsets_table.rs` |
+| Windows build 覆盖 | 8 已知行 + 6 patch-equiv 映射 = 5 distinct layouts | `implant-evasionsdk/src/offsets_table.rs` |
 
 ---
 
@@ -305,7 +305,7 @@ trex                    T-REX EDR 评估分级
     --fltmgr C:\Windows\System32\drivers\fltmgr.sys --build 17763 --out flt.toml)
 ```
 
-无 PDB 时回退到内置偏移表(`implant-evasionsdk/src/offsets_table.rs`,覆盖 8 主 build + 6 patch-equivalent)。
+无 PDB 时回退到内置偏移表(`implant-evasionsdk/src/offsets_table.rs`,8 个已知 build 号 + 6 个 patch-equivalent 映射 = 5 种 distinct EPROCESS/ETW 布局;22631=22621、26200=26100、18362=19041 共享布局)。
 
 ---
 
@@ -371,7 +371,7 @@ cargo clippy --workspace --all-targets
 | **WdtKernel 驱动** | 🟡 stub | 物理内存 r/w(0x9C412420/0x9C41242C)真,但 VA `raw_rw` 永返 `Err(0)`。 |
 | **etw_deception 事件伪造** | 🟡 死路径 | 完整实现,但无 tier 装配;仅 `operator-kernel-cli forge-etw` 子命令调用。 |
 | **nyx-loader 反射加载** | ✅ **已交付(真机验证)** | 真实 Layer-2(pic-loader no_std PIC,`crates/nyx-loader/pic-loader/`)已接线:`wrap_payload` 按最终布局发射 `[LAYER1+bridge][key][magic\|len\|nonce][ct\|\|tag][LAYER2]`(`nyx-loader/src/lib.rs`);**真机 E2E 探针 PASS**(`crates/loader-probe-exe`):CreateThread 线程入口执行完整 blob,fixture 与真实 implant DLL 均反射加载成功、DllMain 执行(marker 证实)、返回 0——在免费 GitHub 托管 windows-latest runner 上运行,零本地硬件;Unicorn 仿真探针(CI Gate 5)+ Qiling selftest 门禁(CI Gate 6)守护回归。 |
-| **implant-evasionsdk trait** | 🟡 9 trait 全 floor(受限交付) | 9 trait 仅 `Floors` no-op impl(`lib.rs:366-413`)。算法子模块(gap/frame/rc4/foliage/apc/swap/offsets_table)真且测试;`offsets_table` 已标记 canonical + pub accessor(`offsets_table.rs:39-44,296,335`),operator-kernelsdk/offset-resolver dev-dep 一致性测试。 |
+| **implant-evasionsdk trait** | 🟡 5/9 trait 有 live impl(受限交付) | `implant-win/src/evasion_glue.rs` 提供 5 个 live impl:`PdataGapScanner`(LivePdataScanner,`evasion_glue.rs:44`)/`StackSpoofKit`(LiveStackSpoof,`evasion_glue.rs:174`)/`BlindKit`(LiveBlind,`evasion_glue.rs:210`)/`MemoryMaskKit`(LiveMemoryMask,`evasion_glue.rs:274`)/`ProcessInjectKit`(ModuleStomper,`evasion_glue.rs:316`);`SleepmaskKit` 由 kits.rs 的 Foliage/NoMask 提供(`kits.rs:43-61`)。其余 3 trait(`SyscallSource`/`UnhookKit`/`AntiDebugKit`)保持 `Floors` no-op(`lib.rs:366-413`)。算法子模块(gap/frame/rc4/foliage/apc/swap/offsets_table)真且测试;`offsets_table` 已标记 canonical + pub accessor(`offsets_table.rs:39-44,296,335`),operator-kernelsdk/offset-resolver dev-dep 一致性测试。 |
 | **`mask_secret()`** | ✅ **已修复** | char-based `first2….last2` 掩码 + 非 ASCII 测试(`store/src/model.rs:73-82,108-119`)。 |
 | **SQLite migration** | 🟡 **部分(受限交付)** | schema_version 迁移机制已启用:session_store v→v+1 `ADD COLUMN send_counter/last_recv`;其余表仍以 `CREATE TABLE IF NOT EXISTS` 基线为主。 |
 | **`created_by` 归因** | ✅ **已接** | `created_by: Some(op.name.clone())`(`implant_gen.rs:917`);生成端点带鉴权解析操作员(open 模式映射 Viewer 并拒绝写端点,`implant_gen.rs:988-992`)。 |

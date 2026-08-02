@@ -28,10 +28,12 @@
 #     nonzero.
 #   * Leg 2 fails if the probe script is missing, the blob is missing, the
 #     probe did not actually run, it exited nonzero, the result file is
-#     missing after the run, or the result file content is not an `OK ...`
-#     line. In particular Leg 2 does NOT trust the probe's exit code alone: it
-#     independently verifies the result file was written and parsed as OK, so a
-#     tampered/skipped probe can never pass by exiting 0 without doing work.
+#     missing after the run, or the result file content is not an `OK rv=0x0`
+#     line (rv must be 0 — the legacy bare-'OK *' check passed any return
+#     value). In particular Leg 2 does NOT trust the probe's exit code alone:
+#     it independently verifies the result file was written and parsed as a
+#     clean zero return, so a tampered/skipped probe can never pass by exiting
+#     0 without doing work.
 #
 # Assumes CWD = repo root. PowerShell 5.1.
 param(
@@ -165,9 +167,24 @@ if (-not $InteractiveProbe) {
     #    empty) is a failed probe — never a silent pass.
     $result = (Get-Content $resultPath -Raw -ErrorAction Stop).Trim()
     Write-Host "   probe result: $result"
-    if ($result -notlike 'OK *') {
+    if ($result -notlike 'OK rv=0x*') {
         Write-Host "::error::loader probe result is not OK: '$result'"
         Write-Host '::error::This is release-blocking: the reflective blob did not load+execute cleanly.'
+        exit 1
+    }
+    # STRICT: the blob entry must return 0 (clean DllMain → return path). The
+    # legacy bare-'OK *' check passed ANY return value; the harness records
+    # `OK rv=0x<N>` for every non-crash, so a nonzero N is a fail.
+    if ($result -match '^OK rv=0x([0-9A-Fa-f]+)') {
+        $rv = [Convert]::ToUInt64($matches[1], 16)
+        if ($rv -ne 0) {
+            Write-Host "::error::loader probe result rv=0x$($matches[1]) — expected 0. Reflective blob did not return cleanly."
+            Write-Host '::error::This is release-blocking: a nonzero return means the blob entry did not complete its contract.'
+            exit 1
+        }
+    } else {
+        Write-Host "::error::loader probe result has no parseable rv field: '$result'"
+        Write-Host '::error::This is release-blocking: cannot verify a clean return.'
         exit 1
     }
     Write-Host '== loader_probe_gate: interactive rundll32 probe PASSED =='

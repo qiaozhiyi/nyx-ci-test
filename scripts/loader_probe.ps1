@@ -16,7 +16,7 @@
 
     Result file contract (written by tools/loader_probe_dll/src/lib.rs):
       Location: $env:NYX_PROBE_RESULT, else C:\nyx\loader_probe_result.txt
-      OK rv=0x<HEX>                        — stub returned cleanly
+      OK rv=0x<HEX>                        — stub returned; rv MUST be 0 (clean DllMain → return path)
       FAIL stage=<stage> [code=0x<N> ...]  — harness or stub failed
 
 .PARAMETER Blob
@@ -33,8 +33,8 @@
 
 .NOTES
     Exit codes:
-      0  blob loaded + DllMain returned cleanly (result = OK)
-      1  blob failed to load (result = FAIL, or harness crashed without result)
+      0  blob loaded + DllMain returned cleanly (result = OK rv=0x0)
+      1  blob failed to load (result = FAIL, rv != 0, or harness crashed without result)
       2  arguments wrong
       3  harness DLL failed to build
       4  timeout waiting for result file
@@ -143,9 +143,25 @@ if (-not $result) {
 $result = $result.Trim()
 Write-Host "   result: $result"
 
-if ($result -like 'OK *') {
-    Write-Host '== loader_probe: PASS — reflective blob loaded + DllMain executed =='
-    exit 0
+if ($result -like 'OK rv=0x*') {
+    # STRICT gate: the blob entry must return 0. The legacy bare-'OK *' check
+    # passed ANY return value; the harness writes `OK rv=0x<N>` for every
+    # non-crash, so a hijacked/truncated return would slip past. The real-machine
+    # probe (crates/loader-probe-exe) asserts the same contract: fixture and
+    # implant DLL both return 0.
+    if ($result -match '^OK rv=0x([0-9A-Fa-f]+)') {
+        $rv = [Convert]::ToUInt64($matches[1], 16)
+        if ($rv -eq 0) {
+            Write-Host '== loader_probe: PASS — reflective blob loaded + DllMain executed (rv=0) =='
+            exit 0
+        }
+        Write-Host "::error::loader probe FAILED: stub returned rv=0x$($matches[1]) — expected 0 (clean DllMain → return path)."
+        Write-Host '::error::A nonzero return means the stub entry did not complete its contract — do NOT ship.'
+        exit 1
+    }
+    # Malformed OK line (no parseable rv field) — treat as failure.
+    Write-Host "::error::loader probe FAILED: OK line has no parseable rv field: '$result'"
+    exit 1
 }
 
 # FAIL — extract the stage for actionable diagnostics.

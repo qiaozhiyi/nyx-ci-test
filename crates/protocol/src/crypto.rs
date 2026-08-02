@@ -232,6 +232,10 @@ pub enum KeyExchangeError {
     /// force a deterministic, decryptable session key shared by every implant
     /// that presents the same pubkey (contributory behavior violation).
     NonContributory,
+    /// HKDF expand failed (output length over the RFC 5869 §2.3 expand bound).
+    /// Only reachable if a future change grows the derived key beyond
+    /// `255 × 32` bytes; today the output is a compile-time 32 bytes.
+    Hkdf(HkdfError),
 }
 
 impl core::fmt::Display for KeyExchangeError {
@@ -241,12 +245,19 @@ impl core::fmt::Display for KeyExchangeError {
                 "key exchange rejected: peer public key is a low-order point \
                  (identity point / all-zero shared secret)",
             ),
+            KeyExchangeError::Hkdf(e) => write!(f, "key exchange failed: {e}"),
         }
     }
 }
 
 #[cfg(feature = "std")]
 impl std::error::Error for KeyExchangeError {}
+
+impl From<HkdfError> for KeyExchangeError {
+    fn from(e: HkdfError) -> Self {
+        KeyExchangeError::Hkdf(e)
+    }
+}
 
 /// The team server's long-term identity keypair. The public half is baked
 /// into every implant's config; the secret never leaves the server.
@@ -313,7 +324,8 @@ impl ServerKeypair {
         if shared_bytes.iter().all(|&b| b == 0) {
             return Err(KeyExchangeError::NonContributory);
         }
-        let key = derive_session_key(&shared_bytes, &self.public.to_bytes(), implant_pub);
+        let key = derive_session_key(&shared_bytes, &self.public.to_bytes(), implant_pub)
+            .map_err(KeyExchangeError::from)?;
         shared_bytes.zeroize();
         Ok(key)
     }
@@ -380,7 +392,8 @@ impl ImplantKeypair {
         if shared_bytes.iter().all(|&b| b == 0) {
             return Err(KeyExchangeError::NonContributory);
         }
-        let key = derive_session_key(&shared_bytes, server_pub, &self.public.to_bytes());
+        let key = derive_session_key(&shared_bytes, server_pub, &self.public.to_bytes())
+            .map_err(KeyExchangeError::from)?;
         shared_bytes.zeroize();
         Ok(key)
     }
@@ -395,11 +408,18 @@ impl Drop for ImplantKeypair {
 
 /// HKDF-SHA256 over the shared secret, bound to both public keys so the
 /// resulting key is unique per (implant, server) pair.
+///
+/// Returns [`HkdfError::OutputTooLong`] if the requested output length exceeds
+/// the RFC 5869 §2.3 expand bound — impossible here because `okm` is a
+/// compile-time `KEY_LEN` (32) byte array, far below `255 × 32`. The failure
+/// is surfaced as a `Result` rather than panicking because the implant builds
+/// with `panic = "abort"` (a panic would tear the process down with no
+/// recovery path).
 pub fn derive_session_key(
     shared: &[u8; 32],
     server_pub: &[u8; PUBKEY_LEN],
     implant_pub: &[u8; PUBKEY_LEN],
-) -> SessionKey {
+) -> Result<SessionKey, HkdfError> {
     // P1-2 fix: use server_pub as the HKDF-Extract salt (RFC 5869 §3.1
     // recommends a non-empty salt; the server's long-term public key is public,
     // fixed, and non-attacker-controlled — an ideal salt per Trail of Bits
@@ -419,12 +439,15 @@ pub fn derive_session_key(
     info[pos..pos + PUBKEY_LEN].copy_from_slice(implant_pub);
     pos += PUBKEY_LEN;
     let mut okm = [0u8; KEY_LEN];
-    // HKDF expand only fails if the requested length exceeds 255 * HashLen; 32 is fine.
+    // HKDF expand fails only when the requested length exceeds 255 * HashLen
+    // (RFC 5869 §2.3); 32 bytes is far below the 8160-byte cap, so the Err arm
+    // is unreachable — but handle it as a Result, not a panic (`panic = "abort"`
+    // builds need a recovery path).
     hk.expand(&info[..pos], &mut okm)
-        .expect("okm.len() <= 255*HashLen is a caller invariant (32 bytes << 255*32)");
+        .map_err(|_| HkdfError::OutputTooLong)?;
     let key = SessionKey::new(okm);
     okm.zeroize();
-    key
+    Ok(key)
 }
 
 /// Which direction a frame travels. The session key is shared by both peers,
@@ -516,6 +539,9 @@ pub fn open_dir(
 /// Back-compat shim: seals with [`Direction::ClientToServer`]. Prefer
 /// [`seal_dir`] for new call sites so the direction is explicit. See
 /// [`seal_dir`] for the error semantics.
+#[deprecated(
+    note = "hardcodes Direction::ClientToServer; use seal_dir with an explicit direction instead"
+)]
 pub fn seal(
     key: &SessionKey,
     counter: u64,
@@ -527,6 +553,9 @@ pub fn seal(
 
 /// Back-compat shim: opens with [`Direction::ClientToServer`]. Prefer
 /// [`open_dir`] for new call sites so the direction is explicit.
+#[deprecated(
+    note = "hardcodes Direction::ClientToServer; use open_dir with an explicit direction instead"
+)]
 pub fn open(
     key: &SessionKey,
     counter: u64,
@@ -543,6 +572,17 @@ pub fn open(
 // domain from session keys.
 
 /// Derive the X25519 public key from a raw 32-byte secret.
+///
+/// **Why this is `Option` but always `Some`** (documented rather than changed
+/// to a bare `[u8; 32]` so the signature stays symmetric with [`ecdh`]'s
+/// failure mode): X25519 clamps the scalar inside the Montgomery ladder
+/// (RFC 7748 §5), so `StaticSecret` accepts *any* 32-byte input — even the
+/// all-zero array clamps to a valid scalar whose public key is a well-defined,
+/// non-identity point. The low-order rejection that makes [`ecdh`] fallible
+/// applies to a *peer's* public key read off the wire, never to a public key
+/// derived from our own clamped scalar, so there is no input for which
+/// derivation can fail. The `None` arm is unreachable; callers may `?` it
+/// without a recovery path.
 pub fn public_from_secret(secret: &[u8; 32]) -> Option<[u8; 32]> {
     let bytes: [u8; 32] = *secret;
     let scalar = x25519_dalek::StaticSecret::from(bytes);

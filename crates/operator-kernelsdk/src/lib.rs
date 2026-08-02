@@ -130,6 +130,12 @@ pub enum KrwError {
     /// Impls MUST resolve offsets dynamically (e.g. via ntoskrnl-metadata style
     /// RVA chasing); hardcoding is a bug.
     UnresolvedOffset(&'static str),
+    /// The kernel's layout is not recognized by the structural invariants a
+    /// runtime probe relies on (corrupted structure, or a genuinely novel
+    /// EPROCESS redesign). Distinct from [`Self::UnresolvedOffset`]: the
+    /// structure exists but its shape violates the probe's invariants, so no
+    /// offset is produced rather than a wrong one.
+    UnsupportedPosture(&'static str),
     /// Bootstrap primitive not available on this host (driver blocked, no DMA
     /// hardware, CVE patched, …).
     Unavailable(&'static str),
@@ -157,6 +163,7 @@ impl fmt::Display for KrwError {
         match self {
             Self::HvciCodePage => f.write_str("HVCI-on: code page is EPT read-only"),
             Self::UnresolvedOffset(s) => write!(f, "unresolved kernel offset: {s}"),
+            Self::UnsupportedPosture(s) => write!(f, "unsupported kernel posture: {s}"),
             Self::Unavailable(s) => write!(f, "kernel primitive unavailable: {s}"),
             Self::Partial { ok } => write!(f, "partial kernel transfer ({ok} bytes)"),
             Self::Other(s) => f.write_str(s),

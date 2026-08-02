@@ -29,6 +29,14 @@ crates/client-ui-web/node_modules/
 crates/client-ui-web/dist/
 tmp/
 
+# IDE / agent / editor working dirs — never commit (kept on disk)
+.idea/
+.jules/
+.omp/
+.claude/agents/
+# one-off local reference manual (Chinese) — not part of the repo
+/ECC技能命令完全参考手册.md
+
 # Playwright MCP test artifacts
 .playwright-mcp/
 

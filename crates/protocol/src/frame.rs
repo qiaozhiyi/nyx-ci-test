@@ -50,6 +50,12 @@ pub enum FrameError {
     /// The underlying AEAD seal failed (allocator failure — the AEAD itself is
     /// otherwise infallible). Callers should drop or retry the frame.
     Aead(chacha20poly1305::Error),
+    /// Plaintext was empty. A beacon frame must carry at least one plaintext
+    /// byte — the receiver's [`MIN_CT_LEN`] rejects the resulting "all tag, no
+    /// data" frame anyway, so sealing one here would be wasted work. Previously
+    /// an `assert!` (panic); now a checked error so `panic = "abort"` builds
+    /// get a recovery path instead of a process teardown.
+    EmptyPlaintext,
     /// Plaintext too large: sealing it would produce a ciphertext exceeding
     /// [`MAX_CT_LEN`] (`plaintext_len + TAG_LEN > MAX_CT_LEN`). The receiver's
     /// [`parse_frame`] rejects such frames outright, so sealing one here would
@@ -65,6 +71,9 @@ impl core::fmt::Display for FrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             FrameError::Aead(e) => write!(f, "frame seal failed (AEAD): {e}"),
+            FrameError::EmptyPlaintext => f.write_str(
+                "frame plaintext is empty: a beacon frame must carry at least one plaintext byte",
+            ),
             FrameError::PlaintextTooLarge {
                 plaintext_len,
                 max_plaintext_len,
@@ -85,17 +94,18 @@ impl std::error::Error for FrameError {}
 /// will use in [`open_frame_dir`].
 ///
 /// Returns [`FrameError::Aead`] if the underlying AEAD encrypt fails
-/// (allocator failure — the AEAD itself is otherwise infallible), or
+/// (allocator failure — the AEAD itself is otherwise infallible),
 /// [`FrameError::PlaintextTooLarge`] if sealing `plaintext` would produce a
-/// ciphertext over [`MAX_CT_LEN`] — the receiver's [`parse_frame`] rejects
-/// those, so failing fast here surfaces the error at the source.
+/// ciphertext over [`MAX_CT_LEN`], or [`FrameError::EmptyPlaintext`] if
+/// `plaintext` is empty. The over-cap case is rejected here because the
+/// receiver's [`parse_frame`] drops those frames — failing fast surfaces the
+/// error at the source.
 ///
-/// **Panics** if `plaintext` is empty. The wire codec never produces a
-/// zero-byte plaintext (every batch carries at least a `u32 count` and every
-/// SessionInfo is non-empty), so an empty plaintext here signals a caller bug.
-/// The parser also rejects the resulting "all-tag, no-data" frame on the
-/// receive side (see [`MIN_CT_LEN`]); panicking here gives the developer a
-/// louder signal at the source rather than a silent round-trip failure.
+/// An empty plaintext is likewise rejected (checked error, not a panic): the
+/// wire codec never produces a zero-byte plaintext (every batch carries at
+/// least a `u32 count` and every SessionInfo is non-empty), so it signals a
+/// caller bug, and the receiver's [`MIN_CT_LEN`] would reject the resulting
+/// "all-tag, no-data" frame anyway.
 pub fn encode_frame_dir(
     pubkey: &[u8; PUBKEY_LEN],
     dir: Direction,
@@ -103,10 +113,9 @@ pub fn encode_frame_dir(
     key: &SessionKey,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, FrameError> {
-    assert!(
-        !plaintext.is_empty(),
-        "encode_frame_dir: empty plaintext is not a valid beacon frame"
-    );
+    if plaintext.is_empty() {
+        return Err(FrameError::EmptyPlaintext);
+    }
     // Encode-side size cap (the receive side enforces the same bound in
     // parse_frame): the AEAD appends a TAG_LEN-byte tag, so a plaintext of
     // `MAX_CT_LEN - TAG_LEN + 1` bytes would already produce an over-cap
@@ -132,6 +141,9 @@ pub fn encode_frame_dir(
 /// implant→server direction). Existing implant/agent-dev callers that *send*
 /// should keep using this; server senders must use [`encode_frame_dir`] with
 /// [`Direction::ServerToClient`]. See [`encode_frame_dir`] for error semantics.
+#[deprecated(
+    note = "hardcodes Direction::ClientToServer; use encode_frame_dir with an explicit direction instead"
+)]
 pub fn encode_frame(
     pubkey: &[u8; PUBKEY_LEN],
     counter: u64,
@@ -148,15 +160,19 @@ pub fn parse_frame(frame: &[u8]) -> Result<RawFrame, WireError> {
     }
     let mut pubkey = [0u8; PUBKEY_LEN];
     pubkey.copy_from_slice(&frame[..PUBKEY_LEN]);
+    // The `frame.len() < FRAME_HEADER` check above guarantees these slices are
+    // exactly 8 / 4 bytes; the conversions are still checked (rather than
+    // `expect`) so a future header change can't introduce a panic in
+    // `panic = "abort"` builds.
     let counter = u64::from_le_bytes(
         frame[PUBKEY_LEN..PUBKEY_LEN + 8]
             .try_into()
-            .expect("8 bytes"),
+            .map_err(|_| WireError::Eof)?,
     );
     let ct_len = u32::from_le_bytes(
         frame[PUBKEY_LEN + 8..PUBKEY_LEN + 12]
             .try_into()
-            .expect("4 bytes"),
+            .map_err(|_| WireError::Eof)?,
     ) as usize;
     let ct_end = FRAME_HEADER + ct_len;
     // Require the frame to be length-exact (no unauthenticated trailing bytes)
@@ -190,6 +206,9 @@ pub fn open_frame_dir(
 /// server/implant callers that *receive* implant-origin frames should keep
 /// using this; receivers of server-origin frames must use [`open_frame_dir`]
 /// with [`Direction::ServerToClient`].
+#[deprecated(
+    note = "hardcodes Direction::ClientToServer; use open_frame_dir with an explicit direction instead"
+)]
 pub fn open_frame(key: &SessionKey, raw: &RawFrame) -> Result<Vec<u8>, chacha20poly1305::Error> {
     open_frame_dir(key, Direction::ClientToServer, raw)
 }

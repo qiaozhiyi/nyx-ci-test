@@ -165,9 +165,11 @@ pub fn resolve_rva_in_range(
 ///
 /// ⚠ This byte encoding is currently IDENTICAL to
 /// [`PSP_CREATE_THREAD_NOTIFY_ROUTINE`], but the two reference DIFFERENT
-/// globals and are disambiguated by RVA range at the call site. Keep them as
-/// separate named constants — do NOT merge them — so a future build where one
-/// reference changes encoding only affects that target's constant.
+/// globals and are disambiguated by their verified RVA windows
+/// ([`PROCESS_NOTIFY_ARRAY_RANGE`] / [`THREAD_NOTIFY_ARRAY_RANGE`]) at the
+/// call site. Keep them as separate named constants — do NOT merge them — so
+/// a future build where one reference changes encoding only affects that
+/// target's constant.
 pub const PSP_CREATE_PROCESS_NOTIFY_ROUTINE: RefSite = RefSite {
     // 4C 8D 35 ?? ?? ?? ??  ; lea r14, [rip+disp32]
     pattern: &[Some(0x4C), Some(0x8D), Some(0x35), None, None, None, None],
@@ -180,11 +182,11 @@ pub const PSP_CREATE_PROCESS_NOTIFY_ROUTINE: RefSite = RefSite {
 ///
 /// **Disambiguation required:** this uses the same `lea r14, [rip+disp32]`
 /// (4C 8D 35) encoding as [`PSP_CREATE_PROCESS_NOTIFY_ROUTINE`] but targets a
-/// DIFFERENT global (Process array is at a lower RVA than Thread in most
-/// builds). Use [`resolve_rva_in_range`] with the expected RVA range to
-/// distinguish them. Keep this constant separate from the Process one — a
-/// build where the Thread reference changes encoding must only touch this
-/// constant.
+/// DIFFERENT global. Use [`resolve_rva_in_range`] with the verified window
+/// [`THREAD_NOTIFY_ARRAY_RANGE`] to distinguish them (verified 17763.1339 PDB:
+/// Thread sits 0x200 BELOW Process — `0x4D9970` vs `0x4D9D70`). Keep this
+/// constant separate from the Process one — a build where the Thread reference
+/// changes encoding must only touch this constant.
 pub const PSP_CREATE_THREAD_NOTIFY_ROUTINE: RefSite = RefSite {
     // 4C 8D 35 ?? ?? ?? ??  ; lea r14, [rip+disp32]  (same encoding as process, DIFFERENT target)
     pattern: &[Some(0x4C), Some(0x8D), Some(0x35), None, None, None, None],
@@ -215,33 +217,86 @@ pub const ETW_THREAT_INT_PROV_REG_HANDLE: RefSite = RefSite {
     disp_offset: 3,
 };
 
+// ---- Verified RVA windows for the Ps*NotifyRoutine arrays ----
+//
+// The Process and Thread reference sites are byte-IDENTICAL (`4C 8D 35`), so
+// a naive first-match scan aliases them (both keys get the same RVA). The
+// arrays are disambiguated by RVA window. The windows below are verified
+// against the 17763.1339 PDB (dbghelp SymFromName — see
+// `examples/bootstrap_test.rs` + `docs/testing/kernel-test-results.md`):
+//
+// ```text
+//   PspCreateThreadNotifyRoutine    RVA 0x4D9970   (64 × PVOID array)
+//   PspLoadImageNotifyRoutine       RVA 0x4D9B70   (+0x200)
+//   PspCreateProcessNotifyRoutine   RVA 0x4D9D70   (+0x400)
+// ```
+//
+// The three arrays are CONTIGUOUS in ntoskrnl `.data`, each 0x200 bytes, in
+// the fixed relative order Thread < LoadImage < Process (NOTE: Process is at
+// a HIGHER RVA than Thread on the verified build — the earlier doc claim was
+// wrong). The absolute positions drift across UBRs (~0x7D000 between 17763.1
+// and 17763.1339), but the relative order + 0x200 spacing is stable, so the
+// three windows below are DISJOINT: any candidate RVA computed by a reference
+// site falls into at most one window. Each window is deliberately wider than
+// the 0x200 array spacing (to tolerate partial drift) yet never overlaps its
+// neighbour's window.
+//
+// [`crate::win::resolve_offsets`] additionally asserts the three resolved
+// KVAs are pairwise distinct at resolve time — the final safety net if a
+// build's layout ever violates the verified order.
+
+/// Verified RVA window of `PspCreateProcessNotifyRoutine` (17763.1339 PDB).
+pub const PROCESS_NOTIFY_ARRAY_RANGE: core::ops::Range<u32> = 0x4D_9C00..0x4D_A000;
+/// Verified RVA window of `PspCreateThreadNotifyRoutine` (17763.1339 PDB).
+/// Disjoint from [`PROCESS_NOTIFY_ARRAY_RANGE`] — Thread sits 0x200 BELOW
+/// Process on the verified build.
+pub const THREAD_NOTIFY_ARRAY_RANGE: core::ops::Range<u32> = 0x4D_8000..0x4D_9A00;
+/// Verified RVA window of `PspLoadImageNotifyRoutine` (17763.1339 PDB).
+pub const LOAD_IMAGE_NOTIFY_ARRAY_RANGE: core::ops::Range<u32> = 0x4D_9A00..0x4D_9C00;
+
 /// Try all known reference sites against `image`, returning a map of
 /// global_name → RVA. Useful for a fully autonomous offset resolution
 /// when no table entry or baked offset is available.
 ///
-/// For globals that share the same pattern encoding (Process/Thread arrays
-/// both use `4C 8D 35`), callers should use [`resolve_rva_in_range`] with
-/// known RVA bounds to disambiguate. This function uses the unfiltered
-/// [`resolve_rva`] which returns the **first** match — acceptable for
-/// unique patterns (PsActiveProcessHead, EtwThreatIntProvRegHandle,
-/// PspLoadImageNotifyRoutine) but may return Process's RVA for Thread's key.
+/// The three Ps*NotifyRoutine arrays (which share reference encodings with
+/// MANY other ntoskrnl sites — `4C 8D 35`/`48 8D 1D` appear all over `.text`)
+/// resolve via [`resolve_rva_in_range`] against their own verified RVA window
+/// ([`PROCESS_NOTIFY_ARRAY_RANGE`] etc.). A target whose computed RVA falls
+/// outside its window (e.g. a drifted UBR position, or a non-array site that
+/// merely shares the encoding) is OMITTED rather than misreported — in
+/// particular the byte-identical Process/Thread pair can no longer alias to
+/// the same RVA. `PsActiveProcessHead` / `EtwThreatIntProvRegHandle` keep the
+/// unfiltered first-match (unique-enough encodings; out of this module's
+/// anti-alias scope).
 pub fn scan_all_known(image: &[u8]) -> alloc::collections::BTreeMap<&'static str, u32> {
-    let sites: &[(&str, &RefSite)] = &[
+    let sites: &[(&str, &RefSite, core::ops::Range<u32>)] = &[
         (
             "PspCreateProcessNotifyRoutine",
             &PSP_CREATE_PROCESS_NOTIFY_ROUTINE,
+            PROCESS_NOTIFY_ARRAY_RANGE,
         ),
         (
             "PspCreateThreadNotifyRoutine",
             &PSP_CREATE_THREAD_NOTIFY_ROUTINE,
+            THREAD_NOTIFY_ARRAY_RANGE,
         ),
-        ("PspLoadImageNotifyRoutine", &PSP_LOAD_IMAGE_NOTIFY_ROUTINE),
-        ("PsActiveProcessHead", &PS_ACTIVE_PROCESS_HEAD),
-        ("EtwThreatIntProvRegHandle", &ETW_THREAT_INT_PROV_REG_HANDLE),
+        (
+            "PspLoadImageNotifyRoutine",
+            &PSP_LOAD_IMAGE_NOTIFY_ROUTINE,
+            LOAD_IMAGE_NOTIFY_ARRAY_RANGE,
+        ),
+        ("PsActiveProcessHead", &PS_ACTIVE_PROCESS_HEAD, 0..0),
+        ("EtwThreatIntProvRegHandle", &ETW_THREAT_INT_PROV_REG_HANDLE, 0..0),
     ];
     let mut map = alloc::collections::BTreeMap::new();
-    for (name, site) in sites {
-        if let Some(rva) = resolve_rva(image, site) {
+    for (name, site, range) in sites {
+        // Notify-array targets: range-filtered (verified window). The other
+        // two globals use the unfiltered first match (range 0..0 sentinel).
+        if !range.is_empty() {
+            if let Some(rva) = resolve_rva_in_range(image, site, range.clone()) {
+                map.insert(*name, rva);
+            }
+        } else if let Some(rva) = resolve_rva(image, site) {
             map.insert(*name, rva);
         }
     }
@@ -373,28 +428,90 @@ mod tests {
 
     #[test]
     fn scan_all_known_finds_multiple_globals() {
-        // Plant three reference sites in the image.
+        // Plant the three notify-array refs at their VERIFIED 17763.1339 PDB
+        // positions (Thread 0x4D9970 < LoadImage 0x4D9B70 < Process 0x4D9D70,
+        // 0x200 apart) plus a PsActiveProcessHead ref.
         let mut image = vec![0x90u8; 0x1000];
-        // PspCreateProcessNotifyRoutine ref at 0x100 (lea r14, [rip+disp32])
+        // PspCreateThreadNotifyRoutine ref at 0x100 (lea r14, [rip+disp32])
         image[0x100] = 0x4C;
         image[0x101] = 0x8D;
         image[0x102] = 0x35;
-        image[0x103..0x107].copy_from_slice(&0x5000u32.to_le_bytes());
-        // PsActiveProcessHead ref at 0x200 (mov rax, [rip+disp32])
+        // next_insn = 0x107; disp = 0x4D9970 - 0x107 = 0x4D9869
+        image[0x103..0x107].copy_from_slice(&0x4D9869i32.to_le_bytes());
+        // PspLoadImageNotifyRoutine ref at 0x200 (lea rbx, [rip+disp32])
         image[0x200] = 0x48;
-        image[0x201] = 0x8B;
-        image[0x202] = 0x05;
-        image[0x203..0x207].copy_from_slice(&0x4000u32.to_le_bytes());
-        // PspLoadImageNotifyRoutine ref at 0x300 (lea rbx, [rip+disp32])
-        image[0x300] = 0x48;
+        image[0x201] = 0x8D;
+        image[0x202] = 0x1D;
+        // next_insn = 0x207; disp = 0x4D9B70 - 0x207 = 0x4D9969
+        image[0x203..0x207].copy_from_slice(&0x4D9969i32.to_le_bytes());
+        // PspCreateProcessNotifyRoutine ref at 0x300 (lea r14, [rip+disp32])
+        image[0x300] = 0x4C;
         image[0x301] = 0x8D;
-        image[0x302] = 0x1D;
-        image[0x303..0x307].copy_from_slice(&0x3000u32.to_le_bytes());
+        image[0x302] = 0x35;
+        // next_insn = 0x307; disp = 0x4D9D70 - 0x307 = 0x4D9A69
+        image[0x303..0x307].copy_from_slice(&0x4D9A69i32.to_le_bytes());
+        // PsActiveProcessHead ref at 0x400 (mov rax, [rip+disp32])
+        image[0x400] = 0x48;
+        image[0x401] = 0x8B;
+        image[0x402] = 0x05;
+        // next_insn = 0x407; disp = 0x40E5C0 - 0x407 = 0x40E1B9
+        image[0x403..0x407].copy_from_slice(&0x40E1B9i32.to_le_bytes());
 
         let map = scan_all_known(&image);
-        assert!(map.contains_key("PspCreateProcessNotifyRoutine"));
-        assert!(map.contains_key("PsActiveProcessHead"));
-        assert!(map.contains_key("PspLoadImageNotifyRoutine"));
+        assert_eq!(map.get("PspCreateProcessNotifyRoutine"), Some(&0x4D9D70));
+        assert_eq!(map.get("PspCreateThreadNotifyRoutine"), Some(&0x4D9970));
+        assert_eq!(map.get("PspLoadImageNotifyRoutine"), Some(&0x4D9B70));
+        assert_eq!(map.get("PsActiveProcessHead"), Some(&0x40E5C0));
+    }
+
+    #[test]
+    fn scan_all_known_disambiguates_shared_encoding_no_alias() {
+        // The historical aliasing failure: a `4C 8D 35` ref targeting the
+        // PROCESS array appears FIRST in the image. The naive first-match scan
+        // used to report that SAME RVA for BOTH Process and Thread keys. With
+        // the verified per-target windows the Process-targeting ref must only
+        // land in the Process key, and the Thread key must pick the Thread ref.
+        let mut image = vec![0x90u8; 0x1000];
+        // Decoy at 0x000 → RVA 0x4D9D70 (Process range) — appears FIRST.
+        image[0x000] = 0x4C;
+        image[0x001] = 0x8D;
+        image[0x002] = 0x35;
+        // next_insn = 0x007; disp = 0x4D9D70 - 0x7 = 0x4D9D69
+        image[0x003..0x007].copy_from_slice(&0x4D9D69i32.to_le_bytes());
+        // Real Thread ref at 0x100 → RVA 0x4D9970 (Thread range).
+        image[0x100] = 0x4C;
+        image[0x101] = 0x8D;
+        image[0x102] = 0x35;
+        image[0x103..0x107].copy_from_slice(&0x4D9869i32.to_le_bytes());
+
+        let map = scan_all_known(&image);
+        // The decoy's RVA (0x4D9D70) is in the PROCESS window, so it lands in
+        // the Process key; the Thread key gets the REAL Thread ref — no alias.
+        assert_eq!(map.get("PspCreateProcessNotifyRoutine"), Some(&0x4D9D70));
+        assert_eq!(map.get("PspCreateThreadNotifyRoutine"), Some(&0x4D9970));
+        assert_ne!(
+            map.get("PspCreateProcessNotifyRoutine"),
+            map.get("PspCreateThreadNotifyRoutine"),
+            "Process/Thread must never alias to the same RVA"
+        );
+    }
+
+    #[test]
+    fn scan_all_known_omits_shared_encoding_outside_verified_windows() {
+        // A `4C 8D 35` ref whose RVA falls outside every verified window (a
+        // drifted UBR position, or a non-array site sharing the encoding) must
+        // be OMITTED from both keys — never reported as a wrong target.
+        let mut image = vec![0x90u8; 0x1000];
+        image[0x100] = 0x4C;
+        image[0x101] = 0x8D;
+        image[0x102] = 0x35;
+        // next_insn = 0x107; disp = 0x12345678 - 0x107 = 0x12345571
+        image[0x103..0x107].copy_from_slice(&0x12345571i32.to_le_bytes());
+
+        let map = scan_all_known(&image);
+        assert!(!map.contains_key("PspCreateProcessNotifyRoutine"));
+        assert!(!map.contains_key("PspCreateThreadNotifyRoutine"));
+        assert!(!map.contains_key("PspLoadImageNotifyRoutine"));
     }
 }
 

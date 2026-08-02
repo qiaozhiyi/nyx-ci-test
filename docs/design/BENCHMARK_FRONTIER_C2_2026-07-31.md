@@ -67,7 +67,7 @@
 | `nyx-mutate` crate 整体删除 | `Cargo.toml` members、`crates/server/Cargo.toml`（CHANGELOG Removed） |
 | **真实反射加载器接线 + 真机验证（2026-08-02）**：pic-loader（Rust no_std PIC）经 regen.sh 产出零重定位 .bin，`wrap_payload` 按最终布局发射 `[LAYER1+bridge][key][magic|len|nonce][ct||tag][LAYER2]`；LAYER1 桥接对齐 pic-loader Win64 ABI。**真机 E2E 硬门禁**（`crates/loader-probe-exe` + CI）：CreateThread 线程入口执行完整 blob（绕开 CFG/CET 调用点强制），修复 pic-loader 两个真 bug（可选头 SizeOfImage 偏移、PE32+ 版本字段缺失）后，**fixture 与真实 implant DLL 均反射加载成功、DllMain 执行（marker 文件证实）、返回 0**——在免费 GitHub 托管 Windows runner 上运行，零本地硬件。Unicorn 仿真探针（Gate 5）持续守护回归 | `crates/loader-probe-exe/`、`crates/nyx-loader/pic-loader/`、`tools/loader-emu/` |
 
-**未在本次冲刺闭合、仍属差距的状态（诚实标注）：** 睡眠混淆仍短路到 `beacon::sleep_seconds`（`crates/implant-win/src/kits.rs:39-79` 死路径，Foliage/Fluctuation/mem::mask 未接线）；TLS 指纹 emitter 仍在 `impersonation` feature 后（`crates/transport/src/fingerprint.rs:201-229`，Err stub）；DoH/DNS/LLM 三 Transport 零消费者（仅 Slack/MCP 经 server `TransportStack` 接线）；无持久化、无横向凭据执行（hashdump LSASS 显式 deferred：`crates/implant-win/src/hashdump.rs` method=2 诚实 Err）。
+**未在本次冲刺闭合、仍属差距的状态（诚实标注）：** 睡眠混淆已条件接线——`kits::sleep` 在 `evasion_active() && fluctuation::enabled()` 时路由 `fluctuation::sleep`（`crates/implant-win/src/kits.rs:75-81`），noevasion 模式回退纯 sleep；剩余差距为 heap 区域未注册掩码（`MemoryMaskKit::register_region` 仍限 32B session key）与 Foliage helper-thread `.text` 掩码路径仍休眠（`mem.rs:249-253`）；TLS 指纹 emitter 仍在 `impersonation` feature 后（`crates/transport/src/fingerprint.rs:201-229`，Err stub）；DoH/DNS/LLM 三 Transport 零消费者（仅 Slack/MCP 经 server `TransportStack` 接线）；无持久化、无横向凭据执行（hashdump LSASS 显式 deferred：`crates/implant-win/src/hashdump.rs` method=2 诚实 Err）。
 
 ---
 
@@ -77,7 +77,7 @@
 
 | 维度（权重） | Nyx | CS 4.13 | BRc4 2.6.3 | 判据要点 |
 |---|---|---|---|---|
-| **端点逃避实装**（15） | **3.0** | **5.0** | **4.5** | Nyx：indirect syscall/SSN 三级回退、BYOUD-Gap CET-safe 栈欺骗、AMSI·ETW 盲打、module stomping+threadless 真装；但睡眠混淆未接线、heap 未 mask、注入面窄。CS：sleepmask 全量重写（代码+heap，100MB）+ BeaconGate RAS + BOF-PE。BRc4：custom-compiler + 模块踩踏 + PEB LDR hook，CET-safe 未证实 |
+| **端点逃避实装**（15） | **3.0** | **5.0** | **4.5** | Nyx：indirect syscall/SSN 三级回退、BYOUD-Gap CET-safe 栈欺骗、AMSI·ETW 盲打、module stomping+threadless 真装、睡眠混淆条件接线（`evasion_active() && enabled()` 时走 fluctuation，`kits.rs:75-81`）；heap 未 mask、注入面窄。CS：sleepmask 全量重写（代码+heap，100MB）+ BeaconGate RAS + BOF-PE。BRc4：custom-compiler + 模块踩踏 + PEB LDR hook，CET-safe 未证实 |
 | **加载器与投递**（10） | **3.0** | **5.0** | **4.5** | Nyx：**真实 Layer-2 反射加载已接线并经真机验证**（pic-loader 6,080B .bin、Win64 ABI 桥接、DllMain marker 证实——`crates/loader-probe-exe` CreateThread 探针在免费 GitHub 托管 windows-latest runner 上跑通 fixture 与真实 implant DLL，零本地硬件）+ Unicorn 仿真探针（Gate 5）回归守护；缺 CS UDRL 生态/Arsenal Kit 的成熟度与 drip-loading。CS：UDRL 生态+Arsenal Kit+drip-loading+Payload Store。BRc4：custom-compiler Badger + safe_http 2–3KB PIC 桩 |
 | **C2信道与流量仿冒**（10） | **2.0** | **5.0** | **4.0** | Nyx：HTTPS WinHTTP 主信道 + SOCKS pivot；8 信道枚举但 SmbPipe/Tcp 门禁、DoH/DNS/LLM 零消费者；Slack/MCP 经 boot-time TransportStack 接线（HMAC fail-closed）；Malleable 解析+c2lint；TLS emitter 为 stub。CS：HTTPS/DNS/SMB/TCP + UDC2 + profile 运行时覆盖 + WS/gRPC 流。BRc4：多通道 + 2.6 扩展 malleability |
 | **BOF与扩展执行**（10） | **2.0** | **5.0** | **4.5** | Nyx：CS ABI `go(args,alen)` + W^X + RAII 释放 + externals 扩展（kernel32/ntdll 动态解析）+ coff 解析 7 测试；无 async BOF/BOF-PE/Interpreter。CS：BOF+异步 BOF+BOF-PE+Beacon Interpreter（C VM）。BRc4：coffexec_async + dotnet store |
@@ -110,7 +110,7 @@
 **前沿**：CS 4.13 默认 sleepmask 重写覆盖 Beacon 代码+heap（100MB 上限）、BeaconGate 全代理调用 RAS；BRc4 custom-compiler 每代唯一二进制、模块踩踏+PEB LDR hook。
 
 **差距与收敛（→P8–P13）**：
-- **睡眠混淆接线**：修 `kits.rs:39-79` 短路，接通 Foliage 加密 + heap 区域注册（P2.1a/最高优先；对应 P12 前的基础逃避）。
+- **heap mask + noevasion 掩码**：`MemoryMaskKit::register_region` 从 32B session key 扩到 beacon 配置结构体/句柄，并补 noevasion 模式下的安全掩码（fluctuation 路由已落地：`kits::sleep` 在 `evasion_active() && enabled()` 时走 `fluctuation::sleep`，`kits.rs:75-81`；Foliage helper-thread `.text` 掩码仍休眠，`mem.rs:249-253`）。
 - **heap sleep mask**：`MemoryMaskKit::register_region` 从 32B session key 扩到 beacon 配置结构体/句柄（P12 前完成，追平 CS）。
 - **CET-safe 栈欺骗保持并验证**：BYOUD-Gap 已在维度领先（见 §4），需物理机 CET-on 验证 + LACUNA 多层链扩展（P12a/P12b）。
 - **注入多样性**：module stomping 被 PE-sieve `.text` hash 盯死时无替代；补 early-bird APC/thread-hijack（P12/P15 窗口）。
@@ -271,7 +271,7 @@ CS 4.13 与 BRc4 2.6.3 均为**纯用户态商品框架**，物理上没有内�
 
 **阶段二：2–4 月（P8–P9 + 整改计划 M0/M1）**——把"已对位但未接线"变成"可用"：
 
-1. **睡眠混淆接线 + heap mask**（修 `kits.rs` 短路；最高优先遗留项）。
+1. **heap mask + noevasion 掩码**（睡眠混淆接线已完成：`kits::sleep` 在 `evasion_active() && enabled()` 时路由 `fluctuation::sleep`，`kits.rs:75-81`；剩余为 `MemoryMaskKit::register_region` 扩展 + noevasion 模式掩码）。
 2. **UDRL 强化**（PE 头擦除、`.pdata` 处理、section 权限收敛；真实 layer-2 已交付并真机验证，本项追平 CS UDRL 生态）。
 3. **transport 消费路径**（DoH/DNS/LLM 接线；TLS emitter 实装 P11a）。
 4. **BOF API 扩面 + 异步 BOF**（追平 coffexec_async）。

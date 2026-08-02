@@ -172,6 +172,11 @@ fn _panic(info: &core::panic::PanicInfo) -> ! {
     // ExitProcess on Windows; on the dev host (no target_os=windows) trap.
     #[cfg(target_os = "windows")]
     {
+        // Crash marker BEFORE ExitProcess so headless crashes are debuggable:
+        // writes `%TEMP%\nyx_panic.txt` with the panic location (nyx_diag
+        // builds only — production leaves no forensic file, matching
+        // `entry::diag_mark`). Best-effort; never panics itself.
+        write_panic_diag(info);
         // Best-effort: resolve ExitProcess and exit with a non-zero code so the
         // host/loader reaps us. If resolution fails (catastrophic — ntdll gone),
         // fall through to the trap.
@@ -188,6 +193,166 @@ fn _panic(info: &core::panic::PanicInfo) -> ! {
         core::hint::spin_loop();
     }
 }
+
+/// Best-effort crash marker for the panic path: writes
+/// `%TEMP%\nyx_panic.txt` (fallback `C:\Windows\Temp\nyx_panic.txt`) with the
+/// panic location via kernel32/kernelbase `GetEnvironmentVariableW` +
+/// `CreateFileW` + `WriteFile` + `CloseHandle` resolved through the PEB walk
+/// (no std, no allocator — the panic path must not allocate). The file exists
+/// so a headless crash leaves an identifiable artifact even when nothing else
+/// (loader log, exit code) was captured. Gated on `nyx_diag` exactly like
+/// `entry::diag_mark`; production builds compile to a no-op and leave no
+/// forensic file on the target host.
+#[cfg(all(target_os = "windows", nyx_diag, not(test)))]
+fn write_panic_diag(info: &core::panic::PanicInfo) {
+    unsafe {
+        use core::ffi::c_void;
+        type GetEnvVarW = unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
+        type CreateFileW = unsafe extern "system" fn(
+            *const u16,
+            u32,
+            u32,
+            *mut c_void,
+            u32,
+            u32,
+            *mut c_void,
+        ) -> *mut c_void;
+        type WriteFile = unsafe extern "system" fn(
+            *mut c_void,
+            *const u8,
+            u32,
+            *mut u32,
+            *mut c_void,
+        ) -> i32;
+        type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+
+        let (Some(gev), Some(cf), Some(wf), Some(ch)) = (
+            resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableW")
+                .or_else(|| resolve::export_addr(b"kernelbase.dll", b"GetEnvironmentVariableW")),
+            resolve::export_addr(b"kernel32.dll", b"CreateFileW")
+                .or_else(|| resolve::export_addr(b"kernelbase.dll", b"CreateFileW")),
+            resolve::export_addr(b"kernel32.dll", b"WriteFile")
+                .or_else(|| resolve::export_addr(b"kernelbase.dll", b"WriteFile")),
+            resolve::export_addr(b"kernel32.dll", b"CloseHandle")
+                .or_else(|| resolve::export_addr(b"kernelbase.dll", b"CloseHandle")),
+        ) else {
+            return;
+        };
+        let get_env: GetEnvVarW = core::mem::transmute(gev);
+        let create: CreateFileW = core::mem::transmute(cf);
+        let write: WriteFile = core::mem::transmute(wf);
+        let close: CloseHandle = core::mem::transmute(ch);
+
+        // Build the path: `%TEMP%\nyx_panic.txt` as a fixed UTF-16 stack
+        // buffer (no allocation). Fall back to C:\Windows\Temp if TEMP is
+        // unset/oversized.
+        let mut tmp16 = [0u16; 260];
+        let mut name16 = [0u16; 5]; // L"TEMP\0"
+        for (i, &b) in b"TEMP".iter().enumerate() {
+            name16[i] = b as u16;
+        }
+        name16[4] = 0;
+        let n = get_env(name16.as_ptr(), tmp16.as_mut_ptr(), 260);
+        let tmp_len = if n != 0 && (n as usize) < 260 { n as usize } else { 0 };
+
+        let mut path16 = [0u16; 320];
+        let mut idx = 0usize;
+        if tmp_len > 0 {
+            for &u in &tmp16[..tmp_len] {
+                if idx < path16.len() {
+                    path16[idx] = u;
+                    idx += 1;
+                }
+            }
+        } else {
+            for u in "C:\\Windows\\Temp".encode_utf16() {
+                if idx < path16.len() {
+                    path16[idx] = u;
+                    idx += 1;
+                }
+            }
+        }
+        for &b in b"\\nyx_panic.txt".iter() {
+            if idx < path16.len() {
+                path16[idx] = b as u16;
+                idx += 1;
+            }
+        }
+        if idx < path16.len() {
+            path16[idx] = 0;
+        }
+
+        // Compose the marker body: `panic at <file>:<line>\n` (ASCII).
+        let mut body = [0u8; 256];
+        let mut blen = 0usize;
+        for &b in b"panic at ".iter() {
+            if blen < body.len() {
+                body[blen] = b;
+                blen += 1;
+            }
+        }
+        if let Some(loc) = info.location() {
+            for &b in loc.file().as_bytes().iter() {
+                if blen < body.len() {
+                    body[blen] = b;
+                    blen += 1;
+                }
+            }
+            if blen < body.len() {
+                body[blen] = b':';
+                blen += 1;
+            }
+            let mut line = loc.line();
+            let mut digits = [0u8; 10];
+            let mut nd = 0usize;
+            if line == 0 {
+                digits[0] = b'0';
+                nd = 1;
+            }
+            while line > 0 {
+                digits[nd] = b'0' + (line % 10) as u8;
+                line /= 10;
+                nd += 1;
+            }
+            for i in (0..nd).rev() {
+                if blen < body.len() {
+                    body[blen] = digits[i];
+                    blen += 1;
+                }
+            }
+        }
+        if blen < body.len() {
+            body[blen] = b'\n';
+            blen += 1;
+        }
+
+        // GENERIC_WRITE=0x40000000, FILE_SHARE_WRITE=2, CREATE_ALWAYS=2,
+        // FILE_ATTRIBUTE_NORMAL=0x80 (mirrors `entry::diag_mark`).
+        let h = create(
+            path16.as_ptr(),
+            0x4000_0000,
+            2,
+            core::ptr::null_mut(),
+            2,
+            0x80,
+            core::ptr::null_mut(),
+        );
+        if h.is_null() || h as usize == usize::MAX {
+            return;
+        }
+        let mut written: u32 = 0;
+        let _ = write(h, body.as_ptr(), blen as u32, &mut written, core::ptr::null_mut());
+        let _ = close(h);
+    }
+}
+
+/// Production / non-Windows fallback: no crash marker (see the `nyx_diag`
+/// variant for the real writer). `#[allow(dead_code)]`: only the real writer
+/// is referenced from `_panic` (which itself only exists in `not(test)`
+/// builds), so test-mode / dev-host builds would otherwise flag this.
+#[cfg(not(all(target_os = "windows", nyx_diag, not(test))))]
+#[allow(dead_code)]
+fn write_panic_diag(_info: &core::panic::PanicInfo) {}
 
 /// Size (bytes) of the most recent failed allocation, or 0 if none was ever
 /// recorded. Set by [`_alloc_error`] before the beacon enters its safe error

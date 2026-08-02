@@ -560,6 +560,12 @@ impl Command {
     }
 }
 
+/// Largest valid [`Response::Channel`] status code. Valid codes are
+/// 0=open, 1=data, 2=closed, 3=error; [`Response::decode`] rejects any status
+/// above this so a bogus byte can't be interpreted as a real channel state
+/// downstream.
+pub const CHANNEL_STATUS_MAX: u8 = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
     /// Raw command/process output.
@@ -578,7 +584,8 @@ pub enum Response {
     /// stdout/stderr produced by a BOF execution.
     BofOutput(Vec<u8>),
     /// A data-channel update for `Connect`/`Socks` (status: 0=open, 1=data,
-    /// 2=closed, 3=error).
+    /// 2=closed, 3=error). Decoding rejects any status above
+    /// [`CHANNEL_STATUS_MAX`].
     Channel {
         chan: u32,
         status: u8,
@@ -651,11 +658,22 @@ impl Response {
                 }
             }
             5 => Response::BofOutput(r.blob()?.to_vec()),
-            6 => Response::Channel {
-                chan: r.u32()?,
-                status: r.u8()?,
-                data: r.blob()?.to_vec(),
-            },
+            6 => {
+                let chan = r.u32()?;
+                let status = r.u8()?;
+                // Valid status codes: 0=open, 1=data, 2=closed, 3=error (see
+                // [`CHANNEL_STATUS_MAX`]). Anything else is malformed — reject
+                // at decode so a bogus status can't be interpreted as a real
+                // channel state downstream.
+                if status > CHANNEL_STATUS_MAX {
+                    return Err(WireError::BadTag(status));
+                }
+                Response::Channel {
+                    chan,
+                    status,
+                    data: r.blob()?.to_vec(),
+                }
+            }
             7 => Response::Image(r.blob()?.to_vec()),
             t => return Err(WireError::BadTag(t)),
         })
@@ -906,6 +924,41 @@ mod tests {
         let mut r = Reader::new(&bytes);
         let decoded = Response::decode(&mut r).unwrap();
         assert_eq!(decoded, Response::Image(png));
+    }
+
+    #[test]
+    fn response_channel_invalid_status_rejected() {
+        // A status byte above CHANNEL_STATUS_MAX (3) must be rejected at
+        // decode — previously unvalidated, a bogus status would have been
+        // interpreted as a real channel state downstream.
+        let mut w = Writer::new();
+        w.u8(6); // Response::Channel tag
+        w.u32(7); // chan
+        w.u8(CHANNEL_STATUS_MAX + 1); // invalid status
+        w.blob(b"").expect("empty blob encodes");
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        assert!(matches!(
+            Response::decode(&mut r),
+            Err(WireError::BadTag(n)) if n == CHANNEL_STATUS_MAX + 1
+        ));
+    }
+
+    #[test]
+    fn response_channel_max_status_roundtrips() {
+        // The boundary value (status == CHANNEL_STATUS_MAX, i.e. "error") is
+        // valid and must survive encode/decode.
+        let resp = Response::Channel {
+            chan: 9,
+            status: CHANNEL_STATUS_MAX,
+            data: vec![1, 2, 3],
+        };
+        let mut w = Writer::new();
+        resp.encode(&mut w)
+            .expect("encode should succeed for test fixture");
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(Response::decode(&mut r).unwrap(), resp);
     }
 
     #[test]

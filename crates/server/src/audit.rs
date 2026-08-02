@@ -12,7 +12,8 @@
 //!
 //! v1 writes are synchronous + flush-per-record (durable against clean
 //! shutdown; a hard crash can lose the last unflushed line, which the `seq` gap
-//! reveals). Rotation + remote shipping are v2.
+//! reveals). Rotation (size cap → `<path>.1` archive, see [`audit_max_bytes`])
+//! bounds the ACTIVE file so reads stay bounded; remote shipping is v2.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -65,6 +66,59 @@ struct Inner {
     last_hash: String,
 }
 
+/// Size cap for the ACTIVE audit log (tunable via `NYX_AUDIT_MAX_BYTES`,
+/// default 64 MiB). When [`AuditWriter::append`] sees the active file at or
+/// past this size it rotates: the current file is archived to `<path>.1` and a
+/// fresh file is started. Bounding the active file also bounds how much a
+/// single `query()` / `verify_chain()` call re-reads (they scan the ACTIVE
+/// file) — without rotation an append-only log grows without bound and every
+/// request re-scans the whole history.
+fn audit_max_bytes() -> u64 {
+    std::env::var("NYX_AUDIT_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64 * 1024 * 1024)
+}
+
+/// Rename the active audit log to `<path>.1` (replacing any prior archive) and
+/// reopen the active path fresh (create+append). Caller holds the write lock
+/// and resets `last_hash` to ZERO_HASH afterwards (the fresh file is a new
+/// chain); `seq` is NOT reset, so sequence numbers stay globally unique across
+/// rotations.
+///
+/// Follows the codebase's existing rename-while-open convention (operators.rs
+/// `persist`): on Unix the old handle would keep pointing at the ARCHIVED
+/// inode, so we MUST replace it with a fresh handle on the active path or
+/// subsequent appends would silently land in the archive.
+fn rotate(path: &Path, file: &mut File) -> std::io::Result<()> {
+    let archive = path.with_extension("jsonl.1");
+    // Durable archive: flush the current contents before renaming.
+    file.sync_all()?;
+    std::fs::rename(path, &archive)?;
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(fresh) => {
+            *file = fresh;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(path)?.permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(path, perms);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // The rename already happened; try to undo it so the handle keeps
+            // pointing at the ACTIVE file (a handle follows its inode, so the
+            // undo restores consistency). If the undo also fails the handle
+            // points at the ARCHIVE: appends land there (data preserved, the
+            // active-file contract degrades to query() erroring until restart).
+            let _ = std::fs::rename(&archive, path);
+            Err(e)
+        }
+    }
+}
+
 impl AuditWriter {
     /// Open (or create) the audit log at `path`. Recovers `seq` + `last_hash`
     /// from existing lines so the hash-chain stays continuous across restart.
@@ -103,6 +157,15 @@ impl AuditWriter {
 
     /// Append a record. Never panics (a poisoned lock or IO error drops ONE
     /// record + logs — the server must stay up; the `seq` gap surfaces the loss).
+    ///
+    /// Rotates the log when the active file exceeds [`audit_max_bytes`]: the
+    /// current file is renamed to `<path>.1` (replacing any previous archive)
+    /// and a fresh file is started. Rotation bounds what a later `query()` /
+    /// `verify_chain()` call re-reads. The chain restarts at ZERO_HASH in the
+    /// fresh file (each file carries an intact chain of its own; verify one at
+    /// a time — archived records are not queryable through the API). Rotation
+    /// is best-effort: on failure we warn and keep appending (the log still
+    /// works; only the size bound is deferred).
     pub fn append(
         &self,
         action: &str,
@@ -117,6 +180,22 @@ impl AuditWriter {
                 return;
             }
         };
+        // Rotate under the lock so rotation is serialized with appends. The
+        // fresh file restarts the chain at ZERO_HASH (the archive keeps its
+        // own intact chain); `seq` keeps counting so ids stay globally unique.
+        if let Ok(meta) = inner.file.metadata() {
+            if meta.len() >= audit_max_bytes() {
+                match rotate(&self.path, &mut inner.file) {
+                    Ok(()) => inner.last_hash = ZERO_HASH.to_string(),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            "audit log rotation failed; continuing to append"
+                        );
+                    }
+                }
+            }
+        }
         inner.seq += 1;
         let seq = inner.seq;
         let ts = now_secs();
@@ -157,6 +236,12 @@ impl AuditWriter {
     /// Read + filter + paginate. Re-opens the file fresh (the log is
     /// append-only, so a concurrent writer can only add lines). Newest-first by
     /// default; `?dir=asc` flips it. Hard cap 5000 so a full scan can't OOM.
+    ///
+    /// The full-file scan is bounded by rotation ([`audit_max_bytes`]): the
+    /// ACTIVE file never exceeds the size cap, so a re-read per request is at
+    /// most a cap-sized scan (the archived `.1` file is not queryable via the
+    /// API — rotate/trim archives by hand to keep them, or they are replaced
+    /// on the next rotation).
     ///
     /// Memory bounding (M12): the file is read oldest-first. The oldest-first
     /// (`dir=asc`) output short-circuits as soon as `limit` page records past
@@ -229,18 +314,20 @@ impl AuditWriter {
         &self.path
     }
 
-    /// Walk the chain; returns `Some(seq)` of the first record whose `hash`
-    /// doesn't match the recomputed link (a broken/tampered page), else `None`.
+    /// Walk the chain; `Ok(true)` iff every scanned record's `hash` matches
+    /// its recomputed link (a clean chain). See [`VerifyError`] for the
+    /// failure modes — the old `Option<u64>` sentinels (`Some(0)` for a
+    /// malformed line, `Some(u64::MAX)` for the scan cap) are gone.
     ///
     /// Line-count bounded (M-DoS): unlike the read path this used to scan the
     /// ENTIRE audit file with no cap. An attacker who grew `audit.jsonl` to
     /// millions of lines could force a single `GET /api/audit/verify` to burn
     /// unbounded CPU/memory. We cap the scan at `MAX_VERIFY_LINES`: past it the
-    /// chain is considered unverifiable from this call and we return `None` with
-    /// a warning (the operator should rotate/trim the log rather than trust a
-    /// partial verification).
-    pub fn verify_chain(path: &Path) -> std::io::Result<Option<u64>> {
-        let f = File::open(path)?;
+    /// chain is considered unverifiable from this call and we return
+    /// [`VerifyError::Truncated`] (the operator should rotate/trim the log
+    /// rather than trust a partial verification).
+    pub fn verify_chain(path: &Path) -> Result<bool, VerifyError> {
+        let f = File::open(path).map_err(VerifyError::Io)?;
         let mut prev = ZERO_HASH.to_string();
         let mut line_count = 0usize;
         for line in BufReader::new(f).lines().map_while(Result::ok) {
@@ -253,28 +340,28 @@ impl AuditWriter {
                      (rotate/trim the audit log to verify in full)"
                 );
                 // Treat as untrusted: a truncated verification cannot honestly
-                // return "chain intact" (Ok(None)), and we have no single seq to
-                // blame. Return u64::MAX as a synthetic "tail not verified"
-                // sentinel so the API surfaces a non-clean result instead of a
+                // return "chain intact" (Ok(true)), and there is no single seq
+                // to blame. Surface the truncation explicitly instead of a
                 // false green light.
-                return Ok(Some(u64::MAX));
+                return Err(VerifyError::Truncated { line: line_count });
             }
             // Malformed line (serde_json failed): previously this fell back to
             // `prev_parse_seq(&line).unwrap_or(0)`, but `prev_parse_seq` ALSO
             // parses via serde_json — so it ALWAYS failed too and returned 0,
             // silently masking the real corruption position with a bogus seq 0.
             // Now surface the corruption explicitly: log the offending line and
-            // blame seq 0 (the canonical "unparseable" sentinel) so operators
-            // see WHERE verification broke instead of a misleading pass/fail.
+            // blame the 1-based line number (the canonical "unparseable"
+            // position) so operators see WHERE verification broke instead of a
+            // misleading pass/fail.
             let rec: AuditRecord = match serde_json::from_str(&line) {
                 Ok(r) => r,
                 Err(_) => {
                     tracing::warn!(line, "audit line malformed during verify");
-                    return Ok(Some(0));
+                    return Err(VerifyError::MalformedLine { line: line_count });
                 }
             };
             if rec.prev_hash != prev {
-                return Ok(Some(rec.seq));
+                return Err(VerifyError::ChainBreak { seq: rec.seq });
             }
             let detail_json = serde_json::to_string(&rec.detail).unwrap_or_else(|_| "null".into());
             let recomputed = hash_record(
@@ -287,12 +374,31 @@ impl AuditWriter {
                 &rec.prev_hash,
             );
             if recomputed != rec.hash {
-                return Ok(Some(rec.seq));
+                return Err(VerifyError::ChainBreak { seq: rec.seq });
             }
             prev = rec.hash;
         }
-        Ok(None)
+        Ok(true)
     }
+}
+
+/// Outcome of an audit-chain verification. `Err` variants replace the old
+/// `Option<u64>` sentinels — `Some(0)` (malformed line) and `Some(u64::MAX)`
+/// (scan cap hit) were magic numbers whose meaning callers had to know; the
+/// variants below carry the same information explicitly.
+#[derive(Debug)]
+pub enum VerifyError {
+    /// The log could not be read (open/IO failure).
+    Io(std::io::Error),
+    /// A record's stored `hash` doesn't match the recomputed link — a broken
+    /// or tampered middle page. Carries the offending record's `seq`.
+    ChainBreak { seq: u64 },
+    /// A line failed to parse as a record, so verification cannot continue.
+    /// Carries the 1-based line number (the corruption position).
+    MalformedLine { line: usize },
+    /// The scan hit `MAX_VERIFY_LINES` before EOF — the tail of the log was
+    /// NOT verified. Treat as untrusted: rotate/trim the log to verify in full.
+    Truncated { line: usize },
 }
 
 /// Upper bound on the number of lines `verify_chain` will scan in one call.
@@ -365,7 +471,7 @@ mod tests {
         assert_eq!(recs[0].prev_hash, recs[1].hash); // chained
                                                      // verify clean
         let path = dir.path().join("audit.jsonl");
-        assert_eq!(AuditWriter::verify_chain(&path).unwrap(), None);
+        assert!(AuditWriter::verify_chain(&path).unwrap());
     }
 
     #[test]
@@ -380,7 +486,10 @@ mod tests {
         // Corrupt the first record's hash field.
         lines[0] = lines[0].replace("\"hash\":\"", "\"hash\":\"ffffff");
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
-        assert!(AuditWriter::verify_chain(&path).unwrap().is_some());
+        assert!(matches!(
+            AuditWriter::verify_chain(&path),
+            Err(VerifyError::ChainBreak { .. })
+        ));
     }
 
     #[test]
@@ -417,6 +526,6 @@ mod tests {
         w.append("task", "bob", "y", serde_json::json!({}));
         let recs = w.query(&AuditQuery::default()).unwrap();
         assert_eq!(recs[0].seq, 2);
-        assert_eq!(AuditWriter::verify_chain(&path).unwrap(), None);
+        assert!(AuditWriter::verify_chain(&path).unwrap());
     }
 }

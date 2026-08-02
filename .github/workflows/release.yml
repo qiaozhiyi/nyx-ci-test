@@ -17,9 +17,14 @@ name: Release
 # executes the real Layer-1 bytes on any host. The rundll32 scripts
 # (selftest_gate.ps1 / loader_probe_gate.ps1) remain for interactive machines.
 #
-# NOTE: until a real Layer-2 reflective loader exists, `wrap_blob` fails loudly
-# by design (generate_loader_stub refuses to emit a broken blob) — releases are
-# blocked there, which is the honest state.
+# NOTE: `wrap_blob` now emits the REAL reflective blob — wrap_payload encrypts
+# the DLL (ChaCha20-Poly1305, per-invocation key baked into the stub) and
+# assembles the definitive layout [LAYER1+bridge][key][magic|len|nonce]
+# [ct||tag][LAYER2]; the Layer-2 PIC loader was verified end-to-end on real
+# hardware 2026-08-02 (crates/loader-probe-exe, DllMain marker). Releases are
+# gated on the loader probe gauntlet below (Unicorn emu probe mandatory on
+# hosted runners; rundll32 harness opt-in on interactive machines) — the
+# fail-loud stub era is over.
 #
 # Trigger: push of a `v*` tag ONLY. No PR, no push-to-main — releases are
 # explicit (operator pushes a tag, never accidentally off main).

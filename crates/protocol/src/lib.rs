@@ -14,8 +14,13 @@
 //! - Implant generates an ephemeral X25519 keypair; the server holds a
 //!   long-term X25519 identity whose public half is baked into implant config.
 //! - Session key = HKDF-SHA256(ECDH(implant_eph, server_id)).
-//! - AEAD = ChaCha20-Poly1305, 96-bit nonce = zero-padded LE counter.
-//!   The implant pubkey is bound as AAD on every operation.
+//! - AEAD = ChaCha20-Poly1305, 96-bit nonce = direction discriminator in
+//!   `nonce[0]` (`crypto::Direction`: 0x00 client→server, 0x01 server→client)
+//!   + zero pad + LE counter in `nonce[4..12]`, so the two directions' nonce
+//!     spaces stay disjoint for every counter value (pre-fix this was documented
+//!     as a zero-padded counter only — that description predates the direction
+//!     split and is wrong).
+//!     The implant pubkey is bound as AAD on every operation.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -36,7 +41,6 @@ pub use crypto::{
     NONCE_LEN, PUBKEY_LEN,
 };
 pub use frame::{
-    encode_frame, encode_frame_dir, open_frame, open_frame_dir, parse_frame, FrameError, RawFrame,
-    FRAME_HEADER, TAG_LEN,
+    encode_frame_dir, open_frame_dir, parse_frame, FrameError, RawFrame, FRAME_HEADER, TAG_LEN,
 };
 pub use msg::{Command, FileOp, Response, SessionInfo, Task, TaskResponse};

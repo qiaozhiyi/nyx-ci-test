@@ -53,13 +53,19 @@ fn frame_seal_open_roundtrip() {
         .expect("test SessionInfo fields are tiny literals << MAX_BLOB_LEN");
     let plaintext = w.into_bytes();
 
-    let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, &plaintext)
-        .expect("test encode of tiny SessionInfo plaintext is infallible");
+    let frame = frame::encode_frame_dir(
+        &implant.public_bytes(),
+        crypto::Direction::ClientToServer,
+        0,
+        &key,
+        &plaintext,
+    )
+    .expect("test encode of tiny SessionInfo plaintext is infallible");
     let raw = frame::parse_frame(&frame).unwrap();
     assert_eq!(raw.counter, 0);
     assert_eq!(raw.pubkey, implant.public_bytes());
 
-    let pt = frame::open_frame(&key, &raw).unwrap();
+    let pt = frame::open_frame_dir(&key, crypto::Direction::ClientToServer, &raw).unwrap();
     assert_eq!(pt, plaintext);
 
     let mut r = wire::Reader::new(&pt);
@@ -73,13 +79,19 @@ fn wrong_key_does_not_decrypt() {
     let implant = crypto::ImplantKeypair::generate().unwrap();
     let key = implant.session_key(&server.public_bytes()).unwrap();
 
-    let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, b"secret")
-        .expect("test encode of tiny plaintext is infallible");
+    let frame = frame::encode_frame_dir(
+        &implant.public_bytes(),
+        crypto::Direction::ClientToServer,
+        0,
+        &key,
+        b"secret",
+    )
+    .expect("test encode of tiny plaintext is infallible");
     let raw = frame::parse_frame(&frame).unwrap();
 
     let other = crypto::ImplantKeypair::generate().unwrap();
     let wrong_key = other.session_key(&server.public_bytes()).unwrap();
-    assert!(frame::open_frame(&wrong_key, &raw).is_err());
+    assert!(frame::open_frame_dir(&wrong_key, crypto::Direction::ClientToServer, &raw).is_err());
 }
 
 #[test]
@@ -171,8 +183,14 @@ fn frame_with_trailing_bytes_is_rejected() {
     let server = crypto::ServerKeypair::generate().unwrap();
     let implant = crypto::ImplantKeypair::generate().unwrap();
     let key = implant.session_key(&server.public_bytes()).unwrap();
-    let frame = frame::encode_frame(&implant.public_bytes(), 0, &key, b"hi")
-        .expect("test encode of tiny plaintext is infallible");
+    let frame = frame::encode_frame_dir(
+        &implant.public_bytes(),
+        crypto::Direction::ClientToServer,
+        0,
+        &key,
+        b"hi",
+    )
+    .expect("test encode of tiny plaintext is infallible");
     let mut with_trailer = frame.clone();
     with_trailer.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // unauthenticated tail
     assert!(
@@ -466,17 +484,22 @@ fn frame_with_zero_width_plaintext_is_rejected() {
 }
 
 /// H-2 (zero-width plaintext rejection, encode side): encode_frame_dir must
-/// panic on an empty plaintext. The wire codec never legitimately produces
-/// one (every batch carries at least a `u32 count`, every SessionInfo is
-/// non-empty), so an empty plaintext here signals a caller bug — panicking
-/// gives the developer a loud signal at the source rather than silently
-/// producing a frame the receiver will reject anyway.
+/// reject an empty plaintext as a checked error (previously an `assert!`
+/// panic). The wire codec never legitimately produces one (every batch carries
+/// at least a `u32 count`, every SessionInfo is non-empty), so an empty
+/// plaintext here signals a caller bug — returning [`frame::FrameError::EmptyPlaintext`]
+/// gives `panic = "abort"` builds a recovery path instead of a teardown, and
+/// the error surfaces at the source rather than a silent round-trip failure.
 #[test]
-#[should_panic(expected = "encode_frame_dir: empty plaintext is not a valid beacon frame")]
-fn encode_frame_dir_panics_on_empty_plaintext() {
+fn encode_frame_dir_rejects_empty_plaintext() {
     let key = crypto::SessionKey::new([0u8; 32]);
     let pubkey = [0u8; crypto::PUBKEY_LEN];
-    let _ = frame::encode_frame_dir(&pubkey, crypto::Direction::ClientToServer, 0, &key, b"");
+    let err = frame::encode_frame_dir(&pubkey, crypto::Direction::ClientToServer, 0, &key, b"")
+        .expect_err("empty plaintext must be rejected as a checked error, not a panic");
+    assert!(
+        matches!(err, frame::FrameError::EmptyPlaintext),
+        "expected EmptyPlaintext, got {err:?}"
+    );
 }
 
 /// MIN_CT_LEN constant pin — guards the lower bound against silent regressions.
@@ -608,7 +631,7 @@ fn encode_frame_cap_boundary_is_exact() {
     let raw = frame::parse_frame(&frame_bytes).unwrap();
     assert_eq!(raw.ciphertext.len(), frame::MAX_CT_LEN);
     // And it round-trips.
-    let pt = frame::open_frame(&key, &raw).unwrap();
+    let pt = frame::open_frame_dir(&key, crypto::Direction::ClientToServer, &raw).unwrap();
     assert_eq!(pt.len(), frame::MAX_CT_LEN - frame::TAG_LEN);
 
     // One byte past the cap is rejected.

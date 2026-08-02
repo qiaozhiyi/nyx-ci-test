@@ -93,10 +93,11 @@ impl Writer {
     /// zero-plaintext bodies via `frame::MIN_CT_LEN`.
     pub fn blob(&mut self, v: &[u8]) -> Result<(), WireError> {
         check_blob_len(v.len())?;
-        let len = v
-            .len()
-            .try_into()
-            .expect("checked against MAX_BLOB_LEN <= u32::MAX");
+        // The cap above already bounds `v.len()` to MAX_BLOB_LEN (256 KiB), so
+        // this conversion cannot overflow; use a checked conversion anyway so a
+        // future cap change can't turn it into a panic (`panic = "abort"`
+        // builds get no recovery path from a panic).
+        let len = u32::try_from(v.len()).map_err(|_| WireError::BadLen(v.len()))?;
         self.u32(len);
         self.buf.extend_from_slice(v);
         Ok(())

