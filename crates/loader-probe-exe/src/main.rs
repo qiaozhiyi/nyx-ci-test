@@ -56,7 +56,7 @@ fn main() {
 mod veh {
     use std::os::raw::c_void;
 
-    pub type PEXCEPTION_POINTERS = *mut EXCEPTION_POINTERS;
+    pub type PExceptionPointers = *mut EXCEPTION_POINTERS;
     #[repr(C)]
     pub struct EXCEPTION_RECORD {
         pub exception_code: u32,
@@ -78,24 +78,25 @@ mod veh {
 
     /// Installs a VEH that prints the faulting RIP (and blob-relative offset)
     /// before the OS kills the process. Returns the handler address.
-    pub fn install(blob_base: usize, blob_len: usize) -> usize {
-        unsafe extern "system" fn handler(ep: PEXCEPTION_POINTERS) -> i32 {
+    pub fn install(_blob_base: usize, _blob_len: usize) -> usize {
+        unsafe extern "system" fn handler(ep: PExceptionPointers) -> i32 {
             let rec = unsafe { &*(*ep).exception_record };
             let rip = rec.exception_address as usize;
             let code = rec.exception_code;
             // 0xC0000005 = AV; 0xC000001D = illegal instruction; 0xC0000096 = privileged.
             if matches!(code, 0xC0000005 | 0xC000001D | 0xC0000096) {
-                let rel = rip.checked_sub(BLOB_BASE).unwrap_or(usize::MAX);
-                let inside = rel < BLOB_LEN;
+                let (base, len) = unsafe { (BLOB_BASE, BLOB_LEN) };
+                let rel = rip.checked_sub(base).unwrap_or(usize::MAX);
+                let inside = rel < len;
                 eprintln!(
-                    "[veh] exception 0x{code:08X} at RIP=0x{rip:x} base=0x{BLOB_BASE:x} len=0x{BLOB_LEN:x} rel=0x{rel:x}{}",
-                    if inside { " (INSIDE BLOB)" } else if rel == usize::MAX { " (BELOW BLOB — image/other)" } else { " (ABOVE BLOB)" }
+                    "[veh] exception 0x{code:08X} at RIP=0x{rip:x} base=0x{base:x} len=0x{len:x} rel=0x{rel:x}{}",
+                    if inside { " (INSIDE BLOB)" } else if rel == usize::MAX { " (BELOW BLOB - image/other)" } else { " (ABOVE BLOB)" }
                 );
             }
             // Continue searching (default): let the OS terminate as usual.
             0
         }
-        let h: unsafe extern "system" fn(PEXCEPTION_POINTERS) -> i32 = handler;
+        let h: unsafe extern "system" fn(PExceptionPointers) -> i32 = handler;
         let addr = h as usize;
         unsafe { AddVectoredExceptionHandler(1, addr) };
         addr
