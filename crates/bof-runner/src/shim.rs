@@ -580,7 +580,7 @@ mod tests {
             "expected at least one byte from committed page"
         );
         assert!(out.len() <= 4096, "exceeded the 4096 %s cap");
-        let first_page = &out[..out.len().min(0x1000)];
+        let first_page = &out.as_bytes()[..out.len().min(0x1000)];
         assert!(
             first_page.iter().all(|&b| b == b'B'),
             "first page of output must be the committed 'B' page"
