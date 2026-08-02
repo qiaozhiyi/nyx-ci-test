@@ -18,6 +18,7 @@ members = [
     "crates/client-ui-web/src-tauri",
     "crates/scripting-rhai",
     "crates/nyx-loader",
+    "crates/loader-probe-exe",
 ]
 # NOTE: `crates/implant-win` is intentionally NOT a workspace member. It is
 # `#![no_std]` + `#![no_main]` + targets `x86_64-pc-windows-gnu` on nightly, and

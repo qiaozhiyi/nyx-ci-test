@@ -100,6 +100,34 @@ jobs:
           }
           Write-Host "CLI + resolver built"
 
+      # ---- 1b. REAL-MACHINE Layer-2 probe (EXE harness, no rundll32) ----
+      # Runs the complete NYX2 blob in-process: wrap_payload -> VirtualAlloc ->
+      # Layer-1 self-locate -> bridge -> pic-loader Layer-2 (PEB walk, chacha
+      # decrypt, reflective PE load) -> DllMain of the real implant DLL.
+      # Deliberately avoids rundll32/LoadLibrary-on-the-blob (the paths that
+      # hang in Session 0 / Server-2025 loader quirks), so this works on
+      # GitHub-hosted runners — real Windows E2E with zero local hardware.
+      - name: Real-machine Layer-2 probe
+        shell: pwsh
+        run: |
+          $prevEap = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            cargo build --release -p nyx-loader-probe-exe 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "probe build exited $LASTEXITCODE" }
+          } finally {
+            $ErrorActionPreference = $prevEap
+          }
+          $probe = "target\release\nyx-loader-probe-exe.exe"
+          $dll = "crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
+          if (-not (Test-Path $probe)) { Write-Host "::error::probe exe missing"; exit 1 }
+          if (-not (Test-Path $dll)) { Write-Host "::error::implant DLL missing"; exit 1 }
+          & $probe $dll
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::real-machine Layer-2 probe FAILED (exit $LASTEXITCODE)"
+            exit 1
+          }
+
       # ---- 2. User-mode selftests on this kernel ----
       # GATES THE PR. continue-on-error was removed: a selftest that crashes,
       # times out, or hits the 0xFFFFFFFF/0xFFFFFFFE harness-failure sentinels

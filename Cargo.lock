@@ -2846,6 +2846,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-loader-probe-exe"
+version = "0.1.0"
+dependencies = [
+ "nyx-loader",
+]
+
+[[package]]
 name = "nyx-parse"
 version = "0.2.0"
 

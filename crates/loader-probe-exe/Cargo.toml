@@ -1,0 +1,10 @@
+[package]
+name = "nyx-loader-probe-exe"
+version = "0.1.0"
+edition = "2021"
+description = "Real-machine Layer-2 reflective-loader probe: runs the full NYX2 blob in-process on a Windows host (incl. GitHub-hosted CI runners)."
+
+[dependencies]
+nyx-loader = { path = "../nyx-loader" }
+
+# No extra deps: VirtualAlloc is hand-declared below (std + explicit FFI only).
