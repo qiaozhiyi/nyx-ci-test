@@ -184,5 +184,7 @@ jobs:
         run: cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --features selftest --target x86_64-pc-windows-gnu
       - name: Install qiling + run selftest matrix
         run: |
-          python3 -m pip install --user -q qiling
-          python3 tools/selftest-qiling/runner.py
+          # macOS system python is externally-managed; use a venv.
+          python3 -m venv /tmp/qiling-venv
+          /tmp/qiling-venv/bin/pip install -q qiling
+          /tmp/qiling-venv/bin/python tools/selftest-qiling/runner.py
