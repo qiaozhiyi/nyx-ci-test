@@ -61,23 +61,40 @@ impl KernelBridge {
                 .map_err(|e| format!("daemon {}: {e}", self.addr))?;
             *guard = Some(s);
         }
-        let stream = guard.as_mut().unwrap();
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|e| format!("write: {e}"))?;
-
-        let mut reader = BufReader::new(&mut *stream);
+        // Write, then read one reply line. ANY failure below (write error, read
+        // error, parse error) leaves the cached stream in an unknown state —
+        // clear the cache so the NEXT op reconnects instead of failing forever
+        // against a dead/desynced connection (the daemon may have restarted
+        // mid-session, or a partial line may have desynced the framing).
+        let write_res = {
+            let stream = guard.as_mut().unwrap();
+            stream.write_all(request.as_bytes()).await
+        };
+        if let Err(e) = write_res {
+            *guard = None;
+            return Err(format!("write: {e}"));
+        }
         let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| format!("read: {e}"))?;
+        let read_res = {
+            let stream = guard.as_mut().unwrap();
+            let mut reader = BufReader::new(&mut *stream);
+            reader.read_line(&mut line).await
+        };
+        if let Err(e) = read_res {
+            *guard = None;
+            return Err(format!("read: {e}"));
+        }
         if line.is_empty() {
             *guard = None;
             return Err("daemon closed".into());
         }
-        serde_json::from_str(&line).map_err(|e| format!("parse: {e}"))
+        match serde_json::from_str(&line) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                *guard = None;
+                Err(format!("parse: {e}"))
+            }
+        }
     }
 }
 

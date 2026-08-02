@@ -163,9 +163,17 @@ impl EtwTiOffsets {
     /// Handles builds outside every explicit range (e.g. 22635 → the
     /// 22H2/23H2 layout, 22001 → Server 2022's). 19045 is NOT handled here
     /// anymore — it is an explicit range entry, aligned with evasionsdk.
+    ///
+    /// Returns `None` ABOVE the last verified build (26200): the Win11 24H2+
+    /// `0x070` EnableInfo offset is "possibly correct, pending PDB verification"
+    /// (module doc), and silently extending it to unknown future kernels
+    /// violates the module's own "Unknown builds return None so the caller MUST
+    /// probe" contract (kernelsdk-2-5).
     fn floor_match(build: u32) -> Option<Self> {
         // Try each known range ceiling; return the one whose range floor <= build.
-        if build >= 26100 {
+        if build > 26200 {
+            None // above the last verified build — caller MUST probe (kernelsdk-2-5)
+        } else if build >= 26100 {
             Self::for_build(26100)
         } else if build >= 22621 {
             Self::for_build(22621)
@@ -492,5 +500,18 @@ mod tests {
         // 22H2/23H2 layout).
         let o2 = EtwTiOffsets::for_build(22635).unwrap();
         assert_eq!(o2.provider_block_to_enable_info, 0x070);
+    }
+
+    #[test]
+    fn builds_above_last_verified_return_none() {
+        // kernelsdk-2-5 regression: the Win11 0x070 EnableInfo layout is only
+        // verified through 26200 — unknown FUTURE builds must return None so
+        // the caller probes instead of writing a guessed offset (bugcheck
+        // risk). Before the fix, floor_match mapped ANY build >= 26100,
+        // including 30000, onto the 24H2 layout.
+        assert!(EtwTiOffsets::for_build(26200).is_some()); // last verified 25H2
+        assert!(EtwTiOffsets::for_build(26201).is_none());
+        assert!(EtwTiOffsets::for_build(28000).is_none());
+        assert!(EtwTiOffsets::for_build(30000).is_none());
     }
 }

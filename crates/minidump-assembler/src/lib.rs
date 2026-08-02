@@ -232,7 +232,12 @@ pub fn assemble_minidump(pid: u32, base_va: u64, raw: &[u8], build: u32) -> Vec<
         build_number: build,
         platform_id: VER_PLATFORM_WIN32_NT,
         csd_version_rva: 0,
-        reserved1: 0,
+        // kernel-tools-7: the pid breadcrumb was documented as living in
+        // reserved1's high 16 bits but the field was hardcoded to 0 and the
+        // pid discarded. Encode it (low 16 bits of the pid, shifted up) so a
+        // dump actually carries the source process it was captured from.
+        // mimikatz ignores reserved1; this is a recovery breadcrumb only.
+        reserved1: (pid & 0xFFFF) << 16,
         cpu_info: [0u8; 24],
     };
     push_system_info(&mut out, &sys_info);
@@ -254,10 +259,7 @@ pub fn assemble_minidump(pid: u32, base_va: u64, raw: &[u8], build: u32) -> Vec<
 
     // Defensive: the layout math should produce exactly total_size.
     debug_assert_eq!(out.len(), total_size, "minidump layout math drifted");
-    // PID is recorded only via the reserved build/channel — we surface it as
-    // the `reserved1` field's high 16 bits so it's recoverable without growing
-    // the struct. (mimikatz ignores reserved1; this is a recovery breadcrumb.)
-    let _ = pid; // recorded into SystemInfo elsewhere if needed in future revs.
+    // pid is surfaced in SystemInfo.reserved1's high 16 bits (see above).
 
     out
 }
@@ -377,6 +379,30 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(build, 22621);
+    }
+
+    /// kernel-tools-7 regression: the pid breadcrumb must be encoded in
+    /// SystemInfo.reserved1's high 16 bits (low 16 bits of the pid, shifted).
+    #[test]
+    fn pid_breadcrumb_recorded_in_reserved1() {
+        let raw = [0u8; 16];
+        let dump = assemble_minidump(684, 0x7ff0_0000, &raw, 19041);
+        // reserved1 sits at SystemInfo offset 0x28 (0x38 + 4*7 = 0x60 file off).
+        let reserved1_off = 0x38 + 28;
+        let reserved1 = u32::from_le_bytes(
+            dump[reserved1_off..reserved1_off + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(reserved1, (684 & 0xFFFF) << 16);
+        // A pid with a nonzero high 16 bits still round-trips via the low mask.
+        let dump2 = assemble_minidump(0x8000_1234, 0x7ff0_0000, &raw, 19041);
+        let reserved1_2 = u32::from_le_bytes(
+            dump2[reserved1_off..reserved1_off + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(reserved1_2, (0x1234 & 0xFFFF) << 16);
     }
 
     /// ProcessorArchitecture is AMD64 (9) so mimikatz picks the x64 path.

@@ -28,6 +28,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// How the x64 unwinder treats a synthesized frame address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,10 +169,15 @@ pub fn build_lacuna_chain(
             }
         }
     }
-    // Append the backed terminator (layer 5) — round-robin the first entry so
-    // consecutive chains don't share the same terminator address.
+    // Append the backed terminator (layer 5) — round-robin across the backed
+    // pool so consecutive chains don't share the same terminator address
+    // (evasionsdk-5: the code used to push backed[0] unconditionally, giving
+    // every chain an identical, trivially pattern-matcheable terminating
+    // return address). Single-entry pools are unaffected (always backed[0]).
     if !backed.is_empty() && out.len() < depth {
-        out.push(SyntheticFrame { addr: backed[0], kind: FrameKind::Backed });
+        static BACKED_ROUND_ROBIN: AtomicUsize = AtomicUsize::new(0);
+        let rot = BACKED_ROUND_ROBIN.fetch_add(1, Ordering::Relaxed) % backed.len();
+        out.push(SyntheticFrame { addr: backed[rot], kind: FrameKind::Backed });
     }
     out
 }
@@ -316,5 +322,20 @@ mod tests {
         let chain = build_lacuna_chain(&[], &[], &[], &tails, &[], 3);
         assert_eq!(chain.len(), 3);
         assert!(chain.iter().all(|f| f.addr >= 0xD0));
+    }
+
+    #[test]
+    fn lacuna_chain_rotates_backed_terminator() {
+        // evasionsdk-5 regression: with a multi-entry backed pool, consecutive
+        // chains must NOT share the same terminator address (round-robin).
+        let gaps = [0xA0];
+        let backed = [0xE0, 0xE1, 0xE2];
+        let t1 = build_lacuna_chain(&gaps, &[], &[], &[], &backed, 2);
+        let t2 = build_lacuna_chain(&gaps, &[], &[], &[], &backed, 2);
+        let a1 = t1.last().unwrap().addr;
+        let a2 = t2.last().unwrap().addr;
+        assert_ne!(a1, a2, "consecutive chains must rotate the backed terminator");
+        assert!(backed.contains(&a1) && backed.contains(&a2));
+        assert_eq!(t1.last().unwrap().kind, FrameKind::Backed);
     }
 }

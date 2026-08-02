@@ -41,7 +41,14 @@ impl Hook for LogHook {
             }
             Event::SessionExit(s) => format!("session_exit: {}", s.session_id),
         };
-        self.records.lock().unwrap().push(line);
+        // Poison-tolerant: a panicked hook must not take down the whole bus
+        // (the server release profile is panic=abort, so `unwrap()` on a
+        // poisoned lock would abort the process). `into_inner()` recovers the
+        // data; the panic is already logged by `EventBus::fire`'s boundary.
+        self.records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(line);
     }
 }
 
@@ -75,12 +82,17 @@ impl Hook for FirstBloodHook {
     fn on_event(&self, event: &Event) {
         if let Event::SessionNew(s) = event {
             // `seen` lock released at the end of this statement, before the
-            // records lock below — no nested locking.
-            let is_first = self.seen.lock().unwrap().insert(s.session_id.clone());
+            // records lock below — no nested locking. Poison-tolerant for the
+            // same reason as `LogHook` (see above).
+            let is_first = self
+                .seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(s.session_id.clone());
             if is_first {
                 self.records
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .push(format!("first blood: {}@{}", s.username, s.hostname));
             }
         }

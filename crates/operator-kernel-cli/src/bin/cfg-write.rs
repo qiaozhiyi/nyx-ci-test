@@ -28,7 +28,11 @@ fn main() {
     let sz = unsafe { *(init as *const u32) } as usize;
     eprintln!("[*] LdrSystemDllInitBlock size=0x{sz:x}");
 
-    let off: usize = if sz <= 0x70 { 0x40 } else if sz <= 0xC0 { 0xC0 } else { 0xC8 };
+    // kernel-tools-4: use the SHARED offset selection from operator-kernelsdk
+    // (cfg::cfg_bitmap_offset) — this binary used to compute its own mapping
+    // (0x40/0xC0/0xC8) that disagreed with nyx-kernel cfg-bypass (0x40/0x60/0x68)
+    // for the same block sizes, so one of them always missed the bitmap.
+    let off = nyx_operator_kernelsdk::cfg::cfg_bitmap_offset(sz);
     let bm = unsafe { *((init + off) as *const usize) };
     let bs = unsafe { *((init + off + 8) as *const usize) };
     eprintln!("[*] CFG bitmap=0x{bm:x} size=0x{bs:x}");

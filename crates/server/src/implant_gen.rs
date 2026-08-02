@@ -149,8 +149,11 @@ fn validate_patched_pe(binary: &[u8], cfg_offset: usize) -> Result<(), String> {
             "bad .nyx_cfg magic at offset {cfg_offset}: expected 0xDEADBEEF, got 0x{magic:08X}"
         ));
     }
-    // Validate data_len fits within the 1024-byte section
-    let data_len = u16::from_le_bytes([binary[cfg_offset + 4], binary[cfg_offset + 5]]) as usize;
+    // Validate data_len fits within the 1024-byte section. Layout:
+    // [magic 4B][keying_levels 4B][data_len u16 2B] -> data_len at +8.
+    // (Previously read at +4 — the keying_levels field — making this check a
+    // permanent no-op; see server-aux-2.)
+    let data_len = u16::from_le_bytes([binary[cfg_offset + 8], binary[cfg_offset + 9]]) as usize;
     if data_len > 900 {
         return Err(format!("data_len too large: {data_len} (max 900)"));
     }
@@ -169,6 +172,10 @@ fn validate_patched_pe(binary: &[u8], cfg_offset: usize) -> Result<(), String> {
 
 /// Maximum implant generation requests per sliding window.
 const DEFAULT_RATE_LIMIT_MAX: usize = 10;
+/// Per-operator global cap per window: bounds how many implants ONE identity
+/// can emit across ALL targets (closes the rotate-target bypass — see
+/// `check_rate_limit`).
+const DEFAULT_OPERATOR_RATE_LIMIT_MAX: usize = 50;
 /// Sliding window duration in seconds (1 hour).
 const DEFAULT_RATE_LIMIT_WINDOW_SECS: u64 = 3600;
 
@@ -598,21 +605,51 @@ fn check_rate_limit(
     port: u16,
 ) -> Result<(), (StatusCode, String)> {
     use std::time::Instant;
-    let key = format!("{}:{}:{}", op_name, callback, port);
-    let mut entry = st.implant_rate_limiter.entry(key).or_default();
     let now = Instant::now();
     let window = std::time::Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS);
-    entry.retain(|t| now.duration_since(*t) < window);
-    if entry.len() >= DEFAULT_RATE_LIMIT_MAX {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "rate limit exceeded: max {} implants per hour per operator/target",
-                DEFAULT_RATE_LIMIT_MAX
-            ),
-        ));
+    // Two buckets: the per-(operator,target) key keeps the original per-target
+    // cap, and a per-operator-only key bounds ONE identity's total volume
+    // across ALL targets — rotating `callback`/`port` (free-form text) can no
+    // longer reset the window and emit an unbounded number of implants.
+    let buckets = [
+        (
+            format!("{op_name}:{callback}:{port}"),
+            DEFAULT_RATE_LIMIT_MAX,
+        ),
+        (op_name.to_string(), DEFAULT_OPERATOR_RATE_LIMIT_MAX),
+    ];
+    for (key, max) in buckets {
+        let mut fresh = true;
+        if let Some(mut entry) = st.implant_rate_limiter.get_mut(&key) {
+            entry.retain(|t| now.duration_since(*t) < window);
+            if entry.is_empty() {
+                // Fully-expired bucket: drop the KEY (not just its timestamps)
+                // so the DashMap cannot grow without bound on attacker-chosen
+                // key material (rotating callbacks).
+                drop(entry);
+                st.implant_rate_limiter.remove(&key);
+            } else {
+                if entry.len() >= max {
+                    return Err((
+                        StatusCode::TOO_MANY_REQUESTS,
+                        format!(
+                            "rate limit exceeded: max {max} implants per hour per {}",
+                            if max == DEFAULT_RATE_LIMIT_MAX {
+                                "operator/target"
+                            } else {
+                                "operator"
+                            }
+                        ),
+                    ));
+                }
+                entry.push(now);
+                fresh = false;
+            }
+        }
+        if fresh {
+            st.implant_rate_limiter.insert(key, vec![now]);
+        }
     }
-    entry.push(now);
     Ok(())
 }
 

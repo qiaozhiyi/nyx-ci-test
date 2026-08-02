@@ -62,13 +62,17 @@ fn main() -> Result<()> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--pdb-path" => { i += 1; pdb_path = Some(PathBuf::from(&args[i])); }
-            "--guid" => { i += 1; guid = Some(args[i].clone()); }
-            "--age" => { i += 1; age = Some(args[i].parse()?); }
-            "--build" => { i += 1; build = Some(args[i].parse()?); }
-            "--ntoskrnl" => { i += 1; ntoskrnl = Some(PathBuf::from(&args[i])); }
-            "--fltmgr" => { i += 1; fltmgr = Some(PathBuf::from(&args[i])); }
-            "--out" => { i += 1; out = PathBuf::from(&args[i]); }
+            // kernel-tools-8: every value flag used to index args[i+1] without
+            // a bounds check, so `--pdb-path` as the LAST argument panicked
+            // with index-out-of-bounds instead of printing usage. Route all
+            // value reads through flag_value() which errors cleanly.
+            "--pdb-path" => { pdb_path = Some(PathBuf::from(flag_value(&args, i, "--pdb-path")?)); i += 1; }
+            "--guid" => { guid = Some(flag_value(&args, i, "--guid")?); i += 1; }
+            "--age" => { age = Some(flag_value(&args, i, "--age")?.parse()?); i += 1; }
+            "--build" => { build = Some(flag_value(&args, i, "--build")?.parse()?); i += 1; }
+            "--ntoskrnl" => { ntoskrnl = Some(PathBuf::from(flag_value(&args, i, "--ntoskrnl")?)); i += 1; }
+            "--fltmgr" => { fltmgr = Some(PathBuf::from(flag_value(&args, i, "--fltmgr")?)); i += 1; }
+            "--out" => { out = PathBuf::from(flag_value(&args, i, "--out")?); i += 1; }
             "--help" | "-h" => {
                 eprintln!(
                     "Usage: nyx-offset-resolver <source> [--out offsets.toml]\n\
@@ -106,6 +110,14 @@ fn main() -> Result<()> {
         }
         i += 1;
     }
+
+/// Fetch the value following a value-taking flag, failing with a usage-style
+/// error instead of panicking when the flag is the last argument (kernel-tools-8).
+fn flag_value(args: &[String], i: usize, flag: &str) -> Result<String> {
+    args.get(i + 1)
+        .cloned()
+        .ok_or_else(|| anyhow!("flag {flag} needs a value"))
+}
 
     // --ntoskrnl: extract GUID+age from the PE, then behave as --guid/--age.
     if let Some(nk_path) = &ntoskrnl {

@@ -276,10 +276,26 @@ impl Transport for MalleableTransport {
             }
         })?;
 
-        if resp.status().is_server_error() {
-            return Err(TransportError::Transient("malleable send: server error"));
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
         }
-        Ok(())
+        // Non-2xx: the frame was NOT delivered, so this must be an error, not
+        // Ok. Mirrors `health_check`'s classification of the same status
+        // classes (4xx = Dead, 5xx = Transient); a 429 rate-limit is a
+        // transient backoff, not a permanent channel failure. Previously
+        // every non-5xx status fell through to `Ok(())`, silently dropping
+        // the frame while reporting success.
+        match status.as_u16() {
+            429 => Err(TransportError::Transient(
+                "malleable send: rate limited (429)",
+            )),
+            s if (400..=499).contains(&s) => {
+                Err(TransportError::Dead("malleable send: client error"))
+            }
+            // 3xx (redirects exhausted) and 5xx are transient/retryable.
+            _ => Err(TransportError::Transient("malleable send: server error")),
+        }
     }
 
     fn recv(&mut self, timeout_ms: u32) -> Result<Vec<u8>, TransportError> {

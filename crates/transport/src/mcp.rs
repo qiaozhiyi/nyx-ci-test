@@ -152,15 +152,6 @@ impl McpTransport {
         })
     }
 
-    /// Build a JSON-RPC 2.0 request body for a notification (no `id` field).
-    fn notification_body(name: &str, params: serde_json::Value) -> serde_json::Value {
-        ureq::json!({
-            "jsonrpc": JSONRPC_VERSION,
-            "method": name,
-            "params": params,
-        })
-    }
-
     /// Build the `Authorization` header value. Always returns
     /// `Some("Bearer <key>")` because the production constructor requires a key.
     /// The test-only `new_without_auth` constructs an empty `api_key`, which
@@ -293,19 +284,34 @@ impl Transport for McpTransport {
 
     fn health_check(&self) -> Result<u64, TransportError> {
         let start = Instant::now();
-        let body = Self::notification_body(
-            "initialize",
-            ureq::json!({
+        // JSON-RPC 2.0 §2.3: `initialize` MUST be a *request* (with an `id`) —
+        // a notification (no `id`) gets NO response from a spec-compliant
+        // server, so `rpc_call`'s response parse would fail and the probe
+        // could never pass (permanently demoting the MCP slot). Use a
+        // monotonically increasing id like `tool_call_body` does; a fresh id
+        // per probe keeps concurrent probes distinguishable.
+        let body = ureq::json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "method": "initialize",
+            "params": {
                 "protocolVersion": JSONRPC_VERSION,
                 "capabilities": {},
                 "clientInfo": {
                     "name": "mcp-c2-client",
                     "version": "1.0.0",
                 },
-            }),
-        );
+            },
+            "id": self.request_id + 1,
+        });
 
-        self.rpc_call(body)?;
+        let json = self.rpc_call(body)?;
+        // A real `initialize` response carries `result` (with protocolVersion);
+        // anything else means the handshake did not complete.
+        if json.get("result").is_none() {
+            return Err(TransportError::Transient(
+                "MCP initialize response missing result",
+            ));
+        }
         Ok(start.elapsed().as_millis() as u64)
     }
 

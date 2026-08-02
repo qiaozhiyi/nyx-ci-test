@@ -90,6 +90,15 @@ pub trait VulnDriverIoctl: Send + Sync {
     /// Human-readable blocklist status. Logged at bootstrap. Purely informational.
     fn blocklist_status(&self) -> &'static str { "unknown" }
 
+    /// Whether this driver can consume kernel **virtual** addresses — the
+    /// `KernelRw` contract [`ByovdDriver`] exposes. Defaults to `true`;
+    /// physical-address-only drivers (e.g. WDTKernel's MmMapIoSpace primitive)
+    /// override to `false` so `kread`/`kwrite` fail with
+    /// [`KrwError::Unavailable`] instead of a misleading
+    /// [`KrwError::Partial { ok: 0 }`] (kernelsdk-1-6: the permanent
+    /// VA→PA mismatch was previously indistinguishable from a flaky driver).
+    fn supports_va(&self) -> bool { true }
+
     /// The per-driver kernel read/write primitive. `op` selects read vs write.
     /// `kaddr` is a kernel virtual address; `buf` is the user buffer; exactly
     /// `buf.len()` bytes are transferred. On partial failure, returns
@@ -470,6 +479,14 @@ impl KernelRw for ByovdDriver {
         if dst.is_empty() {
             return Ok(());
         }
+        // kernelsdk-1-6: a driver that cannot consume kernel VAs (physical-only
+        // primitive) must surface that permanently as Unavailable, not as a
+        // transient Partial { ok: 0 } that callers would retry forever.
+        if !self.driver.supports_va() {
+            return Err(KrwError::Unavailable(
+                "driver is physical-address-only — kernel-VA reads unsupported",
+            ));
+        }
         // Delegate to the per-driver protocol. The default `raw_rw` implements
         // the RTCore64 byte-loop; iqvw64e / Shield / WdtKernel override it with
         // their own IOCTL contract. This is where the driver-agnostic KernelRw
@@ -483,6 +500,11 @@ impl KernelRw for ByovdDriver {
     fn kwrite(&self, kaddr: usize, src: &[u8]) -> Result<(), KrwError> {
         if src.is_empty() {
             return Ok(());
+        }
+        if !self.driver.supports_va() {
+            return Err(KrwError::Unavailable(
+                "driver is physical-address-only — kernel-VA writes unsupported",
+            ));
         }
         // raw_rw takes &mut [u8] (the same buffer is in/out for some drivers).
         // `src` here is &[u8] — casting it to &mut would alias a shared borrow
@@ -889,6 +911,20 @@ mod tests {
                 0xD3, 0x44
             ]
         );
+    }
+
+    #[test]
+    fn physical_only_driver_reports_va_unsupported() {
+        // kernelsdk-1-6 regression: WdtKernel is a physical-address-only
+        // primitive. `supports_va()` must be false so ByovdDriver's kread/
+        // kwrite fail with KrwError::Unavailable up front instead of a
+        // misleading transient Partial { ok: 0 }.
+        let d = crate::byovd_drivers::wdtkernel::WdtKernel;
+        assert!(!d.supports_va(), "WdtKernel is physical-only");
+        // VA-capable reference drivers must stay true (default).
+        assert!(RtCore64.supports_va());
+        assert!(crate::byovd_drivers::shield::Shield.supports_va());
+        assert!(Iqvw64e.supports_va());
     }
 
     // Re-declare the GUID constant for the test (the real one is in etwti.rs;

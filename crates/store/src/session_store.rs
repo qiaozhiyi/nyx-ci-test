@@ -60,10 +60,11 @@ pub struct SessionRecord {
     pub send_counter: u64,
     /// Highest C2S frame counter received for this session (schema v3+).
     pub last_recv: u64,
-    /// One-time auth token presented at check-in, if any (32 bytes). Persisted
-    /// only so a reconnecting implant with the same key is recognized; by the
-    /// time this is written the token has already been consumed in the
-    /// `implants` table, so this is forensic, not auth state.
+    /// SHA-256 of the one-time auth token presented at check-in, if any (32
+    /// bytes). The RAW token is never persisted here — the server writes only
+    /// the hash (mirroring the `implants` table, which stores the same SHA-256)
+    /// so a leaked DB file yields no replayable token material. Restore never
+    /// replays it, so this column is forensic, not auth state.
     pub auth_token: Option<Vec<u8>>,
 }
 

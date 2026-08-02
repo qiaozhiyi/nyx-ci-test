@@ -163,6 +163,30 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         for t in tasks {
             if matches!(t.command, Command::Exit) {
                 tracing::info!("Exit task received; shutting down");
+                // Final flush: earlier tasks in this same batch may already
+                // have produced responses (download chunks, shell output) that
+                // the top-of-loop send has not carried yet. Best-effort POST
+                // them before exiting — otherwise they are silently lost with
+                // the loop teardown. Counter advances only on success (same
+                // P0-3 discipline as the main loop).
+                if !pending_responses.is_empty() {
+                    let frame = encode_frame(
+                        &pubkey,
+                        counter,
+                        &key,
+                        &encode_batch(&mut pending_responses),
+                    )
+                    .map_err(|e| anyhow::anyhow!("failed to seal final flush frame: {e}"))?;
+                    match ureq::post(&beacon_url).send_bytes(&frame) {
+                        // Loop exits immediately after this flush, so the
+                        // counter is not advanced (dead store otherwise).
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "final flush on exit failed; responses not delivered"
+                        ),
+                    }
+                }
                 return Ok(());
             }
             // A task may yield multiple responses (e.g. a streamed Download or

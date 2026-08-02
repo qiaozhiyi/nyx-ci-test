@@ -9,6 +9,7 @@
  * `ls` task results render as a FileTable whose row actions (进入 / 下载)
  * submit follow-up commands through the `onCommand` prop.
  */
+import { useEffect, useMemo } from 'react';
 import type { JsonCommand, ResultView } from '../lib/types';
 import { FileTable, parseLsLines } from './FileTable';
 import './TaskBlock.css';
@@ -38,6 +39,10 @@ export interface TaskBlockProps {
 export function TaskBlock({ task, onCommand }: TaskBlockProps) {
   const { task_id, command_label, status, results, opsec } = task;
 
+  // `file` results are FileChunks (seq/eof) that arrive across multiple drains;
+  // aggregate them into one download view instead of a line per chunk.
+  const fileChunks = useMemo(() => results.filter((r) => r.kind === 'file'), [results]);
+
   return (
     <div className={`taskblock taskblock--${status}`}>
       <div className="taskblock__head">
@@ -57,14 +62,17 @@ export function TaskBlock({ task, onCommand }: TaskBlockProps) {
 
       {results.length > 0 && (
         <div className="taskblock__body">
-          {results.map((r, i) => (
-            <ResultLine
-              key={`${r.task_id}-${i}-${r.seq ?? 0}`}
-              result={r}
-              commandLabel={command_label}
-              onCommand={onCommand}
-            />
-          ))}
+          {fileChunks.length > 0 && <FileDownloadView chunks={fileChunks} />}
+          {results
+            .filter((r) => r.kind !== 'file')
+            .map((r, i) => (
+              <ResultLine
+                key={`${r.task_id}-${i}-${r.seq ?? 0}`}
+                result={r}
+                commandLabel={command_label}
+                onCommand={onCommand}
+              />
+            ))}
         </div>
       )}
     </div>
@@ -86,9 +94,10 @@ function StatusPill({ status }: { status: TaskEntry['status'] }) {
 
 /**
  * Result renderer for the 7 wire `kind` values.
- * Fully renders: output | bof | ok | error | file; `ls` output goes structured
- * via FileTable when it parses into rows (plain <pre> fallback otherwise).
- * TODO (later agents): image -> screenshot preview, channel -> SOCKS/rportfwd monitor.
+ * Fully renders: output | bof | ok | error | file | image | channel. `ls`
+ * output goes structured via FileTable when it parses into rows (plain <pre>
+ * fallback otherwise); `file` chunks aggregate at the TaskBlock level; `image`
+ * decodes data_hex into an inline preview; `channel` shows a byte counter.
  */
 function ResultLine({
   result,
@@ -130,18 +139,22 @@ function ResultLine({
     case 'error':
       return <pre className="result result--error mono">{result.text}</pre>;
     case 'file':
-      // MVP: plain status. TODO: aggregate FileChunk into a download manager.
+      // FileChunks are aggregated at the TaskBlock level (FileDownloadView);
+      // this branch only fires for stray file results with no data_hex.
       return (
         <div className="result result--file mono">
           文件下载中… {result.text}
         </div>
       );
     case 'image':
-      // TODO: render base64/data_hex into an <img> preview gallery.
-      return <div className="result result--todo mono">[截图] {result.text}</div>;
+      // Screenshots arrive as raw bytes hex-encoded in data_hex (BMP from the
+      // implant's capture_bmp, possibly PNG from other sources). Decode into a
+      // base64 data URL and render an inline preview.
+      return <ImagePreview result={result} />;
     case 'channel':
-      // TODO: SOCKS / reverse-portfwd channel monitor with byte counters.
-      return <div className="result result--todo mono">[通道数据] {result.text}</div>;
+      // SOCKS / reverse-portfwd relay: show the byte count carried by this
+      // frame (data_hex = hex-encoded bytes) plus the server summary text.
+      return <ChannelMonitor result={result} />;
     default:
       // Unknown kind: never silently drop — surface the raw kind so it is visible.
       return (
@@ -150,6 +163,96 @@ function ResultLine({
         </pre>
       );
   }
+}
+
+/* ----------------------------- image / file / channel ---------------------- */
+
+/** Decode a hex string into bytes (valid hex guaranteed by the server). */
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+/** Base64-encode bytes for a data: URL (WebView-safe, no Buffer dependency). */
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+/** Image result renderer: decode data_hex into an inline <img> preview. */
+function ImagePreview({ result }: { result: ResultView }) {
+  const hex = result.data_hex ?? '';
+  if (hex.length < 2) {
+    return <div className="result result--todo mono">[截图] {result.text}</div>;
+  }
+  const bytes = hexToBytes(hex);
+  // BMP magic "BM" (implant capture_bmp), else assume PNG.
+  const mime = bytes.length >= 2 && bytes[0] === 0x42 && bytes[1] === 0x4d ? 'image/bmp' : 'image/png';
+  const src = `data:${mime};base64,${bytesToBase64(bytes)}`;
+  return (
+    <div className="result result--image">
+      <img className="result--image-img" src={src} alt="screenshot" />
+      <div className="result--image-meta mono">{result.text}</div>
+    </div>
+  );
+}
+
+/** Channel result renderer: byte counter monitor for SOCKS/rportfwd frames. */
+function ChannelMonitor({ result }: { result: ResultView }) {
+  const nBytes = result.data_hex ? result.data_hex.length / 2 : 0;
+  return (
+    <div className="result result--channel mono">
+      [通道数据] {result.text}
+      {nBytes > 0 && <span className="result--channel-bytes"> · {nBytes} B</span>}
+    </div>
+  );
+}
+
+/**
+ * FileChunk aggregator: chunks (seq/eof) arrive across several drains; join
+ * them in seq order into one Blob and offer a download link once eof lands.
+ * The Blob URL is created lazily (only on completion) and revoked on unmount.
+ */
+function FileDownloadView({ chunks }: { chunks: ResultView[] }) {
+  const done = chunks.some((c) => c.eof === 1);
+  const totalBytes = chunks.reduce((n, c) => n + (c.data_hex ? c.data_hex.length / 2 : 0), 0);
+  const name = chunks.find((c) => c.text)?.text.replace(/^<chunk\s+/, '').replace(/#\d+>$/, '') ?? 'download';
+
+  const blobUrl = useMemo(() => {
+    if (!done) return null;
+    const ordered = [...chunks].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+    const hex = ordered.map((c) => c.data_hex ?? '').join('');
+    const bytes = hexToBytes(hex);
+    return URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+  }, [chunks, done]);
+
+  // Revoke the object URL when it is replaced or the view unmounts.
+  useEffect(() => () => {
+    if (blobUrl) URL.revokeObjectURL(blobUrl);
+  }, [blobUrl]);
+
+  if (!done) {
+    return (
+      <div className="result result--file mono">
+        文件下载中… {totalBytes.toLocaleString()} B 已接收
+      </div>
+    );
+  }
+  return (
+    <div className="result result--file mono">
+      {blobUrl ? (
+        <a className="result--file-link" href={blobUrl} download={name}>
+          ⬇ 下载 {name}（{totalBytes.toLocaleString()} B）
+        </a>
+      ) : (
+        `文件接收完成（${totalBytes.toLocaleString()} B）`
+      )}
+    </div>
+  );
 }
 
 /* ----------------------------- ls path helpers ----------------------------- */

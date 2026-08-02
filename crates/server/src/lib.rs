@@ -570,16 +570,56 @@ pub fn load_or_create_keypair(
             .as_slice()
             .try_into()
             .map_err(|_| anyhow::anyhow!("keyfile {} is not 32 bytes", path.display()))?;
-        Ok(ServerKeypair::from_secret_bytes(arr))
-    } else {
-        let kp = ServerKeypair::generate()
-            .map_err(|_| anyhow::anyhow!("CSPRNG failure during keypair generation"))?;
-        std::fs::write(path, kp.to_secret_bytes())?;
+        // A truncated-but-32-byte keyfile (crash corruption) silently rotates
+        // the server identity, invalidating every live session and implant
+        // token. An all-zero key is the canonical corruption signature — reject
+        // it loudly instead of using a broken identity.
+        if arr == [0u8; 32] {
+            anyhow::bail!(
+                "keyfile {} is all-zero (corrupted or zeroed); refusing to use a \
+                 broken server identity — restore the keyfile or delete it to \
+                 regenerate (note: regenerating invalidates all sessions)",
+                path.display()
+            );
+        }
+        // Existing-file path: tighten permissions to 0600 (best-effort on
+        // Unix) so a pre-existing loose file (e.g. created under a permissive
+        // umask before this check existed) does not stay world-readable.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
+        Ok(ServerKeypair::from_secret_bytes(arr))
+    } else {
+        let kp = ServerKeypair::generate()
+            .map_err(|_| anyhow::anyhow!("CSPRNG failure during keypair generation"))?;
+        // Atomic create: write to a temp file in the SAME directory, set 0600
+        // on the temp BEFORE renaming it into place, then rename. This avoids
+        // (a) the TOCTOU window where the final path exists with umask-default
+        // perms (previous code chmodded AFTER `fs::write`) and (b) a crash
+        // mid-write corrupting the keyfile at the final path.
+        let tmp = path.with_extension("key.tmp");
+        {
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp)?;
+                f.write_all(&kp.to_secret_bytes())?;
+                f.sync_all()?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::write(&tmp, kp.to_secret_bytes())?;
+            }
+        }
+        std::fs::rename(&tmp, path)?;
         Ok(kp)
     }
 }
@@ -1232,6 +1272,21 @@ fn handle_new_session(
             Some(store) => {
                 match store.get_by_token_hash(&token_hash) {
                     Ok(Some(rec)) => {
+                        // The one-time token is BOUND to the implant it was
+                        // issued to (implant_gen stores `implant_pub` per token
+                        // record). The check-in's claimed pubkey must match:
+                        // a holder of a token extracted from a captured binary
+                        // (or the raw token persisted in the sessions table)
+                        // must not be able to register under an attacker-chosen
+                        // pubkey. Fail closed on mismatch, BEFORE consuming.
+                        if rec.implant_pub != hex::encode(raw.pubkey) {
+                            tracing::warn!(
+                                token_pub = %rec.implant_pub,
+                                claimed_pub = %hex::encode(raw.pubkey),
+                                "auth_token presented for a different implant pubkey — rejecting"
+                            );
+                            anyhow::bail!("auth_token belongs to a different implant pubkey");
+                        }
                         // Token validated — now atomically consume it. The
                         // consume is the anti-replay claim for one-time tokens:
                         // a concurrent check-in carrying the same token loses
@@ -1399,11 +1454,19 @@ fn handle_new_session(
                     // No S2C frame was sent yet, so send_counter is 0.
                     send_counter: 0,
                     last_recv: raw.counter,
-                    // SessionInfo.auth_token is [u8;32]; the store keeps a Vec.
-                    // By the time this row is written the token has already been
-                    // consumed in the `implants` table, so this is forensic, not
-                    // auth state.
-                    auth_token: auth_token.map(|t| t.to_vec()),
+                    // Persist only the SHA-256 of the one-time token — NEVER
+                    // the raw 32 bytes. The `implants` table stores the same
+                    // hash (implant_gen hashes before insert), so a leaked DB
+                    // file (backup / IR copy) yields no replayable token
+                    // material. The restore path never replays it (auth_token
+                    // is set to None there), so this column is forensic, not
+                    // auth state — a hash preserves the forensic linkage
+                    // without exposing the secret.
+                    auth_token: auth_token.map(|t| {
+                        let mut h = sha2::Sha256::new();
+                        h.update(t);
+                        h.finalize().to_vec()
+                    }),
                 });
             }
             // No tasks queued yet — reply with an empty batch.

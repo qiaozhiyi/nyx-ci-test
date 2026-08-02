@@ -175,31 +175,30 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
         None
     };
 
-    let features_bitmap = r.u32().ok().unwrap_or(0);
+    let features_bitmap = r.u32().ok()?;
     // keying_levels is read from the section header (unencrypted) above and is
     // authoritative.  The plaintext copy is consumed for backward compat with
     // older server builds that still embed it, but we discard the value.
-    let _keying_levels_plain = r.u32().ok().unwrap_or(0);
-    let expires_at = r.u64().ok().unwrap_or(0);
+    let _keying_levels_plain = r.u32().ok()?;
+    // implant-beacon-6: a truncated extended tail fails the decode (→ compile-
+    // time config fallback) instead of silently zeroing expires_at — the
+    // kill-date must never be lost without a diagnostic.
+    let expires_at = r.u64().ok()?;
 
     // Channel dispatcher fields (spec-1). Old server-generated configs stop
     // after expires_at — `remaining()==0` → default to Https-only.
     let (primary_channel, fallback_bitmap, doh_resolver, smb_pipe_name, extc2_api_host, extc2_token,
          rotation_hosts, fronting_host, proxy_server) =
         if r.remaining() > 0 {
-            let pc = r.u8().ok().unwrap_or(0);
-            let fb = r.u8().ok().unwrap_or(0);
-            let dr = r.str().ok().unwrap_or_default();
-            let sp = r.str().ok().unwrap_or_default();
-            let eh = r.str().ok().unwrap_or_default();
-            let et = r.str().ok().unwrap_or_default();
+            let pc = r.u8().ok()?;
+            let fb = r.u8().ok()?;
+            let dr = r.str().ok()?;
+            let sp = r.str().ok()?;
+            let eh = r.str().ok()?;
+            let et = r.str().ok()?;
             // spec-7 HTTP enhancement fields — further backward compat layer.
             let (rh, fh, ps) = if r.remaining() > 0 {
-                (
-                    r.str().ok().unwrap_or_default(),
-                    r.str().ok().unwrap_or_default(),
-                    r.str().ok().unwrap_or_default(),
-                )
+                (r.str().ok()?, r.str().ok()?, r.str().ok()?)
             } else {
                 (crate::heap::String::new(), crate::heap::String::new(), crate::heap::String::new())
             };

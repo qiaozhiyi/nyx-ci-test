@@ -15,5 +15,15 @@ export default defineConfig(async () => ({
     target: "es2022",
     minify: "esbuild",
     sourcemap: false,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // three is only used by the lazily-loaded TopologyPage; splitting it
+          // into its own chunk keeps ~600KB of 3D engine out of the initial
+          // bundle while letting TopologyPage's async import pull it on demand.
+          three: ["three"],
+        },
+      },
+    },
   },
 }));

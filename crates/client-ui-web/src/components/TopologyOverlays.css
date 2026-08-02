@@ -141,6 +141,28 @@
   text-transform: uppercase;
   border-radius: var(--r-pill);
 }
+
+/* Operator-local annotations (alias + tags) below the priv pill. */
+.topo-info-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+}
+.topo-info-meta-alias {
+  color: var(--text-faint);
+  font-size: 10.5px;
+  text-decoration: line-through;
+}
+.topo-info-meta-tag {
+  color: var(--accent);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--r-pill);
+  padding: 0 6px;
+  font-size: 10px;
+}
 .topo-info-priv--server {
   color: var(--accent);
   background: var(--accent-bg);

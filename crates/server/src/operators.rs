@@ -130,7 +130,23 @@ fn argon2_instance() -> Argon2<'static> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
-    let params = Params::new(m_cost, t_cost, p_cost, None).expect("argon2 params must be valid");
+    // Params::new returns Err for values that parse but violate argon2's
+    // bounds (e.g. NYX_ARGON2_M=0). NEVER `.expect` here: the server ships
+    // `panic = "abort"`, so a mistyped env var would panic on EVERY
+    // authentication attempt and take the whole control plane down. Fail
+    // SAFE to the OWASP baseline with a clear warning instead.
+    let params = match Params::new(m_cost, t_cost, p_cost, None) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                m_cost, t_cost, p_cost,
+                "invalid NYX_ARGON2_* parameters; falling back to OWASP baseline (65536/3/1)"
+            );
+            Params::new(65536, 3, 1, None)
+                .expect("OWASP baseline argon2 params are valid by construction")
+        }
+    };
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 

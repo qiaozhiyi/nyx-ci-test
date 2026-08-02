@@ -60,6 +60,11 @@ pub fn spawn(app: AppHandle, state: Arc<BackendState>) {
         let mut tick = interval(SESSION_POLL);
         let mut last_sig: Option<String> = None;
         let mut fail_count: u32 = 0;
+        // Emit `nyx://error` at most once per outage: the frontend treats it as
+        // fatal and tears the connection down (see App.tsx onError), so
+        // re-emitting on every subsequent failed tick would just spam while the
+        // poll loop winds down. Reset when a fetch succeeds again.
+        let mut error_reported = false;
 
         loop {
             tick.tick().await;
@@ -68,6 +73,7 @@ pub fn spawn(app: AppHandle, state: Arc<BackendState>) {
             let Some(Connection { server, bearer }) = conn else {
                 // Disconnected — reset signature so next connect re-emits full list.
                 last_sig = None;
+                error_reported = false;
                 continue;
             };
 
@@ -77,6 +83,7 @@ pub fn spawn(app: AppHandle, state: Arc<BackendState>) {
             match rest::fetch_sessions(&client, &server, &bearer).await {
                 Ok(sessions) => {
                     fail_count = 0;
+                    error_reported = false;
                     // Expire pending tasks for sessions that vanished from the
                     // server: their results will never drain, so resolve the
                     // console blocks with a synthetic error instead of hanging.
@@ -94,7 +101,8 @@ pub fn spawn(app: AppHandle, state: Arc<BackendState>) {
                     eprintln!(
                         "[poll] fetch_sessions failed ({fail_count}/{MAX_SESSION_FETCH_FAILURES}): {e}"
                     );
-                    if fail_count >= MAX_SESSION_FETCH_FAILURES {
+                    if fail_count >= MAX_SESSION_FETCH_FAILURES && !error_reported {
+                        error_reported = true;
                         let _ = app.emit("nyx://error", e.to_string());
                     }
                 }

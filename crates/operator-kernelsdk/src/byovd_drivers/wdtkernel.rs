@@ -40,13 +40,16 @@
 //! operational-safety failure (BSOD / corruption), not a soft error.
 //!
 //! Per the BYOVD fix contract ("a clear not-working stub is better than a
-//! silently-wrong implementation"), `raw_rw` therefore returns
-//! `Err(KrwError::Unavailable(...))` rather than pretending. To use WDTKernel
-//! for kernel R/W it must be COMPOSED with a VA→PA step (a DTB page-walk via a
-//! separate primitive, or pairing it with a driver that exposes
-//! `MmGetPhysicalAddress`); the physical-mode helpers below
-//! ([`WdtKernel::phys_read`] / [`WdtKernel::phys_write`]) implement the correct
-//! bulk IOCTL protocol for that composition.
+//! silently-wrong implementation"), this driver overrides
+//! [`VulnDriverIoctl::supports_va`] to `false`, so [`ByovdDriver`]'s
+//! `kread`/`kwrite` return `Err(KrwError::Unavailable(...))` up front — the
+//! permanent VA→PA mismatch is never misreported as a transient partial
+//! transfer (kernelsdk-1-6). To use WDTKernel for kernel R/W it must be
+//! COMPOSED with a VA→PA step (a DTB page-walk via a separate primitive, or
+//! pairing it with a driver that exposes `MmGetPhysicalAddress`); the
+//! physical-mode helpers below ([`WdtKernel::phys_read`] /
+//! [`WdtKernel::phys_write`]) implement the correct bulk IOCTL protocol for
+//! that composition.
 //!
 //! Source: github.com/magicsword-io/LOLDrivers/issues/290
 
@@ -83,10 +86,20 @@ impl VulnDriverIoctl for WdtKernel {
         "CLEAN: not on Microsoft Vulnerable Driver Blocklist as of July 2026. HVCI-compatible (WHQL)."
     }
 
+    /// Physical-address-only primitive: the `KernelRw` VA contract cannot be
+    /// satisfied, so [`ByovdDriver`] fails up front with
+    /// `KrwError::Unavailable` (kernelsdk-1-6) instead of feeding a VA to
+    /// MmMapIoSpace and corrupting random physical RAM.
+    fn supports_va(&self) -> bool {
+        false
+    }
+
     /// KernelRw hands us a kernel VIRTUAL address; WDTKernel can only consume
     /// PHYSICAL addresses (MmMapIoSpace, no VA→PA wrapper). Returning a clear
     /// error here is correct: silently feeding a VA to MmMapIoSpace corrupts
-    /// random physical RAM. See the module doc for the composition story.
+    /// random physical RAM. The VA→PA mismatch is already rejected up front by
+    /// [`ByovdDriver`] via `supports_va() == false`; this is the defense in
+    /// depth in case a caller drives `raw_rw` directly.
     unsafe fn raw_rw(
         &self,
         _op: RwOp,
@@ -96,9 +109,8 @@ impl VulnDriverIoctl for WdtKernel {
         _dioctl: DeviceIoControlFn,
     ) -> Result<(), usize> {
         // Cannot satisfy the VA-based KernelRw contract; signal failure via
-        // the Partial path with ok=0. The caller wraps this as
-        // KrwError::Partial { ok: 0 }; bootstrap surfaces it to the operator
-        // (see the module doc — a clear not-working stub beats a silent one).
+        // the Partial path with ok=0 (the ByovdDriver gate already turned this
+        // into KrwError::Unavailable before raw_rw is reached).
         Err(0)
     }
 }

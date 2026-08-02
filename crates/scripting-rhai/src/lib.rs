@@ -137,6 +137,7 @@ impl RhaiHook {
             .set_max_operations(limits.max_ops_per_dispatch) // per dispatch; 0 = off
             .set_max_string_size(64 * 1024) // no unbounded string concatenation
             .set_max_array_size(4096)
+            .set_max_map_size(4096) // object-map growth (default: unlimited)
             .set_max_variables(512)
             .set_max_functions(64)
             .set_max_expr_depths(32, 32); // expression / statement nesting

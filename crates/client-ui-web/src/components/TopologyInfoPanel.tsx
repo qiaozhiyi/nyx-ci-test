@@ -16,6 +16,7 @@ import { CHANNEL_LABEL } from '../lib/topology-scene';
 import type { SessionView } from '../lib/types';
 import { archName, classifyOs } from '../lib/types';
 import { OS_COLORS, OS_LABELS } from '../lib/os-icons';
+import { useSessionMeta } from '../hooks/sessionMeta';
 import './TopologyOverlays.css';
 
 export interface TopologyInfoPanelProps {
@@ -50,6 +51,11 @@ export function TopologyInfoPanel({
   visible = true,
   onClose,
 }: TopologyInfoPanelProps) {
+  // Operator-local annotations (alias/tags/notes) live in localStorage via
+  // useSessionMeta — the same source SessionTable renders — so a node the
+  // operator annotated in the table shows the same context here.
+  const { meta } = useSessionMeta(session?.id ?? null);
+  const displayName = meta.alias && meta.alias.length > 0 ? meta.alias : session?.hostname ?? node?.label ?? '';
   return (
     <aside
       className={`topo-panel topo-info ${node ? '' : 'topo-info-empty'} ${visible ? 'is-visible' : 'is-hidden'}`}
@@ -84,11 +90,19 @@ export function TopologyInfoPanel({
               {OS_LABELS[session ? classifyOs(session.os) : node.os]}
             </div>
             <h2 className="topo-info-host" title={session ? session.hostname : node.label}>
-              {session ? session.hostname : node.label}
+              {displayName}
             </h2>
             <div className={`topo-info-priv topo-info-priv--${node.priv}`}>
               {PRIV_LABEL[node.priv] ?? node.priv}
             </div>
+            {session && (meta.alias || meta.tags.length > 0) && (
+              <div className="topo-info-meta">
+                {meta.alias && <span className="topo-info-meta-alias mono">{session.hostname}</span>}
+                {meta.tags.map((t) => (
+                  <span key={t} className="topo-info-meta-tag">#{t}</span>
+                ))}
+              </div>
+            )}
           </header>
 
           <dl className="topo-info-grid">

