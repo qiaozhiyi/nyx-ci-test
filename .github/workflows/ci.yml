@@ -184,13 +184,10 @@ jobs:
         run: cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --features selftest --target x86_64-pc-windows-gnu
       - name: Install qiling + run selftest matrix
         run: |
-          # Pin qiling==1.4.6 + capstone (the versions validated locally on
-          # py3.9/3.12): the 2.x arch importer breaks with
-          # QlErrorModuleNotFound (.arch.x86). brew python@3.12 has capstone
-          # wheels; the system 3.14 python does not.
-          brew install python@3.12
-          /opt/homebrew/opt/python@3.12/bin/python3.12 -m venv /tmp/qiling-venv
+          # capstone 5.0.1 imports distutils.sysconfig — REMOVED in Python
+          # 3.12. Use brew python@3.11 (distutils intact), matching the
+          # validated py3.9 environment semantics.
+          brew install python@3.11
+          /opt/homebrew/opt/python@3.11/bin/python3.11 -m venv /tmp/qiling-venv
           /tmp/qiling-venv/bin/pip install -q capstone==5.0.1 qiling==1.4.6
-          # Surface the REAL import error (qiling wraps it as QlErrorModuleNotFound)
-          /tmp/qiling-venv/bin/python -c "import qiling.arch.x86" 2>&1 || true
           /tmp/qiling-venv/bin/python tools/selftest-qiling/runner.py
