@@ -189,5 +189,7 @@ jobs:
           # validated py3.9 environment semantics.
           brew install python@3.11
           /opt/homebrew/opt/python@3.11/bin/python3.11 -m venv /tmp/qiling-venv
-          /tmp/qiling-venv/bin/pip install -q capstone==5.0.1 qiling==1.4.6
+          # qiling 1.4.6 is incompatible with unicorn 2.x (API renames); pin 1.x.
+          /tmp/qiling-venv/bin/pip install -q unicorn==1.0.3 capstone==5.0.1 qiling==1.4.6
+          /tmp/qiling-venv/bin/python -c "import qiling.arch.x86" 2>&1 || true
           /tmp/qiling-venv/bin/python tools/selftest-qiling/runner.py
