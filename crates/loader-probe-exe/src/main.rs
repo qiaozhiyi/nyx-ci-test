@@ -88,8 +88,8 @@ mod veh {
                 let rel = rip.checked_sub(BLOB_BASE).unwrap_or(usize::MAX);
                 let inside = rel < BLOB_LEN;
                 eprintln!(
-                    "[veh] exception 0x{code:08X} at RIP=0x{rip:x}{} blob_rel=0x{rel:x}",
-                    if inside { " (INSIDE BLOB)" } else { "" }
+                    "[veh] exception 0x{code:08X} at RIP=0x{rip:x} base=0x{BLOB_BASE:x} len=0x{BLOB_LEN:x} rel=0x{rel:x}{}",
+                    if inside { " (INSIDE BLOB)" } else if rel == usize::MAX { " (BELOW BLOB — image/other)" } else { " (ABOVE BLOB)" }
                 );
             }
             // Continue searching (default): let the OS terminate as usual.
@@ -121,7 +121,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    println!("[probe] reflective target: {dll_path} ({} bytes)", dll_bytes.len());
+    println!(
+        "[probe] reflective target: {dll_path} ({} bytes)",
+        dll_bytes.len()
+    );
 
     let blob = match nyx_loader::wrap_payload(&dll_bytes, &nyx_loader::LoaderConfig::random()) {
         Ok(b) => b,
@@ -130,13 +133,26 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    println!("[probe] blob: {} bytes (Layer-1 + key + header + ct + Layer-2)", blob.len());
+    println!(
+        "[probe] blob: {} bytes (Layer-1 + key + header + ct + Layer-2)",
+        blob.len()
+    );
 
     // SAFETY: blob is valid for blob.len() bytes; the page is RWX so Layer-2's
     // self-modifying/thunk work is permitted. `exec` below treats it as code.
-    let base = unsafe { VirtualAlloc(std::ptr::null_mut(), blob.len(), MEM_COMMIT_RESERVE, PAGE_EXECUTE_READWRITE) };
+    let base = unsafe {
+        VirtualAlloc(
+            std::ptr::null_mut(),
+            blob.len(),
+            MEM_COMMIT_RESERVE,
+            PAGE_EXECUTE_READWRITE,
+        )
+    };
     if base.is_null() {
-        eprintln!("error: VirtualAlloc failed (last error {})", std::io::Error::last_os_error());
+        eprintln!(
+            "error: VirtualAlloc failed (last error {})",
+            std::io::Error::last_os_error()
+        );
         return ExitCode::from(2);
     }
     // Fault reporting: any AV inside the blob prints the blob-relative offset
@@ -147,6 +163,11 @@ fn main() -> ExitCode {
     }
     veh::install(base as usize, blob.len());
     unsafe { std::ptr::copy_nonoverlapping(blob.as_ptr(), base as *mut u8, blob.len()) };
+    println!(
+        "[probe] blob mapped at 0x{:x} ({} bytes); calling entry...",
+        base as usize,
+        blob.len()
+    );
 
     // Layer-1 self-locates via call/pop, so no args are needed; Layer-2's
     // final `ret` returns to OUR call site with the result in rax.
@@ -154,7 +175,11 @@ fn main() -> ExitCode {
     // self-locating PIC entry (call $+5 at offset 0).
     let entry: extern "C" fn() -> usize = unsafe { std::mem::transmute(base) };
     let rv = entry();
-    println!("[probe] Layer-2 returned 0x{rv:x} ({})", if rv == 0 { "PASS" } else { "FAIL" });
+    println!("[probe] entry RETURNED rv=0x{rv:x}");
+    println!(
+        "[probe] Layer-2 returned 0x{rv:x} ({})",
+        if rv == 0 { "PASS" } else { "FAIL" }
+    );
 
     // SAFETY: page no longer needed; MEM_RELEASE frees the whole allocation.
     unsafe { VirtualFree(base, 0, MEM_RELEASE) };
