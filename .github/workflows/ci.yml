@@ -137,3 +137,19 @@ jobs:
         shell: cmd
         working-directory: crates/client-ui-web
         run: npm run build
+
+  # ---- Gate 5: headless loader probe (Unicorn emu of the real Layer-1 bytes) ----
+  # Runs on ANY host (no Windows needed): executes the LAYER1_BOOTSTRAP bytes in
+  # a Unicorn x86-64 emulator and asserts the magic-present handoff and the
+  # magic-absent bail contracts. Guards against Layer-1 regressions on every PR.
+  loader-emu:
+    name: Loader emu probe
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install unicorn + run probe
+        run: |
+          python3 -m pip install --user -q unicorn
+          python3 tools/loader-emu/loader_emu.py
