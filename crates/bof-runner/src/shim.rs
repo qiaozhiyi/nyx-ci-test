@@ -576,6 +576,15 @@ mod tests {
     /// Rust `&str` fmt (NUL-terminated on the stack), and return the captured
     /// output. Drives every test below.
     fn run_format(args: [u64; 4], fmt: &str) -> String {
+        // Serialize shim tests: the static OUT capture buffer is a
+        // single-threaded contract (see the SAFETY note at the top of this
+        // file), but the default test harness runs tests on many threads —
+        // concurrent run_format calls interleave writes to the shared buffer
+        // (observed on native-Windows CI: a %s test asserting the 4096 cap
+        // read 4178 bytes = its own 4096 plus another test's digits). The
+        // production BOF path runs on one worker thread and is untouched.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap();
         nyx_bof_reset();
         // Put a NUL terminator after the bytes; the fmt string in real BOFs is
         // also NUL-terminated. Capacity +1 guarantees room for it.
