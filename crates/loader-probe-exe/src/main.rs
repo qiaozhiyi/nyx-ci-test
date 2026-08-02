@@ -170,12 +170,28 @@ fn main() -> ExitCode {
         blob.len()
     );
 
-    // Layer-1 self-locates via call/pop, so no args are needed; Layer-2's
-    // final `ret` returns to OUR call site with the result in rax.
-    // SAFETY: base holds the blob bytes, mapped RWX; entry is the documented
-    // self-locating PIC entry (call $+5 at offset 0).
-    let entry: extern "C" fn() -> usize = unsafe { std::mem::transmute(base) };
-    let rv = entry();
+    // Indirect call through raw asm: the compiler inserts a Control Flow
+    // Guard dispatch (_guard_dispatch_icall) for transmuted function pointers
+    // on MSVC builds, and CFG rejects the RWX blob address as an invalid
+    // target — AV 0xC0000005 AT THE CALL SITE (fixed image RIP, both rounds
+    // observed on hosted CI). Raw `call` bypasses the guard; the blob is
+    // self-locating (call $+5; pop rax at offset 0) and Layer-2's final `ret`
+    // returns to OUR call site with the result in rax.
+    //
+    // SAFETY: `base` points at RWX memory holding the blob; the entry is the
+    // documented self-locating PIC entry. Caller-saved registers are
+    // clobbered by the callee; xmm0-5 clobbered defensively (scalar chacha,
+    // but the fixture/selftest DLLs may use SSE in DllMain).
+    let mut rv: usize = 0;
+    unsafe {
+        core::arch::asm!(
+            "call rax",
+            in("rax") base as usize,
+            lateout("rax") rv,
+            out("rcx") _, out("rdx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _, out("xmm4") _, out("xmm5") _,
+        );
+    }
     println!("[probe] entry RETURNED rv=0x{rv:x}");
     println!(
         "[probe] Layer-2 returned 0x{rv:x} ({})",
