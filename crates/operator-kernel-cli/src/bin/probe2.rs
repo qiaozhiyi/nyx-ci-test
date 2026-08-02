@@ -1,4 +1,4 @@
-#![cfg(target_os = "windows")]
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 use std::ffi::c_void;
 
 extern "system" {
@@ -6,6 +6,7 @@ extern "system" {
     fn GetProcAddress(h: *mut c_void, n: *const u8) -> *mut c_void;
 }
 
+#[cfg(target_os = "windows")]
 fn main() {
     let ntdll = unsafe { GetModuleHandleA("ntdll.dll\0".as_ptr()) };
     let init = unsafe { GetProcAddress(ntdll, "LdrSystemDllInitBlock\0".as_ptr()) } as usize;
@@ -21,4 +22,9 @@ fn main() {
         } else { "" };
         println!("  off=0x{off:03x}: va=0x{v1:016x} sz=0x{v2:016x}{tag}");
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!("probe2: Windows-only diagnostic; nothing to do on this host");
 }

