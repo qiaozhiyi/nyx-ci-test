@@ -190,6 +190,8 @@ jobs:
           # pip). This pins the exact locally-validated environment.
           brew install python@3.11
           /opt/homebrew/opt/python@3.11/bin/python3.11 -m venv /tmp/qiling-venv
-          /tmp/qiling-venv/bin/pip install -q setuptools capstone==5.0.1 qiling==1.4.6
+          # setuptools >= 81 removed pkg_resources (which capstone 5.0.1
+          # imports); pin <81 for the validated combo.
+          /tmp/qiling-venv/bin/pip install -q 'setuptools<81' capstone==5.0.1 qiling==1.4.6
           /tmp/qiling-venv/bin/python -c "import qiling.arch.x86" 2>&1 || true
           /tmp/qiling-venv/bin/python tools/selftest-qiling/runner.py
