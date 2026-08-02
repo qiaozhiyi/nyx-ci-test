@@ -108,21 +108,16 @@ jobs:
       # hang in Session 0 / Server-2025 loader quirks), so this works on
       # GitHub-hosted runners — real Windows E2E with zero local hardware.
       #
-      # KNOWN ISSUE (tracked): pic-loader's reflective_load corrupts the stack
-      # on real PEs (fixture + implant DLL; emu passes because its synthetic
-      # env fails reflective_load earlier with 0x3). The probe chain itself
-      # (--layer2-ret round) must pass; the full round is informational until
-      # the reflective_load bug lands.
+      # PASSING since 2026-08-02 (SizeOfImage/optional-header fixes + thread
+      # entry model). HARD gate: fixture + real implant DLL must both return 0.
       - name: Real-machine Layer-2 probe
-        continue-on-error: true
         shell: pwsh
         run: |
           $prevEap = $ErrorActionPreference
           $ErrorActionPreference = 'Continue'
           try {
-            # MSVC enables CET (CETCOMPAT) by default; an indirect call into
-            # the RWX blob (no endbr64) faults AT THE CALL SITE — the fixed
-            # image-RIP AV seen in every round including --layer2-ret. Disable.
+            # MSVC enables CET (CETCOMPAT) by default; the thread-entry model
+            # avoids indirect-call enforcement, but keep the flag off anyway.
             $env:RUSTFLAGS = "-C link-arg=/CETCOMPAT:NO"
             cargo build --release -p nyx-loader-probe-exe 2>&1 | Out-String | Write-Host
             if ($LASTEXITCODE -ne 0) { throw "probe build exited $LASTEXITCODE" }
@@ -135,19 +130,21 @@ jobs:
           if (-not (Test-Path $probe)) { Write-Host "::error::probe exe missing"; exit 1 }
           if (-not (Test-Path $dll)) { Write-Host "::error::implant DLL missing"; exit 1 }
           if (-not (Test-Path $fixture)) { Write-Host "::error::fixture DLL missing"; exit 1 }
-          Write-Host "--- probe round 0: --layer2-ret (probe chain only) ---"
-          & $probe --layer2-ret $fixture
           Write-Host "--- probe round 1: fixture dllmain_ok.dll ---"
           & $probe $fixture
           $fixture_exit = $LASTEXITCODE
           Write-Host "--- probe round 2: real implant DLL ---"
           & $probe $dll
           $dll_exit = $LASTEXITCODE
-          if ($fixture_exit -ne 0 -and $dll_exit -ne 0) {
-            Write-Host "::warning::real-machine Layer-2 probe failed both rounds (fixture=$fixture_exit dll=$dll_exit) — tracked: pic-loader reflective_load stack corruption"
-          } else {
-            Write-Host "::notice::real-machine Layer-2 probe PASSED (fixture=$fixture_exit dll=$dll_exit)"
+          # The fixture's DllMain writes this marker on DLL_PROCESS_ATTACH;
+          # its presence proves DllMain executed inside the reflective load.
+          $marker = "C:\nyx_probe_fixture_loaded.txt"
+          $marker_ok = Test-Path $marker
+          if ($fixture_exit -ne 0 -or $dll_exit -ne 0 -or -not $marker_ok) {
+            Write-Host "::error::real-machine Layer-2 probe FAILED (fixture=$fixture_exit dll=$dll_exit marker=$marker_ok)"
+            exit 1
           }
+          Write-Host "::notice::real-machine Layer-2 probe PASSED (fixture=$fixture_exit dll=$dll_exit DllMain-marker=$marker_ok)"
 
       # ---- 2. User-mode selftests on this kernel ----
       # GATES THE PR. continue-on-error was removed: a selftest that crashes,

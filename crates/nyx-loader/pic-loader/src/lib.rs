@@ -28,6 +28,10 @@
 //!
 //! * `0` on success — the reflective PE load completed and `DllMain` returned.
 //! * `usize::MAX` on Poly1305 tag mismatch — output buffer is zeroed first.
+//! * `1` bootstrap resolution failed (PEB walk / exports).
+//! * `2` output-page VirtualAlloc failed.
+//! * `4..=14` reflective_load stage codes (diagnostics; see the stage
+//!   comments in `reflective_load`).
 //! * `1`/`2`/… — PEB-walk failure, alloc failure, or PE-parse failure.
 //!
 //! The host-side loader probe harness (`tools/loader_probe_dll`) interprets any
