@@ -190,8 +190,11 @@ jobs:
           # pip). This pins the exact locally-validated environment.
           brew install python@3.11
           /opt/homebrew/opt/python@3.11/bin/python3.11 -m venv /tmp/qiling-venv
-          # capstone 5.0.1 has no py3.11 wheel (source build fails to load
-          # via ctypes on arm64); let pip resolve a wheel-capable capstone.
+          # keystone-engine has no py3.11/arm64 wheel and its source-built
+          # dylib fails to load; the runner never assembles, so stub it.
           /tmp/qiling-venv/bin/pip install -q 'setuptools<81' qiling==1.4.6
+          KEYSITE=$(/tmp/qiling-venv/bin/python -c "import site; print(site.getsitepackages()[0])")
+          mkdir -p "$KEYSITE/keystone"
+          cp tools/selftest-qiling/keystone_stub.py "$KEYSITE/keystone/__init__.py"
           /tmp/qiling-venv/bin/python -c "import qiling.arch.x86" 2>&1 || true
           /tmp/qiling-venv/bin/python tools/selftest-qiling/runner.py
