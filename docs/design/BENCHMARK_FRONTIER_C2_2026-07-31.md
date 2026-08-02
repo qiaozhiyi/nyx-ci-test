@@ -65,7 +65,7 @@
 | rhai 全局预算：累计 op 上限（`on_progress` 永不复位）+ 单次派发上限 + 墙钟 + `nyx_log` 频率 | `crates/scripting-rhai/src/` |
 | UI：任务历史 session 级 App store（切会话不清空）+ 结果带 `session_id` + pending 过期合成错误 | `client-ui-web`（CHANGELOG wp-ui） |
 | `nyx-mutate` crate 整体删除 | `Cargo.toml` members、`crates/server/Cargo.toml`（CHANGELOG Removed） |
-| loader fail-loud：`LAYER2_PEB_WALK` 碎片删除，反射加载显式不可交付直至真实 layer-2 存在；`tools/srdi --loader` 强制 `--encrypt`；release 探针门禁 fail-closed | `crates/nyx-loader/src/lib.rs:169-172, 208-211` |
+| **真实反射加载器已接线（2026-08-02 终扫）**：pic-loader（Rust no_std PIC）经 regen.sh 产出 6,080B 零重定位 .bin，`wrap_payload` 按最终布局发射 `[LAYER1+bridge][key][magic|len|nonce][ct||tag][LAYER2]`；LAYER1 桥接寄存器对齐 pic-loader Win64 ABI；**Unicorn 仿真探针**（`tools/loader-emu`，CI Gate 5）在任意宿主执行真实字节：magic 定位/头部解析/DllMain 触发全 PASS；release 门禁 = 仿真探针，零 Windows 依赖 | `crates/nyx-loader/src/on_target.rs`（LAYER1_BOOTSTRAP+bridge）、`pic-loader/regen.sh`、`tools/loader-emu/loader_emu.py` |
 
 **未在本次冲刺闭合、仍属差距的状态（诚实标注）：** 睡眠混淆仍短路到 `beacon::sleep_seconds`（`crates/implant-win/src/kits.rs:39-79` 死路径，Foliage/Fluctuation/mem::mask 未接线）；TLS 指纹 emitter 仍在 `impersonation` feature 后（`crates/transport/src/fingerprint.rs:201-229`，Err stub）；DoH/DNS/LLM 三 Transport 零消费者（仅 Slack/MCP 经 server `TransportStack` 接线）；无持久化、无横向凭据执行（hashdump LSASS 显式 deferred：`crates/implant-win/src/hashdump.rs` method=2 诚实 Err）。
 
@@ -78,7 +78,7 @@
 | 维度（权重） | Nyx | CS 4.13 | BRc4 2.6.3 | 判据要点 |
 |---|---|---|---|---|
 | **端点逃避实装**（15） | **3.0** | **5.0** | **4.5** | Nyx：indirect syscall/SSN 三级回退、BYOUD-Gap CET-safe 栈欺骗、AMSI·ETW 盲打、module stomping+threadless 真装；但睡眠混淆未接线、heap 未 mask、注入面窄。CS：sleepmask 全量重写（代码+heap，100MB）+ BeaconGate RAS + BOF-PE。BRc4：custom-compiler + 模块踩踏 + PEB LDR hook，CET-safe 未证实 |
-| **加载器与投递**（10） | **1.0** | **5.0** | **4.5** | Nyx：加密+组装（sRDI）真，**反射加载 fail-loud**——能力缺失但诚实（LAYER2 碎片已删，`--encrypt` 强制，探针门禁 fail-closed）。CS：UDRL 生态+Arsenal Kit+drip-loading+Payload Store。BRc4：custom-compiler Badger + safe_http 2–3KB PIC 桩 |
+| **加载器与投递**（10） | **3.0** | **5.0** | **4.5** | Nyx：**真实 Layer-2 反射加载已接线并经仿真探针验证**（pic-loader 6,080B .bin、Win64 ABI 桥接、DllMain 触发断言）；缺 CS UDRL 生态/Arsenal Kit 的成熟度与 drip-loading。CS：UDRL 生态+Arsenal Kit+drip-loading+Payload Store。BRc4：custom-compiler Badger + safe_http 2–3KB PIC 桩 |
 | **C2信道与流量仿冒**（10） | **2.0** | **5.0** | **4.0** | Nyx：HTTPS WinHTTP 主信道 + SOCKS pivot；8 信道枚举但 SmbPipe/Tcp 门禁、DoH/DNS/LLM 零消费者；Slack/MCP 经 boot-time TransportStack 接线（HMAC fail-closed）；Malleable 解析+c2lint；TLS emitter 为 stub。CS：HTTPS/DNS/SMB/TCP + UDC2 + profile 运行时覆盖 + WS/gRPC 流。BRc4：多通道 + 2.6 扩展 malleability |
 | **BOF与扩展执行**（10） | **2.0** | **5.0** | **4.5** | Nyx：CS ABI `go(args,alen)` + W^X + RAII 释放 + externals 扩展（kernel32/ntdll 动态解析）+ coff 解析 7 测试；无 async BOF/BOF-PE/Interpreter。CS：BOF+异步 BOF+BOF-PE+Beacon Interpreter（C VM）。BRc4：coffexec_async + dotnet store |
 | **后渗透工具集**（10） | **2.5** | **5.0** | **4.5** | Nyx：28 wire Command——fs/shell/upload/download/FileOp(Ls)/env/clipboard/portscan/net/screenshot/keylog/screenwatch/hashdump(SAM/SYSTEM)/bof/socks/pivot/token 操作/inject；缺持久化、缺 LSASS dump（显式 deferred）。CS：全生态+SSH beacon。BRc4：110+ 命令 + Shadowcloak |

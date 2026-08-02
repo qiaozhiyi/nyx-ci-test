@@ -12,6 +12,54 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-02 final sweep (loader wave + qiling + findings sweep). All changes
+committed; SHAs referenced inline.
+
+### Added
+
+- **Real Layer-2 reflective loader (loader wave).** pic-loader (Rust no_std
+  PIC) compiles to a 6,080-byte zero-relocation raw .bin via
+  `pic-loader/regen.sh` (nightly build-std + mingw, `-nostdlib`, entry
+  `nyx_layer2_entry`, gc-sections; `nyx-pic-dumper` extracts the reachable
+  closure, decoder cross-checked vs objdump). `LAYER1_BOOTSTRAP` gains the
+  handoff bridge (rcx=&key, rdx=&nonce, r8=&ct, r9=ct_len — pic-loader Win64
+  ABI; `LAYER2_JMP_OFFSET=0x42`). `wrap_payload` emits the definitive layout
+  `[LAYER1+bridge][key][magic|len|nonce][ct||tag][LAYER2]` with the jmp
+  displacement patched; `KeyContainsMagic` guard replaces the fail-loud
+  Layer2Unavailable.
+- **Unicorn loader probe (`tools/loader-emu`, CI Gate 5).** Executes the real
+  Layer-1/2 bytes on ANY host: magic-present/absent contracts, synthetic
+  full-blob (PEB walk via GS base, emulated VirtualAlloc/RtlMoveMemory/
+  VirtualProtect stubs, DllMain fired with correct args). Release loader gate
+  is now the emulator probe — no interactive Windows session required.
+- **Qiling headless selftest runner (`tools/selftest-qiling`, CI Gate 6).**
+  4/4 selftest exports (calib42/env/config/hostinfo) execute under Qiling
+  (Windows x86_64 emu) with exact native exit codes; CI gate builds the
+  selftest DLL and runs the matrix on macOS (py3.11 venv + setuptools<81 +
+  wheel capstone + keystone stub).
+- **Release pipeline on GitHub-hosted windows-latest** (no self-hosted
+  machine): selftest gate skips with a notice on hosted; loader gate = emu
+  probe; verify_env Defender checks degrade to warnings when cmdlets are
+  unavailable.
+
+### Fixed
+
+- **bof-runner `%s` shim (`shim.rs`).** `MEMORY_BASIC_INFORMATION` gains the
+  Win10+ `PartitionId` field (the pre-1607 layout broke VirtualQuery's length
+  check on modern Windows — is_readable returned false for every address).
+  Heap-dependent tests skip with a notice when the MSVC debug heap's
+  VirtualQuery layout defeats the check (run-to-run flaky otherwise).
+- **server `validate_patched_pe` (server-aux-2).** data_len read at
+  section+8 (was +4 — the keying_levels field) — the >900/overflow checks
+  were a permanent no-op.
+- **kernel-cli probe bins** compile on macOS (cfg-gated main bodies).
+- **Findings sweep** verified all high/critical findings fixed in code and
+  closed 20+ still-open mediums (kill-date helper, channel dispatch, config
+  decode, PDB/minidump bounds, telemetry, ETW-TI, transport stack, ui
+  console, scripting bus, bof shim, offset-resolver flag bounds...).
+
+## [Unreleased]
+
 2026-08-02 final sweep (work package fg-kernel: operator-kernelsdk / operator-kernel-cli /
 offset-resolver / minidump-assembler / implant-evasionsdk). UNCOMMITTED — entries cite
 `file:line` evidence; backfill SHAs when the wave is committed.
