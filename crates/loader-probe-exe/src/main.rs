@@ -53,6 +53,59 @@ fn main() {
 }
 
 #[cfg(target_os = "windows")]
+mod veh {
+    use std::os::raw::c_void;
+
+    pub type PEXCEPTION_POINTERS = *mut EXCEPTION_POINTERS;
+    #[repr(C)]
+    pub struct EXCEPTION_RECORD {
+        pub exception_code: u32,
+        pub exception_flags: u32,
+        pub exception_record: *mut EXCEPTION_RECORD,
+        pub exception_address: *mut c_void,
+        pub number_parameters: u32,
+        pub exception_information: [usize; 15],
+    }
+    #[repr(C)]
+    pub struct EXCEPTION_POINTERS {
+        pub exception_record: *mut EXCEPTION_RECORD,
+        pub context_record: *mut c_void,
+    }
+
+    extern "system" {
+        pub fn AddVectoredExceptionHandler(first: u32, handler: usize) -> *mut c_void;
+    }
+
+    /// Installs a VEH that prints the faulting RIP (and blob-relative offset)
+    /// before the OS kills the process. Returns the handler address.
+    pub fn install(blob_base: usize, blob_len: usize) -> usize {
+        unsafe extern "system" fn handler(ep: PEXCEPTION_POINTERS) -> i32 {
+            let rec = unsafe { &*(*ep).exception_record };
+            let rip = rec.exception_address as usize;
+            let code = rec.exception_code;
+            // 0xC0000005 = AV; 0xC000001D = illegal instruction; 0xC0000096 = privileged.
+            if matches!(code, 0xC0000005 | 0xC000001D | 0xC0000096) {
+                let rel = rip.checked_sub(BLOB_BASE).unwrap_or(usize::MAX);
+                let inside = rel < BLOB_LEN;
+                eprintln!(
+                    "[veh] exception 0x{code:08X} at RIP=0x{rip:x}{} blob_rel=0x{rel:x}",
+                    if inside { " (INSIDE BLOB)" } else { "" }
+                );
+            }
+            // Continue searching (default): let the OS terminate as usual.
+            0
+        }
+        let h: unsafe extern "system" fn(PEXCEPTION_POINTERS) -> i32 = handler;
+        let addr = h as usize;
+        unsafe { AddVectoredExceptionHandler(1, addr) };
+        addr
+    }
+
+    pub static mut BLOB_BASE: usize = 0;
+    pub static mut BLOB_LEN: usize = 0;
+}
+
+#[cfg(target_os = "windows")]
 fn main() -> ExitCode {
     let dll_path = match std::env::args().nth(1) {
         Some(p) => p,
@@ -86,6 +139,13 @@ fn main() -> ExitCode {
         eprintln!("error: VirtualAlloc failed (last error {})", std::io::Error::last_os_error());
         return ExitCode::from(2);
     }
+    // Fault reporting: any AV inside the blob prints the blob-relative offset
+    // (which stage crashed) before the OS terminates the process.
+    unsafe {
+        veh::BLOB_BASE = base as usize;
+        veh::BLOB_LEN = blob.len();
+    }
+    veh::install(base as usize, blob.len());
     unsafe { std::ptr::copy_nonoverlapping(blob.as_ptr(), base as *mut u8, blob.len()) };
 
     // Layer-1 self-locates via call/pop, so no args are needed; Layer-2's
