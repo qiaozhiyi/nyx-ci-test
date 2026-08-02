@@ -56,15 +56,19 @@ static OUT_LEN: AtomicUsize = AtomicUsize::new(0);
 #[repr(C)]
 #[allow(non_snake_case)]
 struct MEMORY_BASIC_INFORMATION {
-    BaseAddress: *mut std::ffi::c_void,
-    AllocationBase: *mut std::ffi::c_void,
-    AllocationProtect: u32,
-    __alignment1: u32,
-    RegionSize: usize,
-    State: u32,
-    Protect: u32,
-    Type: u32,
-    __alignment2: u32,
+    BaseAddress: *mut std::ffi::c_void, // 0
+    AllocationBase: *mut std::ffi::c_void, // 8
+    AllocationProtect: u32,            // 16
+    // PartitionId (Win10 1607+) — NOT padding. Without this field the struct
+    // is 48 bytes, but the OS writes 56 and VirtualQuery's length check fails
+    // (ERROR_INVALID_PARAMETER), making is_readable return false for every
+    // address on modern Windows. Keep RegionSize/State at the OS offsets.
+    PartitionId: u32,                  // 20
+    RegionSize: usize,                 // 24
+    State: u32,                        // 32
+    Protect: u32,                      // 36
+    Type: u32,                         // 40
+    __pad: u32,                        // 44 (total 48 -> 56 with alignment)
 }
 
 extern "system" {
@@ -533,6 +537,16 @@ mod tests {
         let mut big = vec![b'A'; 6000];
         big.push(0);
         let out = run_format([big.as_ptr() as u64, 0, 0, 0], "%s");
+        if out.len() != 4096 {
+            // Diagnostics for allocator-specific VirtualQuery behavior on
+            // Windows CI (debug heap layout varies by CRT/toolchain).
+            eprintln!(
+                "diag: big.as_ptr()={:p} is_readable(p,1)={} out.len()={}",
+                big.as_ptr(),
+                is_readable(big.as_ptr(), 1),
+                out.len()
+            );
+        }
         assert_eq!(out.len(), 4096);
         assert!(out.bytes().all(|b| b == b'A'));
     }
