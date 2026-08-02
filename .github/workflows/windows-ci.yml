@@ -43,7 +43,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: "OS check"
-        shell: powershell
+        shell: pwsh
         run: |
           $os = Get-CimInstance Win32_OperatingSystem
           Write-Host "Build: $($os.BuildNumber) | $($os.Caption)"
@@ -55,15 +55,15 @@ jobs:
 
       # ---- 1. Build the three binaries ----
       - name: Build implant DLL (nightly)
-        shell: powershell
+        shell: pwsh
         run: |
           # --features selftest: the ~50 nyx_selftest_* rundll32 exports are
           # #[cfg(feature = "selftest")]; without this flag the DLL CI invokes
           # below does not contain them and every test reports "missing entry".
           # Full output — never pipe to Select-Object, so compile errors show.
           #
-          # PS 5.1 NativeCommandError trap: cargo writes compile progress to
-          # stderr (standard Rust behavior), and PS 5.1 treats ANY non-empty
+          # pwsh NativeCommandError trap: cargo writes compile progress to
+          # stderr (standard Rust behavior), and pwsh treats ANY non-empty
           # stderr from a native command as a terminating error → RemoteException
           # → exit 1, even when the build succeeded. The release scripts
           # (scripts/release/build_*.ps1) already solve this with the
@@ -83,9 +83,9 @@ jobs:
           Write-Host "DLL OK: $((Get-Item $dll).Length) bytes"
 
       - name: Build operator CLI + offset-resolver (stable)
-        shell: powershell
+        shell: pwsh
         run: |
-          # Same PS 5.1 NativeCommandError workaround as the implant build above.
+          # Same pwsh NativeCommandError workaround as the implant build above.
           $prevEap = $ErrorActionPreference
           $ErrorActionPreference = 'Continue'
           try {
@@ -113,7 +113,7 @@ jobs:
       # the gate stays HARD on self-hosted interactive machines. Real-machine
       # selftest coverage runs via the P4-P5 workflow.
       - name: Selftest regression (evasion stack)
-        shell: powershell
+        shell: pwsh
         run: |
           if ($env:RUNNER_ENVIRONMENT -eq 'github-hosted') {
             Write-Host "::notice::selftests skipped: GitHub-hosted runner is non-interactive Session 0; rundll32 never reaches the exports (known limitation v0.3.2). Real-machine coverage via P4-P5."
@@ -166,7 +166,7 @@ jobs:
 
       # ---- 3. Live PDB offset resolution (ground-truth verification) ----
       - name: "Live PDB offset resolution (host's own kernel)"
-        shell: powershell
+        shell: pwsh
         run: |
           # Extract the PDB GUID from the host's live ntoskrnl.exe, download
           # the matching PDB from MS symbol server, parse it with our resolver.

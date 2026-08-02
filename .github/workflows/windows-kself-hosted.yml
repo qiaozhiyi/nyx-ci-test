@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: "Environment check (build / Defender / KslD)"
-        shell: powershell
+        shell: pwsh
         run: |
           $os = Get-CimInstance Win32_OperatingSystem
           Write-Host "OS: $($os.Caption) build $($os.BuildNumber)"
@@ -52,7 +52,7 @@ jobs:
           echo BUILD_OK
 
       - name: "Live PDB offset resolution (host build)"
-        shell: powershell
+        shell: pwsh
         run: |
           # One-shot: offset-resolver reads the live ntoskrnl.exe's PE debug
           # dir (goblin), downloads the matching PDB from MS symbol server,

@@ -76,7 +76,7 @@ jobs:
         run: rustup toolchain install 1.96.0 --component clippy --no-self-update
       - name: cargo clippy (workspace, excl. client-ui)
         shell: cmd
-        run: cargo +1.96.0 clippy --locked --workspace --exclude nyx-client-ui --all-targets -- -D warnings
+        run: cargo +1.96.0 clippy --locked --workspace --exclude nyx-client-ui-web --all-targets -- -D warnings
 
   # ---- Gate 3: workspace tests ----
   test:
@@ -91,7 +91,7 @@ jobs:
         run: rustup toolchain install 1.96.0 --no-self-update
       - name: cargo test --workspace (excl. client-ui)
         shell: cmd
-        run: cargo +1.96.0 test --locked --workspace --exclude nyx-client-ui --all-targets
+        run: cargo +1.96.0 test --locked --workspace --exclude nyx-client-ui-web --all-targets
 
   # ---- Gate 4: standalone crates (each has its own [workspace]) ----
   standalone:
