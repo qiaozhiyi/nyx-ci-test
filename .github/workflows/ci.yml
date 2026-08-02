@@ -12,18 +12,14 @@ name: CI
 # The standalone crates ARE tested in the `standalone` job via their own
 # `cargo test --lib` so their 87+53 unit tests are gated too.
 #
-# Runner: self-hosted Windows Server 2019 (build 17763). GitHub-hosted
-# ubuntu/macos runners were retired after a billing block stopped all
-# hosted jobs. macOS coverage is dropped (no Mac self-hosted runner); the
-# Linux-equivalent assertions are covered on Windows since the workspace is
-# pure Rust with no platform-specific gates in these jobs.
+# Runner: GitHub-hosted windows-latest (Server 2025). The workspace is pure
+# Rust with no platform-specific gates in these jobs, so Windows coverage
+# stands in for the whole matrix (macOS assertions are covered by local dev
+# runs and the cross-target implant checks).
 #
-# Toolchains: stable + nightly are pre-installed on the runner via rustup.
-# We call `rustup` directly instead of dtolnay/rust-toolchain — that action
-# requires bash which isn't on the runner service PATH.
+# Toolchains: stable + nightly are installed via rustup in each job.
 #
-# All cargo commands use `shell: cmd` to avoid PowerShell 5.1 treating
-# cargo's stderr progress ("Compiling...") as a NativeCommandError.
+# All cargo commands use `shell: cmd` (available on hosted Windows).
 #
 # Authorized red-team security research project.
 
@@ -33,9 +29,8 @@ on:
   pull_request:
     branches: [main]
 
-# Workflows run on a persistent self-hosted runner. Never execute code from an
-# external fork there: fork PRs are reviewed before a maintainer branch is
-# created, then receive the normal required checks.
+# Workflows run on GitHub-hosted windows-latest. Fork PRs are reviewed before
+# a maintainer branch is created, then receive the normal required checks.
 permissions:
   contents: read
 
@@ -57,7 +52,7 @@ jobs:
   fmt:
     name: Format
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, win-17763]
+    runs-on: windows-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -72,7 +67,7 @@ jobs:
   clippy:
     name: Clippy
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, win-17763]
+    runs-on: windows-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -87,7 +82,7 @@ jobs:
   test:
     name: Test
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, win-17763]
+    runs-on: windows-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -102,7 +97,7 @@ jobs:
   standalone:
     name: Standalone crate tests
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, win-17763]
+    runs-on: windows-latest
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
@@ -130,7 +125,7 @@ jobs:
   ui-build:
     name: UI build
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, win-17763]
+    runs-on: windows-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4

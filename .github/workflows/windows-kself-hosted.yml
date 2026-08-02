@@ -1,17 +1,10 @@
-name: Win KslD (self-hosted 17763)
+name: Win KslD (hosted windows-latest)
 
-# Runs the kernel-tier bypass stack on the self-hosted physical Win Server 2019
-# (build 17763, HVCI off, Defender + KslD running). The runner is registered
-# directly on the host (label: win-17763) — no SSH, no scp, no escaping layer.
-# GitHub dispatches the job to the runner agent; it executes locally.
-#
-# Why this isn't on a GitHub-hosted runner: KslD needs the MpKsl device (a
-# Defender kernel driver), GitHub's Windows runners don't expose it, and even
-# if they did they lack the admin token KslD requires.
-#
-# Why this isn't the old SSH-tunnel workflow: that hit 7 distinct edge cases in
-# the ubuntu→SSH→PowerShell→git stack. A self-hosted runner is the documented,
-# supported path for "run CI on my own machine."
+# Kernel-tier LivingOffDefender smoke: builds the CLI + resolver and attempts
+# the KslD bootstrap. On GitHub-hosted runners the MpKsl device is not exposed
+# and HVCI blocks driver loading, so the bootstrap step self-skips
+# (continue-on-error) — the job still gates the builds and the live-PDB
+# offset resolution against the host's own kernel.
 #
 # Authorized red-team security research.
 
@@ -31,7 +24,7 @@ concurrency:
 
 jobs:
   ksld:
-    runs-on: [self-hosted, win-17763]
+    runs-on: windows-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -58,15 +51,16 @@ jobs:
           cargo build --manifest-path crates/offset-resolver/Cargo.toml
           echo BUILD_OK
 
-      - name: "Live PDB offset resolution (17763 ground truth)"
-        shell: cmd
+      - name: "Live PDB offset resolution (host build)"
+        shell: powershell
         run: |
-          REM One-shot: offset-resolver reads the live ntoskrnl.exe's PE debug
-          REM dir (goblin), downloads the matching PDB from MS symbol server,
-          REM parses EPROCESS + ETW-TI 4-hop chain offsets. No PowerShell PE
-          REM walker — that ate 5 CI iterations on PS 5.1 NativeCommandError.
-          crates\offset-resolver\target\debug\nyx-offset-resolver.exe --ntoskrnl C:\Windows\System32\ntoskrnl.exe --build 17763 --out offsets_17763_live.toml
-          type offsets_17763_live.toml
+          # One-shot: offset-resolver reads the live ntoskrnl.exe's PE debug
+          # dir (goblin), downloads the matching PDB from MS symbol server,
+          # parses EPROCESS + ETW-TI 4-hop chain offsets. The build number is
+          # taken from the registry (never hardcoded).
+          $hostBuild = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuildNumber
+          & crates\offset-resolver\target\debug\nyx-offset-resolver.exe --ntoskrnl C:\Windows\System32\ntoskrnl.exe --build $hostBuild --out offsets_live.toml
+          type offsets_live.toml
 
       - name: "Kernel bootstrap via KslD (Living off the Defender)"
         shell: cmd
