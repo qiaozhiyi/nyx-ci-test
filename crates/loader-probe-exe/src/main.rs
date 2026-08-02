@@ -174,7 +174,8 @@ fn main() -> ExitCode {
     unsafe { veh::IMG_BASE = img_base };
 
     let args: Vec<String> = std::env::args().collect();
-    let dll_path = match args.iter().find(|a| !a.starts_with("--")) {
+    // argv[0] is the probe itself; the first positional after flags is the DLL.
+    let dll_path = match args.iter().skip(1).find(|a| !a.starts_with("--")) {
         Some(p) => p.clone(),
         None => {
             eprintln!("usage: nyx-loader-probe.exe [--layer2-ret] <implant-dll>");
