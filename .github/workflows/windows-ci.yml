@@ -120,13 +120,27 @@ jobs:
           }
           $probe = "target\release\nyx-loader-probe-exe.exe"
           $dll = "crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
+          $fixture = "crates\loader-probe-exe\fixture\dllmain_ok.dll"
           if (-not (Test-Path $probe)) { Write-Host "::error::probe exe missing"; exit 1 }
           if (-not (Test-Path $dll)) { Write-Host "::error::implant DLL missing"; exit 1 }
+          if (-not (Test-Path $fixture)) { Write-Host "::error::fixture DLL missing"; exit 1 }
+          # Round 1: minimal fixture DLL — isolates core decrypt/map from
+          # big-DLL reflective-load complexity.
+          Write-Host "--- probe round 1: fixture dllmain_ok.dll ---"
+          & $probe $fixture
+          $fixture_exit = $LASTEXITCODE
+          Write-Host "--- probe round 2: real implant DLL ---"
           & $probe $dll
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::real-machine Layer-2 probe FAILED (exit $LASTEXITCODE)"
+          $dll_exit = $LASTEXITCODE
+          if ($fixture_exit -ne 0 -and $dll_exit -ne 0) {
+            Write-Host "::error::real-machine Layer-2 probe FAILED both rounds (fixture=$fixture_exit dll=$dll_exit)"
             exit 1
           }
+          if ($fixture_exit -eq 0 -and $dll_exit -ne 0) {
+            Write-Host "::warning::fixture PASSED but real implant DLL probe failed ($dll_exit) — reflective-load issue with the full DLL; core loader is sound"
+            exit 1
+          }
+          Write-Host "::notice::real-machine Layer-2 probe PASSED (fixture=$fixture_exit dll=$dll_exit)"
 
       # ---- 2. User-mode selftests on this kernel ----
       # GATES THE PR. continue-on-error was removed: a selftest that crashes,
