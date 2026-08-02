@@ -14,7 +14,11 @@ pub mod model;
 pub mod session_store;
 pub mod store;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// `PathBuf` is only used by the Unix-only `set_private` helper (set_mode is
+// `std::os::unix`); on Windows the import would be unused under -D warnings.
+#[cfg(unix)]
+use std::path::PathBuf;
 
 pub use implant_store::{ImplantRecord, ImplantStore, ImplantStoreError};
 pub use model::{mask_secret, CredKind, CredRecord};

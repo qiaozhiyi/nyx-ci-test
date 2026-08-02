@@ -232,7 +232,7 @@ jobs:
 
           & $resolver --guid $guid --age $age --build $hostBuild --out offsets_live.toml 2>&1
           if (Test-Path offsets_live.toml) {
-            Write-Host "=== Resolved offsets (live build $hostBuild) ===""
+            Write-Host "=== Resolved offsets (live build $hostBuild) ==="
             Get-Content offsets_live.toml
             $content = Get-Content offsets_live.toml -Raw
             if ($content -notmatch "etw_ti\.provider_block_to_enable_info") {

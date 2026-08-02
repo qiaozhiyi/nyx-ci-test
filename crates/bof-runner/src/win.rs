@@ -285,8 +285,8 @@ fn alloc_tramp_table(
         return None;
     }
     let count = targets.len().min(layout::TRAMP_STUBS_PER_PAGE);
-    // Stubs must never overlap in the shared page.
-    debug_assert!(layout::TRAMP_STUB_STRIDE >= layout::TRAMP_STUB_LEN);
+    // Stubs must never overlap in the shared page: TRAMP_STUB_STRIDE is
+    // TRAMP_STUB_LEN rounded up to 16 bytes, so stride >= len is structural.
     let hint = near_addr.saturating_sub(0x1000_0000); // 256 MiB below
                                                       // SAFETY: `hint` is an arbitrary address, only handed to `VirtualAlloc`;
                                                       // `try_alloc_tramp` documents this contract.
@@ -440,9 +440,9 @@ pub struct ExecResult {
     pub defined: HashMap<String, u64>,
 }
 
-/// Load + run a BOF's `go()`: wire up the externals table (BeaconPrintf shim
-/// + kernel32/ntdll/CRT exports, each through its REL32 trampoline stub),
-/// reset output, call `go(args, alen)`, return captured output.
+/// Load + run a BOF's `go()`: wire up the externals table (the BeaconPrintf
+/// shim plus kernel32/ntdll/CRT exports, each through its REL32 trampoline
+/// stub), reset output, call `go(args, alen)`, return captured output.
 ///
 /// `args` is the packed CS argument blob (`[u32 tag][u32 len][bytes]` per
 /// argument, as produced by `agent-dev`'s `pack_bof_args`); the entry receives it
