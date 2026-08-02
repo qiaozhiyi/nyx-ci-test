@@ -24,7 +24,9 @@
 //! Exit codes: 0 = full E2E passed (DllMain ran); 1 = blob failed;
 //! 2 = usage/build error; 0xE1 = Layer-2 returned non-zero (tag mismatch etc).
 
+#[cfg(target_os = "windows")]
 use std::os::raw::c_void;
+#[cfg(target_os = "windows")]
 use std::process::ExitCode;
 
 #[cfg(target_os = "windows")]
