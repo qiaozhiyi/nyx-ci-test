@@ -167,14 +167,17 @@ jobs:
   selftest-qiling:
     name: Implant selftest via Qiling
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: macos-latest
+    timeout-minutes: 40
     env:
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
-      - name: Install mingw-w64 (Windows GNU linker for the implant build)
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      # macos-latest + brew mingw-w64 reproduces the exact toolchain the runner
+      # was validated against locally (ubuntu's apt mingw 12 links a different
+      # DLL layout that breaks the emulated export walk).
+      - name: Install mingw-w64 (Windows GNU linker)
+        run: brew install mingw-w64
       - name: Install nightly toolchain + Windows GNU target
         run: rustup toolchain install nightly --target x86_64-pc-windows-gnu --no-self-update
       - name: Build selftest DLL
