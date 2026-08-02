@@ -524,13 +524,19 @@ struct ImageOptionalHeaderPe32Plus {
     _size_of_uninit_data: u32,
     address_of_entry_point: u32,
     _base_of_code: u32,
-    // Windows-specific (88 bytes).
+    // Windows-specific (88 bytes). NOTE: the version fields are SIX u16s
+    // (MajorOS/MinorOS/MajorImage/MinorImage/MajorSubsystem/MinorSubsystem)
+    // spanning offsets 40-52; a truncated struct shifted SizeOfImage to offset
+    // 50 (MinorSubsystemVersion, usually 0) — reflective_load read
+    // size_of_image == 0 and rejected every real PE.
     image_base: u64,
     _section_alignment: u32,
     _file_alignment: u32,
     _os_ver: u16,
     _img_ver: u16,
-    _sub_ver: u16,
+    _img_ver_minor: u16,
+    _sub_ver_major: u16,
+    _sub_ver_minor: u16,
     _win32_ver: u32,
     size_of_image: u32,
     size_of_headers: u32,
