@@ -31,3 +31,6 @@ tmp/
 
 # Playwright MCP test artifacts
 .playwright-mcp/
+
+# test fixtures intentionally named *.bin (embed! round-trip)
+!crates/config/tests/fixtures/*.bin
