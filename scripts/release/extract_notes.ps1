@@ -74,8 +74,8 @@ $NOTES_HEADER = @"
 
 ## Build & verification provenance
 
-- **Built on:** self-hosted runner ``[self-hosted, win-17763]`` (Windows Server
-  2019, build 17763).
+- **Built on:** GitHub-hosted ``windows-latest`` runner (Windows Server 2025,
+  build 26100).
 - **Defender posture during build:** MAPSReporting = 0 (no cloud sample upload);
   ExclusionPath covers all build target directories. See ``docs/RELEASE_ENV.md``
   for the reproducible setup steps.
