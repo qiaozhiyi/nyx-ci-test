@@ -153,3 +153,33 @@ jobs:
         run: |
           python3 -m pip install --user -q unicorn
           python3 tools/loader-emu/loader_emu.py
+
+  # ---- Gate 6: implant selftest DLL under Qiling (Windows x86_64 emu) ----
+  # Builds the selftest-flavored implant DLL for the Windows GNU target and
+  # runs tools/selftest-qiling/runner.py, which loads it under Qiling
+  # (Windows/x86_64 emulation) and calls the nyx_selftest_* exports, checking
+  # each one's ExitProcess bitmask. Guards the PEB-walk export resolution and
+  # the syscall-light selftest modules against regressions on every PR.
+  #
+  # RUSTFLAGS is cleared: the workflow-level `-D warnings` env is fine for the
+  # workspace crates but would fail the standalone nightly no_std build on
+  # incidental warnings.
+  selftest-qiling:
+    name: Implant selftest via Qiling
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mingw-w64 (Windows GNU linker for the implant build)
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Install nightly toolchain + Windows GNU target
+        run: rustup toolchain install nightly --target x86_64-pc-windows-gnu --no-self-update
+      - name: Build selftest DLL
+        run: cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --features selftest --target x86_64-pc-windows-gnu
+      - name: Install qiling + run selftest matrix
+        run: |
+          python3 -m pip install --user -q qiling
+          python3 tools/selftest-qiling/runner.py

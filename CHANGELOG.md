@@ -12,6 +12,70 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-02 final sweep (work package fg-kernel: operator-kernelsdk / operator-kernel-cli /
+offset-resolver / minidump-assembler / implant-evasionsdk). UNCOMMITTED — entries cite
+`file:line` evidence; backfill SHAs when the wave is committed.
+
+### Changed
+
+- **offset-resolver: value flags no longer panic on a missing argument
+  (kernel-tools-8).** Every value-taking flag (`--pdb-path`, `--guid`, `--age`,
+  `--build`, `--ntoskrnl`, `--fltmgr`, `--out`) indexed `args[i+1]` without a
+  bounds check, so `nyx-offset-resolver --pdb-path` as the LAST argument
+  panicked with index-out-of-bounds. All value reads now route through a
+  `flag_value()` helper that returns a usage-style error
+  (`crates/offset-resolver/src/main.rs:66-82,110-114`).
+- **minidump-assembler: pid breadcrumb actually encoded (kernel-tools-7).** The
+  API documented pid as recorded in SystemInfo, but `reserved1` was hardcoded 0
+  and the pid discarded. `assemble_minidump` now writes the pid's low 16 bits
+  into `reserved1`'s high 16 bits and a regression test pins it
+  (`crates/minidump-assembler/src/lib.rs:231-244,281-291`).
+- **Single shared CFG-bitmap offset selection (kernel-tools-4).** `nyx-kernel
+  cfg-bypass` (0x40/0x60/0x68) and the standalone `cfg-write` binary
+  (0x40/0xC0/0xC8) maintained divergent mappings for the same
+  LdrSystemDllInitBlock sizes — at most one could be right per build. New
+  `nyx_operator_kernelsdk::cfg::cfg_bitmap_offset()` is the single source of
+  truth; both binaries and `locate_cfg_bitmap` consume it
+  (`crates/operator-kernelsdk/src/cfg.rs:44-58,93`,
+  `crates/operator-kernel-cli/src/bin/cfg-write.rs:38`,
+  `crates/operator-kernel-cli/src/main.rs:368`).
+- **WdtKernel reports its permanent VA→PA mismatch as Unavailable
+  (kernelsdk-1-6).** The physical-only driver's `raw_rw` returned `Err(0)`,
+  which `ByovdDriver` mapped to the transient-looking `KrwError::Partial
+  { ok: 0 }` despite the module doc promising `Unavailable`. `VulnDriverIoctl`
+  now has a `supports_va()` capability (default true); WdtKernel overrides to
+  false and `ByovdDriver::kread/kwrite` fail up front with `Unavailable`
+  (`crates/operator-kernelsdk/src/byovd.rs:98-101,484-490,504-510`,
+  `crates/operator-kernelsdk/src/byovd_drivers/wdtkernel.rs:92-95`).
+- **etwti floor-match stops at the last verified build (kernelsdk-2-5).**
+  `EtwTiOffsets::for_build` mapped ANY build >= 26100 (including unknown future
+  builds) onto the unverified 24H2 `0x070` layout, violating its own "unknown
+  builds return None" contract. `floor_match` now returns `None` above 26200
+  (`crates/operator-kernelsdk/src/etwti.rs:172-188`).
+- **Forged ETW Process Start carries the child PID (kernelsdk-2-7).**
+  `forge_process_create` swallowed `child_pid` and wrote the parent into the
+  header ProcessId; the CLI also fed ASCII bytes into a UNICODE_STRING payload.
+  The header ProcessId is now the child (the event's subject), the parent
+  rides in a new UserData ParentID field, and the CLI encodes the image name as
+  UTF-16LE (`crates/operator-kernelsdk/src/etw_deception.rs:185-191,224-233`,
+  `crates/operator-kernel-cli/src/main.rs:415-426`).
+- **evasionsdk: SleepmaskKit floor is distinguishable (evasionsdk-3).**
+  `sleep_masked` now returns `Result<(), EvasionError>` and the floor returns
+  `NoFloor` instead of silently doing nothing with a `()` signature
+  (`crates/implant-evasionsdk/src/lib.rs:254-262,403-412`).
+- **evasionsdk: MaskToken zeroes its key on drop (evasionsdk-4).** The token's
+  documented "Drop MUST repair" contract is now honest: the seam cannot restore
+  image bytes, but `Drop` wipes the 32-byte RC4 key on every drop path, and the
+  doc says unmask must be called first (`crates/implant-evasionsdk/src/lib.rs`).
+- **evasionsdk: LACUNA chain rotates its backed terminator (evasionsdk-5).**
+  `build_lacuna_chain` pushed `backed[0]` unconditionally despite the doc
+  promising round-robin; it now cycles across the backed pool via an atomic
+  counter, with a regression test
+  (`crates/implant-evasionsdk/src/frame.rs:171-177,296-306`).
+- **evasionsdk: crate status comment updated (evasionsdk-2).** The "Seams only;
+  no real impls yet" claim was stale — 5 of 9 traits have live impls in
+  `implant-win/src/evasion_glue.rs` (`crates/implant-evasionsdk/src/lib.rs:43-49`).
+
 2026-07-31 wave-2 fix sprint (work packages w2-clipboard / w2-ntalloc / w2-channels /
 w2-kernelsdk-core / w2-kernelsdk-net / w2-pdb / w2-quickwins). All changes below are
 UNCOMMITTED in the working tree, so entries cite `file:line` evidence instead of commit
