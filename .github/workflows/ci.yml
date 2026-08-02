@@ -184,12 +184,12 @@ jobs:
         run: cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --features selftest --target x86_64-pc-windows-gnu
       - name: Install qiling + run selftest matrix
         run: |
-          # capstone 5.0.1 imports distutils.sysconfig — REMOVED in Python
-          # 3.12. Use brew python@3.11 (distutils intact), matching the
-          # validated py3.9 environment semantics.
+          set -e
+          # capstone 5.0.1 imports distutils.sysconfig — REMOVED in Python 3.12,
+          # intact in 3.11. qiling 1.4.6 requires unicorn>=2.0.1 (leave it to
+          # pip). This pins the exact locally-validated environment.
           brew install python@3.11
           /opt/homebrew/opt/python@3.11/bin/python3.11 -m venv /tmp/qiling-venv
-          # qiling 1.4.6 is incompatible with unicorn 2.x (API renames); pin 1.x.
-          /tmp/qiling-venv/bin/pip install -q unicorn==1.0.3 capstone==5.0.1 qiling==1.4.6
+          /tmp/qiling-venv/bin/pip install -q capstone==5.0.1 qiling==1.4.6
           /tmp/qiling-venv/bin/python -c "import qiling.arch.x86" 2>&1 || true
           /tmp/qiling-venv/bin/python tools/selftest-qiling/runner.py
