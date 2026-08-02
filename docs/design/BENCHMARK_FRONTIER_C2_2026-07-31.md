@@ -65,7 +65,7 @@
 | rhai 全局预算：累计 op 上限（`on_progress` 永不复位）+ 单次派发上限 + 墙钟 + `nyx_log` 频率 | `crates/scripting-rhai/src/` |
 | UI：任务历史 session 级 App store（切会话不清空）+ 结果带 `session_id` + pending 过期合成错误 | `client-ui-web`（CHANGELOG wp-ui） |
 | `nyx-mutate` crate 整体删除 | `Cargo.toml` members、`crates/server/Cargo.toml`（CHANGELOG Removed） |
-| **真实反射加载器已接线（2026-08-02 终扫）**：pic-loader（Rust no_std PIC）经 regen.sh 产出 6,080B 零重定位 .bin，`wrap_payload` 按最终布局发射 `[LAYER1+bridge][key][magic|len|nonce][ct||tag][LAYER2]`；LAYER1 桥接寄存器对齐 pic-loader Win64 ABI；**Unicorn 仿真探针**（`tools/loader-emu`，CI Gate 5）在任意宿主执行真实字节：magic 定位/头部解析/DllMain 触发全 PASS；release 门禁 = 仿真探针，零 Windows 依赖 | `crates/nyx-loader/src/on_target.rs`（LAYER1_BOOTSTRAP+bridge）、`pic-loader/regen.sh`、`tools/loader-emu/loader_emu.py` |
+| **真实反射加载器接线 + 真机验证（2026-08-02）**：pic-loader（Rust no_std PIC）经 regen.sh 产出零重定位 .bin，`wrap_payload` 按最终布局发射 `[LAYER1+bridge][key][magic|len|nonce][ct||tag][LAYER2]`；LAYER1 桥接对齐 pic-loader Win64 ABI。**真机 E2E 硬门禁**（`crates/loader-probe-exe` + CI）：CreateThread 线程入口执行完整 blob（绕开 CFG/CET 调用点强制），修复 pic-loader 两个真 bug（可选头 SizeOfImage 偏移、PE32+ 版本字段缺失）后，**fixture 与真实 implant DLL 均反射加载成功、DllMain 执行（marker 文件证实）、返回 0**——在免费 GitHub 托管 Windows runner 上运行，零本地硬件。Unicorn 仿真探针（Gate 5）持续守护回归 | `crates/loader-probe-exe/`、`pic-loader/`、`tools/loader-emu/` |
 
 **未在本次冲刺闭合、仍属差距的状态（诚实标注）：** 睡眠混淆仍短路到 `beacon::sleep_seconds`（`crates/implant-win/src/kits.rs:39-79` 死路径，Foliage/Fluctuation/mem::mask 未接线）；TLS 指纹 emitter 仍在 `impersonation` feature 后（`crates/transport/src/fingerprint.rs:201-229`，Err stub）；DoH/DNS/LLM 三 Transport 零消费者（仅 Slack/MCP 经 server `TransportStack` 接线）；无持久化、无横向凭据执行（hashdump LSASS 显式 deferred：`crates/implant-win/src/hashdump.rs` method=2 诚实 Err）。
 
