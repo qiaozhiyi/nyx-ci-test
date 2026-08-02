@@ -12,6 +12,47 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-02 zero-leftover sweep (work packages w-inject / w-misc / w-kernel-relay /
+w-gc / w-transport / w-offsets / w-pattern / w-docs-cleanup). IN PROGRESS — working
+tree, so entries cite `file:line` evidence; backfill SHAs when the wave is committed.
+
+### Fixed
+
+- **Zero-leftover sweep scope (in progress).** Per-package contracts:
+  - w-inject: `module_stomp` owns cleanup — both handles closed + `TerminateProcess`
+    on every non-success path, disarmed-OK path returns Drop-guarded handles
+    (`crates/implant-win/src/inject.rs`); `BeaconInformation` shim rewritten to the CS
+    layout (version@0, pid@4, hostname@8, user@0x10, … isadmin last;
+    `crates/implant-win/src/bof.rs`).
+  - w-misc: keylog dump takes the same claim/lock discipline as the live
+    WH_KEYBOARD_LL writer so it never reads a reserved-but-unwritten slot
+    (`crates/implant-win/src/keylog.rs`); T-REX `assess_kernel` reports an explicit
+    not-assessed/unsupported status instead of a false-clean zeroed report
+    (`crates/implant-win/src/trex/mod.rs`).
+  - w-kernel-relay: `send_op` gains the method field + a daemon neutralize dispatch arm
+    (freeze/choke/kill via the kernelsdk path the CLI uses); kernel audit records the
+    outcome after dispatch; daemon gets per-connection threads + a 16 KiB line cap
+    while keeping the 10s auth-wait (`crates/server/src/kernel.rs`,
+    `crates/operator-kernel-cli/src/main.rs`).
+  - w-gc: session GC switches from snapshot-then-remove to DashMap `remove_if`
+    re-checking the same age/idle + pending-empty predicate under the write lock
+    (`crates/server/src/lib.rs`).
+  - w-transport: `activate()` demotes only on `TransportError::Dead` (Transient/Timeout
+    leave the slot Fresh); the `send()` Timeout retry arm sleeps `RETRY_BACKOFF_MS * attempt`
+    like the Transient arm (`crates/transport/src/stack.rs`).
+  - w-offsets: evasionsdk `offsets_table.rs` becomes the single source of truth for
+    operator-kernelsdk + offset-resolver with a compile-time/test consistency guard
+    (`crates/implant-evasionsdk/src/offsets_table.rs`,
+    `crates/operator-kernelsdk/src/{offsets,etwti}.rs`, `crates/offset-resolver/src/main.rs`).
+  - w-pattern: the notify-array scan pattern is made distinct per target (named
+    constants with the same semantics + a per-target comment)
+    (`crates/operator-kernelsdk/src/pattern_scan.rs`, `crates/operator-kernelsdk/src/win/mod.rs`).
+  - w-docs-cleanup: README.md / docs/README.md / docs/STATUS.md /
+    docs/design/BENCHMARK_FRONTIER_C2_2026-07-31.md reconciled with the current tree
+    (loader real-machine PASS, qiling gate, hosted CI, kernel-cli probe bins on macOS,
+    bof shim skip) — all remaining "gate 关闭"/fail-loud-only loader phrasing removed;
+    root `librust_out.rmeta` deleted.
+
 2026-08-02 final sweep (loader wave + qiling + findings sweep). All changes
 committed; SHAs referenced inline.
 
@@ -19,7 +60,7 @@ committed; SHAs referenced inline.
 
 - **Real Layer-2 reflective loader (loader wave).** pic-loader (Rust no_std
   PIC) compiles to a 6,080-byte zero-relocation raw .bin via
-  `pic-loader/regen.sh` (nightly build-std + mingw, `-nostdlib`, entry
+  `crates/nyx-loader/pic-loader/regen.sh` (nightly build-std + mingw, `-nostdlib`, entry
   `nyx_layer2_entry`, gc-sections; `nyx-pic-dumper` extracts the reachable
   closure, decoder cross-checked vs objdump). `LAYER1_BOOTSTRAP` gains the
   handoff bridge (rcx=&key, rdx=&nonce, r8=&ct, r9=ct_len — pic-loader Win64
@@ -41,6 +82,20 @@ committed; SHAs referenced inline.
   machine): selftest gate skips with a notice on hosted; loader gate = emu
   probe; verify_env Defender checks degrade to warnings when cmdlets are
   unavailable.
+- **Real-machine Layer-2 validation (`crates/loader-probe-exe`, committed
+  `aadf1fc` + probe wave).** The full NYX2 blob executes on a REAL Windows
+  host without rundll32/LoadLibrary (both hang in Session 0): a plain console
+  process `VirtualAlloc`s an RWX page, copies the blob, and runs it as a
+  `CreateThread` thread entry — thread entry bypasses CFG/CET call-site
+  enforcement, which is why the earlier direct-call attempts faulted at a
+  fixed image RIP on hosted CI. A VEH reports the blob-relative RIP on fault.
+  The probe found and fixed two real pic-loader bugs: `SizeOfImage` read at
+  the wrong optional-header offset (now bounded by a 64 MiB cap, not the file
+  size) and missing PE32+ version fields. Result: fixture AND the real implant
+  DLL both reflectively load, DllMain runs (marker verified), Layer-2 returns
+  0 — on a free GitHub-hosted windows-latest runner, zero local hardware. CI
+  now hard-gates on this probe (`43c34be`); the Unicorn emu probe (Gate 5)
+  stays as the cross-host regression guard.
 
 ### Fixed
 
@@ -58,11 +113,10 @@ committed; SHAs referenced inline.
   decode, PDB/minidump bounds, telemetry, ETW-TI, transport stack, ui
   console, scripting bus, bof shim, offset-resolver flag bounds...).
 
-## [Unreleased]
-
-2026-08-02 final sweep (work package fg-kernel: operator-kernelsdk / operator-kernel-cli /
-offset-resolver / minidump-assembler / implant-evasionsdk). UNCOMMITTED — entries cite
-`file:line` evidence; backfill SHAs when the wave is committed.
+2026-08-02 fg-kernel sweep (work package fg-kernel: operator-kernelsdk / operator-kernel-cli /
+offset-resolver / minidump-assembler / implant-evasionsdk). Committed on branch
+`refactor/ah-audit-followups` — the original "UNCOMMITTED" caveat is obsolete; entries cite
+`file:line` evidence, backfill SHAs on tag.
 
 ### Changed
 
@@ -125,9 +179,8 @@ offset-resolver / minidump-assembler / implant-evasionsdk). UNCOMMITTED — entr
   `implant-win/src/evasion_glue.rs` (`crates/implant-evasionsdk/src/lib.rs:43-49`).
 
 2026-07-31 wave-2 fix sprint (work packages w2-clipboard / w2-ntalloc / w2-channels /
-w2-kernelsdk-core / w2-kernelsdk-net / w2-pdb / w2-quickwins). All changes below are
-UNCOMMITTED in the working tree, so entries cite `file:line` evidence instead of commit
-SHAs; backfill SHAs when the wave is committed.
+w2-kernelsdk-core / w2-kernelsdk-net / w2-pdb / w2-quickwins). Committed on branch
+`refactor/ah-audit-followups`; entries cite `file:line` evidence — backfill SHAs on tag.
 
 ### Changed
 
@@ -172,9 +225,9 @@ SHAs; backfill SHAs when the wave is committed.
 2026-07-31 audit-follow-up sprint (branch `refactor/ah-audit-followups`, work packages
 wp-protocol / wp-store / wp-kernel-daemon / wp-loader / wp-implant-core / wp-implant-inject /
 wp-bof-runner / wp-agent-dev / wp-server-a / wp-server-b / wp-ui / wp-scripting /
-wp-config-macros / wp-transport / wp-offsets). All changes below are UNCOMMITTED in the
-working tree, so entries cite `file:line` evidence instead of commit SHAs; backfill SHAs
-when the wave is committed. Central validation: `cargo check`/`cargo test --workspace
+wp-config-macros / wp-transport / wp-offsets). All changes below are committed on branch
+`refactor/ah-audit-followups`; entries cite `file:line` evidence — backfill SHAs on tag.
+Central validation: `cargo check`/`cargo test --workspace
 --exclude nyx-client-ui` all green; standalone `implant-evasionsdk` (54), `operator-kernelsdk`
 (102+8), `minidump-assembler`, `offset-resolver`, `client-ui-web`, and implant-win nightly
 cross-check all pass.
@@ -202,7 +255,9 @@ cross-check all pass.
 - **Kernel daemon auth (wp-kernel-daemon).** `--serve` requires `NYX_DAEMON_TOKEN`
   (exit 7 without it); every connection must open with `auth <token>` (constant-time
   compare); `pid<=0` rejected; per-connection op rate limit
-  (`crates/operator-kernel-cli/src/main.rs:157-177, 536-551`).
+  (`crates/operator-kernel-cli/src/main.rs:161-177, 552-556`; auth answered with
+  `{"ok":true}`, 16 KiB line cap + per-connection threads landed later in the
+  zero-leftover sweep — see that section).
 - **Beacon send/receive discipline (wp-implant-core).** `beacon_send_frame` advances the
   counter and clears pending only after a successful send (P0-3 discipline); S2C replay
   protection via `LAST_SERVER_COUNTER` / `accept_server_counter`; `#[alloc_error_handler]`
@@ -261,11 +316,15 @@ cross-check all pass.
 - **`nyx-mutate` crate deleted (wp-server-b).** Workspace member, dependency, and
   `FEATURE_MUTATE` / `MutationReport` plumbing removed from the server
   (`Cargo.toml` members, `crates/server/Cargo.toml`, `implant_gen.rs`).
-- **nyx-loader `LAYER2_PEB_WALK` fragment deleted (wp-loader).** The broken 65-byte
-  fragment is gone; `generate_loader_stub`/`wrap_payload` now fail loudly (return `Result`)
-  — reflective loading is explicitly not shippable until a real layer-2 exists
-  (`crates/nyx-loader/src/lib.rs:169-172, 208-211`). `tools/srdi --loader` now requires
-  `--encrypt` (inert PIC_STUB path rejected).
+- **nyx-loader `LAYER2_PEB_WALK` placeholder deleted (wp-loader).** The non-functional
+  65-byte placeholder blob is gone, superseded by the real Layer-2
+  (`LAYER2_CODE = include_bytes!("../pic-loader/pic-loader.bin")`,
+  `crates/nyx-loader/src/on_target.rs:262`, appended by `wrap_payload` with the Layer-1
+  `jmp rel32` patched, `lib.rs:230-277` — see the final-sweep Added entry for the loader
+  wave). The interim fail-loud gate is gone with it: `LoaderError` now only reports
+  `KeyContainsMagic` (`lib.rs:131-141`), and `tools/srdi --loader` no longer requires
+  `--encrypt` — the v2 loader path is inherently ChaCha20-Poly1305-encrypted
+  (`tools/srdi/src/main.rs:119-124`).
 
 ### Security
 
@@ -273,7 +332,9 @@ cross-check all pass.
   the Slack relay is enabled — missing, non-hex, or all-zero key is a boot error
   (`crates/server/src/extc2_relay.rs:381-413`).
 - **Fail-closed release probe gate (wp-loader).** A missing or `FAIL` loader probe result
-  blocks release (`scripts/release/*.ps1`).
+  blocks release (`scripts/release/*.ps1`); CI hard gate + DllMain-marker check in
+  `43c34be`, since superseded by the Unicorn emu probe as the release gate — see the
+  final-sweep Added entries.
 - **Token consumption fail-closed (wp-store).** One-time token consume is atomic — a
   `used=0` row with zero rows updated rejects the attempt.
 - **Daemon rate limit + auth (wp-kernel-daemon).** See Changed; unauthenticated or

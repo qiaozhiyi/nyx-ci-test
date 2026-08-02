@@ -358,12 +358,31 @@ pub fn resolve_offsets(
         0
     };
 
-    // Expected RVA ranges (approximate, from known builds).
-    // Process array is typically at a lower RVA than Thread.
-    // These are broad enough to cover UBR drift (~0x8000 bytes).
-    let process_kva = resolve_with_range("PspCreateProcessNotifyRoutine", 0x400_000, 0x600_000);
-    let thread_kva = resolve_with_range("PspCreateThreadNotifyRoutine", 0x400_000, 0x600_000);
-    let image_kva = resolve_with_range("PspLoadImageNotifyRoutine", 0x400_000, 0x600_000);
+    // Fallback expected-RVA bounds for each notify-array target (approximate,
+    // from known builds; broad enough to cover UBR drift ~0x8000 bytes).
+    // Each target gets its OWN named constant even though the values currently
+    // coincide — a build where one array's range drifts must only touch that
+    // target's constant (mirrors the anti-alias rule in pattern_scan.rs for the
+    // shared `4C 8D 35` bytes).
+    const PROCESS_NOTIFY_ARRAY_RANGE: core::ops::Range<u32> = 0x400_000..0x600_000;
+    const THREAD_NOTIFY_ARRAY_RANGE: core::ops::Range<u32> = 0x400_000..0x600_000;
+    const LOAD_IMAGE_NOTIFY_ARRAY_RANGE: core::ops::Range<u32> = 0x400_000..0x600_000;
+
+    let process_kva = resolve_with_range(
+        "PspCreateProcessNotifyRoutine",
+        PROCESS_NOTIFY_ARRAY_RANGE.start,
+        PROCESS_NOTIFY_ARRAY_RANGE.end,
+    );
+    let thread_kva = resolve_with_range(
+        "PspCreateThreadNotifyRoutine",
+        THREAD_NOTIFY_ARRAY_RANGE.start,
+        THREAD_NOTIFY_ARRAY_RANGE.end,
+    );
+    let image_kva = resolve_with_range(
+        "PspLoadImageNotifyRoutine",
+        LOAD_IMAGE_NOTIFY_ARRAY_RANGE.start,
+        LOAD_IMAGE_NOTIFY_ARRAY_RANGE.end,
+    );
     let ps_active_kva = if let Some(&rva) = map.get("PsActiveProcessHead") {
         base + rva as usize
     } else {

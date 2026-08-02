@@ -12,8 +12,16 @@
 //! how silent bugchecks happen. The `_strict` variants take UBR for the
 //! patches that restructured structs mid-build (ETW GUID entry, EPROCESS
 //! Protection position drifted across Win10/11).
+//!
+//! ## Canonical source (w-offsets)
+//! The cross-version rows (Win10 1809 → Win11 25H2 + Server 2019/2022) are
+//! derived at **compile time** from `evasionsdk::offsets_table` — the single
+//! source of truth — so a row/policy change there propagates here
+//! automatically. Only the pre-1809 legacy rows (10240–17134) and the
+//! ring-0-only `peb` offsets live in this crate.
 
 use alloc::vec::Vec;
+use nyx_implant_evasionsdk::offsets_table as ev;
 
 // ============================================================================
 // EPROCESS — build 17763 x64 (struct size 0x850)
@@ -66,6 +74,43 @@ pub struct EprocessBuild {
     pub build: u32,
     pub offsets: EprocessOffsets,
 }
+
+/// Derive an operator-side EPROCESS row from the canonical
+/// `evasionsdk::offsets_table` row for the same build (w-offsets). The 7
+/// shared field offsets are copied verbatim from the canonical row — the
+/// single source of truth — and only `peb` (ring-0-only knowledge the ring-3
+/// canonical table deliberately does not carry) is added here.
+const fn from_canonical(canon: ev::BuildOffsets, peb: usize) -> EprocessBuild {
+    EprocessBuild {
+        build: canon.build,
+        offsets: EprocessOffsets {
+            unique_process_id: canon.eprocess.unique_process_id,
+            active_process_links: canon.eprocess.active_process_links,
+            token: canon.eprocess.token,
+            image_file_name: canon.eprocess.image_file_name,
+            signature_level: canon.eprocess.signature_level,
+            section_signature_level: canon.eprocess.section_signature_level,
+            protection: canon.eprocess.protection,
+            peb,
+        },
+    }
+}
+
+/// Compile-time consistency guard (w-offsets): the canonical-derived rows in
+/// [`KNOWN_EPROCESS_BUILDS`] index into `ev::KNOWN_BUILDS` positionally. If
+/// the canonical table is ever reordered or a row is inserted, these
+/// assertions fail the build instead of silently deriving the wrong build's
+/// offsets.
+const _: () = {
+    assert!(ev::KNOWN_BUILDS[0].build == 17763);
+    assert!(ev::KNOWN_BUILDS[1].build == 18362);
+    assert!(ev::KNOWN_BUILDS[2].build == 19041);
+    assert!(ev::KNOWN_BUILDS[3].build == 20348);
+    assert!(ev::KNOWN_BUILDS[4].build == 22621);
+    assert!(ev::KNOWN_BUILDS[5].build == 22631);
+    assert!(ev::KNOWN_BUILDS[6].build == 26100);
+    assert!(ev::KNOWN_BUILDS[7].build == 26200);
+};
 
 pub const KNOWN_EPROCESS_BUILDS: &[EprocessBuild] = &[
     // Win10 1507 (10240)
@@ -152,118 +197,23 @@ pub const KNOWN_EPROCESS_BUILDS: &[EprocessBuild] = &[
             peb: 0x338, // peb: approximated from build 1607
         },
     },
-    // Win10 1809 / Server 2019 (17763) — code-verified: matches existing offsets.rs
-    EprocessBuild {
-        build: 17763,
-        offsets: EprocessOffsets {
-            unique_process_id: 0x2e0,
-            active_process_links: 0x2e8,
-            token: 0x358,
-            image_file_name: 0x450,
-            signature_level: 0x6c8,
-            section_signature_level: 0x6c9,
-            protection: 0x6ca,
-            peb: 0x3F8,
-        },
-    },
-    // Win10 1903 (18362) — fields shifted +8 from 1809
-    EprocessBuild {
-        build: 18362,
-        offsets: EprocessOffsets {
-            unique_process_id: 0x2e8,
-            active_process_links: 0x2f0,
-            token: 0x360,
-            image_file_name: 0x450,
-            signature_level: 0x6f8,
-            section_signature_level: 0x6f9,
-            protection: 0x6fa,
-            peb: 0x408,
-        },
-    },
-    // Win10 2004 (19041) — same EPROCESS as 1903
-    EprocessBuild {
-        build: 19041,
-        offsets: EprocessOffsets {
-            unique_process_id: 0x2e8,
-            active_process_links: 0x2f0,
-            token: 0x360,
-            image_file_name: 0x450,
-            signature_level: 0x6f8,
-            section_signature_level: 0x6f9,
-            protection: 0x6fa,
-            peb: 0x440,
-        },
-    },
-    // Server 2022 (20348) — major shift: PID→0x440
-    EprocessBuild {
-        build: 20348,
-        offsets: EprocessOffsets {
-            unique_process_id: 0x440,
-            active_process_links: 0x448,
-            token: 0x4b8,
-            image_file_name: 0x5a0,
-            signature_level: 0x878,
-            section_signature_level: 0x879,
-            protection: 0x87a,
-            peb: 0x4C0,
-        },
-    },
-    // Win11 22H2 (22621)
-    EprocessBuild {
-        build: 22621,
-        offsets: EprocessOffsets {
-            unique_process_id: 0x440,
-            active_process_links: 0x448,
-            token: 0x4b8,
-            image_file_name: 0x5a0,
-            signature_level: 0x878,
-            section_signature_level: 0x879,
-            protection: 0x87a,
-            peb: 0x5B8,
-        },
-    },
-    // Win11 23H2 (22631) — same as 22H2
-    EprocessBuild {
-        build: 22631,
-        offsets: EprocessOffsets {
-            unique_process_id: 0x440,
-            active_process_links: 0x448,
-            token: 0x4b8,
-            image_file_name: 0x5a0,
-            signature_level: 0x878,
-            section_signature_level: 0x879,
-            protection: 0x87a,
-            peb: 0x5B8, // peb: approximated from build 22621
-        },
-    },
-    // Win11 24H2 (26100) — CET default, EPROCESS restructured
-    EprocessBuild {
-        build: 26100,
-        offsets: EprocessOffsets {
-            unique_process_id: 0x450,
-            active_process_links: 0x458,
-            token: 0x4c8,
-            image_file_name: 0x5a8,
-            signature_level: 0x87c,
-            section_signature_level: 0x87d,
-            protection: 0x87e,
-            peb: 0x6C8,
-        },
-    },
-    // Win11 25H2 (26200) — same as 24H2
-    EprocessBuild {
-        build: 26200,
-        offsets: EprocessOffsets {
-            unique_process_id: 0x450,
-            active_process_links: 0x458,
-            token: 0x4c8,
-            image_file_name: 0x5a8,
-            signature_level: 0x87c,
-            section_signature_level: 0x87d,
-            protection: 0x87e,
-            peb: 0x6C8,
-        },
-    },
+    // ---- Canonical rows (Win10 1809 → Win11 25H2 + Server 2019/2022) ----
+    //
+    // Derived at compile time from `evasionsdk::offsets_table::KNOWN_BUILDS`
+    // (the SINGLE source of truth for cross-version kernel offsets) via
+    // [`from_canonical`]. The 7 EPROCESS field offsets come from the canonical
+    // row verbatim; `peb` is ring-0-only knowledge, so it stays operator-side
+    // here. The `const _: ()` guard above pins the positional indices to the
+    // canonical build numbers — if the canonical table is reordered or gains a
+    // row, this file stops compiling.
+    from_canonical(ev::KNOWN_BUILDS[0], 0x3F8), // Win10 1809 / Server 2019 (17763)
+    from_canonical(ev::KNOWN_BUILDS[1], 0x408), // Win10 1903 (18362)
+    from_canonical(ev::KNOWN_BUILDS[2], 0x440), // Win10 2004 (19041)
+    from_canonical(ev::KNOWN_BUILDS[3], 0x4C0), // Server 2022 (20348)
+    from_canonical(ev::KNOWN_BUILDS[4], 0x5B8), // Win11 22H2 (22621)
+    from_canonical(ev::KNOWN_BUILDS[5], 0x5B8), // Win11 23H2 (22631)
+    from_canonical(ev::KNOWN_BUILDS[6], 0x6C8), // Win11 24H2 (26100)
+    from_canonical(ev::KNOWN_BUILDS[7], 0x6C8), // Win11 25H2 (26200)
 ];
 
 /// Patch builds whose EPROCESS layout is *verified identical* to a baseline
@@ -272,20 +222,13 @@ pub const KNOWN_EPROCESS_BUILDS: &[EprocessBuild] = &[
 /// allow-list — adding an entry requires confirming (Vergilius / EDRSandblast
 /// CSV) that the layout truly matches. See `offsets_table.rs` for the rationale
 /// against blind floor-matching.
-pub const PATCH_EQUIVALENT_BUILDS: &[(u32, u32)] = &[
-    // Win10 20H2/21H1/21H2/22H2 — enablement packages over 2004 (19041).
-    (19042, 19041),
-    (19043, 19041),
-    (19044, 19041),
-    (19045, 19041),
-    // Win10 1909 (18363) — same EPROCESS as 1903 (18362).
-    (18363, 18362),
-    // Win11 21H2 (22000) — same EPROCESS as Server 2022 (20348).
-    (22000, 20348),
-    // Win11 25H2 (26200) is already in the table (same as 24H2). Future
-    // Insider builds (e.g. 262xx, 263xx) are NOT listed — they return None
-    // from for_build and must go through resolve_eprocess_offsets (probe).
-];
+///
+/// Sourced verbatim from the canonical `evasionsdk::offsets_table` (the
+/// single source of truth, w-offsets) — identical by construction, no
+/// duplicated literals. Future Insider builds (e.g. 262xx, 263xx) are NOT
+/// listed — they return `None` from [`for_build`] and must go through
+/// `resolve_eprocess_offsets` (probe).
+pub const PATCH_EQUIVALENT_BUILDS: &[(u32, u32)] = ev::PATCH_EQUIVALENT_BUILDS;
 
 /// Look up EPROCESS offsets for a Windows build number. Resolution order:
 ///
@@ -1228,12 +1171,16 @@ mod probe_tests {
 }
 
 // ============================================================================
-// Cross-crate offset-table consistency (dev-dep: nyx-implant-evasionsdk)
+// Cross-crate offset-table consistency (dep: nyx-implant-evasionsdk)
 //
-// The implant-side `evasionsdk::offsets_table` is the canonical cross-version
-// kernel offset table. The ring-0 kit (this crate) and the ring-3 implant
-// reading the SAME structure at DIFFERENT offsets is a silent-miss / bugcheck
-// pair, so every build both sides know must resolve to the same patched build.
+// The implant-side `evasionsdk::offsets_table` is the single source of truth
+// for cross-version kernel offsets (w-offsets): the canonical EPROCESS rows
+// above are derived from it at compile time. The ring-0 kit (this crate) and
+// the ring-3 implant reading the SAME structure at DIFFERENT offsets is a
+// silent-miss / bugcheck pair, so every build both sides know must resolve to
+// the same patched build. These tests guard the runtime lookups that are NOT
+// compile-time-derived (legacy pre-1809 rows, patch-equivalent resolution,
+// and the ETW-TI ranges in etwti.rs).
 // ============================================================================
 #[cfg(test)]
 mod cross_crate_table_consistency_tests {
@@ -1246,7 +1193,8 @@ mod cross_crate_table_consistency_tests {
     /// patched build (EPROCESS) / the SAME chase-hop offsets (ETW-TI) on both
     /// sides. Also checks the reverse direction: every build in evasionsdk's
     /// canonical pair list must be resolvable here with the same patched build
-    /// (catches a build added to evasionsdk but not mirrored into this crate).
+    /// (catches a build added to evasionsdk whose ETW-TI range or legacy row
+    /// was not kept in sync here).
     #[test]
     fn kernelsdk_resolves_every_evasionsdk_overlap_to_the_same_patch_build() {
         use nyx_implant_evasionsdk::offsets_table as ev;

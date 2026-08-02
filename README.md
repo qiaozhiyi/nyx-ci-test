@@ -8,7 +8,7 @@
 
 > 📋 **完整审计报告**:[`docs/audits/CODE_TRUTH_2026-07-18.md`](docs/audits/CODE_TRUTH_2026-07-18.md)(逐 crate 证据) · [`AUTHORITATIVE_FACTS_2026-07-18.md`](docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md)(数字基准,所有文档统一来源)
 
-**实测规模**:~68,800 行 Rust · 17 workspace 成员 + 6 独立 crate · 488 `#[test]` · 46 个 selftest 导出 · 28 wire `Command` / 7 `Response` 变体。
+**实测规模**:~68,800 行 Rust · 18 workspace 成员 + 6 独立 crate · 488 `#[test]` · 46 个 selftest 导出 · 28 wire `Command` / 7 `Response` 变体。
 
 ---
 
@@ -76,7 +76,8 @@ crates/
 ├── scripting/             # 脚本事件总线 (237 LOC)
 ├── scripting-rhai/        # Rhai 引擎绑定 (166 LOC, 资源配额)
 ├── config/ + config-macros/  # 编译期加密配置 (ChaCha20-Poly1305, 345 LOC)
-└── nyx-loader/            # PIC payload 加密 (1,225 LOC;🔴 反射加载 gate 关闭—缺真实 layer-2,生成即报错)
+├── loader-probe-exe/        # 真机 Layer-2 反射加载探针 (CreateThread 入口,DllMain marker 验证)
+└── nyx-loader/              # PIC payload 加密 + 反射加载 (3,210 LOC;pic-loader no_std Layer-2,真机验证 PASS)
 ```
 
 > **注**:`implant-win` / `operator-kernelsdk` / `operator-kernel-cli` / `minidump-assembler` / `offset-resolver` / `implant-evasionsdk` 共 6 个 crate 是**独立 crate**(不在 workspace,因 no_std/nightly/Windows target 隔离),单独构建。
@@ -86,7 +87,7 @@ crates/
 | 维度 | 数值 | 来源 |
 |---|---|---|
 | workspace Rust 源码 | 68,751 行 | `find crates -name '*.rs' \| xargs wc -l` |
-| workspace 成员 | 17(+6 独立) | `Cargo.toml [workspace] members` |
+| workspace 成员 | 18(+6 独立) | `Cargo.toml [workspace] members` |
 | `#[test]` / `#[tokio::test]` | 488 | 含独立 crate;`cargo test --workspace` 跑 267(workspace 内) |
 | selftest 导出 | 46 | `implant-win/src/selftests.rs`(`#[cfg(feature="selftest")]`) |
 | wire `Command` 变体 | **28** | `protocol/src/msg.rs:130` |
@@ -210,14 +211,15 @@ curl -X POST http://127.0.0.1:8443/api/generate-implant \
 | `NYX_CREDS` | `~/.nyx/server-creds.db` | 凭据+implant+session SQLite 路径 |
 | `NYX_AUDIT_LOG` | `~/.nyx/audit.jsonl` | 审计日志(哈希链,`audit.rs:106-261`) |
 | `NYX_TEMPLATE` | — | implant DLL 模板路径(启用生成) |
-| `NYX_KERNEL_DAEMON` | — | `host:port` 内核 daemon;设后注册 `/api/kernel/*` 路由 |
+| `NYX_KERNEL_DAEMON` | — | `host:port` 内核 daemon;设后注册 `/api/kernel/*` 路由;配合 `NYX_KERNEL_DAEMON_TOKEN` 使用 |
+| `NYX_KERNEL_DAEMON_TOKEN` | —(bridge 必需) | server→daemon 共享密钥:bridge 每连接首行发 `auth <token>`(daemon 答 `{"ok":true}`);缺省时 bridge 拒绝 op(`server/src/kernel.rs:32,88-98`;镜像 daemon 侧 `NYX_DAEMON_TOKEN`) |
 | `NYX_ALLOW_OPEN` | — | `=1` 允许非 loopback 开放模式 |
 | `NYX_SESSION_MAX_AGE` | `604800`(7d) | session 年龄 GC(豁免近期活跃会话) |
 | `NYX_SESSION_MAX_IDLE` | `86400`(24h) | session 空闲 GC |
 | `NYX_EXTC2_SLACK_TOKEN` / `NYX_EXTC2_SLACK_CHANNEL` | — | Slack ExtC2 中转(bot token + channel);与 HMAC key 三者齐备才启用 |
 | `NYX_EXTC2_SLACK_HMAC_KEY` | —(**启用 Slack 时必需**) | Slack 中转帧 HMAC 密钥(hex,32B);启用 Slack 中转而缺省/非 hex/全零 → **boot 失败**(fail-closed,`extc2_relay.rs:381-413`) |
 | `NYX_EXTC2_MCP_URL` / `NYX_EXTC2_MCP_SESSION` | — | MCP ExtC2 中转(server URL + session) |
-| `NYX_DAEMON_TOKEN` | —(内核 daemon 必需) | 内核 daemon 共享密钥:`--serve` 无此变量 exit 7;每连接首行必须 `auth <token>`(constant-time 比较;`operator-kernel-cli/src/main.rs:157-177`) |
+| `NYX_DAEMON_TOKEN` | —(内核 daemon 必需) | 内核 daemon 共享密钥:`--serve` 无此变量 exit 7;每连接首行必须 `auth <token>`(constant-time 比较,daemon 答 `{"ok":true}`;`operator-kernel-cli/src/main.rs:161-177,552-556`) |
 
 ---
 
@@ -289,7 +291,7 @@ trex                    T-REX EDR 评估分级
 #         pg-window / cfg-bypass / forge-etw / --serve <port>(daemon 模式)
 ```
 
-`--serve <port>` 启动 TCP JSON-line daemon,team server 设 `NYX_KERNEL_DAEMON=127.0.0.1:<port>` 后会注册 `/api/kernel/{status,blind-etw,hide,dump-lsass,neutralize,detach-minifilter}` 6 个路由。
+`--serve <port>` 启动 TCP JSON-line daemon(每连接独立线程,单行 ≤ 16 KiB,60 ops/min 限速),team server 设 `NYX_KERNEL_DAEMON=127.0.0.1:<port>` 后会注册 `/api/kernel/{status,blind-etw,hide,dump-lsass,neutralize,detach-minifilter}` 6 个路由。daemon 要求 `NYX_DAEMON_TOKEN`(缺省 exit 7),每连接首行必须 `auth <token>`(答 `{"ok":true}`);server bridge 侧以 `NYX_KERNEL_DAEMON_TOKEN` 镜像该密钥(`server/src/kernel.rs:32`),`neutralize` op 带 `method: freeze|choke|kill`。
 
 ### 偏移自动解析
 
@@ -368,7 +370,7 @@ cargo clippy --workspace --all-targets
 | **EdrNeutralizer::kill** | 🟡 仅 resolve | 只解析 EPROCESS KVA,不终止目标进程。 |
 | **WdtKernel 驱动** | 🟡 stub | 物理内存 r/w(0x9C412420/0x9C41242C)真,但 VA `raw_rw` 永返 `Err(0)`。 |
 | **etw_deception 事件伪造** | 🟡 死路径 | 完整实现,但无 tier 装配;仅 `operator-kernel-cli forge-etw` 子命令调用。 |
-| **nyx-loader 反射加载** | 🔴 **gate 关闭(规划中)** | `generate_loader_stub`/`wrap_payload` 现在返回 `Result` 并在缺真实 layer-2 时**报错拒绝生成**(`nyx-loader/src/lib.rs:169-172,208-211`),不再产出会 on-target 失败的占位 blob;`tools/srdi --loader` 强制 `--encrypt`;release probe gate fail-closed。layer-2(PEB walk/import resolve/DllMain on-target)尚未实现。 |
+| **nyx-loader 反射加载** | ✅ **已交付(真机验证)** | 真实 Layer-2(pic-loader no_std PIC,`crates/nyx-loader/pic-loader/`)已接线:`wrap_payload` 按最终布局发射 `[LAYER1+bridge][key][magic\|len\|nonce][ct\|\|tag][LAYER2]`(`nyx-loader/src/lib.rs`);**真机 E2E 探针 PASS**(`crates/loader-probe-exe`):CreateThread 线程入口执行完整 blob,fixture 与真实 implant DLL 均反射加载成功、DllMain 执行(marker 证实)、返回 0——在免费 GitHub 托管 windows-latest runner 上运行,零本地硬件;Unicorn 仿真探针(CI Gate 5)+ Qiling selftest 门禁(CI Gate 6)守护回归。 |
 | **implant-evasionsdk trait** | 🟡 9 trait 全 floor(受限交付) | 9 trait 仅 `Floors` no-op impl(`lib.rs:366-413`)。算法子模块(gap/frame/rc4/foliage/apc/swap/offsets_table)真且测试;`offsets_table` 已标记 canonical + pub accessor(`offsets_table.rs:39-44,296,335`),operator-kernelsdk/offset-resolver dev-dep 一致性测试。 |
 | **`mask_secret()`** | ✅ **已修复** | char-based `first2….last2` 掩码 + 非 ASCII 测试(`store/src/model.rs:73-82,108-119`)。 |
 | **SQLite migration** | 🟡 **部分(受限交付)** | schema_version 迁移机制已启用:session_store v→v+1 `ADD COLUMN send_counter/last_recv`;其余表仍以 `CREATE TABLE IF NOT EXISTS` 基线为主。 |
@@ -390,6 +392,7 @@ cargo clippy --workspace --all-targets
 | 同上 | /screenshot 跨会话(Session 0 → 2) | ✅ |
 | 同上 | /hashdump SAM + SYSTEM hive | ✅ |
 | Win11 24H2(build 26100,CI runner) | 编译无回归 | ✅ |
+| GitHub 托管 windows-latest(Server 2025) | 反射加载 blob E2E(fixture + 真实 implant DLL,CreateThread 入口,DllMain marker) | ✅(2026-08-02) |
 | Win11 25H2 CET+HVCI 物理机 | SPOOF_SWAP CET 修复缝 / HVCI 硬件触发 | 🟡 需物理机 |
 | macOS(team server + agent-dev + GUI) | 协议循环 + 操作端 | ✅(本次审计期间实测 server 运行 + 真实 beacon 会话) |
 
@@ -398,7 +401,7 @@ cargo clippy --workspace --all-targets
 ## Roadmap
 
 - **睡眠混淆默认化** — `kits::sleep` 已条件接线(evasion+enabled 时走 `fluctuation::sleep`,`kits.rs:75-81`);待办:noevasion 模式下的安全掩码(helper-thread `.text` 掩码恢复,`mem.rs:249-253`)。
-- **nyx-loader layer-2** — 实现真实 layer-2(PEB walk/import resolve/DllMain on-target);当前 `generate_loader_stub`/`wrap_payload` 在缺 layer-2 时 fail-loud(`nyx-loader/src/lib.rs:169-172`)。
+- **nyx-loader UDRL 强化** — 真实 layer-2 已交付并经真机验证(`crates/loader-probe-exe` CreateThread 探针 + DllMain marker,2026-08-02);待办:PE 头擦除、`.pdata` 处理、section 权限收敛、分段投递(Stage0→Stage1→Stage2,对齐 CS UDRL 生态)。
 - **BOF API 扩面** — 接入 `BeaconDataParse`/`BeaconIsAdmin`/`BeaconGetSpawnTo` 等,提升社区 BOF 兼容性(页释放已由 RAII guard 完成,`win.rs:455-459`)。
 - **transport/ 剩余 4 通道接线** — Slack/MCP 已接 server 中转(boot-time `TransportStack`,`extc2_relay.rs`);待办:malleable/doh_dns/llm_api/smb_pipe 接 server 路由。implant 侧保持自滚通道(no_std PIC 设计,非目标)。
 - **TLS 指纹 emitter 落地** — `impersonation` feature 已提供 BoringSSL(`wreq`)实现(`fingerprint.rs:201-211`);待办:接入 server 出站链路并在默认构建启用。

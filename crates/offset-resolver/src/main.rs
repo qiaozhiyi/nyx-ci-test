@@ -614,30 +614,29 @@ fn parse_pdb_global_rva(data: &[u8], names: &[&str]) -> Result<usize> {
     ))
 }
 
-/// Known offsets per build (mirrors evasionsdk::offsets_table). The PDB walker
-/// will eventually replace this with real parsed values, but this gives a
-/// working end-to-end pipeline today.
+/// Known offsets per build — sourced from the canonical table
+/// (`evasionsdk::offsets_table`, the SINGLE source of truth for cross-version
+/// kernel offsets, w-offsets). The PDB walker replaces this with real parsed
+/// values when a PDB is supplied; this gives a working end-to-end pipeline for
+/// `--build`-only runs.
+///
+/// Resolution follows the canonical table's explicit allow-list policy: exact
+/// `KNOWN_BUILDS` rows + `PATCH_EQUIVALENT_BUILDS` (e.g. 19045 → 19041). Any
+/// other build returns `None` — no range/floor matching, so an unverified
+/// build cannot silently bake a guessed offset into the TOML.
 fn emit_known_offsets(build: u32) -> Option<BTreeMap<&'static str, usize>> {
-    // (pid, links, token, image, sig_level, sec_sig_level, protection, etw_block, etw_enableinfo, etw_isenabled)
-    let (pid, links, token, image, sl, ssl, prot, etw_b, etw_e, etw_ie) = match build {
-        17763 => (0x2e0, 0x2e8, 0x358, 0x450, 0x6c8, 0x6c9, 0x6ca, 0x020, 0x060, 0x000),
-        18362..=19045 => (0x2e8, 0x2f0, 0x360, 0x450, 0x6f8, 0x6f9, 0x6fa, 0x020, 0x060, 0x000),
-        20348..=22000 => (0x440, 0x448, 0x4b8, 0x5a0, 0x878, 0x879, 0x87a, 0x020, 0x060, 0x000),
-        22621..=22631 => (0x440, 0x448, 0x4b8, 0x5a0, 0x878, 0x879, 0x87a, 0x020, 0x070, 0x000),
-        26100..=26200 => (0x450, 0x458, 0x4c8, 0x5a8, 0x87c, 0x87d, 0x87e, 0x020, 0x070, 0x000),
-        _ => return None,
-    };
+    let off = nyx_implant_evasionsdk::offsets_table::for_build(build)?;
     let mut m = BTreeMap::new();
-    m.insert("eprocess.unique_process_id", pid);
-    m.insert("eprocess.active_process_links", links);
-    m.insert("eprocess.token", token);
-    m.insert("eprocess.image_file_name", image);
-    m.insert("eprocess.signature_level", sl);
-    m.insert("eprocess.section_signature_level", ssl);
-    m.insert("eprocess.protection", prot);
-    m.insert("etw_ti.guid_entry_to_provider_block", etw_b);
-    m.insert("etw_ti.provider_block_to_enable_info", etw_e);
-    m.insert("etw_ti.is_enabled_within_enable_info", etw_ie);
+    m.insert("eprocess.unique_process_id", off.eprocess.unique_process_id);
+    m.insert("eprocess.active_process_links", off.eprocess.active_process_links);
+    m.insert("eprocess.token", off.eprocess.token);
+    m.insert("eprocess.image_file_name", off.eprocess.image_file_name);
+    m.insert("eprocess.signature_level", off.eprocess.signature_level);
+    m.insert("eprocess.section_signature_level", off.eprocess.section_signature_level);
+    m.insert("eprocess.protection", off.eprocess.protection);
+    m.insert("etw_ti.guid_entry_to_provider_block", off.etw_ti.guid_entry_to_provider_block);
+    m.insert("etw_ti.provider_block_to_enable_info", off.etw_ti.provider_block_to_enable_info);
+    m.insert("etw_ti.is_enabled_within_enable_info", off.etw_ti.is_enabled_within_enable_info);
     Some(m)
 }
 
@@ -661,9 +660,10 @@ mod tests {
 
     /// The known-offsets rows `--build` emits must agree with the implant-side
     /// canonical table (`evasionsdk::offsets_table`) for every overlapping
-    /// build. The baked offsets are the compile-time primary path, so a row
-    /// that disagrees with the canonical table would ship a wrong offset
-    /// straight into the implant binary.
+    /// build. Since `emit_known_offsets` now sources its rows DIRECTLY from
+    /// the canonical table, this pins the TOML key mapping + the build→row
+    /// resolution rather than the offset values themselves (those cannot
+    /// diverge by construction).
     #[test]
     fn emit_known_offsets_rows_agree_with_evasionsdk_table() {
         // Iterate the canonical build → patched-build map (exact + patch-
@@ -729,6 +729,23 @@ mod tests {
                 ev_off.etw_ti.is_enabled_within_enable_info,
                 "etw is-enabled row mismatch for build {build}"
             );
+        }
+    }
+
+    /// `emit_known_offsets` resolves EXACTLY the canonical build set (explicit
+    /// rows + patch-equivalent builds) — nothing else. Intermediate builds the
+    /// old range-matching arms used to cover (e.g. 19000, 21000, 22632) are
+    /// not verified Windows builds and must return `None` (canonical no-floor
+    /// policy), so a `--build`-only run cannot bake a guessed offset.
+    #[test]
+    fn emit_known_offsets_resolves_only_canonical_builds() {
+        // Canonical exact + patch-equivalent builds resolve.
+        for &b in &[17763, 18362, 19041, 19045, 20348, 22000, 22621, 22631, 26100, 26200] {
+            assert!(emit_known_offsets(b).is_some(), "canonical build {b} must resolve");
+        }
+        // Non-canonical builds (incl. formerly range-matched ones) do not.
+        for &b in &[10240, 14393, 19000, 21000, 22632, 26300, 26999] {
+            assert!(emit_known_offsets(b).is_none(), "non-canonical build {b} must NOT resolve");
         }
     }
 }

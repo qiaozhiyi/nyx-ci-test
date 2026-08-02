@@ -199,13 +199,17 @@ impl TransportStack {
 
     /// Activate slot `idx`: run probe + init if still `Fresh`. Returns `Ok(())`
     /// if the channel is usable, or `Err(TransportError)` if the probe/init
-    /// failed (in which case the slot is demoted).
+    /// failed. Only a `Dead` probe failure demotes the slot: Transient/Timeout
+    /// probe failures leave it `Fresh` so a later send re-probes (a
+    /// slow-but-alive channel must not be skipped until proven dead).
     fn activate(&mut self, idx: usize) -> Result<(), TransportError> {
         let slot = &mut self.slots[idx];
         if slot.state == SlotState::Fresh {
             if slot.transport.requires_probe() {
                 if let Err(error) = slot.transport.health_check() {
-                    slot.state = SlotState::Demoted;
+                    if matches!(error, TransportError::Dead(_)) {
+                        slot.state = SlotState::Demoted;
+                    }
                     return Err(error);
                 }
             }
@@ -314,6 +318,11 @@ impl TransportStack {
                             self.slots[idx].state = SlotState::Burned;
                             break;
                         }
+                        // Same backoff pacing as the Transient arm above so a
+                        // slow channel isn't hammered while it recovers.
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            RETRY_BACKOFF_MS * u64::from(attempt),
+                        ));
                     }
                     Err(TransportError::PayloadTooLarge(n)) => {
                         // Should be impossible post-guard, but if a leaf
@@ -465,6 +474,7 @@ mod tests {
         max_frame: usize,
         send_results: Mutex<Vec<Result<(), TransportError>>>,
         recv_results: Mutex<Vec<Result<Vec<u8>, TransportError>>>,
+        probe_results: Mutex<Vec<Result<u64, TransportError>>>,
         health: Result<u64, TransportError>,
         probe_required: bool,
         send_calls: AtomicU32,
@@ -477,6 +487,7 @@ mod tests {
                 max_frame: 1024 * 1024,
                 send_results: Mutex::new(Vec::new()),
                 recv_results: Mutex::new(Vec::new()),
+                probe_results: Mutex::new(Vec::new()),
                 health: Ok(1),
                 probe_required: false,
                 send_calls: AtomicU32::new(0),
@@ -490,6 +501,13 @@ mod tests {
 
         fn recv_seq(self, results: Vec<Result<Vec<u8>, TransportError>>) -> Self {
             *self.recv_results.lock().unwrap() = results;
+            self
+        }
+
+        /// Queue of health_check results consumed in order; once exhausted,
+        /// `health` is used. Lets tests model a probe that recovers.
+        fn probe_seq(self, results: Vec<Result<u64, TransportError>>) -> Self {
+            *self.probe_results.lock().unwrap() = results;
             self
         }
 
@@ -535,7 +553,12 @@ mod tests {
         }
 
         fn health_check(&self) -> Result<u64, TransportError> {
-            self.health.clone()
+            let mut q = self.probe_results.lock().unwrap();
+            if q.is_empty() {
+                self.health.clone()
+            } else {
+                q.remove(0)
+            }
         }
 
         fn name(&self) -> &'static str {
@@ -681,6 +704,45 @@ mod tests {
             .unwrap();
         stack.send(b"x").unwrap();
         assert_eq!(stack.active_name(), Some("alive"));
+    }
+
+    #[test]
+    fn transient_probe_failure_leaves_slot_fresh_for_reprobe() {
+        // A Transient probe failure must NOT demote: the slot stays Fresh so
+        // the next send re-probes (here the probe then recovers).
+        let flaky = Mock::ok("flaky")
+            .probe(true)
+            .probe_seq(vec![Err(TransportError::Transient("probe timeout"))]);
+        let mut stack = TransportStack::builder().push(flaky).build().unwrap();
+
+        // First send: probe fails Transiently, so activation fails; the slot
+        // is left Fresh but unusable for THIS send → single-channel stack
+        // reports Exhausted.
+        assert!(matches!(stack.send(b"x"), Err(StackError::Exhausted)));
+
+        // Second send: slot still Fresh → re-probed → probe recovers → the
+        // channel activates and the send succeeds.
+        stack.send(b"y").unwrap();
+        assert_eq!(stack.active_name(), Some("flaky"));
+    }
+
+    #[test]
+    fn send_timeout_retries_within_budget_then_succeeds() {
+        // A timed-out send is retried (with backoff) up to the budget and does
+        // not demote the channel; a later success keeps it active.
+        let slow = Mock::ok("slow").send_seq(vec![
+            Err(TransportError::Timeout),
+            Err(TransportError::Timeout),
+            Ok(()),
+        ]);
+        let mut stack = TransportStack::builder()
+            .transient_retries(3)
+            .push(slow)
+            .build()
+            .unwrap();
+
+        stack.send(b"x").unwrap();
+        assert_eq!(stack.active_name(), Some("slow"));
     }
 
     #[test]

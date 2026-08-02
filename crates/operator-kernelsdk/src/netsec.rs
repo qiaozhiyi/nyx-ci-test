@@ -749,6 +749,10 @@ impl EdrNeutralizer {
 }
 
 impl EdrNeutralizeKit for EdrNeutralizer {
+    fn kill_kva(&self, krw: &dyn KernelRw, pid: u32) -> Result<usize, KitError> {
+        self.kill(krw, pid)
+    }
+
     fn neutralize(&self, _pid: u32, m: NeutralizeMethod) -> Result<(), KitError> {
         // Note: the trait doesn't pass a KernelRw. For Kill, the operator
         // should call `EdrNeutralizer::kill(krw, pid)` directly, which

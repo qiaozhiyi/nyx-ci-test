@@ -17,16 +17,15 @@ description = "Nyx operator-side kernel-tier kit seams (P2.2+). Traits + no-op f
 name = "nyx_operator_kernelsdk"
 path = "src/lib.rs"
 
-# No dependencies by design: the seams are pure trait definitions + error
-# types so they can be cross-compiled and reviewed without any toolchain
-# beyond core/alloc. Implementations pull in their own deps (ntapi, windows,
-# pcileech bindings, …) when they are written.
+# Cross-crate offset-table consumption: the implant-side canonical table
+# (evasionsdk::offsets_table) is the SINGLE source of truth — offsets.rs and
+# etwti.rs derive their rows from it (no duplicated offset literals). The
+# dependency is no_std + zero-dep, so the crate stays standalone-buildable
+# (only core/alloc in the toolchain, same as today).
+[dependencies]
+nyx-implant-evasionsdk = { path = "../implant-evasionsdk" }
 
 [dev-dependencies]
 # no_std Mutex for the mock KernelRw in tests (replaces std::sync::Mutex so the
 # crate's mock tests compile + run on the macOS dev host without std).
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
-# Cross-crate offset-table consistency tests: the implant-side canonical table
-# (evasionsdk::offsets_table) is the source of truth; every overlapping build
-# here must resolve to the same patched build.
-nyx-implant-evasionsdk = { path = "../implant-evasionsdk" }

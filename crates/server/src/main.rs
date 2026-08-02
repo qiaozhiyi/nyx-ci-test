@@ -164,8 +164,13 @@ async fn main() -> anyhow::Result<()> {
     // `kernel = None` and the router skips registering those routes entirely.
     let kernel = match std::env::var("NYX_KERNEL_DAEMON") {
         Ok(addr) => {
-            let bridge =
-                nyx_server::kernel::KernelBridge::new(nyx_server::kernel::KernelConfig { addr });
+            // The daemon token (NYX_KERNEL_DAEMON_TOKEN, mirroring the daemon's
+            // NYX_DAEMON_TOKEN) is picked up by KernelConfig::default() — the
+            // bridge refuses ops with a clear error if it is unset.
+            let bridge = nyx_server::kernel::KernelBridge::new(nyx_server::kernel::KernelConfig {
+                addr,
+                ..Default::default()
+            });
             tracing::info!("kernel daemon bridge enabled (NYX_KERNEL_DAEMON)");
             Some(Arc::new(bridge))
         }

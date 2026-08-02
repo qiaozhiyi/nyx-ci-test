@@ -680,8 +680,12 @@ pub fn spawn_session_gc(state: Arc<AppState>) {
         loop {
             interval.tick().await;
             let now = Instant::now();
-            // Collect keys to evict under read-only iteration first (avoids
-            // holding a write-lock while doing duration arithmetic).
+            // Collect candidate keys under read-only iteration first (avoids
+            // holding a write-lock while doing duration arithmetic). This is
+            // only the SNAPSHOT: removal re-checks the predicate atomically
+            // via `remove_if` (below), so a session that checked in or queued
+            // a pending task between the snapshot and the removal is left
+            // alone.
             let evicted: Vec<SessionId> = state
                 .sessions
                 .iter()
@@ -702,8 +706,24 @@ pub fn spawn_session_gc(state: Arc<AppState>) {
                 })
                 .collect();
 
+            let mut evicted_count = 0usize;
             for key in &evicted {
-                if let Some((_, s)) = state.sessions.remove(key) {
+                // `remove_if` re-evaluates the SAME predicate (age/idle +
+                // pending-empty) under the shard write lock, atomically with
+                // the removal — closing the snapshot-then-remove TOCTOU where
+                // a beacon check-in landing between the snapshot and `remove()`
+                // could refresh `last_seen` or queue a pending task and still
+                // get its live session evicted. A candidate that no longer
+                // matches the predicate is simply left in place.
+                let removed = state.sessions.remove_if(key, |_, s| {
+                    let age = now.duration_since(s.created).as_secs();
+                    let idle = now.duration_since(s.last_seen).as_secs();
+                    let too_old = age > max_age && idle > max_idle;
+                    let too_idle = idle > max_idle && s.pending.is_empty();
+                    too_old || too_idle
+                });
+                if let Some((_, s)) = removed {
+                    evicted_count += 1;
                     let age = now.duration_since(s.created).as_secs();
                     let idle = now.duration_since(s.last_seen).as_secs();
                     tracing::info!(
@@ -725,8 +745,8 @@ pub fn spawn_session_gc(state: Arc<AppState>) {
                 }
             }
 
-            if !evicted.is_empty() {
-                tracing::info!(evicted = evicted.len(), "session GC sweep complete");
+            if evicted_count > 0 {
+                tracing::info!(evicted = evicted_count, "session GC sweep complete");
             }
 
             // Fingerprint GC (H4): evict cached inbound TLS fingerprints older

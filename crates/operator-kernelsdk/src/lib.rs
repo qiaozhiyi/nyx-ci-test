@@ -266,6 +266,17 @@ pub enum NeutralizeMethod {
 }
 pub trait EdrNeutralizeKit {
     fn neutralize(&self, pid: u32, m: NeutralizeMethod) -> Result<(), KitError>;
+
+    /// Resolve the target EPROCESS KVA for the Kill tier (kernel
+    /// ZwTerminateProcess via a driver IOCTL / PplStripper flow). The trait
+    /// has no KernelRw param, so this is a separate method; implementations
+    /// without the kernel helper return a clear UnsupportedPosture instead of
+    /// a false success.
+    fn kill_kva(&self, _krw: &dyn KernelRw, _pid: u32) -> Result<usize, KitError> {
+        Err(KitError::UnsupportedPosture(
+            "Kill: this kit implementation has no kernel-r/w Kill tier",
+        ))
+    }
 }
 
 // ---- §3 Persistence / protection ------------------------------------------

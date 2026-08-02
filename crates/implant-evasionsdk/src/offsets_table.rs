@@ -37,13 +37,15 @@
 //! is a bugcheck, so each cites its build.
 //!
 //! ## Canonical source
-//! This module is the **canonical** cross-version kernel offset table for Nyx.
-//! The operator-side mirrors — `operator-kernelsdk::offsets` (EPROCESS) and
-//! `operator-kernelsdk::etwti` (ETW-TI) — and `offset-resolver`'s
-//! `emit_known_offsets` must agree with it on every overlapping build: those
-//! crates dev-depend on this one and run consistency tests that fail when a
-//! build resolves to a different patched build here. When a build row or the
-//! patch-equivalent policy changes, update the mirrors and run those tests.
+//! This module is the **single source of truth** for Nyx's cross-version
+//! kernel offset table (w-offsets). `operator-kernelsdk::offsets` (EPROCESS)
+//! and `operator-kernelsdk::etwti` (ETW-TI) depend on this crate and derive
+//! their rows from [`KNOWN_BUILDS`] / [`PATCH_EQUIVALENT_BUILDS`] — no
+//! duplicated offset literals — and `offset-resolver`'s `emit_known_offsets`
+//! reads the same data. Changing a row or the patch-equivalent policy here
+//! propagates to every consumer automatically; compile-time guards (const
+//! assertions in `operator-kernelsdk::offsets`) + cross-crate consistency
+//! tests fail loudly if a consumer's derivation ever diverges.
 //!
 //! ## Layout stability (what does NOT drift)
 //! - x64 PEB layout (gs:[0x60], ImageBaseAddress@0x10, BeingDebugged@0x02,
@@ -330,8 +332,9 @@ pub fn for_build_strict(build: u32, ubr: u32) -> Option<EtwTiOffsets> {
 /// patch build maps to its baseline (e.g. `(19045, 19041)`).
 ///
 /// This is the canonical build → patched-build map: `operator-kernelsdk` and
-/// `offset-resolver` dev-depend on this crate and assert their own tables
-/// resolve every overlapping build to the SAME patched build listed here.
+/// `offset-resolver` consume this crate (regular dependency, w-offsets) and
+/// derive / assert their rows resolve every overlapping build to the SAME
+/// patched build listed here.
 pub fn known_builds() -> &'static [(u32, u32)] {
     // Exact rows: a build resolves to itself (mirrors KNOWN_BUILDS).
     &[

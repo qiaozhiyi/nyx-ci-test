@@ -156,26 +156,37 @@ pub fn resolve_rva_in_range(
 // Format: [byte, byte, None(wildcard), ...] + disp_offset = where the
 // lea's disp32 starts within the matched bytes.
 
-/// Reference site for `PspCreateProcessNotifyRoutine`.
+/// Reference site for `PspCreateProcessNotifyRoutine` — scans the **Process**
+/// notify-array target in the ntoskrnl image.
 /// In ntoskrnl, `PspCallProcessNotifyRoutines` does:
 ///   `lea r14, [rip + disp32]  ; PspCreateProcessNotifyRoutine`
 ///   `mov ecx, <count>`
 /// The surrounding bytes are stable across builds.
+///
+/// ⚠ This byte encoding is currently IDENTICAL to
+/// [`PSP_CREATE_THREAD_NOTIFY_ROUTINE`], but the two reference DIFFERENT
+/// globals and are disambiguated by RVA range at the call site. Keep them as
+/// separate named constants — do NOT merge them — so a future build where one
+/// reference changes encoding only affects that target's constant.
 pub const PSP_CREATE_PROCESS_NOTIFY_ROUTINE: RefSite = RefSite {
     // 4C 8D 35 ?? ?? ?? ??  ; lea r14, [rip+disp32]
     pattern: &[Some(0x4C), Some(0x8D), Some(0x35), None, None, None, None],
     disp_offset: 3, // disp32 starts at byte 3 of the lea instruction
 };
 
-/// Reference site for `PspCreateThreadNotifyRoutine`.
+/// Reference site for `PspCreateThreadNotifyRoutine` — scans the **Thread**
+/// notify-array target in the ntoskrnl image.
 /// In ntoskrnl, `PspCallThreadNotifyRoutines` references this array.
 ///
 /// **Disambiguation required:** this uses the same `lea r14, [rip+disp32]`
-/// (4C 8D 35) encoding as `PSP_CREATE_PROCESS_NOTIFY_ROUTINE`. Use
-/// [`resolve_rva_in_range`] with the expected RVA range to distinguish them.
-/// Typical ranges: Process array is at a lower RVA than Thread in most builds.
+/// (4C 8D 35) encoding as [`PSP_CREATE_PROCESS_NOTIFY_ROUTINE`] but targets a
+/// DIFFERENT global (Process array is at a lower RVA than Thread in most
+/// builds). Use [`resolve_rva_in_range`] with the expected RVA range to
+/// distinguish them. Keep this constant separate from the Process one — a
+/// build where the Thread reference changes encoding must only touch this
+/// constant.
 pub const PSP_CREATE_THREAD_NOTIFY_ROUTINE: RefSite = RefSite {
-    // 4C 8D 35 ?? ?? ?? ??  ; lea r14, [rip+disp32]  (same encoding as process)
+    // 4C 8D 35 ?? ?? ?? ??  ; lea r14, [rip+disp32]  (same encoding as process, DIFFERENT target)
     pattern: &[Some(0x4C), Some(0x8D), Some(0x35), None, None, None, None],
     disp_offset: 3,
 };

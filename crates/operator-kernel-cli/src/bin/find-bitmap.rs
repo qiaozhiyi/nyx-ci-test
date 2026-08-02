@@ -9,9 +9,9 @@ extern "system" {
 
 #[cfg(target_os = "windows")]
 fn main() {
-    let ntdll = unsafe { GetModuleHandleA("ntdll.dll\0".as_ptr()) };
+    let ntdll = unsafe { GetModuleHandleA(c"ntdll.dll".as_ptr().cast::<u8>()) };
     let ldrp = unsafe {
-        GetProcAddress(ntdll, "LdrpValidateUserCallTarget\0".as_ptr())
+        GetProcAddress(ntdll, c"LdrpValidateUserCallTarget".as_ptr().cast::<u8>())
     } as *const u8;
     if ldrp.is_null() {
         println!("LdrpValidateUserCallTarget NOT FOUND (may not be exported)");

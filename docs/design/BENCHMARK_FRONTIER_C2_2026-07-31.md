@@ -1,6 +1,6 @@
 # Nyx vs 前沿商业 C2 — 多角度基准评测（2026-07-31）
 
-> **状态**：Active — 本文是 2026-07-31 修复冲刺（分支 `refactor/ah-audit-followups`，11-commit sprint）**之后**的权威当前状态基准，取代 `docs/testing/p2-benchmark-vs-cs413-brc4-v23.md`（2026-06-26 快照）与 `docs/research/commercial_c2_security_research.md`（研究素材，非产品承诺）中的过时对位结论。
+> **状态**：Active — 本文是 2026-07-31 修复冲刺（分支 `refactor/ah-audit-followups`，11-commit sprint）+ 2026-08-02 loader 波次（真实 Layer-2 反射加载 + 真机验证）**之后**的权威当前状态基准，取代 `docs/testing/p2-benchmark-vs-cs413-brc4-v23.md`（2026-06-26 快照）与 `docs/research/commercial_c2_security_research.md`（研究素材，非产品承诺）中的过时对位结论。
 > **口径**：Nyx 侧全部以**当前代码 + CHANGELOG [Unreleased]** 为准（`file:line` 证据）；商业框架侧以厂商官方发布页为准。能力状态沿用 [`STATUS.md`](../STATUS.md) 四档：已交付 / 受限交付 / 实验性 / 规划中。诚实优先——未接线、未验证的能力不得视为"可用"。
 > **数据基线说明**：[`AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) 早于本次冲刺，属**基线快照**；凡与本文件或当前代码冲突处，以当前代码为准（例如 loader 反射加载、BOF API、transport 接线三项在冲刺后状态已变化）。
 
@@ -43,7 +43,7 @@
 | **working-hours callbacks** | 办公时间回调调度（release notes） |
 | **扩展 malleability（2.6）** | 自定义响应类型/响应头等流量塑形（release notes） |
 
-### 1.3 Nyx 当前（分支 `refactor/ah-audit-followups`，2026-07-31 冲刺后）
+### 1.3 Nyx 当前（分支 `refactor/ah-audit-followups`，2026-07-31 冲刺 + 2026-08-02 loader 波次后）
 
 来源：本仓库代码 + [`CHANGELOG [Unreleased]`](../../CHANGELOG.md)（文件:行证据）+ [`STATUS.md`](../STATUS.md)。冲刺（wp-protocol / wp-store / wp-kernel-daemon / wp-loader / wp-implant-core / wp-implant-inject / wp-bof-runner / wp-agent-dev / wp-server-a / wp-server-b / wp-ui / wp-scripting / wp-transport / wp-offsets + wave-2）共 13+ 工作包，workspace check + test 全绿（`nyx-server` 72 / `nyx-transport` 109 / `nyx-protocol` 49 / `nyx-store` 28）。
 
@@ -65,7 +65,7 @@
 | rhai 全局预算：累计 op 上限（`on_progress` 永不复位）+ 单次派发上限 + 墙钟 + `nyx_log` 频率 | `crates/scripting-rhai/src/` |
 | UI：任务历史 session 级 App store（切会话不清空）+ 结果带 `session_id` + pending 过期合成错误 | `client-ui-web`（CHANGELOG wp-ui） |
 | `nyx-mutate` crate 整体删除 | `Cargo.toml` members、`crates/server/Cargo.toml`（CHANGELOG Removed） |
-| **真实反射加载器接线 + 真机验证（2026-08-02）**：pic-loader（Rust no_std PIC）经 regen.sh 产出零重定位 .bin，`wrap_payload` 按最终布局发射 `[LAYER1+bridge][key][magic|len|nonce][ct||tag][LAYER2]`；LAYER1 桥接对齐 pic-loader Win64 ABI。**真机 E2E 硬门禁**（`crates/loader-probe-exe` + CI）：CreateThread 线程入口执行完整 blob（绕开 CFG/CET 调用点强制），修复 pic-loader 两个真 bug（可选头 SizeOfImage 偏移、PE32+ 版本字段缺失）后，**fixture 与真实 implant DLL 均反射加载成功、DllMain 执行（marker 文件证实）、返回 0**——在免费 GitHub 托管 Windows runner 上运行，零本地硬件。Unicorn 仿真探针（Gate 5）持续守护回归 | `crates/loader-probe-exe/`、`pic-loader/`、`tools/loader-emu/` |
+| **真实反射加载器接线 + 真机验证（2026-08-02）**：pic-loader（Rust no_std PIC）经 regen.sh 产出零重定位 .bin，`wrap_payload` 按最终布局发射 `[LAYER1+bridge][key][magic|len|nonce][ct||tag][LAYER2]`；LAYER1 桥接对齐 pic-loader Win64 ABI。**真机 E2E 硬门禁**（`crates/loader-probe-exe` + CI）：CreateThread 线程入口执行完整 blob（绕开 CFG/CET 调用点强制），修复 pic-loader 两个真 bug（可选头 SizeOfImage 偏移、PE32+ 版本字段缺失）后，**fixture 与真实 implant DLL 均反射加载成功、DllMain 执行（marker 文件证实）、返回 0**——在免费 GitHub 托管 Windows runner 上运行，零本地硬件。Unicorn 仿真探针（Gate 5）持续守护回归 | `crates/loader-probe-exe/`、`crates/nyx-loader/pic-loader/`、`tools/loader-emu/` |
 
 **未在本次冲刺闭合、仍属差距的状态（诚实标注）：** 睡眠混淆仍短路到 `beacon::sleep_seconds`（`crates/implant-win/src/kits.rs:39-79` 死路径，Foliage/Fluctuation/mem::mask 未接线）；TLS 指纹 emitter 仍在 `impersonation` feature 后（`crates/transport/src/fingerprint.rs:201-229`，Err stub）；DoH/DNS/LLM 三 Transport 零消费者（仅 Slack/MCP 经 server `TransportStack` 接线）；无持久化、无横向凭据执行（hashdump LSASS 显式 deferred：`crates/implant-win/src/hashdump.rs` method=2 诚实 Err）。
 
@@ -78,7 +78,7 @@
 | 维度（权重） | Nyx | CS 4.13 | BRc4 2.6.3 | 判据要点 |
 |---|---|---|---|---|
 | **端点逃避实装**（15） | **3.0** | **5.0** | **4.5** | Nyx：indirect syscall/SSN 三级回退、BYOUD-Gap CET-safe 栈欺骗、AMSI·ETW 盲打、module stomping+threadless 真装；但睡眠混淆未接线、heap 未 mask、注入面窄。CS：sleepmask 全量重写（代码+heap，100MB）+ BeaconGate RAS + BOF-PE。BRc4：custom-compiler + 模块踩踏 + PEB LDR hook，CET-safe 未证实 |
-| **加载器与投递**（10） | **3.0** | **5.0** | **4.5** | Nyx：**真实 Layer-2 反射加载已接线并经仿真探针验证**（pic-loader 6,080B .bin、Win64 ABI 桥接、DllMain 触发断言）；缺 CS UDRL 生态/Arsenal Kit 的成熟度与 drip-loading。CS：UDRL 生态+Arsenal Kit+drip-loading+Payload Store。BRc4：custom-compiler Badger + safe_http 2–3KB PIC 桩 |
+| **加载器与投递**（10） | **3.0** | **5.0** | **4.5** | Nyx：**真实 Layer-2 反射加载已接线并经真机验证**（pic-loader 6,080B .bin、Win64 ABI 桥接、DllMain marker 证实——`crates/loader-probe-exe` CreateThread 探针在免费 GitHub 托管 windows-latest runner 上跑通 fixture 与真实 implant DLL，零本地硬件）+ Unicorn 仿真探针（Gate 5）回归守护；缺 CS UDRL 生态/Arsenal Kit 的成熟度与 drip-loading。CS：UDRL 生态+Arsenal Kit+drip-loading+Payload Store。BRc4：custom-compiler Badger + safe_http 2–3KB PIC 桩 |
 | **C2信道与流量仿冒**（10） | **2.0** | **5.0** | **4.0** | Nyx：HTTPS WinHTTP 主信道 + SOCKS pivot；8 信道枚举但 SmbPipe/Tcp 门禁、DoH/DNS/LLM 零消费者；Slack/MCP 经 boot-time TransportStack 接线（HMAC fail-closed）；Malleable 解析+c2lint；TLS emitter 为 stub。CS：HTTPS/DNS/SMB/TCP + UDC2 + profile 运行时覆盖 + WS/gRPC 流。BRc4：多通道 + 2.6 扩展 malleability |
 | **BOF与扩展执行**（10） | **2.0** | **5.0** | **4.5** | Nyx：CS ABI `go(args,alen)` + W^X + RAII 释放 + externals 扩展（kernel32/ntdll 动态解析）+ coff 解析 7 测试；无 async BOF/BOF-PE/Interpreter。CS：BOF+异步 BOF+BOF-PE+Beacon Interpreter（C VM）。BRc4：coffexec_async + dotnet store |
 | **后渗透工具集**（10） | **2.5** | **5.0** | **4.5** | Nyx：28 wire Command——fs/shell/upload/download/FileOp(Ls)/env/clipboard/portscan/net/screenshot/keylog/screenwatch/hashdump(SAM/SYSTEM)/bof/socks/pivot/token 操作/inject；缺持久化、缺 LSASS dump（显式 deferred）。CS：全生态+SSH beacon。BRc4：110+ 命令 + Shadowcloak |
@@ -97,7 +97,7 @@
 | Cobalt Strike 4.13 | 490.0 | 98.0% |
 | BRc4 Catalyst 2.6.3 | 412.5 | 82.5% |
 
-> 读法：百分比是"相对商品级成熟度"的加权代理，不是任务完成度。Nyx 的 46% 主要由三道硬墙拖低——**加载器（1.0）**、**跨平台（0.5）**、**横向/凭据（1.5）**；逃避与服务端/工程三个维度（3.0/3.5/3.5）已进入可对位区间。
+> 读法：百分比是"相对商品级成熟度"的加权代理，不是任务完成度。Nyx 的 46% 主要由硬墙拖低——**加载器（3.0，真机已验证但缺 UDRL 生态）**、**跨平台（0.5）**、**横向/凭据（1.5）**；逃避与服务端/工程三个维度（3.0/3.5/3.5）已进入可对位区间。
 
 ---
 
@@ -116,15 +116,14 @@
 - **注入多样性**：module stomping 被 PE-sieve `.text` hash 盯死时无替代；补 early-bird APC/thread-hijack（P12/P15 窗口）。
 - **ETW-Ti APC 窗口利用**（P12b）、CET 内核禁用（P12e，经 BYOVD）。
 
-### 3.2 加载器与投递（10）— 冲刺后 1.0（能力缺失但诚实）
+### 3.2 加载器与投递（10）— 冲刺后 3.0（真实 Layer-2 已真机验证）
 
-**Nyx 现有**：`nyx-loader` 加密+组装真；`tools/srdi` 反射加载工具（sRDI，PE 导出表 OOB 已修复 CRITICAL-25/26/27）；**反射加载 fail-loud**——`LAYER2_PEB_WALK` 65B 碎片已删除，`generate_loader_stub`/`wrap_payload` 返回 `Result`，`--encrypt` 强制，release 探针门禁 fail-closed。**这是本次冲刺最重要的诚实化**：loader 从"纸面 1.0 却宣称可用"改为"明确不可交付，直到真实 layer-2 存在"。
+**Nyx 现有**：`nyx-loader` 加密+组装真；`tools/srdi` 反射加载工具（sRDI，PE 导出表 OOB 已修复 CRITICAL-25/26/27）；**真实 Layer-2 反射加载已接线并经真机验证（2026-08-02）**——pic-loader（Rust no_std PIC，`crates/nyx-loader/pic-loader/`，6,080B 零重定位 .bin）经 `wrap_payload` 按最终布局发射 `[LAYER1+bridge][key][magic|len|nonce][ct||tag][LAYER2]`；**真机 E2E 探针 PASS**（`crates/loader-probe-exe`：CreateThread 线程入口执行完整 blob，fixture 与真实 implant DLL 均反射加载成功、DllMain 执行（marker 文件证实）、返回 0，运行在免费 GitHub 托管 windows-latest runner，零本地硬件）；Unicorn 仿真探针（CI Gate 5）+ Qiling selftest 门禁（CI Gate 6）守护回归。2026-07-31 冲刺的 fail-loud 中间态（缺 layer-2 即拒绝生成）已完成使命退役——诚实化纪律证明 loader 在真实 layer-2 落地前绝不假装可用，落地后证据可复现。
 
 **前沿**：CS UDRL 生态（PE 头擦除、TLS callback 处理、Arsenal Kit 模板）+ drip-loading 分片投递 + Payload Store；BRc4 custom-compiler Badger（-30% 体积）+ safe_http 2–3KB PIC 桩。
 
 **差距与收敛（→P13d/P8c/P9c）**：
-- **真实 layer-2 反射加载**：在目标上完成映射→重定位→导入→TLS→头擦除（P2.1b；对应 P13d stager 体系）。
-- **UDRL 强化**：PE 头擦除、`.pdata` 处理、section 权限收敛（P13d）。
+- **UDRL 强化**：PE 头擦除、`.pdata` 处理、section 权限收敛（P13d；真实 layer-2 的映射→重定位→导入→TLS→DllMain 已落地并真机验证，P2.1b 主线闭合）。
 - **分段投递**：Stage0 PIC <512B → Stage1 sRDI → Stage2 模块拉取，每段不同信道（P13d）。
 - **模块热更新 + 签名验证**：ED25519 模块签名，防信道劫持后下发恶意模块（P9c/P9e）。
 
@@ -248,7 +247,7 @@ CS 4.13 与 BRc4 2.6.3 均为**纯用户态商品框架**，物理上没有内�
 
 ### 4.3 Fail-Loud 诚实性（工程文化领先）
 
-本次冲刺的最大结构性变化：**把"宣称可用"改为"诚实报缺"**——loader 反射加载 fail-loud（能力缺失但绝不静默假装可用）、hashdump LSASS 显式 Err（loudest IOC）、SmbPipe/Tcp 信道拒绝而非接受后挂死、Slack HMAC key 缺失即 boot 失败、token 消费原子 fail-closed、release 探针门禁 fail-closed、PG 未验证即拒绝。CS/BRc4 闭源，无法做同等透明审计。这对**授权演练的可信度**（知道什么能用、什么不能用）是真实差异化。
+本次冲刺的最大结构性变化：**把"宣称可用"改为"诚实报缺"**——loader 反射加载先 fail-loud（能力缺失时绝不静默假装可用）、hashdump LSASS 显式 Err（loudest IOC）、SmbPipe/Tcp 信道拒绝而非接受后挂死、Slack HMAC key 缺失即 boot 失败、token 消费原子 fail-closed、release 探针门禁 fail-closed、PG 未验证即拒绝。这一纪律在 2026-08-02 兑现：loader 从 fail-loud 中间态走到**真实 Layer-2 + 真机验证 PASS**（`crates/loader-probe-exe`，CreateThread 入口 + DllMain marker 证实），全程在免费 GitHub 托管 runner 上完成、证据可复现。CS/BRc4 闭源，无法做同等透明审计。这对**授权演练的可信度**（知道什么能用、什么不能用）是真实差异化。
 
 ---
 
@@ -258,7 +257,7 @@ CS 4.13 与 BRc4 2.6.3 均为**纯用户态商品框架**，物理上没有内�
 
 | 框架 | 加权分/500 | 归一化 | 一句话 |
 |---|---|---|---|
-| **Nyx（2026-07-31 冲刺后）** | **230.0** | **46.0%** | 逃避/服务端/工程三轴可对位；加载器、跨平台、横向/凭据三道硬墙拖低 |
+| **Nyx（2026-07-31 冲刺 + 2026-08-02 loader 波次）** | **230.0** | **46.0%** | 逃避/服务端/工程三轴可对位；加载器已真机验证但缺 UDRL 生态，跨平台、横向/凭据两道硬墙拖低 |
 | Cobalt Strike 4.13 | 490.0 | 98.0% | 商品级全维度成熟，逃避面（sleepmask/BOF-PE/Interpreter）与生态无可争议第一 |
 | BRc4 Catalyst 2.6.3 | 412.5 | 82.5% | custom-compiler + Shadowcloak + 110 命令，用户态逃避强、生态次之 |
 
@@ -268,12 +267,12 @@ CS 4.13 与 BRc4 2.6.3 均为**纯用户态商品框架**，物理上没有内�
 
 **阶段一：已闭合（2026-07-31 冲刺，勿再投入）**
 
-协议贡献性 X25519 + 帧上限 + `FileOp::Ls`；beacon 发送纪律 + S2C 重放 + OOM；ZeroBits/PoolParty/BOF ABI/W^X；信道门禁 + I/O 超时；store 原子 token + char-safe mask + busy_timeout + 计数持久化；server GC 活跃豁免 + 重新准入 + 批处理 + kill-date 严格校验 + argon2 卸载 + TransportStack 接线 + Slack fail-closed；内核 daemon 认证；PG 门禁；KernelRw 契约；`--build` 必填；rhai 全局预算；UI session 历史 + pending 过期；`nyx-mutate` 删除；loader fail-loud。**验收证据**：workspace check + test 全绿（server 72 / transport 109 / protocol 49 / store 28）。
+协议贡献性 X25519 + 帧上限 + `FileOp::Ls`；beacon 发送纪律 + S2C 重放 + OOM；ZeroBits/PoolParty/BOF ABI/W^X；信道门禁 + I/O 超时；store 原子 token + char-safe mask + busy_timeout + 计数持久化；server GC 活跃豁免 + 重新准入 + 批处理 + kill-date 严格校验 + argon2 卸载 + TransportStack 接线 + Slack fail-closed；内核 daemon 认证；PG 门禁；KernelRw 契约；`--build` 必填；rhai 全局预算；UI session 历史 + pending 过期；`nyx-mutate` 删除；loader fail-loud 中间态。**2026-08-02 追加闭合（loader 波次）**：真实 Layer-2 反射加载 + 真机验证 PASS（`crates/loader-probe-exe`，DllMain marker 证实）+ Unicorn 仿真探针（Gate 5）+ Qiling selftest 门禁（Gate 6）+ 发布管线迁至 GitHub 托管 runner（selftest 门禁带 notice 跳过）。**验收证据**：workspace check + test 全绿（server 72 / transport 109 / protocol 49 / store 28）。
 
 **阶段二：2–4 月（P8–P9 + 整改计划 M0/M1）**——把"已对位但未接线"变成"可用"：
 
 1. **睡眠混淆接线 + heap mask**（修 `kits.rs` 短路；最高优先遗留项）。
-2. **真实反射加载 layer-2**（loader 从 fail-loud 到真交付；对齐 CS UDRL）。
+2. **UDRL 强化**（PE 头擦除、`.pdata` 处理、section 权限收敛；真实 layer-2 已交付并真机验证，本项追平 CS UDRL 生态）。
 3. **transport 消费路径**（DoH/DNS/LLM 接线；TLS emitter 实装 P11a）。
 4. **BOF API 扩面 + 异步 BOF**（追平 coffexec_async）。
 5. **implant-core 抽象**（P8a–P8f 地基，为跨平台铺路）。
@@ -300,5 +299,5 @@ CS 4.13 与 BRc4 2.6.3 均为**纯用户态商品框架**，物理上没有内�
 | [Brute Ratel C4 发布页](https://bruteratel.com/category/release/) + releases.txt | §1.2 Catalyst v2.6.3 事实 | 2026-07-30 |
 | [`docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md) | §1.3/§3 Nyx 基线（**早于冲刺，作基线快照**） | 2026-07-18，冲刺后需以代码为准 |
 | [`docs/research/commercial_c2_security_research.md`](../research/commercial_c2_security_research.md) | §1/§4 商业框架技术细节（CS 4.13 时间线、Draugr vs BYOUD-Gap、BRc4 编译器） | 研究素材，非产品承诺 |
-| [`docs/STATUS.md`](../STATUS.md) + [`CHANGELOG.md`](../../CHANGELOG.md) | §1.3/§2/§3 Nyx 冲刺后状态（file:line 证据） | 2026-08-01 |
+| [`docs/STATUS.md`](../STATUS.md) + [`CHANGELOG.md`](../../CHANGELOG.md) | §1.3/§2/§3 Nyx 冲刺后状态（file:line 证据） | 2026-08-02 |
 | 仓库代码（`crates/*` file:line，见 §1.3 表） | §1.3/§3 Nyx 能力实证 | 分支 `refactor/ah-audit-followups` |
