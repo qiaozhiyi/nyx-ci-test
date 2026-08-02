@@ -184,9 +184,11 @@ jobs:
         run: cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --features selftest --target x86_64-pc-windows-gnu
       - name: Install qiling + run selftest matrix
         run: |
-          # macOS system python 3.14 breaks qiling's arch importer (removed
-          # `imp` API); brew python@3.12 matches the validated env (3.9-3.12).
+          # Pin qiling==1.4.6 + capstone (the versions validated locally on
+          # py3.9/3.12): the 2.x arch importer breaks with
+          # QlErrorModuleNotFound (.arch.x86). brew python@3.12 has capstone
+          # wheels; the system 3.14 python does not.
           brew install python@3.12
           /opt/homebrew/opt/python@3.12/bin/python3.12 -m venv /tmp/qiling-venv
-          /tmp/qiling-venv/bin/pip install -q qiling
+          /tmp/qiling-venv/bin/pip install -q capstone==5.0.1 qiling==1.4.6
           /tmp/qiling-venv/bin/python tools/selftest-qiling/runner.py
