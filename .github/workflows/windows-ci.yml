@@ -120,6 +120,10 @@ jobs:
           $prevEap = $ErrorActionPreference
           $ErrorActionPreference = 'Continue'
           try {
+            # MSVC enables CET (CETCOMPAT) by default; an indirect call into
+            # the RWX blob (no endbr64) faults AT THE CALL SITE — the fixed
+            # image-RIP AV seen in every round including --layer2-ret. Disable.
+            $env:RUSTFLAGS = "-C link-arg=/CETCOMPAT:NO"
             cargo build --release -p nyx-loader-probe-exe 2>&1 | Out-String | Write-Host
             if ($LASTEXITCODE -ne 0) { throw "probe build exited $LASTEXITCODE" }
           } finally {
