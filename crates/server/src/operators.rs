@@ -277,6 +277,20 @@ impl OperatorRegistry {
         }
     }
 
+    /// All registered operators, for the collaboration UI (`GET /api/operators`).
+    /// Empty in open mode (the only identity is `_anonymous`).
+    pub fn roster(&self) -> Vec<(String, Role)> {
+        match self.ops.read() {
+            Ok(g) => {
+                let mut v: Vec<(String, Role)> =
+                    g.iter().map(|(n, r)| (n.clone(), r.role)).collect();
+                v.sort_by(|a, b| a.0.cmp(&b.0));
+                v
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Resolve a bearer value to an identity. Accepts `name:secret` (multi-op)
     /// or a bare token (matched against the `_legacy` record, if any).
     ///

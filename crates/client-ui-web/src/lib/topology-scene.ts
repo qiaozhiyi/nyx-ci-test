@@ -1022,37 +1022,12 @@ export function createTopologyScene(
 }
 
 // ---------------------------------------------------------------------------
-// Mock data (MVP demo). Real sessions can be passed in by the React page.
-// ---------------------------------------------------------------------------
-
-export const MOCK_NODES: TopologyNode[] = [
-  // size hierarchy: server (central gravity well) >> admin > user, so the
-  // hierarchy reads at a glance. Effective card scale spans ~3x.
-  // Positions spread ~1.8x wider than the original ±11 envelope so cards do
-  // not overlap at the default zoom (server stays at the origin).
-  { id: 'srv', label: 'nyx-srv', os: 'debian', priv: 'server', pos: [0, 0, 0], size: 2.2, isServer: true },
-  { id: 'dc01', label: 'DC-01', os: 'win-server', priv: 'admin', pos: [14.4, 3.6, -10.8], size: 1.4, active: true },
-  { id: 'win7', label: 'WIN-7F3A', os: 'windows', priv: 'user', pos: [-16.2, 5.4, -7.2], size: 0.85 },
-  { id: 'db', label: 'DB-SRV', os: 'ubuntu', priv: 'user', pos: [12.6, -7.2, 14.4], size: 0.85 },
-  { id: 'web', label: 'WEB-EDGE', os: 'debian', priv: 'user', pos: [-12.6, -5.4, 16.2], size: 0.8 },
-  { id: 'fs', label: 'FS-01', os: 'windows', priv: 'user', pos: [19.8, -1.8, 9], size: 0.8 },
-  { id: 'mac', label: 'DEV-MAC', os: 'macos', priv: 'user', pos: [-5.4, 10.8, 10.8], size: 0.78, stale: true },
-  { id: 'kali', label: 'PWN-01', os: 'kali', priv: 'user', pos: [5.4, 12.6, -14.4], size: 0.78 },
-];
-
-export const MOCK_EDGES: TopologyEdge[] = [
-  { from: 'srv', to: 'dc01', kind: 'https' },
-  { from: 'srv', to: 'win7', kind: 'https' },
-  { from: 'srv', to: 'db', kind: 'https' },
-  { from: 'srv', to: 'web', kind: 'https' },
-  { from: 'srv', to: 'mac', kind: 'https' },
-  { from: 'srv', to: 'kali', kind: 'https' },
-  { from: 'dc01', to: 'fs', kind: 'smb' },
-  { from: 'web', to: 'fs', kind: 'tcp' },
-];
-
-// ---------------------------------------------------------------------------
 // Optional helper: convert live SessionView[] into topology nodes.
+// Exported for the React page. The page renders an honest empty state when
+// there are no sessions — the former MOCK_NODES/MOCK_EDGES demo data was
+// removed because it masqueraded as real network topology.
+// ---------------------------------------------------------------------------
+
 // Exported for the React page; the page decides whether to use mock or real.
 // ---------------------------------------------------------------------------
 

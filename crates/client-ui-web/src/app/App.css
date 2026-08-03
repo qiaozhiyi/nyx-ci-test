@@ -21,29 +21,3 @@
   color: var(--text-muted);
   font-size: 12px;
 }
-
-/* Placeholder surfaces shown until the real modules are wired in. */
-.placeholder {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: var(--sp-2);
-  color: var(--text-second);
-  text-align: center;
-  padding: var(--sp-7);
-}
-
-.placeholder-mark {
-  font-size: 22px;
-  font-weight: 600;
-  color: var(--text);
-  letter-spacing: 0.04em;
-  margin-bottom: var(--sp-1);
-}
-
-.placeholder-note {
-  color: var(--text-muted);
-  font-size: 12px;
-}

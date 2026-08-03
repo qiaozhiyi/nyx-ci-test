@@ -297,6 +297,67 @@ pub async fn revoke_implant(
     Ok(resp.json().await?)
 }
 
+// ===== Collaboration (M3) =====
+
+/// `GET /api/report` — markdown engagement report snapshot.
+pub async fn fetch_report(client: &Client, server: &str, bearer: &str) -> Result<String> {
+    let url = format!("{}/api/report", server.trim_end_matches('/'));
+    let resp = authed(client.get(&url), &Some(bearer.to_string()))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "report: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    Ok(resp.text().await?)
+}
+
+/// `POST /api/session/owner` — assign (or clear) session ownership.
+pub async fn set_session_owner(
+    client: &Client,
+    server: &str,
+    bearer: &str,
+    session: &str,
+    owner: Option<&str>,
+) -> Result<serde_json::Value> {
+    let url = format!("{}/api/session/owner", server.trim_end_matches('/'));
+    let resp = authed(client.post(&url), &Some(bearer.to_string()))
+        .json(&serde_json::json!({ "session": session, "owner": owner }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "session owner: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    Ok(resp.json().await?)
+}
+
+/// `GET /api/operators` — operator roster for the ownership picker.
+pub async fn fetch_operators(
+    client: &Client,
+    server: &str,
+    bearer: &str,
+) -> Result<serde_json::Value> {
+    let url = format!("{}/api/operators", server.trim_end_matches('/'));
+    let resp = authed(client.get(&url), &Some(bearer.to_string()))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "operators: HTTP {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    Ok(resp.json().await?)
+}
+
 // ===== Profile =====
 
 /// `GET /api/profile` — current Malleable C2 profile summary.

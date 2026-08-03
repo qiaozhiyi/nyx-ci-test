@@ -2777,11 +2777,14 @@ dependencies = [
  "nyx-bof-runner",
  "nyx-profile",
  "nyx-protocol",
+ "nyx-transport",
  "rand 0.8.6",
  "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "wreq",
 ]
 
 [[package]]

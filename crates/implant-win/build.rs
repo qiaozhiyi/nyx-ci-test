@@ -137,6 +137,9 @@ fn bake_config() {
     write_str(&mut blob, cfg.rotation_hosts.as_bytes());
     write_str(&mut blob, cfg.fronting_host.as_bytes());
     write_str(&mut blob, cfg.proxy_server.as_bytes());
+    // Raw pivot fields (spec-3):
+    write_str(&mut blob, cfg.tcp_peer_host.as_bytes());
+    write_u16(&mut blob, cfg.tcp_peer_port);
 
     let out_dir = env::var("OUT_DIR").unwrap();
 
@@ -543,6 +546,9 @@ struct ConfigVals {
     rotation_hosts: String,
     fronting_host: String,
     proxy_server: String,
+    // Raw pivot channel (spec-3):
+    tcp_peer_host: String,
+    tcp_peer_port: u16,
 }
 
 /// Minimal TOML-ish parser. Only understands `key = "value"` (strings) and
@@ -566,6 +572,9 @@ fn parse_config(text: Option<&str>) -> ConfigVals {
     let mut rotation_hosts = String::new();
     let mut fronting_host = String::new();
     let mut proxy_server = String::new();
+    // Raw pivot channel (spec-3):
+    let mut tcp_peer_host = String::new();
+    let mut tcp_peer_port: u16 = 0;
 
     if let Some(t) = text {
         for raw in t.lines() {
@@ -656,6 +665,16 @@ fn parse_config(text: Option<&str>) -> ConfigVals {
                         proxy_server = s;
                     }
                 }
+                "tcp_peer_host" => {
+                    if let Some(s) = unquote(val) {
+                        tcp_peer_host = s;
+                    }
+                }
+                "tcp_peer_port" => {
+                    if let Ok(p) = unquote(val).unwrap_or_default().parse::<u16>() {
+                        tcp_peer_port = p;
+                    }
+                }
                 _ => {}
             }
         }
@@ -677,6 +696,8 @@ fn parse_config(text: Option<&str>) -> ConfigVals {
         rotation_hosts,
         fronting_host,
         proxy_server,
+        tcp_peer_host,
+        tcp_peer_port,
     }
 }
 

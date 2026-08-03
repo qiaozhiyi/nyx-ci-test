@@ -22,13 +22,13 @@
 //! resolves WinHTTP. `kernel32.dll` is always resident (the process loader maps
 //! it before any user code runs), so no `LoadLibraryA` is needed.
 //!
-//! ## NotImplemented status (implant-channels-2/3)
-//! The parent side (pipe server on the team server / parent implant) does NOT
-//! exist in this repo yet, so a beacon selected onto
-//! [`super::Channel::SmbPipe`] can never transact end-to-end. The dispatcher and `SetChannel` gate this
-//! channel as not implemented (`Response::Err` on select, `None` +
-//! `ERR_CH_NOT_IMPL` on dispatch). The client-side code below stays live and
-//! bounded so the channel is ready to flip on when the pivot side lands.
+//! ## Parent side
+//! The pipe server lives in the team server on Windows
+//! (`crates/server/src/smb_listener.rs`, `NYX_SMB_PIPE_NAME`) or on a parent
+//! implant acting as a pivot. `SetChannel` still rejects an implant whose
+//! `smb_pipe_name` is unconfigured (loud misconfiguration error, not a dead
+//! spin); the dispatcher also fails fast with `ERR_CH_SMB_NOCONF` at
+//! transaction time.
 //!
 //! ## Synchronous I/O + bounded-blocking contract
 //!

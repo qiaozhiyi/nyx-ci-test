@@ -33,7 +33,7 @@ crates/
 ├── protocol/              # 加密协议 (X25519+HKDF+ChaCha20-Poly1305, 1,895 LOC, 无 stub)
 ├── server/                # 团队服务器 (tokio/axum, 5,615 LOC)
 ├── store/                 # SQLite 凭据/implant/session 库 (1,321 LOC)
-├── transport/             # TLS JA3/JA4 + 通道定义 (3,420 LOC, 🟡 Slack/MCP 已接 server 中转,4 通道待接线)
+├── transport/             # TLS JA3/JA4 + 通道定义 (3,420 LOC, ✅ 4 个 extc2 中继 Slack/LLM/Discord/MCP 全接 server TransportStack;DoH 权威应答器在 server)
 ├── rest/                  # REST 类型库 (189 LOC, client 共享)
 ├── parse/                 # shell 输出解析器 (544 LOC)
 ├── profile/               # Malleable C2 profile 解析 + c2lint (1,733 LOC)
@@ -359,7 +359,7 @@ cargo clippy --workspace --all-targets
 |---|---|---|
 | **睡眠混淆 Fluctuation** | 🟡 **条件接线(受限交付)** | `kits::sleep` 在 `evasion_active() && fluctuation::enabled()` 时路由 `fluctuation::sleep`(`kits.rs:75-81`);fluctuation 默认开启(`NYX_FLUCTUATION_OFF=1` 关闭,`fluctuation.rs:11-15`),失败降级纯 sleep(`fluctuation.rs:25-33`);noevasion 模式(`set_evasion_off`)跳过掩码。Foliage helper-thread `.text` 掩码路径仍休眠(`mem.rs:249-253`)。 |
 | **Foliage APC .text 加密** | 🔴 入口死代码,helpers 存活 | `sleep::sleep()` 零调用方(beacon 循环走 `kits::sleep` → `fluctuation::sleep`,`sleep.rs:79-91`);helpers(`own_text_region`/`raw_create_thread`/`FoliageRaw` 等)仍被 fluctuation/evasion_glue/keylog 等使用(`sleep.rs:84`)。 |
-| **transport/ crate** | 🟡 **部分接线(受限交付)** | 6 个 `Transport` impl 中 Slack/MCP 经 boot-time `TransportStack` 由 server 中转(`extc2_relay.rs:57-59,122-127,214-218`);malleable/doh_dns/llm_api/smb_pipe 4 通道 stack-ready 但未接路由。JA3/JA4 接入 server listener。implant 侧保持自滚 WinHTTP 通道(no_std PIC 设计,`transport/src/lib.rs:36-42`)。 |
+| **transport/ crate** | 🟡 **全接线(受限交付)** | 4 个第三方 API 中继(Slack/LLM/Discord/MCP)经 boot-time `TransportStack` 由 server 中转(`extc2_relay.rs`,均 HMAC fail-closed);DoH 信道由 server 权威 DNS 应答器(`server/src/dns_responder.rs`,RFC 8484 JSON + UDP/53)支撑,`agent-dev --channel doh` 消费 `DohDnsTransport`;SMB/TCP pivot 父监听在 server(`smb_listener.rs` Windows-only / `tcp_pivot.rs`);TLS emitter 由 `nyx-agent-dev` `impersonation` feature 消费(CI Gate 7)。implant 侧保持自滚 WinHTTP 通道(no_std PIC 设计)。 |
 | **TLS 指纹 emitter** | 🟡 **feature 门控(实验性)** | `impersonation` feature 下返回真实 BoringSSL(`wreq`)客户端(`fingerprint.rs:201-211`;`Cargo.toml [features]`);默认(hermetic)构建仍返 `Err(BackendUnavailable)`(`fingerprint.rs:225-229`)。未接入 server 出站链路。 |
 | **caller-spoof** | 🟡 **已实现(受限交付)** | `call_with_spoofed_return!` 宏 + 函数形式已存在(`caller_spoof.rs:464-499`);CET 探测自门:检测到 CET 时降级 `call_plain`(`caller_spoof.rs:36-41,212-229`)。 |
 | **proxy_veh 注册路径** | 🟡 未用 | `register_section_backed_handler` 完整实现(KnownDlls SEC_IMAGE + code cave trampoline),但 HWBP 路径直接用 `AddVectoredExceptionHandler`。gadgets 扫描后未消费。 |

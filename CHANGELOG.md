@@ -12,9 +12,82 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
-2026-08-03 wI: T-REX kernel assessment → operator-kernelsdk (real, hosted-CI
-verified). Working tree — entries cite `file:line` evidence; backfill SHAs when
-the wave is committed.
+2026-08-03 wW: full wiring sweep — every documented "未接线" item closed.
+Working tree — entries cite `file:line` evidence; backfill SHAs when the wave
+is committed.
+
+### Added
+
+- **External-C2 relays complete (wW).** `/extc2/llm` and `/extc2/discord` were
+  plain-beacon aliases; now real relays. New `DiscordTransport`
+  (`crates/transport/src/discord_api.rs` — bot messages, 2000-char content cap
+  → 1400-byte max frame, HMAC frame integrity per CRITICAL-22) joined the
+  shared boot-time `TransportStack` alongside Slack/LLM/MCP. Env contracts,
+  all fail-closed: `NYX_EXTC2_LLM_KEY` + `NYX_EXTC2_LLM_MODEL` +
+  `NYX_EXTC2_LLM_SESSION_KEY`; `NYX_EXTC2_DISCORD_TOKEN` +
+  `NYX_EXTC2_DISCORD_CHANNEL` + `NYX_EXTC2_DISCORD_HMAC_KEY`
+  (`crates/server/src/extc2_relay.rs`). The `extc2_alias_handler` is deleted —
+  no plain-beacon alias routes remain.
+- **Authoritative DNS responder (DoH channel server half, wW).**
+  `crates/server/src/dns_responder.rs`: RFC 8484 JSON `POST /dns-query` route +
+  UDP/53 wire responder (`NYX_DOH_DOMAIN` enables, `NYX_DOH_UDP_ADDR`
+  configures), serving `c{seq}-{i}.{b64}.{domain}` chunk uploads,
+  `task.{domain}` reply polls (TTL + serve-count bounded), and `health.{domain}`
+  A canaries. Chunks reassemble through `parse_frame` → `handle_frame` — the
+  same funnel as `/beacon`. Hand-rolled DNS wire format (compression pointers
+  handled, hop-capped).
+- **Raw pivot channels wired end-to-end (wW).** `Channel::SmbPipe`/`Tcp` were
+  gated `is_implemented() == false` (implant-channels-2/3: no parent side). The
+  team server now hosts both parents: `crates/server/src/tcp_pivot.rs`
+  (reverse_tcp listener, `NYX_TCP_PIVOT_ADDR`) and
+  `crates/server/src/smb_listener.rs` (Windows-only named-pipe server,
+  `NYX_SMB_PIPE_NAME`). Implant gates flipped: dispatch arms call the real
+  `smb::send_recv`/`tcp::send_recv`; `SetChannel` now rejects only
+  *unconfigured* endpoints (pipe name / `tcp_peer_host`+`tcp_peer_port`, both
+  added to the config blob with backward-compatible tail layers in
+  `config.rs`/`config_placeholder.rs`/`build.rs`).
+- **Dev agent is a full beacon now (wW).** `agent-dev/src/pivot.rs` — std port
+  of the implant's relay channel table (Connect/Socks CONNECT+BIND/
+  ChannelData/ChannelClose/pump, thread-local table, per-cycle pump in the
+  beacon loop). SOCKS relay now works end-to-end on the dev host:
+  operator → server → agent → socket → back. `BeaconLink` abstraction gives the
+  agent the DoH channel (`NYX_CHANNEL=doh` via `DohDnsTransport` against the
+  server's `/dns-query`) and the FULL two-sided Malleable profile shaping
+  (client envelope on send — steps/headers/UA/URI — server envelope on recv),
+  matching the PIC implant.
+- **TLS fingerprint emitter consumed (wW).** `nyx-agent-dev` gains the
+  `impersonation` feature (`NYX_IMERSONATE=chrome|firefox|safari|edge`) using
+  `nyx-transport::fingerprint::build_impersonating_client` (BoringSSL wreq)
+  driven by an embedded Tokio runtime; live JA3 validation passes. CI gate 7
+  (`impersonation` job in `.github/workflows/ci.yml`) compiles both crates with
+  the feature and runs the live `validate_ja3_live` probe on hosted runners.
+- **Collaboration context + reporting loop (M3 v1, wW).** Session ownership:
+  `owner` column (store schema v4 migration), `Session.owner`,
+  `POST /api/session/owner` (audited, viewer-denied), owner surfaced in
+  `SessionView` and restored on restart; beacon-path upserts never clobber it.
+  `GET /api/operators` (roster for the picker). `GET /api/report` — markdown
+  engagement snapshot (sessions/creds-by-kind/audit tail). UI: Settings page
+  (connection + loaded profile + report export), owner chip + transfer select
+  in SessionTable, topology honest empty state (MOCK_NODES demo data removed),
+  dead placeholder CSS deleted, Dock settings button enabled.
+- **E2E coverage for every new path:** DoH full beacon loop (agent over
+  `DohDnsTransport` → task → shell output), TCP pivot reverse_tcp transaction,
+  SOCKS relay full chain (connect → channeldata → echoed bytes), DoH HTTP
+  chunk upload + task poll, collaboration API (owner/roster/report), DNS wire
+  roundtrips incl. compression pointers.
+- **SMB listener real-Windows runtime verification (wW).** New Windows-only
+  e2e `crates/server/tests/smb_pipe_e2e.rs` (`#![cfg(windows)]`): boots the
+  named-pipe parent exactly as the server does (`NYX_SMB_PIPE_NAME`), drives
+  the child-side transaction with `CreateFileW`-equivalent `std::fs::File`
+  opens — `[4B LE len][sealed check-in frame]` in, sealed reply out — and
+  asserts the reply opens with the session key and the session lands in the
+  registry. Runs natively in CI Gate 3 on hosted windows-latest, closing the
+  "runtime validation pending hosted Windows CI" caveat. Gate 6 additionally
+  builds the production (default-features) implant DLL — selftest exports are
+  feature-gated out, so the exact shipped layout is now gated too — completing
+  build verification for all 6 standalone crates (the other 5 were already in
+  the `standalone` job).
+
 
 ### Added
 

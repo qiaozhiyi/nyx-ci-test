@@ -363,3 +363,14 @@
   color: var(--danger);
   border-color: var(--danger);
 }
+
+/* Collaboration (M3): server-side session ownership chip + picker. */
+.st-owner-chip {
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+}

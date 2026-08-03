@@ -18,6 +18,8 @@ export interface SessionView {
   ja3?: string;
   ja4?: string;
   stale: boolean;
+  /** Operator who owns this session (server-side, `POST /api/session/owner`). */
+  owner?: string | null;
 }
 
 export interface TaskAck {

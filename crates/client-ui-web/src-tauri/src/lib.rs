@@ -43,6 +43,9 @@ pub fn run() {
             commands::list_implants,
             commands::revoke_implant,
             commands::fetch_profile,
+            commands::fetch_report,
+            commands::set_session_owner,
+            commands::fetch_operators,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

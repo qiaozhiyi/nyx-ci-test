@@ -6,6 +6,7 @@ import { Workspace } from './Workspace';
 import { CredsPage } from './CredsPage';
 import { ImplantPage } from './ImplantPage';
 import { EventsPage } from './EventsPage';
+import { SettingsPage } from './SettingsPage';
 import { Dock } from '../components/Dock';
 import { TaskStoreProvider, useTaskStore } from './taskStore';
 import { disconnect, onError, onSessions } from '../lib/invoke';
@@ -17,7 +18,7 @@ import './App.css';
 const TopologyPage = lazy(() => import('./TopologyPage'));
 
 /** The surfaces reachable from the Dock. */
-export type Page = 'workspace' | 'topology' | 'creds' | 'implant' | 'events';
+export type Page = 'workspace' | 'topology' | 'creds' | 'implant' | 'events' | 'settings';
 
 /**
  * App — top-level shell.
@@ -153,6 +154,7 @@ function AppInner() {
         {activePage === 'creds' && <CredsPage />}
         {activePage === 'implant' && <ImplantPage />}
         {activePage === 'events' && <EventsPage />}
+        {activePage === 'settings' && <SettingsPage />}
       </main>
     </div>
   );

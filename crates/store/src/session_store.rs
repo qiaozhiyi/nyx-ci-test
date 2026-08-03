@@ -66,6 +66,9 @@ pub struct SessionRecord {
     /// so a leaked DB file yields no replayable token material. Restore never
     /// replays it, so this column is forensic, not auth state.
     pub auth_token: Option<Vec<u8>>,
+    /// Operator name who owns this session (schema v4+). `None` = unowned.
+    /// Set ONLY via `update_owner` — the beacon-path upsert never touches it.
+    pub owner: Option<String>,
 }
 
 pub struct SessionStore {
@@ -143,7 +146,7 @@ impl SessionStore {
     /// Append a `if current < N { ALTER ... }` arm here when altering
     /// the `sessions` table post-baseline, and bump
     /// `CURRENT_SCHEMA_VERSION` to match.
-    const CURRENT_SCHEMA_VERSION: i64 = 3;
+    const CURRENT_SCHEMA_VERSION: i64 = 4;
 
     fn migrate(conn: &Connection) -> Result<()> {
         // CREATE the version table FIRST so the SELECT below never fails
@@ -188,6 +191,11 @@ impl SessionStore {
                     "ALTER TABLE sessions ADD COLUMN last_recv INTEGER NOT NULL DEFAULT 0",
                     [],
                 )?;
+            }
+            // v3 → v4: operator ownership of a session. `DEFAULT NULL`
+            // backfills existing rows as unowned.
+            if current < 4 {
+                conn.execute("ALTER TABLE sessions ADD COLUMN owner TEXT", [])?;
             }
             conn.execute(
                 "UPDATE _sessions_schema_version SET version = ?1;",
@@ -260,6 +268,19 @@ impl SessionStore {
         Ok(n > 0)
     }
 
+    /// Set (or clear, with `None`) the operator who owns a session. Returns
+    /// `true` if a row matched. This is the ONLY writer of the `owner` column
+    /// — the beacon-path upsert deliberately leaves it untouched so a check-in
+    /// can never clobber operator assignment.
+    pub fn update_owner(&self, session_id: &str, owner: Option<&str>) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|_| SessionStoreError::Poisoned)?;
+        let n = conn.execute(
+            "UPDATE sessions SET owner = ?1 WHERE session_id = ?2",
+            params![owner, session_id],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Bump ONLY `last_seen` for an existing session — the cheap update the
     /// beacon path runs (throttled) between full upserts. Returns `true` if a
     /// row matched (the session is known to the store).
@@ -278,7 +299,7 @@ impl SessionStore {
         let mut stmt = conn.prepare(
             "SELECT session_id, beacon_id, hostname, username, os, arch, pid,
                     is_admin, first_seen, last_seen, auth_token,
-                    send_counter, last_recv
+                    send_counter, last_recv, owner
              FROM sessions
              ORDER BY last_seen DESC",
         )?;
@@ -326,6 +347,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         auth_token: row.get(10)?,
         send_counter: row.get::<_, i64>(11)? as u64,
         last_recv: row.get::<_, i64>(12)? as u64,
+        owner: row.get(13)?,
     })
 }
 
@@ -348,6 +370,7 @@ mod tests {
             send_counter: 0,
             last_recv: 0,
             auth_token: Some(vec![0xAB; 32]),
+            owner: None,
         }
     }
 
@@ -463,6 +486,27 @@ mod tests {
     }
 
     #[test]
+    fn owner_roundtrip_and_upsert_never_clobbers() {
+        let s = SessionStore::open_in_memory().unwrap();
+        let mut r = rec("aa", "host-a", 1000);
+        r.owner = Some("alice".into());
+        s.upsert(&r).unwrap();
+        // The beacon-path upsert deliberately does NOT write owner — an
+        // in-memory record without owner must not clear an assigned one.
+        let mut r2 = rec("aa", "host-a", 1001);
+        r2.owner = None;
+        s.upsert(&r2).unwrap();
+        assert_eq!(s.list().unwrap().remove(0).owner.as_deref(), None);
+        // The dedicated update_owner is the only writer.
+        assert!(s.update_owner("aa", Some("bob")).unwrap());
+        assert_eq!(s.list().unwrap().remove(0).owner.as_deref(), Some("bob"));
+        assert!(s.update_owner("aa", None).unwrap());
+        assert_eq!(s.list().unwrap().remove(0).owner, None);
+        // Unknown session → Ok(false).
+        assert!(!s.update_owner("nonexistent", Some("x")).unwrap());
+    }
+
+    #[test]
     fn update_counters_persists_and_reports_match() {
         let s = SessionStore::open_in_memory().unwrap();
         s.upsert(&rec("aa", "host-a", 1000)).unwrap();
@@ -523,7 +567,7 @@ mod tests {
         assert!(s.update_counters("legacy-id", 7, 9).unwrap());
         let got = s.list().unwrap().remove(0);
         assert_eq!((got.send_counter, got.last_recv), (7, 9));
-        // Version must be stamped 3 after the migration.
+        // Version must be stamped to the current version after the migration.
         let v: i64 = {
             let conn = Connection::open(&path).unwrap();
             conn.query_row("SELECT version FROM _sessions_schema_version", [], |r| {
@@ -531,7 +575,12 @@ mod tests {
             })
             .unwrap()
         };
-        assert_eq!(v, 3, "schema version must be stamped to 3");
+        assert_eq!(v, SessionStore::CURRENT_SCHEMA_VERSION);
+        // v4 adds the owner column: legacy rows restore as unowned.
+        assert_eq!(got.owner, None);
+        // The owner column is writable on migrated rows.
+        assert!(s.update_owner("legacy-id", Some("alice")).unwrap());
+        assert_eq!(s.list().unwrap().remove(0).owner.as_deref(), Some("alice"));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));

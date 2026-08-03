@@ -16,13 +16,14 @@ interface NavItem {
   badge?: number;
 }
 
-// workspace & topology are the two live surfaces; the rest are gated for now.
+// All five surfaces + settings are live.
 const NAV: NavItem[] = [
   { id: 'workspace', icon: '⌘', label: '工作区 — 会话与控制台' },
   { id: 'topology', icon: '◈', label: '拓扑 — 3D beacon 图' },
   { id: 'creds', icon: '🔑', label: '凭据库' },
   { id: 'events', icon: '≡', label: '审计 / 事件日志' },
   { id: 'implant', icon: '⚙', label: 'Implant 构建器' },
+  { id: 'settings', icon: '⋮', label: '设置' },
 ];
 
 export function Dock({ activePage, onPageChange, onDisconnect }: DockProps) {
@@ -66,15 +67,7 @@ export function Dock({ activePage, onPageChange, onDisconnect }: DockProps) {
         >
           <span className="dock-icon" aria-hidden>⏻</span>
         </button>
-        <button
-          type="button"
-          className="dock-item disabled"
-          title="设置（后续版本）"
-          aria-label="设置"
-          disabled
-        >
-          <span className="dock-icon" aria-hidden>⋮</span>
-        </button>
+
       </div>
     </nav>
   );

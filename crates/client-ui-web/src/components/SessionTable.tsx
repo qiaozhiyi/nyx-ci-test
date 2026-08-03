@@ -1,7 +1,8 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { SessionView } from '../lib/types';
 import { archName, classifyOs } from '../lib/types';
 import { listAllSessionMeta, useSessionMeta } from '../hooks/sessionMeta';
+import { fetchOperators, setSessionOwner } from '../lib/invoke';
 import './SessionTable.css';
 
 export interface SessionTableProps {
@@ -49,6 +50,22 @@ function staleMinutes(secs: number): number {
 
 export function SessionTable({ sessions, selectedId, onSelect }: SessionTableProps) {
   const [filter, setFilter] = useState<FilterKey>('all');
+  // Operator roster for the ownership picker (empty in open mode).
+  const [operators, setOperators] = useState<{ name: string; role: string }[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    fetchOperators()
+      .then((ops) => {
+        if (!cancelled) setOperators(ops);
+      })
+      .catch(() => {
+        // Roster is a collaboration nicety — a fetch failure must not break
+        // the session list.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   // Snapshot all metadata once per render; cheap (single localStorage index read)
   // and lets us sort/filter without each row subscribing individually.
   const allMeta = useMemo(() => listAllSessionMeta(), [sessions, selectedId, filter]);
@@ -118,6 +135,7 @@ export function SessionTable({ sessions, selectedId, onSelect }: SessionTablePro
               session={s}
               active={s.id === selectedId}
               onSelect={onSelect}
+              operators={operators}
             />
           ))
         )}
@@ -130,9 +148,10 @@ interface SessionRowProps {
   session: SessionView;
   active: boolean;
   onSelect: (id: string) => void;
+  operators: { name: string; role: string }[];
 }
 
-function SessionRow({ session, active, onSelect }: SessionRowProps) {
+function SessionRow({ session, active, onSelect, operators }: SessionRowProps) {
   const { meta, toggleStar, update, addTag, removeTag, reset } = useSessionMeta(session.id);
   const [tagDraft, setTagDraft] = useState('');
   const da = isDA(session);
@@ -255,6 +274,35 @@ function SessionRow({ session, active, onSelect }: SessionRowProps) {
               maxLength={500}
             />
           </label>
+
+          <div className="st-meta-field">
+            <span className="st-meta-label">
+              归属
+              {session.owner && (
+                <span className="st-owner-chip" title={`由 ${session.owner} 认领`}>
+                  {session.owner}
+                </span>
+              )}
+            </span>
+            <select
+              className="st-meta-input mono"
+              aria-label="分配归属"
+              value={session.owner ?? ''}
+              onChange={(e) => {
+                const v = e.target.value;
+                setSessionOwner(session.id, v === '' ? null : v).catch((err: unknown) => {
+                  console.error('set owner failed:', err);
+                });
+              }}
+            >
+              <option value="">未分配</option>
+              {operators.map((o) => (
+                <option key={o.name} value={o.name}>
+                  {o.name} ({o.role})
+                </option>
+              ))}
+            </select>
+          </div>
 
           <div className="st-meta-actions">
             <button

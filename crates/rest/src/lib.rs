@@ -59,6 +59,10 @@ pub struct SessionView {
     /// gone. Cleared to `false` on the first live check-in after boot.
     #[serde(default)]
     pub stale: bool,
+    /// Operator name who owns this session (`POST /api/session/owner`).
+    /// `None` = unowned.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// Ack for `POST /api/task`: the assigned task id (and, for `Connect`, the

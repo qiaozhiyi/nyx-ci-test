@@ -80,6 +80,7 @@ pub(crate) fn extract_hex(text: &str) -> Option<String> {
     longest.map(|s| s.to_string())
 }
 
+pub mod discord_api;
 pub mod doh_dns;
 pub mod fingerprint;
 pub mod h2;

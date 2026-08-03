@@ -204,6 +204,48 @@ pub async fn revoke_implant(
         .map_err(|e| e.to_string())
 }
 
+// ===== Collaboration (M3) =====
+
+#[tauri::command]
+pub async fn fetch_report(state: State<'_, Arc<BackendState>>) -> Result<String, String> {
+    let conn = state.connection.read().await.clone();
+    let Some(Connection { server, bearer }) = conn else {
+        return Err("not connected".into());
+    };
+    let client = rest::http_client();
+    rest::fetch_report(&client, &server, &bearer)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_session_owner(
+    state: State<'_, Arc<BackendState>>,
+    session: String,
+    owner: Option<String>,
+) -> Result<Value, String> {
+    let conn = state.connection.read().await.clone();
+    let Some(Connection { server, bearer }) = conn else {
+        return Err("not connected".into());
+    };
+    let client = rest::http_client();
+    rest::set_session_owner(&client, &server, &bearer, &session, owner.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn fetch_operators(state: State<'_, Arc<BackendState>>) -> Result<Value, String> {
+    let conn = state.connection.read().await.clone();
+    let Some(Connection { server, bearer }) = conn else {
+        return Err("not connected".into());
+    };
+    let client = rest::http_client();
+    rest::fetch_operators(&client, &server, &bearer)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ===== Profile =====
 
 #[tauri::command]

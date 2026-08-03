@@ -1,0 +1,100 @@
+.settings-page {
+  height: 100%;
+  overflow-y: auto;
+  padding: var(--sp-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+  max-width: 720px;
+}
+
+.settings-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0;
+}
+
+.settings-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.settings-card h3 {
+  margin: 0 0 var(--sp-2);
+  font-size: 14px;
+  color: var(--text);
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.settings-input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+.settings-input:focus {
+  outline: none;
+  border-color: var(--accent-border);
+}
+
+.settings-btn {
+  align-self: flex-start;
+  background: var(--accent);
+  border: none;
+  border-radius: var(--r-md);
+  color: #fff;
+  padding: 8px 16px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.settings-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.settings-dl {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 6px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.settings-dl dt {
+  color: var(--text-muted);
+}
+
+.settings-dl dd {
+  margin: 0;
+  color: var(--text);
+  word-break: break-all;
+}
+
+.settings-muted {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 0;
+}
+
+.settings-notice {
+  color: var(--accent);
+  font-size: 13px;
+  margin: 0;
+}

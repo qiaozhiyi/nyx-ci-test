@@ -167,3 +167,24 @@
 @media (max-width: 760px) {
   .topo-hint { display: none; }
 }
+
+/* Honest empty state — no demo data (was MOCK_NODES fallback). */
+.topo-empty {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  text-align: center;
+  color: var(--text-muted);
+  pointer-events: none;
+  z-index: 5;
+}
+.topo-empty-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+.topo-empty-hint {
+  font-size: 12px;
+}

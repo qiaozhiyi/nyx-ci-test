@@ -19,8 +19,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   createTopologyScene,
-  MOCK_NODES,
-  MOCK_EDGES,
   sessionsToNodes,
   type TopologyNode,
   type TopologyEdge,
@@ -34,8 +32,8 @@ import { TopologyStats } from '../components/TopologyStats';
 import './TopologyPage.css';
 
 export interface TopologyPageProps {
-  /** Live sessions. When provided (and non-empty) the page uses real nodes;
-   *  otherwise it falls back to mock data for the demo. */
+  /** Live sessions. When empty the page shows the honest empty state
+   *  (server root + guidance) — no demo data. */
   sessions?: SessionView[];
   /** Optional task index: sessionId -> recent task labels. */
   tasksBySession?: Record<string, { id: number; label: string }[]>;
@@ -67,32 +65,34 @@ export function TopologyPage({ sessions, tasksBySession }: TopologyPageProps) {
   const [showInfo, setShowInfo] = useState(true);
   const [showStats, setShowStats] = useState(true);
 
-  // Decide node/edge set: prefer real sessions, fall back to mock.
-  const { nodes, edges, usingMock } = useMemo<{
+  // Node/edge set from REAL sessions only. With no sessions the page shows
+  // the honest empty state (server root + guidance) — the mock demo data was
+  // removed because it masqueraded as real network topology.
+  const { nodes, edges, empty } = useMemo<{
     nodes: TopologyNode[];
     edges: TopologyEdge[];
-    usingMock: boolean;
+    empty: boolean;
   }>(() => {
+    const srv: TopologyNode = {
+      id: '__srv__',
+      label: 'nyx-srv',
+      os: 'debian',
+      priv: 'server',
+      pos: [0, 0, 0],
+      size: 1.6,
+      isServer: true,
+    };
     if (sessions && sessions.length > 0) {
-      // No pivot edges available from the server in MVP — just egress lines.
+      // No pivot edges available from the server yet — just egress lines.
       const ns = sessionsToNodes(sessions);
-      const srv: TopologyNode = {
-        id: '__srv__',
-        label: 'nyx-srv',
-        os: 'debian',
-        priv: 'server',
-        pos: [0, 0, 0],
-        size: 1.6,
-        isServer: true,
-      };
       const es: TopologyEdge[] = ns.map((n) => ({
         from: '__srv__',
         to: n.id,
         kind: 'https' as const,
       }));
-      return { nodes: [srv, ...ns], edges: es, usingMock: false };
+      return { nodes: [srv, ...ns], edges: es, empty: false };
     }
-    return { nodes: MOCK_NODES, edges: MOCK_EDGES, usingMock: true };
+    return { nodes: [srv], edges: [], empty: true };
   }, [sessions]);
 
   // Create the scene exactly once per mount. Later data changes go through
@@ -147,7 +147,7 @@ export function TopologyPage({ sessions, tasksBySession }: TopologyPageProps) {
     setToggles((prev) => ({ ...prev, [key]: value }));
 
   // Resolve the matching live session for the selected node (best-effort).
-  const selectedSession = selected && !usingMock && sessions
+  const selectedSession = selected && !empty && sessions
     ? sessions.find((s) => s.id === selected.id)
     : undefined;
   // Only real task data — never invent entries for the panel.
@@ -172,12 +172,21 @@ export function TopologyPage({ sessions, tasksBySession }: TopologyPageProps) {
         </div>
       )}
 
+      {empty && (
+        <div className="topo-empty">
+          <div className="topo-empty-title">暂无 beacon 会话</div>
+          <div className="topo-empty-hint">
+            启动 agent-dev（或投递 implant）后，拓扑将显示真实节点与回连链路。
+          </div>
+        </div>
+      )}
+
       {/* Top floating toolbar */}
       <div className="topo-toolbar">
         <div className="topo-toolbar-brand">
           <span className="topo-toolbar-brand-mark" aria-hidden>◆</span>
           <span className="topo-toolbar-brand-text">Nyx 拓扑</span>
-          {usingMock && <span className="topo-toolbar-tag">演示数据</span>}
+          {empty && <span className="topo-toolbar-tag">等待回连</span>}
         </div>
         <div className="topo-toolbar-toggles">
           <Toggle

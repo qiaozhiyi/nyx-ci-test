@@ -4,14 +4,12 @@
 //! parent beacon (reverse_tcp). Traffic flows child → TCP → parent → HTTPS →
 //! server. This module implements the child (connecting) side only.
 //!
-//! ## NotImplemented status (implant-channels-2/3)
-//! The parent side (team-server listener / parent-implant bind socket) does
-//! NOT exist in this repo yet, so a beacon selected onto
-//! [`super::Channel::Tcp`] can never transact end-to-end. The dispatcher and `SetChannel` therefore gate
-//! this channel as not implemented (`Response::Err` on select, `None` +
-//! `ERR_CH_NOT_IMPL` on dispatch). The child-side code below stays live and
-//! timeout-bounded so the channel is ready to flip on when the pivot side
-//! lands.
+//! ## Parent side
+//! The team server hosts the parent listener (`crates/server/src/tcp_pivot.rs`,
+//! `NYX_TCP_PIVOT_ADDR`); a parent implant's bind socket works too. The peer
+//! is baked into the build config (`tcp_peer_host`/`tcp_peer_port`);
+//! `SetChannel` rejects an unconfigured peer loudly and the dispatcher fails
+//! fast with `ERR_CH_TCP_NOPEER` at transaction time.
 //!
 //! Framing: 4-byte little-endian length prefix followed by the frame body, in
 //! both directions. This mirrors CS's `tcp_frame_header` malleable option with a

@@ -162,6 +162,25 @@ export function revokeImplant(implantPub: string): Promise<{ ok: boolean; revoke
   return invoke('revoke_implant', { implantPub });
 }
 
+// ===== Collaboration (M3) =====
+
+/** Markdown engagement report snapshot (server `GET /api/report`). */
+export function fetchReport(): Promise<string> {
+  return invoke('fetch_report');
+}
+
+/** Assign (or clear) the operator who owns a session. */
+export function setSessionOwner(session: string, owner: string | null): Promise<{ ok: boolean }> {
+  return invoke('set_session_owner', { session, owner });
+}
+
+/** Operator roster for the ownership picker (`GET /api/operators`). */
+export function fetchOperators(): Promise<{ name: string; role: string }[]> {
+  return invoke('fetch_operators');
+}
+
+// ===== Profile =====
+
 // ===== Profile =====
 
 export interface ProfileView {
@@ -171,7 +190,7 @@ export interface ProfileView {
   useragent?: string | null;
 }
 
-// @deprecated: zero callers, kept for future profile API
+// Wired by the Settings page (shows the loaded Malleable profile).
 export function fetchProfile(): Promise<ProfileView> {
   return invoke('fetch_profile');
 }
