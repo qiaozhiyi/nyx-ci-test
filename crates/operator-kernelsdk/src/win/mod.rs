@@ -37,6 +37,10 @@ pub mod pagewalk;
 pub mod pattern_scan;
 pub mod resolve;
 pub mod va_rw;
+/// Real T4-T5 kernel assessment (module enumeration + code integrity +
+/// callback arrays + ETW-TI probe) over a live `KernelRw` — the
+/// operator-side replacement for the implant's user-mode T-REX kernel stubs.
+pub mod assess;
 
 use crate::byovd::{ByovdDriver, RtCore64, VulnDriverIoctl};
 use crate::etwti::{EtwTiBlind, EtwTiOffsets};

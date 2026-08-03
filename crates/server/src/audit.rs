@@ -58,6 +58,11 @@ pub struct AuditQuery {
 pub struct AuditWriter {
     inner: Mutex<Inner>,
     path: PathBuf,
+    /// Size cap for the ACTIVE file: `append` rotates when the active file
+    /// reaches this many bytes. Set from `NYX_AUDIT_MAX_BYTES` by
+    /// [`AuditWriter::open`]; [`AuditWriter::open_with_cap`] injects a fixed
+    /// cap so tests can exercise rotation without mutating process-global env.
+    cap_bytes: u64,
 }
 
 struct Inner {
@@ -122,7 +127,19 @@ fn rotate(path: &Path, file: &mut File) -> std::io::Result<()> {
 impl AuditWriter {
     /// Open (or create) the audit log at `path`. Recovers `seq` + `last_hash`
     /// from existing lines so the hash-chain stays continuous across restart.
+    /// The rotation size cap comes from the `NYX_AUDIT_MAX_BYTES` env var
+    /// (default 64 MiB) — see [`audit_max_bytes`].
     pub fn open(path: &Path) -> std::io::Result<Self> {
+        Self::open_with_cap(path, audit_max_bytes())
+    }
+
+    /// Open (or create) the audit log at `path` with an explicit rotation
+    /// cap (`cap_bytes`) instead of the process-global `NYX_AUDIT_MAX_BYTES`.
+    /// Semantics are identical to [`AuditWriter::open`] except for where the
+    /// cap comes from; tests use this to exercise rotation deterministically
+    /// without mutating env (which would rotate other parallel tests' logs
+    /// mid-flight).
+    pub fn open_with_cap(path: &Path, cap_bytes: u64) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -152,13 +169,16 @@ impl AuditWriter {
                 last_hash,
             }),
             path: path.to_path_buf(),
+            cap_bytes,
         })
     }
 
     /// Append a record. Never panics (a poisoned lock or IO error drops ONE
     /// record + logs — the server must stay up; the `seq` gap surfaces the loss).
     ///
-    /// Rotates the log when the active file exceeds [`audit_max_bytes`]: the
+    /// Rotates the log when the active file exceeds its size cap (the
+    /// `NYX_AUDIT_MAX_BYTES` env cap read by [`AuditWriter::open`], or the
+    /// cap injected via [`AuditWriter::open_with_cap`]): the
     /// current file is renamed to `<path>.1` (replacing any previous archive)
     /// and a fresh file is started. Rotation bounds what a later `query()` /
     /// `verify_chain()` call re-reads. The chain restarts at ZERO_HASH in the
@@ -184,7 +204,7 @@ impl AuditWriter {
         // fresh file restarts the chain at ZERO_HASH (the archive keeps its
         // own intact chain); `seq` keeps counting so ids stay globally unique.
         if let Ok(meta) = inner.file.metadata() {
-            if meta.len() >= audit_max_bytes() {
+            if meta.len() >= self.cap_bytes {
                 match rotate(&self.path, &mut inner.file) {
                     Ok(()) => inner.last_hash = ZERO_HASH.to_string(),
                     Err(e) => {
@@ -527,5 +547,71 @@ mod tests {
         let recs = w.query(&AuditQuery::default()).unwrap();
         assert_eq!(recs[0].seq, 2);
         assert!(AuditWriter::verify_chain(&path).unwrap());
+    }
+
+    /// Rotation archives the over-cap file and starts a FRESH chain: the
+    /// active file is renamed to the archive (via `with_extension("jsonl.1")`,
+    /// see `rotate`), the active path restarts small, and BOTH files carry
+    /// intact hash chains — the archive preserves the pre-rotation chain
+    /// (rename, not rewrite), the active file restarts at ZERO_HASH. `seq` is
+    /// NOT reset, so ids stay globally unique across the boundary.
+    ///
+    /// The cap is injected via `open_with_cap` so this test never mutates the
+    /// process-global `NYX_AUDIT_MAX_BYTES` (which would rotate other parallel
+    /// tests' logs mid-flight).
+    #[test]
+    fn audit_rotation_archives_and_resets_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        // Mirrors rotate()'s archive naming exactly (audit.log -> audit.jsonl.1).
+        let archive = path.with_extension("jsonl.1");
+        let cap = 512u64;
+
+        let w = AuditWriter::open_with_cap(&path, cap).unwrap();
+        let mut appended = 0u64;
+        while !archive.exists() {
+            appended += 1;
+            assert!(
+                appended <= 64,
+                "rotation never triggered after {appended} appends (cap {cap}B)"
+            );
+            w.append(
+                "rotate",
+                "system",
+                "t",
+                serde_json::json!({ "n": appended }),
+            );
+        }
+
+        // Rotation fired: the archive holds the >=cap pre-rotation log; the
+        // active file restarted small (only the record that triggered the
+        // rotation was written after the fresh open).
+        assert!(
+            std::fs::metadata(&archive).unwrap().len() >= cap,
+            "archive should hold the over-cap pre-rotation log"
+        );
+        let active_len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            active_len < cap,
+            "active file must restart small after rotation, got {active_len}B"
+        );
+
+        // The fresh ACTIVE file is a new chain: it verifies from ZERO_HASH...
+        assert!(
+            AuditWriter::verify_chain(&path).unwrap(),
+            "active file chain must verify (fresh chain restarting at ZERO_HASH)"
+        );
+        // ...while the ARCHIVE preserves the pre-rotation chain intact.
+        assert!(
+            AuditWriter::verify_chain(&archive).unwrap(),
+            "archive chain must verify (rename preserves the pre-rotation log)"
+        );
+
+        // `seq` is NOT reset across rotation: the active file holds only the
+        // post-rotation records, and the newest seq equals the total append
+        // count (rotation is the only event that produced the archive).
+        let recs = w.query(&AuditQuery::default()).unwrap();
+        assert_eq!(recs.len(), 1, "active file holds only post-rotation records");
+        assert_eq!(recs[0].seq, appended, "seq must keep counting across rotation");
     }
 }

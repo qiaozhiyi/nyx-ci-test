@@ -449,7 +449,7 @@ mod tests {
         let ctx = 0x2000_1000usize;
         let routine = 0xFFFF_8000_0000_3000u64;
         // Only slot 0 is occupied — without ntoskrnl bounds the kit skips it.
-        krw.set_u64(array_kva + 0 * 8, ctx as u64 | 0x1);
+        krw.set_u64(array_kva, ctx as u64 | 0x1);
         krw.set_u64(ctx, routine);
 
         let runtime = RuntimeOffsets {

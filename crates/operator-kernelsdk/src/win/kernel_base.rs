@@ -248,3 +248,105 @@ pub unsafe fn module_info_by_name(name: &[u8]) -> Result<ModuleInfo, KrwError> {
         core::str::from_utf8(name).unwrap_or("<mod>")
     )))
 }
+
+/// One entry from the loaded-kernel-module list, returned by [`loaded_modules`].
+pub struct LoadedModule {
+    pub base: usize,
+    pub size: usize,
+    /// Lowercased ASCII file name (e.g. `b"ntoskrnl.exe"`, `b"fltmgr.sys"`),
+    /// derived from the entry's full path tail. Safe to feed the EDR driver-name
+    /// matcher in `win::assess`.
+    pub name: alloc::vec::Vec<u8>,
+}
+
+/// Enumerate ALL loaded kernel modules (NtQuerySystemInformation class 11).
+///
+/// Unlike [`ntoskrnl_module_info`] / [`module_info_by_name`] (which return a
+/// single module), this returns the full list — used by the kernel assessment
+/// (`win::assess`) to count drivers and match EDR driver names. Module[0] is
+/// ntoskrnl.exe; drivers follow.
+///
+/// # Safety
+/// Same NtQuerySystemInformation contract as [`ntoskrnl_module_info`].
+pub unsafe fn loaded_modules() -> Result<alloc::vec::Vec<LoadedModule>, KrwError> {
+    type NtQuerySystemInformationFn =
+        unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
+    let nqsi: NtQuerySystemInformationFn =
+        unsafe { super::resolve::resolve_sym(b"ntdll.dll", b"NtQuerySystemInformation") }?;
+
+    let mut buf = alloc::vec![0u8; 256 * 1024];
+    let mut ret_len: u32 = 0;
+    let status = unsafe {
+        nqsi(
+            SYSTEM_MODULE_INFORMATION,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as u32,
+            &mut ret_len,
+        )
+    };
+    if status as u32 == 0xC0000004 {
+        buf = alloc::vec![0u8; ret_len as usize + 0x1000];
+        let status2 = unsafe {
+            nqsi(
+                SYSTEM_MODULE_INFORMATION,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                &mut ret_len,
+            )
+        };
+        if status2 < 0 {
+            return Err(KrwError::Other(alloc::format!(
+                "NtQuerySystemInformation retry failed: {:#x}",
+                status2 as u32
+            )));
+        }
+    } else if status < 0 {
+        return Err(KrwError::Other(alloc::format!(
+            "NtQuerySystemInformation failed: {:#x}",
+            status as u32
+        )));
+    }
+    if buf.len() < 8 {
+        return Err(KrwError::Other(
+            "NtQuerySystemInformation buffer too short".into(),
+        ));
+    }
+    let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    const ENTRY_SIZE: usize = 296;
+    let mut out = alloc::vec::Vec::with_capacity(count.min(1024));
+    for i in 0..count {
+        let off = 8 + i * ENTRY_SIZE;
+        if off + ENTRY_SIZE > buf.len() {
+            break;
+        }
+        let entry_ptr = buf.as_ptr().wrapping_add(off) as *const RtlProcessModuleInformation;
+        let entry = unsafe { &*entry_ptr };
+        // File name = bytes after the last '\' or '/', NUL-stripped, lowercased.
+        let plen = entry
+            .full_path
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(entry.full_path.len());
+        let mut start = 0usize;
+        for (idx, &b) in entry.full_path[..plen].iter().enumerate() {
+            if b == b'\\' || b == b'/' {
+                start = idx + 1;
+            }
+        }
+        let name: alloc::vec::Vec<u8> = entry.full_path[start..plen]
+            .iter()
+            .map(|b| b.to_ascii_lowercase())
+            .collect();
+        out.push(LoadedModule {
+            base: entry.image_base as usize,
+            size: entry.image_size as usize,
+            name,
+        });
+    }
+    if out.is_empty() {
+        return Err(KrwError::Other(
+            "NtQuerySystemInformation returned 0 modules".into(),
+        ));
+    }
+    Ok(out)
+}

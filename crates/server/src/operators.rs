@@ -867,4 +867,99 @@ mod tests {
         assert!(reg.resolve("alice:wrong").is_none());
         assert!(reg.resolve("nobody:x").is_none());
     }
+
+    /// The per-writer temp-name fix (`json.tmp.<sha256(tag) prefix>`) must
+    /// hold under a REAL concurrent rehash race: two threads persisting
+    /// DIFFERENT full registry snapshots to the SAME path with different tags.
+    /// Each writer's temp is private and the rename is atomic, so both writers
+    /// succeed and the final file is ONE complete, parseable snapshot — never
+    /// a torn interleave — containing every operator (last-writer-wins per
+    /// key is fine), with 0600 perms. A barrier forces the writes to overlap
+    /// (no sleeps); a shared-temp implementation would fail the parse/union
+    /// assertions under this interleaving.
+    #[test]
+    fn concurrent_persist_no_torn_write() {
+        use std::sync::Barrier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operators.json");
+
+        // Two snapshots of the SAME registry that differ only in one
+        // operator's freshly-rehashed secret (the concurrent-rehash race from
+        // persist()'s doc). Both maps carry the FULL registry.
+        let mk_map = |conflict_secret: &str| {
+            let mut m = HashMap::new();
+            m.insert(
+                "conflict".into(),
+                OperatorRecord {
+                    name: "conflict".into(),
+                    secret_hash: conflict_secret.into(),
+                    role: Role::Admin,
+                    created: 0,
+                },
+            );
+            for i in 0..32 {
+                let name = format!("op-{i}");
+                m.insert(
+                    name.clone(),
+                    OperatorRecord {
+                        name,
+                        secret_hash: format!("plain:{}", sha256_hex(&format!("secret-{i}"))),
+                        role: Role::Operator,
+                        created: 0,
+                    },
+                );
+            }
+            m
+        };
+        let map_a = mk_map("rehash-v1");
+        let map_b = mk_map("rehash-v2");
+
+        let barrier = std::sync::Arc::new(Barrier::new(3)); // two writers + this thread
+        let p1 = path.clone();
+        let p2 = path.clone();
+        let b1 = barrier.clone();
+        let t1 = std::thread::spawn(move || {
+            b1.wait();
+            persist(&p1, &map_a, "alice").expect("writer A must succeed");
+        });
+        let b2 = barrier.clone();
+        let t2 = std::thread::spawn(move || {
+            b2.wait();
+            persist(&p2, &map_b, "bob").expect("writer B must succeed");
+        });
+        barrier.wait(); // release both writers together
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        // Final file must exist and parse as ONE complete JSON snapshot (a
+        // torn write would fail to parse or duplicate records).
+        let bytes = std::fs::read(&path).expect("final registry file must exist");
+        let rows: Vec<OperatorRecord> = serde_json::from_slice(&bytes)
+            .expect("final file must be one complete, valid JSON snapshot (no torn write)");
+        assert_eq!(
+            rows.len(),
+            33,
+            "union of the two snapshots must be complete and un-duplicated"
+        );
+        let names: std::collections::HashSet<String> =
+            rows.iter().map(|r| r.name.clone()).collect();
+        for i in 0..32 {
+            assert!(names.contains(&format!("op-{i}")), "missing op-{i}");
+        }
+        // The shared key must hold ONE complete writer value (last-writer-wins).
+        let conflict = rows.iter().find(|r| r.name == "conflict").unwrap();
+        assert!(
+            conflict.secret_hash == "rehash-v1" || conflict.secret_hash == "rehash-v2",
+            "conflict key must be one COMPLETE writer value, got: {}",
+            conflict.secret_hash
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "persisted registry must be 0600");
+        }
+    }
 }

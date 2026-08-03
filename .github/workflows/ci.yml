@@ -153,6 +153,7 @@ jobs:
         run: |
           python3 -m pip install --user -q unicorn
           python3 tools/loader-emu/loader_emu.py
+          python3 tools/loader-emu/loader_emu.py --blob tools/loader-emu/fixture/blob.bin
 
   # ---- Gate 6: implant selftest DLL under Qiling (Windows x86_64 emu) ----
   # Builds the selftest-flavored implant DLL for the Windows GNU target and

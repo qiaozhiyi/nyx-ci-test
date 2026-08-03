@@ -12,6 +12,33 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-03 wI: T-REX kernel assessment → operator-kernelsdk (real, hosted-CI
+verified). Working tree — entries cite `file:line` evidence; backfill SHAs when
+the wave is committed.
+
+### Added
+
+- **Real T4-T5 kernel assessment (wI).** The implant's user-mode T-REX kernel
+  stubs (`assess_kernel` + six stub helpers in
+  `crates/implant-win/src/trex/mod.rs`) are deleted. The real assessment lives
+  in `operator-kernelsdk`: `KernelAssessment` / `assess_kernel(&dyn KernelRw)`
+  — module enumeration + code integrity via `NtQuerySystemInformation`
+  (classes 11/103), Ps*NotifyRoutine callback counts via the pattern-scan path
+  shared with `resolve_offsets`, ETW-TI enable probe via the `EtwTiBlind`
+  chase, kernel-debugger probe via `KUSER_SHARED_DATA`. `status` is `Assessed`
+  only when a real NtQuery path succeeded — never fabricated
+  (`crates/operator-kernelsdk/src/{lib.rs,win/assess.rs,win/kernel_base.rs}`).
+- `nyx-kernel assess` subcommand prints a single `{"assess":{...}}` JSON line
+  (stdout) + human summary (stderr); exits 0 even for a hostile posture — an
+  assessment, not a gate (`crates/operator-kernel-cli/src/main.rs`).
+- Hard CI gate: `windows-byovd-hosted.yml` runs `nyx-kernel.exe assess` and
+  fails the job unless status=Assessed and total_drivers > 0; job-level
+  `continue-on-error` removed (repo gate convention), HVCI-skip stays green via
+  the existing conditional steps
+  (`.github/workflows/windows-byovd-hosted.yml`).
+- T-REX module docs updated: the implant covers T0-T3 user-mode; T4-T5 is
+  operator-side via `nyx-kernel assess` (`crates/implant-win/src/trex/mod.rs`).
+
 2026-08-02 zero-leftover sweep (work packages w-inject / w-misc / w-kernel-relay /
 w-gc / w-transport / w-offsets / w-pattern / w-docs-cleanup). IN PROGRESS — working
 tree, so entries cite `file:line` evidence; backfill SHAs when the wave is committed.
@@ -26,9 +53,13 @@ tree, so entries cite `file:line` evidence; backfill SHAs when the wave is commi
     `crates/implant-win/src/bof.rs`).
   - w-misc: keylog dump takes the same claim/lock discipline as the live
     WH_KEYBOARD_LL writer so it never reads a reserved-but-unwritten slot
-    (`crates/implant-win/src/keylog.rs`); T-REX `assess_kernel` reports an explicit
-    not-assessed/unsupported status instead of a false-clean zeroed report
-    (`crates/implant-win/src/trex/mod.rs`).
+    (`crates/implant-win/src/keylog.rs`); T-REX drops its user-mode kernel
+    stubs — the T4-T5 kernel assessment moved to `operator-kernelsdk`
+    (`assess_kernel` / `nyx-kernel assess`), BYOVD-backed and hard-gated on
+    hosted Windows CI (`crates/implant-win/src/trex/mod.rs`,
+    `crates/operator-kernelsdk/src/{lib.rs,win/assess.rs,win/kernel_base.rs}`,
+    `crates/operator-kernel-cli/src/main.rs`,
+    `.github/workflows/windows-byovd-hosted.yml`).
   - w-kernel-relay: `send_op` gains the method field + a daemon neutralize dispatch arm
     (freeze/choke/kill via the kernelsdk path the CLI uses); kernel audit records the
     outcome after dispatch; daemon gets per-connection threads + a 16 KiB line cap

@@ -1093,7 +1093,7 @@ CLAUDE.md 和 STATUS.md 诚实标注了 CET Shadow Stack、section-backed handle
 
 | 能力声称 | 项目自评 | 三轮审计验证 | 差距性质 |
 |---|---|---|---|
-| T-REX 侦察引擎 | "实现" | **CRIT-3: 100% stub，全部 API 返回 null/0** | ❌ 虚假（现已诚实化为 Unknown banner） |
+| T-REX 侦察引擎 | "实现" | **CRIT-3: 100% stub，全部 API 返回 null/0** | ✅ 已修复：T0-T3 真 scanner（2026-07-14+）；T4-T5 内核评估移入 operator-kernelsdk（`nyx-kernel assess`，BYOVD 真机 + hosted CI 硬门，2026-08） |
 | Pool Party 注入 | "0-of-3 FND" | **CRIT-NEW-2: 实际调用 NtCreateThreadEx** | ❌ 误导性（现已诚实标注） |
 | mem mask/unmask 往返 | "byte-identical" | **CRIT-NEW-4: 每次生成新 key → 数据损坏** | ❌ 虚假（已修复：单 key 缓存） |
 | CSPRNG 失败处理 | "安全" | **CRIT-NEW-1: 失败时全零标量 → 共享确定密钥** | ❌ 严重（已修复：Result 传播） |

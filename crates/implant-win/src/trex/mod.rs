@@ -18,6 +18,13 @@
 //! | **T3** | ★★★☆☆ Medium | `OpenSCManagerW` + `EnumServicesStatusExW` | None |
 //! | **T4** | ★★★★☆ High | Kernel module enumeration (`NtQuerySystemInformation` class 11) | Admin |
 //! | **T5** | ★★★★★ BYOVD | Kernel callback enumeration + HVCI/CET probe | Admin + Driver |
+//!
+//! **T4-T5 are NOT implemented in this module (wI).** The kernel assessment is
+//! operator-side: `operator-kernelsdk::assess_kernel` (driven by `nyx-kernel
+//! assess`, BYOVD-backed) performs the real module enumeration, code-integrity,
+//! callback-array and ETW-TI probe, verified on hosted Windows CI
+//! (`.github/workflows/windows-byovd-hosted.yml`). This module covers the
+//! user-mode tiers T0-T3 only.
 
 #![cfg(target_os = "windows")]
 
@@ -67,7 +74,6 @@ pub struct TargetAssessment {
     pub tier: ThreatTier,
     pub products: Vec<DetectedProduct>,
     pub mitigations: MitigationFlags,
-    pub kernel_posture: KernelPosture,
     pub recommendation: &'static str,
 }
 
@@ -143,48 +149,6 @@ pub struct MitigationFlags {
     pub secure_boot: bool,
 }
 
-/// Whether a [`KernelPosture`] reflects a real kernel-layer assessment.
-///
-/// Honest-status marker for the T4/T5 pipeline. The backing helpers
-/// (`query_system_module_info`, `get_ntoskrnl_base`, `probe_etw_provider_enabled`,
-/// …) are user-mode stubs that return null/None/false — the structures they
-/// would read (SystemModuleInformation, SystemCodeIntegrityInformation, the
-/// Ps/Ob/Cm callback arrays, ETW-TI registrar state) live in kernel memory and
-/// are not reachable from a plain user-mode PIC implant without a BYOVD read
-/// primitive. Reporting the all-zero [`KernelPosture::default()`] as if it were
-/// a clean kernel would be a false 'clean' posture. Consumers MUST treat a
-/// `NotAssessed` posture as *unknown*, never as evidence of a clean kernel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum KernelAssessmentStatus {
-    /// Assessment completed against real kernel data.
-    Assessed,
-    /// Assessment could not run — kernel reads are unavailable here. The
-    /// posture fields are unset, NOT evidence of a clean kernel.
-    #[default]
-    NotAssessed,
-}
-
-/// Kernel-layer posture — requires T4+ access.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct KernelPosture {
-    /// Whether the fields below reflect a real assessment. `NotAssessed`
-    /// (default) means the posture is unknown — never interpret zeroed fields
-    /// as a clean kernel.
-    pub status: KernelAssessmentStatus,
-    pub total_drivers: u32,
-    pub edr_drivers: u32,
-    pub minifilter_count: u32,
-    pub etw_ti_active: bool,
-    pub process_callbacks: u32,
-    pub image_load_callbacks: u32,
-    pub registry_callbacks: u32,
-    pub ob_callbacks: u32,
-    pub test_signing_enabled: bool,
-    pub kernel_debugger_present: bool,
-    pub hvci_enabled: bool,
-    pub vbs_enabled: bool,
-}
-
 // ---- Public API -----------------------------------------------------------
 /// Whether the T-REX user-mode scanners are backed by real syscall resolvers.
 ///
@@ -214,7 +178,6 @@ pub unsafe fn assess_user_mode() -> TargetAssessment {
         tier: ThreatTier::Clean,
         products: Vec::with_capacity(16),
         mitigations: MitigationFlags::default(),
-        kernel_posture: KernelPosture::default(),
         recommendation: "Continue with user-mode evasion",
     };
     // ⚠ T-REX RECON UNIMPLEMENTED (P0-6): every scan_* helper below is a stub
@@ -249,65 +212,6 @@ pub unsafe fn assess_user_mode() -> TargetAssessment {
     assessment.recommendation = recommend(&assessment);
 
     assessment
-}
-
-/// Run T4-T5 assessment (kernel access required).
-/// `rw` is a kernel read/write primitive (e.g., BYOVD driver handle).
-///
-/// Honest-status contract: the backing helpers are user-mode stubs
-/// (`query_system_module_info` → null, `get_ntoskrnl_base` → None,
-/// `probe_etw_provider_enabled` → false), so a real kernel assessment cannot
-/// be produced from user mode — the structures they would read are in kernel
-/// memory. Rather than report an all-zero (false 'clean') posture, this
-/// returns [`KernelAssessmentStatus::NotAssessed`]; the enumeration calls are
-/// retained so that implementing the helpers (or wiring a real `rw` read
-/// primitive) flips the status to `Assessed` in exactly one place.
-pub unsafe fn assess_kernel(rw: &dyn KernelReadWrite) -> KernelPosture {
-    let mut posture = KernelPosture::default();
-
-    // T4: Kernel module enumeration
-    enumerate_kernel_modules(&mut posture);
-
-    // T4: HVCI/VBS/Code Integrity status
-    query_code_integrity(&mut posture);
-
-    // T5: Kernel callback enumeration (BYOVD read)
-    enumerate_process_callbacks(rw, &mut posture);
-    enumerate_image_load_callbacks(rw, &mut posture);
-    enumerate_registry_callbacks(rw, &mut posture);
-
-    // T5: ETW-TI provider status
-    probe_etw_ti_provider(&mut posture);
-
-    // The helpers above are user-mode stubs — nothing real was measured. Mark
-    // the posture NOT ASSESSED so consumers never mistake the zeroed fields
-    // for a clean kernel. Flip to `Assessed` when the helpers gain real
-    // kernel reads.
-    posture.status = KernelAssessmentStatus::NotAssessed;
-
-    posture
-}
-
-/// Combine user-mode + kernel assessment into final decision.
-///
-/// A [`KernelAssessmentStatus::NotAssessed`] kernel posture is treated as
-/// unknown: it never RAISES the tier (no fabricated kernel detections), and
-/// callers that need to distinguish "clean" from "not measured" must check
-/// `kernel.status` themselves — a NotAssessed posture is NOT evidence of a
-/// clean kernel.
-pub fn final_assessment(user: TargetAssessment, kernel: KernelPosture) -> ThreatTier {
-    let mut tier = user.tier;
-
-    if kernel.status == KernelAssessmentStatus::Assessed
-        && (kernel.etw_ti_active || kernel.process_callbacks > 0)
-    {
-        tier = tier.max(ThreatTier::KernelArmed);
-    }
-    if user.mitigations.hvci_enabled || user.mitigations.cet_strict {
-        tier = tier.max(ThreatTier::Fortress);
-    }
-
-    tier
 }
 
 // ---- T0: Process Name Scanning --------------------------------------------
@@ -683,121 +587,6 @@ fn query_image_load(_flags: &mut MitigationFlags) {
     }
 }
 
-// ---- Kernel-Layer Assessment (T4-T5) --------------------------------------
-
-/// Trait for kernel read/write primitive (BYOVD driver handle).
-pub trait KernelReadWrite {
-    unsafe fn read_u64(&self, addr: u64) -> Option<u64>;
-    unsafe fn read_bytes(&self, addr: u64, buf: &mut [u8]) -> bool;
-    unsafe fn write_u64(&self, addr: u64, val: u64) -> bool;
-}
-
-unsafe fn enumerate_kernel_modules(posture: &mut KernelPosture) {
-    // NtQuerySystemInformation(SystemModuleInformation, class 11)
-    // Maps module names → EDR driver patterns
-    let buf = query_system_module_info();
-    if buf.is_null() {
-        return;
-    }
-
-    let modules = &*(buf as *const SystemModuleInfo);
-    for i in 0..modules.count as usize {
-        let entry = &*((buf as usize
-            + core::mem::size_of::<SystemModuleInfo>()
-            + i * core::mem::size_of::<SystemModuleEntry>())
-            as *const SystemModuleEntry);
-        let name = core::ffi::CStr::from_ptr(entry.name.as_ptr() as *const i8);
-        let name_bytes = name.to_bytes();
-
-        posture.total_drivers += 1;
-        if is_edr_driver(name_bytes) {
-            posture.edr_drivers += 1;
-        }
-    }
-
-    free(buf as *mut u8);
-}
-
-unsafe fn query_code_integrity(posture: &mut KernelPosture) {
-    // NtQuerySystemInformation(SystemCodeIntegrityInformation, class 103)
-    // Flags: CODEINTEGRITY_OPTION_ENABLED, HVCI_KMCI_ENABLED, TESTSIGN
-    let ci = query_system_code_integrity();
-    if ci.is_null() {
-        return;
-    }
-
-    let info = &*ci;
-    let options = info.code_integrity_options;
-
-    posture.hvci_enabled = (options & (1 << 9)) != 0; // HVCI_KMCI_ENABLED
-    posture.vbs_enabled = (options & (1 << 12)) != 0; // VBS enabled (approximate)
-    posture.test_signing_enabled = (options & (1 << 1)) != 0; // TESTSIGN
-}
-
-unsafe fn enumerate_process_callbacks(rw: &dyn KernelReadWrite, posture: &mut KernelPosture) {
-    // Locate PspCreateProcessNotifyRoutine via ntoskrnl.exe base + offset
-    // Read 64-slot array, decode EX_CALLBACK pointers, map to drivers
-    let ntos = match get_ntoskrnl_base() {
-        Some(b) => b,
-        None => return,
-    };
-
-    // PspCreateProcessNotifyRoutine offset — build-specific
-    // Fallback: pattern scan for the array reference
-    let array_addr = match find_callback_array(ntos, rw) {
-        Some(a) => a,
-        None => return,
-    };
-
-    for slot in 0..64 {
-        let entry = match rw.read_u64(array_addr + slot * 8) {
-            Some(e) => e,
-            None => continue,
-        };
-        if entry == 0 {
-            continue;
-        }
-
-        // EX_CALLBACK: clear low 4 bits (EX_RUNDOWN_REF flags)
-        let callback = entry & !0xF;
-        if callback != 0 {
-            posture.process_callbacks += 1;
-        }
-    }
-}
-
-unsafe fn enumerate_image_load_callbacks(_rw: &dyn KernelReadWrite, posture: &mut KernelPosture) {
-    // PsSetLoadImageNotifyRoutine → PspLoadImageNotifyRoutine array
-    // Same pattern as process callbacks but different symbol
-    // PspLoadImageNotifyRoutine — typically near PspCreateProcessNotifyRoutine
-    let ntos = match get_ntoskrnl_base() {
-        Some(b) => b,
-        None => return,
-    };
-    // Offset relative to PspCreateProcessNotifyRoutine (typically +0x200 or similar)
-    // For now: skip if Psp offset unknown
-    let _ = ntos;
-    posture.image_load_callbacks = 0; // requires per-build offset DB
-}
-
-unsafe fn enumerate_registry_callbacks(_rw: &dyn KernelReadWrite, posture: &mut KernelPosture) {
-    // CmRegisterCallback → CmpCallBackVector
-    // Enumerate registry callbacks similarly
-    posture.registry_callbacks = 0; // requires per-build offset DB
-}
-
-unsafe fn probe_etw_ti_provider(posture: &mut KernelPosture) {
-    // GUID: F4E1897C-BB5D-5668-F1D8-040F4D8DD344
-    // Query via NtTraceControl(EtwpNotificationRegistrar, ...)
-    let guid: [u8; 16] = [
-        0x7C, 0x89, 0xE1, 0xF4, 0x5D, 0xBB, 0x68, 0x56, 0xF1, 0xD8, 0x04, 0x0F, 0x4D, 0x8D, 0xD3,
-        0x44,
-    ];
-    // NtTraceControl(control_code=0x0027, guid, enable_info)
-    // If enable_info.IsEnabled != 0 → ETW-TI is active
-    posture.etw_ti_active = probe_etw_provider_enabled(&guid);
-}
-
 // ---- Decision Engine ------------------------------------------------------
 
 fn determine_tier(assessment: &TargetAssessment) -> ThreatTier {
@@ -1027,9 +816,10 @@ fn match_service_pattern(display: &str, image: &str) -> Option<Vendor> {
 /// false positives (e.g. service-substring `"sense"` matches the unrelated
 /// `Sensor servo` driver, `"sep"` matches any `*.sep` inf) and false negatives
 /// (real EDR drivers use the kernel-driver naming space: `.sys` suffix, vendor
-/// prefixes absent from the service list). See `is_edr_driver` for the
-/// byte-level matcher used by the T4 kernel module enumerator — this function
-/// is the string-level twin used by the T2 WMI `Win32_SystemDriver` query.
+/// prefixes absent from the service list). This is the string-level matcher
+/// used by the T2 WMI `Win32_SystemDriver` query; the byte-level twin used by
+/// the operator-side kernel module enumerator lives in `operator-kernelsdk`
+/// (`win::assess::is_edr_driver_name`).
 ///
 /// Rules (informed by 2026 EDR driver naming, see EDRSandblast / eSentire
 /// Surveyor driver name lists):
@@ -1113,25 +903,6 @@ fn match_driver_name(name: &str) -> Option<Vendor> {
     None
 }
 
-fn is_edr_driver(name: &[u8]) -> bool {
-    // EDR kernel driver names (2026)
-    let name_lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
-    let n = core::str::from_utf8(&name_lower).unwrap_or("");
-    n.contains("csagent") || n.contains("csdevice") ||
-    n.contains("sentinel") && n.contains("monitor") ||
-    n.contains("cbfs") || n.contains("carbon") ||
-    n.contains("elastic") && n.contains("defend") ||
-    n.contains("cortex") || n.contains("traps") ||
-    n.contains("sophos") && n.contains("driver") ||
-    n.contains("klif") || n.contains("klam") || // Kaspersky
-    n.contains("mfe") || n.contains("mfenc") || // McAfee
-    n.contains("symefa") || n.contains("symevnt") || // Symantec
-    n.contains("eamonm") || n.contains("ehdrv") || // ESET
-    n.contains("bdvedisk") || n.contains("trufos") || // Bitdefender
-    n.contains("sysmon") || n.contains("procmon") ||
-    n.contains("windefend") || n.contains("wdfilter")
-}
-
 // ---- Internal helpers (stubs — resolved via PEB walk at runtime) ----------
 
 type Handle = *mut core::ffi::c_void;
@@ -1171,25 +942,6 @@ struct ServiceStatusProcess {
     pub wait_hint: u32,
     pub process_id: u32,
     pub service_flags: u32,
-}
-
-#[repr(C)]
-struct SystemModuleInfo {
-    _reserved: u32,
-    count: u32,
-}
-
-#[repr(C)]
-struct SystemModuleEntry {
-    _section: usize,
-    _flags: u32,
-    base: usize,
-    size: u32,
-    _index: u16,
-    _load_count: u16,
-    _load_order_index: u16,
-    _name_offset: u16,
-    name: [u8; 256],
 }
 
 unsafe fn create_toolhelp_snapshot() -> Handle {
@@ -1739,38 +1491,6 @@ unsafe fn wmi_query_drivers(a: &mut TargetAssessment) {
         }
     }
 }
-// ---- Kernel-backing helpers (T4/T5) --------------------------------------
-//
-// All of these are USER-MODE STUBS: they cannot read kernel memory, so they
-// return null/None/false. This is deliberate — the structures they would read
-// (SystemModuleInformation, SystemCodeIntegrityInformation, the Ps/Ob/Cm
-// callback arrays, ETW-TI registrar state) are reachable only via a kernel
-// read/write primitive (e.g. a BYOVD driver handle, passed as `rw` to
-// [`assess_kernel`]). Because of that, [`assess_kernel`] reports
-// [`KernelAssessmentStatus::NotAssessed`] rather than a false-'clean' zeroed
-// posture. Implement these against a real `KernelReadWrite` primitive and flip
-// the status in `assess_kernel` to `Assessed`.
-unsafe fn query_system_module_info() -> *mut u8 {
-    core::ptr::null_mut()
-}
-unsafe fn query_system_code_integrity() -> *mut CodeIntegrityInfo {
-    core::ptr::null_mut()
-}
-unsafe fn get_ntoskrnl_base() -> Option<u64> {
-    None
-}
-unsafe fn find_callback_array(_ntos: u64, _rw: &dyn KernelReadWrite) -> Option<u64> {
-    None
-}
-unsafe fn probe_etw_provider_enabled(_guid: &[u8; 16]) -> bool {
-    false
-}
-
-#[repr(C)]
-struct CodeIntegrityInfo {
-    code_integrity_options: u32,
-    _pad: [u32; 4],
-}
 
 fn merge_or_push(products: &mut Vec<DetectedProduct>, product: DetectedProduct) {
     for p in products.iter_mut() {
@@ -1782,19 +1502,6 @@ fn merge_or_push(products: &mut Vec<DetectedProduct>, product: DetectedProduct) 
         }
     }
     products.push(product);
-}
-
-trait Max {
-    fn max(self, other: Self) -> Self;
-}
-impl Max for ThreatTier {
-    fn max(self, other: Self) -> Self {
-        if (other as u8) > (self as u8) {
-            other
-        } else {
-            self
-        }
-    }
 }
 
 // ---- Selftest support -----------------------------------------------------

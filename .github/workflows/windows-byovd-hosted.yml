@@ -14,7 +14,7 @@ name: Win BYOVD (hosted)
 #   2. HVCI 关 → 下载 RTCore64.sys(公开 PoC,运行时拉,不进 git)→ 构建
 #      operator-kernel-cli → bootstrap BYOVD → 跑全 kernelsdk 路径
 #      (pg-window / detach-minifilter / blind-etw / hide / dump-lsass)
-#   3. HVCI 开 → 跳过,不挂 workflow(continue-on-error + 条件 step)
+#   3. HVCI 开 → 跳过,不挂 workflow(条件 step 全 skip;assess 硬门仅 skip==false 时执行)
 #
 # 只覆盖 P0.a/b(纯算法,无需内核)+ P3.b(minidump CLI)+ ETW-TI/DKOM/LSASS
 # (BYOVD IOCTL 路径)。P4/P5 在 windows-ci.yml 跑(纯用户态)。
@@ -41,7 +41,11 @@ jobs:
   byovd:
     runs-on: windows-latest
     timeout-minutes: 25
-    continue-on-error: true   # HVCI 开则跳过,不挂 workflow
+    # wI: job-level continue-on-error REMOVED so the kernel-assessment step is a
+    # real hard gate (repo convention: gates remove continue-on-error — see
+    # windows-ci.yml "GATES THE PR"). HVCI-on still skips cleanly: every step is
+    # `if: steps.probe.outputs.skip == 'false'`, so a skip=true probe leaves the
+    # job green. Exploratory steps keep their own step-level continue-on-error.
     steps:
       - uses: actions/checkout@v4
 
@@ -257,6 +261,48 @@ jobs:
           REM ---- Verify minidump file exists ----
           echo === Verify minidump file ===
           dir lsass_*.dmp 2>nul || echo no dmp file (dump_lsass may not have completed)
+
+      # ---- 4b. T-REX kernel assessment (wI) — HARD GATE ----
+      # The real T4-T5 kernel assessment (operator-kernelsdk assess_kernel) must
+      # succeed on the hosted runner: the two user-mode NtQuery paths
+      # (SystemModuleInformation class 11 / SystemCodeIntegrityInformation class
+      # 103) MUST return real data -> status="Assessed" with a non-empty module
+      # list. Unlike the exploratory steps above, this is a HARD gate: a
+      # not-assessed assessment or a zero module count fails the job (same
+      # fail-loud contract as the loader probe). The driver is already loaded by
+      # the previous step (LoadedDriver does not auto-unload; NtLoadDriver
+      # returns STATUS_IMAGE_ALREADY_LOADED, which the bootstrap treats as OK).
+      - name: Kernel assessment (nyx-kernel assess) - hard gate
+        if: steps.probe.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          $exe = "crates\operator-kernel-cli\target\release\nyx-kernel.exe"
+          Write-Host "=== T-REX kernel assessment (BYOVD-backed) ==="
+          $out = & $exe assess --byovd "$env:DRIVER_PATH" NyaRTCore 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) {
+            Write-Host "::error::nyx-kernel assess exited $exit - assessment must run on the hosted runner"
+            exit 1
+          }
+          $jsonLine = ($out | Where-Object { $_ -like '{"assess":*' } | Select-Object -First 1)
+          if (-not $jsonLine) {
+            Write-Host "::error::no {""assess"":{...}} JSON line in nyx-kernel assess output"
+            exit 1
+          }
+          $assess = $jsonLine | ConvertFrom-Json
+          $a = $assess.assess
+          Write-Host "status=$($a.status) total_drivers=$($a.total_drivers) edr_drivers=$($a.edr_drivers)"
+          Write-Host "process_callbacks=$($a.process_callbacks) image_load_callbacks=$($a.image_load_callbacks) hvci=$($a.hvci_enabled) vbs=$($a.vbs_enabled)"
+          if ($a.status -ne "Assessed") {
+            Write-Host "::error::kernel assessment NotAssessed - the NtQuery paths failed on the hosted runner"
+            exit 1
+          }
+          if ($a.total_drivers -le 0) {
+            Write-Host "::error::kernel module enumeration returned 0 modules - NtQuerySystemInformation(SystemModuleInformation) failed"
+            exit 1
+          }
+          Write-Host "::notice::kernel assessment PASS: status=Assessed, $($a.total_drivers) modules, $($a.edr_drivers) EDR drivers"
 
       # ---- 5. minidump 文件格式验证(P3.a 产物)----
       - name: Verify minidump file format

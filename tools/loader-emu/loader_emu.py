@@ -744,8 +744,28 @@ def run_full_blob(blob: bytes, layer2_entry_off: int) -> dict:
     sysinfo = install_system(uc)
     uc.msr_write(GS_BASE_MSR, sysinfo["teb"])        # gs:[0x60] now reads the PEB
 
+    # ── dynamic-module + wildcard-stub region ──────────────────────────────
+    # Real emitters load REAL DLLs whose imports reach beyond the synthetic
+    # OS's three modules and six exports (GetModuleHandleA, CreateFileA, CRT
+    # entries, …). Two fallbacks make any real import table resolvable:
+    #  * LoadLibraryA of an unknown DLL → synthesize a module image on the
+    #    fly (mem_map a 0x4000 region, return its base; its export table is
+    #    never consulted because GetProcAddress below falls back too).
+    #  * GetProcAddress of an unknown export → a per-name stub in the
+    #    wildcard page holding `mov eax, 1; ret` (b8 01 00 00 00 c3), so the
+    #    IAT slot is populated with a non-NULL, non-crashing body and the
+    #    reflective load proceeds to DllMain. Real EDR-loading blobs would
+    #    want these stubbed semantically; this fixture's DllMain ignores the
+    #    return values, which is the contract being probed (loader plumbing,
+    #    not API semantics).
+    DYNM_BASE = 0x75_0000
+    uc.mem_map(DYNM_BASE, 0x10000, perms=7)
+    dynmod = {"next": DYNM_BASE}
+    stub = {"next": DYNM_BASE + 0x8000, "seq": 0}
+
     state = {"layer2_reached": False, "alloc_calls": [], "memmove_calls": [],
-             "vp_calls": [], "lla_calls": [], "gpa_calls": [], "dllmain": None}
+             "vp_calls": [], "lla_calls": [], "gpa_calls": [], "dllmain": None,
+             "wild_lla": [], "wild_gpa": []}
     entry_va = BLOB_BASE + layer2_entry_off
     alloc = {"next": HEAP_BASE}
 
@@ -857,6 +877,11 @@ def run_full_blob(blob: bytes, layer2_entry_off: int) -> dict:
             if mname == want or mname.split(".")[0] == want.split(".")[0]:
                 base = mbase
                 break
+        if base == 0:
+            # Unknown module (e.g. msvcrt.dll): synthesize an image region.
+            base = dynmod["next"]
+            dynmod["next"] += 0x4000
+            state["wild_lla"].append(name)
         uc.reg_write(UC_X86_REG_RAX, base)
 
     def on_gpa(uc, address, size, ud):
@@ -868,6 +893,12 @@ def run_full_blob(blob: bytes, layer2_entry_off: int) -> dict:
             if mbase == mod:
                 va = sysinfo["exports"][mname].get(name.decode("ascii", "replace"), 0)
                 break
+        if va == 0:
+            # Unknown export: per-name `mov eax, 1; ret` stub.
+            va = stub["next"]
+            stub["next"] += 0x10
+            uc.mem_write(va, b"\xB8\x01\x00\x00\x00\xC3")
+            state["wild_gpa"].append(name)
         uc.reg_write(UC_X86_REG_RAX, va)
 
     def on_null(uc, address, size, ud):

