@@ -283,7 +283,7 @@ pub struct KernelAssessment {
 /// On Windows, reads kernel memory via `krw` (callback arrays + ETW-TI
 /// provider chain) and calls `NtQuerySystemInformation`. Single-threaded
 /// operator context.
-pub unsafe fn assess_kernel(krw: &dyn KernelRw) -> KernelAssessment {
+pub unsafe fn assess_kernel(krw: Option<&dyn KernelRw>) -> KernelAssessment {
     #[cfg(target_os = "windows")]
     {
         // SAFETY: documented on the function; the Windows impl validates every

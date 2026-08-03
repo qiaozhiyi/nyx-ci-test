@@ -67,7 +67,7 @@ const KUSER_SHARED_DATA_KD_DEBUGGER_ENABLED: usize = 0x7FFE_0000 + 0x2D4;
 /// # Safety
 /// Reads kernel memory via `krw` (callback arrays, ETW-TI provider chain) and
 /// calls `NtQuerySystemInformation`. Single-threaded operator context.
-pub unsafe fn assess_kernel_impl(krw: &dyn KernelRw) -> KernelAssessment {
+pub unsafe fn assess_kernel_impl(krw: Option<&dyn KernelRw>) -> KernelAssessment {
     let mut out = KernelAssessment::default();
     let mut any_query_ok = false;
 
@@ -99,14 +99,21 @@ pub unsafe fn assess_kernel_impl(krw: &dyn KernelRw) -> KernelAssessment {
     out.kernel_debugger_present = kd_debugger_enabled();
 
     // ---- T5: callback arrays (same resolution path as `resolve_offsets`) ----
-    if let Some((process_kva, image_kva)) = unsafe { resolve_notify_arrays(krw) } {
+    // Requires a live `KernelRw` (BYOVD/KslD); with `None` the arrays are
+    // honestly unmeasured (0) — the user-mode paths above still produce real
+    // data and flip the status to Assessed.
+    let (process_kva, image_kva) = match krw {
+        Some(rw) => unsafe { resolve_notify_arrays(rw) }.unwrap_or((0, 0)),
+        None => (0, 0),
+    };
+    if process_kva != 0 || image_kva != 0 {
         // Honest per-array: a window that resolved to 0 counts 0 (never read
         // address 0 through the driver).
         if process_kva != 0 {
-            out.process_callbacks = count_callbacks(krw, process_kva);
+            out.process_callbacks = count_callbacks(krw.unwrap(), process_kva);
         }
         if image_kva != 0 {
-            out.image_load_callbacks = count_callbacks(krw, image_kva);
+            out.image_load_callbacks = count_callbacks(krw.unwrap(), image_kva);
         }
         // Registry callbacks (`CmpCallBackVector`): no verified pattern site
         // exists in `pattern_scan` yet, so the window cannot be resolved —
@@ -115,7 +122,10 @@ pub unsafe fn assess_kernel_impl(krw: &dyn KernelRw) -> KernelAssessment {
     }
 
     // ---- T5: ETW-TI provider enable state (EtwTiBlind chase) ----
-    out.etw_ti_active = unsafe { probe_etw_ti_active(krw) };
+    out.etw_ti_active = match krw {
+        Some(rw) => unsafe { probe_etw_ti_active(rw) },
+        None => false,  // honest: not measured without a driver
+    };
 
     out.status = if any_query_ok {
         KernelAssessmentStatus::Assessed

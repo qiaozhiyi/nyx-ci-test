@@ -151,6 +151,43 @@ jobs:
           }
           Write-Host "::notice::real-machine Layer-2 probe PASSED (fixture=$fixture_exit dll=$dll_exit DllMain-marker=$marker_ok)"
 
+      # ---- 1c. DRIVERLESS kernel assessment (nyx-kernel assess --user) ----
+      # Real T-REX T4-T5 data on ANY real Windows without a driver: the two
+      # user-mode NtQuery paths (SystemModuleInformation class 11 /
+      # SystemCodeIntegrityInformation class 103) plus the KUSER_SHARED_DATA
+      # kernel-debugger probe. HARD gate: status must be Assessed with a
+      # non-empty module list on this hosted runner (a real kernel, real
+      # data — nothing to skip). The BYOVD/KslD variant (callback arrays +
+      # ETW-TI) runs in windows-byovd-hosted.yml when HVCI is off.
+      - name: Kernel assessment (nyx-kernel assess --user) - hard gate
+        shell: pwsh
+        run: |
+          $exe = "target\release\nyx-kernel.exe"
+          if (-not (Test-Path $exe)) { Write-Host "::error::nyx-kernel.exe missing"; exit 1 }
+          $out = & $exe assess --user 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) {
+            Write-Host "::error::nyx-kernel assess --user exited $exit"
+            exit 1
+          }
+          $jsonLine = ($out | Where-Object { $_ -like '{"assess":*' } | Select-Object -First 1)
+          if (-not $jsonLine) {
+            Write-Host "::error::no {""assess"":{...}} JSON line in output"
+            exit 1
+          }
+          $a = ($jsonLine | ConvertFrom-Json).assess
+          Write-Host "status=$($a.status) total_drivers=$($a.total_drivers) edr_drivers=$($a.edr_drivers) hvci=$($a.hvci_enabled) vbs=$($a.vbs_enabled)"
+          if ($a.status -ne "Assessed") {
+            Write-Host "::error::kernel assessment NotAssessed - the NtQuery paths failed on this runner"
+            exit 1
+          }
+          if ($a.total_drivers -le 0) {
+            Write-Host "::error::module enumeration returned 0 modules - NtQuerySystemInformation(11) failed"
+            exit 1
+          }
+          Write-Host "::notice::kernel assessment PASS: status=Assessed, $($a.total_drivers) modules, $($a.edr_drivers) EDR drivers"
+
       # ---- 2. User-mode selftests on this kernel ----
       # GATES THE PR. continue-on-error was removed: a selftest that crashes,
       # times out, or hits the 0xFFFFFFFF/0xFFFFFFFE harness-failure sentinels

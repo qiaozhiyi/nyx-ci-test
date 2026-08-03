@@ -59,6 +59,22 @@ fn main() {
     }
     let cmd = &args[1];
 
+    // ---- 1b. Driverless assessment early path (`assess --user`) ----
+    // The two user-mode NtQuery paths (module enumeration + code integrity)
+    // run on ANY real Windows without a driver — this is what the hosted
+    // windows-ci hard gate exercises. `assess` without `--user` requires a
+    // bootstrap below (BYOVD/KslD) and additionally measures callback arrays
+    // + ETW-TI.
+    if cmd == "assess" && args.iter().any(|a| a == "--user") {
+        let a = unsafe { nyx_operator_kernelsdk::assess_kernel(None) };
+        println!("{}", assess_json_line(&a));
+        eprintln!(
+            "[+] driverless kernel assessment: status={:?} total_drivers={} edr_drivers={} hvci={} vbs={}",
+            a.status, a.total_drivers, a.edr_drivers, a.hvci_enabled, a.vbs_enabled
+        );
+        return;
+    }
+
     // ---- 2. Detect Windows build at runtime (no hardcoding) ----
     let build = detect_build();
     eprintln!("[*] detected Windows build {build}");
@@ -189,7 +205,7 @@ fn main() {
             // verified). An assessment is NOT a gate: exit 0 even for a
             // hostile posture — only a complete failure to produce any real
             // data is an error (and even that is reported, not faked).
-            let a = unsafe { nyx_operator_kernelsdk::assess_kernel(&*tier.rw) };
+            let a = unsafe { nyx_operator_kernelsdk::assess_kernel(Some(&*tier.rw)) };
             // Single JSON line on stdout for the CI gate / team-server parser.
             println!("{}", assess_json_line(&a));
             // Human summary on stderr (keeps stdout machine-parseable).

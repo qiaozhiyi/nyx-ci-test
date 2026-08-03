@@ -611,7 +611,14 @@ mod tests {
         // post-rotation records, and the newest seq equals the total append
         // count (rotation is the only event that produced the archive).
         let recs = w.query(&AuditQuery::default()).unwrap();
-        assert_eq!(recs.len(), 1, "active file holds only post-rotation records");
-        assert_eq!(recs[0].seq, appended, "seq must keep counting across rotation");
+        assert_eq!(
+            recs.len(),
+            1,
+            "active file holds only post-rotation records"
+        );
+        assert_eq!(
+            recs[0].seq, appended,
+            "seq must keep counting across rotation"
+        );
     }
 }
