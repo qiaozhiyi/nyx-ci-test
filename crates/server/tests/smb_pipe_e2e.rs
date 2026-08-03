@@ -56,15 +56,16 @@ fn read_exact_bounded(file: &mut std::fs::File, buf: &mut [u8], deadline: Instan
     Ok(())
 }
 
-#[test]
-fn smb_pipe_listener_roundtrips() {
-    let state = Arc::new(AppState::default());
+/// One child transaction, exactly like the implant's `smb::send_recv`:
+/// open the pipe, write `[4B LE len][sealed check-in frame]`, read the
+/// `[4B LE len][sealed reply]`, assert the reply opens with the session key
+/// and the session lands in the registry. Returns the session pubkey.
+fn child_transaction(
+    state: &Arc<AppState>,
+    pipe_name: &str,
+    beacon_id: u32,
+) -> [u8; 32] {
     let server_pub = state.keypair.public_bytes();
-    let pipe_name = test_pipe_name();
-
-    // Boot the listener on its own thread — the exact entry the server uses
-    // at startup with NYX_SMB_PIPE_NAME set.
-    nyx_server::smb_listener::spawn(state.clone(), pipe_name.clone());
 
     // The listener thread creates the pipe instance asynchronously, so the
     // first open can hit ERROR_FILE_NOT_FOUND / ERROR_PIPE_BUSY. Retry with
@@ -74,7 +75,7 @@ fn smb_pipe_listener_roundtrips() {
         match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&pipe_name)
+            .open(pipe_name)
         {
             Ok(f) => break f,
             Err(e) => {
@@ -93,7 +94,7 @@ fn smb_pipe_listener_roundtrips() {
     let key = ikp.session_key(&server_pub).unwrap();
     let mut w = Writer::new();
     SessionInfo {
-        beacon_id: 42,
+        beacon_id,
         hostname: "smb-pipe-host".into(),
         username: "tester".into(),
         os: "windows".into(),
@@ -128,4 +129,33 @@ fn smb_pipe_listener_roundtrips() {
     // The session registry must contain the new session (peer placeholder
     // 0.0.0.0:0 is the documented named-pipe behavior).
     assert!(state.sessions.contains_key(&pubkey));
+    pubkey
+}
+
+#[test]
+fn smb_pipe_listener_roundtrips() {
+    // Surface the listener thread's own logs (nyx::pivot target) so a
+    // failing round-trip shows which phase errored server-side.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+
+    let state = Arc::new(AppState::default());
+    let pipe_name = test_pipe_name();
+
+    // Boot the listener on its own thread — the exact entry the server uses
+    // at startup with NYX_SMB_PIPE_NAME set.
+    nyx_server::smb_listener::spawn(state.clone(), pipe_name.clone());
+
+    // First child transaction: full check-in round-trip.
+    child_transaction(&state, &pipe_name, 42);
+
+    // Second child transaction (fresh session, different beacon_id) proves
+    // the listener re-arms after DisconnectNamedPipe and keeps serving — the
+    // spawn-loop re-arm path, not just a one-shot transaction. No sleep:
+    // the listener only re-arms after the child has consumed the reply
+    // (PeekNamedPipe flush in serve_transaction), so the next connect can
+    // race the re-arm safely.
+    child_transaction(&state, &pipe_name, 43);
 }

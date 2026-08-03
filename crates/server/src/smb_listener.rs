@@ -86,6 +86,14 @@ extern "system" {
         lp_overlapped: *mut std::ffi::c_void,
     ) -> i32;
     fn DisconnectNamedPipe(h_named_pipe: *mut std::ffi::c_void) -> i32;
+    fn PeekNamedPipe(
+        h_named_pipe: *mut std::ffi::c_void,
+        lp_buffer: *mut u8,
+        n_buffer_size: u32,
+        lp_bytes_read: *mut u32,
+        lp_total_bytes_avail: *mut u32,
+        lp_bytes_left_this_message: *mut u32,
+    ) -> i32;
     fn GetLastError() -> u32;
 }
 
@@ -205,7 +213,43 @@ fn serve_transaction(state: &Arc<AppState>, pipe: *mut std::ffi::c_void) -> std:
     let mut out = Vec::with_capacity(4 + reply.len());
     out.extend_from_slice(&(reply.len() as u32).to_le_bytes());
     out.extend_from_slice(&reply);
-    write_all_bounded(pipe, &out)
+    write_all_bounded(pipe, &out)?;
+
+    // The child reads the reply BEFORE closing its handle. `DisconnectNamedPipe`
+    // discards any unread data still in the pipe buffer, so re-arming
+    // immediately after the write would race the child's read and drop the
+    // reply tail (child sees ERROR_PIPE_NOT_CONNECTED mid-reply — reproduced
+    // on wine, latent on real Windows). Wait until the child has consumed the
+    // reply (bounded like the I/O phases) before the loop re-arms.
+    let flush_deadline = std::time::Instant::now() + IO_TIMEOUT;
+    loop {
+        let mut avail: u32 = 0;
+        let ok = unsafe {
+            PeekNamedPipe(
+                pipe,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut avail,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            // Pipe broken — the child is gone; nothing left to preserve.
+            return Ok(());
+        }
+        if avail == 0 {
+            break;
+        }
+        if std::time::Instant::now() >= flush_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "pipe flush timeout",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 /// Read exactly `buf.len()` bytes with a 30 s deadline. Named-pipe reads

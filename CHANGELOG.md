@@ -78,15 +78,26 @@ is committed.
 - **SMB listener real-Windows runtime verification (wW).** New Windows-only
   e2e `crates/server/tests/smb_pipe_e2e.rs` (`#![cfg(windows)]`): boots the
   named-pipe parent exactly as the server does (`NYX_SMB_PIPE_NAME`), drives
-  the child-side transaction with `CreateFileW`-equivalent `std::fs::File`
-  opens — `[4B LE len][sealed check-in frame]` in, sealed reply out — and
-  asserts the reply opens with the session key and the session lands in the
-  registry. Runs natively in CI Gate 3 on hosted windows-latest, closing the
-  "runtime validation pending hosted Windows CI" caveat. Gate 6 additionally
-  builds the production (default-features) implant DLL — selftest exports are
-  feature-gated out, so the exact shipped layout is now gated too — completing
-  build verification for all 6 standalone crates (the other 5 were already in
-  the `standalone` job).
+  two consecutive child-side transactions with `CreateFileW`-equivalent
+  `std::fs::File` opens — `[4B LE len][sealed check-in frame]` in, sealed
+  reply out — and asserts the reply opens with the session key, the session
+  lands in the registry, and the listener re-arms for a second session.
+  Verified locally under wine (real Win32 named-pipe semantics) and runs
+  natively in CI Gate 3 on hosted windows-latest, closing the "runtime
+  validation pending hosted Windows CI" caveat. Gate 6 additionally builds
+  the production (default-features) implant DLL — selftest exports are
+  feature-gated out, so the exact shipped layout is now gated too —
+  completing build verification for all 6 standalone crates (the other 5
+  were already in the `standalone` job).
+- **fix(smb-listener): drain the reply before re-arming the pipe (wW).**
+  `serve_transaction` wrote the sealed reply and returned immediately; the
+  spawn loop then called `DisconnectNamedPipe`, which discards any data the
+  child has not yet read from the pipe buffer — racing the child's reply
+  read and dropping the reply tail (`ERROR_PIPE_NOT_CONNECTED` mid-reply).
+  Latent on real Windows, reproduced deterministically under wine. The
+  listener now waits until the child has consumed the reply
+  (`PeekNamedPipe` drain poll, bounded by the same 30 s phase deadline)
+  before allowing the loop to re-arm.
 
 
 ### Added
