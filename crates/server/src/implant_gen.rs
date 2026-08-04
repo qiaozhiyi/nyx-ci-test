@@ -116,6 +116,13 @@ pub fn validate_template_pe(bytes: &[u8]) -> Result<(), String> {
 /// `.nyx_cfg` section magic (0xDEADBEEF), and section bounds so a malformed
 /// implant is caught before it is stored or returned to the operator.
 fn validate_patched_pe(binary: &[u8], cfg_offset: usize) -> Result<(), String> {
+    check_patched_pe_headers(binary)?;
+    check_nyx_cfg_layout(binary, cfg_offset)
+}
+
+/// Check the patched binary's minimum size, MZ magic, and PE\0\0 signature
+/// at the offset pointed to by 0x3C.
+fn check_patched_pe_headers(binary: &[u8]) -> Result<(), String> {
     if binary.len() < 4096 {
         return Err("patched binary too small".to_string());
     }
@@ -134,6 +141,12 @@ fn validate_patched_pe(binary: &[u8], cfg_offset: usize) -> Result<(), String> {
     {
         return Err("missing PE\\0\\0 signature in patched binary".to_string());
     }
+    Ok(())
+}
+
+/// Check the `.nyx_cfg` section magic, `data_len` bound, and section extents
+/// in the patched binary.
+fn check_nyx_cfg_layout(binary: &[u8], cfg_offset: usize) -> Result<(), String> {
     // .nyx_cfg section magic at cfg_offset
     if cfg_offset + 6 > binary.len() {
         return Err("cfg_offset out of bounds in patched binary".to_string());
@@ -276,6 +289,26 @@ fn parse_iso8601_to_unix(s: &str) -> Option<u64> {
         return Some(secs);
     }
     // (2) YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS[Z|+00:00]
+    let (year, month, day) = parse_date_fields(s)?;
+    // year >= 1970 ⇒ days >= 0; try_from is the checked conversion.
+    let days = u64::try_from(civil_to_days(year, month, day)?).ok()?;
+    // Default to midnight UTC if no time component.
+    if s.len() == 10 {
+        return days.checked_mul(86_400);
+    }
+    let (hour, minute, second) = parse_time_fields_and_suffix(s)?;
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(u64::from(hour).checked_mul(3_600)?)?
+        .checked_add(u64::from(minute).checked_mul(60)?)?
+        .checked_add(u64::from(second))?;
+    Some(secs)
+}
+
+/// Parse and field-check the `YYYY-MM-DD` date part of `s`. Rejects anything
+/// shorter than 10 bytes, non-digit fields, misplaced `-` separators, and
+/// pre-epoch years.
+fn parse_date_fields(s: &str) -> Option<(u32, u32, u32)> {
     let bytes = s.as_bytes();
     // Year: 4 ASCII digits.
     if bytes.len() < 10 || !bytes[..4].iter().all(u8::is_ascii_digit) {
@@ -295,12 +328,14 @@ fn parse_iso8601_to_unix(s: &str) -> Option<u64> {
     }
     let month: u32 = s[5..7].parse().ok()?;
     let day: u32 = s[8..10].parse().ok()?;
-    // year >= 1970 ⇒ days >= 0; try_from is the checked conversion.
-    let days = u64::try_from(civil_to_days(year, month, day)?).ok()?;
-    // Default to midnight UTC if no time component.
-    if bytes.len() == 10 {
-        return days.checked_mul(86_400);
-    }
+    Some((year, month, day))
+}
+
+/// Parse and field-check the `HH:MM:SS` time part and the optional UTC
+/// suffix of `s` (which is longer than 10 bytes, i.e. has a time component).
+/// Non-UTC offsets are rejected to keep the contract unambiguous.
+fn parse_time_fields_and_suffix(s: &str) -> Option<(u32, u32, u32)> {
+    let bytes = s.as_bytes();
     // Expect 'T' or ' ' separator then HH:MM:SS.
     if bytes[10] != b'T' && bytes[10] != b't' && bytes[10] != b' ' {
         return None;
@@ -329,12 +364,7 @@ fn parse_iso8601_to_unix(s: &str) -> Option<u64> {
             return None; // non-UTC offset — reject
         }
     }
-    let secs = days
-        .checked_mul(86_400)?
-        .checked_add(u64::from(hour).checked_mul(3_600)?)?
-        .checked_add(u64::from(minute).checked_mul(60)?)?
-        .checked_add(u64::from(second))?;
-    Some(secs)
+    Some((hour, minute, second))
 }
 
 /// True iff `y` is a Gregorian leap year (divisible by 4, except centuries
@@ -525,12 +555,7 @@ fn validate_generate_request<'a>(
     implant_store: Option<&'a Arc<nyx_store::ImplantStore>>,
     req: &GenerateRequest,
 ) -> Result<ValidatedTemplate<'a>, (StatusCode, String)> {
-    if op.role == Role::Viewer {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "forbidden: viewer role cannot generate implants".into(),
-        ));
-    }
+    check_operator_role(op)?;
 
     let template = template.ok_or_else(|| {
         (
@@ -546,6 +571,26 @@ fn validate_generate_request<'a>(
         )
     })?;
 
+    check_request_fields(req)?;
+
+    Ok((template, implant_store))
+}
+
+/// Reject operators with the Viewer role — read-only identities may not
+/// generate implants.
+fn check_operator_role(op: &OperatorIdentity) -> Result<(), (StatusCode, String)> {
+    if op.role == Role::Viewer {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "forbidden: viewer role cannot generate implants".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Field-check the request body: callback length, jitter/format/sleep ranges,
+/// and the generation-time env-keying prohibition.
+fn check_request_fields(req: &GenerateRequest) -> Result<(), (StatusCode, String)> {
     // Validate inputs.
     if req.callback.is_empty() || req.callback.len() > 255 {
         return Err((
@@ -585,8 +630,7 @@ fn validate_generate_request<'a>(
                 .into(),
         ));
     }
-
-    Ok((template, implant_store))
+    Ok(())
 }
 
 /// Rate limiting: sliding window keyed by (operator, callback, port). Two
@@ -604,8 +648,7 @@ fn check_rate_limit(
     callback: &str,
     port: u16,
 ) -> Result<(), (StatusCode, String)> {
-    use std::time::Instant;
-    let now = Instant::now();
+    let now = std::time::Instant::now();
     let window = std::time::Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS);
     // Two buckets: the per-(operator,target) key keeps the original per-target
     // cap, and a per-operator-only key bounds ONE identity's total volume
@@ -619,36 +662,52 @@ fn check_rate_limit(
         (op_name.to_string(), DEFAULT_OPERATOR_RATE_LIMIT_MAX),
     ];
     for (key, max) in buckets {
-        let mut fresh = true;
-        if let Some(mut entry) = st.implant_rate_limiter.get_mut(&key) {
-            entry.retain(|t| now.duration_since(*t) < window);
-            if entry.is_empty() {
-                // Fully-expired bucket: drop the KEY (not just its timestamps)
-                // so the DashMap cannot grow without bound on attacker-chosen
-                // key material (rotating callbacks).
-                drop(entry);
-                st.implant_rate_limiter.remove(&key);
-            } else {
-                if entry.len() >= max {
-                    return Err((
-                        StatusCode::TOO_MANY_REQUESTS,
-                        format!(
-                            "rate limit exceeded: max {max} implants per hour per {}",
-                            if max == DEFAULT_RATE_LIMIT_MAX {
-                                "operator/target"
-                            } else {
-                                "operator"
-                            }
-                        ),
-                    ));
-                }
-                entry.push(now);
-                fresh = false;
+        check_rate_bucket(st, key, max, now, window)?;
+    }
+    Ok(())
+}
+
+/// Apply the sliding window to a single rate-limit bucket: prune expired
+/// timestamps, reject with 429 once `max` live entries exist, otherwise record
+/// `now`. A fully-expired bucket's KEY is removed (not just its timestamps) so
+/// the DashMap cannot grow without bound on attacker-chosen key material
+/// (rotating callbacks).
+fn check_rate_bucket(
+    st: &AppState,
+    key: String,
+    max: usize,
+    now: std::time::Instant,
+    window: std::time::Duration,
+) -> Result<(), (StatusCode, String)> {
+    let mut fresh = true;
+    if let Some(mut entry) = st.implant_rate_limiter.get_mut(&key) {
+        entry.retain(|t| now.duration_since(*t) < window);
+        if entry.is_empty() {
+            // Fully-expired bucket: drop the KEY (not just its timestamps)
+            // so the DashMap cannot grow without bound on attacker-chosen
+            // key material (rotating callbacks).
+            drop(entry);
+            st.implant_rate_limiter.remove(&key);
+        } else {
+            if entry.len() >= max {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "rate limit exceeded: max {max} implants per hour per {}",
+                        if max == DEFAULT_RATE_LIMIT_MAX {
+                            "operator/target"
+                        } else {
+                            "operator"
+                        }
+                    ),
+                ));
             }
+            entry.push(now);
+            fresh = false;
         }
-        if fresh {
-            st.implant_rate_limiter.insert(key, vec![now]);
-        }
+    }
+    if fresh {
+        st.implant_rate_limiter.insert(key, vec![now]);
     }
     Ok(())
 }
