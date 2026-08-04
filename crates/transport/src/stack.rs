@@ -223,18 +223,7 @@ impl TransportStack {
     /// channel and advances; on `Transient`, retries up to the per-channel cap
     /// then burns the slot and advances; on success, pins `active_idx`.
     pub fn send(&mut self, frame: &[u8]) -> Result<(), StackError> {
-        // Global oversize guard: if the frame can't fit on ANY channel, fail
-        // fast rather than walking the whole stack.
-        if !self.slots.is_empty() && frame.len() > self.min_frame_size() {
-            // ...but only fail if it's also larger than every individual cap.
-            let any_fit = self.slots.iter().any(|s| s.max_frame >= frame.len());
-            if !any_fit {
-                return Err(StackError::OversizeAll {
-                    frame_len: frame.len(),
-                    min_cap: self.min_frame_size(),
-                });
-            }
-        }
+        self.check_global_frame_cap(frame)?;
 
         let mut start = self.active_idx.unwrap_or(0);
         loop {
@@ -266,82 +255,140 @@ impl TransportStack {
                 continue;
             }
 
-            // Retry loop for transient failures.
-            let mut attempt = 0u32;
-            loop {
-                attempt += 1;
-                let slot = &mut self.slots[idx];
-                match slot.transport.send(frame) {
-                    Ok(()) => {
-                        self.active_idx = Some(idx);
-                        return Ok(());
-                    }
-                    Err(TransportError::Dead(reason)) => {
-                        tracing::warn!(
-                            channel = self.slots[idx].transport.name(),
-                            reason,
-                            attempt,
-                            "channel dead; demoting"
-                        );
-                        self.slots[idx].state = SlotState::Demoted;
-                        break;
-                    }
-                    Err(TransportError::Transient(reason)) => {
-                        if attempt > self.max_transient_retries {
-                            tracing::warn!(
-                                channel = self.slots[idx].transport.name(),
-                                reason,
-                                attempt,
-                                "channel burned through transient retries; advancing"
-                            );
-                            self.slots[idx].state = SlotState::Burned;
-                            break;
-                        }
-                        tracing::debug!(
-                            channel = self.slots[idx].transport.name(),
-                            reason,
-                            attempt,
-                            "transient failure; retrying"
-                        );
-                        // Brief backoff before retry. Capped so a tight retry
-                        // budget doesn't translate into a long stall.
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            RETRY_BACKOFF_MS * u64::from(attempt),
-                        ));
-                    }
-                    Err(TransportError::Timeout) => {
-                        // Same treatment as Transient: retry until the cap,
-                        // then burn. A single timed-out send is common under
-                        // packet loss and shouldn't immediately demote a
-                        // healthy channel.
-                        if attempt > self.max_transient_retries {
-                            self.slots[idx].state = SlotState::Burned;
-                            break;
-                        }
-                        // Same backoff pacing as the Transient arm above so a
-                        // slow channel isn't hammered while it recovers.
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            RETRY_BACKOFF_MS * u64::from(attempt),
-                        ));
-                    }
-                    Err(TransportError::PayloadTooLarge(n)) => {
-                        // Should be impossible post-guard, but if a leaf
-                        // enforces a stricter runtime cap than its advertised
-                        // max_frame_size, treat it as a hard advance.
-                        tracing::error!(
-                            channel = self.slots[idx].transport.name(),
-                            payload = n,
-                            cap = self.slots[idx].max_frame,
-                            "leaf rejected within-cap frame; advancing"
-                        );
-                        self.slots[idx].state = SlotState::Burned;
-                        break;
-                    }
-                }
+            // Retry loop for transient failures. On success the active channel
+            // is pinned; on demote/burn the slot is skipped and we advance.
+            if self.send_with_retries(idx, frame) {
+                return Ok(());
             }
 
             start = idx + 1;
         }
+    }
+
+    /// Global oversize guard: if the frame can't fit on ANY channel, fail
+    /// fast rather than walking the whole stack.
+    fn check_global_frame_cap(&self, frame: &[u8]) -> Result<(), StackError> {
+        if !self.slots.is_empty() && frame.len() > self.min_frame_size() {
+            // ...but only fail if it's also larger than every individual cap.
+            let any_fit = self.slots.iter().any(|s| s.max_frame >= frame.len());
+            if !any_fit {
+                return Err(StackError::OversizeAll {
+                    frame_len: frame.len(),
+                    min_cap: self.min_frame_size(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Retry loop for transient failures on slot `idx`. Returns `true` when
+    /// the frame was sent (active channel pinned); `false` when the slot was
+    /// demoted/burned and the caller should advance to the next channel.
+    fn send_with_retries(&mut self, idx: usize, frame: &[u8]) -> bool {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let slot = &mut self.slots[idx];
+            match slot.transport.send(frame) {
+                Ok(()) => {
+                    self.active_idx = Some(idx);
+                    return true;
+                }
+                Err(TransportError::Dead(reason)) => {
+                    self.demote_dead(idx, reason, attempt);
+                    return false;
+                }
+                Err(TransportError::Transient(reason)) => {
+                    if !self.handle_transient_retry(idx, reason, attempt) {
+                        return false;
+                    }
+                }
+                Err(TransportError::Timeout) => {
+                    if !self.handle_timeout_retry(idx, attempt) {
+                        return false;
+                    }
+                }
+                Err(TransportError::PayloadTooLarge(n)) => {
+                    self.burn_within_cap_rejection(idx, n);
+                    return false;
+                }
+            }
+            // Brief backoff before retry (same pacing for Transient and
+            // Timeout so a slow channel isn't hammered while it recovers).
+            // Capped so a tight retry budget doesn't translate into a long
+            // stall.
+            Self::retry_backoff(attempt);
+        }
+    }
+
+    /// Demote a channel whose send reported `Dead`.
+    fn demote_dead(&mut self, idx: usize, reason: &'static str, attempt: u32) {
+        tracing::warn!(
+            channel = self.slots[idx].transport.name(),
+            reason,
+            attempt,
+            "channel dead; demoting"
+        );
+        self.slots[idx].state = SlotState::Demoted;
+    }
+
+    /// Handle a `Transient` send failure. Returns `true` to retry (the caller
+    /// applies the backoff), `false` once the retry budget is exhausted and
+    /// the slot has been burned.
+    fn handle_transient_retry(&mut self, idx: usize, reason: &'static str, attempt: u32) -> bool {
+        if attempt > self.max_transient_retries {
+            tracing::warn!(
+                channel = self.slots[idx].transport.name(),
+                reason,
+                attempt,
+                "channel burned through transient retries; advancing"
+            );
+            self.slots[idx].state = SlotState::Burned;
+            return false;
+        }
+        tracing::debug!(
+            channel = self.slots[idx].transport.name(),
+            reason,
+            attempt,
+            "transient failure; retrying"
+        );
+        true
+    }
+
+    /// Handle a `Timeout` send failure. Returns `true` to retry (the caller
+    /// applies the backoff), `false` once the retry budget is exhausted and
+    /// the slot has been burned.
+    fn handle_timeout_retry(&mut self, idx: usize, attempt: u32) -> bool {
+        // Same treatment as Transient: retry until the cap,
+        // then burn. A single timed-out send is common under
+        // packet loss and shouldn't immediately demote a
+        // healthy channel.
+        if attempt > self.max_transient_retries {
+            self.slots[idx].state = SlotState::Burned;
+            return false;
+        }
+        true
+    }
+
+    /// Burn a channel that rejected a frame within its advertised cap.
+    fn burn_within_cap_rejection(&mut self, idx: usize, payload: usize) {
+        // Should be impossible post-guard, but if a leaf
+        // enforces a stricter runtime cap than its advertised
+        // max_frame_size, treat it as a hard advance.
+        tracing::error!(
+            channel = self.slots[idx].transport.name(),
+            payload,
+            cap = self.slots[idx].max_frame,
+            "leaf rejected within-cap frame; advancing"
+        );
+        self.slots[idx].state = SlotState::Burned;
+    }
+
+    /// Backoff between transient retries; scaled by attempt number.
+    fn retry_backoff(attempt: u32) {
+        std::thread::sleep(std::time::Duration::from_millis(
+            RETRY_BACKOFF_MS * u64::from(attempt),
+        ));
     }
 
     /// Receive the next frame from the active channel. Must be called after a
