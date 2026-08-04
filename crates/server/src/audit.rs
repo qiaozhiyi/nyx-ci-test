@@ -252,6 +252,7 @@ impl AuditWriter {
 
     /// Hash-chain update: compute the link over the record fields, build the
     /// record, and advance `last_hash` to the new link.
+    #[allow(clippy::too_many_arguments)]
     fn chain_link(
         inner: &mut Inner,
         seq: u64,

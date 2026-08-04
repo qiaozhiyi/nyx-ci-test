@@ -90,10 +90,13 @@ struct ExtFields {
     signature_algorithms: Vec<u16>,
 }
 
+/// Stage 1 output: `(legacy_version, cipher_suites, body, cursor)`.
+type FixedFields<'a> = (u16, Vec<u16>, &'a [u8], usize);
+
 /// Stage 1: record + handshake header, fixed fields (version/random/session id),
 /// cipher list, compression list. Returns `(legacy_version, cipher_suites, body,
 /// cursor)` where `cursor` sits just past the compression list.
-fn parse_fixed_fields(rec: &[u8]) -> Result<(u16, Vec<u16>, &[u8], usize), &'static str> {
+fn parse_fixed_fields(rec: &[u8]) -> Result<FixedFields<'_>, &'static str> {
     if rec.len() < 5 {
         return Err("record too short");
     }
@@ -140,13 +143,12 @@ fn parse_fixed_fields(rec: &[u8]) -> Result<(u16, Vec<u16>, &[u8], usize), &'sta
     Ok((legacy_version, cipher_suites, body, p))
 }
 
+/// Stage 2 output: raw `(type, data)` extension list plus collected fields.
+type ExtParse = (Vec<(u16, Vec<u8>)>, ExtFields);
+
 /// Stage 2: walk the extension block, collecting the raw `(type, data)` list and
 /// the per-type fields JA3/JA4 need.
-fn parse_extensions(
-    body: &[u8],
-    mut q: usize,
-    ext_end: usize,
-) -> Result<(Vec<(u16, Vec<u8>)>, ExtFields), &'static str> {
+fn parse_extensions(body: &[u8], mut q: usize, ext_end: usize) -> Result<ExtParse, &'static str> {
     let mut extensions: Vec<(u16, Vec<u8>)> = Vec::new();
     let mut f = ExtFields::default();
     while q + 4 <= ext_end && q + 4 <= body.len() {
