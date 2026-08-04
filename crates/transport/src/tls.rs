@@ -45,6 +45,55 @@ fn u16be(b: &[u8], o: usize) -> u16 {
 /// Parse a TLS ClientHello from a raw record (`ContentType || Version || Length
 /// || Handshake...`). Returns the fields JA3/JA4 need.
 pub fn parse_client_hello(rec: &[u8]) -> Result<ClientHello, &'static str> {
+    let (legacy_version, cipher_suites, body, p) = parse_fixed_fields(rec)?;
+
+    if p + 2 > body.len() {
+        // No extensions at all is legal.
+        return Ok(ClientHello {
+            legacy_version,
+            cipher_suites,
+            extensions: Vec::new(),
+            sni: None,
+            alpn: None,
+            supported_versions: Vec::new(),
+            supported_groups: Vec::new(),
+            ec_point_formats: Vec::new(),
+            signature_algorithms: Vec::new(),
+        });
+    }
+    let ext_len = u16be(body, p) as usize;
+    let ext_end = p + 2 + ext_len;
+
+    let (extensions, f) = parse_extensions(body, p + 2, ext_end)?;
+
+    Ok(ClientHello {
+        legacy_version,
+        cipher_suites,
+        extensions,
+        sni: f.sni,
+        alpn: f.alpn,
+        supported_versions: f.supported_versions,
+        supported_groups: f.supported_groups,
+        ec_point_formats: f.ec_point_formats,
+        signature_algorithms: f.signature_algorithms,
+    })
+}
+
+/// Per-extension fields collected while walking the extension block.
+#[derive(Default)]
+struct ExtFields {
+    sni: Option<String>,
+    alpn: Option<String>,
+    supported_versions: Vec<u16>,
+    supported_groups: Vec<u16>,
+    ec_point_formats: Vec<u8>,
+    signature_algorithms: Vec<u16>,
+}
+
+/// Stage 1: record + handshake header, fixed fields (version/random/session id),
+/// cipher list, compression list. Returns `(legacy_version, cipher_suites, body,
+/// cursor)` where `cursor` sits just past the compression list.
+fn parse_fixed_fields(rec: &[u8]) -> Result<(u16, Vec<u16>, &[u8], usize), &'static str> {
     if rec.len() < 5 {
         return Err("record too short");
     }
@@ -88,33 +137,18 @@ pub fn parse_client_hello(rec: &[u8]) -> Result<ClientHello, &'static str> {
     let comp_len = body[p] as usize;
     p += 1 + comp_len;
 
-    if p + 2 > body.len() {
-        // No extensions at all is legal.
-        return Ok(ClientHello {
-            legacy_version,
-            cipher_suites,
-            extensions: Vec::new(),
-            sni: None,
-            alpn: None,
-            supported_versions: Vec::new(),
-            supported_groups: Vec::new(),
-            ec_point_formats: Vec::new(),
-            signature_algorithms: Vec::new(),
-        });
-    }
-    let ext_len = u16be(body, p) as usize;
-    p += 2;
-    let ext_end = p + ext_len;
+    Ok((legacy_version, cipher_suites, body, p))
+}
 
+/// Stage 2: walk the extension block, collecting the raw `(type, data)` list and
+/// the per-type fields JA3/JA4 need.
+fn parse_extensions(
+    body: &[u8],
+    mut q: usize,
+    ext_end: usize,
+) -> Result<(Vec<(u16, Vec<u8>)>, ExtFields), &'static str> {
     let mut extensions: Vec<(u16, Vec<u8>)> = Vec::new();
-    let mut sni = None;
-    let mut alpn = None;
-    let mut supported_versions = Vec::new();
-    let mut supported_groups = Vec::new();
-    let mut ec_point_formats = Vec::new();
-    let mut signature_algorithms = Vec::new();
-
-    let mut q = p;
+    let mut f = ExtFields::default();
     while q + 4 <= ext_end && q + 4 <= body.len() {
         let etype = u16be(body, q);
         let elen = u16be(body, q + 2) as usize;
@@ -123,59 +157,53 @@ pub fn parse_client_hello(rec: &[u8]) -> Result<ClientHello, &'static str> {
             .get(q..q + elen)
             .ok_or("extension data out of bounds")?;
         extensions.push((etype, edata.to_vec()));
-        match etype {
-            0 => {
-                // SNI: list_len(2), name_type(1), name_len(2), name.
-                if edata.len() >= 5 {
-                    let nl = u16be(edata, 3) as usize;
-                    if 5 + nl <= edata.len() {
-                        sni = Some(String::from_utf8_lossy(&edata[5..5 + nl]).into_owned());
-                    }
-                }
-            }
-            10 => supported_groups.extend(read_u16_list(edata)),
-            11 => {
-                if !edata.is_empty() {
-                    let fl = edata[0] as usize;
-                    ec_point_formats = edata[1..1 + fl.min(edata.len() - 1)].to_vec();
-                }
-            }
-            13 => signature_algorithms.extend(read_u16_list(edata)),
-            16 => {
-                // ALPN: list_len(2), proto_len(1), proto.
-                if edata.len() >= 4 {
-                    let pl = edata[2] as usize;
-                    if 3 + pl <= edata.len() {
-                        alpn = Some(String::from_utf8_lossy(&edata[3..3 + pl]).into_owned());
-                    }
-                }
-            }
-            43
-                // supported_versions: list_len(1), versions(2 each).
-                if !edata.is_empty() => {
-                    let vl = edata[0] as usize;
-                    let mut k = 1;
-                    while k + 2 <= 1 + vl && k + 2 <= edata.len() {
-                        supported_versions.push(u16be(edata, k));
-                        k += 2;
-                    }
-                }
-            _ => {}
-        }
+        apply_extension(etype, edata, &mut f);
         q += elen;
     }
+    Ok((extensions, f))
+}
 
-    Ok(ClientHello {
-        legacy_version,
-        cipher_suites,
-        extensions,
-        sni,
-        alpn,
-        supported_versions,
-        supported_groups,
-        ec_point_formats,
-        signature_algorithms,
-    })
+/// Decode one extension's data into the field it feeds (SNI/ALPN/groups/…).
+fn apply_extension(etype: u16, edata: &[u8], f: &mut ExtFields) {
+    match etype {
+        0 => {
+            // SNI: list_len(2), name_type(1), name_len(2), name.
+            if edata.len() >= 5 {
+                let nl = u16be(edata, 3) as usize;
+                if 5 + nl <= edata.len() {
+                    f.sni = Some(String::from_utf8_lossy(&edata[5..5 + nl]).into_owned());
+                }
+            }
+        }
+        10 => f.supported_groups.extend(read_u16_list(edata)),
+        11 => {
+            if !edata.is_empty() {
+                let fl = edata[0] as usize;
+                f.ec_point_formats = edata[1..1 + fl.min(edata.len() - 1)].to_vec();
+            }
+        }
+        13 => f.signature_algorithms.extend(read_u16_list(edata)),
+        16 => {
+            // ALPN: list_len(2), proto_len(1), proto.
+            if edata.len() >= 4 {
+                let pl = edata[2] as usize;
+                if 3 + pl <= edata.len() {
+                    f.alpn = Some(String::from_utf8_lossy(&edata[3..3 + pl]).into_owned());
+                }
+            }
+        }
+        43
+            // supported_versions: list_len(1), versions(2 each).
+            if !edata.is_empty() => {
+            let vl = edata[0] as usize;
+            let mut k = 1;
+            while k + 2 <= 1 + vl && k + 2 <= edata.len() {
+                f.supported_versions.push(u16be(edata, k));
+                k += 2;
+            }
+        }
+        _ => {}
+    }
 }
 
 fn read_u16_list(edata: &[u8]) -> Vec<u16> {
@@ -237,7 +265,11 @@ fn hex4(v: u16) -> String {
 
 /// Compute JA4 (`a_b_c`) for a parsed ClientHello.
 pub fn ja4(ch: &ClientHello) -> String {
-    // ja4_a
+    format!("{}_{}_{}", ja4_a(ch), ja4_b(ch), ja4_c(ch))
+}
+
+/// ja4_a — transport + version + SNI + cipher/extension counts + ALPN.
+fn ja4_a(ch: &ClientHello) -> String {
     let ver_val = ch
         .supported_versions
         .iter()
@@ -271,9 +303,11 @@ pub fn ja4(ch: &ClientHello) -> String {
         .map(|a| a.chars().take(2).collect::<String>())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "00".to_string());
-    let ja4_a = format!("t{ver}{sni}{ncs:02}{nex:02}{alpn}");
+    format!("t{ver}{sni}{ncs:02}{nex:02}{alpn}")
+}
 
-    // ja4_b — sorted GREASE-free ciphers.
+/// ja4_b — sorted GREASE-free ciphers.
+fn ja4_b(ch: &ClientHello) -> String {
     let mut cs: Vec<u16> = ch
         .cipher_suites
         .iter()
@@ -281,7 +315,7 @@ pub fn ja4(ch: &ClientHello) -> String {
         .filter(|c| !is_grease(*c))
         .collect();
     cs.sort_unstable();
-    let ja4_b = if cs.is_empty() {
+    if cs.is_empty() {
         "000000000000".to_string()
     } else {
         sha256_12hex(
@@ -292,9 +326,11 @@ pub fn ja4(ch: &ClientHello) -> String {
                 .join(",")
                 .as_bytes(),
         )
-    };
+    }
+}
 
-    // ja4_c — sorted GREASE/SNI/ALPN-free extensions + original-order sig algs.
+/// ja4_c — sorted GREASE/SNI/ALPN-free extensions + original-order sig algs.
+fn ja4_c(ch: &ClientHello) -> String {
     let mut exts: Vec<u16> = ch
         .extensions
         .iter()
@@ -313,7 +349,7 @@ pub fn ja4(ch: &ClientHello) -> String {
         'i'
     };
     exts.sort_unstable();
-    let ja4_c = if exts.is_empty() && ch.signature_algorithms.is_empty() {
+    if exts.is_empty() && ch.signature_algorithms.is_empty() {
         "000000000000".to_string()
     } else {
         let ext_str = exts.iter().copied().map(hex4).collect::<Vec<_>>().join(",");
@@ -329,9 +365,7 @@ pub fn ja4(ch: &ClientHello) -> String {
             prefix,
             sha256_12hex(format!("{ext_str}_{sig_str}").as_bytes())
         )
-    };
-
-    format!("{ja4_a}_{ja4_b}_{ja4_c}")
+    }
 }
 
 /// Read the first TLS record (the ClientHello) from a byte stream that has just
