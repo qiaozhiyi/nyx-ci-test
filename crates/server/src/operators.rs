@@ -249,6 +249,16 @@ pub struct OperatorRegistry {
     auth_budget: AuthBudget,
 }
 
+/// Minimal cloned fields of the matched operator record, captured under the
+/// read lock so verification and rehash can run lock-free. Cloning is cheap
+/// (name + role + a PHC string) and avoids borrowing into the lock guard's
+/// lifetime.
+struct MatchedRecord {
+    name: String,
+    role: Role,
+    secret_hash: String,
+}
+
 impl OperatorRegistry {
     pub fn empty() -> Self {
         Self {
@@ -323,69 +333,8 @@ impl OperatorRegistry {
             Some((n, s)) => (n, s),
             None => ("_legacy", bearer),
         };
-        // `MatchedRecord` holds the minimal cloned fields we need post-unlock.
-        // Cloning is cheap (name + role + a PHC string) and avoids borrowing
-        // into the lock guard's lifetime.
-        struct MatchedRecord {
-            name: String,
-            role: Role,
-            secret_hash: String,
-        }
-        let matched: MatchedRecord = {
-            let g = self.ops.read().ok()?;
-            match g.get(name) {
-                Some(r) => MatchedRecord {
-                    name: r.name.clone(),
-                    role: r.role,
-                    secret_hash: r.secret_hash.clone(),
-                },
-                None => {
-                    // Not-found path: pay the same argon2 cost as the found
-                    // path (timing equalization), but only within the global
-                    // auth-work budget — a garbage-token flood must not be
-                    // able to force unbounded KDF executions. Both paths take
-                    // (or skip) the budget identically, preserving the timing
-                    // match between found and not-found.
-                    //
-                    // The dummy KDF must cost what the FOUND path would cost:
-                    // verify_secret verifies with the params EMBEDDED in the
-                    // matched record's PHC string, not the current env-tuned
-                    // instance — so pick a representative argon2 record
-                    // (smallest name: deterministic across calls and
-                    // restarts) and run the dummy with ITS params. `plain:`
-                    // markers are skipped: their found path runs no argon2 at
-                    // all. See `run_dummy_argon2`.
-                    let dummy_phc = g
-                        .values()
-                        .filter(|r| r.secret_hash.starts_with("$argon2"))
-                        .min_by_key(|r| &r.name)
-                        .map(|r| r.secret_hash.clone());
-                    if self.auth_budget.try_take() {
-                        let secret_owned = secret.to_string();
-                        let _ = offload_kdf(move || {
-                            run_dummy_argon2(&secret_owned, dummy_phc.as_deref())
-                        });
-                    } else {
-                        tracing::warn!(
-                            target: "nyx::auth",
-                            "auth-work budget exhausted; denying unknown operator without KDF (fail-closed)"
-                        );
-                    }
-                    return None;
-                }
-            }
-        };
-        if !self.auth_budget.try_take() {
-            tracing::warn!(
-                target: "nyx::auth",
-                operator = %matched.name,
-                "auth-work budget exhausted; denying without running argon2 (fail-closed)"
-            );
-            return None;
-        }
-        let stored_hash = matched.secret_hash.clone();
-        let secret_owned = secret.to_string();
-        if !offload_kdf(move || verify_secret(&stored_hash, &secret_owned)).unwrap_or(false) {
+        let matched: MatchedRecord = self.snapshot_matched(name, secret)?;
+        if !self.verify_with_budget(&matched, secret) {
             return None;
         }
         let identity = OperatorIdentity {
@@ -401,6 +350,72 @@ impl OperatorRegistry {
         Some(identity)
     }
 
+    /// Snapshot the record matching `name` under the read lock, cloned into a
+    /// [`MatchedRecord`]. On the not-found path, run the timing-equalization
+    /// dummy argon2 KDF (H6) within the global auth-work budget and return
+    /// `None`; a poisoned registry lock also yields `None` (fail-closed).
+    fn snapshot_matched(&self, name: &str, secret: &str) -> Option<MatchedRecord> {
+        let g = self.ops.read().ok()?;
+        match g.get(name) {
+            Some(r) => Some(MatchedRecord {
+                name: r.name.clone(),
+                role: r.role,
+                secret_hash: r.secret_hash.clone(),
+            }),
+            None => {
+                // Not-found path: pay the same argon2 cost as the found
+                // path (timing equalization), but only within the global
+                // auth-work budget — a garbage-token flood must not be
+                // able to force unbounded KDF executions. Both paths take
+                // (or skip) the budget identically, preserving the timing
+                // match between found and not-found.
+                //
+                // The dummy KDF must cost what the FOUND path would cost:
+                // verify_secret verifies with the params EMBEDDED in the
+                // matched record's PHC string, not the current env-tuned
+                // instance — so pick a representative argon2 record
+                // (smallest name: deterministic across calls and
+                // restarts) and run the dummy with ITS params. `plain:`
+                // markers are skipped: their found path runs no argon2 at
+                // all. See `run_dummy_argon2`.
+                let dummy_phc = g
+                    .values()
+                    .filter(|r| r.secret_hash.starts_with("$argon2"))
+                    .min_by_key(|r| &r.name)
+                    .map(|r| r.secret_hash.clone());
+                if self.auth_budget.try_take() {
+                    let secret_owned = secret.to_string();
+                    let _ =
+                        offload_kdf(move || run_dummy_argon2(&secret_owned, dummy_phc.as_deref()));
+                } else {
+                    tracing::warn!(
+                        target: "nyx::auth",
+                        "auth-work budget exhausted; denying unknown operator without KDF (fail-closed)"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Take one auth-work budget slot and verify `secret` against the matched
+    /// record's stored hash on the tokio blocking pool. Fail-closed: returns
+    /// `false` when the budget is exhausted, the KDF closure fails, or the
+    /// secret does not verify.
+    fn verify_with_budget(&self, matched: &MatchedRecord, secret: &str) -> bool {
+        if !self.auth_budget.try_take() {
+            tracing::warn!(
+                target: "nyx::auth",
+                operator = %matched.name,
+                "auth-work budget exhausted; denying without running argon2 (fail-closed)"
+            );
+            return false;
+        }
+        let stored_hash = matched.secret_hash.clone();
+        let secret_owned = secret.to_string();
+        offload_kdf(move || verify_secret(&stored_hash, &secret_owned)).unwrap_or(false)
+    }
+
     /// Re-hash `name`'s secret to argon2id and persist. Called from
     /// [`resolve`](Self::resolve) when a legacy `plain:` record verifies
     /// successfully — this is the OWASP "rehash on next login" migration path.
@@ -411,6 +426,18 @@ impl OperatorRegistry {
     /// best-effort: a flush failure is logged but does NOT revert the in-memory
     /// upgrade (the next successful login will retry the flush).
     fn rehash_operator(&self, name: &str, plaintext_secret: &str) {
+        let Some(new_hash) = self.rehash_with_budget(name, plaintext_secret) else {
+            return;
+        };
+        self.apply_rehashed_record(name, new_hash);
+    }
+
+    /// Run the transparent-rehash argon2 KDF for `name`'s secret within the
+    /// auth-work budget and off the worker thread. Fail-closed: returns `None`
+    /// when the budget is exhausted, the KDF errors, or the blocking-pool
+    /// closure fails — the record stays legacy and retries on the next
+    /// successful login.
+    fn rehash_with_budget(&self, name: &str, plaintext_secret: &str) -> Option<String> {
         // The rehash KDF is as expensive as a verify; run it off the worker
         // thread and within the auth-work budget. Fail-closed: when the budget
         // is exhausted the upgrade is skipped (the record stays legacy and
@@ -421,27 +448,38 @@ impl OperatorRegistry {
                 operator = name,
                 "auth-work budget exhausted; skipping transparent rehash (record stays legacy)"
             );
-            return;
+            return None;
         }
         let secret_owned = plaintext_secret.to_string();
-        let new_hash = match offload_kdf(move || hash_argon2(&secret_owned)) {
-            Some(Ok(h)) => h,
+        match offload_kdf(move || hash_argon2(&secret_owned)) {
+            Some(Ok(h)) => Some(h),
             Some(Err(e)) => {
                 tracing::warn!(
                     operator = name,
                     error = ?e,
                     "transparent rehash to argon2id failed; legacy plain: record left in place"
                 );
-                return;
+                None
             }
             None => {
                 tracing::warn!(
                     operator = name,
                     "transparent rehash: KDF closure failed in spawn_blocking; legacy plain: record left in place"
                 );
-                return;
+                None
             }
-        };
+        }
+    }
+
+    /// Swap `new_hash` into `name`'s record under the write lock, then flush
+    /// the registry to disk OUTSIDE the lock when a backing path is configured
+    /// (so a slow/unresponsive filesystem can't stall concurrent
+    /// authentications on other operators). The swap is skipped when the lock
+    /// is poisoned, the record vanished, or a concurrent rehash already won
+    /// the race — idempotent under contention. Persistence is best-effort: a
+    /// flush failure is logged but does NOT revert the in-memory upgrade (the
+    /// next successful login will retry the flush).
+    fn apply_rehashed_record(&self, name: &str, new_hash: String) {
         // Swap in-memory under the write lock.
         let flush_path = {
             let mut g = match self.ops.write() {
@@ -507,64 +545,9 @@ impl OperatorRegistry {
         nyx_token: Option<&str>,
         bootstrap: Option<&str>,
     ) -> std::io::Result<Self> {
-        let mut map: HashMap<String, OperatorRecord> = if path.exists() {
-            let txt = std::fs::read_to_string(path)?;
-            let parsed: Vec<OperatorRecord> = serde_json::from_str(&txt).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("operators file parse error: {e}"),
-                )
-            })?;
-            parsed.into_iter().map(|r| (r.name.clone(), r)).collect()
-        } else {
-            HashMap::new()
-        };
-
+        let mut map = load_registry_map(path)?;
         if map.is_empty() {
-            if let Some(bs) = bootstrap.and_then(|s| {
-                let (n, sec) = s.split_once(':')?;
-                (!n.is_empty() && !sec.is_empty()).then_some((n, sec))
-            }) {
-                // Bootstrap operator: always argon2id. The plain: fallback is
-                // gone — if argon2 fails we surface the error rather than
-                // silently storing an unsalted SHA-256 (the legacy weakness).
-                let hash = hash_argon2(bs.1).map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("bootstrap argon2 hash failed: {e}"),
-                    )
-                })?;
-                map.insert(
-                    bs.0.to_string(),
-                    OperatorRecord {
-                        name: bs.0.to_string(),
-                        secret_hash: hash,
-                        role: Role::Admin,
-                        created: now_secs(),
-                    },
-                );
-                persist(path, &map, bs.0)?;
-                tracing::info!(
-                    operator = bs.0,
-                    "bootstrapped admin operator from NYX_BOOTSTRAP_OPERATOR"
-                );
-            } else if let Some(tok) = nyx_token.filter(|s| !s.is_empty()) {
-                // _legacy token: upgrade from plain:sha256 to argon2id. The
-                // legacy plain: path remains in verify_secret only for reading
-                // pre-existing records; new _legacy records are argon2id.
-                let hash =
-                    hash_argon2(tok).unwrap_or_else(|_| format!("plain:{}", sha256_hex(tok)));
-                map.insert(
-                    "_legacy".into(),
-                    OperatorRecord {
-                        name: "_legacy".into(),
-                        secret_hash: hash,
-                        role: Role::Admin,
-                        created: now_secs(),
-                    },
-                );
-                // Not persisted — _legacy is synthesized from NYX_TOKEN each boot.
-            }
+            bootstrap_empty_registry(path, &mut map, nyx_token, bootstrap)?;
         }
         Ok(Self {
             ops: RwLock::new(map),
@@ -572,6 +555,93 @@ impl OperatorRegistry {
             auth_budget: AuthBudget::new(),
         })
     }
+}
+
+/// Load the operator map from `path`. Returns an empty map when the file is
+/// absent; a parse failure surfaces as an `InvalidData` error.
+fn load_registry_map(path: &Path) -> std::io::Result<HashMap<String, OperatorRecord>> {
+    if path.exists() {
+        let txt = std::fs::read_to_string(path)?;
+        let parsed: Vec<OperatorRecord> = serde_json::from_str(&txt).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("operators file parse error: {e}"),
+            )
+        })?;
+        Ok(parsed.into_iter().map(|r| (r.name.clone(), r)).collect())
+    } else {
+        Ok(HashMap::new())
+    }
+}
+
+/// Seed an empty registry: bootstrap one admin from `bootstrap` (`name:secret`)
+/// when set, else synthesize a `_legacy` admin from `nyx_token`, else leave
+/// the registry empty (open mode).
+fn bootstrap_empty_registry(
+    path: &Path,
+    map: &mut HashMap<String, OperatorRecord>,
+    nyx_token: Option<&str>,
+    bootstrap: Option<&str>,
+) -> std::io::Result<()> {
+    if let Some(bs) = bootstrap.and_then(|s| {
+        let (n, sec) = s.split_once(':')?;
+        (!n.is_empty() && !sec.is_empty()).then_some((n, sec))
+    }) {
+        seed_bootstrap_admin(path, map, bs)
+    } else if let Some(tok) = nyx_token.filter(|s| !s.is_empty()) {
+        seed_legacy_token(map, tok);
+        Ok(())
+    } else {
+        Ok(())
+    }
+}
+
+/// Bootstrap one admin operator (`name:secret`) into `map` and persist. Always
+/// argon2id — a KDF failure surfaces as an error rather than silently storing
+/// an unsalted SHA-256 (the legacy weakness).
+fn seed_bootstrap_admin(
+    path: &Path,
+    map: &mut HashMap<String, OperatorRecord>,
+    bs: (&str, &str),
+) -> std::io::Result<()> {
+    let hash = hash_argon2(bs.1).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bootstrap argon2 hash failed: {e}"),
+        )
+    })?;
+    map.insert(
+        bs.0.to_string(),
+        OperatorRecord {
+            name: bs.0.to_string(),
+            secret_hash: hash,
+            role: Role::Admin,
+            created: now_secs(),
+        },
+    );
+    persist(path, map, bs.0)?;
+    tracing::info!(
+        operator = bs.0,
+        "bootstrapped admin operator from NYX_BOOTSTRAP_OPERATOR"
+    );
+    Ok(())
+}
+
+/// Synthesize the `_legacy` admin record from a bare `NYX_TOKEN`. Upgraded to
+/// argon2id; the plain:sha256 path remains in `verify_secret` only for reading
+/// pre-existing records. Not persisted — `_legacy` is re-synthesized from
+/// `NYX_TOKEN` each boot.
+fn seed_legacy_token(map: &mut HashMap<String, OperatorRecord>, tok: &str) {
+    let hash = hash_argon2(tok).unwrap_or_else(|_| format!("plain:{}", sha256_hex(tok)));
+    map.insert(
+        "_legacy".into(),
+        OperatorRecord {
+            name: "_legacy".into(),
+            secret_hash: hash,
+            role: Role::Admin,
+            created: now_secs(),
+        },
+    );
 }
 
 /// Verify a secret against a stored hash. argon2 PHC strings use argon2;
