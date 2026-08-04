@@ -219,22 +219,42 @@ impl AuditWriter {
         inner.seq += 1;
         let seq = inner.seq;
         let ts = now_secs();
-        let prev = inner.last_hash.clone();
-        // Serialize detail ONCE; the SAME bytes feed both the hash-chain link
-        // AND the persisted record, so `verify_chain` can never observe a
-        // hash/storage fork (HIGH-4). Previously `detail_json` fell back to
-        // "null" for the hash while `rec.detail` kept the original `Value` —
-        // if that Value then re-serialized to something else, the recomputed
-        // link wouldn't match. Now a serialization failure zeroes `detail` in
-        // BOTH places (hash input + stored record) so they always agree.
-        let detail_json = match serde_json::to_string(&detail) {
+        let detail_json = Self::serialize_detail(&mut detail);
+        let rec = Self::chain_link(&mut inner, seq, ts, operator, action, target, detail, &detail_json);
+        Self::persist_record(&mut inner.file, &rec);
+    }
+
+    /// Serialize detail ONCE; the SAME bytes feed both the hash-chain link
+    /// AND the persisted record, so `verify_chain` can never observe a
+    /// hash/storage fork (HIGH-4). Previously `detail_json` fell back to
+    /// "null" for the hash while `rec.detail` kept the original `Value` —
+    /// if that Value then re-serialized to something else, the recomputed
+    /// link wouldn't match. Now a serialization failure zeroes `detail` in
+    /// BOTH places (hash input + stored record) so they always agree.
+    fn serialize_detail(detail: &mut serde_json::Value) -> String {
+        match serde_json::to_string(detail) {
             Ok(s) => s,
             Err(_) => {
-                detail = serde_json::Value::Null;
+                *detail = serde_json::Value::Null;
                 "null".to_string()
             }
-        };
-        let hash = hash_record(seq, ts, operator, action, target, &detail_json, &prev);
+        }
+    }
+
+    /// Hash-chain update: compute the link over the record fields, build the
+    /// record, and advance `last_hash` to the new link.
+    fn chain_link(
+        inner: &mut Inner,
+        seq: u64,
+        ts: u64,
+        operator: &str,
+        action: &str,
+        target: &str,
+        detail: serde_json::Value,
+        detail_json: &str,
+    ) -> AuditRecord {
+        let prev = inner.last_hash.clone();
+        let hash = hash_record(seq, ts, operator, action, target, detail_json, &prev);
         let rec = AuditRecord {
             seq,
             ts,
@@ -246,8 +266,14 @@ impl AuditWriter {
             hash: hash.clone(),
         };
         inner.last_hash = hash;
-        if let Ok(line) = serde_json::to_string(&rec) {
-            if writeln!(inner.file, "{line}").is_err() || inner.file.flush().is_err() {
+        rec
+    }
+
+    /// 落盘 flush: write the serialized record and flush per-record (durable
+    /// against clean shutdown).
+    fn persist_record(file: &mut File, rec: &AuditRecord) {
+        if let Ok(line) = serde_json::to_string(rec) {
+            if writeln!(file, "{line}").is_err() || file.flush().is_err() {
                 tracing::warn!("audit log write failed — record may be lost");
             }
         }
@@ -277,16 +303,34 @@ impl AuditWriter {
     pub fn query(&self, q: &AuditQuery) -> std::io::Result<Vec<AuditRecord>> {
         let f = File::open(&self.path)?;
         let reader = BufReader::new(f);
+        let (limit, offset, is_asc, keep) = Self::page_params(q);
+        Ok(Self::scan_records(reader, q, limit, offset, is_asc, keep))
+    }
+
+    /// 过滤条件解析: resolve pagination/direction parameters from the query.
+    /// Returns `(limit, offset, is_asc, keep)`. `keep` bounds the ring buffer
+    /// for the newest-first path. Cap it at HARD_CAP so an attacker-supplied
+    /// `offset` can't grow the buffer unboundedly; an offset beyond the cap
+    /// simply yields an empty page.
+    fn page_params(q: &AuditQuery) -> (usize, usize, bool, usize) {
         let limit = q.limit.unwrap_or(500).min(HARD_CAP);
         let offset = q.offset.unwrap_or(0);
         let is_asc = q.dir.as_deref() == Some("asc");
-        // `keep` bounds the ring buffer for the newest-first path. Cap it at
-        // HARD_CAP so an attacker-supplied `offset` can't grow the buffer
-        // unboundedly; an offset beyond the cap simply yields an empty page.
         let keep = offset.saturating_add(limit).min(HARD_CAP);
+        (limit, offset, is_asc, keep)
+    }
 
-        // Oldest-first (`asc`) path: collect only the page records, then stop.
-        // Newest-first path: ring buffer of the `keep` newest matches.
+    /// 记录扫描: read the file oldest-first, filter, and paginate.
+    /// Oldest-first (`asc`) path: collect only the page records, then stop.
+    /// Newest-first path: ring buffer of the `keep` newest matches.
+    fn scan_records(
+        reader: BufReader<File>,
+        q: &AuditQuery,
+        limit: usize,
+        offset: usize,
+        is_asc: bool,
+        keep: usize,
+    ) -> Vec<AuditRecord> {
         let mut asc_recs: Vec<AuditRecord> = Vec::new();
         let mut ring: std::collections::VecDeque<AuditRecord> =
             std::collections::VecDeque::with_capacity(keep.max(1));
@@ -321,12 +365,11 @@ impl AuditWriter {
         }
 
         if is_asc {
-            return Ok(asc_recs);
+            return asc_recs;
         }
         // Newest-first: the buffer holds the `keep` newest matches in insertion
         // (oldest-first) order. Reverse → newest-first, then skip/take the page.
-        let recs: Vec<AuditRecord> = ring.into_iter().rev().skip(offset).take(limit).collect();
-        Ok(recs)
+        ring.into_iter().rev().skip(offset).take(limit).collect()
     }
 
     /// The on-disk log path (for `GET /api/audit/verify`).
@@ -365,40 +408,47 @@ impl AuditWriter {
                 // false green light.
                 return Err(VerifyError::Truncated { line: line_count });
             }
-            // Malformed line (serde_json failed): previously this fell back to
-            // `prev_parse_seq(&line).unwrap_or(0)`, but `prev_parse_seq` ALSO
-            // parses via serde_json — so it ALWAYS failed too and returned 0,
-            // silently masking the real corruption position with a bogus seq 0.
-            // Now surface the corruption explicitly: log the offending line and
-            // blame the 1-based line number (the canonical "unparseable"
-            // position) so operators see WHERE verification broke instead of a
-            // misleading pass/fail.
-            let rec: AuditRecord = match serde_json::from_str(&line) {
-                Ok(r) => r,
-                Err(_) => {
-                    tracing::warn!(line, "audit line malformed during verify");
-                    return Err(VerifyError::MalformedLine { line: line_count });
-                }
-            };
-            if rec.prev_hash != prev {
-                return Err(VerifyError::ChainBreak { seq: rec.seq });
-            }
-            let detail_json = serde_json::to_string(&rec.detail).unwrap_or_else(|_| "null".into());
-            let recomputed = hash_record(
-                rec.seq,
-                rec.ts,
-                &rec.operator,
-                &rec.action,
-                &rec.target,
-                &detail_json,
-                &rec.prev_hash,
-            );
-            if recomputed != rec.hash {
-                return Err(VerifyError::ChainBreak { seq: rec.seq });
-            }
-            prev = rec.hash;
+            prev = Self::verify_record(&line, &prev, line_count)?;
         }
         Ok(true)
+    }
+
+    /// 逐条重算/比对: parse one line, check its `prev_hash` link, and recompute
+    /// its hash-chain link. Returns the record's hash (the next record's
+    /// expected `prev_hash`).
+    fn verify_record(line: &str, prev: &str, line_count: usize) -> Result<String, VerifyError> {
+        // Malformed line (serde_json failed): previously this fell back to
+        // `prev_parse_seq(&line).unwrap_or(0)`, but `prev_parse_seq` ALSO
+        // parses via serde_json — so it ALWAYS failed too and returned 0,
+        // silently masking the real corruption position with a bogus seq 0.
+        // Now surface the corruption explicitly: log the offending line and
+        // blame the 1-based line number (the canonical "unparseable"
+        // position) so operators see WHERE verification broke instead of a
+        // misleading pass/fail.
+        let rec: AuditRecord = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(line, "audit line malformed during verify");
+                return Err(VerifyError::MalformedLine { line: line_count });
+            }
+        };
+        if rec.prev_hash != prev {
+            return Err(VerifyError::ChainBreak { seq: rec.seq });
+        }
+        let detail_json = serde_json::to_string(&rec.detail).unwrap_or_else(|_| "null".into());
+        let recomputed = hash_record(
+            rec.seq,
+            rec.ts,
+            &rec.operator,
+            &rec.action,
+            &rec.target,
+            &detail_json,
+            &rec.prev_hash,
+        );
+        if recomputed != rec.hash {
+            return Err(VerifyError::ChainBreak { seq: rec.seq });
+        }
+        Ok(rec.hash)
     }
 }
 
