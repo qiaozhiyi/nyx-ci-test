@@ -212,14 +212,32 @@ fn ingest_chunk(st: &AppState, doh: &DohState, seq: u64, idx: usize, b64: &str, 
         doh.chunks.remove(&k);
     }
 
+    let Some(data) = decode_chunk(b64) else {
+        return;
+    };
+    buffer_chunk(doh, seq, idx, data, now);
+    let Some(frame) = assemble_frame(doh, seq) else {
+        return;
+    };
+    dispatch_frame(st, doh, &frame, seq, peer);
+}
+
+/// Decode one base64url chunk payload; `None` when it is not a well-formed
+/// chunk from our client.
+fn decode_chunk(b64: &str) -> Option<Vec<u8>> {
     let Ok(data) = B64.decode(b64) else {
-        return; // not our client (or corrupted label) — ignore
+        return None; // not our client (or corrupted label) — ignore
     };
     // Sanity: one chunk of our client is ≤160 bytes.
     if data.is_empty() || data.len() > 160 {
-        return;
+        return None;
     }
+    Some(data)
+}
 
+/// Buffer one decoded chunk in the per-sequence assembly state, creating the
+/// assembly on first chunk. `now` is the ingest instant for TTL bookkeeping.
+fn buffer_chunk(doh: &DohState, seq: u64, idx: usize, data: Vec<u8>, now: Instant) {
     let mut entry = doh.chunks.entry(seq).or_insert_with(|| ChunkAcc {
         parts: Vec::new(),
         updated: now,
@@ -229,22 +247,31 @@ fn ingest_chunk(st: &AppState, doh: &DohState, seq: u64, idx: usize, b64: &str, 
         entry.parts.resize(idx + 1, None);
     }
     entry.parts[idx] = Some(data);
+}
 
+/// Assemble the buffered chunks of `seq` when they are contiguous from index
+/// 0, consuming the assembly; `None` while gaps remain.
+fn assemble_frame(doh: &DohState, seq: u64) -> Option<Vec<u8>> {
+    let entry = doh.chunks.get(&seq)?;
     // Assemble only when the parts are contiguous from index 0.
     let mut frame = Vec::new();
     for part in &entry.parts {
         match part {
             Some(bytes) => frame.extend_from_slice(bytes),
-            None => return, // gap — keep waiting
+            None => return None, // gap — keep waiting
         }
     }
     drop(entry);
     doh.chunks.remove(&seq); // consumed
+    Some(frame)
+}
 
-    // Push through the same channel-agnostic funnel as /beacon. A frame that
-    // fails to parse is garbage (or from a different zone's delegation) —
-    // drop it and keep serving.
-    let Ok(raw) = nyx_protocol::parse_frame(&frame) else {
+/// Push an assembled frame through the same channel-agnostic funnel as
+/// /beacon and buffer the sealed reply keyed by session pubkey. A frame that
+/// fails to parse is garbage (or from a different zone's delegation) — drop
+/// it and keep serving.
+fn dispatch_frame(st: &AppState, doh: &DohState, frame: &[u8], seq: u64, peer: SocketAddr) {
+    let Ok(raw) = nyx_protocol::parse_frame(frame) else {
         tracing::debug!(target: "nyx::doh", %peer, seq, bytes = frame.len(), "DoH chunk assembly failed frame parse");
         return;
     };
@@ -410,7 +437,22 @@ pub fn spawn_udp_responder(state: Arc<AppState>, bind: String) {
 fn answer_wire_query(st: &AppState, query: &[u8], peer: SocketAddr) -> Option<Vec<u8>> {
     let (id, qname, qtype, qclass, qend) = parse_wire_query(query)?;
     let response = handle_query(st, &qname, qtype, peer);
+    let out = build_wire_response(query, id, &qname, qtype, qclass, response);
+    // qend unused beyond validation; keep the slice tidy.
+    let _ = qend;
+    Some(out)
+}
 
+/// Build the wire-format response for a parsed query: header (QR|AA, echo
+/// RD; NXDOMAIN for names we don't serve), question echo, and answer section.
+fn build_wire_response(
+    query: &[u8],
+    id: u16,
+    qname: &str,
+    qtype: u16,
+    qclass: u16,
+    response: DohAnswer,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(query.len() + 64);
     // Header: id, flags (QR|AA, echo RD; NXDOMAIN sets RCODE=3).
     let rcode: u16 = match response {
@@ -425,10 +467,17 @@ fn answer_wire_query(st: &AppState, query: &[u8], peer: SocketAddr) -> Option<Ve
     out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
 
     // Question echo (re-encode uncompressed — resolvers accept it).
-    encode_wire_name(&qname, &mut out);
+    encode_wire_name(qname, &mut out);
     out.extend_from_slice(&qtype.to_be_bytes());
     out.extend_from_slice(&qclass.to_be_bytes());
 
+    append_wire_answer(&mut out, response);
+    out
+}
+
+/// Append the answer section and patch ANCOUNT in the header. An oversized
+/// TXT payload degrades to an empty answer (ANCOUNT stays 0).
+fn append_wire_answer(out: &mut Vec<u8>, response: DohAnswer) {
     // Answer section (compute ANCOUNT before the match moves `response`).
     let has_answer = matches!(response, DohAnswer::Txt(_) | DohAnswer::A(_));
     match response {
@@ -436,7 +485,7 @@ fn answer_wire_query(st: &AppState, query: &[u8], peer: SocketAddr) -> Option<Ve
             let data = B64.encode(&bytes);
             if data.len() > 255 {
                 // Cannot fit a TXT character-string; serve an empty answer.
-                return Some(out);
+                return;
             }
             out.extend_from_slice(&[0xC0, 0x0C]); // name: pointer to qname
             out.extend_from_slice(&TYPE_TXT.to_be_bytes());
@@ -458,9 +507,6 @@ fn answer_wire_query(st: &AppState, query: &[u8], peer: SocketAddr) -> Option<Ve
     }
     // Patch ANCOUNT (1 when we appended an answer).
     out[6..8].copy_from_slice(&(has_answer as u16).to_be_bytes());
-    // qend unused beyond validation; keep the slice tidy.
-    let _ = qend;
-    Some(out)
 }
 
 /// Parse a DNS wire-format query: returns `(id, qname, qtype, qclass, end)`.
