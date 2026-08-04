@@ -35,7 +35,11 @@ fn test_pipe_name() -> String {
 /// Read exactly `buf.len()` bytes, looping over short reads (byte-mode
 /// named-pipe reads return whatever is currently buffered) with a hard
 /// deadline so a wedged listener fails the test instead of hanging CI.
-fn read_exact_bounded(file: &mut std::fs::File, buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
+fn read_exact_bounded(
+    file: &mut std::fs::File,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
     let mut off = 0;
     while off < buf.len() {
         if Instant::now() >= deadline {
@@ -60,11 +64,7 @@ fn read_exact_bounded(file: &mut std::fs::File, buf: &mut [u8], deadline: Instan
 /// open the pipe, write `[4B LE len][sealed check-in frame]`, read the
 /// `[4B LE len][sealed reply]`, assert the reply opens with the session key
 /// and the session lands in the registry. Returns the session pubkey.
-fn child_transaction(
-    state: &Arc<AppState>,
-    pipe_name: &str,
-    beacon_id: u32,
-) -> [u8; 32] {
+fn child_transaction(state: &Arc<AppState>, pipe_name: &str, beacon_id: u32) -> [u8; 32] {
     let server_pub = state.keypair.public_bytes();
 
     // The listener thread creates the pipe instance asynchronously, so the

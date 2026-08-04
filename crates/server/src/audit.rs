@@ -220,7 +220,16 @@ impl AuditWriter {
         let seq = inner.seq;
         let ts = now_secs();
         let detail_json = Self::serialize_detail(&mut detail);
-        let rec = Self::chain_link(&mut inner, seq, ts, operator, action, target, detail, &detail_json);
+        let rec = Self::chain_link(
+            &mut inner,
+            seq,
+            ts,
+            operator,
+            action,
+            target,
+            detail,
+            &detail_json,
+        );
         Self::persist_record(&mut inner.file, &rec);
     }
 

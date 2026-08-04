@@ -89,12 +89,19 @@ def funcs(path):
         i += 1
     return out
 
-for root in ROOTS:
+def targets(root):
+    if os.path.isfile(root):
+        yield root
+        return
     for dirpath, _, files in os.walk(root):
         for f in sorted(files):
-            if not f.endswith(".rs") or f in SKIP_FILES:
-                continue
-            p = os.path.join(dirpath, f)
-            for name, length, line in funcs(p):
-                if length > THRESH:
-                    print(f"{length:4d}  {p}:{line}  {name}")
+            yield os.path.join(dirpath, f)
+
+for root in ROOTS:
+    for p in targets(root):
+        f = os.path.basename(p)
+        if not f.endswith(".rs") or f in SKIP_FILES:
+            continue
+        for name, length, line in funcs(p):
+            if length > THRESH:
+                print(f"{length:4d}  {p}:{line}  {name}")
