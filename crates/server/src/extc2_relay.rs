@@ -215,93 +215,30 @@ impl ExtC2RelayConfig {
     /// here (channels pushed in priority order: Slack first, MCP as fallback)
     /// and stored in [`Self::stack`]; both relay entry points send through it.
     pub fn from_env() -> Result<Self, String> {
-        let slack: Option<SlackRelay> = match (
-            std::env::var("NYX_EXTC2_SLACK_TOKEN"),
-            std::env::var("NYX_EXTC2_SLACK_CHANNEL"),
-        ) {
-            (Ok(token), Ok(channel)) if !token.is_empty() && !channel.is_empty() => {
-                let hmac_hex = std::env::var("NYX_EXTC2_SLACK_HMAC_KEY").map_err(|_| {
-                    "NYX_EXTC2_SLACK_HMAC_KEY is required when the Slack relay is enabled \
-                     (NYX_EXTC2_SLACK_TOKEN and NYX_EXTC2_SLACK_CHANNEL are both set); \
-                     refusing to start with a guessable HMAC key"
-                        .to_string()
-                })?;
-                let session_key = decode_hmac_key(&hmac_hex)?;
-                Some(SlackRelay {
-                    bot_token: token.into(),
-                    channel_id: channel.into(),
-                    session_key,
-                })
-            }
-            _ => None,
-        };
-        let mcp: Option<McpRelay> = match (
-            std::env::var("NYX_EXTC2_MCP_URL"),
-            std::env::var("NYX_EXTC2_MCP_KEY"),
-            std::env::var("NYX_EXTC2_MCP_SESSION"),
-        ) {
-            (Ok(url), Ok(key), Ok(session))
-                if !url.is_empty() && !key.is_empty() && !session.is_empty() =>
-            {
-                Some(McpRelay {
-                    server_url: url.into(),
-                    api_key: key.into(),
-                    session_id: session.into(),
-                })
-            }
-            _ => None,
-        };
+        let slack = Self::slack_from_env()?;
+        let mcp = Self::mcp_from_env();
+        let llm = Self::llm_from_env()?;
+        let discord = Self::discord_from_env()?;
 
-        // LLM (Anthropic) relay: key + model + a 32-byte session key shared
-        // with the LLM-beacon out-of-band. The session key is REQUIRED and
-        // fail-closed (same contract as Slack's HMAC key): without it a third
-        // party who can prompt the model could inject relayed frames
-        // (CRITICAL-23).
-        let llm: Option<LlmRelay> = match (
-            std::env::var("NYX_EXTC2_LLM_KEY"),
-            std::env::var("NYX_EXTC2_LLM_MODEL"),
-        ) {
-            (Ok(key), Ok(model)) if !key.is_empty() && !model.is_empty() => {
-                let session_hex = std::env::var("NYX_EXTC2_LLM_SESSION_KEY").map_err(|_| {
-                    "NYX_EXTC2_LLM_SESSION_KEY is required when the LLM relay is enabled \
-                     (NYX_EXTC2_LLM_KEY and NYX_EXTC2_LLM_MODEL are both set); refusing \
-                     to start with unauthenticated relayed frames"
-                        .to_string()
-                })?;
-                let session_key = decode_hmac_key(&session_hex)?;
-                Some(LlmRelay {
-                    api_key: key.into(),
-                    model: model.into(),
-                    session_key,
-                })
-            }
-            _ => None,
-        };
+        let stack = Self::build_stack(&slack, &mcp, &llm, &discord)?;
 
-        // Discord relay: bot token + channel ID + HMAC key. Same fail-closed
-        // HMAC contract as Slack — without it anyone who can post into the
-        // channel could forge relayed frames.
-        let discord: Option<DiscordRelay> = match (
-            std::env::var("NYX_EXTC2_DISCORD_TOKEN"),
-            std::env::var("NYX_EXTC2_DISCORD_CHANNEL"),
-        ) {
-            (Ok(token), Ok(channel)) if !token.is_empty() && !channel.is_empty() => {
-                let hmac_hex = std::env::var("NYX_EXTC2_DISCORD_HMAC_KEY").map_err(|_| {
-                    "NYX_EXTC2_DISCORD_HMAC_KEY is required when the Discord relay is \
-                     enabled (NYX_EXTC2_DISCORD_TOKEN and NYX_EXTC2_DISCORD_CHANNEL are \
-                     both set); refusing to start with a guessable HMAC key"
-                        .to_string()
-                })?;
-                let session_key = decode_hmac_key(&hmac_hex)?;
-                Some(DiscordRelay {
-                    bot_token: token.into(),
-                    channel_id: channel.into(),
-                    session_key,
-                })
-            }
-            _ => None,
-        };
+        Ok(ExtC2RelayConfig {
+            slack,
+            mcp,
+            llm,
+            discord,
+            stack,
+        })
+    }
 
+    /// Build the ONE shared transport stack when any relay is enabled.
+    /// Returns `Ok(None)` when no relay is enabled.
+    fn build_stack(
+        slack: &Option<SlackRelay>,
+        mcp: &Option<McpRelay>,
+        llm: &Option<LlmRelay>,
+        discord: &Option<DiscordRelay>,
+    ) -> Result<Option<Arc<Mutex<TransportStack>>>, String> {
         // Build the ONE shared transport stack when any relay is enabled. The
         // transports are constructed here at boot, not per relay call: each
         // owns an HTTP agent and per-channel rate-limit/cooldown state that
@@ -344,13 +281,117 @@ impl ExtC2RelayConfig {
             None
         };
 
-        Ok(ExtC2RelayConfig {
-            slack,
-            mcp,
-            llm,
-            discord,
-            stack,
-        })
+        Ok(stack)
+    }
+
+    /// Parse the Slack relay env config. Returns `Ok(None)` when the relay is
+    /// disabled; `Err` (fail-closed) when it is enabled but
+    /// `NYX_EXTC2_SLACK_HMAC_KEY` is missing, malformed, or all-zero.
+    fn slack_from_env() -> Result<Option<SlackRelay>, String> {
+        let slack: Option<SlackRelay> = match (
+            std::env::var("NYX_EXTC2_SLACK_TOKEN"),
+            std::env::var("NYX_EXTC2_SLACK_CHANNEL"),
+        ) {
+            (Ok(token), Ok(channel)) if !token.is_empty() && !channel.is_empty() => {
+                let hmac_hex = std::env::var("NYX_EXTC2_SLACK_HMAC_KEY").map_err(|_| {
+                    "NYX_EXTC2_SLACK_HMAC_KEY is required when the Slack relay is enabled \
+                     (NYX_EXTC2_SLACK_TOKEN and NYX_EXTC2_SLACK_CHANNEL are both set); \
+                     refusing to start with a guessable HMAC key"
+                        .to_string()
+                })?;
+                let session_key = decode_hmac_key(&hmac_hex)?;
+                Some(SlackRelay {
+                    bot_token: token.into(),
+                    channel_id: channel.into(),
+                    session_key,
+                })
+            }
+            _ => None,
+        };
+        Ok(slack)
+    }
+
+    /// Parse the MCP relay env config. Returns `Ok(None)` when the relay is
+    /// disabled.
+    fn mcp_from_env() -> Option<McpRelay> {
+        match (
+            std::env::var("NYX_EXTC2_MCP_URL"),
+            std::env::var("NYX_EXTC2_MCP_KEY"),
+            std::env::var("NYX_EXTC2_MCP_SESSION"),
+        ) {
+            (Ok(url), Ok(key), Ok(session))
+                if !url.is_empty() && !key.is_empty() && !session.is_empty() =>
+            {
+                Some(McpRelay {
+                    server_url: url.into(),
+                    api_key: key.into(),
+                    session_id: session.into(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse the LLM (Anthropic) relay env config. Returns `Ok(None)` when the
+    /// relay is disabled; `Err` (fail-closed) when it is enabled but
+    /// `NYX_EXTC2_LLM_SESSION_KEY` is missing, malformed, or all-zero.
+    fn llm_from_env() -> Result<Option<LlmRelay>, String> {
+        // LLM (Anthropic) relay: key + model + a 32-byte session key shared
+        // with the LLM-beacon out-of-band. The session key is REQUIRED and
+        // fail-closed (same contract as Slack's HMAC key): without it a third
+        // party who can prompt the model could inject relayed frames
+        // (CRITICAL-23).
+        let llm: Option<LlmRelay> = match (
+            std::env::var("NYX_EXTC2_LLM_KEY"),
+            std::env::var("NYX_EXTC2_LLM_MODEL"),
+        ) {
+            (Ok(key), Ok(model)) if !key.is_empty() && !model.is_empty() => {
+                let session_hex = std::env::var("NYX_EXTC2_LLM_SESSION_KEY").map_err(|_| {
+                    "NYX_EXTC2_LLM_SESSION_KEY is required when the LLM relay is enabled \
+                     (NYX_EXTC2_LLM_KEY and NYX_EXTC2_LLM_MODEL are both set); refusing \
+                     to start with unauthenticated relayed frames"
+                        .to_string()
+                })?;
+                let session_key = decode_hmac_key(&session_hex)?;
+                Some(LlmRelay {
+                    api_key: key.into(),
+                    model: model.into(),
+                    session_key,
+                })
+            }
+            _ => None,
+        };
+        Ok(llm)
+    }
+
+    /// Parse the Discord relay env config. Returns `Ok(None)` when the relay
+    /// is disabled; `Err` (fail-closed) when it is enabled but
+    /// `NYX_EXTC2_DISCORD_HMAC_KEY` is missing, malformed, or all-zero.
+    fn discord_from_env() -> Result<Option<DiscordRelay>, String> {
+        // Discord relay: bot token + channel ID + HMAC key. Same fail-closed
+        // HMAC contract as Slack — without it anyone who can post into the
+        // channel could forge relayed frames.
+        let discord: Option<DiscordRelay> = match (
+            std::env::var("NYX_EXTC2_DISCORD_TOKEN"),
+            std::env::var("NYX_EXTC2_DISCORD_CHANNEL"),
+        ) {
+            (Ok(token), Ok(channel)) if !token.is_empty() && !channel.is_empty() => {
+                let hmac_hex = std::env::var("NYX_EXTC2_DISCORD_HMAC_KEY").map_err(|_| {
+                    "NYX_EXTC2_DISCORD_HMAC_KEY is required when the Discord relay is \
+                     enabled (NYX_EXTC2_DISCORD_TOKEN and NYX_EXTC2_DISCORD_CHANNEL are \
+                     both set); refusing to start with a guessable HMAC key"
+                        .to_string()
+                })?;
+                let session_key = decode_hmac_key(&hmac_hex)?;
+                Some(DiscordRelay {
+                    bot_token: token.into(),
+                    channel_id: channel.into(),
+                    session_key,
+                })
+            }
+            _ => None,
+        };
+        Ok(discord)
     }
 
     /// True iff at least one channel's relay is configured. When false the
