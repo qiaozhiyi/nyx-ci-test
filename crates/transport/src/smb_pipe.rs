@@ -16,55 +16,6 @@
 
 use crate::traits::{Transport, TransportError};
 
-// ---- Windows FFI bindings ---------------------------------------------------
-
-#[cfg(windows)]
-mod win32 {
-    use std::os::windows::io::RawHandle;
-
-    pub const INVALID_HANDLE_VALUE: isize = -1;
-    pub const GENERIC_READ: u32 = 0x80000000;
-    pub const GENERIC_WRITE: u32 = 0x40000000;
-    pub const OPEN_EXISTING: u32 = 3;
-    pub const ERROR_PIPE_BUSY: u32 = 231;
-    #[allow(dead_code)] // reserved for future WaitNamedPipe integration
-    pub const NMPWAIT_USE_DEFAULT_WAIT: u32 = 0;
-
-    extern "system" {
-        pub fn CreateFileW(
-            lpFileName: *const u16,
-            dwDesiredAccess: u32,
-            dwShareMode: u32,
-            lpSecurityAttributes: *const std::ffi::c_void,
-            dwCreationDisposition: u32,
-            dwFlagsAndAttributes: u32,
-            hTemplateFile: RawHandle,
-        ) -> RawHandle;
-
-        pub fn ReadFile(
-            hFile: RawHandle,
-            lpBuffer: *mut u8,
-            nNumberOfBytesToRead: u32,
-            lpNumberOfBytesRead: *mut u32,
-            lpOverlapped: *const std::ffi::c_void,
-        ) -> i32;
-
-        pub fn WriteFile(
-            hFile: RawHandle,
-            lpBuffer: *const u8,
-            nNumberOfBytesToWrite: u32,
-            lpNumberOfBytesWritten: *mut u32,
-            lpOverlapped: *const std::ffi::c_void,
-        ) -> i32;
-
-        pub fn CloseHandle(hObject: RawHandle) -> i32;
-
-        pub fn WaitNamedPipeW(lpNamedPipeName: *const u16, nTimeOut: u32) -> i32;
-
-        pub fn GetLastError() -> u32;
-    }
-}
-
 // ---- Constants --------------------------------------------------------------
 
 /// Default named pipe path (well-known C2 pipe name).
@@ -212,25 +163,51 @@ impl SmbPipeTransport {
     }
 
     fn connect_inner(&mut self, timeout_ms: Option<u32>) -> Result<(), TransportError> {
+        // Encode pipe name as UTF-16 (Windows wide string).
+        let wide = self.pipe_name_wide();
+
+        // If a timeout was requested, wait for the pipe to become available.
+        if let Some(ms) = timeout_ms {
+            Self::wait_for_pipe(&wide, ms)?;
+        }
+
+        let handle = Self::open_pipe(&wide)?;
+
+        self.handle = handle;
+        self.connected = true;
+        Ok(())
+    }
+
+    /// Encode the pipe name as a null-terminated UTF-16 wide string.
+    fn pipe_name_wide(&self) -> Vec<u16> {
         use std::os::windows::ffi::OsStrExt;
-        use win32::*;
 
         // Encode pipe name as UTF-16 (Windows wide string).
         let wide: Vec<u16> = std::ffi::OsStr::new(&self.pipe_name)
             .encode_wide()
             .chain(std::iter::once(0)) // null terminator
             .collect();
+        wide
+    }
 
-        // If a timeout was requested, wait for the pipe to become available.
-        if let Some(ms) = timeout_ms {
-            // WaitNamedPipeW returns non-zero on success (pipe available).
-            // Returns 0 on timeout or error.
-            let wait_result = unsafe { WaitNamedPipeW(wide.as_ptr(), ms) };
-            if wait_result == 0 {
-                let _err = unsafe { GetLastError() };
-                return Err(TransportError::Transient("smb-pipe: pipe not available"));
-            }
+    /// Wait for the pipe to become available within `ms` milliseconds.
+    fn wait_for_pipe(wide: &[u16], ms: u32) -> Result<(), TransportError> {
+        use win32::*;
+
+        // WaitNamedPipeW returns non-zero on success (pipe available).
+        // Returns 0 on timeout or error.
+        let wait_result = unsafe { WaitNamedPipeW(wide.as_ptr(), ms) };
+        if wait_result == 0 {
+            let _err = unsafe { GetLastError() };
+            return Err(TransportError::Transient("smb-pipe: pipe not available"));
         }
+        Ok(())
+    }
+
+    /// Open the pipe via `CreateFileW` and classify failures. Returns the raw
+    /// handle on success.
+    fn open_pipe(wide: &[u16]) -> Result<std::os::windows::io::RawHandle, TransportError> {
+        use win32::*;
 
         let handle = unsafe {
             CreateFileW(
@@ -252,9 +229,7 @@ impl SmbPipeTransport {
             return Err(TransportError::Dead("smb-pipe: CreateFileW failed"));
         }
 
-        self.handle = handle;
-        self.connected = true;
-        Ok(())
+        Ok(handle)
     }
 
     /// Write all bytes to the pipe. Returns false on failure.
@@ -360,6 +335,55 @@ impl Transport for SmbPipeTransport {
 
     fn max_frame_size(&self) -> usize {
         MAX_FRAME
+    }
+}
+
+// ---- Windows FFI bindings ---------------------------------------------------
+
+#[cfg(windows)]
+mod win32 {
+    use std::os::windows::io::RawHandle;
+
+    pub const INVALID_HANDLE_VALUE: isize = -1;
+    pub const GENERIC_READ: u32 = 0x80000000;
+    pub const GENERIC_WRITE: u32 = 0x40000000;
+    pub const OPEN_EXISTING: u32 = 3;
+    pub const ERROR_PIPE_BUSY: u32 = 231;
+    #[allow(dead_code)] // reserved for future WaitNamedPipe integration
+    pub const NMPWAIT_USE_DEFAULT_WAIT: u32 = 0;
+
+    extern "system" {
+        pub fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: *const std::ffi::c_void,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: RawHandle,
+        ) -> RawHandle;
+
+        pub fn ReadFile(
+            hFile: RawHandle,
+            lpBuffer: *mut u8,
+            nNumberOfBytesToRead: u32,
+            lpNumberOfBytesRead: *mut u32,
+            lpOverlapped: *const std::ffi::c_void,
+        ) -> i32;
+
+        pub fn WriteFile(
+            hFile: RawHandle,
+            lpBuffer: *const u8,
+            nNumberOfBytesToWrite: u32,
+            lpNumberOfBytesWritten: *mut u32,
+            lpOverlapped: *const std::ffi::c_void,
+        ) -> i32;
+
+        pub fn CloseHandle(hObject: RawHandle) -> i32;
+
+        pub fn WaitNamedPipeW(lpNamedPipeName: *const u16, nTimeOut: u32) -> i32;
+
+        pub fn GetLastError() -> u32;
     }
 }
 
