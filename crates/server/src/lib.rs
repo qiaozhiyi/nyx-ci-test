@@ -434,80 +434,101 @@ pub fn load_persisted_sessions(state: &AppState) -> usize {
     };
     let n = rows.len();
     for r in rows {
-        let mut key_bytes = [0u8; 32];
-        if hex::decode_to_slice(&r.session_id, &mut key_bytes).is_err() {
-            // A row with a non-hex/non-32-byte id can't have come from this
-            // server (it always writes a 32-byte pubkey hex). Skip it rather
-            // than poisoning the registry — a hand-edited DB shouldn't take the
-            // server down.
-            tracing::warn!(
-                session_id = %r.session_id,
-                "persisted session has a malformed id; skipping"
-            );
-            continue;
+        if let Some((key_bytes, session)) = load_persisted_sessions_rehydrate(state, r) {
+            state.sessions.entry(key_bytes).or_insert(session);
         }
-        // Avoid clobbering a session a racer beacon already registered between
-        // the store `list` and here (vanishingly unlikely at boot, but the
-        // registry is the authority).
-        if state.sessions.contains_key(&key_bytes) {
-            continue;
-        }
-        // `created`/`last_seen` use a synthetic Instant: there's no way to turn
-        // a stored wall-clock `u64` back into a monotonic `Instant`, so back-date
-        // from now using the stored age. The age/idle GC math is duration-based,
-        // so this keeps eviction behaviour consistent with live sessions.
-        let now = Instant::now();
-        let now_s = now_unix();
-        let age_secs = now_s.saturating_sub(r.first_seen);
-        let idle_secs = now_s.saturating_sub(r.last_seen);
-        let created = now
-            .checked_sub(std::time::Duration::from_secs(age_secs))
-            .unwrap_or(now);
-        let last_seen_instant = now
-            .checked_sub(std::time::Duration::from_secs(idle_secs))
-            .unwrap_or(now);
-        let session = Session {
-            // The live session key is re-derived on the FIRST post-restart
-            // check-in (handle_frame derives it from the server keypair +
-            // pubkey); store a zero placeholder. It is overwritten before any
-            // decrypt by the existing-session branch's `s.key.clone()`.
-            key: SessionKey::new([0u8; 32]),
-            info: SessionInfo {
-                beacon_id: r.beacon_id,
-                hostname: r.hostname,
-                username: r.username,
-                os: r.os,
-                arch: r.arch,
-                pid: r.pid,
-                is_admin: r.is_admin,
-                // The one-time token already lived in the `implants` table and
-                // was consumed at the original check-in; don't replay it.
-                auth_token: None,
-            },
-            owner: r.owner.clone(),
-            // Restore the send/recv counters persisted with the row (contract
-            // 4) so BOTH counter spaces continue across a restart: the C2S
-            // watermark (`last_recv`) keeps the anti-replay check continuous —
-            // the implant's next counter (> persisted last_recv) passes — and
-            // the S2C nonce space (`send_counter`) resumes where it left off
-            // instead of reusing nonces the implant already saw. Legacy rows
-            // written before the columns existed restore as 0 (the columns
-            // DEFAULT 0), which preserves the pre-restore semantics for them.
-            last_recv: r.last_recv,
-            send_counter: r.send_counter,
-            next_task_id: 1,
-            pending: Vec::new(),
-            results: Vec::new(),
-            created,
-            last_seen: last_seen_instant,
-            ja3: None,
-            ja4: None,
-            stale: true,
-            persisted_last_touch: last_seen_instant,
-        };
-        state.sessions.entry(key_bytes).or_insert(session);
     }
     n
+}
+
+/// Decode a persisted row's session id and rebuild the in-memory [`Session`].
+/// Returns `None` for rows that must be skipped: a malformed id (non-hex /
+/// non-32-byte — can't have come from this server), or a pubkey a racer beacon
+/// already registered between the store `list` and here.
+fn load_persisted_sessions_rehydrate(
+    state: &AppState,
+    r: nyx_store::SessionRecord,
+) -> Option<(SessionId, Session)> {
+    let mut key_bytes = [0u8; 32];
+    if hex::decode_to_slice(&r.session_id, &mut key_bytes).is_err() {
+        // A row with a non-hex/non-32-byte id can't have come from this
+        // server (it always writes a 32-byte pubkey hex). Skip it rather
+        // than poisoning the registry — a hand-edited DB shouldn't take the
+        // server down.
+        tracing::warn!(
+            session_id = %r.session_id,
+            "persisted session has a malformed id; skipping"
+        );
+        return None;
+    }
+    // Avoid clobbering a session a racer beacon already registered between
+    // the store `list` and here (vanishingly unlikely at boot, but the
+    // registry is the authority).
+    if state.sessions.contains_key(&key_bytes) {
+        return None;
+    }
+    // `created`/`last_seen` use a synthetic Instant: there's no way to turn
+    // a stored wall-clock `u64` back into a monotonic `Instant`, so back-date
+    // from now using the stored age. The age/idle GC math is duration-based,
+    // so this keeps eviction behaviour consistent with live sessions.
+    let now = Instant::now();
+    let now_s = now_unix();
+    let age_secs = now_s.saturating_sub(r.first_seen);
+    let idle_secs = now_s.saturating_sub(r.last_seen);
+    let created = now
+        .checked_sub(std::time::Duration::from_secs(age_secs))
+        .unwrap_or(now);
+    let last_seen_instant = now
+        .checked_sub(std::time::Duration::from_secs(idle_secs))
+        .unwrap_or(now);
+    let session = load_persisted_sessions_build_session(r, created, last_seen_instant);
+    Some((key_bytes, session))
+}
+
+/// Assemble the [`Session`] for a restored row. The live session key is
+/// re-derived on the FIRST post-restart check-in (handle_frame derives it from
+/// the server keypair + pubkey); store a zero placeholder. It is overwritten
+/// before any decrypt by the existing-session branch's `s.key.clone()`.
+fn load_persisted_sessions_build_session(
+    r: nyx_store::SessionRecord,
+    created: Instant,
+    last_seen_instant: Instant,
+) -> Session {
+    Session {
+        key: SessionKey::new([0u8; 32]),
+        info: SessionInfo {
+            beacon_id: r.beacon_id,
+            hostname: r.hostname,
+            username: r.username,
+            os: r.os,
+            arch: r.arch,
+            pid: r.pid,
+            is_admin: r.is_admin,
+            // The one-time token already lived in the `implants` table and
+            // was consumed at the original check-in; don't replay it.
+            auth_token: None,
+        },
+        owner: r.owner.clone(),
+        // Restore the send/recv counters persisted with the row (contract
+        // 4) so BOTH counter spaces continue across a restart: the C2S
+        // watermark (`last_recv`) keeps the anti-replay check continuous —
+        // the implant's next counter (> persisted last_recv) passes — and
+        // the S2C nonce space (`send_counter`) resumes where it left off
+        // instead of reusing nonces the implant already saw. Legacy rows
+        // written before the columns existed restore as 0 (the columns
+        // DEFAULT 0), which preserves the pre-restore semantics for them.
+        last_recv: r.last_recv,
+        send_counter: r.send_counter,
+        next_task_id: 1,
+        pending: Vec::new(),
+        results: Vec::new(),
+        created,
+        last_seen: last_seen_instant,
+        ja3: None,
+        ja4: None,
+        stale: true,
+        persisted_last_touch: last_seen_instant,
+    }
 }
 
 /// Bridge scripting events into the server's `tracing` log (the default hook).
@@ -600,65 +621,87 @@ pub fn load_profile(path: &std::path::Path) -> anyhow::Result<nyx_profile::Profi
 pub fn load_or_create_keypair(
     path: &std::path::Path,
 ) -> anyhow::Result<nyx_protocol::ServerKeypair> {
-    use nyx_protocol::ServerKeypair;
     if path.exists() {
-        let bytes = std::fs::read(path)?;
-        let arr: [u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("keyfile {} is not 32 bytes", path.display()))?;
-        // A truncated-but-32-byte keyfile (crash corruption) silently rotates
-        // the server identity, invalidating every live session and implant
-        // token. An all-zero key is the canonical corruption signature — reject
-        // it loudly instead of using a broken identity.
-        if arr == [0u8; 32] {
-            anyhow::bail!(
-                "keyfile {} is all-zero (corrupted or zeroed); refusing to use a \
-                 broken server identity — restore the keyfile or delete it to \
-                 regenerate (note: regenerating invalidates all sessions)",
-                path.display()
-            );
-        }
-        // Existing-file path: tighten permissions to 0600 (best-effort on
-        // Unix) so a pre-existing loose file (e.g. created under a permissive
-        // umask before this check existed) does not stay world-readable.
+        load_or_create_keypair_existing(path)
+    } else {
+        load_or_create_keypair_generate(path)
+    }
+}
+
+/// Existing-file path: read the stored 32-byte secret, reject the all-zero
+/// corruption signature, and tighten permissions to 0600 (best-effort on Unix)
+/// so a pre-existing loose file (e.g. created under a permissive umask before
+/// this check existed) does not stay world-readable.
+fn load_or_create_keypair_existing(
+    path: &std::path::Path,
+) -> anyhow::Result<nyx_protocol::ServerKeypair> {
+    use nyx_protocol::ServerKeypair;
+    let bytes = std::fs::read(path)?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("keyfile {} is not 32 bytes", path.display()))?;
+    // A truncated-but-32-byte keyfile (crash corruption) silently rotates
+    // the server identity, invalidating every live session and implant
+    // token. An all-zero key is the canonical corruption signature — reject
+    // it loudly instead of using a broken identity.
+    if arr == [0u8; 32] {
+        anyhow::bail!(
+            "keyfile {} is all-zero (corrupted or zeroed); refusing to use a \
+             broken server identity — restore the keyfile or delete it to \
+             regenerate (note: regenerating invalidates all sessions)",
+            path.display()
+        );
+    }
+    // Existing-file path: tighten permissions to 0600 (best-effort on
+    // Unix) so a pre-existing loose file (e.g. created under a permissive
+    // umask before this check existed) does not stay world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(ServerKeypair::from_secret_bytes(arr))
+}
+
+/// Generate a fresh keypair and persist it atomically: write to a temp file in
+/// the SAME directory with 0600 set on the temp BEFORE renaming it into place,
+/// then rename. This avoids (a) the TOCTOU window where the final path exists
+/// with umask-default perms (previous code chmodded AFTER `fs::write`) and (b)
+/// a crash mid-write corrupting the keyfile at the final path.
+fn load_or_create_keypair_generate(
+    path: &std::path::Path,
+) -> anyhow::Result<nyx_protocol::ServerKeypair> {
+    use nyx_protocol::ServerKeypair;
+    let kp = ServerKeypair::generate()
+        .map_err(|_| anyhow::anyhow!("CSPRNG failure during keypair generation"))?;
+    // Atomic create: write to a temp file in the SAME directory, set 0600
+    // on the temp BEFORE renaming it into place, then rename. This avoids
+    // (a) the TOCTOU window where the final path exists with umask-default
+    // perms (previous code chmodded AFTER `fs::write`) and (b) a crash
+    // mid-write corrupting the keyfile at the final path.
+    let tmp = path.with_extension("key.tmp");
+    {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(&kp.to_secret_bytes())?;
+            f.sync_all()?;
         }
-        Ok(ServerKeypair::from_secret_bytes(arr))
-    } else {
-        let kp = ServerKeypair::generate()
-            .map_err(|_| anyhow::anyhow!("CSPRNG failure during keypair generation"))?;
-        // Atomic create: write to a temp file in the SAME directory, set 0600
-        // on the temp BEFORE renaming it into place, then rename. This avoids
-        // (a) the TOCTOU window where the final path exists with umask-default
-        // perms (previous code chmodded AFTER `fs::write`) and (b) a crash
-        // mid-write corrupting the keyfile at the final path.
-        let tmp = path.with_extension("key.tmp");
+        #[cfg(not(unix))]
         {
-            #[cfg(unix)]
-            {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&tmp)?;
-                f.write_all(&kp.to_secret_bytes())?;
-                f.sync_all()?;
-            }
-            #[cfg(not(unix))]
-            {
-                std::fs::write(&tmp, kp.to_secret_bytes())?;
-            }
+            std::fs::write(&tmp, kp.to_secret_bytes())?;
         }
-        std::fs::rename(&tmp, path)?;
-        Ok(kp)
     }
+    std::fs::rename(&tmp, path)?;
+    Ok(kp)
 }
 
 /// Load + compile a Rhai operator script (`NYX_SCRIPT`) into a hook. Errors if
@@ -716,106 +759,137 @@ pub fn spawn_session_gc(state: Arc<AppState>) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            let now = Instant::now();
-            // Collect candidate keys under read-only iteration first (avoids
-            // holding a write-lock while doing duration arithmetic). This is
-            // only the SNAPSHOT: removal re-checks the predicate atomically
-            // via `remove_if` (below), so a session that checked in or queued
-            // a pending task between the snapshot and the removal is left
-            // alone.
-            let evicted: Vec<SessionId> = state
-                .sessions
-                .iter()
-                .filter_map(|entry| {
-                    let age = now.duration_since(entry.value().created).as_secs();
-                    let idle = now.duration_since(entry.value().last_seen).as_secs();
-                    // Age-eviction also requires the session to be idle: a
-                    // session that checked in recently is alive and must never
-                    // be evicted just because it is old. Idle-eviction exempts
-                    // sessions with queued pending tasks (delivery in flight).
-                    let too_old = age > max_age && idle > max_idle;
-                    let too_idle = idle > max_idle && entry.value().pending.is_empty();
-                    if too_old || too_idle {
-                        Some(*entry.key())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let mut evicted_count = 0usize;
-            for key in &evicted {
-                // `remove_if` re-evaluates the SAME predicate (age/idle +
-                // pending-empty) under the shard write lock, atomically with
-                // the removal — closing the snapshot-then-remove TOCTOU where
-                // a beacon check-in landing between the snapshot and `remove()`
-                // could refresh `last_seen` or queue a pending task and still
-                // get its live session evicted. A candidate that no longer
-                // matches the predicate is simply left in place.
-                let removed = state.sessions.remove_if(key, |_, s| {
-                    let age = now.duration_since(s.created).as_secs();
-                    let idle = now.duration_since(s.last_seen).as_secs();
-                    let too_old = age > max_age && idle > max_idle;
-                    let too_idle = idle > max_idle && s.pending.is_empty();
-                    too_old || too_idle
-                });
-                if let Some((_, s)) = removed {
-                    evicted_count += 1;
-                    let session_id = hex::encode(key);
-                    let age = now.duration_since(s.created).as_secs();
-                    let idle = now.duration_since(s.last_seen).as_secs();
-                    tracing::info!(
-                        session = %session_id,
-                        host = %s.info.hostname,
-                        user = %s.info.username,
-                        age_secs = age,
-                        idle_secs = idle,
-                        pending = s.pending.len(),
-                        "session evicted by GC"
-                    );
-                    // Mirror the Command::Exit path in `post_task`: fire
-                    // SessionExit so operator hooks (`on_session_exit`) run
-                    // when GC evicts a session too. Previously the event was
-                    // only produced on an explicit Exit task, leaving the hook
-                    // dead for evicted (idle/aged-out) sessions. Fired AFTER
-                    // `remove_if` drops the shard write lock — the same
-                    // liveness discipline `handle_beacon` uses — so a slow
-                    // operator script can't block this session's DashMap shard.
-                    state.events.fire(&nyx_scripting::Event::SessionExit(
-                        nyx_scripting::SessionExit {
-                            session_id: session_id.clone(),
-                        },
-                    ));
-                    // Drop the persisted row too so the store doesn't accumulate
-                    // dead sessions forever (the next boot would otherwise
-                    // restore a session the runtime just evicted). Fire-and-
-                    // forget: the background writer applies it asynchronously.
-                    if let Some(persist) = &state.sessions_db {
-                        persist.delete(session_id);
-                    }
-                }
-            }
-
-            if evicted_count > 0 {
-                tracing::info!(evicted = evicted_count, "session GC sweep complete");
-            }
-
-            // Fingerprint GC (H4): evict cached inbound TLS fingerprints older
-            // than FINGERPRINT_TTL. An unauthenticated attacker can otherwise
-            // open thousands of TLS connections (each inserts an entry that's
-            // only popped on a valid check-in) and grow this map without bound.
-            // `retain` takes the DashMap shard write lock per shard; this runs
-            // on the same 60s interval as the session sweep.
-            let before = state.fingerprints.len();
-            state
-                .fingerprints
-                .retain(|_, fp| fp.created.elapsed().as_secs() < FINGERPRINT_TTL);
-            let removed = before.saturating_sub(state.fingerprints.len());
-            if removed > 0 {
-                tracing::info!(evicted = removed, "fingerprint GC sweep complete");
-            }
+            spawn_session_gc_sweep(&state, max_age, max_idle);
         }
     });
+}
+
+/// One 60s sweep: evict stale sessions (age/idle policies) then expired inbound
+/// TLS fingerprints.
+fn spawn_session_gc_sweep(state: &Arc<AppState>, max_age: u64, max_idle: u64) {
+    let now = Instant::now();
+    // Collect candidate keys under read-only iteration first (avoids
+    // holding a write-lock while doing duration arithmetic). This is
+    // only the SNAPSHOT: removal re-checks the predicate atomically
+    // via `remove_if` (below), so a session that checked in or queued
+    // a pending task between the snapshot and the removal is left
+    // alone.
+    let evicted: Vec<SessionId> = state
+        .sessions
+        .iter()
+        .filter_map(|entry| {
+            let age = now.duration_since(entry.value().created).as_secs();
+            let idle = now.duration_since(entry.value().last_seen).as_secs();
+            // Age-eviction also requires the session to be idle: a
+            // session that checked in recently is alive and must never
+            // be evicted just because it is old. Idle-eviction exempts
+            // sessions with queued pending tasks (delivery in flight).
+            let too_old = age > max_age && idle > max_idle;
+            let too_idle = idle > max_idle && entry.value().pending.is_empty();
+            if too_old || too_idle {
+                Some(*entry.key())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let evicted_count = spawn_session_gc_evict(state, &evicted, now, max_age, max_idle);
+    if evicted_count > 0 {
+        tracing::info!(evicted = evicted_count, "session GC sweep complete");
+    }
+
+    spawn_session_gc_fingerprints(state);
+}
+
+/// Atomically remove the snapshot candidates whose predicate still holds. Each
+/// removal is logged at INFO level so operators can see when a beacon drops
+/// offline permanently. Returns the count removed.
+fn spawn_session_gc_evict(
+    state: &Arc<AppState>,
+    evicted: &[SessionId],
+    now: Instant,
+    max_age: u64,
+    max_idle: u64,
+) -> usize {
+    let mut evicted_count = 0usize;
+    for key in evicted {
+        // `remove_if` re-evaluates the SAME predicate (age/idle +
+        // pending-empty) under the shard write lock, atomically with
+        // the removal — closing the snapshot-then-remove TOCTOU where
+        // a beacon check-in landing between the snapshot and `remove()`
+        // could refresh `last_seen` or queue a pending task and still
+        // get its live session evicted. A candidate that no longer
+        // matches the predicate is simply left in place.
+        let removed = state.sessions.remove_if(key, |_, s| {
+            let age = now.duration_since(s.created).as_secs();
+            let idle = now.duration_since(s.last_seen).as_secs();
+            let too_old = age > max_age && idle > max_idle;
+            let too_idle = idle > max_idle && s.pending.is_empty();
+            too_old || too_idle
+        });
+        if let Some((_, s)) = removed {
+            evicted_count += 1;
+            spawn_session_gc_evict_one(state, key, s, now);
+        }
+    }
+    evicted_count
+}
+
+/// Log the eviction, fire `SessionExit` so operator hooks (`on_session_exit`)
+/// run for evicted sessions too, and drop the persisted row. Fired AFTER
+/// `remove_if` drops the shard write lock — the same liveness discipline
+/// `handle_beacon` uses — so a slow operator script can't block this session's
+/// DashMap shard.
+fn spawn_session_gc_evict_one(state: &Arc<AppState>, key: &SessionId, s: Session, now: Instant) {
+    let session_id = hex::encode(key);
+    let age = now.duration_since(s.created).as_secs();
+    let idle = now.duration_since(s.last_seen).as_secs();
+    tracing::info!(
+        session = %session_id,
+        host = %s.info.hostname,
+        user = %s.info.username,
+        age_secs = age,
+        idle_secs = idle,
+        pending = s.pending.len(),
+        "session evicted by GC"
+    );
+    // Mirror the Command::Exit path in `post_task`: fire
+    // SessionExit so operator hooks (`on_session_exit`) run
+    // when GC evicts a session too. Previously the event was
+    // only produced on an explicit Exit task, leaving the hook
+    // dead for evicted (idle/aged-out) sessions. Fired AFTER
+    // `remove_if` drops the shard write lock — the same
+    // liveness discipline `handle_beacon` uses — so a slow
+    // operator script can't block this session's DashMap shard.
+    state.events.fire(&nyx_scripting::Event::SessionExit(
+        nyx_scripting::SessionExit {
+            session_id: session_id.clone(),
+        },
+    ));
+    // Drop the persisted row too so the store doesn't accumulate
+    // dead sessions forever (the next boot would otherwise
+    // restore a session the runtime just evicted). Fire-and-
+    // forget: the background writer applies it asynchronously.
+    if let Some(persist) = &state.sessions_db {
+        persist.delete(session_id);
+    }
+}
+
+/// Evict cached inbound TLS fingerprints older than [`FINGERPRINT_TTL`] (H4).
+/// An unauthenticated attacker can otherwise open thousands of TLS connections
+/// (each inserts an entry that's only popped on a valid check-in) and grow the
+/// map without bound. `retain` takes the DashMap shard write lock per shard;
+/// this runs on the same 60s interval as the session sweep.
+fn spawn_session_gc_fingerprints(state: &Arc<AppState>) {
+    let before = state.fingerprints.len();
+    state
+        .fingerprints
+        .retain(|_, fp| fp.created.elapsed().as_secs() < FINGERPRINT_TTL);
+    let removed = before.saturating_sub(state.fingerprints.len());
+    if removed > 0 {
+        tracing::info!(evicted = removed, "fingerprint GC sweep complete");
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
