@@ -302,6 +302,51 @@ unsafe fn do_rsp_swap<T, F: FnOnce() -> T>(chain: &StagedChain, f: F) -> T
 where
     T: Default,
 {
+    // Stage the fake stack (process-lifetime leak) + pick the spoofed RSP
+    // (see the stage helpers for the geometry).
+    let (buf, cap) = do_rsp_swap_stage_fake_stack();
+    let fake_rsp = do_rsp_swap_stage_fill_sea(chain, buf, cap);
+
+    // Reset the "trampoline ran" flag for THIS invocation. run_f_on_spoof sets
+    // it true the instant it ptr::reads f (taking ownership of f's env). We use
+    // it below to decide whether to forget(f) (f consumed) vs drop(f) (f still
+    // live because the asm faulted before the bridge ran) and whether `out` is
+    // initialized. Cleared here so a stale true from a prior call can't mislead.
+    SWAP_DONE.store(false, Ordering::Release);
+    // Mark that the swap was attempted (diagnostic: a selftest can read this).
+    SWAP_ATTEMPTED.store(true, Ordering::Release);
+
+    // Reentrancy guard: if another swap is in flight (shouldn't happen under
+    // the single-beacon-thread invariant, but belt-and-suspenders), degrade.
+    if SWAP_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return f();
+    }
+
+    // ---- THE mov rsp EXECUTION (Task F) -------------------------------------
+    //
+    // f now runs ON THE SPOOFED STACK. The trick that lets a generic f cross
+    // the asm boundary: `asm! sym` can only call a CONCRETE fn, so we `call` a
+    // concrete trampoline (`spoof_trampoline`) that reads f (as an erased fn
+    // pointer) + the out-slot address from per-call statics, invokes f, and
+    // writes T into the caller's MaybeUninit<T>. The single-beacon-thread
+    // invariant makes the statics safe (no concurrent callers).
+    //
+    // CET safety (module docs layer 2): this path is only reached after
+    // `should_execute(cet_on, ...)` in with_spoofed_stack returned Execute — i.e.
+    // CET is OFF on this host. On a CET-on host the gap-chain `ret`s would #CP,
+    // but decide() already degrades before we get here. The blind `mov rsp /
+    // call / ret` is therefore safe on the guarded path.
+    let out = do_rsp_swap_stage_swap::<T, F>(&f, fake_rsp);
+    do_rsp_swap_stage_restore::<T, F>(f, out)
+}
+
+/// Stage 1: acquire (or create) the process-lifetime fake-stack buffer.
+/// Returns the 8 KiB `Vec<u64>` buffer pointer + its capacity (`cap`).
+#[cfg(target_arch = "x86_64")]
+unsafe fn do_rsp_swap_stage_fake_stack() -> (*mut u64, usize) {
     // Stage the fake stack (process-lifetime leak). Layout (stack grows DOWN,
     // low address → high): the fake stack needs room BELOW RSP for the nested
     // `call`s (trampoline → bridge → f → f's frame) + 32-byte shadow spaces,
@@ -326,6 +371,14 @@ where
         FAKE_STACK.store(ptr as usize, Ordering::Release);
         ptr
     };
+    (buf, cap)
+}
+
+/// Stage 2: fill the fake-stack buffer as a gap sea (leaf-gap addresses cycled
+/// across every slot) and pick the spoofed RSP — a 16-aligned slot in the
+/// middle of the sea. Returns the fake RSP address.
+#[cfg(target_arch = "x86_64")]
+unsafe fn do_rsp_swap_stage_fill_sea(chain: &StagedChain, buf: *mut u64, cap: usize) -> usize {
     // ---- Fake-stack geometry (BYOUD-Gap chain staging) ----------------------
     //
     // The gap chain is staged as a GAP SEA: every slot of the buffer is filled
@@ -360,57 +413,6 @@ where
         }
     }
 
-    // Reset the "trampoline ran" flag for THIS invocation. run_f_on_spoof sets
-    // it true the instant it ptr::reads f (taking ownership of f's env). We use
-    // it below to decide whether to forget(f) (f consumed) vs drop(f) (f still
-    // live because the asm faulted before the bridge ran) and whether `out` is
-    // initialized. Cleared here so a stale true from a prior call can't mislead.
-    SWAP_DONE.store(false, Ordering::Release);
-    // Mark that the swap was attempted (diagnostic: a selftest can read this).
-    SWAP_ATTEMPTED.store(true, Ordering::Release);
-
-    // Reentrancy guard: if another swap is in flight (shouldn't happen under
-    // the single-beacon-thread invariant, but belt-and-suspenders), degrade.
-    if SWAP_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return f();
-    }
-
-    // ---- THE mov rsp EXECUTION (Task F) -------------------------------------
-    //
-    // f now runs ON THE SPOOFED STACK. The trick that lets a generic f cross
-    // the asm boundary: `asm! sym` can only call a CONCRETE fn, so we `call` a
-    // concrete trampoline (`spoof_trampoline`) that reads f (as an erased fn
-    // pointer) + the out-slot address from per-call statics, invokes f, and
-    // writes T into the caller's MaybeUninit<T>. The single-beacon-thread
-    // invariant makes the statics safe (no concurrent callers).
-    //
-    // CET safety (module docs layer 2): this path is only reached after
-    // `should_execute(cet_on, ...)` in with_spoofed_stack returned Execute — i.e.
-    // CET is OFF on this host. On a CET-on host the gap-chain `ret`s would #CP,
-    // but decide() already degrades before we get here. The blind `mov rsp /
-    // call / ret` is therefore safe on the guarded path.
-
-    use core::mem::MaybeUninit;
-    let mut out: MaybeUninit<T> = MaybeUninit::uninit();
-    let out_addr = out.as_mut_ptr() as usize;
-
-    // Store the erased f + out-slot for the trampoline. f's exact closure type
-    // is anonymous (impl FnOnce), but within THIS monomorphization of
-    // do_rsp_swap<T> it is fixed — so we pass it to a <T, F> bridge whose F is
-    // inferred here. The bridge reads f by raw pointer + writes T to out.
-    SWAP_FN.store(
-        run_f_on_spoof::<T, F> as *const () as usize,
-        Ordering::Release,
-    );
-    SWAP_F.store(
-        core::ptr::addr_of!(f) as *const () as usize,
-        Ordering::Release,
-    );
-    SWAP_OUT.store(out_addr, Ordering::Release);
-
     // fake_rsp: a slot in the MIDDLE of the gap sea — below it (toward the
     // buffer base) the CALL pushes and the trampoline/bridge/f frames build,
     // above it the gap run the unwinder walks after the real frames. Chosen at
@@ -421,11 +423,35 @@ where
     if (buf as usize + rsp_idx * core::mem::size_of::<u64>()) % 16 != 0 {
         rsp_idx += 1; // adjacent slot is the 16-aligned one
     }
-    let fake_rsp = unsafe { buf.add(rsp_idx) } as usize;
-    #[allow(unused_assignments, unused_variables)]
+    unsafe { buf.add(rsp_idx) as usize }
+}
+
+/// Stage 3: store the erased f / out-slot pointers for the trampoline and run
+/// the `mov rsp` swap — f executes ON the spoofed stack. Returns the out-slot.
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_assignments, unused_variables)]
+unsafe fn do_rsp_swap_stage_swap<T, F: FnOnce() -> T>(
+    f: &F,
+    fake_rsp: usize,
+) -> core::mem::MaybeUninit<T> {
+    use core::mem::MaybeUninit;
+    let mut out: MaybeUninit<T> = MaybeUninit::uninit();
+    let out_addr = out.as_mut_ptr() as usize;
+    // Store the erased f + out-slot for the trampoline. f's exact closure type
+    // is anonymous (impl FnOnce), but within THIS monomorphization of
+    // do_rsp_swap<T> it is fixed — so we pass it to a <T, F> bridge whose F is
+    // inferred here. The bridge reads f by raw pointer + writes T to out.
+    SWAP_FN.store(
+        run_f_on_spoof::<T, F> as *const () as usize,
+        Ordering::Release,
+    );
+    SWAP_F.store(
+        f as *const F as *const () as usize,
+        Ordering::Release,
+    );
+    SWAP_OUT.store(out_addr, Ordering::Release);
     let mut save_rsp: usize;
     let fake_in = fake_rsp;
-
     // The swap: save real RSP → load spoofed RSP → call trampoline (f runs on
     // the spoofed stack) → restore real RSP. The trampoline's `ret` returns to
     // the instruction after `call` HERE (real RSP is restored right after).
@@ -452,7 +478,19 @@ where
             out("r11") _,
         );
     }
+    out
+}
 
+/// Stage 4: teardown — clear the per-call statics, then decide `f`'s ownership
+/// and `out`'s init state from whether the trampoline actually ran.
+#[cfg(target_arch = "x86_64")]
+unsafe fn do_rsp_swap_stage_restore<T, F: FnOnce() -> T>(
+    f: F,
+    out: core::mem::MaybeUninit<T>,
+) -> T
+where
+    T: Default,
+{
     // Clear the per-call statics (release the reentrancy guard last so a
     // concurrent caller can't observe a half-torn-down slot set).
     SWAP_FN.store(0, Ordering::Release);
