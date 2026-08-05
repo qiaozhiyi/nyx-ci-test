@@ -564,7 +564,19 @@ unsafe fn remote_module_base(h: *mut core::ffi::c_void, name: &[u8]) -> Option<u
     let mut ptr = [0u8; 8];
     unsafe { remote_read(h, rpm, ldr + 0x10, &mut ptr) }?;
     let sentinel = ldr + 0x10;
-    let mut link = u64::from_le_bytes(ptr) as usize;
+    let link = u64::from_le_bytes(ptr) as usize;
+    unsafe { remote_module_base_walk(h, rpm, name, link, sentinel) }
+}
+
+/// Walk the target's InLoadOrderModuleList (up to 512 entries) and return the
+/// base of the module whose BaseDllName case-insensitively matches `name`.
+unsafe fn remote_module_base_walk(
+    h: *mut core::ffi::c_void,
+    rpm: ReadProcessMemory,
+    name: &[u8],
+    mut link: usize,
+    sentinel: usize,
+) -> Option<usize> {
     // LDR_DATA_TABLE_ENTRY (x64): InLoadOrderLinks +0x00, DllBase +0x30,
     // BaseDllName (UNICODE_STRING) +0x58 → Length u16 @+0x58, Buffer @+0x60.
     for _ in 0..512 {
