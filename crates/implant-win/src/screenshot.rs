@@ -361,49 +361,77 @@ struct WinstaGuard {
 // preserved deliberately.
 #[allow(clippy::question_mark)]
 unsafe fn attach_interactive() -> Option<WinstaGuard> {
+    // Resolve all 7 user32 exports up front as raw addresses; each stage
+    // helper below transmutes the ones it calls.
+    let ows = match unsafe { crate::resolve::export_addr(b"user32.dll", b"OpenWindowStationW") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let gpws = match unsafe { crate::resolve::export_addr(b"user32.dll", b"GetProcessWindowStation") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let spws = match unsafe { crate::resolve::export_addr(b"user32.dll", b"SetProcessWindowStation") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let odk = match unsafe { crate::resolve::export_addr(b"user32.dll", b"OpenDesktopW") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let std = match unsafe { crate::resolve::export_addr(b"user32.dll", b"SetThreadDesktop") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let cd = match unsafe { crate::resolve::export_addr(b"user32.dll", b"CloseDesktop") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let cws = match unsafe { crate::resolve::export_addr(b"user32.dll", b"CloseWindowStation") } {
+        Some(a) => a,
+        None => return None,
+    };
+
+    // Stage 1: save the original station, open WinSta0 and switch to it.
+    let (original_winsta, hwinsta) = attach_interactive_open_station(ows, gpws, spws, cws)?;
+
+    // Open the default desktop and attach the thread.  The desktop handle is
+    // closed immediately after SetThreadDesktop — the thread's assignment
+    // keeps the desktop object alive (per MSDN).
+    attach_interactive_open_desktop(odk, std, cd);
+    // DO NOT restore the original window station here — the caller needs
+    // WinSta0 active for the GDI capture. detach_interactive() does the
+    // restore + close using the guard we hand back. Returning the guard even
+    // when SetThreadDesktop failed: the process IS switched to WinSta0, so the
+    // caller must still detach to restore + close.
+    Some(WinstaGuard {
+        original: original_winsta,
+        opened: hwinsta,
+    })
+}
+
+/// Stage 1 of [`attach_interactive`]: save the process's current window
+/// station and switch it to WinSta0. Returns the (original, opened) handle
+/// pair for the caller's guard, or `None` — with the opened handle already
+/// closed — when the open or the switch failed.
+///
+/// # Safety
+/// Transmutes the resolved user32 export addresses and calls them on raw
+/// handles; the caller must pass the returned pair to [`detach_interactive`].
+unsafe fn attach_interactive_open_station(
+    ows: usize,
+    gpws: usize,
+    spws: usize,
+    cws: usize,
+) -> Option<(*mut c_void, *mut c_void)> {
     type OpenWindowStationW = unsafe extern "system" fn(*const u16, i32, u32) -> *mut c_void;
     type GetProcessWindowStation = unsafe extern "system" fn() -> *mut c_void;
     type SetProcessWindowStation = unsafe extern "system" fn(*mut c_void) -> i32;
-    type OpenDesktopW = unsafe extern "system" fn(*const u16, u32, i32, u32) -> *mut c_void;
-    type SetThreadDesktop = unsafe extern "system" fn(*mut c_void) -> i32;
-    type CloseDesktop = unsafe extern "system" fn(*mut c_void) -> i32;
     type CloseWindowStation = unsafe extern "system" fn(*mut c_void) -> i32;
-
-    let ows: OpenWindowStationW =
-        match unsafe { crate::resolve::export_addr(b"user32.dll", b"OpenWindowStationW") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return None,
-        };
-    let gpws: GetProcessWindowStation =
-        match unsafe { crate::resolve::export_addr(b"user32.dll", b"GetProcessWindowStation") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return None,
-        };
-    let spws: SetProcessWindowStation =
-        match unsafe { crate::resolve::export_addr(b"user32.dll", b"SetProcessWindowStation") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return None,
-        };
-    let odk: OpenDesktopW =
-        match unsafe { crate::resolve::export_addr(b"user32.dll", b"OpenDesktopW") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return None,
-        };
-    let std: SetThreadDesktop =
-        match unsafe { crate::resolve::export_addr(b"user32.dll", b"SetThreadDesktop") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return None,
-        };
-    let cd: CloseDesktop =
-        match unsafe { crate::resolve::export_addr(b"user32.dll", b"CloseDesktop") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return None,
-        };
-    let cws: CloseWindowStation =
-        match unsafe { crate::resolve::export_addr(b"user32.dll", b"CloseWindowStation") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return None,
-        };
+    let ows: OpenWindowStationW = unsafe { core::mem::transmute(ows) };
+    let gpws: GetProcessWindowStation = unsafe { core::mem::transmute(gpws) };
+    let spws: SetProcessWindowStation = unsafe { core::mem::transmute(spws) };
+    let cws: CloseWindowStation = unsafe { core::mem::transmute(cws) };
 
     // Save the process's current window station so detach_interactive() can
     // restore it AFTER the capture. Per MSDN, the handle returned by
@@ -427,10 +455,25 @@ unsafe fn attach_interactive() -> Option<WinstaGuard> {
         let _ = unsafe { cws(hwinsta) };
         return None;
     }
+    Some((original_winsta, hwinsta))
+}
 
-    // Open the default desktop and attach the thread.  The desktop handle is
-    // closed immediately after SetThreadDesktop — the thread's assignment
-    // keeps the desktop object alive (per MSDN).
+/// Stage 2 of [`attach_interactive`]: open the `default` desktop and attach
+/// the thread. The desktop handle is closed immediately after
+/// SetThreadDesktop — the thread's assignment keeps the desktop object alive
+/// (per MSDN). Best-effort: a SetThreadDesktop failure is ignored (the
+/// process IS already switched to WinSta0, so the caller must still detach).
+///
+/// # Safety
+/// Transmutes the resolved user32 export addresses and calls them on raw
+/// handles.
+unsafe fn attach_interactive_open_desktop(odk: usize, std: usize, cd: usize) {
+    type OpenDesktopW = unsafe extern "system" fn(*const u16, u32, i32, u32) -> *mut c_void;
+    type SetThreadDesktop = unsafe extern "system" fn(*mut c_void) -> i32;
+    type CloseDesktop = unsafe extern "system" fn(*mut c_void) -> i32;
+    let odk: OpenDesktopW = unsafe { core::mem::transmute(odk) };
+    let std: SetThreadDesktop = unsafe { core::mem::transmute(std) };
+    let cd: CloseDesktop = unsafe { core::mem::transmute(cd) };
     let mut desk_name = crate::heap::Vec::<u16>::with_capacity(8);
     for &b in b"default\0" {
         desk_name.push(b as u16);
@@ -443,15 +486,6 @@ unsafe fn attach_interactive() -> Option<WinstaGuard> {
     } else {
         false
     };
-    // DO NOT restore the original window station here — the caller needs
-    // WinSta0 active for the GDI capture. detach_interactive() does the
-    // restore + close using the guard we hand back. Returning the guard even
-    // when SetThreadDesktop failed: the process IS switched to WinSta0, so the
-    // caller must still detach to restore + close.
-    Some(WinstaGuard {
-        original: original_winsta,
-        opened: hwinsta,
-    })
 }
 
 /// Restore the original window station and close the WinSta0 handle opened
@@ -822,7 +856,39 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
 /// `capture_to_file` (BMP) and `capture_diag` (test log). Returns false on any
 /// resolution / open / write failure.
 unsafe fn write_all_to_file(path: &[u8], data: &[u8]) -> bool {
-    let cf: unsafe extern "system" fn(
+    // Resolve CreateFileW/WriteFile as raw addresses; CloseHandle is used
+    // directly here so it is transmuted inline.
+    let cf = match unsafe { export_addr(b"kernel32.dll", b"CreateFileW") } {
+        Some(a) => a,
+        None => return false,
+    };
+    let wf = match unsafe { export_addr(b"kernel32.dll", b"WriteFile") } {
+        Some(a) => a,
+        None => return false,
+    };
+    let ch: unsafe extern "system" fn(*mut c_void) -> i32 =
+        match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return false,
+        };
+    let h = match write_all_to_file_open(cf, path) {
+        Some(h) => h,
+        None => return false,
+    };
+    let ok = write_all_to_file_write(h, wf, data);
+    let _ = unsafe { ch(h) };
+    ok
+}
+
+/// Open `path` (ASCII, NUL-terminated) with GENERIC_WRITE + CREATE_ALWAYS.
+/// Returns the open handle, or `None` if CreateFileW failed. Part of
+/// [`write_all_to_file`]'s open stage.
+///
+/// # Safety
+/// Transmutes the resolved CreateFileW address and calls it on the widened
+/// path buffer.
+unsafe fn write_all_to_file_open(cf: usize, path: &[u8]) -> Option<*mut c_void> {
+    type CreateFileW = unsafe extern "system" fn(
         *const u16,
         u32,
         u32,
@@ -830,20 +896,8 @@ unsafe fn write_all_to_file(path: &[u8], data: &[u8]) -> bool {
         u32,
         u32,
         *mut c_void,
-    ) -> *mut c_void = match unsafe { export_addr(b"kernel32.dll", b"CreateFileW") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return false,
-    };
-    let wf: unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *const c_void) -> i32 =
-        match unsafe { export_addr(b"kernel32.dll", b"WriteFile") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
-        };
-    let ch: unsafe extern "system" fn(*mut c_void) -> i32 =
-        match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
-        };
+    ) -> *mut c_void;
+    let cf: CreateFileW = unsafe { core::mem::transmute(cf) };
     let mut wide = crate::heap::Vec::<u16>::with_capacity(path.len());
     for &by in path {
         if by == 0 {
@@ -864,8 +918,27 @@ unsafe fn write_all_to_file(path: &[u8], data: &[u8]) -> bool {
         )
     };
     if h.is_null() || h as usize == !0 {
-        return false;
+        return None;
     }
+    Some(h)
+}
+
+/// Write `data` to open handle `h`, advancing by the ACTUAL bytes written
+/// each iteration (`wr`) so a partial WriteFile can't silently drop middle
+/// bytes. Returns false on any write failure. Part of [`write_all_to_file`]'s
+/// write stage.
+///
+/// # Safety
+/// Transmutes the resolved WriteFile address and calls it on `h`/`data`.
+unsafe fn write_all_to_file_write(h: *mut c_void, wf: usize, data: &[u8]) -> bool {
+    type WriteFile = unsafe extern "system" fn(
+        *mut c_void,
+        *const u8,
+        u32,
+        *mut u32,
+        *const c_void,
+    ) -> i32;
+    let wf: WriteFile = unsafe { core::mem::transmute(wf) };
     let mut off = 0usize;
     let mut ok = true;
     while off < data.len() {
@@ -879,7 +952,6 @@ unsafe fn write_all_to_file(path: &[u8], data: &[u8]) -> bool {
         }
         off += wr as usize;
     }
-    let _ = unsafe { ch(h) };
     ok
 }
 
@@ -894,26 +966,6 @@ unsafe fn write_all_to_file(path: &[u8], data: &[u8]) -> bool {
 #[cfg(feature = "selftest")]
 pub unsafe fn dpi_probe_diag() {
     let mut s: Vec<u8> = Vec::new();
-    fn num(s: &mut Vec<u8>, v: i64) {
-        if v < 0 {
-            s.push(b'-');
-        }
-        let mut u = v.unsigned_abs();
-        let mut tmp = [0u8; 20];
-        let mut n = 0usize;
-        if u == 0 {
-            tmp[0] = b'0';
-            n = 1;
-        }
-        while u != 0 {
-            tmp[n] = b'0' + (u % 10) as u8;
-            n += 1;
-            u /= 10;
-        }
-        for k in (0..n).rev() {
-            s.push(tmp[k]);
-        }
-    }
     type Gsm = unsafe extern "system" fn(i32) -> i32;
     type Stdac = unsafe extern "system" fn(isize) -> isize;
     let Some(gsm_a) = (unsafe { export_addr(b"user32.dll", b"GetSystemMetrics") }) else {
@@ -921,9 +973,9 @@ pub unsafe fn dpi_probe_diag() {
     };
     let gsm: Gsm = unsafe { core::mem::transmute(gsm_a) };
     s.extend_from_slice(b"vs_before=");
-    num(&mut s, unsafe { gsm(78) } as i64);
+    dpi_probe_diag_num(&mut s, unsafe { gsm(78) } as i64);
     s.push(b'x');
-    num(&mut s, unsafe { gsm(79) } as i64);
+    dpi_probe_diag_num(&mut s, unsafe { gsm(79) } as i64);
     s.push(b'\n');
     match unsafe { export_addr(b"user32.dll", b"SetThreadDpiAwarenessContext") } {
         None => s.extend_from_slice(b"stdac=UNRESOLVED\n"),
@@ -931,23 +983,48 @@ pub unsafe fn dpi_probe_diag() {
             let f: Stdac = unsafe { core::mem::transmute(a) };
             let old = unsafe { f(-4) };
             s.extend_from_slice(b"stdac_old=");
-            num(&mut s, old as i64);
+            dpi_probe_diag_num(&mut s, old as i64);
             s.push(b'\n');
         }
     }
     s.extend_from_slice(b"vs_after=");
-    num(&mut s, unsafe { gsm(78) } as i64);
+    dpi_probe_diag_num(&mut s, unsafe { gsm(78) } as i64);
     s.push(b'x');
-    num(&mut s, unsafe { gsm(79) } as i64);
+    dpi_probe_diag_num(&mut s, unsafe { gsm(79) } as i64);
     s.push(b'\n');
     if let Some(a) = unsafe { export_addr(b"user32.dll", b"GetDpiForSystem") } {
         type Gdfs = unsafe extern "system" fn() -> u32;
         let g: Gdfs = unsafe { core::mem::transmute(a) };
         s.extend_from_slice(b"getdpi=");
-        num(&mut s, unsafe { g() } as i64);
+        dpi_probe_diag_num(&mut s, unsafe { g() } as i64);
         s.push(b'\n');
     }
     let _ = unsafe { write_all_to_file(b"C:\\Windows\\Temp\\nyx_dpi_diag.txt\0", &s) };
+}
+
+/// Decimal-encode `v` (with a leading `-` when negative) and append the ASCII
+/// digits to `s`. Extracted from [`dpi_probe_diag`]'s diagnostic log
+/// formatting.
+#[cfg(feature = "selftest")]
+fn dpi_probe_diag_num(s: &mut Vec<u8>, v: i64) {
+    if v < 0 {
+        s.push(b'-');
+    }
+    let mut u = v.unsigned_abs();
+    let mut tmp = [0u8; 20];
+    let mut n = 0usize;
+    if u == 0 {
+        tmp[0] = b'0';
+        n = 1;
+    }
+    while u != 0 {
+        tmp[n] = b'0' + (u % 10) as u8;
+        n += 1;
+        u /= 10;
+    }
+    for k in (0..n).rev() {
+        s.push(tmp[k]);
+    }
 }
 
 /// Capture → write BMP to `path` (ASCII, NUL-terminated). Helper export path.
@@ -1390,7 +1467,35 @@ fn push_dec_u16(v: &mut crate::heap::Vec<u16>, n: u16) {
 }
 
 unsafe fn read_file(path: &[u8]) -> Option<Vec<u8>> {
-    let cf: unsafe extern "system" fn(
+    let cf = match unsafe { export_addr(b"kernel32.dll", b"CreateFileW") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let rf = match unsafe { export_addr(b"kernel32.dll", b"ReadFile") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let ch = match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let h = match read_file_open(cf, path) {
+        Some(h) => h,
+        None => return None,
+    };
+    let out = read_file_read(rf, ch, h)?;
+    read_file_validate(out)
+}
+
+/// Open `path` (ASCII, NUL-terminated) with GENERIC_READ + OPEN_EXISTING.
+/// Returns the open handle, or `None` if CreateFileW failed. Part of
+/// [`read_file`]'s open stage.
+///
+/// # Safety
+/// Transmutes the resolved CreateFileW address and calls it on the widened
+/// path buffer.
+unsafe fn read_file_open(cf: usize, path: &[u8]) -> Option<*mut c_void> {
+    type CreateFileW = unsafe extern "system" fn(
         *const u16,
         u32,
         u32,
@@ -1398,12 +1503,8 @@ unsafe fn read_file(path: &[u8]) -> Option<Vec<u8>> {
         u32,
         u32,
         *mut c_void,
-    ) -> *mut c_void =
-        unsafe { core::mem::transmute(export_addr(b"kernel32.dll", b"CreateFileW")?) };
-    let rf: unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *const c_void) -> i32 =
-        unsafe { core::mem::transmute(export_addr(b"kernel32.dll", b"ReadFile")?) };
-    let ch: unsafe extern "system" fn(*mut c_void) -> i32 =
-        unsafe { core::mem::transmute(export_addr(b"kernel32.dll", b"CloseHandle")?) };
+    ) -> *mut c_void;
+    let cf: CreateFileW = unsafe { core::mem::transmute(cf) };
     let mut wide = crate::heap::Vec::<u16>::with_capacity(path.len());
     for &by in path {
         if by == 0 {
@@ -1426,6 +1527,26 @@ unsafe fn read_file(path: &[u8]) -> Option<Vec<u8>> {
     if h.is_null() || h as usize == !0 {
         return None;
     }
+    Some(h)
+}
+
+/// Drain open handle `h` into a Vec, closing `h` on EVERY path (ReadFile
+/// failure or true EOF). Part of [`read_file`]'s read stage.
+///
+/// # Safety
+/// Transmutes the resolved ReadFile/CloseHandle addresses and calls them on
+/// the open handle.
+unsafe fn read_file_read(rf: usize, ch: usize, h: *mut c_void) -> Option<Vec<u8>> {
+    type ReadFile = unsafe extern "system" fn(
+        *mut c_void,
+        *mut u8,
+        u32,
+        *mut u32,
+        *const c_void,
+    ) -> i32;
+    type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+    let rf: ReadFile = unsafe { core::mem::transmute(rf) };
+    let ch: CloseHandle = unsafe { core::mem::transmute(ch) };
     let mut out: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
     // Read loop: only treat `got == 0` (true EOF — ReadFile returns nonzero with
@@ -1455,11 +1576,15 @@ unsafe fn read_file(path: &[u8]) -> Option<Vec<u8>> {
         out.extend_from_slice(&buf[..got as usize]);
     }
     let _ = unsafe { ch(h) };
-    // Validate the result is a complete, well-formed BMP before trusting it.
-    // Min BMP = 14-byte file header + 40-byte info header. Check the "BM" magic
-    // and that the file-size field in the header matches what we actually read —
-    // a mismatch means a truncated capture (missing scan lines), which must NOT
-    // be streamed to the operator as a valid screenshot.
+    Some(out)
+}
+
+/// Validate `out` is a complete, well-formed BMP before trusting it.
+/// Min BMP = 14-byte file header + 40-byte info header. Check the "BM" magic
+/// and that the file-size field in the header matches what we actually read —
+/// a mismatch means a truncated capture (missing scan lines), which must NOT
+/// be streamed to the operator as a valid screenshot.
+fn read_file_validate(out: Vec<u8>) -> Option<Vec<u8>> {
     if out.len() < 58 || &out[0..2] != b"BM" {
         return None;
     }
