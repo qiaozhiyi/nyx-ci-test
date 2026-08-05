@@ -43,6 +43,43 @@ pub unsafe fn check_preservation(
     let opt_sz = unsafe { *(nt.add(20) as *const u16) } as usize;
     let sec_base = unsafe { nt.add(24 + opt_sz) };
 
+    let (pdata_rva, pdata_size, rdata_rva, rdata_size) =
+        check_preservation_scan_sections(sec_base, num_sec);
+
+    let text_end = text_rva + text_size;
+
+    // Check if .pdata overlaps with .text range.
+    let pdata_in_text =
+        pdata_rva > 0 && pdata_rva < text_end && (pdata_rva + pdata_size) > text_rva;
+
+    let rdata_in_text =
+        rdata_rva > 0 && rdata_rva < text_end && (rdata_rva + rdata_size) > text_rva;
+
+    let automatic = !pdata_in_text && !rdata_in_text;
+
+    let backup = check_preservation_backup(
+        module_base,
+        automatic,
+        pdata_rva,
+        pdata_size,
+        text_rva,
+        text_end,
+    );
+
+    Some(UnwindPreservation {
+        automatic,
+        pdata_rva,
+        pdata_size,
+        backup,
+    })
+}
+
+/// Scan the PE section table for `.pdata` and `.rdata`, returning
+/// `(pdata_rva, pdata_size, rdata_rva, rdata_size)` (0 = section absent).
+unsafe fn check_preservation_scan_sections(
+    sec_base: *const u8,
+    num_sec: usize,
+) -> (usize, usize, usize, usize) {
     let mut pdata_rva: usize = 0;
     let mut pdata_size: usize = 0;
     let mut rdata_rva: usize = 0;
@@ -65,19 +102,20 @@ pub unsafe fn check_preservation(
             rdata_size = sz;
         }
     }
+    (pdata_rva, pdata_size, rdata_rva, rdata_size)
+}
 
-    let text_end = text_rva + text_size;
-
-    // Check if .pdata overlaps with .text range.
-    let pdata_in_text =
-        pdata_rva > 0 && pdata_rva < text_end && (pdata_rva + pdata_size) > text_rva;
-
-    let rdata_in_text =
-        rdata_rva > 0 && rdata_rva < text_end && (rdata_rva + rdata_size) > text_rva;
-
-    let automatic = !pdata_in_text && !rdata_in_text;
-
-    let backup = if !automatic {
+/// When `.pdata`/`.rdata` overlap `.text` (linker merge), copy the overlapping
+/// region into a backup buffer before Fluctuation flips `.text` to NOACCESS.
+unsafe fn check_preservation_backup(
+    module_base: *const u8,
+    automatic: bool,
+    pdata_rva: usize,
+    pdata_size: usize,
+    text_rva: usize,
+    text_end: usize,
+) -> Option<Vec<u8>> {
+    if !automatic {
         // Need to preserve: copy the overlapping region before it goes NOACCESS.
         let overlap_start = pdata_rva.max(text_rva);
         let overlap_end = (pdata_rva + pdata_size).min(text_end);
@@ -95,14 +133,7 @@ pub unsafe fn check_preservation(
         }
     } else {
         None
-    };
-
-    Some(UnwindPreservation {
-        automatic,
-        pdata_rva,
-        pdata_size,
-        backup,
-    })
+    }
 }
 
 /// Diagnostic: log unwind preservation status at bootstrap.
