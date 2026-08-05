@@ -29,8 +29,8 @@
 
 #![cfg(target_os = "windows")]
 
-use crate::heap::Vec;
 use super::ChannelCtx;
+use crate::heap::Vec;
 
 /// Build-time toggle for safe_http. When `NYX_SAFE_HTTP=1` is set at build
 /// time, the HTTPS channel wraps every POST in `mem::mask()` → WinHTTP →

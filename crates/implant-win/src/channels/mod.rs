@@ -23,12 +23,12 @@
 use crate::heap::{String, Vec};
 
 // Submodules — each channel implementation.
-pub mod https;
-pub mod doh;
 pub mod dns;
+pub mod doh;
+pub mod extc2;
+pub mod https;
 pub mod smb;
 pub mod tcp;
-pub mod extc2;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Channel enum + runtime state

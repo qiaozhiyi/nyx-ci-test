@@ -87,7 +87,6 @@ pub unsafe fn wide_slice_to_utf8(w: &[u16]) -> String {
 
 // ---- T0: Process Enumeration ------------------------------------------------
 
-
 pub unsafe fn create_toolhelp_snapshot() -> *mut c_void {
     let addr = resolve_kernel32!(b"CreateToolhelp32Snapshot", CT32S);
     if addr == 0 {
@@ -131,8 +130,6 @@ pub unsafe fn close_handle(h: *mut c_void) {
 
 // ---- T3: Service Manager Enumeration ----------------------------------------
 
-
-
 pub unsafe fn open_sc_manager() -> *mut c_void {
     let addr = resolve_advapi32!(b"OpenSCManagerW", OSM);
     if addr == 0 {
@@ -171,10 +168,30 @@ pub unsafe fn enum_services_status_ex(
         return 0;
     }
     type Fn = unsafe extern "system" fn(
-        *mut c_void, u32, u32, u32, *mut u8, u32, *mut u32, *mut u32, *mut u32, *const u16,
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        *mut u8,
+        u32,
+        *mut u32,
+        *mut u32,
+        *mut u32,
+        *const u16,
     ) -> i32;
     let f: Fn = core::mem::transmute(addr);
-    f(scm, level, svc_type, state, buf, buf_sz, needed, returned, resume, core::ptr::null())
+    f(
+        scm,
+        level,
+        svc_type,
+        state,
+        buf,
+        buf_sz,
+        needed,
+        returned,
+        resume,
+        core::ptr::null(),
+    )
 }
 
 // ---- Mitigation Queries -----------------------------------------------------
@@ -307,7 +324,9 @@ pub unsafe fn reg_enum_key_ex_a(
         *mut u64,
     ) -> i32;
     let f: Fn = core::mem::transmute(addr);
-    f(hkey, index, name, name_len, reserved, class, class_len, last_write)
+    f(
+        hkey, index, name, name_len, reserved, class, class_len, last_write,
+    )
 }
 
 /// advapi32!RegQueryValueExA(hKey, lpValueName, lpReserved, lpType, lpData,
@@ -324,14 +343,8 @@ pub unsafe fn reg_query_value_ex_a(
     if addr == 0 {
         return -1;
     }
-    type Fn = unsafe extern "system" fn(
-        usize,
-        *const u8,
-        *mut u32,
-        *mut u32,
-        *mut u8,
-        *mut u32,
-    ) -> i32;
+    type Fn =
+        unsafe extern "system" fn(usize, *const u8, *mut u32, *mut u32, *mut u8, *mut u32) -> i32;
     let f: Fn = core::mem::transmute(addr);
     f(hkey, name, reserved, typ, data, len)
 }
@@ -458,7 +471,10 @@ impl Guid {
     /// Build from a packed 16-byte serialised GUID (as in the const arrays).
     pub const fn from_bytes(b: [u8; 16]) -> Self {
         Self {
-            data1: (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24),
+            data1: (b[0] as u32)
+                | ((b[1] as u32) << 8)
+                | ((b[2] as u32) << 16)
+                | ((b[3] as u32) << 24),
             data2: (b[4] as u16) | ((b[5] as u16) << 8),
             data3: (b[6] as u16) | ((b[7] as u16) << 8),
             data4: [b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]],
@@ -484,7 +500,13 @@ impl Variant {
     /// Zero-initialised variant — required by IWbemClassObject::Get (caller
     /// must pass a valid VARIANT*; the impl fills vt+union).
     pub const fn zero() -> Self {
-        Self { vt: 0, _reserved1: 0, _reserved2: 0, _reserved3: 0, union: 0 }
+        Self {
+            vt: 0,
+            _reserved1: 0,
+            _reserved2: 0,
+            _reserved3: 0,
+            union: 0,
+        }
     }
     /// Extract the BSTR pointer if the variant holds a VT_BSTR, else null.
     pub fn bstr_ptr(&self) -> *const u16 {
@@ -520,10 +542,7 @@ pub fn co_init_succeeded(hr: i32) -> bool {
 
 /// ole32!CoCreateInstance(CLSID, null, CLSCTX, IID, out**). Returns the
 /// interface pointer or null. Used to activate IWbemLocator.
-pub unsafe fn co_create_instance(
-    clsid: &Guid,
-    iid: &Guid,
-) -> *mut c_void {
+pub unsafe fn co_create_instance(clsid: &Guid, iid: &Guid) -> *mut c_void {
     if !force_load(b"ole32.dll") {
         return core::ptr::null_mut();
     }
@@ -532,10 +551,10 @@ pub unsafe fn co_create_instance(
         None => return core::ptr::null_mut(),
     };
     type Fn = unsafe extern "system" fn(
-        *const Guid, // rclsid
-        *mut c_void, // pUnkOuter
-        u32,         // dwClsContext
-        *const Guid, // riid
+        *const Guid,      // rclsid
+        *mut c_void,      // pUnkOuter
+        u32,              // dwClsContext
+        *const Guid,      // riid
         *mut *mut c_void, // ppv
     ) -> i32;
     let f: Fn = core::mem::transmute(addr);
@@ -556,11 +575,7 @@ pub unsafe fn co_create_instance(
 /// ole32!CoSetProxyBlanket — required for DCOM hardening (KB5004442). Without
 /// it, IWbemServices::ExecQuery fails with E_ACCESSDENIED on patched hosts.
 /// We set PKT_PRIVACY on the services proxy before any query.
-pub unsafe fn co_set_proxy_blanket(
-    proxy: *mut c_void,
-    authn_level: u32,
-    imp_level: u32,
-) -> bool {
+pub unsafe fn co_set_proxy_blanket(proxy: *mut c_void, authn_level: u32, imp_level: u32) -> bool {
     let addr = match export_addr(b"ole32.dll", b"CoSetProxyBlanket") {
         Some(a) => a,
         None => return false,
@@ -578,7 +593,16 @@ pub unsafe fn co_set_proxy_blanket(
     ) -> i32;
     let f: Fn = core::mem::transmute(addr);
     // RPC_C_AUTHN_WINNT = 10, RPC_C_AUTHZ_NONE = 0.
-    f(proxy, 10, 0, core::ptr::null_mut(), authn_level, imp_level, core::ptr::null_mut(), EOAC_NONE) >= 0
+    f(
+        proxy,
+        10,
+        0,
+        core::ptr::null_mut(),
+        authn_level,
+        imp_level,
+        core::ptr::null_mut(),
+        EOAC_NONE,
+    ) >= 0
 }
 
 /// oleaut32!SysAllocString(wchar_t*) → BSTR. Used to wrap a stack UTF-16
@@ -661,37 +685,47 @@ pub unsafe fn wbem_locator_connect_server(
 ) -> i32 {
     let f = vtable_slot(locator, 3);
     type Fn = unsafe extern "system" fn(
-        *mut c_void, // this
-        *mut u16,    // strNetworkResource (BSTR)
-        *mut u16,    // strUser
-        *mut u16,    // strPassword
-        *mut u16,    // strLocale
-        i32,         // lSecurityFlags
-        *mut u16,    // strAuthority
-        *mut c_void, // pCtx (IWbemContext*)
+        *mut c_void,      // this
+        *mut u16,         // strNetworkResource (BSTR)
+        *mut u16,         // strUser
+        *mut u16,         // strPassword
+        *mut u16,         // strLocale
+        i32,              // lSecurityFlags
+        *mut u16,         // strAuthority
+        *mut c_void,      // pCtx (IWbemContext*)
         *mut *mut c_void, // ppNamespace
     ) -> i32;
     let f: Fn = core::mem::transmute(f);
-    f(locator, network_resource, user, password, locale, security_flags, authority, context, out_services)
+    f(
+        locator,
+        network_resource,
+        user,
+        password,
+        locale,
+        security_flags,
+        authority,
+        context,
+        out_services,
+    )
 }
 
 /// IWbemServices::ExecQuery (slot 20). Runs a WQL query and returns an
 /// IEnumWbemClassObject enumerator. Returns null on failure.
 pub unsafe fn wbem_services_exec_query(
     services: *mut c_void,
-    language: *mut u16,  // BSTR — always "WQL"
-    query: *mut u16,     // BSTR — e.g. "SELECT * FROM AntiVirusProduct"
+    language: *mut u16, // BSTR — always "WQL"
+    query: *mut u16,    // BSTR — e.g. "SELECT * FROM AntiVirusProduct"
     flags: i32,
     context: *mut c_void,
     out_enum: *mut *mut c_void,
 ) -> i32 {
     let f = vtable_slot(services, 20);
     type Fn = unsafe extern "system" fn(
-        *mut c_void, // this
-        *mut u16,    // strQueryLanguage
-        *mut u16,    // strQuery
-        i32,         // lFlags
-        *mut c_void, // pCtx (IWbemContext*)
+        *mut c_void,      // this
+        *mut u16,         // strQueryLanguage
+        *mut u16,         // strQuery
+        i32,              // lFlags
+        *mut c_void,      // pCtx (IWbemContext*)
         *mut *mut c_void, // ppEnum
     ) -> i32;
     let f: Fn = core::mem::transmute(f);
@@ -710,11 +744,11 @@ pub unsafe fn enum_wbem_next(
 ) -> i32 {
     let f = vtable_slot(enumerator, 4);
     type Fn = unsafe extern "system" fn(
-        *mut c_void, // this
-        i32,         // lTimeout
-        u32,         // uCount
+        *mut c_void,      // this
+        i32,              // lTimeout
+        u32,              // uCount
         *mut *mut c_void, // apObjects
-        *mut u32,    // puReturned
+        *mut u32,         // puReturned
     ) -> i32;
     let f: Fn = core::mem::transmute(f);
     f(enumerator, timeout, count, out_objects, returned)
@@ -731,12 +765,12 @@ pub unsafe fn wbem_object_get(
 ) -> i32 {
     let f = vtable_slot(object, 3);
     type Fn = unsafe extern "system" fn(
-        *mut c_void, // this
-        *mut u16,    // wszName
-        i32,         // lFlags
+        *mut c_void,  // this
+        *mut u16,     // wszName
+        i32,          // lFlags
         *mut Variant, // pVal
-        *mut i32,    // pvtType (CIMTYPE*)
-        *mut i32,    // plFlavor
+        *mut i32,     // pvtType (CIMTYPE*)
+        *mut i32,     // plFlavor
     ) -> i32;
     let f: Fn = core::mem::transmute(f);
     f(object, name, flags, out_val, out_type, out_flavor)

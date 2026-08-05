@@ -148,9 +148,7 @@ unsafe fn init_resolve_table_fresh(
 
 /// Stage 1b: fallback path when the KnownDlls mapping failed (ACL / low IL) —
 /// disk ntdll first, then the hooked in-process ntdll as last resort.
-unsafe fn init_resolve_table_fallback(
-    ntdll: &LiveNtdll,
-) -> Option<(Vec<(String, u32)>, u64)> {
+unsafe fn init_resolve_table_fallback(ntdll: &LiveNtdll) -> Option<(Vec<(String, u32)>, u64)> {
     // KnownDlls mapping failed (ACL / low IL). Before falling back to
     // the hooked ntdll for SSN resolution too, try reading ntdll off
     // DISK (fresh_ntdll_text_disk): the on-disk file is pristine, so
@@ -256,8 +254,7 @@ unsafe fn init_flip_exec_read(page: *mut core::ffi::c_void, trampoline_pages: us
     // VirtualProtect flips. Uses kernel32!VirtualProtect (PEB-resolved) to
     // avoid recursing through the indirect-syscall trampoline.
     if let Some(vp_addr) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect") {
-        type VpFn =
-            unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, *mut u32) -> i32;
+        type VpFn = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, *mut u32) -> i32;
         let vp: VpFn = core::mem::transmute(vp_addr);
         let mut old: u32 = 0;
         vp(page, trampoline_pages, 0x20, &mut old);

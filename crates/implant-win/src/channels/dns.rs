@@ -14,8 +14,8 @@
 
 #![cfg(target_os = "windows")]
 
-use crate::heap::Vec;
 use super::ChannelCtx;
+use crate::heap::Vec;
 
 /// Send `frame` as an HTTPS POST to `/dns`, return the response body.
 ///
@@ -28,13 +28,5 @@ pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
     } else {
         ctx.server_host.as_bytes()
     };
-    unsafe {
-        crate::transport::post_frame(
-            host,
-            ctx.server_port,
-            b"/dns",
-            frame,
-            ctx.use_tls,
-        )
-    }
+    unsafe { crate::transport::post_frame(host, ctx.server_port, b"/dns", frame, ctx.use_tls) }
 }

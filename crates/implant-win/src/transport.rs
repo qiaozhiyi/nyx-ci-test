@@ -616,7 +616,12 @@ unsafe fn post_frame_finish(
 
 /// Close the request/connection/session handle chain (same order everywhere:
 /// req → conn → session).
-unsafe fn close_winhttp_chain(fns: &WinhttpFns, req: HINTERNET, conn: HINTERNET, session: HINTERNET) {
+unsafe fn close_winhttp_chain(
+    fns: &WinhttpFns,
+    req: HINTERNET,
+    conn: HINTERNET,
+    session: HINTERNET,
+) {
     (fns.close_handle)(req);
     (fns.close_handle)(conn);
     (fns.close_handle)(session);
@@ -743,13 +748,7 @@ unsafe fn post_frame_enhanced_open_session(
         (WINHTTP_ACCESS_TYPE_NAMED_PROXY, Some(pw))
     };
     let session = match &proxy_w {
-        Some(pw) => (fns.open)(
-            ua.as_ptr(),
-            access_type,
-            pw.as_ptr(),
-            core::ptr::null(),
-            0,
-        ),
+        Some(pw) => (fns.open)(ua.as_ptr(), access_type, pw.as_ptr(), core::ptr::null(), 0),
         None => (fns.open)(
             ua.as_ptr(),
             access_type,
@@ -911,7 +910,11 @@ unsafe fn post_frame_enhanced_add_headers(
 
 /// Send request (with cert-ignore, same pre-send approach as post_frame).
 /// Returns false on any failure (the caller closes the handle chain).
-unsafe fn post_frame_enhanced_maybe_relax_cert(fns: &WinhttpFns, req: HINTERNET, use_tls: bool) -> bool {
+unsafe fn post_frame_enhanced_maybe_relax_cert(
+    fns: &WinhttpFns,
+    req: HINTERNET,
+    use_tls: bool,
+) -> bool {
     // ---- Send request (with cert-ignore, same pre-send approach as post_frame) ----
     let can_relax_cert = use_tls && fns.set_option.is_some() && tls_insecure_retry();
     if can_relax_cert {

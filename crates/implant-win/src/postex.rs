@@ -267,10 +267,8 @@ pub unsafe fn steal_token(pid: u32) -> Result<(), &'static str> {
 
 /// Resolve the exports `steal_token` needs (kernel32 + advapi32), preserving
 /// the per-export error messages.
-fn steal_token_resolve() -> Result<
-    (OpenProcess, OpenProcessToken, DuplicateTokenEx, CloseHandle),
-    &'static str,
-> {
+fn steal_token_resolve(
+) -> Result<(OpenProcess, OpenProcessToken, DuplicateTokenEx, CloseHandle), &'static str> {
     let open_process: OpenProcess = match unsafe { export_addr(b"kernel32.dll", b"OpenProcess") } {
         Some(a) => unsafe { core::mem::transmute(a) },
         None => return Err("steal_token: OpenProcess unresolved"),

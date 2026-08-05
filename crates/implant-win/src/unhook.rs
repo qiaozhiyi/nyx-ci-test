@@ -270,7 +270,11 @@ unsafe fn fresh_ntdll_open_section(
     oa: &mut ObjectAttributes,
 ) -> Option<*mut c_void> {
     let mut section: *mut c_void = core::ptr::null_mut();
-    let st = open(&mut section, SECTION_MIN_ACCESS, oa as *mut ObjectAttributes);
+    let st = open(
+        &mut section,
+        SECTION_MIN_ACCESS,
+        oa as *mut ObjectAttributes,
+    );
     if st < 0 || section.is_null() {
         return None;
     }
@@ -279,10 +283,7 @@ unsafe fn fresh_ntdll_open_section(
 
 /// NtMapViewOfSection, PAGE_READONLY, ViewSize=0 (whole image). Returns the
 /// mapped base address, or `None` if the map failed.
-unsafe fn fresh_ntdll_map_view(
-    map: NtMapViewOfSection,
-    section: *mut c_void,
-) -> Option<*mut u8> {
+unsafe fn fresh_ntdll_map_view(map: NtMapViewOfSection, section: *mut c_void) -> Option<*mut u8> {
     let mut base: *mut c_void = core::ptr::null_mut();
     let mut view_size: usize = 0;
     let mut section_offset: u64 = 0;
@@ -415,7 +416,8 @@ unsafe fn read_ntdll_file() -> Option<Vec<u8>> {
 
 /// Resolve the four kernel32 file-IO exports via the PEB walk and transmute
 /// them to their FFI types.
-unsafe fn read_ntdll_resolve() -> Option<(GetSystemDirectoryW, CreateFileW, ReadFile, CloseHandle)> {
+unsafe fn read_ntdll_resolve() -> Option<(GetSystemDirectoryW, CreateFileW, ReadFile, CloseHandle)>
+{
     let gsdw = crate::resolve::export_addr(b"kernel32.dll", b"GetSystemDirectoryW")?;
     let create = crate::resolve::export_addr(b"kernel32.dll", b"CreateFileW")?;
     let read = crate::resolve::export_addr(b"kernel32.dll", b"ReadFile")?;
@@ -463,10 +465,7 @@ unsafe fn read_ntdll_sysdir(gsdw: GetSystemDirectoryW) -> Option<[u16; 260]> {
 
 /// Open `%SystemRoot%\ntdll.dll` with CreateFileW (GENERIC_READ, share
 /// read+delete, OPEN_EXISTING). Returns the handle, or `None` on failure.
-unsafe fn read_ntdll_create(
-    create: CreateFileW,
-    sysdir: &[u16; 260],
-) -> Option<*mut c_void> {
+unsafe fn read_ntdll_create(create: CreateFileW, sysdir: &[u16; 260]) -> Option<*mut c_void> {
     // 3. CreateFileW (GENERIC_READ, share read+delete, OPEN_EXISTING).
     let h = create(
         sysdir.as_ptr(),

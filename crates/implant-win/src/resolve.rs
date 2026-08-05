@@ -45,7 +45,9 @@ pub unsafe fn djb2_utf16(ptr: *const u16, len: usize) -> u32 {
     for i in 0..len {
         let c = *ptr.add(i);
         let lo = (c & 0xFF) as u8;
-        h = h.wrapping_mul(33).wrapping_add(lo.to_ascii_lowercase() as u32);
+        h = h
+            .wrapping_mul(33)
+            .wrapping_add(lo.to_ascii_lowercase() as u32);
     }
     h
 }

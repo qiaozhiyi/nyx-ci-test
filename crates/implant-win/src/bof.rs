@@ -83,8 +83,7 @@ fn page(n: usize) -> usize {
 /// wild relocation target reports status bits instead of AV'ing the probe.
 #[cfg(feature = "selftest")]
 unsafe fn vq_readable(addr: usize, len: usize) -> bool {
-    type VirtualQueryFn =
-        unsafe extern "system" fn(*const c_void, *mut u8, usize) -> usize;
+    type VirtualQueryFn = unsafe extern "system" fn(*const c_void, *mut u8, usize) -> usize;
     let Some(a) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualQuery") else {
         return false;
     };
@@ -1037,7 +1036,11 @@ unsafe fn run_resolve_api() -> Result<(VirtualAllocFn, VirtualProtectFn, Virtual
 }
 
 /// Stage 2b: build the RAII owner of every VirtualAlloc'd section region.
-fn run_new_guard(coff: &nyx_coff::Coff<'_>, free: VirtualFreeFn, protect: VirtualProtectFn) -> SectionGuard {
+fn run_new_guard(
+    coff: &nyx_coff::Coff<'_>,
+    free: VirtualFreeFn,
+    protect: VirtualProtectFn,
+) -> SectionGuard {
     // RAII owner of every VirtualAlloc'd section region. Its Drop zeroes each
     // region (RX flipped back to RW first) then releases it with
     // VirtualFree(MEM_RELEASE) — this is the leak fix: previously every BOF
@@ -1185,10 +1188,16 @@ fn run_entry_addr(coff: &nyx_coff::Coff<'_>, bases: &[u64]) -> Result<u64, Respo
     // 5. Resolve the entry symbol `go`.
     let entry_sym = match coff.symbols.iter().find(|s| s.name == "go") {
         Some(s) => s,
-        None => return Err(Response::Err(String::from("BOF entry symbol `go` not found"))),
+        None => {
+            return Err(Response::Err(String::from(
+                "BOF entry symbol `go` not found",
+            )))
+        }
     };
     if entry_sym.section_number < 1 {
-        return Err(Response::Err(String::from("BOF entry `go` is external/undefined")));
+        return Err(Response::Err(String::from(
+            "BOF entry `go` is external/undefined",
+        )));
     }
     Ok(bases[(entry_sym.section_number - 1) as usize] + entry_sym.value as u64)
 }

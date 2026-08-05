@@ -17,32 +17,32 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 // ---- FFI types for the NT heap API ----
 
 type RtlCreateHeap = unsafe extern "system" fn(
-    u32,                          // Flags (HEAP_GROWABLE = 0x00000002)
-    *mut core::ffi::c_void,       // HeapBase (NULL = let NT pick)
-    usize,                        // ReserveSize (0 = default)
-    usize,                        // CommitSize (0 = default)
-    *mut core::ffi::c_void,       // LockParam (NULL)
-    *mut core::ffi::c_void,       // Parameters (NULL)
-) -> *mut core::ffi::c_void;      // Heap handle
+    u32,                    // Flags (HEAP_GROWABLE = 0x00000002)
+    *mut core::ffi::c_void, // HeapBase (NULL = let NT pick)
+    usize,                  // ReserveSize (0 = default)
+    usize,                  // CommitSize (0 = default)
+    *mut core::ffi::c_void, // LockParam (NULL)
+    *mut core::ffi::c_void, // Parameters (NULL)
+) -> *mut core::ffi::c_void; // Heap handle
 
 type RtlAllocateHeap = unsafe extern "system" fn(
-    *mut core::ffi::c_void,       // HeapHandle
-    u32,                          // Flags (0)
-    usize,                        // Size
-) -> *mut core::ffi::c_void;      // Allocated pointer
+    *mut core::ffi::c_void, // HeapHandle
+    u32,                    // Flags (0)
+    usize,                  // Size
+) -> *mut core::ffi::c_void; // Allocated pointer
 
 type RtlFreeHeap = unsafe extern "system" fn(
-    *mut core::ffi::c_void,       // HeapHandle
-    u32,                          // Flags (0)
-    *mut core::ffi::c_void,       // Pointer to free
-) -> i32;                         // BOOL
+    *mut core::ffi::c_void, // HeapHandle
+    u32,                    // Flags (0)
+    *mut core::ffi::c_void, // Pointer to free
+) -> i32; // BOOL
 
 type RtlReAllocateHeap = unsafe extern "system" fn(
-    *mut core::ffi::c_void,       // HeapHandle
-    u32,                          // Flags (0)
-    *mut core::ffi::c_void,       // Existing pointer
-    usize,                        // New size
-) -> *mut core::ffi::c_void;      // Reallocated pointer
+    *mut core::ffi::c_void, // HeapHandle
+    u32,                    // Flags (0)
+    *mut core::ffi::c_void, // Existing pointer
+    usize,                  // New size
+) -> *mut core::ffi::c_void; // Reallocated pointer
 
 // ---- Resolved function pointers (cached in atomics) ----
 
@@ -159,15 +159,12 @@ struct SlabDesc {
 /// >64 KiB allocations from multiple threads are fully handled by `fetch_add`
 /// handing each writer a unique index (no torn writes, no lost updates, no
 /// OOB). See P0-1.
-static SLAB_TABLE: [SlabDesc; MAX_SLABS] = [
-    const {
-        SlabDesc {
-            base: AtomicU64::new(0),
-            len: AtomicU64::new(0),
-        }
-    };
-    MAX_SLABS
-];
+static SLAB_TABLE: [SlabDesc; MAX_SLABS] = [const {
+    SlabDesc {
+        base: AtomicU64::new(0),
+        len: AtomicU64::new(0),
+    }
+}; MAX_SLABS];
 static SLAB_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Record a large allocation in the slab table. Called from inside
@@ -301,7 +298,11 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
         let free_fn: RtlFreeHeap = core::mem::transmute(free_addr as usize);
         let align = layout.align();
         if align <= 8 {
-            free_fn(heap_handle as *mut core::ffi::c_void, 0, ptr as *mut core::ffi::c_void);
+            free_fn(
+                heap_handle as *mut core::ffi::c_void,
+                0,
+                ptr as *mut core::ffi::c_void,
+            );
         } else {
             // Recover the original pointer stored 8 bytes before.
             let store = (ptr_addr - 8) as *mut *mut core::ffi::c_void;
@@ -310,7 +311,12 @@ unsafe impl core::alloc::GlobalAlloc for NtHeapAllocator {
         }
     }
 
-    unsafe fn realloc(&self, ptr: *mut u8, layout: core::alloc::Layout, new_size: usize) -> *mut u8 {
+    unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        layout: core::alloc::Layout,
+        new_size: usize,
+    ) -> *mut u8 {
         // Check fallback buffer.
         let fb_base = core::ptr::addr_of_mut!(FALLBACK_MEM) as usize;
         let fb_end = fb_base + FALLBACK_SIZE;

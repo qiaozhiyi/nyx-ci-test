@@ -113,8 +113,7 @@ pub fn pid() -> u32 {
 /// resolved — callers MUST treat 0 as "unknown, do not enforce", NOT as the
 /// epoch, so that a missing clock can't kill the beacon spuriously.
 pub fn now_unix() -> u64 {
-    type GetSystemTimeAsFileTime =
-        unsafe extern "system" fn(*mut u8); // *mut FILETIME (8 bytes, low+high u32)
+    type GetSystemTimeAsFileTime = unsafe extern "system" fn(*mut u8); // *mut FILETIME (8 bytes, low+high u32)
     let addr = match unsafe { export_addr(b"kernel32.dll", b"GetSystemTimeAsFileTime") } {
         Some(a) => a,
         None => return 0,
@@ -133,9 +132,7 @@ pub fn now_unix() -> u64 {
     // Guard against the (impossible-on-a-real-host) case where FILETIME is
     // below the Unix epoch — saturating_sub avoids an underflow wrap that
     // would produce a huge bogus timestamp.
-    filetime_100ns
-        .saturating_sub(FILETIME_EPOCH_OFFSET_100NS)
-        / TICKS_PER_SEC
+    filetime_100ns.saturating_sub(FILETIME_EPOCH_OFFSET_100NS) / TICKS_PER_SEC
 }
 
 /// `GetUserNameW` → username, or `"user"` on failure. Needs `advapi32.dll`

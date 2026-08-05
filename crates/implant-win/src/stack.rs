@@ -445,10 +445,7 @@ unsafe fn do_rsp_swap_stage_swap<T, F: FnOnce() -> T>(
         run_f_on_spoof::<T, F> as *const () as usize,
         Ordering::Release,
     );
-    SWAP_F.store(
-        f as *const F as *const () as usize,
-        Ordering::Release,
-    );
+    SWAP_F.store(f as *const F as *const () as usize, Ordering::Release);
     SWAP_OUT.store(out_addr, Ordering::Release);
     let mut save_rsp: usize;
     let fake_in = fake_rsp;
@@ -484,10 +481,7 @@ unsafe fn do_rsp_swap_stage_swap<T, F: FnOnce() -> T>(
 /// Stage 4: teardown — clear the per-call statics, then decide `f`'s ownership
 /// and `out`'s init state from whether the trampoline actually ran.
 #[cfg(target_arch = "x86_64")]
-unsafe fn do_rsp_swap_stage_restore<T, F: FnOnce() -> T>(
-    f: F,
-    out: core::mem::MaybeUninit<T>,
-) -> T
+unsafe fn do_rsp_swap_stage_restore<T, F: FnOnce() -> T>(f: F, out: core::mem::MaybeUninit<T>) -> T
 where
     T: Default,
 {

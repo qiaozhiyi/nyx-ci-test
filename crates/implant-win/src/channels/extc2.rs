@@ -32,8 +32,8 @@
 
 #![cfg(target_os = "windows")]
 
-use crate::heap::Vec;
 use super::ChannelCtx;
+use crate::heap::Vec;
 
 /// Post `frame` to the Slack external-C2 endpoint on the C2 server.
 ///

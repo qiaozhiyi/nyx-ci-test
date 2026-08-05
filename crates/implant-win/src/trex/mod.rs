@@ -357,9 +357,9 @@ unsafe fn scan_service_manager_probe_size(scm: Handle) -> Option<u32> {
     // First call: get buffer size
     enum_services_status_ex(
         scm,
-        0,  // SC_ENUM_PROCESS_INFO
-        0,  // SERVICE_WIN32
-        3,  // SERVICE_STATE_ALL
+        0, // SC_ENUM_PROCESS_INFO
+        0, // SERVICE_WIN32
+        3, // SERVICE_STATE_ALL
         core::ptr::null_mut(),
         0,
         &mut needed,
@@ -387,7 +387,8 @@ unsafe fn scan_service_manager_collect(
     if enum_services_status_ex(
         scm,
         0,
-        0, 3,
+        0,
+        3,
         buf,
         needed,
         &mut needed,
@@ -457,7 +458,7 @@ fn query_cfg(flags: &mut MitigationFlags) {
     let ok = unsafe {
         get_process_mitigation_policy(
             -1isize as *mut core::ffi::c_void, // GetCurrentProcess
-            8,                // ProcessControlFlowGuardPolicy
+            8,                                 // ProcessControlFlowGuardPolicy
             &mut policy as *mut CfgPolicy as *mut core::ffi::c_void,
             core::mem::size_of::<CfgPolicy>() as u32,
         )
@@ -925,7 +926,9 @@ fn match_driver_name_av(lower: &str) -> Option<Vendor> {
     {
         return Some(Vendor::SophosInterceptX);
     }
-    if lower.contains("klif") || lower.contains("klam") || lower.contains("klick")
+    if lower.contains("klif")
+        || lower.contains("klam")
+        || lower.contains("klick")
         || lower.contains("kltdi")
     {
         return Some(Vendor::Kaspersky);
@@ -933,7 +936,9 @@ fn match_driver_name_av(lower: &str) -> Option<Vendor> {
     if lower.contains("mfenc") || lower.contains("mfeh") || lower.contains("mfefirek") {
         return Some(Vendor::McAfee);
     }
-    if lower.contains("symefa") || lower.contains("symevnt") || lower.contains("symcorpu")
+    if lower.contains("symefa")
+        || lower.contains("symevnt")
+        || lower.contains("symcorpu")
         || lower.contains("srtsp")
     {
         return Some(Vendor::Symantec);
@@ -1031,7 +1036,9 @@ unsafe fn enum_services_status_ex(
     resume: *mut u32,
     _group: *const u16,
 ) -> i32 {
-    scanners::enum_services_status_ex(scm, level, typ, state, buf, buf_sz, needed, returned, resume, _group)
+    scanners::enum_services_status_ex(
+        scm, level, typ, state, buf, buf_sz, needed, returned, resume, _group,
+    )
 }
 
 unsafe fn wcslen(s: *const u16) -> usize {
@@ -1117,13 +1124,8 @@ unsafe fn open_registry_subkey(parent: HKey, name: &str) -> HKey {
     let n = bytes.len().min(buf.len() - 1);
     buf[..n].copy_from_slice(&bytes[..n]);
     let mut h: usize = 0;
-    let st = scanners::reg_open_key_ex_a(
-        parent as usize,
-        buf.as_ptr(),
-        0,
-        scanners::KEY_READ,
-        &mut h,
-    );
+    let st =
+        scanners::reg_open_key_ex_a(parent as usize, buf.as_ptr(), 0, scanners::KEY_READ, &mut h);
     if st != scanners::ERROR_SUCCESS || h == 0 {
         return core::ptr::null_mut();
     }
@@ -1296,11 +1298,7 @@ unsafe fn query_reg_value_read(k: HKey, value_name: &[u8; 64], typ: u32, len: u3
 ///
 /// Safety: COM is thread-affine — caller must invoke on the thread that
 /// called CoInitializeEx. T-REX is single-threaded so this holds.
-unsafe fn wmi_run_string_query(
-    namespace: &[u8],
-    wql: &[u8],
-    prop_name: &[u8],
-) -> Vec<String> {
+unsafe fn wmi_run_string_query(namespace: &[u8], wql: &[u8], prop_name: &[u8]) -> Vec<String> {
     let locator = match wmi_query_locator() {
         Some(l) => l,
         None => return Vec::new(),

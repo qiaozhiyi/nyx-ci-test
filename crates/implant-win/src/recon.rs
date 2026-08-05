@@ -204,10 +204,7 @@ fn do_driveinfo_resolve_gdfs() -> Option<GetDiskFreeSpaceExW> {
 /// Enumerate drive roots with `GetLogicalDriveStringsW` and query each via
 /// `GetDiskFreeSpaceExW`, appending one `C:\ total=X free=Y avail=Z` line per
 /// reachable drive.
-fn do_driveinfo_collect(
-    glds: GetLogicalDriveStringsW,
-    gdfs: GetDiskFreeSpaceExW,
-) -> Response {
+fn do_driveinfo_collect(glds: GetLogicalDriveStringsW, gdfs: GetDiskFreeSpaceExW) -> Response {
     const BUFW: usize = 260;
     let mut buf = vec![0u16; BUFW];
     // Fills buf with "C:\\\0D:\\\0...\0\0" (UTF-16). Returns chars copied,
@@ -327,11 +324,11 @@ fn do_env_dump_all() -> Response {
 /// Fetch a single environment variable via `GetEnvironmentVariableW`.
 fn do_env_single(name: &str) -> Response {
     type GetEnvVarW = unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
-    let gev: GetEnvVarW =
-        match unsafe { export_addr(b"kernel32.dll", b"GetEnvironmentVariableW") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return Response::Err("env: GetEnvironmentVariableW unresolved".into()),
-        };
+    let gev: GetEnvVarW = match unsafe { export_addr(b"kernel32.dll", b"GetEnvironmentVariableW") }
+    {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Response::Err("env: GetEnvironmentVariableW unresolved".into()),
+    };
 
     let name16 = to_utf16(name.as_bytes());
     // 32767 is the documented max env-var length in chars; avoids the
@@ -431,12 +428,11 @@ fn do_clipboard_resolve() -> Result<ClipboardFns, &'static str> {
         Some(a) => unsafe { core::mem::transmute(a) },
         None => return Err("clipboard: GetClipboardData unresolved"),
     };
-    let isavail: IsClipboardFormatAvailable = match unsafe {
-        export_addr(b"user32.dll", b"IsClipboardFormatAvailable")
-    } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Err("clipboard: IsClipboardFormatAvailable unresolved"),
-    };
+    let isavail: IsClipboardFormatAvailable =
+        match unsafe { export_addr(b"user32.dll", b"IsClipboardFormatAvailable") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return Err("clipboard: IsClipboardFormatAvailable unresolved"),
+        };
     let glock: GlobalLock = match unsafe { export_addr(b"kernel32.dll", b"GlobalLock") } {
         Some(a) => unsafe { core::mem::transmute(a) },
         None => return Err("clipboard: GlobalLock unresolved"),
@@ -528,9 +524,7 @@ fn do_clipboard_read_locked(
         let len = bounded_nul_len(p as *const u8, size_bytes);
         // SAFETY: `len <= size_bytes`; see above.
         let mut out = Vec::new();
-        out.extend_from_slice(unsafe {
-            core::slice::from_raw_parts(p as *const u8, len)
-        });
+        out.extend_from_slice(unsafe { core::slice::from_raw_parts(p as *const u8, len) });
         out
     };
     unsafe { (fns.gunlock)(h) };

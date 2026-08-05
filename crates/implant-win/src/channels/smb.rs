@@ -53,10 +53,10 @@
 
 #![cfg(target_os = "windows")]
 
+use super::ChannelCtx;
 use crate::heap::{vec, Vec};
 use crate::resolve::export_addr;
 use core::ffi::c_void;
-use super::ChannelCtx;
 
 // ── Win32 constants ────────────────────────────────────────────────────────
 
@@ -271,9 +271,7 @@ unsafe fn send_recv_open_pipe(fns: &K32Fns, pipe_name: &[u8]) -> Option<Handle> 
             core::ptr::null_mut(),
         )
     };
-    if (handle == INVALID_HANDLE || handle.is_null())
-        && (fns.get_last_error)() == ERROR_PIPE_BUSY
-    {
+    if (handle == INVALID_HANDLE || handle.is_null()) && (fns.get_last_error)() == ERROR_PIPE_BUSY {
         // Instance busy — wait (bounded) for the server to accept, then retry.
         let _ = (fns.wait_named_pipe_w)(wide.as_ptr(), PIPE_WAIT_MS);
         handle = unsafe {

@@ -276,7 +276,9 @@ unsafe fn redirect_one_slot(
             // binding), so VirtualProtect is required.
             let mut old: u32 = 0;
             let page_addr = slot_ptr as *mut c_void;
-            let ok = unsafe { vp(page_addr, 8, 0x04 /* PAGE_READWRITE */, &mut old) };
+            let ok = unsafe {
+                vp(page_addr, 8, 0x04 /* PAGE_READWRITE */, &mut old)
+            };
             if ok != 0 {
                 unsafe { core::ptr::write(slot_ptr, stub_addr) };
                 // Restore original protection (closes the RW window).

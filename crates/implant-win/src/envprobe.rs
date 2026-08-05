@@ -661,10 +661,7 @@ unsafe fn running_process_count_query() -> Option<crate::heap::Vec<u8>> {
     // SystemProcessInformation = 0x5
     const SYSTEM_PROCESS_INFO: u32 = 0x5;
 
-    let nt_query = crate::resolve::export_addr(
-        b"ntdll.dll",
-        b"NtQuerySystemInformation",
-    )?;
+    let nt_query = crate::resolve::export_addr(b"ntdll.dll", b"NtQuerySystemInformation")?;
     type NtQuery = unsafe extern "system" fn(
         SystemInformationClass: u32,
         SystemInformation: *mut u8,
@@ -679,12 +676,7 @@ unsafe fn running_process_count_query() -> Option<crate::heap::Vec<u8>> {
     buf.resize(buf_size as usize, 0u8);
 
     let mut needed: u32 = 0;
-    let status = nt_query(
-        SYSTEM_PROCESS_INFO,
-        buf.as_mut_ptr(),
-        buf_size,
-        &mut needed,
-    );
+    let status = nt_query(SYSTEM_PROCESS_INFO, buf.as_mut_ptr(), buf_size, &mut needed);
 
     if status < 0 {
         // STATUS_INFO_LENGTH_MISMATCH → needed contains required size.

@@ -72,7 +72,15 @@ unsafe fn do_fluctuate(seconds: u32) -> bool {
         Some(v) => v,
         None => return false,
     };
-    if !do_fluctuate_build(rt, page, prot_tramp, delay_tramp, region.base, region.len, seconds) {
+    if !do_fluctuate_build(
+        rt,
+        page,
+        prot_tramp,
+        delay_tramp,
+        region.base,
+        region.len,
+        seconds,
+    ) {
         return false;
     }
     do_fluctuate_execute(rt, page)

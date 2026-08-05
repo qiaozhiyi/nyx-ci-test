@@ -50,7 +50,11 @@ pub fn install_ghost_chain(chain: &GhostChain) {
     // Bound the depth we ever install: protects the frames_len * 8 multiply in
     // with_ghost_stack from overflow on a corrupted/huge chain, and caps the
     // process-lifetime leak. MAX_GHOST_DEPTH = 32.
-    let len = if len > MAX_GHOST_DEPTH { MAX_GHOST_DEPTH } else { len };
+    let len = if len > MAX_GHOST_DEPTH {
+        MAX_GHOST_DEPTH
+    } else {
+        len
+    };
     let src_slice: &[usize] = &chain.frames[..len];
 
     let Some(buf) = install_ghost_chain_alloc_static(src_slice) else {

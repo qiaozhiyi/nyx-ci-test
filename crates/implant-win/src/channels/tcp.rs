@@ -27,10 +27,10 @@
 
 #![cfg(target_os = "windows")]
 
+use super::ChannelCtx;
 use crate::heap::{vec, Vec};
 use crate::resolve::export_addr;
 use core::ffi::c_void;
-use super::ChannelCtx;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Winsock constants
@@ -230,8 +230,20 @@ unsafe fn ensure_ws2_32_resolve() -> Option<alloc::boxed::Box<WsaFns>> {
         Some(getsockopt),
         Some(setsockopt),
         Some(wsa_get_last_error),
-    ) = (wsa_startup, wsa_cleanup, socket, connect, send, recv, closesocket, select, ioctlsocket, getsockopt, setsockopt, wsa_get_last_error)
-    {
+    ) = (
+        wsa_startup,
+        wsa_cleanup,
+        socket,
+        connect,
+        send,
+        recv,
+        closesocket,
+        select,
+        ioctlsocket,
+        getsockopt,
+        setsockopt,
+        wsa_get_last_error,
+    ) {
         Some(alloc::boxed::Box::new(WsaFns {
             wsa_startup: core::mem::transmute(wsa_startup),
             wsa_cleanup: core::mem::transmute(wsa_cleanup),
@@ -419,12 +431,7 @@ pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
 
 /// One TCP round-trip: socket → connect → send frame → recv response. Owns the
 /// socket lifecycle. Caller has already done WSAStartup and will do WSACleanup.
-unsafe fn tcp_round(
-    fns: &WsaFns,
-    sin_addr: u32,
-    sin_port: u16,
-    frame: &[u8],
-) -> Option<Vec<u8>> {
+unsafe fn tcp_round(fns: &WsaFns, sin_addr: u32, sin_port: u16, frame: &[u8]) -> Option<Vec<u8>> {
     // ---- socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) ----
     let s = (fns.socket)(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if s == INVALID_SOCKET {
@@ -567,12 +574,7 @@ unsafe fn tcp_exchange_send(fns: &WsaFns, s: Socket, frame: &[u8]) -> bool {
 unsafe fn tcp_exchange_recv(fns: &WsaFns, s: Socket) -> Option<Vec<u8>> {
     // ---- Recv length prefix (LE) ----
     let len_buf = recv_exact(fns, s, 4)?;
-    let resp_len = u32::from_le_bytes([
-        len_buf[0],
-        len_buf[1],
-        len_buf[2],
-        len_buf[3],
-    ]) as usize;
+    let resp_len = u32::from_le_bytes([len_buf[0], len_buf[1], len_buf[2], len_buf[3]]) as usize;
 
     // Guard: a malicious/buggy peer could claim a huge length to exhaust the
     // bump allocator. Cap at MAX_RESPONSE_BYTES (16 MiB) and reject otherwise.

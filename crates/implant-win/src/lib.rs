@@ -218,8 +218,9 @@ fn write_panic_diag(info: &core::panic::PanicInfo) {
 #[cfg(all(target_os = "windows", nyx_diag, not(test)))]
 fn write_panic_diag_resolve() -> Option<(usize, usize, usize, usize)> {
     let (Some(gev), Some(cf), Some(wf), Some(ch)) = (
-        unsafe { resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableW") }
-            .or_else(|| unsafe { resolve::export_addr(b"kernelbase.dll", b"GetEnvironmentVariableW") }),
+        unsafe { resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableW") }.or_else(
+            || unsafe { resolve::export_addr(b"kernelbase.dll", b"GetEnvironmentVariableW") },
+        ),
         unsafe { resolve::export_addr(b"kernel32.dll", b"CreateFileW") }
             .or_else(|| unsafe { resolve::export_addr(b"kernelbase.dll", b"CreateFileW") }),
         unsafe { resolve::export_addr(b"kernel32.dll", b"WriteFile") }
@@ -249,7 +250,11 @@ fn write_panic_diag_build_path(gev: usize) -> [u16; 320] {
     }
     name16[4] = 0;
     let n = unsafe { get_env(name16.as_ptr(), tmp16.as_mut_ptr(), 260) };
-    let tmp_len = if n != 0 && (n as usize) < 260 { n as usize } else { 0 };
+    let tmp_len = if n != 0 && (n as usize) < 260 {
+        n as usize
+    } else {
+        0
+    };
 
     let mut path16 = [0u16; 320];
     let mut idx = 0usize;
@@ -350,13 +355,8 @@ unsafe fn write_panic_diag_write_file(
         u32,
         *mut c_void,
     ) -> *mut c_void;
-    type WriteFile = unsafe extern "system" fn(
-        *mut c_void,
-        *const u8,
-        u32,
-        *mut u32,
-        *mut c_void,
-    ) -> i32;
+    type WriteFile =
+        unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
 
     let create: CreateFileW = core::mem::transmute(cf);
@@ -378,7 +378,13 @@ unsafe fn write_panic_diag_write_file(
         return;
     }
     let mut written: u32 = 0;
-    let _ = write(h, body.as_ptr(), blen as u32, &mut written, core::ptr::null_mut());
+    let _ = write(
+        h,
+        body.as_ptr(),
+        blen as u32,
+        &mut written,
+        core::ptr::null_mut(),
+    );
     let _ = close(h);
 }
 
