@@ -45,93 +45,7 @@ impl PdataGapScanner for LivePdataScanner {
     fn scan(&self) -> Result<GapPool, EvasionError> {
         let mut pool = GapPool::default();
         for &name in WHITELIST {
-            // SAFETY: PEB walk reads loader state stable post-load; pdata_view
-            // reads a loader-owned, committed section. A module not in the
-            // loader list simply yields None and is skipped.
-            let base = unsafe { resolve::module_base_by_name(name) };
-            let base = match base {
-                Some(b) => b,
-                None => continue, // win32u/wow64 may be absent — skip, not fatal
-            };
-            let view = match unsafe { resolve::pdata_view(base) } {
-                Some(v) => v,
-                None => continue, // module mapped but no .pdata — skip
-            };
-            // Pure core: bytes → sorted RUNTIME_FUNCTION_ENTRY list.
-            let entries = gap::RuntimeFunctionEntry::parse_table(view.bytes);
-            // Pure core: entries → gap RVAs (inter-function + tail), sampled
-            // every 8 bytes, capped at MAX_PER_GAP per range.
-            let gaps = gap::enumerate_gaps(&entries, view.image_size, MAX_PER_GAP);
-            if gaps.is_empty() {
-                continue;
-            }
-            // Classify each gap RVA into gaps/ghosts/nops via byte-pattern
-            // predicates read from the live image. `image` is the raw bytes
-            // from `[base, base+image_size)` so the predicates can inspect the
-            // byte at each gap RVA.
-            //
-            // SAFETY: the whole module image is mapped readable; reading one
-            // byte at an in-range RVA is sound.
-            let image_bytes =
-                unsafe { core::slice::from_raw_parts(base, view.image_size as usize) };
-            let mut per_module = gap::classify_into_pool(
-                &gaps,
-                Some(image_bytes),
-                // ghost_pred: a real executable byte at the gap → a "ghost"
-                // function (code with no .pdata entry). `C3` (ret) at a gap
-                // strongly implies a tiny leaf/thunk lives there. Treat any
-                // non-zero, non-padding byte as a ghost candidate.
-                |_rva, image| -> bool {
-                    let img = match image {
-                        Some(b) => b,
-                        None => return false,
-                    };
-                    let off = _rva as usize;
-                    if off >= img.len() {
-                        return false;
-                    }
-                    // Ghost = executable code at a gap (no .pdata). Strongest
-                    // signal: a leaf return (C3 ret / C2 imm16 ret / E8 rel32
-                    // call thunk). Treat C3/C2/E8 as ghost candidates.
-                    matches!(img[off], 0xC3 | 0xC2 | 0xE8)
-                },
-                // nop_pred: alignment / padding fills (`90` nop, `CC` int3, or
-                // a run of zero bytes) between functions, plus multi-byte NOPs.
-                |_rva, image| -> bool {
-                    let img = match image {
-                        Some(b) => b,
-                        None => return false,
-                    };
-                    let off = _rva as usize;
-                    if off >= img.len() {
-                        return false;
-                    }
-                    let b = img[off];
-                    b == 0x90
-                        || b == 0xCC
-                        || b == 0x00
-                        || (b == 0x66 && off + 1 < img.len() && img[off + 1] == 0x90)
-                },
-            );
-            // Promote RVAs to absolute addresses so downstream kits (frame
-            // chains, leaf-bridge synthesis) get directly-usable pointers.
-            let base_usize = base as usize;
-            for a in per_module.gaps.iter_mut() {
-                *a += base_usize;
-            }
-            for a in per_module.ghosts.iter_mut() {
-                *a += base_usize;
-            }
-            for a in per_module.nops.iter_mut() {
-                *a += base_usize;
-            }
-            for a in per_module.tails.iter_mut() {
-                *a += base_usize;
-            }
-            pool.gaps.extend_from_slice(&per_module.gaps);
-            pool.ghosts.extend_from_slice(&per_module.ghosts);
-            pool.nops.extend_from_slice(&per_module.nops);
-            pool.tails.extend_from_slice(&per_module.tails);
+            scan_module(name, &mut pool);
         }
         if !pool.is_usable() {
             // No gaps anywhere = something is badly wrong (every Win10/11/Server
@@ -145,17 +59,128 @@ impl PdataGapScanner for LivePdataScanner {
         // defeat return-address-in-module validation (the unwinder's final frame
         // resolves to a legit signed module). We pick a few well-known leaf-like
         // exports whose addresses are stable and non-sensitive.
-        let backed_targets: &[(&[u8], &[u8])] = &[
-            (b"ntdll.dll", b"NtDelayExecution"),
-            (b"ntdll.dll", b"NtClose"),
-            (b"kernelbase.dll", b"Sleep"),
-        ];
-        for &(module, func) in backed_targets {
-            if let Some(addr) = unsafe { resolve::export_addr(module, func) } {
-                pool.backed.push(addr);
-            }
-        }
+        populate_backed_targets(&mut pool);
         Ok(pool)
+    }
+}
+
+/// Scan one whitelisted DLL: resolve its base, read its `.pdata` exception
+/// directory, run the pure gap core and merge the results into `pool`.
+fn scan_module(name: &[u8], pool: &mut GapPool) {
+    // SAFETY: PEB walk reads loader state stable post-load; pdata_view
+    // reads a loader-owned, committed section. A module not in the
+    // loader list simply yields None and is skipped.
+    let base = unsafe { resolve::module_base_by_name(name) };
+    let base = match base {
+        Some(b) => b,
+        None => return, // win32u/wow64 may be absent — skip, not fatal
+    };
+    let view = match unsafe { resolve::pdata_view(base) } {
+        Some(v) => v,
+        None => return, // module mapped but no .pdata — skip
+    };
+    // Pure core: bytes → sorted RUNTIME_FUNCTION_ENTRY list.
+    let entries = gap::RuntimeFunctionEntry::parse_table(view.bytes);
+    // Pure core: entries → gap RVAs (inter-function + tail), sampled
+    // every 8 bytes, capped at MAX_PER_GAP per range.
+    let gaps = gap::enumerate_gaps(&entries, view.image_size, MAX_PER_GAP);
+    if gaps.is_empty() {
+        return;
+    }
+    classify_module(base, &gaps, view.image_size, pool);
+}
+
+/// Classify each gap RVA into gaps/ghosts/nops via byte-pattern predicates
+/// read from the live image, promote RVAs to absolute addresses and merge
+/// the result into `pool`. `image` is the raw bytes from `[base,
+/// base+image_size)` so the predicates can inspect the byte at each gap RVA.
+fn classify_module(base: *mut u8, gaps: &[gap::Gap], image_size: u32, pool: &mut GapPool) {
+    // SAFETY: the whole module image is mapped readable; reading one
+    // byte at an in-range RVA is sound.
+    let image_bytes = unsafe { core::slice::from_raw_parts(base, image_size as usize) };
+    let mut per_module = gap::classify_into_pool(
+        gaps,
+        Some(image_bytes),
+        // ghost_pred: a real executable byte at the gap → a "ghost"
+        // function (code with no .pdata entry). `C3` (ret) at a gap
+        // strongly implies a tiny leaf/thunk lives there. Treat any
+        // non-zero, non-padding byte as a ghost candidate.
+        ghost_pred,
+        // nop_pred: alignment / padding fills (`90` nop, `CC` int3, or
+        // a run of zero bytes) between functions, plus multi-byte NOPs.
+        nop_pred,
+    );
+    // Promote RVAs to absolute addresses so downstream kits (frame
+    // chains, leaf-bridge synthesis) get directly-usable pointers.
+    let base_usize = base as usize;
+    for a in per_module.gaps.iter_mut() {
+        *a += base_usize;
+    }
+    for a in per_module.ghosts.iter_mut() {
+        *a += base_usize;
+    }
+    for a in per_module.nops.iter_mut() {
+        *a += base_usize;
+    }
+    for a in per_module.tails.iter_mut() {
+        *a += base_usize;
+    }
+    pool.gaps.extend_from_slice(&per_module.gaps);
+    pool.ghosts.extend_from_slice(&per_module.ghosts);
+    pool.nops.extend_from_slice(&per_module.nops);
+    pool.tails.extend_from_slice(&per_module.tails);
+}
+
+/// ghost_pred: a real executable byte at the gap → a "ghost" function (code
+/// with no .pdata entry). `C3` (ret) at a gap strongly implies a tiny
+/// leaf/thunk lives there. Treat any non-zero, non-padding byte as a ghost
+/// candidate. Strongest signal: a leaf return (C3 ret / C2 imm16 ret / E8
+/// rel32 call thunk). Treat C3/C2/E8 as ghost candidates.
+fn ghost_pred(_rva: u32, image: Option<&[u8]>) -> bool {
+    let img = match image {
+        Some(b) => b,
+        None => return false,
+    };
+    let off = _rva as usize;
+    if off >= img.len() {
+        return false;
+    }
+    matches!(img[off], 0xC3 | 0xC2 | 0xE8)
+}
+
+/// nop_pred: alignment / padding fills (`90` nop, `CC` int3, or a run of zero
+/// bytes) between functions, plus multi-byte NOPs.
+fn nop_pred(_rva: u32, image: Option<&[u8]>) -> bool {
+    let img = match image {
+        Some(b) => b,
+        None => return false,
+    };
+    let off = _rva as usize;
+    if off >= img.len() {
+        return false;
+    }
+    let b = img[off];
+    b == 0x90
+        || b == 0xCC
+        || b == 0x00
+        || (b == 0x66 && off + 1 < img.len() && img[off + 1] == 0x90)
+}
+
+/// LACUNA layer 5: populate the `backed` pool with real `.pdata`-covered
+/// ntdll/kernelbase function addresses to use as chain terminators. These
+/// defeat return-address-in-module validation (the unwinder's final frame
+/// resolves to a legit signed module). We pick a few well-known leaf-like
+/// exports whose addresses are stable and non-sensitive.
+fn populate_backed_targets(pool: &mut GapPool) {
+    let backed_targets: &[(&[u8], &[u8])] = &[
+        (b"ntdll.dll", b"NtDelayExecution"),
+        (b"ntdll.dll", b"NtClose"),
+        (b"kernelbase.dll", b"Sleep"),
+    ];
+    for &(module, func) in backed_targets {
+        if let Some(addr) = unsafe { resolve::export_addr(module, func) } {
+            pool.backed.push(addr);
+        }
     }
 }
 
