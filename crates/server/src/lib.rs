@@ -1498,81 +1498,24 @@ fn handle_new_session(
 
     // Validate one-time auth_token if present (per-implant generated implants).
     // Legacy implants (compile-time config, no token) skip this check.
+    handle_new_session_validate_token(st, raw, &info)?;
+
+    handle_new_session_register(st, peer, raw, key, info)
+}
+
+/// Validate one-time auth_token if present (per-implant generated implants).
+/// Legacy implants (compile-time config, no token) skip this check.
+fn handle_new_session_validate_token(
+    st: &AppState,
+    raw: &nyx_protocol::RawFrame,
+    info: &SessionInfo,
+) -> anyhow::Result<()> {
     if let Some(ref token) = info.auth_token {
         let mut hasher = sha2::Sha256::new();
         hasher.update(token);
         let token_hash = hex::encode(hasher.finalize());
-
         match &st.implants {
-            Some(store) => {
-                match store.get_by_token_hash(&token_hash) {
-                    Ok(Some(rec)) => {
-                        // The one-time token is BOUND to the implant it was
-                        // issued to (implant_gen stores `implant_pub` per token
-                        // record). The check-in's claimed pubkey must match:
-                        // a holder of a token extracted from a captured binary
-                        // (or the raw token persisted in the sessions table)
-                        // must not be able to register under an attacker-chosen
-                        // pubkey. Fail closed on mismatch, BEFORE consuming.
-                        if rec.implant_pub != hex::encode(raw.pubkey) {
-                            tracing::warn!(
-                                token_pub = %rec.implant_pub,
-                                claimed_pub = %hex::encode(raw.pubkey),
-                                "auth_token presented for a different implant pubkey — rejecting"
-                            );
-                            anyhow::bail!("auth_token belongs to a different implant pubkey");
-                        }
-                        // Token validated — now atomically consume it. The
-                        // consume is the anti-replay claim for one-time tokens:
-                        // a concurrent check-in carrying the same token loses
-                        // the UPDATE race (0 rows) and must be REJECTED, and a
-                        // store error means the token may still be replayable —
-                        // also rejected. Fail CLOSED: never accept a check-in
-                        // whose token consumption wasn't confirmed.
-                        match store.mark_token_used(&rec.implant_pub) {
-                            Ok(true) => {
-                                tracing::info!(
-                                    implant_pub = %rec.implant_pub,
-                                    implant_id = rec.id,
-                                    "auth_token validated and consumed"
-                                );
-                            }
-                            Ok(false) => {
-                                tracing::warn!(
-                                    implant_pub = %rec.implant_pub,
-                                    implant_id = rec.id,
-                                    "mark_token_used consumed 0 rows; token already claimed by \
-                                     a concurrent check-in — rejecting"
-                                );
-                                anyhow::bail!("auth_token already consumed by another check-in");
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    implant_pub = %rec.implant_pub,
-                                    implant_id = rec.id,
-                                    "mark_token_used failed; one-time token may be replayable — \
-                                     rejecting check-in"
-                                );
-                                anyhow::bail!("auth_token consumption failed; rejecting check-in");
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // Token not found, already used, or revoked.
-                        anyhow::bail!(
-                            "auth_token rejected: not found, already consumed, or revoked"
-                        );
-                    }
-                    Err(e) => {
-                        // Store error — fail CLOSED: a store that can't
-                        // validate a presented one-time token must NOT allow
-                        // the check-in (the token may be replayed/revoked).
-                        tracing::warn!(error = %e, "implant store error during token check; rejecting check-in");
-                        anyhow::bail!("auth_token present but cannot validate: store error");
-                    }
-                }
-            }
+            Some(store) => handle_new_session_consume_token(raw, store, &token_hash),
             None => {
                 // No implant store — token was sent but can't be validated.
                 // Fail CLOSED: an unvalidatable one-time token must not allow
@@ -1583,8 +1526,102 @@ fn handle_new_session(
                 anyhow::bail!("auth_token present but cannot validate: no store");
             }
         }
+    } else {
+        Ok(())
     }
+}
 
+/// Look up the presented token hash in the implant store and atomically consume
+/// the token. Fail CLOSED on any store error: a store that can't validate a
+/// presented one-time token must NOT allow the check-in (the token may be
+/// replayed/revoked).
+fn handle_new_session_consume_token(
+    raw: &nyx_protocol::RawFrame,
+    store: &Arc<nyx_store::ImplantStore>,
+    token_hash: &str,
+) -> anyhow::Result<()> {
+    match store.get_by_token_hash(token_hash) {
+        Ok(Some(rec)) => {
+            // The one-time token is BOUND to the implant it was
+            // issued to (implant_gen stores `implant_pub` per token
+            // record). The check-in's claimed pubkey must match:
+            // a holder of a token extracted from a captured binary
+            // (or the raw token persisted in the sessions table)
+            // must not be able to register under an attacker-chosen
+            // pubkey. Fail closed on mismatch, BEFORE consuming.
+            if rec.implant_pub != hex::encode(raw.pubkey) {
+                tracing::warn!(
+                    token_pub = %rec.implant_pub,
+                    claimed_pub = %hex::encode(raw.pubkey),
+                    "auth_token presented for a different implant pubkey — rejecting"
+                );
+                anyhow::bail!("auth_token belongs to a different implant pubkey");
+            }
+            handle_new_session_consume_token_record(store, &rec)
+        }
+        Ok(None) => {
+            // Token not found, already used, or revoked.
+            anyhow::bail!("auth_token rejected: not found, already consumed, or revoked");
+        }
+        Err(e) => {
+            // Store error — fail CLOSED: a store that can't
+            // validate a presented one-time token must NOT allow
+            // the check-in (the token may be replayed/revoked).
+            tracing::warn!(error = %e, "implant store error during token check; rejecting check-in");
+            anyhow::bail!("auth_token present but cannot validate: store error");
+        }
+    }
+}
+
+/// A matching token record: the anti-replay consume via `mark_token_used`. A
+/// concurrent check-in carrying the same token loses the UPDATE race (0 rows)
+/// and must be REJECTED, and a store error means the token may still be
+/// replayable — also rejected. Fail CLOSED: never accept a check-in whose
+/// token consumption wasn't confirmed.
+fn handle_new_session_consume_token_record(
+    store: &Arc<nyx_store::ImplantStore>,
+    rec: &nyx_store::ImplantRecord,
+) -> anyhow::Result<()> {
+    match store.mark_token_used(&rec.implant_pub) {
+        Ok(true) => {
+            tracing::info!(
+                implant_pub = %rec.implant_pub,
+                implant_id = rec.id,
+                "auth_token validated and consumed"
+            );
+        }
+        Ok(false) => {
+            tracing::warn!(
+                implant_pub = %rec.implant_pub,
+                implant_id = rec.id,
+                "mark_token_used consumed 0 rows; token already claimed by \
+                 a concurrent check-in — rejecting"
+            );
+            anyhow::bail!("auth_token already consumed by another check-in");
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                implant_pub = %rec.implant_pub,
+                implant_id = rec.id,
+                "mark_token_used failed; one-time token may be replayable — \
+                 rejecting check-in"
+            );
+            anyhow::bail!("auth_token consumption failed; rejecting check-in");
+        }
+    }
+    Ok(())
+}
+
+/// Registration stage: log the new session, snapshot the scripting-event /
+/// fingerprint / persist payloads, then atomically check-and-insert.
+fn handle_new_session_register(
+    st: &AppState,
+    peer: &std::net::SocketAddr,
+    raw: &nyx_protocol::RawFrame,
+    key: SessionKey,
+    info: SessionInfo,
+) -> anyhow::Result<Vec<u8>> {
     tracing::info!(
         beacon_id = info.beacon_id,
         host = %info.hostname,
@@ -1592,20 +1629,7 @@ fn handle_new_session(
         os = %info.os,
         "new session registered"
     );
-    let new_event = nyx_scripting::Event::SessionNew(nyx_scripting::SessionNew {
-        session_id: hex::encode(raw.pubkey),
-        hostname: info.hostname.clone(),
-        username: info.username.clone(),
-        os: info.os.clone(),
-        is_admin: info.is_admin == 1,
-    });
-    // Pop the inbound TLS fingerprint the sniffer captured for this peer
-    // (TLS path). On plaintext (dev) or when sniff failed, both stay None.
-    let fp = st
-        .fingerprints
-        .remove(peer)
-        .map(|(_, v)| v)
-        .unwrap_or_default();
+    let (new_event, fp) = handle_new_session_build_event(st, peer, raw, &info);
     // Clone before moving into the Session struct — the reply below still
     // needs &key to seal the empty-task batch. (SessionKey is no longer Copy
     // so it has a real Drop that zeroizes; the clone is zeroized on drop.)
@@ -1626,7 +1650,42 @@ fn handle_new_session(
         info.auth_token,
     );
     let boot_time = now_unix();
-    let session = Session {
+    let session = handle_new_session_build_session(raw, key, info, fp);
+    handle_new_session_insert(st, raw, session, new_event, persist_id, persist_info, boot_time, reply_key)
+}
+
+/// Build the `SessionNew` scripting event and pop the inbound TLS fingerprint
+/// the sniffer captured for this peer (TLS path). On plaintext (dev) or when
+/// sniff failed, both stay None.
+fn handle_new_session_build_event(
+    st: &AppState,
+    peer: &std::net::SocketAddr,
+    raw: &nyx_protocol::RawFrame,
+    info: &SessionInfo,
+) -> (nyx_scripting::Event, Fingerprint) {
+    let new_event = nyx_scripting::Event::SessionNew(nyx_scripting::SessionNew {
+        session_id: hex::encode(raw.pubkey),
+        hostname: info.hostname.clone(),
+        username: info.username.clone(),
+        os: info.os.clone(),
+        is_admin: info.is_admin == 1,
+    });
+    let fp = st
+        .fingerprints
+        .remove(peer)
+        .map(|(_, v)| v)
+        .unwrap_or_default();
+    (new_event, fp)
+}
+
+/// Build the [`Session`] struct for a fresh registration.
+fn handle_new_session_build_session(
+    raw: &nyx_protocol::RawFrame,
+    key: SessionKey,
+    info: SessionInfo,
+    fp: Fingerprint,
+) -> Session {
+    Session {
         key,
         info,
         last_recv: raw.counter,
@@ -1641,23 +1700,35 @@ fn handle_new_session(
         stale: false,
         owner: None,
         persisted_last_touch: Instant::now(),
-    };
-    // Atomically check-and-insert via `entry()`. This fully closes the
-    // TOCTOU that previously existed between `contains_key` and
-    // `or_insert_with` (two separate lock acquisitions): two concurrent
-    // check-ins carrying the same ephemeral pubkey + counter=0 could BOTH
-    // see `contains_key == false`, both proceed into the "newly inserted"
-    // branch, and both emit `encode_frame_dir(ServerToClient, 0, ...)` —
-    // reusing AEAD nonce 0 under the same session key and breaking the
-    // (key, nonce) uniqueness invariant of ChaCha20-Poly1305.
-    //
-    // `Entry::Vacant` holds the DashMap shard write lock across both the
-    // vacancy check AND the insert, so exactly one racer observes Vacant
-    // (winner: fires SessionNew, persists, replies S2C:0) while the other
-    // observes Occupied (loser: bails with a clean error → 400, no second
-    // S2C:0 frame). The loser's next beacon cycle arrives as an existing
-    // session. The loser's pre-built `session` is dropped unused (its
-    // SessionKey zeroizes on Drop).
+    }
+}
+
+/// Atomically check-and-insert via `entry()`. This fully closes the
+/// TOCTOU that previously existed between `contains_key` and
+/// `or_insert_with` (two separate lock acquisitions): two concurrent
+/// check-ins carrying the same ephemeral pubkey + counter=0 could BOTH
+/// see `contains_key == false`, both proceed into the "newly inserted"
+/// branch, and both emit `encode_frame_dir(ServerToClient, 0, ...)` —
+/// reusing AEAD nonce 0 under the same session key and breaking the
+/// (key, nonce) uniqueness invariant of ChaCha20-Poly1305.
+///
+/// `Entry::Vacant` holds the DashMap shard write lock across both the
+/// vacancy check AND the insert, so exactly one racer observes Vacant
+/// (winner: fires SessionNew, persists, replies S2C:0) while the other
+/// observes Occupied (loser: bails with a clean error → 400, no second
+/// S2C:0 frame). The loser's next beacon cycle arrives as an existing
+/// session. The loser's pre-built `session` is dropped unused (its
+/// SessionKey zeroizes on Drop).
+fn handle_new_session_insert(
+    st: &AppState,
+    raw: &nyx_protocol::RawFrame,
+    session: Session,
+    new_event: nyx_scripting::Event,
+    persist_id: String,
+    persist_info: (u32, String, String, String, u8, u32, u8, Option<[u8; 32]>),
+    boot_time: u64,
+    reply_key: SessionKey,
+) -> anyhow::Result<Vec<u8>> {
     match st.sessions.entry(raw.pubkey) {
         Entry::Vacant(v) => {
             // Winner: insert the session, then fire event + persist + reply.
@@ -1665,61 +1736,7 @@ fn handle_new_session(
             // the shard lock stays held through the whole match arm.
             v.insert(session);
             st.events.fire(&new_event);
-            // Persist full session metadata so the registry survives a team-
-            // server restart. Fire-and-forget off the hot path: the upsert
-            // hands an owned record to the background writer thread, so a
-            // slow disk can never block this check-in. Only the race-winner
-            // persists (the loser bails below), so there's no double-write.
-            if let Some(persist) = &st.sessions_db {
-                let (beacon_id, hostname, username, os, arch, pid, is_admin, auth_token) =
-                    persist_info;
-                persist.upsert(nyx_store::SessionRecord {
-                    session_id: persist_id,
-                    beacon_id,
-                    hostname,
-                    username,
-                    os,
-                    arch,
-                    pid,
-                    is_admin,
-                    first_seen: boot_time,
-                    last_seen: boot_time,
-                    // Persist the C2S watermark from THIS check-in so a restart
-                    // right after registration keeps the anti-replay continuity
-                    // (the next beacon, counter+1, passes the restored check).
-                    // No S2C frame was sent yet, so send_counter is 0.
-                    send_counter: 0,
-                    last_recv: raw.counter,
-                    // Persist only the SHA-256 of the one-time token — NEVER
-                    // the raw 32 bytes. The `implants` table stores the same
-                    // hash (implant_gen hashes before insert), so a leaked DB
-                    // file (backup / IR copy) yields no replayable token
-                    // material. The restore path never replays it (auth_token
-                    // is set to None there), so this column is forensic, not
-                    // auth state — a hash preserves the forensic linkage
-                    // without exposing the secret.
-                    auth_token: auth_token.map(|t| {
-                        let mut h = sha2::Sha256::new();
-                        h.update(t);
-                        h.finalize().to_vec()
-                    }),
-                    // Operator ownership is set only via the ownership API;
-                    // a check-in never claims a session.
-                    owner: None,
-                });
-            }
-            // No tasks queued yet — reply with an empty batch.
-            // Reply sealed in the server→implant nonce space
-            // (Direction::ServerToClient) so it never collides with the
-            // implant's own Tx nonces under the shared key.
-            Ok(encode_frame_dir(
-                &raw.pubkey,
-                Direction::ServerToClient,
-                0,
-                &reply_key,
-                &Task::encode_vec(&[])?,
-            )
-            .map_err(|e| anyhow::anyhow!("failed to seal S2C:0 reply: {e}"))?)
+            handle_new_session_winner(st, raw, persist_id, persist_info, boot_time, reply_key)
         }
         Entry::Occupied(_) => {
             // Lost the check-in race: the other thread already registered the
@@ -1728,6 +1745,95 @@ fn handle_new_session(
             anyhow::bail!("concurrent check-in race: session already registered");
         }
     }
+}
+
+/// Race-winner path: persist the full session metadata (fire-and-forget off
+/// the hot path — only the race-winner persists, so there's no double-write),
+/// then reply with an empty task batch sealed in the server→implant nonce
+/// space (Direction::ServerToClient) so it never collides with the implant's
+/// own Tx nonces under the shared key.
+fn handle_new_session_winner(
+    st: &AppState,
+    raw: &nyx_protocol::RawFrame,
+    persist_id: String,
+    persist_info: (u32, String, String, String, u8, u32, u8, Option<[u8; 32]>),
+    boot_time: u64,
+    reply_key: SessionKey,
+) -> anyhow::Result<Vec<u8>> {
+    // Persist full session metadata so the registry survives a team-
+    // server restart. Fire-and-forget off the hot path: the upsert
+    // hands an owned record to the background writer thread, so a
+    // slow disk can never block this check-in. Only the race-winner
+    // persists (the loser bails below), so there's no double-write.
+    if let Some(persist) = &st.sessions_db {
+        handle_new_session_persist_winner(
+            persist,
+            persist_id,
+            persist_info,
+            boot_time,
+            raw.counter,
+        );
+    }
+    // No tasks queued yet — reply with an empty batch.
+    // Reply sealed in the server→implant nonce space
+    // (Direction::ServerToClient) so it never collides with the
+    // implant's own Tx nonces under the shared key.
+    Ok(encode_frame_dir(
+        &raw.pubkey,
+        Direction::ServerToClient,
+        0,
+        &reply_key,
+        &Task::encode_vec(&[])?,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to seal S2C:0 reply: {e}"))?)
+}
+
+/// Persist the race-winner's full session metadata so the registry survives a
+/// team-server restart. Fire-and-forget off the hot path: the upsert hands an
+/// owned record to the background writer thread, so a slow disk can never
+/// block this check-in.
+fn handle_new_session_persist_winner(
+    persist: &Arc<SessionPersistence>,
+    persist_id: String,
+    persist_info: (u32, String, String, String, u8, u32, u8, Option<[u8; 32]>),
+    boot_time: u64,
+    last_recv: u64,
+) {
+    let (beacon_id, hostname, username, os, arch, pid, is_admin, auth_token) = persist_info;
+    persist.upsert(nyx_store::SessionRecord {
+        session_id: persist_id,
+        beacon_id,
+        hostname,
+        username,
+        os,
+        arch,
+        pid,
+        is_admin,
+        first_seen: boot_time,
+        last_seen: boot_time,
+        // Persist the C2S watermark from THIS check-in so a restart
+        // right after registration keeps the anti-replay continuity
+        // (the next beacon, counter+1, passes the restored check).
+        // No S2C frame was sent yet, so send_counter is 0.
+        send_counter: 0,
+        last_recv,
+        // Persist only the SHA-256 of the one-time token — NEVER
+        // the raw 32 bytes. The `implants` table stores the same
+        // hash (implant_gen hashes before insert), so a leaked DB
+        // file (backup / IR copy) yields no replayable token
+        // material. The restore path never replays it (auth_token
+        // is set to None there), so this column is forensic, not
+        // auth state — a hash preserves the forensic linkage
+        // without exposing the secret.
+        auth_token: auth_token.map(|t| {
+            let mut h = sha2::Sha256::new();
+            h.update(t);
+            h.finalize().to_vec()
+        }),
+        // Operator ownership is set only via the ownership API;
+        // a check-in never claims a session.
+        owner: None,
+    });
 }
 
 /// Re-admit a session whose first post-restart message is a [`TaskResponse`]
