@@ -12,9 +12,16 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-05 WP-A: AH-2 巨函数拆分完成 — 冻结清单 140 个 >50 行非测试函数全部拆至
+<50 行（transport 6 / server 27 / implant-win 107），纯 extract-method、零行为变更；
+执行：Task 0-57 全部完成；质量：15 簇对抗评审（34 条 low 接受/记录，1 条 medium +
+2 条 low 修复：write_panic_diag unsafe 上下文恢复（nyx_diag 构建）、do_download
+句柄每路径恰关一次、into_command fmt 稳定化）；终验：复扫 0、fmt/clippy/test 全绿、
+implant-win base+selftest+nyx_diag 三配置交叉检查 Finished。
+
 2026-08-03 wW: full wiring sweep — every documented "未接线" item closed.
-Working tree — entries cite `file:line` evidence; backfill SHAs when the wave
-is committed.
+Committed (2026-08-03) — SHAs `1826a35` (feat(wiring))、`282007f`
+(fix(smb-listener)).
 
 ### Added
 
@@ -124,12 +131,13 @@ is committed.
   operator-side via `nyx-kernel assess` (`crates/implant-win/src/trex/mod.rs`).
 
 2026-08-02 zero-leftover sweep (work packages w-inject / w-misc / w-kernel-relay /
-w-gc / w-transport / w-offsets / w-pattern / w-docs-cleanup). IN PROGRESS — working
-tree, so entries cite `file:line` evidence; backfill SHAs when the wave is committed.
+w-gc / w-transport / w-offsets / w-pattern / w-docs-cleanup). Committed
+(2026-08-02/03) — SHAs `922cbfb` (fix(zero-sweep))、`7c86fba` (fix(zero-sweep2))、
+`219ff7a` (feat(zero-leftovers))、`dbff55a` (fix(ci): shim tests serialized).
 
 ### Fixed
 
-- **Zero-leftover sweep scope (in progress).** Per-package contracts:
+- **Zero-leftover sweep scope (committed 2026-08-02/03).** Per-package contracts:
   - w-inject: `module_stomp` owns cleanup — both handles closed + `TerminateProcess`
     on every non-success path, disarmed-OK path returns Drop-guarded handles
     (`crates/implant-win/src/inject.rs`); `BeaconInformation` shim rewritten to the CS

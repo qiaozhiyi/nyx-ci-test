@@ -4,7 +4,7 @@
 
 纯 Rust 全栈 C2 框架,融合 Cobalt Strike 的可扩展性与 Brute Ratel 的默认隐蔽性。**所有能力状态以代码核对为准**(本次 README 于 2026-07-18 经 6 路并行代码审计重写,每条声称附 `file:line` 证据)。
 
-> ⚠️ **证据时效(2026-07-21)**:本日一批 P0 修复合并,改 16 个文件(`beacon.rs`/`fs.rs`/`ntalloc.rs`/`screenshot.rs`/`entry.rs`/`syscalls.rs`/`envprobe.rs`/`hookchain.rs`/`selftests.rs`/`sleep.rs`/`channels/mod.rs` + 3 workflow yml + 2 ps1 脚本)。正文 `file:line` 证据可能因行号偏移/函数签名变更/截图捕获序列重写而滞后数行;**canonical truth 以 `git log --oneline -10` + 实际源码为准**。查当前状态:`git log --oneline -- crates/implant-win/src/` 与 `git diff 2026-07-18..HEAD -- crates/implant-win/src/`。
+> ⚠️ **证据时效（2026-08-05）**：本日一批 P0 修复合并，改 16 个文件（`beacon.rs`/`fs.rs`/`ntalloc.rs`/`screenshot.rs`/`entry.rs`/`syscalls.rs`/`envprobe.rs`/`hookchain.rs`/`selftests.rs`/`sleep.rs`/`channels/mod.rs` + 3 workflow yml + 2 ps1 脚本）。正文 `file:line` 证据可能因行号偏移/函数签名变更/截图捕获序列重写而滞后数行；**canonical truth 以 `git log --oneline -10` + 实际源码为准**。查当前状态：`git log --oneline -- crates/implant-win/src/` 与 `git diff 2026-07-18..HEAD -- crates/implant-win/src/`。
 
 > 📋 **完整审计报告**:[`docs/audits/CODE_TRUTH_2026-07-18.md`](docs/audits/CODE_TRUTH_2026-07-18.md)(逐 crate 证据) · [`AUTHORITATIVE_FACTS_2026-07-18.md`](docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md)(数字基准,所有文档统一来源)
 
@@ -22,7 +22,7 @@
 | **内核层 SDK** | BYOVD(Shield/RTCore64/Iqvw64e 可用,WDTKernel 物理内存 stub);ETW-TI blind(4-hop);DKOM 进程隐藏;回调中和+重定向;MiniFilter 解链;PPL stripper;CFG bitmap;LSASS 内核读;minidump 组装;ETW 事件伪造 | ✅ 算法完整 + mock 测试;PatchGuard 偏移未验证 |
 | **操作端** | Tauri 2 + React + Three.js 桌面 GUI(3D 网络拓扑 + 语义化命令 + 结构化输出);REST API;2s 轮询增量更新 | ✅ 可用(2026-07-17 接入全部 server 端点);无会话元数据 overlay |
 | **脚本 / 扩展** | Rhai 脚本(3 event,资源配额);Malleable C2 profile(c2lint);BOF(CS ABI `go(args,alen)`,W^X 加载,`BeaconPrintf` + kernel32/ntdll externals 表) | ✅ 脚本可用 / 🟡 BOF 兼容面仍窄 |
-| **传输层** | 6 个 `Transport` trait impl(Malleable/DoH/Slack/LLM/MCP/SMB)+ JA3/JA4 计算 | 🟡 **部分接线**:JA3/JA4 接入 server listener;Slack/MCP 经 boot-time `TransportStack` 中转(`extc2_relay.rs:57-59,122-127,214-218`);其余 4 通道 stack-ready 待接路由;implant 侧自滚通道(no_std PIC 设计) |
+| **传输层** | 6 个 `Transport` trait impl（Malleable/DoH/Slack/LLM/MCP/SMB）+ JA3/JA4 计算 | ✅ 4 个 extc2 中继（Slack/LLM/Discord/MCP）全接 boot-time `TransportStack`；DoH 权威应答器、SMB/TCP pivot 父监听已落地（2026-08-03 接线波次） |
 
 ---
 
