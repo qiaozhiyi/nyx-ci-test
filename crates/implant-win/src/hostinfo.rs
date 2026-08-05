@@ -169,6 +169,28 @@ pub fn is_admin() -> u8 {
     if !force_load(b"advapi32.dll") {
         return 0;
     }
+    let gcp = match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") } {
+        Some(a) => a,
+        None => return 0,
+    };
+    let opt = match unsafe { export_addr(b"advapi32.dll", b"OpenProcessToken") } {
+        Some(a) => a,
+        None => return 0,
+    };
+    let gti = match unsafe { export_addr(b"advapi32.dll", b"GetTokenInformation") } {
+        Some(a) => a,
+        None => return 0,
+    };
+    let close = match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
+        Some(a) => a,
+        None => return 0,
+    };
+    is_admin_query(gcp, opt, gti, close)
+}
+
+/// Resolve the token APIs from raw addresses, open the current process token,
+/// and query `TokenElevation`; returns 1 if elevated, 0 otherwise.
+fn is_admin_query(gcp: usize, opt: usize, gti: usize, close: usize) -> u8 {
     type GetCurrentProcess = unsafe extern "system" fn() -> *mut c_void;
     type OpenProcessToken = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
     type GetTokenInformation = unsafe extern "system" fn(
@@ -180,24 +202,10 @@ pub fn is_admin() -> u8 {
     ) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
 
-    let gcp: GetCurrentProcess = match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") }
-    {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return 0,
-    };
-    let opt: OpenProcessToken = match unsafe { export_addr(b"advapi32.dll", b"OpenProcessToken") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return 0,
-    };
-    let gti: GetTokenInformation =
-        match unsafe { export_addr(b"advapi32.dll", b"GetTokenInformation") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return 0,
-        };
-    let close: CloseHandle = match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return 0,
-    };
+    let gcp: GetCurrentProcess = unsafe { core::mem::transmute(gcp) };
+    let opt: OpenProcessToken = unsafe { core::mem::transmute(opt) };
+    let gti: GetTokenInformation = unsafe { core::mem::transmute(gti) };
+    let close: CloseHandle = unsafe { core::mem::transmute(close) };
 
     // TOKEN_QUERY = 0x0008.
     let proc = unsafe { gcp() };
@@ -255,30 +263,44 @@ pub fn machine_sid() -> Option<[u8; 68]> {
     if !force_load(b"advapi32.dll") {
         return None;
     }
+    let gcp = match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let opt = match unsafe { export_addr(b"advapi32.dll", b"OpenProcessToken") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let gti = match unsafe { export_addr(b"advapi32.dll", b"GetTokenInformation") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let close = match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let (buf, token) = machine_sid_query(gcp, opt, gti, close)?;
+    machine_sid_extract(close, token, &buf)
+}
+
+/// Open the current process token and query `TokenUser` into a stack buffer.
+/// Closes the token on query failure; the caller must close it on success.
+fn machine_sid_query(
+    gcp: usize,
+    opt: usize,
+    gti: usize,
+    close: usize,
+) -> Option<([u8; 128], *mut c_void)> {
     type GetCurrentProcess = unsafe extern "system" fn() -> *mut c_void;
     type OpenProcessToken = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
     type GetTokenInformation =
         unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
 
-    let gcp: GetCurrentProcess = match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") }
-    {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return None,
-    };
-    let opt: OpenProcessToken = match unsafe { export_addr(b"advapi32.dll", b"OpenProcessToken") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return None,
-    };
-    let gti: GetTokenInformation =
-        match unsafe { export_addr(b"advapi32.dll", b"GetTokenInformation") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return None,
-        };
-    let close: CloseHandle = match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return None,
-    };
+    let gcp: GetCurrentProcess = unsafe { core::mem::transmute(gcp) };
+    let opt: OpenProcessToken = unsafe { core::mem::transmute(opt) };
+    let gti: GetTokenInformation = unsafe { core::mem::transmute(gti) };
+    let close: CloseHandle = unsafe { core::mem::transmute(close) };
 
     let proc = unsafe { gcp() };
     let mut token: *mut c_void = core::ptr::null_mut();
@@ -300,6 +322,14 @@ pub fn machine_sid() -> Option<[u8; 68]> {
         unsafe { close(token) };
         return None;
     }
+
+    Some((buf, token))
+}
+
+/// Copy the SID bytes out of the `TokenUser` buffer and close the token.
+fn machine_sid_extract(close: usize, token: *mut c_void, buf: &[u8; 128]) -> Option<[u8; 68]> {
+    type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+    let close: CloseHandle = unsafe { core::mem::transmute(close) };
 
     // The SID pointer lives at buf[0..8] on x64.
     let sid_ptr = unsafe { *(buf.as_ptr() as *const usize) } as *const u8;
@@ -353,6 +383,11 @@ pub fn primary_mac() -> Option<[u8; 6]> {
         return None;
     }
 
+    primary_mac_parse(&buf)
+}
+
+/// Extract the MAC from a populated `IP_ADAPTER_INFO` buffer.
+fn primary_mac_parse(buf: &[u8]) -> Option<[u8; 6]> {
     // IP_ADAPTER_INFO layout (x64):
     //   +0x00  Next           (8 B  pointer)
     //   +0x08  ComboIndex     (4 B  DWORD)
