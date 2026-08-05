@@ -328,6 +328,28 @@ unsafe fn scan_service_manager(assessment: &mut TargetAssessment) {
         return;
     }
 
+    let needed = match scan_service_manager_probe_size(scm) {
+        Some(n) => n,
+        None => {
+            close_sc_manager(scm);
+            return;
+        }
+    };
+
+    let buf = alloc(needed as usize);
+    if buf.is_null() {
+        close_sc_manager(scm);
+        return;
+    }
+
+    scan_service_manager_collect(scm, buf, needed, assessment);
+
+    free(buf);
+    close_sc_manager(scm);
+}
+
+/// First EnumServicesStatusExW call: queries the required buffer size.
+unsafe fn scan_service_manager_probe_size(scm: Handle) -> Option<u32> {
     let mut needed: u32 = 0;
     let mut returned: u32 = 0;
     let mut resume: u32 = 0;
@@ -347,16 +369,21 @@ unsafe fn scan_service_manager(assessment: &mut TargetAssessment) {
     );
 
     if needed == 0 {
-        close_sc_manager(scm);
-        return;
+        return None;
     }
+    Some(needed)
+}
 
-    let buf = alloc(needed as usize);
-    if buf.is_null() {
-        close_sc_manager(scm);
-        return;
-    }
-
+/// Second EnumServicesStatusExW call; merges matched services into the assessment.
+unsafe fn scan_service_manager_collect(
+    scm: Handle,
+    buf: *mut u8,
+    needed: u32,
+    assessment: &mut TargetAssessment,
+) {
+    let mut needed = needed;
+    let mut returned: u32 = 0;
+    let mut resume: u32 = 0;
     if enum_services_status_ex(
         scm,
         0,
@@ -390,9 +417,6 @@ unsafe fn scan_service_manager(assessment: &mut TargetAssessment) {
             }
         }
     }
-
-    free(buf);
-    close_sc_manager(scm);
 }
 
 // ---- Mitigation Query -----------------------------------------------------
@@ -686,7 +710,13 @@ impl Vendor {
 /// Match process name → vendor. Updated to 2026 EDR/AV process names.
 fn match_process_name(name: &str) -> Option<Vendor> {
     let lower = name.to_lowercase();
-    // Tier 1 EDR — 2026 process names
+    match_process_name_tier1(&lower)
+        .or_else(|| match_process_name_tier2(&lower))
+        .or_else(|| match_process_name_infra(&lower))
+}
+
+/// Tier 1 EDR — 2026 process names
+fn match_process_name_tier1(lower: &str) -> Option<Vendor> {
     if lower.contains("csfalcon") || lower.contains("csagent") {
         return Some(Vendor::CrowdStrike);
     }
@@ -716,7 +746,11 @@ fn match_process_name(name: &str) -> Option<Vendor> {
     if lower.contains("sophos") || lower.contains("savservice") || lower.contains("hmpalert") {
         return Some(Vendor::SophosInterceptX);
     }
-    // Tier 2 AV
+    None
+}
+
+/// Tier 2 AV
+fn match_process_name_tier2(lower: &str) -> Option<Vendor> {
     if lower.contains("msmpeng") {
         return Some(Vendor::Defender);
     }
@@ -748,7 +782,11 @@ fn match_process_name(name: &str) -> Option<Vendor> {
     if lower.contains("nsbu") || lower.contains("navw32") {
         return Some(Vendor::Norton);
     }
-    // Infrastructure
+    None
+}
+
+/// Infrastructure
+fn match_process_name_infra(lower: &str) -> Option<Vendor> {
     if lower.contains("sysmon") {
         return Some(Vendor::Sysmon);
     }
@@ -847,6 +885,13 @@ fn match_service_pattern(display: &str, image: &str) -> Option<Vendor> {
 /// used as a token — every kernel driver has it.
 fn match_driver_name(name: &str) -> Option<Vendor> {
     let lower = name.to_lowercase();
+    match_driver_name_edr(&lower)
+        .or_else(|| match_driver_name_av(&lower))
+        .or_else(|| match_driver_name_infra(&lower))
+}
+
+/// EDR kernel-driver names.
+fn match_driver_name_edr(lower: &str) -> Option<Vendor> {
     if lower.contains("csagent") || lower.contains("csdevice") {
         return Some(Vendor::CrowdStrike);
     }
@@ -867,6 +912,11 @@ fn match_driver_name(name: &str) -> Option<Vendor> {
     if lower.contains("cortex") || lower.contains("traps") {
         return Some(Vendor::CortexXDR);
     }
+    None
+}
+
+/// AV kernel-driver names.
+fn match_driver_name_av(lower: &str) -> Option<Vendor> {
     if lower.contains("sophos")
         && (lower.contains("bp")
             || lower.contains("boot")
@@ -897,6 +947,11 @@ fn match_driver_name(name: &str) -> Option<Vendor> {
     if lower.contains("tmact") || lower.contains("tmebc") || lower.contains("tmbmsrv") {
         return Some(Vendor::TrendMicroApex);
     }
+    None
+}
+
+/// Infrastructure kernel-driver names.
+fn match_driver_name_infra(lower: &str) -> Option<Vendor> {
     if lower.contains("sysmondrv") {
         return Some(Vendor::Sysmon);
     }
@@ -1117,11 +1172,26 @@ unsafe fn query_reg_value(k: HKey, name: &[u8]) -> String {
     if k.is_null() {
         return String::new();
     }
+    let value_name = query_reg_value_name(name);
+    // Two-pass: first query for the byte length, then allocate + read.
+    let (typ, len) = match query_reg_value_size(k, &value_name) {
+        Some(sz) => sz,
+        None => return String::new(),
+    };
+    query_reg_value_read(k, &value_name, typ, len)
+}
+
+/// Copies the value name into a fixed 64-byte NUL-padded buffer.
+fn query_reg_value_name(name: &[u8]) -> [u8; 64] {
     let mut value_name = [0u8; 64];
     let n = name.len().min(value_name.len() - 1);
     value_name[..n].copy_from_slice(&name[..n]);
+    value_name
+}
 
-    // Two-pass: first query for the byte length, then allocate + read.
+/// First RegQueryValueExA pass: returns (type, byte length) when the value is
+/// a present REG_SZ/REG_EXPAND_SZ string, None otherwise.
+unsafe fn query_reg_value_size(k: HKey, value_name: &[u8; 64]) -> Option<(u32, u32)> {
     let mut typ: u32 = 0;
     let mut len: u32 = 0;
     let st = scanners::reg_query_value_ex_a(
@@ -1133,17 +1203,23 @@ unsafe fn query_reg_value(k: HKey, name: &[u8]) -> String {
         &mut len,
     );
     if st != scanners::ERROR_SUCCESS || len == 0 {
-        return String::new();
+        return None;
     }
     if typ != scanners::REG_SZ && typ != scanners::REG_EXPAND_SZ {
-        return String::new();
+        return None;
     }
+    Some((typ, len))
+}
 
+/// Second RegQueryValueExA pass: reads the value, trims trailing NULs and
+/// decodes it lossy ASCII→String.
+unsafe fn query_reg_value_read(k: HKey, value_name: &[u8; 64], typ: u32, len: u32) -> String {
     // Cap the allocation — a runaway length would be a registry corruption / API
     // misuse signal, not a real DisplayName. 8 KiB is well past MAX_PATH*2.
     let cap = (len as usize).min(8192);
     let mut buf = vec![0u8; cap + 1];
     let mut len2: u32 = (cap + 1) as u32;
+    let mut typ = typ;
     let st = scanners::reg_query_value_ex_a(
         k as usize,
         value_name.as_ptr(),
@@ -1225,11 +1301,35 @@ unsafe fn wmi_run_string_query(
     wql: &[u8],
     prop_name: &[u8],
 ) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+    let locator = match wmi_query_locator() {
+        Some(l) => l,
+        None => return Vec::new(),
+    };
+    let services = match wmi_query_connect(locator, namespace) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    // 4. CoSetProxyBlanket — required by 2022 DCOM hardening. Without it,
+    //    ExecQuery fails with E_ACCESSDENIED on patched hosts. The locator
+    //    itself does not need a blanket (ConnectServer already succeeded).
+    //    RPC_C_AUTHN_LEVEL_PKT_PRIVACY (6) + RPC_C_IMP_LEVEL_IMPERSONATE (3).
+    let _ = scanners::co_set_proxy_blanket(
+        services,
+        scanners::RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+        scanners::RPC_C_IMP_LEVEL_IMPERSONATE,
+    );
+    let enumerator = match wmi_query_exec(services, locator, wql) {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+    wmi_query_collect(enumerator, services, locator, prop_name)
+}
 
+/// CoInitializeEx + CoCreateInstance(CLSID_WbemLocator) → IWbemLocator*.
+unsafe fn wmi_query_locator() -> Option<*mut c_void> {
     // 1. CoInitializeEx. Idempotent per-thread — return S_FALSE if already done.
     if !scanners::co_init_succeeded(scanners::co_initialize_ex()) {
-        return out;
+        return None;
     }
 
     // 2. CoCreateInstance(CLSID_WbemLocator, IID_IWbemLocator) → IWbemLocator*.
@@ -1237,16 +1337,20 @@ unsafe fn wmi_run_string_query(
     let iid = scanners::Guid::from_bytes(scanners::IID_IWBEM_LOCATOR);
     let locator = scanners::co_create_instance(&clsid, &iid);
     if locator.is_null() {
-        return out;
+        return None;
     }
+    Some(locator)
+}
 
+/// ConnectServer on the namespace → IWbemServices*. Releases the locator on failure.
+unsafe fn wmi_query_connect(locator: *mut c_void, namespace: &[u8]) -> Option<*mut c_void> {
     // 3. ConnectServer. Build the BSTR for the namespace path. Only the
     //    namespace BSTR and the security-flags arg matter; the rest can be
     //    null/zero (anonymous local auth, default locale, no WbemContext).
     let ns_bstr = ascii_to_bstr(namespace);
     if ns_bstr.is_null() {
         scanners::com_release(locator);
-        return out;
+        return None;
     }
     let mut services: *mut c_void = core::ptr::null_mut();
     let hr = scanners::wbem_locator_connect_server(
@@ -1263,19 +1367,17 @@ unsafe fn wmi_run_string_query(
     scanners::sys_free_string(ns_bstr);
     if hr < 0 || services.is_null() {
         scanners::com_release(locator);
-        return out;
+        return None;
     }
+    Some(services)
+}
 
-    // 4. CoSetProxyBlanket — required by 2022 DCOM hardening. Without it,
-    //    ExecQuery fails with E_ACCESSDENIED on patched hosts. The locator
-    //    itself does not need a blanket (ConnectServer already succeeded).
-    //    RPC_C_AUTHN_LEVEL_PKT_PRIVACY (6) + RPC_C_IMP_LEVEL_IMPERSONATE (3).
-    let _ = scanners::co_set_proxy_blanket(
-        services,
-        scanners::RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
-        scanners::RPC_C_IMP_LEVEL_IMPERSONATE,
-    );
-
+/// ExecQuery → IEnumWbemClassObject*. Releases services/locator on failure.
+unsafe fn wmi_query_exec(
+    services: *mut c_void,
+    locator: *mut c_void,
+    wql: &[u8],
+) -> Option<*mut c_void> {
     // 5. ExecQuery. Wrap "WQL" and the query text as BSTRs. RETURN_IMMEDIATELY
     //    | FORWARD_ONLY = semisynchronous forward-only enumeration (cheap,
     //    no cache to release, no blocking the provider host).
@@ -1286,7 +1388,7 @@ unsafe fn wmi_run_string_query(
         scanners::sys_free_string(wql_bstr);
         scanners::com_release(services);
         scanners::com_release(locator);
-        return out;
+        return None;
     }
     let mut enumerator: *mut c_void = core::ptr::null_mut();
     let hr = scanners::wbem_services_exec_query(
@@ -1302,7 +1404,7 @@ unsafe fn wmi_run_string_query(
     if hr < 0 || enumerator.is_null() {
         scanners::com_release(services);
         scanners::com_release(locator);
-        return out;
+        return None;
     }
 
     // 6. Enumerator blanket — same reason as the services proxy.
@@ -1311,7 +1413,16 @@ unsafe fn wmi_run_string_query(
         scanners::RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
         scanners::RPC_C_IMP_LEVEL_IMPERSONATE,
     );
+    Some(enumerator)
+}
 
+/// Collects results and tears down the COM objects (enumerator, services, locator).
+unsafe fn wmi_query_collect(
+    enumerator: *mut c_void,
+    services: *mut c_void,
+    locator: *mut c_void,
+    prop_name: &[u8],
+) -> Vec<String> {
     // 7. Iterate. Fetch one object at a time; stop when Next returns fewer
     //    than requested (WBEM_S_FALSE at end of result set) or an error.
     //    Cap at 64 results — a real host has at most a handful of AV products
@@ -1322,8 +1433,23 @@ unsafe fn wmi_run_string_query(
         scanners::com_release(enumerator);
         scanners::com_release(services);
         scanners::com_release(locator);
-        return out;
+        return Vec::new();
     }
+    let out = wmi_query_iterate(enumerator, prop_bstr);
+    scanners::sys_free_string(prop_bstr);
+
+    // 8. Tear down. Each Release drops a refcount; WMI provider objects free
+    //    themselves when their refcount hits zero.
+    scanners::com_release(enumerator);
+    scanners::com_release(services);
+    scanners::com_release(locator);
+
+    out
+}
+
+/// Iterates the result set, reading one string property per object.
+unsafe fn wmi_query_iterate(enumerator: *mut c_void, prop_bstr: *mut u16) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
     let mut guard = 0u32;
     loop {
         if guard >= 64 {
@@ -1367,14 +1493,6 @@ unsafe fn wmi_run_string_query(
         scanners::variant_clear(&mut variant);
         scanners::com_release(obj);
     }
-    scanners::sys_free_string(prop_bstr);
-
-    // 8. Tear down. Each Release drops a refcount; WMI provider objects free
-    //    themselves when their refcount hits zero.
-    scanners::com_release(enumerator);
-    scanners::com_release(services);
-    scanners::com_release(locator);
-
     out
 }
 
@@ -1524,6 +1642,24 @@ pub unsafe extern "system" fn nyx_selftest_trex() -> ! {
 
 unsafe fn write_report(a: &TargetAssessment) {
     // Resolve CreateFileW + WriteFile + CloseHandle via PEB walk
+    let (cf, wf, ch) = match write_report_resolve() {
+        Some(addrs) => addrs,
+        None => return,
+    };
+
+    type FnCH = unsafe extern "system" fn(*mut c_void) -> i32;
+    let _close: FnCH = core::mem::transmute(ch);
+
+    let h = write_report_open(cf);
+    if h as isize == -1 || h.is_null() {
+        return;
+    }
+    write_report_body(wf, h, a);
+}
+
+/// Resolve CreateFileW + WriteFile + CloseHandle via PEB walk.
+#[allow(dead_code)]
+unsafe fn write_report_resolve() -> Option<(usize, usize, usize)> {
     let cf = crate::resolve::export_addr(b"kernel32.dll", b"CreateFileW")
         .or_else(|| crate::resolve::export_addr(b"kernelbase.dll", b"CreateFileW"));
     let wf = crate::resolve::export_addr(b"kernel32.dll", b"WriteFile")
@@ -1531,10 +1667,15 @@ unsafe fn write_report(a: &TargetAssessment) {
     let ch = crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle")
         .or_else(|| crate::resolve::export_addr(b"kernelbase.dll", b"CloseHandle"));
 
-    let (Some(cf), Some(wf), Some(ch)) = (cf, wf, ch) else {
-        return;
-    };
+    match (cf, wf, ch) {
+        (Some(cf), Some(wf), Some(ch)) => Some((cf, wf, ch)),
+        _ => None,
+    }
+}
 
+/// Transmutes CreateFileW and opens `C:\nyx\trex_report.txt` (CREATE_ALWAYS).
+#[allow(dead_code)]
+unsafe fn write_report_open(cf: usize) -> *mut c_void {
     type FnCF = unsafe extern "system" fn(
         *const u16,
         u32,
@@ -1544,13 +1685,7 @@ unsafe fn write_report(a: &TargetAssessment) {
         u32,
         *mut c_void,
     ) -> *mut c_void;
-    type FnWF =
-        unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
-    type FnCH = unsafe extern "system" fn(*mut c_void) -> i32;
-
     let create: FnCF = core::mem::transmute(cf);
-    let write: FnWF = core::mem::transmute(wf);
-    let _close: FnCH = core::mem::transmute(ch);
 
     let path: [u16; 48] = {
         let s = b"C:\\nyx\\trex_report.txt";
@@ -1561,7 +1696,7 @@ unsafe fn write_report(a: &TargetAssessment) {
         a
     };
 
-    let h = create(
+    create(
         path.as_ptr(),
         0x4000_0000,
         0,
@@ -1569,10 +1704,15 @@ unsafe fn write_report(a: &TargetAssessment) {
         2,
         0x80,
         core::ptr::null_mut(),
-    );
-    if h as isize == -1 || h.is_null() {
-        return;
-    }
+    )
+}
+
+/// Transmutes WriteFile and writes the header, tier, product list and recommendation.
+#[allow(dead_code)]
+unsafe fn write_report_body(wf: usize, h: *mut c_void, a: &TargetAssessment) {
+    type FnWF =
+        unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
+    let write: FnWF = core::mem::transmute(wf);
 
     let mut written: u32 = 0;
     let _ = write(
@@ -1598,6 +1738,18 @@ unsafe fn write_report(a: &TargetAssessment) {
         &mut written,
         core::ptr::null_mut(),
     );
+    write_report_products(wf, h, a);
+    write_report_recommendation(wf, h, a);
+}
+
+/// Writes the detected-product count and one line per product.
+#[allow(dead_code)]
+unsafe fn write_report_products(wf: usize, h: *mut c_void, a: &TargetAssessment) {
+    type FnWF =
+        unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
+    let write: FnWF = core::mem::transmute(wf);
+
+    let mut written: u32 = 0;
     let prod_count = a.products.len();
     let _ = write(
         h,
@@ -1626,6 +1778,16 @@ unsafe fn write_report(a: &TargetAssessment) {
         );
         let _ = write(h, b"\r\n".as_ptr(), 2, &mut written, core::ptr::null_mut());
     }
+}
+
+/// Writes the closing recommendation line.
+#[allow(dead_code)]
+unsafe fn write_report_recommendation(wf: usize, h: *mut c_void, a: &TargetAssessment) {
+    type FnWF =
+        unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
+    let write: FnWF = core::mem::transmute(wf);
+
+    let mut written: u32 = 0;
     let _ = write(
         h,
         b"\r\nRecommendation: ".as_ptr(),
