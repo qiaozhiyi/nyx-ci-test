@@ -202,21 +202,9 @@ unsafe fn ensure_ws2_32_load_dll() -> bool {
 /// Resolve the 12 Winsock exports and build the function table.
 /// Returns None when any export is missing.
 unsafe fn ensure_ws2_32_resolve() -> Option<alloc::boxed::Box<WsaFns>> {
-    let wsa_startup = export_addr(b"ws2_32.dll", b"WSAStartup");
-    let wsa_cleanup = export_addr(b"ws2_32.dll", b"WSACleanup");
-    let socket = export_addr(b"ws2_32.dll", b"socket");
-    let connect = export_addr(b"ws2_32.dll", b"connect");
-    let send = export_addr(b"ws2_32.dll", b"send");
-    let recv = export_addr(b"ws2_32.dll", b"recv");
-    let closesocket = export_addr(b"ws2_32.dll", b"closesocket");
     // I/O timeouts (implant-channels-3): select/ioctlsocket/getsockopt for the
     // bounded non-blocking connect; setsockopt for SO_RCVTIMEO/SO_SNDTIMEO;
     // WSAGetLastError to distinguish WSAEWOULDBLOCK from a real connect error.
-    let select = export_addr(b"ws2_32.dll", b"select");
-    let ioctlsocket = export_addr(b"ws2_32.dll", b"ioctlsocket");
-    let getsockopt = export_addr(b"ws2_32.dll", b"getsockopt");
-    let setsockopt = export_addr(b"ws2_32.dll", b"setsockopt");
-    let wsa_get_last_error = export_addr(b"ws2_32.dll", b"WSAGetLastError");
     if let (
         Some(wsa_startup),
         Some(wsa_cleanup),
@@ -231,36 +219,68 @@ unsafe fn ensure_ws2_32_resolve() -> Option<alloc::boxed::Box<WsaFns>> {
         Some(setsockopt),
         Some(wsa_get_last_error),
     ) = (
-        wsa_startup,
-        wsa_cleanup,
-        socket,
-        connect,
-        send,
-        recv,
-        closesocket,
-        select,
-        ioctlsocket,
-        getsockopt,
-        setsockopt,
-        wsa_get_last_error,
+        export_addr(b"ws2_32.dll", b"WSAStartup"),
+        export_addr(b"ws2_32.dll", b"WSACleanup"),
+        export_addr(b"ws2_32.dll", b"socket"),
+        export_addr(b"ws2_32.dll", b"connect"),
+        export_addr(b"ws2_32.dll", b"send"),
+        export_addr(b"ws2_32.dll", b"recv"),
+        export_addr(b"ws2_32.dll", b"closesocket"),
+        export_addr(b"ws2_32.dll", b"select"),
+        export_addr(b"ws2_32.dll", b"ioctlsocket"),
+        export_addr(b"ws2_32.dll", b"getsockopt"),
+        export_addr(b"ws2_32.dll", b"setsockopt"),
+        export_addr(b"ws2_32.dll", b"WSAGetLastError"),
     ) {
-        Some(alloc::boxed::Box::new(WsaFns {
-            wsa_startup: core::mem::transmute(wsa_startup),
-            wsa_cleanup: core::mem::transmute(wsa_cleanup),
-            socket: core::mem::transmute(socket),
-            connect: core::mem::transmute(connect),
-            send: core::mem::transmute(send),
-            recv: core::mem::transmute(recv),
-            closesocket: core::mem::transmute(closesocket),
-            select: core::mem::transmute(select),
-            ioctlsocket: core::mem::transmute(ioctlsocket),
-            getsockopt: core::mem::transmute(getsockopt),
-            setsockopt: core::mem::transmute(setsockopt),
-            wsa_get_last_error: core::mem::transmute(wsa_get_last_error),
-        }))
+        Some(ensure_ws2_32_build_table(
+            wsa_startup,
+            wsa_cleanup,
+            socket,
+            connect,
+            send,
+            recv,
+            closesocket,
+            select,
+            ioctlsocket,
+            getsockopt,
+            setsockopt,
+            wsa_get_last_error,
+        ))
     } else {
         None
     }
+}
+
+/// Build the Winsock function table from the 12 resolved export addresses
+/// (all non-null — the caller's `if let` already unwrapped them).
+unsafe fn ensure_ws2_32_build_table(
+    wsa_startup: usize,
+    wsa_cleanup: usize,
+    socket: usize,
+    connect: usize,
+    send: usize,
+    recv: usize,
+    closesocket: usize,
+    select: usize,
+    ioctlsocket: usize,
+    getsockopt: usize,
+    setsockopt: usize,
+    wsa_get_last_error: usize,
+) -> alloc::boxed::Box<WsaFns> {
+    alloc::boxed::Box::new(WsaFns {
+        wsa_startup: core::mem::transmute(wsa_startup),
+        wsa_cleanup: core::mem::transmute(wsa_cleanup),
+        socket: core::mem::transmute(socket),
+        connect: core::mem::transmute(connect),
+        send: core::mem::transmute(send),
+        recv: core::mem::transmute(recv),
+        closesocket: core::mem::transmute(closesocket),
+        select: core::mem::transmute(select),
+        ioctlsocket: core::mem::transmute(ioctlsocket),
+        getsockopt: core::mem::transmute(getsockopt),
+        setsockopt: core::mem::transmute(setsockopt),
+        wsa_get_last_error: core::mem::transmute(wsa_get_last_error),
+    })
 }
 
 /// One-time install of the resolved table into the static. If we lost the
