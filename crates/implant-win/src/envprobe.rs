@@ -398,6 +398,31 @@ unsafe fn read_nic_mac_oui(apis: &NtRegApis, handle: usize) -> Option<[u8; 6]> {
         buffer: val_name_buf.as_mut_ptr(),
     };
 
+    let (info_buf, stride, avail) = read_nic_mac_oui_query_value(apis, handle, &val_name)?;
+    let nibbles = read_nic_mac_oui_parse_nibbles(&info_buf, stride, avail)?;
+
+    // Assemble the OUI into the first 3 bytes (high nibble | low nibble per
+    // byte), preserving the original assembly; bytes [3..6] stay 0.
+    let mut mac = [0u8; 6];
+    mac[0] = (nibbles[0] << 4) | nibbles[1];
+    mac[1] = (nibbles[2] << 4) | nibbles[3];
+    mac[2] = (nibbles[4] << 4) | nibbles[5];
+    Some(mac)
+}
+
+/// Query the `NetworkAddress` value from an open NIC key handle. Returns the
+/// raw KEY_VALUE_PARTIAL_INFORMATION buffer plus the char `stride` (2 for
+/// REG_SZ/REG_MULTI_SZ UTF-16 data, 1 otherwise) and the usable byte count,
+/// or `None` if the query failed or the buffer holds no data.
+///
+/// # Safety
+/// `apis` must hold valid NT registry fn pointers. `handle` must be a valid
+/// open key handle.
+unsafe fn read_nic_mac_oui_query_value(
+    apis: &NtRegApis,
+    handle: usize,
+    val_name: &UnicodeString,
+) -> Option<([u8; 64], usize, usize)> {
     // KEY_VALUE_PARTIAL_INFORMATION layout (per the WDK):
     //   TitleIndex  @ +0  (u32)
     //   Type        @ +4  (u32)   <- REG_SZ=1, REG_MULTI_SZ=7
@@ -408,7 +433,7 @@ unsafe fn read_nic_mac_oui(apis: &NtRegApis, handle: usize) -> Option<[u8; 6]> {
     let st = unsafe {
         (apis.query)(
             handle,
-            &val_name,
+            val_name,
             2, // KeyValuePartialInformation
             info_buf.as_mut_ptr(),
             info_buf.len() as u32,
@@ -439,10 +464,18 @@ unsafe fn read_nic_mac_oui(apis: &NtRegApis, handle: usize) -> Option<[u8; 6]> {
     if avail < data_off {
         return None;
     }
+    Some((info_buf, stride, avail))
+}
 
-    // Parse the first 6 hex nibbles (3 bytes = OUI) from Data @ +12, stepping
-    // by `stride` so UTF-16 padding bytes are skipped (we read only the
-    // meaningful low byte of each code unit).
+/// Parse the first 6 hex nibbles (3 bytes = OUI) from `Data @ +12`, stepping
+/// by `stride` so UTF-16 padding bytes are skipped (we read only the
+/// meaningful low byte of each code unit). `None` if not enough hex digits.
+fn read_nic_mac_oui_parse_nibbles(
+    info_buf: &[u8; 64],
+    stride: usize,
+    avail: usize,
+) -> Option<[u8; 6]> {
+    let data_off = 12usize;
     let mut nibbles = [0u8; 6];
     let mut parsed = 0usize;
     while parsed < 6 {
@@ -456,14 +489,7 @@ unsafe fn read_nic_mac_oui(apis: &NtRegApis, handle: usize) -> Option<[u8; 6]> {
     if parsed < 6 {
         return None; // not enough hex digits — not a MAC
     }
-
-    // Assemble the OUI into the first 3 bytes (high nibble | low nibble per
-    // byte), preserving the original assembly; bytes [3..6] stay 0.
-    let mut mac = [0u8; 6];
-    mac[0] = (nibbles[0] << 4) | nibbles[1];
-    mac[1] = (nibbles[2] << 4) | nibbles[3];
-    mac[2] = (nibbles[4] << 4) | nibbles[5];
-    Some(mac)
+    Some(nibbles)
 }
 
 /// The number of NIC slots to probe. VM virtual NICs land in different slots
@@ -622,15 +648,23 @@ fn system_uptime_secs() -> u64 {
 /// walk the `SYSTEM_PROCESS_INFORMATION` linked list counting entries.
 /// No process handles are opened and no per-process detail is read.
 unsafe fn running_process_count() -> u32 {
+    let Some(buf) = running_process_count_query() else {
+        return 0;
+    };
+    running_process_count_walk(&buf)
+}
+
+/// Query `SystemProcessInformation` (class 5) into a growable heap buffer,
+/// growing once if the initial 64 KiB isn't enough. Returns the filled buffer,
+/// or `None` on any query failure.
+unsafe fn running_process_count_query() -> Option<crate::heap::Vec<u8>> {
     // SystemProcessInformation = 0x5
     const SYSTEM_PROCESS_INFO: u32 = 0x5;
 
-    let Some(nt_query) = crate::resolve::export_addr(
+    let nt_query = crate::resolve::export_addr(
         b"ntdll.dll",
         b"NtQuerySystemInformation",
-    ) else {
-        return 0;
-    };
+    )?;
     type NtQuery = unsafe extern "system" fn(
         SystemInformationClass: u32,
         SystemInformation: *mut u8,
@@ -663,13 +697,17 @@ unsafe fn running_process_count() -> u32 {
                 core::ptr::null_mut(),
             );
             if status2 < 0 {
-                return 0;
+                return None;
             }
         } else {
-            return 0;
+            return None;
         }
     }
+    Some(buf)
+}
 
+/// Walk the `SYSTEM_PROCESS_INFORMATION` linked list counting entries.
+fn running_process_count_walk(buf: &[u8]) -> u32 {
     // Walk the linked list. Each entry starts with:
     //   ULONG NextEntryOffset  (0 = end of list)
     //   ULONG NumberOfThreads
