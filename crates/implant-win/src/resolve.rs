@@ -456,24 +456,7 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
 /// itself, pointing to an ASCII string like "NTDLL.RtlAddVectoredExceptionHandler").
 /// These are recursively resolved via PEB walk to avoid jumping into string data.
 unsafe fn export_addr_by_hash_pub(base: *mut u8, fn_hash: u32) -> Option<usize> {
-    let e_lfanew = *(base.add(0x3C) as *const i32) as usize;
-    let nt = base.add(e_lfanew);
-    let opt = nt.add(24);
-    let magic = *(opt as *const u16);
-    let dd_off = if magic == 0x20B { 112 } else { 96 };
-    let export_rva = *(opt.add(dd_off) as *const u32);
-    if export_rva == 0 {
-        return None;
-    }
-    // Export-directory SIZE (bytes) is the second u32 of the data directory
-    // entry (RVA + size). We must read it from the PE header — NOT use
-    // `ExportDirectory.number_of_functions`, which is a *count* of functions,
-    // not a byte length. Using the count here under-sized the forwarder bounds
-    // check so high-RVA forwarders escaped detection and we returned the
-    // forwarder *string* address as if it were code → calling it AV'd
-    // (root cause of the hwbp_blind crash: kernel32!AddVectoredExceptionHandler
-    // forwards to NTDLL.RtlAddVectoredExceptionHandler at a high RVA).
-    let export_dir_size = *(opt.add(dd_off + 4) as *const u32) as usize;
+    let (export_rva, export_dir_size) = export_directory_range(base)?;
     let dir = base.add(export_rva as usize) as *const ExportDirectory;
     let n = (*dir).number_of_names as usize;
     let num_funcs = (*dir).number_of_functions as usize;
@@ -506,6 +489,29 @@ unsafe fn export_addr_by_hash_pub(base: *mut u8, fn_hash: u32) -> Option<usize> 
         }
     }
     None
+}
+
+/// Read the export directory RVA and size (bytes) from the PE optional header.
+unsafe fn export_directory_range(base: *mut u8) -> Option<(u32, usize)> {
+    let e_lfanew = *(base.add(0x3C) as *const i32) as usize;
+    let nt = base.add(e_lfanew);
+    let opt = nt.add(24);
+    let magic = *(opt as *const u16);
+    let dd_off = if magic == 0x20B { 112 } else { 96 };
+    let export_rva = *(opt.add(dd_off) as *const u32);
+    if export_rva == 0 {
+        return None;
+    }
+    // Export-directory SIZE (bytes) is the second u32 of the data directory
+    // entry (RVA + size). We must read it from the PE header — NOT use
+    // `ExportDirectory.number_of_functions`, which is a *count* of functions,
+    // not a byte length. Using the count here under-sized the forwarder bounds
+    // check so high-RVA forwarders escaped detection and we returned the
+    // forwarder *string* address as if it were code → calling it AV'd
+    // (root cause of the hwbp_blind crash: kernel32!AddVectoredExceptionHandler
+    // forwards to NTDLL.RtlAddVectoredExceptionHandler at a high RVA).
+    let export_dir_size = *(opt.add(dd_off + 4) as *const u32) as usize;
+    Some((export_rva, export_dir_size))
 }
 
 /// Resolve a PE forwarded export. The forwarder string format is
@@ -595,30 +601,41 @@ unsafe fn fwd_name_matches(stem: &[u8], loader_name: &[u16], api_set: bool) -> b
         nlen += 1;
     }
     let name = &name[..nlen];
-    let stem_l = stem.len();
     if api_set {
-        // API set: full-name literal compare (case-insensitive). The loader
-        // surfaces the contract name verbatim.
-        if stem_l != nlen {
-            return false;
-        }
-        let mut s = stem.iter();
-        let mut n = name.iter();
-        loop {
-            match (s.next(), n.next()) {
-                (Some(&a), Some(&b)) => {
-                    if a.to_ascii_lowercase() != b {
-                        return false;
-                    }
+        fwd_name_matches_api_set(stem, name)
+    } else {
+        fwd_name_matches_ext(stem, name)
+    }
+}
+
+/// API-set names match the full loader name literally (case-insensitive). The
+/// loader surfaces the contract name verbatim.
+unsafe fn fwd_name_matches_api_set(stem: &[u8], name: &[u8]) -> bool {
+    let stem_l = stem.len();
+    if stem_l != name.len() {
+        return false;
+    }
+    let mut s = stem.iter();
+    let mut n = name.iter();
+    loop {
+        match (s.next(), n.next()) {
+            (Some(&a), Some(&b)) => {
+                if a.to_ascii_lowercase() != b {
+                    return false;
                 }
-                (None, None) => return true,
-                _ => return false,
             }
+            (None, None) => return true,
+            _ => return false,
         }
     }
-    // Non-API-set: stem must equal loader name minus an optional ".dll"/".exe".
-    // Require the loader name to be exactly stem + ext (so "ntdll" matches
-    // "ntdll.dll" but "kernel" does not match "kernelbase.dll").
+}
+
+/// Non-API-set: stem must equal loader name minus an optional ".dll"/".exe".
+/// Require the loader name to be exactly stem + ext (so "ntdll" matches
+/// "ntdll.dll" but "kernel" does not match "kernelbase.dll").
+unsafe fn fwd_name_matches_ext(stem: &[u8], name: &[u8]) -> bool {
+    let stem_l = stem.len();
+    let nlen = name.len();
     let (b0, b1, b2, b3) = if nlen >= 4 {
         (
             name[nlen - 4],
