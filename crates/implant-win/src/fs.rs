@@ -647,9 +647,8 @@ pub fn do_download(rt: &Runtime, path: &str) -> Vec<Response> {
             Ok(h) => h,
             Err(e) => return e,
         };
-        // Stream the file in CHUNK-sized reads; the error paths inside
-        // do_download_read_all close the handle themselves and return early —
-        // only the EOF path falls through to the close below.
+        // Stream the file in CHUNK-sized reads; the handle is closed exactly
+        // once below on every path (read error, unresolved, or EOF).
         let chunks = do_download_read_all(rt, handle, path);
         let _ = crate::syscalls::nt_close(rt, handle as usize);
         chunks
@@ -689,8 +688,8 @@ fn do_download_open(rt: &Runtime, path: &str) -> Result<*mut core::ffi::c_void, 
 /// Read the file in CHUNK-sized blocks until STATUS_END_OF_FILE, streaming
 /// one `Response::FileChunk` per block (128 KiB). An empty file yields a
 /// single empty chunk with eof=1 (matches the dev agent); the last chunk is
-/// marked eof=1. On read errors the handle is closed here and the error
-/// returned; on EOF the caller closes the handle.
+/// marked eof=1. Read errors are returned as-is; `do_download` closes the
+/// handle exactly once on every path.
 fn do_download_read_all(
     rt: &Runtime,
     handle: *mut core::ffi::c_void,
@@ -701,7 +700,8 @@ fn do_download_read_all(
     let name = basename(path);
     let mut seq = 0u32;
     loop {
-        // One NtReadFile fill; unresolved reads close the handle and return.
+        // One NtReadFile fill; unresolved reads return the error (the
+        // caller closes the handle).
         let (status, got) = match do_download_read(rt, handle, &mut buf) {
             Ok(r) => r,
             Err(e) => return e,
@@ -716,11 +716,8 @@ fn do_download_read_all(
         // A non-EOF negative status is a real read error (e.g. a transient
         // STATUS_FILE_LOCK_CONFLICT). Don't push a partial/stale chunk and
         // pretend success — surface the error so the operator knows the
-        // download was truncated, and close the handle.
+        // download was truncated. The caller closes the handle exactly once.
         if status < 0 {
-            unsafe {
-                let _ = crate::syscalls::nt_close(rt, handle as usize);
-            }
             return vec![Response::Err(String::from(format_ntstatus(
                 "download read",
                 status,
@@ -755,9 +752,9 @@ fn do_download_mark_eof(chunks: &mut Vec<Response>, name: &String) {
     }
 }
 
-/// Issue one NtReadFile into `buf`, returning (status, bytes-read). On an
-/// unresolved NtReadFile the handle is closed here and the error vector
-/// returned (mirrors the original loop's cleanup).
+/// Issue one NtReadFile into `buf`, returning (status, bytes-read). An
+/// unresolved NtReadFile is returned as an error; the caller closes the
+/// handle exactly once.
 fn do_download_read(
     rt: &Runtime,
     handle: *mut core::ffi::c_void,
@@ -779,12 +776,9 @@ fn do_download_read(
         );
         match rst {
             Some(s) => Ok((s, read_iosb.information)), // bytes actually read
-            None => {
-                let _ = crate::syscalls::nt_close(rt, handle as usize);
-                Err(vec![Response::Err(String::from(
-                    "download: NtReadFile unresolved",
-                ))])
-            }
+            None => Err(vec![Response::Err(String::from(
+                "download: NtReadFile unresolved",
+            ))]),
         }
     }
 }
