@@ -236,7 +236,9 @@ fn decode_extended_tail(
 
 /// Parse the present channel-dispatcher tail (spec-1), including the spec-7
 /// HTTP enhancement and spec-3 raw pivot backward-compat layers.
-fn decode_extended_tail_present(r: &mut Reader) -> Result<
+fn decode_extended_tail_present(
+    r: &mut Reader,
+) -> Result<
     (
         u8,
         u8,

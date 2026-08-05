@@ -354,14 +354,7 @@ fn load_runtime_config_parse_fields(
 /// [beacon_uri str][sleep_seconds u32][jitter_pct u8][use_tls u8]`.
 fn load_runtime_config_parse_core(
     r: &mut Reader,
-) -> Option<(
-    crate::heap::String,
-    u16,
-    crate::heap::String,
-    u32,
-    u8,
-    bool,
-)> {
+) -> Option<(crate::heap::String, u16, crate::heap::String, u32, u8, bool)> {
     let server_host = r.str().ok()?;
     let server_port = r.u16().ok()?;
     let beacon_uri = r.str().ok()?;

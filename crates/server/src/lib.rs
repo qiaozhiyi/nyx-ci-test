@@ -2458,7 +2458,10 @@ impl JsonCommand {
         Ok(match self {
             JsonCommand::Ping => Command::Ping,
             JsonCommand::Shell { args } => Command::Shell { args },
-            JsonCommand::Sleep { seconds, jitter_pct } => into_command_sleep(seconds, jitter_pct),
+            JsonCommand::Sleep {
+                seconds,
+                jitter_pct,
+            } => into_command_sleep(seconds, jitter_pct),
             JsonCommand::Upload { name, data_hex } => into_command_upload(name, data_hex)?,
             JsonCommand::Download { path } => Command::Download { path },
             JsonCommand::Bof {
@@ -2468,7 +2471,12 @@ impl JsonCommand {
             } => into_command_bof(name, args, data_hex)?,
             JsonCommand::FileOp { op, path, dest } => into_command_fileop(op, path, dest)?,
             JsonCommand::Connect { host, port } => into_command_connect(host, port),
-            JsonCommand::Socks { chan, op, addr, port } => into_command_socks(chan, op, addr, port),
+            JsonCommand::Socks {
+                chan,
+                op,
+                addr,
+                port,
+            } => into_command_socks(chan, op, addr, port),
             JsonCommand::Screenshot { monitor } => Command::Screenshot { monitor },
             JsonCommand::Portscan { host, ports } => Command::Portscan { host, ports },
             JsonCommand::Net { query } => Command::Net { query },
@@ -2483,9 +2491,12 @@ impl JsonCommand {
             }
             JsonCommand::ChannelClose { chan } => Command::ChannelClose { chan },
             JsonCommand::StealToken { pid } => Command::StealToken { pid },
-            JsonCommand::MakeToken { domain, user, password, logon_type } => {
-                into_command_make_token(domain, user, password, logon_type)
-            },
+            JsonCommand::MakeToken {
+                domain,
+                user,
+                password,
+                logon_type,
+            } => into_command_make_token(domain, user, password, logon_type),
             JsonCommand::Rev2Self => Command::Rev2Self,
             JsonCommand::GetUid => Command::GetUid,
             JsonCommand::Inject {
