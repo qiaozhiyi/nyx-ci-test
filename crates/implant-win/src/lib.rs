@@ -218,14 +218,14 @@ fn write_panic_diag(info: &core::panic::PanicInfo) {
 #[cfg(all(target_os = "windows", nyx_diag, not(test)))]
 fn write_panic_diag_resolve() -> Option<(usize, usize, usize, usize)> {
     let (Some(gev), Some(cf), Some(wf), Some(ch)) = (
-        resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableW")
-            .or_else(|| resolve::export_addr(b"kernelbase.dll", b"GetEnvironmentVariableW")),
-        resolve::export_addr(b"kernel32.dll", b"CreateFileW")
-            .or_else(|| resolve::export_addr(b"kernelbase.dll", b"CreateFileW")),
-        resolve::export_addr(b"kernel32.dll", b"WriteFile")
-            .or_else(|| resolve::export_addr(b"kernelbase.dll", b"WriteFile")),
-        resolve::export_addr(b"kernel32.dll", b"CloseHandle")
-            .or_else(|| resolve::export_addr(b"kernelbase.dll", b"CloseHandle")),
+        unsafe { resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableW") }
+            .or_else(|| unsafe { resolve::export_addr(b"kernelbase.dll", b"GetEnvironmentVariableW") }),
+        unsafe { resolve::export_addr(b"kernel32.dll", b"CreateFileW") }
+            .or_else(|| unsafe { resolve::export_addr(b"kernelbase.dll", b"CreateFileW") }),
+        unsafe { resolve::export_addr(b"kernel32.dll", b"WriteFile") }
+            .or_else(|| unsafe { resolve::export_addr(b"kernelbase.dll", b"WriteFile") }),
+        unsafe { resolve::export_addr(b"kernel32.dll", b"CloseHandle") }
+            .or_else(|| unsafe { resolve::export_addr(b"kernelbase.dll", b"CloseHandle") }),
     ) else {
         return None;
     };
@@ -248,7 +248,7 @@ fn write_panic_diag_build_path(gev: usize) -> [u16; 320] {
         name16[i] = b as u16;
     }
     name16[4] = 0;
-    let n = get_env(name16.as_ptr(), tmp16.as_mut_ptr(), 260);
+    let n = unsafe { get_env(name16.as_ptr(), tmp16.as_mut_ptr(), 260) };
     let tmp_len = if n != 0 && (n as usize) < 260 { n as usize } else { 0 };
 
     let mut path16 = [0u16; 320];
