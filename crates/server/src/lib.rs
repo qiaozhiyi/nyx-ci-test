@@ -1728,6 +1728,7 @@ fn handle_new_session_build_session(
 /// S2C:0 frame). The loser's next beacon cycle arrives as an existing
 /// session. The loser's pre-built `session` is dropped unused (its
 /// SessionKey zeroizes on Drop).
+#[allow(clippy::too_many_arguments)] // 8 stage inputs, mirror of the original inline call
 fn handle_new_session_insert(
     st: &AppState,
     raw: &nyx_protocol::RawFrame,
@@ -1787,14 +1788,14 @@ fn handle_new_session_winner(
     // Reply sealed in the server→implant nonce space
     // (Direction::ServerToClient) so it never collides with the
     // implant's own Tx nonces under the shared key.
-    Ok(encode_frame_dir(
+    encode_frame_dir(
         &raw.pubkey,
         Direction::ServerToClient,
         0,
         &reply_key,
         &Task::encode_vec(&[])?,
     )
-    .map_err(|e| anyhow::anyhow!("failed to seal S2C:0 reply: {e}"))?)
+    .map_err(|e| anyhow::anyhow!("failed to seal S2C:0 reply: {e}"))
 }
 
 /// Persist the race-winner's full session metadata so the registry survives a
