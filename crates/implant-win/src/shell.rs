@@ -129,11 +129,18 @@ pub fn run_shell(args: &str) -> Response {
 unsafe fn run_shell_inner(args: &str) -> Response {
     // ---- resolve all 7 kernel32 exports up front ----
     // If any is missing, fail fast rather than transmute a null address.
-    let (create_process, create_pipe, read_file, wait_for_single, _get_exit_code, close_handle, set_handle_info) =
-        match run_shell_inner_resolve() {
-            Ok(fns) => fns,
-            Err(e) => return Response::Err(String::from(e)),
-        };
+    let ShellExports {
+        create_process,
+        create_pipe,
+        read_file,
+        wait_for_single,
+        get_exit_code: _get_exit_code,
+        close_handle,
+        set_handle_info,
+    } = match run_shell_inner_resolve() {
+        Ok(fns) => fns,
+        Err(e) => return Response::Err(String::from(e)),
+    };
 
     // ---- build the pipe: read end stays in the parent, write end goes to child ----
     let (child_std_out_read, child_std_out_write) =
@@ -165,6 +172,18 @@ unsafe fn run_shell_inner(args: &str) -> Response {
     run_shell_inner_finish(_get_exit_code, close_handle, pi, child_std_out_read, out)
 }
 
+/// The 7 kernel32 exports used by [`run_shell_inner`], resolved up front in
+/// one pass. Grouped so the resolve helper's signature stays short.
+struct ShellExports {
+    create_process: CreateProcessW,
+    create_pipe: CreatePipe,
+    read_file: ReadFile,
+    wait_for_single: WaitForSingleObject,
+    get_exit_code: GetExitCodeProcess,
+    close_handle: CloseHandle,
+    set_handle_info: SetHandleInformation,
+}
+
 /// Resolve all 7 kernel32 exports used by [`run_shell_inner`], in the order
 /// the original function did. Returns the resolved function pointers, or the
 /// exact original `shell: <export> unresolved` message on the first miss.
@@ -172,8 +191,7 @@ unsafe fn run_shell_inner(args: &str) -> Response {
 /// # Safety
 /// Transmutes raw export addresses into function pointers; every one is used
 /// on kernel handles below.
-unsafe fn run_shell_inner_resolve(
-) -> Result<(CreateProcessW, CreatePipe, ReadFile, WaitForSingleObject, GetExitCodeProcess, CloseHandle, SetHandleInformation), &'static str> {
+unsafe fn run_shell_inner_resolve() -> Result<ShellExports, &'static str> {
     let create_process: CreateProcessW = match export_addr(b"kernel32.dll", b"CreateProcessW") {
         Some(a) => core::mem::transmute(a),
         None => return Err("shell: CreateProcessW unresolved"),
@@ -205,15 +223,15 @@ unsafe fn run_shell_inner_resolve(
             Some(a) => core::mem::transmute(a),
             None => return Err("shell: SetHandleInformation unresolved"),
         };
-    Ok((
+    Ok(ShellExports {
         create_process,
         create_pipe,
         read_file,
         wait_for_single,
-        _get_exit_code,
+        get_exit_code: _get_exit_code,
         close_handle,
         set_handle_info,
-    ))
+    })
 }
 
 /// Build the anonymous pipe: read end stays in the parent, write end goes to
