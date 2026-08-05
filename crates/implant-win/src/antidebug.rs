@@ -44,6 +44,41 @@ pub fn is_debugged() -> bool {
 /// Returns true if a debugger port is set. Goes through the indirect-syscall
 /// runtime when it's up (falls back to the resolved export otherwise).
 pub fn is_remote_debugged() -> bool {
+    // Prefer the indirect-syscall runtime if initialized.
+    if let Some(rt) = crate::syscalls::global() {
+        if let Some(debugged) = is_remote_debugged_via_syscall(rt) {
+            return debugged;
+        }
+        // Fall through to the export path if the syscall didn't return success.
+    }
+    is_remote_debugged_via_export()
+}
+
+/// Returns Some(port != 0) when the indirect syscall succeeded, None otherwise.
+fn is_remote_debugged_via_syscall(rt: &'static crate::syscalls::Runtime) -> Option<bool> {
+    let mut port: usize = 0;
+    let mut retlen: u32 = 0;
+    // NtQueryInformationProcess is 5 args → syscall6 padded.
+    let st = unsafe {
+        crate::syscalls::syscall6(
+            rt,
+            crate::resolve::djb2(b"ntqueryinformationprocess"),
+            usize::MAX, // GetCurrentProcess pseudohandle (-1 = 0xFFFF...FFFF).
+            PROCESS_DEBUG_PORT as usize,
+            &mut port as *mut usize as usize,
+            core::mem::size_of::<usize>(),
+            &mut retlen as *mut u32 as usize,
+            0,
+        )
+    };
+    match st {
+        Some(0) => Some(port != 0),
+        _ => None,
+    }
+}
+
+/// Export-resolution fallback path (kernel32 GetCurrentProcess + ntdll NQIP).
+fn is_remote_debugged_via_export() -> bool {
     type GetCurrentProcess = unsafe extern "system" fn() -> *mut c_void;
     type NtQueryInformationProcess = unsafe extern "system" fn(
         *mut c_void, // ProcessHandle
@@ -53,30 +88,6 @@ pub fn is_remote_debugged() -> bool {
         *mut u32,    // ReturnLength
     ) -> i32;
 
-    // Prefer the indirect-syscall runtime if initialized.
-    if let Some(rt) = crate::syscalls::global() {
-        let mut port: usize = 0;
-        let mut retlen: u32 = 0;
-        // NtQueryInformationProcess is 5 args → syscall6 padded.
-        let st = unsafe {
-            crate::syscalls::syscall6(
-                rt,
-                crate::resolve::djb2(b"ntqueryinformationprocess"),
-                usize::MAX, // GetCurrentProcess pseudohandle (-1 = 0xFFFF...FFFF).
-                PROCESS_DEBUG_PORT as usize,
-                &mut port as *mut usize as usize,
-                core::mem::size_of::<usize>(),
-                &mut retlen as *mut u32 as usize,
-                0,
-            )
-        };
-        if let Some(0) = st {
-            return port != 0;
-        }
-        // Fall through to the export path if the syscall didn't return success.
-    }
-
-    // Export fallback.
     let gcp: GetCurrentProcess = match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") }
     {
         Some(a) => unsafe { core::mem::transmute(a) },
