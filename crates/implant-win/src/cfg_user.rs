@@ -194,6 +194,37 @@ unsafe fn mark_nt(addr: usize) -> bool {
     mark_single_nt(nt_set_vm, alloc_base, reg_size, offset)
 }
 
+#[repr(C)]
+struct CfgTargetInfo {
+    offset: usize,
+    flags: u32,
+}
+
+#[repr(C)]
+struct MemRegionEntry {
+    virtual_address: *mut c_void,
+    number_of_bytes: usize,
+}
+
+#[repr(C)]
+struct VmCfgInfo {
+    number_of_entries: u32,
+    _pad: u32,
+    _z1: usize,
+    _z2: usize,
+    entry_ptr: *mut CfgTargetInfo,
+    out_ptr: *mut u32,
+}
+
+type SetVmFn = unsafe extern "system" fn(
+    *mut c_void,
+    u32,
+    usize,
+    *mut MemRegionEntry,
+    *mut VmCfgInfo,
+    u32,
+) -> i32;
+
 /// Single-address mark via the NT path (reuses resolved set_vm address).
 unsafe fn mark_single_nt(
     nt_set_vm: usize,
@@ -201,36 +232,20 @@ unsafe fn mark_single_nt(
     reg_size: usize,
     offset: usize,
 ) -> bool {
-    #[repr(C)]
-    struct CfgTargetInfo {
-        offset: usize,
-        flags: u32,
-    }
+    let st = mark_single_nt_invoke(nt_set_vm, alloc_base, reg_size, offset);
+    // 0 = STATUS_SUCCESS, negative = error code.
+    // STATUS_CFG_CALL_TARGET_ALREADY_VALID = 0xC0000413 → non-fatal.
+    st >= 0
+}
 
-    #[repr(C)]
-    struct MemRegionEntry {
-        virtual_address: *mut c_void,
-        number_of_bytes: usize,
-    }
-
-    #[repr(C)]
-    struct VmCfgInfo {
-        number_of_entries: u32,
-        _pad: u32,
-        _z1: usize,
-        _z2: usize,
-        entry_ptr: *mut CfgTargetInfo,
-        out_ptr: *mut u32,
-    }
-
-    type SetVmFn = unsafe extern "system" fn(
-        *mut c_void,
-        u32,
-        usize,
-        *mut MemRegionEntry,
-        *mut VmCfgInfo,
-        u32,
-    ) -> i32;
+/// Build the per-entry descriptors and issue the `NtSetInformationVirtualMemory`
+/// (VmCfgCallTargetInformation) call; returns the NT status.
+unsafe fn mark_single_nt_invoke(
+    nt_set_vm: usize,
+    alloc_base: *mut c_void,
+    reg_size: usize,
+    offset: usize,
+) -> i32 {
     let set_fn: SetVmFn = core::mem::transmute(nt_set_vm);
 
     let mut cti = CfgTargetInfo { offset, flags: 1 };
@@ -250,46 +265,58 @@ unsafe fn mark_single_nt(
 
     // VmCfgCallTargetInformation = 4 (0x4)
     // InformationClass = 4 for the Set call
-    let st = set_fn(
+    set_fn(
         (-1isize) as *mut c_void, // CurrentProcess
         4,                        // VmCfgCallTargetInformation
         1,                        // NumberOfMemRangeEntries
         &mut mre,
         &mut vmi,
         core::mem::size_of::<VmCfgInfo>() as u32,
-    );
-    // 0 = STATUS_SUCCESS, negative = error code.
-    // STATUS_CFG_CALL_TARGET_ALREADY_VALID = 0xC0000413 → non-fatal.
-    st >= 0
+    )
 }
 
 // ---- Internal: Memory region query ----------------------------------------
+
+#[repr(C)]
+struct MemBasicInfo {
+    base: *mut c_void,
+    alloc_base: *mut c_void,
+    alloc_prot: u32,
+    _p1: u32,
+    reg_size: usize,
+    state: u32,
+    prot: u32,
+    typ: u32,
+    _p2: u32,
+}
+
+type QueryVmFn = unsafe extern "system" fn(
+    *mut c_void,
+    *const c_void,
+    u32,
+    *mut c_void,
+    usize,
+    *mut usize,
+) -> i32;
 
 /// Query the allocation base and region size for `addr`.
 /// Returns `Some((alloc_base, region_size))` if the region is committed private
 /// memory (MEM_COMMIT | MEM_PRIVATE); `None` otherwise.
 unsafe fn query_region(nt_query_vm: usize, addr: usize) -> Option<(*mut c_void, usize)> {
-    #[repr(C)]
-    struct MemBasicInfo {
-        base: *mut c_void,
-        alloc_base: *mut c_void,
-        alloc_prot: u32,
-        _p1: u32,
-        reg_size: usize,
-        state: u32,
-        prot: u32,
-        typ: u32,
-        _p2: u32,
+    let (alloc_base, state, typ, reg_size) = query_region_query(nt_query_vm, addr)?;
+    // MEM_COMMIT = 0x1000, MEM_PRIVATE = 0x20000
+    if state != 0x1000 || typ != 0x20000 {
+        return None;
     }
+    Some((alloc_base, reg_size))
+}
 
-    type QueryVmFn = unsafe extern "system" fn(
-        *mut c_void,
-        *const c_void,
-        u32,
-        *mut c_void,
-        usize,
-        *mut usize,
-    ) -> i32;
+/// Invoke `NtQueryVirtualMemory` and return the raw region fields
+/// `(alloc_base, state, type, region_size)` on success.
+unsafe fn query_region_query(
+    nt_query_vm: usize,
+    addr: usize,
+) -> Option<(*mut c_void, u32, u32, usize)> {
     let query_fn: QueryVmFn = core::mem::transmute(nt_query_vm);
 
     let mut mbi = MemBasicInfo {
@@ -317,12 +344,7 @@ unsafe fn query_region(nt_query_vm: usize, addr: usize) -> Option<(*mut c_void, 
         return None;
     }
 
-    // MEM_COMMIT = 0x1000, MEM_PRIVATE = 0x20000
-    if mbi.state != 0x1000 || mbi.typ != 0x20000 {
-        return None;
-    }
-
-    Some((mbi.alloc_base, mbi.reg_size))
+    Some((mbi.alloc_base, mbi.state, mbi.typ, mbi.reg_size))
 }
 
 // ---- Selftest support -----------------------------------------------------
