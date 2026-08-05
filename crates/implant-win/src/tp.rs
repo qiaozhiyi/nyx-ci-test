@@ -877,8 +877,18 @@ unsafe fn hijack_fetch_table(
     // Grow the buffer generously — the table can expand between the size query
     // and the content query.
     let cap = needed.saturating_mul(3) / 2 + 0x1000;
-    let mut buf = crate::heap::vec![0u8; cap as usize];
+    let buf = crate::heap::vec![0u8; cap as usize];
+    unsafe { hijack_fetch_table_payload(qsi, buf, cap) }
+}
 
+/// Fetch the full SYSTEM_HANDLE_INFORMATION_EX payload, retrying once at 2x
+/// when the table grew between the size and content queries
+/// (STATUS_INFO_LENGTH_MISMATCH).
+unsafe fn hijack_fetch_table_payload(
+    qsi: NtQuerySystemInformationFn,
+    mut buf: crate::heap::Vec<u8>,
+    cap: u32,
+) -> Result<crate::heap::Vec<u8>, String> {
     // ---- 2. Fetch the full handle table ----
     let mut ret_len: u32 = 0;
     let st = unsafe {
