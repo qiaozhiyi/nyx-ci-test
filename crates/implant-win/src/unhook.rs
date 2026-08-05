@@ -210,10 +210,7 @@ struct RawSection {
 /// Resolves NtOpenSection/NtMapViewOfSection from the (hooked) in-process
 /// ntdll via the PEB walk. See module docs on the chicken-and-egg trade-off.
 pub unsafe fn fresh_ntdll_text() -> Option<(*mut u8, u32, u32)> {
-    let open = crate::resolve::export_addr(b"ntdll.dll", b"NtOpenSection")?;
-    let map = crate::resolve::export_addr(b"ntdll.dll", b"NtMapViewOfSection")?;
-    let open: NtOpenSection = core::mem::transmute(open);
-    let map: NtMapViewOfSection = core::mem::transmute(map);
+    let (open, map) = fresh_ntdll_resolve()?;
 
     // Build "\KnownDlls\ntdll" as UTF-16 on the stack. NO ".dll" — the
     // KnownDlls object is named "ntdll", and "\KnownDlls\ntdll.dll" FAILS.
@@ -251,14 +248,41 @@ pub unsafe fn fresh_ntdll_text() -> Option<(*mut u8, u32, u32)> {
         security_quality_of_service: core::ptr::null_mut(),
     };
 
-    // NtOpenSection -> section handle.
+    let section = fresh_ntdll_open_section(open, &mut oa)?;
+    let fresh = fresh_ntdll_map_view(map, section)?;
+    let (rva, size) = fresh_ntdll_locate_text(fresh)?;
+    Some((fresh, rva, size))
+}
+
+/// Resolve the two section-mapping exports from the (hooked) in-process ntdll.
+unsafe fn fresh_ntdll_resolve() -> Option<(NtOpenSection, NtMapViewOfSection)> {
+    let open = crate::resolve::export_addr(b"ntdll.dll", b"NtOpenSection")?;
+    let map = crate::resolve::export_addr(b"ntdll.dll", b"NtMapViewOfSection")?;
+    let open: NtOpenSection = core::mem::transmute(open);
+    let map: NtMapViewOfSection = core::mem::transmute(map);
+    Some((open, map))
+}
+
+/// NtOpenSection -> section handle. `None` when the KnownDlls section can't
+/// be opened (ACL, low IL) — the caller falls back to the hooked ntdll.
+unsafe fn fresh_ntdll_open_section(
+    open: NtOpenSection,
+    oa: &mut ObjectAttributes,
+) -> Option<*mut c_void> {
     let mut section: *mut c_void = core::ptr::null_mut();
-    let st = open(&mut section, SECTION_MIN_ACCESS, &mut oa);
+    let st = open(&mut section, SECTION_MIN_ACCESS, oa as *mut ObjectAttributes);
     if st < 0 || section.is_null() {
         return None;
     }
+    Some(section)
+}
 
-    // NtMapViewOfSection, PAGE_READONLY, ViewSize=0 (whole image).
+/// NtMapViewOfSection, PAGE_READONLY, ViewSize=0 (whole image). Returns the
+/// mapped base address, or `None` if the map failed.
+unsafe fn fresh_ntdll_map_view(
+    map: NtMapViewOfSection,
+    section: *mut c_void,
+) -> Option<*mut u8> {
     let mut base: *mut c_void = core::ptr::null_mut();
     let mut view_size: usize = 0;
     let mut section_offset: u64 = 0;
@@ -277,10 +301,14 @@ pub unsafe fn fresh_ntdll_text() -> Option<(*mut u8, u32, u32)> {
     if st < 0 || base.is_null() {
         return None;
     }
+    Some(base as *mut u8)
+}
 
-    let fresh = base as *mut u8;
+/// Parse the mapped PE's `.text` and return `(text_rva, text_size)`. On a
+/// parse failure the fresh view is unmapped before returning `None`.
+unsafe fn fresh_ntdll_locate_text(fresh: *mut u8) -> Option<(u32, u32)> {
     match parse_text_section(fresh) {
-        Some((rva, size)) => Some((fresh, rva, size)),
+        Some((rva, size)) => Some((rva, size)),
         None => {
             unmap_fresh(fresh);
             None
@@ -379,6 +407,15 @@ pub unsafe fn fresh_ntdll_text_disk() -> Option<DiskTextHandle> {
 /// Resolves `GetSystemDirectoryW`/`CreateFileW`/`ReadFile`/`CloseHandle` from
 /// kernel32 via the PEB walk.
 unsafe fn read_ntdll_file() -> Option<Vec<u8>> {
+    let (gsdw, create, read, close) = read_ntdll_resolve()?;
+    let sysdir = read_ntdll_sysdir(gsdw)?;
+    let h = read_ntdll_create(create, &sysdir)?;
+    read_ntdll_read_all(read, close, h)
+}
+
+/// Resolve the four kernel32 file-IO exports via the PEB walk and transmute
+/// them to their FFI types.
+unsafe fn read_ntdll_resolve() -> Option<(GetSystemDirectoryW, CreateFileW, ReadFile, CloseHandle)> {
     let gsdw = crate::resolve::export_addr(b"kernel32.dll", b"GetSystemDirectoryW")?;
     let create = crate::resolve::export_addr(b"kernel32.dll", b"CreateFileW")?;
     let read = crate::resolve::export_addr(b"kernel32.dll", b"ReadFile")?;
@@ -387,7 +424,12 @@ unsafe fn read_ntdll_file() -> Option<Vec<u8>> {
     let create: CreateFileW = core::mem::transmute(create);
     let read: ReadFile = core::mem::transmute(read);
     let close: CloseHandle = core::mem::transmute(close);
+    Some((gsdw, create, read, close))
+}
 
+/// Build the full `%SystemRoot%\ntdll.dll` wide path in a 260-char buffer.
+/// Returns `None` if the system directory query fails or the path doesn't fit.
+unsafe fn read_ntdll_sysdir(gsdw: GetSystemDirectoryW) -> Option<[u16; 260]> {
     // 1. System directory (wide). GetSystemDirectoryW returns the required
     //    length (chars, excl. NUL); if it exceeds our 260-char buffer, give up.
     let mut sysdir: [u16; 260] = [0; 260];
@@ -416,7 +458,15 @@ unsafe fn read_ntdll_file() -> Option<Vec<u8>> {
     for (i, &c) in suffix.iter().enumerate() {
         sysdir[n as usize + i] = c;
     }
+    Some(sysdir)
+}
 
+/// Open `%SystemRoot%\ntdll.dll` with CreateFileW (GENERIC_READ, share
+/// read+delete, OPEN_EXISTING). Returns the handle, or `None` on failure.
+unsafe fn read_ntdll_create(
+    create: CreateFileW,
+    sysdir: &[u16; 260],
+) -> Option<*mut c_void> {
     // 3. CreateFileW (GENERIC_READ, share read+delete, OPEN_EXISTING).
     let h = create(
         sysdir.as_ptr(),
@@ -430,7 +480,16 @@ unsafe fn read_ntdll_file() -> Option<Vec<u8>> {
     if h.is_null() || h == INVALID_HANDLE_VALUE {
         return None;
     }
+    Some(h)
+}
 
+/// Read the whole file into a heap `Vec<u8>` and close the handle. Returns
+/// `None` on any Win32 failure or if the file exceeds [`NTDLL_FILE_CAP`].
+unsafe fn read_ntdll_read_all(
+    read: ReadFile,
+    close: CloseHandle,
+    h: *mut c_void,
+) -> Option<Vec<u8>> {
     // 4. ReadFile loop into a growing Vec until EOF (read==0) or the cap.
     //    `cap_chunk` defends the per-read nNumberOfBytesToRead (u32): never ask
     //    for more than u32::MAX, and keep the cumulative buffer under the cap.
