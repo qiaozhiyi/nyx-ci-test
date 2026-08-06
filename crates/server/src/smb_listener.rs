@@ -50,7 +50,6 @@ const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
 const PIPE_READMODE_BYTE: u32 = 0x0000_0000;
 const PIPE_WAIT: u32 = 0x0000_0000;
 const PIPE_UNLIMITED_INSTANCES: u32 = 0xFF;
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 const ERROR_PIPE_CONNECTED: i32 = 535;
 const ERROR_NO_DATA: i32 = 232;
 const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
@@ -116,7 +115,11 @@ pub fn spawn(state: Arc<AppState>, pipe_name: String) {
             let pipe = unsafe {
                 CreateNamedPipeW(
                     wide.as_ptr(),
-                    PIPE_ACCESS_DUPLEX | FILE_ATTRIBUTE_NORMAL,
+                    // PIPE_ACCESS_* | FILE_FLAG_* | SECURITY_SQOS_PRESENT only —
+                    // FILE_ATTRIBUTE_NORMAL is invalid here and makes real
+                    // Windows return ERROR_INVALID_PARAMETER (wine tolerated
+                    // it; caught on windows-latest 2026-08).
+                    PIPE_ACCESS_DUPLEX,
                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                     PIPE_UNLIMITED_INSTANCES,
                     65536,

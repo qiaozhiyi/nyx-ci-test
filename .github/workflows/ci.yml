@@ -186,11 +186,6 @@ jobs:
         run: rustup toolchain install nightly --target x86_64-pc-windows-gnu --no-self-update
       - name: Build selftest DLL
         run: cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --features selftest --target x86_64-pc-windows-gnu
-      # Production (default-features) build: ~50 selftest exports are
-      # feature-gated OUT, so this validates the exact shipped DLL layout —
-      # the last of the 6 standalone crates with no dedicated build gate.
-      - name: Build production DLL (no selftest exports)
-        run: cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-gnu
       - name: Install qiling + run selftest matrix
         run: |
           set -e
@@ -207,6 +202,14 @@ jobs:
           cp tools/selftest-qiling/keystone_stub.py "$KEYSITE/keystone/__init__.py"
           /tmp/qiling-venv/bin/python -c "import qiling.arch.x86" 2>&1 || true
           /tmp/qiling-venv/bin/python tools/selftest-qiling/runner.py
+      # Production (default-features) build: ~50 selftest exports are
+      # feature-gated OUT, so this validates the exact shipped DLL layout —
+      # the last of the 6 standalone crates with no dedicated build gate.
+      # MUST run AFTER the matrix: both builds write the same DLL path and
+      # the production build would strip the selftest exports the runner
+      # needs (caught on public CI 2026-08).
+      - name: Build production DLL (no selftest exports)
+        run: cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-gnu
 
   # ---- Gate 7: TLS fingerprint emission (impersonation feature) ----
   # The JA3/JA4 *computation* engine (server-side inbound sniffing) is covered

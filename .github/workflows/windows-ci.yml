@@ -162,7 +162,9 @@ jobs:
       - name: Kernel assessment (nyx-kernel assess --user) - hard gate
         shell: pwsh
         run: |
-          $exe = "target\release\nyx-kernel.exe"
+          # operator-kernel-cli is a standalone workspace: its binary lands in
+          # its own target dir, not the root one (fixed 2026-08).
+          $exe = "crates\operator-kernel-cli\target\release\nyx-kernel.exe"
           if (-not (Test-Path $exe)) { Write-Host "::error::nyx-kernel.exe missing"; exit 1 }
           $out = & $exe assess --user 2>&1
           $exit = $LASTEXITCODE
