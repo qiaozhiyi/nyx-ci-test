@@ -867,8 +867,8 @@ pub unsafe extern "system" fn nyx_selftest_bof_isolated() {
             Ok(Response::BofOutput(_)) => {
                 diag_stderr("bof_isolated(print): BofOutput without BOF-PRINT-OK marker")
             }
-            Ok(Response::Err(_)) => {
-                diag_stderr("bof_isolated(print): child failed (Response::Err)")
+            Ok(Response::Err(msg)) => {
+                diag_stderr_parts(&["bof_isolated(print): Response::Err: ", msg.as_str()])
             }
             Err(e) => diag_stderr_parts(&["bof_isolated(print): pre-launch failure: ", e]),
             _ => diag_stderr("bof_isolated(print): unexpected response"),
@@ -882,6 +882,9 @@ pub unsafe extern "system" fn nyx_selftest_bof_isolated() {
             match r {
                 Ok(Response::BofOutput(_)) => {
                     diag_stderr("bof_isolated(crash): expected Err, got clean BofOutput")
+                }
+                Ok(Response::Err(msg)) => {
+                    diag_stderr_parts(&["bof_isolated(crash): Response::Err: ", msg.as_str()])
                 }
                 Err(e) => diag_stderr_parts(&["bof_isolated(crash): pre-launch failure: ", e]),
                 _ => diag_stderr("bof_isolated(crash): expected Err, got other response"),
