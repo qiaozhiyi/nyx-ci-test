@@ -166,8 +166,13 @@ pub unsafe extern "C" fn nyx_bof_host_entry(packed: *const u8) -> ! {
 /// Write a stage number into the payload's stage slot (the parent reads it
 /// back from its local section mapping — pipe-independent progress signal).
 unsafe fn set_stage(packed: *const u8, base_off: usize, stage: u64) {
+    // Primary: the payload stage slot. Redundant: the blob_len field
+    // (payload offset 0) — never re-read after parse, and it gives the
+    // parent a zero-layout-change observation point.
     let slot = unsafe { (packed.add(base_off) as *const u64) as *mut u64 };
     unsafe { slot.write_unaligned(stage) };
+    let len_slot = packed as *mut u32;
+    unsafe { len_slot.write_unaligned(stage as u32) };
 }
 
 /// Parse the packed payload, stash the args pointer for the dataparse
