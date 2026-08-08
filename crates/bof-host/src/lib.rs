@@ -191,7 +191,6 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
             return Some(r);
         }
     }
-    stamp_diag(0xC6);
     None
 }
 
