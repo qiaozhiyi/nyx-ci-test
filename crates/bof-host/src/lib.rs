@@ -207,10 +207,34 @@ unsafe fn entry_run(packed: *const u8) -> u32 {
     // back from its local section mapping (band-out-of-band progress, since
     // the pipe may be unwritable in some environments).
     let base_off = args_len_off + 4 + args_len as usize;
-    // TEB slot writes DISABLED (diagnostic): the child loads normally under
-    // the CreateRemoteThread model, so the PEB walk works and the fallback
-    // slots are unnecessary; gs:[0x1780]/[0x1788] writes are suspected of
-    // corrupting TEB state under some environments.
+    // B3 parent-provided bases (see [`export_addr`]): [u64 stage][u64
+    // ntdll_base][u64 stdout_handle] sit right after the packed args.
+    // Stashed in the TEB slots gs:[0x1780] (ntdll base) and gs:[0x1788]
+    // (stdout handle) — nothing else in the sacrificial process uses them.
+    // The stage slot is written by `set_stage` below (the parent reads it
+    // back from its section view — pipe-independent progress signal).
+    if base_off + 24 <= (MAX_ARGS as usize) + 4 + 24 {
+        let nt_base = unsafe { (packed.add(base_off + 8) as *const u64).read_unaligned() };
+        let out_handle = unsafe { (packed.add(base_off + 16) as *const u64).read_unaligned() };
+        if nt_base != 0 {
+            unsafe {
+                core::arch::asm!(
+                    "mov qword ptr gs:[0x1780], {}",
+                    in(reg) nt_base,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+        if out_handle != 0 {
+            unsafe {
+                core::arch::asm!(
+                    "mov qword ptr gs:[0x1788], {}",
+                    in(reg) out_handle,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+    }
     // Stage 1: entry reached + payload parsed.
     set_stage(packed, base_off, 1);
 
