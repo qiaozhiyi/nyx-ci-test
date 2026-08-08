@@ -23,7 +23,7 @@ type RtlFreeHeapFn = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) ->
 /// Resolve + call `RtlGetProcessHeap`. Null on failure (kernel32 gone —
 /// catastrophic; the alloc error handler will fire on the null return).
 unsafe fn process_heap() -> *mut c_void {
-    let Some(addr) = (unsafe { export_addr(b"ntdll.dll", b"RtlGetProcessHeap") }) else {
+    let Some(addr) = (unsafe { export_addr(b"ntdll.dll", b"rtlgetprocessheap") }) else {
         return core::ptr::null_mut();
     };
     let f: RtlGetProcessHeapFn = unsafe { core::mem::transmute(addr) };
@@ -39,7 +39,7 @@ unsafe impl GlobalAlloc for ProcessHeapAlloc {
         if heap.is_null() {
             return core::ptr::null_mut();
         }
-        let Some(addr) = (unsafe { export_addr(b"ntdll.dll", b"RtlAllocateHeap") }) else {
+        let Some(addr) = (unsafe { export_addr(b"ntdll.dll", b"rtlallocateheap") }) else {
             return core::ptr::null_mut();
         };
         let f: RtlAllocateHeapFn = unsafe { core::mem::transmute(addr) };
@@ -52,7 +52,7 @@ unsafe impl GlobalAlloc for ProcessHeapAlloc {
         if heap.is_null() {
             return;
         }
-        let Some(addr) = (unsafe { export_addr(b"ntdll.dll", b"RtlFreeHeap") }) else {
+        let Some(addr) = (unsafe { export_addr(b"ntdll.dll", b"rtlfreeheap") }) else {
             return;
         };
         let f: RtlFreeHeapFn = unsafe { core::mem::transmute(addr) };

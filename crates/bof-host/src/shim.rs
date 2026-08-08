@@ -41,7 +41,7 @@ unsafe fn out_write(bytes: &[u8]) {
     if handle == 0 {
         return;
     }
-    let Some(wf_addr) = (unsafe { export_addr(b"ntdll.dll", b"NtWriteFile") }) else {
+    let Some(wf_addr) = (unsafe { export_addr(b"ntdll.dll", b"ntwritefile") }) else {
         return;
     };
     type NtWriteFileFn = unsafe extern "system" fn(
@@ -504,7 +504,7 @@ pub unsafe extern "C" fn BeaconCleanupProcess(pi: *mut core::ffi::c_void) {
     }
     // PROCESS_INFORMATION layout (Win64): HANDLE hProcess, hThread; DWORD pid, tid.
     type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
-    if let Some(addr) = unsafe { export_addr(b"ntdll.dll", b"CloseHandle") } {
+    if let Some(addr) = unsafe { export_addr(b"ntdll.dll", b"closehandle") } {
         let close: CloseHandle = unsafe { core::mem::transmute(addr) };
         let base = pi as *const usize;
         let (h_proc, h_thread) = unsafe { (*base, *base.add(1)) };

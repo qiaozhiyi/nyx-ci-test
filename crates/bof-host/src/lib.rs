@@ -86,7 +86,7 @@ fn _alloc_error(_layout: core::alloc::Layout) -> ! {
 /// Resolve `ExitProcess` and leave the process with `code`. Diverges.
 fn exit_process(code: u32) -> ! {
     // NtTerminateProcess on NtCurrentProcess: no kernel32 in the child.
-    if let Some(addr) = unsafe { crate::export_addr(b"ntdll.dll", b"NtTerminateProcess") } {
+    if let Some(addr) = unsafe { crate::export_addr(b"ntdll.dll", b"ntterminateprocess") } {
         let f: extern "system" fn(usize, i32) -> i32 = unsafe { core::mem::transmute(addr) };
         let _ = unsafe { f(!0usize, code as i32) };
     }
