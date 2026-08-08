@@ -253,10 +253,15 @@ unsafe fn entry_run(packed: *const u8) -> u32 {
 
     set_stage(packed, base_off, 2);
     let r = unsafe { exec::run(blob, args_ptr, args_len as i32) };
-    set_stage(packed, base_off, 3);
     match r {
-        Ok(()) => 0,
+        Ok(()) => {
+            set_stage(packed, base_off, 3);
+            0
+        }
         Err(msg) => {
+            // 0xE1 = exec failed (diagnostic); the message goes to the pipe
+            // when the stdout handle slot is present.
+            set_stage(packed, base_off, 0xE1);
             shim::write_line(b"[bof-host] ");
             shim::write_line(msg.as_bytes());
             shim::write_line(b"\n");
