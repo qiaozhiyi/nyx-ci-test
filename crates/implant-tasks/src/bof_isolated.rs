@@ -328,12 +328,18 @@ unsafe fn reclaim_timeout(
     api: &ReclaimApi,
     proc_h: *mut c_void,
     pipe_read: *mut c_void,
-    out: Vec<u8>,
+    mut out: Vec<u8>,
 ) -> Response {
     unsafe {
         let _ = (api.terminate)(proc_h, 1);
+        // The kill lands: whatever the child wrote before stalling (stage
+        // markers etc.) is now readable — keep it for the diagnostics.
         if (api.wait_for_single)(proc_h, KILL_SETTLE_MS) == 0 {
-            drain(api.read_file, pipe_read);
+            let tail = drain(api.read_file, pipe_read);
+            if out.len() < DRAIN_CAP {
+                let room = DRAIN_CAP.saturating_sub(out.len());
+                out.extend_from_slice(&tail[..tail.len().min(room)]);
+            }
         }
     }
     let mut msg = String::from("bof isolate timeout");
