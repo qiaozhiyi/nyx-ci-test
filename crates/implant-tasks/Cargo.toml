@@ -1,0 +1,52 @@
+# NOTE: not a workspace member — built standalone or as a path dependency of
+# nyx-implant-win (requires nightly + a Windows x86_64 target). Kept out of the
+# root workspace so the stable dev-host workspace stays green.
+[package]
+name = "nyx-implant-tasks"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Nyx Windows PIC implant task layer (beacon loop, task modules, BOF loader, selftests) extracted from nyx-implant-win. Requires nightly + Windows toolchain for the full build."
+
+[features]
+default = []
+# Gate the ~50 #[no_mangle] nyx_selftest_* / nyx_linger* rundll32 exports in
+# selftests.rs (plus the selftest-gated items in bof/fs/screenshot/task_guard
+# and trex's nyx_selftest_trex) behind this feature. Production builds
+# (default features) exclude all selftest exports. Forwarded by the shell
+# crate's `selftest` feature.
+selftest = []
+
+# Standalone (NOT in the root workspace), same pattern as nyx-implant-core.
+[workspace]
+
+[dependencies]
+# Core layer (WP-C crate split): heap/cell/fmt/resolve/ntalloc/unhook/stack/
+# version/syscalls/context/hostinfo/config/diag live there.
+nyx-implant-core = { path = "../implant-core" }
+# Evasion layer (WP-C crate split, step 2): blind/blind_hwbp/cfg_user/sleep/
+# fluctuation/mem/antidebug/lacuna/lacuna_stomp/caller_spoof/envprobe/
+# evasion_glue/hookchain/insomniac/proxy_veh live there.
+nyx-implant-evasion = { path = "../implant-evasion" }
+# Net layer (WP-C crate split, step 3): the beacon loop dispatches through
+# channels; selftests drive transport/channels directly.
+nyx-implant-net = { path = "../implant-net" }
+# Path dep (this crate is standalone, outside the root workspace). protocol
+# builds WITHOUT its `std` feature here — the implant is #![no_std], so pulling
+# in std would duplicate the panic_impl lang item.
+nyx-protocol = { path = "../protocol", default-features = false }
+# COFF/BOF loader core (no_std-compatible): parse + relocate a CS-compatible
+# BOF object file. bof.rs maps sections W^X and runs them.
+nyx-coff = { path = "../coff" }
+# Userland evasion kit seams (no_std): inject.rs implements ProcessInjectKit
+# (ModuleStomper); selftests.rs uses PdataGapScanner/gap/swap primitives.
+nyx-implant-evasionsdk = { path = "../implant-evasionsdk", default-features = false }
+
+# no_std PIC: dev/check builds must abort too — there's no unwinding without
+# std, so any debug panic path (e.g. integer-overflow checks) would otherwise
+# fail `cargo check` with "unwinding panics are not supported without std".
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

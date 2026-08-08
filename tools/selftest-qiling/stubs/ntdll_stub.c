@@ -1,7 +1,7 @@
 /*
  * Stub ntdll.dll for Qiling selftest runs.
  *
- * The implant's global allocator (crates/implant-win/src/ntalloc.rs) resolves
+ * The implant's global allocator (crates/implant-core/src/ntalloc.rs) resolves
  * RtlCreateHeap + RtlAllocateHeap (+ RtlFreeHeap/RtlReAllocateHeap) through
  * the PEB walk. Qiling implements hook_RtlAllocateHeap (allocates from its own
  * emulated heap) but NOT RtlCreateHeap/RtlFreeHeap, so:

@@ -67,7 +67,7 @@ fn clamp_scalar(mut s: [u8; 32]) -> [u8; 32] {
 ///                            server_pub || implant_pub)
 ///
 /// This MUST match `derive_config_key` in
-/// `crates/implant-win/src/config_placeholder.rs`.
+/// `crates/implant-tasks/src/config_placeholder.rs`.
 fn derive_config_key_server(implant_priv: &[u8; 32], server_pub: &[u8; 32]) -> Option<[u8; 32]> {
     let implant_pub = nyx_protocol::crypto::public_from_secret(implant_priv)?;
     let shared = nyx_protocol::crypto::ecdh(implant_priv, server_pub)?;
@@ -620,7 +620,7 @@ fn check_request_fields(req: &GenerateRequest) -> Result<(), (StatusCode, String
     // know at generation time), so a non-zero `keying` would produce an
     // implant that can never decrypt its own config — a dead beacon. Reject
     // hard rather than ship a guaranteed-broken implant. See
-    // `crates/implant-win/src/env_keying.rs` for the layer semantics.
+    // `crates/implant-tasks/src/env_keying.rs` for the layer semantics.
     if req.keying != 0 {
         return Err((
             StatusCode::BAD_REQUEST,

@@ -7,7 +7,7 @@ the guest process through `ExitProcess(bitmask)`; the runner captures that
 exit code (rcx at the ExitProcess hook) and reports a feasibility matrix.
 
 The implant resolves Windows APIs itself through a PEB-walk + export-table
-hash lookup (crates/implant-win/src/resolve.rs) and calls export addresses
+hash lookup (crates/implant-core/src/resolve.rs) and calls export addresses
 directly — it does NOT use the IAT. Qiling intercepts those direct calls with
 its per-instruction code hook and dispatches to its Python API
 implementations by export name, so the rootfs only needs PE stubs whose
@@ -31,7 +31,7 @@ env dump-all sub-check sees a non-empty result), GetUserNameW (writes
 strlen (byte-level ops for the allocator and string paths).
 
 Exit codes:
-  bitmask   -> sub-check bits set (see crates/implant-win/src/selftests.rs)
+  bitmask   -> sub-check bits set (see crates/implant-tasks/src/selftests.rs)
   0xAD      -> allocator OOM (fallback bump buffer exhausted)
   0xFFFFFFFE-> runtime bootstrap failed (not used by the matrix below)
 """
@@ -70,6 +70,7 @@ MATRIX = [
     ("nyx_selftest_env", "env dump-all + unset-var via kernel32"),
     ("nyx_selftest_config", "in-memory config blob decode (pure)"),
     ("nyx_selftest_hostinfo", "hostname/user/pid/beacon_id via PEB walk"),
+    ("nyx_selftest_task_guard", "VEH task guard: rootfs lacks VEH/capture exports → env-skip flag (exit 9)"),
 ]
 
 # Per-export emulation budget (seconds). A selftest that hangs (e.g. an

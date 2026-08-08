@@ -41,5 +41,9 @@ tmp/
 # Playwright MCP test artifacts
 .playwright-mcp/
 
+# Python bytecode caches (tools/selftest-qiling, docs scripts, …)
+__pycache__/
+*.pyc
+
 # test fixtures intentionally named *.bin (embed! round-trip)
 !crates/config/tests/fixtures/*.bin

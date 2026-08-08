@@ -48,6 +48,7 @@ $EXPECTED_CODES = @{
     "nyx_selftest_pivot"          = $null   # needs closed port — host-dependent
     "nyx_selftest_inject"         = $null   # depends on sacrificial spawn success
     "nyx_selftest_resolve_forwarder" = 7    # bits 0-2
+    "nyx_selftest_task_guard"     = 7       # bits 0-2: round-trip/crash-recovery/re-arm (bit3 = env-skip flag)
     "nyx_selftest_syscall_rt"     = 3       # bits 0-1
     # The remaining exports (*_diag, *_probe, *_edge, *_full, *_armed variants)
     # are diagnostic/probe entries with host-dependent exit codes — $null.

@@ -1,0 +1,44 @@
+# NOTE: not a workspace member — built standalone or as a path dependency of
+# nyx-implant-win (requires nightly + a Windows x86_64 target). Kept out of the
+# root workspace so the stable dev-host workspace stays green.
+[package]
+name = "nyx-implant-net"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Nyx Windows PIC implant network layer (malleable-C2 envelopes/WinHTTP transport/channel dispatcher) extracted from nyx-implant-win. Requires nightly + Windows toolchain for the full build."
+
+[features]
+default = []
+
+# Standalone (NOT in the root workspace), same pattern as nyx-implant-core.
+[workspace]
+
+[dependencies]
+# Core layer (WP-C crate split): heap/resolve/config/diag live there; this
+# crate sits two layers above it in the DAG (core ← evasion ← net ← tasks ←
+# shell).
+nyx-implant-core = { path = "../implant-core" }
+# Evasion layer (WP-C crate split, step 2): channels/https.rs uses
+# mem::mask/unmask for the safe-http window (encrypt sensitive memory for the
+# duration of the WinHTTP transaction).
+nyx-implant-evasion = { path = "../implant-evasion" }
+# Malleable C2 transform engine (no_std): the transport applies the http-post
+# client envelope to each request body and inverts the server envelope on each
+# response. build.rs resolves the profile host-side (std) and bakes the
+# resolved Step/Terminator lists; the runtime crate only encodes/decodes.
+nyx-profile = { path = "../profile", default-features = false, features = ["no_std"] }
+
+[build-dependencies]
+# build.rs parses NYX_PROFILE (host-side, std) and bakes the resolved envelope
+# Step/Terminator lists into OUT_DIR/envelopes.rs for the runtime crate.
+nyx-profile = { path = "../profile" }
+
+# no_std PIC: dev/check builds must abort too — there's no unwinding without
+# std, so any debug panic path (e.g. integer-overflow checks) would otherwise
+# fail `cargo check` with "unwinding panics are not supported without std".
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

@@ -363,7 +363,10 @@ pub fn apply<'a>(
                 // COFF relocs are *deltas*: the field already holds the
                 // compiler's value (incl. any in-section addend); add the
                 // symbol's final address to it.
-                let cur = i64::from_le_bytes(buf[off..end].try_into().unwrap());
+                let cur = i64::from_le_bytes(match buf[off..end].try_into() {
+                    Ok(b) => b,
+                    Err(_) => return Err(ApplyError::BadOffset),
+                });
                 let v = cur.wrapping_add(target as i64);
                 buf[off..end].copy_from_slice(&v.to_le_bytes());
             }
@@ -389,18 +392,20 @@ pub fn apply<'a>(
                     reloc::REL32_3 => 3,
                     reloc::REL32_4 => 4,
                     reloc::REL32_5 => 5,
-                    // unreachable: the match arm above enumerates exactly these.
-                    _ => unreachable!("REL32 family arm caught non-family type"),
+                    // The match arm above enumerates exactly these; anything
+                    // else is an error, never a panic (WP-B2).
+                    _ => return Err(ApplyError::UnsupportedReloc(r.typ)),
                 };
-                let cur = i32::from_le_bytes(buf[off..end].try_into().unwrap());
+                let cur = i32::from_le_bytes(match buf[off..end].try_into() {
+                    Ok(b) => b,
+                    Err(_) => return Err(ApplyError::BadOffset),
+                });
                 // The displacement must fit in an i32 (the field width). If the
                 // resolved target is more than ~2 GiB away from the fixup
                 // location (e.g. BOF and trampoline loaded far apart), casting
                 // the i64 disp to i32 would silently truncate and apply a wrong
-                // fixup. Reject it instead. The pre-existing `end - off == 4`
-                // bounds check above makes the `try_into().unwrap()` above
-                // unreachable; it is left in because removing it would require
-                // an extra local.
+                // fixup. Reject it instead. (The `try_into` above is guarded by
+                // the `end - off == 4` check; the Err arm is defensive, WP-B2.)
                 let disp = target as i64 - loc as i64 - 4 - n;
                 if !(-2_147_483_648i64..=2_147_483_647i64).contains(&disp) {
                     return Err(ApplyError::RelocOverflow);

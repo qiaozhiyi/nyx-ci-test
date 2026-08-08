@@ -2,7 +2,7 @@
  * Stub kernel32.dll for Qiling selftest runs.
  *
  * The implant resolves every Win32 API through a PEB-walk + export-table hash
- * lookup (crates/implant-win/src/resolve.rs) and calls the export address
+ * lookup (crates/implant-core/src/resolve.rs) and calls the export address
  * directly. Qiling intercepts those direct calls with a code hook
  * (ql.hook_code -> hook_winapi) that dispatches to its Python API
  * implementations by export name, so the stub functions here are NEVER

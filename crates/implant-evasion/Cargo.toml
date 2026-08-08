@@ -1,0 +1,42 @@
+# NOTE: not a workspace member — built standalone or as a path dependency of
+# nyx-implant-win (requires nightly + a Windows x86_64 target). Kept out of the
+# root workspace so the stable dev-host workspace stays green.
+[package]
+name = "nyx-implant-evasion"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Nyx Windows PIC implant evasion layer (sleep mask/memory encryption/ETW+AMSI blinding/HWBP) extracted from nyx-implant-win. Requires nightly + Windows toolchain for the full build."
+
+[features]
+default = []
+# Forwarded by nyx-implant-win's `selftest` feature: gates the
+# `nyx_selftest_hookchain` / `nyx_selftest_hookchain_full` /
+# `nyx_selftest_envprobe` rundll32 exports. Production builds (default
+# features) exclude them.
+selftest = []
+
+# Standalone (NOT in the root workspace), same pattern as nyx-implant-core.
+[workspace]
+
+[dependencies]
+# Core layer (WP-C crate split): heap/cell/resolve/ntalloc/syscalls/stack/diag
+# live there; this crate sits directly above it in the DAG
+# (core ← evasion ← net ← tasks ← shell).
+nyx-implant-core = { path = "../implant-core" }
+# Userland evasion kit seams (no_std): gap/frame/rc4 algorithm cores + trait
+# seams. evasion_glue is the live impl of these traits over the process.
+nyx-implant-evasionsdk = { path = "../implant-evasionsdk", default-features = false }
+# NOTE: distinct from THIS crate's name (nyx-implant-evasion). nyx-evasion is
+# the SSN-resolution + indirect-syscall stub template algorithms crate
+# (crates/evasion); hookchain uses `nyx_evasion::stub::indirect_stub`.
+nyx-evasion = { path = "../evasion" }
+
+# no_std PIC: dev/check builds must abort too — there's no unwinding without
+# std, so any debug panic path (e.g. integer-overflow checks) would otherwise
+# fail `cargo check` with "unwinding panics are not supported without std".
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

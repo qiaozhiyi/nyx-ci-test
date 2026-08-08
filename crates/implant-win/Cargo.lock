@@ -195,18 +195,58 @@ name = "nyx-evasion"
 version = "0.2.0"
 
 [[package]]
+name = "nyx-implant-core"
+version = "0.2.0"
+dependencies = [
+ "nyx-config",
+ "nyx-evasion",
+ "nyx-implant-evasionsdk",
+ "nyx-protocol",
+]
+
+[[package]]
+name = "nyx-implant-evasion"
+version = "0.2.0"
+dependencies = [
+ "nyx-evasion",
+ "nyx-implant-core",
+ "nyx-implant-evasionsdk",
+]
+
+[[package]]
 name = "nyx-implant-evasionsdk"
 version = "0.0.1"
+
+[[package]]
+name = "nyx-implant-net"
+version = "0.2.0"
+dependencies = [
+ "nyx-implant-core",
+ "nyx-implant-evasion",
+ "nyx-profile",
+]
+
+[[package]]
+name = "nyx-implant-tasks"
+version = "0.2.0"
+dependencies = [
+ "nyx-coff",
+ "nyx-implant-core",
+ "nyx-implant-evasion",
+ "nyx-implant-evasionsdk",
+ "nyx-implant-net",
+ "nyx-protocol",
+]
 
 [[package]]
 name = "nyx-implant-win"
 version = "0.2.0"
 dependencies = [
- "nyx-coff",
- "nyx-config",
- "nyx-evasion",
+ "nyx-implant-core",
+ "nyx-implant-evasion",
  "nyx-implant-evasionsdk",
- "nyx-profile",
+ "nyx-implant-net",
+ "nyx-implant-tasks",
  "nyx-protocol",
 ]
 
