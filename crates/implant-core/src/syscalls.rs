@@ -1114,6 +1114,27 @@ pub unsafe fn nt_open_thread(
 /// # Safety
 /// `buffer` must be writable for `buf_len` bytes (per `info_class`'s layout);
 /// `ret_len` must be a valid out-pointer. Args pass verbatim to the kernel.
+/// `NTSTATUS NtReadVirtualMemory(HANDLE, PVOID BaseAddress, PVOID Buffer,
+/// SIZE_T BufferSize, PSIZE_T NumberOfBytesRead)` — cross-process read
+/// (loader-readiness polling in the B3 isolated path).
+pub unsafe fn nt_read_virtual_memory(
+    rt: &Runtime,
+    handle: usize,
+    base: usize,
+    buffer: *mut u8,
+    buf_len: usize,
+) -> Option<i32> {
+    syscall5(
+        rt,
+        djb2(b"ntreadvirtualmemory"),
+        handle,
+        base,
+        buffer as usize,
+        buf_len,
+        0,
+    )
+}
+
 pub unsafe fn nt_query_system_information(
     rt: &Runtime,
     info_class: u32,

