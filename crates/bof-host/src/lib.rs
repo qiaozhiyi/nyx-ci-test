@@ -214,6 +214,10 @@ unsafe fn entry_run(packed: *const u8) -> u32 {
             }
         }
     }
+    // Stage markers (NtWriteFile to the inherited stdout pipe): the parent's
+    // timeout diagnostics carry whatever the child wrote, so a stall is
+    // attributable to a stage instead of an opaque 60s timeout.
+    shim::write_line(b"[bof-host] entry\n");
 
     // Stash the args pointer in the TEB ArbitraryUserPointer slot (gs:[0x28])
     // so BeaconDataParse(NULL, 0) can recover it without a writable static
@@ -228,8 +232,12 @@ unsafe fn entry_run(packed: *const u8) -> u32 {
         );
     }
 
+    shim::write_line(b"[bof-host] loading\n");
     match unsafe { exec::run(blob, args_ptr, args_len as i32) } {
-        Ok(()) => 0,
+        Ok(()) => {
+            shim::write_line(b"[bof-host] done\n");
+            0
+        }
         Err(msg) => {
             shim::write_line(b"[bof-host] ");
             shim::write_line(msg.as_bytes());
