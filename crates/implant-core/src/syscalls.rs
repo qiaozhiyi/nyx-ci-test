@@ -1130,50 +1130,6 @@ pub unsafe fn nt_query_system_information(
         ret_len as *mut u32 as usize,
     )
 }
-
-/// `NTSTATUS NtQueryInformationProcess(HANDLE, PROCESSINFOCLASS, PVOID,
-/// ULONG, PULONG)` — ProcessBasicInformation (0) yields the child's
-/// `PebBaseAddress` (PROCESS_BASIC_INFORMATION offset 8 on x64), needed to
-/// poll LDR readiness in a freshly resumed sacrificial child.
-pub unsafe fn nt_query_information_process(
-    rt: &Runtime,
-    handle: usize,
-    info_class: u32,
-    buffer: *mut u8,
-    buf_len: u32,
-    ret_len: *mut u32,
-) -> Option<i32> {
-    syscall5(
-        rt,
-        djb2(b"ntqueryinformationprocess"),
-        handle,
-        info_class as usize,
-        buffer as usize,
-        buf_len as usize,
-        ret_len as usize,
-    )
-}
-
-/// `NTSTATUS NtReadVirtualMemory(HANDLE, PVOID BaseAddress, PVOID Buffer,
-/// SIZE_T BufferSize, PSIZE_T NumberOfBytesRead)` — cross-process read used
-/// to walk the child's PEB->Ldr module list from the parent.
-pub unsafe fn nt_read_virtual_memory(
-    rt: &Runtime,
-    handle: usize,
-    base: usize,
-    buffer: *mut u8,
-    buf_len: usize,
-) -> Option<i32> {
-    syscall5(
-        rt,
-        djb2(b"ntreadvirtualmemory"),
-        handle,
-        base,
-        buffer as usize,
-        buf_len,
-        0,
-    )
-}
 #[cfg(test)]
 mod tests {
     use super::*;

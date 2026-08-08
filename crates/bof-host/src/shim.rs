@@ -11,8 +11,8 @@
 //! `BeaconDataParse(NULL, 0)` fallback reads the TEB slot the entry stashed),
 //! and the shim table is a `match`, not a static of pointers.
 
+use crate::export_addr;
 use core::ffi::c_void;
-use nyx_implant_core::resolve::export_addr;
 
 /// `STD_OUTPUT_HANDLE` (GetStdHandle selector, (DWORD)-11).
 const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
