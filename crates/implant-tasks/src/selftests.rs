@@ -855,16 +855,37 @@ pub unsafe extern "system" fn nyx_selftest_bof_isolated() {
         args.push(String::from("nyx"));
         // bit1: clean run — the marker came back through the pipe capture.
         let r = unsafe { crate::bof::bof_isolated(print_blob, &args) };
-        if let Ok(Response::BofOutput(buf)) = r {
-            if contains_subslice(&buf, b"BOF-PRINT-OK") {
+        match r {
+            Ok(Response::BofOutput(buf)) if contains_subslice(&buf, b"BOF-PRINT-OK") => {
                 mask |= 1 << 1;
             }
+            // Diagnostics on the probe's stderr (visible in CI logs) — the
+            // real-machine gate turns a masked exit 5 into an actionable
+            // message instead of a bare bitmask. No format! here: this
+            // no_std panic=abort cdylib must not pull in fmt's
+            // unwinding-support symbols (rust_eh_personality link error).
+            Ok(Response::BofOutput(_)) => {
+                diag_stderr("bof_isolated(print): BofOutput without BOF-PRINT-OK marker")
+            }
+            Ok(Response::Err(_)) => {
+                diag_stderr("bof_isolated(print): child failed (Response::Err)")
+            }
+            Err(e) => diag_stderr_parts(&["bof_isolated(print): pre-launch failure: ", e]),
+            _ => diag_stderr("bof_isolated(print): unexpected response"),
         }
         // bit2: the faulting child must surface as an error; a clean
         // Ok(BofOutput) here would mean the exit-code mapping is broken.
         let r = unsafe { crate::bof::bof_isolated(crash_blob, &args) };
         if matches!(r, Err(_) | Ok(Response::Err(_))) {
             mask |= 1 << 2;
+        } else {
+            match r {
+                Ok(Response::BofOutput(_)) => {
+                    diag_stderr("bof_isolated(crash): expected Err, got clean BofOutput")
+                }
+                Err(e) => diag_stderr_parts(&["bof_isolated(crash): pre-launch failure: ", e]),
+                _ => diag_stderr("bof_isolated(crash): expected Err, got other response"),
+            }
         }
     } else {
         // bit3: skip flag — CreateProcessW unresolvable (Qiling stub rootfs).
@@ -872,6 +893,52 @@ pub unsafe extern "system" fn nyx_selftest_bof_isolated() {
     }
 
     unsafe { exit(mask) };
+}
+
+/// Write diagnostic parts + newline to the probe's stderr (PEB-walked
+/// GetStdHandle/WriteFile; absent under the Qiling stub rootfs — best-effort,
+/// never affects the test result). Allocation-free: lets the real-machine
+/// probe log the exact `bof_isolated` outcome without pulling format! / fmt
+/// unwinding symbols into this no_std panic=abort cdylib.
+#[cfg(feature = "selftest")]
+fn diag_stderr(msg: &str) {
+    diag_stderr_parts(&[msg]);
+}
+
+/// [`diag_stderr`] with multiple segments (e.g. static prefix + `&'static
+/// str` error) — no intermediate allocation.
+#[cfg(feature = "selftest")]
+fn diag_stderr_parts(parts: &[&str]) {
+    unsafe {
+        let Some(std_err) = export_addr(b"kernel32.dll", b"GetStdHandle") else {
+            return;
+        };
+        let Some(write_file) = export_addr(b"kernel32.dll", b"WriteFile") else {
+            return;
+        };
+        type GetStdHandleFn = unsafe extern "system" fn(u32) -> *mut core::ffi::c_void;
+        type WriteFileFn = unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            *const u8,
+            u32,
+            *mut u32,
+            *mut core::ffi::c_void,
+        ) -> i32;
+        let gsh: GetStdHandleFn = core::mem::transmute(std_err);
+        let wf: WriteFileFn = core::mem::transmute(write_file);
+        let h = gsh(0xFFFF_FFF4); // (DWORD)-12 = STD_ERROR_HANDLE
+        let mut written: u32 = 0;
+        for part in parts {
+            wf(
+                h,
+                part.as_ptr(),
+                part.len() as u32,
+                &mut written,
+                core::ptr::null_mut(),
+            );
+        }
+        wf(h, b"\n".as_ptr(), 1, &mut written, core::ptr::null_mut());
+    }
 }
 
 /// Read-only probe for the B3 isolated path's host requirement

