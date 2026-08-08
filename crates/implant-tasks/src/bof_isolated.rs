@@ -196,7 +196,7 @@ unsafe fn loader_wait_kernel32(
         return Err("bof isolate: loader resume failed");
     }
     let mut ready = false;
-    for _ in 0..250 {
+    for _ in 0..1500 {
         let mut probe: u32 = 0;
         let st = unsafe {
             sc::nt_read_virtual_memory(
