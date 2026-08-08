@@ -155,14 +155,6 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
 /// built it; the length caps below reject absurd values).
 #[no_mangle]
 pub unsafe extern "C" fn nyx_bof_host_entry(packed: *const u8) -> ! {
-    // ENTRY MARKER (diagnostic): stamp the payload's blob_len field before
-    // anything else — the parent reads it back to prove the hijacked thread
-    // really started executing this blob.
-    if !packed.is_null() {
-        unsafe {
-            (packed as *mut u32).write_unaligned(0xEE);
-        }
-    }
     // Keep the indirectly-reached Beacon-API shims inside the dumper's
     // reachability closure (never executes at runtime — see shim_keepalive).
     shim_keepalive(packed);
