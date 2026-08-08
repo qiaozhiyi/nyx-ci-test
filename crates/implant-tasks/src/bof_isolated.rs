@@ -212,7 +212,11 @@ unsafe fn loader_ready(
         return Err("bof isolate: child has no PEB");
     }
     let mut ready = false;
-    for _ in 0..250 {
+    // Budget 20 s: on some hosts (non-interactive Session 0) the loader
+    // takes several seconds to link the first modules after resume
+    // (observed: Ldr stays 0 for >5 s on windows-latest while a plain
+    // resumed cmd.exe still finishes within 15 s).
+    for _ in 0..1000 {
         // LDR_DATA: InLoadOrderModuleList at offset 0x10; entries link via
         // LDR_DATA_TABLE_ENTRY.InLoadOrderLinks.flink (offset 0x8). Only
         // this chain is what bof-host's resolve walks — InMemoryOrder
