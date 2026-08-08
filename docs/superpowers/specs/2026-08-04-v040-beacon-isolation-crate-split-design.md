@@ -1,7 +1,7 @@
 # v0.4.0 专项设计:Beacon 任务隔离 + 巨函数拆分 + implant-win crate 拆分
 
 **日期:** 2026-08-04
-**状态:** 已批准(用户逐节确认)
+**状态:** 已批准(用户逐节确认);WP-A/WP-B1/WP-B2/WP-C 已实施(2026-08-08),余 B3(BOF 子进程)待实施
 **来源:** `docs/design/NYX_REMEDIATION_PROGRAM_2026Q3.md` M1/M2;`docs/audits/FULL_CODE_AUDIT_2026-07-21.md` CRITICAL-19;`docs/audits/ANTI_HUMAN_AUDIT_2026-07-23.md` AH-1/AH-2
 **分支:** `refactor/ah-audit-followups`(后续按工作包切子分支)
 
@@ -93,7 +93,7 @@ nyx-implant-core ← nyx-implant-evasion ← nyx-implant-net ← nyx-implant-tas
 
 **障碍与对策:**
 
-- 全局唯一项(`#[global_allocator]`、`#[panic_handler]`、`#[alloc_error_handler]`、`server_pub` include)只能留壳;build.rs 烘焙逻辑随迁或改壳生成。
+- 全局唯一项(`#[global_allocator]`、`#[panic_handler]`、`#[alloc_error_handler]`)只能留壳;build.rs 烘焙逻辑随迁或改壳生成。**【2026-08-08 实施修订】** `server_pub` include 不留壳:实测 `config.rs` (core) 消费 `SERVER_PUB`,留壳构成 core→壳反向边;已将 bake_server_pub + include 整体下沉 `nyx-implant-core`(config.rs 自己 include),烘焙逻辑按消费方三分——config_blob+server_pub → core、envelopes → net(生成代码 `crate::heap` 路径改 `nyx_implant_core::heap`)、bake_offsets 留壳(该烘焙自始无消费方,HEAD 既有,未动)。另:`task_guard.rs`(WP-B1 新增)归属 tasks crate,补记于此。
 - 共享 static(`EVASION_ACTIVE`、`BLIND_OK/BLIND_ERR`、`mem::REGIONS/MASK_KEY`、`syscalls::GLOBAL_RT`)跨 crate 扩 pub 面;entry init 序列(`syscalls::init_global → blind → hookchain → mem key …`)文档化 + 顺序断言。
 - ~17 处 `pub(crate)` 转 `pub`,逐个人工核对,不批量放开。
 - 拆分顺序:断环三刀 → core → evasion → net → tasks,每抽一个过一次 CI。

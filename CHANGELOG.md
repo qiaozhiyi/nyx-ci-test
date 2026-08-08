@@ -12,6 +12,46 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-08 WP-C 完成 + WP-B2 清零 — implant-win 拆分为 **4 rlib + 1 cdylib 壳**
+（spec 2026-08-04-v040 §5）：`nyx-implant-core`（heap/cell/fmt/resolve/ntalloc/
+unhook/stack/version/syscalls/context/hostinfo/config/diag 13 模块，含
+bake_config + bake_server_pub 烘焙随迁）← `nyx-implant-evasion`（16 模块）
+← `nyx-implant-net`（envelopes/transport/channels/*，bake_envelopes 随迁，
+生成代码 heap 路径改 `nyx_implant_core::`）← `nyx-implant-tasks`（beacon/bof/
+inject/trex/selftests 等 24 文件）← 壳 `nyx-implant-win`（lib.rs 全局唯一项
++ entry + dllmain + re-export 桥）。断环三刀前置落地：`sleep_seconds` 下沉
+evasion 侧 sleep.rs（断 fluctuation→beacon）、`ModuleStomper` 移 inject.rs
+（断 evasion_glue→inject）、`csprng_fill`/`diag_mark` 抽 core 侧 diag.rs
+（断 mem/channels→entry）；唯一 DAG 硬违规 config→server_pub 以烘焙+include
+整体下沉 core 消解（spec "server_pub 只能留壳" 条目已修订）。pub 提升 13 项
+逐个人工核对（core 7 / evasion 5 / tasks 1）；no_mangle 面（15 Beacon* shim、
+NYX_CFG_PLACEHOLDER、~53 selftest 导出、hwbp_veh_handler）壳侧 pub use 保活，
+strings + Qiling + objdump 导出表三重实证。WP-B2 任务路径 panic 站点清零：
+beacon 3× unreachable→Response::Err 误路由哨兵、context 6 读写助手 panic-free、
+bof run_entry_addr section_number 上界检查（恶意 BOF 可越界杀 beacon 的真实洞）、
+coff crate 3 处 unwrap/unreachable 改错误返回、fs rename 长度检查下沉、
+trex/screenshot/tp 加固；144 处索引点全量审计（唯一必修即 bof 上界）。
+验证：五 crate fmt 干净、base/selftest/nyx_diag 三配置交叉编译 0 告警、
+Qiling 矩阵 5/5 PASS 且 bitmask 不变、生产 DLL 导出表不变（selftest 导出
+feature 门控正确消失）、根 workspace check/test 全绿；5 路对抗评审零
+critical/high/medium。CI Gate 4 新增 4 个 standalone crate 的
+check + fmt（硬）+ clippy（report-only，~300 条拆分前既有 lint 记为
+AH-13 遗留债）。已知偏差：implant-win/config.toml 改指针文件（烘焙读
+implant-core 副本）；kernel_offsets 烘焙自始无消费方（HEAD 既有，未动）。
+
+2026-08-06 WP-B1: beacon 任务隔离第一块落地 — `implant-win` 新增 VEH 任务守卫
+（`task_guard.rs`，spec 2026-08-04-v040 §WP-B1）。`beacon_dispatch_tasks` /
+`beacon_oneshot_run_tasks` 的每次 `execute()` 包一层链尾 VEH（First=0）：只放行
+AV / ILLEGAL_INSTRUCTION / STACK_OVERFLOW 三类致命故障，命中后从 `RtlCaptureContext`
+快照恢复、返回 `Response::Err("task crashed: 0x…")` 哨兵，beacon 进程不坠；
+与 `blind_hwbp` 的 First=1 #DB 处理器无冲突（#DB 硬放行）。自测
+`nyx_selftest_task_guard`：round-trip / 崩溃恢复 / 复位三 bit，环境无 VEH 时置
+skip 标志（0x9）——Qiling 矩阵已接入，5/5 PASS。同批告警清零：implant-win
+selftest 构建 21 条 + default 构建 4 条 dead-code 全部修复（Foliage 残留 import、
+`static_mut_refs` 4+2 处改 `&raw`、`register_veh_once` 死参数、`BeaconInit.kp`
+死字段、NtQuery fn-type 参数命名、selftest-only 助手补 cfg 门控），双 feature
+构建 0 告警、fmt 干净。`.gitignore` 补 `__pycache__/`。
+
 2026-08-05 WP-A: AH-2 巨函数拆分完成 — 冻结清单 140 个 >50 行非测试函数全部拆至
 <50 行（transport 6 / server 27 / implant-win 107），纯 extract-method、零行为变更；
 执行：Task 0-57 全部完成；质量：15 簇对抗评审（34 条 low 接受/记录，1 条 medium +
