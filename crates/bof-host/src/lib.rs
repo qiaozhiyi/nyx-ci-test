@@ -128,9 +128,27 @@ fn ascii_lower(name: &[u8]) -> ([u8; 32], usize) {
 }
 
 pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
-    // Try the exact name, then lowercase — Windows ntdll stores export
-    // names lowercase (resolve.rs notes it), wine keeps them CamelCase, so
-    // both are needed for cross-environment resolution.
+    // Diagnostic PEB walk: gs:[0x60] -> PEB -> Ldr -> InLoadOrder list.
+    // Falls through to resolve::export_addr (which may still succeed) but
+    // stamps the failure class for the parent probe.
+    let peb_v: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[0x60]",
+            out(reg) peb_v,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    if peb_v == 0 {
+        stamp_diag(0xC7);
+    } else {
+        let ldr_v = unsafe { *(peb_v as *const u64).add(0x18 / 8) };
+        if ldr_v == 0 {
+            stamp_diag(0xC8);
+        } else {
+            stamp_diag(0xC9);
+        }
+    }
     if let Some(a) = nyx_implant_core::resolve::export_addr(module, func) {
         return Some(a);
     }
