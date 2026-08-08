@@ -159,8 +159,6 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
             return Some(a);
         }
     }
-    // Diagnostic: PEB-walk path failed.
-    stamp_diag(0xC4);
     // The sacrificial child's loader never runs (kernel32 is not even
     // mapped — proven on windows-latest: reading the parent's kernel32 base
     // in the child returns STATUS_PARTIAL_COPY while ntdll reads fine), so
