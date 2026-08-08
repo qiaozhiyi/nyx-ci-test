@@ -35,8 +35,16 @@ pub enum Kind {
     IndirectJmpMem,
     /// RIP-relative memory operand; `disp_pos` is the offset of the disp32
     /// field within the instruction, `size` the memory operand size (1/2/4/8/
-    /// 16), `write` whether the instruction stores to memory.
-    RipRelative { disp_pos: usize, size: usize, write: bool },
+    /// 16), `write` whether the instruction stores to memory, `is_lea`
+    /// whether the instruction is LEA (address COMPUTED, never dereferenced —
+    /// the target may be an otherwise-unreachable function/constant-anchor
+    /// thunk in .text that relayout should follow).
+    RipRelative {
+        disp_pos: usize,
+        size: usize,
+        write: bool,
+        is_lea: bool,
+    },
     /// Absolute memory addressing (no RIP base) — needs a relocation; error.
     AbsoluteMem,
 }
@@ -290,7 +298,16 @@ pub fn decode(code: &[u8], at: usize, va: u64) -> Result<Decoded, DecodeError> {
         let write = is_mem_write(map, op, op2, modrm);
         return Ok(Decoded {
             len,
-            kind: Kind::RipRelative { disp_pos: disp32_pos, size, write },
+            kind: Kind::RipRelative {
+                disp_pos: disp32_pos,
+                size,
+                write,
+                // LEA (0x8D) never dereferences — the target is an address
+                // being COMPUTED (function/constant anchor), so relayout may
+                // follow it into .text even when it is not otherwise
+                // reachable (LLVM constant-anchor thunks).
+                is_lea: map == 1 && op == 0x8D,
+            },
             target: None,
         });
     }

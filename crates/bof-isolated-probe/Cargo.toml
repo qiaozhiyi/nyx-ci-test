@@ -1,0 +1,8 @@
+[package]
+name = "nyx-bof-isolated-probe"
+version = "0.1.0"
+edition = "2021"
+description = "Real-machine B3 isolated-BOF selftest probe: loads the selftest DLL and calls nyx_selftest_bof_isolated, whose ExitProcess bitmask becomes the probe exit code (expect 7 = 0b0111). Runs on any Windows host including GitHub-hosted runners (plain console process, no rundll32/GUI — see loader-probe-exe precedent)."
+
+[dependencies]
+# No extra deps: LoadLibraryA/GetProcAddress hand-declared below (std + explicit FFI only).

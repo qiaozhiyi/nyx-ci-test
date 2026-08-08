@@ -1152,7 +1152,10 @@ mod tests {
         let bytes = w.into_bytes();
         let mut r = Reader::new(&bytes);
         let (name, args, blob) = decode_bof_legacy(&mut r);
-        assert_eq!((name.as_str(), args.len(), blob.as_slice()), ("go", 1, &[9u8][..]));
+        assert_eq!(
+            (name.as_str(), args.len(), blob.as_slice()),
+            ("go", 1, &[9u8][..])
+        );
         // Exactly one trailing byte remains: the isolate flag (1).
         assert_eq!(r.remaining(), 1);
         assert_eq!(r.u8().unwrap(), 1);
@@ -1165,9 +1168,6 @@ mod tests {
         let mut bytes = encode_bof_legacy("go", &[], &[1]);
         bytes.push(2);
         let mut r = Reader::new(&bytes);
-        assert!(matches!(
-            Command::decode(&mut r),
-            Err(WireError::BadTag(2))
-        ));
+        assert!(matches!(Command::decode(&mut r), Err(WireError::BadTag(2))));
     }
 }

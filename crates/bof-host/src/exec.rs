@@ -210,7 +210,10 @@ pub unsafe fn run(blob: &[u8], args_ptr: *const u8, args_len: i32) -> Result<(),
 
     // Anchor near the shim code (inside this blob) so REL32 calls from BOF
     // .text to the Beacon-API shims span < 2 GiB (see bof.rs::run_anchor).
-    let anchor = crate::shim::beacon_api_addr("BeaconPrintf").unwrap_or(0x10000) as usize;
+    // The fn-item address equals beacon_api_addr("BeaconPrintf") and avoids
+    // a name-string constant (LLVM may sink such constants into .text
+    // dead regions, tripping the PIC dumper's reachability gate).
+    let anchor = crate::shim::BeaconPrintf as *const () as usize;
 
     // 1. Allocate each section as its own RW region; copy raw bytes.
     let mut bases: Vec<u64> = Vec::with_capacity(coff.sections.len());

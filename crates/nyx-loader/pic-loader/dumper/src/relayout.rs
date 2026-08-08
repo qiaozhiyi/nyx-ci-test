@@ -108,6 +108,19 @@ pub fn dump(pe: &Pe, opts: &DumpOpts) -> Result<Vec<u8>, DumpError> {
                     }
                 }
             }
+            // An LEA computes an address without dereferencing: the target
+            // may be a function or a constant-anchor thunk in .text that is
+            // only referenced by address. Follow it so the relayout gate
+            // doesn't fail on a reachable lea of unreachable code.
+            Kind::RipRelative { disp_pos, is_lea, .. } => {
+                if is_lea {
+                    let disp = read_disp32(&insn.bytes, disp_pos);
+                    let target = calc_target(a + d.len as u64, disp);
+                    if (text_lo..text_hi).contains(&target) {
+                        stack.push(target);
+                    }
+                }
+            }
             _ => {}
         }
         // fallthrough
@@ -135,7 +148,7 @@ pub fn dump(pe: &Pe, opts: &DumpOpts) -> Result<Vec<u8>, DumpError> {
         let insn = &insns[&a];
         let d = insn.decoded;
         match d.kind {
-            Kind::RipRelative { disp_pos, size, write } => {
+            Kind::RipRelative { disp_pos, size, write, is_lea: _ } => {
                 let disp = read_disp32(&insn.bytes, disp_pos);
                 let target = calc_target(a + d.len as u64, disp);
                 if target < text_lo || target >= text_hi {

@@ -558,13 +558,35 @@ pub unsafe extern "C" fn BeaconInformation(info: *mut BeaconInfo) {
     }
 }
 
+/// Value returned by [`BeaconGetSpawnTo`]. A `static` (not a `const` or
+/// string literal): mergeable string constants make LLVM emit an anchor
+/// thunk in .text that the PIC dumper's reachability walk can't cover,
+/// failing the blob relayout gate.
+static SPAWN_TO_VALUE: [u8; 8] = *b"cmd.exe\0";
+
+/// `char *BeaconGetSpawnTo(BOOL x86)` — the path a BOF should use when it
+/// spawns its next process. Value matches bof.rs ("cmd.exe"). Returns a
+/// READ-ONLY pointer (see [`beacon_api_addr`] doc): the isolated host has no
+/// writable statics, and a BOF writing into the buffer faults inside the
+/// sacrificial child — contained by B3.
+#[no_mangle]
+#[inline(never)] // see the dumper-closure note above
+pub unsafe extern "C" fn BeaconGetSpawnTo(_x86: i32) -> *mut u8 {
+    // Optimizer barrier (same rationale as BeaconIsAdmin).
+    core::hint::black_box(());
+    SPAWN_TO_VALUE.as_ptr() as *mut u8
+}
+
 /// Map a Beacon-API external name to the address of our Rust shim. `match`,
 /// not a static table — a static of fn pointers would emit base relocations
 /// the raw blob can't fix up (dumper hard error).
 ///
-/// NOT provided vs bof.rs: `BeaconGetSpawnTo` (needs a writable static
-/// scratch buffer). A BOF referencing it fails the load with a loud
-/// "unresolved external" — run it inline instead.
+/// Divergences vs bof.rs (documented受限交付): `BeaconGetSpawnTo` returns a
+/// READ-ONLY .rdata string (bof.rs returns a writable scratch buffer) — the
+/// isolated host has no writable statics (PIC dumper gate); a BOF that
+/// writes into the returned buffer faults INSIDE the sacrificial child,
+/// where B3 contains it. `BeaconIsAdmin` reports 0 (see its doc). Every
+/// other shim matches the inline semantics.
 pub fn beacon_api_addr(name: &str) -> Option<u64> {
     /// fn-item → u64 address (see bof.rs for the coercion trick).
     fn addr_of(f: *const ()) -> u64 {
@@ -582,6 +604,7 @@ pub fn beacon_api_addr(name: &str) -> Option<u64> {
         "BeaconDataShort" => addr_of(BeaconDataShort as *const ()),
         "BeaconDataLength" => addr_of(BeaconDataLength as *const ()),
         "BeaconIsAdmin" => addr_of(BeaconIsAdmin as *const ()),
+        "BeaconGetSpawnTo" => addr_of(BeaconGetSpawnTo as *const ()),
         "BeaconRevertToken" => addr_of(BeaconRevertToken as *const ()),
         "BeaconCleanupProcess" => addr_of(BeaconCleanupProcess as *const ()),
         "BeaconInformation" => addr_of(BeaconInformation as *const ()),

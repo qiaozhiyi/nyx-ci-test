@@ -255,6 +255,27 @@ jobs:
           }
           Write-Host "::notice::all $($tests.Count) selftests ran without bootstrap-sentinel or timeout failures"
 
+      # ---- B3 isolated-BOF probe (real machine, hosted-runnable) ----
+      # Unlike the rundll32 selftests above, this one also runs on
+      # GitHub-hosted runners: the probe is a plain console process that
+      # loads the selftest DLL and calls the export directly (loader-probe
+      # precedent), and the sacrificial child (notepad.exe, suspended +
+      # hijacked) never touches the interactive desktop — its main thread is
+      # the bof-host PIC blob. The probe's exit code is the selftest bitmask:
+      # 7 = 0b0111 (fixtures ok, bof_print.o round-tripped through the pipe,
+      # crash fixture surfaced as an error, beacon survived).
+      - name: B3 isolated-BOF probe (real machine)
+        shell: pwsh
+        run: |
+          cargo build --release -p nyx-bof-isolated-probe 2>&1 | Out-String | Write-Host
+          if ($LASTEXITCODE -ne 0) { throw "probe build exited $LASTEXITCODE" }
+          $dll = "crates/implant-win/target/x86_64-pc-windows-msvc/release/nyx_implant_win.dll"
+          & "target/release/nyx-bof-isolated-probe.exe" $dll
+          if ($LASTEXITCODE -ne 7) {
+            throw "nyx_selftest_bof_isolated expected exit 7 (0b0111), got $LASTEXITCODE"
+          }
+          Write-Host "B3 isolated-BOF probe: PASS (0b0111)"
+
       # ---- 3. Live PDB offset resolution (ground-truth verification) ----
       - name: "Live PDB offset resolution (host's own kernel)"
         shell: pwsh
