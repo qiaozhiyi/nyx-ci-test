@@ -91,7 +91,8 @@ fn exit_process(code: u32) -> ! {
         let _ = unsafe { f(!0usize, code as i32) };
     }
     // Defensive trap — only reached if resolution failed (catastrophic).
-    stamp_diag(0xC3);
+    // No stamp here: the export_addr classify stamps (0xC4/0xC5/0xC6) must
+    // remain visible.
     loop {
         core::hint::spin_loop();
     }
