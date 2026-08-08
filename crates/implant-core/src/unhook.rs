@@ -524,7 +524,7 @@ unsafe fn read_ntdll_read_all(
 /// crate). Captures `PointerToRawData` (the file offset the disk path needs).
 unsafe fn parse_sections_raw(image: &[u8]) -> Option<Vec<RawSection>> {
     // DOS header: MZ + e_lfanew @ 0x3C.
-    let m0 = *image.get(0)?;
+    let m0 = *image.first()?;
     let m1 = *image.get(1)?;
     if m0 != b'M' || m1 != b'Z' {
         return None;

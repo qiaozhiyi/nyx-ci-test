@@ -92,12 +92,12 @@ fn is_remote_debugged_via_export() -> bool {
 
     let gcp: GetCurrentProcess = match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") }
     {
-        Some(a) => unsafe { core::mem::transmute(a) },
+        Some(a) => unsafe { core::mem::transmute::<usize, GetCurrentProcess>(a) },
         None => return false,
     };
     let nqip: NtQueryInformationProcess =
         match unsafe { export_addr(b"ntdll.dll", b"NtQueryInformationProcess") } {
-            Some(a) => unsafe { core::mem::transmute(a) },
+            Some(a) => unsafe { core::mem::transmute::<usize, NtQueryInformationProcess>(a) },
             None => return false,
         };
     let mut port: usize = 0;
@@ -120,7 +120,7 @@ fn is_remote_debugged_via_export() -> bool {
 pub fn uptime_secs() -> u64 {
     type GetTickCount64 = unsafe extern "system" fn() -> u64;
     let f: GetTickCount64 = match unsafe { export_addr(b"kernel32.dll", b"GetTickCount64") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
+        Some(a) => unsafe { core::mem::transmute::<usize, GetTickCount64>(a) },
         None => return 0,
     };
     let ms = unsafe { f() };

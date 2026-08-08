@@ -28,9 +28,9 @@ const STUB_SIZE: usize = 32;
 
 /// The resolved syscall runtime: SSN table + the ntdll `syscall` gadget address
 /// + a pre-populated executable trampoline region (one stub slot per SSN).
-/// Stubs are written at init time and the whole region is flipped to RX once,
-/// eliminating both the per-call VirtualProtect churn and the race condition
-/// where multi-threaded/APC contexts could overwrite another thread's stub.
+///   Stubs are written at init time and the whole region is flipped to RX once,
+///   eliminating both the per-call VirtualProtect churn and the race condition
+///   where multi-threaded/APC contexts could overwrite another thread's stub.
 pub struct Runtime {
     /// (api name, SSN) for every resolvable syscall.
     table: Vec<(String, u32)>,
@@ -45,6 +45,10 @@ impl Runtime {
     /// Build the runtime: locate ntdll, resolve SSNs, find the gadget, allocate
     /// the RX trampoline page. Returns None if any step fails (should never
     /// happen in a real process).
+    ///
+    /// # Safety
+    /// Walks the PEB loader list and parses ntdll's export directory; call once
+    /// during bootstrap, before other threads issue indirect syscalls.
     pub unsafe fn init() -> Option<Self> {
         let ntdll = LiveNtdll::locate()?;
 
@@ -299,7 +303,7 @@ unsafe fn scan_syscall_gadget(ntdll: &LiveNtdll) -> Option<u64> {
     // they can sit well past 64KB, so we scan a generous range. Reading is done
     // in chunks (not one giant alloc) to stay friendly to the bump allocator.
     let start = 0x1000u32;
-    let end = 0x2_00_000u32; // 2 MiB — covers any reasonable ntdll .text
+    let end = 0x0020_0000u32; // 2 MiB — covers any reasonable ntdll .text
     let chunk = 0x1_0000u32; // 64 KiB chunks
     let mut off = start;
     while off < end {
@@ -384,6 +388,9 @@ pub unsafe fn syscall5(
 /// # Safety
 /// Same as [`syscall4`]; additionally a5/a6 must match the target syscall's
 /// 5th/6th parameters (stack-passed per Win64 ABI).
+// Arity mirrors the target NT syscall's parameter count — collapsing the
+// signature would change the call ABI contract.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn syscall6(
     rt: &Runtime,
     name_hash: u32,
@@ -414,6 +421,9 @@ pub unsafe fn syscall6(
 /// Same as [`syscall4`]; args 5–11 must match the target syscall's stack-passed
 /// parameters. Passing fewer than 11 meaningful args is fine — pad the tail
 /// with 0; the syscall ignores positions past its real arity.
+// Arity mirrors the target NT syscall's parameter count — collapsing the
+// signature would change the call ABI contract.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn syscall11(
     rt: &Runtime,
     name_hash: u32,
@@ -540,6 +550,9 @@ pub unsafe fn init_global() {
 ///   0xB4 = trampoline page allocated
 ///   0xB5 = Runtime built + Box::leak installed
 /// A crash (127) before any of these = the step crashed.
+///
+/// # Safety
+/// Diagnostic only: terminates the process via `ExitProcess` at each step.
 #[cfg(feature = "selftest")]
 #[no_mangle]
 #[allow(unused_assignments)]
@@ -641,11 +654,23 @@ pub fn ssn_nt_allocate_virtual_memory(rt: &Runtime) -> Option<u32> {
 // the runtime is down or the SSN couldn't be resolved; Some(status) otherwise.
 
 /// `NtClose(Handle)` — 1 real arg, called via the 4-arg shim (extras ignored).
+///
+/// # Safety
+/// `handle` must be a valid (or already-closed) kernel handle; it is passed
+/// verbatim to the kernel.
 pub unsafe fn nt_close(rt: &Runtime, handle: usize) -> Option<i32> {
     syscall4(rt, djb2(b"ntclose"), handle, 0, 0, 0)
 }
 
 /// `NtCreateFile` — 11 real args.
+///
+/// # Safety
+/// Pointer-typed args (`file_handle`, `obj_attr`, `io_status`, `ea_buffer`)
+/// must satisfy the NtCreateFile contract; all args are passed verbatim to
+/// the kernel.
+// Arity mirrors NtCreateFile's real parameter count (11) — collapsing the
+// signature would change the call ABI contract.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn nt_create_file(
     rt: &Runtime,
     file_handle: usize,
@@ -678,6 +703,13 @@ pub unsafe fn nt_create_file(
 }
 
 /// `NtWriteFile` — 9 real args (padded into the 11-arg shim).
+///
+/// # Safety
+/// `handle` must be a valid file handle; `io_status`/`buffer`/`byte_offset`
+/// must satisfy the NtWriteFile contract. All args pass verbatim to the kernel.
+// Arity mirrors NtWriteFile's real parameter count (9) — collapsing the
+// signature would change the call ABI contract.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn nt_write_file(
     rt: &Runtime,
     handle: usize,
@@ -708,6 +740,13 @@ pub unsafe fn nt_write_file(
 }
 
 /// `NtReadFile` — 9 real args (padded into the 11-arg shim).
+///
+/// # Safety
+/// `handle` must be a valid file handle; `io_status`/`buffer`/`byte_offset`
+/// must satisfy the NtReadFile contract. All args pass verbatim to the kernel.
+// Arity mirrors NtReadFile's real parameter count (9) — collapsing the
+// signature would change the call ABI contract.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn nt_read_file(
     rt: &Runtime,
     handle: usize,
@@ -738,6 +777,11 @@ pub unsafe fn nt_read_file(
 }
 
 /// `NtSetInformationFile` — 5 real args (padded into the 6-arg shim).
+///
+/// # Safety
+/// `handle` must be a valid file handle; `io_status`/`file_info` must satisfy
+/// the NtSetInformationFile contract for `file_info_class`. Args pass verbatim
+/// to the kernel.
 pub unsafe fn nt_set_information_file(
     rt: &Runtime,
     handle: usize,
@@ -759,6 +803,11 @@ pub unsafe fn nt_set_information_file(
 }
 
 /// `NtQueryAttributesFile` — 2 real args (padded into the 4-arg shim).
+///
+/// # Safety
+/// `obj_attr` must point at a valid OBJECT_ATTRIBUTES for the queried file;
+/// `file_info` must point at a writable FILE_BASIC_INFORMATION. Args pass
+/// verbatim to the kernel.
 pub unsafe fn nt_query_attributes_file(
     rt: &Runtime,
     obj_attr: usize,
@@ -778,6 +827,14 @@ pub unsafe fn nt_query_attributes_file(
 /// directory (FileDirectoryInformation class): `file_info`/`length` describe
 /// the output buffer, `file_name` is an optional wildcard mask (NULL = all
 /// entries), `return_single_entry`/`restart_scan` control the scan position.
+///
+/// # Safety
+/// `handle` must be a valid directory handle; `io_status`/`file_info`/
+/// `file_name` must satisfy the NtQueryDirectoryFile contract. Args pass
+/// verbatim to the kernel.
+// Arity mirrors NtQueryDirectoryFile's real parameter count (11) — collapsing
+// the signature would change the call ABI contract.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn nt_query_directory_file(
     rt: &Runtime,
     handle: usize,
@@ -810,6 +867,10 @@ pub unsafe fn nt_query_directory_file(
 }
 
 /// `NtDelayExecution` — 2 real args (padded into the 4-arg shim).
+///
+/// # Safety
+/// `delay` must point at a valid `i64` interval (100ns units, negative =
+/// relative). Args pass verbatim to the kernel.
 pub unsafe fn nt_delay_execution(rt: &Runtime, alertable: u8, delay: usize) -> Option<i32> {
     syscall4(
         rt,
@@ -1025,6 +1086,11 @@ pub unsafe fn nt_resume_thread(rt: &Runtime, thread: usize, prev_count: &mut u32
 /// `NtOpenThread` — opens a handle to a thread by its TID + client ID. Used by
 /// Foliage to get a handle to the current (beacon) thread for APC queuing.
 /// 4 real args (ThreadHandle*, DesiredAccess, ObjectAttrs, ClientId*).
+///
+/// # Safety
+/// `handle_out` must point at a writable HANDLE slot; `obj_attr`/`client_id`
+/// must point at valid OBJECT_ATTRIBUTES / CLIENT_ID. Args pass verbatim to
+/// the kernel.
 pub unsafe fn nt_open_thread(
     rt: &Runtime,
     handle_out: usize,
@@ -1044,6 +1110,10 @@ pub unsafe fn nt_open_thread(
 
 /// `NtQuerySystemInformation(SystemInformationClass, Buffer, Length, ReturnLength)` — 4 args.
 /// Used by T-REX for process enumeration (SystemProcessInformation class 5).
+///
+/// # Safety
+/// `buffer` must be writable for `buf_len` bytes (per `info_class`'s layout);
+/// `ret_len` must be a valid out-pointer. Args pass verbatim to the kernel.
 pub unsafe fn nt_query_system_information(
     rt: &Runtime,
     info_class: u32,

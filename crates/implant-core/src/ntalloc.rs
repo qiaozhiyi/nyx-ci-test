@@ -127,6 +127,10 @@ unsafe fn ensure_heap() -> u64 {
 }
 
 /// Force the allocator to resolve APIs NOW (call from entry before any alloc).
+///
+/// # Safety
+/// Resolves Windows APIs via the PEB walk (see `resolve::export_addr`); call
+/// once from the entry point, before other threads can allocate.
 pub unsafe fn force_resolve() {
     ensure_resolved();
 }
@@ -156,7 +160,7 @@ struct SlabDesc {
 /// Both the table and the counter are plain `static` (NOT `static mut`):
 /// `AtomicU64`/`AtomicUsize` are internally mutable, matching the `REGIONS`
 /// pattern in `mem.rs`. This is the global-allocator hot path — concurrent
-/// >64 KiB allocations from multiple threads are fully handled by `fetch_add`
+/// \>64 KiB allocations from multiple threads are fully handled by `fetch_add`
 /// handing each writer a unique index (no torn writes, no lost updates, no
 /// OOB). See P0-1.
 static SLAB_TABLE: [SlabDesc; MAX_SLABS] = [const {

@@ -398,6 +398,7 @@ pub fn alloc_oom_size() -> u64 {
 ///      default path's panic → `ExitProcess(0xC000_0001)`. The distinct code
 ///      lets the loader/harness tell an OOM apart from a crash and restart the
 ///      beacon — the recoverable outcome for the operator.
+///
 /// A wire error frame is intentionally NOT attempted: every step of the
 /// existing send path (`encode_batch` → `encode_frame` → `dispatch_send_recv`)
 /// allocates, and re-entering it from inside the allocator-failure path would

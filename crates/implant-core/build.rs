@@ -4,10 +4,10 @@
 //! crate split, together with the modules that consume them):
 //!
 //! 1. **Team server long-term X25519 public key** (`OUT_DIR/server_pub.rs`) —
-//!    see `bake_server_pub`. Source (first match wins):
-//!      a. `NYX_SERVER_PUB` env (64 hex chars).
-//!      b. A clearly-marked dev fallback key (NOT for production, but a real
-//!         non-identity X25519 point so the ECDH doesn't collapse).
+//!    see `bake_server_pub`. Source (first match wins): the `NYX_SERVER_PUB`
+//!    env (64 hex chars), or a clearly-marked dev fallback key (NOT for
+//!    production, but a real non-identity X25519 point so the ECDH doesn't
+//!    collapse).
 //!
 //! 2. **Per-build encrypted config** (`OUT_DIR/config_blob.rs`) — see
 //!    `bake_config`. Reads a TOML-ish config file (default `config.toml` next
