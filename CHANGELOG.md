@@ -12,6 +12,49 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-08 B3 BOF 子进程隔离（受限交付，spec 2026-08-04-v040 §4-B3 完成）—
+operator 显式选择 `Command::Bof.isolate` 时，BOF 在牺牲子进程（bof-host）中
+执行而非 beacon 内联：崩溃杀子进程、beacon 存活上报 `Response::Err`。
+
+- **新 standalone crate `crates/bof-host`**：no_std cdylib → PIC blob
+  `bof-host.bin`（14646 字节，入口 `nyx_bof_host_entry` @ offset 0，0 基址
+  重定位）。COFF 加载核心（parse/alloc/relocate/flip/call）自 `bof.rs` 抽取
+  移植；`BeaconPrintf`/`BeaconOutput` 写继承 stdout 管道；`ExitProcess(status)`
+  结束（0 干净 / 1 加载器错误 / 其他 = BOF 自身退出或崩溃）。无写静态
+  （stateless `HeapAlloc` 分配器 + match 式 shim 表 + TEB ArbitraryUserPointer
+  参数暂存）；`BeaconGetSpawnTo` 刻意不在 shim 表（unresolved external 直白
+  报错）。管线：`regen.sh`（nightly + x86_64-pc-windows-gnu + `-Zbuild-std`）
+  + 复用 pic-loader dumper（`nyx-bof-host-dumper`，entry 参数化）→ bin 提交
+  入库（crate 级 .gitignore 取反）。共享 decoder 放宽 LEA disp32 常量豁免
+  （lea 不访存，disp 是常量偏移非指针）；pic-loader regen 无回归。
+- **协议**：`Command::Bof.isolate`（wire 尾部可选标志字节，新旧双向兼容测试
+  4 个，旧组合按内联执行）；server `JsonCommand.isolate`（serde default）+ 
+  batch packer 强制 invariant：isolate BOF 独占帧尾（flush 后单任务帧，单测
+  3 场景：孤立/前置/后置）。
+- **implant**：`bof_isolated`（`create_sacrificial_isolated` 变体：
+  CreatePipe 继承 stdout + STARTF_USESTDHANDLES + 挂起 CreateProcessW +
+  tp.rs section 投递 `[blob+payload]` + 主线程 hijack Rip=base、
+  Rcx=base+blob.len()）；wait-first 回收（60s 超时 TerminateProcess，
+  EOF 排空 → `BofOutput`，退出码/崩溃/超时 → `Response::Err`，
+  SacrificialProcess/PipeRead RAII 每路径防泄漏）；pre-launch 失败 WARN
+  前缀回退内联（BOF 未运行，不双重执行）。drain 1 MiB 上限防御。
+- **自测**：`nyx_selftest_bof_isolated`（bof_print.o 管道回收
+  "BOF-PRINT-OK" + 新 fixture `bof_crash.o`（mingw gcc -c，null 页写崩溃）
+  断言崩溃经 Err 通道 + beacon 存活；CreateProcessW 不可解析时置 skip 标志
+  exit 0x9）。Qiling 矩阵 6/6 PASS（本地真实验证，macOS 复刻 Gate 6）；
+  真机 `windows-ci` 期望 0b0111。
+- **已知限制（受限交付）**：输出超过管道缓冲（~64KB）的 BOF 表现为 60s 超时
+  Err 而非部分输出；`BeaconGetSpawnTo` 隔离模式不可用；Qiling 下跳过
+  （exit 0x9），真机验证归 windows-ci 自托管 runner。
+
+2026-08-08 AH-13 clippy 债清理（WP-C 后续）— implant-core/evasion/net/win 四
+crate 机械清理：transmute turbofish 注解、`?` 转换、迭代器转换、
+`is_multiple_of`、c-string 字面量、match guard、`.dll`/`.exe` 分支合并等
+（CI-pinned stable 1.96.0 构造全可用，零行为变更）；rustdoc missing-#Safety
+补齐；implant-win build.rs kernel-offsets 烘焙（`bake_offsets`/`NYX_OFFSETS`）
+移除——HEAD 与工作树均无 `include!` 消费方，偏移单一来源为
+evasionsdk 运行时表（spec §5 实施修订同步；历史文档引用已更新）。
+
 2026-08-08 WP-C 完成 + WP-B2 清零 — implant-win 拆分为 **4 rlib + 1 cdylib 壳**
 （spec 2026-08-04-v040 §5）：`nyx-implant-core`（heap/cell/fmt/resolve/ntalloc/
 unhook/stack/version/syscalls/context/hostinfo/config/diag 13 模块，含
