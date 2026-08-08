@@ -185,7 +185,7 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
             options(nostack, preserves_flags, readonly),
         );
         let mut cand = (ret & !0xFFF) as *mut u8;
-        for _ in 0..0x2000 {
+        for _ in 0..0x400 {
             let mz = unsafe { *(cand as *const u16) };
             if mz == 0x5A4D {
                 let e = unsafe { *(cand.add(0x3C) as *const i32) } as usize;
@@ -265,6 +265,11 @@ pub unsafe extern "C" fn nyx_bof_host_entry(packed: *const u8) -> ! {
             in(reg) ret,
             options(nostack, preserves_flags),
         );
+        // Diagnostic: write ret's low 32 bits into the payload blob_len
+        // field so the parent probe can see what the return address is.
+        if !packed.is_null() {
+            unsafe { (packed as *mut u32).write_unaligned(ret as u32) };
+        }
     }
     // Keep the indirectly-reached Beacon-API shims inside the dumper's
     // reachability closure (never executes at runtime — see shim_keepalive).
