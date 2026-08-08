@@ -288,16 +288,17 @@ struct SecurityAttributes {
 /// Single-threaded beacon context.
 pub unsafe fn create_sacrificial_isolated(
     spawn_to: &str,
-) -> Result<(SacrificialProcess, *mut c_void), &'static str> {
+) -> Result<(SacrificialProcess, *mut c_void, usize), &'static str> {
     let create_proc = unsafe { create_sacrificial_resolve() }?;
     let (create_pipe, set_handle_info, close) = unsafe { isolated_pipe_resolve()? };
     let (pipe_read, pipe_write) = unsafe { isolated_pipe(create_pipe, set_handle_info)? };
+    let pipe_write_val = pipe_write as usize;
     let (mut cmd, mut si, mut pi) = create_sacrificial_buffers(spawn_to);
     isolated_startup(&mut si, pipe_write);
     match unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &mut si, &mut pi, 1) } {
         Ok(proc) => {
             close(pipe_write); // child holds its own inherited writer
-            Ok((proc, pipe_read))
+            Ok((proc, pipe_read, pipe_write_val))
         }
         Err(e) => {
             close(pipe_read);

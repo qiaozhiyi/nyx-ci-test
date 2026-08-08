@@ -3,12 +3,12 @@
 //! The PIC dumper refuses any reachable WRITABLE data reference, so the
 //! implant's `ntalloc` (which caches resolved API addresses + the heap handle
 //! in atomics) is unusable here. This allocator resolves
-//! `GetProcessHeap`/`HeapAlloc`/`HeapFree` through the PEB walk on EVERY
+//! `RtlGetProcessHeap`/`RtlAllocateHeap`/`RtlFreeHeap` through the PEB walk on EVERY
 //! call — no cached state at all. Resolution is allocation-free
 //! (`resolve::export_addr` hashes the export tables in place), so there is no
 //! allocator-recursion cycle.
 //!
-//! `HeapAlloc` on the process heap returns 16-aligned memory on x64, which
+//! `RtlAllocateHeap` on the process heap returns 16-aligned memory on x64, which
 //! satisfies every `Layout` the COFF core produces (its largest alignment is
 //! `u64`).
 
@@ -16,17 +16,17 @@ use crate::export_addr;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
 
-type GetProcessHeapFn = unsafe extern "system" fn() -> *mut c_void;
-type HeapAllocFn = unsafe extern "system" fn(*mut c_void, u32, usize) -> *mut c_void;
-type HeapFreeFn = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
+type RtlGetProcessHeapFn = unsafe extern "system" fn() -> *mut c_void;
+type RtlAllocateHeapFn = unsafe extern "system" fn(*mut c_void, u32, usize) -> *mut c_void;
+type RtlFreeHeapFn = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
 
-/// Resolve + call `GetProcessHeap`. Null on failure (kernel32 gone —
+/// Resolve + call `RtlGetProcessHeap`. Null on failure (kernel32 gone —
 /// catastrophic; the alloc error handler will fire on the null return).
 unsafe fn process_heap() -> *mut c_void {
-    let Some(addr) = (unsafe { export_addr(b"kernel32.dll", b"GetProcessHeap") }) else {
+    let Some(addr) = (unsafe { export_addr(b"ntdll.dll", b"RtlGetProcessHeap") }) else {
         return core::ptr::null_mut();
     };
-    let f: GetProcessHeapFn = unsafe { core::mem::transmute(addr) };
+    let f: RtlGetProcessHeapFn = unsafe { core::mem::transmute(addr) };
     unsafe { f() }
 }
 
@@ -39,10 +39,10 @@ unsafe impl GlobalAlloc for ProcessHeapAlloc {
         if heap.is_null() {
             return core::ptr::null_mut();
         }
-        let Some(addr) = (unsafe { export_addr(b"kernel32.dll", b"HeapAlloc") }) else {
+        let Some(addr) = (unsafe { export_addr(b"ntdll.dll", b"RtlAllocateHeap") }) else {
             return core::ptr::null_mut();
         };
-        let f: HeapAllocFn = unsafe { core::mem::transmute(addr) };
+        let f: RtlAllocateHeapFn = unsafe { core::mem::transmute(addr) };
         let size = if layout.size() == 0 { 1 } else { layout.size() };
         unsafe { f(heap, 0, size) as *mut u8 }
     }
@@ -52,10 +52,10 @@ unsafe impl GlobalAlloc for ProcessHeapAlloc {
         if heap.is_null() {
             return;
         }
-        let Some(addr) = (unsafe { export_addr(b"kernel32.dll", b"HeapFree") }) else {
+        let Some(addr) = (unsafe { export_addr(b"ntdll.dll", b"RtlFreeHeap") }) else {
             return;
         };
-        let f: HeapFreeFn = unsafe { core::mem::transmute(addr) };
+        let f: RtlFreeHeapFn = unsafe { core::mem::transmute(addr) };
         let _ = unsafe { f(heap, 0, ptr as *mut c_void) };
     }
 }

