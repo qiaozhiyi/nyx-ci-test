@@ -1,0 +1,5 @@
+# bof-host.bin is a GENERATED artifact that IS committed (the implant embeds
+# it via include_bytes! from bof.rs), so it must negate the root `*.bin`
+# ignore rule. Same precedent as crates/nyx-loader/pic-loader and the
+# crates/config fixtures.
+!bof-host.bin

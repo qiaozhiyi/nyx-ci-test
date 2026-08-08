@@ -246,6 +246,16 @@ jobs:
       # needs (caught on public CI 2026-08).
       - name: Build production DLL (no selftest exports)
         run: cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-gnu
+      # B3 bof-host (crates/bof-host): standalone no_std cdylib like Gate 4's
+      # crates, but nightly-only (alloc_error_handler is still unstable on
+      # stable 1.96.0), so its fmt/check/clippy live in this nightly+mingw
+      # job instead of Gate 4.
+      - name: bof-host fmt (B3)
+        run: cargo +nightly fmt --check --manifest-path crates/bof-host/Cargo.toml
+      - name: bof-host check (B3)
+        run: cargo +nightly check --manifest-path crates/bof-host/Cargo.toml --target x86_64-pc-windows-gnu
+      - name: bof-host clippy (B3)
+        run: cargo +nightly clippy --manifest-path crates/bof-host/Cargo.toml --target x86_64-pc-windows-gnu
 
   # ---- Gate 7: TLS fingerprint emission (impersonation feature) ----
   # The JA3/JA4 *computation* engine (server-side inbound sniffing) is covered

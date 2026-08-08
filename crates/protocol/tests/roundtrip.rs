@@ -232,6 +232,7 @@ fn p2p_command_variants_roundtrip() {
                 name: "whoami.x64.o".into(),
                 args: vec!["-v".into()],
                 blob: vec![0xCC; 4],
+                isolate: false,
             },
         },
         msg::Task {

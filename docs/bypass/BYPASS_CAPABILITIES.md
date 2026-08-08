@@ -378,10 +378,11 @@ FrameList → RegisteredFilters`，把目标 EDR 过滤器（如 WdFilter）从�
 
 **对抗：** Windows 版本更新导致 EPROCESS/ETW 结构体偏移漂移
 
-**三层架构：**
-1. **编译期烘焙**（`NYX_OFFSETS`）— operator 用 `offset-resolver --build N` 生成 `offsets.toml` → `build.rs` 烘焙成常量。**目标侧零解析。**
-2. **运行时表**（`offsets_table.rs`）— 覆盖 Win10 1809→Win11 25H2 共 8 个 build，按 PEB OSBuildNumber 查表
-3. **Pattern scan**（预留）— 未知 build 的兜底
+**两层架构：**
+1. **运行时表**（`offsets_table.rs`）— 覆盖 Win10 1809→Win11 25H2 共 8 个 build，按 PEB OSBuildNumber 查表
+2. **Pattern scan**（预留）— 未知 build 的兜底
+
+> 注：编译期烘焙（`NYX_OFFSETS`/`bake_offsets`）已于 2026-08-08 移除——生成文件自始无 `include!` 消费方（offset-resolver 的产出物无下游），偏移单一来源为 evasionsdk 运行时表。目标侧零解析由查表实现。
 
 **覆盖版本：**
 | Build | 版本 | PID offset | Protection offset |

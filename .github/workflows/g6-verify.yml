@@ -142,7 +142,7 @@ jobs:
           # sentinel check below would misread that as a passing run.
           $tests = @(
             "nyx_selftest","nyx_selftest_postex","nyx_selftest_evasion",
-            "nyx_selftest_inject_pool"
+            "nyx_selftest_inject_pool","nyx_selftest_bof_isolated"
           )
           Write-Host "Test                      Exit   Ran   Bits"
           Write-Host "------------------------- ------ ----- ----"

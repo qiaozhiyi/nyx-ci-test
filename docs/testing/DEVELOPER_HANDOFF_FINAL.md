@@ -132,7 +132,7 @@ crates/
 │   ├── antidebug.rs     PEB BeingDebugged + uptime
 │   ├── unhook.rs        ntdll .text 从磁盘重映射
 │   ├── selftests.rs     41 个 selftest 导出（含 hwbp_blind + resolve_forwarder）
-│   ├── build.rs         bake_offsets (NYX_OFFSETS 编译期注入)
+│   ├── build.rs         仅声明 nyx_diag/nyx_skip_sandbox cfg（烘焙已全部随迁/移除，2026-08-08）
 │   └── config.toml      beacon 配置
 │
 ├── evasion/                       # SSN 解析 (11 测)
@@ -193,9 +193,10 @@ cargo run --manifest-path crates\offset-resolver\Cargo.toml -- --build 22621 --o
 cargo run --manifest-path crates\offset-resolver\Cargo.toml -- --pdb-path ntkrnlmp.pdb --out offsets.toml
 ```
 
-### 编译期烘焙 offset
+### offset 解析（2026-08-08 起）
 ```
-NYX_OFFSETS=offsets.toml cargo +nightly build --release --manifest-path crates\implant-win\Cargo.toml --target x86_64-pc-windows-msvc -Z build-std=core,alloc,panic_abort
+编译期烘焙（NYX_OFFSETS / bake_offsets）已移除：生成文件无 include! 消费方。
+偏移解析 = evasionsdk 运行时表（offsets_table.rs，按 PEB OSBuildNumber 查表）+ 预留 pattern scan。
 ```
 
 ---
@@ -296,11 +297,12 @@ NYX_OFFSETS=offsets.toml cargo +nightly build --release --manifest-path crates\i
 | 22621/22631 | Win11 22H2/23H2 | 0x440 | 0x87a | 0x070 |
 | 26100/26200 | Win11 24H2/25H2 | 0x450 | 0x87e | 0x070 |
 
-### 三层 offset 解析
+### 两层 offset 解析
 
-1. **编译期烘焙** (`NYX_OFFSETS`) — operator 用 offset-resolver 生成 toml → build.rs 烘焙。目标侧零解析。
-2. **运行时表** (`offsets_table.rs`) — 按 PEB OSBuildNumber 查表，floor-match 未知 patch build。
-3. **Pattern scan** (`pattern_scan.rs`) — lea [rip+disp32] 特征扫描 RVA。最后一道。
+1. **运行时表** (`offsets_table.rs`) — 按 PEB OSBuildNumber 查表，floor-match 未知 patch build。
+2. **Pattern scan** (`pattern_scan.rs`) — lea [rip+disp32] 特征扫描 RVA。最后一道。
+
+> 编译期烘焙（`NYX_OFFSETS`）已于 2026-08-08 移除（无消费方）。
 
 ### 真机验证的版本
 

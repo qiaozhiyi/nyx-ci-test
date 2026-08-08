@@ -17,6 +17,9 @@
 //!   wire `Command`.
 //! - [`bof`] — W^X COFF loader + Beacon-API shims (`#[no_mangle]` `Beacon*`
 //!   exports the loader keys on by name).
+//! - [`bof_isolated`] — B3 sacrificial child-process BOF execution (bof-host
+//!   blob, section delivery, pipe capture); re-exported as
+//!   `crate::bof::bof_isolated`.
 //! - [`config_placeholder`] — the `#[no_mangle]` `NYX_CFG_PLACEHOLDER` static
 //!   the server patches by symbol name during `generate_implant`.
 //! - [`fs`] / [`shell`] / [`recon`] — file ops (NT syscalls), shell, recon.
@@ -37,6 +40,8 @@ extern crate alloc;
 pub mod beacon;
 #[cfg(target_os = "windows")]
 pub mod bof;
+#[cfg(target_os = "windows")]
+pub mod bof_isolated;
 #[cfg(target_os = "windows")]
 pub mod config_placeholder;
 #[cfg(target_os = "windows")]

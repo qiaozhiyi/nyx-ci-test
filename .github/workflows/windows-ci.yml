@@ -224,7 +224,8 @@ jobs:
             "nyx_selftest","nyx_selftest_postex","nyx_selftest_evasion",
             "nyx_selftest_syscall_rt","nyx_selftest_blind_nttrace",
             "nyx_selftest_hookchain",
-            "nyx_selftest_inject_pool","nyx_selftest_lacuna"
+            "nyx_selftest_inject_pool","nyx_selftest_lacuna",
+            "nyx_selftest_bof_isolated"
           )
           Write-Host "Test                      Exit   Bits"
           Write-Host "------------------------- ------ ----"

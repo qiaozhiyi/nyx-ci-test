@@ -71,6 +71,7 @@ MATRIX = [
     ("nyx_selftest_config", "in-memory config blob decode (pure)"),
     ("nyx_selftest_hostinfo", "hostname/user/pid/beacon_id via PEB walk"),
     ("nyx_selftest_task_guard", "VEH task guard: rootfs lacks VEH/capture exports → env-skip flag (exit 9)"),
+    ("nyx_selftest_bof_isolated", "B3 isolated BOF: stub kernel32 lacks CreateProcessW → env-skip flag (exit 9)"),
 ]
 
 # Per-export emulation budget (seconds). A selftest that hangs (e.g. an

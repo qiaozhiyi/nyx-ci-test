@@ -816,6 +816,79 @@ pub unsafe extern "system" fn nyx_selftest_bof_trace() {
     unsafe { exit(1) };
 }
 
+// ============================================================================
+// bof isolated (B3): run a real COFF in the bof-host child process via
+// crate::bof::bof_isolated (contract: clean → Ok(Response::BofOutput);
+// crash/nonzero/timeout → Ok(Response::Err); only host-API failure → Err).
+//   bit0 = embedded fixtures are AMD64 COFF (machine 0x8664 at offset 0) —
+//          runs everywhere, including the Qiling stub rootfs
+//   bit1 = clean run: bof_print.o → Ok(BofOutput) whose bytes contain
+//          "BOF-PRINT-OK" (the child's inherited-stdout pipe was drained to
+//          EOF and the marker survived the trip back)
+//   bit2 = crash run: bof_crash.o (deliberate null-page store) surfaces as
+//          Err / Response::Err — NEVER a clean Ok(BofOutput) for a faulted
+//          child — and this beacon process survived (reaching exit proves it)
+//   bit3 = SKIP FLAG (not a pass): bit1/bit2 were NOT executed because
+//          CreateProcessW doesn't resolve here — the Qiling stub rootfs
+//          kernel32 exports no process-creation API, so spawning a child
+//          under emulation is impossible and the isolated path skips with a
+//          visible flag (task_guard precedent). A healthy Windows host yields
+//          0b0111 = 7; 0b1001 = 9 means bit1/bit2 were skipped — visibly
+//          different, never a silent pass.
+// Expect 7 on a real Windows host.
+// ============================================================================
+#[cfg(feature = "selftest")]
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_bof_isolated() {
+    let mut mask: u32 = 0;
+    let print_blob: &[u8] = include_bytes!("../tests/fixtures/bof_print.o");
+    let crash_blob: &[u8] = include_bytes!("../tests/fixtures/bof_crash.o");
+
+    // bit0: fixture sanity — both blobs carry the AMD64 COFF machine type.
+    let amd64 = |b: &[u8]| b.len() >= 2 && u16::from_le_bytes([b[0], b[1]]) == 0x8664;
+    if amd64(print_blob) && amd64(crash_blob) {
+        mask |= 1 << 0;
+    }
+
+    if bof_isolated_prereqs_available() {
+        let mut args: Vec<String> = Vec::new();
+        args.push(String::from("nyx"));
+        // bit1: clean run — the marker came back through the pipe capture.
+        let r = unsafe { crate::bof::bof_isolated(print_blob, &args) };
+        if let Ok(Response::BofOutput(buf)) = r {
+            if contains_subslice(&buf, b"BOF-PRINT-OK") {
+                mask |= 1 << 1;
+            }
+        }
+        // bit2: the faulting child must surface as an error; a clean
+        // Ok(BofOutput) here would mean the exit-code mapping is broken.
+        let r = unsafe { crate::bof::bof_isolated(crash_blob, &args) };
+        if matches!(r, Err(_) | Ok(Response::Err(_))) {
+            mask |= 1 << 2;
+        }
+    } else {
+        // bit3: skip flag — CreateProcessW unresolvable (Qiling stub rootfs).
+        mask |= 1 << 3;
+    }
+
+    unsafe { exit(mask) };
+}
+
+/// Read-only probe for the B3 isolated path's host requirement
+/// (task_guard::prereqs_available precedent): CreateProcessW, kernel32 first
+/// with a kernelbase fallback. Resolution failure means no child process can
+/// be spawned in this environment (Qiling stub rootfs), so the selftest skips
+/// the child bits with a visible flag instead of dying on an unresolved call.
+#[cfg(feature = "selftest")]
+fn bof_isolated_prereqs_available() -> bool {
+    // SAFETY: resolution is a read-only PEB walk; nothing is called.
+    unsafe {
+        export_addr(b"kernel32.dll", b"CreateProcessW")
+            .or_else(|| export_addr(b"kernelbase.dll", b"CreateProcessW"))
+            .is_some()
+    }
+}
+
 /// Append `v` as 16 lowercase hex chars (no 0x prefix).
 #[cfg(feature = "selftest")]
 fn push_hex_u64(s: &mut String, v: u64) {
