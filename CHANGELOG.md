@@ -12,6 +12,38 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-09 B3 真机（windows-latest 24H2）全链打通 — 前一天"受限交付"的
+B3 隔离路径在真机上一轮 15 连失败，本轮以证据驱动逐层定位，修掉 6 个
+互相掩盖的 bug，windows-ci 全绿（run 31310348731：probe `BOF-PRINT-OK`
+管道回传 + `nyx_selftest_bof_isolated` exit 7=0b0111 + injection-chain +
+syscall_rt 全 PASS）：
+
+- **根因（最后一个）dumper lea 常量截断**（6254153）：PIC dumper 按指令
+  操作数宽度拷贝 RIP 相对引用的常量，`lea` 的宽度是 8 字节指针而非字面量
+  长度——所有 >8B 字符串字面量被截断（`"cmd.exe\0"` 恰好 8B 才一直没暴露）。
+  bof-host 的 djb2 因此对 `"nttermin"+相邻垃圾` 求哈希，真机上**全部**
+  ntdll 导出解析静默失败。修复：lea 引用常量统一扩展拷贝 128B（图像尾截
+  断保护）；pic-loader.bin 重生成字节级一致（无回归）。死尸证据：func
+  取证槽 len=18、前缀 `"nttermin"` 正确、target_hash 0xaa264e9e ≠ 正确值
+  0xffb4438f。
+- `NtAllocateVirtualMemory` 适配器少传 ZeroBits（6 参写成 5 参），后续实
+  参整体左移，每次分区分配必败（33b9926）。
+- 进程堆改读 `PEB+0x30`：`RtlGetProcessHeap` 在 24H2 ntdll 导出表**不存
+  在**（probe 导出矩阵实证 MISSING；此前每次分配即 alloc-error 死）
+  （7e0f8e4）。
+- 返回地址扫描命中首个 MZ/PE 即返回，不再继续下探（越过映像基址读未映
+  射页 → 子进程 0xc0000005，run 31308772386）（7e0f8e4）。
+- export-walk 以 BLINK(+0x8) 而非 FLINK(+0x0) 前进——首条目（exe）之后
+  即回表头，永远找不到 ntdll（41927a0）。
+- bof-host 移除按名称的 Ldr 走查：24H2 上 populated Ldr 列表中旧偏移处
+  的 (len,buf) 字段不可信，走查野指针解引用直接 AV（run 31308540437 死
+  尸 stamp=0xC9+stage=2+0xc0000005）；ntdll-only 解析走 父基址 → 导出特
+  征走查 → 返回地址扫描 三级回退（7af1ace）。
+- 证据通道（nyx-ci-test probe + bof-host 内建）：死尸 stamp/8+11 槽 diag
+  记录经**本地 section 视图**读取（子进程死亡后仍可读，这是全部定位的
+  关键）；probe 管道写端可继承修复（此前子进程 stdout 是死句柄，所有
+  `[bof-host]` 诊断静默丢失）；导出存在性矩阵 + 父进程侧解析副本对照。
+
 2026-08-08 B3 BOF 子进程隔离（受限交付，spec 2026-08-04-v040 §4-B3 完成）—
 operator 显式选择 `Command::Bof.isolate` 时，BOF 在牺牲子进程（bof-host）中
 执行而非 beacon 内联：崩溃杀子进程、beacon 存活上报 `Response::Err`。
