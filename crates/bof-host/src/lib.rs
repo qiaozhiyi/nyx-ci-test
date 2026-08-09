@@ -203,16 +203,16 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
             stamp_diag(0xC9);
         }
     }
-    if let Some(a) = nyx_implant_core::resolve::export_addr(module, func) {
-        return Some(a);
-    }
+    // NO name-based Ldr walk here. `resolve::export_addr` matches modules by
+    // hashing UNICODE_STRING name fields at pre-24H2 LDR_DATA_TABLE_ENTRY
+    // offsets; on 24H2 those fields moved, so in a fully-initialized child
+    // (populated Ldr list) the walk dereferences wild (length, buffer) pairs
+    // and AVs the process (root cause of run 31308540437: post-mortem
+    // stamp=0xC9 + stage=2 + exit 0xc0000005 — death inside the first
+    // export_addr). bof-host only ever resolves ntdll, whose base the parent
+    // provides and the fallbacks below locate without any name matching.
     let (lower_buf, lower_len) = ascii_lower(func);
     let lower = &lower_buf[..lower_len];
-    if lower != func {
-        if let Some(a) = nyx_implant_core::resolve::export_addr(module, lower) {
-            return Some(a);
-        }
-    }
     // The sacrificial child's loader never runs (kernel32 is not even
     // mapped — proven on windows-latest: reading the parent's kernel32 base
     // in the child returns STATUS_PARTIAL_COPY while ntdll reads fine), so
@@ -278,6 +278,7 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
             }
         }
     }
+    stamp_diag(0xD1); // parent-base miss (post-mortem milestone)
     // 2) loader-walk by export feature (name fields moved on 24H2)
     if let Some(nt) = ntdll_via_export_walk() {
         if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
@@ -295,6 +296,7 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
             }
         }
     }
+    stamp_diag(0xD2); // export-probe walk miss
     // 3) thread return address -> ntdll scan (last resort)
     if let Some(r) = scan_ntdll(nyx_implant_core::resolve::djb2(func)) {
         return Some(r);

@@ -272,6 +272,7 @@ pub unsafe fn run(blob: &[u8], args_ptr: *const u8, args_len: i32) -> Result<(),
         }
     };
 
+    crate::stamp_diag(0x20); // milestone: COFF parsed
     // Resolve VirtualAlloc/VirtualProtect/VirtualFree up front; the guard is
     // built before any allocation so every region pushed so far is freed on
     // a later failure.
@@ -280,6 +281,7 @@ pub unsafe fn run(blob: &[u8], args_ptr: *const u8, args_len: i32) -> Result<(),
     let protect =
         unsafe { virtual_protect() }.ok_or_else(|| String::from("VirtualProtect unresolved"))?;
     let free = unsafe { virtual_free() }.ok_or_else(|| String::from("VirtualFree unresolved"))?;
+    crate::stamp_diag(0x21); // milestone: VM adapters resolved
     let mut guard = SectionGuard {
         sections: Vec::with_capacity(coff.sections.len()),
         free,
@@ -319,6 +321,7 @@ pub unsafe fn run(blob: &[u8], args_ptr: *const u8, args_len: i32) -> Result<(),
         });
     }
 
+    crate::stamp_diag(0x22); // milestone: sections allocated + copied
     // 2. Map defined symbols → absolute addresses (section_base + value).
     let mut defined: Vec<(String, u64)> = Vec::with_capacity(coff.symbols.len());
     for sym in &coff.symbols {
@@ -367,6 +370,7 @@ pub unsafe fn run(blob: &[u8], args_ptr: *const u8, args_len: i32) -> Result<(),
         }
     }
 
+    crate::stamp_diag(0x23); // milestone: relocations applied
     // 4. Flip code sections to RX (W^X: close the write window).
     for i in 0..bases.len() {
         if is_code[i] {
@@ -386,6 +390,7 @@ pub unsafe fn run(blob: &[u8], args_ptr: *const u8, args_len: i32) -> Result<(),
         }
     }
 
+    crate::stamp_diag(0x24); // milestone: code sections flipped RX
     // 5. Resolve the entry symbol `go`.
     let entry_sym = coff
         .symbols
@@ -406,6 +411,7 @@ pub unsafe fn run(blob: &[u8], args_ptr: *const u8, args_len: i32) -> Result<(),
     //    no-args BOF gets a NULL buffer (BeaconDataParse(NULL, 0) fallback)
     //    instead of a dangling empty-slice pointer. The SectionGuard drops
     //    after go() returns, zeroing + freeing every region.
+    crate::stamp_diag(0x25); // milestone: calling go()
     unsafe {
         let go: extern "C" fn(*const u8, i32) = core::mem::transmute(entry_addr);
         if args_len <= 0 || args_ptr.is_null() {
@@ -414,6 +420,7 @@ pub unsafe fn run(blob: &[u8], args_ptr: *const u8, args_len: i32) -> Result<(),
             go(args_ptr, args_len);
         }
     }
+    crate::stamp_diag(0x26); // milestone: go() returned
     drop(guard);
     Ok(())
 }
