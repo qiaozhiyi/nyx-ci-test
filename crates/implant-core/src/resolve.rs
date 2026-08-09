@@ -470,6 +470,11 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
 /// Handles PE forwarded exports (where the RVA falls within the export directory
 /// itself, pointing to an ASCII string like "NTDLL.RtlAddVectoredExceptionHandler").
 /// These are recursively resolved via PEB walk to avoid jumping into string data.
+///
+/// # Safety
+/// `base` must point to a valid, mapped PE image (MZ/PE headers readable, and
+/// the export directory within the mapping). Forwarder resolution walks the
+/// PEB loader lists of the current process.
 pub unsafe fn export_addr_by_hash_pub(base: *mut u8, fn_hash: u32) -> Option<usize> {
     let (export_rva, export_dir_size) = export_directory_range(base)?;
     let dir = base.add(export_rva as usize) as *const ExportDirectory;

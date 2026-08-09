@@ -1108,15 +1108,13 @@ pub unsafe fn nt_open_thread(
     )
 }
 
-/// `NtQuerySystemInformation(SystemInformationClass, Buffer, Length, ReturnLength)` — 4 args.
-/// Used by T-REX for process enumeration (SystemProcessInformation class 5).
-///
-/// # Safety
-/// `buffer` must be writable for `buf_len` bytes (per `info_class`'s layout);
-/// `ret_len` must be a valid out-pointer. Args pass verbatim to the kernel.
 /// `NTSTATUS NtReadVirtualMemory(HANDLE, PVOID BaseAddress, PVOID Buffer,
 /// SIZE_T BufferSize, PSIZE_T NumberOfBytesRead)` — cross-process read
 /// (loader-readiness polling in the B3 isolated path).
+///
+/// # Safety
+/// `handle` must be a valid process handle with read access; `buffer` must be
+/// writable for `buf_len` bytes. Args pass verbatim to the kernel.
 pub unsafe fn nt_read_virtual_memory(
     rt: &Runtime,
     handle: usize,
@@ -1135,6 +1133,12 @@ pub unsafe fn nt_read_virtual_memory(
     )
 }
 
+/// `NtQuerySystemInformation(SystemInformationClass, Buffer, Length, ReturnLength)` — 4 args.
+/// Used by T-REX for process enumeration (SystemProcessInformation class 5).
+///
+/// # Safety
+/// `buffer` must be writable for `buf_len` bytes (per `info_class`'s layout);
+/// `ret_len` must be a valid out-pointer. Args pass verbatim to the kernel.
 pub unsafe fn nt_query_system_information(
     rt: &Runtime,
     info_class: u32,

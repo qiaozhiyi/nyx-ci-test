@@ -170,7 +170,7 @@ unsafe fn run_in_child(
     pipe_read: *mut c_void,
 ) -> Result<Response, &'static str> {
     let base = unsafe { crate::tp::section_deliver(proc.handle, image) }
-        .map_err(|e| "bof isolate: section delivery failed")?;
+        .map_err(|_| "bof isolate: section delivery failed")?;
     let _ = base;
     let entry = base as usize; // blob entry at offset 0
     let arg = (base + BOF_HOST_BLOB.len()) as usize; // payload appended after the code
