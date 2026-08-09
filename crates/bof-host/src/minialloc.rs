@@ -16,18 +16,25 @@ use crate::export_addr;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
 
-type RtlGetProcessHeapFn = unsafe extern "system" fn() -> *mut c_void;
 type RtlAllocateHeapFn = unsafe extern "system" fn(*mut c_void, u32, usize) -> *mut c_void;
 type RtlFreeHeapFn = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
 
-/// Resolve + call `RtlGetProcessHeap`. Null on failure (kernel32 gone —
-/// catastrophic; the alloc error handler will fire on the null return).
+/// Read the process heap straight from the PEB (`PEB->ProcessHeap`,
+/// offset 0x30 on x64). No export resolution at all: `RtlGetProcessHeap`
+/// turned out to be unresolvable on the windows-latest 24H2 ntdll
+/// (real-machine run 31308772386: parent-base and export-walk both missed
+/// it), and the PEB field needs none.
 unsafe fn process_heap() -> *mut c_void {
-    let Some(addr) = (unsafe { export_addr(b"ntdll.dll", b"rtlgetprocessheap") }) else {
+    let peb: usize;
+    core::arch::asm!(
+        "mov {}, gs:[0x60]",
+        out(reg) peb,
+        options(nostack, preserves_flags, readonly),
+    );
+    if peb == 0 {
         return core::ptr::null_mut();
-    };
-    let f: RtlGetProcessHeapFn = unsafe { core::mem::transmute(addr) };
-    unsafe { f() }
+    }
+    unsafe { *((peb as *const u8).add(0x30) as *const *mut c_void) }
 }
 
 /// Stateless `GlobalAlloc` over the Win32 process heap.
