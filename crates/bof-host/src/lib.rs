@@ -290,6 +290,26 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
         }
     }
     unsafe { diag_u64(0, base) };
+    // Record the PE-header ingredients the lookup consumed (e_lfanew /
+    // magic / export RVA / NumberOfNames as seen from the CHILD) — a correct
+    // base with a failing lookup means one of these reads is wrong.
+    if base != 0 {
+        let b = base as *const u8;
+        let e = unsafe { *(b.add(0x3C) as *const i32) } as u32 as u64;
+        let nth = unsafe { b.add(e as usize) };
+        let magic = unsafe { *(nth.add(24) as *const u16) } as u64;
+        let dd = if magic == 0x20B { 112usize } else { 96 };
+        let erva = unsafe { *(nth.add(24 + dd) as *const u32) } as u64;
+        let non = if erva != 0 {
+            (unsafe { *(b.add(erva as usize + 0x18) as *const u32) }) as u64
+        } else {
+            0
+        };
+        unsafe { diag_u64(4, e) };
+        unsafe { diag_u64(5, magic) };
+        unsafe { diag_u64(6, erva) };
+        unsafe { diag_u64(7, non) };
+    }
     stamp_diag(0xD1); // parent-base miss (post-mortem milestone)
     // 2) loader-walk by export feature (name fields moved on 24H2)
     let walk_nt = unsafe { ntdll_via_export_walk() };
