@@ -37,7 +37,15 @@ type VirtualFreeFn = unsafe extern "system" fn(*mut c_void, usize, u32) -> i32;
 /// everything from **ntdll** — the one image CreateProcessW always maps.
 /// These adapters keep the VirtualAlloc/Protect/Free call sites unchanged
 /// while executing the equivalent Nt* calls.
-type NtAllocVmFn = unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32, u32) -> i32;
+// NTSTATUS NtAllocateVirtualMemory(HANDLE, PVOID *BaseAddress,
+// ULONG_PTR ZeroBits, PSIZE_T RegionSize, ULONG AllocationType, ULONG
+// Protect) — SIX parameters. An earlier 5-parameter adapter dropped
+// ZeroBits, shifting every later argument one slot left (RegionSize
+// received the AllocationType VALUE as a pointer, Protect was stack
+// garbage): every allocation returned STATUS_INVALID_PARAMETER /
+// STATUS_ACCESS_VIOLATION and the loader died with "VirtualAlloc failed".
+type NtAllocVmFn =
+    unsafe extern "system" fn(usize, *mut *mut c_void, usize, *mut usize, u32, u32) -> i32;
 type NtProtectVmFn =
     unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32, *mut u32) -> i32;
 type NtFreeVmFn = unsafe extern "system" fn(usize, *mut *mut c_void, *mut usize, u32) -> i32;
@@ -57,7 +65,7 @@ unsafe extern "system" fn nt_alloc_adapter(
     };
     let mut base = addr;
     let mut sz = size;
-    let st = unsafe { f(CUR_PROC, &mut base, &mut sz, alloc_type, protect) };
+    let st = unsafe { f(CUR_PROC, &mut base, 0, &mut sz, alloc_type, protect) };
     if st < 0 {
         core::ptr::null_mut()
     } else {
