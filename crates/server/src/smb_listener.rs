@@ -85,14 +85,7 @@ extern "system" {
         lp_overlapped: *mut std::ffi::c_void,
     ) -> i32;
     fn DisconnectNamedPipe(h_named_pipe: *mut std::ffi::c_void) -> i32;
-    fn PeekNamedPipe(
-        h_named_pipe: *mut std::ffi::c_void,
-        lp_buffer: *mut u8,
-        n_buffer_size: u32,
-        lp_bytes_read: *mut u32,
-        lp_total_bytes_avail: *mut u32,
-        lp_bytes_left_this_message: *mut u32,
-    ) -> i32;
+    fn FlushFileBuffers(h_file: *mut std::ffi::c_void) -> i32;
     fn GetLastError() -> u32;
 }
 
@@ -244,37 +237,23 @@ fn serve_transaction_seal_reply(pipe: *mut std::ffi::c_void, reply: &[u8]) -> st
 /// The child reads the reply BEFORE closing its handle. `DisconnectNamedPipe`
 /// discards any unread data still in the pipe buffer, so re-arming
 /// immediately after the write would race the child's read and drop the
-/// reply tail (child sees ERROR_PIPE_NOT_CONNECTED mid-reply — reproduced
-/// on wine, latent on real Windows). Wait until the child has consumed the
-/// reply (bounded like the I/O phases) before the loop re-arms.
+/// reply tail (child sees ERROR_PIPE_NOT_CONNECTED mid-reply — flaky on
+/// windows-latest CI, 2026-08). `FlushFileBuffers` on the server handle is
+/// the documented fix: it blocks until the client has read every byte the
+/// server wrote. (An earlier PeekNamedPipe drain loop was a no-op here:
+/// PeekNamedPipe reports bytes available to *this* handle — the
+/// client→server direction, already drained by the request read — not the
+/// unconsumed reply in the server→client buffer.)
 fn serve_transaction_drain_wait(pipe: *mut std::ffi::c_void) -> std::io::Result<()> {
-    let flush_deadline = std::time::Instant::now() + IO_TIMEOUT;
-    loop {
-        let mut avail: u32 = 0;
-        let ok = unsafe {
-            PeekNamedPipe(
-                pipe,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-                &mut avail,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            // Pipe broken — the child is gone; nothing left to preserve.
-            return Ok(());
-        }
-        if avail == 0 {
-            break;
-        }
-        if std::time::Instant::now() >= flush_deadline {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "pipe flush timeout",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    let ok = unsafe { FlushFileBuffers(pipe) };
+    if ok == 0 {
+        // Flush failure means the child is gone (ERROR_PIPE_NOT_CONNECTED /
+        // ERROR_BROKEN_PIPE) — nothing left to preserve for it.
+        tracing::debug!(
+            target: "nyx::pivot",
+            last_error = unsafe { GetLastError() },
+            "smb pivot reply flush failed; child already gone"
+        );
     }
     Ok(())
 }

@@ -155,7 +155,7 @@ fn smb_pipe_listener_roundtrips() {
     // the listener re-arms after DisconnectNamedPipe and keeps serving — the
     // spawn-loop re-arm path, not just a one-shot transaction. No sleep:
     // the listener only re-arms after the child has consumed the reply
-    // (PeekNamedPipe flush in serve_transaction), so the next connect can
+    // (FlushFileBuffers drain in serve_transaction), so the next connect can
     // race the re-arm safely.
     child_transaction(&state, &pipe_name, 43);
 }
