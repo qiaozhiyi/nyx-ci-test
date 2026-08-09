@@ -353,6 +353,24 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
             unsafe { diag_u64(14, fn_rva) };
             unsafe { diag_u64(15, erva + dir_size) };
         }
+        // func-slice forensics: is `func` still "ntterminateprocess" in the
+        // blob (len + first bytes + independently-computed inline hash)? The
+        // djb2 target above (slot 12) was 0xaa264e9e child-side vs
+        // 0xffb4438f parent-side — either the literal bytes or resolve::djb2
+        // itself is mis-relocated in the dumped blob.
+        {
+            unsafe { diag_u64(16, func.len() as u64) };
+            let mut head = 0u64;
+            for (i, &c) in func.iter().take(8).enumerate() {
+                head |= (c as u64) << (i * 8);
+            }
+            unsafe { diag_u64(17, head) };
+            let mut h: u32 = 5381;
+            for &c in func {
+                h = h.wrapping_mul(33).wrapping_add(c.to_ascii_lowercase() as u32);
+            }
+            unsafe { diag_u64(18, h as u64) };
+        }
     }
     stamp_diag(0xD1); // parent-base miss (post-mortem milestone)
     // 2) loader-walk by export feature (name fields moved on 24H2)
