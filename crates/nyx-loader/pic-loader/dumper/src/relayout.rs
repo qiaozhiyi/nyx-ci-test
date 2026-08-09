@@ -136,8 +136,8 @@ pub fn dump(pe: &Pe, opts: &DumpOpts) -> Result<Vec<u8>, DumpError> {
     }
 
     // ── 3. collect references from reachable code ─────────────────────────
-    // data targets: va -> (max size needed, written?)
-    let mut data_refs: BTreeMap<u64, (usize, bool)> = BTreeMap::new();
+    // data targets: va -> (max size needed, written?, lea-referenced?)
+    let mut data_refs: BTreeMap<u64, (usize, bool, bool)> = BTreeMap::new();
     let mut branch_refs: Vec<(u64, u64)> = Vec::new(); // (insn_va, target_va)
     let mut rip_patches: Vec<(u64, usize, usize, bool)> = Vec::new(); // (insn_va, disp_pos, size, write)
     let mut mem_indirect: Vec<(u64, &'static str)> = Vec::new();
@@ -148,14 +148,15 @@ pub fn dump(pe: &Pe, opts: &DumpOpts) -> Result<Vec<u8>, DumpError> {
         let insn = &insns[&a];
         let d = insn.decoded;
         match d.kind {
-            Kind::RipRelative { disp_pos, size, write, is_lea: _ } => {
+            Kind::RipRelative { disp_pos, size, write, is_lea } => {
                 let disp = read_disp32(&insn.bytes, disp_pos);
                 let target = calc_target(a + d.len as u64, disp);
                 if target < text_lo || target >= text_hi {
                     // external data reference — must be copied into the blob
-                    let e = data_refs.entry(target).or_insert((0, false));
+                    let e = data_refs.entry(target).or_insert((0, false, false));
                     e.0 = e.0.max(size);
                     e.1 = e.1 || write;
+                    e.2 = e.2 || is_lea;
                 } else {
                     // reference into code (e.g. lea of a function) — patch as
                     // a code-relative target.
@@ -164,7 +165,7 @@ pub fn dump(pe: &Pe, opts: &DumpOpts) -> Result<Vec<u8>, DumpError> {
                             "reachable code at {a:#x} references unreachable code {target:#x}"
                         ));
                     }
-                    data_refs.entry(target).or_insert((1, false));
+                    data_refs.entry(target).or_insert((1, false, false));
                 }
                 rip_patches.push((a, disp_pos, size, write));
             }
@@ -281,25 +282,39 @@ pub fn dump(pe: &Pe, opts: &DumpOpts) -> Result<Vec<u8>, DumpError> {
     }
 
     // Data: 16-byte aligned copies of every referenced constant.
-    let mut data_blocks: BTreeMap<u64, (usize, usize, bool)> = BTreeMap::new();
-    // (orig_va) -> (src_off, size, write)
-    for (tgt, (size, write)) in &data_refs {
-        let size = (*size).max(1);
+    let mut data_blocks: BTreeMap<u64, (usize, usize, bool, bool)> = BTreeMap::new();
+    // (orig_va) -> (src_off, size, write, lea)
+    for (tgt, (size, write, lea)) in &data_refs {
+        let mut size = (*size).max(1);
         let src_off = match pe.rva_to_off(*tgt as u32) {
             Some(o) => o,
             None => return fail(format!("data ref target {tgt:#x} outside image")),
         };
+        // A LEA conveys only the constant's ADDRESS — never its length (the
+        // recorded operand size is the 8-byte pointer, not the literal).
+        // Copying `size` bytes truncates every string literal longer than 8
+        // (bof-host root cause: djb2 hashed "nttermin"+adjacent junk instead
+        // of "ntterminateprocess"). Extend generously and clamp at the image
+        // end; over-copied bytes are dead weight, under-copied bytes are
+        // silent corruption.
+        if *lea {
+            const LEA_CONST_SPAN: usize = 128;
+            size = LEA_CONST_SPAN.min(pe.data.len().saturating_sub(src_off));
+            if size == 0 {
+                return fail(format!("lea data ref target {tgt:#x} at image end"));
+            }
+        }
         if src_off + size > pe.data.len() {
             return fail(format!("data ref target {tgt:#x} truncated"));
         }
-        data_blocks.insert(*tgt, (src_off, size, *write));
+        data_blocks.insert(*tgt, (src_off, size, *write, *lea));
     }
     // round blob length to 16
     while blob.len() % 16 != 0 {
         blob.push(0);
     }
     let mut data_place: BTreeMap<u64, usize> = BTreeMap::new(); // orig_va -> blob_off
-    for (tgt, (src_off, size, write)) in &data_blocks {
+    for (tgt, (src_off, size, write, _lea)) in &data_blocks {
         if *size == 0 {
             continue;
         }
