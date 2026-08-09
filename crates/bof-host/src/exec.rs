@@ -273,9 +273,9 @@ pub unsafe fn run(blob: &[u8], args_ptr: *const u8, args_len: i32) -> Result<(),
     };
 
     crate::stamp_diag(0x20); // milestone: COFF parsed
-    // Resolve VirtualAlloc/VirtualProtect/VirtualFree up front; the guard is
-    // built before any allocation so every region pushed so far is freed on
-    // a later failure.
+                             // Resolve VirtualAlloc/VirtualProtect/VirtualFree up front; the guard is
+                             // built before any allocation so every region pushed so far is freed on
+                             // a later failure.
     let alloc =
         unsafe { virtual_alloc() }.ok_or_else(|| String::from("VirtualAlloc unresolved"))?;
     let protect =
@@ -322,7 +322,7 @@ pub unsafe fn run(blob: &[u8], args_ptr: *const u8, args_len: i32) -> Result<(),
     }
 
     crate::stamp_diag(0x22); // milestone: sections allocated + copied
-    // 2. Map defined symbols → absolute addresses (section_base + value).
+                             // 2. Map defined symbols → absolute addresses (section_base + value).
     let mut defined: Vec<(String, u64)> = Vec::with_capacity(coff.symbols.len());
     for sym in &coff.symbols {
         if sym.section_number >= 1 && (sym.section_number as usize) <= bases.len() {
@@ -371,7 +371,7 @@ pub unsafe fn run(blob: &[u8], args_ptr: *const u8, args_len: i32) -> Result<(),
     }
 
     crate::stamp_diag(0x23); // milestone: relocations applied
-    // 4. Flip code sections to RX (W^X: close the write window).
+                             // 4. Flip code sections to RX (W^X: close the write window).
     for i in 0..bases.len() {
         if is_code[i] {
             let mut old: u32 = 0;
@@ -391,7 +391,7 @@ pub unsafe fn run(blob: &[u8], args_ptr: *const u8, args_len: i32) -> Result<(),
     }
 
     crate::stamp_diag(0x24); // milestone: code sections flipped RX
-    // 5. Resolve the entry symbol `go`.
+                             // 5. Resolve the entry symbol `go`.
     let entry_sym = coff
         .symbols
         .iter()

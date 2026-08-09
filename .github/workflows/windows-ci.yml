@@ -275,6 +275,11 @@ jobs:
             throw "nyx_selftest_bof_isolated expected exit 7 (0b0111), got $LASTEXITCODE"
           }
           Write-Host "B3 isolated-BOF probe: PASS (0b0111)"
+          # pwsh steps fail on a non-zero $LASTEXITCODE even without throw —
+          # the probe's expected exit is 7, so reset explicitly (same trap as
+          # the syscall_rt step in b3-verify.yml; caught on the public CI
+          # mirror, nyx-ci-test run 31312910796).
+          exit 0
 
       # ---- 3. Live PDB offset resolution (ground-truth verification) ----
       - name: "Live PDB offset resolution (host's own kernel)"

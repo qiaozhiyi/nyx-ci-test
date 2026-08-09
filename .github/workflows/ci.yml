@@ -127,37 +127,56 @@ jobs:
       # this gate. fmt is a hard gate; clippy runs report-only for now — the
       # pre-split implant was never under a clippy gate and carries ~300
       # pre-existing style lints (AH-13 debt recorded, not split regressions).
+      # The clippy steps therefore run with RUSTFLAGS cleared: the workflow-level
+      # -D warnings would otherwise promote those recorded lints to hard errors
+      # (confirmed on the public CI mirror, nyx-ci-test run 31312910796).
       - name: Ensure rustfmt + clippy for lint steps
         shell: cmd
         run: rustup component add rustfmt clippy --toolchain 1.96.0
-      - name: implant-core check + fmt + clippy (WP-C)
+      - name: implant-core check + fmt (WP-C)
         shell: cmd
         run: |
           cargo +1.96.0 check --locked --manifest-path crates/implant-core/Cargo.toml && ^
-          cargo +1.96.0 fmt --manifest-path crates/implant-core/Cargo.toml -- --check && ^
-          cargo +1.96.0 clippy --locked --manifest-path crates/implant-core/Cargo.toml || ^
+          cargo +1.96.0 fmt --manifest-path crates/implant-core/Cargo.toml -- --check || ^
           exit 1
-      - name: implant-evasion check + fmt + clippy (WP-C)
+      - name: implant-core clippy (report-only, AH-13)
+        shell: cmd
+        env:
+          RUSTFLAGS: ""
+        run: cargo +1.96.0 clippy --locked --manifest-path crates/implant-core/Cargo.toml
+      - name: implant-evasion check + fmt (WP-C)
         shell: cmd
         run: |
           cargo +1.96.0 check --locked --manifest-path crates/implant-evasion/Cargo.toml && ^
-          cargo +1.96.0 fmt --manifest-path crates/implant-evasion/Cargo.toml -- --check && ^
-          cargo +1.96.0 clippy --locked --manifest-path crates/implant-evasion/Cargo.toml || ^
+          cargo +1.96.0 fmt --manifest-path crates/implant-evasion/Cargo.toml -- --check || ^
           exit 1
-      - name: implant-net check + fmt + clippy (WP-C)
+      - name: implant-evasion clippy (report-only, AH-13)
+        shell: cmd
+        env:
+          RUSTFLAGS: ""
+        run: cargo +1.96.0 clippy --locked --manifest-path crates/implant-evasion/Cargo.toml
+      - name: implant-net check + fmt (WP-C)
         shell: cmd
         run: |
           cargo +1.96.0 check --locked --manifest-path crates/implant-net/Cargo.toml && ^
-          cargo +1.96.0 fmt --manifest-path crates/implant-net/Cargo.toml -- --check && ^
-          cargo +1.96.0 clippy --locked --manifest-path crates/implant-net/Cargo.toml || ^
+          cargo +1.96.0 fmt --manifest-path crates/implant-net/Cargo.toml -- --check || ^
           exit 1
-      - name: implant-tasks check + fmt + clippy (WP-C)
+      - name: implant-net clippy (report-only, AH-13)
+        shell: cmd
+        env:
+          RUSTFLAGS: ""
+        run: cargo +1.96.0 clippy --locked --manifest-path crates/implant-net/Cargo.toml
+      - name: implant-tasks check + fmt (WP-C)
         shell: cmd
         run: |
           cargo +1.96.0 check --locked --manifest-path crates/implant-tasks/Cargo.toml && ^
-          cargo +1.96.0 fmt --manifest-path crates/implant-tasks/Cargo.toml -- --check && ^
-          cargo +1.96.0 clippy --locked --manifest-path crates/implant-tasks/Cargo.toml || ^
+          cargo +1.96.0 fmt --manifest-path crates/implant-tasks/Cargo.toml -- --check || ^
           exit 1
+      - name: implant-tasks clippy (report-only, AH-13)
+        shell: cmd
+        env:
+          RUSTFLAGS: ""
+        run: cargo +1.96.0 clippy --locked --manifest-path crates/implant-tasks/Cargo.toml
 
   # The operator UI is outside the Rust workspace, so it needs an explicit
   # quality gate rather than relying on the workspace jobs above.
