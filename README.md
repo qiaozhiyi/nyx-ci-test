@@ -4,7 +4,14 @@
 
 纯 Rust 全栈 C2 框架,融合 Cobalt Strike 的可扩展性与 Brute Ratel 的默认隐蔽性。**所有能力状态以代码核对为准**(本次 README 于 2026-07-18 经 6 路并行代码审计重写,每条声称附 `file:line` 证据)。
 
-> ⚠️ **证据时效（2026-08-05）**：本日一批 P0 修复合并，改 16 个文件（`beacon.rs`/`fs.rs`/`ntalloc.rs`/`screenshot.rs`/`entry.rs`/`syscalls.rs`/`envprobe.rs`/`hookchain.rs`/`selftests.rs`/`sleep.rs`/`channels/mod.rs` + 3 workflow yml + 2 ps1 脚本）。正文 `file:line` 证据可能因行号偏移/函数签名变更/截图捕获序列重写而滞后数行；**canonical truth 以 `git log --oneline -10` + 实际源码为准**。查当前状态：`git log --oneline -- crates/implant-win/src/` 与 `git diff 2026-07-18..HEAD -- crates/implant-win/src/`。
+> ⚠️ **证据时效（2026-08-09）**：本日一批 B3/CI 修复合并（dumper lea 截断根因 + 5 个连带 bug、smb pivot 回复竞态、qiling CRT IAT、`-D warnings` 门禁合规、bof-host fmt、workflow exit-0）。正文 `file:line` 证据可能滞后数行；**canonical truth 以 `git log --oneline -10` + 实际源码为准**。
+
+> 🚀 **最新进展（2026-08-09，分支 `refactor/ah-audit-followups`）**：
+> - **B3 隔离 BOF 链真机全绿**：根因是 PIC dumper 把 lea 引用常量按指针宽度（8B）拷贝，>8B 字符串字面量被截断，导致 bof-host 全部 ntdll 导出解析失败；连带修复 24H2 堆解析（PEB+0x30）、Ldr 走查方向、`NtAllocateVirtualMemory` 6 参等 5 个 bug。真机证据：`nyx_selftest_bof_isolated` exit 7（0b0111）、`bof_print.o` 经牺牲子进程管道回传 `BOF-PRINT-OK`、注入链/syscall_rt 全 PASS。
+> - **CI 整体迁移到公有测试仓库**：主仓库（私有）GitHub Actions 因账户 billing/spending limit 全面停用（job 在 runner 分配前秒败）。完整 CI 面已镜像到公有仓库 `qiaozhiyi/nyx-ci-test` 的 `ny-mirror.yml`（12 个 job 覆盖 ci.yml 全部门禁 + windows-ci/g6/p4-p5/kself，经 deploy key 克隆私有源码，公有 runner 免费），最终一轮 **12/12 全绿**；按需触发：`gh workflow run ny-mirror.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支>`，历史 runs/artifacts 用后清空。
+> - **Session 0 selftest 限制消除**：hosted runner 上 rundll32 永远到不了导出（v0.3.2 已知限制）——改用 `nyx-bof-isolated-probe` 控制台探针直调导出，9 个 selftest 导出在 hosted runner 上**真跑**（bitmask 全对，`bof_isolated=7`）。
+> - **qiling 仿真矩阵 6/6**：`nyx_selftest_env` 的 UcError 根因是新版 nightly/LLVM 的 loop-idiom recognition 发出真 `wcslen` IAT 调用而 qiling 的 ntdll stub 不导出它；`tools/selftest-qiling/runner.py` 新增 CRT IAT shim 修复。
+> - **SMB pivot 回复竞态修复**：服务端 drain 等待原为 `PeekNamedPipe` 空操作（探的是 client→server 方向），`DisconnectNamedPipe` 会丢弃客户端未读回复（flake 233）；改 `FlushFileBuffers`（`server/src/smb_listener.rs`）。
 
 > 📋 **完整审计报告**:[`docs/audits/CODE_TRUTH_2026-07-18.md`](docs/audits/CODE_TRUTH_2026-07-18.md)(逐 crate 证据) · [`AUTHORITATIVE_FACTS_2026-07-18.md`](docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md)(数字基准,所有文档统一来源)
 
@@ -351,6 +358,21 @@ cargo run -p nyx-profile --bin c2lint -- <profile>
 cargo clippy --workspace --all-targets
 ```
 
+### CI(2026-08-09 起:公有测试仓库镜像)
+
+主仓库(私有)的 GitHub Actions 因账户 billing/spending limit 已停用(job 在 runner 分配前即失败,非代码问题)。完整 CI 面镜像在公有仓库 **`qiaozhiyi/nyx-ci-test`**:
+
+```bash
+# 全量验证(12 个 job:ci.yml 全部门禁 + windows-ci 植入体全链 + g6 24H2 内核
+# + p4-p5 userland + kself;windows-latest = Server 2025 = 26100 内核)
+gh workflow run ny-mirror.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
+
+# B3 隔离 BOF 专用验证链
+gh workflow run b3-verify.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
+```
+
+镜像 workflow 经只读 deploy key 克隆本私有仓库,在免费公有 runner 上执行与 `.github/workflows/` 相同的步骤;hosted runner 上的用户态 selftest 不再跳过——由 `nyx-bof-isolated-probe` 控制台探针直调导出(Session 0 安全)。用完即清空历史 runs/artifacts,workflow 文件常驻备用。`windows-byovd-hosted.yml` 未镜像(需预置 RTCore64.sys + HVCI 关闭,hosted runner 上本就自我跳过)。
+
 ---
 
 ## 已知限制(代码核对实情,2026-07-18)
@@ -393,6 +415,10 @@ cargo clippy --workspace --all-targets
 | 同上 | /hashdump SAM + SYSTEM hive | ✅ |
 | Win11 24H2(build 26100,CI runner) | 编译无回归 | ✅ |
 | GitHub 托管 windows-latest(Server 2025) | 反射加载 blob E2E(fixture + 真实 implant DLL,CreateThread 入口,DllMain marker) | ✅(2026-08-02) |
+| GitHub 托管 windows-latest(公有测试仓库镜像) | **CI 全量 12/12 绿**:fmt/clippy/workspace+standalone 测试/UI build/loader-emu/qiling/impersonation/windows-ci 全链/g6/p4-p5/kself | ✅(2026-08-09) |
+| 同上 | **9 个 selftest 导出经控制台探针真跑**(替代 Session 0 挂死的 rundll32;`bof_isolated=7 (0b0111)`、`syscall_rt=3`、`postex=15`) | ✅(2026-08-09) |
+| 同上 | **B3 隔离 BOF 链**:`bof_print.o` 经牺牲子进程管道回传 `BOF-PRINT-OK`;注入链探针;syscall_rt 探针 | ✅(2026-08-09) |
+| Qiling 仿真(macos runner) | selftest 导出可行性矩阵 **6/6**(含修复后的 `nyx_selftest_env`) | ✅(2026-08-09) |
 | Win11 25H2 CET+HVCI 物理机 | SPOOF_SWAP CET 修复缝 / HVCI 硬件触发 | 🟡 需物理机 |
 | macOS(team server + agent-dev + GUI) | 协议循环 + 操作端 | ✅(本次审计期间实测 server 运行 + 真实 beacon 会话) |
 
