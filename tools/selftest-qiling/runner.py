@@ -30,6 +30,16 @@ env dump-all sub-check sees a non-empty result), GetUserNameW (writes
 "qiling" so the hostinfo username sub-check passes), and memset/memcmp/
 strlen (byte-level ops for the allocator and string paths).
 
+CRT imports the ntdll stub does NOT export (wcslen, strncmp, calloc, free,
+the CRT-startup helpers, ...) are left by Qiling pointing at unmapped magic
+stub addresses, so any IAT call to them dies with UC_ERR_FETCH_UNMAPPED.
+Newer nightly/LLVM makes this bite: it recognizes the u16 length loop in
+do_env_dump_all (implant-tasks/src/recon.rs) and emits a real `wcslen`
+call through the IAT, crashing nyx_selftest_env. fixup_crt_iat() redirects
+every unresolved IAT slot to a mapped shim page implemented in Python below
+(wcslen/strncmp get faithful semantics; the never-called CRT-startup helpers
+get a return-0 stub, strictly better than the previous crash).
+
 Exit codes:
   bitmask   -> sub-check bits set (see crates/implant-tasks/src/selftests.rs)
   0xAD      -> allocator OOM (fallback bump buffer exhausted)
@@ -190,6 +200,112 @@ def setup_overrides(ql: Qiling) -> None:
     ql.os.set_api("strlen", hook_strlen, QL_INTERCEPT.CALL)
 
 
+def fixup_crt_iat(ql: Qiling, dll_path: Path) -> list:
+    """Redirect IAT slots Qiling left pointing at unmapped memory.
+
+    Qiling resolves the DLL's api-ms-win-crt-* imports against the ntdll stub
+    (its api-set fallback). Names the stub does not export (wcslen, strncmp,
+    calloc, free, CRT-startup helpers) get a magic stub address that is not
+    backed by any mapping, so calling it raises UC_ERR_FETCH_UNMAPPED. Newer
+    nightly/LLVM emits exactly such a call: loop-idiom recognition turns the
+    u16 length loop in do_env_dump_all into `wcslen`.
+
+    For every import slot whose target is unmapped, patch the slot to a byte
+    in a freshly mapped shim page (a bare `ret`) and register a hook_address
+    callback that computes the return value in Python before the `ret` runs.
+    wcslen/strncmp get real implementations (they ARE called by the current
+    codegen); everything else gets a return-0 stub — never called by the
+    selftests, and strictly better than the previous hard crash.
+
+    Returns the list of (dll, name) pairs that were redirected.
+    """
+    import pefile  # qiling dependency; deferred so --help stays cheap
+
+    def shim_wcslen(ql: Qiling) -> None:
+        # wcslen(s=rcx); rax = number of u16 code units before the NUL
+        s = ql.arch.regs.read("rcx")
+        n = 0
+        while ql.mem.read(s + n * 2, 2) != b"\x00\x00":
+            n += 1
+            if n > 1 << 20:  # runaway guard
+                break
+        ql.arch.regs.write("rax", n)
+
+    def shim_strncmp(ql: Qiling) -> None:
+        # strncmp(a=rcx, b=rdx, count=r8); rax = 0 / negative / positive
+        a, b, count = (
+            ql.arch.regs.read("rcx"),
+            ql.arch.regs.read("rdx"),
+            ql.arch.regs.read("r8"),
+        )
+        res = 0
+        for i in range(count):
+            ca = ql.mem.read(a + i, 1)[0]
+            cb = ql.mem.read(b + i, 1)[0]
+            if ca != cb:
+                res = ca - cb
+                break
+            if ca == 0:
+                break
+        ql.arch.regs.write("rax", res & 0xFFFFFFFFFFFFFFFF)
+
+    def shim_ret0(ql: Qiling) -> None:
+        ql.arch.regs.write("rax", 0)
+
+    shims = {"wcslen": shim_wcslen, "strncmp": shim_strncmp}
+
+    pe = pefile.PE(str(dll_path), fast_load=True)
+    pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+    if not hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+        return []
+
+    main_base = None
+    dll_name = dll_path.name.lower()
+    for img in ql.loader.images:
+        if img.path.replace("\\", "/").rsplit("/", 1)[-1].lower() == dll_name:
+            main_base = img.base
+            break
+    if main_base is None:
+        return []
+    pe_base = pe.OPTIONAL_HEADER.ImageBase
+
+    def is_mapped(addr: int) -> bool:
+        return any(start <= addr < end for start, end, *_ in ql.mem.map_info)
+
+    # Lazily map one page of `ret` stubs; each redirect gets its own 16-byte
+    # slot so hook_address can attach a per-function callback.
+    shim_page = None
+    shim_next = 0
+
+    def next_shim_addr() -> int:
+        nonlocal shim_page, shim_next
+        if shim_page is None or shim_next + 0x10 > 0x1000:
+            cand = 0x40000000
+            while is_mapped(cand):
+                cand += 0x1000
+            ql.mem.map(cand, 0x1000, info="crt-iat-shims")
+            ql.mem.write(cand, b"\xc3" * 0x1000)  # every byte a `ret`
+            shim_page, shim_next = cand, 0
+        addr = shim_page + shim_next
+        shim_next += 0x10
+        return addr
+
+    redirected = []
+    for entry in pe.DIRECTORY_ENTRY_IMPORT:
+        dll = entry.dll.decode(errors="replace")
+        for imp in entry.imports:
+            slot = main_base + (imp.address - pe_base)
+            target = ql.mem.read_ptr(slot)
+            if is_mapped(target):
+                continue
+            name = imp.name.decode(errors="replace") if imp.name else f"ord{imp.ordinal}"
+            addr = next_shim_addr()
+            ql.mem.write_ptr(slot, addr)
+            ql.hook_address(shims.get(name, shim_ret0), addr)
+            redirected.append((dll, name))
+    return redirected
+
+
 def run_export(dll_path: Path, export: str, timeout_ms: int) -> dict:
     """Load the DLL fresh and invoke one selftest export.
 
@@ -208,6 +324,7 @@ def run_export(dll_path: Path, export: str, timeout_ms: int) -> dict:
             libcache=False,
         )
         setup_overrides(ql)
+        fixup_crt_iat(ql, dll_path)
 
         addr = find_export(ql, export)
         if addr is None:
