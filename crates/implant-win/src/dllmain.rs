@@ -36,28 +36,37 @@
 
 /// Windows DLL entry point. Returns TRUE unconditionally.
 ///
-/// Implemented with inline assembly (`nomem`, `nostack`) so the compiler does
-/// NOT emit a stack frame or GS cookie check.  Without CRT startup (`-nostartfiles`)
-/// the `__security_cookie` is never initialised, and any function with a stack
-/// frame would fail the cookie check → STATUS_STACK_BUFFER_OVERRUN (0xC0000409).
+/// Implemented as a `#[unsafe(naked)]` function so the compiler CANNOT emit a
+/// prologue, stack frame, or GS cookie check in ANY codegen profile. Without
+/// CRT startup (`-nostartfiles`) the `__security_cookie` is never initialised,
+/// and any function with a stack frame would fail the cookie check →
+/// STATUS_STACK_BUFFER_OVERRUN (0xC0000409).
+///
+/// Naked is load-bearing, not cosmetic: the previous non-naked version relied
+/// on `asm!(..., options(nostack, nomem))` + `unreachable_unchecked()` to avoid
+/// a frame, which only holds under release optimisation. Debug codegen still
+/// emitted a prologue (`subq $0x38, %rsp` before the asm block, observed in
+/// disassembly), so the inlined `ret` popped the wrong address → c0000005 at
+/// ip=0 during `DLL_PROCESS_ATTACH`, LoadLibraryA fails GetLastError=998.
 ///
 /// This is the real DLL entry point — the linker flag `-Wl,-e,DllMain` points
 /// the PE entry directly here, bypassing `DllMainCRTStartup` entirely.
 ///
 /// # Safety
 /// Called by the OS loader as the PE entry point. Safe only because the body
-/// is pure `nostack`/`nomem` assembly that returns TRUE without touching the
-/// stack or memory — no Rust code may be added here (see the GS-cookie note
-/// above).
+/// is pure assembly that returns TRUE without touching the stack or memory —
+/// no Rust code may be added here (see the GS-cookie note above).
 #[no_mangle]
+#[unsafe(naked)]
 pub unsafe extern "system" fn DllMain(
     _hinst: *mut core::ffi::c_void,
     _reason: u32,
     _reserved: *mut core::ffi::c_void,
 ) -> i32 {
-    // Return TRUE (1) via raw assembly — no prologue, no stack frame, no GS cookie.
-    // `nostack` tells LLVM this asm block does not touch the stack.
-    core::arch::asm!("mov eax, 1", "ret", options(nostack, nomem));
-    // Unreachable — the asm above returns. Below is only for type-checking.
-    core::hint::unreachable_unchecked();
+    // Return TRUE (1) — naked_asm is the whole function body: no prologue,
+    // no stack frame, no GS cookie, in every codegen profile.
+    core::arch::naked_asm!(
+        "mov eax, 1",
+        "ret",
+    );
 }
