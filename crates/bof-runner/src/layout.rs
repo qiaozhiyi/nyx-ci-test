@@ -67,6 +67,23 @@ pub fn tramp_stub_offset(index: usize) -> usize {
 
 // ── Externals table (names only; `win.rs` resolves them to addresses) ───────
 
+/// Beacon-API shim names the loader resolves to the in-Rust shims in
+/// `win.rs` (one trampoline stub each). This is the core CS `beacon.h`
+/// surface: `BeaconPrintf` plus the `datap` argument parser, `BeaconIsAdmin`,
+/// `BeaconGetSpawnTo`, and the community `BeaconOutput` extension. Each name
+/// appears exactly once (enforced by a test).
+pub const BEACON_APIS: &[&str] = &[
+    "BeaconPrintf",
+    "BeaconOutput",
+    "BeaconDataParse",
+    "BeaconDataExtract",
+    "BeaconDataInt",
+    "BeaconDataShort",
+    "BeaconDataLength",
+    "BeaconIsAdmin",
+    "BeaconGetSpawnTo",
+];
+
 /// kernel32/ntdll exports resolved at load time via `GetModuleHandleA` +
 /// `GetProcAddress`, as `(module, export name)` pairs. Each name appears at
 /// most once in this list (enforced by a test); the first module in the pair
@@ -208,12 +225,28 @@ mod tests {
         for w in names.windows(2) {
             assert_ne!(w[0], w[1], "duplicate external name `{}`", w[0]);
         }
-        // Sanity: the whole table fits in one trampoline page.
-        assert!(names.len() <= TRAMP_STUBS_PER_PAGE);
+        // Sanity: the whole table plus the Beacon-API shims fits in one
+        // trampoline page.
+        assert!(names.len() + BEACON_APIS.len() <= TRAMP_STUBS_PER_PAGE);
         // The CRT lists must be well-formed (non-empty, no blank entries).
         assert!(!CRT_NAMES.is_empty());
         assert!(!CRT_MODULES.is_empty());
         assert!(CRT_NAMES.iter().all(|n| !n.is_empty()));
         assert!(CRT_MODULES.iter().all(|m| !m.is_empty()));
+    }
+
+    #[test]
+    fn beacon_apis_have_unique_names() {
+        // Same shadowing hazard as the externals table, and none of the shim
+        // names may collide with a kernel32/ntdll/CRT export name.
+        let mut names: Vec<&str> = BEACON_APIS.to_vec();
+        names.sort_unstable();
+        for w in names.windows(2) {
+            assert_ne!(w[0], w[1], "duplicate Beacon-API name `{}`", w[0]);
+        }
+        for &n in BEACON_APIS {
+            assert!(!EXTERN_SINGLES.iter().any(|(_, e)| *e == n));
+            assert!(!CRT_NAMES.contains(&n));
+        }
     }
 }

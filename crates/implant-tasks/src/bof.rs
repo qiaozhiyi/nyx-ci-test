@@ -443,11 +443,17 @@ pub unsafe extern "C" fn BeaconDataParse(d: *mut DataParseState, buffer: *const 
 
 /// `char *BeaconDataExtract(datap *parser, int *size)`. Reads a u32 length then
 /// that many bytes; advances the buffer cursor.
+///
+/// All blob reads use `read_unaligned`: the cursor sits at arbitrary byte
+/// offsets (e.g. a u32 length field right after a consumed 1-byte extract), so
+/// a plain `*(p as *const i32)` would be misaligned-pointer UB. CS has memcpy
+/// semantics here. Same for the `size` out-pointer: the BOF may hand us any
+/// (e.g. packed-struct) address, so writes go through `write_unaligned`.
 #[no_mangle]
 pub unsafe extern "C" fn BeaconDataExtract(d: *mut DataParseState, size: *mut i32) -> *const u8 {
     if d.is_null() || (*d).buffer.is_null() || (*d).original.is_null() {
         if !size.is_null() {
-            *size = 0;
+            core::ptr::write_unaligned(size, 0);
         }
         return core::ptr::null();
     }
@@ -455,15 +461,15 @@ pub unsafe extern "C" fn BeaconDataExtract(d: *mut DataParseState, size: *mut i3
     let left = (*d).size - consumed as i32;
     if left < 4 {
         if !size.is_null() {
-            *size = 0;
+            core::ptr::write_unaligned(size, 0);
         }
         return core::ptr::null();
     }
-    let len = *((*d).buffer as *const i32);
+    let len = core::ptr::read_unaligned((*d).buffer as *const i32);
     if len < 0 {
         // Negative length is malformed (attacker-controlled i32).
         if !size.is_null() {
-            *size = 0;
+            core::ptr::write_unaligned(size, 0);
         }
         return core::ptr::null();
     }
@@ -474,14 +480,14 @@ pub unsafe extern "C" fn BeaconDataExtract(d: *mut DataParseState, size: *mut i3
     let need = 4usize.checked_add(len_u).unwrap_or(usize::MAX);
     if need > left as usize {
         if !size.is_null() {
-            *size = 0;
+            core::ptr::write_unaligned(size, 0);
         }
         return core::ptr::null();
     }
     let p = (*d).buffer.add(4);
     (*d).buffer = p.add(len_u);
     if !size.is_null() {
-        *size = len;
+        core::ptr::write_unaligned(size, len);
     }
     p
 }
@@ -497,7 +503,8 @@ pub unsafe extern "C" fn BeaconGetInt(d: *mut DataParseState) -> i32 {
     if left < 4 {
         return 0;
     }
-    let v = *((*d).buffer as *const i32);
+    // read_unaligned: the cursor can sit at any byte offset (packed CS blob).
+    let v = core::ptr::read_unaligned((*d).buffer as *const i32);
     (*d).buffer = (*d).buffer.add(4);
     v
 }
@@ -513,7 +520,8 @@ pub unsafe extern "C" fn BeaconGetShort(d: *mut DataParseState) -> i16 {
     if left < 2 {
         return 0;
     }
-    let v = *((*d).buffer as *const i16);
+    // read_unaligned: the cursor can sit at any byte offset (packed CS blob).
+    let v = core::ptr::read_unaligned((*d).buffer as *const i16);
     (*d).buffer = (*d).buffer.add(2);
     v
 }
@@ -1284,5 +1292,110 @@ unsafe fn run_call_capture(args: &[String], entry_addr: u64, _bases: &[u64]) -> 
         }
         let out = captured_output().to_vec();
         Response::BofOutput(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: packed CS blobs put u32/u16 fields at ARBITRARY byte
+    /// offsets. Before the fix the datap shims used aligned derefs
+    /// (`*(p as *const i32)`) — misaligned-pointer UB (debug panic, release
+    /// silently tolerated by x86 hardware). They must use unaligned reads.
+    #[test]
+    fn datap_reads_at_misaligned_offsets() {
+        // Extract a 1-byte field first so the int/short reads land at ODD
+        // byte offsets — exactly what a packed CS blob produces.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1u32.to_le_bytes()); // extract len = 1
+        blob.push(b'Z');
+        blob.extend_from_slice(&0x1234_5678u32.to_le_bytes()); // int @ offset 5
+        blob.extend_from_slice(&0x5566u16.to_le_bytes()); // short @ offset 9
+        let mut d = DataParseState {
+            original: core::ptr::null(),
+            buffer: core::ptr::null(),
+            size: 0,
+            lengths: 0,
+        };
+        unsafe {
+            BeaconDataParse(&mut d, blob.as_ptr(), blob.len() as i32);
+            let mut sz: i32 = 0;
+            let p = BeaconDataExtract(&mut d, &mut sz);
+            assert!(!p.is_null());
+            assert_eq!(sz, 1);
+            assert_eq!(*p, b'Z');
+            assert_eq!(BeaconGetInt(&mut d), 0x1234_5678);
+            assert_eq!(BeaconGetShort(&mut d), 0x5566);
+            assert_eq!(BeaconDataLength(&mut d), 0);
+        }
+    }
+
+    /// The `size` out-pointer may itself be misaligned (a BOF can pass the
+    /// address of a field inside a packed struct). Writes must be unaligned.
+    #[test]
+    fn datap_extract_writes_size_at_misaligned_out_pointer() {
+        let blob = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&2u32.to_le_bytes());
+            v.extend_from_slice(b"hi");
+            v
+        };
+        // Backing buffer with a dynamic offset so `sz` sits at a 4-misaligned
+        // address regardless of where the stack slot lands.
+        let mut raw = [0u8; 8];
+        let base = raw.as_mut_ptr() as usize;
+        let off = (4 - base % 4) % 4 + 1; // (base + off) % 4 == 1, off + 4 <= 8
+        let sz = unsafe { raw.as_mut_ptr().add(off) } as *mut i32;
+        assert_ne!(sz as usize % 4, 0, "test setup: sz must be misaligned");
+        let mut d = DataParseState {
+            original: core::ptr::null(),
+            buffer: core::ptr::null(),
+            size: 0,
+            lengths: 0,
+        };
+        unsafe {
+            BeaconDataParse(&mut d, blob.as_ptr(), blob.len() as i32);
+            let p = BeaconDataExtract(&mut d, sz);
+            assert!(!p.is_null());
+            assert_eq!(core::ptr::read_unaligned(sz), 2);
+            assert_eq!(core::slice::from_raw_parts(p, 2), b"hi");
+        }
+    }
+
+    /// Truncation / malformed inputs stay defined: NULL + size=0, no cursor
+    /// advance past the blob, no negative-length OOB.
+    #[test]
+    fn datap_extract_rejects_truncated_and_negative_lengths() {
+        let mut d = DataParseState {
+            original: core::ptr::null(),
+            buffer: core::ptr::null(),
+            size: 0,
+            lengths: 0,
+        };
+        // Declared length (4) exceeds the remaining bytes (2 payload bytes).
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&4u32.to_le_bytes());
+        blob.extend_from_slice(b"ab");
+        let mut sz: i32 = -1;
+        unsafe {
+            BeaconDataParse(&mut d, blob.as_ptr(), blob.len() as i32);
+            assert!(BeaconDataExtract(&mut d, &mut sz).is_null());
+            assert_eq!(sz, 0);
+            // Negative length is malformed.
+            blob[0] = 0xFF;
+            blob[1] = 0xFF;
+            blob[2] = 0xFF;
+            blob[3] = 0xFF; // len = -1
+            BeaconDataParse(&mut d, blob.as_ptr(), blob.len() as i32);
+            assert!(BeaconDataExtract(&mut d, &mut sz).is_null());
+            assert_eq!(sz, 0);
+            // Fewer than 4 bytes left: clamp to 0 without reading OOB.
+            BeaconDataParse(&mut d, blob.as_ptr(), 3);
+            assert_eq!(BeaconGetInt(&mut d), 0);
+            // Fewer than 2 bytes left: same clamp for the short read.
+            BeaconDataParse(&mut d, blob.as_ptr(), 1);
+            assert_eq!(BeaconGetShort(&mut d), 0);
+        }
     }
 }

@@ -7,11 +7,12 @@
 //! via `VirtualProtect`. At the moment `go()` is invoked, no page is W+X.
 //! Data sections stay `PAGE_READWRITE`.
 //!
-//! Externals are resolved from the `BeaconPrintf` shim plus a table of common
-//! kernel32/ntdll/CRT exports (`GetModuleHandleA/W`, `GetProcAddress`,
-//! `VirtualAlloc`, `VirtualProtect`, `VirtualFree`, `LoadLibraryA`,
-//! `GetLastError`, the memcpy family, …) fetched at load time via
-//! `GetModuleHandleA` + `GetProcAddress`.
+//! Externals are resolved from the Beacon-API shims (`BeaconPrintf`, the
+//! `datap` parser family, `BeaconIsAdmin`, `BeaconGetSpawnTo`, `BeaconOutput`)
+//! plus a table of common kernel32/ntdll/CRT exports (`GetModuleHandleA/W`,
+//! `GetProcAddress`, `VirtualAlloc`, `VirtualProtect`, `VirtualFree`,
+//! `LoadLibraryA`, `GetLastError`, the memcpy family, …) fetched at load time
+//! via `GetModuleHandleA` + `GetProcAddress`.
 //!
 //! ## REL32 trampoline table
 //! BOF sections are loaded via `VirtualAlloc` at low addresses while the
@@ -218,8 +219,8 @@ pub fn load(blob: &[u8], entry: &str, externals: HashMap<String, u64>) -> Result
         if s.relocations.is_empty() {
             continue;
         }
-        let patched = apply(s, &coff, bases[i], &resolver)
-            .map_err(|e| format!("reloc `{}`: {:?}", s.name, e))?;
+        let patched =
+            apply(s, &coff, bases[i], &resolver).map_err(|e| format!("reloc `{}`: {e}", s.name))?;
         unsafe {
             std::ptr::copy_nonoverlapping(patched.as_ptr(), bases[i] as *mut u8, patched.len())
         };
@@ -401,6 +402,29 @@ fn resolve_export(module: &str, name: &str) -> Option<u64> {
     Some(p as usize as u64)
 }
 
+/// Map a Beacon-API name from [`layout::BEACON_APIS`] to the address of the
+/// in-Rust shim in [`crate::shim`]. Function items coerce through `*const ()`
+/// (a thin pointer) so we dodge spelling out each shim's full signature.
+fn beacon_shim_addr(name: &str) -> Option<u64> {
+    use crate::shim::*;
+    fn addr_of(f: *const ()) -> u64 {
+        f as usize as u64
+    }
+    let addr: u64 = match name {
+        "BeaconPrintf" => addr_of(BeaconPrintf as *const ()),
+        "BeaconOutput" => addr_of(BeaconOutput as *const ()),
+        "BeaconDataParse" => addr_of(BeaconDataParse as *const ()),
+        "BeaconDataExtract" => addr_of(BeaconDataExtract as *const ()),
+        "BeaconDataInt" => addr_of(BeaconDataInt as *const ()),
+        "BeaconDataShort" => addr_of(BeaconDataShort as *const ()),
+        "BeaconDataLength" => addr_of(BeaconDataLength as *const ()),
+        "BeaconIsAdmin" => addr_of(BeaconIsAdmin as *const ()),
+        "BeaconGetSpawnTo" => addr_of(BeaconGetSpawnTo as *const ()),
+        _ => return None,
+    };
+    Some(addr)
+}
+
 /// Build the external symbol table. `near_addr` should be near the BOF's
 /// allocated memory so REL32 relocations can reach the trampoline stubs.
 ///
@@ -408,10 +432,15 @@ fn resolve_export(module: &str, name: &str) -> Option<u64> {
 /// kept alive for the lifetime of the BOF execution (the relocated BOF jumps
 /// through the stubs into the shim / kernel32 exports); it is freed on `Drop`.
 fn beacon_apis(near_addr: u64) -> (HashMap<String, u64>, Option<VirtualAllocGuard>) {
-    // Real addresses: the BeaconPrintf shim first, then the resolved
-    // kernel32/ntdll/CRT exports.
-    let real = crate::shim::BeaconPrintf as *const () as usize as u64;
-    let mut targets: Vec<(String, u64)> = vec![("BeaconPrintf".to_string(), real)];
+    // Real addresses: the Beacon-API shims first (every name in
+    // `layout::BEACON_APIS` MUST map here — a missing arm means that API is
+    // silently `Unresolved` for BOFs), then the resolved kernel32/ntdll/CRT
+    // exports.
+    let mut targets: Vec<(String, u64)> = Vec::new();
+    for &name in layout::BEACON_APIS {
+        let addr = beacon_shim_addr(name).expect("BEACON_APIS entry has a shim");
+        targets.push((name.to_string(), addr));
+    }
     targets.extend(external_targets());
 
     let (table_base, table_guard) = match alloc_tramp_table(near_addr, &targets) {
@@ -440,8 +469,8 @@ pub struct ExecResult {
     pub defined: HashMap<String, u64>,
 }
 
-/// Load + run a BOF's `go()`: wire up the externals table (the BeaconPrintf
-/// shim plus kernel32/ntdll/CRT exports, each through its REL32 trampoline
+/// Load + run a BOF's `go()`: wire up the externals table (the Beacon-API
+/// shims plus kernel32/ntdll/CRT exports, each through its REL32 trampoline
 /// stub), reset output, call `go(args, alen)`, return captured output.
 ///
 /// `args` is the packed CS argument blob (`[u32 tag][u32 len][bytes]` per

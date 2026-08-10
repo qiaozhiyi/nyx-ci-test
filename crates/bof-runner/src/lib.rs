@@ -22,7 +22,9 @@
 //! module.
 //!
 //! ## Externals table
-//! Besides the `BeaconPrintf` shim, the loader resolves a table of common
+//! Besides the Beacon-API shims (`BeaconPrintf`, the `datap` argument-parser
+//! family, `BeaconIsAdmin`, `BeaconGetSpawnTo`, `BeaconOutput` — see
+//! `layout::BEACON_APIS`), the loader resolves a table of common
 //! kernel32/ntdll exports (`GetModuleHandleA/W`, `GetProcAddress`,
 //! `VirtualAlloc`, `VirtualProtect`, `VirtualFree`, `LoadLibraryA`,
 //! `GetLastError`, the memcpy family, …) at load time via `GetModuleHandleA`

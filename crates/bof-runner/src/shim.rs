@@ -1,9 +1,14 @@
 //! Beacon-API shim — pure Rust, minimal-stack replacement for beacon_api.c.
 //!
 //! Provides `BeaconPrintf` (CS CALLBACK_OUTPUT) with C ABI so BOFs that call
-//! the CS Beacon API can produce captured output. Uses a static byte buffer
-//! and a hand-rolled formatter — **no heap, no Mutex, no String** — so the
-//! shim works safely inside the BOF's RWX memory region with a tiny stack.
+//! the CS Beacon API can produce captured output, plus the core CS beacon.h
+//! surface community BOFs resolve at load time: the `datap` argument parser
+//! (`BeaconDataParse` / `BeaconDataInt` / `BeaconDataShort` /
+//! `BeaconDataLength` / `BeaconDataExtract`), `BeaconIsAdmin`,
+//! `BeaconGetSpawnTo`, and the community `BeaconOutput` raw-blob sibling.
+//! Uses a static byte buffer and a hand-rolled formatter — **no heap, no
+//! Mutex, no String** — so the shim works safely inside the BOF's RWX memory
+//! region with a tiny stack.
 //!
 //! The CS ABI signature is `void BeaconPrintf(int type, const char* fmt, ...)`.
 //! On x86_64 Windows the first 4 integer/pointer args land in rcx/rdx/r8/r9;
@@ -181,6 +186,284 @@ pub unsafe extern "C" fn BeaconPrintf(
         return;
     }
     format_into(&[a1, a2, a3, a4], fmt);
+}
+
+/// `void BeaconOutput(int type, char *data, int len)` — NOT part of the
+/// official CS `beacon.h` (which only declares `BeaconPrintf` for output),
+/// but a common community-loader extension (TrustedSec COFFLoader et al.
+/// provide it as a raw-blob sibling of Printf). We append `data[0..len]`
+/// verbatim to the same capture buffer; Printf stays the canonical output
+/// path, so this is an append, not an alias.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconOutput(_type: i32, data: *const u8, len: i32) {
+    if data.is_null() || len <= 0 {
+        return;
+    }
+    // SAFETY: `data` points to `len` readable bytes (BOF-supplied blob, per
+    // the community ABI contract); each byte goes through the bounds-checked
+    // `push_byte`.
+    for i in 0..len as usize {
+        push_byte(unsafe { *data.add(i) });
+    }
+}
+
+// ── datap argument parser (CS beacon.h) ──────────────────────────────────────
+//
+// CS packs BOF arguments into a single blob the entry receives as
+// `go(char *args, int alen)`; the BOF stack-allocates a `datap`, initializes it
+// with `BeaconDataParse(&p, args, alen)`, then consumes fields sequentially:
+// `BeaconDataInt` eats a 4-byte LE int, `BeaconDataShort` a 2-byte LE short,
+// `BeaconDataExtract` a u32 length + that many bytes, `BeaconDataLength`
+// reports the bytes remaining. The `datap` layout below is opaque to BOFs
+// (they only hand it back to these functions), so we track `original`+`size`
+// and derive "consumed" from pointer arithmetic — the same model as the
+// implant twin in `crates/implant-tasks/src/bof.rs`.
+
+/// CS `datap` parse state. Fields are public only because the struct appears
+/// in the `extern "C"` signatures below; BOFs treat it as opaque.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DataParseState {
+    pub original: *const u8,
+    pub buffer: *const u8,
+    pub size: i32,
+    pub lengths: i32,
+}
+
+/// Bytes remaining in `d` (0 on any null/invalid state).
+unsafe fn data_left(d: *const DataParseState) -> i32 {
+    if d.is_null() || (*d).buffer.is_null() || (*d).original.is_null() {
+        return 0;
+    }
+    let consumed = (*d).buffer as usize - (*d).original as usize;
+    ((*d).size - consumed as i32).max(0)
+}
+
+/// `void BeaconDataParse(datap *parser, char *buffer, int size)`.
+/// CS semantics: store `buffer`/`size` verbatim. A NULL buffer (the canonical
+/// no-args call, `BeaconDataParse(&p, NULL, 0)`) yields a parser whose every
+/// extract/int/short returns null/0 — defined, never a crash.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconDataParse(d: *mut DataParseState, buffer: *const u8, size: i32) {
+    if d.is_null() {
+        return;
+    }
+    // SAFETY: `d` is a valid, BOF-stack-allocated datap (null checked above).
+    unsafe {
+        (*d).original = buffer;
+        (*d).buffer = buffer;
+        (*d).size = size;
+        (*d).lengths = 0;
+    }
+}
+
+/// `char *BeaconDataExtract(datap *parser, int *size)`. Reads a u32 length
+/// then that many bytes; advances the cursor. Returns NULL and sets
+/// `*size = 0` on truncation/malformed input (attacker-controlled length).
+///
+/// All blob reads use `read_unaligned`: the cursor sits at arbitrary byte
+/// offsets (e.g. a u32 length field right after a consumed 2-byte short), so
+/// a plain `*(p as *const i32)` would be misaligned-pointer UB. CS has memcpy
+/// semantics here.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconDataExtract(d: *mut DataParseState, size: *mut i32) -> *const u8 {
+    let fail = |size: *mut i32| {
+        if !size.is_null() {
+            // SAFETY: BOF-supplied out-pointer; write_unaligned because the
+            // BOF may hand us any (e.g. packed-struct) address.
+            unsafe { core::ptr::write_unaligned(size, 0) };
+        }
+        core::ptr::null()
+    };
+    let left = data_left(d);
+    if left < 4 {
+        return fail(size);
+    }
+    // SAFETY: `left >= 4`, so 4 bytes at `buffer` are inside the blob.
+    let len = unsafe { core::ptr::read_unaligned((*d).buffer as *const i32) };
+    if len < 0 {
+        return fail(size);
+    }
+    // Bounds check in usize to avoid i32 overflow: when `len` ≈ i32::MAX a
+    // naive `left < 4 + len` wraps negative and bypasses the guard → OOB read.
+    let need = 4usize.saturating_add(len as usize);
+    if need > left as usize {
+        return fail(size);
+    }
+    // SAFETY: `need <= left`, so [buffer+4, buffer+4+len) is inside the blob.
+    unsafe {
+        let p = (*d).buffer.add(4);
+        (*d).buffer = p.add(len as usize);
+        if !size.is_null() {
+            core::ptr::write_unaligned(size, len);
+        }
+        p
+    }
+}
+
+/// `int BeaconDataInt(datap *parser)` — read a 4-byte LE int, advance.
+/// Returns 0 when fewer than 4 bytes remain (CS-clamped, never OOB).
+#[no_mangle]
+pub unsafe extern "C" fn BeaconDataInt(d: *mut DataParseState) -> i32 {
+    if data_left(d) < 4 {
+        return 0;
+    }
+    // SAFETY: `left >= 4`, so the read and the +4 cursor advance stay inside
+    // the blob. read_unaligned: the cursor can sit at any byte offset.
+    unsafe {
+        let v = core::ptr::read_unaligned((*d).buffer as *const i32);
+        (*d).buffer = (*d).buffer.add(4);
+        v
+    }
+}
+
+/// `short BeaconDataShort(datap *parser)` — read a 2-byte LE short, advance.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconDataShort(d: *mut DataParseState) -> i16 {
+    if data_left(d) < 2 {
+        return 0;
+    }
+    // SAFETY: `left >= 2`, so the read and the +2 cursor advance stay inside
+    // the blob. read_unaligned: the cursor can sit at any byte offset.
+    unsafe {
+        let v = core::ptr::read_unaligned((*d).buffer as *const i16);
+        (*d).buffer = (*d).buffer.add(2);
+        v
+    }
+}
+
+/// `int BeaconDataLength(datap *parser)` — bytes remaining in the buffer.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconDataLength(d: *mut DataParseState) -> i32 {
+    data_left(d)
+}
+
+// ── BeaconIsAdmin / BeaconGetSpawnTo ─────────────────────────────────────────
+
+extern "system" {
+    fn GetModuleHandleA(lp_module_name: *const c_char) -> *mut std::ffi::c_void;
+    fn GetProcAddress(
+        h_module: *mut std::ffi::c_void,
+        lp_proc_name: *const c_char,
+    ) -> *mut std::ffi::c_void;
+    fn GetCurrentProcess() -> *mut std::ffi::c_void;
+    fn CloseHandle(h_object: *mut std::ffi::c_void) -> i32;
+}
+
+type OpenProcessTokenFn =
+    unsafe extern "system" fn(*mut std::ffi::c_void, u32, *mut *mut std::ffi::c_void) -> i32;
+type GetTokenInformationFn = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    u32,
+    *mut std::ffi::c_void,
+    u32,
+    *mut u32,
+) -> i32;
+
+/// `TOKEN_QUERY` — required to query token information (winnt.h).
+const TOKEN_QUERY: u32 = 0x0008;
+/// `TokenElevation` — TOKEN_INFORMATION_CLASS enum value (winnt.h).
+const TOKEN_ELEVATION: u32 = 20;
+
+/// `BOOL BeaconIsAdmin()`. In the loader context this answers the only
+/// question a BOF can meaningfully ask: is the CURRENT process token
+/// elevated? Resolved at call time from advapi32 (`OpenProcessToken` +
+/// `GetTokenInformation(TokenElevation)`); the token handle is always closed.
+/// Any failure (advapi32 missing, token query denied — including odd Wine
+/// token states) returns 0 ("not admin / unknown"): a BOF gating privileged
+/// work on `BeaconIsAdmin()` then takes its non-admin path, which is the
+/// failure-safe direction.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconIsAdmin() -> i32 {
+    let Some(open) = resolve_export(b"advapi32.dll\0", b"OpenProcessToken\0") else {
+        return 0;
+    };
+    let Some(query) = resolve_export(b"advapi32.dll\0", b"GetTokenInformation\0") else {
+        return 0;
+    };
+    // SAFETY: both pointers came from GetProcAddress on a loaded module with
+    // the exact names above; the fn-pointer types match the documented Win32
+    // signatures.
+    let open: OpenProcessTokenFn = unsafe { std::mem::transmute(open) };
+    let query: GetTokenInformationFn = unsafe { std::mem::transmute(query) };
+    let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: GetCurrentProcess() returns the process pseudo-handle (always
+    // valid); `token` is a valid out-pointer.
+    if unsafe { open(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 || token.is_null() {
+        return 0;
+    }
+    let mut elevated: u32 = 0;
+    let mut ret_len: u32 = 0;
+    // SAFETY: `token` is a live token handle; `elevated` is a valid 4-byte
+    // buffer for TOKEN_ELEVATION { DWORD TokenIsElevated }.
+    let ok = unsafe {
+        query(
+            token,
+            TOKEN_ELEVATION,
+            &mut elevated as *mut u32 as *mut std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            &mut ret_len,
+        )
+    };
+    // SAFETY: `token` is our handle; closing it is always safe and cannot
+    // invalidate `elevated` (already copied out).
+    unsafe { CloseHandle(token) };
+    if ok == 0 {
+        return 0;
+    }
+    (elevated != 0) as i32
+}
+
+/// Resolve `name` from an already-loaded module (NUL-terminated byte strings).
+/// `GetModuleHandleA` never loads anything; returns the raw address or None.
+fn resolve_export(module: &'static [u8], name: &'static [u8]) -> Option<usize> {
+    // SAFETY: both byte strings are NUL-terminated statics; GetModuleHandleA
+    // only queries the loaded-module list and GetProcAddress only reads the
+    // export table of an already-loaded module.
+    unsafe {
+        let h = GetModuleHandleA(module.as_ptr() as *const c_char);
+        if h.is_null() {
+            return None;
+        }
+        let p = GetProcAddress(h, name.as_ptr() as *const c_char);
+        if p.is_null() {
+            None
+        } else {
+            Some(p as usize)
+        }
+    }
+}
+
+/// Writable scratch buffer backing [`BeaconGetSpawnTo`]. Community BOFs
+/// commonly MUTATE the spawn-to path to splice command-line arguments, so the
+/// returned pointer must be writable — a `static &[u8]` would back the string
+/// in read-only `.rdata` and AV on write. Same single-threaded contract as
+/// `OUT` (see the `OutCell` SAFETY block): BOF execution is one thread.
+struct SpawnCell(UnsafeCell<[u8; SPAWN_CAP]>);
+// SAFETY: see `OutCell` — the buffer is only ever touched from the single BOF
+// execution thread (enforced by `win::Loaded: !Sync`).
+unsafe impl Sync for SpawnCell {}
+const SPAWN_CAP: usize = 2048;
+static SPAWN: SpawnCell = SpawnCell(UnsafeCell::new([0; SPAWN_CAP]));
+
+/// `char *BeaconGetSpawnTo(BOOL x86)` — return the configured spawn-to path.
+/// The runner has no spawn-to configuration today, so this returns the CS
+/// default (`C:\Windows\System32\cmd.exe`) in a writable static buffer, never
+/// NULL — CS's contract is that the pointer stays valid until the BOF
+/// returns. The buffer is re-stamped on each call so a BOF that scribbled
+/// arguments last time doesn't see stale garbage. The `x86` selector is
+/// accepted but ignored (x64 runner; no WOW64 spawn-to).
+#[no_mangle]
+pub unsafe extern "C" fn BeaconGetSpawnTo(_x86: i32) -> *mut u8 {
+    const TEMPLATE: &[u8] = b"C:\\Windows\\System32\\cmd.exe\0";
+    let copy_len = TEMPLATE.len().min(SPAWN_CAP);
+    // SAFETY: single-threaded BOF contract (see `SpawnCell`); `copy_len` is
+    // bounded by SPAWN_CAP so the copy stays in bounds.
+    unsafe {
+        let buf: *mut u8 = SPAWN.0.get().cast();
+        core::ptr::copy_nonoverlapping(TEMPLATE.as_ptr(), buf, copy_len);
+        buf
+    }
 }
 
 fn format_into(args: &[u64; 4], fmt: *const c_char) {
@@ -881,5 +1164,187 @@ mod tests {
     /// low 32 bits to i32.
     fn uint_minus_42() -> i32 {
         -42
+    }
+
+    // ── datap argument parser ────────────────────────────────────────────────
+
+    /// Packed CS blob: [u32 int][u16 short][u32 len][bytes]. The helpers below
+    /// call the extern "C" shims in-process (they are plain fns).
+    fn packed_blob() -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+        b.extend_from_slice(&0x5566u16.to_le_bytes());
+        b.extend_from_slice(&6u32.to_le_bytes());
+        b.extend_from_slice(b"hello\0");
+        b
+    }
+
+    #[test]
+    fn datap_parses_int_short_extract_length() {
+        let blob = packed_blob();
+        let mut d = DataParseState {
+            original: std::ptr::null(),
+            buffer: std::ptr::null(),
+            size: 0,
+            lengths: 99,
+        };
+        unsafe {
+            BeaconDataParse(&mut d, blob.as_ptr(), blob.len() as i32);
+            assert_eq!(d.lengths, 0, "parse resets the lengths field");
+            assert_eq!(BeaconDataLength(&mut d), blob.len() as i32);
+            assert_eq!(BeaconDataInt(&mut d), 0x1122_3344);
+            assert_eq!(BeaconDataShort(&mut d), 0x5566);
+            let mut sz: i32 = -1;
+            let p = BeaconDataExtract(&mut d, &mut sz);
+            assert!(!p.is_null());
+            assert_eq!(sz, 6);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(p as *const c_char).to_bytes(),
+                b"hello"
+            );
+            assert_eq!(BeaconDataLength(&mut d), 0, "blob fully consumed");
+            // Over-read clamps to 0/NULL instead of reading past the blob.
+            assert_eq!(BeaconDataInt(&mut d), 0);
+            assert!(BeaconDataExtract(&mut d, &mut sz).is_null());
+            assert_eq!(sz, 0);
+        }
+    }
+
+    #[test]
+    fn datap_null_buffer_is_defined_no_crash() {
+        // The canonical no-args call: BeaconDataParse(&p, NULL, 0).
+        let mut d = DataParseState {
+            original: std::ptr::null(),
+            buffer: std::ptr::null(),
+            size: 0,
+            lengths: 0,
+        };
+        unsafe {
+            BeaconDataParse(&mut d, std::ptr::null(), 0);
+            assert_eq!(BeaconDataLength(&mut d), 0);
+            assert_eq!(BeaconDataInt(&mut d), 0);
+            assert_eq!(BeaconDataShort(&mut d), 0);
+            let mut sz: i32 = -1;
+            assert!(BeaconDataExtract(&mut d, &mut sz).is_null());
+            assert_eq!(sz, 0);
+        }
+    }
+
+    #[test]
+    fn datap_extract_truncated_length_returns_null() {
+        // Length field claims 100 bytes; only 2 follow. Must not read OOB.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&100u32.to_le_bytes());
+        blob.extend_from_slice(b"ab");
+        let mut d = DataParseState {
+            original: std::ptr::null(),
+            buffer: std::ptr::null(),
+            size: 0,
+            lengths: 0,
+        };
+        unsafe {
+            BeaconDataParse(&mut d, blob.as_ptr(), blob.len() as i32);
+            let mut sz: i32 = -1;
+            assert!(BeaconDataExtract(&mut d, &mut sz).is_null());
+            assert_eq!(sz, 0);
+        }
+    }
+
+    #[test]
+    fn datap_extract_negative_length_returns_null() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(-1i32).to_le_bytes());
+        blob.extend_from_slice(b"abcd");
+        let mut d = DataParseState {
+            original: std::ptr::null(),
+            buffer: std::ptr::null(),
+            size: 0,
+            lengths: 0,
+        };
+        unsafe {
+            BeaconDataParse(&mut d, blob.as_ptr(), blob.len() as i32);
+            let mut sz: i32 = -1;
+            assert!(BeaconDataExtract(&mut d, &mut sz).is_null());
+            assert_eq!(sz, 0);
+        }
+    }
+
+    #[test]
+    fn datap_reads_at_misaligned_offsets() {
+        // Extract a 1-byte field first so the int/short reads land at ODD
+        // byte offsets — exactly what a packed CS blob produces. A plain
+        // aligned deref would be misaligned-pointer UB (debug panic); the
+        // shims must use unaligned reads.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1u32.to_le_bytes()); // extract len = 1
+        blob.push(b'Z');
+        blob.extend_from_slice(&0x1234_5678u32.to_le_bytes()); // int @ offset 5
+        blob.extend_from_slice(&0x5566u16.to_le_bytes()); // short @ offset 9
+        let mut d = DataParseState {
+            original: std::ptr::null(),
+            buffer: std::ptr::null(),
+            size: 0,
+            lengths: 0,
+        };
+        unsafe {
+            BeaconDataParse(&mut d, blob.as_ptr(), blob.len() as i32);
+            let mut sz: i32 = 0;
+            let p = BeaconDataExtract(&mut d, &mut sz);
+            assert!(!p.is_null());
+            assert_eq!(sz, 1);
+            assert_eq!(*p, b'Z');
+            assert_eq!(BeaconDataInt(&mut d), 0x1234_5678);
+            assert_eq!(BeaconDataShort(&mut d), 0x5566);
+            assert_eq!(BeaconDataLength(&mut d), 0);
+        }
+    }
+
+    // ── BeaconOutput / BeaconGetSpawnTo ──────────────────────────────────────
+
+    #[test]
+    fn beacon_output_appends_raw_bytes() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        nyx_bof_reset();
+        // Non-UTF8 byte included: BeaconOutput appends raw bytes verbatim.
+        let blob = b"RAW-OUT\x01\xff";
+        unsafe { BeaconOutput(0, blob.as_ptr(), blob.len() as i32) };
+        let out = unsafe { std::ffi::CStr::from_ptr(nyx_bof_output()) }.to_bytes();
+        assert_eq!(out, blob);
+        // An embedded NUL truncates the CStr view (the buffer holds the full
+        // blob; `nyx_bof_output` is a C-string interface).
+        nyx_bof_reset();
+        unsafe { BeaconOutput(0, b"a\0b".as_ptr(), 3) };
+        let out = unsafe { std::ffi::CStr::from_ptr(nyx_bof_output()) }.to_bytes();
+        assert_eq!(out, b"a");
+        // A null/negative call is a defined no-op.
+        nyx_bof_reset();
+        unsafe { BeaconOutput(0, std::ptr::null(), 4) };
+        unsafe { BeaconOutput(0, blob.as_ptr(), -1) };
+        let out = unsafe { std::ffi::CStr::from_ptr(nyx_bof_output()) }.to_bytes();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn get_spawn_to_returns_writable_cmd_exe() {
+        let p = unsafe { BeaconGetSpawnTo(0) };
+        assert!(!p.is_null(), "spawn-to must never be NULL");
+        let s = unsafe { std::ffi::CStr::from_ptr(p as *const c_char) }.to_bytes();
+        assert_eq!(s, b"C:\\Windows\\System32\\cmd.exe");
+        // CS contract: the buffer is writable (BOFs splice arguments into it).
+        unsafe { *p.add(s.len()) = b' ' };
+        // Re-stamped on the next call (no stale mutation leaks across BOFs).
+        let p2 = unsafe { BeaconGetSpawnTo(0) };
+        assert_eq!(p, p2, "stable static buffer");
+        let s2 = unsafe { std::ffi::CStr::from_ptr(p2 as *const c_char) }.to_bytes();
+        assert_eq!(s2, b"C:\\Windows\\System32\\cmd.exe");
+    }
+
+    #[test]
+    fn is_admin_returns_a_defined_bool() {
+        // Real token query under Wine/Windows: must not crash and must return
+        // exactly 0 or 1 (the concrete value is environment-dependent).
+        let v = unsafe { BeaconIsAdmin() };
+        assert!(v == 0 || v == 1, "BeaconIsAdmin returned {v}");
     }
 }
