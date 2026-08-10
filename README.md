@@ -99,7 +99,7 @@ crates/
 | selftest 导出 | 46 | `implant-win/src/selftests.rs`(`#[cfg(feature="selftest")]`) |
 | wire `Command` 变体 | **28** | `protocol/src/msg.rs:130` |
 | wire `Response` 变体 | 7 | `protocol/src/msg.rs:560` |
-| GUI 命令(已解析) | 29 | `client-ui-web/src/components/CommandInput.tsx` |
+| GUI 命令(已解析) | 36 | `client-ui-web/src/components/CommandInput.tsx` |
 | server 路由 | 14 静态 + 7 beacon + 6 kernel(条件) + 动态 profile | `server/src/lib.rs:716-779` |
 | BYOVD 驱动 | 3 可用 + 1 stub | `operator-kernelsdk/src/byovd_drivers/` |
 | Windows build 覆盖 | 8 已知行 + 6 patch-equiv 映射 = 5 distinct layouts | `implant-evasionsdk/src/offsets_table.rs` |
@@ -232,7 +232,7 @@ curl -X POST http://127.0.0.1:8443/api/generate-implant \
 
 ## GUI 命令速查
 
-操作端为 Tauri 桌面 GUI(旧 ratatui TUI / Makepad GUI 已于 commit `c5064dc` 归档)。命令输入框解析 **29 个命令**(`CommandInput.tsx:214-454`),全部映射到 `POST /api/task`。session 元数据(rename/tag/star/alias)**尚未接入 GUI**。
+操作端为 Tauri 桌面 GUI(旧 ratatui TUI / Makepad GUI 已于 commit `c5064dc` 归档)。命令输入框解析 **36 个命令**(`CommandInput.tsx:213-509`),全部映射到 `POST /api/task`。session 元数据(rename/tag/star/alias)**尚未接入 GUI**。
 
 ### 会话 / 侦察
 
@@ -263,6 +263,7 @@ download <remote>       下载(64KB 分块)
 ```
 shell <cmd>             cmd.exe /c 或 sh -c
 bof <hex> [args...]     BOF 执行(CS ABI,args 透传,BeaconPrintf + kernel32/ntdll externals)
+bof <hex> isolate [...] 隔离 BOF:牺牲子进程 bof-host 执行,崩溃不拖垮 beacon(等价 bof-iso <hex> [...])
 exit                    退出 implant
 getuid                  当前用户
 stealtoken <pid>        窃取 token(Windows)
@@ -279,6 +280,8 @@ inject <pid> <hex> [m]  进程注入(m: 0=PoolParty/OFF→stomp, 1=ThreadlessHWB
 connect <host> <port>   TCP 反向端口转发
 socks <port>            SOCKS5 relay
 setchannel <ch>         切换 C2 通道
+channeldata <ch> <hex>  向中继通道写原始字节(SOCKS/rportfwd 回写,hex 须偶数长)
+chanwrite <ch> <text>   同 channeldata,载荷按 UTF-8 文本自动转 hex
 channelclose <id>       关闭通道
 trex                    T-REX EDR 评估分级
 ```
@@ -343,7 +346,7 @@ cargo test --workspace
 # 植入体检查(nightly + Windows target,需 cd 进独立 crate)
 (cd crates/implant-win && cargo +nightly check --target x86_64-pc-windows-gnu)
 
-# 内核 SDK 测试(独立 crate,全 mock,可 macOS 跑)
+# 内核 SDK 测试(独立 crate,全 mock + 作战链场景;macOS 137/137,Windows 经 wine64 154/154,两平台并集 162 全过)
 (cd crates/operator-kernelsdk && cargo test)
 
 # 独立 crate 测试

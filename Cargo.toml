@@ -103,19 +103,3 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
-# The Makepad GUI client must NOT use the implant release profile. The implant
-# settings above (opt-level="z", lto=true, codegen-units=1, panic="abort") cause
-# a SIGSEGV during Makepad's GPU/Metal init on macOS 26 — the aggressive size
-# optimization + LTO mis-compiles something in the wgpu/Metal binding path,
-# producing a null-deref (EXC_BAD_ACCESS @0x68) on window creation. This is a
-# normal, full-debug-info release profile for the desktop app. Build with:
-#   cargo build --profile gui -p nyx-client-ui
-[profile.gui]
-inherits = "release"
-opt-level = 3
-lto = false
-codegen-units = 16
-strip = false
-panic = "unwind"
-debug = true
-
