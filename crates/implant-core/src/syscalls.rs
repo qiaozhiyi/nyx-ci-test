@@ -39,6 +39,20 @@ pub struct Runtime {
     /// Pre-populated trampoline region (PAGE_EXECUTE_READ after init).
     /// Each SSN's stub lives at `trampoline + (ssn * STUB_SIZE)`.
     trampoline: *mut u8,
+    /// Emulation fallback (x64-on-ARM64, "Prism"): name → ntdll export address.
+    ///
+    /// The x64 emulator refuses to dispatch a `syscall` that isn't reached
+    /// through the genuine per-function ntdll stub: jumping to a shared
+    /// `syscall; ret` gadget raises 0xC000026F ("an internal error occurred in
+    /// the Win32 x86 emulation subsystem") AT the gadget and kills the process
+    /// (verified empirically: resolved SSN, stub bytes and gadget bytes were
+    /// all confirmed correct in-process — the fault is the indirect jump
+    /// itself, not bad resolution). Indirect syscalls are therefore impossible
+    /// under emulation, so [`syscall4`]/[`syscall5`]/[`syscall6`]/[`syscall11`]
+    /// call the ntdll export directly instead (function over stealth — the
+    /// same noevasion-degrade convention used elsewhere).
+    /// `None` on native x64: zero cost, zero behavior change.
+    direct: Option<Vec<(String, usize)>>,
 }
 
 impl Runtime {
@@ -56,10 +70,24 @@ impl Runtime {
         let (table, syscall_gadget) = init_resolve_ssn_table(&ntdll, &mut fresh_guard)?;
         // fresh_guard drops here → unmaps the second ntdll view (transient IOC).
         let page = init_build_trampoline(&table, syscall_gadget)?;
+        // x64-on-ARM64 emulation degrades to direct ntdll calls (see `direct`).
+        let direct = if is_x64_emulated_on_arm64() {
+            let base = ntdll.module().base as usize;
+            Some(
+                ntdll
+                    .exports_iter()
+                    .iter()
+                    .map(|(name, rva)| (name.to_string_lossy(), base + *rva as usize))
+                    .collect(),
+            )
+        } else {
+            None
+        };
         Some(Self {
             table,
             syscall_gadget,
             trampoline: page as *mut u8,
+            direct,
         })
     }
 
@@ -73,6 +101,24 @@ impl Runtime {
             }
         }
         None
+    }
+
+    /// Look up the direct-call ntdll export address by name hash (emulation
+    /// fallback only — always `None` on native x64).
+    pub fn direct_by_hash(&self, name_hash: u32) -> Option<usize> {
+        let t = self.direct.as_ref()?;
+        for (name, addr) in t {
+            if djb2(name.as_bytes()) == name_hash {
+                return Some(*addr);
+            }
+        }
+        None
+    }
+
+    /// True when the runtime degraded to direct ntdll calls (x64-on-ARM64
+    /// emulation); false on native x64 (indirect-syscall mode).
+    pub fn is_direct_mode(&self) -> bool {
+        self.direct.is_some()
     }
 
     /// The ntdll `syscall; ret` gadget address (for indirect stubs).
@@ -100,6 +146,51 @@ impl Runtime {
     pub unsafe fn trampoline_for(&self, ssn: u32) -> *const u8 {
         unsafe { self.trampoline.add((ssn as usize) * STUB_SIZE) as *const u8 }
     }
+}
+
+/// IMAGE_FILE_MACHINE_ARM64 (`IsWow64Process2` NativeMachine).
+const IMAGE_FILE_MACHINE_ARM64: u16 = 0xAA64;
+/// PROCESSOR_ARCHITECTURE_ARM64 (`SYSTEM_INFO.wProcessorArchitecture`).
+const PROCESSOR_ARCHITECTURE_ARM64: u16 = 12;
+
+/// True when this x64 binary is running under Windows-on-ARM64 x64 emulation
+/// (Prism/xtajit). Primary: `IsWow64Process2` — resolved from kernel32 first,
+/// then kernelbase (the kernel32 export is a forwarder on Win10+, which the
+/// PEB export walk can't follow and reports as missing). Fallback:
+/// `GetNativeSystemInfo` → ARM64 (x64 code on an ARM64-native OS is emulated
+/// by definition). Both failing → false (native x64).
+pub fn is_x64_emulated_on_arm64() -> bool {
+    type IsWow64Process2 =
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut u16, *mut u16) -> i32;
+    for module in [b"kernel32.dll".as_slice(), b"kernelbase.dll".as_slice()] {
+        if let Some(addr) = unsafe { crate::resolve::export_addr(module, b"IsWow64Process2") } {
+            let f: IsWow64Process2 = unsafe { core::mem::transmute(addr) };
+            let mut process_machine: u16 = 0;
+            let mut native_machine: u16 = 0;
+            let ok = unsafe {
+                f(
+                    (-1isize) as *mut core::ffi::c_void,
+                    &mut process_machine,
+                    &mut native_machine,
+                )
+            };
+            if ok != 0 {
+                return native_machine == IMAGE_FILE_MACHINE_ARM64;
+            }
+        }
+    }
+    // SYSTEM_INFO is 48 bytes; wProcessorArchitecture is the first u16.
+    type GetNativeSystemInfo = unsafe extern "system" fn(*mut [u64; 6]);
+    if let Some(addr) =
+        unsafe { crate::resolve::export_addr(b"kernel32.dll", b"GetNativeSystemInfo") }
+    {
+        let f: GetNativeSystemInfo = unsafe { core::mem::transmute(addr) };
+        let mut si = [0u64; 6];
+        unsafe { f(&mut si) };
+        let arch = (si[0] & 0xFFFF) as u16;
+        return arch == PROCESSOR_ARCHITECTURE_ARM64;
+    }
+    false
 }
 
 /// Stage 1 of [`Runtime::init`]: resolve the SSN table + syscall gadget.
@@ -337,6 +428,13 @@ pub unsafe fn syscall4(
     a3: usize,
     a4: usize,
 ) -> Option<i32> {
+    // Emulation fallback (x64-on-ARM64): call the ntdll export directly —
+    // indirect syscalls are fatal there (see `Runtime::direct`).
+    if let Some(addr) = rt.direct_by_hash(name_hash) {
+        type F = unsafe extern "system" fn(usize, usize, usize, usize) -> i32;
+        let f: F = core::mem::transmute(addr);
+        return Some(unsafe { f(a1, a2, a3, a4) });
+    }
     let ssn = rt.ssn_by_hash(name_hash)?;
     // BYOUD-Gap stack spoof: wrap the indirect syscall in spoof_wrap so the
     // caller's return address resolves to a signed-DLL .pdata gap instead of
@@ -368,6 +466,12 @@ pub unsafe fn syscall5(
     a4: usize,
     a5: usize,
 ) -> Option<i32> {
+    // Emulation fallback (x64-on-ARM64): direct ntdll call (see syscall4).
+    if let Some(addr) = rt.direct_by_hash(name_hash) {
+        type F = unsafe extern "system" fn(usize, usize, usize, usize, usize) -> i32;
+        let f: F = core::mem::transmute(addr);
+        return Some(unsafe { f(a1, a2, a3, a4, a5) });
+    }
     let ssn = rt.ssn_by_hash(name_hash)?;
     unsafe {
         crate::stack::spoof_wrap(|| {
@@ -401,6 +505,12 @@ pub unsafe fn syscall6(
     a5: usize,
     a6: usize,
 ) -> Option<i32> {
+    // Emulation fallback (x64-on-ARM64): direct ntdll call (see syscall4).
+    if let Some(addr) = rt.direct_by_hash(name_hash) {
+        type F = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize) -> i32;
+        let f: F = core::mem::transmute(addr);
+        return Some(unsafe { f(a1, a2, a3, a4, a5, a6) });
+    }
     let ssn = rt.ssn_by_hash(name_hash)?;
     unsafe {
         crate::stack::spoof_wrap(|| {
@@ -439,6 +549,24 @@ pub unsafe fn syscall11(
     a10: usize,
     a11: usize,
 ) -> Option<i32> {
+    // Emulation fallback (x64-on-ARM64): direct ntdll call (see syscall4).
+    if let Some(addr) = rt.direct_by_hash(name_hash) {
+        type F = unsafe extern "system" fn(
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        ) -> i32;
+        let f: F = core::mem::transmute(addr);
+        return Some(unsafe { f(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11) });
+    }
     let ssn = rt.ssn_by_hash(name_hash)?;
     unsafe {
         crate::stack::spoof_wrap(|| {

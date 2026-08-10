@@ -16,6 +16,8 @@ dist/
 crates/*/target/
 crates/*/*/target/
 tools/*/target/
+# implant-win server-template build output (used by team-server NYX_TEMPLATE)
+crates/implant-win/target-template/
 # dev junk at repo root
 /librust_out.rmeta
 /ui.log
