@@ -115,6 +115,20 @@ pub mod telemetry;
 /// this is where the Windows-only bootstrap lands.
 #[cfg(target_os = "windows")]
 pub mod win;
+/// KslD.sys ("Living off the Defender") protocol constants + honest
+/// `Unavailable` stub on non-Windows hosts. The file is written cross-platform
+/// (the real `KernelRw` impl is internally cfg-gated `windows_impl`), but the
+/// `win` parent module above is Windows-only — without this path module the
+/// stub and its 4 stub tests compiled on NO platform (dead code). On Windows
+/// the real impl is reached as `win::ksld`.
+#[cfg(not(target_os = "windows"))]
+#[path = "win/ksld.rs"]
+pub mod ksld;
+/// Red-team operation-chain scenario tests (wave-2): chains the per-kit mocks
+/// into end-to-end engagement flows (EDR suppression / credentials / PG
+/// window) against one shared fake kernel image.
+#[cfg(test)]
+mod scenarios;
 
 // ---- Errors ---------------------------------------------------------------
 

@@ -29,3 +29,8 @@ nyx-implant-evasionsdk = { path = "../implant-evasionsdk" }
 # no_std Mutex for the mock KernelRw in tests (replaces std::sync::Mutex so the
 # crate's mock tests compile + run on the macOS dev host without std).
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+# Chain (b) scenario test only: wrap the mock-kernel LSASS capture in a minidump
+# envelope (read-only use of the sibling crate's public API) and verify the
+# output parses with the reference `minidump` crate.
+nyx-minidump-assembler = { path = "../minidump-assembler" }
+minidump = "0.22"

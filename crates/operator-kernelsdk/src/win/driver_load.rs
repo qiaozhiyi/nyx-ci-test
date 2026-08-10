@@ -319,7 +319,7 @@ impl RegApi {
                 // reg_path starts with \Registry\Machine\... — but RegCreateKeyExW
                 // wants the path relative to HKEY (without the \Registry\Machine prefix).
                 // So we skip the prefix and pass SYSTEM\CurrentControlSet\Services\<name>.
-                self.strip_prefix(reg_path).as_ptr(),
+                Self::strip_prefix(reg_path).as_ptr(),
                 0,
                 core::ptr::null_mut(),
                 REG_OPTION_NON_VOLATILE,
@@ -445,7 +445,7 @@ impl RegApi {
     ///
     /// `\Registry\Machine\` is exactly 18 UTF-16 code units
     /// (`\`(1) + `Registry`(8) + `\`(1) + `Machine`(7) + `\`(1) = 18).
-    fn strip_prefix<'a>(&self, reg_path: &'a [u16]) -> &'a [u16] {
+    fn strip_prefix(reg_path: &[u16]) -> &[u16] {
         // RegCreateKeyExW with HKEY_LOCAL_MACHINE wants `SYSTEM\CurrentControl-
         // Set\...` (no leading backslash). Stripping 18 leaves exactly that.
         if reg_path.len() > 18 {
@@ -458,7 +458,7 @@ impl RegApi {
     fn delete_key(&self, reg_path: &[u16]) {
         // RegDeleteKeyW also wants relative path. Open the parent first, then
         // delete the leaf. For simplicity, use RegDeleteKeyW with HKLM + relative.
-        let _ = unsafe { (self.delete_key_fn)(self.hklm, self.strip_prefix(reg_path).as_ptr()) };
+        let _ = unsafe { (self.delete_key_fn)(self.hklm, Self::strip_prefix(reg_path).as_ptr()) };
     }
 }
 
@@ -467,3 +467,83 @@ impl RegApi {
 #[allow(unused_imports)]
 use alloc::format;
 use alloc::vec::Vec;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn u16s(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+    fn from_u16(v: &[u16]) -> alloc::string::String {
+        alloc::string::String::from_utf16_lossy(v)
+    }
+
+    #[test]
+    fn image_path_relative_system32_kept_relative() {
+        // `sc create`-style relative path under %SystemRoot% — the most
+        // broadly accepted form (Server 2019 rejects \??\ absolute paths).
+        let out = build_image_path(&u16s("System32\\drivers\\RTCore64.sys"));
+        assert_eq!(from_u16(&out), "System32\\drivers\\RTCore64.sys\0");
+    }
+
+    #[test]
+    fn image_path_absolute_gets_nt_prefix() {
+        let out = build_image_path(&u16s("C:\\temp\\RTCore64.sys"));
+        assert_eq!(from_u16(&out), "\\??\\C:\\temp\\RTCore64.sys\0");
+    }
+
+    #[test]
+    fn image_path_nt_prefixed_system32_becomes_relative() {
+        // Already \??\-prefixed, but under System32 → strip the prefix AND
+        // emit relative (the Server-2019-safe form).
+        let out = build_image_path(&u16s("\\??\\System32\\drivers\\x.sys"));
+        assert_eq!(from_u16(&out), "System32\\drivers\\x.sys\0");
+    }
+
+    #[test]
+    fn image_path_case_insensitive_system32_and_nul_trim() {
+        // Mixed-case "system32\" matches; trailing NULs trimmed, exactly one
+        // terminator appended.
+        let mut p = u16s("system32\\DRIVERS\\x.sys");
+        p.push(0);
+        p.push(0);
+        let out = build_image_path(&p);
+        assert_eq!(from_u16(&out), "system32\\DRIVERS\\x.sys\0");
+    }
+
+    #[test]
+    fn image_path_absolute_with_nul_trimmed_then_prefixed() {
+        let mut p = u16s("D:\\drivers\\iqvw64e.sys");
+        p.push(0);
+        let out = build_image_path(&p);
+        assert_eq!(from_u16(&out), "\\??\\D:\\drivers\\iqvw64e.sys\0");
+    }
+
+    #[test]
+    fn strip_prefix_removes_exactly_18_code_units() {
+        // `\Registry\Machine\` = 18 UTF-16 code units; what remains must be
+        // the HKLM-relative path RegCreateKeyExW/RegDeleteKeyW expect.
+        let reg = u16s("\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\RTCore64");
+        assert_eq!(
+            from_u16(RegApi::strip_prefix(&reg)),
+            "SYSTEM\\CurrentControlSet\\Services\\RTCore64"
+        );
+        // A shorter path is returned untouched (defensive: no panic, no crop).
+        let short = u16s("SYSTEM");
+        assert_eq!(RegApi::strip_prefix(&short), &short[..]);
+    }
+
+    #[test]
+    fn services_prefix_is_18_units_after_registry_machine() {
+        // The NT-namespace prefix passed to NtLoadDriver keeps the full
+        // `\Registry\Machine\...` form; strip_prefix undoes exactly the first
+        // 18 units of it. Pin both lengths together.
+        let prefix = u16s(SERVICES_PREFIX);
+        assert_eq!(prefix.len(), 18 + "SYSTEM\\CurrentControlSet\\Services\\".len());
+        assert_eq!(
+            from_u16(RegApi::strip_prefix(&prefix)),
+            "SYSTEM\\CurrentControlSet\\Services\\"
+        );
+    }
+}

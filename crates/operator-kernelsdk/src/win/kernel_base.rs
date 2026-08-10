@@ -114,37 +114,83 @@ pub unsafe fn ntoskrnl_module_info() -> Result<(usize, usize), KrwError> {
     }
 
     // Parse: first ULONG = module count, then the array of entries.
+    first_module(&buf)
+}
+
+/// x64 size of one RTL_PROCESS_MODULE_INFORMATION entry (see struct note).
+const ENTRY_SIZE: usize = 296;
+
+/// Parse the module count from a SystemModuleInformation buffer.
+fn parse_module_count(buf: &[u8]) -> Result<usize, KrwError> {
     if buf.len() < 8 {
         return Err(KrwError::Other(
             "NtQuerySystemInformation buffer too short".into(),
         ));
     }
-    let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    Ok(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize)
+}
+
+/// Borrow entry `i` from a SystemModuleInformation buffer. Module[0] is at
+/// offset 8 (count ULONG + 4 padding bytes on x64).
+fn module_entry(buf: &[u8], i: usize) -> Option<&RtlProcessModuleInformation> {
+    let off = 8 + i * ENTRY_SIZE;
+    if off + ENTRY_SIZE > buf.len() {
+        return None;
+    }
+    let entry_ptr = buf.as_ptr().wrapping_add(off) as *const RtlProcessModuleInformation;
+    // SAFETY: bounds checked above; layout is the documented C struct.
+    Some(unsafe { &*entry_ptr })
+}
+
+/// Pure parse: `(base, size)` of Module[0] (ntoskrnl.exe by convention).
+fn first_module(buf: &[u8]) -> Result<(usize, usize), KrwError> {
+    let count = parse_module_count(buf)?;
     if count == 0 {
         return Err(KrwError::Other(
             "NtQuerySystemInformation returned 0 modules".into(),
         ));
     }
-
-    // Module[0] is at offset 8 (after the count ULONG + 4 padding bytes on x64).
-    // Each RTL_PROCESS_MODULE_INFORMATION is 296 bytes on x64.
-    const ENTRY_SIZE: usize = 296;
-    if buf.len() < 8 + ENTRY_SIZE {
-        return Err(KrwError::Other(
-            "buffer too short for first module entry".into(),
-        ));
-    }
-    let entry_ptr = buf.as_ptr().wrapping_add(8) as *const RtlProcessModuleInformation;
-    let entry = unsafe { &*entry_ptr };
-
+    let entry = module_entry(buf, 0).ok_or_else(|| {
+        KrwError::Other("buffer too short for first module entry".into())
+    })?;
     let base = entry.image_base as usize;
     if base == 0 {
         return Err(KrwError::Unavailable(
             "ntoskrnl ImageBase is zero (Win11 24H2+ KASLR restriction — need SeDebugPrivilege or fallback)",
         ));
     }
-    let size = entry.image_size as usize;
-    Ok((base, size))
+    Ok((base, entry.image_size as usize))
+}
+
+/// ASCII case-insensitive "does the NUL-padded `full_path` end with `needle`".
+fn path_ends_with_ci(path: &[u8; 256], needle: &[u8]) -> bool {
+    let plen = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    if plen < needle.len() {
+        return false;
+    }
+    let tail = &path[plen - needle.len()..plen];
+    tail.iter()
+        .zip(needle.iter())
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// File name = bytes after the last path separator, NUL-stripped, lowercased.
+fn entry_file_name(entry: &RtlProcessModuleInformation) -> alloc::vec::Vec<u8> {
+    let plen = entry
+        .full_path
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(entry.full_path.len());
+    let mut start = 0usize;
+    for (idx, &b) in entry.full_path[..plen].iter().enumerate() {
+        if b == b'\\' || b == b'/' {
+            start = idx + 1;
+        }
+    }
+    entry.full_path[start..plen]
+        .iter()
+        .map(|b| b.to_ascii_lowercase())
+        .collect()
 }
 
 /// A loaded kernel module's base + size, returned by [`module_info_by_name`].
@@ -207,29 +253,18 @@ pub unsafe fn module_info_by_name(name: &[u8]) -> Result<ModuleInfo, KrwError> {
             "NtQuerySystemInformation buffer too short".into(),
         ));
     }
-    let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    const ENTRY_SIZE: usize = 296;
-    // ASCII case-insensitive "ends with" against the module's full_path (which
-    // is a fixed 256-byte NUL-padded UTF-8 path like
-    // "\SystemRoot\System32\drivers\fltmgr.sys").
-    let ends_with_ci = |path: &[u8; 256], needle: &[u8]| -> bool {
-        let plen = path.iter().position(|&b| b == 0).unwrap_or(path.len());
-        if plen < needle.len() {
-            return false;
-        }
-        let tail = &path[plen - needle.len()..plen];
-        tail.iter()
-            .zip(needle.iter())
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-    };
+    find_module_by_name(&buf, name)
+}
+
+/// Pure parse: `(base, size)` of the first module whose full path ends with
+/// `name` (case-insensitive), e.g. `b"fltmgr.sys"`.
+fn find_module_by_name(buf: &[u8], name: &[u8]) -> Result<ModuleInfo, KrwError> {
+    let count = parse_module_count(buf)?;
     for i in 0..count {
-        let off = 8 + i * ENTRY_SIZE;
-        if off + ENTRY_SIZE > buf.len() {
+        let Some(entry) = module_entry(buf, i) else {
             break;
-        }
-        let entry_ptr = buf.as_ptr().wrapping_add(off) as *const RtlProcessModuleInformation;
-        let entry = unsafe { &*entry_ptr };
-        if ends_with_ci(&entry.full_path, name) {
+        };
+        if path_ends_with_ci(&entry.full_path, name) {
             let base = entry.image_base as usize;
             if base == 0 {
                 return Err(KrwError::Other(alloc::format!(
@@ -311,36 +346,21 @@ pub unsafe fn loaded_modules() -> Result<alloc::vec::Vec<LoadedModule>, KrwError
             "NtQuerySystemInformation buffer too short".into(),
         ));
     }
-    let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    const ENTRY_SIZE: usize = 296;
+    parse_module_list(&buf)
+}
+
+/// Pure parse: the full loaded-module list (names lowercased file tails).
+fn parse_module_list(buf: &[u8]) -> Result<alloc::vec::Vec<LoadedModule>, KrwError> {
+    let count = parse_module_count(buf)?;
     let mut out = alloc::vec::Vec::with_capacity(count.min(1024));
     for i in 0..count {
-        let off = 8 + i * ENTRY_SIZE;
-        if off + ENTRY_SIZE > buf.len() {
+        let Some(entry) = module_entry(buf, i) else {
             break;
-        }
-        let entry_ptr = buf.as_ptr().wrapping_add(off) as *const RtlProcessModuleInformation;
-        let entry = unsafe { &*entry_ptr };
-        // File name = bytes after the last '\' or '/', NUL-stripped, lowercased.
-        let plen = entry
-            .full_path
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(entry.full_path.len());
-        let mut start = 0usize;
-        for (idx, &b) in entry.full_path[..plen].iter().enumerate() {
-            if b == b'\\' || b == b'/' {
-                start = idx + 1;
-            }
-        }
-        let name: alloc::vec::Vec<u8> = entry.full_path[start..plen]
-            .iter()
-            .map(|b| b.to_ascii_lowercase())
-            .collect();
+        };
         out.push(LoadedModule {
             base: entry.image_base as usize,
             size: entry.image_size as usize,
-            name,
+            name: entry_file_name(entry),
         });
     }
     if out.is_empty() {
@@ -349,4 +369,95 @@ pub unsafe fn loaded_modules() -> Result<alloc::vec::Vec<LoadedModule>, KrwError
         ));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// The parser's fixed stride must match the actual C layout — if the
+    /// struct definition drifts, every offset below is wrong.
+    #[test]
+    fn entry_size_matches_struct_layout() {
+        assert_eq!(
+            core::mem::size_of::<RtlProcessModuleInformation>(),
+            ENTRY_SIZE
+        );
+    }
+
+    /// Build a synthetic SystemModuleInformation buffer: count ULONG + 4 pad
+    /// bytes, then packed 296-byte entries (base, size, full_path).
+    fn module_buf(entries: &[(usize, u32, &[u8])]) -> Vec<u8> {
+        let mut buf = alloc::vec![0u8; 8 + entries.len() * ENTRY_SIZE];
+        buf[0..4].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (i, (base, size, path)) in entries.iter().enumerate() {
+            let off = 8 + i * ENTRY_SIZE;
+            buf[off + 16..off + 24].copy_from_slice(&base.to_le_bytes()); // image_base
+            buf[off + 24..off + 28].copy_from_slice(&size.to_le_bytes()); // image_size
+            buf[off + 40..off + 40 + path.len()].copy_from_slice(path); // full_path
+        }
+        buf
+    }
+
+    #[test]
+    fn first_module_returns_ntoskrnl_base_and_size() {
+        let buf = module_buf(&[
+            (0xFFFF_8000_1000_0000, 0xC0_0000, b"\\SystemRoot\\System32\\ntoskrnl.exe"),
+            (0xFFFF_8000_2000_0000, 0x8_0000, b"\\SystemRoot\\System32\\drivers\\FLTMGR.SYS"),
+        ]);
+        let (base, size) = first_module(&buf).unwrap();
+        assert_eq!(base, 0xFFFF_8000_1000_0000);
+        assert_eq!(size, 0xC0_0000);
+    }
+
+    #[test]
+    fn first_module_rejects_zero_base_and_empty_list() {
+        // Win11 24H2+ KASLR restriction: ImageBase zeroed → Unavailable.
+        let buf = module_buf(&[(0, 0xC0_0000, b"\\SystemRoot\\System32\\ntoskrnl.exe")]);
+        assert!(matches!(first_module(&buf), Err(KrwError::Unavailable(_))));
+        // Zero modules.
+        let buf = module_buf(&[]);
+        assert!(matches!(first_module(&buf), Err(KrwError::Other(_))));
+        // Truncated buffer.
+        assert!(matches!(first_module(&buf[..4]), Err(KrwError::Other(_))));
+    }
+
+    #[test]
+    fn find_module_by_name_matches_case_insensitive_tail() {
+        let buf = module_buf(&[
+            (0xFFFF_8000_1000_0000, 0xC0_0000, b"\\SystemRoot\\System32\\ntoskrnl.exe"),
+            (0xFFFF_8000_2000_0000, 0x8_0000, b"\\SystemRoot\\System32\\drivers\\FLTMGR.SYS"),
+            (0xFFFF_8000_4000_0000, 0x2_0000, b"\\??\\C:\\EDR\\edr.sys"),
+        ]);
+        // Uppercase path, lowercase query → hit.
+        let m = find_module_by_name(&buf, b"fltmgr.sys").unwrap();
+        assert_eq!(m.base, 0xFFFF_8000_2000_0000);
+        assert_eq!(m.size, 0x8_0000);
+        // Not loaded → clear error, never a zero-base false success.
+        assert!(matches!(
+            find_module_by_name(&buf, b"clfsw32.sys"),
+            Err(KrwError::Other(_))
+        ));
+        // Name must match the TAIL, not a prefix substring.
+        assert!(matches!(
+            find_module_by_name(&buf, b"System32"),
+            Err(KrwError::Other(_))
+        ));
+    }
+
+    #[test]
+    fn parse_module_list_lowercases_file_tails() {
+        let buf = module_buf(&[
+            (0xFFFF_8000_1000_0000, 0xC0_0000, b"\\SystemRoot\\System32\\ntoskrnl.exe"),
+            (0xFFFF_8000_2000_0000, 0x8_0000, b"\\SystemRoot\\System32\\drivers\\FLTMGR.SYS"),
+            (0xFFFF_8000_4000_0000, 0x2_0000, b"\\??\\C:\\EDR\\EdrSensor.sys"),
+        ]);
+        let mods = parse_module_list(&buf).unwrap();
+        assert_eq!(mods.len(), 3);
+        assert_eq!(mods[0].name, b"ntoskrnl.exe");
+        assert_eq!(mods[1].name, b"fltmgr.sys");
+        assert_eq!(mods[2].name, b"edrsensor.sys");
+        assert_eq!(mods[2].base, 0xFFFF_8000_4000_0000);
+    }
 }

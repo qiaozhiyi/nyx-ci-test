@@ -485,6 +485,7 @@ pub use windows_impl::LivingOffDefender;
 
 /// Non-Windows stub: KslD.sys is a Windows Defender driver; unavailable elsewhere.
 #[cfg(not(target_os = "windows"))]
+#[derive(Debug)]
 pub struct LivingOffDefender;
 
 #[cfg(not(target_os = "windows"))]
