@@ -585,3 +585,40 @@ pub unsafe extern "system" fn nyx_selftest_hookchain_full() {
     let count = unsafe { apply() };
     do_exit((count & 0xFF) as u32);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Range gate: [base, base+size) — inclusive at the start, exclusive at
+    /// the end, strict reject outside.
+    #[test]
+    fn is_in_ntdll_boundaries() {
+        let base = 0x1000usize as *mut u8;
+        let size = 0x100usize;
+        assert!(!is_in_ntdll(0x0FFF, base, size));
+        assert!(is_in_ntdll(0x1000, base, size));
+        assert!(is_in_ntdll(0x10FF, base, size));
+        assert!(!is_in_ntdll(0x1100, base, size));
+        assert!(!is_in_ntdll(0x7FFF_0000, base, size));
+    }
+
+    /// Binary search over the sorted RVA→SSN table: every table entry hits;
+    /// gaps / out-of-range / empty table miss.
+    #[test]
+    fn lookup_ssn_by_rva_hits_and_misses() {
+        let table = [
+            RvaSsn { rva: 0x10, ssn: 1 },
+            RvaSsn { rva: 0x20, ssn: 2 },
+            RvaSsn { rva: 0x30, ssn: 3 },
+            RvaSsn { rva: 0x40, ssn: 4 },
+        ];
+        for e in &table {
+            assert_eq!(lookup_ssn_by_rva(&table, e.rva as usize), Some(e.ssn));
+        }
+        assert_eq!(lookup_ssn_by_rva(&table, 0x08), None); // before first
+        assert_eq!(lookup_ssn_by_rva(&table, 0x25), None); // between entries
+        assert_eq!(lookup_ssn_by_rva(&table, 0x80), None); // after last
+        assert_eq!(lookup_ssn_by_rva(&[], 0x10), None); // empty table
+    }
+}

@@ -793,3 +793,93 @@ pub unsafe extern "system" fn nyx_selftest_envprobe() {
     };
     do_exit(code);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ASCII hex decoding: digits, both alpha cases, rejects everything else.
+    #[test]
+    fn hex_val_decodes_all_forms() {
+        assert_eq!(hex_val(b'0'), Some(0));
+        assert_eq!(hex_val(b'9'), Some(9));
+        assert_eq!(hex_val(b'a'), Some(10));
+        assert_eq!(hex_val(b'f'), Some(15));
+        assert_eq!(hex_val(b'A'), Some(10));
+        assert_eq!(hex_val(b'F'), Some(15));
+        assert_eq!(hex_val(b'g'), None);
+        assert_eq!(hex_val(b'G'), None);
+        assert_eq!(hex_val(b'/'), None);
+        assert_eq!(hex_val(b':'), None);
+        assert_eq!(hex_val(0), None);
+    }
+
+    /// The NIC-class path builder must append the zero-padded 4-digit slot
+    /// suffix and NUL-terminate at the returned char count.
+    #[test]
+    fn net_cfg_reg_path_utf16_builds_slot_suffix() {
+        let (buf, n) = net_cfg_reg_path_utf16(7);
+        assert_eq!(n, NET_CFG_REG_PREFIX.len() + 5);
+        let prefix: std::vec::Vec<u16> = NET_CFG_REG_PREFIX.iter().map(|&b| b as u16).collect();
+        assert_eq!(&buf[..prefix.len()], prefix.as_slice());
+        let suffix: std::vec::Vec<u16> = b"\\0007".iter().map(|&b| b as u16).collect();
+        assert_eq!(&buf[prefix.len()..n], suffix.as_slice());
+        assert_eq!(buf[n], 0); // NUL terminator
+
+        let (buf16, n16) = net_cfg_reg_path_utf16(16);
+        let suffix16: std::vec::Vec<u16> = b"\\0016".iter().map(|&b| b as u16).collect();
+        assert_eq!(&buf16[prefix.len()..n16], suffix16.as_slice());
+    }
+
+    /// OUI nibble parse: REG_SZ data is UTF-16 (stride 2) — only the low byte
+    /// of each code unit is meaningful. "000C29" → nibbles [0,0,0,C,2,9].
+    #[test]
+    fn parse_nibbles_utf16_stride() {
+        let mut info = [0u8; 64];
+        let hex = b"000C29";
+        for (i, &c) in hex.iter().enumerate() {
+            info[12 + i * 2] = c; // low byte of each UTF-16 unit
+        }
+        let got = read_nic_mac_oui_parse_nibbles(&info, 2, 12 + 6 * 2).unwrap();
+        assert_eq!(got, [0x0, 0x0, 0x0, 0xC, 0x2, 0x9]);
+    }
+
+    /// Raw-byte data (stride 1) parses the same MAC; non-hex or truncated
+    /// data is rejected.
+    #[test]
+    fn parse_nibbles_stride1_and_rejects() {
+        let mut info = [0u8; 64];
+        info[12..18].copy_from_slice(b"080027");
+        let got = read_nic_mac_oui_parse_nibbles(&info, 1, 18).unwrap();
+        assert_eq!(got, [0x0, 0x8, 0x0, 0x0, 0x2, 0x7]);
+
+        // Non-hex digit → None.
+        info[12] = b'G';
+        assert_eq!(read_nic_mac_oui_parse_nibbles(&info, 1, 18), None);
+        // Truncated avail (only 4 of 6 nibbles reachable) → None.
+        info[12..18].copy_from_slice(b"080027");
+        assert_eq!(read_nic_mac_oui_parse_nibbles(&info, 2, 20), None);
+    }
+
+    /// SYSTEM_PROCESS_INFORMATION walk: follows NextEntryOffset links and
+    /// counts entries until a zero link or buffer end.
+    #[test]
+    fn running_process_count_walk_follows_links() {
+        // 3 entries: 0 → 200 → 500 → (0 = end).
+        let mut buf = std::vec![0u8; 1024];
+        buf[0..4].copy_from_slice(&200u32.to_ne_bytes());
+        buf[200..204].copy_from_slice(&500u32.to_ne_bytes());
+        buf[500..504].copy_from_slice(&0u32.to_ne_bytes());
+        assert_eq!(running_process_count_walk(&buf), 3);
+
+        // Single entry (first link is zero).
+        let mut one = std::vec![0u8; 64];
+        one[0..4].copy_from_slice(&0u32.to_ne_bytes());
+        assert_eq!(running_process_count_walk(&one), 1);
+
+        // Link past the buffer end: counted once, then stops (no OOB read).
+        let mut trunc = std::vec![0u8; 64];
+        trunc[0..4].copy_from_slice(&4096u32.to_ne_bytes());
+        assert_eq!(running_process_count_walk(&trunc), 1);
+    }
+}

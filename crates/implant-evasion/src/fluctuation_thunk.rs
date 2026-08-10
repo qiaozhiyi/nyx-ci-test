@@ -295,3 +295,80 @@ fn build_step4(b: &mut Vec<u8>) {
 fn build_epilogue(b: &mut Vec<u8>) {
     b.push(0xC3);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rd_u64(b: &[u8], off: usize) -> u64 {
+        u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
+    }
+    fn rd_i64(b: &[u8], off: usize) -> i64 {
+        i64::from_le_bytes(b[off..off + 8].try_into().unwrap())
+    }
+    fn count_pat(b: &[u8], pat: &[u8]) -> usize {
+        b.windows(pat.len()).filter(|w| *w == pat).count()
+    }
+
+    /// The R10-relative data block must carry every build parameter at its
+    /// documented offset (see build_data_block layout comment).
+    #[test]
+    fn data_block_layout_matches_params() {
+        let t = build(0xAAAA, 0xBBBB, 0xCCCC, 0x1234, 2, 0xDDDD);
+        let b = &t.bytes;
+        assert_eq!(rd_u64(b, 0x00), 0xAAAA); // protect_tramp
+        assert_eq!(rd_u64(b, 0x08), 0xBBBB); // delay_tramp
+        assert_eq!(rd_u64(b, 0x10), 0xCCCC); // text_base
+        assert_eq!(rd_u64(b, 0x18), 0x1234); // text_len
+        assert_eq!(rd_i64(b, 0x20), -20_000_000); // delay = -(2s in 100ns)
+        assert_eq!(rd_u64(b, 0x28), 0); // old_prot scratch
+        assert_eq!(rd_u64(b, 0x30), 0xDDDD); // unmask_fn absolute VA
+    }
+
+    /// Delay computation: seconds → negative 100ns relative interval.
+    #[test]
+    fn delay_encoding_is_negative_100ns() {
+        let t = build(1, 2, 3, 4, 0, 5);
+        assert_eq!(rd_i64(&t.bytes, 0x20), 0);
+        let t = build(1, 2, 3, 4, u32::MAX, 5);
+        assert_eq!(
+            rd_i64(&t.bytes, 0x20),
+            -((u32::MAX as i64) * 10_000_000)
+        );
+    }
+
+    /// The LEA that anchors R10 at the data block must sit right after the
+    /// 0x38-byte block with the exact [rip - 0x3F] displacement.
+    #[test]
+    fn lea_r10_anchors_data_block() {
+        let t = build(1, 2, 3, 4, 5, 6);
+        let b = &t.bytes;
+        assert_eq!(&b[0x38..0x3B], &[0x4C, 0x8D, 0x15]); // lea r10, [rip+rel]
+        assert_eq!(i32::from_le_bytes(b[0x3B..0x3F].try_into().unwrap()), -0x3F);
+    }
+
+    /// v0.3.1 ABI fix: every one of the 4 call sites (3 syscalls + inline
+    /// unmask) must realign with `sub rsp,0x28` — never the misaligned 0x20.
+    #[test]
+    fn all_call_sites_use_0x28_shadow_realign() {
+        let t = build(1, 2, 3, 4, 5, 6);
+        let b = &t.bytes;
+        assert_eq!(count_pat(b, &[0x48, 0x83, 0xEC, 0x28]), 4); // sub rsp,0x28
+        assert_eq!(count_pat(b, &[0x48, 0x83, 0xC4, 0x28]), 4); // add rsp,0x28
+        assert_eq!(count_pat(b, &[0x48, 0x83, 0xEC, 0x20]), 0); // sub rsp,0x20
+    }
+
+    /// Protection immediates: step 1 flips to PAGE_NOACCESS (1), step 3 back
+    /// to PAGE_EXECUTE_READ (0x20); thunk terminates with `ret` and fits the
+    /// one-page budget.
+    #[test]
+    fn protection_immediates_and_epilogue() {
+        let t = build(1, 2, 3, 4, 5, 6);
+        let b = &t.bytes;
+        assert_eq!(count_pat(b, &[0x49, 0xC7, 0xC1, 1, 0, 0, 0]), 1); // r9 = NOACCESS
+        assert_eq!(count_pat(b, &[0x49, 0xC7, 0xC1, 0x20, 0, 0, 0]), 1); // r9 = RX
+        assert_eq!(*b.last().unwrap(), 0xC3); // ret
+        assert_eq!(t.len, b.len());
+        assert!(t.len <= THUNK_MAX);
+    }
+}

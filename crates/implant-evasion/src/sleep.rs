@@ -388,3 +388,90 @@ pub unsafe fn raw_create_thread(
         Some(h as usize)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal synthetic PE image (as `section_va_len` parses it):
+    /// DOS header with MZ + e_lfanew, NT signature "PE\0\0", file header
+    /// fields (num_sections / size_of_optional_header) and `sections`
+    /// 40-byte IMAGE_SECTION_HEADER entries (name, vsize, vaddr).
+    fn fake_pe(sections: &[(&[u8; 8], u32, u32)]) -> std::vec::Vec<u8> {
+        const E_LFANEW: usize = 0x80;
+        const SIZE_OPT: usize = 0xF0;
+        let sec_off = E_LFANEW + 24 + SIZE_OPT;
+        let mut buf = std::vec![0u8; sec_off + sections.len() * 40 + 64];
+        buf[0] = b'M';
+        buf[1] = b'Z';
+        buf[60..64].copy_from_slice(&(E_LFANEW as i32).to_le_bytes());
+        let nt = E_LFANEW;
+        buf[nt] = b'P';
+        buf[nt + 1] = b'E';
+        buf[nt + 6..nt + 8].copy_from_slice(&(sections.len() as u16).to_le_bytes());
+        buf[nt + 20..nt + 22].copy_from_slice(&(SIZE_OPT as u16).to_le_bytes());
+        for (i, (name, vsize, vaddr)) in sections.iter().enumerate() {
+            let s = sec_off + i * 40;
+            buf[s..s + 8].copy_from_slice(*name);
+            buf[s + 8..s + 12].copy_from_slice(&vsize.to_le_bytes());
+            buf[s + 12..s + 16].copy_from_slice(&vaddr.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn section_va_len_finds_text() {
+        let pe = fake_pe(&[
+            (b".text\0\0\0", 0x2000, 0x1000),
+            (b".rdata\0\0", 0x800, 0x3000),
+        ]);
+        let got = unsafe { section_va_len(pe.as_ptr() as usize, b".text") };
+        assert_eq!(got, Some((0x1000, 0x2000)));
+        let got = unsafe { section_va_len(pe.as_ptr() as usize, b".rdata") };
+        assert_eq!(got, Some((0x3000, 0x800)));
+    }
+
+    #[test]
+    fn section_va_len_rejects_bad_headers() {
+        let mut pe = fake_pe(&[(b".text\0\0\0", 0x2000, 0x1000)]);
+        // Bad MZ magic.
+        pe[0] = b'X';
+        assert_eq!(unsafe { section_va_len(pe.as_ptr() as usize, b".text") }, None);
+        // Restore MZ, break the PE signature.
+        pe[0] = b'M';
+        pe[0x80] = b'X';
+        assert_eq!(unsafe { section_va_len(pe.as_ptr() as usize, b".text") }, None);
+    }
+
+    #[test]
+    fn section_va_len_missing_section_returns_none() {
+        let pe = fake_pe(&[(b".text\0\0\0", 0x2000, 0x1000)]);
+        assert_eq!(unsafe { section_va_len(pe.as_ptr() as usize, b".pdata") }, None);
+    }
+
+    /// Real PEB-walk integration: the test binary's own .text must be found
+    /// and contain this function's address.
+    #[test]
+    fn own_text_region_contains_self() {
+        let region = unsafe { own_text_region() }.expect("own .text region must resolve");
+        assert!(region.len > 0);
+        let f = own_text_region as *const () as usize;
+        assert!(
+            f >= region.base && f < region.base + region.len,
+            "own_text_region ({:#x}) outside reported .text [{:#x}, {:#x})",
+            f,
+            region.base,
+            region.base + region.len
+        );
+    }
+
+    /// Resolution-chain smoke: a zero-second sleep must return promptly via
+    /// the NtWaitForSingleObject export path (indirect runtime is not
+    /// initialized in a test process).
+    #[test]
+    fn sleep_seconds_zero_returns_promptly() {
+        let start = std::time::Instant::now();
+        sleep_seconds(0);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+}

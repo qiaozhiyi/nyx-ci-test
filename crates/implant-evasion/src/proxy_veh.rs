@@ -722,3 +722,96 @@ pub fn selftest_proxy_gadgets() -> u8 {
         (true, true) => 3,
     }
 }
+
+// NOTE: these tests mutate the global gadget statics; run with
+// `--test-threads=1`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Synthetic PE for `pe_sections` / `find_code_cave`: DOS + PE sig +
+    /// file header (num_sections, size_of_optional_header) + section headers.
+    fn fake_pe(sections: &[(&[u8; 8], u32, u32)]) -> std::vec::Vec<u8> {
+        const E_LFANEW: usize = 0x80;
+        const SIZE_OPT: usize = 0xF0;
+        let mut buf = std::vec![0u8; 0x4000];
+        buf[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes()); // "MZ"
+        buf[60..64].copy_from_slice(&(E_LFANEW as i32).to_le_bytes());
+        let nt = E_LFANEW;
+        buf[nt..nt + 4].copy_from_slice(&0x0000_4550u32.to_le_bytes()); // "PE\0\0"
+        let fh = nt + 4;
+        buf[fh + 2..fh + 4].copy_from_slice(&(sections.len() as u16).to_le_bytes());
+        buf[fh + 16..fh + 18].copy_from_slice(&(SIZE_OPT as u16).to_le_bytes());
+        let sec_base = fh + 20 + SIZE_OPT;
+        for (i, (name, vsize, vaddr)) in sections.iter().enumerate() {
+            let s = sec_base + i * 40;
+            buf[s..s + 8].copy_from_slice(*name);
+            buf[s + 8..s + 12].copy_from_slice(&vsize.to_le_bytes());
+            buf[s + 12..s + 16].copy_from_slice(&vaddr.to_le_bytes());
+            buf[s + 16..s + 20].copy_from_slice(&0x200u32.to_le_bytes()); // raw size
+        }
+        buf
+    }
+
+    /// Section header walk: correct count/pointer for a valid PE; bad DOS
+    /// magic or bad PE signature rejected.
+    #[test]
+    fn pe_sections_parses_and_rejects() {
+        let mut pe = fake_pe(&[(b".text\0\0\0", 0x1000, 0x1000)]);
+        let (secs, num) = unsafe { pe_sections(pe.as_mut_ptr()) }.unwrap();
+        assert_eq!(num, 1);
+        let first = unsafe { &*secs };
+        assert_eq!(&first.name[..5], b".text");
+        assert_eq!(first.virtual_address, 0x1000);
+
+        pe[0] = 0; // break MZ
+        assert!(unsafe { pe_sections(pe.as_mut_ptr()) }.is_none());
+        pe[0] = b'M';
+        pe[0x80] = 0; // break PE sig
+        assert!(unsafe { pe_sections(pe.as_mut_ptr()) }.is_none());
+    }
+
+    /// A 16+ byte 0xCC run preceded by `ret` is an inter-function code cave;
+    /// the same run preceded by any other byte is intra-function padding and
+    /// must be skipped.
+    #[test]
+    fn find_code_cave_accepts_inter_function_padding() {
+        let mut pe = fake_pe(&[(b".text\0\0\0", 0x800, 0x1000)]);
+        // 0xC3 (ret) followed by 17 INT3s at section offset 0x100.
+        pe[0x1000 + 0x100] = 0xC3;
+        for b in &mut pe[0x1000 + 0x101..0x1000 + 0x112] {
+            *b = 0xCC;
+        }
+        let got = unsafe { find_code_cave(pe.as_mut_ptr() as *mut c_void, 0x4000) };
+        assert_eq!(got, Some(pe.as_ptr() as usize + 0x1000 + 0x101));
+    }
+
+    #[test]
+    fn find_code_cave_rejects_intra_function_run() {
+        let mut pe = fake_pe(&[(b".text\0\0\0", 0x800, 0x1000)]);
+        // 0x40 (not ret/int3) followed by 17 INT3s — padding inside a hot fn.
+        pe[0x1000 + 0x100] = 0x40;
+        for b in &mut pe[0x1000 + 0x101..0x1000 + 0x112] {
+            *b = 0xCC;
+        }
+        assert_eq!(unsafe { find_code_cave(pe.as_mut_ptr() as *mut c_void, 0x4000) }, None);
+    }
+
+    /// Proxy preference: `call rbx` (CET-safe) wins over `jmp rbx`; the
+    /// selftest code encodes the found-gadget bitmask.
+    #[test]
+    fn proxy_handler_prefers_call_rbx() {
+        JMP_RBX_GADGET.store(0x111, Ordering::Release);
+        CALL_RBX_GADGET.store(0x222, Ordering::Release);
+        assert_eq!(proxy_handler_addr(), 0x222);
+        assert_eq!(selftest_proxy_gadgets(), 3);
+
+        CALL_RBX_GADGET.store(0, Ordering::Release);
+        assert_eq!(proxy_handler_addr(), 0x111);
+        assert_eq!(selftest_proxy_gadgets(), 1);
+
+        JMP_RBX_GADGET.store(0, Ordering::Release);
+        assert_eq!(proxy_handler_addr(), 0);
+        assert_eq!(selftest_proxy_gadgets(), 0);
+    }
+}

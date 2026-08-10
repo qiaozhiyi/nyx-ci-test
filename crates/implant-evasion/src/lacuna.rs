@@ -165,3 +165,90 @@ pub unsafe fn bootstrap_scan() {
 
     SCANNED.store(true, Ordering::Release);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Synthetic PE with a .pdata exception directory holding the given
+    /// RUNTIME_FUNCTION entries (begin, end). PE32+ magic so the directory
+    /// path (not the section-name fallback) is exercised.
+    fn fake_pe_with_pdata_dir(entries: &[(u32, u32)]) -> std::vec::Vec<u8> {
+        const E_LFANEW: usize = 0x80;
+        const PDATA_RVA: usize = 0x2000;
+        let mut buf = std::vec![0u8; PDATA_RVA + entries.len() * 12 + 16];
+        buf[0x3C..0x40].copy_from_slice(&(E_LFANEW as i32).to_le_bytes());
+        let nt = E_LFANEW;
+        buf[nt] = b'P';
+        buf[nt + 1] = b'E';
+        // OptionalHeader magic PE32+ (0x20B) at nt+4+20.
+        buf[nt + 24..nt + 26].copy_from_slice(&0x20Bu16.to_le_bytes());
+        // DataDirectory[3] (Exception): RVA at nt+4+112+3*8, size +4.
+        let dd = nt + 4 + 112 + 3 * 8;
+        buf[dd..dd + 4].copy_from_slice(&(PDATA_RVA as u32).to_le_bytes());
+        buf[dd + 4..dd + 8].copy_from_slice(&((entries.len() * 12) as u32).to_le_bytes());
+        for (i, &(begin, end)) in entries.iter().enumerate() {
+            let e = PDATA_RVA + i * 12;
+            buf[e..e + 4].copy_from_slice(&begin.to_le_bytes());
+            buf[e + 4..e + 8].copy_from_slice(&end.to_le_bytes());
+        }
+        buf
+    }
+
+    /// A ≥16-byte gap between two RUNTIME_FUNCTION entries yields one
+    /// GhostRegion with exact RVA/VA/len.
+    #[test]
+    fn scan_ghosts_finds_inter_function_gap() {
+        let pe = fake_pe_with_pdata_dir(&[(0x1000, 0x1100), (0x1200, 0x1300)]);
+        let ghosts = unsafe { scan_ghosts(pe.as_ptr()) };
+        assert_eq!(ghosts.len(), 1);
+        let g = ghosts[0];
+        assert_eq!(g.rva_begin, 0x1100);
+        assert_eq!(g.rva_end, 0x1200);
+        assert_eq!(g.va_begin, pe.as_ptr() as usize + 0x1100);
+        assert_eq!(g.len, 0x100);
+    }
+
+    /// Gaps smaller than 16 bytes are rejected.
+    #[test]
+    fn scan_ghosts_rejects_sub_16_gaps() {
+        let pe = fake_pe_with_pdata_dir(&[(0x1000, 0x1100), (0x1108, 0x1200)]);
+        assert!(unsafe { scan_ghosts(pe.as_ptr()) }.is_empty());
+    }
+
+    /// The chain builder rotates ntdll → kernelbase → win32u and anchors each
+    /// frame at the region MIDPOINT (va_begin + len/2).
+    #[test]
+    fn build_ghost_chain_rotates_pools_at_midpoints() {
+        let mk = |va: usize, len: usize| GhostRegion {
+            rva_begin: 0,
+            rva_end: 0,
+            va_begin: va,
+            len,
+        };
+        let ntdll = [mk(1000, 100)];
+        let kb = [mk(2000, 200)];
+        let w32u = [mk(3000, 300)];
+        let chain = build_ghost_chain(&ntdll, &kb, &w32u, 6);
+        let want = [1050usize, 2100, 3150, 1050, 2100, 3150];
+        assert_eq!(chain.frames.as_slice(), &want);
+    }
+
+    /// Empty pools contribute no frames; a partially-populated pool set keeps
+    /// cycling its own entries.
+    #[test]
+    fn build_ghost_chain_skips_empty_pools() {
+        let mk = |va: usize| GhostRegion {
+            rva_begin: 0,
+            rva_end: 0,
+            va_begin: va,
+            len: 64,
+        };
+        let empty: [GhostRegion; 0] = [];
+        let chain = build_ghost_chain(&empty, &empty, &empty, 3);
+        assert!(chain.frames.is_empty());
+        let ntdll = [mk(1000), mk(5000)];
+        let chain = build_ghost_chain(&ntdll, &empty, &empty, 4);
+        assert_eq!(chain.frames.as_slice(), &[1032usize, 5032]);
+    }
+}

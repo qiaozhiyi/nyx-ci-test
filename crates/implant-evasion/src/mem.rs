@@ -398,3 +398,72 @@ pub unsafe fn unmask_text(base: usize, len: usize, key: &[u8]) {
         };
     }
 }
+
+// NOTE: these tests mutate the global MASK_STATE / region table; run with
+// `--test-threads=1` (the beacon context they model is single-threaded too).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RC4 round-trip through the internal key path: encrypt+decrypt must
+    /// restore byte-identical content.
+    #[test]
+    fn round_trip_selftest_restores_bytes() {
+        let original: std::vec::Vec<u8> = (0..=255u8).collect();
+        let mut buf = original.clone();
+        round_trip_selftest(&mut buf);
+        assert_eq!(buf, original);
+        // And a single pass must actually change the content (not a no-op).
+        let mut buf2 = original.clone();
+        Rc4::apply_oneshot(mask_key(), &mut buf2);
+        assert_ne!(buf2, original);
+    }
+
+    /// The process-lifetime key must be cached: two derivations return the
+    /// SAME buffer (this was the mask(A)/unmask(B) corruption bug).
+    #[test]
+    fn mask_key_is_cached_process_lifetime() {
+        let k1 = mask_key();
+        let k2 = mask_key();
+        assert!(core::ptr::eq(k1, k2));
+        assert_eq!(k1, k2);
+    }
+
+    /// Full mask→unmask cycle over a registered region with the idempotency
+    /// guard: double-mask and double-unmask must both be no-ops, so the data
+    /// survives the sequence intact.
+    #[test]
+    fn mask_unmask_round_trip_with_idempotency_guard() {
+        let original: std::vec::Vec<u8> = (0..64).map(|i| (i * 7 + 3) as u8).collect();
+        let buf: &'static mut [u8] = std::boxed::Box::leak(original.clone().into_boxed_slice());
+        // register_region consumes the &'static mut; keep raw parts for a
+        // read-only view used by the assertions below.
+        let (ptr, len) = (buf.as_mut_ptr(), buf.len());
+        let view = || unsafe { core::slice::from_raw_parts(ptr, len) };
+        let before = registered_count();
+        assert!(unsafe { register_region(buf) });
+        assert_eq!(registered_count(), before + 1);
+
+        mask();
+        assert_ne!(view(), original.as_slice(), "mask must encrypt in place");
+        mask(); // double-mask: no-op, must NOT apply RC4 a second time
+        unmask();
+        assert_eq!(view(), original.as_slice(), "unmask must restore bytes");
+        unmask(); // double-unmask: no-op
+        assert_eq!(view(), original.as_slice());
+    }
+
+    /// enumerate_beacon_heap_regions must include every registered region
+    /// (pointer + length preserved).
+    #[test]
+    fn enumerate_includes_registered_regions() {
+        let buf: &'static mut [u8] = std::boxed::Box::leak(std::vec![0xABu8; 48].into_boxed_slice());
+        let ptr = buf.as_mut_ptr();
+        assert!(unsafe { register_region(buf) });
+        let regions = enumerate_beacon_heap_regions();
+        assert!(
+            regions.iter().any(|&(p, l)| p == ptr && l == 48),
+            "registered region missing from enumeration"
+        );
+    }
+}

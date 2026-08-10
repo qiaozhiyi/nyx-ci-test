@@ -323,3 +323,37 @@ impl MemoryMaskKit for LiveMemoryMask {
 // NOTE (WP-C 断环第二刀): the `ProcessInjectKit` glue (`ModuleStomper`) moved
 // to the tasks crate's `inject` module (`nyx-implant-tasks`), so this module
 // no longer depends on the inject side.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ghost_pred: C3 (ret) / C2 (ret imm16) / E8 (call rel32) at the gap are
+    /// ghost-function candidates; padding and anything else are not. A missing
+    /// image or out-of-range RVA is always false.
+    #[test]
+    fn ghost_pred_byte_classification() {
+        let img = [0xC3u8, 0x90, 0xC2, 0xE8];
+        assert!(ghost_pred(0, Some(&img)));
+        assert!(!ghost_pred(1, Some(&img)));
+        assert!(ghost_pred(2, Some(&img)));
+        assert!(ghost_pred(3, Some(&img)));
+        assert!(!ghost_pred(4, Some(&img)), "out-of-range RVA");
+        assert!(!ghost_pred(0, None), "no image");
+    }
+
+    /// nop_pred: 90 / CC / 00 fills and the multi-byte 66 90 NOP count as
+    /// alignment padding; a trailing lone 66 and non-padding bytes do not.
+    #[test]
+    fn nop_pred_byte_classification() {
+        let img = [0x90u8, 0xCC, 0x00, 0x66, 0x90, 0x66, 0x91, 0x66];
+        assert!(nop_pred(0, Some(&img)));
+        assert!(nop_pred(1, Some(&img)));
+        assert!(nop_pred(2, Some(&img)));
+        assert!(nop_pred(3, Some(&img)), "66 90 two-byte NOP");
+        assert!(!nop_pred(5, Some(&img)), "66 91 (xchg cx,ax) is not a NOP fill");
+        assert!(!nop_pred(7, Some(&img)), "lone trailing 66");
+        assert!(!nop_pred(8, Some(&img)), "out-of-range RVA");
+        assert!(!nop_pred(0, None), "no image");
+    }
+}

@@ -192,3 +192,65 @@ pub unsafe fn bootstrap_check() {
         head = unsafe { (*entry).in_load_order_links.flink };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Synthetic PE (as `check_preservation` parses it): e_lfanew, file header
+    /// (num_sections @ nt+6, size_of_optional_header @ nt+20) and section
+    /// headers (name[8], vsize@8, rva@12, raw_size@16).
+    fn fake_pe(sections: &[(&[u8; 8], u32, u32, u32)]) -> std::vec::Vec<u8> {
+        const E_LFANEW: usize = 0x80;
+        const SIZE_OPT: usize = 0xF0;
+        let sec_off = E_LFANEW + 24 + SIZE_OPT;
+        let mut buf = std::vec![0u8; 0x4000];
+        buf[0x3C..0x40].copy_from_slice(&(E_LFANEW as i32).to_le_bytes());
+        let nt = E_LFANEW;
+        buf[nt + 6..nt + 8].copy_from_slice(&(sections.len() as u16).to_le_bytes());
+        buf[nt + 20..nt + 22].copy_from_slice(&(SIZE_OPT as u16).to_le_bytes());
+        for (i, (name, vsize, rva, raw)) in sections.iter().enumerate() {
+            let s = sec_off + i * 40;
+            buf[s..s + 8].copy_from_slice(*name);
+            buf[s + 8..s + 12].copy_from_slice(&vsize.to_le_bytes());
+            buf[s + 12..s + 16].copy_from_slice(&rva.to_le_bytes());
+            buf[s + 16..s + 20].copy_from_slice(&raw.to_le_bytes());
+        }
+        buf
+    }
+
+    /// .pdata / .rdata fully outside .text → automatic InsomniacUnwinding, no
+    /// backup needed.
+    #[test]
+    fn preservation_automatic_when_pdata_outside_text() {
+        let pe = fake_pe(&[
+            (b".text\0\0\0", 0x2000, 0x1000, 0x2000),
+            (b".pdata\0\0", 0x300, 0x3400, 0x300),
+            (b".rdata\0\0", 0x400, 0x3800, 0x400),
+        ]);
+        let pres = unsafe { check_preservation(pe.as_ptr(), 0x1000, 0x2000) }.unwrap();
+        assert!(pres.automatic);
+        assert_eq!(pres.pdata_rva, 0x3400);
+        assert_eq!(pres.pdata_size, 0x300);
+        assert!(pres.backup.is_none());
+    }
+
+    /// .pdata overlapping .text → not automatic, and the backup must hold
+    /// exactly the overlapping bytes [max(rva,text) .. min(end,text_end)).
+    #[test]
+    fn preservation_backs_up_exact_overlap_bytes() {
+        let mut pe = fake_pe(&[
+            (b".text\0\0\0", 0x2000, 0x1000, 0x2000),
+            (b".pdata\0\0", 0x400, 0x1800, 0x400),
+        ]);
+        // Distinctive pattern in the overlap region 0x1800..0x1C00.
+        for i in 0x1800..0x1C00usize {
+            pe[i] = (i & 0xFF) as u8;
+        }
+        let pres = unsafe { check_preservation(pe.as_ptr(), 0x1000, 0x2000) }.unwrap();
+        assert!(!pres.automatic);
+        let backup = pres.backup.expect("overlap must be backed up");
+        assert_eq!(backup.len(), 0x400);
+        assert_eq!(backup.as_slice(), &pe[0x1800..0x1C00]);
+    }
+}

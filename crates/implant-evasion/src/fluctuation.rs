@@ -338,3 +338,19 @@ unsafe fn restore_dr_state(rt: &nyx_implant_core::syscalls::Runtime, saved: &DrS
         0, // RaiseAlert = FALSE
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Operator gate round-trip: default ON (no NYX_FLUCTUATION_OFF at build),
+    /// runtime toggle honored.
+    #[test]
+    fn enabled_gate_round_trip() {
+        assert!(enabled(), "fluctuation must default ON");
+        set_enabled(false);
+        assert!(!enabled());
+        set_enabled(true);
+        assert!(enabled());
+    }
+}

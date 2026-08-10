@@ -1410,3 +1410,192 @@ pub unsafe fn blind_amsi_hwbp() -> Result<usize, &'static str> {
         .ok_or("amsi not loaded")?;
     add_hwbp(addr, ShadowType::AmsiInvalidArg)
 }
+
+// NOTE: these tests mutate the global slot pool / states; run with
+// `--test-threads=1` (the HWBP subsystem they model is single-threaded too).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::Ordering;
+
+    fn wr_u64(buf: &mut [u8], off: usize, v: u64) {
+        buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    fn wr_u32(buf: &mut [u8], off: usize, v: u32) {
+        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn rd_u64(buf: &[u8], off: usize) -> u64 {
+        u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+    }
+    fn rd_u32(buf: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+    }
+
+    /// Raw CONTEXT read/write helpers round-trip at the documented offsets,
+    /// tolerating unaligned access.
+    #[test]
+    fn ctx_read_write_round_trip() {
+        let mut buf = [0u8; 1232];
+        let base = buf.as_mut_ptr() as usize;
+        unsafe {
+            ctx_write_u64_at(base, CTX_DR6, 0xDEAD_BEEF);
+            assert_eq!(ctx_read_u64_at(base, CTX_DR6), 0xDEAD_BEEF);
+            ctx_write_u32_at(base, CTX_CONTEXT_FLAGS, 0x1000_1F);
+            assert_eq!(rd_u32(&buf, CTX_CONTEXT_FLAGS), 0x1000_1F);
+            // Unaligned offset must not fault (write_unaligned/read_unaligned).
+            ctx_write_u64_at(base, 3, 0xAB);
+            assert_eq!(ctx_read_u64_at(base, 3), 0xAB);
+        }
+    }
+
+    /// The VEH's exception triage: STATUS_SINGLE_STEP + DR6 B-bits yields
+    /// (slot_bits, rip, fault_addr); wrong code or no B-bits passes through.
+    #[test]
+    fn veh_check_single_step_triage() {
+        let mut exr = [0u8; 0x20];
+        let mut ctx = [0u8; 1232];
+        wr_u32(&mut exr, 0, STATUS_SINGLE_STEP as u32);
+        wr_u64(&mut exr, 0x10, 0x1234_5678); // ExceptionAddress
+        wr_u64(&mut ctx, CTX_DR6, 0x5); // B0 + B2
+        wr_u64(&mut ctx, CTX_RIP, 0x4141_4141);
+        let got = unsafe {
+            veh_check_single_step(exr.as_ptr(), ctx.as_mut_ptr())
+        };
+        assert_eq!(got, Some((0x5, 0x4141_4141, 0x1234_5678)));
+
+        // Not a single-step exception → pass through.
+        wr_u32(&mut exr, 0, 0xC000_0005u32); // ACCESS_VIOLATION
+        assert_eq!(unsafe { veh_check_single_step(exr.as_ptr(), ctx.as_mut_ptr()) }, None);
+
+        // Single-step but no B0-B3 bits (TF trap) → pass through.
+        wr_u32(&mut exr, 0, STATUS_SINGLE_STEP as u32);
+        wr_u64(&mut ctx, CTX_DR6, 1 << 14); // BS only
+        assert_eq!(unsafe { veh_check_single_step(exr.as_ptr(), ctx.as_mut_ptr()) }, None);
+    }
+
+    /// Resume fixup: DR6 cleared, RF set, ContextFlags gains DEBUG_REGISTERS
+    /// | CONTROL — leaving the pre-existing flags intact.
+    #[test]
+    fn veh_clear_dr6_set_rf_fixup() {
+        let mut ctx = [0u8; 1232];
+        wr_u64(&mut ctx, CTX_DR6, 0xFFFF_FFFF);
+        wr_u32(&mut ctx, CTX_EFLAGS, 0x202);
+        wr_u32(&mut ctx, CTX_CONTEXT_FLAGS, 0x10_0000);
+        unsafe { veh_clear_dr6_set_rf(ctx.as_mut_ptr()) };
+        assert_eq!(rd_u64(&ctx, CTX_DR6), 0);
+        assert_eq!(rd_u32(&ctx, CTX_EFLAGS), 0x202 | RF_BIT);
+        assert_eq!(
+            rd_u32(&ctx, CTX_CONTEXT_FLAGS),
+            0x10_0000 | CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL
+        );
+    }
+
+    /// Slot scan on a fabricated OCCUPIED slot: fault at the target redirects
+    /// RIP to the shadow; a foreign address or a VACANT slot does not.
+    #[test]
+    fn veh_scan_slots_redirect_and_foreign() {
+        unsafe {
+            core::ptr::write_volatile(
+                HWBP_POOL[0].get(),
+                HwbpEntry {
+                    target: 0x1000,
+                    shadow: 0x2000,
+                    original_dr7: 0,
+                },
+            );
+            HWBP_SLOT_STATE[0].store(SLOT_OCCUPIED, Ordering::Release);
+        }
+        let mut ctx = [0u8; 1232];
+        // Hit via fault_addr.
+        wr_u64(&mut ctx, CTX_DR6, 1);
+        wr_u64(&mut ctx, CTX_RIP, 0x9999);
+        assert!(unsafe { veh_scan_slots(1, 0x9999, 0x1000, ctx.as_mut_ptr()) });
+        assert_eq!(rd_u64(&ctx, CTX_RIP), 0x2000, "RIP must redirect to shadow");
+        assert_eq!(rd_u64(&ctx, CTX_DR6), 0);
+        assert_ne!(rd_u32(&ctx, CTX_EFLAGS) & RF_BIT, 0);
+
+        // Hit via RIP equality (fallback match).
+        let mut ctx2 = [0u8; 1232];
+        assert!(unsafe { veh_scan_slots(1, 0x1000, 0x5555, ctx2.as_mut_ptr()) });
+        assert_eq!(rd_u64(&ctx2, CTX_RIP), 0x2000);
+
+        // Foreign address: no redirect.
+        let mut ctx3 = [0u8; 1232];
+        assert!(!unsafe { veh_scan_slots(1, 0x6666, 0x7777, ctx3.as_mut_ptr()) });
+        assert_eq!(rd_u64(&ctx3, CTX_RIP), 0);
+
+        // VACANT slot with a stale B-bit: foreign, not ours.
+        HWBP_SLOT_STATE[0].store(SLOT_VACANT, Ordering::Release);
+        let mut ctx4 = [0u8; 1232];
+        assert!(!unsafe { veh_scan_slots(1, 0x9999, 0x1000, ctx4.as_mut_ptr()) });
+    }
+
+    /// A #DB on a CLAIMED (mid-arm/disarm) slot is handled as a benign
+    /// one-shot: DR6 clear + RF set, but NO RIP redirect (the slot is not
+    /// yet/anymore published).
+    #[test]
+    fn veh_scan_slots_claimed_is_benign_one_shot() {
+        HWBP_SLOT_STATE[1].store(SLOT_CLAIMED, Ordering::Release);
+        let mut ctx = [0u8; 1232];
+        wr_u64(&mut ctx, CTX_DR6, 2);
+        wr_u64(&mut ctx, CTX_RIP, 0x9999);
+        assert!(unsafe { veh_scan_slots(2, 0x9999, 0x1000, ctx.as_mut_ptr()) });
+        assert_eq!(rd_u64(&ctx, CTX_RIP), 0x9999, "claimed slot must not redirect");
+        assert_eq!(rd_u64(&ctx, CTX_DR6), 0);
+        assert_ne!(rd_u32(&ctx, CTX_EFLAGS) & RF_BIT, 0);
+        HWBP_SLOT_STATE[1].store(SLOT_VACANT, Ordering::Release);
+    }
+
+    /// The armer's slot claim: four slots claim in order, the fifth fails;
+    /// states are restored afterwards.
+    #[test]
+    fn claim_slot_exhausts_pool() {
+        for want in 0..4usize {
+            assert_eq!(claim_slot(), Ok(want));
+        }
+        assert_eq!(claim_slot(), Err("all 4 DR slots full"));
+        for slot in HWBP_SLOT_STATE.iter() {
+            slot.store(SLOT_VACANT, Ordering::Release);
+        }
+    }
+
+    /// Disarm bookkeeping: publishing VACANT decrements the live count and
+    /// frees the slot (active_count reads the same counter).
+    #[test]
+    fn publish_slot_vacant_updates_count_and_state() {
+        HWBP_COUNT.store(2, Ordering::Release);
+        HWBP_SLOT_STATE[2].store(SLOT_OCCUPIED, Ordering::Release);
+        publish_slot_vacant(2);
+        assert_eq!(active_count(), 1);
+        assert_eq!(HWBP_SLOT_STATE[2].load(Ordering::Acquire), SLOT_VACANT);
+        HWBP_COUNT.store(0, Ordering::Release);
+    }
+
+    /// DR7 disarm math: only the target slot's L/G (bits 2s..2s+1) and
+    /// R/W+LEN (bits 16+4s..19+4s) are cleared; every other slot's bits
+    /// survive. DRx/DR6 are zeroed and DEBUG_REGISTERS is requested.
+    #[test]
+    fn disarm_dr_register_clears_only_own_slot_bits() {
+        static CAPTURED_DR7: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        unsafe extern "system" fn fake_get(_h: usize, ctx: usize) -> i32 {
+            // Pretend the thread has every DR7 bit set.
+            ctx_write_u64_at(ctx, CTX_DR7, u64::MAX);
+            0
+        }
+        unsafe extern "system" fn fake_set(_h: usize, ctx: usize) -> i32 {
+            CAPTURED_DR7.store(ctx_read_u64_at(ctx, CTX_DR7), Ordering::Release);
+            0
+        }
+        let mut buf = [0xFFu8; 1232];
+        buf[CTX_CONTEXT_FLAGS..CTX_CONTEXT_FLAGS + 4].copy_from_slice(&0u32.to_le_bytes());
+        let base = buf.as_mut_ptr() as usize;
+        assert!(unsafe { disarm_dr_register(base, 1, fake_get, fake_set) });
+        // !(0x3 << 2) & !(0xF << 20) applied to all-ones.
+        let want = u64::MAX & !(0x3u64 << 2) & !(0xFu64 << 20);
+        assert_eq!(CAPTURED_DR7.load(Ordering::Acquire), want);
+        assert_eq!(rd_u64(&buf, CTX_DR0 + 8), 0, "DR1 must be zeroed");
+        assert_eq!(rd_u64(&buf, CTX_DR6), 0, "DR6 must be zeroed");
+        assert_eq!(rd_u32(&buf, CTX_CONTEXT_FLAGS), CONTEXT_DEBUG_REGISTERS);
+    }
+}

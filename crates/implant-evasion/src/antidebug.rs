@@ -131,3 +131,29 @@ pub fn uptime_secs() -> u64 {
 pub fn looks_sandboxed(min_uptime: u64) -> bool {
     is_debugged() || is_remote_debugged() || uptime_secs() < min_uptime
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real PEB read under the test process: no debugger is attached, so the
+    /// BeingDebugged byte must be clear.
+    #[test]
+    fn is_debugged_false_without_debugger() {
+        assert!(!is_debugged());
+    }
+
+    /// The uptime gate must trip when the threshold exceeds any possible
+    /// uptime — regardless of debugger state.
+    #[test]
+    fn looks_sandboxed_trips_on_impossible_uptime_threshold() {
+        assert!(looks_sandboxed(u64::MAX));
+    }
+
+    /// With a zero threshold and no debugger, none of the three checks may
+    /// fire (exercises the PEB + ProcessDebugPort resolution paths for real).
+    #[test]
+    fn looks_sandboxed_clean_with_zero_threshold() {
+        assert!(!looks_sandboxed(0));
+    }
+}

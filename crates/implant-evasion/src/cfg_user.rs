@@ -421,3 +421,27 @@ pub fn selftest_cfg() -> u8 {
         (false, false) => 0x80,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Empty input must short-circuit to 0 marked without resolving any API
+    /// (guards the caller contract before the region query runs).
+    #[test]
+    fn mark_addrs_cfg_valid_empty_is_zero() {
+        assert_eq!(unsafe { mark_addrs_cfg_valid(&[]) }, 0);
+    }
+
+    /// Real allocation + both mark paths through the live resolver: the
+    /// selftest must return one of its documented status codes (and must not
+    /// crash on hosts where SetProcessValidCallTargets is absent).
+    #[test]
+    fn selftest_cfg_returns_documented_code() {
+        let code = selftest_cfg();
+        assert!(
+            matches!(code, 0x80..=0x84),
+            "unexpected selftest_cfg code {code:#x}"
+        );
+    }
+}
