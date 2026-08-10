@@ -14,6 +14,12 @@
 #   server run. This script makes that mistake impossible: it always re-extracts
 #   the live pubkey from the current server's log before starting the agent.
 #
+#   RBAC: /api/sessions requires operator credentials since the RBAC landing
+#   (open mode = anonymous Viewer; a populated registry = 401 without a
+#   bearer). This script bootstraps a throwaway admin via
+#   NYX_BOOTSTRAP_OPERATOR (overridable) and points NYX_OPERATORS_FILE at a
+#   temp file so a real ~/.nyx/operators.json can never leak in.
+#
 # Usage:
 #   ./scripts/keyfile_check.sh                      # uses ~/.nyx/server.key, port 18455
 #   KEYFILE=/path/k.key PORT=19455 ./scripts/keyfile_check.sh
@@ -26,6 +32,7 @@ export MSYS2_ENV_CONV_EXCL='*'   # don't let MSYS2 mangle beacon URIs on Windows
 
 PORT="${PORT:-18455}"
 KEYFILE="${KEYFILE:-$HOME/.nyx/server.key}"
+OP="${NYX_BOOTSTRAP_OPERATOR:-probe:keyfile}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 SRV="$ROOT/target/debug/nyx-server"
@@ -36,12 +43,14 @@ AGT="$ROOT/target/debug/nyx-agent-dev"
 SLOG=$(mktemp -t nyx_srv.XXXX)
 ALOG=$(mktemp -t nyx_agt.XXXX)
 WD=$(mktemp -d -t nyx_wd.XXXX)
+OPSFILE=$(mktemp -t nyx_ops.XXXX)
+echo '[]' > "$OPSFILE"
 SPID=""; APID=""
 cleanup() {
   [ -n "$SPID" ] && kill "$SPID" 2>/dev/null
   [ -n "$APID" ] && kill "$APID" 2>/dev/null
   wait 2>/dev/null
-  rm -rf "$WD"; rm -f "$SLOG" "$ALOG"
+  rm -rf "$WD"; rm -f "$SLOG" "$ALOG" "$OPSFILE"
 }
 trap cleanup EXIT
 
@@ -60,13 +69,16 @@ else
 fi
 
 echo "=== starting server on 127.0.0.1:$PORT with NYX_KEYFILE ==="
-NYX_KEYFILE="$KEYFILE" RUST_LOG=info NYX_BIND=127.0.0.1:$PORT "$SRV" > "$SLOG" 2>&1 &
+NYX_KEYFILE="$KEYFILE" RUST_LOG=info NYX_BIND=127.0.0.1:$PORT \
+  NYX_BOOTSTRAP_OPERATOR="$OP" NYX_OPERATORS_FILE="$OPSFILE" \
+  "$SRV" > "$SLOG" 2>&1 &
 SPID=$!
+AUTH="Authorization: Bearer $OP"
 
 # Wait for HTTP up.
 up=0
 for i in $(seq 1 40); do
-  curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/sessions" && { up=1; break; }
+  curl -sf -o /dev/null -H "$AUTH" "http://127.0.0.1:$PORT/api/sessions" && { up=1; break; }
   sleep 0.25
 done
 [ "$up" = 1 ] || { echo "❌ server failed to start:"; tail -15 "$SLOG"; exit 1; }
@@ -111,8 +123,11 @@ APID=$!
 
 SID=""
 for i in $(seq 1 40); do
-  SID=$(curl -sf "http://127.0.0.1:$PORT/api/sessions" 2>/dev/null \
-        | python3 -c "import sys,json;d=json.load(sys.stdin);print(d[-1]['id'] if d else '')" 2>/dev/null)
+  # Sessions persist across server restarts (SQLite restore, marked stale=true
+  # until a live check-in). Pick the youngest NON-stale session — `d[-1]` would
+  # happily hand us a dead restored one.
+  SID=$(curl -sf -H "$AUTH" "http://127.0.0.1:$PORT/api/sessions" 2>/dev/null \
+        | python3 -c "import sys,json;d=json.load(sys.stdin);live=[s for s in d if not s.get('stale')];live.sort(key=lambda s:s.get('age_secs',1<<30));print(live[0]['id'] if live else '')" 2>/dev/null)
   [ -n "$SID" ] && break
   sleep 0.25
 done
