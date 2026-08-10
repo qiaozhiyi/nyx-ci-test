@@ -60,7 +60,13 @@ const MAX_EXPORT_NAMES: usize = 1 << 20;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        usage(&args[0]);
+        usage(&args[0], 2);
+    }
+    // Help wins anywhere on the command line — check before args[1] is
+    // interpreted as the DLL path so `nyx-srdi --help` doesn't error with
+    // "read --help: No such file or directory".
+    if wants_help(&args) {
+        usage(&args[0], 0);
     }
     let dll = &args[1];
     let mut out = PathBuf::from("agent.bin");
@@ -100,7 +106,8 @@ fn main() {
                 encrypt = true;
             }
             "-h" | "--help" => {
-                usage(&args[0]);
+                // Unreachable: wants_help() above already handled any position.
+                usage(&args[0], 0);
             }
             other => {
                 eprintln!("error: unknown arg '{}'", other);
@@ -254,7 +261,14 @@ fn main() {
     }
 }
 
-fn usage(prog: &str) -> ! {
+/// Returns true when `-h`/`--help` appears anywhere after argv[0], regardless
+/// of position. Checked before the positional DLL argument so help always
+/// prints usage and exits 0.
+fn wants_help(args: &[String]) -> bool {
+    args.iter().skip(1).any(|a| a == "-h" || a == "--help")
+}
+
+fn usage(prog: &str, code: i32) -> ! {
     eprintln!("usage: {} <nyx_implant_win.dll> [options]", prog);
     eprintln!();
     eprintln!("options:");
@@ -282,7 +296,7 @@ fn usage(prog: &str) -> ! {
         "  {} implant.dll --format v2 --loader     # v2: full reflective loader blob via emitter",
         prog
     );
-    process::exit(2);
+    process::exit(code);
 }
 
 /// PE parse + extract. Returns (entry_rva_relative_to_text_start, text_bytes).
@@ -567,5 +581,41 @@ fn usize_to_u32(n: usize) -> Result<u32, String> {
         Err(format!("size {} exceeds u32::MAX (header would lie)", n))
     } else {
         Ok(n as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wants_help;
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn help_as_first_arg_is_detected() {
+        // Regression: `--help` used to be taken as the DLL path and the run
+        // failed with "read --help: No such file or directory".
+        assert!(wants_help(&argv(&["nyx-srdi", "--help"])));
+        assert!(wants_help(&argv(&["nyx-srdi", "-h"])));
+    }
+
+    #[test]
+    fn help_in_any_position_is_detected() {
+        assert!(wants_help(&argv(&["nyx-srdi", "implant.dll", "--help"])));
+        assert!(wants_help(&argv(&[
+            "nyx-srdi", "implant.dll", "--format", "v2", "-h"
+        ])));
+    }
+
+    #[test]
+    fn no_help_flag_is_not_detected() {
+        assert!(!wants_help(&argv(&["nyx-srdi"])));
+        assert!(!wants_help(&argv(&["nyx-srdi", "implant.dll"])));
+        assert!(!wants_help(&argv(&[
+            "nyx-srdi", "implant.dll", "--format", "v2", "--loader", "-o", "out.bin"
+        ])));
+        // A path that merely contains "help" must not trigger the help path.
+        assert!(!wants_help(&argv(&["nyx-srdi", "my--helper.dll"])));
     }
 }
