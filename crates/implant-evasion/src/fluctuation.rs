@@ -1,5 +1,21 @@
 //! Fluctuation sleep mask — military-grade, CFG/CET immune.
 //! Flips .text to PAGE_NOACCESS during sleep, back to RX on wake.
+//!
+//! ## Why "CET immune" is accurate (audited 2026-08)
+//! This path never forges a return address and never swaps RSP:
+//!   - The PIC thunk (`fluctuation_thunk`) is entered by a normal indirect
+//!     `call` and leaves by a matching `ret`; every `call` inside it
+//!     (3 syscalls + the inline unmask) is balanced by its callee's `ret`.
+//!     Shadow-stack push/pop stays matched at all times → no #CP.
+//!   - The DR save/clear/restore uses `NtGetContextThread` /
+//!     `NtSetContextThread` / `NtContinue` with CONTEXT_DEBUG_REGISTERS
+//!     (0x100010) ONLY — RIP/RSP (and the shadow-stack pointer SSP) are not
+//!     in the restored set, so the resume cannot desync the shadow stack.
+//! Remaining caveat: CET **IBT** (`endbr64` enforcement) is a separate
+//! mitigation this audit does not gate — the thunk page and the indirect
+//! `call [r10]` targets carry no ENDBR64. Windows user-mode HSP currently
+//! enforces shadow stack only; if IBT enforcement ships for user mode, the
+//! thunk's indirect-call targets need re-validation on real hardware.
 
 #![cfg(target_os = "windows")]
 

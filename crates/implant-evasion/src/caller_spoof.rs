@@ -25,7 +25,35 @@
 /// Win64 feature constant for `IsProcessorFeaturePresent`: Intel CET shadow
 /// stack (Hardware-enforced Stack Protection). Documented in winnt.h as
 /// `PF_RETURN_CONTROL_ENFORCE` (value 41).
+///
+/// ## What the bit actually answers
+/// Feature 41 reports **user-mode shadow stack** support/enforcement for the
+/// CURRENT process: on Win11 22H2+ with CET-capable hardware (Intel 11th-gen+
+/// / AMD Zen3+), a process that opted into HSP ( linker `/CETCOMPAT` or
+/// `SetProcessMitigationPolicy` ) sees TRUE; every pre-CET OS (Win10, Server
+/// 2019/2022) and every non-opted-in process sees FALSE. It does NOT cover:
+///   - CET **IBT** (indirect-branch tracking / `endbr64` enforcement) — a
+///     separate mitigation this probe cannot see; indirect `call rax`-style
+///     jumps into non-ENDBR stubs are a distinct #CP class not gated here.
+///   - **Kernel-side** CET / HVCI / PatchGuard posture — user-mode
+///     `IsProcessorFeaturePresent` says nothing about the kernel.
+/// So `false` means "user-mode shadow-stack #CP on forged `ret`s is not a
+/// hazard for THIS process", nothing more.
+///
+/// ## Cross-implementation consistency
+/// `nyx_implant_core::version::cet_active()` (cached) and the loader probe
+/// (`nyx-loader/src/dll_probe.rs`) query the SAME export with the SAME
+/// constant 41, so all three agree per-process. Keep it that way: if this
+/// constant or API ever changes, change all three together.
 const PF_CET_SHADOW_STACK: u32 = 41;
+
+/// Interpret the raw `IsProcessorFeaturePresent(PF_CET_SHADOW_STACK)` return
+/// value: any non-zero means the feature is present. Extracted as a pure
+/// function so the decision mapping is unit-testable without a live PEB-walk
+/// resolver (wine64 has no CET — the tests pin the DECISION, not the bit).
+fn probe_value_means_cet(raw: i32) -> bool {
+    raw != 0
+}
 
 /// Probe whether this process runs under Intel CET hardware-enforced shadow
 /// stack (HSP). Resolves `kernel32!IsProcessorFeaturePresent` via the PEB walk
@@ -51,7 +79,7 @@ pub unsafe fn is_cet_enabled() -> bool {
     };
     type FnIsPresent = unsafe extern "system" fn(u32) -> i32;
     let f: FnIsPresent = core::mem::transmute(addr);
-    f(PF_CET_SHADOW_STACK) != 0
+    probe_value_means_cet(f(PF_CET_SHADOW_STACK))
 }
 
 /// Selftest: report CET shadow-stack status. The return-address spoof path
@@ -74,5 +102,33 @@ pub fn selftest_cet_status() -> u8 {
         1
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The probe-value mapping: non-zero (including any negative garbage the
+    /// API will never actually return) means CET present; exactly 0 means off.
+    /// This is the part of `is_cet_enabled` that is unit-testable without a
+    /// hardware CET bit — wine64 always reports 0 for feature 41.
+    #[test]
+    fn probe_value_means_cet_mapping() {
+        assert!(!probe_value_means_cet(0));
+        assert!(probe_value_means_cet(1));
+        assert!(probe_value_means_cet(-1));
+        assert!(probe_value_means_cet(i32::MAX));
+    }
+
+    /// Live-resolution smoke: the PEB-walk resolver + export call chain must
+    /// not fault, and the selftest byte must agree with the raw probe. On
+    /// wine64 feature 41 is always 0 → both report CET off; on a real
+    /// CET-enabled host both would report on — either way they must agree.
+    #[test]
+    fn is_cet_enabled_and_selftest_agree() {
+        let raw = unsafe { is_cet_enabled() };
+        let reported = selftest_cet_status();
+        assert_eq!(reported, if raw { 1 } else { 0 });
     }
 }
