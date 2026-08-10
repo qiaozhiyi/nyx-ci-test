@@ -794,7 +794,10 @@ mod tests {
         for b in &mut pe[0x1000 + 0x101..0x1000 + 0x112] {
             *b = 0xCC;
         }
-        assert_eq!(unsafe { find_code_cave(pe.as_mut_ptr() as *mut c_void, 0x4000) }, None);
+        assert_eq!(
+            unsafe { find_code_cave(pe.as_mut_ptr() as *mut c_void, 0x4000) },
+            None
+        );
     }
 
     /// Proxy preference: `call rbx` (CET-safe) wins over `jmp rbx`; the

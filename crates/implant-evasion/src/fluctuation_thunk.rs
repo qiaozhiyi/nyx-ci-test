@@ -331,10 +331,7 @@ mod tests {
         let t = build(1, 2, 3, 4, 0, 5);
         assert_eq!(rd_i64(&t.bytes, 0x20), 0);
         let t = build(1, 2, 3, 4, u32::MAX, 5);
-        assert_eq!(
-            rd_i64(&t.bytes, 0x20),
-            -((u32::MAX as i64) * 10_000_000)
-        );
+        assert_eq!(rd_i64(&t.bytes, 0x20), -((u32::MAX as i64) * 10_000_000));
     }
 
     /// The LEA that anchors R10 at the data block must sit right after the

@@ -351,7 +351,10 @@ mod tests {
         assert!(nop_pred(1, Some(&img)));
         assert!(nop_pred(2, Some(&img)));
         assert!(nop_pred(3, Some(&img)), "66 90 two-byte NOP");
-        assert!(!nop_pred(5, Some(&img)), "66 91 (xchg cx,ax) is not a NOP fill");
+        assert!(
+            !nop_pred(5, Some(&img)),
+            "66 91 (xchg cx,ax) is not a NOP fill"
+        );
         assert!(!nop_pred(7, Some(&img)), "lone trailing 66");
         assert!(!nop_pred(8, Some(&img)), "out-of-range RVA");
         assert!(!nop_pred(0, None), "no image");

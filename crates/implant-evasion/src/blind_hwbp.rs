@@ -1458,19 +1458,23 @@ mod tests {
         wr_u64(&mut exr, 0x10, 0x1234_5678); // ExceptionAddress
         wr_u64(&mut ctx, CTX_DR6, 0x5); // B0 + B2
         wr_u64(&mut ctx, CTX_RIP, 0x4141_4141);
-        let got = unsafe {
-            veh_check_single_step(exr.as_ptr(), ctx.as_mut_ptr())
-        };
+        let got = unsafe { veh_check_single_step(exr.as_ptr(), ctx.as_mut_ptr()) };
         assert_eq!(got, Some((0x5, 0x4141_4141, 0x1234_5678)));
 
         // Not a single-step exception → pass through.
         wr_u32(&mut exr, 0, 0xC000_0005u32); // ACCESS_VIOLATION
-        assert_eq!(unsafe { veh_check_single_step(exr.as_ptr(), ctx.as_mut_ptr()) }, None);
+        assert_eq!(
+            unsafe { veh_check_single_step(exr.as_ptr(), ctx.as_mut_ptr()) },
+            None
+        );
 
         // Single-step but no B0-B3 bits (TF trap) → pass through.
         wr_u32(&mut exr, 0, STATUS_SINGLE_STEP as u32);
         wr_u64(&mut ctx, CTX_DR6, 1 << 14); // BS only
-        assert_eq!(unsafe { veh_check_single_step(exr.as_ptr(), ctx.as_mut_ptr()) }, None);
+        assert_eq!(
+            unsafe { veh_check_single_step(exr.as_ptr(), ctx.as_mut_ptr()) },
+            None
+        );
     }
 
     /// Resume fixup: DR6 cleared, RF set, ContextFlags gains DEBUG_REGISTERS
@@ -1540,7 +1544,11 @@ mod tests {
         wr_u64(&mut ctx, CTX_DR6, 2);
         wr_u64(&mut ctx, CTX_RIP, 0x9999);
         assert!(unsafe { veh_scan_slots(2, 0x9999, 0x1000, ctx.as_mut_ptr()) });
-        assert_eq!(rd_u64(&ctx, CTX_RIP), 0x9999, "claimed slot must not redirect");
+        assert_eq!(
+            rd_u64(&ctx, CTX_RIP),
+            0x9999,
+            "claimed slot must not redirect"
+        );
         assert_eq!(rd_u64(&ctx, CTX_DR6), 0);
         assert_ne!(rd_u32(&ctx, CTX_EFLAGS) & RF_BIT, 0);
         HWBP_SLOT_STATE[1].store(SLOT_VACANT, Ordering::Release);
@@ -1576,8 +1584,7 @@ mod tests {
     /// survive. DRx/DR6 are zeroed and DEBUG_REGISTERS is requested.
     #[test]
     fn disarm_dr_register_clears_only_own_slot_bits() {
-        static CAPTURED_DR7: core::sync::atomic::AtomicU64 =
-            core::sync::atomic::AtomicU64::new(0);
+        static CAPTURED_DR7: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         unsafe extern "system" fn fake_get(_h: usize, ctx: usize) -> i32 {
             // Pretend the thread has every DR7 bit set.
             ctx_write_u64_at(ctx, CTX_DR7, u64::MAX);

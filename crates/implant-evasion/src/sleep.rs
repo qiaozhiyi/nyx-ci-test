@@ -436,17 +436,26 @@ mod tests {
         let mut pe = fake_pe(&[(b".text\0\0\0", 0x2000, 0x1000)]);
         // Bad MZ magic.
         pe[0] = b'X';
-        assert_eq!(unsafe { section_va_len(pe.as_ptr() as usize, b".text") }, None);
+        assert_eq!(
+            unsafe { section_va_len(pe.as_ptr() as usize, b".text") },
+            None
+        );
         // Restore MZ, break the PE signature.
         pe[0] = b'M';
         pe[0x80] = b'X';
-        assert_eq!(unsafe { section_va_len(pe.as_ptr() as usize, b".text") }, None);
+        assert_eq!(
+            unsafe { section_va_len(pe.as_ptr() as usize, b".text") },
+            None
+        );
     }
 
     #[test]
     fn section_va_len_missing_section_returns_none() {
         let pe = fake_pe(&[(b".text\0\0\0", 0x2000, 0x1000)]);
-        assert_eq!(unsafe { section_va_len(pe.as_ptr() as usize, b".pdata") }, None);
+        assert_eq!(
+            unsafe { section_va_len(pe.as_ptr() as usize, b".pdata") },
+            None
+        );
     }
 
     /// Real PEB-walk integration: the test binary's own .text must be found

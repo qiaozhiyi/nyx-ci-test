@@ -457,7 +457,8 @@ mod tests {
     /// (pointer + length preserved).
     #[test]
     fn enumerate_includes_registered_regions() {
-        let buf: &'static mut [u8] = std::boxed::Box::leak(std::vec![0xABu8; 48].into_boxed_slice());
+        let buf: &'static mut [u8] =
+            std::boxed::Box::leak(std::vec![0xABu8; 48].into_boxed_slice());
         let ptr = buf.as_mut_ptr();
         assert!(unsafe { register_region(buf) });
         let regions = enumerate_beacon_heap_regions();
