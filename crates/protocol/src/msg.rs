@@ -13,10 +13,9 @@ const MAX_BATCH: usize = 65_536;
 
 /// Hard cap on per-cycle command/arg element counts (tasks dispatched to an
 /// implant, BOF args). Legitimate payloads never exceed a few dozen items per
-/// beacon cycle; 256 is a generous ceiling. This is a *secondary* guard — the
-/// primary allocation guard is [`MAX_BATCH`] — applied directly to the loop
-/// iteration count so that even if the allocation guard is somehow bypassed the
-/// decoder still terminates in bounded time.
+/// beacon cycle; 256 is a generous ceiling, and the encode side clamps to it —
+/// so a declared count past it on the wire is malformed and rejected with
+/// [`WireError::BadLen`] at decode (see [`checked_count`]).
 ///
 /// **NOT applied to [`TaskResponse`] batches** — those carry `FileChunk`/BOF
 /// output streams that legitimately run into thousands of items per cycle (a
@@ -26,14 +25,18 @@ const MAX_BATCH: usize = 65_536;
 /// bounded by the server's `MAX_RESULTS_PER_SESSION` eviction instead.
 const MAX_WIRE_COUNT: usize = 256;
 
-/// Validate a length-prefixed element count read off the wire. Returns the
-/// count to allocate for, capped at the remaining input (a hard upper bound:
-/// you can't have more elements than unread bytes, since each element is at
-/// least one byte) and at [`MAX_BATCH`]. Errors with [`WireError::BadLen`] on
-/// an absurd declared count so the caller never calls `Vec::with_capacity` with
-/// an attacker-influenced u32.
-fn checked_count(r: &mut Reader, declared: u32) -> Result<usize, WireError> {
-    if declared as usize > MAX_BATCH {
+/// Validate a length-prefixed element count read off the wire. `max` is the
+/// per-type wire cap ([`MAX_WIRE_COUNT`] or [`MAX_BATCH`]); a declared count
+/// past it is malformed — the encode side never emits one — and is rejected
+/// with [`WireError::BadLen`] before any allocation, so the caller never calls
+/// `Vec::with_capacity` with an attacker-influenced u32 and never silently
+/// decodes fewer elements than declared. Returns the count to allocate for,
+/// capped at the remaining input (a hard upper bound: you can't have more
+/// elements than unread bytes, since each element is at least one byte). The
+/// caller must then attempt to read exactly `declared` elements; a short
+/// payload surfaces as [`WireError::Eof`] from the element reads.
+fn checked_count(r: &mut Reader, declared: u32, max: usize) -> Result<usize, WireError> {
+    if declared as usize > max {
         return Err(WireError::BadLen(declared as usize));
     }
     // Reserve only what could plausibly be read — never more than remaining.
@@ -495,10 +498,9 @@ impl Command {
             7 => {
                 let name = checked_str(r, 256)?;
                 let n_raw = r.u32()?;
-                let cap = checked_count(r, n_raw)?;
-                let n = (n_raw as usize).min(MAX_WIRE_COUNT);
+                let cap = checked_count(r, n_raw, MAX_WIRE_COUNT)?;
                 let mut args = Vec::with_capacity(cap);
-                for _ in 0..n {
+                for _ in 0..n_raw {
                     args.push(checked_str(r, 4096)?);
                 }
                 let blob = r.blob()?.to_vec();
@@ -748,10 +750,11 @@ impl Task {
     pub fn decode_vec(data: &[u8]) -> Result<Vec<Task>, WireError> {
         let mut r = Reader::new(data);
         let n_raw = r.u32()?;
-        let cap = checked_count(&mut r, n_raw)?;
-        let n = (n_raw as usize).min(MAX_WIRE_COUNT);
+        let cap = checked_count(&mut r, n_raw, MAX_WIRE_COUNT)?;
+        // Read exactly the declared count: a short payload must surface as
+        // Eof, never a silently truncated batch (mirrors TaskResponse).
         let mut out = Vec::with_capacity(cap);
-        for _ in 0..n {
+        for _ in 0..n_raw {
             out.push(Task::decode(&mut r)?);
         }
         Ok(out)
@@ -790,15 +793,17 @@ impl TaskResponse {
     pub fn decode_vec(data: &[u8]) -> Result<Vec<TaskResponse>, WireError> {
         let mut r = Reader::new(data);
         let n_raw = r.u32()?;
-        let cap = checked_count(&mut r, n_raw)?;
+        let cap = checked_count(&mut r, n_raw, MAX_BATCH)?;
         // Results stream FileChunk / BOF output and legitimately run into the
         // thousands per cycle — do NOT apply MAX_WIRE_COUNT (256) here, it would
-        // silently drop file-tail chunks. `checked_count` already bounds the
-        // allocation at MAX_BATCH (65536) and the per-session buffer is evicted
-        // server-side past MAX_RESULTS_PER_SESSION.
-        let n = (n_raw as usize).min(MAX_BATCH).min(cap);
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
+        // silently drop file-tail chunks. `checked_count` bounds the allocation
+        // at MAX_BATCH (65536) and the per-session buffer is evicted server-side
+        // past MAX_RESULTS_PER_SESSION. Read exactly the declared count: a short
+        // payload must surface as Eof, never a silently truncated batch
+        // (previously the loop was clamped to the remaining byte count, so a
+        // declared count with an empty payload decoded as `Ok(vec![])`).
+        let mut out = Vec::with_capacity(cap);
+        for _ in 0..n_raw {
             out.push(TaskResponse::decode(&mut r)?);
         }
         Ok(out)
