@@ -754,6 +754,3 @@ mod tests {
         assert!(unsafe { send_recv(&c, b"x") }.is_none());
     }
 }
-
-
-

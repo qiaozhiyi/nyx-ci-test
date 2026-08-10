@@ -72,7 +72,8 @@ pub(crate) fn one_shot_http_server(response: Vec<u8>) -> (u16, Receiver<Captured
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             response.len()
         );
-        sock.write_all(head_out.as_bytes()).expect("write response head");
+        sock.write_all(head_out.as_bytes())
+            .expect("write response head");
         sock.write_all(&response).expect("write response body");
         sock.flush().ok();
         let _ = tx.send(CapturedRequest {

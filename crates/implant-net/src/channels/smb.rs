@@ -424,7 +424,10 @@ mod tests {
 
     #[test]
     fn to_utf16_zero_extends_ascii_and_nul_terminates() {
-        assert_eq!(to_utf16(b"\\\\.\\pipe\\nyx").len(), "\\\\.\\pipe\\nyx".len() + 1);
+        assert_eq!(
+            to_utf16(b"\\\\.\\pipe\\nyx").len(),
+            "\\\\.\\pipe\\nyx".len() + 1
+        );
         assert_eq!(to_utf16(b"ab").as_slice(), &[0x61u16, 0x62, 0]);
         assert_eq!(to_utf16(b"").as_slice(), &[0u16]);
     }

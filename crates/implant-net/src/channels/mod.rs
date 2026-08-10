@@ -464,7 +464,10 @@ mod tests {
             Some(b"alpha.example".as_slice())
         );
         advance_rotation_host();
-        assert_eq!(select_rotation_host(hosts), Some(b"beta.example".as_slice()));
+        assert_eq!(
+            select_rotation_host(hosts),
+            Some(b"beta.example".as_slice())
+        );
         advance_rotation_host();
         assert_eq!(
             select_rotation_host(hosts),
@@ -527,7 +530,11 @@ mod tests {
 
     /// Dispatch one frame through `ch` against a one-shot loopback server and
     /// assert the response round-trips and the request hit `expected_path`.
-    fn assert_dispatch_hits_path(ch: Channel, expected_path: &str, configure: impl Fn(&mut ChannelCtx)) {
+    fn assert_dispatch_hits_path(
+        ch: Channel,
+        expected_path: &str,
+        configure: impl Fn(&mut ChannelCtx),
+    ) {
         let (port, rx) = testutil::one_shot_http_server(testutil::server_wire_response(b"TASKS"));
         let mut ctx = testutil::ctx("127.0.0.1", port);
         configure(&mut ctx);
@@ -541,7 +548,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(15))
             .expect("server captured request");
         assert!(
-            cap.request_line.starts_with(&format!("POST {expected_path} ")),
+            cap.request_line
+                .starts_with(&format!("POST {expected_path} ")),
             "{ch:?} hit {:?}, expected path {expected_path}",
             cap.request_line
         );

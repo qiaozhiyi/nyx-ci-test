@@ -1005,7 +1005,9 @@ mod tests {
             Some(nyx_profile::Terminator::Header(name)) => {
                 // Header terminator: the ENTIRE frame rides in the header.
                 assert!(wire_body.is_empty());
-                let (n, v) = data_header.as_ref().expect("header terminator ⇒ data header");
+                let (n, v) = data_header
+                    .as_ref()
+                    .expect("header terminator ⇒ data header");
                 assert_eq!(n, name.as_bytes());
                 assert_eq!(*v, expected);
             }
@@ -1062,7 +1064,10 @@ mod tests {
         match data_header {
             Some((n, v)) => {
                 assert!(wire_body.is_empty());
-                assert!(cap.body.is_empty(), "body must be empty with header terminator");
+                assert!(
+                    cap.body.is_empty(),
+                    "body must be empty with header terminator"
+                );
                 let needle = format!(
                     "{}: {}",
                     String::from_utf8_lossy(&n),
@@ -1108,7 +1113,8 @@ mod tests {
             fronting_host: b"cdn-front.example",
             proxy_url: b"",
         };
-        let out = unsafe { post_frame_enhanced(b"127.0.0.1", port, b"/beacon", b"PING", false, &opts) };
+        let out =
+            unsafe { post_frame_enhanced(b"127.0.0.1", port, b"/beacon", b"PING", false, &opts) };
         assert_eq!(out.as_deref(), Some(b"OK".as_slice()));
         let cap = rx
             .recv_timeout(Duration::from_secs(15))
@@ -1131,9 +1137,8 @@ mod tests {
             proxy_url: proxy.as_bytes(),
         };
         // server_host is unresolvable — only the proxy path can succeed.
-        let out = unsafe {
-            post_frame_enhanced(b"c2.example", 8443, b"/beacon", b"PING", false, &opts)
-        };
+        let out =
+            unsafe { post_frame_enhanced(b"c2.example", 8443, b"/beacon", b"PING", false, &opts) };
         assert_eq!(out.as_deref(), Some(b"OK".as_slice()));
         let cap = rx
             .recv_timeout(Duration::from_secs(15))
@@ -1146,4 +1151,3 @@ mod tests {
         );
     }
 }
-
