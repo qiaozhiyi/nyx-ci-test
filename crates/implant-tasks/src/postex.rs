@@ -102,10 +102,12 @@ type OpenThreadToken = unsafe extern "system" fn(*mut c_void, u32, i32, *mut *mu
 /// advapi32 `GetTokenInformation`.
 type GetTokenInformation = unsafe extern "system" fn(
     *mut c_void, // TokenHandle
-    u8,          // TOKEN_INFORMATION_CLASS (1 = TokenUser)
-    *mut u8,     // TokenInformation
-    u32,         // TokenInformationLength
-    *mut u32,    // ReturnLength
+    u32,         // TOKEN_INFORMATION_CLASS (1 = TokenUser) — full-width enum;
+    // u8 would leave garbage in the upper rdx bits (x64 ABI) and
+    // advapi32 reads the full 32-bit class register
+    *mut u8,  // TokenInformation
+    u32,      // TokenInformationLength
+    *mut u32, // ReturnLength
 ) -> i32;
 /// advapi32 `LookupAccountSidW`.
 type LookupAccountSidW = unsafe extern "system" fn(
@@ -115,7 +117,8 @@ type LookupAccountSidW = unsafe extern "system" fn(
     *mut u32,      // cchName
     *mut u16,      // ReferencedDomainName
     *mut u32,      // cchDomainName
-    *mut u8,       // peUse
+    *mut u32,      // peUse — SID_NAME_USE is a 32-bit enum; a *mut u8 slot
+                   // would get 3 neighbouring bytes stomped by the API
 ) -> i32;
 /// advapi32 `LogonUserW`.
 type LogonUserW = unsafe extern "system" fn(
@@ -531,7 +534,11 @@ pub fn getuid() -> String {
         Ok(t) => t,
         Err(e) => return String::from(e),
     };
-    let sid_ptr = match getuid_sid(gti, close, tok) {
+    // The buffer must outlive `getuid_account`: GetTokenInformation returns
+    // the SID as a pointer INTO this same buffer, so a callee-local buffer
+    // would dangle the moment the helper returned.
+    let mut tok_buf = [0u8; 64];
+    let sid_ptr = match getuid_sid(gti, close, tok, &mut tok_buf) {
         Ok(s) => s,
         Err(e) => return String::from(e),
     };
@@ -614,15 +621,16 @@ fn getuid_open_token(
 }
 
 /// `GetTokenInformation(TokenUser)` → the SID pointer (first 8 bytes of the
-/// TOKEN_USER layout on x64). Closes `tok`.
+/// TOKEN_USER layout on x64). Closes `tok`. `buf` is caller-owned so the SID
+/// pointer stays valid after return (it points INTO `buf`).
 fn getuid_sid(
     gti: GetTokenInformation,
     close: CloseHandle,
     tok: *mut c_void,
+    buf: &mut [u8; 64],
 ) -> Result<*const c_void, &'static str> {
     // TOKEN_USER layout: { SID_AND_ATTRIBUTES { PVOID Sid; ULONG Attributes; } }
     // = 8 + 4 = 12 bytes (SID_AND_ATTRIBUTES is pointer-sized ptr + u32).
-    let mut buf = [0u8; 64];
     let mut retlen: u32 = 0;
     let ok = unsafe { gti(tok, 1, buf.as_mut_ptr(), buf.len() as u32, &mut retlen) };
     let _ = unsafe { close(tok) };
@@ -646,7 +654,7 @@ fn getuid_account(
     let mut domain = [0u16; 256];
     let mut cch_name: u32 = name.len() as u32;
     let mut cch_dom: u32 = domain.len() as u32;
-    let mut pe_use: u8 = 0;
+    let mut pe_use: u32 = 0;
     let ok = unsafe {
         las(
             core::ptr::null(),

