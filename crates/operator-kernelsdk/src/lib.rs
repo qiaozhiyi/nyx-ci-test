@@ -31,14 +31,17 @@
 //! - `telemetry::MiniFilterUnlinker` — fltmgr RegisteredFilters LIST_ENTRY unlink.
 //! - `persistence::ProcessHider` — ActiveProcessLinks unlink (DKOM).
 //! - `persistence::PplStripper` — EPROCESS.Protection + SignatureLevel zero.
-//! - `persistence::TimingRepairWindow` / `RuntimePgBypassWindow` — the two real
-//!   PatchGuard bypass windows, selected by `win::select_pg_window` (capability-
-//!   driven: PG-context offsets table + `supports_thread_suspend` flag).
+//! - `persistence::PeekabooWindow` / `RuntimePgBypassWindow` /
+//!   `TimingRepairWindow` — the three PatchGuard bypass strategies, selected
+//!   by `win::select_pg_window_with_probe` in priority order: Peekaboo
+//!   (offset-free, needs a kernel callback seam — preferred) > RuntimePgBypass
+//!   (Win11 24H2+, flag-suspension) > TimingRepair (timing-based).
 //!   ⚠ EXPERIMENTAL (kernelsdk-1-1): the PG-context table rows are PLACEHOLDER
-//!   offsets (0x190/0x08, never PDB-verified) — `select_pg_window` gates on
-//!   `PgContextOffsets::verified` and returns `None` for every build until
-//!   per-build validation lands. The bypass code paths stay; the capability
-//!   is OFF rather than silently wrong.
+//!   offsets (0x190/0x08, never PDB-verified) — the two PG-context windows
+//!   gate on `PgContextOffsets::verified` and are unreachable until per-build
+//!   validation lands. Peekaboo consumes only PDB-resolved EPROCESS offsets,
+//!   so it is NOT blocked by that gate; the capability is OFF only where no
+//!   `PeekabooProbe` seam is supplied rather than silently wrong.
 //! - `netsec::UserModeEdrSilencer` — WFP block-rule templates (FFI operator-side).
 //! - `netsec::KernelLsassReader` — DTB read + page-walk orchestration shell.
 //! - `netsec::EdrNeutralizer` — Kill/Freeze/Choke tiers (framework).
@@ -388,10 +391,14 @@ pub trait EdrNeutralizeKit {
 
 // ---- §3 Persistence / protection ------------------------------------------
 
-/// §3.1/3.2 — PatchGuard-aware unchecked window. Two impls: `RuntimePgBypass`
-/// (kurasagi / TheiaPg class, Win11 24H2-25H2) and `OutflankTimingRepair`
-/// (data-only DKOM + repair in the terminate callback before PspProcessDelete).
-/// The returned guard's `Drop` repairs / re-arms — do not leak it.
+/// §3.1/3.2 — PatchGuard-aware unchecked window. Three impls, selected by
+/// `win::select_pg_window_with_probe` in priority order: `PeekabooWindow`
+/// (Outflank Peekaboo — offset-free DKOM cover, re-links ActiveProcessLinks in
+/// the terminate callback before PspProcessDelete; preferred when a kernel
+/// callback seam exists) > `RuntimePgBypassWindow` (kurasagi / TheiaPg class,
+/// Win11 24H2-25H2 flag-suspension) > `TimingRepairWindow` (timing-based
+/// repair, Win10 17763–19041). The returned guard's `Drop` repairs / re-arms —
+/// do not leak it.
 pub trait PatchGuardKit {
     fn enter_unchecked(&self, krw: &dyn KernelRw) -> Result<PgGuard<'_>, KitError>;
 }
@@ -400,9 +407,10 @@ pub trait PatchGuardKit {
 /// Borrows the kit so it cannot be dropped mid-window.
 ///
 /// The `repair` callback is set by the specific PG bypass implementation
-/// (`TimingRepairWindow` or `RuntimePgBypassWindow`) and performs the
-/// necessary cleanup when the guard is dropped — e.g., re-enabling PG
-/// validation or resuming the suspended validation thread.
+/// (`PeekabooWindow`, `RuntimePgBypassWindow`, or `TimingRepairWindow`) and
+/// performs the necessary cleanup when the guard is dropped — e.g., re-linking
+/// hidden entries, re-enabling PG validation, or resuming the suspended
+/// validation thread.
 #[must_use = "the PG guard repairs on Drop; leaking it leaves the kernel tampered"]
 pub struct PgGuard<'a> {
     // Lifetime anchor: ties the guard's lifetime to the kit so the kit cannot
@@ -585,8 +593,9 @@ pub trait DriverHandle: Send + Sync {
 /// drop (by design — see `LoadedDriver`'s Drop). KslD path leaves this `None`.
 ///
 /// PG windows are NOT stored here (they borrow `&dyn KernelRw` for their
-/// repair callback and can't outlive `rw`). Use `select_pg_window(build,
-/// &*tier.rw)` at the call site.
+/// repair callback and can't outlive `rw`). Use `select_pg_window_with_probe(build,
+/// &*tier.rw, probe)` at the call site (or `select_pg_window` when no
+/// `PeekabooProbe` seam exists).
 pub struct KernelTier {
     pub rw: Box<dyn KernelRw>,
     pub etw_ti: Option<Box<dyn EtwTiKit>>,

