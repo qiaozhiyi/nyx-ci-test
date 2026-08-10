@@ -93,11 +93,15 @@ pub struct BuildOffsets {
 /// ## EPROCESS drift history (key transitions)
 /// - 17763 (1809/Server2019): PID@0x2e0, Links@0x2e8, Protection@0x6ca
 /// - 18362 (19H1): PID@0x2e8, Links@0x2f0, Protection@0x6fa — fields shifted +8
-/// - 19041-19045 (20H1-22H2): same as 18362
-/// - 20348 (Server 2022): PID@0x440, Links@0x448, Protection@0x87a — major shift
-/// - 22000 (Win11 21H2): PID@0x440, Links@0x448, Protection@0x87a
-/// - 22621 (Win11 22H2): PID@0x440, Protection@0x87a (ETW-TI EnableInfo shifted)
-/// - 26100 (Win11 24H2): PID@0x450, Protection@0x87c (CET-default; ETW restructured)
+/// - 19041-19045 (20H1-22H2): PID@0x440, Links@0x448, Protection@0x87a — major
+///   shift (this table previously mis-attributed it to 20348; corrected from
+///   the 19041 ntoskrnl.pdb, pg-pdb-verify pass 2026-08)
+/// - 20348 (Server 2022): same EPROCESS as 19041
+/// - 22000 (Win11 21H2): same as 20348
+/// - 22621 (Win11 22H2): same as 20348 (PDB-verified 2026-08; ETW-TI
+///   EnableInfo stayed @ 0x060 — the earlier 0x070 was wrong)
+/// - 26100 (Win11 24H2): PID@0x1d0, Protection@0x5fa — 24H2 restructured
+///   EPROCESS again (CET-default; Vergilius level-2 evidence)
 pub const KNOWN_BUILDS: &[BuildOffsets] = &[
     // ---- Win10 1809 / Server 2019 (build 17763) ----
     BuildOffsets {
@@ -140,17 +144,21 @@ pub const KNOWN_BUILDS: &[BuildOffsets] = &[
         },
     },
     // ---- Win10 2004-22H2 (builds 19041-19045) ----
-    // Same EPROCESS as 19H1. ETW-TI EnableInfo @ 0x060 (stable).
+    // EPROCESS restructured at 2004 (PID 0x2e8 → 0x440) — this row previously
+    // mis-copied the 19H1/18362 layout. Corrected from the real 19041
+    // ntoskrnl.pdb downloaded from the MS symbol server (pg-pdb-verify pass,
+    // 2026-08) — PDB = primary (level-1) evidence; Vergilius + EDRSandblast
+    // CSV corroborate. ETW-TI EnableInfo @ 0x060 (stable).
     BuildOffsets {
         build: 19041,
         eprocess: EprocessOffsets {
-            unique_process_id: 0x2e8,
-            active_process_links: 0x2f0,
-            token: 0x360,
-            image_file_name: 0x450,
-            signature_level: 0x6f8,
-            section_signature_level: 0x6f9,
-            protection: 0x6fa,
+            unique_process_id: 0x440,
+            active_process_links: 0x448,
+            token: 0x4b8,
+            image_file_name: 0x5a8,
+            signature_level: 0x878,
+            section_signature_level: 0x879,
+            protection: 0x87a,
         },
         etw_ti: EtwTiOffsets {
             guid_entry_to_provider_block: 0x020,
@@ -159,14 +167,16 @@ pub const KNOWN_BUILDS: &[BuildOffsets] = &[
         },
     },
     // ---- Server 2022 / Win11 21H2 (builds 20348/22000) ----
-    // Major EPROCESS shift: PID moved to 0x440. Protection to 0x87a.
+    // Same EPROCESS layout as 19041 (the 2004 restructuring). ImageFileName
+    // corrected 0x5a0 → 0x5a8 (PDB level-1: real 19041/22621 ntoskrnl.pdb,
+    // pg-pdb-verify pass 2026-08; Vergilius 21H2 corroborates).
     BuildOffsets {
         build: 20348,
         eprocess: EprocessOffsets {
             unique_process_id: 0x440,
             active_process_links: 0x448,
             token: 0x4b8,
-            image_file_name: 0x5a0,
+            image_file_name: 0x5a8,
             signature_level: 0x878,
             section_signature_level: 0x879,
             protection: 0x87a,
@@ -184,15 +194,19 @@ pub const KNOWN_BUILDS: &[BuildOffsets] = &[
             unique_process_id: 0x440,
             active_process_links: 0x448,
             token: 0x4b8,
-            image_file_name: 0x5a0,
+            image_file_name: 0x5a8,
             signature_level: 0x878,
             section_signature_level: 0x879,
             protection: 0x87a,
         },
         etw_ti: EtwTiOffsets {
-            // 22H2 restructured the ETW GUID entry — EnableInfo shifted.
+            // EnableInfo corrected 0x070 → 0x060: the real 22621 ntoskrnl.pdb
+            // (MS symbol server, pg-pdb-verify pass 2026-08 — PDB level-1)
+            // shows _ETW_GUID_ENTRY::ProviderEnableInfo stayed at 0x060; the
+            // 22H2 GUID-entry restructure did NOT move it. ImageFileName
+            // 0x5a0 → 0x5a8 same pass.
             guid_entry_to_provider_block: 0x020,
-            provider_block_to_enable_info: 0x070,
+            provider_block_to_enable_info: 0x060,
             is_enabled_within_enable_info: 0x000,
         },
     },
@@ -203,32 +217,36 @@ pub const KNOWN_BUILDS: &[BuildOffsets] = &[
             unique_process_id: 0x440,
             active_process_links: 0x448,
             token: 0x4b8,
-            image_file_name: 0x5a0,
+            image_file_name: 0x5a8,
             signature_level: 0x878,
             section_signature_level: 0x879,
             protection: 0x87a,
         },
         etw_ti: EtwTiOffsets {
             guid_entry_to_provider_block: 0x020,
-            provider_block_to_enable_info: 0x070,
+            provider_block_to_enable_info: 0x060,
             is_enabled_within_enable_info: 0x000,
         },
     },
-    // ---- Win11 24H2 (build 26100) — CET default, ETW restructured ----
+    // ---- Win11 24H2 (build 26100) — CET default, EPROCESS restructured ----
+    // 24H2 restructured EPROCESS AGAIN (PID 0x440 → 0x1d0, Protection 0x87a →
+    // 0x5fa). Evidence: Vergilius _EPROCESS 26100 (level-2 secondary — no
+    // symbol-server PDB parse yet; EDRSandblast CSV corroborates). ETW-TI
+    // EnableInfo 0x070 → 0x060 (Vergilius _ETW_GUID_ENTRY 26100, level-2).
     BuildOffsets {
         build: 26100,
         eprocess: EprocessOffsets {
-            unique_process_id: 0x450,
-            active_process_links: 0x458,
-            token: 0x4c8,
-            image_file_name: 0x5a8,
-            signature_level: 0x87c,
-            section_signature_level: 0x87d,
-            protection: 0x87e,
+            unique_process_id: 0x1d0,
+            active_process_links: 0x1d8,
+            token: 0x248,
+            image_file_name: 0x338,
+            signature_level: 0x5f8,
+            section_signature_level: 0x5f9,
+            protection: 0x5fa,
         },
         etw_ti: EtwTiOffsets {
             guid_entry_to_provider_block: 0x020,
-            provider_block_to_enable_info: 0x070,
+            provider_block_to_enable_info: 0x060,
             is_enabled_within_enable_info: 0x000,
         },
     },
@@ -236,17 +254,17 @@ pub const KNOWN_BUILDS: &[BuildOffsets] = &[
     BuildOffsets {
         build: 26200,
         eprocess: EprocessOffsets {
-            unique_process_id: 0x450,
-            active_process_links: 0x458,
-            token: 0x4c8,
-            image_file_name: 0x5a8,
-            signature_level: 0x87c,
-            section_signature_level: 0x87d,
-            protection: 0x87e,
+            unique_process_id: 0x1d0,
+            active_process_links: 0x1d8,
+            token: 0x248,
+            image_file_name: 0x338,
+            signature_level: 0x5f8,
+            section_signature_level: 0x5f9,
+            protection: 0x5fa,
         },
         etw_ti: EtwTiOffsets {
             guid_entry_to_provider_block: 0x020,
-            provider_block_to_enable_info: 0x070,
+            provider_block_to_enable_info: 0x060,
             is_enabled_within_enable_info: 0x000,
         },
     },
@@ -374,10 +392,42 @@ mod tests {
     }
 
     #[test]
+    fn win10_2004_row_matches_pdb() {
+        // pg-pdb-verify pass (2026-08): the real 19041 ntoskrnl.pdb from the
+        // MS symbol server gives these values (PDB = level-1 evidence). The
+        // previous row mis-copied the 18362 layout.
+        let o = for_build(19041).unwrap();
+        assert_eq!(o.eprocess.unique_process_id, 0x440);
+        assert_eq!(o.eprocess.active_process_links, 0x448);
+        assert_eq!(o.eprocess.token, 0x4b8);
+        assert_eq!(o.eprocess.image_file_name, 0x5a8);
+        assert_eq!(o.eprocess.signature_level, 0x878);
+        assert_eq!(o.eprocess.section_signature_level, 0x879);
+        assert_eq!(o.eprocess.protection, 0x87a);
+    }
+
+    #[test]
+    fn win11_22h2_row_matches_pdb() {
+        // Same pg-pdb-verify pass: 22621 ntoskrnl.pdb (PDB level-1). Pin the
+        // two corrected fields — ImageFileName 0x5a8 (was 0x5a0) and ETW-TI
+        // EnableInfo 0x060 (was 0x070).
+        let o = for_build(22621).unwrap();
+        assert_eq!(o.eprocess.image_file_name, 0x5a8);
+        assert_eq!(o.etw_ti.provider_block_to_enable_info, 0x060);
+    }
+
+    #[test]
     fn win11_24h2_offsets_are_populated() {
+        // 24H2 restructured EPROCESS (Vergilius 26100, level-2 evidence).
         let o = for_build(26100).unwrap();
-        assert_eq!(o.eprocess.unique_process_id, 0x450);
-        assert_eq!(o.eprocess.protection, 0x87e);
+        assert_eq!(o.eprocess.unique_process_id, 0x1d0);
+        assert_eq!(o.eprocess.active_process_links, 0x1d8);
+        assert_eq!(o.eprocess.token, 0x248);
+        assert_eq!(o.eprocess.image_file_name, 0x338);
+        assert_eq!(o.eprocess.signature_level, 0x5f8);
+        assert_eq!(o.eprocess.section_signature_level, 0x5f9);
+        assert_eq!(o.eprocess.protection, 0x5fa);
+        assert_eq!(o.etw_ti.provider_block_to_enable_info, 0x060);
     }
 
     #[test]
@@ -386,7 +436,7 @@ mod tests {
         // same kernel binary, same EPROCESS layout. Resolves to 19041's row.
         let o = for_build(19045).unwrap();
         assert_eq!(o.build, 19041);
-        assert_eq!(o.eprocess.unique_process_id, 0x2e8);
+        assert_eq!(o.eprocess.unique_process_id, 0x440);
 
         // The full 19042-19045 enablement range all maps to 19041.
         for &patch in &[19042, 19043, 19044, 19045] {
@@ -434,7 +484,7 @@ mod tests {
     #[test]
     fn for_build_strict_non_17763_uses_table() {
         let o = for_build_strict(22621, 1).unwrap();
-        assert_eq!(o.provider_block_to_enable_info, 0x070); // 22H2 shifted
+        assert_eq!(o.provider_block_to_enable_info, 0x060); // PDB-verified (was 0x070)
     }
 
     #[test]

@@ -62,9 +62,12 @@ pub struct EprocessOffsets {
     pub section_signature_level: usize,
     pub protection: usize,
     /// `_EPROCESS.Peb` — build-specific offset of the PEB pointer field.
-    /// Authoritative: comes from the offsets table (Vergilius cross-checked).
-    /// The dynamic probe cannot discover this (System's PEB is NULL), so it
-    /// returns 0 for unknown builds — callers must rely on the table.
+    /// Operator-side literals in [`KNOWN_EPROCESS_BUILDS`] — re-verified in
+    /// the pg-pdb-verify pass (2026-08): 19041 + 22621 against the real MS
+    /// symbol-server `ntkrnlmp.pdb`, the other canonical builds against
+    /// Vergilius. The dynamic probe cannot discover this (System's PEB is
+    /// NULL), so it returns 0 for unknown builds — callers must rely on the
+    /// table.
     pub peb: usize,
 }
 
@@ -206,14 +209,19 @@ pub const KNOWN_EPROCESS_BUILDS: &[EprocessBuild] = &[
     // here. The `const _: ()` guard above pins the positional indices to the
     // canonical build numbers — if the canonical table is reordered or gains a
     // row, this file stops compiling.
-    from_canonical(ev::KNOWN_BUILDS[0], 0x3F8), // Win10 1809 / Server 2019 (17763)
-    from_canonical(ev::KNOWN_BUILDS[1], 0x408), // Win10 1903 (18362)
-    from_canonical(ev::KNOWN_BUILDS[2], 0x440), // Win10 2004 (19041)
-    from_canonical(ev::KNOWN_BUILDS[3], 0x4C0), // Server 2022 (20348)
-    from_canonical(ev::KNOWN_BUILDS[4], 0x5B8), // Win11 22H2 (22621)
-    from_canonical(ev::KNOWN_BUILDS[5], 0x5B8), // Win11 23H2 (22631)
-    from_canonical(ev::KNOWN_BUILDS[6], 0x6C8), // Win11 24H2 (26100)
-    from_canonical(ev::KNOWN_BUILDS[7], 0x6C8), // Win11 25H2 (26200)
+    // `peb` literals re-verified in the pg-pdb-verify pass (2026-08): 19041 +
+    // 22621 parsed from the MS symbol server's `ntkrnlmp.pdb` via
+    // offset-resolver, the rest cross-checked against Vergilius _EPROCESS.
+    // Several prior values (0x408 / 0x440 / 0x4C0 / 0x5B8 / 0x6C8) were wrong
+    // and are corrected here.
+    from_canonical(ev::KNOWN_BUILDS[0], 0x3F8), // Win10 1809 / Server 2019 (17763) — Peb @ 0x3F8 (Vergilius)
+    from_canonical(ev::KNOWN_BUILDS[1], 0x3F8), // Win10 1903 (18362) — Peb @ 0x3F8 (Vergilius; was 0x408)
+    from_canonical(ev::KNOWN_BUILDS[2], 0x550), // Win10 2004 (19041) — Peb @ 0x550 (PDB-verified)
+    from_canonical(ev::KNOWN_BUILDS[3], 0x550), // Server 2022 (20348) — Peb @ 0x550 (Vergilius 21H2)
+    from_canonical(ev::KNOWN_BUILDS[4], 0x550), // Win11 22H2 (22621) — Peb @ 0x550 (PDB-verified)
+    from_canonical(ev::KNOWN_BUILDS[5], 0x550), // Win11 23H2 (22631) — Peb @ 0x550 (Vergilius)
+    from_canonical(ev::KNOWN_BUILDS[6], 0x2E0), // Win11 24H2 (26100) — Peb @ 0x2E0 (Vergilius; 24H2 restructured EPROCESS)
+    from_canonical(ev::KNOWN_BUILDS[7], 0x2E0), // Win11 25H2 (26200) — Peb @ 0x2E0 (Vergilius)
 ];
 
 /// Patch builds whose EPROCESS layout is *verified identical* to a baseline
@@ -370,6 +378,42 @@ impl RuntimeOffsets {
 }
 
 // ============================================================================
+// KPCR / KPRCB — x64 field offsets
+//
+// The PatchGuard-window factory resolves the current processor's `_KPRCB`
+// from the KPCR (GS base in kernel mode). Verification status per constant
+// (pg-pdb-verify pass, 2026-08 — offset-resolver against the MS symbol
+// server's `ntkrnlmp.pdb` for 19041 + 22621.1265):
+//
+// - `kpcr::CURRENT_PRCB` / `kprcb::CURRENT_THREAD` — **PDB-VERIFIED**: both
+//   fields are present in the public PDB type stream and agree on both
+//   builds (0x20 / 0x08; also matches Vergilius).
+// - `kpcr::PRCB` — **ABI/Vergilius-verified, NOT PDB-verifiable**: the
+//   public PDB truncates `_KPCR` at `PcrAlign1` (0x118) — the embedded PRCB
+//   body only exists in private symbols. 0x180 is frozen by the x64 kernel
+//   ABI (GS-based KPCR access is compiled into the kernel itself) and
+//   cross-checked against Vergilius, but could not be parsed from a public
+//   PDB.
+// ============================================================================
+pub mod kpcr {
+    /// `_KPCR.CurrentPrcb` — pointer to the current processor's `_KPRCB`
+    /// (readable in kernel mode as `gs:[0x20]`). PDB-verified (19041/22621).
+    pub const CURRENT_PRCB: usize = 0x20;
+    /// `_KPCR.Prcb` — the EMBEDDED `_KPRCB` (not a pointer): the PRCB body
+    /// starts at KPCR + 0x180, i.e. `gs:[0x180]` is the KPRCB base itself.
+    /// NOT in the public PDB (truncated struct) — ABI/Vergilius-verified.
+    pub const PRCB: usize = 0x180;
+}
+
+pub mod kprcb {
+    /// `_KPRCB.CurrentThread` — the running `_KTHREAD*` (KPCR + 0x188).
+    /// PDB-verified (19041/22621). NOTE: reading `gs:[0x188]` yields the
+    /// current THREAD, not the PRCB — a pointer to the PRCB lives at
+    /// [`kpcr::CURRENT_PRCB`] (`gs:[0x20]`).
+    pub const CURRENT_THREAD: usize = 0x08;
+}
+
+// ============================================================================
 // PatchGuard context offsets — per-build PG validation thread / context layout
 //
 // PatchGuard's internal context (the `PATCH_GUARD_CONTEXT` structure) is not
@@ -377,15 +421,28 @@ impl RuntimeOffsets {
 // `TimingRepairWindow` and `RuntimePgBypassWindow` kits to locate the PG
 // validation thread and context-valid flag.
 //
+// ⚠⚠ UNVERIFIED — DO NOT ENABLE ⚠⚠
+// Every row in [`KNOWN_PG_CONTEXT_BUILDS`] is a GUESS (`prcb_pg_thread_offset:
+// 0x190` / `context_valid_offset: 0x08`, extrapolated from public KPCR/_KPRCB
+// layouts). The PatchGuard context structure is UNDOCUMENTED and — confirmed
+// in the pg-pdb-verify pass (2026-08) — carries NO type information in the
+// public `ntkrnlmp.pdb` on the MS symbol server (checked 19041 + 22621 type
+// streams: no PG-context struct exists to parse), so these offsets CANNOT be
+// PDB-validated by design; validating them requires a live-kernel KPCR dump
+// per build. Writing a kernel address derived from them is a BSoD lottery.
+// The runtime build allow-list gate [`pg_context_usable_for_window`] returns
+// `false` for every build while all rows are unverified, so
+// `win::select_pg_window` refuses to construct a window instead of silently
+// writing the kernel. Flip `verified` per-build ONLY with dump evidence.
+//
+// ALTERNATIVE PATH (preferred until per-build dumps land): Outflank Peekaboo
+// (https://github.com/outflanknl/Peekaboo) — a timing-based PG bypass that
+// suspends PG validation WITHOUT touching the undocumented PG context
+// structure at all, so it needs none of these offsets. The Peekaboo window
+// kit is being implemented in `persistence.rs` alongside this table.
+//
 // Sources: kurasagi / TheiaPg research (Win11 24H2+), Outflank Peekaboo
 // (timing-based PG bypass), Vergilius _KPCR/_KPRCB layouts.
-//
-// ⚠ EXPERIMENTAL (kernelsdk-1-1): every row below carries PLACEHOLDER
-// offsets — `prcb_pg_thread_offset: 0x190` / `context_valid_offset: 0x08`
-// guessed from public KPCR/_KPRCB layouts, never verified against a live
-// kernel or PDB. `win::select_pg_window` gates on `PgContextOffsets::verified`
-// and returns `None` while a row is unverified, so the PatchGuard-window
-// capability is OFF for every build until per-build PDB validation lands.
 // ============================================================================
 
 /// Per-build PatchGuard context offsets. The bootstrap resolves the current
@@ -519,12 +576,17 @@ pub fn pg_context_for_build(build: u32) -> Option<&'static PgContextBuild> {
 /// True when `build` has a PG-context row whose offsets are verified enough to
 /// build a bypass window.
 ///
-/// This is the single gate for the (EXPERIMENTAL, kernelsdk-1-1)
-/// PatchGuard-window capability: while every table row is a placeholder
-/// ([`PgContextOffsets::verified`] == false), this returns `false` for every
-/// build and [`crate::win::select_pg_window`] yields `None`. Rows are flipped
-/// to verified per-build as PDB validation lands — no other code needs to
-/// change.
+/// This is the single gate — the runtime build allow-list — for the
+/// (UNVERIFIED, kernelsdk-1-1) PatchGuard-window capability: while every table
+/// row is a guess ([`PgContextOffsets::verified`] == false), this returns
+/// `false` for every build and [`crate::win::select_pg_window`] yields `None`,
+/// so an unverified build REFUSES the technique instead of silently writing
+/// the kernel. PDB validation can never land for these offsets (the PG
+/// context struct is undocumented and absent from the public ntkrnlmp.pdb —
+/// see the section header above); rows are flipped to verified per-build only
+/// with live-kernel dump evidence — no other code needs to change. Until
+/// then, the Peekaboo timing-based window (`persistence.rs`) is the intended
+/// PG-bypass path — it needs no PG-context offsets at all.
 ///
 /// Patch-equivalent builds (e.g. 19045 → 19041) inherit the baseline row's
 /// `verified` flag through [`pg_context_for_build`].
@@ -624,7 +686,10 @@ pub mod flt {
             return Some(rva);
         }
         // 2. Patch-equivalent.
-        if let Some(&(_, baseline)) = FLT_PATCH_EQUIVALENT_BUILDS.iter().find(|(p, _)| *p == build) {
+        if let Some(&(_, baseline)) = FLT_PATCH_EQUIVALENT_BUILDS
+            .iter()
+            .find(|(p, _)| *p == build)
+        {
             return KNOWN_FLT_GLOBALS_RVAS
                 .iter()
                 .find(|(b, _)| *b == baseline)
@@ -752,6 +817,36 @@ mod eprocess_table_tests {
         // silently floor-match — resolve_eprocess_offsets is the fallback.
         assert!(for_build(26300).is_none());
         assert!(for_build(26999).is_none());
+    }
+
+    #[test]
+    fn peb_literals_match_pdb_verified_values() {
+        // pg-pdb-verify (2026-08): the 19041 + 22621 Peb offsets were parsed
+        // from the real MS symbol-server ntkrnlmp.pdb via offset-resolver;
+        // the others cross-checked against Vergilius _EPROCESS. Several prior
+        // literals were wrong — this pins the corrected values.
+        assert_eq!(for_build(19041).unwrap().offsets.peb, 0x550);
+        assert_eq!(for_build(22621).unwrap().offsets.peb, 0x550);
+        // Patch-equivalent builds inherit the baseline's Peb.
+        assert_eq!(for_build(19045).unwrap().offsets.peb, 0x550);
+        assert_eq!(for_build(17763).unwrap().offsets.peb, 0x3F8);
+        assert_eq!(for_build(18362).unwrap().offsets.peb, 0x3F8);
+        assert_eq!(for_build(20348).unwrap().offsets.peb, 0x550);
+        assert_eq!(for_build(26100).unwrap().offsets.peb, 0x2E0);
+        assert_eq!(for_build(26200).unwrap().offsets.peb, 0x2E0);
+    }
+
+    #[test]
+    fn kpcr_layout_constants_are_abi_frozen_values() {
+        // pg-pdb-verify: CURRENT_PRCB + CURRENT_THREAD were parsed from the
+        // 19041 + 22621 public PDBs; PRCB is ABI/Vergilius-only (the public
+        // PDB truncates _KPCR at PcrAlign1 0x118).
+        assert_eq!(kpcr::CURRENT_PRCB, 0x20);
+        assert_eq!(kpcr::PRCB, 0x180);
+        assert_eq!(kprcb::CURRENT_THREAD, 0x08);
+        // gs:[0x188] = KPRCB.CurrentThread — NOT a PRCB pointer (the PRCB
+        // pointer lives at gs:[0x20]). Pin that relationship.
+        assert_eq!(kpcr::PRCB + kprcb::CURRENT_THREAD, 0x188);
     }
 
     #[test]
@@ -970,7 +1065,8 @@ pub fn probe_eprocess_offsets(
     // Step 5: Scan for Protection byte == 0x72 (WinSystem:PP = Type:2 |
     // Signer:7<<4). Two structural guards against false positives:
     //   a) bounded window after ImageFileName — protection − image_file_name
-    //      is 0x272..0x27A across EVERY row in KNOWN_EPROCESS_BUILDS;
+    //      is 0x27A..0x2D2 across the PDB/Vergilius-verified layouts
+    //      (0x27A on 17763, 0x2AA on 18362, 0x2D2 on 19041–22631);
     //   b) the two ADJACENT preceding bytes (SignatureLevel / Section-
     //      SignatureLevel) must be equal, valid SE_SIGNING_LEVEL values.
     let protection_lo = image_name_offset + 0x100;
@@ -1122,7 +1218,7 @@ mod probe_tests {
         krw.set_u64(base + offsets.active_process_links + 8, blink as u64);
         krw.set_u64(flink + 8, links_kva as u64); // next entry's Blink → here
         krw.set_u64(blink, links_kva as u64); // prev entry's Flink → here
-        // Token (any value — probe validates fast-ref shape)
+                                              // Token (any value — probe validates fast-ref shape)
         krw.set_u64(base + offsets.token, 0xFFFF_8000_0000_5000 | 0x7);
         // ImageFileName = "System\0" (+ zero pad byte — CHAR[15] field)
         krw.set_bytes(base + offsets.image_file_name, b"System\0\0");
@@ -1379,7 +1475,9 @@ mod cross_crate_table_consistency_tests {
 
         for build in builds {
             // Overlap filter: only builds the implant-side table also knows.
-            let Some(ev_off) = ev::for_build(build) else { continue };
+            let Some(ev_off) = ev::for_build(build) else {
+                continue;
+            };
 
             // EPROCESS — same patched build on both sides.
             let k_ep = crate::offsets::for_build(build)
@@ -1395,18 +1493,15 @@ mod cross_crate_table_consistency_tests {
             let k_etw = EtwTiOffsets::for_build(build)
                 .unwrap_or_else(|| panic!("kernelsdk ETW-TI table misses build {build}"));
             assert_eq!(
-                k_etw.guid_entry_to_provider_block,
-                ev_off.etw_ti.guid_entry_to_provider_block,
+                k_etw.guid_entry_to_provider_block, ev_off.etw_ti.guid_entry_to_provider_block,
                 "ETW-TI guid-entry hop disagreement for build {build}"
             );
             assert_eq!(
-                k_etw.provider_block_to_enable_info,
-                ev_off.etw_ti.provider_block_to_enable_info,
+                k_etw.provider_block_to_enable_info, ev_off.etw_ti.provider_block_to_enable_info,
                 "ETW-TI provider-block hop disagreement for build {build}"
             );
             assert_eq!(
-                k_etw.is_enabled_within_enable_info,
-                ev_off.etw_ti.is_enabled_within_enable_info,
+                k_etw.is_enabled_within_enable_info, ev_off.etw_ti.is_enabled_within_enable_info,
                 "ETW-TI is-enabled hop disagreement for build {build}"
             );
         }

@@ -31,3 +31,7 @@ anyhow = "1"
 # Canonical cross-version kernel offset table — emit_known_offsets sources its
 # rows from here (single source of truth; no duplicated offset literals).
 nyx-implant-evasionsdk = { path = "../implant-evasionsdk" }
+# Operator-side ring-0 offset table — emit_known_offsets sources the ring-0-only
+# offsets the canonical ring-3 table deliberately does not carry (EPROCESS.Peb)
+# plus the PDB-verified KPCR/KPRCB ABI constants from here (pg-pdb-verify).
+nyx-operator-kernelsdk = { path = "../operator-kernelsdk" }

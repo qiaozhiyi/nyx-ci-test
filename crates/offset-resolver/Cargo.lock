@@ -352,9 +352,17 @@ dependencies = [
  "anyhow",
  "goblin",
  "nyx-implant-evasionsdk",
+ "nyx-operator-kernelsdk",
  "pdb",
  "sha2",
  "ureq",
+]
+
+[[package]]
+name = "nyx-operator-kernelsdk"
+version = "0.0.1"
+dependencies = [
+ "nyx-implant-evasionsdk",
 ]
 
 [[package]]

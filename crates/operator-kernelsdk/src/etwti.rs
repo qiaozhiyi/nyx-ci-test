@@ -35,7 +35,8 @@
 //!   `ETWRT_PROVIDER_BLOCK` in this chain — `ProviderEnableInfo` is embedded
 //!   directly in `_ETW_GUID_ENTRY`. **This is the offset that varies**:
 //!   `0x050` on builds ≤1903 and 17763 RTM (<1075); `0x060` on ≥2004 and
-//!   17763.1075+; possibly `0x070` on some Win11 builds (needs PDB verification).
+//!   17763.1075+ through Win11 25H2 (PDB-verified on 22621 in the pg-pdb-verify
+//!   pass 2026-08 — the earlier `0x070` for Win11 was wrong).
 //! - `is_enabled_within_enable_info` = `_TRACE_ENABLE_INFO::IsEnabled` offset.
 //!   Stable at `0x0` (it's the struct's first field on every build).
 //!
@@ -106,7 +107,7 @@ pub const ETW_TI_GUID: [u8; 16] = [
 /// - `guid_entry_to_provider_block`: actually `_ETW_REG_ENTRY::GuidEntry`
 ///   (offset `0x20`, stable since Vista x64).
 /// - `provider_block_to_enable_info`: actually
-///   `_ETW_GUID_ENTRY::ProviderEnableInfo` (offset `0x050`/`0x060`/`0x070` —
+///   `_ETW_GUID_ENTRY::ProviderEnableInfo` (offset `0x050`/`0x060` —
 ///   **the variable one**; resolved exactly by the PDB walker).
 /// - `is_enabled_within_enable_info`: `_TRACE_ENABLE_INFO::IsEnabled`
 ///   (offset `0x0`, stable — struct's first field).
@@ -159,11 +160,10 @@ impl EtwTiOffsets {
     /// 22H2/23H2 layout, 22001 → Server 2022's). Values come from the
     /// canonical table via [`Self::for_build`].
     ///
-    /// Returns `None` ABOVE the last verified build (26200): the Win11 24H2+
-    /// `0x070` EnableInfo offset is "possibly correct, pending PDB verification"
-    /// (module doc), and silently extending it to unknown future kernels
-    /// violates the module's own "Unknown builds return None so the caller MUST
-    /// probe" contract (kernelsdk-2-5).
+    /// Returns `None` ABOVE the last verified build (26200): the table is only
+    /// verified through 25H2, and silently extending the last known layout to
+    /// unknown future kernels violates the module's own "Unknown builds return
+    /// None so the caller MUST probe" contract (kernelsdk-2-5).
     fn floor_match(build: u32) -> Option<Self> {
         // Try each known canonical row; return the one whose row <= build.
         if build > 26200 {
@@ -464,13 +464,15 @@ mod tests {
 
     #[test]
     fn win11_22h2_now_has_known_offsets() {
-        // 22H2 EnableInfo shifted to 0x070 (was None before the cross-version table).
+        // 22H2 EnableInfo is 0x060 — PDB-verified against the real 22621
+        // ntoskrnl.pdb (pg-pdb-verify pass 2026-08); the earlier 0x070 was
+        // wrong (was None before the cross-version table).
         let o = EtwTiOffsets::for_build(22621).unwrap();
-        assert_eq!(o.provider_block_to_enable_info, 0x070);
+        assert_eq!(o.provider_block_to_enable_info, 0x060);
         // 24H2 same ETW layout as 22H2.
         let o2 = EtwTiOffsets::for_build(26100).unwrap();
-        assert_eq!(o2.provider_block_to_enable_info, 0x070);
-        // Server 2022 / Win11 21H2 still at 0x060 (pre-22H2 layout).
+        assert_eq!(o2.provider_block_to_enable_info, 0x060);
+        // Server 2022 / Win11 21H2 also at 0x060.
         let o3 = EtwTiOffsets::for_build(20348).unwrap();
         assert_eq!(o3.provider_block_to_enable_info, 0x060);
     }
@@ -484,12 +486,12 @@ mod tests {
         // Builds outside every explicit range still floor-match (22635 → the
         // 22H2/23H2 layout).
         let o2 = EtwTiOffsets::for_build(22635).unwrap();
-        assert_eq!(o2.provider_block_to_enable_info, 0x070);
+        assert_eq!(o2.provider_block_to_enable_info, 0x060);
     }
 
     #[test]
     fn builds_above_last_verified_return_none() {
-        // kernelsdk-2-5 regression: the Win11 0x070 EnableInfo layout is only
+        // kernelsdk-2-5 regression: the Win11 EnableInfo layout is only
         // verified through 26200 — unknown FUTURE builds must return None so
         // the caller probes instead of writing a guessed offset (bugcheck
         // risk). Before the fix, floor_match mapped ANY build >= 26100,

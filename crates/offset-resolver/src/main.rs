@@ -42,10 +42,10 @@
 //! So the build number cannot be extracted from a PDB, `--build <num>` is
 //! required on every run, and there is deliberately NO silent default.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::io::Read;
 use anyhow::{anyhow, Context, Result};
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::path::PathBuf;
 
 const SYMSRV: &str = "https://msdl.microsoft.com/download/symbols";
 
@@ -66,13 +66,34 @@ fn main() -> Result<()> {
             // a bounds check, so `--pdb-path` as the LAST argument panicked
             // with index-out-of-bounds instead of printing usage. Route all
             // value reads through flag_value() which errors cleanly.
-            "--pdb-path" => { pdb_path = Some(PathBuf::from(flag_value(&args, i, "--pdb-path")?)); i += 1; }
-            "--guid" => { guid = Some(flag_value(&args, i, "--guid")?); i += 1; }
-            "--age" => { age = Some(flag_value(&args, i, "--age")?.parse()?); i += 1; }
-            "--build" => { build = Some(flag_value(&args, i, "--build")?.parse()?); i += 1; }
-            "--ntoskrnl" => { ntoskrnl = Some(PathBuf::from(flag_value(&args, i, "--ntoskrnl")?)); i += 1; }
-            "--fltmgr" => { fltmgr = Some(PathBuf::from(flag_value(&args, i, "--fltmgr")?)); i += 1; }
-            "--out" => { out = PathBuf::from(flag_value(&args, i, "--out")?); i += 1; }
+            "--pdb-path" => {
+                pdb_path = Some(PathBuf::from(flag_value(&args, i, "--pdb-path")?));
+                i += 1;
+            }
+            "--guid" => {
+                guid = Some(flag_value(&args, i, "--guid")?);
+                i += 1;
+            }
+            "--age" => {
+                age = Some(flag_value(&args, i, "--age")?.parse()?);
+                i += 1;
+            }
+            "--build" => {
+                build = Some(flag_value(&args, i, "--build")?.parse()?);
+                i += 1;
+            }
+            "--ntoskrnl" => {
+                ntoskrnl = Some(PathBuf::from(flag_value(&args, i, "--ntoskrnl")?));
+                i += 1;
+            }
+            "--fltmgr" => {
+                fltmgr = Some(PathBuf::from(flag_value(&args, i, "--fltmgr")?));
+                i += 1;
+            }
+            "--out" => {
+                out = PathBuf::from(flag_value(&args, i, "--out")?);
+                i += 1;
+            }
             "--help" | "-h" => {
                 eprintln!(
                     "Usage: nyx-offset-resolver <source> [--out offsets.toml]\n\
@@ -111,21 +132,26 @@ fn main() -> Result<()> {
         i += 1;
     }
 
-/// Fetch the value following a value-taking flag, failing with a usage-style
-/// error instead of panicking when the flag is the last argument (kernel-tools-8).
-fn flag_value(args: &[String], i: usize, flag: &str) -> Result<String> {
-    args.get(i + 1)
-        .cloned()
-        .ok_or_else(|| anyhow!("flag {flag} needs a value"))
-}
+    /// Fetch the value following a value-taking flag, failing with a usage-style
+    /// error instead of panicking when the flag is the last argument (kernel-tools-8).
+    fn flag_value(args: &[String], i: usize, flag: &str) -> Result<String> {
+        args.get(i + 1)
+            .cloned()
+            .ok_or_else(|| anyhow!("flag {flag} needs a value"))
+    }
 
     // --ntoskrnl: extract GUID+age from the PE, then behave as --guid/--age.
     if let Some(nk_path) = &ntoskrnl {
         let (nk_guid, nk_age) = extract_pdb_ref_from_pe(nk_path)
             .with_context(|| format!("extract PDB ref from {}", nk_path.display()))?;
-        eprintln!("Extracted from {}: GUID={nk_guid} AGE={nk_age}", nk_path.display());
+        eprintln!(
+            "Extracted from {}: GUID={nk_guid} AGE={nk_age}",
+            nk_path.display()
+        );
         guid = Some(nk_guid);
-        if age.is_none() { age = Some(nk_age); }
+        if age.is_none() {
+            age = Some(nk_age);
+        }
     }
 
     // The build number must ALWAYS be explicit (kernel-tools-2). There is no
@@ -162,8 +188,7 @@ fn flag_value(args: &[String], i: usize, flag: &str) -> Result<String> {
     // download the PDB so the real offsets are parsed from it below instead
     // of the known table. build_num is already pinned by --build.
     if let (Some(g), Some(a)) = (&guid, age) {
-        let data = download_pdb("ntkrnlmp.pdb", g, a)
-            .context("download PDB from symbol server")?;
+        let data = download_pdb("ntkrnlmp.pdb", g, a).context("download PDB from symbol server")?;
         downloaded_pdb = Some(data);
     }
 
@@ -190,7 +215,10 @@ fn flag_value(args: &[String], i: usize, flag: &str) -> Result<String> {
     if let Some(flt_path) = &fltmgr {
         match resolve_flt_globals_rva(flt_path) {
             Ok(rva) => {
-                eprintln!("Resolved FltGlobals RVA = 0x{rva:x} from {}", flt_path.display());
+                eprintln!(
+                    "Resolved FltGlobals RVA = 0x{rva:x} from {}",
+                    flt_path.display()
+                );
                 offsets.insert("flt.globals_rva", rva);
             }
             Err(e) => {
@@ -244,6 +272,8 @@ fn parse_pdb_offsets(data: &[u8], build_num: u32) -> Result<BTreeMap<&'static st
         b"_ETW_REG_ENTRY",
         b"_ETW_GUID_ENTRY",
         b"_TRACE_ENABLE_INFO",
+        b"_KPCR",
+        b"_KPRCB",
     ];
     let mut struct_fields: std::collections::HashMap<&[u8], pdb::TypeIndex> =
         std::collections::HashMap::new();
@@ -271,7 +301,7 @@ fn parse_pdb_offsets(data: &[u8], build_num: u32) -> Result<BTreeMap<&'static st
                 }
                 finder.update(&iter);
             }
-            Ok(None) => break,           // drained — finder now covers all types
+            Ok(None) => break, // drained — finder now covers all types
             Err(_) => {
                 // Skip malformed item but still advance the finder position map.
                 finder.update(&iter);
@@ -292,7 +322,13 @@ fn parse_pdb_offsets(data: &[u8], build_num: u32) -> Result<BTreeMap<&'static st
         .or_else(|| struct_fields.get(b"EPROCESS".as_slice()))
     {
         eprintln!("Found _EPROCESS in PDB");
-        extract_struct_fields(&finder, fields_index, &mut offsets, map_eprocess_field, "_EPROCESS")?;
+        extract_struct_fields(
+            &finder,
+            fields_index,
+            &mut offsets,
+            map_eprocess_field,
+            "_EPROCESS",
+        )?;
     } else {
         anyhow::bail!("_EPROCESS struct not found in PDB");
     }
@@ -319,6 +355,46 @@ fn parse_pdb_offsets(data: &[u8], build_num: u32) -> Result<BTreeMap<&'static st
                 }
             }
         }
+    }
+
+    // ---- KPCR / KPRCB (pg-pdb-verify) ----
+    //
+    // The PatchGuard-window factory resolves the current processor's _KPRCB
+    // from the KPCR. `CurrentPrcb` (0x20) and `_KPRCB::CurrentThread` (0x08)
+    // ARE present in the public PDB type stream and are parsed here
+    // (verified identical on 19041 + 22621). `_KPCR::Prcb` (0x180) is NOT:
+    // the public ntkrnlmp.pdb truncates _KPCR at `PcrAlign1` (0x118) — the
+    // embedded PRCB body only exists in private symbols — so `kpcr.prcb`
+    // always falls back to the x64-ABI constant and the operator is told the
+    // value did NOT come from this PDB. NOTE: the PatchGuard CONTEXT
+    // structure is likewise undocumented and absent from the public PDB type
+    // stream (confirmed on 19041 + 22621) — kernelsdk's
+    // `prcb_pg_thread_offset` / `context_valid_offset` stay UNVERIFIED by
+    // design (gated off via `pg_context_usable_for_window`); the Peekaboo
+    // timing-based window is the offset-free alternative path.
+    if let Err(e) = resolve_kpcr_offsets(&finder, &struct_fields, &mut offsets) {
+        eprintln!("Warning: KPCR/KPRCB PDB parse failed ({e:#}); using ABI-constant fallback");
+    }
+    if !offsets.contains_key("kpcr.prcb") {
+        use nyx_operator_kernelsdk::offsets::kpcr;
+        eprintln!(
+            "Note: _KPCR.Prcb is absent from the public PDB (struct truncated at PcrAlign1 \
+             0x118); kpcr.prcb = 0x{:x} is the x64-ABI constant, NOT PDB-verified",
+            kpcr::PRCB
+        );
+        offsets.insert("kpcr.prcb", kpcr::PRCB);
+    }
+    if !offsets.contains_key("kpcr.current_prcb") {
+        offsets.insert(
+            "kpcr.current_prcb",
+            nyx_operator_kernelsdk::offsets::kpcr::CURRENT_PRCB,
+        );
+    }
+    if !offsets.contains_key("kprcb.current_thread") {
+        offsets.insert(
+            "kprcb.current_thread",
+            nyx_operator_kernelsdk::offsets::kprcb::CURRENT_THREAD,
+        );
     }
 
     Ok(offsets)
@@ -378,7 +454,13 @@ fn resolve_etw_ti_offsets(
     }
     // Hop 3: _TRACE_ENABLE_INFO :: IsEnabled (→ 0x0, struct's first field)
     if let Some(&idx) = struct_fields.get(b"_TRACE_ENABLE_INFO".as_slice()) {
-        extract_struct_fields(finder, idx, offsets, map_trace_enable_info, "_TRACE_ENABLE_INFO")?;
+        extract_struct_fields(
+            finder,
+            idx,
+            offsets,
+            map_trace_enable_info,
+            "_TRACE_ENABLE_INFO",
+        )?;
     } else {
         anyhow::bail!("_TRACE_ENABLE_INFO not found in PDB type stream");
     }
@@ -414,6 +496,46 @@ fn map_trace_enable_info(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Resolve the KPCR/KPRCB field offsets from the PDB type stream.
+///
+///   `_KPCR::Prcb`            (→ `kpcr.prcb` — embedded _KPRCB, 0x180 on x64)
+///   `_KPCR::CurrentPrcb`     (→ `kpcr.current_prcb` — pointer, gs:[0x20])
+///   `_KPRCB::CurrentThread`  (→ `kprcb.current_thread` — KPCR+0x188)
+fn resolve_kpcr_offsets(
+    finder: &pdb::TypeFinder,
+    struct_fields: &std::collections::HashMap<&[u8], pdb::TypeIndex>,
+    offsets: &mut BTreeMap<&'static str, usize>,
+) -> Result<()> {
+    if let Some(&idx) = struct_fields.get(b"_KPCR".as_slice()) {
+        extract_struct_fields(finder, idx, offsets, map_kpcr_field, "_KPCR")?;
+    } else {
+        anyhow::bail!("_KPCR not found in PDB type stream");
+    }
+    if let Some(&idx) = struct_fields.get(b"_KPRCB".as_slice()) {
+        extract_struct_fields(finder, idx, offsets, map_kprcb_field, "_KPRCB")?;
+    } else {
+        anyhow::bail!("_KPRCB not found in PDB type stream");
+    }
+    Ok(())
+}
+
+/// Map `_KPCR` PDB field names → our TOML keys.
+fn map_kpcr_field(name: &str) -> Option<&'static str> {
+    match name {
+        "Prcb" => Some("kpcr.prcb"),
+        "CurrentPrcb" => Some("kpcr.current_prcb"),
+        _ => None,
+    }
+}
+
+/// Map `_KPRCB` PDB field names → our TOML keys.
+fn map_kprcb_field(name: &str) -> Option<&'static str> {
+    match name {
+        "CurrentThread" => Some("kprcb.current_thread"),
+        _ => None,
+    }
+}
+
 /// Map a PDB field name to our offsets.toml key. Returns None for fields we
 /// don't extract.
 fn map_eprocess_field(name: &str) -> Option<&'static str> {
@@ -425,6 +547,9 @@ fn map_eprocess_field(name: &str) -> Option<&'static str> {
         "SignatureLevel" => Some("eprocess.signature_level"),
         "SectionSignatureLevel" => Some("eprocess.section_signature_level"),
         "Protection" => Some("eprocess.protection"),
+        // Ring-0-only field the canonical ring-3 table does not carry;
+        // kernelsdk's KNOWN_EPROCESS_BUILDS holds the known-table values.
+        "Peb" => Some("eprocess.peb"),
         "DirectoryTableBase" => Some("eprocess.directory_table_base"),
         _ => None,
     }
@@ -463,17 +588,19 @@ fn format_symserver_guid(guid: &str, age: u32) -> String {
 /// BitConverter read, Data4 raw). Verified end-to-end against the live MS
 /// symbol server for 17763.1339 (GUID B02B8B6B-1856-8873-..., age 1).
 fn extract_pdb_ref_from_pe(exe_path: &std::path::Path) -> Result<(String, u32)> {
-    let bytes = std::fs::read(exe_path)
-        .with_context(|| format!("read PE {}", exe_path.display()))?;
+    let bytes =
+        std::fs::read(exe_path).with_context(|| format!("read PE {}", exe_path.display()))?;
     let pe = goblin::pe::PE::parse(&bytes)
         .with_context(|| format!("parse PE {}", exe_path.display()))?;
 
     // goblin parses the CodeView debug entry for us: codeview_pdb70_debug_info
     // holds the RSDS record's GUID (16 raw LE bytes) + age. We just format it
     // into the canonical mixed-endian hex string format_symserver_guid expects.
-    let debug_data = pe.debug_data
+    let debug_data = pe
+        .debug_data
         .ok_or_else(|| anyhow::anyhow!("PE has no debug data directory"))?;
-    let cv70 = debug_data.codeview_pdb70_debug_info
+    let cv70 = debug_data
+        .codeview_pdb70_debug_info
         .ok_or_else(|| anyhow::anyhow!("PE has no PDB 7.0 (RSDS) CodeView entry"))?;
 
     // signature is a [u8; 16] Win32 GUID in little-endian layout:
@@ -486,8 +613,13 @@ fn extract_pdb_ref_from_pe(exe_path: &std::path::Path) -> Result<(String, u32)> 
     let d3 = u16::from_le_bytes([s[6], s[7]]);
     let guid = format!(
         "{:08X}{:04X}{:04X}{}",
-        d1, d2, d3,
-        s[8..16].iter().map(|b| format!("{:02X}", b)).collect::<String>()
+        d1,
+        d2,
+        d3,
+        s[8..16]
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<String>()
     );
     Ok((guid, cv70.age))
 }
@@ -545,8 +677,8 @@ fn resolve_flt_globals_rva(fltmgr_exe: &std::path::Path) -> Result<usize> {
 
     // 2. Download fltmgr.pdb (download_pdb is parameterised by pdb_name).
     let pdb_name = "fltmgr.pdb";
-    let data = download_pdb(pdb_name, &guid, age)
-        .context("download fltmgr.pdb from symbol server")?;
+    let data =
+        download_pdb(pdb_name, &guid, age).context("download fltmgr.pdb from symbol server")?;
 
     // 3. Walk the PDB global/public symbols for `FltGlobals`.
     parse_pdb_global_rva(&data, &["FltGlobals", "_FltGlobals"])
@@ -575,9 +707,7 @@ fn parse_pdb_global_rva(data: &[u8], names: &[&str]) -> Result<usize> {
         .ok_or_else(|| anyhow!("PDB has no section table (corrupt or stripped)?"))?;
     eprintln!("Loaded {} PE sections from PDB", sections.len());
 
-    let symbols = pdb
-        .global_symbols()
-        .context("read global_symbols stream")?;
+    let symbols = pdb.global_symbols().context("read global_symbols stream")?;
     let mut iter = symbols.iter();
     while let Some(symbol) = iter.next().with_context(|| "iterate PDB symbols")? {
         if let Ok(pdb::SymbolData::Public(pub_data)) = symbol.parse() {
@@ -625,18 +755,48 @@ fn parse_pdb_global_rva(data: &[u8], names: &[&str]) -> Result<usize> {
 /// other build returns `None` — no range/floor matching, so an unverified
 /// build cannot silently bake a guessed offset into the TOML.
 fn emit_known_offsets(build: u32) -> Option<BTreeMap<&'static str, usize>> {
+    use nyx_operator_kernelsdk::offsets as k;
+
     let off = nyx_implant_evasionsdk::offsets_table::for_build(build)?;
+    // Ring-0-only knowledge the canonical ring-3 table deliberately does not
+    // carry: EPROCESS.Peb comes from the operator-side kernelsdk table
+    // (PDB-verified for 19041/22621 in the pg-pdb-verify pass). `off.build` is
+    // the resolved baseline build (patch-equivalent builds resolve first).
+    let k_ep = k::for_build(off.build)?;
     let mut m = BTreeMap::new();
     m.insert("eprocess.unique_process_id", off.eprocess.unique_process_id);
-    m.insert("eprocess.active_process_links", off.eprocess.active_process_links);
+    m.insert(
+        "eprocess.active_process_links",
+        off.eprocess.active_process_links,
+    );
     m.insert("eprocess.token", off.eprocess.token);
     m.insert("eprocess.image_file_name", off.eprocess.image_file_name);
     m.insert("eprocess.signature_level", off.eprocess.signature_level);
-    m.insert("eprocess.section_signature_level", off.eprocess.section_signature_level);
+    m.insert(
+        "eprocess.section_signature_level",
+        off.eprocess.section_signature_level,
+    );
     m.insert("eprocess.protection", off.eprocess.protection);
-    m.insert("etw_ti.guid_entry_to_provider_block", off.etw_ti.guid_entry_to_provider_block);
-    m.insert("etw_ti.provider_block_to_enable_info", off.etw_ti.provider_block_to_enable_info);
-    m.insert("etw_ti.is_enabled_within_enable_info", off.etw_ti.is_enabled_within_enable_info);
+    m.insert("eprocess.peb", k_ep.offsets.peb);
+    m.insert(
+        "etw_ti.guid_entry_to_provider_block",
+        off.etw_ti.guid_entry_to_provider_block,
+    );
+    m.insert(
+        "etw_ti.provider_block_to_enable_info",
+        off.etw_ti.provider_block_to_enable_info,
+    );
+    m.insert(
+        "etw_ti.is_enabled_within_enable_info",
+        off.etw_ti.is_enabled_within_enable_info,
+    );
+    // x64-ABI-frozen KPCR/KPRCB constants — `current_prcb`/`current_thread`
+    // PDB-verified (19041/22621), `prcb` ABI/Vergilius-only (the public PDB
+    // truncates _KPCR). Same values the PDB-parse path emits, so both paths
+    // produce the same TOML.
+    m.insert("kpcr.prcb", k::kpcr::PRCB);
+    m.insert("kpcr.current_prcb", k::kpcr::CURRENT_PRCB);
+    m.insert("kprcb.current_thread", k::kprcb::CURRENT_THREAD);
     Some(m)
 }
 
@@ -680,38 +840,31 @@ mod tests {
             let row = emit_known_offsets(build)
                 .unwrap_or_else(|| panic!("emit_known_offsets misses build {build}"));
             assert_eq!(
-                row["eprocess.unique_process_id"],
-                ev_off.eprocess.unique_process_id,
+                row["eprocess.unique_process_id"], ev_off.eprocess.unique_process_id,
                 "pid row mismatch for build {build}"
             );
             assert_eq!(
-                row["eprocess.active_process_links"],
-                ev_off.eprocess.active_process_links,
+                row["eprocess.active_process_links"], ev_off.eprocess.active_process_links,
                 "links row mismatch for build {build}"
             );
             assert_eq!(
-                row["eprocess.token"],
-                ev_off.eprocess.token,
+                row["eprocess.token"], ev_off.eprocess.token,
                 "token row mismatch for build {build}"
             );
             assert_eq!(
-                row["eprocess.image_file_name"],
-                ev_off.eprocess.image_file_name,
+                row["eprocess.image_file_name"], ev_off.eprocess.image_file_name,
                 "image row mismatch for build {build}"
             );
             assert_eq!(
-                row["eprocess.signature_level"],
-                ev_off.eprocess.signature_level,
+                row["eprocess.signature_level"], ev_off.eprocess.signature_level,
                 "sig-level row mismatch for build {build}"
             );
             assert_eq!(
-                row["eprocess.section_signature_level"],
-                ev_off.eprocess.section_signature_level,
+                row["eprocess.section_signature_level"], ev_off.eprocess.section_signature_level,
                 "sec-sig-level row mismatch for build {build}"
             );
             assert_eq!(
-                row["eprocess.protection"],
-                ev_off.eprocess.protection,
+                row["eprocess.protection"], ev_off.eprocess.protection,
                 "protection row mismatch for build {build}"
             );
             assert_eq!(
@@ -740,12 +893,143 @@ mod tests {
     #[test]
     fn emit_known_offsets_resolves_only_canonical_builds() {
         // Canonical exact + patch-equivalent builds resolve.
-        for &b in &[17763, 18362, 19041, 19045, 20348, 22000, 22621, 22631, 26100, 26200] {
-            assert!(emit_known_offsets(b).is_some(), "canonical build {b} must resolve");
+        for &b in &[
+            17763, 18362, 19041, 19045, 20348, 22000, 22621, 22631, 26100, 26200,
+        ] {
+            assert!(
+                emit_known_offsets(b).is_some(),
+                "canonical build {b} must resolve"
+            );
         }
         // Non-canonical builds (incl. formerly range-matched ones) do not.
         for &b in &[10240, 14393, 19000, 21000, 22632, 26300, 26999] {
-            assert!(emit_known_offsets(b).is_none(), "non-canonical build {b} must NOT resolve");
+            assert!(
+                emit_known_offsets(b).is_none(),
+                "non-canonical build {b} must NOT resolve"
+            );
         }
+    }
+
+    /// The ring-0-only offsets `emit_known_offsets` emits (EPROCESS.Peb + the
+    /// KPCR/KPRCB constants) must agree with the operator-side kernelsdk
+    /// table — the same values the ring-0 kits consume. They are sourced from
+    /// kernelsdk directly, so this pins the TOML key mapping + build→row
+    /// resolution rather than the values (identical by construction); the
+    /// ground-truth check is the live PDB run (pg-pdb-verify, 2026-08: the
+    /// 19041 + 22621 ntkrnlmp.pdb parses matched these tables).
+    #[test]
+    fn emit_known_offsets_ring0_rows_agree_with_kernelsdk() {
+        use nyx_operator_kernelsdk::offsets as k;
+
+        for &(build, _patched) in ev::known_builds() {
+            let row = emit_known_offsets(build)
+                .unwrap_or_else(|| panic!("emit_known_offsets misses build {build}"));
+            let k_ep = k::for_build(build)
+                .unwrap_or_else(|| panic!("kernelsdk EPROCESS table misses build {build}"));
+
+            // All 8 EPROCESS fields — including Peb (kernelsdk-only knowledge).
+            assert_eq!(
+                row["eprocess.unique_process_id"], k_ep.offsets.unique_process_id,
+                "pid mismatch for build {build}"
+            );
+            assert_eq!(
+                row["eprocess.active_process_links"], k_ep.offsets.active_process_links,
+                "links mismatch for build {build}"
+            );
+            assert_eq!(
+                row["eprocess.token"], k_ep.offsets.token,
+                "token mismatch for build {build}"
+            );
+            assert_eq!(
+                row["eprocess.image_file_name"], k_ep.offsets.image_file_name,
+                "image mismatch for build {build}"
+            );
+            assert_eq!(
+                row["eprocess.signature_level"], k_ep.offsets.signature_level,
+                "sig-level mismatch for build {build}"
+            );
+            assert_eq!(
+                row["eprocess.section_signature_level"], k_ep.offsets.section_signature_level,
+                "sec-sig-level mismatch for build {build}"
+            );
+            assert_eq!(
+                row["eprocess.protection"], k_ep.offsets.protection,
+                "protection mismatch for build {build}"
+            );
+            assert_eq!(
+                row["eprocess.peb"], k_ep.offsets.peb,
+                "peb mismatch for build {build}"
+            );
+
+            // KPCR/KPRCB ABI constants — identical for every build.
+            assert_eq!(row["kpcr.prcb"], k::kpcr::PRCB);
+            assert_eq!(row["kpcr.current_prcb"], k::kpcr::CURRENT_PRCB);
+            assert_eq!(row["kprcb.current_thread"], k::kprcb::CURRENT_THREAD);
+        }
+    }
+
+    /// Diagnostic (manual): dump every member of `_KPCR` / `_KPRCB` from a
+    /// local PDB. Run with:
+    ///   NYX_PDB=/path/to/ntkrnlmp.pdb cargo test -- --ignored dump_kpcr_members --nocapture
+    #[test]
+    #[ignore]
+    fn dump_kpcr_members() {
+        use pdb::{FallibleIterator, TypeData};
+        let path = std::env::var("NYX_PDB").expect("set NYX_PDB to a ntkrnlmp.pdb");
+        let data = std::fs::read(path).unwrap();
+        let cursor = std::io::Cursor::new(data);
+        let mut pdb = pdb::PDB::open(cursor).unwrap();
+        let type_info = pdb.type_information().unwrap();
+        let mut iter = type_info.iter();
+        let mut finder = type_info.finder();
+        let mut found: std::collections::HashMap<String, pdb::TypeIndex> =
+            std::collections::HashMap::new();
+        while let Ok(Some(item)) = iter.next() {
+            if let Ok(TypeData::Class(ref c)) = item.parse() {
+                let name = c.name.to_string().into_owned();
+                if (name == "_KPCR" || name == "_KPRCB") && !found.contains_key(&name) {
+                    if let Some(fields) = c.fields {
+                        found.insert(name, fields);
+                    }
+                }
+            }
+            finder.update(&iter);
+        }
+        for (name, fields_index) in &found {
+            println!("== {name} ==");
+            if let Ok(item) = finder.find(*fields_index) {
+                if let Ok(TypeData::FieldList(fl)) = item.parse() {
+                    for field in &fl.fields {
+                        if let TypeData::Member(m) = field {
+                            println!("  {} @ 0x{:x}", m.name, m.offset);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!found.is_empty());
+    }
+
+    /// Pin the pg-pdb-verify (2026-08) ground truth: the values parsed from
+    /// the real MS symbol-server `ntkrnlmp.pdb` for 19041 + 22621. If a table
+    /// edit regresses these, the TOML a `--build`-only run bakes goes back to
+    /// being silently wrong.
+    #[test]
+    fn emit_known_offsets_matches_pdb_ground_truth() {
+        // _EPROCESS.Peb @ 0x550 on both 19041 and 22621 (PDB-parsed).
+        assert_eq!(emit_known_offsets(19041).unwrap()["eprocess.peb"], 0x550);
+        assert_eq!(emit_known_offsets(22621).unwrap()["eprocess.peb"], 0x550);
+        // KPCR/KPRCB: CurrentPrcb + CurrentThread PDB-parsed on both builds;
+        // Prcb is the ABI constant (public PDB truncates _KPCR at 0x118).
+        assert_eq!(emit_known_offsets(19041).unwrap()["kpcr.prcb"], 0x180);
+        assert_eq!(
+            emit_known_offsets(19041).unwrap()["kpcr.current_prcb"],
+            0x20
+        );
+        assert_eq!(
+            emit_known_offsets(19041).unwrap()["kprcb.current_thread"],
+            0x08
+        );
+        assert_eq!(emit_known_offsets(22621).unwrap()["kpcr.prcb"], 0x180);
     }
 }
