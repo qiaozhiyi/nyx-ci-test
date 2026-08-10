@@ -81,7 +81,8 @@ bootstrap_chain() → Priority 1: KslD.sys (Living off the Defender)
 | Build | PID offset | Links offset | Protection offset |
 |---|---|---|---|
 | 17763 (Server 2019) | 0x2e0 | 0x2e8 | 0x6ca |
-| 18362-19045 (Win10) | 0x2e8 | 0x2f0 | 0x6fa |
+| 18362 (Win10 1909) | 0x2e8 | 0x2f0 | 0x6fa |
+| 19041-19045 (Win10 2004-22H2) | 0x440 | 0x448 | 0x878 |
 | 20348/22000 | 0x440 | 0x448 | 0x87a |
 | 22621/22631 (Win11) | 0x440 | 0x448 | 0x87a |
-| 26100/26200 (Win11 24H2/25H2) | 0x450 | 0x458 | 0x87e |
+| 26100/26200 (Win11 24H2/25H2) | 0x1d0 | 0x1d8 | 0x5fa |

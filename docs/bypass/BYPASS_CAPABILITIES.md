@@ -388,10 +388,11 @@ FrameList → RegisteredFilters`，把目标 EDR 过滤器（如 WdFilter）从�
 | Build | 版本 | PID offset | Protection offset |
 |---|---|---|---|
 | 17763 | Server 2019 / 1809 | 0x2e0 | 0x6ca |
-| 18362-19045 | Win10 19H1-22H2 | 0x2e8 | 0x6fa |
+| 18362 | Win10 1909 | 0x2e8 | 0x6fa |
+| 19041-19045 | Win10 2004-22H2 | 0x440 | 0x878 |
 | 20348/22000 | Server 2022 / Win11 21H2 | 0x440 | 0x87a |
 | 22621/22631 | Win11 22H2/23H2 | 0x440 | 0x87a |
-| 26100/26200 | Win11 24H2/25H2 | 0x450 | 0x87e |
+| 26100/26200 | Win11 24H2/25H2 | 0x1d0 | 0x5fa |
 
 **真机验证：** Server 2019 build_number=17763 + CET=off ✅（`IsProcessorFeaturePresent(41)` 真实探测）
 

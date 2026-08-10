@@ -292,10 +292,11 @@ cargo run --manifest-path crates\offset-resolver\Cargo.toml -- --pdb-path ntkrnl
 | Build | 版本 | EPROCESS.PID | Protection | ETW-TI EnableInfo |
 |---|---|---|---|---|
 | 17763 | Server 2019 / 1809 | 0x2e0 | 0x6ca | 0x060 (UBR<1075: 0x050) |
-| 18362-19045 | Win10 19H1-22H2 | 0x2e8 | 0x6fa | 0x060 |
+| 18362 | Win10 1909 | 0x2e8 | 0x6fa | 0x060 |
+| 19041-19045 | Win10 2004-22H2 | 0x440 | 0x878 | 0x060 |
 | 20348/22000 | Server 2022 / Win11 21H2 | 0x440 | 0x87a | 0x060 |
-| 22621/22631 | Win11 22H2/23H2 | 0x440 | 0x87a | 0x070 |
-| 26100/26200 | Win11 24H2/25H2 | 0x450 | 0x87e | 0x070 |
+| 22621/22631 | Win11 22H2/23H2 | 0x440 | 0x87a | 0x060 |
+| 26100/26200 | Win11 24H2/25H2 | 0x1d0 | 0x5fa | 0x060 |
 
 ### 两层 offset 解析
 

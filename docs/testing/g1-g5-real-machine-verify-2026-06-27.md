@@ -169,7 +169,7 @@ implant 的 indirect-syscall / HWBP-VEH / PEB-walk 原语被拦。这不是 impl
 | implant 在 26100 编译无回归 | ✅ |
 | operator-kernelsdk 在 Windows 编译（修 1 bug） | ✅ |
 | CET 探测逻辑跑通（IsProcessorFeaturePresent(41)） | ✅（返回 False——CPU 无 CET） |
-| offset 跨版本（26100 表已就绪，PID 0x450/Links 0x458/Protection 0x87e） | 🟡 表就绪，PDB 提取受限待补 |
+| offset 跨版本（26100 表已就绪，PID 0x1d0/Links 0x1d8/Protection 0x5fa） | 🟡 表就绪，PDB 提取受限待补 |
 | selftest 在 26100 | 🟡 全 TIMEOUT（runner 姿态严，非 implant bug） |
 | HVCI-on / VBS 默认行为 | ❌ GitHub runner 不支持嵌套虚拟化 |
 | CET 硬件 `#CP` 触发 | ❌ runner CPU (EPYC 7763) 无 CET |

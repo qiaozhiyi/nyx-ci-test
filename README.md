@@ -28,7 +28,7 @@
 | **Windows PIC 植入体** | 29,202 LOC `no_std` DLL;**28** Command 全派发;间接 syscall;9 通道(5 直连 + 4 ExtC2 中转);Module Stomping + ThreadlessInject + Pool Party;HWBP patchless blind;CFG 用户态 bitmap;LACUNA/insomniac/caller-spoof/proxy-veh scanner | ✅ 核心链路完整;**睡眠混淆条件接线**(见已知限制) |
 | **内核层 SDK** | BYOVD(Shield/RTCore64/Iqvw64e 可用,WDTKernel 物理内存 stub);ETW-TI blind(4-hop);DKOM 进程隐藏;回调中和+重定向;MiniFilter 解链;PPL stripper;CFG bitmap;LSASS 内核读;minidump 组装;ETW 事件伪造 | ✅ 算法完整 + mock 测试;PatchGuard 偏移未验证 |
 | **操作端** | Tauri 2 + React + Three.js 桌面 GUI(3D 网络拓扑 + 语义化命令 + 结构化输出);REST API;2s 轮询增量更新 | ✅ 可用(2026-07-17 接入全部 server 端点);无会话元数据 overlay |
-| **脚本 / 扩展** | Rhai 脚本(3 event,资源配额);Malleable C2 profile(c2lint);BOF(CS ABI `go(args,alen)`,W^X 加载,`BeaconPrintf` + kernel32/ntdll externals 表) | ✅ 脚本可用 / 🟡 BOF 兼容面仍窄 |
+| **脚本 / 扩展** | Rhai 脚本(3 event,资源配额);Malleable C2 profile(c2lint);BOF(CS ABI `go(args,alen)`,W^X 加载,Beacon API 族:`BeaconPrintf`/`BeaconOutput` + datap 解析族 + `BeaconIsAdmin`/`BeaconGetSpawnTo` + kernel32/ntdll externals 表) | ✅ 脚本可用 / ✅ BOF 核心 API 已扩面(token/spawn/inject 类未接) |
 | **传输层** | 6 个 `Transport` trait impl（Malleable/DoH/Slack/LLM/MCP/SMB）+ JA3/JA4 计算 | ✅ 4 个 extc2 中继（Slack/LLM/Discord/MCP）全接 boot-time `TransportStack`；DoH 权威应答器、SMB/TCP pivot 父监听已落地（2026-08-03 接线波次） |
 
 ---
@@ -76,7 +76,7 @@ crates/
 │   ├── src-tauri/src/     #   Rust 后端 (~613 LOC, 12 #[tauri::command])
 │   └── src/               #   前端 (~4,500 LOC ts/tsx, 含 1001 LOC 拓扑场景)
 ├── agent-dev/             # macOS/Linux 开发验证植入体 (1,181 LOC, 完整协议循环)
-├── bof-runner/            # BOF 加载器 (1,564 LOC, CS ABI + kernel32/ntdll externals 表)
+├── bof-runner/            # BOF 加载器 (CS ABI + Beacon API 族(datap/IsAdmin/GetSpawnTo/Output) + kernel32/ntdll externals 表)
 ├── coff/                  # COFF/AMD64 解析 + 重定位 (365 LOC)
 ├── evasion/               # syscall 解析 (Hell/Halo/Tartarus Gate, 264 LOC)
 ├── implant-evasionsdk/    # 植入体逃避算法库 (2,028 LOC, 5/9 trait 有 live impl)
@@ -102,7 +102,7 @@ crates/
 | GUI 命令(已解析) | 36 | `client-ui-web/src/components/CommandInput.tsx` |
 | server 路由 | 14 静态 + 7 beacon + 6 kernel(条件) + 动态 profile | `server/src/lib.rs:716-779` |
 | BYOVD 驱动 | 3 可用 + 1 stub | `operator-kernelsdk/src/byovd_drivers/` |
-| Windows build 覆盖 | 8 已知行 + 6 patch-equiv 映射 = 5 distinct layouts | `implant-evasionsdk/src/offsets_table.rs` |
+| Windows build 覆盖 | 8 已知行 + 6 patch-equiv 映射 = 4 distinct layouts | `implant-evasionsdk/src/offsets_table.rs` |
 
 ---
 
@@ -262,7 +262,7 @@ download <remote>       下载(64KB 分块)
 
 ```
 shell <cmd>             cmd.exe /c 或 sh -c
-bof <hex> [args...]     BOF 执行(CS ABI,args 透传,BeaconPrintf + kernel32/ntdll externals)
+bof <hex> [args...]     BOF 执行(CS ABI,args 透传,Beacon API 族 + kernel32/ntdll externals)
 bof <hex> isolate [...] 隔离 BOF:牺牲子进程 bof-host 执行,崩溃不拖垮 beacon(等价 bof-iso <hex> [...])
 exit                    退出 implant
 getuid                  当前用户
@@ -315,7 +315,7 @@ trex                    T-REX EDR 评估分级
     --fltmgr C:\Windows\System32\drivers\fltmgr.sys --build 17763 --out flt.toml)
 ```
 
-无 PDB 时回退到内置偏移表(`implant-evasionsdk/src/offsets_table.rs`,8 个已知 build 号 + 6 个 patch-equivalent 映射 = 5 种 distinct EPROCESS/ETW 布局;22631=22621、26200=26100、18362=19041 共享布局)。
+无 PDB 时回退到内置偏移表(`implant-evasionsdk/src/offsets_table.rs`,8 个已知 build 号 + 6 个 patch-equivalent 映射 = 4 种 distinct EPROCESS/ETW 布局;19041=20348=22000=22621=22631、26200=26100 共享布局)。
 
 ---
 
@@ -389,7 +389,7 @@ gh workflow run b3-verify.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
 | **caller-spoof** | 🟡 **已实现(受限交付)** | `call_with_spoofed_return!` 宏 + 函数形式已存在(`caller_spoof.rs:464-499`);CET 探测自门:检测到 CET 时降级 `call_plain`(`caller_spoof.rs:36-41,212-229`)。 |
 | **proxy_veh 注册路径** | 🟡 未用 | `register_section_backed_handler` 完整实现(KnownDlls SEC_IMAGE + code cave trampoline),但 HWBP 路径直接用 `AddVectoredExceptionHandler`。gadgets 扫描后未消费。 |
 | **Pool Party 注入** | 🟡 完整但默认 OFF(受限交付) | `tp.rs` 全实现(section 投递 + worker-factory 劫持 + `_TP_DIRECT` splice),仅 `NYX_POOL_PARTY_ON=1 && method=0 && pid!=0` 时触发。本次修复 `SYSTEM_HANDLE_INFORMATION_EX` 布局(count@0/stride 0x28/handle@0x10/pid@0x08)+ synthetic-buffer 测试。 |
-| **BOF 兼容面** | 🟡 **受限交付(已扩面)** | externals 表扩展:BeaconPrintf + `GetModuleHandleA/GetProcAddress` 解析的 kernel32/ntdll 常用导出(`bof-runner/src/win.rs:409-414`);W^X:代码段 reloc 后 `VirtualProtect(RX)` 再 `go()`(`lib.rs:14-19`);CS ABI `go(args,alen)` + NULL fallback(`win.rs:489-498`);内存经 RAII guard 于 `go()` 返回后释放(`win.rs:455-459`)。Beacon API 面仍限于 BeaconPrintf(无 BeaconDataParse/BeaconIsAdmin 等),多数社区 BOF 仍可能 `Unresolved`。 |
+| **BOF 兼容面** | 🟡 **受限交付(Beacon API 已扩面)** | Beacon API 面:`BeaconPrintf`/`BeaconOutput` + `datap` 解析族(`BeaconDataParse`/`BeaconDataInt`/`BeaconDataShort`/`BeaconDataLength`/`BeaconDataExtract`,misaligned 安全)+ `BeaconIsAdmin`(advapi32 TokenElevation)+ `BeaconGetSpawnTo`(`bof-runner/src/shim.rs`,`layout::BEACON_APIS` 注册);+ `GetModuleHandleA/GetProcAddress` 解析的 kernel32/ntdll 常用导出(`bof-runner/src/win.rs`);W^X:代码段 reloc 后 `VirtualProtect(RX)` 再 `go()`;CS ABI `go(args,alen)` + NULL fallback;内存经 RAII guard 于 `go()` 返回后释放。wine64 实测:datap 全 API 解析回显正确、admin/spawn/raw 输出正确、未实现 API 报 `unresolved external symbol` 带名报错(2026-08-10)。仍未接:token/spawn/inject 类(`BeaconUseToken`/`BeaconSpawnTemporaryProcess`/`BeaconInjectProcess` 等)。 |
 | **WfpKit(内核)** | 🔴 装配但永失败 | `netsec.rs:block_outbound_for_pid` 永返 Err(拒绝零条件 filter);`assemble_tier` 设 `wfp: None`。**注:implant-win 中无任何 WFP 代码**(grep 零命中)。 |
 | **PatchGuard bypass** | 🟡 偏移未验证 | `persistence.rs:550-720` 用 valid_flag 置零法,偏移 `prcb_pg_thread=0x190`/`valid=0x08` 代码自标需 PDB 验证。非 Outflank Peekaboo 法。 |
 | **EdrNeutralizer::kill** | 🟡 仅 resolve | 只解析 EPROCESS KVA,不终止目标进程。 |
@@ -431,7 +431,7 @@ gh workflow run b3-verify.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
 
 - **睡眠混淆默认化** — `kits::sleep` 已条件接线(evasion+enabled 时走 `fluctuation::sleep`,`kits.rs:75-81`);待办:noevasion 模式下的安全掩码(helper-thread `.text` 掩码恢复,`mem.rs:249-253`)。
 - **nyx-loader UDRL 强化** — 真实 layer-2 已交付并经真机验证(`crates/loader-probe-exe` CreateThread 探针 + DllMain marker,2026-08-02);待办:PE 头擦除、`.pdata` 处理、section 权限收敛、分段投递(Stage0→Stage1→Stage2,对齐 CS UDRL 生态)。
-- **BOF API 扩面** — 接入 `BeaconDataParse`/`BeaconIsAdmin`/`BeaconGetSpawnTo` 等,提升社区 BOF 兼容性(页释放已由 RAII guard 完成,`win.rs:455-459`)。
+- **BOF API 扩面(剩余)** — datap 解析族/`BeaconIsAdmin`/`BeaconGetSpawnTo`/`BeaconOutput` 已交付并经 wine64 实测(2026-08-10,`bof-runner/src/shim.rs`);待办:token/spawn/inject 类(`BeaconUseToken`/`BeaconSpawnTemporaryProcess`/`BeaconInjectProcess`/`BeaconFormatAlloc` 等)与 spawn-to 可配置化。
 - **transport/ 剩余 4 通道接线** — Slack/MCP 已接 server 中转(boot-time `TransportStack`,`extc2_relay.rs`);待办:malleable/doh_dns/llm_api/smb_pipe 接 server 路由。implant 侧保持自滚通道(no_std PIC 设计,非目标)。
 - **TLS 指纹 emitter 落地** — `impersonation` feature 已提供 BoringSSL(`wreq`)实现(`fingerprint.rs:201-211`);待办:接入 server 出站链路并在默认构建启用。
 - **PatchGuard 偏移验证** — 用 PDB 校验 PRCB/context 偏移,或改用 Outflank Peekaboo 时序法。
