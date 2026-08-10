@@ -299,10 +299,24 @@ fn ja4_a(ch: &ClientHello) -> String {
         .filter(|(t, _)| !is_grease(*t))
         .count()
         .min(99);
+    // ALPN field: 2 ASCII bytes, taken from the lossy-decoded string's
+    // UTF-8 bytes (never chars — multibyte scalars would break the fixed
+    // 10-char width). One byte pads with '0'; none falls back to "00".
     let alpn = ch
         .alpn
         .as_deref()
-        .map(|a| a.chars().take(2).collect::<String>())
+        .map(|a| {
+            let mut s: String = a
+                .bytes()
+                .filter(|b| b.is_ascii())
+                .take(2)
+                .map(char::from)
+                .collect();
+            if s.len() == 1 {
+                s.push('0');
+            }
+            s
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "00".to_string());
     format!("t{ver}{sni}{ncs:02}{nex:02}{alpn}")
@@ -351,8 +365,10 @@ fn ja4_c(ch: &ClientHello) -> String {
         'i'
     };
     exts.sort_unstable();
+    // The a/i prefix is part of the documented ja4_c shape in every case,
+    // including the empty one (bare 12 zero hex follows the prefix).
     if exts.is_empty() && ch.signature_algorithms.is_empty() {
-        "000000000000".to_string()
+        format!("{prefix}000000000000")
     } else {
         let ext_str = exts.iter().copied().map(hex4).collect::<Vec<_>>().join(",");
         let sig_str = ch
@@ -382,8 +398,13 @@ pub fn sniff_client_hello<R: std::io::Read>(
     mut r: R,
 ) -> std::io::Result<(Vec<u8>, Option<String>, Option<String>)> {
     // TLS record header: ContentType(1) Version(2) Length(2). Read header first.
+    // Streams shorter than 5 bytes replay exactly the bytes actually read —
+    // never zero-padded bytes the peer never sent.
     let mut header = [0u8; 5];
-    let _ = read_exact(&mut r, &mut header);
+    let hdr_len = read_exact(&mut r, &mut header)?;
+    if hdr_len < header.len() {
+        return Ok((header[..hdr_len].to_vec(), None, None));
+    }
     // ContentType 22 = Handshake. If it isn't, this isn't a TLS ClientHello.
     if header[0] != 22 {
         return Ok((header.to_vec(), None, None));
