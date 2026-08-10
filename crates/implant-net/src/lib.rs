@@ -24,6 +24,9 @@
 
 extern crate alloc;
 
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) mod testutil;
+
 #[cfg(target_os = "windows")]
 pub mod channels;
 #[cfg(target_os = "windows")]

