@@ -76,7 +76,9 @@ export type JsonCommand =
   | { type: 'rev2self' }
   | { type: 'getuid' }
   // execution / injection
-  | { type: 'bof'; name: string; args: string[]; data_hex: string }
+  // bof isolate (B3): run in a sacrificial bof-host child instead of inline
+  // in the beacon; optional, server default false.
+  | { type: 'bof'; name: string; args: string[]; data_hex: string; isolate?: boolean }
   | { type: 'inject'; method: number; pid: number; spawn_to: string; sc_hex: string }
   | { type: 'trex' }
   // channels / pivots

