@@ -12,6 +12,36 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-10/11 ARM64 VM 全链路实证 + 生成管线根因修复 + 任务面/GUI 修复波次 —
+Parallels Win11 ARM64（build 26100，Prism x64 仿真，中文系统，Defender 实时
+保护 ON）完成 team server → generate-implant → beacon 回家 → 用户层任务面
+全演练，全绿、0 检出（报告 `docs/testing/vm-arm64-verify-2026-08-10.md`）：
+
+- **generate-implant 死 implant 根因修复**（b94a158）：fat LTO 把
+  `NYX_CFG_PLACEHOLDER` 读取常量折叠，服务器对 `.nyx_cfg` 段的链接后补丁被
+  吞——此前 generate-implant 产出的植入体**全部回连编译期默认 127.0.0.1**。
+  `black_box` 修复 + `nyx_selftest_cfgstage` 诊断导出；同 commit 修复 getuid
+  三个 x64 ABI bug（`GetTokenInformation` class u8→u32、`LookupAccountSidW`
+  peUse 输出宽度、SID 指针指向已弹栈帧）。
+- **Prism 仿真间接 syscall 降级**（87d8ade）：ARM64 Windows x64 仿真层拒绝
+  非 ntdll stub 位点的间接 syscall（0xC000026F）；新增
+  `is_x64_emulated_on_arm64()` 探测，仿真下 syscall4/5/6/11 直调 ntdll、
+  fluctuation 降级纯 sleep。已知残留：全 evasion 入口 `nyx_entry` 仿真下仍
+  崩（noevasion 正常，真 x64 无此问题）。
+- **shell 中文输出 + 内建 cd/pwd**（dc9094c）：shell 输出 OEM/GBK→UTF-8
+  转码（中文 Windows cmd 不再乱码）；新增内建 cd/pwd（beacon 进程级持久
+  CWD，复合命令仍走 cmd）。
+- **fileop 相对路径修复**（23cf714）：`ls .`、`ls ..`、相对子目录经
+  GetFullPathNameW 预解析并跟随 beacon CWD；此前 `\??\.` 直接 0xC0000034。
+- **GUI 交互层 10 项修复**（e2f9fe9）：默认选死 beacon、跨会话 task_id 撞
+  车、drain 失败吞错、网络抖动踢人清史改横幅自动重试、截图重复解码卡死、
+  假超时阈值 120s→180s 等。
+- **GUI 文件选择器 + 结果内存治理**（ae9def4）：BOF/upload 原生文件选择器
+  （tauri-plugin-dialog + Rust `read_file_hex`）；结果内存上限每会话 300 任
+  务块 / 64MB data_hex（超出剥最旧）；u8 校验、exit 确认。
+- **GUI「文件」Dock 页**（de06636）：远程文件浏览器（路径导航/双击进目录/
+  下载/上传）。
+
 2026-08-09 B3 真机（windows-latest 24H2）全链打通 — 前一天"受限交付"的
 B3 隔离路径在真机上一轮 15 连失败，本轮以证据驱动逐层定位，修掉 6 个
 互相掩盖的 bug，windows-ci 全绿（run 31310348731：probe `BOF-PRINT-OK`

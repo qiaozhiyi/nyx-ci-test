@@ -13,6 +13,12 @@
 > - **qiling 仿真矩阵 6/6**：`nyx_selftest_env` 的 UcError 根因是新版 nightly/LLVM 的 loop-idiom recognition 发出真 `wcslen` IAT 调用而 qiling 的 ntdll stub 不导出它；`tools/selftest-qiling/runner.py` 新增 CRT IAT shim 修复。
 > - **SMB pivot 回复竞态修复**：服务端 drain 等待原为 `PeekNamedPipe` 空操作（探的是 client→server 方向），`DisconnectNamedPipe` 会丢弃客户端未读回复（flake 233）；改 `FlushFileBuffers`（`server/src/smb_listener.rs`）。
 
+> 🚀 **最新进展（2026-08-11，commit 在 `main`）**：
+> - **ARM64 VM 全链路实证**：Parallels Win11 ARM64（build 26100，Prism x64 仿真，中文系统，Defender 实时保护 ON）上完成 team server → generate-implant → beacon 回家 → 用户层任务面（shell/文件/截屏/剪贴板/keylog/portscan/BOF 内联+隔离/hashdump/getuid/trex）全绿，0 检出。报告：[`docs/testing/vm-arm64-verify-2026-08-10.md`](docs/testing/vm-arm64-verify-2026-08-10.md)。
+> - **generate-implant 死 implant 根因修复**（`b94a158`）：fat LTO 把 `.nyx_cfg` 段读取常量折叠，服务器链接后补丁被吞——此前 generate-implant 产出的植入体全部回连 127.0.0.1。`black_box` 修复，真机实证回连。
+> - **Prism 仿真降级**（`87d8ade`）：仿真拒绝非 ntdll stub 位点的间接 syscall（0xC000026F），新增仿真探测 + 直调降级；已知残留：全 evasion 入口 `nyx_entry` 仿真下仍崩（noevasion 正常，真 x64 无此问题）。
+> - **任务面 / GUI 波次**：shell OEM/GBK→UTF-8 转码 + 内建 cd/pwd（`dc9094c`）、fileop 相对路径跟随 beacon CWD（`23cf714`）、GUI 交互 10 项修复（`e2f9fe9`）、BOF/upload 原生文件选择器 + 结果内存治理（`ae9def4`）、「文件」Dock 页远程文件浏览器（`de06636`）。
+
 > 📋 **完整审计报告**:[`docs/audits/CODE_TRUTH_2026-07-18.md`](docs/audits/CODE_TRUTH_2026-07-18.md)(逐 crate 证据) · [`AUTHORITATIVE_FACTS_2026-07-18.md`](docs/audits/AUTHORITATIVE_FACTS_2026-07-18.md)(数字基准,所有文档统一来源)
 
 **实测规模**:~68,800 行 Rust · 18 workspace 成员 + 6 独立 crate · 488 `#[test]` · 46 个 selftest 导出 · 28 wire `Command` / 7 `Response` 变体。
@@ -27,7 +33,7 @@
 | **团队服务器** | tokio/axum HTTP(S);三机制鉴权(bootstrap operator / operators file / legacy token);三角色 RBAC(argon2id);会话/任务队列;SQLite 凭据+implant 库;哈希链审计;Rhai 事件脚本;Malleable C2 profile;implant 生成 | ✅ 完整(`server/src/lib.rs`,14 静态 + 动态 profile 路由) |
 | **Windows PIC 植入体** | 29,202 LOC `no_std` DLL;**28** Command 全派发;间接 syscall;9 通道(5 直连 + 4 ExtC2 中转);Module Stomping + ThreadlessInject + Pool Party;HWBP patchless blind;CFG 用户态 bitmap;LACUNA/insomniac/caller-spoof/proxy-veh scanner | ✅ 核心链路完整;**睡眠混淆条件接线**(见已知限制) |
 | **内核层 SDK** | BYOVD(Shield/RTCore64/Iqvw64e 可用,WDTKernel 物理内存 stub);ETW-TI blind(4-hop);DKOM 进程隐藏;回调中和+重定向;MiniFilter 解链;PPL stripper;CFG bitmap;LSASS 内核读;minidump 组装;ETW 事件伪造 | ✅ 算法完整 + mock 测试;PatchGuard 偏移未验证 |
-| **操作端** | Tauri 2 + React + Three.js 桌面 GUI(3D 网络拓扑 + 语义化命令 + 结构化输出);REST API;2s 轮询增量更新 | ✅ 可用(2026-07-17 接入全部 server 端点);无会话元数据 overlay |
+| **操作端** | Tauri 2 + React + Three.js 桌面 GUI(3D 网络拓扑 + 语义化命令 + 结构化输出 + 「文件」Dock 页远程文件浏览器);BOF/upload 原生文件选择器;会话元数据 overlay(本地 star/alias/tag/notes + 归属分配);REST API;2s 轮询增量更新 | ✅ 可用(2026-07-17 接入全部 server 端点) |
 | **脚本 / 扩展** | Rhai 脚本(3 event,资源配额);Malleable C2 profile(c2lint);BOF(CS ABI `go(args,alen)`,W^X 加载,Beacon API 族:`BeaconPrintf`/`BeaconOutput` + datap 解析族 + `BeaconIsAdmin`/`BeaconGetSpawnTo` + kernel32/ntdll externals 表) | ✅ 脚本可用 / ✅ BOF 核心 API 已扩面(token/spawn/inject 类未接) |
 | **传输层** | 6 个 `Transport` trait impl（Malleable/DoH/Slack/LLM/MCP/SMB）+ JA3/JA4 计算 | ✅ 4 个 extc2 中继（Slack/LLM/Discord/MCP）全接 boot-time `TransportStack`；DoH 权威应答器、SMB/TCP pivot 父监听已落地（2026-08-03 接线波次） |
 
@@ -185,7 +191,7 @@ npm install          # 首次:装前端依赖
 npm run tauri dev    # 启动(自动连 http://127.0.0.1:8443,在连接页输入 bearer)
 ```
 
-> GUI 含 3D 网络拓扑(Three.js,UnrealBloom 后处理 + 射线点击选中)、语义化命令输入、结构化任务输出、2s 增量轮询。纯前端开发(不启 Tauri 外壳):`npm run dev`。
+> GUI 含 3D 网络拓扑(Three.js,UnrealBloom 后处理 + 射线点击选中)、语义化命令输入、结构化任务输出、「文件」Dock 页远程文件浏览器(路径导航/双击进目录/下载/上传)、BOF/upload 原生文件选择器、2s 增量轮询。纯前端开发(不启 Tauri 外壳):`npm run dev`。
 
 ### 5. 服务器侧生成 implant
 
@@ -198,6 +204,8 @@ curl -X POST http://127.0.0.1:8443/api/generate-implant \
 ```
 
 服务器 patch DLL 模板(每 implant 独立 X25519 keypair + config 加密 + 一次性 auth_token),`NYX_TEMPLATE` 指向模板路径。速率限制 10/hr/target(`implant_gen.rs`)。
+
+> **产线已真机实证可用**(2026-08-10,ARM64 VM 全链路演练):此前 fat LTO 把 `.nyx_cfg` 段读取常量折叠,服务器补丁被吞,产出 implant 全部回连 127.0.0.1(死 implant);commit `b94a158` 以 `black_box` 修复,生成 implant 已在真 C2 会话实证回连。证据:[`docs/testing/vm-arm64-verify-2026-08-10.md`](docs/testing/vm-arm64-verify-2026-08-10.md) §3.1。
 
 ---
 
@@ -232,7 +240,7 @@ curl -X POST http://127.0.0.1:8443/api/generate-implant \
 
 ## GUI 命令速查
 
-操作端为 Tauri 桌面 GUI(旧 ratatui TUI / Makepad GUI 已于 commit `c5064dc` 归档)。命令输入框解析 **36 个命令**(`CommandInput.tsx:213-509`),全部映射到 `POST /api/task`。session 元数据(rename/tag/star/alias)**尚未接入 GUI**。
+操作端为 Tauri 桌面 GUI(旧 ratatui TUI / Makepad GUI 已于 commit `c5064dc` 归档)。命令输入框解析 **36 个命令**(`CommandInput.tsx:213-509`),全部映射到 `POST /api/task`;另有「文件」Dock 页远程文件浏览器(2026-08-11 `de06636`,路径导航/下载/上传,不走命令框)。会话元数据(star/alias/tag/notes 存 localStorage,归属 owner 走 `POST /api/session/owner`)已在 SessionTable 接入。
 
 ### 会话 / 侦察
 
@@ -251,17 +259,17 @@ portscan <host> <ports> TCP 端口扫描
 ### 文件操作
 
 ```
-ls [path]               目录列表
-cd / mkdir / rm         文件系统操作
+ls [path]               目录列表(相对路径经 GetFullPathNameW 预解析,跟随 beacon CWD,2026-08-11 `23cf714`)
+cd / mkdir / rm         文件系统操作(cd 设置 beacon 进程级持久 CWD)
 mv / cp                 移动 / 复制
-upload <local> <remote>   上传
+upload <local> <remote>   上传(GUI 原生文件选择器)
 download <remote>       下载(64KB 分块)
 ```
 
 ### 执行 / 权限
 
 ```
-shell <cmd>             cmd.exe /c 或 sh -c
+shell <cmd>             cmd.exe /c 或 sh -c;内建 cd/pwd(beacon 进程级持久 CWD,与 fileop 共享;复合命令仍走 cmd);中文 Windows OEM/GBK 输出自动转 UTF-8(2026-08-11 `dc9094c`)
 bof <hex> [args...]     BOF 执行(CS ABI,args 透传,Beacon API 族 + kernel32/ntdll externals)
 bof <hex> isolate [...] 隔离 BOF:牺牲子进程 bof-host 执行,崩溃不拖垮 beacon(等价 bof-iso <hex> [...])
 exit                    退出 implant
@@ -403,6 +411,7 @@ gh workflow run b3-verify.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
 | **fallback 链** | 🟡 短 | 只有 `Https → DohDns → Dns`(`channels/mod.rs:259`)。 |
 | **GUI 渲染盲点** | 🟡 部分 | `image`/`channel`/`file` 结果是占位符;`ProcessTable.tsx` 死文件;`fetch_profile` 定义但前端未调。 |
 | **Win11 25H2 真机** | 🟡 暂缓 | 需 CET+HVCI 物理机。 |
+| **ARM64 x64 仿真(Prism)** | 🟡 仿真独有限制(2026-08-11) | Win11 ARM64 的 x64 仿真层拒绝从非 ntdll 原生 stub 位点到达的间接 syscall(`0xC000026F`);已加仿真探测 + 直调 ntdll 降级(commit `87d8ade`),fluctuation 仿真下降级纯 sleep。**全 evasion 入口 `nyx_entry` 在仿真下仍崩**(evasion init 有绕开 syscall shim 直用 gadget 的路径),`noevasion` 入口正常;**真 x64 无此问题**。内核层(HVCI/PatchGuard/驱动)依旧无环境,状态不变。证据:`docs/testing/vm-arm64-verify-2026-08-10.md` §7。 |
 | **sessions 持久化** | ✅ 完整 | SQLite durability layer,boot 恢复,2026-07-16 实测重启同 id 复原;每帧持久化 `send_counter`/`last_recv`。 |
 
 ---
@@ -422,6 +431,7 @@ gh workflow run b3-verify.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
 | 同上 | **9 个 selftest 导出经控制台探针真跑**(替代 Session 0 挂死的 rundll32;`bof_isolated=7 (0b0111)`、`syscall_rt=3`、`postex=15`) | ✅(2026-08-09) |
 | 同上 | **B3 隔离 BOF 链**:`bof_print.o` 经牺牲子进程管道回传 `BOF-PRINT-OK`;注入链探针;syscall_rt 探针 | ✅(2026-08-09) |
 | Qiling 仿真(macos runner) | selftest 导出可行性矩阵 **6/6**(含修复后的 `nyx_selftest_env`) | ✅(2026-08-09) |
+| Parallels Win11 ARM64(build 26100,Prism x64 仿真,中文系统)+ Defender ON | generate-implant → beacon 回家 → 用户层任务面全演练(shell/文件双向传输/截屏/剪贴板/keylog/portscan/BOF 内联+隔离/hashdump SAM+SYSTEM/getuid/trex) | ✅(2026-08-10,0 检出;`docs/testing/vm-arm64-verify-2026-08-10.md`) |
 | Win11 25H2 CET+HVCI 物理机 | SPOOF_SWAP CET 修复缝 / HVCI 硬件触发 | 🟡 需物理机 |
 | macOS(team server + agent-dev + GUI) | 协议循环 + 操作端 | ✅(本次审计期间实测 server 运行 + 真实 beacon 会话) |
 

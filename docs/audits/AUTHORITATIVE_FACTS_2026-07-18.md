@@ -6,6 +6,15 @@
 
 ---
 
+## 2026-08-11 更新（VM 全链路实证,部分旧结论闭环）
+
+> 本小节是后续事实增补;下方 2026-07-18 正文保留为审计时点快照,硬指标数字仍以正文为基准,能力结论以本小节 + `git log` 为准。
+
+- **VM 全链路验证已完成**（2026-08-10）：Parallels Win11 ARM64（build 26100,Prism x64 仿真,中文系统,Defender 实时保护 ON）上 team server → generate-implant → beacon 回家 → 用户层任务面（shell/文件/截屏/剪贴板/keylog/portscan/BOF 内联+隔离/hashdump/getuid/trex）全绿,0 检出。报告:[`docs/testing/vm-arm64-verify-2026-08-10.md`](../testing/vm-arm64-verify-2026-08-10.md)。**意义:这是框架首次有 implant 真机回连 + 全任务面的端到端证据。**
+- **生成管线根因修复**（`b94a158`）：fat LTO 常量折叠吞掉服务器对 `.nyx_cfg` 段的链接后补丁——此前 generate-implant 产出的植入体全部回连 127.0.0.1（死 implant）。已用 `black_box` 修复并真机实证回连;同 commit 修复 getuid 三个 x64 ABI bug。凡引用「generate-implant 未经真机验证/植入体未实证回连」的旧口径,以此条为准,已闭环。
+- **Prism 仿真降级**（`87d8ade`）：ARM64 Windows x64 仿真层拒绝非 ntdll stub 位点的间接 syscall（0xC000026F）,已加仿真探测 + 直调降级。已知残留:全 evasion 入口 `nyx_entry` 仿真下仍崩（noevasion 正常）,**真 x64 无此问题**;内核层（HVCI/PatchGuard/驱动）依旧无环境,§1 内核相关结论不变。
+- **同波次任务面/GUI 修复**：shell OEM/GBK→UTF-8 转码 + 内建 cd/pwd（`dc9094c`）、fileop 相对路径跟随 beacon CWD（`23cf714`）、GUI 交互 10 项修复（`e2f9fe9`）、BOF/upload 原生文件选择器 + 结果内存治理（`ae9def4`）、「文件」Dock 页远程文件浏览器（`de06636`）。明细见 [CHANGELOG [Unreleased]](../../CHANGELOG.md#unreleased)。
+
 ## §0 硬指标（实测，2026-07-18，commit 未提交前）
 
 | 指标 | 权威值 | 测量命令 / 证据 |
