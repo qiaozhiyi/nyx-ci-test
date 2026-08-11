@@ -1,0 +1,269 @@
+/**
+ * FilesPage — 远程文件浏览器。
+ * 视觉语言与 SessionTable / CredsPage 一致:暗色 --panel 底、hover 高亮、
+ * mono 数据列,全部引用 tokens.css 变量。
+ */
+.files-page {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  min-width: 0;
+}
+
+/* ---- 顶部:标题 + 路径栏 ------------------------------------------------- */
+.fp-header {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-5) var(--sp-3);
+}
+
+.fp-title-group {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+
+.fp-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.fp-host {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.fp-pathbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.fp-path {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  border-radius: var(--r-sm);
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.1s ease;
+  font-family: inherit;
+}
+
+.fp-path:focus {
+  border-color: var(--accent-border);
+}
+
+.fp-btn {
+  height: 26px;
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-second);
+  border-radius: var(--r-sm);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.fp-btn:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.fp-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.fp-btn--accent {
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+  color: var(--accent-hov);
+}
+
+.fp-btn--accent:hover:not(:disabled) {
+  background: var(--accent-bg);
+  color: var(--accent-hov);
+}
+
+/* ---- 状态条 ------------------------------------------------------------- */
+.fp-error {
+  margin: 0 var(--sp-5) var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--danger);
+  border-radius: var(--r-sm);
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.fp-notice {
+  margin: 0 var(--sp-5) var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--r-sm);
+  background: var(--accent-bg);
+  color: var(--accent-hov);
+  font-size: 11.5px;
+}
+
+.fp-loading {
+  margin: 0 var(--sp-5) var(--sp-2);
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+/* ---- 目录表 ------------------------------------------------------------- */
+.fp-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 var(--sp-3) var(--sp-4);
+  min-height: 0;
+}
+
+.fp-table {
+  display: flex;
+  flex-direction: column;
+}
+
+.fp-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-sm);
+  font-size: 12px;
+  color: var(--text);
+  min-width: 0;
+}
+
+.fp-row--head {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--border-dim);
+  border-radius: 0;
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+
+.fp-row--dir {
+  cursor: pointer;
+}
+
+.fp-row:not(.fp-row--head):hover {
+  background: var(--hover);
+}
+
+.fp-col-name {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fp-icon {
+  flex-shrink: 0;
+  color: var(--text-faint);
+}
+
+.fp-icon--dir {
+  color: var(--accent-hov);
+}
+
+.fp-col-modified {
+  width: 160px;
+  flex-shrink: 0;
+  color: var(--text-second);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fp-col-size {
+  width: 90px;
+  flex-shrink: 0;
+  text-align: right;
+  color: var(--text-second);
+  font-size: 11px;
+}
+
+.fp-col-ops {
+  width: 56px;
+  flex-shrink: 0;
+  text-align: right;
+}
+
+.fp-op {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-second);
+  border-radius: var(--r-sm);
+  font-size: 10.5px;
+  padding: 1px var(--sp-2);
+  cursor: pointer;
+  transition: background 0.1s ease, color 0.1s ease, border-color 0.1s ease;
+}
+
+.fp-op:hover {
+  color: var(--accent-hov);
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+}
+
+/* ---- 空态 --------------------------------------------------------------- */
+.fp-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: var(--sp-7) var(--sp-5);
+  color: var(--text-second);
+  font-size: 12px;
+  gap: var(--sp-1);
+  height: 100%;
+}
+
+.fp-empty-sub {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* ---- 下载进度条 ---------------------------------------------------------- */
+.fp-downloads {
+  border-top: 1px solid var(--border-dim);
+  padding: var(--sp-2) var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fp-dl {
+  font-size: 11px;
+  color: var(--text-second);
+}
+
+.fp-dl--error {
+  color: var(--danger);
+}

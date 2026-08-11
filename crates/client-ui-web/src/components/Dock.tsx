@@ -22,6 +22,7 @@ const NAV: NavItem[] = [
   { id: 'topology', icon: '◈', label: '拓扑 — 3D beacon 图' },
   { id: 'creds', icon: '🔑', label: '凭据库' },
   { id: 'events', icon: '≡', label: '审计 / 事件日志' },
+  { id: 'files', icon: '🗀', label: '文件 — 远程文件浏览器' },
   { id: 'implant', icon: '⚙', label: 'Implant 构建器' },
   { id: 'settings', icon: '⋮', label: '设置' },
 ];

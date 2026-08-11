@@ -7,6 +7,7 @@ import { CredsPage } from './CredsPage';
 import { ImplantPage } from './ImplantPage';
 import { EventsPage } from './EventsPage';
 import { SettingsPage } from './SettingsPage';
+import { FilesPage } from './FilesPage';
 import { Dock } from '../components/Dock';
 import { TaskStoreProvider, useTaskStore } from './taskStore';
 import { disconnect, onError, onSessions } from '../lib/invoke';
@@ -18,7 +19,7 @@ import './App.css';
 const TopologyPage = lazy(() => import('./TopologyPage'));
 
 /** The surfaces reachable from the Dock. */
-export type Page = 'workspace' | 'topology' | 'creds' | 'implant' | 'events' | 'settings';
+export type Page = 'workspace' | 'topology' | 'creds' | 'implant' | 'events' | 'files' | 'settings';
 
 /**
  * App — top-level shell.
@@ -55,6 +56,8 @@ function AppInner() {
   // Sessions live at the top level: both Workspace and Topology consume them.
   const [sessions, setSessions] = useState<SessionView[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // FilesPage 直接消费选中的 SessionView(未选中时它自己显示空态)。
+  const selectedSession = sessions.find((s) => s.id === selectedId) ?? null;
 
   // Backend-level errors (auth/network) mean the team-server link is
   // degraded — NOT that the operator should be logged out. The poll loop
@@ -166,6 +169,7 @@ function AppInner() {
         {activePage === 'creds' && <CredsPage />}
         {activePage === 'implant' && <ImplantPage />}
         {activePage === 'events' && <EventsPage />}
+        {activePage === 'files' && <FilesPage session={selectedSession} />}
         {activePage === 'settings' && <SettingsPage />}
       </main>
     </div>
