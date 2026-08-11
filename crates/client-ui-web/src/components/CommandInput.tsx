@@ -18,6 +18,7 @@
  * in-progress draft; walking past the newest entry restores it.
  */
 import { useState, useRef, type KeyboardEvent, type ChangeEvent } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import type { JsonCommand, SessionView } from '../lib/types';
 import './CommandInput.css';
 
@@ -55,6 +56,10 @@ export function CommandInput({ session, onSubmit }: CommandInputProps) {
   const [value, setValue] = useState('');
   // null = editing the draft; a number = walking HISTORY at that index.
   const [histIdx, setHistIdx] = useState<number | null>(null);
+  // 「选择文件」选中的本地文件(hex 由 Rust read_file_hex 读好)。
+  const [picked, setPicked] = useState<{ name: string; hex: string } | null>(null);
+  // 解析/取值错误的明确中文提示(setchannel、screenshot 越界等)。
+  const [errMsg, setErrMsg] = useState('');
   const draftRef = useRef('');
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -62,16 +67,50 @@ export function CommandInput({ session, onSubmit }: CommandInputProps) {
   const cmdName = tokens.length > 0 ? tokens[0].toLowerCase() : '';
   const known = cmdName === '' || KNOWN_COMMANDS.includes(cmdName as (typeof KNOWN_COMMANDS)[number]);
   const opsec = OPSEC_PATTERNS.test(value);
+  const canPick = cmdName === 'bof' || cmdName === 'bof-iso' || cmdName === 'upload';
+
+  /** 「选择文件」按钮:pick_file 选路径 → read_file_hex 读 hex,填入 picked。 */
+  async function handlePick() {
+    setErrMsg('');
+    try {
+      const isBof = cmdName !== 'upload';
+      const path = await invoke<string | null>('pick_file', {
+        title: isBof ? '选择 BOF (COFF .o) 文件' : '选择要上传的文件',
+        filters: isBof ? ['o', 'obj'] : [],
+      });
+      if (!path) return; // 用户取消
+      const hex = await invoke<string>('read_file_hex', { path });
+      const name = path.split(/[\\/]/).pop() || path;
+      setPicked({ name, hex });
+      // 输入行只有命令名时,自动把文件名补成第一个参数
+      if (tokens.length === 1) setValue(`${tokens[0]} ${name} `);
+    } catch (e) {
+      setErrMsg(String(e));
+    }
+  }
 
   function handleSubmit() {
     const trimmed = value.trim();
     if (!trimmed) return;
-    const parsed = parseCommand(trimmed);
+    const parsed = parseCommand(trimmed, picked?.hex ?? null);
     if (!parsed) return; // unknown command — refuse to submit, hint already shown
+    if ('error' in parsed) {
+      setErrMsg(parsed.error);
+      return;
+    }
+    // exit 二次确认:防历史回放/误触直接杀掉 beacon
+    if (
+      parsed.command.type === 'exit' &&
+      !window.confirm(`确认向 ${session.hostname} 发送 exit?beacon 将被终止。`)
+    ) {
+      return;
+    }
+    setErrMsg('');
     pushHistory(session.id, trimmed);
     onSubmit(parsed.command, parsed.label, opsec);
     setValue('');
     setHistIdx(null);
+    setPicked(null);
   }
 
   /** Walk history: delta -1 = older entries, +1 = newer (draft past the end). */
@@ -122,6 +161,7 @@ export function CommandInput({ session, onSubmit }: CommandInputProps) {
   function handleChange(e: ChangeEvent<HTMLInputElement>) {
     setValue(e.target.value);
     setHistIdx(null); // manual edits leave history-navigation mode
+    setErrMsg('');
   }
 
   return (
@@ -170,11 +210,33 @@ export function CommandInput({ session, onSubmit }: CommandInputProps) {
         />
       </div>
 
+      {/* bof / upload 的本地文件选择条(hex 已读好,提交时进 data_hex) */}
+      {canPick && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '0 var(--sp-2)' }}>
+          <button
+            type="button"
+            className="mono"
+            style={{ fontSize: 11, padding: '2px 8px', cursor: 'pointer' }}
+            onClick={handlePick}
+          >
+            选择文件
+          </button>
+          {picked && (
+            <span className="mono" style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+              已选 {picked.name}({picked.hex.length / 2} 字节)
+            </span>
+          )}
+        </div>
+      )}
+
       <div className="cmdinput__hints">
         {!known && (
           <span className="cmdinput__hint cmdinput__hint--err">
             未知命令。常用: ping / shell / download / ls / net / screenshot / bof / channeldata / chanwrite …
           </span>
+        )}
+        {errMsg && (
+          <span className="cmdinput__hint cmdinput__hint--err">{errMsg}</span>
         )}
         {opsec && (
           <span className="cmdinput__hint cmdinput__hint--opsec">
@@ -193,9 +255,16 @@ export interface ParsedCommand {
   label: string;
 }
 
+/** 解析失败但原因明确(参数越界等)时返回的报错,UI 直接展示。 */
+export interface ParseError {
+  error: string;
+}
+
 /**
  * Parse a raw input line into a JsonCommand + display label.
- * Returns null for unknown / malformed commands (caller shows a hint).
+ * Returns null for unknown commands (caller shows the unknown hint),
+ * a ParseError for recognized-but-invalid args (caller shows the message).
+ * pickedHex:「选择文件」读到的本地文件 hex,bof / upload 用来填 data_hex。
  *
  * Grammar (recognized names = KNOWN_COMMANDS; representative forms):
  *   ping
@@ -210,7 +279,10 @@ export interface ParsedCommand {
  *   bof <name> [isolate] [args...] / channeldata <chan> <hex> /
  *   chanwrite <chan> <text...>  (see the switch below for the rest)
  */
-export function parseCommand(line: string): ParsedCommand | null {
+export function parseCommand(
+  line: string,
+  pickedHex: string | null = null,
+): ParsedCommand | ParseError | null {
   const trimmed = line.trim();
   if (!trimmed) return null;
   const parts = trimmed.split(/\s+/);
@@ -289,9 +361,14 @@ export function parseCommand(line: string): ParsedCommand | null {
     // --- recon / collection ---
     case 'screenshot': {
       const monitor = args.length > 0 ? parseInt(args[0], 10) : 0;
+      const m = Number.isFinite(monitor) ? monitor : 0;
+      // Server field is monitor: u8 — 越界直接中文报错,别让 server 400。
+      if (m < 0 || m > 255) {
+        return { error: `screenshot 的 monitor 必须在 0-255 之间(收到 ${args[0]})` };
+      }
       return {
-        command: { type: 'screenshot', monitor: Number.isFinite(monitor) ? monitor : 0 },
-        label: `screenshot ${monitor}`,
+        command: { type: 'screenshot', monitor: m },
+        label: `screenshot ${m}`,
       };
     }
 
@@ -377,16 +454,18 @@ export function parseCommand(line: string): ParsedCommand | null {
       // bof <name> [args...] | bof <name> isolate [args...] | bof-iso <name> [args...]
       // `isolate` (B3): run the BOF in a sacrificial bof-host child instead of
       // inline in the beacon — a crashed BOF kills the child, not the beacon.
-      // data_hex empty (BOF upload via separate flow).
+      // data_hex 来自「选择文件」读到的 COFF;未选则空串(旧行为,implant 会失败,
+      // 由下方报错拦截)。
       if (args.length === 0) return null;
+      if (!pickedHex) return { error: 'bof 需要 COFF 文件:先点「选择文件」选中 .o' };
       const isolate = name === 'bof-iso' || args[1] === 'isolate';
       const bofArgs = args[1] === 'isolate' ? args.slice(2) : args.slice(1);
       return {
         command: {
-          type: 'bof', name: args[0], args: bofArgs, data_hex: '',
+          type: 'bof', name: args[0], args: bofArgs, data_hex: pickedHex,
           ...(isolate ? { isolate: true } : {}),
         },
-        label: `${isolate ? 'bof-iso' : 'bof'} ${args[0]}`,
+        label: `${isolate ? 'bof-iso' : 'bof'} ${args[0]} (${pickedHex.length / 2} bytes)`,
       };
     }
 
@@ -414,6 +493,10 @@ export function parseCommand(line: string): ParsedCommand | null {
       if (args.length === 0) return null;
       const ch = parseInt(args[0], 10);
       if (!Number.isFinite(ch)) return null;
+      // Server field is channel: u8 — 越界直接中文报错,别让 server 400。
+      if (ch < 0 || ch > 255) {
+        return { error: `setchannel 的 channel 必须在 0-255 之间(收到 ${ch})` };
+      }
       return { command: { type: 'setchannel', channel: ch }, label: `setchannel ${ch}` };
     }
 
@@ -493,12 +576,14 @@ export function parseCommand(line: string): ParsedCommand | null {
       return { command: { type: 'channelclose', chan }, label: `channelclose ${chan}` };
     }
 
-    // --- file upload (hex data inline; for GUI file-picker upload see upload button) ---
+    // --- file upload (hex data inline, or via the「选择文件」button) ---
     case 'upload': {
-      // upload <name> <hex_data>
-      if (args.length < 2) return null;
+      // upload <name> [hex_data] —— 手贴 hex 优先(现有路径);没贴则用
+      // 「选择文件」读到的 hex;两者都没有则明确报错。
+      if (args.length === 0) return null;
       const name = args[0];
-      const data_hex = args.slice(1).join('');
+      const data_hex = args.slice(1).join('') || pickedHex || '';
+      if (!data_hex) return { error: 'upload 需要数据:手贴 hex 或点「选择文件」' };
       return {
         command: { type: 'upload', name, data_hex },
         label: `upload ${name} (${data_hex.length / 2} bytes)`,

@@ -15,16 +15,26 @@ export function ConnectPage({ onConnected, error: externalError }: ConnectPagePr
   const [bearer, setBearer] = useState('');
   const [loading, setLoading] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  // 外部错误（如掉线）是 prop 无法直接清掉；记录已确认的值，点开始连接或
+  // 修改输入后不再显示，直到 shell 推来一个不同的新错误。
+  const [dismissedError, setDismissedError] = useState<string | null>(null);
 
   // A local connect failure takes precedence over a shell-supplied error.
-  const error = localError ?? externalError;
+  const shownExternal =
+    externalError && externalError !== dismissedError ? externalError : null;
+  const error = localError ?? shownExternal;
   const canSubmit = !loading && server.trim().length > 0 && bearer.trim().length > 0;
+
+  function dismissExternal() {
+    if (externalError) setDismissedError(externalError);
+  }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     if (!canSubmit) return;
     setLoading(true);
     setLocalError(null);
+    dismissExternal();
     try {
       await connect(server.trim(), bearer.trim());
       onConnected();
@@ -52,7 +62,10 @@ export function ConnectPage({ onConnected, error: externalError }: ConnectPagePr
             type="text"
             className="field-input mono"
             value={server}
-            onChange={(e) => setServer(e.target.value)}
+            onChange={(e) => {
+              setServer(e.target.value);
+              dismissExternal();
+            }}
             placeholder="http://127.0.0.1:8443"
             spellCheck={false}
             autoComplete="off"
@@ -66,7 +79,10 @@ export function ConnectPage({ onConnected, error: externalError }: ConnectPagePr
             type="password"
             className="field-input mono"
             value={bearer}
-            onChange={(e) => setBearer(e.target.value)}
+            onChange={(e) => {
+              setBearer(e.target.value);
+              dismissExternal();
+            }}
             placeholder="name:secret"
             spellCheck={false}
             autoComplete="off"

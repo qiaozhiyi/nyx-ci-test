@@ -228,16 +228,19 @@ function FileDownloadView({ chunks }: { chunks: ResultView[] }) {
   const done = chunks.some((c) => c.eof === 1);
   const totalBytes = chunks.reduce((n, c) => n + (c.data_hex ? c.data_hex.length / 2 : 0), 0);
   const name = chunks.find((c) => c.text)?.text.replace(/^<chunk\s+/, '').replace(/#\d+>$/, '') ?? 'download';
+  // 内存治理可能已剥离部分 chunk 的 data_hex(见 taskStore 的 enforceSessionLimits);
+  // 此时拼出的 Blob 是残缺的,不建下载链接,只显示完成信息。
+  const stripped = chunks.some((c) => !c.data_hex);
 
   const blobUrl = useMemo(() => {
-    if (!done) return null;
+    if (!done || stripped) return null;
     const ordered = [...chunks].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
     const hex = ordered.map((c) => c.data_hex ?? '').join('');
     const bytes = hexToBytes(hex);
     // TS 5.7+ lib types make hexToBytes' Uint8Array<ArrayBufferLike> not
     // assignable to BlobPart; the runtime value is a plain Uint8Array.
     return URL.createObjectURL(new Blob([bytes as BlobPart], { type: 'application/octet-stream' }));
-  }, [chunks, done]);
+  }, [chunks, done, stripped]);
 
   // Revoke the object URL when it is replaced or the view unmounts.
   useEffect(() => () => {

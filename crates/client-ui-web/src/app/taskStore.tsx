@@ -33,8 +33,60 @@ import {
   type TaskSubmitted,
 } from '../lib/invoke';
 
+/**
+ * 内存治理阈值(审计发现 #3):results 只增不减,截图/下载的 data_hex 单条可达
+ * 12MB(字节),全留 React state 会让长时间 screenwatch 的 WebView 膨胀到崩溃。
+ * MAX_TASKS_PER_SESSION — 每会话最多保留的任务块数。任务块高度不定、虚拟化
+ * 收益低风险高,故不引入;300 块对长时间操作仍留有充足历史,超出丢弃最旧块,
+ * 顺带控制 DOM 规模。MAX_RESULT_BYTES_PER_SESSION — 每会话全部结果的 data_hex
+ * 字节总预算。单张 1080p BMP 约 12MB,64MB 约可保留最近 5 张截图外加若干下载
+ * 块;超预算时从最旧块开始剥离 data_hex(text 追加丢弃标记)直到回到预算内。
+ */
+const MAX_TASKS_PER_SESSION = 300;
+const MAX_RESULT_BYTES_PER_SESSION = 64 * 1024 * 1024;
+
 /** Per-session task flows, keyed by session id. */
 export type TaskMap = Record<string, TaskEntry[]>;
+
+/** 剥离单个结果的 data_hex;text 已有内容不动,追加丢弃标记。 */
+function stripDataHex(r: ResultView): ResultView {
+  return {
+    ...r,
+    data_hex: undefined,
+    text: `${r.text} [大结果已丢弃以释放内存]`,
+  };
+}
+
+/** 对一个会话的任务列表执行上限治理:块数上限 + data_hex 字节预算。 */
+function enforceSessionLimits(list: TaskEntry[]): TaskEntry[] {
+  // 块数上限:超出的最旧块整体丢弃。
+  const capped =
+    list.length > MAX_TASKS_PER_SESSION
+      ? list.slice(list.length - MAX_TASKS_PER_SESSION)
+      : list;
+  // data_hex 字节预算:超预算时从最旧块开始剥离,直到回到预算内。
+  let bytes = 0;
+  for (const t of capped) {
+    for (const r of t.results) if (r.data_hex) bytes += r.data_hex.length / 2;
+  }
+  if (bytes <= MAX_RESULT_BYTES_PER_SESSION) return capped;
+  const next: TaskEntry[] = [];
+  for (const t of capped) {
+    if (bytes <= MAX_RESULT_BYTES_PER_SESSION) {
+      next.push(t);
+      continue;
+    }
+    let changed = false;
+    const results = t.results.map((r) => {
+      if (bytes <= MAX_RESULT_BYTES_PER_SESSION || !r.data_hex) return r;
+      bytes -= r.data_hex.length / 2;
+      changed = true;
+      return stripDataHex(r);
+    });
+    next.push(changed ? { ...t, results } : t);
+  }
+  return next;
+}
 
 type TaskAction =
   | { type: 'addTask'; session: string; entry: TaskEntry }
@@ -48,7 +100,7 @@ function taskReducer(state: TaskMap, action: TaskAction): TaskMap {
       const list = state[action.session] ?? [];
       // Guard against duplicate inserts (e.g. retried submit with same id).
       if (list.some((t) => t.task_id === action.entry.task_id)) return state;
-      return { ...state, [action.session]: [...list, action.entry] };
+      return { ...state, [action.session]: enforceSessionLimits([...list, action.entry]) };
     }
     case 'ack': {
       const list = state[action.session];
@@ -71,7 +123,7 @@ function taskReducer(state: TaskMap, action: TaskAction): TaskMap {
         action.result.kind === 'error' ? 'error' : 'completed';
       const next = [...list];
       next[idx] = { ...task, results, status };
-      return { ...state, [action.session]: next };
+      return { ...state, [action.session]: enforceSessionLimits(next) };
     }
     case 'clear':
       return {};

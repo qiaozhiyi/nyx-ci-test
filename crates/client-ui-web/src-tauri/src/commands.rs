@@ -264,3 +264,39 @@ pub async fn fetch_profile(state: State<'_, Arc<BackendState>>) -> Result<Value,
         .await
         .map_err(|e| e.to_string())
 }
+
+// ===== 文件选择 / 读取(BOF / upload 用)=====
+
+/// 文件读取上限:64 MB。二进制走 hex 过 IPC 已经不轻,再大直接防呆拒绝。
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 打开系统文件选择对话框,返回选中文件的绝对路径;用户取消返回 None。
+/// filters 为扩展名列表(不含点,如 ["o", "obj"]),空列表表示不过滤。
+#[tauri::command]
+pub fn pick_file(app: tauri::AppHandle, title: String, filters: Vec<String>) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    let mut dlg = app.dialog().file().set_title(title);
+    let exts: Vec<&str> = filters.iter().map(|s| s.as_str()).collect();
+    if !exts.is_empty() {
+        dlg = dlg.add_filter("files", &exts);
+    }
+    dlg.blocking_pick_file()
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// 读取本地文件并返回小写 hex 串(前端 bof / upload 的 data_hex)。
+#[tauri::command]
+pub async fn read_file_hex(path: String) -> Result<String, String> {
+    use std::fmt::Write;
+    let meta = std::fs::metadata(&path).map_err(|e| format!("无法访问文件 {path}: {e}"))?;
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(format!("文件过大({} 字节),超过 64MB 上限", meta.len()));
+    }
+    let data = std::fs::read(&path).map_err(|e| format!("无法读取文件 {path}: {e}"))?;
+    let mut hex = String::with_capacity(data.len() * 2);
+    for b in &data {
+        let _ = write!(hex, "{b:02x}");
+    }
+    Ok(hex)
+}

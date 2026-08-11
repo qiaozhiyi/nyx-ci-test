@@ -9,12 +9,18 @@ use anyhow::{anyhow, Result};
 use nyx_rest::{authed, ResultView, SessionView, TaskAck};
 use reqwest::Client;
 
-/// Build a reqwest client with sane timeouts for an operator console.
+/// Shared reqwest client with sane timeouts for an operator console.
+/// `Client` is an `Arc` internally, so cloning shares the connection pool.
 pub fn http_client() -> Client {
-    Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .expect("reqwest client build")
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("reqwest client build")
+        })
+        .clone()
 }
 
 /// `GET /api/sessions` — list all active sessions.
@@ -104,19 +110,16 @@ pub async fn list_creds(
     reveal: bool,
     kind: Option<&str>,
 ) -> Result<Vec<serde_json::Value>> {
-    let mut url = format!("{}/api/creds", server.trim_end_matches('/'));
-    let mut params: Vec<String> = Vec::new();
+    let url = format!("{}/api/creds", server.trim_end_matches('/'));
+    // reveal=false / kind=None 直接跳过，其余交给 reqwest 做 URL 编码。
+    let mut query: Vec<(&str, &str)> = Vec::new();
     if reveal {
-        params.push("reveal=1".into());
+        query.push(("reveal", "1"));
     }
     if let Some(k) = kind {
-        params.push(format!("kind={}", k));
+        query.push(("kind", k));
     }
-    if !params.is_empty() {
-        url.push('?');
-        url.push_str(&params.join("&"));
-    }
-    let resp = authed(client.get(&url), &Some(bearer.to_string()))
+    let resp = authed(client.get(&url).query(&query), &Some(bearer.to_string()))
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -183,23 +186,22 @@ pub async fn fetch_audit(
     bearer: &str,
     params: &serde_json::Value,
 ) -> Result<Vec<serde_json::Value>> {
-    let base = format!("{}/api/audit", server.trim_end_matches('/'));
-    let mut url = base;
-    let mut qs: Vec<String> = Vec::new();
+    let url = format!("{}/api/audit", server.trim_end_matches('/'));
+    // 手工拼 query 会漏掉 bool/负数且不做编码；统一转字符串交给 reqwest 编码，
+    // null/数组/对象这类无法平铺的值跳过。
+    let mut qs: Vec<(&str, String)> = Vec::new();
     if let Some(obj) = params.as_object() {
         for (k, v) in obj {
-            if let Some(s) = v.as_str() {
-                qs.push(format!("{}={}", k, s));
-            } else if let Some(n) = v.as_u64() {
-                qs.push(format!("{}={}", k, n));
-            }
+            let s = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => continue,
+            };
+            qs.push((k.as_str(), s));
         }
     }
-    if !qs.is_empty() {
-        url.push('?');
-        url.push_str(&qs.join("&"));
-    }
-    let resp = authed(client.get(&url), &Some(bearer.to_string()))
+    let resp = authed(client.get(&url).query(&qs), &Some(bearer.to_string()))
         .send()
         .await?;
     if !resp.status().is_success() {

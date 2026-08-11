@@ -26,6 +26,10 @@ import { TaskBlock, type TaskEntry } from './TaskBlock';
 import { CommandInput } from './CommandInput';
 import './CommandConsole.css';
 
+// 下发失败块的本地 id：模块级递增负计数器，保证唯一且不与服务器正 id 冲突
+// （之前用 Date.now()，同毫秒两次失败会被 addTask 去重丢掉）。
+let nextLocalErrorId = -1;
+
 export interface CommandConsoleProps {
   session: SessionView;
 }
@@ -56,7 +60,7 @@ export function CommandConsole({ session }: CommandConsoleProps) {
     } catch {
       // Surface as an immediate error block so the operator sees the failure.
       const errorTask: TaskEntry = {
-        task_id: Date.now(),
+        task_id: nextLocalErrorId--,
         command_label: label,
         status: 'error',
         results: [

@@ -22,6 +22,7 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(BackendState::new()))
         .setup(|app| {
             // Spawn the background poll loop with access to the app handle (for emit).
@@ -46,6 +47,8 @@ pub fn run() {
             commands::fetch_report,
             commands::set_session_owner,
             commands::fetch_operators,
+            commands::pick_file,
+            commands::read_file_hex,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
