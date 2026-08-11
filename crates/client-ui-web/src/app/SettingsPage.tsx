@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { connect, disconnect, fetchProfile, fetchReport } from '../lib/invoke';
 import type { ProfileView } from '../lib/invoke';
+import { useTaskStore } from './taskStore';
 import './SettingsPage.css';
 
 /**
@@ -16,6 +17,7 @@ export function SettingsPage() {
   const [reconnecting, setReconnecting] = useState(false);
   const [reporting, setReporting] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const { clearAll } = useTaskStore();
 
   useEffect(() => {
     let cancelled = false;
@@ -42,6 +44,10 @@ export function SettingsPage() {
       // Drop the current link, then reconnect to the new endpoint.
       await disconnect();
       await connect(server.trim(), bearer.trim());
+      // disconnect() cleared the BACKEND pending queue; mirror it in the
+      // frontend or every in-flight block would sit at 'processing' forever
+      // (no more drains, no expiry path runs for them).
+      clearAll();
       setNotice('已重新连接');
     } catch (e) {
       setNotice(`重连失败: ${e instanceof Error ? e.message : String(e)}`);

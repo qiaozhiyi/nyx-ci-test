@@ -135,7 +135,9 @@ pub fn authed(req: reqwest::RequestBuilder, token: &Option<String>) -> reqwest::
 /// A cheap, stable signature of a session list for change detection — the
 /// worker only pushes a UI snapshot when this string changes. Deliberately
 /// excludes `age_secs` (which churns every second) so the UI doesn't flap on
-/// every poll tick.
+/// every poll tick. `stale`/`owner` ARE included: they flip on rare discrete
+/// events (restored session re-checks in, operator assigns ownership) and the
+/// UI badges must refresh when they do.
 pub fn session_signature(list: &[SessionView]) -> String {
     let mut s = String::new();
     for v in list {
@@ -145,7 +147,13 @@ pub fn session_signature(list: &[SessionView]) -> String {
         s.push('|');
         s.push_str(&v.username);
         s.push('|');
-        s.push_str(&format!("{}|{}", v.is_admin, v.pending));
+        s.push_str(&format!(
+            "{}|{}|{}|{}",
+            v.is_admin,
+            v.pending,
+            v.stale,
+            v.owner.as_deref().unwrap_or("")
+        ));
         s.push(';');
     }
     s

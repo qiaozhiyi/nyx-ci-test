@@ -35,10 +35,15 @@ export function CommandConsole({ session }: CommandConsoleProps) {
   const tasks = tasksBySession[session.id] ?? [];
   const flowRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll to the bottom when a new task/result lands.
+  // Auto-scroll to the bottom when a new task/result lands — but only if the
+  // operator is already near the bottom. Yanking the view down while they
+  // scroll back through history (screenwatch frames keep arriving) made the
+  // console unreadable.
   useEffect(() => {
     const el = flowRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 120) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [tasks]);
 
   // Submit handler: send to backend, then insert an optimistic entry. If the

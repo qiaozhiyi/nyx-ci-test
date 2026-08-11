@@ -56,19 +56,17 @@ function AppInner() {
   const [sessions, setSessions] = useState<SessionView[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  // Backend-level errors (auth/network) imply the team-server link is gone.
-  // The error is fatal: tear the backend connection down (fire-and-forget) so
-  // the 2s poll loop stops hammering the dead server, and clear per-session
-  // task history so the next connect starts from a clean slate. Mirrors
-  // handleDisconnect, minus the page navigation.
+  // Backend-level errors (auth/network) mean the team-server link is
+  // degraded — NOT that the operator should be logged out. The poll loop
+  // only emits after 3 consecutive fetch failures and keeps retrying; it
+  // recovers on its own when the server comes back. So: surface a banner,
+  // keep the connection and ALL task history. Tearing down here used to
+  // wipe every session's console on a 6-second network blip.
   useEffect(() => {
     let unlisten: UnlistenFn | null = null;
     let cancelled = false;
     onError((msg) => {
       setError(msg);
-      setConnected(false);
-      clearAll();
-      disconnect().catch((err) => console.error('disconnect failed:', err));
     }).then((fn) => {
       if (cancelled) fn();
       else unlisten = fn;
@@ -77,9 +75,6 @@ function AppInner() {
       cancelled = true;
       if (unlisten) unlisten();
     };
-    // clearAll / disconnect are stable (useCallback); eslint would demand them
-    // here, but re-subscribing on every render is unnecessary — the listener is
-    // registered once for the app lifetime.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -94,8 +89,17 @@ function AppInner() {
     let cancelled = false;
     onSessions((s) => {
       setSessions(s);
-      // Auto-select the first session if none is selected yet.
-      setSelectedId((cur) => cur ?? (s.length > 0 ? s[0].id : null));
+      // Sessions arrive: server is reachable again — clear any outage banner.
+      setError(null);
+      // Auto-select: keep the current pick while it exists; otherwise land on
+      // the first LIVE (non-stale) session, not blindly s[0] — the server
+      // returns oldest-first, so s[0] is typically a stale restored session
+      // and commands sent to it can never come back.
+      setSelectedId((cur) => {
+        if (cur && s.some((x) => x.id === cur)) return cur;
+        const live = s.find((x) => !x.stale);
+        return (live ?? s[0])?.id ?? null;
+      });
     }).then((fn) => {
       if (cancelled) fn();
       else unlisten = fn;
@@ -139,6 +143,14 @@ function AppInner() {
     <div className="app-shell">
       <Dock activePage={activePage} onPageChange={setActivePage} onDisconnect={handleDisconnect} />
       <main className="app-main">
+        {error && (
+          <div className="app-banner" role="alert">
+            <span className="app-banner-text">连接异常（自动重试中）: {error}</span>
+            <button type="button" className="app-banner-x" onClick={() => setError(null)}>
+              ×
+            </button>
+          </div>
+        )}
         {activePage === 'workspace' && (
           <Workspace
             sessions={sessions}

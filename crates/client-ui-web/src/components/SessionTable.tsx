@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { SessionView } from '../lib/types';
 import { archName, classifyOs } from '../lib/types';
-import { listAllSessionMeta, useSessionMeta } from '../hooks/sessionMeta';
+import { listAllSessionMeta, useSessionMeta, META_CHANGED_EVENT } from '../hooks/sessionMeta';
 import { fetchOperators, setSessionOwner } from '../lib/invoke';
 import './SessionTable.css';
 
@@ -68,7 +68,15 @@ export function SessionTable({ sessions, selectedId, onSelect }: SessionTablePro
   }, []);
   // Snapshot all metadata once per render; cheap (single localStorage index read)
   // and lets us sort/filter without each row subscribing individually.
-  const allMeta = useMemo(() => listAllSessionMeta(), [sessions, selectedId, filter]);
+  // Re-read on every meta write (same-window writes don't fire `storage`).
+  const [metaTick, setMetaTick] = useState(0);
+  useEffect(() => {
+    const bump = () => setMetaTick((t) => t + 1);
+    window.addEventListener(META_CHANGED_EVENT, bump);
+    return () => window.removeEventListener(META_CHANGED_EVENT, bump);
+  }, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const allMeta = useMemo(() => listAllSessionMeta(), [sessions, selectedId, filter, metaTick]);
 
   const aliveCount = sessions.filter((s) => !s.stale).length;
   const staleCount = sessions.length - aliveCount;
@@ -85,7 +93,9 @@ export function SessionTable({ sessions, selectedId, onSelect }: SessionTablePro
         default: return true;
       }
     });
-    // Starred first (by last-edit recency), then unstarred in original order.
+    // Starred first (by last-edit recency); then LIVE before stale (the server
+    // returns oldest-first, so an unstyled list buries live sessions under
+    // restored stale ones); then original order.
     return filtered.sort((a, b) => {
       const sa = allMeta[a.id]?.starred ? 1 : 0;
       const sb = allMeta[b.id]?.starred ? 1 : 0;
@@ -93,6 +103,9 @@ export function SessionTable({ sessions, selectedId, onSelect }: SessionTablePro
       if (sa === 1 && sb === 1) {
         return (allMeta[b.id]?.updated_at ?? 0) - (allMeta[a.id]?.updated_at ?? 0);
       }
+      const la = a.stale ? 1 : 0;
+      const lb = b.stale ? 1 : 0;
+      if (la !== lb) return la - lb;
       return 0;
     });
   }, [sessions, filter, allMeta]);

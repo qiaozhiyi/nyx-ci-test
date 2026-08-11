@@ -186,13 +186,20 @@ function bytesToBase64(bytes: Uint8Array): string {
 /** Image result renderer: decode data_hex into an inline <img> preview. */
 function ImagePreview({ result }: { result: ResultView }) {
   const hex = result.data_hex ?? '';
-  if (hex.length < 2) {
+  // Memoize the decode: a 1080p BMP is ~12MB of hex, and hexToBytes +
+  // bytesToBase64 are synchronous hundreds-of-ms work. Without this, ANY
+  // task-store change (every screenwatch frame) re-decoded every historical
+  // screenshot and progressively froze the console.
+  const src = useMemo(() => {
+    if (hex.length < 2) return null;
+    const bytes = hexToBytes(hex);
+    // BMP magic "BM" (implant capture_bmp), else assume PNG.
+    const mime = bytes.length >= 2 && bytes[0] === 0x42 && bytes[1] === 0x4d ? 'image/bmp' : 'image/png';
+    return `data:${mime};base64,${bytesToBase64(bytes)}`;
+  }, [hex]);
+  if (!src) {
     return <div className="result result--todo mono">[截图] {result.text}</div>;
   }
-  const bytes = hexToBytes(hex);
-  // BMP magic "BM" (implant capture_bmp), else assume PNG.
-  const mime = bytes.length >= 2 && bytes[0] === 0x42 && bytes[1] === 0x4d ? 'image/bmp' : 'image/png';
-  const src = `data:${mime};base64,${bytesToBase64(bytes)}`;
   return (
     <div className="result result--image">
       <img className="result--image-img" src={src} alt="screenshot" />

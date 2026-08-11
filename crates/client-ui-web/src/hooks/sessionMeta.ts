@@ -68,11 +68,25 @@ function readRaw(sessionId: string): SessionMeta {
   return parsed ?? EMPTY_META;
 }
 
+/**
+ * Fired on `window` after any local metadata write. Same-window `storage`
+ * events don't fire, so without this the SessionTable's listAll snapshot
+ * never refreshed after starring/tagging (list looked "frozen").
+ */
+export const META_CHANGED_EVENT = 'nyx:session-meta-changed';
+
+function notifyMetaChanged(): void {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event(META_CHANGED_EVENT));
+  }
+}
+
 function writeRaw(sessionId: string, meta: SessionMeta): void {
   if (!isBrowser()) return;
   const next = { ...meta, v: SCHEMA_VERSION, updated_at: Date.now() };
   window.localStorage.setItem(storageKey(sessionId), JSON.stringify(next));
   bumpIndex(sessionId);
+  notifyMetaChanged();
 }
 
 /** Keep the id index in sync so listAll can enumerate without key scanning. */
@@ -119,6 +133,7 @@ export function clearSessionMeta(sessionId: string): void {
   } catch {
     // ignore
   }
+  notifyMetaChanged();
 }
 
 /**

@@ -10,6 +10,42 @@
   min-width: 0;
   height: 100%;
   overflow: hidden;
+  position: relative;
+}
+
+/* Non-fatal backend outage banner (poll loop keeps retrying underneath).
+   Overlays the page top instead of reflowing the layout. */
+.app-banner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--warn-bg, #3a2a12);
+  color: var(--warn-fg, #e8b45a);
+  border-bottom: 1px solid var(--border, #444);
+  font-size: 12px;
+}
+
+.app-banner-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-banner-x {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
 }
 
 /* Suspense fallback while the lazily-loaded TopologyPage chunk arrives. */

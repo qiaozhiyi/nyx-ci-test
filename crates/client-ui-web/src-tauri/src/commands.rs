@@ -24,6 +24,11 @@ pub async fn connect(
     rest::fetch_sessions(&client, &server, &bearer)
         .await
         .map_err(|e| e.to_string())?;
+    // Clear leftover pending from a PREVIOUS connection: the frontend can
+    // connect without an explicit disconnect (Settings reconnect path used
+    // to), and stale entries would be expired against the new server's
+    // session ids — emitting bogus timeout errors into fresh consoles.
+    state.pending.write().await.clear();
     *state.connection.write().await = Some(Connection { server, bearer });
     Ok(())
 }

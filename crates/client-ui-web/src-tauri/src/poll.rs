@@ -36,9 +36,11 @@ const MAX_SESSION_FETCH_FAILURES: u32 = 3;
 
 /// Consecutive EMPTY `/api/results` drains tolerated for a pending task before
 /// it is expired and the console block resolved with a synthetic error result.
-/// 60 drains × 2s poll ≈ 2 minutes of beacon silence — check-ins usually
-/// happen every ~30s, so this is a generous dead-beacon bound.
-const MAX_EMPTY_DRAINS: u32 = 60;
+/// 90 drains × 2s poll ≈ 3 minutes of beacon silence. This must exceed the
+/// worst-case command round trip of a default-profile implant (sleep 60s +
+/// 20% jitter → up to ~72s to pick the task up + ~72s for the result to come
+/// back ≈ 144s); anything tighter false-expires healthy beacons.
+const MAX_EMPTY_DRAINS: u32 = 90;
 
 /// `nyx://result` payload: a `ResultView` plus the session it belongs to.
 /// Every result (real drain or synthetic expiry error) carries `session_id`
@@ -186,7 +188,11 @@ async fn drain_pending_results(
                         },
                     );
                 }
-                // Remove completed/errored tasks from pending.
+                // Remove completed/errored tasks from pending. Server task
+                // ids are PER-SESSION counters (Session.next_task_id), so the
+                // retain must be scoped to this session — an unscoped match
+                // would silently delete another session's pending task that
+                // happens to share the id, hanging its console block forever.
                 let done_ids: std::collections::HashSet<u64> =
                     results.iter().map(|r| r.task_id).collect();
                 let mut p = state.pending.write().await;
@@ -194,28 +200,8 @@ async fn drain_pending_results(
                     // Empty drain: nothing completed this tick. Advance the
                     // consecutive-empty counter; tasks that still produce no
                     // result after MAX_EMPTY_DRAINS are expired (dead beacon).
-                    for t in p.iter_mut().filter(|t| t.session == session) {
-                        t.empty_drains = t.empty_drains.saturating_add(1);
-                    }
-                    let expired: Vec<PendingTask> = p
-                        .iter()
-                        .filter(|t| t.session == session && t.empty_drains >= MAX_EMPTY_DRAINS)
-                        .cloned()
-                        .collect();
-                    if !expired.is_empty() {
-                        p.retain(|t| !(t.session == session && t.empty_drains >= MAX_EMPTY_DRAINS));
-                        for t in &expired {
-                            emit_error_result(
-                                app,
-                                &t.session,
-                                t.task_id,
-                                format!(
-                                    "命令超时：连续 {} 次检查未回流结果，beacon 可能已失联。",
-                                    MAX_EMPTY_DRAINS
-                                ),
-                            );
-                        }
-                    }
+                    drop(p);
+                    register_empty_drain(app, state, &session).await;
                 } else {
                     // Drain produced results — the session is alive; reset the
                     // empty-drain counters of its remaining pending tasks, then
@@ -223,13 +209,51 @@ async fn drain_pending_results(
                     for t in p.iter_mut().filter(|t| t.session == session) {
                         t.empty_drains = 0;
                     }
-                    p.retain(|t| !done_ids.contains(&t.task_id));
+                    p.retain(|t| !(t.session == session && done_ids.contains(&t.task_id)));
                 }
             }
-            Err(_) => {
-                // Transient network error — leave pending, retry next tick.
+            Err(e) => {
+                // Failed drains must count toward expiry too: a session whose
+                // results endpoint persistently errors (RBAC 403, flaky link
+                // where /api/sessions still succeeds) would otherwise keep
+                // tasks pending FOREVER with zero UI feedback.
+                eprintln!("[poll] drain_results failed for {session}: {e}");
+                register_empty_drain(app, state, &session).await;
             }
         }
+    }
+}
+
+/// Advance the consecutive-empty counter for every pending task of `session`
+/// and expire those past `MAX_EMPTY_DRAINS`, resolving their console blocks
+/// with a synthetic error result. Shared by the empty-drain and failed-drain
+/// branches. Lock is never held across the emit.
+async fn register_empty_drain(app: &AppHandle, state: &Arc<BackendState>, session: &str) {
+    let expired: Vec<PendingTask> = {
+        let mut p = state.pending.write().await;
+        for t in p.iter_mut().filter(|t| t.session == session) {
+            t.empty_drains = t.empty_drains.saturating_add(1);
+        }
+        let expired: Vec<PendingTask> = p
+            .iter()
+            .filter(|t| t.session == session && t.empty_drains >= MAX_EMPTY_DRAINS)
+            .cloned()
+            .collect();
+        if !expired.is_empty() {
+            p.retain(|t| !(t.session == session && t.empty_drains >= MAX_EMPTY_DRAINS));
+        }
+        expired
+    };
+    for t in &expired {
+        emit_error_result(
+            app,
+            &t.session,
+            t.task_id,
+            format!(
+                "命令超时：连续 {} 次检查未回流结果，beacon 可能已失联。",
+                MAX_EMPTY_DRAINS
+            ),
+        );
     }
 }
 
