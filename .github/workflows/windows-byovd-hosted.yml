@@ -9,6 +9,13 @@ name: Win BYOVD (hosted)
 #   3. hosted runner 默认关 HVCI(Azure VM 性能优化),黑名单只在 HVCI 路径
 #      强制执行 — HVCI 关 → RTCore64 可加载。
 #
+# 2026-08-13 修正: windows-latest 已迁至 Server 2025(build 26100+),其
+# WDAC/CI 策略在无 HVCI 时也处于 Enforced,blocklist 拦 RTCore64(实测
+# 0xC0000034)→ probe skip。钉回 windows-2022(Server 2022):CI 策略不强制、
+# HVCI 关、Defender 默认关 — RTCore64 全链可跑。windows-2022 标签现存
+# (VS2022 用户路径,runner-images 仓库在册);若其退役,再评估其他零成本路径。
+
+#
 # 流程:
 #   1. 探测 HVCI / 黑名单状态(Win32_DeviceGuard + 注册表)
 #   2. HVCI 关 → 下载 RTCore64.sys(公开 PoC,运行时拉,不进 git)→ 构建
@@ -39,7 +46,7 @@ concurrency:
 
 jobs:
   byovd:
-    runs-on: windows-latest
+    runs-on: windows-2022  # Server 2022: CI policy not enforced, HVCI off → RTCore64 loads (Server 2025 hardens → skip)
     timeout-minutes: 25
     # wI: job-level continue-on-error REMOVED so the kernel-assessment step is a
     # real hard gate (repo convention: gates remove continue-on-error — see
