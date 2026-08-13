@@ -9,11 +9,13 @@ name: Win BYOVD (hosted)
 #   3. hosted runner 默认关 HVCI(Azure VM 性能优化),黑名单只在 HVCI 路径
 #      强制执行 — HVCI 关 → RTCore64 可加载。
 #
-# 2026-08-13 修正: windows-latest 已迁至 Server 2025(build 26100+),其
+# 2026-08-13 实测修正: windows-latest 已迁至 Server 2025(build 26100+),其
 # WDAC/CI 策略在无 HVCI 时也处于 Enforced,blocklist 拦 RTCore64(实测
-# 0xC0000034)→ probe skip。钉回 windows-2022(Server 2022):CI 策略不强制、
-# HVCI 关、Defender 默认关 — RTCore64 全链可跑。windows-2022 标签现存
-# (VS2022 用户路径,runner-images 仓库在册);若其退役,再评估其他零成本路径。
+# 0xC0000034)→ probe skip。钉回 windows-2022(Server 2022, 镜像 20260802.262):
+# CI 策略同样 Enforced(CodeIntegrityPolicyEnforcementStatus=2),但
+# VulnerableDriverBlocklistEnable 注册表未设置 → blocklist 未开。probe 因此
+# 改为: 仅 HVCI 运行中或 blocklist 注册表=1 才 skip;其余情况尝试加载
+# RTCore64,由 NTSTATUS 实证裁决(loaded 状态门禁硬 gate)。
 
 #
 # 流程:
@@ -95,20 +97,22 @@ jobs:
 
           Write-Host "=== Decision ==="
           Write-Host "HVCI actively running: $hvci_running"
-          # The blocklist is enforced when CodeIntegrityPolicyEnforcementStatus=2
-          # (Enforced), NOT only when HVCI is actively running. On Server 2025 /
-          # Win11 24H2 the CI policy is enforced even with VBS but no HVCI
-          # service. RTCore64.sys IS on the blocklist -> load blocked -> manifests
-          # as 0xC0000034 STATUS_OBJECT_NAME_NOT_FOUND (not the expected
-          # 0xC0000428 STATUS_DRIVER_BLOCKED on this build).
           $ci_enforced = ($dg.CodeIntegrityPolicyEnforcementStatus -eq 2)
-          $blocked = $hvci_running -or $ci_enforced
+          Write-Host "CodeIntegrityPolicyEnforcementStatus enforced: $ci_enforced"
+          # 2026-08-13 (windows-2022 image 20260802.262): the CI policy IS
+          # enforced (status 2) on the hosted image, BUT the vulnerable-driver
+          # blocklist registry value is UNSET. The blocklist is what rejects
+          # RTCore64; a plain enforced signing policy passes WHQL/attestation-
+          # signed drivers. On the Server 2025 image CI enforcement came WITH
+          # the blocklist (empirically 0xC0000034); on this 2022 image the
+          # registry says otherwise — so attempt the load and let the NTSTATUS
+          # decide. The hard gate runs only when the driver reaches RUNNING.
+          $blocked = $hvci_running -or ($bl -eq 1)
           if ($blocked) {
-            Write-Host "::warning::Code Integrity policy enforced (CI=$ci_enforced, HVCI=$hvci_running) - RTCore64.sys on blocklist will be rejected. Skipping BYOVD load attempt."
-            Write-Host "::notice::This is the documented Server 2025 hardening: WDAC/blocklist enforces without HVCI. Use self-hosted runner (windows-kself-hosted.yml) where CI policy is off."
+            Write-Host "::warning::HVCI running or blocklist registry on (HVCI=$hvci_running, blk=$bl) - RTCore64.sys will be rejected. Skipping BYOVD load attempt."
             "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } else {
-            Write-Host "::notice::CI policy NOT enforced (HVCI=$hvci_running, CI=$ci_enforced) - RTCore64.sys load should succeed (signed driver, blocklist not on enforcement path)."
+            Write-Host "::notice::HVCI off + blocklist registry unset (CI enforced=$ci_enforced) - attempting RTCore64.sys load; NTSTATUS decides (0xC0000428 / 0xC0000034 = blocked)."
             "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           }
 
@@ -205,10 +209,13 @@ jobs:
 
       # ---- 4. BYOVD 真机回归(对应 M6 Task G-K + P0.a/b + P3.b)----
       - name: BYOVD bootstrap + kernelsdk full path
+        id: bootstrap
         if: steps.probe.outputs.skip == 'false'
         shell: cmd
         continue-on-error: true   # BYOVD load may fail by privilege/blocklist/registry; do not fail job
         run: |
+          REM Driver load result feeds the hard gate below; default false.
+          echo loaded=false>> "%GITHUB_OUTPUT%"
           REM ---- Task G: BYOVD driver load ----
           echo === Task G: BYOVD bootstrap ===
           echo DRIVER_PATH=%DRIVER_PATH%
@@ -228,6 +235,9 @@ jobs:
             echo kernelsdk BYOVD needs a HVCI-off + blocklist-off host (self-hosted 17763, see windows-kself-hosted.yml)
             exit /b 0
           )
+          REM Driver must reach RUNNING for the hard gate to fire.
+          sc query NyaRTCore | findstr /i "RUNNING" >nul && echo loaded=true>> "%GITHUB_OUTPUT%"
+
 
           REM ---- P0.a: PatchGuard window ----
           echo === P0.a: PatchGuard window select ===
@@ -279,8 +289,12 @@ jobs:
       # fail-loud contract as the loader probe). The driver is already loaded by
       # the previous step (LoadedDriver does not auto-unload; NtLoadDriver
       # returns STATUS_IMAGE_ALREADY_LOADED, which the bootstrap treats as OK).
+      - name: Driver not RUNNING — kernel matrix not exercised (honest skip)
+        if: steps.probe.outputs.skip == 'false' && steps.bootstrap.outputs.loaded != 'true'
+        run: echo "::warning::RTCore64 load did not reach RUNNING state (hosted image hardening). Kernel matrix (ETW-TI/DKOM/LSASS/assess hard gate) skipped; algorithm coverage lives in ci.yml unit tests."
+
       - name: Kernel assessment (nyx-kernel assess) - hard gate
-        if: steps.probe.outputs.skip == 'false'
+        if: steps.probe.outputs.skip == 'false' && steps.bootstrap.outputs.loaded == 'true'
         shell: pwsh
         run: |
           $exe = "crates\operator-kernel-cli\target\release\nyx-kernel.exe"
