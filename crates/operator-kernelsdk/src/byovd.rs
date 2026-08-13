@@ -532,7 +532,7 @@ impl KernelRw for ByovdDriver {
 /// other targets it stays the no-op stub so the seam crate still type-checks
 /// (and so the mock tests build on the dev host).
 #[cfg(target_os = "windows")]
-fn resolve_sym<T>(module: &[u8], name: &[u8]) -> Result<T, KrwError> {
+pub(crate) fn resolve_sym<T>(module: &[u8], name: &[u8]) -> Result<T, KrwError> {
     // SAFETY: operator-side, single-threaded; T must match the export signature
     // (every call site here uses a typed `*Fn` alias matching the documented
     // export). Forwarded unchanged.

