@@ -486,6 +486,13 @@ fn lockdown_stub_page() {
 /// bootstrap context. Must run AFTER `syscalls::init_global` (needs the SSN
 /// table + the ntdll `syscall;ret` gadget address).
 pub unsafe fn apply() -> usize {
+    // x64-on-ARM64 emulation (Prism): redirected IAT slots would point at
+    // indirect-syscall stubs whose `jmp gadget` is fatal under the emulator
+    // (0xC000026F — see `syscalls::Runtime::direct`). Skip: zero redirects,
+    // IATs left untouched (the noevasion-degrade convention).
+    if syscalls::is_x64_emulated_on_arm64() {
+        return 0;
+    }
     // Reset the stub arena for each apply() call so the page is allocated
     // fresh (RWX).  Reusing an already-locked-down (RX) page from a prior
     // apply() causes an AV when alloc_persistent_stub writes to it — the

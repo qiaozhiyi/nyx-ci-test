@@ -1037,6 +1037,14 @@ unsafe fn configure_dr_slot(
 /// execution of `target_addr` should be redirected (the beacon thread); the
 /// shadow buffer must be initialized ([`init_shadow_buffer`]).
 pub unsafe fn add_hwbp(target_addr: usize, shadow_type: ShadowType) -> Result<usize, &'static str> {
+    // x64-on-ARM64 emulation (Prism): debug registers are not delivered to
+    // emulated x64 processes (WoA WoW64 gap — llvm/llvm-project#80665), so
+    // the DR arm + single-step VEH flow cannot work. Refuse before touching
+    // the thread context; callers fall back to byte-patch blinding (the
+    // noevasion-degrade convention).
+    if nyx_implant_core::syscalls::is_x64_emulated_on_arm64() {
+        return Err("hwbp unsupported under x64-on-ARM64 emulation");
+    }
     diag(b'a');
 
     // 0. Preconditions.
