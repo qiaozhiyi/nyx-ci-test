@@ -12,6 +12,22 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-13（续）内核层零成本路径实证：
+
+- **`windows-byovd-hosted.yml` 实测修正**（4a5888a + 31cb1e2）：windows-latest
+  已迁 Server 2025（WDAC CI 策略 Enforced 拦 RTCore64）；钉回 windows-2022
+  后实测 CI 策略同样 Enforced（`CodeIntegrityPolicyEnforcementStatus=2`）且
+  blocklist 直接经 WDAC 生效（注册表 `VulnerableDriverBlocklistEnable` 未设
+  仍拦）——`NtLoadDriver` 返回 0xC0000034。probe 改为「仅 HVCI 运行中或
+  blocklist 注册表=1 才 skip，否则尝试加载由 NTSTATUS 裁决」；新增 loaded
+  状态门禁 hard gate + 诚实 skip 通知。
+- **免费驱动层路径候选已锁定**：WDTKernel.sys（Dell，WHQL 签名，LOLDrivers
+  `LoadsDespiteHVCI: TRUE`，不在 blocklist），kernelsdk 已含
+  `byovd_drivers/wdtkernel.rs`（phys-only IOCTL 协议）。下一工作包：Update
+  Catalog 取样 + CLI phys 模式（VA→PA 组合）+ CI 真机验证。
+- **驱动无关内核评估免费常跑**：`assess --user` 硬门在 hosted runner 上
+  PASS（真内核模块表 + CI 状态）。
+
 2026-08-13 Prism 全 evasion 入口崩溃修复 + 内核云上验证路径：
 
 - **`nyx_entry` 仿真崩溃根因修复**（c2525de）：E1 二分实证真凶为 HookChain
