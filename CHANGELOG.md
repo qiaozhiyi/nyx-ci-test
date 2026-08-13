@@ -12,6 +12,27 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-13 Prism 全 evasion 入口崩溃修复 + 内核云上验证路径：
+
+- **`nyx_entry` 仿真崩溃根因修复**（c2525de）：E1 二分实证真凶为 HookChain
+  ——其 IAT 重定向安装的持久间接 syscall stub（`mov eax,SSN; jmp gadget`）
+  正是仿真器拒绝分派的模式（0xC000026F，与 `syscalls::Runtime::direct` 同
+  机制），首个经重定向导入的 Win32 调用即在 L0_loop_start 后杀进程。仿真
+  下（`is_x64_emulated_on_arm64()`）：HookChain 整体跳过（bootstrap +
+  `hookchain::apply` 双层门禁）、HWBP 拒绝武装并直落 byte-patch 盲化
+  （WoA WoW64 不投递调试寄存器，llvm/llvm-project#80665；bootstrap +
+  `blind_hwbp::add_hwbp` 双层门禁）、RSP swap 永不武装。真 x64 零行为变更。
+  验证（Parallels Win11 ARM64 build 26200，Defender 实时保护 ON）：修复前
+  EXITCODE=0xC000026F；修复后生成 implant 经 `/api/generate-implant` 全
+  evasion 入口实证回家（SYSTEM 会话），shell 任务回环正确。
+- **内核层验证环境路径**：`scripts/kernel-lab/`（Azure Trusted Launch
+  Gen2 VM 一键部署 `deploy_azure_lab.sh` + VM 内 VBS/HVCI 引导
+  `bootstrap_kernel_lab.ps1` + 姿态验证 `verify_kernel_env.ps1`）。HVCI/
+  PatchGuard/驱动矩阵待 `az login` 后跑首个云上实例（本机 Apple Silicon
+  只能跑 ARM64 Windows 内核，x64 kernelsdk 工作无解，故走云）。
+- **状态更正**：v0.4.0 专项（WP-A/B1/B2/C/B3）此前已全部落地（2026-08-08），
+  STATUS 第 8 条已载；本轮仅同步残留问题口径。
+
 2026-08-10/11 ARM64 VM 全链路实证 + 生成管线根因修复 + 任务面/GUI 修复波次 —
 Parallels Win11 ARM64（build 26100，Prism x64 仿真，中文系统，Defender 实时
 保护 ON）完成 team server → generate-implant → beacon 回家 → 用户层任务面
