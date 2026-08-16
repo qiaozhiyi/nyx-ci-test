@@ -103,6 +103,13 @@ impl CredStore {
     /// arm when adding columns or altering tables — `ALTER TABLE ...
     /// ADD COLUMN` is the forward-only pattern SQLite supports without a
     /// full reload.
+    ///
+    /// The arms + version stamp run inside ONE transaction: without it a
+    /// crash/SIGKILL between two arms (or between an arm and the stamp)
+    /// would leave the DB half-migrated at the OLD version, and the next
+    /// `open()` would re-run the first arm and die on duplicate-column —
+    /// a permanent open failure. Rolling back keeps the pre-migration
+    /// state, so the next open retries cleanly.
     const CURRENT_SCHEMA_VERSION: i64 = 1;
 
     fn migrate(conn: &Connection) -> Result<()> {
@@ -127,16 +134,18 @@ impl CredStore {
                 r.get(0)
             })?;
         if current < Self::CURRENT_SCHEMA_VERSION {
+            let tx = conn.unchecked_transaction()?;
             // --- migration arms (forward-only) ---------------------------------
             // v0 → v1: initial baseline (creds table already created by init).
             //         No ALTER needed — this just stamps the version.
             // if current < 1 {
-            //     conn.execute("ALTER TABLE creds ADD COLUMN ...", [])?;
+            //     tx.execute("ALTER TABLE creds ADD COLUMN ...", [])?;
             // }
-            conn.execute(
+            tx.execute(
                 "UPDATE _creds_schema_version SET version = ?1;",
                 params![Self::CURRENT_SCHEMA_VERSION],
             )?;
+            tx.commit()?;
         }
         Ok(())
     }
@@ -308,5 +317,86 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn migrates_legacy_creds_db_without_version_table() {
+        // Mirror of session_store's `migrates_v2_sessions_table_adding_counters`
+        // for the v0 → v1 path: a pre-schema-versioning DB (commit 537bba0 era)
+        // has the `creds` table but NO `_creds_schema_version` table. open()
+        // must seed version 0, stamp CURRENT, preserve the fixture row, and
+        // leave the store writable.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("nyx-creds-migrate-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE creds (
+                    realm        TEXT NOT NULL,
+                    user         TEXT NOT NULL,
+                    kind         TEXT NOT NULL,
+                    secret       TEXT NOT NULL,
+                    source       TEXT NOT NULL DEFAULT '',
+                    beacon       TEXT,
+                    collected_at INTEGER NOT NULL DEFAULT 0,
+                    notes        TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (realm, user, kind)
+                );
+                INSERT INTO creds (realm, user, kind, secret, source, collected_at)
+                VALUES ('DEV', 'legacy', 'hash', 'legacyhash', 'old', 1700000000);",
+            )
+            .unwrap();
+        }
+        let s = CredStore::open(&path).unwrap();
+        assert_eq!(s.count().unwrap(), 1, "fixture row must survive migration");
+        assert_eq!(
+            s.get("DEV", "legacy", CredKind::Hash)
+                .unwrap()
+                .unwrap()
+                .secret,
+            "legacyhash"
+        );
+        // Version must be stamped to CURRENT after the migration.
+        let v: i64 = {
+            let conn = s.conn.lock().unwrap();
+            conn.query_row("SELECT MAX(version) FROM _creds_schema_version", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(v, CredStore::CURRENT_SCHEMA_VERSION);
+        // The migrated store stays writable.
+        s.upsert(&rec("DEV", "alice", "deadbeef")).unwrap();
+        assert_eq!(s.count().unwrap(), 2);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn fresh_db_lands_at_current_version_and_reopen_is_idempotent() {
+        // A fresh DB must stamp CURRENT on first open (no incremental arms
+        // needed — the baseline CREATE TABLE IS the latest shape), and a
+        // second open must be a no-op: still exactly ONE version row.
+        let s = CredStore::open_in_memory().unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            let v: i64 = conn
+                .query_row("SELECT MAX(version) FROM _creds_schema_version", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(v, CredStore::CURRENT_SCHEMA_VERSION);
+        }
+        // Re-run the migration gate (what a second open() does).
+        CredStore::migrate(&s.conn.lock().unwrap()).unwrap();
+        let conn = s.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _creds_schema_version", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 1, "reopen must not append stale version rows");
     }
 }

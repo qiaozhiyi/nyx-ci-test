@@ -130,7 +130,10 @@ impl ImplantStore {
         Ok(())
     }
 
-    /// Schema-migration gate (see `store::Store::migrate` for rationale).
+    /// Schema-migration gate (see `store::CredStore::migrate` for rationale —
+    /// per-store version table, forward-only ALTER arms, and the whole
+    /// migration wrapped in ONE transaction so a crash mid-migration rolls
+    /// back instead of bricking the next `open()` on duplicate-column).
     const CURRENT_SCHEMA_VERSION: i64 = 1;
 
     fn migrate(conn: &Connection) -> Result<()> {
@@ -157,10 +160,12 @@ impl ImplantStore {
         )?;
         if current < Self::CURRENT_SCHEMA_VERSION {
             // v0 → v1: baseline (implants table already created above).
-            conn.execute(
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
                 "UPDATE _implants_schema_version SET version = ?1;",
                 params![Self::CURRENT_SCHEMA_VERSION],
             )?;
+            tx.commit()?;
         }
         Ok(())
     }
@@ -527,5 +532,101 @@ mod tests {
         let result = s.insert(&rec2);
         assert!(result.is_err());
         assert_eq!(s.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn migrates_legacy_implants_db_without_version_table() {
+        // Mirror of session_store's migration test for the v0 → v1 path: a
+        // pre-schema-versioning DB (commit 9865e79 era) has the `implants`
+        // table but NO `_implants_schema_version` table. open() must seed
+        // version 0, stamp CURRENT, preserve the fixture row, and leave the
+        // token-claim path functional.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "nyx-implants-migrate-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let token_hash = hash(b"legacy-token");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE implants (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    implant_pub     TEXT NOT NULL UNIQUE,
+                    auth_token_hash TEXT NOT NULL,
+                    auth_token_used INTEGER NOT NULL DEFAULT 0,
+                    created_at      TEXT NOT NULL,
+                    created_by      TEXT,
+                    expires_at      TEXT,
+                    callback_host   TEXT NOT NULL,
+                    callback_port   INTEGER NOT NULL,
+                    format          TEXT NOT NULL DEFAULT 'dll',
+                    features_bitmap INTEGER NOT NULL DEFAULT 0,
+                    keying_levels   INTEGER NOT NULL DEFAULT 0,
+                    sha256          TEXT NOT NULL,
+                    size_bytes      INTEGER NOT NULL,
+                    revoked         INTEGER NOT NULL DEFAULT 0,
+                    notes           TEXT
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO implants
+                 (implant_pub, auth_token_hash, created_at, callback_host,
+                  callback_port, sha256, size_bytes)
+                 VALUES ('legacy-pub', ?1, '2026-07-12T00:00:00Z', '10.0.0.1',
+                         8443, 'ab', 1024)",
+                params![token_hash],
+            )
+            .unwrap();
+        }
+        let s = ImplantStore::open(&path).unwrap();
+        assert_eq!(s.count().unwrap(), 1, "fixture row must survive migration");
+        let got = s.get_by_pubkey("legacy-pub").unwrap().unwrap();
+        assert_eq!(got.auth_token_hash, token_hash);
+        assert!(!got.auth_token_used);
+        // Version must be stamped to CURRENT after the migration.
+        let v: i64 = {
+            let conn = s.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT MAX(version) FROM _implants_schema_version",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(v, ImplantStore::CURRENT_SCHEMA_VERSION);
+        // The migrated store's claim path still works on the legacy row.
+        assert!(s.mark_token_used("legacy-pub").unwrap());
+        assert!(s.get_by_token_hash(&token_hash).unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn fresh_db_lands_at_current_version_and_reopen_is_idempotent() {
+        let s = ImplantStore::open_in_memory().unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            let v: i64 = conn
+                .query_row(
+                    "SELECT MAX(version) FROM _implants_schema_version",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(v, ImplantStore::CURRENT_SCHEMA_VERSION);
+        }
+        // Re-run the migration gate (what a second open() does).
+        ImplantStore::migrate(&s.conn.lock().unwrap()).unwrap();
+        let conn = s.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _implants_schema_version", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 1, "reopen must not append stale version rows");
     }
 }

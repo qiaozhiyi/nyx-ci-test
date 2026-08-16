@@ -146,6 +146,13 @@ impl SessionStore {
     /// Append a `if current < N { ALTER ... }` arm here when altering
     /// the `sessions` table post-baseline, and bump
     /// `CURRENT_SCHEMA_VERSION` to match.
+    ///
+    /// All arms + the version stamp run inside ONE transaction: the v3 arm
+    /// alone issues TWO `ALTER TABLE`s, and a crash between them would leave
+    /// the DB half-migrated at the OLD version — the next `open()` would
+    /// re-run the first ALTER and die on duplicate-column, permanently
+    /// bricking the store. A rollback preserves the pre-migration state so
+    /// the next open retries cleanly.
     const CURRENT_SCHEMA_VERSION: i64 = 4;
 
     fn migrate(conn: &Connection) -> Result<()> {
@@ -171,6 +178,7 @@ impl SessionStore {
             |r| r.get(0),
         )?;
         if current < Self::CURRENT_SCHEMA_VERSION {
+            let tx = conn.unchecked_transaction()?;
             // v0 → v1: baseline (creds/implants tables created by their stores).
             // v1 → v2: session-persistence baseline — the `sessions` table is
             //          created idempotently in `init`, so no ALTER is needed;
@@ -183,11 +191,11 @@ impl SessionStore {
             //          exist only AFTER the ALTER (adding them to the CREATE
             //          would make this arm fail with duplicate-column).
             if current < 3 {
-                conn.execute(
+                tx.execute(
                     "ALTER TABLE sessions ADD COLUMN send_counter INTEGER NOT NULL DEFAULT 0",
                     [],
                 )?;
-                conn.execute(
+                tx.execute(
                     "ALTER TABLE sessions ADD COLUMN last_recv INTEGER NOT NULL DEFAULT 0",
                     [],
                 )?;
@@ -195,12 +203,13 @@ impl SessionStore {
             // v3 → v4: operator ownership of a session. `DEFAULT NULL`
             // backfills existing rows as unowned.
             if current < 4 {
-                conn.execute("ALTER TABLE sessions ADD COLUMN owner TEXT", [])?;
+                tx.execute("ALTER TABLE sessions ADD COLUMN owner TEXT", [])?;
             }
-            conn.execute(
+            tx.execute(
                 "UPDATE _sessions_schema_version SET version = ?1;",
                 params![Self::CURRENT_SCHEMA_VERSION],
             )?;
+            tx.commit()?;
         }
         Ok(())
     }
@@ -584,6 +593,104 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn migrates_v0_sessions_db_without_version_table() {
+        // The oldest possible sessions DB (commit 841ffc5 era, before
+        // per-store version tables existed): the `sessions` table in its
+        // pre-counter shape and NO `_sessions_schema_version` at all. open()
+        // must seed version 0 and run EVERY arm (v0 → v4) in one shot:
+        // counters + owner backfilled, fixture row preserved, store writable.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "nyx-session-migrate-v0-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    session_id    TEXT NOT NULL PRIMARY KEY,
+                    beacon_id     INTEGER NOT NULL,
+                    hostname      TEXT NOT NULL,
+                    username      TEXT NOT NULL,
+                    os            TEXT NOT NULL,
+                    arch          INTEGER NOT NULL,
+                    pid           INTEGER NOT NULL,
+                    is_admin      INTEGER NOT NULL,
+                    first_seen    INTEGER NOT NULL,
+                    last_seen     INTEGER NOT NULL,
+                    auth_token    BLOB
+                );
+                INSERT INTO sessions (session_id, beacon_id, hostname, username, os,
+                                      arch, pid, is_admin, first_seen, last_seen)
+                VALUES ('v0-id', 9, 'v0-host', 'v0-user', 'windows',
+                        1, 4242, 1, 500, 600);",
+            )
+            .unwrap();
+        }
+        let s = SessionStore::open(&path).unwrap();
+        let got = s.list().unwrap().remove(0);
+        assert_eq!(got.session_id, "v0-id");
+        assert_eq!(got.pid, 4242, "fixture row must survive the v0 → v4 jump");
+        assert_eq!((got.send_counter, got.last_recv), (0, 0));
+        assert_eq!(got.owner, None);
+        // All arms committed: version stamped straight to CURRENT, exactly once.
+        let (v, n): (i64, i64) = {
+            let conn = s.conn.lock().unwrap();
+            let v = conn
+                .query_row(
+                    "SELECT MAX(version) FROM _sessions_schema_version",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let n = conn
+                .query_row("SELECT COUNT(*) FROM _sessions_schema_version", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            (v, n)
+        };
+        assert_eq!(v, SessionStore::CURRENT_SCHEMA_VERSION);
+        assert_eq!(n, 1);
+        // Migrated row accepts both v3+ and v4+ writers.
+        assert!(s.update_counters("v0-id", 3, 4).unwrap());
+        assert!(s.update_owner("v0-id", Some("op")).unwrap());
+        let got = s.list().unwrap().remove(0);
+        assert_eq!((got.send_counter, got.last_recv), (3, 4));
+        assert_eq!(got.owner.as_deref(), Some("op"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn fresh_db_lands_at_current_version_and_reopen_is_idempotent() {
+        let s = SessionStore::open_in_memory().unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            let v: i64 = conn
+                .query_row(
+                    "SELECT MAX(version) FROM _sessions_schema_version",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(v, SessionStore::CURRENT_SCHEMA_VERSION);
+        }
+        // Re-run the migration gate (what a second open() does): must be a
+        // no-op — no duplicate ALTER attempt, no extra version row.
+        SessionStore::migrate(&s.conn.lock().unwrap()).unwrap();
+        let conn = s.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _sessions_schema_version", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 1, "reopen must not append stale version rows");
     }
 
     #[test]
