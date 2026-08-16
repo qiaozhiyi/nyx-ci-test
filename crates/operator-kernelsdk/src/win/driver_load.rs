@@ -77,8 +77,8 @@ pub struct LoadedDriver {
 }
 
 impl LoadedDriver {
-    /// Load a driver from `sys_path` (e.g. `C:\temp\RTCore64.sys`) under the
-    /// service name `svc_name` (e.g. `RTCore64`).
+    /// Load a driver from `sys_path` (e.g. `C:\temp\shield.sys`) under the
+    /// service name `svc_name` (e.g. `shield`).
     ///
     /// Steps:
     /// 1. Create the registry service key with ImagePath = `\??\<sys_path>`.
@@ -184,7 +184,7 @@ impl crate::DriverHandle for LoadedDriver {
 /// Build the ImagePath registry value from the operator-supplied driver path.
 ///
 /// The IO manager / NtLoadDriver resolves ImagePath as follows:
-///   - A relative path (no drive letter, e.g. `System32\drivers\RTCore64.sys`)
+///   - A relative path (no drive letter, e.g. `System32\drivers\shield.sys`)
 ///     is resolved relative to `%SystemRoot%`. This is what `sc create` writes
 ///     and is the most broadly accepted form.
 ///   - An absolute NT path (`\??\C:\...`) is accepted on most builds but is
@@ -483,14 +483,14 @@ mod tests {
     fn image_path_relative_system32_kept_relative() {
         // `sc create`-style relative path under %SystemRoot% — the most
         // broadly accepted form (Server 2019 rejects \??\ absolute paths).
-        let out = build_image_path(&u16s("System32\\drivers\\RTCore64.sys"));
-        assert_eq!(from_u16(&out), "System32\\drivers\\RTCore64.sys\0");
+        let out = build_image_path(&u16s("System32\\drivers\\shield.sys"));
+        assert_eq!(from_u16(&out), "System32\\drivers\\shield.sys\0");
     }
 
     #[test]
     fn image_path_absolute_gets_nt_prefix() {
-        let out = build_image_path(&u16s("C:\\temp\\RTCore64.sys"));
-        assert_eq!(from_u16(&out), "\\??\\C:\\temp\\RTCore64.sys\0");
+        let out = build_image_path(&u16s("C:\\temp\\shield.sys"));
+        assert_eq!(from_u16(&out), "\\??\\C:\\temp\\shield.sys\0");
     }
 
     #[test]
@@ -514,20 +514,20 @@ mod tests {
 
     #[test]
     fn image_path_absolute_with_nul_trimmed_then_prefixed() {
-        let mut p = u16s("D:\\drivers\\iqvw64e.sys");
+        let mut p = u16s("D:\\drivers\\wdtkernel.sys");
         p.push(0);
         let out = build_image_path(&p);
-        assert_eq!(from_u16(&out), "\\??\\D:\\drivers\\iqvw64e.sys\0");
+        assert_eq!(from_u16(&out), "\\??\\D:\\drivers\\wdtkernel.sys\0");
     }
 
     #[test]
     fn strip_prefix_removes_exactly_18_code_units() {
         // `\Registry\Machine\` = 18 UTF-16 code units; what remains must be
         // the HKLM-relative path RegCreateKeyExW/RegDeleteKeyW expect.
-        let reg = u16s("\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\RTCore64");
+        let reg = u16s("\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\shield");
         assert_eq!(
             from_u16(RegApi::strip_prefix(&reg)),
-            "SYSTEM\\CurrentControlSet\\Services\\RTCore64"
+            "SYSTEM\\CurrentControlSet\\Services\\shield"
         );
         // A shorter path is returned untouched (defensive: no panic, no crop).
         let short = u16s("SYSTEM");

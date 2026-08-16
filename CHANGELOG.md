@@ -12,6 +12,41 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-16 BYOVD 驱动包清理（删除 blocklisted 驱动，默认换 Shield）：
+
+- **删除 RTCore64 与 iqvw64e**：两者均已实锤在微软 Vulnerable Driver
+  Blocklist 上——CI 实测 RTCore64 在全部 hosted 镜像被 WDAC CI 策略拦截
+  （`NtLoadDriver` 0xC0000034，2026-08-13）；iqvw64e 自 2023 年起在名单。
+  `byovd.rs` 中两个 struct/impl、`byovd_drivers/rtc64.rs` /
+  `byovd_drivers/iqvw64e.rs` 整文件删除；`VulnDriverIoctl::raw_rw` 从
+  RTCore64 逐字节循环默认实现改为 trait 必需方法（无消费者残留），
+  `addr_offset` / `pack` / `RwPacket` 等只服务旧默认路径的接口一并清除。
+- **默认驱动换 Shield**：`win::bootstrap_byovd` 硬编码默认从 RtCore64 改为
+  `Box::new(Shield)`（clean，VA 任意 memcpy，单双向 IOCTL）；
+  `default_driver()` 的 `NYX_BYOVD` 取值收敛为 `wdtkernel|shield`。
+  存活加载链 = KslD → WDT phys / Shield VA，默认 Shield。
+- **配套同步**：kernelsdk mock 场景测试改为 Shield + WdtKernel 覆盖
+  （selector 跳过 absent 设备语义保留）；`cfg-write` 改走 Shield 设备；
+  `windows-byovd-hosted.yml` 删除 RTCore64 `byovd` job（保留
+  `blocklist-gate` + `byovd-wdt`，loaded 硬门与诚实 skip 语义不变）；
+  `check_byovd_blocklist.py` 保留 RTCore64 阳性对照并新增 iqvw64e 阳性
+  对照 + shield.sys 三变体缺席断言；`p4-p5-validate.yml` 与
+  `scripts/kernel-lab/` 改为 Shield/WDT 语境。验证：kernelsdk 163 host
+  测试全绿，blocklist 脚本本机 PASS。
+
+2026-08-15 生产接缝落地（PeekabooProbe 客户端 + 探针驱动 + ETW 伪造 kit 接线 + store 迁移事务化）：
+
+- **PeekabooProbe 生产接缝**：`win/peekaboo.rs` 实现 `persistence::PeekabooProbe` 的首个生产 impl——`PeekabooProbeClient` 走 `\\.\PeekabooProbe` METHOD_BUFFERED IOCTL 契约（HANDSHAKE/STATUS/TRACK/UNTRACK 四码，固定小端布局）；配套 `tools/peekaboo-probe/peekaboo_probe.c` 签名探针驱动源码（`PsSetCreateProcessNotifyRoutineEx` 回调在被跟踪进程终止时于内核态执行 Peekaboo 修复，`nt!PspProcessDelete` 一致性检查之前）。TRACK 直接消费 window 隐藏时用的 `EPROCESS+ActiveProcessLinks` KVA，偏移零重复。pack/parse + 客户端为纯跨平台代码（host 单测 + `scenarios.rs` mock transport 集成测试）；仅 CreateFileW/DeviceIoControl 传输与 `driver_load` 加载器 cfg(windows)。效果：`select_pg_window_with_probe` tier 1（offset-free `PeekabooWindow`）在生产可达，不再只有 MockPeekabooProbe 测试缝。驱动签名+部署仍需 operator 侧（EV 证书/WDK 构建）。
+- **ETW 伪造 kit 接线**：`EtwDeceiver` 实现 `EtwForgeKit` trait，`win::assemble_tier` 装入 `KernelTier::etw_forge`（与其他 kit 同 object-safe 缝模式）；`NtTraceEvent` 注入本身仍 operator 侧。
+- **store schema 迁移事务化**：`store.rs`/`session_store.rs`/`implant_store.rs` 的迁移 arm + 版本戳包进单个事务——此前崩溃/SIGKILL 落在两个 arm 之间会留下半迁移的旧版本 DB，下次 `open()` 重跑首个 arm 撞 duplicate-column 永久打不开；回滚保持迁移前状态，下次干净重试。
+
+2026-08-14 内核/睡眠混淆四问题专项修复（Foliage 死代码清零 + PG 偏移离线证伪 + WFP 实装 + WDT 免费验证链）：
+
+- **Foliage APC 死代码残留清零**：执行器本体已于 841ffc5（2026-07-15）删除，本轮清掉残留——evasionsdk 纯模型 `foliage.rs`/`apc.rs` 整文件删除（零非 test 消费者）、`sleep.rs` 废弃入口 `sleep()` 及失效 gating 注释约 100 行删除；`kits.rs` 误导性命名 `struct Foliage`（实为 Fluctuation kit）改名 `Fluctuation`；keylog/entry/selftests/mem/implant-core 等失效注释同步为现状。存活睡眠路径不变：beacon → `kits::sleep` → `fluctuation::sleep`（PAGE_NOACCESS 翻转）。验证：4 个 implant standalone crate 交叉 check 干净、evasionsdk 47 host 测试全绿。
+- **PatchGuard 占位偏移离线证伪**：微软符号服务器取 19041.1023/22621.1778/26100.1742 三个 ntkrnlmp.pdb，`dump_kpcr_members` 实证三 build 上 `_KPRCB+0x190` 均为 `ProcessorState.SpecialRegisters.LastExceptionToRip`（saved RIP 槽，非指针）——`prcb_pg_thread_offset=0x190` 占位确定性证伪（证据含 PDB 版本+GUID，写入 `offsets.rs` 注释）；`verified:false` allow-list 门与测试钉不动，真值仍需 live-kernel KPCR dump（17763/26200 未 dump，诚实标注）；PeekabooWindow 仍为出货的 offset-free PG 路径。
+- **WFP kit 实装（不再永返 Err）**：`netsec.rs` 实现 pid→image-path（OpenProcess+QueryFullProcessImageNameW）→ `FwpmGetAppIdFromFileName0` → 单条件 `FWPM_CONDITION_ALE_APP_ID`（FWP_MATCH_EQUAL）block filter；旧 96 字节"简化 FWPM_FILTER0"修正为 SDK 全布局（200 字节），layer GUID 与 `FWP_ACTION_BLOCK=0x1001` 按 SDK 纠正；AppId blob RAII 保证 `FwpmFilterAdd0` 返回后才释放；解析失败诚实 Err，无任何路径可装零条件 filter（P0-9 回归钉测试）；`assemble_tier` 接入 `wfp: Some(UserModeEdrSilencer)`。Windows lab 端到端验证待做。
+- **WDT BYOVD 免费验证链**：CR3 扫描纯逻辑抽出 `cr3_scan.rs`（host 可测），修复 1 MiB 块边界漏针 bug（6 字节 tail 重叠携带，含跨块回归测试）+ 末位 off-by-one；新增 8 个 mock-phys 单元测试（kernelsdk 159 全绿）；新增 `scripts/check_byovd_blocklist.py` 离线 blocklist 回归门（微软官方 VulnerableDriverBlockList：WDTKernel 缺席 / RTCore64 在场阳性对照；LOLDrivers 交叉引用 `LoadsDespiteHVCI=TRUE`——本机实测 PASS）；`windows-byovd-hosted.yml` 新增 `blocklist-gate`（ubuntu-latest）+ `byovd-wdt`（windows-2022，LOLDrivers LFS 取样 + SHA256 钉 + loaded 状态硬门 + `assess --wdt` JSON 断言）两个 job——免费验证除 HVCI-on 姿态外全链路；HVCI-on 真机矩阵仍无零成本环境，留 `scripts/kernel-lab/` Azure spot 一次性会话。
+
 2026-08-13（续）内核层零成本路径实证：
 
 - **`windows-byovd-hosted.yml` 实测修正**（4a5888a + 31cb1e2）：windows-latest

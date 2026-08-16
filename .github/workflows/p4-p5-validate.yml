@@ -142,7 +142,7 @@ jobs:
           Write-Host "HVCI actively running: $hvci_running"
           Write-Host "CI policy enforced: $ci_enforced"
           if ($ci_enforced -or $hvci_running) {
-            Write-Host "::warning::HVCI/CI policy is enforcing -- BYOVD (RTCore64) load blocked. Skipping kernelsdk job."
+            Write-Host "::warning::HVCI/CI policy is enforcing -- BYOVD (shield.sys) load blocked. Skipping kernelsdk job."
             echo "skip=true" >> $env:GITHUB_OUTPUT
           } else {
             Write-Host "::notice::HVCI NOT running + CI policy NOT enforced -- BYOVD load should succeed."
@@ -174,14 +174,16 @@ jobs:
         if: steps.hvci_probe.outputs.skip == 'false'
         shell: pwsh
         run: |
-          # RTCore64.sys is .gitignore excluded — must be pre-provisioned.
-          $driverPath = "$env:GITHUB_WORKSPACE\tools\RTCore64.sys"
+          # shield.sys (BYOVD default since 2026-08-16 — RTCore64/iqvw64e were
+          # removed from the driver pack; both are on the MS blocklist) is
+          # .gitignore excluded — must be pre-provisioned.
+          $driverPath = "$env:GITHUB_WORKSPACE\tools\shield.sys"
           if (-not (Test-Path $driverPath)) {
-            Write-Host "::warning::RTCore64.sys not found at $driverPath -- skipping BYOVD load."
+            Write-Host "::warning::shield.sys not found at $driverPath -- skipping BYOVD load."
             return
           }
-          # Bootstrap (KslD → BYOVD fallback)
-          .\target\release\nyx-kernel.exe bootstrap --byovd $driverPath NyaRTCore
+          # Bootstrap (KslD → BYOVD fallback, default driver = Shield)
+          .\target\release\nyx-kernel.exe bootstrap --byovd $driverPath NyaShield
           if ($LASTEXITCODE -ne 0) { throw "bootstrap failed (exit $LASTEXITCODE)" }
           # P0.a — PatchGuard window
           .\target\release\nyx-kernel.exe pg-window

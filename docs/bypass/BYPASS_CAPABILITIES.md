@@ -178,17 +178,17 @@
 
 > **⚠️ 前置条件（适用本章节 §10–§17 全部能力）：必须先成功加载一个合法签名的漏洞驱动获取内核读写（`KernelRw`）能力。** 未加载驱动时，本章节所有能力均不可用。`byovd.rs` 头部明确标注 "CODE SHIPPED, NOT LOADED"——代码已就绪，但驱动加载是 operator 的显式动作，非默认行为。
 >
-> **驱动加载链：** 优先 KslD.sys（Living off the Defender, §18）→ 回退 RTCore64.sys (CVE-2019-16098, §10)。驱动层已抽象为 `VulnDriverIoctl` trait，可插拔其他 Nday/白驱动（见 §10 末尾）。
+> **驱动加载链：** 优先 KslD.sys（Living off the Defender, §18）→ 回退 BYOVD 驱动包（默认 Shield.sys，clean VA memcpy；或 WDTKernel phys 模式）。驱动层已抽象为 `VulnDriverIoctl` trait，可插拔其他 Nday/白驱动（见 §10 末尾）。
 > 真机验证在 Server 2019 17763.1339 上完成（2026-06-26，任务 G-K 全通过）。
 
-### 10. BYOVD 内核读写（KernelRw via RTCore64）✅
+### 10. BYOVD 内核读写（KernelRw via BYOVD 驱动包）✅
 
 **对抗：** 无内核权限的 EDR 检测
 
-**原理：** 加载一个有漏洞的合法签名驱动（RTCore64.sys，MSI Afterburner），通过其 IOCTL 通道读写任意物理地址。配合 4 级页表遍历（VA→PA），实现内核虚拟地址的读写。
+**原理：** 加载一个有漏洞的合法签名驱动（当前默认 Shield.sys，Horizon DataSys；历史验证用 RTCore64.sys，MSI Afterburner），通过其 IOCTL 通道读写任意内核地址。物理型驱动配合 4 级页表遍历（VA→PA），实现内核虚拟地址的读写。
 
 **实现：**
-- `byovd.rs` — `ByovdDriver`（IOCTL 封包/解包，48 字节固定协议）+ `RtCore64`（device_path + IOCTL codes + protocol 枚举）
+- `byovd.rs` — `ByovdDriver`（IOCTL 封包/解包）+ `VulnDriverIoctl` trait（device_path + IOCTL codes + `raw_rw` 协议，必需方法）；驱动包 `byovd_drivers/`：Shield（默认）/ WdtKernel（phys-only）
 - `win/driver_load.rs` — `NtLoadDriver` bootstrap（注册表 key + ImagePath + DeviceName + Type=内核 + 加载/卸载）
 - `win/pagewalk.rs` — x64 4 级页表遍历 VA→PA（纯算法，5 测）
 - `win/va_rw.rs` — `VaKernelRw`：VA→PA→物理读写的 KernelRw 适配器
@@ -331,14 +331,14 @@
 
 ### 18. KslD.sys Living off the Defender（优先驱动加载路径）✅
 
-**对抗：** BYOVD 驱动加载检测（RTCore64.sys 不在所有主机上存在）
+**对抗：** BYOVD 驱动加载检测（外挂 .sys 不在所有主机上存在）
 
-**原理：** 优先从 Defender 自带的 `KslD.sys`（KrnlSecLab Driver，Windows 10 1809+）获取内核读写能力。KslD.sys 由 Defender 安装、有合法签名、在 Defender-on 的主机上总是存在。通过注册表 + `NtLoadDriver` 加载后，用其 IOCTL 通道执行内核物理读写（和 RTCore64 相同的 ByovdDriver 适配）。
+**原理：** 优先从 Defender 自带的 `KslD.sys`（KrnlSecLab Driver，Windows 10 1809+）获取内核读写能力。KslD.sys 由 Defender 安装、有合法签名、在 Defender-on 的主机上总是存在。通过注册表 + `NtLoadDriver` 加载后，用其 IOCTL 通道执行内核物理读写（与 BYOVD 驱动包相同的 ByovdDriver 适配）。
 
 **实现：**
 - `operator-kernelsdk/src/win/driver_load.rs` — `load_ksld()` 完整 NtLoadDriver 注册表 bootstrap
-- `operator-kernelsdk/src/win/mod.rs` — `bootstrap_chain()` Priority 1: KslD → Priority 2: RTCore64 fallback
-- `operator-kernelsdk/src/byovd.rs` — `ByovdDriver`（RTCore64 专用）；KslD 的完整 KernelRw 在 `win/ksld.rs`（`LivingOffDefender`，`QueryDosDeviceW` 动态设备枚举 + 逐字节 kread/kwrite）
+- `operator-kernelsdk/src/win/mod.rs` — `bootstrap_chain()` Priority 1: KslD → Priority 2: BYOVD fallback（默认 Shield）
+- `operator-kernelsdk/src/byovd.rs` — `ByovdDriver` + `VulnDriverIoctl` 驱动包；KslD 的完整 KernelRw 在 `win/ksld.rs`（`LivingOffDefender`，`QueryDosDeviceW` 动态设备枚举 + 逐字节 kread/kwrite）
 
 **接线状态：** 🟢 100% — `bootstrap_chain()` 已接通 KslD 优先路径 + `LivingOffDefender::open()` 支持动态 `QueryDosDeviceW` 枚举 MpKsl* 设备名
 
@@ -414,7 +414,7 @@ FrameList → RegisteredFilters`，把目标 EDR 过滤器（如 WdFilter）从�
 | **进程枚举** | DKOM ActiveProcessLinks unlink | ✅ |
 | **PPL 保护** | Protection 字段剥离 | ✅ |
 | **EDR 回调（Sysmon/WdFilter）** | ctx 指针 repurpose → ret gadget（DATA 写，HVCI-safe，**selective slot 已完成**） | ✅ 真机验证 EID1 SILENCED/RESUMED |
-| **驱动加载（BYOVD）** | bootstrap_chain(): KslD 优先（动态 `QueryDosDeviceW` 枚举）→ RTCore64 回退 | ✅ 真机（KslD 设备动态解析 + RTCore64） |
+| **驱动加载（BYOVD）** | bootstrap_chain(): KslD 优先（动态 `QueryDosDeviceW` 枚举）→ BYOVD 回退（默认 Shield / WDT phys） | ✅ 真机（KslD 设备动态解析 + 历史 RTCore64 链路） |
 | **MiniFilter 文件过滤** | `telemetry.rs::MiniFilterUnlinker`（list-unlink 已注册过滤器，数据写） | 🔶 算法完成，**bootstrap 未接线**（`flt_globals_kva=0`） |
 | **PE .text hash（PE-sieve）** | ThreadlessInject (HWBP)（`inject.rs:489-632`） | ✅ 已实现 |
 | **CET shadow stack** | 悲观降级（CET-on 不执行 RSP swap，`SPOOF_SWAP_ENABLED=false`） | ✅ 降级安全 |
@@ -437,7 +437,7 @@ FrameList → RegisteredFilters`，把目标 EDR 过滤器（如 WdFilter）从�
 | **transport 信道消费** | 6 个 Transport impl（Malleable/DoH/Slack/LLM/MCP/SMB）全部零消费者 | 🔴 **未接通**（AUTHORITATIVE_FACTS §3 #4） |
 | **caller-spoof 运行时宏** | 当前仅 scanner，缺任意敏感调用的自动 spoof 宏 | 🔴 未接通（AUTHORITATIVE_FACTS §3 #7） |
 | **MiniFilter 接线** | `telemetry.rs::MiniFilterUnlinker` 算法已写，但 `bootstrap_chain()` 未解析 `flt_globals_kva` | 🔴 算法在，接线缺（G4） |
-| **driver 加载的 HVCI/CI 绕过** | HVCI-on 主机上 RTCore64 可能被 CI 拒绝 | 当前目标 HVCI-off；HVCI-on 需 DMA 或 driverless CVE |
+| **driver 加载的 HVCI/CI 绕过** | HVCI-on 主机上 blocklisted 驱动会被 CI 拒绝（微软 blocklist） | 当前出货驱动（WDT/Shield）不在名单上；blocklisted Nday 需 DMA 或 driverless CVE |
 | **WFP filter 注入** | netsec 规则生成的内核调用站 binding | 🔶 算法就绪，binding 未接 |
 | **LSASS 凭据解析** | `read_process_mem` 框架就绪，LSASS 特化的 drypt 解析未实现 | 🔶 框架就绪 |
 | **postex token 操作接线** | `postex.rs` 有 steal/use/revert 实现，但无 `Command` 调用（仅 selftest） | 🔴 未接线（G1） |

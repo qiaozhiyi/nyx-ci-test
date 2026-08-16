@@ -521,9 +521,11 @@ impl<'a> PatchGuardKit for RuntimePgBypassWindow<'a> {
 /// kernel-interaction seam of the Peekaboo path (kept behind a trait so the
 /// timing/window logic stays host-testable with a mock).
 ///
-/// Real impl (operator-side driver): registers a
-/// PsSetCreateProcessNotifyRoutineEx callback; when a guarded process
-/// terminates (CreateInfo == NULL) the callback fires before
+/// Production impl: `win::peekaboo::PeekabooProbeClient` (re-exported as
+/// `crate::peekaboo` on non-Windows hosts) — the user-mode client for the
+/// signed probe driver (`tools/peekaboo-probe/peekaboo_probe.c`), which
+/// registers a PsSetCreateProcessNotifyRoutineEx callback; when a guarded
+/// process terminates (CreateInfo == NULL) the callback fires before
 /// nt!PspProcessDelete's LIST_ENTRY validation — that is the repair window,
 /// and the callback performs [`PeekabooWindow::repair_links`] for the
 /// terminating EPROCESS.

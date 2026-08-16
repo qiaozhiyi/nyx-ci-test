@@ -1395,11 +1395,9 @@ pub unsafe extern "system" fn nyx_linger() {
 }
 
 // ============================================================================
-// nyx_linger_foliage: same surface as nyx_linger but with the Foliage sleep
-// mask ARMED, so each 1s sleep slice goes through the mask→sleep→unmask cycle
-// (RC4 of registered data regions around the parked NtDelayExecution). This is
-// the scan target for task B: compare its PE-sieve surface to nyx_linger's.
-// Invoke: rundll32 nyx_implant_win.dll,nyx_linger_foliage  (then scan its PID).
+// nyx_linger_foliage: REMOVED with the Foliage APC chain (commit 841ffc5).
+// The plain `nyx_linger` export above remains the scan target; Fluctuation is
+// exercised through the normal beacon sleep path.
 // ============================================================================
 
 // Marker: %TEMP%\nyx_etwti_status.txt with "code=<hex> status=<signed-dec>" per line.
@@ -2997,13 +2995,11 @@ fn join(base: &str, suffix: &str) -> String {
 }
 
 // ============================================================================
-// P2.1a-iii Foliage sleep mask: arm + one 1s sleep cycle, check no crash.
-// bit0 = armed + sleep returned (no crash). The mask/unmask round-trip didn't
-// corrupt the running image (we're executing through .text — if RC4 left it
-// encrypted we'd never reach the exit).
+// P2.1a-iii sleep-mask selftests: REMOVED. `nyx_selftest_foliage` and
+// `nyx_selftest_foliage_apc` were deleted with the Foliage APC chain (commit
+// 841ffc5) — superseded by the Fluctuation sleep mask, which is exercised via
+// the normal beacon sleep path instead of a dedicated selftest export.
 // ============================================================================
-// NOTE: nyx_selftest_foliage and nyx_selftest_foliage_apc were removed — the
-// Foliage APC chain is dead code (superseded by Fluctuation sleep mask).
 
 // ============================================================================
 // P2.1a-ii swap decision: confirm the staging + decide() path runs without

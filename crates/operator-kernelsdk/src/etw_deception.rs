@@ -345,8 +345,32 @@ impl EtwDeceiver {
     }
 }
 
-// ---- §4.2 Frequency Keeper ------------------------------------------------
+/// [`crate::EtwForgeKit`] impl — this is how `win::assemble_tier` wires the
+/// deceiver into `KernelTier::etw_forge`. The trait methods delegate 1:1 to
+/// the inherent forge methods; the trait exists so the tier can hold the kit
+/// behind an object-safe seam like every other kit.
+impl crate::EtwForgeKit for EtwDeceiver {
+    fn forge_process_create(
+        &self,
+        parent_pid: u32,
+        child_pid: u32,
+        image_name: &[u8],
+        timestamp: u64,
+    ) -> Result<Vec<u8>, KitError> {
+        EtwDeceiver::forge_process_create(self, parent_pid, child_pid, image_name, timestamp)
+    }
 
+    fn forge_process_stop(
+        &self,
+        pid: u32,
+        exit_status: u32,
+        timestamp: u64,
+    ) -> Result<Vec<u8>, KitError> {
+        EtwDeceiver::forge_process_stop(self, pid, exit_status, timestamp)
+    }
+}
+
+// ---- §4.2 Frequency Keeper ------------------------------------------------
 /// Tracks the expected event frequency for a single ETW provider and decides
 /// when the next forged event should be injected.
 #[derive(Clone, Debug)]

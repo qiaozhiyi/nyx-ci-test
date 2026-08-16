@@ -1035,8 +1035,9 @@ pub unsafe fn nt_wait_for_single_object(
 }
 
 /// `NtProtectVirtualMemory` — 5 real args: ProcessHandle, BaseAddress* (IN OUT),
-/// RegionSize* (IN OUT), NewAccessMask, OldAccessMask* (OUT). Used by Foliage
-/// (RX↔RW flip) + mem (.text mask). The current-process pseudo-handle
+/// RegionSize* (IN OUT), NewAccessMask, OldAccessMask* (OUT). Used by mem
+/// (.text mask RX↔RW flip) + fluctuation (page-flip sleep mask). The
+/// current-process pseudo-handle
 /// (`0xFFFF_FFFF_FFFF_FFFF`) is passed for ProcessHandle.
 ///
 /// # Safety
@@ -1061,8 +1062,10 @@ pub unsafe fn nt_protect_virtual_memory(
 }
 
 /// `NtQueueApcThread(ThreadHandle, ApcRoutine, ApcArgument1, ApcArgument2,
-/// ApcArgument3)` — 5 real args. Used by the Foliage chain to queue `NtContinue`
-/// APCs that walk the sleeping thread through its context dance.
+/// ApcArgument3)` — 5 real args. No current callers — its only consumer was
+/// the Foliage chain (removed, commit 841ffc5), which queued `NtContinue`
+/// APCs that walk the sleeping thread through its context dance. Kept for a
+/// future APC-class sleep mask.
 ///
 /// # Safety
 /// `thread` must be a real thread handle with THREAD_SET_CONTEXT access.
@@ -1086,9 +1089,9 @@ pub unsafe fn nt_queue_apc_thread(
 }
 
 /// `NtContinue(ContextRecord, RaiseAlert)` — 2 real args. Restores a thread's
-/// register state from a CONTEXT struct. The Foliage chain queues APCs that
-/// each call NtContinue to install the next context in the mask→sleep→unmask
-/// dance. 2 args → padded into the 4-arg shim.
+/// register state from a CONTEXT struct. Used by the Fluctuation thunk
+/// trampoline (and formerly by the removed Foliage chain) to install the next
+/// context in the mask→sleep→unmask dance. 2 args → padded into the 4-arg shim.
 ///
 /// # Safety
 /// `ctx` must point at a valid, properly-aligned CONTEXT (1232 bytes on x64).
@@ -1097,8 +1100,9 @@ pub unsafe fn nt_continue(rt: &Runtime, ctx: usize, raise_alert: u8) -> Option<i
 }
 
 /// `NtGetContextThread(ThreadHandle, ContextRecord)` — 2 real args. Captures
-/// the current register state of `thread` into `ctx`. Used by Foliage to save
-/// the original CONTEXT before installing a spoofed one.
+/// the current register state of `thread` into `ctx`. Used by fluctuation and
+/// inject (thread hijack) to save the original CONTEXT before installing a
+/// spoofed one.
 ///
 /// # Safety
 /// `ctx` must point at an aligned, writable CONTEXT buffer (1232 bytes on x64).
@@ -1107,8 +1111,8 @@ pub unsafe fn nt_get_context_thread(rt: &Runtime, thread: usize, ctx: usize) -> 
 }
 
 /// `NtSetContextThread(ThreadHandle, ContextRecord)` — 2 real args. Installs
-/// `ctx` as the register state of `thread`. Used by Foliage to set the spoofed
-/// CONTEXT (RIP = gap address) and later restore the original.
+/// `ctx` as the register state of `thread`. Used by fluctuation and inject to
+/// set the spoofed CONTEXT (RIP = gap address) and later restore the original.
 ///
 /// # Safety
 /// `ctx` must point at a valid CONTEXT. Modifying a running thread's RIP/RSP
@@ -1211,8 +1215,10 @@ pub unsafe fn nt_resume_thread(rt: &Runtime, thread: usize, prev_count: &mut u32
     )
 }
 
-/// `NtOpenThread` — opens a handle to a thread by its TID + client ID. Used by
-/// Foliage to get a handle to the current (beacon) thread for APC queuing.
+/// `NtOpenThread` — opens a handle to a thread by its TID + client ID. No
+/// current callers via this wrapper — its only consumer was the Foliage
+/// chain (removed, commit 841ffc5), which used it to get a handle to the
+/// current (beacon) thread for APC queuing.
 /// 4 real args (ThreadHandle*, DesiredAccess, ObjectAttrs, ClientId*).
 ///
 /// # Safety

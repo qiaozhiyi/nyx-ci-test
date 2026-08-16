@@ -2,12 +2,12 @@
 //!
 //! ## How to add a new driver (3 steps)
 //!
-//! 1. Create `byovd/<name>.rs` implementing `VulnDriverIoctl`.
-//! 2. Add `pub mod <name>;` to this file.
-//! 3. Add a constructor in the `drivers!` macro at the bottom.
+//! 1. Create `byovd_drivers/<name>.rs` implementing `VulnDriverIoctl`.
+//! 2. Add `pub mod <name>;` + a `pub use` re-export to this file.
+//! 3. Wire it into `byovd::default_driver()` (`NYX_BYOVD` match arm).
 //!
-//! Each driver file is self-contained: IOCTL codes, device path, struct layout.
-//! The `VulnDriverIoctl` trait handles everything else via `addr_offset()`.
+//! Each driver file is self-contained: IOCTL codes, device path, struct layout,
+//! and the `raw_rw` wire protocol (a required trait method — no default).
 //!
 //! ## Driver selection
 //!
@@ -20,13 +20,9 @@
 //! No driver stays unblocklisted forever. The pluggable architecture lets
 //! operators swap drivers without touching anything outside this directory.
 
-pub mod rtc64;
-pub mod iqvw64e;
 pub mod shield;
 pub mod wdtkernel;
 
 // Re-export for convenience.
-pub use rtc64::RtCore64;
-pub use iqvw64e::Iqvw64e;
 pub use shield::Shield;
 pub use wdtkernel::WdtKernel;

@@ -1,24 +1,36 @@
-//! Caller-spoof diagnostic — CET shadow-stack probe only.
+//! Caller-spoof CET posture — shadow-stack probe + CET-safety contract.
 //!
 //! # Status
-//! The return-address spoofing machinery (`ReturnStub` scanner,
+//! The old return-address spoofing machinery (`ReturnStub` scanner,
 //! `call_with_spoofed_return` / `call_with_spoofed_return!`, `call_plain`) was
-//! **removed** — it was dead code with no production call site, and its ABI
-//! premise was wrong: the Win64 convention requires the CALL **site** RSP to be
-//! 16-aligned, i.e. the target's entry RSP to be 8 mod 16, but the old
-//! implementation delivered the target with a 16-aligned entry RSP (via a
-//! `sub rsp, reserve` whose size was pinned to a 16-multiple). That misalignment
-//! plus the fake frame's shadow-space placement inside compiler-owned frame
-//! regions could not be made sound without a naked asm shim, and the module
-//! could not be validated on the engagement target (Server 2019 17763, no CET).
-//! Deleting it removes ~460 lines of unexercised, unsound call-spoofing claims.
+//! removed — it was dead code with no production call site, and its ABI
+//! premise was wrong (the Win64 convention requires the CALL **site** RSP to
+//! be 16-aligned; the old implementation delivered the target with a
+//! 16-aligned entry RSP). Its CET story was also wrong-headed: that design
+//! RETURNED THROUGH a forged frame (`ret` pops the forged address → mismatch
+//! with the shadow stack → #CP), which is the one spoof shape CET genuinely
+//! kills.
 //!
-//! What remains is the **CET probe** (`[`is_cet_enabled`]`), which is live:
-//! `nyx_selftest_cet_status` reports it as an operator diagnostic, and the
-//! loader's host-side probe (`nyx-loader/src/dll_probe.rs`) mirrors the same
-//! `IsProcessorFeaturePresent(PF_RETURN_CONTROL_ENFORCE)` query so the two
-//! agree. The probe answers "would a return-address spoof path degrade here?",
-//! which the remaining call-stack-spoofing code in [`nyx_implant_core::stack`] also uses.
+//! The live spoof is the gap-sea RSP swap in [`nyx_implant_core::stack`]
+//! (`with_spoofed_stack` / `spoof_wrap`, armed at bootstrap via
+//! `evasionsdk::swap::decide`). It is **CET-shadow-stack-safe by
+//! construction**: the fake stack is entered with a normal `call`, so every
+//! executed `ret` pops a value a real `call` just pushed (matched data +
+//! shadow pair), and the forged leaf-gap chain above the call region is only
+//! READ by EDR unwinders, never POPPED. There is therefore NO CET
+//! degradation on the spoof path — `swap::decide` gates only on gap
+//! usability, and the spoof stays active on CET-on hosts. (Windows enforces
+//! CET's other half, IBT, only in kernel mode, so the trampoline's indirect
+//! calls need no `endbr64`.)
+//!
+//! What remains here is the **CET probe** (`[`is_cet_enabled`]`), which is
+//! live: `nyx_selftest_cet_status` reports it as an operator diagnostic, and
+//! the loader's host-side probe (`nyx-loader/src/dll_probe.rs`) mirrors the
+//! same `IsProcessorFeaturePresent(PF_RETURN_CONTROL_ENFORCE)` query so the
+//! two agree. The probe now answers "is shadow-stack enforcement active
+//! while the (CET-safe) spoof runs" — useful posture information (a
+//! kernel-level detector can compare data vs shadow stack there), not a
+//! go/no-go gate.
 
 #![cfg(target_os = "windows")]
 

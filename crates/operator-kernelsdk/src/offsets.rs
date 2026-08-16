@@ -427,9 +427,31 @@ pub mod kprcb {
 // layouts). The PatchGuard context structure is UNDOCUMENTED and — confirmed
 // in the pg-pdb-verify pass (2026-08) — carries NO type information in the
 // public `ntkrnlmp.pdb` on the MS symbol server (checked 19041 + 22621 type
-// streams: no PG-context struct exists to parse), so these offsets CANNOT be
-// PDB-validated by design; validating them requires a live-kernel KPCR dump
-// per build. Writing a kernel address derived from them is a BSoD lottery.
+// streams: no PG-context struct exists to parse), so the PG-context-side
+// offsets CANNOT be PDB-validated by design; validating them requires a
+// live-kernel KPCR dump per build. Writing a kernel address derived from
+// them is a BSoD lottery.
+//
+// OFFLINE FALSIFICATION (2026-08-13): the PRCB-side half IS checkable —
+// `_KPRCB` is present in the public PDB type stream. Dumps of MS
+// symbol-server ntkrnlmp.pdb (offset-resolver `dump_kpcr_members`; PDBs
+// matched to ntoskrnl.exe 10.0.19041.1023 / 10.0.22621.1778 /
+// 10.0.26100.1742, PDB GUID+age 121F238DD43DA32C1476AC846D4FEA74/1,
+// DB9E9EC849EB856A93EB8F4736A05ABD/1, 953A8DE880B0818C32DA2DEC1D79C2D9/1)
+// agree on all three builds:
+//   - `_KPRCB.ProcessorState` (a `_KPROCESSOR_STATE`, size 0x5c0) starts at
+//     0x100, so KPRCB+0x190 = ProcessorState+0x90 =
+//     `_KSPECIAL_REGISTERS.LastExceptionToRip` — a saved u64 register, not
+//     a pointer field. The `prcb_pg_thread_offset: 0x190` placeholder is
+//     FALSIFIED: reading it as a PG validation-thread pointer would pick up
+//     a stale exception RIP.
+//   - The public `_KPRCB` type is truncated at 0x700 (last member
+//     `PrcbPad12` @ 0x6d8); the real struct is larger, but the
+//     0x100..0x6c0 ProcessorState region is ABI-stable and genuine.
+//   - Builds 17763 / 26200 were not dumped in this pass; their rows remain
+//     unfalsified placeholders (same layout family, no evidence pulled).
+// `context_valid_offset: 0x08` and `context_size` refer to the PG context
+// struct itself and stay unverifiable offline (no PDB type, see above).
 // The runtime build allow-list gate [`pg_context_usable_for_window`] returns
 // `false` for every build while all rows are unverified, so
 // `win::select_pg_window` refuses to construct a window instead of silently
@@ -500,7 +522,9 @@ pub const KNOWN_PG_CONTEXT_BUILDS: &[PgContextBuild] = &[
     PgContextBuild {
         build: 19041,
         offsets: PgContextOffsets {
-            prcb_pg_thread_offset: 0x190, // PLACEHOLDER
+            // PLACEHOLDER, falsified 2026-08-13 (PDB 19041.1023): KPRCB+0x190 =
+            // ProcessorState.SpecialRegisters.LastExceptionToRip — see header.
+            prcb_pg_thread_offset: 0x190,
             context_valid_offset: 0x08,   // PLACEHOLDER
             context_size: 0x800,
             supports_thread_suspend: false,
@@ -511,7 +535,9 @@ pub const KNOWN_PG_CONTEXT_BUILDS: &[PgContextBuild] = &[
     PgContextBuild {
         build: 22621,
         offsets: PgContextOffsets {
-            prcb_pg_thread_offset: 0x190, // PLACEHOLDER
+            // PLACEHOLDER, falsified 2026-08-13 (PDB 22621.1778): KPRCB+0x190 =
+            // ProcessorState.SpecialRegisters.LastExceptionToRip — see header.
+            prcb_pg_thread_offset: 0x190,
             context_valid_offset: 0x08,   // PLACEHOLDER
             context_size: 0x900,
             supports_thread_suspend: false,
@@ -522,7 +548,9 @@ pub const KNOWN_PG_CONTEXT_BUILDS: &[PgContextBuild] = &[
     PgContextBuild {
         build: 26100,
         offsets: PgContextOffsets {
-            prcb_pg_thread_offset: 0x190, // PLACEHOLDER
+            // PLACEHOLDER, falsified 2026-08-13 (PDB 26100.1742): KPRCB+0x190 =
+            // ProcessorState.SpecialRegisters.LastExceptionToRip — see header.
+            prcb_pg_thread_offset: 0x190,
             context_valid_offset: 0x08,   // PLACEHOLDER
             context_size: 0x900,
             supports_thread_suspend: true,

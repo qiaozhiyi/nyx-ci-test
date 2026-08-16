@@ -32,7 +32,7 @@
 | **加密协议** | X25519 ECDH + HKDF-SHA256 + ChaCha20-Poly1305;方向隔离 nonce;单调计数器防重放;secrets 零化;contributory X25519(拒绝低阶点/全零共享密钥) | ✅ 完整无弱点(`protocol/src/crypto.rs:222-248,302-319,370-386`) |
 | **团队服务器** | tokio/axum HTTP(S);三机制鉴权(bootstrap operator / operators file / legacy token);三角色 RBAC(argon2id);会话/任务队列;SQLite 凭据+implant 库;哈希链审计;Rhai 事件脚本;Malleable C2 profile;implant 生成 | ✅ 完整(`server/src/lib.rs`,14 静态 + 动态 profile 路由) |
 | **Windows PIC 植入体** | 29,202 LOC `no_std` DLL;**28** Command 全派发;间接 syscall;9 通道(5 直连 + 4 ExtC2 中转);Module Stomping + ThreadlessInject + Pool Party;HWBP patchless blind;CFG 用户态 bitmap;LACUNA/insomniac/caller-spoof/proxy-veh scanner | ✅ 核心链路完整;**睡眠混淆条件接线**(见已知限制) |
-| **内核层 SDK** | BYOVD(Shield/RTCore64/Iqvw64e 可用,WDTKernel 物理内存 stub);ETW-TI blind(4-hop);DKOM 进程隐藏;回调中和+重定向;MiniFilter 解链;PPL stripper;CFG bitmap;LSASS 内核读;minidump 组装;ETW 事件伪造 | ✅ 算法完整 + mock 测试;PatchGuard 偏移未验证 |
+| **内核层 SDK** | BYOVD(默认 Shield VA memcpy,WDTKernel phys 模式已接线(CR3 扫描+MZ 门,CI 待跑);RTCore64/iqvw64e 已因微软 blocklist 移除);ETW-TI blind(4-hop);DKOM 进程隐藏;回调中和+重定向;MiniFilter 解链;PPL stripper;CFG bitmap;LSASS 内核读;minidump 组装;ETW 事件伪造 | ✅ 算法完整 + mock 测试;PatchGuard 占位偏移已离线证伪 |
 | **操作端** | Tauri 2 + React + Three.js 桌面 GUI(3D 网络拓扑 + 语义化命令 + 结构化输出 + 「文件」Dock 页远程文件浏览器);BOF/upload 原生文件选择器;会话元数据 overlay(本地 star/alias/tag/notes + 归属分配);REST API;2s 轮询增量更新 | ✅ 可用(2026-07-17 接入全部 server 端点) |
 | **脚本 / 扩展** | Rhai 脚本(3 event,资源配额);Malleable C2 profile(c2lint);BOF(CS ABI `go(args,alen)`,W^X 加载,Beacon API 族:`BeaconPrintf`/`BeaconOutput` + datap 解析族 + `BeaconIsAdmin`/`BeaconGetSpawnTo` + kernel32/ntdll externals 表) | ✅ 脚本可用 / ✅ BOF 核心 API 已扩面(token/spawn/inject 类未接) |
 | **传输层** | 6 个 `Transport` trait impl（Malleable/DoH/Slack/LLM/MCP/SMB）+ JA3/JA4 计算 | ✅ 4 个 extc2 中继（Slack/LLM/Discord/MCP）全接 boot-time `TransportStack`；DoH 权威应答器、SMB/TCP pivot 父监听已落地（2026-08-03 接线波次） |
@@ -60,17 +60,17 @@ crates/
 │   ├── lacuna.rs          #   .pdata 间隙扫描
 │   ├── stack.rs           #   BYOUD-Gap 栈欺骗 (mov rsp 内联汇编)
 │   ├── fluctuation.rs     #   睡眠混淆实现 (🟡 条件接线,见已知限制)
-│   ├── sleep.rs           #   Foliage APC 脚手架 (🔴 入口死代码,helpers 存活)
+│   ├── sleep.rs           #   sleep 基建 (own_text_region/raw_create_thread 等,供 fluctuation 复用;Foliage APC 已删)
 │   ├── inject.rs          #   Module Stomping (默认 arm) + ThreadlessInject
 │   ├── tp.rs              #   Pool Party (默认 OFF)
 │   ├── channels/          #   9 通道: Https/DohDns/Dns/Smb/Tcp + 4 ExtC2 中转
 │   └── selftests.rs       #   46 个 selftest 导出 (feature-gated)
 ├── operator-kernelsdk/    # 内核 EDR 绕过 SDK (9,791 LOC, 独立 crate)
-│   ├── byovd.rs + byovd_drivers/  # BYOVD: Shield / RTCore64 / Iqvw64e / WdtKernel(stub)
+│   ├── byovd.rs + byovd_drivers/  # BYOVD: Shield(默认) / WdtKernel(phys)
 │   ├── etwti.rs           #   ETW-TI blind (4-hop)
 │   ├── telemetry.rs       #   回调中和 + MiniFilter 解链
 │   ├── persistence.rs     #   DKOM 隐藏 + PPL strip + PatchGuard 窗口
-│   ├── netsec.rs          #   LSASS 内核读 + CFG bitmap + WfpKit(🟡 永返 Err)
+│   ├── netsec.rs          #   LSASS 内核读 + CFG bitmap + WfpKit(✅ ALE_APP_ID 实装,待 lab)
 │   ├── etw_deception.rs   #   ETW 事件伪造 (🟡 仅 CLI 调用,无 tier 装配)
 │   └── win/ksld.rs        #   LivingOffDefender (优先于 BYOVD)
 │
@@ -382,7 +382,7 @@ gh workflow run ny-mirror.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
 gh workflow run b3-verify.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
 ```
 
-镜像 workflow 经只读 deploy key 克隆本私有仓库,在免费公有 runner 上执行与 `.github/workflows/` 相同的步骤;hosted runner 上的用户态 selftest 不再跳过——由 `nyx-bof-isolated-probe` 控制台探针直调导出(Session 0 安全)。用完即清空历史 runs/artifacts,workflow 文件常驻备用。`windows-byovd-hosted.yml` 未镜像(需预置 RTCore64.sys + HVCI 关闭,hosted runner 上本就自我跳过)。
+镜像 workflow 经只读 deploy key 克隆本私有仓库,在免费公有 runner 上执行与 `.github/workflows/` 相同的步骤;hosted runner 上的用户态 selftest 不再跳过——由 `nyx-bof-isolated-probe` 控制台探针直调导出(Session 0 安全)。用完即清空历史 runs/artifacts,workflow 文件常驻备用。`windows-byovd-hosted.yml` 未镜像(含真机驱动加载 + loaded 硬门,免费 runner 上由 blocklist-gate 覆盖离线断言)。
 
 ---
 
@@ -391,20 +391,20 @@ gh workflow run b3-verify.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
 | 项 | 代码实情 | 证据(file:line) |
 |---|---|---|
 | **睡眠混淆 Fluctuation** | 🟡 **条件接线(受限交付)** | `kits::sleep` 在 `evasion_active() && fluctuation::enabled()` 时路由 `fluctuation::sleep`(`kits.rs:75-81`);fluctuation 默认开启(`NYX_FLUCTUATION_OFF=1` 关闭,`fluctuation.rs:11-15`),失败降级纯 sleep(`fluctuation.rs:25-33`);noevasion 模式(`set_evasion_off`)跳过掩码。Foliage helper-thread `.text` 掩码路径仍休眠(`mem.rs:249-253`)。 |
-| **Foliage APC .text 加密** | 🔴 入口死代码,helpers 存活 | `sleep::sleep()` 零调用方(beacon 循环走 `kits::sleep` → `fluctuation::sleep`,`sleep.rs:79-91`);helpers(`own_text_region`/`raw_create_thread`/`FoliageRaw` 等)仍被 fluctuation/evasion_glue/keylog 等使用(`sleep.rs:84`)。 |
+| **Foliage APC .text 加密** | ⛔ 已删除(841ffc5,被 Fluctuation 取代) | 执行器 2026-07-15 删除;2026-08-14 残留清零(evasionsdk `foliage.rs`/`apc.rs` 模型 + `sleep.rs` 废弃入口 + 失效注释);`kits.rs` 误名 `Foliage`→`Fluctuation`。存活路径:beacon→`kits::sleep`→`fluctuation::sleep`。 |
 | **transport/ crate** | 🟡 **全接线(受限交付)** | 4 个第三方 API 中继(Slack/LLM/Discord/MCP)经 boot-time `TransportStack` 由 server 中转(`extc2_relay.rs`,均 HMAC fail-closed);DoH 信道由 server 权威 DNS 应答器(`server/src/dns_responder.rs`,RFC 8484 JSON + UDP/53)支撑,`agent-dev --channel doh` 消费 `DohDnsTransport`;SMB/TCP pivot 父监听在 server(`smb_listener.rs` Windows-only / `tcp_pivot.rs`);TLS emitter 由 `nyx-agent-dev` `impersonation` feature 消费(CI Gate 7)。implant 侧保持自滚 WinHTTP 通道(no_std PIC 设计)。 |
 | **TLS 指纹 emitter** | 🟡 **feature 门控(实验性)** | `impersonation` feature 下返回真实 BoringSSL(`wreq`)客户端(`fingerprint.rs:201-211`;`Cargo.toml [features]`);默认(hermetic)构建仍返 `Err(BackendUnavailable)`(`fingerprint.rs:225-229`)。未接入 server 出站链路。 |
 | **caller-spoof** | 🟡 **已实现(受限交付)** | `call_with_spoofed_return!` 宏 + 函数形式已存在(`caller_spoof.rs:464-499`);CET 探测自门:检测到 CET 时降级 `call_plain`(`caller_spoof.rs:36-41,212-229`)。 |
 | **proxy_veh 注册路径** | 🟡 未用 | `register_section_backed_handler` 完整实现(KnownDlls SEC_IMAGE + code cave trampoline),但 HWBP 路径直接用 `AddVectoredExceptionHandler`。gadgets 扫描后未消费。 |
 | **Pool Party 注入** | 🟡 完整但默认 OFF(受限交付) | `tp.rs` 全实现(section 投递 + worker-factory 劫持 + `_TP_DIRECT` splice),仅 `NYX_POOL_PARTY_ON=1 && method=0 && pid!=0` 时触发。本次修复 `SYSTEM_HANDLE_INFORMATION_EX` 布局(count@0/stride 0x28/handle@0x10/pid@0x08)+ synthetic-buffer 测试。 |
 | **BOF 兼容面** | 🟡 **受限交付(Beacon API 已扩面)** | Beacon API 面:`BeaconPrintf`/`BeaconOutput` + `datap` 解析族(`BeaconDataParse`/`BeaconDataInt`/`BeaconDataShort`/`BeaconDataLength`/`BeaconDataExtract`,misaligned 安全)+ `BeaconIsAdmin`(advapi32 TokenElevation)+ `BeaconGetSpawnTo`(`bof-runner/src/shim.rs`,`layout::BEACON_APIS` 注册);+ `GetModuleHandleA/GetProcAddress` 解析的 kernel32/ntdll 常用导出(`bof-runner/src/win.rs`);W^X:代码段 reloc 后 `VirtualProtect(RX)` 再 `go()`;CS ABI `go(args,alen)` + NULL fallback;内存经 RAII guard 于 `go()` 返回后释放。wine64 实测:datap 全 API 解析回显正确、admin/spawn/raw 输出正确、未实现 API 报 `unresolved external symbol` 带名报错(2026-08-10)。仍未接:token/spawn/inject 类(`BeaconUseToken`/`BeaconSpawnTemporaryProcess`/`BeaconInjectProcess` 等)。 |
-| **WfpKit(内核)** | 🔴 装配但永失败 | `netsec.rs:block_outbound_for_pid` 永返 Err(拒绝零条件 filter);`assemble_tier` 设 `wfp: None`。**注:implant-win 中无任何 WFP 代码**(grep 零命中)。 |
-| **PatchGuard bypass** | 🟡 偏移未验证 | `persistence.rs:550-720` 用 valid_flag 置零法,偏移 `prcb_pg_thread=0x190`/`valid=0x08` 代码自标需 PDB 验证。非 Outflank Peekaboo 法。 |
+| **WfpKit(内核)** | 🟡 已实装(待 lab 端到端) | pid→image-path(OpenProcess+QueryFullProcessImageNameW)→`FwpmGetAppIdFromFileName0`→单条件 `FWPM_CONDITION_ALE_APP_ID` block(`netsec.rs`;FWPM_FILTER0 按 SDK 200B 布局修正);零条件 filter 不可能构造(P0-9 钉测试);`assemble_tier` 已接 `wfp: Some(...)`。**注:implant-win 中无任何 WFP 代码**(grep 零命中)。 |
+| **PatchGuard bypass** | 🟡 占位已离线证伪,真值未取 | `persistence.rs` valid_flag 置零法;2026-08-14 三个 ntkrnlmp.pdb 实证 `_KPRCB+0x190`=`LastExceptionToRip`(非指针),`prcb_pg_thread=0x190` 占位证伪(证据见 `offsets.rs` 注释);allow-list 门仍 OFF,真值需 live-kernel KPCR dump。非 Outflank Peekaboo 法(PeekabooWindow 另为出货路径)。 |
 | **EdrNeutralizer::kill** | 🟡 仅 resolve | 只解析 EPROCESS KVA,不终止目标进程。 |
 | **WdtKernel 驱动** | 🟡 stub | 物理内存 r/w(0x9C412420/0x9C41242C)真,但 VA `raw_rw` 永返 `Err(0)`。 |
 | **etw_deception 事件伪造** | 🟡 死路径 | 完整实现,但无 tier 装配;仅 `operator-kernel-cli forge-etw` 子命令调用。 |
 | **nyx-loader 反射加载** | ✅ **已交付(真机验证)** | 真实 Layer-2(pic-loader no_std PIC,`crates/nyx-loader/pic-loader/`)已接线:`wrap_payload` 按最终布局发射 `[LAYER1+bridge][key][magic\|len\|nonce][ct\|\|tag][LAYER2]`(`nyx-loader/src/lib.rs`);**真机 E2E 探针 PASS**(`crates/loader-probe-exe`):CreateThread 线程入口执行完整 blob,fixture 与真实 implant DLL 均反射加载成功、DllMain 执行(marker 证实)、返回 0——在免费 GitHub 托管 windows-latest runner 上运行,零本地硬件;Unicorn 仿真探针(CI Gate 5)+ Qiling selftest 门禁(CI Gate 6)守护回归。 |
-| **implant-evasionsdk trait** | 🟡 5/9 trait 有 live impl(受限交付) | `implant-win/src/evasion_glue.rs` 提供 5 个 live impl:`PdataGapScanner`(LivePdataScanner,`evasion_glue.rs:44`)/`StackSpoofKit`(LiveStackSpoof,`evasion_glue.rs:174`)/`BlindKit`(LiveBlind,`evasion_glue.rs:210`)/`MemoryMaskKit`(LiveMemoryMask,`evasion_glue.rs:274`)/`ProcessInjectKit`(ModuleStomper,`evasion_glue.rs:316`);`SleepmaskKit` 由 kits.rs 的 Foliage/NoMask 提供(`kits.rs:43-61`)。其余 3 trait(`SyscallSource`/`UnhookKit`/`AntiDebugKit`)保持 `Floors` no-op(`lib.rs:366-413`)。算法子模块(gap/frame/rc4/foliage/apc/swap/offsets_table)真且测试;`offsets_table` 已标记 canonical + pub accessor(`offsets_table.rs:39-44,296,335`),operator-kernelsdk/offset-resolver dev-dep 一致性测试。 |
+| **implant-evasionsdk trait** | 🟡 5/9 trait 有 live impl(受限交付) | `implant-win/src/evasion_glue.rs` 提供 5 个 live impl:`PdataGapScanner`(LivePdataScanner,`evasion_glue.rs:44`)/`StackSpoofKit`(LiveStackSpoof,`evasion_glue.rs:174`)/`BlindKit`(LiveBlind,`evasion_glue.rs:210`)/`MemoryMaskKit`(LiveMemoryMask,`evasion_glue.rs:274`)/`ProcessInjectKit`(ModuleStomper,`evasion_glue.rs:316`);`SleepmaskKit` 由 kits.rs 的 Fluctuation/NoMask 提供(`kits.rs:43-61`)。其余 3 trait(`SyscallSource`/`UnhookKit`/`AntiDebugKit`)保持 `Floors` no-op(`lib.rs:366-413`)。算法子模块(gap/frame/rc4/swap/offsets_table)真且测试;`offsets_table` 已标记 canonical + pub accessor(`offsets_table.rs:39-44,296,335`),operator-kernelsdk/offset-resolver dev-dep 一致性测试。 |
 | **`mask_secret()`** | ✅ **已修复** | char-based `first2….last2` 掩码 + 非 ASCII 测试(`store/src/model.rs:73-82,108-119`)。 |
 | **SQLite migration** | 🟡 **部分(受限交付)** | schema_version 迁移机制已启用:session_store v→v+1 `ADD COLUMN send_counter/last_recv`;其余表仍以 `CREATE TABLE IF NOT EXISTS` 基线为主。 |
 | **`created_by` 归因** | ✅ **已接** | `created_by: Some(op.name.clone())`(`implant_gen.rs:917`);生成端点带鉴权解析操作员(open 模式映射 Viewer 并拒绝写端点,`implant_gen.rs:988-992`)。 |
@@ -444,7 +444,7 @@ gh workflow run b3-verify.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
 - **BOF API 扩面(剩余)** — datap 解析族/`BeaconIsAdmin`/`BeaconGetSpawnTo`/`BeaconOutput` 已交付并经 wine64 实测(2026-08-10,`bof-runner/src/shim.rs`);待办:token/spawn/inject 类(`BeaconUseToken`/`BeaconSpawnTemporaryProcess`/`BeaconInjectProcess`/`BeaconFormatAlloc` 等)与 spawn-to 可配置化。
 - **transport/ 剩余 4 通道接线** — Slack/MCP 已接 server 中转(boot-time `TransportStack`,`extc2_relay.rs`);待办:malleable/doh_dns/llm_api/smb_pipe 接 server 路由。implant 侧保持自滚通道(no_std PIC 设计,非目标)。
 - **TLS 指纹 emitter 落地** — `impersonation` feature 已提供 BoringSSL(`wreq`)实现(`fingerprint.rs:201-211`);待办:接入 server 出站链路并在默认构建启用。
-- **PatchGuard 偏移验证** — 用 PDB 校验 PRCB/context 偏移,或改用 Outflank Peekaboo 时序法。
+- **PatchGuard 偏移验证** — 2026-08-14 离线 PDB 已证伪 0x190 占位(PDB 无 PG context 结构,此路本来就走不通);真值需 live-kernel KPCR dump,或走已实装的 Peekaboo 时序路径。
 - **caller-spoof CET 路径** — 宏已实现(`caller_spoof.rs:464-499`);待办:CET 主机上的真 spoof(IRET_FRAME/shadow-stack surgery;当前检测到 CET 时降级 `call_plain`)。
 - **GUI 会话元数据 overlay** — rename / tag / star / alias(TUI 曾有,GUI 无)。
 - **CET 物理机验证** — Win11 25H2 CET+HVCI 真机 + `#CP` 修复缝(`KiControlProtectionFault` + `RtlRestoreContext`)。

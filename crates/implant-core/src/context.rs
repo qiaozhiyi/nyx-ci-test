@@ -1,8 +1,9 @@
 //! x64 `CONTEXT` record (Task E foundation).
 //!
-//! The Foliage APC→NtContinue chain (Task E) drives the beacon thread through
-//! a mask→sleep→unmask cycle by queueing APCs that each call
-//! `NtContinue(&CONTEXT, FALSE)`. Building a spoofed CONTEXT requires the
+//! The Fluctuation sleep mask (and formerly the Foliage APC→NtContinue chain,
+//! removed in commit 841ffc5) drives the beacon thread through a
+//! mask→sleep→unmask cycle by installing CONTEXTs via `NtContinue` /
+//! `NtSetContextThread`. Building a spoofed CONTEXT requires the
 //! exact x64 layout — 1232 bytes, 16-byte aligned. The CONTEXT/APC syscalls in
 //! [`crate::syscalls`] take it as an opaque `usize`, so this module provides a
 //! typed buffer + offset accessors that match WinNT.h byte-for-byte.

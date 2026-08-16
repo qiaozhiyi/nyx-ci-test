@@ -7,6 +7,7 @@
 > ⚠️ **2026-07-18 勘误：** 据独立审计 [`AUTHORITATIVE_FACTS`](../audits/AUTHORITATIVE_FACTS_2026-07-18.md)：
 > (1) **PatchGuard 偏移未在真机验证**；(2) **WfpKit 永返 Err**（下表标 🔶 偏乐观，实际无可用调用路径）；
 > (3) **WdtKernel 为 stub**；(4) 下表"真机 7/7 PASS"指 H–K 诊断链路，不等同于所有 kit 算法生产可用。
+> ✅ **2026-08-14 更新：** (1) PG `0x190` 占位已经离线 PDB 证伪（`offsets.rs` 注释含证据，真值仍需 live-kernel dump）；(2) WfpKit 已实装 `ALE_APP_ID` 单条件过滤（不再永返 Err，Windows lab 端到端待验）；(3) WdtKernel phys 模式已接线（CR3 扫描 + MZ 门 + CLI `--wdt`，CI 真机验证待跑）。
 
 ---
 
@@ -15,7 +16,7 @@
 ```
 operator-kernelsdk/ (standalone crate, no_std, workspace green)
 ├── lib.rs          — KernelTier trait + no-op default
-├── byovd.rs        — ByovdDriver (RTCore64 IOCTL) + RtCore64 protocol
+├── byovd.rs        — ByovdDriver (IOCTL seam) + VulnDriverIoctl trait（驱动包: Shield 默认 / WdtKernel phys）
 ├── etwti.rs        — EtwTiBlind (IsEnabled=0 via kernel write)
 ├── telemetry.rs    — CallbackKit + CallbackNeutralizer (repurpose/neutralize)
 ├── persistence.rs  — ProcessHider (DKOM) + PPL strip + PG windows
@@ -37,8 +38,11 @@ operator-kernelsdk/ (standalone crate, no_std, workspace green)
 **驱动加载优先级链:**
 ```
 bootstrap_chain() → Priority 1: KslD.sys (Living off the Defender)
-                  → Priority 2: RTCore64.sys (BYOVD fallback)
+                  → Priority 2: BYOVD fallback — 默认 Shield.sys（clean，VA memcpy）；
+                    WDTKernel.sys phys 模式（--wdt，HVCI-safe）
 ```
+（RTCore64 / iqvw64e 已于 2026-08-16 从驱动包删除——两者均在微软 Vulnerable
+Driver Blocklist 上，hosted CI 实测 NtLoadDriver 0xC0000034。）
 
 ---
 
@@ -46,14 +50,14 @@ bootstrap_chain() → Priority 1: KslD.sys (Living off the Defender)
 
 | Kit | 算法 | 实现 | 真机 | 说明 |
 |---|---|---|---|---|
-| KernelRw (BYOVD) | ✅ | ✅ | ✅ 10MB 读 | RTCore64 IOCTL 48B protocol |
+| KernelRw (BYOVD) | ✅ | ✅ | ✅ 10MB 读 | 默认 Shield 单 IOCTL 双向 memcpy（历史真机验证用 RTCore64，已删） |
 | ETW-TI Blind | ✅ | ✅ | ✅ IsEnabled→0 | 5 版本 offset 表 |
 | ProcessHider (DKOM) | ✅ | ✅ | ✅ 1→0→1 | ActiveProcessLinks unlink |
 | PPL Strip | ✅ | ✅ | 🔶 | offset 真机确认 |
 | CallbackKit | ✅ | ✅ | ✅ EID1 SILENCED | repurpose DATA write, selective slot |
-| PatchGuardKit | ✅ | ✅ | 🔴 偏移未验证 | TimingRepair + RuntimePgBypass（2026-07-18 审计：PG 偏移未真机验证） |
+| PatchGuardKit | ✅ | ✅ | 🔴 占位已证伪 | TimingRepair + RuntimePgBypass；2026-08-14 离线 PDB 证伪 `+0x190`=`LastExceptionToRip`，真值需 live-kernel KPCR dump（门仍 OFF） |
 | KslD | ✅ | ✅ | ✅ | QueryDosDeviceW enum, bootstrap_chain |
-| WfpRuleSet | ✅ | 🟡 | 🔴 永返 Err | 2026-07-18 审计：`netsec.rs` WfpKit 永返 Err，无可用调用路径 |
+| WfpRuleSet | ✅ | ✅ | 🔶 待 lab 验证 | 2026-08-14 实装 ALE_APP_ID 单条件 block（FwpmGetAppIdFromFileName0，零条件不可能），tier 已接线；端到端待 Windows lab |
 | LSASS Reader | ✅ | ✅ | 🔶 | 框架就绪 |
 | PatternScan | ✅ | ✅ | 🔶 | 需真实 ntoskrnl image |
 

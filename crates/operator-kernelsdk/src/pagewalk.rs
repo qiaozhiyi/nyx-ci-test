@@ -1,6 +1,6 @@
 //! x64 4-level page-table walk — pure algorithm (VA → PA translation).
 //!
-//! RTCore64 and most physical-memory BYOVD drivers operate on **physical**
+//! Physical-memory BYOVD drivers (e.g. WDTKernel) operate on **physical**
 //! addresses. To read/write a kernel **virtual** address, we must translate
 //! VA→PA by walking the 4-level page table (PML4 → PDPT → PD → PT) starting
 //! from the process's CR3 (DirectoryTableBase).

