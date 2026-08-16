@@ -122,9 +122,17 @@ impl VulnDriverIoctl for WdtKernel {
         // that path does not exist and would fail CreateFileW). 9 code units
         // after the \\.\ prefix: '_','_','W','D','T','_','_'.
         static PATH: [u16; 11] = [
-            '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
-            '_' as u16, '_' as u16, 'W' as u16, 'D' as u16,
-            'T' as u16, '_' as u16, '_' as u16,
+            '\\' as u16,
+            '\\' as u16,
+            '.' as u16,
+            '\\' as u16,
+            '_' as u16,
+            '_' as u16,
+            'W' as u16,
+            'D' as u16,
+            'T' as u16,
+            '_' as u16,
+            '_' as u16,
         ];
         &PATH
     }
@@ -132,8 +140,12 @@ impl VulnDriverIoctl for WdtKernel {
     // accurate (per LOLDrivers #290); the VA→PA-composed impl exists in
     // `win/wdt.rs` (CR3 scan + VaKernelRw) — raw_rw itself does NOT call them
     // on a raw VA.
-    fn read_ioctl(&self) -> u32 { WDT_IOCTL_READ_BULK }
-    fn write_ioctl(&self) -> u32 { WDT_IOCTL_WRITE_BULK }
+    fn read_ioctl(&self) -> u32 {
+        WDT_IOCTL_READ_BULK
+    }
+    fn write_ioctl(&self) -> u32 {
+        WDT_IOCTL_WRITE_BULK
+    }
     fn blocklist_status(&self) -> &'static str {
         "CLEAN: not on Microsoft Vulnerable Driver Blocklist as of July 2026. HVCI-compatible (WHQL)."
     }

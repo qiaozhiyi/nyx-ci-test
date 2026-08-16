@@ -10,9 +10,8 @@ extern "system" {
 #[cfg(target_os = "windows")]
 fn main() {
     let ntdll = unsafe { GetModuleHandleA(c"ntdll.dll".as_ptr().cast::<u8>()) };
-    let ldrp = unsafe {
-        GetProcAddress(ntdll, c"LdrpValidateUserCallTarget".as_ptr().cast::<u8>())
-    } as *const u8;
+    let ldrp = unsafe { GetProcAddress(ntdll, c"LdrpValidateUserCallTarget".as_ptr().cast::<u8>()) }
+        as *const u8;
     if ldrp.is_null() {
         println!("LdrpValidateUserCallTarget NOT FOUND (may not be exported)");
         // Try LdrpCfgProcessLoadConfig instead
@@ -26,14 +25,16 @@ fn main() {
     let code = unsafe { std::slice::from_raw_parts(ldrp, 128) };
     for i in 0..code.len().saturating_sub(6) {
         // mov rax/rbx/rcx/rdx, [rip + disp32]
-        if code[i] == 0x48 && code[i+1] == 0x8B && (code[i+2] & 0xC7) == 0x05 {
-            let reg = (code[i+2] >> 3) & 7;
-            let disp = i32::from_le_bytes([code[i+3], code[i+4], code[i+5], code[i+6]]);
+        if code[i] == 0x48 && code[i + 1] == 0x8B && (code[i + 2] & 0xC7) == 0x05 {
+            let reg = (code[i + 2] >> 3) & 7;
+            let disp = i32::from_le_bytes([code[i + 3], code[i + 4], code[i + 5], code[i + 6]]);
             let target = unsafe { ldrp.add(i + 7).offset(disp as isize) };
             let val = unsafe { *(target as *const usize) };
-            let regs = ["rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi"];
-            println!("  +{}: mov {}, [rip{:+}] -> {:p} = 0x{:016x}",
-                i, regs[reg as usize], disp, target, val);
+            let regs = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi"];
+            println!(
+                "  +{}: mov {}, [rip{:+}] -> {:p} = 0x{:016x}",
+                i, regs[reg as usize], disp, target, val
+            );
         }
     }
 }

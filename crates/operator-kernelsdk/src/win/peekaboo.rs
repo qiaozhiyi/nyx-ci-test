@@ -52,15 +52,42 @@ use alloc::vec::Vec;
 /// Win32 device path for CreateFileW (`\\.\PeekabooProbe`), NUL-terminated.
 /// Written as explicit code units to stay const on no_std.
 pub const DEVICE_PATH_W: &[u16] = &[
-    b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16, b'P' as u16, b'e' as u16, b'e' as u16,
-    b'k' as u16, b'a' as u16, b'b' as u16, b'o' as u16, b'o' as u16, b'P' as u16, b'r' as u16,
-    b'o' as u16, b'b' as u16, b'e' as u16, 0,
+    b'\\' as u16,
+    b'\\' as u16,
+    b'.' as u16,
+    b'\\' as u16,
+    b'P' as u16,
+    b'e' as u16,
+    b'e' as u16,
+    b'k' as u16,
+    b'a' as u16,
+    b'b' as u16,
+    b'o' as u16,
+    b'o' as u16,
+    b'P' as u16,
+    b'r' as u16,
+    b'o' as u16,
+    b'b' as u16,
+    b'e' as u16,
+    0,
 ];
 
 /// Default registry service name for `driver_load` (operator may override).
 pub const DEFAULT_SERVICE_NAME: &[u16] = &[
-    b'P' as u16, b'e' as u16, b'e' as u16, b'k' as u16, b'a' as u16, b'b' as u16, b'o' as u16,
-    b'o' as u16, b'P' as u16, b'r' as u16, b'o' as u16, b'b' as u16, b'e' as u16, 0,
+    b'P' as u16,
+    b'e' as u16,
+    b'e' as u16,
+    b'k' as u16,
+    b'a' as u16,
+    b'b' as u16,
+    b'o' as u16,
+    b'o' as u16,
+    b'P' as u16,
+    b'r' as u16,
+    b'o' as u16,
+    b'b' as u16,
+    b'e' as u16,
+    0,
 ];
 
 /// Handshake magic — ASCII "PKKP" (Peekaboo Kernel Probe), little-endian.
@@ -307,9 +334,7 @@ impl<T: PeekabooTransport> PeekabooProbeClient<T> {
             .ioctl(IOCTL_PEEKABOO_UNTRACK, &req, &mut out)
             .is_ok()
         {
-            self.tracked
-                .borrow_mut()
-                .retain(|&e| e != eprocess_kva);
+            self.tracked.borrow_mut().retain(|&e| e != eprocess_kva);
         }
     }
 }
@@ -382,8 +407,10 @@ mod windows_impl {
         /// # Safety
         /// Caller guarantees the driver is loaded and its device accessible.
         pub unsafe fn open() -> Result<Self, KrwError> {
-            let create_file = unsafe { resolve_sym::<CreateFileWFn>(b"kernel32.dll", b"CreateFileW")? };
-            let dioctl = unsafe { resolve_sym::<DeviceIoControlFn>(b"kernel32.dll", b"DeviceIoControl")? };
+            let create_file =
+                unsafe { resolve_sym::<CreateFileWFn>(b"kernel32.dll", b"CreateFileW")? };
+            let dioctl =
+                unsafe { resolve_sym::<DeviceIoControlFn>(b"kernel32.dll", b"DeviceIoControl")? };
             // DEVICE_PATH_W is NUL-terminated by construction (const above).
             let h = unsafe {
                 create_file(
@@ -397,18 +424,16 @@ mod windows_impl {
                 )
             };
             if h as isize == -1 || h.is_null() {
-                let gle = unsafe { resolve_sym::<GetLastErrorFn>(b"kernel32.dll", b"GetLastError") }
-                    .map(|f| unsafe { f() })
-                    .unwrap_or(0);
+                let gle =
+                    unsafe { resolve_sym::<GetLastErrorFn>(b"kernel32.dll", b"GetLastError") }
+                        .map(|f| unsafe { f() })
+                        .unwrap_or(0);
                 return Err(KrwError::Other(alloc::format!(
                     "peekaboo device open failed (Win32 err={}) — is the probe driver loaded?",
                     gle
                 )));
             }
-            Ok(Self {
-                device: h,
-                dioctl,
-            })
+            Ok(Self { device: h, dioctl })
         }
     }
 
@@ -428,9 +453,10 @@ mod windows_impl {
                 )
             };
             if ok == 0 {
-                let gle = unsafe { resolve_sym::<GetLastErrorFn>(b"kernel32.dll", b"GetLastError") }
-                    .map(|f| unsafe { f() })
-                    .unwrap_or(0);
+                let gle =
+                    unsafe { resolve_sym::<GetLastErrorFn>(b"kernel32.dll", b"GetLastError") }
+                        .map(|f| unsafe { f() })
+                        .unwrap_or(0);
                 return Err(KrwError::Other(alloc::format!(
                     "peekaboo ioctl {:#x} failed (Win32 err={})",
                     code,
@@ -523,12 +549,19 @@ mod tests {
         let mut reply = [0u8; 16];
         reply[0..4].copy_from_slice(&PROTOCOL_MAGIC.to_le_bytes());
         reply[4..8].copy_from_slice(&1u32.to_le_bytes());
-        reply[8..12].copy_from_slice(&(CAP_TERMINATION_REPAIR | CAP_VALIDATION_TRACKING).to_le_bytes());
+        reply[8..12]
+            .copy_from_slice(&(CAP_TERMINATION_REPAIR | CAP_VALIDATION_TRACKING).to_le_bytes());
         reply[12..16].copy_from_slice(&STATUS_CALLBACK_REGISTERED.to_le_bytes());
         let r = parse_handshake_reply(&reply).unwrap();
         assert_eq!(r.version, 1);
-        assert_eq!(r.capabilities & CAP_TERMINATION_REPAIR, CAP_TERMINATION_REPAIR);
-        assert_eq!(r.status_flags & STATUS_CALLBACK_REGISTERED, STATUS_CALLBACK_REGISTERED);
+        assert_eq!(
+            r.capabilities & CAP_TERMINATION_REPAIR,
+            CAP_TERMINATION_REPAIR
+        );
+        assert_eq!(
+            r.status_flags & STATUS_CALLBACK_REGISTERED,
+            STATUS_CALLBACK_REGISTERED
+        );
 
         // Wrong magic echo → refused (device-name collision guard).
         reply[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
@@ -543,7 +576,9 @@ mod tests {
     #[test]
     fn status_and_ack_parsing_bounds() {
         let mut s = [0u8; 8];
-        s[0..4].copy_from_slice(&(STATUS_CALLBACK_REGISTERED | STATUS_VALIDATION_ACTIVE).to_le_bytes());
+        s[0..4].copy_from_slice(
+            &(STATUS_CALLBACK_REGISTERED | STATUS_VALIDATION_ACTIVE).to_le_bytes(),
+        );
         s[4..8].copy_from_slice(&3u32.to_le_bytes());
         let r = parse_status_reply(&s).unwrap();
         assert_eq!(r.status_flags, 0x3);
@@ -581,7 +616,9 @@ mod tests {
                 IOCTL_PEEKABOO_HANDSHAKE => {
                     out[0..4].copy_from_slice(&PROTOCOL_MAGIC.to_le_bytes());
                     out[4..8].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-                    out[8..12].copy_from_slice(&(CAP_TERMINATION_REPAIR | CAP_VALIDATION_TRACKING).to_le_bytes());
+                    out[8..12].copy_from_slice(
+                        &(CAP_TERMINATION_REPAIR | CAP_VALIDATION_TRACKING).to_le_bytes(),
+                    );
                     out[12..16].copy_from_slice(&self.status_flags.get().to_le_bytes());
                     Ok(16)
                 }
@@ -608,7 +645,13 @@ mod tests {
         }
     }
 
-    fn scripted(flags: u32) -> (ScriptedTransport, std::rc::Rc<core::cell::Cell<u32>>, std::rc::Rc<core::cell::RefCell<Vec<u64>>>) {
+    fn scripted(
+        flags: u32,
+    ) -> (
+        ScriptedTransport,
+        std::rc::Rc<core::cell::Cell<u32>>,
+        std::rc::Rc<core::cell::RefCell<Vec<u64>>>,
+    ) {
         let status_flags = std::rc::Rc::new(core::cell::Cell::new(flags));
         let untracked = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
         (

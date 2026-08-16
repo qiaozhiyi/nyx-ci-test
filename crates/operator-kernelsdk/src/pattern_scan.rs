@@ -286,7 +286,11 @@ pub fn scan_all_known(image: &[u8]) -> alloc::collections::BTreeMap<&'static str
             LOAD_IMAGE_NOTIFY_ARRAY_RANGE,
         ),
         ("PsActiveProcessHead", &PS_ACTIVE_PROCESS_HEAD, 0..0),
-        ("EtwThreatIntProvRegHandle", &ETW_THREAT_INT_PROV_REG_HANDLE, 0..0),
+        (
+            "EtwThreatIntProvRegHandle",
+            &ETW_THREAT_INT_PROV_REG_HANDLE,
+            0..0,
+        ),
     ];
     let mut map = alloc::collections::BTreeMap::new();
     for (name, site, range) in sites {

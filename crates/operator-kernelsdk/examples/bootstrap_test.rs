@@ -18,8 +18,6 @@
 //! # Safety
 //! 加载驱动进内核（不可逆，直到 unload）。仅在授权目标 + VM 上运行。
 
-
-
 #[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::byovd::resolve_kernel_symbol;
 #[cfg(target_os = "windows")]
@@ -291,7 +289,6 @@ fn main() {
     // 不主动 unload —— I/J/K 复用同一个驱动。
     std::mem::forget(loaded);
 }
-
 
 // ----------------------------------------------------------------------------
 // Non-Windows entry-point fallback (E0601 mitigation).

@@ -150,9 +150,8 @@ fn first_module(buf: &[u8]) -> Result<(usize, usize), KrwError> {
             "NtQuerySystemInformation returned 0 modules".into(),
         ));
     }
-    let entry = module_entry(buf, 0).ok_or_else(|| {
-        KrwError::Other("buffer too short for first module entry".into())
-    })?;
+    let entry = module_entry(buf, 0)
+        .ok_or_else(|| KrwError::Other("buffer too short for first module entry".into()))?;
     let base = entry.image_base as usize;
     if base == 0 {
         return Err(KrwError::Unavailable(
@@ -403,8 +402,16 @@ mod tests {
     #[test]
     fn first_module_returns_ntoskrnl_base_and_size() {
         let buf = module_buf(&[
-            (0xFFFF_8000_1000_0000, 0xC0_0000, b"\\SystemRoot\\System32\\ntoskrnl.exe"),
-            (0xFFFF_8000_2000_0000, 0x8_0000, b"\\SystemRoot\\System32\\drivers\\FLTMGR.SYS"),
+            (
+                0xFFFF_8000_1000_0000,
+                0xC0_0000,
+                b"\\SystemRoot\\System32\\ntoskrnl.exe",
+            ),
+            (
+                0xFFFF_8000_2000_0000,
+                0x8_0000,
+                b"\\SystemRoot\\System32\\drivers\\FLTMGR.SYS",
+            ),
         ]);
         let (base, size) = first_module(&buf).unwrap();
         assert_eq!(base, 0xFFFF_8000_1000_0000);
@@ -426,8 +433,16 @@ mod tests {
     #[test]
     fn find_module_by_name_matches_case_insensitive_tail() {
         let buf = module_buf(&[
-            (0xFFFF_8000_1000_0000, 0xC0_0000, b"\\SystemRoot\\System32\\ntoskrnl.exe"),
-            (0xFFFF_8000_2000_0000, 0x8_0000, b"\\SystemRoot\\System32\\drivers\\FLTMGR.SYS"),
+            (
+                0xFFFF_8000_1000_0000,
+                0xC0_0000,
+                b"\\SystemRoot\\System32\\ntoskrnl.exe",
+            ),
+            (
+                0xFFFF_8000_2000_0000,
+                0x8_0000,
+                b"\\SystemRoot\\System32\\drivers\\FLTMGR.SYS",
+            ),
             (0xFFFF_8000_4000_0000, 0x2_0000, b"\\??\\C:\\EDR\\edr.sys"),
         ]);
         // Uppercase path, lowercase query → hit.
@@ -449,9 +464,21 @@ mod tests {
     #[test]
     fn parse_module_list_lowercases_file_tails() {
         let buf = module_buf(&[
-            (0xFFFF_8000_1000_0000, 0xC0_0000, b"\\SystemRoot\\System32\\ntoskrnl.exe"),
-            (0xFFFF_8000_2000_0000, 0x8_0000, b"\\SystemRoot\\System32\\drivers\\FLTMGR.SYS"),
-            (0xFFFF_8000_4000_0000, 0x2_0000, b"\\??\\C:\\EDR\\EdrSensor.sys"),
+            (
+                0xFFFF_8000_1000_0000,
+                0xC0_0000,
+                b"\\SystemRoot\\System32\\ntoskrnl.exe",
+            ),
+            (
+                0xFFFF_8000_2000_0000,
+                0x8_0000,
+                b"\\SystemRoot\\System32\\drivers\\FLTMGR.SYS",
+            ),
+            (
+                0xFFFF_8000_4000_0000,
+                0x2_0000,
+                b"\\??\\C:\\EDR\\EdrSensor.sys",
+            ),
         ]);
         let mods = parse_module_list(&buf).unwrap();
         assert_eq!(mods.len(), 3);

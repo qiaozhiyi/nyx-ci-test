@@ -17,8 +17,6 @@
 //!
 //! ⚠️ 只动 slot[5]，绝不碰 slot[0] (ntoskrnl 内部)。
 
-
-
 #[cfg(target_os = "windows")]
 use core::ffi::c_void;
 #[cfg(target_os = "windows")]
@@ -379,7 +377,6 @@ fn main() {
     println!("\n[callback_repurpose_test] DONE.");
     std::mem::forget(loaded);
 }
-
 
 // ----------------------------------------------------------------------------
 // Non-Windows entry-point fallback (E0601 mitigation).

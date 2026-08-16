@@ -12,8 +12,6 @@
 //!        --target x86_64-pc-windows-msvc --example etw_ti_blind_test
 //! 运行: target\...\examples\etw_ti_blind_test.exe
 
-
-
 #[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::etwti::{EtwTiBlind, EtwTiOffsets};
 #[cfg(target_os = "windows")]
@@ -194,7 +192,6 @@ fn main() {
     println!("    verify: logman query \"Microsoft-Windows-Threat-Intelligence\"");
     std::mem::forget(loaded);
 }
-
 
 // ----------------------------------------------------------------------------
 // Non-Windows entry-point fallback (E0601 mitigation).

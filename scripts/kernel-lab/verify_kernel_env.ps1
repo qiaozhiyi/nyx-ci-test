@@ -1,17 +1,19 @@
 # verify_kernel_env.ps1 — report the kernel-research posture of the lab VM.
 # Run elevated after bootstrap_kernel_lab.ps1 + reboot.
 #
-# Exit code 0 when VBS AND HVCI are running (the matrix-ready state),
-# 1 otherwise — scriptable as a CI-style gate.
+# Pure reporter: always exits 0 (unless WMI/bcdedit queries themselves fail).
+# Posture facts are data, not a gate — the HVCI-on verification matrix was
+# ABANDONED 2026-08-16 (run_hvci_matrix.sh deleted); HVCI/VBS state is now
+# informational only. The shipped BYOVD drivers (WDTKernel/Shield) are clean
+# of the MS blocklist, so HVCI posture gates nothing we run in the lab.
 #
 # -Json: additionally print ONE JSON line (prefix "POSTURE_JSON:") with the
-# machine-readable posture — consumed by run_hvci_matrix.sh as evidence.
-# The prefix keeps the line findable inside 'az vm run-command' output, which
-# interleaves stdout/stderr.
+# machine-readable posture. The prefix keeps the line findable inside
+# 'az vm run-command' output, which interleaves stdout/stderr.
 #
 # Optional driver-load probe:  .\verify_kernel_env.ps1 -TestDriver C:\lab\test.sys
 # Attempts sc.exe create/start and reports the exact failure code:
-#   1275 = blocked by CI policy (HVCI/blocklist/testsigning off) — expected
+#   1275 = blocked by CI policy (blocklist/testsigning off) — expected
 #          for unsigned/test-signed code with enforcement ON,
 #   0/running = driver loaded (posture allows it).
 
@@ -23,7 +25,7 @@ param(
 
 $fail = 0
 
-# --- VBS / HVCI state -------------------------------------------------------
+# --- VBS / HVCI state (informational — HVCI matrix abandoned 2026-08-16) ----
 $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard
 $vbsStatus = $dg.VirtualizationBasedSecurityStatus   # 0 off, 1 enabled-not-running, 2 running
 $services  = @($dg.SecurityServicesRunning)          # 1 = Credential Guard, 2 = HVCI (memory integrity)
@@ -40,8 +42,7 @@ Write-Host ("Credential Guard      : {0}" -f $(if ($cgRunning) { 'RUNNING' } els
 Write-Host ("Secure Boot           : {0}" -f $secureBoot)
 Write-Host ("CI policy enforced    : {0}" -f $ciEnforced)
 
-if ($vbsStatus -ne 2)  { $fail = 1 }
-if (-not $hvciRunning) { $fail = 1 }
+# Posture is reported, never gated (HVCI matrix abandoned — see header).
 
 # --- Blocklist registry (KB5020779: on-by-default once HVCI is on) -----------
 $bl = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Config' -ErrorAction SilentlyContinue).VulnerableDriverBlocklistEnable
@@ -60,7 +61,7 @@ Write-Host ("OS build              : {0}" -f $os.BuildNumber)
 Write-Host ("Architecture          : {0}" -f $env:PROCESSOR_ARCHITECTURE)
 Write-Host ("Hyper-V present       : {0}" -f $cs.HypervisorPresent)
 
-# --- Machine-readable posture line (for run_hvci_matrix.sh evidence) ----------
+# --- Machine-readable posture line -------------------------------------------
 if ($Json) {
     $posture = [ordered]@{
         vbs_status         = $vbsStatus
@@ -75,7 +76,6 @@ if ($Json) {
         os_caption         = $os.Caption
         arch               = $env:PROCESSOR_ARCHITECTURE
         hypervisor_present = [bool]$cs.HypervisorPresent
-        matrix_ready       = ($fail -eq 0)
     }
     Write-Host ("POSTURE_JSON:" + ($posture | ConvertTo-Json -Compress))
 }

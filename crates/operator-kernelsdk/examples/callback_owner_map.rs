@@ -10,8 +10,6 @@
 //! 目的: 找出哪个 slot 是 ntoskrnl 内部(不能碰，会导致 triple fault)，
 //! 哪些是外部 EDR 驱动(Defender/Sysmon)，为 K-2 安全 repurpose 选目标。
 
-
-
 #[cfg(target_os = "windows")]
 use core::ffi::c_void;
 #[cfg(target_os = "windows")]
@@ -299,7 +297,6 @@ fn main() {
     println!("\n[callback_owner_map] DONE (read-only).");
     std::mem::forget(loaded);
 }
-
 
 // ----------------------------------------------------------------------------
 // Non-Windows entry-point fallback (E0601 mitigation).

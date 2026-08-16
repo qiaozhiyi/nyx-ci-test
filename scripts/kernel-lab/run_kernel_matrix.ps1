@@ -1,7 +1,12 @@
 # run_kernel_matrix.ps1 — GUEST-side nyx-kernel matrix runner for the Azure
-# kernel lab. Executed INSIDE the VM by run_hvci_matrix.sh via
-# 'az vm run-command invoke' (RunPowerShellScript). Not meant for RDP use,
+# kernel lab. Run INSIDE the VM (manually, or headless via
+# 'az vm run-command invoke' RunPowerShellScript). Not meant for RDP use,
 # but runnable manually for debugging.
+#
+# NOTE (2026-08-16): the HVCI-on verification matrix is ABANDONED — the
+# run_hvci_matrix.sh orchestrator was deleted. The shipping BYOVD drivers
+# (WDTKernel / Shield) are clean of the MS blocklist, so HVCI posture no
+# longer gates anything we ship; this matrix now runs on a plain x64 lab VM.
 #
 # What it does:
 #   1. Downloads nyx-kernel.exe from the lab storage container (read SAS).
@@ -22,9 +27,9 @@
 #                      offsets) — exit 5 is the CORRECT current behavior
 #   - fail           : anything else; the step did something we did not predict
 #
-# Params (passed by run_hvci_matrix.sh via run-command --parameters):
+# Params (via 'az vm run-command invoke' --parameters, or manual):
 #   -ContainerSasUrl <url>  container URL incl. SAS token, permissions rwl
-#   -DriverMode wdt|byovd|both   (default both — the HVCI matrix wants both arms)
+#   -DriverMode wdt|byovd|both   (default both)
 #   -WorkDir <path>        default C:\nyxlab
 param(
     [Parameter(Mandatory=$true)][string]$ContainerSasUrl,
@@ -126,7 +131,7 @@ try {
     # ---- 2. driverless baseline: runs on ANY Windows, HVCI or not ----
     Invoke-KitStep 'assess-user-baseline' $exe @('assess','--user')
 
-    # ---- 3. WDT arm (the HVCI-proof BYOVD path — the point of the lab) ----
+    # ---- 3. WDT arm (clean WHQL phys-mode BYOVD path) ----
     if ($DriverMode -in 'wdt','both') {
         $wdtSys = 'C:\Windows\System32\drivers\WDTKernel.sys'
         if (Get-WDTKernel (Join-Path $WorkDir 'WDTKernel.sys')) {

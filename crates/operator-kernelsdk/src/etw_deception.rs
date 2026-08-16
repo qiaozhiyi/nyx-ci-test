@@ -272,7 +272,8 @@ impl EtwDeceiver {
         buf[unicode_string_offset + 2..unicode_string_offset + 4]
             .copy_from_slice(&(unicode_string_len).to_le_bytes());
         // UNICODE_STRING.Padding (u32) = 0
-        buf[unicode_string_offset + 4..unicode_string_offset + 8].copy_from_slice(&0u32.to_le_bytes());
+        buf[unicode_string_offset + 4..unicode_string_offset + 8]
+            .copy_from_slice(&0u32.to_le_bytes());
         // UNICODE_STRING.Buffer — zeroed. The UserData payload is inline
         // immediately after this header, so no absolute VA is needed (and
         // embedding the operator's own heap pointer here would leak it).
@@ -333,7 +334,7 @@ impl EtwDeceiver {
         buf[45] = 2; // Opcode = Stop
         buf[46..48].copy_from_slice(&0u16.to_le_bytes()); // Task
         buf[48..56].copy_from_slice(&0x0020_0000_0000_0000u64.to_le_bytes()); // Keyword
-        // KernelTime/UserTime union (offset 0x38) — 0
+                                                                              // KernelTime/UserTime union (offset 0x38) — 0
         buf[56..64].copy_from_slice(&0u64.to_le_bytes());
         // ActivityId (GUID, offset 0x40, 16 bytes) — zeroed (already 0).
 
@@ -551,7 +552,9 @@ mod tests {
             buf
         };
         let ts = 0x01D8_A000_0000_0000u64;
-        let buf = d.forge_process_create(100, 200, &image_name_utf16, ts).unwrap();
+        let buf = d
+            .forge_process_create(100, 200, &image_name_utf16, ts)
+            .unwrap();
 
         // Buffer must be at least EVENT_HEADER_SIZE + 4 (ParentID) + 16 (UNICODE_STRING header) + image data.
         assert!(buf.len() >= EVENT_HEADER_SIZE + 4 + 16 + image_name_utf16.len());

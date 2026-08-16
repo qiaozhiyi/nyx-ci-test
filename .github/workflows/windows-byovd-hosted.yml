@@ -8,10 +8,12 @@ name: Win BYOVD (hosted)
 # job 一并移除 — 加载一个必被拦的驱动没有验证价值,其 blocklist 断言移交
 # blocklist-gate(阳性对照)。BYOVD 默认驱动现为 Shield(clean,VA 任意
 # memcpy);存活验证链:
-#   - blocklist-gate: 离线断言 WDT/Shield 不在名单、RTCore64/iqvw64e 在名单
-#     (阳性对照,scripts/check_byovd_blocklist.py)。
+#   - blocklist-gate: 离线断言 WDT/Shield/ALSysIO64 不在名单、RTCore64/
+#     iqvw64e 在名单(阳性对照,scripts/check_byovd_blocklist.py)。
 #   - byovd-wdt:      WDTKernel(WHQL, LoadsDespiteHVCI)真机加载 + loaded
 #                     状态硬门 + assess JSON 断言。
+#   - byovd-alsysio:  ALSysIO64(CPUID CPU-Z,钉 v2.0.8.0 SHA256)真机加载 +
+#                     assess 硬门 — 第二条 clean phys 路径(2026-08-16 新增)。
 #
 # 覆盖: blocklist 离线回归 + WDT 真机加载/assess。P0.a/b 与 ETW-TI/DKOM/
 # LSASS 的算法路径由 kernelsdk host 单测(ci.yml)覆盖;P4/P5 在
@@ -60,6 +62,38 @@ jobs:
       - name: MS blocklist version diff (report-only tripwire)
         if: always()
         run: python3 scripts/check_byovd_blocklist.py --version-report
+
+  # ---- WFP kit e2e(2026-08-16)----
+  # UserModeEdrSilencer(netsec.rs)此前只有 host 端结构/布局单测——WFP FFI 在
+  # macOS 上编不过,真实 BFE 行为从未被验证过。hosted windows runner 是
+  # elevated + BFE 默认运行,wfp-selftest 全程 loopback(无网络依赖),
+  # 是零成本硬门:baseline connect → ALE_APP_ID block(AppId 锚定自身临时
+  # 副本,不碰真实 EDR)→ guard drop → 连接恢复(无残留)。任一阶段失败
+  # job 红(exit 2 harness 坏 / 3 filter 没拦住 / 4 drop 后残留 / 5 操作错)。
+  wfp-selftest:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust + build operator-kernel-cli
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build nyx-kernel CLI
+        run: cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml
+      - name: WFP kit self-test (hard gate)
+        shell: pwsh
+        run: |
+          $out = & crates\operator-kernel-cli\target\release\nyx-kernel.exe wfp-selftest 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          $jsonLine = ($out | Where-Object { $_ -like '{"wfp_selftest":*' } | Select-Object -First 1)
+          if (-not $jsonLine) { Write-Host "::error::no {\"wfp_selftest\":{...}} JSON line"; exit 1 }
+          $r = ($jsonLine | ConvertFrom-Json).wfp_selftest
+          Write-Host "baseline=$($r.baseline) blocked=$($r.blocked) restored=$($r.restored) filters=$($r.filters) note=$($r.note)"
+          if ($exit -ne 0 -or -not ($r.baseline -and $r.blocked -and $r.restored -and $r.filters -eq 1)) {
+            Write-Host "::error::WFP self-test failed (exit $exit)"
+            exit 1
+          }
+          Write-Host "::notice::WFP kit e2e PASS — install/block/drop-restore all verified live"
 
   # ---- WDTKernel BYOVD arm(2026-08-14)----
   # WDTKernel(Dell Watchdog Timer, WHQL 签名, LOLDrivers #290)不在 MS
@@ -227,3 +261,124 @@ jobs:
             exit 1
           }
           Write-Host "::notice::WDT kernel assessment PASS: status=Assessed, $($a.total_drivers) modules"
+
+  # ---- ALSysIO64 BYOVD arm(2026-08-16)----
+  # ALSysIO64.sys(CPUID CPU-Z,LOLDrivers 4d365dd0)不在 MS blocklist 上。
+  # ⚠ 钉死 v2.0.8.0(SHA256 7196187f…):v2.1.0.0 的 dispatch 删掉了 R/W
+  # IOCTL(0x9C402618/61C 落到 STATUS_NOT_IMPLEMENTED 默认臂,jump-table
+  # 解码实证,见 byovd_drivers/alsysio.rs 头注释)。加载 v2.1.0.0 会得到
+  # 能开设备但读写全败的死驱动——所以本 job 的 loaded 硬门之外还有
+  # assess 全链硬门(CR3 扫描 + MZ 验证不过就红)。
+  byovd-alsysio:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Disable Defender + add exclusions
+        shell: pwsh
+        run: |
+          Set-MpPreference -DisableRealtimeMonitoring $true -Force -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE" -Force -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionProcess "nyx-kernel.exe","cargo.exe" -Force -ErrorAction SilentlyContinue
+
+      # ---- 1. 拉 ALSysIO64 v2.0.8.0(LOLDrivers LFS,MZ + SHA256 钉)----
+      - name: Fetch ALSysIO64.sys v2.0.8.0 (pinned SHA256) + copy to System32\drivers
+        shell: pwsh
+        run: |
+          $staging = New-Item -ItemType Directory -Force -Path "target\drivers"
+          $stagingPath = Join-Path $staging.FullName "ALSysIO64.sys"
+          $finalPath = "C:\Windows\System32\drivers\ALSysIO64.sys"
+          $candidates = @(
+            @{ url = "https://github.com/magicsword-io/LOLDrivers/raw/main/drivers/13dda15ef67eb265869fc371c72d6ef0.bin";
+               sha256 = "7196187FB1EF8D108B380D37B2AF8EFDEB3CA1F6EEFD37B5DC114C609147216D" },
+            @{ url = "https://media.githubusercontent.com/media/magicsword-io/LOLDrivers/main/drivers/13dda15ef67eb265869fc371c72d6ef0.bin";
+               sha256 = "7196187FB1EF8D108B380D37B2AF8EFDEB3CA1F6EEFD37B5DC114C609147216D" }
+          )
+          $got = $false
+          foreach ($c in $candidates) {
+            try {
+              Write-Host "trying: $($c.url)"
+              Invoke-WebRequest -Uri $c.url -OutFile $stagingPath -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+              $fs = [IO.File]::OpenRead($stagingPath)
+              $b = New-Object byte[] 2
+              $fs.Read($b, 0, 2) | Out-Null
+              $fs.Close()
+              if (-not ($b[0] -eq 0x4D -and $b[1] -eq 0x5A)) {
+                Write-Host "  downloaded but NOT a valid PE (no MZ); trying next mirror"
+                continue
+              }
+              $h = (Get-FileHash $stagingPath -Algorithm SHA256).Hash
+              if ($h -ne $c.sha256) {
+                Write-Host "  SHA256 mismatch (got $h, want $($c.sha256)); trying next mirror"
+                continue
+              }
+              $sz = (Get-Item $stagingPath).Length
+              Write-Host "::notice::downloaded: $stagingPath ($sz bytes, valid MZ + SHA256 match)"
+              $got = $true
+              break
+            } catch {
+              Write-Host "  failed: $($_.Exception.Message)"
+            }
+          }
+          if (-not $got) {
+            Write-Host "::error::all mirrors failed - LOLDrivers driver URL scheme may have changed"
+            exit 1
+          }
+          Copy-Item -Path $stagingPath -Destination $finalPath -Force
+          echo "DRIVER_PATH=$finalPath" >> $env:GITHUB_ENV
+
+      - name: Install Rust + build operator-kernel-cli
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build nyx-kernel CLI
+        shell: cmd
+        run: |
+          cargo build --release --manifest-path crates/operator-kernel-cli/Cargo.toml
+          if not exist "crates\operator-kernel-cli\target\release\nyx-kernel.exe" (
+            echo ::error::nyx-kernel.exe build failed & exit /b 1
+          )
+          echo BUILD_OK
+
+      # ---- 2. ALSysIO phys-mode bootstrap(加载 + CR3 扫描 + MZ 验证)----
+      - name: ALSysIO bootstrap (load + CR3 discover)
+        id: bootstrap
+        shell: cmd
+        continue-on-error: true
+        run: |
+          echo loaded=false>> "%GITHUB_OUTPUT%"
+          echo === ALSysIO phys-mode bootstrap ===
+          crates\operator-kernel-cli\target\release\nyx-kernel.exe bootstrap --alsysio "%DRIVER_PATH%" --alsysio-svc NyaAlsys
+          echo BOOTSTRAP_EXIT=%ERRORLEVEL%
+          if %ERRORLEVEL% NEQ 0 (
+            echo ::warning::ALSysIO bootstrap failed - see error above.
+            exit /b 0
+          )
+          sc query NyaAlsys | findstr /i "RUNNING" >nul && echo loaded=true>> "%GITHUB_OUTPUT%"
+
+      - name: Driver not RUNNING — assess not exercised (honest skip)
+        if: steps.bootstrap.outputs.loaded != 'true'
+        run: echo "::warning::ALSysIO64 load did not reach RUNNING state. assess hard gate skipped; offline coverage = alsysio unit tests + blocklist-gate job."
+
+      # ---- 3. assess — HARD GATE(loaded==true 时必须 Assessed)----
+      - name: Kernel assessment (nyx-kernel assess --alsysio) - hard gate
+        if: steps.bootstrap.outputs.loaded == 'true'
+        shell: pwsh
+        run: |
+          $exe = "crates\operator-kernel-cli\target\release\nyx-kernel.exe"
+          Write-Host "=== T-REX kernel assessment (ALSysIO phys-mode) ==="
+          $out = & $exe assess --alsysio "$env:DRIVER_PATH" --alsysio-svc NyaAlsys 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) {
+            Write-Host "::error::nyx-kernel assess --alsysio exited $exit"
+            exit 1
+          }
+          $jsonLine = ($out | Where-Object { $_ -like '{"assess":*' } | Select-Object -First 1)
+          if (-not $jsonLine) { Write-Host "::error::no assess JSON line"; exit 1 }
+          $a = ($jsonLine | ConvertFrom-Json).assess
+          Write-Host "status=$($a.status) total_drivers=$($a.total_drivers)"
+          if ($a.status -ne "Assessed" -or $a.total_drivers -le 0) {
+            Write-Host "::error::ALSysIO assessment failed"
+            exit 1
+          }
+          Write-Host "::notice::ALSysIO kernel assessment PASS: status=Assessed, $($a.total_drivers) modules"

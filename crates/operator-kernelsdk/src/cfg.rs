@@ -22,8 +22,8 @@
 //!   0x40 on Win8.1. Detect via the Size field (first ULONG of the block).
 //! - Win11 24H2: SCPCFG coexists; classic CFG bitmap still checked.
 
-use crate::KernelRw;
 use crate::offsets::EprocessOffsets;
+use crate::KernelRw;
 
 /// Offset of `_KPROCESS.DirectoryTableBase` within `_EPROCESS` (x64).
 /// KPROCESS is the first embedded struct; this field is stable across Win10+ builds.
@@ -79,7 +79,11 @@ pub fn locate_cfg_bitmap(ntdll_base: usize, krw: &dyn KernelRw) -> Option<CfgBit
 
     // 4. Read CfgBitMap (ULONG64, 8 bytes) and CfgBitMapSize (ULONG64, 8 bytes).
     let mut bitmap_buf = [0u8; 16];
-    krw.kread(ntdll_base + init_block_rva + cfg_bitmap_off, &mut bitmap_buf).ok()?;
+    krw.kread(
+        ntdll_base + init_block_rva + cfg_bitmap_off,
+        &mut bitmap_buf,
+    )
+    .ok()?;
     let bitmap_addr = usize::from_le_bytes(bitmap_buf[..8].try_into().unwrap());
     let bitmap_size = usize::from_le_bytes(bitmap_buf[8..16].try_into().unwrap());
 
@@ -161,7 +165,10 @@ pub fn get_process_cr3(
 
         // Read UniqueProcessId.
         let mut pid_buf = [0u8; 8];
-        if krw.kread(eprocess + offsets.unique_process_id, &mut pid_buf).is_err() {
+        if krw
+            .kread(eprocess + offsets.unique_process_id, &mut pid_buf)
+            .is_err()
+        {
             break;
         }
         let pid = usize::from_le_bytes(pid_buf);
@@ -169,7 +176,10 @@ pub fn get_process_cr3(
         if pid == target_pid {
             // Found the target. Read DirectoryTableBase from KPROCESS.
             let mut dtb_buf = [0u8; 8];
-            if krw.kread(eprocess + KPROCESS_DIRECTORY_TABLE_BASE, &mut dtb_buf).is_err() {
+            if krw
+                .kread(eprocess + KPROCESS_DIRECTORY_TABLE_BASE, &mut dtb_buf)
+                .is_err()
+            {
                 return None;
             }
             return Some(u64::from_le_bytes(dtb_buf));
@@ -196,14 +206,21 @@ fn resolve_export_rva(ntdll_base: usize, krw: &dyn KernelRw, name: &str) -> Opti
     // Optional header: DataDirectory[0] (export directory) starts at offset 0x88 (PE32+) or 0x78 (PE32).
     // Check Magic at e_lfanew + 4 + 20 (offset of Magic in optional header).
     let mut magic_buf = [0u8; 2];
-    krw.kread(ntdll_base + e_lfanew + 4 + 20, &mut magic_buf).ok()?;
+    krw.kread(ntdll_base + e_lfanew + 4 + 20, &mut magic_buf)
+        .ok()?;
     let magic = u16::from_le_bytes(magic_buf);
     let export_dir_off = if magic == 0x20B { 0x88 } else { 0x78 }; // PE32+:PE32
 
     let mut export_rva_buf = [0u8; 4];
-    krw.kread(ntdll_base + e_lfanew + 4 + export_dir_off, &mut export_rva_buf).ok()?;
+    krw.kread(
+        ntdll_base + e_lfanew + 4 + export_dir_off,
+        &mut export_rva_buf,
+    )
+    .ok()?;
     let export_rva = u32::from_le_bytes(export_rva_buf) as usize;
-    if export_rva == 0 { return None; }
+    if export_rva == 0 {
+        return None;
+    }
 
     // Read export directory.
     let export_kva = ntdll_base + export_rva;
@@ -222,12 +239,14 @@ fn resolve_export_rva(ntdll_base: usize, krw: &dyn KernelRw, name: &str) -> Opti
         let mid = (lo + hi) / 2;
         // Read name RVA at name_rva + mid * 4.
         let mut name_rva_buf = [0u8; 4];
-        krw.kread(ntdll_base + name_rva + mid * 4, &mut name_rva_buf).ok()?;
+        krw.kread(ntdll_base + name_rva + mid * 4, &mut name_rva_buf)
+            .ok()?;
         let entry_name_rva = u32::from_le_bytes(name_rva_buf) as usize;
         // Read the first few chars to compare.
         let mut cmp_buf = [0u8; 64];
         let cmp_len = name_bytes.len().min(63);
-        krw.kread(ntdll_base + entry_name_rva, &mut cmp_buf[..cmp_len]).ok()?;
+        krw.kread(ntdll_base + entry_name_rva, &mut cmp_buf[..cmp_len])
+            .ok()?;
         let cmp = core::str::from_utf8(&cmp_buf[..cmp_len]).unwrap_or("");
         if name_bytes < cmp.as_bytes() {
             hi = mid;
@@ -236,11 +255,13 @@ fn resolve_export_rva(ntdll_base: usize, krw: &dyn KernelRw, name: &str) -> Opti
         } else {
             // Found. Read ordinal at ord_rva + mid * 2.
             let mut ord_buf = [0u8; 2];
-            krw.kread(ntdll_base + ord_rva + mid * 2, &mut ord_buf).ok()?;
+            krw.kread(ntdll_base + ord_rva + mid * 2, &mut ord_buf)
+                .ok()?;
             let ord = u16::from_le_bytes(ord_buf) as usize;
             // Read function RVA at func_rva + ord * 4.
             let mut func_rva_buf = [0u8; 4];
-            krw.kread(ntdll_base + func_rva + ord * 4, &mut func_rva_buf).ok()?;
+            krw.kread(ntdll_base + func_rva + ord * 4, &mut func_rva_buf)
+                .ok()?;
             return Some(u32::from_le_bytes(func_rva_buf) as usize);
         }
     }

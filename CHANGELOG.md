@@ -12,6 +12,45 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-16（续2）BYOVD 第二条 clean phys 路径 — ALSysIO64：
+
+- **选型与实证**：CPUID CPU-Z `ALSysIO64.sys`（LOLDrivers `4d365dd0`，
+  KDU `alcpu` provider）不在 MS blocklist（A5 离线断言）。对 LOLDrivers
+  两个样本做 dispatch jump-table 直接解码：v2.0.8.0 的 case 0x18/0x1C
+  指向 `MmMapIoSpace` 物理读写臂（in `{pa:u64,size:u32}`，单
+  METHOD_BUFFERED 缓冲区），**v2.1.0.0 的 0x18/0x1C 已落入
+  STATUS_NOT_IMPLEMENTED 默认臂**——IOCTL 号有效版本区间收窄为
+  v2.0.x，CI 钉死 v2.0.8.0 SHA256 `7196187f…`（不符即红）。
+- **代码**：`byovd_drivers/alsysio.rs`（`VulnDriverIoctl` +
+  `supports_va=false` + `phys_read/phys_write` + 5 单测）；
+  `win/alsys.rs`（`AlsysPhys` + `open_alsys` + `bootstrap_alsys`，复用
+  泛化后的 `wdt::bootstrap_phys_with` 骨架：load → open → CR3 扫描 →
+  MZ 验证 → `VaKernelRw`）；`KernelBootstrap::Alsys` 变体 + CLI
+  `--alsysio`/`--alsysio-svc` 臂；`NYX_BYOVD=alsysio` 可选；
+  scenarios 选择器候选表更新（phys-only 正确跳过语义）。
+- **门**：`check_byovd_blocklist.py` 新增 A5（名 + 双版本 SHA256 缺席）
+  /B3（LOLDrivers 钉样本在场）；`windows-byovd-hosted.yml` 新增
+  `byovd-alsysio` job（windows-2022 真机加载 + assess `Assessed` 硬门）。
+- **验证**：kernelsdk 168 host 测试全绿；`x86_64-pc-windows-msvc`
+  target check 0 error 0 warning；A5/B3 断言逻辑已用 live 抓取数据
+  本地预演通过。
+
+2026-08-16（续）HVCI-on 验证矩阵放弃：
+
+- **决策**：放弃 HVCI-on 真机/云上验证矩阵。依据：出货 BYOVD 驱动
+  （WDTKernel / Shield）均不在微软 Vulnerable Driver Blocklist 上，
+  HVCI 姿态不再阻塞任何出货路径；HVCI-on 只对"加载 blocklisted Nday"
+  有意义，而该场景已由 DMA / driverless CVE / KslD 覆盖。
+  代码的 HVCI 感知（`KrwError::HvciCodePage` 数据写降级契约、assess
+  HVCI/VBS 位检测）保留——目标机仍可能开 HVCI，行为契约不变；放弃
+  的只是"我们自己在 HVCI-on 环境下做验证"的基础设施。
+- **删除**：`scripts/kernel-lab/run_hvci_matrix.sh`（HVCI 编排器）；
+  `verify_kernel_env.ps1` 不再以 VBS+HVCI 运行为退出码门（纯姿态报告，
+  `matrix_ready` 字段移除）；`bootstrap_kernel_lab.ps1` 改为启用
+  test-signing（peekaboo-probe 测试签名驱动），不再启用 VBS/HVCI；
+  `run_kernel_matrix.ps1`/`deploy_azure_lab.sh` 注释同步为普通 x64
+  lab 语境（PG live dump / WFP e2e / 驱动功能验证）。
+
 2026-08-16 BYOVD 驱动包清理（删除 blocklisted 驱动，默认换 Shield）：
 
 - **删除 RTCore64 与 iqvw64e**：两者均已实锤在微软 Vulnerable Driver

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # deploy_azure_lab.sh — provision an x64 Windows kernel-research VM on Azure
-# with Trusted Launch (VBS), ready for HVCI / PatchGuard / driver verification.
+# (Trusted Launch Gen2), for PatchGuard / driver / WFP verification.
 #
 # Why Azure: the kernelsdk work is x64-only (PRCB gs:[0x20], Peekaboo, vuln-
 # driver IOCTL wires). Apple-Silicon Parallels can only run ARM64 Windows (an
-# ARM64 kernel — wrong architecture). Azure Trusted Launch Gen2 VMs expose
-# real Hyper-V VBS to the guest, so HVCI (memory integrity) and Credential
-# Guard can be switched on inside the VM — no nested-virt gymnastics.
+# ARM64 kernel — wrong architecture). NOTE: the HVCI-on verification matrix
+# was ABANDONED 2026-08-16 — the shipped BYOVD drivers are clean of the MS
+# blocklist so HVCI posture gates nothing we ship. Trusted Launch is kept
+# because it is the flexible SKU (Secure Boot toggleable for test-signing);
+# the guest bootstrap no longer enables VBS/HVCI.
 #
 # Usage:
 #   ./scripts/kernel-lab/deploy_azure_lab.sh                 # create everything (idempotent)
@@ -51,21 +53,20 @@ print_next_steps() {
 Next:
   1. RDP in, copy scripts/kernel-lab/bootstrap_kernel_lab.ps1 + verify_kernel_env.ps1 into the VM.
   2. Elevated PowerShell:  Set-ExecutionPolicy Bypass -Scope Process; .\bootstrap_kernel_lab.ps1
-  3. Reboot, then:  .\verify_kernel_env.ps1   — expect VBS running + HVCI running.
-     (headless alternative: scripts/kernel-lab/run_hvci_matrix.sh does all of
-      this via 'az vm run-command' — no RDP needed)
+  3. Reboot, then:  .\verify_kernel_env.ps1   — expect test-signing ON; VBS/HVCI OFF is FINE
+     (the HVCI matrix was abandoned 2026-08-16; run_kernel_matrix.ps1 runs on
+      a plain x64 VM, manually or via 'az vm run-command').
   4. Driver experiments:
      - BYOVD (WDTKernel / Shield — neither is on the MS vulnerable driver
        blocklist): loads with the blocklist ON, no toggle needed.
-       A blocklisted driver would need the blocklist OFF first — it is ON by
-       default when memory integrity is on (KB5020779).
+       A blocklisted driver would need the blocklist OFF first.
        Headless: .\bootstrap_kernel_lab.ps1 -DisableBlocklist   (needs reboot)
        GUI:      Windows Security → Device security → Core isolation.
      - test-signed own driver: requires Secure Boot OFF:
          az vm deallocate -g $RG -n $VM
          az vm update -g $RG -n $VM --security-type TrustedLaunch --enable-secure-boot false --enable-vtpm true
          az vm start -g $RG -n $VM
-       then in VM: bcdedit /set testsigning on && shutdown /r /t 0
+       (bootstrap_kernel_lab.ps1 already enables testsigning; reboot applies it)
   5. Idle cost: deallocate when done —  az vm deallocate -g $RG -n $VM
      Full cleanup:  $0 teardown
 EOF

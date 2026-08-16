@@ -525,7 +525,7 @@ pub const KNOWN_PG_CONTEXT_BUILDS: &[PgContextBuild] = &[
             // PLACEHOLDER, falsified 2026-08-13 (PDB 19041.1023): KPRCB+0x190 =
             // ProcessorState.SpecialRegisters.LastExceptionToRip — see header.
             prcb_pg_thread_offset: 0x190,
-            context_valid_offset: 0x08,   // PLACEHOLDER
+            context_valid_offset: 0x08, // PLACEHOLDER
             context_size: 0x800,
             supports_thread_suspend: false,
             verified: false, // placeholder — unverified (kernelsdk-1-1)
@@ -538,7 +538,7 @@ pub const KNOWN_PG_CONTEXT_BUILDS: &[PgContextBuild] = &[
             // PLACEHOLDER, falsified 2026-08-13 (PDB 22621.1778): KPRCB+0x190 =
             // ProcessorState.SpecialRegisters.LastExceptionToRip — see header.
             prcb_pg_thread_offset: 0x190,
-            context_valid_offset: 0x08,   // PLACEHOLDER
+            context_valid_offset: 0x08, // PLACEHOLDER
             context_size: 0x900,
             supports_thread_suspend: false,
             verified: false, // placeholder — unverified (kernelsdk-1-1)
@@ -551,7 +551,7 @@ pub const KNOWN_PG_CONTEXT_BUILDS: &[PgContextBuild] = &[
             // PLACEHOLDER, falsified 2026-08-13 (PDB 26100.1742): KPRCB+0x190 =
             // ProcessorState.SpecialRegisters.LastExceptionToRip — see header.
             prcb_pg_thread_offset: 0x190,
-            context_valid_offset: 0x08,   // PLACEHOLDER
+            context_valid_offset: 0x08, // PLACEHOLDER
             context_size: 0x900,
             supports_thread_suspend: true,
             verified: false, // placeholder — unverified (kernelsdk-1-1)

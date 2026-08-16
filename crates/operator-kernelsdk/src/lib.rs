@@ -76,15 +76,15 @@ use core::fmt;
 /// is operator-side and never runs on this host.
 pub mod byovd;
 pub mod byovd_drivers;
+/// CFG bitmap manipulation — mark NtContinue as valid call target via kernel r/w.
+/// Used to enable Ekko/Foliage sleep obfuscation on CFG-enabled processes
+/// where CreateTimerQueueTimer callbacks are blocked by Control Flow Guard.
+pub mod cfg;
 /// System-process CR3 discovery via physical-memory scan (System EPROCESS
 /// needle + alignment/PID gates + MZ-validated page walk) — pure algorithm,
 /// host-testable. The WDTKernel phys-mode bootstrap (`win::wdt`) drives it
 /// with a live `\\.\__WDT__` handle.
 pub mod cr3_scan;
-/// CFG bitmap manipulation — mark NtContinue as valid call target via kernel r/w.
-/// Used to enable Ekko/Foliage sleep obfuscation on CFG-enabled processes
-/// where CreateTimerQueueTimer callbacks are blocked by Control Flow Guard.
-pub mod cfg;
 /// ETW Deception — event forgery + frequency keeper (Bypass Complete Phase 4).
 /// Forges synthetic ETW events that match real kernel-provider cadence, defeating
 /// frequency/content-based detection when the ETW-TI blind is active.
@@ -95,6 +95,15 @@ pub mod etw_deception;
 /// KernelRw; the bootstrap (BYOVD/driverless/DMA `KernelRw` impl + symbol
 /// resolution) lands in Part B / the operator's chosen path.
 pub mod etwti;
+/// KslD.sys ("Living off the Defender") protocol constants + honest
+/// `Unavailable` stub on non-Windows hosts. The file is written cross-platform
+/// (the real `KernelRw` impl is internally cfg-gated `windows_impl`), but the
+/// `win` parent module above is Windows-only — without this path module the
+/// stub and its 4 stub tests compiled on NO platform (dead code). On Windows
+/// the real impl is reached as `win::ksld`.
+#[cfg(not(target_os = "windows"))]
+#[path = "win/ksld.rs"]
+pub mod ksld;
 /// Network/credential/neutralize kits (P2.2 §2.4/§2.5/§4): `UserModeEdrSilencer`
 /// (WFP rule templates), `KernelLsassReader` (DTB + page-walk shell),
 /// `EdrNeutralizer` (Kill/Freeze/Choke tiers). Algorithm + framework.
@@ -117,28 +126,6 @@ pub mod pagewalk;
 /// ntoskrnl pattern scan (byte-signature → RVA) — pure algorithm, host-testable.
 /// The fallback offset resolver for unknown builds.
 pub mod pattern_scan;
-/// Persistence/protection kits (P2.2 §3): `ProcessHider` (ActiveProcessLinks
-/// unlink), `PplStripper` (Protection.Level zero), `PatchGuardWindow`
-/// (DKOM-window state machine). Mock-tested.
-pub mod persistence;
-/// Telemetry neutralization kits (P2.2 §2.2/§2.3): `CallbackNeutralizer`
-/// (Ps*NotifyRoutine ret-stub) + `MiniFilterUnlinker` (RegisteredFilters
-/// unlink). Algorithms over `&dyn KernelRw`; mock-tested.
-pub mod telemetry;
-/// Windows-specific kernel-tier shells (BYOVD/KslD/DMA `KernelRw` impls +
-/// symbol resolution). Empty for now — algorithms live in the sibling modules;
-/// this is where the Windows-only bootstrap lands.
-#[cfg(target_os = "windows")]
-pub mod win;
-/// KslD.sys ("Living off the Defender") protocol constants + honest
-/// `Unavailable` stub on non-Windows hosts. The file is written cross-platform
-/// (the real `KernelRw` impl is internally cfg-gated `windows_impl`), but the
-/// `win` parent module above is Windows-only — without this path module the
-/// stub and its 4 stub tests compiled on NO platform (dead code). On Windows
-/// the real impl is reached as `win::ksld`.
-#[cfg(not(target_os = "windows"))]
-#[path = "win/ksld.rs"]
-pub mod ksld;
 /// PeekabooProbe production seam — protocol constants + pure pack/parse layer
 /// + the transport-generic [`peekaboo::PeekabooProbeClient`] (a real
 /// [`persistence::PeekabooProbe`] impl over the `\\.\PeekabooProbe` IOCTL
@@ -149,11 +136,24 @@ pub mod ksld;
 #[cfg(not(target_os = "windows"))]
 #[path = "win/peekaboo.rs"]
 pub mod peekaboo;
+/// Persistence/protection kits (P2.2 §3): `ProcessHider` (ActiveProcessLinks
+/// unlink), `PplStripper` (Protection.Level zero), `PatchGuardWindow`
+/// (DKOM-window state machine). Mock-tested.
+pub mod persistence;
 /// Red-team operation-chain scenario tests (wave-2): chains the per-kit mocks
 /// into end-to-end engagement flows (EDR suppression / credentials / PG
 /// window) against one shared fake kernel image.
 #[cfg(test)]
 mod scenarios;
+/// Telemetry neutralization kits (P2.2 §2.2/§2.3): `CallbackNeutralizer`
+/// (Ps*NotifyRoutine ret-stub) + `MiniFilterUnlinker` (RegisteredFilters
+/// unlink). Algorithms over `&dyn KernelRw`; mock-tested.
+pub mod telemetry;
+/// Windows-specific kernel-tier shells (BYOVD/KslD/DMA `KernelRw` impls +
+/// symbol resolution). Empty for now — algorithms live in the sibling modules;
+/// this is where the Windows-only bootstrap lands.
+#[cfg(target_os = "windows")]
+pub mod win;
 
 // ---- Errors ---------------------------------------------------------------
 
@@ -766,8 +766,15 @@ mod tests {
 
         let handle = tier.unload_driver();
         assert!(handle.is_some());
-        assert_eq!(count.load(Ordering::SeqCst), 1, "unload must run exactly once");
-        assert!(tier.loaded_driver.is_none(), "field must be cleared after unload");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "unload must run exactly once"
+        );
+        assert!(
+            tier.loaded_driver.is_none(),
+            "field must be cleared after unload"
+        );
 
         // Second call is a harmless no-op (idempotent contract).
         assert!(tier.unload_driver().is_none());

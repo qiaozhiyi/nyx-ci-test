@@ -124,7 +124,7 @@ pub unsafe fn assess_kernel_impl(krw: Option<&dyn KernelRw>) -> KernelAssessment
     // ---- T5: ETW-TI provider enable state (EtwTiBlind chase) ----
     out.etw_ti_active = match krw {
         Some(rw) => unsafe { probe_etw_ti_active(rw) },
-        None => false,  // honest: not measured without a driver
+        None => false, // honest: not measured without a driver
     };
 
     out.status = if any_query_ok {
@@ -140,10 +140,9 @@ pub unsafe fn assess_kernel_impl(krw: Option<&dyn KernelRw>) -> KernelAssessment
 unsafe fn query_code_integrity() -> Option<u32> {
     type NtQuerySystemInformationFn =
         unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
-    let nqsi: NtQuerySystemInformationFn = unsafe {
-        crate::win::resolve::resolve_sym(b"ntdll.dll", b"NtQuerySystemInformation")
-    }
-    .ok()?;
+    let nqsi: NtQuerySystemInformationFn =
+        unsafe { crate::win::resolve::resolve_sym(b"ntdll.dll", b"NtQuerySystemInformation") }
+            .ok()?;
 
     let mut info = SystemCodeIntegrityInformation {
         options: 0,
@@ -285,12 +284,11 @@ fn detect_build() -> u32 {
         reserved: u8,
     }
     type RtlGetVersionFn = unsafe extern "system" fn(*mut RtlOsVersionInfoExW) -> i32;
-    let rtl_get_version: RtlGetVersionFn = match unsafe {
-        crate::win::resolve::resolve_sym(b"ntdll.dll", b"RtlGetVersion")
-    } {
-        Ok(f) => f,
-        Err(_) => return 0,
-    };
+    let rtl_get_version: RtlGetVersionFn =
+        match unsafe { crate::win::resolve::resolve_sym(b"ntdll.dll", b"RtlGetVersion") } {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
     let mut info = RtlOsVersionInfoExW {
         os_version_info_size: core::mem::size_of::<RtlOsVersionInfoExW>() as u32,
         major_version: 0,
@@ -427,7 +425,8 @@ mod tests {
     #[test]
     fn code_integrity_bit_positions_match_spec() {
         // The T-REX spec bits: TESTSIGN=bit1, HVCI_KMCI=bit9, VBS≈bit12.
-        let options = (1u32 << CI_TESTSIGN_BIT) | (1u32 << CI_HVCI_KMCI_BIT) | (1u32 << CI_VBS_APPROX_BIT);
+        let options =
+            (1u32 << CI_TESTSIGN_BIT) | (1u32 << CI_HVCI_KMCI_BIT) | (1u32 << CI_VBS_APPROX_BIT);
         assert_ne!(options & (1 << 1), 0);
         assert_ne!(options & (1 << 9), 0);
         assert_ne!(options & (1 << 12), 0);

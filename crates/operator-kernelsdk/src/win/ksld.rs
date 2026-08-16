@@ -300,8 +300,8 @@ mod windows_impl {
                 if let Some(name) = device_name {
                     v.push(name);
                 }
-                v.push(KSLD_DEFAULT_DEVICE);       // \\.\KslD (newer engines)
-                v.push(KSLD_ALT_DEVICE_MPKSL);     // \\.\MpKsl (older engines)
+                v.push(KSLD_DEFAULT_DEVICE); // \\.\KslD (newer engines)
+                v.push(KSLD_ALT_DEVICE_MPKSL); // \\.\MpKsl (older engines)
                 v
             };
 
@@ -320,7 +320,7 @@ mod windows_impl {
                     create_file(
                         path_buf.as_ptr(),
                         0x0012_0003, // FILE_READ_DATA|FILE_WRITE_DATA|SYNCHRONIZE (minimal)
-                        0x03,          // FILE_SHARE_READ | FILE_SHARE_WRITE
+                        0x03,        // FILE_SHARE_READ | FILE_SHARE_WRITE
                         ptr::null_mut(),
                         0x03, // OPEN_EXISTING
                         0,

@@ -244,8 +244,7 @@ fn resolve_nt<T>(name: &[u8]) -> Result<T, KrwError> {
 /// `RtlAdjustPrivilege` — enables/disables a privilege in the calling thread's
 /// token (or the process token, falling back to the system token). Simpler than
 /// the OpenProcessToken → AdjustTokenPrivileges chain.
-type RtlAdjustPrivilegeFn =
-    unsafe extern "system" fn(u32, i32, i32, *mut i32) -> i32;
+type RtlAdjustPrivilegeFn = unsafe extern "system" fn(u32, i32, i32, *mut i32) -> i32;
 
 /// Enable `SeLoadDriverPrivilege` (LUID 10) in the calling thread's token.
 /// Returns `true` if the privilege is now enabled (or was already). Best-effort:
@@ -257,12 +256,11 @@ type RtlAdjustPrivilegeFn =
 /// token. We use `0` (process).
 fn enable_load_driver_privilege() -> bool {
     const SE_LOAD_DRIVER_PRIVILEGE: u32 = 10;
-    let rtl_adjust: RtlAdjustPrivilegeFn = match unsafe {
-        super::resolve::resolve_sym(b"ntdll.dll", b"RtlAdjustPrivilege")
-    } {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
+    let rtl_adjust: RtlAdjustPrivilegeFn =
+        match unsafe { super::resolve::resolve_sym(b"ntdll.dll", b"RtlAdjustPrivilege") } {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
     let mut enabled: i32 = 0;
     // SAFETY: RtlAdjustPrivilege with the well-known LUID 10 + ClientOnly=0 is
     // a documented safe path; the out-param is a stack i32.
@@ -540,7 +538,10 @@ mod tests {
         // `\Registry\Machine\...` form; strip_prefix undoes exactly the first
         // 18 units of it. Pin both lengths together.
         let prefix = u16s(SERVICES_PREFIX);
-        assert_eq!(prefix.len(), 18 + "SYSTEM\\CurrentControlSet\\Services\\".len());
+        assert_eq!(
+            prefix.len(),
+            18 + "SYSTEM\\CurrentControlSet\\Services\\".len()
+        );
         assert_eq!(
             from_u16(RegApi::strip_prefix(&prefix)),
             "SYSTEM\\CurrentControlSet\\Services\\"

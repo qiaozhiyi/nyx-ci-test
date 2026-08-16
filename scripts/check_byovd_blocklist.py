@@ -23,6 +23,10 @@ Asserts against LIVE public datasets (nothing repo-local to go stale):
         the DEFAULT BYOVD driver (clean, arbitrary VA memcpy); if any
         variant name appears, the default path is dead and this gate must
         go red.
+    A5. ALSysIO64.sys is ABSENT (name + pinned v2.0.8.0 sample SHA256 +
+        v2.1.0.0 SHA256) — the second clean phys driver (added 2026-08-16).
+        NOTE: only v2.0.x implements the R/W IOCTLs we use; v2.1.0.0 removed
+        them (proven by dispatch jump-table decode).
 
   LOLDrivers dataset (cross-reference — tracks KNOWN-vulnerable drivers, a
   superset of the MS blocklist):
@@ -72,6 +76,17 @@ WDTKERNEL_SHA256 = [
     # authentihashes
     "6a27a2af4b3123d2e0e0daa23bdda0a2f8cfbef495b257dc83cfe8b4faffd7d5",
     "cfae2c01311fb5a6d5aa5be2a3822e01e825258fe4d860e6e8778cb6738b95f3",
+]
+
+# ALSysIO64.sys (CPUID CPU-Z) file SHA256s catalogued by LOLDrivers (id
+# 4d365dd0-34c3-492e-a2bd-c16266796ae5). 7196187f… = the PINNED v2.0.8.0
+# sample the CI fetch gate downloads (its R/W IOCTLs were statically
+# verified); 7a20ca8f… = v2.1.0.0, whose dispatch REMOVED those IOCTLs —
+# clean of the blocklist but useless to us, kept here so a future blocklist
+# addition of either variant is caught.
+ALSYSIO_SHA256 = [
+    "7196187fb1ef8d108b380d37b2af8efdeb3ca1f6eefd37b5dc114c609147216d",
+    "7a20ca8f9361eb892257b3693095ffeee61457dc4e22d9b119e3a9f3a1507069",
 ]
 
 # HVCI tripwire: SiPolicy <VersionEx> of the MS blocklist, pinned at the last
@@ -200,6 +215,17 @@ def check_ms_blocklist(failures):
     else:
         print("[+] A4: shield.sys / shield-async.sys / shieldwp.sys ABSENT from MS blocklist")
 
+    # A5: ALSysIO64 must be ABSENT (second clean phys driver, added
+    # 2026-08-16). Content check on the PINNED v2.0.8.0 sample hash — the
+    # only version whose R/W IOCTLs we verified (v2.1.0.0 removed them; its
+    # hash is asserted absent too, it just can't drive R/W for us).
+    if any("alsysio" in f for f in low_names):
+        failures.append("A5 FAIL: ALSysIO64 named in the MS vulnerable-driver blocklist")
+    for h in ALSYSIO_SHA256:
+        if h in xml_low:
+            failures.append(f"A5 FAIL: ALSysIO64 SHA256 {h[:16]}… found in the MS blocklist")
+    print("[+] A5: ALSysIO64.sys ABSENT from MS blocklist (name + pinned v2.0.8.0 hash)")
+
 
 def check_loldrivers(failures):
     data = fetch([LOLDRIVERS_URL])
@@ -236,6 +262,19 @@ def check_loldrivers(failures):
     n = sum(len(e.get("KnownVulnerableSamples") or []) for e in wdt)
     print(f"[+] B2: WDTKernel.sys catalogued ({n} samples), all LoadsDespiteHVCI=TRUE (not MS-blocklisted)")
 
+    # B3: ALSysIO64 catalogued with our pinned v2.0.8.0 sample present (the
+    # LFS blob the CI fetch gate downloads must still be in the dataset).
+    alsys = by_tag("ALSysIO64.sys")
+    pinned = "7196187fb1ef8d108b380d37b2af8efdeb3ca1f6eefd37b5dc114c609147216d"
+    if not any(
+        (s.get("SHA256") or "").lower() == pinned
+        for e in alsys
+        for s in e.get("KnownVulnerableSamples") or []
+    ):
+        failures.append("B3 FAIL: pinned ALSysIO64 v2.0.8.0 sample not in LOLDrivers — CI fetch gate blob may be gone")
+    else:
+        print("[+] B3: ALSysIO64.sys catalogued, pinned v2.0.8.0 sample present")
+
 
 def main():
     if "--version-report" in sys.argv:
@@ -251,7 +290,7 @@ def main():
             print(f"::error::{f}")
         print("BLOCKLIST GATE: FAIL")
         sys.exit(1)
-    print("BLOCKLIST GATE: PASS — WDTKernel/Shield not blocklisted, controls intact")
+    print("BLOCKLIST GATE: PASS — WDTKernel/Shield/ALSysIO64 not blocklisted, controls intact")
 
 
 if __name__ == "__main__":

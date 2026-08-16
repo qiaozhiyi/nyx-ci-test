@@ -15,8 +15,6 @@
 //! ⚠️ 高风险：写错地址或 routine 首字节不止 0xC3 语义，可能 BSOD。每个
 //! routine 先 kread 验证首字节是合理指令字节（不是已 0xC3），再写。
 
-
-
 #[cfg(target_os = "windows")]
 use nyx_operator_kernelsdk::offsets::{notify_routines, RuntimeOffsets};
 #[cfg(target_os = "windows")]
@@ -258,7 +256,6 @@ fn main() {
     println!("\n[callback_neutralize_test] DONE — callbacks neutralized then restored.");
     std::mem::forget(loaded);
 }
-
 
 // ----------------------------------------------------------------------------
 // Non-Windows entry-point fallback (E0601 mitigation).

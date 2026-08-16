@@ -181,7 +181,10 @@ mod tests {
                 self.write_u64(entry_pa, table | 1);
                 table
             };
-            let pdpt = ensure((dtb & 0x000F_FFFF_FFFF_F000) + ((va >> 39) & 0x1FF) * 8, bump);
+            let pdpt = ensure(
+                (dtb & 0x000F_FFFF_FFFF_F000) + ((va >> 39) & 0x1FF) * 8,
+                bump,
+            );
             let pd = ensure(pdpt + ((va >> 30) & 0x1FF) * 8, bump);
             let pt = ensure(pd + ((va >> 21) & 0x1FF) * 8, bump);
             self.write_u64(pt + ((va >> 12) & 0x1FF) * 8, pa | 1);

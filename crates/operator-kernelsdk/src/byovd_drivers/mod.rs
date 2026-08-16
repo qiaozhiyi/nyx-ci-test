@@ -20,9 +20,11 @@
 //! No driver stays unblocklisted forever. The pluggable architecture lets
 //! operators swap drivers without touching anything outside this directory.
 
+pub mod alsysio;
 pub mod shield;
 pub mod wdtkernel;
 
 // Re-export for convenience.
+pub use alsysio::AlsysIo;
 pub use shield::Shield;
 pub use wdtkernel::WdtKernel;
