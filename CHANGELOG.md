@@ -12,6 +12,24 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-16（续3）WFP kit ARM64 VM 端到端验证通过 + 两个真机 bug 修复：
+
+- **e2e 实证**：Parallels Win11 ARM64（build 26100，Prism x64 仿真，
+  SYSTEM 通道）`nyx-kernel wfp-selftest` → `{"baseline":true,"blocked":
+  true,"restored":true,"filters":1,"note":"ok"}`，loopback 按预期被
+  单条件 AppId block filter 拦截、guard drop 后恢复、**零残留**。
+  WFP kit 状态从"实装待验"升为"真机已验"。
+- **bug 1（FWP_E_NULL_DISPLAY_NAME 0x80320023）**：真机 `FwpmFilterAdd0`
+  拒绝 `displayData.name=NULL` 的 filter——mock 测试无法暴露。filter
+  现携带静态名 "NyxWfpKit"（static 生命周期天然满足借用契约）。
+- **bug 2（filter 持久化残留）**：`FwpmEngineOpen0` 传 NULL（默认会话）
+  时 filter 是持久对象，`FwpmEngineClose0` 不回收——首次 e2e 的
+  residue 阶段保持 blocked，需重启清除。会话改开
+  `FWPM_SESSION_FLAG_DYNAMIC`（新增 `FwpmSession0` 72 字节 SDK 布局 +
+  `wfp_session0_layout_matches_sdk` 偏移钉测试），动态会话独占其
+  filter：关会话/进程死亡即清除，guard 文档承诺的无残留契约自此成立。
+- kernelsdk 169 host 测试全绿 + windows-msvc check 0 警告。
+
 2026-08-16（续2）BYOVD 第二条 clean phys 路径 — ALSysIO64：
 
 - **选型与实证**：CPUID CPU-Z `ALSysIO64.sys`（LOLDrivers `4d365dd0`，

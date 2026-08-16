@@ -330,14 +330,25 @@ fn wfp_open_silence_session(rules: &[WfpBlockRule]) -> Result<WfpSilenceGuard, K
         unsafe { crate::win::resolve::resolve_sym(b"fwpuclnt.dll", b"FwpmFilterAdd0") }
             .map_err(|_| KitError::Other("FwpmFilterAdd0 unresolved".into()))?;
 
-    // 1. Open engine session.
+    // 1. Open engine session — MUST be **dynamic**: filters added on the
+    // default (session=NULL) session are PERSISTENT and survive
+    // FwpmEngineClose0 (measured on ARM64 Win11 26100, 2026-08-16: the
+    // residue phase of wfp-selftest stayed blocked after guard drop).
+    // FWPM_SESSION_FLAG_DYNAMIC makes the session own its filters — close
+    // (or process death) removes them; the no-residue contract the guard
+    // documents only holds for dynamic sessions.
+    type GetCurrentProcessId = unsafe extern "system" fn() -> u32;
+    let get_pid: GetCurrentProcessId =
+        unsafe { crate::win::resolve::resolve_sym(b"kernel32.dll", b"GetCurrentProcessId") }
+            .map_err(|_| KitError::Other("GetCurrentProcessId unresolved".into()))?;
+    let session = FwpmSession0::dynamic(unsafe { get_pid() });
     let mut engine_handle: *mut core::ffi::c_void = core::ptr::null_mut();
     let st = unsafe {
         open(
             core::ptr::null(), // local server
             10,                // RPC_C_AUTHN_WINNT
             core::ptr::null(), // default identity
-            core::ptr::null(), // default session
+            &session as *const FwpmSession0 as *const core::ffi::c_void,
             &mut engine_handle,
         )
     };
@@ -477,6 +488,64 @@ fn ale_app_id_condition(app_id: *mut FwpByteBlob) -> FwpmFilterCondition0 {
     }
 }
 
+/// FWPM_SESSION0 — full SDK layout on x64 (72 bytes). We only set `flags`
+/// (DYNAMIC) + `processId` + a display name; sessionKey zero lets BFE assign.
+/// Per-field x64 offsets (pinned by `wfp_session0_layout_matches_sdk`):
+/// ```text
+///   0   sessionKey           GUID      (16)
+///   16  displayData          { wchar_t* name; wchar_t* desc }
+///   32  flags                UINT32    (FWPM_SESSION_FLAG_DYNAMIC = 0x1)
+///   36  txnWaitTimeoutInMSec UINT32
+///   40  processId            DWORD
+///   48  sid                  SID*      (8, align 8 — 44 is pad)
+///   56  username             wchar_t*
+///   64  kernelMode           BOOL
+/// ```
+#[repr(C)]
+#[cfg(any(target_os = "windows", test))]
+struct FwpmSession0 {
+    session_key: Guid,
+    display_name: *const u16,
+    display_desc: *const u16,
+    flags: u32,
+    txn_wait_ms: u32,
+    process_id: u32,
+    _pad0: u32,
+    sid: *mut core::ffi::c_void,
+    username: *mut core::ffi::c_void,
+    kernel_mode: i32,
+    _pad1: u32,
+}
+
+/// FWPM_SESSION_FLAG_DYNAMIC — session owns its objects; close/process-death
+/// removes them (the no-residue contract).
+#[cfg(any(target_os = "windows", test))]
+const FWPM_SESSION_FLAG_DYNAMIC: u32 = 0x1;
+
+#[cfg(any(target_os = "windows", test))]
+impl FwpmSession0 {
+    fn dynamic(process_id: u32) -> Self {
+        // "NyxWfpSession\0" UTF-16 — static, trivially outlives the open call.
+        static SESSION_NAME: [u16; 14] = [
+            'N' as u16, 'y' as u16, 'x' as u16, 'W' as u16, 'f' as u16, 'p' as u16, 'S' as u16,
+            'e' as u16, 's' as u16, 's' as u16, 'i' as u16, 'o' as u16, 'n' as u16, 0,
+        ];
+        FwpmSession0 {
+            session_key: Guid([0; 16]),
+            display_name: SESSION_NAME.as_ptr(),
+            display_desc: core::ptr::null(),
+            flags: FWPM_SESSION_FLAG_DYNAMIC,
+            txn_wait_ms: 0,
+            process_id,
+            _pad0: 0,
+            sid: core::ptr::null_mut(),
+            username: core::ptr::null_mut(),
+            kernel_mode: 0,
+            _pad1: 0,
+        }
+    }
+}
+
 /// FWPM_FILTER0 — full SDK layout on x64 (200 bytes). Fields we don't use are
 /// zeroed; the ones that matter are `layer_key`, `num_filter_conditions` /
 /// `filter_conditions`, and `action_type`.
@@ -505,22 +574,22 @@ fn ale_app_id_condition(app_id: *mut FwpByteBlob) -> FwpmFilterCondition0 {
 #[repr(C)]
 struct FwpmFilter0 {
     filter_key: Guid,                               // 0: zero = auto-generate
-    display_name: *const u16,                       // 16: FWPM_DISPLAY_DATA0.name (null)
-    display_desc: *const u16,                       // 24: FWPM_DISPLAY_DATA0.description (null)
-    flags: u32,                 // 32: FWPM_FILTER_FLAG_NONE = 0 (never PERSISTENT)
-    provider_key: *const Guid,  // 40: null
+    display_name: *const u16, // 16: FWPM_DISPLAY_DATA0.name (static "NyxWfpKit")
+    display_desc: *const u16, // 24: FWPM_DISPLAY_DATA0.description (null)
+    flags: u32,               // 32: FWPM_FILTER_FLAG_NONE = 0 (never PERSISTENT)
+    provider_key: *const Guid, // 40: null
     provider_data: FwpByteBlob, // 48: empty
-    layer_key: Guid,            // 64: FWPM_LAYER_ALE_AUTH_CONNECT_V4
-    sublayer_key: Guid,         // 80: zero = default sublayer
-    weight_type: u32,           // 96: FWP_VALUE0.type = FWP_EMPTY (0) → auto weight
-    weight_value: u64,          // 104: FWP_VALUE0 union (unused)
+    layer_key: Guid,          // 64: FWPM_LAYER_ALE_AUTH_CONNECT_V4
+    sublayer_key: Guid,       // 80: zero = default sublayer
+    weight_type: u32,         // 96: FWP_VALUE0.type = FWP_EMPTY (0) → auto weight
+    weight_value: u64,        // 104: FWP_VALUE0 union (unused)
     num_filter_conditions: u32, // 112: ALWAYS 1 — see P0-9 below
     filter_conditions: *const FwpmFilterCondition0, // 120
-    action_type: u32,           // 128: FWPM_ACTION0.type = FWP_ACTION_BLOCK
-    action_guid: Guid,          // 132: FWPM_ACTION0 union (unused for block)
-    raw_context: [u64; 2],      // 152: { UINT64 rawContext; GUID providerContext } union (16 bytes)
-    reserved: *const Guid,      // 168: SDK reserved pointer — always null
-    filter_id: u64,             // 176: OUT (0 on input)
+    action_type: u32,         // 128: FWPM_ACTION0.type = FWP_ACTION_BLOCK
+    action_guid: Guid,        // 132: FWPM_ACTION0 union (unused for block)
+    raw_context: [u64; 2],    // 152: { UINT64 rawContext; GUID providerContext } union (16 bytes)
+    reserved: *const Guid,    // 168: SDK reserved pointer — always null
+    filter_id: u64,           // 176: OUT (0 on input)
     effective_weight_type: u32, // 184: FWP_VALUE0 (OUT)
     effective_weight_value: u64, // 192: FWP_VALUE0 union (OUT)
 }
@@ -536,11 +605,26 @@ impl FwpmFilter0 {
     /// the WFP contract, 0 conditions means *"match ALL traffic on this
     /// layer"* — every outbound IPv4 packet on the host, not just the EDR's.
     /// There is deliberately no constructor that can produce that.
+    /// Real WFP rejects a filter whose `displayData.name` is NULL with
+    /// `FWP_E_NULL_DISPLAY_NAME` (0x80320023 — measured on ARM64 Win11
+    /// 26100, 2026-08-16; the mock tests never saw it). A `static` name
+    /// trivially outlives the `FwpmFilterAdd0` call.
     fn block_outbound_app_id(conditions: *const FwpmFilterCondition0) -> Self {
+        // "NyxWfpKit\0" / "Nyx WFP kit outbound block\0" as UTF-16.
+        static NAME: [u16; 10] = [
+            'N' as u16, 'y' as u16, 'x' as u16, 'W' as u16, 'f' as u16, 'p' as u16, 'K' as u16,
+            'i' as u16, 't' as u16, 0,
+        ];
+        static DESC: [u16; 27] = [
+            'N' as u16, 'y' as u16, 'x' as u16, ' ' as u16, 'W' as u16, 'F' as u16, 'P' as u16,
+            ' ' as u16, 'k' as u16, 'i' as u16, 't' as u16, ' ' as u16, 'o' as u16, 'u' as u16,
+            't' as u16, 'b' as u16, 'o' as u16, 'u' as u16, 'n' as u16, 'd' as u16, ' ' as u16,
+            'b' as u16, 'l' as u16, 'o' as u16, 'c' as u16, 'k' as u16, 0,
+        ];
         FwpmFilter0 {
             filter_key: Guid([0; 16]),
-            display_name: core::ptr::null(),
-            display_desc: core::ptr::null(),
+            display_name: NAME.as_ptr(),
+            display_desc: DESC.as_ptr(),
             flags: 0,
             provider_key: core::ptr::null(),
             provider_data: FwpByteBlob {
@@ -1619,6 +1703,25 @@ mod tests {
         assert_eq!(core::mem::size_of::<FwpConditionValue0>(), 16);
         assert_eq!(core::mem::size_of::<FwpmFilterCondition0>(), 40);
         assert_eq!(core::mem::size_of::<FwpmFilter0>(), 200);
+    }
+
+    #[test]
+    fn wfp_session0_layout_matches_sdk() {
+        // FWPM_SESSION0 x64: 72 bytes; flags@32, processId@40, sid@48,
+        // kernelMode@64. The DYNAMIC flag is the no-residue contract — pin it.
+        assert_eq!(core::mem::size_of::<FwpmSession0>(), 72);
+        assert_eq!(core::mem::offset_of!(FwpmSession0, flags), 32);
+        assert_eq!(core::mem::offset_of!(FwpmSession0, process_id), 40);
+        assert_eq!(core::mem::offset_of!(FwpmSession0, sid), 48);
+        assert_eq!(core::mem::offset_of!(FwpmSession0, kernel_mode), 64);
+        assert_eq!(FWPM_SESSION_FLAG_DYNAMIC, 0x1);
+        let s = FwpmSession0::dynamic(1234);
+        assert_eq!(s.flags, FWPM_SESSION_FLAG_DYNAMIC);
+        assert_eq!(s.process_id, 1234);
+        assert!(
+            !s.display_name.is_null(),
+            "NULL display name rejected (FWP_E_NULL_DISPLAY_NAME)"
+        );
     }
 
     #[test]
