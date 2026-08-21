@@ -32,10 +32,12 @@
 //!     `BeaconDataParse(NULL, 0)` args fallback reads the args pointer the
 //!     entry stashed in the TEB `ArbitraryUserPointer` slot (gs:[0x28]; the
 //!     `args_len` u32 sits immediately before the args bytes);
-//!   - `BeaconGetSpawnTo` (needs a writable static scratch buffer) is
-//!     deliberately NOT in the shim table — a BOF referencing it fails load
-//!     with a loud "unresolved external" (isolated mode is a受限交付 subset;
-//!     inline execution keeps the full shim set).
+//!   - `BeaconGetSpawnTo` returns a READ-ONLY `.rdata` string (no writable
+//!     scratch buffer), and `BeaconSpawnTemporaryProcess` is deliberately NOT
+//!     in the shim table — process creation needs kernel32 `CreateProcess`,
+//!     which is never mapped in the sacrificial child — so a BOF referencing
+//!     it fails load with a loud "unresolved external" (isolated mode is
+//!     a受限交付 subset; inline execution keeps the full shim set).
 //! - **NO static tables holding pointers** (they would emit base relocations
 //!   the raw blob cannot fix up): the shim table is a `match` on the external
 //!   name, exactly like `bof.rs::beacon_api_addr`.
@@ -645,6 +647,11 @@ fn shim_keepalive(packed: *const u8) {
         // RevertToken returns nothing — it carries an in-body optimizer
         // barrier instead (see shim.rs).
         shim::BeaconRevertToken();
+        // Pure shims (no memory writes) need their results sunk into
+        // black_box: otherwise the optimizer deletes the "dead" keepalive
+        // call and the dumper loses the out-of-line body beacon_api_addr
+        // lea's (IsAdmin/DataLength fired exactly that gate).
+        let _ = core::hint::black_box(shim::BeaconUseToken(core::ptr::null_mut()));
         shim::BeaconCleanupProcess(core::ptr::null_mut());
         shim::BeaconInformation(core::ptr::null_mut());
         // Also keep the exec stage functions reachable-from-entry honest:

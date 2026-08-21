@@ -5,7 +5,12 @@
 //! surface community BOFs resolve at load time: the `datap` argument parser
 //! (`BeaconDataParse` / `BeaconDataInt` / `BeaconDataShort` /
 //! `BeaconDataLength` / `BeaconDataExtract`), `BeaconIsAdmin`,
-//! `BeaconGetSpawnTo`, and the community `BeaconOutput` raw-blob sibling.
+//! `BeaconGetSpawnTo`, the token family (`BeaconUseToken` /
+//! `BeaconRevertToken`), the spawn family (`BeaconSpawnTemporaryProcess` /
+//! `BeaconCleanupProcess`), and the community `BeaconOutput` raw-blob
+//! sibling. The injection family (`BeaconInjectProcess` /
+//! `BeaconInjectTemporaryProcess`) is deliberately NOT shimmed — see
+//! `layout::BEACON_APIS` for the rationale.
 //! Uses a static byte buffer and a hand-rolled formatter — **no heap, no
 //! Mutex, no String** — so the shim works safely inside the BOF's RWX memory
 //! region with a tiny stack.
@@ -453,6 +458,9 @@ static SPAWN: SpawnCell = SpawnCell(UnsafeCell::new([0; SPAWN_CAP]));
 /// returns. The buffer is re-stamped on each call so a BOF that scribbled
 /// arguments last time doesn't see stale garbage. The `x86` selector is
 /// accepted but ignored (x64 runner; no WOW64 spawn-to).
+///
+/// The returned path is the exact command line [`BeaconSpawnTemporaryProcess`]
+/// launches — the value is truthful, not decorative.
 #[no_mangle]
 pub unsafe extern "C" fn BeaconGetSpawnTo(_x86: i32) -> *mut u8 {
     const TEMPLATE: &[u8] = b"C:\\Windows\\System32\\cmd.exe\0";
@@ -463,6 +471,180 @@ pub unsafe extern "C" fn BeaconGetSpawnTo(_x86: i32) -> *mut u8 {
         let buf: *mut u8 = SPAWN.0.get().cast();
         core::ptr::copy_nonoverlapping(TEMPLATE.as_ptr(), buf, copy_len);
         buf
+    }
+}
+
+// ── token family (CS beacon.h): BeaconUseToken / BeaconRevertToken ───────────
+//
+// Both are thin wrappers over the advapi32 token primitives, resolved at call
+// time like `BeaconIsAdmin` (advapi32 is guaranteed loaded in any process that
+// can run BOFs, but the resolver keeps the failure mode defined). The runner
+// keeps NO token state of its own: CS's `BeaconUseToken` additionally stores
+// the token for later spawns; here impersonation applies to the calling
+// thread only, and `BeaconRevertToken` (advapi32 `RevertToSelf`) drops it.
+
+type ImpersonateLoggedOnUserFn = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type RevertToSelfFn = unsafe extern "system" fn() -> i32;
+
+/// `BOOL BeaconUseToken(HANDLE token)` — impersonate the BOF thread with
+/// `token` (advapi32 `ImpersonateLoggedOnUser`). Returns the raw BOOL result;
+/// a NULL token or an unresolvable advapi32 export is a defined failure (0),
+/// never a crash. CS additionally reports the new token to the operator and
+/// stashes it for `BeaconSpawnTemporaryProcess`; this stateless shim does
+/// neither (documented divergence — the spawn shim always uses the current
+/// process token).
+#[no_mangle]
+pub unsafe extern "C" fn BeaconUseToken(token: *mut std::ffi::c_void) -> i32 {
+    if token.is_null() {
+        return 0;
+    }
+    let Some(imp) = resolve_export(b"advapi32.dll\0", b"ImpersonateLoggedOnUser\0") else {
+        return 0;
+    };
+    // SAFETY: `imp` came from GetProcAddress on advapi32 with the exact name;
+    // the fn-pointer type matches the documented Win32 signature. `token` is
+    // a BOF-supplied handle, non-null (checked above).
+    let imp: ImpersonateLoggedOnUserFn = unsafe { std::mem::transmute(imp) };
+    unsafe { imp(token) }
+}
+
+/// `void BeaconRevertToken()` — drop the thread's impersonation token
+/// (advapi32 `RevertToSelf`). Best-effort: if advapi32 cannot be resolved
+/// there is nothing to revert through, so the shim is a no-op (same failure
+/// philosophy as `BeaconIsAdmin`: degrade, never crash).
+#[no_mangle]
+pub unsafe extern "C" fn BeaconRevertToken() {
+    let Some(revert) = resolve_export(b"advapi32.dll\0", b"RevertToSelf\0") else {
+        return;
+    };
+    // SAFETY: `revert` came from GetProcAddress on advapi32 with the exact
+    // name; the fn-pointer type matches the documented Win32 signature.
+    // RevertToSelf takes no arguments and is safe to call when the thread is
+    // not impersonating.
+    let revert: RevertToSelfFn = unsafe { std::mem::transmute(revert) };
+    unsafe { revert() };
+}
+
+// ── spawn family (CS beacon.h): BeaconSpawnTemporaryProcess / CleanupProcess ─
+
+type CreateProcessAFn = unsafe extern "system" fn(
+    *const c_char,         // lpApplicationName
+    *mut c_char,           // lpCommandLine (writable!)
+    *mut std::ffi::c_void, // lpProcessAttributes
+    *mut std::ffi::c_void, // lpThreadAttributes
+    i32,                   // bInheritHandles
+    u32,                   // dwCreationFlags
+    *mut std::ffi::c_void, // lpEnvironment
+    *const c_char,         // lpCurrentDirectory
+    *mut std::ffi::c_void, // lpStartupInfo (STARTUPINFOA)
+    *mut std::ffi::c_void, // lpProcessInformation
+) -> i32;
+
+/// `CREATE_SUSPENDED` — the primary thread is created suspended (winbase.h).
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
+/// `sizeof(STARTUPINFOA)` on x64 — DWORD cb + pad, 3 LPSTR, 8 DWORD, WORD
+/// wShowWindow + WORD cbReserved2 + pad, LPBYTE, 3 HANDLE = 104 bytes (68 is
+/// the x86 size; CreateProcess validates `cb`, so the default must carry the
+/// native size). The `cb` field sits at offset 0.
+const STARTUPINFOA_SIZE: usize = 104;
+/// `sizeof(PROCESS_INFORMATION)` on x64 — 2 HANDLEs + 2 DWORDs.
+const PROCESS_INFORMATION_SIZE: usize = 24;
+
+/// `BOOL BeaconSpawnTemporaryProcess(BOOL x86, BOOL ignoreToken, STARTUPINFOA
+/// *si, PROCESS_INFORMATION *pi)` — spawn the spawn-to path
+/// ([`BeaconGetSpawnTo`]) as a temporary process, filling `pi` for the BOF.
+/// Like CS, the process is created **suspended** (`CREATE_SUSPENDED`): the
+/// CS pattern is spawn-then-inject-then-resume. The injection primitives
+/// (`BeaconInjectProcess` / `BeaconInjectTemporaryProcess`) are deliberately
+/// NOT implemented (they need a full cross-process write+execute chain — see
+/// `layout::BEACON_APIS`), so a BOF that loads here and spawns a process owns
+/// its lifecycle: resume/terminate it via its own imports and release the
+/// handles with [`BeaconCleanupProcess`].
+///
+/// `si` is passed straight through to `CreateProcessA`; a NULL `si` gets a
+/// zeroed default with `cb` set. `x86` is accepted but ignored (x64 runner,
+/// no WOW64 spawn-to); `ignoreToken` is accepted but moot — this stateless
+/// shim never stores a token (see [`BeaconUseToken`]), so the spawn always
+/// uses the current process token. Returns the raw `CreateProcessA` BOOL;
+/// `pi` is zeroed before the call so a failed spawn leaves defined
+/// (all-NULL) handle state, and the BOF can read `GetLastError`.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconSpawnTemporaryProcess(
+    _x86: i32,
+    _ignore_token: i32,
+    si: *mut std::ffi::c_void,
+    pi: *mut std::ffi::c_void,
+) -> i32 {
+    if pi.is_null() {
+        return 0;
+    }
+    let Some(create) = resolve_export(b"kernel32.dll\0", b"CreateProcessA\0") else {
+        return 0;
+    };
+    // SAFETY: `create` came from GetProcAddress on kernel32 with the exact
+    // name; the fn-pointer type matches the documented Win32 signature.
+    let create: CreateProcessAFn = unsafe { std::mem::transmute(create) };
+    // Defined handle state on failure: CreateProcessA does not touch
+    // PROCESS_INFORMATION when it fails, so zero it ourselves first.
+    // SAFETY: `pi` is a BOF-supplied out-pointer to 24 bytes (null checked).
+    unsafe { core::ptr::write_bytes(pi, 0, PROCESS_INFORMATION_SIZE) };
+    // Default STARTUPINFOA when the BOF passes NULL. `cb` at offset 0 must
+    // carry the struct size or CreateProcessA fails with
+    // ERROR_INVALID_PARAMETER.
+    let mut default_si = [0u8; STARTUPINFOA_SIZE];
+    if si.is_null() {
+        default_si[0..4].copy_from_slice(&(STARTUPINFOA_SIZE as u32).to_le_bytes());
+    }
+    let si_ptr = if si.is_null() {
+        default_si.as_mut_ptr() as *mut std::ffi::c_void
+    } else {
+        si
+    };
+    // The spawn-to buffer is writable (see `SpawnCell`) — CreateProcessA
+    // temporarily mutates lpCommandLine while parsing it. Calling
+    // BeaconGetSpawnTo here re-stamps the buffer, discarding any argument
+    // splicing a previous BOF left behind.
+    let cmd = unsafe { BeaconGetSpawnTo(0) } as *mut c_char;
+    // SAFETY: all pointers valid per above; `cmd` is NUL-terminated; `pi`
+    // points at 24 writable bytes; `si_ptr` at STARTUPINFOA_SIZE readable bytes.
+    unsafe {
+        create(
+            std::ptr::null(),
+            cmd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            CREATE_SUSPENDED,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            si_ptr,
+            pi,
+        )
+    }
+}
+
+/// `void BeaconCleanupProcess(PROCESS_INFORMATION *pi)` — close `hProcess`
+/// and `hThread` from a process the BOF spawned (CS's companion to
+/// [`BeaconSpawnTemporaryProcess`]). Best-effort; NULL `pi` or NULL handles
+/// are defined no-ops. NOTE: like CS, this closes handles only — it does NOT
+/// terminate the process.
+#[no_mangle]
+pub unsafe extern "C" fn BeaconCleanupProcess(pi: *mut std::ffi::c_void) {
+    if pi.is_null() {
+        return;
+    }
+    // PROCESS_INFORMATION layout (Win64): HANDLE hProcess, hThread; DWORD pid, tid.
+    // SAFETY: `pi` is a BOF-supplied pointer to the 24-byte struct (null
+    // checked); handles sit at offsets 0 and 8.
+    let base = pi as *const usize;
+    let (h_proc, h_thread) = unsafe { (*base, *base.add(1)) };
+    if h_proc != 0 {
+        // SAFETY: closing a BOF-owned handle is always safe.
+        unsafe { CloseHandle(h_proc as *mut std::ffi::c_void) };
+    }
+    if h_thread != 0 {
+        // SAFETY: closing a BOF-owned handle is always safe.
+        unsafe { CloseHandle(h_thread as *mut std::ffi::c_void) };
     }
 }
 
@@ -1346,5 +1528,163 @@ mod tests {
         // exactly 0 or 1 (the concrete value is environment-dependent).
         let v = unsafe { BeaconIsAdmin() };
         assert!(v == 0 || v == 1, "BeaconIsAdmin returned {v}");
+    }
+
+    // ── token family (BeaconUseToken / BeaconRevertToken) ────────────────────
+
+    #[test]
+    fn use_token_null_is_defined_failure() {
+        // NULL token: defined 0, never a crash, never an impersonation.
+        assert_eq!(unsafe { BeaconUseToken(std::ptr::null_mut()) }, 0);
+    }
+
+    #[test]
+    fn revert_token_without_impersonation_is_safe() {
+        // RevertToSelf on a non-impersonating thread is documented as a
+        // no-op success; the shim must be callable and not crash.
+        unsafe { BeaconRevertToken() };
+    }
+
+    #[test]
+    fn use_token_with_duplicated_self_token_then_revert() {
+        // Full round trip with a REAL impersonation token: duplicate the
+        // current process token (SecurityImpersonation), hand it to
+        // BeaconUseToken, then revert. Exercises the advapi32 resolution path
+        // end-to-end under Wine/Windows. Environment-dependent steps (token
+        // duplication) skip rather than fail.
+        type OpenProcessTokenFn = unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            u32,
+            *mut *mut std::ffi::c_void,
+        ) -> i32;
+        type DuplicateTokenFn = unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            u32,
+            *mut *mut std::ffi::c_void,
+        ) -> i32;
+        const TOKEN_DUPLICATE: u32 = 0x0002;
+        const SECURITY_IMPERSONATION: u32 = 2;
+        let Some(open) = resolve_export(b"advapi32.dll\0", b"OpenProcessToken\0") else {
+            eprintln!("skipping use_token round trip: no advapi32 OpenProcessToken");
+            return;
+        };
+        let Some(dup) = resolve_export(b"advapi32.dll\0", b"DuplicateToken\0") else {
+            eprintln!("skipping use_token round trip: no advapi32 DuplicateToken");
+            return;
+        };
+        let open: OpenProcessTokenFn = unsafe { std::mem::transmute(open) };
+        let dup: DuplicateTokenFn = unsafe { std::mem::transmute(dup) };
+        let mut proc_token: *mut std::ffi::c_void = std::ptr::null_mut();
+        if unsafe { open(GetCurrentProcess(), TOKEN_DUPLICATE, &mut proc_token) } == 0 {
+            eprintln!("skipping use_token round trip: OpenProcessToken denied");
+            return;
+        }
+        let mut imp_token: *mut std::ffi::c_void = std::ptr::null_mut();
+        let dup_ok = unsafe { dup(proc_token, SECURITY_IMPERSONATION, &mut imp_token) };
+        unsafe { CloseHandle(proc_token) };
+        if dup_ok == 0 || imp_token.is_null() {
+            eprintln!("skipping use_token round trip: DuplicateToken failed");
+            return;
+        }
+        let used = unsafe { BeaconUseToken(imp_token) };
+        unsafe { BeaconRevertToken() };
+        unsafe { CloseHandle(imp_token) };
+        assert_eq!(used, 1, "BeaconUseToken(real impersonation token)");
+    }
+
+    // ── spawn family (BeaconSpawnTemporaryProcess / BeaconCleanupProcess) ────
+
+    /// PROCESS_INFORMATION out-param for the spawn tests: 2 HANDLEs + 2
+    /// DWORDs = 24 bytes, passed as raw usize slots.
+    fn spawn(x86: i32, si: *mut std::ffi::c_void, pi: &mut [usize; 3]) -> i32 {
+        unsafe { BeaconSpawnTemporaryProcess(x86, 0, si, pi.as_mut_ptr() as *mut std::ffi::c_void) }
+    }
+
+    #[test]
+    fn spawn_null_process_info_is_defined_failure() {
+        assert_eq!(
+            unsafe {
+                BeaconSpawnTemporaryProcess(0, 0, std::ptr::null_mut(), std::ptr::null_mut())
+            },
+            0,
+            "NULL PROCESS_INFORMATION must fail defined, not crash"
+        );
+    }
+
+    #[test]
+    fn cleanup_process_null_is_noop() {
+        unsafe { BeaconCleanupProcess(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn spawn_temporary_process_spawns_suspended_and_cleans_up() {
+        // Real CreateProcessA of the spawn-to path (cmd.exe) under
+        // Wine/Windows. The process comes up SUSPENDED (CS contract) so it
+        // cannot run away; we terminate it and close the handles through the
+        // shim itself.
+        type TerminateProcessFn = unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> i32;
+        let Some(term) = resolve_export(b"kernel32.dll\0", b"TerminateProcess\0") else {
+            eprintln!("skipping spawn test: no kernel32 TerminateProcess");
+            return;
+        };
+        let term: TerminateProcessFn = unsafe { std::mem::transmute(term) };
+        let mut pi = [0usize; 3];
+        let ok = spawn(0, std::ptr::null_mut(), &mut pi);
+        if ok == 0 {
+            // CreateProcessA can fail in stripped-down environments (no
+            // System32 cmd.exe under some Wine prefixes); the defined
+            // failure contract is covered by the NULL-pi test, so skip here.
+            eprintln!("skipping spawn test: CreateProcessA failed in this environment");
+            return;
+        }
+        let (h_proc, h_thread, pid_tid) = (pi[0], pi[1], pi[2]);
+        assert_ne!(h_proc, 0, "spawned process handle");
+        assert_ne!(h_thread, 0, "spawned thread handle");
+        assert_ne!(pid_tid as u32, 0, "spawned pid");
+        unsafe {
+            term(h_proc as *mut std::ffi::c_void, 0);
+            BeaconCleanupProcess(pi.as_mut_ptr() as *mut std::ffi::c_void);
+        }
+        // The spawn-to buffer survives CreateProcessA's command-line mutation:
+        // the next BeaconGetSpawnTo re-stamps a clean path.
+        let p = unsafe { BeaconGetSpawnTo(0) };
+        let s = unsafe { std::ffi::CStr::from_ptr(p as *const c_char) }.to_bytes();
+        assert_eq!(s, b"C:\\Windows\\System32\\cmd.exe");
+    }
+
+    #[test]
+    fn spawn_failed_create_leaves_zeroed_process_info() {
+        // Force CreateProcessA to fail: a STARTUPINFOA whose `cb` field is 0
+        // is rejected with ERROR_INVALID_PARAMETER. `pi` pre-filled with
+        // garbage must come back zeroed (defined handle state).
+        let bad_si = [0u8; STARTUPINFOA_SIZE];
+        let mut pi = [usize::MAX; 3];
+        let ok = unsafe {
+            BeaconSpawnTemporaryProcess(
+                0,
+                0,
+                bad_si.as_ptr() as *mut std::ffi::c_void,
+                pi.as_mut_ptr() as *mut std::ffi::c_void,
+            )
+        };
+        if ok == 0 {
+            assert_eq!(
+                pi, [0usize; 3],
+                "failed spawn must leave a zeroed PROCESS_INFORMATION"
+            );
+        } else {
+            // An environment that accepts cb=0: the spawn happened, so own
+            // its lifecycle (no leak from a test).
+            unsafe {
+                type TerminateProcessFn =
+                    unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> i32;
+                if let Some(term) = resolve_export(b"kernel32.dll\0", b"TerminateProcess\0") {
+                    let term: TerminateProcessFn = std::mem::transmute(term);
+                    term(pi[0] as *mut std::ffi::c_void, 0);
+                }
+                BeaconCleanupProcess(pi.as_mut_ptr() as *mut std::ffi::c_void);
+            }
+            eprintln!("note: this environment accepted a cb=0 STARTUPINFOA");
+        }
     }
 }

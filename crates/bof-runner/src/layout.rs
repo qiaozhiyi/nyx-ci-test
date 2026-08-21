@@ -70,8 +70,18 @@ pub fn tramp_stub_offset(index: usize) -> usize {
 /// Beacon-API shim names the loader resolves to the in-Rust shims in
 /// `win.rs` (one trampoline stub each). This is the core CS `beacon.h`
 /// surface: `BeaconPrintf` plus the `datap` argument parser, `BeaconIsAdmin`,
-/// `BeaconGetSpawnTo`, and the community `BeaconOutput` extension. Each name
-/// appears exactly once (enforced by a test).
+/// `BeaconGetSpawnTo`, the token family (`BeaconUseToken` /
+/// `BeaconRevertToken`), the spawn family (`BeaconSpawnTemporaryProcess` /
+/// `BeaconCleanupProcess`), and the community `BeaconOutput` extension. Each
+/// name appears exactly once (enforced by a test).
+///
+/// Deliberately NOT here: the injection family (`BeaconInjectProcess`,
+/// `BeaconInjectTemporaryProcess`). A truthful implementation needs a full
+/// cross-process injection chain (allocate + write + execute in the target),
+/// which is a post-ex primitive of its own, not a shim; a stub that pretends
+/// to inject would silently break BOFs. BOFs referencing them fail load with
+/// a loud, NAMED `Unresolved` error (the loader reports the symbol name), so
+/// the limitation is visible instead of silent.
 pub const BEACON_APIS: &[&str] = &[
     "BeaconPrintf",
     "BeaconOutput",
@@ -82,6 +92,10 @@ pub const BEACON_APIS: &[&str] = &[
     "BeaconDataLength",
     "BeaconIsAdmin",
     "BeaconGetSpawnTo",
+    "BeaconUseToken",
+    "BeaconRevertToken",
+    "BeaconSpawnTemporaryProcess",
+    "BeaconCleanupProcess",
 ];
 
 /// kernel32/ntdll exports resolved at load time via `GetModuleHandleA` +

@@ -483,7 +483,12 @@ pub unsafe extern "C" fn BeaconIsAdmin() -> i32 {
     0
 }
 
-/// `void BeaconRevertToken()` — documented no-op (same rationale as bof.rs).
+/// `void BeaconRevertToken()` — drop the thread's impersonation token. The
+/// sacrificial child has no advapi32 (kernel32 is not even mapped), so this
+/// uses the ntdll primitive directly: `NtSetInformationThread(
+/// GetCurrentThread, ThreadImpersonationToken, NULL)` clears the thread's
+/// impersonation token — the same observable effect as `RevertToSelf`.
+/// Best-effort: if ntdll resolution fails there is nothing to revert through.
 #[no_mangle]
 #[inline(never)] // see the dumper-closure note above
 pub unsafe extern "C" fn BeaconRevertToken() {
@@ -492,6 +497,53 @@ pub unsafe extern "C" fn BeaconRevertToken() {
     // this out-of-line body (beacon_api_addr lea's it). black_box(()) emits
     // no instructions — it only makes the call un-eliminable.
     core::hint::black_box(());
+    let _ = unsafe { set_thread_impersonation(core::ptr::null_mut()) };
+}
+
+/// `ThreadImpersonationToken` — THREADINFOCLASS value (winnt.h).
+const THREAD_IMPERSONATION_TOKEN: u32 = 6;
+/// `GetCurrentThread()` pseudo-handle value ((HANDLE)-2).
+const CURRENT_THREAD: usize = -2isize as usize;
+
+/// Set (`token`) or clear (NULL) the calling thread's impersonation token via
+/// `ntdll!NtSetInformationThread(ThreadImpersonationToken)`. Stateless: no
+/// cached token statics (dumper constraint). Returns 1 on STATUS_SUCCESS,
+/// 0 on any failure (resolution miss or NTSTATUS != 0).
+unsafe fn set_thread_impersonation(token: *mut c_void) -> i32 {
+    type NtSetInformationThreadFn =
+        unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32) -> i32;
+    let Some(addr) = (unsafe { export_addr(b"ntdll.dll", b"ntsetinformationthread") }) else {
+        return 0;
+    };
+    let f: NtSetInformationThreadFn = unsafe { core::mem::transmute(addr) };
+    let mut t = token;
+    // SAFETY: `f` is the resolved ntdll export; CURRENT_THREAD is the
+    // documented pseudo-handle; `t` is a valid HANDLE-sized in-buffer.
+    let status = unsafe {
+        f(
+            CURRENT_THREAD as *mut c_void,
+            THREAD_IMPERSONATION_TOKEN,
+            core::ptr::addr_of_mut!(t).cast::<c_void>(),
+            core::mem::size_of::<*mut c_void>() as u32,
+        )
+    };
+    (status == 0) as i32
+}
+
+/// `BOOL BeaconUseToken(HANDLE token)` — impersonate the calling thread with
+/// `token`. The child has no advapi32 (`ImpersonateLoggedOnUser` lives
+/// there), so this goes through the ntdll primitive
+/// [`set_thread_impersonation`]: semantically the thread-token half of CS's
+/// API (CS also stashes the token for later spawns and reports it to the
+/// operator — the isolated host does neither; there is no spawn primitive in
+/// the child to consume a stored token). A NULL token is a defined 0.
+#[no_mangle]
+#[inline(never)] // see the dumper-closure note above
+pub unsafe extern "C" fn BeaconUseToken(token: *mut c_void) -> i32 {
+    if token.is_null() {
+        return 0;
+    }
+    unsafe { set_thread_impersonation(token) }
 }
 
 /// `void BeaconCleanupProcess(PROCESS_INFORMATION *p)` — close hProcess +
@@ -607,8 +659,16 @@ pub unsafe extern "C" fn BeaconGetSpawnTo(_x86: i32) -> *mut u8 {
 /// READ-ONLY .rdata string (bof.rs returns a writable scratch buffer) — the
 /// isolated host has no writable statics (PIC dumper gate); a BOF that
 /// writes into the returned buffer faults INSIDE the sacrificial child,
-/// where B3 contains it. `BeaconIsAdmin` reports 0 (see its doc). Every
-/// other shim matches the inline semantics.
+/// where B3 contains it. `BeaconIsAdmin` reports 0 (see its doc).
+/// `BeaconUseToken`/`BeaconRevertToken` operate on the THREAD token via
+/// ntdll (no advapi32 in the child; see their docs). The spawn family is
+/// split: `BeaconCleanupProcess` is here (CloseHandle over ntdll), but
+/// `BeaconSpawnTemporaryProcess` is deliberately NOT in this table — process
+/// creation needs CreateProcess (kernel32, never mapped in the sacrificial
+/// child), and an ntdll-only NtCreateUserProcess chain is too fragile for
+/// the PIC blob; a BOF referencing it fails load with a loud, NAMED
+/// "unresolved external" instead of a silent stub. Every other shim matches
+/// the inline semantics.
 pub fn beacon_api_addr(name: &str) -> Option<u64> {
     /// fn-item → u64 address (see bof.rs for the coercion trick).
     fn addr_of(f: *const ()) -> u64 {
@@ -627,6 +687,7 @@ pub fn beacon_api_addr(name: &str) -> Option<u64> {
         "BeaconDataLength" => addr_of(BeaconDataLength as *const ()),
         "BeaconIsAdmin" => addr_of(BeaconIsAdmin as *const ()),
         "BeaconGetSpawnTo" => addr_of(BeaconGetSpawnTo as *const ()),
+        "BeaconUseToken" => addr_of(BeaconUseToken as *const ()),
         "BeaconRevertToken" => addr_of(BeaconRevertToken as *const ()),
         "BeaconCleanupProcess" => addr_of(BeaconCleanupProcess as *const ()),
         "BeaconInformation" => addr_of(BeaconInformation as *const ()),
