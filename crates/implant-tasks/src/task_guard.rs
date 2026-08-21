@@ -40,8 +40,7 @@
 //!   WP-B2 removes the crash sources themselves.
 //! - **Future task-internal VEHs** must register First=1 (head) so they
 //!   preempt the guard for their own faults, and must pass SINGLE_STEP and
-//!   non-fatal codes down the chain. `proxy_veh`'s First=1 helpers already
-//!   follow this discipline.
+//!   non-fatal codes down the chain.
 //! - **Non-reentrant** by the crate-wide single-beacon-thread invariant
 //!   (hard constraint #3): one guarded task at a time.
 //!

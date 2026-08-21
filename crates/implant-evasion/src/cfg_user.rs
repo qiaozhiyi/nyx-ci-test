@@ -4,9 +4,10 @@
 //! # Why
 //! CFG validates every indirect call/jump target against a per-process bitmap.
 //! If the target isn't marked, the process terminates with
-//! `STATUS_STACK_BUFFER_OVERRUN`. When using VEH proxy handlers or indirect
-//! gadgets (`jmp rbx` in ntdll → implant handler), the implant handler's
-//! address MUST be in the CFG bitmap.
+//! `STATUS_STACK_BUFFER_OVERRUN`. The HWBP blind's VEH handler
+//! (`blind_hwbp::hwbp_veh_handler`) lives in implant-private memory, and the
+//! OS vectored-exception dispatcher calls it indirectly — so its address MUST
+//! be in the CFG bitmap.
 //!
 //! # Two paths
 //! - **Documented**: `SetProcessValidCallTargets` (kernelbase.dll, Win10+)
@@ -21,7 +22,8 @@
 //!
 //! # Usage
 //! ```text
-//! // Mark the implant's VEH handler as CFG-valid so jmp rbx → handler works:
+//! // Mark the implant's VEH handler as CFG-valid so the dispatcher's
+//! // indirect call passes the CFG check:
 //! cfg_user::mark_addr_cfg_valid(handler_addr);
 //! ```
 
