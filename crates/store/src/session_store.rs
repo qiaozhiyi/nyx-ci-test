@@ -31,6 +31,11 @@ pub enum SessionStoreError {
     Io(#[from] std::io::Error),
     #[error("session-store lock poisoned")]
     Poisoned,
+    /// The DB file was last written by a NEWER binary than this one.
+    /// Fail-closed: opening it could silently misread columns the older
+    /// binary doesn't know about, so `open()` refuses instead.
+    #[error("sessions schema version {found} is newer than this binary supports ({supported}); refusing to open")]
+    SchemaTooNew { found: i64, supported: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, SessionStoreError>;
@@ -152,7 +157,13 @@ impl SessionStore {
     /// the DB half-migrated at the OLD version — the next `open()` would
     /// re-run the first ALTER and die on duplicate-column, permanently
     /// bricking the store. A rollback preserves the pre-migration state so
-    /// the next open retries cleanly.
+    /// the next open retries cleanly. Each ALTER is additionally gated on
+    /// the column being absent, so a DB torn by a PRE-transaction binary
+    /// (stamp old, some columns already applied) still recovers.
+    ///
+    /// A stamp NEWER than `CURRENT_SCHEMA_VERSION` (DB written by a future
+    /// binary) is rejected with [`SessionStoreError::SchemaTooNew`] at
+    /// startup — fail-closed instead of silently misreading unknown columns.
     const CURRENT_SCHEMA_VERSION: i64 = 4;
 
     fn migrate(conn: &Connection) -> Result<()> {
@@ -177,6 +188,15 @@ impl SessionStore {
             [],
             |r| r.get(0),
         )?;
+        // Startup stamp validation: a stamp NEWER than this binary means the
+        // DB was written by a future build — refuse rather than silently
+        // misreading its columns.
+        if current > Self::CURRENT_SCHEMA_VERSION {
+            return Err(SessionStoreError::SchemaTooNew {
+                found: current,
+                supported: Self::CURRENT_SCHEMA_VERSION,
+            });
+        }
         if current < Self::CURRENT_SCHEMA_VERSION {
             let tx = conn.unchecked_transaction()?;
             // v0 → v1: baseline (creds/implants tables created by their stores).
@@ -190,20 +210,30 @@ impl SessionStore {
             //          at version 0 and runs this arm, so the columns must
             //          exist only AFTER the ALTER (adding them to the CREATE
             //          would make this arm fail with duplicate-column).
+            //          Each ALTER is gated on the column being absent so a DB
+            //          torn by a PRE-transaction binary (stamp < 3, one
+            //          counter column already added) recovers by adding only
+            //          the missing one instead of dying on duplicate-column.
             if current < 3 {
-                tx.execute(
-                    "ALTER TABLE sessions ADD COLUMN send_counter INTEGER NOT NULL DEFAULT 0",
-                    [],
-                )?;
-                tx.execute(
-                    "ALTER TABLE sessions ADD COLUMN last_recv INTEGER NOT NULL DEFAULT 0",
-                    [],
-                )?;
+                if !column_exists(&tx, "sessions", "send_counter")? {
+                    tx.execute(
+                        "ALTER TABLE sessions ADD COLUMN send_counter INTEGER NOT NULL DEFAULT 0",
+                        [],
+                    )?;
+                }
+                if !column_exists(&tx, "sessions", "last_recv")? {
+                    tx.execute(
+                        "ALTER TABLE sessions ADD COLUMN last_recv INTEGER NOT NULL DEFAULT 0",
+                        [],
+                    )?;
+                }
             }
             // v3 → v4: operator ownership of a session. `DEFAULT NULL`
-            // backfills existing rows as unowned.
+            // backfills existing rows as unowned. Column-gated like v3.
             if current < 4 {
-                tx.execute("ALTER TABLE sessions ADD COLUMN owner TEXT", [])?;
+                if !column_exists(&tx, "sessions", "owner")? {
+                    tx.execute("ALTER TABLE sessions ADD COLUMN owner TEXT", [])?;
+                }
             }
             tx.execute(
                 "UPDATE _sessions_schema_version SET version = ?1;",
@@ -338,6 +368,21 @@ impl SessionStore {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
         Ok(n)
     }
+}
+
+/// `true` if `col` exists on `table` — lets a migration arm skip an ALTER
+/// that a torn (pre-single-transaction) migration already applied, so the
+/// recovery path adds only the columns still missing. `table`/`col` are
+/// crate-internal constants (PRAGMA cannot bind them as parameters).
+fn column_exists(conn: &Connection, table: &str, col: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for n in names {
+        if n? == col {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Map a SQL row onto a `SessionRecord`.
@@ -662,6 +707,131 @@ mod tests {
         let got = s.list().unwrap().remove(0);
         assert_eq!((got.send_counter, got.last_recv), (3, 4));
         assert_eq!(got.owner.as_deref(), Some("op"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn migrates_torn_v2_db_with_partial_counter_columns() {
+        // Half-migrated recovery: a DB torn by a PRE-single-transaction
+        // binary — stamp still v2, but the v3 arm's FIRST ALTER
+        // (`send_counter`) already landed while `last_recv` (and v4's
+        // `owner`) never did. A naive re-run of the arm would die on
+        // duplicate-column; the column-gated arm must add only what is
+        // missing, preserve the fixture row (including the counter value
+        // written before the tear), and stamp CURRENT.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "nyx-session-torn-v3-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    session_id    TEXT NOT NULL PRIMARY KEY,
+                    beacon_id     INTEGER NOT NULL,
+                    hostname      TEXT NOT NULL,
+                    username      TEXT NOT NULL,
+                    os            TEXT NOT NULL,
+                    arch          INTEGER NOT NULL,
+                    pid           INTEGER NOT NULL,
+                    is_admin      INTEGER NOT NULL,
+                    first_seen    INTEGER NOT NULL,
+                    last_seen     INTEGER NOT NULL,
+                    auth_token    BLOB
+                );
+                CREATE TABLE _sessions_schema_version (version INTEGER NOT NULL);
+                INSERT INTO _sessions_schema_version (version) VALUES (2);
+                ALTER TABLE sessions ADD COLUMN send_counter INTEGER NOT NULL DEFAULT 0;
+                INSERT INTO sessions (session_id, beacon_id, hostname, username, os,
+                                      arch, pid, is_admin, first_seen, last_seen,
+                                      send_counter)
+                VALUES ('torn-id', 7, 'torn-host', 'torn-user', 'linux',
+                        1, 42, 0, 1000, 2000, 41);",
+            )
+            .unwrap();
+        }
+        let s = SessionStore::open(&path).unwrap();
+        let got = s.list().unwrap().remove(0);
+        assert_eq!(got.session_id, "torn-id");
+        assert_eq!(
+            got.send_counter, 41,
+            "pre-tear counter value must survive the recovery"
+        );
+        assert_eq!(got.last_recv, 0, "missing column backfilled DEFAULT 0");
+        assert_eq!(got.owner, None);
+        // All arms committed: version stamped straight to CURRENT, exactly once.
+        let (v, n): (i64, i64) = {
+            let conn = s.conn.lock().unwrap();
+            let v = conn
+                .query_row(
+                    "SELECT MAX(version) FROM _sessions_schema_version",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let n = conn
+                .query_row("SELECT COUNT(*) FROM _sessions_schema_version", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            (v, n)
+        };
+        assert_eq!(v, SessionStore::CURRENT_SCHEMA_VERSION);
+        assert_eq!(n, 1);
+        // The recovered store accepts both v3+ and v4+ writers.
+        assert!(s.update_counters("torn-id", 42, 9).unwrap());
+        assert!(s.update_owner("torn-id", Some("op")).unwrap());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn rejects_db_stamped_by_newer_binary() {
+        // Startup stamp validation: a DB whose `_sessions_schema_version` is
+        // NEWER than this binary supports (written by a future build) must be
+        // refused fail-closed — and left untouched for the newer binary.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "nyx-session-too-new-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = SessionStore::open(&path).unwrap();
+            s.upsert(&rec("aa", "host-a", 1000)).unwrap();
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE _sessions_schema_version SET version = ?1;",
+                params![SessionStore::CURRENT_SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        }
+        match SessionStore::open(&path) {
+            Err(SessionStoreError::SchemaTooNew { found, supported }) => {
+                assert_eq!(found, SessionStore::CURRENT_SCHEMA_VERSION + 1);
+                assert_eq!(supported, SessionStore::CURRENT_SCHEMA_VERSION);
+            }
+            other => panic!("expected SchemaTooNew, got {:?}", other.is_ok()),
+        }
+        // The rejected open must not have disturbed the data or the stamp.
+        let conn = Connection::open(&path).unwrap();
+        let v: i64 = conn
+            .query_row(
+                "SELECT MAX(version) FROM _sessions_schema_version",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, SessionStore::CURRENT_SCHEMA_VERSION + 1);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));

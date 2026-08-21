@@ -22,6 +22,11 @@ pub enum ImplantStoreError {
     Io(#[from] std::io::Error),
     #[error("implant-store lock poisoned")]
     Poisoned,
+    /// The DB file was last written by a NEWER binary than this one.
+    /// Fail-closed: opening it could silently misread columns the older
+    /// binary doesn't know about, so `open()` refuses instead.
+    #[error("implants schema version {found} is newer than this binary supports ({supported}); refusing to open")]
+    SchemaTooNew { found: i64, supported: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, ImplantStoreError>;
@@ -134,6 +139,8 @@ impl ImplantStore {
     /// per-store version table, forward-only ALTER arms, and the whole
     /// migration wrapped in ONE transaction so a crash mid-migration rolls
     /// back instead of bricking the next `open()` on duplicate-column).
+    /// A stamp NEWER than `CURRENT_SCHEMA_VERSION` is rejected with
+    /// [`ImplantStoreError::SchemaTooNew`] at startup (fail-closed).
     const CURRENT_SCHEMA_VERSION: i64 = 1;
 
     fn migrate(conn: &Connection) -> Result<()> {
@@ -158,6 +165,15 @@ impl ImplantStore {
             [],
             |r| r.get(0),
         )?;
+        // Startup stamp validation: a stamp NEWER than this binary means the
+        // DB was written by a future build — refuse rather than silently
+        // misreading its columns.
+        if current > Self::CURRENT_SCHEMA_VERSION {
+            return Err(ImplantStoreError::SchemaTooNew {
+                found: current,
+                supported: Self::CURRENT_SCHEMA_VERSION,
+            });
+        }
         if current < Self::CURRENT_SCHEMA_VERSION {
             // v0 → v1: baseline (implants table already created above).
             let tx = conn.unchecked_transaction()?;
@@ -600,6 +616,126 @@ mod tests {
         // The migrated store's claim path still works on the legacy row.
         assert!(s.mark_token_used("legacy-pub").unwrap());
         assert!(s.get_by_token_hash(&token_hash).unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn recovers_from_torn_empty_version_table() {
+        // Half-migrated state: a crash/SIGKILL between the version-table
+        // CREATE and the version-0 seed (two separate statements) leaves the
+        // table present but EMPTY. The next open() must re-seed version 0,
+        // stamp CURRENT, and preserve the fixture row.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "nyx-implants-torn-seed-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let token_hash = hash(b"torn-token");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE implants (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    implant_pub     TEXT NOT NULL UNIQUE,
+                    auth_token_hash TEXT NOT NULL,
+                    auth_token_used INTEGER NOT NULL DEFAULT 0,
+                    created_at      TEXT NOT NULL,
+                    created_by      TEXT,
+                    expires_at      TEXT,
+                    callback_host   TEXT NOT NULL,
+                    callback_port   INTEGER NOT NULL,
+                    format          TEXT NOT NULL DEFAULT 'dll',
+                    features_bitmap INTEGER NOT NULL DEFAULT 0,
+                    keying_levels   INTEGER NOT NULL DEFAULT 0,
+                    sha256          TEXT NOT NULL,
+                    size_bytes      INTEGER NOT NULL,
+                    revoked         INTEGER NOT NULL DEFAULT 0,
+                    notes           TEXT
+                );
+                CREATE TABLE _implants_schema_version (version INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO implants
+                 (implant_pub, auth_token_hash, created_at, callback_host,
+                  callback_port, sha256, size_bytes)
+                 VALUES ('torn-pub', ?1, '2026-07-12T00:00:00Z', '10.0.0.1',
+                         8443, 'ab', 1024)",
+                params![token_hash],
+            )
+            .unwrap();
+        }
+        let s = ImplantStore::open(&path).unwrap();
+        assert_eq!(s.count().unwrap(), 1, "fixture row must survive re-seed");
+        let (v, n): (i64, i64) = {
+            let conn = s.conn.lock().unwrap();
+            let v = conn
+                .query_row(
+                    "SELECT MAX(version) FROM _implants_schema_version",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let n = conn
+                .query_row("SELECT COUNT(*) FROM _implants_schema_version", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            (v, n)
+        };
+        assert_eq!(v, ImplantStore::CURRENT_SCHEMA_VERSION);
+        assert_eq!(n, 1, "re-seed must produce exactly one version row");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn rejects_db_stamped_by_newer_binary() {
+        // Startup stamp validation: a DB whose `_implants_schema_version` is
+        // NEWER than this binary supports (written by a future build) must be
+        // refused fail-closed — and left untouched for the newer binary.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "nyx-implants-too-new-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = ImplantStore::open(&path).unwrap();
+            s.insert(&test_record("future-pub", b"future-token"))
+                .unwrap();
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE _implants_schema_version SET version = ?1;",
+                params![ImplantStore::CURRENT_SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        }
+        match ImplantStore::open(&path) {
+            Err(ImplantStoreError::SchemaTooNew { found, supported }) => {
+                assert_eq!(found, ImplantStore::CURRENT_SCHEMA_VERSION + 1);
+                assert_eq!(supported, ImplantStore::CURRENT_SCHEMA_VERSION);
+            }
+            other => panic!("expected SchemaTooNew, got {:?}", other.is_ok()),
+        }
+        // The rejected open must not have disturbed the data or the stamp.
+        let conn = Connection::open(&path).unwrap();
+        let v: i64 = conn
+            .query_row(
+                "SELECT MAX(version) FROM _implants_schema_version",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, ImplantStore::CURRENT_SCHEMA_VERSION + 1);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM implants", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));

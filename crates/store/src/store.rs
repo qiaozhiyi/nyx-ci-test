@@ -31,6 +31,11 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("cred-store lock poisoned")]
     Poisoned,
+    /// The DB file was last written by a NEWER binary than this one.
+    /// Fail-closed: opening it could silently misread columns the older
+    /// binary doesn't know about, so `open()` refuses instead.
+    #[error("creds schema version {found} is newer than this binary supports ({supported}); refusing to open")]
+    SchemaTooNew { found: i64, supported: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -110,6 +115,10 @@ impl CredStore {
     /// `open()` would re-run the first arm and die on duplicate-column —
     /// a permanent open failure. Rolling back keeps the pre-migration
     /// state, so the next open retries cleanly.
+    ///
+    /// A stamp NEWER than `CURRENT_SCHEMA_VERSION` (DB written by a future
+    /// binary) is rejected with [`StoreError::SchemaTooNew`] at startup —
+    /// fail-closed instead of silently misreading unknown columns.
     const CURRENT_SCHEMA_VERSION: i64 = 1;
 
     fn migrate(conn: &Connection) -> Result<()> {
@@ -133,6 +142,15 @@ impl CredStore {
             conn.query_row("SELECT MAX(version) FROM _creds_schema_version", [], |r| {
                 r.get(0)
             })?;
+        // Startup stamp validation: a stamp NEWER than this binary means the
+        // DB was written by a future build — refuse rather than silently
+        // misreading its columns.
+        if current > Self::CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::SchemaTooNew {
+                found: current,
+                supported: Self::CURRENT_SCHEMA_VERSION,
+            });
+        }
         if current < Self::CURRENT_SCHEMA_VERSION {
             let tx = conn.unchecked_transaction()?;
             // --- migration arms (forward-only) ---------------------------------
@@ -369,6 +387,103 @@ mod tests {
         // The migrated store stays writable.
         s.upsert(&rec("DEV", "alice", "deadbeef")).unwrap();
         assert_eq!(s.count().unwrap(), 2);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn recovers_from_torn_empty_version_table() {
+        // Half-migrated state: a crash/SIGKILL between the version-table
+        // CREATE and the version-0 seed (two separate statements) leaves the
+        // table present but EMPTY. The next open() must re-seed version 0,
+        // run the arms, and stamp CURRENT — the fixture row survives.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "nyx-creds-torn-seed-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE creds (
+                    realm        TEXT NOT NULL,
+                    user         TEXT NOT NULL,
+                    kind         TEXT NOT NULL,
+                    secret       TEXT NOT NULL,
+                    source       TEXT NOT NULL DEFAULT '',
+                    beacon       TEXT,
+                    collected_at INTEGER NOT NULL DEFAULT 0,
+                    notes        TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (realm, user, kind)
+                );
+                CREATE TABLE _creds_schema_version (version INTEGER NOT NULL);
+                INSERT INTO creds (realm, user, kind, secret)
+                VALUES ('DEV', 'torn', 'hash', 'tornhash');",
+            )
+            .unwrap();
+        }
+        let s = CredStore::open(&path).unwrap();
+        assert_eq!(s.count().unwrap(), 1, "fixture row must survive re-seed");
+        let (v, n): (i64, i64) = {
+            let conn = s.conn.lock().unwrap();
+            let v = conn
+                .query_row("SELECT MAX(version) FROM _creds_schema_version", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let n = conn
+                .query_row("SELECT COUNT(*) FROM _creds_schema_version", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            (v, n)
+        };
+        assert_eq!(v, CredStore::CURRENT_SCHEMA_VERSION);
+        assert_eq!(n, 1, "re-seed must produce exactly one version row");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn rejects_db_stamped_by_newer_binary() {
+        // Startup stamp validation: a DB whose `_creds_schema_version` is
+        // NEWER than this binary supports (written by a future build) must be
+        // refused fail-closed — and left untouched for the newer binary.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("nyx-creds-too-new-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = CredStore::open(&path).unwrap();
+            s.upsert(&rec("DEV", "alice", "futurehash")).unwrap();
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE _creds_schema_version SET version = ?1;",
+                params![CredStore::CURRENT_SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        }
+        match CredStore::open(&path) {
+            Err(StoreError::SchemaTooNew { found, supported }) => {
+                assert_eq!(found, CredStore::CURRENT_SCHEMA_VERSION + 1);
+                assert_eq!(supported, CredStore::CURRENT_SCHEMA_VERSION);
+            }
+            other => panic!("expected SchemaTooNew, got {:?}", other.is_ok()),
+        }
+        // The rejected open must not have disturbed the data or the stamp.
+        let conn = Connection::open(&path).unwrap();
+        let v: i64 = conn
+            .query_row("SELECT MAX(version) FROM _creds_schema_version", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(v, CredStore::CURRENT_SCHEMA_VERSION + 1);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM creds", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
