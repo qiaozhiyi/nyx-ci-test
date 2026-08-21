@@ -233,7 +233,7 @@ fn parse_config(text: Option<&str>) -> ConfigVals {
     let mut use_tls = Defaults::TLS;
     // Channel dispatcher defaults (spec-1):
     let mut primary_channel: u8 = 0; // Https
-    let mut fallback_bitmap: u8 = 0; // no fallback
+    let mut fallback_bitmap: u8 = 0; // 0 = runtime uses the build-time default chain
     let mut doh_resolver = String::new();
     let mut smb_pipe_name = String::new();
     let mut extc2_api_host = String::new();
