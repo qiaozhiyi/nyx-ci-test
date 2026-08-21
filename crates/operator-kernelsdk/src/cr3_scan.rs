@@ -167,7 +167,7 @@ mod tests {
             self.write(pa, &v.to_le_bytes());
         }
         /// Map one 4 KiB page in tables rooted at `dtb` (bump-allocated
-        /// intermediate tables) — same builder as va_rw's MockPhysMem.
+        /// intermediate tables) — same builder as pagewalk's MockPhysMem.
         fn map_page(&mut self, dtb: u64, va: u64, pa: u64, bump: &mut u64) {
             let mut ensure = |entry_pa: u64, bump: &mut u64| -> u64 {
                 let mut raw = [0u8; 8];

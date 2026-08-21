@@ -189,6 +189,26 @@ fn main() {
         match result {
             Ok(b) => {
                 eprintln!("[+] {kind} bootstrap OK (cr3 discovered + MZ-validated)");
+                // VA→PA selftest: the CR3 scan MZ-gate proves the walk, but
+                // NOT the VaKernelRw adapter path (VA contract check →
+                // per-page translate → chunked phys read). Read the ntoskrnl
+                // base through the live adapter and require MZ before running
+                // any kernel op on top of it. On failure, unload the driver
+                // (no residue) and refuse to continue on a broken primitive.
+                let mut mz = [0u8; 2];
+                let ok = matches!(
+                    b.as_kernel_rw().kread(nt_base as usize, &mut mz),
+                    Ok(()) if &mz == b"MZ"
+                );
+                if !ok {
+                    eprintln!(
+                        "[!] {kind} VA→PA selftest FAILED: kread(ntoskrnl base) did not yield MZ — \
+                         unloading driver and refusing to run ops on a broken VA layer"
+                    );
+                    unload_phys_bootstrap(b);
+                    std::process::exit(3);
+                }
+                eprintln!("[+] {kind} VA→PA selftest OK (MZ at ntoskrnl base via VaKernelRw)");
                 b
             }
             Err(e) => {
@@ -1480,6 +1500,21 @@ fn parse_byovd(args: &[String]) -> (Option<String>, Option<String>) {
         None => return (None, None),
     };
     (args.get(idx + 1).cloned(), args.get(idx + 2).cloned())
+}
+
+/// Unload the driver held by a phys-mode bootstrap (WDT / ALSysIO). Used when
+/// the post-bootstrap VA→PA selftest fails — a failed bootstrap must leave no
+/// loaded-driver residue (same contract as `wdt::bootstrap_phys_with`).
+#[cfg(target_os = "windows")]
+fn unload_phys_bootstrap(b: nyx_operator_kernelsdk::win::KernelBootstrap) {
+    use nyx_operator_kernelsdk::win::KernelBootstrap;
+    match b {
+        KernelBootstrap::Wdt(mut loaded, _) | KernelBootstrap::Alsys(mut loaded, _) => {
+            loaded.unload();
+        }
+        // Phys arms only produce Wdt/Alsys; other variants carry nothing to do.
+        _ => {}
+    }
 }
 
 #[cfg(target_os = "windows")]
