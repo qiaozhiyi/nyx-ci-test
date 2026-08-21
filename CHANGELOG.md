@@ -12,6 +12,16 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-21 七路并行工作包（内核收尾 + 已知限制清理）：
+
+- **K1 内核 VA→PA host 可测化 + CLI 自检臂**：`VaKernelRw` 适配器（含 `PhysWrite` trait）从 `cfg(windows)` 的 `win/va_rw.rs` 上移 crate-root `pagewalk.rs`（host 可编译可测），`win/va_rw.rs` 退化为 re-export 壳（wdt/alsys/CLI 导入路径不变）；pagewalk 测试增至 15 个（1GB 大页、PFN >4GiB 不截断、分级 NotPresent、跨 2MB 大页 kread/kwrite 往返、IOCTL 失败契约）。CLI `--wdt`/`--alsysio` bootstrap 成功后新增 VA→PA 自检臂（经适配器读 ntoskrnl 基址验 MZ，失败则卸载驱动 exit(3)）。kernelsdk 184 host 测试全绿 + windows-msvc check 无警告。
+- **K2 EdrNeutralizer::kill 测试闭环**：该能力实为 0d4a202 已实装（strip PPL/签名级别 → 用户态 TerminateProcess → 失败回滚保护字节），旧"仅 resolve"记录过时。本轮拆出 `kill_with` 可测试性缝，成功路径测试不再 Windows-only；新增 5 个 mock KernelRw host 测试（成功保持 strip / 终止失败回滚 / 回滚失败诚实报"ALIVE with PPL stripped" / 非规范地址拒写 / trait 委派）。
+- **I1 proxy_veh 死代码删除**：调查实证两条路径均无消费价值（Mode A gadget 扫描结果全 workspace 零消费、架构上无法服务 HWBP #DB 流程；Mode B section-backed handler 的规避前提在其针对的扫描模型下不成立且 NtProtect restore 已被审计标记），整文件删除留 tombstone 模块文档（-820 行），`blind_hwbp::init_countermeasures` 变 no-op（bootstrap 省一次 .text gadget 扫描）。wine64 53 测试全绿，implant-win 下游 re-export 不破。
+- **I2 BOF token/spawn API 扩面**：bof-runner 实装 `BeaconUseToken`（ImpersonateLoggedOnUser）/`BeaconRevertToken`（RevertToSelf，按 CS beacon.h 真实名）/`BeaconSpawnTemporaryProcess`（CreateProcessA CREATE_SUSPENDED，STARTUPINFOA cb=104 修正）/`BeaconCleanupProcess`——`BeaconGetSpawnTo` 返回值自此真实；inject 族保持带名 unresolved 报错并注释理由。bof-host（no_std PIC）用 ntdll `NtSetInformationThread` 原语实装 UseToken/RevertToken（stateless，符合无写静态约束），SpawnTemporaryProcess 不可行保持带名报错；`bof-host.bin` 已 regen（23504→23888 字节，dumper 0 重定位）。wine64 54 单测 + live-fire e2e（真实 spawn cmd.exe、token 回环）全绿。
+- **I3 fallback 链扩展**：`DEFAULT_FALLBACK_CHAIN` 由 `Https→DohDns→Dns` 扩为 `Https→DohDns→Dns→Tcp→SmbPipe`——9 通道 implant 侧全部有真实 sender，Tcp/SmbPipe 未配置时 fail-fast 廉价跳过；4 个 ExtC2 刻意不入链（与 Https 同 server_host，无兜底语义），理由写入链文档注释。新增链完整性 + ExtC2 fail-fast 测试，wine64 36 测试全绿。**行为变化**：bake 了 tcp/smb 配置的部署在三层互联网通道全失败后现在会自动切 pivot 通道。
+- **S1 SQLite 迁移框架补全**：三个 store（CredStore v1 / SessionStore v4 / ImplantStore v1）统一启动时版本戳校验——戳高于当前版本 fail-closed 报 `SchemaTooNew`（旧二进制不再静默打开新库）；session_store v3/v4 迁移 arm 改逐列幂等（PRAGMA table_info 判定），可恢复单事务化之前撕裂的库。6 个新测试（含半迁移恢复、撕裂前数据保留），41 全绿。
+- **G1 GUI 盲点核查**：image/channel/file 真实渲染、ProcessTable.tsx、fetch_profile 接线、Three.js 按需加载四项经代码核实均已在此前波次落地（主 bundle 实测 305KB，three 独立异步 chunk），无需改动——已知限制表相应条目本轮关闭。
+
 2026-08-16（续3）WFP kit ARM64 VM 端到端验证通过 + 两个真机 bug 修复：
 
 - **e2e 实证**：Parallels Win11 ARM64（build 26100，Prism x64 仿真，

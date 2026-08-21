@@ -41,6 +41,8 @@
 
 12. **WFP kit ARM64 VM 端到端验证 + 两个真机 bug 修复（2026-08-16）** — Parallels Win11 ARM64（26100，Prism x64 仿真，SYSTEM 通道）跑 `nyx-kernel wfp-selftest`：**baseline→blocked→restored 全过、无残留**。e2e 抓到两个 mock 测试盲区 bug 并已修复：(1) `FwpmFilterAdd0` 拒绝 `displayData.name=NULL` 的 filter（`FWP_E_NULL_DISPLAY_NAME` 0x80320023）——filter 现带静态名 "NyxWfpKit"；(2) `FwpmEngineOpen0` 传默认会话导致 filter **持久化残留**（guard drop 后仍 blocked，重启才清除）——会话改为 `FWPM_SESSION_FLAG_DYNAMIC`（新增 `FwpmSession0` SDK 布局 + 偏移钉测试 `wfp_session0_layout_matches_sdk`），关会话即清 filter，无残留契约成立。kernelsdk 169 测试全绿。
 
+13. **七路并行工作包：内核收尾 + 已知限制清理（2026-08-21）** — (K1) `VaKernelRw` 适配器上移 crate-root `pagewalk.rs`（原困在 `cfg(windows)` 导致 host 零覆盖），pagewalk 15 测试（大页/PFN/分级 NotPresent/跨页往返/IOCTL 契约），CLI phys 臂新增 bootstrap 后 VA→PA 自检（失败卸载驱动 exit(3)）；kernelsdk 184 全绿。(K2) `EdrNeutralizer::kill` 实为 0d4a202 已实装（strip PPL → 用户态 TerminateProcess → 失败回滚），本轮拆 `kill_with` 缝 + 5 host mock 测试，旧"仅 resolve"记录作废。(I1) proxy_veh 两模式经调查实证无消费价值（gadget 扫描零消费且架构上无法服务 HWBP #DB；section-backed handler 规避前提不成立），整文件删除留 tombstone，wine64 53 全绿。(I2) BOF token/spawn 族接线：bof-runner 实装 `BeaconUseToken`/`BeaconRevertToken`/`BeaconSpawnTemporaryProcess`/`BeaconCleanupProcess`（wine64 live-fire 真实 spawn + token 回环），bof-host 经 ntdll 原语实装 UseToken/RevertToken，`bof-host.bin` regen；inject 族保持带名报错。(I3) fallback 链扩为 `Https→DohDns→Dns→Tcp→SmbPipe`（9 通道 implant 侧全有真实 sender；ExtC2 刻意不入链），wine64 36 全绿——**行为变化**：配置过 tcp/smb 的部署互联网通道全失败后自动切 pivot。(S1) store 三库统一版本戳启动校验（`SchemaTooNew` fail-closed）+ 迁移 arm 逐列幂等（可恢复撕裂库），41 全绿。(G1) GUI 盲点四项（image/channel/file 渲染、ProcessTable、fetch_profile、Three.js lazy chunk）经核实均已在此前波次落地，主 bundle 实测 305KB，条目关闭。明细见 [CHANGELOG [Unreleased]](../CHANGELOG.md#unreleased)。
+
 ## 近期发布门禁
 
 - Rust 工作区与独立包的格式、静态检查和测试；
