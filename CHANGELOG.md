@@ -12,6 +12,11 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-21（续）两个本地工作包（无需真机/服务器）：
+
+- **fallback_bitmap 运行时消费接通**：`Config.fallback_bitmap`（wire spec-1 既有 u8 字段）此前零消费，现已接入 implant failover 路径。语义：bitmap=0 完全保持静态链 `Https→DohDns→Dns→Tcp→SmbPipe`（逐通道断言与旧行为一致，向后兼容硬约束）；非零时按 `DEFAULT_FALLBACK_CHAIN` 位置过滤、保持链序（位位置不含顺序信息，{Smb,Tcp} 解析为 Tcp→SmbPipe）；链外位 5-7 忽略（ExtC2 与 Https 同 egress 无兜底语义，DiscordApi(8) u8 不可编码），仅含链外位 = 禁用自动 failover；bitmap 不 gate operator 显式 SetChannel。改动：implant-net `next_fallback_with_bitmap` + 3 测试；implant-tasks `beacon_send_frame` 接线 `cfg.fallback_bitmap` + failover 接线测试（死端口触发，bitmap=0/bit2/0xE0 三场景）；implant-core config.rs/build.rs 注释修正。wine64：net 39 / tasks 21 全绿。遗留：server 侧尚无界面下发非零 bitmap（build.rs 配置键解析已存在）。
+- **evasionsdk 剩余 trait 补 live impl（5/9 → 8/9）**：`LiveSyscalls`（SyscallProvider：幂等 init + NtAllocateVirtualMemory SSN 活性校验，Prism 直调降级诚实语义）、`LiveUnhook`（新底层原语 implant-core `unhook::restore_ntdll_text`：KnownDlls SEC_IMAGE 映射（降级磁盘 ntdll）→ .text 边界比对（版本不一致拒写）→ diff==0 不写不 VirtualProtect 幂等无 IOC → RWX 窗口整体写回并还原保护；**硬约束：必须先于 BlindKit**，否则覆盖自家 EtwEventWrite/NtTraceEvent 补丁）、`LiveAntiDebug`（PEB BeingDebugged + ProcessDebugPort OR，有意不含 uptime 启发式）。SleepmaskKit 在 SDK seam 保持 Floors（真 Fluctuation 仍在 implant-tasks kits.rs 后，迁移待定）。验证：evasionsdk host 47 绿；implant-core wine 10 绿（含模拟 inline hook 修复测试）；implant-evasion wine 56 绿；implant-win nightly check 双 feature 0 警告。遗留：三个新 impl 与既有 5 个一样是独立选用，未接入 entry.rs bootstrap（LiveUnhook 进 bootstrap 须排在 blind 前，属集成决策）。
+
 2026-08-21 七路并行工作包（内核收尾 + 已知限制清理）：
 
 - **K1 内核 VA→PA host 可测化 + CLI 自检臂**：`VaKernelRw` 适配器（含 `PhysWrite` trait）从 `cfg(windows)` 的 `win/va_rw.rs` 上移 crate-root `pagewalk.rs`（host 可编译可测），`win/va_rw.rs` 退化为 re-export 壳（wdt/alsys/CLI 导入路径不变）；pagewalk 测试增至 15 个（1GB 大页、PFN >4GiB 不截断、分级 NotPresent、跨 2MB 大页 kread/kwrite 往返、IOCTL 失败契约）。CLI `--wdt`/`--alsysio` bootstrap 成功后新增 VA→PA 自检臂（经适配器读 ntoskrnl 基址验 MZ，失败则卸载驱动 exit(3)）。kernelsdk 184 host 测试全绿 + windows-msvc check 无警告。
