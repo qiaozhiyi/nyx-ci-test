@@ -21,6 +21,6 @@ mod baked {
 }
 
 pub use baked::{
-    post_client_headers, post_client_steps, post_client_terminator, post_server_steps,
-    post_server_terminator, POST_CLIENT_UA,
+    post_client_headers, post_client_padding, post_client_steps, post_client_terminator,
+    post_server_padding, post_server_steps, post_server_terminator, POST_CLIENT_UA,
 };

@@ -55,6 +55,11 @@ pub struct LlmApiTransport {
     model: String,
     api_url: String,
     agent: Agent,
+    /// BoringSSL impersonating client (feature `impersonation`). `Some` only
+    /// after [`Self::with_impersonation`]; every request then goes through it
+    /// instead of `agent` so the TLS ClientHello matches a real browser.
+    #[cfg(feature = "impersonation")]
+    impersonator: Option<crate::blocking::BlockingImpersonatingClient>,
     conversation_id: String,
     /// HMAC-SHA256 key for relayed-frame integrity (CRITICAL-23/24). Derived
     /// per-channel from the session key; NOT a cipher key.
@@ -77,6 +82,8 @@ impl LlmApiTransport {
             model,
             api_url: ANTHROPIC_API_URL.to_string(),
             agent: Agent::new(),
+            #[cfg(feature = "impersonation")]
+            impersonator: None,
             conversation_id: nanoid(),
             channel_secret: crate::traits::derive_channel_key(&session_key, b"llm"),
             last_send: None,
@@ -89,19 +96,53 @@ impl LlmApiTransport {
         self
     }
 
+    /// Route this channel's HTTP through a BoringSSL client impersonating
+    /// `profile`'s TLS/HTTP2 fingerprint (feature `impersonation`). Replaces
+    /// the plain `ureq` path for every request this transport makes.
+    #[cfg(feature = "impersonation")]
+    pub fn with_impersonation(
+        mut self,
+        profile: crate::fingerprint::BrowserProfile,
+    ) -> Result<Self, crate::fingerprint::ValidateJa3Error> {
+        self.impersonator = Some(crate::blocking::BlockingImpersonatingClient::new(profile)?);
+        Ok(self)
+    }
+
     // ---- internal helpers --------------------------------------------------
 
-    /// Post a user message to the Claude API and return the text content of
-    /// Claude's response.
-    fn post_message(&self, content: &str, max_tokens: u32) -> Result<String, TransportError> {
-        let body = ureq::json!({
-            "model": self.model,
-            "max_tokens": max_tokens,
-            "messages": [{
-                "role": "user",
-                "content": content
-            }]
-        });
+    /// POST `body` to the Messages API and return the parsed response JSON.
+    /// Dispatches to the impersonating BoringSSL client when configured
+    /// (feature `impersonation`); otherwise plain ureq — the default path is
+    /// unchanged.
+    fn post_api_json(&self, body: serde_json::Value) -> Result<serde_json::Value, TransportError> {
+        #[cfg(feature = "impersonation")]
+        if let Some(client) = &self.impersonator {
+            let resp = client
+                .post_json(
+                    &self.api_url,
+                    &[
+                        ("x-api-key", self.api_key.as_str()),
+                        ("anthropic-version", ANTHROPIC_VERSION),
+                    ],
+                    &body,
+                    Duration::from_secs(60),
+                )
+                .map_err(|e| {
+                    if e.is_timeout() {
+                        TransportError::Timeout
+                    } else {
+                        TransportError::Transient("LLM API request failed")
+                    }
+                })?;
+            // wreq does not error on non-2xx; classify it here (the ureq
+            // path gets the same outcome via `ureq::Error::Status`).
+            if !(200..300).contains(&resp.status()) {
+                return Err(TransportError::Transient("LLM API request failed"));
+            }
+            return resp
+                .json()
+                .map_err(|_| TransportError::Transient("failed to parse LLM API response"));
+        }
 
         let resp = self
             .agent
@@ -121,9 +162,23 @@ impl LlmApiTransport {
 
         // Parse the response. Anthropic Messages API returns:
         // { "content": [{ "type": "text", "text": "..." }], ... }
-        let json: serde_json::Value = resp
-            .into_json()
-            .map_err(|_| TransportError::Transient("failed to parse LLM API response"))?;
+        resp.into_json()
+            .map_err(|_| TransportError::Transient("failed to parse LLM API response"))
+    }
+
+    /// Post a user message to the Claude API and return the text content of
+    /// Claude's response.
+    fn post_message(&self, content: &str, max_tokens: u32) -> Result<String, TransportError> {
+        let body = ureq::json!({
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": [{
+                "role": "user",
+                "content": content
+            }]
+        });
+
+        let json = self.post_api_json(body)?;
 
         // Check for API-level errors.
         if json.get("error").is_some() {
@@ -384,5 +439,16 @@ mod tests {
         let id = nanoid();
         assert_eq!(id.len(), 12);
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    /// Feature-gated: `with_impersonation` must construct the BoringSSL
+    /// client without any network I/O and install it on the transport.
+    #[cfg(feature = "impersonation")]
+    #[test]
+    fn with_impersonation_constructs_without_network() {
+        let t = LlmApiTransport::new("sk-test".into(), "m".into(), [0; 32])
+            .with_impersonation(crate::fingerprint::BrowserProfile::Safari)
+            .expect("impersonating client construction does no network I/O");
+        assert!(t.impersonator.is_some());
     }
 }

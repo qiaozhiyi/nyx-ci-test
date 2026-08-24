@@ -153,3 +153,14 @@ exec '<bat>'` 一键调用。C2 任务驱动用 `tmp/vm-bridge/drill.sh <session
 级别的根因——其中 LTO 常量折叠意味着 **generate-implant 此前产出的全是死 implant**。
 修复后：beacon 真实回家，用户层任务面（文件/shell/截屏/剪贴板/键记/端口扫描/
 BOF/hashdump/getuid）全绿，Defender 实时保护下零检出。**用户层在此环境实证可用。**
+
+## 10. 量化记录口径（2026-08-21 起）
+
+本报告的 Defender 结论是**全链路聚合的二元口径**（0 检出/0 隔离，§6）。
+自 2026-08-21 起，后续演练按 `docs/testing/edr-quant-matrix.md` 定义的
+"技术 × EDR × 告警量" schema 逐条量化记录（采集脚本
+`scripts/edr_matrix_record.sh`，记录落 `.agents/orchestrator/edr_matrix.csv`）。
+
+按新 schema 回看本报告：全部任务共享一条隐含记录，等价于 `alerts=0`、
+`env_limit=Prism 仿真降级 + 无 CET`——但它是聚合值，**不可拆算回填**到单技术行，
+首版矩阵（edr-quant-matrix.md §3）的各行仍为"待实测"。

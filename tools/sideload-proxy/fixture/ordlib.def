@@ -1,0 +1,3 @@
+LIBRARY "orddll.dll"
+EXPORTS
+  ord_answer @1 NONAME

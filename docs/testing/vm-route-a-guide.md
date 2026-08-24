@@ -146,6 +146,12 @@ Get-MpPreference | Select ExclusionPath
 
 - **第一遍（Defender ON，默认）**：阶段 2+3 全量跑。任何一步被检出/被杀，记录
   `Get-MpThreatDetection` 的 ThreatName 和时间点，这就是最真实的最小 EDR 对照
+- **告警量量化采集（2026-08-21 起，WP-B）**：每做完一种技术的实测（单技术跑一轮，
+  触发方式对照 `docs/testing/edr-quant-matrix.md` §5），用
+  `scripts/edr_matrix_record.sh record` 按"技术 × EDR × 告警量" schema 追加一行
+  （自动采集 `Get-MpThreatDetection`/`Get-MpThreat` 前后差值与 Defender 版本号，
+  落 `.agents/orchestrator/edr_matrix.csv`；用法见脚本文末注释）。环境限制字段
+  强制填写，口径见 `docs/testing/edr-quant-matrix.md` §2
 - **第二遍（Defender OFF，快照回滚后）**:
   `Set-MpPreference -DisableRealtimeMonitoring $true`（如被 Tamper Protection 拦，
   先在 Windows 安全中心 UI 关篡改防护）。用于区分"功能 bug"和"被 Defender 拦"——

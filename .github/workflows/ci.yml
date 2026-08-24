@@ -300,3 +300,8 @@ jobs:
         run: cargo +1.96.0 build --locked -p nyx-agent-dev --features impersonation
       - name: Live JA3 emission validation
         run: cargo +1.96.0 test --locked -p nyx-transport --features impersonation -- --ignored validate_ja3_live
+      # WP-E server extc2 path: BlockingImpersonatingClient (blocking.rs) is
+      # the client the server's NYX_EXTC2_IMPERSONATE wires up — same peet.ws
+      # assertion as the async path above, plus a chrome≠firefox differential.
+      - name: Live JA3 emission validation (blocking client, server extc2 path)
+        run: cargo +1.96.0 test --locked -p nyx-transport --features impersonation -- --ignored blocking_probe --nocapture

@@ -1,0 +1,319 @@
+name: Hosted Verify (zero-cost wave)
+
+# Zero-cost real-machine verification wave (2026-08-24) — closes the
+# "needs a real machine" leftovers of the 2026-08-21 frontier-gap work
+# packages using ONLY free GitHub-hosted runners (private-repo free tier,
+# Windows 2x multiplier — manual + weekly triggers keep the burn bounded).
+# Resource mapping: docs/testing/free-test-resources-2026-08-21.md §4.
+#
+#   deviceguard-probe : which hosted image actually has VBS/HVCI on
+#                       (feeds the BYOVD HVCI-skip probe decision;
+#                       informational, never fails).
+#   edr-matrix        : WP-B first live fill — Defender realtime ON, five
+#                       selftest-export techniques via the console probe
+#                       harness (windows-ci.yml B3/B4 precedent), alert delta
+#                       via Get-MpThreatDetection, one CSV row per technique
+#                       per docs/testing/edr-quant-matrix.md §1.1.
+#   sideload-runtime  : WP-H delivery chain on the real Windows loader:
+#                       app-dir host -> generated proxy DLL -> forwarded
+#                       exports + DllMain implant trigger (fixture marker).
+#                       Locally pre-smoked under wine64 (2026-08-24).
+#
+# Per-PR hard gates stay in windows-ci.yml (FLS selftest B4 etc.); this
+# workflow produces periodic EVIDENCE, not merge gates.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 0" # Sun 03:17 UTC
+
+permissions:
+  contents: read   # 仓库惯例（ci.yml/windows-ci.yml）；私有仓 checkout 必需
+
+jobs:
+  # ---- Which free image has VBS/HVCI on? (BYOVD HVCI-on matrix Q, STATUS #11)
+  deviceguard-probe:
+    name: "DeviceGuard probe (${{ matrix.os }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - name: Report VBS/HVCI state
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host "OS: $($os.Caption) build $($os.BuildNumber)"
+          try {
+            $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard
+            Write-Host "VirtualizationBasedSecurityStatus: $($dg.VirtualizationBasedSecurityStatus) (0=off 1=enabled-not-running 2=running)"
+            Write-Host "SecurityServicesConfigured: $($dg.SecurityServicesConfigured -join ',')"
+            Write-Host "SecurityServicesRunning:    $($dg.SecurityServicesRunning -join ',')  (1=HVCI)"
+            $hvci = $dg.SecurityServicesRunning -contains 1
+            Write-Host "::notice::${{ matrix.os }}: VBS=$($dg.VirtualizationBasedSecurityStatus) HVCI-running=$hvci"
+          } catch {
+            Write-Host "::notice::${{ matrix.os }}: Win32_DeviceGuard unavailable: $_"
+          }
+
+  # ---- WP-B: first measured matrix fill (5 hosted-runnable techniques) ----
+  # threadless / fluctuation have no hosted-runnable selftest export (they
+  # need a live C2 session, edr-quant-matrix.md §5) — those two rows stay
+  # 待实测 by design, not omission.
+  edr-matrix:
+    name: "EDR matrix vs Defender (native x64)"
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Server-2025 images ship realtime protection off (p4-p5-validate.yml:29).
+      # Turn it ON — detection is the entire point. If it won't stay on, the
+      # rows are still recorded honestly with env_limit="Defender 已关闭"
+      # (schema enum, edr-quant-matrix.md §2) instead of silently faking "无".
+      - name: Enable Defender realtime protection
+        id: defender
+        shell: pwsh
+        run: |
+          Set-MpPreference -DisableRealtimeMonitoring $false -Force -ErrorAction SilentlyContinue
+          $st = Get-MpComputerStatus
+          Write-Host "AMServiceEnabled:          $($st.AMServiceEnabled)"
+          Write-Host "RealTimeProtectionEnabled: $($st.RealTimeProtectionEnabled)"
+          Write-Host "AMProductVersion:          $($st.AMProductVersion)"
+          if ($st.RealTimeProtectionEnabled) {
+            "env_limit=无" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          } else {
+            Write-Host "::warning::realtime protection did not stay ON — rows recorded with env_limit=Defender 已关闭"
+            "env_limit=Defender 已关闭" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+
+      - name: Ensure nightly toolchain
+        shell: cmd
+        run: rustup toolchain install nightly --component rust-src --no-self-update & rustup target add x86_64-pc-windows-msvc --toolchain nightly
+
+      - name: Build implant DLL (nightly, selftest exports)
+        shell: pwsh
+        run: |
+          # pwsh NativeCommandError trap workaround — mirrors windows-ci.yml.
+          $prevEap = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            cargo +nightly build --release --features selftest --manifest-path crates/implant-win/Cargo.toml --target x86_64-pc-windows-msvc 2>&1 |
+              Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "cargo build exited $LASTEXITCODE" }
+          } finally {
+            $ErrorActionPreference = $prevEap
+          }
+          $dll = "crates/implant-win/target/x86_64-pc-windows-msvc/release/nyx_implant_win.dll"
+          if (-not (Test-Path $dll)) { Write-Host "::error::implant DLL build failed"; exit 1 }
+
+      - name: Build console probe harness
+        shell: pwsh
+        run: |
+          $prevEap = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            cargo build --release -p nyx-bof-isolated-probe 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "probe build exited $LASTEXITCODE" }
+          } finally {
+            $ErrorActionPreference = $prevEap
+          }
+          if (-not (Test-Path "target\release\nyx-bof-isolated-probe.exe")) { Write-Host "::error::probe exe missing"; exit 1 }
+
+      # Pass masks (scripts/win_selftest_all.ps1 2026-08-24 comments +
+      # selftests.rs): armed=0xF, pool=0x7 (0x5 = WARN-degraded to method 2,
+      # recorded as pool_party FAILURE per edr-quant-matrix.md §5), fls=0x7,
+      # hwbp=0xFF, syscall_rt=0b11. Hosted runner is native x64 Server 2025 —
+      # the Prism env-skip codes (0xB/0x1D/0xC1) must NOT appear here.
+      - name: Run matrix (5 techniques, alert delta each)
+        shell: pwsh
+        run: |
+          $probe = "target\release\nyx-bof-isolated-probe.exe"
+          $dll = "crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
+          $evidence = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          $rows = @(
+            @{ T = "module_stomp";     E = "nyx_selftest_inject_armed"; P = @(0xF) },
+            @{ T = "pool_party";       E = "nyx_selftest_inject_pool";  P = @(0x7) },
+            @{ T = "fls_callback";     E = "nyx_selftest_inject_fls";   P = @(0x7) },
+            @{ T = "hwbp_blind";       E = "nyx_selftest_hwbp_blind";   P = @(0xFF) },
+            @{ T = "indirect_syscall"; E = "nyx_selftest_syscall_rt";   P = @(0x3) }
+          )
+          foreach ($r in $rows) {
+            Write-Host "===== $($r.T) ($($r.E)) ====="
+            pwsh -NoProfile -File scripts/edr_matrix_hosted.ps1 `
+              -Technique $r.T -Export $r.E -PassCodes $r.P `
+              -Probe $probe -Dll $dll `
+              -EnvLimit "${{ steps.defender.outputs.env_limit }}" `
+              -Csv out\edr_matrix.csv -Evidence $evidence -LogDir out
+            if ($LASTEXITCODE -eq 3) { Write-Host "::error::$($r.T): collector precondition failed"; exit 1 }
+          }
+          Write-Host "===== matrix CSV ====="
+          Get-Content out\edr_matrix.csv
+
+      - name: Upload matrix artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edr-matrix-${{ github.run_id }}
+          path: |
+            out/edr_matrix.csv
+            out/nyx_matrix_*.txt
+            out/nyx_g6_*.resp
+          if-no-files-found: ignore
+          retention-days: 90
+
+  # ---- WP-H: sideload delivery chain on the real Windows loader ----
+  # Two stages, both pre-smoked locally under wine64 (2026-08-24, MARKER_OK):
+  #   1. named:   host_version.exe imports version.dll -> proxy forwards all
+  #               16 exports to version_orig.dll; DllMain trigger loads the
+  #               fixture implant (marker C:\nyx_probe_fixture_loaded.txt).
+  #   2. ordinal: orddll.dll exports ord_answer by ordinal 1 NONAME; proxy
+  #               forwards "_ord_1" = "orddll_orig.#1" @1 NONAME; host_ord.exe
+  #               resolves it via GetProcAddress(#1) and must get 42.
+  # Defender realtime is left as-is (image default): this job verifies the
+  # MECHANICS on the real loader; the detection-signal dimension is the
+  # edr-matrix job's column, not a gate here.
+  sideload-runtime:
+    name: "Sideload chain runtime (WP-H)"
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure stable toolchain + gnu target
+        shell: cmd
+        run: rustup toolchain install 1.96.0 --no-self-update & rustup target add x86_64-pc-windows-gnu --toolchain 1.96.0
+
+      - name: Locate mingw linker
+        shell: pwsh
+        run: |
+          # Repo .cargo/config.toml pins x86_64-w64-mingw32-gcc; hosted images
+          # ship mingw-w64 but the prefixed name is not guaranteed on PATH.
+          if (Get-Command x86_64-w64-mingw32-gcc -ErrorAction SilentlyContinue) {
+            Write-Host "prefixed gcc on PATH"
+          } elseif (Get-Command gcc -ErrorAction SilentlyContinue) {
+            Write-Host "falling back to unprefixed gcc for the gnu target"
+            "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=gcc" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            Write-Host "::error::no mingw gcc found on runner"; exit 1
+          }
+          gcc --version 2>&1 | Select-Object -First 1
+
+      - name: Build proxy generator
+        shell: pwsh
+        run: |
+          $prevEap = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            cargo +1.96.0 build --release --manifest-path tools/sideload-proxy/Cargo.toml 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "tool build exited $LASTEXITCODE" }
+          } finally {
+            $ErrorActionPreference = $prevEap
+          }
+
+      - name: Stage 1 — named-export chain (version.dll)
+        shell: pwsh
+        run: |
+          $prevEap = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            $w = "$env:GITHUB_WORKSPACE\out\sideload1"
+            New-Item -ItemType Directory -Force -Path "$w\deploy" | Out-Null
+            Copy-Item C:\Windows\System32\version.dll "$w\version.dll"
+            & tools\sideload-proxy\target\release\nyx-sideload-proxy.exe `
+              "$w\version.dll" --out "$w\proxy" --implant dllmain_ok.dll --delay-ms 1000
+            if ($LASTEXITCODE -ne 0) { throw "generator exited $LASTEXITCODE" }
+            Push-Location "$w\proxy"
+            cargo +1.96.0 build --release --target x86_64-pc-windows-gnu 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "proxy build exited $LASTEXITCODE" }
+            Pop-Location
+            gcc -O2 tools\sideload-proxy\fixture\host_version.c -o "$w\deploy\host_version.exe" -lversion
+            if ($LASTEXITCODE -ne 0) { throw "host build exited $LASTEXITCODE" }
+            Copy-Item "$w\proxy\target\x86_64-pc-windows-gnu\release\version.dll" "$w\deploy\version.dll"
+            Move-Item "$w\version.dll" "$w\deploy\version_orig.dll"
+            Copy-Item crates\loader-probe-exe\fixture\dllmain_ok.dll "$w\deploy\"
+            $marker = "C:\nyx_probe_fixture_loaded.txt"
+            Remove-Item $marker -Force -ErrorAction SilentlyContinue
+            Push-Location "$w\deploy"
+            & .\host_version.exe
+            $code = $LASTEXITCODE
+            Pop-Location
+            $mark = Test-Path $marker
+            Write-Host "host exit=$code marker=$mark"
+            if ($code -ne 0 -or -not $mark) {
+              Write-Host "::error::stage 1 FAILED (exit=$code marker=$mark)"
+              exit 1
+            }
+            Write-Host "::notice::stage 1 PASS — named forwarding + DllMain trigger verified on real loader"
+          } finally {
+            $ErrorActionPreference = $prevEap
+          }
+
+      - name: Stage 2 — ordinal-only forwarder runtime
+        shell: pwsh
+        run: |
+          $prevEap = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            $w = "$env:GITHUB_WORKSPACE\out\sideload2"
+            New-Item -ItemType Directory -Force -Path "$w\deploy" | Out-Null
+            gcc -shared -O2 tools\sideload-proxy\fixture\ordlib.c tools\sideload-proxy\fixture\ordlib.def -o "$w\orddll.dll"
+            if ($LASTEXITCODE -ne 0) { throw "ordlib build exited $LASTEXITCODE" }
+            & tools\sideload-proxy\target\release\nyx-sideload-proxy.exe `
+              "$w\orddll.dll" --out "$w\proxy" --implant dllmain_ok.dll --delay-ms 1000
+            if ($LASTEXITCODE -ne 0) { throw "generator exited $LASTEXITCODE" }
+            Get-Content "$w\proxy\exports.def"
+            Push-Location "$w\proxy"
+            cargo +1.96.0 build --release --target x86_64-pc-windows-gnu 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "proxy build exited $LASTEXITCODE" }
+            Pop-Location
+            gcc -O2 tools\sideload-proxy\fixture\host_ord.c -o "$w\deploy\host_ord.exe"
+            if ($LASTEXITCODE -ne 0) { throw "host build exited $LASTEXITCODE" }
+            Copy-Item "$w\proxy\target\x86_64-pc-windows-gnu\release\orddll.dll" "$w\deploy\orddll.dll"
+            Move-Item "$w\orddll.dll" "$w\deploy\orddll_orig.dll"
+            Copy-Item crates\loader-probe-exe\fixture\dllmain_ok.dll "$w\deploy\"
+            $marker = "C:\nyx_probe_fixture_loaded.txt"
+            Remove-Item $marker -Force -ErrorAction SilentlyContinue
+            Push-Location "$w\deploy"
+            & .\host_ord.exe
+            $code = $LASTEXITCODE
+            Pop-Location
+            $mark = Test-Path $marker
+            Write-Host "host exit=$code marker=$mark"
+            if ($code -ne 0 -or -not $mark) {
+              Write-Host "::error::stage 2 FAILED (exit=$code marker=$mark) — ordinal forwarder did not resolve"
+              exit 1
+            }
+            Write-Host "::notice::stage 2 PASS — ordinal-only forwarder resolved on real loader"
+          } finally {
+            $ErrorActionPreference = $prevEap
+          }
+
+      - name: Defender telemetry (post-mortem)
+        if: failure()
+        shell: pwsh
+        run: |
+          $out = "defender-telemetry.txt"
+          "=== Get-MpComputerStatus ===" | Out-File $out
+          try { Get-MpComputerStatus | Format-List | Out-String | Out-File $out -Append }
+          catch { "Get-MpComputerStatus failed: $_" | Out-File $out -Append }
+          "=== Get-MpThreatDetection ===" | Out-File $out -Append
+          try {
+            $det = Get-MpThreatDetection
+            if ($det) { $det | Format-List | Out-String | Out-File $out -Append }
+            else { "(no threat detections recorded)" | Out-File $out -Append }
+          } catch { "Get-MpThreatDetection failed: $_" | Out-File $out -Append }
+          Get-Content $out
+
+      - name: Upload sideload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sideload-diag-${{ github.run_id }}
+          path: |
+            out/sideload1/**
+            out/sideload2/**
+            defender-telemetry.txt
+          if-no-files-found: ignore
+          retention-days: 30

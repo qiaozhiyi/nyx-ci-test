@@ -113,6 +113,19 @@ pub struct Profile {
     pub blocks: Vec<Block>,
 }
 
+// ---- traffic-timing baseline (`set timing_baseline`) -----------------------
+
+/// Traffic-timing baseline declared by the top-level `set timing_baseline`.
+/// `Uniform` (the default) keeps the classic sleep±jitter cadence; `Bursty`
+/// paces check-ins as short-interval bursts separated by long sleeps, blurring
+/// the connection-cadence metadata that uniform jitter still leaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimingBaseline {
+    #[default]
+    Uniform,
+    Bursty,
+}
+
 impl Profile {
     /// First top-level `set <key>` value.
     pub fn option(&self, key: &str) -> Option<&Str> {
@@ -138,5 +151,14 @@ impl Profile {
     }
     pub fn http_stager(&self) -> Option<&Block> {
         self.block("http-stager")
+    }
+
+    /// `set timing_baseline` — `bursty` or `uniform` (the default when unset).
+    /// Unknown values resolve to `Uniform` here; c2lint flags them as an error.
+    pub fn timing_baseline(&self) -> TimingBaseline {
+        match self.option("timing_baseline") {
+            Some(v) if v.as_str() == "bursty" => TimingBaseline::Bursty,
+            _ => TimingBaseline::Uniform,
+        }
     }
 }

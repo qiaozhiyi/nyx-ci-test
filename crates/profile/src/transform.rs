@@ -52,6 +52,7 @@ pub enum TransformError {
     TooShort,
     PrefixMismatch,
     SuffixMismatch,
+    InvalidPadding,
 }
 
 // Manual `Display` + `Error` impls (not thiserror) so this module is
@@ -67,6 +68,9 @@ impl core::fmt::Display for TransformError {
             Self::TooShort => write!(f, "data too short for mask (need >= 4-byte key prefix)"),
             Self::PrefixMismatch => write!(f, "prepend prefix did not match"),
             Self::SuffixMismatch => write!(f, "append suffix did not match"),
+            Self::InvalidPadding => {
+                write!(f, "invalid padding suffix (bad length encoding or out-of-range pad)")
+            }
         }
     }
 }
@@ -287,6 +291,77 @@ fn fnv1a32(b: &[u8]) -> u32 {
     h
 }
 
+// ---- traffic-shaping padding (profile `set padding_min/max`) ---------------
+
+/// Maximum padding length. The length is self-delimiting as TWO URL-safe
+/// base64 chars (6 bits each, see [`pad_append`]), so `n <= 4095`.
+pub const PAD_LEN_CAP: usize = 4095;
+
+/// Append traffic-shaping padding to an already-transformed payload, blurring
+/// the packet-length distribution (a metadata-level CS Malleable C2 residue:
+/// content mimicry alone leaves sizes/timing detectable).
+///
+/// Wire layout: `encode(frame) || pad || len2`, where `pad` is `n` bytes and
+/// `len2` is `n` itself as two 6-bit base64url chars. The padding rides AFTER
+/// the transform chain (never through e.g. base64) so the receiver can locate
+/// and strip it via [`pad_strip`] BEFORE [`decode`] — that ordering is the
+/// round-trip contract. All emitted bytes come from the URL-safe base64
+/// alphabet so a padded payload stays valid in every terminator position
+/// (body, header value, URI suffix).
+///
+/// `seed` drives a xorshift32 chain (length pick + filler bytes). Padding is
+/// traffic-shaping filler, not secret material, so a cheap PRNG seeded by the
+/// caller's own randomness is enough — same discipline as `mask` above.
+/// `max == 0` disables padding entirely: the buffer is left untouched, keeping
+/// the wire format byte-identical to profiles without padding.
+pub fn pad_append(out: &mut Vec<u8>, min: usize, max: usize, seed: u32) {
+    let max = max.min(PAD_LEN_CAP);
+    let min = min.min(max);
+    if max == 0 {
+        return;
+    }
+    let mut x = if seed == 0 { 0x9E37_79B9 } else { seed };
+    x = xorshift32(x);
+    let n = min + (x as usize) % (max - min + 1);
+    for _ in 0..n {
+        x = xorshift32(x);
+        out.push(URL_ALPHA[(x as usize) & 63]);
+    }
+    out.push(URL_ALPHA[(n >> 6) & 63]);
+    out.push(URL_ALPHA[n & 63]);
+}
+
+/// Strip the padding [`pad_append`] added: decode the 2-char length suffix,
+/// drop it plus the `n` filler bytes, return the remaining payload. Fails on a
+/// malformed suffix or an `n` outside `[min, max]` (profile desync / tamper).
+/// Callers must invoke this ONLY when padding is enabled (`max > 0`) — with
+/// padding disabled the wire carries no length suffix at all.
+pub fn pad_strip(buf: &[u8], min: usize, max: usize) -> Result<&[u8], TransformError> {
+    if buf.len() < 2 {
+        return Err(TransformError::InvalidPadding);
+    }
+    let hi = b64url_val(buf[buf.len() - 2]).ok_or(TransformError::InvalidPadding)?;
+    let lo = b64url_val(buf[buf.len() - 1]).ok_or(TransformError::InvalidPadding)?;
+    let n = hi * 64 + lo;
+    let max = max.min(PAD_LEN_CAP);
+    let min = min.min(max);
+    if n < min || n > max || n + 2 > buf.len() {
+        return Err(TransformError::InvalidPadding);
+    }
+    Ok(&buf[..buf.len() - 2 - n])
+}
+
+fn b64url_val(c: u8) -> Option<usize> {
+    URL_ALPHA.iter().position(|&a| a == c)
+}
+
+fn xorshift32(mut x: u32) -> u32 {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    x
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,5 +437,62 @@ mod tests {
         ];
         let msg = b"s3ss1on-met4data-payload";
         assert_eq!(decode(&steps, &encode(&steps, msg)).unwrap(), msg);
+    }
+
+    #[test]
+    fn padding_roundtrip() {
+        for (min, max) in [(0, 16), (8, 64), (32, 32), (0, PAD_LEN_CAP)] {
+            for seed in [1u32, 0xDEAD_BEEF, 42] {
+                let mut buf = b"payload".to_vec();
+                pad_append(&mut buf, min, max, seed);
+                assert!(buf.len() >= 7 + min + 2, "pad + 2-char suffix present");
+                assert!(buf.len() <= 7 + max.min(PAD_LEN_CAP) + 2);
+                let stripped = pad_strip(&buf, min, max).expect("strip must invert append");
+                assert_eq!(stripped, b"payload");
+            }
+        }
+    }
+
+    #[test]
+    fn padding_disabled_is_byte_identical() {
+        let mut buf = b"payload".to_vec();
+        pad_append(&mut buf, 0, 0, 123);
+        assert_eq!(buf, b"payload", "max=0 → no padding, no length suffix");
+    }
+
+    #[test]
+    fn padding_varies_length_across_seeds() {
+        let lens: alloc::collections::BTreeSet<usize> = (1..64u32)
+            .map(|seed| {
+                let mut buf = Vec::new();
+                pad_append(&mut buf, 0, 200, seed);
+                buf.len()
+            })
+            .collect();
+        assert!(lens.len() > 1, "padding must blur the length distribution");
+    }
+
+    #[test]
+    fn pad_strip_rejects_malformed_suffix() {
+        // Too short / non-base64url suffix / out-of-range length all fail.
+        assert_eq!(pad_strip(b"x", 0, 16), Err(TransformError::InvalidPadding));
+        assert_eq!(
+            pad_strip(b"payload\x00\xff", 0, 16),
+            Err(TransformError::InvalidPadding)
+        );
+        // Suffix decodes to n=10 but the buffer only has 7 payload bytes.
+        let mut buf = b"payload".to_vec();
+        buf.push(URL_ALPHA[0]);
+        buf.push(URL_ALPHA[10]);
+        assert_eq!(
+            pad_strip(&buf, 0, 16),
+            Err(TransformError::InvalidPadding)
+        );
+        // n=4 within range but below a nonzero min → desync detected.
+        let mut buf = b"payload".to_vec();
+        buf.extend_from_slice(b"abcd");
+        buf.push(URL_ALPHA[0]);
+        buf.push(URL_ALPHA[4]);
+        assert_eq!(pad_strip(&buf, 8, 16), Err(TransformError::InvalidPadding));
     }
 }

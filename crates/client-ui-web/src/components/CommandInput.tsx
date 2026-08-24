@@ -506,7 +506,7 @@ export function parseCommand(
     // --- injection ---
     case 'inject': {
       // inject <method> <pid> <spawn_to> <hex_shellcode>
-      // method: 0=pool_party 1=threadless 2=module_stomp
+      // method: 0=pool_party 1=threadless 2=module_stomp 3=fls_callback
       if (args.length < 3) return null;
       const method = parseInt(args[0], 10) || 0;
       const pid = parseInt(args[1], 10);

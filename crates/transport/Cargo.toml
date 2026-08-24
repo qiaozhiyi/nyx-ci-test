@@ -27,13 +27,18 @@ tracing = { workspace = true }
 # default dev build.
 wreq = { version = "5.3", default-features = false, features = ["json"], optional = true }
 wreq-util = { version = "2.2", optional = true }
+# Current-thread runtime driving the async wreq client from the synchronous
+# (ureq-style) channel impls — see `blocking.rs`. Optional for the same
+# hermetic-build reason as wreq.
+tokio = { workspace = true, optional = true }
 
 [features]
 default = []
 # Enable the BoringSSL-backed wreq client for real out-bound JA3 control.
 # Pulls in `wreq` + `wreq-util` (and transitively `boring-sys2`, which needs
-# cmake, go, and a C compiler on the host).
-impersonation = ["dep:wreq", "dep:wreq-util"]
+# cmake, go, and a C compiler on the host) plus `tokio` for the blocking
+# facade's private current-thread runtime.
+impersonation = ["dep:wreq", "dep:wreq-util", "dep:tokio"]
 
 [dev-dependencies]
 md-5 = "0.10"

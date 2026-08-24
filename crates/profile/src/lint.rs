@@ -38,6 +38,14 @@ const TERMINATORS: &[&str] = &["header", "parameter", "print", "uri-append"];
 /// Substrings that mark a user-agent as a known Beacon default (a classic IOC).
 const DEFAULT_UA_FRAGMENTS: &[&str] = &["compatible; MSIE", "CobaltStrike", "Beacon"];
 
+/// Legal values for the top-level `set timing_baseline` (traffic cadence).
+const TIMING_BASELINES: &[&str] = &["uniform", "bursty"];
+
+/// Padding above this size gets a Note: oversized bodies are themselves an
+/// IOC (and the self-delimiting length suffix caps at
+/// [`crate::transform::PAD_LEN_CAP`], above which the envelope clamps).
+const LARGE_PADDING_BYTES: u64 = 4096;
+
 /// Lint a profile. Returns diagnostics in source order; a profile with no
 /// `Error`s gets a trailing `Note: profile OK`.
 pub fn lint(p: &Profile) -> Vec<Diagnostic> {
@@ -130,6 +138,50 @@ pub fn lint(p: &Profile) -> Vec<Diagnostic> {
         if s.as_str().parse::<u64>().is_err() {
             d.push(warn(0, "`sleeptime` is not a number"));
         }
+    }
+
+    // ---- traffic-metadata shaping (padding / timing baseline) --------------
+    // Content-layer mimicry alone leaves timing and packet-length distributions
+    // as a detectable residue — metadata-only detection of CS Malleable C2 is
+    // practical (Striking Back At Cobalt, arXiv:2506.08922).
+    let pad_min = padding_option(p, "padding_min", &mut d);
+    let pad_max = padding_option(p, "padding_max", &mut d);
+    if let (Some(min), Some(max)) = (pad_min, pad_max) {
+        if min > max {
+            d.push(err(0, format!("padding_min {min} > padding_max {max}")));
+        }
+    }
+    if let Some(max) = pad_max {
+        if max > LARGE_PADDING_BYTES {
+            d.push(note(
+                0,
+                format!(
+                    "padding_max {max} is large — oversized bodies are themselves an IOC \
+                     (also clamped to {} by the length suffix encoding)",
+                    crate::transform::PAD_LEN_CAP
+                ),
+            ));
+        }
+    }
+    if let Some(tb) = p.option("timing_baseline") {
+        let s = tb.as_str();
+        if !TIMING_BASELINES.contains(&s.as_ref()) {
+            d.push(err(
+                0,
+                format!("unknown `timing_baseline` {s:?} (expected uniform|bursty)"),
+            ));
+        }
+    }
+    if p.option("padding_min").is_none()
+        && p.option("padding_max").is_none()
+        && p.option("timing_baseline").is_none()
+    {
+        d.push(warn(
+            0,
+            "no `padding_min/max` or `timing_baseline` set — content-layer mimicry alone \
+             does not counter metadata-level detection (timing / packet-length / cadence; \
+             cf. Striking Back At Cobalt, arXiv:2506.08922)",
+        ));
     }
 
     // duplicate top-level blocks
@@ -273,6 +325,22 @@ fn check_no_crlf_in_wire_stmts(block: &crate::ast::Block, d: &mut Vec<Diagnostic
         }
     }
     walk(block, d);
+}
+
+/// Parse a top-level padding option (`padding_min`/`padding_max`) as a byte
+/// count. Non-numeric values are a hard Error (the runtime would silently
+/// treat them as 0); absent → `None`.
+fn padding_option(p: &Profile, key: &str, d: &mut Vec<Diagnostic>) -> Option<u64> {
+    let v = p.option(key)?;
+    let s = v.as_str();
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        d.push(err(
+            0,
+            format!("`{key}` must be a byte count (digits only), got {s:?}"),
+        ));
+        return None;
+    }
+    s.parse::<u64>().ok()
 }
 
 fn err(line: u32, msg: impl Into<String>) -> Diagnostic {

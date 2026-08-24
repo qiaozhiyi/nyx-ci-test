@@ -98,6 +98,26 @@ impl fmt::Display for BrowserProfile {
     }
 }
 
+impl std::str::FromStr for BrowserProfile {
+    type Err = String;
+
+    /// Parse a coarse family name (`chrome` / `firefox` / `safari` / `edge`,
+    /// case-insensitive) — the value space of operator-facing config such as
+    /// the server's `NYX_EXTC2_IMPERSONATE` env var. Unknown values are
+    /// rejected so a typo fails loudly instead of silently picking a default.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "chrome" => Ok(BrowserProfile::Chrome),
+            "firefox" => Ok(BrowserProfile::Firefox),
+            "safari" => Ok(BrowserProfile::Safari),
+            "edge" => Ok(BrowserProfile::Edge),
+            other => Err(format!(
+                "unknown browser profile {other:?} (expected chrome|firefox|safari|edge)"
+            )),
+        }
+    }
+}
+
 /// Map a coarse [`BrowserProfile`] to the concrete preset name string that the
 /// BoringSSL backend uses internally (e.g. `"Chrome137"` for wreq-util's
 /// `Emulation::Chrome137`).
@@ -347,6 +367,28 @@ mod tests {
         assert_eq!(BrowserProfile::Firefox.to_string(), "Firefox139");
         assert_eq!(BrowserProfile::Safari.to_string(), "Safari18_5");
         assert_eq!(BrowserProfile::Edge.to_string(), "Edge134");
+    }
+
+    /// `FromStr` parses the four family names case-insensitively and rejects
+    /// anything else (operator-facing config must fail loudly on a typo).
+    #[test]
+    fn from_str_parses_family_names_and_rejects_unknown() {
+        use std::str::FromStr;
+        assert_eq!(
+            BrowserProfile::from_str("chrome"),
+            Ok(BrowserProfile::Chrome)
+        );
+        assert_eq!(
+            BrowserProfile::from_str("Firefox"),
+            Ok(BrowserProfile::Firefox)
+        );
+        assert_eq!(
+            BrowserProfile::from_str(" SAFARI "),
+            Ok(BrowserProfile::Safari)
+        );
+        assert_eq!(BrowserProfile::from_str("edge"), Ok(BrowserProfile::Edge));
+        assert!(BrowserProfile::from_str("").is_err());
+        assert!(BrowserProfile::from_str("netscape").is_err());
     }
 
     /// The probe URL constant is the expected peet.ws endpoint.

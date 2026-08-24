@@ -128,6 +128,16 @@ fn emit_envelopes(profile: &nyx_profile::Profile) -> String {
         "pub fn post_server_terminator() -> Option<nyx_profile::transform::Terminator> {{ {} }}\n",
         terminator_expr(&server.terminator)
     ));
+    // Traffic-shaping padding range (top-level `set padding_min/max`), baked as
+    // a plain `(min, max)` tuple — both 0 when the profile doesn't set them.
+    s.push_str(&format!(
+        "pub fn post_client_padding() -> (usize, usize) {{ ({}, {}) }}\n",
+        client.padding_min, client.padding_max
+    ));
+    s.push_str(&format!(
+        "pub fn post_server_padding() -> (usize, usize) {{ ({}, {}) }}\n",
+        server.padding_min, server.padding_max
+    ));
     s
 }
 
@@ -141,7 +151,9 @@ fn emit_envelopes_none() -> &'static str {
      pub fn post_client_terminator() -> Option<nyx_profile::transform::Terminator> { None }\n\
      pub fn post_client_headers() -> nyx_implant_core::heap::Vec<(&'static [u8], &'static [u8])> { nyx_implant_core::heap::Vec::new() }\n\
      pub fn post_server_steps() -> nyx_implant_core::heap::Vec<nyx_profile::transform::Step> { nyx_implant_core::heap::Vec::new() }\n\
-     pub fn post_server_terminator() -> Option<nyx_profile::transform::Terminator> { None }\n"
+     pub fn post_server_terminator() -> Option<nyx_profile::transform::Terminator> { None }\n\
+     pub fn post_client_padding() -> (usize, usize) { (0, 0) }\n\
+     pub fn post_server_padding() -> (usize, usize) { (0, 0) }\n"
 }
 
 /// Render a byte slice as a Rust array literal `[0xNN, ...]`.

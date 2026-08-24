@@ -205,3 +205,113 @@ fn crlf_in_header_name_is_an_error() {
         errors(&p)
     );
 }
+
+// ---- traffic-metadata shaping checks (padding / timing_baseline) -----------
+
+fn warnings(p: &nyx_profile::Profile) -> Vec<String> {
+    lint(p)
+        .into_iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .map(|d| d.message)
+        .collect()
+}
+
+#[test]
+fn valid_padding_and_timing_baseline_lint_clean() {
+    let src = r#"
+        set padding_min "16";
+        set padding_max "256";
+        set timing_baseline "bursty";
+        http-get { set uri "/g"; client { metadata { header "Cookie"; } } server { output { print; } } }
+        http-post { set uri "/p"; client { output { print; } } server { output { print; } } }
+    "#;
+    let p = parse(src).unwrap();
+    let errs = errors(&p);
+    assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    // ...and the metadata-shaping warning must be gone.
+    assert!(
+        !warnings(&p).iter().any(|m| m.contains("padding")),
+        "{:?}",
+        warnings(&p)
+    );
+}
+
+#[test]
+fn non_numeric_padding_is_an_error() {
+    let src = r#"
+        set padding_max "lots";
+        http-get { set uri "/g"; client { metadata { header "Cookie"; } } server { output { print; } } }
+        http-post { set uri "/p"; client { output { print; } } server { output { print; } } }
+    "#;
+    let p = parse(src).unwrap();
+    assert!(
+        errors(&p).iter().any(|m| m.contains("padding_max")),
+        "{:?}",
+        errors(&p)
+    );
+}
+
+#[test]
+fn padding_min_above_max_is_an_error() {
+    let src = r#"
+        set padding_min "512";
+        set padding_max "64";
+        http-get { set uri "/g"; client { metadata { header "Cookie"; } } server { output { print; } } }
+        http-post { set uri "/p"; client { output { print; } } server { output { print; } } }
+    "#;
+    let p = parse(src).unwrap();
+    assert!(
+        errors(&p)
+            .iter()
+            .any(|m| m.contains("padding_min") && m.contains("padding_max")),
+        "{:?}",
+        errors(&p)
+    );
+}
+
+#[test]
+fn oversized_padding_max_is_a_note() {
+    let src = r#"
+        set padding_max "9000";
+        http-get { set uri "/g"; client { metadata { header "Cookie"; } } server { output { print; } } }
+        http-post { set uri "/p"; client { output { print; } } server { output { print; } } }
+    "#;
+    let p = parse(src).unwrap();
+    assert!(errors(&p).is_empty(), "{:?}", errors(&p));
+    let notes: Vec<_> = lint(&p)
+        .into_iter()
+        .filter(|d| d.severity == Severity::Note)
+        .collect();
+    assert!(
+        notes.iter().any(|n| n.message.contains("padding_max")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn unknown_timing_baseline_is_an_error() {
+    let src = r#"
+        set timing_baseline "chaotic";
+        http-get { set uri "/g"; client { metadata { header "Cookie"; } } server { output { print; } } }
+        http-post { set uri "/p"; client { output { print; } } server { output { print; } } }
+    "#;
+    let p = parse(src).unwrap();
+    assert!(
+        errors(&p).iter().any(|m| m.contains("timing_baseline")),
+        "{:?}",
+        errors(&p)
+    );
+}
+
+#[test]
+fn no_metadata_shaping_is_a_warning() {
+    // GOOD sets transforms/UA but neither padding nor timing_baseline → the
+    // metadata-level detection warning must fire (content mimicry alone is
+    // not enough, arXiv:2506.08922).
+    let p = parse(GOOD).unwrap();
+    assert!(
+        warnings(&p).iter().any(|m| m.contains("metadata")),
+        "{:?}",
+        warnings(&p)
+    );
+}

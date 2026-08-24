@@ -38,7 +38,7 @@ pub mod parser;
 pub mod transform;
 
 #[cfg(feature = "std")]
-pub use ast::{Block, Item, Profile, Setting, Str};
+pub use ast::{Block, Item, Profile, Setting, Str, TimingBaseline};
 #[cfg(feature = "std")]
 pub use envelope::{
     get_client_envelope, get_server_envelope, post_client_envelope, post_server_envelope,
@@ -50,7 +50,7 @@ pub use lexer::LexError;
 pub use lint::{lint, Diagnostic, Severity};
 #[cfg(feature = "std")]
 pub use parser::{parse, ParseError};
-pub use transform::{decode, encode, Step, Terminator, TransformError};
+pub use transform::{decode, encode, pad_append, pad_strip, Step, Terminator, TransformError, PAD_LEN_CAP};
 // `steps_from_block` needs `ast::Block` → gated out under `no_std`; build.rs
 // resolves steps host-side for the implant instead.
 #[cfg(feature = "std")]

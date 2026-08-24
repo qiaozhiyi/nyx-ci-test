@@ -73,6 +73,30 @@ struct CreateMessagePayload {
 
 // ---- Transport --------------------------------------------------------------
 
+/// Response of a Discord API call. The plain-ureq path by default; the
+/// BoringSSL impersonating client when `with_impersonation` was used
+/// (feature `impersonation`). Both expose the one thing callers need:
+/// `into_json`.
+enum ApiResponse {
+    // Boxed: `ureq::Response` is much larger than `BlockingResponse`
+    // (clippy::large_enum_variant).
+    Ureq(Box<ureq::Response>),
+    #[cfg(feature = "impersonation")]
+    Impersonated(crate::blocking::BlockingResponse),
+}
+
+impl ApiResponse {
+    /// Parse the body as JSON. Error detail is collapsed to `String` —
+    /// callers only ever map it to "parse error".
+    fn into_json<T: serde::de::DeserializeOwned>(self) -> Result<T, String> {
+        match self {
+            ApiResponse::Ureq(resp) => resp.into_json().map_err(|e| e.to_string()),
+            #[cfg(feature = "impersonation")]
+            ApiResponse::Impersonated(resp) => resp.json().map_err(|e| e.to_string()),
+        }
+    }
+}
+
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 /// Inter-message cooldown — Discord rate-limits message sends per channel;
 /// 1.2 s mirrors the Slack channel's pacing and stays comfortably under the
@@ -96,6 +120,11 @@ pub struct DiscordTransport {
     channel_secret: [u8; 32],
     bot_user_id: Option<String>,
     agent: ureq::Agent,
+    /// BoringSSL impersonating client (feature `impersonation`). `Some` only
+    /// after [`Self::with_impersonation`]; every request then goes through it
+    /// instead of `agent` so the TLS ClientHello matches a real browser.
+    #[cfg(feature = "impersonation")]
+    impersonator: Option<crate::blocking::BlockingImpersonatingClient>,
     /// Highest snowflake id seen so far (recv cursor).
     last_seen_id: Option<u64>,
     next_send_after: Option<Instant>,
@@ -124,9 +153,23 @@ impl DiscordTransport {
             agent: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(10))
                 .build(),
+            #[cfg(feature = "impersonation")]
+            impersonator: None,
             last_seen_id: None,
             next_send_after: None,
         }
+    }
+
+    /// Route this channel's HTTP through a BoringSSL client impersonating
+    /// `profile`'s TLS/HTTP2 fingerprint (feature `impersonation`). Replaces
+    /// the plain `ureq` path for every request this transport makes.
+    #[cfg(feature = "impersonation")]
+    pub fn with_impersonation(
+        mut self,
+        profile: crate::fingerprint::BrowserProfile,
+    ) -> Result<Self, crate::fingerprint::ValidateJa3Error> {
+        self.impersonator = Some(crate::blocking::BlockingImpersonatingClient::new(profile)?);
+        Ok(self)
     }
 
     /// Test-only constructor with a fixed all-zero session key, so unit tests
@@ -148,8 +191,24 @@ impl DiscordTransport {
         &self,
         path: &str,
         body: serde_json::Value,
-    ) -> Result<ureq::Response, TransportError> {
+    ) -> Result<ApiResponse, TransportError> {
         let url = format!("{DISCORD_API_BASE}{path}");
+        #[cfg(feature = "impersonation")]
+        if let Some(client) = &self.impersonator {
+            let auth = self.auth_header();
+            let resp = client
+                .post_json(
+                    &url,
+                    &[("Authorization", auth.as_str())],
+                    &body,
+                    Duration::from_secs(10),
+                )
+                .map_err(|_| TransportError::Transient("Discord transport error (network)"))?;
+            if let Some(e) = Self::classify_status(resp.status()) {
+                return Err(e);
+            }
+            return Ok(ApiResponse::Impersonated(resp));
+        }
         let resp = self
             .agent
             .post(&url)
@@ -157,36 +216,60 @@ impl DiscordTransport {
             .set("Content-Type", "application/json; charset=utf-8")
             .send_json(body)
             .map_err(|e| self.classify_ureq_error(e))?;
-        Ok(resp)
+        Ok(ApiResponse::Ureq(Box::new(resp)))
     }
 
     /// GET a Discord API endpoint.
-    fn discord_get(&self, path: &str) -> Result<ureq::Response, TransportError> {
+    fn discord_get(&self, path: &str) -> Result<ApiResponse, TransportError> {
         let url = format!("{DISCORD_API_BASE}{path}");
+        #[cfg(feature = "impersonation")]
+        if let Some(client) = &self.impersonator {
+            let auth = self.auth_header();
+            let resp = client
+                .get(
+                    &url,
+                    &[("Authorization", auth.as_str())],
+                    &[],
+                    Duration::from_secs(10),
+                )
+                .map_err(|_| TransportError::Transient("Discord transport error (network)"))?;
+            if let Some(e) = Self::classify_status(resp.status()) {
+                return Err(e);
+            }
+            return Ok(ApiResponse::Impersonated(resp));
+        }
         let resp = self
             .agent
             .get(&url)
             .set("Authorization", &self.auth_header())
             .call()
             .map_err(|e| self.classify_ureq_error(e))?;
-        Ok(resp)
+        Ok(ApiResponse::Ureq(Box::new(resp)))
+    }
+
+    /// Classify an HTTP status code into a `TransportError`. Shared by the
+    /// plain-ureq path (via `classify_ureq_error`) and the impersonating
+    /// path (whose client does not error on non-2xx). `None` = success.
+    fn classify_status(code: u16) -> Option<TransportError> {
+        match code {
+            429 => Some(TransportError::Transient("Discord rate limited (429)")),
+            401 => Some(TransportError::Dead("Discord token invalid (401)")),
+            403 => Some(TransportError::Dead(
+                "Discord token lacks channel permissions (403)",
+            )),
+            c if c >= 500 => Some(TransportError::Transient("Discord server error (5xx)")),
+            _ => None,
+        }
     }
 
     /// Classify a `ureq::Error` into a `TransportError`.
     fn classify_ureq_error(&self, e: ureq::Error) -> TransportError {
         match &e {
-            ureq::Error::Status(429, _) => TransportError::Transient("Discord rate limited (429)"),
-            ureq::Error::Status(401, _) => TransportError::Dead("Discord token invalid (401)"),
-            ureq::Error::Status(403, _) => {
-                TransportError::Dead("Discord token lacks channel permissions (403)")
-            }
-            ureq::Error::Status(code, _) if *code >= 500 => {
-                TransportError::Transient("Discord server error (5xx)")
-            }
+            ureq::Error::Status(code, _) => Self::classify_status(*code)
+                .unwrap_or(TransportError::Transient("Discord API error")),
             ureq::Error::Transport(_) => {
                 TransportError::Transient("Discord transport error (network)")
             }
-            _ => TransportError::Transient("Discord API error"),
         }
     }
 
@@ -462,5 +545,16 @@ mod tests {
             open_frame(&discord.channel_secret, &cross_blob),
             Err(crate::traits::FrameIntegrityError)
         );
+    }
+
+    /// Feature-gated: `with_impersonation` must construct the BoringSSL
+    /// client without any network I/O and install it on the transport.
+    #[cfg(feature = "impersonation")]
+    #[test]
+    fn with_impersonation_constructs_without_network() {
+        let t = DiscordTransport::new_for_test("bot-token".into(), "123".into())
+            .with_impersonation(crate::fingerprint::BrowserProfile::Firefox)
+            .expect("impersonating client construction does no network I/O");
+        assert!(t.impersonator.is_some());
     }
 }

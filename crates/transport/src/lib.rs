@@ -80,6 +80,11 @@ pub(crate) fn extract_hex(text: &str) -> Option<String> {
     longest.map(|s| s.to_string())
 }
 
+/// Blocking facade over the async wreq impersonation backend, for the
+/// synchronous external-C2 channels. Feature-gated: without `impersonation`
+/// there is no BoringSSL backend to wrap.
+#[cfg(feature = "impersonation")]
+pub mod blocking;
 pub mod discord_api;
 pub mod doh_dns;
 pub mod fingerprint;

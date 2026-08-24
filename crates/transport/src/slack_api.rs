@@ -57,6 +57,30 @@ struct PostMessagePayload {
 
 // ---- Transport ------------------------------------------------------------
 
+/// Response of a Slack API call. The plain-ureq path by default; the
+/// BoringSSL impersonating client when `with_impersonation` was used
+/// (feature `impersonation`). Both expose the one thing callers need:
+/// `into_json`.
+enum ApiResponse {
+    // Boxed: `ureq::Response` is much larger than `BlockingResponse`
+    // (clippy::large_enum_variant).
+    Ureq(Box<ureq::Response>),
+    #[cfg(feature = "impersonation")]
+    Impersonated(crate::blocking::BlockingResponse),
+}
+
+impl ApiResponse {
+    /// Parse the body as JSON. Error detail is collapsed to `String` —
+    /// callers only ever map it to "parse error".
+    fn into_json<T: serde::de::DeserializeOwned>(self) -> Result<T, String> {
+        match self {
+            ApiResponse::Ureq(resp) => resp.into_json().map_err(|e| e.to_string()),
+            #[cfg(feature = "impersonation")]
+            ApiResponse::Impersonated(resp) => resp.json().map_err(|e| e.to_string()),
+        }
+    }
+}
+
 const SLACK_API_BASE: &str = "https://slack.com/api/";
 const SEND_COOLDOWN_MS: u64 = 1200;
 const POLL_INTERVAL_MS: u64 = 500;
@@ -76,6 +100,11 @@ pub struct SlackTransport {
     channel_secret: [u8; 32],
     bot_user_id: Option<String>,
     agent: ureq::Agent,
+    /// BoringSSL impersonating client (feature `impersonation`). `Some` only
+    /// after [`Self::with_impersonation`]; every request then goes through it
+    /// instead of `agent` so the TLS ClientHello matches a real browser.
+    #[cfg(feature = "impersonation")]
+    impersonator: Option<crate::blocking::BlockingImpersonatingClient>,
     last_ts: Option<String>,
     next_send_after: Option<Instant>,
 }
@@ -103,9 +132,23 @@ impl SlackTransport {
             agent: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(10))
                 .build(),
+            #[cfg(feature = "impersonation")]
+            impersonator: None,
             last_ts: None,
             next_send_after: None,
         }
+    }
+
+    /// Route this channel's HTTP through a BoringSSL client impersonating
+    /// `profile`'s TLS/HTTP2 fingerprint (feature `impersonation`). Replaces
+    /// the plain `ureq` path for every request this transport makes.
+    #[cfg(feature = "impersonation")]
+    pub fn with_impersonation(
+        mut self,
+        profile: crate::fingerprint::BrowserProfile,
+    ) -> Result<Self, crate::fingerprint::ValidateJa3Error> {
+        self.impersonator = Some(crate::blocking::BlockingImpersonatingClient::new(profile)?);
+        Ok(self)
     }
 
     /// Test-only constructor with a fixed all-zero session key, so unit tests
@@ -129,8 +172,24 @@ impl SlackTransport {
         &self,
         method: &str,
         body: serde_json::Value,
-    ) -> Result<ureq::Response, TransportError> {
+    ) -> Result<ApiResponse, TransportError> {
         let url = format!("{SLACK_API_BASE}{method}");
+        #[cfg(feature = "impersonation")]
+        if let Some(client) = &self.impersonator {
+            let auth = self.auth_header();
+            let resp = client
+                .post_json(
+                    &url,
+                    &[("Authorization", auth.as_str())],
+                    &body,
+                    Duration::from_secs(10),
+                )
+                .map_err(|_| TransportError::Transient("Slack transport error (network)"))?;
+            if let Some(e) = Self::classify_status(resp.status()) {
+                return Err(e);
+            }
+            return Ok(ApiResponse::Impersonated(resp));
+        }
         let resp = self
             .agent
             .post(&url)
@@ -138,7 +197,7 @@ impl SlackTransport {
             .set("Content-Type", "application/json; charset=utf-8")
             .send_json(body)
             .map_err(|e| self.classify_ureq_error(e))?;
-        Ok(resp)
+        Ok(ApiResponse::Ureq(Box::new(resp)))
     }
 
     /// GET a Slack API method with query params. Returns the raw response.
@@ -146,8 +205,24 @@ impl SlackTransport {
         &self,
         method: &str,
         params: &[(&str, &str)],
-    ) -> Result<ureq::Response, TransportError> {
+    ) -> Result<ApiResponse, TransportError> {
         let url = format!("{SLACK_API_BASE}{method}");
+        #[cfg(feature = "impersonation")]
+        if let Some(client) = &self.impersonator {
+            let auth = self.auth_header();
+            let resp = client
+                .get(
+                    &url,
+                    &[("Authorization", auth.as_str())],
+                    params,
+                    Duration::from_secs(10),
+                )
+                .map_err(|_| TransportError::Transient("Slack transport error (network)"))?;
+            if let Some(e) = Self::classify_status(resp.status()) {
+                return Err(e);
+            }
+            return Ok(ApiResponse::Impersonated(resp));
+        }
         let mut req = self
             .agent
             .get(&url)
@@ -156,36 +231,40 @@ impl SlackTransport {
             req = req.query(k, v);
         }
         let resp = req.call().map_err(|e| self.classify_ureq_error(e))?;
-        Ok(resp)
+        Ok(ApiResponse::Ureq(Box::new(resp)))
+    }
+
+    /// Classify an HTTP status code into a `TransportError`. Shared by the
+    /// plain-ureq path (via `classify_ureq_error`) and the impersonating
+    /// path (whose client does not error on non-2xx). `None` = success.
+    fn classify_status(code: u16) -> Option<TransportError> {
+        match code {
+            429 => Some(TransportError::Transient("Slack rate limited (429)")),
+            401 => Some(TransportError::Dead("Slack token invalid (401)")),
+            403 => Some(TransportError::Dead(
+                "Slack token lacks required scopes (403)",
+            )),
+            c if c >= 500 => Some(TransportError::Transient("Slack server error (5xx)")),
+            _ => None,
+        }
     }
 
     /// Classify a `ureq::Error` into a `TransportError`.
     fn classify_ureq_error(&self, e: ureq::Error) -> TransportError {
         match &e {
-            ureq::Error::Status(429, _) => TransportError::Transient("Slack rate limited (429)"),
-            ureq::Error::Status(401, _) => TransportError::Dead("Slack token invalid (401)"),
-            ureq::Error::Status(403, _) => {
-                TransportError::Dead("Slack token lacks required scopes (403)")
-            }
-            ureq::Error::Status(code, _) if *code >= 500 => {
-                TransportError::Transient("Slack server error (5xx)")
+            ureq::Error::Status(code, _) => {
+                Self::classify_status(*code).unwrap_or(TransportError::Transient("Slack API error"))
             }
             ureq::Error::Transport(_) => {
                 TransportError::Transient("Slack transport error (network)")
             }
-            _ => TransportError::Transient("Slack API error"),
         }
     }
 
     /// Resolve the bot user ID by calling `auth.test`. Used during `init()`.
     fn resolve_bot_user_id(&mut self) -> Result<(), TransportError> {
         let resp: serde_json::Value = self
-            .agent
-            .post(&format!("{SLACK_API_BASE}auth.test"))
-            .set("Authorization", &self.auth_header())
-            .set("Content-Type", "application/json; charset=utf-8")
-            .send_json(serde_json::json!({}))
-            .map_err(|e| self.classify_ureq_error(e))?
+            .slack_post("auth.test", serde_json::json!({}))?
             .into_json()
             .map_err(|_| TransportError::Transient("Slack auth.test parse error"))?;
 
@@ -336,13 +415,7 @@ impl Transport for SlackTransport {
 
     fn health_check(&self) -> Result<u64, TransportError> {
         let start = Instant::now();
-        let resp = self
-            .agent
-            .post(&format!("{SLACK_API_BASE}auth.test"))
-            .set("Authorization", &self.auth_header())
-            .set("Content-Type", "application/json; charset=utf-8")
-            .send_json(serde_json::json!({}))
-            .map_err(|error| self.classify_ureq_error(error))?;
+        let resp = self.slack_post("auth.test", serde_json::json!({}))?;
 
         let json = resp
             .into_json::<serde_json::Value>()
@@ -482,5 +555,16 @@ mod tests {
             open_frame(&slack.channel_secret, &cross_blob),
             Err(crate::traits::FrameIntegrityError)
         );
+    }
+
+    /// Feature-gated: `with_impersonation` must construct the BoringSSL
+    /// client without any network I/O and install it on the transport.
+    #[cfg(feature = "impersonation")]
+    #[test]
+    fn with_impersonation_constructs_without_network() {
+        let t = SlackTransport::new_for_test("xoxb-test".into(), "C000".into())
+            .with_impersonation(crate::fingerprint::BrowserProfile::Chrome)
+            .expect("impersonating client construction does no network I/O");
+        assert!(t.impersonator.is_some());
     }
 }

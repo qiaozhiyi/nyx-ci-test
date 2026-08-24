@@ -1,0 +1,20 @@
+[package]
+name = "nyx-sideload-proxy"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Generates a proxy DLL crate for DLL-sideloading delivery: parses the original DLL's export table and emits a mingw-compatible forwarding skeleton. Standalone (NOT a workspace member)."
+
+# Standalone so the stable workspace stays green (same pattern as tools/srdi);
+# build directly:
+#   cargo run --release -- <original.dll> --out proxy_out/
+#
+# Zero external dependencies: the export-table parser is self-contained
+# (src/pe_exports.rs) because goblin's public `pe.exports` only enumerates
+# *named* exports and would silently drop ordinal-only exports, which a proxy
+# generator must not lose.
+[workspace]
+
+[[bin]]
+name = "nyx-sideload-proxy"
+path = "src/main.rs"

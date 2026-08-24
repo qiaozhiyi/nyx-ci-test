@@ -73,6 +73,11 @@ pub struct McpTransport {
     /// verify — including hex runs extracted from unrelated MCP responses.
     channel_secret: [u8; 32],
     agent: Agent,
+    /// BoringSSL impersonating client (feature `impersonation`). `Some` only
+    /// after [`Self::with_impersonation`]; every request then goes through it
+    /// instead of `agent` so the TLS ClientHello matches a real browser.
+    #[cfg(feature = "impersonation")]
+    impersonator: Option<crate::blocking::BlockingImpersonatingClient>,
     request_id: u64,
 }
 
@@ -110,8 +115,22 @@ impl McpTransport {
             api_key,
             channel_secret,
             agent: Agent::new(),
+            #[cfg(feature = "impersonation")]
+            impersonator: None,
             request_id: 0,
         }
+    }
+
+    /// Route this channel's HTTP through a BoringSSL client impersonating
+    /// `profile`'s TLS/HTTP2 fingerprint (feature `impersonation`). Replaces
+    /// the plain `ureq` path for every request this transport makes.
+    #[cfg(feature = "impersonation")]
+    pub fn with_impersonation(
+        mut self,
+        profile: crate::fingerprint::BrowserProfile,
+    ) -> Result<Self, crate::fingerprint::ValidateJa3Error> {
+        self.impersonator = Some(crate::blocking::BlockingImpersonatingClient::new(profile)?);
+        Ok(self)
     }
 
     /// Test-only constructor that does NOT require an API key. Production code
@@ -132,6 +151,8 @@ impl McpTransport {
             api_key: String::new(),
             channel_secret,
             agent: Agent::new(),
+            #[cfg(feature = "impersonation")]
+            impersonator: None,
             request_id: 0,
         }
     }
@@ -168,6 +189,36 @@ impl McpTransport {
 
     /// POST a JSON-RPC request to the MCP server and return the parsed result.
     fn rpc_call(&self, body: serde_json::Value) -> Result<serde_json::Value, TransportError> {
+        #[cfg(feature = "impersonation")]
+        if let Some(client) = &self.impersonator {
+            let auth = self.auth_header();
+            let mut headers: Vec<(&str, &str)> = Vec::new();
+            if let Some(ref a) = auth {
+                headers.push(("Authorization", a.as_str()));
+            }
+            let resp = client
+                .post_json(&self.server_url, &headers, &body, Duration::from_secs(30))
+                .map_err(|e| {
+                    if e.is_timeout() {
+                        TransportError::Timeout
+                    } else {
+                        TransportError::Transient("MCP RPC transport error")
+                    }
+                })?;
+            // wreq does not error on non-2xx; classify it here (the ureq
+            // path gets the same outcome via `ureq::Error::Status`).
+            if !(200..300).contains(&resp.status()) {
+                return Err(TransportError::Transient("MCP RPC transport error"));
+            }
+            let json: serde_json::Value = resp
+                .json()
+                .map_err(|_| TransportError::Transient("MCP RPC response parse error"))?;
+            if json.get("error").is_some() {
+                return Err(TransportError::Transient("MCP RPC error"));
+            }
+            return Ok(json);
+        }
+
         // Break the ureq builder chain so the Authorization header is added
         // only when an API key is configured (P1-15). `set`/`timeout`/`send_json`
         // take `mut self -> Self`, so the request stays owned across the break.
@@ -512,6 +563,17 @@ mod tests {
             open_frame(&t.channel_secret, &forged),
             Err(crate::traits::FrameIntegrityError)
         );
+    }
+
+    /// Feature-gated: `with_impersonation` must construct the BoringSSL
+    /// client without any network I/O and install it on the transport.
+    #[cfg(feature = "impersonation")]
+    #[test]
+    fn with_impersonation_constructs_without_network() {
+        let t = McpTransport::new_without_auth("https://mcp.example.com".into(), "sess-1".into())
+            .with_impersonation(crate::fingerprint::BrowserProfile::Edge)
+            .expect("impersonating client construction does no network I/O");
+        assert!(t.impersonator.is_some());
     }
 
     #[test]

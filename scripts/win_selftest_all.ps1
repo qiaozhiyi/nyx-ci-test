@@ -47,6 +47,8 @@ $EXPECTED_CODES = @{
     "nyx_selftest_hashdump"       = 4       # bitmask: SAM hive parse
     "nyx_selftest_pivot"          = $null   # needs closed port — host-dependent
     "nyx_selftest_inject"         = $null   # depends on sacrificial spawn success
+    "nyx_selftest_inject_fls"     = $null   # 0x7 pass (native x64) / 0xB = Prism env-skip (bit3 flag, 2026-08-24)
+    "nyx_selftest_inject_pool"    = $null   # 0x7 pass / 0x5 WARN-degrade / 0x1 = pool party Err (see %TEMP%\nyx_g6_inject_pool.resp)
     "nyx_selftest_resolve_forwarder" = 7    # bits 0-2
     "nyx_selftest_task_guard"     = 7       # bits 0-2: round-trip/crash-recovery/re-arm (bit3 = env-skip flag)
     "nyx_selftest_syscall_rt"     = 3       # bits 0-1
@@ -67,8 +69,8 @@ $EXPECTED_CODES = @{
     "nyx_selftest_hashdump_diag"  = 1
     "nyx_selftest_hookchain"      = $null   # bitmask — SSN resolution host-dependent
     "nyx_selftest_hookchain_full" = $null
-    "nyx_selftest_hwbp_blind"     = $null   # HWBP — needs specific config
-    "nyx_selftest_inject_armed"   = $null
+    "nyx_selftest_hwbp_blind"     = $null   # 0xFF pass / 0xC0 add_hwbp fail / 0xC1 = Prism env-skip (2026-08-24)
+    "nyx_selftest_inject_armed"   = $null   # 0xF pass / 0x1D = Prism env-skip (bit4 flag, 2026-08-24)
     "nyx_selftest_rt_probe"       = $null   # probe
     "nyx_selftest_rt_steps"       = $null
     "nyx_selftest_screenshot_diag"= 63      # bits 0-5

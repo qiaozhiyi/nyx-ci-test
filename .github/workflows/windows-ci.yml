@@ -7,7 +7,10 @@ name: Windows CI
 #      runners execute jobs in non-interactive Session 0 where rundll32 never
 #      reaches the selftest exports (verified 2026-08-01 via entry markers; the
 #      same exports pass on real machines — P4-P5 workflow). Kept as a HARD
-#      gate for self-hosted interactive runners.
+#      gate for self-hosted interactive runners. Two selftests DO run on
+#      hosted runners via the bof-isolated-probe console harness (LoadLibrary
+#      + direct export call, no rundll32): nyx_selftest_bof_isolated and the
+#      WP-A nyx_selftest_inject_fls (inject method 3) regression below.
 #   3. Live PDB offset resolution — extracts the GUID from the runner's own
 #      ntoskrnl.exe, downloads the matching PDB from the MS symbol server,
 #      and verifies the offset-resolver extracts correct EPROCESS + ETW-TI
@@ -281,6 +284,46 @@ jobs:
           # mirror, nyx-ci-test run 31312910796).
           exit 0
 
+      # ---- B4 FLS callback-inject selftest (WP-A, inject method 3) ----
+      # nyx_selftest_inject_fls (implant-tasks/src/selftests.rs:667): forces
+      # FLS_INJECT_ENABLED on, spawns a RUNNING notepad sacrificial (Session-0
+      # safe — no window-station interaction needed for kernel32 to map), then
+      # do_inject(3, pid) registers a remote FLS callback + trigger stub with a
+      # 1-byte `ret` probe payload. Same hosted-runnable harness as the B3
+      # probe above (no rundll32). HARD gate: exit must be exactly 7 (0b0111 =
+      # sacrificial spawned | kernel32 mapped | "fls callback inject ok").
+      # Defender realtime is deliberately left ON: a block/detection is itself
+      # signal — on failure the "Defender telemetry" step at the end of this
+      # job captures Get-MpThreatDetection as an artifact.
+      - name: FLS callback-inject selftest (inject method 3)
+        shell: pwsh
+        run: |
+          # Anti-sandbox suite may flag the hosted runner as a VM; bypass so
+          # the selftest actually executes (same as the regression step above).
+          $env:NYX_SKIP_SANDBOX = "1"
+          $probe = "target\release\nyx-bof-isolated-probe.exe"
+          $dll = "crates\implant-win\target\x86_64-pc-windows-msvc\release\nyx_implant_win.dll"
+          if (-not (Test-Path $probe)) { Write-Host "::error::probe exe missing"; exit 1 }
+          if (-not (Test-Path $dll)) { Write-Host "::error::implant DLL missing"; exit 1 }
+          Write-Host "Defender DisableRealtimeMonitoring: $((Get-MpPreference).DisableRealtimeMonitoring)"
+          # Start-Process + explicit timeout (not `&`): do_inject(3) waits for
+          # remote kernel32; a hung wait must not burn the 25-min job timeout.
+          $p = Start-Process $probe -ArgumentList "`"$dll`"","nyx_selftest_inject_fls" -PassThru -WindowStyle Hidden
+          $p.WaitForExit(45000) | Out-Null
+          if (-not $p.HasExited) {
+            $p.Kill()
+            Write-Host "::error::nyx_selftest_inject_fls TIMEOUT (45s) — remote FlsAlloc/wait likely hung"
+            exit 1
+          }
+          $code = $p.ExitCode
+          Write-Host "nyx_selftest_inject_fls exit: $code (0b$([Convert]::ToString($code,2)))"
+          if ($code -ne 7) {
+            Write-Host "::error::nyx_selftest_inject_fls expected 7 (0b0111), got $code — check Defender telemetry artifact"
+            exit 1
+          }
+          Write-Host "::notice::FLS callback-inject selftest PASS (mask=7: sacrificial + kernel32 + inject ok)"
+          exit 0
+
       # ---- 3. Live PDB offset resolution (ground-truth verification) ----
       - name: "Live PDB offset resolution (host's own kernel)"
         shell: pwsh
@@ -366,5 +409,36 @@ jobs:
         with:
           name: offsets-${{ github.run_id }}
           path: offsets_live.toml
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # ---- Defender post-mortem ----
+      # The FLS inject selftest (and the whole evasion stack) runs with
+      # Defender realtime ON. When any step fails, capture the detection log:
+      # a Defender block is a plausible root cause for an inject-selftest mask
+      # miss, and the detection name is exactly the EDR signal we want.
+      - name: Defender telemetry (post-mortem)
+        if: failure()
+        shell: pwsh
+        run: |
+          $out = "defender-telemetry.txt"
+          "=== Get-MpComputerStatus ===" | Out-File $out
+          try {
+            Get-MpComputerStatus | Format-List | Out-String | Out-File $out -Append
+          } catch { "Get-MpComputerStatus failed: $_" | Out-File $out -Append }
+          "=== Get-MpThreatDetection ===" | Out-File $out -Append
+          try {
+            $det = Get-MpThreatDetection
+            if ($det) { $det | Format-List | Out-String | Out-File $out -Append }
+            else { "(no threat detections recorded)" | Out-File $out -Append }
+          } catch { "Get-MpThreatDetection failed: $_" | Out-File $out -Append }
+          Get-Content $out
+
+      - name: Upload Defender telemetry
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defender-telemetry-${{ github.run_id }}
+          path: defender-telemetry.txt
           if-no-files-found: ignore
           retention-days: 30

@@ -374,6 +374,14 @@ impl SyscallProvider for LiveSyscalls {
 /// for the source chain and the hard ordering constraint: MUST run before
 /// `BlindKit` — the restore overwrites our own ntdll byte-patches too.
 /// Idempotent: an already-pristine ntdll costs one fresh map + diff, no write.
+///
+/// **Decision: opt-in only, never in the default bootstrap.** External
+/// evidence (AutoBypass, arXiv 2608.01639, Table 11 — aggregated across 5
+/// real AV/EDR): `unhook_ntdll` succeeds 51.4% of the time but generates 139
+/// alerts, the second-highest alert volume of all techniques measured — EDR
+/// self-integrity checks watch `.text` restoration closely. That alert
+/// profile contradicts Nyx's default HWBP patchless-blind route, so this kit
+/// stays an operator-selected option alongside the other non-default impls.
 pub struct LiveUnhook;
 
 impl UnhookKit for LiveUnhook {
