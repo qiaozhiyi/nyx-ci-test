@@ -126,6 +126,10 @@ export interface GenerateRequest {
   expires?: string;
   notes?: string;
   deliver?: string;    // "inline" for base64 binary
+  // spec-1 channel tail (2026-08-24): primary channel enum 0-8, failover
+  // bitmap bit N = channel enum N (0 = build-time default chain).
+  primary_channel?: number;
+  fallback_bitmap?: number;
 }
 
 export interface GenerateResponse {

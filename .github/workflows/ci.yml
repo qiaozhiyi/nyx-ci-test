@@ -238,7 +238,7 @@ jobs:
       - name: Install mingw-w64 (Windows GNU linker)
         run: brew install mingw-w64
       - name: Install nightly toolchain + Windows GNU target
-        run: rustup toolchain install nightly --target x86_64-pc-windows-gnu --no-self-update
+        run: rustup toolchain install nightly --target x86_64-pc-windows-gnu --component rustfmt --component clippy --no-self-update   # rustfmt/clippy no longer ship in the macos nightly image by default (runner image 2026-08 change; bof-host fmt/clippy steps below fail without them)
       - name: Build selftest DLL
         run: cargo +nightly build --release --manifest-path crates/implant-win/Cargo.toml --features selftest --target x86_64-pc-windows-gnu
       - name: Install qiling + run selftest matrix
@@ -299,9 +299,25 @@ jobs:
       - name: Build nyx-agent-dev with impersonation
         run: cargo +1.96.0 build --locked -p nyx-agent-dev --features impersonation
       - name: Live JA3 emission validation
-        run: cargo +1.96.0 test --locked -p nyx-transport --features impersonation -- --ignored validate_ja3_live
+        # peet.ws connect failures are transient (CI run 32680860772,
+        # 2026-08-24): retry before calling it a real fingerprint regression.
+        run: |
+          for i in 1 2 3; do
+            cargo +1.96.0 test --locked -p nyx-transport --features impersonation -- --ignored validate_ja3_live && exit 0
+            echo "::warning::JA3 live probe attempt $i failed — retrying in 10s"
+            sleep 10
+          done
+          echo "::error::JA3 live probe failed 3x — real fingerprint regression or peet.ws outage"
+          exit 1
       # WP-E server extc2 path: BlockingImpersonatingClient (blocking.rs) is
       # the client the server's NYX_EXTC2_IMPERSONATE wires up — same peet.ws
       # assertion as the async path above, plus a chrome≠firefox differential.
       - name: Live JA3 emission validation (blocking client, server extc2 path)
-        run: cargo +1.96.0 test --locked -p nyx-transport --features impersonation -- --ignored blocking_probe --nocapture
+        run: |
+          for i in 1 2 3; do
+            cargo +1.96.0 test --locked -p nyx-transport --features impersonation -- --ignored blocking_probe --nocapture && exit 0
+            echo "::warning::blocking JA3 probe attempt $i failed — retrying in 10s"
+            sleep 10
+          done
+          echo "::error::blocking JA3 probe failed 3x"
+          exit 1

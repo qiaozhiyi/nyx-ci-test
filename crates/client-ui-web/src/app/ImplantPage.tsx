@@ -37,6 +37,8 @@ interface FormState {
   inline: boolean;
   expires: string;
   features: string;
+  primary_channel: string;
+  fallback_bitmap: string;
 }
 
 const DEFAULTS: FormState = {
@@ -51,6 +53,8 @@ const DEFAULTS: FormState = {
   inline: false,
   expires: '',
   features: '',
+  primary_channel: '',
+  fallback_bitmap: '',
 };
 
 /**
@@ -173,6 +177,11 @@ export function ImplantPage() {
   // features is a number when provided; empty/non-numeric stays undefined.
   const featuresNum =
     form.features.trim() === '' ? undefined : Number(form.features);
+  // spec-1 channel tail (2026-08-24): optional; server validates range.
+  const primaryNum =
+    form.primary_channel.trim() === '' ? undefined : Number(form.primary_channel);
+  const bitmapNum =
+    form.fallback_bitmap.trim() === '' ? undefined : Number(form.fallback_bitmap);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -200,6 +209,8 @@ export function ImplantPage() {
         jitter: Number(form.jitter) || undefined,
         tls: form.tls,
         features: Number.isFinite(featuresNum) ? featuresNum : undefined,
+        primary_channel: Number.isFinite(primaryNum) ? primaryNum : undefined,
+        fallback_bitmap: Number.isFinite(bitmapNum) ? bitmapNum : undefined,
         expires: form.expires.trim() || undefined,
         notes: form.notes.trim() || undefined,
         deliver: form.inline ? 'inline' : undefined,
@@ -412,6 +423,32 @@ export function ImplantPage() {
                   onChange={onText('features')}
                   min={0}
                   placeholder="留空则不设置"
+                />
+              </label>
+
+              <label className="ip-field">
+                <span className="ip-label">primary_channel</span>
+                <input
+                  type="number"
+                  className="ip-input mono"
+                  value={form.primary_channel}
+                  onChange={onText('primary_channel')}
+                  min={0}
+                  max={8}
+                  placeholder="0 = Https（默认）"
+                />
+              </label>
+
+              <label className="ip-field">
+                <span className="ip-label">fallback_bitmap</span>
+                <input
+                  type="number"
+                  className="ip-input mono"
+                  value={form.fallback_bitmap}
+                  onChange={onText('fallback_bitmap')}
+                  min={0}
+                  max={255}
+                  placeholder="0 = 默认链；bit N = 通道 N"
                 />
               </label>
             </div>

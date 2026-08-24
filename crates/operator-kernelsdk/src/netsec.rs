@@ -1868,10 +1868,17 @@ mod tests {
         };
         #[cfg(target_os = "windows")]
         {
+            // Terminate step stubbed through the kill_with seam: this test's
+            // assertion target is the pid→EPROCESS list walk. The real
+            // terminate would OpenProcess(PROCESS_TERMINATE) a REAL host pid —
+            // environment-dependent (access denied on CI runners where pid
+            // 100 is protected) and potentially destructive (an openable pid
+            // 100 would actually be killed). Caught by the windows-latest
+            // standalone-tests gate 2026-08-24.
             // PID 100 → EPROCESS at e1.
-            assert_eq!(kit.kill(&krw, 100).unwrap(), e1);
+            assert_eq!(kit.kill_with(&krw, 100, |_| Ok(())).unwrap(), e1);
             // PID 200 → EPROCESS at e2.
-            assert_eq!(kit.kill(&krw, 200).unwrap(), e2);
+            assert_eq!(kit.kill_with(&krw, 200, |_| Ok(())).unwrap(), e2);
         }
         #[cfg(not(target_os = "windows"))]
         {

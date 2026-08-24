@@ -880,6 +880,35 @@ fn op_wfp_selftest() -> i32 {
     let blocked = run_probe(&listener, &probe, &addr) != Some(0);
     eprintln!("[+] wfp-selftest blocked phase: connect blocked = {blocked}");
     if !blocked {
+        // Live diagnostics (2026-08-24: first hosted-runner run, Server 2025
+        // x64, blocked=false while the identical kit passes on Win11 26100
+        // ARM64). The guard owns a DYNAMIC session — its filters vanish the
+        // moment this process exits, so a workflow post-mortem would see an
+        // empty table. Dump the live filter list NOW and print the sections
+        // touching our probe image (AppId condition sanity: does the kernel
+        // see the same path we anchored?).
+        eprintln!("[!] wfp-selftest probe image: {}", probe.display());
+        if let Ok(out) = std::process::Command::new("netsh")
+            .args(["wfp", "show", "filters", "file=-"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let lines: Vec<&str> = text.lines().collect();
+            let needle = "nyx_wfp_probe";
+            for (i, l) in lines.iter().enumerate() {
+                if l.contains(needle) {
+                    let lo = i.saturating_sub(12);
+                    let hi = (i + 3).min(lines.len());
+                    for seg in &lines[lo..hi] {
+                        eprintln!("    {seg}");
+                    }
+                    eprintln!("    ----");
+                }
+            }
+            if !text.contains(needle) {
+                eprintln!("[!] no live filter references the probe image — install matched nothing?");
+            }
+        }
         drop(guard);
         let _ = idle.kill();
         cleanup(&probe);

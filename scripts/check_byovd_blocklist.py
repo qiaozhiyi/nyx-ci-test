@@ -186,12 +186,17 @@ def check_ms_blocklist(failures):
     xml_low = xml.lower()
 
     # A1: WDTKernel must be ABSENT.
+    a1_before = len(failures)
     if any("wdtkernel" in f or "wdt\\" in f for f in low_names):
         failures.append("A1 FAIL: WDTKernel named in the MS vulnerable-driver blocklist")
     for h in WDTKERNEL_SHA256:
         if h in xml_low:
             failures.append(f"A1 FAIL: WDTKernel SHA256 {h[:16]}… found in the MS blocklist")
-    print("[+] A1: WDTKernel.sys ABSENT from MS vulnerable-driver blocklist")
+    # Honest print: the [+] line must reflect the check outcome, not run
+    # unconditionally (the old unconditional print masked the 2026-08-24 A5
+    # failure in CI logs — green-looking line directly above the ::error::).
+    if len(failures) == a1_before:
+        print("[+] A1: WDTKernel.sys ABSENT from MS vulnerable-driver blocklist")
 
     # A2: RTCore64 must be PRESENT (positive control).
     if not any("rtcore" in f for f in low_names):
@@ -219,12 +224,27 @@ def check_ms_blocklist(failures):
     # 2026-08-16). Content check on the PINNED v2.0.8.0 sample hash — the
     # only version whose R/W IOCTLs we verified (v2.1.0.0 removed them; its
     # hash is asserted absent too, it just can't drive R/W for us).
-    if any("alsysio" in f for f in low_names):
+    # 2026-08-24 precision fix (caught by the first CI run of this gate): the
+    # policy DOES name a SIBLING — FileName "ALSysIO.sys" (note: not
+    # "ALSysIO64.sys") ≤2.0.10.x, hash-identified sample 01af9b2e…, present in
+    # the SAME pinned policy 10.0.29545.0. The 2026-08-16 offline assertion
+    # missed it (hash-only / exact-name check). That entry does NOT cover the
+    # shipped x64 v2.0.8.0 sample (ALSysIO64.sys, SHA256 7196187f…): different
+    # FileName, different hash. Gate on OUR artifacts exactly; surface the
+    # sibling as a family-level watch — Microsoft is circling ALSysIO.
+    sibling_hits = [f for f in low_names if "alsysio" in f]
+    a5_before = len(failures)
+    if any("alsysio64" in f for f in low_names):
         failures.append("A5 FAIL: ALSysIO64 named in the MS vulnerable-driver blocklist")
     for h in ALSYSIO_SHA256:
         if h in xml_low:
             failures.append(f"A5 FAIL: ALSysIO64 SHA256 {h[:16]}… found in the MS blocklist")
-    print("[+] A5: ALSysIO64.sys ABSENT from MS blocklist (name + pinned v2.0.8.0 hash)")
+    if len(failures) == a5_before:
+        print("[+] A5: ALSysIO64.sys ABSENT from MS blocklist (name + pinned v2.0.8.0 hash)")
+    if sibling_hits:
+        print(f"::warning::A5 watch: blocklist names sibling entry {sibling_hits} — "
+              "our pinned ALSysIO64.sys v2.0.8.0 is NOT covered (name+hash differ), "
+              "but the family is on Microsoft's radar; re-evaluate on each policy bump")
 
 
 def check_loldrivers(failures):

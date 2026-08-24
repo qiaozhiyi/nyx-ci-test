@@ -50,7 +50,9 @@ pub use lexer::LexError;
 pub use lint::{lint, Diagnostic, Severity};
 #[cfg(feature = "std")]
 pub use parser::{parse, ParseError};
-pub use transform::{decode, encode, pad_append, pad_strip, Step, Terminator, TransformError, PAD_LEN_CAP};
+pub use transform::{
+    decode, encode, pad_append, pad_strip, Step, Terminator, TransformError, PAD_LEN_CAP,
+};
 // `steps_from_block` needs `ast::Block` → gated out under `no_std`; build.rs
 // resolves steps host-side for the implant instead.
 #[cfg(feature = "std")]

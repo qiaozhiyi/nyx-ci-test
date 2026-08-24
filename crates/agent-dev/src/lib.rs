@@ -1530,7 +1530,10 @@ mod tests {
                 assert_eq!(*d, base, "cycle {i} should be the long gap");
             } else {
                 assert!(*d < base, "cycle {i} should be a short in-burst interval");
-                assert!(*d >= Duration::from_millis(500), "cycle {i} above the floor");
+                assert!(
+                    *d >= Duration::from_millis(500),
+                    "cycle {i} above the floor"
+                );
             }
         }
         // base 很小时短间隔也有下限,不会忙循环。

@@ -69,7 +69,10 @@ impl core::fmt::Display for TransformError {
             Self::PrefixMismatch => write!(f, "prepend prefix did not match"),
             Self::SuffixMismatch => write!(f, "append suffix did not match"),
             Self::InvalidPadding => {
-                write!(f, "invalid padding suffix (bad length encoding or out-of-range pad)")
+                write!(
+                    f,
+                    "invalid padding suffix (bad length encoding or out-of-range pad)"
+                )
             }
         }
     }
@@ -484,10 +487,7 @@ mod tests {
         let mut buf = b"payload".to_vec();
         buf.push(URL_ALPHA[0]);
         buf.push(URL_ALPHA[10]);
-        assert_eq!(
-            pad_strip(&buf, 0, 16),
-            Err(TransformError::InvalidPadding)
-        );
+        assert_eq!(pad_strip(&buf, 0, 16), Err(TransformError::InvalidPadding));
         // n=4 within range but below a nonzero min → desync detected.
         let mut buf = b"payload".to_vec();
         buf.extend_from_slice(b"abcd");

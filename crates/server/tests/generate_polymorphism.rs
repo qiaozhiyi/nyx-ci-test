@@ -56,7 +56,10 @@ fn validate_patched(binary: &[u8], cfg_off: usize) {
     assert_eq!(&binary[0..2], b"MZ", "missing MZ magic");
     let pe_sig_off =
         u32::from_le_bytes([binary[0x3C], binary[0x3D], binary[0x3E], binary[0x3F]]) as usize;
-    assert!(pe_sig_off + 4 <= binary.len(), "PE sig offset out of bounds");
+    assert!(
+        pe_sig_off + 4 <= binary.len(),
+        "PE sig offset out of bounds"
+    );
     assert_eq!(
         &binary[pe_sig_off..pe_sig_off + 4],
         b"PE\0\0",
@@ -216,8 +219,7 @@ async fn two_generations_differ_in_dead_zone_and_overlay_only() {
 
     // The .nyx_cfg dead-zone tail (past header + ciphertext) must actually be
     // randomized — not the old all-zero padding.
-    let data_len_a =
-        u16::from_le_bytes([a.binary[cfg_a + 8], a.binary[cfg_a + 9]]) as usize;
+    let data_len_a = u16::from_le_bytes([a.binary[cfg_a + 8], a.binary[cfg_a + 9]]) as usize;
     let tail_a = &a.binary[cfg_a + 86 + data_len_a..cfg_a + SECTION_LEN];
     assert!(
         tail_a.iter().any(|&x| x != 0),

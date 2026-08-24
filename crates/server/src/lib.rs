@@ -1180,7 +1180,10 @@ fn shape_beacon_response(st: &AppState, frame: Vec<u8>) -> Response {
         return (StatusCode::OK, body_bytes(frame)).into_response();
     };
     let env = nyx_profile::post_server_envelope(profile);
-    if env.terminator.is_none() && env.steps.is_empty() && env.headers.is_empty() && env.padding_max == 0
+    if env.terminator.is_none()
+        && env.steps.is_empty()
+        && env.headers.is_empty()
+        && env.padding_max == 0
     {
         // No envelope declared — raw frame, legacy behaviour.
         return (StatusCode::OK, body_bytes(frame)).into_response();

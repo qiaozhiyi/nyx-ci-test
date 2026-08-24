@@ -66,7 +66,9 @@ fn padding_of(profile: &Profile) -> (usize, usize) {
             .option(key)
             .and_then(|s| s.as_str().parse::<usize>().ok())
     };
-    let max = parse("padding_max").unwrap_or(0).min(transform::PAD_LEN_CAP);
+    let max = parse("padding_max")
+        .unwrap_or(0)
+        .min(transform::PAD_LEN_CAP);
     let min = parse("padding_min").unwrap_or(0).min(max);
     (min, max)
 }

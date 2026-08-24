@@ -230,10 +230,8 @@ impl SessionStore {
             }
             // v3 → v4: operator ownership of a session. `DEFAULT NULL`
             // backfills existing rows as unowned. Column-gated like v3.
-            if current < 4 {
-                if !column_exists(&tx, "sessions", "owner")? {
-                    tx.execute("ALTER TABLE sessions ADD COLUMN owner TEXT", [])?;
-                }
+            if current < 4 && !column_exists(&tx, "sessions", "owner")? {
+                tx.execute("ALTER TABLE sessions ADD COLUMN owner TEXT", [])?;
             }
             tx.execute(
                 "UPDATE _sessions_schema_version SET version = ?1;",
