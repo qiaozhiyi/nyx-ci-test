@@ -1039,6 +1039,7 @@ fn router_api_routes(state: &AppState) -> Router<Arc<AppState>> {
                 "/api/kernel/detach-minifilter",
                 post(kernel::detach_minifilter),
             )
+            .route("/api/kernel/window", post(kernel::window))
     } else {
         api_routes
     }

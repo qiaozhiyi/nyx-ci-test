@@ -306,10 +306,11 @@ trex                    T-REX EDR 评估分级
 
 # 子命令: bootstrap / blind-etw / hide <pid> / dump-lsass <pid> \
 #         neutralize <pid> <freeze|choke|kill> / detach-minifilter \
+#         window-open [pid] / window-close / window --phase open|close \
 #         pg-window / cfg-bypass / forge-etw / --serve <port>(daemon 模式)
 ```
 
-`--serve <port>` 启动 TCP JSON-line daemon(每连接独立线程,单行 ≤ 16 KiB,60 ops/min 限速),team server 设 `NYX_KERNEL_DAEMON=127.0.0.1:<port>` 后会注册 `/api/kernel/{status,blind-etw,hide,dump-lsass,neutralize,detach-minifilter}` 6 个路由。daemon 要求 `NYX_DAEMON_TOKEN`(缺省 exit 7),每连接首行必须 `auth <token>`(答 `{"ok":true}`);server bridge 侧以 `NYX_KERNEL_DAEMON_TOKEN` 镜像该密钥(`server/src/kernel.rs:32`),`neutralize` op 带 `method: freeze|choke|kill`。
+`--serve <port>` 启动 TCP JSON-line daemon(每连接独立线程,单行 ≤ 16 KiB,60 ops/min 限速),team server 设 `NYX_KERNEL_DAEMON=127.0.0.1:<port>` 后会注册 `/api/kernel/{status,blind-etw,hide,dump-lsass,neutralize,detach-minifilter,window}` 路由。daemon 要求 `NYX_DAEMON_TOKEN`(缺省 exit 7),每连接首行必须 `auth <token>`(答 `{"ok":true}`);server bridge 侧以 `NYX_KERNEL_DAEMON_TOKEN` 镜像该密钥(`server/src/kernel.rs:32`),`neutralize` op 带 `method: freeze|choke|kill`。`POST /api/kernel/window` 以 `{phase:open|close, pid?}` 编排默认时间窗(open 失败即停:`blind-etw` → `neutralize` freeze → `detach-minifilter`;close 尽最大努力,无 undo 的 kit 诚实返回 `restored:false`)。植入体任务不会自动暂停,需操作员自行排序。WFP 不在默认窗内。
 
 ### 偏移自动解析
 
