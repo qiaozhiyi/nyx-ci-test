@@ -89,6 +89,10 @@ pub struct Config {
     pub tcp_peer_host: String,
     /// TCP pivot peer port. 0 = not configured.
     pub tcp_peer_port: u16,
+    /// Per-implant traffic-timing override (L4, optional tail byte).
+    /// 0 = inherit bake (`NYX_PROFILE` `timing_baseline`, default uniform),
+    /// 1 = uniform, 2 = bursty. A missing tail byte decodes as 0.
+    pub timing_baseline: u8,
 }
 
 mod baked {
@@ -182,6 +186,7 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
         proxy_server,
         tcp_peer_host,
         tcp_peer_port,
+        timing_baseline,
     ) = decode_extended_tail(&mut r)?;
     Ok(Config {
         server_host,
@@ -202,11 +207,12 @@ pub fn decode(blob: &[u8]) -> Result<Config, WireError> {
         proxy_server,
         tcp_peer_host,
         tcp_peer_port,
+        timing_baseline,
     })
 }
 
 /// Channel-dispatcher tail fields (spec-1 + spec-7 HTTP + spec-3 raw pivot
-/// layers), in wire order — see `decode_extended_tail_present`.
+/// + L4 timing_baseline), in wire order — see `decode_extended_tail_present`.
 type ExtendedTail = (
     u8,
     u8,
@@ -219,6 +225,7 @@ type ExtendedTail = (
     String,
     String,
     u16,
+    u8,
 );
 
 /// Parse the channel-dispatcher tail of the blob, defaulting to Https-only
@@ -249,6 +256,7 @@ fn decode_extended_tail(r: &mut Reader) -> Result<ExtendedTail, WireError> {
             String::new(),
             String::new(),
             0,
+            0,
         ))
     }
 }
@@ -263,17 +271,21 @@ fn decode_extended_tail_present(r: &mut Reader) -> Result<ExtendedTail, WireErro
     let extc2_api_host = r.str()?;
     let extc2_token = r.str()?;
     // spec-7 HTTP enhancement fields — further backward compat layer.
-    let (rotation_hosts, fronting_host, proxy_server) = if r.remaining() > 0 {
+    // `remaining() > 1` (not `> 0`): a single leftover byte is the L4
+    // `timing_baseline` u8, not a truncated spec-7 string (min 4 bytes).
+    let (rotation_hosts, fronting_host, proxy_server) = if r.remaining() > 1 {
         (r.str()?, r.str()?, r.str()?)
     } else {
         (String::new(), String::new(), String::new())
     };
     // spec-3 raw pivot fields — further backward compat layer.
-    let (tcp_peer_host, tcp_peer_port) = if r.remaining() > 0 {
+    let (tcp_peer_host, tcp_peer_port) = if r.remaining() > 1 {
         (r.str()?, r.u16()?)
     } else {
         (String::new(), 0)
     };
+    // L4 optional tail: missing byte = 0 inherit (bake / default uniform).
+    let timing_baseline = if r.remaining() > 0 { r.u8()? } else { 0 };
     Ok((
         primary_channel,
         fallback_bitmap,
@@ -286,5 +298,6 @@ fn decode_extended_tail_present(r: &mut Reader) -> Result<ExtendedTail, WireErro
         proxy_server,
         tcp_peer_host,
         tcp_peer_port,
+        timing_baseline,
     ))
 }

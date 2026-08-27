@@ -130,6 +130,8 @@ export interface GenerateRequest {
   // bitmap bit N = channel enum N (0 = build-time default chain).
   primary_channel?: number;
   fallback_bitmap?: number;
+  // L4 timing override: 0 = inherit bake, 1 = uniform, 2 = bursty.
+  timing_baseline?: number;
 }
 
 export interface GenerateResponse {

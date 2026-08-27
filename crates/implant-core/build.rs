@@ -134,6 +134,9 @@ fn bake_config() {
     // Raw pivot fields (spec-3):
     write_str(&mut blob, cfg.tcp_peer_host.as_bytes());
     write_u16(&mut blob, cfg.tcp_peer_port);
+    // L4 timing_baseline is an optional trailing u8 (0 = inherit bake).
+    // Compile-time configs omit it so the implant uses TIMING_BASELINE_BURSTY
+    // from NYX_PROFILE; generate-implant writes the byte per-implant.
 
     let out_dir = env::var("OUT_DIR").unwrap();
 

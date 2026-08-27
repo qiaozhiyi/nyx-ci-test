@@ -177,6 +177,7 @@ fn load_runtime_config_build_cfg(
         proxy_server,
         tcp_peer_host,
         tcp_peer_port,
+        timing_baseline,
     ) = channel_tail;
     nyx_implant_core::config::Config {
         server_host,
@@ -197,6 +198,7 @@ fn load_runtime_config_build_cfg(
         proxy_server,
         tcp_peer_host,
         tcp_peer_port,
+        timing_baseline,
     }
 }
 
@@ -419,7 +421,8 @@ fn load_runtime_config_kill_date(r: &mut Reader) -> Option<u64> {
 /// `[primary_channel u8][fallback_bitmap u8][doh_resolver str]
 /// [smb_pipe_name str][extc2_api_host str][extc2_token str]
 /// [rotation_hosts str][fronting_host str][proxy_server str]
-/// [tcp_peer_host str][tcp_peer_port u16]`.
+/// [tcp_peer_host str][tcp_peer_port u16][timing_baseline u8]`.
+/// `timing_baseline` is the L4 optional tail (missing byte = 0 inherit).
 type ChannelTail = (
     u8,
     u8,
@@ -432,6 +435,7 @@ type ChannelTail = (
     nyx_implant_core::heap::String,
     nyx_implant_core::heap::String,
     u16,
+    u8,
 );
 
 /// Parse the channel-dispatcher tail (spec-1). Old server-generated configs
@@ -453,6 +457,7 @@ fn load_runtime_config_parse_tail(r: &mut Reader) -> Option<ChannelTail> {
             nyx_implant_core::heap::String::new(),
             nyx_implant_core::heap::String::new(),
             0u16,
+            0u8,
         ))
     }
 }
@@ -467,7 +472,9 @@ fn load_runtime_config_parse_tail_present(r: &mut Reader) -> Option<ChannelTail>
     let eh = r.str().ok()?;
     let et = r.str().ok()?;
     // spec-7 HTTP enhancement fields — further backward compat layer.
-    let (rh, fh, ps) = if r.remaining() > 0 {
+    // `remaining() > 1` (not `> 0`): a single leftover byte is the L4
+    // `timing_baseline` u8, not a truncated spec-7 string (min 4 bytes).
+    let (rh, fh, ps) = if r.remaining() > 1 {
         (r.str().ok()?, r.str().ok()?, r.str().ok()?)
     } else {
         (
@@ -477,11 +484,13 @@ fn load_runtime_config_parse_tail_present(r: &mut Reader) -> Option<ChannelTail>
         )
     };
     // spec-3 raw pivot fields — further backward compat layer.
-    let (tcp_peer_host, tcp_peer_port) = if r.remaining() > 0 {
+    let (tcp_peer_host, tcp_peer_port) = if r.remaining() > 1 {
         (r.str().ok()?, r.u16().ok()?)
     } else {
         (nyx_implant_core::heap::String::new(), 0u16)
     };
+    // L4 optional tail: missing byte = 0 inherit (bake / default uniform).
+    let timing_baseline = if r.remaining() > 0 { r.u8().ok()? } else { 0 };
     Some((
         pc,
         fb,
@@ -494,6 +503,7 @@ fn load_runtime_config_parse_tail_present(r: &mut Reader) -> Option<ChannelTail>
         ps,
         tcp_peer_host,
         tcp_peer_port,
+        timing_baseline,
     ))
 }
 
