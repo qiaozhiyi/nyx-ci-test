@@ -161,6 +161,18 @@ cargo run --release -p nyx-agent-dev
 
 `agent-dev` 跑完整加密协议循环(check-in / task / execute / return),Windows-only 原语(StealToken/Inject/Trex/Keylog 等)返回 `Response::Err`。
 
+可选 Malleable C2 stealth profile（padding + `timing_baseline "bursty"`）。**未设 `NYX_PROFILE` 时不自动加载**（默认 `padding_max==0` wire 不变）。server 与 agent-dev 读同一路径：
+
+```bash
+NYX_PROFILE=profiles/stealth.profile \
+cargo run --release -p nyx-server
+
+NYX_PROFILE=profiles/stealth.profile \
+NYX_SERVER=http://127.0.0.1:8443 \
+NYX_SERVER_PUB=<服务器输出的公钥 hex> \
+cargo run --release -p nyx-agent-dev
+```
+
 ### 3. 构建 Windows PIC 植入体
 
 > ⚠️ **implant-win 是独立 crate,不在 workspace 里。** 必须在它的目录内构建,不能用 `-p nyx-implant-win`。
@@ -221,7 +233,7 @@ curl -X POST http://127.0.0.1:8443/api/generate-implant \
 | `NYX_KILLDATE` | —(永不过期) | Unix 时间戳,过期拒绝所有 beacon(`main.rs:44-59`);implant 生成侧 kill-date 严格校验(ISO 8601/`YYYY-MM-DD`,闰年+当月天数+年≥1970+checked 算术,`implant_gen.rs:258-268,340-374`) |
 | `NYX_TLS` | off | 任意值启用 rustls HTTPS |
 | `NYX_CERT` / `NYX_KEY` | — | PEM 证书/密钥(需同时设) |
-| `NYX_PROFILE` | — | Malleable C2 profile(c2lint 在加载时验证) |
+| `NYX_PROFILE` | — | Malleable C2 profile(c2lint 在加载时验证)。红队可用 `NYX_PROFILE=profiles/stealth.profile`（padding + bursty）；**未设则不加载** |
 | `NYX_SCRIPT` | — | Rhai 事件脚本(`on_session_new` / `on_result` / `on_session_exit`) |
 | `NYX_CREDS` | `~/.nyx/server-creds.db` | 凭据+implant+session SQLite 路径 |
 | `NYX_AUDIT_LOG` | `~/.nyx/audit.jsonl` | 审计日志(哈希链,`audit.rs:106-261`) |

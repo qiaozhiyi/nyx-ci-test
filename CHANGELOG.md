@@ -12,6 +12,10 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-28 用户态 stealth Malleable profile：
+
+- **`profiles/stealth.profile`**：checked-in 操作员模板，含 `sleeptime`/`jitter`、`padding_min/max`（64–512，≤4096）、`timing_baseline "bursty"`、可 invert 的 http-post `base64; print;` 信封、真实浏览器 UA 池（默认 Chrome/131，非 `Mozilla/4.0 Nyx`）。`c2lint` 0 Error / 0 Warning。`NYX_PROFILE=profiles/stealth.profile` 同时给 server 与 agent-dev；**未设 env 不自动加载**（默认 `padding_max==0` wire 不变）。`nyx-profile` 测试 `lint(parse(stealth.profile))` 无 Error 且 envelope invert。
+
 2026-08-28 implant 内存/注入 stealth（VAD R1–R3 + Pool Party 0x5）：
 
 - **R3 RWX→RX**：`threadless_inject_alloc` 与 Pool Party stub/section 视图改为 alloc/map RW → 写 → `NtProtectVirtualMemory` / 目标视图 `PAGE_EXECUTE_READ`（0x20）。protect 失败则 Err，不以 RWX 为稳态。FLS 路径未改。
