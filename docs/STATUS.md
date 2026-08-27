@@ -1,6 +1,6 @@
 # Nyx 当前状态
 
-**更新日期：** 2026-08-24  
+**更新日期：** 2026-08-28  
 **用途：** 本文件是项目能力状态和整改进度的入口；遇到旧报告或 README 表述冲突时，以当前代码、CI 结果和本文件链接的审计记录为准。
 
 ## 能力状态口径
@@ -50,6 +50,8 @@
 17. **零成本 hosted 验证波次（2026-08-24，仅免费 GitHub hosted runner，无真机无花费）** — 新 workflow `windows-hosted-verify.yml`（手动 + 周定时，私有仓免费额度）：(a) **WP-B 矩阵首轮实测自动化**——`edr-matrix` job 反开 Defender 实时保护（开不起来如实记 `env_limit=Defender 已关闭`），5 个 hosted 可跑技术经控制台探针逐个触发 + `Get-MpThreatDetection` 差值计告警，CSV 逐列对齐 `edr-quant-matrix.md` §1.1，artifact 90 天；**hosted runner 为原生 x64，矩阵行 `env_limit=无`**，比 ARM64 VM 口径更强；threadless/fluctuation 无导出可驱保持待实测。(b) **WP-H sideload 投递链真 loader 实测**——named + ordinal-only 两阶段（fixture `tools/sideload-proxy/fixture/`），本地 wine64 预冒烟双 PASS（含一次 wine builtin 优先导致的假警报排查，机制经最小 DllMain 探针证伪非生成器缺陷）。(c) **WP-E 遗留关闭**——ci.yml impersonation job 增跑 `blocking_probe_*` live JA3（server extc2 出站路径）。(d) `deviceguard-probe` 探测免费镜像 HVCI 状态（信息性）。遗留：workflow 首跑数据回填矩阵 §3；MDE 评估实验室/第三方免费 EDR 注册实测（调研文档 §3）。
 
 16. **前沿对标差距改进八工作包（2026-08-21，依据 [前沿对标差距分析报告](research/frontier_gap_analysis_2026-08-21.md)，P0–P3 全覆盖）** — (WP-A) **FLS 回调注入原语**实装为 `inject method 3`（`implant-tasks/src/fls.rs`；勘察实证 PEB `FlsCallback` 偏移自 Win10 1903 起移除，改走版本无关的远程 `FlsAlloc` 注册 + stub 触发线程退出 rundown 路径；wine64 25 全绿，真机待验）；(WP-B) **"技术 × EDR × 告警量"量化框架**落地（`docs/testing/edr-quant-matrix.md` 11 列 schema + `scripts/edr_matrix_record.sh` 单技术告警差值采集，7 技术 × Defender 首版矩阵待 VM 实测）；(WP-C) **流量元数据整形**：profile 新维度 `padding_min/max`（自定界 padding，invert 可剥离，后向兼容）+ `timing_baseline`（agent-dev 突发节奏），c2lint 增 4 项元数据检查；(WP-D) 见第 15 条；(WP-E) **TLS emitter 接 server extc2 出站**（`NYX_EXTC2_IMPERSONATE` + `--features impersonation` 可选启用，hermetic 默认构建不破，第 22 行表述已修正）；(WP-F) **VAD 一致性离线分析**（`docs/research/vad-consistency-analysis.md`：stomp 哈希 IOC 暴露最高、threadless/pool_party RWX 常驻、实装建议 R1-R6）；(WP-G) **载荷多态生成**：管线勘察定论（预编译模板+生成期补丁）+ `docs/design/NYX_POLYMORPHISM_DESIGN.md` L1-L4 路线图 + 第一增量（`.nyx_cfg` 死区随机化 + 随机 PE overlay，同请求两次生成哈希必异）；(WP-H) **sideloading 投递链**（`docs/design/SIDELOADING_DELIVERY.md` + `tools/sideload-proxy` 代理 DLL 生成器，GNU ld .def 转发，mingw 交叉编译实测通过）。明细见 [CHANGELOG [Unreleased]](../CHANGELOG.md#unreleased)。
+
+18. **内核时间窗 T2 第一增量（2026-08-28）** — operator 发起、非 implant 信令：`POST /api/kernel/window`（Admin-only，与既有 kernel 路由同鉴权）body `{phase: open|close, pid?}`。open 失败即停（502 + `failed_step`）：`blind-etw` → `neutralize` method=`freeze`（既有 daemon op，不调用 kill）→ `detach-minifilter`；WFP 不在默认窗（AppId filter 过响）。close 按逆序尽最大努力：**三个 kit 均无 kernelsdk undo**（ETW-TI 无 unblind、MiniFilter unlink 自环无 relink、freeze 无解冻），诚实返回 `restored: false, reason: "no undo op"`，不发明内核写。植入体任务**不会自动暂停**，需操作员自行排序 inject/hashdump。CLI：`nyx-kernel window-open [pid]` / `window-close` / daemon JSON `window-open`/`window-close`。无 kernel GUI 故未加按钮。验证：`nyx-server` 单测覆盖 plan 顺序 + fail-closed fold（不需真驱动）。明细见 [CHANGELOG [Unreleased]](../CHANGELOG.md#unreleased)。
 
 ## 近期发布门禁
 

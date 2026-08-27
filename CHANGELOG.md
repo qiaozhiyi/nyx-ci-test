@@ -25,6 +25,12 @@ this file and the code disagree, the code wins.
 - **PIC implant `timing_baseline=bursty`**：`implant-net/build.rs` 烘焙 `TIMING_BASELINE_BURSTY`（无 profile 为 false）；`bursty_delay(cycle, base)` 对齐 agent-dev `BURST_LEN=4`（秒级：in-burst = max(1, base/8)，quiet gap = base）。beacon `sleep_jitter` 在 bursty 时先选 base 再套 jitter_pct；`base==0` 仍 no-op；cycle 用 AtomicU32。
 - **L4 per-implant 覆盖**：`.nyx_cfg` spec-1 尾后一字节 u8（0 继承 bake / 1 uniform / 2 bursty）；缺字节 = 0。`GenerateRequest.timing_baseline` 未知值 HTTP 400；旧请求无字段 serde 默认 0。UI 生成表单 + invoke.ts 同 `fallback_bitmap` 模式。这是元数据整形，不声称 NDR bypass。
 
+2026-08-28 内核时间窗 T2 第一增量（operator 发起，非 implant 信令；蓝图 [`docs/bypass/EDR_BLINDNESS_UPGRADE_2026-07.md`](docs/bypass/EDR_BLINDNESS_UPGRADE_2026-07.md) §0.3 T2）：
+
+- **`POST /api/kernel/window`**（Admin-only，与既有 `/api/kernel/*` 同鉴权，仅 `NYX_KERNEL_DAEMON` 设时注册）：body `{ "phase": "open"|"close", "pid": optional u32 }`。open 失败即停（502 + `failed_step`，不继续后续 kit）：daemon `blind-etw` → `neutralize` method=`freeze`（既有 neutralize 路由语义，**不调用 kill**）→ `detach-minifilter`。WFP **不在**默认窗（AppId filter 过响）。close 逆序尽最大努力；当前三个 kit 均无 kernelsdk restore（ETW-TI 无 unblind、MiniFilter unlink 自环无 relink、freeze 无解冻），返回 per-step `restored: false, reason: "no undo op"`，不谎报 `ok: true`，不发明内核写。**植入体任务不会自动暂停**，操作员须自行排序 inject/hashdump。
+- **CLI / daemon**：`nyx-kernel window-open [pid]`、`window-close`、`window --phase open|close`；`--serve` JSON `{"op":"window-open","pid":N}` / `{"op":"window-close"}`，复用既有 kit 函数，无重复 IOCTL。
+- **测试**：server `window_plan` 顺序 + fail-closed fold（含 `ok:false` 视为失败、fold 不拉后续 kit）；CLI host 单测 plan/close JSON。不需真驱动。无 kernel GUI，跳过 UI。
+
 2026-08-24（续）hosted 波次首跑实证 + 八项修复（ci-test 公共镜像，run 32680867069/…60770/…60771/…60772）：
 
 - **首跑实证（零成本）**：(1) **WP-H sideload 真 loader 双阶段 PASS**（windows-latest：named 转发 + DllMain 触发 marker；ordinal-only `orddll_orig.#1` 转发解析返回 42）——WP-H 最大遗留关闭。(2) **WP-A FLS 真机 PASS 双确认**：windows-ci B4 硬门（exit 7）+ edr-matrix 行 100%。(3) **EDR 矩阵首版实测 5 行**：module_stomp/hwbp_blind/indirect_syscall/fls_callback 全 100%、0 告警；**pool_party 0.0%——exit 0x5（WARN 降级 method 2），原生 x64 Server 2025 上 pool party 未跑通**，首个真实平台差异数据点；Defender 实时保护在 Server 2025 镜像不可开（AMService on / RTP off，Set-MpPreference 无效），5 行如实记 `env_limit=Defender 已关闭`——功能结果，非检测结果。(4) **deviceguard-probe：windows-2022 与 windows-latest 均 VBS=2 运行但 HVCI=False**——免费层无 HVCI-on 环境实锤，HVCI 矩阵维持环境阻塞（现有决策不变，证据补齐）。

