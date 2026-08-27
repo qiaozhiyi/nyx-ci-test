@@ -45,6 +45,8 @@ md-5 = "0.10"
 # The `validate_ja3_live_*` ignored test is async and needs a runtime. tokio is
 # already a workspace dependency; pull it in single-threaded for tests.
 tokio = { workspace = true }
+# CS profile parser for jitter_ms passthrough tests (not a runtime dep).
+nyx-profile = { workspace = true }
 
 [lib]
 name = "nyx_transport"

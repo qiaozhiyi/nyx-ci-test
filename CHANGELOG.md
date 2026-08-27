@@ -12,6 +12,12 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-28 流量元数据整形收尾 + L4 per-implant 时序（WP-C leftover + `NYX_POLYMORPHISM_DESIGN.md` L4）：
+
+- **malleable.rs `jitter_ms` 透传**：`MalleableProfile` 增 `jitter_base_ms`，从 CS profile 的 `sleeptime`/`jitter`/`timing_baseline` 映射（`cs_timing_to_jitter`）；缺 timing 时 `jitter_ms()==0`（默认 cadence 不变）；有 jitter/`timing_baseline` 时非零。预构建 profile 的 `jitter_base_ms=0` + 非零 pct 仍走历史 100ms ± pct。nyx-profile 仅 test 依赖，默认构建不启用 impersonation。
+- **PIC implant `timing_baseline=bursty`**：`implant-net/build.rs` 烘焙 `TIMING_BASELINE_BURSTY`（无 profile 为 false）；`bursty_delay(cycle, base)` 对齐 agent-dev `BURST_LEN=4`（秒级：in-burst = max(1, base/8)，quiet gap = base）。beacon `sleep_jitter` 在 bursty 时先选 base 再套 jitter_pct；`base==0` 仍 no-op；cycle 用 AtomicU32。
+- **L4 per-implant 覆盖**：`.nyx_cfg` spec-1 尾后一字节 u8（0 继承 bake / 1 uniform / 2 bursty）；缺字节 = 0。`GenerateRequest.timing_baseline` 未知值 HTTP 400；旧请求无字段 serde 默认 0。UI 生成表单 + invoke.ts 同 `fallback_bitmap` 模式。这是元数据整形，不声称 NDR bypass。
+
 2026-08-24（续）hosted 波次首跑实证 + 八项修复（ci-test 公共镜像，run 32680867069/…60770/…60771/…60772）：
 
 - **首跑实证（零成本）**：(1) **WP-H sideload 真 loader 双阶段 PASS**（windows-latest：named 转发 + DllMain 触发 marker；ordinal-only `orddll_orig.#1` 转发解析返回 42）——WP-H 最大遗留关闭。(2) **WP-A FLS 真机 PASS 双确认**：windows-ci B4 硬门（exit 7）+ edr-matrix 行 100%。(3) **EDR 矩阵首版实测 5 行**：module_stomp/hwbp_blind/indirect_syscall/fls_callback 全 100%、0 告警；**pool_party 0.0%——exit 0x5（WARN 降级 method 2），原生 x64 Server 2025 上 pool party 未跑通**，首个真实平台差异数据点；Defender 实时保护在 Server 2025 镜像不可开（AMService on / RTP off，Set-MpPreference 无效），5 行如实记 `env_limit=Defender 已关闭`——功能结果，非检测结果。(4) **deviceguard-probe：windows-2022 与 windows-latest 均 VBS=2 运行但 HVCI=False**——免费层无 HVCI-on 环境实锤，HVCI 矩阵维持环境阻塞（现有决策不变，证据补齐）。

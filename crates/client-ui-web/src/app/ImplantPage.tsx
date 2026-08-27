@@ -39,6 +39,7 @@ interface FormState {
   features: string;
   primary_channel: string;
   fallback_bitmap: string;
+  timing_baseline: string;
 }
 
 const DEFAULTS: FormState = {
@@ -55,6 +56,7 @@ const DEFAULTS: FormState = {
   features: '',
   primary_channel: '',
   fallback_bitmap: '',
+  timing_baseline: '',
 };
 
 /**
@@ -182,6 +184,8 @@ export function ImplantPage() {
     form.primary_channel.trim() === '' ? undefined : Number(form.primary_channel);
   const bitmapNum =
     form.fallback_bitmap.trim() === '' ? undefined : Number(form.fallback_bitmap);
+  const timingNum =
+    form.timing_baseline.trim() === '' ? undefined : Number(form.timing_baseline);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -211,6 +215,7 @@ export function ImplantPage() {
         features: Number.isFinite(featuresNum) ? featuresNum : undefined,
         primary_channel: Number.isFinite(primaryNum) ? primaryNum : undefined,
         fallback_bitmap: Number.isFinite(bitmapNum) ? bitmapNum : undefined,
+        timing_baseline: Number.isFinite(timingNum) ? timingNum : undefined,
         expires: form.expires.trim() || undefined,
         notes: form.notes.trim() || undefined,
         deliver: form.inline ? 'inline' : undefined,
@@ -449,6 +454,19 @@ export function ImplantPage() {
                   min={0}
                   max={255}
                   placeholder="0 = 默认链；bit N = 通道 N"
+                />
+              </label>
+
+              <label className="ip-field">
+                <span className="ip-label">timing_baseline</span>
+                <input
+                  type="number"
+                  className="ip-input mono"
+                  value={form.timing_baseline}
+                  onChange={onText('timing_baseline')}
+                  min={0}
+                  max={2}
+                  placeholder="0 = 继承 profile；1 = uniform；2 = bursty"
                 />
               </label>
             </div>

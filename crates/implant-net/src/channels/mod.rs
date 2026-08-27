@@ -702,6 +702,7 @@ mod tests {
             proxy_server: String::from("127.0.0.1:8080"),
             tcp_peer_host: String::from("10.0.0.5"),
             tcp_peer_port: 4444,
+            timing_baseline: 0,
         };
         let ctx = ChannelCtx::from_config(&cfg);
         assert_eq!(ctx.server_host, "c2.example.com");

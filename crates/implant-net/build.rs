@@ -23,6 +23,18 @@ fn main() {
     bake_envelopes();
 }
 
+/// Bake `TIMING_BASELINE_BURSTY` into `OUT_DIR/timing.rs` (host-includable,
+/// no implant-core heap types). Default false when `NYX_PROFILE` is unset.
+fn bake_timing(bursty: bool) {
+    let out_dir = env::var("OUT_DIR").unwrap();
+    let dest = Path::new(&out_dir).join("timing.rs");
+    fs::write(
+        &dest,
+        format!("pub const TIMING_BASELINE_BURSTY: bool = {bursty};\n"),
+    )
+    .unwrap();
+}
+
 // ---- malleable C2 envelopes (profile → baked Step/Terminator) -------------
 
 /// When `NYX_PROFILE` is set, parse it (host-side, full nyx-profile std) and
@@ -49,6 +61,7 @@ fn bake_envelopes() {
             let out_dir = env::var("OUT_DIR").unwrap();
             let dest = Path::new(&out_dir).join("envelopes.rs");
             fs::write(&dest, emit_envelopes_none()).unwrap();
+            bake_timing(false);
             return;
         }
     };
@@ -74,6 +87,7 @@ fn bake_envelopes() {
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest = Path::new(&out_dir).join("envelopes.rs");
     fs::write(&dest, emit_envelopes(&profile)).unwrap();
+    bake_timing(profile.timing_baseline() == nyx_profile::TimingBaseline::Bursty);
 }
 
 /// Emit the resolved http-post client (request) + server (response) envelopes.
