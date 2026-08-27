@@ -12,11 +12,16 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-28 WFP kit hosted Server 2025 `blocked=false`：
+
+- **根因（代码）**：`FwpmFilter0` 把 `sublayer_key` 置 `GUID_NULL`（默认 UNIVERSAL 子层）且 `weight_type=FWP_EMPTY` 自动权重（`netsec.rs` `block_outbound_app_id`）。hosted Server 2025 默认子层有高权重 loopback PERMIT（AppContainerLoopback / `IsLoopback`），可压过 AppId BLOCK；自测只连 `127.0.0.1`，于是 filter 已装仍 `blocked=false`。同 build 26100 的 ARM64 VM 无该 PERMIT 仲裁所以通过。另：`silence_edr` 在无 admin / BFE 停时也 JSON 写 `blocked=false`，把环境限制记成产品失败。
+- **修复**：DYNAMIC 会话不变、filter 仍名 "NyxWfpKit"。新增自有子层（`NyxWfpSub`，weight `0xFFFF`）+ filter `FWP_UINT8` 权重 15，BLOCK 不再与 UNIVERSAL loopback PERMIT 同层仲裁。`FwpmEngineOpen0`/`FwpmFilterAdd0`/`FwpmSubLayerAdd0` 的 5/1058/1722/1753 等 DWORD/HRESULT 归 `env_limit:`；`wfp-selftest` 遇 env_limit 打 `note=env_limit:…` 退出 6（workflow skip，不当 `blocked=false` 产品失败），filter 已装但未拦仍 exit 3，并打印 session_flags / AppId blob 长度 / idle 镜像 vs 探针副本 `path_match`。kernelsdk 增 skip-vs-fail + 路径归一化宿主测试。**hosted Server 2025 复跑仍待确认 loopback 现可 `blocked=true`。**
+
 2026-08-24（续）hosted 波次首跑实证 + 八项修复（ci-test 公共镜像，run 32680867069/…60770/…60771/…60772）：
 
 - **首跑实证（零成本）**：(1) **WP-H sideload 真 loader 双阶段 PASS**（windows-latest：named 转发 + DllMain 触发 marker；ordinal-only `orddll_orig.#1` 转发解析返回 42）——WP-H 最大遗留关闭。(2) **WP-A FLS 真机 PASS 双确认**：windows-ci B4 硬门（exit 7）+ edr-matrix 行 100%。(3) **EDR 矩阵首版实测 5 行**：module_stomp/hwbp_blind/indirect_syscall/fls_callback 全 100%、0 告警；**pool_party 0.0%——exit 0x5（WARN 降级 method 2），原生 x64 Server 2025 上 pool party 未跑通**，首个真实平台差异数据点；Defender 实时保护在 Server 2025 镜像不可开（AMService on / RTP off，Set-MpPreference 无效），5 行如实记 `env_limit=Defender 已关闭`——功能结果，非检测结果。(4) **deviceguard-probe：windows-2022 与 windows-latest 均 VBS=2 运行但 HVCI=False**——免费层无 HVCI-on 环境实锤，HVCI 矩阵维持环境阻塞（现有决策不变，证据补齐）。
 - **八项修复**：(a) cargo fmt 三处（08-21 波次未过 fmt 门）；(b) clippy `collapsible_if`（session_store.rs v3→v4 迁移臂）；(c) **kernelsdk 危险测试修复**：`edr_neutralizer_kill_finds_eprocess` 的 Windows 臂对硬编码 pid 100 做真 `OpenProcess(PROCESS_TERMINATE)`——CI runner 上 access denied（失败形态），本机若可开则**真的会杀宿主进程**；改走 K2 `kill_with` 缝注入 stub（断言目标本就是 pid→EPROCESS 链表遍历）；(d) blocklist-gate **A5 精确化**：政策 10.0.29545.0 实锤含 `ALSysIO.sys`（≤2.0.10.x，hash 01af9b2e…，32 位名兄弟条目，08-16 离线断言漏检）但**不含**出货的 `ALSysIO64.sys` v2.0.8.0（文件名+哈希均异）——名称检查收紧为 `alsysio64` 精确匹配，兄弟条目降为 ::warning 级 family watch；顺带修复 A1/A5 `[+] ABSENT` 无条件打印（失败时日志仍显示绿色假象）；(e) ci.yml Qiling job 补 nightly `rustfmt`/`clippy` 组件（macos 镜像不再默认携带）；(f) JA3 live 两步加 3 次重试（peet.ws 连接抖动，本地实测 200 可达）；(g) WFP selftest 增 live 诊断（guard 存活期 dump 过滤器表 + 探针镜像路径——动态会话退出即清，workflow 级 post-mortem 看不到）；(h) **fallback_bitmap server 下发闭环**：GenerateRequest 增 `primary_channel`(0-8 校验 400)/`fallback_bitmap`，`build_implant_config` 无条件写 spec-1 尾段（空通道参数串，implant 解码与缺省等价），UI 生成表单两字段 + invoke.ts 类型；3 个新 wire 测试（尾段携带/缺省语义/越界拒绝）。验证：server 85+4+13 / store 41 / kernelsdk 184 host / clippy `-D warnings` / fmt / UI build 全绿，kernelsdk+kernel-cli windows-gnu target check 0 告警。
-- **待回**：WFP kit 在 hosted Server 2025 x64 首跑 `blocked=false`（同 build 26100 的 ARM64 VM 通过）——live 诊断已部署，根因待复跑数据；若证实 hosted 环境差异，按 env_limit 口径记录而非产品失败。MDE 评估实验室/第三方 EDR 注册实测仍按调研文档 §3 另行推进。
+- **待回**：WFP kit hosted Server 2025 x64 首跑 `blocked=false` 已按 2026-08-28 条目修 skip-vs-fail + 子层权重，**复跑仍待确认** `blocked=true`。MDE 评估实验室/第三方 EDR 注册实测仍按调研文档 §3 另行推进。
 
 2026-08-24 零成本 hosted 验证波次（依据 [免费测试资源调研](docs/testing/free-test-resources-2026-08-21.md) §4 落地建议 1/2/4；私有仓免费额度，Windows 2x 倍率，手动 + 周一定时触发控制消耗）：
 
