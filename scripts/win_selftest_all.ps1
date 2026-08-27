@@ -48,7 +48,10 @@ $EXPECTED_CODES = @{
     "nyx_selftest_pivot"          = $null   # needs closed port — host-dependent
     "nyx_selftest_inject"         = $null   # depends on sacrificial spawn success
     "nyx_selftest_inject_fls"     = $null   # 0x7 pass (native x64) / 0xB = Prism env-skip (bit3 flag, 2026-08-24)
-    "nyx_selftest_inject_pool"    = $null   # 0x7 pass / 0x5 WARN-degrade / 0x1 = pool party Err (see %TEMP%\nyx_g6_inject_pool.resp)
+    "nyx_selftest_inject_pool"    = $null   # 0x7 pass / 0x5 WARN-degrade / 0x9 env-skip (no worker factory / OpenProcess) / 0x1 = pool party Err
+    "nyx_selftest_vad"            = $null   # 0x7 pass (walk + image RX + scratch leftover gone)
+    "nyx_selftest_inject_threadless" = $null # 0x7 pass (spawn + alloc/write/RX + cleanup); safe prefix, no RIP hijack
+    "nyx_selftest_fluctuation"    = $null   # 0x7 pass (scratch NOACCESS→RX); never flips implant .text
     "nyx_selftest_resolve_forwarder" = 7    # bits 0-2
     "nyx_selftest_task_guard"     = 7       # bits 0-2: round-trip/crash-recovery/re-arm (bit3 = env-skip flag)
     "nyx_selftest_syscall_rt"     = 3       # bits 0-1

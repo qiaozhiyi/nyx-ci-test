@@ -12,6 +12,13 @@ this file and the code disagree, the code wins.
 
 ## [Unreleased]
 
+2026-08-28 implant 内存/注入 stealth（VAD R1–R3 + Pool Party 0x5）：
+
+- **R3 RWX→RX**：`threadless_inject_alloc` 与 Pool Party stub/section 视图改为 alloc/map RW → 写 → `NtProtectVirtualMemory` / 目标视图 `PAGE_EXECUTE_READ`（0x20）。protect 失败则 Err，不以 RWX 为稳态。FLS 路径未改。
+- **R2 stomp 掩护 DLL 池**：`xpsservices.dll` → `colorui.dll` → `dpx.dll` → `cryptui.dll`（均微软签名、System32、冷门；排除 mshtml）。按 LoadLibrary 成功且远程 `.text` vsize ≥ payload 选用；全部失败返回最后一条 COVER_LOAD_FAIL / COVER_TOO_SMALL。
+- **R1 VAD 自检**：新模块 `vad.rs`（VirtualQuery 枚举 + Image/Mapped/Private 分类 + PEB/`K32GetMappedFileNameW` 背靠名）。导出 `nyx_selftest_vad`（bit0 走查 / bit1 Image RX / bit2 scratch RX 释放无残留）。补齐 `nyx_selftest_inject_threadless`（安全前缀，1 字节 `ret`，不 RIP 劫持）与 `nyx_selftest_fluctuation`（scratch 页 NOACCESS→RX，不翻 implant `.text`）。
+- **Pool Party 0x5**：hosted 出口 0x5 是自测 bitmask（spawn + WARN 降级），不是产品伪造成功。根因：(1) `SYSTEM_HANDLE_INFORMATION_EX` Handles[] 在 x64 从 **0x10** 起（Reserved @0x08），旧解析 0x08 得到 0 candidates；(2) 未部署 sleeper 时 notepad 可能没有 worker factory / OpenProcess GLE=5。修复句柄表偏移并在无 worker factory / OpenProcess 失败时置 **bit3 skip（0x9）**，与 0x5 WARN-fail 区分。不把 0x9 记为成功。
+
 2026-08-24（续）hosted 波次首跑实证 + 八项修复（ci-test 公共镜像，run 32680867069/…60770/…60771/…60772）：
 
 - **首跑实证（零成本）**：(1) **WP-H sideload 真 loader 双阶段 PASS**（windows-latest：named 转发 + DllMain 触发 marker；ordinal-only `orddll_orig.#1` 转发解析返回 42）——WP-H 最大遗留关闭。(2) **WP-A FLS 真机 PASS 双确认**：windows-ci B4 硬门（exit 7）+ edr-matrix 行 100%。(3) **EDR 矩阵首版实测 5 行**：module_stomp/hwbp_blind/indirect_syscall/fls_callback 全 100%、0 告警；**pool_party 0.0%——exit 0x5（WARN 降级 method 2），原生 x64 Server 2025 上 pool party 未跑通**，首个真实平台差异数据点；Defender 实时保护在 Server 2025 镜像不可开（AMService on / RTP off，Set-MpPreference 无效），5 行如实记 `env_limit=Defender 已关闭`——功能结果，非检测结果。(4) **deviceguard-probe：windows-2022 与 windows-latest 均 VBS=2 运行但 HVCI=False**——免费层无 HVCI-on 环境实锤，HVCI 矩阵维持环境阻塞（现有决策不变，证据补齐）。

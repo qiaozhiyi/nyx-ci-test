@@ -123,9 +123,11 @@ jobs:
 
       # Pass masks (scripts/win_selftest_all.ps1 2026-08-24 comments +
       # selftests.rs): armed=0xF, pool=0x7 (0x5 = WARN-degraded to method 2,
-      # recorded as pool_party FAILURE per edr-quant-matrix.md §5), fls=0x7,
-      # hwbp=0xFF, syscall_rt=0b11. Hosted runner is native x64 Server 2025 —
-      # the Prism env-skip codes (0xB/0x1D/0xC1) must NOT appear here.
+      # recorded as pool_party FAILURE per edr-quant-matrix.md §5; 0x9 =
+      # env skip — no worker factory / OpenProcess, NOT a pass and NOT 0x5),
+      # fls=0x7, hwbp=0xFF, syscall_rt=0b11. Hosted runner is native x64
+      # Server 2025 — the Prism env-skip codes (0xB/0x1D/0xC1) must NOT
+      # appear here.
       - name: Run matrix (5 techniques, alert delta each)
         shell: pwsh
         run: |

