@@ -786,19 +786,44 @@ fn wfp_probe_connect(addr: &str) -> i32 {
 /// Requires admin (FwpmEngineOpen0 → BFE). No driver / no bootstrap needed.
 ///
 /// Exit codes: 0 pass · 2 baseline broken (harness fault, NOT the kit) ·
-/// 3 filter did not block · 4 residue after drop · 5 operational error.
+/// 3 filter did not block · 4 residue after drop · 5 operational error ·
+/// 6 env skip (no admin / BFE down — `note` starts with `env_limit:`, not a
+/// product failure).
 /// Prints ONE machine-readable line: {"wfp_selftest":{...}} on stdout.
 #[cfg(target_os = "windows")]
 fn op_wfp_selftest() -> i32 {
+    use nyx_operator_kernelsdk::netsec::{
+        wfp_error_is_env_limit, wfp_image_paths_equal, WFP_SESSION_FLAG_DYNAMIC,
+    };
     use nyx_operator_kernelsdk::WfpKit;
     use std::io::Write;
     use std::net::TcpListener;
     use std::process::{Command, Stdio};
 
-    let json = |baseline: bool, blocked: bool, restored: bool, filters: usize, note: &str| {
+    let json_escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let json = |baseline: bool,
+                blocked: bool,
+                restored: bool,
+                filters: usize,
+                note: &str,
+                session_flags: u32,
+                app_id_blob_len: u32,
+                path_match: bool| {
+        let env = match note.strip_prefix("env_limit:") {
+            Some(rest) => format!("\"{}\"", json_escape(rest)),
+            None => "null".into(),
+        };
         println!(
-            r#"{{"wfp_selftest":{{"baseline":{},"blocked":{},"restored":{},"filters":{},"note":"{}"}}}}"#,
-            baseline, blocked, restored, filters, note
+            r#"{{"wfp_selftest":{{"baseline":{},"blocked":{},"restored":{},"filters":{},"note":"{}","env_limit":{},"session_flags":{},"app_id_blob_len":{},"path_match":{}}}}}"#,
+            baseline,
+            blocked,
+            restored,
+            filters,
+            json_escape(note),
+            env,
+            session_flags,
+            app_id_blob_len,
+            path_match
         );
         std::io::stdout().flush().ok();
     };
@@ -808,14 +833,14 @@ fn op_wfp_selftest() -> i32 {
         Ok(p) => p,
         Err(e) => {
             eprintln!("[!] current_exe: {e}");
-            json(false, false, false, 0, "current_exe failed");
+            json(false, false, false, 0, "current_exe failed", 0, 0, false);
             return 5;
         }
     };
     let probe = std::env::temp_dir().join(format!("nyx_wfp_probe_{}.exe", std::process::id()));
     if let Err(e) = std::fs::copy(&own, &probe) {
         eprintln!("[!] copy self to {}: {e}", probe.display());
-        json(false, false, false, 0, "probe copy failed");
+        json(false, false, false, 0, "probe copy failed", 0, 0, false);
         return 5;
     }
     let cleanup = |probe: &std::path::Path| {
@@ -827,7 +852,7 @@ fn op_wfp_selftest() -> i32 {
         Err(e) => {
             eprintln!("[!] bind loopback: {e}");
             cleanup(&probe);
-            json(false, false, false, 0, "listener bind failed");
+            json(false, false, false, 0, "listener bind failed", 0, 0, false);
             return 5;
         }
     };
@@ -866,7 +891,16 @@ fn op_wfp_selftest() -> i32 {
     if !baseline {
         eprintln!("[!] wfp-selftest baseline connect failed — harness fault, not the kit");
         cleanup(&probe);
-        json(false, false, false, 0, "baseline connect failed");
+        json(
+            false,
+            false,
+            false,
+            0,
+            "baseline connect failed",
+            0,
+            0,
+            false,
+        );
         return 2;
     }
     eprintln!("[+] wfp-selftest baseline: loopback connect OK");
@@ -882,7 +916,7 @@ fn op_wfp_selftest() -> i32 {
         Err(e) => {
             eprintln!("[!] spawn idle probe: {e}");
             cleanup(&probe);
-            json(true, false, false, 0, "idle spawn failed");
+            json(true, false, false, 0, "idle spawn failed", 0, 0, false);
             return 5;
         }
     };
@@ -891,24 +925,68 @@ fn op_wfp_selftest() -> i32 {
     let guard = match kit.silence_edr(&[idle.id()]) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("[!] silence_edr failed: {e:?} (admin + BFE required)");
             let _ = idle.kill();
             cleanup(&probe);
-            json(true, false, false, 0, "silence_edr failed");
+            if let Some(why) = wfp_error_is_env_limit(&e) {
+                // Admin missing / BFE stopped: structured skip, NOT blocked=false
+                // as a product failure. ARM64 VM (WFP works) never takes this arm.
+                let note = format!("env_limit:{why}");
+                eprintln!("[!] wfp-selftest env_limit skip: {note}");
+                json(
+                    true,
+                    false,
+                    false,
+                    0,
+                    &note,
+                    WFP_SESSION_FLAG_DYNAMIC,
+                    0,
+                    false,
+                );
+                return 6;
+            }
+            eprintln!("[!] silence_edr failed: {e:?} (admin + BFE required)");
+            json(
+                true,
+                false,
+                false,
+                0,
+                "silence_edr failed",
+                WFP_SESSION_FLAG_DYNAMIC,
+                0,
+                false,
+            );
             return 5;
         }
     };
     let filters = guard.filter_count();
+    let session_flags = guard.session_flags();
+    let app_id_blob_len = guard.app_id_blob_lens().first().copied().unwrap_or(0);
+    let image_path = guard.image_paths().first().cloned().unwrap_or_default();
+    let probe_s = probe.to_string_lossy();
+    let path_match = wfp_image_paths_equal(&image_path, probe_s.as_ref());
     eprintln!(
-        "[+] wfp-selftest install: {filters} filter(s), ids {:?}",
+        "[+] wfp-selftest install: {filters} filter(s), ids {:?}, session_flags={session_flags:#x}, app_id_blob_len={app_id_blob_len}, path_match={path_match}",
         guard.filter_ids()
+    );
+    eprintln!(
+        "[+] wfp-selftest AppId image: {image_path}  probe copy: {}",
+        probe.display()
     );
     if filters != 1 {
         eprintln!("[!] expected exactly 1 filter, got {filters}");
         drop(guard);
         let _ = idle.kill();
         cleanup(&probe);
-        json(true, false, false, filters, "unexpected filter count");
+        json(
+            true,
+            false,
+            false,
+            filters,
+            "unexpected filter count",
+            session_flags,
+            app_id_blob_len,
+            path_match,
+        );
         return 5;
     }
 
@@ -920,10 +998,13 @@ fn op_wfp_selftest() -> i32 {
         // x64, blocked=false while the identical kit passes on Win11 26100
         // ARM64). The guard owns a DYNAMIC session — its filters vanish the
         // moment this process exits, so a workflow post-mortem would see an
-        // empty table. Dump the live filter list NOW and print the sections
-        // touching our probe image (AppId condition sanity: does the kernel
-        // see the same path we anchored?).
-        eprintln!("[!] wfp-selftest probe image: {}", probe.display());
+        // empty table. Dump the live filter list NOW plus AppId path equality
+        // (idle image vs connecting probe copy).
+        eprintln!("[!] wfp-selftest probe copy: {}", probe.display());
+        eprintln!("[!] wfp-selftest idle image: {image_path}");
+        eprintln!(
+            "[!] wfp-selftest path_match={path_match} session_flags={session_flags:#x} app_id_blob_len={app_id_blob_len} filters={filters}"
+        );
         if let Ok(out) = std::process::Command::new("netsh")
             .args(["wfp", "show", "filters", "file=-"])
             .output()
@@ -946,6 +1027,9 @@ fn op_wfp_selftest() -> i32 {
                     "[!] no live filter references the probe image — install matched nothing?"
                 );
             }
+            if !text.contains("NyxWfpKit") {
+                eprintln!("[!] no live filter named NyxWfpKit");
+            }
         }
         drop(guard);
         let _ = idle.kill();
@@ -956,6 +1040,9 @@ fn op_wfp_selftest() -> i32 {
             false,
             filters,
             "filter did not block probe image",
+            session_flags,
+            app_id_blob_len,
+            path_match,
         );
         return 3;
     }
@@ -970,7 +1057,16 @@ fn op_wfp_selftest() -> i32 {
     let _ = idle.kill();
     let _ = idle.wait();
     cleanup(&probe);
-    json(true, blocked, restored, filters, "ok");
+    json(
+        true,
+        blocked,
+        restored,
+        filters,
+        "ok",
+        session_flags,
+        app_id_blob_len,
+        path_match,
+    );
     if restored {
         eprintln!("[+] wfp-selftest PASS (baseline → blocked → restored, 1 filter, no residue)");
         0
@@ -1486,7 +1582,7 @@ fn usage_text() -> &'static str {
 
 Commands:
   bootstrap [--byovd <sys> <svc>] [--wdt <sys>] [--alsysio <sys>] [--flt-rva <hex>]
-  wfp-selftest             # driverless WFP kit e2e: baseline→block→restore (admin; prints {"wfp_selftest":{...}})
+  wfp-selftest             # driverless WFP kit e2e: baseline→block→restore (admin; prints {"wfp_selftest":{...}}; exit 6 = env_limit skip)
   assess                   # real T4-T5 kernel assessment (prints {"assess":{...}} JSON line)
   blind-etw
   hide <pid>
@@ -1497,7 +1593,7 @@ Commands:
   window-close             # best-effort reverse; kits without undo report restored:false
   window --phase open|close [pid]
   pg-window                # PatchGuard unchecked window (holds until Ctrl+C)
-  wfp-selftest             # driverless WFP kit e2e: baseline→block→restore (admin; prints {"wfp_selftest":{...}})
+  wfp-selftest             # driverless WFP kit e2e: baseline→block→restore (admin; prints {"wfp_selftest":{...}}; exit 6 = env_limit skip)
   cfg-bypass               # mark NtContinue as a valid CFG call target
   forge-etw [<parent> <child> <image> [out.bin]]
   --serve <port>           # daemon mode (see below)

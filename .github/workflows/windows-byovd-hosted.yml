@@ -70,6 +70,7 @@ jobs:
   # 是零成本硬门:baseline connect → ALE_APP_ID block(AppId 锚定自身临时
   # 副本,不碰真实 EDR)→ guard drop → 连接恢复(无残留)。任一阶段失败
   # job 红(exit 2 harness 坏 / 3 filter 没拦住 / 4 drop 后残留 / 5 操作错)。
+  # exit 6 + note env_limit:* = 环境跳过(无 admin / BFE 停),不是产品失败。
   wfp-selftest:
     runs-on: windows-latest
     timeout-minutes: 15
@@ -88,7 +89,11 @@ jobs:
           $jsonLine = ($out | Where-Object { $_ -like '{"wfp_selftest":*' } | Select-Object -First 1)
           if (-not $jsonLine) { Write-Host "::error::no {\"wfp_selftest\":{...}} JSON line"; exit 1 }
           $r = ($jsonLine | ConvertFrom-Json).wfp_selftest
-          Write-Host "baseline=$($r.baseline) blocked=$($r.blocked) restored=$($r.restored) filters=$($r.filters) note=$($r.note)"
+          Write-Host "baseline=$($r.baseline) blocked=$($r.blocked) restored=$($r.restored) filters=$($r.filters) note=$($r.note) env_limit=$($r.env_limit)"
+          if ($exit -eq 6 -or ($r.note -like 'env_limit:*')) {
+            Write-Host "::warning::WFP self-test skipped ($($r.note)) — env_limit, not a product failure"
+            exit 0
+          }
           if ($exit -ne 0 -or -not ($r.baseline -and $r.blocked -and $r.restored -and $r.filters -eq 1)) {
             Write-Host "::error::WFP self-test failed (exit $exit)"
             exit 1
